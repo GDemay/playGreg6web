@@ -162,6 +162,8 @@
       opfsInvalidations: 0,
       bytesFromOpfs: 0,
       bytesFromNetwork: 0,
+      wireBytesReleased: 0,
+      droppedWasmBuffers: 0,
     };
   }
 
@@ -187,6 +189,8 @@
       this.opfsInvalidations = 0;
       this.bytesFromOpfs = 0;
       this.bytesFromNetwork = 0;
+      this.wireBytesReleased = 0;
+      this.droppedWasmBuffers = 0;
       this._abortRecorded = false;
     }
 
@@ -243,6 +247,13 @@
     recordNetworkBytes(deltaBytes) {
       const delta = sanitizeNonNegativeInt(deltaBytes);
       if (delta > 0) this.bytesFromNetwork += delta;
+    }
+
+    recordWireBytesReleased(deltaBytes, droppedBuffers = 1) {
+      const bytes = sanitizeNonNegativeInt(deltaBytes);
+      const count = sanitizeNonNegativeInt(droppedBuffers);
+      if (bytes > 0) this.wireBytesReleased += bytes;
+      if (count > 0) this.droppedWasmBuffers += count;
     }
 
     recordAbort() {
@@ -335,6 +346,8 @@
         opfsInvalidations: sanitizeNonNegativeInt(this.opfsInvalidations),
         bytesFromOpfs: sanitizeNonNegativeInt(this.bytesFromOpfs),
         bytesFromNetwork: sanitizeNonNegativeInt(this.bytesFromNetwork),
+        wireBytesReleased: sanitizeNonNegativeInt(this.wireBytesReleased),
+        droppedWasmBuffers: sanitizeNonNegativeInt(this.droppedWasmBuffers),
       };
     }
   }
@@ -355,7 +368,28 @@
     return typeof SharedArrayBuffer !== 'undefined' && buf instanceof SharedArrayBuffer;
   }
 
+  function isCompiledWasmModule(value) {
+    return Boolean(
+      value &&
+        typeof value === 'object' &&
+        typeof WebAssembly !== 'undefined' &&
+        typeof WebAssembly.Module === 'function' &&
+        value instanceof WebAssembly.Module
+    );
+  }
+
+  function isTransferableArrayBuffer(value) {
+    if (!value || typeof value !== 'object' || isSharedArrayBuffer(value)) return false;
+    return (
+      value instanceof ArrayBuffer ||
+      Object.prototype.toString.call(value) === '[object ArrayBuffer]'
+    );
+  }
+
   function getBinaryBufferInfo(value) {
+    if (!value || typeof value !== 'object' || isCompiledWasmModule(value)) {
+      return null;
+    }
     if (value instanceof ArrayBuffer) {
       return { backingBuffer: value, byteLength: value.byteLength };
     }
@@ -366,6 +400,64 @@
       return { backingBuffer: value.buffer, byteLength: value.byteLength };
     }
     return null;
+  }
+
+  /**
+   * Collect unique standalone transferable non-SAB `ArrayBuffer`s reachable inside `payload`
+   * so Window -> Worker `postMessage(msg, transferList)` transfers large `.wasm` / `.pgim` /
+   * `.wgsl.pack` wire buffers zero-copy rather than cloning them.
+   *
+   * @param {unknown} payload
+   * @returns {ArrayBuffer[]}
+   */
+  function collectTransferableBuffers(payload) {
+    const unique = new Set();
+    const visited = new Set();
+
+    const visit = (value) => {
+      if (!value || typeof value !== 'object' || isCompiledWasmModule(value)) return;
+      if (isTransferableArrayBuffer(value)) {
+        if (!value.detached && value.byteLength > 0) unique.add(value);
+        return;
+      }
+      if (isSharedArrayBuffer(value)) return;
+      if (ArrayBuffer.isView(value)) {
+        const buf = value.buffer;
+        if (
+          isTransferableArrayBuffer(buf) &&
+          !buf.detached &&
+          value.byteOffset === 0 &&
+          value.byteLength === buf.byteLength &&
+          buf.byteLength > 0
+        ) {
+          unique.add(buf);
+        }
+        return;
+      }
+      if (visited.has(value)) return;
+      visited.add(value);
+      if (Array.isArray(value)) {
+        for (let i = 0; i < value.length; i += 1) visit(value[i]);
+        return;
+      }
+      if (value instanceof Map || value instanceof Set) {
+        for (const entryVal of value.values()) visit(entryVal);
+        return;
+      }
+      const keys = Object.keys(value);
+      for (let i = 0; i < keys.length; i += 1) {
+        let child;
+        try {
+          child = value[keys[i]];
+        } catch {
+          continue;
+        }
+        visit(child);
+      }
+    };
+
+    visit(payload);
+    return Array.from(unique);
   }
 
   function isWritableOwnProperty(obj, key) {
@@ -379,11 +471,24 @@
     return desc.writable === true;
   }
 
+  const BINARY_PAYLOAD_PROP_KEYS = Object.freeze([
+    'bytes',
+    'buffer',
+    'wasmBinary',
+    'wireBytes',
+    'rawBytes',
+    'arrayBuffer',
+    'data',
+    'wasmBytes',
+    'wasmBuffer',
+  ]);
+
   /**
    * Release large binary payload references (`ArrayBuffer`, `SharedArrayBuffer`, or TypedArray views)
    * held on a preloaded boot bundle or asset preload result while preserving lightweight metadata
    * (`bytesLoaded`, `totalBytes`, `entryCount`, `manifest`, `header`, `timingMs`, `durationMs`,
-   * `transport`). Defensive and idempotent: never throws on null, primitive, or frozen inputs.
+   * `transport`) and compiled `WebAssembly.Module` instances.
+   * Defensive and idempotent: never throws on null, primitive, or frozen inputs.
    *
    * @param {unknown} bundle
    * @returns {{ releasedFields: string[], releasedBytes: number }}
@@ -432,10 +537,27 @@
     };
 
     const releasePayloadContainer = (obj, prefix) => {
-      if (!obj || typeof obj !== 'object' || visitedObjects.has(obj)) return;
+      if (!obj || typeof obj !== 'object' || isCompiledWasmModule(obj) || visitedObjects.has(obj)) return;
       visitedObjects.add(obj);
-      nullBinaryProp(obj, 'bytes', `${prefix}.bytes`);
-      nullBinaryProp(obj, 'buffer', `${prefix}.buffer`);
+      for (let i = 0; i < BINARY_PAYLOAD_PROP_KEYS.length; i += 1) {
+        const propKey = BINARY_PAYLOAD_PROP_KEYS[i];
+        nullBinaryProp(obj, propKey, `${prefix}.${propKey}`);
+      }
+      if (Object.prototype.hasOwnProperty.call(obj, 'sideModules')) {
+        releaseCollection(obj.sideModules, `${prefix}.sideModules`);
+      }
+      if (Object.prototype.hasOwnProperty.call(obj, 'modules')) {
+        releaseCollection(obj.modules, `${prefix}.modules`);
+      }
+      if (Object.prototype.hasOwnProperty.call(obj, 'modulesByName')) {
+        releaseCollection(obj.modulesByName, `${prefix}.modulesByName`);
+      }
+      if (Object.prototype.hasOwnProperty.call(obj, 'guestModuleBytes')) {
+        releaseCollection(obj.guestModuleBytes, `${prefix}.guestModuleBytes`);
+      }
+      if (Object.prototype.hasOwnProperty.call(obj, 'preloadedBuffers')) {
+        releaseCollection(obj.preloadedBuffers, `${prefix}.preloadedBuffers`);
+      }
     };
 
     const releaseAssetSlot = (parent, key, prefix) => {
@@ -448,9 +570,13 @@
       } catch {
         return;
       }
-      if (!val || typeof val !== 'object') return;
+      if (!val || typeof val !== 'object' || isCompiledWasmModule(val)) return;
       if (getBinaryBufferInfo(val)) {
         nullBinaryProp(parent, key, prefix);
+        return;
+      }
+      if (val instanceof Map || Array.isArray(val)) {
+        releaseCollection(val, prefix);
         return;
       }
       releasePayloadContainer(val, prefix);
@@ -459,22 +585,66 @@
     const releaseModuleList = (list, prefix) => {
       if (!Array.isArray(list) || visitedObjects.has(list)) return;
       visitedObjects.add(list);
+      let allDirectBinary = list.length > 0;
       for (let i = 0; i < list.length; i += 1) {
         const item = list[i];
-        if (!item || typeof item !== 'object') continue;
+        if (!item || typeof item !== 'object' || isCompiledWasmModule(item)) {
+          allDirectBinary = false;
+          continue;
+        }
         if (getBinaryBufferInfo(item)) {
           nullBinaryProp(list, String(i), `${prefix}[${i}]`);
         } else {
+          allDirectBinary = false;
           releasePayloadContainer(item, `${prefix}[${i}]`);
+        }
+      }
+      if (allDirectBinary && !Object.isFrozen(list)) {
+        try {
+          list.length = 0;
+        } catch {
+          // Ignore non-resizable arrays.
+        }
+      }
+    };
+
+    const releaseBinaryMap = (map, prefix) => {
+      if (!(map instanceof Map) || visitedObjects.has(map)) return;
+      visitedObjects.add(map);
+      for (const [k, val] of Array.from(map.entries())) {
+        if (!val || typeof val !== 'object' || isCompiledWasmModule(val)) continue;
+        const info = getBinaryBufferInfo(val);
+        const keyLabel = typeof k === 'string' || typeof k === 'number' ? String(k) : 'entry';
+        if (info) {
+          map.delete(k);
+          releasedFields.push(`${prefix}.${keyLabel}`);
+          recordBufferBytes(info);
+        } else {
+          releasePayloadContainer(val, `${prefix}.${keyLabel}`);
         }
       }
     };
 
     const releaseModuleMap = (map, prefix) => {
       if (!map || typeof map !== 'object' || Array.isArray(map) || visitedObjects.has(map)) return;
+      if (map instanceof Map) {
+        releaseBinaryMap(map, prefix);
+        return;
+      }
       visitedObjects.add(map);
       for (const key of Object.keys(map)) {
         releaseAssetSlot(map, key, `${prefix}.${key}`);
+      }
+    };
+
+    const releaseCollection = (col, prefix) => {
+      if (!col || typeof col !== 'object') return;
+      if (Array.isArray(col)) {
+        releaseModuleList(col, prefix);
+      } else if (col instanceof Map) {
+        releaseBinaryMap(col, prefix);
+      } else {
+        releaseModuleMap(col, prefix);
       }
     };
 
@@ -483,18 +653,46 @@
     nullBinaryProp(bundle, 'buffer', 'buffer');
     nullBinaryProp(bundle, 'bytes', 'bytes');
     nullBinaryProp(bundle, 'pgimBytes', 'pgimBytes');
+    nullBinaryProp(bundle, 'pgimBuffer', 'pgimBuffer');
+    nullBinaryProp(bundle, 'shaderPackBuffer', 'shaderPackBuffer');
+    nullBinaryProp(bundle, 'wasmBinary', 'wasmBinary');
+    nullBinaryProp(bundle, 'wasmBytes', 'wasmBytes');
+    nullBinaryProp(bundle, 'wasmBuffer', 'wasmBuffer');
+    nullBinaryProp(bundle, 'wireBytes', 'wireBytes');
+    nullBinaryProp(bundle, 'rawBytes', 'rawBytes');
+    nullBinaryProp(bundle, 'arrayBuffer', 'arrayBuffer');
 
     releaseAssetSlot(bundle, 'shaderPackBytes', 'shaderPackBytes');
     releaseAssetSlot(bundle, 'pgim', 'pgim');
     releaseAssetSlot(bundle, 'shaderPackIndex', 'shaderPackIndex');
     releaseAssetSlot(bundle, 'reflectionManifest', 'reflectionManifest');
     releaseAssetSlot(bundle, 'reflectionSidecar', 'reflectionSidecar');
+    releaseAssetSlot(bundle, 'runtimeWasm', 'runtimeWasm');
+    releaseAssetSlot(bundle, 'opfsWarmBoot', 'opfsWarmBoot');
 
     if (Object.prototype.hasOwnProperty.call(bundle, 'modules')) {
-      releaseModuleList(bundle.modules, 'modules');
+      releaseCollection(bundle.modules, 'modules');
     }
     if (Object.prototype.hasOwnProperty.call(bundle, 'modulesByName')) {
-      releaseModuleMap(bundle.modulesByName, 'modulesByName');
+      releaseCollection(bundle.modulesByName, 'modulesByName');
+    }
+    if (Object.prototype.hasOwnProperty.call(bundle, 'sideModules')) {
+      releaseCollection(bundle.sideModules, 'sideModules');
+    }
+    if (Object.prototype.hasOwnProperty.call(bundle, 'sideModuleBytes')) {
+      releaseCollection(bundle.sideModuleBytes, 'sideModuleBytes');
+    }
+    if (Object.prototype.hasOwnProperty.call(bundle, 'guestModules')) {
+      releaseCollection(bundle.guestModules, 'guestModules');
+    }
+    if (Object.prototype.hasOwnProperty.call(bundle, 'guestModuleBytes')) {
+      releaseCollection(bundle.guestModuleBytes, 'guestModuleBytes');
+    }
+    if (Object.prototype.hasOwnProperty.call(bundle, 'wasmModules')) {
+      releaseCollection(bundle.wasmModules, 'wasmModules');
+    }
+    if (Object.prototype.hasOwnProperty.call(bundle, 'preloadedBuffers')) {
+      releaseCollection(bundle.preloadedBuffers, 'preloadedBuffers');
     }
     if (Object.prototype.hasOwnProperty.call(bundle, 'mainModule')) {
       releaseAssetSlot(bundle, 'mainModule', 'mainModule');
@@ -507,16 +705,18 @@
     ) {
       const program = bundle.program;
       visitedObjects.add(program);
-      nullBinaryProp(program, 'bytes', 'program.bytes');
-      nullBinaryProp(program, 'buffer', 'program.buffer');
+      for (let i = 0; i < BINARY_PAYLOAD_PROP_KEYS.length; i += 1) {
+        const propKey = BINARY_PAYLOAD_PROP_KEYS[i];
+        nullBinaryProp(program, propKey, `program.${propKey}`);
+      }
       if (Object.prototype.hasOwnProperty.call(program, 'mainModule')) {
         releaseAssetSlot(program, 'mainModule', 'program.mainModule');
       }
       if (Object.prototype.hasOwnProperty.call(program, 'modules')) {
-        releaseModuleList(program.modules, 'program.modules');
+        releaseCollection(program.modules, 'program.modules');
       }
       if (Object.prototype.hasOwnProperty.call(program, 'modulesByName')) {
-        releaseModuleMap(program.modulesByName, 'program.modulesByName');
+        releaseCollection(program.modulesByName, 'program.modulesByName');
       }
     }
 
@@ -1197,12 +1397,14 @@
         const handle = await dir.getFileHandle(key, { create: true });
         if (!handle || typeof handle.createWritable !== 'function') return false;
         const writable = await handle.createWritable();
+        let payload = isSharedArrayBuffer(bytes.buffer) ? bytes.slice() : bytes;
         try {
-          const payload = isSharedArrayBuffer(bytes.buffer) ? bytes.slice() : bytes;
           await writable.write(payload);
+          payload = null;
           await writable.close();
           return true;
         } catch (err) {
+          payload = null;
           if (typeof writable.abort === 'function') {
             try {
               await writable.abort();
@@ -2120,6 +2322,10 @@
     this.useSharedArrayBuffer = Boolean(useSharedArrayBuffer);
     this.targetBuffer = targetBuffer;
     this._telemetryRun = null;
+    this._wireBytesReleased = 0;
+    this._droppedWasmBuffers = 0;
+    this._streamingCompiles = 0;
+    this._fallbackCompiles = 0;
   }
 
   /**
@@ -2154,7 +2360,23 @@
    * Return sanitized finite throughput and retry/abort telemetry for the latest preload run.
    */
   getStats() {
-    return this._telemetryRun ? this._telemetryRun.snapshot() : emptyTelemetrySnapshot();
+    const snap = this._telemetryRun ? this._telemetryRun.snapshot() : emptyTelemetrySnapshot();
+    snap.wireBytesReleased = Math.max(snap.wireBytesReleased, sanitizeNonNegativeInt(this._wireBytesReleased));
+    snap.droppedWasmBuffers = Math.max(snap.droppedWasmBuffers, sanitizeNonNegativeInt(this._droppedWasmBuffers));
+    return snap;
+  }
+
+  /**
+   * Return sanitized numeric telemetry for wire-byte drops and streaming Wasm compilation.
+   */
+  getMemoryDropTelemetry() {
+    const snap = this.getStats();
+    return {
+      wireBytesReleased: snap.wireBytesReleased,
+      droppedWasmBuffers: snap.droppedWasmBuffers,
+      streamingCompiles: sanitizeNonNegativeInt(this._streamingCompiles),
+      fallbackCompiles: sanitizeNonNegativeInt(this._fallbackCompiles),
+    };
   }
 
   /**
@@ -2169,7 +2391,113 @@
    */
   resetStats() {
     this._telemetryRun = null;
+    this._wireBytesReleased = 0;
+    this._droppedWasmBuffers = 0;
+    this._streamingCompiles = 0;
+    this._fallbackCompiles = 0;
     return this.getStats();
+  }
+
+  /**
+   * Fetch and compile a `.wasm` binary (e.g. `runtime.wasm` or `guest_part_*.wasm`) into a
+   * `WebAssembly.Module` without retaining raw wire bytes on the Window heap.
+   *
+   * Prefers `WebAssembly.compileStreaming` whenever supported and the HTTP response carries
+   * `application/wasm` (so wire bytes never materialize as a JS `ArrayBuffer`). Falls back
+   * cleanly to `response.arrayBuffer()` -> `WebAssembly.compile(bytes)` with immediate wire-byte
+   * release and increments `wireBytesReleased` / `droppedWasmBuffers`.
+   *
+   * @param {string} url
+   * @param {{ signal?: AbortSignal, wasmApi?: typeof WebAssembly, allowStreamingWithoutContentType?: boolean }} [options]
+   */
+  async compileWasmStreaming(url, options = {}) {
+    if (typeof url !== 'string' || url.length === 0) {
+      throw new TypeError('Wasm module url must be a non-empty string');
+    }
+    const safeOpts = options && typeof options === 'object' ? options : {};
+    const signal = safeOpts.signal || null;
+    const wasmApi =
+      safeOpts.wasmApi && typeof safeOpts.wasmApi === 'object'
+        ? safeOpts.wasmApi
+        : typeof WebAssembly !== 'undefined'
+          ? WebAssembly
+          : null;
+    if (!wasmApi || typeof wasmApi.compile !== 'function') {
+      throw new Error('WebAssembly.compile is unavailable');
+    }
+    throwIfAborted(signal);
+    const started = this._now();
+    const run = this._telemetryRun || this._startTelemetryRun();
+    const ctx = {
+      url,
+      signal,
+      emit: () => {},
+      requests: 0,
+      run,
+      ownsTotalBytes: false,
+      what: 'Wasm module',
+    };
+    const response = await this._request(ctx, { method: 'GET', credentials: 'same-origin' });
+    if (!response || !response.ok) {
+      throw httpError(url, response ? response.status : 0, 'Wasm module');
+    }
+    const declaredBytes = contentLength(response);
+    const contentType = String(headerValue(response, 'content-type') || '').toLowerCase();
+    const isRealResponse = typeof Response === 'undefined' || response instanceof Response;
+    const canStream =
+      typeof wasmApi.compileStreaming === 'function' &&
+      (isRealResponse || safeOpts.allowStreamingWithoutContentType === true) &&
+      (contentType.includes('application/wasm') || safeOpts.allowStreamingWithoutContentType === true);
+
+    if (canStream) {
+      try {
+        const mod = await raceAbort(wasmApi.compileStreaming(Promise.resolve(response)), signal);
+        this._streamingCompiles += 1;
+        const bytesLoaded = declaredBytes !== null ? declaredBytes : 0;
+        return {
+          module: mod,
+          url,
+          streaming: true,
+          bytesLoaded,
+          wireBytesReleased: 0,
+          durationMs: this._elapsedSince(started),
+        };
+      } catch (streamErr) {
+        if ((signal && signal.aborted) || isAbortError(streamErr)) {
+          throw streamErr;
+        }
+        // If body was already consumed by compileStreaming, re-throw; otherwise fall back to arrayBuffer().
+        if (response.bodyUsed) {
+          throw streamErr;
+        }
+      }
+    }
+
+    let wireBytes = await raceAbort(response.arrayBuffer(), signal);
+    throwIfAborted(signal);
+    const byteLength = wireBytes && typeof wireBytes.byteLength === 'number' ? wireBytes.byteLength : 0;
+    let mod;
+    try {
+      const compilePromise = wasmApi.compile(wireBytes);
+      wireBytes = null;
+      mod = await raceAbort(compilePromise, signal);
+    } finally {
+      wireBytes = null;
+      if (byteLength > 0) {
+        this._wireBytesReleased += byteLength;
+        this._droppedWasmBuffers += 1;
+        if (run) run.recordWireBytesReleased(byteLength, 1);
+      }
+    }
+    this._fallbackCompiles += 1;
+    return {
+      module: mod,
+      url,
+      streaming: false,
+      bytesLoaded: byteLength,
+      wireBytesReleased: byteLength,
+      durationMs: this._elapsedSince(started),
+    };
   }
 
   /**
@@ -2524,7 +2852,7 @@
       })
     );
     // Avoid SharedArrayBuffer views in FileSystemWritableFileStream.write().
-    const writeBytes = isSharedArrayBuffer(bytes.buffer) ? bytes.slice() : bytes;
+    let payloadToWrite = isSharedArrayBuffer(bytes.buffer) ? bytes.slice() : bytes;
     const dataMeta = {
       kind: 'pgim',
       version: this.opfsCacheVersion,
@@ -2543,7 +2871,9 @@
     };
 
     const runWrite = async () => {
-      const writeRes = await store.write(fp.dataKey, writeBytes, dataMeta);
+      const dataToWrite = payloadToWrite;
+      payloadToWrite = null;
+      const writeRes = await store.write(fp.dataKey, dataToWrite, dataMeta);
       const stored =
         writeRes !== false &&
         !(writeRes && typeof writeRes === 'object' && writeRes.stored === false);
@@ -3767,7 +4097,8 @@
         // Server ignored the Range header: consume the full body as a single GET.
         return this._consumeFullBody(ctx, firstRes.fullResponse, probe.totalBytes);
       }
-      const { bytes: first, range, etag: chunkEtag } = firstRes;
+      let { bytes: first, range, etag: chunkEtag } = firstRes;
+      firstRes.bytes = null;
       if (range && (range.start !== 0 || range.end - range.start + 1 !== first.byteLength)) {
         throw new PgimPreloadError('RANGE_MISMATCH', `PGIM first chunk Content-Range does not match the ${first.byteLength} received bytes`);
       }
@@ -3780,23 +4111,25 @@
       const transportTotal = range && range.total !== null ? range.total : probe.totalBytes;
       const header = parsePgimHeader(first, { totalBytes: transportTotal });
       const total = header.fileSize;
-      if (first.byteLength !== Math.min(firstLen, total)) {
-        throw new PgimPreloadError('RANGE_MISMATCH', `PGIM first chunk returned ${first.byteLength} bytes, expected ${Math.min(firstLen, total)}`);
+      const firstByteLen = first.byteLength;
+      if (firstByteLen !== Math.min(firstLen, total)) {
+        throw new PgimPreloadError('RANGE_MISMATCH', `PGIM first chunk returned ${firstByteLen} bytes, expected ${Math.min(firstLen, total)}`);
       }
       const dest = this._allocate(total);
       dest.bytes.set(first, 0);
+      first = null;
       if (ctx.run) {
         if (ctx.ownsTotalBytes) ctx.run.setTotalBytes(total);
-        ctx.run.recordBytes(first.byteLength);
-        ctx.run.recordNetworkBytes(first.byteLength);
+        ctx.run.recordBytes(firstByteLen);
+        ctx.run.recordNetworkBytes(firstByteLen);
         ctx.run.recordChunk(1);
       }
-      ctx.emit('header', first.byteLength, total);
+      ctx.emit('header', firstByteLen, total);
 
       const parallel = await this._parallelChunks(
         ctx,
         dest.bytes,
-        first.byteLength,
+        firstByteLen,
         async (start, end, signal) => {
           const chunkRes = await this._fetchRangeChunkWithRetry(ctx, start, end, dest.bytes, signal, {
             allowFullFallback: false,
@@ -3830,21 +4163,23 @@
         return toBytes(await raceAbort(Promise.resolve().then(() => cache.read(ctx.url, offset, length)), signal), 'rangeCache chunk');
       };
       const firstLen = probe.totalBytes !== null ? Math.min(chunkSize, probe.totalBytes) : chunkSize;
-      const first = await read(0, firstLen, ctx.signal);
+      let first = await read(0, firstLen, ctx.signal);
       const header = parsePgimHeader(first, { totalBytes: probe.totalBytes });
       const total = header.fileSize;
-      if (first.byteLength !== Math.min(firstLen, total)) {
-        throw new PgimPreloadError('RANGE_MISMATCH', `rangeCache returned ${first.byteLength} bytes, expected ${Math.min(firstLen, total)}`);
+      const firstByteLen = first.byteLength;
+      if (firstByteLen !== Math.min(firstLen, total)) {
+        throw new PgimPreloadError('RANGE_MISMATCH', `rangeCache returned ${firstByteLen} bytes, expected ${Math.min(firstLen, total)}`);
       }
       const dest = this._allocate(total);
       dest.bytes.set(first, 0);
+      first = null;
       if (ctx.run) {
         if (ctx.ownsTotalBytes) ctx.run.setTotalBytes(total);
-        ctx.run.recordBytes(first.byteLength);
+        ctx.run.recordBytes(firstByteLen);
         ctx.run.recordChunk(1);
       }
-      ctx.emit('header', first.byteLength, total);
-      const parallel = await this._parallelChunks(ctx, dest.bytes, first.byteLength, (start, end, signal) =>
+      ctx.emit('header', firstByteLen, total);
+      const parallel = await this._parallelChunks(ctx, dest.bytes, firstByteLen, (start, end, signal) =>
         read(start, end - start, signal)
       );
       const chunksFetched = 1 + parallel.chunksCompleted;
@@ -3931,24 +4266,38 @@
       const expected = declared !== null ? declared : knownTotal;
       const body = response.body;
       if (!body || typeof body.getReader !== 'function') {
-        const whole = new Uint8Array(await raceAbort(response.arrayBuffer(), ctx.signal));
+        let whole = new Uint8Array(await raceAbort(response.arrayBuffer(), ctx.signal));
         throwIfAborted(ctx.signal);
         const header = parsePgimHeader(whole, { totalBytes: expected });
-        if (whole.byteLength !== header.fileSize) {
-          throw new PgimPreloadError('TRUNCATED', `truncated PGIM image: needed ${header.fileSize} bytes, only ${whole.byteLength} available`, {
+        const wholeByteLen = whole.byteLength;
+        if (wholeByteLen !== header.fileSize) {
+          throw new PgimPreloadError('TRUNCATED', `truncated PGIM image: needed ${header.fileSize} bytes, only ${wholeByteLen} available`, {
             needed: header.fileSize,
-            available: whole.byteLength,
+            available: wholeByteLen,
           });
         }
-        const dest = this._allocate(header.fileSize);
-        dest.bytes.set(whole, 0);
+        let dest;
+        if (
+          this.targetBuffer === null &&
+          !this.useSharedArrayBuffer &&
+          whole.buffer instanceof ArrayBuffer &&
+          whole.byteOffset === 0 &&
+          whole.byteLength === whole.buffer.byteLength
+        ) {
+          dest = { bytes: whole, shared: false };
+          whole = null;
+        } else {
+          dest = this._allocate(header.fileSize);
+          dest.bytes.set(whole, 0);
+          whole = null;
+        }
         if (ctx.run) {
           if (ctx.ownsTotalBytes) ctx.run.setTotalBytes(header.fileSize);
-          ctx.run.recordBytes(whole.byteLength);
-          ctx.run.recordNetworkBytes(whole.byteLength);
+          ctx.run.recordBytes(wholeByteLen);
+          ctx.run.recordNetworkBytes(wholeByteLen);
           ctx.run.recordChunk(1);
         }
-        ctx.emit('download', whole.byteLength, header.fileSize);
+        ctx.emit('download', wholeByteLen, header.fileSize);
         return {
           ...dest,
           transport: 'full',
@@ -4253,6 +4602,7 @@
     parseProgramManifest,
     parseBootManifest,
     preloadProgramModules,
+    collectTransferableBuffers,
     releaseBootBundleBytes,
     PgimPreloader,
     default: PgimPreloader,
