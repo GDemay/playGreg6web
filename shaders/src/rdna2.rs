@@ -1016,18 +1016,26 @@ fn vopc_mnemonic(op: u8) -> String {
         0x78..=0x7F => format!("v_cmpx_{}_u16", INT_CC[(op & 0x7) as usize]),
         0x80..=0x87 => format!("v_cmp_{}_i32", INT_CC[(op & 0x7) as usize]),
         0x88 => "v_cmp_class_f32".to_string(),
+        0x89..=0x8E => format!("v_cmp_{}_i16", INT_CC[(op & 0x7) as usize]),
         0x8F => "v_cmp_class_f16".to_string(),
         0x90..=0x97 => format!("v_cmpx_{}_i32", INT_CC[(op & 0x7) as usize]),
         0x98 => "v_cmpx_class_f32".to_string(),
+        0x99..=0x9E => format!("v_cmpx_{}_i16", INT_CC[(op & 0x7) as usize]),
         0x9F => "v_cmpx_class_f16".to_string(),
         0xA0..=0xA7 => format!("v_cmp_{}_i64", INT_CC[(op & 0x7) as usize]),
         0xA8 => "v_cmp_class_f64".to_string(),
+        0xA9..=0xAE => format!("v_cmp_{}_u16", INT_CC[(op & 0x7) as usize]),
         0xB0..=0xB7 => format!("v_cmpx_{}_i64", INT_CC[(op & 0x7) as usize]),
         0xB8 => "v_cmpx_class_f64".to_string(),
+        0xB9..=0xBE => format!("v_cmpx_{}_u16", INT_CC[(op & 0x7) as usize]),
         0xC0..=0xC7 => format!("v_cmp_{}_u32", INT_CC[(op & 0x7) as usize]),
+        0xC8..=0xCF => format!("v_cmp_{}_f16", FLOAT_CC[(op & 0x7) as usize]),
         0xD0..=0xD7 => format!("v_cmpx_{}_u32", INT_CC[(op & 0x7) as usize]),
+        0xD8..=0xDF => format!("v_cmpx_{}_f16", FLOAT_CC[(op & 0x7) as usize]),
         0xE0..=0xE7 => format!("v_cmp_{}_u64", INT_CC[(op & 0x7) as usize]),
+        0xE8..=0xEF => format!("v_cmp_{}_f16", FLOAT_CC[8 + (op & 0x7) as usize]),
         0xF0..=0xF7 => format!("v_cmpx_{}_u64", INT_CC[(op & 0x7) as usize]),
+        0xF8..=0xFF => format!("v_cmpx_{}_f16", FLOAT_CC[8 + (op & 0x7) as usize]),
         other => format!("vopc_op_{other:#04x}"),
     }
 }
@@ -1180,6 +1188,7 @@ fn vop3_info(op: u16) -> (String, u8, bool) {
         0x16E => ("v_div_scale_f64".to_string(), 3, true),
         0x170 => ("v_mad_u64_u32".to_string(), 3, true),
         0x171 => ("v_mad_i64_i32".to_string(), 3, true),
+        0x178 => ("v_xor3_b32".to_string(), 3, false),
         0x180..=0x1FF => (vop1_mnemonic((op - 0x180) as u8), 1, false),
         0x2FF => ("v_lshlrev_b64".to_string(), 2, false),
         0x300 => ("v_lshrrev_b64".to_string(), 2, false),
@@ -1209,6 +1218,9 @@ fn vop3_info(op: u16) -> (String, u8, bool) {
         0x36F => ("v_and_or_b32".to_string(), 3, false),
         0x370 => ("v_or3_b32".to_string(), 3, false),
         0x371 => ("v_and_or_b32".to_string(), 3, false),
+        0x372 => ("v_or3_b32".to_string(), 3, false),
+        0x377 => ("v_permlane16_b32".to_string(), 3, false),
+        0x378 => ("v_permlanex16_b32".to_string(), 3, false),
         other => (format!("vop3_op_{other:#05x}"), 3, false),
     }
 }
@@ -4776,6 +4788,81 @@ mod tests {
 
         let summary = analyze_program(&bytes);
         assert_eq!(summary.max_vgpr, Some(11), "v_add_f64 writes v[10:11]");
+        assert_eq!(summary.truncated_instructions, 0);
+    }
+
+    #[test]
+    fn decodes_s39_swap_readlane_writelane_not64_ff1_class_f16_xad_or3_xor3_cube_and_16bit_vopc() {
+        let mut words = Vec::new();
+        // VOP1: v_swap_b32 v3, v7
+        words.push(enc_vop1(0x65, 3, 256 + 7));
+        // VOP3: v_writelane_b32 v40, s8, 0 & lane 1
+        words.extend_from_slice(&enc_vop3(0x361, 40, 8, 128 + 0, 0, false, 0, 0, 0));
+        words.extend_from_slice(&enc_vop3(0x361, 40, 9, 128 + 1, 0, false, 0, 0, 0));
+        // VOP3: v_readlane_b32 s10, v40, 0 & s11, v40, 1
+        words.extend_from_slice(&enc_vop3(0x360, 10, 256 + 40, 128 + 0, 0, false, 0, 0, 0));
+        words.extend_from_slice(&enc_vop3(0x360, 11, 256 + 40, 128 + 1, 0, false, 0, 0, 0));
+        // SOP1: s_not_b64 s[12:13], s8  &  s_ff1_i32_b32 s14, s12
+        words.push(enc_sop1(0x08, 12, 8));
+        words.push(enc_sop1(0x13, 14, 12));
+        // VOP3: v_cmp_class_f16 s6, v1, 0x3ff & VOPC v_cmpx_class_f16
+        words.extend_from_slice(&enc_vop3(0x08F, 6, 256 + 1, 0xFF, 0, false, 0, 0, 0));
+        words.push(0x0000_03FF);
+        words.push(enc_vopc(0x9F, 256 + 1, 2));
+        // VOP3: v_xad_u32 (0x345), v_or3_b32 (0x372), v_xor3_b32 (0x178), v_permlanex16_b32 (0x378)
+        words.extend_from_slice(&enc_vop3(0x345, 5, 256 + 1, 256 + 2, 256 + 3, false, 0, 0, 0));
+        words.extend_from_slice(&enc_vop3(0x372, 6, 256 + 1, 256 + 2, 256 + 3, false, 0, 0, 0));
+        words.extend_from_slice(&enc_vop3(0x178, 7, 256 + 1, 256 + 2, 256 + 3, false, 0, 0, 0));
+        words.extend_from_slice(&enc_vop3(0x378, 8, 256 + 1, 2, 3, false, 0, 0, 0));
+        // VOP3: cubemap ops v_cubeid_f32 (0x144), v_cubesc_f32 (0x145), v_cubetc_f32 (0x146), v_cubema_f32 (0x147)
+        words.extend_from_slice(&enc_vop3(0x144, 10, 256 + 1, 256 + 2, 256 + 3, false, 0, 0, 0));
+        words.extend_from_slice(&enc_vop3(0x145, 11, 256 + 1, 256 + 2, 256 + 3, false, 0, 0, 0));
+        words.extend_from_slice(&enc_vop3(0x146, 12, 256 + 1, 256 + 2, 256 + 3, false, 0, 0, 0));
+        words.extend_from_slice(&enc_vop3(0x147, 13, 256 + 1, 256 + 2, 256 + 3, false, 0, 0, 0));
+        // GFX10.3 VOPC 16-bit compares: 0xC9/0xCA/0xCC/0xCE/0xD9/0xE8 (f16), 0x89 (i16), 0xA9 (u16)
+        words.push(enc_vopc(0xC9, 256 + 1, 2)); // v_cmp_lt_f16
+        words.push(enc_vopc(0xCA, 256 + 1, 2)); // v_cmp_eq_f16
+        words.push(enc_vopc(0xCC, 256 + 1, 2)); // v_cmp_gt_f16
+        words.push(enc_vopc(0xCE, 256 + 1, 2)); // v_cmp_ge_f16
+        words.push(enc_vopc(0xD9, 256 + 1, 2)); // v_cmpx_lt_f16
+        words.push(enc_vopc(0xE8, 256 + 1, 2)); // v_cmp_u_f16
+        words.push(enc_vopc(0x89, 256 + 1, 2)); // v_cmp_lt_i16
+        words.push(enc_vopc(0xA9, 256 + 1, 2)); // v_cmp_lt_u16
+        words.push(enc_sopp(0x01, 0));
+
+        let bytes = words_to_bytes(&words);
+        let insts = decode_program(&bytes);
+        assert_eq!(insts.len(), 26);
+        assert_eq!(insts[0].format_text(), "v_swap_b32 v3, v7");
+        assert_eq!(insts[1].format_text(), "v_writelane_b32 v40, s8, 0");
+        assert_eq!(insts[2].format_text(), "v_writelane_b32 v40, s9, 1");
+        assert_eq!(insts[3].format_text(), "v_readlane_b32 s10, v40, 0");
+        assert_eq!(insts[4].format_text(), "v_readlane_b32 s11, v40, 1");
+        assert_eq!(insts[5].format_text(), "s_not_b64 s[12:13], s8");
+        assert_eq!(insts[6].format_text(), "s_ff1_i32_b32 s14, s12");
+        assert_eq!(insts[7].format_text(), "v_cmp_class_f16 s6, v1, 0x000003ff");
+        assert_eq!(insts[7].size, 12);
+        assert_eq!(insts[8].format_text(), "v_cmpx_class_f16 exec, v1, v2");
+        assert_eq!(insts[9].format_text(), "v_xad_u32 v5, v1, v2, v3");
+        assert_eq!(insts[10].format_text(), "v_or3_b32 v6, v1, v2, v3");
+        assert_eq!(insts[11].format_text(), "v_xor3_b32 v7, v1, v2, v3");
+        assert_eq!(insts[12].format_text(), "v_permlanex16_b32 v8, v1, s2, s3");
+        assert_eq!(insts[13].format_text(), "v_cubeid_f32 v10, v1, v2, v3");
+        assert_eq!(insts[14].format_text(), "v_cubesc_f32 v11, v1, v2, v3");
+        assert_eq!(insts[15].format_text(), "v_cubetc_f32 v12, v1, v2, v3");
+        assert_eq!(insts[16].format_text(), "v_cubema_f32 v13, v1, v2, v3");
+        assert_eq!(insts[17].format_text(), "v_cmp_lt_f16 vcc, v1, v2");
+        assert_eq!(insts[18].format_text(), "v_cmp_eq_f16 vcc, v1, v2");
+        assert_eq!(insts[19].format_text(), "v_cmp_gt_f16 vcc, v1, v2");
+        assert_eq!(insts[20].format_text(), "v_cmp_ge_f16 vcc, v1, v2");
+        assert_eq!(insts[21].format_text(), "v_cmpx_lt_f16 exec, v1, v2");
+        assert_eq!(insts[22].format_text(), "v_cmp_u_f16 vcc, v1, v2");
+        assert_eq!(insts[23].format_text(), "v_cmp_lt_i16 vcc, v1, v2");
+        assert_eq!(insts[24].format_text(), "v_cmp_lt_u16 vcc, v1, v2");
+
+        let summary = analyze_program(&bytes);
+        assert_eq!(summary.max_vgpr, Some(40));
+        assert_eq!(summary.max_sgpr, Some(14));
         assert_eq!(summary.truncated_instructions, 0);
     }
 }
