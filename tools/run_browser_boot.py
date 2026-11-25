@@ -5,7 +5,8 @@
         [--smoke] [--boot-dir DIR] [--game-dir DIR] [--shader-pack FILE] [--out-dir DIR]
         [--runs-dir DIR] [--port PORT] [--duration-s N] [--headless | --headed]
         [--chrome PATH] [--trust-build] [--rebuild] [--no-build] [--dry-run]
-        [--capture-frames [DIR]] [--capture-interval-sec SEC] [--mp4] [--baseline NAME|DIR]
+        [--capture-frames [DIR]] [--capture-interval-sec SEC] [--mp4] [--mp4-fps FPS]
+        [--mp4-skip-black] [--hide-hud] [--baseline NAME|DIR]
         [--input-script PRESET] [--stream-shaders] [--stream-threshold-mb MB]
         [--boot-options JSON|FILE] [--report-to-log] [--max-wall-ms MS] [--dump-pipelines]
 
@@ -117,6 +118,8 @@ ALLOWED_INPUT_SCRIPT_PRESETS: dict[str, str] = {
     "menu-flow": "menu-flow",
     "calibration-skip": "calibration-skip",
     "intro-watch": "intro-watch",
+    "legal-notices": "legal-notices",
+    "chrome-menu-flow": "chrome-menu-flow",
 }
 _SAFE_INPUT_SCRIPT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
@@ -773,6 +776,7 @@ def build_target_url(
     input_script: str | None = None,
     stream_shaders: bool = False,
     stream_threshold_mb: float | None = None,
+    hide_hud: bool = False,
 ) -> str:
     """Construct the local browser boot URL with sanitized query parameters."""
     params: list[tuple[str, str]] = []
@@ -786,10 +790,24 @@ def build_target_url(
     clean_threshold = validate_stream_threshold_mb(stream_threshold_mb)
     if clean_threshold is not None:
         params.append(("streamThresholdMb", format_stream_threshold_mb(clean_threshold)))
+    if hide_hud:
+        params.append(("hud", "0"))
     base = f"http://{host}:{port}/"
     if not params:
         return base
     return f"{base}?{urlencode(params)}"
+
+
+def validate_mp4_fps(raw: float | int | None) -> float | None:
+    """Validate `--mp4-fps` as an optional positive finite number."""
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise RunnerError("--mp4-fps must be a positive finite number")
+    value = float(raw)
+    if not math.isfinite(value) or value <= 0.0:
+        raise RunnerError("--mp4-fps must be a positive finite number")
+    return value
 
 
 def validate_capture_interval_sec(raw: float | int) -> float:
@@ -1639,6 +1657,9 @@ class BrowserSessionResult:
     non_black_canvas_frames: int | None = None
     scripted_inputs_sent: int = 0
     mp4_path: str | None = None
+    mp4_fps: float | None = None
+    mp4_skip_black: bool = False
+    hide_hud: bool = False
     warnings: list[str] = field(default_factory=list)
     target_url: str = ""
     input_script: str | None = None
@@ -1829,32 +1850,125 @@ def check_canvas_non_black(
     return False
 
 
+_FRAME_FILE_RE = re.compile(r"^frame_(\d+)\.(?:jpg|png)$")
+
+
+def _list_numbered_frames(frames_dir: Path, ext: str) -> list[tuple[int, Path]]:
+    numbered: list[tuple[int, Path]] = []
+    suffix = f".{ext}"
+    for candidate in frames_dir.glob(f"frame_*{suffix}"):
+        if not candidate.is_file():
+            continue
+        match = _FRAME_FILE_RE.match(candidate.name)
+        if match is not None:
+            numbered.append((int(match.group(1)), candidate))
+    numbered.sort(key=lambda item: item[0])
+    return numbered
+
+
+def find_first_non_black_frame_number(
+    frames: Sequence[tuple[int, Path]],
+    *,
+    canvas_min_x: int = CANVAS_MIN_X,
+    pil_image_mod: Any | None = None,
+    _auto_import_pil: bool = True,
+) -> tuple[int | None, int]:
+    """Return `(first_non_black_frame_number, skipped_leading_black_count)`.
+
+    Returns `(None, 0)` when Pillow is unavailable, no frames exist, or every
+    captured frame is black so callers fall back to encoding all frames cleanly.
+    """
+    if not frames:
+        return None, 0
+    img_mod = pil_image_mod
+    if img_mod is None and _auto_import_pil:
+        img_mod = _import_pil_image()
+    if img_mod is None:
+        return None, 0
+
+    skipped = 0
+    for frame_num, frame_path in frames:
+        try:
+            raw_bytes = frame_path.read_bytes()
+        except OSError:
+            return (frame_num, skipped) if skipped > 0 else (None, 0)
+        non_black = check_canvas_non_black(
+            raw_bytes,
+            canvas_min_x=canvas_min_x,
+            pil_image_mod=img_mod,
+            _auto_import_pil=False,
+        )
+        if non_black is True:
+            return frame_num, skipped
+        if non_black is None:
+            return (frame_num, skipped) if skipped > 0 else (None, 0)
+        skipped += 1
+    return None, 0
+
+
+def _format_ffmpeg_fps(fps: float) -> str:
+    """Format a validated positive finite FPS value for ffmpeg `-framerate`."""
+    rounded = round(fps, 3)
+    if rounded > 0.0:
+        return str(rounded)
+    text = f"{fps:.10f}".rstrip("0").rstrip(".")
+    return text if text and text != "0" else f"{fps:.16f}".rstrip("0").rstrip(".")
+
+
 def encode_frames_to_mp4(
     frames_dir: Path,
     out_mp4: Path,
     *,
     fps: float = 1.0,
+    skip_black: bool = False,
+    canvas_min_x: int = CANVAS_MIN_X,
+    pil_image_mod: Any | None = None,
+    _auto_import_pil: bool = True,
     runner: CommandRunner = run_command,
     which_fn: WhichFn = shutil.which,
 ) -> tuple[bool, str | None]:
     """Encode captured `frame_0001.jpg` / `frame_0001.png` screenshots into an H.264 MP4 using `ffmpeg`."""
+    if fps is None:
+        raise RunnerError("--mp4-fps must be a positive finite number")
+    clean_fps = validate_mp4_fps(fps)
+    assert clean_fps is not None
     ffmpeg = which_fn("ffmpeg")
     if not ffmpeg:
         return False, "ffmpeg not found on PATH; skipping MP4 encoding"
     if not frames_dir.is_dir():
         return False, "no captured JPEG frames found for MP4 encoding"
-    if any(frames_dir.glob("frame_*.jpg")):
+    jpg_frames = _list_numbered_frames(frames_dir, "jpg")
+    png_frames = _list_numbered_frames(frames_dir, "png") if not jpg_frames else []
+    if jpg_frames:
         pattern = "frame_%04d.jpg"
-    elif any(frames_dir.glob("frame_*.png")):
+        numbered_frames = jpg_frames
+    elif png_frames:
         pattern = "frame_%04d.png"
+        numbered_frames = png_frames
     else:
         return False, "no captured JPEG frames found for MP4 encoding"
-    rate = max(1.0, round(fps, 3))
+
+    start_number: int | None = None
+    if skip_black:
+        first_non_black, skipped_count = find_first_non_black_frame_number(
+            numbered_frames,
+            canvas_min_x=canvas_min_x,
+            pil_image_mod=pil_image_mod,
+            _auto_import_pil=_auto_import_pil,
+        )
+        if first_non_black is not None and skipped_count > 0:
+            start_number = first_non_black
+
+    rate_str = _format_ffmpeg_fps(clean_fps)
     cmd = [
         ffmpeg,
         "-y",
         "-framerate",
-        str(rate),
+        rate_str,
+    ]
+    if start_number is not None:
+        cmd += ["-start_number", str(start_number)]
+    cmd += [
         "-i",
         str(frames_dir / pattern),
         "-c:v",
@@ -1885,6 +1999,9 @@ def run_browser_session(
     capture_frames: bool | Path | str | None,
     frame_interval_s: float,
     encode_mp4: bool,
+    mp4_fps: float | None = None,
+    mp4_skip_black: bool = False,
+    hide_hud: bool = False,
     capture_frames_dir: Path | None = None,
     capture_interval_sec: float | None = None,
     input_script: str | None = None,
@@ -1904,6 +2021,10 @@ def run_browser_session(
     cdp_port = find_free_port(host)
     clean_input_script = validate_input_script_preset(input_script)
     clean_threshold_mb = validate_stream_threshold_mb(stream_threshold_mb)
+    clean_mp4_fps = validate_mp4_fps(mp4_fps)
+    effective_hide_hud = bool(hide_hud)
+    effective_mp4_skip_black = bool(mp4_skip_black)
+    effective_canvas_min_x = 0 if effective_hide_hud else CANVAS_MIN_X
     target_url = build_target_url(
         host,
         server_port,
@@ -1911,6 +2032,7 @@ def run_browser_session(
         input_script=clean_input_script,
         stream_shaders=stream_shaders,
         stream_threshold_mb=clean_threshold_mb,
+        hide_hud=effective_hide_hud,
     )
 
     if capture_frames_dir is not None:
@@ -1987,6 +2109,9 @@ def run_browser_session(
         boot_options=dict(boot_options) if boot_options is not None else None,
         capture_frames_enabled=want_frames,
         capture_frames_dir=repo_relative_label(frames_dir, repo) if want_frames else None,
+        hide_hud=effective_hide_hud,
+        mp4_fps=clean_mp4_fps,
+        mp4_skip_black=effective_mp4_skip_black,
     )
     server_proc: Any = None
     chrome_proc: Any = None
@@ -2066,7 +2191,7 @@ def run_browser_session(
                     if pil_image_mod is not None:
                         non_black = check_canvas_non_black(
                             raw_bytes,
-                            canvas_min_x=CANVAS_MIN_X,
+                            canvas_min_x=effective_canvas_min_x,
                             pil_image_mod=pil_image_mod,
                             _auto_import_pil=False,
                         )
@@ -2198,11 +2323,19 @@ def run_browser_session(
             result.exit_code = 0
 
         if encode_mp4:
-            fps = 1.0 / max(effective_frame_interval, 0.1)
+            effective_mp4_fps = (
+                clean_mp4_fps
+                if clean_mp4_fps is not None
+                else max(1.0, round(1.0 / max(effective_frame_interval, 0.1), 3))
+            )
             ok_mp4, mp4_warn = encode_frames_to_mp4(
                 frames_dir,
                 run_dir / "capture.mp4",
-                fps=fps,
+                fps=effective_mp4_fps,
+                skip_black=effective_mp4_skip_black,
+                canvas_min_x=effective_canvas_min_x,
+                pil_image_mod=pil_image_mod,
+                _auto_import_pil=False,
                 runner=runner,
                 which_fn=which_fn,
             )
@@ -2387,6 +2520,9 @@ def build_telemetry_payload(
     stream_shaders: bool = False,
     stream_threshold_mb: float | None = None,
     boot_options: Mapping[str, Any] | None = None,
+    hide_hud: bool = False,
+    mp4_fps: float | None = None,
+    mp4_skip_black: bool = False,
 ) -> dict[str, Any]:
     """Build sanitized `telemetry.json` artifact."""
     probe = session.final_probe if isinstance(session.final_probe, Mapping) else {}
@@ -2402,6 +2538,9 @@ def build_telemetry_payload(
         stream_shaders or session.stream_shaders or effective_stream_threshold_mb is not None
     )
     effective_boot_options = boot_options if boot_options is not None else session.boot_options
+    effective_hide_hud = bool(hide_hud or session.hide_hud)
+    effective_mp4_fps = mp4_fps if mp4_fps is not None else session.mp4_fps
+    effective_mp4_skip_black = bool(mp4_skip_black or session.mp4_skip_black)
     summary: dict[str, Any] = {
         "realPackDrawCount": gpu_counts["realPackDrawCount"],
         "fallbackDrawCount": gpu_counts["fallbackDrawCount"],
@@ -2422,6 +2561,7 @@ def build_telemetry_payload(
             "preset": preset,
             "smoke": smoke,
             "headless": headless,
+            "hide_hud": effective_hide_hud,
             "inputScript": effective_input_script,
             "stream_shaders": effective_stream_shaders,
             "stream_threshold_mb": effective_stream_threshold_mb,
@@ -2444,6 +2584,8 @@ def build_telemetry_payload(
             "nonBlackCanvasFrames": session.non_black_canvas_frames,
             "capture_frames_dir": session.capture_frames_dir,
             "mp4": session.mp4_path,
+            "mp4_fps": effective_mp4_fps,
+            "mp4_skip_black": effective_mp4_skip_black,
             "page_error_count": len(session.page_errors),
             "warnings": list(session.warnings),
         }
@@ -2599,6 +2741,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="positive finite seconds between PNG screenshots when --capture-frames <dir> is set (default 2.0)",
     )
     p.add_argument("--mp4", action="store_true", help="encode captured frames to capture.mp4 via ffmpeg")
+    p.add_argument(
+        "--mp4-fps",
+        type=float,
+        default=None,
+        metavar="FPS",
+        help="positive finite framerate for capture.mp4 via ffmpeg (default derived from frame capture interval)",
+    )
+    p.add_argument(
+        "--mp4-skip-black",
+        action="store_true",
+        help="omit leading black-only boot frames when building capture.mp4 via ffmpeg",
+    )
+    p.add_argument(
+        "--hide-hud",
+        action="store_true",
+        help="append hud=0 to the target URL for clean fullscreen captures without the HUD card",
+    )
     p.add_argument("--baseline", help="earlier run (name in runs-dir or directory path) to compare against")
     p.add_argument("--ignore", action="append", default=[], metavar="PATTERN", help="compare_boot_reports --ignore")
     p.add_argument("--time-tolerance", type=float, metavar="REL", help="compare_boot_reports --time-tolerance")
@@ -2609,7 +2768,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         metavar="PRESET",
         help=(
             "sanitized scripted-input preset appended as ?inputScript=<preset> "
-            "(allowed: start-screen, menu-flow, calibration-skip, intro-watch)"
+            "(allowed: start-screen, menu-flow, calibration-skip, intro-watch, "
+            "legal-notices, chrome-menu-flow)"
         ),
     )
     p.add_argument(
@@ -2712,6 +2872,9 @@ def _run(
         raise RunnerError("--frame-interval-s must be > 0")
     capture_interval_sec = validate_capture_interval_sec(args.capture_interval_sec)
     capture_frames_enabled, capture_frames_dir = validate_capture_frames_arg(args.capture_frames, repo)
+    mp4_fps = validate_mp4_fps(args.mp4_fps)
+    mp4_skip_black = bool(args.mp4_skip_black)
+    hide_hud = bool(args.hide_hud)
     if args.jobs < 1:
         raise RunnerError("--jobs must be >= 1")
 
@@ -2834,6 +2997,7 @@ def _run(
             input_script=input_script,
             stream_shaders=stream_shaders,
             stream_threshold_mb=stream_threshold_mb,
+            hide_hud=hide_hud,
         )
         dry_payload = sanitize_value(
             {
@@ -2843,6 +3007,7 @@ def _run(
                 "run_dir": repo_relative_label(run_dir, repo),
                 "duration_s": duration_s,
                 "headless": args.headless,
+                "hide_hud": hide_hud,
                 "send_input": send_input,
                 "input_script": input_script,
                 "inputScript": input_script,
@@ -2856,6 +3021,8 @@ def _run(
                 "capture_frames_dir": repo_relative_label(capture_frames_dir, repo) if capture_frames_dir is not None else None,
                 "capture_interval_sec": capture_interval_sec,
                 "mp4": bool(args.mp4),
+                "mp4_fps": mp4_fps,
+                "mp4_skip_black": mp4_skip_black,
                 "trust_build": bool(args.trust_build),
                 "port": preview_port,
                 "chrome_found": chrome_path is not None,
@@ -2925,6 +3092,9 @@ def _run(
         capture_interval_sec=capture_interval_sec,
         frame_interval_s=float(args.frame_interval_s),
         encode_mp4=bool(args.mp4),
+        mp4_fps=mp4_fps,
+        mp4_skip_black=mp4_skip_black,
+        hide_hud=hide_hud,
         input_script=input_script,
         stream_shaders=stream_shaders,
         stream_threshold_mb=stream_threshold_mb,
@@ -2952,6 +3122,9 @@ def _run(
         stream_shaders=stream_shaders,
         stream_threshold_mb=stream_threshold_mb,
         boot_options=resolved_boot_options,
+        hide_hud=hide_hud,
+        mp4_fps=mp4_fps,
+        mp4_skip_black=mp4_skip_black,
     )
     (run_dir / "telemetry.json").write_text(json.dumps(telemetry_payload, indent=2) + "\n", encoding="utf-8")
 
@@ -2962,6 +3135,7 @@ def _run(
             "name": name,
             "duration_s": duration_s,
             "headless": bool(args.headless),
+            "hide_hud": hide_hud,
             "send_input": send_input,
             "input_script": input_script,
             "inputScript": input_script,
@@ -2977,6 +3151,8 @@ def _run(
             "capturedFrames": len(session.captured_frames),
             "nonBlackCanvasFrames": session.non_black_canvas_frames,
             "mp4": bool(args.mp4),
+            "mp4_fps": mp4_fps,
+            "mp4_skip_black": mp4_skip_black,
             "trust_build": bool(args.trust_build),
             "chrome": basename_label(chrome_path),
             "plan": sanitized_plan,
