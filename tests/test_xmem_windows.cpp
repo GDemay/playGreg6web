@@ -7,6 +7,7 @@
 #include <cstring>
 #include <vector>
 
+#include "os/ucrt_bridge.h"
 #include "os/vmem.h"
 #include "os/win32_kernel.h"
 #include "os/xbox_scarlett.h"
@@ -533,6 +534,28 @@ void test_native_shared_view_write_tracking() {
             CHECK(a[0x80] == 0x5a && a[0x80 + 63] == 0x5a && c[0x80] == 0x5a);
             CHECK(take(cur, a, 2 * k64K) && pages.size() == k64K / kWrittenPageSize && pages.front() == 0);
             CHECK(take(cur, a, 2 * k64K) && pages.empty());
+        }
+        std::remove(path);
+    }
+    // The same through the guest CRT entry points: pg6_crt_fread into an armed page succeeds, and a
+    // guest stdio buffer on an armed page (pg6_crt_setvbuf) is never handed to the kernel.
+    {
+        const char* path = "test_xmem_windows_r40b.tmp";
+        if (std::FILE* f = std::fopen(path, "wb")) {
+            const std::vector<uint8_t> fill(8192, 0x6b);
+            std::fwrite(fill.data(), 1, fill.size(), f);
+            std::fclose(f);
+        }
+        std::FILE* f = std::fopen(path, "rb");
+        CHECK(f != nullptr);
+        if (f != nullptr) {
+            CHECK(take(cur, a, 2 * k64K));  // (arms the views)
+            CHECK(pg6_crt_setvbuf(f, reinterpret_cast<char*>(a + 0x2000), 0 /*_IOFBF*/, 4096) == 0);
+            uint8_t host[16] = {};
+            CHECK(pg6_crt_fread(host, 1, sizeof(host), f) == sizeof(host) && host[0] == 0x6b);
+            CHECK(pg6_crt_fread(a + 0x100, 1, 64, f) == 64);
+            CHECK(a[0x100] == 0x6b && a[0x100 + 63] == 0x6b);
+            std::fclose(f);
         }
         std::remove(path);
     }
