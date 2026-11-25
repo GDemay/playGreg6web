@@ -9,6 +9,7 @@
   const DEFAULT_MAX_POOL_BYTES = 512 * 1024 * 1024; // 512 MiB (accommodates simultaneous 4K scene plane 1 + 1080p UI plane 0)
   const DEFAULT_IDLE_FRAME_TTL = 8;
   const DEFAULT_OVERSIZED_TARGET_BYTES = 24 * 1024 * 1024; // 24 MiB (separates 4K targets >= 31.6 MiB from 1080p targets <= 15.8 MiB)
+  const DEFAULT_OVERSIZED_RECLAIM_IDLE_FRAMES = 2;
   const DEFAULT_MAX_TEXTURE_DIMENSION_2D = 8192;
   const DEFAULT_MAX_TEXTURE_ARRAY_LAYERS = 256;
 
@@ -986,6 +987,8 @@
       this._idleBuckets = new Map();
       /** @type {Map<number, object>} Idle records in insertion order (oldest = LRU) */
       this._idleLru = new Map();
+      /** @type {Set<object>} Idle records released via releaseTransient() during the current frame */
+      this._transientAliases = new Set();
       /** @type {WeakMap<object, { id: number, leaseToken: number }>} Per-acquire handle tokens */
       this._handleTokens = new WeakMap();
       /** @type {WeakSet<object>} Tracks GPUTexture instances already destroyed to guarantee no double-destroy */
@@ -998,6 +1001,7 @@
       this._hits = 0;
       this._misses = 0;
       this._transientReuseCount = 0;
+      this._intraFrameAliasHits = 0;
       this._viewsCached = 0;
       this._viewCacheHits = 0;
       this._viewCacheMisses = 0;
@@ -1008,6 +1012,7 @@
       this._budgetEvictions = 0;
       this._idleEvictions = 0;
       this._oversizedEvictions = 0;
+      this._reclaimedOversizedBytes = 0;
       this._leakedReleases = 0;
       this._dimensionClampCount = 0;
       this._formatNormalizeCount = 0;
@@ -1110,6 +1115,9 @@
       record.active = false;
       record.retireOnRelease = false;
       record.leaseToken = 0;
+      record.releasedFrame = -1;
+      record.transientAliasFrame = -1;
+      this._transientAliases.delete(record);
       this._allEntries.delete(record.id);
 
       const removedViews =
@@ -1366,6 +1374,9 @@
       record.active = false;
       record.leaseToken = 0;
       record.lastUsedFrame = frameIndex;
+      record.releasedFrame = frameIndex;
+      record.transientAliasFrame = -1;
+      this._transientAliases.delete(record);
       this._activeEntries.delete(record.id);
       this._activeBytes = Math.max(0, this._activeBytes - record.byteSize);
       this._idleBytes += record.byteSize;
@@ -1377,6 +1388,69 @@
       }
       bucket.push(record);
       this._idleLru.set(record.id, record);
+    }
+
+    _isCompatibleTransientAlias(candidate, reqDesc) {
+      if (!candidate || candidate.transientAliasFrame !== this._currentFrame) {
+        return false;
+      }
+      const d = candidate.desc;
+      if (
+        d.dimension !== reqDesc.dimension ||
+        d.width !== reqDesc.width ||
+        d.height !== reqDesc.height ||
+        d.depthOrArrayLayers !== reqDesc.depthOrArrayLayers ||
+        d.format !== reqDesc.format ||
+        d.sampleCount !== reqDesc.sampleCount ||
+        d.mipLevelCount !== reqDesc.mipLevelCount
+      ) {
+        return false;
+      }
+      if ((d.usage & reqDesc.usage) !== reqDesc.usage) {
+        return false;
+      }
+      if (reqDesc.viewFormats.length > 0) {
+        for (let i = 0; i < reqDesc.viewFormats.length; i += 1) {
+          if (!d.viewFormats.includes(reqDesc.viewFormats[i])) {
+            return false;
+          }
+        }
+      }
+      return true;
+    }
+
+    _claimIdleRecord(record, label, sanitized, isIntraFrame) {
+      this._transientAliases.delete(record);
+      record.transientAliasFrame = -1;
+      record.active = true;
+      record.lastUsedFrame = this._currentFrame;
+      if (typeof label === 'string' && label.length > 0) {
+        record.label = label;
+      }
+
+      this._activeEntries.set(record.id, record);
+      this._idleBytes = Math.max(0, this._idleBytes - record.byteSize);
+      this._activeBytes += record.byteSize;
+      this._hits += 1;
+      this._transientReuseCount += 1;
+      if (isIntraFrame) {
+        this._intraFrameAliasHits += 1;
+      }
+      if (record.view !== null) {
+        this._viewCacheHits += 1;
+      }
+
+      if (sanitized.dimensionClamped) {
+        this._dimensionClampCount += 1;
+      }
+      if (sanitized.formatNormalized) {
+        this._formatNormalizeCount += 1;
+      }
+      if (sanitized.sampleCountNormalized) {
+        this._sampleCountNormalizeCount += 1;
+      }
+
+      return this._makeHandle(record, true);
     }
 
     _makeHandle(record, reused) {
@@ -1440,8 +1514,8 @@
       const key = makeRenderTargetKey(normalizedDesc);
       const byteSize = estimateRenderTargetBytes(normalizedDesc);
 
-      // 1. Check idle bucket for an exact descriptor match (MRU pop lets unused duplicates age out).
-      //    Skip and clean up any invalidated or externally-destroyed records so stale views are never returned.
+      // 1a. Check idle bucket for an exact descriptor match (MRU pop lets unused duplicates age out).
+      //     Skip and clean up any invalidated or externally-destroyed records so stale views are never returned.
       const bucket = this._idleBuckets.get(key);
       if (bucket && bucket.length > 0) {
         while (bucket.length > 0) {
@@ -1450,6 +1524,7 @@
             this._idleBuckets.delete(key);
           }
           this._idleLru.delete(record.id);
+          this._transientAliases.delete(record);
 
           if (!this._isRecordReusable(record)) {
             this._idleBytes = Math.max(0, this._idleBytes - record.byteSize);
@@ -1462,32 +1537,33 @@
             continue;
           }
 
-          record.active = true;
-          record.lastUsedFrame = this._currentFrame;
-          if (typeof label === 'string' && label.length > 0) {
-            record.label = label;
-          }
+          const isIntraFrame =
+            record.releasedFrame === this._currentFrame ||
+            record.transientAliasFrame === this._currentFrame;
+          return this._claimIdleRecord(record, label, sanitized, isIntraFrame);
+        }
+      }
 
-          this._activeEntries.set(record.id, record);
-          this._idleBytes = Math.max(0, this._idleBytes - record.byteSize);
-          this._activeBytes += record.byteSize;
-          this._hits += 1;
-          this._transientReuseCount += 1;
-          if (record.view !== null) {
-            this._viewCacheHits += 1;
+      // 1b. Check compatible intra-frame transient targets released via releaseTransient()
+      //     (MRU scan: matching geometry/format/sampleCount/mips with superset usage & viewFormats).
+      if (this._transientAliases.size > 0) {
+        const candidates = Array.from(this._transientAliases);
+        for (let i = candidates.length - 1; i >= 0; i -= 1) {
+          const candidate = candidates[i];
+          if (candidate.transientAliasFrame !== this._currentFrame) {
+            this._transientAliases.delete(candidate);
+            continue;
           }
-
-          if (sanitized.dimensionClamped) {
-            this._dimensionClampCount += 1;
+          if (!this._isRecordReusable(candidate)) {
+            this._evictIdleRecord(candidate);
+            continue;
           }
-          if (sanitized.formatNormalized) {
-            this._formatNormalizeCount += 1;
+          if (!this._isCompatibleTransientAlias(candidate, normalizedDesc)) {
+            continue;
           }
-          if (sanitized.sampleCountNormalized) {
-            this._sampleCountNormalizeCount += 1;
-          }
-
-          return this._makeHandle(record, true);
+          this._idleLru.delete(candidate.id);
+          this._removeFromIdleBucket(candidate);
+          return this._claimIdleRecord(candidate, label, sanitized, true);
         }
       }
 
@@ -1551,6 +1627,8 @@
         destroyed: false,
         retireOnRelease: false,
         lastUsedFrame: this._currentFrame,
+        releasedFrame: -1,
+        transientAliasFrame: -1,
         leaseToken: 0,
       };
 
@@ -1639,6 +1717,42 @@
     }
 
     /**
+     * Mark an acquired transient render target available for immediate intra-frame aliasing
+     * by later non-overlapping passes in the same frame (e.g., G-buffer -> lighting ->
+     * post-process -> UI) without allocating duplicate 4K textures. Supports exact descriptor
+     * reuse as well as compatible superset `usage` / `viewFormats` aliasing within the current
+     * frame. Safe against duplicate or stale handle releases.
+     *
+     * @param {object | number} entryOrId
+     * @returns {boolean} True if an active target was released; false if already idle/unknown/stale.
+     */
+    releaseTransient(entryOrId) {
+      this._assertNotDestroyed();
+
+      const { id, expectedLeaseToken } = this._resolveEntryId(entryOrId, 'releaseTransient');
+
+      const record = this._allEntries.get(id);
+      if (!record || !record.active) {
+        return false;
+      }
+
+      // Guard against stale handle double-release stealing a newer pass's active lease.
+      if (expectedLeaseToken !== null && record.leaseToken !== expectedLeaseToken) {
+        return false;
+      }
+
+      if (!this._isRecordReusable(record)) {
+        this._retireActiveRecord(record);
+        return true;
+      }
+
+      this._moveActiveToIdle(record, this._currentFrame);
+      record.transientAliasFrame = this._currentFrame;
+      this._transientAliases.add(record);
+      return true;
+    }
+
+    /**
      * End the current frame epoch:
      * 1. Handle any leaked (still-active) render targets: auto-release back into the idle pool
      *    (or retire/destroy if invalidated during resize) when `autoReleaseLeaked` is enabled,
@@ -1660,6 +1774,7 @@
 
       const endedFrame = this._currentFrame;
       this._currentFrame += 1;
+      this._transientAliases.clear();
 
       let leakedCount = 0;
       let autoReleasedCount = 0;
@@ -1791,6 +1906,40 @@
     }
 
     /**
+     * Aggressively destroy and reclaim idle oversized render targets (`byteSize >= oversizedTargetBytes`)
+     * whose idle age satisfies `currentFrame - entry.lastUsedFrame >= maxIdleFrames`
+     * (e.g., across Start Screen -> 4K Bink2 -> Main Menu -> In-Game scene/resolution transitions).
+     * Never destroys currently active/checked-out targets or non-oversized targets.
+     *
+     * @param {number} [maxIdleFrames=2] Non-negative integer frame threshold.
+     * @returns {{ reclaimedCount: number, reclaimedBytes: number }}
+     */
+    reclaimOversizedIdle(maxIdleFrames = DEFAULT_OVERSIZED_RECLAIM_IDLE_FRAMES) {
+      this._assertNotDestroyed();
+      assertNonNegativeInteger(maxIdleFrames, 'maxIdleFrames');
+
+      let reclaimedCount = 0;
+      let reclaimedBytes = 0;
+      const idleRecords = Array.from(this._idleLru.values());
+      for (let i = 0; i < idleRecords.length; i += 1) {
+        const record = idleRecords[i];
+        if (
+          this._isOversizedRecord(record) &&
+          this._currentFrame - record.lastUsedFrame >= maxIdleFrames
+        ) {
+          const bytes = record.byteSize;
+          if (this._evictIdleRecord(record, 'idle')) {
+            reclaimedCount += 1;
+            reclaimedBytes += bytes;
+            this._reclaimedOversizedBytes += bytes;
+          }
+        }
+      }
+
+      return { reclaimedCount, reclaimedBytes };
+    }
+
+    /**
      * Destroy all currently idle pooled render targets (e.g., on viewport/swapchain resize)
      * while leaving any currently active in-flight targets intact and flagging them for
      * immediate destruction on release so stale pre-resize targets are never reused.
@@ -1811,6 +1960,7 @@
 
       this._idleBuckets.clear();
       this._idleLru.clear();
+      this._transientAliases.clear();
       this._idleBytes = 0;
 
       // Mark in-flight active records so they are retired/destroyed cleanly on release
@@ -1856,7 +2006,10 @@
       const budgetEvictions = sanitizeNonNegativeCounter(this._budgetEvictions);
       const idleEvictions = sanitizeNonNegativeCounter(this._idleEvictions);
       const oversizedEvictions = sanitizeNonNegativeCounter(this._oversizedEvictions);
+      const reclaimedOversizedBytes = sanitizeNonNegativeCounter(this._reclaimedOversizedBytes);
       const transientReuseCount = sanitizeNonNegativeCounter(this._transientReuseCount);
+      const intraFrameAliasHits = sanitizeNonNegativeCounter(this._intraFrameAliasHits);
+      const vramBudgetUtilization = clampUnitRate(totalBytes, this._maxPoolBytes);
 
       return {
         hits: poolHits,
@@ -1864,6 +2017,7 @@
         poolHits,
         poolMisses,
         transientReuseCount,
+        intraFrameAliasHits,
         viewsCached: sanitizeNonNegativeCounter(this._viewsCached),
         viewCacheHits,
         viewCacheMisses,
@@ -1884,6 +2038,7 @@
         peakEstimatedBytes: peakVramBytes,
         peakVramBytes,
         maxPoolBytes: this._maxPoolBytes,
+        vramBudgetUtilization,
         idleFrameTtl: this._idleFrameTtl,
         oversizedTargetBytes: this._oversizedTargetBytes,
         oversizedIdleFrameTtl: this._oversizedIdleFrameTtl,
@@ -1891,6 +2046,7 @@
         budgetEvictions,
         idleEvictions,
         oversizedEvictions,
+        reclaimedOversizedBytes,
         leakedReleases: sanitizeNonNegativeCounter(this._leakedReleases),
         dimensionClampCount: sanitizeNonNegativeCounter(this._dimensionClampCount),
         formatNormalizeCount: sanitizeNonNegativeCounter(this._formatNormalizeCount),
@@ -1910,6 +2066,7 @@
       this._hits = 0;
       this._misses = 0;
       this._transientReuseCount = 0;
+      this._intraFrameAliasHits = 0;
       this._viewCacheHits = 0;
       this._viewCacheMisses = 0;
       this._peakBytes =
@@ -1919,6 +2076,7 @@
       this._budgetEvictions = 0;
       this._idleEvictions = 0;
       this._oversizedEvictions = 0;
+      this._reclaimedOversizedBytes = 0;
       this._leakedReleases = 0;
       this._dimensionClampCount = 0;
       this._formatNormalizeCount = 0;
@@ -1946,6 +2104,7 @@
       this._activeEntries.clear();
       this._idleBuckets.clear();
       this._idleLru.clear();
+      this._transientAliases.clear();
       this._activeBytes = 0;
       this._idleBytes = 0;
       this._viewsCached = 0;
