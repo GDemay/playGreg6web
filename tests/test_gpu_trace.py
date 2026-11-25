@@ -1465,5 +1465,534 @@ class TestGpuTraceV2Packets(unittest.TestCase):
         self.assertFalse(gpu_trace.decode_stream(short).packets[0].valid)
 
 
+def _make_pipeline_key(
+    *,
+    vs_shader: int = 0,
+    ps_shader: int = 0,
+    color_formats: list[int | None] = (27,),  # bgra8unorm
+    depth_format: int = 0,
+) -> bytes:
+    """Build a minimal valid 376-byte GpuRenderPipelineKey for audit tests."""
+    key = bytearray(gpu_trace.RENDER_PIPELINE_KEY_SIZE)
+    struct.pack_into("<QQII", key, 0, vs_shader, ps_shader, 0, len(color_formats))
+    for i, fmt in enumerate(color_formats):
+        if fmt is not None and fmt != 0:
+            struct.pack_into("<BBBxBBBxBBBx", key, 24 + 12 * i, fmt, 0, 0xF, 0, 1, 0, 0, 1, 0)
+    if depth_format:
+        struct.pack_into("<BBBx", key, 120, depth_format, 1, 4)  # less-equal
+    struct.pack_into("<IIB3x", key, 160, 1, 0xFFFFFFFF, 0)  # multisample count=1
+    return bytes(key)
+
+
+class TestGpuTraceAudits(unittest.TestCase):
+    def test_shader_summary_ranking_active_vs_unused(self) -> None:
+        unused_wgsl = "@fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(0.0); }"
+        unused_hash = f"0x{gpu_trace.fnv1a_64(unused_wgsl.encode('utf-8')):016x}"
+        v1_vs_hash = f"0x{gpu_trace.fnv1a_64(SAMPLE_VS_WGSL.encode('utf-8')):016x}"
+
+        stream = b"".join(
+            [
+                # Shader modules: v2 (key hashes), v1 inline, v1 hash-ref, and unused modules.
+                gpu_trace.encode_create_shader_module(1, gpu_trace.GpuShaderStage.Vertex, SAMPLE_VS_WGSL),
+                gpu_trace.encode_create_shader_module(2, gpu_trace.GpuShaderStage.Fragment, SAMPLE_FS_WGSL),
+                gpu_trace.encode_create_shader_module(3, gpu_trace.GpuShaderStage.Compute, ""),
+                gpu_trace.encode_create_shader_module(4, gpu_trace.GpuShaderStage.Vertex, SAMPLE_VS_WGSL),
+                gpu_trace.encode_create_shader_module(
+                    5, gpu_trace.GpuShaderStage.Fragment, "wgpk:0x00000000cafe0005"
+                ),
+                gpu_trace.encode_create_shader_module(
+                    6, gpu_trace.GpuShaderStage.Compute, "0x00000000dead0006"
+                ),
+                gpu_trace.encode_create_shader_module(
+                    7, gpu_trace.GpuShaderStage.Fragment, unused_wgsl
+                ),
+                # Two v2 render pipelines sharing vs_shader 0x1111, different ps_shader.
+                gpu_trace.encode_create_render_pipeline2(
+                    100,
+                    1,
+                    2,
+                    0,
+                    _make_pipeline_key(vs_shader=0x1111, ps_shader=0x2222, color_formats=[27]),
+                ),
+                gpu_trace.encode_create_render_pipeline2(
+                    101,
+                    1,
+                    2,
+                    0,
+                    _make_pipeline_key(vs_shader=0x1111, ps_shader=0x2223, color_formats=[27]),
+                ),
+                # v2 compute pipeline dispatched 5 times (should rank #1).
+                gpu_trace.encode_create_compute_pipeline2(102, 3, 0, cs_shader=0x3333),
+                # v1 render pipeline drawn once.
+                gpu_trace.encode_create_render_pipeline(
+                    103, 4, 5, 12, gpu_trace.GpuPrimitiveTopology.TriangleList
+                ),
+                # v1 compute pipeline created but never dispatched.
+                gpu_trace.encode_create_compute_pipeline(104, 6),
+                gpu_trace.encode_begin_frame(),
+                gpu_trace.encode_begin_render_pass(
+                    [{"texture_id": gpu_trace.SWAPCHAIN_TEXTURE_ID, "load_op": 2, "store_op": 1}]
+                ),
+                gpu_trace.encode_set_pipeline(100),
+                gpu_trace.encode_draw(3),
+                gpu_trace.encode_draw_indexed(6),
+                gpu_trace.encode_set_pipeline(101),
+                gpu_trace.encode_draw(9),
+                gpu_trace.encode_set_pipeline(103),
+                gpu_trace.encode_draw(3),
+                gpu_trace.encode_end_render_pass(),
+                gpu_trace.encode_set_compute_pipeline(102),
+                gpu_trace.encode_dispatch_compute(1, 1, 1),
+                gpu_trace.encode_dispatch_compute(2, 1, 1),
+                gpu_trace.encode_dispatch_compute(3, 1, 1),
+                gpu_trace.encode_dispatch_compute(4, 1, 1),
+                gpu_trace.encode_dispatch_compute(5, 1, 1),
+                gpu_trace.encode_present(),
+            ]
+        )
+
+        trace = gpu_trace.decode_stream(stream, strict=True)
+        self.assertTrue(trace.ok, [d.message for d in trace.diagnostics])
+
+        summary = gpu_trace.summarize_shaders(trace)
+        self.assertEqual(summary["total_shaders"], 8)
+        self.assertEqual(summary["active_shaders"], 6)
+        self.assertEqual(summary["unused_shaders"], 2)
+        self.assertEqual(summary["total_draws"], 4)
+        self.assertEqual(summary["total_dispatches"], 5)
+        self.assertEqual(summary["unbound_draws"], 0)
+        self.assertEqual(summary["unbound_dispatches"], 0)
+
+        rows = summary["shaders"]
+        # #1: compute shader 0x3333 with 5 dispatches
+        self.assertEqual(rows[0]["shader_hash"], "0x0000000000003333")
+        self.assertEqual(rows[0]["stage"], "Compute")
+        self.assertEqual(rows[0]["pipeline_count"], 1)
+        self.assertEqual(rows[0]["draw_count"], 0)
+        self.assertEqual(rows[0]["dispatch_count"], 5)
+        self.assertEqual(rows[0]["total_executions"], 5)
+        self.assertTrue(rows[0]["active"])
+
+        # #2: shared vertex shader 0x1111 across 2 pipelines with 3 total draws (2 + 1)
+        self.assertEqual(rows[1]["shader_hash"], "0x0000000000001111")
+        self.assertEqual(rows[1]["stage"], "Vertex")
+        self.assertEqual(rows[1]["pipeline_count"], 2)
+        self.assertEqual(rows[1]["pipeline_ids"], [100, 101])
+        self.assertEqual(rows[1]["draw_count"], 3)
+        self.assertEqual(rows[1]["dispatch_count"], 0)
+
+        # #3: fragment shader 0x2222 with 2 draws
+        self.assertEqual(rows[2]["shader_hash"], "0x0000000000002222")
+        self.assertEqual(rows[2]["stage"], "Fragment")
+        self.assertEqual(rows[2]["draw_count"], 2)
+
+        # Next three have 1 draw each: 0x2223, 0xcafe0005, and v1 inline VS hash
+        one_draw_hashes = {r["shader_hash"] for r in rows[3:6]}
+        self.assertEqual(
+            one_draw_hashes,
+            {"0x0000000000002223", "0x00000000cafe0005", v1_vs_hash},
+        )
+        self.assertTrue(all(r["draw_count"] == 1 and r["active"] for r in rows[3:6]))
+
+        # Last two are unused: 0xdead0006 (attached to 1 pipeline, 0 dispatches) and unused_hash (0 pipelines)
+        self.assertEqual(rows[6]["shader_hash"], "0x00000000dead0006")
+        self.assertEqual(rows[6]["pipeline_count"], 1)
+        self.assertEqual(rows[6]["total_executions"], 0)
+        self.assertFalse(rows[6]["active"])
+
+        self.assertEqual(rows[7]["shader_hash"], unused_hash)
+        self.assertEqual(rows[7]["pipeline_count"], 0)
+        self.assertEqual(rows[7]["total_executions"], 0)
+        self.assertFalse(rows[7]["active"])
+
+        # active_shader_hashes only includes executed shaders, ordered by executions descending.
+        self.assertEqual(len(summary["active_shader_hashes"]), 6)
+        self.assertEqual(summary["active_shader_hashes"][0], "0x0000000000003333")
+        self.assertEqual(summary["active_shader_hashes"][1], "0x0000000000001111")
+        self.assertNotIn("0x00000000dead0006", summary["active_shader_hashes"])
+        self.assertNotIn(unused_hash, summary["active_shader_hashes"])
+
+        # Verify CLI --shader-summary in text and JSON, plus backwards compatibility when omitted.
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "shaders.pg6trace"
+            trace_path.write_bytes(stream)
+
+            # Default mode omits shader_summary completely.
+            buf_default = io.StringIO()
+            with redirect_stdout(buf_default):
+                rc = gpu_trace.main([str(trace_path), "--json", "--stats"])
+            self.assertEqual(rc, 0)
+            default_json = json.loads(buf_default.getvalue())
+            self.assertNotIn("shader_summary", default_json)
+            self.assertNotIn("binding_audit", default_json)
+
+            # --shader-summary --json populates "shader_summary".
+            buf_json = io.StringIO()
+            with redirect_stdout(buf_json):
+                rc = gpu_trace.main([str(trace_path), "--json", "--stats", "--shader-summary"])
+            self.assertEqual(rc, 0)
+            with_summary = json.loads(buf_json.getvalue())
+            self.assertIn("shader_summary", with_summary)
+            self.assertNotIn("binding_audit", with_summary)
+            self.assertEqual(with_summary["shader_summary"]["active_shaders"], 6)
+            self.assertEqual(
+                with_summary["shader_summary"]["shaders"][0]["shader_hash"],
+                "0x0000000000003333",
+            )
+
+            # --shader-summary text table output.
+            buf_text = io.StringIO()
+            with redirect_stdout(buf_text):
+                rc = gpu_trace.main([str(trace_path), "--stats", "--shader-summary"])
+            self.assertEqual(rc, 0)
+            text_out = buf_text.getvalue()
+            self.assertIn("Shader Summary:", text_out)
+            self.assertIn("Total: 8 | Active: 6 | Unused: 2", text_out)
+            self.assertIn("0x0000000000003333", text_out)
+            self.assertIn("0x0000000000001111", text_out)
+            self.assertIn("0x00000000dead0006", text_out)
+
+    def test_binding_audit_bind_group_layout_mismatches(self) -> None:
+        stream = b"".join(
+            [
+                gpu_trace.encode_create_bind_group_layout(
+                    100,
+                    [
+                        (0, 0x3, 0, 0),          # buffer (uniform)
+                        (1, 0x2, 2, 0, 2),       # texture (float, 2d)
+                        (2, 0x2, 1, 0),          # sampler (filtering)
+                        (3, 0x4, 3, 0, 2, 0, 16),  # storageTexture (write-only, r32float)
+                    ],
+                ),
+                # Manifest-reference layout should be skipped without false positives.
+                gpu_trace.encode_create_bind_group_layout(
+                    101,
+                    [],
+                    content_id=0xABCDEF,
+                    flags=gpu_trace.MANIFEST_REFERENCE_FLAG,
+                ),
+                # Bind group 200: every resource kind mismatched + 1 undeclared binding (@7).
+                gpu_trace.encode_create_bind_group2(
+                    200,
+                    100,
+                    [
+                        (0, gpu_trace.GpuBindResourceType.TextureView, 50),  # expected Buffer
+                        (1, gpu_trace.GpuBindResourceType.Sampler, 51),      # expected TextureView
+                        (2, gpu_trace.GpuBindResourceType.Buffer, 52),       # expected Sampler
+                        (3, gpu_trace.GpuBindResourceType.Buffer, 53),       # expected TextureView (storageTexture)
+                        (7, gpu_trace.GpuBindResourceType.Buffer, 54),       # undeclared in layout 100
+                    ],
+                ),
+                # Bind group 201: missing bindings 2 & 3 + duplicate binding 0.
+                gpu_trace.encode_create_bind_group2(
+                    201,
+                    100,
+                    [
+                        (0, gpu_trace.GpuBindResourceType.Buffer, 52),
+                        (0, gpu_trace.GpuBindResourceType.Buffer, 52),
+                        (1, gpu_trace.GpuBindResourceType.TextureView, 50),
+                    ],
+                ),
+                # Bind group 202: references unknown layout 999.
+                gpu_trace.encode_create_bind_group2(
+                    202,
+                    999,
+                    [(0, gpu_trace.GpuBindResourceType.Buffer, 52)],
+                ),
+                # Bind group 203: references manifest-ref layout 101 -> skipped cleanly.
+                gpu_trace.encode_create_bind_group2(
+                    203,
+                    101,
+                    [(0, gpu_trace.GpuBindResourceType.Buffer, 52)],
+                ),
+            ]
+        )
+
+        trace = gpu_trace.decode_stream(stream, strict=True)
+        self.assertTrue(trace.ok)
+
+        audit = gpu_trace.audit_bindings(trace)
+        self.assertFalse(audit["ok"])
+        self.assertEqual(audit["bind_group_layouts_seen"], 2)
+        self.assertEqual(audit["manifest_reference_layouts"], 1)
+        self.assertEqual(audit["bind_groups_audited"], 4)
+        self.assertEqual(audit["bind_groups_skipped_manifest_layout"], 1)
+        self.assertEqual(audit["render_pass_mismatch_count"], 0)
+        self.assertEqual(
+            audit["bind_group_mismatch_counts"],
+            {
+                "duplicate_binding": 1,
+                "missing_binding": 2,
+                "resource_kind_mismatch": 4,
+                "undeclared_binding": 1,
+                "unknown_layout": 1,
+            },
+        )
+        self.assertEqual(audit["bind_group_mismatch_count"], 9)
+        self.assertEqual(audit["total_mismatches"], 9)
+
+        kind_mismatches = [
+            m for m in audit["bind_group_mismatches"] if m["kind"] == "resource_kind_mismatch"
+        ]
+        self.assertEqual(
+            [(m["binding"], m["expected_layout_type"], m["actual_resource_type"]) for m in kind_mismatches],
+            [
+                (0, "buffer", "TextureView"),
+                (1, "texture", "Sampler"),
+                (2, "sampler", "Buffer"),
+                (3, "storageTexture", "Buffer"),
+            ],
+        )
+
+        text = gpu_trace.format_trace_text(trace, stats_only=True, binding_audit=True)
+        self.assertIn("Binding Audit:", text)
+        self.assertIn("ISSUES FOUND (9 mismatch(es))", text)
+        self.assertIn("[resource_kind_mismatch]", text)
+        self.assertIn("[undeclared_binding]", text)
+        self.assertIn("[missing_binding]", text)
+        self.assertIn("[unknown_layout]", text)
+
+    def test_binding_audit_render_pass_format_mismatches_and_swapchain_histogram(self) -> None:
+        stream = b"".join(
+            [
+                # v1 texture: rgba16float
+                gpu_trace.encode_create_texture(
+                    50, 1280, 720, texture_format=gpu_trace.GpuTextureFormat.Rgba16Float, usage_flags=0x10
+                ),
+                # v2 textures: rgba8unorm (22), depth32float (48), bgra8unorm (27)
+                gpu_trace.encode_create_texture2(51, 1280, 720, 22, usage_flags=0x10),
+                gpu_trace.encode_create_texture2(52, 1280, 720, 48, usage_flags=0x10),
+                gpu_trace.encode_create_texture2(53, 1280, 720, 27, usage_flags=0x10),
+                # Pipeline 100: targets [bgra8unorm (27), rgba8unorm (22)], depth depth24plus-stencil8 (47)
+                gpu_trace.encode_create_render_pipeline2(
+                    100, 1, 2, 0, _make_pipeline_key(color_formats=[27, 22], depth_format=47)
+                ),
+                # Pipeline 101: targets [rgba16float (40)] only, no depth-stencil
+                gpu_trace.encode_create_render_pipeline2(
+                    101, 1, 2, 0, _make_pipeline_key(color_formats=[40], depth_format=0)
+                ),
+                # Pipeline 102: targets [bgra8unorm (27)] for swapchain
+                gpu_trace.encode_create_render_pipeline2(
+                    102, 1, 2, 0, _make_pipeline_key(color_formats=[27], depth_format=0)
+                ),
+                # Pipeline 103: targets [rgba8unorm (22)] for swapchain
+                gpu_trace.encode_create_render_pipeline2(
+                    103, 1, 2, 0, _make_pipeline_key(color_formats=[22], depth_format=0)
+                ),
+                gpu_trace.encode_begin_frame(),
+                # Pass 1: tex#50 (rgba16float), tex#51 (rgba8unorm), ds=tex#52 (depth32float)
+                gpu_trace.encode_begin_render_pass(
+                    [
+                        {"texture_id": 50, "load_op": 2, "store_op": 1},
+                        {"texture_id": 51, "load_op": 2, "store_op": 1},
+                    ],
+                    {"texture_id": 52, "depth_load_op": 2, "depth_store_op": 1},
+                ),
+                # Draw 1 (pipeline 100): slot 0 mismatch (rgba16float vs bgra8unorm) + depth mismatch (depth32float vs depth24plus-stencil8)
+                gpu_trace.encode_set_pipeline(100),
+                gpu_trace.encode_draw(3),
+                # Draw 2 (pipeline 101): slot 1 missing in pipeline + depth presence mismatch
+                gpu_trace.encode_set_pipeline(101),
+                gpu_trace.encode_draw_indexed(6),
+                gpu_trace.encode_end_render_pass(),
+                # Pass 2: tex#53 (bgra8unorm) only, no depth
+                gpu_trace.encode_begin_render_pass(
+                    [{"texture_id": 53, "load_op": 2, "store_op": 1}]
+                ),
+                # Draw 3 (pipeline 100): slot 1 missing in render pass + depth presence mismatch
+                gpu_trace.encode_set_pipeline(100),
+                gpu_trace.encode_draw(3),
+                gpu_trace.encode_end_render_pass(),
+                # Pass 3: swapchain (default view) drawn with bgra8unorm x2 and rgba8unorm x1 -> format histogram conflict
+                gpu_trace.encode_begin_render_pass(
+                    [{"texture_id": gpu_trace.SWAPCHAIN_TEXTURE_ID, "load_op": 2, "store_op": 1}]
+                ),
+                gpu_trace.encode_set_pipeline(102),
+                gpu_trace.encode_draw(3),
+                gpu_trace.encode_draw(6),
+                gpu_trace.encode_set_pipeline(103),
+                gpu_trace.encode_draw(3),
+                gpu_trace.encode_end_render_pass(),
+                # Pass 4: swapchain with explicit view format bgra8unorm (27), drawn with pipeline 103 (rgba8unorm)
+                gpu_trace.encode_begin_render_pass(
+                    [
+                        {
+                            "texture_id": gpu_trace.SWAPCHAIN_TEXTURE_ID,
+                            "load_op": 1,
+                            "store_op": 1,
+                            "view": gpu_trace.encode_texture_view_desc(texture_format=27),
+                        }
+                    ]
+                ),
+                gpu_trace.encode_set_pipeline(103),
+                gpu_trace.encode_draw(3),
+                gpu_trace.encode_end_render_pass(),
+                gpu_trace.encode_present(),
+            ]
+        )
+
+        trace = gpu_trace.decode_stream(stream, strict=True)
+        self.assertTrue(trace.ok, [d.message for d in trace.diagnostics])
+
+        audit = gpu_trace.audit_bindings(trace)
+        self.assertFalse(audit["ok"])
+        self.assertEqual(audit["bind_group_mismatch_count"], 0)
+        self.assertEqual(audit["render_passes_seen"], 4)
+        self.assertEqual(audit["draws_audited"], 7)
+        self.assertEqual(
+            audit["render_pass_mismatch_counts"],
+            {
+                "color_format_mismatch": 2,
+                "depth_stencil_format_mismatch": 1,
+                "depth_stencil_presence_mismatch": 2,
+                "missing_pipeline_color_target": 1,
+                "missing_render_pass_attachment": 1,
+            },
+        )
+        self.assertEqual(audit["render_pass_mismatch_count"], 7)
+        # Swapchain histogram: pipeline 102 (bgra8unorm) x2 + pipeline 103 (rgba8unorm) x2
+        self.assertEqual(audit["swapchain_target_formats"], {"bgra8unorm": 2, "rgba8unorm": 2})
+        self.assertTrue(audit["swapchain_format_conflict"])
+
+        color_mismatches = [
+            m for m in audit["render_pass_mismatches"] if m["kind"] == "color_format_mismatch"
+        ]
+        self.assertEqual(len(color_mismatches), 2)
+        self.assertEqual(
+            (color_mismatches[0]["render_pass_format"], color_mismatches[0]["pipeline_format"]),
+            ("rgba16float", "bgra8unorm"),
+        )
+        self.assertTrue(color_mismatches[1]["swapchain"])
+        self.assertEqual(
+            (color_mismatches[1]["render_pass_format"], color_mismatches[1]["pipeline_format"]),
+            ("bgra8unorm", "rgba8unorm"),
+        )
+
+        text = gpu_trace.format_trace_text(trace, stats_only=True, binding_audit=True)
+        self.assertIn("Swapchain Target Formats: bgra8unorm=2, rgba8unorm=2 [CONFLICT]", text)
+        self.assertIn("[color_format_mismatch]", text)
+        self.assertIn("[missing_pipeline_color_target]", text)
+        self.assertIn("[missing_render_pass_attachment]", text)
+        self.assertIn("[depth_stencil_format_mismatch]", text)
+
+    def test_binding_audit_clean_trace_and_cli_combined(self) -> None:
+        stream = b"".join(
+            [
+                gpu_trace.encode_create_bind_group_layout(
+                    10,
+                    [
+                        (0, 0x3, 0, 0),            # uniform buffer
+                        (1, 0x2, 2, 0, 2),         # sampled texture 2d
+                        (2, 0x2, 1, 0),            # filtering sampler
+                        (3, 0x4, 3, 0, 2, 0, 22),  # storageTexture rgba8unorm
+                    ],
+                ),
+                gpu_trace.encode_create_bind_group2(
+                    11,
+                    10,
+                    [
+                        (0, gpu_trace.GpuBindResourceType.Buffer, 20, 0, 256),
+                        (1, gpu_trace.GpuBindResourceType.TextureView, 21),
+                        (2, gpu_trace.GpuBindResourceType.Sampler, 22),
+                        (3, gpu_trace.GpuBindResourceType.TextureView, 23),
+                    ],
+                ),
+                # Offscreen texture rgba8unorm (22) viewed as rgba8unorm-srgb (23) + depth32float
+                gpu_trace.encode_create_texture2(
+                    30, 640, 360, 22, usage_flags=0x10, view_formats=[23]
+                ),
+                gpu_trace.encode_create_texture(
+                    31, 640, 360, texture_format=gpu_trace.GpuTextureFormat.Depth32Float, usage_flags=0x10
+                ),
+                gpu_trace.encode_create_render_pipeline2(
+                    40, 1, 2, 0,
+                    _make_pipeline_key(vs_shader=0xABCD, ps_shader=0xEF01, color_formats=[23], depth_format=48),
+                ),
+                gpu_trace.encode_create_render_pipeline2(
+                    41, 1, 2, 0,
+                    _make_pipeline_key(vs_shader=0xABCD, ps_shader=0xEF02, color_formats=[27], depth_format=0),
+                ),
+                gpu_trace.encode_begin_frame(),
+                gpu_trace.encode_begin_render_pass(
+                    [
+                        {
+                            "texture_id": 30,
+                            "load_op": 2,
+                            "store_op": 1,
+                            "view": gpu_trace.encode_texture_view_desc(texture_format=23),
+                        }
+                    ],
+                    {"texture_id": 31, "depth_load_op": 2, "depth_store_op": 1},
+                ),
+                gpu_trace.encode_set_pipeline(40),
+                gpu_trace.encode_set_bind_group2(0, 11),
+                gpu_trace.encode_draw(6),
+                gpu_trace.encode_end_render_pass(),
+                gpu_trace.encode_begin_render_pass(
+                    [{"texture_id": gpu_trace.SWAPCHAIN_TEXTURE_ID, "load_op": 2, "store_op": 1}]
+                ),
+                gpu_trace.encode_set_pipeline(41),
+                gpu_trace.encode_draw(3),
+                gpu_trace.encode_end_render_pass(),
+                gpu_trace.encode_present(),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "clean.pg6trace"
+            trace_path.write_bytes(stream)
+
+            # Combined CLI --shader-summary --binding-audit --json
+            buf_json = io.StringIO()
+            with redirect_stdout(buf_json):
+                rc = gpu_trace.main(
+                    [str(trace_path), "--json", "--stats", "--shader-summary", "--binding-audit"]
+                )
+            self.assertEqual(rc, 0)
+            payload = json.loads(buf_json.getvalue())
+            self.assertTrue(payload["ok"])
+            self.assertIn("shader_summary", payload)
+            self.assertIn("binding_audit", payload)
+
+            audit = payload["binding_audit"]
+            self.assertTrue(audit["ok"])
+            self.assertEqual(audit["total_mismatches"], 0)
+            self.assertEqual(audit["bind_group_mismatch_count"], 0)
+            self.assertEqual(audit["render_pass_mismatch_count"], 0)
+            self.assertEqual(audit["draws_audited"], 2)
+            self.assertEqual(audit["swapchain_target_formats"], {"bgra8unorm": 1})
+            self.assertFalse(audit["swapchain_format_conflict"])
+
+            # Combined CLI text output
+            buf_text = io.StringIO()
+            with redirect_stdout(buf_text):
+                rc = gpu_trace.main(
+                    [str(trace_path), "--stats", "--shader-summary", "--binding-audit"]
+                )
+            self.assertEqual(rc, 0)
+            text_out = buf_text.getvalue()
+            self.assertIn("Shader Summary:", text_out)
+            self.assertIn("0x000000000000abcd", text_out)
+            self.assertIn("Binding Audit:", text_out)
+            self.assertIn("Status: CLEAN (0 mismatches)", text_out)
+            self.assertIn("Swapchain Target Formats: bgra8unorm=1", text_out)
+            self.assertNotIn("[CONFLICT]", text_out)
+
+    def test_audits_on_state_bridge_fixture(self) -> None:
+        fixture = REPO_ROOT / "tests" / "fixtures" / "state_bridge_frame.hex"
+        if not fixture.is_file():
+            self.skipTest("state_bridge_frame.hex fixture not present")
+        raw = bytes.fromhex("".join(fixture.read_text(encoding="utf-8").split()))
+        trace = gpu_trace.decode_stream(raw, strict=True)
+        audit = gpu_trace.audit_bindings(trace)
+        self.assertTrue(audit["ok"], audit)
+        self.assertEqual(audit["total_mismatches"], 0)
+        self.assertEqual(audit["draws_audited"], 2)
+        self.assertEqual(audit["swapchain_target_formats"], {"bgra8unorm": 1})
+        summary = gpu_trace.summarize_shaders(trace)
+        self.assertEqual(summary["total_draws"], 2)
+        self.assertGreaterEqual(summary["active_shaders"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
