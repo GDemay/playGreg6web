@@ -745,6 +745,7 @@ class TestServeLocalQuietDisconnects(unittest.TestCase):
                     ConnectionAbortedError,
                     ConnectionResetError,
                     BrokenPipeError,
+                    TimeoutError,
                 ):
                     with self.subTest(exc=exc_cls.__name__):
                         buf = io.StringIO()
@@ -781,6 +782,7 @@ class TestServeLocalQuietDisconnects(unittest.TestCase):
                 ConnectionAbortedError,
                 ConnectionResetError,
                 BrokenPipeError,
+                TimeoutError,
             ):
                 with self.subTest(exc=exc_cls.__name__):
                     class _AbortingWriter:
@@ -794,13 +796,16 @@ class TestServeLocalQuietDisconnects(unittest.TestCase):
                     handler.shaders_root = data / "shaders"
                     handler.boot_root = None
                     handler.headers = {}
+                    handler.close_connection = False
                     handler.wfile = _AbortingWriter()
                     handler.send_response = lambda *a, **kw: None
                     handler.send_header = lambda *a, **kw: None
                     handler.end_headers = lambda *a, **kw: None
 
-                    # Should return quietly without propagating socket disconnect errors.
+                    # Should return quietly without propagating socket disconnect errors
+                    # and mark the HTTP/1.1 connection closed to prevent stream desync.
                     handler._serve_file("/data/chunk.bin", send_body=True)
+                    self.assertTrue(handler.close_connection)
 
 
 class TestServeLocalSideModuleDiscovery(unittest.TestCase):
