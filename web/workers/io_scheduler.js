@@ -76,6 +76,12 @@
   const SPECULATIVE_PREFETCH_RE = /(?:^|\/)(?:prefetch|speculative)(?:\/|$)|\.prefetch$/i;
   const UI_FONT_PATH_RE =
     /(?:^|[/._-])(?:ui|hud|fonts?|scaleform|frontend|menu|splash)(?:[/._-]|$)/i;
+  const BOOT_CRITICAL_RPF_NAMES = new Set([
+    'movies.rpf',
+    'shaders.rpf',
+    'textures.rpf',
+    'levels.rpf',
+  ]);
 
   function normalizePathForClassification(pathOrRelPath) {
     if (typeof pathOrRelPath !== 'string') {
@@ -85,6 +91,12 @@
     if (!s) {
       return '';
     }
+    s = s.replace(/\\/g, '/');
+    // Strip Win32 extended-length / device prefixes (e.g. `\\?\G:\...`, `\\.\G:\...`)
+    // before stripping URL query strings so the `?` in `\\?\` is not mistaken for a query.
+    if (/^\/\/[?.]\//.test(s)) {
+      s = s.slice(4);
+    }
     const qIdx = s.indexOf('?');
     if (qIdx !== -1) {
       s = s.slice(0, qIdx);
@@ -93,7 +105,55 @@
     if (hIdx !== -1) {
       s = s.slice(0, hIdx);
     }
-    return s.replace(/\\/g, '/').toLowerCase();
+    s = s.toLowerCase();
+    if (/^rpf:\/\//.test(s)) {
+      s = s.slice(6);
+    } else if (/^[a-z][a-z0-9+.-]*:\/\//.test(s)) {
+      const afterScheme = s.indexOf('://') + 3;
+      const pathStart = s.indexOf('/', afterScheme);
+      s = pathStart === -1 ? '' : s.slice(pathStart);
+    }
+    return s;
+  }
+
+  function isBootCriticalRpfPath(pathOrUrl) {
+    const norm = normalizePathForClassification(pathOrUrl);
+    if (!norm) {
+      return false;
+    }
+    const parts = norm.split('/');
+    const hasNestedRpf = norm.includes('.rpf/');
+    for (let i = parts.length - 1; i >= 0; i -= 1) {
+      const seg = parts[i];
+      if (!seg) {
+        continue;
+      }
+      if (BOOT_CRITICAL_RPF_NAMES.has(seg)) {
+        return true;
+      }
+      if (i === parts.length - 1 && !hasNestedRpf) {
+        return false;
+      }
+    }
+    return false;
+  }
+
+  function classifyBootArchivePriority(pathOrUrl) {
+    const norm = normalizePathForClassification(pathOrUrl);
+    if (!norm) {
+      return IO_PRIORITY.NORMAL;
+    }
+    if (SPECULATIVE_PREFETCH_RE.test(norm)) {
+      return IO_PRIORITY.PREFETCH;
+    }
+    if (
+      isBootCriticalRpfPath(norm) ||
+      norm.endsWith('.wgsl.pack') ||
+      norm.endsWith('.pgim')
+    ) {
+      return IO_PRIORITY.HIGH;
+    }
+    return IO_PRIORITY.NORMAL;
   }
 
   function isBinkVideoPath(pathOrRelPath) {
@@ -156,6 +216,7 @@
     if (
       norm.endsWith('.bk2') ||
       norm.endsWith('.bik') ||
+      isBootCriticalRpfPath(norm) ||
       isUiFontRpfPath(norm) ||
       isDirectFontOrUiAssetPath(norm)
     ) {
@@ -358,6 +419,9 @@
         agedPromotions: 0,
         totalQueueWaitMs: 0,
         maxQueueWaitMs: 0,
+        peakQueueDepth: 0,
+        highPriorityCount: 0,
+        preemptedCount: 0,
         binkVideoReads: 0,
         shaderPackReads: 0,
         uiFontReads: 0,
@@ -410,6 +474,9 @@
       }
 
       this._byPriority[priority].scheduled += 1;
+      if (priority <= IO_PRIORITY.HIGH) {
+        this._stats.highPriorityCount += 1;
+      }
       if (isBinkVideoPath(path)) {
         this._stats.binkVideoReads += 1;
       } else if (isShaderPackPath(path)) {
@@ -485,6 +552,7 @@
 
         this._queues[priority].push(task);
         this._drain();
+        this._updatePeakQueueDepth();
       });
     }
 
@@ -597,6 +665,10 @@
       return this.clear('Scheduler reset');
     }
 
+    resetStats() {
+      this._resetCounters();
+    }
+
     getStats() {
       const byPriority = {};
       const avgQueueWaitMsByPriority = {};
@@ -649,6 +721,11 @@
         promotions: this._stats.agedPromotions,
         avgQueueWaitMs,
         maxQueueWaitMs: this._stats.maxQueueWaitMs,
+        peakQueueDepth: this._stats.peakQueueDepth,
+        avgWaitMs: avgQueueWaitMs,
+        maxWaitMs: this._stats.maxQueueWaitMs,
+        highPriorityCount: this._stats.highPriorityCount,
+        preemptedCount: this._stats.preemptedCount,
         binkVideoReads: this._stats.binkVideoReads,
         shaderPackReads: this._stats.shaderPackReads,
         uiFontReads: this._stats.uiFontReads,
@@ -663,6 +740,38 @@
       return Number.isFinite(value) ? value : 0;
     }
 
+    _getQueuedCount() {
+      let total = 0;
+      for (let i = 0; i < PRIORITY_LEVELS.length; i += 1) {
+        total += this._queues[PRIORITY_LEVELS[i]].length;
+      }
+      return total;
+    }
+
+    _updatePeakQueueDepth() {
+      const queued = this._getQueuedCount();
+      if (queued > this._stats.peakQueueDepth) {
+        this._stats.peakQueueDepth = queued;
+      }
+    }
+
+    _hasEarlierLowerPriorityQueued(task) {
+      for (let i = 0; i < PRIORITY_LEVELS.length; i += 1) {
+        const level = PRIORITY_LEVELS[i];
+        if (level <= task.priority) {
+          continue;
+        }
+        const queue = this._queues[level];
+        for (let j = 0; j < queue.length; j += 1) {
+          const other = queue[j];
+          if (other.state === 'queued' && other.seq < task.seq) {
+            return true;
+          }
+        }
+      }
+      return false;
+    }
+
     _resetCounters() {
       this._stats.enqueued = 0;
       this._stats.dispatched = 0;
@@ -674,6 +783,9 @@
       this._stats.agedPromotions = 0;
       this._stats.totalQueueWaitMs = 0;
       this._stats.maxQueueWaitMs = 0;
+      this._stats.peakQueueDepth = 0;
+      this._stats.highPriorityCount = 0;
+      this._stats.preemptedCount = 0;
       this._stats.binkVideoReads = 0;
       this._stats.shaderPackReads = 0;
       this._stats.uiFontReads = 0;
@@ -1012,6 +1124,8 @@
         if (promoted) {
           this._stats.agedPromotions += 1;
           prioStats.agedPromotions += 1;
+        } else if (this._hasEarlierLowerPriorityQueued(task)) {
+          this._stats.preemptedCount += 1;
         }
 
         this._inFlight += 1;
@@ -1191,6 +1305,8 @@
     DEFAULT_DEDUPE_IN_FLIGHT,
     makeReadKey,
     classifyIoPriority,
+    classifyBootArchivePriority,
+    isBootCriticalRpfPath,
     isBinkVideoPath,
     isShaderPackPath,
     isUiFontRpfPath,

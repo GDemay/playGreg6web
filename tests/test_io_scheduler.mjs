@@ -21,6 +21,8 @@ const {
   DEFAULT_DEDUPE_IN_FLIGHT,
   makeReadKey,
   classifyIoPriority,
+  classifyBootArchivePriority,
+  isBootCriticalRpfPath,
   isBinkVideoPath,
   isShaderPackPath,
   isUiFontRpfPath,
@@ -2259,4 +2261,415 @@ test('W206 step-based priority aging (agingIntervalMs) prevents starvation under
   assert.equal(afterReset.agedPromotions, 0);
   assert.equal(afterReset.avgQueueWaitMs, 0);
   assert.equal(afterReset.maxQueueWaitMs, 0);
+});
+
+// ---------------------------------------------------------------------------
+// W248: Boot-critical RPF priority classification & queue-latency telemetry
+// ---------------------------------------------------------------------------
+
+test('W248 exports classifyBootArchivePriority and isBootCriticalRpfPath in CommonJS and Worker globalThis', () => {
+  assert.equal(typeof classifyBootArchivePriority, 'function');
+  assert.equal(typeof isBootCriticalRpfPath, 'function');
+
+  const src = fs.readFileSync(path.join(repoRoot, 'web/workers/io_scheduler.js'), 'utf8');
+  const sandbox = {};
+  sandbox.globalThis = sandbox;
+  sandbox.self = sandbox;
+  vm.runInNewContext(src, sandbox);
+
+  assert.equal(typeof sandbox.PlayGta6IoScheduler.classifyBootArchivePriority, 'function');
+  assert.equal(typeof sandbox.PlayGta6IoScheduler.isBootCriticalRpfPath, 'function');
+  assert.equal(
+    sandbox.PlayGta6IoScheduler.classifyBootArchivePriority('/game/movies.rpf'),
+    IO_PRIORITY.HIGH
+  );
+  assert.equal(
+    sandbox.PlayGta6IoScheduler.classifyBootArchivePriority('/shaders/boot.wgsl.pack'),
+    IO_PRIORITY.HIGH
+  );
+  assert.equal(
+    sandbox.PlayGta6IoScheduler.classifyBootArchivePriority('boot/guest.pgim'),
+    IO_PRIORITY.HIGH
+  );
+});
+
+test('W248 classifyBootArchivePriority classifies boot-critical RPFs, shader packs, and pgim assets across paths and URLs without leaking host paths', () => {
+  // Boot-critical RPFs: movies.rpf, shaders.rpf, textures.rpf, levels.rpf
+  for (const input of [
+    '/game/movies.rpf',
+    '/game/shaders.rpf',
+    '/game/textures.rpf',
+    '/game/levels.rpf',
+    'game/movies.rpf',
+    'movies.rpf',
+    '/GAME/SHADERS.RPF?v=2#frag',
+    'http://127.0.0.1:8080/game/textures.rpf?range=0-4095',
+    'https://cdn.example.invalid/data/game/levels.rpf#top',
+    'rpf://game/movies.rpf/intro.bk2',
+    'rpf://shaders.rpf/core.bin',
+    'C:\\Users\\private_user\\Xbox\\game\\movies.rpf',
+    'file:///C:/Users/private_user/game/textures.rpf',
+    '\\\\?\\G:\\game\\levels.rpf',
+  ]) {
+    assert.equal(
+      classifyBootArchivePriority(input),
+      IO_PRIORITY.HIGH,
+      `Expected HIGH from classifyBootArchivePriority for ${input}`
+    );
+    assert.equal(
+      isBootCriticalRpfPath(input),
+      true,
+      `Expected isBootCriticalRpfPath true for ${input}`
+    );
+    assert.equal(
+      classifyIoPriority(input),
+      IO_PRIORITY.HIGH,
+      `Expected HIGH from classifyIoPriority for ${input}`
+    );
+  }
+
+  // Shader packs & .pgim guest images -> HIGH from classifyBootArchivePriority,
+  // while classifyIoPriority preserves CRITICAL (W188 compatibility).
+  for (const input of [
+    '/shaders/frame1.wgsl.pack',
+    'shaders/main.wgsl.pack?v=3#entry',
+    'http://127.0.0.1:8080/shaders/core.wgsl.pack',
+    'guest/game_main.pgim',
+    '/boot/game.pgim',
+    'https://localhost:8080/boot/GAME.PGIM?cache=1',
+    'C:\\Users\\private_user\\work\\game.pgim',
+  ]) {
+    assert.equal(
+      classifyBootArchivePriority(input),
+      IO_PRIORITY.HIGH,
+      `Expected HIGH from classifyBootArchivePriority for ${input}`
+    );
+    assert.equal(
+      isBootCriticalRpfPath(input),
+      false,
+      `Expected isBootCriticalRpfPath false for ${input}`
+    );
+    assert.equal(
+      classifyIoPriority(input),
+      IO_PRIORITY.CRITICAL,
+      `Expected CRITICAL preserved from classifyIoPriority for ${input}`
+    );
+  }
+
+  // Non-boot RPFs, false-positive substring guards, and invalid/empty inputs -> NORMAL
+  for (const input of [
+    '/game/audio.rpf',
+    '/game/my_movies.rpf',
+    '/game/levels_extra.rpf',
+    'x64/levels/world.rpf',
+    'x64/textures/terrain.ttpf',
+    'https://movies.rpf',
+    'misc/data.bin',
+    '',
+    '   ',
+    null,
+    undefined,
+    42,
+    {},
+  ]) {
+    assert.equal(
+      classifyBootArchivePriority(input),
+      IO_PRIORITY.NORMAL,
+      `Expected NORMAL from classifyBootArchivePriority for ${String(input)}`
+    );
+    assert.equal(isBootCriticalRpfPath(input), false);
+  }
+
+  // Speculative prefetch paths remain PREFETCH
+  assert.equal(classifyBootArchivePriority('prefetch/world_lod.rpf'), IO_PRIORITY.PREFETCH);
+  assert.equal(classifyBootArchivePriority('x64/speculative/movies.rpf'), IO_PRIORITY.PREFETCH);
+  assert.equal(classifyBootArchivePriority('movies.rpf.prefetch'), IO_PRIORITY.PREFETCH);
+
+  // Explicit caller override still takes precedence in classifyIoPriority
+  assert.equal(classifyIoPriority('/game/movies.rpf', IO_PRIORITY.PREFETCH), IO_PRIORITY.PREFETCH);
+  assert.equal(classifyIoPriority('/game/levels.rpf', IO_PRIORITY.CRITICAL), IO_PRIORITY.CRITICAL);
+});
+
+test('W248 boot-critical RPFs preempt queued NORMAL/PREFETCH reads and record sanitized telemetry', async () => {
+  const dispatchOrder = [];
+  const blockerGate = deferred();
+
+  const rangeCache = {
+    read(filePath, offset, length) {
+      dispatchOrder.push(filePath);
+      if (filePath === 'blocker.bin') {
+        return blockerGate.promise;
+      }
+      return Promise.resolve(makeBytes(filePath.charCodeAt(0), length));
+    },
+  };
+
+  const scheduler = new IoPriorityScheduler({
+    rangeCache,
+    maxConcurrency: 1,
+    sleep: async () => {},
+  });
+
+  // Occupy concurrency slot so subsequent reads queue up.
+  const pBlocker = scheduler.scheduleRead('blocker.bin', 0, 16, {
+    priority: IO_PRIORITY.PREFETCH,
+  });
+
+  // Queue lower-priority traffic BEFORE boot-critical archives arrive.
+  const pPrefetch = scheduler.scheduleRead('prefetch/bg_chunk.rpf', 0, 16);
+  const pNormal = scheduler.scheduleRead('/game/audio.rpf', 0, 16);
+
+  // Queue boot-critical RPFs, shader pack, and guest .pgim without explicit priority.
+  const pMovies = scheduler.scheduleRead('/game/movies.rpf', 0, 64);
+  const pShaders = scheduler.scheduleRead('/game/shaders.rpf', 0, 64);
+  const pTextures = scheduler.scheduleRead('/game/textures.rpf', 0, 64);
+  const pLevels = scheduler.scheduleRead('/game/levels.rpf', 0, 64);
+  const pPack = scheduler.scheduleRead('/shaders/boot.wgsl.pack', 0, 128);
+  const pPgim = scheduler.scheduleRead('/boot/guest.pgim', 0, 128);
+
+  const midStats = scheduler.getStats();
+  assert.equal(midStats.queued, 8);
+  assert.equal(midStats.peakQueueDepth, 8);
+  assert.equal(midStats.highPriorityCount, 6);
+  assert.equal(midStats.preemptedCount, 0);
+
+  blockerGate.resolve(makeBytes(1, 16));
+  await Promise.all([
+    pBlocker,
+    pPrefetch,
+    pNormal,
+    pMovies,
+    pShaders,
+    pTextures,
+    pLevels,
+    pPack,
+    pPgim,
+  ]);
+
+  assert.deepEqual(dispatchOrder, [
+    'blocker.bin',
+    '/shaders/boot.wgsl.pack',
+    '/boot/guest.pgim',
+    '/game/movies.rpf',
+    '/game/shaders.rpf',
+    '/game/textures.rpf',
+    '/game/levels.rpf',
+    '/game/audio.rpf',
+    'prefetch/bg_chunk.rpf',
+  ]);
+
+  const finalStats = scheduler.getStats();
+  assert.equal(finalStats.queued, 0);
+  assert.equal(finalStats.inFlight, 0);
+  assert.equal(finalStats.peakQueueDepth, 8);
+  assert.equal(finalStats.highPriorityCount, 6);
+  // 6 CRITICAL/HIGH reads jumped ahead of earlier NORMAL/PREFETCH, and NORMAL jumped ahead of earlier PREFETCH.
+  assert.equal(finalStats.preemptedCount, 7);
+  assert.equal(finalStats.completed, 9);
+
+  // Verify getStats() output is strictly sanitized (contains no raw paths or archive names).
+  const serialized = JSON.stringify(finalStats);
+  assert.equal(serialized.includes('movies.rpf'), false);
+  assert.equal(serialized.includes('shaders.rpf'), false);
+  assert.equal(serialized.includes('wgsl.pack'), false);
+  assert.equal(serialized.includes('guest.pgim'), false);
+  assert.equal(serialized.includes('blocker.bin'), false);
+});
+
+test('W248 deterministic queue-latency telemetry (peakQueueDepth, avgWaitMs, maxWaitMs, highPriorityCount, preemptedCount) and FIFO/aging boundaries', async () => {
+  let fakeNow = 0;
+  const gates = new Map();
+
+  const rangeCache = {
+    read(filePath, offset, length) {
+      const gate = gates.get(filePath);
+      if (gate) return gate.promise;
+      return Promise.resolve(makeBytes(7, length));
+    },
+  };
+
+  const gBlocker = deferred();
+  const gMovies = deferred();
+  const gPrefetch = deferred();
+  const gNormal = deferred();
+  gates.set('blocker.bin', gBlocker);
+  gates.set('/game/movies.rpf', gMovies);
+  gates.set('prefetch/bg.rpf', gPrefetch);
+  gates.set('/game/audio.rpf', gNormal);
+
+  const scheduler = new IoPriorityScheduler({
+    rangeCache,
+    maxConcurrency: 1,
+    agingThresholdMs: 100,
+    nowFn: () => fakeNow,
+    sleep: async () => {},
+  });
+
+  // Pre-aborted and invalid reads must not affect W248 telemetry counters.
+  const preAborted = new AbortController();
+  preAborted.abort();
+  await assert.rejects(
+    scheduler.scheduleRead('/game/movies.rpf', 0, 16, { signal: preAborted.signal }),
+    { name: 'AbortError' }
+  );
+  await assert.rejects(scheduler.scheduleRead('/game/shaders.rpf', -1, 16), RangeError);
+
+  assert.equal(scheduler.getStats().highPriorityCount, 0);
+  assert.equal(scheduler.getStats().peakQueueDepth, 0);
+  assert.equal(scheduler.getStats().preemptedCount, 0);
+
+  // t = 0: blocker dispatches immediately (wait = 0ms); prefetch queues at t = 0.
+  const pBlocker = scheduler.scheduleRead('blocker.bin', 0, 8, { priority: IO_PRIORITY.NORMAL });
+  const pPrefetch = scheduler.scheduleRead('prefetch/bg.rpf', 0, 8);
+
+  // t = 10: NORMAL queues.
+  fakeNow = 10;
+  const pNormal = scheduler.scheduleRead('/game/audio.rpf', 0, 8);
+
+  // t = 25: HIGH boot RPF queues (depth = 3: prefetch, normal, movies).
+  fakeNow = 25;
+  const pMovies = scheduler.scheduleRead('/game/movies.rpf', 0, 8);
+
+  assert.equal(scheduler.getStats().peakQueueDepth, 3);
+
+  // t = 50: blocker completes -> movies.rpf (wait = 25ms) preempts earlier NORMAL & PREFETCH.
+  fakeNow = 50;
+  gBlocker.resolve(makeBytes(1, 8));
+  await pBlocker;
+  await Promise.resolve();
+
+  const afterMoviesDispatch = scheduler.getStats();
+  assert.equal(afterMoviesDispatch.preemptedCount, 1);
+  assert.equal(afterMoviesDispatch.agedPromotions, 0);
+
+  // t = 120: movies completes -> prefetch waited 120ms (>= 100ms agingThresholdMs) so aging promotes it.
+  // Aged promotion must NOT increment preemptedCount.
+  fakeNow = 120;
+  gMovies.resolve(makeBytes(2, 8));
+  await pMovies;
+  await Promise.resolve();
+
+  // t = 140: prefetch completes -> audio.rpf dispatches last (wait = 140 - 10 = 130ms).
+  fakeNow = 140;
+  gPrefetch.resolve(makeBytes(3, 8));
+  await pPrefetch;
+  await Promise.resolve();
+
+  gNormal.resolve(makeBytes(4, 8));
+  await pNormal;
+
+  // Dispatched waits: blocker (0) + movies (25) + prefetch (120) + audio (130)
+  // Total wait = 275ms across 4 dispatches => avgWaitMs = 68.75ms, maxWaitMs = 130ms.
+  const stats = scheduler.getStats();
+  assert.equal(stats.peakQueueDepth, 3);
+  assert.equal(stats.avgWaitMs, 68.75);
+  assert.equal(stats.avgWaitMs, stats.avgQueueWaitMs);
+  assert.equal(stats.maxWaitMs, 130);
+  assert.equal(stats.maxWaitMs, stats.maxQueueWaitMs);
+  assert.equal(stats.highPriorityCount, 1);
+  assert.equal(stats.preemptedCount, 1);
+  assert.equal(stats.agedPromotions, 1);
+
+  // Snapshot isolation: mutating returned fields must not corrupt internal state.
+  stats.peakQueueDepth = 999;
+  stats.avgWaitMs = 999;
+  stats.maxWaitMs = 999;
+  stats.highPriorityCount = 999;
+  stats.preemptedCount = 999;
+  const fresh = scheduler.getStats();
+  assert.equal(fresh.peakQueueDepth, 3);
+  assert.equal(fresh.avgWaitMs, 68.75);
+  assert.equal(fresh.maxWaitMs, 130);
+  assert.equal(fresh.highPriorityCount, 1);
+  assert.equal(fresh.preemptedCount, 1);
+
+  // FIFO ordering when higher priority is enqueued BEFORE lower priority must yield preemptedCount === 0.
+  scheduler.resetStats();
+  const gHold2 = deferred();
+  gates.set('hold2.bin', gHold2);
+  fakeNow = 200;
+  const pHold2 = scheduler.scheduleRead('hold2.bin', 0, 8, { priority: IO_PRIORITY.NORMAL });
+  const pHighFirst = scheduler.scheduleRead('/game/textures.rpf', 0, 8);
+  const pNormalSecond = scheduler.scheduleRead('plain.bin', 0, 8);
+  gHold2.resolve(makeBytes(9, 8));
+  await Promise.all([pHold2, pHighFirst, pNormalSecond]);
+  assert.equal(scheduler.getStats().preemptedCount, 0);
+  assert.equal(scheduler.getStats().highPriorityCount, 1);
+  assert.equal(scheduler.getStats().peakQueueDepth, 2);
+});
+
+test('W248 resetStats() cleanly resets telemetry without cancelling queued or in-flight reads', async () => {
+  let fakeNow = 0;
+  const g1 = deferred();
+  const g2 = deferred();
+
+  const rangeCache = {
+    read(filePath, offset, length) {
+      if (filePath === 'first.bin') return g1.promise;
+      if (filePath === 'second.bin') return g2.promise;
+      return Promise.resolve(makeBytes(4, length));
+    },
+  };
+
+  const scheduler = new IoPriorityScheduler({
+    rangeCache,
+    maxConcurrency: 1,
+    nowFn: () => fakeNow,
+    sleep: async () => {},
+  });
+
+  // Accumulate telemetry while first.bin is in-flight and queued reads wait.
+  const p1 = scheduler.scheduleRead('first.bin', 0, 8, { priority: IO_PRIORITY.NORMAL });
+  const p2 = scheduler.scheduleRead('second.bin', 0, 8, { priority: IO_PRIORITY.NORMAL });
+  const p3 = scheduler.scheduleRead('/game/shaders.rpf', 0, 8);
+
+  assert.equal(scheduler.getStats().inFlight, 1);
+  assert.equal(scheduler.getStats().queued, 2);
+  assert.equal(scheduler.getStats().peakQueueDepth, 2);
+  assert.equal(scheduler.getStats().highPriorityCount, 1);
+
+  // Call resetStats() mid-flight: telemetry zeroes, but active & queued tasks are NOT cancelled.
+  scheduler.resetStats();
+  const afterMidReset = scheduler.getStats();
+  assert.equal(afterMidReset.inFlight, 1);
+  assert.equal(afterMidReset.queued, 2);
+  assert.equal(afterMidReset.peakQueueDepth, 0);
+  assert.equal(afterMidReset.avgWaitMs, 0);
+  assert.equal(afterMidReset.maxWaitMs, 0);
+  assert.equal(afterMidReset.highPriorityCount, 0);
+  assert.equal(afterMidReset.preemptedCount, 0);
+  assert.equal(afterMidReset.completed, 0);
+  assert.equal(afterMidReset.cancelled, 0);
+
+  // Unblock first.bin at t = 40 -> queued shaders.rpf preempts second.bin and resolves cleanly!
+  fakeNow = 40;
+  g1.resolve(makeBytes(1, 8));
+  await p1;
+  await p3;
+
+  fakeNow = 60;
+  g2.resolve(makeBytes(2, 8));
+  await p2;
+
+  const afterDrain = scheduler.getStats();
+  assert.equal(afterDrain.inFlight, 0);
+  assert.equal(afterDrain.queued, 0);
+  assert.equal(afterDrain.completed, 3);
+  assert.equal(afterDrain.preemptedCount, 1);
+  assert.equal(afterDrain.maxWaitMs, 40);
+  assert.equal(afterDrain.avgWaitMs, 40);
+
+  // Calling resetStats() when idle zeroes every telemetry field cleanly.
+  scheduler.resetStats();
+  const afterIdleReset = scheduler.getStats();
+  assert.equal(afterIdleReset.peakQueueDepth, 0);
+  assert.equal(afterIdleReset.avgWaitMs, 0);
+  assert.equal(afterIdleReset.maxWaitMs, 0);
+  assert.equal(afterIdleReset.avgQueueWaitMs, 0);
+  assert.equal(afterIdleReset.maxQueueWaitMs, 0);
+  assert.equal(afterIdleReset.highPriorityCount, 0);
+  assert.equal(afterIdleReset.preemptedCount, 0);
+  assert.equal(afterIdleReset.completed, 0);
+  assert.equal(afterIdleReset.dispatched, 0);
+  assert.equal(afterIdleReset.enqueued, 0);
 });
