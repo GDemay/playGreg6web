@@ -2850,5 +2850,338 @@ class VisibleFrameHeapAndAudioRingMetricsTests(unittest.TestCase):
             self.assertIn("audio_ring: attached=false, frames_drained=0", dig_partial)
 
 
+class MenuToIngameFpsAndQuietServerTests(unittest.TestCase):
+    def test_menu_to_ingame_preset_validation_url_help_and_dry_run(self):
+        self.assertEqual(rbb.ALLOWED_INPUT_SCRIPT_PRESETS.get("menu-to-ingame"), "menu-to-ingame")
+        self.assertEqual(rbb.INPUT_SCRIPT_ALIASES.get("menu-to-ingame"), "menu-to-ingame")
+        self.assertEqual(rbb.sanitize_input_script_preset("menu-to-ingame"), "menu-to-ingame")
+        self.assertEqual(rbb.sanitize_input_script_preset("  MENU-TO-INGAME  "), "menu-to-ingame")
+        self.assertEqual(rbb.validate_input_script_preset("menu-to-ingame"), "menu-to-ingame")
+        self.assertEqual(
+            rbb.build_target_url("127.0.0.1", 8080, input_script="menu-to-ingame"),
+            "http://127.0.0.1:8080/?inputScript=menu-to-ingame",
+        )
+
+        help_text = rbb.build_arg_parser().format_help()
+        self.assertIn("menu-to-ingame", help_text)
+        self.assertIn("--quiet-server", help_text)
+
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            code, out, err, _, _ = fx.run_cli(
+                "--smoke",
+                "--dry-run",
+                "--name",
+                "dry-menu-to-ingame",
+                "--input-script",
+                "menu-to-ingame",
+            )
+            self.assertEqual(code, 0, err)
+            payload = json.loads(out)
+            self.assertEqual(payload["input_script"], "menu-to-ingame")
+            self.assertEqual(payload["inputScript"], "menu-to-ingame")
+            self.assertEqual(
+                payload["url"],
+                "http://127.0.0.1:<ephemeral>/?smoke=1&inputScript=menu-to-ingame",
+            )
+
+    def test_compute_present_fps_avg_normal_and_edge_cases(self):
+        # 1. Normal 30 FPS subsampled run from FIRST_PRESENT (1000 ms) to last present (11000 ms)
+        subsampled = [{"index": 0, "wall_ms": 1000.0}, {"index": 1, "wall_ms": 6000.0}, {"index": 2, "wall_ms": 11000.0}]
+        self.assertEqual(
+            rbb.compute_present_fps_avg(subsampled, present_count=301, first_present_ms=1000.0),
+            30.0,
+        )
+
+        # 2. Normal per-present run without explicit present_count or first_present_ms
+        per_present = [
+            {"wall_ms": 1000.0},
+            {"wall_ms": 1500.0},
+            {"wall_ms": 2000.0},
+            {"wall_ms": 2500.0},
+            {"wall_ms": 3000.0},
+        ]
+        self.assertEqual(rbb.compute_present_fps_avg(per_present), 2.0)
+
+        # 3. Fractional rounding to 2 decimal places: (11 - 1) / 3.0s = 3.33
+        self.assertEqual(
+            rbb.compute_present_fps_avg(
+                [{"wall_ms": 500.0}, {"wall_ms": 3500.0}],
+                present_count=11,
+                first_present_ms=500.0,
+            ),
+            3.33,
+        )
+
+        # 4. Single trailing sample after explicit first_present_ms with >= 2 total presents
+        self.assertEqual(
+            rbb.compute_present_fps_avg(
+                [{"wall_ms": 2000.0}],
+                present_count=11,
+                first_present_ms=1000.0,
+            ),
+            10.0,
+        )
+
+        # 5. < 2 presents returns None
+        self.assertIsNone(rbb.compute_present_fps_avg([], present_count=0, first_present_ms=None))
+        self.assertIsNone(rbb.compute_present_fps_avg([{"wall_ms": 1000.0}], present_count=1, first_present_ms=1000.0))
+        self.assertIsNone(rbb.compute_present_fps_avg([{"wall_ms": 1000.0}]))
+        self.assertIsNone(rbb.compute_present_fps_avg([], present_count=10, first_present_ms=1000.0))
+        self.assertIsNone(rbb.compute_present_fps_avg(None, present_count=5, first_present_ms=1000.0))
+
+        # 6. Zero duration returns None (identical timestamps or single sample at FIRST_PRESENT)
+        self.assertIsNone(
+            rbb.compute_present_fps_avg(
+                [{"wall_ms": 1000.0}, {"wall_ms": 1000.0}],
+                present_count=2,
+                first_present_ms=1000.0,
+            )
+        )
+        self.assertIsNone(
+            rbb.compute_present_fps_avg(
+                [{"wall_ms": 125.0}],
+                present_count=6,
+                first_present_ms=125.0,
+            )
+        )
+
+        # 7. Negative duration / invalid timestamps return None
+        self.assertIsNone(rbb.compute_present_fps_avg([{"wall_ms": 2000.0}, {"wall_ms": 1000.0}]))
+        self.assertIsNone(
+            rbb.compute_present_fps_avg(
+                [{"wall_ms": float("nan")}, {"wall_ms": float("inf")}, {"wall_ms": -5.0}, {"wall_ms": True}],
+                present_count=4,
+            )
+        )
+
+    def test_quiet_server_cli_flag_and_server_command_construction(self):
+        parser = rbb.build_arg_parser()
+        self.assertFalse(parser.parse_args([]).quiet_server)
+        self.assertTrue(parser.parse_args(["--quiet-server"]).quiet_server)
+
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+
+            # Direct build_server_cmd check (quiet=False vs quiet=True)
+            cmd_default = rbb.build_server_cmd(
+                repo=fx.repo,
+                host="127.0.0.1",
+                port=8000,
+                web_dir=fx.repo / "web",
+                data_dir=fx.repo / "local-data",
+                boot_dir=fx.boot_dir,
+                game_dir=None,
+                shaders_dir=None,
+            )
+            self.assertNotIn("--quiet", cmd_default)
+
+            cmd_quiet = rbb.build_server_cmd(
+                repo=fx.repo,
+                host="127.0.0.1",
+                port=8000,
+                web_dir=fx.repo / "web",
+                data_dir=fx.repo / "local-data",
+                boot_dir=fx.boot_dir,
+                game_dir=None,
+                shaders_dir=None,
+                quiet=True,
+            )
+            self.assertIn("--quiet", cmd_quiet)
+            self.assertEqual(cmd_quiet[-1], "--quiet")
+
+            # Dry-run without vs with --quiet-server
+            code_def, out_def, err_def, _, _ = fx.run_cli("--smoke", "--dry-run", "--name", "q-def")
+            self.assertEqual(code_def, 0, err_def)
+            dry_def = json.loads(out_def)
+            self.assertFalse(dry_def["quiet_server"])
+            self.assertNotIn("--quiet", dry_def["server_command"])
+
+            code_q, out_q, err_q, _, _ = fx.run_cli("--smoke", "--dry-run", "--name", "q-on", "--quiet-server")
+            self.assertEqual(code_q, 0, err_q)
+            dry_q = json.loads(out_q)
+            self.assertTrue(dry_q["quiet_server"])
+            self.assertIn("--quiet", dry_q["server_command"])
+
+            # Live run_browser_session passes --quiet to serve_local.py (and not to Chrome)
+            spawned_cmds: list[list[str]] = []
+
+            class FakeProc:
+                returncode = None
+
+                def poll(self):
+                    return self.returncode
+
+                def terminate(self):
+                    self.returncode = 0
+
+                def wait(self, timeout=None):
+                    return 0
+
+                def kill(self):
+                    self.returncode = -9
+
+            def fake_popen(cmd, **kwargs):
+                spawned_cmds.append(list(cmd))
+                return FakeProc()
+
+            class FakeCdp:
+                def __init__(self, ws_url: str) -> None:
+                    self.ws_url = ws_url
+
+                def connect(self):
+                    return None
+
+                def close(self):
+                    return None
+
+                def send(self, method: str, params=None, timeout=None):
+                    if method == "Runtime.evaluate":
+                        return {"result": {"value": make_sample_probe(presents=2)}}
+                    return {}
+
+                def drain_events(self, timeout: float = 0.0):
+                    return []
+
+            run_dir = fx.build / "runs" / "quiet-sess"
+            run_dir.mkdir(parents=True)
+            res = rbb.run_browser_session(
+                repo=fx.repo,
+                run_dir=run_dir,
+                chrome_path=fx.chrome,
+                port=0,
+                boot_dir=None,
+                game_dir=None,
+                shaders_dir=None,
+                duration_s=0.05,
+                headless=True,
+                smoke=True,
+                send_input=False,
+                capture_frames=False,
+                frame_interval_s=1.0,
+                encode_mp4=False,
+                quiet_server=True,
+                popen_fn=fake_popen,
+                cdp_factory=FakeCdp,
+                wait_server_fn=lambda *a, **k: {"status_code": 200, "coop": "same-origin", "coep": "require-corp"},
+                wait_cdp_fn=lambda *a, **k: "ws://127.0.0.1:9222/devtools/page/1",
+            )
+            self.assertTrue(res.ok)
+            self.assertEqual(len(spawned_cmds), 2)
+            server_cmd, chrome_cmd = spawned_cmds
+            self.assertTrue(any("serve_local.py" in tok for tok in server_cmd))
+            self.assertIn("--quiet", server_cmd)
+            self.assertNotIn("--quiet", chrome_cmd)
+
+            # CLI live run forwards quiet_server=True to session_runner and command.json
+            code_cli, _, err_cli, _, sessions = fx.run_cli(
+                "--smoke",
+                "--name",
+                "quiet-cli",
+                "--quiet-server",
+                "--input-script",
+                "menu-to-ingame",
+            )
+            self.assertEqual(code_cli, 0, err_cli)
+            self.assertTrue(sessions[0]["quiet_server"])
+            self.assertEqual(sessions[0]["input_script"], "menu-to-ingame")
+            cmd_meta = json.loads((fx.build / "runs" / "quiet-cli" / "command.json").read_text(encoding="utf-8"))
+            self.assertTrue(cmd_meta["quiet_server"])
+            self.assertEqual(cmd_meta["input_script"], "menu-to-ingame")
+
+    def test_present_fps_avg_in_boot_report_telemetry_and_digest(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            probe = make_sample_probe(
+                boot_mode="real-wasm64",
+                session_state="running_wasm",
+                stage="FIRST_VISIBLE_FRAME",
+                presents=61,
+                real_draws=120,
+                fallback_draws=0,
+                milestones=[
+                    {"milestone": "PGIM_LOAD", "index": 0, "reached": True, "elapsedMs": 15.0},
+                    {"milestone": "FIRST_PRESENT", "index": 8, "reached": True, "elapsedMs": 1000.0},
+                    {"milestone": "FIRST_VISIBLE_FRAME", "index": 9, "reached": True, "elapsedMs": 3000.0},
+                ],
+            )
+            probe["bootState"]["gpu"]["firstVisibleFrameMs"] = 3000.0
+            probe["bootState"]["gpu"]["blackLoadingMs"] = 2000.0
+            probe["memory"] = {"usedJSHeapSize": 128 * 1024 * 1024, "totalJSHeapSize": 256 * 1024 * 1024}
+            probe["audioStats"] = {"guestRingAttached": True, "guestFramesDrained": 960}
+
+            session = make_fake_session_result(
+                probe=probe,
+                first_present_ms=1000.0,
+                presents=[
+                    {"index": 0, "wall_ms": 1000.0, "dispatches": 0, "import_calls": 0, "counters": {}},
+                    {"index": 1, "wall_ms": 2000.0, "dispatches": 0, "import_calls": 0, "counters": {}},
+                    {"index": 2, "wall_ms": 3000.0, "dispatches": 0, "import_calls": 0, "counters": {}},
+                ],
+            )
+
+            code, out, err, _, _ = fx.run_cli(
+                "--smoke",
+                "--name",
+                "t73-fps-run",
+                "--input-script",
+                "menu-to-ingame",
+                "--quiet-server",
+                session_runner=lambda **kw: session,
+            )
+            self.assertEqual(code, 0, err)
+            run_dir = fx.build / "runs" / "t73-fps-run"
+            report = json.loads((run_dir / "boot-report.json").read_text(encoding="utf-8"))
+            telemetry = json.loads((run_dir / "telemetry.json").read_text(encoding="utf-8"))
+            digest_text = (run_dir / "digest.txt").read_text(encoding="utf-8")
+
+            # (61 - 1) presents / (3000 - 1000 ms) = 30.0 FPS
+            self.assertEqual(report["present_fps_avg"], 30.0)
+            self.assertEqual(report["summary"]["present_fps_avg"], 30.0)
+            self.assertEqual(telemetry["present_fps_avg"], 30.0)
+            self.assertEqual(telemetry["summary"]["present_fps_avg"], 30.0)
+            self.assertIn("present_fps_avg: 30.00", digest_text)
+            self.assertIn("present_fps_avg: 30.00", out)
+            self.assertIn("input_script: menu-to-ingame", digest_text)
+
+            # T61 metrics remain intact alongside present_fps_avg
+            self.assertEqual(report["first_visible_frame_s"], 3.0)
+            self.assertEqual(report["black_loading_s"], 2.0)
+            self.assertEqual(report["js_heap_used_mb"], 128.0)
+            self.assertIs(report["audio_ring_attached"], True)
+            self.assertIn("first_visible_frame_s: 3.0 (black_loading_s=2.0)", digest_text)
+            self.assertIn("js_heap_mb: used=128.0, total=256.0", digest_text)
+            self.assertIn("audio_ring: attached=true, frames_drained=960", digest_text)
+
+            # Summary-only fallback in digest()
+            summary_only_rep = {
+                "status": "ok",
+                "phase": "FIRST_PRESENT",
+                "mode": "real-wasm64",
+                "exit_code": 0,
+                "elapsed_ms": 3000.0,
+                "milestones": [],
+                "presents": [],
+                "counters": {"presents": 61},
+                "summary": {"present_fps_avg": 29.75},
+            }
+            self.assertIn("present_fps_avg: 29.75", rbb.digest(summary_only_rep, 0))
+
+            # Null / missing present_fps_avg is null top-level and omitted from summary & digest.txt
+            single_present_sess = make_fake_session_result(
+                probe=make_sample_probe(presents=1),
+                first_present_ms=1000.0,
+                presents=[{"index": 0, "wall_ms": 1000.0, "dispatches": 0, "import_calls": 0, "counters": {}}],
+            )
+            rep_null = rbb.build_boot_report(single_present_sess, smoke=True, preset="smoke")
+            self.assertIsNone(rep_null["present_fps_avg"])
+            self.assertNotIn("present_fps_avg", rep_null["summary"])
+            self.assertNotIn("present_fps_avg:", rbb.digest(rep_null, 0))
+
+            # compare_boot_reports compatibility preserved
+            cmp_res = compare_boot_reports.compare(report, report, compare_boot_reports.Tolerances())
+            self.assertEqual(cmp_res.failures(), [])
+
+
 if __name__ == "__main__":
     unittest.main()
