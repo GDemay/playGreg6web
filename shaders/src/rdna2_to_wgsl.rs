@@ -14,7 +14,7 @@
 //! * Graceful fallback for unsupported opcodes: emits sanitized WGSL comments and
 //!   increments `unsupported_op_count` while keeping the generated WGSL valid under Naga.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
 use std::num::NonZeroU32;
 
@@ -1123,6 +1123,9 @@ fn record_src_usage(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SgprOrigin {
+    /// Lattice bottom: scratch SGPR/VGPR not yet written on this path.
+    Unwritten,
+    /// Lattice top: overwritten with a non-tracked/dynamic value or conflicting origins.
     Unknown,
     /// Hardware vertex-buffer table pointer (`s[0:1]` in vertex stages), optionally offset by bytes.
     VbTablePtr { byte_offset: i32 },
@@ -1195,11 +1198,15 @@ struct OriginState {
 
 impl OriginState {
     fn initial(stage: ShaderStage) -> Self {
-        let mut origins = [SgprOrigin::Unknown; 106];
+        let mut origins = [SgprOrigin::Unwritten; 106];
         // Seed console ABI initial SGPR origins:
-        //   Graphics: user data starts at s8; vertex hardware VB table ptr is in s[0:1].
-        //   Compute:  user data starts at s4.
+        //   Graphics: system SGPRs in s0..s7 (vertex hardware VB table ptr in s[0:1]),
+        //             user data starts at s8..s31; scratch SGPRs s32..s105 start Unwritten (bottom).
+        //   Compute:  system SGPRs in s0..s3, user data starts at s4..s31; s32..s105 Unwritten.
         let user_base: usize = if stage == ShaderStage::Compute { 4 } else { 8 };
+        for slot in origins.iter_mut().take(user_base) {
+            *slot = SgprOrigin::Unknown;
+        }
         if stage == ShaderStage::Vertex {
             origins[0] = SgprOrigin::VbTablePtr { byte_offset: 0 };
         }
@@ -1212,15 +1219,19 @@ impl OriginState {
         Self {
             origins,
             lane_origins: BTreeMap::new(),
-            vgpr_uniform_origins: [SgprOrigin::Unknown; 256],
+            vgpr_uniform_origins: [SgprOrigin::Unwritten; 256],
         }
     }
 
     /// Monotonic CFG dataflow join. Returns `true` if `self` changed.
-    fn join_from(&mut self, other: &Self) -> bool {
+    fn join_from(
+        &mut self,
+        other: &Self,
+        def_aliases: &mut BTreeMap<usize, BTreeSet<usize>>,
+    ) -> bool {
         let mut changed = false;
         for (dst, &src) in self.origins.iter_mut().zip(other.origins.iter()) {
-            let joined = join_cfg_origin(*dst, src);
+            let joined = join_cfg_origin(*dst, src, Some(def_aliases));
             if joined != *dst {
                 *dst = joined;
                 changed = true;
@@ -1231,7 +1242,7 @@ impl OriginState {
             .iter_mut()
             .zip(other.vgpr_uniform_origins.iter())
         {
-            let joined = join_cfg_origin(*dst, src);
+            let joined = join_cfg_origin(*dst, src, Some(def_aliases));
             if joined != *dst {
                 *dst = joined;
                 changed = true;
@@ -1242,8 +1253,8 @@ impl OriginState {
             for (&k, dst) in &mut self.lane_origins {
                 match other.lane_origins.get(&k).copied() {
                     Some(src) => {
-                        let joined = join_cfg_origin(*dst, src);
-                        if joined == SgprOrigin::Unknown {
+                        let joined = join_cfg_origin(*dst, src, Some(def_aliases));
+                        if matches!(joined, SgprOrigin::Unknown | SgprOrigin::Unwritten) {
                             to_remove.push(k);
                         } else if joined != *dst {
                             *dst = joined;
@@ -1285,6 +1296,7 @@ struct AnalysisCollector {
     out: DescriptorAnalysis,
     tainted_defs: BTreeSet<usize>,
     def_parents: BTreeMap<usize, usize>,
+    def_aliases: BTreeMap<usize, BTreeSet<usize>>,
     direct_descriptor_defs: BTreeSet<usize>,
     raw_descriptor_defs: BTreeSet<usize>,
     buffer_load_uses: Vec<BufferLoadUse>,
@@ -1345,6 +1357,26 @@ fn is_const_src(src: u8, origins: &[SgprOrigin; 106]) -> bool {
         || (src <= 105 && matches!(origins[src as usize], SgprOrigin::ConstImmediate { .. }))
 }
 
+fn normalize_read_origin(o: SgprOrigin) -> SgprOrigin {
+    if o == SgprOrigin::Unwritten {
+        SgprOrigin::Unknown
+    } else {
+        o
+    }
+}
+
+fn record_def_alias(
+    def_aliases: Option<&mut BTreeMap<usize, BTreeSet<usize>>>,
+    d1: usize,
+    d2: usize,
+) {
+    if d1 != d2
+        && let Some(aliases) = def_aliases
+    {
+        aliases.entry(d1.min(d2)).or_default().insert(d1.max(d2));
+    }
+}
+
 fn resolve_src_origin_u8(
     src: u8,
     literal: Option<u32>,
@@ -1352,7 +1384,7 @@ fn resolve_src_origin_u8(
     origins: &[SgprOrigin; 106],
 ) -> SgprOrigin {
     if src <= 105 {
-        origins[src as usize]
+        normalize_read_origin(origins[src as usize])
     } else if let Some(v) = decode_inline_u32_src(u16::from(src), literal) {
         SgprOrigin::ConstImmediate {
             def_inst_idx: inst_idx,
@@ -1375,9 +1407,9 @@ fn resolve_src_pair_origins(
     origins: &[SgprOrigin; 106],
 ) -> (SgprOrigin, SgprOrigin) {
     if src <= 105 {
-        let lo = origins[src as usize];
+        let lo = normalize_read_origin(origins[src as usize]);
         let hi = if src <= 104 {
-            origins[(src + 1) as usize]
+            normalize_read_origin(origins[(src + 1) as usize])
         } else {
             SgprOrigin::Unknown
         };
@@ -1430,12 +1462,17 @@ fn is_const_zero(o: SgprOrigin) -> bool {
 }
 
 /// Monotonic 4-level lattice join for CFG block merges:
-/// `Bottom < ConstZero < { NonZeroConst | KnownTable/Desc } < Unknown (Top)`.
-fn join_cfg_origin(a: SgprOrigin, b: SgprOrigin) -> SgprOrigin {
+/// `Unwritten (Bottom) < ConstZero < { NonZeroConst | KnownTable/Desc } < Unknown (Top)`.
+fn join_cfg_origin(
+    a: SgprOrigin,
+    b: SgprOrigin,
+    def_aliases: Option<&mut BTreeMap<usize, BTreeSet<usize>>>,
+) -> SgprOrigin {
     if a == b {
         return a;
     }
     match (a, b) {
+        (SgprOrigin::Unwritten, other) | (other, SgprOrigin::Unwritten) => other,
         (SgprOrigin::Unknown, _) | (_, SgprOrigin::Unknown) => SgprOrigin::Unknown,
         (
             SgprOrigin::TableDesc {
@@ -1450,12 +1487,15 @@ fn join_cfg_origin(a: SgprOrigin, b: SgprOrigin) -> SgprOrigin {
                 table_byte_offset: o2,
                 addr_offset: ao2,
             },
-        ) if u1 == u2 && o1 == o2 && ao1 == ao2 => SgprOrigin::TableDesc {
-            def_inst_idx: d1.min(d2),
-            user_sgpr: u1,
-            table_byte_offset: o1,
-            addr_offset: ao1,
-        },
+        ) if u1 == u2 && o1 == o2 && ao1 == ao2 => {
+            record_def_alias(def_aliases, d1, d2);
+            SgprOrigin::TableDesc {
+                def_inst_idx: d1.min(d2),
+                user_sgpr: u1,
+                table_byte_offset: o1,
+                addr_offset: ao1,
+            }
+        }
         (
             SgprOrigin::DynamicHeapDesc {
                 def_inst_idx: d1,
@@ -1465,10 +1505,13 @@ fn join_cfg_origin(a: SgprOrigin, b: SgprOrigin) -> SgprOrigin {
                 def_inst_idx: d2,
                 origin: h2,
             },
-        ) if h1 == h2 => SgprOrigin::DynamicHeapDesc {
-            def_inst_idx: d1.min(d2),
-            origin: h1,
-        },
+        ) if h1 == h2 => {
+            record_def_alias(def_aliases, d1, d2);
+            SgprOrigin::DynamicHeapDesc {
+                def_inst_idx: d1.min(d2),
+                origin: h1,
+            }
+        }
         (
             SgprOrigin::VbDesc {
                 def_inst_idx: d1,
@@ -1478,10 +1521,13 @@ fn join_cfg_origin(a: SgprOrigin, b: SgprOrigin) -> SgprOrigin {
                 def_inst_idx: d2,
                 vb_slot: v2,
             },
-        ) if v1 == v2 => SgprOrigin::VbDesc {
-            def_inst_idx: d1.min(d2),
-            vb_slot: v1,
-        },
+        ) if v1 == v2 => {
+            record_def_alias(def_aliases, d1, d2);
+            SgprOrigin::VbDesc {
+                def_inst_idx: d1.min(d2),
+                vb_slot: v1,
+            }
+        }
         (
             SgprOrigin::RawTableDesc {
                 def_inst_idx: d1,
@@ -1495,12 +1541,15 @@ fn join_cfg_origin(a: SgprOrigin, b: SgprOrigin) -> SgprOrigin {
                 table_offset: o2,
                 is_dynamic: dyn2,
             },
-        ) if b1 == b2 && o1 == o2 && dyn1 == dyn2 => SgprOrigin::RawTableDesc {
-            def_inst_idx: d1.min(d2),
-            table_sbase: b1,
-            table_offset: o1,
-            is_dynamic: dyn1,
-        },
+        ) if b1 == b2 && o1 == o2 && dyn1 == dyn2 => {
+            record_def_alias(def_aliases, d1, d2);
+            SgprOrigin::RawTableDesc {
+                def_inst_idx: d1.min(d2),
+                table_sbase: b1,
+                table_offset: o1,
+                is_dynamic: dyn1,
+            }
+        }
         (
             SgprOrigin::ConstImmediate {
                 def_inst_idx: d1,
@@ -1522,12 +1571,18 @@ fn join_cfg_origin(a: SgprOrigin, b: SgprOrigin) -> SgprOrigin {
 
 /// Merge two branch origins for `s_cmov_b32/b64`, `s_cmovk_i32`, `s_cselect_b32/b64`.
 /// Preserves the origin when both branches agree or when one branch is a known table/descriptor
-/// origin and the other is `Unknown` or a constant fallback (e.g. null-pointer guard).
-fn merge_select_origin(a: SgprOrigin, b: SgprOrigin, inst_idx: usize) -> SgprOrigin {
+/// origin and the other is `Unknown`, `Unwritten`, or a constant fallback (e.g. null-pointer guard).
+fn merge_select_origin(
+    a: SgprOrigin,
+    b: SgprOrigin,
+    inst_idx: usize,
+    def_aliases: Option<&mut BTreeMap<usize, BTreeSet<usize>>>,
+) -> SgprOrigin {
     if a == b {
         return a;
     }
     match (a, b) {
+        (SgprOrigin::Unwritten, other) | (other, SgprOrigin::Unwritten) => other,
         (
             SgprOrigin::TableDesc {
                 def_inst_idx: d1,
@@ -1541,12 +1596,15 @@ fn merge_select_origin(a: SgprOrigin, b: SgprOrigin, inst_idx: usize) -> SgprOri
                 table_byte_offset: o2,
                 addr_offset: ao2,
             },
-        ) if u1 == u2 && o1 == o2 && ao1 == ao2 => SgprOrigin::TableDesc {
-            def_inst_idx: d1.min(d2),
-            user_sgpr: u1,
-            table_byte_offset: o1,
-            addr_offset: ao1,
-        },
+        ) if u1 == u2 && o1 == o2 && ao1 == ao2 => {
+            record_def_alias(def_aliases, d1, d2);
+            SgprOrigin::TableDesc {
+                def_inst_idx: d1.min(d2),
+                user_sgpr: u1,
+                table_byte_offset: o1,
+                addr_offset: ao1,
+            }
+        }
         (
             SgprOrigin::DynamicHeapDesc {
                 def_inst_idx: d1,
@@ -1556,10 +1614,13 @@ fn merge_select_origin(a: SgprOrigin, b: SgprOrigin, inst_idx: usize) -> SgprOri
                 def_inst_idx: d2,
                 origin: h2,
             },
-        ) if h1 == h2 => SgprOrigin::DynamicHeapDesc {
-            def_inst_idx: d1.min(d2),
-            origin: h1,
-        },
+        ) if h1 == h2 => {
+            record_def_alias(def_aliases, d1, d2);
+            SgprOrigin::DynamicHeapDesc {
+                def_inst_idx: d1.min(d2),
+                origin: h1,
+            }
+        }
         (
             SgprOrigin::VbDesc {
                 def_inst_idx: d1,
@@ -1569,10 +1630,35 @@ fn merge_select_origin(a: SgprOrigin, b: SgprOrigin, inst_idx: usize) -> SgprOri
                 def_inst_idx: d2,
                 vb_slot: v2,
             },
-        ) if v1 == v2 => SgprOrigin::VbDesc {
-            def_inst_idx: d1.min(d2),
-            vb_slot: v1,
-        },
+        ) if v1 == v2 => {
+            record_def_alias(def_aliases, d1, d2);
+            SgprOrigin::VbDesc {
+                def_inst_idx: d1.min(d2),
+                vb_slot: v1,
+            }
+        }
+        (
+            SgprOrigin::RawTableDesc {
+                def_inst_idx: d1,
+                table_sbase: b1,
+                table_offset: o1,
+                is_dynamic: dyn1,
+            },
+            SgprOrigin::RawTableDesc {
+                def_inst_idx: d2,
+                table_sbase: b2,
+                table_offset: o2,
+                is_dynamic: dyn2,
+            },
+        ) if b1 == b2 && o1 == o2 && dyn1 == dyn2 => {
+            record_def_alias(def_aliases, d1, d2);
+            SgprOrigin::RawTableDesc {
+                def_inst_idx: d1.min(d2),
+                table_sbase: b1,
+                table_offset: o1,
+                is_dynamic: dyn1,
+            }
+        }
         (
             SgprOrigin::ConstImmediate { value: v1, .. },
             SgprOrigin::ConstImmediate { value: v2, .. },
@@ -1940,6 +2026,80 @@ fn is_synthesized_root_vsharp(origins: &[SgprOrigin; 106], rsrc_sgpr: u8) -> boo
             || matches!(origins[idx + 3], SgprOrigin::ConstImmediate { .. }))
 }
 
+/// Resolve the 4-SGPR V# descriptor origin at `s[rsrc_sgpr .. rsrc_sgpr+3]`.
+///
+/// Checks word 0 (`origins[rsrc_sgpr]`) first; when word 0 is `Unknown`/`Unwritten` (e.g.
+/// after dynamic base-address arithmetic or partial self-overwrite across a CFG merge), falls
+/// back to matching consecutive `TableDesc` / `DynamicHeapDesc` / `VbDesc` origins in words 2 & 3
+/// (`num_records` and `rsrc_word3`) from the same defining instruction.
+fn resolve_vsharp_origin(origins: &[SgprOrigin; 106], rsrc_sgpr: u8) -> SgprOrigin {
+    let idx = rsrc_sgpr as usize;
+    if idx >= origins.len() {
+        return SgprOrigin::Unknown;
+    }
+    let w0 = origins[idx];
+    if !matches!(w0, SgprOrigin::Unknown | SgprOrigin::Unwritten) {
+        return w0;
+    }
+    if idx + 3 < origins.len() {
+        match (origins[idx + 2], origins[idx + 3]) {
+            (
+                SgprOrigin::TableDesc {
+                    def_inst_idx: d2,
+                    user_sgpr: u2,
+                    table_byte_offset: o2,
+                    ..
+                },
+                SgprOrigin::TableDesc {
+                    def_inst_idx: d3,
+                    user_sgpr: u3,
+                    table_byte_offset: o3,
+                    ..
+                },
+            ) if d2 == d3 && u2 == u3 && o2 >= 8 && o3 == o2 + 4 => {
+                return SgprOrigin::TableDesc {
+                    def_inst_idx: d2,
+                    user_sgpr: u2,
+                    table_byte_offset: o2 - 8,
+                    addr_offset: 0,
+                };
+            }
+            (
+                SgprOrigin::DynamicHeapDesc {
+                    def_inst_idx: d2,
+                    origin: h2,
+                },
+                SgprOrigin::DynamicHeapDesc {
+                    def_inst_idx: d3,
+                    origin: h3,
+                },
+            ) if d2 == d3 && h2 == h3 => {
+                return SgprOrigin::DynamicHeapDesc {
+                    def_inst_idx: d2,
+                    origin: h2,
+                };
+            }
+            (
+                SgprOrigin::VbDesc {
+                    def_inst_idx: d2,
+                    vb_slot: v2,
+                },
+                SgprOrigin::VbDesc {
+                    def_inst_idx: d3,
+                    vb_slot: v3,
+                },
+            ) if d2 == d3 && v2 == v3 => {
+                return SgprOrigin::VbDesc {
+                    def_inst_idx: d2,
+                    vb_slot: v2,
+                };
+            }
+            _ => {}
+        }
+    }
+    w0
+}
+
 fn step_origin_state(
     state: &mut OriginState,
     inst_idx: usize,
@@ -1997,10 +2157,19 @@ fn step_origin_state(
                                 resolve_src_pair_origins(*ssrc0, *literal, inst_idx, &state.origins);
                             let dst_lo = state.origins[*sdst as usize];
                             let dst_hi = state.origins[(*sdst + 1) as usize];
-                            (
-                                merge_select_origin(dst_lo, src_lo, inst_idx),
-                                merge_select_origin(dst_hi, src_hi, inst_idx),
-                            )
+                            let lo = merge_select_origin(
+                                dst_lo,
+                                src_lo,
+                                inst_idx,
+                                collector.as_deref_mut().map(|c| &mut c.def_aliases),
+                            );
+                            let hi = merge_select_origin(
+                                dst_hi,
+                                src_hi,
+                                inst_idx,
+                                collector.as_deref_mut().map(|c| &mut c.def_aliases),
+                            );
+                            (lo, hi)
                         }
                         0x08 => {
                             // s_not_b64
@@ -2040,7 +2209,12 @@ fn step_origin_state(
                     0x05 => {
                         // s_cmov_b32
                         let src = resolve_src_origin_u8(*ssrc0, *literal, inst_idx, &state.origins);
-                        merge_select_origin(prev, src, inst_idx)
+                        merge_select_origin(
+                            prev,
+                            src,
+                            inst_idx,
+                            collector.as_deref_mut().map(|c| &mut c.def_aliases),
+                        )
                     }
                     0x07 => {
                         // s_not_b32
@@ -2161,6 +2335,7 @@ fn step_origin_state(
                                 value: Some(imm as u32),
                             },
                             inst_idx,
+                            collector.as_deref_mut().map(|c| &mut c.def_aliases),
                         )
                     }
                     0x0F => {
@@ -2201,7 +2376,7 @@ fn step_origin_state(
             // descriptors (if the result is later consumed by math/compare/VALU, that taints it).
             let is_addr_or_select_op = matches!(
                 *op,
-                0x00..=0x04
+                0x00..=0x05
                     | 0x0A
                     | 0x0B
                     | 0x0E
@@ -2267,10 +2442,19 @@ fn step_origin_state(
                 let (new_lo, new_hi) = match *op {
                     0x0B => {
                         // s_cselect_b64
-                        (
-                            merge_select_origin(s0_lo, s1_lo, inst_idx),
-                            merge_select_origin(s0_hi, s1_hi, inst_idx),
-                        )
+                        let lo = merge_select_origin(
+                            s0_lo,
+                            s1_lo,
+                            inst_idx,
+                            collector.as_deref_mut().map(|c| &mut c.def_aliases),
+                        );
+                        let hi = merge_select_origin(
+                            s0_hi,
+                            s1_hi,
+                            inst_idx,
+                            collector.as_deref_mut().map(|c| &mut c.def_aliases),
+                        );
+                        (lo, hi)
                     }
                     0x0F => {
                         // s_and_b64
@@ -2520,7 +2704,12 @@ fn step_origin_state(
                     0x0A => {
                         let s0 = resolve_src_origin_u8(*ssrc0, *literal, inst_idx, &state.origins);
                         let s1 = resolve_src_origin_u8(*ssrc1, *literal, inst_idx, &state.origins);
-                        next_origin = merge_select_origin(s0, s1, inst_idx);
+                        next_origin = merge_select_origin(
+                            s0,
+                            s1,
+                            inst_idx,
+                            collector.as_deref_mut().map(|c| &mut c.def_aliases),
+                        );
                     }
                     // s_and_b32
                     0x0E => {
@@ -2748,7 +2937,9 @@ fn step_origin_state(
 
             // Snapshot base & dynamic-offset origins BEFORE overwriting sdata (since sdata can
             // alias sbase_sgpr and/or soffset, e.g. `s_load_dwordx4 s[8:11], s[8:9], s10`).
-            let base_origin = if (sbase_sgpr as usize) < state.origins.len() {
+            let base_origin = if matches!(*op, 0x08..=0x0C) {
+                resolve_vsharp_origin(&state.origins, sbase_sgpr)
+            } else if (sbase_sgpr as usize) < state.origins.len() {
                 state.origins[sbase_sgpr as usize]
             } else {
                 SgprOrigin::Unknown
@@ -3099,13 +3290,15 @@ fn step_origin_state(
                         if sd <= 105 {
                             let restored = if (256..=511).contains(src0) {
                                 let vsrc = (*src0 - 256) as u8;
-                                state
-                                    .lane_origins
-                                    .get(&(vsrc, 0))
-                                    .copied()
-                                    .unwrap_or(state.vgpr_uniform_origins[vsrc as usize])
+                                normalize_read_origin(
+                                    state
+                                        .lane_origins
+                                        .get(&(vsrc, 0))
+                                        .copied()
+                                        .unwrap_or(state.vgpr_uniform_origins[vsrc as usize]),
+                                )
                             } else if *src0 <= 105 {
-                                state.origins[*src0 as usize]
+                                normalize_read_origin(state.origins[*src0 as usize])
                             } else {
                                 SgprOrigin::Unknown
                             };
@@ -3220,13 +3413,15 @@ fn step_origin_state(
                 if sd <= 105 {
                     let restored = if (256..=511).contains(src0) {
                         let vsrc = (*src0 - 256) as u8;
-                        state
-                            .lane_origins
-                            .get(&(vsrc, 0))
-                            .copied()
-                            .unwrap_or(state.vgpr_uniform_origins[vsrc as usize])
+                        normalize_read_origin(
+                            state
+                                .lane_origins
+                                .get(&(vsrc, 0))
+                                .copied()
+                                .unwrap_or(state.vgpr_uniform_origins[vsrc as usize]),
+                        )
                     } else if *src0 <= 105 {
-                        state.origins[*src0 as usize]
+                        normalize_read_origin(state.origins[*src0 as usize])
                     } else {
                         SgprOrigin::Unknown
                     };
@@ -3269,7 +3464,7 @@ fn step_origin_state(
                 if sd <= 105 {
                     let restored = if (256..=511).contains(src0) {
                         let vsrc = (*src0 - 256) as u8;
-                        if let Some(lane) =
+                        let raw = if let Some(lane) =
                             resolve_const_lane_index(*src1, *literal, &state.origins)
                         {
                             state
@@ -3279,7 +3474,8 @@ fn step_origin_state(
                                 .unwrap_or(state.vgpr_uniform_origins[vsrc as usize])
                         } else {
                             state.vgpr_uniform_origins[vsrc as usize]
-                        }
+                        };
+                        normalize_read_origin(raw)
                     } else {
                         SgprOrigin::Unknown
                     };
@@ -3456,11 +3652,7 @@ fn step_origin_state(
             }
             if let Some(col) = collector.as_deref_mut() {
                 let rsrc_sgpr = srsrc.saturating_mul(4);
-                let origin = if (rsrc_sgpr as usize) < state.origins.len() {
-                    state.origins[rsrc_sgpr as usize]
-                } else {
-                    SgprOrigin::Unknown
-                };
+                let origin = resolve_vsharp_origin(&state.origins, rsrc_sgpr);
                 match origin {
                     SgprOrigin::VbDesc {
                         def_inst_idx,
@@ -3541,11 +3733,7 @@ fn step_origin_state(
             }
             if let Some(col) = collector.as_deref_mut() {
                 let rsrc_sgpr = srsrc.saturating_mul(4);
-                let origin = if (rsrc_sgpr as usize) < state.origins.len() {
-                    state.origins[rsrc_sgpr as usize]
-                } else {
-                    SgprOrigin::Unknown
-                };
+                let origin = resolve_vsharp_origin(&state.origins, rsrc_sgpr);
                 match origin {
                     SgprOrigin::VbDesc {
                         def_inst_idx,
@@ -3636,24 +3824,31 @@ fn mark_untainted_def_and_parents(
     start_def: usize,
     force_start: bool,
     def_parents: &BTreeMap<usize, usize>,
+    def_aliases: &BTreeMap<usize, BTreeSet<usize>>,
     tainted_defs: &BTreeSet<usize>,
     vsharp_fetch_insts: &mut BTreeSet<usize>,
 ) {
-    if force_start || !tainted_defs.contains(&start_def) {
-        vsharp_fetch_insts.insert(start_def);
-    }
-    let mut cur = start_def;
-    for _ in 0..8 {
-        let Some(&parent) = def_parents.get(&cur) else {
-            break;
-        };
-        if parent == cur {
-            break;
+    let mut visited: BTreeSet<usize> = BTreeSet::new();
+    let mut stack: Vec<(usize, bool)> = vec![(start_def, force_start)];
+    while let Some((cur, forced)) = stack.pop() {
+        if visited.len() >= 32 || !visited.insert(cur) {
+            continue;
         }
-        if !tainted_defs.contains(&parent) {
-            vsharp_fetch_insts.insert(parent);
+        if forced || !tainted_defs.contains(&cur) {
+            vsharp_fetch_insts.insert(cur);
         }
-        cur = parent;
+        if let Some(aliases) = def_aliases.get(&cur) {
+            for &alias in aliases {
+                if !visited.contains(&alias) {
+                    stack.push((alias, forced));
+                }
+            }
+        }
+        if let Some(&parent) = def_parents.get(&cur)
+            && !visited.contains(&parent)
+        {
+            stack.push((parent, false));
+        }
     }
 }
 
@@ -3661,7 +3856,7 @@ fn mark_untainted_def_and_parents(
 /// SGPR provenance (`s8+` graphics, `s4+` compute) across CFG basic blocks, SALU address
 /// derivation, 2-level nested table pointers, VGPR lane/uniform spills, hardware VB-table
 /// (`s[0:1]`), SM 6.6 dynamic descriptor heaps, and inline static-sampler S# origins
-/// for `<pack>.reflect.json` (S31 / #662, S34 / #733, S40 / #890).
+/// for `<pack>.reflect.json` (S31 / #662, S34 / #733, S40 / #890, S41 / #917).
 fn analyze_vsharp_indirections(
     active: &[Rdna2Instruction],
     stage: ShaderStage,
@@ -3675,18 +3870,21 @@ fn analyze_vsharp_indirections(
 
     // Pass 1: Monotonic forward dataflow fixpoint over CFG basic blocks so clobbers on one
     // branch (e.g. before `s_branch` / early `s_endpgm`) never pollute sibling blocks.
+    // Use an ordered `BTreeSet` worklist (lowest block ID first = near-RPO, deduplicated) so
+    // chained `if/else` diamonds converge linearly without burning the per-block visit budget.
     let mut block_in: Vec<Option<OriginState>> = vec![None; num_blocks];
     let mut visits: Vec<u8> = vec![0; num_blocks];
-    let mut worklist: VecDeque<BlockId> = VecDeque::new();
+    let mut worklist: BTreeSet<BlockId> = BTreeSet::new();
+    let mut pass1_def_aliases: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
     let entry_state = OriginState::initial(stage);
     let Some(entry) = cfg.entry() else {
         return DescriptorAnalysis::default();
     };
     block_in[entry] = Some(entry_state.clone());
-    worklist.push_back(entry);
+    worklist.insert(entry);
 
-    while let Some(bid) = worklist.pop_front() {
-        if visits[bid] >= 16 {
+    while let Some(bid) = worklist.pop_first() {
+        if visits[bid] >= 32 {
             continue;
         }
         visits[bid] += 1;
@@ -3707,11 +3905,11 @@ fn analyze_vsharp_indirections(
             match &mut block_in[succ] {
                 None => {
                     block_in[succ] = Some(state.clone());
-                    worklist.push_back(succ);
+                    worklist.insert(succ);
                 }
                 Some(existing) => {
-                    if existing.join_from(&state) {
-                        worklist.push_back(succ);
+                    if existing.join_from(&state, &mut pass1_def_aliases) {
+                        worklist.insert(succ);
                     }
                 }
             }
@@ -3720,7 +3918,10 @@ fn analyze_vsharp_indirections(
 
     // Pass 2: Single pass over every non-synthetic block using converged incoming origins to
     // record descriptor uses, tainting, nested pointer chains, and CBV sources.
-    let mut collector = AnalysisCollector::default();
+    let mut collector = AnalysisCollector {
+        def_aliases: pass1_def_aliases,
+        ..AnalysisCollector::default()
+    };
     for (bid, block) in cfg.blocks.iter().enumerate() {
         if block.synthetic_exit || block.instr_range.is_empty() {
             continue;
@@ -3742,6 +3943,7 @@ fn analyze_vsharp_indirections(
         mut out,
         tainted_defs,
         def_parents,
+        def_aliases,
         direct_descriptor_defs,
         raw_descriptor_defs,
         buffer_load_uses,
@@ -3755,6 +3957,7 @@ fn analyze_vsharp_indirections(
             def_idx,
             true,
             &def_parents,
+            &def_aliases,
             &tainted_defs,
             &mut out.vsharp_fetch_insts,
         );
@@ -3766,6 +3969,7 @@ fn analyze_vsharp_indirections(
                 def_idx,
                 false,
                 &def_parents,
+                &def_aliases,
                 &tainted_defs,
                 &mut out.vsharp_fetch_insts,
             );
@@ -3773,11 +3977,16 @@ fn analyze_vsharp_indirections(
     }
 
     for buf_use in buffer_load_uses {
-        if !tainted_defs.contains(&buf_use.def_inst_idx) {
+        if buf_use.source.is_some() {
+            // `s_buffer_load_*` consumes a 128-bit hardware V# descriptor from a known
+            // descriptor table or dynamic heap. Always suppress its V# load(s) and attribute
+            // the CBV read even if a V# word (e.g. `num_records` / stride) or a copied SGPR
+            // pair was also inspected by scalar/vector ALU or comparisons (S41 / #917).
             mark_untainted_def_and_parents(
                 buf_use.def_inst_idx,
-                false,
+                true,
                 &def_parents,
+                &def_aliases,
                 &tainted_defs,
                 &mut out.vsharp_fetch_insts,
             );
@@ -3786,6 +3995,20 @@ fn analyze_vsharp_indirections(
                 if let Some(src) = buf_use.source {
                     out.cbv_sources.entry(key).or_insert(src);
                 }
+            }
+        } else if !tainted_defs.contains(&buf_use.def_inst_idx)
+            || out.vsharp_fetch_insts.contains(&buf_use.def_inst_idx)
+        {
+            mark_untainted_def_and_parents(
+                buf_use.def_inst_idx,
+                false,
+                &def_parents,
+                &def_aliases,
+                &tainted_defs,
+                &mut out.vsharp_fetch_insts,
+            );
+            if let Some(key) = buf_use.cbv_key {
+                out.indirect_smem_cbv_keys.insert(buf_use.inst_idx, key);
             }
         }
     }
@@ -3799,6 +4022,7 @@ fn analyze_vsharp_indirections(
                     ptr_load.ptr_def,
                     false,
                     &def_parents,
+                    &def_aliases,
                     &tainted_defs,
                     &mut out.vsharp_fetch_insts,
                 );
@@ -18854,6 +19078,238 @@ mod tests {
         assert!(
             json.contains("\"source\": {\"user_sgpr\": 4, \"root_descriptor\": true}"),
             "JSON:\n{json}"
+        );
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    // -- S41 (#917): Fix S40 vertex stage reflection regression --
+
+    #[test]
+    fn s41_vertex_split_s_mov_b64_self_overwrite_tainted_vsharp_and_root_descriptor_no_none_source()
+    {
+        // Reproduces the exact GFX10.3 vertex shader pattern from Issue #917:
+        //   - V# loaded from s17 + 0x40 into s[12:15]
+        //   - s_buffer_load_dwordx2 s[22:23], s[12:15], 0x0
+        //   - s_mov_b64 s[24:25], s12 (copies low 64 bits of V#)
+        //   - s_buffer_load_dwordx2 s[12:13], s[12:15], s18 (reads s[12:15] AND overwrites s[12:13])
+        //   - s_mov_b64 s[26:27], s14 (copies high 64 bits of V#)
+        //   - scalar compare on V# word 2 (s26 / num_records) taints the V# load def
+        //   - s_mov_b32 s12, s24 restores s12 before buffer_load_dword v2, v2, s[12:15], 0 offen
+        //   - Synthesized RootDescriptor V# in s[12:15] from s[19:20] with s_buffer_load_* overwriting
+        //     s17 and s19 while continuing to read s[12:15]
+        //   - Subsequent table V# reloads from s16 + 0x40 and s17 + {0x0, 0x60, 0x80}
+        //   - Final buffer_load_dword using the split-copied V# in s[24:27]
+        //
+        // Previously in S40, tainting def(s[12:15]) dropped indirect_smem_cbv_keys for the earlier
+        // s_buffer_load_dwordx2 reads on s[12:15], emitting a `cb` binding with `source: None`.
+        let mut words = Vec::new();
+        words.push(enc_sop1(0x03, 10, 17)); // s_mov_b32 s10, s17
+        words.push(enc_sop1(0x03, 11, 0x80)); // s_mov_b32 s11, 0
+        words.extend_from_slice(&enc_smem(0x02, 12, 5, 0x7D, 0x40, false, false)); // s_load_dwordx4 s[12:15], s[10:11], 0x40
+        words.extend_from_slice(&enc_smem(0x09, 22, 6, 0x7D, 0x0, false, false)); // s_buffer_load_dwordx2 s[22:23], s[12:15], 0x0
+        words.push(enc_sop1(0x04, 24, 12)); // s_mov_b64 s[24:25], s[12:13]
+        words.extend_from_slice(&enc_smem(0x09, 12, 6, 18, 0x0, false, false)); // s_buffer_load_dwordx2 s[12:13], s[12:15], s18
+        words.push(enc_sop1(0x04, 26, 14)); // s_mov_b64 s[26:27], s[14:15]
+        // Inspect V# word 2 (num_records) in s26 -> taints the V# load def!
+        words.push(enc_sopc(0x06, 26, 128 + 0)); // s_cmp_eq_u32 s26, 0
+        // Restore s12 from s24 and read storage buffer via s[12:15] (offen)
+        words.push(enc_sop1(0x03, 12, 24)); // s_mov_b32 s12, s24
+        let mubuf_s12_w0 = (0b111000u32 << 26) | (0x0Cu32 << 18) | (1u32 << 12); // buffer_load_dword offen
+        let mubuf_s12_w1 = (0x80u32 << 24) | (3u32 << 16) | (2u32 << 8) | 2u32; // vdata=v2, vaddr=v2, srsrc=3 (s[12:15])
+        words.extend_from_slice(&[mubuf_s12_w0, mubuf_s12_w1]);
+        // Synthesize RootDescriptor V# in s[12:15] from s[19:20]
+        words.push(enc_sop1(0x03, 12, 19)); // s_mov_b32 s12, s19
+        words.push(enc_sop1(0x03, 13, 20)); // s_mov_b32 s13, s20
+        words.push(enc_sop1(0x03, 14, 193)); // s_mov_b32 s14, -1
+        words.push(enc_sop1(0x03, 15, 0xFF)); // s_mov_b32 s15, 0x31016fac
+        words.push(0x3101_6FAC);
+        words.extend_from_slice(&enc_smem(0x0B, 40, 6, 0x7D, 0x60, false, false)); // s_buffer_load_dwordx8 s[40:47], s[12:15], 0x60
+        words.extend_from_slice(&enc_smem(0x08, 17, 6, 0x7D, 0x0, false, false)); // s_buffer_load_dword s17, s[12:15], 0x0
+        words.extend_from_slice(&enc_smem(0x08, 19, 6, 0x7D, 0xC, false, false)); // s_buffer_load_dword s19, s[12:15], 0xc
+        words.extend_from_slice(&enc_smem(0x08, 17, 6, 0x7D, 0x18, false, false)); // s_buffer_load_dword s17, s[12:15], 0x18
+        // Reload table V# descriptors from s16 + 0x40 and s17 + {0x0, 0x60, 0x80}
+        words.extend_from_slice(&enc_smem(0x02, 12, 8, 0x7D, 0x40, false, false)); // s_load_dwordx4 s[12:15], s[16:17], 0x40
+        words.extend_from_slice(&enc_smem(0x08, 30, 6, 0x7D, 0x0, false, false)); // s_buffer_load_dword s30, s[12:15], 0x0
+        words.extend_from_slice(&enc_smem(0x02, 16, 5, 0x7D, 0x0, false, false)); // s_load_dwordx4 s[16:19], s[10:11], 0x0
+        words.extend_from_slice(&enc_smem(0x08, 31, 8, 0x7D, 0x0, false, false)); // s_buffer_load_dword s31, s[16:19], 0x0
+        words.extend_from_slice(&enc_smem(0x02, 40, 5, 0x7D, 0x60, false, false)); // s_load_dwordx4 s[40:43], s[10:11], 0x60
+        words.extend_from_slice(&enc_smem(0x08, 32, 20, 0x7D, 0x0, false, false)); // s_buffer_load_dword s32, s[40:43], 0x0
+        words.extend_from_slice(&enc_smem(0x02, 12, 5, 0x7D, 0x80, false, false)); // s_load_dwordx4 s[12:15], s[10:11], 0x80
+        words.extend_from_slice(&enc_smem(0x08, 33, 6, 0x7D, 0x0, false, false)); // s_buffer_load_dword s33, s[12:15], 0x0
+        // Final buffer_load_dword using the split-copied V# in s[24:27] (srsrc=6)
+        let mubuf_s24_w0 = (0b111000u32 << 26) | (0x0Cu32 << 18) | (1u32 << 12);
+        let mubuf_s24_w1 = (0x80u32 << 24) | (6u32 << 16) | (3u32 << 8) | 2u32; // vdata=v3, vaddr=v2, srsrc=6 (s[24:27])
+        words.extend_from_slice(&[mubuf_s24_w0, mubuf_s24_w1]);
+        // Combine results and export pos0
+        words.push(enc_vop2(0x03, 2, 22, 2)); // v2 += s22
+        words.push(enc_vop2(0x03, 3, 30, 3)); // v3 += s30
+        words.push(enc_vop2(0x03, 4, 31, 2)); // v4 = s31 + v2
+        words.push(enc_vop2(0x03, 5, 32, 3)); // v5 = s32 + v3
+        words.push(enc_vop2(0x03, 5, 33, 5)); // v5 += s33
+        words.extend_from_slice(&enc_exp(12, 0xF, false, true, false, [2, 3, 4, 5]));
+        words.push(enc_sopp(0x01, 0));
+
+        let out = translate_as(&words, Rdna2StageOverride::Vertex);
+        assert!(out.naga_validated);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert!(
+            out.bindings.iter().all(|b| b.source.is_some()),
+            "every binding must have a non-None reflected source (zero source: None): {:?}",
+            out.bindings
+        );
+
+        let cbv_sources: Vec<WgslBindingSource> = out
+            .bindings
+            .iter()
+            .filter(|b| b.kind == "uniform")
+            .map(|b| b.source.expect("uniform binding must have source"))
+            .collect();
+        assert_eq!(
+            cbv_sources,
+            vec![
+                WgslBindingSource::Table {
+                    user_sgpr: 16,
+                    table_byte_offset: 0x40,
+                },
+                WgslBindingSource::Table {
+                    user_sgpr: 17,
+                    table_byte_offset: 0x0,
+                },
+                WgslBindingSource::Table {
+                    user_sgpr: 17,
+                    table_byte_offset: 0x40,
+                },
+                WgslBindingSource::Table {
+                    user_sgpr: 17,
+                    table_byte_offset: 0x60,
+                },
+                WgslBindingSource::Table {
+                    user_sgpr: 17,
+                    table_byte_offset: 0x80,
+                },
+                WgslBindingSource::RootDescriptor { user_sgpr: 19 },
+            ],
+            "bindings: {:?}",
+            out.bindings
+        );
+
+        let sbufs: Vec<_> = out
+            .bindings
+            .iter()
+            .filter(|b| b.kind == "read-only-storage")
+            .collect();
+        assert_eq!(sbufs.len(), 1, "bindings: {:?}", out.bindings);
+        assert_eq!(
+            sbufs[0].source,
+            Some(WgslBindingSource::Table {
+                user_sgpr: 17,
+                table_byte_offset: 0x40,
+            })
+        );
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn s41_vsharp_word23_recovery_cfg_unwritten_scratch_and_merged_branch_defs() {
+        // Exercises three additional S41 reflection fixes in one vertex shader:
+        //   1. Dynamic base-address offset on V# words 0..1 (`s_add_u32 s12, s24, s22;
+        //      s_addc_u32 s13, s25, 0`) while words 2..3 (`s14..s15`) still carry intact
+        //      `TableDesc(s17, 0x40 + 8/12)` -> recovers `Table(s17, 0x40)` for both
+        //      `s_buffer_load_dword` and `buffer_load_dword`.
+        //   2. High scratch SGPR `s[40:43]` (`>= s32`, starts `Unwritten`) initialized inside
+        //      an `if` branch (`s17 + 0x60`) and consumed after the merge -> keeps `Table(s17, 0x60)`
+        //      instead of being wiped to `Unknown` by the unwritten skip edge.
+        //   3. Two branches of an `if/else` diamond both load `s[44:47]` from `s17 + 0x80`
+        //      at distinct instructions (`d1` and `d2`) and merge before `s_buffer_load_dword` ->
+        //      BOTH `d1` and `d2` are suppressed (no leaked `RootDescriptor(s17)` CBV).
+        let mut words = Vec::new();
+        words.push(enc_sop1(0x03, 10, 17)); // s10 = s17
+        words.push(enc_sop1(0x03, 11, 0x80)); // s11 = 0
+        words.extend_from_slice(&enc_smem(0x02, 12, 5, 0x7D, 0x40, false, false)); // V# @ s17+0x40
+        words.extend_from_slice(&enc_smem(0x09, 22, 6, 0x7D, 0x0, false, false)); // s[22:23] = dynamic data
+        words.push(enc_sop1(0x04, 24, 12)); // s[24:25] = s[12:13]
+        // Dynamic offset added to base_addr_lo/hi of s[12:15]; s[14:15] remain TableDesc(s17, 72/76)
+        words.push(enc_sop2(0x00, 12, 24, 22)); // s_add_u32 s12, s24, s22 (Unknown!)
+        words.push(enc_sop2(0x04, 13, 25, 128 + 0)); // s_addc_u32 s13, s25, 0 (Unknown!)
+        words.extend_from_slice(&enc_smem(0x08, 28, 6, 0x7D, 0x0, false, false)); // s_buffer_load_dword s28, s[12:15], 0
+        let mubuf_w0 = (0b111000u32 << 26) | (0x0Cu32 << 18) | (1u32 << 12);
+        let mubuf_w1 = (0x80u32 << 24) | (3u32 << 16) | (2u32 << 8) | 2u32;
+        words.extend_from_slice(&[mubuf_w0, mubuf_w1]); // buffer_load_dword v2, v2, s[12:15], 0 offen
+
+        // 2. Skip-if initializing high scratch SGPR s[40:43] (`Unwritten` on skip path)
+        words.push(enc_sopc(0x06, 22, 128 + 0));
+        let skip_branch_idx = words.len();
+        words.push(0); // s_cbranch_scc0 AFTER_INIT
+        words.extend_from_slice(&enc_smem(0x02, 40, 5, 0x7D, 0x60, false, false)); // s[40:43] = V# @ s17+0x60
+        let after_init_off = words.len() * 4;
+        words[skip_branch_idx] = enc_sopp(0x04, branch_simm(skip_branch_idx * 4, after_init_off));
+        words.extend_from_slice(&enc_smem(0x08, 29, 20, 0x7D, 0x0, false, false)); // s_buffer_load_dword s29, s[40:43], 0
+
+        // 3. If/else diamond loading s[44:47] from s17+0x80 on BOTH branches (d1 and d2)
+        words.push(enc_sopc(0x06, 23, 128 + 0));
+        let diamond_cbranch_idx = words.len();
+        words.push(0); // s_cbranch_scc0 ELSE
+        words.extend_from_slice(&enc_smem(0x02, 44, 5, 0x7D, 0x80, false, false)); // d1: s[44:47] @ s17+0x80
+        let diamond_sbranch_idx = words.len();
+        words.push(0); // s_branch MERGE
+        let else_off = words.len() * 4;
+        words.extend_from_slice(&enc_smem(0x02, 44, 5, 0x7D, 0x80, false, false)); // d2: s[44:47] @ s17+0x80
+        let merge_off = words.len() * 4;
+        words[diamond_cbranch_idx] = enc_sopp(0x04, branch_simm(diamond_cbranch_idx * 4, else_off));
+        words[diamond_sbranch_idx] = enc_sopp(0x02, branch_simm(diamond_sbranch_idx * 4, merge_off));
+        words.extend_from_slice(&enc_smem(0x08, 30, 22, 0x7D, 0x0, false, false)); // s_buffer_load_dword s30, s[44:47], 0
+
+        words.push(enc_vop2(0x03, 2, 28, 2));
+        words.push(enc_vop2(0x03, 3, 29, 2));
+        words.push(enc_vop2(0x03, 4, 30, 3));
+        words.extend_from_slice(&enc_exp(12, 0xF, false, true, false, [2, 3, 4, 4]));
+        words.push(enc_sopp(0x01, 0));
+
+        let out = translate_as(&words, Rdna2StageOverride::Vertex);
+        assert!(out.naga_validated);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert!(
+            out.bindings.iter().all(|b| b.source.is_some()),
+            "every binding must have a non-None reflected source: {:?}",
+            out.bindings
+        );
+
+        let cbv_sources: Vec<WgslBindingSource> = out
+            .bindings
+            .iter()
+            .filter(|b| b.kind == "uniform")
+            .map(|b| b.source.expect("uniform binding must have source"))
+            .collect();
+        assert_eq!(
+            cbv_sources,
+            vec![
+                WgslBindingSource::Table {
+                    user_sgpr: 17,
+                    table_byte_offset: 0x40,
+                },
+                WgslBindingSource::Table {
+                    user_sgpr: 17,
+                    table_byte_offset: 0x60,
+                },
+                WgslBindingSource::Table {
+                    user_sgpr: 17,
+                    table_byte_offset: 0x80,
+                },
+            ],
+            "merged branch V# defs must both be suppressed without leaking RootDescriptor(17): {:?}",
+            out.bindings
+        );
+        let sbuf = out
+            .bindings
+            .iter()
+            .find(|b| b.kind == "read-only-storage")
+            .expect("expected read-only-storage binding");
+        assert_eq!(
+            sbuf.source,
+            Some(WgslBindingSource::Table {
+                user_sgpr: 17,
+                table_byte_offset: 0x40,
+            })
         );
         assert_naga_wgsl_valid(&out.wgsl);
     }
