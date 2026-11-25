@@ -7,6 +7,7 @@
   'use strict';
 
   const WEBGPU_BYTES_PER_ROW_ALIGNMENT = 256;
+  const DXGI_FORMAT_MAX_ID = 132;
   const DEFAULT_MAX_SCRATCH_BYTES = 16 * 1024 * 1024; // 16 MiB upper cap for persistent scratch pool
   const A8_UNORM_EXPANDED_WEBGPU_FORMAT = 'rgba8unorm';
   const TEXTURE_COMPRESSION_BC_FEATURE = 'texture-compression-bc';
@@ -99,71 +100,107 @@
   const BC_FORMAT_PATTERN = /^bc[1-7]/;
   const COMPRESSED_FORMAT_PATTERN = /^(bc[1-7]|etc2-|eac-|astc-)/;
 
-  // Canonical WebGPU GPUTextureFormat block geometry (blockWidth, blockHeight, bytesPerBlock).
+  function makeWebGpuInfo(
+    webgpuFormat,
+    blockWidth,
+    blockHeight,
+    bytesPerBlock,
+    options = {}
+  ) {
+    const isDepth = Boolean(options.isDepth);
+    const hasStencil = Boolean(options.hasStencil);
+    const aspect =
+      options.aspect ||
+      (hasStencil && !isDepth
+        ? 'stencil-only'
+        : isDepth && !hasStencil
+          ? 'depth-only'
+          : 'all');
+    return Object.freeze({
+      webgpuFormat,
+      blockWidth,
+      blockHeight,
+      bytesPerBlock,
+      aspect,
+      isCompressed: Boolean(options.isCompressed),
+      isDepth,
+      hasStencil,
+      isSrgb: Boolean(options.isSrgb),
+      isHdr: Boolean(options.isHdr),
+      requiresFeature: options.requiresFeature || null,
+    });
+  }
+
+  // Canonical WebGPU GPUTextureFormat block geometry, aspect, sRGB, HDR, and feature metadata.
   const WEBGPU_FORMAT_INFO = Object.freeze({
-    r8unorm: Object.freeze({ webgpuFormat: 'r8unorm', blockWidth: 1, blockHeight: 1, bytesPerBlock: 1, isCompressed: false, isDepth: false, isSrgb: false }),
-    r8snorm: Object.freeze({ webgpuFormat: 'r8snorm', blockWidth: 1, blockHeight: 1, bytesPerBlock: 1, isCompressed: false, isDepth: false, isSrgb: false }),
-    r8uint: Object.freeze({ webgpuFormat: 'r8uint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 1, isCompressed: false, isDepth: false, isSrgb: false }),
-    r8sint: Object.freeze({ webgpuFormat: 'r8sint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 1, isCompressed: false, isDepth: false, isSrgb: false }),
-    r16unorm: Object.freeze({ webgpuFormat: 'r16unorm', blockWidth: 1, blockHeight: 1, bytesPerBlock: 2, isCompressed: false, isDepth: false, isSrgb: false }),
-    r16snorm: Object.freeze({ webgpuFormat: 'r16snorm', blockWidth: 1, blockHeight: 1, bytesPerBlock: 2, isCompressed: false, isDepth: false, isSrgb: false }),
-    r16uint: Object.freeze({ webgpuFormat: 'r16uint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 2, isCompressed: false, isDepth: false, isSrgb: false }),
-    r16sint: Object.freeze({ webgpuFormat: 'r16sint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 2, isCompressed: false, isDepth: false, isSrgb: false }),
-    r16float: Object.freeze({ webgpuFormat: 'r16float', blockWidth: 1, blockHeight: 1, bytesPerBlock: 2, isCompressed: false, isDepth: false, isSrgb: false }),
-    rg8unorm: Object.freeze({ webgpuFormat: 'rg8unorm', blockWidth: 1, blockHeight: 1, bytesPerBlock: 2, isCompressed: false, isDepth: false, isSrgb: false }),
-    rg8snorm: Object.freeze({ webgpuFormat: 'rg8snorm', blockWidth: 1, blockHeight: 1, bytesPerBlock: 2, isCompressed: false, isDepth: false, isSrgb: false }),
-    rg8uint: Object.freeze({ webgpuFormat: 'rg8uint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 2, isCompressed: false, isDepth: false, isSrgb: false }),
-    rg8sint: Object.freeze({ webgpuFormat: 'rg8sint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 2, isCompressed: false, isDepth: false, isSrgb: false }),
-    r32uint: Object.freeze({ webgpuFormat: 'r32uint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
-    r32sint: Object.freeze({ webgpuFormat: 'r32sint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
-    r32float: Object.freeze({ webgpuFormat: 'r32float', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
-    rg16unorm: Object.freeze({ webgpuFormat: 'rg16unorm', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
-    rg16snorm: Object.freeze({ webgpuFormat: 'rg16snorm', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
-    rg16uint: Object.freeze({ webgpuFormat: 'rg16uint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
-    rg16sint: Object.freeze({ webgpuFormat: 'rg16sint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
-    rg16float: Object.freeze({ webgpuFormat: 'rg16float', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
-    rgba8unorm: Object.freeze({ webgpuFormat: 'rgba8unorm', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
-    'rgba8unorm-srgb': Object.freeze({ webgpuFormat: 'rgba8unorm-srgb', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: true }),
-    rgba8snorm: Object.freeze({ webgpuFormat: 'rgba8snorm', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
-    rgba8uint: Object.freeze({ webgpuFormat: 'rgba8uint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
-    rgba8sint: Object.freeze({ webgpuFormat: 'rgba8sint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
-    bgra8unorm: Object.freeze({ webgpuFormat: 'bgra8unorm', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
-    'bgra8unorm-srgb': Object.freeze({ webgpuFormat: 'bgra8unorm-srgb', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: true }),
-    rgb9e5ufloat: Object.freeze({ webgpuFormat: 'rgb9e5ufloat', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
-    rgb10a2uint: Object.freeze({ webgpuFormat: 'rgb10a2uint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
-    rgb10a2unorm: Object.freeze({ webgpuFormat: 'rgb10a2unorm', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
-    rg11b10ufloat: Object.freeze({ webgpuFormat: 'rg11b10ufloat', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
-    rg32uint: Object.freeze({ webgpuFormat: 'rg32uint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 8, isCompressed: false, isDepth: false, isSrgb: false }),
-    rg32sint: Object.freeze({ webgpuFormat: 'rg32sint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 8, isCompressed: false, isDepth: false, isSrgb: false }),
-    rg32float: Object.freeze({ webgpuFormat: 'rg32float', blockWidth: 1, blockHeight: 1, bytesPerBlock: 8, isCompressed: false, isDepth: false, isSrgb: false }),
-    rgba16unorm: Object.freeze({ webgpuFormat: 'rgba16unorm', blockWidth: 1, blockHeight: 1, bytesPerBlock: 8, isCompressed: false, isDepth: false, isSrgb: false }),
-    rgba16snorm: Object.freeze({ webgpuFormat: 'rgba16snorm', blockWidth: 1, blockHeight: 1, bytesPerBlock: 8, isCompressed: false, isDepth: false, isSrgb: false }),
-    rgba16uint: Object.freeze({ webgpuFormat: 'rgba16uint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 8, isCompressed: false, isDepth: false, isSrgb: false }),
-    rgba16sint: Object.freeze({ webgpuFormat: 'rgba16sint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 8, isCompressed: false, isDepth: false, isSrgb: false }),
-    rgba16float: Object.freeze({ webgpuFormat: 'rgba16float', blockWidth: 1, blockHeight: 1, bytesPerBlock: 8, isCompressed: false, isDepth: false, isSrgb: false }),
-    rgba32uint: Object.freeze({ webgpuFormat: 'rgba32uint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 16, isCompressed: false, isDepth: false, isSrgb: false }),
-    rgba32sint: Object.freeze({ webgpuFormat: 'rgba32sint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 16, isCompressed: false, isDepth: false, isSrgb: false }),
-    rgba32float: Object.freeze({ webgpuFormat: 'rgba32float', blockWidth: 1, blockHeight: 1, bytesPerBlock: 16, isCompressed: false, isDepth: false, isSrgb: false }),
-    stencil8: Object.freeze({ webgpuFormat: 'stencil8', blockWidth: 1, blockHeight: 1, bytesPerBlock: 1, isCompressed: false, isDepth: true, isSrgb: false }),
-    depth16unorm: Object.freeze({ webgpuFormat: 'depth16unorm', blockWidth: 1, blockHeight: 1, bytesPerBlock: 2, isCompressed: false, isDepth: true, isSrgb: false }),
-    depth24plus: Object.freeze({ webgpuFormat: 'depth24plus', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: true, isSrgb: false }),
-    'depth24plus-stencil8': Object.freeze({ webgpuFormat: 'depth24plus-stencil8', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: true, isSrgb: false }),
-    depth32float: Object.freeze({ webgpuFormat: 'depth32float', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: true, isSrgb: false }),
-    'depth32float-stencil8': Object.freeze({ webgpuFormat: 'depth32float-stencil8', blockWidth: 1, blockHeight: 1, bytesPerBlock: 8, isCompressed: false, isDepth: true, isSrgb: false }),
-    'bc1-rgba-unorm': Object.freeze({ webgpuFormat: 'bc1-rgba-unorm', blockWidth: 4, blockHeight: 4, bytesPerBlock: 8, isCompressed: true, isDepth: false, isSrgb: false }),
-    'bc1-rgba-unorm-srgb': Object.freeze({ webgpuFormat: 'bc1-rgba-unorm-srgb', blockWidth: 4, blockHeight: 4, bytesPerBlock: 8, isCompressed: true, isDepth: false, isSrgb: true }),
-    'bc2-rgba-unorm': Object.freeze({ webgpuFormat: 'bc2-rgba-unorm', blockWidth: 4, blockHeight: 4, bytesPerBlock: 16, isCompressed: true, isDepth: false, isSrgb: false }),
-    'bc2-rgba-unorm-srgb': Object.freeze({ webgpuFormat: 'bc2-rgba-unorm-srgb', blockWidth: 4, blockHeight: 4, bytesPerBlock: 16, isCompressed: true, isDepth: false, isSrgb: true }),
-    'bc3-rgba-unorm': Object.freeze({ webgpuFormat: 'bc3-rgba-unorm', blockWidth: 4, blockHeight: 4, bytesPerBlock: 16, isCompressed: true, isDepth: false, isSrgb: false }),
-    'bc3-rgba-unorm-srgb': Object.freeze({ webgpuFormat: 'bc3-rgba-unorm-srgb', blockWidth: 4, blockHeight: 4, bytesPerBlock: 16, isCompressed: true, isDepth: false, isSrgb: true }),
-    'bc4-r-unorm': Object.freeze({ webgpuFormat: 'bc4-r-unorm', blockWidth: 4, blockHeight: 4, bytesPerBlock: 8, isCompressed: true, isDepth: false, isSrgb: false }),
-    'bc4-r-snorm': Object.freeze({ webgpuFormat: 'bc4-r-snorm', blockWidth: 4, blockHeight: 4, bytesPerBlock: 8, isCompressed: true, isDepth: false, isSrgb: false }),
-    'bc5-rg-unorm': Object.freeze({ webgpuFormat: 'bc5-rg-unorm', blockWidth: 4, blockHeight: 4, bytesPerBlock: 16, isCompressed: true, isDepth: false, isSrgb: false }),
-    'bc5-rg-snorm': Object.freeze({ webgpuFormat: 'bc5-rg-snorm', blockWidth: 4, blockHeight: 4, bytesPerBlock: 16, isCompressed: true, isDepth: false, isSrgb: false }),
-    'bc6h-rgb-ufloat': Object.freeze({ webgpuFormat: 'bc6h-rgb-ufloat', blockWidth: 4, blockHeight: 4, bytesPerBlock: 16, isCompressed: true, isDepth: false, isSrgb: false }),
-    'bc6h-rgb-float': Object.freeze({ webgpuFormat: 'bc6h-rgb-float', blockWidth: 4, blockHeight: 4, bytesPerBlock: 16, isCompressed: true, isDepth: false, isSrgb: false }),
-    'bc7-rgba-unorm': Object.freeze({ webgpuFormat: 'bc7-rgba-unorm', blockWidth: 4, blockHeight: 4, bytesPerBlock: 16, isCompressed: true, isDepth: false, isSrgb: false }),
-    'bc7-rgba-unorm-srgb': Object.freeze({ webgpuFormat: 'bc7-rgba-unorm-srgb', blockWidth: 4, blockHeight: 4, bytesPerBlock: 16, isCompressed: true, isDepth: false, isSrgb: true }),
+    r8unorm: makeWebGpuInfo('r8unorm', 1, 1, 1),
+    r8snorm: makeWebGpuInfo('r8snorm', 1, 1, 1),
+    r8uint: makeWebGpuInfo('r8uint', 1, 1, 1),
+    r8sint: makeWebGpuInfo('r8sint', 1, 1, 1),
+    r16unorm: makeWebGpuInfo('r16unorm', 1, 1, 2, { requiresFeature: TEXTURE_FORMATS_TIER1_FEATURE }),
+    r16snorm: makeWebGpuInfo('r16snorm', 1, 1, 2, { requiresFeature: TEXTURE_FORMATS_TIER1_FEATURE }),
+    r16uint: makeWebGpuInfo('r16uint', 1, 1, 2),
+    r16sint: makeWebGpuInfo('r16sint', 1, 1, 2),
+    r16float: makeWebGpuInfo('r16float', 1, 1, 2, { isHdr: true }),
+    rg8unorm: makeWebGpuInfo('rg8unorm', 1, 1, 2),
+    rg8snorm: makeWebGpuInfo('rg8snorm', 1, 1, 2),
+    rg8uint: makeWebGpuInfo('rg8uint', 1, 1, 2),
+    rg8sint: makeWebGpuInfo('rg8sint', 1, 1, 2),
+    r32uint: makeWebGpuInfo('r32uint', 1, 1, 4),
+    r32sint: makeWebGpuInfo('r32sint', 1, 1, 4),
+    r32float: makeWebGpuInfo('r32float', 1, 1, 4, { isHdr: true }),
+    rg16unorm: makeWebGpuInfo('rg16unorm', 1, 1, 4, { requiresFeature: TEXTURE_FORMATS_TIER1_FEATURE }),
+    rg16snorm: makeWebGpuInfo('rg16snorm', 1, 1, 4, { requiresFeature: TEXTURE_FORMATS_TIER1_FEATURE }),
+    rg16uint: makeWebGpuInfo('rg16uint', 1, 1, 4),
+    rg16sint: makeWebGpuInfo('rg16sint', 1, 1, 4),
+    rg16float: makeWebGpuInfo('rg16float', 1, 1, 4, { isHdr: true }),
+    rgba8unorm: makeWebGpuInfo('rgba8unorm', 1, 1, 4),
+    'rgba8unorm-srgb': makeWebGpuInfo('rgba8unorm-srgb', 1, 1, 4, { isSrgb: true }),
+    rgba8snorm: makeWebGpuInfo('rgba8snorm', 1, 1, 4),
+    rgba8uint: makeWebGpuInfo('rgba8uint', 1, 1, 4),
+    rgba8sint: makeWebGpuInfo('rgba8sint', 1, 1, 4),
+    bgra8unorm: makeWebGpuInfo('bgra8unorm', 1, 1, 4),
+    'bgra8unorm-srgb': makeWebGpuInfo('bgra8unorm-srgb', 1, 1, 4, { isSrgb: true }),
+    rgb9e5ufloat: makeWebGpuInfo('rgb9e5ufloat', 1, 1, 4, { isHdr: true }),
+    rgb10a2uint: makeWebGpuInfo('rgb10a2uint', 1, 1, 4),
+    rgb10a2unorm: makeWebGpuInfo('rgb10a2unorm', 1, 1, 4, { isHdr: true }),
+    rg11b10ufloat: makeWebGpuInfo('rg11b10ufloat', 1, 1, 4, { isHdr: true }),
+    rg32uint: makeWebGpuInfo('rg32uint', 1, 1, 8),
+    rg32sint: makeWebGpuInfo('rg32sint', 1, 1, 8),
+    rg32float: makeWebGpuInfo('rg32float', 1, 1, 8, { isHdr: true }),
+    rgba16unorm: makeWebGpuInfo('rgba16unorm', 1, 1, 8, { requiresFeature: TEXTURE_FORMATS_TIER1_FEATURE }),
+    rgba16snorm: makeWebGpuInfo('rgba16snorm', 1, 1, 8, { requiresFeature: TEXTURE_FORMATS_TIER1_FEATURE }),
+    rgba16uint: makeWebGpuInfo('rgba16uint', 1, 1, 8),
+    rgba16sint: makeWebGpuInfo('rgba16sint', 1, 1, 8),
+    rgba16float: makeWebGpuInfo('rgba16float', 1, 1, 8, { isHdr: true }),
+    rgba32uint: makeWebGpuInfo('rgba32uint', 1, 1, 16),
+    rgba32sint: makeWebGpuInfo('rgba32sint', 1, 1, 16),
+    rgba32float: makeWebGpuInfo('rgba32float', 1, 1, 16, { isHdr: true }),
+    stencil8: makeWebGpuInfo('stencil8', 1, 1, 1, { isDepth: true, hasStencil: true, aspect: 'stencil-only' }),
+    depth16unorm: makeWebGpuInfo('depth16unorm', 1, 1, 2, { isDepth: true, aspect: 'depth-only' }),
+    depth24plus: makeWebGpuInfo('depth24plus', 1, 1, 4, { isDepth: true, aspect: 'depth-only' }),
+    'depth24plus-stencil8': makeWebGpuInfo('depth24plus-stencil8', 1, 1, 4, { isDepth: true, hasStencil: true, aspect: 'all' }),
+    depth32float: makeWebGpuInfo('depth32float', 1, 1, 4, { isDepth: true, aspect: 'depth-only' }),
+    'depth32float-stencil8': makeWebGpuInfo('depth32float-stencil8', 1, 1, 8, {
+      isDepth: true,
+      hasStencil: true,
+      aspect: 'all',
+      requiresFeature: DEPTH32FLOAT_STENCIL8_FEATURE,
+    }),
+    'bc1-rgba-unorm': makeWebGpuInfo('bc1-rgba-unorm', 4, 4, 8, { isCompressed: true, requiresFeature: TEXTURE_COMPRESSION_BC_FEATURE }),
+    'bc1-rgba-unorm-srgb': makeWebGpuInfo('bc1-rgba-unorm-srgb', 4, 4, 8, { isCompressed: true, isSrgb: true, requiresFeature: TEXTURE_COMPRESSION_BC_FEATURE }),
+    'bc2-rgba-unorm': makeWebGpuInfo('bc2-rgba-unorm', 4, 4, 16, { isCompressed: true, requiresFeature: TEXTURE_COMPRESSION_BC_FEATURE }),
+    'bc2-rgba-unorm-srgb': makeWebGpuInfo('bc2-rgba-unorm-srgb', 4, 4, 16, { isCompressed: true, isSrgb: true, requiresFeature: TEXTURE_COMPRESSION_BC_FEATURE }),
+    'bc3-rgba-unorm': makeWebGpuInfo('bc3-rgba-unorm', 4, 4, 16, { isCompressed: true, requiresFeature: TEXTURE_COMPRESSION_BC_FEATURE }),
+    'bc3-rgba-unorm-srgb': makeWebGpuInfo('bc3-rgba-unorm-srgb', 4, 4, 16, { isCompressed: true, isSrgb: true, requiresFeature: TEXTURE_COMPRESSION_BC_FEATURE }),
+    'bc4-r-unorm': makeWebGpuInfo('bc4-r-unorm', 4, 4, 8, { isCompressed: true, requiresFeature: TEXTURE_COMPRESSION_BC_FEATURE }),
+    'bc4-r-snorm': makeWebGpuInfo('bc4-r-snorm', 4, 4, 8, { isCompressed: true, requiresFeature: TEXTURE_COMPRESSION_BC_FEATURE }),
+    'bc5-rg-unorm': makeWebGpuInfo('bc5-rg-unorm', 4, 4, 16, { isCompressed: true, requiresFeature: TEXTURE_COMPRESSION_BC_FEATURE }),
+    'bc5-rg-snorm': makeWebGpuInfo('bc5-rg-snorm', 4, 4, 16, { isCompressed: true, requiresFeature: TEXTURE_COMPRESSION_BC_FEATURE }),
+    'bc6h-rgb-ufloat': makeWebGpuInfo('bc6h-rgb-ufloat', 4, 4, 16, { isCompressed: true, isHdr: true, requiresFeature: TEXTURE_COMPRESSION_BC_FEATURE }),
+    'bc6h-rgb-float': makeWebGpuInfo('bc6h-rgb-float', 4, 4, 16, { isCompressed: true, isHdr: true, requiresFeature: TEXTURE_COMPRESSION_BC_FEATURE }),
+    'bc7-rgba-unorm': makeWebGpuInfo('bc7-rgba-unorm', 4, 4, 16, { isCompressed: true, requiresFeature: TEXTURE_COMPRESSION_BC_FEATURE }),
+    'bc7-rgba-unorm-srgb': makeWebGpuInfo('bc7-rgba-unorm-srgb', 4, 4, 16, { isCompressed: true, isSrgb: true, requiresFeature: TEXTURE_COMPRESSION_BC_FEATURE }),
   });
 
   /**
@@ -171,54 +208,93 @@
    */
   const DXGI_FORMAT = Object.freeze({
     UNKNOWN: 0,
+    R32G32B32A32_TYPELESS: 1,
     R32G32B32A32_FLOAT: 2,
     R32G32B32A32_UINT: 3,
+    R32G32B32A32_SINT: 4,
+    R16G16B16A16_TYPELESS: 9,
     R16G16B16A16_FLOAT: 10,
     R16G16B16A16_UNORM: 11,
     R16G16B16A16_UINT: 12,
     R16G16B16A16_SNORM: 13,
+    R16G16B16A16_SINT: 14,
+    R32G32_TYPELESS: 15,
     R32G32_FLOAT: 16,
     R32G32_UINT: 17,
+    R32G32_SINT: 18,
+    R32G8X24_TYPELESS: 19,
     D32_FLOAT_S8X24_UINT: 20,
+    R32_FLOAT_X8X24_TYPELESS: 21,
+    X32_TYPELESS_G8X24_UINT: 22,
+    R10G10B10A2_TYPELESS: 23,
     R10G10B10A2_UNORM: 24,
+    R10G10B10A2_UINT: 25,
     R11G11B10_FLOAT: 26,
+    R8G8B8A8_TYPELESS: 27,
     R8G8B8A8_UNORM: 28,
     R8G8B8A8_UNORM_SRGB: 29,
     R8G8B8A8_UINT: 30,
     R8G8B8A8_SNORM: 31,
     R8G8B8A8_SINT: 32,
+    R16G16_TYPELESS: 33,
     R16G16_FLOAT: 34,
     R16G16_UNORM: 35,
     R16G16_UINT: 36,
+    R16G16_SNORM: 37,
+    R16G16_SINT: 38,
+    R32_TYPELESS: 39,
     D32_FLOAT: 40,
     R32_FLOAT: 41,
     R32_UINT: 42,
     R32_SINT: 43,
+    R24G8_TYPELESS: 44,
     D24_UNORM_S8_UINT: 45,
+    R24_UNORM_X8_TYPELESS: 46,
+    X24_TYPELESS_G8_UINT: 47,
+    R8G8_TYPELESS: 48,
     R8G8_UNORM: 49,
     R8G8_UINT: 50,
+    R8G8_SNORM: 51,
+    R8G8_SINT: 52,
+    R16_TYPELESS: 53,
     R16_FLOAT: 54,
     D16_UNORM: 55,
     R16_UNORM: 56,
     R16_UINT: 57,
+    R16_SNORM: 58,
+    R16_SINT: 59,
+    R8_TYPELESS: 60,
     R8_UNORM: 61,
     R8_UINT: 62,
     R8_SNORM: 63,
+    R8_SINT: 64,
     A8_UNORM: 65,
+    R9G9B9E5_SHAREDEXP: 67,
+    BC1_TYPELESS: 70,
     BC1_UNORM: 71,
     BC1_UNORM_SRGB: 72,
+    BC2_TYPELESS: 73,
     BC2_UNORM: 74,
     BC2_UNORM_SRGB: 75,
+    BC3_TYPELESS: 76,
     BC3_UNORM: 77,
     BC3_UNORM_SRGB: 78,
+    BC4_TYPELESS: 79,
     BC4_UNORM: 80,
     BC4_SNORM: 81,
+    BC5_TYPELESS: 82,
     BC5_UNORM: 83,
     BC5_SNORM: 84,
     B8G8R8A8_UNORM: 87,
+    B8G8R8X8_UNORM: 88,
+    B8G8R8A8_TYPELESS: 90,
     B8G8R8A8_UNORM_SRGB: 91,
+    B8G8R8X8_TYPELESS: 92,
+    B8G8R8X8_UNORM_SRGB: 93,
+    BC6H_TYPELESS: 94,
     BC6H_UF16: 95,
     BC6H_SF16: 96,
+    BC7_TYPELESS: 97,
     BC7_UNORM: 98,
     BC7_UNORM_SRGB: 99,
   });
@@ -229,6 +305,42 @@
     )
   );
 
+  function makeDescriptor(
+    dxgiFormat,
+    webgpuFormat,
+    nativeWebgpuFormat,
+    blockWidth,
+    blockHeight,
+    bytesPerBlock,
+    options = {}
+  ) {
+    const isDepth = Boolean(options.isDepth);
+    const hasStencil = Boolean(options.hasStencil);
+    const aspect =
+      options.aspect ||
+      (isDepth && !hasStencil ? 'depth-only' : 'all');
+    return Object.freeze({
+      dxgiFormat,
+      name: DXGI_FORMAT_NAMES[dxgiFormat],
+      webgpuFormat,
+      nativeWebgpuFormat,
+      blockWidth,
+      blockHeight,
+      bytesPerBlock,
+      aspect,
+      isCompressed: Boolean(options.isCompressed),
+      isDepth,
+      hasStencil,
+      isSrgb: Boolean(options.isSrgb),
+      isHdr: Boolean(options.isHdr),
+      isTypeless: Boolean(options.isTypeless),
+      isAlphaOnly: Boolean(options.isAlphaOnly),
+      swizzle: options.swizzle || null,
+      requiresFeature: options.requiresFeature || null,
+      needsSoftwareDecode: Boolean(options.needsSoftwareDecode),
+    });
+  }
+
   function makeEntry(
     dxgiFormat,
     webgpuFormat,
@@ -237,27 +349,25 @@
     bytesPerBlock,
     options = {}
   ) {
-    return Object.freeze({
+    return makeDescriptor(
       dxgiFormat,
-      name: DXGI_FORMAT_NAMES[dxgiFormat],
+      webgpuFormat,
       webgpuFormat,
       blockWidth,
       blockHeight,
       bytesPerBlock,
-      isCompressed: Boolean(options.isCompressed),
-      isDepth: Boolean(options.isDepth),
-      isSrgb: Boolean(options.isSrgb),
-      isAlphaOnly: Boolean(options.isAlphaOnly),
-      swizzle: options.swizzle || null,
-      requiresFeature: options.requiresFeature || null,
-    });
+      options
+    );
   }
 
   // Canonical DXGI_FORMAT -> WebGPU GPUTextureFormat descriptor table.
   const FORMAT_TABLE = Object.freeze({
-    [DXGI_FORMAT.R32G32B32A32_FLOAT]: makeEntry(DXGI_FORMAT.R32G32B32A32_FLOAT, 'rgba32float', 1, 1, 16),
+    [DXGI_FORMAT.R32G32B32A32_TYPELESS]: makeEntry(DXGI_FORMAT.R32G32B32A32_TYPELESS, 'rgba32float', 1, 1, 16, { isHdr: true, isTypeless: true }),
+    [DXGI_FORMAT.R32G32B32A32_FLOAT]: makeEntry(DXGI_FORMAT.R32G32B32A32_FLOAT, 'rgba32float', 1, 1, 16, { isHdr: true }),
     [DXGI_FORMAT.R32G32B32A32_UINT]: makeEntry(DXGI_FORMAT.R32G32B32A32_UINT, 'rgba32uint', 1, 1, 16),
-    [DXGI_FORMAT.R16G16B16A16_FLOAT]: makeEntry(DXGI_FORMAT.R16G16B16A16_FLOAT, 'rgba16float', 1, 1, 8),
+    [DXGI_FORMAT.R32G32B32A32_SINT]: makeEntry(DXGI_FORMAT.R32G32B32A32_SINT, 'rgba32sint', 1, 1, 16),
+    [DXGI_FORMAT.R16G16B16A16_TYPELESS]: makeEntry(DXGI_FORMAT.R16G16B16A16_TYPELESS, 'rgba16float', 1, 1, 8, { isHdr: true, isTypeless: true }),
+    [DXGI_FORMAT.R16G16B16A16_FLOAT]: makeEntry(DXGI_FORMAT.R16G16B16A16_FLOAT, 'rgba16float', 1, 1, 8, { isHdr: true }),
     [DXGI_FORMAT.R16G16B16A16_UNORM]: makeEntry(
       DXGI_FORMAT.R16G16B16A16_UNORM,
       'rgba16unorm',
@@ -275,18 +385,48 @@
       8,
       { requiresFeature: TEXTURE_FORMATS_TIER1_FEATURE }
     ),
-    [DXGI_FORMAT.R32G32_FLOAT]: makeEntry(DXGI_FORMAT.R32G32_FLOAT, 'rg32float', 1, 1, 8),
+    [DXGI_FORMAT.R16G16B16A16_SINT]: makeEntry(DXGI_FORMAT.R16G16B16A16_SINT, 'rgba16sint', 1, 1, 8),
+    [DXGI_FORMAT.R32G32_TYPELESS]: makeEntry(DXGI_FORMAT.R32G32_TYPELESS, 'rg32float', 1, 1, 8, { isHdr: true, isTypeless: true }),
+    [DXGI_FORMAT.R32G32_FLOAT]: makeEntry(DXGI_FORMAT.R32G32_FLOAT, 'rg32float', 1, 1, 8, { isHdr: true }),
     [DXGI_FORMAT.R32G32_UINT]: makeEntry(DXGI_FORMAT.R32G32_UINT, 'rg32uint', 1, 1, 8),
+    [DXGI_FORMAT.R32G32_SINT]: makeEntry(DXGI_FORMAT.R32G32_SINT, 'rg32sint', 1, 1, 8),
+    [DXGI_FORMAT.R32G8X24_TYPELESS]: makeEntry(
+      DXGI_FORMAT.R32G8X24_TYPELESS,
+      'depth32float-stencil8',
+      1,
+      1,
+      8,
+      { isDepth: true, hasStencil: true, aspect: 'all', isTypeless: true, requiresFeature: DEPTH32FLOAT_STENCIL8_FEATURE }
+    ),
     [DXGI_FORMAT.D32_FLOAT_S8X24_UINT]: makeEntry(
       DXGI_FORMAT.D32_FLOAT_S8X24_UINT,
       'depth32float-stencil8',
       1,
       1,
       8,
-      { isDepth: true, requiresFeature: DEPTH32FLOAT_STENCIL8_FEATURE }
+      { isDepth: true, hasStencil: true, aspect: 'all', requiresFeature: DEPTH32FLOAT_STENCIL8_FEATURE }
     ),
-    [DXGI_FORMAT.R10G10B10A2_UNORM]: makeEntry(DXGI_FORMAT.R10G10B10A2_UNORM, 'rgb10a2unorm', 1, 1, 4),
-    [DXGI_FORMAT.R11G11B10_FLOAT]: makeEntry(DXGI_FORMAT.R11G11B10_FLOAT, 'rg11b10ufloat', 1, 1, 4),
+    [DXGI_FORMAT.R32_FLOAT_X8X24_TYPELESS]: makeEntry(
+      DXGI_FORMAT.R32_FLOAT_X8X24_TYPELESS,
+      'depth32float-stencil8',
+      1,
+      1,
+      8,
+      { isDepth: true, hasStencil: true, aspect: 'depth-only', isTypeless: true, requiresFeature: DEPTH32FLOAT_STENCIL8_FEATURE }
+    ),
+    [DXGI_FORMAT.X32_TYPELESS_G8X24_UINT]: makeEntry(
+      DXGI_FORMAT.X32_TYPELESS_G8X24_UINT,
+      'depth32float-stencil8',
+      1,
+      1,
+      8,
+      { isDepth: true, hasStencil: true, aspect: 'stencil-only', isTypeless: true, requiresFeature: DEPTH32FLOAT_STENCIL8_FEATURE }
+    ),
+    [DXGI_FORMAT.R10G10B10A2_TYPELESS]: makeEntry(DXGI_FORMAT.R10G10B10A2_TYPELESS, 'rgb10a2unorm', 1, 1, 4, { isHdr: true, isTypeless: true }),
+    [DXGI_FORMAT.R10G10B10A2_UNORM]: makeEntry(DXGI_FORMAT.R10G10B10A2_UNORM, 'rgb10a2unorm', 1, 1, 4, { isHdr: true }),
+    [DXGI_FORMAT.R10G10B10A2_UINT]: makeEntry(DXGI_FORMAT.R10G10B10A2_UINT, 'rgb10a2uint', 1, 1, 4),
+    [DXGI_FORMAT.R11G11B10_FLOAT]: makeEntry(DXGI_FORMAT.R11G11B10_FLOAT, 'rg11b10ufloat', 1, 1, 4, { isHdr: true }),
+    [DXGI_FORMAT.R8G8B8A8_TYPELESS]: makeEntry(DXGI_FORMAT.R8G8B8A8_TYPELESS, 'rgba8unorm', 1, 1, 4, { isTypeless: true }),
     [DXGI_FORMAT.R8G8B8A8_UNORM]: makeEntry(DXGI_FORMAT.R8G8B8A8_UNORM, 'rgba8unorm', 1, 1, 4),
     [DXGI_FORMAT.R8G8B8A8_UNORM_SRGB]: makeEntry(
       DXGI_FORMAT.R8G8B8A8_UNORM_SRGB,
@@ -299,7 +439,8 @@
     [DXGI_FORMAT.R8G8B8A8_UINT]: makeEntry(DXGI_FORMAT.R8G8B8A8_UINT, 'rgba8uint', 1, 1, 4),
     [DXGI_FORMAT.R8G8B8A8_SNORM]: makeEntry(DXGI_FORMAT.R8G8B8A8_SNORM, 'rgba8snorm', 1, 1, 4),
     [DXGI_FORMAT.R8G8B8A8_SINT]: makeEntry(DXGI_FORMAT.R8G8B8A8_SINT, 'rgba8sint', 1, 1, 4),
-    [DXGI_FORMAT.R16G16_FLOAT]: makeEntry(DXGI_FORMAT.R16G16_FLOAT, 'rg16float', 1, 1, 4),
+    [DXGI_FORMAT.R16G16_TYPELESS]: makeEntry(DXGI_FORMAT.R16G16_TYPELESS, 'rg16float', 1, 1, 4, { isHdr: true, isTypeless: true }),
+    [DXGI_FORMAT.R16G16_FLOAT]: makeEntry(DXGI_FORMAT.R16G16_FLOAT, 'rg16float', 1, 1, 4, { isHdr: true }),
     [DXGI_FORMAT.R16G16_UNORM]: makeEntry(
       DXGI_FORMAT.R16G16_UNORM,
       'rg16unorm',
@@ -309,22 +450,60 @@
       { requiresFeature: TEXTURE_FORMATS_TIER1_FEATURE }
     ),
     [DXGI_FORMAT.R16G16_UINT]: makeEntry(DXGI_FORMAT.R16G16_UINT, 'rg16uint', 1, 1, 4),
-    [DXGI_FORMAT.D32_FLOAT]: makeEntry(DXGI_FORMAT.D32_FLOAT, 'depth32float', 1, 1, 4, { isDepth: true }),
-    [DXGI_FORMAT.R32_FLOAT]: makeEntry(DXGI_FORMAT.R32_FLOAT, 'r32float', 1, 1, 4),
+    [DXGI_FORMAT.R16G16_SNORM]: makeEntry(
+      DXGI_FORMAT.R16G16_SNORM,
+      'rg16snorm',
+      1,
+      1,
+      4,
+      { requiresFeature: TEXTURE_FORMATS_TIER1_FEATURE }
+    ),
+    [DXGI_FORMAT.R16G16_SINT]: makeEntry(DXGI_FORMAT.R16G16_SINT, 'rg16sint', 1, 1, 4),
+    [DXGI_FORMAT.R32_TYPELESS]: makeEntry(DXGI_FORMAT.R32_TYPELESS, 'r32float', 1, 1, 4, { isHdr: true, isTypeless: true }),
+    [DXGI_FORMAT.D32_FLOAT]: makeEntry(DXGI_FORMAT.D32_FLOAT, 'depth32float', 1, 1, 4, { isDepth: true, aspect: 'depth-only' }),
+    [DXGI_FORMAT.R32_FLOAT]: makeEntry(DXGI_FORMAT.R32_FLOAT, 'r32float', 1, 1, 4, { isHdr: true }),
     [DXGI_FORMAT.R32_UINT]: makeEntry(DXGI_FORMAT.R32_UINT, 'r32uint', 1, 1, 4),
     [DXGI_FORMAT.R32_SINT]: makeEntry(DXGI_FORMAT.R32_SINT, 'r32sint', 1, 1, 4),
+    [DXGI_FORMAT.R24G8_TYPELESS]: makeEntry(
+      DXGI_FORMAT.R24G8_TYPELESS,
+      'depth24plus-stencil8',
+      1,
+      1,
+      4,
+      { isDepth: true, hasStencil: true, aspect: 'all', isTypeless: true }
+    ),
     [DXGI_FORMAT.D24_UNORM_S8_UINT]: makeEntry(
       DXGI_FORMAT.D24_UNORM_S8_UINT,
       'depth24plus-stencil8',
       1,
       1,
       4,
-      { isDepth: true }
+      { isDepth: true, hasStencil: true, aspect: 'all' }
     ),
+    [DXGI_FORMAT.R24_UNORM_X8_TYPELESS]: makeEntry(
+      DXGI_FORMAT.R24_UNORM_X8_TYPELESS,
+      'depth24plus-stencil8',
+      1,
+      1,
+      4,
+      { isDepth: true, hasStencil: true, aspect: 'depth-only', isTypeless: true }
+    ),
+    [DXGI_FORMAT.X24_TYPELESS_G8_UINT]: makeEntry(
+      DXGI_FORMAT.X24_TYPELESS_G8_UINT,
+      'depth24plus-stencil8',
+      1,
+      1,
+      4,
+      { isDepth: true, hasStencil: true, aspect: 'stencil-only', isTypeless: true }
+    ),
+    [DXGI_FORMAT.R8G8_TYPELESS]: makeEntry(DXGI_FORMAT.R8G8_TYPELESS, 'rg8unorm', 1, 1, 2, { isTypeless: true }),
     [DXGI_FORMAT.R8G8_UNORM]: makeEntry(DXGI_FORMAT.R8G8_UNORM, 'rg8unorm', 1, 1, 2),
     [DXGI_FORMAT.R8G8_UINT]: makeEntry(DXGI_FORMAT.R8G8_UINT, 'rg8uint', 1, 1, 2),
-    [DXGI_FORMAT.R16_FLOAT]: makeEntry(DXGI_FORMAT.R16_FLOAT, 'r16float', 1, 1, 2),
-    [DXGI_FORMAT.D16_UNORM]: makeEntry(DXGI_FORMAT.D16_UNORM, 'depth16unorm', 1, 1, 2, { isDepth: true }),
+    [DXGI_FORMAT.R8G8_SNORM]: makeEntry(DXGI_FORMAT.R8G8_SNORM, 'rg8snorm', 1, 1, 2),
+    [DXGI_FORMAT.R8G8_SINT]: makeEntry(DXGI_FORMAT.R8G8_SINT, 'rg8sint', 1, 1, 2),
+    [DXGI_FORMAT.R16_TYPELESS]: makeEntry(DXGI_FORMAT.R16_TYPELESS, 'r16float', 1, 1, 2, { isHdr: true, isTypeless: true }),
+    [DXGI_FORMAT.R16_FLOAT]: makeEntry(DXGI_FORMAT.R16_FLOAT, 'r16float', 1, 1, 2, { isHdr: true }),
+    [DXGI_FORMAT.D16_UNORM]: makeEntry(DXGI_FORMAT.D16_UNORM, 'depth16unorm', 1, 1, 2, { isDepth: true, aspect: 'depth-only' }),
     [DXGI_FORMAT.R16_UNORM]: makeEntry(
       DXGI_FORMAT.R16_UNORM,
       'r16unorm',
@@ -334,14 +513,28 @@
       { requiresFeature: TEXTURE_FORMATS_TIER1_FEATURE }
     ),
     [DXGI_FORMAT.R16_UINT]: makeEntry(DXGI_FORMAT.R16_UINT, 'r16uint', 1, 1, 2),
+    [DXGI_FORMAT.R16_SNORM]: makeEntry(
+      DXGI_FORMAT.R16_SNORM,
+      'r16snorm',
+      1,
+      1,
+      2,
+      { requiresFeature: TEXTURE_FORMATS_TIER1_FEATURE }
+    ),
+    [DXGI_FORMAT.R16_SINT]: makeEntry(DXGI_FORMAT.R16_SINT, 'r16sint', 1, 1, 2),
+    [DXGI_FORMAT.R8_TYPELESS]: makeEntry(DXGI_FORMAT.R8_TYPELESS, 'r8unorm', 1, 1, 1, { isTypeless: true }),
     [DXGI_FORMAT.R8_UNORM]: makeEntry(DXGI_FORMAT.R8_UNORM, 'r8unorm', 1, 1, 1),
     [DXGI_FORMAT.R8_UINT]: makeEntry(DXGI_FORMAT.R8_UINT, 'r8uint', 1, 1, 1),
     [DXGI_FORMAT.R8_SNORM]: makeEntry(DXGI_FORMAT.R8_SNORM, 'r8snorm', 1, 1, 1),
+    [DXGI_FORMAT.R8_SINT]: makeEntry(DXGI_FORMAT.R8_SINT, 'r8sint', 1, 1, 1),
     [DXGI_FORMAT.A8_UNORM]: makeEntry(DXGI_FORMAT.A8_UNORM, 'r8unorm', 1, 1, 1, {
       isAlphaOnly: true,
       swizzle: '000r',
     }),
+    [DXGI_FORMAT.R9G9B9E5_SHAREDEXP]: makeEntry(DXGI_FORMAT.R9G9B9E5_SHAREDEXP, 'rgb9e5ufloat', 1, 1, 4, { isHdr: true }),
     [DXGI_FORMAT.B8G8R8A8_UNORM]: makeEntry(DXGI_FORMAT.B8G8R8A8_UNORM, 'bgra8unorm', 1, 1, 4),
+    [DXGI_FORMAT.B8G8R8X8_UNORM]: makeEntry(DXGI_FORMAT.B8G8R8X8_UNORM, 'bgra8unorm', 1, 1, 4, { swizzle: 'rgb1' }),
+    [DXGI_FORMAT.B8G8R8A8_TYPELESS]: makeEntry(DXGI_FORMAT.B8G8R8A8_TYPELESS, 'bgra8unorm', 1, 1, 4, { isTypeless: true }),
     [DXGI_FORMAT.B8G8R8A8_UNORM_SRGB]: makeEntry(
       DXGI_FORMAT.B8G8R8A8_UNORM_SRGB,
       'bgra8unorm-srgb',
@@ -350,8 +543,22 @@
       4,
       { isSrgb: true }
     ),
+    [DXGI_FORMAT.B8G8R8X8_TYPELESS]: makeEntry(DXGI_FORMAT.B8G8R8X8_TYPELESS, 'bgra8unorm', 1, 1, 4, { isTypeless: true, swizzle: 'rgb1' }),
+    [DXGI_FORMAT.B8G8R8X8_UNORM_SRGB]: makeEntry(
+      DXGI_FORMAT.B8G8R8X8_UNORM_SRGB,
+      'bgra8unorm-srgb',
+      1,
+      1,
+      4,
+      { isSrgb: true, swizzle: 'rgb1' }
+    ),
 
     // BC1..BC7 4x4 block-compressed formats (require 'texture-compression-bc' in WebGPU).
+    [DXGI_FORMAT.BC1_TYPELESS]: makeEntry(DXGI_FORMAT.BC1_TYPELESS, 'bc1-rgba-unorm', 4, 4, 8, {
+      isCompressed: true,
+      isTypeless: true,
+      requiresFeature: TEXTURE_COMPRESSION_BC_FEATURE,
+    }),
     [DXGI_FORMAT.BC1_UNORM]: makeEntry(DXGI_FORMAT.BC1_UNORM, 'bc1-rgba-unorm', 4, 4, 8, {
       isCompressed: true,
       requiresFeature: TEXTURE_COMPRESSION_BC_FEATURE,
@@ -359,6 +566,11 @@
     [DXGI_FORMAT.BC1_UNORM_SRGB]: makeEntry(DXGI_FORMAT.BC1_UNORM_SRGB, 'bc1-rgba-unorm-srgb', 4, 4, 8, {
       isCompressed: true,
       isSrgb: true,
+      requiresFeature: TEXTURE_COMPRESSION_BC_FEATURE,
+    }),
+    [DXGI_FORMAT.BC2_TYPELESS]: makeEntry(DXGI_FORMAT.BC2_TYPELESS, 'bc2-rgba-unorm', 4, 4, 16, {
+      isCompressed: true,
+      isTypeless: true,
       requiresFeature: TEXTURE_COMPRESSION_BC_FEATURE,
     }),
     [DXGI_FORMAT.BC2_UNORM]: makeEntry(DXGI_FORMAT.BC2_UNORM, 'bc2-rgba-unorm', 4, 4, 16, {
@@ -370,6 +582,11 @@
       isSrgb: true,
       requiresFeature: TEXTURE_COMPRESSION_BC_FEATURE,
     }),
+    [DXGI_FORMAT.BC3_TYPELESS]: makeEntry(DXGI_FORMAT.BC3_TYPELESS, 'bc3-rgba-unorm', 4, 4, 16, {
+      isCompressed: true,
+      isTypeless: true,
+      requiresFeature: TEXTURE_COMPRESSION_BC_FEATURE,
+    }),
     [DXGI_FORMAT.BC3_UNORM]: makeEntry(DXGI_FORMAT.BC3_UNORM, 'bc3-rgba-unorm', 4, 4, 16, {
       isCompressed: true,
       requiresFeature: TEXTURE_COMPRESSION_BC_FEATURE,
@@ -377,6 +594,11 @@
     [DXGI_FORMAT.BC3_UNORM_SRGB]: makeEntry(DXGI_FORMAT.BC3_UNORM_SRGB, 'bc3-rgba-unorm-srgb', 4, 4, 16, {
       isCompressed: true,
       isSrgb: true,
+      requiresFeature: TEXTURE_COMPRESSION_BC_FEATURE,
+    }),
+    [DXGI_FORMAT.BC4_TYPELESS]: makeEntry(DXGI_FORMAT.BC4_TYPELESS, 'bc4-r-unorm', 4, 4, 8, {
+      isCompressed: true,
+      isTypeless: true,
       requiresFeature: TEXTURE_COMPRESSION_BC_FEATURE,
     }),
     [DXGI_FORMAT.BC4_UNORM]: makeEntry(DXGI_FORMAT.BC4_UNORM, 'bc4-r-unorm', 4, 4, 8, {
@@ -387,6 +609,11 @@
       isCompressed: true,
       requiresFeature: TEXTURE_COMPRESSION_BC_FEATURE,
     }),
+    [DXGI_FORMAT.BC5_TYPELESS]: makeEntry(DXGI_FORMAT.BC5_TYPELESS, 'bc5-rg-unorm', 4, 4, 16, {
+      isCompressed: true,
+      isTypeless: true,
+      requiresFeature: TEXTURE_COMPRESSION_BC_FEATURE,
+    }),
     [DXGI_FORMAT.BC5_UNORM]: makeEntry(DXGI_FORMAT.BC5_UNORM, 'bc5-rg-unorm', 4, 4, 16, {
       isCompressed: true,
       requiresFeature: TEXTURE_COMPRESSION_BC_FEATURE,
@@ -395,12 +622,25 @@
       isCompressed: true,
       requiresFeature: TEXTURE_COMPRESSION_BC_FEATURE,
     }),
+    [DXGI_FORMAT.BC6H_TYPELESS]: makeEntry(DXGI_FORMAT.BC6H_TYPELESS, 'bc6h-rgb-ufloat', 4, 4, 16, {
+      isCompressed: true,
+      isHdr: true,
+      isTypeless: true,
+      requiresFeature: TEXTURE_COMPRESSION_BC_FEATURE,
+    }),
     [DXGI_FORMAT.BC6H_UF16]: makeEntry(DXGI_FORMAT.BC6H_UF16, 'bc6h-rgb-ufloat', 4, 4, 16, {
       isCompressed: true,
+      isHdr: true,
       requiresFeature: TEXTURE_COMPRESSION_BC_FEATURE,
     }),
     [DXGI_FORMAT.BC6H_SF16]: makeEntry(DXGI_FORMAT.BC6H_SF16, 'bc6h-rgb-float', 4, 4, 16, {
       isCompressed: true,
+      isHdr: true,
+      requiresFeature: TEXTURE_COMPRESSION_BC_FEATURE,
+    }),
+    [DXGI_FORMAT.BC7_TYPELESS]: makeEntry(DXGI_FORMAT.BC7_TYPELESS, 'bc7-rgba-unorm', 4, 4, 16, {
+      isCompressed: true,
+      isTypeless: true,
       requiresFeature: TEXTURE_COMPRESSION_BC_FEATURE,
     }),
     [DXGI_FORMAT.BC7_UNORM]: makeEntry(DXGI_FORMAT.BC7_UNORM, 'bc7-rgba-unorm', 4, 4, 16, {
@@ -414,24 +654,353 @@
     }),
   });
 
-  function resolveDxgiFormatCode(dxgiFormat) {
+  // Precomputed O(1) dense lookup tables indexed by DXGI_FORMAT numeric ID 0..132.
+  // Every valid slot holds a frozen descriptor; unsupported slots hold null (no holes).
+  // Both native and feature-fallback variants are prebuilt so hot lookups allocate 0 objects.
+  const _dxgiTable = new Array(DXGI_FORMAT_MAX_ID + 1).fill(null);
+  const _dxgiFallbackTable = new Array(DXGI_FORMAT_MAX_ID + 1).fill(null);
+  for (let code = 0; code <= DXGI_FORMAT_MAX_ID; code += 1) {
+    if (!Object.prototype.hasOwnProperty.call(FORMAT_TABLE, code)) {
+      continue;
+    }
+    const entry = FORMAT_TABLE[code];
+    _dxgiTable[code] = entry;
+    if (entry.requiresFeature === TEXTURE_COMPRESSION_BC_FEATURE) {
+      _dxgiFallbackTable[code] = makeDescriptor(
+        entry.dxgiFormat,
+        entry.isSrgb ? 'rgba8unorm-srgb' : 'rgba8unorm',
+        entry.nativeWebgpuFormat,
+        entry.blockWidth,
+        entry.blockHeight,
+        entry.bytesPerBlock,
+        {
+          aspect: entry.aspect,
+          isCompressed: entry.isCompressed,
+          isDepth: entry.isDepth,
+          hasStencil: entry.hasStencil,
+          isSrgb: entry.isSrgb,
+          isHdr: entry.isHdr,
+          isTypeless: entry.isTypeless,
+          isAlphaOnly: entry.isAlphaOnly,
+          swizzle: entry.swizzle,
+          requiresFeature: entry.requiresFeature,
+          needsSoftwareDecode: true,
+        }
+      );
+    } else if (entry.requiresFeature === DEPTH32FLOAT_STENCIL8_FEATURE) {
+      _dxgiFallbackTable[code] = makeDescriptor(
+        entry.dxgiFormat,
+        'depth24plus-stencil8',
+        entry.nativeWebgpuFormat,
+        entry.blockWidth,
+        entry.blockHeight,
+        entry.bytesPerBlock,
+        {
+          aspect: entry.aspect,
+          isCompressed: entry.isCompressed,
+          isDepth: entry.isDepth,
+          hasStencil: entry.hasStencil,
+          isSrgb: entry.isSrgb,
+          isHdr: entry.isHdr,
+          isTypeless: entry.isTypeless,
+          isAlphaOnly: entry.isAlphaOnly,
+          swizzle: entry.swizzle,
+          requiresFeature: entry.requiresFeature,
+          needsSoftwareDecode: false,
+        }
+      );
+    } else if (
+      entry.requiresFeature === TEXTURE_FORMATS_TIER1_FEATURE &&
+      NORM16_TEXTURE_FORMATS.has(entry.webgpuFormat)
+    ) {
+      const fallbackFmt = entry.webgpuFormat.startsWith('rgba')
+        ? 'rgba16float'
+        : entry.webgpuFormat.startsWith('rg')
+          ? 'rg16float'
+          : 'r16float';
+      _dxgiFallbackTable[code] = makeDescriptor(
+        entry.dxgiFormat,
+        fallbackFmt,
+        entry.nativeWebgpuFormat,
+        entry.blockWidth,
+        entry.blockHeight,
+        entry.bytesPerBlock,
+        {
+          aspect: entry.aspect,
+          isCompressed: entry.isCompressed,
+          isDepth: entry.isDepth,
+          hasStencil: entry.hasStencil,
+          isSrgb: entry.isSrgb,
+          isHdr: entry.isHdr,
+          isTypeless: entry.isTypeless,
+          isAlphaOnly: entry.isAlphaOnly,
+          swizzle: entry.swizzle,
+          requiresFeature: entry.requiresFeature,
+          needsSoftwareDecode: false,
+        }
+      );
+    } else {
+      _dxgiFallbackTable[code] = entry;
+    }
+  }
+  const DXGI_FORMAT_TABLE = Object.freeze(_dxgiTable);
+  const DXGI_FALLBACK_TABLE = Object.freeze(_dxgiFallbackTable);
+
+  // Precomputed O(1) null-prototype name -> DXGI numeric ID map (bare, DXGI_FORMAT_-prefixed,
+  // and common HDR/RT shorthand aliases) for zero-alloc string lookups.
+  const DXGI_NAME_TO_CODE = Object.create(null);
+  for (const [name, code] of Object.entries(DXGI_FORMAT)) {
+    if (code > 0 && code <= DXGI_FORMAT_MAX_ID && DXGI_FORMAT_TABLE[code] !== null) {
+      DXGI_NAME_TO_CODE[name] = code;
+      DXGI_NAME_TO_CODE['DXGI_FORMAT_' + name] = code;
+    }
+  }
+  const DXGI_SHORTHAND_ALIASES = [
+    ['RGBA32_FLOAT', DXGI_FORMAT.R32G32B32A32_FLOAT],
+    ['RGBA32F', DXGI_FORMAT.R32G32B32A32_FLOAT],
+    ['RGBA16_FLOAT', DXGI_FORMAT.R16G16B16A16_FLOAT],
+    ['RGBA16F', DXGI_FORMAT.R16G16B16A16_FLOAT],
+    ['RG32_FLOAT', DXGI_FORMAT.R32G32_FLOAT],
+    ['RG16_FLOAT', DXGI_FORMAT.R16G16_FLOAT],
+    ['RG16F', DXGI_FORMAT.R16G16_FLOAT],
+    ['R16F', DXGI_FORMAT.R16_FLOAT],
+    ['RGB10A2_UNORM', DXGI_FORMAT.R10G10B10A2_UNORM],
+    ['RG11B10_FLOAT', DXGI_FORMAT.R11G11B10_FLOAT],
+    ['RGBA8_UNORM', DXGI_FORMAT.R8G8B8A8_UNORM],
+    ['RGBA8_UNORM_SRGB', DXGI_FORMAT.R8G8B8A8_UNORM_SRGB],
+    ['BGRA8_UNORM', DXGI_FORMAT.B8G8R8A8_UNORM],
+    ['BGRA8_UNORM_SRGB', DXGI_FORMAT.B8G8R8A8_UNORM_SRGB],
+  ];
+  for (let i = 0; i < DXGI_SHORTHAND_ALIASES.length; i += 1) {
+    const aliasName = DXGI_SHORTHAND_ALIASES[i][0];
+    const aliasCode = DXGI_SHORTHAND_ALIASES[i][1];
+    DXGI_NAME_TO_CODE[aliasName] = aliasCode;
+    DXGI_NAME_TO_CODE['DXGI_FORMAT_' + aliasName] = aliasCode;
+  }
+  Object.freeze(DXGI_NAME_TO_CODE);
+
+  // Frozen classification & storage result singletons to eliminate hot-path allocations.
+  const SUPPORT_CORE = Object.freeze({
+    supported: true,
+    requiredFeature: null,
+    fallbackFormat: null,
+    reason: null,
+  });
+  const SUPPORT_INVALID = Object.freeze({
+    supported: false,
+    requiredFeature: null,
+    fallbackFormat: null,
+    reason: 'invalid-format',
+  });
+  const SUPPORT_BC_OK = Object.freeze({
+    supported: true,
+    requiredFeature: TEXTURE_COMPRESSION_BC_FEATURE,
+    fallbackFormat: null,
+    reason: null,
+  });
+  const SUPPORT_BC_MISSING = Object.freeze({
+    supported: false,
+    requiredFeature: TEXTURE_COMPRESSION_BC_FEATURE,
+    fallbackFormat: 'rgba8unorm',
+    reason: 'missing-bc',
+  });
+  const SUPPORT_BC3D_OK = Object.freeze({
+    supported: true,
+    requiredFeature: TEXTURE_COMPRESSION_BC_SLICED_3D_FEATURE,
+    fallbackFormat: null,
+    reason: null,
+  });
+  const SUPPORT_BC3D_MISSING = Object.freeze({
+    supported: false,
+    requiredFeature: TEXTURE_COMPRESSION_BC_SLICED_3D_FEATURE,
+    fallbackFormat: 'rgba8unorm',
+    reason: 'missing-bc-sliced-3d',
+  });
+  const SUPPORT_NORM16_TIER1_OK = Object.freeze({
+    supported: true,
+    requiredFeature: TEXTURE_FORMATS_TIER1_FEATURE,
+    fallbackFormat: null,
+    reason: null,
+  });
+  const SUPPORT_NORM16_CHROMIUM_OK = Object.freeze({
+    supported: true,
+    requiredFeature: CHROMIUM_UNORM16_FEATURE,
+    fallbackFormat: null,
+    reason: null,
+  });
+  const SUPPORT_NORM16_MISSING_R = Object.freeze({
+    supported: false,
+    requiredFeature: TEXTURE_FORMATS_TIER1_FEATURE,
+    fallbackFormat: 'r16float',
+    reason: 'missing-unorm16',
+  });
+  const SUPPORT_NORM16_MISSING_RG = Object.freeze({
+    supported: false,
+    requiredFeature: TEXTURE_FORMATS_TIER1_FEATURE,
+    fallbackFormat: 'rg16float',
+    reason: 'missing-unorm16',
+  });
+  const SUPPORT_NORM16_MISSING_RGBA = Object.freeze({
+    supported: false,
+    requiredFeature: TEXTURE_FORMATS_TIER1_FEATURE,
+    fallbackFormat: 'rgba16float',
+    reason: 'missing-unorm16',
+  });
+  const SUPPORT_D32S8_OK = Object.freeze({
+    supported: true,
+    requiredFeature: DEPTH32FLOAT_STENCIL8_FEATURE,
+    fallbackFormat: null,
+    reason: null,
+  });
+  const SUPPORT_D32S8_MISSING = Object.freeze({
+    supported: false,
+    requiredFeature: DEPTH32FLOAT_STENCIL8_FEATURE,
+    fallbackFormat: 'depth24plus-stencil8',
+    reason: 'missing-depth32float-stencil8',
+  });
+
+  const STORAGE_OK_BY_FORMAT = Object.create(null);
+  for (const fmt of CORE_STORAGE_TEXTURE_FORMATS) {
+    STORAGE_OK_BY_FORMAT[fmt] = Object.freeze({
+      storageFormat: fmt,
+      supportsStorageBinding: true,
+      needsLinearSiblingView: false,
+      reason: null,
+    });
+  }
+  for (const fmt of TIER1_STORAGE_TEXTURE_FORMATS) {
+    if (!STORAGE_OK_BY_FORMAT[fmt]) {
+      STORAGE_OK_BY_FORMAT[fmt] = Object.freeze({
+        storageFormat: fmt,
+        supportsStorageBinding: true,
+        needsLinearSiblingView: false,
+        reason: null,
+      });
+    }
+  }
+  STORAGE_OK_BY_FORMAT.bgra8unorm = Object.freeze({
+    storageFormat: 'bgra8unorm',
+    supportsStorageBinding: true,
+    needsLinearSiblingView: false,
+    reason: null,
+  });
+  Object.freeze(STORAGE_OK_BY_FORMAT);
+
+  const STORAGE_INVALID = Object.freeze({
+    storageFormat: null,
+    supportsStorageBinding: false,
+    needsLinearSiblingView: false,
+    reason: 'invalid-format',
+  });
+  const STORAGE_DEPTH_STENCIL = Object.freeze({
+    storageFormat: null,
+    supportsStorageBinding: false,
+    needsLinearSiblingView: false,
+    reason: 'depth-stencil-not-storage-compatible',
+  });
+  const STORAGE_COMPRESSED = Object.freeze({
+    storageFormat: null,
+    supportsStorageBinding: false,
+    needsLinearSiblingView: false,
+    reason: 'compressed-not-storage-compatible',
+  });
+  const STORAGE_MISSING_BGRA = Object.freeze({
+    storageFormat: null,
+    supportsStorageBinding: false,
+    needsLinearSiblingView: false,
+    reason: 'missing-bgra8unorm-storage',
+  });
+  const STORAGE_MISSING_TIER1 = Object.freeze({
+    storageFormat: null,
+    supportsStorageBinding: false,
+    needsLinearSiblingView: false,
+    reason: 'missing-texture-formats-tier1',
+  });
+  const STORAGE_SRGB_RGBA8 = Object.freeze({
+    storageFormat: 'rgba8unorm',
+    supportsStorageBinding: true,
+    needsLinearSiblingView: true,
+    reason: 'srgb-requires-linear-view',
+  });
+  const STORAGE_SRGB_BGRA8 = Object.freeze({
+    storageFormat: 'bgra8unorm',
+    supportsStorageBinding: true,
+    needsLinearSiblingView: true,
+    reason: 'srgb-requires-linear-view',
+  });
+  const STORAGE_SRGB_UNSUPPORTED = Object.freeze({
+    storageFormat: null,
+    supportsStorageBinding: false,
+    needsLinearSiblingView: false,
+    reason: 'srgb-not-storage-compatible',
+  });
+  const STORAGE_UNSUPPORTED = Object.freeze({
+    storageFormat: null,
+    supportsStorageBinding: false,
+    needsLinearSiblingView: false,
+    reason: 'unsupported-storage-format',
+  });
+
+  const ZERO_MIP_LAYOUT = Object.freeze({
+    width: 0,
+    height: 0,
+    mipLevel: 0,
+    copyWidth: 0,
+    copyHeight: 0,
+    blocksX: 0,
+    blocksY: 0,
+    blockWidth: 0,
+    blockHeight: 0,
+    bytesPerBlock: 0,
+    unalignedBytesPerRow: 0,
+    bytesPerRow: 0,
+    rowsPerImage: 0,
+    tightBytes: 0,
+    totalBytes: 0,
+    byteSize: 0,
+  });
+
+  function resolveDxgiCodeFast(dxgiFormat) {
     if (typeof dxgiFormat === 'number') {
-      if (Number.isInteger(dxgiFormat) && Object.prototype.hasOwnProperty.call(FORMAT_TABLE, dxgiFormat)) {
-        return dxgiFormat;
+      if (dxgiFormat >= 0 && dxgiFormat <= DXGI_FORMAT_MAX_ID && (dxgiFormat | 0) === dxgiFormat) {
+        return DXGI_FORMAT_TABLE[dxgiFormat] !== null ? dxgiFormat : -1;
       }
-      throw new RangeError(`Unsupported DXGI_FORMAT value: ${dxgiFormat}`);
+      return -1;
     }
     if (typeof dxgiFormat === 'string') {
-      const normalized = dxgiFormat.trim().toUpperCase().replace(/^DXGI_FORMAT_/, '');
-      if (Object.prototype.hasOwnProperty.call(DXGI_FORMAT, normalized)) {
-        const code = DXGI_FORMAT[normalized];
-        if (Object.prototype.hasOwnProperty.call(FORMAT_TABLE, code)) {
-          return code;
+      const direct = DXGI_NAME_TO_CODE[dxgiFormat];
+      if (direct !== undefined) {
+        return direct;
+      }
+      const normalized = dxgiFormat.trim().toUpperCase();
+      const hit = DXGI_NAME_TO_CODE[normalized];
+      if (hit !== undefined) {
+        return hit;
+      }
+      if (normalized.startsWith('DXGI_FORMAT_')) {
+        const stripped = normalized.slice(12);
+        const strippedHit = DXGI_NAME_TO_CODE[stripped];
+        if (strippedHit !== undefined) {
+          return strippedHit;
         }
       }
-      throw new RangeError(`Unsupported DXGI_FORMAT name: ${JSON.stringify(dxgiFormat)}`);
+      return -1;
     }
-    throw new TypeError(`dxgiFormat must be a DXGI_FORMAT integer or name string`);
+    return -2;
+  }
+
+  function resolveDxgiFormatCode(dxgiFormat) {
+    const code = resolveDxgiCodeFast(dxgiFormat);
+    if (code >= 0) {
+      return code;
+    }
+    if (code === -2) {
+      throw new TypeError(`dxgiFormat must be a DXGI_FORMAT integer or name string`);
+    }
+    if (typeof dxgiFormat === 'number') {
+      throw new RangeError(`Unsupported DXGI_FORMAT value: ${dxgiFormat}`);
+    }
+    throw new RangeError(`Unsupported DXGI_FORMAT name: ${JSON.stringify(dxgiFormat)}`);
   }
 
   function hasSupportedFeature(supportedFeatures, featureName) {
@@ -492,46 +1061,69 @@
   }
 
   function resolveFormatBlockInfo(formatOrInfo) {
-    if (formatOrInfo && typeof formatOrInfo === 'object') {
-      return formatOrInfo;
+    if (typeof formatOrInfo === 'number') {
+      if (
+        formatOrInfo >= 0 &&
+        formatOrInfo <= DXGI_FORMAT_MAX_ID &&
+        (formatOrInfo | 0) === formatOrInfo
+      ) {
+        const entry = DXGI_FORMAT_TABLE[formatOrInfo];
+        if (entry !== null) {
+          return entry;
+        }
+      }
+      throw new RangeError(`Unsupported DXGI_FORMAT value: ${formatOrInfo}`);
     }
     if (typeof formatOrInfo === 'string') {
+      if (Object.prototype.hasOwnProperty.call(WEBGPU_FORMAT_INFO, formatOrInfo)) {
+        return WEBGPU_FORMAT_INFO[formatOrInfo];
+      }
+      const directCode = DXGI_NAME_TO_CODE[formatOrInfo];
+      if (directCode !== undefined) {
+        return DXGI_FORMAT_TABLE[directCode];
+      }
       const lowered = formatOrInfo.trim().toLowerCase();
       if (Object.prototype.hasOwnProperty.call(WEBGPU_FORMAT_INFO, lowered)) {
         return WEBGPU_FORMAT_INFO[lowered];
       }
-      return FORMAT_TABLE[resolveDxgiFormatCode(formatOrInfo)];
+      return DXGI_FORMAT_TABLE[resolveDxgiFormatCode(formatOrInfo)];
     }
-    if (typeof formatOrInfo === 'number') {
-      return FORMAT_TABLE[resolveDxgiFormatCode(formatOrInfo)];
+    if (formatOrInfo && typeof formatOrInfo === 'object') {
+      return formatOrInfo;
     }
     throw new TypeError('formatInfo must be a format descriptor object, WebGPU format name, or DXGI_FORMAT');
   }
 
   /**
    * Look up WebGPU block geometry (`blockWidth`, `blockHeight`, `bytesPerBlock`,
-   * `isCompressed`, `isDepth`, `isSrgb`) by WebGPU format string, DXGI_FORMAT code/name,
+   * `aspect`, `isCompressed`, `isDepth`, `hasStencil`, `isSrgb`, `isHdr`,
+   * `requiresFeature`) by WebGPU format string, DXGI_FORMAT code/name,
    * or format descriptor object. Returns `null` for unknown/invalid values.
    *
    * @param {string | number | object} formatOrInfo
    */
   function getWebGpuFormatInfo(formatOrInfo) {
+    if (typeof formatOrInfo === 'number') {
+      return formatOrInfo >= 0 &&
+        formatOrInfo <= DXGI_FORMAT_MAX_ID &&
+        (formatOrInfo | 0) === formatOrInfo
+        ? DXGI_FORMAT_TABLE[formatOrInfo]
+        : null;
+    }
     if (typeof formatOrInfo === 'string') {
+      if (Object.prototype.hasOwnProperty.call(WEBGPU_FORMAT_INFO, formatOrInfo)) {
+        return WEBGPU_FORMAT_INFO[formatOrInfo];
+      }
+      const directCode = DXGI_NAME_TO_CODE[formatOrInfo];
+      if (directCode !== undefined) {
+        return DXGI_FORMAT_TABLE[directCode];
+      }
       const lowered = formatOrInfo.trim().toLowerCase();
       if (Object.prototype.hasOwnProperty.call(WEBGPU_FORMAT_INFO, lowered)) {
         return WEBGPU_FORMAT_INFO[lowered];
       }
-      try {
-        return FORMAT_TABLE[resolveDxgiFormatCode(formatOrInfo)];
-      } catch {
-        return null;
-      }
-    }
-    if (typeof formatOrInfo === 'number') {
-      return Number.isInteger(formatOrInfo) &&
-        Object.prototype.hasOwnProperty.call(FORMAT_TABLE, formatOrInfo)
-        ? FORMAT_TABLE[formatOrInfo]
-        : null;
+      const code = resolveDxgiCodeFast(formatOrInfo);
+      return code >= 0 ? DXGI_FORMAT_TABLE[code] : null;
     }
     if (
       formatOrInfo &&
@@ -830,8 +1422,52 @@
     }
   }
 
+  function selectDxgiDescriptorForFeatures(code, supportedFeatures) {
+    const entry = DXGI_FORMAT_TABLE[code];
+    const req = entry.requiresFeature;
+    if (req === null) {
+      return entry;
+    }
+    if (req === TEXTURE_COMPRESSION_BC_FEATURE) {
+      return hasSupportedFeature(supportedFeatures, TEXTURE_COMPRESSION_BC_FEATURE)
+        ? entry
+        : DXGI_FALLBACK_TABLE[code];
+    }
+    if (req === DEPTH32FLOAT_STENCIL8_FEATURE) {
+      return hasSupportedFeature(supportedFeatures, DEPTH32FLOAT_STENCIL8_FEATURE)
+        ? entry
+        : DXGI_FALLBACK_TABLE[code];
+    }
+    if (req === TEXTURE_FORMATS_TIER1_FEATURE) {
+      return hasSupportedFeature(supportedFeatures, TEXTURE_FORMATS_TIER1_FEATURE) ||
+        hasSupportedFeature(supportedFeatures, CHROMIUM_UNORM16_FEATURE)
+        ? entry
+        : DXGI_FALLBACK_TABLE[code];
+    }
+    return entry;
+  }
+
+  /**
+   * Non-throwing O(1) zero-allocation lookup into the precomputed dense DXGI
+   * format table (`0..132`). Returns a frozen descriptor record (or `null` for
+   * unsupported/out-of-range/invalid inputs).
+   *
+   * @param {number | string} dxgiFormat
+   * @param {Set<string> | string[] | Iterable<string> | Record<string, boolean> | null} [supportedFeatures]
+   */
+  function lookupDxgiFormat(dxgiFormat, supportedFeatures) {
+    const code = resolveDxgiCodeFast(dxgiFormat);
+    if (code < 0) {
+      return null;
+    }
+    return selectDxgiDescriptorForFeatures(code, supportedFeatures);
+  }
+
   /**
    * Map a DXGI / Xbox texture format to WebGPU GPUTextureFormat metadata.
+   *
+   * Uses the precomputed O(1) dense lookup table (`0..132`) of frozen descriptor
+   * records so hot texture-creation and upload calls allocate zero objects.
    *
    * When a BCn format is requested and `supportedFeatures` does not contain
    * `'texture-compression-bc'`, `needsSoftwareDecode` is set to `true` and
@@ -842,51 +1478,7 @@
    */
   function mapDxgiFormatToWebGpu(dxgiFormat, supportedFeatures) {
     const code = resolveDxgiFormatCode(dxgiFormat);
-    const entry = FORMAT_TABLE[code];
-
-    let webgpuFormat = entry.webgpuFormat;
-    let needsSoftwareDecode = false;
-
-    if (entry.requiresFeature === TEXTURE_COMPRESSION_BC_FEATURE) {
-      const hasBc = hasSupportedFeature(supportedFeatures, TEXTURE_COMPRESSION_BC_FEATURE);
-      if (!hasBc) {
-        needsSoftwareDecode = true;
-        webgpuFormat = entry.isSrgb ? 'rgba8unorm-srgb' : 'rgba8unorm';
-      }
-    } else if (
-      entry.requiresFeature === DEPTH32FLOAT_STENCIL8_FEATURE &&
-      !hasSupportedFeature(supportedFeatures, DEPTH32FLOAT_STENCIL8_FEATURE)
-    ) {
-      webgpuFormat = 'depth24plus-stencil8';
-    } else if (
-      entry.requiresFeature === TEXTURE_FORMATS_TIER1_FEATURE &&
-      NORM16_TEXTURE_FORMATS.has(entry.webgpuFormat) &&
-      !hasSupportedFeature(supportedFeatures, TEXTURE_FORMATS_TIER1_FEATURE) &&
-      !hasSupportedFeature(supportedFeatures, CHROMIUM_UNORM16_FEATURE)
-    ) {
-      webgpuFormat = entry.webgpuFormat.startsWith('rgba')
-        ? 'rgba16float'
-        : entry.webgpuFormat.startsWith('rg')
-          ? 'rg16float'
-          : 'r16float';
-    }
-
-    return {
-      dxgiFormat: entry.dxgiFormat,
-      name: entry.name,
-      webgpuFormat,
-      nativeWebgpuFormat: entry.webgpuFormat,
-      blockWidth: entry.blockWidth,
-      blockHeight: entry.blockHeight,
-      bytesPerBlock: entry.bytesPerBlock,
-      isCompressed: entry.isCompressed,
-      isDepth: entry.isDepth,
-      isSrgb: entry.isSrgb,
-      isAlphaOnly: entry.isAlphaOnly,
-      swizzle: entry.swizzle,
-      requiresFeature: entry.requiresFeature,
-      needsSoftwareDecode,
-    };
+    return selectDxgiDescriptorForFeatures(code, supportedFeatures);
   }
 
   /**
@@ -900,6 +1492,9 @@
   function getSrgbSiblingFormat(format) {
     if (typeof format !== 'string') {
       return null;
+    }
+    if (Object.prototype.hasOwnProperty.call(SRGB_SIBLING_FORMATS, format)) {
+      return SRGB_SIBLING_FORMATS[format];
     }
     const normalized = format.trim().toLowerCase();
     if (Object.prototype.hasOwnProperty.call(SRGB_SIBLING_FORMATS, normalized)) {
@@ -926,120 +1521,62 @@
    *   reason: string | null
    * }}
    */
-  function classifyTextureFormatSupport(format, options = {}) {
+  function classifyTextureFormatSupport(format, options) {
     if (typeof format !== 'string') {
-      return {
-        supported: false,
-        requiredFeature: null,
-        fallbackFormat: null,
-        reason: 'invalid-format',
-      };
+      return SUPPORT_INVALID;
     }
 
-    const normalized = format.trim().toLowerCase();
+    const normalized = Object.prototype.hasOwnProperty.call(WEBGPU_FORMAT_INFO, format)
+      ? format
+      : format.trim().toLowerCase();
     if (!normalized) {
-      return {
-        supported: false,
-        requiredFeature: null,
-        fallbackFormat: null,
-        reason: 'invalid-format',
-      };
+      return SUPPORT_INVALID;
     }
 
-    const opts = options && typeof options === 'object' ? options : {};
+    const opts = options && typeof options === 'object' ? options : null;
+    const rawDim = opts && typeof opts.dimension === 'string' ? opts.dimension : '2d';
     const dimension =
-      typeof opts.dimension === 'string' && opts.dimension.trim()
-        ? opts.dimension.trim().toLowerCase()
-        : '2d';
-    const deviceFeatures = opts.deviceFeatures !== undefined ? opts.deviceFeatures : null;
+      rawDim === '2d' || rawDim === '3d' || rawDim === '1d'
+        ? rawDim
+        : rawDim.trim().toLowerCase() || '2d';
+    const deviceFeatures = opts && opts.deviceFeatures !== undefined ? opts.deviceFeatures : null;
 
-    if (BC_FORMAT_PATTERN.test(normalized)) {
+    const info = Object.prototype.hasOwnProperty.call(WEBGPU_FORMAT_INFO, normalized)
+      ? WEBGPU_FORMAT_INFO[normalized]
+      : null;
+
+    if ((info && info.requiresFeature === TEXTURE_COMPRESSION_BC_FEATURE) || (!info && BC_FORMAT_PATTERN.test(normalized))) {
       if (dimension === '3d') {
-        if (hasSupportedFeature(deviceFeatures, TEXTURE_COMPRESSION_BC_SLICED_3D_FEATURE)) {
-          return {
-            supported: true,
-            requiredFeature: TEXTURE_COMPRESSION_BC_SLICED_3D_FEATURE,
-            fallbackFormat: null,
-            reason: null,
-          };
-        }
-        return {
-          supported: false,
-          requiredFeature: TEXTURE_COMPRESSION_BC_SLICED_3D_FEATURE,
-          fallbackFormat: 'rgba8unorm',
-          reason: 'missing-bc-sliced-3d',
-        };
+        return hasSupportedFeature(deviceFeatures, TEXTURE_COMPRESSION_BC_SLICED_3D_FEATURE)
+          ? SUPPORT_BC3D_OK
+          : SUPPORT_BC3D_MISSING;
       }
-
-      if (hasSupportedFeature(deviceFeatures, TEXTURE_COMPRESSION_BC_FEATURE)) {
-        return {
-          supported: true,
-          requiredFeature: TEXTURE_COMPRESSION_BC_FEATURE,
-          fallbackFormat: null,
-          reason: null,
-        };
-      }
-      return {
-        supported: false,
-        requiredFeature: TEXTURE_COMPRESSION_BC_FEATURE,
-        fallbackFormat: 'rgba8unorm',
-        reason: 'missing-bc',
-      };
+      return hasSupportedFeature(deviceFeatures, TEXTURE_COMPRESSION_BC_FEATURE)
+        ? SUPPORT_BC_OK
+        : SUPPORT_BC_MISSING;
     }
 
     if (NORM16_TEXTURE_FORMATS.has(normalized)) {
       if (hasSupportedFeature(deviceFeatures, TEXTURE_FORMATS_TIER1_FEATURE)) {
-        return {
-          supported: true,
-          requiredFeature: TEXTURE_FORMATS_TIER1_FEATURE,
-          fallbackFormat: null,
-          reason: null,
-        };
+        return SUPPORT_NORM16_TIER1_OK;
       }
       if (hasSupportedFeature(deviceFeatures, CHROMIUM_UNORM16_FEATURE)) {
-        return {
-          supported: true,
-          requiredFeature: CHROMIUM_UNORM16_FEATURE,
-          fallbackFormat: null,
-          reason: null,
-        };
+        return SUPPORT_NORM16_CHROMIUM_OK;
       }
-      const fallbackFormat = normalized.startsWith('rgba')
-        ? 'rgba16float'
+      return normalized.startsWith('rgba')
+        ? SUPPORT_NORM16_MISSING_RGBA
         : normalized.startsWith('rg')
-          ? 'rg16float'
-          : 'r16float';
-      return {
-        supported: false,
-        requiredFeature: TEXTURE_FORMATS_TIER1_FEATURE,
-        fallbackFormat,
-        reason: 'missing-unorm16',
-      };
+          ? SUPPORT_NORM16_MISSING_RG
+          : SUPPORT_NORM16_MISSING_R;
     }
 
     if (normalized === 'depth32float-stencil8') {
-      if (hasSupportedFeature(deviceFeatures, DEPTH32FLOAT_STENCIL8_FEATURE)) {
-        return {
-          supported: true,
-          requiredFeature: DEPTH32FLOAT_STENCIL8_FEATURE,
-          fallbackFormat: null,
-          reason: null,
-        };
-      }
-      return {
-        supported: false,
-        requiredFeature: DEPTH32FLOAT_STENCIL8_FEATURE,
-        fallbackFormat: 'depth24plus-stencil8',
-        reason: 'missing-depth32float-stencil8',
-      };
+      return hasSupportedFeature(deviceFeatures, DEPTH32FLOAT_STENCIL8_FEATURE)
+        ? SUPPORT_D32S8_OK
+        : SUPPORT_D32S8_MISSING;
     }
 
-    return {
-      supported: true,
-      requiredFeature: null,
-      fallbackFormat: null,
-      reason: null,
-    };
+    return SUPPORT_CORE;
   }
 
   function extractDeviceFeatures(optionsOrFeatures) {
@@ -1085,127 +1622,59 @@
    */
   function resolveStorageCompatibleFormat(webgpuFormat, optionsOrFeatures) {
     if (typeof webgpuFormat !== 'string') {
-      return {
-        storageFormat: null,
-        supportsStorageBinding: false,
-        needsLinearSiblingView: false,
-        reason: 'invalid-format',
-      };
+      return STORAGE_INVALID;
     }
 
-    const normalized = webgpuFormat.trim().toLowerCase();
+    const normalized = Object.prototype.hasOwnProperty.call(WEBGPU_FORMAT_INFO, webgpuFormat)
+      ? webgpuFormat
+      : webgpuFormat.trim().toLowerCase();
     if (!normalized) {
-      return {
-        storageFormat: null,
-        supportsStorageBinding: false,
-        needsLinearSiblingView: false,
-        reason: 'invalid-format',
-      };
+      return STORAGE_INVALID;
+    }
+
+    if (DEPTH_STENCIL_TEXTURE_FORMATS.has(normalized)) {
+      return STORAGE_DEPTH_STENCIL;
+    }
+
+    const info = Object.prototype.hasOwnProperty.call(WEBGPU_FORMAT_INFO, normalized)
+      ? WEBGPU_FORMAT_INFO[normalized]
+      : null;
+    if ((info && info.isCompressed) || (!info && COMPRESSED_FORMAT_PATTERN.test(normalized))) {
+      return STORAGE_COMPRESSED;
+    }
+
+    if (CORE_STORAGE_TEXTURE_FORMATS.has(normalized)) {
+      return STORAGE_OK_BY_FORMAT[normalized];
     }
 
     const deviceFeatures = extractDeviceFeatures(optionsOrFeatures);
 
-    if (DEPTH_STENCIL_TEXTURE_FORMATS.has(normalized)) {
-      return {
-        storageFormat: null,
-        supportsStorageBinding: false,
-        needsLinearSiblingView: false,
-        reason: 'depth-stencil-not-storage-compatible',
-      };
-    }
-
-    if (COMPRESSED_FORMAT_PATTERN.test(normalized)) {
-      return {
-        storageFormat: null,
-        supportsStorageBinding: false,
-        needsLinearSiblingView: false,
-        reason: 'compressed-not-storage-compatible',
-      };
-    }
-
-    if (CORE_STORAGE_TEXTURE_FORMATS.has(normalized)) {
-      return {
-        storageFormat: normalized,
-        supportsStorageBinding: true,
-        needsLinearSiblingView: false,
-        reason: null,
-      };
-    }
-
     if (normalized === 'bgra8unorm') {
-      if (hasSupportedFeature(deviceFeatures, BGRA8UNORM_STORAGE_FEATURE)) {
-        return {
-          storageFormat: 'bgra8unorm',
-          supportsStorageBinding: true,
-          needsLinearSiblingView: false,
-          reason: null,
-        };
-      }
-      return {
-        storageFormat: null,
-        supportsStorageBinding: false,
-        needsLinearSiblingView: false,
-        reason: 'missing-bgra8unorm-storage',
-      };
+      return hasSupportedFeature(deviceFeatures, BGRA8UNORM_STORAGE_FEATURE)
+        ? STORAGE_OK_BY_FORMAT.bgra8unorm
+        : STORAGE_MISSING_BGRA;
     }
 
     if (TIER1_STORAGE_TEXTURE_FORMATS.has(normalized)) {
-      if (hasSupportedFeature(deviceFeatures, TEXTURE_FORMATS_TIER1_FEATURE)) {
-        return {
-          storageFormat: normalized,
-          supportsStorageBinding: true,
-          needsLinearSiblingView: false,
-          reason: null,
-        };
-      }
-      return {
-        storageFormat: null,
-        supportsStorageBinding: false,
-        needsLinearSiblingView: false,
-        reason: 'missing-texture-formats-tier1',
-      };
+      return hasSupportedFeature(deviceFeatures, TEXTURE_FORMATS_TIER1_FEATURE)
+        ? STORAGE_OK_BY_FORMAT[normalized]
+        : STORAGE_MISSING_TIER1;
     }
 
     if (normalized.endsWith('-srgb')) {
       const linearSibling = getSrgbSiblingFormat(normalized);
       if (linearSibling === 'rgba8unorm') {
-        return {
-          storageFormat: 'rgba8unorm',
-          supportsStorageBinding: true,
-          needsLinearSiblingView: true,
-          reason: 'srgb-requires-linear-view',
-        };
+        return STORAGE_SRGB_RGBA8;
       }
       if (linearSibling === 'bgra8unorm') {
-        if (hasSupportedFeature(deviceFeatures, BGRA8UNORM_STORAGE_FEATURE)) {
-          return {
-            storageFormat: 'bgra8unorm',
-            supportsStorageBinding: true,
-            needsLinearSiblingView: true,
-            reason: 'srgb-requires-linear-view',
-          };
-        }
-        return {
-          storageFormat: null,
-          supportsStorageBinding: false,
-          needsLinearSiblingView: false,
-          reason: 'missing-bgra8unorm-storage',
-        };
+        return hasSupportedFeature(deviceFeatures, BGRA8UNORM_STORAGE_FEATURE)
+          ? STORAGE_SRGB_BGRA8
+          : STORAGE_MISSING_BGRA;
       }
-      return {
-        storageFormat: null,
-        supportsStorageBinding: false,
-        needsLinearSiblingView: false,
-        reason: 'srgb-not-storage-compatible',
-      };
+      return STORAGE_SRGB_UNSUPPORTED;
     }
 
-    return {
-      storageFormat: null,
-      supportsStorageBinding: false,
-      needsLinearSiblingView: false,
-      reason: 'unsupported-storage-format',
-    };
+    return STORAGE_UNSUPPORTED;
   }
 
   /**
@@ -1369,6 +1838,287 @@
       totalBytes: base.totalBytes,
       needsRowPadding: base.bytesPerRow !== base.unalignedBytesPerRow,
     };
+  }
+
+  function sanitizeMipLevel(mipLevel) {
+    if (mipLevel === undefined || mipLevel === null) {
+      return 0;
+    }
+    if (typeof mipLevel !== 'number') {
+      return 0;
+    }
+    if (mipLevel === Infinity) {
+      return 31;
+    }
+    if (!Number.isFinite(mipLevel) || mipLevel <= 0) {
+      return 0;
+    }
+    return Math.floor(mipLevel);
+  }
+
+  function shrinkDimForMip(dim, mip) {
+    if (mip <= 0) {
+      return dim;
+    }
+    if (mip >= 31) {
+      return 1;
+    }
+    if (dim <= 0x7fffffff) {
+      const shifted = dim >>> mip;
+      return shifted > 1 ? shifted : 1;
+    }
+    const shrunk = Math.floor(dim / Math.pow(2, mip));
+    return shrunk > 1 ? shrunk : 1;
+  }
+
+  function alignBytesPerRowValue(unalignedBytesPerRow, alignBytesPerRow) {
+    if (unalignedBytesPerRow <= 0) {
+      return 0;
+    }
+    if (alignBytesPerRow === WEBGPU_BYTES_PER_ROW_ALIGNMENT && unalignedBytesPerRow <= 0x7fffff00) {
+      return (unalignedBytesPerRow + 255) & ~255;
+    }
+    if (alignBytesPerRow <= 1) {
+      return unalignedBytesPerRow;
+    }
+    return Math.ceil(unalignedBytesPerRow / alignBytesPerRow) * alignBytesPerRow;
+  }
+
+  function writeZeroMipLayout(out, mip, blockWidth, blockHeight, bytesPerBlock) {
+    out.width = 0;
+    out.height = 0;
+    out.mipLevel = mip;
+    out.copyWidth = 0;
+    out.copyHeight = 0;
+    out.blocksX = 0;
+    out.blocksY = 0;
+    out.blockWidth = blockWidth;
+    out.blockHeight = blockHeight;
+    out.bytesPerBlock = bytesPerBlock;
+    out.unalignedBytesPerRow = 0;
+    out.bytesPerRow = 0;
+    out.rowsPerImage = 0;
+    out.tightBytes = 0;
+    out.totalBytes = 0;
+    out.byteSize = 0;
+    return out;
+  }
+
+  /**
+   * Pure, non-throwing mip-level layout helper handling BC 4x4 block rounding
+   * and WebGPU 256-byte `bytesPerRow` alignment.
+   *
+   * - Never throws on degenerate (`0`, negative, `NaN`, `Infinity`) dimensions,
+   *   negative/`NaN` `mipLevel`, or unknown formats; returns zeroed metrics.
+   * - Pass a reusable `out` object to populate it in-place with ZERO heap
+   *   allocations on hot 30 FPS texture upload loops.
+   *
+   * @param {number | string | object} dxgiOrWebGpuFormat
+   * @param {number} width
+   * @param {number} height
+   * @param {number} [mipLevel=0]
+   * @param {object | null} [out=null]
+   * @param {number} [alignBytesPerRow=256]
+   */
+  function computeMipLayout(
+    dxgiOrWebGpuFormat,
+    width,
+    height,
+    mipLevel = 0,
+    out = null,
+    alignBytesPerRow = WEBGPU_BYTES_PER_ROW_ALIGNMENT
+  ) {
+    const target = out && typeof out === 'object' ? out : null;
+    const info = getWebGpuFormatInfo(dxgiOrWebGpuFormat);
+    const mip = sanitizeMipLevel(mipLevel);
+
+    if (
+      !info ||
+      typeof width !== 'number' ||
+      typeof height !== 'number' ||
+      !Number.isFinite(width) ||
+      !Number.isFinite(height) ||
+      width < 1 ||
+      height < 1
+    ) {
+      if (target) {
+        return writeZeroMipLayout(
+          target,
+          mip,
+          info ? info.blockWidth : 0,
+          info ? info.blockHeight : 0,
+          info ? info.bytesPerBlock : 0
+        );
+      }
+      return ZERO_MIP_LAYOUT;
+    }
+
+    const baseWidth = Math.floor(width);
+    const baseHeight = Math.floor(height);
+    if (baseWidth < 1 || baseHeight < 1) {
+      if (target) {
+        return writeZeroMipLayout(target, mip, info.blockWidth, info.blockHeight, info.bytesPerBlock);
+      }
+      return ZERO_MIP_LAYOUT;
+    }
+
+    const align =
+      typeof alignBytesPerRow === 'number' &&
+      Number.isFinite(alignBytesPerRow) &&
+      alignBytesPerRow >= 1
+        ? Math.floor(alignBytesPerRow)
+        : WEBGPU_BYTES_PER_ROW_ALIGNMENT;
+
+    const mipWidth = shrinkDimForMip(baseWidth, mip);
+    const mipHeight = shrinkDimForMip(baseHeight, mip);
+    const blockWidth = info.blockWidth;
+    const blockHeight = info.blockHeight;
+    const bytesPerBlock = info.bytesPerBlock;
+
+    let blocksX;
+    let blocksY;
+    if (blockWidth === 1 && blockHeight === 1) {
+      blocksX = mipWidth;
+      blocksY = mipHeight;
+    } else if (blockWidth === 4 && blockHeight === 4 && mipWidth <= 0x7ffffffc && mipHeight <= 0x7ffffffc) {
+      blocksX = (mipWidth + 3) >>> 2;
+      blocksY = (mipHeight + 3) >>> 2;
+    } else {
+      blocksX = Math.ceil(mipWidth / blockWidth);
+      blocksY = Math.ceil(mipHeight / blockHeight);
+    }
+
+    const copyWidth = blocksX * blockWidth;
+    const copyHeight = blocksY * blockHeight;
+    const unalignedBytesPerRow = blocksX * bytesPerBlock;
+    const bytesPerRow = alignBytesPerRowValue(unalignedBytesPerRow, align);
+    const rowsPerImage = blocksY;
+    const tightBytes = unalignedBytesPerRow * rowsPerImage;
+    const totalBytes = bytesPerRow * rowsPerImage;
+
+    if (target) {
+      target.width = mipWidth;
+      target.height = mipHeight;
+      target.mipLevel = mip;
+      target.copyWidth = copyWidth;
+      target.copyHeight = copyHeight;
+      target.blocksX = blocksX;
+      target.blocksY = blocksY;
+      target.blockWidth = blockWidth;
+      target.blockHeight = blockHeight;
+      target.bytesPerBlock = bytesPerBlock;
+      target.unalignedBytesPerRow = unalignedBytesPerRow;
+      target.bytesPerRow = bytesPerRow;
+      target.rowsPerImage = rowsPerImage;
+      target.tightBytes = tightBytes;
+      target.totalBytes = totalBytes;
+      target.byteSize = totalBytes;
+      return target;
+    }
+
+    return {
+      width: mipWidth,
+      height: mipHeight,
+      mipLevel: mip,
+      copyWidth,
+      copyHeight,
+      blocksX,
+      blocksY,
+      blockWidth,
+      blockHeight,
+      bytesPerBlock,
+      unalignedBytesPerRow,
+      bytesPerRow,
+      rowsPerImage,
+      tightBytes,
+      totalBytes,
+      byteSize: totalBytes,
+    };
+  }
+
+  /**
+   * Pure, guaranteed zero-allocation mip byte-size helper returning a primitive
+   * number (0 on degenerate/invalid dimensions or unknown format).
+   *
+   * Handles BC 4x4 block rounding and 256-byte `bytesPerRow` alignment by default
+   * (pass `alignedOrBytesPerRow = false` or `1` for tightly-packed byte size).
+   *
+   * @param {number | string | object} dxgiOrWebGpuFormat
+   * @param {number} width
+   * @param {number} height
+   * @param {number} [mipLevel=0]
+   * @param {number} [depthOrLayers=1]
+   * @param {boolean | number} [alignedOrBytesPerRow=true]
+   * @returns {number}
+   */
+  function computeMipByteSize(
+    dxgiOrWebGpuFormat,
+    width,
+    height,
+    mipLevel = 0,
+    depthOrLayers = 1,
+    alignedOrBytesPerRow = true
+  ) {
+    const info = getWebGpuFormatInfo(dxgiOrWebGpuFormat);
+    if (
+      !info ||
+      typeof width !== 'number' ||
+      typeof height !== 'number' ||
+      !Number.isFinite(width) ||
+      !Number.isFinite(height) ||
+      width < 1 ||
+      height < 1
+    ) {
+      return 0;
+    }
+    if (
+      typeof depthOrLayers !== 'number' ||
+      !Number.isFinite(depthOrLayers) ||
+      depthOrLayers < 1
+    ) {
+      return 0;
+    }
+
+    const baseWidth = Math.floor(width);
+    const baseHeight = Math.floor(height);
+    const layers = Math.floor(depthOrLayers);
+    if (baseWidth < 1 || baseHeight < 1 || layers < 1) {
+      return 0;
+    }
+
+    const mip = sanitizeMipLevel(mipLevel);
+    const mipWidth = shrinkDimForMip(baseWidth, mip);
+    const mipHeight = shrinkDimForMip(baseHeight, mip);
+    const blockWidth = info.blockWidth;
+    const blockHeight = info.blockHeight;
+
+    let blocksX;
+    let blocksY;
+    if (blockWidth === 1 && blockHeight === 1) {
+      blocksX = mipWidth;
+      blocksY = mipHeight;
+    } else if (blockWidth === 4 && blockHeight === 4 && mipWidth <= 0x7ffffffc && mipHeight <= 0x7ffffffc) {
+      blocksX = (mipWidth + 3) >>> 2;
+      blocksY = (mipHeight + 3) >>> 2;
+    } else {
+      blocksX = Math.ceil(mipWidth / blockWidth);
+      blocksY = Math.ceil(mipHeight / blockHeight);
+    }
+
+    const unalignedBytesPerRow = blocksX * info.bytesPerBlock;
+    let align = WEBGPU_BYTES_PER_ROW_ALIGNMENT;
+    if (alignedOrBytesPerRow === false) {
+      align = 1;
+    } else if (
+      typeof alignedOrBytesPerRow === 'number' &&
+      Number.isFinite(alignedOrBytesPerRow) &&
+      alignedOrBytesPerRow >= 1
+    ) {
+      align = Math.floor(alignedOrBytesPerRow);
+    }
+
+    const bytesPerRow = alignBytesPerRowValue(unalignedBytesPerRow, align);
+    return bytesPerRow * blocksY * layers;
   }
 
   /**
@@ -1865,6 +2615,8 @@
   const exportsObj = Object.freeze({
     DXGI_FORMAT,
     DXGI_FORMAT_NAMES,
+    DXGI_FORMAT_MAX_ID,
+    DXGI_FORMAT_TABLE,
     WEBGPU_FORMAT_INFO,
     WEBGPU_BYTES_PER_ROW_ALIGNMENT,
     DEFAULT_MAX_SCRATCH_BYTES,
@@ -1877,6 +2629,7 @@
     BGRA8UNORM_STORAGE_FEATURE,
     TextureScratchPool,
     getWebGpuFormatInfo,
+    lookupDxgiFormat,
     mapDxgiFormatToWebGpu,
     getSrgbSiblingFormat,
     classifyTextureFormatSupport,
@@ -1885,6 +2638,8 @@
     calcMipLayout,
     alignCopyExtentForFormat,
     calcMipUploadLayout,
+    computeMipLayout,
+    computeMipByteSize,
     padTextureRowsForWriteTexture,
     expandA8ToRgba8,
     expandA8ToRgba8Layout,
