@@ -329,6 +329,12 @@
     };
 
     const MAX_LOG_LINES = 200;
+    const WEBGPU_FRAME_LOG_RE = /^WebGPU\s+frame\s+#(\d+)\s+presented$/i;
+    const WEBGPU_FRAME_LOG_MILESTONES = new Set([1, 10, 60]);
+    const WEBGPU_FRAME_LOG_INTERVAL_FRAMES = 300;
+    const WEBGPU_FRAME_LOG_INTERVAL_MS = 10000;
+    let lastLoggedWebGpuFrame = 0;
+    let lastLoggedWebGpuFrameAtMs = -Infinity;
     const SCRIPTED_INPUT_PRESET_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/i;
     const SAFE_SWAPCHAIN_FORMAT_RE = /^[a-z0-9-]{1,32}$/i;
     const GPU_BOOT_TELEMETRY_KEYS = Object.freeze([
@@ -914,6 +920,29 @@
     }
 
     function appendLog(message, level = 'info') {
+      const text = String(message ?? '');
+      const frameMatch = WEBGPU_FRAME_LOG_RE.exec(text.trim());
+      if (frameMatch) {
+        const frameNum = Number.parseInt(frameMatch[1], 10);
+        if (Number.isSafeInteger(frameNum) && frameNum >= 1) {
+          setValue(metricEls.frames, String(frameNum));
+          const nowMs =
+            typeof performance !== 'undefined' && typeof performance.now === 'function'
+              ? performance.now()
+              : Date.now();
+          const isMilestone = WEBGPU_FRAME_LOG_MILESTONES.has(frameNum);
+          const dueByInterval =
+            frameNum > 60 &&
+            (frameNum - lastLoggedWebGpuFrame >= WEBGPU_FRAME_LOG_INTERVAL_FRAMES ||
+              nowMs - lastLoggedWebGpuFrameAtMs >= WEBGPU_FRAME_LOG_INTERVAL_MS);
+          if (!isMilestone && !dueByInterval) {
+            return;
+          }
+          lastLoggedWebGpuFrame = frameNum;
+          lastLoggedWebGpuFrameAtMs = nowMs;
+        }
+      }
+
       const entry = document.createElement('div');
       entry.className = 'log-entry';
       const normalized = ['info', 'ok', 'warn', 'error'].includes(level) ? level : 'info';
@@ -925,7 +954,7 @@
 
       const msgSpan = document.createElement('span');
       msgSpan.className = 'log-msg';
-      msgSpan.textContent = String(message ?? '');
+      msgSpan.textContent = text;
 
       entry.append(timeSpan, msgSpan);
       logEl.appendChild(entry);
@@ -1162,6 +1191,8 @@
     clearLogBtn.addEventListener('click', (ev) => {
       ev.preventDefault();
       ev.stopPropagation();
+      lastLoggedWebGpuFrame = 0;
+      lastLoggedWebGpuFrameAtMs = -Infinity;
       logEl.textContent = '';
       syncLogCount();
     });

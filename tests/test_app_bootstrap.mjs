@@ -18,9 +18,11 @@ import bootstrapDefault, {
   extractGpuAdapterFromLogLine,
   parseBootUrlOptions,
   parseSplashHoldQuery,
+  parseWebGpuFramePresentedLabel,
   resolveDefaultGameBase,
   sanitizeInputScriptPreset,
   sanitizeSideModuleUrls,
+  shouldLogWebGpuPresentedFrame,
 } from '../web/app_bootstrap.js';
 import { SESSION_MODE, SESSION_STATE } from '../web/runtime/session_controller.js';
 import { SmokeDemoRunner } from '../web/demo/run_smoke_demo.js';
@@ -5262,4 +5264,445 @@ test('W333 wires W321 RuntimeSessionController phase durations, getPhaseTelemetr
   assert.equal(afterDestroy.ok, false);
   assert.equal(afterDestroy.destroyed, true);
   assert.equal(memoryReclaimEvents.length, 2);
+});
+
+test('W343 throttles per-frame WebGPU frame presented logs while updating perfMonitor, HUD metrics, and defaultHoldUntilVisible splash hold', async () => {
+  const { createRequire } = await import('node:module');
+  const require = createRequire(import.meta.url);
+  const { SplashOverlayController, DISMISS_REASONS } = require('../web/ui/splash_overlay.js');
+  const { BootOrchestrator } = require('../web/runtime/boot_orchestrator.js');
+
+  // Helper unit checks.
+  assert.equal(parseWebGpuFramePresentedLabel('WebGPU frame #1 presented'), 1);
+  assert.equal(parseWebGpuFramePresentedLabel('WebGPU frame #3014 presented'), 3014);
+  assert.equal(parseWebGpuFramePresentedLabel('wgpu_worker ready (nvidia turing)'), null);
+  assert.equal(parseWebGpuFramePresentedLabel(null), null);
+
+  assert.equal(shouldLogWebGpuPresentedFrame(1), true);
+  assert.equal(shouldLogWebGpuPresentedFrame(2, { lastLoggedFrame: 1, lastLoggedAtMs: 0, nowMs: 16 }), false);
+  assert.equal(shouldLogWebGpuPresentedFrame(10, { lastLoggedFrame: 1, lastLoggedAtMs: 0, nowMs: 160 }), true);
+  assert.equal(shouldLogWebGpuPresentedFrame(11, { lastLoggedFrame: 10, lastLoggedAtMs: 160, nowMs: 176 }), false);
+  assert.equal(shouldLogWebGpuPresentedFrame(60, { lastLoggedFrame: 10, lastLoggedAtMs: 160, nowMs: 1000 }), true);
+  assert.equal(shouldLogWebGpuPresentedFrame(61, { lastLoggedFrame: 60, lastLoggedAtMs: 1000, nowMs: 1016 }), false);
+  assert.equal(shouldLogWebGpuPresentedFrame(360, { lastLoggedFrame: 60, lastLoggedAtMs: 1000, nowMs: 6000 }), true);
+  assert.equal(shouldLogWebGpuPresentedFrame(65, { lastLoggedFrame: 60, lastLoggedAtMs: 1000, nowMs: 11000 }), true);
+
+  // wgpu_worker ready (<adapter>) log extraction.
+  assert.equal(extractGpuAdapterFromLogLine('wgpu_worker ready (nvidia turing)'), 'nvidia turing');
+  assert.equal(extractGpuAdapterFromLogLine('wgpu_worker ready (WebGPU)'), null);
+
+  function makeMockNode(tag = 'div') {
+    const attrs = new Map();
+    const styles = new Map();
+    const node = {
+      tagName: String(tag).toUpperCase(),
+      className: '',
+      hidden: false,
+      textContent: '',
+      innerHTML: '',
+      parentNode: null,
+      children: [],
+      style: {
+        setProperty(k, v) {
+          styles.set(k, String(v));
+        },
+        getPropertyValue(k) {
+          return styles.get(k) || '';
+        },
+      },
+      classList: {
+        add(c) {
+          const set = new Set(String(node.className || '').split(/\s+/).filter(Boolean));
+          set.add(c);
+          node.className = [...set].join(' ');
+        },
+        remove(c) {
+          const set = new Set(String(node.className || '').split(/\s+/).filter(Boolean));
+          set.delete(c);
+          node.className = [...set].join(' ');
+        },
+        contains(c) {
+          return String(node.className || '').split(/\s+/).includes(c);
+        },
+      },
+      setAttribute(k, v) {
+        attrs.set(k, String(v));
+      },
+      getAttribute(k) {
+        return attrs.has(k) ? attrs.get(k) : null;
+      },
+      removeAttribute(k) {
+        attrs.delete(k);
+      },
+      appendChild(child) {
+        child.parentNode = node;
+        node.children.push(child);
+        return child;
+      },
+      removeChild(child) {
+        const idx = node.children.indexOf(child);
+        if (idx >= 0) node.children.splice(idx, 1);
+        child.parentNode = null;
+        return child;
+      },
+      addEventListener() {},
+      removeEventListener() {},
+      querySelector() {
+        return null;
+      },
+    };
+    return node;
+  }
+
+  const clock = createClock(1000);
+  const raf = createFakeRaf(clock);
+  const timers = createFakeTimers();
+  const webgpu = createMockWebGpuEnv();
+  const hud = createMockHud();
+  const broadcastInstances = [];
+  class MockBroadcastChannel {
+    constructor(name) {
+      this.name = name;
+      this.onmessage = null;
+      broadcastInstances.push(this);
+    }
+    close() {}
+  }
+
+  const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+    clock,
+    raf,
+    timers,
+    gpu: webgpu.gpu,
+  });
+  windowObj.location = { origin: 'http://127.0.0.1:8080', search: '' };
+  windowObj.BroadcastChannel = MockBroadcastChannel;
+  documentObj.head = makeMockNode('head');
+  documentObj.createElement = (tag) => makeMockNode(tag);
+  documentObj.querySelector = () => null;
+
+  const mockWorker = createFakeEventTarget({
+    postMessage() {},
+    terminate() {},
+  });
+
+  const app = bootstrapPlayGta6App({
+    windowObj,
+    documentObj,
+    navigatorObj,
+    fetchImpl: createMockFetch({
+      ok: true,
+      coopCoep: true,
+      hasWasmBinary: true,
+      pgimUrl: '/boot/guest.pgim',
+      splashImage: '/game/xbs_splash.png',
+    }),
+    canvas: webgpu.canvas,
+    hud,
+    splashContainer: makeMockNode('div'),
+    SplashOverlayCtor: SplashOverlayController,
+    BootOrchestratorCtor: BootOrchestrator,
+    pgimPreloader: {
+      async preloadBootBundle() {
+        return { pgim: new Uint8Array(4), shaderPackBytes: null, reflectionManifest: null, bytesLoaded: 4 };
+      },
+    },
+    splashOverlayOptions: { fadeMs: 0, visibleFrameFadeMs: 0, nowFn: clock.now },
+    defaultHoldUntilVisible: true,
+    now: clock.now,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+    createWasmWorker() {
+      return mockWorker;
+    },
+  });
+
+  try {
+    assert.equal(app.bootUrlOptions.holdUntilVisible, true);
+    const started = await app.start();
+    assert.equal(started.ok, true);
+    assert.equal(broadcastInstances.length, 1);
+
+    // Boot log & adapter ready log must never be evicted by per-frame spam.
+    broadcastInstances[0].onmessage({ data: { label: 'wgpu_worker ready (nvidia turing)' } });
+    broadcastInstances[0].onmessage({ data: { label: '[boot] D3D12_CREATE_DEVICE' } });
+
+    // Simulate 400 real-Wasm64 frames at ~60 FPS arriving via BOTH BroadcastChannel label
+    // AND worker gpu-telemetry (just like web/loader.js in real Chrome).
+    for (let frame = 1; frame <= 400; frame += 1) {
+      clock.advance(16);
+      broadcastInstances[0].onmessage({
+        data: { label: `WebGPU frame #${frame} presented` },
+      });
+      mockWorker.dispatch('message', {
+        data: {
+          type: 'gpu-telemetry',
+          frameStats: {
+            framesPresented: frame,
+            droppedFrames: 0,
+            drawCalls: frame * 3,
+            packetsProcessed: frame * 12,
+            computeDispatches: frame,
+          },
+        },
+      });
+    }
+
+    // 1. Splash stays held on black frames while defaultHoldUntilVisible: true is active!
+    assert.equal(app.splashOverlay.getState().holdingForVisibleFrame, true);
+    assert.equal(app.splashOverlay.getState().dismissed, false);
+    assert.equal(app.splashOverlay.getState().blackPresentsWhileHeld, 400);
+
+    // 2. Per-frame log spam is stopped: only milestones (#1, #10, #60, #360) logged, not 400!
+    const crashFrameLogs = app.crashReporter
+      .getLogs()
+      .filter((entry) => /^WebGPU frame #\d+ presented$/.test(entry.message))
+      .map((entry) => entry.message);
+    assert.deepEqual(crashFrameLogs, [
+      'WebGPU frame #1 presented',
+      'WebGPU frame #10 presented',
+      'WebGPU frame #60 presented',
+      'WebGPU frame #360 presented',
+    ]);
+    const hudFrameLogs = hud.logs
+      .filter((entry) => /^WebGPU frame #\d+ presented$/.test(entry.message))
+      .map((entry) => entry.message);
+    assert.deepEqual(hudFrameLogs, crashFrameLogs);
+
+    // Early boot log is still preserved in CrashReporter recentLogs (not evicted!).
+    assert.ok(
+      app.crashReporter.getLogs().some((entry) => entry.message === 'wgpu_worker ready (nvidia turing)')
+    );
+
+    // 3. HUD Frames / FPS metrics still updated smoothly.
+    const lastFrameMetric = [...hud.metricsUpdates]
+      .reverse()
+      .find((m) => m.framesPresented >= 390 || m.totalFrames >= 390);
+    assert.ok(lastFrameMetric, 'Expected HUD metrics to receive live frame updates');
+    assert.ok(
+      hud.metricsUpdates.some((m) => typeof m.fps === 'number' && m.fps > 30),
+      'Expected HUD metrics to receive live positive FPS updates'
+    );
+
+    // 4. PerfMonitor has exact live real-Wasm64 counts with ZERO double-counting!
+    const perfSnap = app.perfMonitor.getSnapshot();
+    assert.equal(perfSnap.frames.totalFrames, 400);
+    assert.ok(perfSnap.frames.fps > 55 && perfSnap.frames.fps < 70, `Expected ~62.5 FPS, got ${perfSnap.frames.fps}`);
+    assert.equal(perfSnap.gpu.totalDrawCalls, 1200);
+    assert.equal(perfSnap.gpu.totalGpuPackets, 4800);
+    assert.equal(perfSnap.gpu.totalComputeDispatches, 400);
+
+    // 5. W338 first-visible-frame dismisses splash smoothly.
+    clock.advance(50);
+    mockWorker.dispatch('message', {
+      data: {
+        type: 'first-visible-frame',
+        firstVisibleFrame: true,
+        framesPresented: 401,
+      },
+    });
+    assert.equal(app.splashOverlay.getState().dismissed, true);
+    assert.equal(app.splashOverlay.getState().dismissReason, DISMISS_REASONS.FIRST_VISIBLE_FRAME);
+  } finally {
+    await app.destroy();
+  }
+});
+
+test('W343 Export Report populates capabilities.wasm64 (Chrome 133+ address: i64), live perf, and bootDiagnostics in real-Wasm64 sessions', async () => {
+  const { HudController } = await import('../web/ui/hud_controller.js');
+
+  function assertI32Limit(value) {
+    return +value;
+  }
+
+  // Strict Chrome 133+ V8 WebAssembly.Memory mock: accepts ONLY `{ address: 'i64' }` with BigInts,
+  // and throws TypeError on legacy `{ index: 'i64' }` (which previously broke CrashReporter.collectCapabilities).
+  const chrome133WasmApi = {
+    Memory: class Chrome133Wasm64Memory {
+      constructor(desc) {
+        if (desc.address === 'i64') {
+          if (typeof desc.initial !== 'bigint' || typeof desc.maximum !== 'bigint') {
+            throw new TypeError('Expected BigInt limits for i64 memory');
+          }
+          return;
+        }
+        assertI32Limit(desc.initial);
+      }
+    },
+  };
+
+  const clock = createClock(2000);
+  const raf = createFakeRaf(clock);
+  const timers = createFakeTimers();
+  const webgpu = createMockWebGpuEnv();
+  const hud = createMockHud();
+  const broadcastInstances = [];
+  class MockBroadcastChannel {
+    constructor(name) {
+      this.name = name;
+      this.onmessage = null;
+      broadcastInstances.push(this);
+    }
+    close() {}
+  }
+
+  const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+    clock,
+    raf,
+    timers,
+    gpu: webgpu.gpu,
+  });
+  windowObj.WebAssembly = chrome133WasmApi;
+  windowObj.BroadcastChannel = MockBroadcastChannel;
+  windowObj.location = { origin: 'http://127.0.0.1:8080', search: '' };
+
+  const mockWorker = createFakeEventTarget({
+    postMessage() {},
+    terminate() {},
+  });
+
+  const app = bootstrapPlayGta6App({
+    windowObj,
+    documentObj,
+    navigatorObj,
+    fetchImpl: createMockFetch({ ok: true, coopCoep: true, hasWasmBinary: true }),
+    canvas: webgpu.canvas,
+    hud,
+    defaultHoldUntilVisible: true,
+    now: clock.now,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+    createWasmWorker() {
+      return mockWorker;
+    },
+  });
+
+  const downloads = [];
+  const hudController = new HudController({
+    app,
+    sessionController: app.session,
+    storageManager: app.storageManager,
+    crashReporter: app.crashReporter,
+    perfMonitor: app.perfMonitor,
+    inputProfiles: app.inputProfiles,
+    hud,
+    downloadBlob(filename, content) {
+      downloads.push({ filename, content });
+      return true;
+    },
+  });
+
+  try {
+    const started = await app.start();
+    assert.equal(started.ok, true);
+
+    // Emit boot adapter, 30 frames, gpu-telemetry, and first-visible-frame.
+    broadcastInstances[0].onmessage({ data: { label: 'wgpu_worker ready (NVIDIA / Turing)' } });
+    for (let i = 1; i <= 30; i += 1) {
+      clock.advance(20);
+      broadcastInstances[0].onmessage({ data: { label: `WebGPU frame #${i} presented` } });
+    }
+    mockWorker.dispatch('message', {
+      data: {
+        type: 'gpu-telemetry',
+        hasVisibleContent: false,
+        frameStats: {
+          framesPresented: 30,
+          droppedFrames: 0,
+          drawCalls: 420,
+          realPackDrawCount: 380,
+          fallbackDrawCount: 40,
+          packetsProcessed: 1500,
+          computeDispatches: 15,
+        },
+        fallbackStats: {
+          totalLookups: 420,
+          packHits: 380,
+          fallbackHits: 40,
+          builtinHits: 0,
+        },
+        missingShaders: [{ hash: '0x00000000cafe1234', stage: 'fragment', hits: 40 }],
+      },
+    });
+    clock.advance(100);
+    mockWorker.dispatch('message', {
+      data: {
+        type: 'first-visible-frame',
+        firstVisibleFrame: true,
+        firstVisibleFrameMs: 1200,
+        blackLoadingMs: 1180,
+        framesPresented: 31,
+        gpuAdapter: 'NVIDIA / Turing (C:\\Users\\alice\\nvwgf2umx.dll)',
+      },
+    });
+
+    const exportResult = await hudController.exportCrashReport();
+    assert.equal(exportResult.ok, true);
+    assert.equal(downloads.length, 1);
+
+    const report = JSON.parse(exportResult.json);
+
+    // 1. capabilities.wasm64 is true on Chrome 133+ `{ address: 'i64' }`!
+    assert.equal(report.capabilities.wasm64, true);
+
+    // 2. Live perf stats populated (NOT 0).
+    assert.equal(report.perf.frames.totalFrames, 31);
+    assert.ok(report.perf.frames.fps > 0);
+    assert.equal(report.perf.gpu.totalDrawCalls, 420);
+    assert.equal(report.perf.gpu.totalGpuPackets, 1500);
+    assert.equal(report.perf.gpu.totalComputeDispatches, 15);
+
+    // 3. bootDiagnostics populated (NOT null) and strictly sanitized.
+    assert.equal(report.bootDiagnostics.gpuAdapter, 'nvidia / turing');
+    assert.equal(report.bootDiagnostics.firstVisibleFrameMs, 1200);
+    assert.equal(report.bootDiagnostics.blackLoadingMs, 1180);
+    assert.ok(
+      typeof report.bootDiagnostics.presentFpsAvg === 'number' &&
+        report.bootDiagnostics.presentFpsAvg > 0
+    );
+    assert.ok(report.bootDiagnostics.bootSnapshot);
+    assert.equal(report.bootDiagnostics.bootSnapshot.stage, 'FIRST_VISIBLE_FRAME');
+    assert.ok(report.bootDiagnostics.gpuTelemetry);
+    assert.equal(report.bootDiagnostics.gpuTelemetry.framesPresented, 31);
+    assert.equal(report.bootDiagnostics.gpuTelemetry.drawCalls, 420);
+    assert.equal(report.bootDiagnostics.gpuTelemetry.fallbackStats.packHits, 380);
+    assert.ok(!exportResult.json.includes('alice'));
+
+    // 4. recentLogs not flooded by per-frame spam.
+    const frameLogEntries = report.recentLogs.filter((l) => /^WebGPU frame #\d+ presented$/.test(l.message));
+    assert.deepEqual(
+      frameLogEntries.map((l) => l.message),
+      ['WebGPU frame #1 presented', 'WebGPU frame #10 presented']
+    );
+  } finally {
+    hudController.destroy();
+    await app.destroy();
+  }
+
+  // Non-Wasm64 engine still reports capabilities.wasm64: false in CrashReporter.
+  const wasm32Host = createMockBrowserHost({ clock, raf, timers, gpu: webgpu.gpu });
+  wasm32Host.windowObj.WebAssembly = {
+    Memory: class Wasm32OnlyMemory {
+      constructor(desc) {
+        assertI32Limit(desc.initial);
+      }
+    },
+  };
+  const wasm32App = bootstrapPlayGta6App({
+    windowObj: wasm32Host.windowObj,
+    documentObj: wasm32Host.documentObj,
+    navigatorObj: wasm32Host.navigatorObj,
+    fetchImpl: createMockFetch({ ok: true, coopCoep: true, hasWasmBinary: false }),
+    canvas: webgpu.canvas,
+    hud: createMockHud(),
+    now: clock.now,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+  });
+  try {
+    assert.equal(wasm32App.crashReporter.collectCapabilities().wasm64, false);
+    assert.equal(wasm32App.crashReporter.buildReport().capabilities.wasm64, false);
+  } finally {
+    await wasm32App.destroy();
+  }
 });
