@@ -143,6 +143,8 @@ const DEFAULT_CLEAR_COLOR = Object.freeze({ r: 0.05, g: 0.07, b: 0.11, a: 1.0 })
 const DEFAULT_MAX_VALIDATION_ERROR_HISTORY = 32;
 const DEFAULT_MAX_VALIDATION_ERROR_POSTS = 64;
 const MAX_VALIDATION_ERROR_MESSAGE_LENGTH = 512;
+const MAX_GPU_ADAPTER_FIELD_LENGTH = 96;
+const MAX_DIRECT_WRITE_BUFFER_CHUNK_BYTES = 4 * 1024 * 1024;
 const WGSL_GROUP0_RE = /@group\(\s*0\s*\)/;
 
 const OPCODE_NAMES = Object.freeze({
@@ -341,6 +343,112 @@ function sanitizeValidationErrorMessage(rawMessage) {
     msg = `${msg.slice(0, MAX_VALIDATION_ERROR_MESSAGE_LENGTH - 3)}...`;
   }
   return msg;
+}
+
+function sanitizeGpuAdapterField(rawValue) {
+  if (typeof rawValue !== 'string') {
+    return '';
+  }
+  let str = rawValue
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/[\x00-\x1F\x7F]+/g, '');
+  // Strip file:// URLs and host filesystem paths (Windows drive, UNC, and Unix paths).
+  str = str.replace(/\bfile:\/\/[^\s"'`<>)\]]+/gi, '');
+  str = str.replace(/\\\\[^\s\\"'`<>)\]]+\\[^\s"'`<>)\]]+/g, '');
+  str = str.replace(/(["'`])[A-Za-z]:[\\\/][^"'`\r\n]+\1/g, '');
+  str = str.replace(/\b[A-Za-z]:[\\\/][^\s"'`<>)\],;]+/g, '');
+  str = str.replace(
+    /(["'`])\/(?:Users|home|var|tmp|private|etc|opt|usr|Volumes|mnt|root|Library|Applications|System)\/[^"'`\r\n]+\1/gi,
+    ''
+  );
+  str = str.replace(
+    /(^|[\s"'`(\[=,:])\/(?:[A-Za-z0-9._-]+\/)+[A-Za-z0-9._~+-]+/g,
+    '$1'
+  );
+  str = str.replace(/[^\x20-\x7E]/g, '');
+  str = str.replace(/\s{2,}/g, ' ').trim().toLowerCase();
+  if (str.length > MAX_GPU_ADAPTER_FIELD_LENGTH) {
+    str = str.slice(0, MAX_GPU_ADAPTER_FIELD_LENGTH).trimEnd();
+  }
+  return str;
+}
+
+function sanitizeGpuAdapterInfo(rawInfo, adapter = null) {
+  const src = rawInfo && typeof rawInfo === 'object' ? rawInfo : {};
+  const vendor = sanitizeGpuAdapterField(src.vendor);
+  const architecture = sanitizeGpuAdapterField(src.architecture);
+  const device = sanitizeGpuAdapterField(src.device);
+  const description = sanitizeGpuAdapterField(src.description);
+  let label = sanitizeGpuAdapterField(src.label);
+  if (!label) {
+    const parts = [];
+    for (const part of [vendor, architecture, device, description]) {
+      if (part && !parts.includes(part)) {
+        parts.push(part);
+      }
+    }
+    label = sanitizeGpuAdapterField(parts.join(' ')) || 'unknown';
+  }
+  const isFallbackAdapter = Boolean(
+    src.isFallbackAdapter === true ||
+      (adapter && typeof adapter === 'object' && adapter.isFallbackAdapter === true)
+  );
+  return {
+    vendor,
+    architecture,
+    device,
+    description,
+    label,
+    isFallbackAdapter,
+  };
+}
+
+/**
+ * Extract and sanitize WebGPU adapter metadata from `adapter.info` or async
+ * `adapter.requestAdapterInfo()` (W257), stripping host paths, control characters,
+ * and bounding every string field to `MAX_GPU_ADAPTER_FIELD_LENGTH` (96) chars.
+ *
+ * @param {GPUAdapter | object | null | undefined} adapter
+ * @returns {Promise<{
+ *   vendor: string,
+ *   architecture: string,
+ *   device: string,
+ *   description: string,
+ *   label: string,
+ *   isFallbackAdapter: boolean,
+ * }>}
+ */
+async function extractSanitizedGpuAdapter(adapter) {
+  if (!adapter || typeof adapter !== 'object') {
+    return sanitizeGpuAdapterInfo(null, null);
+  }
+  let rawInfo = null;
+  try {
+    if (adapter.info && typeof adapter.info === 'object') {
+      rawInfo = adapter.info;
+    }
+  } catch (_) {
+    rawInfo = null;
+  }
+  const hasPopulatedField = Boolean(
+    rawInfo &&
+      ((typeof rawInfo.vendor === 'string' && rawInfo.vendor.trim().length > 0) ||
+        (typeof rawInfo.architecture === 'string' && rawInfo.architecture.trim().length > 0) ||
+        (typeof rawInfo.device === 'string' && rawInfo.device.trim().length > 0) ||
+        (typeof rawInfo.description === 'string' && rawInfo.description.trim().length > 0) ||
+        (typeof rawInfo.label === 'string' && rawInfo.label.trim().length > 0))
+  );
+  if (!hasPopulatedField && typeof adapter.requestAdapterInfo === 'function') {
+    try {
+      const asyncInfo = await adapter.requestAdapterInfo();
+      if (asyncInfo && typeof asyncInfo === 'object') {
+        rawInfo = rawInfo ? { ...rawInfo, ...asyncInfo } : asyncInfo;
+      }
+    } catch (_) {
+      // Gracefully ignore requestAdapterInfo rejections or unsupported environments.
+    }
+  }
+  return sanitizeGpuAdapterInfo(rawInfo, adapter);
 }
 
 function normalizeFallbackProfileName(profile) {
@@ -1716,6 +1824,25 @@ class WgpuCommandProcessor {
     this._onFirstPresent =
       typeof options.onFirstPresent === 'function' ? options.onFirstPresent : null;
     this._firstPresentNotified = false;
+    this._firstPresentMs = null;
+    this._onFirstVisibleFrame =
+      typeof options.onFirstVisibleFrame === 'function' ? options.onFirstVisibleFrame : null;
+    this._firstVisibleFrameListeners = new Set();
+    this._firstVisibleFrameNotified = false;
+    this._firstVisibleFrameMs = null;
+    this._blackLoadingMs = null;
+    this._gpuAdapter =
+      options.gpuAdapter && typeof options.gpuAdapter === 'object'
+        ? sanitizeGpuAdapterInfo(options.gpuAdapter)
+        : null;
+    this.drawExecutor =
+      options.drawExecutor && typeof options.drawExecutor === 'object'
+        ? options.drawExecutor
+        : null;
+    this._frameDrawsThisFrame = 0;
+    this._frameRealPackDrawsThisFrame = 0;
+    this._frameFallbackDrawsThisFrame = 0;
+    this._frameNonClearDrawsThisFrame = 0;
     this._splashFramesPresented = 0;
     this._lastSplashPresentMs = null;
 
@@ -1729,6 +1856,7 @@ class WgpuCommandProcessor {
     this._skippedDrawCount = 0;
     this._computeDispatchCount = 0;
     this._bytesProcessed = 0;
+    this._chunkedWriteBufferUploads = 0;
     // W99: torn-down/lost GPU instance hardening counters (fence + present submit failures).
     this._workDoneFenceFailures = 0;
     this._presentSubmitFailures = 0;
@@ -2218,6 +2346,47 @@ class WgpuCommandProcessor {
 
   get swapchain() {
     return this._swapchain;
+  }
+
+  get firstVisibleFrame() {
+    return this._firstVisibleFrameNotified;
+  }
+
+  get firstVisibleFrameMs() {
+    return this._firstVisibleFrameMs;
+  }
+
+  get firstPresentMs() {
+    return this._firstPresentMs;
+  }
+
+  get blackLoadingMs() {
+    return this._blackLoadingMs;
+  }
+
+  get gpuAdapter() {
+    return this._gpuAdapter ? { ...this._gpuAdapter } : null;
+  }
+
+  get chunkedWriteBufferUploads() {
+    return this._chunkedWriteBufferUploads;
+  }
+
+  setGpuAdapter(adapterInfo) {
+    this._gpuAdapter =
+      adapterInfo && typeof adapterInfo === 'object'
+        ? sanitizeGpuAdapterInfo(adapterInfo)
+        : null;
+  }
+
+  addFirstVisibleFrameListener(listener) {
+    if (typeof listener !== 'function') {
+      return () => {};
+    }
+    this._firstVisibleFrameListeners.add(listener);
+    return () => {
+      this._firstVisibleFrameListeners.delete(listener);
+    };
   }
 
   get validationErrorCount() {
@@ -3030,16 +3199,75 @@ class WgpuCommandProcessor {
     }
   }
 
+  _getNowMs() {
+    const val = typeof this._validationNow === 'function' ? this._validationNow() : defaultNowMs();
+    return typeof val === 'number' && Number.isFinite(val) ? val : Date.now();
+  }
+
+  _resetPerFrameDrawCounters() {
+    this._frameDrawsThisFrame = 0;
+    this._frameRealPackDrawsThisFrame = 0;
+    this._frameFallbackDrawsThisFrame = 0;
+    this._frameNonClearDrawsThisFrame = 0;
+  }
+
   _notifyFirstPresent(info = {}) {
     if (this._firstPresentNotified) {
       return false;
     }
     this._firstPresentNotified = true;
+    const ts =
+      typeof info.timestampMs === 'number' && Number.isFinite(info.timestampMs)
+        ? info.timestampMs
+        : this._getNowMs();
+    if (this._firstPresentMs === null) {
+      this._firstPresentMs = ts;
+    }
+    const payload =
+      info && typeof info === 'object'
+        ? {
+            ...info,
+            timestampMs: ts,
+            gpuAdapter:
+              info.gpuAdapter !== undefined
+                ? info.gpuAdapter
+                : this._gpuAdapter
+                  ? { ...this._gpuAdapter }
+                  : null,
+          }
+        : {
+            timestampMs: ts,
+            gpuAdapter: this._gpuAdapter ? { ...this._gpuAdapter } : null,
+          };
     if (typeof this._onFirstPresent === 'function') {
       try {
-        this._onFirstPresent(info);
+        this._onFirstPresent(payload);
       } catch (_) {
         // Telemetry hooks must never break frame presentation.
+      }
+    }
+    return true;
+  }
+
+  _notifyFirstVisibleFrame(info = {}) {
+    if (this._firstVisibleFrameNotified) {
+      return false;
+    }
+    this._firstVisibleFrameNotified = true;
+    if (typeof this._onFirstVisibleFrame === 'function') {
+      try {
+        this._onFirstVisibleFrame(info);
+      } catch (_) {
+        // Telemetry hooks must never break frame presentation.
+      }
+    }
+    if (this._firstVisibleFrameListeners && this._firstVisibleFrameListeners.size > 0) {
+      for (const listener of this._firstVisibleFrameListeners) {
+        try {
+          listener(info);
+        } catch (_) {
+          // Telemetry listeners must never break frame presentation.
+        }
       }
     }
     return true;
@@ -3750,6 +3978,7 @@ class WgpuCommandProcessor {
   _resetFrameState() {
     this._clearColor = { ...DEFAULT_CLEAR_COLOR };
     this._passCommands = [];
+    this._resetPerFrameDrawCounters();
   }
 
   _ensurePendingEncoder() {
@@ -3825,6 +4054,13 @@ class WgpuCommandProcessor {
       const targetFrame = Math.max(frameIndex, current);
       this.resourceRegistry.beginFrame(targetFrame);
     }
+    if (
+      this.drawExecutor &&
+      typeof this.drawExecutor.beginFrame === 'function'
+    ) {
+      this.drawExecutor.beginFrame();
+    }
+    this._resetPerFrameDrawCounters();
     this._frameBegunForIndex = frameIndex;
   }
 
@@ -5734,6 +5970,20 @@ class WgpuCommandProcessor {
       }
     }
 
+    if (data.byteLength > MAX_DIRECT_WRITE_BUFFER_CHUNK_BYTES) {
+      const chunkMax = MAX_DIRECT_WRITE_BUFFER_CHUNK_BYTES;
+      for (let off = 0; off < data.byteLength; off += chunkMax) {
+        const chunkLen = Math.min(chunkMax, data.byteLength - off);
+        this.device.queue.writeBuffer(
+          buffer,
+          dstOffset + off,
+          data.subarray(off, off + chunkLen)
+        );
+      }
+      this._chunkedWriteBufferUploads += 1;
+      return;
+    }
+
     this.device.queue.writeBuffer(buffer, dstOffset, data);
   }
 
@@ -7451,13 +7701,20 @@ class WgpuCommandProcessor {
         return;
       }
       this._drawCallCount += 1;
+      this._frameDrawsThisFrame += 1;
+      const isClearPipe = Boolean(pipeMeta && pipeMeta.isClear === true);
       if (pipeMeta && pipeMeta.isRealPack && specializedActiveKey === null) {
         this._realPackDrawCount += 1;
+        this._frameRealPackDrawsThisFrame += 1;
       } else if (
         (pipeMeta && (pipeMeta.isFallback || pipeMeta.usesFallbackShader)) ||
         specializedActiveKey !== null
       ) {
         this._fallbackDrawCount += 1;
+        this._frameFallbackDrawsThisFrame += 1;
+      }
+      if (!isClearPipe) {
+        this._frameNonClearDrawsThisFrame += 1;
       }
     };
 
@@ -7687,6 +7944,7 @@ class WgpuCommandProcessor {
     }
 
     if (submitted) {
+      const presentTs = this._getNowMs();
       this.frameCount += 1;
       this._presentCount += 1;
       if (this.frameCount === 1) {
@@ -7694,7 +7952,111 @@ class WgpuCommandProcessor {
           frameIndex: 0,
           framesPresented: 1,
           source: 'command-buffer',
-          timestampMs: Date.now(),
+          timestampMs: presentTs,
+          gpuAdapter: this._gpuAdapter ? { ...this._gpuAdapter } : null,
+        });
+      }
+
+      const rawSummary =
+        this.drawExecutor && typeof this.drawExecutor.getFrameDrawSummary === 'function'
+          ? this.drawExecutor.getFrameDrawSummary()
+          : null;
+      const summary = rawSummary
+        ? {
+            hasNonClearDraw:
+              Boolean(rawSummary.hasNonClearDraw === true) ||
+              this._frameNonClearDrawsThisFrame > 0,
+            realPackDrawsThisFrame:
+              toNonNegativeInt(rawSummary.realPackDrawsThisFrame, 0) +
+              this._frameRealPackDrawsThisFrame,
+            fallbackDrawsThisFrame:
+              toNonNegativeInt(rawSummary.fallbackDrawsThisFrame, 0) +
+              this._frameFallbackDrawsThisFrame,
+            drawsThisFrame:
+              toNonNegativeInt(rawSummary.drawsThisFrame, 0) + this._frameDrawsThisFrame,
+          }
+        : {
+            hasNonClearDraw: this._frameNonClearDrawsThisFrame > 0,
+            realPackDrawsThisFrame: this._frameRealPackDrawsThisFrame,
+            fallbackDrawsThisFrame: this._frameFallbackDrawsThisFrame,
+            drawsThisFrame: this._frameDrawsThisFrame,
+          };
+
+      let swapchainReportedFirstVisible = false;
+      if (activeSwapchain && typeof activeSwapchain.markFrameContent === 'function') {
+        const prevSwapVisible = Boolean(
+          activeSwapchain.hasFirstVisibleFrame === true ||
+            activeSwapchain.hasVisibleContent === true
+        );
+        let markResult = null;
+        try {
+          markResult = activeSwapchain.markFrameContent({
+            hasNonClearDraw: summary.hasNonClearDraw,
+            nonClearDraw: summary.hasNonClearDraw,
+            hasVisibleContent: summary.hasNonClearDraw,
+            hasDraws: summary.hasNonClearDraw,
+            realPackDraws: summary.realPackDrawsThisFrame,
+            fallbackDraws: summary.fallbackDrawsThisFrame,
+            drawsThisFrame: summary.drawsThisFrame,
+            timestampMs: presentTs,
+          });
+        } catch (_) {
+          markResult = null;
+        }
+        if (typeof activeSwapchain.recordFramePresented === 'function') {
+          try {
+            activeSwapchain.recordFramePresented(presentTs);
+          } catch (_) {
+            // Swapchain telemetry must never break frame presentation.
+          }
+        }
+        const nextSwapVisible = Boolean(
+          activeSwapchain.hasFirstVisibleFrame === true ||
+            activeSwapchain.hasVisibleContent === true
+        );
+        if (
+          (!prevSwapVisible && nextSwapVisible) ||
+          (markResult &&
+            typeof markResult === 'object' &&
+            (markResult.firstVisible === true ||
+              markResult.firstVisibleFrame === true ||
+              markResult.isFirstVisibleFrame === true ||
+              markResult.hasFirstVisibleFrame === true))
+        ) {
+          swapchainReportedFirstVisible = true;
+        }
+      }
+
+      if (
+        (summary.hasNonClearDraw || swapchainReportedFirstVisible) &&
+        !this._firstVisibleFrameNotified
+      ) {
+        const firstVisibleFrameMs =
+          activeSwapchain &&
+          typeof activeSwapchain.firstVisibleFrameMs === 'number' &&
+          Number.isFinite(activeSwapchain.firstVisibleFrameMs)
+            ? activeSwapchain.firstVisibleFrameMs
+            : activeSwapchain &&
+                typeof activeSwapchain.firstVisiblePresentMs === 'number' &&
+                Number.isFinite(activeSwapchain.firstVisiblePresentMs)
+              ? activeSwapchain.firstVisiblePresentMs
+              : presentTs;
+        const firstPresentMs =
+          this._firstPresentMs !== null ? this._firstPresentMs : firstVisibleFrameMs;
+        const blackLoadingMs = Math.max(0, firstVisibleFrameMs - firstPresentMs);
+        this._firstVisibleFrameMs = firstVisibleFrameMs;
+        this._blackLoadingMs = blackLoadingMs;
+        this._notifyFirstVisibleFrame({
+          type: 'first-visible-frame',
+          firstVisibleFrame: true,
+          firstVisibleFrameMs,
+          firstPresentMs,
+          blackLoadingMs,
+          presentCount: this._presentCount,
+          realPackDrawsThisFrame: summary.realPackDrawsThisFrame,
+          fallbackDrawsThisFrame: summary.fallbackDrawsThisFrame,
+          drawsThisFrame: summary.drawsThisFrame,
+          gpuAdapter: this._gpuAdapter ? { ...this._gpuAdapter } : null,
         });
       }
     }
@@ -7839,7 +8201,13 @@ class WgpuCommandProcessor {
           this._flushPendingUploads(true);
         }
         this._resetFrameState();
-        this._ensureFrameBegun();
+        if (this._frameBegunForIndex === this.frameCount) {
+          if (this.drawExecutor && typeof this.drawExecutor.beginFrame === 'function') {
+            this.drawExecutor.beginFrame();
+          }
+        } else {
+          this._ensureFrameBegun();
+        }
         break;
       case OPCODES.CLEAR_COLOR:
         if (payloadBytes >= 16) {
@@ -8187,6 +8555,12 @@ class WgpuCommandProcessor {
       presentCount: this._presentCount,
       splashFramesPresented: this._splashFramesPresented,
       firstPresent: this._firstPresentNotified || this.frameCount > 0,
+      firstPresentMs: this._firstPresentMs,
+      firstVisibleFrame: this._firstVisibleFrameNotified,
+      firstVisibleFrameMs: this._firstVisibleFrameMs,
+      blackLoadingMs: this._blackLoadingMs,
+      gpuAdapter: this._gpuAdapter ? { ...this._gpuAdapter } : null,
+      chunkedWriteBufferUploads: this._chunkedWriteBufferUploads,
       packetCount: this._packetCount,
       drawCalls: this._drawCallCount,
       realPackDrawCount: this._realPackDrawCount,
@@ -8272,6 +8646,9 @@ class WgpuCommandProcessor {
     this._swapchain = null;
     this._ownsSwapchain = false;
     this._validationErrorCallbacks.clear();
+    if (this._firstVisibleFrameListeners) {
+      this._firstVisibleFrameListeners.clear();
+    }
     this._pendingEncoder = null;
     this._hasPendingUploadCommands = false;
     this._passCommands = [];
@@ -8844,6 +9221,24 @@ function buildGpuTelemetrySnapshot(processor, options = {}) {
     snapshot.swapchainStats = resolveSwapchainTelemetry(processor, stats);
     snapshot.textureStats = resolveTextureTelemetry(processor, stats);
     snapshot.shaderPackStats = resolveShaderPackTelemetry(processor, stats);
+    // W257: first-visible-frame readiness & sanitized GPU adapter metadata.
+    snapshot.firstVisibleFrame = Boolean(stats && stats.firstVisibleFrame === true);
+    snapshot.firstVisibleFrameMs =
+      stats &&
+      typeof stats.firstVisibleFrameMs === 'number' &&
+      Number.isFinite(stats.firstVisibleFrameMs)
+        ? stats.firstVisibleFrameMs
+        : null;
+    snapshot.blackLoadingMs =
+      stats &&
+      typeof stats.blackLoadingMs === 'number' &&
+      Number.isFinite(stats.blackLoadingMs)
+        ? stats.blackLoadingMs
+        : null;
+    snapshot.gpuAdapter =
+      stats && stats.gpuAdapter && typeof stats.gpuAdapter === 'object'
+        ? sanitizeGpuAdapterInfo(stats.gpuAdapter)
+        : null;
   }
   return snapshot;
 }
@@ -9392,16 +9787,26 @@ function createWgpuWorkerHandler(options = {}) {
   const telemetryNow = typeof options.now === 'function' ? options.now : () => Date.now();
   const onFirstPresent =
     typeof options.onFirstPresent === 'function' ? options.onFirstPresent : null;
+  const onFirstVisibleFrame =
+    typeof options.onFirstVisibleFrame === 'function' ? options.onFirstVisibleFrame : null;
   const onValidationError =
     typeof options.onValidationError === 'function' ? options.onValidationError : null;
   let canvas = options.canvas || null;
   let processor = options.processor || null;
   let swapchain = options.swapchain || (processor && processor.swapchain) || null;
   let attachedRing = processor && processor.ring ? processor.ring : null;
+  let currentGpuAdapter =
+    options.gpuAdapter && typeof options.gpuAdapter === 'object'
+      ? sanitizeGpuAdapterInfo(options.gpuAdapter)
+      : processor && processor.gpuAdapter && typeof processor.gpuAdapter === 'object'
+        ? sanitizeGpuAdapterInfo(processor.gpuAdapter)
+        : null;
   let preloadedInDefaultInit = false;
   let lastTelemetryEmitMs = -Infinity;
   let firstPresentNotified = false;
+  let firstVisibleFrameNotified = false;
   let unbindValidationListener = null;
+  let unbindFirstVisibleFrameListener = null;
 
   // W100: bounded device-loss recovery state (per worker session).
   const deviceRecoveryEnabled = options.enableDeviceRecovery !== false;
@@ -9447,6 +9852,88 @@ function createWgpuWorkerHandler(options = {}) {
     }
   }
 
+  function getActiveGpuAdapter() {
+    if (processor && processor._gpuAdapter && typeof processor._gpuAdapter === 'object') {
+      return { ...processor._gpuAdapter };
+    }
+    if (currentGpuAdapter && typeof currentGpuAdapter === 'object') {
+      return { ...currentGpuAdapter };
+    }
+    return null;
+  }
+
+  function emitFirstVisibleFrame(info = {}) {
+    if (firstVisibleFrameNotified) {
+      return false;
+    }
+    firstVisibleFrameNotified = true;
+    const payload = {
+      type: 'first-visible-frame',
+      firstVisibleFrame: true,
+      firstVisibleFrameMs:
+        typeof info.firstVisibleFrameMs === 'number' && Number.isFinite(info.firstVisibleFrameMs)
+          ? info.firstVisibleFrameMs
+          : telemetryNow(),
+      firstPresentMs:
+        typeof info.firstPresentMs === 'number' && Number.isFinite(info.firstPresentMs)
+          ? info.firstPresentMs
+          : null,
+      blackLoadingMs:
+        typeof info.blackLoadingMs === 'number' && Number.isFinite(info.blackLoadingMs)
+          ? Math.max(0, info.blackLoadingMs)
+          : 0,
+      presentCount: toNonNegativeInt(info.presentCount, 0),
+      realPackDrawsThisFrame: toNonNegativeInt(info.realPackDrawsThisFrame, 0),
+      fallbackDrawsThisFrame: toNonNegativeInt(info.fallbackDrawsThisFrame, 0),
+      drawsThisFrame: toNonNegativeInt(info.drawsThisFrame, 0),
+      gpuAdapter:
+        info.gpuAdapter && typeof info.gpuAdapter === 'object'
+          ? sanitizeGpuAdapterInfo(info.gpuAdapter)
+          : getActiveGpuAdapter(),
+    };
+    postMessage(payload);
+    if (onFirstVisibleFrame) {
+      try {
+        onFirstVisibleFrame(payload);
+      } catch (_) {
+        // Non-fatal telemetry callback error.
+      }
+    }
+    return true;
+  }
+
+  function bindProcessorFirstVisibleFrame(targetProcessor) {
+    if (unbindFirstVisibleFrameListener) {
+      try {
+        unbindFirstVisibleFrameListener();
+      } catch (_) {
+        // Ignore cleanup errors on prior processor.
+      }
+      unbindFirstVisibleFrameListener = null;
+    }
+    if (!targetProcessor) {
+      return;
+    }
+    if (
+      currentGpuAdapter &&
+      !targetProcessor._gpuAdapter &&
+      typeof targetProcessor.setGpuAdapter === 'function'
+    ) {
+      targetProcessor.setGpuAdapter(currentGpuAdapter);
+    } else if (
+      !currentGpuAdapter &&
+      targetProcessor._gpuAdapter &&
+      typeof targetProcessor._gpuAdapter === 'object'
+    ) {
+      currentGpuAdapter = sanitizeGpuAdapterInfo(targetProcessor._gpuAdapter);
+    }
+    if (typeof targetProcessor.addFirstVisibleFrameListener === 'function') {
+      unbindFirstVisibleFrameListener = targetProcessor.addFirstVisibleFrameListener((info) => {
+        emitFirstVisibleFrame(info);
+      });
+    }
+  }
+
   function bindProcessorValidationErrors(targetProcessor) {
     if (unbindValidationListener) {
       try {
@@ -9457,6 +9944,7 @@ function createWgpuWorkerHandler(options = {}) {
       unbindValidationListener = null;
     }
     bindProcessorDeviceLoss(targetProcessor);
+    bindProcessorFirstVisibleFrame(targetProcessor);
     if (!targetProcessor) {
       return;
     }
@@ -9787,6 +10275,7 @@ function createWgpuWorkerHandler(options = {}) {
     if (!adapter) {
       throw new Error('no WebGPU adapter available');
     }
+    const gpuAdapter = await extractSanitizedGpuAdapter(adapter);
     const { device } = await requestNegotiatedDevice(adapter);
     if (!device || typeof device !== 'object') {
       throw new Error('requestDevice returned no device');
@@ -9811,7 +10300,7 @@ function createWgpuWorkerHandler(options = {}) {
         // Fall back to the existing context object.
       }
     }
-    return { device, ctx, format };
+    return { device, ctx, format, gpuAdapter };
   }
 
   /**
@@ -9830,6 +10319,12 @@ function createWgpuWorkerHandler(options = {}) {
       acquiredDevice = acquired.device;
       if (targetProcessor !== processor || targetProcessor.destroyed) {
         throw new Error('processor replaced or destroyed during recovery');
+      }
+      if (acquired.gpuAdapter && typeof acquired.gpuAdapter === 'object') {
+        currentGpuAdapter = sanitizeGpuAdapterInfo(acquired.gpuAdapter);
+        if (typeof targetProcessor.setGpuAdapter === 'function') {
+          targetProcessor.setGpuAdapter(currentGpuAdapter);
+        }
       }
       targetProcessor.rebindDevice(acquired.device, acquired.ctx, {
         format: acquired.format,
@@ -9970,6 +10465,8 @@ function createWgpuWorkerHandler(options = {}) {
       postMessage({ error: 'no WebGPU adapter available' });
       return null;
     }
+    const gpuAdapter = await extractSanitizedGpuAdapter(adapter);
+    currentGpuAdapter = gpuAdapter;
     if (adapter.info && typeof adapter.info === 'object') {
       const desc = [adapter.info.vendor, adapter.info.architecture, adapter.info.description]
         .filter((s) => typeof s === 'string' && s.length > 0)
@@ -10073,6 +10570,8 @@ function createWgpuWorkerHandler(options = {}) {
       width,
       height,
       now: telemetryNow,
+      gpuAdapter,
+      drawExecutor: initPayload.drawExecutor ?? options.drawExecutor,
       swapchain: activeSwapchain,
       ownsSwapchain,
       logger: options.logger,
@@ -10191,8 +10690,10 @@ function createWgpuWorkerHandler(options = {}) {
 
     const info = adapter.info
       ? `${adapter.info.vendor || 'gpu'} ${adapter.info.architecture || ''}`.trim()
-      : 'WebGPU';
-    postMessage({ ready: true, adapter: info, features: enabledFeatures });
+      : gpuAdapter && (gpuAdapter.vendor || gpuAdapter.architecture)
+        ? `${gpuAdapter.vendor || 'gpu'} ${gpuAdapter.architecture || ''}`.trim()
+        : 'WebGPU';
+    postMessage({ ready: true, adapter: info, gpuAdapter, features: enabledFeatures });
     return processor;
   }
 
@@ -10236,6 +10737,7 @@ function createWgpuWorkerHandler(options = {}) {
           swapchain = created.swapchain || swapchain;
           lastTelemetryEmitMs = -Infinity;
           firstPresentNotified = false;
+          firstVisibleFrameNotified = false;
           bindProcessorValidationErrors(processor);
         }
         if (payload.ringSab || payload.ring) {
@@ -10376,6 +10878,23 @@ function createWgpuWorkerHandler(options = {}) {
             fallbackSamplerBindingsSynthesized: stats
               ? toNonNegativeInt(stats.fallbackSamplerBindingsSynthesized, 0)
               : 0,
+            firstVisibleFrame: Boolean(stats && stats.firstVisibleFrame === true),
+            firstVisibleFrameMs:
+              stats &&
+              typeof stats.firstVisibleFrameMs === 'number' &&
+              Number.isFinite(stats.firstVisibleFrameMs)
+                ? stats.firstVisibleFrameMs
+                : null,
+            blackLoadingMs:
+              stats &&
+              typeof stats.blackLoadingMs === 'number' &&
+              Number.isFinite(stats.blackLoadingMs)
+                ? stats.blackLoadingMs
+                : null,
+            gpuAdapter: (stats && stats.gpuAdapter) || getActiveGpuAdapter(),
+            chunkedWriteBufferUploads: stats
+              ? toNonNegativeInt(stats.chunkedWriteBufferUploads, 0)
+              : 0,
           };
           if (payload.id !== undefined) {
             reply.id = payload.id;
@@ -10385,6 +10904,7 @@ function createWgpuWorkerHandler(options = {}) {
           postMessage({
             id: payload.id,
             stats,
+            gpuAdapter: (stats && stats.gpuAdapter) || getActiveGpuAdapter(),
           });
         }
       } else if (payload.type === 'present-splash-frame' || payload.type === 'bink-frame') {
@@ -10516,6 +11036,7 @@ function createWgpuWorkerHandler(options = {}) {
               width: result.width,
               height: result.height,
               timestamp: telemetryNow(),
+              gpuAdapter: getActiveGpuAdapter(),
             };
             if (notifyHandlerFirstPresent(firstPresentInfo)) {
               postMessage(firstPresentInfo);
@@ -10532,6 +11053,14 @@ function createWgpuWorkerHandler(options = {}) {
           }
           unbindValidationListener = null;
         }
+        if (unbindFirstVisibleFrameListener) {
+          try {
+            unbindFirstVisibleFrameListener();
+          } catch (_) {
+            // Ignore cleanup errors.
+          }
+          unbindFirstVisibleFrameListener = null;
+        }
         // W100: intentional host destroy must never trigger device-loss recovery.
         bindProcessorDeviceLoss(null);
         if (typeof processor.destroy === 'function') {
@@ -10544,12 +11073,18 @@ function createWgpuWorkerHandler(options = {}) {
         const result = processor.drainRing();
         if (result.presents > 0) {
           if (prevFrames === 0 && result.frameCount >= 1) {
-            notifyHandlerFirstPresent({
+            const firstPresentInfo = {
+              type: 'first-present',
+              firstPresent: true,
               source: 'command-buffer',
               frameIndex: 0,
               framesPresented: result.frameCount,
               timestamp: telemetryNow(),
-            });
+              gpuAdapter: getActiveGpuAdapter(),
+            };
+            if (notifyHandlerFirstPresent(firstPresentInfo)) {
+              postMessage(firstPresentInfo);
+            }
           }
           postMessage({ frame: result.frameCount });
           maybeEmitFrameTelemetry(prevFrames, result.frameCount);
@@ -10566,12 +11101,18 @@ function createWgpuWorkerHandler(options = {}) {
         const result = processor.executeCommandBuffer(batchBuffer);
         if (result.presents > 0) {
           if (prevFrames === 0 && result.frameCount >= 1) {
-            notifyHandlerFirstPresent({
+            const firstPresentInfo = {
+              type: 'first-present',
+              firstPresent: true,
               source: 'command-buffer',
               frameIndex: 0,
               framesPresented: result.frameCount,
               timestamp: telemetryNow(),
-            });
+              gpuAdapter: getActiveGpuAdapter(),
+            };
+            if (notifyHandlerFirstPresent(firstPresentInfo)) {
+              postMessage(firstPresentInfo);
+            }
           }
           postMessage({ frame: result.frameCount });
           maybeEmitFrameTelemetry(prevFrames, result.frameCount);
@@ -10604,6 +11145,10 @@ const exportedApi = {
   OPTIONAL_ADAPTER_FEATURES,
   selectSupportedAdapterLimits,
   OPTIONAL_ADAPTER_LIMIT_SPECS,
+  extractSanitizedGpuAdapter,
+  sanitizeGpuAdapterInfo,
+  MAX_GPU_ADAPTER_FIELD_LENGTH,
+  MAX_DIRECT_WRITE_BUFFER_CHUNK_BYTES,
   selectFallbackShaderProfile,
   sanitizeValidationErrorMessage,
   normalizeValidationErrorType,
