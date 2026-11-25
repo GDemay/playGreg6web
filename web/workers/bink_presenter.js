@@ -17,6 +17,7 @@
   const TARGET_FPS_30_INTERVAL_MS = 1000 / 30;
   const DEFAULT_BIND_GROUP_CACHE_CAPACITY = 16;
   const DOUBLE_BUFFER_SLOTS = 2;
+  const TRIPLE_BUFFER_SLOTS = 3;
   const UNIFORM_FLAG_FULL_RANGE = 1;
   const UNIFORM_FLAG_SWAP_CHROMA = 2;
 
@@ -704,6 +705,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         loadOp = BINK_LOAD_OP.CLEAR,
         targetFps = DEFAULT_TARGET_FPS,
         doubleBuffer = true,
+        enableTripleBuffering = false,
+        planeRingDepth,
         slotCount,
         bindGroupCacheCapacity = DEFAULT_BIND_GROUP_CACHE_CAPACITY,
         now = defaultNowMs,
@@ -731,8 +734,32 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       validateLoadOp(loadOp);
       assertPositiveFinite(targetFps, 'targetFps');
 
+      if (planeRingDepth !== undefined) {
+        assertPositiveInteger(planeRingDepth, 'planeRingDepth');
+      }
+      if (slotCount !== undefined) {
+        assertPositiveInteger(slotCount, 'slotCount');
+      }
+      if (
+        planeRingDepth !== undefined &&
+        slotCount !== undefined &&
+        planeRingDepth !== slotCount
+      ) {
+        throw new RangeError(
+          `Conflicting planeRingDepth (${planeRingDepth}) and slotCount (${slotCount})`
+        );
+      }
+
       const resolvedSlotCount =
-        slotCount !== undefined ? slotCount : doubleBuffer ? DOUBLE_BUFFER_SLOTS : 1;
+        planeRingDepth !== undefined
+          ? planeRingDepth
+          : enableTripleBuffering
+            ? TRIPLE_BUFFER_SLOTS
+            : slotCount !== undefined
+              ? slotCount
+              : doubleBuffer
+                ? DOUBLE_BUFFER_SLOTS
+                : 1;
       assertPositiveInteger(resolvedSlotCount, 'slotCount');
       assertPositiveInteger(bindGroupCacheCapacity, 'bindGroupCacheCapacity');
 
@@ -746,12 +773,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       this._targetFps = targetFps;
       this._now = now;
 
-      // Reusable plane texture slots (double-buffered by default).
+      // Reusable plane texture ring slots (double-buffered by default; opt-in triple-buffering
+      // via enableTripleBuffering: true or planeRingDepth: 3).
+      this._planeRingDepth = resolvedSlotCount;
       this._slots = [];
       for (let i = 0; i < resolvedSlotCount; i += 1) {
         this._slots.push(createEmptySlot(i));
       }
       this._activeSlotIndex = 0;
+      this._activePlaneSlot = 0;
       this._hasFrame = false;
       this._unpresentedFrame = false;
 
@@ -976,6 +1006,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       this._lastFrameIntervalMs = 0;
       this._measuredFrameIntervals = 0;
       this._targetFps30Hits = 0;
+      this._planeSlotRotations = 0;
+      this._reusedUploadDescriptors = 0;
+      this._framesOver30FpsBudget = 0;
+      this._peakPresentIntervalMs = 0;
       this._destroyed = false;
     }
 
@@ -1088,6 +1122,30 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       return this._uniformWritesSkipped;
     }
 
+    get planeRingDepth() {
+      return this._planeRingDepth;
+    }
+
+    get activePlaneSlot() {
+      return this._activePlaneSlot;
+    }
+
+    get planeSlotRotations() {
+      return sanitizeNonNegativeInteger(this._planeSlotRotations);
+    }
+
+    get reusedUploadDescriptors() {
+      return sanitizeNonNegativeInteger(this._reusedUploadDescriptors);
+    }
+
+    get framesOver30FpsBudget() {
+      return sanitizeNonNegativeInteger(this._framesOver30FpsBudget);
+    }
+
+    get peakPresentIntervalMs() {
+      return sanitizeNonNegativeNumber(this._peakPresentIntervalMs);
+    }
+
     _recordUploadDuration(startMs, endMs) {
       const raw = endMs - startMs;
       const durationMs = Number.isFinite(raw) && raw > 0 ? raw : 0;
@@ -1124,6 +1182,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       }
       this._pendingUploads.length = 0;
       this._pendingUploadsDrain.length = 0;
+      this._uploadDestinationScratch.texture = null;
       this._invalidateBindGroupCache();
     }
 
@@ -1179,6 +1238,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       if (formatOrSizeChanged) {
         // Destroy stale textures across all slots immediately on resolution/format change.
         this._destroyAllSlots();
+        this._activeSlotIndex = 0;
+        this._activePlaneSlot = 0;
         this._resizeCount += 1;
         this._planeReallocations += 1;
         if (this._pixelFormat !== format) {
@@ -1192,7 +1253,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         return 0;
       }
 
-      return (this._activeSlotIndex + 1) % this._slots.length;
+      return (this._activePlaneSlot + 1) % this._planeRingDepth;
     }
 
     _ensureSlotTextures(slotIndex, format, width, height) {
@@ -1363,6 +1424,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             prepared.data,
             this._stagingLayoutScratch
           );
+          this._reusedUploadDescriptors += 1;
         } else {
           const layout = {
             width,
@@ -1394,6 +1456,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
           width,
           height
         );
+        this._reusedUploadDescriptors += 1;
       }
 
       this._bytesUploaded += prepared.totalBytes;
@@ -1507,6 +1570,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
       const uploadMs = this._recordUploadDuration(uploadStartMs, this._now());
 
+      const rotatedSlot = this._hasFrame && writeSlotIndex !== this._activePlaneSlot;
       if (this._pixelFormat !== BINK_PIXEL_FORMAT.RGBA8) {
         this._uniformsDirty = true;
       }
@@ -1514,6 +1578,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       this._frameWidth = width;
       this._frameHeight = height;
       this._activeSlotIndex = writeSlotIndex;
+      this._activePlaneSlot = writeSlotIndex;
+      if (rotatedSlot) {
+        this._planeSlotRotations += 1;
+      }
       this._hasFrame = true;
       this._unpresentedFrame = true;
       this._uploadedFrames += 1;
@@ -1726,10 +1794,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         this._uniformsDirty = true;
       }
 
+      const rotatedSlot = this._hasFrame && writeSlotIndex !== this._activePlaneSlot;
       this._pixelFormat = format;
       this._frameWidth = width;
       this._frameHeight = height;
       this._activeSlotIndex = writeSlotIndex;
+      this._activePlaneSlot = writeSlotIndex;
+      if (rotatedSlot) {
+        this._planeSlotRotations += 1;
+      }
       this._hasFrame = true;
       this._unpresentedFrame = true;
       this._uploadedFrames += 1;
@@ -1888,10 +1961,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         this._uniformsDirty = true;
       }
 
+      const rotatedSlot = this._hasFrame && writeSlotIndex !== this._activePlaneSlot;
       this._pixelFormat = BINK_PIXEL_FORMAT.NV12;
       this._frameWidth = width;
       this._frameHeight = height;
       this._activeSlotIndex = writeSlotIndex;
+      this._activePlaneSlot = writeSlotIndex;
+      if (rotatedSlot) {
+        this._planeSlotRotations += 1;
+      }
       this._hasFrame = true;
       this._unpresentedFrame = true;
       this._uploadedFrames += 1;
@@ -2397,8 +2475,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         if (Number.isFinite(deltaMs) && deltaMs > 0) {
           this._lastFrameIntervalMs = deltaMs;
           this._measuredFrameIntervals += 1;
+          if (deltaMs > this._peakPresentIntervalMs) {
+            this._peakPresentIntervalMs = deltaMs;
+          }
           if (deltaMs <= TARGET_FPS_30_INTERVAL_MS) {
             this._targetFps30Hits += 1;
+          } else {
+            this._framesOver30FpsBudget += 1;
           }
         } else {
           this._lastFrameIntervalMs = 0;
@@ -2462,6 +2545,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       this._frameWidth = 0;
       this._frameHeight = 0;
       this._activeSlotIndex = 0;
+      this._activePlaneSlot = 0;
       this._hasFrame = false;
       this._unpresentedFrame = false;
       this._lastAdvanceMs = null;
@@ -2493,6 +2577,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       this._frameWidth = 0;
       this._frameHeight = 0;
       this._activeSlotIndex = 0;
+      this._activePlaneSlot = 0;
       this._hasFrame = false;
       this._unpresentedFrame = false;
       this._lastAdvanceMs = null;
@@ -2730,6 +2815,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       this._lastFrameIntervalMs = 0;
       this._measuredFrameIntervals = 0;
       this._targetFps30Hits = 0;
+      this._planeSlotRotations = 0;
+      this._reusedUploadDescriptors = 0;
+      this._framesOver30FpsBudget = 0;
+      this._peakPresentIntervalMs = 0;
       this._lastPresentMs = null;
     }
 
@@ -2763,11 +2852,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         lastUploadMs: pacing.lastUploadMs,
         lastFrameIntervalMs: pacing.lastFrameIntervalMs,
         targetFpsHitRate30: this.targetFpsHitRate30,
+        framesOver30FpsBudget: sanitizeNonNegativeInteger(this._framesOver30FpsBudget),
+        peakPresentIntervalMs: sanitizeNonNegativeNumber(this._peakPresentIntervalMs),
         resizeCount: this._resizeCount,
         planeReallocations: this._planeReallocations,
         scratchAllocations: this._scratchAllocations,
         directZeroCopyUploads: this._directZeroCopyUploads,
         chromaRepackUploads: this._chromaRepackUploads,
+        reusedUploadDescriptors: sanitizeNonNegativeInteger(this._reusedUploadDescriptors),
         bytesUploaded: this._bytesUploaded,
         bindGroupCacheHits: this._bindGroupCacheHits,
         bindGroupCacheMisses: this._bindGroupCacheMisses,
@@ -2776,6 +2868,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         bindGroupCacheCapacity: this._bindGroupCacheCapacity,
         uniformWritesSkipped: this._uniformWritesSkipped,
         slotCount: this._slots.length,
+        planeRingDepth: sanitizeNonNegativeInteger(this._planeRingDepth),
+        planeSlotRotations: sanitizeNonNegativeInteger(this._planeSlotRotations),
         activeSlotIndex: this._activeSlotIndex,
         hasFrame: this._hasFrame,
         paused: this._paused,
@@ -2807,6 +2901,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       this._loadColorAttachmentScratch.view = null;
       this._presentResultScratch.viewport = null;
       this._rgbaUploadOptionsScratch.commandEncoder = null;
+      this._activeSlotIndex = 0;
+      this._activePlaneSlot = 0;
       this._hasFrame = false;
       this._unpresentedFrame = false;
       this._lastAdvanceMs = null;
@@ -2833,6 +2929,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     DEFAULT_TARGET_FPS,
     TARGET_FPS_30_INTERVAL_MS,
     DEFAULT_BIND_GROUP_CACHE_CAPACITY,
+    TRIPLE_BUFFER_SLOTS,
     BINK_PIXEL_FORMAT,
     BINK_CHROMA_ORDER,
     BINK_LOAD_OP,
