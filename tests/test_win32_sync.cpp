@@ -1184,6 +1184,142 @@ void test_sync_microbench() {
     CHECK(srw_ns < 1000.0);
 }
 
+// Contention microbench (printed only): independent ping-pong pairs running at once, which a single
+// process-wide dispatcher lock serialises, plus many producers/consumers on one shared semaphore.
+void test_sync_contention_microbench() {
+    constexpr int kPairs = 4;
+    constexpr int kRounds = 5000;
+    std::vector<Handle> pings(kPairs);
+    std::vector<Handle> pongs(kPairs);
+    for (int p = 0; p < kPairs; ++p) {
+        pings[p] = CreateEventW(nullptr, false, false, nullptr);
+        pongs[p] = CreateEventW(nullptr, false, false, nullptr);
+    }
+    std::vector<std::thread> threads;
+    const auto pairs_start = std::chrono::steady_clock::now();
+    for (int p = 0; p < kPairs; ++p) {
+        threads.emplace_back([&, p]() {
+            for (int i = 0; i < kRounds; ++i) {
+                CHECK(WaitForSingleObject(pings[p], kLongWait) == WAIT_OBJECT_0);
+                CHECK(SetEvent(pongs[p]));
+            }
+        });
+        threads.emplace_back([&, p]() {
+            for (int i = 0; i < kRounds; ++i) {
+                CHECK(SetEvent(pings[p]));
+                CHECK(WaitForSingleObject(pongs[p], kLongWait) == WAIT_OBJECT_0);
+            }
+        });
+    }
+    for (auto& t : threads) {
+        t.join();
+    }
+    const double pairs_ns =
+        std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - pairs_start).count() /
+        (static_cast<double>(kPairs) * kRounds);
+    threads.clear();
+    for (int p = 0; p < kPairs; ++p) {
+        CloseHandle(pings[p]);
+        CloseHandle(pongs[p]);
+    }
+
+    // Shared semaphore: producers release one unit at a time, consumers take them (and also poll a
+    // per-consumer event via wait-any so the multi-object path is exercised under contention).
+    constexpr int kWorkers = 4;
+    constexpr int kItems = 20000;
+    const Handle sem = CreateSemaphoreW(nullptr, 0, kWorkers * kItems, nullptr);
+    std::atomic<int> consumed{0};
+    const auto sem_start = std::chrono::steady_clock::now();
+    for (int w = 0; w < kWorkers; ++w) {
+        threads.emplace_back([&]() {
+            for (int i = 0; i < kItems; ++i) {
+                CHECK(ReleaseSemaphore(sem, 1, nullptr));
+            }
+        });
+        threads.emplace_back([&]() {
+            const Handle idle = CreateEventW(nullptr, true, false, nullptr);
+            const Handle set[2] = {idle, sem};
+            for (int i = 0; i < kItems; ++i) {
+                CHECK(WaitForMultipleObjects(2, set, false, kLongWait) == WAIT_OBJECT_0 + 1);
+                consumed.fetch_add(1, std::memory_order_relaxed);
+            }
+            CloseHandle(idle);
+        });
+    }
+    for (auto& t : threads) {
+        t.join();
+    }
+    const double sem_ns =
+        std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - sem_start).count() /
+        (static_cast<double>(kWorkers) * kItems);
+    CHECK(consumed.load() == kWorkers * kItems);
+    CHECK(WaitForSingleObject(sem, 0) == WAIT_TIMEOUT);
+    CloseHandle(sem);
+
+    std::printf("sync contention microbench: %d concurrent event ping-pong pairs %.0f ns/round trip, "
+                "%d+%d semaphore producers/consumers %.0f ns/item\n",
+                kPairs, pairs_ns, kWorkers, kWorkers, sem_ns);
+}
+
+// Wait-all vs. wait-any contention on the same objects: every unit released must be taken exactly
+// once, and a wait-all must take both semaphores atomically (never one without the other).
+void test_wait_all_any_stress() {
+    constexpr int kRounds = 3000;
+    const Handle a = CreateSemaphoreW(nullptr, 0, 1 << 20, nullptr);
+    const Handle b = CreateSemaphoreW(nullptr, 0, 1 << 20, nullptr);
+    std::atomic<int> taken_a{0};
+    std::atomic<int> taken_b{0};
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> threads;
+    for (int w = 0; w < 2; ++w) {
+        threads.emplace_back([&]() {  // wait-all consumer
+            const Handle set[2] = {a, b};
+            while (!stop.load()) {
+                const uint32_t r = WaitForMultipleObjects(2, set, true, 1);
+                if (r == WAIT_OBJECT_0) {
+                    taken_a.fetch_add(1);
+                    taken_b.fetch_add(1);
+                } else {
+                    CHECK(r == WAIT_TIMEOUT);
+                }
+            }
+        });
+        threads.emplace_back([&]() {  // wait-any consumer
+            const Handle set[2] = {b, a};
+            while (!stop.load()) {
+                const uint32_t r = WaitForMultipleObjects(2, set, false, 1);
+                if (r == WAIT_OBJECT_0) {
+                    taken_b.fetch_add(1);
+                } else if (r == WAIT_OBJECT_0 + 1) {
+                    taken_a.fetch_add(1);
+                } else {
+                    CHECK(r == WAIT_TIMEOUT);
+                }
+            }
+        });
+    }
+    for (int i = 0; i < kRounds; ++i) {
+        CHECK(ReleaseSemaphore(a, 1, nullptr));
+        CHECK(ReleaseSemaphore(b, 1, nullptr));
+    }
+    // Drain: consumers keep running until every unit is gone.
+    const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while ((taken_a.load() < kRounds || taken_b.load() < kRounds) &&
+           std::chrono::steady_clock::now() < give_up) {
+        std::this_thread::yield();
+    }
+    stop.store(true);
+    for (auto& t : threads) {
+        t.join();
+    }
+    CHECK(taken_a.load() == kRounds);
+    CHECK(taken_b.load() == kRounds);
+    CHECK(WaitForSingleObject(a, 0) == WAIT_TIMEOUT);
+    CHECK(WaitForSingleObject(b, 0) == WAIT_TIMEOUT);
+    CloseHandle(a);
+    CloseHandle(b);
+}
+
 }  // namespace
 
 // Critical sections live in guest memory the runtime must not interpret: uninitialized bytes,
@@ -1252,6 +1388,8 @@ void test_critical_section_guest_storage() {
 int main() {
     test_critical_section_guest_storage();
     test_sync_microbench();
+    test_sync_contention_microbench();
+    test_wait_all_any_stress();
     test_semaphores();
     test_live_kernel_handle_counts();
     test_mutexes();
