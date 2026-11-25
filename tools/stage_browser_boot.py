@@ -1,24 +1,31 @@
 #!/usr/bin/env python3
-"""Safe local browser real-boot artifact staging CLI (Track 5 / W51, W66).
+"""Safe local browser real-boot artifact staging CLI (Track 5 / W51, W66, W119).
 
 Stages allowlisted local recompilation boot artifacts (`program-manifest.json`,
 `build-manifest.json`, nested `*.pgim`) from `--program-dir` into `--boot-dir`
-(served at `/boot/` by `server/serve_local.py`), and validates + atomically
-stages `runtime.wasm`, `runtime.js`, and any sibling top-level `*.wasm`
-Emscripten side modules from `--wasm-dir` into `--web-dist`.
+(served at `/boot/` by `server/serve_local.py`), validates + atomically stages
+`runtime.wasm`, `runtime.js`, and any sibling top-level `*.wasm` Emscripten
+side modules from `--wasm-dir` into `--web-dist`, atomically stages `.wgsl.pack`
+shader bundles plus adjacent/overridden `<pack>.reflect.json` sidecars into
+`--shaders-dir`, and optionally writes a schema-validated `boot-options.json`
+into `--boot-dir`.
 
 Safety & privacy invariants:
-- Refuses to write boot artifacts into tracked repository directories
-  (`--boot-dir` must be under `work/`, `local-data/`, or outside the repo).
+- Refuses to write boot artifacts or `boot-options.json` into tracked repository
+  directories (`--boot-dir` must be under `work/`, `local-data/`, or outside the
+  repo).
 - Refuses to write Wasm64 runtime artifacts into tracked repository directories
   (`--web-dist` must be `web/dist` or outside the repo).
+- Refuses to write shader packs or `.reflect.json` sidecars into tracked
+  repository directories (`--shaders-dir` must be under `local-data/`, `work/`,
+  or outside the repo).
 - Skips any symlinks escaping `--program-dir` / `--wasm-dir`, rejects unsafe
-  side-module filenames/traversal, and never copies non-allowlisted build
-  artifacts (`.ll`, `.o`, `.cpp`, `.c`, `.h`, `.rsp`, etc.).
+  side-module or shader-pack filenames/traversal, and never copies
+  non-allowlisted build artifacts (`.ll`, `.o`, `.cpp`, `.c`, `.h`, `.rsp`, etc.).
 - Validates `runtime.wasm` via `tools/check_wasm_exports.py` (`memory64`,
-  shared memory, 5/5 `env.host_*` ABI imports) BEFORE atomically replacing
-  files (including any side-module `*.wasm` chunks) in `--web-dist`
-  (`os.replace` via same-directory temp file).
+  shared memory, 5/5 `env.host_*` ABI imports), validates `.reflect.json` JSON
+  structure, and schema-validates `boot-options.json` BEFORE atomically
+  replacing files (`os.replace` via same-directory temp file).
 - Strictly sanitized JSON and text output: zero Windows/POSIX/UNC host paths,
   zero usernames, and zero raw bytes.
 - Pure Python 3.12 standard library only.
@@ -26,7 +33,10 @@ Safety & privacy invariants:
 Usage:
     python tools/stage_browser_boot.py --program-dir work/recomp_program
         [--wasm-dir work/wasm_guest_dist] [--boot-dir work/recomp_build]
-        [--web-dist web/dist] [--dry-run] [--json]
+        [--web-dist web/dist] [--shader-pack work/splash.wgsl.pack]
+        [--shaders-dir local-data/shaders] [--reflect-sidecar <path>]
+        [--verify-window-marks] [--boot-options-json <json-or-file>]
+        [--dry-run] [--json]
 """
 
 from __future__ import annotations
@@ -48,12 +58,40 @@ DEFAULT_REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_PROGRAM_DIR_REL = Path("work") / "recomp_program"
 DEFAULT_BOOT_DIR_REL = Path("work") / "recomp_build"
 DEFAULT_WEB_DIST_REL = Path("web") / "dist"
+DEFAULT_SHADERS_DIR_REL = Path("local-data") / "shaders"
 
 RUNTIME_WASM_NAME = "runtime.wasm"
 RUNTIME_JS_NAME = "runtime.js"
+DEFAULT_SHADER_PACK_NAME = "splash.wgsl.pack"
+REFLECT_SIDECAR_SUFFIX = ".reflect.json"
+BOOT_OPTIONS_NAME = "boot-options.json"
+WGPK_MAGIC = b"WGPK"
+
 _SAFE_SIDE_MODULE_NAME_RE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._-]*\.wasm$", re.IGNORECASE
 )
+_SAFE_SHADER_PACK_NAME_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*\.wgsl\.pack$", re.IGNORECASE
+)
+
+BOOT_OPTIONS_UINT_KEYS: frozenset[str] = frozenset(
+    {
+        "max_wall_ms",
+        "max_dispatches",
+        "arena_log_limit",
+        "import_trace_limit",
+    }
+)
+BOOT_OPTIONS_BOOL_KEYS: frozenset[str] = frozenset(
+    {
+        "report_to_log",
+        "verify_window_marks",
+    }
+)
+BOOT_OPTIONS_ALLOWED_KEYS: frozenset[str] = (
+    BOOT_OPTIONS_UINT_KEYS | BOOT_OPTIONS_BOOL_KEYS
+)
+_UINT64_MAX = (1 << 64) - 1
 
 ALLOWLISTED_MANIFEST_NAMES: frozenset[str] = frozenset(
     {
@@ -248,6 +286,37 @@ def validate_web_dist_safety(web_dist: Path, repo_root: Path) -> tuple[bool, str
         f"refusing to write Wasm64 runtime into tracked repository directory '{label}' "
         "(must be web/dist or outside the repository)",
     )
+
+
+def validate_shaders_dir_safety(shaders_dir: Path, repo_root: Path) -> tuple[bool, str | None]:
+    """Ensure `--shaders-dir` is under `local-data/`, `work/`, or outside the repository."""
+    resolved_repo = repo_root.resolve()
+    resolved_shaders = shaders_dir.resolve()
+    if not resolved_shaders.is_relative_to(resolved_repo):
+        return True, None
+
+    allowed_roots = (
+        resolved_repo / "local-data",
+        resolved_repo / "work",
+    )
+    if any(resolved_shaders.is_relative_to(allowed) for allowed in allowed_roots):
+        return True, None
+
+    label = repo_relative_label(resolved_shaders, resolved_repo) or "<repo>"
+    return (
+        False,
+        f"refusing to write shader artifacts into tracked repository directory '{label}' "
+        "(must be under local-data/, work/, or outside the repository)",
+    )
+
+
+def is_safe_shader_pack_name(filename: str) -> bool:
+    """Return True only for safe top-level `*.wgsl.pack` filenames."""
+    if not filename:
+        return False
+    if "/" in filename or "\\" in filename or "\x00" in filename or ".." in filename:
+        return False
+    return _SAFE_SHADER_PACK_NAME_RE.match(filename) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -493,6 +562,91 @@ def atomic_copy_files(pairs: Sequence[tuple[Path, Path]]) -> None:
         for tmp_path, _ in staged:
             if tmp_path not in replaced:
                 tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def plan_bytes_stage(payload: bytes, dst: Path) -> FileStagePlan:
+    """Determine whether raw `payload` bytes must be written to `dst`."""
+    payload_size = len(payload)
+    payload_digest = hashlib.sha256(payload).hexdigest()
+
+    if dst.is_symlink():
+        return FileStagePlan(
+            needs_copy=True,
+            reason="replace_symlink",
+            size_bytes=payload_size,
+            sha256=payload_digest,
+        )
+
+    if not dst.exists():
+        return FileStagePlan(
+            needs_copy=True,
+            reason="missing",
+            size_bytes=payload_size,
+            sha256=payload_digest,
+        )
+
+    if not dst.is_file():
+        raise StageBrowserBootError(
+            f"destination path is not a regular file: {basename_label(dst)}"
+        )
+
+    dst_stat = dst.stat()
+    if int(dst_stat.st_size) != payload_size:
+        return FileStagePlan(
+            needs_copy=True,
+            reason="size_changed",
+            size_bytes=payload_size,
+            sha256=payload_digest,
+        )
+
+    dst_digest = sha256_file(dst)
+    if dst_digest != payload_digest:
+        return FileStagePlan(
+            needs_copy=True,
+            reason="sha256_changed",
+            size_bytes=payload_size,
+            sha256=payload_digest,
+        )
+
+    return FileStagePlan(
+        needs_copy=False,
+        reason="unchanged",
+        size_bytes=payload_size,
+        sha256=payload_digest,
+    )
+
+
+def _write_temp_bytes(payload: bytes, dst_dir: Path, final_name: str) -> Path:
+    """Write `payload` bytes into a new temp file in `dst_dir`."""
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    fd, tmp_str = tempfile.mkstemp(
+        prefix=f".{final_name}.",
+        suffix=".tmp",
+        dir=dst_dir,
+    )
+    tmp_path = Path(tmp_str)
+    try:
+        with os.fdopen(fd, "wb") as dst_fh:
+            dst_fh.write(payload)
+            dst_fh.flush()
+            try:
+                os.fsync(dst_fh.fileno())
+            except OSError:
+                pass
+        return tmp_path
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def atomic_write_bytes(payload: bytes, dst: Path) -> None:
+    """Atomically write `payload` to `dst` via a same-directory temp file and `os.replace`."""
+    tmp_path = _write_temp_bytes(payload, dst.parent, dst.name)
+    try:
+        os.replace(tmp_path, dst)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
         raise
 
 
@@ -893,26 +1047,645 @@ def stage_wasm_runtime(
 
 
 # ---------------------------------------------------------------------------
+# Shader pack (.wgsl.pack) & .reflect.json sidecar staging (W119)
+# ---------------------------------------------------------------------------
+
+
+def _empty_shaders_section() -> dict[str, Any]:
+    return {
+        "status": "skipped",
+        "pack": None,
+        "sidecar": None,
+        "sidecar_staged": False,
+        "sidecar_bytes": 0,
+        "copied_count": 0,
+        "planned_count": 0,
+        "unchanged_count": 0,
+    }
+
+
+def validate_reflect_sidecar(sidecar_path: Path) -> tuple[bool, dict[str, Any], list[str]]:
+    """Validate a `<pack>.reflect.json` stage-reflection sidecar file."""
+    label = basename_label(sidecar_path)
+    try:
+        raw_text = sidecar_path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError) as exc:
+        return (
+            False,
+            {},
+            [sanitize_text(f"failed to read reflection sidecar {label}: {exc}")],
+        )
+
+    try:
+        parsed = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        return (
+            False,
+            {},
+            [
+                sanitize_text(
+                    f"invalid JSON in reflection sidecar {label} "
+                    f"(line {exc.lineno}, col {exc.colno}): {exc.msg}"
+                )
+            ],
+        )
+
+    if not isinstance(parsed, dict):
+        return (
+            False,
+            {},
+            [f"invalid reflection sidecar {label}: top-level JSON value must be an object"],
+        )
+
+    errors: list[str] = []
+    schema_val = parsed.get("schema")
+    if schema_val is not None and (not isinstance(schema_val, str) or not schema_val.strip()):
+        errors.append(
+            f"invalid reflection sidecar {label}: 'schema' must be a non-empty string"
+        )
+
+    version_val = parsed.get("version")
+    if version_val is not None and (
+        isinstance(version_val, bool) or not isinstance(version_val, int) or version_val < 1
+    ):
+        errors.append(
+            f"invalid reflection sidecar {label}: 'version' must be a positive integer"
+        )
+
+    stages_val = parsed.get("stages")
+    if not isinstance(stages_val, dict):
+        errors.append(
+            f"invalid reflection sidecar {label}: missing or non-object 'stages' map"
+        )
+    else:
+        for stage_key, stage_entry in stages_val.items():
+            if not isinstance(stage_key, str) or not isinstance(stage_entry, dict):
+                errors.append(
+                    f"invalid reflection sidecar {label}: every entry in 'stages' must be a JSON object"
+                )
+                break
+
+    if errors:
+        return False, {}, sanitize_value(errors)
+
+    summary = {
+        "schema": sanitize_text(schema_val) if isinstance(schema_val, str) else None,
+        "version": int(version_val) if isinstance(version_val, int) else None,
+        "stage_count": len(stages_val),
+    }
+    return True, summary, []
+
+
+def stage_shader_pack(
+    *,
+    shader_pack: Path | str | None,
+    shaders_dir: Path | str = DEFAULT_SHADERS_DIR_REL,
+    shader_pack_name: str = DEFAULT_SHADER_PACK_NAME,
+    reflect_sidecar: Path | str | None = None,
+    repo_root: Path | str = DEFAULT_REPO_ROOT,
+    dry_run: bool = False,
+) -> tuple[dict[str, Any], list[str], list[str]]:
+    """Atomically stage a `.wgsl.pack` bundle and its adjacent or overridden `.reflect.json` sidecar."""
+    resolved_repo = Path(repo_root).resolve()
+    shaders_dir_path = _resolve_against_repo(shaders_dir, resolved_repo)
+    shaders_section = _empty_shaders_section()
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    shaders_safe, shaders_safety_err = validate_shaders_dir_safety(
+        shaders_dir_path, resolved_repo
+    )
+    if not shaders_safe:
+        shaders_section["status"] = "refused"
+        errors.append(shaders_safety_err or "refused unsafe --shaders-dir")
+        return sanitize_value(shaders_section), sanitize_value(errors), sanitize_value(warnings)
+
+    if shader_pack is None:
+        if reflect_sidecar is not None:
+            shaders_section["status"] = "error"
+            errors.append("--reflect-sidecar requires --shader-pack")
+        return sanitize_value(shaders_section), sanitize_value(errors), sanitize_value(warnings)
+
+    if not is_safe_shader_pack_name(shader_pack_name):
+        shaders_section["status"] = "refused"
+        errors.append(
+            f"refusing unsafe shader pack destination filename: {sanitize_text(shader_pack_name)}"
+        )
+        return sanitize_value(shaders_section), sanitize_value(errors), sanitize_value(warnings)
+
+    src_pack_raw = _resolve_against_repo(shader_pack, resolved_repo)
+    if not src_pack_raw.name.lower().endswith(".wgsl.pack"):
+        shaders_section["status"] = "refused"
+        errors.append(
+            f"shader-pack must end with .wgsl.pack: {basename_label(src_pack_raw)}"
+        )
+        return sanitize_value(shaders_section), sanitize_value(errors), sanitize_value(warnings)
+
+    try:
+        src_pack = src_pack_raw.resolve(strict=True)
+    except OSError:
+        shaders_section["status"] = "error"
+        errors.append(
+            f"shader-pack does not exist: {repo_relative_label(src_pack_raw, resolved_repo)}"
+        )
+        return sanitize_value(shaders_section), sanitize_value(errors), sanitize_value(warnings)
+
+    if not src_pack.is_file():
+        shaders_section["status"] = "error"
+        errors.append(
+            f"shader-pack is not a regular file: {repo_relative_label(src_pack_raw, resolved_repo)}"
+        )
+        return sanitize_value(shaders_section), sanitize_value(errors), sanitize_value(warnings)
+
+    try:
+        pack_size = int(src_pack.stat().st_size)
+        with src_pack.open("rb") as fh:
+            pack_magic = fh.read(len(WGPK_MAGIC))
+    except OSError as exc:
+        shaders_section["status"] = "error"
+        errors.append(
+            f"failed to read shader-pack {basename_label(src_pack_raw)}: {sanitize_text(str(exc))}"
+        )
+        return sanitize_value(shaders_section), sanitize_value(errors), sanitize_value(warnings)
+
+    if pack_size == 0:
+        shaders_section["status"] = "refused"
+        errors.append(f"refusing empty shader-pack: {basename_label(src_pack_raw)}")
+        return sanitize_value(shaders_section), sanitize_value(errors), sanitize_value(warnings)
+
+    if pack_magic != WGPK_MAGIC:
+        warnings.append(
+            f"shader-pack {basename_label(src_pack_raw)} does not start with WGPK magic"
+        )
+
+    # Locate optional adjacent `<src_pack>.reflect.json` or explicit `--reflect-sidecar` override.
+    sidecar_source: str | None = None
+    sidecar_resolved: Path | None = None
+    sidecar_meta: dict[str, Any] = {}
+
+    if reflect_sidecar is not None:
+        sidecar_source = "override"
+        sidecar_raw = _resolve_against_repo(reflect_sidecar, resolved_repo)
+        try:
+            sidecar_candidate = sidecar_raw.resolve(strict=True)
+        except OSError:
+            shaders_section["status"] = "error"
+            errors.append(
+                f"reflect-sidecar does not exist: {repo_relative_label(sidecar_raw, resolved_repo)}"
+            )
+            return (
+                sanitize_value(shaders_section),
+                sanitize_value(errors),
+                sanitize_value(warnings),
+            )
+        if not sidecar_candidate.is_file():
+            shaders_section["status"] = "error"
+            errors.append(
+                f"reflect-sidecar is not a regular file: "
+                f"{repo_relative_label(sidecar_raw, resolved_repo)}"
+            )
+            return (
+                sanitize_value(shaders_section),
+                sanitize_value(errors),
+                sanitize_value(warnings),
+            )
+        sidecar_resolved = sidecar_candidate
+    else:
+        adjacent_raw = Path(str(src_pack_raw) + REFLECT_SIDECAR_SUFFIX)
+        if adjacent_raw.exists() or adjacent_raw.is_symlink():
+            sidecar_source = "adjacent"
+            try:
+                adjacent_resolved = adjacent_raw.resolve(strict=True)
+            except OSError:
+                shaders_section["status"] = "refused"
+                errors.append(
+                    f"adjacent reflection sidecar is unreadable or a broken symlink: "
+                    f"{basename_label(adjacent_raw)}"
+                )
+                return (
+                    sanitize_value(shaders_section),
+                    sanitize_value(errors),
+                    sanitize_value(warnings),
+                )
+            if not adjacent_resolved.is_file():
+                shaders_section["status"] = "refused"
+                errors.append(
+                    f"adjacent reflection sidecar is not a regular file: "
+                    f"{basename_label(adjacent_raw)}"
+                )
+                return (
+                    sanitize_value(shaders_section),
+                    sanitize_value(errors),
+                    sanitize_value(warnings),
+                )
+            sidecar_resolved = adjacent_resolved
+
+    # Validate sidecar JSON BEFORE staging either the pack or the sidecar so
+    # invalid sidecars never clobber existing staged files.
+    if sidecar_resolved is not None:
+        sidecar_ok, sidecar_meta, sidecar_errors = validate_reflect_sidecar(sidecar_resolved)
+        if not sidecar_ok:
+            shaders_section["status"] = "refused"
+            errors.extend(sidecar_errors)
+            return (
+                sanitize_value(shaders_section),
+                sanitize_value(errors),
+                sanitize_value(warnings),
+            )
+
+    resolved_shaders = shaders_dir_path.resolve()
+    dst_pack = shaders_dir_path / shader_pack_name
+    dst_sidecar = Path(str(dst_pack) + REFLECT_SIDECAR_SUFFIX)
+    sidecar_dest_name = dst_sidecar.name
+
+    candidates: list[tuple[str, str, Path, Path]] = [
+        ("pack", shader_pack_name, src_pack, dst_pack),
+    ]
+    if sidecar_resolved is not None:
+        candidates.append(("sidecar", sidecar_dest_name, sidecar_resolved, dst_sidecar))
+
+    for _, dest_name, _, dst_file in candidates:
+        if dst_file.parent.resolve() != resolved_shaders or dst_file.name != dest_name:
+            shaders_section["status"] = "refused"
+            errors.append(
+                f"refused shader artifact escaping shaders-dir: {sanitize_text(dest_name)}"
+            )
+            return (
+                sanitize_value(shaders_section),
+                sanitize_value(errors),
+                sanitize_value(warnings),
+            )
+
+    plans: list[tuple[str, str, Path, Path, FileStagePlan]] = []
+    for kind, dest_name, src_file, dst_file in candidates:
+        try:
+            plan = plan_file_stage(src_file, dst_file)
+        except (OSError, StageBrowserBootError) as exc:
+            shaders_section["status"] = "error"
+            errors.append(
+                f"failed to inspect shader artifact {sanitize_text(dest_name)}: "
+                f"{sanitize_text(str(exc))}"
+            )
+            return (
+                sanitize_value(shaders_section),
+                sanitize_value(errors),
+                sanitize_value(warnings),
+            )
+        plans.append((kind, dest_name, src_file, dst_file, plan))
+
+    to_copy = [
+        (src_file, dst_file)
+        for _, _, src_file, dst_file, plan in plans
+        if plan.needs_copy
+    ]
+    if to_copy and not dry_run:
+        try:
+            atomic_copy_files(to_copy)
+        except OSError as exc:
+            shaders_section["status"] = "error"
+            errors.append(
+                f"failed to atomically stage shader artifacts: {sanitize_text(str(exc))}"
+            )
+            return (
+                sanitize_value(shaders_section),
+                sanitize_value(errors),
+                sanitize_value(warnings),
+            )
+
+    copied = 0
+    planned = 0
+    unchanged = 0
+    for kind, dest_name, _, _, plan in plans:
+        if not plan.needs_copy:
+            unchanged += 1
+            action = "unchanged"
+        elif dry_run:
+            planned += 1
+            action = "plan_copy"
+        else:
+            copied += 1
+            action = "copied"
+
+        entry: dict[str, Any] = {
+            "name": sanitize_text(dest_name),
+            "action": action,
+            "reason": plan.reason,
+            "size_bytes": plan.size_bytes,
+            "sha256": plan.sha256,
+        }
+        if kind == "pack":
+            shaders_section["pack"] = entry
+        else:
+            entry["source"] = sidecar_source
+            entry["stage_count"] = int(sidecar_meta.get("stage_count", 0))
+            shaders_section["sidecar"] = entry
+            if action in ("copied", "unchanged"):
+                shaders_section["sidecar_staged"] = True
+                shaders_section["sidecar_bytes"] = plan.size_bytes
+
+    shaders_section["copied_count"] = copied
+    shaders_section["planned_count"] = planned
+    shaders_section["unchanged_count"] = unchanged
+    if dry_run:
+        shaders_section["status"] = "planned" if planned > 0 else "unchanged"
+    elif copied > 0:
+        shaders_section["status"] = "staged"
+    else:
+        shaders_section["status"] = "unchanged"
+
+    return sanitize_value(shaders_section), sanitize_value(errors), sanitize_value(warnings)
+
+
+# ---------------------------------------------------------------------------
+# Validated boot-options.json staging (W119 / O36 / O37)
+# ---------------------------------------------------------------------------
+
+
+def _empty_boot_options_section() -> dict[str, Any]:
+    return {
+        "status": "skipped",
+        "staged": False,
+        "filename": BOOT_OPTIONS_NAME,
+        "action": None,
+        "reason": None,
+        "size_bytes": 0,
+        "sha256": None,
+        "options": None,
+    }
+
+
+def parse_and_validate_boot_options(
+    *,
+    boot_options: Mapping[str, Any] | str | Path | None = None,
+    verify_window_marks: bool = False,
+    repo_root: Path | str = DEFAULT_REPO_ROOT,
+) -> tuple[bool, dict[str, Any] | None, list[str]]:
+    """Parse and schema-validate `boot-options.json` input and CLI flags."""
+    if boot_options is None and not verify_window_marks:
+        return True, None, []
+
+    resolved_repo = Path(repo_root).resolve()
+    raw_obj: Any = {}
+
+    if boot_options is not None:
+        if isinstance(boot_options, Mapping):
+            raw_obj = dict(boot_options)
+        elif isinstance(boot_options, Path):
+            try:
+                raw_text = boot_options.read_text(encoding="utf-8-sig")
+            except (OSError, UnicodeDecodeError) as exc:
+                return (
+                    False,
+                    None,
+                    [
+                        sanitize_text(
+                            f"failed to read boot-options file {basename_label(boot_options)}: {exc}"
+                        )
+                    ],
+                )
+            try:
+                raw_obj = json.loads(raw_text)
+            except json.JSONDecodeError as exc:
+                return (
+                    False,
+                    None,
+                    [
+                        sanitize_text(
+                            f"invalid JSON in boot-options file {basename_label(boot_options)} "
+                            f"(line {exc.lineno}, col {exc.colno}): {exc.msg}"
+                        )
+                    ],
+                )
+        elif isinstance(boot_options, str):
+            stripped = boot_options.strip()
+            looks_like_json = (
+                stripped.startswith(("{", "[", '"'))
+                or stripped in ("true", "false", "null")
+                or (bool(stripped) and stripped[0] in "-0123456789")
+            )
+            if looks_like_json:
+                try:
+                    raw_obj = json.loads(stripped)
+                except json.JSONDecodeError as exc:
+                    return (
+                        False,
+                        None,
+                        [
+                            sanitize_text(
+                                f"invalid inline boot-options JSON "
+                                f"(line {exc.lineno}, col {exc.colno}): {exc.msg}"
+                            )
+                        ],
+                    )
+            else:
+                options_path = _resolve_against_repo(boot_options, resolved_repo)
+                if not options_path.is_file():
+                    return (
+                        False,
+                        None,
+                        [
+                            f"boot-options JSON file does not exist: "
+                            f"{repo_relative_label(options_path, resolved_repo)}"
+                        ],
+                    )
+                try:
+                    raw_text = options_path.read_text(encoding="utf-8-sig")
+                except (OSError, UnicodeDecodeError) as exc:
+                    return (
+                        False,
+                        None,
+                        [
+                            sanitize_text(
+                                f"failed to read boot-options file "
+                                f"{basename_label(options_path)}: {exc}"
+                            )
+                        ],
+                    )
+                try:
+                    raw_obj = json.loads(raw_text)
+                except json.JSONDecodeError as exc:
+                    return (
+                        False,
+                        None,
+                        [
+                            sanitize_text(
+                                f"invalid JSON in boot-options file "
+                                f"{basename_label(options_path)} "
+                                f"(line {exc.lineno}, col {exc.colno}): {exc.msg}"
+                            )
+                        ],
+                    )
+        else:
+            return (
+                False,
+                None,
+                ["invalid boot-options input: expected JSON object, JSON string, or file path"],
+            )
+
+    if not isinstance(raw_obj, dict):
+        return (
+            False,
+            None,
+            ["invalid boot-options.json: top-level JSON value must be an object"],
+        )
+
+    errors: list[str] = []
+    validated: dict[str, Any] = {}
+    for raw_key, value in raw_obj.items():
+        key = str(raw_key)
+        if key not in BOOT_OPTIONS_ALLOWED_KEYS:
+            errors.append(
+                f"invalid boot-options.json: unsupported key '{sanitize_text(key)}' "
+                f"(allowed: {', '.join(sorted(BOOT_OPTIONS_ALLOWED_KEYS))})"
+            )
+            continue
+        if key in BOOT_OPTIONS_UINT_KEYS:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > _UINT64_MAX:
+                errors.append(
+                    f"invalid boot-options.json: '{key}' must be a non-negative uint64 integer"
+                )
+                continue
+            validated[key] = int(value)
+        elif key in BOOT_OPTIONS_BOOL_KEYS:
+            if not isinstance(value, bool):
+                errors.append(
+                    f"invalid boot-options.json: '{key}' must be a boolean"
+                )
+                continue
+            validated[key] = value
+
+    if errors:
+        return False, None, sanitize_value(errors)
+
+    if verify_window_marks:
+        validated["verify_window_marks"] = True
+
+    ordered = {key: validated[key] for key in sorted(validated)}
+    return True, ordered, []
+
+
+def stage_boot_options(
+    *,
+    boot_dir: Path | str = DEFAULT_BOOT_DIR_REL,
+    boot_options: Mapping[str, Any] | str | Path | None = None,
+    verify_window_marks: bool = False,
+    repo_root: Path | str = DEFAULT_REPO_ROOT,
+    dry_run: bool = False,
+) -> tuple[dict[str, Any], list[str], list[str]]:
+    """Validate and atomically stage sanitized `boot-options.json` into `--boot-dir`."""
+    resolved_repo = Path(repo_root).resolve()
+    boot_path = _resolve_against_repo(boot_dir, resolved_repo)
+    section = _empty_boot_options_section()
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    boot_safe, boot_safety_err = validate_boot_dir_safety(boot_path, resolved_repo)
+    if not boot_safe:
+        section["status"] = "refused"
+        errors.append(boot_safety_err or "refused unsafe --boot-dir")
+        return sanitize_value(section), sanitize_value(errors), sanitize_value(warnings)
+
+    ok_val, validated, val_errors = parse_and_validate_boot_options(
+        boot_options=boot_options,
+        verify_window_marks=verify_window_marks,
+        repo_root=resolved_repo,
+    )
+    if not ok_val:
+        section["status"] = "refused"
+        errors.extend(val_errors)
+        return sanitize_value(section), sanitize_value(errors), sanitize_value(warnings)
+
+    if validated is None:
+        return sanitize_value(section), sanitize_value(errors), sanitize_value(warnings)
+
+    resolved_boot = boot_path.resolve()
+    dst_file = boot_path / BOOT_OPTIONS_NAME
+    if dst_file.parent.resolve() != resolved_boot or dst_file.name != BOOT_OPTIONS_NAME:
+        section["status"] = "refused"
+        errors.append("refused boot-options.json escaping boot-dir")
+        return sanitize_value(section), sanitize_value(errors), sanitize_value(warnings)
+
+    payload = (json.dumps(validated, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    try:
+        plan = plan_bytes_stage(payload, dst_file)
+    except (OSError, StageBrowserBootError) as exc:
+        section["status"] = "error"
+        errors.append(
+            f"failed to inspect {BOOT_OPTIONS_NAME}: {sanitize_text(str(exc))}"
+        )
+        return sanitize_value(section), sanitize_value(errors), sanitize_value(warnings)
+
+    if plan.needs_copy and not dry_run:
+        try:
+            atomic_write_bytes(payload, dst_file)
+        except OSError as exc:
+            section["status"] = "error"
+            errors.append(
+                f"failed to atomically stage {BOOT_OPTIONS_NAME}: {sanitize_text(str(exc))}"
+            )
+            return sanitize_value(section), sanitize_value(errors), sanitize_value(warnings)
+
+    if not plan.needs_copy:
+        action = "unchanged"
+        status = "unchanged"
+        staged = True
+    elif dry_run:
+        action = "plan_copy"
+        status = "planned"
+        staged = False
+    else:
+        action = "copied"
+        status = "staged"
+        staged = True
+
+    section["status"] = status
+    section["staged"] = staged
+    section["action"] = action
+    section["reason"] = plan.reason
+    section["size_bytes"] = plan.size_bytes
+    section["sha256"] = plan.sha256
+    section["options"] = validated
+    return sanitize_value(section), sanitize_value(errors), sanitize_value(warnings)
+
+
+# ---------------------------------------------------------------------------
 # End-to-end staging pipeline
 # ---------------------------------------------------------------------------
 
 
 def stage_browser_boot(
     *,
-    program_dir: Path | str,
+    program_dir: Path | str | None = None,
     wasm_dir: Path | str | None = None,
     boot_dir: Path | str = DEFAULT_BOOT_DIR_REL,
     web_dist: Path | str = DEFAULT_WEB_DIST_REL,
+    shader_pack: Path | str | None = None,
+    shaders_dir: Path | str = DEFAULT_SHADERS_DIR_REL,
+    shader_pack_name: str = DEFAULT_SHADER_PACK_NAME,
+    reflect_sidecar: Path | str | None = None,
+    verify_window_marks: bool = False,
+    boot_options: Mapping[str, Any] | str | Path | None = None,
     repo_root: Path | str = DEFAULT_REPO_ROOT,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Stage allowlisted boot artifacts and (optionally) validated Wasm64 runtime files."""
+    """Stage allowlisted boot artifacts, Wasm64 runtime, shader packs + sidecars, and boot-options."""
     resolved_repo = Path(repo_root).resolve()
-    program_path = _resolve_against_repo(program_dir, resolved_repo)
+    program_path = (
+        _resolve_against_repo(program_dir, resolved_repo) if program_dir is not None else None
+    )
     boot_path = _resolve_against_repo(boot_dir, resolved_repo)
     web_dist_path = _resolve_against_repo(web_dist, resolved_repo)
     wasm_path = (
         _resolve_against_repo(wasm_dir, resolved_repo) if wasm_dir is not None else None
+    )
+    shader_pack_path = (
+        _resolve_against_repo(shader_pack, resolved_repo) if shader_pack is not None else None
+    )
+    shaders_dir_path = _resolve_against_repo(shaders_dir, resolved_repo)
+    reflect_sidecar_path = (
+        _resolve_against_repo(reflect_sidecar, resolved_repo)
+        if reflect_sidecar is not None
+        else None
     )
 
     errors: list[str] = []
@@ -921,6 +1694,9 @@ def stage_browser_boot(
     boot_safe, boot_safety_err = validate_boot_dir_safety(boot_path, resolved_repo)
     web_dist_safe, web_dist_safety_err = validate_web_dist_safety(
         web_dist_path, resolved_repo
+    )
+    shaders_safe, shaders_safety_err = validate_shaders_dir_safety(
+        shaders_dir_path, resolved_repo
     )
 
     boot_section: dict[str, Any] = {
@@ -935,16 +1711,25 @@ def stage_browser_boot(
         "artifacts": [],
     }
     wasm_section: dict[str, Any] = _empty_wasm_section()
+    shaders_section: dict[str, Any] = _empty_shaders_section()
+    boot_options_section: dict[str, Any] = _empty_boot_options_section()
+
+    wants_boot_options = bool(verify_window_marks or boot_options is not None)
 
     if not boot_safe:
         boot_section["status"] = "refused"
+        if wants_boot_options:
+            boot_options_section["status"] = "refused"
         errors.append(boot_safety_err or "refused unsafe --boot-dir")
     if not web_dist_safe:
         wasm_section["status"] = "refused"
         errors.append(web_dist_safety_err or "refused unsafe --web-dist")
+    if not shaders_safe:
+        shaders_section["status"] = "refused"
+        errors.append(shaders_safety_err or "refused unsafe --shaders-dir")
 
     # Early exit if any safety guard tripped — never touch filesystem.
-    if not boot_safe or not web_dist_safe:
+    if not boot_safe or not web_dist_safe or not shaders_safe:
         return sanitize_value(
             {
                 "schema_version": SCHEMA_VERSION,
@@ -955,20 +1740,31 @@ def stage_browser_boot(
                     "boot_dir": repo_relative_label(boot_path, resolved_repo),
                     "wasm_dir": repo_relative_label(wasm_path, resolved_repo),
                     "web_dist": repo_relative_label(web_dist_path, resolved_repo),
+                    "shader_pack": repo_relative_label(shader_pack_path, resolved_repo),
+                    "shaders_dir": repo_relative_label(shaders_dir_path, resolved_repo),
+                    "reflect_sidecar": repo_relative_label(reflect_sidecar_path, resolved_repo),
                 },
                 "safety": {
                     "boot_dir_safe": boot_safe,
                     "web_dist_safe": web_dist_safe,
+                    "shaders_dir_safe": shaders_safe,
                 },
                 "boot": boot_section,
                 "wasm": wasm_section,
+                "shaders": shaders_section,
+                "boot_options": boot_options_section,
+                "sidecar_staged": False,
+                "sidecar_bytes": 0,
+                "boot_options_staged": False,
                 "errors": errors,
                 "warnings": warnings,
             }
         )
 
     # ---- Stage 1: Allowlisted boot artifacts (--program-dir -> --boot-dir) ----
-    if not program_path.is_dir():
+    if program_path is None:
+        boot_section["status"] = "skipped"
+    elif not program_path.is_dir():
         boot_section["status"] = "error"
         errors.append(
             f"program-dir does not exist or is not a directory: "
@@ -1083,6 +1879,34 @@ def stage_browser_boot(
         errors.extend(wasm_errors)
         warnings.extend(wasm_warnings)
 
+    # ---- Stage 3: Shader pack + adjacent/overridden .reflect.json sidecar ----
+    if shader_pack_path is not None or reflect_sidecar_path is not None:
+        shaders_section, shader_errors, shader_warnings = stage_shader_pack(
+            shader_pack=shader_pack_path,
+            shaders_dir=shaders_dir_path,
+            shader_pack_name=shader_pack_name,
+            reflect_sidecar=reflect_sidecar_path,
+            repo_root=resolved_repo,
+            dry_run=dry_run,
+        )
+        errors.extend(shader_errors)
+        warnings.extend(shader_warnings)
+
+    # ---- Stage 4: Optional validated boot-options.json (--boot-dir/boot-options.json) ----
+    if wants_boot_options:
+        if boot_section["status"] == "refused":
+            boot_options_section["status"] = "refused"
+        else:
+            boot_options_section, opts_errors, opts_warnings = stage_boot_options(
+                boot_dir=boot_path,
+                boot_options=boot_options,
+                verify_window_marks=verify_window_marks,
+                repo_root=resolved_repo,
+                dry_run=dry_run,
+            )
+            errors.extend(opts_errors)
+            warnings.extend(opts_warnings)
+
     ok = len(errors) == 0
     return sanitize_value(
         {
@@ -1094,13 +1918,22 @@ def stage_browser_boot(
                 "boot_dir": repo_relative_label(boot_path, resolved_repo),
                 "wasm_dir": repo_relative_label(wasm_path, resolved_repo),
                 "web_dist": repo_relative_label(web_dist_path, resolved_repo),
+                "shader_pack": repo_relative_label(shader_pack_path, resolved_repo),
+                "shaders_dir": repo_relative_label(shaders_dir_path, resolved_repo),
+                "reflect_sidecar": repo_relative_label(reflect_sidecar_path, resolved_repo),
             },
             "safety": {
                 "boot_dir_safe": boot_safe,
                 "web_dist_safe": web_dist_safe,
+                "shaders_dir_safe": shaders_safe,
             },
             "boot": boot_section,
             "wasm": wasm_section,
+            "shaders": shaders_section,
+            "boot_options": boot_options_section,
+            "sidecar_staged": bool(shaders_section.get("sidecar_staged", False)),
+            "sidecar_bytes": int(shaders_section.get("sidecar_bytes", 0)),
+            "boot_options_staged": bool(boot_options_section.get("staged", False)),
             "errors": errors,
             "warnings": warnings,
         }
@@ -1119,6 +1952,8 @@ def format_report_text(report: Mapping[str, Any]) -> str:
     paths = report.get("paths") or {}
     boot = report.get("boot") or {}
     wasm = report.get("wasm") or {}
+    shaders = report.get("shaders") or {}
+    boot_options = report.get("boot_options") or {}
 
     lines: list[str] = [
         f"Browser Real-Boot Staging [{status_label}] mode={mode}",
@@ -1181,6 +2016,48 @@ def format_report_text(report: Mapping[str, Any]) -> str:
             f"{item_name} ({item.get('size_bytes')} bytes, {item.get('reason')})"
         )
 
+    shaders_status = str(shaders.get("status", "skipped")).upper()
+    shaders_src = paths.get("shader_pack") or "<none>"
+    sidecar_staged = bool(report.get("sidecar_staged", shaders.get("sidecar_staged", False)))
+    sidecar_bytes = int(report.get("sidecar_bytes", shaders.get("sidecar_bytes", 0)) or 0)
+    lines.append(
+        f"  Shaders: {shaders_src} -> {paths.get('shaders_dir') or '<none>'} "
+        f"[{shaders_status}] "
+        f"(sidecar_staged={'true' if sidecar_staged else 'false'}, "
+        f"sidecar_bytes={sidecar_bytes})"
+    )
+    pack_item = shaders.get("pack")
+    if isinstance(pack_item, Mapping):
+        lines.append(
+            f"    [{str(pack_item.get('action', '')).upper()}] "
+            f"{pack_item.get('name')} ({pack_item.get('size_bytes')} bytes, "
+            f"{pack_item.get('reason')})"
+        )
+    sidecar_item = shaders.get("sidecar")
+    if isinstance(sidecar_item, Mapping):
+        lines.append(
+            f"    [{str(sidecar_item.get('action', '')).upper()}] "
+            f"{sidecar_item.get('name')} ({sidecar_item.get('size_bytes')} bytes, "
+            f"{sidecar_item.get('reason')}, stages={sidecar_item.get('stage_count', 0)}, "
+            f"source={sidecar_item.get('source')})"
+        )
+
+    boot_opts_status = str(boot_options.get("status", "skipped")).upper()
+    boot_opts_staged = bool(
+        report.get("boot_options_staged", boot_options.get("staged", False))
+    )
+    lines.append(
+        f"  BootOptions: {paths.get('boot_dir')}/{BOOT_OPTIONS_NAME} "
+        f"[{boot_opts_status}] "
+        f"(boot_options_staged={'true' if boot_opts_staged else 'false'})"
+    )
+    if boot_options.get("action"):
+        lines.append(
+            f"    [{str(boot_options.get('action', '')).upper()}] "
+            f"{boot_options.get('filename', BOOT_OPTIONS_NAME)} "
+            f"({boot_options.get('size_bytes', 0)} bytes, {boot_options.get('reason')})"
+        )
+
     warnings = report.get("warnings") or []
     if warnings:
         lines.append("  Warnings:")
@@ -1199,16 +2076,20 @@ def format_report_text(report: Mapping[str, Any]) -> str:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Safely stage allowlisted local recomp boot artifacts (.pgim + manifests) "
-            "and validated Wasm64 runtime.{wasm,js} plus sibling *.wasm side modules "
-            "for server/serve_local.py."
+            "Safely stage allowlisted local recomp boot artifacts (.pgim + manifests), "
+            "validated Wasm64 runtime.{wasm,js} plus sibling *.wasm side modules, "
+            ".wgsl.pack shader bundles with adjacent .reflect.json sidecars, "
+            "and optional validated boot-options.json for server/serve_local.py."
         )
     )
     parser.add_argument(
         "--program-dir",
         type=Path,
-        default=DEFAULT_PROGRAM_DIR_REL,
-        help="Source recomp program directory (default: work/recomp_program).",
+        default=None,
+        help=(
+            "Source recomp program directory (default: work/recomp_program unless "
+            "staging shaders/boot-options standalone without it)."
+        ),
     )
     parser.add_argument(
         "--wasm-dir",
@@ -1230,6 +2111,61 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=Path,
         default=DEFAULT_WEB_DIST_REL,
         help="Destination Wasm64 web dist directory (default: web/dist).",
+    )
+    parser.add_argument(
+        "--shader-pack",
+        type=Path,
+        default=None,
+        help=(
+            "Optional source .wgsl.pack file to stage into --shaders-dir "
+            "(auto-stages adjacent <pack>.reflect.json when present)."
+        ),
+    )
+    parser.add_argument(
+        "--shaders-dir",
+        type=Path,
+        default=DEFAULT_SHADERS_DIR_REL,
+        help=(
+            "Destination directory for staged .wgsl.pack and .reflect.json sidecars "
+            "(default: local-data/shaders)."
+        ),
+    )
+    parser.add_argument(
+        "--shader-pack-name",
+        type=str,
+        default=DEFAULT_SHADER_PACK_NAME,
+        help=(
+            "Destination filename inside --shaders-dir for --shader-pack "
+            "(default: splash.wgsl.pack)."
+        ),
+    )
+    parser.add_argument(
+        "--reflect-sidecar",
+        type=Path,
+        default=None,
+        help=(
+            "Optional override path for the .reflect.json sidecar staged alongside "
+            "--shader-pack."
+        ),
+    )
+    parser.add_argument(
+        "--verify-window-marks",
+        action="store_true",
+        help=(
+            "Stage validated boot-options.json into --boot-dir with "
+            "verify_window_marks=true."
+        ),
+    )
+    parser.add_argument(
+        "--boot-options-json",
+        "--boot-options",
+        dest="boot_options_json",
+        type=str,
+        default=None,
+        help=(
+            "Optional inline JSON object or path to a JSON file to validate and stage "
+            "as boot-options.json into --boot-dir."
+        ),
     )
     parser.add_argument(
         "--repo-root",
@@ -1255,11 +2191,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 
+    program_dir = args.program_dir
+    if program_dir is None:
+        resolved_repo = Path(args.repo_root).resolve()
+        default_program = _resolve_against_repo(DEFAULT_PROGRAM_DIR_REL, resolved_repo)
+        has_other_target = bool(
+            args.shader_pack is not None
+            or args.reflect_sidecar is not None
+            or args.verify_window_marks
+            or args.boot_options_json is not None
+        )
+        if not has_other_target or default_program.is_dir():
+            program_dir = DEFAULT_PROGRAM_DIR_REL
+
     report = stage_browser_boot(
-        program_dir=args.program_dir,
+        program_dir=program_dir,
         wasm_dir=args.wasm_dir,
         boot_dir=args.boot_dir,
         web_dist=args.web_dist,
+        shader_pack=args.shader_pack,
+        shaders_dir=args.shaders_dir,
+        shader_pack_name=args.shader_pack_name,
+        reflect_sidecar=args.reflect_sidecar,
+        verify_window_marks=args.verify_window_marks,
+        boot_options=args.boot_options_json,
         repo_root=args.repo_root,
         dry_run=args.dry_run,
     )
