@@ -85,6 +85,7 @@ constexpr const char kXblAliasModule[] = "Microsoft.Xbox.Services.GDK.C.Thunks.d
     E(K32, "WaitForSingleObject", pg6_win32_wait_for_single_object) \
     E(K32, "CreateFileA", pg6_win32_create_file_a) \
     E(K32, "CreateFileW", pg6_win32_create_file_w) \
+    E(K32, "CreateFile2", pg6_win32_create_file_2) \
     E(K32, "ReadFile", pg6_win32_read_file) \
     E(K32, "WriteFile", pg6_win32_write_file) \
     E(K32, "SetFilePointerEx", pg6_win32_set_file_pointer_ex) \
@@ -291,6 +292,7 @@ constexpr const char kXblAliasModule[] = "Microsoft.Xbox.Services.GDK.C.Thunks.d
     E(K32, "IsProcessorFeaturePresent", pg6_win32_is_processor_feature_present) \
     E(K32, "GetThreadGroupAffinity", pg6_win32_get_thread_group_affinity) \
     E(K32, "SetThreadGroupAffinity", pg6_win32_set_thread_group_affinity) \
+    E(K32, "SetThreadIdealProcessorEx", pg6_win32_set_thread_ideal_processor_ex) \
     E(K32, "GetCommandLineA", pg6_win32_get_command_line_a) \
     E(K32, "Sleep", pg6_win32_sleep) \
     E(K32, "InitializeCriticalSectionAndSpinCount", pg6_win32_initialize_critical_section_and_spin_count) \

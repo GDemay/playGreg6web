@@ -1220,6 +1220,8 @@ RUNTIME_EXCEPTION_APIS: frozenset[tuple[str, str]] = frozenset(
             "RtlDeleteFunctionTable",
             "SetUnhandledExceptionFilter",
             "UnhandledExceptionFilter",
+            "AddVectoredExceptionHandler",
+            "RemoveVectoredExceptionHandler",
         )
     }
     | {

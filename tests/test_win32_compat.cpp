@@ -750,6 +750,22 @@ void test_process_and_threads() {
     CHECK(pg6_win32_set_thread_group_affinity(th, nullptr, nullptr) == 0);
     CHECK(pg6_win32_get_thread_group_affinity(0x7777, &ga) == 0);
     CHECK(pg6_win32_get_thread_group_affinity(th, nullptr) == 0);
+    // SetThreadIdealProcessorEx: a recorded hint; the previous value starts at processor 0.
+    Pg6ProcessorNumber ideal{0, 1, 0};
+    Pg6ProcessorNumber before{9, 9, 9};
+    CHECK(pg6_win32_set_thread_ideal_processor_ex(th, &ideal, &before) == 1);
+    CHECK(before.group == 0 && before.number == 0);
+    ideal.number = 0;
+    CHECK(pg6_win32_set_thread_ideal_processor_ex(th, &ideal, &before) == 1);
+    CHECK(before.number == 1);
+    ideal.group = 1;
+    CHECK(pg6_win32_set_thread_ideal_processor_ex(th, &ideal, nullptr) == 0);
+    CHECK(GetLastError() == ERROR_INVALID_PARAMETER);
+    ideal = Pg6ProcessorNumber{0, 255, 0};
+    CHECK(pg6_win32_set_thread_ideal_processor_ex(th, &ideal, nullptr) == 0);
+    CHECK(pg6_win32_set_thread_ideal_processor_ex(th, nullptr, nullptr) == 0);
+    CHECK(pg6_win32_set_thread_ideal_processor_ex(0x7777, &ideal, nullptr) == 0);
+    CHECK(GetLastError() == ERROR_INVALID_HANDLE);
     CHECK(ResumeThread(th) != RESUME_THREAD_FAILED);
     CHECK(WaitForSingleObject(th, 5000) == WAIT_OBJECT_0);
     CloseHandle(th);

@@ -82,10 +82,18 @@ struct Table {
     std::vector<uint32_t> index;                // position of entries[i] in the guest table
 };
 
+struct VectoredHandler {
+    uint64_t handle = 0;   // what AddVectoredExceptionHandler returned
+    uint64_t handler = 0;  // guest function VA: LONG (EXCEPTION_POINTERS*)
+};
+
 struct Registry {
     std::shared_mutex mutex;
     std::vector<std::unique_ptr<Table>> tables;
     std::atomic<uint64_t> unhandled_filter{0};
+    std::mutex vectored_mutex;
+    std::vector<VectoredHandler> vectored;  // call order
+    uint64_t next_vectored = 0;
     std::mutex exports_mutex;
     bool exports_registered = false;
 };
@@ -736,6 +744,39 @@ DispatchOutcome dispatch(VirtualMemoryArena& arena,
 }
 
 // The top-level filter for an exception nobody handled. Returns true to continue execution.
+// Vectored handlers run first, in registration order (AddVectoredExceptionHandler(1, ...)
+// prepends): the first that answers EXCEPTION_CONTINUE_EXECUTION resumes with the (possibly
+// modified) context; EXCEPTION_CONTINUE_SEARCH passes the exception on.
+bool run_vectored_handlers(VirtualMemoryArena& arena,
+                           GuestState& state,
+                           Scratch& scratch,
+                           uint64_t record_va,
+                           uint64_t context_va,
+                           bool* pending) {
+    *pending = false;
+    std::vector<VectoredHandler> handlers;
+    {
+        std::lock_guard<std::mutex> lock(registry().vectored_mutex);
+        handlers = registry().vectored;
+    }
+    if (handlers.empty()) {
+        return false;
+    }
+    const uint64_t pointers_va = scratch.alloc(sizeof(GuestExceptionPointers));
+    write_guest(arena, pointers_va, GuestExceptionPointers{record_va, context_va});
+    for (const VectoredHandler& h : handlers) {
+        const auto result = static_cast<int32_t>(call_with(arena, state, scratch, h.handler, {pointers_va}, nullptr));
+        if (state.unwind_pending != 0) {
+            *pending = true;
+            return false;
+        }
+        if (result == kExceptionContinueExecutionFilter) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool run_unhandled_filter(VirtualMemoryArena& arena,
                           GuestState& state,
                           Scratch& scratch,
@@ -918,6 +959,16 @@ void thunk_rtl_restore_context(void* p) {
     restore_context(arena, s, ctx, s.gpr[GuestReg::Rdx]);
 }
 
+void thunk_add_vectored_exception_handler(void* p) {
+    GuestState& s = as_state(p);
+    finish(s, add_vectored_exception_handler(static_cast<uint32_t>(s.gpr[GuestReg::Rcx]), s.gpr[GuestReg::Rdx]));
+}
+
+void thunk_remove_vectored_exception_handler(void* p) {
+    GuestState& s = as_state(p);
+    finish(s, remove_vectored_exception_handler(s.gpr[GuestReg::Rcx]) ? 1 : 0);
+}
+
 void thunk_set_unhandled_exception_filter(void* p) {
     GuestState& s = as_state(p);
     finish(s, set_unhandled_exception_filter(s.gpr[GuestReg::Rcx]));
@@ -959,6 +1010,8 @@ constexpr ExceptionExport kExports[] = {
     {"KERNEL32.dll", "RtlDeleteFunctionTable", &thunk_rtl_delete_function_table},
     {"KERNEL32.dll", "SetUnhandledExceptionFilter", &thunk_set_unhandled_exception_filter},
     {"KERNEL32.dll", "UnhandledExceptionFilter", &thunk_unhandled_exception_filter},
+    {"KERNEL32.dll", "AddVectoredExceptionHandler", &thunk_add_vectored_exception_handler},
+    {"KERNEL32.dll", "RemoveVectoredExceptionHandler", &thunk_remove_vectored_exception_handler},
     {"ntdll.dll", "RtlRaiseException", &thunk_rtl_raise_exception},
     {"ntdll.dll", "RtlCaptureContext", &thunk_rtl_capture_context},
     {"ntdll.dll", "RtlLookupFunctionEntry", &thunk_rtl_lookup_function_entry},
@@ -1337,6 +1390,18 @@ RestoreResult raise_exception(VirtualMemoryArena& arena, GuestState& state, cons
     if (!write_guest(arena, context_va, ctx) || !write_guest(arena, record_va, rec)) {
         raise_fault(FaultKind::BadStack, &state, rec.address, scratch.top);
     }
+    {
+        bool pending = false;
+        const bool resume = run_vectored_handlers(arena, state, scratch, record_va, context_va, &pending);
+        if (pending) {
+            return RestoreResult::Pending;
+        }
+        if (resume) {
+            read_guest(arena, context_va, ctx);
+            state.gpr[GuestReg::Rsp] = thunk_rsp;
+            return finish_restore(arena, state, thunk_rsp, ctx);
+        }
+    }
     const DispatchOutcome outcome = dispatch(arena, state, scratch, record_va, context_va, ctx);
     if (outcome == DispatchOutcome::Pending) {
         return RestoreResult::Pending;
@@ -1507,6 +1572,35 @@ RestoreResult restore_context(VirtualMemoryArena& arena, GuestState& state, Gues
 
 uint64_t set_unhandled_exception_filter(uint64_t filter) {
     return registry().unhandled_filter.exchange(filter, std::memory_order_acq_rel);
+}
+
+uint64_t add_vectored_exception_handler(uint32_t first, uint64_t handler) {
+    if (handler == 0) {
+        return 0;
+    }
+    Registry& r = registry();
+    std::lock_guard<std::mutex> lock(r.vectored_mutex);
+    // An opaque, non-null handle that is never a guest address (like the host's heap pointer).
+    const uint64_t handle = kVectoredHandleBase + 16 * ++r.next_vectored;
+    const VectoredHandler h{handle, handler};
+    if (first != 0) {
+        r.vectored.insert(r.vectored.begin(), h);
+    } else {
+        r.vectored.push_back(h);
+    }
+    return handle;
+}
+
+bool remove_vectored_exception_handler(uint64_t handle) {
+    Registry& r = registry();
+    std::lock_guard<std::mutex> lock(r.vectored_mutex);
+    for (auto it = r.vectored.begin(); it != r.vectored.end(); ++it) {
+        if (it->handle == handle) {
+            r.vectored.erase(it);
+            return true;
+        }
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
