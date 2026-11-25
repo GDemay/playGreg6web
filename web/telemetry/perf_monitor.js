@@ -6,6 +6,26 @@ export const DEFAULT_WINDOW_SIZE = 120;
 export const DEFAULT_JANK_THRESHOLD_MS = 33.34;
 export const DEFAULT_HUD_INTERVAL_MS = 250;
 export const BYTES_PER_MB = 1024 * 1024;
+export const PERF_PHASES = Object.freeze({
+  BOOT: 'boot',
+  LOADING_ASSETS: 'loading_assets',
+  GAMEPLAY: 'gameplay',
+  MENU: 'menu',
+});
+
+const PERF_PHASE_VALUES = Object.freeze(Object.values(PERF_PHASES));
+const PERF_PHASE_SET = new Set(PERF_PHASE_VALUES);
+
+function sanitizePhase(phase, fallback = PERF_PHASES.BOOT) {
+  if (typeof phase !== 'string') {
+    return fallback;
+  }
+  if (PERF_PHASE_SET.has(phase)) {
+    return phase;
+  }
+  const normalized = phase.trim().toLowerCase().replace(/[\s-]+/g, '_');
+  return PERF_PHASE_SET.has(normalized) ? normalized : fallback;
+}
 
 function defaultNow() {
   if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
@@ -57,6 +77,7 @@ export class PerfMonitor {
    * @param {number} [options.jankThresholdMs=33.34] Frame delta threshold above which a frame counts as jank.
    * @param {number} [options.gpuWindowSize] Fixed ring capacity for GPU batch rate aggregation (defaults to windowSize).
    * @param {number} [options.ioWindowSize] Fixed ring capacity for I/O throughput aggregation (defaults to windowSize).
+   * @param {string} [options.initialPhase='boot'] Initial telemetry phase (`PERF_PHASES`).
    * @param {() => number} [options.now] Monotonic clock returning milliseconds.
    * @param {(fn: () => void, ms: number) => any} [options.setInterval] Injectable interval scheduler.
    * @param {(id: any) => void} [options.clearInterval] Injectable interval canceller.
@@ -71,6 +92,7 @@ export class PerfMonitor {
       jankThresholdMs = DEFAULT_JANK_THRESHOLD_MS,
       gpuWindowSize = windowSize,
       ioWindowSize = windowSize,
+      initialPhase = PERF_PHASES.BOOT,
       now = defaultNow,
       setInterval: setIntervalImpl = defaultSetInterval,
       clearInterval: clearIntervalImpl = defaultClearInterval,
@@ -102,6 +124,7 @@ export class PerfMonitor {
     this._jankThresholdMs = jankThresholdMs;
     this._gpuWindowSize = gpuWindowSize;
     this._ioWindowSize = ioWindowSize;
+    this._initialPhase = sanitizePhase(initialPhase, PERF_PHASES.BOOT);
     this._now = now;
     this._setInterval = setIntervalImpl;
     this._clearInterval = clearIntervalImpl;
@@ -110,6 +133,18 @@ export class PerfMonitor {
     this._frameDeltas = new Float64Array(windowSize);
     this._scratchSorted = new Float64Array(windowSize);
     this._frameDrawCalls = new Float64Array(windowSize);
+
+    // Per-phase frame timing ring buffers (pre-allocated, zero allocations on hot path).
+    this._phaseBuckets = Object.create(null);
+    for (let i = 0; i < PERF_PHASE_VALUES.length; i += 1) {
+      const phase = PERF_PHASE_VALUES[i];
+      this._phaseBuckets[phase] = {
+        deltas: new Float64Array(windowSize),
+        writeIdx: 0,
+        sampleCount: 0,
+        frameCount: 0,
+      };
+    }
 
     // GPU batch rate ring buffers (pre-allocated).
     this._gpuPacketsRing = new Float64Array(gpuWindowSize);
@@ -138,8 +173,25 @@ export class PerfMonitor {
     return this._hudTimerId !== null;
   }
 
+  get currentPhase() {
+    return this._currentPhase;
+  }
+
   /**
-   * Resets all frame, GPU, I/O, and audio telemetry counters and rolling rings.
+   * Sets the active telemetry phase for phase-segmented frame-time histograms.
+   * Invalid or unrecognized values are safely sanitized to `'boot'`.
+   *
+   * @param {string} [phase] One of `PERF_PHASES` (`'boot'`, `'loading_assets'`, `'gameplay'`, `'menu'`).
+   * @returns {string} The sanitized active phase.
+   */
+  setPhase(phase) {
+    const sanitized = sanitizePhase(phase, PERF_PHASES.BOOT);
+    this._currentPhase = sanitized;
+    return sanitized;
+  }
+
+  /**
+   * Resets all frame, phase, GPU, I/O, and audio telemetry counters and rolling rings.
    * Keeps any attached HUD timer active so subsequent ticks push fresh values.
    */
   reset() {
@@ -157,6 +209,15 @@ export class PerfMonitor {
     this._totalFrames = 0;
     this._jankFrames = 0;
     this._lastFrameTimestamp = null;
+
+    this._currentPhase = this._initialPhase;
+    for (let i = 0; i < PERF_PHASE_VALUES.length; i += 1) {
+      const bucket = this._phaseBuckets[PERF_PHASE_VALUES[i]];
+      bucket.deltas.fill(0);
+      bucket.writeIdx = 0;
+      bucket.sampleCount = 0;
+      bucket.frameCount = 0;
+    }
 
     this._gpuPacketsRing.fill(0);
     this._gpuDurationsRing.fill(0);
@@ -188,7 +249,7 @@ export class PerfMonitor {
   }
 
   /**
-   * Internal zero-allocation helper to commit a frame delta and flush pending draw calls.
+   * Internal zero-allocation helper to commit a frame delta to global and active-phase rings.
    * @param {number} dtMs
    */
   _pushFrameDelta(dtMs) {
@@ -203,6 +264,20 @@ export class PerfMonitor {
     }
     if (safeDtMs > this._jankThresholdMs) {
       this._jankFrames += 1;
+    }
+
+    const phase = sanitizePhase(this._currentPhase, PERF_PHASES.BOOT);
+    const bucket = this._phaseBuckets[phase];
+    if (bucket) {
+      bucket.deltas[bucket.writeIdx] = safeDtMs;
+      bucket.writeIdx += 1;
+      if (bucket.writeIdx === this._windowSize) {
+        bucket.writeIdx = 0;
+      }
+      if (bucket.sampleCount < this._windowSize) {
+        bucket.sampleCount += 1;
+      }
+      bucket.frameCount += 1;
     }
   }
 
@@ -430,7 +505,58 @@ export class PerfMonitor {
   }
 
   /**
-   * Computes a structured telemetry snapshot across frames, GPU, I/O, and audio.
+   * Computes sanitized rolling histogram stats for a single phase bucket using
+   * the pre-allocated `_scratchSorted` buffer.
+   *
+   * @param {{ deltas: Float64Array, sampleCount: number, frameCount: number }} bucket
+   */
+  _computePhaseStats(bucket) {
+    const count = Math.min(bucket.sampleCount, bucket.deltas.length);
+    const frameCount = sanitizeNonNegativeNumber(bucket.frameCount, 0);
+
+    if (count <= 0) {
+      return {
+        frameCount,
+        avgFps: 0,
+        onePercentLowFps: 0,
+        avgFrameMs: 0,
+        p95FrameMs: 0,
+        p99FrameMs: 0,
+        maxFrameMs: 0,
+      };
+    }
+
+    let sum = 0;
+    for (let i = 0; i < count; i += 1) {
+      const dt = sanitizeNonNegativeNumber(bucket.deltas[i], 0);
+      this._scratchSorted[i] = dt;
+      sum += dt;
+    }
+
+    const sorted = this._scratchSorted.subarray(0, count);
+    sorted.sort();
+
+    const avgFrameMs = sanitizeNonNegativeNumber(sum / count, 0);
+    const p95FrameMs = percentileFromSorted(sorted, count, 0.95);
+    const p99FrameMs = percentileFromSorted(sorted, count, 0.99);
+    const maxFrameMs = sanitizeNonNegativeNumber(sorted[count - 1], 0);
+    const avgFps = avgFrameMs > 0 ? sanitizeNonNegativeNumber(1000 / avgFrameMs, 0) : 0;
+    const onePercentLowFps =
+      p99FrameMs > 0 ? sanitizeNonNegativeNumber(1000 / p99FrameMs, 0) : 0;
+
+    return {
+      frameCount,
+      avgFps,
+      onePercentLowFps,
+      avgFrameMs,
+      p95FrameMs,
+      p99FrameMs,
+      maxFrameMs,
+    };
+  }
+
+  /**
+   * Computes a structured telemetry snapshot across frames, phases, GPU, I/O, and audio.
    */
   getSnapshot() {
     const count = this._frameCount;
@@ -515,10 +641,19 @@ export class PerfMonitor {
     const totalReads = this._cacheHits + this._cacheMisses;
     const cacheHitRate = totalReads > 0 ? this._cacheHits / totalReads : 0;
 
+    const currentPhase = sanitizePhase(this._currentPhase, PERF_PHASES.BOOT);
+    const phases = {};
+    for (let i = 0; i < PERF_PHASE_VALUES.length; i += 1) {
+      const phase = PERF_PHASE_VALUES[i];
+      phases[phase] = this._computePhaseStats(this._phaseBuckets[phase]);
+    }
+
     return {
       timestampMs: this._now(),
       windowSize: this._windowSize,
       jankThresholdMs: this._jankThresholdMs,
+      currentPhase,
+      phases,
       frames: {
         fps,
         onePercentLowFps,
