@@ -9,8 +9,10 @@ const {
   BOOT_STAGE_ORDER,
   BOOT_STAGE_LABELS,
   computeBootProgress,
+  sanitizeScriptedInputPreset,
   SplashOverlayController,
   DEFAULT_FADE_MS,
+  REDUCED_MOTION_QUERY,
 } = splashMod;
 
 class MockClassList {
@@ -568,4 +570,371 @@ test('streamingProgress accepts numeric pct and hides stream when absent', () =>
   assert.equal(controller.getState().streamPct, null);
   assert.equal(controller.getState().root.querySelector('.pg6-splash__stream').hidden, true);
   controller.destroy();
+});
+
+test('W151: exports sanitizeScriptedInputPreset and REDUCED_MOTION_QUERY on module and UMD global', () => {
+  assert.equal(typeof sanitizeScriptedInputPreset, 'function');
+  assert.equal(REDUCED_MOTION_QUERY, '(prefers-reduced-motion: reduce)');
+  assert.equal(
+    globalThis.PlayGta6SplashOverlay.sanitizeScriptedInputPreset,
+    sanitizeScriptedInputPreset
+  );
+  assert.equal(globalThis.PlayGta6SplashOverlay.REDUCED_MOTION_QUERY, REDUCED_MOTION_QUERY);
+});
+
+test('W151: validates nowFn, reducedMotion, and matchMedia constructor options', () => {
+  assert.throws(
+    () => new SplashOverlayController({ documentObj: new MockDocument(), nowFn: 123 }),
+    TypeError
+  );
+  assert.throws(
+    () => new SplashOverlayController({ documentObj: new MockDocument(), reducedMotion: 'yes' }),
+    TypeError
+  );
+  assert.throws(
+    () => new SplashOverlayController({ documentObj: new MockDocument(), matchMedia: {} }),
+    TypeError
+  );
+  assert.doesNotThrow(() => {
+    const c = new SplashOverlayController({
+      documentObj: new MockDocument(),
+      nowFn: null,
+      reducedMotion: null,
+      matchMedia: null,
+    });
+    c.destroy();
+  });
+});
+
+test('W151: tracks FIRST_PRESENT dismissal telemetry via getStats() and getState() using injectable nowFn', () => {
+  let now = 1000;
+  let statsInsideOnDismiss = null;
+  let controllerRef = null;
+
+  const { controller, timer, dismissCalls } = createController({
+    fadeMs: 40,
+    nowFn: () => now,
+    onDismiss: () => {
+      statsInsideOnDismiss = controllerRef.getStats();
+    },
+  });
+  controllerRef = controller;
+
+  const initialStats = controller.getStats();
+  assert.equal(initialStats.visible, true);
+  assert.equal(initialStats.dismissed, false);
+  assert.equal(initialStats.fading, false);
+  assert.equal(initialStats.destroyed, false);
+  assert.equal(initialStats.dismissedAtMs, null);
+  assert.equal(initialStats.dismissCount, 0);
+  assert.equal(initialStats.fadeDurationMs, null);
+  assert.equal(initialStats.fadeMs, 40);
+  assert.equal(initialStats.reducedMotion, false);
+  assert.equal(initialStats.scriptedInputPreset, null);
+  assert.equal('root' in initialStats, false);
+  assert.doesNotThrow(() => JSON.stringify(initialStats));
+
+  // Trigger FIRST_PRESENT fade at t=1000.
+  controller.onFirstPresent();
+  const fadingStats = controller.getStats();
+  assert.equal(fadingStats.visible, true);
+  assert.equal(fadingStats.dismissed, true);
+  assert.equal(fadingStats.fading, true);
+  assert.equal(fadingStats.dismissCount, 0);
+  assert.equal(fadingStats.dismissedAtMs, null);
+  assert.equal(fadingStats.fadeDurationMs, null);
+  assert.equal(timer.size, 1);
+
+  // Advance clock to t=1045 and flush fade timer.
+  now = 1045;
+  timer.flush();
+
+  assert.equal(dismissCalls.length, 1);
+  assert.ok(statsInsideOnDismiss);
+  assert.equal(statsInsideOnDismiss.visible, false);
+  assert.equal(statsInsideOnDismiss.dismissCount, 1);
+  assert.equal(statsInsideOnDismiss.dismissedAtMs, 1045);
+  assert.equal(statsInsideOnDismiss.fadeDurationMs, 45);
+
+  const afterStats = controller.getStats();
+  const afterState = controller.getState();
+  assert.equal(afterStats.visible, false);
+  assert.equal(afterStats.dismissed, true);
+  assert.equal(afterStats.fading, false);
+  assert.equal(afterStats.dismissCount, 1);
+  assert.equal(afterStats.dismissedAtMs, 1045);
+  assert.equal(afterStats.fadeDurationMs, 45);
+  assert.equal(afterState.dismissCount, 1);
+  assert.equal(afterState.dismissedAtMs, 1045);
+  assert.equal(afterState.fadeDurationMs, 45);
+
+  // Repeated idempotent dismiss does not increment count or overwrite timestamp.
+  now = 1500;
+  controller.onFirstPresent();
+  controller.dismiss({ fadeMs: 0 });
+  assert.equal(controller.getStats().dismissCount, 1);
+  assert.equal(controller.getStats().dismissedAtMs, 1045);
+  assert.equal(controller.getStats().fadeDurationMs, 45);
+
+  // Manual show() resets visibility without clearing historical telemetry; hide() does not count as dismiss.
+  controller.show();
+  assert.equal(controller.getStats().visible, true);
+  assert.equal(controller.getStats().dismissed, false);
+  assert.equal(controller.getStats().dismissCount, 1);
+
+  controller.hide();
+  assert.equal(controller.getStats().visible, false);
+  assert.equal(controller.getStats().dismissCount, 1);
+
+  // Re-show and perform a second immediate dismissal at t=2500.
+  controller.show();
+  now = 2500;
+  controller.onFirstPresent({ fadeMs: 0 });
+  const secondStats = controller.getStats();
+  assert.equal(secondStats.visible, false);
+  assert.equal(secondStats.dismissCount, 2);
+  assert.equal(secondStats.dismissedAtMs, 2500);
+  assert.equal(secondStats.fadeDurationMs, 0);
+  assert.equal(dismissCalls.length, 2);
+
+  controller.destroy();
+  const destroyedStats = controller.getStats();
+  assert.equal(destroyedStats.destroyed, true);
+  assert.equal(destroyedStats.visible, false);
+  assert.equal(destroyedStats.dismissCount, 2);
+  assert.equal(destroyedStats.dismissedAtMs, 2500);
+});
+
+test('W151: sanitizes telemetry when nowFn is static, negative, NaN, or throws, and aborts cleanly on destroy', () => {
+  // Static clock during timed fade falls back to effective fadeMs.
+  const staticCase = createController({ fadeMs: 60, nowFn: () => 500 });
+  staticCase.controller.onFirstPresent();
+  staticCase.timer.flush();
+  assert.equal(staticCase.controller.getStats().dismissedAtMs, 500);
+  assert.equal(staticCase.controller.getStats().fadeDurationMs, 60);
+  staticCase.controller.destroy();
+
+  // Throwing / invalid nowFn values are sanitized to 0 and never throw.
+  const faultyClocks = [
+    () => {
+      throw new Error('clock failure');
+    },
+    () => Number.NaN,
+    () => -100,
+    () => Number.POSITIVE_INFINITY,
+    () => 'not-a-number',
+  ];
+  for (const nowFn of faultyClocks) {
+    const { controller, timer } = createController({ fadeMs: 30, nowFn });
+    assert.doesNotThrow(() => controller.onFirstPresent());
+    assert.doesNotThrow(() => timer.flush());
+    const stats = controller.getStats();
+    assert.equal(stats.dismissedAtMs, 0);
+    assert.equal(stats.fadeDurationMs, 30);
+    assert.equal(stats.dismissCount, 1);
+    controller.destroy();
+  }
+
+  // Destroy mid-fade cancels dismissal without incrementing dismissCount.
+  const midFade = createController({ fadeMs: 50, nowFn: () => 900 });
+  midFade.controller.onFirstPresent();
+  assert.equal(midFade.timer.size, 1);
+  midFade.controller.destroy();
+  assert.equal(midFade.timer.size, 0);
+  midFade.timer.flush();
+  assert.equal(midFade.dismissCalls.length, 0);
+  assert.equal(midFade.controller.getStats().dismissCount, 0);
+  assert.equal(midFade.controller.getStats().dismissedAtMs, null);
+  assert.equal(midFade.controller.getStats().destroyed, true);
+});
+
+test('W151: prefers-reduced-motion option and matchMedia detection dismiss cleanly without transition delay', () => {
+  // 1) Explicit reducedMotion: true option skips fade timer completely.
+  let now = 3000;
+  const explicit = createController({
+    fadeMs: 400,
+    reducedMotion: true,
+    nowFn: () => now,
+  });
+  assert.equal(explicit.controller.getStats().reducedMotion, true);
+  assert.equal(
+    explicit.controller.getState().root.style.getPropertyValue('--pg6-splash-fade'),
+    '0ms'
+  );
+  explicit.controller.onFirstPresent();
+  assert.equal(explicit.timer.size, 0);
+  assert.equal(explicit.dismissCalls.length, 1);
+  assert.equal(explicit.controller.getStats().visible, false);
+  assert.equal(explicit.controller.getStats().fading, false);
+  assert.equal(explicit.controller.getStats().dismissCount, 1);
+  assert.equal(explicit.controller.getStats().dismissedAtMs, 3000);
+  assert.equal(explicit.controller.getStats().fadeDurationMs, 0);
+  explicit.controller.destroy();
+
+  // 2) Injected matchMedia returning matches: true triggers immediate dismissal.
+  const seenQueries = [];
+  const viaOptionMedia = createController({
+    fadeMs: 250,
+    nowFn: () => 4100,
+    matchMedia: (query) => {
+      seenQueries.push(query);
+      return { matches: query === REDUCED_MOTION_QUERY };
+    },
+  });
+  assert.equal(viaOptionMedia.controller.getStats().reducedMotion, true);
+  viaOptionMedia.controller.dismiss();
+  assert.equal(viaOptionMedia.timer.size, 0);
+  assert.equal(viaOptionMedia.controller.getStats().visible, false);
+  assert.equal(viaOptionMedia.controller.getStats().fadeDurationMs, 0);
+  assert.equal(viaOptionMedia.controller.getStats().dismissedAtMs, 4100);
+  assert.ok(seenQueries.includes(REDUCED_MOTION_QUERY));
+  viaOptionMedia.controller.destroy();
+
+  // 3) documentObj.defaultView.matchMedia detection works automatically.
+  const docWithView = new MockDocument();
+  docWithView.defaultView = {
+    matchMedia: (query) => ({ matches: query === REDUCED_MOTION_QUERY }),
+  };
+  const viaView = createController({
+    documentObj: docWithView,
+    fadeMs: 300,
+    nowFn: () => 5200,
+  });
+  assert.equal(viaView.controller.getStats().reducedMotion, true);
+  viaView.controller.onFirstPresent();
+  assert.equal(viaView.timer.size, 0);
+  assert.equal(viaView.controller.getStats().visible, false);
+  assert.equal(viaView.controller.getStats().fadeDurationMs, 0);
+  viaView.controller.destroy();
+
+  // 4) Per-call reducedMotion override on dismiss() works in both directions.
+  const perCall = createController({ fadeMs: 100, reducedMotion: false, nowFn: () => 6000 });
+  perCall.controller.dismiss({ reducedMotion: true });
+  assert.equal(perCall.timer.size, 0);
+  assert.equal(perCall.controller.getStats().visible, false);
+  assert.equal(perCall.controller.getStats().fadeDurationMs, 0);
+  perCall.controller.show();
+  perCall.controller.dismiss({ reducedMotion: false, fadeMs: 35 });
+  assert.equal(perCall.timer.size, 1);
+  assert.equal(perCall.controller.getStats().fading, true);
+  perCall.timer.flush();
+  assert.equal(perCall.controller.getStats().fadeDurationMs, 35);
+  perCall.controller.destroy();
+
+  // 5) Faulty matchMedia falls back safely to false and never throws.
+  const faultyMedia = createController({
+    fadeMs: 25,
+    matchMedia: () => {
+      throw new Error('matchMedia unavailable');
+    },
+  });
+  assert.equal(faultyMedia.controller.getStats().reducedMotion, false);
+  assert.doesNotThrow(() => faultyMedia.controller.onFirstPresent());
+  assert.equal(faultyMedia.timer.size, 1);
+  faultyMedia.timer.flush();
+  assert.equal(faultyMedia.controller.getStats().visible, false);
+  faultyMedia.controller.destroy();
+
+  // 6) Injected shared stylesheet contains prefers-reduced-motion media query.
+  const styleDoc = new MockDocument();
+  const styled = createController({ documentObj: styleDoc });
+  const styleEl = styleDoc.head.children.find((el) => el.getAttribute('data-pg6-splash-style') === '1');
+  assert.ok(styleEl);
+  assert.match(styleEl.textContent, /@media \(prefers-reduced-motion: reduce\)/);
+  styled.controller.destroy();
+});
+
+test('W151: setScriptedInput renders sanitized indicator pill, hides on null, and rejects malicious inputs', () => {
+  // Direct allowlist verification.
+  assert.equal(sanitizeScriptedInputPreset('start-screen'), 'start-screen');
+  assert.equal(sanitizeScriptedInputPreset('  menu_nav-01  '), 'menu_nav-01');
+  assert.equal(sanitizeScriptedInputPreset('A'), 'A');
+  assert.equal(sanitizeScriptedInputPreset('a'.repeat(32)), 'a'.repeat(32));
+  assert.equal(sanitizeScriptedInputPreset('a'.repeat(33)), null);
+  assert.equal(sanitizeScriptedInputPreset(''), null);
+  assert.equal(sanitizeScriptedInputPreset('   '), null);
+  assert.equal(sanitizeScriptedInputPreset(null), null);
+  assert.equal(sanitizeScriptedInputPreset(undefined), null);
+  assert.equal(sanitizeScriptedInputPreset(42), null);
+  assert.equal(sanitizeScriptedInputPreset({ preset: 'start-screen' }), null);
+  assert.equal(sanitizeScriptedInputPreset('-leading-dash'), null);
+  assert.equal(sanitizeScriptedInputPreset('_leading_underscore'), null);
+  assert.equal(sanitizeScriptedInputPreset('start screen'), null);
+  assert.equal(sanitizeScriptedInputPreset('../etc/passwd'), null);
+  assert.equal(sanitizeScriptedInputPreset('C:\\Users\\alice\\script.json'), null);
+  assert.equal(sanitizeScriptedInputPreset('/home/alice/private/input.json'), null);
+  assert.equal(sanitizeScriptedInputPreset('file:///Users/bob/script'), null);
+  assert.equal(sanitizeScriptedInputPreset('start-screen?token=secret'), null);
+  assert.equal(sanitizeScriptedInputPreset('<script>alert(1)</script>'), null);
+  assert.equal(sanitizeScriptedInputPreset('start\nscreen'), null);
+
+  const { controller } = createController();
+  const pill = controller.getState().root.querySelector('.pg6-splash__scripted');
+  assert.ok(pill);
+
+  // Initially inactive and hidden.
+  assert.equal(controller.getState().scriptedInputPreset, null);
+  assert.equal(controller.getStats().scriptedInputPreset, null);
+  assert.equal(pill.hidden, true);
+  assert.equal(pill.style.display, 'none');
+  assert.equal(pill.getAttribute('aria-hidden'), 'true');
+  assert.equal(pill.getAttribute('data-active'), 'false');
+  assert.equal(pill.getAttribute('data-preset'), null);
+  assert.equal(pill.textContent, '');
+
+  // Valid preset shows pill with clean text and attributes.
+  const state1 = controller.setScriptedInput('  start-screen  ');
+  assert.equal(state1.scriptedInputPreset, 'start-screen');
+  assert.equal(controller.getStats().scriptedInputPreset, 'start-screen');
+  assert.equal(pill.hidden, false);
+  assert.equal(pill.style.display, '');
+  assert.equal(pill.getAttribute('aria-hidden'), 'false');
+  assert.equal(pill.getAttribute('data-active'), 'true');
+  assert.equal(pill.getAttribute('data-preset'), 'start-screen');
+  assert.equal(pill.textContent, 'Scripted input: start-screen');
+
+  // Clearing with null hides pill and removes preset metadata.
+  const state2 = controller.setScriptedInput(null);
+  assert.equal(state2.scriptedInputPreset, null);
+  assert.equal(controller.getStats().scriptedInputPreset, null);
+  assert.equal(pill.hidden, true);
+  assert.equal(pill.style.display, 'none');
+  assert.equal(pill.getAttribute('aria-hidden'), 'true');
+  assert.equal(pill.getAttribute('data-active'), 'false');
+  assert.equal(pill.getAttribute('data-preset'), null);
+  assert.equal(pill.textContent, '');
+
+  // Malicious inputs clear active preset and never leak into DOM or telemetry.
+  const maliciousInputs = [
+    'C:\\Users\\secretuser\\GTA6\\macros.json',
+    '../secret/preset',
+    '<img src=x onerror=alert(1)>',
+    'preset\r\ninjection',
+    'preset with spaces',
+    'x'.repeat(64),
+  ];
+  for (const bad of maliciousInputs) {
+    controller.setScriptedInput('demo_preset');
+    assert.equal(controller.getStats().scriptedInputPreset, 'demo_preset');
+    controller.setScriptedInput(bad);
+    assert.equal(controller.getStats().scriptedInputPreset, null);
+    assert.equal(controller.getState().scriptedInputPreset, null);
+    assert.equal(pill.hidden, true);
+    assert.equal(pill.textContent, '');
+    assert.equal(pill.getAttribute('data-preset'), null);
+    assert.equal(JSON.stringify(controller.getStats()).includes(bad), false);
+  }
+
+  // Initial constructor scriptedInput option works and sanitizes.
+  const withInitial = createController({ scriptedInput: 'boot_menu-1' });
+  assert.equal(withInitial.controller.getStats().scriptedInputPreset, 'boot_menu-1');
+  const initPill = withInitial.controller.getState().root.querySelector('.pg6-splash__scripted');
+  assert.equal(initPill.hidden, false);
+  assert.equal(initPill.textContent, 'Scripted input: boot_menu-1');
+  withInitial.controller.destroy();
+
+  // Safe no-op after destroy.
+  controller.destroy();
+  assert.doesNotThrow(() => controller.setScriptedInput('start-screen'));
+  assert.equal(controller.getStats().destroyed, true);
 });
