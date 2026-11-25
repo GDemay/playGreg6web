@@ -374,6 +374,7 @@ class TestVerifyBrowserBoot(unittest.TestCase):
             self.assertTrue(gate.details["shadersOk"])
             self.assertTrue(gate.details["bootOk"])
             self.assertTrue(gate.details["gameSplashOk"])
+            self.assertTrue(gate.details["http11_keep_alive"])
 
     def test_sanitization_strips_windows_and_posix_paths_and_usernames(self) -> None:
         samples = [
@@ -610,6 +611,154 @@ class TestVerifyBrowserBoot(unittest.TestCase):
             gate = vbb.check_import_coverage_gate(repo, audit_fn=_full_import_coverage)
             self.assertEqual(gate.status, "pass")
             self.assertIn("587/587", gate.summary)
+
+    def test_shader_pack_sidecar_valid_reports_stage_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _create_repo_skeleton(Path(tmp), include_server=False)
+            shaders_dir = repo / "local-data" / "shaders"
+            _build_shader_artifacts(shaders_dir)
+            sidecar = {
+                "schema": "playgta6-stage-reflection",
+                "version": 1,
+                "stages": {
+                    "0x1111111111111111": {"stage": "vertex", "bindings": []},
+                    "0x2222222222222222": {"stage": "fragment", "bindings": []},
+                    "0x3333333333333333": {"stage": "compute", "bindings": []},
+                },
+            }
+            (shaders_dir / "fallback.wgsl.pack.reflect.json").write_text(
+                json.dumps(sidecar, indent=2),
+                encoding="utf-8",
+            )
+            gate = vbb.check_shader_pack_gate(repo, data_dir=repo / "local-data")
+            self.assertEqual(gate.status, "pass")
+            self.assertTrue(gate.details["sidecar_present"])
+            self.assertTrue(gate.details["sidecar_valid"])
+            self.assertEqual(gate.details["sidecar_stage_count"], 3)
+            payload = json.dumps(gate.to_dict())
+            self.assertNotRegex(payload, r"[A-Za-z]:\\")
+            self.assertNotIn("/Users/", payload)
+            self.assertNotIn("/home/", payload)
+
+    def test_shader_pack_sidecar_missing_stays_passing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _create_repo_skeleton(Path(tmp), include_server=False)
+            _build_shader_artifacts(repo / "local-data" / "shaders")
+            gate = vbb.check_shader_pack_gate(repo, data_dir=repo / "local-data")
+            self.assertEqual(gate.status, "pass")
+            self.assertFalse(gate.details["sidecar_present"])
+            self.assertFalse(gate.details["sidecar_valid"])
+            self.assertEqual(gate.details["sidecar_stage_count"], 0)
+
+    def test_shader_pack_sidecar_malformed_reports_invalid_without_failing_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _create_repo_skeleton(Path(tmp), include_server=False)
+            shaders_dir = repo / "local-data" / "shaders"
+            _build_shader_artifacts(shaders_dir)
+            sidecar_path = shaders_dir / "fallback.wgsl.pack.reflect.json"
+
+            # Malformed JSON syntax.
+            sidecar_path.write_text('{"schema": "playgta6-stage-reflection", ', encoding="utf-8")
+            gate = vbb.check_shader_pack_gate(repo, data_dir=repo / "local-data")
+            self.assertNotEqual(gate.status, "fail")
+            self.assertTrue(gate.details["sidecar_present"])
+            self.assertFalse(gate.details["sidecar_valid"])
+            self.assertEqual(gate.details["sidecar_stage_count"], 0)
+            payload = json.dumps(gate.to_dict())
+            self.assertNotRegex(payload, r"[A-Za-z]:\\")
+
+            # Structurally invalid stages field (list instead of dict).
+            sidecar_path.write_text(
+                json.dumps({"schema": "playgta6-stage-reflection", "version": 1, "stages": []}),
+                encoding="utf-8",
+            )
+            gate_bad_shape = vbb.check_shader_pack_gate(repo, data_dir=repo / "local-data")
+            self.assertNotEqual(gate_bad_shape.status, "fail")
+            self.assertTrue(gate_bad_shape.details["sidecar_present"])
+            self.assertFalse(gate_bad_shape.details["sidecar_valid"])
+            self.assertEqual(gate_bad_shape.details["sidecar_stage_count"], 0)
+
+    def test_boot_options_valid_and_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _create_repo_skeleton(Path(tmp), include_server=False)
+            recomp_dir = repo / "work" / "recomp_build"
+            _build_recomp_artifacts(recomp_dir)
+
+            # Absent boot-options.json passes without error.
+            gate_absent = vbb.check_recomp_artifacts_gate(repo, recomp_dir=recomp_dir)
+            self.assertEqual(gate_absent.status, "pass")
+            self.assertFalse(gate_absent.details["boot_options_present"])
+            self.assertFalse(gate_absent.details["boot_options_valid"])
+
+            # Valid boot-options.json passes with boot_options_present & boot_options_valid.
+            (recomp_dir / "boot-options.json").write_text(
+                json.dumps({"verify_window_marks": True, "max_wall_ms": 300000}),
+                encoding="utf-8",
+            )
+            gate_valid = vbb.check_recomp_artifacts_gate(repo, recomp_dir=recomp_dir)
+            self.assertEqual(gate_valid.status, "pass")
+            self.assertTrue(gate_valid.details["boot_options_present"])
+            self.assertTrue(gate_valid.details["boot_options_valid"])
+
+    def test_boot_options_malformed_fails_cleanly(self) -> None:
+        cases = [
+            "{not valid json",
+            json.dumps(["not", "an", "object"]),
+            json.dumps({"verify_window_marks": "yes"}),
+            json.dumps({"max_wall_ms": -5}),
+            json.dumps({"custom_nested": {"bad": True}}),
+        ]
+        for raw_content in cases:
+            with self.subTest(raw_content=raw_content):
+                with tempfile.TemporaryDirectory() as tmp:
+                    repo = _create_repo_skeleton(Path(tmp), include_server=False)
+                    recomp_dir = repo / "work" / "recomp_build"
+                    _build_recomp_artifacts(recomp_dir)
+                    (recomp_dir / "boot-options.json").write_text(raw_content, encoding="utf-8")
+
+                    gate = vbb.check_recomp_artifacts_gate(repo, recomp_dir=recomp_dir)
+                    self.assertEqual(gate.status, "fail")
+                    self.assertTrue(gate.details["boot_options_present"])
+                    self.assertFalse(gate.details["boot_options_valid"])
+                    payload = json.dumps(gate.to_dict())
+                    self.assertNotRegex(payload, r"[A-Za-z]:\\")
+                    self.assertNotIn("/Users/", payload)
+                    self.assertNotIn("/home/", payload)
+
+    def test_http11_keep_alive_probe_detects_non_persistent_server(self) -> None:
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class _ClosingHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"
+
+            def log_message(self, format: str, *args: object) -> None:
+                return None
+
+            def do_GET(self) -> None:
+                body = b'{"ok":true}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_HEAD(self) -> None:
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.send_header("Connection", "close")
+                self.end_headers()
+
+        httpd = HTTPServer(("127.0.0.1", 0), _ClosingHandler)
+        port = int(httpd.server_address[1])
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            self.assertFalse(vbb._probe_http11_keep_alive("127.0.0.1", port))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=2)
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@ import argparse
 import http.client
 import importlib.util
 import json
+import math
 import os
 import re
 import sys
@@ -533,6 +534,112 @@ def _lift_stats_from_manifest(doc: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+_BOOT_OPTION_BOOL_KEYS: frozenset[str] = frozenset(
+    {
+        "verify_window_marks",
+        "report_to_log",
+    }
+)
+_BOOT_OPTION_UINT_KEYS: frozenset[str] = frozenset(
+    {
+        "max_wall_ms",
+        "max_dispatches",
+        "arena_log_limit",
+        "import_trace_limit",
+    }
+)
+
+
+def _inspect_boot_options(boot_dir: Path) -> dict[str, Any]:
+    """Validate optional `boot-options.json` in `boot_dir` (O36/O37)."""
+    options_path = boot_dir / "boot-options.json"
+    if not options_path.is_file():
+        return {
+            "boot_options_present": False,
+            "boot_options_valid": False,
+            "error": None,
+            "keys": [],
+        }
+
+    try:
+        resolved_dir = boot_dir.resolve()
+        resolved_file = options_path.resolve(strict=True)
+        if not resolved_file.is_relative_to(resolved_dir):
+            return {
+                "boot_options_present": True,
+                "boot_options_valid": False,
+                "error": "boot-options.json: path escapes boot directory",
+                "keys": [],
+            }
+        raw_text = resolved_file.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError) as exc:
+        return {
+            "boot_options_present": True,
+            "boot_options_valid": False,
+            "error": f"boot-options.json: {type(exc).__name__}",
+            "keys": [],
+        }
+
+    try:
+        doc = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        return {
+            "boot_options_present": True,
+            "boot_options_valid": False,
+            "error": f"boot-options.json: {type(exc).__name__}",
+            "keys": [],
+        }
+
+    if not isinstance(doc, dict):
+        return {
+            "boot_options_present": True,
+            "boot_options_valid": False,
+            "error": "boot-options.json: expected JSON object",
+            "keys": [],
+        }
+
+    keys: list[str] = []
+    for raw_key, value in doc.items():
+        key = sanitize_text(str(raw_key))
+        keys.append(key)
+        if raw_key in _BOOT_OPTION_BOOL_KEYS:
+            if not isinstance(value, bool):
+                return {
+                    "boot_options_present": True,
+                    "boot_options_valid": False,
+                    "error": f"boot-options.json: '{key}' must be boolean",
+                    "keys": sorted(keys),
+                }
+        elif raw_key in _BOOT_OPTION_UINT_KEYS:
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                return {
+                    "boot_options_present": True,
+                    "boot_options_valid": False,
+                    "error": f"boot-options.json: '{key}' must be non-negative integer",
+                    "keys": sorted(keys),
+                }
+        else:
+            is_scalar = (
+                value is None
+                or isinstance(value, (bool, int, str))
+                or (isinstance(value, float) and math.isfinite(value))
+            )
+            if not is_scalar:
+                return {
+                    "boot_options_present": True,
+                    "boot_options_valid": False,
+                    "error": f"boot-options.json: '{key}' must be a scalar value",
+                    "keys": sorted(keys),
+                }
+
+    return {
+        "boot_options_present": True,
+        "boot_options_valid": True,
+        "error": None,
+        "keys": sorted(keys),
+    }
+
+
 def check_recomp_artifacts_gate(
     repo_root: Path,
     recomp_dir: Path | None = None,
@@ -553,6 +660,8 @@ def check_recomp_artifacts_gate(
         "pgimNames": [],
         "shardCount": 0,
         "liftCoveragePct": 0.0,
+        "boot_options_present": False,
+        "boot_options_valid": False,
     }
 
     if not target.is_dir():
@@ -585,6 +694,15 @@ def check_recomp_artifacts_gate(
         "unsupportedInstructions": 0,
     }
     parse_errors: list[str] = []
+    boot_options_info = _inspect_boot_options(target)
+    details["boot_options_present"] = boot_options_info["boot_options_present"]
+    details["boot_options_valid"] = boot_options_info["boot_options_valid"]
+    if boot_options_info["keys"]:
+        details["bootOptionsKeys"] = boot_options_info["keys"]
+    if boot_options_info["error"]:
+        details["bootOptionsError"] = boot_options_info["error"]
+        parse_errors.append(boot_options_info["error"])
+
     for path in (program_path, build_path):
         if path is None:
             continue
@@ -633,6 +751,17 @@ def check_recomp_artifacts_gate(
             next_action="cargo run -p playgta6-recomp -- build-program --help",
         )
 
+    if details["boot_options_present"] and not details["boot_options_valid"]:
+        return GateResult(
+            name="recomp_artifacts",
+            status="fail",
+            summary=sanitize_text(
+                str(details.get("bootOptionsError") or "boot-options.json invalid")
+            ),
+            details=details,
+            next_action="fix or remove boot-options.json in the boot directory",
+        )
+
     coverage = float(lift_stats.get("liftCoveragePct") or 0.0)
     shards = int(lift_stats.get("shardCount") or 0)
     summary = (
@@ -654,6 +783,88 @@ def check_recomp_artifacts_gate(
         details=details,
         next_action=None,
     )
+
+
+def _inspect_shader_sidecars(
+    pack_files: Sequence[Path],
+    shaders_dir: Path,
+) -> dict[str, Any]:
+    """Inspect adjacent `<pack>.reflect.json` sidecar files for staged `.wgsl.pack` bundles."""
+    present_count = 0
+    all_valid = True
+    stage_count = 0
+    sidecar_names: list[str] = []
+    sidecar_errors: list[str] = []
+
+    try:
+        shaders_dir_resolved = shaders_dir.resolve()
+    except OSError:
+        shaders_dir_resolved = None
+
+    for pack_path in pack_files:
+        sidecar_path = pack_path.with_name(f"{pack_path.name}.reflect.json")
+        if not sidecar_path.is_file():
+            continue
+        present_count += 1
+        label = basename_label(sidecar_path)
+        sidecar_names.append(label)
+
+        try:
+            resolved_sidecar = sidecar_path.resolve(strict=True)
+            if shaders_dir_resolved is not None and not resolved_sidecar.is_relative_to(
+                shaders_dir_resolved
+            ):
+                all_valid = False
+                sidecar_errors.append(f"{label}: path escapes shaders directory")
+                continue
+            raw_text = resolved_sidecar.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeDecodeError) as exc:
+            all_valid = False
+            sidecar_errors.append(f"{label}: {type(exc).__name__}")
+            continue
+
+        try:
+            doc = json.loads(raw_text)
+        except json.JSONDecodeError as exc:
+            all_valid = False
+            sidecar_errors.append(f"{label}: {type(exc).__name__}")
+            continue
+
+        if not isinstance(doc, dict):
+            all_valid = False
+            sidecar_errors.append(f"{label}: expected JSON object")
+            continue
+
+        if "schema" in doc and not isinstance(doc["schema"], str):
+            all_valid = False
+            sidecar_errors.append(f"{label}: schema must be string")
+            continue
+
+        if "version" in doc and (
+            not isinstance(doc["version"], int) or isinstance(doc["version"], bool)
+        ):
+            all_valid = False
+            sidecar_errors.append(f"{label}: version must be integer")
+            continue
+
+        stages = doc.get("stages")
+        if not isinstance(stages, dict) or not all(
+            isinstance(stage_entry, dict) for stage_entry in stages.values()
+        ):
+            all_valid = False
+            sidecar_errors.append(f"{label}: missing or invalid stages object")
+            continue
+
+        stage_count += len(stages)
+
+    sidecar_present = present_count > 0
+    return {
+        "sidecar_present": sidecar_present,
+        "sidecar_valid": sidecar_present and all_valid,
+        "sidecar_stage_count": stage_count,
+        "sidecar_names": sidecar_names,
+        "sidecar_errors": sidecar_errors,
+    }
 
 
 def check_shader_pack_gate(
@@ -679,6 +890,9 @@ def check_shader_pack_gate(
         "reflectionValid": False,
         "reflectionShaderCount": 0,
         "hashParityOk": False,
+        "sidecar_present": False,
+        "sidecar_valid": False,
+        "sidecar_stage_count": 0,
     }
 
     if not shaders_dir.is_dir():
@@ -730,6 +944,15 @@ def check_shader_pack_gate(
 
     details["validPackCount"] = valid_packs
     details["packErrors"] = pack_errors
+
+    sidecar_info = _inspect_shader_sidecars(pack_files, shaders_dir)
+    details["sidecar_present"] = sidecar_info["sidecar_present"]
+    details["sidecar_valid"] = sidecar_info["sidecar_valid"]
+    details["sidecar_stage_count"] = sidecar_info["sidecar_stage_count"]
+    if sidecar_info["sidecar_names"]:
+        details["sidecarNames"] = sidecar_info["sidecar_names"]
+    if sidecar_info["sidecar_errors"]:
+        details["sidecarErrors"] = sidecar_info["sidecar_errors"]
 
     if valid_packs <= 0:
         return GateResult(
@@ -795,12 +1018,29 @@ def check_shader_pack_gate(
             next_action="python tools/gen_fallback_shaders.py --out-dir local-data/shaders",
         )
 
+    if details["sidecar_present"] and not details["sidecar_valid"]:
+        return GateResult(
+            name="shader_pack",
+            status="warn",
+            summary=(
+                f"{valid_packs} valid WGPK pack(s); reflection-manifest.json OK "
+                f"but adjacent .reflect.json sidecar invalid"
+            ),
+            details=details,
+            next_action="python tools/stage_reflection_sidecar.py --help",
+        )
+
+    sidecar_note = (
+        f"; sidecar OK ({details['sidecar_stage_count']} stages)"
+        if details["sidecar_present"] and details["sidecar_valid"]
+        else ""
+    )
     return GateResult(
         name="shader_pack",
         status="pass",
         summary=(
             f"{valid_packs} valid WGPK pack(s); reflection-manifest.json "
-            f"({details['reflectionShaderCount']} shaders) parity OK"
+            f"({details['reflectionShaderCount']} shaders) parity OK{sidecar_note}"
         ),
         details=details,
         next_action=None,
@@ -960,6 +1200,63 @@ def _http_get(
         conn.close()
 
 
+def _probe_http11_keep_alive(
+    host: str,
+    port: int,
+    *,
+    timeout: float = 3.0,
+) -> bool:
+    """Send two sequential requests over one HTTPConnection and verify HTTP/1.1 reuse."""
+    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    try:
+        conn.request("GET", "/api/status", headers={"Connection": "keep-alive"})
+        resp1 = conn.getresponse()
+        resp1.read()
+        sock1 = conn.sock
+        if (
+            resp1.status != 200
+            or resp1.version != 11
+            or resp1.will_close
+            or sock1 is None
+        ):
+            return False
+        conn_hdr1 = (resp1.getheader("Connection") or "").lower()
+        if "close" in conn_hdr1:
+            return False
+        try:
+            fd1 = sock1.fileno()
+            local_addr1 = sock1.getsockname()
+        except OSError:
+            return False
+        if fd1 < 0:
+            return False
+
+        conn.request("HEAD", "/", headers={"Connection": "keep-alive"})
+        resp2 = conn.getresponse()
+        resp2.read()
+        sock2 = conn.sock
+        if (
+            resp2.status != 200
+            or resp2.version != 11
+            or resp2.will_close
+            or sock2 is None
+        ):
+            return False
+        conn_hdr2 = (resp2.getheader("Connection") or "").lower()
+        if "close" in conn_hdr2:
+            return False
+        try:
+            fd2 = sock2.fileno()
+            local_addr2 = sock2.getsockname()
+        except OSError:
+            return False
+        return sock2 is sock1 and fd2 == fd1 and local_addr2 == local_addr1
+    except (OSError, http.client.HTTPException):
+        return False
+    finally:
+        conn.close()
+
+
 def check_local_server_gate(
     repo_root: Path,
     *,
@@ -992,6 +1289,7 @@ def check_local_server_gate(
         "bootOk": False,
         "gameSplashOk": None,
         "splashUrl": None,
+        "http11_keep_alive": False,
     }
 
     server_file = repo_root / "server" / "serve_local.py"
@@ -1152,12 +1450,16 @@ def check_local_server_gate(
             game_splash_ok = False
         details["gameSplashOk"] = game_splash_ok
 
+        # HTTP/1.1 persistent keep-alive reuse check (GET /api/status -> HEAD /)
+        details["http11_keep_alive"] = _probe_http11_keep_alive("127.0.0.1", port)
+
         isolation_ok = bool(
             details["coopValid"]
             and details["coepValid"]
             and details["statusEndpointOk"]
             and details["range206Ok"]
             and details["rootOk"]
+            and details["http11_keep_alive"]
         )
         endpoints_ok = bool(details["shadersOk"] and details["bootOk"])
         splash_requirement_ok = game_splash_ok is not False
@@ -1171,7 +1473,7 @@ def check_local_server_gate(
             return GateResult(
                 name="local_server",
                 status="pass",
-                summary=f"COOP/COEP + Range 206 + boot endpoints OK{splash_note}",
+                summary=f"COOP/COEP + HTTP/1.1 keep-alive + Range 206 + boot endpoints OK{splash_note}",
                 details=details,
                 next_action=None,
             )
@@ -1185,6 +1487,8 @@ def check_local_server_gate(
             missing.append("range-206")
         if not details["rootOk"]:
             missing.append("/")
+        if not details["http11_keep_alive"]:
+            missing.append("http11-keep-alive")
         if not details["shadersOk"]:
             missing.append("/shaders/")
         if not details["bootOk"]:
@@ -1222,6 +1526,10 @@ def check_local_server_gate(
             details["corpValid"] = captured.get("cross-origin-resource-policy") == "same-origin"
             details["acceptRangesValid"] = captured.get("accept-ranges") == "bytes"
             details["statusEndpointOk"] = callable(getattr(serve, "build_status_payload", None))
+            details["http11_keep_alive"] = (
+                getattr(handler_cls, "protocol_version", "") == "HTTP/1.1"
+                and captured.get("connection", "").lower() == "keep-alive"
+            )
             ok = bool(details["coopValid"] and details["coepValid"])
             return GateResult(
                 name="local_server",
