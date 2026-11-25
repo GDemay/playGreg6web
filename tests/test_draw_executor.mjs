@@ -2357,3 +2357,347 @@ test('W194 immediate pass-directed setViewport/setScissorRect/setBlendConstant/s
   assert.equal(minRes.viewportElided, false);
   assert.equal(minExec.getStats().elidedViewportScissorSets, 0);
 });
+
+// ---------------------------------------------------------------------------
+// W251 Per-frame non-clear draw visibility & state-elision hit-rate telemetry
+// ---------------------------------------------------------------------------
+
+test('W251 beginFrame and getFrameDrawSummary track real-pack, fallback, multi-pass, clear-only, and skipped draws across frames', () => {
+  const { device, pass } = createMockWebGpu();
+  const router = new ShaderFallbackRouter();
+  const executor = new DrawExecutor({ device, shaderFallbackRouter: router });
+
+  const realPipe = {
+    kind: 'GPURenderPipeline',
+    handle: 8001,
+    getBindGroupLayout: () => ({ kind: 'GPUBindGroupLayout' }),
+  };
+  const clearPipe = {
+    kind: 'GPURenderPipeline',
+    handle: 8002,
+    isClear: true,
+    getBindGroupLayout: () => ({ kind: 'GPUBindGroupLayout' }),
+  };
+  const vb = device.createBuffer({ size: 256, usage: BUFFER_USAGE.VERTEX });
+  const ib = device.createBuffer({ size: 128, usage: BUFFER_USAGE.INDEX });
+  const indirectBuf = device.createBuffer({ size: 64, usage: BUFFER_USAGE.INDIRECT });
+  const cbv = device.createBuffer({ size: 256, usage: BUFFER_USAGE.UNIFORM });
+
+  // 1. Fresh executor starts at zeroed per-frame and cumulative counters.
+  const initialSummary = executor.getFrameDrawSummary();
+  assert.deepEqual(initialSummary, {
+    hasNonClearDraw: false,
+    realPackDrawsThisFrame: 0,
+    fallbackDrawsThisFrame: 0,
+    drawsThisFrame: 0,
+  });
+  const initialStats = executor.getStats();
+  assert.equal(initialStats.totalDrawsExecuted, 0);
+  assert.equal(initialStats.hasNonClearDraw, false);
+  assert.equal(initialStats.realPackDrawsThisFrame, 0);
+  assert.equal(initialStats.fallbackDrawsThisFrame, 0);
+  assert.equal(initialStats.drawsThisFrame, 0);
+  assert.equal(initialStats.stateElisionHitRate, 0);
+
+  // Mutating getFrameDrawSummary() output cannot corrupt internal state.
+  initialSummary.hasNonClearDraw = true;
+  initialSummary.drawsThisFrame = 999;
+  assert.deepEqual(executor.getFrameDrawSummary(), {
+    hasNonClearDraw: false,
+    realPackDrawsThisFrame: 0,
+    fallbackDrawsThisFrame: 0,
+    drawsThisFrame: 0,
+  });
+
+  // 2. Frame 1: skipped draws and explicit clear-only draws keep hasNonClearDraw === false.
+  executor.beginFrame();
+  executor.beginPass();
+  executor.setPipeline(realPipe);
+  executor.setIndexBuffer(ib, 'uint16', 0);
+
+  assert.equal(executor.draw(null, 3, 1).skipped, true);
+  assert.equal(executor.draw(pass, 0, 1).skipped, true);
+  assert.equal(executor.drawIndexed(pass, 1000, 1, 0, 0, 0).skipped, true);
+  assert.equal(executor.drawIndirect(pass, indirectBuf, 2).skipped, true);
+
+  assert.deepEqual(executor.getFrameDrawSummary(), {
+    hasNonClearDraw: false,
+    realPackDrawsThisFrame: 0,
+    fallbackDrawsThisFrame: 0,
+    drawsThisFrame: 0,
+  });
+  assert.equal(executor.getStats().totalDrawsExecuted, 0);
+
+  // Explicit clear-quad draws execute and count as draws, but do NOT latch hasNonClearDraw.
+  executor.setPipeline(clearPipe);
+  assert.equal(executor.draw(pass, 3, 1).executed, true);
+  executor.setPipeline(realPipe);
+  assert.equal(executor.executeDraw(pass, { vertexCount: 3, isClear: true }).executed, true);
+  assert.equal(executor.executeDraw(pass, { vertexCount: 3, drawCategory: 'clear' }).executed, true);
+
+  assert.deepEqual(executor.getFrameDrawSummary(), {
+    hasNonClearDraw: false,
+    realPackDrawsThisFrame: 3,
+    fallbackDrawsThisFrame: 0,
+    drawsThisFrame: 3,
+  });
+  assert.equal(executor.getStats().hasNonClearDraw, false);
+  assert.equal(executor.getStats().totalDrawsExecuted, 3);
+
+  // 3. Frame 2: multi-pass frame mixes real-pack + fallback draws across direct, indexed, and indirect paths.
+  executor.beginFrame();
+  assert.deepEqual(executor.getFrameDrawSummary(), {
+    hasNonClearDraw: false,
+    realPackDrawsThisFrame: 0,
+    fallbackDrawsThisFrame: 0,
+    drawsThisFrame: 0,
+  });
+  // Cumulative counter persists across beginFrame().
+  assert.equal(executor.getStats().totalDrawsExecuted, 3);
+
+  // Pass 1 (real-pack draws)
+  executor.beginPass();
+  executor.setPipeline(realPipe);
+  executor.setVertexBuffer(0, vb, 0);
+  executor.setIndexBuffer(ib, 'uint16', 0);
+  assert.equal(executor.draw(pass, 6, 1).executed, true);
+  assert.equal(executor.drawIndexed(pass, 12, 1, 0, 0, 0).executed, true);
+  assert.equal(executor.drawIndirect(pass, indirectBuf, 0).executed, true);
+  assert.equal(executor.drawIndexedIndirect(pass, indirectBuf, 20).executed, true);
+  executor.endPass();
+
+  // Pass boundaries (endPass / beginPass / resetState) MUST NOT clear per-frame counters.
+  assert.deepEqual(executor.getFrameDrawSummary(), {
+    hasNonClearDraw: true,
+    realPackDrawsThisFrame: 4,
+    fallbackDrawsThisFrame: 0,
+    drawsThisFrame: 4,
+  });
+
+  // Pass 2 (fallback draws in the same frame)
+  executor.beginPass();
+  executor.setPipeline({ vertexShaderHash: '0x1234', fragmentShaderHash: '0x5678', isFallback: true });
+  executor.setConstantBuffer(0, cbv);
+  executor.setIndexBuffer(ib, 'uint16', 0);
+  assert.equal(executor.draw(pass, 3, 1).executed, true);
+  assert.equal(executor.drawIndexed(pass, 6, 1, 0, 0, 0).executed, true);
+  assert.equal(executor.drawIndirect(pass, indirectBuf, 0).executed, true);
+  assert.equal(executor.drawIndexedIndirect(pass, indirectBuf, 20).executed, true);
+
+  const f2Summary = executor.getFrameDrawSummary();
+  assert.deepEqual(f2Summary, {
+    hasNonClearDraw: true,
+    realPackDrawsThisFrame: 4,
+    fallbackDrawsThisFrame: 4,
+    drawsThisFrame: 8,
+  });
+  assert.equal(
+    f2Summary.drawsThisFrame,
+    f2Summary.realPackDrawsThisFrame + f2Summary.fallbackDrawsThisFrame
+  );
+
+  const f2Stats = executor.getStats();
+  assert.equal(f2Stats.hasNonClearDraw, true);
+  assert.equal(f2Stats.realPackDrawsThisFrame, 4);
+  assert.equal(f2Stats.fallbackDrawsThisFrame, 4);
+  assert.equal(f2Stats.drawsThisFrame, 8);
+  assert.equal(f2Stats.totalDraws, 11);
+  assert.equal(f2Stats.totalDrawsExecuted, 11);
+  assert.equal(f2Stats.normalDraws, 7);
+  assert.equal(f2Stats.fallbackDraws, 4);
+
+  // 4. Frame 3: beginFrame resets per-frame fields cleanly while preserving cumulative totals.
+  executor.beginFrame();
+  assert.deepEqual(executor.getFrameDrawSummary(), {
+    hasNonClearDraw: false,
+    realPackDrawsThisFrame: 0,
+    fallbackDrawsThisFrame: 0,
+    drawsThisFrame: 0,
+  });
+  assert.equal(executor.getStats().totalDrawsExecuted, 11);
+  assert.equal(executor.getStats().hasNonClearDraw, false);
+  assert.equal(executor.getStats().realPackDrawsThisFrame, 0);
+  assert.equal(executor.getStats().fallbackDrawsThisFrame, 0);
+
+  // Destroyed executor skips without mutating per-frame visibility or totalDrawsExecuted.
+  executor.destroy();
+  assert.equal(executor.draw(pass, 3, 1).reason, 'executor-destroyed');
+  assert.deepEqual(executor.getFrameDrawSummary(), {
+    hasNonClearDraw: false,
+    realPackDrawsThisFrame: 0,
+    fallbackDrawsThisFrame: 0,
+    drawsThisFrame: 0,
+  });
+  assert.equal(executor.getStats().totalDrawsExecuted, 11);
+});
+
+test('W251 stateElisionHitRate tracks exact clamped [0, 1] ratio and resets cleanly in resetStats / reset({ stats: true })', () => {
+  const { device, pass } = createMockWebGpu();
+  const router = new ShaderFallbackRouter();
+  const executor = new DrawExecutor({ device, shaderFallbackRouter: router });
+
+  const pipe = {
+    kind: 'GPURenderPipeline',
+    handle: 8101,
+    getBindGroupLayout: () => ({ kind: 'GPUBindGroupLayout' }),
+  };
+  const vb = device.createBuffer({ size: 256, usage: BUFFER_USAGE.VERTEX });
+  const ib = device.createBuffer({ size: 128, usage: BUFFER_USAGE.INDEX });
+  const bg = { kind: 'GPUBindGroup', handle: 8102 };
+
+  // Cold state -> hit rate is 0.
+  assert.equal(executor.getStats().stateElisionHitRate, 0);
+
+  executor.beginFrame();
+  executor.beginPass();
+  executor.setPipeline(pipe);
+  executor.setVertexBuffer(0, vb, 0);
+  executor.setIndexBuffer(ib, 'uint16', 0);
+  executor.setBindGroup(0, bg);
+  executor.setViewport(0, 0, 1280, 720, 0, 1);
+  executor.setScissorRect(0, 0, 1280, 720);
+  executor.setBlendConstant({ r: 0.1, g: 0.2, b: 0.3, a: 1.0 });
+  executor.setStencilReference(5);
+
+  // Draw 1: 8 emitted state calls, 0 elided -> 0 / 8 = 0.
+  assert.equal(executor.drawIndexed(pass, 6, 1, 0, 0, 0).executed, true);
+  assert.equal(executor.getStats().totalElidedStateCalls, 0);
+  assert.equal(executor.getStats().stateElisionHitRate, 0);
+
+  // Draw 2: 8 emitted, 8 elided -> 8 / 16 = 0.5.
+  assert.equal(executor.drawIndexed(pass, 6, 1, 0, 0, 0).executed, true);
+  assert.equal(executor.getStats().totalElidedStateCalls, 8);
+  assert.equal(executor.getStats().stateElisionHitRate, 0.5);
+
+  // Draw 3: 8 emitted, 16 elided -> 16 / 24 = 2/3.
+  assert.equal(executor.drawIndexed(pass, 6, 1, 0, 0, 0).executed, true);
+  assert.equal(executor.getStats().totalElidedStateCalls, 16);
+  assert.ok(Math.abs(executor.getStats().stateElisionHitRate - 16 / 24) < 1e-12);
+  assert.ok(executor.getStats().stateElisionHitRate >= 0 && executor.getStats().stateElisionHitRate <= 1);
+
+  // beginFrame() preserves cumulative stateElisionHitRate.
+  executor.beginFrame();
+  assert.ok(Math.abs(executor.getStats().stateElisionHitRate - 16 / 24) < 1e-12);
+
+  // Mid-pass resetStats() zeroes hit rate and per-frame visibility; next elided draw yields exact 1.0 (clamped <= 1).
+  executor.resetStats();
+  const afterReset = executor.getStats();
+  assert.equal(afterReset.totalDrawsExecuted, 0);
+  assert.equal(afterReset.totalElidedStateCalls, 0);
+  assert.equal(afterReset.stateElisionHitRate, 0);
+  assert.equal(afterReset.hasNonClearDraw, false);
+  assert.equal(afterReset.realPackDrawsThisFrame, 0);
+  assert.equal(afterReset.fallbackDrawsThisFrame, 0);
+  assert.equal(afterReset.drawsThisFrame, 0);
+  assert.deepEqual(executor.getFrameDrawSummary(), {
+    hasNonClearDraw: false,
+    realPackDrawsThisFrame: 0,
+    fallbackDrawsThisFrame: 0,
+    drawsThisFrame: 0,
+  });
+
+  // Bound pass state is still live after resetStats(), so the next identical draw elides all 8 calls -> 8/8 = 1.0.
+  assert.equal(executor.drawIndexed(pass, 6, 1, 0, 0, 0).executed, true);
+  assert.equal(executor.getStats().totalElidedStateCalls, 8);
+  assert.equal(executor.getStats().stateElisionHitRate, 1);
+
+  // reset({ stats: true }) resets both state and all W251 telemetry cleanly.
+  executor.reset({ stats: true });
+  const afterFullReset = executor.getStats();
+  assert.equal(afterFullReset.totalDrawsExecuted, 0);
+  assert.equal(afterFullReset.stateElisionHitRate, 0);
+  assert.equal(afterFullReset.hasNonClearDraw, false);
+  assert.equal(afterFullReset.realPackDrawsThisFrame, 0);
+  assert.equal(afterFullReset.fallbackDrawsThisFrame, 0);
+  assert.equal(afterFullReset.drawsThisFrame, 0);
+
+  // Elision disabled -> hit rate remains strictly 0 across repeated draws.
+  const noElideEnv = createMockWebGpu();
+  const noElideExec = new DrawExecutor({
+    device: noElideEnv.device,
+    shaderFallbackRouter: router,
+    elideRedundantState: false,
+  });
+  noElideExec.beginFrame();
+  noElideExec.beginPass();
+  noElideExec.setPipeline(pipe);
+  noElideExec.setVertexBuffer(0, vb, 0);
+  noElideExec.draw(noElideEnv.pass, 3, 1);
+  noElideExec.draw(noElideEnv.pass, 3, 1);
+  assert.equal(noElideExec.getStats().stateElisionHitRate, 0);
+  assert.equal(noElideExec.getStats().totalDrawsExecuted, 2);
+  assert.equal(noElideExec.getFrameDrawSummary().hasNonClearDraw, true);
+
+  // JSON serializability of getFrameDrawSummary() and getStats().
+  const roundTripStats = JSON.parse(JSON.stringify(noElideExec.getStats()));
+  assert.equal(roundTripStats.totalDrawsExecuted, 2);
+  assert.equal(roundTripStats.hasNonClearDraw, true);
+  assert.equal(roundTripStats.realPackDrawsThisFrame, 2);
+  assert.equal(roundTripStats.fallbackDrawsThisFrame, 0);
+  assert.equal(roundTripStats.stateElisionHitRate, 0);
+});
+
+test('W251 fallback-only frame still latches hasNonClearDraw and integrates cleanly with W231 swapchain content shape', () => {
+  const { device, pass } = createMockWebGpu();
+  const router = new ShaderFallbackRouter();
+  const executor = new DrawExecutor({ device, shaderFallbackRouter: router });
+  const cbv = device.createBuffer({ size: 256, usage: BUFFER_USAGE.UNIFORM });
+
+  // Frame 1: clear-only (no draws) -> summary indicates no visible draw yet.
+  executor.beginFrame();
+  const emptySummary = executor.getFrameDrawSummary();
+  assert.equal(emptySummary.hasNonClearDraw, false);
+  assert.equal(emptySummary.realPackDrawsThisFrame, 0);
+  assert.equal(emptySummary.fallbackDrawsThisFrame, 0);
+  assert.equal(emptySummary.drawsThisFrame, 0);
+
+  // Frame 2: fallback splash draw latches hasNonClearDraw = true with fallbackDrawsThisFrame = 1.
+  executor.beginFrame();
+  executor.beginPass();
+  executor.setConstantBuffer(0, cbv);
+  assert.equal(executor.draw(pass, 3, 1).executed, true);
+
+  const fbSummary = executor.getFrameDrawSummary();
+  assert.deepEqual(fbSummary, {
+    hasNonClearDraw: true,
+    realPackDrawsThisFrame: 0,
+    fallbackDrawsThisFrame: 1,
+    drawsThisFrame: 1,
+  });
+
+  // Verify direct compatibility with W231 WgpuSwapchain.markFrameContent().
+  const { WgpuSwapchain } = require('../web/workers/wgpu_swapchain.js');
+  const mockCanvas = {
+    width: 1280,
+    height: 720,
+    getContext() {
+      return {
+        configure() {},
+        unconfigure() {},
+        getCurrentTexture() {
+          return { createView: () => ({ kind: 'GPUTextureView' }) };
+        },
+      };
+    },
+  };
+  const swapchain = new WgpuSwapchain({ canvas: mockCanvas, device });
+  swapchain.markFrameContent({
+    nonClearDraw: emptySummary.hasNonClearDraw,
+    realPackDraws: emptySummary.realPackDrawsThisFrame,
+    hasDraws: emptySummary.drawsThisFrame > 0,
+  });
+  swapchain.recordFramePresented(16.6);
+  assert.equal(swapchain.getStats().hasVisibleContent, false);
+  assert.equal(swapchain.getStats().blackPresentsTotal, 1);
+  assert.equal(swapchain.getStats().visiblePresentsTotal, 0);
+
+  swapchain.markFrameContent({
+    nonClearDraw: fbSummary.hasNonClearDraw,
+    realPackDraws: fbSummary.realPackDrawsThisFrame,
+    hasDraws: fbSummary.drawsThisFrame > 0,
+  });
+  swapchain.recordFramePresented(33.2);
+  assert.equal(swapchain.getStats().hasVisibleContent, true);
+  assert.equal(swapchain.getStats().visiblePresentsTotal, 1);
+  assert.equal(swapchain.getStats().firstVisiblePresentIndex, 2);
+});
