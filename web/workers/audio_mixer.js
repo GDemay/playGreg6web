@@ -8,6 +8,9 @@
   const DEFAULT_MAX_RESAMPLE_FRAMES = 524288;
   const DEFAULT_CHANNELS = 2;
   const DEFAULT_MAX_VOICES = 64;
+  const DEFAULT_QUANTUM_FRAMES = 128;
+  const DEFAULT_INITIAL_BUFFER_FRAMES = 1024;
+  const DEFAULT_GAIN_RAMP_FRAMES = 64;
   const DEFAULT_SOFT_CLIP_KNEE = 0.95;
   const DEFAULT_LIMITER_KNEE = DEFAULT_SOFT_CLIP_KNEE;
 
@@ -309,11 +312,109 @@
     const p = clamp(pan, -1.0, 1.0);
     if (p <= -1.0) return { left: 1.0, right: 0.0 };
     if (p >= 1.0) return { left: 0.0, right: 1.0 };
+    if (p === 0.0) return { left: Math.SQRT1_2, right: Math.SQRT1_2 };
     const angle = (p + 1.0) * (Math.PI * 0.25);
     return {
       left: Math.cos(angle),
       right: Math.sin(angle),
     };
+  }
+
+  /**
+   * Precomputes and stores scalar mono and stereo/surround equal-power pan
+   * coefficients directly on a voice object so the hot mix loop performs
+   * zero trigonometric calls and zero object allocations per quantum.
+   */
+  function updateVoicePanGains(voice) {
+    const p = voice.pan;
+    if (p <= -1.0) {
+      voice.panL = 1.0;
+      voice.panR = 0.0;
+      voice.panLL = 1.0;
+      voice.panLR = 1.0;
+      voice.panRL = 0.0;
+      voice.panRR = 0.0;
+    } else if (p >= 1.0) {
+      voice.panL = 0.0;
+      voice.panR = 1.0;
+      voice.panLL = 0.0;
+      voice.panLR = 0.0;
+      voice.panRL = 1.0;
+      voice.panRR = 1.0;
+    } else if (p === 0.0) {
+      voice.panL = Math.SQRT1_2;
+      voice.panR = Math.SQRT1_2;
+      voice.panLL = 1.0;
+      voice.panLR = 0.0;
+      voice.panRL = 0.0;
+      voice.panRR = 1.0;
+    } else {
+      const monoAngle = (p + 1.0) * (Math.PI * 0.25);
+      voice.panL = Math.cos(monoAngle);
+      voice.panR = Math.sin(monoAngle);
+      if (p < 0.0) {
+        const x = (p + 1.0) * (Math.PI * 0.5);
+        voice.panLL = 1.0;
+        voice.panLR = Math.cos(x);
+        voice.panRL = 0.0;
+        voice.panRR = Math.sin(x);
+      } else {
+        const x = p * (Math.PI * 0.5);
+        voice.panLL = Math.cos(x);
+        voice.panLR = 0.0;
+        voice.panRL = Math.sin(x);
+        voice.panRR = 1.0;
+      }
+    }
+  }
+
+  /**
+   * Resolves a ramp specification (non-negative frame count or options object
+   * with `rampFrames`, `frames`, `durationMs`, or `durationSec`) into an integer
+   * frame count without allocating in the numeric fast path.
+   */
+  function resolveRampFrames(rampSpec, sampleRate, fallbackFrames) {
+    if (rampSpec === undefined || rampSpec === null) {
+      return fallbackFrames;
+    }
+    if (typeof rampSpec === 'number') {
+      if (!Number.isFinite(rampSpec) || rampSpec < 0) {
+        throw new RangeError(`rampFrames must be a non-negative finite number, got ${rampSpec}`);
+      }
+      return Math.floor(rampSpec);
+    }
+    if (typeof rampSpec === 'object') {
+      if (rampSpec.rampFrames !== undefined) {
+        const v = rampSpec.rampFrames;
+        if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) {
+          throw new RangeError(`rampFrames must be a non-negative finite number, got ${v}`);
+        }
+        return Math.floor(v);
+      }
+      if (rampSpec.frames !== undefined) {
+        const v = rampSpec.frames;
+        if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) {
+          throw new RangeError(`frames must be a non-negative finite number, got ${v}`);
+        }
+        return Math.floor(v);
+      }
+      if (rampSpec.durationMs !== undefined) {
+        const ms = rampSpec.durationMs;
+        if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) {
+          throw new RangeError(`durationMs must be a non-negative finite number, got ${ms}`);
+        }
+        return Math.round((ms / 1000.0) * sampleRate);
+      }
+      if (rampSpec.durationSec !== undefined) {
+        const sec = rampSpec.durationSec;
+        if (typeof sec !== 'number' || !Number.isFinite(sec) || sec < 0) {
+          throw new RangeError(`durationSec must be a non-negative finite number, got ${sec}`);
+        }
+        return Math.round(sec * sampleRate);
+      }
+      return fallbackFrames;
+    }
+    throw new RangeError(`rampFrames must be a non-negative number or options object, got ${rampSpec}`);
   }
 
   /**
@@ -720,10 +821,11 @@
   }
 
   /**
-   * Lock-free multi-voice stereo audio mixer with equal-power panning,
-   * linear resampling, seamless looping, non-finite sample sanitization,
-   * configurable soft-clip tanh limiter, and direct SharedArrayBuffer
-   * AudioRingBuffer pumping.
+   * Lock-free multi-voice stereo audio mixer with zero-allocation hot mix
+   * passes backed by pre-allocated Float32Array accumulation buffers, smooth
+   * per-voice & master gain ramping, equal-power panning, linear resampling,
+   * seamless looping, non-finite sample sanitization, configurable soft-clip
+   * tanh limiter, and direct SharedArrayBuffer AudioRingBuffer pumping.
    */
   class AudioMixer {
     constructor(options = {}) {
@@ -763,30 +865,140 @@
         throw new RangeError(`limiterKnee must be in [0, 1), got ${limiterKnee}`);
       }
 
+      const initialBufferFrames =
+        options.initialBufferFrames !== undefined
+          ? options.initialBufferFrames
+          : options.initialCapacityFrames !== undefined
+            ? options.initialCapacityFrames
+            : options.quantumFrames !== undefined
+              ? options.quantumFrames
+              : DEFAULT_INITIAL_BUFFER_FRAMES;
+      if (!Number.isInteger(initialBufferFrames) || initialBufferFrames <= 0) {
+        throw new RangeError(
+          `initialBufferFrames must be a positive integer, got ${initialBufferFrames}`
+        );
+      }
+
+      const defaultGainRampFrames =
+        options.gainRampFrames !== undefined
+          ? resolveRampFrames(options.gainRampFrames, sampleRate, 0)
+          : options.rampFrames !== undefined
+            ? resolveRampFrames(options.rampFrames, sampleRate, 0)
+            : 0;
+
+      const reuseOutputBuffer = Boolean(options.reuseOutputBuffer);
+
       this.sampleRate = sampleRate;
       this.channels = DEFAULT_CHANNELS;
       this.maxVoices = maxVoices;
       this._masterGain = masterGain;
+      this._masterGainTarget = masterGain;
+      this._masterGainRampRemaining = 0;
+      this._masterGainRampStep = 0.0;
+      this._defaultGainRampFrames = defaultGainRampFrames;
+      this._reuseOutputBuffer = reuseOutputBuffer;
       this._softClip = softClip;
       this._limiterKnee = limiterKnee;
 
       this._voices = new Map();
+      this._voiceList = [];
+      this._finishedIds = [];
       this._nextVoiceId = 1;
-      this._mixScratch = new Float64Array(0);
+
+      // Pre-allocated Float32Array accumulation & scratch output buffers so hot
+      // mix passes perform zero per-quantum heap allocations in steady state.
+      const initialSamples = initialBufferFrames * DEFAULT_CHANNELS;
+      this._mixScratch = new Float32Array(initialSamples);
+      this._outputScratch = new Float32Array(initialSamples);
+      this._outputScratchView = this._outputScratch;
+      this._outputScratchViewLen = initialSamples;
+      this._monoScratch = new Float32Array(initialBufferFrames);
+      this._monoScratchView = this._monoScratch;
+      this._monoScratchViewLen = initialBufferFrames;
+      this._emptyFloat32 = new Float32Array(0);
+      this._scratchReallocations = 0;
 
       this._renderedFrames = 0;
+      this._quantaMixed = 0;
       this._downmixedFrames = 0;
       this._resampledFrames = 0;
-      this._underrunCount = 0;
+      this._ringUnderrunCount = 0;
+      this._manualUnderrunQuanta = 0;
       this._peakOutputLevel = 0.0;
       this._clippedSamples = 0;
       this._sanitizedNonFiniteSamples = 0;
       this._activeVoicePeak = 0;
     }
 
+    _ensureScratchCapacity(sampleCount) {
+      if (sampleCount <= this._mixScratch.length) {
+        return;
+      }
+      let nextSamples =
+        this._mixScratch.length > 0
+          ? this._mixScratch.length
+          : DEFAULT_QUANTUM_FRAMES * DEFAULT_CHANNELS;
+      while (nextSamples < sampleCount) {
+        nextSamples *= 2;
+      }
+      this._mixScratch = new Float32Array(nextSamples);
+      this._outputScratch = new Float32Array(nextSamples);
+      this._outputScratchView = this._outputScratch;
+      this._outputScratchViewLen = nextSamples;
+      this._scratchReallocations += 1;
+    }
+
+    _getScratchOutputView(sampleCount) {
+      if (sampleCount === 0) {
+        return this._emptyFloat32;
+      }
+      this._ensureScratchCapacity(sampleCount);
+      if (
+        this._outputScratchViewLen !== sampleCount ||
+        this._outputScratchView.buffer !== this._outputScratch.buffer
+      ) {
+        this._outputScratchView =
+          sampleCount === this._outputScratch.length
+            ? this._outputScratch
+            : this._outputScratch.subarray(0, sampleCount);
+        this._outputScratchViewLen = sampleCount;
+      }
+      return this._outputScratchView;
+    }
+
+    _getMonoScratchView(frameCount) {
+      if (frameCount === 0) {
+        return this._emptyFloat32;
+      }
+      if (frameCount > this._monoScratch.length) {
+        let nextFrames =
+          this._monoScratch.length > 0 ? this._monoScratch.length : DEFAULT_QUANTUM_FRAMES;
+        while (nextFrames < frameCount) {
+          nextFrames *= 2;
+        }
+        this._monoScratch = new Float32Array(nextFrames);
+        this._monoScratchView = this._monoScratch;
+        this._monoScratchViewLen = nextFrames;
+        this._scratchReallocations += 1;
+      }
+      if (
+        this._monoScratchViewLen !== frameCount ||
+        this._monoScratchView.buffer !== this._monoScratch.buffer
+      ) {
+        this._monoScratchView =
+          frameCount === this._monoScratch.length
+            ? this._monoScratch
+            : this._monoScratch.subarray(0, frameCount);
+        this._monoScratchViewLen = frameCount;
+      }
+      return this._monoScratchView;
+    }
+
     _countActiveVoices() {
       let active = 0;
-      for (const voice of this._voices.values()) {
+      const list = this._voiceList;
+      for (let i = 0; i < list.length; i++) {
+        const voice = list[i];
         if (!voice.stopped && !voice.finished) {
           active += 1;
         }
@@ -806,12 +1018,26 @@
       return this._masterGain;
     }
 
-    setMasterGain(gain) {
+    setMasterGain(gain, rampFrames) {
       if (typeof gain !== 'number' || !Number.isFinite(gain)) {
-        return this._masterGain;
+        return this._masterGainTarget;
       }
-      this._masterGain = gain < 0 ? 0.0 : gain;
-      return this._masterGain;
+      const target = gain < 0 ? 0.0 : gain;
+      const frames = resolveRampFrames(
+        rampFrames,
+        this.sampleRate,
+        this._defaultGainRampFrames
+      );
+      this._masterGainTarget = target;
+      if (frames <= 0 || this._masterGain === target) {
+        this._masterGain = target;
+        this._masterGainRampRemaining = 0;
+        this._masterGainRampStep = 0.0;
+      } else {
+        this._masterGainRampRemaining = frames;
+        this._masterGainRampStep = (target - this._masterGain) / frames;
+      }
+      return this._masterGainTarget;
     }
 
     /**
@@ -820,8 +1046,11 @@
      * @param {object} config
      * @param {Float32Array|ArrayBuffer|ArrayBufferView|number[]} config.samples
      * @param {number} [config.sampleRate]
-     * @param {number} [config.channels=1] 1 (mono) or 2 (interleaved stereo).
+     * @param {number} [config.channels=1] 1 (mono), 2 (stereo), 4 (quad), 6 (5.1), or 8 (7.1).
      * @param {number} [config.gain=1.0]
+     * @param {number} [config.initialGain] Optional starting gain for fade-in ramps.
+     * @param {number} [config.fadeInFrames=0] Optional fade-in ramp duration in output frames.
+     * @param {number} [config.gainRampFrames] Optional default ramp duration for this voice.
      * @param {number} [config.pan=0.0] Equal-power pan in [-1, 1].
      * @param {boolean} [config.loop=false]
      * @param {number} [config.pitch=1.0] Playback rate multiplier (> 0).
@@ -870,6 +1099,45 @@
           ? Math.max(0.0, config.gain)
           : 1.0;
 
+      const voiceGainRampFrames =
+        config.gainRampFrames !== undefined
+          ? resolveRampFrames(config.gainRampFrames, this.sampleRate, 0)
+          : null;
+
+      const fadeInFrames =
+        config.fadeInFrames !== undefined
+          ? resolveRampFrames(config.fadeInFrames, this.sampleRate, 0)
+          : 0;
+
+      const explicitInitialGain =
+        config.initialGain !== undefined
+          ? config.initialGain
+          : config.startGain;
+
+      let startGain = gain;
+      let initRampFrames = 0;
+      if (
+        typeof explicitInitialGain === 'number' &&
+        Number.isFinite(explicitInitialGain)
+      ) {
+        startGain = Math.max(0.0, explicitInitialGain);
+        if (fadeInFrames > 0) {
+          initRampFrames = fadeInFrames;
+        } else if (voiceGainRampFrames !== null && voiceGainRampFrames > 0) {
+          initRampFrames = voiceGainRampFrames;
+        } else if (this._defaultGainRampFrames > 0) {
+          initRampFrames = this._defaultGainRampFrames;
+        } else if (startGain !== gain) {
+          initRampFrames = DEFAULT_GAIN_RAMP_FRAMES;
+        }
+      } else if (fadeInFrames > 0) {
+        startGain = 0.0;
+        initRampFrames = fadeInFrames;
+      }
+
+      const initRampRemaining = startGain !== gain && initRampFrames > 0 ? initRampFrames : 0;
+      const initRampStep = initRampRemaining > 0 ? (gain - startGain) / initRampRemaining : 0.0;
+
       const pan =
         typeof config.pan === 'number' && Number.isFinite(config.pan)
           ? clamp(config.pan, -1.0, 1.0)
@@ -891,7 +1159,7 @@
       const frameCount = Math.floor(samples.length / channels);
       const voiceId = this._nextVoiceId++;
 
-      this._voices.set(voiceId, {
+      const voice = {
         id: voiceId,
         samples,
         frameCount,
@@ -901,14 +1169,29 @@
         surroundGain,
         lfeGain,
         gain,
+        currentGain: startGain,
+        targetGain: gain,
+        gainRampRemaining: initRampRemaining,
+        gainRampStep: initRampStep,
+        gainRampFrames: voiceGainRampFrames,
         pan,
+        panL: Math.SQRT1_2,
+        panR: Math.SQRT1_2,
+        panLL: 1.0,
+        panLR: 0.0,
+        panRL: 0.0,
+        panRR: 1.0,
         loop,
         pitch,
         position: 0.0,
         paused: false,
         stopped: false,
         finished: false,
-      });
+      };
+      updateVoicePanGains(voice);
+
+      this._voices.set(voiceId, voice);
+      this._voiceList.push(voice);
 
       this._updateActiveVoicePeak();
       return voiceId;
@@ -918,14 +1201,66 @@
       return this._voices.has(voiceId);
     }
 
-    setVoiceGain(voiceId, gain) {
+    getVoiceGain(voiceId) {
+      const voice = this._voices.get(voiceId);
+      return voice ? voice.currentGain : null;
+    }
+
+    /**
+     * Sets a voice's target gain with optional click-free linear ramping.
+     *
+     * @param {number} voiceId
+     * @param {number} gain Non-negative target gain.
+     * @param {number|object} [rampFrames] Optional ramp duration in output frames or `{ rampFrames | durationMs | durationSec }`.
+     * @returns {boolean}
+     */
+    setVoiceGain(voiceId, gain, rampFrames) {
       const voice = this._voices.get(voiceId);
       if (!voice) return false;
       if (typeof gain !== 'number' || !Number.isFinite(gain)) {
         return false;
       }
-      voice.gain = gain < 0 ? 0.0 : gain;
+      const target = gain < 0 ? 0.0 : gain;
+      const defaultRamp =
+        voice.gainRampFrames !== null
+          ? voice.gainRampFrames
+          : this._defaultGainRampFrames;
+      const frames = resolveRampFrames(rampFrames, this.sampleRate, defaultRamp);
+
+      voice.gain = target;
+      voice.targetGain = target;
+      if (frames <= 0 || voice.currentGain === target) {
+        voice.currentGain = target;
+        voice.gainRampRemaining = 0;
+        voice.gainRampStep = 0.0;
+      } else {
+        voice.gainRampRemaining = frames;
+        voice.gainRampStep = (target - voice.currentGain) / frames;
+      }
       return true;
+    }
+
+    /**
+     * Smoothly ramps a voice's gain from its current instantaneous gain to
+     * `targetGain` over `rampFrames` output frames (defaults to voice/mixer
+     * ramp length or `DEFAULT_GAIN_RAMP_FRAMES`).
+     *
+     * @param {number} voiceId
+     * @param {number} targetGain
+     * @param {number|object} [rampFrames]
+     * @returns {boolean}
+     */
+    rampVoiceGain(voiceId, targetGain, rampFrames) {
+      const voice = this._voices.get(voiceId);
+      if (!voice) return false;
+      const fallback =
+        voice.gainRampFrames !== null && voice.gainRampFrames > 0
+          ? voice.gainRampFrames
+          : this._defaultGainRampFrames > 0
+            ? this._defaultGainRampFrames
+            : DEFAULT_GAIN_RAMP_FRAMES;
+      const resolved = resolveRampFrames(rampFrames, this.sampleRate, fallback);
+      return this.setVoiceGain(voiceId, targetGain, resolved);
     }
 
     setVoicePan(voiceId, pan) {
@@ -935,6 +1270,7 @@
         return false;
       }
       voice.pan = clamp(pan, -1.0, 1.0);
+      updateVoicePanGains(voice);
       return true;
     }
 
@@ -971,47 +1307,73 @@
       voice.stopped = true;
       voice.paused = false;
       voice.position = 0.0;
+      voice.currentGain = voice.targetGain;
+      voice.gainRampRemaining = 0;
+      voice.gainRampStep = 0.0;
       return true;
     }
 
     destroyVoice(voiceId) {
-      return this._voices.delete(voiceId);
+      const deleted = this._voices.delete(voiceId);
+      if (deleted) {
+        const list = this._voiceList;
+        for (let i = 0; i < list.length; i++) {
+          if (list[i].id === voiceId) {
+            list.splice(i, 1);
+            break;
+          }
+        }
+      }
+      return deleted;
     }
 
     /**
-     * Renders `frameCount` interleaved stereo Float32 frames from all active voices,
-     * applying linear resampling, equal-power panning, master gain, and soft-clip
-     * Math.tanh limiting. Finished non-looping voices are automatically reaped.
+     * Records one or more underrun quanta in mixer telemetry (e.g. reported by
+     * an AudioWorklet quantum callback or stream feeder).
      *
-     * @param {number} frameCount
-     * @returns {Float32Array} Interleaved stereo Float32Array of length frameCount * 2.
+     * @param {number} [quanta=1]
+     * @returns {number} Updated total underrunQuanta count.
      */
-    renderFrames(frameCount) {
-      if (!Number.isInteger(frameCount) || frameCount < 0) {
-        throw new RangeError(`frameCount must be a non-negative integer, got ${frameCount}`);
+    recordUnderrun(quanta = 1) {
+      if (!Number.isInteger(quanta) || quanta < 0) {
+        throw new RangeError(`quanta must be a non-negative integer, got ${quanta}`);
+      }
+      this._manualUnderrunQuanta += quanta;
+      return this._ringUnderrunCount + this._manualUnderrunQuanta;
+    }
+
+    /**
+     * Zero-allocation core stereo mix pass. Accumulates all active voices into
+     * the pre-allocated Float32Array `_mixScratch`, applies per-voice and
+     * master gain ramping, non-finite sample sanitization, and smooth
+     * soft-clip / clamp protection, and writes interleaved stereo Float32
+     * samples into `output[0 .. frameCount * 2 - 1]`.
+     *
+     * @private
+     */
+    _mixIntoBuffer(output, frameCount) {
+      if (frameCount === 0) {
+        return 0;
       }
 
       const sampleCount = frameCount * 2;
-      const output = new Float32Array(sampleCount);
-      if (frameCount === 0) {
-        return output;
-      }
-
-      if (this._mixScratch.length < sampleCount) {
-        this._mixScratch = new Float64Array(sampleCount);
-      }
+      this._ensureScratchCapacity(sampleCount);
       const mix = this._mixScratch;
       mix.fill(0.0, 0, sampleCount);
 
-      const finishedIds = [];
+      const finishedIds = this._finishedIds;
+      finishedIds.length = 0;
       const outSampleRate = this.sampleRate;
+      const voiceList = this._voiceList;
+      const voiceCount = voiceList.length;
       let sanitized = 0;
       let downmixed = 0;
       let resampled = 0;
 
       this._updateActiveVoicePeak();
 
-      for (const voice of this._voices.values()) {
+      for (let v = 0; v < voiceCount; v++) {
+        const voice = voiceList[v];
         if (voice.paused || voice.stopped || voice.finished) {
           continue;
         }
@@ -1028,131 +1390,101 @@
         const src = voice.samples;
         const step = (voice.sampleRate * voice.pitch) / outSampleRate;
         const isResampling = voice.sampleRate !== outSampleRate || voice.pitch !== 1.0;
-        const gain = voice.gain;
         const loop = voice.loop;
         let pos = voice.position;
+        let curGain = voice.currentGain;
+        const targetGain = voice.targetGain;
+        let rampRem = voice.gainRampRemaining;
+        const rampStep = voice.gainRampStep;
         let voiceRendered = 0;
 
         if (voice.channels === 1) {
-          const panGains = computeMonoPanGains(voice.pan);
-          const gL = gain * panGains.left;
-          const gR = gain * panGains.right;
+          const panL = voice.panL;
+          const panR = voice.panR;
 
-          for (let f = 0; f < frameCount; f++) {
-            if (pos >= srcFrames) {
-              if (loop) {
-                pos %= srcFrames;
-              } else {
-                voice.finished = true;
-                finishedIds.push(voice.id);
-                break;
+          if (!isResampling && rampRem === 0 && pos === Math.floor(pos)) {
+            // Fast 1:1 steady-gain mono path (no per-sample floor/frac/ramp checks).
+            const gL = curGain * panL;
+            const gR = curGain * panR;
+            let f = 0;
+            let idx = pos;
+            while (f < frameCount) {
+              if (idx >= srcFrames) {
+                if (loop) {
+                  idx %= srcFrames;
+                } else {
+                  voice.finished = true;
+                  finishedIds.push(voice.id);
+                  break;
+                }
               }
-            }
-
-            const i0 = Math.floor(pos);
-            const frac = pos - i0;
-            let sample;
-            if (frac === 0) {
-              sample = src[i0];
-            } else {
-              let i1 = i0 + 1;
-              if (i1 >= srcFrames) {
-                i1 = loop ? 0 : srcFrames - 1;
+              const avail = srcFrames - idx;
+              const rem = frameCount - f;
+              const chunk = rem < avail ? rem : avail;
+              const fEnd = f + chunk;
+              for (; f < fEnd; f++, idx++) {
+                let sample = src[idx];
+                if (!Number.isFinite(sample)) {
+                  sample = 0.0;
+                  sanitized += 1;
+                }
+                const outIdx = f * 2;
+                mix[outIdx] += sample * gL;
+                mix[outIdx + 1] += sample * gR;
               }
-              const s0 = src[i0];
-              const s1 = src[i1];
-              sample = s0 + (s1 - s0) * frac;
+              voiceRendered += chunk;
             }
-
-            if (!Number.isFinite(sample)) {
-              sample = 0.0;
-              sanitized += 1;
-            }
-
-            const outIdx = f * 2;
-            mix[outIdx] += sample * gL;
-            mix[outIdx + 1] += sample * gR;
-
-            voiceRendered += 1;
-            pos += step;
-          }
-
-          if (!voice.finished && !loop && pos >= srcFrames) {
-            voice.finished = true;
-            finishedIds.push(voice.id);
-          } else if (loop && pos >= srcFrames) {
-            pos %= srcFrames;
-          }
-          voice.position = pos;
-        } else if (voice.channels === 2) {
-          // Stereo input with W3C Web Audio StereoPannerNode equal-power panning.
-          const p = voice.pan;
-          let ll, lr, rl, rr;
-          if (p <= -1.0) {
-            ll = 1.0; lr = 1.0; rl = 0.0; rr = 0.0;
-          } else if (p >= 1.0) {
-            ll = 0.0; lr = 0.0; rl = 1.0; rr = 1.0;
-          } else if (p <= 0.0) {
-            const x = (p + 1.0) * (Math.PI * 0.5);
-            ll = 1.0;
-            lr = Math.cos(x);
-            rl = 0.0;
-            rr = Math.sin(x);
+            pos = idx;
           } else {
-            const x = p * (Math.PI * 0.5);
-            ll = Math.cos(x);
-            lr = 0.0;
-            rl = Math.sin(x);
-            rr = 1.0;
-          }
+            for (let f = 0; f < frameCount; f++) {
+              if (pos >= srcFrames) {
+                if (loop) {
+                  pos %= srcFrames;
+                } else {
+                  voice.finished = true;
+                  finishedIds.push(voice.id);
+                  break;
+                }
+              }
 
-          for (let f = 0; f < frameCount; f++) {
-            if (pos >= srcFrames) {
-              if (loop) {
-                pos %= srcFrames;
+              if (rampRem > 0) {
+                if (rampRem === 1) {
+                  curGain = targetGain;
+                  rampRem = 0;
+                } else {
+                  curGain += rampStep;
+                  rampRem -= 1;
+                }
+              }
+
+              const i0 = Math.floor(pos);
+              const frac = pos - i0;
+              let sample;
+              if (frac === 0) {
+                sample = src[i0];
               } else {
-                voice.finished = true;
-                finishedIds.push(voice.id);
-                break;
+                let i1 = i0 + 1;
+                if (i1 >= srcFrames) {
+                  i1 = loop ? 0 : srcFrames - 1;
+                }
+                const s0 = src[i0];
+                const s1 = src[i1];
+                sample = s0 + (s1 - s0) * frac;
               }
-            }
 
-            const i0 = Math.floor(pos);
-            const frac = pos - i0;
-            const base0 = i0 * 2;
-            let rawL;
-            let rawR;
-            if (frac === 0) {
-              rawL = src[base0];
-              rawR = src[base0 + 1];
-            } else {
-              let i1 = i0 + 1;
-              if (i1 >= srcFrames) {
-                i1 = loop ? 0 : srcFrames - 1;
+              if (!Number.isFinite(sample)) {
+                sample = 0.0;
+                sanitized += 1;
               }
-              const base1 = i1 * 2;
-              rawL = src[base0] + (src[base1] - src[base0]) * frac;
-              rawR = src[base0 + 1] + (src[base1 + 1] - src[base0 + 1]) * frac;
+
+              const scaled = sample * curGain;
+              const outIdx = f * 2;
+              mix[outIdx] += scaled * panL;
+              mix[outIdx + 1] += scaled * panR;
+
+              voiceRendered += 1;
+              pos += step;
             }
-
-            if (!Number.isFinite(rawL)) {
-              rawL = 0.0;
-              sanitized += 1;
-            }
-            if (!Number.isFinite(rawR)) {
-              rawR = 0.0;
-              sanitized += 1;
-            }
-
-            const sL = rawL * gain;
-            const sR = rawR * gain;
-
-            const outIdx = f * 2;
-            mix[outIdx] += sL * ll + sR * lr;
-            mix[outIdx + 1] += sL * rl + sR * rr;
-
-            voiceRendered += 1;
-            pos += step;
           }
 
           if (!voice.finished && !loop && pos >= srcFrames) {
@@ -1162,32 +1494,177 @@
             pos %= srcFrames;
           }
           voice.position = pos;
+          voice.currentGain = curGain;
+          voice.gainRampRemaining = rampRem;
+          if (rampRem === 0) {
+            voice.gainRampStep = 0.0;
+          }
+        } else if (voice.channels === 2) {
+          // Stereo input with cached W3C Web Audio StereoPannerNode equal-power pan matrix.
+          const ll = voice.panLL;
+          const lr = voice.panLR;
+          const rl = voice.panRL;
+          const rr = voice.panRR;
+
+          if (!isResampling && rampRem === 0 && pos === Math.floor(pos)) {
+            let f = 0;
+            let idx = pos;
+            if (voice.pan === 0.0) {
+              // Fast center-panned 1:1 stereo passthrough path.
+              while (f < frameCount) {
+                if (idx >= srcFrames) {
+                  if (loop) {
+                    idx %= srcFrames;
+                  } else {
+                    voice.finished = true;
+                    finishedIds.push(voice.id);
+                    break;
+                  }
+                }
+                const avail = srcFrames - idx;
+                const rem = frameCount - f;
+                const chunk = rem < avail ? rem : avail;
+                const fEnd = f + chunk;
+                for (; f < fEnd; f++, idx++) {
+                  const base0 = idx * 2;
+                  let rawL = src[base0];
+                  let rawR = src[base0 + 1];
+                  if (!Number.isFinite(rawL)) {
+                    rawL = 0.0;
+                    sanitized += 1;
+                  }
+                  if (!Number.isFinite(rawR)) {
+                    rawR = 0.0;
+                    sanitized += 1;
+                  }
+                  const outIdx = f * 2;
+                  mix[outIdx] += rawL * curGain;
+                  mix[outIdx + 1] += rawR * curGain;
+                }
+                voiceRendered += chunk;
+              }
+            } else {
+              const gLL = curGain * ll;
+              const gLR = curGain * lr;
+              const gRL = curGain * rl;
+              const gRR = curGain * rr;
+              while (f < frameCount) {
+                if (idx >= srcFrames) {
+                  if (loop) {
+                    idx %= srcFrames;
+                  } else {
+                    voice.finished = true;
+                    finishedIds.push(voice.id);
+                    break;
+                  }
+                }
+                const avail = srcFrames - idx;
+                const rem = frameCount - f;
+                const chunk = rem < avail ? rem : avail;
+                const fEnd = f + chunk;
+                for (; f < fEnd; f++, idx++) {
+                  const base0 = idx * 2;
+                  let rawL = src[base0];
+                  let rawR = src[base0 + 1];
+                  if (!Number.isFinite(rawL)) {
+                    rawL = 0.0;
+                    sanitized += 1;
+                  }
+                  if (!Number.isFinite(rawR)) {
+                    rawR = 0.0;
+                    sanitized += 1;
+                  }
+                  const outIdx = f * 2;
+                  mix[outIdx] += rawL * gLL + rawR * gLR;
+                  mix[outIdx + 1] += rawL * gRL + rawR * gRR;
+                }
+                voiceRendered += chunk;
+              }
+            }
+            pos = idx;
+          } else {
+            for (let f = 0; f < frameCount; f++) {
+              if (pos >= srcFrames) {
+                if (loop) {
+                  pos %= srcFrames;
+                } else {
+                  voice.finished = true;
+                  finishedIds.push(voice.id);
+                  break;
+                }
+              }
+
+              if (rampRem > 0) {
+                if (rampRem === 1) {
+                  curGain = targetGain;
+                  rampRem = 0;
+                } else {
+                  curGain += rampStep;
+                  rampRem -= 1;
+                }
+              }
+
+              const i0 = Math.floor(pos);
+              const frac = pos - i0;
+              const base0 = i0 * 2;
+              let rawL;
+              let rawR;
+              if (frac === 0) {
+                rawL = src[base0];
+                rawR = src[base0 + 1];
+              } else {
+                let i1 = i0 + 1;
+                if (i1 >= srcFrames) {
+                  i1 = loop ? 0 : srcFrames - 1;
+                }
+                const base1 = i1 * 2;
+                rawL = src[base0] + (src[base1] - src[base0]) * frac;
+                rawR = src[base0 + 1] + (src[base1 + 1] - src[base0 + 1]) * frac;
+              }
+
+              if (!Number.isFinite(rawL)) {
+                rawL = 0.0;
+                sanitized += 1;
+              }
+              if (!Number.isFinite(rawR)) {
+                rawR = 0.0;
+                sanitized += 1;
+              }
+
+              const sL = rawL * curGain;
+              const sR = rawR * curGain;
+
+              const outIdx = f * 2;
+              mix[outIdx] += sL * ll + sR * lr;
+              mix[outIdx + 1] += sL * rl + sR * rr;
+
+              voiceRendered += 1;
+              pos += step;
+            }
+          }
+
+          if (!voice.finished && !loop && pos >= srcFrames) {
+            voice.finished = true;
+            finishedIds.push(voice.id);
+          } else if (loop && pos >= srcFrames) {
+            pos %= srcFrames;
+          }
+          voice.position = pos;
+          voice.currentGain = curGain;
+          voice.gainRampRemaining = rampRem;
+          if (rampRem === 0) {
+            voice.gainRampStep = 0.0;
+          }
         } else {
           // Multi-channel surround (4ch quad, 6ch 5.1, 8ch 7.1) ITU-R BS.775 downmix to stereo.
           const chCount = voice.channels;
           const centerGain = voice.centerGain;
           const surroundGain = voice.surroundGain;
           const lfeGain = voice.lfeGain;
-
-          const p = voice.pan;
-          let ll, lr, rl, rr;
-          if (p <= -1.0) {
-            ll = 1.0; lr = 1.0; rl = 0.0; rr = 0.0;
-          } else if (p >= 1.0) {
-            ll = 0.0; lr = 0.0; rl = 1.0; rr = 1.0;
-          } else if (p <= 0.0) {
-            const x = (p + 1.0) * (Math.PI * 0.5);
-            ll = 1.0;
-            lr = Math.cos(x);
-            rl = 0.0;
-            rr = Math.sin(x);
-          } else {
-            const x = p * (Math.PI * 0.5);
-            ll = Math.cos(x);
-            lr = 0.0;
-            rl = Math.sin(x);
-            rr = 1.0;
-          }
+          const ll = voice.panLL;
+          const lr = voice.panLR;
+          const rl = voice.panRL;
+          const rr = voice.panRR;
 
           for (let f = 0; f < frameCount; f++) {
             if (pos >= srcFrames) {
@@ -1197,6 +1674,16 @@
                 voice.finished = true;
                 finishedIds.push(voice.id);
                 break;
+              }
+            }
+
+            if (rampRem > 0) {
+              if (rampRem === 1) {
+                curGain = targetGain;
+                rampRem = 0;
+              } else {
+                curGain += rampStep;
+                rampRem -= 1;
               }
             }
 
@@ -1274,8 +1761,8 @@
             if (!Number.isFinite(rawL)) { rawL = 0.0; sanitized += 1; }
             if (!Number.isFinite(rawR)) { rawR = 0.0; sanitized += 1; }
 
-            const sL = rawL * gain;
-            const sR = rawR * gain;
+            const sL = rawL * curGain;
+            const sR = rawR * curGain;
 
             const outIdx = f * 2;
             mix[outIdx] += sL * ll + sR * lr;
@@ -1293,6 +1780,11 @@
             pos %= srcFrames;
           }
           voice.position = pos;
+          voice.currentGain = curGain;
+          voice.gainRampRemaining = rampRem;
+          if (rampRem === 0) {
+            voice.gainRampStep = 0.0;
+          }
         }
 
         if (isResampling && voiceRendered > 0) {
@@ -1300,43 +1792,149 @@
         }
       }
 
-      // Automatically reap finished non-looping voices.
-      for (let i = 0; i < finishedIds.length; i++) {
-        this._voices.delete(finishedIds[i]);
+      // Automatically reap finished non-looping voices without allocating.
+      if (finishedIds.length > 0) {
+        for (let i = 0; i < finishedIds.length; i++) {
+          this._voices.delete(finishedIds[i]);
+        }
+        let writeIdx = 0;
+        for (let i = 0; i < voiceList.length; i++) {
+          const voice = voiceList[i];
+          if (!voice.finished) {
+            voiceList[writeIdx++] = voice;
+          }
+        }
+        voiceList.length = writeIdx;
+        finishedIds.length = 0;
       }
 
-      // Apply master gain, non-finite sanitizer, soft-clip/hard-clip limiter, and update metering stats.
-      const masterGain = this._masterGain;
+      // Apply master gain (with optional per-frame ramp), non-finite sanitizer,
+      // inlined smooth soft-clip/hard-clip limiter, and update metering stats.
       const softClip = this._softClip;
       const knee = this._limiterKnee;
+      const headroom = 1.0 - knee;
       let peak = this._peakOutputLevel;
       let clipped = 0;
 
-      for (let i = 0; i < sampleCount; i++) {
-        let raw = mix[i] * masterGain;
-        if (!Number.isFinite(raw)) {
-          raw = 0.0;
-          sanitized += 1;
+      if (this._masterGainRampRemaining > 0) {
+        let mg = this._masterGain;
+        const mgTarget = this._masterGainTarget;
+        let mgRem = this._masterGainRampRemaining;
+        const mgStep = this._masterGainRampStep;
+
+        for (let f = 0; f < frameCount; f++) {
+          if (mgRem > 0) {
+            if (mgRem === 1) {
+              mg = mgTarget;
+              mgRem = 0;
+            } else {
+              mg += mgStep;
+              mgRem -= 1;
+            }
+          }
+
+          const base = f * 2;
+          for (let c = 0; c < 2; c++) {
+            const i = base + c;
+            let raw = mix[i] * mg;
+            if (!Number.isFinite(raw)) {
+              raw = 0.0;
+              sanitized += 1;
+            }
+
+            let limited;
+            if (softClip) {
+              if (raw > knee) {
+                clipped += 1;
+                const compressed = knee + headroom * Math.tanh((raw - knee) / headroom);
+                limited = compressed > 1.0 ? 1.0 : compressed;
+              } else if (raw < -knee) {
+                clipped += 1;
+                const compressed = knee + headroom * Math.tanh((-raw - knee) / headroom);
+                limited = compressed > 1.0 ? -1.0 : -compressed;
+              } else {
+                limited = raw;
+              }
+            } else {
+              if (raw > 1.0) {
+                clipped += 1;
+                limited = 1.0;
+              } else if (raw < -1.0) {
+                clipped += 1;
+                limited = -1.0;
+              } else {
+                limited = raw;
+              }
+            }
+
+            const absVal = limited < 0 ? -limited : limited;
+            if (absVal > peak) {
+              peak = absVal;
+            }
+            output[i] = limited;
+          }
         }
 
-        let limited;
+        this._masterGain = mg;
+        this._masterGainRampRemaining = mgRem;
+        if (mgRem === 0) {
+          this._masterGainRampStep = 0.0;
+        }
+      } else {
+        const masterGain = this._masterGain;
         if (softClip) {
-          if (raw > knee || raw < -knee) {
-            clipped += 1;
-          }
-          limited = softClipSample(raw, knee);
-        } else {
-          if (raw > 1.0 || raw < -1.0) {
-            clipped += 1;
-          }
-          limited = clamp(raw, -1.0, 1.0);
-        }
+          for (let i = 0; i < sampleCount; i++) {
+            let raw = mix[i] * masterGain;
+            if (!Number.isFinite(raw)) {
+              raw = 0.0;
+              sanitized += 1;
+            }
 
-        const absVal = Math.abs(limited);
-        if (absVal > peak) {
-          peak = absVal;
+            let limited;
+            if (raw > knee) {
+              clipped += 1;
+              const compressed = knee + headroom * Math.tanh((raw - knee) / headroom);
+              limited = compressed > 1.0 ? 1.0 : compressed;
+            } else if (raw < -knee) {
+              clipped += 1;
+              const compressed = knee + headroom * Math.tanh((-raw - knee) / headroom);
+              limited = compressed > 1.0 ? -1.0 : -compressed;
+            } else {
+              limited = raw;
+            }
+
+            const absVal = limited < 0 ? -limited : limited;
+            if (absVal > peak) {
+              peak = absVal;
+            }
+            output[i] = limited;
+          }
+        } else {
+          for (let i = 0; i < sampleCount; i++) {
+            let raw = mix[i] * masterGain;
+            if (!Number.isFinite(raw)) {
+              raw = 0.0;
+              sanitized += 1;
+            }
+
+            let limited;
+            if (raw > 1.0) {
+              clipped += 1;
+              limited = 1.0;
+            } else if (raw < -1.0) {
+              clipped += 1;
+              limited = -1.0;
+            } else {
+              limited = raw;
+            }
+
+            const absVal = limited < 0 ? -limited : limited;
+            if (absVal > peak) {
+              peak = absVal;
+            }
+            output[i] = limited;
+          }
         }
-        output[i] = limited;
       }
 
       this._peakOutputLevel = peak;
@@ -1345,14 +1943,105 @@
       this._downmixedFrames += downmixed;
       this._resampledFrames += resampled;
       this._renderedFrames += frameCount;
+      this._quantaMixed += 1;
 
+      return frameCount;
+    }
+
+    /**
+     * Zero-allocation stereo mix pass directly into a caller-supplied
+     * interleaved stereo Float32Array (`targetBuffer.length >= frameCount * 2`).
+     *
+     * @param {Float32Array} targetBuffer Destination interleaved stereo buffer.
+     * @param {number} [frameCount] Number of stereo frames to mix (defaults to `Math.floor(targetBuffer.length / 2)`).
+     * @returns {number} Number of frames mixed.
+     */
+    mixInto(targetBuffer, frameCount) {
+      if (!(targetBuffer instanceof Float32Array)) {
+        throw new TypeError('targetBuffer must be a Float32Array');
+      }
+      const frames =
+        frameCount !== undefined ? frameCount : Math.floor(targetBuffer.length / 2);
+      if (!Number.isInteger(frames) || frames < 0) {
+        throw new RangeError(`frameCount must be a non-negative integer, got ${frames}`);
+      }
+      const sampleCount = frames * 2;
+      if (targetBuffer.length < sampleCount) {
+        throw new RangeError(
+          `targetBuffer length (${targetBuffer.length}) is smaller than required ${sampleCount} samples`
+        );
+      }
+      return this._mixIntoBuffer(targetBuffer, frames);
+    }
+
+    /**
+     * Alias for `mixInto(targetBuffer, frameCount)`.
+     *
+     * @param {Float32Array} targetBuffer
+     * @param {number} [frameCount]
+     * @returns {number}
+     */
+    renderFramesInto(targetBuffer, frameCount) {
+      return this.mixInto(targetBuffer, frameCount);
+    }
+
+    /**
+     * Renders `frameCount` interleaved stereo Float32 frames from all active voices,
+     * applying linear resampling, per-voice gain ramping, equal-power panning,
+     * master gain, and soft-clip Math.tanh limiting. Finished non-looping voices
+     * are automatically reaped.
+     *
+     * Pass an optional pre-allocated `targetBuffer` (or construct with
+     * `{ reuseOutputBuffer: true }`) for zero per-quantum output allocations.
+     *
+     * @param {number} frameCount
+     * @param {Float32Array} [targetBuffer] Optional caller-owned destination buffer.
+     * @returns {Float32Array} Interleaved stereo Float32Array of length frameCount * 2.
+     */
+    renderFrames(frameCount, targetBuffer) {
+      if (!Number.isInteger(frameCount) || frameCount < 0) {
+        throw new RangeError(`frameCount must be a non-negative integer, got ${frameCount}`);
+      }
+
+      const sampleCount = frameCount * 2;
+      if (targetBuffer !== undefined) {
+        if (!(targetBuffer instanceof Float32Array)) {
+          throw new TypeError('targetBuffer must be a Float32Array');
+        }
+        if (targetBuffer.length < sampleCount) {
+          throw new RangeError(
+            `targetBuffer length (${targetBuffer.length}) is smaller than required ${sampleCount} samples`
+          );
+        }
+        if (frameCount > 0) {
+          this._mixIntoBuffer(targetBuffer, frameCount);
+        }
+        return targetBuffer.length === sampleCount
+          ? targetBuffer
+          : targetBuffer.subarray(0, sampleCount);
+      }
+
+      if (this._reuseOutputBuffer) {
+        const outView = this._getScratchOutputView(sampleCount);
+        if (frameCount > 0) {
+          this._mixIntoBuffer(outView, frameCount);
+        }
+        return outView;
+      }
+
+      const output = new Float32Array(sampleCount);
+      if (frameCount === 0) {
+        return output;
+      }
+      this._mixIntoBuffer(output, frameCount);
       return output;
     }
 
     /**
-     * Renders frames and writes them into an AudioRingBuffer (from audio_worker.js
-     * or any compatible ring exposing pushSamples()/write()), respecting available
-     * free ring space so it never overflows.
+     * Renders frames using pre-allocated Float32Array scratch buffers (zero
+     * per-quantum allocations) and writes them into an AudioRingBuffer (from
+     * audio_worker.js or any compatible ring exposing pushSamples()/write()),
+     * respecting available free ring space so it never overflows.
      *
      * @param {object} audioRingBuffer AudioRingBuffer instance.
      * @param {number} [maxFrames] Optional upper bound on frames to render and push.
@@ -1372,19 +2061,18 @@
               Number.isFinite(audioRingBuffer.underruns) &&
               audioRingBuffer.underruns >= 0
             ? Math.floor(audioRingBuffer.underruns)
-            : null;
+            : typeof audioRingBuffer.underrunQuanta === 'number' &&
+                Number.isFinite(audioRingBuffer.underrunQuanta) &&
+                audioRingBuffer.underrunQuanta >= 0
+              ? Math.floor(audioRingBuffer.underrunQuanta)
+              : null;
       if (ringUnderruns !== null) {
-        this._underrunCount = ringUnderruns;
+        this._ringUnderrunCount = ringUnderruns;
       }
 
-      const writer =
-        typeof audioRingBuffer.pushSamples === 'function'
-          ? (buf) => audioRingBuffer.pushSamples(buf)
-          : typeof audioRingBuffer.write === 'function'
-            ? (buf) => audioRingBuffer.write(buf)
-            : null;
-
-      if (!writer) {
+      const hasPushSamples = typeof audioRingBuffer.pushSamples === 'function';
+      const hasWrite = !hasPushSamples && typeof audioRingBuffer.write === 'function';
+      if (!hasPushSamples && !hasWrite) {
         throw new TypeError('audioRingBuffer must implement pushSamples() or write()');
       }
 
@@ -1416,48 +2104,71 @@
         return 0;
       }
 
-      const rendered = this.renderFrames(framesToRender);
       const ringChannels =
         Number.isInteger(audioRingBuffer.channels) && audioRingBuffer.channels > 0
           ? audioRingBuffer.channels
           : DEFAULT_CHANNELS;
 
+      if (ringChannels !== 1 && ringChannels !== 2) {
+        throw new RangeError(`Unsupported audioRingBuffer channel count: ${ringChannels}`);
+      }
+
+      const outView = this._getScratchOutputView(framesToRender * 2);
+      this._mixIntoBuffer(outView, framesToRender);
+
       if (ringChannels === 2) {
-        return writer(rendered);
+        return hasPushSamples
+          ? audioRingBuffer.pushSamples(outView)
+          : audioRingBuffer.write(outView);
       }
 
-      if (ringChannels === 1) {
-        const mono = new Float32Array(framesToRender);
-        for (let f = 0; f < framesToRender; f++) {
-          mono[f] = (rendered[f * 2] + rendered[f * 2 + 1]) * 0.5;
-        }
-        return writer(mono);
+      const monoView = this._getMonoScratchView(framesToRender);
+      for (let f = 0; f < framesToRender; f++) {
+        const base = f * 2;
+        monoView[f] = (outView[base] + outView[base + 1]) * 0.5;
       }
-
-      throw new RangeError(`Unsupported audioRingBuffer channel count: ${ringChannels}`);
+      return hasPushSamples
+        ? audioRingBuffer.pushSamples(monoView)
+        : audioRingBuffer.write(monoView);
     }
 
     /**
-     * Resets mixer voices (unless `{ clearVoices: false }`) and zeroes all mix telemetry counters.
+     * Resets mixer voices (unless `{ clearVoices: false }`) and zeroes all mix
+     * telemetry counters while retaining pre-allocated scratch buffers.
      *
      * @param {object} [options]
      * @param {boolean} [options.clearVoices=true] When true, clears all registered voices.
      */
     reset(options = {}) {
-      const clearVoices = options && options.clearVoices !== undefined ? Boolean(options.clearVoices) : true;
+      const clearVoices =
+        options && options.clearVoices !== undefined ? Boolean(options.clearVoices) : true;
       if (clearVoices) {
         this._voices.clear();
+        this._voiceList.length = 0;
       }
+      this._finishedIds.length = 0;
       if (this._mixScratch.length > 0) {
         this._mixScratch.fill(0.0);
       }
+      if (this._outputScratch.length > 0) {
+        this._outputScratch.fill(0.0);
+      }
+      if (this._monoScratch.length > 0) {
+        this._monoScratch.fill(0.0);
+      }
+      this._masterGain = this._masterGainTarget;
+      this._masterGainRampRemaining = 0;
+      this._masterGainRampStep = 0.0;
       this._renderedFrames = 0;
+      this._quantaMixed = 0;
       this._downmixedFrames = 0;
       this._resampledFrames = 0;
-      this._underrunCount = 0;
+      this._ringUnderrunCount = 0;
+      this._manualUnderrunQuanta = 0;
       this._peakOutputLevel = 0.0;
       this._clippedSamples = 0;
       this._sanitizedNonFiniteSamples = 0;
+      this._scratchReallocations = 0;
       this._activeVoicePeak = clearVoices ? 0 : this._countActiveVoices();
     }
 
@@ -1468,7 +2179,9 @@
       let activeVoices = 0;
       let playingVoices = 0;
       let pausedVoices = 0;
-      for (const voice of this._voices.values()) {
+      const list = this._voiceList;
+      for (let i = 0; i < list.length; i++) {
+        const voice = list[i];
         if (!voice.stopped && !voice.finished) {
           activeVoices += 1;
           if (voice.paused) {
@@ -1478,6 +2191,8 @@
           }
         }
       }
+
+      const totalUnderruns = this._ringUnderrunCount + this._manualUnderrunQuanta;
 
       return {
         activeVoices,
@@ -1490,16 +2205,23 @@
         masterGain: this._masterGain,
         softClip: this._softClip,
         limiterKnee: this._limiterKnee,
+        gainRampFrames: this._defaultGainRampFrames,
+        framesMixed: this._renderedFrames,
         renderedFrames: this._renderedFrames,
+        quantaMixed: this._quantaMixed,
         downmixedFrames: this._downmixedFrames,
         resampledFrames: this._resampledFrames,
-        underrunCount: this._underrunCount,
+        underrunQuanta: totalUnderruns,
+        underrunCount: totalUnderruns,
         peakLevel: this._peakOutputLevel,
         peakOutputLevel: this._peakOutputLevel,
         clippedSamples: this._clippedSamples,
         sanitizedNonFiniteSamples: this._sanitizedNonFiniteSamples,
         nanSanitizedSamples: this._sanitizedNonFiniteSamples,
+        peakVoices: this._activeVoicePeak,
         activeVoicePeak: this._activeVoicePeak,
+        scratchCapacityFrames: this._mixScratch.length >>> 1,
+        scratchReallocations: this._scratchReallocations,
       };
     }
   }
@@ -1518,6 +2240,9 @@
     DEFAULT_MAX_RESAMPLE_FRAMES,
     DEFAULT_CHANNELS,
     DEFAULT_MAX_VOICES,
+    DEFAULT_QUANTUM_FRAMES,
+    DEFAULT_INITIAL_BUFFER_FRAMES,
+    DEFAULT_GAIN_RAMP_FRAMES,
     DEFAULT_SOFT_CLIP_KNEE,
     ITU_BS775_CENTER_GAIN,
     ITU_BS775_SURROUND_GAIN,
