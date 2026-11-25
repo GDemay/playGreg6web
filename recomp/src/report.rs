@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
+use playgta6_recomp::pipeline::ShardRecord;
 use playgta6_recomp::summary::{
     CoverageSummary, RankedCount, format_top_n, percentage_2dp, rank_top_n, sanitize_label,
 };
@@ -721,10 +722,500 @@ pub fn json_str(input: &str) -> String {
     out
 }
 
-/// Sanitizes a report source label (stripping host directory prefixes and control characters).
+/// Sanitizes a report source label (stripping Windows/Unix host directory prefixes,
+/// bare directory trails, relative traversal segments, and control characters).
 #[allow(dead_code)]
 pub fn sanitize_source_label(raw: &str) -> String {
-    sanitize_label(raw)
+    let trimmed = raw.trim();
+    if trimmed.ends_with('/') || trimmed.ends_with('\\') {
+        return "<unknown>".to_string();
+    }
+    let cleaned = sanitize_label(trimmed);
+    if cleaned == "." || cleaned == ".." {
+        return "<unknown>".to_string();
+    }
+    cleaned
+}
+
+/// Returns `true` if `text` appears to contain a leaked Windows or Unix host filesystem path
+/// (drive letters like `C:\` or `C:/`, UNC/extended paths like `\\server\share` or `\\?\`,
+/// `file://` URIs, or common Unix root directories like `/home/` or `/Users/`).
+#[allow(dead_code)]
+pub fn contains_host_path(text: &str) -> bool {
+    let bytes = text.as_bytes();
+
+    // 1. file:// URI scheme (case-insensitive)
+    if text.to_ascii_lowercase().contains("file://") {
+        return true;
+    }
+
+    // 2. Windows drive-letter paths: `C:\`, `C:/`, and JSON-escaped `C:\\`, `C:\/`
+    for i in 0..bytes.len().saturating_sub(2) {
+        if bytes[i].is_ascii_alphabetic()
+            && bytes[i + 1] == b':'
+            && matches!(bytes[i + 2], b'\\' | b'/')
+        {
+            let preceded_by_ident = i > 0 && bytes[i - 1].is_ascii_alphanumeric();
+            if !preceded_by_ident {
+                return true;
+            }
+        }
+    }
+
+    // 3. Windows UNC / extended-length paths (`\\?\`, `\\.\`, JSON-escaped `\\\\`,
+    //    or raw `\\host\share`).
+    if text.contains(r"\\?\") || text.contains(r"\\.\") || text.contains(r"\\\\") {
+        return true;
+    }
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        if bytes[i] == b'\\' && bytes[i + 1] == b'\\' && bytes[i + 2].is_ascii_alphanumeric() {
+            let preceded_by_bs = i > 0 && bytes[i - 1] == b'\\';
+            if !preceded_by_bs {
+                let mut j = i + 2;
+                while j < bytes.len()
+                    && (bytes[j].is_ascii_alphanumeric() || matches!(bytes[j], b'.' | b'-' | b'_'))
+                {
+                    j += 1;
+                }
+                if j > i + 2 && j < bytes.len() && bytes[j] == b'\\' {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    // 4. Common Unix/macOS host root prefixes
+    const UNIX_ROOTS: &[&str] = &[
+        "/Users/",
+        "/home/",
+        "/root/",
+        "/tmp/",
+        "/var/",
+        "/opt/",
+        "/etc/",
+        "/mnt/",
+        "/Volumes/",
+        "/private/",
+    ];
+    for root in UNIX_ROOTS {
+        let mut search_from = 0;
+        while let Some(rel_idx) = text[search_from..].find(root) {
+            let idx = search_from + rel_idx;
+            let boundary_ok = idx == 0
+                || matches!(
+                    bytes[idx - 1],
+                    b' ' | b'\t'
+                        | b'\n'
+                        | b'\r'
+                        | b'"'
+                        | b'\''
+                        | b'`'
+                        | b'('
+                        | b'['
+                        | b'='
+                        | b','
+                        | b':'
+                );
+            if boundary_ok {
+                return true;
+            }
+            search_from = idx + root.len();
+        }
+    }
+
+    false
+}
+
+/// Default maximum skew ratio (`max / mean`) at or below which a Wasm64 shard layout is
+/// considered balanced for parallel compilation and fast-boot streaming.
+#[allow(dead_code)]
+pub const DEFAULT_MAX_SKEW_RATIO: f64 = 1.50;
+
+/// Sanitized per-shard measurement for Wasm64 fast-boot and parallel-compile diagnostics.
+///
+/// Holds a sanitized shard label (never a host directory path), function count, and byte size.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardEntry {
+    pub name: String,
+    pub functions: usize,
+    pub bytes: u64,
+}
+
+#[allow(dead_code)]
+impl ShardEntry {
+    /// Creates a sanitized shard measurement, stripping any host directory prefixes from `name`.
+    pub fn new(name: &str, functions: usize, bytes: u64) -> Self {
+        Self {
+            name: sanitize_source_label(name),
+            functions,
+            bytes,
+        }
+    }
+}
+
+/// Pure, deterministic Wasm64 shard skew & fast-boot balance metrics.
+///
+/// Computes function-count and byte-size balance ratios (`max / mean`) with exact 2dp rounding
+/// and zero-division guards for empty or zero-function shard sets.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShardBalanceSummary {
+    pub shard_count: usize,
+    pub total_functions: usize,
+    pub min_shard_functions: usize,
+    pub max_shard_functions: usize,
+    pub mean_shard_functions: f64,
+    pub skew_ratio: f64,
+    pub total_bytes: u64,
+    pub min_shard_bytes: u64,
+    pub max_shard_bytes: u64,
+    pub mean_shard_bytes: f64,
+    pub byte_skew_ratio: f64,
+    pub max_skew_threshold: f64,
+    pub balanced: bool,
+    pub shards: Vec<ShardEntry>,
+}
+
+#[allow(dead_code)]
+impl ShardBalanceSummary {
+    /// Computes shard balance metrics from raw per-shard function counts using
+    /// [`DEFAULT_MAX_SKEW_RATIO`].
+    pub fn from_function_counts(counts: &[usize]) -> Self {
+        Self::from_function_counts_with_threshold(counts, DEFAULT_MAX_SKEW_RATIO)
+    }
+
+    /// Computes shard balance metrics from raw per-shard function counts using a custom maximum
+    /// acceptable skew threshold (finite values `< 1.0` are clamped to `1.0`; non-finite values
+    /// fall back to [`DEFAULT_MAX_SKEW_RATIO`]).
+    pub fn from_function_counts_with_threshold(counts: &[usize], max_skew_threshold: f64) -> Self {
+        let width = counts
+            .len()
+            .saturating_sub(1)
+            .to_string()
+            .len()
+            .max(5);
+        let entries = counts.iter().enumerate().map(|(idx, &functions)| {
+            ShardEntry::new(&format!("shard-{idx:0width$}"), functions, 0)
+        });
+        Self::from_shards_with_threshold(entries, max_skew_threshold)
+    }
+
+    /// Computes shard balance metrics from sanitized [`ShardEntry`] items using
+    /// [`DEFAULT_MAX_SKEW_RATIO`].
+    pub fn from_shards<I>(entries: I) -> Self
+    where
+        I: IntoIterator<Item = ShardEntry>,
+    {
+        Self::from_shards_with_threshold(entries, DEFAULT_MAX_SKEW_RATIO)
+    }
+
+    /// Computes shard balance metrics from [`ShardEntry`] items using a custom maximum acceptable
+    /// skew threshold (finite values `< 1.0` are clamped to `1.0`; non-finite values fall back to
+    /// [`DEFAULT_MAX_SKEW_RATIO`]).
+    ///
+    /// All shard names are re-sanitized and deterministically sorted regardless of input order.
+    pub fn from_shards_with_threshold<I>(entries: I, max_skew_threshold: f64) -> Self
+    where
+        I: IntoIterator<Item = ShardEntry>,
+    {
+        let threshold = if max_skew_threshold.is_finite() {
+            (max_skew_threshold.max(1.0) * 100.0).round() / 100.0
+        } else {
+            DEFAULT_MAX_SKEW_RATIO
+        };
+
+        let mut shards: Vec<ShardEntry> = entries
+            .into_iter()
+            .map(|entry| ShardEntry::new(&entry.name, entry.functions, entry.bytes))
+            .collect();
+        shards.sort_by(|a, b| {
+            a.name
+                .to_ascii_lowercase()
+                .cmp(&b.name.to_ascii_lowercase())
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.functions.cmp(&b.functions))
+                .then_with(|| a.bytes.cmp(&b.bytes))
+        });
+
+        let shard_count = shards.len();
+        if shard_count == 0 {
+            return Self {
+                shard_count: 0,
+                total_functions: 0,
+                min_shard_functions: 0,
+                max_shard_functions: 0,
+                mean_shard_functions: 0.0,
+                skew_ratio: 0.0,
+                total_bytes: 0,
+                min_shard_bytes: 0,
+                max_shard_bytes: 0,
+                mean_shard_bytes: 0.0,
+                byte_skew_ratio: 0.0,
+                max_skew_threshold: threshold,
+                balanced: true,
+                shards,
+            };
+        }
+
+        let mut min_shard_functions = usize::MAX;
+        let mut max_shard_functions = 0usize;
+        let mut total_fn_u128 = 0u128;
+
+        let mut min_shard_bytes = u64::MAX;
+        let mut max_shard_bytes = 0u64;
+        let mut total_bytes_u128 = 0u128;
+
+        for shard in &shards {
+            min_shard_functions = min_shard_functions.min(shard.functions);
+            max_shard_functions = max_shard_functions.max(shard.functions);
+            total_fn_u128 = total_fn_u128.saturating_add(shard.functions as u128);
+
+            min_shard_bytes = min_shard_bytes.min(shard.bytes);
+            max_shard_bytes = max_shard_bytes.max(shard.bytes);
+            total_bytes_u128 = total_bytes_u128.saturating_add(shard.bytes as u128);
+        }
+
+        let count_u128 = shard_count as u128;
+        let total_functions = usize::try_from(total_fn_u128).unwrap_or(usize::MAX);
+        let mean_shard_functions = ratio_2dp_u128(total_fn_u128, count_u128);
+        let skew_ratio = if total_fn_u128 == 0 {
+            0.0
+        } else {
+            ratio_2dp_product(max_shard_functions as u128, count_u128, total_fn_u128)
+        };
+
+        let total_bytes = u64::try_from(total_bytes_u128).unwrap_or(u64::MAX);
+        let mean_shard_bytes = ratio_2dp_u128(total_bytes_u128, count_u128);
+        let byte_skew_ratio = if total_bytes_u128 == 0 {
+            0.0
+        } else {
+            ratio_2dp_product(max_shard_bytes as u128, count_u128, total_bytes_u128)
+        };
+
+        let balanced = skew_ratio <= threshold && byte_skew_ratio <= threshold;
+
+        Self {
+            shard_count,
+            total_functions,
+            min_shard_functions,
+            max_shard_functions,
+            mean_shard_functions,
+            skew_ratio,
+            total_bytes,
+            min_shard_bytes,
+            max_shard_bytes,
+            mean_shard_bytes,
+            byte_skew_ratio,
+            max_skew_threshold: threshold,
+            balanced,
+            shards,
+        }
+    }
+
+    /// Computes shard skew & fast-boot balance metrics directly from pipeline [`ShardRecord`]s.
+    ///
+    /// Uses each shard's compiled object byte size when present, otherwise its LLVM IR byte size.
+    pub fn from_shard_records(records: &[ShardRecord]) -> Self {
+        Self::from_shard_records_with_threshold(records, DEFAULT_MAX_SKEW_RATIO)
+    }
+
+    /// Computes shard skew & fast-boot balance metrics from pipeline [`ShardRecord`]s using a
+    /// custom maximum acceptable skew threshold.
+    pub fn from_shard_records_with_threshold(
+        records: &[ShardRecord],
+        max_skew_threshold: f64,
+    ) -> Self {
+        let entries = records.iter().map(|rec| {
+            let file = rec.obj.as_ref().unwrap_or(&rec.ll);
+            ShardEntry::new(&file.path, rec.functions, file.size)
+        });
+        Self::from_shards_with_threshold(entries, max_skew_threshold)
+    }
+
+    /// Formats a compact, deterministic one-line Wasm64 shard balance summary.
+    pub fn render_one_line(&self) -> String {
+        let status = if self.balanced { "balanced" } else { "skewed" };
+        if self.total_bytes > 0 {
+            format!(
+                "shards {} (total {} fns, min {}, max {}, mean {:.2}, skew {:.2}x | bytes {}, min {}, max {}, mean {:.2}, byte_skew {:.2}x, {})",
+                self.shard_count,
+                self.total_functions,
+                self.min_shard_functions,
+                self.max_shard_functions,
+                self.mean_shard_functions,
+                self.skew_ratio,
+                self.total_bytes,
+                self.min_shard_bytes,
+                self.max_shard_bytes,
+                self.mean_shard_bytes,
+                self.byte_skew_ratio,
+                status,
+            )
+        } else {
+            format!(
+                "shards {} (total {} fns, min {}, max {}, mean {:.2}, skew {:.2}x, {})",
+                self.shard_count,
+                self.total_functions,
+                self.min_shard_functions,
+                self.max_shard_functions,
+                self.mean_shard_functions,
+                self.skew_ratio,
+                status,
+            )
+        }
+    }
+
+    /// Renders a sanitized, deterministically ordered Markdown Wasm64 shard balance report.
+    pub fn render_markdown(&self) -> String {
+        let mut out = String::with_capacity(512);
+        let status = if self.balanced { "balanced" } else { "skewed" };
+        let _ = writeln!(out, "### Wasm64 Shard Balance");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "- {}", self.render_one_line());
+        let _ = writeln!(out);
+        let _ = writeln!(out, "| Metric | Value |");
+        let _ = writeln!(out, "| --- | ---: |");
+        let _ = writeln!(out, "| Shards | {} |", self.shard_count);
+        let _ = writeln!(out, "| Total Functions | {} |", self.total_functions);
+        let _ = writeln!(out, "| Min / Max Functions | {} / {} |", self.min_shard_functions, self.max_shard_functions);
+        let _ = writeln!(out, "| Mean Functions | {:.2} |", self.mean_shard_functions);
+        let _ = writeln!(out, "| Function Skew Ratio | {:.2}x |", self.skew_ratio);
+        let _ = writeln!(out, "| Total Bytes | {} |", self.total_bytes);
+        let _ = writeln!(out, "| Min / Max Bytes | {} / {} |", self.min_shard_bytes, self.max_shard_bytes);
+        let _ = writeln!(out, "| Mean Bytes | {:.2} |", self.mean_shard_bytes);
+        let _ = writeln!(out, "| Byte Skew Ratio | {:.2}x |", self.byte_skew_ratio);
+        let _ = writeln!(out, "| Max Skew Threshold | {:.2}x |", self.max_skew_threshold);
+        let _ = writeln!(out, "| Status | {status} |");
+
+        if !self.shards.is_empty() {
+            let _ = writeln!(out);
+            let _ = writeln!(out, "| Shard | Functions | Bytes |");
+            let _ = writeln!(out, "| --- | ---: | ---: |");
+            for shard in &self.shards {
+                let _ = writeln!(
+                    out,
+                    "| `{}` | {} | {} |",
+                    md_table_cell(&shard.name),
+                    shard.functions,
+                    shard.bytes
+                );
+            }
+        }
+        out
+    }
+
+    /// Renders a sanitized RFC 8259 JSON Wasm64 shard balance report with strictly sorted keys.
+    pub fn render_json(&self) -> String {
+        let mut out = String::with_capacity(512);
+        write_shard_balance_json(&mut out, self, 0, true);
+        out.push('\n');
+        out
+    }
+}
+
+#[allow(dead_code)]
+fn ratio_2dp_u128(numerator: u128, denominator: u128) -> f64 {
+    if denominator == 0 {
+        return 0.0;
+    }
+    if let Some(scaled) = numerator.checked_mul(200)
+        && let Some(num) = scaled.checked_add(denominator)
+        && let Some(den) = denominator.checked_mul(2)
+    {
+        return (num / den) as f64 / 100.0;
+    }
+    ((numerator as f64 / denominator as f64) * 100.0).round() / 100.0
+}
+
+#[allow(dead_code)]
+fn ratio_2dp_product(a: u128, b: u128, denominator: u128) -> f64 {
+    if denominator == 0 {
+        return 0.0;
+    }
+    if let Some(prod) = a.checked_mul(b) {
+        return ratio_2dp_u128(prod, denominator);
+    }
+    let ratio = (a as f64 / denominator as f64) * (b as f64);
+    (ratio * 100.0).round() / 100.0
+}
+
+#[allow(dead_code)]
+fn write_shard_balance_json(
+    out: &mut String,
+    summary: &ShardBalanceSummary,
+    base_indent: usize,
+    indent_opening: bool,
+) {
+    let i0 = " ".repeat(base_indent);
+    let i1 = " ".repeat(base_indent + 2);
+    let i2 = " ".repeat(base_indent + 4);
+
+    if indent_opening {
+        let _ = writeln!(out, "{i0}{{");
+    } else {
+        let _ = writeln!(out, "{{");
+    }
+    let _ = writeln!(out, "{i1}\"balanced\": {},", summary.balanced);
+    let _ = writeln!(
+        out,
+        "{i1}\"byte_skew_ratio\": {:.2},",
+        summary.byte_skew_ratio
+    );
+    let _ = writeln!(out, "{i1}\"max_shard_bytes\": {},", summary.max_shard_bytes);
+    let _ = writeln!(
+        out,
+        "{i1}\"max_shard_functions\": {},",
+        summary.max_shard_functions
+    );
+    let _ = writeln!(
+        out,
+        "{i1}\"max_skew_threshold\": {:.2},",
+        summary.max_skew_threshold
+    );
+    let _ = writeln!(
+        out,
+        "{i1}\"mean_shard_bytes\": {:.2},",
+        summary.mean_shard_bytes
+    );
+    let _ = writeln!(
+        out,
+        "{i1}\"mean_shard_functions\": {:.2},",
+        summary.mean_shard_functions
+    );
+    let _ = writeln!(out, "{i1}\"min_shard_bytes\": {},", summary.min_shard_bytes);
+    let _ = writeln!(
+        out,
+        "{i1}\"min_shard_functions\": {},",
+        summary.min_shard_functions
+    );
+    let _ = writeln!(out, "{i1}\"shard_count\": {},", summary.shard_count);
+    if summary.shards.is_empty() {
+        let _ = writeln!(out, "{i1}\"shards\": [],");
+    } else {
+        let _ = writeln!(out, "{i1}\"shards\": [");
+        for (idx, shard) in summary.shards.iter().enumerate() {
+            let comma = if idx + 1 < summary.shards.len() {
+                ","
+            } else {
+                ""
+            };
+            let _ = writeln!(
+                out,
+                "{i2}{{\"bytes\": {}, \"functions\": {}, \"name\": {}}}{comma}",
+                shard.bytes,
+                shard.functions,
+                json_str(&shard.name)
+            );
+        }
+        let _ = writeln!(out, "{i1}],");
+    }
+    let _ = writeln!(out, "{i1}\"skew_ratio\": {:.2},", summary.skew_ratio);
+    let _ = writeln!(out, "{i1}\"total_bytes\": {},", summary.total_bytes);
+    let _ = writeln!(out, "{i1}\"total_functions\": {}", summary.total_functions);
+    let _ = write!(out, "{i0}}}");
 }
 
 /// Percentage of discovered functions lifted (`0.00..=100.00`, zero-division safe).
@@ -755,16 +1246,18 @@ where
     format_top_n(entries, limit)
 }
 
-/// Sanitized instruction-coverage & unresolved-import breakdown for CLI/program reports.
+/// Sanitized instruction-coverage, unresolved-import, and optional Wasm64 shard-balance breakdown
+/// for CLI/program reports.
 ///
 /// Holds counts, percentages, and sanitized labels only — never host paths or raw binary bytes.
 #[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CoverageReport {
     pub source: String,
     pub summary: CoverageSummary,
     pub unresolved_by_dll: Vec<RankedCount>,
     pub unsupported_mnemonics: Vec<RankedCount>,
+    pub shard_balance: Option<ShardBalanceSummary>,
 }
 
 #[allow(dead_code)]
@@ -776,6 +1269,7 @@ impl CoverageReport {
             summary,
             unresolved_by_dll: Vec::new(),
             unsupported_mnemonics: Vec::new(),
+            shard_balance: None,
         }
     }
 
@@ -785,7 +1279,10 @@ impl CoverageReport {
         I: IntoIterator<Item = (S, usize)>,
         S: AsRef<str>,
     {
-        self.unresolved_by_dll = rank_top_n(entries, usize::MAX);
+        let sanitized = entries
+            .into_iter()
+            .map(|(label, count)| (sanitize_source_label(label.as_ref()), count));
+        self.unresolved_by_dll = rank_top_n(sanitized, usize::MAX);
         self
     }
 
@@ -795,7 +1292,16 @@ impl CoverageReport {
         I: IntoIterator<Item = (S, usize)>,
         S: AsRef<str>,
     {
-        self.unsupported_mnemonics = rank_top_n(entries, usize::MAX);
+        let sanitized = entries
+            .into_iter()
+            .map(|(label, count)| (sanitize_source_label(label.as_ref()), count));
+        self.unsupported_mnemonics = rank_top_n(sanitized, usize::MAX);
+        self
+    }
+
+    /// Attaches Wasm64 shard skew & fast-boot balance metrics to this coverage report.
+    pub fn with_shard_balance(mut self, balance: ShardBalanceSummary) -> Self {
+        self.shard_balance = Some(balance);
         self
     }
 
@@ -809,20 +1315,20 @@ impl CoverageReport {
     ) -> Self {
         let mut bound_lookup: BTreeMap<String, usize> = BTreeMap::new();
         for (dll, &count) in bound_by_dll {
-            let key = sanitize_label(dll).to_ascii_lowercase();
+            let key = sanitize_source_label(dll).to_ascii_lowercase();
             let slot = bound_lookup.entry(key).or_insert(0);
             *slot = slot.saturating_add(count);
         }
 
         let mut totals_by_dll: BTreeMap<String, (String, usize)> = BTreeMap::new();
         for module in &pe.imports {
-            let clean = sanitize_label(&module.dll_name);
+            let clean = sanitize_source_label(&module.dll_name);
             let key = clean.to_ascii_lowercase();
             let entry = totals_by_dll.entry(key).or_insert((clean, 0));
             entry.1 = entry.1.saturating_add(module.symbols.len());
         }
         for module in &pe.delay_imports {
-            let clean = sanitize_label(&module.dll_name);
+            let clean = sanitize_source_label(&module.dll_name);
             let key = clean.to_ascii_lowercase();
             let entry = totals_by_dll.entry(key).or_insert((clean, 0));
             entry.1 = entry.1.saturating_add(module.symbols.len());
@@ -865,8 +1371,8 @@ impl CoverageReport {
         format!("[{}] {}", self.source, self.summary.format_one_line())
     }
 
-    /// Formats a crisp one-line progress ratio plus deterministic top-N unresolved-import and
-    /// unsupported-mnemonic breakdowns.
+    /// Formats a crisp one-line progress ratio plus deterministic top-N unresolved-import,
+    /// unsupported-mnemonic, and optional Wasm64 shard-balance breakdowns.
     pub fn render_breakdown_line(&self, top_n: usize) -> String {
         let mut out = self.render_one_line();
         if !self.unresolved_by_dll.is_empty() {
@@ -887,10 +1393,14 @@ impl CoverageReport {
             );
             let _ = write!(out, " | top unsupported: {top}");
         }
+        if let Some(ref balance) = self.shard_balance {
+            let _ = write!(out, " | {}", balance.render_one_line());
+        }
         out
     }
 
-    /// Renders a sanitized Markdown coverage summary with deterministic top-N breakdown tables.
+    /// Renders a sanitized Markdown coverage summary with deterministic top-N breakdown tables
+    /// and optional Wasm64 shard-balance diagnostics.
     pub fn render_coverage_markdown(&self, top_n: usize) -> String {
         let mut out = String::with_capacity(512);
         let _ = writeln!(out, "## Coverage Summary — `{}`", md_inline(&self.source));
@@ -944,38 +1454,28 @@ impl CoverageReport {
             "- Top Unsupported Mnemonics (top {top_n}): {}",
             md_inline(&top_unsupported)
         );
+        if let Some(ref balance) = self.shard_balance {
+            let _ = writeln!(out);
+            out.push_str(&balance.render_markdown());
+        }
         out
     }
 
-    /// Renders a sanitized RFC 8259 JSON coverage summary with deterministic top-N breakdowns.
+    /// Renders a sanitized RFC 8259 JSON coverage summary with strictly sorted top-level keys
+    /// and deterministic top-N breakdowns.
     pub fn render_coverage_json(&self, top_n: usize) -> String {
         let mut out = String::with_capacity(512);
         let _ = writeln!(out, "{{");
-        let _ = writeln!(out, "  \"source\": {},", json_str(&self.source));
         let _ = writeln!(
             out,
-            "  \"summary_line\": {},",
-            json_str(&self.render_breakdown_line(top_n))
+            "  \"bound_import_pct\": {:.2},",
+            self.bound_import_pct()
         );
+        let _ = writeln!(out, "  \"bound_imports\": {},", self.summary.bound_imports);
         let _ = writeln!(
             out,
-            "  \"total_functions\": {},",
-            self.summary.total_functions
-        );
-        let _ = writeln!(
-            out,
-            "  \"lifted_functions\": {},",
-            self.summary.lifted_functions
-        );
-        let _ = writeln!(
-            out,
-            "  \"lifted_function_pct\": {:.2},",
-            self.lifted_function_pct()
-        );
-        let _ = writeln!(
-            out,
-            "  \"total_instructions\": {},",
-            self.summary.total_instructions
+            "  \"decoded_instruction_pct\": {:.2},",
+            self.decoded_instruction_pct()
         );
         let _ = writeln!(
             out,
@@ -984,28 +1484,54 @@ impl CoverageReport {
         );
         let _ = writeln!(
             out,
-            "  \"decoded_instruction_pct\": {:.2},",
-            self.decoded_instruction_pct()
-        );
-        let _ = writeln!(out, "  \"total_imports\": {},", self.summary.total_imports);
-        let _ = writeln!(out, "  \"bound_imports\": {},", self.summary.bound_imports);
-        let _ = writeln!(
-            out,
-            "  \"unresolved_imports\": {},",
-            self.summary.unresolved_imports()
+            "  \"lifted_function_pct\": {:.2},",
+            self.lifted_function_pct()
         );
         let _ = writeln!(
             out,
-            "  \"bound_import_pct\": {:.2},",
-            self.bound_import_pct()
+            "  \"lifted_functions\": {},",
+            self.summary.lifted_functions
         );
-        write_ranked_json(&mut out, "top_unresolved_imports", &self.unresolved_by_dll, top_n, true);
+        if let Some(ref balance) = self.shard_balance {
+            let _ = write!(out, "  \"shard_balance\": ");
+            write_shard_balance_json(&mut out, balance, 2, false);
+            let _ = writeln!(out, ",");
+        }
+        let _ = writeln!(out, "  \"source\": {},", json_str(&self.source));
+        let _ = writeln!(
+            out,
+            "  \"summary_line\": {},",
+            json_str(&self.render_breakdown_line(top_n))
+        );
+        write_ranked_json(
+            &mut out,
+            "top_unresolved_imports",
+            &self.unresolved_by_dll,
+            top_n,
+            true,
+        );
         write_ranked_json(
             &mut out,
             "top_unsupported_mnemonics",
             &self.unsupported_mnemonics,
             top_n,
-            false,
+            true,
+        );
+        let _ = writeln!(
+            out,
+            "  \"total_functions\": {},",
+            self.summary.total_functions
+        );
+        let _ = writeln!(out, "  \"total_imports\": {},", self.summary.total_imports);
+        let _ = writeln!(
+            out,
+            "  \"total_instructions\": {},",
+            self.summary.total_instructions
+        );
+        let _ = writeln!(
+            out,
+            "  \"unresolved_imports\": {}",
+            self.summary.unresolved_imports()
         );
         let _ = writeln!(out, "}}");
         out
@@ -1415,5 +1941,409 @@ mod tests {
         JsonValidator::validate(&json_zero).expect("zero top-N JSON must be valid");
         assert!(json_zero.contains("\"top_unresolved_imports\": []"));
         assert!(json_zero.contains("\"top_unsupported_mnemonics\": []"));
+    }
+
+    /// Extracts top-level JSON object keys in appearance order (for deterministic schema tests).
+    fn extract_top_level_json_keys(json: &str) -> Vec<String> {
+        let bytes = json.as_bytes();
+        let mut keys = Vec::new();
+        let mut depth = 0usize;
+        let mut i = 0usize;
+        let mut expect_key = false;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => {
+                    depth += 1;
+                    if depth == 1 {
+                        expect_key = true;
+                    }
+                    i += 1;
+                }
+                b'}' => {
+                    depth = depth.saturating_sub(1);
+                    expect_key = false;
+                    i += 1;
+                }
+                b',' if depth == 1 => {
+                    expect_key = true;
+                    i += 1;
+                }
+                b'"' => {
+                    let start = i + 1;
+                    i += 1;
+                    while i < bytes.len() {
+                        if bytes[i] == b'\\' {
+                            i += 2;
+                        } else if bytes[i] == b'"' {
+                            break;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    let text = &json[start..i];
+                    i += 1;
+                    if depth == 1 && expect_key {
+                        keys.push(text.to_string());
+                        expect_key = false;
+                    }
+                }
+                _ => {
+                    i += 1;
+                }
+            }
+        }
+        keys
+    }
+
+    #[test]
+    fn shard_balance_handles_empty_zero_and_single_shard_without_panicking() {
+        let empty = ShardBalanceSummary::from_function_counts(&[]);
+        assert_eq!(empty.shard_count, 0);
+        assert_eq!(empty.total_functions, 0);
+        assert_eq!(empty.min_shard_functions, 0);
+        assert_eq!(empty.max_shard_functions, 0);
+        assert_eq!(empty.mean_shard_functions, 0.0);
+        assert_eq!(empty.skew_ratio, 0.0);
+        assert_eq!(empty.byte_skew_ratio, 0.0);
+        assert!(empty.balanced);
+        let empty_json = empty.render_json();
+        JsonValidator::validate(&empty_json).expect("empty shard balance JSON must be valid");
+        assert!(empty_json.contains("\"shard_count\": 0"));
+        assert!(empty_json.contains("\"shards\": []"));
+
+        let zeros = ShardBalanceSummary::from_function_counts(&[0, 0, 0]);
+        assert_eq!(zeros.shard_count, 3);
+        assert_eq!(zeros.total_functions, 0);
+        assert_eq!(zeros.min_shard_functions, 0);
+        assert_eq!(zeros.max_shard_functions, 0);
+        assert_eq!(zeros.skew_ratio, 0.0);
+        assert!(zeros.balanced);
+        JsonValidator::validate(&zeros.render_json()).expect("all-zero shard JSON must be valid");
+
+        let single = ShardBalanceSummary::from_function_counts(&[42]);
+        assert_eq!(single.shard_count, 1);
+        assert_eq!(single.total_functions, 42);
+        assert_eq!(single.min_shard_functions, 42);
+        assert_eq!(single.max_shard_functions, 42);
+        assert_eq!(single.mean_shard_functions, 42.0);
+        assert_eq!(single.skew_ratio, 1.0);
+        assert!(single.balanced);
+
+        // Zero-min shard must never divide by zero.
+        let mixed_zero = ShardBalanceSummary::from_function_counts(&[100, 0]);
+        assert_eq!(mixed_zero.min_shard_functions, 0);
+        assert_eq!(mixed_zero.max_shard_functions, 100);
+        assert_eq!(mixed_zero.mean_shard_functions, 50.0);
+        assert_eq!(mixed_zero.skew_ratio, 2.0);
+        assert!(!mixed_zero.balanced);
+
+        // Non-finite and sub-1.0 thresholds are safely normalized.
+        let nan_thresh = ShardBalanceSummary::from_function_counts_with_threshold(&[10, 10], f64::NAN);
+        assert_eq!(nan_thresh.max_skew_threshold, DEFAULT_MAX_SKEW_RATIO);
+        assert!(nan_thresh.balanced);
+
+        let sub_one = ShardBalanceSummary::from_function_counts_with_threshold(&[10, 10], 0.25);
+        assert_eq!(sub_one.max_skew_threshold, 1.0);
+        assert!(sub_one.balanced);
+    }
+
+    #[test]
+    fn shard_balance_computes_function_and_byte_skew_and_pipeline_records() {
+        let balanced = ShardBalanceSummary::from_function_counts(&[2048, 2048, 1536]);
+        assert_eq!(balanced.shard_count, 3);
+        assert_eq!(balanced.total_functions, 5632);
+        assert_eq!(balanced.min_shard_functions, 1536);
+        assert_eq!(balanced.max_shard_functions, 2048);
+        assert_eq!(balanced.mean_shard_functions, 1877.33);
+        assert_eq!(balanced.skew_ratio, 1.09);
+        assert!(balanced.balanced);
+
+        let skewed = ShardBalanceSummary::from_function_counts(&[2048, 2048, 100, 100]);
+        assert_eq!(skewed.mean_shard_functions, 1074.0);
+        assert_eq!(skewed.skew_ratio, 1.91);
+        assert!(!skewed.balanced);
+
+        // Exact threshold boundary at 1.50x
+        let boundary_ok = ShardBalanceSummary::from_function_counts_with_threshold(&[30, 10], 1.50);
+        assert_eq!(boundary_ok.skew_ratio, 1.5);
+        assert!(boundary_ok.balanced);
+
+        let boundary_fail = ShardBalanceSummary::from_function_counts_with_threshold(&[30, 10], 1.49);
+        assert_eq!(boundary_fail.skew_ratio, 1.5);
+        assert!(!boundary_fail.balanced);
+
+        // Uniform function count with skewed byte sizes flips balanced to false.
+        let byte_skewed = ShardBalanceSummary::from_shards(vec![
+            ShardEntry::new("shard-00000.wasm", 100, 1_000_000),
+            ShardEntry::new("shard-00001.wasm", 100, 10_000),
+        ]);
+        assert_eq!(byte_skewed.skew_ratio, 1.0);
+        assert_eq!(byte_skewed.total_bytes, 1_010_000);
+        assert_eq!(byte_skewed.min_shard_bytes, 10_000);
+        assert_eq!(byte_skewed.max_shard_bytes, 1_000_000);
+        assert_eq!(byte_skewed.byte_skew_ratio, 1.98);
+        assert!(!byte_skewed.balanced);
+        assert!(byte_skewed.render_one_line().contains("byte_skew 1.98x, skewed"));
+
+        // Direct construction from pipeline ShardRecord prefers obj.size when present.
+        use playgta6_recomp::pipeline::OutputFile;
+        let records = vec![
+            ShardRecord {
+                index: 1,
+                first: 0x2000,
+                last: 0x2FFF,
+                functions: 120,
+                instructions: 3000,
+                unsupported: BTreeMap::new(),
+                ll: OutputFile {
+                    path: "lift/shard-00001.ll".to_string(),
+                    size: 90_000,
+                    hash: 1,
+                },
+                obj: Some(OutputFile {
+                    path: "lift/shard-00001.o".to_string(),
+                    size: 40_000,
+                    hash: 2,
+                }),
+            },
+            ShardRecord {
+                index: 0,
+                first: 0x1000,
+                last: 0x1FFF,
+                functions: 100,
+                instructions: 2500,
+                unsupported: BTreeMap::new(),
+                ll: OutputFile {
+                    path: "lift/shard-00000.ll".to_string(),
+                    size: 50_000,
+                    hash: 3,
+                },
+                obj: None,
+            },
+        ];
+        let from_rec = ShardBalanceSummary::from_shard_records(&records);
+        assert_eq!(from_rec.shard_count, 2);
+        assert_eq!(from_rec.total_functions, 220);
+        assert_eq!(from_rec.total_bytes, 90_000);
+        assert_eq!(from_rec.shards[0].name, "shard-00000.ll");
+        assert_eq!(from_rec.shards[1].name, "shard-00001.o");
+        assert!(from_rec.balanced);
+    }
+
+    #[test]
+    fn deterministic_json_and_text_ordering_independent_of_hashmap_or_input_order() {
+        use std::collections::HashMap;
+
+        let mut shard_map = HashMap::new();
+        shard_map.insert("shard-00002.wasm", (512usize, 120_000u64));
+        shard_map.insert("shard-00000.wasm", (2048usize, 480_000u64));
+        shard_map.insert("shard-00001.wasm", (2048usize, 460_000u64));
+
+        let balance_from_map = ShardBalanceSummary::from_shards(
+            shard_map
+                .iter()
+                .map(|(name, &(fns, bytes))| ShardEntry::new(name, fns, bytes)),
+        );
+        let balance_from_rev = ShardBalanceSummary::from_shards(vec![
+            ShardEntry::new("shard-00001.wasm", 2048, 460_000),
+            ShardEntry::new("shard-00002.wasm", 512, 120_000),
+            ShardEntry::new("shard-00000.wasm", 2048, 480_000),
+        ]);
+
+        assert_eq!(balance_from_map, balance_from_rev);
+        assert_eq!(
+            balance_from_map.render_one_line(),
+            balance_from_rev.render_one_line()
+        );
+        assert_eq!(
+            balance_from_map.render_markdown(),
+            balance_from_rev.render_markdown()
+        );
+        let shard_json_a = balance_from_map.render_json();
+        let shard_json_b = balance_from_rev.render_json();
+        assert_eq!(shard_json_a, shard_json_b);
+        JsonValidator::validate(&shard_json_a).expect("shard balance JSON must be valid");
+
+        // Verify shard balance top-level JSON keys are strictly sorted in ascending ASCII order.
+        let shard_keys = extract_top_level_json_keys(&shard_json_a);
+        assert!(shard_keys.len() >= 10);
+        for pair in shard_keys.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "shard_balance JSON keys must be strictly sorted: {:?} >= {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+
+        // Verify CoverageReport with attached shard balance is order-independent and key-sorted.
+        let mut unresolved_map = HashMap::new();
+        unresolved_map.insert("d3d12_xs.dll", 4usize);
+        unresolved_map.insert("bink2scarlett.dll", 4usize);
+        unresolved_map.insert("ws2_32.dll", 1usize);
+
+        let mut unsupported_map = HashMap::new();
+        unsupported_map.insert("vmovdqu", 9usize);
+        unsupported_map.insert("aesenc", 9usize);
+        unsupported_map.insert("cpuid", 2usize);
+
+        let summary = CoverageSummary {
+            total_functions: 4608,
+            lifted_functions: 4600,
+            total_instructions: 100_000,
+            decoded_instructions: 99_980,
+            total_imports: 20,
+            bound_imports: 11,
+        };
+        let rep_a = CoverageReport::new("game.exe", summary)
+            .with_unresolved_imports(unresolved_map.iter().map(|(&k, &v)| (k, v)))
+            .with_unsupported_mnemonics(unsupported_map.iter().map(|(&k, &v)| (k, v)))
+            .with_shard_balance(balance_from_map);
+        let rep_b = CoverageReport::new("game.exe", summary)
+            .with_unresolved_imports(vec![
+                ("ws2_32.dll", 1),
+                ("d3d12_xs.dll", 4),
+                ("bink2scarlett.dll", 4),
+            ])
+            .with_unsupported_mnemonics(vec![("cpuid", 2), ("vmovdqu", 9), ("aesenc", 9)])
+            .with_shard_balance(balance_from_rev);
+
+        assert_eq!(rep_a, rep_b);
+        assert_eq!(rep_a.render_breakdown_line(5), rep_b.render_breakdown_line(5));
+        assert_eq!(
+            rep_a.render_coverage_markdown(5),
+            rep_b.render_coverage_markdown(5)
+        );
+        let cov_json_a = rep_a.render_coverage_json(5);
+        let cov_json_b = rep_b.render_coverage_json(5);
+        assert_eq!(cov_json_a, cov_json_b);
+        JsonValidator::validate(&cov_json_a).expect("coverage+shard JSON must be valid");
+
+        let cov_keys = extract_top_level_json_keys(&cov_json_a);
+        assert!(cov_keys.contains(&"shard_balance".to_string()));
+        for pair in cov_keys.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "coverage JSON keys must be strictly sorted: {:?} >= {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn sanitization_blocks_windows_and_unix_host_path_leaks_in_all_reports() {
+        // Direct label sanitization edge cases (Windows, UNC, Unix, URIs, directory trails, traversal)
+        assert_eq!(
+            sanitize_source_label(r"C:\Users\alice\Games\GTA6\game.exe"),
+            "game.exe"
+        );
+        assert_eq!(
+            sanitize_source_label(r"\\?\C:\Private\Builds\shard-00001.wasm"),
+            "shard-00001.wasm"
+        );
+        assert_eq!(
+            sanitize_source_label(r"\\fileserver\share\secret\d3d12_xs.dll"),
+            "d3d12_xs.dll"
+        );
+        assert_eq!(sanitize_source_label(r"C:\Users\alice\"), "<unknown>");
+        assert_eq!(
+            sanitize_source_label("/home/runner/work/playgta6web/local-data/game.exe"),
+            "game.exe"
+        );
+        assert_eq!(
+            sanitize_source_label("/Users/alice/Documents/shard-00000.ll"),
+            "shard-00000.ll"
+        );
+        assert_eq!(sanitize_source_label("/home/alice/"), "<unknown>");
+        assert_eq!(
+            sanitize_source_label("file:///C:/Users/alice/game.exe"),
+            "game.exe"
+        );
+        assert_eq!(sanitize_source_label("../../secret/game.exe"), "game.exe");
+        assert_eq!(sanitize_source_label("../.."), "<unknown>");
+        assert_eq!(sanitize_source_label("."), "<unknown>");
+
+        // Host path leak detector positive & negative cases
+        assert!(contains_host_path(r"C:\Users\alice\game.exe"));
+        assert!(contains_host_path("\"source\": \"C:\\\\Users\\\\alice\\\\game.exe\""));
+        assert!(contains_host_path("D:/local-data/game.exe"));
+        assert!(contains_host_path(r"\\?\C:\secret\file.wasm"));
+        assert!(contains_host_path(r"\\fileserver\share\file.wasm"));
+        assert!(contains_host_path("\"path\": \"\\\\\\\\fileserver\\\\share\\\\file.wasm\""));
+        assert!(contains_host_path("/home/runner/work/game.exe"));
+        assert!(contains_host_path("\"source\": \"/Users/alice/game.exe\""));
+        assert!(contains_host_path("file:///tmp/game.exe"));
+        assert!(!contains_host_path("{\"source\": \"game.exe\", \"shard\": \"shard-00000.wasm\"}"));
+        assert!(!contains_host_path("\"source\": \"Synthetic\\\"Game\\\\v1.exe\""));
+
+        // Full serialized report audit: even raw struct-literal ShardEntry paths must be sanitized.
+        let summary = CoverageSummary {
+            total_functions: 200,
+            lifted_functions: 195,
+            total_instructions: 5000,
+            decoded_instructions: 4990,
+            total_imports: 10,
+            bound_imports: 8,
+        };
+        let shards = ShardBalanceSummary::from_shards(vec![
+            ShardEntry {
+                name: r"C:\Users\alice\Private\work\lift\shard-00000.wasm".to_string(),
+                functions: 100,
+                bytes: 200_000,
+            },
+            ShardEntry {
+                name: "/home/runner/secret_build/lift/shard-00001.wasm".to_string(),
+                functions: 100,
+                bytes: 210_000,
+            },
+            ShardEntry {
+                name: r"\\fileserver\share\hidden\shard-00002.wasm".to_string(),
+                functions: 0,
+                bytes: 0,
+            },
+        ]);
+        let report = CoverageReport::new(r"C:\Users\alice\Games\Title\game.exe", summary)
+            .with_unresolved_imports(vec![
+                (r"C:\XboxSDK\Private\d3d12_xs.dll", 2),
+                ("/Users/alice/libs/bink2.dll", 1),
+            ])
+            .with_unsupported_mnemonics(vec![("/tmp/secret_dir/vmovdqu", 3)])
+            .with_shard_balance(shards);
+
+        let one_line = report.render_breakdown_line(5);
+        let markdown = report.render_coverage_markdown(5);
+        let json = report.render_coverage_json(5);
+        JsonValidator::validate(&json).expect("sanitized report JSON must be valid");
+
+        for output in [&one_line, &markdown, &json] {
+            assert!(
+                !contains_host_path(output),
+                "host path leaked into output: {output}"
+            );
+            for forbidden in [
+                "Users",
+                "alice",
+                "Private",
+                "runner",
+                "secret_build",
+                "fileserver",
+                "hidden",
+                "XboxSDK",
+                "secret_dir",
+                r"C:\",
+                "/home/",
+                "/tmp/",
+            ] {
+                assert!(
+                    !output.contains(forbidden),
+                    "forbidden host path segment `{forbidden}` leaked into output: {output}"
+                );
+            }
+        }
+        assert!(json.contains("\"source\": \"game.exe\""));
+        assert!(json.contains("\"name\": \"shard-00000.wasm\""));
+        assert!(json.contains("\"name\": \"shard-00001.wasm\""));
+        assert!(json.contains("\"name\": \"shard-00002.wasm\""));
     }
 }
