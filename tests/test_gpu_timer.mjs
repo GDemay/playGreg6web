@@ -8,8 +8,10 @@ const {
   DEFAULT_MAX_PASSES_PER_FRAME,
   DEFAULT_READBACK_SLOTS,
   DEFAULT_HISTORY_SIZE,
+  DEFAULT_FRAME_BUDGET_MS,
   BUFFER_USAGE,
   MAP_MODE,
+  computePercentiles,
   GpuPassTimer,
 } = gpuTimerMod;
 
@@ -172,9 +174,11 @@ function createMockWebGpu({ supported = true, deferMap = false } = {}) {
 
 test('UMD export attaches PlayGta6GpuTimer on globalThis and exposes defaults', () => {
   assert.equal(globalThis.PlayGta6GpuTimer.GpuPassTimer, GpuPassTimer);
+  assert.equal(globalThis.PlayGta6GpuTimer.computePercentiles, computePercentiles);
   assert.equal(DEFAULT_MAX_PASSES_PER_FRAME, 32);
   assert.equal(DEFAULT_READBACK_SLOTS, 3);
-  assert.equal(DEFAULT_HISTORY_SIZE, 60);
+  assert.equal(DEFAULT_HISTORY_SIZE, 120);
+  assert.equal(DEFAULT_FRAME_BUDGET_MS, 16.67);
   assert.equal(BUFFER_USAGE.QUERY_RESOLVE, 0x0200);
   assert.equal(BUFFER_USAGE.MAP_READ, 0x0001);
   assert.equal(MAP_MODE.READ, 0x0001);
@@ -583,4 +587,335 @@ test('idempotent destroy() releases GPUQuerySet and all buffers cleanly and turn
   assert.equal(timer.getPassTimestampWrites('after_destroy'), undefined);
   assert.equal(timer.resolveFrame(env.device.createCommandEncoder()), false);
   assert.equal(await timer.collectCompletedReadback(), null);
+});
+
+test('computePercentiles handles 0, 1, and N samples deterministically without mutating input', () => {
+  const zeroExpected = {
+    count: 0,
+    avgMs: 0,
+    minMs: 0,
+    p50Ms: 0,
+    p95Ms: 0,
+    p99Ms: 0,
+    maxMs: 0,
+  };
+  assert.deepEqual(computePercentiles(null), zeroExpected);
+  assert.deepEqual(computePercentiles(undefined), zeroExpected);
+  assert.deepEqual(computePercentiles([]), zeroExpected);
+  assert.deepEqual(computePercentiles(new Float64Array(0)), zeroExpected);
+  assert.deepEqual(computePercentiles([Number.NaN, Number.POSITIVE_INFINITY]), zeroExpected);
+
+  assert.deepEqual(computePercentiles([4.25]), {
+    count: 1,
+    avgMs: 4.25,
+    minMs: 4.25,
+    p50Ms: 4.25,
+    p95Ms: 4.25,
+    p99Ms: 4.25,
+    maxMs: 4.25,
+  });
+
+  // Unsorted array must not be mutated.
+  const unsorted = [50, 10, 40, 20, 30];
+  const snapshot = unsorted.slice();
+  assert.deepEqual(computePercentiles(unsorted), {
+    count: 5,
+    avgMs: 30,
+    minMs: 10,
+    p50Ms: 30,
+    p95Ms: 50,
+    p99Ms: 50,
+    maxMs: 50,
+  });
+  assert.deepEqual(unsorted, snapshot);
+
+  // 100 samples (1..100 in reverse order) => exact nearest-rank P50=50, P95=95, P99=99.
+  const hundred = [];
+  for (let i = 100; i >= 1; i -= 1) {
+    hundred.push(i);
+  }
+  const hundredCopy = hundred.slice();
+  assert.deepEqual(computePercentiles(hundred), {
+    count: 100,
+    avgMs: 50.5,
+    minMs: 1,
+    p50Ms: 50,
+    p95Ms: 95,
+    p99Ms: 99,
+    maxMs: 100,
+  });
+  assert.deepEqual(hundred, hundredCopy);
+
+  // TypedArray input is also preserved without mutation.
+  const typed = new Float64Array([9.5, 1.5, 5.5]);
+  assert.deepEqual(computePercentiles(typed), {
+    count: 3,
+    avgMs: 5.5,
+    minMs: 1.5,
+    p50Ms: 5.5,
+    p95Ms: 9.5,
+    p99Ms: 9.5,
+    maxMs: 9.5,
+  });
+  assert.deepEqual(Array.from(typed), [9.5, 1.5, 5.5]);
+});
+
+test('rolling per-pass percentiles evict oldest samples beyond historySize', async () => {
+  const env = createMockWebGpu({ supported: true });
+  const timer = new GpuPassTimer({
+    device: env.device,
+    maxPassesPerFrame: 4,
+    readbackSlots: 2,
+    historySize: 5,
+    frameBudgetMs: 16.67,
+  });
+
+  assert.equal(timer.historySize, 5);
+  assert.equal(timer.frameBudgetMs, 16.67);
+  assert.equal(timer.getPassPercentiles('gbuffer'), null);
+
+  // Feed 7 frames: first two are huge spikes (30ms, 25ms) that must be evicted from the 5-sample window,
+  // leaving [2, 6, 4, 10, 8] -> sorted [2, 4, 6, 8, 10].
+  const durationsMs = [30, 25, 2, 6, 4, 10, 8];
+  for (const ms of durationsMs) {
+    timer.beginFrame();
+    timer.getPassTimestampWrites('gbuffer');
+    env.setFrameTimestamps([1_000_000n, 1_000_000n + BigInt(Math.round(ms * 1_000_000))]);
+    assert.equal(timer.resolveFrame(env.device.createCommandEncoder()), true);
+    await timer.collectCompletedReadback();
+  }
+
+  const p = timer.getPassPercentiles('gbuffer');
+  assert.deepEqual(p, {
+    count: 5,
+    totalCount: 7,
+    lastMs: 8,
+    avgMs: 6,
+    minMs: 2,
+    p50Ms: 6,
+    p95Ms: 10,
+    p99Ms: 10,
+    maxMs: 10,
+    budgetExceedCount: 2,
+  });
+
+  // Defensive snapshot: mutating returned object does not corrupt internal state.
+  p.p99Ms = 999;
+  p.budgetExceedCount = 999;
+  assert.equal(timer.getPassPercentiles('gbuffer').p99Ms, 10);
+  assert.equal(timer.getPassPercentiles('gbuffer').budgetExceedCount, 2);
+
+  timer.destroy();
+});
+
+test('budgetExceedCount tracks spikes strictly above custom frameBudgetMs and aggregates in getSummary()', async () => {
+  const env = createMockWebGpu({ supported: true });
+  const timer = new GpuPassTimer({
+    device: env.device,
+    maxPassesPerFrame: 4,
+    readbackSlots: 2,
+    historySize: 20,
+    frameBudgetMs: 4.0,
+  });
+
+  assert.equal(timer.frameBudgetMs, 4.0);
+
+  // Validate option rejection for invalid frameBudgetMs values.
+  assert.throws(() => new GpuPassTimer({ device: env.device, frameBudgetMs: 0 }), RangeError);
+  assert.throws(() => new GpuPassTimer({ device: env.device, frameBudgetMs: -2 }), RangeError);
+  assert.throws(() => new GpuPassTimer({ device: env.device, frameBudgetMs: Number.NaN }), RangeError);
+
+  // 4 frames with 2 passes each:
+  // shadow:   [2.0, 4.0 (at boundary, not spike), 4.5 (spike), 6.0 (spike)] -> 2 spikes
+  // lighting: [1.0, 5.0 (spike), 3.0, 2.0]                                  -> 1 spike
+  const frames = [
+    [2.0, 1.0],
+    [4.0, 5.0],
+    [4.5, 3.0],
+    [6.0, 2.0],
+  ];
+
+  for (const [shadowMs, lightingMs] of frames) {
+    timer.beginFrame();
+    timer.getPassTimestampWrites('shadow');
+    timer.getPassTimestampWrites('lighting');
+    const sNs = BigInt(Math.round(shadowMs * 1_000_000));
+    const lNs = BigInt(Math.round(lightingMs * 1_000_000));
+    env.setFrameTimestamps([0n, sNs, 10_000_000n, 10_000_000n + lNs]);
+    assert.equal(timer.resolveFrame(env.device.createCommandEncoder()), true);
+    await timer.collectCompletedReadback();
+  }
+
+  const summary = timer.getSummary();
+  assert.equal(summary.supported, true);
+  assert.equal(summary.frameBudgetMs, 4.0);
+  assert.equal(summary.historySize, 20);
+  assert.equal(summary.resolvedFrames, 4);
+  assert.equal(summary.skippedFrames, 0);
+  assert.equal(summary.droppedPasses, 0);
+  assert.equal(summary.lastFrameGpuMs, 8.0);
+  assert.equal(summary.budgetExceedCount, 3);
+
+  assert.deepEqual(summary.passes.shadow, {
+    count: 4,
+    totalCount: 4,
+    lastMs: 6.0,
+    avgMs: 4.125,
+    minMs: 2.0,
+    p50Ms: 4.0,
+    p95Ms: 6.0,
+    p99Ms: 6.0,
+    maxMs: 6.0,
+    budgetExceedCount: 2,
+  });
+
+  assert.deepEqual(summary.passes.lighting, {
+    count: 4,
+    totalCount: 4,
+    lastMs: 2.0,
+    avgMs: 2.75,
+    minMs: 1.0,
+    p50Ms: 2.0,
+    p95Ms: 5.0,
+    p99Ms: 5.0,
+    maxMs: 5.0,
+    budgetExceedCount: 1,
+  });
+
+  // Unknown pass returns null.
+  assert.equal(timer.getPassPercentiles('nonexistent'), null);
+  assert.equal(timer.getPassPercentiles(''), null);
+  assert.equal(timer.getPassPercentiles(null), null);
+
+  timer.destroy();
+});
+
+test('getPassPercentiles, getSummary, and reset degrade cleanly when timestamp-query is unsupported', () => {
+  const env = createMockWebGpu({ supported: false });
+  const timer = new GpuPassTimer({
+    device: env.device,
+    frameBudgetMs: 8.33,
+    historySize: 30,
+  });
+
+  assert.equal(timer.supported, false);
+  assert.equal(timer.getPassPercentiles('main'), null);
+  assert.deepEqual(timer.getSummary(), {
+    supported: false,
+    frameBudgetMs: 8.33,
+    historySize: 30,
+    resolvedFrames: 0,
+    skippedFrames: 0,
+    droppedPasses: 0,
+    lastFrameGpuMs: 0,
+    budgetExceedCount: 0,
+    passes: {},
+  });
+
+  timer.reset();
+  assert.deepEqual(timer.getSummary(), {
+    supported: false,
+    frameBudgetMs: 8.33,
+    historySize: 30,
+    resolvedFrames: 0,
+    skippedFrames: 0,
+    droppedPasses: 0,
+    lastFrameGpuMs: 0,
+    budgetExceedCount: 0,
+    passes: {},
+  });
+
+  timer.destroy();
+});
+
+test('reset() and destroy() clear rolling histories, spike counters, and discard stale pre-reset readbacks', async () => {
+  const env = createMockWebGpu({ supported: true, deferMap: true });
+  const timer = new GpuPassTimer({
+    device: env.device,
+    maxPassesPerFrame: 4,
+    readbackSlots: 2,
+    historySize: 10,
+    frameBudgetMs: 5.0,
+  });
+
+  // Frame 1 (8ms -> spike)
+  timer.beginFrame();
+  timer.getPassTimestampWrites('post');
+  env.setFrameTimestamps([0n, 8_000_000n]);
+  assert.equal(timer.resolveFrame(env.device.createCommandEncoder()), true);
+  const p1 = timer.collectCompletedReadback();
+  env.pendingMaps.shift().resolve();
+  await p1;
+
+  assert.equal(timer.getPassPercentiles('post').budgetExceedCount, 1);
+  assert.equal(timer.getSummary().budgetExceedCount, 1);
+
+  // Frame 2 (12ms -> submitted before reset, mapped after reset)
+  timer.beginFrame();
+  timer.getPassTimestampWrites('post');
+  env.setFrameTimestamps([0n, 12_000_000n]);
+  assert.equal(timer.resolveFrame(env.device.createCommandEncoder()), true);
+  const preResetReadback = timer.collectCompletedReadback();
+
+  // Call reset() while Frame 2 is in-flight.
+  timer.reset();
+
+  assert.equal(timer.supported, true);
+  assert.equal(timer.isDestroyed, false);
+  assert.equal(timer.getPassPercentiles('post'), null);
+  assert.deepEqual(timer.getSummary(), {
+    supported: true,
+    frameBudgetMs: 5.0,
+    historySize: 10,
+    resolvedFrames: 0,
+    skippedFrames: 0,
+    droppedPasses: 0,
+    lastFrameGpuMs: 0,
+    budgetExceedCount: 0,
+    passes: {},
+  });
+
+  // Resolving the stale pre-reset readback must return null and not pollute post-reset telemetry.
+  env.pendingMaps.shift().resolve();
+  assert.equal(await preResetReadback, null);
+  assert.equal(timer.getPassPercentiles('post'), null);
+  assert.equal(timer.getSummary().budgetExceedCount, 0);
+
+  // Timer remains usable after reset() and records fresh post-reset frames cleanly.
+  timer.beginFrame();
+  timer.getPassTimestampWrites('post');
+  env.setFrameTimestamps([0n, 3_000_000n]); // 3ms (within 5ms budget)
+  assert.equal(timer.resolveFrame(env.device.createCommandEncoder()), true);
+  const p3 = timer.collectCompletedReadback();
+  env.pendingMaps.shift().resolve();
+  await p3;
+
+  assert.deepEqual(timer.getPassPercentiles('post'), {
+    count: 1,
+    totalCount: 1,
+    lastMs: 3.0,
+    avgMs: 3.0,
+    minMs: 3.0,
+    p50Ms: 3.0,
+    p95Ms: 3.0,
+    p99Ms: 3.0,
+    maxMs: 3.0,
+    budgetExceedCount: 0,
+  });
+
+  // destroy() clears rolling history & spike counters too.
+  timer.destroy();
+  assert.equal(timer.isDestroyed, true);
+  assert.equal(timer.getPassPercentiles('post'), null);
+  assert.deepEqual(timer.getSummary(), {
+    supported: true,
+    frameBudgetMs: 5.0,
+    historySize: 10,
+    resolvedFrames: 0,
+    skippedFrames: 0,
+    droppedPasses: 0,
+    lastFrameGpuMs: 0,
+    budgetExceedCount: 0,
+    passes: {},
+  });
 });
