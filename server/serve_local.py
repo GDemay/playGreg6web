@@ -11,15 +11,18 @@
   `--allow-dump-dir <dir>` to capture live Chrome Wasm64 pipeline dumps strictly inside
   the configured directory with traversal protection and per-file size caps.
 - Sends Cross-Origin Isolation headers (COOP/COEP/CORP) required for SharedArrayBuffer.
-- Uses HTTP/1.1 persistent keep-alive connections with large streaming buffers (1 MiB).
+- Uses HTTP/1.1 persistent keep-alive connections with large streaming buffers (1 MiB)
+  and a bounded thread-safe read-only file-handle cache for `.rpf`/`.pack`/`.pgim`/`.wasm`.
 - Supports HTTP `Range` (`bytes=start-end`, `bytes=start-`, `bytes=-suffix`), `HEAD`,
-  `OPTIONS`, `Cache-Control: no-cache`, deterministic `ETag`/`Last-Modified`,
-  `If-None-Match` (`304`), and `If-Range`.
+  `OPTIONS`, `Cache-Control: no-cache`, deterministic strong `ETag`/`Last-Modified`,
+  `If-Match` (`412`), `If-None-Match` (`304`), and `If-Range`.
 """
 
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
+import ctypes
 import importlib.util
 import json
 import mimetypes
@@ -41,9 +44,14 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
+if os.name == "nt":
+    import msvcrt
+
 RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$", re.IGNORECASE)
 
 BOOT_ALLOWED_SUFFIXES = (".pgim", ".json", ".wasm", ".js")
+CACHEABLE_IMMUTABLE_SUFFIXES = (".rpf", ".pack", ".pgim", ".wasm")
+DEFAULT_FILE_HANDLE_CACHE_SIZE = 32
 RUNTIME_WASM_NAME = "runtime.wasm"
 PREFERRED_SHADER_PACK_NAMES = ("splash.wgsl.pack", "fallback.wgsl.pack")
 SAFE_SIDE_MODULE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.wasm$", re.IGNORECASE)
@@ -208,6 +216,23 @@ def etag_matches_if_none_match(header_value: str, etag: str) -> bool:
     return False
 
 
+def etag_matches_if_match(header_value: str, etag: str) -> bool:
+    """Evaluate `If-Match` using RFC 9110 Section 13.1.1 strong comparison."""
+    if not etag or etag.startswith(("W/", "w/")):
+        return False
+    for raw_token in header_value.split(","):
+        token = raw_token.strip()
+        if not token:
+            continue
+        if token == "*":
+            return True
+        if token.startswith(("W/", "w/")):
+            continue
+        if token == etag:
+            return True
+    return False
+
+
 def if_range_matches(header_value: str, etag: str, last_modified: str, mtime: float) -> bool:
     """Evaluate RFC 9110 Section 13.1.5 `If-Range` condition (strong ETag or HTTP-date)."""
     value = header_value.strip()
@@ -254,6 +279,292 @@ def _get_thread_stream_buffer(chunk_bytes: int) -> bytearray:
         buf = bytearray(chunk_bytes)
         _STREAM_BUFFERS.buf = buf
     return buf
+
+
+_HAS_PREAD = hasattr(os, "pread")
+_WIN32_KERNEL32: Any | None = None
+_WIN32_INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+_WIN32_GENERIC_READ = 0x80000000
+_WIN32_FILE_SHARE_ALL = 0x01 | 0x02 | 0x04  # READ | WRITE | DELETE
+_WIN32_OPEN_EXISTING = 3
+_WIN32_FILE_ATTRIBUTE_NORMAL = 0x80
+_WIN32_FILE_FLAG_RANDOM_ACCESS = 0x10000000
+
+
+def _get_win32_kernel32() -> Any | None:
+    global _WIN32_KERNEL32
+    if os.name != "nt":
+        return None
+    if _WIN32_KERNEL32 is None:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateFileW.restype = ctypes.c_void_p
+        k32.CreateFileW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        k32.CloseHandle.restype = ctypes.c_int
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        _WIN32_KERNEL32 = k32
+    return _WIN32_KERNEL32
+
+
+def is_cacheable_file_path(path: Path) -> bool:
+    """Return True for large immutable asset suffixes eligible for FD caching."""
+    return path.name.lower().endswith(CACHEABLE_IMMUTABLE_SUFFIXES)
+
+
+def _open_readonly_fd(path: Path) -> int:
+    """Open `path` read-only with delete/write sharing on Windows for safe FD caching."""
+    path_str = str(path)
+    if os.name == "nt":
+        k32 = _get_win32_kernel32()
+        if k32 is not None:
+            handle = k32.CreateFileW(
+                path_str,
+                _WIN32_GENERIC_READ,
+                _WIN32_FILE_SHARE_ALL,
+                None,
+                _WIN32_OPEN_EXISTING,
+                _WIN32_FILE_ATTRIBUTE_NORMAL | _WIN32_FILE_FLAG_RANDOM_ACCESS,
+                None,
+            )
+            if handle is not None and handle != _WIN32_INVALID_HANDLE_VALUE:
+                try:
+                    return msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+                except OSError:
+                    k32.CloseHandle(handle)
+    return os.open(path_str, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+
+
+def _close_fd_safely(fd: int | None) -> None:
+    if fd is None or fd < 0:
+        return
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+class _CachedFileHandle:
+    """Refcounted read-only file descriptor entry guarded by `(realpath, size, mtime_ns)`."""
+
+    __slots__ = ("realpath", "size", "mtime_ns", "key", "fd", "io_lock", "refcount", "retired")
+
+    def __init__(self, realpath: str, size: int, mtime_ns: int, fd: int) -> None:
+        self.realpath = realpath
+        self.size = size
+        self.mtime_ns = mtime_ns
+        self.key = (realpath, size, mtime_ns)
+        self.fd = fd
+        self.io_lock = threading.Lock()
+        self.refcount = 1
+        self.retired = False
+
+    def detach_fd(self) -> int | None:
+        fd = self.fd
+        if fd < 0:
+            return None
+        self.fd = -1
+        return fd
+
+    def read_at(self, offset: int, size: int) -> bytes:
+        if _HAS_PREAD:
+            return os.pread(self.fd, size, offset)
+        with self.io_lock:
+            os.lseek(self.fd, offset, os.SEEK_SET)
+            return os.read(self.fd, size)
+
+
+class ReadOnlyFileHandleCache:
+    """Thread-safe bounded LRU cache of read-only file descriptors for large Range assets.
+
+    Entries are validated against `(realpath, st_size, st_mtime_ns)` on every acquire;
+    stale entries are immediately retired and closed once in-flight reads release them.
+    """
+
+    def __init__(self, max_entries: int = DEFAULT_FILE_HANDLE_CACHE_SIZE) -> None:
+        if max_entries < 0:
+            raise ValueError("max_entries must be >= 0")
+        self._max_entries = max_entries
+        self._lock = threading.Lock()
+        self._entries: OrderedDict[str, _CachedFileHandle] = OrderedDict()
+        self._closed = False
+        self._hits = 0
+        self._misses = 0
+        self._evictions = 0
+        self._invalidations = 0
+        self._open_handles = 0
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+    def stats(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "entries": len(self._entries),
+                "max_entries": self._max_entries,
+                "hits": self._hits,
+                "misses": self._misses,
+                "evictions": self._evictions,
+                "invalidations": self._invalidations,
+                "open_handles": self._open_handles,
+            }
+
+    def acquire(self, path: Path, st: os.stat_result) -> _CachedFileHandle | None:
+        """Borrow a refcounted handle matching `(realpath, st.st_size, st.st_mtime_ns)`."""
+        if self._max_entries <= 0:
+            return None
+        try:
+            realpath = os.path.realpath(path)
+        except OSError:
+            return None
+        expected_key = (realpath, st.st_size, st.st_mtime_ns)
+        stale_fd: int | None = None
+
+        with self._lock:
+            if self._closed:
+                return None
+            existing = self._entries.get(realpath)
+            if existing is not None:
+                if existing.key == expected_key:
+                    self._entries.move_to_end(realpath)
+                    existing.refcount += 1
+                    self._hits += 1
+                    return existing
+                self._entries.pop(realpath, None)
+                existing.retired = True
+                self._invalidations += 1
+                if existing.refcount <= 0:
+                    stale_fd = existing.detach_fd()
+                    if stale_fd is not None:
+                        self._open_handles -= 1
+
+        _close_fd_safely(stale_fd)
+
+        try:
+            fd = _open_readonly_fd(path)
+        except OSError:
+            return None
+
+        try:
+            fstat = os.fstat(fd)
+        except OSError:
+            _close_fd_safely(fd)
+            return None
+
+        if (
+            not stat.S_ISREG(fstat.st_mode)
+            or fstat.st_size != st.st_size
+            or fstat.st_mtime_ns != st.st_mtime_ns
+        ):
+            _close_fd_safely(fd)
+            return None
+
+        fds_to_close: list[int] = []
+        with self._lock:
+            if self._closed:
+                fds_to_close.append(fd)
+                entry: _CachedFileHandle | None = None
+            else:
+                existing = self._entries.get(realpath)
+                if existing is not None and existing.key == expected_key:
+                    self._entries.move_to_end(realpath)
+                    existing.refcount += 1
+                    self._hits += 1
+                    fds_to_close.append(fd)
+                    entry = existing
+                else:
+                    if existing is not None:
+                        self._entries.pop(realpath, None)
+                        existing.retired = True
+                        self._invalidations += 1
+                        if existing.refcount <= 0:
+                            old_fd = existing.detach_fd()
+                            if old_fd is not None:
+                                self._open_handles -= 1
+                                fds_to_close.append(old_fd)
+                    entry = _CachedFileHandle(realpath, st.st_size, st.st_mtime_ns, fd)
+                    self._entries[realpath] = entry
+                    self._open_handles += 1
+                    self._misses += 1
+                    while len(self._entries) > self._max_entries:
+                        _, evicted = self._entries.popitem(last=False)
+                        evicted.retired = True
+                        self._evictions += 1
+                        if evicted.refcount <= 0:
+                            evicted_fd = evicted.detach_fd()
+                            if evicted_fd is not None:
+                                self._open_handles -= 1
+                                fds_to_close.append(evicted_fd)
+
+        for dead_fd in fds_to_close:
+            _close_fd_safely(dead_fd)
+        return entry
+
+    def release(self, entry: _CachedFileHandle) -> None:
+        """Release a previously acquired handle; closes it immediately if retired."""
+        fd_to_close: int | None = None
+        with self._lock:
+            entry.refcount -= 1
+            if entry.retired and entry.refcount <= 0:
+                fd_to_close = entry.detach_fd()
+                if fd_to_close is not None:
+                    self._open_handles -= 1
+        _close_fd_safely(fd_to_close)
+
+    def invalidate(self, path: Path) -> None:
+        """Evict and retire any cached handle for `path`."""
+        try:
+            realpath = os.path.realpath(path)
+        except OSError:
+            return
+        fd_to_close: int | None = None
+        with self._lock:
+            existing = self._entries.pop(realpath, None)
+            if existing is not None:
+                existing.retired = True
+                self._invalidations += 1
+                if existing.refcount <= 0:
+                    fd_to_close = existing.detach_fd()
+                    if fd_to_close is not None:
+                        self._open_handles -= 1
+        _close_fd_safely(fd_to_close)
+
+    def invalidate_entry(self, entry: _CachedFileHandle) -> None:
+        """Retire a specific cached entry (e.g., on mid-stream truncation)."""
+        fd_to_close: int | None = None
+        with self._lock:
+            if self._entries.get(entry.realpath) is entry:
+                self._entries.pop(entry.realpath, None)
+                entry.retired = True
+                self._invalidations += 1
+                if entry.refcount <= 0:
+                    fd_to_close = entry.detach_fd()
+                    if fd_to_close is not None:
+                        self._open_handles -= 1
+        _close_fd_safely(fd_to_close)
+
+    def close_all(self) -> None:
+        """Close all idle cached handles and prevent further caching after shutdown."""
+        fds_to_close: list[int] = []
+        with self._lock:
+            self._closed = True
+            while self._entries:
+                _, entry = self._entries.popitem(last=False)
+                entry.retired = True
+                if entry.refcount <= 0:
+                    fd = entry.detach_fd()
+                    if fd is not None:
+                        self._open_handles -= 1
+                        fds_to_close.append(fd)
+        for fd in fds_to_close:
+            _close_fd_safely(fd)
 
 
 def _count_shader_packs(web_root: Path, data_root: Path, shaders_root: Path | None = None) -> int:
@@ -872,12 +1183,60 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
                 self.close_connection = True
                 raise
 
+    def _get_file_handle_cache(self) -> ReadOnlyFileHandleCache | None:
+        cache = getattr(self, "file_handle_cache", None)
+        if cache is not None:
+            return cache
+        server = getattr(self, "server", None)
+        return getattr(server, "file_handle_cache", None) if server is not None else None
+
+    def _get_combined_header(self, name: str) -> str | None:
+        if hasattr(self.headers, "get_all"):
+            values = self.headers.get_all(name)
+            return ", ".join(values) if values else None
+        return self.headers.get(name)
+
     def _send_not_modified(self, etag: str, last_modified: str) -> None:
         self.send_response(HTTPStatus.NOT_MODIFIED)
         self.send_header("ETag", etag)
         self.send_header("Last-Modified", last_modified)
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
+
+    def _send_precondition_failed(self, etag: str, last_modified: str) -> None:
+        self.send_response(HTTPStatus.PRECONDITION_FAILED)
+        self.send_header("Content-Length", "0")
+        self.send_header("ETag", etag)
+        self.send_header("Last-Modified", last_modified)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def _stream_cached_file_range(
+        self,
+        entry: _CachedFileHandle,
+        start: int,
+        length: int,
+        cache: ReadOnlyFileHandleCache,
+    ) -> None:
+        chunk_bytes = max(1, self._get_stream_chunk_bytes())
+        offset = start
+        remaining = length
+        while remaining > 0:
+            to_read = chunk_bytes if remaining > chunk_bytes else remaining
+            try:
+                chunk = entry.read_at(offset, to_read)
+            except OSError:
+                cache.invalidate_entry(entry)
+                raise
+            if not chunk:
+                # File shrank mid-stream after Content-Length was emitted:
+                # invalidate handle and force socket close so HTTP/1.1 framing stays synced.
+                cache.invalidate_entry(entry)
+                self.close_connection = True
+                break
+            offset += len(chunk)
+            remaining -= len(chunk)
+            self.wfile.write(chunk)
 
     def _stream_file_range(self, f: Any, length: int) -> None:
         chunk_bytes = max(1, self._get_stream_chunk_bytes())
@@ -930,18 +1289,31 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
             self._send_empty(HTTPStatus.NOT_FOUND)
             return
 
+        cache = self._get_file_handle_cache()
         try:
             st = target.stat()
         except OSError:
+            if cache is not None and isinstance(target, Path):
+                cache.invalidate(target)
             self._send_empty(HTTPStatus.NOT_FOUND)
             return
         if not stat.S_ISREG(st.st_mode):
+            if cache is not None and isinstance(target, Path):
+                cache.invalidate(target)
             self._send_empty(HTTPStatus.NOT_FOUND)
             return
 
         file_size = st.st_size
         etag = compute_etag(st)
         last_modified = formatdate(st.st_mtime, usegmt=True)
+
+        # RFC 9110 §13.2.2 Step 1: evaluate If-Match (strong comparison) before Range / If-None-Match.
+        if_match = self._get_combined_header("If-Match")
+        if if_match is not None:
+            if not etag_matches_if_match(if_match, etag):
+                self._send_precondition_failed(etag, last_modified)
+                return
+
         range_header = self.headers.get("Range")
 
         # Never short-circuit HTTP Range requests to 304 Not Modified: browsers
@@ -949,11 +1321,7 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
         # subsequent slices of large .rpf / .wgsl.pack files, and returning 304
         # starves or corrupts ranged streaming (RFC 9110 §13.1.5 uses If-Range).
         if not range_header:
-            if hasattr(self.headers, "get_all"):
-                raw_if_none_match = self.headers.get_all("If-None-Match")
-                if_none_match = ", ".join(raw_if_none_match) if raw_if_none_match else None
-            else:
-                if_none_match = self.headers.get("If-None-Match")
+            if_none_match = self._get_combined_header("If-None-Match")
             if if_none_match:
                 if etag_matches_if_none_match(if_none_match, etag):
                     self._send_not_modified(etag, last_modified)
@@ -969,7 +1337,7 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
 
         if_range_header = self.headers.get("If-Range")
         apply_range = bool(range_header)
-        if apply_range and if_range_header:
+        if apply_range and if_range_header is not None:
             if not if_range_matches(if_range_header, etag, last_modified, st.st_mtime):
                 apply_range = False
 
@@ -1006,6 +1374,22 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
         if not send_body or length == 0:
             send_file_headers()
             return
+
+        if cache is not None and isinstance(target, Path) and is_cacheable_file_path(target):
+            cached_entry = cache.acquire(target, st)
+            if cached_entry is not None:
+                try:
+                    send_file_headers()
+                    self._stream_cached_file_range(cached_entry, start, length, cache)
+                except CLIENT_DISCONNECT_ERRORS:
+                    self.close_connection = True
+                    return
+                except Exception:
+                    self.close_connection = True
+                    raise
+                finally:
+                    cache.release(cached_entry)
+                return
 
         try:
             f = target.open("rb")
@@ -1183,6 +1567,10 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
                     )
                     return
 
+                cache = self._get_file_handle_cache()
+                if cache is not None:
+                    cache.invalidate(target)
+
                 if append_mode:
                     current_size = target.stat().st_size if target.exists() else 0
                     if current_size + bytes_written > max_bytes:
@@ -1262,6 +1650,33 @@ class QuietThreadingHTTPServer(ThreadingHTTPServer):
 
     block_on_close = False
 
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        RequestHandlerClass: Any,
+        bind_and_activate: bool = True,
+        *,
+        file_handle_cache_size: int = DEFAULT_FILE_HANDLE_CACHE_SIZE,
+    ) -> None:
+        if file_handle_cache_size < 0:
+            raise ValueError("file_handle_cache_size must be >= 0")
+        self.file_handle_cache: ReadOnlyFileHandleCache | None = (
+            ReadOnlyFileHandleCache(max_entries=file_handle_cache_size)
+            if file_handle_cache_size > 0
+            else None
+        )
+        super().__init__(
+            server_address,
+            RequestHandlerClass,
+            bind_and_activate=bind_and_activate,
+        )
+
+    def server_close(self) -> None:
+        cache = getattr(self, "file_handle_cache", None)
+        if cache is not None:
+            cache.close_all()
+        super().server_close()
+
     def handle_error(self, request: Any, client_address: Any) -> None:
         exc = sys.exc_info()[1]
         if isinstance(exc, CLIENT_DISCONNECT_ERRORS):
@@ -1282,11 +1697,14 @@ def create_server(
     max_dump_file_bytes: int = DEFAULT_MAX_DUMP_FILE_BYTES,
     keep_alive_timeout: float | None = None,
     stream_chunk_bytes: int | None = None,
+    file_handle_cache_size: int = DEFAULT_FILE_HANDLE_CACHE_SIZE,
 ) -> QuietThreadingHTTPServer:
     if max_dump_file_bytes < 0:
         raise ValueError("max_dump_file_bytes must be >= 0")
     if stream_chunk_bytes is not None and stream_chunk_bytes <= 0:
         raise ValueError("stream_chunk_bytes must be > 0")
+    if file_handle_cache_size < 0:
+        raise ValueError("file_handle_cache_size must be >= 0")
     handler = partial(
         PlayGta6Handler,
         web_root=web_root,
@@ -1299,7 +1717,11 @@ def create_server(
         keep_alive_timeout=keep_alive_timeout,
         stream_chunk_bytes=stream_chunk_bytes,
     )
-    return QuietThreadingHTTPServer((host, port), handler)
+    return QuietThreadingHTTPServer(
+        (host, port),
+        handler,
+        file_handle_cache_size=file_handle_cache_size,
+    )
 
 
 def _load_dotenv_value(repo_root: Path, key: str) -> str | None:
