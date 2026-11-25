@@ -4,7 +4,8 @@
   const DEFAULT_SAMPLE_RATE = 48000;
   const DEFAULT_CHANNELS = 2;
   const DEFAULT_MAX_VOICES = 64;
-  const DEFAULT_LIMITER_KNEE = 0.75;
+  const DEFAULT_SOFT_CLIP_KNEE = 0.95;
+  const DEFAULT_LIMITER_KNEE = DEFAULT_SOFT_CLIP_KNEE;
 
   // Standard IMA / DVI ADPCM step-index adjustment table (16 4-bit nibble values).
   const IMA_INDEX_TABLE = Object.freeze([
@@ -307,22 +308,35 @@
 
   /**
    * Smooth C1-continuous soft-clip limiter backed by Math.tanh.
-   * Completely linear for |x| <= knee and smoothly saturates toward +-1.0 beyond knee.
+   * Non-finite inputs (NaN / +-Infinity) are sanitized to 0.0.
+   * Completely bit-exact for |x| <= knee and smoothly saturates toward +-1.0 beyond knee.
+   *
+   * @param {number} x Input sample value.
+   * @param {number} [knee=0.95] Linear passthrough knee in [0, 1).
+   * @returns {number} Finite sample strictly bounded inside [-1.0, 1.0].
    */
-  function softClipTanh(x, knee) {
+  function softClipSample(x, knee = DEFAULT_SOFT_CLIP_KNEE) {
+    if (typeof knee !== 'number' || !Number.isFinite(knee) || knee < 0 || knee >= 1.0) {
+      throw new RangeError(`knee must be in [0, 1), got ${knee}`);
+    }
+    if (!Number.isFinite(x)) {
+      return 0.0;
+    }
     const absX = Math.abs(x);
     if (absX <= knee) {
       return x;
     }
     const headroom = 1.0 - knee;
     const compressed = knee + headroom * Math.tanh((absX - knee) / headroom);
-    return x < 0 ? -compressed : compressed;
+    const bounded = compressed > 1.0 ? 1.0 : compressed;
+    return x < 0 ? -bounded : bounded;
   }
 
   /**
    * Lock-free multi-voice stereo audio mixer with equal-power panning,
-   * linear resampling, seamless looping, soft-clip tanh limiter, and
-   * direct SharedArrayBuffer AudioRingBuffer pumping.
+   * linear resampling, seamless looping, non-finite sample sanitization,
+   * configurable soft-clip tanh limiter, and direct SharedArrayBuffer
+   * AudioRingBuffer pumping.
    */
   class AudioMixer {
     constructor(options = {}) {
@@ -344,8 +358,15 @@
         throw new RangeError(`masterGain must be a non-negative finite number, got ${masterGain}`);
       }
 
+      const softClip =
+        options.softClip !== undefined ? Boolean(options.softClip) : true;
+
       const limiterKnee =
-        options.limiterKnee !== undefined ? options.limiterKnee : DEFAULT_LIMITER_KNEE;
+        options.limiterKnee !== undefined
+          ? options.limiterKnee
+          : options.softClipKnee !== undefined
+            ? options.softClipKnee
+            : DEFAULT_LIMITER_KNEE;
       if (
         typeof limiterKnee !== 'number' ||
         !Number.isFinite(limiterKnee) ||
@@ -359,6 +380,7 @@
       this.channels = DEFAULT_CHANNELS;
       this.maxVoices = maxVoices;
       this._masterGain = masterGain;
+      this._softClip = softClip;
       this._limiterKnee = limiterKnee;
 
       this._voices = new Map();
@@ -366,8 +388,28 @@
       this._mixScratch = new Float64Array(0);
 
       this._renderedFrames = 0;
-      this._peakLevel = 0.0;
+      this._peakOutputLevel = 0.0;
       this._clippedSamples = 0;
+      this._sanitizedNonFiniteSamples = 0;
+      this._activeVoicePeak = 0;
+    }
+
+    _countActiveVoices() {
+      let active = 0;
+      for (const voice of this._voices.values()) {
+        if (!voice.stopped && !voice.finished) {
+          active += 1;
+        }
+      }
+      return active;
+    }
+
+    _updateActiveVoicePeak() {
+      const active = this._countActiveVoices();
+      if (active > this._activeVoicePeak) {
+        this._activeVoicePeak = active;
+      }
+      return active;
     }
 
     get masterGain() {
@@ -451,6 +493,7 @@
         finished: false,
       });
 
+      this._updateActiveVoicePeak();
       return voiceId;
     }
 
@@ -501,6 +544,7 @@
       voice.paused = false;
       voice.stopped = false;
       voice.finished = false;
+      this._updateActiveVoicePeak();
       return true;
     }
 
@@ -544,6 +588,9 @@
 
       const finishedIds = [];
       const outSampleRate = this.sampleRate;
+      let sanitized = 0;
+
+      this._updateActiveVoicePeak();
 
       for (const voice of this._voices.values()) {
         if (voice.paused || voice.stopped || voice.finished) {
@@ -583,14 +630,23 @@
 
             const i0 = Math.floor(pos);
             const frac = pos - i0;
-            let i1 = i0 + 1;
-            if (i1 >= srcFrames) {
-              i1 = loop ? 0 : srcFrames - 1;
+            let sample;
+            if (frac === 0) {
+              sample = src[i0];
+            } else {
+              let i1 = i0 + 1;
+              if (i1 >= srcFrames) {
+                i1 = loop ? 0 : srcFrames - 1;
+              }
+              const s0 = src[i0];
+              const s1 = src[i1];
+              sample = s0 + (s1 - s0) * frac;
             }
 
-            const s0 = src[i0];
-            const s1 = src[i1];
-            const sample = s0 + (s1 - s0) * frac;
+            if (!Number.isFinite(sample)) {
+              sample = 0.0;
+              sanitized += 1;
+            }
 
             const outIdx = f * 2;
             mix[outIdx] += sample * gL;
@@ -641,15 +697,33 @@
 
             const i0 = Math.floor(pos);
             const frac = pos - i0;
-            let i1 = i0 + 1;
-            if (i1 >= srcFrames) {
-              i1 = loop ? 0 : srcFrames - 1;
+            const base0 = i0 * 2;
+            let rawL;
+            let rawR;
+            if (frac === 0) {
+              rawL = src[base0];
+              rawR = src[base0 + 1];
+            } else {
+              let i1 = i0 + 1;
+              if (i1 >= srcFrames) {
+                i1 = loop ? 0 : srcFrames - 1;
+              }
+              const base1 = i1 * 2;
+              rawL = src[base0] + (src[base1] - src[base0]) * frac;
+              rawR = src[base0 + 1] + (src[base1 + 1] - src[base0 + 1]) * frac;
             }
 
-            const base0 = i0 * 2;
-            const base1 = i1 * 2;
-            const sL = (src[base0] + (src[base1] - src[base0]) * frac) * gain;
-            const sR = (src[base0 + 1] + (src[base1 + 1] - src[base0 + 1]) * frac) * gain;
+            if (!Number.isFinite(rawL)) {
+              rawL = 0.0;
+              sanitized += 1;
+            }
+            if (!Number.isFinite(rawR)) {
+              rawR = 0.0;
+              sanitized += 1;
+            }
+
+            const sL = rawL * gain;
+            const sR = rawR * gain;
 
             const outIdx = f * 2;
             mix[outIdx] += sL * ll + sR * lr;
@@ -673,18 +747,33 @@
         this._voices.delete(finishedIds[i]);
       }
 
-      // Apply master gain, soft-clip tanh limiter, and update metering stats.
+      // Apply master gain, non-finite sanitizer, soft-clip/hard-clip limiter, and update metering stats.
       const masterGain = this._masterGain;
+      const softClip = this._softClip;
       const knee = this._limiterKnee;
-      let peak = this._peakLevel;
+      let peak = this._peakOutputLevel;
       let clipped = 0;
 
       for (let i = 0; i < sampleCount; i++) {
-        const raw = mix[i] * masterGain;
-        if (raw > 1.0 || raw < -1.0) {
-          clipped += 1;
+        let raw = mix[i] * masterGain;
+        if (!Number.isFinite(raw)) {
+          raw = 0.0;
+          sanitized += 1;
         }
-        const limited = softClipTanh(raw, knee);
+
+        let limited;
+        if (softClip) {
+          if (raw > knee || raw < -knee) {
+            clipped += 1;
+          }
+          limited = softClipSample(raw, knee);
+        } else {
+          if (raw > 1.0 || raw < -1.0) {
+            clipped += 1;
+          }
+          limited = clamp(raw, -1.0, 1.0);
+        }
+
         const absVal = Math.abs(limited);
         if (absVal > peak) {
           peak = absVal;
@@ -692,8 +781,9 @@
         output[i] = limited;
       }
 
-      this._peakLevel = peak;
+      this._peakOutputLevel = peak;
       this._clippedSamples += clipped;
+      this._sanitizedNonFiniteSamples += sanitized;
       this._renderedFrames += frameCount;
 
       return output;
@@ -774,6 +864,27 @@
     }
 
     /**
+     * Resets mixer voices (unless `{ clearVoices: false }`) and zeroes all mix telemetry counters.
+     *
+     * @param {object} [options]
+     * @param {boolean} [options.clearVoices=true] When true, clears all registered voices.
+     */
+    reset(options = {}) {
+      const clearVoices = options && options.clearVoices !== undefined ? Boolean(options.clearVoices) : true;
+      if (clearVoices) {
+        this._voices.clear();
+      }
+      if (this._mixScratch.length > 0) {
+        this._mixScratch.fill(0.0);
+      }
+      this._renderedFrames = 0;
+      this._peakOutputLevel = 0.0;
+      this._clippedSamples = 0;
+      this._sanitizedNonFiniteSamples = 0;
+      this._activeVoicePeak = clearVoices ? 0 : this._countActiveVoices();
+    }
+
+    /**
      * Returns mixer diagnostics and voice metering stats.
      */
     getStats() {
@@ -800,9 +911,14 @@
         sampleRate: this.sampleRate,
         channels: this.channels,
         masterGain: this._masterGain,
+        softClip: this._softClip,
+        limiterKnee: this._limiterKnee,
         renderedFrames: this._renderedFrames,
-        peakLevel: this._peakLevel,
+        peakLevel: this._peakOutputLevel,
+        peakOutputLevel: this._peakOutputLevel,
         clippedSamples: this._clippedSamples,
+        sanitizedNonFiniteSamples: this._sanitizedNonFiniteSamples,
+        activeVoicePeak: this._activeVoicePeak,
       };
     }
   }
@@ -811,9 +927,11 @@
     AudioMixer,
     decodePcm16,
     decodeImaAdpcm,
+    softClipSample,
     DEFAULT_SAMPLE_RATE,
     DEFAULT_CHANNELS,
     DEFAULT_MAX_VOICES,
+    DEFAULT_SOFT_CLIP_KNEE,
     IMA_INDEX_TABLE,
     IMA_STEP_TABLE,
   };
