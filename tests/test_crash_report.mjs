@@ -944,3 +944,206 @@ test('setBootSnapshot and setGpuTelemetry enforce strict allowlisting and export
   assert.equal(reporter.getBootSnapshot(), null);
   assert.equal(reporter.getGpuTelemetry(), null);
 });
+
+test('W152 coalesces consecutive and non-consecutive duplicate (category, message) errors without evicting earlier root causes', () => {
+  const clock = createDeterministicClock(1700001000000);
+  const reporter = new CrashReporter({ maxErrors: 3, now: clock.now });
+
+  // Initial zero stats
+  assert.equal(reporter.recordedErrorCount, 0);
+  assert.equal(reporter.coalescedCount, 0);
+  assert.deepEqual(reporter.categoryCounts, {});
+  assert.deepEqual(reporter.getErrorStats(), {
+    recordedCount: 0,
+    bufferedCount: 0,
+    coalescedCount: 0,
+    droppedCount: 0,
+    maxErrors: 3,
+    categoryCounts: {},
+  });
+
+  // 1. Record two early root-cause errors.
+  const root1 = reporter.recordError('wasm_trap', new WebAssembly.RuntimeError('null indirect call'), {
+    stage: 'TLS_INIT',
+  });
+  assert.equal(root1.occurrences, 1);
+  assert.equal(root1.firstSeenAtMs, 1700001000000);
+  assert.equal(root1.lastSeenAtMs, 1700001000000);
+
+  clock.advance(50);
+  const root2 = reporter.recordError('io_error', 'HTTPFS range request returned 503', {
+    chunk: 4,
+  });
+  assert.equal(root2.occurrences, 1);
+  assert.equal(root2.firstSeenAtMs, 1700001000050);
+  assert.equal(root2.lastSeenAtMs, 1700001000050);
+
+  // 2. Flood 250 identical WebGPU validation errors — earlier root causes must survive.
+  for (let i = 0; i < 250; i += 1) {
+    clock.advance(16);
+    reporter.recordError('webgpu_validation', {
+      name: 'GPUValidationError',
+      message: 'Bind group layout mismatch at slot 0',
+    });
+  }
+
+  // 3. Non-consecutive repeat of root1 (even via auto-classification) coalesces into existing root1 entry.
+  clock.advance(100);
+  const root1Repeat = reporter.recordError(null, new WebAssembly.RuntimeError('null indirect call'), {
+    stage: 'LATER_STAGE',
+  });
+  assert.equal(root1Repeat.occurrences, 2);
+  assert.equal(root1Repeat.firstSeenAtMs, 1700001000000);
+  assert.equal(root1Repeat.lastSeenAtMs, clock.now());
+  // Root-cause context from first occurrence is preserved.
+  assert.deepEqual(root1Repeat.context, { stage: 'TLS_INIT' });
+
+  assert.equal(reporter.errorCount, 3);
+  assert.equal(reporter.recordedErrorCount, 253);
+  assert.equal(reporter.coalescedCount, 250);
+  assert.deepEqual(reporter.categoryCounts, {
+    wasm_trap: 2,
+    io_error: 1,
+    webgpu_validation: 250,
+  });
+
+  const errors = reporter.getErrors();
+  assert.equal(errors.length, 3);
+  // Chronological first-seen order preserved.
+  assert.equal(errors[0].message, 'null indirect call');
+  assert.equal(errors[0].occurrences, 2);
+  assert.equal(errors[0].timestampMs, 1700001000000);
+  assert.equal(errors[0].firstSeenAtMs, 1700001000000);
+  assert.equal(errors[0].lastSeenAtMs, clock.now());
+
+  assert.equal(errors[1].message, 'HTTPFS range request returned 503');
+  assert.equal(errors[1].occurrences, 1);
+
+  assert.equal(errors[2].category, 'webgpu_validation');
+  assert.equal(errors[2].message, 'Bind group layout mismatch at slot 0');
+  assert.equal(errors[2].occurrences, 250);
+  assert.equal(errors[2].firstSeenAtMs, 1700001000050 + 16);
+  assert.equal(errors[2].lastSeenAtMs, 1700001000050 + 16 * 250);
+
+  // Additive stats exposed in buildReport() and toJson() alongside bootDiagnostics.
+  const report = reporter.buildReport();
+  assert.deepEqual(report.errorStats, {
+    recordedCount: 253,
+    bufferedCount: 3,
+    coalescedCount: 250,
+    droppedCount: 0,
+    maxErrors: 3,
+    categoryCounts: {
+      wasm_trap: 2,
+      io_error: 1,
+      webgpu_validation: 250,
+    },
+  });
+  assert.equal(report.errors.length, 3);
+  assert.equal(report.errors[2].occurrences, 250);
+  assert.equal(report.bootDiagnostics.classifiedErrors[1].code, 'HTTPFS_PGIM_ERROR');
+  assert.equal(report.bootDiagnostics.classifiedErrors[1].occurrences, 1);
+  assert.equal(report.bootDiagnostics.errorCodeCounts.HTTPFS_PGIM_ERROR, 1);
+  assert.equal(report.bootDiagnostics.errorCodeCounts.UNKNOWN_BOOT_ERROR, 252);
+
+  const parsed = JSON.parse(reporter.toJson());
+  assert.deepEqual(parsed.errorStats, report.errorStats);
+});
+
+test('W152 separates distinct categories with same message, handles eviction + re-entry, redaction, immutability, and clear()', () => {
+  const clock = createDeterministicClock(1700002000000);
+  const reporter = new CrashReporter({ maxErrors: 2, now: clock.now });
+
+  // Same message across different categories must NOT coalesce.
+  reporter.recordError('io_error', 'request timed out');
+  clock.advance(10);
+  reporter.recordError('worker_error', 'request timed out');
+  assert.equal(reporter.errorCount, 2);
+  assert.equal(reporter.recordedErrorCount, 2);
+  assert.equal(reporter.coalescedCount, 0);
+  assert.deepEqual(reporter.categoryCounts, { io_error: 1, worker_error: 1 });
+
+  // Pushing a 3rd distinct error evicts the oldest ('io_error', 'request timed out').
+  clock.advance(10);
+  reporter.recordError('runtime', 'Failed opening C:\\Users\\alice\\GTA6\\a.bin?token=sec1');
+  assert.equal(reporter.errorCount, 2);
+  assert.equal(reporter.getErrorStats().droppedCount, 1);
+
+  // Different raw host path & secret token that sanitize to the exact same message MUST coalesce cleanly without leaking.
+  clock.advance(20);
+  const coalescedSanitized = reporter.recordError(
+    'runtime',
+    'Failed opening C:\\Users\\bob\\GTA6\\b.bin?token=sec2',
+    { rawDump: new Uint8Array([1, 2, 3, 4]), token: 'must-not-leak' }
+  );
+  assert.equal(coalescedSanitized.occurrences, 2);
+  assert.equal(coalescedSanitized.message, 'Failed opening [REDACTED_PATH]?[REDACTED]');
+  assert.equal(reporter.coalescedCount, 1);
+
+  // Re-recording the previously evicted error creates a fresh entry (occurrences: 1) rather than resurrecting evicted state.
+  clock.advance(30);
+  const reentered = reporter.recordError('io_error', 'request timed out');
+  assert.equal(reentered.occurrences, 1);
+  assert.equal(reentered.firstSeenAtMs, clock.now());
+  assert.equal(reentered.lastSeenAtMs, clock.now());
+
+  const stats = reporter.getErrorStats();
+  assert.equal(stats.recordedCount, 5);
+  assert.equal(stats.bufferedCount, 2);
+  assert.equal(stats.coalescedCount, 1);
+  assert.equal(stats.droppedCount, 2);
+  assert.equal(stats.bufferedCount + stats.droppedCount + stats.coalescedCount, stats.recordedCount);
+  assert.deepEqual(stats.categoryCounts, {
+    io_error: 2,
+    worker_error: 1,
+    runtime: 2,
+  });
+
+  // Returned stats and error snapshots are defensively cloned.
+  stats.categoryCounts.io_error = 9999;
+  const catCopy = reporter.categoryCounts;
+  catCopy.runtime = 9999;
+  const errSnapshot = reporter.getErrors();
+  errSnapshot[0].occurrences = 9999;
+  assert.equal(reporter.categoryCounts.io_error, 2);
+  assert.equal(reporter.categoryCounts.runtime, 2);
+  assert.equal(reporter.getErrors()[0].occurrences, 2);
+
+  // Exported JSON leaks zero paths, usernames, or tokens.
+  const json = reporter.toJson();
+  for (const forbidden of ['alice', 'bob', 'GTA6', 'sec1', 'sec2', 'must-not-leak']) {
+    assert.ok(!json.includes(forbidden), `Leaked forbidden token: ${forbidden}`);
+  }
+
+  // clear() resets ring, coalescing index, and all counters.
+  reporter.clear();
+  assert.equal(reporter.errorCount, 0);
+  assert.equal(reporter.recordedErrorCount, 0);
+  assert.equal(reporter.coalescedCount, 0);
+  assert.deepEqual(reporter.categoryCounts, {});
+  assert.deepEqual(reporter.getErrorStats(), {
+    recordedCount: 0,
+    bufferedCount: 0,
+    coalescedCount: 0,
+    droppedCount: 0,
+    maxErrors: 2,
+    categoryCounts: {},
+  });
+
+  // After clear(), recording a previously-seen error starts fresh with occurrences === 1.
+  clock.advance(10);
+  const freshAfterClear = reporter.recordError('io_error', 'request timed out');
+  assert.equal(freshAfterClear.occurrences, 1);
+  assert.equal(reporter.recordedErrorCount, 1);
+  assert.equal(reporter.coalescedCount, 0);
+
+  // coalesceDuplicates option validation & opt-out mode.
+  assert.throws(() => new CrashReporter({ coalesceDuplicates: 'yes' }), TypeError);
+  const rawReporter = new CrashReporter({ maxErrors: 2, coalesceDuplicates: false, now: clock.now });
+  rawReporter.recordError('runtime', 'dup');
+  rawReporter.recordError('runtime', 'dup');
+  assert.equal(rawReporter.errorCount, 2);
+  assert.equal(rawReporter.recordedErrorCount, 2);
+  assert.equal(rawReporter.coalescedCount, 0);
+  assert.deepEqual(rawReporter.categoryCounts, { runtime: 2 });
+});
