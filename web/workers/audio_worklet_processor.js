@@ -6,8 +6,10 @@
   const DEFAULT_SMOOTHING_FRAMES = 64;
   const DEFAULT_DECLICK_FRAMES = 32;
   const DEFAULT_FADE_IN_FRAMES = DEFAULT_DECLICK_FRAMES;
+  const DEFAULT_UNDERRUN_RAMP_FRAMES = 64;
   const MAX_DECLICK_FRAMES = 4096;
   const DEFAULT_SAMPLE_CLAMP_LIMIT = 1.0;
+  const DEFAULT_SOFT_LIMIT_KNEE = 0.9;
   const MAX_TRACKED_CHANNELS = 32;
 
   // Atomic Int32 header layout at byte offset 0..32 of the SharedArrayBuffer.
@@ -64,6 +66,233 @@
     return value;
   }
 
+  function sanitizeFadeCurve(value, fallback) {
+    if (value === 'cosine' || value === 'linear') {
+      return value;
+    }
+    return fallback;
+  }
+
+  function sanitizeSoftLimitKnee(value, fallback) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value >= 1.0) {
+      return fallback;
+    }
+    return value;
+  }
+
+  function softLimitPositive(absVal, knee, headroom) {
+    const compressed = knee + headroom * Math.tanh((absVal - knee) / headroom);
+    return compressed > 1.0 ? 1.0 : compressed;
+  }
+
+  /**
+   * Applies an in-place, zero-allocation half-cosine smooth gain ramp over
+   * `frameCount` interleaved frames from `startGain` to `endGain`.
+   *
+   * @param {Float32Array|number[]} samples Interleaved PCM sample buffer modified in place.
+   * @param {number} [channels=1] Number of interleaved channels (>= 1).
+   * @param {number} [frameCount] Number of frames to ramp (clamped to buffer length).
+   * @param {number} [startGain=1.0] Starting gain at frame 0.
+   * @param {number} [endGain=0.0] Ending gain at frame `frameCount - 1`.
+   * @returns {Float32Array|number[]} The mutated `samples` buffer.
+   */
+  function applyFadeRamp(samples, channels = 1, frameCount, startGain = 1.0, endGain = 0.0) {
+    if (!samples || typeof samples.length !== 'number') {
+      throw new TypeError('applyFadeRamp requires a Float32Array or array-like sample buffer');
+    }
+    if (!Number.isInteger(channels) || channels <= 0) {
+      throw new RangeError(`channels must be a positive integer, got ${channels}`);
+    }
+    const maxFrames = Math.floor(samples.length / channels);
+    let n;
+    if (frameCount === undefined || frameCount === null) {
+      n = maxFrames;
+    } else {
+      if (typeof frameCount !== 'number' || !Number.isFinite(frameCount) || frameCount < 0) {
+        throw new RangeError(`frameCount must be a non-negative finite number, got ${frameCount}`);
+      }
+      n = Math.floor(frameCount);
+      if (n > maxFrames) n = maxFrames;
+    }
+    if (n <= 0) {
+      return samples;
+    }
+
+    const g0 = typeof startGain === 'number' && Number.isFinite(startGain) ? startGain : 0.0;
+    const g1 = typeof endGain === 'number' && Number.isFinite(endGain) ? endGain : 0.0;
+
+    if (n === 1) {
+      for (let c = 0; c < channels; c++) {
+        const s = samples[c];
+        samples[c] = g1 === 0.0 || s - s !== 0 ? 0.0 : s * g1;
+      }
+      return samples;
+    }
+
+    const gDiff = g1 - g0;
+    const lastIdx = n - 1;
+    const invDenom = Math.PI / lastIdx;
+
+    if (channels === 2) {
+      for (let f = 0; f < n; f++) {
+        const gain =
+          f === 0
+            ? g0
+            : f === lastIdx
+              ? g1
+              : g0 + gDiff * (0.5 * (1.0 - Math.cos(f * invDenom)));
+        const base = f * 2;
+        if (gain === 0.0) {
+          samples[base] = 0.0;
+          samples[base + 1] = 0.0;
+        } else {
+          const s0 = samples[base];
+          const s1 = samples[base + 1];
+          samples[base] = s0 - s0 !== 0 ? 0.0 : s0 * gain;
+          samples[base + 1] = s1 - s1 !== 0 ? 0.0 : s1 * gain;
+        }
+      }
+    } else if (channels === 1) {
+      for (let f = 0; f < n; f++) {
+        const gain =
+          f === 0
+            ? g0
+            : f === lastIdx
+              ? g1
+              : g0 + gDiff * (0.5 * (1.0 - Math.cos(f * invDenom)));
+        const s = samples[f];
+        samples[f] = gain === 0.0 || s - s !== 0 ? 0.0 : s * gain;
+      }
+    } else {
+      for (let f = 0; f < n; f++) {
+        const gain =
+          f === 0
+            ? g0
+            : f === lastIdx
+              ? g1
+              : g0 + gDiff * (0.5 * (1.0 - Math.cos(f * invDenom)));
+        const base = f * channels;
+        if (gain === 0.0) {
+          for (let c = 0; c < channels; c++) {
+            samples[base + c] = 0.0;
+          }
+        } else {
+          for (let c = 0; c < channels; c++) {
+            const s = samples[base + c];
+            samples[base + c] = s - s !== 0 ? 0.0 : s * gain;
+          }
+        }
+      }
+    }
+
+    return samples;
+  }
+
+  /**
+   * Sanitizes non-finite samples (`NaN` / `±Infinity`) to `0.0`, passes normal
+   * audio `|x| <= knee` (default `0.9`) bit-exact linearly, and smoothly
+   * soft-clips `|x| > knee` into `[-1.0, 1.0]` using a C1-continuous `tanh` knee.
+   *
+   * @param {number} x Input sample value.
+   * @param {number} [knee=0.9] Linear passthrough threshold in `[0, 1)`.
+   * @returns {number} Finite sample strictly bounded in `[-1.0, 1.0]`.
+   */
+  function softLimitSample(x, knee = DEFAULT_SOFT_LIMIT_KNEE) {
+    if (typeof knee !== 'number' || !Number.isFinite(knee) || knee < 0 || knee >= 1.0) {
+      throw new RangeError(`knee must be in [0, 1), got ${knee}`);
+    }
+    if (typeof x !== 'number' || !Number.isFinite(x)) {
+      return 0.0;
+    }
+    const absX = x < 0 ? -x : x;
+    if (absX <= knee) {
+      return x;
+    }
+    const headroom = 1.0 - knee;
+    const bounded = softLimitPositive(absX, knee, headroom);
+    return x < 0 ? -bounded : bounded;
+  }
+
+  /**
+   * Sanitizes non-finite samples to `0.0` and applies transparent `softLimitSample`
+   * protection in place across `samples[0 .. count - 1]`.
+   * Pass a reusable `outStats` object to avoid any heap allocation on hot paths.
+   *
+   * @param {Float32Array|number[]} samples
+   * @param {number} [count] Number of samples to process (defaults to `samples.length`).
+   * @param {number|object} [kneeOrOptions=0.9] Knee in `[0, 1)` or `{ knee, stats }`.
+   * @param {{ softClippedSamples: number, nonFiniteSanitized: number }} [outStats]
+   * @returns {{ softClippedSamples: number, nonFiniteSanitized: number }}
+   */
+  function sanitizeAndSoftLimitBuffer(samples, count, kneeOrOptions = DEFAULT_SOFT_LIMIT_KNEE, outStats = null) {
+    if (!samples || typeof samples.length !== 'number') {
+      throw new TypeError('sanitizeAndSoftLimitBuffer requires a Float32Array or array-like buffer');
+    }
+
+    let knee = DEFAULT_SOFT_LIMIT_KNEE;
+    let statsTarget = outStats;
+    if (typeof kneeOrOptions === 'object' && kneeOrOptions !== null) {
+      if (kneeOrOptions.knee !== undefined) {
+        knee = kneeOrOptions.knee;
+      } else if (kneeOrOptions.softLimitKnee !== undefined) {
+        knee = kneeOrOptions.softLimitKnee;
+      }
+      if (!statsTarget && kneeOrOptions.stats && typeof kneeOrOptions.stats === 'object') {
+        statsTarget = kneeOrOptions.stats;
+      } else if (
+        !statsTarget &&
+        kneeOrOptions.knee === undefined &&
+        kneeOrOptions.softLimitKnee === undefined
+      ) {
+        statsTarget = kneeOrOptions;
+      }
+    } else if (kneeOrOptions !== undefined) {
+      knee = kneeOrOptions;
+    }
+
+    if (typeof knee !== 'number' || !Number.isFinite(knee) || knee < 0 || knee >= 1.0) {
+      throw new RangeError(`knee must be in [0, 1), got ${knee}`);
+    }
+
+    let n;
+    if (count === undefined || count === null) {
+      n = samples.length;
+    } else {
+      if (typeof count !== 'number' || !Number.isFinite(count) || count < 0) {
+        throw new RangeError(`count must be a non-negative finite number, got ${count}`);
+      }
+      n = Math.floor(count);
+      if (n > samples.length) n = samples.length;
+    }
+
+    const negKnee = -knee;
+    const headroom = 1.0 - knee;
+    let softClippedSamples = 0;
+    let nonFiniteSanitized = 0;
+
+    for (let i = 0; i < n; i++) {
+      const s = samples[i];
+      if (s - s !== 0) {
+        samples[i] = 0.0;
+        nonFiniteSanitized++;
+      } else if (s > knee) {
+        samples[i] = softLimitPositive(s, knee, headroom);
+        softClippedSamples++;
+      } else if (s < negKnee) {
+        samples[i] = -softLimitPositive(-s, knee, headroom);
+        softClippedSamples++;
+      }
+    }
+
+    if (statsTarget) {
+      statsTarget.softClippedSamples = (statsTarget.softClippedSamples || 0) + softClippedSamples;
+      statsTarget.nonFiniteSanitized = (statsTarget.nonFiniteSanitized || 0) + nonFiniteSanitized;
+      return statsTarget;
+    }
+
+    return { softClippedSamples, nonFiniteSanitized };
+  }
+
   const BaseAudioWorkletProcessor =
     typeof AudioWorkletProcessor === 'function'
       ? AudioWorkletProcessor
@@ -101,10 +330,29 @@
       this._gain = clampGain(procOpts.gain !== undefined ? procOpts.gain : 1.0);
       this._muted = Boolean(procOpts.muted);
       this._smoothingFrames = sanitizeSmoothingFrames(procOpts.smoothingFrames);
-      const rawDeclick =
-        procOpts.declickFrames !== undefined
-          ? procOpts.declickFrames
-          : procOpts.underrunFadeFrames;
+
+      const explicitCosine =
+        procOpts.cosineRamp === true ||
+        procOpts.fadeCurve === 'cosine' ||
+        procOpts.underrunRampFrames !== undefined;
+      this._fadeCurve = sanitizeFadeCurve(
+        procOpts.fadeCurve,
+        explicitCosine ? 'cosine' : 'linear'
+      );
+
+      let rawDeclick;
+      if (procOpts.declickFrames !== undefined) {
+        rawDeclick = procOpts.declickFrames;
+      } else if (procOpts.underrunFadeFrames !== undefined) {
+        rawDeclick = procOpts.underrunFadeFrames;
+      } else if (procOpts.underrunRampFrames !== undefined) {
+        rawDeclick =
+          procOpts.underrunRampFrames === true
+            ? DEFAULT_UNDERRUN_RAMP_FRAMES
+            : procOpts.underrunRampFrames;
+      } else if (explicitCosine) {
+        rawDeclick = DEFAULT_UNDERRUN_RAMP_FRAMES;
+      }
       this._declickFrames = sanitizeDeclickFrames(rawDeclick, 0);
 
       const rawFadeIn =
@@ -127,6 +375,29 @@
         clampLimit = sanitizeClampLimit(procOpts.clampSamples, 0.0);
       }
       this._clampLimit = clampLimit;
+
+      let softLimitEnabled = false;
+      let softLimitKnee = DEFAULT_SOFT_LIMIT_KNEE;
+      const rawSoftKnee =
+        procOpts.softLimitKnee !== undefined
+          ? procOpts.softLimitKnee
+          : procOpts.limiterKnee;
+      if (rawSoftKnee !== undefined && rawSoftKnee !== null) {
+        softLimitKnee = sanitizeSoftLimitKnee(rawSoftKnee, DEFAULT_SOFT_LIMIT_KNEE);
+        softLimitEnabled = true;
+      }
+      const rawSoftLimit =
+        procOpts.softLimit !== undefined ? procOpts.softLimit : procOpts.softClip;
+      if (rawSoftLimit !== undefined) {
+        if (typeof rawSoftLimit === 'number') {
+          softLimitKnee = sanitizeSoftLimitKnee(rawSoftLimit, DEFAULT_SOFT_LIMIT_KNEE);
+          softLimitEnabled = true;
+        } else {
+          softLimitEnabled = Boolean(rawSoftLimit);
+        }
+      }
+      this._softLimitEnabled = softLimitEnabled;
+      this._softLimitKnee = softLimitKnee;
 
       this._targetGain = this._muted ? 0.0 : this._gain;
       this._currentGain = this._targetGain;
@@ -151,6 +422,7 @@
       this._processedFrames = 0;
       this._sanitizedSamples = 0;
       this._clampedSamples = 0;
+      this._softClippedSamples = 0;
       this._underruns = 0;
       this._underrunFrames = 0;
 
@@ -177,8 +449,24 @@
       return this._sanitizedSamples;
     }
 
+    get nonFiniteSanitized() {
+      return this._sanitizedSamples;
+    }
+
     get clampedSamples() {
       return this._clampedSamples;
+    }
+
+    get softClippedSamples() {
+      return this._softClippedSamples;
+    }
+
+    get softLimit() {
+      return this._softLimitEnabled;
+    }
+
+    get softLimitKnee() {
+      return this._softLimitKnee;
     }
 
     get clampSamples() {
@@ -201,6 +489,10 @@
       return this._declickFrames;
     }
 
+    get fadeCurve() {
+      return this._fadeCurve;
+    }
+
     get fadeInFrames() {
       return this._fadeInFramesOverride >= 0 ? this._fadeInFramesOverride : this._declickFrames;
     }
@@ -209,12 +501,38 @@
       return this._declickFadeOuts;
     }
 
+    get underrunFadeOuts() {
+      return this._declickFadeOuts;
+    }
+
     get fadeInCount() {
+      return this._fadeInCount;
+    }
+
+    get recoveryFadeIns() {
       return this._fadeInCount;
     }
 
     get inUnderrun() {
       return this._inUnderrun;
+    }
+
+    setFadeCurve(curve) {
+      this._fadeCurve = sanitizeFadeCurve(curve, this._fadeCurve);
+      return this._fadeCurve;
+    }
+
+    setSoftLimit(enabledOrKnee, optionalKnee) {
+      if (typeof enabledOrKnee === 'number') {
+        this._softLimitKnee = sanitizeSoftLimitKnee(enabledOrKnee, this._softLimitKnee);
+        this._softLimitEnabled = true;
+      } else if (enabledOrKnee !== undefined) {
+        this._softLimitEnabled = Boolean(enabledOrKnee);
+      }
+      if (optionalKnee !== undefined && optionalKnee !== null) {
+        this._softLimitKnee = sanitizeSoftLimitKnee(optionalKnee, this._softLimitKnee);
+      }
+      return this._softLimitEnabled;
     }
 
     setDeclickFrames(frames) {
@@ -358,9 +676,12 @@
         currentGain: this._currentGain,
         targetGain: this._targetGain,
         declickFrames: this._declickFrames,
+        fadeCurve: this._fadeCurve,
         fadeInFrames: this.fadeInFrames,
         clampSamples: this._clampLimit > 0.0,
         clampLimit: this._clampLimit,
+        softLimit: this._softLimitEnabled,
+        softLimitKnee: this._softLimitKnee,
         capacityFrames: this._capacityFrames,
         channels: this._channels,
         bufferedFrames: this._computeBufferedFrames(),
@@ -368,7 +689,9 @@
         underrunFrames: ctrl ? Atomics.load(ctrl, HDR_UNDERRUN_FRAMES) : this._underrunFrames,
         inUnderrun: this._inUnderrun,
         fadeOutCount: this._declickFadeOuts,
+        underrunFadeOuts: this._declickFadeOuts,
         fadeInCount: this._fadeInCount,
+        recoveryFadeIns: this._fadeInCount,
         overflows,
         overruns: overflows,
         droppedFrames: ctrl ? Atomics.load(ctrl, HDR_DROPPED_FRAMES) : 0,
@@ -376,7 +699,9 @@
         processedFrames: this._processedFrames,
         framesProcessed: this._processedFrames,
         sanitizedSamples: this._sanitizedSamples,
+        nonFiniteSanitized: this._sanitizedSamples,
         clampedSamples: this._clampedSamples,
+        softClippedSamples: this._softClippedSamples,
       };
     }
 
@@ -488,6 +813,45 @@
           break;
         }
 
+        case 'setFadeCurve': {
+          const raw = msg.fadeCurve !== undefined ? msg.fadeCurve : msg.curve;
+          this.setFadeCurve(raw);
+          if (msg.id !== undefined) {
+            this._post({
+              type: 'fadeCurve',
+              fadeCurve: this._fadeCurve,
+              id: msg.id,
+            });
+          }
+          break;
+        }
+
+        case 'setSoftLimit':
+        case 'setSoftClip': {
+          const enabledOrKnee =
+            msg.softLimit !== undefined
+              ? msg.softLimit
+              : msg.softClip !== undefined
+                ? msg.softClip
+                : msg.enabled;
+          const knee =
+            msg.softLimitKnee !== undefined
+              ? msg.softLimitKnee
+              : msg.knee !== undefined
+                ? msg.knee
+                : msg.limiterKnee;
+          this.setSoftLimit(enabledOrKnee, knee);
+          if (msg.id !== undefined) {
+            this._post({
+              type: 'softLimit',
+              softLimit: this._softLimitEnabled,
+              softLimitKnee: this._softLimitKnee,
+              id: msg.id,
+            });
+          }
+          break;
+        }
+
         case 'stats': {
           const reply = Object.assign({ type: 'stats' }, this.getStats());
           if (msg.id !== undefined) reply.id = msg.id;
@@ -582,6 +946,11 @@
         outChannels < lastSamples.length ? outChannels : lastSamples.length;
       const clampLimit = this._clampLimit;
       const negClampLimit = -clampLimit;
+      const softLimit = this._softLimitEnabled;
+      const softKnee = this._softLimitKnee;
+      const negSoftKnee = -softKnee;
+      const softHeadroom = 1.0 - softKnee;
+      const useCosine = this._fadeCurve === 'cosine';
 
       if (framesToRead > 0) {
         const wasInUnderrun = this._inUnderrun;
@@ -593,7 +962,9 @@
           this._inUnderrun = false;
           if (fadeInFrames > 0) {
             if (wasMidFadeOut) {
-              const prevScale = (this._declickTotal - this._declickPos) / this._declickTotal;
+              const prevScale = useCosine
+                ? 0.5 * (1.0 + Math.cos(Math.PI * (this._declickPos / this._declickTotal)))
+                : (this._declickTotal - this._declickPos) / this._declickTotal;
               const fadeInFrom = this._fadeInFrom;
               let hasOffset = false;
               for (let c = 0; c < trackedChannels; c++) {
@@ -630,6 +1001,7 @@
         const copyChannels = inChannels < outChannels ? inChannels : outChannels;
         let sanitized = 0;
         let clamped = 0;
+        let softClipped = 0;
 
         if (this._rampRemaining > 0) {
           // Smooth linear gain ramp (click-free volume/mute transition).
@@ -653,25 +1025,47 @@
               if (sL - sL !== 0) {
                 sL = 0.0;
                 sanitized++;
-              } else if (clampLimit > 0.0) {
-                if (sL > clampLimit) {
-                  sL = clampLimit;
-                  clamped++;
-                } else if (sL < negClampLimit) {
-                  sL = negClampLimit;
-                  clamped++;
+              } else {
+                if (softLimit) {
+                  if (sL > softKnee) {
+                    sL = softLimitPositive(sL, softKnee, softHeadroom);
+                    softClipped++;
+                  } else if (sL < negSoftKnee) {
+                    sL = -softLimitPositive(-sL, softKnee, softHeadroom);
+                    softClipped++;
+                  }
+                }
+                if (clampLimit > 0.0) {
+                  if (sL > clampLimit) {
+                    sL = clampLimit;
+                    clamped++;
+                  } else if (sL < negClampLimit) {
+                    sL = negClampLimit;
+                    clamped++;
+                  }
                 }
               }
               if (sR - sR !== 0) {
                 sR = 0.0;
                 sanitized++;
-              } else if (clampLimit > 0.0) {
-                if (sR > clampLimit) {
-                  sR = clampLimit;
-                  clamped++;
-                } else if (sR < negClampLimit) {
-                  sR = negClampLimit;
-                  clamped++;
+              } else {
+                if (softLimit) {
+                  if (sR > softKnee) {
+                    sR = softLimitPositive(sR, softKnee, softHeadroom);
+                    softClipped++;
+                  } else if (sR < negSoftKnee) {
+                    sR = -softLimitPositive(-sR, softKnee, softHeadroom);
+                    softClipped++;
+                  }
+                }
+                if (clampLimit > 0.0) {
+                  if (sR > clampLimit) {
+                    sR = clampLimit;
+                    clamped++;
+                  } else if (sR < negClampLimit) {
+                    sR = negClampLimit;
+                    clamped++;
+                  }
                 }
               }
               if (gain === 0.0) {
@@ -697,25 +1091,47 @@
                 if (sL - sL !== 0) {
                   sL = 0.0;
                   sanitized++;
-                } else if (clampLimit > 0.0) {
-                  if (sL > clampLimit) {
-                    sL = clampLimit;
-                    clamped++;
-                  } else if (sL < negClampLimit) {
-                    sL = negClampLimit;
-                    clamped++;
+                } else {
+                  if (softLimit) {
+                    if (sL > softKnee) {
+                      sL = softLimitPositive(sL, softKnee, softHeadroom);
+                      softClipped++;
+                    } else if (sL < negSoftKnee) {
+                      sL = -softLimitPositive(-sL, softKnee, softHeadroom);
+                      softClipped++;
+                    }
+                  }
+                  if (clampLimit > 0.0) {
+                    if (sL > clampLimit) {
+                      sL = clampLimit;
+                      clamped++;
+                    } else if (sL < negClampLimit) {
+                      sL = negClampLimit;
+                      clamped++;
+                    }
                   }
                 }
                 if (sR - sR !== 0) {
                   sR = 0.0;
                   sanitized++;
-                } else if (clampLimit > 0.0) {
-                  if (sR > clampLimit) {
-                    sR = clampLimit;
-                    clamped++;
-                  } else if (sR < negClampLimit) {
-                    sR = negClampLimit;
-                    clamped++;
+                } else {
+                  if (softLimit) {
+                    if (sR > softKnee) {
+                      sR = softLimitPositive(sR, softKnee, softHeadroom);
+                      softClipped++;
+                    } else if (sR < negSoftKnee) {
+                      sR = -softLimitPositive(-sR, softKnee, softHeadroom);
+                      softClipped++;
+                    }
+                  }
+                  if (clampLimit > 0.0) {
+                    if (sR > clampLimit) {
+                      sR = clampLimit;
+                      clamped++;
+                    } else if (sR < negClampLimit) {
+                      sR = negClampLimit;
+                      clamped++;
+                    }
                   }
                 }
                 if (gain === 0.0) {
@@ -740,13 +1156,24 @@
               if (s - s !== 0) {
                 s = 0.0;
                 sanitized++;
-              } else if (clampLimit > 0.0) {
-                if (s > clampLimit) {
-                  s = clampLimit;
-                  clamped++;
-                } else if (s < negClampLimit) {
-                  s = negClampLimit;
-                  clamped++;
+              } else {
+                if (softLimit) {
+                  if (s > softKnee) {
+                    s = softLimitPositive(s, softKnee, softHeadroom);
+                    softClipped++;
+                  } else if (s < negSoftKnee) {
+                    s = -softLimitPositive(-s, softKnee, softHeadroom);
+                    softClipped++;
+                  }
+                }
+                if (clampLimit > 0.0) {
+                  if (s > clampLimit) {
+                    s = clampLimit;
+                    clamped++;
+                  } else if (s < negClampLimit) {
+                    s = negClampLimit;
+                    clamped++;
+                  }
                 }
               }
               const v = gain === 0.0 ? 0.0 : s * gain;
@@ -768,13 +1195,24 @@
                 if (s - s !== 0) {
                   s = 0.0;
                   sanitized++;
-                } else if (clampLimit > 0.0) {
-                  if (s > clampLimit) {
-                    s = clampLimit;
-                    clamped++;
-                  } else if (s < negClampLimit) {
-                    s = negClampLimit;
-                    clamped++;
+                } else {
+                  if (softLimit) {
+                    if (s > softKnee) {
+                      s = softLimitPositive(s, softKnee, softHeadroom);
+                      softClipped++;
+                    } else if (s < negSoftKnee) {
+                      s = -softLimitPositive(-s, softKnee, softHeadroom);
+                      softClipped++;
+                    }
+                  }
+                  if (clampLimit > 0.0) {
+                    if (s > clampLimit) {
+                      s = clampLimit;
+                      clamped++;
+                    } else if (s < negClampLimit) {
+                      s = negClampLimit;
+                      clamped++;
+                    }
                   }
                 }
                 const v = gain === 0.0 ? 0.0 : s * gain;
@@ -797,13 +1235,24 @@
                 if (s - s !== 0) {
                   s = 0.0;
                   sanitized++;
-                } else if (clampLimit > 0.0) {
-                  if (s > clampLimit) {
-                    s = clampLimit;
-                    clamped++;
-                  } else if (s < negClampLimit) {
-                    s = negClampLimit;
-                    clamped++;
+                } else {
+                  if (softLimit) {
+                    if (s > softKnee) {
+                      s = softLimitPositive(s, softKnee, softHeadroom);
+                      softClipped++;
+                    } else if (s < negSoftKnee) {
+                      s = -softLimitPositive(-s, softKnee, softHeadroom);
+                      softClipped++;
+                    }
+                  }
+                  if (clampLimit > 0.0) {
+                    if (s > clampLimit) {
+                      s = clampLimit;
+                      clamped++;
+                    } else if (s < negClampLimit) {
+                      s = negClampLimit;
+                      clamped++;
+                    }
                   }
                 }
                 output[c][f] = gain === 0.0 ? 0.0 : s * gain;
@@ -827,13 +1276,24 @@
                   if (s - s !== 0) {
                     s = 0.0;
                     sanitized++;
-                  } else if (clampLimit > 0.0) {
-                    if (s > clampLimit) {
-                      s = clampLimit;
-                      clamped++;
-                    } else if (s < negClampLimit) {
-                      s = negClampLimit;
-                      clamped++;
+                  } else {
+                    if (softLimit) {
+                      if (s > softKnee) {
+                        s = softLimitPositive(s, softKnee, softHeadroom);
+                        softClipped++;
+                      } else if (s < negSoftKnee) {
+                        s = -softLimitPositive(-s, softKnee, softHeadroom);
+                        softClipped++;
+                      }
+                    }
+                    if (clampLimit > 0.0) {
+                      if (s > clampLimit) {
+                        s = clampLimit;
+                        clamped++;
+                      } else if (s < negClampLimit) {
+                        s = negClampLimit;
+                        clamped++;
+                      }
                     }
                   }
                   output[c][dst] = gain === 0.0 ? 0.0 : s * gain;
@@ -856,7 +1316,7 @@
             for (let c = 0; c < outChannels; c++) {
               output[c].fill(0, 0, framesToRead);
             }
-            // Scan consumed ring samples so sanitized/clamped telemetry stays exact while muted.
+            // Scan consumed ring samples so sanitized/clamped/softClipped telemetry stays exact while muted.
             const scanChannels = inChannels === 1 ? 1 : copyChannels;
             if (scanChannels === inChannels) {
               const firstCount = firstFrames * inChannels;
@@ -865,8 +1325,13 @@
                 const s = samples[src + i];
                 if (s - s !== 0) {
                   sanitized++;
-                } else if (clampLimit > 0.0 && (s > clampLimit || s < negClampLimit)) {
-                  clamped++;
+                } else {
+                  if (softLimit && (s > softKnee || s < negSoftKnee)) {
+                    softClipped++;
+                  }
+                  if (clampLimit > 0.0 && (s > clampLimit || s < negClampLimit)) {
+                    clamped++;
+                  }
                 }
               }
               if (secondFrames > 0) {
@@ -875,8 +1340,13 @@
                   const s = samples[i];
                   if (s - s !== 0) {
                     sanitized++;
-                  } else if (clampLimit > 0.0 && (s > clampLimit || s < negClampLimit)) {
-                    clamped++;
+                  } else {
+                    if (softLimit && (s > softKnee || s < negSoftKnee)) {
+                      softClipped++;
+                    }
+                    if (clampLimit > 0.0 && (s > clampLimit || s < negClampLimit)) {
+                      clamped++;
+                    }
                   }
                 }
               }
@@ -887,8 +1357,13 @@
                   const s = samples[srcBase + c];
                   if (s - s !== 0) {
                     sanitized++;
-                  } else if (clampLimit > 0.0 && (s > clampLimit || s < negClampLimit)) {
-                    clamped++;
+                  } else {
+                    if (softLimit && (s > softKnee || s < negSoftKnee)) {
+                      softClipped++;
+                    }
+                    if (clampLimit > 0.0 && (s > clampLimit || s < negClampLimit)) {
+                      clamped++;
+                    }
                   }
                 }
                 srcBase += inChannels;
@@ -900,8 +1375,13 @@
                     const s = samples[srcBase + c];
                     if (s - s !== 0) {
                       sanitized++;
-                    } else if (clampLimit > 0.0 && (s > clampLimit || s < negClampLimit)) {
-                      clamped++;
+                    } else {
+                      if (softLimit && (s > softKnee || s < negSoftKnee)) {
+                        softClipped++;
+                      }
+                      if (clampLimit > 0.0 && (s > clampLimit || s < negClampLimit)) {
+                        clamped++;
+                      }
                     }
                   }
                   srcBase += inChannels;
@@ -919,25 +1399,47 @@
                 if (sL - sL !== 0) {
                   sL = 0.0;
                   sanitized++;
-                } else if (clampLimit > 0.0) {
-                  if (sL > clampLimit) {
-                    sL = clampLimit;
-                    clamped++;
-                  } else if (sL < negClampLimit) {
-                    sL = negClampLimit;
-                    clamped++;
+                } else {
+                  if (softLimit) {
+                    if (sL > softKnee) {
+                      sL = softLimitPositive(sL, softKnee, softHeadroom);
+                      softClipped++;
+                    } else if (sL < negSoftKnee) {
+                      sL = -softLimitPositive(-sL, softKnee, softHeadroom);
+                      softClipped++;
+                    }
+                  }
+                  if (clampLimit > 0.0) {
+                    if (sL > clampLimit) {
+                      sL = clampLimit;
+                      clamped++;
+                    } else if (sL < negClampLimit) {
+                      sL = negClampLimit;
+                      clamped++;
+                    }
                   }
                 }
                 if (sR - sR !== 0) {
                   sR = 0.0;
                   sanitized++;
-                } else if (clampLimit > 0.0) {
-                  if (sR > clampLimit) {
-                    sR = clampLimit;
-                    clamped++;
-                  } else if (sR < negClampLimit) {
-                    sR = negClampLimit;
-                    clamped++;
+                } else {
+                  if (softLimit) {
+                    if (sR > softKnee) {
+                      sR = softLimitPositive(sR, softKnee, softHeadroom);
+                      softClipped++;
+                    } else if (sR < negSoftKnee) {
+                      sR = -softLimitPositive(-sR, softKnee, softHeadroom);
+                      softClipped++;
+                    }
+                  }
+                  if (clampLimit > 0.0) {
+                    if (sR > clampLimit) {
+                      sR = clampLimit;
+                      clamped++;
+                    } else if (sR < negClampLimit) {
+                      sR = negClampLimit;
+                      clamped++;
+                    }
                   }
                 }
                 outL[f] = sL;
@@ -953,25 +1455,47 @@
                   if (sL - sL !== 0) {
                     sL = 0.0;
                     sanitized++;
-                  } else if (clampLimit > 0.0) {
-                    if (sL > clampLimit) {
-                      sL = clampLimit;
-                      clamped++;
-                    } else if (sL < negClampLimit) {
-                      sL = negClampLimit;
-                      clamped++;
+                  } else {
+                    if (softLimit) {
+                      if (sL > softKnee) {
+                        sL = softLimitPositive(sL, softKnee, softHeadroom);
+                        softClipped++;
+                      } else if (sL < negSoftKnee) {
+                        sL = -softLimitPositive(-sL, softKnee, softHeadroom);
+                        softClipped++;
+                      }
+                    }
+                    if (clampLimit > 0.0) {
+                      if (sL > clampLimit) {
+                        sL = clampLimit;
+                        clamped++;
+                      } else if (sL < negClampLimit) {
+                        sL = negClampLimit;
+                        clamped++;
+                      }
                     }
                   }
                   if (sR - sR !== 0) {
                     sR = 0.0;
                     sanitized++;
-                  } else if (clampLimit > 0.0) {
-                    if (sR > clampLimit) {
-                      sR = clampLimit;
-                      clamped++;
-                    } else if (sR < negClampLimit) {
-                      sR = negClampLimit;
-                      clamped++;
+                  } else {
+                    if (softLimit) {
+                      if (sR > softKnee) {
+                        sR = softLimitPositive(sR, softKnee, softHeadroom);
+                        softClipped++;
+                      } else if (sR < negSoftKnee) {
+                        sR = -softLimitPositive(-sR, softKnee, softHeadroom);
+                        softClipped++;
+                      }
+                    }
+                    if (clampLimit > 0.0) {
+                      if (sR > clampLimit) {
+                        sR = clampLimit;
+                        clamped++;
+                      } else if (sR < negClampLimit) {
+                        sR = negClampLimit;
+                        clamped++;
+                      }
                     }
                   }
                   outL[dst] = sL;
@@ -986,13 +1510,24 @@
                 if (s - s !== 0) {
                   s = 0.0;
                   sanitized++;
-                } else if (clampLimit > 0.0) {
-                  if (s > clampLimit) {
-                    s = clampLimit;
-                    clamped++;
-                  } else if (s < negClampLimit) {
-                    s = negClampLimit;
-                    clamped++;
+                } else {
+                  if (softLimit) {
+                    if (s > softKnee) {
+                      s = softLimitPositive(s, softKnee, softHeadroom);
+                      softClipped++;
+                    } else if (s < negSoftKnee) {
+                      s = -softLimitPositive(-s, softKnee, softHeadroom);
+                      softClipped++;
+                    }
+                  }
+                  if (clampLimit > 0.0) {
+                    if (s > clampLimit) {
+                      s = clampLimit;
+                      clamped++;
+                    } else if (s < negClampLimit) {
+                      s = negClampLimit;
+                      clamped++;
+                    }
                   }
                 }
                 for (let c = 0; c < outChannels; c++) {
@@ -1008,13 +1543,24 @@
                   if (s - s !== 0) {
                     s = 0.0;
                     sanitized++;
-                  } else if (clampLimit > 0.0) {
-                    if (s > clampLimit) {
-                      s = clampLimit;
-                      clamped++;
-                    } else if (s < negClampLimit) {
-                      s = negClampLimit;
-                      clamped++;
+                  } else {
+                    if (softLimit) {
+                      if (s > softKnee) {
+                        s = softLimitPositive(s, softKnee, softHeadroom);
+                        softClipped++;
+                      } else if (s < negSoftKnee) {
+                        s = -softLimitPositive(-s, softKnee, softHeadroom);
+                        softClipped++;
+                      }
+                    }
+                    if (clampLimit > 0.0) {
+                      if (s > clampLimit) {
+                        s = clampLimit;
+                        clamped++;
+                      } else if (s < negClampLimit) {
+                        s = negClampLimit;
+                        clamped++;
+                      }
                     }
                   }
                   for (let c = 0; c < outChannels; c++) {
@@ -1031,13 +1577,24 @@
                   if (s - s !== 0) {
                     s = 0.0;
                     sanitized++;
-                  } else if (clampLimit > 0.0) {
-                    if (s > clampLimit) {
-                      s = clampLimit;
-                      clamped++;
-                    } else if (s < negClampLimit) {
-                      s = negClampLimit;
-                      clamped++;
+                  } else {
+                    if (softLimit) {
+                      if (s > softKnee) {
+                        s = softLimitPositive(s, softKnee, softHeadroom);
+                        softClipped++;
+                      } else if (s < negSoftKnee) {
+                        s = -softLimitPositive(-s, softKnee, softHeadroom);
+                        softClipped++;
+                      }
+                    }
+                    if (clampLimit > 0.0) {
+                      if (s > clampLimit) {
+                        s = clampLimit;
+                        clamped++;
+                      } else if (s < negClampLimit) {
+                        s = negClampLimit;
+                        clamped++;
+                      }
                     }
                   }
                   output[c][f] = s;
@@ -1056,13 +1613,24 @@
                     if (s - s !== 0) {
                       s = 0.0;
                       sanitized++;
-                    } else if (clampLimit > 0.0) {
-                      if (s > clampLimit) {
-                        s = clampLimit;
-                        clamped++;
-                      } else if (s < negClampLimit) {
-                        s = negClampLimit;
-                        clamped++;
+                    } else {
+                      if (softLimit) {
+                        if (s > softKnee) {
+                          s = softLimitPositive(s, softKnee, softHeadroom);
+                          softClipped++;
+                        } else if (s < negSoftKnee) {
+                          s = -softLimitPositive(-s, softKnee, softHeadroom);
+                          softClipped++;
+                        }
+                      }
+                      if (clampLimit > 0.0) {
+                        if (s > clampLimit) {
+                          s = clampLimit;
+                          clamped++;
+                        } else if (s < negClampLimit) {
+                          s = negClampLimit;
+                          clamped++;
+                        }
                       }
                     }
                     output[c][dst] = s;
@@ -1085,25 +1653,47 @@
                 if (sL - sL !== 0) {
                   sL = 0.0;
                   sanitized++;
-                } else if (clampLimit > 0.0) {
-                  if (sL > clampLimit) {
-                    sL = clampLimit;
-                    clamped++;
-                  } else if (sL < negClampLimit) {
-                    sL = negClampLimit;
-                    clamped++;
+                } else {
+                  if (softLimit) {
+                    if (sL > softKnee) {
+                      sL = softLimitPositive(sL, softKnee, softHeadroom);
+                      softClipped++;
+                    } else if (sL < negSoftKnee) {
+                      sL = -softLimitPositive(-sL, softKnee, softHeadroom);
+                      softClipped++;
+                    }
+                  }
+                  if (clampLimit > 0.0) {
+                    if (sL > clampLimit) {
+                      sL = clampLimit;
+                      clamped++;
+                    } else if (sL < negClampLimit) {
+                      sL = negClampLimit;
+                      clamped++;
+                    }
                   }
                 }
                 if (sR - sR !== 0) {
                   sR = 0.0;
                   sanitized++;
-                } else if (clampLimit > 0.0) {
-                  if (sR > clampLimit) {
-                    sR = clampLimit;
-                    clamped++;
-                  } else if (sR < negClampLimit) {
-                    sR = negClampLimit;
-                    clamped++;
+                } else {
+                  if (softLimit) {
+                    if (sR > softKnee) {
+                      sR = softLimitPositive(sR, softKnee, softHeadroom);
+                      softClipped++;
+                    } else if (sR < negSoftKnee) {
+                      sR = -softLimitPositive(-sR, softKnee, softHeadroom);
+                      softClipped++;
+                    }
+                  }
+                  if (clampLimit > 0.0) {
+                    if (sR > clampLimit) {
+                      sR = clampLimit;
+                      clamped++;
+                    } else if (sR < negClampLimit) {
+                      sR = negClampLimit;
+                      clamped++;
+                    }
                   }
                 }
                 outL[f] = sL * gain;
@@ -1119,25 +1709,47 @@
                   if (sL - sL !== 0) {
                     sL = 0.0;
                     sanitized++;
-                  } else if (clampLimit > 0.0) {
-                    if (sL > clampLimit) {
-                      sL = clampLimit;
-                      clamped++;
-                    } else if (sL < negClampLimit) {
-                      sL = negClampLimit;
-                      clamped++;
+                  } else {
+                    if (softLimit) {
+                      if (sL > softKnee) {
+                        sL = softLimitPositive(sL, softKnee, softHeadroom);
+                        softClipped++;
+                      } else if (sL < negSoftKnee) {
+                        sL = -softLimitPositive(-sL, softKnee, softHeadroom);
+                        softClipped++;
+                      }
+                    }
+                    if (clampLimit > 0.0) {
+                      if (sL > clampLimit) {
+                        sL = clampLimit;
+                        clamped++;
+                      } else if (sL < negClampLimit) {
+                        sL = negClampLimit;
+                        clamped++;
+                      }
                     }
                   }
                   if (sR - sR !== 0) {
                     sR = 0.0;
                     sanitized++;
-                  } else if (clampLimit > 0.0) {
-                    if (sR > clampLimit) {
-                      sR = clampLimit;
-                      clamped++;
-                    } else if (sR < negClampLimit) {
-                      sR = negClampLimit;
-                      clamped++;
+                  } else {
+                    if (softLimit) {
+                      if (sR > softKnee) {
+                        sR = softLimitPositive(sR, softKnee, softHeadroom);
+                        softClipped++;
+                      } else if (sR < negSoftKnee) {
+                        sR = -softLimitPositive(-sR, softKnee, softHeadroom);
+                        softClipped++;
+                      }
+                    }
+                    if (clampLimit > 0.0) {
+                      if (sR > clampLimit) {
+                        sR = clampLimit;
+                        clamped++;
+                      } else if (sR < negClampLimit) {
+                        sR = negClampLimit;
+                        clamped++;
+                      }
                     }
                   }
                   outL[dst] = sL * gain;
@@ -1152,13 +1764,24 @@
                 if (s - s !== 0) {
                   s = 0.0;
                   sanitized++;
-                } else if (clampLimit > 0.0) {
-                  if (s > clampLimit) {
-                    s = clampLimit;
-                    clamped++;
-                  } else if (s < negClampLimit) {
-                    s = negClampLimit;
-                    clamped++;
+                } else {
+                  if (softLimit) {
+                    if (s > softKnee) {
+                      s = softLimitPositive(s, softKnee, softHeadroom);
+                      softClipped++;
+                    } else if (s < negSoftKnee) {
+                      s = -softLimitPositive(-s, softKnee, softHeadroom);
+                      softClipped++;
+                    }
+                  }
+                  if (clampLimit > 0.0) {
+                    if (s > clampLimit) {
+                      s = clampLimit;
+                      clamped++;
+                    } else if (s < negClampLimit) {
+                      s = negClampLimit;
+                      clamped++;
+                    }
                   }
                 }
                 const v = s * gain;
@@ -1175,13 +1798,24 @@
                   if (s - s !== 0) {
                     s = 0.0;
                     sanitized++;
-                  } else if (clampLimit > 0.0) {
-                    if (s > clampLimit) {
-                      s = clampLimit;
-                      clamped++;
-                    } else if (s < negClampLimit) {
-                      s = negClampLimit;
-                      clamped++;
+                  } else {
+                    if (softLimit) {
+                      if (s > softKnee) {
+                        s = softLimitPositive(s, softKnee, softHeadroom);
+                        softClipped++;
+                      } else if (s < negSoftKnee) {
+                        s = -softLimitPositive(-s, softKnee, softHeadroom);
+                        softClipped++;
+                      }
+                    }
+                    if (clampLimit > 0.0) {
+                      if (s > clampLimit) {
+                        s = clampLimit;
+                        clamped++;
+                      } else if (s < negClampLimit) {
+                        s = negClampLimit;
+                        clamped++;
+                      }
                     }
                   }
                   const v = s * gain;
@@ -1199,13 +1833,24 @@
                   if (s - s !== 0) {
                     s = 0.0;
                     sanitized++;
-                  } else if (clampLimit > 0.0) {
-                    if (s > clampLimit) {
-                      s = clampLimit;
-                      clamped++;
-                    } else if (s < negClampLimit) {
-                      s = negClampLimit;
-                      clamped++;
+                  } else {
+                    if (softLimit) {
+                      if (s > softKnee) {
+                        s = softLimitPositive(s, softKnee, softHeadroom);
+                        softClipped++;
+                      } else if (s < negSoftKnee) {
+                        s = -softLimitPositive(-s, softKnee, softHeadroom);
+                        softClipped++;
+                      }
+                    }
+                    if (clampLimit > 0.0) {
+                      if (s > clampLimit) {
+                        s = clampLimit;
+                        clamped++;
+                      } else if (s < negClampLimit) {
+                        s = negClampLimit;
+                        clamped++;
+                      }
                     }
                   }
                   output[c][f] = s * gain;
@@ -1224,13 +1869,24 @@
                     if (s - s !== 0) {
                       s = 0.0;
                       sanitized++;
-                    } else if (clampLimit > 0.0) {
-                      if (s > clampLimit) {
-                        s = clampLimit;
-                        clamped++;
-                      } else if (s < negClampLimit) {
-                        s = negClampLimit;
-                        clamped++;
+                    } else {
+                      if (softLimit) {
+                        if (s > softKnee) {
+                          s = softLimitPositive(s, softKnee, softHeadroom);
+                          softClipped++;
+                        } else if (s < negSoftKnee) {
+                          s = -softLimitPositive(-s, softKnee, softHeadroom);
+                          softClipped++;
+                        }
+                      }
+                      if (clampLimit > 0.0) {
+                        if (s > clampLimit) {
+                          s = clampLimit;
+                          clamped++;
+                        } else if (s < negClampLimit) {
+                          s = negClampLimit;
+                          clamped++;
+                        }
                       }
                     }
                     output[c][dst] = s * gain;
@@ -1251,6 +1907,9 @@
         if (clamped > 0) {
           this._clampedSamples += clamped;
         }
+        if (softClipped > 0) {
+          this._softClippedSamples += softClipped;
+        }
 
         let nextRead = read + framesToRead;
         if (nextRead >= modulus) {
@@ -1258,7 +1917,7 @@
         }
         Atomics.store(ctrl, HDR_READ_CURSOR, nextRead);
 
-        // Apply smooth linear fade-in (or crossfade from interrupted fade-out) on recovery.
+        // Apply smooth linear or half-cosine fade-in (or crossfade from interrupted fade-out) on recovery.
         if (this._fadeInTotal > 0) {
           const total = this._fadeInTotal;
           const startPos = this._fadeInPos;
@@ -1268,7 +1927,12 @@
           if (this._fadeInHasOffset) {
             const fadeInFrom = this._fadeInFrom;
             for (let f = 0; f < rampCount; f++) {
-              const alpha = (startPos + f) / total;
+              const stepIdx = startPos + f;
+              const alpha = useCosine
+                ? stepIdx === 0
+                  ? 0.0
+                  : 0.5 * (1.0 - Math.cos(Math.PI * (stepIdx / total)))
+                : stepIdx / total;
               if (alpha === 0.0) {
                 for (let c = 0; c < trackedChannels; c++) {
                   output[c][f] = fadeInFrom[c];
@@ -1288,7 +1952,12 @@
             }
           } else {
             for (let f = 0; f < rampCount; f++) {
-              const alpha = (startPos + f) / total;
+              const stepIdx = startPos + f;
+              const alpha = useCosine
+                ? stepIdx === 0
+                  ? 0.0
+                  : 0.5 * (1.0 - Math.cos(Math.PI * (stepIdx / total)))
+                : stepIdx / total;
               if (alpha === 0.0) {
                 for (let c = 0; c < outChannels; c++) {
                   output[c][f] = 0.0;
@@ -1350,7 +2019,12 @@
             const fadeCount = missingFrames < remainingFade ? missingFrames : remainingFade;
 
             for (let i = 0; i < fadeCount; i++) {
-              const scale = (total - 1 - (startPos + i)) / total;
+              const stepIdx = startPos + i;
+              const scale = useCosine
+                ? stepIdx === total - 1
+                  ? 0.0
+                  : 0.5 * (1.0 + Math.cos(Math.PI * ((stepIdx + 1) / total)))
+                : (total - 1 - stepIdx) / total;
               const dst = framesToRead + i;
               if (scale === 0.0) {
                 for (let c = 0; c < outChannels; c++) {
@@ -1423,13 +2097,18 @@
 
   const exportsObj = {
     PlayGta6AudioWorkletProcessor,
+    applyFadeRamp,
+    softLimitSample,
+    sanitizeAndSoftLimitBuffer,
     PROCESSOR_NAME,
     DEFAULT_CHANNELS,
     DEFAULT_SMOOTHING_FRAMES,
     DEFAULT_DECLICK_FRAMES,
     DEFAULT_FADE_IN_FRAMES,
+    DEFAULT_UNDERRUN_RAMP_FRAMES,
     MAX_DECLICK_FRAMES,
     DEFAULT_SAMPLE_CLAMP_LIMIT,
+    DEFAULT_SOFT_LIMIT_KNEE,
     HDR_WRITE_CURSOR,
     HDR_READ_CURSOR,
     HDR_CAPACITY_FRAMES,

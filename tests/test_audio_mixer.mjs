@@ -5,12 +5,16 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const mixerMod = require('../web/workers/audio_mixer.js');
 const audioWorkerMod = require('../web/workers/audio_worker.js');
+const workletMod = require('../web/workers/audio_worklet_processor.js');
 
 const {
   AudioMixer,
   decodePcm16,
   decodeImaAdpcm,
   softClipSample,
+  softLimitSample,
+  sanitizeAndSoftLimitBuffer,
+  applyFadeRamp,
   downmixToStereo,
   resampleLinear,
   DEFAULT_SAMPLE_RATE,
@@ -22,7 +26,9 @@ const {
   DEFAULT_QUANTUM_FRAMES,
   DEFAULT_INITIAL_BUFFER_FRAMES,
   DEFAULT_GAIN_RAMP_FRAMES,
+  DEFAULT_UNDERRUN_RAMP_FRAMES,
   DEFAULT_SOFT_CLIP_KNEE,
+  DEFAULT_SOFT_LIMIT_KNEE,
   ITU_BS775_CENTER_GAIN,
   ITU_BS775_SURROUND_GAIN,
   ITU_BS775_LFE_GAIN,
@@ -31,6 +37,20 @@ const {
   IMA_STEP_TABLE,
 } = mixerMod;
 const { AudioRingBuffer } = audioWorkerMod;
+const {
+  PlayGta6AudioWorkletProcessor,
+  applyFadeRamp: workletApplyFadeRamp,
+  softLimitSample: workletSoftLimitSample,
+  sanitizeAndSoftLimitBuffer: workletSanitizeAndSoftLimitBuffer,
+  DEFAULT_UNDERRUN_RAMP_FRAMES: WORKLET_DEFAULT_UNDERRUN_RAMP_FRAMES,
+  DEFAULT_SOFT_LIMIT_KNEE: WORKLET_DEFAULT_SOFT_LIMIT_KNEE,
+  HDR_WRITE_CURSOR,
+  HDR_READ_CURSOR,
+  HDR_CAPACITY_FRAMES,
+  HDR_CHANNELS,
+  RING_HEADER_INT32_COUNT,
+  RING_HEADER_BYTES,
+} = workletMod;
 
 /**
  * Reference IMA-ADPCM encoder helper for testing mono & stereo waveforms
@@ -1344,4 +1364,437 @@ test('W217: soft-clip bounds & telemetry expose framesMixed, activeVoices, peakV
   assert.throws(() => mixer.recordUnderrun(-1), RangeError);
   assert.throws(() => mixer.recordUnderrun(1.5), RangeError);
 });
+
+// ---------------------------------------------------------------------------
+// W272: Click-Free Underrun Cosine Ramps & NaN/Inf + Soft-Clip Limiter
+// ---------------------------------------------------------------------------
+
+function pushRawWorkletSabFrames(sab, rawSamples) {
+  const ctrl = new Int32Array(sab, 0, RING_HEADER_INT32_COUNT);
+  const cap = Atomics.load(ctrl, HDR_CAPACITY_FRAMES);
+  const channels = Atomics.load(ctrl, HDR_CHANNELS);
+  const modulus = cap * 2;
+  const payload = new Float32Array(sab, RING_HEADER_BYTES, cap * channels);
+
+  const inputFrames = Math.floor(rawSamples.length / channels);
+  const write = Atomics.load(ctrl, HDR_WRITE_CURSOR);
+  const read = Atomics.load(ctrl, HDR_READ_CURSOR);
+  let used = write - read;
+  if (used < 0) used += modulus;
+  const free = Math.max(0, cap - used);
+  const toWrite = Math.min(inputFrames, free);
+
+  if (toWrite > 0) {
+    const writeSlot = write >= cap ? write - cap : write;
+    const firstFrames = Math.min(toWrite, cap - writeSlot);
+    const secondFrames = toWrite - firstFrames;
+    const firstSamples = firstFrames * channels;
+
+    for (let i = 0; i < firstSamples; i++) {
+      payload[writeSlot * channels + i] = rawSamples[i];
+    }
+    for (let i = 0; i < secondFrames * channels; i++) {
+      payload[i] = rawSamples[firstSamples + i];
+    }
+
+    let nextWrite = write + toWrite;
+    if (nextWrite >= modulus) nextWrite -= modulus;
+    Atomics.store(ctrl, HDR_WRITE_CURSOR, nextWrite);
+  }
+  return toWrite;
+}
+
+test('W272: applyFadeRamp performs zero-alloc in-place half-cosine fade-out and fade-in ramps across channels', () => {
+  assert.equal(typeof applyFadeRamp, 'function');
+  assert.equal(typeof workletApplyFadeRamp, 'function');
+  assert.equal(DEFAULT_UNDERRUN_RAMP_FRAMES, 64);
+  assert.equal(WORKLET_DEFAULT_UNDERRUN_RAMP_FRAMES, 64);
+  assert.equal(globalThis.PlayGta6AudioMixer.applyFadeRamp, applyFadeRamp);
+  assert.equal(globalThis.PlayGta6AudioWorklet.applyFadeRamp, workletApplyFadeRamp);
+
+  // 1. Stereo half-cosine fade-out 1.0 -> 0.0 over 64 frames (in-place, returns same buffer).
+  const stereoOut = new Float32Array(64 * 2);
+  for (let f = 0; f < 64; f++) {
+    stereoOut[f * 2] = 0.8;
+    stereoOut[f * 2 + 1] = -0.6;
+  }
+  const returned = applyFadeRamp(stereoOut, 2, 64, 1.0, 0.0);
+  assert.equal(returned, stereoOut);
+  assert.ok(Math.abs(stereoOut[0] - 0.8) < 1e-6);
+  assert.ok(Math.abs(stereoOut[1] - -0.6) < 1e-6);
+  assert.equal(stereoOut[63 * 2], 0.0);
+  assert.equal(stereoOut[63 * 2 + 1], 0.0);
+
+  // Verify half-cosine curvature (gentle slope at ends, steepest near midpoint ~0.5).
+  const midExpectedGain = 0.5 * (1.0 + Math.cos((Math.PI * 31) / 63));
+  assert.ok(Math.abs(stereoOut[31 * 2] - 0.8 * midExpectedGain) < 1e-5);
+  assert.ok(Math.abs(stereoOut[31 * 2 + 1] - -0.6 * midExpectedGain) < 1e-5);
+  const startSlope = Math.abs(stereoOut[0] - stereoOut[2]);
+  const midSlope = Math.abs(stereoOut[31 * 2] - stereoOut[32 * 2]);
+  const endSlope = Math.abs(stereoOut[62 * 2] - stereoOut[63 * 2]);
+  assert.ok(startSlope < midSlope * 0.1, `Cosine start slope (${startSlope}) should be much gentler than midpoint (${midSlope})`);
+  assert.ok(endSlope < midSlope * 0.1, `Cosine end slope (${endSlope}) should be much gentler than midpoint (${midSlope})`);
+
+  // Strictly monotonic fade-out.
+  for (let f = 1; f < 64; f++) {
+    assert.ok(stereoOut[f * 2] <= stereoOut[(f - 1) * 2] + 1e-7);
+    assert.ok(stereoOut[f * 2 + 1] >= stereoOut[(f - 1) * 2 + 1] - 1e-7);
+  }
+
+  // 2. Half-cosine fade-in 0.0 -> 1.0 over 64 frames via worklet helper matches mixer helper.
+  const stereoIn = new Float32Array(64 * 2);
+  for (let f = 0; f < 64; f++) {
+    stereoIn[f * 2] = 0.5;
+    stereoIn[f * 2 + 1] = -0.5;
+  }
+  workletApplyFadeRamp(stereoIn, 2, 64, 0.0, 1.0);
+  assert.equal(stereoIn[0], 0.0);
+  assert.equal(stereoIn[1], 0.0);
+  assert.ok(Math.abs(stereoIn[63 * 2] - 0.5) < 1e-6);
+  assert.ok(Math.abs(stereoIn[63 * 2 + 1] - -0.5) < 1e-6);
+  for (let f = 1; f < 64; f++) {
+    assert.ok(stereoIn[f * 2] >= stereoIn[(f - 1) * 2] - 1e-7);
+    assert.ok(stereoIn[f * 2 + 1] <= stereoIn[(f - 1) * 2 + 1] + 1e-7);
+  }
+
+  // 3. Sanitizes NaN/Infinity inside ramped buffer so gain * Infinity never yields NaN.
+  const dirtyMono = new Float32Array([Number.POSITIVE_INFINITY, 0.5, Number.NaN, 0.5]);
+  applyFadeRamp(dirtyMono, 1, 4, 0.0, 1.0);
+  assert.equal(dirtyMono[0], 0.0);
+  assert.equal(dirtyMono[2], 0.0);
+  assert.ok(dirtyMono.every(Number.isFinite));
+});
+
+test('W272: softLimitSample and sanitizeAndSoftLimitBuffer pass |x| <= 0.9 linearly, soft-clip |x| > 0.9, and sanitize NaN/Inf', () => {
+  assert.equal(typeof softLimitSample, 'function');
+  assert.equal(typeof sanitizeAndSoftLimitBuffer, 'function');
+  assert.equal(typeof workletSoftLimitSample, 'function');
+  assert.equal(typeof workletSanitizeAndSoftLimitBuffer, 'function');
+  assert.equal(DEFAULT_SOFT_LIMIT_KNEE, 0.9);
+  assert.equal(WORKLET_DEFAULT_SOFT_LIMIT_KNEE, 0.9);
+
+  // 1. Bit-exact linear pass-through for |x| <= 0.9 (both mixer and worklet exports).
+  const normalSamples = [-0.9, -0.75, -0.5, -0.123456, -0.0, 0.0, 0.25, 0.65, 0.8999999, 0.9];
+  for (const x of normalSamples) {
+    assert.ok(Object.is(softLimitSample(x), x), `mixer softLimitSample(${x}) must be bit-exact`);
+    assert.ok(Object.is(workletSoftLimitSample(x), x), `worklet softLimitSample(${x}) must be bit-exact`);
+  }
+
+  // 2. Smooth monotonic soft-clipping for |x| > 0.9 and |x| > 1.0 strictly into [-1.0, 1.0].
+  const hotInputs = [0.91, 0.95, 1.0, 1.05, 1.15, 1.3, 1.8];
+  let prev = 0.9;
+  for (const x of hotInputs) {
+    const pos = softLimitSample(x);
+    const neg = softLimitSample(-x);
+    assert.equal(pos, workletSoftLimitSample(x));
+    assert.ok(pos > prev && pos <= 1.0, `softLimitSample(${x})=${pos} must be monotonic in (${prev}, 1.0]`);
+    assert.equal(neg, -pos, 'softLimitSample must be odd-symmetric');
+    prev = pos;
+  }
+  assert.ok(softLimitSample(1.0) > 0.97 && softLimitSample(1.0) < 0.99);
+  assert.ok(softLimitSample(3.0) <= 1.0 && softLimitSample(3.0) > 0.9999);
+  assert.ok(softLimitSample(1e6) <= 1.0 && softLimitSample(-1e6) >= -1.0);
+
+  // 3. Non-finite inputs (NaN / +-Infinity) sanitize to 0.0.
+  for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+    assert.equal(softLimitSample(bad), 0.0);
+    assert.equal(workletSoftLimitSample(bad), 0.0);
+  }
+
+  // 4. sanitizeAndSoftLimitBuffer mutates in place, preserves |x| <= 0.9, soft-clips peaks, sanitizes NaN/Inf.
+  const buf = new Float32Array([
+    -0.9,
+    0.5,
+    0.9,
+    1.5,
+    -2.5,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    Number.NEGATIVE_INFINITY,
+    0.95,
+  ]);
+  const res = sanitizeAndSoftLimitBuffer(buf, buf.length);
+  assert.equal(res.softClippedSamples, 3); // 1.5, -2.5, 0.95
+  assert.equal(res.nonFiniteSanitized, 3); // NaN, +Inf, -Inf
+  assert.equal(buf[0], Math.fround(-0.9));
+  assert.equal(buf[1], 0.5);
+  assert.equal(buf[2], Math.fround(0.9));
+  assert.ok(buf[3] > 0.9 && buf[3] <= 1.0);
+  assert.ok(buf[4] < -0.9 && buf[4] >= -1.0);
+  assert.equal(buf[5], 0.0);
+  assert.equal(buf[6], 0.0);
+  assert.equal(buf[7], 0.0);
+  assert.ok(buf[8] > 0.9 && buf[8] < 1.0);
+
+  // Reusable outStats accumulator (zero-alloc call pattern).
+  const reusableStats = { softClippedSamples: 0, nonFiniteSanitized: 0 };
+  const buf2 = new Float32Array([0.4, 2.0, Number.NaN, -1.2]);
+  const retStats = workletSanitizeAndSoftLimitBuffer(buf2, 4, DEFAULT_SOFT_LIMIT_KNEE, reusableStats);
+  assert.equal(retStats, reusableStats);
+  assert.equal(reusableStats.softClippedSamples, 2);
+  assert.equal(reusableStats.nonFiniteSanitized, 1);
+  assert.equal(buf2[0], Math.fround(0.4));
+  assert.equal(buf2[2], 0.0);
+  assert.ok(buf2[1] > 0.9 && buf2[1] <= 1.0);
+  assert.ok(buf2[3] < -0.9 && buf2[3] >= -1.0);
+});
+
+test('W272: PlayGta6AudioWorkletProcessor applies cosine underrun fade-out, recovery fade-in, soft-limiter, and tracks stats', () => {
+  const ring = AudioRingBuffer.create(512, 2);
+  const processor = new PlayGta6AudioWorkletProcessor({
+    processorOptions: {
+      sab: ring.sab,
+      cosineRamp: true,
+      softLimit: true,
+    },
+  });
+
+  assert.equal(processor.fadeCurve, 'cosine');
+  assert.equal(processor.declickFrames, 64);
+  assert.equal(processor.fadeInFrames, 64);
+  assert.equal(processor.softLimit, true);
+  assert.equal(processor.softLimitKnee, 0.9);
+
+  // 1. Steady-state quantum with normal samples (|x| <= 0.9), hot peaks (> 1.0), and NaN/Infinity.
+  const q1Pcm = new Float32Array(128 * 2);
+  for (let f = 0; f < 128; f++) {
+    q1Pcm[f * 2] = 0.8;
+    q1Pcm[f * 2 + 1] = -0.6;
+  }
+  q1Pcm[0] = Number.NaN;
+  q1Pcm[1] = Number.POSITIVE_INFINITY;
+  q1Pcm[2] = 2.5; // soft-clipped into (0.9, 1.0]
+  q1Pcm[3] = -1.8; // soft-clipped into [-1.0, -0.9)
+  q1Pcm[4] = Number.NEGATIVE_INFINITY;
+  assert.equal(pushRawWorkletSabFrames(ring.sab, q1Pcm), 128);
+
+  const out1 = [[new Float32Array(128), new Float32Array(128)]];
+  assert.equal(processor.process([], out1), true);
+  assert.equal(out1[0][0][0], 0.0);
+  assert.equal(out1[0][1][0], 0.0);
+  assert.ok(out1[0][0][1] > 0.9 && out1[0][0][1] <= 1.0);
+  assert.ok(out1[0][1][1] < -0.9 && out1[0][1][1] >= -1.0);
+  assert.equal(out1[0][0][2], 0.0);
+  // Normal audio |x| <= 0.9 passes bit-exact untouched.
+  assert.equal(out1[0][0][10], Math.fround(0.8));
+  assert.equal(out1[0][1][10], Math.fround(-0.6));
+  assert.equal(processor.nonFiniteSanitized, 3);
+  assert.equal(processor.softClippedSamples, 2);
+
+  // 2. Full underrun after steady-state -> 64-frame half-cosine fade-out to exact 0.0.
+  const out2 = [[new Float32Array(128).fill(9.0), new Float32Array(128).fill(-9.0)]];
+  assert.equal(processor.process([], out2), true);
+  const [fadeL, fadeR] = out2[0];
+  const expectedFirstScale = 0.5 * (1.0 + Math.cos(Math.PI / 64));
+  const expectedMidScale = 0.5 * (1.0 + Math.cos((32 * Math.PI) / 64)); // exact 0.5
+  assert.ok(Math.abs(fadeL[0] - Math.fround(0.8) * expectedFirstScale) < 1e-5);
+  assert.ok(Math.abs(fadeR[0] - Math.fround(-0.6) * expectedFirstScale) < 1e-5);
+  assert.ok(Math.abs(fadeL[31] - Math.fround(0.8) * expectedMidScale) < 1e-5);
+  assert.equal(fadeL[63], 0.0);
+  assert.equal(fadeR[63], 0.0);
+  for (let f = 64; f < 128; f++) {
+    assert.equal(fadeL[f], 0.0);
+    assert.equal(fadeR[f], 0.0);
+  }
+  assert.equal(processor.underrunFadeOuts, 1);
+  assert.equal(processor.recoveryFadeIns, 0);
+
+  // 3. Recovery after underrun -> 64-frame half-cosine fade-in from 0.0 -> full amplitude.
+  const q3Pcm = new Float32Array(128 * 2);
+  for (let f = 0; f < 128; f++) {
+    q3Pcm[f * 2] = 0.7;
+    q3Pcm[f * 2 + 1] = -0.5;
+  }
+  assert.equal(ring.pushSamples(q3Pcm), 128);
+  const out3 = [[new Float32Array(128), new Float32Array(128)]];
+  assert.equal(processor.process([], out3), true);
+  const [recL, recR] = out3[0];
+  assert.equal(recL[0], 0.0);
+  assert.equal(recR[0], 0.0);
+  // Midpoint (frame 32) is exact 0.5 * amplitude for cosine fade-in.
+  assert.ok(Math.abs(recL[32] - Math.fround(0.7) * 0.5) < 1e-5);
+  assert.ok(Math.abs(recR[32] - Math.fround(-0.5) * 0.5) < 1e-5);
+  // Post-ramp frames (64..127) are bit-exact full amplitude.
+  assert.equal(recL[64], Math.fround(0.7));
+  assert.equal(recR[64], Math.fround(-0.5));
+  assert.equal(recL[127], Math.fround(0.7));
+  assert.equal(recR[127], Math.fround(-0.5));
+
+  // Verify stats surface all W272 counters.
+  const stats = processor.getStats();
+  assert.equal(stats.fadeCurve, 'cosine');
+  assert.equal(stats.underrunFadeOuts, 1);
+  assert.equal(stats.recoveryFadeIns, 1);
+  assert.equal(stats.softClippedSamples, 2);
+  assert.equal(stats.nonFiniteSanitized, 3);
+  assert.equal(stats.softLimit, true);
+  assert.equal(stats.softLimitKnee, 0.9);
+
+  // Verify control messages toggle fadeCurve and softLimit cleanly.
+  const replies = [];
+  processor.port.postMessage = (m) => replies.push(m);
+  processor.port.onmessage({ data: { type: 'setFadeCurve', fadeCurve: 'linear', id: 'fc-1' } });
+  assert.deepEqual(replies[replies.length - 1], { type: 'fadeCurve', fadeCurve: 'linear', id: 'fc-1' });
+  processor.port.onmessage({ data: { type: 'setFadeCurve', fadeCurve: 'cosine', id: 'fc-2' } });
+  assert.equal(processor.fadeCurve, 'cosine');
+
+  processor.port.onmessage({ data: { type: 'setSoftLimit', softLimit: true, knee: 0.85, id: 'sl-1' } });
+  assert.deepEqual(replies[replies.length - 1], {
+    type: 'softLimit',
+    softLimit: true,
+    softLimitKnee: 0.85,
+    id: 'sl-1',
+  });
+  assert.equal(processor.softLimitKnee, 0.85);
+});
+
+test('W272: PlayGta6AudioWorkletProcessor process() stays strictly zero-allocation with cosine ramps and softLimit active', () => {
+  const ring = AudioRingBuffer.create(256, 2);
+  const processor = new PlayGta6AudioWorkletProcessor({
+    processorOptions: {
+      sab: ring.sab,
+      cosineRamp: true,
+      softLimit: true,
+      smoothingFrames: 16,
+    },
+  });
+
+  const fullChunk = new Float32Array(128 * 2);
+  for (let f = 0; f < 128; f++) {
+    fullChunk[f * 2] = 0.7;
+    fullChunk[f * 2 + 1] = -0.7;
+  }
+  fullChunk[2] = Number.NaN;
+  fullChunk[3] = 2.4;
+
+  const partialChunk = new Float32Array(96 * 2);
+  for (let f = 0; f < 96; f++) {
+    partialChunk[f * 2] = 0.6;
+    partialChunk[f * 2 + 1] = -1.9;
+  }
+  partialChunk[4] = Number.NEGATIVE_INFINITY;
+
+  const out = [[new Float32Array(128), new Float32Array(128)]];
+  const origFloat32 = globalThis.Float32Array;
+  let float32Allocs = 0;
+  let tracking = false;
+  globalThis.Float32Array = new Proxy(origFloat32, {
+    construct(target, args, newTarget) {
+      if (tracking) float32Allocs++;
+      return Reflect.construct(target, args, newTarget);
+    },
+  });
+
+  try {
+    for (let q = 0; q < 64; q++) {
+      if (q % 6 === 2) {
+        pushRawWorkletSabFrames(ring.sab, partialChunk);
+      } else if (q % 6 !== 3) {
+        pushRawWorkletSabFrames(ring.sab, fullChunk);
+      }
+      tracking = true;
+      const keepAlive = processor.process([], out);
+      tracking = false;
+      assert.equal(keepAlive, true);
+      for (let f = 0; f < 128; f++) {
+        assert.ok(Number.isFinite(out[0][0][f]) && Math.abs(out[0][0][f]) <= 1.0);
+        assert.ok(Number.isFinite(out[0][1][f]) && Math.abs(out[0][1][f]) <= 1.0);
+      }
+    }
+  } finally {
+    tracking = false;
+    globalThis.Float32Array = origFloat32;
+  }
+
+  assert.equal(float32Allocs, 0, `Expected 0 Float32Array allocations in process(), got ${float32Allocs}`);
+  assert.ok(processor.underrunFadeOuts > 0);
+  assert.ok(processor.recoveryFadeIns > 0);
+  assert.ok(processor.softClippedSamples > 0);
+  assert.ok(processor.nonFiniteSanitized > 0);
+});
+
+test('W272: AudioMixer tracks underrunFadeOuts, recoveryFadeIns, softClippedSamples, nonFiniteSanitized and performs zero-alloc cosine recovery', () => {
+  const mixer = new AudioMixer({
+    sampleRate: 48000,
+    softClip: true,
+    limiterKnee: 0.9,
+    underrunRampFrames: 64,
+    quantumFrames: 128,
+    reuseOutputBuffer: true,
+  });
+
+  // 1. Render steady-state stereo voice + hot peak + NaN sample.
+  const src = new Float32Array(256 * 2);
+  for (let f = 0; f < 256; f++) {
+    src[f * 2] = 0.6;
+    src[f * 2 + 1] = -0.4;
+  }
+  src[0] = 1.6; // > 0.9 soft-clipped
+  src[1] = -2.0; // < -0.9 soft-clipped
+  src[2] = Number.NaN; // sanitized to 0.0
+  src[3] = Number.POSITIVE_INFINITY; // sanitized to 0.0
+
+  mixer.createVoice({ samples: src, channels: 2, gain: 1.0, pan: 0.0, loop: true });
+  const q1 = mixer.renderFrames(64);
+  assert.ok(q1[0] > 0.9 && q1[0] <= 1.0);
+  assert.ok(q1[1] < -0.9 && q1[1] >= -1.0);
+  assert.equal(q1[2], 0.0);
+  assert.equal(q1[3], 0.0);
+  assert.equal(q1[10], Math.fround(0.6)); // |0.6| <= 0.9 untouched
+
+  // 2. Underrun fade-out writes smooth half-cosine ramp from last rendered stereo frame to 0.0.
+  const fadeBuf = new Float32Array(96 * 2);
+  assert.equal(mixer.renderUnderrunFadeOut(fadeBuf, 96), 96);
+  assert.ok(Math.abs(fadeBuf[0] - Math.fround(0.6)) < 1e-6);
+  assert.ok(Math.abs(fadeBuf[1] - Math.fround(-0.4)) < 1e-6);
+  assert.equal(fadeBuf[63 * 2], 0.0);
+  assert.equal(fadeBuf[63 * 2 + 1], 0.0);
+  for (let f = 64; f < 96; f++) {
+    assert.equal(fadeBuf[f * 2], 0.0);
+    assert.equal(fadeBuf[f * 2 + 1], 0.0);
+  }
+
+  // Next renderFrames automatically applies armed half-cosine recovery fade-in (0.0 -> 1.0 over 64 frames).
+  const recOut = new Float32Array(128 * 2);
+  mixer.mixInto(recOut, 128);
+  assert.equal(recOut[0], 0.0);
+  assert.equal(recOut[1], 0.0);
+  const midCos = 0.5 * (1.0 - Math.cos((31 * Math.PI) / 63));
+  assert.ok(Math.abs(recOut[31 * 2] - Math.fround(0.6) * midCos) < 1e-5);
+  assert.ok(Math.abs(recOut[63 * 2] - Math.fround(0.6)) < 1e-6);
+  assert.ok(Math.abs(recOut[100 * 2] - Math.fround(0.6)) < 1e-6);
+
+  // 3. pumpToRing detects AudioRingBuffer underrun and applies zero-alloc half-cosine recovery fade-in.
+  const ring = AudioRingBuffer.create(256, 2);
+  ring.pullSamples(new Float32Array(32 * 2)); // triggers ring underrun
+  assert.equal(ring.underruns, 1);
+
+  const allocsBefore = mixer.getStats().scratchReallocations;
+  assert.equal(mixer.pumpToRing(ring, 128), 128);
+  assert.equal(mixer.getStats().scratchReallocations, allocsBefore);
+
+  const pulled = new Float32Array(128 * 2);
+  assert.equal(ring.pullSamples(pulled), 128);
+  assert.equal(pulled[0], 0.0);
+  assert.equal(pulled[1], 0.0);
+  assert.ok(pulled[32 * 2] > 0.25 && pulled[32 * 2] < 0.35);
+  assert.ok(Math.abs(pulled[63 * 2] - Math.fround(0.6)) < 1e-6);
+  assert.ok(Math.abs(pulled[127 * 2] - Math.fround(0.6)) < 1e-6);
+
+  // 4. Stats counters reflect all W272 telemetry and reset cleanly on reset().
+  const stats = mixer.getStats();
+  assert.equal(stats.underrunRampFrames, 64);
+  assert.equal(stats.underrunFadeOuts, 1);
+  assert.equal(stats.recoveryFadeIns, 2); // 1 from renderUnderrunFadeOut + 1 from pumpToRing underrun
+  assert.ok(stats.softClippedSamples >= 2);
+  assert.ok(stats.nonFiniteSanitized >= 2);
+
+  mixer.reset();
+  const after = mixer.getStats();
+  assert.equal(after.underrunFadeOuts, 0);
+  assert.equal(after.recoveryFadeIns, 0);
+  assert.equal(after.softClippedSamples, 0);
+  assert.equal(after.nonFiniteSanitized, 0);
+});
+
 
