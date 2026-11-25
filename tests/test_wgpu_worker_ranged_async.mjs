@@ -1,6 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+import vm from 'node:vm';
 
 import {
   WgslPackCache,
@@ -11,20 +15,36 @@ import {
 } from '../web/workers/wgsl_pack_loader.js';
 
 const require = createRequire(import.meta.url);
+const WORKERS_DIR = fileURLToPath(new URL('../web/workers/', import.meta.url));
 const {
   WgpuCommandProcessor,
   createWgpuWorkerHandler,
   buildGpuTelemetrySnapshot,
   DEFAULT_AUTO_STREAM_SHADER_THRESHOLD_BYTES,
   DEFAULT_STREAM_SHADERS_THRESHOLD_BYTES,
+  DEFAULT_MISSING_SUMMARY_LIMIT,
+  DEFAULT_MAX_CONCURRENT_PIPELINE_COMPILES,
+  sanitizeMissingShaderSummary,
   resolveShaderPackStreamThresholdBytes,
   OPCODES,
   SHADER_STAGE,
+  BIND_RESOURCE_TYPE,
 } = require('../web/workers/wgpu_worker.js');
 const {
   installRenderStatePackets,
   TEXTURE_FORMAT_NAMES: RS_TEXTURE_FORMAT_NAMES,
 } = require('../web/workers/render_state_packets.js');
+const {
+  BinkVideoPresenter,
+  UNIFORM_FLAG_SWAP_CHROMA,
+} = require('../web/workers/bink_presenter.js');
+const { WebGpuPipelineCache } = require('../web/workers/pipeline_cache.js');
+const {
+  ReflectionRegistry,
+  computeBindGroupLayoutHash,
+  computePipelineLayoutHash,
+  SHADER_STAGE_BITS,
+} = require('../web/workers/reflection_loader.js');
 
 class BinaryCommandBuilder {
   constructor() {
@@ -923,4 +943,896 @@ test('W159 destroying a pending pipeline before ranged shaders resolve prevents 
   assert.equal(processor.getStats().asyncShaderPendingCount, 0);
 
   processor.destroy();
+});
+
+// ===========================================================================
+// W185: Live wiring of W165 (Bink2 chromaOrder/loadOp), W167 (fallback sampler
+// synthesis), W168 (graphics-over-compute async pipeline priority & compile
+// latency telemetry), and W179 (categorized missing-shader summary export).
+// ===========================================================================
+
+function createRichW185MockWebGpu(options = {}) {
+  let nextId = 1;
+  const samplerDescs = [];
+  const bindGroupDescs = [];
+  const renderPasses = [];
+  const writeBufferCalls = [];
+  const writeTextureCalls = [];
+  const asyncCompiles = [];
+
+  const queue = {
+    writeBuffer(buffer, offset, data) {
+      const bytes =
+        data instanceof Uint8Array
+          ? new Uint8Array(data)
+          : ArrayBuffer.isView(data)
+            ? new Uint8Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength))
+            : new Uint8Array(data.slice(0));
+      writeBufferCalls.push({ buffer, offset, data: bytes });
+    },
+    writeTexture(dest, data, dataLayout, size) {
+      writeTextureCalls.push({ dest, dataLayout: { ...dataLayout }, size: { ...size } });
+    },
+    submit() {},
+    onSubmittedWorkDone() {
+      return Promise.resolve();
+    },
+  };
+
+  const makePipeline = (kind, desc) => {
+    const pipe = {
+      kind,
+      id: nextId++,
+      desc,
+      getBindGroupLayout(index) {
+        return { kind: 'GPUBindGroupLayout', pipelineId: pipe.id, index };
+      },
+    };
+    return pipe;
+  };
+
+  const device = {
+    features: new Set(),
+    queue,
+    createShaderModule(desc) {
+      if (typeof options.onCreateShaderModule === 'function') {
+        return options.onCreateShaderModule(desc, () => nextId++);
+      }
+      return { kind: 'GPUShaderModule', id: nextId++, code: desc.code };
+    },
+    createBuffer(desc) {
+      return {
+        kind: 'GPUBuffer',
+        id: nextId++,
+        size: desc.size,
+        usage: desc.usage,
+        destroy() {},
+      };
+    },
+    createTexture(desc) {
+      const id = nextId++;
+      return {
+        kind: 'GPUTexture',
+        id,
+        desc,
+        width: desc.size.width,
+        height: desc.size.height,
+        createView() {
+          return { kind: 'GPUTextureView', id: `view-${id}`, textureId: id };
+        },
+        destroy() {},
+      };
+    },
+    createBindGroupLayout(desc) {
+      return { kind: 'GPUBindGroupLayout', id: nextId++, desc };
+    },
+    createPipelineLayout(desc) {
+      return { kind: 'GPUPipelineLayout', id: nextId++, desc };
+    },
+    createBindGroup(desc) {
+      const bg = { kind: 'GPUBindGroup', id: nextId++, desc };
+      bindGroupDescs.push(desc);
+      return bg;
+    },
+    createRenderPipeline(desc) {
+      return makePipeline('GPURenderPipeline', desc);
+    },
+    createComputePipeline(desc) {
+      return makePipeline('GPUComputePipeline', desc);
+    },
+    createCommandEncoder() {
+      return {
+        beginRenderPass(passDesc) {
+          const rec = { passDesc, draws: [], ended: false };
+          renderPasses.push(rec);
+          return {
+            setPipeline() {},
+            setViewport() {},
+            setScissorRect() {},
+            setBindGroup() {},
+            setVertexBuffer() {},
+            setIndexBuffer() {},
+            draw(vc, ic, fv, fi) {
+              rec.draws.push({ vc, ic, fv, fi });
+            },
+            drawIndexed() {},
+            end() {
+              rec.ended = true;
+            },
+          };
+        },
+        beginComputePass() {
+          return {
+            setPipeline() {},
+            setBindGroup() {},
+            dispatchWorkgroups() {},
+            end() {},
+          };
+        },
+        finish() {
+          return { kind: 'GPUCommandBuffer', id: nextId++ };
+        },
+      };
+    },
+  };
+
+  if (options.omitCreateSampler !== true) {
+    device.createSampler = (desc = {}) => {
+      samplerDescs.push({ ...desc });
+      return { kind: 'GPUSampler', id: nextId++, desc: { ...desc } };
+    };
+  }
+
+  if (options.asyncPipelines === true) {
+    const enqueueAsync = (kind, gpuKind) => (desc) =>
+      new Promise((resolve, reject) => {
+        const entry = {
+          kind,
+          desc,
+          pipeline: null,
+          resolve() {
+            entry.pipeline = makePipeline(gpuKind, desc);
+            resolve(entry.pipeline);
+          },
+          reject(err) {
+            reject(err instanceof Error ? err : new Error(String(err || 'compile failed')));
+          },
+        };
+        asyncCompiles.push(entry);
+      });
+    device.createRenderPipelineAsync = enqueueAsync('render', 'GPURenderPipeline');
+    device.createComputePipelineAsync = enqueueAsync('compute', 'GPUComputePipeline');
+  }
+
+  const swapWidth = options.swapWidth || 1280;
+  const swapHeight = options.swapHeight || 720;
+  const ctx = {
+    canvas: { width: swapWidth, height: swapHeight },
+    configure() {},
+    getCurrentTexture() {
+      const view = { kind: 'GPUTextureView', id: `swap-${nextId++}` };
+      return {
+        width: swapWidth,
+        height: swapHeight,
+        createView() {
+          return view;
+        },
+      };
+    },
+  };
+
+  const canvas = {
+    width: swapWidth,
+    height: swapHeight,
+    getContext() {
+      return ctx;
+    },
+  };
+
+  const adapter = {
+    info: { vendor: 'mock-gpu', architecture: 'w185-test' },
+    async requestDevice() {
+      return device;
+    },
+  };
+
+  const navigatorObj = {
+    gpu: {
+      async requestAdapter() {
+        return adapter;
+      },
+      getPreferredCanvasFormat() {
+        return 'bgra8unorm';
+      },
+    },
+  };
+
+  return {
+    device,
+    ctx,
+    canvas,
+    adapter,
+    navigator: navigatorObj,
+    samplerDescs,
+    bindGroupDescs,
+    renderPasses,
+    writeBufferCalls,
+    writeTextureCalls,
+    asyncCompiles,
+  };
+}
+
+function makeYuv420FramePlanes(width, height) {
+  const uvW = Math.ceil(width / 2);
+  const uvH = Math.ceil(height / 2);
+  return {
+    y: new Uint8Array(width * height).fill(180),
+    u: new Uint8Array(uvW * uvH).fill(96),
+    v: new Uint8Array(uvW * uvH).fill(160),
+  };
+}
+
+function buildCreateTexturePacket(id, width, height, formatCode = 0, usage = 0x06) {
+  const buf = new ArrayBuffer(32);
+  const v = new DataView(buf);
+  v.setUint32(0, id, true);
+  v.setUint32(4, width, true);
+  v.setUint32(8, height, true);
+  v.setUint32(12, 1, true);
+  v.setUint32(16, 1, true);
+  v.setUint32(20, formatCode, true);
+  v.setUint32(24, usage, true);
+  v.setUint32(28, 1, true); // 2d
+  return new BinaryCommandBuilder()._pushPacket(OPCODES.CREATE_TEXTURE, new Uint8Array(buf));
+}
+
+function buildCreateBindGroupPacket(id, pipelineId, groupIndex, entries) {
+  const buf = new ArrayBuffer(16 + entries.length * 32);
+  const v = new DataView(buf);
+  v.setUint32(0, id, true);
+  v.setUint32(4, pipelineId, true);
+  v.setUint32(8, groupIndex, true);
+  v.setUint32(12, entries.length, true);
+  for (let i = 0; i < entries.length; i += 1) {
+    const e = entries[i];
+    const base = 16 + i * 32;
+    v.setUint32(base, e.binding, true);
+    v.setUint32(base + 4, e.resourceType, true);
+    v.setUint32(base + 8, e.resourceId, true);
+    v.setBigUint64(base + 16, BigInt(e.offset || 0), true);
+    v.setBigUint64(base + 24, BigInt(e.size || 0), true);
+  }
+  return new BinaryCommandBuilder()._pushPacket(OPCODES.CREATE_BIND_GROUP, new Uint8Array(buf));
+}
+
+// ---------------------------------------------------------------------------
+// 6. W185 / W165: Bink2 chromaOrder ('yuv' | 'yvu') & loadOp ('clear' | 'load')
+// ---------------------------------------------------------------------------
+
+test('W185 (W165) forwards chromaOrder and loadOp from init config and bink-frame / present-splash-frame messages', async () => {
+  // 6a. Constructor init config (binkChromaOrder: 'yvu', binkLoadOp: 'load') + per-frame toggle via worker messages.
+  const mock = createRichW185MockWebGpu({ swapWidth: 1920, swapHeight: 1080 });
+  const processor = new WgpuCommandProcessor(mock.device, mock.ctx, {
+    width: 1920,
+    height: 1080,
+    binkChromaOrder: 'yvu',
+    binkLoadOp: 'load',
+  });
+  const posted = [];
+  const handler = createWgpuWorkerHandler({
+    processor,
+    postMessage: (m) => posted.push(m),
+    now: () => 1000,
+  });
+
+  // Frame 1 inherits init chromaOrder='yvu' and loadOp='load' (menu underlay).
+  const planes1 = makeYuv420FramePlanes(256, 16);
+  await handler.handleMessage({
+    type: 'bink-frame',
+    id: 'w165-1',
+    frame: {
+      width: 256,
+      height: 16,
+      format: 'yuv420p',
+      planes: planes1,
+      frameIndex: 0,
+    },
+  });
+
+  const ack1 = posted.find((m) => m && m.type === 'splash-frame-presented' && m.id === 'w165-1');
+  assert.ok(ack1 && ack1.ok === true);
+  assert.equal(processor.binkPresenter.chromaOrder, 'yvu');
+  assert.equal(processor.binkPresenter.loadOp, 'load');
+  assert.equal(mock.renderPasses.length, 1);
+  assert.equal(mock.renderPasses[0].passDesc.colorAttachments[0].loadOp, 'load');
+  assert.equal(mock.renderPasses[0].passDesc.colorAttachments[0].clearValue, undefined);
+
+  // Uniform buffer flags lane (u32[3]) has UNIFORM_FLAG_SWAP_CHROMA set for 'yvu'.
+  assert.ok(mock.writeBufferCalls.length >= 1);
+  const u32Frame1 = new Uint32Array(
+    mock.writeBufferCalls[0].data.buffer,
+    mock.writeBufferCalls[0].data.byteOffset,
+    4
+  );
+  assert.equal((u32Frame1[3] & UNIFORM_FLAG_SWAP_CHROMA) !== 0, true);
+
+  // Frame 2 switches per-message to chromaOrder='yuv' and loadOp='clear'.
+  const planes2 = makeYuv420FramePlanes(256, 16);
+  await handler.handleMessage({
+    type: 'present-splash-frame',
+    id: 'w165-2',
+    chromaOrder: 'yuv',
+    loadOp: 'clear',
+    frame: {
+      width: 256,
+      height: 16,
+      format: 'yuv420p',
+      planes: planes2,
+      frameIndex: 1,
+    },
+  });
+
+  const ack2 = posted.find((m) => m && m.type === 'splash-frame-presented' && m.id === 'w165-2');
+  assert.ok(ack2 && ack2.ok === true);
+  assert.equal(processor.binkPresenter.chromaOrder, 'yuv');
+  assert.equal(processor.binkPresenter.loadOp, 'clear');
+  assert.equal(mock.renderPasses.length, 2);
+  assert.equal(mock.renderPasses[1].passDesc.colorAttachments[0].loadOp, 'clear');
+  assert.ok(mock.renderPasses[1].passDesc.colorAttachments[0].clearValue);
+
+  const u32Frame2 = new Uint32Array(
+    mock.writeBufferCalls[mock.writeBufferCalls.length - 1].data.buffer,
+    mock.writeBufferCalls[mock.writeBufferCalls.length - 1].data.byteOffset,
+    4
+  );
+  assert.equal((u32Frame2[3] & UNIFORM_FLAG_SWAP_CHROMA) !== 0, false);
+
+  // 6b. Direct BinkVideoPresenter fallback (SplashFrameBridge: null) forwards chromaOrder + loadOp directly.
+  const directMock = createRichW185MockWebGpu();
+  const directPresenter = new BinkVideoPresenter({ device: directMock.device });
+  const directProc = new WgpuCommandProcessor(directMock.device, directMock.ctx, {
+    binkPresenter: directPresenter,
+    SplashFrameBridge: null,
+  });
+
+  const directRes = directProc.presentSplashFrame(
+    {
+      width: 256,
+      height: 8,
+      format: 'yuv420p',
+      planes: makeYuv420FramePlanes(256, 8),
+      chromaOrder: 'yvu',
+      loadOp: 'load',
+      frameIndex: 0,
+    }
+  );
+  assert.equal(directRes.ok, true);
+  assert.equal(directRes.chromaOrder, 'yvu');
+  assert.equal(directRes.loadOp, 'load');
+  assert.equal(directPresenter.chromaOrder, 'yvu');
+  assert.equal(directPresenter.loadOp, 'load');
+  assert.equal(directMock.renderPasses[0].passDesc.colorAttachments[0].loadOp, 'load');
+  assert.equal(directProc.getStats().binkPresenter.chromaOrder, 'yvu');
+  assert.equal(directProc.getStats().binkPresenter.loadOp, 'load');
+
+  // 6c. Minimal mock presenter lacking W165 setChromaOrder/setLoadOp keeps working safely.
+  const minimalMock = createRichW185MockWebGpu();
+  const minimalPresenter = {
+    uploadYuv420Frame() {},
+    presentFrame() {
+      return { presented: true };
+    },
+  };
+  const minimalProc = new WgpuCommandProcessor(minimalMock.device, minimalMock.ctx, {
+    binkPresenter: minimalPresenter,
+    SplashFrameBridge: null,
+    binkChromaOrder: 'yvu',
+    binkLoadOp: 'load',
+  });
+  const minRes = minimalProc.presentSplashFrame({
+    width: 16,
+    height: 8,
+    format: 'yuv420p',
+    planes: makeYuv420FramePlanes(16, 8),
+    chromaOrder: 'yvu',
+    loadOp: 'load',
+  });
+  assert.equal(minRes.ok, true);
+
+  processor.destroy();
+  directProc.destroy();
+  minimalProc.destroy();
+});
+
+// ---------------------------------------------------------------------------
+// 7. W185 / W167: Default fallback sampler synthesis on bind-group creation
+// ---------------------------------------------------------------------------
+
+test('W185 (W167) synthesizes default fallback samplers via pipelineCache when reflected or sentinel sampler bindings are missing', async () => {
+  const mock = createRichW185MockWebGpu();
+  const pipelineCache = new WebGpuPipelineCache({ device: mock.device });
+  const reflectionRegistry = new ReflectionRegistry();
+
+  const TEX_FS_WGSL = [
+    '@group(0) @binding(0) var u_tex: texture_2d<f32>;',
+    '@group(0) @binding(1) var u_smp: sampler;',
+    '@fragment fn fs_main() -> @location(0) vec4<f32> { return textureSample(u_tex, u_smp, vec2<f32>(0.5)); }',
+  ].join('\n');
+
+  const fsHash = wgpkFormatHashHex(wgpkFnv1a64(TEX_FS_WGSL));
+  const fsBglEntries = [
+    {
+      binding: 0,
+      visibility: SHADER_STAGE_BITS.FRAGMENT,
+      texture: { sampleType: 'float', viewDimension: '2d', multisampled: false },
+    },
+    {
+      binding: 1,
+      visibility: SHADER_STAGE_BITS.FRAGMENT,
+      sampler: { type: 'filtering' },
+    },
+  ];
+  const fsBglId = computeBindGroupLayoutHash({ entries: fsBglEntries });
+  const fsPlId = computePipelineLayoutHash([fsBglId]);
+
+  reflectionRegistry.loadManifest({
+    schema_version: 1,
+    register_convention: { source: 'dxc-spirv', shifts: { b: 0, t: 0, u: 0, s: 0 } },
+    bind_group_layouts: {
+      [fsBglId]: { entries: fsBglEntries },
+    },
+    pipeline_layouts: {
+      [fsPlId]: { bindGroupLayouts: [fsBglId] },
+    },
+    shaders: {
+      [fsHash]: {
+        stage: 'fragment',
+        entry_point: 'fs_main',
+        name: 'w185_fs',
+        pipeline_layout: fsPlId,
+        bind_group_layouts: [fsBglId],
+        layout_complete: true,
+        fragment_outputs: [{ location: 0, type: 'vec4<f32>' }],
+        bindings: [
+          { group: 0, binding: 0, name: 'u_tex', resource: 'texture', in_layout: true },
+          { group: 0, binding: 1, name: 'u_smp', resource: 'sampler', in_layout: true },
+        ],
+      },
+    },
+  });
+
+  const processor = new WgpuCommandProcessor(mock.device, mock.ctx, {
+    format: 'bgra8unorm',
+    pipelineCache,
+    reflectionRegistry,
+  });
+
+  // Create VS + FS + reflected pipeline 10 + texture 100, then CreateBindGroup with ONLY texture @0 (no sampler @1!).
+  const builder = new BinaryCommandBuilder()
+    .createShaderModule(1, SHADER_STAGE.VERTEX, VS_WGSL)
+    .createShaderModule(2, SHADER_STAGE.FRAGMENT, TEX_FS_WGSL)
+    .createRenderPipeline(10, 1, 2, 0);
+  const texChunk = buildCreateTexturePacket(100, 16, 16).finish();
+  const bgChunk = buildCreateBindGroupPacket(50, 10, 0, [
+    { binding: 0, resourceType: BIND_RESOURCE_TYPE.TEXTURE_VIEW, resourceId: 100 },
+  ]).finish();
+
+  processor.executeCommandBuffer(builder.finish());
+  processor.executeCommandBuffer(texChunk);
+  processor.executeCommandBuffer(bgChunk);
+
+  // Zero validation errors, bind group created with synthesized filtering sampler at binding 1!
+  assert.equal(processor.validationErrorCount, 0);
+  assert.equal(processor.bindGroups.has(50), true);
+  assert.equal(mock.samplerDescs.length, 1);
+  assert.equal(mock.samplerDescs[0].magFilter, 'linear');
+  assert.equal(mock.samplerDescs[0].minFilter, 'linear');
+  assert.equal(mock.samplerDescs[0].addressModeU, 'clamp-to-edge');
+
+  const createdBg = mock.bindGroupDescs[0];
+  assert.equal(createdBg.entries.length, 2);
+  assert.equal(createdBg.entries[0].binding, 0);
+  assert.equal(createdBg.entries[1].binding, 1);
+  assert.equal(createdBg.entries[1].resource.kind, 'GPUSampler');
+
+  // Second bind group reuses the cached default sampler (zero extra createSampler calls).
+  processor.executeCommandBuffer(
+    buildCreateBindGroupPacket(51, 10, 0, [
+      { binding: 0, resourceType: BIND_RESOURCE_TYPE.TEXTURE_VIEW, resourceId: 100 },
+    ]).finish()
+  );
+  assert.equal(mock.samplerDescs.length, 1);
+  assert.equal(processor.getStats().fallbackSamplersCreated, 1);
+  assert.equal(processor.getStats().fallbackSamplerBindingsSynthesized, 2);
+
+  const snap = buildGpuTelemetrySnapshot(processor, { timestamp: 3000 });
+  assert.deepEqual(snap.fallbackSamplerStats, {
+    fallbackSamplersCreated: 1,
+    fallbackSamplerBindingsSynthesized: 2,
+    fallbackSamplerCount: 1,
+  });
+
+  // Sentinel sampler resourceId 0 also synthesizes a default filtering sampler without error;
+  // unknown non-zero sampler IDs still record a validation error.
+  processor.executeCommandBuffer(
+    buildCreateBindGroupPacket(52, 10, 0, [
+      { binding: 0, resourceType: BIND_RESOURCE_TYPE.TEXTURE_VIEW, resourceId: 100 },
+      { binding: 1, resourceType: BIND_RESOURCE_TYPE.SAMPLER, resourceId: 0 },
+    ]).finish()
+  );
+  assert.equal(processor.bindGroups.has(52), true);
+  assert.equal(processor.validationErrorCount, 0);
+
+  processor.executeCommandBuffer(
+    buildCreateBindGroupPacket(53, 10, 0, [
+      { binding: 1, resourceType: BIND_RESOURCE_TYPE.SAMPLER, resourceId: 9999 },
+    ]).finish()
+  );
+  assert.equal(processor.bindGroups.has(53), false);
+  assert.equal(processor.validationErrorCount, 1);
+
+  // Device without createSampler skips fallback synthesis gracefully without throwing.
+  const noSamplerMock = createRichW185MockWebGpu({ omitCreateSampler: true });
+  const noSamplerProc = new WgpuCommandProcessor(noSamplerMock.device, noSamplerMock.ctx, {
+    format: 'bgra8unorm',
+  });
+  assert.equal(noSamplerProc.getOrCreateDefaultSampler('filtering'), null);
+
+  processor.destroy();
+  noSamplerProc.destroy();
+});
+
+// ---------------------------------------------------------------------------
+// 8. W185 / W168: Graphics-over-compute async pipeline priority & latency telemetry
+// ---------------------------------------------------------------------------
+
+test('W185 (W168) configures AsyncPipelineCache with prioritizeGraphics and maxConcurrentCompiles and surfaces compile latency telemetry', async () => {
+  assert.equal(DEFAULT_MAX_CONCURRENT_PIPELINE_COMPILES, 4);
+
+  let fakeNow = 100;
+  const mock = createRichW185MockWebGpu({ asyncPipelines: true });
+  const processor = new WgpuCommandProcessor(mock.device, mock.ctx, {
+    format: 'bgra8unorm',
+    maxConcurrentCompiles: 2,
+    prioritizeGraphics: true,
+    now: () => fakeNow,
+  });
+  installRenderStatePackets(processor);
+
+  assert.equal(processor.asyncPipelineCache.prioritizeGraphics, true);
+  assert.equal(processor.asyncPipelineCache.maxConcurrentCompiles, 2);
+  assert.equal(processor.asyncPipelineCache.maxConcurrent, 2);
+
+  // Enqueue 4 background compute pipelines first (2 start immediately, 2 queue), then 2 UI render pipelines!
+  const stream = new BinaryCommandBuilder()
+    .createShaderModule(1, SHADER_STAGE.VERTEX, VS_WGSL)
+    .createShaderModule(2, SHADER_STAGE.FRAGMENT, FS_WGSL)
+    .createShaderModule(3, SHADER_STAGE.COMPUTE, CS_WGSL)
+    .createComputePipeline2(101, 3, 0)
+    .createComputePipeline2(102, 3, 0)
+    .createComputePipeline2(103, 3, 0)
+    .createComputePipeline2(104, 3, 0)
+    .createRenderPipeline2(201, 1, 2, 0)
+    .createRenderPipeline2(202, 1, 2, 0)
+    .finish();
+
+  processor.executeCommandBuffer(stream);
+
+  // At most 2 compiles in flight; both initial slots are the first two compute jobs.
+  assert.equal(mock.asyncCompiles.length, 2);
+  assert.deepEqual(
+    mock.asyncCompiles.map((c) => c.kind),
+    ['compute', 'compute']
+  );
+
+  // Complete the first two compute jobs after 15ms and 35ms -> next 2 dispatched MUST be the 2 render pipelines!
+  fakeNow = 115;
+  mock.asyncCompiles[0].resolve();
+  await new Promise((r) => setImmediate(r));
+  fakeNow = 135;
+  mock.asyncCompiles[1].resolve();
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal(mock.asyncCompiles.length, 4);
+  assert.deepEqual(
+    mock.asyncCompiles.slice(2, 4).map((c) => c.kind),
+    ['render', 'render'],
+    'graphics render pipelines must be promoted ahead of queued background compute pipelines'
+  );
+
+  // Resolve both render pipelines (10ms each) and the remaining 2 compute pipelines (20ms each).
+  fakeNow = 145;
+  mock.asyncCompiles[2].resolve();
+  mock.asyncCompiles[3].resolve();
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal(mock.asyncCompiles.length, 6);
+  assert.deepEqual(
+    mock.asyncCompiles.slice(4, 6).map((c) => c.kind),
+    ['compute', 'compute']
+  );
+  fakeNow = 165;
+  mock.asyncCompiles[4].resolve();
+  mock.asyncCompiles[5].resolve();
+  await processor.asyncPipelineCache.whenIdle();
+  await new Promise((r) => setImmediate(r));
+
+  // Verify compile latency & priority telemetry on getStats(), gpu-stats reply, and buildGpuTelemetrySnapshot().
+  const stats = processor.getStats();
+  assert.ok(stats.asyncPipelineStats);
+  assert.equal(stats.asyncPipelineStats.compiled, 6);
+  assert.equal(stats.asyncPipelineStats.prioritizeGraphics, true);
+  assert.equal(stats.asyncPipelineStats.maxConcurrentCompiles, 2);
+  assert.equal(stats.asyncPipelineStats.peakConcurrentCompiles, 2);
+  assert.ok(stats.asyncPipelineStats.priorityPromotions >= 2);
+  assert.ok(stats.asyncPipelineStats.avgCompileMs > 0);
+  assert.equal(stats.asyncPipelineStats.maxCompileMs, 35);
+
+  assert.ok(stats.asyncPipelineCompileStats);
+  assert.equal(stats.asyncPipelineCompileStats.prioritizeGraphics, true);
+  assert.equal(stats.asyncPipelineCompileStats.maxConcurrentCompiles, 2);
+  assert.equal(stats.asyncPipelineCompileStats.peakConcurrentCompiles, 2);
+  assert.equal(stats.asyncPipelineCompileStats.maxCompileMs, 35);
+  assert.ok(stats.asyncPipelineCompileStats.priorityPromotions >= 2);
+
+  const snap = buildGpuTelemetrySnapshot(processor, { timestamp: 4000 });
+  assert.equal(snap.asyncPipelineStats.compiled, 6);
+  assert.equal(snap.asyncPipelineStats.maxConcurrent, 2);
+  assert.equal(snap.asyncPipelineCompileStats.prioritizeGraphics, true);
+  assert.equal(snap.asyncPipelineCompileStats.maxConcurrentCompiles, 2);
+  assert.equal(snap.asyncPipelineCompileStats.peakConcurrentCompiles, 2);
+  assert.equal(snap.asyncPipelineCompileStats.maxCompileMs, 35);
+  assert.ok(snap.asyncPipelineCompileStats.avgCompileMs > 0);
+  assert.ok(snap.asyncPipelineCompileStats.priorityPromotions >= 2);
+
+  const posted = [];
+  const handler = createWgpuWorkerHandler({
+    processor,
+    postMessage: (m) => posted.push(m),
+  });
+  await handler.handleMessage({ id: 'w168-stats', type: 'request-gpu-stats' });
+  const reply = posted.find((m) => m && m.id === 'w168-stats' && m.type === 'gpu-stats');
+  assert.ok(reply);
+  assert.equal(reply.asyncPipelineCompileStats.maxCompileMs, 35);
+  assert.equal(reply.asyncPipelineCompileStats.prioritizeGraphics, true);
+  assert.equal(reply.asyncPipelineStats.compiled, 6);
+
+  // Also verify maxConcurrentCompiles: 0 (unlimited) and prioritizeGraphics: false options.
+  const unlimitedProc = new WgpuCommandProcessor(mock.device, mock.ctx, {
+    maxConcurrentCompiles: 0,
+    prioritizeGraphics: false,
+  });
+  assert.equal(unlimitedProc.asyncPipelineCache.maxConcurrentCompiles, 0);
+  assert.equal(unlimitedProc.asyncPipelineCache.maxConcurrent, 0);
+  assert.equal(unlimitedProc.asyncPipelineCache.prioritizeGraphics, false);
+
+  processor.destroy();
+  unlimitedProc.destroy();
+});
+
+// ---------------------------------------------------------------------------
+// 9. W185 / W179: Categorized missing-shader summary export & sanitization
+// ---------------------------------------------------------------------------
+
+test('W185 (W179) exports bounded, sanitized missingShaderSummary on getStats, gpu-stats, missingShaders, and gpu-telemetry', async () => {
+  assert.equal(DEFAULT_MISSING_SUMMARY_LIMIT, 32);
+
+  const badCompileWgsl = '@fragment fn broken_fs() { invalid_token; }';
+  const mock = createRichW185MockWebGpu({
+    onCreateShaderModule(desc, nextId) {
+      if (desc.code === badCompileWgsl) {
+        throw new Error('WGSL parse error at C:\\Users\\secret\\shader.wgsl');
+      }
+      return { kind: 'GPUShaderModule', id: nextId(), code: desc.code };
+    },
+  });
+
+  const processor = new WgpuCommandProcessor(mock.device, mock.ctx, {
+    format: 'bgra8unorm',
+  });
+
+  // Trigger not_in_pack misses + compile_failed + reflection_failed + real-shader guard.
+  const missVsHash = '0x1111222233334444';
+  const missFsHash = '0x5555666677778888';
+  const reflFailHash = '0x9999aaaabbbbcccc';
+  const realHash = '0xdeadbeef00001234';
+
+  processor.shaderFallbackRouter.registerRealShader(realHash, 'fragment', {
+    wgsl: FS_WGSL,
+    source: 'real',
+  });
+  processor.shaderFallbackRouter.recordMissingShader(reflFailHash, 'compute', 'reflection_failed');
+
+  processor.executeCommandBuffer(
+    new BinaryCommandBuilder()
+      .createShaderModule(1, SHADER_STAGE.VERTEX, missVsHash)
+      .createShaderModule(2, SHADER_STAGE.FRAGMENT, missFsHash)
+      .createShaderModule(3, SHADER_STAGE.FRAGMENT, missFsHash)
+      .createShaderModule(4, SHADER_STAGE.FRAGMENT, badCompileWgsl)
+      .createShaderModule(5, SHADER_STAGE.FRAGMENT, realHash)
+      .finish()
+  );
+
+  const summary = processor.getMissingShaderSummary({ limit: 2 });
+  assert.ok(summary);
+  assert.equal(summary.totalMissingEvents, 5); // 3 not_in_pack + 1 reflection_failed + 1 compile_failed
+  assert.equal(summary.countsByReason.not_in_pack, 3);
+  assert.equal(summary.countsByReason.reflection_failed, 1);
+  assert.equal(summary.countsByReason.compile_failed, 1);
+  assert.equal(summary.countsByReason.other, 0);
+  assert.equal(summary.countsByStage.vertex, 1);
+  assert.equal(summary.countsByStage.fragment, 3);
+  assert.equal(summary.countsByStage.compute, 1);
+  assert.equal(summary.realShaderGuard.registeredRealShaders, 1);
+  assert.equal(summary.realShaderGuard.blockedOverrideCount, 1);
+  assert.equal(summary.topMissing.length, 2, 'limit must cap topMissing array');
+  assert.equal(summary.topMissing[0].hashHex, missFsHash);
+  assert.equal(summary.topMissing[0].hitCount, 2);
+
+  // Verify getStats(), buildGpuTelemetrySnapshot(), request-gpu-stats, and missingShaders worker replies.
+  const stats = processor.getStats();
+  assert.ok(stats.missingShaderSummary);
+  assert.equal(stats.missingShaderSummary.countsByReason.compile_failed, 1);
+  assert.equal(stats.missingShaderSummary.countsByReason.not_in_pack, 3);
+
+  const snap = buildGpuTelemetrySnapshot(processor, { timestamp: 5000, limit: 2 });
+  assert.ok(snap.missingShaderSummary);
+  assert.equal(snap.missingShaderSummary.totalMissingEvents, 5);
+  assert.equal(snap.missingShaderSummary.topMissing.length, 2);
+
+  const posted = [];
+  const handler = createWgpuWorkerHandler({
+    processor,
+    postMessage: (m) => posted.push(m),
+  });
+  await handler.handleMessage({ id: 'w179-stats', type: 'request-gpu-stats' });
+  await handler.handleMessage({ id: 'w179-miss', missingShaders: true, limit: 2 });
+
+  const statsReply = posted.find((m) => m && m.id === 'w179-stats' && m.type === 'gpu-stats');
+  assert.ok(statsReply && statsReply.missingShaderSummary);
+  assert.equal(statsReply.missingShaderSummary.countsByReason.compile_failed, 1);
+
+  const missReply = posted.find((m) => m && m.id === 'w179-miss');
+  assert.ok(missReply && missReply.missingShaderSummary);
+  assert.equal(missReply.missingShaderSummary.topMissing.length, 2);
+
+  // Sanitization strips host paths, raw WGSL, raw buffers, and invalid hashes from untrusted summaries.
+  const sanitized = sanitizeMissingShaderSummary(
+    {
+      totalMissingEvents: 9,
+      uniqueMissingHashes: 4,
+      maxTrackedHashes: 8192,
+      overflowCount: 0,
+      countsByReason: { not_in_pack: 9, evilKey: 'C:\\Users\\secret\\game.exe' },
+      countsByStage: { vertex: 9 },
+      topMissing: [
+        { hashHex: 'C:\\Users\\secret\\bad.rpf', stage: 'vertex', reason: 'not_in_pack', hitCount: 99 },
+        {
+          hashHex: '0x000000000000abcd',
+          stage: 'ps',
+          reason: 'compile_failed',
+          hitCount: 5,
+          hostPath: '/Users/secret/gta6.rpf',
+          wgsl: '@fragment fn leaked() {}',
+          rawBytes: new Uint8Array([1, 2, 3]),
+        },
+        { hashHex: '0x000000000000beef', stage: 'vs', reason: 'not_in_pack', hitCount: 1 },
+      ],
+    },
+    1
+  );
+  assert.equal(sanitized.topMissing.length, 1);
+  assert.equal(sanitized.topMissing[0].hashHex, '0x000000000000abcd');
+  assert.equal(sanitized.topMissing[0].stage, 'fragment');
+  assert.equal(sanitized.topMissing[0].reason, 'compile_failed');
+  const json = JSON.stringify(sanitized);
+  assert.equal(json.includes('secret'), false);
+  assert.equal(json.includes('leaked'), false);
+  assert.equal(json.includes('rawBytes'), false);
+
+  // Legacy minimal mock shaderFallbackRouter without getMissingShaderSummary keeps working safely.
+  const legacyProc = new WgpuCommandProcessor(mock.device, mock.ctx, {
+    shaderFallbackRouter: {
+      resolve() {
+        return { wgsl: VS_WGSL, source: 'builtin' };
+      },
+    },
+  });
+  assert.equal(legacyProc.getMissingShaderSummary(), null);
+  assert.equal(buildGpuTelemetrySnapshot(legacyProc, { timestamp: 5001 }).missingShaderSummary, null);
+
+  processor.destroy();
+  legacyProc.destroy();
+});
+
+// ---------------------------------------------------------------------------
+// 10. W185 classic WorkerGlobalScope importScripts smoke test
+// ---------------------------------------------------------------------------
+
+test('W185 classic WorkerGlobalScope importScripts wires W165/W167/W168/W179 cleanly with zero errors', async () => {
+  const mock = createRichW185MockWebGpu({ asyncPipelines: true, swapWidth: 1280, swapHeight: 720 });
+  const posted = [];
+  const sandbox = {
+    console,
+    TextEncoder,
+    TextDecoder,
+    URL,
+    performance,
+    setTimeout,
+    clearTimeout,
+    navigator: mock.navigator,
+    postMessage(msg) {
+      posted.push(msg);
+    },
+  };
+  const vmCtx = vm.createContext(sandbox);
+  vmCtx.self = vmCtx;
+  vmCtx.importScripts = (...urls) => {
+    for (const rel of urls) {
+      const fullPath = path.resolve(WORKERS_DIR, rel);
+      vm.runInContext(readFileSync(fullPath, 'utf8'), vmCtx, { filename: fullPath });
+    }
+  };
+
+  vm.runInContext(
+    readFileSync(path.resolve(WORKERS_DIR, './wgpu_worker.js'), 'utf8'),
+    vmCtx,
+    { filename: path.resolve(WORKERS_DIR, './wgpu_worker.js') }
+  );
+
+  await vmCtx.self.onmessage({
+    data: {
+      init: true,
+      canvas: mock.canvas,
+      width: 1280,
+      height: 720,
+      enableSplashBridge: true,
+      enablePipelineCache: true,
+      binkChromaOrder: 'yvu',
+      binkLoadOp: 'load',
+      maxConcurrentCompiles: 2,
+      prioritizeGraphics: true,
+    },
+  });
+
+  const vmY = vm.runInContext('new Uint8Array(256 * 8).fill(190)', vmCtx);
+  const vmU = vm.runInContext('new Uint8Array(128 * 4).fill(120)', vmCtx);
+  const vmV = vm.runInContext('new Uint8Array(128 * 4).fill(140)', vmCtx);
+  await vmCtx.self.onmessage({
+    data: {
+      type: 'bink-frame',
+      id: 'vm-w185-bink',
+      frame: {
+        width: 256,
+        height: 8,
+        format: 'yuv420p',
+        planes: { y: vmY, u: vmU, v: vmV },
+        frameIndex: 0,
+      },
+    },
+  });
+
+  await vmCtx.self.onmessage({ data: { id: 'vm-w185-stats', type: 'request-gpu-stats' } });
+  await vmCtx.self.onmessage({ data: { id: 'vm-w185-tel', type: 'request-gpu-telemetry' } });
+
+  const errors = posted.filter((m) => m && m.error);
+  assert.deepEqual(errors, [], `unexpected classic worker errors: ${JSON.stringify(errors)}`);
+
+  const binkAck = posted.find((m) => m && m.id === 'vm-w185-bink');
+  assert.ok(binkAck && binkAck.ok === true);
+  assert.equal(mock.renderPasses[0].passDesc.colorAttachments[0].loadOp, 'load');
+
+  const statsReply = posted.find((m) => m && m.id === 'vm-w185-stats' && m.type === 'gpu-stats');
+  assert.ok(statsReply);
+  assert.equal(statsReply.stats.binkPresenter.chromaOrder, 'yvu');
+  assert.equal(statsReply.stats.binkPresenter.loadOp, 'load');
+  assert.equal(statsReply.asyncPipelineCompileStats.prioritizeGraphics, true);
+  assert.equal(statsReply.asyncPipelineCompileStats.maxConcurrentCompiles, 2);
+  assert.ok(statsReply.missingShaderSummary);
+
+  const telReply = posted.find((m) => m && m.id === 'vm-w185-tel' && m.type === 'gpu-telemetry');
+  assert.ok(telReply);
+  assert.equal(telReply.asyncPipelineCompileStats.prioritizeGraphics, true);
+  assert.equal(telReply.asyncPipelineCompileStats.maxConcurrentCompiles, 2);
+  assert.ok(telReply.missingShaderSummary);
 });
