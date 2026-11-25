@@ -1547,10 +1547,14 @@ test('W147 constructor validates retryDelayMs, maxRetryDelayMs, sleepFn, nowFn a
     state: 'idle',
     bytesLoaded: 0,
     totalBytes: 0,
+    chunksFetched: 0,
     requests: 0,
     durationMs: 0,
+    elapsedMs: 0,
     bytesPerSec: 0,
     peakBytesPerSec: 0,
+    throughputMBps: 0,
+    parallelMode: false,
     retryCount: 0,
     abortedCount: 0,
   });
@@ -1903,10 +1907,14 @@ test('W147 honors AbortSignal immediately during retry backoff and tracks aborte
       state: 'idle',
       bytesLoaded: 0,
       totalBytes: 0,
+      chunksFetched: 0,
       requests: 0,
       durationMs: 0,
+      elapsedMs: 0,
       bytesPerSec: 0,
       peakBytesPerSec: 0,
+      throughputMBps: 0,
+      parallelMode: false,
       retryCount: 0,
       abortedCount: 0,
     });
@@ -1965,4 +1973,355 @@ test('W147 honors AbortSignal immediately during retry backoff and tracks aborte
     assert.equal(preloader.getStats().bytesPerSec, 0);
     assert.equal(preloader.getStats().peakBytesPerSec, 0);
   }
+});
+
+// ---------------------------------------------------------------------------------------------
+// W208: Parallel ranged prefetch optimizations, chunkBytes option, and throughput telemetry.
+// ---------------------------------------------------------------------------------------------
+
+test('W208 supports chunkBytes option, exports defaults, and validates per-call overrides', async () => {
+  assert.equal(pgimMod.DEFAULT_CHUNK_BYTES, 4 * 1024 * 1024);
+  assert.equal(pgimMod.DEFAULT_CONCURRENCY, 4);
+
+  const image = buildLargePgim();
+  const server = createServer({ '/w208/game.pgim': image }, { delayMs: 2 });
+
+  assert.throws(() => new PgimPreloader({ fetchImpl: server.fetchImpl, chunkBytes: 16 }), RangeError);
+  const preloader = new PgimPreloader({ fetchImpl: server.fetchImpl, chunkBytes: 8192, concurrency: 3 });
+  assert.equal(preloader.chunkBytes, 8192);
+  assert.equal(preloader.chunkSize, 8192);
+  assert.equal(preloader.concurrency, 3);
+
+  await assert.rejects(
+    preloader.preloadGuestImage('/w208/game.pgim', { chunkBytes: 32 }),
+    RangeError
+  );
+  await assert.rejects(
+    preloader.preloadGuestImage('/w208/game.pgim', { concurrency: 0 }),
+    RangeError
+  );
+
+  // Per-call override with smaller chunkBytes + bounded concurrency.
+  const res = await preloader.preloadGuestImage('/w208/game.pgim', { chunkBytes: 4096, concurrency: 2 });
+  assert.deepEqual(res.bytes, image);
+  assert.equal(res.chunksFetched, Math.ceil(image.byteLength / 4096));
+  assert.equal(res.parallelMode, true);
+  assert.ok(server.maxInFlight <= 2, `per-call concurrency 2 exceeded: ${server.maxInFlight}`);
+});
+
+test('W208 parallel Range chunk reassembly preserves exact bytes under out-of-order chunk latency', async () => {
+  const image = buildLargePgim();
+  const chunkBytes = 3072; // intentionally non-power-of-two / non-page-aligned boundary
+  const expectedChunks = Math.ceil(image.byteLength / chunkBytes);
+  let inFlight = 0;
+  let maxInFlight = 0;
+  let chunkIndex = 0;
+
+  const fetchImpl = async (url, init = {}) => {
+    const method = init.method || 'GET';
+    if (method === 'HEAD') {
+      return new Response(null, {
+        status: 200,
+        headers: {
+          'content-length': String(image.byteLength),
+          'accept-ranges': 'bytes',
+        },
+      });
+    }
+    const range = init.headers?.Range;
+    const match = /^bytes=(\d+)-(\d+)$/.exec(range);
+    assert.ok(match, `expected Range header, got ${range}`);
+    const start = Number(match[1]);
+    const end = Math.min(Number(match[2]), image.byteLength - 1);
+    const slice = image.slice(start, end + 1);
+    const myIdx = chunkIndex++;
+
+    inFlight += 1;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    try {
+      // Reverse latency so later chunks finish before earlier chunks.
+      const waitMs = Math.max(1, (expectedChunks - (myIdx % expectedChunks)) * 2);
+      await delay(waitMs, init.signal);
+      // Stream chunk in multiple tiny sub-slices to exercise direct-write ReadableStream path.
+      const stream = new ReadableStream({
+        start(controller) {
+          const mid = Math.floor(slice.byteLength / 2);
+          if (mid > 0) controller.enqueue(slice.subarray(0, mid));
+          controller.enqueue(slice.subarray(mid));
+          controller.close();
+        },
+      });
+      return new Response(stream, {
+        status: 206,
+        headers: {
+          'content-range': `bytes ${start}-${end}/${image.byteLength}`,
+          'content-length': String(slice.byteLength),
+        },
+      });
+    } finally {
+      inFlight -= 1;
+    }
+  };
+
+  let clockMs = 500;
+  const timedFetch = async (url, init) => {
+    const res = await fetchImpl(url, init);
+    if (init?.method === 'GET') clockMs += 10;
+    return res;
+  };
+
+  const preloader = new PgimPreloader({
+    fetchImpl: timedFetch,
+    chunkBytes,
+    concurrency: 4,
+    nowFn: () => clockMs,
+  });
+
+  const result = await preloader.preloadGuestImage('/w208/out-of-order.pgim', { verifyChecksums: true });
+  assert.deepEqual(result.bytes, image);
+  assert.equal(result.bytesLoaded, image.byteLength);
+  assert.equal(result.totalBytes, image.byteLength);
+  assert.equal(result.chunksFetched, expectedChunks);
+  assert.equal(result.parallelMode, true);
+  assert.equal(result.transport, 'range');
+  assert.ok(maxInFlight > 1 && maxInFlight <= 4, `expected 1 < maxInFlight <= 4, got ${maxInFlight}`);
+
+  const stats = preloader.getStats();
+  assert.equal(stats.bytesLoaded, image.byteLength);
+  assert.equal(stats.totalBytes, image.byteLength);
+  assert.equal(stats.chunksFetched, expectedChunks);
+  assert.equal(stats.elapsedMs, stats.durationMs);
+  assert.ok(stats.elapsedMs > 0);
+  assert.equal(stats.parallelMode, true);
+  const expectedMBps = (image.byteLength * 1000) / (stats.elapsedMs * 1024 * 1024);
+  assert.ok(Math.abs(stats.throughputMBps - expectedMBps) < 1e-9);
+  assert.equal(result.elapsedMs, stats.elapsedMs);
+  assert.equal(result.throughputMBps, stats.throughputMBps);
+});
+
+test('W208 falls back gracefully to single streaming fetch with parallelMode=false when Range is unsupported', async () => {
+  const image = buildLargePgim();
+  let clockMs = 100;
+
+  // Case 1: Accept-Ranges: none
+  {
+    const server = createServer({ 'no-range.pgim': image }, { supportRange: false, acceptRanges: 'none' });
+    const fetchImpl = async (url, init) => {
+      const res = await server.fetchImpl(url, init);
+      if (init?.method === 'GET') clockMs += 50;
+      return res;
+    };
+    const preloader = new PgimPreloader({ fetchImpl, chunkBytes: 4096, concurrency: 4, nowFn: () => clockMs });
+    const result = await preloader.preloadPgim('no-range.pgim');
+    assert.deepEqual(new Uint8Array(result.buffer), image);
+    assert.equal(result.transport, 'full');
+    assert.equal(result.parallelMode, false);
+    assert.equal(result.chunksFetched, 1);
+    assert.equal(result.bytesLoaded, image.byteLength);
+    assert.equal(result.totalBytes, image.byteLength);
+    assert.equal(result.elapsedMs, 50);
+    assert.ok(result.throughputMBps > 0 && Number.isFinite(result.throughputMBps));
+
+    const stats = preloader.getStats();
+    assert.equal(stats.parallelMode, false);
+    assert.equal(stats.chunksFetched, 1);
+    assert.equal(stats.elapsedMs, 50);
+    assert.equal(stats.throughputMBps, result.throughputMBps);
+  }
+
+  // Case 2: Server omits Accept-Ranges and ignores Range header (returns 200 OK stream)
+  {
+    const server = createServer({ 'ignored-range.pgim': image }, { supportRange: false, acceptRanges: null });
+    const preloader = new PgimPreloader({ fetchImpl: server.fetchImpl, chunkBytes: 4096, concurrency: 4 });
+    const result = await preloader.preloadGuestImage('ignored-range.pgim');
+    assert.deepEqual(result.bytes, image);
+    assert.equal(result.transport, 'full');
+    assert.equal(result.parallelMode, false);
+    assert.equal(result.chunksFetched, 1);
+    assert.equal(preloader.getStats().parallelMode, false);
+    assert.equal(preloader.getStats().chunksFetched, 1);
+  }
+});
+
+test('W208 retries mid-stream chunk body errors with backoff without corrupting reassembled bytes or double-counting', async () => {
+  const image = buildLargePgim();
+  const chunkBytes = 4096;
+  const expectedChunks = Math.ceil(image.byteLength / chunkBytes);
+  const flakyRange = 'bytes=8192-12287';
+  let flakyAttempts = 0;
+  const sleeps = [];
+  let clockMs = 1000;
+
+  const fetchImpl = async (url, init = {}) => {
+    if (init.method === 'HEAD') {
+      return new Response(null, {
+        status: 200,
+        headers: { 'content-length': String(image.byteLength), 'accept-ranges': 'bytes' },
+      });
+    }
+    const range = init.headers?.Range;
+    const match = /^bytes=(\d+)-(\d+)$/.exec(range);
+    const start = Number(match[1]);
+    const end = Math.min(Number(match[2]), image.byteLength - 1);
+    const slice = image.slice(start, end + 1);
+    clockMs += 5;
+
+    if (range === flakyRange) {
+      flakyAttempts += 1;
+      if (flakyAttempts <= 2) {
+        // Emit corrupted/partial bytes then throw a transient network error mid-stream.
+        const corruptPrefix = new Uint8Array(512).fill(0xee);
+        const brokenStream = new ReadableStream({
+          pull(controller) {
+            if (!this._sent) {
+              this._sent = true;
+              controller.enqueue(corruptPrefix);
+            } else {
+              controller.error(new TypeError('stream reset by peer'));
+            }
+          },
+        });
+        return new Response(brokenStream, {
+          status: 206,
+          headers: {
+            'content-range': `bytes ${start}-${end}/${image.byteLength}`,
+            'content-length': String(slice.byteLength),
+          },
+        });
+      }
+    }
+
+    return new Response(slice, {
+      status: 206,
+      headers: {
+        'content-range': `bytes ${start}-${end}/${image.byteLength}`,
+        'content-length': String(slice.byteLength),
+      },
+    });
+  };
+
+  const preloader = new PgimPreloader({
+    fetchImpl,
+    chunkBytes,
+    concurrency: 3,
+    maxRetries: 3,
+    retryDelayMs: 15,
+    sleepFn: async (ms) => {
+      sleeps.push(ms);
+      clockMs += ms;
+    },
+    nowFn: () => clockMs,
+  });
+
+  const result = await preloader.preloadGuestImage('/w208/flaky-stream.pgim', { verifyChecksums: true });
+  assert.deepEqual(result.bytes, image);
+  assert.equal(flakyAttempts, 3);
+  assert.deepEqual(sleeps, [15, 30]);
+  assert.equal(result.retryCount, 2);
+  assert.equal(result.chunksFetched, expectedChunks);
+  assert.equal(result.bytesLoaded, image.byteLength);
+  assert.equal(result.parallelMode, true);
+  assert.equal(preloader.getStats().chunksFetched, expectedChunks);
+  assert.equal(preloader.getStats().retryCount, 2);
+});
+
+test('W208 preloadShaderPack uses parallel Range chunks when supported and falls back seamlessly when unsupported', async () => {
+  // Build a larger WGPK shader pack (> 16 KiB) to span multiple 4 KiB Range chunks.
+  const shaders = [];
+  for (let i = 0; i < 40; i += 1) {
+    shaders.push({
+      hash: BigInt(0x1000 + i),
+      stage: i % 2 === 0 ? 'vertex' : 'fragment',
+      wgsl: `// shader ${i}\n${'/* pad */ '.repeat(45)}\n@fragment fn main_${i}() {}`,
+    });
+  }
+  const pack = new Uint8Array(buildWgslPackBuffer(shaders));
+  assert.ok(pack.byteLength > 16384, `expected >16 KiB shader pack, got ${pack.byteLength}`);
+  const chunkBytes = 4096;
+  const expectedChunks = Math.ceil(pack.byteLength / chunkBytes);
+
+  // Parallel ranged path (Accept-Ranges: bytes + Content-Length).
+  {
+    const server = createServer({ '/shaders/boot.wgsl.pack': pack }, { delayMs: 2 });
+    const preloader = new PgimPreloader({ fetchImpl: server.fetchImpl, chunkBytes, concurrency: 4 });
+    const res = await preloader.preloadShaderPack('/shaders/boot.wgsl.pack');
+    assert.deepEqual(res.bytes, pack);
+    assert.equal(parseWgslPack(res.bytes).size, 40);
+    assert.equal(res.transport, 'range');
+    assert.equal(res.parallelMode, true);
+    assert.equal(res.chunksFetched, expectedChunks);
+    assert.equal(res.bytesLoaded, pack.byteLength);
+    assert.equal(res.totalBytes, pack.byteLength);
+    assert.ok(server.maxInFlight > 1 && server.maxInFlight <= 4);
+    assert.equal(preloader.getStats().parallelMode, true);
+    assert.equal(preloader.getStats().chunksFetched, expectedChunks);
+  }
+
+  // Fallback path when Accept-Ranges: none.
+  {
+    const server = createServer({ '/shaders/boot.wgsl.pack': pack }, { supportRange: false, acceptRanges: 'none' });
+    const preloader = new PgimPreloader({ fetchImpl: server.fetchImpl, chunkBytes, concurrency: 4 });
+    const res = await preloader.preloadShaderPack('/shaders/boot.wgsl.pack');
+    assert.deepEqual(res.bytes, pack);
+    assert.equal(res.transport, 'full');
+    assert.equal(res.parallelMode, false);
+    assert.equal(res.chunksFetched, 1);
+    assert.equal(preloader.getStats().parallelMode, false);
+    assert.equal(preloader.getStats().chunksFetched, 1);
+  }
+});
+
+test('W208 aborts in-flight parallel Range chunk stream readers cleanly', async () => {
+  const image = buildLargePgim();
+  const controller = new AbortController();
+  let cancelledReaders = 0;
+
+  const fetchImpl = async (url, init = {}) => {
+    if (init.method === 'HEAD') {
+      return new Response(null, {
+        status: 200,
+        headers: { 'content-length': String(image.byteLength), 'accept-ranges': 'bytes' },
+      });
+    }
+    const range = init.headers?.Range;
+    const match = /^bytes=(\d+)-(\d+)$/.exec(range);
+    const start = Number(match[1]);
+    const end = Math.min(Number(match[2]), image.byteLength - 1);
+    const slice = image.slice(start, end + 1);
+    if (start === 0) {
+      return new Response(slice, {
+        status: 206,
+        headers: {
+          'content-range': `bytes ${start}-${end}/${image.byteLength}`,
+          'content-length': String(slice.byteLength),
+        },
+      });
+    }
+    // Hang chunk streams until aborted and count cancellations.
+    const hangingStream = new ReadableStream({
+      pull() {
+        return new Promise(() => {});
+      },
+      cancel() {
+        cancelledReaders += 1;
+      },
+    });
+    return new Response(hangingStream, {
+      status: 206,
+      headers: {
+        'content-range': `bytes ${start}-${end}/${image.byteLength}`,
+        'content-length': String(slice.byteLength),
+      },
+    });
+  };
+
+  const preloader = new PgimPreloader({ fetchImpl, chunkBytes: 4096, concurrency: 3 });
+  const pending = preloader.preloadGuestImage('/w208/abort-stream.pgim', { signal: controller.signal });
+  setTimeout(() => controller.abort(), 15);
+  await assert.rejects(pending, (err) => err.name === 'AbortError');
+  assert.ok(cancelledReaders >= 1, 'expected hung chunk readers to be cancelled on abort');
+  const stats = preloader.getStats();
+  assert.equal(stats.state, 'aborted');
+  assert.equal(stats.abortedCount, 1);
+  assert.equal(stats.chunksFetched, 1); // only chunk 0 completed before abort
 });
