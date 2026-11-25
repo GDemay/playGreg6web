@@ -4847,6 +4847,15 @@ class RenderStatePackets {
     return null;
   }
 
+  _resolveActualTextureDimension(texture, meta) {
+    if (texture && typeof texture.dimension === 'string') return texture.dimension;
+    if (texture && texture.desc && typeof texture.desc.dimension === 'string') {
+      return texture.desc.dimension;
+    }
+    if (meta && typeof meta.dimension === 'string') return meta.dimension;
+    return null;
+  }
+
   _textureView(textureId, desc) {
     this._syncDeviceGeneration();
     const texture = this.processor.textures.get(textureId);
@@ -4864,6 +4873,63 @@ class RenderStatePackets {
       ) {
         effectiveDesc = { ...effectiveDesc, format: meta.format };
       }
+    }
+    const actualTexDim = this._resolveActualTextureDimension(texture, meta);
+    const isPromoted1DTo2D = Boolean(meta && meta.promoted1DTo2D === true);
+    const texMipCount =
+      typeof texture.mipLevelCount === 'number' && texture.mipLevelCount >= 1
+        ? texture.mipLevelCount
+        : texture.desc &&
+            typeof texture.desc.mipLevelCount === 'number' &&
+            texture.desc.mipLevelCount >= 1
+          ? texture.desc.mipLevelCount
+          : meta && typeof meta.mipLevelCount === 'number' && meta.mipLevelCount >= 1
+            ? meta.mipLevelCount
+            : isPromoted1DTo2D
+              ? 1
+              : null;
+    if (
+      effectiveDesc &&
+      effectiveDesc.dimension === '1d' &&
+      (actualTexDim === '2d' || isPromoted1DTo2D)
+    ) {
+      // W347: W341/W342 promote 1D LUT textures (e.g. 4096x1) to WebGPU dimension '2d';
+      // coerce explicit '1d' view descriptors to '2d' with valid single-layer/mip bounds.
+      const coerced = {
+        ...effectiveDesc,
+        dimension: '2d',
+        baseArrayLayer: 0,
+        arrayLayerCount: 1,
+      };
+      if (isPromoted1DTo2D || texMipCount === 1) {
+        if (coerced.baseMipLevel !== undefined && coerced.baseMipLevel !== 0) {
+          coerced.baseMipLevel = 0;
+        }
+        coerced.mipLevelCount = 1;
+      }
+      effectiveDesc = coerced;
+    } else if (
+      actualTexDim === '1d' &&
+      effectiveDesc &&
+      typeof effectiveDesc.dimension === 'string' &&
+      effectiveDesc.dimension !== 'undefined' &&
+      effectiveDesc.dimension !== '1d'
+    ) {
+      // W347: Reverse guard — real WebGPU '1d' textures only allow '1d' views (1 mip, 1 layer).
+      const coerced = { ...effectiveDesc, dimension: '1d' };
+      if (coerced.baseArrayLayer !== undefined && coerced.baseArrayLayer !== 0) {
+        coerced.baseArrayLayer = 0;
+      }
+      if (coerced.arrayLayerCount !== undefined && coerced.arrayLayerCount !== 1) {
+        coerced.arrayLayerCount = 1;
+      }
+      if (coerced.baseMipLevel !== undefined && coerced.baseMipLevel !== 0) {
+        coerced.baseMipLevel = 0;
+      }
+      if (coerced.mipLevelCount !== undefined && coerced.mipLevelCount !== 1) {
+        coerced.mipLevelCount = 1;
+      }
+      effectiveDesc = coerced;
     }
     const key = buildTextureViewKey(effectiveDesc);
     let views = this.textureViews.get(textureId);
@@ -5185,14 +5251,22 @@ class RenderStatePackets {
     const key = `texture:${format}:${viewDimension}:${multisampled}:${Boolean(layoutEntry.storageTexture)}`;
     if (!this.dummies.has(key)) {
       const layers = viewDimension === 'cube' || viewDimension === 'cube-array' ? 6 : 1;
+      const requestedDim = viewDimension === '1d' ? '1d' : viewDimension === '3d' ? '3d' : '2d';
       const texture = this.device.createTexture({
         size: { width: 1, height: 1, depthOrArrayLayers: layers },
         format,
         usage: layoutEntry.storageTexture ? GPU_TEXTURE_USAGE_STORAGE_BINDING : GPU_TEXTURE_USAGE_TEXTURE_BINDING,
-        dimension: viewDimension === '1d' ? '1d' : viewDimension === '3d' ? '3d' : '2d',
-        sampleCount: multisampled ? 4 : 1,
+        dimension: requestedDim,
+        sampleCount: multisampled && requestedDim === '2d' && layers === 1 ? 4 : 1,
       });
-      this.dummies.set(key, texture.createView({ dimension: viewDimension }));
+      const actualDummyDim = typeof texture.dimension === 'string' ? texture.dimension : requestedDim;
+      const effectiveViewDim =
+        viewDimension === '1d' && actualDummyDim === '2d'
+          ? '2d'
+          : actualDummyDim === '1d' && viewDimension !== '1d'
+            ? '1d'
+            : viewDimension;
+      this.dummies.set(key, texture.createView({ dimension: effectiveViewDim }));
     }
     return this.dummies.get(key);
   }
@@ -5380,14 +5454,18 @@ class RenderStatePackets {
           textureUsage = texObj.desc.usage;
         }
         textureFormat = texFormat || null;
+        const actualTexDim = this._resolveActualTextureDimension(texObj, texMeta);
+        const isPromoted1DTo2D = Boolean(texMeta && texMeta.promoted1DTo2D === true);
         if (viewDesc && typeof viewDesc.dimension === 'string' && viewDesc.dimension !== 'undefined') {
-          textureViewDimension = viewDesc.dimension;
+          if (viewDesc.dimension === '1d' && (actualTexDim === '2d' || isPromoted1DTo2D)) {
+            textureViewDimension = '2d';
+          } else if (actualTexDim === '1d' && viewDesc.dimension !== '1d') {
+            textureViewDimension = '1d';
+          } else {
+            textureViewDimension = viewDesc.dimension;
+          }
         } else {
-          const baseDim =
-            (texMeta && texMeta.dimension) ||
-            (texObj && typeof texObj.dimension === 'string' ? texObj.dimension : null) ||
-            (texObj && texObj.desc && typeof texObj.desc.dimension === 'string' ? texObj.desc.dimension : null) ||
-            '2d';
+          const baseDim = actualTexDim || '2d';
           const baseLayers =
             (texMeta && typeof texMeta.depthOrArrayLayers === 'number' ? texMeta.depthOrArrayLayers : null) ||
             (texObj && typeof texObj.depthOrArrayLayers === 'number' ? texObj.depthOrArrayLayers : null) ||
@@ -5422,6 +5500,9 @@ class RenderStatePackets {
             entryUsedDummy = true;
           } else if (resolvedStorage.needsLinearSiblingView) {
             const linearViewDesc = { ...viewDesc, format: resolvedStorage.storageFormat };
+            if (linearViewDesc.mipLevelCount !== 1) {
+              linearViewDesc.mipLevelCount = 1;
+            }
             const linearView = this._textureView(resourceId, linearViewDesc);
             if (linearView) {
               realResource = linearView;
@@ -5438,10 +5519,15 @@ class RenderStatePackets {
               entryUsedDummy = true;
             }
           } else {
-            const resolvedView = this._textureView(resourceId, viewDesc);
+            const storageViewDesc =
+              viewDesc && viewDesc.mipLevelCount === 1
+                ? viewDesc
+                : { ...(viewDesc || {}), mipLevelCount: 1 };
+            const resolvedView = this._textureView(resourceId, storageViewDesc);
             if (resolvedView) {
               realResource = resolvedView;
               entryResource = resolvedView;
+              textureViewDescUsed = storageViewDesc;
             }
           }
         } else if (
