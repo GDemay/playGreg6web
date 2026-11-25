@@ -12,6 +12,7 @@
   const TEXTURE_FORMATS_TIER1_FEATURE = 'texture-formats-tier1';
   const CHROMIUM_UNORM16_FEATURE = 'chromium-experimental-unorm16-texture-formats';
   const DEPTH32FLOAT_STENCIL8_FEATURE = 'depth32float-stencil8';
+  const BGRA8UNORM_STORAGE_FEATURE = 'bgra8unorm-storage';
 
   const SRGB_SIBLING_FORMATS = Object.freeze({
     rgba8unorm: 'rgba8unorm-srgb',
@@ -37,7 +38,64 @@
     'rgba16snorm',
   ]);
 
+  const DEPTH_STENCIL_TEXTURE_FORMATS = new Set([
+    'depth16unorm',
+    'depth24plus',
+    'depth24plus-stencil8',
+    'depth32float',
+    'depth32float-stencil8',
+    'stencil8',
+  ]);
+
+  // Core WebGPU storage-compatible texture formats (WebGPU "Texture Format Capabilities").
+  const CORE_STORAGE_TEXTURE_FORMATS = new Set([
+    'rgba8unorm',
+    'rgba8snorm',
+    'rgba8uint',
+    'rgba8sint',
+    'rgba16uint',
+    'rgba16sint',
+    'rgba16float',
+    'r32uint',
+    'r32sint',
+    'r32float',
+    'rg32uint',
+    'rg32sint',
+    'rg32float',
+    'rgba32uint',
+    'rgba32sint',
+    'rgba32float',
+  ]);
+
+  // Storage-compatible formats enabled by optional 'texture-formats-tier1'.
+  const TIER1_STORAGE_TEXTURE_FORMATS = new Set([
+    'r8unorm',
+    'r8snorm',
+    'r8uint',
+    'r8sint',
+    'r16unorm',
+    'r16snorm',
+    'r16uint',
+    'r16sint',
+    'r16float',
+    'rg8unorm',
+    'rg8snorm',
+    'rg8uint',
+    'rg8sint',
+    'rg16unorm',
+    'rg16snorm',
+    'rg16uint',
+    'rg16sint',
+    'rg16float',
+    'rgb10a2uint',
+    'rgb10a2unorm',
+    'rg11b10ufloat',
+    'rgba16unorm',
+    'rgba16snorm',
+  ]);
+
   const BC_FORMAT_PATTERN = /^bc[1-7]/;
+  const COMPRESSED_FORMAT_PATTERN = /^(bc[1-7]|etc2-|eac-|astc-)/;
 
   /**
    * Standard DirectX / Xbox Series DXGI_FORMAT numeric enum values (dxgiformat.h).
@@ -45,7 +103,13 @@
   const DXGI_FORMAT = Object.freeze({
     UNKNOWN: 0,
     R32G32B32A32_FLOAT: 2,
+    R32G32B32A32_UINT: 3,
     R16G16B16A16_FLOAT: 10,
+    R16G16B16A16_UNORM: 11,
+    R16G16B16A16_UINT: 12,
+    R16G16B16A16_SNORM: 13,
+    R32G32_FLOAT: 16,
+    R32G32_UINT: 17,
     D32_FLOAT_S8X24_UINT: 20,
     R10G10B10A2_UNORM: 24,
     R11G11B10_FLOAT: 26,
@@ -55,15 +119,23 @@
     R8G8B8A8_SNORM: 31,
     R8G8B8A8_SINT: 32,
     R16G16_FLOAT: 34,
+    R16G16_UNORM: 35,
+    R16G16_UINT: 36,
     D32_FLOAT: 40,
     R32_FLOAT: 41,
     R32_UINT: 42,
     R32_SINT: 43,
     D24_UNORM_S8_UINT: 45,
     R8G8_UNORM: 49,
+    R8G8_UINT: 50,
     R16_FLOAT: 54,
     D16_UNORM: 55,
+    R16_UNORM: 56,
+    R16_UINT: 57,
     R8_UNORM: 61,
+    R8_UINT: 62,
+    R8_SNORM: 63,
+    A8_UNORM: 65,
     BC1_UNORM: 71,
     BC1_UNORM_SRGB: 72,
     BC2_UNORM: 74,
@@ -106,6 +178,8 @@
       isCompressed: Boolean(options.isCompressed),
       isDepth: Boolean(options.isDepth),
       isSrgb: Boolean(options.isSrgb),
+      isAlphaOnly: Boolean(options.isAlphaOnly),
+      swizzle: options.swizzle || null,
       requiresFeature: options.requiresFeature || null,
     });
   }
@@ -113,7 +187,27 @@
   // Canonical DXGI_FORMAT -> WebGPU GPUTextureFormat descriptor table.
   const FORMAT_TABLE = Object.freeze({
     [DXGI_FORMAT.R32G32B32A32_FLOAT]: makeEntry(DXGI_FORMAT.R32G32B32A32_FLOAT, 'rgba32float', 1, 1, 16),
+    [DXGI_FORMAT.R32G32B32A32_UINT]: makeEntry(DXGI_FORMAT.R32G32B32A32_UINT, 'rgba32uint', 1, 1, 16),
     [DXGI_FORMAT.R16G16B16A16_FLOAT]: makeEntry(DXGI_FORMAT.R16G16B16A16_FLOAT, 'rgba16float', 1, 1, 8),
+    [DXGI_FORMAT.R16G16B16A16_UNORM]: makeEntry(
+      DXGI_FORMAT.R16G16B16A16_UNORM,
+      'rgba16unorm',
+      1,
+      1,
+      8,
+      { requiresFeature: TEXTURE_FORMATS_TIER1_FEATURE }
+    ),
+    [DXGI_FORMAT.R16G16B16A16_UINT]: makeEntry(DXGI_FORMAT.R16G16B16A16_UINT, 'rgba16uint', 1, 1, 8),
+    [DXGI_FORMAT.R16G16B16A16_SNORM]: makeEntry(
+      DXGI_FORMAT.R16G16B16A16_SNORM,
+      'rgba16snorm',
+      1,
+      1,
+      8,
+      { requiresFeature: TEXTURE_FORMATS_TIER1_FEATURE }
+    ),
+    [DXGI_FORMAT.R32G32_FLOAT]: makeEntry(DXGI_FORMAT.R32G32_FLOAT, 'rg32float', 1, 1, 8),
+    [DXGI_FORMAT.R32G32_UINT]: makeEntry(DXGI_FORMAT.R32G32_UINT, 'rg32uint', 1, 1, 8),
     [DXGI_FORMAT.D32_FLOAT_S8X24_UINT]: makeEntry(
       DXGI_FORMAT.D32_FLOAT_S8X24_UINT,
       'depth32float-stencil8',
@@ -137,6 +231,15 @@
     [DXGI_FORMAT.R8G8B8A8_SNORM]: makeEntry(DXGI_FORMAT.R8G8B8A8_SNORM, 'rgba8snorm', 1, 1, 4),
     [DXGI_FORMAT.R8G8B8A8_SINT]: makeEntry(DXGI_FORMAT.R8G8B8A8_SINT, 'rgba8sint', 1, 1, 4),
     [DXGI_FORMAT.R16G16_FLOAT]: makeEntry(DXGI_FORMAT.R16G16_FLOAT, 'rg16float', 1, 1, 4),
+    [DXGI_FORMAT.R16G16_UNORM]: makeEntry(
+      DXGI_FORMAT.R16G16_UNORM,
+      'rg16unorm',
+      1,
+      1,
+      4,
+      { requiresFeature: TEXTURE_FORMATS_TIER1_FEATURE }
+    ),
+    [DXGI_FORMAT.R16G16_UINT]: makeEntry(DXGI_FORMAT.R16G16_UINT, 'rg16uint', 1, 1, 4),
     [DXGI_FORMAT.D32_FLOAT]: makeEntry(DXGI_FORMAT.D32_FLOAT, 'depth32float', 1, 1, 4, { isDepth: true }),
     [DXGI_FORMAT.R32_FLOAT]: makeEntry(DXGI_FORMAT.R32_FLOAT, 'r32float', 1, 1, 4),
     [DXGI_FORMAT.R32_UINT]: makeEntry(DXGI_FORMAT.R32_UINT, 'r32uint', 1, 1, 4),
@@ -150,9 +253,25 @@
       { isDepth: true }
     ),
     [DXGI_FORMAT.R8G8_UNORM]: makeEntry(DXGI_FORMAT.R8G8_UNORM, 'rg8unorm', 1, 1, 2),
+    [DXGI_FORMAT.R8G8_UINT]: makeEntry(DXGI_FORMAT.R8G8_UINT, 'rg8uint', 1, 1, 2),
     [DXGI_FORMAT.R16_FLOAT]: makeEntry(DXGI_FORMAT.R16_FLOAT, 'r16float', 1, 1, 2),
     [DXGI_FORMAT.D16_UNORM]: makeEntry(DXGI_FORMAT.D16_UNORM, 'depth16unorm', 1, 1, 2, { isDepth: true }),
+    [DXGI_FORMAT.R16_UNORM]: makeEntry(
+      DXGI_FORMAT.R16_UNORM,
+      'r16unorm',
+      1,
+      1,
+      2,
+      { requiresFeature: TEXTURE_FORMATS_TIER1_FEATURE }
+    ),
+    [DXGI_FORMAT.R16_UINT]: makeEntry(DXGI_FORMAT.R16_UINT, 'r16uint', 1, 1, 2),
     [DXGI_FORMAT.R8_UNORM]: makeEntry(DXGI_FORMAT.R8_UNORM, 'r8unorm', 1, 1, 1),
+    [DXGI_FORMAT.R8_UINT]: makeEntry(DXGI_FORMAT.R8_UINT, 'r8uint', 1, 1, 1),
+    [DXGI_FORMAT.R8_SNORM]: makeEntry(DXGI_FORMAT.R8_SNORM, 'r8snorm', 1, 1, 1),
+    [DXGI_FORMAT.A8_UNORM]: makeEntry(DXGI_FORMAT.A8_UNORM, 'r8unorm', 1, 1, 1, {
+      isAlphaOnly: true,
+      swizzle: '000r',
+    }),
     [DXGI_FORMAT.B8G8R8A8_UNORM]: makeEntry(DXGI_FORMAT.B8G8R8A8_UNORM, 'bgra8unorm', 1, 1, 4),
     [DXGI_FORMAT.B8G8R8A8_UNORM_SRGB]: makeEntry(
       DXGI_FORMAT.B8G8R8A8_UNORM_SRGB,
@@ -328,6 +447,17 @@
       !hasSupportedFeature(supportedFeatures, DEPTH32FLOAT_STENCIL8_FEATURE)
     ) {
       webgpuFormat = 'depth24plus-stencil8';
+    } else if (
+      entry.requiresFeature === TEXTURE_FORMATS_TIER1_FEATURE &&
+      NORM16_TEXTURE_FORMATS.has(entry.webgpuFormat) &&
+      !hasSupportedFeature(supportedFeatures, TEXTURE_FORMATS_TIER1_FEATURE) &&
+      !hasSupportedFeature(supportedFeatures, CHROMIUM_UNORM16_FEATURE)
+    ) {
+      webgpuFormat = entry.webgpuFormat.startsWith('rgba')
+        ? 'rgba16float'
+        : entry.webgpuFormat.startsWith('rg')
+          ? 'rg16float'
+          : 'r16float';
     }
 
     return {
@@ -341,6 +471,8 @@
       isCompressed: entry.isCompressed,
       isDepth: entry.isDepth,
       isSrgb: entry.isSrgb,
+      isAlphaOnly: entry.isAlphaOnly,
+      swizzle: entry.swizzle,
       requiresFeature: entry.requiresFeature,
       needsSoftwareDecode,
     };
@@ -496,6 +628,172 @@
       requiredFeature: null,
       fallbackFormat: null,
       reason: null,
+    };
+  }
+
+  function extractDeviceFeatures(optionsOrFeatures) {
+    if (!optionsOrFeatures) {
+      return null;
+    }
+    if (
+      typeof optionsOrFeatures === 'object' &&
+      !Array.isArray(optionsOrFeatures) &&
+      typeof optionsOrFeatures.has !== 'function' &&
+      typeof optionsOrFeatures[Symbol.iterator] !== 'function'
+    ) {
+      if (Object.prototype.hasOwnProperty.call(optionsOrFeatures, 'deviceFeatures')) {
+        return optionsOrFeatures.deviceFeatures || null;
+      }
+      if (Object.prototype.hasOwnProperty.call(optionsOrFeatures, 'supportedFeatures')) {
+        return optionsOrFeatures.supportedFeatures || null;
+      }
+    }
+    return optionsOrFeatures;
+  }
+
+  /**
+   * Resolve whether a WebGPU texture format can be bound as a UAV storage texture
+   * (`GPUTextureUsage.STORAGE_BINDING`), and if an sRGB format requires a linear
+   * sibling texture view (e.g. `rgba8unorm-srgb` -> `rgba8unorm`).
+   *
+   * Depth/stencil, block-compressed, and unsupported sRGB/optional formats return
+   * `storageFormat: null` and `supportsStorageBinding: false` with a machine-readable
+   * `reason` so callers can avoid WebGPU validation errors cleanly.
+   *
+   * @param {string} webgpuFormat
+   * @param {{
+   *   deviceFeatures?: Set<string> | string[] | Iterable<string> | Record<string, boolean> | null,
+   *   supportedFeatures?: Set<string> | string[] | Iterable<string> | Record<string, boolean> | null
+   * } | Set<string> | string[] | Iterable<string> | Record<string, boolean> | null} [optionsOrFeatures]
+   * @returns {{
+   *   storageFormat: string | null,
+   *   supportsStorageBinding: boolean,
+   *   needsLinearSiblingView: boolean,
+   *   reason: string | null
+   * }}
+   */
+  function resolveStorageCompatibleFormat(webgpuFormat, optionsOrFeatures) {
+    if (typeof webgpuFormat !== 'string') {
+      return {
+        storageFormat: null,
+        supportsStorageBinding: false,
+        needsLinearSiblingView: false,
+        reason: 'invalid-format',
+      };
+    }
+
+    const normalized = webgpuFormat.trim().toLowerCase();
+    if (!normalized) {
+      return {
+        storageFormat: null,
+        supportsStorageBinding: false,
+        needsLinearSiblingView: false,
+        reason: 'invalid-format',
+      };
+    }
+
+    const deviceFeatures = extractDeviceFeatures(optionsOrFeatures);
+
+    if (DEPTH_STENCIL_TEXTURE_FORMATS.has(normalized)) {
+      return {
+        storageFormat: null,
+        supportsStorageBinding: false,
+        needsLinearSiblingView: false,
+        reason: 'depth-stencil-not-storage-compatible',
+      };
+    }
+
+    if (COMPRESSED_FORMAT_PATTERN.test(normalized)) {
+      return {
+        storageFormat: null,
+        supportsStorageBinding: false,
+        needsLinearSiblingView: false,
+        reason: 'compressed-not-storage-compatible',
+      };
+    }
+
+    if (CORE_STORAGE_TEXTURE_FORMATS.has(normalized)) {
+      return {
+        storageFormat: normalized,
+        supportsStorageBinding: true,
+        needsLinearSiblingView: false,
+        reason: null,
+      };
+    }
+
+    if (normalized === 'bgra8unorm') {
+      if (hasSupportedFeature(deviceFeatures, BGRA8UNORM_STORAGE_FEATURE)) {
+        return {
+          storageFormat: 'bgra8unorm',
+          supportsStorageBinding: true,
+          needsLinearSiblingView: false,
+          reason: null,
+        };
+      }
+      return {
+        storageFormat: null,
+        supportsStorageBinding: false,
+        needsLinearSiblingView: false,
+        reason: 'missing-bgra8unorm-storage',
+      };
+    }
+
+    if (TIER1_STORAGE_TEXTURE_FORMATS.has(normalized)) {
+      if (hasSupportedFeature(deviceFeatures, TEXTURE_FORMATS_TIER1_FEATURE)) {
+        return {
+          storageFormat: normalized,
+          supportsStorageBinding: true,
+          needsLinearSiblingView: false,
+          reason: null,
+        };
+      }
+      return {
+        storageFormat: null,
+        supportsStorageBinding: false,
+        needsLinearSiblingView: false,
+        reason: 'missing-texture-formats-tier1',
+      };
+    }
+
+    if (normalized.endsWith('-srgb')) {
+      const linearSibling = getSrgbSiblingFormat(normalized);
+      if (linearSibling === 'rgba8unorm') {
+        return {
+          storageFormat: 'rgba8unorm',
+          supportsStorageBinding: true,
+          needsLinearSiblingView: true,
+          reason: 'srgb-requires-linear-view',
+        };
+      }
+      if (linearSibling === 'bgra8unorm') {
+        if (hasSupportedFeature(deviceFeatures, BGRA8UNORM_STORAGE_FEATURE)) {
+          return {
+            storageFormat: 'bgra8unorm',
+            supportsStorageBinding: true,
+            needsLinearSiblingView: true,
+            reason: 'srgb-requires-linear-view',
+          };
+        }
+        return {
+          storageFormat: null,
+          supportsStorageBinding: false,
+          needsLinearSiblingView: false,
+          reason: 'missing-bgra8unorm-storage',
+        };
+      }
+      return {
+        storageFormat: null,
+        supportsStorageBinding: false,
+        needsLinearSiblingView: false,
+        reason: 'srgb-not-storage-compatible',
+      };
+    }
+
+    return {
+      storageFormat: null,
+      supportsStorageBinding: false,
+      needsLinearSiblingView: false,
+      reason: 'unsupported-storage-format',
     };
   }
 
@@ -939,10 +1237,13 @@
     TEXTURE_COMPRESSION_BC_FEATURE,
     TEXTURE_COMPRESSION_BC_SLICED_3D_FEATURE,
     TEXTURE_FORMATS_TIER1_FEATURE,
+    CHROMIUM_UNORM16_FEATURE,
     DEPTH32FLOAT_STENCIL8_FEATURE,
+    BGRA8UNORM_STORAGE_FEATURE,
     mapDxgiFormatToWebGpu,
     getSrgbSiblingFormat,
     classifyTextureFormatSupport,
+    resolveStorageCompatibleFormat,
     calcMipSize,
     calcMipLayout,
     padTextureRowsForWriteTexture,
