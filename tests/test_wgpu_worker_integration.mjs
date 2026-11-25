@@ -1798,3 +1798,474 @@ test('W121 telemetry surfaces TexturePackets bc3dFallbacks and bc3dFallbackUploa
 
   processor.destroy();
 });
+
+// ---------------------------------------------------------------------------
+// 6. W136: On-demand ranged WGSL pack shader resolution via getWgslAsync(hash)
+// ---------------------------------------------------------------------------
+
+function createControllableRangeFetch(packBuffer, options = {}) {
+  const packBytes = new Uint8Array(packBuffer);
+  const requests = [];
+  const deferredRanges = [];
+  const { deferDataRanges = false, failDataRangeStatus = null, dataStartOffset = 0 } = options;
+
+  const fetchImpl = async (url, init = {}) => {
+    const method = (init && init.method ? String(init.method) : 'GET').toUpperCase();
+    const headers = init && init.headers ? init.headers : {};
+    const rangeHeader = headers.Range || headers.range || null;
+    const req = { url, method, rangeHeader, start: null, end: null };
+    requests.push(req);
+
+    if (method === 'HEAD') {
+      return {
+        ok: true,
+        status: 200,
+        headers: new Map([
+          ['content-length', String(packBytes.byteLength)],
+          ['accept-ranges', 'bytes'],
+        ]),
+      };
+    }
+
+    if (rangeHeader) {
+      const m = /^bytes=(\d+)-(\d+)$/.exec(rangeHeader);
+      assert.ok(m, `Unexpected Range header: ${rangeHeader}`);
+      const start = Number(m[1]);
+      const end = Math.min(Number(m[2]), packBytes.byteLength - 1);
+      req.start = start;
+      req.end = end;
+
+      const isDataRange = dataStartOffset > 0 && start >= dataStartOffset;
+      if (isDataRange && deferDataRanges) {
+        await new Promise((resolve, reject) => {
+          deferredRanges.push({ req, start, end, resolve, reject });
+        });
+      }
+
+      if (isDataRange && failDataRangeStatus !== null) {
+        return {
+          ok: false,
+          status: failDataRangeStatus,
+          statusText: 'Internal Server Error',
+          headers: new Map(),
+          async arrayBuffer() {
+            return new ArrayBuffer(0);
+          },
+        };
+      }
+
+      const slice = packBytes.slice(start, end + 1);
+      return {
+        ok: true,
+        status: 206,
+        headers: new Map([
+          ['content-range', `bytes ${start}-${end}/${packBytes.byteLength}`],
+          ['content-length', String(slice.byteLength)],
+        ]),
+        async arrayBuffer() {
+          return slice.buffer.slice(slice.byteOffset, slice.byteOffset + slice.byteLength);
+        },
+      };
+    }
+
+    return {
+      ok: true,
+      status: 200,
+      headers: new Map([['content-length', String(packBytes.byteLength)]]),
+      async arrayBuffer() {
+        return packBuffer.slice(0);
+      },
+    };
+  };
+
+  return {
+    requests,
+    deferredRanges,
+    fetchImpl,
+    resolveNextDeferred() {
+      const next = deferredRanges.shift();
+      assert.ok(next, 'Expected a deferred range fetch to resolve');
+      next.resolve();
+      return next;
+    },
+    resolveAllDeferred() {
+      while (deferredRanges.length > 0) {
+        deferredRanges.shift().resolve();
+      }
+    },
+  };
+}
+
+test('W136 ranged .wgsl.pack resolves shader on demand via HTTP 206 Range, swaps real GPUShaderModule, deduplicates in-flight fetches, and caches LRU hits', async () => {
+  const vsWgsl = '@vertex fn vs_ranged() -> @builtin(position) vec4<f32> { return vec4<f32>(0.25, 0.5, 0.0, 1.0); }\n';
+  const fsWgsl = '@fragment fn fs_ranged() -> @location(0) vec4<f32> { return vec4<f32>(0.2, 0.8, 0.4, 1.0); }\n';
+  const csWgsl = '@compute @workgroup_size(8, 1, 1) fn cs_unused() {}\n';
+  const vsHash = wgpkFormatHashHex(wgpkFnv1a64(vsWgsl));
+  const fsHash = wgpkFormatHashHex(wgpkFnv1a64(fsWgsl));
+  const csHash = wgpkFormatHashHex(wgpkFnv1a64(csWgsl));
+  const unknownHash = '0x0123456789abcdef';
+
+  const packBuffer = buildWgslPackBuffer([
+    { hash: vsHash, stage: WGPK_SHADER_STAGE.VERTEX, wgsl: vsWgsl },
+    { hash: fsHash, stage: WGPK_SHADER_STAGE.FRAGMENT, wgsl: fsWgsl },
+    { hash: csHash, stage: WGPK_SHADER_STAGE.COMPUTE, wgsl: csWgsl },
+  ]);
+  const dataStart = 16 + 3 * 20; // WGPK header (16B) + 3 entries (20B each)
+  const vsByteLen = new TextEncoder().encode(vsWgsl).byteLength;
+
+  const net = createControllableRangeFetch(packBuffer, {
+    deferDataRanges: true,
+    dataStartOffset: dataStart,
+  });
+  const packCache = new WgslPackCache();
+  const mock = createFullMockWebGpu({ timestampQuery: false });
+  const processor = new WgpuCommandProcessor(mock.device, mock.ctx, {
+    format: 'bgra8unorm',
+    wgslPackCache: packCache,
+    enableResourceRegistry: true,
+  });
+
+  // Load pack in ranged index-only mode (`streamThresholdBytes: 1`, `initialRangeBytes: dataStart` so only header+table are fetched).
+  await processor.loadShaderPackUrl('/shaders/ranged-w136.wgsl.pack', {
+    fetch: net.fetchImpl,
+    streamThresholdBytes: 1,
+    initialRangeBytes: dataStart,
+  });
+  assert.equal(packCache.getStats().mode, 'ranged');
+  assert.equal(net.requests.filter((r) => r.method === 'GET' && r.rangeHeader === null).length, 0);
+  const requestsAfterIndex = net.requests.length;
+
+  // Issue CreateShaderModule(1, VERTEX, vsHash) twice while in-flight to verify deduplication for (shaderId, hash).
+  const stream = new BinaryCommandBuilder()
+    .createShaderModule(1, SHADER_STAGE.VERTEX, vsHash)
+    .createShaderModule(1, SHADER_STAGE.VERTEX, vsHash)
+    .createShaderModule(99, SHADER_STAGE.FRAGMENT, unknownHash)
+    .finish();
+  processor.executeCommandBuffer(stream);
+
+  // Synchronously installed fallback module while range fetch is in flight; unknown hash did NOT trigger ranged fetch.
+  assert.equal(processor.shaderModules.get(1).source, 'builtin');
+  assert.equal(processor.getStats().rangedShaderFetches, 1);
+  assert.equal(processor.getStats().rangedShaderReady, 0);
+  assert.equal(processor.getStats().rangedShaderErrors, 0);
+  assert.equal(net.deferredRanges.length, 1);
+
+  // Verify the HTTP 206 Range request targets ONLY vsWgsl's exact byte range.
+  const sliceReq = net.deferredRanges[0];
+  assert.equal(sliceReq.start, dataStart);
+  assert.equal(sliceReq.end, dataStart + vsByteLen - 1);
+
+  // Release the deferred HTTP 206 Range fetch and wait for async compilation + swap.
+  net.resolveNextDeferred();
+  await processor.flushPendingRangedShaders();
+
+  const updated = processor.shaderModules.get(1);
+  assert.ok(updated && updated.module, 'Expected real compiled GPUShaderModule swapped into shaderModules');
+  assert.equal(updated.source, 'pack');
+  assert.equal(updated.code, vsWgsl);
+  assert.equal(updated.module.code, vsWgsl);
+  assert.equal(updated.resolvedHash, vsHash);
+  assert.equal(updated.entryPoint, 'vs_ranged');
+  assert.equal(updated.fallbackProfile, null);
+
+  // Telemetry counters on both getStats() and buildGpuTelemetrySnapshot().shaderPackStats.
+  const stats = processor.getStats();
+  assert.equal(stats.rangedShaderFetches, 1);
+  assert.equal(stats.rangedShaderReady, 1);
+  assert.equal(stats.rangedShaderErrors, 0);
+  const snap = buildGpuTelemetrySnapshot(processor, { timestamp: 60001 });
+  assert.equal(snap.shaderPackStats.mode, 'ranged');
+  assert.equal(snap.shaderPackStats.rangedShaderFetches, 1);
+  assert.equal(snap.shaderPackStats.rangedShaderReady, 1);
+  assert.equal(snap.shaderPackStats.rangedShaderErrors, 0);
+
+  // Only 1 data range request occurred (never fetched fsWgsl or csWgsl, never full 200 GET).
+  assert.equal(net.requests.length, requestsAfterIndex + 1);
+  assert.equal(net.requests.filter((r) => r.method === 'GET' && r.rangeHeader === null).length, 0);
+
+  // Subsequent pipeline creation uses the real compiled GPUShaderModule (not fallback).
+  const inlineFs = '@fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }\n';
+  const pipeStream = new BinaryCommandBuilder()
+    .createShaderModule(2, SHADER_STAGE.FRAGMENT, inlineFs)
+    .createRenderPipeline(10, 1, 2, 0)
+    .finish();
+  processor.executeCommandBuffer(pipeStream);
+  const rpCall = mock.calls.find((c) => c.op === 'createRenderPipeline');
+  assert.ok(rpCall);
+  assert.equal(rpCall.desc.vertex.module, updated.module);
+  assert.equal(rpCall.desc.vertex.module.code, vsWgsl);
+
+  // Subsequent CreateShaderModule for the same hash hits the synchronous LRU fast path (zero new fetches).
+  const cachedStream = new BinaryCommandBuilder()
+    .createShaderModule(10, SHADER_STAGE.VERTEX, vsHash)
+    .finish();
+  processor.executeCommandBuffer(cachedStream);
+  assert.equal(processor.shaderModules.get(10).source, 'pack');
+  assert.equal(processor.shaderModules.get(10).code, vsWgsl);
+  assert.equal(processor.shaderModules.get(10).module.code, vsWgsl);
+  assert.equal(processor.getStats().rangedShaderFetches, 1);
+  assert.equal(processor.getStats().rangedShaderReady, 1);
+  assert.equal(net.requests.length, requestsAfterIndex + 1);
+
+  processor.destroy();
+});
+
+test('W136 destroying or recreating shaderId before async range fetch resolves prevents stale module overwrite', async () => {
+  const wgslA = '@vertex fn vs_a() -> @builtin(position) vec4<f32> { return vec4<f32>(1.0, 0.0, 0.0, 1.0); }\n';
+  const wgslB = '@vertex fn vs_b() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0, 1.0, 0.0, 1.0); }\n';
+  const wgslC = '@vertex fn vs_c() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0, 0.0, 1.0, 1.0); }\n';
+  const hashA = wgpkFormatHashHex(wgpkFnv1a64(wgslA));
+  const hashB = wgpkFormatHashHex(wgpkFnv1a64(wgslB));
+  const hashC = wgpkFormatHashHex(wgpkFnv1a64(wgslC));
+
+  const packBuffer = buildWgslPackBuffer([
+    { hash: hashA, stage: WGPK_SHADER_STAGE.VERTEX, wgsl: wgslA },
+    { hash: hashB, stage: WGPK_SHADER_STAGE.VERTEX, wgsl: wgslB },
+    { hash: hashC, stage: WGPK_SHADER_STAGE.VERTEX, wgsl: wgslC },
+  ]);
+  const dataStart = 16 + 3 * 20;
+
+  const net = createControllableRangeFetch(packBuffer, {
+    deferDataRanges: true,
+    dataStartOffset: dataStart,
+  });
+  const packCache = new WgslPackCache();
+  const mock = createFullMockWebGpu({ timestampQuery: false });
+  const processor = new WgpuCommandProcessor(mock.device, mock.ctx, {
+    format: 'bgra8unorm',
+    wgslPackCache: packCache,
+  });
+
+  await processor.loadShaderPackUrl('/shaders/ranged-stale.wgsl.pack', {
+    fetch: net.fetchImpl,
+    streamThresholdBytes: 1,
+    initialRangeBytes: dataStart,
+  });
+
+  // 1. Destroy shader 20 before its range fetch resolves -> stale module must NOT be installed.
+  processor.executeCommandBuffer(
+    new BinaryCommandBuilder()
+      .createShaderModule(20, SHADER_STAGE.VERTEX, hashA)
+      .destroyResource(20)
+      .finish()
+  );
+  assert.equal(processor.shaderModules.has(20), false);
+  assert.equal(processor.getStats().rangedShaderFetches, 1);
+
+  net.resolveNextDeferred();
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(processor.shaderModules.has(20), false);
+  assert.equal(processor.getStats().rangedShaderReady, 0);
+  assert.equal(processor.getStats().rangedShaderErrors, 0);
+
+  // 2. Recreate shader 21 with inline WGSL before its range fetch resolves -> inline module preserved.
+  const inlineOverride = '@vertex fn vs_inline_override() -> @builtin(position) vec4<f32> { return vec4<f32>(0.5); }\n';
+  processor.executeCommandBuffer(
+    new BinaryCommandBuilder()
+      .createShaderModule(21, SHADER_STAGE.VERTEX, hashB)
+      .createShaderModule(21, SHADER_STAGE.VERTEX, inlineOverride)
+      .finish()
+  );
+  assert.equal(processor.shaderModules.get(21).source, 'inline');
+  assert.equal(processor.shaderModules.get(21).code, inlineOverride);
+  assert.equal(processor.getStats().rangedShaderFetches, 2);
+
+  net.resolveNextDeferred();
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(processor.shaderModules.get(21).source, 'inline');
+  assert.equal(processor.shaderModules.get(21).code, inlineOverride);
+  assert.equal(processor.getStats().rangedShaderReady, 0);
+  assert.equal(processor.getStats().rangedShaderErrors, 0);
+
+  // 3. Recreate shader 30 with a different ranged hash (hashC) while hashA-fresh is in flight ->
+  //    even if the newer fetch resolves first and the older fetch resolves later, newer module wins.
+  const packBuffer2 = buildWgslPackBuffer([
+    { hash: hashA, stage: WGPK_SHADER_STAGE.VERTEX, wgsl: wgslA },
+    { hash: hashC, stage: WGPK_SHADER_STAGE.VERTEX, wgsl: wgslC },
+  ]);
+  const dataStart2 = 16 + 2 * 20;
+  const net2 = createControllableRangeFetch(packBuffer2, {
+    deferDataRanges: true,
+    dataStartOffset: dataStart2,
+  });
+  const packCache2 = new WgslPackCache();
+  const mock2 = createFullMockWebGpu({ timestampQuery: false });
+  const proc2 = new WgpuCommandProcessor(mock2.device, mock2.ctx, {
+    format: 'bgra8unorm',
+    wgslPackCache: packCache2,
+  });
+  await proc2.loadShaderPackUrl('/shaders/ranged-recreate.wgsl.pack', {
+    fetch: net2.fetchImpl,
+    streamThresholdBytes: 1,
+    initialRangeBytes: dataStart2,
+  });
+
+  proc2.executeCommandBuffer(
+    new BinaryCommandBuilder()
+      .createShaderModule(30, SHADER_STAGE.VERTEX, hashA)
+      .createShaderModule(30, SHADER_STAGE.VERTEX, hashC)
+      .finish()
+  );
+  assert.equal(proc2.getStats().rangedShaderFetches, 2);
+  assert.equal(net2.deferredRanges.length, 2);
+
+  // Resolve the SECOND fetch (hashC) first, then resolve the FIRST stale fetch (hashA) afterwards.
+  const staleFetch = net2.deferredRanges.shift();
+  const newerFetch = net2.deferredRanges.shift();
+  newerFetch.resolve();
+  await proc2.flushPendingRangedShaders();
+  assert.equal(proc2.shaderModules.get(30).code, wgslC);
+  assert.equal(proc2.getStats().rangedShaderReady, 1);
+
+  staleFetch.resolve();
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(proc2.shaderModules.get(30).code, wgslC, 'Late stale resolution must not overwrite newer shader');
+  assert.equal(proc2.getStats().rangedShaderReady, 1);
+  assert.equal(proc2.getStats().rangedShaderErrors, 0);
+
+  processor.destroy();
+  proc2.destroy();
+});
+
+test('W136 ranged fetch error and compile error increment rangedShaderErrors cleanly without crashing', async () => {
+  const vsWgsl = '@vertex fn vs_err() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }\n';
+  const fsWgsl = '@fragment fn fs_compile_fail() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }\n';
+  const vsHash = wgpkFormatHashHex(wgpkFnv1a64(vsWgsl));
+  const fsHash = wgpkFormatHashHex(wgpkFnv1a64(fsWgsl));
+
+  const packBuffer = buildWgslPackBuffer([
+    { hash: vsHash, stage: WGPK_SHADER_STAGE.VERTEX, wgsl: vsWgsl },
+    { hash: fsHash, stage: WGPK_SHADER_STAGE.FRAGMENT, wgsl: fsWgsl },
+  ]);
+  const dataStart = 16 + 2 * 20;
+
+  // 1. HTTP 500 on data range slice increments rangedShaderErrors without crashing.
+  const failNet = createControllableRangeFetch(packBuffer, {
+    failDataRangeStatus: 500,
+    dataStartOffset: dataStart,
+  });
+  const failCache = new WgslPackCache();
+  const mockFail = createFullMockWebGpu({ timestampQuery: false });
+  const procFail = new WgpuCommandProcessor(mockFail.device, mockFail.ctx, {
+    format: 'bgra8unorm',
+    wgslPackCache: failCache,
+  });
+
+  await procFail.loadShaderPackUrl('/shaders/ranged-err.wgsl.pack', {
+    fetch: failNet.fetchImpl,
+    streamThresholdBytes: 1,
+    initialRangeBytes: dataStart,
+  });
+
+  procFail.executeCommandBuffer(
+    new BinaryCommandBuilder()
+      .createShaderModule(40, SHADER_STAGE.VERTEX, vsHash)
+      .finish()
+  );
+  await procFail.flushPendingRangedShaders();
+
+  assert.equal(procFail.getStats().rangedShaderFetches, 1);
+  assert.equal(procFail.getStats().rangedShaderReady, 0);
+  assert.equal(procFail.getStats().rangedShaderErrors, 1);
+  assert.equal(procFail.shaderModules.get(40).source, 'builtin', 'Fallback shader stays intact on fetch error');
+
+  const failSnap = buildGpuTelemetrySnapshot(procFail, { timestamp: 60002 });
+  assert.equal(failSnap.shaderPackStats.rangedShaderFetches, 1);
+  assert.equal(failSnap.shaderPackStats.rangedShaderReady, 0);
+  assert.equal(failSnap.shaderPackStats.rangedShaderErrors, 1);
+
+  // Worker remains healthy and continues rendering frames after a ranged fetch error.
+  const frameRes = procFail.executeCommandBuffer(
+    new BinaryCommandBuilder().beginFrame().clearColor(0.1, 0.2, 0.3, 1.0).present().finish()
+  );
+  assert.deepEqual(frameRes, { frameCount: 1, presents: 1 });
+
+  // 2. Compile error during async GPUShaderModule creation increments rangedShaderErrors cleanly.
+  const compileNet = createControllableRangeFetch(packBuffer, { dataStartOffset: dataStart });
+  const compileCache = new WgslPackCache();
+  const mockCompile = createFullMockWebGpu({ timestampQuery: false });
+  const origCreateShaderModule = mockCompile.device.createShaderModule.bind(mockCompile.device);
+  mockCompile.device.createShaderModule = (desc) => {
+    if (desc && desc.code === fsWgsl) {
+      throw new Error('Synthetic WGSL compile failure');
+    }
+    return origCreateShaderModule(desc);
+  };
+  const procCompile = new WgpuCommandProcessor(mockCompile.device, mockCompile.ctx, {
+    format: 'bgra8unorm',
+    wgslPackCache: compileCache,
+  });
+  await procCompile.loadShaderPackUrl('/shaders/ranged-compile-err.wgsl.pack', {
+    fetch: compileNet.fetchImpl,
+    streamThresholdBytes: 1,
+    initialRangeBytes: dataStart,
+  });
+
+  procCompile.executeCommandBuffer(
+    new BinaryCommandBuilder()
+      .createShaderModule(41, SHADER_STAGE.FRAGMENT, fsHash)
+      .finish()
+  );
+  await procCompile.flushPendingRangedShaders();
+
+  assert.equal(procCompile.getStats().rangedShaderFetches, 1);
+  assert.equal(procCompile.getStats().rangedShaderReady, 0);
+  assert.equal(procCompile.getStats().rangedShaderErrors, 1);
+  assert.equal(procCompile.shaderModules.get(41).source, 'builtin');
+
+  procFail.destroy();
+  procCompile.destroy();
+});
+
+test('W136 ranged pack resolves on demand cleanly when enableShaderFallback is false', async () => {
+  const vsWgsl = '@vertex fn vs_no_fallback() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }\n';
+  const vsHash = wgpkFormatHashHex(wgpkFnv1a64(vsWgsl));
+  const packBuffer = buildWgslPackBuffer([
+    { hash: vsHash, stage: WGPK_SHADER_STAGE.VERTEX, wgsl: vsWgsl },
+  ]);
+  const dataStart = 16 + 20;
+
+  const net = createControllableRangeFetch(packBuffer, {
+    deferDataRanges: true,
+    dataStartOffset: dataStart,
+  });
+  const packCache = new WgslPackCache();
+  const mock = createFullMockWebGpu({ timestampQuery: false });
+  const processor = new WgpuCommandProcessor(mock.device, mock.ctx, {
+    format: 'bgra8unorm',
+    enableShaderFallback: false,
+    wgslPackCache: packCache,
+  });
+
+  await processor.loadShaderPackUrl('/shaders/ranged-nofb.wgsl.pack', {
+    fetch: net.fetchImpl,
+    streamThresholdBytes: 1,
+    initialRangeBytes: dataStart,
+  });
+
+  processor.executeCommandBuffer(
+    new BinaryCommandBuilder()
+      .createShaderModule(50, SHADER_STAGE.VERTEX, vsHash)
+      .finish()
+  );
+
+  // Must NOT compile the raw hash string as WGSL before range fetch completes.
+  const shaderCallsBefore = mock.calls.filter((c) => c.op === 'createShaderModule');
+  assert.equal(shaderCallsBefore.length, 0);
+  assert.equal(processor.ensureShaderModule(50), null);
+  assert.equal(processor.getStats().rangedShaderFetches, 1);
+
+  net.resolveNextDeferred();
+  await processor.flushPendingRangedShaders();
+
+  const resolved = processor.shaderModules.get(50);
+  assert.ok(resolved && resolved.module);
+  assert.equal(resolved.source, 'pack');
+  assert.equal(resolved.code, vsWgsl);
+  assert.equal(resolved.module.code, vsWgsl);
+  assert.equal(processor.getStats().rangedShaderFetches, 1);
+  assert.equal(processor.getStats().rangedShaderReady, 1);
+  assert.equal(processor.getStats().rangedShaderErrors, 0);
+
+  processor.destroy();
+});
