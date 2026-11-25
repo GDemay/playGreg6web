@@ -322,7 +322,65 @@ void Device::flush_pipeline_dump() {
     }
 }
 
+void Device::register_lag_fence(Fence* fence) {
+    std::lock_guard<std::mutex> lock(lag_mutex_);
+    lag_fences_.insert(fence);
+    if (!lag_publisher_.joinable() && !lag_stop_) {
+        // Publishes capped values while no present comes (titles poll the completed-value word).
+        lag_publisher_ = std::thread([this] {
+            std::unique_lock<std::mutex> l(lag_mutex_);
+            while (!lag_stop_) {
+                lag_cv_.wait_for(l, std::chrono::milliseconds(8));
+                if (lag_stop_) {
+                    break;
+                }
+                l.unlock();
+                publish_fences();
+                l.lock();
+            }
+        });
+    }
+}
+
+void Device::unregister_lag_fence(Fence* fence) {
+    std::lock_guard<std::mutex> lock(lag_mutex_);
+    lag_fences_.erase(fence);
+}
+
+void Device::on_frame_presented() {
+    present_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    publish_fences();
+}
+
+void Device::publish_fences() {
+    uint64_t by_present = 0, by_cap = 0, lag = 0;
+    const auto now = std::chrono::steady_clock::now();
+    const uint64_t epoch = present_epoch();
+    const std::chrono::milliseconds cap(options_.fence_publish_cap_ms);
+    {
+        std::lock_guard<std::mutex> lock(lag_mutex_);
+        for (Fence* f : lag_fences_) {
+            f->publish_due(epoch, now, cap, &by_present, &by_cap, &lag);
+        }
+    }
+    if (by_present != 0) {
+        count(xbox::Counter::FencePublishesByPresent, by_present);
+        count(xbox::Counter::FencePublishLagFrames, lag);
+    }
+    if (by_cap != 0) {
+        count(xbox::Counter::FencePublishesByCap, by_cap);
+    }
+}
+
 Device::~Device() {
+    {
+        std::lock_guard<std::mutex> lock(lag_mutex_);
+        lag_stop_ = true;
+    }
+    lag_cv_.notify_all();
+    if (lag_publisher_.joinable()) {
+        lag_publisher_.join();
+    }
     {
         std::vector<uint32_t> storage_ids;
         {
@@ -1680,11 +1738,12 @@ HResult CommandAllocator::Reset() {
 }
 
 Fence::Fence(com::Ref<Device> device, uint64_t initial_value, uint32_t flags)
-    : ChildBase(std::move(device)), value_(initial_value), flags_(flags) {
+    : ChildBase(std::move(device)), value_(initial_value), published_(initial_value), flags_(flags) {
     device_->fences.fetch_add(1);
 }
 
 Fence::~Fence() {
+    device_->unregister_lag_fence(this);
     {
         std::lock_guard<std::mutex> lock(mutex_);
         destroyed_ = true;
@@ -1715,7 +1774,7 @@ void Fence::publish_value_locked() {
     if (value_word_ == 0) {
         return;
     }
-    const uint64_t current = value_.load(std::memory_order_acquire);
+    const uint64_t current = published_.load(std::memory_order_acquire);
     if (auto* word = static_cast<uint64_t*>(com::guest_to_host(value_word_, sizeof(uint64_t)))) {
         std::atomic_ref<uint64_t>(*word).store(current, std::memory_order_release);
         os::guest_window::mark_written(value_word_, sizeof(uint64_t));  // O37
@@ -1725,13 +1784,17 @@ void Fence::publish_value_locked() {
 }
 
 HResult Fence::SetEventOnCompletion(uint64_t value, uint64_t event_handle) {
+    // Waits complete on the executed value (our GPU work for it is done) and publish it: only
+    // polling sees the publication lag (DeviceOptions::fence_publish_lag).
     if (event_handle == 0) {
         // D3D12: a null event blocks synchronously until the fence reaches `value`.
-        if (value_.load(std::memory_order_acquire) >= value) {
-            return kSOk;
+        if (value_.load(std::memory_order_acquire) < value) {
+            std::unique_lock<std::mutex> lock(mutex_);
+            cv_.wait(lock, [&] { return value_.load(std::memory_order_acquire) >= value || destroyed_; });
         }
-        std::unique_lock<std::mutex> lock(mutex_);
-        cv_.wait(lock, [&] { return value_.load(std::memory_order_acquire) >= value || destroyed_; });
+        if (publish_for_wait(value)) {
+            device_->count(xbox::Counter::FencePublishesByWait);
+        }
         return kSOk;
     }
     {
@@ -1740,6 +1803,9 @@ HResult Fence::SetEventOnCompletion(uint64_t value, uint64_t event_handle) {
             waits_.emplace(value, event_handle);
             return kSOk;
         }
+    }
+    if (publish_for_wait(value)) {
+        device_->count(xbox::Counter::FencePublishesByWait);
     }
     pg6_win32_set_event(event_handle);
     return kSOk;
@@ -1750,6 +1816,11 @@ HResult Fence::Signal(uint64_t value) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         value_.store(value, std::memory_order_release);
+        // A CPU signal is visible at once; pending queue signals above it stay pending.
+        published_.store(value, std::memory_order_release);
+        while (!pending_.empty() && pending_.front().value <= value) {
+            pending_.pop_front();
+        }
         publish_value_locked();
         fire_events_locked(&to_set);
     }
@@ -1760,19 +1831,75 @@ HResult Fence::Signal(uint64_t value) {
     return kSOk;
 }
 
-void Fence::signal_from_queue(uint64_t value) {
+void Fence::signal_from_queue(uint64_t value, uint64_t present_epoch) {
     std::vector<uint64_t> to_set;
+    bool register_now = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (value > value_.load(std::memory_order_acquire)) {
             value_.store(value, std::memory_order_release);
-            publish_value_locked();
+            if (device_->fence_publish_lag()) {
+                pending_.push_back({value, present_epoch, std::chrono::steady_clock::now()});
+                register_now = !registered_;
+                registered_ = true;
+            } else {
+                publish_locked(value);
+            }
+        }
+        // Events wait on the executed value: they fire now and publish what they waited for.
+        const auto end = waits_.upper_bound(value_.load(std::memory_order_acquire));
+        if (waits_.begin() != end) {
+            publish_locked(std::prev(end)->first);
         }
         fire_events_locked(&to_set);
+    }
+    if (register_now) {
+        device_->register_lag_fence(this);
     }
     cv_.notify_all();
     for (uint64_t handle : to_set) {
         pg6_win32_set_event(handle);
+    }
+}
+
+void Fence::publish_locked(uint64_t value) {
+    if (value <= published_.load(std::memory_order_acquire)) {
+        return;
+    }
+    published_.store(value, std::memory_order_release);
+    while (!pending_.empty() && pending_.front().value <= value) {
+        pending_.pop_front();
+    }
+    publish_value_locked();
+}
+
+bool Fence::publish_for_wait(uint64_t value) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const uint64_t target = std::min(value, value_.load(std::memory_order_acquire));
+    const bool was_pending = target > published_.load(std::memory_order_acquire);
+    publish_locked(target);
+    return was_pending;
+}
+
+void Fence::publish_due(uint64_t present_epoch, std::chrono::steady_clock::time_point now,
+                        std::chrono::milliseconds cap, uint64_t* by_present, uint64_t* by_cap, uint64_t* lag_frames) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    uint64_t target = 0;
+    while (!pending_.empty()) {
+        const PendingSignal& p = pending_.front();
+        if (present_epoch >= p.epoch + 2) {
+            ++*by_present;
+            *lag_frames += present_epoch - p.epoch - 1;
+        } else if (now - p.at >= cap) {
+            ++*by_cap;
+        } else {
+            break;
+        }
+        target = p.value;
+        pending_.pop_front();
+    }
+    if (target != 0) {
+        publish_locked(target);
     }
 }
 
@@ -1824,7 +1951,7 @@ HResult CommandQueue::Signal(InterfaceArg<IFenceHost> fence, uint64_t value) {
     // Work is handed to the GPU process at ExecuteCommandLists time and executes in submission
     // order; the runtime has no GPU completion feedback, so a queue signal completes when it is
     // issued (everything submitted before it has been handed off).
-    static_cast<Fence*>(fence.get())->signal_from_queue(value);
+    static_cast<Fence*>(fence.get())->signal_from_queue(value, device_->present_epoch());
     return kSOk;
 }
 
@@ -1835,7 +1962,11 @@ HResult CommandQueue::Wait(InterfaceArg<IFenceHost> fence, uint64_t value) {
     }
     // Submissions are executed in order on one GPU timeline; a GPU wait for a value the CPU has not
     // signalled yet cannot be expressed in the packet stream and is only recorded.
-    if (fence->GetCompletedValue() < value) {
+    // A queue wait for an executed value is satisfied (and publishes it, as a blocking wait).
+    if (auto* f = static_cast<Fence*>(fence.get()); f->executed_value() >= value && f->publish_for_wait(value)) {
+        device_->count(xbox::Counter::FencePublishesByWait);
+    }
+    if (static_cast<Fence*>(fence.get())->executed_value() < value) {
         device_->note_bad_argument("ID3D12CommandQueue::Wait: fence value " + std::to_string(value) +
                                    " not reached at submission (not enforced)");
     }

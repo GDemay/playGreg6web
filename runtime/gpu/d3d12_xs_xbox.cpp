@@ -1284,6 +1284,7 @@ HResult CommandQueue::PresentX(uint32_t plane_count, uint64_t planes, uint64_t p
     if (plane.Token != 0) {
         device_->note_present_token(plane.Token);
     }
+    device_->on_frame_presented();  // fence publication epoch (DeviceOptions::fence_publish_lag)
     device_->count(xbox::Counter::PresentPlanesDrawn, drawn);
     device_->count(xbox::Counter::PresentPlanesNotDrawn, plane_count - drawn);
     // O36: the flip waits for the title's sync interval on the 60 Hz display (gpu/present_pacing.h):

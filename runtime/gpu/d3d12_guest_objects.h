@@ -56,10 +56,12 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
@@ -68,6 +70,7 @@
 #include <span>
 #include <tuple>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -590,6 +593,16 @@ struct DeviceOptions {
     std::shared_ptr<const StageReflectionIndex> stage_reflection;
     // Optional detiling hook for tiled console layouts (layout >= 0x101).
     DetileFn detile_texture;
+    // Fence completion latency (G66, #691): a queue Signal's value is published (the fence's
+    // completed-value word and GetCompletedValue) only once the next frame has been presented, as
+    // a GPU running about a frame behind the CPU would, or after `fence_publish_cap_ms` without
+    // that. Titles that write upload-ring data a frame ahead retire ring regions on the published
+    // value; this runtime reads that memory at ExecuteCommandLists, so a value published at issue
+    // lets them overwrite data a later submission still has to read. Blocking waits (fence events,
+    // a null-event SetEventOnCompletion, queue Wait) for an executed value complete at once and
+    // publish it. Off: values are published at issue. Boot harness: --no-fence-lag turns it off.
+    bool fence_publish_lag = true;
+    uint32_t fence_publish_cap_ms = 100;
 };
 
 struct DeviceStats {
@@ -723,6 +736,16 @@ public:
     // events shut down (false). `timeout_ms` = kInfiniteFrameWait waits without a bound.
     bool wait_present_token(uint64_t token, uint32_t timeout_ms);
     static constexpr uint32_t kInfiniteFrameWait = 0xFFFFFFFFu;
+    // Fence completion latency (DeviceOptions::fence_publish_lag): fences with pending queue
+    // signals, the present epoch (PresentX count) and the publisher.
+    bool fence_publish_lag() const { return options_.fence_publish_lag; }
+    uint64_t present_epoch() const { return present_epoch_.load(std::memory_order_acquire); }
+    void register_lag_fence(Fence* fence);
+    void unregister_lag_fence(Fence* fence);
+    // Called at every PresentX (after the present): advances the epoch and publishes due values.
+    void on_frame_presented();
+    // Publishes the values the epoch rule or the cap admits on every registered fence.
+    void publish_fences();
     void count(xbox::Counter c, uint64_t n = 1) { xbox_counters_[static_cast<size_t>(c)].fetch_add(n); }
     uint64_t counter(xbox::Counter c) const { return xbox_counters_[static_cast<size_t>(c)].load(); }
     // Last frame token passed to ExecuteCommandLists / a present plane (0 = none).
@@ -1121,6 +1144,12 @@ private:
     std::mutex present_mutex_;
     std::condition_variable present_cv_;
     bool present_shutdown_ = false;
+    std::atomic<uint64_t> present_epoch_{0};
+    std::mutex lag_mutex_;
+    std::set<Fence*> lag_fences_;
+    std::condition_variable lag_cv_;
+    bool lag_stop_ = false;
+    std::thread lag_publisher_;  // publishes capped values while no present comes
     xbox::FramePacer pacer_;
     std::atomic<uint64_t> xbox_counters_[static_cast<size_t>(xbox::Counter::Count)] = {};
     std::atomic<uint64_t> last_frame_token_{0};
@@ -1177,20 +1206,39 @@ public:
     static constexpr const char* kComClassName = "ID3D12Fence";
     Fence(com::Ref<Device> device, uint64_t initial_value, uint32_t flags);
     ~Fence() override;
-    uint64_t GetCompletedValue() override { return value_.load(std::memory_order_acquire); }
+    uint64_t GetCompletedValue() override { return published_.load(std::memory_order_acquire); }
     HResult SetEventOnCompletion(uint64_t value, uint64_t event_handle) override;
     HResult Signal(uint64_t value) override;
     uint32_t GetCreationFlags() override { return flags_; }
     uint64_t CompletedValueAddress() override;
-    // GPU-side signal (queue Signal): monotonically advances completed value when the work
-    // submitted before it completed, which in this runtime is at submission time (see Queue::Signal).
-    void signal_from_queue(uint64_t value);
+    // GPU-side signal (queue Signal): the work submitted before it has been handed off (and its
+    // CPU-visible memory read) at once, so the value is executed now; it is published now or, with
+    // DeviceOptions::fence_publish_lag, at Device::publish_fences (next frame presented / cap).
+    void signal_from_queue(uint64_t value, uint64_t present_epoch);
+    // The executed value (what has really been handed off), and the published one.
+    uint64_t executed_value() const { return value_.load(std::memory_order_acquire); }
+    // Publishes the pending queue signals the rule admits: signalled at an epoch at least two below
+    // `present_epoch` (the next frame has been presented), or older than `cap`. Returns the number
+    // of values published by the epoch rule and by the cap.
+    void publish_due(uint64_t present_epoch, std::chrono::steady_clock::time_point now,
+                     std::chrono::milliseconds cap, uint64_t* by_present, uint64_t* by_cap, uint64_t* lag_frames);
+    // Publishes `value` (if executed) because a blocking wait needs it; true when it was pending.
+    bool publish_for_wait(uint64_t value);
 
 private:
     void fire_events_locked(std::vector<uint64_t>* to_set);
     void publish_value_locked();
+    void publish_locked(uint64_t value);
 
-    std::atomic<uint64_t> value_;
+    struct PendingSignal {
+        uint64_t value;
+        uint64_t epoch;
+        std::chrono::steady_clock::time_point at;
+    };
+    std::atomic<uint64_t> value_;      // executed
+    std::atomic<uint64_t> published_;  // what the title sees (word, GetCompletedValue)
+    std::deque<PendingSignal> pending_;
+    bool registered_ = false;
     uint32_t flags_;
     uint64_t value_word_ = 0;  // guest word behind CompletedValueAddress (allocated on first use)
     bool destroyed_ = false;
