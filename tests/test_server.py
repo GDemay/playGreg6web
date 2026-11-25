@@ -738,5 +738,432 @@ class TestServeLocal(unittest.TestCase):
         self.assertTrue(handler.close_connection)
 
 
+class TestServeLocalDumpEndpoint(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.web_root = self.base / "web"
+        self.data_root = self.base / "data"
+        self.dump_root = self.base / "dumps"
+        self.outside_root = self.base / "outside"
+        self.web_root.mkdir()
+        self.data_root.mkdir()
+        self.dump_root.mkdir()
+        self.outside_root.mkdir()
+        (self.web_root / "index.html").write_text("<h1>ok</h1>", encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    @contextlib.contextmanager
+    def _running_server(
+        self,
+        *,
+        dump_root: Path | None = None,
+        max_dump_file_bytes: int = serve_local.DEFAULT_MAX_DUMP_FILE_BYTES,
+    ):
+        httpd = serve_local.create_server(
+            "127.0.0.1",
+            0,
+            self.web_root,
+            self.data_root,
+            dump_root=dump_root,
+            max_dump_file_bytes=max_dump_file_bytes,
+        )
+        port = httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield port
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=2)
+
+    def _request(
+        self,
+        port: int,
+        method: str,
+        path: str,
+        body: bytes | None = None,
+        headers: dict[str, str] | None = None,
+    ):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        try:
+            conn.request(method, path, body=body, headers=headers or {})
+            resp = conn.getresponse()
+            resp_body = resp.read()
+            return resp.status, dict(resp.getheaders()), resp_body
+        finally:
+            conn.close()
+
+    def _assert_isolation_headers(self, headers: dict[str, str]) -> None:
+        self.assertEqual(headers.get("Cross-Origin-Opener-Policy"), "same-origin")
+        self.assertEqual(headers.get("Cross-Origin-Embedder-Policy"), "require-corp")
+        self.assertEqual(headers.get("Cross-Origin-Resource-Policy"), "same-origin")
+        self.assertEqual(headers.get("Accept-Ranges"), "bytes")
+
+    def _assert_no_host_path_leak(self, raw_text: str) -> None:
+        for sensitive in (
+            str(self.base),
+            str(self.dump_root),
+            str(self.outside_root),
+            str(self.web_root),
+            str(self.data_root),
+            os.environ.get("USERNAME", ""),
+            os.environ.get("USER", ""),
+        ):
+            if sensitive and len(sensitive) > 2:
+                self.assertNotIn(sensitive, raw_text)
+
+    def test_disabled_by_default_rejects_dump_post(self) -> None:
+        with self._running_server(dump_root=None) as port:
+            status, headers, body = self._request(
+                port,
+                "POST",
+                "/__pg6_dump/dxil/shader_001.bin",
+                body=b"DXBC\x01\x02\x03\x04",
+            )
+            self.assertIn(status, (403, 404))
+            self.assertEqual(status, 403)
+            self._assert_isolation_headers(headers)
+            self.assertEqual(headers.get("Content-Type"), "application/json")
+            self.assertEqual(headers.get("Cache-Control"), "no-store")
+            text = body.decode("utf-8")
+            self._assert_no_host_path_leak(text)
+            payload = json.loads(text)
+            self.assertFalse(payload["ok"])
+            self.assertEqual(list(self.dump_root.iterdir()), [])
+
+            # Non-dump POST endpoints remain 405 Method Not Allowed.
+            st405, hdr405, body405 = self._request(
+                port, "POST", "/api/status", body=b'{"x":1}'
+            )
+            self.assertEqual(st405, 405)
+            self._assert_isolation_headers(hdr405)
+            self.assertEqual(body405, b"")
+
+    def test_valid_atomic_write_and_overwrite(self) -> None:
+        with self._running_server(dump_root=self.dump_root) as port:
+            data1 = b"DXBC\x00\x01\x02\x03menu_intro_pipeline"
+            status, headers, body = self._request(
+                port,
+                "POST",
+                "/__pg6_dump/menu/intro/pso_deadbeef.dxil",
+                body=data1,
+            )
+            self.assertEqual(status, 200)
+            self._assert_isolation_headers(headers)
+            self.assertEqual(headers.get("Content-Type"), "application/json")
+            self.assertEqual(headers.get("Cache-Control"), "no-store")
+            raw_text = body.decode("utf-8")
+            self._assert_no_host_path_leak(raw_text)
+            resp_json = json.loads(raw_text)
+            self.assertEqual(
+                resp_json,
+                {
+                    "ok": True,
+                    "path": "menu/intro/pso_deadbeef.dxil",
+                    "bytes_written": len(data1),
+                    "total_bytes": len(data1),
+                },
+            )
+            written_file = self.dump_root / "menu" / "intro" / "pso_deadbeef.dxil"
+            self.assertEqual(written_file.read_bytes(), data1)
+
+            # Overwrite without ?append=1 replaces contents atomically.
+            data2 = b"SHORTER"
+            st2, hdr2, body2 = self._request(
+                port,
+                "POST",
+                "/__pg6_dump/menu/intro/pso_deadbeef.dxil",
+                body=data2,
+            )
+            self.assertEqual(st2, 200)
+            self._assert_isolation_headers(hdr2)
+            self.assertEqual(
+                json.loads(body2.decode("utf-8")),
+                {
+                    "ok": True,
+                    "path": "menu/intro/pso_deadbeef.dxil",
+                    "bytes_written": len(data2),
+                    "total_bytes": len(data2),
+                },
+            )
+            self.assertEqual(written_file.read_bytes(), data2)
+
+            # Zero-byte write is valid and leaves no temporary files behind.
+            st3, hdr3, body3 = self._request(
+                port, "POST", "/__pg6_dump/empty.bin", body=b""
+            )
+            self.assertEqual(st3, 200)
+            self._assert_isolation_headers(hdr3)
+            self.assertEqual(
+                json.loads(body3.decode("utf-8")),
+                {
+                    "ok": True,
+                    "path": "empty.bin",
+                    "bytes_written": 0,
+                    "total_bytes": 0,
+                },
+            )
+            self.assertEqual((self.dump_root / "empty.bin").read_bytes(), b"")
+            leftover_tmp = list(self.dump_root.rglob(".pg6_dump_*.tmp"))
+            self.assertEqual(leftover_tmp, [])
+
+            # Non-dump POST still returns 405 even when dump endpoint is enabled.
+            st405, hdr405, body405 = self._request(
+                port, "POST", "/api/status", body=b"{}"
+            )
+            self.assertEqual(st405, 405)
+            self._assert_isolation_headers(hdr405)
+            self.assertEqual(body405, b"")
+
+            # OPTIONS on dump endpoint advertises POST while / stays GET, HEAD, OPTIONS.
+            st_opt, hdr_opt, _ = self._request(port, "OPTIONS", "/__pg6_dump/a.bin")
+            self.assertEqual(st_opt, 204)
+            self._assert_isolation_headers(hdr_opt)
+            self.assertIn("POST", hdr_opt.get("Allow", ""))
+
+    def test_append_chunked_streaming_write_and_keep_alive(self) -> None:
+        with self._running_server(dump_root=self.dump_root) as port:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            try:
+                chunks = [b"CHUNK0:", b"DXIL_BODY_", b"FINAL_TAIL!"]
+                expected_total = 0
+                first_sock = None
+                for idx, chunk in enumerate(chunks):
+                    path = "/__pg6_dump/stream/pipeline.dxil?append=1"
+                    conn.request("POST", path, body=chunk)
+                    resp = conn.getresponse()
+                    raw = resp.read()
+                    hdrs = dict(resp.getheaders())
+                    self.assertEqual(resp.status, 200)
+                    self._assert_isolation_headers(hdrs)
+                    self.assertFalse(resp.will_close)
+                    if idx == 0:
+                        first_sock = conn.sock
+                    else:
+                        self.assertIs(conn.sock, first_sock)
+                    expected_total += len(chunk)
+                    data = json.loads(raw.decode("utf-8"))
+                    self.assertEqual(
+                        data,
+                        {
+                            "ok": True,
+                            "path": "stream/pipeline.dxil",
+                            "bytes_written": len(chunk),
+                            "total_bytes": expected_total,
+                        },
+                    )
+                    self._assert_no_host_path_leak(raw.decode("utf-8"))
+
+                out_file = self.dump_root / "stream" / "pipeline.dxil"
+                self.assertEqual(out_file.read_bytes(), b"".join(chunks))
+
+                # ?append=0 overwrites instead of appending.
+                conn.request("POST", "/__pg6_dump/stream/pipeline.dxil?append=0", body=b"RESET")
+                resp_reset = conn.getresponse()
+                raw_reset = resp_reset.read()
+                self.assertEqual(resp_reset.status, 200)
+                self.assertEqual(
+                    json.loads(raw_reset.decode("utf-8")),
+                    {
+                        "ok": True,
+                        "path": "stream/pipeline.dxil",
+                        "bytes_written": 5,
+                        "total_bytes": 5,
+                    },
+                )
+                self.assertEqual(out_file.read_bytes(), b"RESET")
+            finally:
+                conn.close()
+
+    def test_traversal_and_invalid_relpath_rejected(self) -> None:
+        (self.dump_root / "existing_dir").mkdir()
+        (self.dump_root / "regular_file.bin").write_bytes(b"abc")
+
+        bad_paths = [
+            "/__pg6_dump/",
+            "/__pg6_dump/?append=1",
+            "/__pg6_dump/.",
+            "/__pg6_dump/..",
+            "/__pg6_dump/../escape.bin",
+            "/__pg6_dump/sub/../../escape.bin",
+            "/__pg6_dump/sub/./file.bin",
+            "/__pg6_dump/%2e%2e/escape.bin",
+            "/__pg6_dump/%2E%2E/escape.bin",
+            "/__pg6_dump/sub/%2e%2e/%2e%2e/escape.bin",
+            "/__pg6_dump/..%2fescape.bin",
+            "/__pg6_dump//etc/passwd",
+            "/__pg6_dump/%2fetc/passwd",
+            "/__pg6_dump/C:/Windows/win.ini",
+            "/__pg6_dump/C%3A/foo.bin",
+            "/__pg6_dump/c:foo.bin",
+            "/__pg6_dump/file.bin:ads",
+            "/__pg6_dump/..%5cescape.bin",
+            "/__pg6_dump/%5cetc%5cpasswd",
+            "/__pg6_dump/sub%5cfile.bin",
+            "/__pg6_dump/foo%00bar.bin",
+            "/__pg6_dump/foo%0abar.bin",
+            "/__pg6_dump/existing_dir/",
+            "/__pg6_dump/existing_dir",
+            "/__pg6_dump/regular_file.bin/child.bin",
+        ]
+
+        with self._running_server(dump_root=self.dump_root) as port:
+            for url_path in bad_paths:
+                with self.subTest(url_path=url_path):
+                    status, headers, body = self._request(
+                        port, "POST", url_path, body=b"bad"
+                    )
+                    self.assertIn(status, (400, 403))
+                    self._assert_isolation_headers(headers)
+                    self.assertEqual(headers.get("Content-Type"), "application/json")
+                    text = body.decode("utf-8")
+                    self._assert_no_host_path_leak(text)
+                    self.assertFalse(json.loads(text)["ok"])
+
+        self.assertFalse((self.base / "escape.bin").exists())
+        self.assertEqual(list(self.outside_root.iterdir()), [])
+
+    def test_symlink_escape_rejected(self) -> None:
+        dir_link = self.dump_root / "escape_dir"
+        file_link = self.dump_root / "escape_file.bin"
+        dangling_link = self.dump_root / "dangling_escape.bin"
+        outside_file = self.outside_root / "target.bin"
+        outside_file.write_bytes(b"ORIGINAL")
+
+        try:
+            os.symlink(self.outside_root, dir_link, target_is_directory=True)
+            os.symlink(outside_file, file_link, target_is_directory=False)
+            os.symlink(
+                self.outside_root / "nonexistent.bin",
+                dangling_link,
+                target_is_directory=False,
+            )
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"symlinks unavailable in this environment: {exc}")
+
+        with self._running_server(dump_root=self.dump_root) as port:
+            for url_path in (
+                "/__pg6_dump/escape_dir/pwn.bin",
+                "/__pg6_dump/escape_dir/nested/pwn.bin",
+                "/__pg6_dump/escape_file.bin",
+                "/__pg6_dump/escape_file.bin?append=1",
+                "/__pg6_dump/dangling_escape.bin",
+            ):
+                with self.subTest(url_path=url_path):
+                    status, headers, body = self._request(
+                        port, "POST", url_path, body=b"OVERWRITTEN"
+                    )
+                    self.assertEqual(status, 403)
+                    self._assert_isolation_headers(headers)
+                    text = body.decode("utf-8")
+                    self._assert_no_host_path_leak(text)
+                    self.assertFalse(json.loads(text)["ok"])
+
+        self.assertEqual(outside_file.read_bytes(), b"ORIGINAL")
+        self.assertFalse((self.outside_root / "pwn.bin").exists())
+        self.assertFalse((self.outside_root / "nonexistent.bin").exists())
+
+    def test_oversized_payload_returns_413_for_single_and_append(self) -> None:
+        cap = 32
+        with self._running_server(
+            dump_root=self.dump_root, max_dump_file_bytes=cap
+        ) as port:
+            # Exact boundary succeeds.
+            st_ok, hdr_ok, body_ok = self._request(
+                port, "POST", "/__pg6_dump/exact.bin", body=b"A" * cap
+            )
+            self.assertEqual(st_ok, 200)
+            self._assert_isolation_headers(hdr_ok)
+            self.assertEqual(json.loads(body_ok.decode("utf-8"))["total_bytes"], cap)
+
+            # Single payload exceeding cap -> 413 Payload Too Large, file not created.
+            st_big, hdr_big, body_big = self._request(
+                port, "POST", "/__pg6_dump/too_big.bin", body=b"B" * (cap + 1)
+            )
+            self.assertEqual(st_big, 413)
+            self._assert_isolation_headers(hdr_big)
+            self.assertEqual(hdr_big.get("Connection", "").lower(), "close")
+            self._assert_no_host_path_leak(body_big.decode("utf-8"))
+            self.assertFalse(json.loads(body_big.decode("utf-8"))["ok"])
+            self.assertFalse((self.dump_root / "too_big.bin").exists())
+
+            # Append mode checks resulting total size <= cap.
+            st1, _, _ = self._request(
+                port, "POST", "/__pg6_dump/chunked.bin", body=b"1" * 20
+            )
+            self.assertEqual(st1, 200)
+            st2, _, body2 = self._request(
+                port, "POST", "/__pg6_dump/chunked.bin?append=1", body=b"2" * 12
+            )
+            self.assertEqual(st2, 200)
+            self.assertEqual(json.loads(body2.decode("utf-8"))["total_bytes"], 32)
+
+            st3, hdr3, body3 = self._request(
+                port, "POST", "/__pg6_dump/chunked.bin?append=1", body=b"X"
+            )
+            self.assertEqual(st3, 413)
+            self._assert_isolation_headers(hdr3)
+            self._assert_no_host_path_leak(body3.decode("utf-8"))
+            self.assertFalse(json.loads(body3.decode("utf-8"))["ok"])
+            # Existing file contents remain intact after rejected append.
+            self.assertEqual(
+                (self.dump_root / "chunked.bin").read_bytes(),
+                (b"1" * 20) + (b"2" * 12),
+            )
+
+    def test_missing_content_length_returns_411(self) -> None:
+        with self._running_server(dump_root=self.dump_root) as port:
+            with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+                sock.sendall(
+                    b"POST /__pg6_dump/nolen.bin HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+                )
+                chunks: list[bytes] = []
+                while True:
+                    data = sock.recv(4096)
+                    if not data:
+                        break
+                    chunks.append(data)
+            raw = b"".join(chunks)
+            header_block, _, body = raw.partition(b"\r\n\r\n")
+            header_text = header_block.decode("iso-8859-1")
+            self.assertTrue(header_text.startswith("HTTP/1.1 411 "))
+            self.assertIn("Cross-Origin-Opener-Policy: same-origin", header_text)
+            self.assertIn("Cross-Origin-Embedder-Policy: require-corp", header_text)
+            self.assertFalse(json.loads(body.decode("utf-8"))["ok"])
+            self.assertFalse((self.dump_root / "nolen.bin").exists())
+
+    def test_resolve_dump_target_unit_and_negative_cap(self) -> None:
+        res, status, err = serve_local.resolve_dump_target(
+            self.dump_root, "dxil/frame_01/pso.bin"
+        )
+        self.assertIsNotNone(res)
+        self.assertIsNone(status)
+        self.assertIsNone(err)
+        target, rel = res
+        self.assertEqual(rel, "dxil/frame_01/pso.bin")
+        self.assertEqual(target, self.dump_root.resolve() / "dxil" / "frame_01" / "pso.bin")
+
+        for bad in ("", "/abs.bin", "../up.bin", "a\\b.bin", "C:/x.bin", "a\x00b.bin", "a//b.bin"):
+            with self.subTest(bad=bad):
+                res_bad, st_bad, err_bad = serve_local.resolve_dump_target(self.dump_root, bad)
+                self.assertIsNone(res_bad)
+                self.assertIn(st_bad, (400, 403))
+                self.assertTrue(err_bad)
+
+        with self.assertRaises(ValueError):
+            serve_local.create_server(
+                "127.0.0.1",
+                0,
+                self.web_root,
+                self.data_root,
+                dump_root=self.dump_root,
+                max_dump_file_bytes=-1,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

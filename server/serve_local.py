@@ -7,6 +7,9 @@
   (boot allowlisted to `.pgim`/`.json`/`.wasm`/`.js` only).
 - Serves sanitized JSON readiness diagnostics at `/api/status` (including staged
   `/dist/*.wasm` side-module discovery).
+- Optionally enables `POST /__pg6_dump/<relpath>` (with `?append=1`) when started with
+  `--allow-dump-dir <dir>` to capture live Chrome Wasm64 pipeline dumps strictly inside
+  the configured directory with traversal protection and per-file size caps.
 - Sends Cross-Origin Isolation headers (COOP/COEP/CORP) required for SharedArrayBuffer.
 - Uses HTTP/1.1 persistent keep-alive connections with large streaming buffers (1 MiB).
 - Supports HTTP `Range` (`bytes=start-end`, `bytes=start-`, `bytes=-suffix`), `HEAD`,
@@ -20,10 +23,13 @@ import argparse
 import importlib.util
 import json
 import mimetypes
+import ntpath
 import os
 import posixpath
 import re
 import sys
+import tempfile
+import threading
 from datetime import timezone
 from email.utils import formatdate, parsedate_to_datetime
 from functools import partial
@@ -31,7 +37,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$", re.IGNORECASE)
 
@@ -40,9 +46,14 @@ RUNTIME_WASM_NAME = "runtime.wasm"
 PREFERRED_SHADER_PACK_NAMES = ("splash.wgsl.pack", "fallback.wgsl.pack")
 SAFE_SIDE_MODULE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.wasm$", re.IGNORECASE)
 
+DUMP_URL_PREFIX = "/__pg6_dump/"
+DEFAULT_MAX_DUMP_FILE_BYTES = 64 * 1024 * 1024  # 64 MiB default cap per dumped file
+_DUMP_WRITE_LOCK = threading.Lock()
+
 STREAM_CHUNK_SIZE = 1024 * 1024  # 1 MiB streaming buffer for large .pgim/.wasm/Range reads
 KEEP_ALIVE_TIMEOUT = 30.0  # Idle socket timeout (seconds) for HTTP/1.1 keep-alive connections
 ALLOWED_METHODS = "GET, HEAD, OPTIONS"
+DUMP_ALLOWED_METHODS = "POST, OPTIONS"
 
 CLIENT_DISCONNECT_ERRORS = (
     BrokenPipeError,
@@ -75,6 +86,73 @@ def safe_resolve(root: Path, rel_url_path: str) -> Path | None:
     except (OSError, ValueError):
         return None
     return candidate
+
+
+def resolve_dump_target(
+    dump_root: Path, rel_url_path: str
+) -> tuple[tuple[Path, str] | None, HTTPStatus | None, str | None]:
+    """Validate `<relpath>` for `POST /__pg6_dump/<relpath>` strictly inside `dump_root`.
+
+    Rejects empty paths, absolute paths, drive letters/colons, backslashes, `.`/`..`
+    traversal segments, NUL/control characters, directory targets, and symlinks
+    escaping the resolved `dump_root`.
+
+    Returns:
+        `((target_path, sanitized_relpath), None, None)` on success, or
+        `(None, HTTPStatus, static_error_message)` on rejection (zero host paths).
+    """
+    if not rel_url_path:
+        return None, HTTPStatus.BAD_REQUEST, "empty dump path"
+
+    decoded = unquote(rel_url_path)
+    if not decoded:
+        return None, HTTPStatus.BAD_REQUEST, "empty dump path"
+    if "\x00" in rel_url_path or any(ord(ch) < 32 or ord(ch) == 127 for ch in decoded):
+        return None, HTTPStatus.BAD_REQUEST, "invalid control character in dump path"
+    if "\\" in decoded:
+        return None, HTTPStatus.BAD_REQUEST, "backslashes are not permitted in dump path"
+    if decoded.startswith("/") or posixpath.isabs(decoded) or ntpath.isabs(decoded):
+        return None, HTTPStatus.BAD_REQUEST, "absolute paths are not permitted"
+    if ntpath.splitdrive(decoded)[0] or ":" in decoded:
+        return None, HTTPStatus.BAD_REQUEST, "drive letters and colons are not permitted"
+
+    segments = decoded.split("/")
+    if not segments or any(seg in ("", ".", "..") for seg in segments):
+        return None, HTTPStatus.BAD_REQUEST, "invalid dump path segment"
+
+    try:
+        root_resolved = dump_root.resolve()
+    except (OSError, RuntimeError):
+        return None, HTTPStatus.FORBIDDEN, "invalid dump directory"
+    if root_resolved.exists() and not root_resolved.is_dir():
+        return None, HTTPStatus.FORBIDDEN, "invalid dump directory"
+
+    current = root_resolved
+    for idx, seg in enumerate(segments):
+        current = current / seg
+        try:
+            if current.is_symlink():
+                resolved_link = current.resolve()
+                if not resolved_link.is_relative_to(root_resolved):
+                    return None, HTTPStatus.FORBIDDEN, "symlink escapes dump directory"
+                if idx == len(segments) - 1 and resolved_link == root_resolved:
+                    return None, HTTPStatus.FORBIDDEN, "symlink escapes dump directory"
+            if idx < len(segments) - 1 and current.exists() and not current.is_dir():
+                return None, HTTPStatus.BAD_REQUEST, "parent path is not a directory"
+        except (OSError, ValueError, RuntimeError):
+            return None, HTTPStatus.FORBIDDEN, "invalid dump target"
+
+    try:
+        candidate_resolved = current.resolve()
+        if not candidate_resolved.is_relative_to(root_resolved) or candidate_resolved == root_resolved:
+            return None, HTTPStatus.FORBIDDEN, "path escapes dump directory"
+        if current.exists() and current.is_dir():
+            return None, HTTPStatus.BAD_REQUEST, "target path is a directory"
+    except (OSError, ValueError, RuntimeError):
+        return None, HTTPStatus.FORBIDDEN, "invalid dump target"
+
+    sanitized_relpath = "/".join(segments)
+    return (current, sanitized_relpath), None, None
 
 
 def parse_byte_range(header: str, file_size: int) -> tuple[int, int] | None:
@@ -508,6 +586,8 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
         game_root: Path | None = None,
         shaders_root: Path | None = None,
         boot_root: Path | None = None,
+        dump_root: Path | None = None,
+        max_dump_file_bytes: int = DEFAULT_MAX_DUMP_FILE_BYTES,
         keep_alive_timeout: float | None = None,
         **kwargs,
     ):
@@ -516,10 +596,13 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
         self.game_root = game_root
         self.shaders_root = shaders_root if shaders_root is not None else (data_root / "shaders")
         self.boot_root = boot_root
+        self.dump_root = dump_root
+        self.max_dump_file_bytes = max_dump_file_bytes
         if keep_alive_timeout is not None:
             self.timeout = keep_alive_timeout
         self._headers_sent = False
         self._connection_header_sent = False
+        self._client_requested_close = False
         super().__init__(*args, **kwargs)
 
     def _request_has_unconsumed_body(self) -> bool:
@@ -553,7 +636,8 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
             for tok in value.split(",")
             if tok.strip()
         }
-        if "close" in tokens or self._request_has_unconsumed_body():
+        self._client_requested_close = "close" in tokens
+        if self._client_requested_close or self._request_has_unconsumed_body():
             self.close_connection = True
         elif "keep-alive" in tokens and self.protocol_version >= "HTTP/1.1":
             self.close_connection = False
@@ -596,6 +680,30 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
+
+    def _send_json(
+        self,
+        status: HTTPStatus,
+        payload: dict[str, Any],
+        *,
+        close: bool = False,
+    ) -> None:
+        if close:
+            self.close_connection = True
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except CLIENT_DISCONNECT_ERRORS:
+            self.close_connection = True
+            return
+        except Exception:
+            self.close_connection = True
+            raise
 
     def _send_method_not_allowed(self) -> None:
         # Close the connection because unsupported methods (e.g. POST/PUT) may
@@ -823,15 +931,224 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
             return
         self._serve_file(url_path, send_body=send_body)
 
+    def _parse_content_length(self) -> tuple[int | None, HTTPStatus | None, str | None]:
+        if self.headers.get("Transfer-Encoding"):
+            return None, HTTPStatus.LENGTH_REQUIRED, "Content-Length required"
+        if hasattr(self.headers, "get_all"):
+            raw_values = self.headers.get_all("Content-Length") or []
+        else:
+            single = self.headers.get("Content-Length")
+            raw_values = [single] if single else []
+        if not raw_values:
+            return None, HTTPStatus.LENGTH_REQUIRED, "Content-Length header required"
+
+        parsed_values: set[int] = set()
+        for raw in raw_values:
+            cleaned = raw.strip()
+            if not cleaned or not cleaned.isdigit():
+                return None, HTTPStatus.BAD_REQUEST, "invalid Content-Length header"
+            parsed_values.add(int(cleaned))
+        if len(parsed_values) != 1:
+            return None, HTTPStatus.BAD_REQUEST, "conflicting Content-Length headers"
+        return next(iter(parsed_values)), None, None
+
+    def _handle_dump_post(self, parsed_url: Any) -> None:
+        if self.dump_root is None:
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {"ok": False, "error": "dump endpoint disabled"},
+                close=True,
+            )
+            return
+
+        rel_url_path = parsed_url.path[len(DUMP_URL_PREFIX) :]
+        resolved, err_status, err_msg = resolve_dump_target(self.dump_root, rel_url_path)
+        if resolved is None:
+            self._send_json(
+                err_status or HTTPStatus.BAD_REQUEST,
+                {"ok": False, "error": err_msg or "invalid dump path"},
+                close=True,
+            )
+            return
+        target, sanitized_relpath = resolved
+
+        content_length, len_status, len_msg = self._parse_content_length()
+        if content_length is None:
+            self._send_json(
+                len_status or HTTPStatus.BAD_REQUEST,
+                {"ok": False, "error": len_msg or "invalid Content-Length"},
+                close=True,
+            )
+            return
+
+        max_bytes = self.max_dump_file_bytes
+        if content_length > max_bytes:
+            self._send_json(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                {"ok": False, "error": "payload exceeds max dump file size"},
+                close=True,
+            )
+            return
+
+        query = parse_qs(parsed_url.query, keep_blank_values=True)
+        append_vals = query.get("append", [])
+        append_mode = any(v.strip().lower() in ("1", "true", "yes") for v in append_vals)
+
+        if append_mode:
+            try:
+                existing_size = target.stat().st_size if target.exists() else 0
+            except OSError:
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {"ok": False, "error": "dump write failed"},
+                    close=True,
+                )
+                return
+            if existing_size + content_length > max_bytes:
+                self._send_json(
+                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                    {"ok": False, "error": "payload exceeds max dump file size"},
+                    close=True,
+                )
+                return
+
+        try:
+            root_resolved = self.dump_root.resolve()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            parent_resolved = target.parent.resolve(strict=True)
+            if not parent_resolved.is_relative_to(root_resolved):
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"ok": False, "error": "path escapes dump directory"},
+                    close=True,
+                )
+                return
+        except OSError:
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"ok": False, "error": "dump write failed"},
+                close=True,
+            )
+            return
+
+        tmp_path: Path | None = None
+        bytes_written = 0
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=target.parent,
+                prefix=".pg6_dump_",
+                suffix=".tmp",
+                delete=False,
+            ) as tmp_file:
+                tmp_path = Path(tmp_file.name)
+                remaining = content_length
+                while remaining > 0:
+                    chunk = self.rfile.read(min(STREAM_CHUNK_SIZE, remaining))
+                    if not chunk:
+                        self._send_json(
+                            HTTPStatus.BAD_REQUEST,
+                            {"ok": False, "error": "incomplete request body"},
+                            close=True,
+                        )
+                        return
+                    bytes_written += len(chunk)
+                    if bytes_written > max_bytes:
+                        self._send_json(
+                            HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                            {"ok": False, "error": "payload exceeds max dump file size"},
+                            close=True,
+                        )
+                        return
+                    tmp_file.write(chunk)
+                    remaining -= len(chunk)
+
+            # Request body is completely consumed; keep-alive is safe if the client wants it.
+            if self.protocol_version >= "HTTP/1.1" and not getattr(
+                self, "_client_requested_close", False
+            ):
+                self.close_connection = False
+
+            with _DUMP_WRITE_LOCK:
+                # Re-validate target containment under lock before committing bytes.
+                recheck, re_status, re_msg = resolve_dump_target(self.dump_root, rel_url_path)
+                if recheck is None:
+                    self._send_json(
+                        re_status or HTTPStatus.FORBIDDEN,
+                        {"ok": False, "error": re_msg or "invalid dump target"},
+                        close=True,
+                    )
+                    return
+
+                if append_mode:
+                    current_size = target.stat().st_size if target.exists() else 0
+                    if current_size + bytes_written > max_bytes:
+                        self._send_json(
+                            HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                            {"ok": False, "error": "payload exceeds max dump file size"},
+                            close=True,
+                        )
+                        return
+                    with target.open("ab") as dest, tmp_path.open("rb") as src:
+                        while True:
+                            buf = src.read(STREAM_CHUNK_SIZE)
+                            if not buf:
+                                break
+                            dest.write(buf)
+                    total_bytes = target.stat().st_size
+                else:
+                    os.replace(tmp_path, target)
+                    tmp_path = None
+                    total_bytes = bytes_written
+        except CLIENT_DISCONNECT_ERRORS:
+            self.close_connection = True
+            return
+        except OSError:
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"ok": False, "error": "dump write failed"},
+                close=True,
+            )
+            return
+        finally:
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "ok": True,
+                "path": sanitized_relpath,
+                "bytes_written": bytes_written,
+                "total_bytes": total_bytes,
+            },
+        )
+
     def do_GET(self) -> None:
         self._dispatch(send_body=True)
 
     def do_HEAD(self) -> None:
         self._dispatch(send_body=False)
 
+    def do_POST(self) -> None:
+        parsed_url = urlsplit(self.path)
+        if parsed_url.path.startswith(DUMP_URL_PREFIX):
+            self._handle_dump_post(parsed_url)
+            return
+        self._send_method_not_allowed()
+
     def do_OPTIONS(self) -> None:
+        url_path = urlsplit(self.path).path
+        allow = (
+            DUMP_ALLOWED_METHODS
+            if (self.dump_root is not None and url_path.startswith(DUMP_URL_PREFIX))
+            else ALLOWED_METHODS
+        )
         self.send_response(HTTPStatus.NO_CONTENT)
-        self.send_header("Allow", ALLOWED_METHODS)
+        self.send_header("Allow", allow)
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
 
@@ -857,8 +1174,12 @@ def create_server(
     game_root: Path | None = None,
     shaders_root: Path | None = None,
     boot_root: Path | None = None,
+    dump_root: Path | None = None,
+    max_dump_file_bytes: int = DEFAULT_MAX_DUMP_FILE_BYTES,
     keep_alive_timeout: float | None = None,
 ) -> QuietThreadingHTTPServer:
+    if max_dump_file_bytes < 0:
+        raise ValueError("max_dump_file_bytes must be >= 0")
     handler = partial(
         PlayGta6Handler,
         web_root=web_root,
@@ -866,6 +1187,8 @@ def create_server(
         game_root=game_root,
         shaders_root=shaders_root,
         boot_root=boot_root,
+        dump_root=dump_root,
+        max_dump_file_bytes=max_dump_file_bytes,
         keep_alive_timeout=keep_alive_timeout,
     )
     return QuietThreadingHTTPServer((host, port), handler)
@@ -932,12 +1255,30 @@ def main() -> None:
         default=default_work,
         help="Work directory used to derive the default --boot path.",
     )
+    parser.add_argument(
+        "--allow-dump-dir",
+        type=Path,
+        default=None,
+        help="Opt-in local directory enabling POST /__pg6_dump/<relpath> (disabled by default).",
+    )
+    parser.add_argument(
+        "--max-dump-file-bytes",
+        type=int,
+        default=DEFAULT_MAX_DUMP_FILE_BYTES,
+        help=f"Maximum allowed byte size per file written via POST /__pg6_dump/ (default: {DEFAULT_MAX_DUMP_FILE_BYTES}).",
+    )
     args = parser.parse_args()
+
+    if args.max_dump_file_bytes < 0:
+        parser.error("--max-dump-file-bytes must be >= 0")
 
     args.data.mkdir(parents=True, exist_ok=True)
     shaders_root = args.shaders if args.shaders is not None else (args.data / "shaders")
     boot_root = args.boot if args.boot is not None else (args.work / "recomp_build")
     game_root = args.game if args.game is not None else None
+    dump_root = args.allow_dump_dir.resolve() if args.allow_dump_dir is not None else None
+    if dump_root is not None:
+        dump_root.mkdir(parents=True, exist_ok=True)
 
     httpd = create_server(
         args.host,
@@ -947,10 +1288,17 @@ def main() -> None:
         game_root=game_root,
         shaders_root=shaders_root,
         boot_root=boot_root,
+        dump_root=dump_root,
+        max_dump_file_bytes=args.max_dump_file_bytes,
+    )
+    dump_summary = (
+        f", /__pg6_dump={dump_root} (max={args.max_dump_file_bytes}B)"
+        if dump_root is not None
+        else ""
     )
     print(
         f"Serving web={args.web}, /data={args.data}, /shaders={shaders_root}, "
-        f"/boot={boot_root}, /game={game_root} at http://{args.host}:{args.port}/"
+        f"/boot={boot_root}, /game={game_root}{dump_summary} at http://{args.host}:{args.port}/"
     )
     try:
         httpd.serve_forever()
