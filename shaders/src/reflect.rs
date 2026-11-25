@@ -393,9 +393,18 @@ pub struct BindGroupLayoutDesc {
 }
 
 impl BindGroupLayoutDesc {
-    /// Canonical compact JSON of the `entries` array.
+    /// Return a copy with entries in canonical ascending `(binding, visibility, layout)` order.
+    pub fn canonicalized(&self) -> Self {
+        let mut entries = self.entries.clone();
+        entries.sort();
+        Self { entries }
+    }
+
+    /// Canonical compact JSON of the `entries` array (invariant to input entry order).
     pub fn canonical_json(&self) -> String {
-        let items: Vec<String> = self.entries.iter().map(LayoutEntry::to_json).collect();
+        let mut sorted: Vec<&LayoutEntry> = self.entries.iter().collect();
+        sorted.sort();
+        let items: Vec<String> = sorted.into_iter().map(LayoutEntry::to_json).collect();
         format!("[{}]", items.join(","))
     }
 
@@ -623,7 +632,7 @@ impl LoweringNeed {
 }
 
 /// One resource binding statically used by an entry point.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ReflectedBinding {
     /// Final WGSL `@group`.
     pub group: u32,
@@ -695,7 +704,7 @@ impl ReflectedBinding {
 }
 
 /// A vertex input or fragment output at a `@location`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ShaderIo {
     pub location: u32,
     /// WGSL type, e.g. `vec4<f32>`.
@@ -722,6 +731,17 @@ impl EntryPointReflection {
     /// `true` when every used binding has a WebGPU layout entry.
     pub fn layout_complete(&self) -> bool {
         self.bindings.iter().all(|b| b.layout.is_some())
+    }
+
+    /// Return a copy with all reflection collections in deterministic canonical order.
+    pub fn canonicalized(&self) -> Self {
+        let mut out = self.clone();
+        out.bindings.sort();
+        out.vertex_inputs.sort();
+        out.fragment_outputs.sort();
+        out.requires_lowering.sort();
+        out.requires_lowering.dedup();
+        out
     }
 }
 
@@ -762,6 +782,10 @@ pub enum ReflectError {
     Conversion(ConversionError),
     /// The SPIR-V front end failed after `convert` succeeded (should not happen).
     FrontEnd(String),
+    EntryPointIndexOutOfRange {
+        index: usize,
+        count: usize,
+    },
     UnsupportedStage {
         entry_point: String,
         stage: String,
@@ -794,6 +818,10 @@ impl fmt::Display for ReflectError {
             Self::FrontEnd(detail) => {
                 write!(f, "SPIR-V front end failed during reflection: {detail}")
             }
+            Self::EntryPointIndexOutOfRange { index, count } => write!(
+                f,
+                "entry point index {index} is out of range for module with {count} entry point(s)"
+            ),
             Self::UnsupportedStage { entry_point, stage } => write!(
                 f,
                 "entry point '{entry_point}' uses stage {stage}, which has no WebGPU pipeline"
@@ -859,6 +887,13 @@ pub fn reflect_module(
         .collect()
 }
 
+/// Maximum recursion depth when flattening nested structs for stage IO reflection.
+const MAX_IO_STRUCT_DEPTH: usize = 32;
+
+fn lookup_type(module: &naga::Module, handle: naga::Handle<naga::Type>) -> Option<&naga::Type> {
+    (handle.index() < module.types.len()).then(|| &module.types[handle])
+}
+
 /// Reflect entry point `index` of a validated module (see [`reflect_module`]).
 pub fn reflect_entry_point(
     module: &naga::Module,
@@ -867,7 +902,12 @@ pub fn reflect_entry_point(
     lowering: Option<&LoweringReport>,
     convention: &RegisterConvention,
 ) -> Result<EntryPointReflection, ReflectError> {
-    let ep = &module.entry_points[index];
+    let Some(ep) = module.entry_points.get(index) else {
+        return Err(ReflectError::EntryPointIndexOutOfRange {
+            index,
+            count: module.entry_points.len(),
+        });
+    };
     let stage = match ep.stage {
         naga::ShaderStage::Vertex => ShaderStage::Vertex,
         naga::ShaderStage::Fragment => ShaderStage::Fragment,
@@ -892,13 +932,18 @@ pub fn reflect_entry_point(
     let mut root_constant_slots: BTreeSet<(u32, u32)> = BTreeSet::new();
     if let Some(report) = lowering {
         for remap in &report.bind_group_remaps {
-            original_bindings.insert(
-                (remap.new_group, remap.new_binding),
-                SpirvBinding {
-                    set: remap.old_group,
-                    binding: remap.old_binding,
-                },
-            );
+            let candidate = SpirvBinding {
+                set: remap.old_group,
+                binding: remap.old_binding,
+            };
+            original_bindings
+                .entry((remap.new_group, remap.new_binding))
+                .and_modify(|existing| {
+                    if candidate < *existing {
+                        *existing = candidate;
+                    }
+                })
+                .or_insert(candidate);
         }
         for remap in &report.push_constant_remaps {
             root_constant_slots.insert((remap.new_group, remap.new_binding));
@@ -915,7 +960,9 @@ pub fn reflect_entry_point(
         let label = var.name.as_deref().unwrap_or("<unnamed>");
 
         if var.space == AddressSpace::Immediate {
-            let size = module.types[var.ty].inner.try_size(gctx).unwrap_or(0);
+            let size = lookup_type(module, var.ty)
+                .and_then(|ty| ty.inner.try_size(gctx))
+                .unwrap_or(0);
             requires_lowering.push(LoweringNeed {
                 kind: LoweringKind::PushConstants,
                 group: None,
@@ -930,8 +977,19 @@ pub fn reflect_entry_point(
             continue;
         };
         let (group, binding) = (res_binding.group, res_binding.binding);
+        if group >= MAX_REFLECTED_GROUPS {
+            return Err(ReflectError::GroupIndexTooLarge {
+                group,
+                max: MAX_REFLECTED_GROUPS,
+            });
+        }
+        let Some(var_ty) = lookup_type(module, var.ty) else {
+            return Err(ReflectError::FrontEnd(format!(
+                "global variable '{label}' references out-of-range type handle"
+            )));
+        };
 
-        let (element_ty, binding_array) = match module.types[var.ty].inner {
+        let (element_ty, binding_array) = match var_ty.inner {
             TypeInner::BindingArray { base, size } => (
                 base,
                 Some(match size {
@@ -941,20 +999,26 @@ pub fn reflect_entry_point(
             ),
             _ => (var.ty, None),
         };
-        let element = &module.types[element_ty].inner;
+        let Some(element_type) = lookup_type(module, element_ty) else {
+            return Err(ReflectError::FrontEnd(format!(
+                "global variable '{label}' references out-of-range element type handle"
+            )));
+        };
+        let element = &element_type.inner;
 
         let (resource, class, mut layout) = match var.space {
             AddressSpace::Uniform => (
                 ResourceKind::Buffer,
                 Some(RegisterClass::B),
-                Ok(BindingLayout::Buffer {
-                    ty: BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: u64::from(element.try_size(gctx).unwrap_or(0)),
-                }),
+                buffer_layout(BufferBindingType::Uniform, element, gctx),
             ),
             AddressSpace::Storage { access } => {
                 let writable = access.intersects(StorageAccess::STORE | StorageAccess::ATOMIC);
+                let buffer_ty = if writable {
+                    BufferBindingType::Storage
+                } else {
+                    BufferBindingType::ReadOnlyStorage
+                };
                 (
                     ResourceKind::Buffer,
                     Some(if writable {
@@ -962,15 +1026,7 @@ pub fn reflect_entry_point(
                     } else {
                         RegisterClass::T
                     }),
-                    Ok(BindingLayout::Buffer {
-                        ty: if writable {
-                            BufferBindingType::Storage
-                        } else {
-                            BufferBindingType::ReadOnlyStorage
-                        },
-                        has_dynamic_offset: false,
-                        min_binding_size: u64::from(element.try_size(gctx).unwrap_or(0)),
-                    }),
+                    buffer_layout(buffer_ty, element, gctx),
                 )
             }
             AddressSpace::Handle => match *element {
@@ -1068,16 +1124,30 @@ pub fn reflect_entry_point(
         });
     }
 
-    bindings.sort_by(|a, b| (a.group, a.binding, &a.name).cmp(&(b.group, b.binding, &b.name)));
+    bindings.sort();
+
+    let mut seen_slots: BTreeMap<(u32, u32), BindingSide> = BTreeMap::new();
+    for b in &bindings {
+        let side = binding_side_for(stage, &ep.name, b);
+        if let Some(first) = seen_slots.get(&(b.group, b.binding)) {
+            return Err(ReflectError::BindingConflict {
+                group: b.group,
+                binding: b.binding,
+                first: Box::new(first.clone()),
+                second: Box::new(side),
+            });
+        }
+        seen_slots.insert((b.group, b.binding), side);
+    }
 
     let mut vertex_inputs = Vec::new();
     let mut fragment_outputs = Vec::new();
     match stage {
         ShaderStage::Vertex => {
             for arg in &ep.function.arguments {
-                collect_io(module, arg.ty, arg.binding.as_ref(), &mut vertex_inputs);
+                collect_io(module, arg.ty, arg.binding.as_ref(), 0, &mut vertex_inputs);
             }
-            vertex_inputs.sort_by_key(|io| io.location);
+            vertex_inputs.sort();
             for io in &vertex_inputs {
                 if io.vertex_format.is_none() {
                     requires_lowering.push(LoweringNeed {
@@ -1098,10 +1168,11 @@ pub fn reflect_entry_point(
                     module,
                     result.ty,
                     result.binding.as_ref(),
+                    0,
                     &mut fragment_outputs,
                 );
             }
-            fragment_outputs.sort_by_key(|io| io.location);
+            fragment_outputs.sort();
             for io in &mut fragment_outputs {
                 io.vertex_format = None;
             }
@@ -1140,6 +1211,47 @@ pub fn reflect_entry_point(
 }
 
 type LayoutResult = Result<BindingLayout, (LoweringKind, String)>;
+
+fn buffer_layout(
+    ty: BufferBindingType,
+    element: &TypeInner,
+    gctx: naga::proc::GlobalCtx<'_>,
+) -> LayoutResult {
+    match element.try_size(gctx) {
+        Some(size) if size > 0 => Ok(BindingLayout::Buffer {
+            ty,
+            has_dynamic_offset: false,
+            min_binding_size: u64::from(size),
+        }),
+        Some(_) => Err((
+            LoweringKind::UnsupportedResource,
+            format!(
+                "zero-size {} buffer binding has no valid WebGPU buffer layout",
+                ty.as_str()
+            ),
+        )),
+        None => Err((
+            LoweringKind::UnsupportedResource,
+            format!(
+                "unsized or overflowing {} buffer binding has no valid WebGPU buffer layout",
+                ty.as_str()
+            ),
+        )),
+    }
+}
+
+fn binding_side_for(stage: ShaderStage, entry_point: &str, b: &ReflectedBinding) -> BindingSide {
+    let layout = match b.layout {
+        Some(layout) => layout.member_json(),
+        None => format!("\"{}\":null", b.resource.as_str()),
+    };
+    BindingSide {
+        stage,
+        entry_point: entry_point.to_string(),
+        name: b.name.clone(),
+        layout,
+    }
+}
 
 fn image_layout(
     dim: ImageDimension,
@@ -1346,11 +1458,18 @@ fn collect_io(
     module: &naga::Module,
     ty: naga::Handle<naga::Type>,
     binding: Option<&Binding>,
+    depth: usize,
     out: &mut Vec<ShaderIo>,
 ) {
+    if depth > MAX_IO_STRUCT_DEPTH {
+        return;
+    }
+    let Some(resolved_ty) = lookup_type(module, ty) else {
+        return;
+    };
     match binding {
         Some(Binding::Location { location, .. }) => {
-            let (wgsl_type, vertex_format) = io_type(&module.types[ty].inner);
+            let (wgsl_type, vertex_format) = io_type(&resolved_ty.inner);
             out.push(ShaderIo {
                 location: *location,
                 wgsl_type,
@@ -1359,9 +1478,9 @@ fn collect_io(
         }
         Some(Binding::BuiltIn(_)) => {}
         None => {
-            if let TypeInner::Struct { members, .. } = &module.types[ty].inner {
+            if let TypeInner::Struct { members, .. } = &resolved_ty.inner {
                 for member in members {
-                    collect_io(module, member.ty, member.binding.as_ref(), out);
+                    collect_io(module, member.ty, member.binding.as_ref(), depth + 1, out);
                 }
             }
         }
@@ -1483,24 +1602,36 @@ pub fn stage_layout(entry: &EntryPointReflection) -> Result<PipelineLayoutDesc, 
 }
 
 fn merge_stages(stages: &[&EntryPointReflection]) -> Result<PipelineLayoutDesc, ReflectError> {
+    let mut ordered_stages: Vec<&EntryPointReflection> = stages.to_vec();
+    ordered_stages.sort_by(|a, b| (a.stage, a.name.as_str()).cmp(&(b.stage, b.name.as_str())));
+
     let mut groups: BTreeMap<u32, BTreeMap<u32, (LayoutEntry, BindingSide)>> = BTreeMap::new();
-    for ep in stages {
+    for ep in ordered_stages {
         let visibility = stage_visibility(ep.stage);
-        for b in &ep.bindings {
-            let Some(layout) = b.layout else {
-                continue;
-            };
+        let mut ordered_bindings: Vec<&ReflectedBinding> = ep.bindings.iter().collect();
+        ordered_bindings.sort();
+
+        let mut stage_slots: BTreeMap<(u32, u32), BindingSide> = BTreeMap::new();
+        for b in ordered_bindings {
             if b.group >= MAX_REFLECTED_GROUPS {
                 return Err(ReflectError::GroupIndexTooLarge {
                     group: b.group,
                     max: MAX_REFLECTED_GROUPS,
                 });
             }
-            let side = BindingSide {
-                stage: ep.stage,
-                entry_point: ep.name.clone(),
-                name: b.name.clone(),
-                layout: layout.member_json(),
+            let side = binding_side_for(ep.stage, &ep.name, b);
+            if let Some(first) = stage_slots.get(&(b.group, b.binding)) {
+                return Err(ReflectError::BindingConflict {
+                    group: b.group,
+                    binding: b.binding,
+                    first: Box::new(first.clone()),
+                    second: Box::new(side),
+                });
+            }
+            stage_slots.insert((b.group, b.binding), side.clone());
+
+            let Some(layout) = b.layout else {
+                continue;
             };
             let slots = groups.entry(b.group).or_default();
             match slots.get_mut(&b.binding) {
@@ -1533,7 +1664,10 @@ fn merge_stages(stages: &[&EntryPointReflection]) -> Result<PipelineLayoutDesc, 
         }
     }
 
-    let group_count = groups.keys().next_back().map_or(0, |&g| g + 1);
+    let group_count = groups
+        .keys()
+        .next_back()
+        .map_or(0, |&g| g.saturating_add(1));
     let bind_group_layouts = (0..group_count)
         .map(|g| BindGroupLayoutDesc {
             entries: groups
@@ -1779,7 +1913,10 @@ pub fn check_pipeline_limits(
         );
     }
 
-    for ep in stages {
+    let mut ordered_stages: Vec<&EntryPointReflection> = stages.to_vec();
+    ordered_stages.sort_by(|a, b| (a.stage, a.name.as_str()).cmp(&(b.stage, b.name.as_str())));
+
+    for ep in ordered_stages {
         let highest = |ios: &[ShaderIo]| {
             ios.iter()
                 .map(|io| u64::from(io.location) + 1)
@@ -1846,9 +1983,10 @@ impl LayoutManifest {
     fn intern(&mut self, layout: &PipelineLayoutDesc) -> Result<(u64, Vec<u64>), ReflectError> {
         let mut ids = Vec::with_capacity(layout.bind_group_layouts.len());
         for bgl in &layout.bind_group_layouts {
-            let id = bgl.content_hash();
+            let canonical_bgl = bgl.canonicalized();
+            let id = canonical_bgl.content_hash();
             match self.bind_group_layouts.get(&id) {
-                Some(existing) if existing != bgl => {
+                Some(existing) if *existing != canonical_bgl => {
                     return Err(ReflectError::HashCollision {
                         table: "bind_group_layouts",
                         hash: id,
@@ -1856,7 +1994,7 @@ impl LayoutManifest {
                 }
                 Some(_) => {}
                 None => {
-                    self.bind_group_layouts.insert(id, bgl.clone());
+                    self.bind_group_layouts.insert(id, canonical_bgl);
                 }
             }
             ids.push(id);
@@ -1898,7 +2036,9 @@ impl LayoutManifest {
             &hash_keyed(&self.bind_group_layouts),
             |out, bgl| {
                 out.push_str("{\n      \"entries\": ");
-                let items: Vec<String> = bgl.entries.iter().map(LayoutEntry::to_json).collect();
+                let mut sorted_entries: Vec<&LayoutEntry> = bgl.entries.iter().collect();
+                sorted_entries.sort();
+                let items: Vec<String> = sorted_entries.into_iter().map(LayoutEntry::to_json).collect();
                 write_compact_array(out, "      ", &items);
                 out.push_str("\n    }");
             },
@@ -1919,6 +2059,19 @@ impl LayoutManifest {
         out.push_str("  \"shaders\": ");
         write_object(&mut out, "  ", &hash_keyed(&self.shaders), |out, record| {
             let ep = &record.entry;
+            let mut sorted_bindings: Vec<&ReflectedBinding> = ep.bindings.iter().collect();
+            sorted_bindings.sort();
+            let mut sorted_vertex_inputs: Vec<&ShaderIo> = ep.vertex_inputs.iter().collect();
+            sorted_vertex_inputs.sort();
+            let mut sorted_fragment_outputs: Vec<&ShaderIo> = ep.fragment_outputs.iter().collect();
+            sorted_fragment_outputs.sort();
+            let mut sorted_lowering: Vec<&LoweringNeed> = ep.requires_lowering.iter().collect();
+            sorted_lowering.sort();
+            sorted_lowering.dedup();
+            let mut sorted_violations: Vec<&LimitViolation> =
+                record.limit_violations.iter().collect();
+            sorted_violations.sort();
+
             out.push_str("{\n");
             let _ = writeln!(out, "      \"stage\": \"{}\",", ep.stage.as_str());
             out.push_str("      \"entry_point\": ");
@@ -1946,34 +2099,36 @@ impl LayoutManifest {
             let sections: [(&str, Vec<String>); 5] = [
                 (
                     "bindings",
-                    ep.bindings.iter().map(ReflectedBinding::to_json).collect(),
+                    sorted_bindings
+                        .into_iter()
+                        .map(ReflectedBinding::to_json)
+                        .collect(),
                 ),
                 (
                     "vertex_inputs",
-                    ep.vertex_inputs
-                        .iter()
+                    sorted_vertex_inputs
+                        .into_iter()
                         .map(|io| io_json(io, true))
                         .collect(),
                 ),
                 (
                     "fragment_outputs",
-                    ep.fragment_outputs
-                        .iter()
+                    sorted_fragment_outputs
+                        .into_iter()
                         .map(|io| io_json(io, false))
                         .collect(),
                 ),
                 (
                     "requires_lowering",
-                    ep.requires_lowering
-                        .iter()
+                    sorted_lowering
+                        .into_iter()
                         .map(LoweringNeed::to_json)
                         .collect(),
                 ),
                 (
                     "limit_violations",
-                    record
-                        .limit_violations
-                        .iter()
+                    sorted_violations
+                        .into_iter()
                         .map(LimitViolation::to_json)
                         .collect(),
                 ),
@@ -1991,8 +2146,9 @@ impl LayoutManifest {
             .collect();
         write_object(&mut out, "  ", &pipelines, |out, record| {
             out.push_str("{\n");
-            let stages: Vec<String> = record
-                .stages
+            let mut sorted_stages = record.stages.clone();
+            sorted_stages.sort();
+            let stages: Vec<String> = sorted_stages
                 .iter()
                 .map(|(stage, hash)| {
                     format!("\"{}\":\"{}\"", stage.as_str(), format_shader_hash(*hash))
@@ -2014,11 +2170,13 @@ impl LayoutManifest {
                 "      \"layout_complete\": {},",
                 record.layout_complete
             );
+            let mut sorted_violations: Vec<&LimitViolation> =
+                record.limit_violations.iter().collect();
+            sorted_violations.sort();
             let sections: [(&str, Vec<String>); 1] = [(
                 "limit_violations",
-                record
-                    .limit_violations
-                    .iter()
+                sorted_violations
+                    .into_iter()
                     .map(LimitViolation::to_json)
                     .collect(),
             )];
@@ -2038,15 +2196,16 @@ pub fn build_layout_manifest(
     pipelines: &[Vec<u64>],
     convention: &RegisterConvention,
 ) -> Result<LayoutManifest, ReflectError> {
-    let mut by_hash: BTreeMap<u64, &EntryPointReflection> = BTreeMap::new();
+    let mut by_hash: BTreeMap<u64, EntryPointReflection> = BTreeMap::new();
     for shader in shaders {
+        let canonical = shader.entry.canonicalized();
         match by_hash.get(&shader.hash) {
-            Some(existing) if **existing != shader.entry => {
+            Some(existing) if *existing != canonical => {
                 return Err(ReflectError::DuplicateShader(shader.hash));
             }
             Some(_) => {}
             None => {
-                by_hash.insert(shader.hash, &shader.entry);
+                by_hash.insert(shader.hash, canonical);
             }
         }
     }
@@ -2056,7 +2215,7 @@ pub fn build_layout_manifest(
         ..LayoutManifest::default()
     };
 
-    for (&hash, &entry) in &by_hash {
+    for (&hash, entry) in &by_hash {
         let layout = stage_layout(entry)?;
         let limit_violations = check_pipeline_limits(&layout, &[entry]);
         let (pipeline_layout, bind_group_layouts) = manifest.intern(&layout)?;
@@ -2076,7 +2235,6 @@ pub fn build_layout_manifest(
         for &hash in spec {
             let entry = by_hash
                 .get(&hash)
-                .copied()
                 .ok_or(ReflectError::UnknownShader(hash))?;
             members.push((entry.stage, hash, entry));
         }
@@ -3357,6 +3515,579 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) { other_name[id.x] = id.y;
             })
         );
         assert_eq!(convention.register_for(RegisterClass::T, 2, 5), None);
+    }
+
+    // -- S51 determinism, classification & edge-case guards -------------------
+
+    #[test]
+    fn deterministic_binding_sort_order_and_canonical_serialization() {
+        // Same resources declared in scrambled vs ascending order must yield identical
+        // reflection bindings, layout hashes, and rendered manifest JSON.
+        let scrambled_src = r#"
+@group(2) @binding(3) var uav_tex: texture_storage_2d<rgba8unorm, write>;
+@group(1) @binding(2) var cmp_smp: sampler_comparison;
+@group(0) @binding(4) var<storage, read_write> uav_buf: array<u32>;
+@group(0) @binding(1) var srv_tex: texture_2d<f32>;
+@group(1) @binding(0) var lin_smp: sampler;
+@group(0) @binding(3) var depth_tex: texture_depth_2d;
+@group(0) @binding(0) var<uniform> cbv: vec4<f32>;
+@group(0) @binding(2) var<storage, read> srv_buf: array<vec4<f32>>;
+
+@compute @workgroup_size(8, 8, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let s = textureSampleLevel(srv_tex, lin_smp, vec2<f32>(0.5), 0.0);
+    let d = textureSampleCompareLevel(depth_tex, cmp_smp, vec2<f32>(0.5), 0.5);
+    let v = cbv + srv_buf[gid.x] + s + vec4<f32>(d);
+    uav_buf[gid.x] = u32(v.x);
+    textureStore(uav_tex, vec2<i32>(gid.xy), v);
+}
+"#;
+        let ordered_src = r#"
+@group(0) @binding(0) var<uniform> cbv: vec4<f32>;
+@group(0) @binding(1) var srv_tex: texture_2d<f32>;
+@group(0) @binding(2) var<storage, read> srv_buf: array<vec4<f32>>;
+@group(0) @binding(3) var depth_tex: texture_depth_2d;
+@group(0) @binding(4) var<storage, read_write> uav_buf: array<u32>;
+@group(1) @binding(0) var lin_smp: sampler;
+@group(1) @binding(2) var cmp_smp: sampler_comparison;
+@group(2) @binding(3) var uav_tex: texture_storage_2d<rgba8unorm, write>;
+
+@compute @workgroup_size(8, 8, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let s = textureSampleLevel(srv_tex, lin_smp, vec2<f32>(0.5), 0.0);
+    let d = textureSampleCompareLevel(depth_tex, cmp_smp, vec2<f32>(0.5), 0.5);
+    let v = cbv + srv_buf[gid.x] + s + vec4<f32>(d);
+    uav_buf[gid.x] = u32(v.x);
+    textureStore(uav_tex, vec2<i32>(gid.xy), v);
+}
+"#;
+        let ep_scrambled = reflect_wgsl(scrambled_src);
+        let ep_ordered = reflect_wgsl(ordered_src);
+        assert_eq!(ep_scrambled, ep_ordered);
+
+        let slots: Vec<(u32, u32)> = ep_scrambled
+            .bindings
+            .iter()
+            .map(|b| (b.group, b.binding))
+            .collect();
+        assert_eq!(
+            slots,
+            vec![(0, 0), (0, 1), (0, 2), (0, 3), (0, 4), (1, 0), (1, 2), (2, 3)]
+        );
+
+        let conv = RegisterConvention::default();
+        let json_a = build_layout_manifest(
+            &[ShaderReflection {
+                hash: 0xabcd,
+                entry: ep_scrambled.clone(),
+            }],
+            &[vec![0xabcd]],
+            &conv,
+        )
+        .unwrap()
+        .render_json();
+        let mut reversed_entry = ep_ordered.clone();
+        reversed_entry.bindings.reverse();
+        let json_b = build_layout_manifest(
+            &[ShaderReflection {
+                hash: 0xabcd,
+                entry: reversed_entry,
+            }],
+            &[vec![0xabcd]],
+            &conv,
+        )
+        .unwrap()
+        .render_json();
+        assert_eq!(json_a, json_b);
+
+        // BindGroupLayoutDesc canonical_json and content_hash are invariant to entry order.
+        let e0 = LayoutEntry {
+            binding: 0,
+            visibility: VISIBILITY_COMPUTE,
+            layout: buffer(BufferBindingType::Uniform, 16),
+        };
+        let e1 = LayoutEntry {
+            binding: 4,
+            visibility: VISIBILITY_COMPUTE,
+            layout: buffer(BufferBindingType::Storage, 4),
+        };
+        let bgl_sorted = BindGroupLayoutDesc {
+            entries: vec![e0, e1],
+        };
+        let bgl_unsorted = BindGroupLayoutDesc {
+            entries: vec![e1, e0],
+        };
+        assert_eq!(bgl_sorted.canonical_json(), bgl_unsorted.canonical_json());
+        assert_eq!(bgl_sorted.content_hash(), bgl_unsorted.content_hash());
+
+        // Cross-stage BindingConflict and check_pipeline_limits are stage-order invariant.
+        let vs = reflect_wgsl(VERTEX_WGSL);
+        let fs_conflict = reflect_wgsl(
+            r#"
+@group(0) @binding(0) var clash: texture_2d<f32>;
+@fragment
+fn fs_main() -> @location(8) vec4<f32> {
+    return textureLoad(clash, vec2<i32>(0), 0);
+}
+"#,
+        );
+        assert_eq!(
+            merge_pipeline(&[&vs, &fs_conflict]),
+            merge_pipeline(&[&fs_conflict, &vs]),
+            "conflict first/second ordering must not depend on input slice order"
+        );
+
+        let mut vs_limit = reflect_wgsl(VERTEX_WGSL);
+        vs_limit.vertex_inputs.push(ShaderIo {
+            location: 16,
+            wgsl_type: "vec4<f32>".to_string(),
+            vertex_format: Some("float32x4"),
+        });
+        let empty_layout = PipelineLayoutDesc::default();
+        assert_eq!(
+            check_pipeline_limits(&empty_layout, &[&vs_limit, &fs_conflict]),
+            check_pipeline_limits(&empty_layout, &[&fs_conflict, &vs_limit]),
+            "limit violation ordering must not depend on stage slice order"
+        );
+    }
+
+    #[test]
+    fn classifies_cbv_srv_uav_and_sampler_resources_with_register_shifts() {
+        let src = r#"
+@group(0) @binding(0) var<uniform> cbv0: vec4<f32>;
+@group(0) @binding(100) var<storage, read> srv_buf0: array<u32>;
+@group(0) @binding(101) var srv_tex_filt: texture_2d<f32>;
+@group(0) @binding(102) var srv_tex_load: texture_2d<f32>;
+@group(0) @binding(103) var srv_depth: texture_depth_2d;
+@group(0) @binding(200) var<storage, read_write> uav_buf0: array<u32>;
+@group(0) @binding(201) var uav_tex0: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(300) var smp_filt: sampler;
+@group(0) @binding(301) var smp_cmp: sampler_comparison;
+
+@fragment
+fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+    let a = textureSample(srv_tex_filt, smp_filt, uv);
+    let b = textureLoad(srv_tex_load, vec2<i32>(0), 0);
+    let d = textureSampleCompare(srv_depth, smp_cmp, uv, 0.5);
+    uav_buf0[0] = srv_buf0[0];
+    textureStore(uav_tex0, vec2<i32>(0), a + b);
+    return cbv0 + a + b + vec4<f32>(d);
+}
+"#;
+        let (module, info) = parse_wgsl(src);
+        let convention = RegisterConvention {
+            shift_b: 0,
+            shift_t: 100,
+            shift_u: 200,
+            shift_s: 300,
+        };
+        let ep = reflect_entry_point(&module, &info, 0, None, &convention).unwrap();
+        assert!(ep.layout_complete());
+
+        let check = |binding: u32,
+                     resource: ResourceKind,
+                     class: RegisterClass,
+                     index: u32,
+                     layout: BindingLayout| {
+            let b = find(&ep, 0, binding);
+            assert_eq!(b.resource, resource, "binding {binding} resource");
+            assert_eq!(
+                b.register,
+                Some(D3dRegister {
+                    class,
+                    index,
+                    space: 0
+                }),
+                "binding {binding} register"
+            );
+            assert_eq!(b.layout, Some(layout), "binding {binding} layout");
+        };
+
+        check(
+            0,
+            ResourceKind::Buffer,
+            RegisterClass::B,
+            0,
+            buffer(BufferBindingType::Uniform, 16),
+        );
+        check(
+            100,
+            ResourceKind::Buffer,
+            RegisterClass::T,
+            0,
+            buffer(BufferBindingType::ReadOnlyStorage, 4),
+        );
+        check(
+            101,
+            ResourceKind::Texture,
+            RegisterClass::T,
+            1,
+            tex(TextureSampleType::Float, TextureViewDimension::D2),
+        );
+        check(
+            102,
+            ResourceKind::Texture,
+            RegisterClass::T,
+            2,
+            tex(
+                TextureSampleType::UnfilterableFloat,
+                TextureViewDimension::D2,
+            ),
+        );
+        check(
+            103,
+            ResourceKind::Texture,
+            RegisterClass::T,
+            3,
+            tex(TextureSampleType::Depth, TextureViewDimension::D2),
+        );
+        check(
+            200,
+            ResourceKind::Buffer,
+            RegisterClass::U,
+            0,
+            buffer(BufferBindingType::Storage, 4),
+        );
+        check(
+            201,
+            ResourceKind::StorageTexture,
+            RegisterClass::U,
+            1,
+            BindingLayout::StorageTexture {
+                access: StorageTextureAccess::WriteOnly,
+                format: "rgba8unorm",
+                view_dimension: TextureViewDimension::D2,
+            },
+        );
+        check(
+            300,
+            ResourceKind::Sampler,
+            RegisterClass::S,
+            0,
+            BindingLayout::Sampler {
+                ty: SamplerBindingType::Filtering,
+            },
+        );
+        check(
+            301,
+            ResourceKind::Sampler,
+            RegisterClass::S,
+            1,
+            BindingLayout::Sampler {
+                ty: SamplerBindingType::Comparison,
+            },
+        );
+    }
+
+    #[test]
+    fn guards_duplicate_group_binding_collisions_within_a_single_stage() {
+        let src = r#"
+@group(0) @binding(0) var<uniform> first_cb: vec4<f32>;
+@group(0) @binding(1) var<uniform> second_cb: vec4<f32>;
+@group(1) @binding(0) var<storage, read_write> out_buf: vec4<f32>;
+
+@compute @workgroup_size(1)
+fn cs_main() {
+    out_buf = first_cb + second_cb;
+}
+"#;
+        let (mut module, info) = parse_wgsl(src);
+        // Force a duplicate (group=0, binding=0) collision on two statically used globals.
+        for (_, var) in module.global_variables.iter_mut() {
+            if var.name.as_deref() == Some("second_cb") {
+                var.binding = Some(naga::ResourceBinding {
+                    group: 0,
+                    binding: 0,
+                });
+            }
+        }
+        let err =
+            reflect_entry_point(&module, &info, 0, None, &RegisterConvention::default())
+                .unwrap_err();
+        match err {
+            ReflectError::BindingConflict {
+                group,
+                binding,
+                first,
+                second,
+            } => {
+                assert_eq!((group, binding), (0, 0));
+                assert_eq!(first.name.as_deref(), Some("first_cb"));
+                assert_eq!(second.name.as_deref(), Some("second_cb"));
+            }
+            other => panic!("expected intra-stage BindingConflict, got {other:?}"),
+        }
+
+        // Manually constructed EntryPointReflection with identical duplicate bindings must also
+        // fail stage_layout and merge_pipeline instead of silently collapsing them.
+        let dup_binding = |name: &str| ReflectedBinding {
+            group: 1,
+            binding: 2,
+            name: Some(name.to_string()),
+            resource: ResourceKind::Buffer,
+            layout: Some(buffer(BufferBindingType::Uniform, 16)),
+            binding_array: None,
+            register: Some(D3dRegister {
+                class: RegisterClass::B,
+                index: 2,
+                space: 1,
+            }),
+            spirv: Some(SpirvBinding { set: 1, binding: 2 }),
+            root_constants: false,
+        };
+        let ep = EntryPointReflection {
+            name: "cs_dup".to_string(),
+            stage: ShaderStage::Compute,
+            bindings: vec![dup_binding("b_second"), dup_binding("b_first")],
+            vertex_inputs: vec![],
+            fragment_outputs: vec![],
+            workgroup_size: Some([1, 1, 1]),
+            requires_lowering: vec![],
+        };
+        let err = stage_layout(&ep).unwrap_err();
+        match err {
+            ReflectError::BindingConflict {
+                group,
+                binding,
+                first,
+                second,
+            } => {
+                assert_eq!((group, binding), (1, 2));
+                assert_eq!(first.name.as_deref(), Some("b_first"));
+                assert_eq!(second.name.as_deref(), Some("b_second"));
+            }
+            other => panic!("expected stage_layout BindingConflict, got {other:?}"),
+        }
+        assert!(matches!(
+            merge_pipeline(&[&ep]),
+            Err(ReflectError::BindingConflict {
+                group: 1,
+                binding: 2,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn guards_zero_size_buffer_bindings_without_panicking() {
+        let src = r#"
+struct NonEmpty { v: vec4<f32> }
+@group(0) @binding(0) var<uniform> zero_cbv: NonEmpty;
+@group(0) @binding(1) var<storage, read_write> zero_uav: NonEmpty;
+@group(0) @binding(2) var<uniform> valid_cbv: vec4<f32>;
+
+@compute @workgroup_size(1)
+fn cs_main() {
+    zero_uav.v = zero_cbv.v + valid_cbv;
+}
+"#;
+        let (mut module, info) = parse_wgsl(src);
+        let empty_struct_ty = module.types.insert(
+            naga::Type {
+                name: Some("EmptyStruct".to_string()),
+                inner: TypeInner::Struct {
+                    members: Vec::new(),
+                    span: 0,
+                },
+            },
+            naga::Span::UNDEFINED,
+        );
+        for (_, var) in module.global_variables.iter_mut() {
+            if matches!(var.name.as_deref(), Some("zero_cbv" | "zero_uav")) {
+                var.ty = empty_struct_ty;
+            }
+        }
+
+        let ep = reflect_entry_point(&module, &info, 0, None, &RegisterConvention::default())
+            .expect("zero-size buffers must be guarded without panicking");
+        assert!(!ep.layout_complete());
+        assert_eq!(find(&ep, 0, 0).layout, None);
+        assert_eq!(find(&ep, 0, 1).layout, None);
+        assert_eq!(
+            find(&ep, 0, 2).layout,
+            Some(buffer(BufferBindingType::Uniform, 16))
+        );
+        assert_eq!(ep.requires_lowering.len(), 2);
+        assert!(
+            ep.requires_lowering.iter().all(|need| {
+                need.kind == LoweringKind::UnsupportedResource
+                    && need.detail.contains("zero-size")
+            }),
+            "{:#?}",
+            ep.requires_lowering
+        );
+
+        // Only the valid non-zero buffer enters the WebGPU bind group layout.
+        let layout = stage_layout(&ep).unwrap();
+        assert_eq!(layout.bind_group_layouts.len(), 1);
+        assert_eq!(layout.bind_group_layouts[0].entries.len(), 1);
+        assert_eq!(layout.bind_group_layouts[0].entries[0].binding, 2);
+
+        // DXIL-style unknown-size (0) buffer layouts still merge and limit-check cleanly.
+        let merged = merge_layouts(
+            buffer(BufferBindingType::Uniform, 0),
+            buffer(BufferBindingType::Uniform, 64),
+        );
+        assert_eq!(merged, Some(buffer(BufferBindingType::Uniform, 64)));
+    }
+
+    #[test]
+    fn guards_out_of_range_indices_and_empty_inputs_without_panicking() {
+        // Empty Naga module: reflect_module returns empty vec, reflect_entry_point returns error.
+        let empty_module = naga::Module::default();
+        let empty_info = validate(&empty_module, "");
+        assert_eq!(
+            reflect_module(
+                &empty_module,
+                &empty_info,
+                None,
+                &RegisterConvention::default()
+            ),
+            Ok(Vec::new())
+        );
+        assert_eq!(
+            reflect_entry_point(
+                &empty_module,
+                &empty_info,
+                0,
+                None,
+                &RegisterConvention::default()
+            ),
+            Err(ReflectError::EntryPointIndexOutOfRange { index: 0, count: 0 })
+        );
+
+        // Single-entry module with out-of-range entry point index.
+        let (mut module, info) = parse_wgsl(COMPUTE_A);
+        assert_eq!(
+            reflect_entry_point(&module, &info, 1, None, &RegisterConvention::default()),
+            Err(ReflectError::EntryPointIndexOutOfRange { index: 1, count: 1 })
+        );
+        assert_eq!(
+            reflect_entry_point(
+                &module,
+                &info,
+                usize::MAX,
+                None,
+                &RegisterConvention::default()
+            ),
+            Err(ReflectError::EntryPointIndexOutOfRange {
+                index: usize::MAX,
+                count: 1
+            })
+        );
+
+        // Out-of-range group index in reflect_entry_point and merge_stages.
+        for (_, var) in module.global_variables.iter_mut() {
+            var.binding = Some(naga::ResourceBinding {
+                group: MAX_REFLECTED_GROUPS,
+                binding: 0,
+            });
+        }
+        assert_eq!(
+            reflect_entry_point(&module, &info, 0, None, &RegisterConvention::default()),
+            Err(ReflectError::GroupIndexTooLarge {
+                group: MAX_REFLECTED_GROUPS,
+                max: MAX_REFLECTED_GROUPS,
+            })
+        );
+
+        let huge_group_ep = EntryPointReflection {
+            name: "cs_oob".to_string(),
+            stage: ShaderStage::Compute,
+            bindings: vec![ReflectedBinding {
+                group: u32::MAX,
+                binding: u32::MAX,
+                name: Some("oob".to_string()),
+                resource: ResourceKind::Buffer,
+                layout: None,
+                binding_array: None,
+                register: None,
+                spirv: None,
+                root_constants: false,
+            }],
+            vertex_inputs: vec![],
+            fragment_outputs: vec![],
+            workgroup_size: Some([1, 1, 1]),
+            requires_lowering: vec![],
+        };
+        assert_eq!(
+            stage_layout(&huge_group_ep),
+            Err(ReflectError::GroupIndexTooLarge {
+                group: u32::MAX,
+                max: MAX_REFLECTED_GROUPS,
+            })
+        );
+
+        // Extreme binding/location u32::MAX must not overflow u64 limit calculations.
+        let extreme_vs = EntryPointReflection {
+            name: "vs_max".to_string(),
+            stage: ShaderStage::Vertex,
+            bindings: vec![ReflectedBinding {
+                group: 0,
+                binding: u32::MAX,
+                name: Some("far_cb".to_string()),
+                resource: ResourceKind::Buffer,
+                layout: Some(buffer(BufferBindingType::Uniform, 16)),
+                binding_array: None,
+                register: None,
+                spirv: None,
+                root_constants: false,
+            }],
+            vertex_inputs: vec![ShaderIo {
+                location: u32::MAX,
+                wgsl_type: "vec4<f32>".to_string(),
+                vertex_format: Some("float32x4"),
+            }],
+            fragment_outputs: vec![],
+            workgroup_size: None,
+            requires_lowering: vec![],
+        };
+        let extreme_layout = stage_layout(&extreme_vs).unwrap();
+        let violations = check_pipeline_limits(&extreme_layout, &[&extreme_vs]);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.limit == "maxBindingsPerBindGroup"
+                    && v.count == u64::from(u32::MAX) + 1)
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.limit == "maxVertexAttributes" && v.count == u64::from(u32::MAX) + 1)
+        );
+
+        // Empty manifest, empty pipeline list, and binding-free fullscreen vertex shader.
+        let empty_manifest =
+            build_layout_manifest(&[], &[], &RegisterConvention::default()).unwrap();
+        let parsed = parse_json(&empty_manifest.render_json());
+        assert_eq!(parsed.get("bind_group_layouts").unwrap().as_obj().unwrap().len(), 0);
+        assert_eq!(parsed.get("pipeline_layouts").unwrap().as_obj().unwrap().len(), 0);
+        assert_eq!(parsed.get("shaders").unwrap().as_obj().unwrap().len(), 0);
+        assert_eq!(parsed.get("pipelines").unwrap().as_obj().unwrap().len(), 0);
+
+        assert_eq!(parse_pipeline_list("").unwrap(), Vec::<Vec<u64>>::new());
+        assert_eq!(
+            parse_pipeline_list("  # comment only\n\n").unwrap(),
+            Vec::<Vec<u64>>::new()
+        );
+        assert!(matches!(
+            build_layout_manifest(&[], &[vec![]], &RegisterConvention::default()),
+            Err(ReflectError::InvalidPipelineStages { stages }) if stages.is_empty()
+        ));
+
+        let fullscreen_vs = reflect_wgsl(
+            r#"
+@vertex
+fn vs_main(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32> {
+    return vec4<f32>(f32(vid), 0.0, 0.0, 1.0);
+}
+"#,
+        );
+        assert!(fullscreen_vs.bindings.is_empty());
+        assert!(fullscreen_vs.layout_complete());
+        let fs_layout = stage_layout(&fullscreen_vs).unwrap();
+        assert!(fs_layout.bind_group_layouts.is_empty());
+        assert!(check_pipeline_limits(&fs_layout, &[&fullscreen_vs]).is_empty());
     }
 
     // -- minimal JSON reader (the crate has no JSON dependency) -----------------
