@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import RuntimeSessionControllerDefault, {
   BOOT_MODE,
+  DEFAULT_MAX_TRANSITION_HISTORY,
   DEFAULT_MAX_VALIDATION_ERRORS,
   DEFAULT_STATUS_URL,
   SESSION_MODE,
@@ -1601,5 +1602,428 @@ test('W72 attaches/detaches wgpuWorker without listener leaks across restart and
   detach(); // idempotent
   await controller.stop();
   assert.equal(worker.listenerCount('message'), 0);
+});
+
+// --- W148: Transition History Ring Buffer & Session Uptime Telemetry ---
+
+test('W148 defaults, constructor option validation (maxTransitionHistory, nowFn), and initial telemetry state', () => {
+  assert.equal(DEFAULT_MAX_TRANSITION_HISTORY, 64);
+
+  assert.throws(() => new RuntimeSessionController({ maxTransitionHistory: 0 }), RangeError);
+  assert.throws(() => new RuntimeSessionController({ maxTransitionHistory: -4 }), RangeError);
+  assert.throws(() => new RuntimeSessionController({ maxTransitionHistory: 2.5 }), RangeError);
+  assert.throws(() => new RuntimeSessionController({ maxTransitionHistory: '64' }), RangeError);
+  assert.throws(() => new RuntimeSessionController({ maxTransitionHistory: NaN }), RangeError);
+  assert.throws(() => new RuntimeSessionController({ nowFn: 'not-a-fn' }), TypeError);
+  assert.throws(() => new RuntimeSessionController({ nowFn: 123 }), TypeError);
+
+  const clock = createClock(10_000);
+  const controller = new RuntimeSessionController({
+    fetchImpl: null,
+    nowFn: clock.now,
+  });
+
+  assert.deepEqual(controller.getTransitionHistory(), []);
+  assert.equal(controller.getSessionUptimeMs(), 0);
+  assert.equal(controller.getSessionUptimeMs(25_000), 0);
+  assert.equal(controller.getRestartCount(), 0);
+  assert.equal(controller.getLastTransitionReason(), null);
+
+  assert.deepEqual(controller.getStateDurations(), {
+    idle: 0,
+    probing: 0,
+    starting: 0,
+    running_wasm: 0,
+    running_smoke: 0,
+    stopped: 0,
+    error: 0,
+  });
+
+  clock.advance(250);
+  assert.equal(controller.getStateDurations().idle, 250);
+  assert.equal(controller.getStateDurations(10_750).idle, 750);
+
+  const snap = controller.getSnapshot();
+  assert.deepEqual(snap.transitionHistory, []);
+  assert.equal(snap.transitionCount, 0);
+  assert.equal(snap.transitionHistorySize, 0);
+  assert.equal(snap.transitionEvictedCount, 0);
+  assert.equal(snap.maxTransitionHistory, 64);
+  assert.equal(snap.sessionUptimeMs, 0);
+  assert.equal(snap.uptimeMs, 0);
+  assert.equal(snap.lastTransitionReason, null);
+  assert.equal(snap.restartCount, 0);
+  assert.equal(snap.recoveryCount, 0);
+  assert.equal(snap.stateDurations.idle, 250);
+
+  const diag = controller.getDiagnostics(11_000);
+  assert.equal(diag.stateDurations.idle, 1000);
+  assert.equal(diag.sessionUptimeMs, 0);
+});
+
+test('W148 exact per-state duration tracking, transition records, and uptime computation', async () => {
+  const clock = createClock(1_000);
+  const statusEvents = [];
+  const telemetryEvents = [];
+
+  const controller = new RuntimeSessionController({
+    fetchImpl: createMockFetch(readyStatus({ hasWasmBinary: true })),
+    nowFn: clock.now,
+    capabilityProbe: async () => {
+      // Spend 150ms in PROBING.
+      clock.advance(150);
+      return fullCapabilities();
+    },
+    startWasmRuntime: async () => {
+      // Spend 350ms in STARTING.
+      clock.advance(350);
+      return {
+        async stop() {
+          // Handle teardown takes 25ms before transitioning to STOPPED.
+          clock.advance(25);
+        },
+      };
+    },
+    onStatusUpdate: (ev) => statusEvents.push(ev),
+    onTelemetry: (ev) => telemetryEvents.push(ev),
+  });
+
+  // Spend 200ms in IDLE before start().
+  clock.advance(200);
+
+  const startRes = await controller.start();
+  assert.equal(startRes.ok, true);
+  assert.equal(controller.getState(), SESSION_STATE.RUNNING_WASM);
+
+  // Immediately upon entering running_wasm (t = 1700), uptime is 0.
+  assert.equal(controller.getSessionUptimeMs(), 0);
+  assert.equal(controller.getSessionUptimeMs(2_700), 1_000);
+  // Clock before startedAtMs clamps to 0.
+  assert.equal(controller.getSessionUptimeMs(500), 0);
+
+  // Advance 1200ms in RUNNING_WASM (t = 2900).
+  clock.advance(1_200);
+  assert.equal(controller.getSessionUptimeMs(), 1_200);
+  assert.equal(controller.getSessionUptimeMs(3_400), 1_700);
+
+  const durationsWhileRunning = controller.getStateDurations();
+  assert.deepEqual(durationsWhileRunning, {
+    idle: 200,
+    probing: 150,
+    starting: 350,
+    running_wasm: 1_200,
+    running_smoke: 0,
+    stopped: 0,
+    error: 0,
+  });
+  // Total duration across all states equals total elapsed wall time (2900 - 1000 = 1900).
+  const sumRunning = Object.values(durationsWhileRunning).reduce((a, b) => a + b, 0);
+  assert.equal(sumRunning, 1_900);
+
+  // Explicit nowMs override on getStateDurations and getSnapshot.
+  assert.equal(controller.getStateDurations(3_900).running_wasm, 2_200);
+  const snapAt3900 = controller.getSnapshot(3_900);
+  assert.equal(snapAt3900.sessionUptimeMs, 2_200);
+  assert.equal(snapAt3900.uptimeMs, 2_200);
+  assert.equal(snapAt3900.stateDurations.running_wasm, 2_200);
+
+  // Stop at t = 2900 (+25ms handle stop -> transition to stopped at t = 2925).
+  await controller.stop();
+  assert.equal(controller.getState(), SESSION_STATE.STOPPED);
+  assert.equal(controller.getSessionUptimeMs(), 0);
+  assert.equal(controller.getSessionUptimeMs(9_999), 0);
+
+  // Spend 75ms in STOPPED (t = 3000).
+  clock.advance(75);
+  const durationsAfterStop = controller.getStateDurations();
+  assert.deepEqual(durationsAfterStop, {
+    idle: 200,
+    probing: 150,
+    starting: 350,
+    running_wasm: 1_225,
+    running_smoke: 0,
+    stopped: 75,
+    error: 0,
+  });
+  assert.equal(
+    Object.values(durationsAfterStop).reduce((a, b) => a + b, 0),
+    2_000
+  );
+
+  // Verify exact transition history records.
+  const history = controller.getTransitionHistory();
+  assert.deepEqual(history, [
+    {
+      seq: 1,
+      from: 'idle',
+      to: 'probing',
+      atMs: 1_200,
+      durationInPrevMs: 200,
+      reason: 'Probing browser capabilities and server readiness',
+    },
+    {
+      seq: 2,
+      from: 'probing',
+      to: 'starting',
+      atMs: 1_350,
+      durationInPrevMs: 150,
+      reason: 'Starting Wasm64 runtime',
+    },
+    {
+      seq: 3,
+      from: 'starting',
+      to: 'running_wasm',
+      atMs: 1_700,
+      durationInPrevMs: 350,
+      reason: 'Wasm64 runtime running',
+    },
+    {
+      seq: 4,
+      from: 'running_wasm',
+      to: 'stopped',
+      atMs: 2_925,
+      durationInPrevMs: 1_225,
+      reason: 'Session stopped',
+    },
+  ]);
+  assert.equal(controller.getLastTransitionReason(), 'Session stopped');
+
+  // Verify status & telemetry observers received non-mutating history & stateDurations.
+  assert.ok(statusEvents.length >= 2);
+  const lastStatus = statusEvents[statusEvents.length - 1];
+  assert.equal(lastStatus.transitionCount, 4);
+  assert.equal(lastStatus.lastTransitionReason, 'Session stopped');
+  assert.equal(lastStatus.sessionUptimeMs, 0);
+  assert.equal(lastStatus.transitionHistory.length, 4);
+  assert.equal(lastStatus.stateDurations.running_wasm, 1_225);
+
+  const bootTelemetry = telemetryEvents.filter((e) => e.type === 'boot-status');
+  assert.ok(bootTelemetry.length >= 2);
+  assert.equal(bootTelemetry[bootTelemetry.length - 1].transitionHistory.length, 4);
+});
+
+test('W148 bounded ring buffer eviction, default 64 cap, and defensive clone immutability', async () => {
+  // 1. Small configurable capacity (4) evicts oldest transitions in exact FIFO order.
+  const clock = createClock(500);
+  const controller = new RuntimeSessionController({
+    fetchImpl: createMockFetch(readyStatus({ hasWasmBinary: true })),
+    now: clock.now,
+    maxTransitionHistory: 4,
+    capabilityProbe: () => {
+      clock.advance(10);
+      return fullCapabilities();
+    },
+    startWasmRuntime: async () => {
+      clock.advance(20);
+      return { stop() {} };
+    },
+    startSmokeDemo: async () => {
+      clock.advance(30);
+      return { stop() {} };
+    },
+  });
+
+  // Cycle 1: idle->probing(1)->starting(2)->running_wasm(3)->stopped(4)
+  await controller.start();
+  clock.advance(100);
+  await controller.stop();
+
+  // Cycle 2: stopped->probing(5)->starting(6)->running_smoke(7)->stopped(8)
+  clock.advance(50);
+  await controller.start({ preferSmoke: true });
+  clock.advance(200);
+  await controller.stop();
+
+  // Cycle 3: stopped->probing(9)->starting(10)->running_wasm(11)
+  clock.advance(40);
+  await controller.start();
+
+  const history = controller.getTransitionHistory();
+  assert.equal(history.length, 4);
+  assert.deepEqual(
+    history.map((e) => ({ seq: e.seq, from: e.from, to: e.to })),
+    [
+      { seq: 8, from: 'running_smoke', to: 'stopped' },
+      { seq: 9, from: 'stopped', to: 'probing' },
+      { seq: 10, from: 'probing', to: 'starting' },
+      { seq: 11, from: 'starting', to: 'running_wasm' },
+    ]
+  );
+
+  const snap = controller.getSnapshot();
+  assert.equal(snap.transitionCount, 11);
+  assert.equal(snap.transitionHistorySize, 4);
+  assert.equal(snap.transitionEvictedCount, 7);
+  assert.equal(snap.maxTransitionHistory, 4);
+
+  // Mutating returned arrays and objects never affects internal ring buffer or duration state.
+  history[0].to = 'mutated';
+  history.push({ seq: 999, from: 'x', to: 'y', atMs: 0, durationInPrevMs: 0, reason: 'bad' });
+  snap.transitionHistory.length = 0;
+  snap.stateDurations.running_wasm = 999_999;
+
+  const freshHistory = controller.getTransitionHistory();
+  assert.equal(freshHistory.length, 4);
+  assert.equal(freshHistory[0].to, 'stopped');
+  assert.equal(freshHistory[0].seq, 8);
+
+  const freshDurations = controller.getStateDurations();
+  freshDurations.idle = 123_456;
+  assert.equal(controller.getStateDurations().idle, 0);
+  assert.equal(controller.getStateDurations().running_wasm, 100);
+  assert.equal(controller.getStateDurations().running_smoke, 200);
+
+  await controller.stop();
+
+  // 2. Default capacity (64): 18 start/stop cycles = 72 transitions -> retains newest 64 (seq 9..72).
+  const defaultClock = createClock(0);
+  const defaultCtrl = new RuntimeSessionController({
+    fetchImpl: createMockFetch(readyStatus({ hasWasmBinary: true })),
+    now: defaultClock.now,
+    capabilityProbe: () => fullCapabilities(),
+    startWasmRuntime: async () => ({ stop() {} }),
+  });
+
+  for (let i = 0; i < 18; i += 1) {
+    defaultClock.advance(5);
+    await defaultCtrl.start();
+    defaultClock.advance(10);
+    await defaultCtrl.stop();
+  }
+
+  const defaultHist = defaultCtrl.getTransitionHistory();
+  assert.equal(defaultHist.length, 64);
+  assert.equal(defaultHist[0].seq, 9);
+  assert.equal(defaultHist[63].seq, 72);
+  assert.equal(defaultCtrl.getSnapshot().transitionCount, 72);
+  assert.equal(defaultCtrl.getSnapshot().transitionEvictedCount, 8);
+});
+
+test('W148 reason sanitization, error recovery, restart(), clearTransitionHistory(), and resetTelemetry()', async () => {
+  const clock = createClock(5_000);
+  let failNext = true;
+  const hexBlob = 'de'.repeat(32);
+
+  const controller = new RuntimeSessionController({
+    fetchImpl: createMockFetch(readyStatus({ hasWasmBinary: true })),
+    nowFn: clock.now,
+    capabilityProbe: () => {
+      clock.advance(20);
+      return fullCapabilities();
+    },
+    startWasmRuntime: async () => {
+      clock.advance(30);
+      if (failNext) {
+        failNext = false;
+        throw new Error(
+          `Boot failed at C:\\Users\\alice\\gta6\\main.wasm and /Users/alice/dump.bin data=${hexBlob}\r\n`
+        );
+      }
+      return { stop() {} };
+    },
+    startSmokeDemo: async () => {
+      clock.advance(40);
+      return { stop() {} };
+    },
+  });
+
+  // 1. Failing start sanitizes error reason in transition history & lastTransitionReason.
+  const failRes = await controller.start();
+  assert.equal(failRes.ok, false);
+  assert.equal(controller.getState(), SESSION_STATE.ERROR);
+  assert.equal(controller.getSessionUptimeMs(), 0);
+  assert.equal(controller.getRestartCount(), 0);
+
+  const errReason = controller.getLastTransitionReason();
+  assert.ok(errReason);
+  assert.doesNotMatch(errReason, /alice|C:\\|\/Users|dededede|[\r\n]/);
+  assert.match(errReason, /<path>/);
+  assert.match(errReason, /<buffer>/);
+
+  // 2. Recover from ERROR via start() increments recoveryCount (not restartCount).
+  clock.advance(100);
+  const recoverRes = await controller.start();
+  assert.equal(recoverRes.ok, true);
+  assert.equal(controller.getState(), SESSION_STATE.RUNNING_WASM);
+  assert.equal(controller.getSnapshot().recoveryCount, 1);
+  assert.equal(controller.getRestartCount(), 0);
+  assert.equal(controller.getStateDurations().error, 100);
+
+  clock.advance(500);
+  assert.equal(controller.getSessionUptimeMs(), 500);
+
+  // 3. restart() into smoke demo increments restartCount, resets active session uptime,
+  //    preserves transition history and cumulative state durations across modes.
+  const r1 = await controller.restart({ preferSmoke: true });
+  assert.equal(r1.ok, true);
+  assert.equal(r1.state, SESSION_STATE.RUNNING_SMOKE);
+  assert.equal(controller.getRestartCount(), 1);
+  assert.equal(controller.getSessionUptimeMs(), 0);
+
+  clock.advance(300);
+  assert.equal(controller.getSessionUptimeMs(), 300);
+
+  const durations = controller.getStateDurations();
+  assert.equal(durations.running_wasm, 500);
+  assert.equal(durations.running_smoke, 300);
+  assert.equal(durations.error, 100);
+
+  // 4. Second restart back to Wasm64.
+  const r2 = await controller.restart({ preferSmoke: false });
+  assert.equal(r2.ok, true);
+  assert.equal(r2.state, SESSION_STATE.RUNNING_WASM);
+  assert.equal(controller.getRestartCount(), 2);
+  assert.equal(controller.getSessionUptimeMs(), 0);
+
+  clock.advance(250);
+  assert.equal(controller.getSessionUptimeMs(), 250);
+  assert.equal(controller.getStateDurations().running_wasm, 750);
+  assert.equal(controller.getStateDurations().running_smoke, 300);
+
+  // 5. clearTransitionHistory empties buffer while preserving seq, durations, restartCount, and uptime.
+  const seqBeforeClear = controller.getSnapshot().transitionCount;
+  controller.clearTransitionHistory();
+  assert.deepEqual(controller.getTransitionHistory(), []);
+  assert.equal(controller.getSnapshot().transitionHistorySize, 0);
+  assert.equal(controller.getSnapshot().transitionCount, seqBeforeClear);
+  assert.equal(controller.getRestartCount(), 2);
+  assert.equal(controller.getSessionUptimeMs(), 250);
+
+  // Next transition continues monotonic seq numbering.
+  await controller.stop();
+  const afterStopHist = controller.getTransitionHistory();
+  assert.equal(afterStopHist.length, 1);
+  assert.equal(afterStopHist[0].seq, seqBeforeClear + 1);
+  assert.equal(afterStopHist[0].from, 'running_wasm');
+  assert.equal(afterStopHist[0].to, 'stopped');
+
+  // 6. resetTelemetry resets counters, history, and state durations while keeping active session intact.
+  await controller.start();
+  clock.advance(400);
+  assert.equal(controller.getSessionUptimeMs(), 400);
+
+  controller.resetTelemetry();
+  assert.deepEqual(controller.getTransitionHistory(), []);
+  assert.equal(controller.getRestartCount(), 0);
+  assert.equal(controller.getLastTransitionReason(), null);
+  const resetSnap = controller.getSnapshot();
+  assert.equal(resetSnap.transitionCount, 0);
+  assert.equal(resetSnap.transitionEvictedCount, 0);
+  assert.equal(resetSnap.recoveryCount, 0);
+  assert.equal(resetSnap.stateDurations.running_wasm, 0);
+  assert.equal(resetSnap.stateDurations.running_smoke, 0);
+  // Active running session uptime is unaffected by telemetry reset.
+  assert.equal(controller.getState(), SESSION_STATE.RUNNING_WASM);
+  assert.equal(controller.getSessionUptimeMs(), 400);
+
+  clock.advance(60);
+  assert.equal(controller.getStateDurations().running_wasm, 60);
+  assert.equal(controller.getSessionUptimeMs(), 460);
+
+  await controller.stop();
+  const postResetHist = controller.getTransitionHistory();
+  assert.equal(postResetHist.length, 1);
+  assert.equal(postResetHist[0].seq, 1);
+  assert.equal(postResetHist[0].durationInPrevMs, 60);
 });
 
