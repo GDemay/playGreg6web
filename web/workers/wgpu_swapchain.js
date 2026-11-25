@@ -592,13 +592,47 @@
     _applyContextConfiguration() {
       this._canvas.width = this._width;
       this._canvas.height = this._height;
-      this._context.configure({
+      const cfg = {
         device: this._device,
         format: this._format,
         alphaMode: this._alphaMode,
-      });
+      };
+      if (Array.isArray(this._viewFormats) && this._viewFormats.length > 0) {
+        cfg.viewFormats = this._viewFormats;
+      }
+      this._context.configure(cfg);
       this._configured = true;
       this._ensureDepthTexture();
+    }
+
+    /**
+     * Switch the configured canvas texture format (e.g. matching the stream-declared swapchain
+     * attachment format such as 'rgba8unorm') without disturbing canvas dimensions or depth state.
+     *
+     * @param {string} format
+     * @param {string[] | null} [viewFormats]
+     * @returns {boolean} True when the format changed and was reapplied.
+     */
+    setFormat(format, viewFormats = null) {
+      if (this._destroyed || this._isDeviceLost) {
+        return false;
+      }
+      if (typeof format !== 'string' || format.length === 0) {
+        return false;
+      }
+      const nextViewFormats =
+        Array.isArray(viewFormats) && viewFormats.length > 0 ? viewFormats.slice() : null;
+      const prevViewKey = Array.isArray(this._viewFormats) ? this._viewFormats.join(',') : '';
+      const nextViewKey = nextViewFormats ? nextViewFormats.join(',') : '';
+      if (this._format === format && prevViewKey === nextViewKey && this._configured) {
+        return false;
+      }
+      this._format = format;
+      this._viewFormats = nextViewFormats;
+      if (this._configured && this._device && this._context) {
+        this._applyContextConfiguration();
+      }
+      return true;
     }
 
     /**
