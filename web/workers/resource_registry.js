@@ -14,6 +14,7 @@
   const DEFAULT_FRAMES_IN_FLIGHT = 3;
   const DEFAULT_SOFT_BUDGET_BYTES = 512 * 1024 * 1024; // 512 MiB
   const DEFAULT_OLDEST_LIVE_LIMIT = 16;
+  const DEFAULT_MAX_CACHED_VIEWS_PER_TEXTURE = 16;
 
   const CREATE_TEXTURE2_OPCODE = 35;
   const CREATE_TEXTURE2_PAYLOAD_BYTES = 40;
@@ -611,7 +612,10 @@
       dimension = '1d';
     } else if (texDimension === '3d') {
       dimension = '3d';
-    } else if (maxArrayLayers !== null && maxArrayLayers > 1 && explicitArrayLayerCount !== 1) {
+    } else if (
+      (maxArrayLayers !== null && maxArrayLayers > 1 && explicitArrayLayerCount !== 1) ||
+      (explicitArrayLayerCount !== null && explicitArrayLayerCount > 1)
+    ) {
       dimension = '2d-array';
     } else {
       dimension = '2d';
@@ -1362,12 +1366,14 @@
         softBudgetBytes = DEFAULT_SOFT_BUDGET_BYTES,
         device = null,
         includeSrgbSiblingViewFormat = false,
+        maxCachedViewsPerTexture = DEFAULT_MAX_CACHED_VIEWS_PER_TEXTURE,
         onBudgetWarning = null,
         onDestroyError = null,
         onSanitizeWarning = null,
       } = options;
 
       assertPositiveInteger(framesInFlight, 'framesInFlight');
+      assertPositiveInteger(maxCachedViewsPerTexture, 'maxCachedViewsPerTexture');
 
       let resolvedBudget = null;
       if (softBudgetBytes !== null && softBudgetBytes !== Infinity) {
@@ -1392,6 +1398,7 @@
       this.softBudgetBytes = resolvedBudget;
       this.device = device;
       this.includeSrgbSiblingViewFormat = Boolean(includeSrgbSiblingViewFormat);
+      this.maxCachedViewsPerTexture = maxCachedViewsPerTexture;
       this._onBudgetWarning = onBudgetWarning;
       this._onDestroyError = onDestroyError;
       this._onSanitizeWarning = onSanitizeWarning;
@@ -1453,10 +1460,12 @@
       this._mipClampCount = 0;
       this._sampleClampCount = 0;
 
-      // Additive W178 view-cache and texture-recreation telemetry exposed on getStats().
+      // Additive W178/W201 view-cache and texture-recreation telemetry exposed on getStats().
       this._staleViewsInvalidated = 0;
       this._viewCacheHits = 0;
       this._viewCacheMisses = 0;
+      this._viewCacheInvalidations = 0;
+      this._viewCacheEvictions = 0;
       this._textureRecreations = 0;
     }
 
@@ -1622,6 +1631,7 @@
 
       if (invalidatedCount > 0) {
         this._staleViewsInvalidated += invalidatedCount;
+        this._viewCacheInvalidations += invalidatedCount;
       }
       return invalidatedCount;
     }
@@ -1667,7 +1677,16 @@
               : '2d'
       );
 
-      const sizeSource = desc || meta || resource || {};
+      const metaHasSize =
+        meta &&
+        (meta.size !== undefined ||
+          meta.width !== undefined ||
+          meta.height !== undefined ||
+          meta.depthOrArrayLayers !== undefined ||
+          meta.depth_or_layers !== undefined ||
+          meta.depth !== undefined ||
+          meta.arrayLayers !== undefined);
+      const sizeSource = desc || (metaHasSize ? meta : resource) || {};
       const extractedSize = extractTextureSize(sizeSource, dimension);
       const mipLevelCount = clampMipLevelCount(
         desc && desc.mipLevelCount !== undefined
@@ -2408,6 +2427,11 @@
       if (perTexCache && perTexCache.has(cacheKey)) {
         const cached = perTexCache.get(cacheKey);
         if (cached && cached.textureGeneration === currentGeneration) {
+          // Maintain LRU order so frequently bound default/subresource views stay resident.
+          if (perTexCache.size > 1) {
+            perTexCache.delete(cacheKey);
+            perTexCache.set(cacheKey, cached);
+          }
           this._viewCacheHits += 1;
           return cached.view;
         }
@@ -2420,6 +2444,7 @@
         }
         perTexCache.delete(cacheKey);
         this._staleViewsInvalidated += 1;
+        this._viewCacheInvalidations += 1;
       }
 
       this._viewCacheMisses += 1;
@@ -2438,6 +2463,27 @@
         this._textureViewCache.set(textureId, perTexCache);
       }
 
+      // Enforce bounded per-texture view cache cap (LRU eviction).
+      while (perTexCache.size >= this.maxCachedViewsPerTexture) {
+        const oldestKey = perTexCache.keys().next().value;
+        if (oldestKey === undefined) {
+          break;
+        }
+        perTexCache.delete(oldestKey);
+        this._viewCacheEvictions += 1;
+      }
+
+      const isDefaultView =
+        viewDesc === undefined ||
+        viewDesc === null ||
+        (viewDesc.format === undefined &&
+          viewDesc.dimension === undefined &&
+          viewDesc.baseMipLevel === undefined &&
+          viewDesc.mipLevelCount === undefined &&
+          viewDesc.baseArrayLayer === undefined &&
+          viewDesc.arrayLayerCount === undefined &&
+          viewDesc.aspect === undefined);
+
       const descriptorSnapshot = {
         format: normalized.format,
         dimension: normalized.dimension,
@@ -2455,6 +2501,7 @@
         textureGeneration: currentGeneration,
         descriptor: descriptorSnapshot,
         createdAtFrame: this._currentFrame,
+        isDefaultView,
       });
 
       this._viewMetadata.set(view, {
@@ -2463,10 +2510,23 @@
         key: cacheKey,
         descriptor: descriptorSnapshot,
         invalidated: false,
-        isDefaultView: false,
+        isDefaultView,
       });
 
       return view;
+    }
+
+    /**
+     * Look up or lazily create and cache the default `GPUTextureView` for
+     * `textureId`, sharing the canonical default cache entry with
+     * `getTextureView(textureId)`.
+     *
+     * @param {number} textureId
+     * @param {{ allowUndeclaredSibling?: boolean }} [options]
+     * @returns {object | undefined}
+     */
+    getDefaultTextureView(textureId, options = {}) {
+      return this.getTextureView(textureId, undefined, options);
     }
 
     /**
@@ -2999,6 +3059,9 @@
         staleViewsInvalidated: this._staleViewsInvalidated,
         viewCacheHits: this._viewCacheHits,
         viewCacheMisses: this._viewCacheMisses,
+        viewCacheInvalidations: this._viewCacheInvalidations,
+        viewCacheEvictions: this._viewCacheEvictions,
+        maxCachedViewsPerTexture: this.maxCachedViewsPerTexture,
         textureRecreations: this._textureRecreations,
         cachedViewCount,
       };
@@ -3053,6 +3116,7 @@
       }
       if (invalidatedViews > 0) {
         this._staleViewsInvalidated += invalidatedViews;
+        this._viewCacheInvalidations += invalidatedViews;
       }
       this._textureViewCache.clear();
       this._linkedViewHandlesByTexture.clear();
@@ -3101,6 +3165,7 @@
   const exportsObj = Object.freeze({
     DEFAULT_FRAMES_IN_FLIGHT,
     DEFAULT_SOFT_BUDGET_BYTES,
+    DEFAULT_MAX_CACHED_VIEWS_PER_TEXTURE,
     CREATE_TEXTURE2_OPCODE,
     CREATE_TEXTURE2_PAYLOAD_BYTES,
     MAX_TEXTURE_VIEW_FORMATS,
@@ -3150,6 +3215,7 @@
     module.exports = {
       DEFAULT_FRAMES_IN_FLIGHT,
       DEFAULT_SOFT_BUDGET_BYTES,
+      DEFAULT_MAX_CACHED_VIEWS_PER_TEXTURE,
       CREATE_TEXTURE2_OPCODE,
       CREATE_TEXTURE2_PAYLOAD_BYTES,
       MAX_TEXTURE_VIEW_FORMATS,

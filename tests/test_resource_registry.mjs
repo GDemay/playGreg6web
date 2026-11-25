@@ -12,6 +12,7 @@ const registryCjs = require('../web/workers/resource_registry.js');
 const {
   DEFAULT_FRAMES_IN_FLIGHT,
   DEFAULT_SOFT_BUDGET_BYTES,
+  DEFAULT_MAX_CACHED_VIEWS_PER_TEXTURE,
   CREATE_TEXTURE2_OPCODE,
   CREATE_TEXTURE2_PAYLOAD_BYTES,
   MAX_TEXTURE_VIEW_FORMATS,
@@ -2129,4 +2130,382 @@ test('W178 direct register(RESOURCE_KIND.TEXTURE, ...) populates descriptor view
   assert.equal(reg.getTextureViewInfo(null), null);
   assert.equal(reg.isTextureViewValid(null), false);
   assert.equal(reg.isTextureViewValid({}), false);
+});
+
+// ---------------------------------------------------------------------------
+// W201: Bounded per-texture GPUTextureView cache (default + subresource views,
+// LRU eviction at per-texture cap, exact key differentiation, invalidation on
+// replacement/retire/destroy, and viewCacheHits/Misses/Invalidations telemetry).
+// ---------------------------------------------------------------------------
+
+test('W201 default and subresource GPUTextureView reuse avoids redundant createView() in hot draw loops', () => {
+  assert.equal(DEFAULT_MAX_CACHED_VIEWS_PER_TEXTURE, 16);
+  assert.equal(globalThis.PlayGta6ResourceRegistry.DEFAULT_MAX_CACHED_VIEWS_PER_TEXTURE, 16);
+
+  // Invalid maxCachedViewsPerTexture constructor values are rejected.
+  assert.throws(() => new GpuResourceRegistry({ maxCachedViewsPerTexture: 0 }), RangeError);
+  assert.throws(() => new GpuResourceRegistry({ maxCachedViewsPerTexture: -4 }), RangeError);
+  assert.throws(() => new GpuResourceRegistry({ maxCachedViewsPerTexture: 2.5 }), RangeError);
+
+  const reg = new GpuResourceRegistry({ framesInFlight: 2 });
+  const initStats = reg.getStats();
+  assert.equal(initStats.viewCacheHits, 0);
+  assert.equal(initStats.viewCacheMisses, 0);
+  assert.equal(initStats.viewCacheInvalidations, 0);
+  assert.equal(initStats.viewCacheEvictions, 0);
+  assert.equal(initStats.maxCachedViewsPerTexture, 16);
+
+  let createViewCount = 0;
+  const tex = {
+    format: 'rgba8unorm',
+    width: 512,
+    height: 512,
+    depthOrArrayLayers: 6,
+    mipLevelCount: 6,
+    dimension: '2d',
+    viewFormats: ['rgba8unorm-srgb'],
+    destroyCount: 0,
+    createView(desc) {
+      createViewCount += 1;
+      return { id: createViewCount, desc: desc ? { ...desc } : null };
+    },
+    destroy() {
+      this.destroyCount += 1;
+    },
+  };
+
+  reg.register(RESOURCE_KIND.TEXTURE, 42, tex, { byteSize: 512 * 512 * 4 * 6 });
+
+  // Default view via getDefaultTextureView, getTextureView(id), null, {}, and explicit canonical descriptor all share 1 cached view.
+  const defView = reg.getDefaultTextureView(42);
+  assert.ok(defView);
+  assert.equal(createViewCount, 1);
+  assert.equal(reg.getTextureViewInfo(defView).isDefaultView, true);
+
+  assert.equal(reg.getTextureView(42), defView);
+  assert.equal(reg.getTextureView(42, null), defView);
+  assert.equal(reg.getTextureView(42, {}), defView);
+  assert.equal(reg.getTextureView(42, { label: 'different-debug-label' }), defView);
+  assert.equal(
+    reg.getTextureView(42, {
+      format: 'RGBA8UNORM',
+      dimension: '2D-ARRAY',
+      baseMipLevel: 0,
+      mipLevelCount: 6,
+      baseArrayLayer: 0,
+      arrayLayerCount: 6,
+      aspect: 'ALL',
+    }),
+    defView
+  );
+  assert.equal(createViewCount, 1);
+
+  // Simulate a hot draw loop binding default SRV + 2 subresource RTV/UAV views 100 times.
+  const rtvMip1Layer2Desc = {
+    dimension: '2d',
+    baseMipLevel: 1,
+    mipLevelCount: 1,
+    baseArrayLayer: 2,
+    arrayLayerCount: 1,
+  };
+  const srgbCubeDesc = {
+    format: 'rgba8unorm-srgb',
+    dimension: 'cube',
+    baseMipLevel: 0,
+    mipLevelCount: 6,
+    baseArrayLayer: 0,
+    arrayLayerCount: 6,
+  };
+
+  const rtvView = reg.getTextureView(42, rtvMip1Layer2Desc);
+  const cubeView = reg.getTextureView(42, srgbCubeDesc);
+  assert.notEqual(rtvView, defView);
+  assert.notEqual(cubeView, defView);
+  assert.notEqual(rtvView, cubeView);
+  assert.equal(createViewCount, 3);
+
+  for (let i = 0; i < 100; i += 1) {
+    assert.equal(reg.getDefaultTextureView(42), defView);
+    assert.equal(reg.getTextureView(42, rtvMip1Layer2Desc), rtvView);
+    assert.equal(reg.getTextureView(42, srgbCubeDesc), cubeView);
+  }
+  assert.equal(createViewCount, 3);
+
+  const stats = reg.getStats();
+  assert.equal(stats.viewCacheMisses, 3);
+  assert.equal(stats.viewCacheHits, 5 + 300);
+  assert.equal(stats.viewCacheInvalidations, 0);
+  assert.equal(stats.viewCacheEvictions, 0);
+  assert.equal(stats.cachedViewCount, 3);
+});
+
+test('W201 exact key differentiation across mip, layer, format, dimension, and aspect', () => {
+  const reg = new GpuResourceRegistry();
+
+  // 1. Multi-mip, multi-layer color texture with sRGB sibling
+  let seq = 0;
+  const colorTex = {
+    format: 'rgba8unorm',
+    width: 128,
+    height: 128,
+    depthOrArrayLayers: 6,
+    mipLevelCount: 4,
+    dimension: '2d',
+    viewFormats: ['rgba8unorm-srgb'],
+    createView(desc) {
+      seq += 1;
+      return { seq, desc: { ...desc } };
+    },
+  };
+  reg.register(RESOURCE_KIND.TEXTURE, 1, colorTex);
+
+  const vBase = reg.getTextureView(1, { dimension: '2d', baseMipLevel: 0, mipLevelCount: 1, baseArrayLayer: 0, arrayLayerCount: 1, format: 'rgba8unorm', aspect: 'all' });
+  const vDiffBaseMip = reg.getTextureView(1, { dimension: '2d', baseMipLevel: 1, mipLevelCount: 1, baseArrayLayer: 0, arrayLayerCount: 1, format: 'rgba8unorm', aspect: 'all' });
+  const vDiffMipCount = reg.getTextureView(1, { dimension: '2d', baseMipLevel: 0, mipLevelCount: 2, baseArrayLayer: 0, arrayLayerCount: 1, format: 'rgba8unorm', aspect: 'all' });
+  const vDiffBaseLayer = reg.getTextureView(1, { dimension: '2d', baseMipLevel: 0, mipLevelCount: 1, baseArrayLayer: 1, arrayLayerCount: 1, format: 'rgba8unorm', aspect: 'all' });
+  const vDiffLayerCount = reg.getTextureView(1, { dimension: '2d-array', baseMipLevel: 0, mipLevelCount: 1, baseArrayLayer: 0, arrayLayerCount: 2, format: 'rgba8unorm', aspect: 'all' });
+  const vDiffDimension = reg.getTextureView(1, { dimension: '2d-array', baseMipLevel: 0, mipLevelCount: 1, baseArrayLayer: 0, arrayLayerCount: 1, format: 'rgba8unorm', aspect: 'all' });
+  const vDiffCube = reg.getTextureView(1, { dimension: 'cube', baseMipLevel: 0, mipLevelCount: 1, baseArrayLayer: 0, arrayLayerCount: 6, format: 'rgba8unorm', aspect: 'all' });
+  const vDiffFormat = reg.getTextureView(1, { dimension: '2d', baseMipLevel: 0, mipLevelCount: 1, baseArrayLayer: 0, arrayLayerCount: 1, format: 'rgba8unorm-srgb', aspect: 'all' });
+
+  const distinctColorViews = [
+    vBase,
+    vDiffBaseMip,
+    vDiffMipCount,
+    vDiffBaseLayer,
+    vDiffLayerCount,
+    vDiffDimension,
+    vDiffCube,
+    vDiffFormat,
+  ];
+  assert.equal(new Set(distinctColorViews).size, distinctColorViews.length);
+  assert.equal(seq, 8);
+
+  // Numeric format code 23 ('rgba8unorm-srgb') hits the same entry as string 'rgba8unorm-srgb'.
+  assert.equal(
+    reg.getTextureView(1, { dimension: '2d', baseMipLevel: 0, mipLevelCount: 1, baseArrayLayer: 0, arrayLayerCount: 1, format: 23, aspect: 'all' }),
+    vDiffFormat
+  );
+  assert.equal(seq, 8);
+
+  // 2. Depth-stencil texture: aspect differentiates 'all', 'depth-only', 'stencil-only'.
+  const dsTex = {
+    format: 'depth32float-stencil8',
+    width: 256,
+    height: 256,
+    depthOrArrayLayers: 1,
+    mipLevelCount: 1,
+    dimension: '2d',
+    createView(desc) {
+      seq += 1;
+      return { seq, desc: { ...desc } };
+    },
+  };
+  reg.register(RESOURCE_KIND.TEXTURE, 2, dsTex);
+
+  const vDsAll = reg.getTextureView(2, { aspect: 'all' });
+  const vDsDepth = reg.getTextureView(2, { aspect: 'depth-only' });
+  const vDsStencil = reg.getTextureView(2, { aspect: 'stencil-only' });
+  assert.equal(new Set([vDsAll, vDsDepth, vDsStencil]).size, 3);
+  assert.equal(vDsDepth.desc.aspect, 'depth-only');
+  assert.equal(vDsStencil.desc.aspect, 'stencil-only');
+  assert.equal(seq, 11);
+
+  // 3. Formatless bare mock texture still infers '2d-array' when arrayLayerCount > 1 and caches cleanly.
+  const bareTex = {
+    createView(desc) {
+      seq += 1;
+      return { seq, desc: { ...desc } };
+    },
+  };
+  reg.register(RESOURCE_KIND.TEXTURE, 3, bareTex);
+  const vBareSingle = reg.getTextureView(3, { baseArrayLayer: 0, arrayLayerCount: 1 });
+  const vBareArray = reg.getTextureView(3, { baseArrayLayer: 0, arrayLayerCount: 4 });
+  assert.equal(vBareSingle.desc.dimension, '2d');
+  assert.equal(vBareArray.desc.dimension, '2d-array');
+  assert.notEqual(vBareSingle, vBareArray);
+  assert.equal(reg.getTextureView(3, { dimension: '2d-array', baseArrayLayer: 0, arrayLayerCount: 4 }), vBareArray);
+
+  const stats = reg.getStats();
+  assert.equal(stats.viewCacheMisses, 13);
+  assert.equal(stats.viewCacheHits, 2);
+  assert.equal(stats.cachedViewCount, 13);
+});
+
+test('W201 bounded per-texture view cache cap (default 16 & custom cap) uses LRU eviction without cross-texture interference', () => {
+  const makeArrayTex = (layers) => {
+    let calls = 0;
+    return {
+      format: 'rgba8unorm',
+      width: 64,
+      height: 64,
+      depthOrArrayLayers: layers,
+      mipLevelCount: 1,
+      dimension: '2d',
+      get createViewCalls() {
+        return calls;
+      },
+      createView(desc) {
+        calls += 1;
+        return { call: calls, desc: { ...desc } };
+      },
+    };
+  };
+
+  // 1. Default per-texture cap is 16: creating 24 distinct layer views caps cache at 16 with 8 evictions.
+  const defaultReg = new GpuResourceRegistry();
+  const texDefault = makeArrayTex(32);
+  defaultReg.register(RESOURCE_KIND.TEXTURE, 1, texDefault);
+
+  for (let layer = 0; layer < 24; layer += 1) {
+    defaultReg.getTextureView(1, { dimension: '2d', baseArrayLayer: layer, arrayLayerCount: 1 });
+  }
+  assert.equal(defaultReg.getCachedTextureViews(1).length, 16);
+  let stats = defaultReg.getStats();
+  assert.equal(stats.cachedViewCount, 16);
+  assert.equal(stats.viewCacheMisses, 24);
+  assert.equal(stats.viewCacheEvictions, 8);
+  assert.equal(stats.viewCacheInvalidations, 0);
+
+  // 2. Custom cap of 3 with LRU promotion: hot default view survives while cold view is evicted.
+  const reg = new GpuResourceRegistry({ maxCachedViewsPerTexture: 3 });
+  const texA = makeArrayTex(8);
+  const texB = makeArrayTex(4);
+  reg.register(RESOURCE_KIND.TEXTURE, 10, texA);
+  reg.register(RESOURCE_KIND.TEXTURE, 20, texB);
+
+  const vDef = reg.getDefaultTextureView(10); // LRU order: [def]
+  const vL0 = reg.getTextureView(10, { dimension: '2d', baseArrayLayer: 0, arrayLayerCount: 1 }); // [def, L0]
+  const vL1 = reg.getTextureView(10, { dimension: '2d', baseArrayLayer: 1, arrayLayerCount: 1 }); // [def, L0, L1]
+  assert.equal(reg.getCachedTextureViews(10).length, 3);
+
+  // Touch vDef so it becomes MRU; L0 is now the least recently used entry.
+  assert.equal(reg.getDefaultTextureView(10), vDef); // [L0, L1, def]
+
+  // Inserting L2 must evict L0 (coldest), keeping L1 and def resident!
+  const vL2 = reg.getTextureView(10, { dimension: '2d', baseArrayLayer: 2, arrayLayerCount: 1 }); // [L1, def, L2]
+  assert.equal(reg.getCachedTextureViews(10).length, 3);
+  assert.equal(reg.getStats().viewCacheEvictions, 1);
+
+  // Evicted view vL0 is still valid on the live texture generation until texture is replaced/retired.
+  assert.equal(reg.isTextureViewValid(vL0), true);
+
+  // Re-accessing def, L1, L2 are all cache hits (zero extra createView calls).
+  const callsBeforeHits = texA.createViewCalls;
+  assert.equal(reg.getDefaultTextureView(10), vDef);
+  assert.equal(reg.getTextureView(10, { dimension: '2d', baseArrayLayer: 1, arrayLayerCount: 1 }), vL1);
+  assert.equal(reg.getTextureView(10, { dimension: '2d', baseArrayLayer: 2, arrayLayerCount: 1 }), vL2);
+  assert.equal(texA.createViewCalls, callsBeforeHits);
+
+  // Re-accessing evicted L0 is a cache miss and creates a fresh view (evicting def? no, def was touched first so order is [def, L1, L2] -> evicts def? wait: def touched, then L1, then L2 -> def is oldest!).
+  // First touch def again so L1 is oldest, then re-fetch L0.
+  assert.equal(reg.getDefaultTextureView(10), vDef); // [L1, L2, def]
+  const vL0Recreated = reg.getTextureView(10, { dimension: '2d', baseArrayLayer: 0, arrayLayerCount: 1 });
+  assert.notEqual(vL0Recreated, vL0);
+  assert.equal(texA.createViewCalls, callsBeforeHits + 1);
+  assert.equal(reg.getCachedTextureViews(10).length, 3);
+
+  // Separate texture handle 20 has its own independent cap of 3.
+  const vB0 = reg.getDefaultTextureView(20);
+  const vB1 = reg.getTextureView(20, { dimension: '2d', baseArrayLayer: 0, arrayLayerCount: 1 });
+  assert.equal(reg.getCachedTextureViews(20).length, 2);
+  assert.equal(reg.getCachedTextureViews(10).length, 3);
+  assert.equal(reg.getDefaultTextureView(20), vB0);
+  assert.equal(reg.getTextureView(20, { dimension: '2d', baseArrayLayer: 0, arrayLayerCount: 1 }), vB1);
+  assert.equal(reg.getStats().cachedViewCount, 5);
+});
+
+test('W201 invalidation clears cached views and updates viewCacheInvalidations on replace, retire, retireHandle, and destroyAll', () => {
+  const reg = new GpuResourceRegistry({ framesInFlight: 2 });
+  let viewSeq = 0;
+  const makeTex = (name) => ({
+    name,
+    format: 'rgba8unorm',
+    width: 128,
+    height: 128,
+    depthOrArrayLayers: 2,
+    mipLevelCount: 3,
+    dimension: '2d',
+    destroyCount: 0,
+    createView(desc) {
+      viewSeq += 1;
+      return { viewSeq, owner: name, desc: { ...desc } };
+    },
+    destroy() {
+      this.destroyCount += 1;
+    },
+  });
+
+  // 1. Replacement via register(TEXTURE, handle, newTex) clears old views and bumps viewCacheInvalidations.
+  const tex1a = makeTex('t1a');
+  const tex1b = makeTex('t1b');
+  reg.register(RESOURCE_KIND.TEXTURE, 1, tex1a);
+  const v1aDef = reg.getDefaultTextureView(1);
+  const v1aMip1 = reg.getTextureView(1, { dimension: '2d', baseMipLevel: 1, mipLevelCount: 1 });
+  assert.equal(reg.getStats().cachedViewCount, 2);
+  assert.equal(reg.getStats().viewCacheInvalidations, 0);
+
+  reg.register(RESOURCE_KIND.TEXTURE, 1, tex1b);
+  assert.equal(reg.isTextureViewValid(v1aDef), false);
+  assert.equal(reg.isTextureViewValid(v1aMip1), false);
+  assert.equal(reg.getCachedTextureViews(1).length, 0);
+  assert.equal(reg.getStats().viewCacheInvalidations, 2);
+  assert.equal(reg.getStats().staleViewsInvalidated, 2);
+
+  const v1bDef = reg.getDefaultTextureView(1);
+  assert.equal(v1bDef.owner, 't1b');
+  assert.notEqual(v1bDef, v1aDef);
+  assert.equal(reg.isTextureViewValid(v1bDef), true);
+
+  // 2. retireHandle(1) clears cached views for handle 1 immediately.
+  assert.equal(reg.retireHandle(1), 1);
+  assert.equal(reg.isTextureViewValid(v1bDef), false);
+  assert.equal(reg.getDefaultTextureView(1), undefined);
+  assert.equal(reg.getStats().viewCacheInvalidations, 3);
+  assert.equal(reg.getStats().cachedViewCount, 0);
+
+  // Collecting the retired textures does NOT double-count invalidations.
+  reg.beginFrame(1);
+  reg.beginFrame(2);
+  assert.equal(tex1a.destroyCount, 1);
+  assert.equal(tex1b.destroyCount, 1);
+  assert.equal(reg.getStats().viewCacheInvalidations, 3);
+
+  // 3. destroyAll() clears cached views across all live textures and updates viewCacheInvalidations once.
+  const tex2 = makeTex('t2');
+  const tex3 = makeTex('t3');
+  reg.register(RESOURCE_KIND.TEXTURE, 2, tex2);
+  reg.register(RESOURCE_KIND.TEXTURE, 3, tex3);
+  const v2a = reg.getDefaultTextureView(2);
+  const v2b = reg.getTextureView(2, { dimension: '2d', baseMipLevel: 2, mipLevelCount: 1 });
+  const v3a = reg.getDefaultTextureView(3);
+  assert.equal(reg.getStats().cachedViewCount, 3);
+
+  reg.destroyAll();
+  assert.equal(reg.isTextureViewValid(v2a), false);
+  assert.equal(reg.isTextureViewValid(v2b), false);
+  assert.equal(reg.isTextureViewValid(v3a), false);
+  assert.equal(reg.getStats().cachedViewCount, 0);
+  assert.equal(reg.getStats().viewCacheInvalidations, 6);
+
+  // Idempotent second destroyAll() does not increment viewCacheInvalidations.
+  reg.destroyAll();
+  assert.equal(reg.getStats().viewCacheInvalidations, 6);
+
+  // Classic-worker importScripts exposes DEFAULT_MAX_CACHED_VIEWS_PER_TEXTURE cleanly with zero top-level leaks.
+  const sandbox = { console, TextEncoder, TextDecoder };
+  const vmCtx = vm.createContext(sandbox);
+  vmCtx.self = vmCtx;
+  vmCtx.importScripts = (...urls) => {
+    for (const rel of urls) {
+      const fullPath = path.resolve(WORKERS_DIR, rel);
+      const source = readFileSync(fullPath, 'utf8');
+      vm.runInContext(source, vmCtx, { filename: fullPath });
+    }
+  };
+  vmCtx.importScripts('./resource_registry.js');
+  assert.doesNotThrow(() => {
+    vm.runInContext('const DEFAULT_MAX_CACHED_VIEWS_PER_TEXTURE = 0;', vmCtx);
+  });
+  assert.equal(vmCtx.PlayGta6ResourceRegistry.DEFAULT_MAX_CACHED_VIEWS_PER_TEXTURE, 16);
 });
