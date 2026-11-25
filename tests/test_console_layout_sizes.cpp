@@ -84,10 +84,51 @@ void test_sizes() {
     CHECK(dg::resource_size_estimate(buffer) == 1000u);
 }
 
+dg::GuestResourceDesc small(uint64_t w, uint32_t h, uint16_t mips, uint32_t format, uint64_t alignment) {
+    dg::GuestResourceDesc t = texture(3, w, h, 1, mips, format, 0);
+    t.Alignment = alignment;
+    return t;
+}
+
+// D3D12 small-resource placement (4 KiB alignment, layout UNKNOWN): 4 KiB swizzle blocks while
+// the surface fits in 64 KiB, else the 64 KiB default.
+void test_small_placement() {
+    // 128x4 R16G16B16A16_UNORM (8 B texels): 4 KiB blocks of 32x16 texels -> 4 blocks = 16 KiB,
+    // though the texels alone are 4 KiB.
+    dg::ResourceAllocation a = dg::resource_allocation(small(128, 4, 1, 11, 4096));
+    CHECK(a.size == 0x4000u && a.alignment == 0x1000u);
+    CHECK(dg::resource_size_estimate(small(128, 4, 1, 11, 4096)) == 0x4000u);
+    const gfx10::TextureLayoutDesc sw4{11u, 128u, 4u, 1u, 1u, 0x105u, 0u};
+    CHECK(gfx10::surface_bytes(sw4) == 0x4000u);
+    // 32x16 RGBA8: one 32x32 block of 4 KiB.
+    a = dg::resource_allocation(small(32, 16, 1, 28, 4096));
+    CHECK(a.size == 0x1000u && a.alignment == 0x1000u);
+    // 64x64 RGBA8 with mips: the SW_4KB_S chain, still within 64 KiB.
+    const gfx10::TextureLayoutDesc chain{28u, 64u, 64u, 1u, 7u, 0x105u, 0u};
+    a = dg::resource_allocation(small(64, 64, 7, 28, 4096));
+    CHECK(a.alignment == 0x1000u && a.size == gfx10::surface_bytes(chain) && a.size <= 0x10000u);
+    // 256x256 RGBA8 does not fit in 64 KiB: the 64 KiB default (linear estimate, aligned).
+    a = dg::resource_allocation(small(256, 256, 1, 28, 4096));
+    CHECK(a.alignment == 0x10000u && a.size == 0x40000u);
+    // Alignment 0 is unchanged: 64 KiB, linear estimate.
+    a = dg::resource_allocation(small(128, 4, 1, 11, 0));
+    CHECK(a.alignment == 0x10000u && a.size == 0x10000u);
+    CHECK(dg::resource_size_estimate(small(128, 4, 1, 11, 0)) == 4096u);
+    // MSAA and explicit console layouts keep their own answers.
+    dg::GuestResourceDesc msaa = small(32, 16, 1, 28, 4096);
+    msaa.SampleCount = 4;
+    CHECK(dg::resource_allocation(msaa).alignment == 0x1000u);
+    dg::GuestResourceDesc linear = small(128, 4, 1, 11, 4096);
+    linear.Layout = 0x100;
+    a = dg::resource_allocation(linear);
+    CHECK(a.alignment == 0x1000u && a.size == ((dg::resource_size_estimate(linear) + 0xFFFu) & ~0xFFFull));
+}
+
 }  // namespace
 
 int main() {
     test_sizes();
+    test_small_placement();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_console_layout_sizes: %d failure(s)\n", g_failures);
         return 1;

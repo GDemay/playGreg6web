@@ -1273,8 +1273,19 @@ struct DxgiFormatLayout {
 DxgiFormatLayout dxgi_format_layout(uint32_t format);
 // Bytes per element of `plane` (depth-stencil formats: 4-byte depth plane, 1-byte stencil plane).
 uint32_t plane_block_bytes(uint32_t format, uint32_t plane);
-// Linear size of a resource's subresources (no tiling or alignment padding).
+// Size of a resource's subresources: the GFX10 placement for verified console layouts and for
+// small-placement textures (see resource_allocation), otherwise the linear size (no tiling or
+// alignment padding).
 uint64_t resource_size_estimate(const GuestResourceDesc& desc);
+// GetResourceAllocationInfo's answer for one description. A Texture2D with layout UNKNOWN that
+// asks for the 4 KiB small-resource alignment is sized in 4 KiB swizzle blocks (SW_4KB_S) and
+// keeps 4 KiB only while that surface fits in 64 KiB; otherwise the answer is the 64 KiB default
+// (the title then repeats the query with alignment 0, as D3D12 applications do).
+struct ResourceAllocation {
+    uint64_t size = 0;
+    uint64_t alignment = 0;
+};
+ResourceAllocation resource_allocation(const GuestResourceDesc& desc);
 
 // Process-wide totals of the work the title records, by outcome (monotonic; sampled per Present).
 // A draw is "issued" when the title records it and ends in exactly one of: emitted (a packet),
