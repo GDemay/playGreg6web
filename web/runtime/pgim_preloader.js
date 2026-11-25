@@ -58,23 +58,214 @@
   const DEFAULT_CONCURRENCY = 4;
   const DEFAULT_MAX_RETRIES = 3;
   const DEFAULT_BASE_RETRY_DELAY_MS = 50;
+  const DEFAULT_MAX_RETRY_DELAY_MS = 30000;
 
-  function defaultSleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+  function defaultSleep(ms, signal) {
+    if (signal && signal.aborted) {
+      return Promise.reject(abortReason(signal));
+    }
+    const delayMs = Number.isFinite(ms) && ms > 0 ? ms : 0;
+    return new Promise((resolve, reject) => {
+      let onAbort = null;
+      const timer = setTimeout(() => {
+        if (signal && onAbort) signal.removeEventListener('abort', onAbort);
+        resolve();
+      }, delayMs);
+      if (signal) {
+        onAbort = () => {
+          clearTimeout(timer);
+          reject(abortReason(signal));
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+    });
+  }
+
+  function isAbortError(err) {
+    if (!err || typeof err !== 'object') return false;
+    return err.name === 'AbortError' || err.code === 'ABORT_ERR';
   }
 
   function isRetryableHttpStatus(status) {
-    return status === 408 || status === 425 || status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
+    return (
+      status === 408 ||
+      status === 425 ||
+      status === 429 ||
+      (Number.isInteger(status) && status >= 500 && status <= 599)
+    );
   }
 
   function isRetryableNetworkError(err) {
     if (!err || typeof err !== 'object') return false;
-    if (err.name === 'AbortError' || err.name === 'TimeoutError') return false;
+    if (isAbortError(err) || err.name === 'TimeoutError') return false;
     if (err instanceof PgimPreloadError) {
-      return err.code === 'NETWORK_ERROR' || (err.code === 'HTTP_ERROR' && isRetryableHttpStatus(err.status));
+      if (err.code === 'NETWORK_ERROR') {
+        if (err.cause && (isAbortError(err.cause) || err.cause.name === 'TimeoutError')) return false;
+        return true;
+      }
+      return err.code === 'HTTP_ERROR' && isRetryableHttpStatus(err.status);
     }
-    // Fetch network failures typically surface as TypeError.
-    return err.name === 'TypeError' || err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT';
+    // Fetch network failures typically surface as TypeError or socket error codes.
+    return (
+      err.name === 'TypeError' ||
+      err.code === 'ECONNRESET' ||
+      err.code === 'ETIMEDOUT' ||
+      err.code === 'ECONNREFUSED' ||
+      err.code === 'EPIPE' ||
+      err.code === 'EAI_AGAIN'
+    );
+  }
+
+  function sanitizeNonNegativeFinite(value) {
+    return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
+  }
+
+  function sanitizeNonNegativeInt(value) {
+    return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+  }
+
+  function computeBytesPerSec(bytes, elapsedMs) {
+    if (!(typeof bytes === 'number' && Number.isFinite(bytes) && bytes > 0)) return 0;
+    if (!(typeof elapsedMs === 'number' && Number.isFinite(elapsedMs) && elapsedMs > 0)) return 0;
+    const rate = (bytes * 1000) / elapsedMs;
+    return Number.isFinite(rate) && rate > 0 ? rate : 0;
+  }
+
+  function emptyTelemetrySnapshot() {
+    return {
+      state: 'idle',
+      bytesLoaded: 0,
+      totalBytes: 0,
+      requests: 0,
+      durationMs: 0,
+      bytesPerSec: 0,
+      peakBytesPerSec: 0,
+      retryCount: 0,
+      abortedCount: 0,
+    };
+  }
+
+  class TelemetryRun {
+    constructor(nowFn) {
+      this._nowFn = nowFn;
+      this.state = 'loading';
+      this.startedAt = this._readClock();
+      this.lastSampleAt = this.startedAt;
+      this.bytesLoaded = 0;
+      this.totalBytes = 0;
+      this.requests = 0;
+      this.durationMs = 0;
+      this.bytesPerSec = 0;
+      this.peakBytesPerSec = 0;
+      this.retryCount = 0;
+      this.abortedCount = 0;
+      this._abortRecorded = false;
+    }
+
+    _readClock() {
+      let ts;
+      try {
+        ts = this._nowFn();
+      } catch {
+        return 0;
+      }
+      return typeof ts === 'number' && Number.isFinite(ts) ? ts : 0;
+    }
+
+    _elapsedMs(from, to) {
+      const delta = to - from;
+      return Number.isFinite(delta) && delta > 0 ? delta : 0;
+    }
+
+    recordRequest() {
+      this.requests += 1;
+    }
+
+    recordRetry() {
+      this.retryCount += 1;
+    }
+
+    recordAbort() {
+      if (!this._abortRecorded) {
+        this._abortRecorded = true;
+        this.abortedCount += 1;
+      }
+      this.state = 'aborted';
+      const ts = this._readClock();
+      this.durationMs = this._elapsedMs(this.startedAt, ts);
+      const avg = computeBytesPerSec(this.bytesLoaded, this.durationMs);
+      this.bytesPerSec = avg;
+      if (avg > this.peakBytesPerSec) this.peakBytesPerSec = avg;
+    }
+
+    setTotalBytes(totalBytes) {
+      const sanitized = sanitizeNonNegativeInt(totalBytes);
+      if (sanitized > 0) this.totalBytes = sanitized;
+    }
+
+    recordBytes(deltaBytes) {
+      const delta = sanitizeNonNegativeInt(deltaBytes);
+      if (delta <= 0) return;
+      const ts = this._readClock();
+      this.bytesLoaded += delta;
+      const totalElapsed = this._elapsedMs(this.startedAt, ts);
+      const sampleElapsed = this._elapsedMs(this.lastSampleAt, ts);
+      this.durationMs = totalElapsed;
+      const avgRate = computeBytesPerSec(this.bytesLoaded, totalElapsed);
+      const sampleRate = computeBytesPerSec(delta, sampleElapsed);
+      this.bytesPerSec = avgRate;
+      const peakCandidate = Math.max(avgRate, sampleRate);
+      if (peakCandidate > this.peakBytesPerSec) {
+        this.peakBytesPerSec = peakCandidate;
+      }
+      if (ts >= this.lastSampleAt) {
+        this.lastSampleAt = ts;
+      }
+    }
+
+    complete(totalBytes = null) {
+      if (totalBytes !== null && totalBytes !== undefined) {
+        const sanitized = sanitizeNonNegativeInt(totalBytes);
+        if (sanitized > this.totalBytes) this.totalBytes = sanitized;
+      }
+      const ts = this._readClock();
+      this.durationMs = this._elapsedMs(this.startedAt, ts);
+      const avgRate = computeBytesPerSec(this.bytesLoaded, this.durationMs);
+      this.bytesPerSec = avgRate;
+      if (avgRate > this.peakBytesPerSec) {
+        this.peakBytesPerSec = avgRate;
+      }
+      this.state = 'complete';
+    }
+
+    fail() {
+      const ts = this._readClock();
+      this.durationMs = this._elapsedMs(this.startedAt, ts);
+      const avgRate = computeBytesPerSec(this.bytesLoaded, this.durationMs);
+      this.bytesPerSec = avgRate;
+      if (avgRate > this.peakBytesPerSec) {
+        this.peakBytesPerSec = avgRate;
+      }
+      if (this.state !== 'aborted') {
+        this.state = 'error';
+      }
+    }
+
+    snapshot() {
+      const bytesPerSec = sanitizeNonNegativeFinite(this.bytesPerSec);
+      const peakBytesPerSec = sanitizeNonNegativeFinite(Math.max(this.peakBytesPerSec, bytesPerSec));
+      return {
+        state: this.state,
+        bytesLoaded: sanitizeNonNegativeInt(this.bytesLoaded),
+        totalBytes: sanitizeNonNegativeInt(this.totalBytes),
+        requests: sanitizeNonNegativeInt(this.requests),
+        durationMs: sanitizeNonNegativeFinite(this.durationMs),
+        bytesPerSec,
+        peakBytesPerSec,
+        retryCount: sanitizeNonNegativeInt(this.retryCount),
+        abortedCount: sanitizeNonNegativeInt(this.abortedCount),
+      };
+    }
   }
 
   /** Error raised for corrupt/truncated containers and failed transfers. `code` mirrors ImageError. */
@@ -1264,8 +1455,12 @@
    *   chunkSize?: number,
    *   concurrency?: number,
    *   maxRetries?: number,
+   *   retryDelayMs?: number,
    *   baseRetryDelayMs?: number,
-   *   sleep?: (ms: number) => Promise<void>,
+   *   maxRetryDelayMs?: number,
+   *   sleepFn?: (ms: number, signal?: AbortSignal) => Promise<void>,
+   *   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>,
+   *   nowFn?: () => number,
    *   useSharedArrayBuffer?: boolean,
    *   targetBuffer?: ArrayBuffer | SharedArrayBuffer | null,
    * }} [options] With `rangeCache`, image chunks are read through `rangeCache.read(url, ...)`
@@ -1277,8 +1472,12 @@
     chunkSize = DEFAULT_CHUNK_SIZE,
     concurrency = DEFAULT_CONCURRENCY,
     maxRetries = DEFAULT_MAX_RETRIES,
-    baseRetryDelayMs = DEFAULT_BASE_RETRY_DELAY_MS,
-    sleep = defaultSleep,
+    retryDelayMs,
+    baseRetryDelayMs,
+    maxRetryDelayMs,
+    sleepFn,
+    sleep,
+    nowFn = now,
     useSharedArrayBuffer = false,
     targetBuffer = null,
   } = {}) {
@@ -1303,11 +1502,29 @@
     if (!Number.isSafeInteger(maxRetries) || maxRetries < 0) {
       throw new RangeError(`maxRetries must be a non-negative integer, got: ${maxRetries}`);
     }
-    if (!Number.isFinite(baseRetryDelayMs) || baseRetryDelayMs < 0) {
-      throw new RangeError(`baseRetryDelayMs must be a non-negative number, got: ${baseRetryDelayMs}`);
+    const effectiveRetryDelayMs =
+      retryDelayMs !== undefined
+        ? retryDelayMs
+        : baseRetryDelayMs !== undefined
+          ? baseRetryDelayMs
+          : DEFAULT_BASE_RETRY_DELAY_MS;
+    if (!Number.isFinite(effectiveRetryDelayMs) || effectiveRetryDelayMs < 0) {
+      throw new RangeError(`retryDelayMs must be a non-negative number, got: ${effectiveRetryDelayMs}`);
     }
-    if (typeof sleep !== 'function') {
-      throw new TypeError('sleep must be a function');
+    const effectiveMaxRetryDelayMs =
+      maxRetryDelayMs !== undefined
+        ? maxRetryDelayMs
+        : Math.max(DEFAULT_MAX_RETRY_DELAY_MS, effectiveRetryDelayMs);
+    if (!Number.isFinite(effectiveMaxRetryDelayMs) || effectiveMaxRetryDelayMs < 0) {
+      throw new RangeError(`maxRetryDelayMs must be a non-negative number, got: ${effectiveMaxRetryDelayMs}`);
+    }
+    const effectiveSleepFn =
+      sleepFn !== undefined ? sleepFn : sleep !== undefined ? sleep : defaultSleep;
+    if (typeof effectiveSleepFn !== 'function') {
+      throw new TypeError('sleepFn must be a function');
+    }
+    if (typeof nowFn !== 'function') {
+      throw new TypeError('nowFn must be a function');
     }
     if (
       targetBuffer !== null &&
@@ -1320,10 +1537,90 @@
     this.chunkSize = chunkSize;
     this.concurrency = concurrency;
     this.maxRetries = maxRetries;
-    this.baseRetryDelayMs = baseRetryDelayMs;
-    this.sleep = sleep;
+    this.retryDelayMs = effectiveRetryDelayMs;
+    this.baseRetryDelayMs = effectiveRetryDelayMs;
+    this.maxRetryDelayMs = effectiveMaxRetryDelayMs;
+    this.sleepFn = effectiveSleepFn;
+    this.sleep = effectiveSleepFn;
+    this.nowFn = nowFn;
     this.useSharedArrayBuffer = Boolean(useSharedArrayBuffer);
     this.targetBuffer = targetBuffer;
+    this._telemetryRun = null;
+  }
+
+  /**
+   * Return sanitized finite throughput and retry/abort telemetry for the latest preload run.
+   */
+  getStats() {
+    return this._telemetryRun ? this._telemetryRun.snapshot() : emptyTelemetrySnapshot();
+  }
+
+  /**
+   * Alias for `getStats()`, returning a sanitized status snapshot.
+   */
+  getSnapshot() {
+    return this.getStats();
+  }
+
+  /**
+   * Reset all throughput and retry/abort telemetry counters back to idle zeros.
+   */
+  resetStats() {
+    this._telemetryRun = null;
+    return this.getStats();
+  }
+
+  /**
+   * Alias for `resetStats()`.
+   */
+  reset() {
+    return this.resetStats();
+  }
+
+  _now() {
+    let ts;
+    try {
+      ts = this.nowFn();
+    } catch {
+      return 0;
+    }
+    return typeof ts === 'number' && Number.isFinite(ts) ? ts : 0;
+  }
+
+  _elapsedSince(started) {
+    const delta = this._now() - started;
+    return Number.isFinite(delta) && delta > 0 ? delta : 0;
+  }
+
+  _startTelemetryRun() {
+    const run = new TelemetryRun(this.nowFn);
+    this._telemetryRun = run;
+    return run;
+  }
+
+  _finishTelemetryError(run, err, signal) {
+    if (!run) return;
+    if ((signal && signal.aborted) || isAbortError(err)) {
+      run.recordAbort();
+    } else {
+      run.fail();
+    }
+  }
+
+  _computeRetryDelayMs(attempt) {
+    const base = this.retryDelayMs;
+    if (!(base > 0)) return 0;
+    const exp = Math.min(Math.max(0, attempt), 30);
+    const raw = base * Math.pow(2, exp);
+    const cap = this.maxRetryDelayMs;
+    if (!Number.isFinite(raw)) return cap;
+    return Math.min(cap, raw);
+  }
+
+  async _sleepWithAbort(delayMs, signal) {
+    throwIfAborted(signal);
+    await raceAbort(Promise.resolve().then(() => this.sleepFn(delayMs, signal)), signal);
+    throwIfAborted(signal);
   }
 
   /**
@@ -1334,25 +1631,52 @@
    *           signal?: AbortSignal, verifyChecksums?: boolean }} [options]
    */
   async preloadGuestImage(url, { onProgress, signal, verifyChecksums = false } = {}) {
-    return this._preloadGuestImageCore(url, {
-      onProgress,
-      signal,
-      verifyChecksums,
-      precomputedProbe: null,
-      emitProbe: true,
-      emitComplete: true,
-    });
+    if (typeof url !== 'string' || url.length === 0) throw new TypeError('PGIM url must be a non-empty string');
+    const run = this._startTelemetryRun();
+    try {
+      const result = await this._preloadGuestImageCore(url, {
+        onProgress,
+        signal,
+        verifyChecksums,
+        precomputedProbe: null,
+        emitProbe: true,
+        emitComplete: true,
+        telemetryRun: run,
+        ownsTotalBytes: true,
+      });
+      run.complete(result.totalBytes);
+      const stats = run.snapshot();
+      return {
+        ...result,
+        bytesPerSec: stats.bytesPerSec,
+        peakBytesPerSec: stats.peakBytesPerSec,
+        retryCount: stats.retryCount,
+        abortedCount: stats.abortedCount,
+      };
+    } catch (err) {
+      this._finishTelemetryError(run, err, signal);
+      throw err;
+    }
   }
 
   async _preloadGuestImageCore(
     url,
-    { onProgress, signal, verifyChecksums = false, precomputedProbe = null, emitProbe = true, emitComplete = true } = {}
+    {
+      onProgress,
+      signal,
+      verifyChecksums = false,
+      precomputedProbe = null,
+      emitProbe = true,
+      emitComplete = true,
+      telemetryRun = null,
+      ownsTotalBytes = true,
+    } = {}
   ) {
     if (typeof url !== 'string' || url.length === 0) throw new TypeError('PGIM url must be a non-empty string');
     throwIfAborted(signal);
-    const started = now();
+    const started = this._now();
     const emit = makeEmitter(onProgress);
-    const ctx = { url, signal, emit, requests: 0 };
+    const ctx = { url, signal, emit, requests: 0, run: telemetryRun, ownsTotalBytes };
 
     let probe = precomputedProbe;
     if (probe === null) {
@@ -1373,7 +1697,7 @@
 
     const layout = parsePgimLayout(loaded.bytes, { verifyChecksums });
     const totalBytes = loaded.bytes.byteLength;
-    const durationMs = now() - started;
+    const durationMs = this._elapsedSince(started);
     if (emitComplete) emit('complete', totalBytes, totalBytes);
     return {
       bytes: loaded.bytes,
@@ -1409,6 +1733,26 @@
       opts = manifestUrl;
       requestedUrl = opts.programManifestUrl ?? opts.manifestUrl;
     }
+    validateManifestEndpointUrl(requestedUrl, 'program manifest URL');
+    const run = this._startTelemetryRun();
+    try {
+      const result = await this._preloadProgramModulesCore(requestedUrl, opts, run);
+      run.complete(result.totalBytes);
+      const stats = run.snapshot();
+      return {
+        ...result,
+        bytesPerSec: stats.bytesPerSec,
+        peakBytesPerSec: stats.peakBytesPerSec,
+        retryCount: stats.retryCount,
+        abortedCount: stats.abortedCount,
+      };
+    } catch (err) {
+      this._finishTelemetryError(run, err, opts && opts.signal);
+      throw err;
+    }
+  }
+
+  async _preloadProgramModulesCore(requestedUrl, opts = {}, telemetryRun = null) {
     const {
       bootManifestUrl = undefined,
       fallbackPgimUrl = null,
@@ -1420,7 +1764,7 @@
     validateManifestEndpointUrl(requestedUrl, 'program manifest URL');
     throwIfAborted(signal);
 
-    const started = now();
+    const started = this._now();
     let totalRequests = 0;
     const emitEvent = (payload) => {
       if (typeof onProgress === 'function') onProgress(payload);
@@ -1440,7 +1784,7 @@
     });
 
     const fetchManifestBytes = async (url, label) => {
-      const ctx = { url, signal, emit: () => {}, requests: 0 };
+      const ctx = { url, signal, emit: () => {}, requests: 0, run: telemetryRun, ownsTotalBytes: false };
       const response = await this._request(ctx, { method: 'GET' });
       totalRequests += ctx.requests;
       if (!response.ok) throw httpError(url, response.status, label);
@@ -1615,6 +1959,8 @@
           signal: probeController.signal,
           emit: () => {},
           requests: 0,
+          run: telemetryRun,
+          ownsTotalBytes: false,
         };
         try {
           probes[idx] = await this._probe(pCtx);
@@ -1661,6 +2007,9 @@
     let maxEmittedPct = 0;
     const emitAggregate = (phase, moduleIndex, descriptor) => {
       const agg = computeAggregate();
+      if (telemetryRun && agg.totalBytes !== null) {
+        telemetryRun.setTotalBytes(agg.totalBytes);
+      }
       const loadedBytes = Math.max(maxEmittedLoaded, agg.loadedBytes);
       const pct = agg.totalBytes !== null ? Math.max(maxEmittedPct, agg.pct) : maxEmittedPct;
       maxEmittedLoaded = loadedBytes;
@@ -1693,6 +2042,8 @@
         precomputedProbe: probes[i],
         emitProbe: false,
         emitComplete: false,
+        telemetryRun,
+        ownsTotalBytes: false,
         onProgress: (evt) => {
           if (typeof evt.loadedBytes === 'number' && evt.loadedBytes > moduleLoaded[i]) {
             moduleLoaded[i] = evt.loadedBytes;
@@ -1739,7 +2090,7 @@
     }
 
     const totalBytes = loadedModules.reduce((acc, m) => acc + m.totalBytes, 0);
-    const durationMs = now() - started;
+    const durationMs = this._elapsedSince(started);
     const lastIdx = moduleCount - 1;
     const lastDescriptor = descriptors[lastIdx];
     emitEvent({
@@ -1796,6 +2147,10 @@
       shared: result.shared,
       transport: result.transport,
       requests: result.requests,
+      bytesPerSec: result.bytesPerSec,
+      peakBytesPerSec: result.peakBytesPerSec,
+      retryCount: result.retryCount,
+      abortedCount: result.abortedCount,
     };
   }
 
@@ -1807,19 +2162,31 @@
    */
   async preloadShaderPack(url, { onProgress, signal } = {}) {
     if (typeof url !== 'string' || url.length === 0) throw new TypeError('shader pack url must be a non-empty string');
-    throwIfAborted(signal);
-    const started = now();
-    const emit = makeEmitter(onProgress);
-    const bytes = await this._fetchAsset(url, 'WGPK shader pack', signal, emit);
-    const validated = validateWgslPackBytes(bytes, url);
-    return {
-      buffer: validated.buffer.byteLength === validated.byteLength && validated.byteOffset === 0
-        ? validated.buffer
-        : validated.slice().buffer,
-      bytes: validated,
-      bytesLoaded: validated.byteLength,
-      durationMs: now() - started,
-    };
+    const run = this._startTelemetryRun();
+    try {
+      throwIfAborted(signal);
+      const started = this._now();
+      const emit = makeEmitter(onProgress);
+      const bytes = await this._fetchAsset(url, 'WGPK shader pack', signal, emit, run, true);
+      const validated = validateWgslPackBytes(bytes, url);
+      run.complete(validated.byteLength);
+      const stats = run.snapshot();
+      return {
+        buffer: validated.buffer.byteLength === validated.byteLength && validated.byteOffset === 0
+          ? validated.buffer
+          : validated.slice().buffer,
+        bytes: validated,
+        bytesLoaded: validated.byteLength,
+        durationMs: this._elapsedSince(started),
+        bytesPerSec: stats.bytesPerSec,
+        peakBytesPerSec: stats.peakBytesPerSec,
+        retryCount: stats.retryCount,
+        abortedCount: stats.abortedCount,
+      };
+    } catch (err) {
+      this._finishTelemetryError(run, err, signal);
+      throw err;
+    }
   }
 
   /**
@@ -1832,17 +2199,29 @@
     if (typeof url !== 'string' || url.length === 0) {
       throw new TypeError('reflection manifest url must be a non-empty string');
     }
-    throwIfAborted(signal);
-    const started = now();
-    const emit = makeEmitter(onProgress);
-    const bytes = await this._fetchAsset(url, 'reflection manifest', signal, emit);
-    const manifest = parseReflectionManifestJson(bytes, url);
-    return {
-      manifest,
-      bytes,
-      bytesLoaded: bytes.byteLength,
-      durationMs: now() - started,
-    };
+    const run = this._startTelemetryRun();
+    try {
+      throwIfAborted(signal);
+      const started = this._now();
+      const emit = makeEmitter(onProgress);
+      const bytes = await this._fetchAsset(url, 'reflection manifest', signal, emit, run, true);
+      const manifest = parseReflectionManifestJson(bytes, url);
+      run.complete(bytes.byteLength);
+      const stats = run.snapshot();
+      return {
+        manifest,
+        bytes,
+        bytesLoaded: bytes.byteLength,
+        durationMs: this._elapsedSince(started),
+        bytesPerSec: stats.bytesPerSec,
+        peakBytesPerSec: stats.peakBytesPerSec,
+        retryCount: stats.retryCount,
+        abortedCount: stats.abortedCount,
+      };
+    } catch (err) {
+      this._finishTelemetryError(run, err, signal);
+      throw err;
+    }
   }
 
   /**
@@ -1870,133 +2249,162 @@
     if (!hasProgramManifest && !hasPgimUrl) {
       throw new TypeError('pgimUrl or programManifestUrl must be a non-empty string');
     }
-    throwIfAborted(signal);
-    const started = now();
-    const timingMs = { pgim: null, shaderPack: null, reflection: null, total: 0 };
-    const { controller, unlink } = linkSignal(signal);
-    const inner = controller.signal;
-    const timed = async (key, fn) => {
-      const t0 = now();
-      try {
-        return await fn();
-      } finally {
-        timingMs[key] = now() - t0;
-      }
-    };
-    const forward = (asset) =>
-      typeof onProgress === 'function' ? (event) => onProgress({ ...event, asset }) : undefined;
+    const run = this._startTelemetryRun();
+    try {
+      throwIfAborted(signal);
+      const started = this._now();
+      const timingMs = { pgim: null, shaderPack: null, reflection: null, total: 0 };
+      const { controller, unlink } = linkSignal(signal);
+      const inner = controller.signal;
+      const timed = async (key, fn) => {
+        const t0 = this._now();
+        try {
+          return await fn();
+        } finally {
+          timingMs[key] = this._elapsedSince(t0);
+        }
+      };
+      const forward = (asset) =>
+        typeof onProgress === 'function' ? (event) => onProgress({ ...event, asset }) : undefined;
 
-    const optionalAsset = async (key, url, label, validate) => {
-      if (!url) return null;
+      const optionalAsset = async (key, url, label, validate) => {
+        if (!url) return null;
+        try {
+          return await timed(key, async () =>
+            validate(await this._fetchAsset(url, label, inner, makeEmitter(onProgress, { asset: key }), run, false), url)
+          );
+        } catch (err) {
+          if (err instanceof PgimPreloadError && err.code === 'NOT_FOUND') {
+            timingMs[key] = timingMs[key] ?? this._elapsedSince(started);
+            if (typeof onProgress === 'function') {
+              onProgress({ phase: 'optional-missing', asset: key, loadedBytes: 0, totalBytes: 0, pct: 0, status: err.status });
+            }
+            return null;
+          }
+          throw err;
+        }
+      };
+
+      const tasks = [
+        timed('pgim', () =>
+          hasProgramManifest
+            ? this._preloadProgramModulesCore(
+                programManifestUrl,
+                {
+                  bootManifestUrl,
+                  fallbackPgimUrl: hasPgimUrl ? pgimUrl : null,
+                  onProgress: forward('pgim'),
+                  signal: inner,
+                  verifyChecksums,
+                },
+                run
+              )
+            : this._preloadGuestImageCore(pgimUrl, {
+                onProgress: forward('pgim'),
+                signal: inner,
+                verifyChecksums,
+                precomputedProbe: null,
+                emitProbe: true,
+                emitComplete: true,
+                telemetryRun: run,
+                ownsTotalBytes: false,
+              })
+        ),
+        optionalAsset('shaderPack', shaderPackUrl, 'WGPK shader pack', validateWgslPackBytes),
+        optionalAsset('reflection', reflectionUrl, 'reflection manifest', parseReflectionManifestJson),
+      ];
+
+      let results;
       try {
-        return await timed(key, async () =>
-          validate(await this._fetchAsset(url, label, inner, makeEmitter(onProgress, { asset: key })), url)
+        results = await Promise.all(
+          tasks.map((task) =>
+            task.catch((err) => {
+              controller.abort(err);
+              throw err;
+            })
+          )
         );
       } catch (err) {
-        if (err instanceof PgimPreloadError && err.code === 'NOT_FOUND') {
-          timingMs[key] = timingMs[key] ?? now() - started;
-          if (typeof onProgress === 'function') {
-            onProgress({ phase: 'optional-missing', asset: key, loadedBytes: 0, totalBytes: 0, pct: 0, status: err.status });
-          }
-          return null;
-        }
+        throwIfAborted(signal);
         throw err;
+      } finally {
+        unlink();
       }
-    };
+      const [pgimResult, shaderPackBytes, reflectionManifest] = results;
+      timingMs.total = this._elapsedSince(started);
+      run.complete(run.bytesLoaded);
+      const stats = run.snapshot();
 
-    const tasks = [
-      timed('pgim', () =>
-        hasProgramManifest
-          ? this.preloadProgramModules(programManifestUrl, {
-              bootManifestUrl,
-              fallbackPgimUrl: hasPgimUrl ? pgimUrl : null,
-              onProgress: forward('pgim'),
-              signal: inner,
-              verifyChecksums,
-            })
-          : this.preloadPgim(pgimUrl, { onProgress: forward('pgim'), signal: inner, verifyChecksums })
-      ),
-      optionalAsset('shaderPack', shaderPackUrl, 'WGPK shader pack', validateWgslPackBytes),
-      optionalAsset('reflection', reflectionUrl, 'reflection manifest', parseReflectionManifestJson),
-    ];
+      if (hasProgramManifest) {
+        const primary = pgimResult.mainModule;
+        if (typeof onProgress === 'function') {
+          onProgress({
+            phase: 'complete',
+            asset: 'bundle',
+            loadedBytes: pgimResult.bytesLoaded,
+            totalBytes: pgimResult.bytesLoaded,
+            pct: 100,
+            moduleIndex: pgimResult.moduleCount - 1,
+            moduleCount: pgimResult.moduleCount,
+            currentModule: pgimResult.modules[pgimResult.moduleCount - 1].name,
+          });
+        }
+        return {
+          pgim: primary,
+          pgimBytes: primary.bytes,
+          pgimHeader: primary.header,
+          pgimLayout: primary.layout,
+          buffer: primary.buffer,
+          header: primary.header,
+          shared: primary.shared,
+          program: pgimResult,
+          modules: pgimResult.modules,
+          modulesByName: pgimResult.modulesByName,
+          moduleCount: pgimResult.moduleCount,
+          shaderPackBytes,
+          reflectionManifest,
+          timingMs,
+          durationMs: timingMs.total,
+          bytesLoaded: pgimResult.bytesLoaded,
+          bytesPerSec: stats.bytesPerSec,
+          peakBytesPerSec: stats.peakBytesPerSec,
+          retryCount: stats.retryCount,
+          abortedCount: stats.abortedCount,
+        };
+      }
 
-    let results;
-    try {
-      results = await Promise.all(
-        tasks.map((task) =>
-          task.catch((err) => {
-            controller.abort(err);
-            throw err;
-          })
-        )
-      );
-    } catch (err) {
-      throwIfAborted(signal);
-      throw err;
-    } finally {
-      unlink();
-    }
-    const [pgimResult, shaderPackBytes, reflectionManifest] = results;
-    timingMs.total = now() - started;
-
-    if (hasProgramManifest) {
-      const primary = pgimResult.mainModule;
+      const image = pgimResult;
       if (typeof onProgress === 'function') {
         onProgress({
           phase: 'complete',
           asset: 'bundle',
-          loadedBytes: pgimResult.bytesLoaded,
-          totalBytes: pgimResult.bytesLoaded,
+          loadedBytes: image.bytesLoaded,
+          totalBytes: image.bytesLoaded,
           pct: 100,
-          moduleIndex: pgimResult.moduleCount - 1,
-          moduleCount: pgimResult.moduleCount,
-          currentModule: pgimResult.modules[pgimResult.moduleCount - 1].name,
         });
       }
       return {
-        pgim: primary,
-        pgimBytes: primary.bytes,
-        pgimHeader: primary.header,
-        pgimLayout: primary.layout,
-        buffer: primary.buffer,
-        header: primary.header,
-        shared: primary.shared,
-        program: pgimResult,
-        modules: pgimResult.modules,
-        modulesByName: pgimResult.modulesByName,
-        moduleCount: pgimResult.moduleCount,
+        pgim: image,
+        pgimBytes: image.bytes,
+        pgimHeader: image.header,
+        pgimLayout: image.layout,
+        buffer: image.buffer,
+        header: image.header,
+        shared: image.shared,
         shaderPackBytes,
         reflectionManifest,
         timingMs,
         durationMs: timingMs.total,
-        bytesLoaded: pgimResult.bytesLoaded,
+        bytesLoaded: image.bytesLoaded,
+        bytesPerSec: stats.bytesPerSec,
+        peakBytesPerSec: stats.peakBytesPerSec,
+        retryCount: stats.retryCount,
+        abortedCount: stats.abortedCount,
       };
+    } catch (err) {
+      this._finishTelemetryError(run, err, signal);
+      throw err;
     }
-
-    const image = pgimResult;
-    if (typeof onProgress === 'function') {
-      onProgress({
-        phase: 'complete',
-        asset: 'bundle',
-        loadedBytes: image.bytesLoaded,
-        totalBytes: image.bytesLoaded,
-        pct: 100,
-      });
-    }
-    return {
-      pgim: image,
-      pgimBytes: image.bytes,
-      pgimHeader: image.header,
-      pgimLayout: image.layout,
-      buffer: image.buffer,
-      header: image.header,
-      shared: image.shared,
-      shaderPackBytes,
-      reflectionManifest,
-      timingMs,
-      durationMs: timingMs.total,
-      bytesLoaded: image.bytesLoaded,
-    };
   }
 
   async _request(ctx, init, signal = ctx.signal) {
@@ -2004,21 +2412,27 @@
     for (;;) {
       throwIfAborted(signal);
       ctx.requests += 1;
+      if (ctx.run) ctx.run.recordRequest();
       try {
         const response = await raceAbort(
           Promise.resolve().then(() => this.fetchImpl(ctx.url, { ...init, signal })),
           signal
         );
         if (isRetryableHttpStatus(response.status) && attempt < this.maxRetries) {
-          const delayMs = this.baseRetryDelayMs * Math.pow(2, attempt);
-          attempt += 1;
-          await raceAbort(Promise.resolve().then(() => this.sleep(delayMs)), signal);
           throwIfAborted(signal);
+          if (response.body && typeof response.body.cancel === 'function') {
+            response.body.cancel().catch(() => {});
+          }
+          const delayMs = this._computeRetryDelayMs(attempt);
+          attempt += 1;
+          if (ctx.run) ctx.run.recordRetry();
+          await this._sleepWithAbort(delayMs, signal);
           continue;
         }
         return response;
       } catch (err) {
         if (signal && signal.aborted) throw abortReason(signal);
+        if (isAbortError(err)) throw err;
         if (err instanceof PgimPreloadError && err.code !== 'NETWORK_ERROR') throw err;
         const wrapped =
           err instanceof PgimPreloadError
@@ -2029,10 +2443,11 @@
                 { url: ctx.url, cause: err }
               );
         if (attempt < this.maxRetries && isRetryableNetworkError(wrapped)) {
-          const delayMs = this.baseRetryDelayMs * Math.pow(2, attempt);
-          attempt += 1;
-          await raceAbort(Promise.resolve().then(() => this.sleep(delayMs)), signal);
           throwIfAborted(signal);
+          const delayMs = this._computeRetryDelayMs(attempt);
+          attempt += 1;
+          if (ctx.run) ctx.run.recordRetry();
+          await this._sleepWithAbort(delayMs, signal);
           continue;
         }
         throw wrapped;
@@ -2129,6 +2544,10 @@
       }
       const dest = this._allocate(total);
       dest.bytes.set(first, 0);
+      if (ctx.run) {
+        if (ctx.ownsTotalBytes) ctx.run.setTotalBytes(total);
+        ctx.run.recordBytes(first.byteLength);
+      }
       ctx.emit('header', first.byteLength, total);
 
       await this._parallelChunks(ctx, dest.bytes, first.byteLength, async (start, end, signal) => {
@@ -2152,6 +2571,7 @@
       const read = async (offset, length, signal) => {
         throwIfAborted(signal);
         ctx.requests += 1;
+        if (ctx.run) ctx.run.recordRequest();
         return toBytes(await raceAbort(Promise.resolve().then(() => cache.read(ctx.url, offset, length)), signal), 'rangeCache chunk');
       };
       const firstLen = probe.totalBytes !== null ? Math.min(this.chunkSize, probe.totalBytes) : this.chunkSize;
@@ -2163,6 +2583,10 @@
       }
       const dest = this._allocate(total);
       dest.bytes.set(first, 0);
+      if (ctx.run) {
+        if (ctx.ownsTotalBytes) ctx.run.setTotalBytes(total);
+        ctx.run.recordBytes(first.byteLength);
+      }
       ctx.emit('header', first.byteLength, total);
       await this._parallelChunks(ctx, dest.bytes, first.byteLength, (start, end, signal) => read(start, end - start, signal));
       return { ...dest, transport: 'range-cache' };
@@ -2194,6 +2618,7 @@
             }
             dest.set(data, start);
             loaded += data.byteLength;
+            if (ctx.run) ctx.run.recordBytes(data.byteLength);
             ctx.emit('download', loaded, total);
           } catch (err) {
             if (failure === null) {
@@ -2232,6 +2657,10 @@
         }
         const dest = this._allocate(header.fileSize);
         dest.bytes.set(whole, 0);
+        if (ctx.run) {
+          if (ctx.ownsTotalBytes) ctx.run.setTotalBytes(header.fileSize);
+          ctx.run.recordBytes(whole.byteLength);
+        }
         ctx.emit('download', whole.byteLength, header.fileSize);
         return { ...dest, transport: 'full' };
       }
@@ -2271,9 +2700,14 @@
             dest = this._allocate(total);
             for (const part of pending) write(part);
             pending = null;
+            if (ctx.run) {
+              if (ctx.ownsTotalBytes) ctx.run.setTotalBytes(total);
+              ctx.run.recordBytes(loaded);
+            }
             ctx.emit('header', loaded, total);
           } else {
             write(chunk);
+            if (ctx.run) ctx.run.recordBytes(chunk.byteLength);
             ctx.emit('download', loaded, total);
           }
         }
@@ -2299,14 +2733,18 @@
       return { ...dest, transport: 'full' };
     }
 
-    async _fetchAsset(url, what, signal, emit) {
-      const ctx = { url, signal, emit, requests: 0 };
+    async _fetchAsset(url, what, signal, emit, telemetryRun = null, ownsTotalBytes = false) {
+      const ctx = { url, signal, emit, requests: 0, run: telemetryRun, ownsTotalBytes };
       const response = await this._request(ctx, { method: 'GET' });
       if (!response.ok) throw httpError(url, response.status, what);
       const declared = contentLength(response);
       emit('download', 0, declared);
       const bytes = new Uint8Array(await raceAbort(response.arrayBuffer(), signal));
       throwIfAborted(signal);
+      if (telemetryRun) {
+        if (ownsTotalBytes) telemetryRun.setTotalBytes(bytes.byteLength);
+        telemetryRun.recordBytes(bytes.byteLength);
+      }
       emit('complete', bytes.byteLength, bytes.byteLength);
       return bytes;
     }
@@ -2333,8 +2771,12 @@
       chunkSize,
       concurrency,
       maxRetries,
+      retryDelayMs,
       baseRetryDelayMs,
+      maxRetryDelayMs,
+      sleepFn,
       sleep,
+      nowFn,
       useSharedArrayBuffer,
       targetBuffer,
       ...callOptions
@@ -2348,8 +2790,12 @@
             ...(chunkSize !== undefined ? { chunkSize } : {}),
             ...(concurrency !== undefined ? { concurrency } : {}),
             ...(maxRetries !== undefined ? { maxRetries } : {}),
+            ...(retryDelayMs !== undefined ? { retryDelayMs } : {}),
             ...(baseRetryDelayMs !== undefined ? { baseRetryDelayMs } : {}),
+            ...(maxRetryDelayMs !== undefined ? { maxRetryDelayMs } : {}),
+            ...(sleepFn !== undefined ? { sleepFn } : {}),
             ...(sleep !== undefined ? { sleep } : {}),
+            ...(nowFn !== undefined ? { nowFn } : {}),
             ...(useSharedArrayBuffer !== undefined ? { useSharedArrayBuffer } : {}),
             ...(targetBuffer !== undefined ? { targetBuffer } : {}),
           });
