@@ -8,6 +8,9 @@ const binkMod = require('../web/workers/bink_presenter.js');
 
 const {
   DEFAULT_MAX_QUEUE_DEPTH,
+  DEFAULT_MIN_VISIBLE_LUMA,
+  DEFAULT_MIN_VISIBLE_PIXELS,
+  DEFAULT_NONBLACK_GRID_MAX_DIM,
   SPLASH_FRAME_SOURCE,
   PIXEL_FORMAT,
   PIXEL_FORMAT_ID,
@@ -19,6 +22,7 @@ const {
   sanitizeFrameFormat,
   sanitizeChromaOrder,
   sanitizeLoadOp,
+  hasVisibleNonBlackPixels,
   generateDiagnosticSplashFrame,
   SplashFrameBridge,
 } = bridgeMod;
@@ -2003,4 +2007,494 @@ test('W279: resetStats() cleanly resets lifecycle counters without dropping queu
   bridge.dispose();
   assert.equal(bmp2.closeCalls, 1);
   assert.throws(() => bridge.resetStats(), /destroyed/i);
+});
+
+test('W307: hasVisibleNonBlackPixels handles thresholds, Rec.709 luma, ImageData, BGRA8, padded stride, Y8 limited range, and bounds safety', () => {
+  assert.equal(DEFAULT_MIN_VISIBLE_LUMA, 8);
+  assert.equal(DEFAULT_MIN_VISIBLE_PIXELS, 4);
+  assert.equal(DEFAULT_NONBLACK_GRID_MAX_DIM, 64);
+
+  const out = { visible: false, maxLuma: 0, visiblePixels: 0, sampledPixels: 0 };
+
+  // 1) All-black RGBA8 (0, 0, 0, 255) fails with maxLuma === 0.
+  const allBlack = makeRgbaFrame(16, 16, 0);
+  assert.equal(hasVisibleNonBlackPixels(allBlack, 16, 16, { out }), false);
+  assert.equal(out.visible, false);
+  assert.equal(out.maxLuma, 0);
+  assert.equal(out.visiblePixels, 0);
+  assert.equal(out.sampledPixels, 256);
+
+  // 2) Exact minVisibleLuma boundary: (7, 7, 7) is below default 8; (8, 8, 8) meets threshold.
+  const dim7 = makeRgbaFrame(8, 8, 7);
+  assert.equal(hasVisibleNonBlackPixels(dim7, 8, 8, { out }), false);
+  assert.equal(out.maxLuma, 7);
+  assert.equal(out.visiblePixels, 0);
+
+  // Only 3 pixels at luma 8 (< default minVisiblePixels = 4) -> still false.
+  const threeAt8 = makeRgbaFrame(8, 8, 0);
+  for (let i = 0; i < 3; i += 1) {
+    threeAt8[i * 4] = 8;
+    threeAt8[i * 4 + 1] = 8;
+    threeAt8[i * 4 + 2] = 8;
+  }
+  assert.equal(hasVisibleNonBlackPixels(threeAt8, 8, 8, { out }), false);
+  assert.equal(out.maxLuma, 8);
+  assert.equal(out.visiblePixels, 3);
+
+  // 4th pixel at luma 8 meets default minVisiblePixels = 4 -> true.
+  threeAt8[3 * 4] = 8;
+  threeAt8[3 * 4 + 1] = 8;
+  threeAt8[3 * 4 + 2] = 8;
+  assert.equal(hasVisibleNonBlackPixels(threeAt8, 8, 8, { out }), true);
+  assert.equal(out.maxLuma, 8);
+  assert.equal(out.visiblePixels, 4);
+
+  // Custom thresholds: minVisibleLuma: 32 rejects (31,31,31), accepts (32,32,32).
+  assert.equal(
+    hasVisibleNonBlackPixels(makeRgbaFrame(4, 4, 31), 4, 4, { minVisibleLuma: 32 }),
+    false
+  );
+  assert.equal(
+    hasVisibleNonBlackPixels(makeRgbaFrame(4, 4, 32), 4, 4, { minVisibleLuma: 32 }),
+    true
+  );
+  // Custom minVisiblePixels: 1 accepts single bright pixel; 5 rejects 4 bright pixels.
+  const singleBright = makeRgbaFrame(8, 8, 0);
+  singleBright[(4 * 8 + 4) * 4] = 200;
+  singleBright[(4 * 8 + 4) * 4 + 1] = 200;
+  singleBright[(4 * 8 + 4) * 4 + 2] = 200;
+  assert.equal(hasVisibleNonBlackPixels(singleBright, 8, 8, { minVisiblePixels: 1 }), true);
+  assert.equal(hasVisibleNonBlackPixels(threeAt8, 8, 8, { minVisiblePixels: 5 }), false);
+
+  // 3) Rec.709 luma weights & BGRA8 support.
+  const darkGreenFail = new Uint8Array(4 * 4 * 4);
+  for (let i = 0; i < darkGreenFail.length; i += 4) {
+    darkGreenFail[i + 1] = 10; // luma = (183*10 + 128) >> 8 = 7
+    darkGreenFail[i + 3] = 255;
+  }
+  assert.equal(hasVisibleNonBlackPixels(darkGreenFail, 4, 4, { out }), false);
+  assert.equal(out.maxLuma, 7);
+
+  const darkGreenPass = new Uint8Array(4 * 4 * 4);
+  for (let i = 0; i < darkGreenPass.length; i += 4) {
+    darkGreenPass[i + 1] = 11; // luma = (183*11 + 128) >> 8 = 8
+    darkGreenPass[i + 3] = 255;
+  }
+  assert.equal(hasVisibleNonBlackPixels(darkGreenPass, 4, 4, { out }), true);
+  assert.equal(out.maxLuma, 8);
+
+  // BGRA8 swap: pure red in BGRA is [0, 0, 255, 255] -> luma 54 (not blue's 19).
+  const bgraRed = new Uint8Array(4 * 4 * 4);
+  for (let i = 0; i < bgraRed.length; i += 4) {
+    bgraRed[i] = 0;
+    bgraRed[i + 1] = 0;
+    bgraRed[i + 2] = 255;
+    bgraRed[i + 3] = 255;
+  }
+  assert.equal(hasVisibleNonBlackPixels(bgraRed, 4, 4, { bgra: true, out }), true);
+  assert.equal(out.maxLuma, 54);
+
+  // 4) respectAlpha option: transparent white (255,255,255,0) ignored when respectAlpha: true.
+  const transparentWhite = new Uint8Array(4 * 4 * 4);
+  for (let i = 0; i < transparentWhite.length; i += 4) {
+    transparentWhite[i] = 255;
+    transparentWhite[i + 1] = 255;
+    transparentWhite[i + 2] = 255;
+    transparentWhite[i + 3] = 0;
+  }
+  assert.equal(hasVisibleNonBlackPixels(transparentWhite, 4, 4), true);
+  assert.equal(
+    hasVisibleNonBlackPixels(transparentWhite, 4, 4, { respectAlpha: true, out }),
+    false
+  );
+  assert.equal(out.maxLuma, 0);
+
+  // 5) ImageData-like object with Uint8ClampedArray (both (imageData) and (imageData, options) forms).
+  const clamped = new Uint8ClampedArray(8 * 8 * 4);
+  const imageData = { data: clamped, width: 8, height: 8 };
+  assert.equal(hasVisibleNonBlackPixels(imageData), false);
+  clamped.fill(100);
+  assert.equal(hasVisibleNonBlackPixels(imageData), true);
+  assert.equal(hasVisibleNonBlackPixels(imageData, { minVisibleLuma: 101 }), false);
+  assert.equal(hasVisibleNonBlackPixels(imageData, { minVisibleLuma: 100, out }), true);
+  assert.equal(out.maxLuma, 100);
+
+  // 6) Padded strideBytes (256B WebGPU alignment): bright garbage in padding is ignored.
+  const padded = new Uint8Array(256 * 4);
+  for (let row = 0; row < 4; row += 1) {
+    // Active 4 pixels = 16 bytes remain black (0), padding bytes [16..255] are 255.
+    padded.fill(255, row * 256 + 16, (row + 1) * 256);
+  }
+  assert.equal(hasVisibleNonBlackPixels(padded, 4, 4, { strideBytes: 256, out }), false);
+  assert.equal(out.maxLuma, 0);
+
+  // 7) Single-channel Y8 luma plane with limited studio range (Y=16 is black, Y=23 is luma 8).
+  const yLimitedBlack = new Uint8Array(8 * 8).fill(16);
+  assert.equal(
+    hasVisibleNonBlackPixels(yLimitedBlack, 8, 8, {
+      bytesPerPixel: 1,
+      colorRange: COLOR_RANGE.LIMITED,
+      out,
+    }),
+    false
+  );
+  assert.equal(out.maxLuma, 0);
+
+  const yLimitedDim = new Uint8Array(8 * 8).fill(22);
+  assert.equal(
+    hasVisibleNonBlackPixels(yLimitedDim, 8, 8, {
+      bytesPerPixel: 1,
+      colorRange: COLOR_RANGE.LIMITED,
+      out,
+    }),
+    false
+  );
+  assert.equal(out.maxLuma, 7);
+
+  const yLimitedVisible = new Uint8Array(8 * 8).fill(23);
+  assert.equal(
+    hasVisibleNonBlackPixels(yLimitedVisible, 8, 8, {
+      bytesPerPixel: 1,
+      colorRange: COLOR_RANGE.LIMITED,
+      out,
+    }),
+    true
+  );
+  assert.equal(out.maxLuma, 8);
+
+  // 8) Null, zero-dim, empty, and truncated buffers fail safely without throwing.
+  assert.equal(hasVisibleNonBlackPixels(null, 8, 8), false);
+  assert.equal(hasVisibleNonBlackPixels(undefined, 8, 8), false);
+  assert.equal(hasVisibleNonBlackPixels(allBlack, 0, 8), false);
+  assert.equal(hasVisibleNonBlackPixels(allBlack, 8, 0), false);
+  assert.equal(hasVisibleNonBlackPixels(new Uint8Array(0), 8, 8), false);
+  assert.equal(hasVisibleNonBlackPixels(new Uint8Array(10), 8, 8), false);
+
+  // Invalid option values throw RangeError.
+  assert.throws(() => hasVisibleNonBlackPixels(allBlack, 16, 16, { minVisibleLuma: -1 }), RangeError);
+  assert.throws(() => hasVisibleNonBlackPixels(allBlack, 16, 16, { minVisibleLuma: 256 }), RangeError);
+  assert.throws(() => hasVisibleNonBlackPixels(allBlack, 16, 16, { minVisibleLuma: Number.NaN }), RangeError);
+  assert.throws(() => hasVisibleNonBlackPixels(allBlack, 16, 16, { minVisiblePixels: 0 }), RangeError);
+  assert.throws(() => hasVisibleNonBlackPixels(allBlack, 16, 16, { maxGridDim: 0 }), RangeError);
+  assert.throws(() => hasVisibleNonBlackPixels(allBlack, 16, 16, { strideBytes: 16 }), RangeError);
+});
+
+test('W307: hasVisibleNonBlackPixels strided 64x64 grid is deterministic and O(1) fast on 4K frames', () => {
+  const width = 3840;
+  const height = 2160;
+  const rgba4k = new Uint8Array(width * height * 4); // 33.17 MB all-black 4K frame
+
+  const out1 = { visible: false, maxLuma: 0, visiblePixels: 0, sampledPixels: 0 };
+  const out2 = { visible: false, maxLuma: 0, visiblePixels: 0, sampledPixels: 0 };
+
+  assert.equal(hasVisibleNonBlackPixels(rgba4k, width, height, { out: out1 }), false);
+  assert.equal(hasVisibleNonBlackPixels(rgba4k, width, height, { out: out2 }), false);
+
+  // Strictly capped at 64x64 = 4096 deterministic samples regardless of 8.3M pixel 4K size.
+  assert.equal(out1.sampledPixels, 4096);
+  assert.deepEqual(out1, out2);
+
+  // Performance sanity: 50 consecutive 4K all-black scans must finish in O(1) time (< 250ms total even on slow CI).
+  const t0 = performance.now();
+  for (let i = 0; i < 50; i += 1) {
+    assert.equal(hasVisibleNonBlackPixels(rgba4k, width, height, { out: out1 }), false);
+  }
+  const elapsedMs = performance.now() - t0;
+  assert.ok(elapsedMs < 250, `expected 50 4K strided probes to stay fast, took ${elapsedMs.toFixed(2)}ms`);
+
+  // Place a small bright 120x68 block in the center of the 4K frame (hits multiple 60x34 stride points).
+  for (let y = 1020; y < 1088; y += 1) {
+    for (let x = 1860; x < 1980; x += 1) {
+      const off = (y * width + x) * 4;
+      rgba4k[off] = 180;
+      rgba4k[off + 1] = 180;
+      rgba4k[off + 2] = 180;
+      rgba4k[off + 3] = 255;
+    }
+  }
+
+  // Default full-grid probe with `out` finds exact maxLuma = 180 across all 4096 grid samples.
+  assert.equal(hasVisibleNonBlackPixels(rgba4k, width, height, { out: out1 }), true);
+  assert.equal(out1.visible, true);
+  assert.equal(out1.maxLuma, 180);
+  assert.ok(out1.visiblePixels >= 4);
+  assert.equal(out1.sampledPixels, 4096);
+
+  // Early-exit mode stops as soon as 4 visible grid samples are hit (< 4096 samples).
+  assert.equal(
+    hasVisibleNonBlackPixels(rgba4k, width, height, { earlyExit: true, out: out2 }),
+    true
+  );
+  assert.equal(out2.visiblePixels, 4);
+  assert.ok(out2.sampledPixels < 4096);
+});
+
+test('W307: renderFrame with requireNonBlackPixels suppresses all-black RGBA/NV12 fade-in frames and emits first-visible-frame once bright pixels appear', () => {
+  const device = createMockWebGpuDevice();
+  const firstPresentEvents = [];
+  const firstVisibleEvents = [];
+
+  const bridge = new SplashFrameBridge({
+    device,
+    targetFps: 1000,
+    maxQueueDepth: 4,
+    requireNonBlackPixels: true,
+    minVisibleLuma: 8,
+    minVisiblePixels: 4,
+    onFirstPresent(info) {
+      firstPresentEvents.push(info);
+    },
+    onFirstVisibleFrame(info) {
+      firstVisibleEvents.push(info);
+    },
+  });
+
+  assert.equal(bridge.requireNonBlackPixels, true);
+  assert.equal(bridge.minVisibleLuma, 8);
+  assert.equal(bridge.minVisiblePixels, 4);
+  assert.equal(bridge.firstVisibleFrameSent, false);
+  assert.equal(bridge.suppressedBlackFrames, 0);
+  assert.equal(bridge.lastSampledMaxLuma, 0);
+
+  // Frame 0: 100% black (0,0,0,255) RGBA8 -> first-present fires, first-visible-frame suppressed.
+  bridge.pushRawFrame({
+    width: 16,
+    height: 16,
+    format: PIXEL_FORMAT.RGBA8,
+    planes: { rgba: makeRgbaFrame(16, 16, 0) },
+    frameIndex: 0,
+    timestampMs: 0,
+  });
+  const r0 = bridge.renderFrame(device, { kind: 'GPUTextureView' }, 320, 180, 0);
+  assert.equal(r0.presented, true);
+  assert.equal(r0.firstPresentSent, true);
+  assert.equal(r0.firstVisibleFrame, false);
+  assert.equal(r0.firstVisibleFrameEmitted, false);
+  assert.equal(r0.suppressedBlackFrame, true);
+  assert.equal(r0.suppressedBlackFrames, 1);
+  assert.equal(r0.lastSampledMaxLuma, 0);
+  assert.equal(firstPresentEvents.length, 1);
+  assert.equal(firstVisibleEvents.length, 0);
+
+  // Frame 1: dim fade-in (7,7,7,255) below threshold 8 -> suppressed, lastSampledMaxLuma === 7.
+  bridge.pushRawFrame({
+    width: 16,
+    height: 16,
+    format: PIXEL_FORMAT.RGBA8,
+    planes: { rgba: makeRgbaFrame(16, 16, 7) },
+    frameIndex: 1,
+    timestampMs: 10,
+  });
+  const r1 = bridge.renderFrame(device, { kind: 'GPUTextureView' }, 320, 180, 10);
+  assert.equal(r1.presented, true);
+  assert.equal(r1.firstVisibleFrameEmitted, false);
+  assert.equal(r1.suppressedBlackFrame, true);
+  assert.equal(r1.suppressedBlackFrames, 2);
+  assert.equal(r1.lastSampledMaxLuma, 7);
+  assert.equal(firstVisibleEvents.length, 0);
+
+  // Frame 2: studio-black NV12 (limited range Y=16) -> suppressed (Y=16 maps to luma 0).
+  const blackNv12 = makeNv12Planes(16, 8, { yFill: 16 });
+  bridge.pushNv12Frame({
+    width: 16,
+    height: 8,
+    yPlane: blackNv12.yPlane,
+    uvPlane: blackNv12.uvPlane,
+    colorRange: COLOR_RANGE.LIMITED,
+    frameIndex: 2,
+    timestampMs: 20,
+  });
+  const r2 = bridge.renderFrame(device, { kind: 'GPUTextureView' }, 320, 180, 20);
+  assert.equal(r2.presented, true);
+  assert.equal(r2.suppressedBlackFrame, true);
+  assert.equal(r2.suppressedBlackFrames, 3);
+  assert.equal(r2.lastSampledMaxLuma, 0);
+  assert.equal(firstVisibleEvents.length, 0);
+
+  // Frame 3: bright diagnostic frame -> immediately emits first-visible-frame ONCE.
+  bridge.pushDiagnosticFrame(32, 16, 3, { timestampMs: 30 });
+  const r3 = bridge.renderFrame(device, { kind: 'GPUTextureView' }, 320, 180, 30);
+  assert.equal(r3.presented, true);
+  assert.equal(r3.firstVisibleFrame, true);
+  assert.equal(r3.firstVisibleFrameEmitted, true);
+  assert.equal(r3.firstVisibleFrameSent, true);
+  assert.equal(r3.suppressedBlackFrame, false);
+  assert.equal(r3.suppressedBlackFrames, 3);
+  assert.equal(r3.lastSampledMaxLuma, 235);
+
+  assert.equal(firstVisibleEvents.length, 1);
+  assert.equal(firstVisibleEvents[0].type, 'first-visible-frame');
+  assert.equal(firstVisibleEvents[0].frameIndex, 3);
+  assert.equal(firstVisibleEvents[0].suppressedBlackFrames, 3);
+  assert.equal(firstVisibleEvents[0].lastSampledMaxLuma, 235);
+
+  // Frame 4: subsequent all-black frame after dismissal must NOT re-emit or increment suppressedBlackFrames.
+  bridge.pushRawFrame({
+    width: 16,
+    height: 16,
+    format: PIXEL_FORMAT.RGBA8,
+    planes: { rgba: makeRgbaFrame(16, 16, 0) },
+    frameIndex: 4,
+    timestampMs: 40,
+  });
+  const r4 = bridge.renderFrame(device, { kind: 'GPUTextureView' }, 320, 180, 40);
+  assert.equal(r4.firstVisibleFrameEmitted, false);
+  assert.equal(r4.suppressedBlackFrame, false);
+  assert.equal(r4.suppressedBlackFrames, 3);
+  assert.equal(r4.lastSampledMaxLuma, 0);
+  assert.equal(firstVisibleEvents.length, 1);
+
+  // getStats() and getState() surface suppressedBlackFrames and lastSampledMaxLuma and sanitize corruption.
+  let stats = bridge.getStats();
+  assert.equal(stats.suppressedBlackFrames, 3);
+  assert.equal(stats.lastSampledMaxLuma, 0);
+  assert.equal(stats.firstVisibleFrameSent, true);
+  assert.equal(stats.requireNonBlackPixels, true);
+
+  bridge._suppressedBlackFrames = -99;
+  bridge._lastSampledMaxLuma = 999;
+  assert.equal(bridge.getStats().suppressedBlackFrames, 0);
+  assert.equal(bridge.getStats().lastSampledMaxLuma, 255);
+  assert.equal(bridge.getState().suppressedBlackFrames, 0);
+  assert.equal(bridge.getState().lastSampledMaxLuma, 255);
+
+  bridge._suppressedBlackFrames = 3;
+  bridge._lastSampledMaxLuma = 235;
+  const resetTelemetry = bridge.resetStats();
+  assert.equal(resetTelemetry.suppressedBlackFrames, 0);
+  assert.equal(resetTelemetry.lastSampledMaxLuma, 0);
+  assert.equal(resetTelemetry.firstVisibleFrameSent, true);
+
+  // reset() re-arms first-visible-frame for a new session.
+  bridge.reset();
+  assert.equal(bridge.getStats().firstVisibleFrameSent, false);
+  assert.equal(bridge.getStats().suppressedBlackFrames, 0);
+  bridge.pushDiagnosticFrame(16, 16, 0, { timestampMs: 0 });
+  bridge.renderFrame(device, { kind: 'GPUTextureView' }, 320, 180, 0);
+  assert.equal(firstVisibleEvents.length, 2);
+
+  bridge.destroy();
+});
+
+test('W307: notifyGuestFirstPresent handoff gate suppresses black fade-in, dismisses on visible probe, and preserves W279 ImageBitmap.close()', () => {
+  const device = createMockWebGpuDevice();
+  const visibleEvents = [];
+  let probeReturn = null;
+
+  const bridge = new SplashFrameBridge({
+    device,
+    targetFps: 1000,
+    maxQueueDepth: 4,
+    onFirstVisibleFrame(info) {
+      visibleEvents.push(info);
+    },
+    canvasProbe() {
+      return probeReturn;
+    },
+  });
+
+  // Providing canvasProbe automatically activates requireNonBlackPixels.
+  assert.equal(bridge.requireNonBlackPixels, true);
+
+  // 1) Render a black copy-only ImageBitmap (probe returns all-black ImageData):
+  //    first-visible-frame is suppressed AND W279 still closes the owned ImageBitmap once!
+  const blackBmp = createMockImageBitmap(8, 8, { withData: false });
+  probeReturn = { data: new Uint8ClampedArray(8 * 8 * 4), width: 8, height: 8 };
+  bridge.pushExternalImage(blackBmp, { timestampMs: 0 });
+  const r0 = bridge.renderFrame(device, { kind: 'GPUTextureView' }, 128, 72, 0);
+  assert.equal(r0.presented, true);
+  assert.equal(r0.suppressedBlackFrame, true);
+  assert.equal(r0.suppressedBlackFrames, 1);
+  assert.equal(blackBmp.closeCalls, 1);
+  assert.equal(blackBmp.closed, true);
+  assert.equal(bridge.getStats().bitmapsClosed, 1);
+  assert.equal(visibleEvents.length, 0);
+
+  // Queue a live splash ImageBitmap waiting while guest boots.
+  const queuedSplashBmp = createMockImageBitmap(8, 8, { withData: false });
+  bridge.pushExternalImage(queuedSplashBmp, { timestampMs: 10 });
+  assert.equal(queuedSplashBmp.closeCalls, 0);
+  assert.equal(bridge.getStats().retainedBitmaps, 1);
+
+  // 2) Guest signals handoff with 100% black fade-in frame (t77 scenario):
+  //    handoff is suppressed, splash stays alive, queued bitmap is NOT prematurely closed.
+  const blackHandoff = bridge.notifyGuestFirstPresent({
+    rgba: makeRgbaFrame(16, 16, 0),
+    width: 16,
+    height: 16,
+  });
+  assert.equal(blackHandoff.guestFirstPresent, false);
+  assert.equal(blackHandoff.splashSuppressed, false);
+  assert.equal(blackHandoff.firstVisibleFrameEmitted, false);
+  assert.equal(blackHandoff.suppressedBlackFrame, true);
+  assert.equal(blackHandoff.suppressedBlackFrames, 2);
+  assert.equal(blackHandoff.lastSampledMaxLuma, 0);
+  assert.equal(blackHandoff.reason, 'black-frame-suppressed');
+  assert.equal(queuedSplashBmp.closeCalls, 0);
+  assert.equal(bridge.getStats().queueDepth, 1);
+  assert.equal(visibleEvents.length, 0);
+
+  // 3) Guest handoff via canvasProbe returning dim (6,6,6) frame -> still suppressed.
+  const dimData = new Uint8ClampedArray(16 * 16 * 4);
+  dimData.fill(6);
+  probeReturn = { data: dimData, width: 16, height: 16 };
+  const dimHandoff = bridge.notifyGuestFirstPresent();
+  assert.equal(dimHandoff.guestFirstPresent, false);
+  assert.equal(dimHandoff.splashSuppressed, false);
+  assert.equal(dimHandoff.suppressedBlackFrame, true);
+  assert.equal(dimHandoff.suppressedBlackFrames, 3);
+  assert.equal(dimHandoff.lastSampledMaxLuma, 6);
+  assert.equal(queuedSplashBmp.closeCalls, 0);
+  assert.equal(visibleEvents.length, 0);
+
+  // 4) Guest renders visible non-black frame -> handoff completes immediately, emits first-visible-frame,
+  //    suppresses splash, and W279 closes the queued splash ImageBitmap cleanly!
+  const brightData = new Uint8ClampedArray(16 * 16 * 4);
+  for (let i = 0; i < brightData.length; i += 4) {
+    brightData[i] = 192;
+    brightData[i + 1] = 192;
+    brightData[i + 2] = 192;
+    brightData[i + 3] = 255;
+  }
+  probeReturn = { data: brightData, width: 16, height: 16 };
+  const visibleHandoff = bridge.notifyGuestFirstPresent();
+  assert.equal(visibleHandoff.guestFirstPresent, true);
+  assert.equal(visibleHandoff.splashSuppressed, true);
+  assert.equal(visibleHandoff.firstVisibleFrame, true);
+  assert.equal(visibleHandoff.firstVisibleFrameEmitted, true);
+  assert.equal(visibleHandoff.suppressedBlackFrame, false);
+  assert.equal(visibleHandoff.suppressedBlackFrames, 3);
+  assert.equal(visibleHandoff.lastSampledMaxLuma, 192);
+  assert.equal(visibleHandoff.reason, 'ok');
+  assert.equal(visibleHandoff.drainedFrames, 1);
+  assert.equal(queuedSplashBmp.closeCalls, 1);
+  assert.equal(queuedSplashBmp.closed, true);
+  assert.equal(bridge.getStats().retainedBitmaps, 0);
+  assert.equal(bridge.getStats().bitmapsClosed, 2);
+  assert.equal(bridge.getStats().suppressedBlackFrames, 3);
+  assert.equal(bridge.getStats().lastSampledMaxLuma, 192);
+  assert.equal(visibleEvents.length, 1);
+  assert.equal(visibleEvents[0].type, 'first-visible-frame');
+  assert.equal(visibleEvents[0].source, 'guest-handoff');
+  assert.equal(visibleEvents[0].lastSampledMaxLuma, 192);
+
+  // Late post-handoff ImageBitmap is still ignored & closed immediately (W279), no double-close on dispose.
+  const lateBmp = createMockImageBitmap(4, 4, { withData: true, fill: 0xaa });
+  const lateRes = bridge.pushExternalImage(lateBmp, { timestampMs: 20 });
+  assert.equal(lateRes.ignored, true);
+  assert.equal(lateBmp.closeCalls, 1);
+
+  bridge.dispose();
+  assert.equal(blackBmp.closeCalls, 1);
+  assert.equal(queuedSplashBmp.closeCalls, 1);
+  assert.equal(lateBmp.closeCalls, 1);
+
+  // Constructor option validation for W307 fields.
+  assert.throws(() => new SplashFrameBridge({ device, onFirstVisibleFrame: 'not-a-fn' }), TypeError);
+  assert.throws(() => new SplashFrameBridge({ device, pixelProbe: 123 }), TypeError);
+  assert.throws(() => new SplashFrameBridge({ device, canvasProbe: {} }), TypeError);
+  assert.throws(() => new SplashFrameBridge({ device, minVisibleLuma: -5 }), RangeError);
+  assert.throws(() => new SplashFrameBridge({ device, minVisibleLuma: 300 }), RangeError);
+  assert.throws(() => new SplashFrameBridge({ device, minVisiblePixels: 0 }), RangeError);
+  assert.throws(() => new SplashFrameBridge({ device, maxGridDim: -1 }), RangeError);
 });
