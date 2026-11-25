@@ -1,4 +1,4 @@
-"""Screen timeline (R40 + T64): per-screen timelines for boot reports and frame captures.
+"""Screen timeline (R40 + T64 + T81): per-screen timelines for boot reports and frame captures.
 
 R40 (boot report Present samples):
 Agents scripting menus tell screens apart by draws per frame and new resources. Each Present sample
@@ -9,11 +9,13 @@ turns them into per-present deltas and collapses consecutive presents with the s
    input_events_in_segment}
 Capped at MAX_SEGMENTS (later presents are folded into the last segment). Times are wall_ms.
 
-T64 (Chrome capture frame directory CLI):
+T64 + T81 (Chrome capture frame directory CLI):
 Analyzes a directory of captured frames (e.g. `frame_0001.png` / `frame_0001.jpg`), groups
-consecutive frames into distinct visual/black screen segments, computes optional dwell durations
-via `--interval-sec <f>`, and outputs either a sanitized plain-text table or structured `--json`
-summary without leaking host paths.
+consecutive frames into distinct visual/black screen segments, computes optional dwell durations,
+leading black-loading duration (`black_loading_s`), first non-black timing (`first_non_black_s`),
+frame counts (`black_frame_count`, `non_black_frame_count`, `all_black`), and per-transition
+milestone deltas (`delta_s`) via `--interval-sec <f>`, and outputs either a sanitized plain-text
+table or structured `--json` summary without leaking host paths or usernames.
 """
 
 from __future__ import annotations
@@ -37,6 +39,66 @@ THUMB_SIZE = (32, 18)
 _IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".bmp", ".webp"})
 _FRAME_NUM_RE = re.compile(r"(\d+)(?!.*\d)")
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_UNC_PATH_RE = re.compile(r"\\\\[^\\\s\"'<>|]+\\[^\\\s\"'<>|]+(?:\\[^\s\"'<>|]+)*")
+_WIN_ABS_PATH_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])[A-Za-z]:[\\/][^\s\"'<>|]*")
+_UNIX_HOST_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_.-])/(?:Users|home|tmp|var|private|mnt|root|opt|srv|Volumes)(?:/[^\s\"'<>|]*)?"
+)
+
+
+def _basename_from_path_text(raw: str) -> str:
+    parts = [p for p in re.split(r"[\\/]+", raw) if p]
+    if not parts:
+        return ""
+    if len(parts[0]) == 2 and parts[0][1] == ":":
+        parts = parts[1:]
+    if not parts:
+        return ""
+    if len(parts) <= 2 and parts[0].lower() in {"users", "home"}:
+        return "<redacted>"
+    return parts[-1]
+
+
+def sanitize_path_label(value: str | Path) -> str:
+    """Reduce any host/absolute/traversal path to a safe basename or relative label."""
+    text = str(value).strip()
+    if not text:
+        return ""
+    if (
+        re.match(r"(?i)^[A-Za-z]:[\\/]", text)
+        or text.startswith(("/", "\\"))
+        or ".." in re.split(r"[\\/]+", text)
+    ):
+        return _basename_from_path_text(text)
+    normalized = text.replace("\\", "/")
+    parts = [p for p in normalized.split("/") if p and p != "."]
+    if parts and parts[0].lower() in {"users", "home"}:
+        return _basename_from_path_text(normalized)
+    return "/".join(parts)
+
+
+def sanitize_text(text: str) -> str:
+    """Scrub host filesystem paths and user home prefixes from arbitrary text."""
+    out = _UNC_PATH_RE.sub(lambda m: _basename_from_path_text(m.group(0)), text)
+    out = _WIN_ABS_PATH_RE.sub(lambda m: _basename_from_path_text(m.group(0)), out)
+    out = _UNIX_HOST_PATH_RE.sub(lambda m: _basename_from_path_text(m.group(0)), out)
+    return out
+
+
+def sanitize_json_payload(value: Any) -> Any:
+    """Recursively sanitize a JSON-serializable payload so no host paths or usernames leak."""
+    if isinstance(value, Path):
+        return sanitize_path_label(value)
+    if isinstance(value, str):
+        return sanitize_text(value)
+    if isinstance(value, dict):
+        return {
+            (sanitize_text(k) if isinstance(k, str) else k): sanitize_json_payload(v)
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [sanitize_json_payload(item) for item in value]
+    return value
 
 
 def _num(v: Any) -> int:
@@ -431,10 +493,13 @@ def summarize_frame_samples(
             start_s: float | None = round(start_ord * clean_interval, 3)
             end_s: float | None = round((start_ord + count) * clean_interval, 3)
             dwell_s: float | None = round(count * clean_interval, 3)
+            prev_start_ord = raw_segments[seg_idx - 1]["start_ord"] if seg_idx > 0 else start_ord
+            delta_s: float | None = round((start_ord - prev_start_ord) * clean_interval, 3)
         else:
             start_s = None
             end_s = None
             dwell_s = None
+            delta_s = None
         segments.append({
             "index": seg_idx,
             "start_frame": seg["start_frame"],
@@ -443,13 +508,21 @@ def summarize_frame_samples(
             "start_s": start_s,
             "end_s": end_s,
             "dwell_s": dwell_s,
+            "delta_s": delta_s,
             "mean_luma": round(seg["luma_sum"] / count, 2),
             "is_black": seg["is_black"],
         })
 
+    all_black = total_frames > 0 and non_black_frames == 0
     first_non_black_s: float | None = (
         round(first_non_black_ord * clean_interval, 3)
         if clean_interval is not None and first_non_black_ord is not None
+        else None
+    )
+    leading_black_frames = first_non_black_ord if first_non_black_ord is not None else total_frames
+    black_loading_s: float | None = (
+        round(leading_black_frames * clean_interval, 3)
+        if clean_interval is not None
         else None
     )
 
@@ -458,8 +531,12 @@ def summarize_frame_samples(
         "unique_segments": len(segments),
         "black_frames": black_frames,
         "non_black_frames": non_black_frames,
+        "black_frame_count": black_frames,
+        "non_black_frame_count": non_black_frames,
+        "all_black": all_black,
         "first_non_black_frame": first_non_black_frame,
         "first_non_black_s": first_non_black_s,
+        "black_loading_s": black_loading_s,
         "segments": segments,
     }
 
@@ -513,16 +590,18 @@ def format_capture_summary(summary: dict[str, Any]) -> list[str]:
     """Render a sanitized plain-text table for a capture-directory timeline summary."""
     total = summary["total_frames"]
     unique = summary["unique_segments"]
-    black = summary["black_frames"]
-    non_black = summary["non_black_frames"]
+    black = summary.get("black_frame_count", summary["black_frames"])
+    non_black = summary.get("non_black_frame_count", summary["non_black_frames"])
     first_frame = summary["first_non_black_frame"]
     first_s = summary["first_non_black_s"]
+    black_loading_s = summary.get("black_loading_s")
+    all_black = bool(summary.get("all_black", False))
     segments = summary["segments"]
 
     seg_word = "segment" if unique == 1 else "segments"
     frame_word = "frame" if total == 1 else "frames"
     if total == 0:
-        return [f"screen timeline: 0 frames, 0 segments (black: 0, non-black: 0)"]
+        return ["screen timeline: 0 frames, 0 segments (black: 0, non-black: 0)"]
 
     if first_frame is None:
         first_desc = "none"
@@ -531,13 +610,23 @@ def format_capture_summary(summary: dict[str, Any]) -> list[str]:
     else:
         first_desc = f"frame {first_frame}"
 
+    header_parts = [
+        f"black: {black}",
+        f"non-black: {non_black}",
+        f"first_non_black: {first_desc}",
+    ]
+    if black_loading_s is not None:
+        header_parts.append(f"black_loading_s: {black_loading_s:.2f}s")
+    if all_black:
+        header_parts.append("all_black: true")
+
     lines = [
         f"screen timeline: {total} {frame_word}, {unique} {seg_word} "
-        f"(black: {black}, non-black: {non_black}, first_non_black: {first_desc})"
+        f"({', '.join(header_parts)})"
     ]
     has_times = any(s.get("dwell_s") is not None for s in segments)
     if has_times:
-        lines.append("  idx  frames      count  start_s    end_s  dwell_s    luma  state")
+        lines.append("  idx  frames      count  start_s    end_s  dwell_s  delta_s    luma  state")
     else:
         lines.append("  idx  frames      count    luma  state")
 
@@ -545,9 +634,11 @@ def format_capture_summary(summary: dict[str, Any]) -> list[str]:
         span = f"{s['start_frame']}..{s['end_frame']}"
         state = "black" if s["is_black"] else "visible"
         if has_times:
+            delta_val = s.get("delta_s")
+            delta_col = f"{delta_val:7.2f}" if delta_val is not None else "    n/a"
             lines.append(
                 f"  {s['index']:3d}  {span:10s}  {s['frame_count']:5d}  "
-                f"{s['start_s']:7.2f}  {s['end_s']:7.2f}  {s['dwell_s']:7.2f}  "
+                f"{s['start_s']:7.2f}  {s['end_s']:7.2f}  {s['dwell_s']:7.2f}  {delta_col}  "
                 f"{s['mean_luma']:6.2f}  {state}"
             )
         else:
@@ -572,7 +663,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--interval-sec",
         type=float,
         default=None,
-        help="Capture interval in seconds per frame; populates start_s, end_s, dwell_s, and first_non_black_s.",
+        help=(
+            "Capture interval in seconds per frame; populates start_s, end_s, dwell_s, "
+            "delta_s, first_non_black_s, and black_loading_s."
+        ),
     )
     parser.add_argument(
         "--json",
@@ -611,11 +705,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("error: frames path is not a directory", file=sys.stderr)
         return 2
     except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print(f"error: {sanitize_text(str(exc))}", file=sys.stderr)
+        return 2
+    except OSError:
+        print("error: unable to read frames directory", file=sys.stderr)
         return 2
 
     if args.json:
-        print(json.dumps(summary, indent=2))
+        print(json.dumps(sanitize_json_payload(summary), indent=2))
     else:
         print("\n".join(format_capture_summary(summary)))
     return 0
