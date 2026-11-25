@@ -375,6 +375,34 @@ bool parse_stage(const Json& s, StageReflection* out, std::string* error) {
                              " needs base_user_sgpr, stride and index {user_sgpr, shift}";
                     return false;
                 }
+            } else if (const Json* cb_heap = src->get("cbv_indexed_sampler_heap") != nullptr
+                                                 ? src->get("cbv_indexed_sampler_heap")
+                                                 : src->get("cbv_indexed_resource_heap");
+                       cb_heap != nullptr) {
+                const bool sampler_cb = src->get("cbv_indexed_sampler_heap") != nullptr;
+                const char* name = sampler_cb ? "cbv_indexed_sampler_heap" : "cbv_indexed_resource_heap";
+                r.source = sampler_cb ? ReflectedSource::CbvIndexedSamplerHeap : ReflectedSource::CbvIndexedResourceHeap;
+                const Json* cbv = cb_heap->type == Json::Type::Object ? cb_heap->get("cbv") : nullptr;
+                bool ok = cbv != nullptr && cbv->type == Json::Type::Object && get_u32(*cbv, "user_sgpr", &r.user_sgpr) &&
+                          get_u32(*cb_heap, "byte_offset", &r.cb_byte_offset) && get_u32(*cb_heap, "shift", &r.heap_shift) &&
+                          get_u32(*cb_heap, "bit_offset", &r.cb_bit_offset, false) &&
+                          get_u32(*cb_heap, "mask", &r.cb_mask, false) && get_u32(*cb_heap, "stride", &r.heap_stride, false);
+                if (ok) {
+                    if (get_bool(*cbv, "root_descriptor")) {
+                        r.cbv = ReflectedCbv::RootDescriptor;
+                    } else if (get_bool(*cbv, "root_constants")) {
+                        r.cbv = ReflectedCbv::RootConstants;
+                    } else {
+                        r.cbv = ReflectedCbv::Table;
+                        ok = get_u32(*cbv, "table_byte_offset", &r.table_byte_offset);
+                    }
+                }
+                if (!ok || r.heap_shift >= 32 || r.cb_bit_offset >= 32 || r.cb_mask == 0 || r.cb_byte_offset % 4 != 0) {
+                    *error = std::string(name) +
+                             " needs cbv {user_sgpr, root_descriptor | table_byte_offset | root_constants}, a dword-aligned "
+                             "byte_offset, shift < 32 and (optional) bit_offset < 32, non-zero mask, stride";
+                    return false;
+                }
             } else if (const Json* inline_sampler = src->get("inline_sampler"); inline_sampler != nullptr) {
                 r.source = ReflectedSource::InlineSampler;
                 const Json* words =
@@ -460,6 +488,16 @@ std::string binding_key(const ReflectedBinding& b) {
             k += std::string(" <- ") + (b.source == ReflectedSource::SamplerHeap ? "sampler" : "resource") +
                  " heap[s" + std::to_string(b.heap_index_sgpr) + " << " + std::to_string(b.heap_shift) + "]";
             break;
+        case ReflectedSource::CbvIndexedSamplerHeap:
+        case ReflectedSource::CbvIndexedResourceHeap:
+            k += std::string(" <- ") + (b.source == ReflectedSource::CbvIndexedSamplerHeap ? "sampler" : "resource") +
+                 " heap[cb(" +
+                 (b.cbv == ReflectedCbv::RootDescriptor ? "root CBV"
+                  : b.cbv == ReflectedCbv::RootConstants ? "root constants"
+                                                          : "table + " + std::to_string(b.table_byte_offset)) +
+                 " at s" + std::to_string(b.user_sgpr) + ")[" + std::to_string(b.cb_byte_offset) + "] << " +
+                 std::to_string(b.heap_shift) + "]";
+            break;
     }
     return k;
 }
@@ -526,12 +564,7 @@ bool same_binding(const bridge::LayoutBinding& a, const bridge::LayoutBinding& b
     return a.entry.type == b.entry.type && a.entry.binding_type == b.entry.binding_type &&
            a.entry.view_dimension == b.entry.view_dimension && a.join.register_class == b.join.register_class &&
            a.join.shader_register == b.join.shader_register && a.join.register_space == b.join.register_space &&
-           a.join.root_constants == b.join.root_constants && a.join.heap == b.join.heap &&
-           a.join.heap_index_parameter == b.join.heap_index_parameter &&
-           a.join.heap_index_dword == b.join.heap_index_dword && a.join.heap_shift == b.join.heap_shift &&
-           a.join.table_parameter == b.join.table_parameter && a.join.table_slot == b.join.table_slot &&
-           a.join.inline_sampler == b.join.inline_sampler &&
-           std::memcmp(&a.join.sampler, &b.join.sampler, sizeof(a.join.sampler)) == 0;
+           d3d::same_join(a.join, b.join);
 }
 
 pso::WgpuVertexFormat element_class(pso::WgpuVertexFormat f, ReflectedComponentType* cls) {
@@ -650,6 +683,71 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                 lb.join.heap_index_parameter = static_cast<uint32_t>(pi);
                 lb.join.heap_index_dword = dword;
                 lb.join.heap_shift = b.heap_shift;
+            } else if (b.source == ReflectedSource::CbvIndexedSamplerHeap ||
+                       b.source == ReflectedSource::CbvIndexedResourceHeap) {
+                // CB-indexed heap (G62): the CB is the root parameter at user_sgpr; the index is read
+                // from it at draw time, the class follows the kind.
+                const int pi = root_parameter_for_user_sgpr(rs, compute, b.user_sgpr);
+                if (pi < 0) {
+                    fail(b, "no root parameter starts at s" + std::to_string(b.user_sgpr));
+                    continue;
+                }
+                const d3d::RootParameterDesc& p = rs.parameters[static_cast<size_t>(pi)];
+                const std::string pname = "root parameter " + std::to_string(pi);
+                d3d::HeapIndexSource from = d3d::HeapIndexSource::CbRootDescriptor;
+                switch (b.cbv) {
+                    case ReflectedCbv::RootDescriptor:
+                        if (p.parameter_type != d3d::RootParameterType::Cbv) {
+                            fail(b, pname + " is not a root CBV");
+                            continue;
+                        }
+                        break;
+                    case ReflectedCbv::RootConstants:
+                        if (p.parameter_type != d3d::RootParameterType::Constants32Bit ||
+                            b.cb_byte_offset / 4 >= p.num_32bit_values) {
+                            fail(b, pname + " is not root constants covering byte " + std::to_string(b.cb_byte_offset));
+                            continue;
+                        }
+                        from = d3d::HeapIndexSource::CbRootConstants;
+                        break;
+                    case ReflectedCbv::Table: {
+                        bool sampler_table = false;
+                        for (const d3d::DescriptorRangeDesc& r : p.ranges) {
+                            sampler_table = sampler_table || r.range_type == d3d::DescriptorRangeType::Sampler;
+                        }
+                        if (p.parameter_type != d3d::RootParameterType::DescriptorTable || sampler_table) {
+                            fail(b, pname + " is not a CBV_SRV_UAV descriptor table");
+                            continue;
+                        }
+                        if (b.table_byte_offset % kTableSlotBytes != 0) {
+                            fail(b, pname + ": byte offset " + std::to_string(b.table_byte_offset) +
+                                        " is not a descriptor boundary");
+                            continue;
+                        }
+                        from = d3d::HeapIndexSource::CbTable;
+                        lb.join.cb_table_slot = b.table_byte_offset / kTableSlotBytes;
+                        break;
+                    }
+                }
+                const bool sampler_kind =
+                    b.kind == ReflectedBindingKind::Sampler || b.kind == ReflectedBindingKind::ComparisonSampler;
+                if ((b.source == ReflectedSource::CbvIndexedSamplerHeap) != sampler_kind) {
+                    fail(b, std::string("a ") + kind_name(b.kind) + " binding cannot come from the " +
+                                (b.source == ReflectedSource::CbvIndexedSamplerHeap ? "sampler" : "resource") + " heap");
+                    continue;
+                }
+                cls = b.kind == ReflectedBindingKind::Uniform ? d3d::DescriptorRangeType::Cbv
+                      : sampler_kind                          ? d3d::DescriptorRangeType::Sampler
+                      : (b.kind == ReflectedBindingKind::Storage || b.kind == ReflectedBindingKind::StorageTexture)
+                          ? d3d::DescriptorRangeType::Uav
+                          : d3d::DescriptorRangeType::Srv;
+                lb.join.heap = sampler_kind ? d3d::HeapAccess::Sampler : d3d::HeapAccess::Resource;
+                lb.join.heap_index_parameter = static_cast<uint32_t>(pi);
+                lb.join.heap_index_source = from;
+                lb.join.heap_shift = b.heap_shift;
+                lb.join.cb_byte_offset = b.cb_byte_offset;
+                lb.join.cb_bit_offset = b.cb_bit_offset;
+                lb.join.cb_mask = b.cb_mask;
             } else if (b.source == ReflectedSource::InlineSampler) {
                 if (b.kind != ReflectedBindingKind::Sampler && b.kind != ReflectedBindingKind::ComparisonSampler) {
                     fail(b, std::string("a ") + kind_name(b.kind) + " binding cannot take an inline sampler");
@@ -763,6 +861,8 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                     case ReflectedSource::SamplerHeap:
                     case ReflectedSource::ResourceHeap:
                     case ReflectedSource::InlineSampler:
+                    case ReflectedSource::CbvIndexedSamplerHeap:
+                    case ReflectedSource::CbvIndexedResourceHeap:
                         break;
                 }
             }
