@@ -4,12 +4,16 @@ import { createRequire } from 'node:module';
 
 import {
   BrowserStorageManager,
+  DEFAULT_CRITICAL_THRESHOLD_RATIO,
   DEFAULT_OPFS_CACHE_DIR,
   DEFAULT_USERDATA_DB_NAME,
   DEFAULT_USERDATA_STORE_NAME,
+  DEFAULT_WARN_THRESHOLD_RATIO,
+  QUOTA_PRESSURE_LEVELS,
   SNAPSHOT_FORMAT,
   SNAPSHOT_VERSION,
   USERDATA_PREFIX,
+  classifyQuotaPressure,
   decodeBase64,
   encodeBase64,
   formatBytes,
@@ -755,4 +759,361 @@ test('BrowserStorageManager degrades gracefully when Storage, OPFS, and IndexedD
   assert.equal(summary.userdata.supported, false);
   assert.equal(summary.totalManagedBytes, 0);
   assert.equal(summary.totalManagedFormatted, '0 B');
+  assert.equal(summary.pressure, 'unknown');
+  assert.equal(summary.quota.pressure, 'unknown');
+  assert.equal(summary.quota.usageRatio, null);
+  assert.deepEqual(summary.eviction, {
+    evictedEntries: 0,
+    evictedBytes: 0,
+    evictedFormatted: '0 B',
+    cleanupCount: 0,
+    lastCleanupAtMs: null,
+  });
+});
+
+// --- W156 Quota Pressure Classification, Eviction Telemetry & Sanitized Usage Snapshot tests ---
+
+test('quota pressure defaults and classifyQuotaPressure classify ok/warn/critical/unknown with safe clamping', () => {
+  assert.equal(DEFAULT_WARN_THRESHOLD_RATIO, 0.75);
+  assert.equal(DEFAULT_CRITICAL_THRESHOLD_RATIO, 0.9);
+  assert.deepEqual(QUOTA_PRESSURE_LEVELS, {
+    OK: 'ok',
+    WARN: 'warn',
+    CRITICAL: 'critical',
+    UNKNOWN: 'unknown',
+  });
+  assert.equal(Object.isFrozen(QUOTA_PRESSURE_LEVELS), true);
+
+  // Positional (usageBytes, quotaBytes) boundaries with default thresholds (0.75 / 0.90)
+  assert.equal(classifyQuotaPressure(0, 1000), 'ok');
+  assert.equal(classifyQuotaPressure(749, 1000), 'ok');
+  assert.equal(classifyQuotaPressure(750, 1000), 'warn');
+  assert.equal(classifyQuotaPressure(899, 1000), 'warn');
+  assert.equal(classifyQuotaPressure(900, 1000), 'critical');
+  assert.equal(classifyQuotaPressure(1000, 1000), 'critical');
+
+  // Safe numeric clamping for over-quota and negative usage
+  assert.equal(classifyQuotaPressure(2500, 1000), 'critical');
+  assert.equal(classifyQuotaPressure(-50, 1000), 'ok');
+
+  // Non-positive quota, non-finite inputs, and unsupported estimates -> 'unknown'
+  assert.equal(classifyQuotaPressure(500, 0), 'unknown');
+  assert.equal(classifyQuotaPressure(0, 0), 'unknown');
+  assert.equal(classifyQuotaPressure(500, -100), 'unknown');
+  assert.equal(classifyQuotaPressure(Number.NaN, 1000), 'unknown');
+  assert.equal(classifyQuotaPressure(500, Number.POSITIVE_INFINITY), 'unknown');
+  assert.equal(classifyQuotaPressure(null), 'unknown');
+  assert.equal(classifyQuotaPressure(undefined), 'unknown');
+  assert.equal(classifyQuotaPressure({ supported: false, usageBytes: 950, quotaBytes: 1000 }), 'unknown');
+  assert.equal(classifyQuotaPressure({ usageRatio: Number.NaN }), 'unknown');
+
+  // Object shapes: getQuotaEstimate(), navigator.storage.estimate(), and usageRatio
+  assert.equal(classifyQuotaPressure({ supported: true, usageBytes: 760, quotaBytes: 1000 }), 'warn');
+  assert.equal(classifyQuotaPressure({ usage: 910, quota: 1000 }), 'critical');
+  assert.equal(classifyQuotaPressure({ supported: true, usageRatio: 0.4 }), 'ok');
+  assert.equal(classifyQuotaPressure({ supported: true, usageRatio: 0.8 }), 'warn');
+  assert.equal(classifyQuotaPressure({ supported: true, usageRatio: 1.5 }), 'critical');
+
+  // Configurable thresholds & threshold clamping/normalization
+  assert.equal(
+    classifyQuotaPressure(600, 1000, { warnThresholdRatio: 0.5, criticalThresholdRatio: 0.8 }),
+    'warn'
+  );
+  assert.equal(
+    classifyQuotaPressure(800, 1000, { warnThresholdRatio: 0.5, criticalThresholdRatio: 0.8 }),
+    'critical'
+  );
+  // Inverted thresholds clamp warn down to critical (0.6 / 0.6)
+  assert.equal(
+    classifyQuotaPressure(599, 1000, { warnThresholdRatio: 0.95, criticalThresholdRatio: 0.6 }),
+    'ok'
+  );
+  assert.equal(
+    classifyQuotaPressure(600, 1000, { warnThresholdRatio: 0.95, criticalThresholdRatio: 0.6 }),
+    'critical'
+  );
+  // Only warnThresholdRatio raised above default critical lifts critical to match
+  assert.equal(classifyQuotaPressure(920, 1000, { warnThresholdRatio: 0.95 }), 'ok');
+  assert.equal(classifyQuotaPressure(950, 1000, { warnThresholdRatio: 0.95 }), 'critical');
+  // Non-finite or out-of-range thresholds safely clamp/fallback
+  assert.equal(
+    classifyQuotaPressure(800, 1000, { warnThresholdRatio: Number.NaN, criticalThresholdRatio: 1.8 }),
+    'warn'
+  );
+  assert.equal(
+    classifyQuotaPressure(0, 1000, { warnThresholdRatio: -0.5, criticalThresholdRatio: 0.5 }),
+    'warn'
+  );
+});
+
+test('BrowserStorageManager configures thresholds and nowFn clock cleanly while preserving now fallback', async () => {
+  let nowVal = 5000;
+  let legacyNowCalls = 0;
+
+  const manager = new BrowserStorageManager({
+    storageObj: createMockStorageObj({ usage: 650, quota: 1000 }),
+    opfsRoot: null,
+    indexedDBFactory: null,
+    warnThresholdRatio: 0.6,
+    criticalThresholdRatio: 0.85,
+    now: () => {
+      legacyNowCalls += 1;
+      return 9999;
+    },
+    nowFn: () => nowVal,
+  });
+
+  assert.equal(manager.warnThresholdRatio, 0.6);
+  assert.equal(manager.criticalThresholdRatio, 0.85);
+  assert.equal(manager.classifyQuotaPressure(600, 1000), 'warn');
+  assert.equal(manager.classifyQuotaPressure(850, 1000), 'critical');
+  assert.equal(manager.classifyQuotaPressure(600, 1000, { warnThresholdRatio: 0.7 }), 'ok');
+
+  const estimate = await manager.getQuotaEstimate();
+  assert.equal(manager.classifyQuotaPressure(estimate), 'warn');
+  assert.equal(legacyNowCalls, 0);
+
+  const stats = manager.getStats();
+  assert.equal(stats.lastQuotaPressure, 'warn');
+  assert.equal(stats.lastQuotaUsageRatio, 0.65);
+  assert.equal(stats.lastQuotaSampleAtMs, 5000);
+
+  // Legacy `now` option still works when `nowFn` is omitted
+  const legacyMgr = new BrowserStorageManager({
+    storageObj: createMockStorageObj({ usage: 100, quota: 1000 }),
+    opfsRoot: null,
+    indexedDBFactory: null,
+    now: () => 4242,
+  });
+  await legacyMgr.getQuotaEstimate();
+  assert.equal(legacyMgr.getStats().lastQuotaSampleAtMs, 4242);
+});
+
+test('eviction telemetry tracks evictedEntries, evictedBytes, cleanupCount, and lastCleanupAtMs via nowFn', async () => {
+  let clockMs = 10000;
+  const opfsRoot = createMockOpfsDirHandle('', {
+    [DEFAULT_OPFS_CACHE_DIR]: createMockOpfsDirHandle(DEFAULT_OPFS_CACHE_DIR, {
+      'chunk_a.bin': makePatternBytes(1024, 1),
+      'chunk_b.bin': makePatternBytes(2048, 2),
+    }),
+  });
+  const mockIdb = createMockIndexedDB();
+  const store = new userdataMod.UserdataStore({ indexedDB: mockIdb });
+  await store.saveFile('/userdata/slot1.sav', makePatternBytes(512, 3), 1000);
+  await store.saveFile('/userdata/slot2.sav', makePatternBytes(256, 4), 2000);
+  store.close();
+
+  const manager = new BrowserStorageManager({
+    storageObj: createMockStorageObj({ usage: 800, quota: 1000, opfsRoot }),
+    indexedDBFactory: mockIdb,
+    nowFn: () => clockMs,
+  });
+
+  // Initial stats before any cleanup
+  const initialStats = manager.getStats();
+  assert.deepEqual(initialStats, {
+    evictedEntries: 0,
+    evictedBytes: 0,
+    evictedFormatted: '0 B',
+    cleanupCount: 0,
+    lastCleanupAtMs: null,
+    warnThresholdRatio: 0.75,
+    criticalThresholdRatio: 0.9,
+    lastQuotaPressure: 'unknown',
+    lastQuotaUsageRatio: null,
+    lastQuotaSampleAtMs: null,
+  });
+
+  // Mutating returned stats object must not affect internal counters
+  initialStats.evictedEntries = 999;
+  assert.equal(manager.getStats().evictedEntries, 0);
+
+  // 1. OPFS cache cleanup
+  const opfsCleared = await manager.clearOpfsCache();
+  assert.deepEqual(opfsCleared, { supported: true, removedCount: 2, freedBytes: 3072 });
+  assert.equal(manager.getStats().evictedEntries, 2);
+  assert.equal(manager.getStats().evictedBytes, 3072);
+  assert.equal(manager.getStats().evictedFormatted, '3 KiB');
+  assert.equal(manager.getStats().cleanupCount, 1);
+  assert.equal(manager.getStats().lastCleanupAtMs, 10000);
+
+  // 2. Userdata cleanup at a later timestamp accumulates totals
+  clockMs = 25000;
+  const userdataCleared = await manager.clearUserdata();
+  assert.deepEqual(userdataCleared, { supported: true, clearedCount: 2, freedBytes: 768 });
+  assert.equal(manager.getStats().evictedEntries, 4);
+  assert.equal(manager.getStats().evictedBytes, 3840);
+  assert.equal(manager.getStats().cleanupCount, 2);
+  assert.equal(manager.getStats().lastCleanupAtMs, 25000);
+
+  // 3. Second OPFS cleanup when empty still records cleanupCount and timestamp
+  clockMs = 30000;
+  const opfsClearedAgain = await manager.clearOpfsCache();
+  assert.deepEqual(opfsClearedAgain, { supported: true, removedCount: 0, freedBytes: 0 });
+  assert.equal(manager.getStats().evictedEntries, 4);
+  assert.equal(manager.getStats().evictedBytes, 3840);
+  assert.equal(manager.getStats().cleanupCount, 3);
+  assert.equal(manager.getStats().lastCleanupAtMs, 30000);
+
+  // 4. resetStats clears all telemetry cleanly
+  const reset = manager.resetStats();
+  assert.equal(reset.evictedEntries, 0);
+  assert.equal(reset.evictedBytes, 0);
+  assert.equal(reset.cleanupCount, 0);
+  assert.equal(reset.lastCleanupAtMs, null);
+  assert.equal(reset.lastQuotaPressure, 'unknown');
+  assert.equal(reset.lastQuotaUsageRatio, null);
+  assert.equal(reset.lastQuotaSampleAtMs, null);
+});
+
+test('eviction telemetry ignores unsupported cleanups and handles zero or invalid clock outputs safely', async () => {
+  // Unsupported APIs must NOT increment cleanupCount or touch lastCleanupAtMs
+  const unsupportedMgr = new BrowserStorageManager({
+    storageObj: null,
+    opfsRoot: null,
+    indexedDBFactory: null,
+    nowFn: () => 12345,
+  });
+  await unsupportedMgr.clearOpfsCache();
+  await unsupportedMgr.clearUserdata();
+  assert.equal(unsupportedMgr.getStats().cleanupCount, 0);
+  assert.equal(unsupportedMgr.getStats().evictedEntries, 0);
+  assert.equal(unsupportedMgr.getStats().evictedBytes, 0);
+  assert.equal(unsupportedMgr.getStats().lastCleanupAtMs, null);
+
+  // Zero timestamp (0 ms) is preserved as 0 (not treated as falsy null)
+  const zeroClockMgr = new BrowserStorageManager({
+    storageObj: null,
+    opfsRoot: createMockOpfsDirHandle(''),
+    indexedDBFactory: null,
+    nowFn: () => 0,
+  });
+  const missingDirClear = await zeroClockMgr.clearOpfsCache();
+  assert.deepEqual(missingDirClear, { supported: true, removedCount: 0, freedBytes: 0 });
+  assert.equal(zeroClockMgr.getStats().cleanupCount, 1);
+  assert.equal(zeroClockMgr.getStats().lastCleanupAtMs, 0);
+
+  // Throwing or non-finite clock must never break cleanup
+  const badClockMgr = new BrowserStorageManager({
+    storageObj: null,
+    opfsRoot: createMockOpfsDirHandle(''),
+    indexedDBFactory: null,
+    nowFn: () => {
+      throw new Error('clock fault');
+    },
+  });
+  const res = await badClockMgr.clearOpfsCache();
+  assert.equal(res.supported, true);
+  assert.equal(badClockMgr.getStats().cleanupCount, 1);
+  assert.equal(badClockMgr.getStats().lastCleanupAtMs, null);
+});
+
+test('getSummary and getUsageSnapshot expose quota pressure, eviction telemetry, and sanitized output', async () => {
+  let clockMs = 1700001000000;
+  let dynamicUsage = 80 * 1024 * 1024;
+  const dynamicQuota = 100 * 1024 * 1024;
+
+  const opfsRoot = createMockOpfsDirHandle('', {
+    'custom-secret-cache-dir': createMockOpfsDirHandle('custom-secret-cache-dir', {
+      'secret_chunk_01.bin': makePatternBytes(4096, 9),
+    }),
+  });
+  const storageObj = {
+    async estimate() {
+      return { usage: dynamicUsage, quota: dynamicQuota };
+    },
+    async persisted() {
+      return true;
+    },
+    async getDirectory() {
+      return opfsRoot;
+    },
+  };
+  const mockIdb = createMockIndexedDB();
+  const store = new userdataMod.UserdataStore({
+    indexedDB: mockIdb,
+    dbName: 'custom-secret-db',
+    storeName: 'custom-secret-store',
+  });
+  await store.saveFile('/userdata/private/player_slot.sav', makePatternBytes(2048, 11), 1700000500000);
+  store.close();
+
+  const manager = new BrowserStorageManager({
+    storageObj,
+    opfsDirName: 'custom-secret-cache-dir',
+    indexedDBFactory: mockIdb,
+    dbName: 'custom-secret-db',
+    storeName: 'custom-secret-store',
+    warnThresholdRatio: 0.75,
+    criticalThresholdRatio: 0.9,
+    nowFn: () => clockMs,
+  });
+
+  // At 80% usage -> 'warn'
+  const warnSummary = await manager.getSummary();
+  assert.equal(warnSummary.pressure, 'warn');
+  assert.equal(warnSummary.quota.pressure, 'warn');
+  assert.equal(warnSummary.quota.usageRatio, 0.8);
+  assert.equal(warnSummary.quota.warnThresholdRatio, 0.75);
+  assert.equal(warnSummary.quota.criticalThresholdRatio, 0.9);
+  assert.deepEqual(warnSummary.eviction, {
+    evictedEntries: 0,
+    evictedBytes: 0,
+    evictedFormatted: '0 B',
+    cleanupCount: 0,
+    lastCleanupAtMs: null,
+  });
+
+  // Trigger a cleanup, then escalate usage to 95% -> 'critical'
+  clockMs = 1700001005000;
+  await manager.clearOpfsCache();
+  dynamicUsage = 95 * 1024 * 1024;
+  clockMs = 1700001010000;
+
+  const snapshot = await manager.getUsageSnapshot();
+  assert.equal(snapshot.capturedAtMs, 1700001010000);
+  assert.equal(snapshot.pressure, 'critical');
+  assert.deepEqual(snapshot.thresholds, {
+    warnThresholdRatio: 0.75,
+    criticalThresholdRatio: 0.9,
+  });
+  assert.equal(snapshot.quota.supported, true);
+  assert.equal(snapshot.quota.usageBytes, 95 * 1024 * 1024);
+  assert.equal(snapshot.quota.quotaBytes, 100 * 1024 * 1024);
+  assert.equal(snapshot.quota.availableBytes, 5 * 1024 * 1024);
+  assert.equal(snapshot.quota.usageRatio, 0.95);
+  assert.equal(snapshot.quota.percentUsed, 95);
+  assert.equal(snapshot.quota.persisted, true);
+  assert.equal(snapshot.quota.pressure, 'critical');
+  assert.deepEqual(snapshot.opfsCache, {
+    supported: true,
+    entryCount: 0,
+    totalBytes: 0,
+    totalFormatted: '0 B',
+  });
+  assert.deepEqual(snapshot.userdata, {
+    supported: true,
+    fileCount: 1,
+    totalBytes: 2048,
+    totalFormatted: '2 KiB',
+  });
+  assert.equal(snapshot.totalManagedBytes, 2048);
+  assert.equal(snapshot.totalManagedFormatted, '2 KiB');
+  assert.deepEqual(snapshot.eviction, {
+    evictedEntries: 1,
+    evictedBytes: 4096,
+    evictedFormatted: '4 KiB',
+    cleanupCount: 1,
+    lastCleanupAtMs: 1700001005000,
+  });
+
+  // Snapshot must be JSON-serializable and sanitized (no raw paths, filenames, or custom dir/db labels)
+  const serialized = JSON.stringify(snapshot);
+  assert.equal(serialized.includes('secret_chunk_01.bin'), false);
+  assert.equal(serialized.includes('player_slot.sav'), false);
+  assert.equal(serialized.includes('custom-secret-cache-dir'), false);
+  assert.equal(serialized.includes('custom-secret-db'), false);
+  assert.equal(serialized.includes('custom-secret-store'), false);
+  assert.equal('entries' in snapshot.opfsCache, false);
+  assert.equal('files' in snapshot.userdata, false);
 });

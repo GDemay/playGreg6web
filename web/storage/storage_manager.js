@@ -10,6 +10,14 @@ export const DEFAULT_USERDATA_DB_VERSION = 1;
 export const USERDATA_PREFIX = '/userdata/';
 export const SNAPSHOT_FORMAT = 'playgta6-userdata-snapshot';
 export const SNAPSHOT_VERSION = 1;
+export const DEFAULT_WARN_THRESHOLD_RATIO = 0.75;
+export const DEFAULT_CRITICAL_THRESHOLD_RATIO = 0.9;
+export const QUOTA_PRESSURE_LEVELS = Object.freeze({
+  OK: 'ok',
+  WARN: 'warn',
+  CRITICAL: 'critical',
+  UNKNOWN: 'unknown',
+});
 
 const BYTE_UNITS = Object.freeze(['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB']);
 const BASE64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
@@ -210,6 +218,150 @@ function compareAscii(a, b) {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
+function clampUnitRatio(value, fallback) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return fallback;
+  }
+  if (value <= 0) {
+    return 0;
+  }
+  if (value >= 1) {
+    return 1;
+  }
+  return value;
+}
+
+function sanitizeNonNegativeInt(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+    return 0;
+  }
+  return Math.floor(value);
+}
+
+function sanitizeTimestampMs(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return null;
+  }
+  return Math.max(0, Math.floor(value));
+}
+
+function normalizeQuotaThresholds(options = {}) {
+  const opts = options && typeof options === 'object' ? options : {};
+  const hasExplicitCritical =
+    typeof opts.criticalThresholdRatio === 'number' && Number.isFinite(opts.criticalThresholdRatio);
+  let warnThresholdRatio = clampUnitRatio(opts.warnThresholdRatio, DEFAULT_WARN_THRESHOLD_RATIO);
+  let criticalThresholdRatio = clampUnitRatio(
+    opts.criticalThresholdRatio,
+    DEFAULT_CRITICAL_THRESHOLD_RATIO
+  );
+
+  if (warnThresholdRatio > criticalThresholdRatio) {
+    if (!hasExplicitCritical) {
+      criticalThresholdRatio = warnThresholdRatio;
+    } else {
+      warnThresholdRatio = criticalThresholdRatio;
+    }
+  }
+
+  return {
+    warnThresholdRatio,
+    criticalThresholdRatio,
+  };
+}
+
+/**
+ * Classifies browser storage quota pressure into 'ok', 'warn', 'critical', or 'unknown'.
+ *
+ * Accepts either:
+ * - A quota estimate object (`{ supported?, usageBytes, quotaBytes }`, `{ usage, quota }`,
+ *   or `{ supported?, usageRatio }`) and optional threshold overrides, or
+ * - Positional numeric arguments `(usageBytes, quotaBytes, options?)`.
+ *
+ * Non-finite, non-positive quota, or unsupported inputs safely resolve to 'unknown'.
+ * Negative usage values clamp to 0 and over-quota ratios clamp to 1.
+ *
+ * @param {object|number|null|undefined} estimateOrUsage
+ * @param {number|object} [quotaOrOptions]
+ * @param {object} [maybeOptions]
+ * @returns {'ok'|'warn'|'critical'|'unknown'}
+ */
+export function classifyQuotaPressure(estimateOrUsage, quotaOrOptions, maybeOptions) {
+  if (estimateOrUsage === null || estimateOrUsage === undefined) {
+    return QUOTA_PRESSURE_LEVELS.UNKNOWN;
+  }
+
+  let ratio = null;
+  let thresholdSource = null;
+
+  if (typeof estimateOrUsage === 'object') {
+    if (estimateOrUsage.supported === false) {
+      return QUOTA_PRESSURE_LEVELS.UNKNOWN;
+    }
+
+    const usage =
+      estimateOrUsage.usageBytes !== undefined ? estimateOrUsage.usageBytes : estimateOrUsage.usage;
+    const quota =
+      estimateOrUsage.quotaBytes !== undefined ? estimateOrUsage.quotaBytes : estimateOrUsage.quota;
+
+    if (usage === undefined && quota === undefined && typeof estimateOrUsage.usageRatio === 'number') {
+      if (!Number.isFinite(estimateOrUsage.usageRatio)) {
+        return QUOTA_PRESSURE_LEVELS.UNKNOWN;
+      }
+      ratio = clampUnitRatio(estimateOrUsage.usageRatio, 0);
+    } else {
+      if (
+        typeof usage !== 'number' ||
+        !Number.isFinite(usage) ||
+        typeof quota !== 'number' ||
+        !Number.isFinite(quota) ||
+        quota <= 0
+      ) {
+        return QUOTA_PRESSURE_LEVELS.UNKNOWN;
+      }
+      const clampedUsage = Math.max(0, usage);
+      ratio = clampUnitRatio(clampedUsage / quota, 0);
+    }
+
+    thresholdSource = {};
+    if (estimateOrUsage.warnThresholdRatio !== undefined) {
+      thresholdSource.warnThresholdRatio = estimateOrUsage.warnThresholdRatio;
+    }
+    if (estimateOrUsage.criticalThresholdRatio !== undefined) {
+      thresholdSource.criticalThresholdRatio = estimateOrUsage.criticalThresholdRatio;
+    }
+    if (quotaOrOptions && typeof quotaOrOptions === 'object') {
+      if (quotaOrOptions.warnThresholdRatio !== undefined) {
+        thresholdSource.warnThresholdRatio = quotaOrOptions.warnThresholdRatio;
+      }
+      if (quotaOrOptions.criticalThresholdRatio !== undefined) {
+        thresholdSource.criticalThresholdRatio = quotaOrOptions.criticalThresholdRatio;
+      }
+    }
+  } else {
+    if (
+      typeof estimateOrUsage !== 'number' ||
+      !Number.isFinite(estimateOrUsage) ||
+      typeof quotaOrOptions !== 'number' ||
+      !Number.isFinite(quotaOrOptions) ||
+      quotaOrOptions <= 0
+    ) {
+      return QUOTA_PRESSURE_LEVELS.UNKNOWN;
+    }
+    const clampedUsage = Math.max(0, estimateOrUsage);
+    ratio = clampUnitRatio(clampedUsage / quotaOrOptions, 0);
+    thresholdSource = maybeOptions && typeof maybeOptions === 'object' ? maybeOptions : {};
+  }
+
+  const { warnThresholdRatio, criticalThresholdRatio } = normalizeQuotaThresholds(thresholdSource);
+  if (ratio >= criticalThresholdRatio) {
+    return QUOTA_PRESSURE_LEVELS.CRITICAL;
+  }
+  if (ratio >= warnThresholdRatio) {
+    return QUOTA_PRESSURE_LEVELS.WARN;
+  }
+  return QUOTA_PRESSURE_LEVELS.OK;
+}
+
 function isNotFoundError(err) {
   if (!err) return false;
   return err.name === 'NotFoundError' || err.code === 8;
@@ -264,6 +416,9 @@ export class BrowserStorageManager {
    * @param {string} [options.storeName='files'] IndexedDB object store name.
    * @param {number} [options.dbVersion=1] IndexedDB schema version.
    * @param {() => number} [options.now] Injectable clock function returning ms epoch.
+   * @param {() => number} [options.nowFn] Injectable clock function returning ms epoch (preferred over `now`).
+   * @param {number} [options.warnThresholdRatio=0.75] Quota ratio in [0, 1] at/above which pressure is 'warn'.
+   * @param {number} [options.criticalThresholdRatio=0.9] Quota ratio in [0, 1] at/above which pressure is 'critical'.
    */
   constructor(options = {}) {
     this.storageObj =
@@ -305,7 +460,129 @@ export class BrowserStorageManager {
         ? options.dbVersion
         : DEFAULT_USERDATA_DB_VERSION;
 
-    this._now = typeof options.now === 'function' ? options.now : () => Date.now();
+    this._now =
+      typeof options.nowFn === 'function'
+        ? options.nowFn
+        : typeof options.now === 'function'
+          ? options.now
+          : () => Date.now();
+
+    const thresholds = normalizeQuotaThresholds(options);
+    this.warnThresholdRatio = thresholds.warnThresholdRatio;
+    this.criticalThresholdRatio = thresholds.criticalThresholdRatio;
+
+    this._evictedEntries = 0;
+    this._evictedBytes = 0;
+    this._cleanupCount = 0;
+    this._lastCleanupAtMs = null;
+    this._lastQuotaPressure = QUOTA_PRESSURE_LEVELS.UNKNOWN;
+    this._lastQuotaUsageRatio = null;
+    this._lastQuotaSampleAtMs = null;
+  }
+
+  _readNowMs() {
+    try {
+      return sanitizeTimestampMs(this._now());
+    } catch {
+      return null;
+    }
+  }
+
+  _recordCleanup(entries, bytes) {
+    this._evictedEntries += sanitizeNonNegativeInt(entries);
+    this._evictedBytes += sanitizeNonNegativeInt(bytes);
+    this._cleanupCount += 1;
+    this._lastCleanupAtMs = this._readNowMs();
+  }
+
+  _recordQuotaSample(estimate) {
+    const pressure = this.classifyQuotaPressure(estimate);
+    const usageRatio =
+      estimate &&
+      estimate.supported !== false &&
+      typeof estimate.quotaBytes === 'number' &&
+      Number.isFinite(estimate.quotaBytes) &&
+      estimate.quotaBytes > 0 &&
+      typeof estimate.usageBytes === 'number' &&
+      Number.isFinite(estimate.usageBytes)
+        ? clampUnitRatio(Math.max(0, estimate.usageBytes) / estimate.quotaBytes, 0)
+        : null;
+
+    this._lastQuotaPressure = pressure;
+    this._lastQuotaUsageRatio = usageRatio;
+    this._lastQuotaSampleAtMs = this._readNowMs();
+  }
+
+  /**
+   * Classifies quota pressure using this manager's configured thresholds by default,
+   * while allowing per-call threshold overrides.
+   *
+   * @param {object|number|null|undefined} estimateOrUsage
+   * @param {number|object} [quotaOrOptions]
+   * @param {object} [maybeOptions]
+   * @returns {'ok'|'warn'|'critical'|'unknown'}
+   */
+  classifyQuotaPressure(estimateOrUsage, quotaOrOptions, maybeOptions) {
+    const defaultThresholds = {
+      warnThresholdRatio: this.warnThresholdRatio,
+      criticalThresholdRatio: this.criticalThresholdRatio,
+    };
+
+    if (estimateOrUsage !== null && typeof estimateOrUsage === 'object') {
+      const mergedOptions = { ...defaultThresholds };
+      if (quotaOrOptions && typeof quotaOrOptions === 'object') {
+        if (quotaOrOptions.warnThresholdRatio !== undefined) {
+          mergedOptions.warnThresholdRatio = quotaOrOptions.warnThresholdRatio;
+        }
+        if (quotaOrOptions.criticalThresholdRatio !== undefined) {
+          mergedOptions.criticalThresholdRatio = quotaOrOptions.criticalThresholdRatio;
+        }
+      }
+      return classifyQuotaPressure(estimateOrUsage, mergedOptions);
+    }
+
+    const mergedOptions = { ...defaultThresholds };
+    if (maybeOptions && typeof maybeOptions === 'object') {
+      if (maybeOptions.warnThresholdRatio !== undefined) {
+        mergedOptions.warnThresholdRatio = maybeOptions.warnThresholdRatio;
+      }
+      if (maybeOptions.criticalThresholdRatio !== undefined) {
+        mergedOptions.criticalThresholdRatio = maybeOptions.criticalThresholdRatio;
+      }
+    }
+    return classifyQuotaPressure(estimateOrUsage, quotaOrOptions, mergedOptions);
+  }
+
+  /**
+   * Returns a fresh, sanitized snapshot of eviction & quota telemetry counters.
+   */
+  getStats() {
+    return {
+      evictedEntries: this._evictedEntries,
+      evictedBytes: this._evictedBytes,
+      evictedFormatted: formatBytes(this._evictedBytes),
+      cleanupCount: this._cleanupCount,
+      lastCleanupAtMs: this._lastCleanupAtMs,
+      warnThresholdRatio: this.warnThresholdRatio,
+      criticalThresholdRatio: this.criticalThresholdRatio,
+      lastQuotaPressure: this._lastQuotaPressure,
+      lastQuotaUsageRatio: this._lastQuotaUsageRatio,
+      lastQuotaSampleAtMs: this._lastQuotaSampleAtMs,
+    };
+  }
+
+  /**
+   * Resets eviction and last-observed quota telemetry counters and returns the cleared stats.
+   */
+  resetStats() {
+    this._evictedEntries = 0;
+    this._evictedBytes = 0;
+    this._cleanupCount = 0;
+    this._lastCleanupAtMs = null;
+    this._lastQuotaPressure = QUOTA_PRESSURE_LEVELS.UNKNOWN;
+    this._lastQuotaUsageRatio = null;
+    this._lastQuotaSampleAtMs = null;
+    return this.getStats();
   }
 
   // --- Storage Quota & Persistence ---
@@ -321,6 +598,7 @@ export class BrowserStorageManager {
     };
 
     if (!this.storageObj || typeof this.storageObj.estimate !== 'function') {
+      this._recordQuotaSample(fallback);
       return fallback;
     }
 
@@ -349,7 +627,7 @@ export class BrowserStorageManager {
         }
       }
 
-      return {
+      const result = {
         supported: true,
         usageBytes,
         quotaBytes,
@@ -357,7 +635,10 @@ export class BrowserStorageManager {
         percentUsed,
         persisted,
       };
+      this._recordQuotaSample(result);
+      return result;
     } catch {
+      this._recordQuotaSample(fallback);
       return fallback;
     }
   }
@@ -476,6 +757,7 @@ export class BrowserStorageManager {
       cacheDir = await root.getDirectoryHandle(this.opfsDirName, { create: false });
     } catch (err) {
       if (isNotFoundError(err)) {
+        this._recordCleanup(0, 0);
         return { supported: true, removedCount: 0, freedBytes: 0 };
       }
       return unsupported;
@@ -514,6 +796,7 @@ export class BrowserStorageManager {
         freedBytes += item.bytes;
       }
 
+      this._recordCleanup(removedCount, freedBytes);
       return {
         supported: true,
         removedCount,
@@ -929,13 +1212,14 @@ export class BrowserStorageManager {
       return unsupported;
     }
 
+    this._recordCleanup(result.value.clearedCount, result.value.freedBytes);
     return {
       supported: true,
       ...result.value,
     };
   }
 
-  // --- Combined HUD Summary ---
+  // --- Combined HUD Summary & Sanitized Usage Snapshot ---
 
   async getSummary() {
     const [quota, opfsCache, userdata] = await Promise.all([
@@ -945,10 +1229,20 @@ export class BrowserStorageManager {
     ]);
 
     const totalManagedBytes = opfsCache.totalBytes + userdata.totalBytes;
+    const pressure = this.classifyQuotaPressure(quota);
+    const usageRatio =
+      quota.supported && quota.quotaBytes > 0
+        ? clampUnitRatio(Math.max(0, quota.usageBytes) / quota.quotaBytes, 0)
+        : null;
 
     return {
+      pressure,
       quota: {
         ...quota,
+        usageRatio,
+        pressure,
+        warnThresholdRatio: this.warnThresholdRatio,
+        criticalThresholdRatio: this.criticalThresholdRatio,
         usageFormatted: formatBytes(quota.usageBytes),
         quotaFormatted: formatBytes(quota.quotaBytes),
         availableFormatted: formatBytes(quota.availableBytes),
@@ -970,6 +1264,65 @@ export class BrowserStorageManager {
       },
       totalManagedBytes,
       totalManagedFormatted: formatBytes(totalManagedBytes),
+      eviction: {
+        evictedEntries: this._evictedEntries,
+        evictedBytes: this._evictedBytes,
+        evictedFormatted: formatBytes(this._evictedBytes),
+        cleanupCount: this._cleanupCount,
+        lastCleanupAtMs: this._lastCleanupAtMs,
+      },
+    };
+  }
+
+  /**
+   * Returns a sanitized, JSON-serializable usage & telemetry snapshot suitable
+   * for HUD badges, crash reports, and diagnostics (no raw file paths or payloads).
+   */
+  async getUsageSnapshot() {
+    const summary = await this.getSummary();
+    const stats = this.getStats();
+
+    return {
+      capturedAtMs: this._readNowMs(),
+      pressure: summary.pressure,
+      thresholds: {
+        warnThresholdRatio: this.warnThresholdRatio,
+        criticalThresholdRatio: this.criticalThresholdRatio,
+      },
+      quota: {
+        supported: summary.quota.supported,
+        usageBytes: summary.quota.usageBytes,
+        quotaBytes: summary.quota.quotaBytes,
+        availableBytes: summary.quota.availableBytes,
+        usageRatio: summary.quota.usageRatio,
+        percentUsed: summary.quota.percentUsed,
+        persisted: summary.quota.persisted,
+        pressure: summary.quota.pressure,
+        usageFormatted: summary.quota.usageFormatted,
+        quotaFormatted: summary.quota.quotaFormatted,
+        availableFormatted: summary.quota.availableFormatted,
+      },
+      opfsCache: {
+        supported: summary.opfsCache.supported,
+        entryCount: summary.opfsCache.entryCount,
+        totalBytes: summary.opfsCache.totalBytes,
+        totalFormatted: summary.opfsCache.totalFormatted,
+      },
+      userdata: {
+        supported: summary.userdata.supported,
+        fileCount: summary.userdata.fileCount,
+        totalBytes: summary.userdata.totalBytes,
+        totalFormatted: summary.userdata.totalFormatted,
+      },
+      totalManagedBytes: summary.totalManagedBytes,
+      totalManagedFormatted: summary.totalManagedFormatted,
+      eviction: {
+        evictedEntries: stats.evictedEntries,
+        evictedBytes: stats.evictedBytes,
+        evictedFormatted: stats.evictedFormatted,
+        cleanupCount: stats.cleanupCount,
+        lastCleanupAtMs: stats.lastCleanupAtMs,
+      },
     };
   }
 }
