@@ -11,8 +11,10 @@
   const DEFAULT_QUANTUM_FRAMES = 128;
   const DEFAULT_INITIAL_BUFFER_FRAMES = 1024;
   const DEFAULT_GAIN_RAMP_FRAMES = 64;
+  const DEFAULT_UNDERRUN_RAMP_FRAMES = 64;
   const DEFAULT_SOFT_CLIP_KNEE = 0.95;
   const DEFAULT_LIMITER_KNEE = DEFAULT_SOFT_CLIP_KNEE;
+  const DEFAULT_SOFT_LIMIT_KNEE = 0.9;
 
   // ITU-R BS.775-3 multi-channel to stereo downmix weights (-3 dB center & surround, LFE omitted by default).
   const ITU_BS775_CENTER_GAIN = Math.SQRT1_2;
@@ -443,6 +445,218 @@
     return x < 0 ? -bounded : bounded;
   }
 
+  /**
+   * Sanitizes non-finite samples (`NaN` / `±Infinity`) to `0.0`, passes normal
+   * audio `|x| <= knee` (default `0.9`) bit-exact linearly, and smoothly
+   * soft-clips `|x| > knee` into `[-1.0, 1.0]` using a C1-continuous `tanh` knee.
+   *
+   * @param {number} x Input sample value.
+   * @param {number} [knee=0.9] Linear passthrough threshold in `[0, 1)`.
+   * @returns {number} Finite sample strictly bounded inside `[-1.0, 1.0]`.
+   */
+  function softLimitSample(x, knee = DEFAULT_SOFT_LIMIT_KNEE) {
+    if (typeof knee !== 'number' || !Number.isFinite(knee) || knee < 0 || knee >= 1.0) {
+      throw new RangeError(`knee must be in [0, 1), got ${knee}`);
+    }
+    if (typeof x !== 'number' || !Number.isFinite(x)) {
+      return 0.0;
+    }
+    const absX = x < 0 ? -x : x;
+    if (absX <= knee) {
+      return x;
+    }
+    const headroom = 1.0 - knee;
+    const compressed = knee + headroom * Math.tanh((absX - knee) / headroom);
+    const bounded = compressed > 1.0 ? 1.0 : compressed;
+    return x < 0 ? -bounded : bounded;
+  }
+
+  /**
+   * Sanitizes non-finite samples to `0.0` and applies transparent `softLimitSample`
+   * protection in place across `samples[0 .. count - 1]`.
+   * Pass a reusable `outStats` object to avoid any heap allocation on hot paths.
+   *
+   * @param {Float32Array|number[]} samples
+   * @param {number} [count] Number of samples to process (defaults to `samples.length`).
+   * @param {number|object} [kneeOrOptions=0.9] Knee in `[0, 1)` or `{ knee, stats }`.
+   * @param {{ softClippedSamples: number, nonFiniteSanitized: number }} [outStats]
+   * @returns {{ softClippedSamples: number, nonFiniteSanitized: number }}
+   */
+  function sanitizeAndSoftLimitBuffer(samples, count, kneeOrOptions = DEFAULT_SOFT_LIMIT_KNEE, outStats = null) {
+    if (!samples || typeof samples.length !== 'number') {
+      throw new TypeError('sanitizeAndSoftLimitBuffer requires a Float32Array or array-like buffer');
+    }
+
+    let knee = DEFAULT_SOFT_LIMIT_KNEE;
+    let statsTarget = outStats;
+    if (typeof kneeOrOptions === 'object' && kneeOrOptions !== null) {
+      if (kneeOrOptions.knee !== undefined) {
+        knee = kneeOrOptions.knee;
+      } else if (kneeOrOptions.softLimitKnee !== undefined) {
+        knee = kneeOrOptions.softLimitKnee;
+      }
+      if (!statsTarget && kneeOrOptions.stats && typeof kneeOrOptions.stats === 'object') {
+        statsTarget = kneeOrOptions.stats;
+      } else if (
+        !statsTarget &&
+        kneeOrOptions.knee === undefined &&
+        kneeOrOptions.softLimitKnee === undefined
+      ) {
+        statsTarget = kneeOrOptions;
+      }
+    } else if (kneeOrOptions !== undefined) {
+      knee = kneeOrOptions;
+    }
+
+    if (typeof knee !== 'number' || !Number.isFinite(knee) || knee < 0 || knee >= 1.0) {
+      throw new RangeError(`knee must be in [0, 1), got ${knee}`);
+    }
+
+    let n;
+    if (count === undefined || count === null) {
+      n = samples.length;
+    } else {
+      if (typeof count !== 'number' || !Number.isFinite(count) || count < 0) {
+        throw new RangeError(`count must be a non-negative finite number, got ${count}`);
+      }
+      n = Math.floor(count);
+      if (n > samples.length) n = samples.length;
+    }
+
+    const negKnee = -knee;
+    const headroom = 1.0 - knee;
+    let softClippedSamples = 0;
+    let nonFiniteSanitized = 0;
+
+    for (let i = 0; i < n; i++) {
+      const s = samples[i];
+      if (s - s !== 0) {
+        samples[i] = 0.0;
+        nonFiniteSanitized += 1;
+      } else if (s > knee) {
+        const compressed = knee + headroom * Math.tanh((s - knee) / headroom);
+        samples[i] = compressed > 1.0 ? 1.0 : compressed;
+        softClippedSamples += 1;
+      } else if (s < negKnee) {
+        const compressed = knee + headroom * Math.tanh((-s - knee) / headroom);
+        samples[i] = compressed > 1.0 ? -1.0 : -compressed;
+        softClippedSamples += 1;
+      }
+    }
+
+    if (statsTarget) {
+      statsTarget.softClippedSamples = (statsTarget.softClippedSamples || 0) + softClippedSamples;
+      statsTarget.nonFiniteSanitized = (statsTarget.nonFiniteSanitized || 0) + nonFiniteSanitized;
+      return statsTarget;
+    }
+
+    return { softClippedSamples, nonFiniteSanitized };
+  }
+
+  /**
+   * Applies an in-place, zero-allocation half-cosine smooth gain ramp over
+   * `frameCount` interleaved frames from `startGain` to `endGain`.
+   *
+   * @param {Float32Array|number[]} samples Interleaved PCM sample buffer modified in place.
+   * @param {number} [channels=1] Number of interleaved channels (>= 1).
+   * @param {number} [frameCount] Number of frames to ramp (clamped to buffer length).
+   * @param {number} [startGain=1.0] Starting gain at frame 0.
+   * @param {number} [endGain=0.0] Ending gain at frame `frameCount - 1`.
+   * @returns {Float32Array|number[]} The mutated `samples` buffer.
+   */
+  function applyFadeRamp(samples, channels = 1, frameCount, startGain = 1.0, endGain = 0.0) {
+    if (!samples || typeof samples.length !== 'number') {
+      throw new TypeError('applyFadeRamp requires a Float32Array or array-like sample buffer');
+    }
+    if (!Number.isInteger(channels) || channels <= 0) {
+      throw new RangeError(`channels must be a positive integer, got ${channels}`);
+    }
+
+    const maxFrames = Math.floor(samples.length / channels);
+    let n;
+    if (frameCount === undefined || frameCount === null) {
+      n = maxFrames;
+    } else {
+      if (typeof frameCount !== 'number' || !Number.isFinite(frameCount) || frameCount < 0) {
+        throw new RangeError(`frameCount must be a non-negative finite number, got ${frameCount}`);
+      }
+      n = Math.floor(frameCount);
+      if (n > maxFrames) n = maxFrames;
+    }
+    if (n <= 0) {
+      return samples;
+    }
+
+    const g0 = typeof startGain === 'number' && Number.isFinite(startGain) ? startGain : 0.0;
+    const g1 = typeof endGain === 'number' && Number.isFinite(endGain) ? endGain : 0.0;
+
+    if (n === 1) {
+      for (let c = 0; c < channels; c++) {
+        const s = samples[c];
+        samples[c] = g1 === 0.0 || s - s !== 0 ? 0.0 : s * g1;
+      }
+      return samples;
+    }
+
+    const gDiff = g1 - g0;
+    const lastIdx = n - 1;
+    const invDenom = Math.PI / lastIdx;
+
+    if (channels === 2) {
+      for (let f = 0; f < n; f++) {
+        const gain =
+          f === 0
+            ? g0
+            : f === lastIdx
+              ? g1
+              : g0 + gDiff * (0.5 * (1.0 - Math.cos(f * invDenom)));
+        const base = f * 2;
+        if (gain === 0.0) {
+          samples[base] = 0.0;
+          samples[base + 1] = 0.0;
+        } else {
+          const s0 = samples[base];
+          const s1 = samples[base + 1];
+          samples[base] = s0 - s0 !== 0 ? 0.0 : s0 * gain;
+          samples[base + 1] = s1 - s1 !== 0 ? 0.0 : s1 * gain;
+        }
+      }
+    } else if (channels === 1) {
+      for (let f = 0; f < n; f++) {
+        const gain =
+          f === 0
+            ? g0
+            : f === lastIdx
+              ? g1
+              : g0 + gDiff * (0.5 * (1.0 - Math.cos(f * invDenom)));
+        const s = samples[f];
+        samples[f] = gain === 0.0 || s - s !== 0 ? 0.0 : s * gain;
+      }
+    } else {
+      for (let f = 0; f < n; f++) {
+        const gain =
+          f === 0
+            ? g0
+            : f === lastIdx
+              ? g1
+              : g0 + gDiff * (0.5 * (1.0 - Math.cos(f * invDenom)));
+        const base = f * channels;
+        if (gain === 0.0) {
+          for (let c = 0; c < channels; c++) {
+            samples[base + c] = 0.0;
+          }
+        } else {
+          for (let c = 0; c < channels; c++) {
+            const s = samples[base + c];
+            samples[base + c] = s - s !== 0 ? 0.0 : s * gain;
+          }
+        }
+      }
+    }
+
+    return samples;
+  }
+
   function validateDownmixGain(value, fallback, name) {
     if (value === undefined) {
       return fallback;
@@ -855,7 +1069,9 @@
           ? options.limiterKnee
           : options.softClipKnee !== undefined
             ? options.softClipKnee
-            : DEFAULT_LIMITER_KNEE;
+            : options.softLimitKnee !== undefined
+              ? options.softLimitKnee
+              : DEFAULT_LIMITER_KNEE;
       if (
         typeof limiterKnee !== 'number' ||
         !Number.isFinite(limiterKnee) ||
@@ -886,6 +1102,11 @@
             ? resolveRampFrames(options.rampFrames, sampleRate, 0)
             : 0;
 
+      const underrunRampFrames =
+        options.underrunRampFrames !== undefined
+          ? resolveRampFrames(options.underrunRampFrames, sampleRate, DEFAULT_UNDERRUN_RAMP_FRAMES)
+          : DEFAULT_UNDERRUN_RAMP_FRAMES;
+
       const reuseOutputBuffer = Boolean(options.reuseOutputBuffer);
 
       this.sampleRate = sampleRate;
@@ -896,6 +1117,7 @@
       this._masterGainRampRemaining = 0;
       this._masterGainRampStep = 0.0;
       this._defaultGainRampFrames = defaultGainRampFrames;
+      this._underrunRampFrames = underrunRampFrames;
       this._reuseOutputBuffer = reuseOutputBuffer;
       this._softClip = softClip;
       this._limiterKnee = limiterKnee;
@@ -924,8 +1146,17 @@
       this._resampledFrames = 0;
       this._ringUnderrunCount = 0;
       this._manualUnderrunQuanta = 0;
+      this._underrunFadeOuts = 0;
+      this._recoveryFadeIns = 0;
+      this._recoveryFadeRemaining = 0;
+      this._recoveryFadeTotal = 0;
+      this._pumpRecoveryFadeRemaining = 0;
+      this._pumpRecoveryFadeTotal = 0;
+      this._lastOutL = 0.0;
+      this._lastOutR = 0.0;
       this._peakOutputLevel = 0.0;
       this._clippedSamples = 0;
+      this._softClippedSamples = 0;
       this._sanitizedNonFiniteSamples = 0;
       this._activeVoicePeak = 0;
     }
@@ -1332,14 +1563,151 @@
      * an AudioWorklet quantum callback or stream feeder).
      *
      * @param {number} [quanta=1]
+     * @param {object} [options]
+     * @param {boolean} [options.armRecovery=false] When true, arms a smooth cosine fade-in on recovery.
      * @returns {number} Updated total underrunQuanta count.
      */
-    recordUnderrun(quanta = 1) {
+    recordUnderrun(quanta = 1, options) {
       if (!Number.isInteger(quanta) || quanta < 0) {
         throw new RangeError(`quanta must be a non-negative integer, got ${quanta}`);
       }
       this._manualUnderrunQuanta += quanta;
+      if (quanta > 0 && options && options.armRecovery) {
+        this.armRecoveryFadeIn();
+      }
       return this._ringUnderrunCount + this._manualUnderrunQuanta;
+    }
+
+    /**
+     * Arms a smooth half-cosine fade-in (`0.0 -> 1.0`) for the next rendered
+     * output frames after an underrun.
+     *
+     * @param {number|object} [rampFrames] Defaults to `underrunRampFrames` (64).
+     * @returns {number} Armed fade-in frame count.
+     */
+    armRecoveryFadeIn(rampFrames) {
+      const frames = resolveRampFrames(
+        rampFrames,
+        this.sampleRate,
+        this._underrunRampFrames
+      );
+      if (frames > 0) {
+        this._recoveryFadeTotal = frames;
+        this._recoveryFadeRemaining = frames;
+        this._recoveryFadeIns += 1;
+      }
+      return frames;
+    }
+
+    /**
+     * Generates a click-free half-cosine fade-out from the last rendered stereo
+     * sample `(lastOutL, lastOutR)` down to `0.0` over up to `underrunRampFrames`
+     * frames and zero-fills any remaining frames, arming a smooth recovery fade-in.
+     *
+     * Pass a caller-supplied `Float32Array` as `targetBufferOrFrames` for zero
+     * heap allocations, or a numeric frame count to return a new `Float32Array`.
+     *
+     * @param {Float32Array|number} targetBufferOrFrames
+     * @param {number} [frameCount]
+     * @returns {number|Float32Array} Frame count written (buffer mode) or new Float32Array (count mode).
+     */
+    renderUnderrunFadeOut(targetBufferOrFrames, frameCount) {
+      let target;
+      let frames;
+      let returnBuffer = false;
+
+      if (typeof targetBufferOrFrames === 'number') {
+        if (!Number.isInteger(targetBufferOrFrames) || targetBufferOrFrames < 0) {
+          throw new RangeError(`frameCount must be a non-negative integer, got ${targetBufferOrFrames}`);
+        }
+        frames = targetBufferOrFrames;
+        target = new Float32Array(frames * 2);
+        returnBuffer = true;
+      } else if (targetBufferOrFrames instanceof Float32Array) {
+        target = targetBufferOrFrames;
+        frames = frameCount !== undefined ? frameCount : Math.floor(target.length / 2);
+        if (!Number.isInteger(frames) || frames < 0) {
+          throw new RangeError(`frameCount must be a non-negative integer, got ${frames}`);
+        }
+        if (target.length < frames * 2) {
+          throw new RangeError(
+            `targetBuffer length (${target.length}) is smaller than required ${frames * 2} samples`
+          );
+        }
+      } else {
+        throw new TypeError('renderUnderrunFadeOut expects a Float32Array or non-negative integer frameCount');
+      }
+
+      if (frames === 0) {
+        return returnBuffer ? target : 0;
+      }
+
+      const lastL = this._lastOutL;
+      const lastR = this._lastOutR;
+      const fadeFrames =
+        this._underrunRampFrames > 0
+          ? frames < this._underrunRampFrames
+            ? frames
+            : this._underrunRampFrames
+          : 0;
+
+      if (fadeFrames > 0 && (lastL !== 0.0 || lastR !== 0.0)) {
+        for (let f = 0; f < fadeFrames; f++) {
+          const base = f * 2;
+          target[base] = lastL;
+          target[base + 1] = lastR;
+        }
+        applyFadeRamp(target, 2, fadeFrames, 1.0, 0.0);
+        if (fadeFrames < frames) {
+          target.fill(0.0, fadeFrames * 2, frames * 2);
+        }
+        this._underrunFadeOuts += 1;
+        this._lastOutL = 0.0;
+        this._lastOutR = 0.0;
+      } else {
+        target.fill(0.0, 0, frames * 2);
+      }
+
+      this.armRecoveryFadeIn();
+      return returnBuffer ? target : frames;
+    }
+
+    /**
+     * Applies an in-place zero-alloc half-cosine recovery fade-in chunk
+     * spanning frames `[startPos .. startPos + rampCount - 1]` of `total`.
+     *
+     * @private
+     */
+    _applyCosineFadeInChunk(output, frameCount, startPos, total) {
+      const remaining = total - startPos;
+      const rampCount = frameCount < remaining ? frameCount : remaining;
+      if (rampCount <= 0) {
+        return 0;
+      }
+      if (startPos === 0 && rampCount === total) {
+        applyFadeRamp(output, 2, total, 0.0, 1.0);
+        return rampCount;
+      }
+      const lastIdx = total - 1;
+      const invDenom = lastIdx > 0 ? Math.PI / lastIdx : 0.0;
+      for (let f = 0; f < rampCount; f++) {
+        const idx = startPos + f;
+        const gain =
+          idx === 0
+            ? 0.0
+            : idx >= lastIdx
+              ? 1.0
+              : 0.5 * (1.0 - Math.cos(idx * invDenom));
+        const base = f * 2;
+        if (gain === 0.0) {
+          output[base] = 0.0;
+          output[base + 1] = 0.0;
+        } else if (gain !== 1.0) {
+          output[base] *= gain;
+          output[base + 1] *= gain;
+        }
+      }
+      return rampCount;
     }
 
     /**
@@ -1937,8 +2305,26 @@
         }
       }
 
+      if (this._recoveryFadeRemaining > 0) {
+        const total = this._recoveryFadeTotal;
+        const startPos = total - this._recoveryFadeRemaining;
+        const applied = this._applyCosineFadeInChunk(output, frameCount, startPos, total);
+        this._recoveryFadeRemaining -= applied;
+        if (this._recoveryFadeRemaining <= 0) {
+          this._recoveryFadeRemaining = 0;
+          this._recoveryFadeTotal = 0;
+        }
+      }
+
+      const lastBase = (frameCount - 1) * 2;
+      this._lastOutL = output[lastBase];
+      this._lastOutR = output[lastBase + 1];
+
       this._peakOutputLevel = peak;
       this._clippedSamples += clipped;
+      if (softClip) {
+        this._softClippedSamples += clipped;
+      }
       this._sanitizedNonFiniteSamples += sanitized;
       this._downmixedFrames += downmixed;
       this._resampledFrames += resampled;
@@ -2066,7 +2452,11 @@
                 audioRingBuffer.underrunQuanta >= 0
               ? Math.floor(audioRingBuffer.underrunQuanta)
               : null;
+      let detectedRingUnderrun = false;
       if (ringUnderruns !== null) {
+        if (ringUnderruns > this._ringUnderrunCount) {
+          detectedRingUnderrun = true;
+        }
         this._ringUnderrunCount = ringUnderruns;
       }
 
@@ -2100,6 +2490,12 @@
         framesToRender = Math.min(framesToRender, maxFrames);
       }
 
+      if (detectedRingUnderrun && this._underrunRampFrames > 0) {
+        this._pumpRecoveryFadeTotal = this._underrunRampFrames;
+        this._pumpRecoveryFadeRemaining = this._underrunRampFrames;
+        this._recoveryFadeIns += 1;
+      }
+
       if (framesToRender <= 0) {
         return 0;
       }
@@ -2115,6 +2511,20 @@
 
       const outView = this._getScratchOutputView(framesToRender * 2);
       this._mixIntoBuffer(outView, framesToRender);
+
+      if (this._pumpRecoveryFadeRemaining > 0) {
+        const total = this._pumpRecoveryFadeTotal;
+        const startPos = total - this._pumpRecoveryFadeRemaining;
+        const applied = this._applyCosineFadeInChunk(outView, framesToRender, startPos, total);
+        this._pumpRecoveryFadeRemaining -= applied;
+        if (this._pumpRecoveryFadeRemaining <= 0) {
+          this._pumpRecoveryFadeRemaining = 0;
+          this._pumpRecoveryFadeTotal = 0;
+        }
+        const lastBase = (framesToRender - 1) * 2;
+        this._lastOutL = outView[lastBase];
+        this._lastOutR = outView[lastBase + 1];
+      }
 
       if (ringChannels === 2) {
         return hasPushSamples
@@ -2165,8 +2575,17 @@
       this._resampledFrames = 0;
       this._ringUnderrunCount = 0;
       this._manualUnderrunQuanta = 0;
+      this._underrunFadeOuts = 0;
+      this._recoveryFadeIns = 0;
+      this._recoveryFadeRemaining = 0;
+      this._recoveryFadeTotal = 0;
+      this._pumpRecoveryFadeRemaining = 0;
+      this._pumpRecoveryFadeTotal = 0;
+      this._lastOutL = 0.0;
+      this._lastOutR = 0.0;
       this._peakOutputLevel = 0.0;
       this._clippedSamples = 0;
+      this._softClippedSamples = 0;
       this._sanitizedNonFiniteSamples = 0;
       this._scratchReallocations = 0;
       this._activeVoicePeak = clearVoices ? 0 : this._countActiveVoices();
@@ -2206,6 +2625,7 @@
         softClip: this._softClip,
         limiterKnee: this._limiterKnee,
         gainRampFrames: this._defaultGainRampFrames,
+        underrunRampFrames: this._underrunRampFrames,
         framesMixed: this._renderedFrames,
         renderedFrames: this._renderedFrames,
         quantaMixed: this._quantaMixed,
@@ -2213,11 +2633,15 @@
         resampledFrames: this._resampledFrames,
         underrunQuanta: totalUnderruns,
         underrunCount: totalUnderruns,
+        underrunFadeOuts: this._underrunFadeOuts,
+        recoveryFadeIns: this._recoveryFadeIns,
         peakLevel: this._peakOutputLevel,
         peakOutputLevel: this._peakOutputLevel,
         clippedSamples: this._clippedSamples,
+        softClippedSamples: this._softClippedSamples,
         sanitizedNonFiniteSamples: this._sanitizedNonFiniteSamples,
         nanSanitizedSamples: this._sanitizedNonFiniteSamples,
+        nonFiniteSanitized: this._sanitizedNonFiniteSamples,
         peakVoices: this._activeVoicePeak,
         activeVoicePeak: this._activeVoicePeak,
         scratchCapacityFrames: this._mixScratch.length >>> 1,
@@ -2231,6 +2655,9 @@
     decodePcm16,
     decodeImaAdpcm,
     softClipSample,
+    softLimitSample,
+    sanitizeAndSoftLimitBuffer,
+    applyFadeRamp,
     downmixToStereo,
     resampleLinear,
     DEFAULT_SAMPLE_RATE,
@@ -2243,7 +2670,9 @@
     DEFAULT_QUANTUM_FRAMES,
     DEFAULT_INITIAL_BUFFER_FRAMES,
     DEFAULT_GAIN_RAMP_FRAMES,
+    DEFAULT_UNDERRUN_RAMP_FRAMES,
     DEFAULT_SOFT_CLIP_KNEE,
+    DEFAULT_SOFT_LIMIT_KNEE,
     ITU_BS775_CENTER_GAIN,
     ITU_BS775_SURROUND_GAIN,
     ITU_BS775_LFE_GAIN,
