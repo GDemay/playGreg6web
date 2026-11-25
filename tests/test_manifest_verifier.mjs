@@ -13,13 +13,18 @@ import {
   INCOMPLETE_DOWNLOAD_SUFFIXES,
   MANIFEST_ABI_VERSION,
   MISMATCH_CATEGORIES,
+  SCHEMA_DIAGNOSTIC_CODES,
+  STREAM_HASH_ALGORITHMS,
+  computeDigest,
   computeStreamingReadiness,
+  createIncrementalVerifier,
   hasIncompleteSuffix,
   parseContentRange,
   validateBootset,
   validateDataManifest,
   validateManifestPath,
   verifyLiveEndpoints,
+  verifyStream,
 } from '../web/storage/manifest_verifier.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -1343,5 +1348,601 @@ describe('verification telemetry, mismatch categories, AbortSignal, and sanitiza
     assert.equal(/[\x00-\x1f\x7f]/.test(serialized), false);
     assert.ok(serialized.includes('<redacted-path>'));
     assert.equal(report.mismatchesByCategory.hash_mismatch, 1);
+  });
+});
+
+function makeSyntheticPayload(byteLength, seed = 0x5a) {
+  const out = new Uint8Array(byteLength);
+  let state = (seed >>> 0) || 1;
+  for (let i = 0; i < byteLength; i += 1) {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+    out[i] = (state >>> 24) & 0xff;
+  }
+  return out;
+}
+
+function splitIntoChunks(bytes, sizes) {
+  const chunks = [];
+  let offset = 0;
+  let sizeIdx = 0;
+  while (offset < bytes.byteLength) {
+    const requested = sizes[sizeIdx % sizes.length];
+    sizeIdx += 1;
+    if (requested === 0) {
+      chunks.push(new Uint8Array(0));
+      continue;
+    }
+    const end = Math.min(bytes.byteLength, offset + requested);
+    chunks.push(bytes.subarray(offset, end));
+    offset = end;
+  }
+  return chunks;
+}
+
+function createChunkReadableStream(chunks, options = {}) {
+  let idx = 0;
+  let cancelled = false;
+  let pulls = 0;
+  const stream = new ReadableStream({
+    pull(controller) {
+      pulls += 1;
+      if (options.hangAtIndex !== undefined && idx === options.hangAtIndex) {
+        if (options.onHang) options.onHang();
+        return new Promise(() => {});
+      }
+      if (idx >= chunks.length) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(chunks[idx]);
+      idx += 1;
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+  return {
+    stream,
+    get pulls() {
+      return pulls;
+    },
+    get cancelled() {
+      return cancelled;
+    },
+  };
+}
+
+describe('incremental streaming chunk verification & schema diagnostics (W221)', () => {
+  it('exports frozen STREAM_HASH_ALGORITHMS and SCHEMA_DIAGNOSTIC_CODES constants', () => {
+    assert.deepEqual(STREAM_HASH_ALGORITHMS, {
+      SHA256: 'sha256',
+      CRC32: 'crc32',
+      FNV1A32: 'fnv1a32',
+      FNV1A64: 'fnv1a64',
+    });
+    assert.equal(Object.isFrozen(STREAM_HASH_ALGORITHMS), true);
+    assert.equal(Object.isFrozen(SCHEMA_DIAGNOSTIC_CODES), true);
+    assert.equal(SCHEMA_DIAGNOSTIC_CODES.TOTAL_BYTES_MISMATCH, 'TOTAL_BYTES_MISMATCH');
+    assert.equal(SCHEMA_DIAGNOSTIC_CODES.CHUNK_HASH_COUNT_MISMATCH, 'CHUNK_HASH_COUNT_MISMATCH');
+  });
+
+  it('matches known reference vectors and Node crypto SHA-256 across all block boundary sizes', () => {
+    const enc = new TextEncoder();
+
+    // Known reference vectors
+    assert.equal(computeDigest(new Uint8Array(0), 'sha256'), sha256Hex(new Uint8Array(0)));
+    assert.equal(computeDigest(enc.encode('abc'), 'SHA-256'), sha256Hex(enc.encode('abc')));
+
+    assert.equal(computeDigest(new Uint8Array(0), 'crc32'), '00000000');
+    assert.equal(computeDigest(enc.encode('123456789'), 'CRC-32'), 'cbf43926');
+
+    assert.equal(computeDigest(new Uint8Array(0), 'fnv1a32'), '811c9dc5');
+    assert.equal(computeDigest(enc.encode('a'), 'fnv-1a'), 'e40c292c');
+    assert.equal(computeDigest(enc.encode('foobar'), 'fnv1a32'), 'bf9cf968');
+
+    assert.equal(computeDigest(new Uint8Array(0), 'fnv1a64'), 'cbf29ce484222325');
+    assert.equal(computeDigest(enc.encode('a'), 'fnv1a-64'), 'af63dc4c8601ec8c');
+    assert.equal(computeDigest(enc.encode('foobar'), 'fnv1a64'), '85944171f73967e8');
+
+    // Every critical SHA-256 padding/block boundary: 55, 56, 57, 63, 64, 65, 119, 120, 127, 128, 129, etc.
+    const boundarySizes = [0, 1, 2, 54, 55, 56, 57, 63, 64, 65, 119, 120, 127, 128, 129, 1024, 65537];
+    for (const size of boundarySizes) {
+      const payload = makeSyntheticPayload(size, size + 17);
+      const expected = sha256Hex(payload);
+      const actual = computeDigest(payload, 'sha256');
+      assert.equal(actual, expected, `SHA-256 mismatch at boundary size=${size}`);
+    }
+  });
+
+  it('guarantees single-shot vs multi-chunk streaming equivalence across algorithms, view types, and chunkings', async () => {
+    const payload = makeSyntheticPayload(131072 + 373, 0x221); // ~128 KiB synthetic .pgim payload
+    const algorithms = [
+      STREAM_HASH_ALGORITHMS.SHA256,
+      STREAM_HASH_ALGORITHMS.CRC32,
+      STREAM_HASH_ALGORITHMS.FNV1A32,
+      STREAM_HASH_ALGORITHMS.FNV1A64,
+    ];
+
+    for (const algorithm of algorithms) {
+      const singleShot = computeDigest(payload, algorithm);
+      if (algorithm === STREAM_HASH_ALGORITHMS.SHA256) {
+        assert.equal(singleShot, sha256Hex(payload));
+      }
+
+      // 1) Irregular prime-sized chunks with interleaved empty 0-byte chunks
+      const verifier = createIncrementalVerifier({
+        algorithm,
+        expectedDigest: singleShot,
+        expectedSize: payload.byteLength,
+        path: 'guest/image.pgim',
+      });
+      const unevenChunks = splitIntoChunks(payload, [0, 1, 7, 13, 63, 64, 65, 0, 509, 4099, 16384]);
+      for (const chunk of unevenChunks) {
+        const step = verifier.update(chunk);
+        assert.equal(step.ok, true);
+        assert.equal(step.aborted, false);
+      }
+      const res = verifier.finalize();
+      assert.equal(res.ok, true, `uneven chunk verification failed for ${algorithm}`);
+      assert.equal(res.digest, singleShot);
+      assert.equal(res.expected, singleShot);
+      assert.equal(res.actual, singleShot);
+      assert.equal(res.checkedBytes, payload.byteLength);
+      assert.equal(res.sizeVerified, true);
+      assert.equal(res.digestVerified, true);
+      assert.equal(res.mismatch, null);
+      assert.deepEqual(res.mismatches, []);
+
+      // 2) ReadableStream via verifyStream
+      const { stream } = createChunkReadableStream(splitIntoChunks(payload, [257, 1024, 8192]));
+      const streamRes = await verifyStream(stream, {
+        algorithm,
+        expectedDigest: singleShot,
+        expectedSize: payload.byteLength,
+        path: 'shaders/boot.wgsl.pack',
+      });
+      assert.equal(streamRes.ok, true);
+      assert.equal(streamRes.digest, singleShot);
+      assert.equal(streamRes.checkedBytes, payload.byteLength);
+
+      // 3) AsyncIterable yielding mixed ArrayBuffer, DataView (non-zero byteOffset), and SharedArrayBuffer views
+      async function* mixedViewStream() {
+        const split1 = 100;
+        const split2 = 500;
+        const split3 = 2000;
+        // Raw ArrayBuffer
+        yield payload.slice(0, split1).buffer;
+        // DataView with non-zero byteOffset
+        const padded = new Uint8Array(split2 - split1 + 23);
+        padded.set(payload.subarray(split1, split2), 11);
+        yield new DataView(padded.buffer, 11, split2 - split1);
+        // SharedArrayBuffer (when available)
+        if (typeof SharedArrayBuffer !== 'undefined') {
+          const sab = new SharedArrayBuffer(split3 - split2);
+          new Uint8Array(sab).set(payload.subarray(split2, split3));
+          yield sab;
+        } else {
+          yield payload.subarray(split2, split3);
+        }
+        // Remaining Uint8Array slice
+        yield payload.subarray(split3);
+      }
+
+      const asyncRes = await verifyStream(mixedViewStream(), {
+        algorithm,
+        expectedDigest: singleShot,
+        expectedSize: payload.byteLength,
+      });
+      assert.equal(asyncRes.ok, true);
+      assert.equal(asyncRes.digest, singleShot);
+      assert.equal(asyncRes.checkedBytes, payload.byteLength);
+    }
+
+    // 1-byte-at-a-time streaming on a 300-byte payload (crosses multiple 64-byte SHA-256 blocks)
+    const small = makeSyntheticPayload(300, 99);
+    const byteChunks = splitIntoChunks(small, [1]);
+    const byteRes = await verifyStream(byteChunks, {
+      algorithm: 'sha256',
+      expectedDigest: sha256Hex(small),
+      expectedSize: small.byteLength,
+    });
+    assert.equal(byteRes.ok, true);
+    assert.equal(byteRes.chunkCount, 300);
+    assert.equal(byteRes.checkedBytes, 300);
+  });
+
+  it('detects corrupted chunks with structured mismatch diagnostics (expected, actual, checkedBytes, elapsedMs) and supports failFast', async () => {
+    const chunkSize = 4096;
+    const payload = makeSyntheticPayload(chunkSize * 4 + 512, 0x77); // 4 full blocks + 1 trailing partial block
+    const expectedFullDigest = computeDigest(payload, 'sha256');
+    const expectedBlockDigests = [];
+    for (let off = 0; off < payload.byteLength; off += chunkSize) {
+      expectedBlockDigests.push(
+        computeDigest(payload.subarray(off, Math.min(payload.byteLength, off + chunkSize)), 'sha256'),
+      );
+    }
+
+    // Corrupt 1 byte inside block #2 (offset 9000)
+    const corrupted = payload.slice();
+    corrupted[chunkSize * 2 + 808] ^= 0x01;
+    const actualFullDigest = computeDigest(corrupted, 'sha256');
+    const actualBlock2Digest = computeDigest(
+      corrupted.subarray(chunkSize * 2, chunkSize * 3),
+      'sha256',
+    );
+
+    let clock = 1000;
+    const stepClock = () => {
+      clock += 10;
+      return clock;
+    };
+
+    // Stream with unaligned network chunk sizes (e.g., 1500 bytes each) across 4096-byte hash blocks!
+    const networkChunks = splitIntoChunks(corrupted, [1500]);
+    const verifier = createIncrementalVerifier({
+      algorithm: 'sha256',
+      expectedDigest: expectedFullDigest,
+      expectedSize: payload.byteLength,
+      chunkSize,
+      expectedChunkDigests: expectedBlockDigests,
+      path: 'assets/world.pgim',
+      nowFn: stepClock,
+    });
+
+    const detectedEarly = [];
+    for (const chunk of networkChunks) {
+      const updateRes = verifier.update(chunk);
+      if (updateRes.mismatch) {
+        detectedEarly.push(updateRes.mismatch);
+      }
+    }
+    const report = verifier.finalize();
+
+    assert.equal(report.ok, false);
+    assert.equal(report.digestVerified, false);
+    assert.equal(report.sizeVerified, true);
+    assert.equal(report.checkedBytes, corrupted.byteLength);
+    assert.equal(report.expected, expectedFullDigest);
+    assert.equal(report.actual, actualFullDigest);
+    assert.equal(report.verifiedBlocks, 4); // blocks 0, 1, 3, 4 matched; block 2 failed
+    assert.equal(report.chunkMismatches.length, 1);
+    assert.equal(detectedEarly.length, 1);
+
+    const chunkErr = report.chunkMismatches[0];
+    assert.equal(chunkErr.category, MISMATCH_CATEGORIES.HASH_MISMATCH);
+    assert.equal(chunkErr.kind, 'chunk_digest_mismatch');
+    assert.equal(chunkErr.path, 'assets/world.pgim');
+    assert.equal(chunkErr.chunkIndex, 2);
+    assert.equal(chunkErr.offset, chunkSize * 2);
+    assert.equal(chunkErr.length, chunkSize);
+    assert.equal(chunkErr.expected, expectedBlockDigests[2]);
+    assert.equal(chunkErr.actual, actualBlock2Digest);
+    assert.ok(chunkErr.checkedBytes >= chunkSize * 3);
+    assert.ok(chunkErr.elapsedMs > 0);
+
+    // Final digest mismatch is also recorded with structured fields.
+    const digestErr = report.mismatches.find((m) => m.kind === 'digest_mismatch');
+    assert.ok(digestErr);
+    assert.equal(digestErr.expected, expectedFullDigest);
+    assert.equal(digestErr.actual, actualFullDigest);
+    assert.equal(digestErr.checkedBytes, corrupted.byteLength);
+    assert.ok(digestErr.elapsedMs >= chunkErr.elapsedMs);
+    assert.equal(report.mismatchesByCategory.hash_mismatch, 2);
+
+    // failFast=true cancels ReadableStream immediately after block #2 fails without pulling tail chunks
+    const fastStream = createChunkReadableStream(
+      splitIntoChunks(corrupted, [chunkSize]),
+    );
+    const fastRes = await verifyStream(fastStream.stream, {
+      algorithm: 'sha256',
+      expectedDigest: expectedFullDigest,
+      expectedSize: payload.byteLength,
+      chunkSize,
+      expectedChunkDigests: expectedBlockDigests,
+      path: 'assets/world.pgim',
+      failFast: true,
+    });
+    assert.equal(fastRes.ok, false);
+    assert.equal(fastStream.cancelled, true);
+    assert.equal(fastRes.chunkMismatches.length, 1);
+    assert.equal(fastRes.chunkMismatches[0].chunkIndex, 2);
+    assert.equal(fastRes.checkedBytes, chunkSize * 3);
+    assert.equal(fastRes.chunkCount, 3);
+    assert.equal(fastRes.digest, null);
+    assert.equal(fastRes.digestVerified, false);
+  });
+
+  it('detects per-update chunk mismatches, truncated streams, oversized streams, and chunk count drift', () => {
+    const chunks = [
+      new Uint8Array([1, 2, 3, 4]),
+      new Uint8Array([5, 6, 7, 8]),
+      new Uint8Array([9, 10, 11, 12]),
+    ];
+    const digests = chunks.map((c) => computeDigest(c, 'crc32'));
+
+    // Missing trailing chunk + truncated size
+    const truncated = createIncrementalVerifier({
+      algorithm: 'crc32',
+      expectedSize: 12,
+      expectedChunkDigests: digests,
+      path: 'shaders/pack.wgsl.pack',
+    });
+    assert.equal(truncated.update(chunks[0]).ok, true);
+    assert.equal(truncated.update(chunks[1]).ok, true);
+    const truncRes = truncated.finalize();
+    assert.equal(truncRes.ok, false);
+    assert.equal(truncRes.sizeVerified, false);
+    assert.equal(truncRes.checkedBytes, 8);
+    assert.ok(truncRes.mismatches.some((m) => m.kind === 'chunk_count_mismatch' && m.expected === 3 && m.actual === 2));
+    assert.ok(truncRes.mismatches.some((m) => m.kind === 'size_mismatch' && m.expected === 12 && m.actual === 8));
+
+    // Oversized stream triggers early size_mismatch during update()
+    const oversized = createIncrementalVerifier({
+      algorithm: 'fnv1a32',
+      expectedSize: 6,
+      path: 'shaders/pack.wgsl.pack',
+    });
+    assert.equal(oversized.update(chunks[0]).ok, true);
+    const overflowStep = oversized.update(chunks[1]);
+    assert.equal(overflowStep.ok, false);
+    assert.equal(overflowStep.mismatch.category, MISMATCH_CATEGORIES.SIZE_MISMATCH);
+    assert.equal(overflowStep.mismatch.expected, 6);
+    assert.equal(overflowStep.mismatch.actual, 8);
+    assert.equal(overflowStep.mismatch.checkedBytes, 8);
+
+    const overRes = oversized.finalize();
+    assert.equal(overRes.ok, false);
+    assert.equal(overRes.sizeVerified, false);
+    assert.equal(overRes.expected, 6);
+    assert.equal(overRes.actual, 8);
+    assert.equal(overRes.mismatchesByCategory.size_mismatch, 1);
+  });
+
+  it('handles empty/boundary inputs, finalize idempotency, reset reuse, entry shorthand, and invalid arguments', () => {
+    // 0-byte verification with no update() calls
+    const emptyVerifier = createIncrementalVerifier({
+      algorithm: 'sha256',
+      expectedDigest: sha256Hex(new Uint8Array(0)),
+      expectedSize: 0,
+      chunkSize: 4096,
+      expectedChunkDigests: [],
+      path: 'empty.bin',
+    });
+    const res1 = emptyVerifier.finalize();
+    const res2 = emptyVerifier.finalize();
+    assert.strictEqual(res1, res2); // idempotent cached result
+    assert.equal(res1.ok, true);
+    assert.equal(res1.checkedBytes, 0);
+    assert.equal(res1.chunkCount, 0);
+    assert.equal(res1.sizeVerified, true);
+    assert.equal(res1.digestVerified, true);
+
+    // Calling update() after finalize() throws; reset() enables reuse
+    assert.throws(() => emptyVerifier.update(new Uint8Array([1])), /already been finalized/);
+    emptyVerifier.reset();
+    assert.equal(emptyVerifier.update(new Uint8Array(0)).ok, true);
+    const resAfterReset = emptyVerifier.finalize();
+    assert.equal(resAfterReset.ok, true);
+    assert.equal(resAfterReset.chunkCount, 1);
+    assert.equal(resAfterReset.checkedBytes, 0);
+
+    // Manifest entry shorthand auto-selects algorithm & expectations
+    const buf = new TextEncoder().encode('PGIM_TEST_PAYLOAD');
+    const crc = computeDigest(buf, 'crc32');
+    const manifestCheck = validateDataManifest({
+      abi_version: 1,
+      file_count: 1,
+      total_bytes: buf.byteLength,
+      files: [{ path: 'guest/boot.pgim', size: buf.byteLength, crc32: crc }],
+    });
+    assert.equal(manifestCheck.ok, true);
+    const entry = manifestCheck.fileMap.get('guest/boot.pgim');
+    const fromEntry = createIncrementalVerifier({ entry });
+    assert.equal(fromEntry.algorithm, 'crc32');
+    fromEntry.update(buf.subarray(0, 5));
+    fromEntry.update(buf.subarray(5));
+    const entryRes = fromEntry.finalize();
+    assert.equal(entryRes.ok, true);
+    assert.equal(entryRes.digest, crc);
+    assert.equal(entryRes.path, 'guest/boot.pgim');
+
+    // Validation errors on bad arguments
+    assert.throws(() => createIncrementalVerifier({ algorithm: 'md5' }), RangeError);
+    assert.throws(() => createIncrementalVerifier({ algorithm: 'sha256', expectedDigest: '1234' }), RangeError);
+    assert.throws(() => createIncrementalVerifier({ expectedSize: -5 }), RangeError);
+    assert.throws(() => createIncrementalVerifier({ chunkSize: 0 }), RangeError);
+    assert.throws(() => createIncrementalVerifier({ expectedChunkDigests: 'not-array' }), TypeError);
+    assert.throws(() => createIncrementalVerifier().update('not-a-buffer'), TypeError);
+  });
+
+  it('reports deterministic telemetry, progress snapshots, AbortSignal cancellation, and sanitized paths', async () => {
+    let clock = 2000;
+    const nowFn = () => {
+      clock += 25;
+      return clock;
+    };
+
+    const payload = makeSyntheticPayload(1000, 0x33);
+    const expected = computeDigest(payload, 'fnv1a64');
+    const seenUpdates = [];
+
+    const verifier = createIncrementalVerifier({
+      algorithm: 'fnv1a64',
+      expectedDigest: expected,
+      expectedSize: 1000,
+      path: 'C:\\Users\\Alice\\Private\\image.pgim',
+      nowFn,
+      onChunk: (u) => seenUpdates.push(u),
+    });
+
+    verifier.update(payload.subarray(0, 400));
+    const midSnap = verifier.getSnapshot();
+    assert.equal(midSnap.checkedBytes, 400);
+    assert.equal(midSnap.chunkCount, 1);
+    assert.equal(midSnap.finalized, false);
+    assert.ok(midSnap.elapsedMs > 0);
+    assert.ok(midSnap.bytesPerSecond > 0);
+    assert.equal(midSnap.path.includes('Alice'), false);
+    assert.ok(midSnap.path.includes('<redacted-path>'));
+
+    verifier.update(payload.subarray(400));
+    const finalRes = verifier.finalize();
+    assert.equal(finalRes.ok, true);
+    assert.equal(finalRes.checkedBytes, 1000);
+    assert.equal(finalRes.bytesVerified, 1000);
+    assert.equal(finalRes.filesVerified, 1);
+    assert.equal(finalRes.chunkCount, 2);
+    assert.ok(finalRes.elapsedMs > 0);
+    assert.ok(finalRes.bytesPerSecond > 0);
+    assert.equal(finalRes.telemetry.checkedBytes, 1000);
+    assert.equal(finalRes.telemetry.chunkCount, 2);
+    assert.equal(seenUpdates.length, 2);
+
+    // Abort mid-stream on a hanging ReadableStream cancels cleanly
+    const controller = new AbortController();
+    const abortStream = createChunkReadableStream(
+      [payload.subarray(0, 200), payload.subarray(200, 400)],
+      {
+        hangAtIndex: 1,
+        onHang: () => setTimeout(() => controller.abort(new Error('cancelled')), 5),
+      },
+    );
+    const abortedRes = await verifyStream(abortStream.stream, {
+      algorithm: 'sha256',
+      expectedDigest: sha256Hex(payload),
+      expectedSize: 1000,
+      signal: controller.signal,
+    });
+    assert.equal(abortedRes.ok, false);
+    assert.equal(abortedRes.aborted, true);
+    assert.equal(abortedRes.telemetry.aborted, true);
+    assert.equal(abortedRes.checkedBytes, 200);
+    assert.equal(abortedRes.filesVerified, 0);
+    assert.equal(abortStream.cancelled, true);
+  });
+
+  it('streams full response body in verifyLiveEndpoints without calling arrayBuffer() when body.getReader() is available', async () => {
+    const payload = makeSyntheticPayload(20000, 0x44);
+    const expectedSha = sha256Hex(payload);
+    const manifest = makeValidManifest({
+      files: [{ path: 'shaders/world.wgsl.pack', size: payload.byteLength, sha256: expectedSha, etag: '"pack-1"' }],
+    });
+
+    let fullArrayBufferCalled = false;
+    const fetchImpl = async (url, init = {}) => {
+      const method = (init.method || 'GET').toUpperCase();
+      const rangeHeader = init.headers?.Range || init.headers?.range || null;
+      const baseHeaders = {
+        'Accept-Ranges': 'bytes',
+        ETag: '"pack-1"',
+      };
+      if (method === 'HEAD') {
+        return {
+          status: 200,
+          ok: true,
+          headers: makeMockHeaders({ ...baseHeaders, 'Content-Length': String(payload.byteLength) }),
+        };
+      }
+      if (rangeHeader) {
+        const slice = payload.subarray(0, 1);
+        return {
+          status: 206,
+          ok: true,
+          headers: makeMockHeaders({
+            ...baseHeaders,
+            'Content-Range': `bytes 0-0/${payload.byteLength}`,
+            'Content-Length': '1',
+          }),
+          async arrayBuffer() {
+            return slice.buffer.slice(slice.byteOffset, slice.byteOffset + slice.byteLength);
+          },
+        };
+      }
+      const { stream } = createChunkReadableStream(splitIntoChunks(payload, [1024, 3000, 4096]));
+      return {
+        status: 200,
+        ok: true,
+        headers: makeMockHeaders({ ...baseHeaders, 'Content-Length': String(payload.byteLength) }),
+        body: stream,
+        async arrayBuffer() {
+          fullArrayBufferCalled = true;
+          throw new Error('arrayBuffer() must not be called when streaming body.getReader()');
+        },
+      };
+    };
+
+    const report = await verifyLiveEndpoints({
+      fetchImpl,
+      dataBase: '/data/',
+      manifest,
+      verifyHashes: true,
+    });
+
+    assert.equal(fullArrayBufferCalled, false);
+    assert.equal(report.ok, true);
+    assert.equal(report.passed, 1);
+    assert.equal(report.bytesVerified, payload.byteLength);
+    assert.equal(report.results[0].hash.verified, true);
+    assert.equal(report.results[0].hash.expected, expectedSha);
+    assert.equal(report.results[0].hash.actual, expectedSha);
+    assert.equal(report.results[0].hash.checkedBytes, payload.byteLength);
+    assert.equal(typeof report.results[0].hash.elapsedMs, 'number');
+  });
+
+  it('emits structured, sanitized schemaDiagnostics for manifest streaming hash fields and bootset issues', () => {
+    const manifestRes = validateDataManifest({
+      abi_version: 1,
+      file_count: 2,
+      total_bytes: 99999,
+      files: [
+        {
+          path: 'guest/image.pgim',
+          size: 8192,
+          crc32: 'ZZZZZZZZ', // invalid hex
+          fnv1a32: '1234', // wrong length
+          fnv1a64: 'not-hex-64',
+          chunk_size: 4096,
+          chunk_hashes: ['a'.repeat(64)], // expects 2 chunks for 8192/4096
+        },
+        {
+          path: 'C:/Users/Alice/secret/levels.rpf', // host path must be redacted in diagnostics
+          size: 100,
+        },
+      ],
+    });
+
+    assert.equal(manifestRes.ok, false);
+    assert.ok(Array.isArray(manifestRes.schemaDiagnostics));
+    const codes = new Set(manifestRes.schemaDiagnostics.map((d) => d.code));
+    assert.ok(codes.has(SCHEMA_DIAGNOSTIC_CODES.INVALID_CRC32));
+    assert.ok(codes.has(SCHEMA_DIAGNOSTIC_CODES.INVALID_FNV1A32));
+    assert.ok(codes.has(SCHEMA_DIAGNOSTIC_CODES.INVALID_FNV1A64));
+    assert.ok(codes.has(SCHEMA_DIAGNOSTIC_CODES.CHUNK_HASH_COUNT_MISMATCH));
+    assert.ok(codes.has(SCHEMA_DIAGNOSTIC_CODES.INVALID_PATH));
+    assert.ok(codes.has(SCHEMA_DIAGNOSTIC_CODES.TOTAL_BYTES_MISMATCH));
+
+    const chunkCountDiag = manifestRes.schemaDiagnostics.find(
+      (d) => d.code === SCHEMA_DIAGNOSTIC_CODES.CHUNK_HASH_COUNT_MISMATCH,
+    );
+    assert.equal(chunkCountDiag.expected, 2);
+    assert.equal(chunkCountDiag.actual, 1);
+    assert.equal(chunkCountDiag.path, 'guest/image.pgim');
+
+    const serializedDiags = JSON.stringify(manifestRes.schemaDiagnostics);
+    assert.equal(serializedDiags.includes('C:/Users/Alice'), false);
+    assert.ok(serializedDiags.includes('<redacted-path>'));
+
+    // Bootset structured schemaDiagnostics
+    const bootRes = validateBootset(
+      [
+        { path: 'MicrosoftGame.Config', offset: 0, length: 9999 },
+        { path: 'missing.rpf', offset: 0, length: 64 },
+      ],
+      makeValidManifest(),
+    );
+    assert.equal(bootRes.ok, false);
+    const bootCodes = new Set(bootRes.schemaDiagnostics.map((d) => d.code));
+    assert.ok(bootCodes.has(SCHEMA_DIAGNOSTIC_CODES.RANGE_OUT_OF_BOUNDS));
+    assert.ok(bootCodes.has(SCHEMA_DIAGNOSTIC_CODES.MISSING_MANIFEST_FILE));
   });
 });
