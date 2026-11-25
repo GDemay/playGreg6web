@@ -1019,5 +1019,538 @@ class TestDiffDumpCoverage(unittest.TestCase):
             self.assertEqual(json.loads(out)["errorCode"], "invalid_argument")
 
 
+class TestVerifyWgslSyntax(unittest.TestCase):
+    """Tests for --verify-wgsl-syntax fast streaming pre-flight validator (T66 / #1210)."""
+
+    def test_find_module_scope_let_lines_handles_comments_braces_and_identifiers(self) -> None:
+        valid_wgsl = """
+        // let commented_out = 1u;
+        /* let block_commented = 2u; /* { let nested_commented = 3u; */ */
+        const palette_size: u32 = 4u;
+        alias let_alias = f32;
+        struct Outlet {
+            let_field: u32,
+        };
+
+        @compute @workgroup_size(1)
+        fn cs_ok() {
+            let local_a = palette_size;
+            if (local_a > 0u) {
+                let nested_b = local_a + 1u;
+            }
+            let local_c = 2u;
+        }
+        """
+        self.assertEqual(wgpk.find_module_scope_let_lines(valid_wgsl), ())
+
+        invalid_wgsl = "\n".join(
+            [
+                "// /* not a block comment",
+                "let bad_top_1: u32 = 1u;",
+                "struct S { x: u32 }; let bad_after_struct = 2u;",
+                "@compute @workgroup_size(1) fn cs() {",
+                "    let ok_inside_fn = 3u;",
+                "}",
+                "/* // */",
+                "let /* inline comment */ bad_with_comment = 4u;",
+                "let",
+                "    bad_multiline = 5u;",
+            ]
+        )
+        self.assertEqual(wgpk.find_module_scope_let_lines(invalid_wgsl), (2, 3, 8, 9))
+
+    def test_valid_pack_and_empty_pack_pass_streaming_verify(self) -> None:
+        wgsl_with_local_lets = """
+        @vertex
+        fn vs_main(@location(0) p: vec3<f32>) -> @builtin(position) vec4<f32> {
+            let pos = vec4<f32>(p, 1.0);
+            return pos;
+        }
+        """.strip()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            valid_pack = root / "valid.wgsl.pack"
+            valid_pack.write_bytes(
+                wgpk.build_wgpk(
+                    [
+                        (0x1000000000000001, "vertex", wgsl_with_local_lets),
+                        (0x1000000000000002, "fragment", MINIMAL_FRAGMENT_WGSL),
+                        (0x1000000000000003, "compute", MINIMAL_COMPUTE_WGSL),
+                    ],
+                    flags=0x00000003,
+                )
+            )
+
+            report = wgpk.verify_wgsl_pack_syntax(valid_pack)
+            self.assertTrue(report.clean)
+            self.assertEqual(report.version, 1)
+            self.assertEqual(report.flags, 3)
+            self.assertEqual(report.entry_count, 3)
+            self.assertEqual(report.entries_checked, 3)
+            self.assertEqual(report.duplicate_hash_count, 0)
+            self.assertEqual(report.module_scope_let_count, 0)
+            self.assertEqual(report.violations, ())
+
+            # CLI JSON mode (explicit `inspect`) -> exit 0
+            code, out, err = _run_cli(["inspect", str(valid_pack), "--verify-wgsl-syntax", "--json"])
+            self.assertEqual(code, 0, msg=err)
+            payload = json.loads(out)
+            self.assertTrue(payload["ok"])
+            self.assertTrue(payload["clean"])
+            self.assertEqual(payload["schema"], wgpk.SYNTAX_VERIFY_REPORT_SCHEMA)
+            self.assertEqual(payload["source"], "valid.wgsl.pack")
+            self.assertEqual(payload["entriesChecked"], 3)
+            self.assertEqual(payload["violationCount"], 0)
+            self.assertNotIn(tmpdir, out)
+
+            # CLI shorthand mode (without `inspect`) + text output -> exit 0
+            code, text_out, err = _run_cli([str(valid_pack), "--verify-wgsl-syntax"])
+            self.assertEqual(code, 0, msg=err)
+            self.assertIn("WGPK Syntax Pre-flight [OK]: valid.wgsl.pack", text_out)
+            self.assertNotIn(tmpdir, text_out)
+
+            # Valid empty pack (0 entries) -> exit 0
+            empty_pack = root / "empty.wgsl.pack"
+            empty_pack.write_bytes(wgpk.build_wgpk([]))
+            code, out, err = _run_cli(["inspect", str(empty_pack), "--verify-wgsl-syntax", "--json"])
+            self.assertEqual(code, 0, msg=err)
+            self.assertTrue(json.loads(out)["clean"])
+
+    def test_module_scope_let_pack_fails_nonzero_and_never_leaks_source_or_host_path(self) -> None:
+        sensitive_dir = "secret_host_user_t66_verify"
+        secret_ident = "SECRET_SHADER_IDENT_NEVER_LEAK_77"
+        broken_wgsl = (
+            "// valid header comment\n"
+            f"let {secret_ident}: f32 = 1.0;\n"
+            "@fragment fn fs_main() -> @location(0) vec4<f32> {\n"
+            "    let ok_local = 0.5;\n"
+            f"    return vec4<f32>({secret_ident}, ok_local, 0.0, 1.0);\n"
+            "}\n"
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nested = Path(tmpdir) / sensitive_dir / "private_shaders"
+            nested.mkdir(parents=True)
+            bad_pack = nested / "broken_let.wgsl.pack"
+            bad_hash = 0xCAFEBABE00001234
+            bad_pack.write_bytes(
+                wgpk.build_wgpk(
+                    [
+                        (0x0000000000000001, "vertex", MINIMAL_VERTEX_WGSL),
+                        (bad_hash, "fragment", broken_wgsl),
+                    ]
+                )
+            )
+
+            # JSON mode exits 1 (without requiring --strict)
+            code, out, _ = _run_cli(["inspect", str(bad_pack), "--verify-wgsl-syntax", "--json"])
+            self.assertEqual(code, 1)
+            payload = json.loads(out)
+            self.assertFalse(payload["ok"])
+            self.assertFalse(payload["clean"])
+            self.assertEqual(payload["source"], "broken_let.wgsl.pack")
+            self.assertEqual(payload["moduleScopeLetCount"], 1)
+            self.assertEqual(payload["violationsByCode"], {"module_scope_let": 1})
+            self.assertEqual(len(payload["violations"]), 1)
+            v0 = payload["violations"][0]
+            self.assertEqual(v0["code"], "module_scope_let")
+            self.assertEqual(v0["entryIndex"], 1)
+            self.assertEqual(v0["hash"], wgpk.format_shader_hash(bad_hash))
+            self.assertEqual(v0["line"], 2)
+
+            for forbidden in (sensitive_dir, "private_shaders", tmpdir, secret_ident, "ok_local"):
+                self.assertNotIn(forbidden, out)
+
+            # Text mode also exits 1 and stays strictly sanitized
+            code, text_out, _ = _run_cli(["inspect", str(bad_pack), "--verify-wgsl-syntax"])
+            self.assertEqual(code, 1)
+            self.assertIn("WGPK Syntax Pre-flight [FAILED]: broken_let.wgsl.pack", text_out)
+            self.assertIn("module_scope_let", text_out)
+            self.assertIn(wgpk.format_shader_hash(bad_hash), text_out)
+            for forbidden in (sensitive_dir, "private_shaders", tmpdir, secret_ident, "ok_local"):
+                self.assertNotIn(forbidden, text_out)
+
+    def test_header_bounds_overlap_zero_length_stage_and_utf8_violations(self) -> None:
+        valid = wgpk.build_wgpk(
+            [
+                (0x1111000000000001, "vertex", MINIMAL_VERTEX_WGSL),
+                (0x1111000000000002, "fragment", MINIMAL_FRAGMENT_WGSL),
+                (0x1111000000000003, "compute", MINIMAL_COMPUTE_WGSL),
+            ]
+        )
+
+        # 1. Truncated header (< 16 bytes)
+        rep = wgpk.verify_wgsl_pack_syntax(valid[:10])
+        self.assertFalse(rep.clean)
+        self.assertEqual(rep.violations_by_code, {"truncated_header": 1})
+
+        # 2. Invalid magic (never leaks raw magic bytes)
+        bad_magic = b"SECR" + valid[4:]
+        rep = wgpk.verify_wgsl_pack_syntax(bad_magic)
+        self.assertFalse(rep.clean)
+        self.assertEqual(rep.violations_by_code, {"invalid_magic": 1})
+        self.assertNotIn("SECR", json.dumps(rep.to_dict()))
+
+        # 3. Unsupported version
+        bad_ver = bytearray(valid)
+        struct.pack_into("<I", bad_ver, 4, 7)
+        rep = wgpk.verify_wgsl_pack_syntax(bytes(bad_ver))
+        self.assertFalse(rep.clean)
+        self.assertEqual(rep.violations_by_code, {"unsupported_version": 1})
+
+        # 4. Truncated entry table (entry_count claims millions of entries on tiny file)
+        huge_count = bytearray(valid[:24])
+        struct.pack_into("<I", huge_count, 8, 5_000_000)
+        rep = wgpk.verify_wgsl_pack_syntax(bytes(huge_count))
+        self.assertFalse(rep.clean)
+        self.assertEqual(rep.violations_by_code, {"truncated_table": 1})
+
+        # 5. Out-of-bounds offset inside header + truncated payload at end of file
+        oob = bytearray(valid)
+        struct.pack_into("<I", oob, 16 + 12, 8)  # entry 0 offset inside header
+        struct.pack_into("<I", oob, 16 + 2 * 20 + 16, 999999)  # entry 2 length past EOF
+        rep = wgpk.verify_wgsl_pack_syntax(bytes(oob))
+        self.assertFalse(rep.clean)
+        self.assertEqual(rep.violations_by_code.get("out_of_bounds"), 2)
+
+        # 6. Overlapping payload ranges (3-way overlap: entry 0 spans entries 1 and 2)
+        overlap = bytearray(valid)
+        e0_off = struct.unpack_from("<I", overlap, 16 + 12)[0]
+        e0_len = struct.unpack_from("<I", overlap, 16 + 16)[0]
+        # Make entry 1 start inside entry 0 and entry 2 also start inside entry 0
+        struct.pack_into("<I", overlap, 16 + 20 + 12, e0_off + 2)
+        struct.pack_into("<I", overlap, 16 + 20 + 16, 8)
+        struct.pack_into("<I", overlap, 16 + 40 + 12, e0_off + 12)
+        struct.pack_into("<I", overlap, 16 + 40 + 16, min(10, e0_len - 12))
+        rep = wgpk.verify_wgsl_pack_syntax(bytes(overlap))
+        self.assertFalse(rep.clean)
+        self.assertEqual(rep.violations_by_code.get("overlapping_payloads"), 2)
+
+        # 7. Zero-length corrupt entry
+        zero_pack = wgpk.build_wgpk(
+            [
+                (0xAAAA000000000001, "vertex", MINIMAL_VERTEX_WGSL),
+                (0xAAAA000000000002, "fragment", ""),
+            ]
+        )
+        rep = wgpk.verify_wgsl_pack_syntax(zero_pack)
+        self.assertFalse(rep.clean)
+        self.assertEqual(rep.violations_by_code, {"zero_length_payload": 1})
+        self.assertEqual(rep.violations[0].entry_index, 1)
+
+        # 8. Invalid stage code + invalid UTF-8 payload
+        bad_stage_utf8 = bytearray(valid)
+        bad_stage_utf8[16 + 8] = 99
+        payload_start = 16 + 3 * 20
+        bad_stage_utf8[payload_start] = 0xFF
+        bad_stage_utf8[payload_start + 1] = 0xFE
+        rep = wgpk.verify_wgsl_pack_syntax(bytes(bad_stage_utf8))
+        self.assertFalse(rep.clean)
+        self.assertEqual(rep.violations_by_code.get("invalid_stage"), 1)
+        self.assertEqual(rep.violations_by_code.get("invalid_utf8"), 1)
+
+    def test_duplicate_hash_pack_fails_verify_and_reports_count(self) -> None:
+        dup_hash = 0xDEADBEEF12345678
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pack_path = Path(tmpdir) / "dup_hashes.wgsl.pack"
+            pack_path.write_bytes(
+                wgpk.build_wgpk(
+                    [
+                        (dup_hash, "vertex", MINIMAL_VERTEX_WGSL),
+                        (0x0000000000000009, "fragment", MINIMAL_FRAGMENT_WGSL),
+                        (dup_hash, "compute", MINIMAL_COMPUTE_WGSL),
+                    ]
+                )
+            )
+            code, out, _ = _run_cli(["inspect", str(pack_path), "--verify-wgsl-syntax", "--json"])
+            self.assertEqual(code, 1)
+            payload = json.loads(out)
+            self.assertFalse(payload["ok"])
+            self.assertFalse(payload["clean"])
+            self.assertEqual(payload["duplicateHashCount"], 1)
+            self.assertEqual(payload["violationsByCode"], {"duplicate_shader_hash": 1})
+            self.assertEqual(payload["violations"][0]["entryIndex"], 2)
+            self.assertEqual(payload["violations"][0]["hash"], wgpk.format_shader_hash(dup_hash))
+
+    def test_verify_missing_file_returns_sanitized_io_error(self) -> None:
+        sensitive = "secret_host_user_missing_verify"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing = Path(tmpdir) / sensitive / "absent.wgsl.pack"
+            code, out, _ = _run_cli(["inspect", str(missing), "--verify-wgsl-syntax", "--json"])
+            self.assertEqual(code, 1)
+            payload = json.loads(out)
+            self.assertFalse(payload["ok"])
+            self.assertEqual(payload["errorCode"], "io_error")
+            self.assertEqual(payload["source"], "absent.wgsl.pack")
+            self.assertNotIn(sensitive, out)
+            self.assertNotIn(tmpdir, out)
+
+
+class TestEmitPriorityHashes(unittest.TestCase):
+    """Tests for --emit-priority-hashes and --from-boot-log (T66 / #1210)."""
+
+    def test_extract_shader_hashes_from_boot_log_text_patterns_and_exclusions(self) -> None:
+        log_text = "\ufeff" + "\n".join(
+            [
+                "# Sanitized browser/native boot log",
+                "1700000000123456 [wgpu] frame=1 dt=16.6ms short=0xdeadbeef",
+                "1700000000123457 [wgpu] shader pack miss: 0xFEDCBA9876543210 (stage=vertex)",
+                "1700000000123458 [wgpu] shader pack hit: 0x0000000000000042 (stage=fragment)",
+                "1700000000123459 [wgpu] shader miss deadbeef00001111 fallback=frame1",
+                "1700000000123460 [wgpu] shader hit: 0000000000000099",
+                '{"event":"pso_miss","vertexShaderHash":"0x1122334455667788","fragmentShaderHash":"0xFEDCBA9876543210"}',
+                "sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "aabbccddeeff0011 # standalone priority hash line",
+                "0x0000000000000042 # duplicate",
+            ]
+        )
+        extracted = wgpk.extract_shader_hashes_from_log_text(log_text)
+        expected = tuple(
+            sorted(
+                [
+                    0xFEDCBA9876543210,
+                    0x0000000000000042,
+                    0xDEADBEEF00001111,
+                    0x0000000000000099,
+                    0x1122334455667788,
+                    0xAABBCCDDEEFF0011,
+                ]
+            )
+        )
+        self.assertEqual(extracted, expected)
+        # Ensure 16-digit decimal timestamps and 64-hex SHA-256 slices were NOT extracted.
+        self.assertNotIn(int("1700000000123456", 16), extracted)
+        self.assertNotIn(int("1700000000123457", 16), extracted)
+        self.assertNotIn(0x0123456789ABCDEF, extracted)
+
+    def test_emit_priority_hashes_pack_only_merged_and_log_only(self) -> None:
+        sensitive = "secret_host_user_t66_priority"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nested = Path(tmpdir) / sensitive / "work"
+            nested.mkdir(parents=True)
+
+            h_pack_1 = 0x3000000000000001
+            h_pack_2 = 0x1000000000000002
+            h_shared = 0x2000000000000003
+            h_log_miss = 0x000000000000AA01
+            h_log_hit = 0xFFFF00000000BB02
+
+            pack_path = nested / "live.wgsl.pack"
+            pack_path.write_bytes(
+                wgpk.build_wgpk(
+                    [
+                        (h_pack_1, "vertex", MINIMAL_VERTEX_WGSL),
+                        (h_pack_2, "fragment", MINIMAL_FRAGMENT_WGSL),
+                        (h_shared, "compute", MINIMAL_COMPUTE_WGSL),
+                    ]
+                )
+            )
+
+            boot_log_a = nested / "chrome_boot_1.log"
+            boot_log_a.write_text(
+                "\n".join(
+                    [
+                        f"[wgpu] shader pack miss {wgpk.format_shader_hash(h_log_miss)}",
+                        f"[wgpu] shader pack hit {wgpk.format_shader_hash(h_shared).upper().replace('0X', '0x')}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            boot_log_b = nested / "native_boot_2.log"
+            boot_log_b.write_text(
+                f"shader hit={wgpk.format_shader_hash(h_log_hit)}\n",
+                encoding="utf-8",
+            )
+
+            # 1. Pack-only export
+            out_pack_only = nested / "out" / "pack_only.txt"
+            code, out, err = _run_cli(
+                [
+                    "inspect",
+                    str(pack_path),
+                    "--emit-priority-hashes",
+                    str(out_pack_only),
+                    "--json",
+                ]
+            )
+            self.assertEqual(code, 0, msg=err)
+            payload = json.loads(out)
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["schema"], wgpk.PRIORITY_HASH_EXPORT_SCHEMA)
+            self.assertEqual(payload["output"], "pack_only.txt")
+            self.assertEqual(payload["packSource"], "live.wgsl.pack")
+            self.assertEqual(payload["bootLogSources"], [])
+            self.assertEqual(payload["packHashCount"], 3)
+            self.assertEqual(payload["bootLogHashCount"], 0)
+            self.assertEqual(payload["uniqueHashCount"], 3)
+            self.assertNotIn(sensitive, out)
+            self.assertNotIn(tmpdir, out)
+            self.assertEqual(
+                out_pack_only.read_text(encoding="utf-8").splitlines(),
+                [
+                    wgpk.format_shader_hash(h_pack_2),
+                    wgpk.format_shader_hash(h_shared),
+                    wgpk.format_shader_hash(h_pack_1),
+                ],
+            )
+
+            # 2. Merged pack + multiple boot logs (deduplicated & sorted)
+            out_merged = nested / "merged_priority.txt"
+            code, out, err = _run_cli(
+                [
+                    str(pack_path),
+                    "--from-boot-log",
+                    str(boot_log_a),
+                    "--from-boot-log",
+                    str(boot_log_b),
+                    "--emit-priority-hashes",
+                    str(out_merged),
+                    "--json",
+                ]
+            )
+            self.assertEqual(code, 0, msg=err)
+            payload = json.loads(out)
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["packHashCount"], 3)
+            self.assertEqual(payload["bootLogHashCount"], 3)
+            self.assertEqual(payload["uniqueHashCount"], 5)
+            self.assertEqual(payload["bootLogSources"], ["chrome_boot_1.log", "native_boot_2.log"])
+            self.assertNotIn(sensitive, out)
+            self.assertEqual(
+                out_merged.read_text(encoding="utf-8").splitlines(),
+                [
+                    wgpk.format_shader_hash(h_log_miss),
+                    wgpk.format_shader_hash(h_pack_2),
+                    wgpk.format_shader_hash(h_shared),
+                    wgpk.format_shader_hash(h_pack_1),
+                    wgpk.format_shader_hash(h_log_hit),
+                ],
+            )
+
+            # 3. Boot-log-only export (no pack argument, shorthand CLI + text output)
+            out_log_only = nested / "log_only.txt"
+            code, text_out, err = _run_cli(
+                [
+                    "--from-boot-log",
+                    str(boot_log_a),
+                    "--emit-priority-hashes",
+                    str(out_log_only),
+                ]
+            )
+            self.assertEqual(code, 0, msg=err)
+            self.assertIn("WGPK Priority Hashes Exported: log_only.txt", text_out)
+            self.assertIn("Emitted unique:     2", text_out)
+            self.assertNotIn(sensitive, text_out)
+            self.assertEqual(
+                out_log_only.read_text(encoding="utf-8").splitlines(),
+                [
+                    wgpk.format_shader_hash(h_log_miss),
+                    wgpk.format_shader_hash(h_shared),
+                ],
+            )
+
+    def test_combined_verify_and_emit_gates_output_on_clean_pack(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            bad_pack = root / "bad.wgsl.pack"
+            bad_pack.write_bytes(
+                wgpk.build_wgpk([(0x1111, "compute", "let bad = 1u;\n@compute @workgroup_size(1) fn cs() {}")])
+            )
+            out_blocked = root / "should_not_exist.txt"
+            code, out, _ = _run_cli(
+                [
+                    "inspect",
+                    str(bad_pack),
+                    "--verify-wgsl-syntax",
+                    "--emit-priority-hashes",
+                    str(out_blocked),
+                    "--json",
+                ]
+            )
+            self.assertEqual(code, 1)
+            self.assertFalse(json.loads(out)["ok"])
+            self.assertFalse(out_blocked.exists())
+
+            good_pack = root / "good.wgsl.pack"
+            good_pack.write_bytes(wgpk.build_wgpk([(0x2222, "compute", MINIMAL_COMPUTE_WGSL)]))
+            out_ok = root / "ok_hashes.txt"
+            code, out, err = _run_cli(
+                [
+                    "inspect",
+                    str(good_pack),
+                    "--verify-wgsl-syntax",
+                    "--emit-priority-hashes",
+                    str(out_ok),
+                    "--json",
+                ]
+            )
+            self.assertEqual(code, 0, msg=err)
+            payload = json.loads(out)
+            self.assertTrue(payload["ok"])
+            self.assertTrue(payload["clean"])
+            self.assertEqual(payload["priorityHashes"]["uniqueHashCount"], 1)
+            self.assertEqual(
+                out_ok.read_text(encoding="utf-8").splitlines(),
+                [wgpk.format_shader_hash(0x2222)],
+            )
+
+    def test_emit_priority_hashes_cli_errors_are_sanitized(self) -> None:
+        sensitive = "secret_host_user_priority_err"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nested = Path(tmpdir) / sensitive
+            nested.mkdir(parents=True)
+            pack_path = nested / "ok.wgsl.pack"
+            pack_path.write_bytes(wgpk.build_wgpk([(0x1, "vertex", MINIMAL_VERTEX_WGSL)]))
+            out_path = nested / "out.txt"
+            missing_log = nested / "missing_boot.log"
+
+            # 1. --from-boot-log without --emit-priority-hashes -> error
+            code, out, _ = _run_cli(
+                ["inspect", str(pack_path), "--from-boot-log", str(missing_log), "--json"]
+            )
+            self.assertEqual(code, 1)
+            self.assertEqual(json.loads(out)["errorCode"], "invalid_argument")
+
+            # 2. --emit-priority-hashes with neither pack nor boot log -> error
+            code, out, _ = _run_cli(
+                ["inspect", "--emit-priority-hashes", str(out_path), "--json"]
+            )
+            self.assertEqual(code, 1)
+            self.assertEqual(json.loads(out)["errorCode"], "invalid_argument")
+
+            # 3. Missing boot log file -> sanitized io_error
+            code, out, _ = _run_cli(
+                [
+                    "inspect",
+                    "--from-boot-log",
+                    str(missing_log),
+                    "--emit-priority-hashes",
+                    str(out_path),
+                    "--json",
+                ]
+            )
+            self.assertEqual(code, 1)
+            payload = json.loads(out)
+            self.assertEqual(payload["errorCode"], "io_error")
+            self.assertEqual(payload["source"], "missing_boot.log")
+            self.assertNotIn(sensitive, out)
+            self.assertNotIn(tmpdir, out)
+
+            # 4. --diff-dump combined with --verify-wgsl-syntax -> invalid_argument
+            code, out, _ = _run_cli(
+                [
+                    "inspect",
+                    str(pack_path),
+                    "--diff-dump",
+                    str(nested),
+                    "--verify-wgsl-syntax",
+                    "--json",
+                ]
+            )
+            self.assertEqual(code, 1)
+            self.assertEqual(json.loads(out)["errorCode"], "invalid_argument")
+
+
 if __name__ == "__main__":
     unittest.main()
