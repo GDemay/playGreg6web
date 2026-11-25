@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import fs from 'node:fs';
+import vm from 'node:vm';
 
 const require = createRequire(import.meta.url);
 const userdataMod = require('../web/workers/userdata.js');
@@ -10,6 +12,9 @@ const {
   DEFAULT_DB_NAME,
   DEFAULT_STORE_NAME,
   DEFAULT_RESTORE_TIMEOUT_MS,
+  DEFAULT_MAX_FILE_BYTES,
+  DEFAULT_MAX_TOTAL_BYTES,
+  DEFAULT_MAX_FILE_COUNT,
   USERDATA_PREFIX,
   ARCHIVE_FORMAT,
   ARCHIVE_VERSION,
@@ -798,4 +803,514 @@ test('importArchive atomically rejects invalid format, version, traversal paths,
   // State must remain completely unchanged after every rejected import!
   assert.deepEqual(await store.listByPrefix('/userdata/'), ['/userdata/original.sav']);
   assert.deepEqual((await store.getFile('/userdata/original.sav')).data, original);
+});
+
+// --- W223: In-memory metadata index, quota-safe writes, and telemetry ---
+
+function createCountingMemoryBackend(initialRecords = []) {
+  const inner = createMemoryBackend();
+  for (const rec of initialRecords) {
+    inner.map.set(rec.path, {
+      path: rec.path,
+      data: rec.data instanceof Uint8Array ? rec.data.slice() : rec.data,
+      mtime: rec.mtime,
+    });
+  }
+  const counts = { getAll: 0, get: 0, put: 0, delete: 0 };
+  return {
+    map: inner.map,
+    counts,
+    isClosed: inner.isClosed,
+    async getAll() {
+      counts.getAll += 1;
+      return inner.getAll();
+    },
+    async get(key) {
+      counts.get += 1;
+      return inner.get(key);
+    },
+    async put(record) {
+      counts.put += 1;
+      return inner.put(record);
+    },
+    async delete(key) {
+      counts.delete += 1;
+      return inner.delete(key);
+    },
+    close() {
+      inner.close();
+    },
+  };
+}
+
+test('W223: classic Worker global execution exposes new quota defaults and preserves UMD API', () => {
+  assert.equal(DEFAULT_MAX_FILE_BYTES, 16 * 1024 * 1024);
+  assert.equal(DEFAULT_MAX_TOTAL_BYTES, 256 * 1024 * 1024);
+  assert.equal(DEFAULT_MAX_FILE_COUNT, 4096);
+  assert.equal(globalThis.PlayGta6Userdata.DEFAULT_MAX_FILE_BYTES, DEFAULT_MAX_FILE_BYTES);
+  assert.equal(globalThis.PlayGta6Userdata.DEFAULT_MAX_TOTAL_BYTES, DEFAULT_MAX_TOTAL_BYTES);
+  assert.equal(globalThis.PlayGta6Userdata.DEFAULT_MAX_FILE_COUNT, DEFAULT_MAX_FILE_COUNT);
+
+  const src = fs.readFileSync(new URL('../web/workers/userdata.js', import.meta.url), 'utf8');
+  const sandbox = {
+    TextEncoder,
+    TextDecoder,
+    Uint8Array,
+    Int16Array,
+    ArrayBuffer,
+    Map,
+    Set,
+    Promise,
+    Date,
+    Error,
+    TypeError,
+    RangeError,
+    Number,
+    Array,
+    Math,
+    JSON,
+    setTimeout,
+    clearTimeout,
+    performance,
+  };
+  sandbox.globalThis = sandbox;
+  sandbox.self = sandbox;
+  vm.runInNewContext(src, sandbox, { filename: 'web/workers/userdata.js' });
+
+  assert.equal(typeof sandbox.PlayGta6Userdata.UserdataStore, 'function');
+  assert.equal(sandbox.PlayGta6Userdata.DEFAULT_MAX_FILE_BYTES, DEFAULT_MAX_FILE_BYTES);
+  assert.equal(sandbox.PlayGta6Userdata.DEFAULT_MAX_TOTAL_BYTES, DEFAULT_MAX_TOTAL_BYTES);
+  assert.equal(sandbox.PlayGta6Userdata.DEFAULT_MAX_FILE_COUNT, DEFAULT_MAX_FILE_COUNT);
+});
+
+test('W223: metadata index eliminates redundant directory scans across repeated XGameSave queries', async () => {
+  const backend = createCountingMemoryBackend([
+    { path: '/userdata/xgs/slot0/header.bin', data: new Uint8Array(16), mtime: 1000 },
+    { path: '/userdata/xgs/slot0/world.sav', data: new Uint8Array(64), mtime: 2000 },
+    { path: '/userdata/xgs/slot1/header.bin', data: new Uint8Array(24), mtime: 1500 },
+    { path: '/userdata/xgs/profile/prefs.json', data: new Uint8Array(10), mtime: 1800 },
+    { path: '/userdata/config.json', data: new Uint8Array(8), mtime: 900 },
+  ]);
+
+  const store = new UserdataStore({ backend });
+  assert.equal(store.getStats().indexReady, false);
+
+  // First query hydrates index with a single getAll() scan (1 miss, 0 hits).
+  const slot0Paths = await store.listByPrefix('/userdata/xgs/slot0');
+  assert.deepEqual(slot0Paths, [
+    '/userdata/xgs/slot0/header.bin',
+    '/userdata/xgs/slot0/world.sav',
+  ]);
+  assert.equal(backend.counts.getAll, 1);
+  assert.equal(store.getStats().indexReady, true);
+  assert.equal(store.getStats().indexMisses, 1);
+  assert.equal(store.getStats().indexHits, 0);
+
+  // Repeated XGameSave metadata queries must hit the in-memory index with ZERO extra getAll/get calls.
+  assert.deepEqual(await store.listByPrefix('/userdata/xgs/'), [
+    '/userdata/xgs/profile/prefs.json',
+    '/userdata/xgs/slot0/header.bin',
+    '/userdata/xgs/slot0/world.sav',
+    '/userdata/xgs/slot1/header.bin',
+  ]);
+
+  const containers = await store.listContainers('/userdata/xgs');
+  assert.deepEqual(containers, [
+    { name: 'profile', prefix: '/userdata/xgs/profile/', blobCount: 1, totalBytes: 10, lastModified: 1800 },
+    { name: 'slot0', prefix: '/userdata/xgs/slot0/', blobCount: 2, totalBytes: 80, lastModified: 2000 },
+    { name: 'slot1', prefix: '/userdata/xgs/slot1/', blobCount: 1, totalBytes: 24, lastModified: 1500 },
+  ]);
+
+  const slotContainers = await store.listContainers('/userdata/xgs/', { namePrefix: 'slot' });
+  assert.deepEqual(
+    slotContainers.map((c) => c.name),
+    ['slot0', 'slot1'],
+  );
+
+  const slot0Meta = await store.listMetadataByPrefix('/userdata/xgs/slot0');
+  assert.deepEqual(slot0Meta, [
+    {
+      path: '/userdata/xgs/slot0/header.bin',
+      size: 16,
+      mtime: 1000,
+      containerPrefix: '/userdata/xgs/',
+      parentDir: '/userdata/xgs/slot0/',
+      name: 'header.bin',
+    },
+    {
+      path: '/userdata/xgs/slot0/world.sav',
+      size: 64,
+      mtime: 2000,
+      containerPrefix: '/userdata/xgs/',
+      parentDir: '/userdata/xgs/slot0/',
+      name: 'world.sav',
+    },
+  ]);
+
+  assert.equal(await store.hasFile('/userdata/xgs/slot0/world.sav'), true);
+  assert.equal(await store.hasFile('/userdata/xgs/slot0/absent.sav'), false);
+  assert.deepEqual(await store.getMetadata('/userdata/config.json'), {
+    path: '/userdata/config.json',
+    size: 8,
+    mtime: 900,
+    containerPrefix: '/userdata/',
+    parentDir: '/userdata/',
+    name: 'config.json',
+  });
+  assert.equal(await store.getMetadata('/userdata/does-not-exist.bin'), null);
+
+  const usage = await store.getUsageStats();
+  assert.deepEqual(usage, {
+    fileCount: 5,
+    totalBytes: 122,
+    prefixes: {
+      '/userdata/': { fileCount: 1, totalBytes: 8 },
+      '/userdata/xgs/': { fileCount: 4, totalBytes: 114 },
+    },
+  });
+
+  const quota = await store.getQuotaInfo();
+  assert.equal(quota.usedBytes, 122);
+  assert.equal(quota.fileCount, 5);
+  assert.equal(quota.remainingBytes, DEFAULT_MAX_TOTAL_BYTES - 122);
+
+  // Missing blob read short-circuits via warm metadata index without calling backend.get().
+  assert.equal(await store.getFile('/userdata/xgs/slot0/nonexistent.bin'), null);
+  assert.equal(backend.counts.get, 0);
+  assert.equal(backend.counts.getAll, 1);
+
+  const stats = store.getStats();
+  assert.equal(stats.indexMisses, 1);
+  assert.equal(stats.indexHits, 11);
+  assert.equal(stats.reads, 1);
+  assert.equal(stats.bytesRead, 0);
+  assert.equal(stats.indexedFiles, 5);
+  assert.equal(stats.indexedBytes, 122);
+
+  // Reading an existing blob fetches from backend and accounts for bytesRead.
+  const fetched = await store.getFile('/userdata/xgs/slot0/world.sav');
+  assert.equal(fetched.data.byteLength, 64);
+  assert.equal(backend.counts.get, 1);
+  assert.equal(store.getStats().reads, 2);
+  assert.equal(store.getStats().bytesRead, 64);
+
+  // Mutating returned metadata objects must not corrupt internal index state.
+  slot0Meta[0].size = 999999;
+  assert.equal((await store.getMetadata('/userdata/xgs/slot0/header.bin')).size, 16);
+});
+
+test('W223: restoreAll warms metadata index and write/delete/invalidateIndex maintain strict coherence', async () => {
+  const backend = createCountingMemoryBackend([
+    { path: '/userdata/saves/slot0.sav', data: new Uint8Array([1, 2, 3, 4]), mtime: 100 },
+  ]);
+  const store = new UserdataStore({ backend });
+
+  const fsAdapter = createMockFsAdapter({ useMkdirTree: true });
+  const restoreRes = await store.restoreAll(fsAdapter);
+  assert.equal(restoreRes.restored, 1);
+  assert.equal(backend.counts.getAll, 1);
+  assert.equal(store.getStats().indexReady, true);
+  assert.equal(store.getStats().reads, 1);
+  assert.equal(store.getStats().bytesRead, 4);
+
+  // Immediately after restoreAll, queries hit warm index without another getAll().
+  assert.deepEqual(await store.listByPrefix('/userdata/saves'), ['/userdata/saves/slot0.sav']);
+  assert.equal(backend.counts.getAll, 1);
+  assert.equal(store.getStats().indexHits, 1);
+
+  // Overwrite existing file (size 4 -> 10) and add a new container file; index updates in-place.
+  await store.saveFile('/userdata/saves/slot0.sav', new Uint8Array(10), 200);
+  await store.saveFile('/userdata/profiles/p0.bin', new Uint8Array(5), 300);
+  assert.equal(backend.counts.getAll, 1);
+
+  assert.deepEqual(await store.getUsageStats(), {
+    fileCount: 2,
+    totalBytes: 15,
+    prefixes: {
+      '/userdata/profiles/': { fileCount: 1, totalBytes: 5 },
+      '/userdata/saves/': { fileCount: 1, totalBytes: 10 },
+    },
+  });
+  assert.equal((await store.getMetadata('/userdata/saves/slot0.sav')).size, 10);
+  assert.equal((await store.getMetadata('/userdata/saves/slot0.sav')).mtime, 200);
+
+  // Delete single file and verify container bucket cleanup.
+  await store.deleteFile('/userdata/profiles/p0.bin');
+  assert.deepEqual(await store.listByPrefix('/userdata/profiles'), []);
+  assert.deepEqual(await store.listContainers('/userdata/'), [
+    { name: 'saves', prefix: '/userdata/saves/', blobCount: 1, totalBytes: 10, lastModified: 200 },
+  ]);
+  assert.equal(backend.counts.getAll, 1);
+
+  // Delete remaining prefix and verify empty state.
+  const removed = await store.deletePrefix('/userdata/saves');
+  assert.equal(removed, 1);
+  assert.deepEqual(await store.getUsageStats(), { fileCount: 0, totalBytes: 0, prefixes: {} });
+  assert.equal(backend.counts.getAll, 1);
+
+  // Inject an external record directly into backend, invalidate index, and confirm rescan picks it up.
+  backend.map.set('/userdata/external/injected.bin', {
+    path: '/userdata/external/injected.bin',
+    data: new Uint8Array([9, 8, 7]),
+    mtime: 555,
+  });
+  store.invalidateIndex();
+  assert.equal(store.getStats().indexReady, false);
+  assert.equal(store.getStats().invalidations, 1);
+
+  assert.deepEqual(await store.listByPrefix('/userdata/'), ['/userdata/external/injected.bin']);
+  assert.equal(backend.counts.getAll, 2);
+  assert.equal(store.getStats().indexedFiles, 1);
+  assert.equal(store.getStats().indexedBytes, 3);
+
+  // close() clears in-memory index safely.
+  store.close();
+  assert.equal(store.getStats().indexReady, false);
+  assert.equal(store.getStats().indexedFiles, 0);
+  assert.equal(store.getStats().indexedBytes, 0);
+});
+
+test('W223: quota-safe write validation enforces maxFileBytes, maxTotalBytes, maxFileCount, and storageEstimate', async () => {
+  let mockUsage = 0;
+  let mockQuota = 200;
+  const backend = createCountingMemoryBackend();
+  const store = new UserdataStore({
+    backend,
+    maxFileBytes: 60,
+    maxTotalBytes: 100,
+    maxFileCount: 2,
+    storageEstimate: async () => ({ usage: mockUsage, quota: mockQuota }),
+  });
+
+  // Single-file limit rejection happens before touching backend.
+  await assert.rejects(
+    () => store.saveFile('/userdata/too-big.bin', new Uint8Array(61)),
+    (err) => err.code === 'QUOTA_EXCEEDED' && err.name === 'QuotaExceededError',
+  );
+  assert.equal(backend.counts.put, 0);
+  assert.equal(store.getStats().quotaRejections, 1);
+  assert.equal(store.getStats().writes, 0);
+
+  // Two valid writes up to total 90 bytes (fileCount = 2).
+  await store.saveFile('/userdata/a.bin', new Uint8Array(50), 10);
+  await store.saveFile('/userdata/b.bin', new Uint8Array(40), 20);
+  assert.equal(backend.counts.put, 2);
+
+  // Exceeding maxFileCount (3 > 2) is rejected atomically.
+  await assert.rejects(
+    () => store.saveFile('/userdata/c.bin', new Uint8Array(5)),
+    (err) => err.code === 'QUOTA_EXCEEDED',
+  );
+  assert.equal(backend.counts.put, 2);
+
+  // Overwriting existing file a.bin from 50 -> 60 bytes brings total to 100 (allowed!).
+  await store.saveFile('/userdata/a.bin', new Uint8Array(60), 30);
+  assert.equal(backend.counts.put, 3);
+  assert.equal((await store.getQuotaInfo()).remainingBytes, 0);
+
+  // Overwriting b.bin from 40 -> 41 bytes would exceed maxTotalBytes (101 > 100) -> rejected!
+  await assert.rejects(
+    () => store.saveFile('/userdata/b.bin', new Uint8Array(41)),
+    (err) => err.code === 'QUOTA_EXCEEDED',
+  );
+  assert.equal((await store.getMetadata('/userdata/b.bin')).size, 40);
+
+  // Freeing space via deleteFile allows writing a new file again.
+  await store.deleteFile('/userdata/b.bin');
+  mockUsage = 195;
+  mockQuota = 200;
+  // Browser storageEstimate rejects +10 bytes when only 5 bytes remain in browser quota.
+  await assert.rejects(
+    () => store.saveFile('/userdata/c.bin', new Uint8Array(10)),
+    (err) => err.code === 'QUOTA_EXCEEDED',
+  );
+  assert.equal(await store.hasFile('/userdata/c.bin'), false);
+
+  // Within browser quota (+5 bytes) succeeds.
+  await store.saveFile('/userdata/c.bin', new Uint8Array(5), 40);
+  assert.equal(await store.hasFile('/userdata/c.bin'), true);
+
+  // Invalid constructor quota options throw RangeError.
+  assert.throws(() => new UserdataStore({ maxFileBytes: -1 }), RangeError);
+  assert.throws(() => new UserdataStore({ maxTotalBytes: NaN }), RangeError);
+  assert.throws(() => new UserdataStore({ maxFileCount: 'bad' }), RangeError);
+});
+
+test('W223: commitUpdate and importArchive enforce atomic quota and path validation before mutating state', async () => {
+  const backend = createCountingMemoryBackend();
+  const store = new UserdataStore({
+    backend,
+    maxFileBytes: 50,
+    maxTotalBytes: 80,
+    maxFileCount: 3,
+  });
+
+  await store.saveFile('/userdata/xgs/slot0/old.bin', new Uint8Array(45), 100);
+  await store.saveFile('/userdata/xgs/slot0/keep.bin', new Uint8Array(20), 100);
+
+  // Atomic commitUpdate: deleting old.bin (45B) frees space for two new blobs (30B + 25B = 55B; net 75B <= 80B).
+  const res = await store.commitUpdate({
+    deletes: ['/userdata/xgs/slot0/old.bin'],
+    writes: [
+      { path: '/userdata/xgs/slot0/new1.bin', data: new Uint8Array(30), mtime: 200 },
+      { path: '/userdata/xgs/slot0/new2.bin', data: new Uint8Array(25), mtime: 201 },
+    ],
+  });
+  assert.deepEqual(res, { written: 2, deleted: 1, bytesWritten: 55 });
+  assert.equal(await store.hasFile('/userdata/xgs/slot0/old.bin'), false);
+  assert.deepEqual(await store.listByPrefix('/userdata/xgs/slot0'), [
+    '/userdata/xgs/slot0/keep.bin',
+    '/userdata/xgs/slot0/new1.bin',
+    '/userdata/xgs/slot0/new2.bin',
+  ]);
+  assert.equal(store.getStats().atomicCommits, 1);
+
+  // Failing commitUpdate (exceeds total quota) must NOT execute its deletes either!
+  await assert.rejects(
+    () =>
+      store.commitUpdate({
+        deletes: ['/userdata/xgs/slot0/keep.bin'],
+        writes: [
+          { path: '/userdata/xgs/slot0/a.bin', data: new Uint8Array(20) },
+          { path: '/userdata/xgs/slot0/b.bin', data: new Uint8Array(20) },
+        ],
+      }),
+    (err) => err.code === 'QUOTA_EXCEEDED',
+  );
+  assert.equal(await store.hasFile('/userdata/xgs/slot0/keep.bin'), true);
+  assert.equal(await store.hasFile('/userdata/xgs/slot0/a.bin'), false);
+
+  // Rejects duplicate write paths and write+delete conflicts.
+  await assert.rejects(() =>
+    store.commitUpdate({
+      writes: [
+        { path: '/userdata/xgs/slot0/dup.bin', data: new Uint8Array(1) },
+        { path: '/userdata/xgs/slot0/dup.bin', data: new Uint8Array(2) },
+      ],
+    }),
+  );
+  await assert.rejects(() =>
+    store.commitUpdate({
+      deletes: ['/userdata/xgs/slot0/keep.bin'],
+      writes: [{ path: '/userdata/xgs/slot0/keep.bin', data: new Uint8Array(1) }],
+    }),
+  );
+
+  // importArchive({ replace: true }) that exceeds maxTotalBytes must NOT wipe existing saves!
+  const oversizedArchive = {
+    format: ARCHIVE_FORMAT,
+    version: ARCHIVE_VERSION,
+    files: [
+      { path: '/userdata/a.bin', size: 45, base64: encodeBase64(new Uint8Array(45)) },
+      { path: '/userdata/b.bin', size: 45, base64: encodeBase64(new Uint8Array(45)) },
+    ],
+  };
+  await assert.rejects(
+    () => store.importArchive(oversizedArchive, { replace: true }),
+    (err) => err.code === 'QUOTA_EXCEEDED',
+  );
+  assert.deepEqual(await store.listByPrefix('/userdata/xgs/slot0'), [
+    '/userdata/xgs/slot0/keep.bin',
+    '/userdata/xgs/slot0/new1.bin',
+    '/userdata/xgs/slot0/new2.bin',
+  ]);
+});
+
+test('W223: path-traversal rejection across all indexed metadata, container, and batch APIs', async () => {
+  const store = new UserdataStore({ backend: createMemoryBackend() });
+  const badPaths = [
+    '/userdata/../escape.sav',
+    '/userdata/saves/../../etc/passwd',
+    '/etc/passwd',
+    '/userdata/sub\\evil.sav',
+    '/userdata/evil\0.sav',
+    '/userdata/',
+  ];
+  for (const bad of badPaths) {
+    await assert.rejects(() => store.getMetadata(bad));
+    await assert.rejects(() => store.hasFile(bad));
+    await assert.rejects(() => store.commitUpdate({ writes: [{ path: bad, data: new Uint8Array([1]) }] }));
+    await assert.rejects(() => store.commitUpdate({ deletes: [bad] }));
+  }
+
+  const badPrefixes = [
+    '/userdata/../etc',
+    '/userdata/saves\\sub',
+    '/userdata/saves\0',
+    '/etc/',
+    '/userdata',
+  ];
+  for (const bad of badPrefixes) {
+    await assert.rejects(() => store.listMetadataByPrefix(bad));
+    await assert.rejects(() => store.listContainers(bad));
+  }
+
+  // Invalid container namePrefix rejects slashes and NUL bytes.
+  await assert.rejects(() => store.listContainers('/userdata/', { namePrefix: '../evil' }));
+  await assert.rejects(() => store.listContainers('/userdata/', { namePrefix: 'a/b' }));
+  await assert.rejects(() => store.listContainers('/userdata/', { namePrefix: 'a\\b' }));
+  await assert.rejects(() => store.listContainers('/userdata/', { namePrefix: 'a\0b' }));
+});
+
+test('W223: telemetry stats accurately track reads, writes, deletes, indexHits, bytesWritten, bytesRead, and resetStats', async () => {
+  const store = new UserdataStore({ backend: createCountingMemoryBackend() });
+  const initial = store.getStats();
+  assert.equal(initial.reads, 0);
+  assert.equal(initial.writes, 0);
+  assert.equal(initial.deletes, 0);
+  assert.equal(initial.indexHits, 0);
+  assert.equal(initial.bytesWritten, 0);
+  assert.equal(initial.bytesRead, 0);
+
+  await store.saveFile('/userdata/s/a.bin', new Uint8Array(12), 100);
+  await store.saveFile('/userdata/s/b.bin', new Uint8Array(18), 200);
+  await store.getFile('/userdata/s/a.bin'); // +1 read, +12 bytesRead
+  await store.getFile('/userdata/s/missing.bin'); // +1 read, +1 indexHit (negative short-circuit)
+  await store.listByPrefix('/userdata/s'); // +1 indexHit
+  await store.getUsageStats(); // +1 indexHit
+  await store.deleteFile('/userdata/s/b.bin'); // +1 delete
+
+  const stats = store.getStats();
+  assert.equal(stats.writes, 2);
+  assert.equal(stats.bytesWritten, 30);
+  assert.equal(stats.reads, 2);
+  assert.equal(stats.bytesRead, 12);
+  assert.equal(stats.deletes, 1);
+  assert.equal(stats.indexHits, 3);
+  assert.ok(typeof stats.lastWriteDurationMs === 'number' && stats.lastWriteDurationMs >= 0);
+  assert.equal(stats.indexedFiles, 1);
+  assert.equal(stats.indexedBytes, 12);
+
+  // resetStats clears cumulative counters without dropping the live index.
+  store.resetStats();
+  const afterReset = store.getStats();
+  assert.equal(afterReset.reads, 0);
+  assert.equal(afterReset.writes, 0);
+  assert.equal(afterReset.deletes, 0);
+  assert.equal(afterReset.indexHits, 0);
+  assert.equal(afterReset.bytesWritten, 0);
+  assert.equal(afterReset.bytesRead, 0);
+  assert.equal(afterReset.indexReady, true);
+  assert.equal(afterReset.indexedFiles, 1);
+  assert.equal(afterReset.indexedBytes, 12);
+});
+
+test('W223: concurrent writes serialize quota checks without overshooting maxTotalBytes', async () => {
+  const store = new UserdataStore({
+    backend: createCountingMemoryBackend(),
+    maxFileBytes: 40,
+    maxTotalBytes: 60,
+  });
+
+  const results = await Promise.allSettled([
+    store.saveFile('/userdata/p1.bin', new Uint8Array(35)),
+    store.saveFile('/userdata/p2.bin', new Uint8Array(35)),
+  ]);
+
+  const fulfilled = results.filter((r) => r.status === 'fulfilled');
+  const rejected = results.filter((r) => r.status === 'rejected');
+  assert.equal(fulfilled.length, 1);
+  assert.equal(rejected.length, 1);
+  assert.equal(rejected[0].reason.code, 'QUOTA_EXCEEDED');
+  assert.equal((await store.getQuotaInfo()).usedBytes, 35);
 });
