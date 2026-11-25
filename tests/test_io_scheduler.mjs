@@ -17,6 +17,9 @@ const rangeCacheMod = require('../web/workers/range_cache.js');
 const {
   IO_PRIORITY,
   IoPriorityScheduler,
+  DEFAULT_AGING_INTERVAL_MS,
+  DEFAULT_DEDUPE_IN_FLIGHT,
+  makeReadKey,
   classifyIoPriority,
   isBinkVideoPath,
   isShaderPackPath,
@@ -1739,4 +1742,521 @@ test('telemetry counters isolate snapshot mutations, exclude pre-aborted/invalid
   assert.equal(afterReset.shaderPackReads, 0);
   assert.equal(afterReset.uiFontReads, 0);
   assert.equal(afterReset.promotions, 0);
+});
+
+// ---------------------------------------------------------------------------
+// W206: Priority aging (starvation prevention), in-flight & queued range
+//       deduplication, cancellation/error cleanup, and top-level telemetry.
+// ---------------------------------------------------------------------------
+
+test('W206 exports DEFAULT_AGING_INTERVAL_MS, DEFAULT_DEDUPE_IN_FLIGHT, and makeReadKey in CJS and Worker globalThis', () => {
+  assert.equal(DEFAULT_AGING_INTERVAL_MS, 0);
+  assert.equal(DEFAULT_DEDUPE_IN_FLIGHT, true);
+  assert.equal(typeof makeReadKey, 'function');
+  assert.equal(makeReadKey('x64/world.rpf', 0, 64), makeReadKey('/x64/world.rpf', 0, 64));
+  assert.notEqual(makeReadKey('x64/world.rpf', 0, 64), makeReadKey('x64/world.rpf', 64, 64));
+
+  const src = fs.readFileSync(path.join(repoRoot, 'web/workers/io_scheduler.js'), 'utf8');
+  const sandbox = {};
+  sandbox.globalThis = sandbox;
+  sandbox.self = sandbox;
+  vm.runInNewContext(src, sandbox);
+
+  assert.equal(sandbox.PlayGta6IoScheduler.DEFAULT_AGING_INTERVAL_MS, 0);
+  assert.equal(sandbox.PlayGta6IoScheduler.DEFAULT_DEDUPE_IN_FLIGHT, true);
+  assert.equal(typeof sandbox.PlayGta6IoScheduler.makeReadKey, 'function');
+});
+
+test('W206 in-flight deduplication coalesces identical concurrent reads and starts fresh after completion', async () => {
+  const calls = [];
+  let gate = deferred();
+
+  const rangeCache = {
+    read(filePath, offset, length) {
+      calls.push(`${filePath}@${offset}+${length}`);
+      return gate.promise;
+    },
+  };
+
+  const scheduler = new IoPriorityScheduler({
+    rangeCache,
+    maxConcurrency: 4,
+    sleep: async () => {},
+  });
+  assert.equal(scheduler.dedupeInFlight, true);
+
+  // Three concurrent requests for the same canonical range (including leading slash).
+  const p1 = scheduler.scheduleRead('x64/levels/world.rpf', 4096, 16, {
+    priority: IO_PRIORITY.NORMAL,
+  });
+  const p2 = scheduler.scheduleRead('x64/levels/world.rpf', 4096, 16, {
+    priority: IO_PRIORITY.HIGH,
+  });
+  const p3 = scheduler.scheduleRead('/x64/levels/world.rpf', 4096, 16, {
+    priority: IO_PRIORITY.PREFETCH,
+  });
+
+  // Distinct offset and distinct length must NOT coalesce.
+  const gateOther = deferred();
+  const callsBeforeDistinct = calls.length;
+  assert.equal(callsBeforeDistinct, 1);
+
+  const midStats = scheduler.getStats();
+  assert.equal(midStats.inFlight, 1);
+  assert.equal(midStats.queued, 0);
+  assert.equal(midStats.enqueued, 1);
+  assert.equal(midStats.dispatched, 1);
+  assert.equal(midStats.deduped, 2);
+  assert.equal(midStats.byPriority.NORMAL.enqueued, 1);
+  assert.equal(midStats.byPriority.HIGH.deduped, 1);
+  assert.equal(midStats.byPriority.PREFETCH.deduped, 1);
+
+  const expected = makeBytes(77, 16);
+  gate.resolve(expected);
+  const [r1, r2, r3] = await Promise.all([p1, p2, p3]);
+  assert.deepEqual(r1, expected);
+  assert.deepEqual(r2, expected);
+  assert.deepEqual(r3, expected);
+  assert.equal(calls.length, 1);
+
+  // Once settled, a subsequent identical read must trigger a fresh rangeCache.read().
+  gate = gateOther;
+  const p4 = scheduler.scheduleRead('x64/levels/world.rpf', 4096, 16);
+  const expected2 = makeBytes(88, 16);
+  gateOther.resolve(expected2);
+  const r4 = await p4;
+  assert.deepEqual(r4, expected2);
+  assert.equal(calls.length, 2);
+
+  const finalStats = scheduler.getStats();
+  assert.equal(finalStats.enqueued, 2);
+  assert.equal(finalStats.dispatched, 2);
+  assert.equal(finalStats.completed, 2);
+  assert.equal(finalStats.deduped, 2);
+  assert.equal(finalStats.inFlight, 0);
+  assert.equal(finalStats.queued, 0);
+});
+
+test('W206 dedupeInFlight: false disables coalescing and distinct offsets/lengths never coalesce', async () => {
+  const calls = [];
+  const gates = [];
+
+  const rangeCache = {
+    read(filePath, offset, length) {
+      calls.push(`${filePath}@${offset}+${length}`);
+      const g = deferred();
+      gates.push(g);
+      return g.promise;
+    },
+  };
+
+  // 1. Distinct ranges on same file with dedupe enabled never coalesce.
+  const deduping = new IoPriorityScheduler({
+    rangeCache,
+    maxConcurrency: 4,
+    sleep: async () => {},
+  });
+  const pA = deduping.scheduleRead('world.rpf', 0, 16);
+  const pB = deduping.scheduleRead('world.rpf', 16, 16);
+  const pC = deduping.scheduleRead('world.rpf', 0, 32);
+  assert.equal(calls.length, 3);
+  assert.equal(deduping.getStats().deduped, 0);
+  assert.equal(deduping.getStats().enqueued, 3);
+  while (gates.length > 0) {
+    gates.shift().resolve(makeBytes(1, 16));
+  }
+  await Promise.all([pA, pB, pC]);
+
+  // 2. dedupeInFlight: false disables coalescing even for identical ranges.
+  calls.length = 0;
+  const noDedupe = new IoPriorityScheduler({
+    rangeCache,
+    maxConcurrency: 4,
+    dedupeInFlight: false,
+    sleep: async () => {},
+  });
+  assert.equal(noDedupe.dedupeInFlight, false);
+  const p1 = noDedupe.scheduleRead('world.rpf', 0, 16);
+  const p2 = noDedupe.scheduleRead('world.rpf', 0, 16);
+  assert.equal(calls.length, 2);
+  assert.equal(noDedupe.getStats().deduped, 0);
+  assert.equal(noDedupe.getStats().enqueued, 2);
+  while (gates.length > 0) {
+    gates.shift().resolve(makeBytes(2, 16));
+  }
+  await Promise.all([p1, p2]);
+});
+
+test('W206 queued deduplication promotes priority when higher-priority caller joins and demotes if that caller aborts', async () => {
+  const dispatchOrder = [];
+  const blockerGate = deferred();
+
+  const rangeCache = {
+    read(filePath, offset, length) {
+      dispatchOrder.push(filePath);
+      if (filePath === 'blocker.bin') {
+        return blockerGate.promise;
+      }
+      return Promise.resolve(makeBytes(filePath.charCodeAt(0), length));
+    },
+  };
+
+  const scheduler = new IoPriorityScheduler({
+    rangeCache,
+    maxConcurrency: 1,
+    sleep: async () => {},
+  });
+
+  // Case 1: CRITICAL caller joins queued PREFETCH -> promotes ahead of HIGH/NORMAL.
+  const pBlocker = scheduler.scheduleRead('blocker.bin', 0, 8, { priority: IO_PRIORITY.CRITICAL });
+  const pPrefetchShared = scheduler.scheduleRead('shared_chunk.rpf', 0, 64, {
+    priority: IO_PRIORITY.PREFETCH,
+  });
+  const pHigh = scheduler.scheduleRead('other_high.rpf', 0, 64, { priority: IO_PRIORITY.HIGH });
+  const pNormal = scheduler.scheduleRead('other_normal.rpf', 0, 64, {
+    priority: IO_PRIORITY.NORMAL,
+  });
+
+  // Also queue another PREFETCH task that gets temporarily promoted and then demoted on abort.
+  const pDemoteBase = scheduler.scheduleRead('demoted_chunk.rpf', 0, 64, {
+    priority: IO_PRIORITY.PREFETCH,
+  });
+  const demoteAbort = new AbortController();
+  const pDemoteJoin = scheduler.scheduleRead('demoted_chunk.rpf', 0, 64, {
+    priority: IO_PRIORITY.CRITICAL,
+    signal: demoteAbort.signal,
+  });
+
+  // Now CRITICAL joins shared_chunk.rpf -> moves from PREFETCH queue to CRITICAL queue!
+  const pCriticalJoin = scheduler.scheduleRead('shared_chunk.rpf', 0, 64, {
+    priority: IO_PRIORITY.CRITICAL,
+  });
+
+  assert.equal(scheduler.getStats().byPriority.CRITICAL.queued, 2);
+  assert.equal(scheduler.getStats().byPriority.PREFETCH.queued, 0);
+
+  // Abort the CRITICAL joiner on demoted_chunk.rpf -> task demotes back to PREFETCH!
+  demoteAbort.abort();
+  await assert.rejects(pDemoteJoin, { name: 'AbortError' });
+  assert.equal(scheduler.getStats().byPriority.CRITICAL.queued, 1);
+  assert.equal(scheduler.getStats().byPriority.PREFETCH.queued, 1);
+
+  blockerGate.resolve(makeBytes(1, 8));
+  const [resPrefetch, resCritical] = await Promise.all([
+    pPrefetchShared,
+    pCriticalJoin,
+    pBlocker,
+    pHigh,
+    pNormal,
+    pDemoteBase,
+  ]);
+
+  assert.deepEqual(resPrefetch, resCritical);
+  assert.deepEqual(dispatchOrder, [
+    'blocker.bin',
+    'shared_chunk.rpf', // promoted to CRITICAL by deduped joiner
+    'other_high.rpf',
+    'other_normal.rpf',
+    'demoted_chunk.rpf', // demoted back to PREFETCH after CRITICAL joiner aborted
+  ]);
+
+  const stats = scheduler.getStats();
+  assert.equal(stats.deduped, 2);
+  assert.equal(stats.enqueued, 5);
+  assert.equal(stats.dispatched, 5);
+  assert.equal(stats.completed, 5);
+  assert.equal(stats.cancelled, 1);
+});
+
+test('W206 partial and full AbortSignal cancellation on deduplicated in-flight reads preserves remaining waiters and maxConcurrency', async () => {
+  const started = [];
+  const gates = [];
+
+  const rangeCache = {
+    read(filePath, offset, length) {
+      started.push(`${filePath}@${offset}`);
+      const g = deferred();
+      gates.push(g);
+      return g.promise;
+    },
+  };
+
+  const scheduler = new IoPriorityScheduler({
+    rangeCache,
+    maxConcurrency: 1,
+    sleep: async () => {},
+  });
+
+  // 1. Partial abort: waiter A aborts while in-flight, waiter B keeps the read alive and resolves.
+  const ctrlA = new AbortController();
+  const pA = scheduler.scheduleRead('shared.rpf', 0, 32, { signal: ctrlA.signal });
+  const pB = scheduler.scheduleRead('shared.rpf', 0, 32);
+
+  ctrlA.abort();
+  await assert.rejects(pA, { name: 'AbortError' });
+  assert.equal(scheduler.getStats().cancelled, 1);
+  assert.equal(scheduler.getStats().inFlight, 1);
+
+  const bytes1 = makeBytes(42, 32);
+  gates.shift().resolve(bytes1);
+  assert.deepEqual(await pB, bytes1);
+  assert.equal(started.length, 1);
+  assert.equal(scheduler.getStats().completed, 1);
+  assert.equal(scheduler.getStats().deduped, 1);
+
+  // 2. Full abort: all waiters abort -> rejects both immediately, removes active dedupe key,
+  //    holds concurrency slot until underlying read settles, then dispatches a fresh retry cleanly.
+  const ctrl1 = new AbortController();
+  const ctrl2 = new AbortController();
+  const p1 = scheduler.scheduleRead('abort_all.rpf', 0, 16, { signal: ctrl1.signal });
+  const p2 = scheduler.scheduleRead('abort_all.rpf', 0, 16, { signal: ctrl2.signal });
+
+  ctrl1.abort();
+  await assert.rejects(p1, { name: 'AbortError' });
+  assert.equal(scheduler.getStats().inFlight, 1);
+
+  ctrl2.abort();
+  await assert.rejects(p2, { name: 'AbortError' });
+  assert.equal(scheduler.getStats().cancelled, 3);
+  assert.equal(scheduler.getStats().inFlight, 1); // still holding slot until underlying settles
+
+  // Because active key was cleaned up when all waiters aborted, a new request for the same range
+  // queues fresh (does not dedupe onto the aborted read) and runs once the slot frees.
+  const pFresh = scheduler.scheduleRead('abort_all.rpf', 0, 16);
+  assert.equal(scheduler.getStats().queued, 1);
+  assert.equal(scheduler.getStats().deduped, 2); // did NOT increment for pFresh
+
+  // Settle the old aborted read -> slot frees -> pFresh dispatches.
+  gates.shift().reject(new Error('HTTP 503 late failure'));
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(started.length, 3);
+
+  const bytes2 = makeBytes(55, 16);
+  gates.shift().resolve(bytes2);
+  assert.deepEqual(await pFresh, bytes2);
+  assert.equal(scheduler.getStats().inFlight, 0);
+  assert.equal(scheduler.getStats().completed, 2);
+});
+
+test('W206 deduplicated error and retry cleanup shares retries and clears active key before rejecting waiters', async () => {
+  let flakeyAttempts = 0;
+  let missingAttempts = 0;
+  const delays = [];
+
+  const rangeCache = {
+    async read(filePath, offset, length) {
+      if (filePath === 'flakey.rpf') {
+        flakeyAttempts += 1;
+        if (flakeyAttempts === 1) {
+          throw new Error('HTTP 503 reading flakey.rpf');
+        }
+        return makeBytes(19, length);
+      }
+      if (filePath === 'missing_once.rpf') {
+        missingAttempts += 1;
+        if (missingAttempts === 1) {
+          throw new Error('HTTP 404 reading missing_once.rpf');
+        }
+        return makeBytes(29, length);
+      }
+      return makeBytes(1, length);
+    },
+  };
+
+  const scheduler = new IoPriorityScheduler({
+    rangeCache,
+    maxConcurrency: 2,
+    maxRetries: 2,
+    baseRetryDelayMs: 25,
+    sleep: async (ms) => {
+      delays.push(ms);
+    },
+  });
+
+  // 1. Coalesced transient 503 retries once and resolves all waiters.
+  const [r1, r2] = await Promise.all([
+    scheduler.scheduleRead('flakey.rpf', 0, 16),
+    scheduler.scheduleRead('flakey.rpf', 0, 16),
+  ]);
+  assert.equal(flakeyAttempts, 2);
+  assert.deepEqual(delays, [25]);
+  assert.deepEqual(r1, makeBytes(19, 16));
+  assert.deepEqual(r2, makeBytes(19, 16));
+  assert.equal(scheduler.getStats().retries, 1);
+  assert.equal(scheduler.getStats().deduped, 1);
+
+  // 2. Non-retryable 404 rejects both waiters AND clears active key before rejection so an
+  //    immediate re-schedule inside .catch() starts a fresh read instead of re-attaching.
+  let recoveryBytes = null;
+  const pErr1 = scheduler.scheduleRead('missing_once.rpf', 0, 16).catch(async (err) => {
+    assert.match(err.message, /HTTP 404/);
+    recoveryBytes = await scheduler.scheduleRead('missing_once.rpf', 0, 16);
+    return 'recovered';
+  });
+  const pErr2 = scheduler.scheduleRead('missing_once.rpf', 0, 16);
+
+  assert.equal(await pErr1, 'recovered');
+  await assert.rejects(pErr2, /HTTP 404/);
+  assert.equal(missingAttempts, 2);
+  assert.deepEqual(recoveryBytes, makeBytes(29, 16));
+
+  const stats = scheduler.getStats();
+  assert.equal(stats.enqueued, 3);
+  assert.equal(stats.dispatched, 3);
+  assert.equal(stats.completed, 2);
+  assert.equal(stats.failed, 1);
+  assert.equal(stats.deduped, 2);
+});
+
+test('W206 cancelPrefetch and clear reject all deduplicated waiters and clean up active keys', async () => {
+  const blockerGate = deferred();
+  const rangeCache = {
+    read(filePath, offset, length) {
+      if (filePath === 'hold.bin') return blockerGate.promise;
+      return Promise.resolve(makeBytes(5, length));
+    },
+  };
+
+  const scheduler = new IoPriorityScheduler({
+    rangeCache,
+    maxConcurrency: 1,
+    sleep: async () => {},
+  });
+
+  const pHold = scheduler.scheduleRead('hold.bin', 0, 8, { priority: IO_PRIORITY.CRITICAL });
+  const pPref1 = scheduler.scheduleRead('bg.rpf', 0, 16, { priority: IO_PRIORITY.PREFETCH });
+  const pPref2 = scheduler.scheduleRead('bg.rpf', 0, 16, { priority: IO_PRIORITY.PREFETCH });
+
+  assert.equal(scheduler.getStats().deduped, 1);
+  assert.equal(scheduler.cancelPrefetch(), 2);
+  await assert.rejects(pPref1, { name: 'AbortError' });
+  await assert.rejects(pPref2, { name: 'AbortError' });
+
+  // Active key was removed, so re-scheduling bg.rpf queues fresh.
+  const pPref3 = scheduler.scheduleRead('bg.rpf', 0, 16, { priority: IO_PRIORITY.NORMAL });
+  const pPref4 = scheduler.scheduleRead('bg.rpf', 0, 16, { priority: IO_PRIORITY.NORMAL });
+  assert.equal(scheduler.clear(), 2);
+  await assert.rejects(pPref3, { name: 'AbortError' });
+  await assert.rejects(pPref4, { name: 'AbortError' });
+
+  blockerGate.resolve(makeBytes(1, 8));
+  await pHold;
+  assert.equal(scheduler.getStats().inFlight, 0);
+  assert.equal(scheduler.getStats().queued, 0);
+});
+
+test('W206 step-based priority aging (agingIntervalMs) prevents starvation under continuous CRITICAL/HIGH load and tracks top-level latency telemetry', async () => {
+  let fakeNow = 0;
+  const dispatchOrder = [];
+  const gates = new Map();
+
+  const rangeCache = {
+    read(filePath, offset, length) {
+      dispatchOrder.push(filePath);
+      const g = gates.get(filePath);
+      if (g) return g.promise;
+      return Promise.resolve(makeBytes(3, length));
+    },
+  };
+
+  const gBlocker = deferred();
+  const gCrit1 = deferred();
+  const gHigh1 = deferred();
+  const gCrit2 = deferred();
+  const gPrefetch = deferred();
+  gates.set('blocker.bin', gBlocker);
+  gates.set('crit-1.bin', gCrit1);
+  gates.set('high-1.bin', gHigh1);
+  gates.set('crit-2.bin', gCrit2);
+  gates.set('bg-prefetch.rpf', gPrefetch);
+
+  const scheduler = new IoPriorityScheduler({
+    rangeCache,
+    maxConcurrency: 1,
+    agingIntervalMs: 50,
+    nowFn: () => fakeNow,
+    sleep: async () => {},
+  });
+  assert.equal(scheduler.agingIntervalMs, 50);
+
+  // t = 0: blocker runs immediately; background PREFETCH (tier 3) queues up.
+  const pBlocker = scheduler.scheduleRead('blocker.bin', 0, 8, { priority: IO_PRIORITY.CRITICAL });
+  const pBgPrefetch = scheduler.scheduleRead('bg-prefetch.rpf', 0, 8, {
+    priority: IO_PRIORITY.PREFETCH,
+  });
+
+  // t = 50: PREFETCH aged 1 step (tier 3 -> eff 2 NORMAL). Fresh CRITICAL (tier 0) arrives -> CRITICAL wins.
+  fakeNow = 50;
+  const pCrit1 = scheduler.scheduleRead('crit-1.bin', 0, 8, { priority: IO_PRIORITY.CRITICAL });
+  const pHigh1 = scheduler.scheduleRead('high-1.bin', 0, 8, { priority: IO_PRIORITY.HIGH });
+  gBlocker.resolve(makeBytes(1, 8));
+  await pBlocker;
+  await Promise.resolve();
+  assert.deepEqual(dispatchOrder, ['blocker.bin', 'crit-1.bin']);
+
+  // t = 100: PREFETCH aged 2 steps (tier 3 -> eff 1 HIGH, enqueuedAt 0).
+  //          high-1 waited 50ms -> aged 1 step (tier 1 -> eff 0 CRITICAL)! So high-1 runs before PREFETCH.
+  fakeNow = 100;
+  gCrit1.resolve(makeBytes(2, 8));
+  await pCrit1;
+  await Promise.resolve();
+  assert.deepEqual(dispatchOrder, ['blocker.bin', 'crit-1.bin', 'high-1.bin']);
+
+  // t = 150: fresh CRITICAL burst arrives (crit-2 at t = 150, eff 0, enq 150).
+  //          PREFETCH has waited 150ms -> aged 3 steps (tier 3 -> eff 0 CRITICAL, enq 0 < 150)!
+  //          PREFETCH MUST promote ahead of fresh crit-2 so it cannot starve!
+  fakeNow = 150;
+  const pCrit2 = scheduler.scheduleRead('crit-2.bin', 0, 8, { priority: IO_PRIORITY.CRITICAL });
+  gHigh1.resolve(makeBytes(3, 8));
+  await pHigh1;
+  await Promise.resolve();
+
+  assert.deepEqual(dispatchOrder, ['blocker.bin', 'crit-1.bin', 'high-1.bin', 'bg-prefetch.rpf']);
+  assert.equal(scheduler.getStats().agedPromotions, 1);
+  assert.equal(scheduler.getStats().byPriority.PREFETCH.agedPromotions, 1);
+
+  // t = 180: PREFETCH completes -> crit-2 runs (wait = 30ms).
+  fakeNow = 180;
+  gPrefetch.resolve(makeBytes(4, 8));
+  await pBgPrefetch;
+  await Promise.resolve();
+  gCrit2.resolve(makeBytes(5, 8));
+  await pCrit2;
+
+  assert.deepEqual(dispatchOrder, [
+    'blocker.bin',
+    'crit-1.bin',
+    'high-1.bin',
+    'bg-prefetch.rpf',
+    'crit-2.bin',
+  ]);
+
+  // Exact queue waits:
+  // blocker: 0ms, crit-1: 0ms, high-1: 50ms, bg-prefetch: 150ms, crit-2: 30ms
+  // total = 230ms across 5 dispatches => avgQueueWaitMs = 46ms, maxQueueWaitMs = 150ms
+  const stats = scheduler.getStats();
+  assert.equal(stats.enqueued, 5);
+  assert.equal(stats.dispatched, 5);
+  assert.equal(stats.completed, 5);
+  assert.equal(stats.deduped, 0);
+  assert.equal(stats.agedPromotions, 1);
+  assert.equal(stats.avgQueueWaitMs, 46);
+  assert.equal(stats.maxQueueWaitMs, 150);
+
+  // Verify per-priority rollups match top-level telemetry and reset() clears all W206 fields.
+  const prios = Object.values(stats.byPriority);
+  assert.equal(prios.reduce((s, p) => s + p.enqueued, 0), stats.enqueued);
+  assert.equal(prios.reduce((s, p) => s + p.dispatched, 0), stats.dispatched);
+  assert.equal(prios.reduce((s, p) => s + p.deduped, 0), stats.deduped);
+
+  scheduler.reset();
+  const afterReset = scheduler.getStats();
+  assert.equal(afterReset.enqueued, 0);
+  assert.equal(afterReset.dispatched, 0);
+  assert.equal(afterReset.completed, 0);
+  assert.equal(afterReset.deduped, 0);
+  assert.equal(afterReset.agedPromotions, 0);
+  assert.equal(afterReset.avgQueueWaitMs, 0);
+  assert.equal(afterReset.maxQueueWaitMs, 0);
 });

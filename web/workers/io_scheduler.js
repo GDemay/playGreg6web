@@ -2,7 +2,9 @@
   'use strict';
 
   // Priority HTTPFS streaming scheduler with bounded concurrency, AbortSignal
-  // cancellation, and exponential retry backoff sitting in front of RangeCache.
+  // cancellation, priority aging (starvation prevention), in-flight range
+  // deduplication, latency telemetry, and exponential retry backoff sitting
+  // in front of RangeCache.
   // Compatible with classic Web Workers (importScripts) and Node CommonJS/ESM tests.
 
   const IO_PRIORITY = Object.freeze({
@@ -30,6 +32,8 @@
   const DEFAULT_MAX_RETRIES = 2;
   const DEFAULT_BASE_RETRY_DELAY_MS = 50;
   const DEFAULT_AGING_THRESHOLD_MS = 0;
+  const DEFAULT_AGING_INTERVAL_MS = 0;
+  const DEFAULT_DEDUPE_IN_FLIGHT = true;
 
   const RETRYABLE_ERROR_CODES = new Set([
     'ECONNRESET',
@@ -296,6 +300,10 @@
     }
   }
 
+  function makeReadKey(path, offset, length) {
+    return `${path.replace(/^\/+/, '')}\0${offset}\0${length}`;
+  }
+
   class IoPriorityScheduler {
     constructor(options = {}) {
       if (!options || !options.rangeCache || typeof options.rangeCache.read !== 'function') {
@@ -321,19 +329,34 @@
         Number.isFinite(options.agingThresholdMs) && options.agingThresholdMs > 0
           ? options.agingThresholdMs
           : DEFAULT_AGING_THRESHOLD_MS;
+      this.agingIntervalMs =
+        Number.isFinite(options.agingIntervalMs) && options.agingIntervalMs > 0
+          ? options.agingIntervalMs
+          : DEFAULT_AGING_INTERVAL_MS;
+      this.dedupeInFlight =
+        options.dedupeInFlight !== undefined
+          ? Boolean(options.dedupeInFlight)
+          : options.dedupe !== undefined
+            ? Boolean(options.dedupe)
+            : DEFAULT_DEDUPE_IN_FLIGHT;
       this.sleep = typeof options.sleep === 'function' ? options.sleep : defaultSleep;
       this.nowFn = typeof options.nowFn === 'function' ? options.nowFn : defaultNow;
 
       this._queues = PRIORITY_LEVELS.map(() => []);
+      this._activeByKey = new Map();
       this._inFlight = 0;
       this._nextSeq = 1;
 
       this._stats = {
+        enqueued: 0,
+        dispatched: 0,
         completed: 0,
         failed: 0,
         cancelled: 0,
         retries: 0,
+        deduped: 0,
         agedPromotions: 0,
+        totalQueueWaitMs: 0,
         maxQueueWaitMs: 0,
         binkVideoReads: 0,
         shaderPackReads: 0,
@@ -342,11 +365,13 @@
 
       this._byPriority = PRIORITY_LEVELS.map(() => ({
         scheduled: 0,
+        enqueued: 0,
         inFlight: 0,
         completed: 0,
         failed: 0,
         cancelled: 0,
         retries: 0,
+        deduped: 0,
         dispatched: 0,
         totalQueueWaitMs: 0,
         maxQueueWaitMs: 0,
@@ -393,28 +418,69 @@
         this._stats.uiFontReads += 1;
       }
 
+      const key = makeReadKey(path, offset, length);
+
+      if (this.dedupeInFlight) {
+        const existingTask = this._activeByKey.get(key);
+        if (existingTask && existingTask.state !== 'settled' && !existingTask.allWaitersCancelled) {
+          this._stats.deduped += 1;
+          this._byPriority[priority].deduped += 1;
+
+          return new Promise((resolve, reject) => {
+            const waiter = {
+              priority,
+              signal,
+              resolve,
+              reject,
+              settled: false,
+              deduped: true,
+              onAbort: null,
+            };
+            this._attachWaiterAbortListener(existingTask, waiter);
+            existingTask.waiters.push(waiter);
+
+            // Prevent priority inversion when a higher-priority caller joins a queued read.
+            if (existingTask.state === 'queued' && priority < existingTask.priority) {
+              this._moveQueuedTask(existingTask, priority);
+            }
+            this._drain();
+          });
+        }
+      }
+
+      this._stats.enqueued += 1;
+      this._byPriority[priority].enqueued += 1;
+
       return new Promise((resolve, reject) => {
         const task = {
           seq: this._nextSeq++,
+          key,
           path,
           offset,
           length,
           priority,
-          signal,
           enqueuedAtMs: this._now(),
+          state: 'queued',
+          waiters: [],
+          allWaitersCancelled: false,
+          cancelError: null,
+          onAllCancelled: null,
+        };
+
+        const waiter = {
+          priority,
+          signal,
           resolve,
           reject,
           settled: false,
-          onQueuedAbort: null,
+          deduped: false,
+          onAbort: null,
         };
+        this._attachWaiterAbortListener(task, waiter);
+        task.waiters.push(waiter);
 
-        if (signal && typeof signal.addEventListener === 'function') {
-          const onQueuedAbort = () => {
-            this._removeQueuedTask(task);
-            this._cancelTask(task, createAbortError(signal.reason));
-          };
-          task.onQueuedAbort = onQueuedAbort;
-          signal.addEventListener('abort', onQueuedAbort, { once: true });
+        if (this.dedupeInFlight) {
+          this._activeByKey.set(key, task);
         }
 
         this._queues[priority].push(task);
@@ -484,11 +550,10 @@
       let count = 0;
       for (let i = 0; i < queuedTasks.length; i += 1) {
         const task = queuedTasks[i];
-        this._detachQueuedAbortListener(task);
-        if (!task.settled) {
-          this._cancelTask(task, createAbortError('Prefetch cancelled'));
-          count += 1;
+        if (task.state === 'settled') {
+          continue;
         }
+        count += this._cancelAllWaiters(task, createAbortError('Prefetch cancelled'));
       }
       return count;
     }
@@ -503,14 +568,24 @@
         const queuedTasks = queue.splice(0, queue.length);
         for (let j = 0; j < queuedTasks.length; j += 1) {
           const task = queuedTasks[j];
-          this._detachQueuedAbortListener(task);
-          if (!task.settled) {
-            task.settled = true;
-            task.reject(createAbortError(reason));
-            cancelledCount += 1;
+          this._deleteActiveKey(task);
+          if (task.state === 'settled') {
+            continue;
+          }
+          task.state = 'settled';
+          const waiters = task.waiters.splice(0, task.waiters.length);
+          for (let k = 0; k < waiters.length; k += 1) {
+            const waiter = waiters[k];
+            this._detachWaiterAbortListener(waiter);
+            if (!waiter.settled) {
+              waiter.settled = true;
+              waiter.reject(createAbortError(reason));
+              cancelledCount += 1;
+            }
           }
         }
       }
+      this._activeByKey.clear();
       this._resetCounters();
       if (this._inFlight === 0) {
         this._nextSeq = 1;
@@ -541,12 +616,14 @@
         byPriority[name] = {
           priority: level,
           scheduled: counters.scheduled,
+          enqueued: counters.enqueued,
           queued: levelQueued,
           inFlight: counters.inFlight,
           completed: counters.completed,
           failed: counters.failed,
           cancelled: counters.cancelled,
           retries: counters.retries,
+          deduped: counters.deduped,
           dispatched: counters.dispatched,
           avgQueueWaitMs,
           maxQueueWaitMs: counters.maxQueueWaitMs,
@@ -555,15 +632,22 @@
         };
       }
 
+      const avgQueueWaitMs =
+        this._stats.dispatched > 0 ? this._stats.totalQueueWaitMs / this._stats.dispatched : 0;
+
       return {
         queued,
         inFlight: this._inFlight,
+        enqueued: this._stats.enqueued,
+        dispatched: this._stats.dispatched,
         completed: this._stats.completed,
         failed: this._stats.failed,
         cancelled: this._stats.cancelled,
         retries: this._stats.retries,
+        deduped: this._stats.deduped,
         agedPromotions: this._stats.agedPromotions,
         promotions: this._stats.agedPromotions,
+        avgQueueWaitMs,
         maxQueueWaitMs: this._stats.maxQueueWaitMs,
         binkVideoReads: this._stats.binkVideoReads,
         shaderPackReads: this._stats.shaderPackReads,
@@ -580,11 +664,15 @@
     }
 
     _resetCounters() {
+      this._stats.enqueued = 0;
+      this._stats.dispatched = 0;
       this._stats.completed = 0;
       this._stats.failed = 0;
       this._stats.cancelled = 0;
       this._stats.retries = 0;
+      this._stats.deduped = 0;
       this._stats.agedPromotions = 0;
+      this._stats.totalQueueWaitMs = 0;
       this._stats.maxQueueWaitMs = 0;
       this._stats.binkVideoReads = 0;
       this._stats.shaderPackReads = 0;
@@ -593,10 +681,12 @@
       for (let i = 0; i < PRIORITY_LEVELS.length; i += 1) {
         const counters = this._byPriority[PRIORITY_LEVELS[i]];
         counters.scheduled = 0;
+        counters.enqueued = 0;
         counters.completed = 0;
         counters.failed = 0;
         counters.cancelled = 0;
         counters.retries = 0;
+        counters.deduped = 0;
         counters.dispatched = 0;
         counters.totalQueueWaitMs = 0;
         counters.maxQueueWaitMs = 0;
@@ -604,15 +694,32 @@
       }
     }
 
-    _detachQueuedAbortListener(task) {
-      if (
-        task.signal &&
-        task.onQueuedAbort &&
-        typeof task.signal.removeEventListener === 'function'
-      ) {
-        task.signal.removeEventListener('abort', task.onQueuedAbort);
+    _deleteActiveKey(task) {
+      if (task && task.key && this._activeByKey.get(task.key) === task) {
+        this._activeByKey.delete(task.key);
       }
-      task.onQueuedAbort = null;
+    }
+
+    _detachWaiterAbortListener(waiter) {
+      if (
+        waiter.signal &&
+        waiter.onAbort &&
+        typeof waiter.signal.removeEventListener === 'function'
+      ) {
+        waiter.signal.removeEventListener('abort', waiter.onAbort);
+      }
+      waiter.onAbort = null;
+    }
+
+    _attachWaiterAbortListener(task, waiter) {
+      if (!waiter.signal || typeof waiter.signal.addEventListener !== 'function') {
+        return;
+      }
+      const onAbort = () => {
+        this._abortWaiter(task, waiter, createAbortError(waiter.signal.reason));
+      };
+      waiter.onAbort = onAbort;
+      waiter.signal.addEventListener('abort', onAbort, { once: true });
     }
 
     _removeQueuedTask(task) {
@@ -621,31 +728,144 @@
       if (idx !== -1) {
         queue.splice(idx, 1);
       }
-      this._detachQueuedAbortListener(task);
+    }
+
+    _moveQueuedTask(task, newPriority) {
+      if (task.state !== 'queued' || task.priority === newPriority) {
+        return;
+      }
+      this._removeQueuedTask(task);
+      const targetQueue = this._queues[newPriority];
+      task.priority = newPriority;
+      // Preserve (enqueuedAtMs, seq) order so targetQueue[0] stays the oldest task
+      // for accurate priority-aging checks.
+      let insertIdx = targetQueue.length;
+      while (insertIdx > 0) {
+        const prev = targetQueue[insertIdx - 1];
+        if (
+          prev.enqueuedAtMs < task.enqueuedAtMs ||
+          (prev.enqueuedAtMs === task.enqueuedAtMs && prev.seq < task.seq)
+        ) {
+          break;
+        }
+        insertIdx -= 1;
+      }
+      targetQueue.splice(insertIdx, 0, task);
+    }
+
+    _abortWaiter(task, waiter, abortErr) {
+      if (waiter.settled) {
+        return;
+      }
+      waiter.settled = true;
+      this._detachWaiterAbortListener(waiter);
+      const idx = task.waiters.indexOf(waiter);
+      if (idx !== -1) {
+        task.waiters.splice(idx, 1);
+      }
+      this._stats.cancelled += 1;
+      this._byPriority[waiter.priority].cancelled += 1;
+      waiter.reject(abortErr);
+
+      if (task.state === 'settled') {
+        return;
+      }
+
+      if (task.waiters.length === 0) {
+        if (task.state === 'queued') {
+          this._removeQueuedTask(task);
+          this._deleteActiveKey(task);
+          task.state = 'settled';
+        } else if (task.state === 'in_flight') {
+          task.allWaitersCancelled = true;
+          task.cancelError = abortErr;
+          this._deleteActiveKey(task);
+          if (task.onAllCancelled) {
+            const onCancel = task.onAllCancelled;
+            task.onAllCancelled = null;
+            onCancel(abortErr);
+          }
+        }
+        return;
+      }
+
+      if (task.state === 'queued') {
+        let bestPriority = IO_PRIORITY.PREFETCH;
+        for (let i = 0; i < task.waiters.length; i += 1) {
+          if (task.waiters[i].priority < bestPriority) {
+            bestPriority = task.waiters[i].priority;
+          }
+        }
+        if (bestPriority !== task.priority) {
+          this._moveQueuedTask(task, bestPriority);
+        }
+      }
     }
 
     _completeTask(task, value) {
-      if (task.settled) return;
-      task.settled = true;
-      this._stats.completed += 1;
-      this._byPriority[task.priority].completed += 1;
-      task.resolve(value);
+      if (task.state === 'settled') return;
+      task.state = 'settled';
+      this._deleteActiveKey(task);
+      const waiters = task.waiters.splice(0, task.waiters.length);
+      let resolvedAny = false;
+      for (let i = 0; i < waiters.length; i += 1) {
+        const waiter = waiters[i];
+        this._detachWaiterAbortListener(waiter);
+        if (waiter.settled) continue;
+        if (waiter.signal && waiter.signal.aborted) {
+          waiter.settled = true;
+          this._stats.cancelled += 1;
+          this._byPriority[waiter.priority].cancelled += 1;
+          waiter.reject(createAbortError(waiter.signal.reason));
+          continue;
+        }
+        waiter.settled = true;
+        resolvedAny = true;
+        waiter.resolve(value);
+      }
+      if (resolvedAny) {
+        this._stats.completed += 1;
+        this._byPriority[task.priority].completed += 1;
+      }
     }
 
     _failTask(task, err) {
-      if (task.settled) return;
-      task.settled = true;
-      this._stats.failed += 1;
-      this._byPriority[task.priority].failed += 1;
-      task.reject(err);
+      if (task.state === 'settled') return;
+      task.state = 'settled';
+      this._deleteActiveKey(task);
+      const waiters = task.waiters.splice(0, task.waiters.length);
+      let failedAny = false;
+      for (let i = 0; i < waiters.length; i += 1) {
+        const waiter = waiters[i];
+        this._detachWaiterAbortListener(waiter);
+        if (waiter.settled) continue;
+        waiter.settled = true;
+        failedAny = true;
+        waiter.reject(err);
+      }
+      if (failedAny) {
+        this._stats.failed += 1;
+        this._byPriority[task.priority].failed += 1;
+      }
     }
 
-    _cancelTask(task, err) {
-      if (task.settled) return;
-      task.settled = true;
-      this._stats.cancelled += 1;
-      this._byPriority[task.priority].cancelled += 1;
-      task.reject(err);
+    _cancelAllWaiters(task, err) {
+      if (task.state === 'settled') return 0;
+      task.state = 'settled';
+      this._deleteActiveKey(task);
+      const waiters = task.waiters.splice(0, task.waiters.length);
+      let count = 0;
+      for (let i = 0; i < waiters.length; i += 1) {
+        const waiter = waiters[i];
+        this._detachWaiterAbortListener(waiter);
+        if (waiter.settled) continue;
+        waiter.settled = true;
+        this._stats.cancelled += 1;
+        this._byPriority[waiter.priority].cancelled += 1;
+        waiter.reject(err);
+        count += 1;
+      }
+      return count;
     }
 
     _dequeueNext(nowMs) {
@@ -697,6 +917,46 @@
         }
       }
 
+      if (this.agingIntervalMs > 0) {
+        let bestLevel = -1;
+        let bestEffectivePriority = Infinity;
+        let bestEnqueuedAtMs = Infinity;
+        let bestSeq = Infinity;
+
+        for (let i = 0; i < PRIORITY_LEVELS.length; i += 1) {
+          const level = PRIORITY_LEVELS[i];
+          const queue = this._queues[level];
+          if (queue.length === 0) {
+            continue;
+          }
+          const head = queue[0];
+          const waitMs = Math.max(0, nowMs - head.enqueuedAtMs);
+          const steps = Math.floor(waitMs / this.agingIntervalMs);
+          const effectivePriority = Math.max(IO_PRIORITY.CRITICAL, level - steps);
+
+          if (
+            bestLevel === -1 ||
+            effectivePriority < bestEffectivePriority ||
+            (effectivePriority === bestEffectivePriority &&
+              (head.enqueuedAtMs < bestEnqueuedAtMs ||
+                (head.enqueuedAtMs === bestEnqueuedAtMs &&
+                  (level < bestLevel || (level === bestLevel && head.seq < bestSeq)))))
+          ) {
+            bestLevel = level;
+            bestEffectivePriority = effectivePriority;
+            bestEnqueuedAtMs = head.enqueuedAtMs;
+            bestSeq = head.seq;
+          }
+        }
+
+        if (bestLevel !== -1) {
+          return {
+            task: this._queues[bestLevel].shift(),
+            promoted: bestLevel > strictLevel,
+          };
+        }
+      }
+
       return {
         task: this._queues[strictLevel].shift(),
         promoted: false,
@@ -711,17 +971,36 @@
           return;
         }
         const { task, promoted } = dequeued;
-        this._detachQueuedAbortListener(task);
-        if (task.settled) {
-          continue;
-        }
-        if (task.signal && task.signal.aborted) {
-          this._cancelTask(task, createAbortError(task.signal.reason));
+        if (task.state === 'settled') {
           continue;
         }
 
+        // Guard against signals marked aborted without firing an event.
+        for (let i = task.waiters.length - 1; i >= 0; i -= 1) {
+          const waiter = task.waiters[i];
+          if (waiter.signal && waiter.signal.aborted) {
+            task.waiters.splice(i, 1);
+            this._detachWaiterAbortListener(waiter);
+            if (!waiter.settled) {
+              waiter.settled = true;
+              this._stats.cancelled += 1;
+              this._byPriority[waiter.priority].cancelled += 1;
+              waiter.reject(createAbortError(waiter.signal.reason));
+            }
+          }
+        }
+        if (task.waiters.length === 0) {
+          this._deleteActiveKey(task);
+          task.state = 'settled';
+          continue;
+        }
+
+        task.state = 'in_flight';
+
         const waitMs = Math.max(0, nowMs - task.enqueuedAtMs);
         const prioStats = this._byPriority[task.priority];
+        this._stats.dispatched += 1;
+        this._stats.totalQueueWaitMs += waitMs;
         prioStats.dispatched += 1;
         prioStats.totalQueueWaitMs += waitMs;
         if (waitMs > prioStats.maxQueueWaitMs) {
@@ -741,27 +1020,35 @@
       }
     }
 
-    _awaitWithAbort(promise, signal) {
-      if (!signal || typeof signal.addEventListener !== 'function') {
-        return promise;
-      }
-      if (signal.aborted) {
+    _awaitTaskOrAbort(promise, task) {
+      if (task.allWaitersCancelled) {
         promise.catch(() => {});
-        return Promise.reject(createAbortError(signal.reason));
+        return Promise.reject(task.cancelError || createAbortError('The operation was aborted'));
       }
       return new Promise((resolve, reject) => {
-        const onAbort = () => {
+        let done = false;
+        const onTaskCancel = (err) => {
+          if (done) return;
+          done = true;
           promise.catch(() => {});
-          reject(createAbortError(signal.reason));
+          reject(err);
         };
-        signal.addEventListener('abort', onAbort, { once: true });
+        task.onAllCancelled = onTaskCancel;
         promise.then(
           (val) => {
-            signal.removeEventListener('abort', onAbort);
+            if (done) return;
+            done = true;
+            if (task.onAllCancelled === onTaskCancel) {
+              task.onAllCancelled = null;
+            }
             resolve(val);
           },
           (err) => {
-            signal.removeEventListener('abort', onAbort);
+            if (done) return;
+            done = true;
+            if (task.onAllCancelled === onTaskCancel) {
+              task.onAllCancelled = null;
+            }
             reject(err);
           }
         );
@@ -769,7 +1056,7 @@
     }
 
     async _runTask(task) {
-      const { path, offset, length, priority, signal } = task;
+      const { path, offset, length, priority } = task;
       const prioStats = this._byPriority[priority];
       let attempt = 0;
       let pendingReadPromise = null;
@@ -782,8 +1069,9 @@
 
       try {
         while (true) {
-          if (signal && signal.aborted) {
-            this._cancelTask(task, createAbortError(signal.reason));
+          if (task.allWaitersCancelled || task.waiters.length === 0) {
+            this._deleteActiveKey(task);
+            task.state = 'settled';
             return;
           }
 
@@ -812,27 +1100,33 @@
           );
 
           try {
-            const bytes = await this._awaitWithAbort(trackedRead, signal);
-            if (signal && signal.aborted) {
-              this._cancelTask(task, createAbortError(signal.reason));
+            const bytes = await this._awaitTaskOrAbort(trackedRead, task);
+            if (task.allWaitersCancelled || task.waiters.length === 0) {
+              this._deleteActiveKey(task);
+              task.state = 'settled';
               return;
             }
             this._completeTask(task, bytes);
             return;
           } catch (err) {
             if (!readSettled) {
-              // Aborted while underlying rangeCache.read() is still running.
-              // Reject the caller immediately, but hold the concurrency slot until
+              // All waiters aborted while underlying rangeCache.read() is still running.
+              // Waiters were already rejected immediately; hold the concurrency slot until
               // the underlying read actually settles so maxConcurrency is preserved.
               pendingReadPromise = trackedRead;
-              this._cancelTask(task, createAbortError(signal ? signal.reason : err));
+              this._deleteActiveKey(task);
+              task.state = 'settled';
               return;
             }
 
-            if ((signal && signal.aborted) || isAbortError(err)) {
-              const abortErr =
-                signal && signal.aborted ? createAbortError(signal.reason) : err;
-              this._cancelTask(task, abortErr);
+            if (task.allWaitersCancelled || task.waiters.length === 0) {
+              this._deleteActiveKey(task);
+              task.state = 'settled';
+              return;
+            }
+
+            if (isAbortError(err)) {
+              this._cancelAllWaiters(task, err);
               return;
             }
 
@@ -852,25 +1146,31 @@
             }
 
             try {
-              await this._awaitWithAbort(sleepPromise, signal);
+              await this._awaitTaskOrAbort(sleepPromise, task);
             } catch (sleepErr) {
-              if ((signal && signal.aborted) || isAbortError(sleepErr)) {
-                const abortErr =
-                  signal && signal.aborted ? createAbortError(signal.reason) : sleepErr;
-                this._cancelTask(task, abortErr);
+              if (task.allWaitersCancelled || task.waiters.length === 0) {
+                this._deleteActiveKey(task);
+                task.state = 'settled';
+                return;
+              }
+              if (isAbortError(sleepErr)) {
+                this._cancelAllWaiters(task, sleepErr);
                 return;
               }
               this._failTask(task, sleepErr);
               return;
             }
 
-            if (signal && signal.aborted) {
-              this._cancelTask(task, createAbortError(signal.reason));
+            if (task.allWaitersCancelled || task.waiters.length === 0) {
+              this._deleteActiveKey(task);
+              task.state = 'settled';
               return;
             }
           }
         }
       } finally {
+        task.onAllCancelled = null;
+        this._deleteActiveKey(task);
         if (pendingReadPromise) {
           pendingReadPromise.then(releaseSlot, releaseSlot);
         } else {
@@ -887,6 +1187,9 @@
     DEFAULT_MAX_RETRIES,
     DEFAULT_BASE_RETRY_DELAY_MS,
     DEFAULT_AGING_THRESHOLD_MS,
+    DEFAULT_AGING_INTERVAL_MS,
+    DEFAULT_DEDUPE_IN_FLIGHT,
+    makeReadKey,
     classifyIoPriority,
     isBinkVideoPath,
     isShaderPackPath,
