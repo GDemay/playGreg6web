@@ -43,6 +43,9 @@ OP_PRESENT = 7
 THIN_MARKER = 0x6E696874  # 'thin': reserved field of a WriteBuffer/WriteTexture whose payload was thinned out
 # opcode -> (fixed payload size, offset of data_len); the reserved u32 is the last field.
 _UPLOAD_LAYOUT = {OP_WRITE_BUFFER: (16, 8), OP_WRITE_TEXTURE: (48, 40)}
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import find_chrome  # noqa: E402
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REPLAY_PAGE = REPO_ROOT / "tools" / "replay" / "replay.html"
 FPS_TARGET = 30.0
@@ -627,7 +630,7 @@ class Cdp:
 
 def build_parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--chrome", required=True, help="path to chrome executable")
+    p.add_argument("--chrome", default=None, help="path to chrome executable (default $PLAYGTA6_CHROME, then auto-detected)")
     p.add_argument("--replay-dir", required=True, help="dir with the trace and wgsl pack (served at /data/)")
     p.add_argument("--trace", required=True, help="trace file name inside --replay-dir")
     p.add_argument("--pack", required=True, help="wgsl pack file name inside --replay-dir")
@@ -650,6 +653,9 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    args.chrome = find_chrome.resolve_chrome(args.chrome, log=lambda m: print(m, file=sys.stderr))
+    if not args.chrome:
+        raise SystemExit("no Chrome found: pass --chrome or set $PLAYGTA6_CHROME")
     if args.luma_threshold < 0.0:
         raise ValueError(f"--luma-threshold must be >= 0, got {args.luma_threshold}")
     replay_dir = Path(args.replay_dir).resolve()
