@@ -1885,8 +1885,23 @@ uint32_t map_sab_buttons_to_gamepad(uint32_t raw_buttons) {
     if ((raw_buttons & input_button::kView) != 0) {
         out |= gamepad_button::kView;
     }
-    if ((raw_buttons & input_button::kSprint) != 0) {
+    if ((raw_buttons & (input_button::kSprint | input_button::kLeftStickPress)) != 0) {
         out |= gamepad_button::kLeftThumbstick;
+    }
+    if ((raw_buttons & input_button::kRightStickPress) != 0) {
+        out |= gamepad_button::kRightThumbstick;
+    }
+    if ((raw_buttons & input_button::kDPadUp) != 0) {
+        out |= gamepad_button::kDPadUp;
+    }
+    if ((raw_buttons & input_button::kDPadDown) != 0) {
+        out |= gamepad_button::kDPadDown;
+    }
+    if ((raw_buttons & input_button::kDPadLeft) != 0) {
+        out |= gamepad_button::kDPadLeft;
+    }
+    if ((raw_buttons & input_button::kDPadRight) != 0) {
+        out |= gamepad_button::kDPadRight;
     }
     return out;
 }
