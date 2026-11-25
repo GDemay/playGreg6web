@@ -31,11 +31,14 @@
 //   worker crash.
 // ---------------------------------------------------------------------------
 
-/** Job priorities. Lower value runs first; FIFO within one level. */
-export const PRIORITY = Object.freeze({ HIGH: 0, NORMAL: 1, LOW: 2 });
+/** Job priorities. Higher numeric value runs first; FIFO within equal priority. */
+export const PRIORITY = Object.freeze({ HIGH: 10, NORMAL: 0, LOW: -10 });
 
-const PRIORITY_NAMES = Object.freeze({ high: 0, normal: 1, low: 2 });
-const PRIORITY_LEVELS = 3;
+const PRIORITY_NAMES = Object.freeze({
+  high: PRIORITY.HIGH,
+  normal: PRIORITY.NORMAL,
+  low: PRIORITY.LOW,
+});
 
 export const DEFAULT_CANCEL_GRACE_MS = 1000;
 export const DEFAULT_BREAKER_MAX_CRASHES = 5;
@@ -178,8 +181,15 @@ function normalisePriority(priority) {
   if (typeof priority === 'string' && Object.prototype.hasOwnProperty.call(PRIORITY_NAMES, priority)) {
     return PRIORITY_NAMES[priority];
   }
-  if (Number.isInteger(priority) && priority >= 0 && priority < PRIORITY_LEVELS) return priority;
+  if (typeof priority === 'number' && Number.isFinite(priority)) {
+    return priority === 0 ? 0 : priority;
+  }
   throw new RangeError(`Invalid priority: ${String(priority)}`);
+}
+
+function jobHigherPriority(a, b) {
+  if (a.priority !== b.priority) return a.priority > b.priority;
+  return a.seq < b.seq;
 }
 
 /** Attach a listener to either a DOM-style or a Node-style worker. */
@@ -298,10 +308,12 @@ export class WorkerPool {
     this._slots = new Set();
     this._slotRespawns = new Array(maxWorkers).fill(0);
     this._slotNeedsRespawn = new Array(maxWorkers).fill(false);
-    this._queues = [[], [], []];
+    this._queue = [];
     this._blocked = [];
     this._running = 0;
     this._nextId = 1;
+    this._nextSeq = 1;
+    this._idleSeq = 0;
     this._crashTimes = [];
     this._lastCrash = null;
     this._circuitOpen = false;
@@ -320,6 +332,7 @@ export class WorkerPool {
       retried: 0,
       hardKills: 0,
       spawned: 0,
+      warmReuses: 0,
       timedOutTasks: 0,
       respawnedWorkers: 0,
       peakQueueDepth: 0,
@@ -336,7 +349,7 @@ export class WorkerPool {
    * @param {*} payload Structured-cloneable job input.
    * @param {object} [opts]
    * @param {Transferable[]} [opts.transfer] Transferred (detached in the caller) with the payload.
-   * @param {'high'|'normal'|'low'|number} [opts.priority='normal']
+   * @param {'high'|'normal'|'low'|number} [opts.priority='normal'] Higher numeric priority runs first; FIFO within equal priority.
    * @param {AbortSignal} [opts.signal]
    * @param {number} [opts.timeoutMs] Run-time limit, measured from when the job starts running.
    * @param {(value: *) => void} [opts.onProgress]
@@ -345,9 +358,17 @@ export class WorkerPool {
   submit(type, payload, opts = {}) {
     return new Promise((resolve, reject) => {
       let priority;
+      let timeoutMs;
       try {
         if (typeof type !== 'string' || type === '') throw new TypeError('job type must be a non-empty string');
         priority = normalisePriority(opts.priority);
+        timeoutMs =
+          opts.timeoutMs === undefined || opts.timeoutMs === null
+            ? this._defaultTimeoutMs
+            : opts.timeoutMs;
+        if (typeof timeoutMs !== 'number' || Number.isNaN(timeoutMs) || timeoutMs < 0) {
+          throw new RangeError(`timeoutMs must be a non-negative number, got ${String(timeoutMs)}`);
+        }
       } catch (err) {
         reject(err);
         return;
@@ -371,11 +392,12 @@ export class WorkerPool {
 
       const job = {
         id: this._nextId++,
+        seq: this._nextSeq++,
         type,
         payload,
         transfer: Array.isArray(opts.transfer) ? opts.transfer : [],
         priority,
-        timeoutMs: opts.timeoutMs ?? this._defaultTimeoutMs,
+        timeoutMs,
         onProgress: typeof opts.onProgress === 'function' ? opts.onProgress : null,
         signal: signal || null,
         resolve,
@@ -388,6 +410,7 @@ export class WorkerPool {
         crashRetries: 0,
         timeoutTimer: null,
         abortListener: null,
+        _heapIndex: -1,
       };
       this._counters.submitted++;
 
@@ -396,7 +419,7 @@ export class WorkerPool {
         signal.addEventListener('abort', job.abortListener, { once: true });
       }
 
-      this._queues[priority].push(job);
+      this._enqueue(job);
       this._pump();
       if (job.state === 'queued' && this._queuedCount() > this._maxQueue) {
         if (this._overflow === 'reject') {
@@ -447,6 +470,29 @@ export class WorkerPool {
     return this.terminate(opts);
   }
 
+  /**
+   * Pre-spawn idle warm workers up to `count` (clamped to `[0, maxWorkers]`).
+   * No-op if the pool is closed or the circuit breaker is open.
+   * @param {number} [count=this._minWorkers]
+   * @returns {number} Current live worker count.
+   */
+  warmUp(count = this._minWorkers) {
+    if (typeof count !== 'number' || !Number.isInteger(count) || count < 0) {
+      throw new RangeError(`warmUp count must be a non-negative integer, got ${count}`);
+    }
+    if (this._closed || this._circuitOpen) return this._slots.size;
+    const target = Math.min(count, this._maxWorkers);
+    while (this._slots.size < target) {
+      const slot = this._spawn();
+      if (!slot) {
+        this._checkBreaker();
+        break;
+      }
+      this._armIdle(slot);
+    }
+    return this._slots.size;
+  }
+
   /** Re-close an open circuit breaker and reset per-slot respawn budgets so new work is accepted again. */
   resetCircuit() {
     this._circuitOpen = false;
@@ -460,26 +506,40 @@ export class WorkerPool {
   stats() {
     let busy = 0;
     for (const slot of this._slots) if (slot.state !== 'idle') busy++;
+    const workers = this._slots.size;
+    const idleWorkers = workers - busy;
+    const queued = this._queuedCount();
+    const blocked = this._blocked.length;
+    const queuedTasks = queued + blocked;
+    const avgRunMs = this._runCount ? this._runTotal / this._runCount : 0;
     return {
-      workers: this._slots.size,
+      workers,
       busy,
-      queued: this._queuedCount(),
-      blocked: this._blocked.length,
+      activeWorkers: busy,
+      idleWorkers,
+      queued,
+      blocked,
+      queuedTasks,
       running: this._running,
       submitted: this._counters.submitted,
       completed: this._counters.completed,
+      completedTasks: this._counters.completed,
       failed: this._counters.failed,
+      failedTasks: this._counters.failed,
       cancelled: this._counters.cancelled,
       rejected: this._counters.rejected,
       crashed: this._counters.crashed,
       retried: this._counters.retried,
       hardKills: this._counters.hardKills,
       spawned: this._counters.spawned,
+      warmReuses: this._counters.warmReuses,
       timedOutTasks: this._counters.timedOutTasks,
       respawnedWorkers: this._counters.respawnedWorkers,
       peakQueueDepth: this._counters.peakQueueDepth,
+      peakQueuedTasks: this._counters.peakQueueDepth,
       avgWaitMs: this._waitCount ? this._waitTotal / this._waitCount : 0,
-      avgRunMs: this._runCount ? this._runTotal / this._runCount : 0,
+      avgRunMs,
+      avgTaskMs: avgRunMs,
       circuitOpen: this._circuitOpen,
       terminated: this._closed,
     };
@@ -493,7 +553,7 @@ export class WorkerPool {
   // ---- internals ---------------------------------------------------------
 
   _queuedCount() {
-    return this._queues[0].length + this._queues[1].length + this._queues[2].length;
+    return this._queue.length;
   }
 
   _recordPeakQueueDepth() {
@@ -507,15 +567,90 @@ export class WorkerPool {
     return this._queuedCount() === 0 && this._blocked.length === 0 && this._running === 0;
   }
 
+  _enqueue(job) {
+    const q = this._queue;
+    const idx = q.length;
+    job._heapIndex = idx;
+    q.push(job);
+    this._siftUp(idx);
+  }
+
   _removeFromQueue(job) {
-    const q = this._queues[job.priority];
-    const i = q.indexOf(job);
-    if (i >= 0) q.splice(i, 1);
+    const q = this._queue;
+    const idx = job._heapIndex;
+    if (idx < 0 || idx >= q.length || q[idx] !== job) return false;
+    job._heapIndex = -1;
+    const last = q.pop();
+    if (idx < q.length) {
+      q[idx] = last;
+      last._heapIndex = idx;
+      if (!this._siftUp(idx)) {
+        this._siftDown(idx);
+      }
+    }
+    return true;
   }
 
   _nextQueued() {
-    for (const q of this._queues) if (q.length > 0) return q.shift();
-    return null;
+    const q = this._queue;
+    if (q.length === 0) return null;
+    const top = q[0];
+    top._heapIndex = -1;
+    const last = q.pop();
+    if (q.length > 0) {
+      q[0] = last;
+      last._heapIndex = 0;
+      this._siftDown(0);
+    }
+    return top;
+  }
+
+  _drainQueued() {
+    const q = this._queue;
+    this._queue = [];
+    for (let i = 0; i < q.length; i++) {
+      q[i]._heapIndex = -1;
+    }
+    return q;
+  }
+
+  _siftUp(idx) {
+    const q = this._queue;
+    const job = q[idx];
+    let moved = false;
+    while (idx > 0) {
+      const parentIdx = (idx - 1) >> 1;
+      const parent = q[parentIdx];
+      if (!jobHigherPriority(job, parent)) break;
+      q[idx] = parent;
+      parent._heapIndex = idx;
+      idx = parentIdx;
+      moved = true;
+    }
+    q[idx] = job;
+    job._heapIndex = idx;
+    return moved;
+  }
+
+  _siftDown(idx) {
+    const q = this._queue;
+    const len = q.length;
+    const job = q[idx];
+    for (;;) {
+      const left = (idx << 1) + 1;
+      if (left >= len) break;
+      let best = left;
+      const right = left + 1;
+      if (right < len && jobHigherPriority(q[right], q[left])) {
+        best = right;
+      }
+      if (!jobHigherPriority(q[best], job)) break;
+      q[idx] = q[best];
+      q[idx]._heapIndex = idx;
+      idx = best;
+    }
+    q[idx] = job;
+    job._heapIndex = idx;
   }
 
   _circuitError() {
@@ -547,7 +682,7 @@ export class WorkerPool {
     const wasRunning = job.state === 'running';
     if (wasRunning) {
       this._running--;
-      this._runTotal += this._now() - job.startedAt;
+      this._runTotal += Math.max(0, this._now() - job.startedAt);
       this._runCount++;
     }
     job.state = 'done';
@@ -565,7 +700,10 @@ export class WorkerPool {
       this._cancelRunning(job, error, 'cancel');
     } else {
       if (job.state === 'queued') this._removeFromQueue(job);
-      else if (job.state === 'blocked') this._blocked.splice(this._blocked.indexOf(job), 1);
+      else if (job.state === 'blocked') {
+        const idx = this._blocked.indexOf(job);
+        if (idx >= 0) this._blocked.splice(idx, 1);
+      }
       this._settle(job, 'cancel', error);
     }
     this._pump();
@@ -590,12 +728,13 @@ export class WorkerPool {
     slot.job = null;
     slot.state = 'cancelling';
     slot.cancelId = job.id;
+    let postFailed = false;
     try {
       slot.worker.postMessage({ id: job.id, cancel: true });
     } catch (_) {
-      // A dead worker will be reported through its own error path.
+      postFailed = true;
     }
-    if (!(this._cancelGraceMs > 0)) {
+    if (postFailed || !(this._cancelGraceMs > 0)) {
       this._hardKill(slot);
     } else if (Number.isFinite(this._cancelGraceMs)) {
       slot.graceTimer = this._setTimeout(() => {
@@ -677,6 +816,8 @@ export class WorkerPool {
       dead: false,
       idleTimer: null,
       graceTimer: null,
+      jobsHandled: 0,
+      lastIdleSeq: 0,
     };
     this._slots.add(slot);
     listen(worker, 'message', (ev) => this._onMessage(slot, ev && ev.data));
@@ -704,9 +845,16 @@ export class WorkerPool {
     }
   }
 
+  /** Pick the most recently used idle warm worker to maximise locality and allow surplus workers to shrink. */
   _idleSlot() {
-    for (const slot of this._slots) if (slot.state === 'idle' && !slot.dead) return slot;
-    return null;
+    let best = null;
+    for (const slot of this._slots) {
+      if (slot.state !== 'idle' || slot.dead) continue;
+      if (!best || slot.lastIdleSeq > best.lastIdleSeq) {
+        best = slot;
+      }
+    }
+    return best;
   }
 
   /** Move jobs onto workers while capacity and breaker allow. */
@@ -724,13 +872,7 @@ export class WorkerPool {
               `Worker respawn limit exceeded (${this._maxRespawnsPerSlot} per slot)`,
               this._lastCrash || undefined
             );
-            const pending = [
-              ...this._queues[0],
-              ...this._queues[1],
-              ...this._queues[2],
-              ...this._blocked,
-            ];
-            this._queues = [[], [], []];
+            const pending = [...this._drainQueued(), ...this._blocked];
             this._blocked = [];
             for (const job of pending) this._settle(job, 'fail', err);
           }
@@ -753,7 +895,7 @@ export class WorkerPool {
     while (this._blocked.length > 0 && this._queuedCount() < this._maxQueue) {
       const job = this._blocked.shift();
       job.state = 'queued';
-      this._queues[job.priority].push(job);
+      this._enqueue(job);
     }
   }
 
@@ -766,7 +908,7 @@ export class WorkerPool {
     job.slot = slot;
     job.startedAt = this._now();
     this._running++;
-    this._waitTotal += job.startedAt - job.submittedAt;
+    this._waitTotal += Math.max(0, job.startedAt - job.submittedAt);
     this._waitCount++;
     slot.job = job;
     slot.state = 'busy';
@@ -775,12 +917,18 @@ export class WorkerPool {
     }
     try {
       slot.worker.postMessage({ id: job.id, type: job.type, payload: job.payload }, job.transfer);
+      if (slot.jobsHandled > 0) this._counters.warmReuses++;
+      slot.jobsHandled++;
     } catch (err) {
       // Job-level failure (e.g. DataCloneError): the worker itself is fine.
       slot.job = null;
       slot.state = 'idle';
+      slot.lastIdleSeq = ++this._idleSeq;
       this._settle(job, 'fail', err);
-      this._armIdle(slot);
+      if (this._queuedCount() === 0 && this._blocked.length === 0) {
+        this._armIdle(slot);
+      }
+      this._checkIdle();
     }
   }
 
@@ -803,8 +951,11 @@ export class WorkerPool {
   _releaseSlot(slot) {
     slot.job = null;
     slot.state = 'idle';
-    this._armIdle(slot);
+    slot.lastIdleSeq = ++this._idleSeq;
     this._pump();
+    if (!slot.dead && slot.state === 'idle') {
+      this._armIdle(slot);
+    }
     this._checkIdle();
   }
 
@@ -872,7 +1023,7 @@ export class WorkerPool {
         }
         job.crashRetries++;
         this._counters.retried++;
-        this._queues[job.priority].unshift(job);
+        this._enqueue(job);
       } else {
         this._settle(job, 'fail', error);
       }
@@ -888,8 +1039,7 @@ export class WorkerPool {
     if (this._circuitOpen || this._breakerMax <= 0) return;
     if (this._crashTimes.length >= this._breakerMax) {
       this._circuitOpen = true;
-      const pending = [...this._queues[0], ...this._queues[1], ...this._queues[2], ...this._blocked];
-      this._queues = [[], [], []];
+      const pending = [...this._drainQueued(), ...this._blocked];
       this._blocked = [];
       for (const job of pending) this._settle(job, 'fail', this._circuitError());
     }
@@ -906,13 +1056,7 @@ export class WorkerPool {
 
   _finishImmediate() {
     const st = this._terminateState;
-    const pending = [
-      ...this._queues[0],
-      ...this._queues[1],
-      ...this._queues[2],
-      ...this._blocked,
-    ];
-    this._queues = [[], [], []];
+    const pending = [...this._drainQueued(), ...this._blocked];
     this._blocked = [];
     const running = [];
     for (const slot of this._slots) if (slot.job) running.push(slot.job);
