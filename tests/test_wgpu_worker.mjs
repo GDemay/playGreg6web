@@ -2480,3 +2480,708 @@ test('W332 optional requireNonBlackFrame gates first-visible-frame via W307 lumi
     procBink.destroy();
   }
 });
+
+// ---------------------------------------------------------------------------
+// W338: Async non-black swapchain luminance probe tests (#1453)
+// ---------------------------------------------------------------------------
+
+function createProbeCapableMockWebGpu({
+  width = 1280,
+  height = 720,
+  format = 'bgra8unorm',
+  textureUsage = TEXTURE_USAGE.RENDER_ATTACHMENT | TEXTURE_USAGE.COPY_SRC,
+  deferMapAsync = false,
+} = {}) {
+  const base = createMockWebGpu();
+  const pixels = new Uint8Array(width * height * 4);
+  // Default: solid black RGB with opaque alpha (255) — alpha must be ignored by probe!
+  for (let i = 3; i < pixels.length; i += 4) {
+    pixels[i] = 255;
+  }
+
+  const copyCalls = [];
+  const probeBuffers = [];
+  const pendingMaps = [];
+  const bufferEvents = [];
+
+  const setPixel = (x, y, c0, c1, c2, a = 255) => {
+    const off = (y * width + x) * 4;
+    pixels[off] = c0;
+    pixels[off + 1] = c1;
+    pixels[off + 2] = c2;
+    pixels[off + 3] = a;
+  };
+
+  const clearPixels = (c0 = 0, c1 = 0, c2 = 0, a = 255) => {
+    for (let i = 0; i < pixels.length; i += 4) {
+      pixels[i] = c0;
+      pixels[i + 1] = c1;
+      pixels[i + 2] = c2;
+      pixels[i + 3] = a;
+    }
+  };
+
+  const ctx = {
+    configured: [],
+    configure(desc) {
+      this.configured.push({ ...desc });
+    },
+    getCurrentTexture() {
+      return {
+        width,
+        height,
+        format,
+        usage: textureUsage,
+        createView() {
+          return base.mockTextureView;
+        },
+      };
+    },
+  };
+
+  const origCreateBuffer = base.device.createBuffer.bind(base.device);
+  base.device.createBuffer = (desc) => {
+    const buf = origCreateBuffer(desc);
+    const backing = new Uint8Array(desc.size);
+    let mapped = false;
+    let mapInFlight = false;
+    buf._backing = backing;
+    buf.mapCalls = 0;
+    buf.unmapCalls = 0;
+    buf.doubleMapDetected = false;
+    buf.mapAsync = (mode) => {
+      if (buf.destroyed) {
+        return Promise.reject(new Error('cannot map destroyed buffer'));
+      }
+      if (mapped || mapInFlight) {
+        buf.doubleMapDetected = true;
+        return Promise.reject(new Error('buffer already mapped or map in flight'));
+      }
+      buf.mapCalls += 1;
+      mapInFlight = true;
+      bufferEvents.push({ op: 'mapAsync', handle: buf.handle, mode });
+      if (deferMapAsync) {
+        return new Promise((resolve, reject) => {
+          pendingMaps.push({
+            buffer: buf,
+            resolve: () => {
+              mapInFlight = false;
+              if (buf.destroyed) {
+                reject(new Error('buffer destroyed while mapping'));
+                return;
+              }
+              mapped = true;
+              resolve();
+            },
+            reject: (err) => {
+              mapInFlight = false;
+              reject(err || new Error('mapAsync aborted'));
+            },
+          });
+        });
+      }
+      return Promise.resolve().then(() => {
+        mapInFlight = false;
+        if (buf.destroyed) {
+          throw new Error('buffer destroyed while mapping');
+        }
+        mapped = true;
+      });
+    };
+    buf.getMappedRange = (offset = 0, size = backing.byteLength - offset) => {
+      if (!mapped || buf.destroyed) {
+        throw new Error('buffer not mapped');
+      }
+      bufferEvents.push({ op: 'getMappedRange', handle: buf.handle, offset, size });
+      return backing.buffer.slice(offset, offset + size);
+    };
+    buf.unmap = () => {
+      if (buf.destroyed) {
+        throw new Error('cannot unmap destroyed buffer');
+      }
+      mapped = false;
+      buf.unmapCalls += 1;
+      bufferEvents.push({ op: 'unmap', handle: buf.handle });
+    };
+    const origDestroy = buf.destroy.bind(buf);
+    buf.destroy = () => {
+      mapped = false;
+      mapInFlight = false;
+      bufferEvents.push({ op: 'destroy', handle: buf.handle });
+      origDestroy();
+    };
+    if (desc && desc.label === 'playgta6-swapchain-luma-probe') {
+      probeBuffers.push(buf);
+    }
+    return buf;
+  };
+
+  const origCreateEncoder = base.device.createCommandEncoder.bind(base.device);
+  base.device.createCommandEncoder = () => {
+    const enc = origCreateEncoder();
+    enc.copyTextureToBuffer = (source, destination, copySize) => {
+      copyCalls.push({
+        source: { ...source, origin: source.origin ? { ...source.origin } : { x: 0, y: 0, z: 0 } },
+        destination: { ...destination },
+        copySize: { ...copySize },
+      });
+      const dstBacking = destination.buffer && destination.buffer._backing;
+      if (dstBacking) {
+        const ox = (source.origin && source.origin.x) || 0;
+        const oy = (source.origin && source.origin.y) || 0;
+        const cw = copySize.width || 0;
+        const ch = copySize.height || 1;
+        const dstOff = destination.offset || 0;
+        const bpr = destination.bytesPerRow || cw * 4;
+        for (let row = 0; row < ch; row += 1) {
+          const srcStart = ((oy + row) * width + ox) * 4;
+          const dstStart = dstOff + row * bpr;
+          dstBacking.set(pixels.subarray(srcStart, srcStart + cw * 4), dstStart);
+        }
+      }
+    };
+    return enc;
+  };
+
+  base.device.createBindGroupLayout = (desc) => ({ kind: 'GPUBindGroupLayout', desc });
+  base.device.createPipelineLayout = (desc) => ({ kind: 'GPUPipelineLayout', desc });
+
+  return {
+    device: base.device,
+    ctx,
+    calls: base.calls,
+    pixels,
+    setPixel,
+    clearPixels,
+    copyCalls,
+    probeBuffers,
+    pendingMaps,
+    bufferEvents,
+  };
+}
+
+function buildRealPackDrawStream(vsHash, fsHash, { includeSetup = true } = {}) {
+  const b = new BinaryCommandBuilder().beginFrame();
+  if (includeSetup) {
+    b.createShaderModule(1, SHADER_STAGE.VERTEX, formatHashHex(vsHash))
+      .createShaderModule(2, SHADER_STAGE.FRAGMENT, formatHashHex(fsHash))
+      .createRenderPipeline(3, 1, 2, 0);
+  }
+  return b.setPipeline(3).draw(3, 1, 0, 0).present().finish();
+}
+
+function createW338PackBuffer() {
+  const vsWgsl = '@vertex fn vs_main() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }';
+  const fsWgsl = '@fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }';
+  const vsHash = fnv1a64(vsWgsl);
+  const fsHash = fnv1a64(fsWgsl);
+  const packBuffer = buildWgslPackBuffer([
+    { hash: vsHash, stage: WGPK_SHADER_STAGE.VERTEX, wgsl: vsWgsl },
+    { hash: fsHash, stage: WGPK_SHADER_STAGE.FRAGMENT, wgsl: fsWgsl },
+  ]);
+  return { vsHash, fsHash, packBuffer };
+}
+
+async function flushMicrotasks(turns = 5) {
+  for (let i = 0; i < turns; i += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
+test('W338 all-black swapchain frames hold first-visible-frame until non-black pixel appears (including bottom-right bar at y=92% and center 6-star)', async () => {
+  const { vsHash, fsHash, packBuffer } = createW338PackBuffer();
+
+  // 1. bgra8unorm 1280x720: bottom-right OFFLINEPLAYER [A] bar at y=92% triggers first-visible-frame.
+  {
+    const env = createProbeCapableMockWebGpu({ width: 1280, height: 720, format: 'bgra8unorm' });
+    let fakeNow = 1000;
+    const posted = [];
+    const processor = new WgpuCommandProcessor(env.device, env.ctx, {
+      format: 'bgra8unorm',
+      width: 1280,
+      height: 720,
+      now: () => fakeNow,
+      wgslPackBuffer: packBuffer,
+    });
+    const handler = createWgpuWorkerHandler({
+      processor,
+      postMessage: (m) => posted.push(m),
+      now: () => fakeNow,
+    });
+
+    // Clear-only frame before any draw: must NOT allocate probe buffer or run copyTextureToBuffer.
+    await handler.handleMessage({
+      cmdBuffer: new BinaryCommandBuilder().beginFrame().clearColor(0, 0, 0, 1).present().finish(),
+    });
+    await flushMicrotasks();
+    assert.equal(env.copyCalls.length, 0);
+    assert.equal(env.probeBuffers.length, 0);
+    assert.equal(processor.firstVisibleFrame, false);
+
+    // Draw #1 with solid black RGB (0,0,0,255): probe runs, holds first-visible-frame!
+    fakeNow = 1100;
+    await handler.handleMessage({
+      cmdBuffer: buildRealPackDrawStream(vsHash, fsHash, { includeSetup: true }),
+    });
+    await flushMicrotasks();
+    assert.equal(env.copyCalls.length, 4);
+    assert.equal(processor.firstVisibleFrame, false);
+    assert.equal(processor.suppressedBlackFrames, 1);
+    assert.equal(posted.filter((m) => m.type === 'first-visible-frame').length, 0);
+
+    // Verify sampled strips match 4 horizontal strips at y = 20%, 50%, 70%, 92%, width <= 64, bytesPerRow = 256.
+    assert.deepEqual(
+      env.copyCalls.map((c) => c.source.origin.y),
+      [Math.floor(720 * 0.2), Math.floor(720 * 0.5), Math.floor(720 * 0.7), Math.floor(720 * 0.92)]
+    );
+    assert.ok(env.copyCalls.every((c) => c.copySize.width === 64 && c.copySize.height === 1));
+    assert.ok(env.copyCalls.every((c) => c.destination.bytesPerRow === 256));
+    assert.deepEqual(
+      env.copyCalls.map((c) => c.destination.offset),
+      [0, 256, 512, 768]
+    );
+
+    // Draw #2 with near-black noise (8,8,8,255) — threshold is strictly > 8, still held!
+    fakeNow = 1400;
+    env.clearPixels(8, 8, 8, 255);
+    await handler.handleMessage({
+      cmdBuffer: buildRealPackDrawStream(vsHash, fsHash, { includeSetup: false }),
+    });
+    await flushMicrotasks();
+    assert.equal(processor.firstVisibleFrame, false);
+    assert.equal(processor.suppressedBlackFrames, 2);
+    assert.equal(processor.lastSampledMaxLuma, 8);
+
+    // Draw #3 paints a bright pixel ONLY in the bottom-right OFFLINEPLAYER [A] bar at y=92% (bgra: B=0, G=0, R=220, A=255).
+    fakeNow = 1700;
+    env.clearPixels(0, 0, 0, 255);
+    const barY = Math.floor(720 * 0.92);
+    const barX = Math.floor((1280 - 64) * 0.9) + 12;
+    env.setPixel(barX, barY, 0, 0, 220, 255);
+    await handler.handleMessage({
+      cmdBuffer: buildRealPackDrawStream(vsHash, fsHash, { includeSetup: false }),
+    });
+    await flushMicrotasks();
+
+    assert.equal(processor.firstVisibleFrame, true);
+    assert.equal(processor.lastSampledMaxLuma, 220);
+    const visMsgs = posted.filter((m) => m.type === 'first-visible-frame');
+    assert.equal(visMsgs.length, 1);
+    assert.equal(visMsgs[0].source, 'swapchain-probe');
+    assert.equal(visMsgs[0].maxLuma, 220);
+    assert.equal(visMsgs[0].suppressedBlackFrames, 2);
+    assert.equal(visMsgs[0].firstVisibleFrameMs, 1700);
+    processor.destroy();
+  }
+
+  // 2. rgba8unorm: center 6-star loading pixel at y=50% triggers first-visible-frame.
+  {
+    const env = createProbeCapableMockWebGpu({ width: 1280, height: 720, format: 'rgba8unorm' });
+    let fakeNow = 2000;
+    const processor = new WgpuCommandProcessor(env.device, env.ctx, {
+      format: 'rgba8unorm',
+      width: 1280,
+      height: 720,
+      now: () => fakeNow,
+      wgslPackBuffer: packBuffer,
+    });
+    env.setPixel(640, Math.floor(720 * 0.5), 0, 185, 0, 255);
+    processor.execute(buildRealPackDrawStream(vsHash, fsHash, { includeSetup: true }));
+    await flushMicrotasks();
+    assert.equal(processor.firstVisibleFrame, true);
+    assert.equal(processor.lastSampledMaxLuma, 185);
+    processor.destroy();
+  }
+});
+
+test('W338 throttles probes (>= 250ms) and enforces strictly non-overlapping in-flight guard (never double-maps)', async () => {
+  const { vsHash, fsHash, packBuffer } = createW338PackBuffer();
+  const env = createProbeCapableMockWebGpu({
+    width: 1280,
+    height: 720,
+    deferMapAsync: true,
+  });
+  let fakeNow = 1000;
+  const processor = new WgpuCommandProcessor(env.device, env.ctx, {
+    format: 'bgra8unorm',
+    width: 1280,
+    height: 720,
+    now: () => fakeNow,
+    wgslPackBuffer: packBuffer,
+  });
+
+  // Frame 1 at t=1000ms starts probe #1 (remains in flight).
+  processor.execute(buildRealPackDrawStream(vsHash, fsHash, { includeSetup: true }));
+  assert.equal(processor.swapchainProbeInFlight, true);
+  assert.equal(processor.swapchainProbeCount, 1);
+  assert.equal(env.copyCalls.length, 4);
+  assert.equal(env.pendingMaps.length, 1);
+  assert.equal(processor.firstVisibleFrame, false);
+
+  // Frame 2 at t=1016ms (in-flight) and Frame 3 at t=1500ms (still in-flight, even past 250ms!):
+  // must NEVER start a second overlapping readback or double-map the buffer!
+  fakeNow = 1016;
+  processor.execute(buildRealPackDrawStream(vsHash, fsHash, { includeSetup: false }));
+  fakeNow = 1500;
+  processor.execute(buildRealPackDrawStream(vsHash, fsHash, { includeSetup: false }));
+  assert.equal(env.copyCalls.length, 4);
+  assert.equal(env.pendingMaps.length, 1);
+  assert.equal(processor.swapchainProbeCount, 1);
+  assert.equal(env.probeBuffers[0].doubleMapDetected, false);
+  assert.equal(processor.firstVisibleFrame, false);
+
+  // Complete probe #1 as all-black at t=1100ms (reset clock to test throttle window relative to t=1000ms start).
+  fakeNow = 1100;
+  env.pendingMaps.shift().resolve();
+  await flushMicrotasks();
+  assert.equal(processor.swapchainProbeInFlight, false);
+  assert.equal(processor.suppressedBlackFrames, 1);
+
+  // Frame 4 at t=1200ms (< 250ms since startMs=1000ms): throttled, no copy/mapAsync!
+  fakeNow = 1200;
+  processor.execute(buildRealPackDrawStream(vsHash, fsHash, { includeSetup: false }));
+  assert.equal(env.copyCalls.length, 4);
+  assert.equal(env.pendingMaps.length, 0);
+  assert.equal(processor.swapchainProbeCount, 1);
+  assert.equal(processor.firstVisibleFrame, false);
+
+  // Frame 5 at t=1250ms (>= 250ms since startMs=1000ms): starts probe #2 reusing the exact same buffer!
+  fakeNow = 1250;
+  env.setPixel(640, Math.floor(720 * 0.5), 140, 200, 255, 255);
+  processor.execute(buildRealPackDrawStream(vsHash, fsHash, { includeSetup: false }));
+  assert.equal(env.probeBuffers.length, 1);
+  assert.equal(env.copyCalls.length, 8);
+  assert.equal(env.pendingMaps.length, 1);
+  assert.equal(processor.swapchainProbeCount, 2);
+
+  env.pendingMaps.shift().resolve();
+  await flushMicrotasks();
+  assert.equal(processor.firstVisibleFrame, true);
+  assert.equal(env.probeBuffers[0].doubleMapDetected, false);
+  assert.equal(env.probeBuffers[0].mapCalls, 2);
+  processor.destroy();
+});
+
+test('W338 reuses single 1024-byte probe buffer and destroys it cleanly on first-visible-frame (zero steady-state overhead) and on destroy()', async () => {
+  const { vsHash, fsHash, packBuffer } = createW338PackBuffer();
+
+  // 1. Destroyed cleanly right after unmap when first-visible-frame fires; zero overhead afterwards.
+  {
+    const env = createProbeCapableMockWebGpu({ width: 1280, height: 720 });
+    let fakeNow = 1000;
+    const processor = new WgpuCommandProcessor(env.device, env.ctx, {
+      format: 'bgra8unorm',
+      width: 1280,
+      height: 720,
+      now: () => fakeNow,
+      wgslPackBuffer: packBuffer,
+    });
+
+    // Black frame allocates one 1024-byte MAP_READ | COPY_DST buffer.
+    processor.execute(buildRealPackDrawStream(vsHash, fsHash, { includeSetup: true }));
+    await flushMicrotasks();
+    assert.equal(env.probeBuffers.length, 1);
+    const probeBuf = env.probeBuffers[0];
+    assert.equal(probeBuf.size, 4 * 256);
+    assert.equal(probeBuf.usage, BUFFER_USAGE.MAP_READ | BUFFER_USAGE.COPY_DST);
+    assert.equal(probeBuf.destroyed, false);
+
+    // Second black frame reuses the exact same buffer.
+    fakeNow = 1300;
+    processor.execute(buildRealPackDrawStream(vsHash, fsHash, { includeSetup: false }));
+    await flushMicrotasks();
+    assert.equal(env.probeBuffers.length, 1);
+    assert.equal(probeBuf.destroyed, false);
+
+    // Non-black frame fires first-visible-frame -> unmaps THEN destroys staging buffer.
+    fakeNow = 1600;
+    env.setPixel(640, Math.floor(720 * 0.2), 255, 255, 255, 255);
+    processor.execute(buildRealPackDrawStream(vsHash, fsHash, { includeSetup: false }));
+    await flushMicrotasks();
+    assert.equal(processor.firstVisibleFrame, true);
+    assert.equal(probeBuf.destroyed, true);
+
+    const bufOps = env.bufferEvents
+      .filter((e) => e.handle === probeBuf.handle)
+      .map((e) => e.op);
+    assert.equal(bufOps[bufOps.length - 1], 'destroy');
+    assert.equal(bufOps[bufOps.length - 2], 'unmap');
+
+    // Subsequent frames have ZERO steady-state probe overhead.
+    const copiesAfterVisible = env.copyCalls.length;
+    const mapsAfterVisible = probeBuf.mapCalls;
+    fakeNow = 2500;
+    processor.execute(buildRealPackDrawStream(vsHash, fsHash, { includeSetup: false }));
+    fakeNow = 3500;
+    processor.execute(buildRealPackDrawStream(vsHash, fsHash, { includeSetup: false }));
+    await flushMicrotasks();
+    assert.equal(env.copyCalls.length, copiesAfterVisible);
+    assert.equal(env.probeBuffers.length, 1);
+    assert.equal(probeBuf.mapCalls, mapsAfterVisible);
+    processor.destroy();
+  }
+
+  // 2. Worker destroy() while a probe is in flight cleanly destroys the buffer with zero unhandled rejections.
+  {
+    const env = createProbeCapableMockWebGpu({
+      width: 1280,
+      height: 720,
+      deferMapAsync: true,
+    });
+    const processor = new WgpuCommandProcessor(env.device, env.ctx, {
+      format: 'bgra8unorm',
+      width: 1280,
+      height: 720,
+      wgslPackBuffer: packBuffer,
+    });
+    const rejections = await collectUnhandledRejections(async () => {
+      processor.execute(buildRealPackDrawStream(vsHash, fsHash, { includeSetup: true }));
+      assert.equal(env.probeBuffers.length, 1);
+      const probeBuf = env.probeBuffers[0];
+      assert.equal(probeBuf.destroyed, false);
+      assert.equal(processor.swapchainProbeInFlight, true);
+
+      processor.destroy();
+      assert.equal(probeBuf.destroyed, true);
+      assert.equal(processor.swapchainProbeInFlight, false);
+
+      // Resolving the stale deferred mapAsync after destroy() must not throw or emit first-visible-frame.
+      env.pendingMaps.shift().resolve();
+      await flushMicrotasks();
+      assert.equal(processor.firstVisibleFrame, false);
+    });
+    assert.deepEqual(rejections, []);
+  }
+});
+
+test('W338 configures swapchain context with RENDER_ATTACHMENT | COPY_SRC when GPUTextureUsage is available and falls back to RENDER_ATTACHMENT on error', async () => {
+  const { configureCanvasContextWithCopySrc } = wgpuMod;
+  const prevGpuTextureUsage = Object.getOwnPropertyDescriptor(globalThis, 'GPUTextureUsage');
+  const mockUsage = Object.freeze({
+    COPY_SRC: 0x01,
+    COPY_DST: 0x02,
+    TEXTURE_BINDING: 0x04,
+    STORAGE_BINDING: 0x08,
+    RENDER_ATTACHMENT: 0x10,
+  });
+
+  try {
+    Object.defineProperty(globalThis, 'GPUTextureUsage', {
+      configurable: true,
+      writable: true,
+      value: mockUsage,
+    });
+
+    // 1. Direct helper: passes RENDER_ATTACHMENT | COPY_SRC when accepted.
+    const acceptedCalls = [];
+    const resOk = configureCanvasContextWithCopySrc(
+      {
+        configure(cfg) {
+          acceptedCalls.push({ ...cfg });
+        },
+      },
+      { device: { id: 'dev' }, format: 'bgra8unorm', alphaMode: 'opaque' }
+    );
+    assert.deepEqual(resOk, { configured: true, copySrcEnabled: true });
+    assert.equal(acceptedCalls.length, 1);
+    assert.equal(acceptedCalls[0].usage, mockUsage.RENDER_ATTACHMENT | mockUsage.COPY_SRC);
+
+    // 2. Direct helper: falls back cleanly to RENDER_ATTACHMENT if COPY_SRC throws.
+    const fallbackCalls = [];
+    const resFallback = configureCanvasContextWithCopySrc(
+      {
+        configure(cfg) {
+          fallbackCalls.push({ ...cfg });
+          if (cfg.usage & mockUsage.COPY_SRC) {
+            throw new Error('COPY_SRC unsupported on swapchain');
+          }
+        },
+      },
+      { device: { id: 'dev' }, format: 'bgra8unorm', alphaMode: 'opaque' }
+    );
+    assert.deepEqual(resFallback, { configured: true, copySrcEnabled: false });
+    assert.equal(fallbackCalls.length, 2);
+    assert.equal(fallbackCalls[0].usage, mockUsage.RENDER_ATTACHMENT | mockUsage.COPY_SRC);
+    assert.equal(fallbackCalls[1].usage, mockUsage.RENDER_ATTACHMENT);
+
+    // 3. Worker init (with WgpuSwapchain enabled): falls back cleanly from COPY_SRC to RENDER_ATTACHMENT
+    //    and does NOT stall first-visible-frame when texture.usage lacks COPY_SRC.
+    const env = createProbeCapableMockWebGpu({
+      width: 640,
+      height: 360,
+      textureUsage: mockUsage.RENDER_ATTACHMENT, // no COPY_SRC after fallback!
+    });
+    const ctxConfigLog = [];
+    env.ctx.configure = (cfg) => {
+      ctxConfigLog.push({ ...cfg });
+      if (cfg.usage && (cfg.usage & mockUsage.COPY_SRC)) {
+        throw new Error('driver rejected swapchain COPY_SRC');
+      }
+    };
+    const canvas = {
+      width: 0,
+      height: 0,
+      getContext(kind) {
+        assert.equal(kind, 'webgpu');
+        return env.ctx;
+      },
+    };
+    const mockGpu = {
+      async requestAdapter() {
+        return {
+          info: { vendor: 'mock', architecture: 'w338-fallback' },
+          async requestDevice() {
+            return env.device;
+          },
+        };
+      },
+      getPreferredCanvasFormat() {
+        return 'bgra8unorm';
+      },
+    };
+    const posted = [];
+    const handler = createWgpuWorkerHandler({
+      postMessage: (m) => posted.push(m),
+      enableSwapchain: true,
+    });
+    await withMockNavigatorGpu(mockGpu, async () => {
+      await handler.handleMessage({ init: true, canvas, width: 640, height: 360 });
+    });
+
+    assert.ok(ctxConfigLog.some((c) => c.usage === (mockUsage.RENDER_ATTACHMENT | mockUsage.COPY_SRC)));
+    assert.equal(ctxConfigLog[ctxConfigLog.length - 1].usage, mockUsage.RENDER_ATTACHMENT);
+
+    // Since swapchain fell back to RENDER_ATTACHMENT only, first draw must emit immediately without stalling!
+    const { vsHash, fsHash, packBuffer } = createW338PackBuffer();
+    handler.processor.loadWgslPack(packBuffer);
+    await handler.handleMessage({
+      cmdBuffer: buildRealPackDrawStream(vsHash, fsHash, { includeSetup: true }),
+    });
+    assert.equal(handler.processor.firstVisibleFrame, true);
+    assert.equal(posted.filter((m) => m.type === 'first-visible-frame').length, 1);
+    handler.processor.destroy();
+  } finally {
+    if (prevGpuTextureUsage) {
+      Object.defineProperty(globalThis, 'GPUTextureUsage', prevGpuTextureUsage);
+    } else {
+      delete globalThis.GPUTextureUsage;
+    }
+  }
+});
+
+test('W338 preserves backwards compatibility on mock devices, supports explicit requireNonBlackFrame: false opt-out, and emits immediately on non-black Bink2 YUV frames', async () => {
+  const { vsHash, fsHash, packBuffer } = createW338PackBuffer();
+
+  // 1. Standard mock device (no copyTextureToBuffer / mapAsync / COPY_SRC): immediate first-visible-frame
+  //    and zero extra createBuffer calls.
+  {
+    const { device, ctx, calls } = createMockWebGpu();
+    const processor = new WgpuCommandProcessor(device, ctx, { wgslPackBuffer: packBuffer });
+    processor.execute(buildRealPackDrawStream(vsHash, fsHash, { includeSetup: true }));
+    assert.equal(processor.firstVisibleFrame, true);
+    assert.equal(processor.swapchainProbeCount, 0);
+    assert.equal(calls.filter((c) => c.op === 'createBuffer').length, 0);
+    processor.destroy();
+  }
+
+  // 2. Real-capability device with explicit requireNonBlackFrame: false opts out of probing completely.
+  {
+    const env = createProbeCapableMockWebGpu({ width: 1280, height: 720 });
+    const processor = new WgpuCommandProcessor(env.device, env.ctx, {
+      wgslPackBuffer: packBuffer,
+      requireNonBlackFrame: false,
+    });
+    processor.execute(buildRealPackDrawStream(vsHash, fsHash, { includeSetup: true }));
+    assert.equal(processor.firstVisibleFrame, true);
+    assert.equal(processor.swapchainProbeCount, 0);
+    assert.equal(env.copyCalls.length, 0);
+    assert.equal(env.probeBuffers.length, 0);
+    processor.destroy();
+  }
+
+  // 3. Default options (real-capability device): non-black Bink2 YUV video frame emits first-visible-frame
+  //    immediately and destroys any pre-allocated swapchain probe buffer cleanly.
+  {
+    const env = createProbeCapableMockWebGpu({ width: 16, height: 8, deferMapAsync: true });
+    const origCreateEncoder = env.device.createCommandEncoder.bind(env.device);
+    env.device.createCommandEncoder = () => {
+      const enc = origCreateEncoder();
+      const origBeginRenderPass = enc.beginRenderPass.bind(enc);
+      enc.beginRenderPass = (desc) => {
+        const pass = origBeginRenderPass(desc);
+        pass.setViewport = () => {};
+        pass.setScissorRect = () => {};
+        return pass;
+      };
+      return enc;
+    };
+
+    const posted = [];
+    const processor = new WgpuCommandProcessor(env.device, env.ctx, {
+      width: 16,
+      height: 8,
+      wgslPackBuffer: packBuffer,
+      enableSplashBridge: true,
+    });
+    const handler = createWgpuWorkerHandler({
+      processor,
+      postMessage: (m) => posted.push(m),
+    });
+
+    // Kick off a black command-buffer draw so a swapchain probe buffer is allocated and in flight.
+    await handler.handleMessage({
+      cmdBuffer: buildRealPackDrawStream(vsHash, fsHash, { includeSetup: true }),
+    });
+    assert.equal(env.probeBuffers.length, 1);
+    assert.equal(env.probeBuffers[0].destroyed, false);
+    assert.equal(processor.firstVisibleFrame, false);
+
+    // Black Bink2 YUV frame (Y=16 limited-range black) -> still held!
+    await handler.handleMessage({
+      type: 'bink-frame',
+      id: 'w338-bink-black',
+      frame: {
+        width: 16,
+        height: 8,
+        format: 'yuv420p',
+        colorRange: 'limited',
+        planes: {
+          y: new Uint8Array(16 * 8).fill(16),
+          u: new Uint8Array(8 * 4).fill(128),
+          v: new Uint8Array(8 * 4).fill(128),
+        },
+        frameIndex: 0,
+      },
+    });
+    assert.equal(processor.firstVisibleFrame, false);
+    assert.equal(posted.filter((m) => m.type === 'first-visible-frame').length, 0);
+
+    // Bright Bink2 YUV frame (Y=200) -> emits first-visible-frame immediately and destroys probe buffer!
+    await handler.handleMessage({
+      type: 'bink-frame',
+      id: 'w338-bink-bright',
+      frame: {
+        width: 16,
+        height: 8,
+        format: 'yuv420p',
+        colorRange: 'limited',
+        planes: {
+          y: new Uint8Array(16 * 8).fill(200),
+          u: new Uint8Array(8 * 4).fill(128),
+          v: new Uint8Array(8 * 4).fill(128),
+        },
+        frameIndex: 1,
+      },
+    });
+    assert.equal(processor.firstVisibleFrame, true);
+    assert.equal(env.probeBuffers[0].destroyed, true);
+    const visMsgs = posted.filter((m) => m.type === 'first-visible-frame');
+    assert.equal(visMsgs.length, 1);
+
+    // Settling the stale in-flight swapchain probe after Bink2 emitted must not throw or double-emit.
+    env.pendingMaps.shift().resolve();
+    await flushMicrotasks();
+    assert.equal(posted.filter((m) => m.type === 'first-visible-frame').length, 1);
+    processor.destroy();
+  }
+});
