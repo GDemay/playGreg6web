@@ -19,6 +19,21 @@ pub const SPIRV_HEADER_BYTES: usize = 20;
 const FNV1A_64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A_64_PRIME: u64 = 0x0000_0100_0000_01b3;
 
+/// Maximum character length retained in a sanitized [`ConversionError::detail`].
+const MAX_ERROR_DETAIL_CHARS: usize = 4096;
+
+/// Maximum character length retained in a sanitized [`ConversionError::blocker_key`].
+const MAX_BLOCKER_KEY_CHARS: usize = 160;
+
+/// Maximum character length retained in each keyword in [`ConversionError::keywords`].
+const MAX_KEYWORD_CHARS: usize = 128;
+
+/// Maximum number of keywords attached to a single [`ConversionError`].
+const MAX_KEYWORDS: usize = 32;
+
+/// Placeholder emitted in place of redacted host filesystem paths in diagnostic strings.
+const REDACTED_PATH_TOKEN: &str = "<path>";
+
 /// WebGPU-compatible shader pipeline stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
@@ -221,8 +236,11 @@ pub fn convert_spirv_bytes_with_options(
         .validate(&module)
         .map_err(|err| classify_validation_error(&err.emit_to_string("")))?;
 
-    let wgsl_source = wgsl::write_string(&module, &info, wgsl::WriterFlags::empty())
-        .map_err(classify_wgsl_error)?;
+    let wgsl_source = normalize_wgsl_newlines(
+        wgsl::write_string(&module, &info, wgsl::WriterFlags::empty())
+            .map_err(classify_wgsl_error)?,
+    );
+    validate_emitted_wgsl(&wgsl_source)?;
 
     Ok(ConvertedShader {
         hash,
@@ -241,15 +259,16 @@ pub fn audit_spirv_file(
     spirv_bytes: &[u8],
     options: &ConvertOptions,
 ) -> ShaderAuditRecord {
+    let safe_source_path = sanitize_audit_source_path(source_path);
     let (sanitized_bytes, mut audit) =
         match sanitize_spirv_bytes(spirv_bytes, &options.sanitize_options()) {
             Ok(pair) => pair,
             Err(err) => {
                 return ShaderAuditRecord {
-                    source_path: source_path.to_string(),
+                    source_path: safe_source_path,
                     stage: None,
                     lowered_to_wgsl: false,
-                    stream_error: Some(err.to_string()),
+                    stream_error: Some(sanitize_diagnostic_text(&err.to_string())),
                     naga_error: None,
                     audit: CompatAudit::default(),
                 };
@@ -267,7 +286,7 @@ pub fn audit_spirv_file(
         Err(err) => {
             let conv_err = classify_spv_error(err);
             return ShaderAuditRecord {
-                source_path: source_path.to_string(),
+                source_path: safe_source_path,
                 stage: None,
                 lowered_to_wgsl: false,
                 stream_error: None,
@@ -292,7 +311,7 @@ pub fn audit_spirv_file(
 
     if let Err(err) = detect_entry_point(&module) {
         return ShaderAuditRecord {
-            source_path: source_path.to_string(),
+            source_path: safe_source_path,
             stage: stage_name,
             lowered_to_wgsl: false,
             stream_error: None,
@@ -307,7 +326,7 @@ pub fn audit_spirv_file(
         Err(err) => {
             let conv_err = classify_validation_error(&err.emit_to_string(""));
             return ShaderAuditRecord {
-                source_path: source_path.to_string(),
+                source_path: safe_source_path,
                 stage: stage_name,
                 lowered_to_wgsl: false,
                 stream_error: None,
@@ -318,18 +337,31 @@ pub fn audit_spirv_file(
     };
 
     match wgsl::write_string(&module, &info, wgsl::WriterFlags::empty()) {
-        Ok(_) => ShaderAuditRecord {
-            source_path: source_path.to_string(),
-            stage: stage_name,
-            lowered_to_wgsl: true,
-            stream_error: None,
-            naga_error: None,
-            audit,
-        },
+        Ok(wgsl_source) => {
+            let normalized = normalize_wgsl_newlines(wgsl_source);
+            match validate_emitted_wgsl(&normalized) {
+                Ok(()) => ShaderAuditRecord {
+                    source_path: safe_source_path,
+                    stage: stage_name,
+                    lowered_to_wgsl: true,
+                    stream_error: None,
+                    naga_error: None,
+                    audit,
+                },
+                Err(conv_err) => ShaderAuditRecord {
+                    source_path: safe_source_path,
+                    stage: stage_name,
+                    lowered_to_wgsl: false,
+                    stream_error: None,
+                    naga_error: Some(conv_err.to_string()),
+                    audit,
+                },
+            }
+        }
         Err(err) => {
             let conv_err = classify_wgsl_error(err);
             ShaderAuditRecord {
-                source_path: source_path.to_string(),
+                source_path: safe_source_path,
                 stage: stage_name,
                 lowered_to_wgsl: false,
                 stream_error: None,
@@ -340,9 +372,178 @@ pub fn audit_spirv_file(
     }
 }
 
+/// Normalize emitted WGSL line endings to `\n` for deterministic cross-platform byte output.
+fn normalize_wgsl_newlines(wgsl: String) -> String {
+    if !wgsl.contains('\r') {
+        return wgsl;
+    }
+    let mut out = String::with_capacity(wgsl.len());
+    let mut chars = wgsl.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\r' {
+            if chars.peek() == Some(&'\n') {
+                let _ = chars.next();
+            }
+            out.push('\n');
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Validate that emitted WGSL is non-empty, lexically well-formed (balanced braces and closed
+/// comments), and contains zero illegal module-scope `let` declarations.
+///
+/// In WGSL, `let` is a reserved keyword valid only inside function/block scope (`brace_depth > 0`);
+/// module-scope constants/globals must use `const`, `override`, or `var`.
+pub fn validate_emitted_wgsl(wgsl: &str) -> Result<(), ConversionError> {
+    let bytes = wgsl.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+    let mut line = 1usize;
+    let mut brace_depth = 0usize;
+    let mut block_comment_depth = 0usize;
+    let mut has_code_token = false;
+
+    while i < len {
+        let b = bytes[i];
+
+        if b == b'\r' {
+            if i + 1 < len && bytes[i + 1] == b'\n' {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            line += 1;
+            continue;
+        }
+        if b == b'\n' {
+            line += 1;
+            i += 1;
+            continue;
+        }
+
+        // Handle nested WGSL block comments (`/* ... /* ... */ ... */`).
+        if block_comment_depth > 0 {
+            if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+                block_comment_depth += 1;
+                i += 2;
+            } else if b == b'*' && i + 1 < len && bytes[i + 1] == b'/' {
+                block_comment_depth -= 1;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+
+        // Enter line comment (`// ...`).
+        if b == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
+            i += 2;
+            while i < len && bytes[i] != b'\n' && bytes[i] != b'\r' {
+                i += 1;
+            }
+            continue;
+        }
+
+        // Enter block comment (`/* ... */`).
+        if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            block_comment_depth = 1;
+            i += 2;
+            continue;
+        }
+
+        if b.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+
+        has_code_token = true;
+
+        match b {
+            b'{' => {
+                brace_depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                if brace_depth == 0 {
+                    return Err(sanitize_conversion_error(ConversionError {
+                        kind: ConversionErrorKind::WgslWriteError,
+                        blocker_key: "WgslValidation: UnbalancedBraces".to_string(),
+                        keywords: vec!["UnbalancedBraces".to_string()],
+                        detail: format!("unmatched closing brace `}}` on WGSL line {line}"),
+                    }));
+                }
+                brace_depth -= 1;
+                i += 1;
+            }
+            c if is_wgsl_ident_start(c) => {
+                let start = i;
+                i += 1;
+                while i < len && is_wgsl_ident_continue(bytes[i]) {
+                    i += 1;
+                }
+                if brace_depth == 0 && &bytes[start..i] == b"let" {
+                    return Err(sanitize_conversion_error(ConversionError {
+                        kind: ConversionErrorKind::WgslWriteError,
+                        blocker_key: "WgslValidation: ModuleScopeLet".to_string(),
+                        keywords: vec!["ModuleScopeLet".to_string()],
+                        detail: format!(
+                            "invalid module-scope `let` declaration on WGSL line {line}"
+                        ),
+                    }));
+                }
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    if block_comment_depth > 0 {
+        return Err(sanitize_conversion_error(ConversionError {
+            kind: ConversionErrorKind::WgslWriteError,
+            blocker_key: "WgslValidation: UnterminatedComment".to_string(),
+            keywords: vec!["UnterminatedComment".to_string()],
+            detail: "emitted WGSL ends with an unterminated block comment".to_string(),
+        }));
+    }
+
+    if brace_depth != 0 {
+        return Err(sanitize_conversion_error(ConversionError {
+            kind: ConversionErrorKind::WgslWriteError,
+            blocker_key: "WgslValidation: UnbalancedBraces".to_string(),
+            keywords: vec!["UnbalancedBraces".to_string()],
+            detail: format!(
+                "emitted WGSL has {brace_depth} unclosed brace(s) at end of module"
+            ),
+        }));
+    }
+
+    if !has_code_token {
+        return Err(sanitize_conversion_error(ConversionError {
+            kind: ConversionErrorKind::WgslWriteError,
+            blocker_key: "WgslValidation: EmptyOutput".to_string(),
+            keywords: vec!["EmptyWgslOutput".to_string()],
+            detail: "emitted WGSL output is empty".to_string(),
+        }));
+    }
+
+    Ok(())
+}
+
+const fn is_wgsl_ident_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_'
+}
+
+const fn is_wgsl_ident_continue(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
 fn classify_stream_error(err: SpirvStreamError) -> ConversionError {
     let detail = err.to_string();
-    match err {
+    let raw = match err {
         SpirvStreamError::TooShort { .. } => ConversionError {
             kind: ConversionErrorKind::InvalidSpirvHeader,
             blocker_key: "InvalidSpirvHeader: truncated".to_string(),
@@ -375,12 +576,13 @@ fn classify_stream_error(err: SpirvStreamError) -> ConversionError {
             keywords: vec!["IncompleteData".to_string()],
             detail,
         },
-    }
+    };
+    sanitize_conversion_error(raw)
 }
 
 fn validate_spirv_header(bytes: &[u8]) -> Result<(), ConversionError> {
     if bytes.len() < SPIRV_HEADER_BYTES {
-        return Err(ConversionError {
+        return Err(sanitize_conversion_error(ConversionError {
             kind: ConversionErrorKind::InvalidSpirvHeader,
             blocker_key: "InvalidSpirvHeader: truncated".to_string(),
             keywords: vec!["TruncatedHeader".to_string()],
@@ -388,11 +590,11 @@ fn validate_spirv_header(bytes: &[u8]) -> Result<(), ConversionError> {
                 "SPIR-V input too short: {} bytes (minimum {SPIRV_HEADER_BYTES})",
                 bytes.len()
             ),
-        });
+        }));
     }
 
     if !bytes.len().is_multiple_of(4) {
-        return Err(ConversionError {
+        return Err(sanitize_conversion_error(ConversionError {
             kind: ConversionErrorKind::InvalidSpirvHeader,
             blocker_key: "InvalidSpirvHeader: unaligned length".to_string(),
             keywords: vec!["UnalignedWordStream".to_string()],
@@ -400,7 +602,7 @@ fn validate_spirv_header(bytes: &[u8]) -> Result<(), ConversionError> {
                 "SPIR-V input length {} is not a multiple of 4 bytes",
                 bytes.len()
             ),
-        });
+        }));
     }
 
     let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
@@ -410,50 +612,59 @@ fn validate_spirv_header(bytes: &[u8]) -> Result<(), ConversionError> {
         } else {
             "BadMagic"
         };
-        return Err(ConversionError {
+        return Err(sanitize_conversion_error(ConversionError {
             kind: ConversionErrorKind::InvalidSpirvHeader,
             blocker_key: format!("InvalidSpirvHeader: {keyword}"),
             keywords: vec![keyword.to_string()],
             detail: format!(
                 "invalid SPIR-V magic 0x{magic:08x} (expected 0x{SPIRV_MAGIC:08x})"
             ),
-        });
+        }));
     }
 
     Ok(())
 }
 
 fn detect_entry_point(module: &naga::Module) -> Result<(ShaderStage, String), ConversionError> {
-    let Some(entry) = module.entry_points.first() else {
-        return Err(ConversionError {
+    let Some(first_entry) = module.entry_points.first() else {
+        return Err(sanitize_conversion_error(ConversionError {
             kind: ConversionErrorKind::ValidationError,
             blocker_key: "ValidationError: MissingEntryPoint".to_string(),
             keywords: vec!["MissingEntryPoint".to_string()],
             detail: "SPIR-V module contains no entry points".to_string(),
-        });
+        }));
     };
 
-    let stage = match entry.stage {
-        naga::ShaderStage::Vertex => ShaderStage::Vertex,
-        naga::ShaderStage::Fragment => ShaderStage::Fragment,
-        naga::ShaderStage::Compute => ShaderStage::Compute,
-        other => {
-            let stage_name = format!("{other:?}");
-            return Err(ConversionError {
-                kind: ConversionErrorKind::ValidationError,
-                blocker_key: format!("UnsupportedStage({stage_name})"),
-                keywords: vec![format!("Stage::{stage_name}")],
-                detail: format!("shader stage {stage_name} is not supported in WebGPU"),
-            });
+    let mut primary_stage = None;
+    for entry in &module.entry_points {
+        let stage = match entry.stage {
+            naga::ShaderStage::Vertex => ShaderStage::Vertex,
+            naga::ShaderStage::Fragment => ShaderStage::Fragment,
+            naga::ShaderStage::Compute => ShaderStage::Compute,
+            other => {
+                let stage_name = format!("{other:?}");
+                return Err(sanitize_conversion_error(ConversionError {
+                    kind: ConversionErrorKind::ValidationError,
+                    blocker_key: format!("UnsupportedStage({stage_name})"),
+                    keywords: vec![format!("Stage::{stage_name}")],
+                    detail: format!("shader stage {stage_name} is not supported in WebGPU"),
+                }));
+            }
+        };
+        if primary_stage.is_none() {
+            primary_stage = Some(stage);
         }
-    };
+    }
 
-    Ok((stage, entry.name.clone()))
+    Ok((
+        primary_stage.expect("non-empty entry_points always sets primary_stage"),
+        first_entry.name.clone(),
+    ))
 }
 
 fn classify_spv_error(err: spv::Error) -> ConversionError {
     let detail = err.to_string();
-    match err {
+    let raw = match err {
         spv::Error::InvalidHeader => ConversionError {
             kind: ConversionErrorKind::InvalidSpirvHeader,
             blocker_key: "InvalidSpirvHeader: naga rejected header".to_string(),
@@ -478,18 +689,24 @@ fn classify_spv_error(err: spv::Error) -> ConversionError {
                 detail,
             }
         }
-        spv::Error::UnsupportedExtension(ext) => ConversionError {
-            kind: ConversionErrorKind::SpirvParseError,
-            blocker_key: format!("UnsupportedExtension({ext})"),
-            keywords: vec![ext],
-            detail,
-        },
-        spv::Error::UnsupportedExtSet(ext) => ConversionError {
-            kind: ConversionErrorKind::SpirvParseError,
-            blocker_key: format!("UnsupportedExtSet({ext})"),
-            keywords: vec![ext],
-            detail,
-        },
+        spv::Error::UnsupportedExtension(ext) => {
+            let safe_ext = sanitize_single_line(&ext, MAX_KEYWORD_CHARS);
+            ConversionError {
+                kind: ConversionErrorKind::SpirvParseError,
+                blocker_key: format!("UnsupportedExtension({safe_ext})"),
+                keywords: vec![safe_ext],
+                detail,
+            }
+        }
+        spv::Error::UnsupportedExtSet(ext) => {
+            let safe_ext = sanitize_single_line(&ext, MAX_KEYWORD_CHARS);
+            ConversionError {
+                kind: ConversionErrorKind::SpirvParseError,
+                blocker_key: format!("UnsupportedExtSet({safe_ext})"),
+                keywords: vec![safe_ext],
+                detail,
+            }
+        }
         spv::Error::UnsupportedInstruction(_, op) => {
             let kw = format!("{op:?}");
             ConversionError {
@@ -572,35 +789,36 @@ fn classify_spv_error(err: spv::Error) -> ConversionError {
                 detail,
             }
         }
-    }
+    };
+    sanitize_conversion_error(raw)
 }
 
 fn classify_validation_error(message: &str) -> ConversionError {
-    let trimmed = message.trim();
-    let first_line = trimmed
+    let sanitized = sanitize_diagnostic_text(message);
+    let first_line = sanitized
         .lines()
         .find(|line| !line.trim().is_empty())
         .unwrap_or("validation failed")
         .trim();
 
-    let keywords = extract_feature_keywords(trimmed);
+    let keywords = extract_feature_keywords(&sanitized);
     let blocker_key = if !keywords.is_empty() {
         format!("ValidationError: {}", keywords.join(", "))
     } else {
         format!("ValidationError: {}", truncate_summary(first_line, 80))
     };
 
-    ConversionError {
+    sanitize_conversion_error(ConversionError {
         kind: ConversionErrorKind::ValidationError,
         blocker_key,
         keywords,
-        detail: trimmed.to_string(),
-    }
+        detail: sanitized,
+    })
 }
 
 fn classify_wgsl_error(err: wgsl::Error) -> ConversionError {
     let detail = err.to_string();
-    match err {
+    let raw = match err {
         wgsl::Error::Unsupported { kind, value } => {
             let kw = format!("{kind}:{value}");
             ConversionError {
@@ -632,7 +850,383 @@ fn classify_wgsl_error(err: wgsl::Error) -> ConversionError {
                 detail,
             }
         }
+    };
+    sanitize_conversion_error(raw)
+}
+
+fn sanitize_conversion_error(err: ConversionError) -> ConversionError {
+    let detail = sanitize_diagnostic_text(&err.detail);
+    let blocker_key = sanitize_single_line(&err.blocker_key, MAX_BLOCKER_KEY_CHARS);
+    let mut keywords = Vec::with_capacity(err.keywords.len().min(MAX_KEYWORDS));
+    for kw in err.keywords {
+        if keywords.len() >= MAX_KEYWORDS {
+            break;
+        }
+        let cleaned = sanitize_single_line(&kw, MAX_KEYWORD_CHARS);
+        if !cleaned.is_empty() {
+            push_unique(&mut keywords, cleaned);
+        }
     }
+    ConversionError {
+        kind: err.kind,
+        blocker_key,
+        keywords,
+        detail,
+    }
+}
+
+fn sanitize_single_line(text: &str, max_chars: usize) -> String {
+    let sanitized = sanitize_diagnostic_text(text);
+    let collapsed = sanitized
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    truncate_summary(&collapsed, max_chars)
+}
+
+/// Sanitize a diagnostic or error string so it is deterministic, single-standard-newline (`\n`),
+/// free of ANSI escape sequences and control characters, bounded in length, and stripped of all
+/// host filesystem paths (Windows drive paths, UNC paths, Unix absolute paths, home-relative
+/// `~/` paths, parent traversal `../` paths, and `file://` URIs).
+pub fn sanitize_diagnostic_text(text: &str) -> String {
+    let cleaned = strip_ansi_and_control_chars(text);
+    let redacted = redact_host_paths(&cleaned);
+    let trimmed = redacted.trim();
+    truncate_summary(trimmed, MAX_ERROR_DETAIL_CHARS)
+}
+
+/// Sanitize a source path label recorded by [`audit_spirv_file`] so absolute host paths, UNC
+/// paths, `file://` URIs, home paths, and `..` traversals are reduced to basename-only while clean
+/// relative forward-slash paths (e.g. `sub/shader.spv`) are preserved deterministically.
+pub fn sanitize_audit_source_path(source_path: &str) -> String {
+    let cleaned = strip_ansi_and_control_chars(source_path);
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return "unknown.spv".to_string();
+    }
+
+    let mut norm = trimmed.replace('\\', "/");
+    let lower = norm.to_ascii_lowercase();
+    let is_host_or_traversal = lower.starts_with("file://")
+        || norm.starts_with('/')
+        || norm.starts_with("~/")
+        || norm == "~"
+        || has_windows_drive_prefix(&norm)
+        || norm.split('/').any(|seg| seg == "..");
+
+    if is_host_or_traversal {
+        let stripped_uri = if lower.starts_with("file://") {
+            norm[7..].trim_start_matches('/')
+        } else {
+            norm.as_str()
+        };
+        if stripped_uri.is_empty() || stripped_uri.ends_with('/') {
+            return "unknown.spv".to_string();
+        }
+        let candidate = stripped_uri.rsplit('/').next().unwrap_or("");
+        if candidate.is_empty()
+            || candidate == "."
+            || candidate == ".."
+            || candidate == "~"
+            || has_windows_drive_prefix(candidate)
+        {
+            return "unknown.spv".to_string();
+        }
+        return candidate.to_string();
+    }
+
+    // Clean relative path: collapse redundant slashes and strip leading `./` segments.
+    let mut segments = Vec::new();
+    for seg in norm.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        segments.push(seg);
+    }
+    if segments.is_empty() {
+        norm.clear();
+        "unknown.spv".to_string()
+    } else {
+        segments.join("/")
+    }
+}
+
+fn has_windows_drive_prefix(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+fn strip_ansi_and_control_chars(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0usize;
+
+    while i < len {
+        let b = bytes[i];
+        // Strip ANSI CSI escape sequences (`ESC [ ... final_byte`).
+        if b == 0x1b {
+            if i + 1 < len && bytes[i + 1] == b'[' {
+                i += 2;
+                while i < len {
+                    let c = bytes[i];
+                    i += 1;
+                    if (0x40..=0x7e).contains(&c) {
+                        break;
+                    }
+                }
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'\r' {
+            if i + 1 < len && bytes[i + 1] == b'\n' {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            out.push('\n');
+            continue;
+        }
+        if b == b'\n' || b == b'\t' {
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+        if b < 0x20 || b == 0x7f {
+            i += 1;
+            continue;
+        }
+        let ch = text[i..].chars().next().unwrap_or(' ');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
+    out
+}
+
+fn redact_host_paths(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0usize;
+
+    while i < len {
+        let at_boundary = i == 0 || is_path_boundary_before(bytes[i - 1]);
+        if at_boundary {
+            // Preserve non-file web URLs (`http://`, `https://`) without redacting their slashes.
+            if starts_with_ascii_ignore_case(&bytes[i..], b"http://")
+                || starts_with_ascii_ignore_case(&bytes[i..], b"https://")
+            {
+                let end = scan_unquoted_token_end(bytes, i);
+                out.push_str(&text[i..end]);
+                i = end;
+                continue;
+            }
+
+            let opening_quote = if i > 0 && (bytes[i - 1] == b'"' || bytes[i - 1] == b'\'') {
+                Some(bytes[i - 1])
+            } else {
+                None
+            };
+
+            if let Some((path_end, suffix_start)) = match_host_path(bytes, i, opening_quote) {
+                out.push_str(REDACTED_PATH_TOKEN);
+                if suffix_start < path_end {
+                    out.push_str(&text[suffix_start..path_end]);
+                }
+                i = path_end;
+                continue;
+            }
+        }
+
+        let ch = text[i..].chars().next().unwrap_or(' ');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
+    out
+}
+
+const fn is_path_boundary_before(b: u8) -> bool {
+    matches!(
+        b,
+        b' ' | b'\t'
+            | b'\n'
+            | b'"'
+            | b'\''
+            | b'`'
+            | b'('
+            | b'['
+            | b'{'
+            | b'<'
+            | b'='
+            | b','
+            | b';'
+            | b':'
+    )
+}
+
+const fn is_unquoted_path_stop(b: u8) -> bool {
+    b.is_ascii_whitespace()
+        || matches!(
+            b,
+            b'"' | b'\'' | b'`' | b'(' | b')' | b'[' | b']' | b'{' | b'}' | b'<' | b'>' | b','
+                | b';'
+        )
+}
+
+fn starts_with_ascii_ignore_case(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.len() >= needle.len()
+        && haystack[..needle.len()]
+            .iter()
+            .zip(needle.iter())
+            .all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
+}
+
+fn scan_unquoted_token_end(bytes: &[u8], start: usize) -> usize {
+    let mut end = start;
+    while end < bytes.len() && !is_unquoted_path_stop(bytes[end]) {
+        end += 1;
+    }
+    end
+}
+
+fn scan_path_token_end(bytes: &[u8], start: usize, opening_quote: Option<u8>) -> usize {
+    if let Some(q) = opening_quote {
+        let mut cursor = start;
+        while cursor < bytes.len() && bytes[cursor] != b'\n' {
+            if bytes[cursor] == q {
+                return cursor;
+            }
+            cursor += 1;
+        }
+    }
+    let mut end = scan_unquoted_token_end(bytes, start);
+    // Keep sentence-ending trailing `.` outside the redacted token unless it's `..` or `/.`.
+    while end > start + 2
+        && bytes[end - 1] == b'.'
+        && bytes[end - 2] != b'.'
+        && bytes[end - 2] != b'/'
+        && bytes[end - 2] != b'\\'
+    {
+        end -= 1;
+    }
+    end
+}
+
+/// If `bytes[start..]` begins a host filesystem path, returns `(token_end, suffix_start)`
+/// where `bytes[start..suffix_start]` is replaced with `<path>` and `bytes[suffix_start..token_end]`
+/// (such as `:42:10`) is preserved.
+fn match_host_path(
+    bytes: &[u8],
+    start: usize,
+    opening_quote: Option<u8>,
+) -> Option<(usize, usize)> {
+    let rem = &bytes[start..];
+
+    // 1. `file://...` URI.
+    if starts_with_ascii_ignore_case(rem, b"file://") {
+        let end = scan_path_token_end(bytes, start, opening_quote);
+        if end > start + 7 {
+            let suffix = find_line_col_suffix(bytes, start + 7, end);
+            return Some((end, suffix));
+        }
+        return None;
+    }
+
+    // 2. UNC or Windows extended-length path (`\\server\share\...`, `\\?\C:\...`, `\\.\...`).
+    if rem.len() >= 3
+        && rem[0] == b'\\'
+        && rem[1] == b'\\'
+        && (rem[2].is_ascii_alphanumeric() || matches!(rem[2], b'?' | b'.' | b'_'))
+    {
+        let end = scan_path_token_end(bytes, start, opening_quote);
+        let suffix = find_line_col_suffix(bytes, start + 2, end);
+        return Some((end, suffix));
+    }
+
+    // 3. Windows drive path (`C:\...` or `C:/...`).
+    if rem.len() >= 3
+        && rem[0].is_ascii_alphabetic()
+        && rem[1] == b':'
+        && (rem[2] == b'\\' || rem[2] == b'/')
+    {
+        let end = scan_path_token_end(bytes, start, opening_quote);
+        let suffix = find_line_col_suffix(bytes, start + 3, end);
+        return Some((end, suffix));
+    }
+
+    // 4. Home-relative path (`~/...` or `~\...`).
+    if rem.len() >= 3
+        && rem[0] == b'~'
+        && (rem[1] == b'/' || rem[1] == b'\\')
+        && !is_unquoted_path_stop(rem[2])
+    {
+        let end = scan_path_token_end(bytes, start, opening_quote);
+        let suffix = find_line_col_suffix(bytes, start + 2, end);
+        return Some((end, suffix));
+    }
+
+    // 5. Parent-directory traversal (`../...` or `..\...`).
+    if rem.len() >= 4
+        && rem[0] == b'.'
+        && rem[1] == b'.'
+        && (rem[2] == b'/' || rem[2] == b'\\')
+        && !is_unquoted_path_stop(rem[3])
+    {
+        let end = scan_path_token_end(bytes, start, opening_quote);
+        let suffix = find_line_col_suffix(bytes, start + 3, end);
+        return Some((end, suffix));
+    }
+
+    // 6. Unix absolute path (`/Users/...`, `/home/...`, `/tmp/...`, or any multi-segment `/a/b`).
+    if rem.len() >= 2
+        && rem[0] == b'/'
+        && (rem[1].is_ascii_alphanumeric() || matches!(rem[1], b'.' | b'_' | b'@' | b'-'))
+    {
+        let end = scan_path_token_end(bytes, start, opening_quote);
+        let token = &bytes[start..end];
+        let has_second_slash = token[1..].contains(&b'/');
+        let is_known_unix_root = matches!(
+            token,
+            b"/Users"
+                | b"/home"
+                | b"/tmp"
+                | b"/var"
+                | b"/etc"
+                | b"/opt"
+                | b"/mnt"
+                | b"/root"
+                | b"/private"
+                | b"/Volumes"
+                | b"/workspace"
+        );
+        if has_second_slash || is_known_unix_root {
+            let suffix = find_line_col_suffix(bytes, start + 1, end);
+            return Some((end, suffix));
+        }
+    }
+
+    None
+}
+
+/// Detect optional trailing `:line` or `:line:col` suffix inside `bytes[min_prefix_end..token_end]`.
+fn find_line_col_suffix(bytes: &[u8], min_prefix_end: usize, token_end: usize) -> usize {
+    let mut split = token_end;
+    for _ in 0..2 {
+        let mut cursor = split;
+        while cursor > min_prefix_end && bytes[cursor - 1].is_ascii_digit() {
+            cursor -= 1;
+        }
+        if cursor < split && cursor > min_prefix_end && bytes[cursor - 1] == b':' {
+            split = cursor - 1;
+        } else {
+            break;
+        }
+    }
+    split
 }
 
 fn debug_variant_name(value: &impl fmt::Debug) -> String {
@@ -656,10 +1250,11 @@ fn truncate_summary(text: &str, max_chars: usize) -> String {
 
 /// Extract capability / extension / WebGPU blocker keywords from diagnostic text.
 pub fn extract_feature_keywords(text: &str) -> Vec<String> {
+    let sanitized = sanitize_diagnostic_text(text);
     let mut found = Vec::new();
 
     // Extract Capabilities(...) tokens emitted by Naga validation errors.
-    let mut rest = text;
+    let mut rest = sanitized.as_str();
     while let Some(idx) = rest.find("Capabilities(") {
         let after = &rest[idx + "Capabilities(".len()..];
         if let Some(end) = after.find(')') {
@@ -676,14 +1271,14 @@ pub fn extract_feature_keywords(text: &str) -> Vec<String> {
     }
 
     // Extract SPIR-V extension identifiers (e.g. SPV_KHR_ray_tracing).
-    for word in text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+    for word in sanitized.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
         if word.starts_with("SPV_") && word.len() > 4 {
             push_unique(&mut found, word.to_string());
         }
     }
 
     // Match well-known WebGPU blocker feature terms when present in diagnostics.
-    let lower = text.to_ascii_lowercase();
+    let lower = sanitized.to_ascii_lowercase();
     const KNOWN_BLOCKERS: &[(&str, &str)] = &[
         ("push_constant", "PushConstants"),
         ("immediate", "ImmediateData"),
@@ -1201,5 +1796,363 @@ mod tests {
         let err = convert_spirv_bytes_with_options(&spv, &ConvertOptions::default().without_lowering())
             .expect_err("push constant SPIR-V must fail baseline validation when lowering is disabled");
         assert_eq!(err.kind, ConversionErrorKind::ValidationError);
+    }
+
+    #[test]
+    fn validate_emitted_wgsl_rejects_module_scope_let_variants() {
+        let cases: &[(&str, usize)] = &[
+            ("let x: u32 = 1u;\nfn main() {}\n", 1),
+            ("const a: u32 = 1u;\n   let b: f32 = 0.0;\n", 2),
+            ("const a: u32 = 1u;\nlet\tb: u32 = 2u;\n", 2),
+            ("const a: u32 = 1u; let b: u32 = 2u;\n", 1),
+            ("fn helper() {\n    let ok = 1u;\n}\nlet bad = 2u;\n", 4),
+            ("fn helper() { let ok = 1u; } let bad = 2u;\n", 1),
+            ("/* comment */ let x = 1u;\n", 1),
+            ("/* outer /* inner */ still comment */ let x = 1u;\n", 1),
+            ("const a = 1u;\nlet\n    x = 2u;\n", 2),
+        ];
+
+        for &(src, expected_line) in cases {
+            let err = validate_emitted_wgsl(src)
+                .expect_err(&format!("expected module-scope `let` error for:\n{src}"));
+            assert_eq!(err.kind, ConversionErrorKind::WgslWriteError);
+            assert_eq!(err.blocker_key, "WgslValidation: ModuleScopeLet");
+            assert_eq!(err.keywords, vec!["ModuleScopeLet".to_string()]);
+            assert!(
+                err.detail.contains(&format!("line {expected_line}")),
+                "expected line {expected_line} in detail '{}'",
+                err.detail
+            );
+        }
+    }
+
+    #[test]
+    fn validate_emitted_wgsl_accepts_function_scope_let_comments_and_ident_prefixes() {
+        let valid_wgsl = r#"
+// let fake_line_comment = 1u;
+/* let fake_block_comment = 2u; { unmatched brace in comment */
+/* outer /* inner let nested = 3u; } */ still comment */
+const letter: u32 = 1u;
+var<private> let_value: f32 = 0.0;
+alias let0 = f32;
+struct let_struct {
+    let_field: u32,
+}
+
+fn let_helper() -> u32 {
+    let inner: u32 = letter;
+    return inner;
+}
+
+@compute @workgroup_size(1, 1, 1)
+fn main() {
+    let local_val: u32 = let_helper();
+    _ = local_val;
+}
+"#;
+        validate_emitted_wgsl(valid_wgsl)
+            .expect("valid WGSL with function-scope let and let-prefixed identifiers should pass");
+    }
+
+    #[test]
+    fn validate_emitted_wgsl_rejects_empty_unbalanced_braces_and_unterminated_comments() {
+        for empty in ["", "   \n\t\r\n", "// comment only\n/* block */\n"] {
+            let err = validate_emitted_wgsl(empty).expect_err("empty WGSL must be rejected");
+            assert_eq!(err.kind, ConversionErrorKind::WgslWriteError);
+            assert_eq!(err.blocker_key, "WgslValidation: EmptyOutput");
+            assert_eq!(err.keywords, vec!["EmptyWgslOutput".to_string()]);
+        }
+
+        let stray_close = validate_emitted_wgsl("fn f() {}\n}\n")
+            .expect_err("stray closing brace must be rejected");
+        assert_eq!(stray_close.kind, ConversionErrorKind::WgslWriteError);
+        assert_eq!(stray_close.blocker_key, "WgslValidation: UnbalancedBraces");
+
+        let unclosed_open = validate_emitted_wgsl("fn f() {\n    let x = 1u;\n")
+            .expect_err("unclosed opening brace must be rejected");
+        assert_eq!(unclosed_open.kind, ConversionErrorKind::WgslWriteError);
+        assert_eq!(unclosed_open.blocker_key, "WgslValidation: UnbalancedBraces");
+
+        let unterminated_comment = validate_emitted_wgsl("/* outer /* inner */\nfn f() {}\n")
+            .expect_err("unterminated nested block comment must be rejected");
+        assert_eq!(unterminated_comment.kind, ConversionErrorKind::WgslWriteError);
+        assert_eq!(
+            unterminated_comment.blocker_key,
+            "WgslValidation: UnterminatedComment"
+        );
+    }
+
+    #[test]
+    fn converted_spirv_wgsl_round_trips_through_naga_wgsl_frontend_with_zero_module_scope_let() {
+        let stages = [
+            ("compute", build_minimal_compute_spv()),
+            ("vertex", build_minimal_vertex_spv()),
+            ("fragment", build_minimal_fragment_spv()),
+        ];
+
+        for (label, spv) in stages {
+            let converted =
+                convert_spirv_bytes(&spv).unwrap_or_else(|e| panic!("{label} failed: {e}"));
+            assert!(
+                !converted.wgsl.contains('\r'),
+                "{label}: emitted WGSL must use normalized LF newlines"
+            );
+            validate_emitted_wgsl(&converted.wgsl)
+                .unwrap_or_else(|e| panic!("{label}: emitted WGSL failed post-validation: {e}"));
+
+            // Round-trip parse & validate through Naga's WGSL front-end to verify zero WGSL
+            // grammar violations (including module-scope `let`).
+            let reparsed = naga::front::wgsl::parse_str(&converted.wgsl)
+                .unwrap_or_else(|e| panic!("{label}: WGSL re-parse failed: {}", e.emit_to_string(&converted.wgsl)));
+            let mut validator = Validator::new(ValidationFlags::all(), Capabilities::empty());
+            validator
+                .validate(&reparsed)
+                .unwrap_or_else(|e| panic!("{label}: WGSL re-validation failed: {}", e.emit_to_string(&converted.wgsl)));
+        }
+    }
+
+    #[test]
+    fn conversion_output_and_errors_are_strictly_deterministic() {
+        let valid_inputs = [
+            build_minimal_compute_spv(),
+            build_minimal_vertex_spv(),
+            build_minimal_fragment_spv(),
+        ];
+
+        for spv in &valid_inputs {
+            let baseline = convert_spirv_bytes(spv).expect("valid SPIR-V must convert");
+            let audit_baseline = audit_spirv_file("sub/shader.spv", spv, &ConvertOptions::default());
+            for _ in 0..5 {
+                let again = convert_spirv_bytes(spv).expect("repeat conversion must succeed");
+                assert_eq!(again, baseline);
+                let audit_again =
+                    audit_spirv_file("sub/shader.spv", spv, &ConvertOptions::default());
+                assert_eq!(audit_again, audit_baseline);
+            }
+        }
+
+        let err_inputs = [
+            vec![0x03, 0x02, 0x23, 0x07],
+            build_unsupported_extension_spv(),
+            build_unsupported_capability_spv(true),
+        ];
+        for bad in &err_inputs {
+            let baseline_err = convert_spirv_bytes(bad).expect_err("invalid SPIR-V must fail");
+            for _ in 0..5 {
+                let again_err = convert_spirv_bytes(bad).expect_err("repeat must fail identically");
+                assert_eq!(again_err, baseline_err);
+            }
+        }
+    }
+
+    #[test]
+    fn sanitize_diagnostic_text_strips_host_paths_ansi_control_chars_and_bounds_length() {
+        // Windows drive paths (unquoted, quoted with spaces, forward slash, line:col, Rust Debug).
+        assert_eq!(
+            sanitize_diagnostic_text(r"failed to parse C:\Users\alice\Games\Secret\shader.spv"),
+            "failed to parse <path>"
+        );
+        assert_eq!(
+            sanitize_diagnostic_text(r#"error at "C:\Program Files\My Game\sky.hlsl":42:10"#),
+            r#"error at "<path>":42:10"#
+        );
+        assert_eq!(
+            sanitize_diagnostic_text("error at D:/Work/Repo/src/a.hlsl:12:5 in main"),
+            "error at <path>:12:5 in main"
+        );
+        assert_eq!(
+            sanitize_diagnostic_text(r#"UnsupportedExtension("C:\\Users\\alice\\ext.spv")"#),
+            r#"UnsupportedExtension("<path>")"#
+        );
+
+        // UNC and extended-length Windows paths.
+        assert_eq!(
+            sanitize_diagnostic_text(r"cannot open \\fileserver\share\private\a.spv"),
+            "cannot open <path>"
+        );
+        assert_eq!(
+            sanitize_diagnostic_text(r"cannot open \\?\C:\Users\alice\a.spv"),
+            "cannot open <path>"
+        );
+
+        // Unix absolute paths, file:// URIs, home paths, and parent traversals.
+        assert_eq!(
+            sanitize_diagnostic_text("error in /Users/alice/projects/game/shader.spv:8:1"),
+            "error in <path>:8:1"
+        );
+        assert_eq!(
+            sanitize_diagnostic_text("error in '/Users/alice/My Game/shader.spv'"),
+            "error in '<path>'"
+        );
+        assert_eq!(
+            sanitize_diagnostic_text("source file:///C:/Users/alice/game/a.spv."),
+            "source <path>."
+        );
+        assert_eq!(
+            sanitize_diagnostic_text("loaded ~/local-data/game/a.spv and ../../secret/b.spv"),
+            "loaded <path> and <path>"
+        );
+
+        // ANSI escape sequences, CR/LF normalization, and NUL control char removal.
+        assert_eq!(
+            sanitize_diagnostic_text("\x1b[31merror\x1b[0m: /home/bob/game/a.spv\r\n\0line2"),
+            "error: <path>\nline2"
+        );
+
+        // Clean compiler diagnostics and web URLs are preserved verbatim.
+        let clean = "Required Capabilities(FLOAT64 | SUBGROUP) via SPV_KHR_ray_tracing (read/write, shader.wgsl:10:5, https://gpuweb.github.io/gpuweb/wgsl/)";
+        assert_eq!(sanitize_diagnostic_text(clean), clean);
+
+        // Unbounded diagnostic length is deterministically capped.
+        let huge = "a".repeat(MAX_ERROR_DETAIL_CHARS + 500);
+        let capped = sanitize_diagnostic_text(&huge);
+        assert_eq!(capped.chars().count(), MAX_ERROR_DETAIL_CHARS + 3);
+        assert!(capped.ends_with("..."));
+    }
+
+    #[test]
+    fn spirv_conversion_and_audit_errors_redact_embedded_host_paths() {
+        // 1. Host path embedded inside OpExtension.
+        let mut b_ext = SpirvBuilder::new();
+        let void_ty = b_ext.id();
+        let fn_ty = b_ext.id();
+        let main_fn = b_ext.id();
+        let entry_label = b_ext.id();
+        b_ext.inst(17, &[1]); // OpCapability Shader
+        b_ext.inst_with_string(10, &[], r"C:\Users\alice\secret\custom_ext", &[]); // OpExtension
+        b_ext.inst(14, &[0, 1]); // OpMemoryModel
+        b_ext.inst_with_string(15, &[5, main_fn], "main", &[]);
+        b_ext.inst(16, &[main_fn, 17, 1, 1, 1]);
+        b_ext.inst(19, &[void_ty]);
+        b_ext.inst(33, &[fn_ty, void_ty]);
+        b_ext.inst(54, &[void_ty, main_fn, 0, fn_ty]);
+        b_ext.inst(248, &[entry_label]);
+        b_ext.inst(253, &[]);
+        b_ext.inst(56, &[]);
+        let ext_spv = b_ext.finish_bytes();
+
+        let ext_err = convert_spirv_bytes(&ext_spv).expect_err("bogus extension must fail");
+        assert_eq!(ext_err.kind, ConversionErrorKind::SpirvParseError);
+        for field in [
+            ext_err.detail.as_str(),
+            ext_err.blocker_key.as_str(),
+            &ext_err.to_string(),
+        ] {
+            assert!(!field.contains("C:\\"), "leaked Windows drive in: {field}");
+            assert!(!field.contains("alice"), "leaked username in: {field}");
+            assert!(!field.contains("secret"), "leaked directory in: {field}");
+            assert!(field.contains("<path>"), "expected redacted token in: {field}");
+        }
+        assert!(ext_err.keywords.iter().all(|kw| !kw.contains("alice")));
+
+        // 2. Host path embedded inside OpExtInstImport.
+        let mut b_imp = SpirvBuilder::new();
+        let ext_id = b_imp.id();
+        let void_ty = b_imp.id();
+        let fn_ty = b_imp.id();
+        let main_fn = b_imp.id();
+        let entry_label = b_imp.id();
+        b_imp.inst(17, &[1]); // OpCapability Shader
+        b_imp.inst_with_string(11, &[ext_id], "/Users/bob/private/ext_set", &[]); // OpExtInstImport
+        b_imp.inst(14, &[0, 1]);
+        b_imp.inst_with_string(15, &[5, main_fn], "main", &[]);
+        b_imp.inst(16, &[main_fn, 17, 1, 1, 1]);
+        b_imp.inst(19, &[void_ty]);
+        b_imp.inst(33, &[fn_ty, void_ty]);
+        b_imp.inst(54, &[void_ty, main_fn, 0, fn_ty]);
+        b_imp.inst(248, &[entry_label]);
+        b_imp.inst(253, &[]);
+        b_imp.inst(56, &[]);
+        let imp_spv = b_imp.finish_bytes();
+
+        let imp_err = convert_spirv_bytes(&imp_spv).expect_err("bogus ext set must fail");
+        assert!(!imp_err.detail.contains("/Users/bob"));
+        assert!(!imp_err.blocker_key.contains("private"));
+        assert!(imp_err.detail.contains("<path>"));
+
+        // 3. Host path embedded inside OpName on a failing validation target (push constant without lowering).
+        let mut b_name = SpirvBuilder::new();
+        let void_ty = b_name.id();
+        let fn_ty = b_name.id();
+        let f32_ty = b_name.id();
+        let vec4_ty = b_name.id();
+        let struct_ty = b_name.id();
+        let ptr_pc_ty = b_name.id();
+        let pc_var = b_name.id();
+        let main_fn = b_name.id();
+        let entry_label = b_name.id();
+        b_name.inst(17, &[1]); // OpCapability Shader
+        b_name.inst(14, &[0, 1]); // OpMemoryModel
+        b_name.inst_with_string(15, &[5, main_fn], "main", &[]);
+        b_name.inst(16, &[main_fn, 17, 1, 1, 1]);
+        b_name.inst_with_string(5, &[pc_var], r"C:\Users\alice\secret\pc.hlsl", &[]); // OpName
+        b_name.inst(71, &[struct_ty, 2]); // Block
+        b_name.inst(72, &[struct_ty, 0, 35, 0]); // MemberDecorate Offset 0
+        b_name.inst(19, &[void_ty]);
+        b_name.inst(33, &[fn_ty, void_ty]);
+        b_name.inst(22, &[f32_ty, 32]);
+        b_name.inst(23, &[vec4_ty, f32_ty, 4]);
+        b_name.inst(30, &[struct_ty, vec4_ty]);
+        b_name.inst(32, &[ptr_pc_ty, 9, struct_ty]);
+        b_name.inst(59, &[ptr_pc_ty, pc_var, 9]);
+        b_name.inst(54, &[void_ty, main_fn, 0, fn_ty]);
+        b_name.inst(248, &[entry_label]);
+        b_name.inst(253, &[]);
+        b_name.inst(56, &[]);
+        let name_spv = b_name.finish_bytes();
+
+        let val_err = convert_spirv_bytes_with_options(
+            &name_spv,
+            &ConvertOptions::default().without_lowering(),
+        )
+        .expect_err("push constant without lowering must fail validation");
+        assert_eq!(val_err.kind, ConversionErrorKind::ValidationError);
+        assert!(!val_err.detail.contains("alice"), "leaked host path: {}", val_err.detail);
+        assert!(!val_err.detail.contains("C:\\"), "leaked drive letter: {}", val_err.detail);
+
+        // 4. audit_spirv_file sanitizes host source_path and error payloads.
+        let host_paths = [
+            r"C:\Users\alice\Games\Secret\foo.spv",
+            "/Users/alice/secret/foo.spv",
+            r"\\fileserver\share\dir\foo.spv",
+            "file:///C:/Users/alice/foo.spv",
+            "../../local-data/secret/foo.spv",
+            "~/secret/foo.spv",
+        ];
+        for host in host_paths {
+            let rec = audit_spirv_file(host, &ext_spv, &ConvertOptions::default());
+            assert_eq!(rec.source_path, "foo.spv", "host path leaked from '{host}'");
+            assert!(!rec.lowered_to_wgsl);
+            let naga_err = rec.naga_error.as_deref().unwrap_or("");
+            assert!(!naga_err.contains("alice"), "leaked in audit naga_error: {naga_err}");
+        }
+
+        // Clean relative paths stay relative and normalized.
+        assert_eq!(sanitize_audit_source_path("sub/dir/foo.spv"), "sub/dir/foo.spv");
+        assert_eq!(sanitize_audit_source_path("./sub//foo.spv"), "sub/foo.spv");
+        assert_eq!(sanitize_audit_source_path(r"sub\dir\foo.spv"), "sub/dir/foo.spv");
+        assert_eq!(sanitize_audit_source_path(r"C:\Users\alice\"), "unknown.spv");
+        assert_eq!(sanitize_audit_source_path(""), "unknown.spv");
+    }
+
+    #[test]
+    fn extract_feature_keywords_ignores_host_path_segments() {
+        // Host path contains words like `task`, `mesh`, `f64`, `subgroup`, `SPV_secret` that
+        // must NOT pollute extracted WebGPU blocker keywords.
+        let spurious = extract_feature_keywords(
+            "failed to read /Users/task/mesh_build/f64/subgroup/SPV_secret_shader.spv: generic error",
+        );
+        assert!(
+            spurious.is_empty(),
+            "host path segments must not trigger keywords, got: {spurious:?}"
+        );
+
+        let mixed = extract_feature_keywords(
+            r"error in C:\Users\alice\task\shader.spv: Required Capabilities(FLOAT64) via SPV_KHR_ray_tracing",
+        );
+        assert!(mixed.iter().any(|k| k == "Capability::FLOAT64"));
+        assert!(mixed.iter().any(|k| k == "SPV_KHR_ray_tracing"));
+        assert!(mixed.iter().any(|k| k == "Float64"));
+        assert!(!mixed.iter().any(|k| k == "TaskShader"));
     }
 }
