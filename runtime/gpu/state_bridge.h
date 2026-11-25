@@ -410,6 +410,8 @@ struct BridgeStats {
     uint64_t pipelines_created = 0;
     uint64_t bind_groups_created = 0;
     uint64_t bind_groups_retired = 0;
+    uint64_t bind_group_cache_hits = 0;    // G66: bind group lookups answered without a CreateBindGroup
+    uint64_t bind_group_cache_misses = 0;  // ... rebuilt (first use or changed descriptors)
     uint64_t memory_bind_groups = 0;            // bind groups over descriptor memory (recorded)
     uint64_t memory_bind_groups_refreshed = 0;  // ... rebuilt at ExecuteCommandLists (words changed)
     uint64_t root_constant_uploads = 0;
@@ -631,7 +633,7 @@ private:
     bool render_pass_open_ = false;
     std::vector<BoundGroup> render_groups_;
     std::vector<BoundGroup> compute_groups_;
-    std::vector<uint32_t> scoped_bind_groups_;  // bind groups already added to the usage scope
+    std::unordered_set<uint32_t> scoped_bind_groups_;  // bind groups already added to the usage scope
     bool compute_pass_valid_ = false;
     uint32_t compute_pipeline_bound_ = 0;
     // Root constants last uploaded per (bind point, parameter): values + ring offset.

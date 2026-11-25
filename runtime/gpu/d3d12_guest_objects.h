@@ -1451,6 +1451,12 @@ enum class Work : size_t {
     // failed their pipeline's reflection join because the bridge has no descriptor arrays yet, per
     // pipeline state created.
     ReflectionLaneIndexedUnbound,
+    // G66: per-draw/dispatch object reuse. Bind group lookups served from the cache vs rebuilt, and
+    // the GPU objects the recorded work created (a steady scene creates none after warm-up).
+    BindGroupCacheHits,
+    BindGroupCacheMisses,
+    BindGroupsCreated,
+    PipelinesCreated,
     Count
 };
 void count_work(Work w, uint64_t n = 1);
