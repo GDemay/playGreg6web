@@ -43,10 +43,12 @@ Tolerances: a value pair matches when |a - b| <= max(floor, rel * max(|a|, |b|))
 Everything else must match exactly. `--ignore PATTERN` (repeatable, fnmatch on the field path,
 e.g. `milestones.*.elapsed_ms` or `address_space.*`) drops known-different fields.
 
-Output is text by default and `--json` for automation. When GPU/draw/frame-pacing metrics are
-present in both reports, an additive, strictly-sanitized `gpu_delta` summary is included without
-altering pass/fail verdicts or exit codes. Exit code: 0 pass, 1 differences, 2 usage error
-(missing or malformed input).
+Output is text by default and `--json` for automation. When GPU/draw/frame-pacing metrics (including
+`FIRST_VISIBLE_FRAME` and `black_loading_ms` / `blackLoadingMs`) are present in both reports, an
+additive, strictly-sanitized `gpu_delta` summary is included without altering pass/fail verdicts or
+exit codes. When sanitized `gpu_adapter` labels differ between baseline and candidate, an
+informational warning note is emitted without altering pass/fail verdicts or exit codes. Exit code:
+0 pass, 1 differences, 2 usage error (missing or malformed input).
 
     python tools/compare_boot_reports.py a.json b.json
     python tools/compare_boot_reports.py a.json b.json --capture a.pg6trace b.pg6trace --json
@@ -58,6 +60,7 @@ import argparse
 import fnmatch
 import json
 import math
+import re
 import statistics
 import sys
 from collections import Counter
@@ -92,6 +95,8 @@ class Comparison:
     ignore: list[str]
     entries: list[dict[str, Any]] = field(default_factory=list)
     gpu_delta: dict[str, dict[str, int | float | None]] = field(default_factory=dict)
+    gpu_adapter: dict[str, Any] | None = None
+    warnings: list[str] = field(default_factory=list)
 
     def _ignored(self, path: str) -> bool:
         return any(fnmatch.fnmatchcase(path, p) for p in self.ignore)
@@ -399,6 +404,8 @@ GPU_DELTA_METRICS: tuple[str, ...] = (
     "gpu_validation_errors",
     "non_black_canvas_frames",
     "first_present_ms",
+    "first_visible_frame_ms",
+    "black_loading_ms",
     "presents",
     "present_fps",
     "frame_time_ms",
@@ -407,10 +414,91 @@ GPU_DELTA_METRICS: tuple[str, ...] = (
 
 _GPU_DELTA_UNITS: dict[str, str] = {
     "first_present_ms": " ms",
+    "first_visible_frame_ms": " ms",
+    "black_loading_ms": " ms",
     "present_fps": " fps",
     "frame_time_ms": " ms",
     "frame_time_median_ms": " ms",
 }
+
+_GPU_ADAPTER_PATH_RE = re.compile(
+    r"(?:\\\\|[A-Za-z]:[\\/]|(?:^|[\s(])/(?:Users|home|tmp|var|opt|root|mnt|private|etc|usr|Library|Volumes)(?:/|$))"
+)
+_GPU_ADAPTER_SAFE_CHAR_RE = re.compile(r"[^A-Za-z0-9 ._/+:(),\-]")
+_GPU_ADAPTER_MAX_LEN = 96
+
+
+def sanitize_gpu_adapter(raw: Any) -> str | None:
+    """Return a strictly-sanitized WebGPU adapter label (e.g. 'nvidia / turing'), or None."""
+    if isinstance(raw, dict):
+        parts: list[str] = []
+        for key in ("vendor", "architecture"):
+            val = sanitize_gpu_adapter(raw.get(key))
+            if val is not None:
+                parts.append(val)
+        return " / ".join(parts) if parts else None
+    if not isinstance(raw, str):
+        return None
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in raw):
+        return None
+    if "\\" in raw or _GPU_ADAPTER_PATH_RE.search(raw):
+        return None
+    cleaned = _GPU_ADAPTER_SAFE_CHAR_RE.sub("", raw)
+    cleaned = " ".join(cleaned.split())
+    if len(cleaned) > _GPU_ADAPTER_MAX_LEN:
+        cleaned = cleaned[:_GPU_ADAPTER_MAX_LEN].rstrip()
+    if not cleaned or not any(ch.isalnum() for ch in cleaned):
+        return None
+    return cleaned
+
+
+def _canonical_gpu_adapter(label: str) -> str:
+    """Normalize an already-sanitized adapter label for case/spacing-insensitive comparison."""
+    parts = [part.strip().lower() for part in label.split("/") if part.strip()]
+    return " / ".join(parts) if parts else label.strip().lower()
+
+
+def extract_gpu_adapter(report: dict[str, Any]) -> str | None:
+    """Extract sanitized `gpu_adapter` from top-level or `summary` of a boot report."""
+    summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
+    for candidate in (
+        report.get("gpu_adapter"),
+        report.get("gpuAdapter"),
+        summary.get("gpu_adapter"),
+        summary.get("gpuAdapter"),
+    ):
+        sanitized = sanitize_gpu_adapter(candidate)
+        if sanitized is not None:
+            return sanitized
+    return None
+
+
+def compare_gpu_adapter(
+    ra: dict[str, Any],
+    rb: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Compare sanitized GPU adapter labels; returns (adapter_info, informational_warning)."""
+    adapter_a = extract_gpu_adapter(ra)
+    adapter_b = extract_gpu_adapter(rb)
+    if adapter_a is None and adapter_b is None:
+        return None, None
+    mismatch = (
+        adapter_a is not None
+        and adapter_b is not None
+        and _canonical_gpu_adapter(adapter_a) != _canonical_gpu_adapter(adapter_b)
+    )
+    info: dict[str, Any] = {
+        "a": adapter_a,
+        "b": adapter_b,
+        "mismatch": mismatch,
+    }
+    warning: str | None = None
+    if mismatch:
+        warning = (
+            f"gpu_adapter mismatch: baseline '{adapter_a}' vs candidate '{adapter_b}' "
+            "(timing deltas may reflect different GPU adapters, not a regression)"
+        )
+    return info, warning
 
 
 def _finite_number(value: Any) -> int | float | None:
@@ -511,6 +599,51 @@ def extract_gpu_metrics(
     set_if_present(
         "first_present_ms",
         _first_number(first_present_elapsed, milestone_first_present, report.get("first_present_ms")),
+    )
+
+    first_visible_elapsed: Any = None
+    fvf = report.get("first_visible_frame")
+    if isinstance(fvf, dict):
+        first_visible_elapsed = fvf.get("elapsed_ms")
+    milestone_first_visible: Any = None
+    for m in report.get("milestones") or []:
+        if isinstance(m, dict) and m.get("milestone") == "FIRST_VISIBLE_FRAME":
+            milestone_first_visible = m.get("elapsed_ms")
+            break
+    set_if_present(
+        "first_visible_frame_ms",
+        _first_number(
+            first_visible_elapsed,
+            milestone_first_visible,
+            report.get("first_visible_frame_ms"),
+            report.get("firstVisibleFrameMs"),
+            summary.get("first_visible_frame_ms"),
+            summary.get("firstVisibleFrameMs"),
+            counters.get("first_visible_frame_ms"),
+            counters.get("firstVisibleFrameMs"),
+        ),
+    )
+
+    derived_black_loading_ms: int | float | None = None
+    if "first_visible_frame_ms" in metrics and "first_present_ms" in metrics:
+        fvf_ms = metrics["first_visible_frame_ms"]
+        fp_ms = metrics["first_present_ms"]
+        if float(fvf_ms) >= float(fp_ms):
+            if isinstance(fvf_ms, int) and isinstance(fp_ms, int):
+                derived_black_loading_ms = fvf_ms - fp_ms
+            else:
+                derived_black_loading_ms = round(float(fvf_ms) - float(fp_ms), 2)
+    set_if_present(
+        "black_loading_ms",
+        _first_number(
+            summary.get("blackLoadingMs"),
+            summary.get("black_loading_ms"),
+            counters.get("black_loading_ms"),
+            counters.get("blackLoadingMs"),
+            report.get("black_loading_ms"),
+            report.get("blackLoadingMs"),
+            derived_black_loading_ms,
+        ),
     )
 
     total_presents = _first_number(counters.get("presents"))
@@ -638,6 +771,9 @@ def compare(
         compare_presents(c, pa, pb)
     if captures:
         compare_captures(c, *captures)
+    c.gpu_adapter, adapter_warning = compare_gpu_adapter(ra, rb)
+    if adapter_warning is not None:
+        c.warnings.append(adapter_warning)
     c.gpu_delta = compute_gpu_delta(ra, rb, pa, pb)
     return c
 
@@ -661,6 +797,10 @@ def to_result(c: Comparison) -> dict[str, Any]:
         "ignore": c.ignore,
         "entries": bad,
     }
+    if c.gpu_adapter is not None:
+        result["gpu_adapter"] = c.gpu_adapter
+    if c.warnings:
+        result["warnings"] = list(c.warnings)
     if c.gpu_delta:
         result["gpu_delta"] = c.gpu_delta
     return result
@@ -692,6 +832,15 @@ def format_text(c: Comparison, verbose: bool = False) -> str:
             lines.append(f"  ok   {e['field']}: {e['a']!r} ({e['mode']})")
         else:
             lines.append(f"  DIFF {e['field']}: {e['a']!r} != {e['b']!r} ({e['mode']})")
+    if c.gpu_adapter is not None:
+        lines.append("[gpu_adapter]")
+        a_label = c.gpu_adapter["a"] if c.gpu_adapter["a"] is not None else "<unknown>"
+        b_label = c.gpu_adapter["b"] if c.gpu_adapter["b"] is not None else "<unknown>"
+        lines.append(f"  adapter: {a_label} -> {b_label}")
+    if c.warnings:
+        lines.append("[warnings]")
+        for warning in c.warnings:
+            lines.append(f"  WARN {warning}")
     if c.gpu_delta:
         lines.append("[gpu_delta]")
         for metric, item in c.gpu_delta.items():

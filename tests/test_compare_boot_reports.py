@@ -494,5 +494,206 @@ class GpuDeltaTests(unittest.TestCase):
             self.assertIn("verdict: PASS", out2.getvalue())
 
 
+class GpuAdapterAndVisibleFrameTests(unittest.TestCase):
+    tol = cbr.Tolerances()
+
+    def test_gpu_adapter_mismatch_emits_informational_warning_without_failing(self):
+        ra = make_browser_report()
+        rb = make_browser_report()
+        ra["gpu_adapter"] = "nvidia / turing"
+        rb["summary"]["gpu_adapter"] = "intel / gen-12lp"
+
+        c = cbr.compare(ra, rb, self.tol)
+        self.assertEqual(c.failures(), [])
+        result = cbr.to_result(c)
+        self.assertEqual(result["verdict"], "pass")
+        self.assertEqual(
+            result["gpu_adapter"],
+            {"a": "nvidia / turing", "b": "intel / gen-12lp", "mismatch": True},
+        )
+        self.assertEqual(len(result["warnings"]), 1)
+        self.assertIn("nvidia / turing", result["warnings"][0])
+        self.assertIn("intel / gen-12lp", result["warnings"][0])
+
+        text = cbr.format_text(c)
+        self.assertIn("[gpu_adapter]", text)
+        self.assertIn("adapter: nvidia / turing -> intel / gen-12lp", text)
+        self.assertIn("[warnings]", text)
+        self.assertIn("WARN gpu_adapter mismatch:", text)
+        self.assertIn("verdict: PASS", text)
+
+        with tempfile.TemporaryDirectory() as d:
+            pa, pb = Path(d, "a.json"), Path(d, "b.json")
+            pa.write_text(json.dumps(ra), encoding="utf-8")
+            pb.write_text(json.dumps(rb), encoding="utf-8")
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = cbr.main([str(pa), str(pb), "--json"])
+            self.assertEqual(code, 0, err.getvalue())
+            payload = json.loads(out.getvalue())
+            self.assertEqual(payload["verdict"], "pass")
+            self.assertTrue(payload["gpu_adapter"]["mismatch"])
+            self.assertEqual(len(payload["warnings"]), 1)
+
+    def test_gpu_adapter_matching_and_canonical_normalization_emit_no_warning(self):
+        ra = make_browser_report()
+        rb = make_browser_report()
+        ra["gpu_adapter"] = "NVIDIA / Turing"
+        rb["summary"]["gpuAdapter"] = "nvidia/turing"
+
+        c = cbr.compare(ra, rb, self.tol)
+        result = cbr.to_result(c)
+        self.assertEqual(
+            result["gpu_adapter"],
+            {"a": "NVIDIA / Turing", "b": "nvidia/turing", "mismatch": False},
+        )
+        self.assertNotIn("warnings", result)
+        text = cbr.format_text(c)
+        self.assertIn("[gpu_adapter]", text)
+        self.assertNotIn("[warnings]", text)
+
+    def test_gpu_adapter_single_side_and_dict_form(self):
+        ra = make_browser_report()
+        rb = make_browser_report()
+        rb["gpu_adapter"] = {"vendor": "amd", "architecture": "rdna2", "secret": "/home/alice/x"}
+
+        c = cbr.compare(ra, rb, self.tol)
+        result = cbr.to_result(c)
+        self.assertEqual(result["gpu_adapter"], {"a": None, "b": "amd / rdna2", "mismatch": False})
+        self.assertNotIn("warnings", result)
+        self.assertNotIn("alice", json.dumps(result))
+        text = cbr.format_text(c)
+        self.assertIn("adapter: <unknown> -> amd / rdna2", text)
+
+    def test_gpu_adapter_sanitization_rejects_paths_control_chars_and_falls_through(self):
+        ra = make_report()
+        rb = make_report()
+        ra["gpu_adapter"] = r"C:\Users\alice\nvidia.dll"
+        ra["summary"] = {"gpu_adapter": "nvidia / turing"}
+        rb["gpu_adapter"] = "/home/bob/driver.so"
+        rb["summary"] = {"gpu_adapter": "intel\nFAKE_LOG_LINE"}
+
+        c = cbr.compare(ra, rb, self.tol)
+        result = cbr.to_result(c)
+        self.assertEqual(result["gpu_adapter"], {"a": "nvidia / turing", "b": None, "mismatch": False})
+        self.assertNotIn("warnings", result)
+        serialized = json.dumps(result)
+        self.assertNotIn("alice", serialized)
+        self.assertNotIn("bob", serialized)
+        self.assertNotIn("FAKE_LOG_LINE", serialized)
+
+        for bad in (
+            None,
+            True,
+            42,
+            "",
+            "   ",
+            " / ",
+            r"\\server\share\gpu",
+            r"D:/Games/gpu.dll",
+            "/Users/carol/libgpu.dylib",
+            "/tmp/adapter",
+            "nvidia\r\ninjected",
+        ):
+            self.assertIsNone(cbr.sanitize_gpu_adapter(bad), f"expected None for {bad!r}")
+
+    def test_first_visible_frame_milestone_and_black_loading_ms_deltas(self):
+        ra = make_browser_report(first_present_ms=45000.0)
+        ra["milestones"].append({"milestone": "FIRST_VISIBLE_FRAME", "elapsed_ms": 195000.0})
+        ra["summary"]["blackLoadingMs"] = 150000.0
+
+        rb = make_browser_report(first_present_ms=45000.0)
+        rb["milestones"].append({"milestone": "FIRST_VISIBLE_FRAME", "elapsed_ms": 65000.0})
+        rb["summary"]["blackLoadingMs"] = 20000.0
+
+        c = cbr.compare(ra, rb, self.tol)
+        # Milestone timing regression/shift beyond tolerance is still checked in milestones section
+        self.assertIn("milestones.FIRST_VISIBLE_FRAME.elapsed_ms", {e["field"] for e in c.failures()})
+
+        result = cbr.to_result(c)
+        gd = result["gpu_delta"]
+        self.assertEqual(
+            gd["first_visible_frame_ms"],
+            {"a": 195000.0, "b": 65000.0, "delta": -130000.0, "pct": -66.67},
+        )
+        self.assertEqual(
+            gd["black_loading_ms"],
+            {"a": 150000.0, "b": 20000.0, "delta": -130000.0, "pct": -86.67},
+        )
+
+        text = cbr.format_text(c)
+        self.assertIn("first_visible_frame_ms: 195000.0 -> 65000.0 (-130000.0 ms, -66.7%)", text)
+        self.assertIn("black_loading_ms: 150000.0 -> 20000.0 (-130000.0 ms, -86.7%)", text)
+
+        # Ignorable via --ignore while preserving gpu_delta output
+        c_ignored = cbr.compare(ra, rb, self.tol, ignore=["milestones.FIRST_VISIBLE_FRAME.elapsed_ms"])
+        self.assertEqual(c_ignored.failures(), [])
+        self.assertIn("first_visible_frame_ms", c_ignored.gpu_delta)
+        self.assertIn("black_loading_ms", c_ignored.gpu_delta)
+
+    def test_black_loading_ms_derived_and_snake_case_and_zero_preserved(self):
+        # Derived from FIRST_VISIBLE_FRAME - FIRST_PRESENT when explicit blackLoadingMs is absent
+        ra = make_browser_report(first_present_ms=40000.0)
+        ra["milestones"].append({"milestone": "FIRST_VISIBLE_FRAME", "elapsed_ms": 140000.0})
+        rb = make_browser_report(first_present_ms=40000.0)
+        rb["milestones"].append({"milestone": "FIRST_VISIBLE_FRAME", "elapsed_ms": 90000.0})
+        gd = cbr.compute_gpu_delta(ra, rb)
+        self.assertEqual(gd["black_loading_ms"], {"a": 100000.0, "b": 50000.0, "delta": -50000.0, "pct": -50.0})
+
+        # Explicit falsy zero must NOT fall through to derived value, and snake_case works
+        ra2 = make_report()
+        rb2 = make_report()
+        ra2["milestones"].extend([
+            {"milestone": "FIRST_PRESENT", "elapsed_ms": 1000},
+            {"milestone": "FIRST_VISIBLE_FRAME", "elapsed_ms": 5000},
+        ])
+        rb2["milestones"].extend([
+            {"milestone": "FIRST_PRESENT", "elapsed_ms": 1000},
+            {"milestone": "FIRST_VISIBLE_FRAME", "elapsed_ms": 5000},
+        ])
+        ra2["black_loading_ms"] = 0
+        rb2["summary"] = {"black_loading_ms": 250}
+        gd2 = cbr.compute_gpu_delta(ra2, rb2)
+        self.assertEqual(gd2["first_visible_frame_ms"], {"a": 5000, "b": 5000, "delta": 0, "pct": 0.0})
+        self.assertEqual(gd2["black_loading_ms"], {"a": 0, "b": 250, "delta": 250, "pct": None})
+
+    def test_visible_frame_and_black_loading_reject_invalid_values(self):
+        ra = make_report()
+        rb = make_report()
+        ra["summary"] = {
+            "firstVisibleFrameMs": True,
+            "blackLoadingMs": float("nan"),
+        }
+        rb["summary"] = {
+            "firstVisibleFrameMs": r"C:\Users\secret\frame.png",
+            "blackLoadingMs": float("inf"),
+        }
+        gd = cbr.compute_gpu_delta(ra, rb)
+        self.assertNotIn("first_visible_frame_ms", gd)
+        self.assertNotIn("black_loading_ms", gd)
+
+    def test_preserves_1023_progress_counters_alongside_adapter_and_visible_frame(self):
+        ra = make_report_v2()
+        rb = make_report_v2()
+        for r in (ra, rb):
+            r["gpu_work"] = {"draws_emitted": 500, "draws_no_shader_module": 10}
+            r["memory"] = {"cpu_window": {"alias_slots": 12, "alias_conflicts": 0}}
+            r["first_present"]["elapsed_ms"] = 2000
+            r["milestones"].extend([
+                {"milestone": "FIRST_PRESENT", "elapsed_ms": 2000, "import_seq": 600},
+                {"milestone": "FIRST_VISIBLE_FRAME", "elapsed_ms": 6000, "import_seq": 900},
+            ])
+        ra["gpu_adapter"] = "nvidia / turing"
+        rb["gpu_adapter"] = "intel / gen-12lp"
+        rb["gpu_work"]["draws_no_shader_module"] = 200  # regression in #1023 counter
+
+        c = cbr.compare(ra, rb, self.tol)
+        self.assertIn("gpu_work.draws_no_shader_module", {e["field"] for e in c.failures()})
+        result = cbr.to_result(c)
+        self.assertEqual(result["verdict"], "fail")
+        self.assertTrue(result["gpu_adapter"]["mismatch"])
+        self.assertEqual(result["gpu_delta"]["black_loading_ms"], {"a": 4000, "b": 4000, "delta": 0, "pct": 0.0})
+
+
 if __name__ == "__main__":
     unittest.main()
