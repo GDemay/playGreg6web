@@ -21,6 +21,11 @@ const moduleStats = {
   activeHashes: 0,
 };
 
+const moduleFingerprintCacheStats = {
+  fingerprintSkippedCount: 0,
+  bytesSkippedByFingerprint: 0,
+};
+
 function normalizeMaxConcurrency(raw, fallback = DEFAULT_MAX_CONCURRENCY) {
   if (raw === undefined || raw === null || typeof raw === 'boolean' || raw === '') {
     return fallback;
@@ -77,6 +82,22 @@ export function getStats() {
 }
 
 /**
+ * Returns a sanitized snapshot of cumulative warm-boot fingerprint cache skip counters.
+ * Contains only non-negative integer counters (never paths, URLs, ETags, or file bytes).
+ *
+ * @returns {{
+ *   fingerprintSkippedCount: number,
+ *   bytesSkippedByFingerprint: number,
+ * }}
+ */
+export function getFingerprintCacheStats() {
+  return {
+    fingerprintSkippedCount: moduleFingerprintCacheStats.fingerprintSkippedCount,
+    bytesSkippedByFingerprint: moduleFingerprintCacheStats.bytesSkippedByFingerprint,
+  };
+}
+
+/**
  * Resets cumulative manifest & stream verification telemetry counters.
  * Preserves any currently active hash count so in-flight workers cannot underflow counters.
  */
@@ -86,6 +107,8 @@ export function resetStats() {
   moduleStats.mismatchCount = 0;
   moduleStats.abortedCount = 0;
   moduleStats.peakConcurrentHashes = moduleStats.activeHashes;
+  moduleFingerprintCacheStats.fingerprintSkippedCount = 0;
+  moduleFingerprintCacheStats.bytesSkippedByFingerprint = 0;
 }
 
 export const MISMATCH_CATEGORIES = Object.freeze({
@@ -178,6 +201,132 @@ const WINDOWS_DRIVE_RE = /^[A-Za-z]:/;
 const CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
 const CONTENT_RANGE_RE = /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i;
 const QUOTED_ETAG_RE = /^(?:W\/)?"[^"]*"$/;
+const STRONG_ETAG_RE = /^"[^"\x00-\x1f\x7f]+"$/;
+
+function normalizeStrongEtag(raw) {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const trimmed = raw.trim();
+  if (!STRONG_ETAG_RE.test(trimmed)) {
+    return null;
+  }
+  return trimmed;
+}
+
+/**
+ * Checks whether an HTTP `ETag` header value is a valid, non-empty strong ETag per RFC 9110
+ * (quoted, non-empty, no control characters, and NOT a weak `W/"..."` validator).
+ *
+ * @param {unknown} rawEtag
+ * @returns {boolean}
+ */
+export function isStrongEtag(rawEtag) {
+  return normalizeStrongEtag(rawEtag) !== null;
+}
+
+function normalizeFingerprintEntry(rawPath, rawRec) {
+  const pathCheck = validateManifestPath(rawPath);
+  if (!pathCheck.ok || !isPlainObject(rawRec)) {
+    return null;
+  }
+  const etag = normalizeStrongEtag(rawRec.etag);
+  if (etag === null) {
+    return null;
+  }
+  if (!isNonNegativeSafeInt(rawRec.size)) {
+    return null;
+  }
+  let sha256 = null;
+  if (rawRec.sha256 !== undefined && rawRec.sha256 !== null) {
+    if (typeof rawRec.sha256 !== 'string' || !SHA256_HEX_RE.test(rawRec.sha256.trim())) {
+      return null;
+    }
+    sha256 = rawRec.sha256.trim().toLowerCase();
+  }
+  return {
+    path: pathCheck.normalized,
+    record: {
+      etag,
+      size: rawRec.size,
+      sha256,
+    },
+  };
+}
+
+function ingestFingerprintSource(targetMap, source) {
+  if (!source) {
+    return;
+  }
+  if (source instanceof Map) {
+    for (const [rawPath, rawRec] of source.entries()) {
+      const normalized = normalizeFingerprintEntry(rawPath, rawRec);
+      if (normalized) {
+        targetMap.set(normalized.path, normalized.record);
+      }
+    }
+    return;
+  }
+  if (!isPlainObject(source)) {
+    return;
+  }
+
+  const looksLikeDirectRecord = 'etag' in source && 'size' in source;
+  if (!looksLikeDirectRecord) {
+    if (
+      source.verifiedFingerprints !== undefined &&
+      (source.verifiedFingerprints instanceof Map || isPlainObject(source.verifiedFingerprints))
+    ) {
+      ingestFingerprintSource(targetMap, source.verifiedFingerprints);
+      return;
+    }
+    if (
+      source.fingerprints !== undefined &&
+      (source.fingerprints instanceof Map || isPlainObject(source.fingerprints))
+    ) {
+      ingestFingerprintSource(targetMap, source.fingerprints);
+      return;
+    }
+    if (Array.isArray(source.results)) {
+      for (const item of source.results) {
+        if (!isPlainObject(item) || item.ok !== true) {
+          continue;
+        }
+        const verifiedSha =
+          isPlainObject(item.hash) && item.hash.verified === true
+            ? item.hash.actual || item.hash.expected || null
+            : null;
+        const normalized = normalizeFingerprintEntry(item.path, {
+          etag: item.etag ?? item.head?.etag ?? null,
+          size: item.expectedSize ?? item.head?.contentLength ?? null,
+          sha256: verifiedSha,
+        });
+        if (normalized) {
+          targetMap.set(normalized.path, normalized.record);
+        }
+      }
+      return;
+    }
+  }
+
+  for (const [rawPath, rawRec] of Object.entries(source)) {
+    const normalized = normalizeFingerprintEntry(rawPath, rawRec);
+    if (normalized) {
+      targetMap.set(normalized.path, normalized.record);
+    }
+  }
+}
+
+function buildFingerprintCacheMap(previousSnapshot, verifiedFingerprints) {
+  const cache = new Map();
+  if (previousSnapshot) {
+    ingestFingerprintSource(cache, previousSnapshot);
+  }
+  if (verifiedFingerprints) {
+    ingestFingerprintSource(cache, verifiedFingerprints);
+  }
+  return cache;
+}
 
 const FILE_URI_RE = /file:\/\/[^\s'")\]]+/gi;
 const WINDOWS_UNC_PATH_RE = /\\\\[^\s'")\]]+/g;
@@ -2263,6 +2412,9 @@ function hasCoopCoepHeaders(headers) {
  * @param {boolean} [options.checkCoopCoep=false] When true, fail probes missing COOP/COEP headers.
  * @param {boolean} [options.verifyHashes=false] When true, verify SHA-256 digests for entries declaring `sha256`.
  * @param {((bytes: Uint8Array) => Promise<string> | string) | null} [options.hashFn=null] Optional SHA-256 hex digest provider.
+ * @param {Record<string, { etag: string, size: number, sha256?: string | null }> | Map<string, { etag: string, size: number, sha256?: string | null }> | object | null} [options.verifiedFingerprints=null] Optional verified fingerprint cache keyed by sanitized entry path for warm-boot ETag+size skip.
+ * @param {Record<string, { etag: string, size: number, sha256?: string | null }> | Map<string, { etag: string, size: number, sha256?: string | null }> | object | null} [options.previousSnapshot=null] Optional previous `verifyLiveEndpoints()` report or fingerprint snapshot map for warm-boot ETag+size skip.
+ * @param {boolean} [options.forceReverify=false] When true, bypass any `verifiedFingerprints`/`previousSnapshot` skip cache and perform full streaming verification.
  * @param {AbortSignal | null} [options.signal=null] Optional AbortSignal to cancel in-flight verification.
  * @param {(() => number) | null} [options.nowFn=null] Optional injectable monotonic clock in milliseconds.
  * @returns {Promise<{
@@ -2281,6 +2433,9 @@ function hasCoopCoepHeaders(headers) {
  *   filesVerified: number,
  *   peakConcurrentHashes: number,
  *   maxConcurrency: number,
+ *   fingerprintSkippedCount: number,
+ *   bytesSkippedByFingerprint: number,
+ *   verifiedFingerprints: Record<string, { etag: string, size: number, sha256: string | null }>,
  *   mismatchCount: number,
  *   mismatchesByCategory: { missing: number, size_mismatch: number, hash_mismatch: number },
  *   mismatches: Array<{ path: string, category: 'missing' | 'size_mismatch' | 'hash_mismatch', detail: string }>,
@@ -2296,6 +2451,8 @@ function hasCoopCoepHeaders(headers) {
  *     abortedCount: number,
  *     peakConcurrentHashes: number,
  *     maxConcurrency: number,
+ *     fingerprintSkippedCount: number,
+ *     bytesSkippedByFingerprint: number,
  *   },
  * }>}
  */
@@ -2310,6 +2467,9 @@ export async function verifyLiveEndpoints(options = {}) {
     checkCoopCoep = false,
     verifyHashes = false,
     hashFn = null,
+    verifiedFingerprints = null,
+    previousSnapshot = null,
+    forceReverify = false,
     signal = null,
     nowFn = null,
   } = options || {};
@@ -2319,12 +2479,15 @@ export async function verifyLiveEndpoints(options = {}) {
   }
 
   const concurrency = normalizeMaxConcurrency(maxConcurrency, DEFAULT_MAX_CONCURRENCY);
+  const fingerprintCache = buildFingerprintCacheMap(previousSnapshot, verifiedFingerprints);
+  const skipCacheEnabled = !forceReverify && fingerprintCache.size > 0;
   const now = resolveNowFn(nowFn);
   const startTime = now();
 
   const mismatchesByCategory = createMismatchesByCategory();
   const mismatches = [];
   const results = [];
+  const verifiedFingerprintsOut = {};
   let passed = 0;
   let failed = 0;
   let skippedIncomplete = 0;
@@ -2335,6 +2498,8 @@ export async function verifyLiveEndpoints(options = {}) {
   let runAbortedCount = 0;
   let runActiveHashes = 0;
   let runPeakConcurrentHashes = 0;
+  let runFingerprintSkippedCount = 0;
+  let runBytesSkippedByFingerprint = 0;
 
   const enterRunHash = () => {
     runActiveHashes += 1;
@@ -2366,6 +2531,8 @@ export async function verifyLiveEndpoints(options = {}) {
       abortedCount: runAbortedCount,
       peakConcurrentHashes: runPeakConcurrentHashes,
       maxConcurrency: concurrency,
+      fingerprintSkippedCount: runFingerprintSkippedCount,
+      bytesSkippedByFingerprint: runBytesSkippedByFingerprint,
     };
     return {
       ok: !aborted && manifestOk && failed === 0,
@@ -2383,6 +2550,9 @@ export async function verifyLiveEndpoints(options = {}) {
       filesVerified: telemetry.filesVerified,
       peakConcurrentHashes: runPeakConcurrentHashes,
       maxConcurrency: concurrency,
+      fingerprintSkippedCount: runFingerprintSkippedCount,
+      bytesSkippedByFingerprint: runBytesSkippedByFingerprint,
+      verifiedFingerprints: verifiedFingerprintsOut,
       mismatchCount: telemetry.mismatchCount,
       mismatchesByCategory: { ...telemetry.mismatchesByCategory },
       mismatches,
@@ -2540,11 +2710,52 @@ export async function verifyLiveEndpoints(options = {}) {
     }
 
     if (entryAborted || signal?.aborted) {
-      return { aborted: true, bytesHashed: fileBytesHashed };
+      return {
+        aborted: true,
+        bytesHashed: fileBytesHashed,
+        fingerprintSkipped: false,
+        bytesSkippedByFingerprint: 0,
+      };
     }
 
-    // 2. Range GET probe (only when file has at least 1 byte; 0-byte files cannot satisfy bytes=0-0)
-    if (entry.size > 0) {
+    // 1b. Warm-boot ETag + size fingerprint skip fast path:
+    //     When HEAD returns HTTP 200 with a strong ETag and Content-Length matching both
+    //     the manifest entry and the verified snapshot (and matching manifest sha256 when
+    //     declared), short-circuit GET body fetches and full streaming SHA-256 hashing.
+    let fingerprintSkipped = false;
+    let fileBytesSkippedByFingerprint = 0;
+    const headStrongEtag = normalizeStrongEtag(headInfo.etag);
+    const cachedFingerprint =
+      skipCacheEnabled && safePath !== '<invalid-path>' ? fingerprintCache.get(safePath) : null;
+
+    if (
+      cachedFingerprint &&
+      headInfo.status === 200 &&
+      fileErrors.length === 0 &&
+      headStrongEtag !== null &&
+      headInfo.contentLength !== null &&
+      headInfo.contentLength === entry.size &&
+      cachedFingerprint.etag === headStrongEtag &&
+      cachedFingerprint.size === entry.size &&
+      (entry.sha256 === null || cachedFingerprint.sha256 === entry.sha256)
+    ) {
+      fingerprintSkipped = true;
+      fileBytesSkippedByFingerprint = entry.size;
+      rangeInfo.skipped = true;
+      if (verifyHashes && entry.sha256 !== null) {
+        hashInfo = {
+          expected: entry.sha256,
+          actual: cachedFingerprint.sha256,
+          verified: true,
+          checkedBytes: 0,
+          skippedByFingerprint: true,
+          elapsedMs: 0,
+        };
+      }
+    }
+
+    // 2. Range GET probe (only when file has at least 1 byte and not skipped via fingerprint cache)
+    if (entry.size > 0 && !fingerprintSkipped) {
       const endByte = Math.min(entry.size - 1, requestedProbeBytes - 1);
       const expectedLength = endByte + 1;
       const rangeHeader = `bytes=0-${endByte}`;
@@ -2699,12 +2910,18 @@ export async function verifyLiveEndpoints(options = {}) {
 
     if (entryAborted || signal?.aborted) {
       rangeBytes = null;
-      return { aborted: true, bytesHashed: fileBytesHashed };
+      return {
+        aborted: true,
+        bytesHashed: fileBytesHashed,
+        fingerprintSkipped: false,
+        bytesSkippedByFingerprint: 0,
+      };
     }
 
     // 3. Optional SHA-256 content hash verification (streams response body in O(1) RAM when
     //    available so multi-hundred-MB .pgim / .wgsl.pack files avoid duplicate full buffers).
     if (
+      !fingerprintSkipped &&
       verifyHashes &&
       entry.sha256 !== null &&
       !fileCategories.has(MISMATCH_CATEGORIES.MISSING)
@@ -2870,16 +3087,41 @@ export async function verifyLiveEndpoints(options = {}) {
     rangeBytes = null;
 
     if (entryAborted || signal?.aborted) {
-      return { aborted: true, bytesHashed: fileBytesHashed };
+      return {
+        aborted: true,
+        bytesHashed: fileBytesHashed,
+        fingerprintSkipped: false,
+        bytesSkippedByFingerprint: 0,
+      };
     }
 
     const fileElapsedMs = computeElapsedMs(fileStart, now());
     const fileOk = fileErrors.length === 0;
+    const resolvedEtag = rangeInfo.etag || headInfo.etag || null;
+    const resolvedStrongEtag = normalizeStrongEtag(resolvedEtag);
+    let verifiedFingerprint = null;
+    if (fileOk && safePath !== '<invalid-path>' && resolvedStrongEtag !== null) {
+      const verifiedSha256 =
+        hashInfo && hashInfo.verified === true
+          ? hashInfo.actual || hashInfo.expected || null
+          : fingerprintSkipped && cachedFingerprint
+            ? cachedFingerprint.sha256
+            : null;
+      verifiedFingerprint = {
+        path: safePath,
+        etag: resolvedStrongEtag,
+        size: entry.size,
+        sha256: verifiedSha256,
+      };
+    }
 
     return {
       aborted: false,
       bytesVerified: fileBytesVerified,
       bytesHashed: fileBytesHashed,
+      fingerprintSkipped,
+      bytesSkippedByFingerprint: fileBytesSkippedByFingerprint,
+      verifiedFingerprint,
       mismatches: fileMismatches,
       result: {
         path: entry.path,
@@ -2890,10 +3132,13 @@ export async function verifyLiveEndpoints(options = {}) {
         head: headInfo,
         range: rangeInfo,
         hash: hashInfo,
-        etag: rangeInfo.etag || headInfo.etag || null,
-        coopCoep: entry.size > 0 ? headCoopCoep && rangeCoopCoep : headCoopCoep,
+        etag: resolvedEtag,
+        coopCoep:
+          entry.size > 0 && !fingerprintSkipped ? headCoopCoep && rangeCoopCoep : headCoopCoep,
         elapsedMs: fileElapsedMs,
         bytesVerified: fileBytesVerified,
+        fingerprintSkipped,
+        bytesSkippedByFingerprint: fileBytesSkippedByFingerprint,
         mismatchCategories: Array.from(fileCategories),
       },
     };
@@ -2929,6 +3174,12 @@ export async function verifyLiveEndpoints(options = {}) {
 
       orderedOutcomes[idx] = outcome;
       runBytesHashed += outcome.bytesHashed;
+      if (outcome.fingerprintSkipped) {
+        runFingerprintSkippedCount += 1;
+        runBytesSkippedByFingerprint += outcome.bytesSkippedByFingerprint;
+        moduleFingerprintCacheStats.fingerprintSkippedCount += 1;
+        moduleFingerprintCacheStats.bytesSkippedByFingerprint += outcome.bytesSkippedByFingerprint;
+      }
       moduleStats.filesVerified += 1;
       moduleStats.bytesHashed += outcome.bytesHashed;
       moduleStats.mismatchCount += outcome.mismatches.length;
@@ -2961,6 +3212,13 @@ export async function verifyLiveEndpoints(options = {}) {
       passed += 1;
     } else {
       failed += 1;
+    }
+    if (outcome.verifiedFingerprint) {
+      verifiedFingerprintsOut[outcome.verifiedFingerprint.path] = {
+        etag: outcome.verifiedFingerprint.etag,
+        size: outcome.verifiedFingerprint.size,
+        sha256: outcome.verifiedFingerprint.sha256,
+      };
     }
     results.push(outcome.result);
   }
