@@ -25,6 +25,7 @@ const {
   BUFFER_ALIGNMENT_BYTES,
   UNIFORM_BUFFER_MIN_BYTES,
   DEFAULT_FAST_SLOT_CAPACITY,
+  DEFAULT_MAX_BIND_GROUPS,
   isBcFormat,
   deviceSupportsBc,
   computeMaxMipLevels,
@@ -48,6 +49,7 @@ function createMockDevice({ features = new Set([TEXTURE_COMPRESSION_BC_FEATURE])
     createTexture: [],
     createSampler: [],
     createShaderModule: [],
+    createBindGroup: [],
   };
   let nextHandle = 1;
 
@@ -75,7 +77,12 @@ function createMockDevice({ features = new Set([TEXTURE_COMPRESSION_BC_FEATURE])
         desc,
         destroyed: false,
         createView(viewDesc) {
-          return { kind: 'GPUTextureView', textureHandle: tex.handle, viewDesc };
+          return {
+            kind: 'GPUTextureView',
+            textureHandle: tex.handle,
+            texture: tex,
+            viewDesc,
+          };
         },
         destroy() {
           tex.destroyed = true;
@@ -93,6 +100,34 @@ function createMockDevice({ features = new Set([TEXTURE_COMPRESSION_BC_FEATURE])
       const mod = { kind: 'GPUShaderModule', handle: nextHandle++, desc };
       calls.createShaderModule.push({ desc, result: mod });
       return mod;
+    },
+    createBindGroup(desc) {
+      // Mirror WebGPU validation: reject any destroyed buffer or texture in entries.
+      const entries = Array.isArray(desc.entries) ? desc.entries : [];
+      for (let i = 0; i < entries.length; i += 1) {
+        const res = entries[i] && entries[i].resource;
+        if (!res) {
+          throw new Error(`WebGPU validation: bindGroup entry ${i} missing resource`);
+        }
+        if (res.buffer && res.buffer.destroyed) {
+          throw new Error('WebGPU validation: Destroyed buffer used in createBindGroup');
+        }
+        if (res.destroyed) {
+          throw new Error('WebGPU validation: Destroyed resource used in createBindGroup');
+        }
+        if (res.texture && res.texture.destroyed) {
+          throw new Error('WebGPU validation: Destroyed texture used in createBindGroup');
+        }
+      }
+      const bg = {
+        kind: 'GPUBindGroup',
+        handle: nextHandle++,
+        layout: desc.layout,
+        entries,
+        label: desc.label,
+      };
+      calls.createBindGroup.push({ desc, result: bg });
+      return bg;
     },
     queue: {
       writeBuffer(buffer, bufferOffset, data) {
@@ -1228,6 +1263,543 @@ test('ResourceTable clearSlot, clearSlots, clear(), and resetStats() preserve mo
   assert.ok(table.getSlotVersion(0) > v0BeforeClearReset);
 
   for (const [k, v] of Object.entries(afterClearReset)) {
+    assert.equal(typeof v, 'number', `stat ${k} must be numeric`);
+    assert.ok(Number.isFinite(v), `stat ${k} must be finite`);
+  }
+});
+
+test('ResourceTable tracks monotonic resource generation stamps across create, overwrite, and destroy for buffers, textures, texture views, and samplers (W267)', async () => {
+  const esmMod = await import('../web/workers/resource_table.js');
+  assert.equal(DEFAULT_MAX_BIND_GROUPS, 4096);
+  assert.equal(esmMod.DEFAULT_MAX_BIND_GROUPS, 4096);
+  assert.equal(globalThis.PlayGta6ResourceTable.DEFAULT_MAX_BIND_GROUPS, 4096);
+
+  const { device } = createMockDevice();
+  const table = new ResourceTable(device);
+  assert.equal(table.maxBindGroups, DEFAULT_MAX_BIND_GROUPS);
+  assert.throws(() => new ResourceTable(device, { maxBindGroups: -1 }), RangeError);
+  assert.throws(() => new ResourceTable(device, { maxBindGroups: 1.5 }), RangeError);
+
+  // Never-created handles report generation 0 and are not current.
+  assert.equal(table.getResourceGeneration('buffer', 1), 0);
+  assert.equal(table.getResourceGeneration('texture', 2), 0);
+  assert.equal(table.getResourceGeneration('textureView', 2), 0);
+  assert.equal(table.getResourceGeneration('sampler', 3), 0);
+  assert.equal(table.isResourceGenerationCurrent('buffer', 1, 0), false);
+
+  // Buffer lifecycle: create -> overwrite -> destroy -> recreate.
+  table.createBuffer(1, { size: 64, usage: GPU_BUFFER_USAGE.UNIFORM });
+  const bg1 = table.getResourceGeneration('buffer', 1);
+  assert.ok(bg1 >= 1);
+  assert.equal(table.isResourceGenerationCurrent('buffer', 1, bg1), true);
+
+  table.createBuffer(1, { size: 128, usage: GPU_BUFFER_USAGE.UNIFORM });
+  const bg2 = table.getResourceGeneration('buffer', 1);
+  assert.ok(bg2 > bg1);
+  assert.equal(table.isResourceGenerationCurrent('buffer', 1, bg1), false);
+  assert.equal(table.isResourceGenerationCurrent('buffer', 1, bg2), true);
+
+  assert.equal(table.destroyBuffer(1), true);
+  const bg3 = table.getResourceGeneration('buffer', 1);
+  assert.ok(bg3 > bg2);
+  assert.equal(table.isResourceGenerationCurrent('buffer', 1, bg2), false);
+  assert.equal(table.isResourceGenerationCurrent('buffer', 1, bg3), false);
+
+  table.createBuffer(1, { size: 64, usage: GPU_BUFFER_USAGE.UNIFORM });
+  const bg4 = table.getResourceGeneration('buffer', 1);
+  assert.ok(bg4 > bg3);
+  assert.equal(table.isResourceGenerationCurrent('buffer', 1, bg4), true);
+
+  // Texture + default view + standalone child view lifecycle.
+  table.createTexture(2, { size: { width: 64, height: 64 }, mipLevelCount: 4, format: 'rgba8unorm' });
+  const tg1 = table.getResourceGeneration('texture', 2);
+  const vg1 = table.getResourceGeneration('textureView', 2);
+  assert.ok(tg1 >= 1);
+  assert.ok(vg1 > tg1);
+  assert.equal(table.isResourceGenerationCurrent('texture', 2, tg1), true);
+  assert.equal(table.isResourceGenerationCurrent('textureView', 2, vg1), true);
+
+  // Overwriting default textureView via createTextureView bumps view generation without destroying texture.
+  const customDefaultView = table.createTextureView(2, { baseMipLevel: 1, mipLevelCount: 1 });
+  assert.ok(customDefaultView);
+  const vg2 = table.getResourceGeneration('textureView', 2);
+  assert.ok(vg2 > vg1);
+  assert.equal(table.getResourceGeneration('texture', 2), tg1);
+  assert.equal(table.isResourceGenerationCurrent('textureView', 2, vg1), false);
+  assert.equal(table.isResourceGenerationCurrent('textureView', 2, vg2), true);
+
+  // Child textureView handle (200) bound to parent texture (2).
+  const childView = table.createTextureView(200, 2, { baseMipLevel: 2, mipLevelCount: 1 });
+  assert.ok(childView);
+  const childGen1 = table.getResourceGeneration('textureView', 200);
+  assert.ok(childGen1 > vg2);
+  assert.equal(table.isResourceGenerationCurrent('textureView', 200, childGen1), true);
+
+  // Destroying parent texture (2) advances texture 2, default view 2, AND child view 200 generations!
+  assert.equal(table.destroyTexture(2), true);
+  const tg2 = table.getResourceGeneration('texture', 2);
+  const vg3 = table.getResourceGeneration('textureView', 2);
+  const childGen2 = table.getResourceGeneration('textureView', 200);
+  assert.ok(tg2 > tg1);
+  assert.ok(vg3 > vg2);
+  assert.ok(childGen2 > childGen1);
+  assert.equal(table.isResourceGenerationCurrent('texture', 2, tg1), false);
+  assert.equal(table.isResourceGenerationCurrent('textureView', 2, vg2), false);
+  assert.equal(table.isResourceGenerationCurrent('textureView', 200, childGen1), false);
+  assert.equal(table.getTextureView(200), undefined);
+
+  // Sampler lifecycle: create -> overwrite -> destroySampler.
+  table.createSampler(3, { magFilter: 'linear' });
+  const sg1 = table.getResourceGeneration('sampler', 3);
+  assert.ok(sg1 > childGen2);
+  assert.equal(table.isResourceGenerationCurrent('sampler', 3, sg1), true);
+
+  table.createSampler(3, { magFilter: 'nearest' });
+  const sg2 = table.getResourceGeneration('sampler', 3);
+  assert.ok(sg2 > sg1);
+  assert.equal(table.isResourceGenerationCurrent('sampler', 3, sg1), false);
+  assert.equal(table.isResourceGenerationCurrent('sampler', 3, sg2), true);
+
+  assert.equal(table.destroySampler(3), true);
+  const sg3 = table.getResourceGeneration('sampler', 3);
+  assert.ok(sg3 > sg2);
+  assert.equal(table.isResourceGenerationCurrent('sampler', 3, sg2), false);
+  assert.equal(table.isResourceGenerationCurrent('sampler', 3, sg3), false);
+});
+
+test('ResourceTable stamps cached GPUBindGroups with (handle, generation) tuples and proactively invalidates on destroy/overwrite (W267)', () => {
+  const { device, calls } = createMockDevice();
+  const table = new ResourceTable(device);
+  const layout = { kind: 'GPUBindGroupLayout', id: 'main-bgl' };
+
+  table.createBuffer(1, { size: 64, usage: GPU_BUFFER_USAGE.UNIFORM });
+  table.createTexture(2, { size: { width: 128, height: 128 }, mipLevelCount: 4, format: 'rgba8unorm' });
+  table.createSampler(3, { magFilter: 'linear' });
+
+  const bGen1 = table.getResourceGeneration('buffer', 1);
+  const tGen1 = table.getResourceGeneration('texture', 2);
+  const tvGen1 = table.getResourceGeneration('textureView', 2);
+  const sGen1 = table.getResourceGeneration('sampler', 3);
+
+  // First call: miss -> creates and caches bind group stamped with exact (handle, generation) tuples.
+  const bg1 = table.getOrCreateBindGroup('pass0:group0', {
+    layout,
+    entries: [
+      { binding: 0, kind: 'buffer', handle: 1, offset: 0, size: 64 },
+      { binding: 1, kind: 'texture', handle: 2 },
+      { binding: 2, kind: 'sampler', handle: 3 },
+    ],
+    label: 'pass0_group0',
+  });
+  assert.ok(bg1);
+  assert.equal(calls.createBindGroup.length, 1);
+  assert.equal(table.hasBindGroup('pass0:group0'), true);
+
+  const meta = table.getBindGroupMeta('pass0:group0');
+  assert.ok(meta);
+  assert.equal(meta.valid, true);
+  assert.deepEqual(meta.stamps, [
+    { kind: 'buffer', handle: 1, generation: bGen1 },
+    { kind: 'texture', handle: 2, generation: tGen1 },
+    { kind: 'textureView', handle: 2, generation: tvGen1 },
+    { kind: 'sampler', handle: 3, generation: sGen1 },
+  ]);
+
+  // Repeat lookup via getBindGroup and getOrCreateBindGroup -> hits without calling device.createBindGroup!
+  assert.strictEqual(table.getBindGroup('pass0:group0'), bg1);
+  assert.strictEqual(
+    table.getOrCreateBindGroup('pass0:group0', {
+      layout,
+      entries: [
+        { binding: 0, kind: 'buffer', handle: 1, offset: 0, size: 64 },
+        { binding: 1, kind: 'texture', handle: 2 },
+        { binding: 2, kind: 'sampler', handle: 3 },
+      ],
+    }),
+    bg1
+  );
+  assert.equal(calls.createBindGroup.length, 1);
+
+  let stats = table.getStats();
+  assert.equal(stats.bindGroupHits, 2);
+  assert.equal(stats.bindGroupMisses, 1);
+  assert.ok(Math.abs(stats.bindGroupHitRate - 2 / 3) < 1e-12);
+  assert.equal(stats.staleBindGroupEvictions, 0);
+  assert.equal(stats.lruBindGroupEvictions, 0);
+  assert.equal(stats.cachedBindGroups, 1);
+
+  // Add a second bind group sharing texture 2 and an unrelated third bind group using only buffer 1.
+  const bgShared = table.getOrCreateBindGroup('pass1:group0', {
+    layout,
+    entries: [{ binding: 0, kind: 'textureView', handle: 2 }],
+  });
+  const bgUnrelated = table.getOrCreateBindGroup('pass2:bufOnly', {
+    layout,
+    entries: [{ binding: 0, kind: 'buffer', handle: 1 }],
+  });
+  assert.ok(bgShared);
+  assert.ok(bgUnrelated);
+  assert.equal(table.getStats().cachedBindGroups, 3);
+
+  // Destroying texture 2 proactively evicts BOTH pass0:group0 and pass1:group0 (once each!),
+  // while leaving pass2:bufOnly completely untouched!
+  assert.equal(table.destroyTexture(2), true);
+  assert.equal(table.hasBindGroup('pass0:group0'), false);
+  assert.equal(table.hasBindGroup('pass1:group0'), false);
+  assert.equal(table.hasBindGroup('pass2:bufOnly'), true);
+
+  stats = table.getStats();
+  assert.equal(stats.staleBindGroupEvictions, 2);
+  assert.equal(stats.cachedBindGroups, 1);
+
+  // Looking up pass0:group0 while texture 2 is destroyed misses (no double-count of stale evictions)
+  // and getOrCreateBindGroup returns null without invoking device.createBindGroup.
+  const createCountBefore = calls.createBindGroup.length;
+  assert.equal(table.getBindGroup('pass0:group0'), undefined);
+  assert.equal(
+    table.getOrCreateBindGroup('pass0:group0', {
+      layout,
+      entries: [
+        { binding: 0, kind: 'buffer', handle: 1, offset: 0, size: 64 },
+        { binding: 1, kind: 'texture', handle: 2 },
+        { binding: 2, kind: 'sampler', handle: 3 },
+      ],
+    }),
+    null
+  );
+  assert.equal(calls.createBindGroup.length, createCountBefore);
+  assert.equal(table.getStats().staleBindGroupEvictions, 2);
+
+  // Recreating texture 2 allows creating a fresh bind group stamped with the new generation!
+  table.createTexture(2, { size: { width: 256, height: 256 }, format: 'rgba8unorm' });
+  const tGen2 = table.getResourceGeneration('texture', 2);
+  assert.ok(tGen2 > tGen1);
+  const bg1Recreated = table.getOrCreateBindGroup('pass0:group0', {
+    layout,
+    entries: [
+      { binding: 0, kind: 'buffer', handle: 1, offset: 0, size: 64 },
+      { binding: 1, kind: 'texture', handle: 2 },
+      { binding: 2, kind: 'sampler', handle: 3 },
+    ],
+  });
+  assert.ok(bg1Recreated);
+  assert.notStrictEqual(bg1Recreated, bg1);
+  const recreatedMeta = table.getBindGroupMeta('pass0:group0');
+  assert.equal(
+    recreatedMeta.stamps.find((s) => s.kind === 'texture' && s.handle === 2).generation,
+    tGen2
+  );
+
+  // Overwriting sampler 3 proactively evicts pass0:group0 (which references sampler 3).
+  const staleBeforeSampler = table.getStats().staleBindGroupEvictions;
+  table.createSampler(3, { magFilter: 'nearest' });
+  assert.equal(table.hasBindGroup('pass0:group0'), false);
+  assert.equal(table.getStats().staleBindGroupEvictions, staleBeforeSampler + 1);
+
+  // Overwriting buffer 1 proactively evicts pass2:bufOnly.
+  table.createBuffer(1, { size: 128, usage: GPU_BUFFER_USAGE.UNIFORM });
+  assert.equal(table.hasBindGroup('pass2:bufOnly'), false);
+  assert.equal(table.getStats().staleBindGroupEvictions, staleBeforeSampler + 2);
+  assert.equal(table.getStats().cachedBindGroups, 0);
+});
+
+test('ResourceTable detects and evicts stale bind groups on lookup (outdated generation stamps, external destroy, and stale direct GPU objects) (W267)', () => {
+  const { device, calls } = createMockDevice();
+  const table = new ResourceTable(device);
+  const layout = { kind: 'GPUBindGroupLayout', id: 'lookup-stale-bgl' };
+
+  const buf1 = table.createBuffer(10, { size: 64, usage: GPU_BUFFER_USAGE.UNIFORM });
+  const tex1 = table.createTexture(20, { size: { width: 32, height: 32 }, format: 'rgba8unorm' });
+  const oldBufGen = table.getResourceGeneration('buffer', 10);
+
+  // Overwrite buffer 10 so oldBufGen is stale.
+  const buf2 = table.createBuffer(10, { size: 64, usage: GPU_BUFFER_USAGE.UNIFORM });
+  assert.equal(buf1.destroyed, true);
+  assert.equal(buf2.destroyed, false);
+
+  // 1. Entry manually cached with an outdated (handle, generation) tuple is detected & evicted on lookup.
+  const staleManualBg = { kind: 'GPUBindGroup', id: 'stale-manual' };
+  table.setBindGroup('manual-stale', staleManualBg, [
+    { kind: 'buffer', handle: 10, generation: oldBufGen },
+  ]);
+  assert.equal(table.getStats().cachedBindGroups, 1);
+  assert.equal(table.hasBindGroup('manual-stale'), false);
+
+  const staleBefore = table.getStats().staleBindGroupEvictions;
+  assert.equal(table.getBindGroup('manual-stale'), undefined);
+  assert.equal(table.getStats().staleBindGroupEvictions, staleBefore + 1);
+  assert.equal(table.getStats().cachedBindGroups, 0);
+  assert.equal(table.getStats().bindGroupMisses, 1);
+
+  // 2. Direct GPU object passed to getOrCreateBindGroup(layout, entries) auto-tracks origin and detects external destroy().
+  const bgDirect = table.getOrCreateBindGroup(layout, [
+    { binding: 0, resource: { buffer: buf2, offset: 0, size: 64 } },
+    { binding: 1, resource: table.getTextureView(20) },
+  ]);
+  assert.ok(bgDirect);
+  // Out-of-order entries deduplicate to the exact same cached bind group!
+  const bgDirectHit = table.getOrCreateBindGroup(layout, [
+    { binding: 1, resource: table.getTextureView(20) },
+    { binding: 0, resource: { buffer: buf2, offset: 0, size: 64 } },
+  ]);
+  assert.strictEqual(bgDirectHit, bgDirect);
+  assert.equal(calls.createBindGroup.length, 1);
+
+  // Externally destroy tex1 (bypassing table.destroyTexture) -> lookup MUST detect and evict as stale!
+  tex1.destroy();
+  const staleBeforeExt = table.getStats().staleBindGroupEvictions;
+  const retryAfterExtDestroy = table.getOrCreateBindGroup(layout, [
+    { binding: 0, resource: { buffer: buf2, offset: 0, size: 64 } },
+    { binding: 1, resource: table.getTextureView(20) },
+  ]);
+  assert.equal(retryAfterExtDestroy, null);
+  assert.equal(table.getStats().staleBindGroupEvictions, staleBeforeExt + 1);
+  assert.equal(table.getStats().cachedBindGroups, 0);
+  assert.equal(calls.createBindGroup.length, 1);
+
+  // 3. Attempting to build a bind group using a previously overwritten/destroyed direct GPUBuffer (buf1) returns null safely.
+  const staleBufResult = table.getOrCreateBindGroup(layout, [
+    { binding: 0, resource: { buffer: buf1, offset: 0, size: 64 } },
+  ]);
+  assert.equal(staleBufResult, null);
+  assert.equal(calls.createBindGroup.length, 1);
+
+  // 4. evictStaleBindGroups() sweeps externally destroyed direct resources proactively.
+  const extBuf = device.createBuffer({ size: 32, usage: GPU_BUFFER_USAGE.UNIFORM });
+  const bgExt = table.getOrCreateBindGroup('ext-key', layout, [
+    { binding: 0, resource: { buffer: extBuf } },
+  ]);
+  assert.ok(bgExt);
+  assert.strictEqual(table.getBindGroup('ext-key'), bgExt);
+  extBuf.destroy();
+  const swept = table.evictStaleBindGroups();
+  assert.equal(swept, 1);
+  assert.equal(table.getStats().cachedBindGroups, 0);
+});
+
+test('ResourceTable enforces bounded LRU cap (maxBindGroups) with recency refresh and accurate lruBindGroupEvictions (W267)', () => {
+  const { device } = createMockDevice();
+  const table = new ResourceTable(device, { maxBindGroups: 3 });
+  assert.equal(table.maxBindGroups, 3);
+
+  table.createBuffer(1, { size: 64, usage: GPU_BUFFER_USAGE.UNIFORM });
+  table.createBuffer(2, { size: 64, usage: GPU_BUFFER_USAGE.UNIFORM });
+  table.createBuffer(3, { size: 64, usage: GPU_BUFFER_USAGE.UNIFORM });
+  table.createBuffer(4, { size: 64, usage: GPU_BUFFER_USAGE.UNIFORM });
+
+  const bgA = { kind: 'GPUBindGroup', name: 'A' };
+  const bgB = { kind: 'GPUBindGroup', name: 'B' };
+  const bgC = { kind: 'GPUBindGroup', name: 'C' };
+  const bgD = { kind: 'GPUBindGroup', name: 'D' };
+  const bgE = { kind: 'GPUBindGroup', name: 'E' };
+
+  table.setBindGroup('A', bgA, [{ kind: 'buffer', handle: 1 }]);
+  table.setBindGroup('B', bgB, [{ kind: 'buffer', handle: 2 }]);
+  table.setBindGroup('C', bgC, [{ kind: 'buffer', handle: 3 }]);
+  assert.equal(table.getStats().cachedBindGroups, 3);
+  assert.equal(table.getStats().lruBindGroupEvictions, 0);
+
+  // Touch 'A' so LRU order becomes [B (oldest), C, A (newest)].
+  assert.strictEqual(table.getBindGroup('A'), bgA);
+
+  // Inserting 'D' must evict 'B' (LRU oldest), preserving 'A', 'C', 'D'.
+  table.setBindGroup('D', bgD, [{ kind: 'buffer', handle: 4 }]);
+  assert.equal(table.getStats().cachedBindGroups, 3);
+  assert.equal(table.getStats().lruBindGroupEvictions, 1);
+  assert.equal(table.hasBindGroup('B'), false);
+  assert.equal(table.hasBindGroup('A'), true);
+  assert.equal(table.hasBindGroup('C'), true);
+  assert.equal(table.hasBindGroup('D'), true);
+
+  // Overwriting an existing key ('C') refreshes its recency without triggering an LRU eviction.
+  const bgC2 = { kind: 'GPUBindGroup', name: 'C2' };
+  table.setBindGroup('C', bgC2, [{ kind: 'buffer', handle: 3 }]);
+  assert.equal(table.getStats().cachedBindGroups, 3);
+  assert.equal(table.getStats().lruBindGroupEvictions, 1);
+
+  // Now order is [A (oldest), D, C (newest)]; inserting 'E' evicts 'A'.
+  table.setBindGroup('E', bgE, [{ kind: 'buffer', handle: 1 }]);
+  assert.equal(table.getStats().cachedBindGroups, 3);
+  assert.equal(table.getStats().lruBindGroupEvictions, 2);
+  assert.equal(table.hasBindGroup('A'), false);
+  assert.strictEqual(table.getBindGroup('C'), bgC2);
+  assert.strictEqual(table.getBindGroup('D'), bgD);
+  assert.strictEqual(table.getBindGroup('E'), bgE);
+
+  // Destroying buffer 2 (whose only bind group 'B' was already LRU-evicted) must NOT increment stale evictions!
+  const staleBefore = table.getStats().staleBindGroupEvictions;
+  table.destroyBuffer(2);
+  assert.equal(table.getStats().staleBindGroupEvictions, staleBefore);
+
+  // maxBindGroups: 0 cleanly disables retention without errors.
+  const uncachedTable = new ResourceTable(device, { maxBindGroups: 0 });
+  const layout = { kind: 'GPUBindGroupLayout', id: 'zero-cap' };
+  uncachedTable.createBuffer(1, { size: 16, usage: GPU_BUFFER_USAGE.UNIFORM });
+  const g1 = uncachedTable.getOrCreateBindGroup('k', {
+    layout,
+    entries: [{ binding: 0, kind: 'buffer', handle: 1 }],
+  });
+  const g2 = uncachedTable.getOrCreateBindGroup('k', {
+    layout,
+    entries: [{ binding: 0, kind: 'buffer', handle: 1 }],
+  });
+  assert.ok(g1);
+  assert.ok(g2);
+  assert.notStrictEqual(g1, g2);
+  assert.equal(uncachedTable.getStats().cachedBindGroups, 0);
+  assert.equal(uncachedTable.getStats().bindGroupMisses, 2);
+  assert.equal(uncachedTable.getStats().bindGroupHits, 0);
+  assert.equal(uncachedTable.getStats().bindGroupHitRate, 0);
+  assert.equal(uncachedTable.getStats().lruBindGroupEvictions, 0);
+});
+
+test('ResourceTable bind-group cache integrates with descriptor slots, resetStats(), and clear() (W267)', () => {
+  const { device, calls } = createMockDevice();
+  const table = new ResourceTable(device, { maxBindGroups: 16 });
+  const layout = { kind: 'GPUBindGroupLayout', id: 'slot-bgl' };
+
+  table.createBuffer(1, { size: 256, usage: GPU_BUFFER_USAGE.UNIFORM });
+  table.createTexture(2, { size: { width: 64, height: 64 }, format: 'rgba8unorm' });
+  table.setSlot(0, { kind: 'buffer', handle: 1, offset: 0, size: 64 });
+  table.setSlot(1, { kind: 'texture', handle: 2 });
+
+  const bg1 = table.getOrCreateBindGroup({
+    key: 'slot-group',
+    layout,
+    slots: [0, 1],
+  });
+  assert.ok(bg1);
+  assert.strictEqual(
+    table.getOrCreateBindGroup({ key: 'slot-group', layout, slots: [0, 1] }),
+    bg1
+  );
+  assert.equal(calls.createBindGroup.length, 1);
+
+  // Rebinding slot 0 to a different offset invalidates the slot-backed bind group on lookup.
+  table.setSlot(0, { kind: 'buffer', handle: 1, offset: 64, size: 64 });
+  const bg2 = table.getOrCreateBindGroup({
+    key: 'slot-group',
+    layout,
+    slots: [0, 1],
+  });
+  assert.ok(bg2);
+  assert.notStrictEqual(bg2, bg1);
+  assert.equal(calls.createBindGroup.length, 2);
+  assert.equal(table.getStats().staleBindGroupEvictions, 1);
+
+  // resetStats() clears bind-group counters while preserving cached bind groups & monotonic generations.
+  const genBeforeReset = table.getResourceGeneration('buffer', 1);
+  table.resetStats();
+  const afterReset = table.getStats();
+  assert.equal(afterReset.bindGroupHits, 0);
+  assert.equal(afterReset.bindGroupMisses, 0);
+  assert.equal(afterReset.bindGroupHitRate, 0);
+  assert.equal(afterReset.staleBindGroupEvictions, 0);
+  assert.equal(afterReset.lruBindGroupEvictions, 0);
+  assert.equal(afterReset.cachedBindGroups, 1);
+  assert.strictEqual(table.getBindGroup('slot-group'), bg2);
+  assert.equal(table.getStats().bindGroupHits, 1);
+  assert.equal(table.getStats().bindGroupHitRate, 1);
+
+  // clear() evicts all cached bind groups while preserving strictly monotonic generations.
+  table.clear();
+  const afterClear = table.getStats();
+  assert.equal(afterClear.cachedBindGroups, 0);
+  assert.ok(table.getResourceGeneration('buffer', 1) > genBeforeReset);
+
+  table.createBuffer(1, { size: 64, usage: GPU_BUFFER_USAGE.UNIFORM });
+  assert.ok(table.getResourceGeneration('buffer', 1) > genBeforeReset + 1);
+  table.clear({ resetStats: true });
+  const afterClearReset = table.getStats();
+  assert.equal(afterClearReset.bindGroupHits, 0);
+  assert.equal(afterClearReset.bindGroupMisses, 0);
+  assert.equal(afterClearReset.bindGroupHitRate, 0);
+  assert.equal(afterClearReset.staleBindGroupEvictions, 0);
+  assert.equal(afterClearReset.lruBindGroupEvictions, 0);
+  assert.equal(afterClearReset.cachedBindGroups, 0);
+});
+
+test('ResourceTable scene transition stress (Start Screen -> 4K Bink2 -> Main Menu) prevents destroyed-resource submits and bounds GPU handles (W267)', () => {
+  const { device, calls } = createMockDevice();
+  const table = new ResourceTable(device, { maxBindGroups: 32 });
+  const uiLayout = { kind: 'GPUBindGroupLayout', id: 'ui' };
+  const binkLayout = { kind: 'GPUBindGroupLayout', id: 'bink2-yuv' };
+  const menuLayout = { kind: 'GPUBindGroupLayout', id: 'main-menu' };
+
+  // Phase 1: Start Screen (reused across 20 frames -> high cache hit rate).
+  table.createBuffer(1, { size: 256, usage: GPU_BUFFER_USAGE.UNIFORM });
+  table.createTexture(10, { size: { width: 1920, height: 1080 }, format: 'rgba8unorm' });
+  table.createSampler(100, { magFilter: 'linear', minFilter: 'linear' });
+
+  for (let frame = 0; frame < 20; frame += 1) {
+    const bg = table.getOrCreateBindGroup('start-screen', {
+      layout: uiLayout,
+      entries: [
+        { binding: 0, kind: 'buffer', handle: 1 },
+        { binding: 1, kind: 'texture', handle: 10 },
+        { binding: 2, kind: 'sampler', handle: 100 },
+      ],
+    });
+    assert.ok(bg);
+  }
+  assert.equal(calls.createBindGroup.length, 1);
+  assert.equal(table.getStats().bindGroupHits, 19);
+  assert.equal(table.getStats().bindGroupMisses, 1);
+  assert.equal(table.getStats().bindGroupHitRate, 19 / 20);
+
+  // Phase 2: Transition to 4K Bink2 (destroy Start Screen textures, reuse identical handle IDs 10, 11, 12).
+  const startTexGen = table.getResourceGeneration('texture', 10);
+  table.destroyTexture(10);
+  assert.equal(table.getStats().staleBindGroupEvictions, 1);
+  assert.equal(table.getStats().cachedBindGroups, 0);
+
+  // Allocate 4K Y, U, V planes reusing handle 10 + 11, 12.
+  table.createTexture(10, { size: { width: 3840, height: 2160 }, format: 'r8unorm' });
+  table.createTexture(11, { size: { width: 1920, height: 1080 }, format: 'r8unorm' });
+  table.createTexture(12, { size: { width: 1920, height: 1080 }, format: 'r8unorm' });
+  assert.ok(table.getResourceGeneration('texture', 10) > startTexGen);
+
+  for (let frame = 0; frame < 60; frame += 1) {
+    const binkBg = table.getOrCreateBindGroup('bink2-4k', {
+      layout: binkLayout,
+      entries: [
+        { binding: 0, kind: 'buffer', handle: 1 },
+        { binding: 1, kind: 'textureView', handle: 10 },
+        { binding: 2, kind: 'textureView', handle: 11 },
+        { binding: 3, kind: 'textureView', handle: 12 },
+        { binding: 4, kind: 'sampler', handle: 100 },
+      ],
+    });
+    assert.ok(binkBg);
+  }
+  assert.equal(calls.createBindGroup.length, 2);
+
+  // Phase 3: Transition to Main Menu (destroy Bink2 planes + stream 128 unique draw bind groups under cap 32).
+  table.destroyTexture(10);
+  table.destroyTexture(11);
+  table.destroyTexture(12);
+  // All 3 planes were in 'bink2-4k', so 'bink2-4k' is evicted EXACTLY ONCE on destroyTexture(10)!
+  assert.equal(table.getStats().staleBindGroupEvictions, 2);
+  assert.equal(table.getStats().cachedBindGroups, 0);
+
+  for (let i = 0; i < 128; i += 1) {
+    const texId = 500 + i;
+    table.createTexture(texId, { size: { width: 256, height: 256 }, format: 'rgba8unorm' });
+    const bg = table.getOrCreateBindGroup(menuLayout, [
+      { binding: 0, kind: 'buffer', handle: 1 },
+      { binding: 1, kind: 'texture', handle: texId },
+      { binding: 2, kind: 'sampler', handle: 100 },
+    ]);
+    assert.ok(bg);
+    assert.ok(table.getStats().cachedBindGroups <= 32);
+  }
+
+  const finalStats = table.getStats();
+  assert.equal(finalStats.cachedBindGroups, 32);
+  assert.equal(finalStats.lruBindGroupEvictions, 96);
+  assert.equal(finalStats.staleBindGroupEvictions, 2);
+  assert.ok(finalStats.bindGroupHitRate >= 0 && finalStats.bindGroupHitRate <= 1);
+  for (const [k, v] of Object.entries(finalStats)) {
     assert.equal(typeof v, 'number', `stat ${k} must be numeric`);
     assert.ok(Number.isFinite(v), `stat ${k} must be finite`);
   }
