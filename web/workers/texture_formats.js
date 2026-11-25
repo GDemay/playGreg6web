@@ -8,7 +8,36 @@
 
   const WEBGPU_BYTES_PER_ROW_ALIGNMENT = 256;
   const TEXTURE_COMPRESSION_BC_FEATURE = 'texture-compression-bc';
+  const TEXTURE_COMPRESSION_BC_SLICED_3D_FEATURE = 'texture-compression-bc-sliced-3d';
+  const TEXTURE_FORMATS_TIER1_FEATURE = 'texture-formats-tier1';
+  const CHROMIUM_UNORM16_FEATURE = 'chromium-experimental-unorm16-texture-formats';
   const DEPTH32FLOAT_STENCIL8_FEATURE = 'depth32float-stencil8';
+
+  const SRGB_SIBLING_FORMATS = Object.freeze({
+    rgba8unorm: 'rgba8unorm-srgb',
+    'rgba8unorm-srgb': 'rgba8unorm',
+    bgra8unorm: 'bgra8unorm-srgb',
+    'bgra8unorm-srgb': 'bgra8unorm',
+    'bc1-rgba-unorm': 'bc1-rgba-unorm-srgb',
+    'bc1-rgba-unorm-srgb': 'bc1-rgba-unorm',
+    'bc2-rgba-unorm': 'bc2-rgba-unorm-srgb',
+    'bc2-rgba-unorm-srgb': 'bc2-rgba-unorm',
+    'bc3-rgba-unorm': 'bc3-rgba-unorm-srgb',
+    'bc3-rgba-unorm-srgb': 'bc3-rgba-unorm',
+    'bc7-rgba-unorm': 'bc7-rgba-unorm-srgb',
+    'bc7-rgba-unorm-srgb': 'bc7-rgba-unorm',
+  });
+
+  const NORM16_TEXTURE_FORMATS = new Set([
+    'r16unorm',
+    'rg16unorm',
+    'rgba16unorm',
+    'r16snorm',
+    'rg16snorm',
+    'rgba16snorm',
+  ]);
+
+  const BC_FORMAT_PATTERN = /^bc[1-7]/;
 
   /**
    * Standard DirectX / Xbox Series DXGI_FORMAT numeric enum values (dxgiformat.h).
@@ -314,6 +343,159 @@
       isSrgb: entry.isSrgb,
       requiresFeature: entry.requiresFeature,
       needsSoftwareDecode,
+    };
+  }
+
+  /**
+   * Return the sRGB <-> linear sibling for WebGPU texture formats that have one
+   * (`rgba8unorm`, `bgra8unorm`, `bc1/bc2/bc3/bc7` unorm <-> `-srgb`), or `null`
+   * if the format has no sRGB sibling or the input is invalid.
+   *
+   * @param {string} format
+   * @returns {string | null}
+   */
+  function getSrgbSiblingFormat(format) {
+    if (typeof format !== 'string') {
+      return null;
+    }
+    const normalized = format.trim().toLowerCase();
+    if (Object.prototype.hasOwnProperty.call(SRGB_SIBLING_FORMATS, normalized)) {
+      return SRGB_SIBLING_FORMATS[normalized];
+    }
+    return null;
+  }
+
+  /**
+   * Classify whether a WebGPU texture format is supported for a given dimension
+   * and optional device feature set, returning the required feature, fallback
+   * format, and machine-readable reason when unsupported.
+   *
+   * @param {string} format
+   * @param {{
+   *   dimension?: '1d' | '2d' | '3d',
+   *   deviceFeatures?: Set<string> | string[] | Iterable<string> | Record<string, boolean> | null,
+   *   usage?: number
+   * }} [options]
+   * @returns {{
+   *   supported: boolean,
+   *   requiredFeature: string | null,
+   *   fallbackFormat: string | null,
+   *   reason: string | null
+   * }}
+   */
+  function classifyTextureFormatSupport(format, options = {}) {
+    if (typeof format !== 'string') {
+      return {
+        supported: false,
+        requiredFeature: null,
+        fallbackFormat: null,
+        reason: 'invalid-format',
+      };
+    }
+
+    const normalized = format.trim().toLowerCase();
+    if (!normalized) {
+      return {
+        supported: false,
+        requiredFeature: null,
+        fallbackFormat: null,
+        reason: 'invalid-format',
+      };
+    }
+
+    const opts = options && typeof options === 'object' ? options : {};
+    const dimension =
+      typeof opts.dimension === 'string' && opts.dimension.trim()
+        ? opts.dimension.trim().toLowerCase()
+        : '2d';
+    const deviceFeatures = opts.deviceFeatures !== undefined ? opts.deviceFeatures : null;
+
+    if (BC_FORMAT_PATTERN.test(normalized)) {
+      if (dimension === '3d') {
+        if (hasSupportedFeature(deviceFeatures, TEXTURE_COMPRESSION_BC_SLICED_3D_FEATURE)) {
+          return {
+            supported: true,
+            requiredFeature: TEXTURE_COMPRESSION_BC_SLICED_3D_FEATURE,
+            fallbackFormat: null,
+            reason: null,
+          };
+        }
+        return {
+          supported: false,
+          requiredFeature: TEXTURE_COMPRESSION_BC_SLICED_3D_FEATURE,
+          fallbackFormat: 'rgba8unorm',
+          reason: 'missing-bc-sliced-3d',
+        };
+      }
+
+      if (hasSupportedFeature(deviceFeatures, TEXTURE_COMPRESSION_BC_FEATURE)) {
+        return {
+          supported: true,
+          requiredFeature: TEXTURE_COMPRESSION_BC_FEATURE,
+          fallbackFormat: null,
+          reason: null,
+        };
+      }
+      return {
+        supported: false,
+        requiredFeature: TEXTURE_COMPRESSION_BC_FEATURE,
+        fallbackFormat: 'rgba8unorm',
+        reason: 'missing-bc',
+      };
+    }
+
+    if (NORM16_TEXTURE_FORMATS.has(normalized)) {
+      if (hasSupportedFeature(deviceFeatures, TEXTURE_FORMATS_TIER1_FEATURE)) {
+        return {
+          supported: true,
+          requiredFeature: TEXTURE_FORMATS_TIER1_FEATURE,
+          fallbackFormat: null,
+          reason: null,
+        };
+      }
+      if (hasSupportedFeature(deviceFeatures, CHROMIUM_UNORM16_FEATURE)) {
+        return {
+          supported: true,
+          requiredFeature: CHROMIUM_UNORM16_FEATURE,
+          fallbackFormat: null,
+          reason: null,
+        };
+      }
+      const fallbackFormat = normalized.startsWith('rgba')
+        ? 'rgba16float'
+        : normalized.startsWith('rg')
+          ? 'rg16float'
+          : 'r16float';
+      return {
+        supported: false,
+        requiredFeature: TEXTURE_FORMATS_TIER1_FEATURE,
+        fallbackFormat,
+        reason: 'missing-unorm16',
+      };
+    }
+
+    if (normalized === 'depth32float-stencil8') {
+      if (hasSupportedFeature(deviceFeatures, DEPTH32FLOAT_STENCIL8_FEATURE)) {
+        return {
+          supported: true,
+          requiredFeature: DEPTH32FLOAT_STENCIL8_FEATURE,
+          fallbackFormat: null,
+          reason: null,
+        };
+      }
+      return {
+        supported: false,
+        requiredFeature: DEPTH32FLOAT_STENCIL8_FEATURE,
+        fallbackFormat: 'depth24plus-stencil8',
+        reason: 'missing-depth32float-stencil8',
+      };
+    }
+
+    return {
+      supported: true,
+      requiredFeature: null,
+      fallbackFormat: null,
+      reason: null,
     };
   }
 
@@ -755,7 +937,12 @@
     DXGI_FORMAT_NAMES,
     WEBGPU_BYTES_PER_ROW_ALIGNMENT,
     TEXTURE_COMPRESSION_BC_FEATURE,
+    TEXTURE_COMPRESSION_BC_SLICED_3D_FEATURE,
+    TEXTURE_FORMATS_TIER1_FEATURE,
+    DEPTH32FLOAT_STENCIL8_FEATURE,
     mapDxgiFormatToWebGpu,
+    getSrgbSiblingFormat,
+    classifyTextureFormatSupport,
     calcMipSize,
     calcMipLayout,
     padTextureRowsForWriteTexture,
