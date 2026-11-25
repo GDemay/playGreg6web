@@ -503,8 +503,49 @@ class RpfArchiveVfs {
     this._entries = entries;
     this._nodesByKey = new Map();
     this._childrenByDirKey = new Map();
+    this._stats = {
+      lookupHits: 0,
+      lookupMisses: 0,
+      compressedEntriesRead: 0,
+      rawEntriesRead: 0,
+      bytesRead: 0,
+    };
 
     this._buildIndex();
+  }
+
+  /**
+   * Returns sanitized numeric-only lookup and read telemetry counters
+   * (zero filenames, archive paths, or host paths).
+   *
+   * @returns {{
+   *   entryCount: number,
+   *   indexedEntries: number,
+   *   lookupHits: number,
+   *   lookupMisses: number,
+   *   compressedEntriesRead: number,
+   *   rawEntriesRead: number,
+   *   bytesRead: number
+   * }}
+   */
+  getStats() {
+    return {
+      entryCount: this._entries.length,
+      indexedEntries: this._nodesByKey.size,
+      lookupHits: this._stats.lookupHits,
+      lookupMisses: this._stats.lookupMisses,
+      compressedEntriesRead: this._stats.compressedEntriesRead,
+      rawEntriesRead: this._stats.rawEntriesRead,
+      bytesRead: this._stats.bytesRead,
+    };
+  }
+
+  resetStats() {
+    this._stats.lookupHits = 0;
+    this._stats.lookupMisses = 0;
+    this._stats.compressedEntriesRead = 0;
+    this._stats.rawEntriesRead = 0;
+    this._stats.bytesRead = 0;
   }
 
   _buildIndex() {
@@ -711,31 +752,82 @@ class RpfArchiveVfs {
     return RpfArchiveVfs.open(reader, totalSize, Object.assign({}, options, { archivePath }));
   }
 
+  resolve(virtualPath) {
+    const norm = normalizeVirtualPath(virtualPath);
+    const node = this._nodesByKey.get(norm.key);
+    if (!node) {
+      this._stats.lookupMisses += 1;
+      return null;
+    }
+    this._stats.lookupHits += 1;
+    return {
+      path: node.path,
+      key: node.key,
+      name: node.name,
+      archivePath: node.path,
+      stat: cloneNodeStat(node),
+    };
+  }
+
   exists(virtualPath) {
     let norm;
     try {
       norm = normalizeVirtualPath(virtualPath);
     } catch {
+      this._stats.lookupMisses += 1;
       return false;
     }
-    return this._nodesByKey.has(norm.key);
+    const found = this._nodesByKey.has(norm.key);
+    if (found) {
+      this._stats.lookupHits += 1;
+    } else {
+      this._stats.lookupMisses += 1;
+    }
+    return found;
   }
 
   stat(virtualPath) {
     const norm = normalizeVirtualPath(virtualPath);
     const node = this._nodesByKey.get(norm.key);
     if (!node) {
+      this._stats.lookupMisses += 1;
       return null;
     }
+    this._stats.lookupHits += 1;
     return cloneNodeStat(node);
+  }
+
+  open(virtualPath) {
+    const norm = normalizeVirtualPath(virtualPath);
+    const node = this._nodesByKey.get(norm.key);
+    if (!node) {
+      this._stats.lookupMisses += 1;
+      throw new RpfFormatError('PATH_NOT_FOUND', `File not found in RPF archive: ${virtualPath}`);
+    }
+    this._stats.lookupHits += 1;
+    if (node.entry.kind !== 'file') {
+      throw new RpfFormatError('NOT_A_FILE', `Path is a directory, not a file: ${virtualPath}`);
+    }
+    const stat = cloneNodeStat(node);
+    return {
+      path: node.path,
+      name: node.name,
+      size: node.entry.uncompressedSize,
+      stat,
+      read: (offset = 0, length = undefined, options = {}) =>
+        this._readNodeRange(node, offset, length, options),
+      readAll: (options = {}) => this._readNodeRange(node, 0, undefined, options),
+    };
   }
 
   listDir(dirPath = '') {
     const norm = normalizeVirtualPath(dirPath);
     const node = this._nodesByKey.get(norm.key);
     if (!node) {
+      this._stats.lookupMisses += 1;
       throw new RpfFormatError('PATH_NOT_FOUND', `Directory not found in RPF archive: ${dirPath}`);
     }
+    this._stats.lookupHits += 1;
     if (node.entry.kind !== 'directory') {
       throw new RpfFormatError('NOT_A_DIRECTORY', `Path is not a directory: ${dirPath}`);
     }
@@ -743,27 +835,7 @@ class RpfArchiveVfs {
     return children.map((child) => cloneNodeStat(child));
   }
 
-  /**
-   * Streams a byte range from a virtual file inside the archive.
-   * Requests ONLY `[entry.dataOffset + offset, ...]` from the underlying range reader,
-   * cleanly clamped to EOF.
-   *
-   * @param {string} virtualPath
-   * @param {number} [offset=0]
-   * @param {number|null|undefined} [length] - Omit to read through EOF.
-   * @param {object} [options] - Optional `{ raw: boolean }`.
-   * @returns {Promise<Uint8Array>}
-   */
-  async readFileRange(virtualPath, offset = 0, length = undefined, options = {}) {
-    const norm = normalizeVirtualPath(virtualPath);
-    const node = this._nodesByKey.get(norm.key);
-    if (!node) {
-      throw new RpfFormatError('PATH_NOT_FOUND', `File not found in RPF archive: ${virtualPath}`);
-    }
-    if (node.entry.kind !== 'file') {
-      throw new RpfFormatError('NOT_A_FILE', `Path is a directory, not a file: ${virtualPath}`);
-    }
-
+  async _readNodeRange(node, offset = 0, length = undefined, options = {}) {
     if (!Number.isSafeInteger(offset) || offset < 0) {
       throw new RangeError(`Invalid readFileRange offset: ${offset}`);
     }
@@ -810,7 +882,10 @@ class RpfArchiveVfs {
         length === undefined || length === null
           ? decompressed.byteLength
           : Math.min(decompressed.byteLength, offset + length);
-      return decompressed.slice(offset, end);
+      const out = decompressed.slice(offset, end);
+      this._stats.compressedEntriesRead += 1;
+      this._stats.bytesRead += out.byteLength;
+      return out;
     }
 
     const fileSize = readRaw ? entry.storedSize : entry.uncompressedSize;
@@ -849,23 +924,288 @@ class RpfArchiveVfs {
       );
     }
 
+    this._stats.rawEntriesRead += 1;
+    this._stats.bytesRead += bytes.byteLength;
     return bytes;
+  }
+
+  /**
+   * Streams a byte range from a virtual file inside the archive.
+   * Requests ONLY `[entry.dataOffset + offset, ...]` from the underlying range reader,
+   * cleanly clamped to EOF.
+   *
+   * @param {string} virtualPath
+   * @param {number} [offset=0]
+   * @param {number|null|undefined} [length] - Omit to read through EOF.
+   * @param {object} [options] - Optional `{ raw: boolean }`.
+   * @returns {Promise<Uint8Array>}
+   */
+  async readFileRange(virtualPath, offset = 0, length = undefined, options = {}) {
+    const norm = normalizeVirtualPath(virtualPath);
+    const node = this._nodesByKey.get(norm.key);
+    if (!node) {
+      this._stats.lookupMisses += 1;
+      throw new RpfFormatError('PATH_NOT_FOUND', `File not found in RPF archive: ${virtualPath}`);
+    }
+    this._stats.lookupHits += 1;
+    if (node.entry.kind !== 'file') {
+      throw new RpfFormatError('NOT_A_FILE', `Path is a directory, not a file: ${virtualPath}`);
+    }
+    return this._readNodeRange(node, offset, length, options);
   }
 
   async readFile(virtualPath, options = {}) {
     return this.readFileRange(virtualPath, 0, undefined, options);
   }
+
+  async readEntry(virtualPath, offset = 0, length = undefined, options = {}) {
+    if (offset !== null && typeof offset === 'object') {
+      return this.readFileRange(virtualPath, 0, undefined, offset);
+    }
+    return this.readFileRange(virtualPath, offset, length, options);
+  }
 }
 
 /**
  * Multi-archive virtual file system mount table with RAGE-style override priority
- * (later mounts override earlier mounts by default).
+ * (later mounts override earlier mounts by default) and an O(1) normalized lowercase
+ * path lookup index.
  */
 class RpfVfsMountTable {
   constructor() {
     this._mounts = [];
+    this._sortedMounts = [];
+    this._pathIndex = new Map();
+    this._virtualDirIndex = new Map();
+    this._unindexedMounts = [];
     this._nextId = 1;
     this._nextOrder = 1;
+    this._stats = {
+      lookupHits: 0,
+      lookupMisses: 0,
+      compressedEntriesRead: 0,
+      rawEntriesRead: 0,
+      bytesRead: 0,
+    };
+    this._seedRootVirtualDir();
+  }
+
+  _seedRootVirtualDir() {
+    this._virtualDirIndex.set('', {
+      path: '',
+      name: '',
+      kind: 'directory',
+      isDirectory: true,
+      isFile: false,
+      virtual: true,
+    });
+  }
+
+  /**
+   * Returns sanitized numeric-only mount table lookup and read telemetry
+   * (zero filenames, mount prefixes, archive paths, or host paths).
+   *
+   * @returns {{
+   *   mountedArchives: number,
+   *   indexedEntries: number,
+   *   lookupHits: number,
+   *   lookupMisses: number,
+   *   compressedEntriesRead: number,
+   *   rawEntriesRead: number,
+   *   bytesRead: number
+   * }}
+   */
+  getStats() {
+    return {
+      mountedArchives: this._mounts.length,
+      indexedEntries: this._pathIndex.size,
+      lookupHits: this._stats.lookupHits,
+      lookupMisses: this._stats.lookupMisses,
+      compressedEntriesRead: this._stats.compressedEntriesRead,
+      rawEntriesRead: this._stats.rawEntriesRead,
+      bytesRead: this._stats.bytesRead,
+    };
+  }
+
+  resetStats() {
+    this._stats.lookupHits = 0;
+    this._stats.lookupMisses = 0;
+    this._stats.compressedEntriesRead = 0;
+    this._stats.rawEntriesRead = 0;
+    this._stats.bytesRead = 0;
+  }
+
+  _indexVirtualPrefix(mount) {
+    for (let i = 0; i < mount.prefixSegments.length; i += 1) {
+      const segPath = mount.prefixSegments.slice(0, i + 1).join('/');
+      const segKey = segPath.toLowerCase();
+      if (!this._virtualDirIndex.has(segKey)) {
+        this._virtualDirIndex.set(segKey, {
+          path: segPath,
+          name: mount.prefixSegments[i],
+          kind: 'directory',
+          isDirectory: true,
+          isFile: false,
+          virtual: true,
+        });
+      }
+    }
+  }
+
+  _indexMount(mount, overwrite = true) {
+    const vfs = mount.vfs;
+    if (vfs && vfs._nodesByKey instanceof Map) {
+      for (const [nodeKey, node] of vfs._nodesByKey.entries()) {
+        const fullKey = mount.prefixKey
+          ? nodeKey
+            ? `${mount.prefixKey}/${nodeKey}`
+            : mount.prefixKey
+          : nodeKey;
+        if (!overwrite && this._pathIndex.has(fullKey)) {
+          continue;
+        }
+        const fullPath = mount.prefix
+          ? node.path
+            ? `${mount.prefix}/${node.path}`
+            : mount.prefix
+          : node.path;
+        this._pathIndex.set(fullKey, {
+          mount,
+          mountId: mount.id,
+          mountPrefix: mount.prefix,
+          vfs,
+          archivePath: node.path,
+          archiveKey: nodeKey,
+          fullPath,
+          node,
+          stat: null,
+        });
+      }
+      return;
+    }
+
+    // Fallback indexing for custom duck-typed VFS instances without _nodesByKey.
+    try {
+      const rootStat = vfs.stat('');
+      if (!rootStat) {
+        this._unindexedMounts.push(mount);
+        return;
+      }
+      const visited = new Set(['']);
+      const queue = [{ archivePath: '', archiveKey: '', stat: rootStat }];
+      while (queue.length > 0) {
+        const item = queue.shift();
+        const fullKey = mount.prefixKey
+          ? item.archiveKey
+            ? `${mount.prefixKey}/${item.archiveKey}`
+            : mount.prefixKey
+          : item.archiveKey;
+        if (overwrite || !this._pathIndex.has(fullKey)) {
+          const fullPath = mount.prefix
+            ? item.archivePath
+              ? `${mount.prefix}/${item.archivePath}`
+              : mount.prefix
+            : item.archivePath;
+          this._pathIndex.set(fullKey, {
+            mount,
+            mountId: mount.id,
+            mountPrefix: mount.prefix,
+            vfs,
+            archivePath: item.archivePath,
+            archiveKey: item.archiveKey,
+            fullPath,
+            node: null,
+            stat: item.stat,
+          });
+        }
+        if (item.stat.isDirectory) {
+          const children = vfs.listDir(item.archivePath);
+          for (const child of children) {
+            const childNorm = normalizeVirtualPath(child.path);
+            if (visited.has(childNorm.key)) continue;
+            visited.add(childNorm.key);
+            queue.push({ archivePath: child.path, archiveKey: childNorm.key, stat: child });
+          }
+        }
+      }
+    } catch {
+      this._unindexedMounts.push(mount);
+    }
+  }
+
+  _rebuildIndex() {
+    this._pathIndex.clear();
+    this._virtualDirIndex.clear();
+    this._unindexedMounts = [];
+    this._seedRootVirtualDir();
+    this._sortedMounts = this._orderedMounts();
+    for (const m of this._sortedMounts) {
+      this._indexMount(m, false);
+      this._indexVirtualPrefix(m);
+    }
+  }
+
+  _buildMountedStat(indexed) {
+    if (indexed.node) {
+      return cloneNodeStat(indexed.node, indexed.fullPath, {
+        mountId: indexed.mountId,
+        mountPrefix: indexed.mountPrefix,
+      });
+    }
+    return Object.assign({}, indexed.stat, {
+      path: indexed.fullPath,
+      mountId: indexed.mountId,
+      mountPrefix: indexed.mountPrefix,
+    });
+  }
+
+  _getEntryMeta(indexed) {
+    if (indexed.node) {
+      const entry = indexed.node.entry;
+      return {
+        isFile: entry.kind === 'file',
+        isCompressed: Boolean(entry.isCompressed),
+        uncompressedSize: entry.uncompressedSize || 0,
+        storedSize: entry.storedSize || 0,
+      };
+    }
+    const st = indexed.stat;
+    return {
+      isFile: Boolean(st && st.isFile),
+      isCompressed: Boolean(st && st.isCompressed),
+      uncompressedSize: st && Number.isFinite(st.uncompressedSize) ? st.uncompressedSize : (st && st.size) || 0,
+      storedSize: st && Number.isFinite(st.storedSize) ? st.storedSize : (st && st.size) || 0,
+    };
+  }
+
+  _lookupEntry(norm) {
+    const indexed = this._pathIndex.get(norm.key);
+    if (indexed) {
+      return indexed;
+    }
+    if (this._unindexedMounts.length > 0) {
+      for (const m of this._unindexedMounts) {
+        const match = this._matchMount(m, norm.key, norm.path);
+        if (!match.matched) continue;
+        if (m.vfs.exists(match.relPath)) {
+          const st = m.vfs.stat(match.relPath);
+          const fullPath =
+            m.prefix && st.path ? `${m.prefix}/${st.path}` : m.prefix || st.path;
+          return {
+            mount: m,
+            mountId: m.id,
+            mountPrefix: m.prefix,
+            vfs: m.vfs,
+            archivePath: st.path,
+            archiveKey: match.relKey,
+            fullPath,
+            node: null,
+            stat: st,
+          };
+        }
+      }
+    }
+    return null;
   }
 
   mount(mountPrefix, vfs, options = {}) {
@@ -899,6 +1239,13 @@ class RpfVfsMountTable {
       order,
     };
     this._mounts.push(record);
+    this._sortedMounts = this._orderedMounts();
+    if (this._sortedMounts[0] === record) {
+      this._indexMount(record, true);
+      this._indexVirtualPrefix(record);
+    } else {
+      this._rebuildIndex();
+    }
     return {
       id: record.id,
       prefix: record.prefix,
@@ -907,10 +1254,17 @@ class RpfVfsMountTable {
     };
   }
 
-  unmount(idOrVfs) {
+  unmount(idOrVfs, options = {}) {
     const before = this._mounts.length;
     this._mounts = this._mounts.filter((m) => m.id !== idOrVfs && m.vfs !== idOrVfs);
-    return this._mounts.length !== before;
+    if (this._mounts.length === before) {
+      return false;
+    }
+    this._rebuildIndex();
+    if (this._mounts.length === 0 || (options && options.resetStats)) {
+      this.resetStats();
+    }
+    return true;
   }
 
   _orderedMounts() {
@@ -921,7 +1275,7 @@ class RpfVfsMountTable {
   }
 
   listMounts() {
-    return this._orderedMounts().map((m) => ({
+    return this._sortedMounts.map((m) => ({
       id: m.id,
       prefix: m.prefix,
       priority: m.priority,
@@ -949,40 +1303,24 @@ class RpfVfsMountTable {
   }
 
   _isVirtualPrefixDir(pathKey) {
-    if (pathKey === '') return true;
-    const prefixCheck = `${pathKey}/`;
-    for (const m of this._mounts) {
-      if (m.prefixKey === pathKey || m.prefixKey.startsWith(prefixCheck)) {
-        return true;
-      }
-    }
-    return false;
+    return this._virtualDirIndex.has(pathKey);
   }
 
   resolve(virtualPath) {
     const norm = normalizeVirtualPath(virtualPath);
-    const ordered = this._orderedMounts();
-    for (const m of ordered) {
-      const match = this._matchMount(m, norm.key, norm.path);
-      if (!match.matched) continue;
-      if (m.vfs.exists(match.relPath)) {
-        const st = m.vfs.stat(match.relPath);
-        const fullPath =
-          m.prefix && st.path ? `${m.prefix}/${st.path}` : m.prefix || st.path;
-        return {
-          mountId: m.id,
-          mountPrefix: m.prefix,
-          vfs: m.vfs,
-          archivePath: st.path,
-          stat: Object.assign({}, st, {
-            path: fullPath,
-            mountId: m.id,
-            mountPrefix: m.prefix,
-          }),
-        };
-      }
+    const indexed = this._lookupEntry(norm);
+    if (!indexed) {
+      this._stats.lookupMisses += 1;
+      return null;
     }
-    return null;
+    this._stats.lookupHits += 1;
+    return {
+      mountId: indexed.mountId,
+      mountPrefix: indexed.mountPrefix,
+      vfs: indexed.vfs,
+      archivePath: indexed.archivePath,
+      stat: this._buildMountedStat(indexed),
+    };
   }
 
   exists(virtualPath) {
@@ -990,40 +1328,65 @@ class RpfVfsMountTable {
     try {
       norm = normalizeVirtualPath(virtualPath);
     } catch {
+      this._stats.lookupMisses += 1;
       return false;
     }
-    if (this.resolve(norm.path) !== null) {
+    if (this._lookupEntry(norm) !== null || this._virtualDirIndex.has(norm.key)) {
+      this._stats.lookupHits += 1;
       return true;
     }
-    return this._isVirtualPrefixDir(norm.key);
+    this._stats.lookupMisses += 1;
+    return false;
   }
 
   stat(virtualPath) {
     const norm = normalizeVirtualPath(virtualPath);
-    const resolved = this.resolve(norm.path);
-    if (resolved) {
-      return resolved.stat;
+    const indexed = this._lookupEntry(norm);
+    if (indexed) {
+      this._stats.lookupHits += 1;
+      return this._buildMountedStat(indexed);
     }
-    if (this._isVirtualPrefixDir(norm.key)) {
-      const name = norm.segments.length > 0 ? norm.segments[norm.segments.length - 1] : '';
-      return {
-        path: norm.path,
-        name,
-        kind: 'directory',
-        isDirectory: true,
-        isFile: false,
-        virtual: true,
-      };
+    const virtualDir = this._virtualDirIndex.get(norm.key);
+    if (virtualDir) {
+      this._stats.lookupHits += 1;
+      return Object.assign({}, virtualDir);
     }
+    this._stats.lookupMisses += 1;
     return null;
+  }
+
+  open(virtualPath) {
+    const norm = normalizeVirtualPath(virtualPath);
+    const indexed = this._lookupEntry(norm);
+    if (!indexed) {
+      this._stats.lookupMisses += 1;
+      throw new RpfFormatError('PATH_NOT_FOUND', `File not found in mount table: ${virtualPath}`);
+    }
+    this._stats.lookupHits += 1;
+    const stat = this._buildMountedStat(indexed);
+    if (!stat.isFile) {
+      throw new RpfFormatError('NOT_A_FILE', `Path is a directory, not a file: ${virtualPath}`);
+    }
+    return {
+      path: stat.path,
+      name: stat.name,
+      size: stat.size,
+      mountId: indexed.mountId,
+      mountPrefix: indexed.mountPrefix,
+      archivePath: indexed.archivePath,
+      stat,
+      read: (offset = 0, length = undefined, options = {}) =>
+        this._readIndexedRange(indexed, offset, length, options),
+      readAll: (options = {}) => this._readIndexedRange(indexed, 0, undefined, options),
+    };
   }
 
   listDir(dirPath = '') {
     const norm = normalizeVirtualPath(dirPath);
-    const ordered = this._orderedMounts();
+    const ordered = this._sortedMounts;
 
-    const winning = this.resolve(norm.path);
-    if (winning && winning.stat.isFile) {
+    const winning = this._lookupEntry(norm);
+    if (winning && this._getEntryMeta(winning).isFile) {
       throw new RpfFormatError('NOT_A_DIRECTORY', `Path is not a directory: ${dirPath}`);
     }
 
@@ -1034,12 +1397,25 @@ class RpfVfsMountTable {
     // priority mounts win on name collisions.
     for (const m of ordered) {
       const match = this._matchMount(m, norm.key, norm.path);
-      if (match.matched && m.vfs.exists(match.relPath)) {
-        const st = m.vfs.stat(match.relPath);
-        if (st && st.isDirectory) {
-          foundAnyDir = true;
-          const entries = m.vfs.listDir(match.relPath);
-          for (const entry of entries) {
+      if (match.matched) {
+        let dirEntries = null;
+        if (m.vfs._nodesByKey instanceof Map && m.vfs._childrenByDirKey instanceof Map) {
+          const dirNode = m.vfs._nodesByKey.get(match.relKey);
+          if (dirNode && dirNode.entry.kind === 'directory') {
+            foundAnyDir = true;
+            const children = m.vfs._childrenByDirKey.get(dirNode.key) || [];
+            dirEntries = children.map((child) => cloneNodeStat(child));
+          }
+        } else if (m.vfs.exists(match.relPath)) {
+          const st = m.vfs.stat(match.relPath);
+          if (st && st.isDirectory) {
+            foundAnyDir = true;
+            dirEntries = m.vfs.listDir(match.relPath);
+          }
+        }
+
+        if (dirEntries) {
+          for (const entry of dirEntries) {
             const nameKey = entry.name.toLowerCase();
             if (!byNameKey.has(nameKey)) {
               const fullPath =
@@ -1094,19 +1470,59 @@ class RpfVfsMountTable {
     );
   }
 
+  async _readIndexedRange(indexed, offset = 0, length = undefined, options = {}) {
+    const meta = this._getEntryMeta(indexed);
+    const readRaw = Boolean(options && options.raw);
+    const isCompressedRead = meta.isCompressed && !readRaw;
+    const effectiveSize = isCompressedRead
+      ? meta.uncompressedSize
+      : readRaw
+        ? meta.storedSize
+        : meta.uncompressedSize;
+
+    const useDirectNode =
+      indexed.node &&
+      typeof indexed.vfs._readNodeRange === 'function' &&
+      indexed.vfs.readFileRange === RpfArchiveVfs.prototype.readFileRange;
+
+    const bytes = useDirectNode
+      ? await indexed.vfs._readNodeRange(indexed.node, offset, length, options)
+      : await indexed.vfs.readFileRange(indexed.archivePath, offset, length, options);
+
+    if (offset < effectiveSize && length !== 0) {
+      if (isCompressedRead) {
+        this._stats.compressedEntriesRead += 1;
+      } else {
+        this._stats.rawEntriesRead += 1;
+      }
+      this._stats.bytesRead += bytes.byteLength;
+    }
+    return bytes;
+  }
+
   async readFileRange(virtualPath, offset = 0, length = undefined, options = {}) {
-    const resolved = this.resolve(virtualPath);
-    if (!resolved) {
+    const norm = normalizeVirtualPath(virtualPath);
+    const indexed = this._lookupEntry(norm);
+    if (!indexed) {
+      this._stats.lookupMisses += 1;
       throw new RpfFormatError('PATH_NOT_FOUND', `File not found in mount table: ${virtualPath}`);
     }
-    if (!resolved.stat.isFile) {
+    this._stats.lookupHits += 1;
+    if (!this._getEntryMeta(indexed).isFile) {
       throw new RpfFormatError('NOT_A_FILE', `Path is a directory, not a file: ${virtualPath}`);
     }
-    return resolved.vfs.readFileRange(resolved.archivePath, offset, length, options);
+    return this._readIndexedRange(indexed, offset, length, options);
   }
 
   async readFile(virtualPath, options = {}) {
     return this.readFileRange(virtualPath, 0, undefined, options);
+  }
+
+  async readEntry(virtualPath, offset = 0, length = undefined, options = {}) {
+    if (offset !== null && typeof offset === 'object') {
+      return this.readFileRange(virtualPath, 0, undefined, offset);
+    }
+    return this.readFileRange(virtualPath, offset, length, options);
   }
 }
 
