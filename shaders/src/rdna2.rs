@@ -1106,6 +1106,21 @@ pub(crate) const fn vop2_is_madk(op: u8) -> bool {
     matches!(op, 0x20 | 0x21 | 0x2C | 0x2D | 0x37 | 0x38)
 }
 
+/// Whether a VOP3 opcode is a GFX10.3 16-bit parameter interpolation instruction
+/// (`v_interp_p1ll_f16`, `v_interp_p1lv_f16`, `v_interp_p2_f16`).
+pub(crate) const fn vop3_is_interp_f16(op: u16) -> bool {
+    matches!(op, 0x342 | 0x343 | 0x35A)
+}
+
+/// Decode the 9-bit `src0` bitfield of GFX10.3 VOP3 `v_interp_*_f16` instructions:
+/// `(attr: bits[5:0], attrchan: bits[7:6], high: bit[8])`.
+pub(crate) const fn decode_vop3_interp_attr(src0: u16) -> (u8, u8, bool) {
+    let attr = (src0 & 0x3F) as u8;
+    let attrchan = ((src0 >> 6) & 0x3) as u8;
+    let high = ((src0 >> 8) & 0x1) != 0;
+    (attr, attrchan, high)
+}
+
 fn vop3_info(op: u16) -> (String, u8, bool) {
     // Returns (mnemonic, num_srcs, is_vop3b)
     match op {
@@ -1173,11 +1188,14 @@ fn vop3_info(op: u16) -> (String, u8, bool) {
         0x310 => ("v_sub_co_u32".to_string(), 2, true),
         0x319 => ("v_subrev_co_u32".to_string(), 2, true),
         0x340 => ("v_mad_u16".to_string(), 3, false),
+        0x342 => ("v_interp_p1ll_f16".to_string(), 2, false),
+        0x343 => ("v_interp_p1lv_f16".to_string(), 3, false),
         0x344 => ("v_perm_b32".to_string(), 3, false),
         0x345 => ("v_xad_u32".to_string(), 3, false),
         0x346 => ("v_lshl_add_u32".to_string(), 3, false),
         0x347 => ("v_add_lshl_u32".to_string(), 3, false),
         0x34B => ("v_fma_f16".to_string(), 3, false),
+        0x35A => ("v_interp_p2_f16".to_string(), 3, false),
         0x35E => ("v_mad_i16".to_string(), 3, false),
         0x360 => ("v_readlane_b32".to_string(), 2, false),
         0x361 => ("v_writelane_b32".to_string(), 2, false),
@@ -1822,7 +1840,8 @@ fn decode_vopc(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
     };
 
     let mnemonic = vopc_mnemonic(op);
-    let operands = format!("vcc, {}, v{vsrc1}", format_src_operand(src0, literal));
+    let dst = if (op & 0x10) != 0 { "exec" } else { "vcc" };
+    let operands = format!("{dst}, {}, v{vsrc1}", format_src_operand(src0, literal));
 
     Rdna2Instruction {
         offset,
@@ -1933,8 +1952,9 @@ fn decode_vop3(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
     let src1 = ((w1 >> 9) & 0x1FF) as u16;
     let src0 = (w1 & 0x1FF) as u16;
 
+    let is_interp_f16 = vop3_is_interp_f16(op);
     let uses_lit = !truncated
-        && (src0 == 0xFF
+        && ((!is_interp_f16 && src0 == 0xFF)
             || (num_srcs >= 2 && src1 == 0xFF)
             || (num_srcs >= 3 && src2 == 0xFF));
     let literal = if uses_lit {
@@ -1965,15 +1985,37 @@ fn decode_vop3(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
     };
 
     if !truncated {
-        let s0 = format_vop3_src(src0, literal, (abs & 1) != 0, (neg & 1) != 0);
-        let _ = write!(operands, ", {s0}");
-        if num_srcs >= 2 {
+        if is_interp_f16 {
+            let (attr, attrchan, high) = decode_vop3_interp_attr(src0);
+            let chan = match attrchan {
+                0 => 'x',
+                1 => 'y',
+                2 => 'z',
+                _ => 'w',
+            };
             let s1 = format_vop3_src(src1, literal, (abs & 2) != 0, (neg & 2) != 0);
-            let _ = write!(operands, ", {s1}");
-        }
-        if num_srcs >= 3 {
-            let s2 = format_vop3_src(src2, literal, (abs & 4) != 0, (neg & 4) != 0);
-            let _ = write!(operands, ", {s2}");
+            let _ = write!(operands, ", {s1}, attr{attr}.{chan}");
+            if num_srcs >= 3 {
+                let s2 = format_vop3_src(src2, literal, (abs & 4) != 0, (neg & 4) != 0);
+                let _ = write!(operands, ", {s2}");
+            }
+            if high {
+                operands.push_str(" high");
+            }
+            if op == 0x35A && (op_sel & 0x8) != 0 {
+                operands.push_str(" op_sel:[0,0,0,1]");
+            }
+        } else {
+            let s0 = format_vop3_src(src0, literal, (abs & 1) != 0, (neg & 1) != 0);
+            let _ = write!(operands, ", {s0}");
+            if num_srcs >= 2 {
+                let s1 = format_vop3_src(src1, literal, (abs & 2) != 0, (neg & 2) != 0);
+                let _ = write!(operands, ", {s1}");
+            }
+            if num_srcs >= 3 {
+                let s2 = format_vop3_src(src2, literal, (abs & 4) != 0, (neg & 4) != 0);
+                let _ = write!(operands, ", {s2}");
+            }
         }
         if clamp {
             operands.push_str(" clamp");
@@ -3002,16 +3044,25 @@ pub fn analyze_instructions(
                 ..
             } => {
                 let (_, num_srcs, _) = vop3_info(*op);
+                let is_interp_f16 = vop3_is_interp_f16(*op);
+                if is_interp_f16 {
+                    has_vintrp = true;
+                }
                 if *op <= 0xFF || *op == 0x360 {
                     record_sgpr(&mut max_sgpr, *vdst & 0x7F);
                 } else {
                     record_vgpr(&mut max_vgpr, *vdst);
+                    if matches!(*op, 0x2FF..=0x301 | 0x364..=0x368) && *vdst < 255 {
+                        record_vgpr(&mut max_vgpr, *vdst + 1);
+                    }
                 }
                 if let Some(sd) = sdst {
                     record_sgpr(&mut max_sgpr, *sd);
                 }
                 if !inst.truncated {
-                    record_src_reg(&mut max_sgpr, &mut max_vgpr, *src0);
+                    if !is_interp_f16 {
+                        record_src_reg(&mut max_sgpr, &mut max_vgpr, *src0);
+                    }
                     if num_srcs >= 2 {
                         record_src_reg(&mut max_sgpr, &mut max_vgpr, *src1);
                     }
@@ -4575,5 +4626,156 @@ mod tests {
                 .to_json()
                 .contains("\"code_start_offset\": 0,")
         );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enc_vop3_opsel(
+        op: u16,
+        vdst: u8,
+        src0: u16,
+        src1: u16,
+        src2: u16,
+        op_sel: u8,
+        clamp: bool,
+        omod: u8,
+    ) -> [u32; 2] {
+        let w0 = (0b110101u32 << 26)
+            | (u32::from(op & 0x3FF) << 16)
+            | (u32::from(clamp) << 15)
+            | (u32::from(op_sel & 0xF) << 11)
+            | u32::from(vdst);
+        let w1 = (u32::from(omod & 0x3) << 27)
+            | (u32::from(src2 & 0x1FF) << 18)
+            | (u32::from(src1 & 0x1FF) << 9)
+            | u32::from(src0 & 0x1FF);
+        [w0, w1]
+    }
+
+    #[test]
+    fn decodes_vop3_f16_interp_opcodes_and_infers_pixel_stage() {
+        let mut words = Vec::new();
+        // Real GFX10.3 pattern: src0 = (high=1 << 8) | (chan=0 << 6) | (attr=1) = 0x101
+        let attr1_x_hi: u16 = (1 << 8) | (0 << 6) | 1;
+        // v_interp_p1ll_f16 v15, v0, attr1.x high (op 0x342)
+        words.extend_from_slice(&enc_vop3_opsel(
+            0x342,
+            15,
+            attr1_x_hi,
+            256 + 0,
+            0,
+            0,
+            false,
+            0,
+        ));
+        // v_interp_p2_f16 v16, v1, attr1.x, v15 high (op 0x35a, op_sel=0 -> lo half)
+        words.extend_from_slice(&enc_vop3_opsel(
+            0x35A,
+            16,
+            attr1_x_hi,
+            256 + 1,
+            256 + 15,
+            0,
+            false,
+            0,
+        ));
+        // v_interp_p2_f16 v16, v1, attr2.z, v15 op_sel:[0,0,0,1] clamp (high dst half)
+        let attr2_z_lo: u16 = (2 << 6) | 2;
+        words.extend_from_slice(&enc_vop3_opsel(
+            0x35A,
+            16,
+            attr2_z_lo,
+            256 + 1,
+            256 + 15,
+            0b1000,
+            true,
+            0,
+        ));
+        // Edge case: attr=63, chan=3 (.w), high=0 => src0 = 0xFF MUST NOT consume a literal word!
+        let attr63_w_lo: u16 = (3 << 6) | 63;
+        assert_eq!(attr63_w_lo, 0xFF);
+        words.extend_from_slice(&enc_vop3_opsel(
+            0x343,
+            17,
+            attr63_w_lo,
+            256 + 0,
+            256 + 2,
+            0,
+            false,
+            0,
+        ));
+        words.push(enc_sopp(0x01, 0));
+
+        let bytes = words_to_bytes(&words);
+        let insts = decode_program(&bytes);
+        assert_eq!(insts.len(), 5);
+        assert_eq!(insts[0].size, 8);
+        assert_eq!(insts[0].mnemonic, "v_interp_p1ll_f16");
+        assert_eq!(insts[0].format_text(), "v_interp_p1ll_f16 v15, v0, attr1.x high");
+        assert_eq!(insts[1].size, 8);
+        assert_eq!(insts[1].mnemonic, "v_interp_p2_f16");
+        assert_eq!(
+            insts[1].format_text(),
+            "v_interp_p2_f16 v16, v1, attr1.x, v15 high"
+        );
+        assert_eq!(insts[2].size, 8);
+        assert_eq!(
+            insts[2].format_text(),
+            "v_interp_p2_f16 v16, v1, attr2.z, v15 op_sel:[0,0,0,1] clamp"
+        );
+        assert_eq!(insts[3].size, 8, "src0 == 0xFF in interp must not consume literal");
+        assert!(!insts[3].truncated);
+        assert_eq!(insts[3].mnemonic, "v_interp_p1lv_f16");
+        assert_eq!(
+            insts[3].format_text(),
+            "v_interp_p1lv_f16 v17, v0, attr63.w, v2"
+        );
+        assert_eq!(insts[4].mnemonic, "s_endpgm");
+
+        let summary = analyze_program(&bytes);
+        assert!(summary.has_vintrp);
+        assert_eq!(summary.inferred_stage, Rdna2InferredStage::Pixel);
+        assert_eq!(summary.max_sgpr, None, "attr in src0 must not fabricate SGPR usage");
+        assert_eq!(summary.max_vgpr, Some(17));
+        assert_eq!(summary.truncated_instructions, 0);
+    }
+
+    #[test]
+    fn decodes_s38_cmpx_ieee_compares_round_mode_get_lod_and_alu_ops() {
+        let mut words = Vec::new();
+        words.push(enc_sopp(0x24, 0x0000)); // s_round_mode
+        words.push(enc_vopc(0x0E, 256 + 1, 2)); // v_cmp_nlt_f32 vcc, v1, v2
+        words.push(enc_vopc(0x1E, 256 + 1, 2)); // v_cmpx_nlt_f32 exec, v1, v2
+        words.push(enc_vopc(0x19, 256 + 1, 2)); // v_cmpx_nge_f32 exec, v1, v2
+        words.push(enc_vopc(0x1B, 256 + 1, 2)); // v_cmpx_ngt_f32 exec, v1, v2
+        words.push(enc_vopc(0x1A, 256 + 1, 2)); // v_cmpx_nlg_f32 exec, v1, v2
+        words.extend_from_slice(&enc_vop3(0x01E, 126, 256 + 1, 256 + 2, 0, false, 0, 0, 0)); // v_cmpx_nlt_f32 exec_lo, v1, v2
+        words.extend_from_slice(&enc_mimg(0x60, 0x3, 1, 2, 4, 2, 1)); // image_get_lod
+        words.extend_from_slice(&enc_vop3(0x364, 10, 256 + 4, 256 + 6, 0, false, 0, 0, 0)); // v_add_f64 v10..11
+        words.push(enc_sop1(0x15, 2, 3)); // s_flbit_i32_b32 s2, s3
+        words.push(enc_sop1(0x1D, 4, 128 + 5)); // s_bitset1_b32 s4, 5
+        words.push(enc_sopk(0x03, 4, 32)); // s_cmpk_eq_i32 s4, 32
+        words.extend_from_slice(&enc_vop3(0x15E, 8, 256 + 1, 128 + 2, 256 + 3, false, 0, 0, 0)); // v_cvt_pk_u8_f32
+        words.push(enc_sopp(0x01, 0));
+
+        let bytes = words_to_bytes(&words);
+        let insts = decode_program(&bytes);
+        assert_eq!(insts.len(), 14);
+        assert_eq!(insts[0].mnemonic, "s_round_mode");
+        assert_eq!(insts[1].format_text(), "v_cmp_nlt_f32 vcc, v1, v2");
+        assert_eq!(insts[2].format_text(), "v_cmpx_nlt_f32 exec, v1, v2");
+        assert_eq!(insts[3].format_text(), "v_cmpx_nge_f32 exec, v1, v2");
+        assert_eq!(insts[4].format_text(), "v_cmpx_ngt_f32 exec, v1, v2");
+        assert_eq!(insts[5].format_text(), "v_cmpx_nlg_f32 exec, v1, v2");
+        assert_eq!(insts[6].format_text(), "v_cmpx_nlt_f32 exec_lo, v1, v2");
+        assert_eq!(insts[7].mnemonic, "image_get_lod");
+        assert_eq!(insts[8].mnemonic, "v_add_f64");
+        assert_eq!(insts[9].format_text(), "s_flbit_i32_b32 s2, s3");
+        assert_eq!(insts[10].format_text(), "s_bitset1_b32 s4, 5");
+        assert_eq!(insts[11].format_text(), "s_cmpk_eq_i32 s4, 32");
+        assert_eq!(insts[12].format_text(), "v_cvt_pk_u8_f32 v8, v1, 2, v3");
+
+        let summary = analyze_program(&bytes);
+        assert_eq!(summary.max_vgpr, Some(11), "v_add_f64 writes v[10:11]");
+        assert_eq!(summary.truncated_instructions, 0);
     }
 }
