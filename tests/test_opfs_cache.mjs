@@ -6,6 +6,7 @@ import {
   DEFAULT_INDEX_FILENAME,
   DEFAULT_INDEX_FLUSH_DELAY_MS,
   DEFAULT_MAX_BYTES,
+  DEFAULT_MAX_OPEN_SYNC_HANDLES,
   DEFAULT_MAX_PENDING_WRITES,
   DEFAULT_MAX_WRITE_CONCURRENCY,
   DEFAULT_OPFS_CACHE_DIR,
@@ -889,4 +890,577 @@ test('W262: putBackground provides non-blocking bounded write-through and degrad
   }
 
   await cache.close();
+});
+
+// --- W313: Web Worker FileSystemSyncAccessHandle fast path, bounded handle pool & cleanup ---
+
+function createSyncMockOpfsDirHandle(name = '', initialEntries = null, opts = {}, sharedState = null, prefix = '') {
+  const state = sharedState || {
+    activeOpenHandles: new Set(),
+    openHandlesByPath: new Map(),
+    totalOpenedHandles: 0,
+    totalClosedHandles: 0,
+    truncateCalls: 0,
+    writeCalls: 0,
+    flushCalls: 0,
+    readCalls: 0,
+    getSizeCalls: 0,
+    createWritableCalls: 0,
+    getFileCalls: 0,
+    nextHandleId: 1,
+    enforceLocks: opts.enforceLocks !== false,
+  };
+  const entries = new Map();
+  const writeCounts = new Map();
+  let totalWrites = 0;
+
+  if (initialEntries) {
+    for (const [k, v] of Object.entries(initialEntries)) {
+      entries.set(k, v instanceof Uint8Array ? v.slice() : v);
+    }
+  }
+
+  const relPathFor = (leaf) => (prefix ? `${prefix}/${leaf}` : leaf);
+
+  const hasOpenHandleUnder = (targetPrefix) => {
+    for (const openPath of state.openHandlesByPath.keys()) {
+      if (openPath === targetPrefix || openPath.startsWith(`${targetPrefix}/`)) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const handle = {
+    kind: 'directory',
+    name,
+    _entries: entries,
+    _writeCounts: writeCounts,
+    _syncState: state,
+    get totalWrites() {
+      return totalWrites;
+    },
+    getWriteCount(fileName) {
+      return writeCounts.get(fileName) || 0;
+    },
+    async getDirectoryHandle(dirName, dirOpts = {}) {
+      const existing = entries.get(dirName);
+      if (existing && existing.kind === 'directory') {
+        return existing;
+      }
+      if (!dirOpts.create) {
+        const err = new Error(`NotFoundError: ${dirName}`);
+        err.name = 'NotFoundError';
+        throw err;
+      }
+      const childPrefix = relPathFor(dirName);
+      const child = createSyncMockOpfsDirHandle(dirName, null, opts, state, childPrefix);
+      entries.set(dirName, child);
+      return child;
+    },
+    async getFileHandle(fileName, fileOpts = {}) {
+      if (!entries.has(fileName)) {
+        if (!fileOpts.create) {
+          const err = new Error(`NotFoundError: ${fileName}`);
+          err.name = 'NotFoundError';
+          throw err;
+        }
+        entries.set(fileName, new Uint8Array(0));
+      }
+      const relPath = relPathFor(fileName);
+      const fileHandle = {
+        kind: 'file',
+        name: fileName,
+        async getFile() {
+          state.getFileCalls += 1;
+          const data = entries.get(fileName);
+          if (!data || data.kind === 'directory') {
+            const err = new Error(`NotFoundError: ${fileName}`);
+            err.name = 'NotFoundError';
+            throw err;
+          }
+          return {
+            size: data.byteLength,
+            lastModified: 1000,
+            async arrayBuffer() {
+              return data.slice().buffer;
+            },
+          };
+        },
+        async createWritable() {
+          state.createWritableCalls += 1;
+          let pending = new Uint8Array(0);
+          return {
+            async write(chunk) {
+              if (typeof opts.onBeforeWrite === 'function') {
+                await opts.onBeforeWrite(relPath, chunk);
+              }
+              pending =
+                chunk instanceof Uint8Array
+                  ? chunk.slice()
+                  : chunk instanceof ArrayBuffer
+                    ? new Uint8Array(chunk.slice(0))
+                    : new TextEncoder().encode(String(chunk));
+            },
+            async close() {
+              entries.set(fileName, pending);
+              totalWrites += 1;
+              writeCounts.set(fileName, (writeCounts.get(fileName) || 0) + 1);
+            },
+            async abort() {
+              pending = new Uint8Array(0);
+            },
+          };
+        },
+      };
+
+      if (opts.exposeSyncAccessHandle !== false) {
+        fileHandle.createSyncAccessHandle = async () => {
+          if (typeof opts.onCreateSyncAccessHandle === 'function') {
+            await opts.onCreateSyncAccessHandle(relPath);
+          }
+          if (state.enforceLocks && state.openHandlesByPath.has(relPath)) {
+            const err = new Error(`NoModificationAllowedError: handle already open for ${relPath}`);
+            err.name = 'NoModificationAllowedError';
+            throw err;
+          }
+          const id = state.nextHandleId;
+          state.nextHandleId += 1;
+          let closed = false;
+          let buffer =
+            entries.get(fileName) instanceof Uint8Array
+              ? entries.get(fileName).slice()
+              : new Uint8Array(0);
+
+          state.activeOpenHandles.add(id);
+          state.openHandlesByPath.set(relPath, id);
+          state.totalOpenedHandles += 1;
+
+          const ensureOpen = () => {
+            if (closed) {
+              const err = new Error(`InvalidStateError: SyncAccessHandle ${id} is closed`);
+              err.name = 'InvalidStateError';
+              throw err;
+            }
+          };
+
+          return {
+            getSize() {
+              ensureOpen();
+              state.getSizeCalls += 1;
+              return buffer.byteLength;
+            },
+            truncate(newSize) {
+              ensureOpen();
+              state.truncateCalls += 1;
+              const target = Math.max(0, Math.floor(newSize));
+              if (target === buffer.byteLength) return;
+              const next = new Uint8Array(target);
+              next.set(buffer.subarray(0, Math.min(target, buffer.byteLength)), 0);
+              buffer = next;
+            },
+            write(view, writeOpts = {}) {
+              ensureOpen();
+              state.writeCalls += 1;
+              const bytes =
+                view instanceof Uint8Array
+                  ? view
+                  : ArrayBuffer.isView(view)
+                    ? new Uint8Array(view.buffer, view.byteOffset, view.byteLength)
+                    : new Uint8Array(view);
+              if (typeof opts.onSyncWrite === 'function') {
+                opts.onSyncWrite(relPath, bytes);
+              }
+              const at = typeof writeOpts.at === 'number' && writeOpts.at >= 0 ? Math.floor(writeOpts.at) : 0;
+              const end = at + bytes.byteLength;
+              if (end > buffer.byteLength) {
+                const grown = new Uint8Array(end);
+                grown.set(buffer, 0);
+                buffer = grown;
+              }
+              buffer.set(bytes, at);
+              return bytes.byteLength;
+            },
+            read(view, readOpts = {}) {
+              ensureOpen();
+              state.readCalls += 1;
+              if (typeof opts.onSyncRead === 'function') {
+                opts.onSyncRead(relPath);
+              }
+              const target =
+                view instanceof Uint8Array
+                  ? view
+                  : ArrayBuffer.isView(view)
+                    ? new Uint8Array(view.buffer, view.byteOffset, view.byteLength)
+                    : new Uint8Array(view);
+              const at = typeof readOpts.at === 'number' && readOpts.at >= 0 ? Math.floor(readOpts.at) : 0;
+              if (at >= buffer.byteLength) {
+                return 0;
+              }
+              const toCopy = Math.min(target.byteLength, buffer.byteLength - at);
+              target.set(buffer.subarray(at, at + toCopy), 0);
+              return toCopy;
+            },
+            flush() {
+              ensureOpen();
+              state.flushCalls += 1;
+              entries.set(fileName, buffer.slice());
+              totalWrites += 1;
+              writeCounts.set(fileName, (writeCounts.get(fileName) || 0) + 1);
+            },
+            close() {
+              if (closed) return;
+              closed = true;
+              state.activeOpenHandles.delete(id);
+              if (state.openHandlesByPath.get(relPath) === id) {
+                state.openHandlesByPath.delete(relPath);
+              }
+              state.totalClosedHandles += 1;
+            },
+          };
+        };
+      }
+
+      return fileHandle;
+    },
+    async *entries() {
+      for (const [entryName, value] of entries.entries()) {
+        if (value && value.kind === 'directory') {
+          yield [entryName, value];
+        } else {
+          yield [
+            entryName,
+            {
+              kind: 'file',
+              name: entryName,
+              async getFile() {
+                return {
+                  size: value.byteLength,
+                  lastModified: 1000,
+                  async arrayBuffer() {
+                    return value.slice().buffer;
+                  },
+                };
+              },
+            },
+          ];
+        }
+      }
+    },
+    async removeEntry(entryName, removeOpts = {}) {
+      if (!entries.has(entryName)) {
+        const err = new Error(`NotFoundError: ${entryName}`);
+        err.name = 'NotFoundError';
+        throw err;
+      }
+      const relPath = relPathFor(entryName);
+      if (state.enforceLocks && hasOpenHandleUnder(relPath)) {
+        const err = new Error(`NoModificationAllowedError: cannot remove ${relPath} while SyncAccessHandle is open`);
+        err.name = 'NoModificationAllowedError';
+        throw err;
+      }
+      const target = entries.get(entryName);
+      if (target && target.kind === 'directory' && target._entries.size > 0 && !removeOpts.recursive) {
+        const err = new Error(`InvalidModificationError: ${entryName} is not empty`);
+        err.name = 'InvalidModificationError';
+        throw err;
+      }
+      entries.delete(entryName);
+    },
+  };
+
+  return handle;
+}
+
+test('W313: SyncAccessHandle fast path provides read/write parity, overwrite truncation, warm reload, and sanitized telemetry', async () => {
+  assert.equal(DEFAULT_MAX_OPEN_SYNC_HANDLES, 8);
+
+  const cacheDir = createSyncMockOpfsDirHandle(DEFAULT_OPFS_CACHE_DIR);
+  const opfsRoot = createMockOpfsDirHandle('', { [DEFAULT_OPFS_CACHE_DIR]: cacheDir });
+  const syncState = cacheDir._syncState;
+
+  const cache = new OpfsChunkCache({
+    opfsRoot,
+    indexFlushDelayMs: 0,
+  });
+
+  const payloadA = makePatternBytes(256, 11);
+  const payloadB = makePatternBytes(128, 22);
+  const payloadAShrunk = makePatternBytes(40, 33);
+  const emptyPayload = new Uint8Array(0);
+
+  await cache.put('chunks/a.bin', payloadA, { fileFingerprint: 'fp-a-1' });
+  await cache.put('chunks/b.bin', payloadB, { fileFingerprint: 'fp-b-1' });
+  await cache.put('chunks/empty.bin', emptyPayload);
+
+  // Overwriting a larger chunk with a smaller payload must truncate cleanly via truncate(0).
+  await cache.put('chunks/a.bin', payloadAShrunk, { fileFingerprint: 'fp-a-2' });
+
+  assert.equal(syncState.createWritableCalls, 0, 'SyncAccessHandle fast path should bypass createWritable()');
+  assert.equal(syncState.getFileCalls, 0, 'SyncAccessHandle fast path should bypass getFile()');
+  assert.ok(syncState.truncateCalls >= 4);
+  assert.ok(syncState.flushCalls >= 4);
+
+  const gotA = await cache.get('chunks/a.bin', { fileFingerprint: 'fp-a-2' });
+  const gotB = await cache.get('chunks/b.bin', { fileFingerprint: 'fp-b-1' });
+  const gotEmpty = await cache.get('chunks/empty.bin');
+  assert.deepEqual(gotA, payloadAShrunk);
+  assert.deepEqual(gotB, payloadB);
+  assert.deepEqual(gotEmpty, emptyPayload);
+  assert.equal(syncState.getFileCalls, 0);
+
+  const stats = cache.getStats();
+  assert.ok(stats.syncHandleWrites >= 4);
+  assert.equal(stats.syncHandleReads, 3);
+  assert.equal(stats.syncHandleFallbacks, 0);
+  assert.ok(stats.openSyncHandles > 0 && stats.openSyncHandles <= DEFAULT_MAX_OPEN_SYNC_HANDLES);
+  assert.equal(stats.openSyncHandles, syncState.activeOpenHandles.size);
+
+  // Verify every telemetry field remains a strictly sanitized primitive.
+  for (const [k, v] of Object.entries(stats)) {
+    assert.ok(
+      typeof v === 'number' || typeof v === 'boolean' || v === null,
+      `telemetry field ${k} must be primitive number/boolean/null, got ${typeof v}`
+    );
+  }
+
+  // Closing the cache must flush and release every open SyncAccessHandle (zero leaks).
+  await cache.close();
+  assert.equal(cache.getStats().openSyncHandles, 0);
+  assert.equal(syncState.activeOpenHandles.size, 0, 'Expected zero leaked SyncAccessHandles after close()');
+  assert.equal(syncState.totalClosedHandles, syncState.totalOpenedHandles);
+
+  // Warm reload in a brand-new OpfsChunkCache reads persisted index & chunks via SyncAccessHandle.
+  const warmCache = new OpfsChunkCache({ opfsRoot, indexFlushDelayMs: 0 });
+  const initRes = await warmCache.init();
+  assert.equal(initRes.loadedFromIndex, true);
+  assert.equal(initRes.entryCount, 3);
+  const warmA = await warmCache.getEntry('chunks/a.bin', { fileFingerprint: 'fp-a-2' });
+  assert.equal(warmA.hit, true);
+  assert.deepEqual(warmA.data, payloadAShrunk);
+  assert.ok(warmCache.getStats().syncHandleReads >= 2); // index read + chunk read
+
+  await warmCache.destroy();
+  assert.equal(warmCache.getStats().openSyncHandles, 0);
+  assert.equal(syncState.activeOpenHandles.size, 0, 'Expected zero leaked SyncAccessHandles after destroy()');
+  assert.equal(syncState.totalClosedHandles, syncState.totalOpenedHandles);
+});
+
+test('W313: bounded SyncAccessHandle LRU pool evicts cleanly, releases handles on delete/evict/clear, and supports non-pooled mode', async () => {
+  const cacheDir = createSyncMockOpfsDirHandle(DEFAULT_OPFS_CACHE_DIR, null, { enforceLocks: true });
+  const opfsRoot = createMockOpfsDirHandle('', { [DEFAULT_OPFS_CACHE_DIR]: cacheDir });
+  const syncState = cacheDir._syncState;
+
+  const cache = new OpfsChunkCache({
+    opfsRoot,
+    maxBytes: 256,
+    maxOpenSyncHandles: 2,
+    indexFlushDelayMs: 50,
+  });
+
+  // Writing 4 chunks with maxOpenSyncHandles=2 must strictly cap open handles at 2.
+  for (let i = 0; i < 4; i += 1) {
+    await cache.put(`k${i}.bin`, makePatternBytes(64, i), { fileFingerprint: `fp-${i}` });
+    assert.ok(
+      cache.getStats().openSyncHandles <= 2,
+      `openSyncHandles exceeded cap: ${cache.getStats().openSyncHandles}`
+    );
+    assert.ok(
+      syncState.activeOpenHandles.size <= 2,
+      `active mock handles exceeded cap: ${syncState.activeOpenHandles.size}`
+    );
+  }
+
+  // Deleting an entry whose handle is currently open in the pool must close it before removeEntry().
+  assert.equal(await cache.delete('k3.bin'), true);
+  assert.equal(cache.has('k3.bin'), false);
+
+  // Triggering LRU budget eviction must close handles on victims before removeEntry().
+  await cache.put('k4.bin', makePatternBytes(128, 4), { fileFingerprint: 'fp-4' });
+  assert.ok(cache.getStats().evictions >= 1);
+
+  // Explicit closeAllHandles() releases every pooled handle synchronously.
+  const closedCount = cache.closeAllHandles();
+  assert.ok(closedCount >= 1);
+  assert.equal(cache.getStats().openSyncHandles, 0);
+  assert.equal(syncState.activeOpenHandles.size, 0);
+
+  // Clearing the cache with active handles closes all handles before removing files.
+  await cache.get('k4.bin');
+  assert.equal(cache.getStats().openSyncHandles, 1);
+  await cache.clear();
+  assert.equal(cache.getStats().openSyncHandles, 0);
+  assert.equal(syncState.activeOpenHandles.size, 0);
+  await cache.close();
+  assert.equal(syncState.totalClosedHandles, syncState.totalOpenedHandles);
+
+  // Non-pooled mode (maxOpenSyncHandles: 0) closes every handle immediately in finally.
+  const nonPooled = new OpfsChunkCache({
+    opfsRoot,
+    maxOpenSyncHandles: 0,
+    indexFlushDelayMs: 0,
+  });
+  await nonPooled.put('ephemeral.bin', makePatternBytes(48, 7));
+  assert.equal(nonPooled.getStats().openSyncHandles, 0);
+  assert.equal(syncState.activeOpenHandles.size, 0);
+  const got = await nonPooled.get('ephemeral.bin');
+  assert.deepEqual(got, makePatternBytes(48, 7));
+  assert.equal(nonPooled.getStats().openSyncHandles, 0);
+  assert.equal(syncState.activeOpenHandles.size, 0);
+  assert.ok(nonPooled.getStats().syncHandleWrites >= 1);
+  assert.equal(nonPooled.getStats().syncHandleReads, 1);
+  assert.equal(syncState.totalClosedHandles, syncState.totalOpenedHandles);
+
+  await nonPooled.close();
+});
+
+test('W313: automatic fallback to createWritable()/getFile() on NoModificationAllowedError, NotSupportedError, and useSyncAccessHandle=false', async () => {
+  let injectErrorName = 'NoModificationAllowedError';
+  const cacheDir = createSyncMockOpfsDirHandle(DEFAULT_OPFS_CACHE_DIR, null, {
+    onCreateSyncAccessHandle() {
+      if (injectErrorName) {
+        const err = new Error(`${injectErrorName}: cannot acquire sync handle`);
+        err.name = injectErrorName;
+        throw err;
+      }
+    },
+  });
+  const opfsRoot = createMockOpfsDirHandle('', { [DEFAULT_OPFS_CACHE_DIR]: cacheDir });
+  const syncState = cacheDir._syncState;
+
+  const cache = new OpfsChunkCache({ opfsRoot, indexFlushDelayMs: 0 });
+  const data1 = makePatternBytes(96, 5);
+  const data2 = makePatternBytes(64, 9);
+
+  // 1. NoModificationAllowedError falls back cleanly on both write and read.
+  const putRes1 = await cache.put('fallback-1.bin', data1);
+  assert.equal(putRes1.stored, true);
+  const got1 = await cache.get('fallback-1.bin');
+  assert.deepEqual(got1, data1);
+  assert.ok(cache.getStats().syncHandleFallbacks >= 2);
+  assert.equal(cache.getStats().syncHandleWrites, 0);
+  assert.equal(cache.getStats().syncHandleReads, 0);
+  assert.ok(syncState.createWritableCalls >= 1);
+  assert.ok(syncState.getFileCalls >= 1);
+  assert.equal(syncState.activeOpenHandles.size, 0);
+
+  // 2. NotSupportedError also falls back cleanly without breaking callers.
+  injectErrorName = 'NotSupportedError';
+  const fallbacksBefore = cache.getStats().syncHandleFallbacks;
+  await cache.put('fallback-2.bin', data2);
+  const got2 = await cache.get('fallback-2.bin');
+  assert.deepEqual(got2, data2);
+  assert.ok(cache.getStats().syncHandleFallbacks > fallbacksBefore);
+  assert.equal(syncState.activeOpenHandles.size, 0);
+
+  // 3. Once sync access handles become available again, subsequent ops use fast path.
+  injectErrorName = null;
+  const got1Fast = await cache.get('fallback-1.bin');
+  assert.deepEqual(got1Fast, data1);
+  assert.equal(cache.getStats().syncHandleReads, 1);
+
+  await cache.close();
+  assert.equal(cache.getStats().openSyncHandles, 0);
+  assert.equal(syncState.activeOpenHandles.size, 0);
+
+  // 4. Opt-out via useSyncAccessHandle: false skips createSyncAccessHandle completely.
+  const openedBeforeOptOut = syncState.totalOpenedHandles;
+  const optOutCache = new OpfsChunkCache({
+    opfsRoot,
+    useSyncAccessHandle: false,
+    indexFlushDelayMs: 0,
+  });
+  await optOutCache.put('async-only.bin', makePatternBytes(32, 3));
+  const asyncGot = await optOutCache.get('async-only.bin');
+  assert.deepEqual(asyncGot, makePatternBytes(32, 3));
+  assert.equal(syncState.totalOpenedHandles, openedBeforeOptOut);
+  assert.equal(optOutCache.getStats().syncHandleWrites, 0);
+  assert.equal(optOutCache.getStats().syncHandleReads, 0);
+  assert.equal(optOutCache.getStats().syncHandleFallbacks, 0);
+  assert.equal(optOutCache.getStats().openSyncHandles, 0);
+  await optOutCache.close();
+});
+
+test('W313: QuotaExceededError recovery on SyncAccessHandle write and concurrent closeAllHandles() race leave zero leaked handles', async () => {
+  let failOnceOnBig = true;
+  let delayOpenResolve = null;
+  let gateTarget = null;
+
+  const cacheDir = createSyncMockOpfsDirHandle(DEFAULT_OPFS_CACHE_DIR, null, {
+    enforceLocks: true,
+    async onCreateSyncAccessHandle(relPath) {
+      if (gateTarget && relPath === gateTarget) {
+        await new Promise((resolve) => {
+          delayOpenResolve = resolve;
+        });
+      }
+    },
+    onSyncWrite(relPath) {
+      if (relPath === 'big-sync.bin' && failOnceOnBig) {
+        failOnceOnBig = false;
+        const err = new Error('QuotaExceededError: OPFS disk full');
+        err.name = 'QuotaExceededError';
+        throw err;
+      }
+    },
+  });
+  const opfsRoot = createMockOpfsDirHandle('', { [DEFAULT_OPFS_CACHE_DIR]: cacheDir });
+  const syncState = cacheDir._syncState;
+
+  const cache = new OpfsChunkCache({ opfsRoot, maxBytes: null, indexFlushDelayMs: 0 });
+  await cache.put('victim-1.bin', makePatternBytes(100, 1));
+  await cache.put('victim-2.bin', makePatternBytes(100, 2));
+
+  // SyncAccessHandle write throws QuotaExceededError -> evicts old entries (closing their handles) and retries cleanly.
+  const bigRes = await cache.put('big-sync.bin', makePatternBytes(150, 3));
+  assert.equal(bigRes.stored, true);
+  assert.equal(bigRes.quotaRecovered, true);
+  assert.ok(bigRes.evictedEntries >= 1);
+  assert.deepEqual(await cache.get('big-sync.bin'), makePatternBytes(150, 3));
+
+  // Concurrent reads of the same unpooled key share one in-flight createSyncAccessHandle() without lock contention.
+  cache.closeAllHandles();
+  gateTarget = 'big-sync.bin';
+  const readP1 = cache.get('big-sync.bin', { touch: false });
+  const readP2 = cache.get('big-sync.bin', { touch: false });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.ok(delayOpenResolve, 'expected gated createSyncAccessHandle to be in flight');
+  const releaseOpen = delayOpenResolve;
+  delayOpenResolve = null;
+  gateTarget = null;
+  releaseOpen();
+  const [b1, b2] = await Promise.all([readP1, readP2]);
+  assert.deepEqual(b1, makePatternBytes(150, 3));
+  assert.deepEqual(b2, makePatternBytes(150, 3));
+  assert.equal(cache.getStats().syncHandleFallbacks, 0);
+
+  // Race: closeAllHandles() called while createSyncAccessHandle() is pending must close the resolved handle immediately.
+  cache.closeAllHandles();
+  gateTarget = 'big-sync.bin';
+  const racingRead = cache.get('big-sync.bin', { touch: false });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.ok(delayOpenResolve);
+  cache.closeAllHandles();
+  const releaseRace = delayOpenResolve;
+  delayOpenResolve = null;
+  gateTarget = null;
+  releaseRace();
+  const racedBytes = await racingRead;
+  assert.deepEqual(racedBytes, makePatternBytes(150, 3));
+  assert.equal(cache.getStats().openSyncHandles, 0);
+  assert.equal(syncState.activeOpenHandles.size, 0, 'Pending SyncAccessHandle resolved after closeAllHandles() must not leak');
+
+  // resetStats() clears cumulative sync counters while keeping live openSyncHandles accurate.
+  await cache.get('big-sync.bin', { touch: false });
+  assert.equal(cache.getStats().openSyncHandles, 1);
+  const reset = cache.resetStats();
+  assert.equal(reset.syncHandleReads, 0);
+  assert.equal(reset.syncHandleWrites, 0);
+  assert.equal(reset.syncHandleFallbacks, 0);
+  assert.equal(reset.openSyncHandles, 1);
+
+  await cache.close();
+  assert.equal(cache.getStats().openSyncHandles, 0);
+  assert.equal(syncState.activeOpenHandles.size, 0);
+  assert.equal(syncState.totalClosedHandles, syncState.totalOpenedHandles);
 });
