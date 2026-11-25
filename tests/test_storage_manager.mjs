@@ -12,11 +12,14 @@ import {
   DEFAULT_QUOTA_BUDGET_RATIO,
   DEFAULT_USERDATA_DB_NAME,
   DEFAULT_USERDATA_STORE_NAME,
+  DEFAULT_WARM_BOOT_MIN_HEADROOM_RATIO,
+  DEFAULT_WARM_BOOT_MIN_RPF_CHUNKS,
   DEFAULT_WARN_THRESHOLD_RATIO,
   QUOTA_PRESSURE_LEVELS,
   SNAPSHOT_FORMAT,
   SNAPSHOT_VERSION,
   USERDATA_PREFIX,
+  WARM_BOOT_RECOMMENDATIONS,
   classifyQuotaPressure,
   decodeBase64,
   encodeBase64,
@@ -1705,4 +1708,350 @@ test('cache management discovers pre-existing OPFS chunks, supports registerCach
   assert.equal((await unsupportedMgr.enforceQuotaBudget()).supported, false);
   assert.equal(unsupportedMgr.getCacheStats().entryCount, 0);
   assert.equal(unsupportedMgr.getCacheStats().quotaUsagePct, 0);
+});
+
+// --- W243 Sanitized Warm-Boot Readiness tests ---
+
+test('warm-boot readiness constants and live OPFS + quota evaluation report ready state cleanly', async () => {
+  assert.equal(DEFAULT_WARM_BOOT_MIN_HEADROOM_RATIO, 0.1);
+  assert.equal(DEFAULT_WARM_BOOT_MIN_RPF_CHUNKS, 1);
+  assert.equal(Object.isFrozen(WARM_BOOT_RECOMMENDATIONS), true);
+  assert.deepEqual(WARM_BOOT_RECOMMENDATIONS, {
+    READY: 'ready',
+    OPFS_UNSUPPORTED: 'opfs-unsupported',
+    LOW_QUOTA_HEADROOM: 'low-quota-headroom',
+    REQUEST_PERSISTENCE: 'request-persistence',
+    WARM_CACHE_EMPTY: 'warm-cache-empty',
+    CACHE_SHADER_PACK: 'cache-shader-pack',
+    CACHE_RPF_CHUNKS: 'cache-rpf-chunks',
+  });
+
+  const opfsRoot = createMockOpfsDirHandle('');
+  const storageObj = createMockStorageObj({
+    usage: 256 * 1024 * 1024,
+    quota: 1024 * 1024 * 1024,
+    persisted: true,
+    opfsRoot,
+  });
+
+  const manager = new BrowserStorageManager({
+    storageObj,
+    indexedDBFactory: null,
+    nowFn: () => 1700005000000,
+  });
+
+  const chunk0 = rangeCacheMod.opfsChunkFileName('x64a.rpf', 0, 262144);
+  const chunk1 = rangeCacheMod.opfsChunkFileName('x64a.rpf', 1, 262144);
+  await manager.putCacheEntry('boot/gta6.pgim', makePatternBytes(4096, 1), { pinned: true });
+  await manager.putCacheEntry('shaders/main.wgsl.pack', makePatternBytes(8192, 2), { pinned: true });
+  await manager.putCacheEntry(chunk0, makePatternBytes(2048, 3));
+  await manager.putCacheEntry(chunk1, makePatternBytes(2048, 4));
+
+  const readiness = await manager.getWarmBootReadiness();
+  assert.deepEqual(readiness, {
+    opfsSupported: true,
+    persisted: true,
+    quotaBytes: 1024 * 1024 * 1024,
+    usageBytes: 256 * 1024 * 1024,
+    availableBytes: 768 * 1024 * 1024,
+    headroomRatio: 0.75,
+    cachedEntries: 4,
+    cachedBytes: 16384,
+    shaderPackCached: true,
+    rpfChunksCached: 2,
+    warmBootReady: true,
+    recommendation: 'ready',
+  });
+
+  // Custom minRpfChunks threshold exceeding current chunk count -> 'cache-rpf-chunks'
+  const needMoreChunks = await manager.getWarmBootReadiness({ minRpfChunks: 4 });
+  assert.equal(needMoreChunks.warmBootReady, false);
+  assert.equal(needMoreChunks.recommendation, WARM_BOOT_RECOMMENDATIONS.CACHE_RPF_CHUNKS);
+});
+
+test('getWarmBootReadiness classifies cold cache, missing shader pack, missing RPF chunks, and persistence recommendations', async () => {
+  const opfsRoot = createMockOpfsDirHandle('');
+  let persisted = true;
+  const storageObj = {
+    async estimate() {
+      return { usage: 100 * 1024 * 1024, quota: 1000 * 1024 * 1024 };
+    },
+    async persisted() {
+      return persisted;
+    },
+    async getDirectory() {
+      return opfsRoot;
+    },
+  };
+
+  const manager = new BrowserStorageManager({
+    storageObj,
+    indexedDBFactory: null,
+  });
+
+  // 1. Cold empty cache
+  const cold = await manager.getWarmBootReadiness();
+  assert.equal(cold.opfsSupported, true);
+  assert.equal(cold.persisted, true);
+  assert.equal(cold.headroomRatio, 0.9);
+  assert.equal(cold.cachedEntries, 0);
+  assert.equal(cold.cachedBytes, 0);
+  assert.equal(cold.shaderPackCached, false);
+  assert.equal(cold.rpfChunksCached, 0);
+  assert.equal(cold.warmBootReady, false);
+  assert.equal(cold.recommendation, WARM_BOOT_RECOMMENDATIONS.WARM_CACHE_EMPTY);
+
+  // 2. Only RPF chunk cached (no shader pack yet)
+  const chunkName = rangeCacheMod.opfsChunkFileName('x64b.rpf', 0, 262144);
+  await manager.putCacheEntry(chunkName, makePatternBytes(1024, 5));
+  const missingShader = await manager.getWarmBootReadiness();
+  assert.equal(missingShader.cachedEntries, 1);
+  assert.equal(missingShader.shaderPackCached, false);
+  assert.equal(missingShader.rpfChunksCached, 1);
+  assert.equal(missingShader.warmBootReady, false);
+  assert.equal(missingShader.recommendation, WARM_BOOT_RECOMMENDATIONS.CACHE_SHADER_PACK);
+
+  // Opting out of shader-pack requirement makes RPF-only cache warm-boot ready
+  const rpfOnlyAllowed = await manager.getWarmBootReadiness({ requireShaderPack: false });
+  assert.equal(rpfOnlyAllowed.warmBootReady, true);
+  assert.equal(rpfOnlyAllowed.recommendation, WARM_BOOT_RECOMMENDATIONS.READY);
+
+  // 3. Only shader pack cached (no RPF chunks)
+  await manager.deleteCacheEntry(chunkName);
+  await manager.putCacheEntry('shaders/boot.wgsl.pack', makePatternBytes(2048, 6));
+  const missingChunks = await manager.getWarmBootReadiness();
+  assert.equal(missingChunks.cachedEntries, 1);
+  assert.equal(missingChunks.shaderPackCached, true);
+  assert.equal(missingChunks.rpfChunksCached, 0);
+  assert.equal(missingChunks.warmBootReady, false);
+  assert.equal(missingChunks.recommendation, WARM_BOOT_RECOMMENDATIONS.CACHE_RPF_CHUNKS);
+
+  // 4. Both shader pack and RPF chunk cached, but storage is not persisted
+  await manager.putCacheEntry(chunkName, makePatternBytes(1024, 7));
+  persisted = false;
+  const unpersisted = await manager.getWarmBootReadiness();
+  assert.equal(unpersisted.persisted, false);
+  assert.equal(unpersisted.warmBootReady, true);
+  assert.equal(unpersisted.recommendation, WARM_BOOT_RECOMMENDATIONS.REQUEST_PERSISTENCE);
+
+  // Strict persistence gating sets warmBootReady to false until persisted
+  const strictUnpersisted = await manager.getWarmBootReadiness({ requirePersistence: true });
+  assert.equal(strictUnpersisted.persisted, false);
+  assert.equal(strictUnpersisted.warmBootReady, false);
+  assert.equal(strictUnpersisted.recommendation, WARM_BOOT_RECOMMENDATIONS.REQUEST_PERSISTENCE);
+});
+
+test('getWarmBootReadiness enforces quota headroom bounds and degrades cleanly when APIs are unavailable', async () => {
+  const opfsRoot = createMockOpfsDirHandle('', {
+    [DEFAULT_OPFS_CACHE_DIR]: createMockOpfsDirHandle(DEFAULT_OPFS_CACHE_DIR, {
+      'shaders/frame1.wgsl.pack': makePatternBytes(2048, 1),
+      [rangeCacheMod.opfsChunkFileName('x64c.rpf', 0, 262144)]: makePatternBytes(1024, 2),
+    }),
+  });
+
+  let usage = 950;
+  let quota = 1000;
+  const manager = new BrowserStorageManager({
+    storageObj: {
+      async estimate() {
+        return { usage, quota };
+      },
+      async persisted() {
+        return true;
+      },
+      async getDirectory() {
+        return opfsRoot;
+      },
+    },
+    indexedDBFactory: null,
+  });
+
+  // 5% headroom < default 10% -> low-quota-headroom
+  const lowHeadroom = await manager.getWarmBootReadiness();
+  assert.equal(lowHeadroom.quotaBytes, 1000);
+  assert.equal(lowHeadroom.usageBytes, 950);
+  assert.equal(lowHeadroom.availableBytes, 50);
+  assert.equal(lowHeadroom.headroomRatio, 0.05);
+  assert.equal(lowHeadroom.warmBootReady, false);
+  assert.equal(lowHeadroom.recommendation, WARM_BOOT_RECOMMENDATIONS.LOW_QUOTA_HEADROOM);
+
+  // Exact boundary (10% headroom === default 0.1) -> ready
+  usage = 900;
+  const boundary = await manager.getWarmBootReadiness();
+  assert.equal(boundary.availableBytes, 100);
+  assert.equal(boundary.headroomRatio, 0.1);
+  assert.equal(boundary.warmBootReady, true);
+  assert.equal(boundary.recommendation, WARM_BOOT_RECOMMENDATIONS.READY);
+
+  // Over-quota clamps availableBytes and headroomRatio to 0
+  usage = 1500;
+  const overQuota = await manager.getWarmBootReadiness();
+  assert.equal(overQuota.availableBytes, 0);
+  assert.equal(overQuota.headroomRatio, 0);
+  assert.equal(overQuota.warmBootReady, false);
+  assert.equal(overQuota.recommendation, WARM_BOOT_RECOMMENDATIONS.LOW_QUOTA_HEADROOM);
+
+  // minAvailableBytes gate trips even when ratio is healthy
+  usage = 200;
+  const minAvailFail = await manager.getWarmBootReadiness({ minAvailableBytes: 900 });
+  assert.equal(minAvailFail.headroomRatio, 0.8);
+  assert.equal(minAvailFail.warmBootReady, false);
+  assert.equal(minAvailFail.recommendation, WARM_BOOT_RECOMMENDATIONS.LOW_QUOTA_HEADROOM);
+
+  // OPFS + Quota completely unavailable -> opfs-unsupported with null headroomRatio
+  const unsupportedMgr = new BrowserStorageManager({
+    storageObj: null,
+    opfsRoot: null,
+    indexedDBFactory: null,
+  });
+  const unsupported = await unsupportedMgr.getWarmBootReadiness(null);
+  assert.deepEqual(unsupported, {
+    opfsSupported: false,
+    persisted: false,
+    quotaBytes: 0,
+    usageBytes: 0,
+    availableBytes: 0,
+    headroomRatio: null,
+    cachedEntries: 0,
+    cachedBytes: 0,
+    shaderPackCached: false,
+    rpfChunksCached: 0,
+    warmBootReady: false,
+    recommendation: 'opfs-unsupported',
+  });
+
+  // OPFS supported without quota API -> headroomRatio null, ready unless minAvailableBytes > 0
+  const opfsOnlyMgr = new BrowserStorageManager({
+    storageObj: null,
+    opfsRoot,
+    indexedDBFactory: null,
+  });
+  const noQuotaReady = await opfsOnlyMgr.getWarmBootReadiness();
+  assert.equal(noQuotaReady.opfsSupported, true);
+  assert.equal(noQuotaReady.quotaBytes, 0);
+  assert.equal(noQuotaReady.headroomRatio, null);
+  assert.equal(noQuotaReady.shaderPackCached, true);
+  assert.equal(noQuotaReady.rpfChunksCached, 1);
+  assert.equal(noQuotaReady.warmBootReady, true);
+  assert.equal(noQuotaReady.recommendation, WARM_BOOT_RECOMMENDATIONS.REQUEST_PERSISTENCE);
+
+  const noQuotaNeedsBytes = await opfsOnlyMgr.getWarmBootReadiness({ minAvailableBytes: 1024 });
+  assert.equal(noQuotaNeedsBytes.warmBootReady, false);
+  assert.equal(noQuotaNeedsBytes.recommendation, WARM_BOOT_RECOMMENDATIONS.LOW_QUOTA_HEADROOM);
+});
+
+test('getWarmBootReadiness accepts optional cacheStats/cacheSummary/quota overrides and keeps output strictly sanitized', async () => {
+  const opfsRoot = createMockOpfsDirHandle('', {
+    'C:\\Users\\secret\\opfs-cache': createMockOpfsDirHandle('C:\\Users\\secret\\opfs-cache', {
+      'shaders/secret_title_pass.wgsl.pack': makePatternBytes(4096, 11),
+      [rangeCacheMod.opfsChunkFileName('secret/path/x64a.rpf', 0, 262144)]: makePatternBytes(2048, 12),
+    }),
+  });
+
+  const manager = new BrowserStorageManager({
+    storageObj: createMockStorageObj({
+      usage: 50 * 1024 * 1024,
+      quota: 500 * 1024 * 1024,
+      persisted: true,
+      opfsRoot,
+    }),
+    opfsDirName: 'C:\\Users\\secret\\opfs-cache',
+    dbName: 'secret-host-db',
+    storeName: 'secret-host-store',
+    indexedDBFactory: null,
+  });
+
+  // 1. Live query sanitization check (no host/dir/db names, no cache filenames)
+  const live = await manager.getWarmBootReadiness();
+  assert.equal(live.warmBootReady, true);
+  assert.equal(live.recommendation, 'ready');
+  const serialized = JSON.stringify(live);
+  assert.equal(serialized.includes('secret'), false);
+  assert.equal(serialized.includes('C:\\'), false);
+  assert.equal(serialized.includes('wgsl.pack'), false);
+  assert.equal(serialized.includes('x64a.rpf'), false);
+  assert.deepEqual(Object.keys(live).sort(), [
+    'availableBytes',
+    'cachedBytes',
+    'cachedEntries',
+    'headroomRatio',
+    'opfsSupported',
+    'persisted',
+    'quotaBytes',
+    'recommendation',
+    'rpfChunksCached',
+    'shaderPackCached',
+    'usageBytes',
+    'warmBootReady',
+  ]);
+
+  // 2. Explicit cacheSummary + quota override (e.g. from RangeCache or pre-fetched summary)
+  const fromOverride = await manager.getWarmBootReadiness({
+    quota: { usage: 2000, quota: 10000, persisted: true },
+    cacheSummary: {
+      supported: true,
+      cachedBytes: 65536,
+      shaderPackCached: true,
+      rpfChunksCached: 5,
+    },
+  });
+  assert.deepEqual(fromOverride, {
+    opfsSupported: true,
+    persisted: true,
+    quotaBytes: 10000,
+    usageBytes: 2000,
+    availableBytes: 8000,
+    headroomRatio: 0.8,
+    cachedEntries: 6,
+    cachedBytes: 65536,
+    shaderPackCached: true,
+    rpfChunksCached: 5,
+    warmBootReady: true,
+    recommendation: 'ready',
+  });
+
+  // 3. Passing manager.getCacheStats() after syncCacheIndex() derives shader/chunk coverage
+  await manager.syncCacheIndex();
+  const fromCacheStats = await manager.getWarmBootReadiness({
+    cacheStats: manager.getCacheStats(),
+  });
+  assert.equal(fromCacheStats.opfsSupported, true);
+  assert.equal(fromCacheStats.cachedEntries, 2);
+  assert.equal(fromCacheStats.cachedBytes, 6144);
+  assert.equal(fromCacheStats.shaderPackCached, true);
+  assert.equal(fromCacheStats.rpfChunksCached, 1);
+  assert.equal(fromCacheStats.warmBootReady, true);
+  assert.equal(fromCacheStats.recommendation, 'ready');
+
+  // 4. Simulated empty cacheStats override must NOT leak tracked _cacheEntries
+  const emptyOverride = await manager.getWarmBootReadiness({
+    cacheStats: { supported: true, entryCount: 0, totalBytes: 0 },
+  });
+  assert.equal(emptyOverride.cachedEntries, 0);
+  assert.equal(emptyOverride.cachedBytes, 0);
+  assert.equal(emptyOverride.shaderPackCached, false);
+  assert.equal(emptyOverride.rpfChunksCached, 0);
+  assert.equal(emptyOverride.warmBootReady, false);
+  assert.equal(emptyOverride.recommendation, WARM_BOOT_RECOMMENDATIONS.WARM_CACHE_EMPTY);
+
+  // 5. Non-finite / negative quota override inputs safely sanitize without NaN
+  const malformedQuota = await manager.getWarmBootReadiness({
+    quota: { usageBytes: Number.NaN, quotaBytes: Number.POSITIVE_INFINITY, persisted: false },
+    cacheStats: {
+      supported: true,
+      entryCount: -5,
+      totalBytes: Number.NaN,
+      shaderPackCached: false,
+      rpfChunksCached: -2,
+    },
+  });
+  assert.equal(malformedQuota.quotaBytes, 0);
+  assert.equal(malformedQuota.usageBytes, 0);
+  assert.equal(malformedQuota.availableBytes, 0);
+  assert.equal(malformedQuota.headroomRatio, null);
+  assert.equal(malformedQuota.cachedEntries, 0);
+  assert.equal(malformedQuota.cachedBytes, 0);
+  assert.equal(malformedQuota.rpfChunksCached, 0);
+  assert.equal(malformedQuota.warmBootReady, false);
+  assert.equal(malformedQuota.recommendation, WARM_BOOT_RECOMMENDATIONS.WARM_CACHE_EMPTY);
 });
