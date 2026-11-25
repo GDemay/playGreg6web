@@ -11,12 +11,15 @@ const shaderFallbackMod = require('../web/workers/shader_fallback_router.js');
 const {
   DEFAULT_MAX_ERROR_HISTORY,
   DEFAULT_MAX_QUARANTINED_KEYS,
+  DEFAULT_MAX_NEGATIVE_CACHE_ENTRIES,
   MAX_PIPELINE_ERROR_MESSAGE_LENGTH,
   FRAME1_VERTEX_STRIDE_24B,
   FRAME1_CBV_MIN_BINDING_SIZE,
   FRAME1_VERTEX_LAYOUT_24B,
   DEFAULT_SAMPLER_DESCRIPTORS,
   SHADER_STAGE_BITS,
+  fnv1a64Hex,
+  buildFastPipelineKey,
   hashDescriptorKey,
   registerShaderModuleId,
   normalizeFallbackProfile,
@@ -344,6 +347,14 @@ test('sync render, compute, and bindGroupLayout cache hits, misses, and telemetr
 
   const stats = cache.getStats();
   assert.deepEqual(stats, {
+    hits: 4,
+    misses: 4,
+    negativeHits: 0,
+    negativeCacheSize: 0,
+    negativeCacheEvictions: 0,
+    hitRate: 0.5,
+    avgCompileMs: (1.5 + 4.0 + 2.5 + 4.0) / 4,
+    shaderPackGeneration: 0,
     renderHits: 2,
     renderMisses: 2,
     computeHits: 1,
@@ -802,6 +813,14 @@ test('evictOlderThan and clear manage lifecycle and isolate stale in-flight comp
   // clear({ resetStats: true }) resets telemetry counters
   cache.clear({ resetStats: true });
   assert.deepEqual(cache.getStats(), {
+    hits: 0,
+    misses: 0,
+    negativeHits: 0,
+    negativeCacheSize: 0,
+    negativeCacheEvictions: 0,
+    hitRate: 0,
+    avgCompileMs: 0,
+    shaderPackGeneration: 0,
     renderHits: 0,
     renderMisses: 0,
     computeHits: 0,
@@ -2485,4 +2504,587 @@ test('W167 color target blend/sRGB/writeMask/depthStencil normalization deduplic
   );
   assert.equal(failCache.getStats().blendPipelineVariants, 0);
   assert.equal(failCache.getStats().srgbPipelineVariants, 0);
+});
+
+// --- W195: Fast Pipeline Lookup Keys, Bounded Negative Cache & Telemetry Tests ---
+
+test('W195 32-bit-limb fnv1a64Hex matches reference BigInt 64-bit FNV-1a across ASCII and UTF-8', () => {
+  const encoder = new TextEncoder();
+  const refFnv1a64 = (input) => {
+    const bytes = encoder.encode(input);
+    let h = 0xcbf29ce484222325n;
+    const prime = 0x00000100000001b3n;
+    const mask = 0xffffffffffffffffn;
+    for (let i = 0; i < bytes.length; i += 1) {
+      h ^= BigInt(bytes[i]);
+      h = (h * prime) & mask;
+    }
+    return `0x${h.toString(16).padStart(16, '0')}`;
+  };
+
+  // Standard FNV-1a 64-bit test vectors + UTF-8 multi-byte & surrogate pairs
+  assert.equal(fnv1a64Hex(''), '0xcbf29ce484222325');
+  assert.equal(fnv1a64Hex('a'), '0xaf63dc4c8601ec8c');
+  assert.equal(fnv1a64Hex('foobar'), '0x85944171f73967e8');
+
+  const samples = [
+    '',
+    'a',
+    'foobar',
+    'r|l:4:auto|v:{m:28:gpu:wgpk:0x0000000000000001|ep:7:vs_main}',
+    'caf\u00e9', // 2-byte UTF-8
+    '\u2603\u4e16\u754c', // 3-byte UTF-8
+    '\ud83d\ude80\ud83c\udfae', // 4-byte UTF-8 surrogate pairs
+    'a'.repeat(513),
+  ];
+  for (const s of samples) {
+    assert.equal(fnv1a64Hex(s), refFnv1a64(s), `mismatch on input ${JSON.stringify(s)}`);
+  }
+});
+
+test('W195 fast key builder is deterministic, key-order invariant, JSON.stringify-free, and classic-Worker safe', () => {
+  const device = createMockGpuDevice();
+  const cache = new WebGpuPipelineCache({ device });
+  const vs = device.createShaderModule({ label: 'wgpk:vertex:0x000000000000f001', code: 'vs' });
+  const fsMod = device.createShaderModule({ label: 'wgpk:fragment:0x000000000000f002', code: 'fs' });
+  const cs = device.createShaderModule({ label: 'wgpk:compute:0x000000000000f003', code: 'cs' });
+
+  const renderA = {
+    layout: 'auto',
+    vertex: {
+      module: vs,
+      entryPoint: 'vs_main',
+      constants: { b: 2, a: 1 },
+      buffers: [
+        {
+          arrayStride: 24,
+          stepMode: 'vertex',
+          attributes: [
+            { format: 'float32x4', offset: 0, shaderLocation: 0 },
+            { format: 'float32x2', offset: 16, shaderLocation: 1 },
+          ],
+        },
+      ],
+    },
+    fragment: {
+      module: fsMod,
+      entryPoint: 'fs_main',
+      targets: [
+        {
+          format: 'bgra8unorm',
+          writeMask: 0xf,
+          blend: {
+            color: { operation: 'add', srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' },
+            alpha: { operation: 'add', srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
+          },
+        },
+      ],
+    },
+    primitive: { topology: 'triangle-list', cullMode: 'back', frontFace: 'ccw', unclippedDepth: false },
+    depthStencil: {
+      format: 'depth24plus-stencil8',
+      depthWriteEnabled: true,
+      depthCompare: 'less-equal',
+      stencilFront: { compare: 'always', failOp: 'keep', depthFailOp: 'keep', passOp: 'replace' },
+      stencilBack: { compare: 'equal', failOp: 'zero', depthFailOp: 'keep', passOp: 'keep' },
+      stencilReadMask: 0xff,
+      stencilWriteMask: 0xff,
+      depthBias: 0,
+      depthBiasSlopeScale: 0,
+      depthBiasClamp: 0,
+    },
+    multisample: { count: 4, mask: 0xffffffff, alphaToCoverageEnabled: false },
+    label: undefined,
+  };
+
+  // Same descriptor with reversed key insertion order at every nesting level
+  const renderB = {
+    multisample: { alphaToCoverageEnabled: false, mask: 0xffffffff, count: 4 },
+    depthStencil: {
+      depthBiasClamp: -0,
+      depthBiasSlopeScale: 0,
+      depthBias: -0,
+      stencilWriteMask: 0xff,
+      stencilReadMask: 0xff,
+      stencilBack: { passOp: 'keep', depthFailOp: 'keep', failOp: 'zero', compare: 'equal' },
+      stencilFront: { passOp: 'replace', depthFailOp: 'keep', failOp: 'keep', compare: 'always' },
+      depthCompare: 'less-equal',
+      depthWriteEnabled: true,
+      format: 'depth24plus-stencil8',
+    },
+    primitive: { unclippedDepth: false, frontFace: 'ccw', cullMode: 'back', topology: 'triangle-list' },
+    fragment: {
+      targets: [
+        {
+          blend: {
+            alpha: { dstFactor: 'one-minus-src-alpha', srcFactor: 'one', operation: 'add' },
+            color: { dstFactor: 'one-minus-src-alpha', srcFactor: 'src-alpha', operation: 'add' },
+          },
+          writeMask: 0xf,
+          format: 'bgra8unorm',
+        },
+      ],
+      entryPoint: 'fs_main',
+      module: fsMod,
+    },
+    vertex: {
+      buffers: [
+        {
+          attributes: [
+            { shaderLocation: 0, offset: 0, format: 'float32x4' },
+            { shaderLocation: 1, offset: 16, format: 'float32x2' },
+          ],
+          stepMode: 'vertex',
+          arrayStride: 24,
+        },
+      ],
+      constants: { a: 1, b: 2 },
+      entryPoint: 'vs_main',
+      module: vs,
+    },
+    layout: 'auto',
+  };
+
+  const computeA = { layout: 'auto', compute: { module: cs, entryPoint: 'cs_main', constants: { y: 8, x: 4 } } };
+  const computeB = { compute: { constants: { x: 4, y: 8 }, entryPoint: 'cs_main', module: cs }, layout: 'auto' };
+  const bglA = { entries: [{ binding: 0, visibility: SHADER_STAGE_BITS.VERTEX, buffer: { type: 'uniform', minBindingSize: 256 } }] };
+  const bglB = { entries: [{ buffer: { minBindingSize: 256, type: 'uniform' }, visibility: SHADER_STAGE_BITS.VERTEX, binding: 0 }] };
+
+  // Prove JSON.stringify is NEVER called on the hot key-generation or lookup path
+  const origStringify = JSON.stringify;
+  JSON.stringify = () => {
+    throw new Error('JSON.stringify must not be called on hot pipeline cache path');
+  };
+  try {
+    const keyA = buildFastPipelineKey(renderA);
+    const keyB = buildFastPipelineKey(renderB);
+    assert.equal(keyA, keyB);
+    assert.ok(keyA.startsWith('r|'));
+
+    const hashA = hashDescriptorKey(renderA);
+    const hashB = hashDescriptorKey(renderB);
+    assert.equal(hashA, hashB);
+    assert.equal(fnv1a64Hex(keyA), hashA);
+
+    assert.equal(buildFastPipelineKey(computeA), buildFastPipelineKey(computeB));
+    assert.equal(hashDescriptorKey(computeA), hashDescriptorKey(computeB));
+    assert.equal(fnv1a64Hex(buildFastPipelineKey(computeA)), hashDescriptorKey(computeA));
+
+    assert.equal(buildFastPipelineKey(bglA), buildFastPipelineKey(bglB));
+    assert.equal(hashDescriptorKey(bglA), hashDescriptorKey(bglB));
+    assert.equal(fnv1a64Hex(buildFastPipelineKey(bglA)), hashDescriptorKey(bglA));
+
+    const rp1 = cache.getOrCreateRenderPipeline(renderA);
+    const rp2 = cache.getOrCreateRenderPipeline(renderB);
+    assert.equal(rp1, rp2);
+
+    const cp1 = cache.getOrCreateComputePipeline(computeA);
+    const cp2 = cache.getOrCreateComputePipeline(computeB);
+    assert.equal(cp1, cp2);
+
+    const l1 = cache.getOrCreateBindGroupLayout(bglA);
+    const l2 = cache.getOrCreateBindGroupLayout(bglB);
+    assert.equal(l1, l2);
+  } finally {
+    JSON.stringify = origStringify;
+  }
+
+  // Classic-Worker sandbox without TextEncoder still works with zero global leakage
+  const scriptPath = path.resolve(
+    path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')),
+    '../web/workers/pipeline_cache.js'
+  );
+  const source = fs.readFileSync(scriptPath, 'utf8');
+  const sandbox = { performance, Date };
+  sandbox.globalThis = sandbox;
+  sandbox.self = sandbox;
+  vm.createContext(sandbox);
+  vm.runInContext(source, sandbox);
+
+  assert.equal(typeof sandbox.PlayGta6PipelineCache.buildFastPipelineKey, 'function');
+  assert.equal(typeof sandbox.PlayGta6PipelineCache.fnv1a64Hex, 'function');
+  assert.equal(sandbox.PlayGta6PipelineCache.DEFAULT_MAX_NEGATIVE_CACHE_ENTRIES, 512);
+  assert.equal(sandbox.buildFastPipelineKey, undefined);
+  assert.equal(sandbox.fnv1a64Hex, undefined);
+  assert.match(sandbox.PlayGta6PipelineCache.hashDescriptorKey({ a: 1 }), /^0x[0-9a-f]{16}$/);
+});
+
+test('W195 distinct render and compute descriptors never collide on fast key or FNV-1a hash', () => {
+  const device = createMockGpuDevice();
+  const vs1 = device.createShaderModule({ label: 'wgpk:vertex:0x0000000000010001', code: 'vs1' });
+  const vs2 = device.createShaderModule({ label: 'wgpk:vertex:0x0000000000010002', code: 'vs2' });
+  const fs1 = device.createShaderModule({ label: 'wgpk:fragment:0x0000000000020001', code: 'fs1' });
+  const fs2 = device.createShaderModule({ label: 'wgpk:fragment:0x0000000000020002', code: 'fs2' });
+  const cs1 = device.createShaderModule({ label: 'wgpk:compute:0x0000000000030001', code: 'cs1' });
+  const cs2 = device.createShaderModule({ label: 'wgpk:compute:0x0000000000030002', code: 'cs2' });
+  const customLayout = device.createPipelineLayout({ bindGroupLayouts: [] });
+
+  const base = () => ({
+    layout: 'auto',
+    vertex: {
+      module: vs1,
+      entryPoint: 'vs_main',
+      buffers: [
+        {
+          arrayStride: 24,
+          stepMode: 'vertex',
+          attributes: [
+            { shaderLocation: 0, offset: 0, format: 'float32x4' },
+            { shaderLocation: 1, offset: 16, format: 'float32x2' },
+          ],
+        },
+      ],
+    },
+    fragment: {
+      module: fs1,
+      entryPoint: 'fs_main',
+      targets: [{ format: 'bgra8unorm', writeMask: 0xf }],
+    },
+    primitive: { topology: 'triangle-list', frontFace: 'ccw', cullMode: 'none' },
+  });
+
+  const make = (mutate) => {
+    const d = base();
+    mutate(d);
+    return d;
+  };
+
+  const variants = [
+    base(),
+    // Shader hash / entryPoint / constants / layout variations
+    make((d) => { d.vertex.module = vs2; }),
+    make((d) => { d.fragment.module = fs2; }),
+    make((d) => { d.vertex.entryPoint = 'vs_alt'; }),
+    make((d) => { d.fragment.entryPoint = 'fs_alt'; }),
+    make((d) => { d.vertex.entryPoint = 'vs_main|f:{m:x}'; }), // delimiter spoofing attempt
+    make((d) => { d.vertex.constants = { mode: 1 }; }),
+    make((d) => { d.vertex.constants = { mode: 2 }; }),
+    make((d) => { d.vertex.constants = { mode: true }; }),
+    make((d) => { d.fragment.constants = { alphaCut: 0.5 }; }),
+    make((d) => { d.layout = customLayout; }),
+    make((d) => { delete d.layout; }),
+    make((d) => { d.label = 'pass_a'; }),
+    make((d) => { d.label = 'pass_b'; }),
+    // Color targets variations
+    make((d) => { d.fragment.targets = [{ format: 'rgba8unorm', writeMask: 0xf }]; }),
+    make((d) => { d.fragment.targets = [{ format: 'bgra8unorm-srgb', writeMask: 0xf }]; }),
+    make((d) => { d.fragment.targets = [{ format: 'bgra8unorm', writeMask: 0x7 }]; }),
+    make((d) => { d.fragment.targets = [{ format: 'bgra8unorm' }]; }), // omitted writeMask vs 0xf
+    make((d) => { d.fragment.targets = [{ format: 'bgra8unorm', writeMask: 0xf }, { format: 'rgba16float' }]; }),
+    make((d) => { d.fragment.targets = [null, { format: 'bgra8unorm', writeMask: 0xf }]; }),
+    make((d) => { d.fragment.targets = [{ format: 'bgra8unorm', writeMask: 0xf }, null]; }),
+    make((d) => { delete d.fragment; }), // depth-only pass
+    // Blend state variations
+    make((d) => {
+      d.fragment.targets[0].blend = {
+        color: { operation: 'add', srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' },
+        alpha: { operation: 'add', srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
+      };
+    }),
+    make((d) => {
+      d.fragment.targets[0].blend = {
+        color: { operation: 'subtract', srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' },
+        alpha: { operation: 'add', srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
+      };
+    }),
+    make((d) => {
+      d.fragment.targets[0].blend = {
+        color: { operation: 'add', srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' },
+        alpha: { operation: 'max', srcFactor: 'one', dstFactor: 'one' },
+      };
+    }),
+    make((d) => { d.fragment.targets[0].blend = null; }),
+    // Primitive topology / culling / frontFace / stripIndexFormat / unclippedDepth
+    make((d) => { d.primitive.topology = 'triangle-strip'; }),
+    make((d) => { d.primitive.topology = 'triangle-strip'; d.primitive.stripIndexFormat = 'uint16'; }),
+    make((d) => { d.primitive.topology = 'triangle-strip'; d.primitive.stripIndexFormat = 'uint32'; }),
+    make((d) => { d.primitive.topology = 'line-list'; }),
+    make((d) => { d.primitive.topology = 'point-list'; }),
+    make((d) => { d.primitive.frontFace = 'cw'; }),
+    make((d) => { d.primitive.cullMode = 'back'; }),
+    make((d) => { d.primitive.cullMode = 'front'; }),
+    make((d) => { d.primitive.unclippedDepth = true; }),
+    make((d) => { d.primitive.unclippedDepth = false; }),
+    // Depth / stencil variations
+    make((d) => { d.depthStencil = { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' }; }),
+    make((d) => { d.depthStencil = { format: 'depth24plus', depthWriteEnabled: false, depthCompare: 'less' }; }),
+    make((d) => { d.depthStencil = { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'greater-equal' }; }),
+    make((d) => { d.depthStencil = { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less' }; }),
+    make((d) => {
+      d.depthStencil = {
+        format: 'depth24plus-stencil8',
+        depthWriteEnabled: true,
+        depthCompare: 'less',
+        stencilFront: { compare: 'always', failOp: 'keep', depthFailOp: 'keep', passOp: 'replace' },
+      };
+    }),
+    make((d) => {
+      d.depthStencil = {
+        format: 'depth24plus-stencil8',
+        depthWriteEnabled: true,
+        depthCompare: 'less',
+        stencilBack: { compare: 'always', failOp: 'keep', depthFailOp: 'keep', passOp: 'replace' },
+      };
+    }),
+    make((d) => {
+      d.depthStencil = {
+        format: 'depth24plus',
+        depthWriteEnabled: true,
+        depthCompare: 'less',
+        depthBias: 2,
+        depthBiasSlopeScale: 1.5,
+      };
+    }),
+    make((d) => { d.depthStencil = null; }),
+    // Vertex layout variations
+    make((d) => { d.vertex.buffers = []; }),
+    make((d) => { d.vertex.buffers[0].arrayStride = 32; }),
+    make((d) => { d.vertex.buffers[0].stepMode = 'instance'; }),
+    make((d) => { d.vertex.buffers[0].attributes[1].offset = 12; }),
+    make((d) => { d.vertex.buffers[0].attributes[1].format = 'float32x3'; }),
+    make((d) => { d.vertex.buffers[0].attributes[1].shaderLocation = 2; }),
+    make((d) => { d.vertex.buffers.push({ arrayStride: 16, stepMode: 'instance', attributes: [{ shaderLocation: 2, offset: 0, format: 'float32x4' }] }); }),
+    make((d) => { d.vertex.buffers = [null, d.vertex.buffers[0]]; }),
+    // Multisample variations
+    make((d) => { d.multisample = { count: 4 }; }),
+    make((d) => { d.multisample = { count: 4, mask: 0x3 }; }),
+    make((d) => { d.multisample = { count: 4, alphaToCoverageEnabled: true }; }),
+    // Extra custom non-standard property triggers generic fallback without collision
+    make((d) => { d.customExtensionFlag = true; }),
+    make((d) => { d.customExtensionFlag = false; }),
+    // Compute pipelines
+    { layout: 'auto', compute: { module: cs1, entryPoint: 'cs_main' } },
+    { layout: 'auto', compute: { module: cs2, entryPoint: 'cs_main' } },
+    { layout: 'auto', compute: { module: cs1, entryPoint: 'cs_alt' } },
+    { layout: 'auto', compute: { module: cs1, entryPoint: 'cs_main', constants: { WG: 64 } } },
+    { layout: customLayout, compute: { module: cs1, entryPoint: 'cs_main' } },
+  ];
+
+  const seenFastKeys = new Set();
+  const seenHashes = new Set();
+
+  for (let i = 0; i < variants.length; i += 1) {
+    const fastKey = buildFastPipelineKey(variants[i]);
+    const hash = hashDescriptorKey(variants[i]);
+    assert.equal(seenFastKeys.has(fastKey), false, `fast key collision at variant ${i}: ${fastKey}`);
+    assert.equal(seenHashes.has(hash), false, `FNV-1a hash collision at variant ${i}: ${hash}`);
+    assert.equal(fnv1a64Hex(fastKey), hash, `hash mismatch with fnv1a64Hex(fastKey) at variant ${i}`);
+    seenFastKeys.add(fastKey);
+    seenHashes.add(hash);
+  }
+  assert.equal(seenFastKeys.size, variants.length);
+  assert.equal(seenHashes.size, variants.length);
+});
+
+test('W195 bounded negative caching, shader-pack update invalidation, and stale async rejection isolation', async () => {
+  let shouldFail = true;
+  let syncRenderCalls = 0;
+  let syncComputeCalls = 0;
+  let asyncRenderCalls = 0;
+  const staleDeferred = createDeferred();
+
+  const device = createMockGpuDevice({
+    renderSyncImpl: (desc, id) => {
+      syncRenderCalls += 1;
+      if (shouldFail) {
+        const err = new Error('Broken shader WGSL validation error');
+        err.name = 'GPUValidationError';
+        throw err;
+      }
+      return { kind: 'GPURenderPipeline', id, desc };
+    },
+    computeSyncImpl: (desc, id) => {
+      syncComputeCalls += 1;
+      if (shouldFail) {
+        throw new Error('Broken compute shader');
+      }
+      return { kind: 'GPUComputePipeline', id, desc };
+    },
+    renderAsyncImpl: async (desc, id) => {
+      asyncRenderCalls += 1;
+      await staleDeferred.promise;
+      throw new Error('Stale async failure from previous shader pack');
+    },
+  });
+
+  const cache = new WebGpuPipelineCache({
+    device,
+    enableNegativeCache: true,
+    maxNegativeCacheEntries: 2,
+  });
+
+  const vs = device.createShaderModule({ label: 'wgpk:vertex:0x0000000000050001', code: 'vs' });
+  const cs = device.createShaderModule({ label: 'wgpk:compute:0x0000000000050002', code: 'cs' });
+  const d1 = { layout: 'auto', vertex: { module: vs, entryPoint: 'broken_1' } };
+  const d2 = { layout: 'auto', vertex: { module: vs, entryPoint: 'broken_2' } };
+  const d3 = { layout: 'auto', compute: { module: cs, entryPoint: 'broken_cs' } };
+
+  // 1. First failure populates negative cache; subsequent frames skip device compilation
+  assert.throws(() => cache.getOrCreateRenderPipeline(d1), /Broken shader/);
+  assert.equal(cache.isNegativeCached(d1), true);
+  for (let frame = 0; frame < 5; frame += 1) {
+    assert.equal(cache.getOrCreateRenderPipeline(d1), null);
+  }
+  assert.equal(syncRenderCalls, 1);
+  assert.equal(cache.getStats().negativeHits, 5);
+  assert.equal(cache.getStats().negativeCacheSize, 1);
+
+  // 2. Bounded LRU eviction on negative cache (capacity = 2):
+  // Touch d1 via negative hit so d2 becomes LRU when d3 is inserted
+  assert.throws(() => cache.getOrCreateRenderPipeline(d2), /Broken shader/);
+  assert.equal(cache.getOrCreateRenderPipeline(d1), null); // refreshes d1 recency
+  assert.throws(() => cache.getOrCreateComputePipeline(d3), /Broken compute/);
+
+  assert.equal(cache.getStats().negativeCacheSize, 2);
+  assert.equal(cache.getStats().negativeCacheEvictions, 1);
+  assert.equal(cache.getStats().evictions, 0); // positive LRU evictions unaffected
+  assert.equal(cache.isNegativeCached(d1), true);
+  assert.equal(cache.isNegativeCached(d2), false); // d2 evicted
+  assert.equal(cache.isNegativeCached(d3), true);
+  assert.equal(cache.getNegativeCacheEntries().length, 2);
+
+  // Also compile a valid pipeline before shader-pack update to verify positive cache survives default update
+  shouldFail = false;
+  const goodDesc = { layout: 'auto', vertex: { module: vs, entryPoint: 'good_vs' } };
+  const goodPipeline = cache.getOrCreateRenderPipeline(goodDesc);
+  assert.equal(goodPipeline.kind, 'GPURenderPipeline');
+  assert.equal(cache.getStats().renderCount, 1);
+
+  // 3. Start an async compile that will reject AFTER onShaderPackUpdated()
+  const staleDesc = { layout: 'auto', vertex: { module: vs, entryPoint: 'stale_async_vs' } };
+  const stalePromise = cache.getOrCreateRenderPipelineAsync(staleDesc);
+  assert.equal(asyncRenderCalls, 1);
+
+  // 4. Shader-pack update clears negative cache & bumps shaderPackGeneration while preserving good pipelines
+  const updateSummary = cache.onShaderPackUpdated();
+  assert.deepEqual(updateSummary, {
+    clearedNegativeEntries: 2,
+    clearedPipelines: 0,
+    shaderPackGeneration: 1,
+  });
+  assert.equal(cache.getStats().negativeCacheSize, 0);
+  assert.equal(cache.getStats().shaderPackGeneration, 1);
+  assert.equal(cache.isNegativeCached(d1), false);
+  assert.equal(cache.isNegativeCached(d3), false);
+  assert.equal(cache.getOrCreateRenderPipeline(goodDesc), goodPipeline); // still cached!
+
+  // Stale async rejection settles after pack update -> must NOT poison the new negative cache
+  staleDeferred.resolve();
+  await assert.rejects(stalePromise, /Stale async failure/);
+  assert.equal(cache.isNegativeCached(staleDesc), false);
+  assert.equal(cache.getStats().negativeCacheSize, 0);
+
+  // Previously broken descriptors now retry and compile cleanly against the updated shader pack
+  const fixedRender = cache.getOrCreateRenderPipeline(d1);
+  const fixedCompute = cache.getOrCreateComputePipeline(d3);
+  assert.equal(fixedRender.kind, 'GPURenderPipeline');
+  assert.equal(fixedCompute.kind, 'GPUComputePipeline');
+  assert.equal(syncComputeCalls, 2);
+
+  // 5. onShaderPackUpdated({ clearPipelines: true }) clears both negative and positive pipeline caches
+  shouldFail = true;
+  const d4 = { layout: 'auto', vertex: { module: vs, entryPoint: 'broken_4' } };
+  assert.throws(() => cache.getOrCreateRenderPipeline(d4), /Broken shader/);
+  const fullUpdate = cache.onShaderPackUpdated({ clearPipelines: true });
+  assert.equal(fullUpdate.clearedNegativeEntries, 1);
+  assert.equal(fullUpdate.clearedPipelines, 3); // goodDesc + d1 + d3
+  assert.equal(fullUpdate.shaderPackGeneration, 2);
+  assert.equal(cache.getStats().renderCount, 0);
+  assert.equal(cache.getStats().computeCount, 0);
+  assert.equal(cache.getStats().negativeCacheSize, 0);
+
+  // 6. clearNegativeCache() removes entries and returns count; option validation works
+  assert.throws(() => cache.getOrCreateRenderPipeline(d4), /Broken shader/);
+  assert.equal(cache.clearNegativeCache(), 1);
+  assert.equal(cache.isNegativeCached(d4), false);
+
+  assert.throws(
+    () => new WebGpuPipelineCache({ device, enableNegativeCache: 'yes' }),
+    /enableNegativeCache must be a boolean/
+  );
+  assert.throws(
+    () => new WebGpuPipelineCache({ device, maxNegativeCacheEntries: 0 }),
+    /maxNegativeCacheEntries must be a positive integer/
+  );
+});
+
+test('W195 telemetry exposes hits, misses, negativeHits, evictions, avgCompileMs, and hitRate accurately', () => {
+  let clock = 0;
+  let failNext = false;
+  const compileDurations = [4.0, 8.0, 12.0];
+
+  const device = createMockGpuDevice({
+    renderSyncImpl: (desc, id) => {
+      if (failNext) {
+        throw new Error('invalid render descriptor');
+      }
+      clock += compileDurations.shift();
+      return { kind: 'GPURenderPipeline', id, desc };
+    },
+  });
+
+  const cache = new WebGpuPipelineCache({
+    device,
+    maxRenderPipelines: 2,
+    now: () => clock,
+  });
+  const vs = device.createShaderModule({ label: 'wgpk:vertex:0x0000000000060001', code: 'vs' });
+  const r1 = { layout: 'auto', vertex: { module: vs, entryPoint: 'vs_1' } };
+  const r2 = { layout: 'auto', vertex: { module: vs, entryPoint: 'vs_2' } };
+  const r3 = { layout: 'auto', vertex: { module: vs, entryPoint: 'vs_3' } };
+  const rBad = { layout: 'auto', vertex: { module: vs, entryPoint: 'vs_bad' } };
+
+  // Initial empty stats
+  let stats = cache.getStats();
+  assert.equal(stats.hits, 0);
+  assert.equal(stats.misses, 0);
+  assert.equal(stats.negativeHits, 0);
+  assert.equal(stats.evictions, 0);
+  assert.equal(stats.avgCompileMs, 0);
+  assert.equal(stats.hitRate, 0);
+
+  // 3 misses (1 eviction since maxRenderPipelines = 2) + 3 hits -> hitRate = 3 / 6 = 0.5
+  cache.getOrCreateRenderPipeline(r1); // miss, 4ms
+  cache.getOrCreateRenderPipeline(r1); // hit
+  cache.getOrCreateRenderPipeline(r2); // miss, 8ms
+  cache.getOrCreateRenderPipeline(r2); // hit
+  cache.getOrCreateRenderPipeline(r3); // miss, 12ms -> evicts r1
+  cache.getOrCreateRenderPipeline(r3); // hit
+
+  // 1 broken compile miss + 2 negative cache hits
+  failNext = true;
+  assert.throws(() => cache.getOrCreateRenderPipeline(rBad), /invalid render descriptor/);
+  assert.equal(cache.getOrCreateRenderPipeline(rBad), null);
+  assert.equal(cache.getOrCreateRenderPipeline(rBad), null);
+
+  stats = cache.getStats();
+  assert.equal(stats.hits, 3);
+  assert.equal(stats.misses, 4);
+  assert.equal(stats.negativeHits, 2);
+  assert.equal(stats.evictions, 1);
+  assert.equal(stats.compileCount, 3);
+  assert.equal(stats.totalCompileMs, 24.0);
+  assert.equal(stats.avgCompileMs, 8.0);
+  assert.equal(stats.hitRate, 3 / 7);
+  assert.equal(stats.cacheBreakdown.total.hitRate, 3 / 7);
+
+  // keyHint fast path hits cache and negative cache cleanly
+  const keyR3 = hashDescriptorKey(r3);
+  const keyBad = hashDescriptorKey(rBad);
+  assert.ok(cache.getOrCreateRenderPipeline(r3, keyR3));
+  assert.equal(cache.getOrCreateRenderPipeline(rBad, keyBad), null);
+  stats = cache.getStats();
+  assert.equal(stats.hits, 4);
+  assert.equal(stats.negativeHits, 3);
+  assert.equal(stats.hitRate, 4 / 8);
+
+  // clear({ resetStats: true }) resets all telemetry cleanly
+  cache.clear({ resetStats: true });
+  stats = cache.getStats();
+  assert.equal(stats.hits, 0);
+  assert.equal(stats.misses, 0);
+  assert.equal(stats.negativeHits, 0);
+  assert.equal(stats.evictions, 0);
+  assert.equal(stats.avgCompileMs, 0);
+  assert.equal(stats.hitRate, 0);
 });

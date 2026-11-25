@@ -11,6 +11,7 @@
   const DEFAULT_PREWARM_CONCURRENCY = 4;
   const DEFAULT_MAX_ERROR_HISTORY = 32;
   const DEFAULT_MAX_QUARANTINED_KEYS = 512;
+  const DEFAULT_MAX_NEGATIVE_CACHE_ENTRIES = DEFAULT_MAX_QUARANTINED_KEYS;
   const MAX_PIPELINE_ERROR_MESSAGE_LENGTH = 512;
   const MAX_PIPELINE_ERROR_KEY_LENGTH = 64;
   const DEFAULT_MAX_VERTEX_BUFFERS = 8;
@@ -250,12 +251,17 @@
   });
 
   // 64-bit FNV-1a constants matching shaders/src/convert.rs & web/workers/wgsl_pack_loader.js.
-  const FNV1A_64_OFFSET_BASIS = 0xcbf29ce484222325n;
-  const FNV1A_64_PRIME = 0x00000100000001b3n;
+  // Computed in pure 32-bit limbs (hi/lo) on the hot path so lookup keys avoid BigInt & TextEncoder allocations.
+  const FNV1A_64_INIT_HI = 0xcbf29ce4;
+  const FNV1A_64_INIT_LO = 0x84222325;
   const U64_MASK = 0xffffffffffffffffn;
   const WGPK_LABEL_RE = /^wgpk:(?:vertex|fragment|compute):(0x[0-9a-f]{1,16})$/i;
 
-  const textEncoder = new TextEncoder();
+  // Precomputed decimal strings for common small non-negative integers (bindings, locations, strides, masks).
+  const SMALL_INT_STRINGS = new Array(257);
+  for (let i = 0; i <= 256; i += 1) {
+    SMALL_INT_STRINGS[i] = String(i);
+  }
 
   // WeakMaps for stable identity of opaque WebGPU objects (GPUShaderModule, GPUBindGroupLayout, etc.)
   // and user-registered WGPK/numeric shader module IDs without leaking GC references.
@@ -273,6 +279,108 @@
 
   function formatHashHex64(value) {
     return `0x${(value & U64_MASK).toString(16).padStart(16, '0')}`;
+  }
+
+  function fnv1a64UpdateByte(state, b) {
+    const lo = (state.lo ^ b) >>> 0;
+    const hi = state.hi;
+    const t0 = (lo & 0xffff) * 0x1b3;
+    const t1 = (lo >>> 16) * 0x1b3 + (t0 >>> 16);
+    state.lo = (((t1 & 0xffff) << 16) | (t0 & 0xffff)) >>> 0;
+    state.hi = (Math.imul(hi, 0x1b3) + ((lo << 8) >>> 0) + (t1 >>> 16)) >>> 0;
+  }
+
+  function fnv1a64UpdateString(state, str) {
+    let lo = state.lo;
+    let hi = state.hi;
+    const len = str.length;
+    for (let i = 0; i < len; i += 1) {
+      let c = str.charCodeAt(i);
+      if (c < 0x80) {
+        lo = (lo ^ c) >>> 0;
+        const t0 = (lo & 0xffff) * 0x1b3;
+        const t1 = (lo >>> 16) * 0x1b3 + (t0 >>> 16);
+        hi = (Math.imul(hi, 0x1b3) + ((lo << 8) >>> 0) + (t1 >>> 16)) >>> 0;
+        lo = (((t1 & 0xffff) << 16) | (t0 & 0xffff)) >>> 0;
+      } else {
+        // UTF-8 encode code points >= 0x80 (including surrogate pairs) identically to TextEncoder.
+        if (c >= 0xd800 && c <= 0xdbff && i + 1 < len) {
+          const next = str.charCodeAt(i + 1);
+          if (next >= 0xdc00 && next <= 0xdfff) {
+            c = 0x10000 + (((c - 0xd800) << 10) | (next - 0xdc00));
+            i += 1;
+          } else {
+            c = 0xfffd;
+          }
+        } else if (c >= 0xd800 && c <= 0xdfff) {
+          c = 0xfffd;
+        }
+        state.hi = hi;
+        state.lo = lo;
+        if (c < 0x800) {
+          fnv1a64UpdateByte(state, 0xc0 | (c >> 6));
+          fnv1a64UpdateByte(state, 0x80 | (c & 0x3f));
+        } else if (c < 0x10000) {
+          fnv1a64UpdateByte(state, 0xe0 | (c >> 12));
+          fnv1a64UpdateByte(state, 0x80 | ((c >> 6) & 0x3f));
+          fnv1a64UpdateByte(state, 0x80 | (c & 0x3f));
+        } else {
+          fnv1a64UpdateByte(state, 0xf0 | (c >> 18));
+          fnv1a64UpdateByte(state, 0x80 | ((c >> 12) & 0x3f));
+          fnv1a64UpdateByte(state, 0x80 | ((c >> 6) & 0x3f));
+          fnv1a64UpdateByte(state, 0x80 | (c & 0x3f));
+        }
+        hi = state.hi;
+        lo = state.lo;
+      }
+    }
+    state.hi = hi;
+    state.lo = lo;
+  }
+
+  function fnv1a64FinalizeHex(state) {
+    return (
+      '0x' +
+      (state.hi >>> 0).toString(16).padStart(8, '0') +
+      (state.lo >>> 0).toString(16).padStart(8, '0')
+    );
+  }
+
+  /**
+   * Compute a 64-bit FNV-1a hex digest (`0x` + 16 hex digits) over a UTF-8 string
+   * using pure 32-bit arithmetic (zero BigInt or TextEncoder allocations).
+   *
+   * @param {string} str
+   * @returns {string}
+   */
+  function fnv1a64Hex(str) {
+    const state = { hi: FNV1A_64_INIT_HI, lo: FNV1A_64_INIT_LO };
+    fnv1a64UpdateString(state, String(str));
+    return fnv1a64FinalizeHex(state);
+  }
+
+  function formatCanonicalNumber(n) {
+    if (n >= 0 && n <= 256 && (n | 0) === n) {
+      return SMALL_INT_STRINGS[n];
+    }
+    if (Number.isNaN(n)) return 'NaN';
+    if (n === Infinity) return 'Inf';
+    if (n === -Infinity) return '-Inf';
+    return Object.is(n, -0) ? '0' : String(n);
+  }
+
+  function emitToken(sink, str) {
+    if (sink.state !== null) {
+      fnv1a64UpdateString(sink.state, str);
+    } else {
+      sink.buf += str;
+    }
+  }
+
+  function emitLenStr(sink, str) {
+    emitToken(sink, formatCanonicalNumber(str.length));
+    emitToken(sink, ':');
+    emitToken(sink, str);
   }
 
   function normalizeShaderId(id) {
@@ -352,16 +460,16 @@
     if (typeof val.label === 'string') {
       const m = WGPK_LABEL_RE.exec(val.label);
       if (m) {
-        return `wgpk:${formatHashHex64(BigInt(m[1]))}`;
+        return `wgpk:0x${m[1].slice(2).toLowerCase().padStart(16, '0')}`;
       }
     }
     return null;
   }
 
   function hasEnumerableDataKeys(val) {
-    const keys = Object.keys(val);
-    for (let i = 0; i < keys.length; i += 1) {
-      const v = val[keys[i]];
+    for (const k in val) {
+      if (!Object.prototype.hasOwnProperty.call(val, k)) continue;
+      const v = val[k];
       if (v !== undefined && typeof v !== 'function') {
         return true;
       }
@@ -369,46 +477,925 @@
     return false;
   }
 
-  function canonicalizeValue(val, keyName, ancestors) {
+  function isPlainRecordObject(val) {
+    if (!val || typeof val !== 'object' || Array.isArray(val)) return false;
+    if (
+      val instanceof Map ||
+      val instanceof Set ||
+      ArrayBuffer.isView(val) ||
+      val instanceof ArrayBuffer ||
+      (typeof SharedArrayBuffer !== 'undefined' && val instanceof SharedArrayBuffer)
+    ) {
+      return false;
+    }
+    if (registeredObjectIds.has(val) || isDuckTypedShaderModule(val) || isNativeWebGpuObject(val)) {
+      return false;
+    }
+    return true;
+  }
+
+  // Resolve a `module` or `layout` slot to a canonical token without allocating key arrays.
+  // Returns null if `val` is a structured non-GPU object that needs generic recursive traversal.
+  function resolveGpuHandleToken(val) {
     if (val === null) return 'null';
     const t = typeof val;
-    if (t === 'undefined') return 'undef';
-    if (t === 'boolean') return val ? 'b:1' : 'b:0';
-    if (t === 'number') {
-      if (Number.isNaN(val)) return 'n:NaN';
-      if (val === Infinity) return 'n:Inf';
-      if (val === -Infinity) return 'n:-Inf';
-      return Object.is(val, -0) ? 'n:0' : `n:${String(val)}`;
+    if (t === 'string') {
+      return val === 'auto' ? 'auto' : `s:${val.length}:${val}`;
     }
     if (t === 'bigint') {
       return `bi:${val.toString(10)}`;
     }
+    if (t === 'number') {
+      return `n:${formatCanonicalNumber(val)}`;
+    }
+    if (t !== 'object') {
+      return null;
+    }
+    const registered = registeredObjectIds.get(val);
+    if (registered !== undefined) {
+      return `reg:${registered}`;
+    }
+    const explicitId = extractExplicitShaderId(val);
+    if (explicitId !== null) {
+      return `gpu:${explicitId}`;
+    }
+    if (isDuckTypedShaderModule(val) || isNativeWebGpuObject(val) || !hasEnumerableDataKeys(val)) {
+      return `gpu-oid:${getOpaqueObjectId(val)}`;
+    }
+    return null;
+  }
+
+  function isFastConstantsObject(obj) {
+    if (!isPlainRecordObject(obj)) return false;
+    for (const k in obj) {
+      if (!Object.prototype.hasOwnProperty.call(obj, k)) continue;
+      const v = obj[k];
+      if (v === undefined || typeof v === 'function') continue;
+      if (typeof v !== 'number' && typeof v !== 'boolean') {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function emitFastConstants(obj, sink) {
+    const keys = [];
+    for (const k in obj) {
+      if (!Object.prototype.hasOwnProperty.call(obj, k)) continue;
+      const v = obj[k];
+      if (v === undefined || typeof v === 'function') continue;
+      keys.push(k);
+    }
+    if (keys.length > 1) {
+      keys.sort();
+    }
+    emitToken(sink, '|c:');
+    emitToken(sink, formatCanonicalNumber(keys.length));
+    emitToken(sink, ':[');
+    for (let i = 0; i < keys.length; i += 1) {
+      if (i > 0) emitToken(sink, ',');
+      const k = keys[i];
+      const v = obj[k];
+      emitLenStr(sink, k);
+      if (typeof v === 'boolean') {
+        emitToken(sink, v ? '=b:1' : '=b:0');
+      } else {
+        emitToken(sink, '=n:');
+        emitToken(sink, formatCanonicalNumber(v));
+      }
+    }
+    emitToken(sink, ']');
+  }
+
+  function isFastVertexAttribute(attr) {
+    if (!isPlainRecordObject(attr)) return false;
+    for (const k in attr) {
+      if (!Object.prototype.hasOwnProperty.call(attr, k)) continue;
+      const v = attr[k];
+      if (v === undefined || typeof v === 'function') continue;
+      if (k === 'format') {
+        if (typeof v !== 'string') return false;
+      } else if (k === 'offset' || k === 'shaderLocation') {
+        if (typeof v !== 'number') return false;
+      } else {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function isFastVertexBuffer(buf) {
+    if (buf === null || buf === undefined) return true;
+    if (!isPlainRecordObject(buf)) return false;
+    for (const k in buf) {
+      if (!Object.prototype.hasOwnProperty.call(buf, k)) continue;
+      const v = buf[k];
+      if (v === undefined || typeof v === 'function') continue;
+      if (k === 'arrayStride') {
+        if (typeof v !== 'number') return false;
+      } else if (k === 'stepMode') {
+        if (typeof v !== 'string') return false;
+      } else if (k === 'attributes') {
+        if (!Array.isArray(v)) return false;
+        for (let i = 0; i < v.length; i += 1) {
+          if (!isFastVertexAttribute(v[i])) return false;
+        }
+      } else {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function isFastVertexState(vertex) {
+    if (!isPlainRecordObject(vertex)) return false;
+    for (const k in vertex) {
+      if (!Object.prototype.hasOwnProperty.call(vertex, k)) continue;
+      const v = vertex[k];
+      if (v === undefined || typeof v === 'function') continue;
+      if (k === 'module') {
+        if (resolveGpuHandleToken(v) === null) return false;
+      } else if (k === 'entryPoint') {
+        if (typeof v !== 'string') return false;
+      } else if (k === 'buffers') {
+        if (!Array.isArray(v)) return false;
+        for (let i = 0; i < v.length; i += 1) {
+          if (!isFastVertexBuffer(v[i])) return false;
+        }
+      } else if (k === 'constants') {
+        if (!isFastConstantsObject(v)) return false;
+      } else {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function isFastBlendComponent(comp) {
+    if (!isPlainRecordObject(comp)) return false;
+    for (const k in comp) {
+      if (!Object.prototype.hasOwnProperty.call(comp, k)) continue;
+      const v = comp[k];
+      if (v === undefined || typeof v === 'function') continue;
+      if (k === 'operation' || k === 'srcFactor' || k === 'dstFactor') {
+        if (typeof v !== 'string') return false;
+      } else {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function isFastBlendState(blend) {
+    if (blend === null) return true;
+    if (!isPlainRecordObject(blend)) return false;
+    for (const k in blend) {
+      if (!Object.prototype.hasOwnProperty.call(blend, k)) continue;
+      const v = blend[k];
+      if (v === undefined || typeof v === 'function') continue;
+      if (k === 'color' || k === 'alpha') {
+        if (!isFastBlendComponent(v)) return false;
+      } else {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function isFastColorTarget(target) {
+    if (target === null || target === undefined) return true;
+    if (!isPlainRecordObject(target)) return false;
+    for (const k in target) {
+      if (!Object.prototype.hasOwnProperty.call(target, k)) continue;
+      const v = target[k];
+      if (v === undefined || typeof v === 'function') continue;
+      if (k === 'format') {
+        if (typeof v !== 'string') return false;
+      } else if (k === 'writeMask') {
+        if (typeof v !== 'number') return false;
+      } else if (k === 'blend') {
+        if (!isFastBlendState(v)) return false;
+      } else {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function isFastFragmentState(fragment) {
+    if (!isPlainRecordObject(fragment)) return false;
+    for (const k in fragment) {
+      if (!Object.prototype.hasOwnProperty.call(fragment, k)) continue;
+      const v = fragment[k];
+      if (v === undefined || typeof v === 'function') continue;
+      if (k === 'module') {
+        if (resolveGpuHandleToken(v) === null) return false;
+      } else if (k === 'entryPoint') {
+        if (typeof v !== 'string') return false;
+      } else if (k === 'targets') {
+        if (!Array.isArray(v)) return false;
+        for (let i = 0; i < v.length; i += 1) {
+          if (!isFastColorTarget(v[i])) return false;
+        }
+      } else if (k === 'constants') {
+        if (!isFastConstantsObject(v)) return false;
+      } else {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function isFastPrimitiveState(prim) {
+    if (!isPlainRecordObject(prim)) return false;
+    for (const k in prim) {
+      if (!Object.prototype.hasOwnProperty.call(prim, k)) continue;
+      const v = prim[k];
+      if (v === undefined || typeof v === 'function') continue;
+      if (k === 'topology' || k === 'stripIndexFormat' || k === 'frontFace' || k === 'cullMode') {
+        if (typeof v !== 'string') return false;
+      } else if (k === 'unclippedDepth') {
+        if (typeof v !== 'boolean') return false;
+      } else {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function isFastStencilFace(face) {
+    if (!isPlainRecordObject(face)) return false;
+    for (const k in face) {
+      if (!Object.prototype.hasOwnProperty.call(face, k)) continue;
+      const v = face[k];
+      if (v === undefined || typeof v === 'function') continue;
+      if (k === 'compare' || k === 'failOp' || k === 'depthFailOp' || k === 'passOp') {
+        if (typeof v !== 'string') return false;
+      } else {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function isFastDepthStencilState(ds) {
+    if (ds === null) return true;
+    if (!isPlainRecordObject(ds)) return false;
+    for (const k in ds) {
+      if (!Object.prototype.hasOwnProperty.call(ds, k)) continue;
+      const v = ds[k];
+      if (v === undefined || typeof v === 'function') continue;
+      if (k === 'format' || k === 'depthCompare') {
+        if (typeof v !== 'string') return false;
+      } else if (k === 'depthWriteEnabled') {
+        if (typeof v !== 'boolean') return false;
+      } else if (k === 'stencilFront' || k === 'stencilBack') {
+        if (!isFastStencilFace(v)) return false;
+      } else if (
+        k === 'stencilReadMask' ||
+        k === 'stencilWriteMask' ||
+        k === 'depthBias' ||
+        k === 'depthBiasSlopeScale' ||
+        k === 'depthBiasClamp'
+      ) {
+        if (typeof v !== 'number') return false;
+      } else {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function isFastMultisampleState(ms) {
+    if (!isPlainRecordObject(ms)) return false;
+    for (const k in ms) {
+      if (!Object.prototype.hasOwnProperty.call(ms, k)) continue;
+      const v = ms[k];
+      if (v === undefined || typeof v === 'function') continue;
+      if (k === 'count' || k === 'mask') {
+        if (typeof v !== 'number') return false;
+      } else if (k === 'alphaToCoverageEnabled') {
+        if (typeof v !== 'boolean') return false;
+      } else {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function isFastRenderDescriptor(desc) {
+    if (!isPlainRecordObject(desc)) return false;
+    if (desc.vertex === undefined || !isFastVertexState(desc.vertex)) {
+      return false;
+    }
+    for (const k in desc) {
+      if (!Object.prototype.hasOwnProperty.call(desc, k)) continue;
+      const v = desc[k];
+      if (v === undefined || typeof v === 'function') continue;
+      switch (k) {
+        case 'vertex':
+          break;
+        case 'layout':
+          if (resolveGpuHandleToken(v) === null) return false;
+          break;
+        case 'label':
+          if (typeof v !== 'string') return false;
+          break;
+        case 'fragment':
+          if (!isFastFragmentState(v)) return false;
+          break;
+        case 'primitive':
+          if (!isFastPrimitiveState(v)) return false;
+          break;
+        case 'depthStencil':
+          if (!isFastDepthStencilState(v)) return false;
+          break;
+        case 'multisample':
+          if (!isFastMultisampleState(v)) return false;
+          break;
+        default:
+          return false;
+      }
+    }
+    return true;
+  }
+
+  function isFastComputeState(compute) {
+    if (!isPlainRecordObject(compute)) return false;
+    for (const k in compute) {
+      if (!Object.prototype.hasOwnProperty.call(compute, k)) continue;
+      const v = compute[k];
+      if (v === undefined || typeof v === 'function') continue;
+      if (k === 'module') {
+        if (resolveGpuHandleToken(v) === null) return false;
+      } else if (k === 'entryPoint') {
+        if (typeof v !== 'string') return false;
+      } else if (k === 'constants') {
+        if (!isFastConstantsObject(v)) return false;
+      } else {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function isFastComputeDescriptor(desc) {
+    if (!isPlainRecordObject(desc)) return false;
+    if (desc.compute === undefined || !isFastComputeState(desc.compute)) {
+      return false;
+    }
+    for (const k in desc) {
+      if (!Object.prototype.hasOwnProperty.call(desc, k)) continue;
+      const v = desc[k];
+      if (v === undefined || typeof v === 'function') continue;
+      if (k === 'compute') {
+        continue;
+      } else if (k === 'layout') {
+        if (resolveGpuHandleToken(v) === null) return false;
+      } else if (k === 'label') {
+        if (typeof v !== 'string') return false;
+      } else {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function isFastBindGroupLayoutEntry(entry) {
+    if (!isPlainRecordObject(entry)) return false;
+    for (const k in entry) {
+      if (!Object.prototype.hasOwnProperty.call(entry, k)) continue;
+      const v = entry[k];
+      if (v === undefined || typeof v === 'function') continue;
+      if (k === 'binding' || k === 'visibility') {
+        if (typeof v !== 'number') return false;
+      } else if (k === 'buffer') {
+        if (!isPlainRecordObject(v)) return false;
+        for (const bk in v) {
+          if (!Object.prototype.hasOwnProperty.call(v, bk)) continue;
+          const bv = v[bk];
+          if (bv === undefined || typeof bv === 'function') continue;
+          if (bk === 'type') {
+            if (typeof bv !== 'string') return false;
+          } else if (bk === 'hasDynamicOffset') {
+            if (typeof bv !== 'boolean') return false;
+          } else if (bk === 'minBindingSize') {
+            if (typeof bv !== 'number') return false;
+          } else {
+            return false;
+          }
+        }
+      } else if (k === 'sampler') {
+        if (!isPlainRecordObject(v)) return false;
+        for (const sk in v) {
+          if (!Object.prototype.hasOwnProperty.call(v, sk)) continue;
+          const sv = v[sk];
+          if (sv === undefined || typeof sv === 'function') continue;
+          if (sk === 'type') {
+            if (typeof sv !== 'string') return false;
+          } else {
+            return false;
+          }
+        }
+      } else if (k === 'texture') {
+        if (!isPlainRecordObject(v)) return false;
+        for (const tk in v) {
+          if (!Object.prototype.hasOwnProperty.call(v, tk)) continue;
+          const tv = v[tk];
+          if (tv === undefined || typeof tv === 'function') continue;
+          if (tk === 'sampleType' || tk === 'viewDimension') {
+            if (typeof tv !== 'string') return false;
+          } else if (tk === 'multisampled') {
+            if (typeof tv !== 'boolean') return false;
+          } else {
+            return false;
+          }
+        }
+      } else if (k === 'storageTexture') {
+        if (!isPlainRecordObject(v)) return false;
+        for (const stk in v) {
+          if (!Object.prototype.hasOwnProperty.call(v, stk)) continue;
+          const stv = v[stk];
+          if (stv === undefined || typeof stv === 'function') continue;
+          if (stk === 'access' || stk === 'format' || stk === 'viewDimension') {
+            if (typeof stv !== 'string') return false;
+          } else {
+            return false;
+          }
+        }
+      } else if (k === 'externalTexture') {
+        if (!isPlainRecordObject(v) || hasEnumerableDataKeys(v)) return false;
+      } else {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function isFastBindGroupLayoutDescriptor(desc) {
+    if (!isPlainRecordObject(desc)) return false;
+    if (!Array.isArray(desc.entries)) return false;
+    for (const k in desc) {
+      if (!Object.prototype.hasOwnProperty.call(desc, k)) continue;
+      const v = desc[k];
+      if (v === undefined || typeof v === 'function') continue;
+      if (k === 'entries') {
+        continue;
+      } else if (k === 'label') {
+        if (typeof v !== 'string') return false;
+      } else {
+        return false;
+      }
+    }
+    for (let i = 0; i < desc.entries.length; i += 1) {
+      if (!isFastBindGroupLayoutEntry(desc.entries[i])) return false;
+    }
+    return true;
+  }
+
+  function emitFastBlendComponent(comp, tag, sink) {
+    emitToken(sink, tag);
+    if (comp.operation !== undefined) {
+      emitToken(sink, 'o:');
+      emitLenStr(sink, comp.operation);
+    }
+    if (comp.srcFactor !== undefined) {
+      emitToken(sink, ';s:');
+      emitLenStr(sink, comp.srcFactor);
+    }
+    if (comp.dstFactor !== undefined) {
+      emitToken(sink, ';d:');
+      emitLenStr(sink, comp.dstFactor);
+    }
+    emitToken(sink, '}');
+  }
+
+  function emitFastStencilFace(face, tag, sink) {
+    emitToken(sink, tag);
+    if (face.compare !== undefined) {
+      emitToken(sink, 'c:');
+      emitLenStr(sink, face.compare);
+    }
+    if (face.failOp !== undefined) {
+      emitToken(sink, ';f:');
+      emitLenStr(sink, face.failOp);
+    }
+    if (face.depthFailOp !== undefined) {
+      emitToken(sink, ';d:');
+      emitLenStr(sink, face.depthFailOp);
+    }
+    if (face.passOp !== undefined) {
+      emitToken(sink, ';p:');
+      emitLenStr(sink, face.passOp);
+    }
+    emitToken(sink, '}');
+  }
+
+  function emitFastRenderDescriptor(desc, sink) {
+    emitToken(sink, 'r');
+    if (desc.layout !== undefined) {
+      emitToken(sink, '|l:');
+      emitLenStr(sink, resolveGpuHandleToken(desc.layout));
+    }
+    if (desc.label !== undefined) {
+      emitToken(sink, '|lbl:');
+      emitLenStr(sink, desc.label);
+    }
+
+    // Vertex state
+    const v = desc.vertex;
+    emitToken(sink, '|v:{');
+    if (v.module !== undefined) {
+      emitToken(sink, 'm:');
+      emitLenStr(sink, resolveGpuHandleToken(v.module));
+    }
+    if (v.entryPoint !== undefined) {
+      emitToken(sink, '|ep:');
+      emitLenStr(sink, v.entryPoint);
+    }
+    if (v.buffers !== undefined) {
+      const bufs = v.buffers;
+      emitToken(sink, '|vb:');
+      emitToken(sink, formatCanonicalNumber(bufs.length));
+      emitToken(sink, ':[');
+      for (let i = 0; i < bufs.length; i += 1) {
+        if (i > 0) emitToken(sink, ',');
+        const b = bufs[i];
+        if (b === null) {
+          emitToken(sink, 'N');
+        } else if (b === undefined) {
+          emitToken(sink, 'U');
+        } else {
+          emitToken(sink, 'B{');
+          if (b.arrayStride !== undefined) {
+            emitToken(sink, 'as:');
+            emitToken(sink, formatCanonicalNumber(b.arrayStride));
+          }
+          if (b.stepMode !== undefined) {
+            emitToken(sink, '|sm:');
+            emitLenStr(sink, b.stepMode);
+          }
+          if (b.attributes !== undefined) {
+            const attrs = b.attributes;
+            emitToken(sink, '|a:');
+            emitToken(sink, formatCanonicalNumber(attrs.length));
+            emitToken(sink, ':[');
+            for (let j = 0; j < attrs.length; j += 1) {
+              if (j > 0) emitToken(sink, ',');
+              const a = attrs[j];
+              emitToken(sink, '{');
+              if (a.shaderLocation !== undefined) {
+                emitToken(sink, 'l:');
+                emitToken(sink, formatCanonicalNumber(a.shaderLocation));
+              }
+              if (a.offset !== undefined) {
+                emitToken(sink, ';o:');
+                emitToken(sink, formatCanonicalNumber(a.offset));
+              }
+              if (a.format !== undefined) {
+                emitToken(sink, ';f:');
+                emitLenStr(sink, a.format);
+              }
+              emitToken(sink, '}');
+            }
+            emitToken(sink, ']');
+          }
+          emitToken(sink, '}');
+        }
+      }
+      emitToken(sink, ']');
+    }
+    if (v.constants !== undefined) {
+      emitFastConstants(v.constants, sink);
+    }
+    emitToken(sink, '}');
+
+    // Fragment state
+    if (desc.fragment !== undefined) {
+      const f = desc.fragment;
+      emitToken(sink, '|f:{');
+      if (f.module !== undefined) {
+        emitToken(sink, 'm:');
+        emitLenStr(sink, resolveGpuHandleToken(f.module));
+      }
+      if (f.entryPoint !== undefined) {
+        emitToken(sink, '|ep:');
+        emitLenStr(sink, f.entryPoint);
+      }
+      if (f.targets !== undefined) {
+        const targets = f.targets;
+        emitToken(sink, '|t:');
+        emitToken(sink, formatCanonicalNumber(targets.length));
+        emitToken(sink, ':[');
+        for (let i = 0; i < targets.length; i += 1) {
+          if (i > 0) emitToken(sink, ',');
+          const t = targets[i];
+          if (t === null) {
+            emitToken(sink, 'N');
+          } else if (t === undefined) {
+            emitToken(sink, 'U');
+          } else {
+            emitToken(sink, 'T{');
+            if (t.format !== undefined) {
+              emitToken(sink, 'f:');
+              emitLenStr(sink, t.format);
+            }
+            if (t.writeMask !== undefined) {
+              emitToken(sink, '|wm:');
+              emitToken(sink, formatCanonicalNumber(t.writeMask));
+            }
+            if (t.blend !== undefined) {
+              if (t.blend === null) {
+                emitToken(sink, '|bl:N');
+              } else {
+                emitToken(sink, '|bl:{');
+                if (t.blend.color !== undefined) {
+                  emitFastBlendComponent(t.blend.color, 'c:{', sink);
+                }
+                if (t.blend.alpha !== undefined) {
+                  emitFastBlendComponent(t.blend.alpha, '|a:{', sink);
+                }
+                emitToken(sink, '}');
+              }
+            }
+            emitToken(sink, '}');
+          }
+        }
+        emitToken(sink, ']');
+      }
+      if (f.constants !== undefined) {
+        emitFastConstants(f.constants, sink);
+      }
+      emitToken(sink, '}');
+    }
+
+    // Primitive state
+    if (desc.primitive !== undefined) {
+      const p = desc.primitive;
+      emitToken(sink, '|p:{');
+      if (p.topology !== undefined) {
+        emitToken(sink, 'top:');
+        emitLenStr(sink, p.topology);
+      }
+      if (p.stripIndexFormat !== undefined) {
+        emitToken(sink, '|sif:');
+        emitLenStr(sink, p.stripIndexFormat);
+      }
+      if (p.frontFace !== undefined) {
+        emitToken(sink, '|ff:');
+        emitLenStr(sink, p.frontFace);
+      }
+      if (p.cullMode !== undefined) {
+        emitToken(sink, '|cm:');
+        emitLenStr(sink, p.cullMode);
+      }
+      if (p.unclippedDepth !== undefined) {
+        emitToken(sink, p.unclippedDepth ? '|ud:1' : '|ud:0');
+      }
+      emitToken(sink, '}');
+    }
+
+    // Depth-stencil state
+    if (desc.depthStencil !== undefined) {
+      const ds = desc.depthStencil;
+      if (ds === null) {
+        emitToken(sink, '|ds:N');
+      } else {
+        emitToken(sink, '|ds:{');
+        if (ds.format !== undefined) {
+          emitToken(sink, 'f:');
+          emitLenStr(sink, ds.format);
+        }
+        if (ds.depthWriteEnabled !== undefined) {
+          emitToken(sink, ds.depthWriteEnabled ? '|dw:1' : '|dw:0');
+        }
+        if (ds.depthCompare !== undefined) {
+          emitToken(sink, '|dc:');
+          emitLenStr(sink, ds.depthCompare);
+        }
+        if (ds.stencilFront !== undefined) {
+          emitFastStencilFace(ds.stencilFront, '|sf:{', sink);
+        }
+        if (ds.stencilBack !== undefined) {
+          emitFastStencilFace(ds.stencilBack, '|sb:{', sink);
+        }
+        if (ds.stencilReadMask !== undefined) {
+          emitToken(sink, '|srm:');
+          emitToken(sink, formatCanonicalNumber(ds.stencilReadMask));
+        }
+        if (ds.stencilWriteMask !== undefined) {
+          emitToken(sink, '|swm:');
+          emitToken(sink, formatCanonicalNumber(ds.stencilWriteMask));
+        }
+        if (ds.depthBias !== undefined) {
+          emitToken(sink, '|db:');
+          emitToken(sink, formatCanonicalNumber(ds.depthBias));
+        }
+        if (ds.depthBiasSlopeScale !== undefined) {
+          emitToken(sink, '|dbs:');
+          emitToken(sink, formatCanonicalNumber(ds.depthBiasSlopeScale));
+        }
+        if (ds.depthBiasClamp !== undefined) {
+          emitToken(sink, '|dbc:');
+          emitToken(sink, formatCanonicalNumber(ds.depthBiasClamp));
+        }
+        emitToken(sink, '}');
+      }
+    }
+
+    // Multisample state
+    if (desc.multisample !== undefined) {
+      const ms = desc.multisample;
+      emitToken(sink, '|ms:{');
+      if (ms.count !== undefined) {
+        emitToken(sink, 'cnt:');
+        emitToken(sink, formatCanonicalNumber(ms.count));
+      }
+      if (ms.mask !== undefined) {
+        emitToken(sink, '|msk:');
+        emitToken(sink, formatCanonicalNumber(ms.mask));
+      }
+      if (ms.alphaToCoverageEnabled !== undefined) {
+        emitToken(sink, ms.alphaToCoverageEnabled ? '|atc:1' : '|atc:0');
+      }
+      emitToken(sink, '}');
+    }
+  }
+
+  function emitFastComputeDescriptor(desc, sink) {
+    emitToken(sink, 'c');
+    if (desc.layout !== undefined) {
+      emitToken(sink, '|l:');
+      emitLenStr(sink, resolveGpuHandleToken(desc.layout));
+    }
+    if (desc.label !== undefined) {
+      emitToken(sink, '|lbl:');
+      emitLenStr(sink, desc.label);
+    }
+    const cs = desc.compute;
+    emitToken(sink, '|cs:{');
+    if (cs.module !== undefined) {
+      emitToken(sink, 'm:');
+      emitLenStr(sink, resolveGpuHandleToken(cs.module));
+    }
+    if (cs.entryPoint !== undefined) {
+      emitToken(sink, '|ep:');
+      emitLenStr(sink, cs.entryPoint);
+    }
+    if (cs.constants !== undefined) {
+      emitFastConstants(cs.constants, sink);
+    }
+    emitToken(sink, '}');
+  }
+
+  function emitFastBindGroupLayoutDescriptor(desc, sink) {
+    emitToken(sink, 'bgl');
+    if (desc.label !== undefined) {
+      emitToken(sink, '|lbl:');
+      emitLenStr(sink, desc.label);
+    }
+    const entries = desc.entries;
+    emitToken(sink, '|e:');
+    emitToken(sink, formatCanonicalNumber(entries.length));
+    emitToken(sink, ':[');
+    for (let i = 0; i < entries.length; i += 1) {
+      if (i > 0) emitToken(sink, ',');
+      const e = entries[i];
+      emitToken(sink, '{');
+      if (e.binding !== undefined) {
+        emitToken(sink, 'b:');
+        emitToken(sink, formatCanonicalNumber(e.binding));
+      }
+      if (e.visibility !== undefined) {
+        emitToken(sink, '|v:');
+        emitToken(sink, formatCanonicalNumber(e.visibility));
+      }
+      if (e.buffer !== undefined) {
+        const b = e.buffer;
+        emitToken(sink, '|buf:{');
+        if (b.type !== undefined) {
+          emitToken(sink, 't:');
+          emitLenStr(sink, b.type);
+        }
+        if (b.hasDynamicOffset !== undefined) {
+          emitToken(sink, b.hasDynamicOffset ? '|do:1' : '|do:0');
+        }
+        if (b.minBindingSize !== undefined) {
+          emitToken(sink, '|mbs:');
+          emitToken(sink, formatCanonicalNumber(b.minBindingSize));
+        }
+        emitToken(sink, '}');
+      }
+      if (e.sampler !== undefined) {
+        emitToken(sink, '|smp:{');
+        if (e.sampler.type !== undefined) {
+          emitToken(sink, 't:');
+          emitLenStr(sink, e.sampler.type);
+        }
+        emitToken(sink, '}');
+      }
+      if (e.texture !== undefined) {
+        const tx = e.texture;
+        emitToken(sink, '|tex:{');
+        if (tx.sampleType !== undefined) {
+          emitToken(sink, 'st:');
+          emitLenStr(sink, tx.sampleType);
+        }
+        if (tx.viewDimension !== undefined) {
+          emitToken(sink, '|vd:');
+          emitLenStr(sink, tx.viewDimension);
+        }
+        if (tx.multisampled !== undefined) {
+          emitToken(sink, tx.multisampled ? '|ms:1' : '|ms:0');
+        }
+        emitToken(sink, '}');
+      }
+      if (e.storageTexture !== undefined) {
+        const st = e.storageTexture;
+        emitToken(sink, '|stx:{');
+        if (st.access !== undefined) {
+          emitToken(sink, 'a:');
+          emitLenStr(sink, st.access);
+        }
+        if (st.format !== undefined) {
+          emitToken(sink, '|f:');
+          emitLenStr(sink, st.format);
+        }
+        if (st.viewDimension !== undefined) {
+          emitToken(sink, '|vd:');
+          emitLenStr(sink, st.viewDimension);
+        }
+        emitToken(sink, '}');
+      }
+      if (e.externalTexture !== undefined) {
+        emitToken(sink, '|ext:{}');
+      }
+      emitToken(sink, '}');
+    }
+    emitToken(sink, ']');
+  }
+
+  function canonicalizeToSink(val, keyName, ancestors, sink) {
+    if (val === null) {
+      emitToken(sink, 'null');
+      return;
+    }
+    const t = typeof val;
+    if (t === 'undefined') {
+      emitToken(sink, 'undef');
+      return;
+    }
+    if (t === 'boolean') {
+      emitToken(sink, val ? 'b:1' : 'b:0');
+      return;
+    }
+    if (t === 'number') {
+      emitToken(sink, 'n:');
+      emitToken(sink, formatCanonicalNumber(val));
+      return;
+    }
+    if (t === 'bigint') {
+      emitToken(sink, 'bi:');
+      emitToken(sink, val.toString(10));
+      return;
+    }
     if (t === 'string') {
-      return `s:${val.length}:${val}`;
+      emitToken(sink, 's:');
+      emitLenStr(sink, val);
+      return;
     }
     if (t === 'symbol') {
-      return `sym:${String(val.description || '')}`;
+      emitToken(sink, 'sym:');
+      emitToken(sink, String(val.description || ''));
+      return;
     }
     if (t === 'function') {
-      return 'fn';
+      emitToken(sink, 'fn');
+      return;
     }
 
     // Check registered GPU resource / shader module IDs first.
     const registered = registeredObjectIds.get(val);
     if (registered !== undefined) {
-      return `reg:${registered}`;
+      emitToken(sink, 'reg:');
+      emitToken(sink, registered);
+      return;
     }
 
     // Handle native/opaque WebGPU objects and shader modules before walking keys.
     const isShaderOrLayoutSlot = keyName === 'module' || keyName === 'layout';
-    const isGpuHandle = isNativeWebGpuObject(val) || isDuckTypedShaderModule(val);
+    const isGpuHandle = isDuckTypedShaderModule(val) || isNativeWebGpuObject(val);
     if (isGpuHandle || isShaderOrLayoutSlot) {
       const explicitId = extractExplicitShaderId(val);
       if (explicitId !== null) {
-        return `gpu:${explicitId}`;
+        emitToken(sink, 'gpu:');
+        emitToken(sink, explicitId);
+        return;
       }
       if (isGpuHandle || !hasEnumerableDataKeys(val)) {
-        return `gpu-oid:${getOpaqueObjectId(val)}`;
+        emitToken(sink, 'gpu-oid:');
+        emitToken(sink, formatCanonicalNumber(getOpaqueObjectId(val)));
+        return;
       }
     }
 
@@ -418,89 +1405,167 @@
 
     if (Array.isArray(val)) {
       ancestors.add(val);
-      const parts = new Array(val.length);
+      emitToken(sink, 'a:');
+      emitToken(sink, formatCanonicalNumber(val.length));
+      emitToken(sink, ':[');
       for (let i = 0; i < val.length; i += 1) {
-        parts[i] = canonicalizeValue(val[i], null, ancestors);
+        if (i > 0) emitToken(sink, ',');
+        canonicalizeToSink(val[i], null, ancestors, sink);
       }
+      emitToken(sink, ']');
       ancestors.delete(val);
-      return `a:${val.length}:[${parts.join(',')}]`;
+      return;
     }
 
     if (ArrayBuffer.isView(val)) {
       const bytes = new Uint8Array(val.buffer, val.byteOffset, val.byteLength);
-      let hex = '';
-      for (let i = 0; i < bytes.length; i += 1) {
-        hex += bytes[i].toString(16).padStart(2, '0');
-      }
       const ctorName = val.constructor ? val.constructor.name : 'View';
-      return `bin:${ctorName}:${bytes.byteLength}:${hex}`;
+      emitToken(sink, 'bin:');
+      emitToken(sink, ctorName);
+      emitToken(sink, ':');
+      emitToken(sink, formatCanonicalNumber(bytes.byteLength));
+      emitToken(sink, ':');
+      for (let i = 0; i < bytes.length; i += 1) {
+        emitToken(sink, bytes[i].toString(16).padStart(2, '0'));
+      }
+      return;
     }
 
-    if (val instanceof ArrayBuffer || (typeof SharedArrayBuffer !== 'undefined' && val instanceof SharedArrayBuffer)) {
+    if (
+      val instanceof ArrayBuffer ||
+      (typeof SharedArrayBuffer !== 'undefined' && val instanceof SharedArrayBuffer)
+    ) {
       const bytes = new Uint8Array(val);
-      let hex = '';
+      emitToken(sink, 'ab:');
+      emitToken(sink, formatCanonicalNumber(bytes.byteLength));
+      emitToken(sink, ':');
       for (let i = 0; i < bytes.length; i += 1) {
-        hex += bytes[i].toString(16).padStart(2, '0');
+        emitToken(sink, bytes[i].toString(16).padStart(2, '0'));
       }
-      return `ab:${bytes.byteLength}:${hex}`;
+      return;
     }
 
     if (val instanceof Set) {
       ancestors.add(val);
       const items = [];
       for (const item of val) {
-        items.push(canonicalizeValue(item, null, ancestors));
+        const subSink = { state: null, buf: '' };
+        canonicalizeToSink(item, null, ancestors, subSink);
+        items.push(subSink.buf);
       }
       ancestors.delete(val);
       items.sort();
-      return `set:${items.length}:[${items.join(',')}]`;
+      emitToken(sink, 'set:');
+      emitToken(sink, formatCanonicalNumber(items.length));
+      emitToken(sink, ':[');
+      for (let i = 0; i < items.length; i += 1) {
+        if (i > 0) emitToken(sink, ',');
+        emitToken(sink, items[i]);
+      }
+      emitToken(sink, ']');
+      return;
     }
 
     if (val instanceof Map) {
       ancestors.add(val);
       const pairs = [];
       for (const [k, v] of val.entries()) {
-        pairs.push(`${canonicalizeValue(k, null, ancestors)}=>${canonicalizeValue(v, null, ancestors)}`);
+        const kSink = { state: null, buf: '' };
+        const vSink = { state: null, buf: '' };
+        canonicalizeToSink(k, null, ancestors, kSink);
+        canonicalizeToSink(v, null, ancestors, vSink);
+        pairs.push(`${kSink.buf}=>${vSink.buf}`);
       }
       ancestors.delete(val);
       pairs.sort();
-      return `map:${pairs.length}:{${pairs.join(',')}}`;
+      emitToken(sink, 'map:');
+      emitToken(sink, formatCanonicalNumber(pairs.length));
+      emitToken(sink, ':{');
+      for (let i = 0; i < pairs.length; i += 1) {
+        if (i > 0) emitToken(sink, ',');
+        emitToken(sink, pairs[i]);
+      }
+      emitToken(sink, '}');
+      return;
     }
 
     // Plain/structured object: sort keys lexicographically for insertion-order invariance.
     ancestors.add(val);
     const keys = Object.keys(val).sort();
-    const fields = [];
+    let count = 0;
+    for (let i = 0; i < keys.length; i += 1) {
+      const v = val[keys[i]];
+      if (v !== undefined && typeof v !== 'function') {
+        count += 1;
+      }
+    }
+    emitToken(sink, 'o:');
+    emitToken(sink, formatCanonicalNumber(count));
+    emitToken(sink, ':{');
+    let emitted = 0;
     for (let i = 0; i < keys.length; i += 1) {
       const k = keys[i];
       const v = val[k];
       if (v === undefined || typeof v === 'function') {
         continue;
       }
-      fields.push(`${k.length}:${k}=${canonicalizeValue(v, k, ancestors)}`);
+      if (emitted > 0) emitToken(sink, ',');
+      emitLenStr(sink, k);
+      emitToken(sink, '=');
+      canonicalizeToSink(v, k, ancestors, sink);
+      emitted += 1;
     }
+    emitToken(sink, '}');
     ancestors.delete(val);
-    return `o:${fields.length}:{${fields.join(',')}}`;
+  }
+
+  function emitDescriptorToSink(obj, sink) {
+    if (isFastRenderDescriptor(obj)) {
+      emitFastRenderDescriptor(obj, sink);
+      return;
+    }
+    if (isFastComputeDescriptor(obj)) {
+      emitFastComputeDescriptor(obj, sink);
+      return;
+    }
+    if (isFastBindGroupLayoutDescriptor(obj)) {
+      emitFastBindGroupLayoutDescriptor(obj, sink);
+      return;
+    }
+    canonicalizeToSink(obj, null, new Set(), sink);
+  }
+
+  /**
+   * Build a compact, deterministic, 100% injective string key directly from WebGPU pipeline or
+   * bind-group-layout descriptor fields without `JSON.stringify` or `Object.keys().sort()` on the
+   * hot path. Covers color targets, blend state, depth/stencil, primitive topology, vertex layout,
+   * multisample state, pipeline layout, and shader hashes/IDs; falls back cleanly for arbitrary JS
+   * descriptors. Satisfies `fnv1a64Hex(buildFastPipelineKey(desc)) === hashDescriptorKey(desc)`.
+   *
+   * @param {unknown} descriptor
+   * @returns {string}
+   */
+  function buildFastPipelineKey(descriptor) {
+    const sink = { state: null, buf: '' };
+    emitDescriptorToSink(descriptor, sink);
+    return sink.buf;
   }
 
   /**
    * Compute a deterministic canonical FNV-1a 64-bit hex hash (`0x` + 16 hex digits)
    * for any WebGPU descriptor or nested JS value, independent of object key insertion order.
-   * Supports `BigInt`, nested arrays/objects, TypedArrays, `Map`/`Set`, opaque `GPUShaderModule`s,
+   * Uses a zero-`JSON.stringify`, zero-`Object.keys().sort()`, zero-`BigInt`, zero-`TextEncoder`
+   * direct field streamer for standard render/compute/bind-group-layout descriptors, and supports
+   * `BigInt`, nested arrays/objects, TypedArrays, `Map`/`Set`, opaque `GPUShaderModule`s,
    * and WGPK shader hashes.
    *
    * @param {unknown} obj
    * @returns {string}
    */
   function hashDescriptorKey(obj) {
-    const canonical = canonicalizeValue(obj, null, new Set());
-    const bytes = textEncoder.encode(canonical);
-    let hash = FNV1A_64_OFFSET_BASIS;
-    for (let i = 0; i < bytes.length; i += 1) {
-      hash ^= BigInt(bytes[i]);
-      hash = (hash * FNV1A_64_PRIME) & U64_MASK;
-    }
-    return formatHashHex64(hash);
+    const state = { hi: FNV1A_64_INIT_HI, lo: FNV1A_64_INIT_LO };
+    emitDescriptorToSink(obj, { state, buf: '' });
+    return fnv1a64FinalizeHex(state);
   }
 
   function normalizeVisibility(visibility) {
@@ -1898,15 +2963,32 @@
       ) {
         throw new TypeError('options.quarantineFailedKeys must be a boolean when provided');
       }
+      if (
+        options.enableNegativeCache !== undefined &&
+        typeof options.enableNegativeCache !== 'boolean'
+      ) {
+        throw new TypeError('options.enableNegativeCache must be a boolean when provided');
+      }
       this._quarantineFailedKeys =
-        options.quarantineFailedKeys !== undefined ? options.quarantineFailedKeys : true;
+        options.quarantineFailedKeys !== undefined
+          ? options.quarantineFailedKeys
+          : options.enableNegativeCache !== undefined
+            ? options.enableNegativeCache
+            : true;
 
-      this._maxQuarantinedKeys = validatePositiveInt(
-        options.maxQuarantinedKeys !== undefined
-          ? options.maxQuarantinedKeys
-          : DEFAULT_MAX_QUARANTINED_KEYS,
-        'maxQuarantinedKeys'
-      );
+      if (options.maxQuarantinedKeys !== undefined) {
+        this._maxQuarantinedKeys = validatePositiveInt(
+          options.maxQuarantinedKeys,
+          'maxQuarantinedKeys'
+        );
+      } else if (options.maxNegativeCacheEntries !== undefined) {
+        this._maxQuarantinedKeys = validatePositiveInt(
+          options.maxNegativeCacheEntries,
+          'maxNegativeCacheEntries'
+        );
+      } else {
+        this._maxQuarantinedKeys = DEFAULT_MAX_QUARANTINED_KEYS;
+      }
 
       if (options.now !== undefined && typeof options.now !== 'function') {
         throw new TypeError('options.now must be a function when provided');
@@ -1940,6 +3022,7 @@
       this._inFlightCompute = new Map();
       this._quarantinedKeys = new Map();
       this._generation = 0;
+      this._shaderPackGeneration = 0;
 
       this._pipelineErrors = [];
       this._pipelineErrorSeq = 0;
@@ -1959,6 +3042,7 @@
         totalCompileMs: 0,
         maxCompileMs: 0,
         quarantineHits: 0,
+        negativeCacheEvictions: 0,
         fallbackNormalizedCount: 0,
         vertexLayoutNormalizedCount: 0,
         layoutNormalizedCount: 0,
@@ -2404,6 +3488,7 @@
       while (this._quarantinedKeys.size > this._maxQuarantinedKeys) {
         const oldestKey = this._quarantinedKeys.keys().next().value;
         this._quarantinedKeys.delete(oldestKey);
+        this._stats.negativeCacheEvictions += 1;
       }
     }
 
@@ -2543,6 +3628,77 @@
     }
 
     /**
+     * Check whether a canonical pipeline key, keyHint, or pipeline descriptor is currently
+     * in the bounded negative cache due to a previous failed/invalid compilation.
+     *
+     * @param {string | bigint | number | object} keyOrDescriptor
+     * @param {string | bigint | number | object} [keyHint]
+     * @returns {boolean}
+     */
+    isNegativeCached(keyOrDescriptor, keyHint) {
+      return this.isQuarantined(keyOrDescriptor, keyHint);
+    }
+
+    /**
+     * Return shallow sanitized copies of currently negative-cached (quarantined) pipeline entries.
+     *
+     * @returns {Array<object>}
+     */
+    getNegativeCacheEntries() {
+      return this.getQuarantinedKeys();
+    }
+
+    /**
+     * Clear all negative-cached (quarantined) failed pipeline keys so future lookups may retry.
+     *
+     * @returns {number} Number of negative-cache entries removed
+     */
+    clearNegativeCache() {
+      return this.clearQuarantine();
+    }
+
+    /**
+     * Notify the cache that the active shader pack has been updated or reloaded.
+     * Clears the bounded negative cache so previously uncompileable descriptors can retry
+     * against the updated shaders, and bumps `shaderPackGeneration` so in-flight failures from
+     * the previous shader pack cannot re-poison the negative cache. When `options.clearPipelines`
+     * (or `options.invalidatePipelines`) is true, also clears cached render/compute pipelines.
+     *
+     * @param {{ clearPipelines?: boolean, invalidatePipelines?: boolean, resetStats?: boolean }} [options]
+     * @returns {{
+     *   clearedNegativeEntries: number,
+     *   clearedPipelines: number,
+     *   shaderPackGeneration: number,
+     * }}
+     */
+    onShaderPackUpdated(options = {}) {
+      const opts = options && typeof options === 'object' ? options : {};
+      this._shaderPackGeneration += 1;
+      const clearedNegativeEntries = this._quarantinedKeys.size;
+      this._quarantinedKeys.clear();
+
+      let clearedPipelines = 0;
+      if (opts.clearPipelines === true || opts.invalidatePipelines === true) {
+        clearedPipelines = this._renderPipelines.size + this._computePipelines.size;
+        this._generation += 1;
+        this._renderPipelines.clear();
+        this._computePipelines.clear();
+        this._inFlightRender.clear();
+        this._inFlightCompute.clear();
+      }
+
+      if (opts.resetStats === true) {
+        this._resetStatsCounters();
+      }
+
+      return {
+        clearedNegativeEntries,
+        clearedPipelines,
+        shaderPackGeneration: this._shaderPackGeneration,
+      };
+    }
+
+    /**
      * Return a cached `GPUBindGroupLayout` or create and cache it via `device.createBindGroupLayout`.
      *
      * @param {GPUBindGroupLayoutDescriptor} descriptor
@@ -2649,6 +3805,22 @@
       }
       if (typeof this._device.createRenderPipeline !== 'function') {
         throw new TypeError('device must provide a createRenderPipeline(descriptor) method');
+      }
+
+      if (
+        keyHint !== undefined &&
+        keyHint !== null &&
+        (typeof keyHint === 'string' || typeof keyHint === 'bigint' || typeof keyHint === 'number')
+      ) {
+        const hintKey = this._resolveKey(null, keyHint);
+        const hintCached = this._getLru(this._renderPipelines, hintKey);
+        if (hintCached !== undefined) {
+          this._stats.renderHits += 1;
+          return hintCached;
+        }
+        if (this._hitQuarantine(hintKey, 'render')) {
+          return null;
+        }
       }
 
       const opts = options && typeof options === 'object' ? options : null;
@@ -2811,6 +3983,32 @@
         );
       }
 
+      if (
+        keyHint !== undefined &&
+        keyHint !== null &&
+        (typeof keyHint === 'string' || typeof keyHint === 'bigint' || typeof keyHint === 'number')
+      ) {
+        let hintKey;
+        try {
+          hintKey = this._resolveKey(null, keyHint);
+        } catch (err) {
+          return Promise.reject(err);
+        }
+        const hintCached = this._getLru(this._renderPipelines, hintKey);
+        if (hintCached !== undefined) {
+          this._stats.renderHits += 1;
+          return Promise.resolve(hintCached);
+        }
+        const hintInFlight = this._inFlightRender.get(hintKey);
+        if (hintInFlight !== undefined) {
+          this._stats.inFlightDedupes += 1;
+          return hintInFlight;
+        }
+        if (this._hitQuarantine(hintKey, 'render')) {
+          return Promise.resolve(null);
+        }
+      }
+
       const opts = options && typeof options === 'object' ? options : null;
       let norm;
       let key;
@@ -2936,6 +4134,7 @@
       }
 
       const generation = this._generation;
+      const shaderPackGeneration = this._shaderPackGeneration;
       const invokeCreateAsync = (desc) => {
         try {
           return Promise.resolve(this._device.createRenderPipelineAsync(desc));
@@ -2955,7 +4154,7 @@
             fallbackProfile: norm.fallbackProfile,
             recovered: false,
           });
-          if (generation === this._generation) {
+          if (generation === this._generation && shaderPackGeneration === this._shaderPackGeneration) {
             this._quarantineKey(key, 'render', emptyErr);
           }
           return null;
@@ -2991,7 +4190,10 @@
                     fallbackProfile: norm.fallbackProfile,
                     recovered: false,
                   });
-                  if (generation === this._generation) {
+                  if (
+                    generation === this._generation &&
+                    shaderPackGeneration === this._shaderPackGeneration
+                  ) {
                     this._quarantineKey(key, 'render', emptyErr);
                   }
                   return null;
@@ -3024,7 +4226,10 @@
                   fallbackProfile: norm.fallbackProfile,
                   recovered: false,
                 });
-                if (generation === this._generation) {
+                if (
+                  generation === this._generation &&
+                  shaderPackGeneration === this._shaderPackGeneration
+                ) {
                   this._quarantineKey(key, 'render', retryErr);
                 }
                 throw retryErr;
@@ -3040,7 +4245,10 @@
             fallbackProfile: norm.fallbackProfile,
             recovered: false,
           });
-          if (generation === this._generation) {
+          if (
+            generation === this._generation &&
+            shaderPackGeneration === this._shaderPackGeneration
+          ) {
             this._quarantineKey(key, 'render', err);
           }
           throw err;
@@ -3105,6 +4313,22 @@
         throw new TypeError('device must provide a createComputePipeline(descriptor) method');
       }
 
+      if (
+        keyHint !== undefined &&
+        keyHint !== null &&
+        (typeof keyHint === 'string' || typeof keyHint === 'bigint' || typeof keyHint === 'number')
+      ) {
+        const hintKey = this._resolveKey(null, keyHint);
+        const hintCached = this._getLru(this._computePipelines, hintKey);
+        if (hintCached !== undefined) {
+          this._stats.computeHits += 1;
+          return hintCached;
+        }
+        if (this._hitQuarantine(hintKey, 'compute')) {
+          return null;
+        }
+      }
+
       const norm = normalizeComputePipelineDescriptor(descriptor);
       const effectiveDescriptor = norm.descriptor;
 
@@ -3158,6 +4382,32 @@
         return Promise.reject(
           new TypeError('getOrCreateComputePipelineAsync requires a descriptor object')
         );
+      }
+
+      if (
+        keyHint !== undefined &&
+        keyHint !== null &&
+        (typeof keyHint === 'string' || typeof keyHint === 'bigint' || typeof keyHint === 'number')
+      ) {
+        let hintKey;
+        try {
+          hintKey = this._resolveKey(null, keyHint);
+        } catch (err) {
+          return Promise.reject(err);
+        }
+        const hintCached = this._getLru(this._computePipelines, hintKey);
+        if (hintCached !== undefined) {
+          this._stats.computeHits += 1;
+          return Promise.resolve(hintCached);
+        }
+        const hintInFlight = this._inFlightCompute.get(hintKey);
+        if (hintInFlight !== undefined) {
+          this._stats.inFlightDedupes += 1;
+          return hintInFlight;
+        }
+        if (this._hitQuarantine(hintKey, 'compute')) {
+          return Promise.resolve(null);
+        }
       }
 
       let norm;
@@ -3219,6 +4469,7 @@
       }
 
       const generation = this._generation;
+      const shaderPackGeneration = this._shaderPackGeneration;
       let rawPromise;
       try {
         rawPromise = Promise.resolve(this._device.createComputePipelineAsync(effectiveDescriptor));
@@ -3236,7 +4487,10 @@
           if (!pipeline) {
             const emptyErr = new Error('createComputePipelineAsync returned empty pipeline');
             this._recordPipelineError('compute', emptyErr, { key });
-            if (generation === this._generation) {
+            if (
+              generation === this._generation &&
+              shaderPackGeneration === this._shaderPackGeneration
+            ) {
               this._quarantineKey(key, 'compute', emptyErr);
             }
             return null;
@@ -3253,7 +4507,10 @@
             this._inFlightCompute.delete(key);
           }
           this._recordPipelineError('compute', err, { key });
-          if (generation === this._generation) {
+          if (
+            generation === this._generation &&
+            shaderPackGeneration === this._shaderPackGeneration
+          ) {
             this._quarantineKey(key, 'compute', err);
           }
           throw err;
@@ -3390,6 +4647,35 @@
       return removed;
     }
 
+    _resetStatsCounters() {
+      this._stats.renderHits = 0;
+      this._stats.renderMisses = 0;
+      this._stats.computeHits = 0;
+      this._stats.computeMisses = 0;
+      this._stats.layoutHits = 0;
+      this._stats.layoutMisses = 0;
+      this._stats.samplerHits = 0;
+      this._stats.samplerMisses = 0;
+      this._stats.inFlightDedupes = 0;
+      this._stats.evictions = 0;
+      this._stats.compileCount = 0;
+      this._stats.totalCompileMs = 0;
+      this._stats.maxCompileMs = 0;
+      this._stats.quarantineHits = 0;
+      this._stats.negativeCacheEvictions = 0;
+      this._stats.fallbackNormalizedCount = 0;
+      this._stats.vertexLayoutNormalizedCount = 0;
+      this._stats.layoutNormalizedCount = 0;
+      this._stats.fallbackRecoveryCount = 0;
+      this._stats.pipelineErrorCount = 0;
+      this._stats.fallbackSamplersCreated = 0;
+      this._stats.fallbackSamplerBindingsSynthesized = 0;
+      this._stats.blendPipelineVariants = 0;
+      this._stats.srgbPipelineVariants = 0;
+      this._pipelineErrors.length = 0;
+      this._pipelineErrorSeq = 0;
+    }
+
     /**
      * Clear all cached render pipelines, compute pipelines, bind group layouts,
      * quarantined failed keys, and detach any in-flight compilations so stale results
@@ -3409,31 +4695,7 @@
       this._quarantinedKeys.clear();
 
       if (options && options.resetStats) {
-        this._stats.renderHits = 0;
-        this._stats.renderMisses = 0;
-        this._stats.computeHits = 0;
-        this._stats.computeMisses = 0;
-        this._stats.layoutHits = 0;
-        this._stats.layoutMisses = 0;
-        this._stats.samplerHits = 0;
-        this._stats.samplerMisses = 0;
-        this._stats.inFlightDedupes = 0;
-        this._stats.evictions = 0;
-        this._stats.compileCount = 0;
-        this._stats.totalCompileMs = 0;
-        this._stats.maxCompileMs = 0;
-        this._stats.quarantineHits = 0;
-        this._stats.fallbackNormalizedCount = 0;
-        this._stats.vertexLayoutNormalizedCount = 0;
-        this._stats.layoutNormalizedCount = 0;
-        this._stats.fallbackRecoveryCount = 0;
-        this._stats.pipelineErrorCount = 0;
-        this._stats.fallbackSamplersCreated = 0;
-        this._stats.fallbackSamplerBindingsSynthesized = 0;
-        this._stats.blendPipelineVariants = 0;
-        this._stats.srgbPipelineVariants = 0;
-        this._pipelineErrors.length = 0;
-        this._pipelineErrorSeq = 0;
+        this._resetStatsCounters();
       }
     }
 
@@ -3476,8 +4738,8 @@
     }
 
     /**
-     * Return a snapshot of cache hit/miss, deduplication, eviction, count, quarantine,
-     * normalization, error tracking, and compile-time telemetry.
+     * Return a snapshot of cache hit/miss, negative-cache, deduplication, eviction, count,
+     * quarantine, normalization, error tracking, and compile-time telemetry.
      */
     getStats() {
       const renderHits = this._stats.renderHits;
@@ -3490,12 +4752,24 @@
       const samplerMisses = this._stats.samplerMisses;
       const totalHits = renderHits + computeHits + layoutHits + samplerHits;
       const totalMisses = renderMisses + computeMisses + layoutMisses + samplerMisses;
-      const hitRate = (hits, misses) => {
+      const compileCount = this._stats.compileCount;
+      const totalCompileMs = this._stats.totalCompileMs;
+      const avgCompileMs = compileCount > 0 ? totalCompileMs / compileCount : 0;
+      const computeHitRate = (hits, misses) => {
         const total = hits + misses;
         return total > 0 ? hits / total : 0;
       };
+      const totalHitRate = computeHitRate(totalHits, totalMisses);
 
       return {
+        hits: totalHits,
+        misses: totalMisses,
+        negativeHits: this._stats.quarantineHits,
+        negativeCacheSize: this._quarantinedKeys.size,
+        negativeCacheEvictions: this._stats.negativeCacheEvictions,
+        hitRate: totalHitRate,
+        avgCompileMs,
+        shaderPackGeneration: this._shaderPackGeneration,
         renderHits,
         renderMisses,
         computeHits,
@@ -3510,8 +4784,8 @@
         computeCount: this._computePipelines.size,
         layoutCount: this._bindGroupLayouts.size,
         fallbackSamplerCount: this._defaultSamplers.size,
-        compileCount: this._stats.compileCount,
-        totalCompileMs: this._stats.totalCompileMs,
+        compileCount,
+        totalCompileMs,
         maxCompileMs: this._stats.maxCompileMs,
         quarantineHits: this._stats.quarantineHits,
         quarantinedKeys: this._quarantinedKeys.size,
@@ -3530,27 +4804,27 @@
           render: {
             hits: renderHits,
             misses: renderMisses,
-            hitRate: hitRate(renderHits, renderMisses),
+            hitRate: computeHitRate(renderHits, renderMisses),
           },
           compute: {
             hits: computeHits,
             misses: computeMisses,
-            hitRate: hitRate(computeHits, computeMisses),
+            hitRate: computeHitRate(computeHits, computeMisses),
           },
           layout: {
             hits: layoutHits,
             misses: layoutMisses,
-            hitRate: hitRate(layoutHits, layoutMisses),
+            hitRate: computeHitRate(layoutHits, layoutMisses),
           },
           sampler: {
             hits: samplerHits,
             misses: samplerMisses,
-            hitRate: hitRate(samplerHits, samplerMisses),
+            hitRate: computeHitRate(samplerHits, samplerMisses),
           },
           total: {
             hits: totalHits,
             misses: totalMisses,
-            hitRate: hitRate(totalHits, totalMisses),
+            hitRate: totalHitRate,
           },
         },
       };
@@ -3564,6 +4838,7 @@
     DEFAULT_PREWARM_CONCURRENCY,
     DEFAULT_MAX_ERROR_HISTORY,
     DEFAULT_MAX_QUARANTINED_KEYS,
+    DEFAULT_MAX_NEGATIVE_CACHE_ENTRIES,
     MAX_PIPELINE_ERROR_MESSAGE_LENGTH,
     DEFAULT_MAX_VERTEX_BUFFERS,
     DEFAULT_MAX_VERTEX_ATTRIBUTES,
@@ -3575,6 +4850,8 @@
     FRAME1_VERTEX_LAYOUT_24B,
     FALLBACK_BIND_GROUP_ENTRIES,
     DEFAULT_SAMPLER_DESCRIPTORS,
+    fnv1a64Hex,
+    buildFastPipelineKey,
     hashDescriptorKey,
     registerShaderModuleId,
     normalizeVisibility,
