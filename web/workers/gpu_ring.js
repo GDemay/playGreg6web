@@ -7,6 +7,10 @@
   const GPU_RING_HEADER_BYTES = 64;
   const GPU_RING_HEADER_WORDS = 16;
   const DEFAULT_CAPACITY_BYTES = 65536;
+  // Binary-compatible with playgta6::GpuPacketHeader (docs/gpu_commands.md):
+  //   u16 opcode (0..2), u16 flags (2..4), u32 payload_bytes (4..8).
+  const GPU_PACKET_HEADER_BYTES = 8;
+  const DEFAULT_BATCH_MAX_PACKETS = 256;
 
   // 32-bit word indices within the 64-byte header (offsets 0..64).
   const HEADER_INDEX = Object.freeze({
@@ -27,6 +31,20 @@
       value <= 0x80000000 &&
       (value & (value - 1)) === 0
     );
+  }
+
+  function sanitizeNonNegInt(value) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+      return 0;
+    }
+    return Math.floor(value);
+  }
+
+  function sanitizeNonNegNumber(value) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+      return 0;
+    }
+    return value;
   }
 
   function toUint8Array(input) {
@@ -59,6 +77,8 @@
     static HEADER_BYTES = GPU_RING_HEADER_BYTES;
     static HEADER_WORDS = GPU_RING_HEADER_WORDS;
     static HEADER_INDEX = HEADER_INDEX;
+    static PACKET_HEADER_BYTES = GPU_PACKET_HEADER_BYTES;
+    static DEFAULT_BATCH_MAX_PACKETS = DEFAULT_BATCH_MAX_PACKETS;
 
     static byteLength(capacityBytes) {
       if (!isPowerOfTwo(capacityBytes)) {
@@ -167,7 +187,31 @@
         byteOffset + GPU_RING_HEADER_BYTES,
         this._capacityBytes
       );
+      this._dataView = new DataView(
+        sab,
+        byteOffset + GPU_RING_HEADER_BYTES,
+        this._capacityBytes
+      );
+      this._headerScratch = new Uint8Array(GPU_PACKET_HEADER_BYTES);
+      this._headerScratchView = new DataView(this._headerScratch.buffer);
       this._scratch = null;
+
+      // Local throughput & backpressure telemetry (kept outside the 64-byte SAB ABI header).
+      this._batchesDrained = 0;
+      this._packetsDrained = 0;
+      this._maxBatchSize = 0;
+      this._backpressureWaits = 0;
+      this._peakOccupancyBytes = 0;
+    }
+
+    _recordOccupancy(bytes) {
+      if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes <= 0) {
+        return;
+      }
+      const clamped = bytes > this._capacityBytes ? this._capacityBytes : Math.floor(bytes);
+      if (clamped > this._peakOccupancyBytes) {
+        this._peakOccupancyBytes = clamped;
+      }
     }
 
     get sab() {
@@ -209,12 +253,28 @@
     availableBytes() {
       const writePos = Atomics.load(this._headerU32, HEADER_INDEX.WRITE_POS);
       const readPos = Atomics.load(this._headerU32, HEADER_INDEX.READ_POS);
-      return (writePos - readPos) >>> 0;
+      const avail = (writePos - readPos) >>> 0;
+      this._recordOccupancy(avail);
+      return avail;
     }
 
     freeBytes() {
       const used = this.availableBytes();
       return used >= this._capacityBytes ? 0 : this._capacityBytes - used;
+    }
+
+    /**
+     * Records an external producer backpressure wait (e.g. Atomics.wait / retry backoff).
+     *
+     * @param {number} [count=1]
+     * @returns {number} Updated backpressure wait count.
+     */
+    recordBackpressureWait(count = 1) {
+      const n = sanitizeNonNegInt(count);
+      if (n > 0) {
+        this._backpressureWaits += n;
+      }
+      return sanitizeNonNegInt(this._backpressureWaits);
     }
 
     /**
@@ -239,8 +299,10 @@
       const writePos = Atomics.load(this._headerU32, HEADER_INDEX.WRITE_POS);
       const readPos = Atomics.load(this._headerU32, HEADER_INDEX.READ_POS);
       const used = (writePos - readPos) >>> 0;
-      const free = this._capacityBytes - used;
+      this._recordOccupancy(used);
+      const free = used >= this._capacityBytes ? 0 : this._capacityBytes - used;
       if (len > free) {
+        this._backpressureWaits += 1;
         Atomics.add(this._headerU32, HEADER_INDEX.DROPPED_PACKETS, 1);
         return false;
       }
@@ -256,6 +318,7 @@
       Atomics.store(this._headerU32, HEADER_INDEX.WRITE_POS, nextWrite);
       Atomics.add(this._headerI32, HEADER_INDEX.NOTIFY_SEQ, 1);
       Atomics.notify(this._headerI32, HEADER_INDEX.NOTIFY_SEQ, 1);
+      this._recordOccupancy(used + len);
       return true;
     }
 
@@ -280,6 +343,7 @@
       if (avail === 0) {
         return 0;
       }
+      this._recordOccupancy(avail);
 
       const offset = (readPos & this._mask) >>> 0;
       let slice;
@@ -301,8 +365,161 @@
         callback(slice);
       } finally {
         Atomics.store(this._headerU32, HEADER_INDEX.READ_POS, nextRead);
+        Atomics.notify(this._headerI32, HEADER_INDEX.READ_POS, 1);
       }
       return avail;
+    }
+
+    /**
+     * Drains up to `maxPackets` complete framed GpuPacketHeader packets in a single
+     * bounded batch, publishing the updated `read_pos` once atomically at batch end.
+     * - Non-wrapping packets are passed as zero-copy subarrays directly over the SAB.
+     * - Only a packet that physically straddles the ring wrap boundary is linearized
+     *   into the reusable internal scratch buffer.
+     * - If `handler` throws mid-batch, only packets that completed prior to the error
+     *   are committed via `read_pos`; the failing packet and all subsequent packets
+     *   remain unread in the ring.
+     * - Views (`packet.bytes` / `packet.payload`) are only guaranteed valid for the
+     *   duration of the `handler` call; copy them if retaining across drains.
+     *
+     * @param {(packet: {opcode: number, flags: number, payloadBytes: number, payload: Uint8Array, bytes: Uint8Array, byteLength: number, wrapped: boolean}, index: number) => void} handler
+     * @param {number} [maxPackets=256]
+     * @returns {{packets: number, bytes: number, remainingBytes: number, wrapped: boolean}}
+     */
+    drainBatch(handler, maxPackets = DEFAULT_BATCH_MAX_PACKETS) {
+      if (typeof handler !== 'function') {
+        throw new TypeError('GpuRingBuffer.drainBatch requires a handler function');
+      }
+      let limit;
+      if (maxPackets === undefined || maxPackets === null) {
+        limit = DEFAULT_BATCH_MAX_PACKETS;
+      } else if (
+        typeof maxPackets !== 'number' ||
+        !Number.isSafeInteger(maxPackets) ||
+        maxPackets < 1
+      ) {
+        throw new RangeError(
+          `GpuRingBuffer.drainBatch maxPackets must be a positive safe integer, got ${maxPackets}`
+        );
+      } else {
+        limit = maxPackets;
+      }
+
+      const readPos = Atomics.load(this._headerU32, HEADER_INDEX.READ_POS);
+      const writePos = Atomics.load(this._headerU32, HEADER_INDEX.WRITE_POS);
+      const avail = (writePos - readPos) >>> 0;
+      if (avail === 0) {
+        return { packets: 0, bytes: 0, remainingBytes: 0, wrapped: false };
+      }
+
+      const boundedAvail = avail > this._capacityBytes ? this._capacityBytes : avail;
+      this._recordOccupancy(boundedAvail);
+
+      const startOffset = (readPos & this._mask) >>> 0;
+      let cursor = 0;
+      let completedPackets = 0;
+      let completedBytes = 0;
+
+      try {
+        while (completedPackets < limit) {
+          const remaining = boundedAvail - cursor;
+          if (remaining < GPU_PACKET_HEADER_BYTES) {
+            break;
+          }
+
+          const pktOffset = (((readPos + cursor) >>> 0) & this._mask) >>> 0;
+          let opcode;
+          let flags;
+          let payloadBytes;
+
+          if (pktOffset + GPU_PACKET_HEADER_BYTES <= this._capacityBytes) {
+            opcode = this._dataView.getUint16(pktOffset, true);
+            flags = this._dataView.getUint16(pktOffset + 2, true);
+            payloadBytes = this._dataView.getUint32(pktOffset + 4, true);
+          } else {
+            const firstHdr = this._capacityBytes - pktOffset;
+            this._headerScratch.set(
+              this._data.subarray(pktOffset, this._capacityBytes),
+              0
+            );
+            this._headerScratch.set(
+              this._data.subarray(0, GPU_PACKET_HEADER_BYTES - firstHdr),
+              firstHdr
+            );
+            opcode = this._headerScratchView.getUint16(0, true);
+            flags = this._headerScratchView.getUint16(2, true);
+            payloadBytes = this._headerScratchView.getUint32(4, true);
+          }
+
+          if (payloadBytes > remaining - GPU_PACKET_HEADER_BYTES) {
+            break;
+          }
+
+          const packetLen = GPU_PACKET_HEADER_BYTES + payloadBytes;
+          let bytes;
+          let payload;
+          let packetWrapped = false;
+
+          if (pktOffset + packetLen <= this._capacityBytes) {
+            bytes = this._data.subarray(pktOffset, pktOffset + packetLen);
+            payload = this._data.subarray(
+              pktOffset + GPU_PACKET_HEADER_BYTES,
+              pktOffset + packetLen
+            );
+          } else {
+            packetWrapped = true;
+            if (!this._scratch || this._scratch.byteLength < packetLen) {
+              this._scratch = new Uint8Array(packetLen);
+            }
+            const firstLen = this._capacityBytes - pktOffset;
+            const secondLen = packetLen - firstLen;
+            this._scratch.set(this._data.subarray(pktOffset, this._capacityBytes), 0);
+            this._scratch.set(this._data.subarray(0, secondLen), firstLen);
+            bytes = this._scratch.subarray(0, packetLen);
+            payload = this._scratch.subarray(GPU_PACKET_HEADER_BYTES, packetLen);
+          }
+
+          handler(
+            {
+              opcode,
+              flags,
+              payloadBytes,
+              payload,
+              bytes,
+              byteLength: packetLen,
+              wrapped: packetWrapped,
+            },
+            completedPackets
+          );
+
+          cursor += packetLen;
+          completedBytes = cursor;
+          completedPackets += 1;
+        }
+      } finally {
+        if (completedBytes > 0) {
+          const nextRead = (readPos + completedBytes) >>> 0;
+          Atomics.store(this._headerU32, HEADER_INDEX.READ_POS, nextRead);
+          Atomics.notify(this._headerI32, HEADER_INDEX.READ_POS, 1);
+        }
+        if (completedPackets > 0) {
+          this._batchesDrained += 1;
+          this._packetsDrained += completedPackets;
+          if (completedPackets > this._maxBatchSize) {
+            this._maxBatchSize = completedPackets;
+          }
+        }
+      }
+
+      const batchWrapped =
+        completedBytes > 0 && startOffset + completedBytes > this._capacityBytes;
+
+      return {
+        packets: completedPackets,
+        bytes: completedBytes,
+        remainingBytes: boundedAvail - completedBytes,
+        wrapped: batchWrapped,
+      };
     }
 
     reset() {
@@ -310,14 +527,30 @@
       Atomics.store(this._headerU32, HEADER_INDEX.READ_POS, 0);
       Atomics.store(this._headerU32, HEADER_INDEX.DROPPED_PACKETS, 0);
       Atomics.store(this._headerU32, HEADER_INDEX.NOTIFY_SEQ, 0);
+      this._batchesDrained = 0;
+      this._packetsDrained = 0;
+      this._maxBatchSize = 0;
+      this._backpressureWaits = 0;
+      this._peakOccupancyBytes = 0;
     }
 
     getStats() {
       const writePos = this.writePos;
       const readPos = this.readPos;
       const availableBytes = (writePos - readPos) >>> 0;
+      this._recordOccupancy(availableBytes);
       const freeBytes =
         availableBytes >= this._capacityBytes ? 0 : this._capacityBytes - availableBytes;
+      const batchesDrained = sanitizeNonNegInt(this._batchesDrained);
+      const packetsDrained = sanitizeNonNegInt(this._packetsDrained);
+      const maxBatchSize = sanitizeNonNegInt(this._maxBatchSize);
+      const avgBatchSize =
+        batchesDrained > 0 ? sanitizeNonNegNumber(packetsDrained / batchesDrained) : 0;
+      const backpressureWaits = sanitizeNonNegInt(this._backpressureWaits);
+      const peakOccupancyBytes = Math.min(
+        this._capacityBytes,
+        sanitizeNonNegInt(this._peakOccupancyBytes)
+      );
       return {
         capacityBytes: this._capacityBytes,
         availableBytes,
@@ -326,6 +559,12 @@
         readPos,
         droppedPackets: this.droppedPackets,
         notifySeq: this.notifySeq,
+        batchesDrained,
+        maxBatchSize,
+        avgBatchSize,
+        packetsDrained,
+        backpressureWaits,
+        peakOccupancyBytes,
       };
     }
   }
@@ -336,7 +575,9 @@
     GPU_RING_VERSION,
     GPU_RING_HEADER_BYTES,
     GPU_RING_HEADER_WORDS,
+    GPU_PACKET_HEADER_BYTES,
     DEFAULT_CAPACITY_BYTES,
+    DEFAULT_BATCH_MAX_PACKETS,
     HEADER_INDEX,
     isPowerOfTwo,
   };
