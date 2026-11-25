@@ -11,6 +11,9 @@
   const DEFAULT_MAX_QUEUE_DEPTH = 3;
   const DEFAULT_PRESENTATION_FORMAT = 'bgra8unorm';
   const DEFAULT_TARGET_FPS = 30;
+  const DEFAULT_MIN_VISIBLE_LUMA = 8;
+  const DEFAULT_MIN_VISIBLE_PIXELS = 4;
+  const DEFAULT_NONBLACK_GRID_MAX_DIM = 64;
 
   const SPLASH_FRAME_SOURCE = Object.freeze({
     RAW: 'raw',
@@ -237,6 +240,34 @@
     return Math.floor(value);
   }
 
+  function sanitizeLuma(value) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+      return 0;
+    }
+    if (value >= 255) {
+      return 255;
+    }
+    return Math.floor(value);
+  }
+
+  function normalizeMinVisibleLuma(value, fallback = DEFAULT_MIN_VISIBLE_LUMA) {
+    if (value === undefined || value === null) {
+      return fallback;
+    }
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 255) {
+      throw new RangeError(`minVisibleLuma must be a finite number between 0 and 255, got ${value}`);
+    }
+    return value;
+  }
+
+  function normalizePositiveIntOption(value, fallback, name) {
+    if (value === undefined || value === null) {
+      return fallback;
+    }
+    assertPositiveInteger(value, name);
+    return value;
+  }
+
   function sanitizeSource(source) {
     if (
       source === SPLASH_FRAME_SOURCE.RAW ||
@@ -453,6 +484,262 @@
   }
 
   /**
+   * Fast, zero-allocation deterministic strided pixel-luminance check (W307).
+   * Samples up to `maxGridDim x maxGridDim` (default 64x64 = 4096) grid points in O(1)
+   * time without allocating temporary buffers.
+   *
+   * Supports RGBA8 (`Uint8Array` / `Uint8ClampedArray` / `ImageData`), optional BGRA8
+   * (`bgra: true` or `format: 'bgra8'`), and single-channel Y8 luma planes (`bytesPerPixel: 1`
+   * with optional `colorRange: 'limited'` studio-range expansion).
+   *
+   * @param {Uint8Array|Uint8ClampedArray|ArrayBufferView|ArrayBuffer|{ data: Uint8Array|Uint8ClampedArray, width?: number, height?: number }|null|undefined} rgbaOrImageData
+   * @param {number|object} [width]
+   * @param {number} [height]
+   * @param {{
+   *   minVisibleLuma?: number,
+   *   minVisiblePixels?: number,
+   *   maxGridDim?: number,
+   *   strideBytes?: number|null,
+   *   bytesPerPixel?: number,
+   *   format?: string,
+   *   bgra?: boolean,
+   *   colorRange?: 'limited'|'full'|null,
+   *   respectAlpha?: boolean,
+   *   earlyExit?: boolean,
+   *   out?: { visible: boolean, maxLuma: number, visiblePixels: number, sampledPixels: number }|null,
+   * }} [options]
+   * @returns {boolean}
+   */
+  function hasVisibleNonBlackPixels(rgbaOrImageData, width, height, options) {
+    let pixels = null;
+    let w = width;
+    let h = height;
+    let opts = options;
+
+    if (
+      rgbaOrImageData !== null &&
+      rgbaOrImageData !== undefined &&
+      typeof rgbaOrImageData === 'object' &&
+      !ArrayBuffer.isView(rgbaOrImageData) &&
+      !(rgbaOrImageData instanceof ArrayBuffer) &&
+      (typeof SharedArrayBuffer === 'undefined' || !(rgbaOrImageData instanceof SharedArrayBuffer))
+    ) {
+      // ImageData-like object `{ data, width, height }`
+      if (typeof width === 'object' && width !== null && height === undefined) {
+        opts = width;
+        w = rgbaOrImageData.width;
+        h = rgbaOrImageData.height;
+      } else {
+        if (w === undefined || w === null) {
+          w = rgbaOrImageData.width;
+        }
+        if (h === undefined || h === null) {
+          h = rgbaOrImageData.height;
+        }
+      }
+      pixels = rgbaOrImageData.data || null;
+    } else {
+      pixels = rgbaOrImageData;
+    }
+
+    const out = opts && typeof opts === 'object' && opts.out && typeof opts.out === 'object'
+      ? opts.out
+      : null;
+
+    if (out) {
+      out.visible = false;
+      out.maxLuma = 0;
+      out.visiblePixels = 0;
+      out.sampledPixels = 0;
+    }
+
+    const minVisibleLuma = normalizeMinVisibleLuma(
+      opts && opts.minVisibleLuma,
+      DEFAULT_MIN_VISIBLE_LUMA
+    );
+    const minVisiblePixels = normalizePositiveIntOption(
+      opts && opts.minVisiblePixels,
+      DEFAULT_MIN_VISIBLE_PIXELS,
+      'minVisiblePixels'
+    );
+    const maxGridDim = normalizePositiveIntOption(
+      opts && opts.maxGridDim,
+      DEFAULT_NONBLACK_GRID_MAX_DIM,
+      'maxGridDim'
+    );
+
+    if (
+      !pixels ||
+      typeof w !== 'number' ||
+      typeof h !== 'number' ||
+      !Number.isFinite(w) ||
+      !Number.isFinite(h)
+    ) {
+      return false;
+    }
+
+    const frameWidth = Math.floor(w);
+    const frameHeight = Math.floor(h);
+    if (frameWidth < 1 || frameHeight < 1) {
+      return false;
+    }
+
+    // Zero-alloc fast path for Uint8Array / Uint8ClampedArray (ImageData.data).
+    let byteView;
+    if (pixels instanceof Uint8Array || pixels instanceof Uint8ClampedArray) {
+      byteView = pixels;
+    } else if (
+      ArrayBuffer.isView(pixels) ||
+      pixels instanceof ArrayBuffer ||
+      (typeof SharedArrayBuffer !== 'undefined' && pixels instanceof SharedArrayBuffer)
+    ) {
+      byteView = toUint8Array(pixels, 'rgbaOrImageData');
+    } else {
+      return false;
+    }
+
+    const len = byteView.length;
+    if (len === 0) {
+      return false;
+    }
+
+    const bpp =
+      opts && (opts.bytesPerPixel === 1 || opts.format === 'y8' || opts.format === 'luma')
+        ? 1
+        : 4;
+    const isBgra = Boolean(
+      bpp === 4 &&
+        opts &&
+        (opts.bgra === true ||
+          (typeof opts.format === 'string' &&
+            (opts.format === 'bgra8' || opts.format === 'bgra8unorm')))
+    );
+    const respectAlpha = Boolean(bpp === 4 && opts && opts.respectAlpha === true);
+    const limitedRange = Boolean(
+      bpp === 1 && opts && opts.colorRange === COLOR_RANGE.LIMITED
+    );
+
+    const activeRowBytes = frameWidth * bpp;
+    let rowStride = activeRowBytes;
+    if (opts && opts.strideBytes !== undefined && opts.strideBytes !== null) {
+      assertPositiveInteger(opts.strideBytes, 'strideBytes');
+      if (opts.strideBytes < activeRowBytes) {
+        throw new RangeError(
+          `strideBytes (${opts.strideBytes}) must be >= width * bytesPerPixel (${activeRowBytes})`
+        );
+      }
+      rowStride = opts.strideBytes;
+    }
+
+    const earlyExit =
+      opts && opts.earlyExit !== undefined ? Boolean(opts.earlyExit) : !out;
+
+    const stepX = frameWidth <= maxGridDim ? 1 : Math.ceil(frameWidth / maxGridDim);
+    const stepY = frameHeight <= maxGridDim ? 1 : Math.ceil(frameHeight / maxGridDim);
+    const stepBytes = stepX * bpp;
+
+    let maxLuma = 0;
+    let visiblePixels = 0;
+    let sampledPixels = 0;
+    let visible = false;
+
+    if (bpp === 1) {
+      for (let y = 0; y < frameHeight; y += stepY) {
+        const rowStart = y * rowStride;
+        if (rowStart >= len) {
+          break;
+        }
+        const maxRowEnd = rowStart + activeRowBytes;
+        const rowEnd = maxRowEnd <= len ? maxRowEnd : len;
+        for (let offset = rowStart; offset < rowEnd; offset += stepBytes) {
+          const rawY = byteView[offset];
+          const luma = limitedRange
+            ? rawY <= 16
+              ? 0
+              : rawY >= 235
+                ? 255
+                : ((rawY - 16) * 298 + 128) >> 8
+            : rawY;
+          sampledPixels += 1;
+          if (luma > maxLuma) {
+            maxLuma = luma;
+          }
+          if (luma >= minVisibleLuma) {
+            visiblePixels += 1;
+            if (visiblePixels >= minVisiblePixels) {
+              visible = true;
+              if (earlyExit) {
+                if (out) {
+                  out.visible = true;
+                  out.maxLuma = maxLuma;
+                  out.visiblePixels = visiblePixels;
+                  out.sampledPixels = sampledPixels;
+                }
+                return true;
+              }
+            }
+          }
+        }
+      }
+    } else {
+      const tailPad = respectAlpha ? 3 : 2;
+      for (let y = 0; y < frameHeight; y += stepY) {
+        const rowStart = y * rowStride;
+        if (rowStart >= len) {
+          break;
+        }
+        const maxRowEnd = rowStart + activeRowBytes;
+        const rowEnd = maxRowEnd <= len ? maxRowEnd : len;
+        const limit = rowEnd - tailPad;
+        for (let offset = rowStart; offset < limit; offset += stepBytes) {
+          const c0 = byteView[offset];
+          const g = byteView[offset + 1];
+          const c2 = byteView[offset + 2];
+          const r = isBgra ? c2 : c0;
+          const b = isBgra ? c0 : c2;
+          // Exact integer Rec.709 luma (54 + 183 + 19 = 256 -> uniform gray (v,v,v) maps to exact v).
+          let luma = (54 * r + 183 * g + 19 * b + 128) >> 8;
+          if (respectAlpha) {
+            const a = byteView[offset + 3];
+            if (a === 0) {
+              luma = 0;
+            } else if (a < 255) {
+              luma = ((luma * a + 127) / 255) | 0;
+            }
+          }
+          sampledPixels += 1;
+          if (luma > maxLuma) {
+            maxLuma = luma;
+          }
+          if (luma >= minVisibleLuma) {
+            visiblePixels += 1;
+            if (visiblePixels >= minVisiblePixels) {
+              visible = true;
+              if (earlyExit) {
+                if (out) {
+                  out.visible = true;
+                  out.maxLuma = maxLuma;
+                  out.visiblePixels = visiblePixels;
+                  out.sampledPixels = sampledPixels;
+                }
+                return true;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (out) {
+      out.visible = visible;
+      out.maxLuma = maxLuma;
+      out.visiblePixels = visiblePixels;
+      out.sampledPixels = sampledPixels;
+    }
+    return visible;
+  }
+
+  /**
    * Bounded splash/Bink2 frame queue that feeds `BinkVideoPresenter` and encodes letterboxed presents.
    */
   class SplashFrameBridge {
@@ -471,9 +758,39 @@
           throw new TypeError('onFirstPresent must be a function when provided');
         }
       }
+      if (opts.onFirstVisibleFrame !== undefined && opts.onFirstVisibleFrame !== null) {
+        if (typeof opts.onFirstVisibleFrame !== 'function') {
+          throw new TypeError('onFirstVisibleFrame must be a function when provided');
+        }
+      }
+      const rawProbe =
+        opts.pixelProbe !== undefined ? opts.pixelProbe : opts.canvasProbe;
+      if (rawProbe !== undefined && rawProbe !== null && typeof rawProbe !== 'function') {
+        throw new TypeError('pixelProbe / canvasProbe must be a function when provided');
+      }
 
       this._maxQueueDepth = maxQueueDepth;
       this._onFirstPresent = opts.onFirstPresent || null;
+      this._onFirstVisibleFrame = opts.onFirstVisibleFrame || null;
+      this._pixelProbe = rawProbe || null;
+      this._requireNonBlackPixels =
+        opts.requireNonBlackPixels !== undefined
+          ? Boolean(opts.requireNonBlackPixels)
+          : Boolean(this._pixelProbe);
+      this._minVisibleLuma = normalizeMinVisibleLuma(
+        opts.minVisibleLuma,
+        DEFAULT_MIN_VISIBLE_LUMA
+      );
+      this._minVisiblePixels = normalizePositiveIntOption(
+        opts.minVisiblePixels,
+        DEFAULT_MIN_VISIBLE_PIXELS,
+        'minVisiblePixels'
+      );
+      this._maxGridDim = normalizePositiveIntOption(
+        opts.maxGridDim,
+        DEFAULT_NONBLACK_GRID_MAX_DIM,
+        'maxGridDim'
+      );
       this._presentationFormat = opts.presentationFormat || DEFAULT_PRESENTATION_FORMAT;
       this._stagingPool = opts.stagingPool || null;
       this._colorSpace =
@@ -515,10 +832,32 @@
       this._bitmapsClosed = 0;
       this._releaseCount = 0;
       this._firstPresentSent = false;
+      this._firstVisibleFrameSent = false;
       this._guestFirstPresent = false;
       this._splashSuppressed = Boolean(opts.suppressSplash);
       this._framesBeforeFirstPresent = 0;
       this._lateSplashFramesIgnored = 0;
+      this._suppressedBlackFrames = 0;
+      this._lastSampledMaxLuma = 0;
+      this._lumaProbeScratch = {
+        visible: false,
+        maxLuma: 0,
+        visiblePixels: 0,
+        sampledPixels: 0,
+      };
+      this._lumaProbeOpts = {
+        minVisibleLuma: this._minVisibleLuma,
+        minVisiblePixels: this._minVisiblePixels,
+        maxGridDim: this._maxGridDim,
+        strideBytes: null,
+        bytesPerPixel: 4,
+        format: null,
+        bgra: false,
+        colorRange: null,
+        respectAlpha: false,
+        earlyExit: false,
+        out: this._lumaProbeScratch,
+      };
       this._nv12FramesForwarded = 0;
       this._yvuFramesForwarded = 0;
       this._underlayLoadFramesPresented = 0;
@@ -585,6 +924,30 @@
 
     get zeroCopy() {
       return this._zeroCopy;
+    }
+
+    get requireNonBlackPixels() {
+      return this._requireNonBlackPixels;
+    }
+
+    get minVisibleLuma() {
+      return this._minVisibleLuma;
+    }
+
+    get minVisiblePixels() {
+      return this._minVisiblePixels;
+    }
+
+    get firstVisibleFrameSent() {
+      return this._firstVisibleFrameSent;
+    }
+
+    get suppressedBlackFrames() {
+      return sanitizeCounter(this._suppressedBlackFrames);
+    }
+
+    get lastSampledMaxLuma() {
+      return sanitizeLuma(this._lastSampledMaxLuma);
     }
 
     /**
@@ -684,23 +1047,357 @@
       };
     }
 
+    _resetLumaScratch() {
+      const s = this._lumaProbeScratch;
+      s.visible = false;
+      s.maxLuma = 0;
+      s.visiblePixels = 0;
+      s.sampledPixels = 0;
+      return s;
+    }
+
+    _configureLumaProbeOpts(overrideOpts, defaults) {
+      const p = this._lumaProbeOpts;
+      p.minVisibleLuma =
+        overrideOpts && overrideOpts.minVisibleLuma !== undefined
+          ? normalizeMinVisibleLuma(overrideOpts.minVisibleLuma, this._minVisibleLuma)
+          : this._minVisibleLuma;
+      p.minVisiblePixels =
+        overrideOpts && overrideOpts.minVisiblePixels !== undefined
+          ? normalizePositiveIntOption(
+              overrideOpts.minVisiblePixels,
+              this._minVisiblePixels,
+              'minVisiblePixels'
+            )
+          : this._minVisiblePixels;
+      p.maxGridDim =
+        overrideOpts && overrideOpts.maxGridDim !== undefined
+          ? normalizePositiveIntOption(
+              overrideOpts.maxGridDim,
+              this._maxGridDim,
+              'maxGridDim'
+            )
+          : this._maxGridDim;
+      p.strideBytes =
+        overrideOpts && overrideOpts.strideBytes !== undefined
+          ? overrideOpts.strideBytes
+          : defaults && defaults.strideBytes !== undefined
+            ? defaults.strideBytes
+            : null;
+      p.bytesPerPixel =
+        defaults && defaults.bytesPerPixel !== undefined ? defaults.bytesPerPixel : 4;
+      p.format =
+        overrideOpts && overrideOpts.format !== undefined
+          ? overrideOpts.format
+          : defaults && defaults.format !== undefined
+            ? defaults.format
+            : null;
+      p.bgra = Boolean(overrideOpts && overrideOpts.bgra === true);
+      p.colorRange =
+        defaults && defaults.colorRange !== undefined ? defaults.colorRange : null;
+      p.respectAlpha = Boolean(overrideOpts && overrideOpts.respectAlpha === true);
+      p.earlyExit = false;
+      p.out = this._lumaProbeScratch;
+      return p;
+    }
+
+    _evaluateProbeOutput(result, fallbackWidth, fallbackHeight, overrideOpts) {
+      const scratch = this._resetLumaScratch();
+      if (result === null || result === undefined) {
+        return null;
+      }
+      if (typeof result === 'boolean') {
+        scratch.visible = result;
+        scratch.maxLuma = result ? 255 : 0;
+        scratch.visiblePixels = result ? this._minVisiblePixels : 0;
+        scratch.sampledPixels = 1;
+        return scratch;
+      }
+      if (typeof result === 'object') {
+        if (typeof result.visible === 'boolean' || typeof result.hasVisiblePixels === 'boolean') {
+          const vis =
+            typeof result.visible === 'boolean' ? result.visible : Boolean(result.hasVisiblePixels);
+          scratch.visible = vis;
+          scratch.maxLuma = sanitizeLuma(
+            result.maxLuma !== undefined ? result.maxLuma : vis ? 255 : 0
+          );
+          scratch.visiblePixels = sanitizeCounter(
+            result.visiblePixels !== undefined
+              ? result.visiblePixels
+              : vis
+                ? this._minVisiblePixels
+                : 0
+          );
+          scratch.sampledPixels = sanitizeCounter(
+            result.sampledPixels !== undefined ? result.sampledPixels : 1
+          );
+          return scratch;
+        }
+        if (
+          result instanceof Uint8Array ||
+          result instanceof Uint8ClampedArray ||
+          ArrayBuffer.isView(result) ||
+          result instanceof ArrayBuffer ||
+          (typeof SharedArrayBuffer !== 'undefined' && result instanceof SharedArrayBuffer)
+        ) {
+          const probeOpts = this._configureLumaProbeOpts(overrideOpts, null);
+          hasVisibleNonBlackPixels(result, fallbackWidth, fallbackHeight, probeOpts);
+          return scratch;
+        }
+        if (result.data !== undefined && result.data !== null) {
+          const w = result.width !== undefined ? result.width : fallbackWidth;
+          const h = result.height !== undefined ? result.height : fallbackHeight;
+          const probeOpts = this._configureLumaProbeOpts(overrideOpts, {
+            strideBytes: result.strideBytes !== undefined ? result.strideBytes : null,
+          });
+          hasVisibleNonBlackPixels(result.data, w, h, probeOpts);
+          return scratch;
+        }
+      }
+      return null;
+    }
+
+    _probeFrameDescriptorNonBlack(frame, overrideOpts) {
+      const scratch = this._resetLumaScratch();
+      if (!frame || typeof frame !== 'object') {
+        return scratch;
+      }
+      const w = frame.width;
+      const h = frame.height;
+      const planes = frame.planes || null;
+      const fmt = frame.format;
+
+      if (fmt === PIXEL_FORMAT.RGBA8 || fmt === 0 || (!fmt && (frame.rgba || (planes && planes.rgba)))) {
+        const rgba = (planes && planes.rgba) || frame.rgba || frame.data || null;
+        if (rgba) {
+          const probeOpts = this._configureLumaProbeOpts(overrideOpts, {
+            bytesPerPixel: 4,
+            strideBytes: frame.strideBytes !== undefined ? frame.strideBytes : null,
+          });
+          hasVisibleNonBlackPixels(rgba, w, h, probeOpts);
+          return scratch;
+        }
+      }
+
+      if (
+        fmt === PIXEL_FORMAT.NV12 ||
+        fmt === PIXEL_FORMAT.YUV420P ||
+        fmt === PIXEL_FORMAT.YUVA420P ||
+        fmt === 1 ||
+        fmt === 2 ||
+        fmt === 3
+      ) {
+        const yPlane = (planes && planes.y) || frame.yPlane || frame.y || null;
+        if (yPlane) {
+          const probeOpts = this._configureLumaProbeOpts(overrideOpts, {
+            bytesPerPixel: 1,
+            strideBytes: frame.yStride !== undefined ? frame.yStride : null,
+            colorRange: frame.colorRange || this._colorRange,
+          });
+          hasVisibleNonBlackPixels(yPlane, w, h, probeOpts);
+          return scratch;
+        }
+      }
+
+      return scratch;
+    }
+
+    _probeFrameNonBlack(frame, opts) {
+      const scratch = this._resetLumaScratch();
+
+      // 1. Explicit per-call pixel/ImageData probe input takes highest precedence.
+      if (opts) {
+        const explicitPixels =
+          opts.pixelData !== undefined
+            ? opts.pixelData
+            : opts.imageData !== undefined
+              ? opts.imageData
+              : opts.rgba !== undefined
+                ? opts.rgba
+                : opts.pixels;
+        if (explicitPixels !== undefined && explicitPixels !== null) {
+          const w = opts.width !== undefined ? opts.width : frame.width;
+          const h = opts.height !== undefined ? opts.height : frame.height;
+          const evaluated = this._evaluateProbeOutput(explicitPixels, w, h, opts);
+          if (evaluated) {
+            return evaluated;
+          }
+        }
+      }
+
+      // 2. Caller-provided pixelProbe / canvasProbe callback (per-call or constructor).
+      const probeFn =
+        (opts &&
+          (typeof opts.pixelProbe === 'function'
+            ? opts.pixelProbe
+            : typeof opts.canvasProbe === 'function'
+              ? opts.canvasProbe
+              : null)) ||
+        this._pixelProbe;
+      if (typeof probeFn === 'function') {
+        try {
+          const probeOutput = probeFn(frame, opts || null);
+          const evaluated = this._evaluateProbeOutput(
+            probeOutput,
+            frame.width,
+            frame.height,
+            opts
+          );
+          if (evaluated) {
+            return evaluated;
+          }
+        } catch (_) {
+          return this._resetLumaScratch();
+        }
+      }
+
+      // 3. Direct zero-alloc probe of the frame's own RGBA or Y luma plane.
+      return this._probeFrameDescriptorNonBlack(frame, opts);
+    }
+
+    _probeHandoffNonBlack(opts) {
+      const scratch = this._resetLumaScratch();
+
+      const explicitPixels =
+        opts.pixelData !== undefined
+          ? opts.pixelData
+          : opts.imageData !== undefined
+            ? opts.imageData
+            : opts.rgba !== undefined
+              ? opts.rgba
+              : opts.pixels;
+      if (explicitPixels !== undefined && explicitPixels !== null) {
+        const w =
+          opts.width !== undefined
+            ? opts.width
+            : explicitPixels.width !== undefined
+              ? explicitPixels.width
+              : this._lastFrameWidth;
+        const h =
+          opts.height !== undefined
+            ? opts.height
+            : explicitPixels.height !== undefined
+              ? explicitPixels.height
+              : this._lastFrameHeight;
+        const evaluated = this._evaluateProbeOutput(explicitPixels, w, h, opts);
+        if (evaluated) {
+          return evaluated;
+        }
+      }
+
+      if (opts.frame && typeof opts.frame === 'object') {
+        return this._probeFrameDescriptorNonBlack(opts.frame, opts);
+      }
+
+      const probeFn =
+        (typeof opts.pixelProbe === 'function'
+          ? opts.pixelProbe
+          : typeof opts.canvasProbe === 'function'
+            ? opts.canvasProbe
+            : null) || this._pixelProbe;
+      if (typeof probeFn === 'function') {
+        try {
+          const probeOutput = probeFn(opts, null);
+          const w = opts.width !== undefined ? opts.width : this._lastFrameWidth;
+          const h = opts.height !== undefined ? opts.height : this._lastFrameHeight;
+          const evaluated = this._evaluateProbeOutput(probeOutput, w, h, opts);
+          if (evaluated) {
+            return evaluated;
+          }
+        } catch (_) {
+          return this._resetLumaScratch();
+        }
+      }
+
+      return scratch;
+    }
+
     /**
      * Signal that the live guest engine has reached `FIRST_PRESENT` handoff.
      * Freezes `framesBeforeFirstPresent` and activates splash suppression unless disabled.
      * When suppression activates, also releases retained splash `ImageBitmap`s, transient
      * pixel buffers, and external scratch textures so splash GPU/CPU memory cannot leak.
      *
-     * @param {{ suppress?: boolean }} [options]
+     * When `requireNonBlackPixels` is active (via constructor, `options.requireNonBlackPixels`,
+     * or supplied pixel/probe data), suppresses premature splash dismissal and `first-visible-frame`
+     * emission on all-black frames until a frame passes `hasVisibleNonBlackPixels`.
+     *
+     * @param {{
+     *   suppress?: boolean,
+     *   requireNonBlackPixels?: boolean,
+     *   rgba?: Uint8Array|Uint8ClampedArray,
+     *   pixels?: Uint8Array|Uint8ClampedArray,
+     *   pixelData?: Uint8Array|Uint8ClampedArray|object,
+     *   imageData?: { data: Uint8Array|Uint8ClampedArray, width: number, height: number },
+     *   frame?: object,
+     *   width?: number,
+     *   height?: number,
+     *   minVisibleLuma?: number,
+     *   minVisiblePixels?: number,
+     *   pixelProbe?: Function,
+     *   canvasProbe?: Function,
+     * }} [options]
      */
     notifyGuestFirstPresent(options = {}) {
       this._assertNotDestroyed();
       if (options !== undefined && options !== null && typeof options !== 'object') {
         throw new TypeError('notifyGuestFirstPresent options must be an object');
       }
+      const opts = options || {};
+      const hasExplicitProbe = Boolean(
+        opts.rgba !== undefined ||
+          opts.pixels !== undefined ||
+          opts.pixelData !== undefined ||
+          opts.imageData !== undefined ||
+          opts.frame !== undefined ||
+          typeof opts.pixelProbe === 'function' ||
+          typeof opts.canvasProbe === 'function'
+      );
+      const checkNonBlack =
+        opts.requireNonBlackPixels !== undefined
+          ? Boolean(opts.requireNonBlackPixels)
+          : this._requireNonBlackPixels || hasExplicitProbe;
+
+      let sampledMaxLuma = 0;
+      let sampledVisiblePixels = 0;
+      let sampledTotalPixels = 0;
+
+      if (checkNonBlack && !this._guestFirstPresent) {
+        const probe = this._probeHandoffNonBlack(opts);
+        sampledMaxLuma = probe.maxLuma;
+        sampledVisiblePixels = probe.visiblePixels;
+        sampledTotalPixels = probe.sampledPixels;
+        this._lastSampledMaxLuma = sampledMaxLuma;
+
+        if (!probe.visible) {
+          this._suppressedBlackFrames += 1;
+          return {
+            guestFirstPresent: this._guestFirstPresent,
+            splashSuppressed: this._splashSuppressed,
+            firstVisibleFrame: false,
+            firstVisibleFrameEmitted: false,
+            firstVisibleFrameSent: this._firstVisibleFrameSent,
+            suppressedBlackFrame: true,
+            suppressedBlackFrames: sanitizeCounter(this._suppressedBlackFrames),
+            lastSampledMaxLuma: sanitizeLuma(this._lastSampledMaxLuma),
+            reason: 'black-frame-suppressed',
+            framesBeforeFirstPresent: this._framesBeforeFirstPresent,
+            lateSplashFramesIgnored: this._lateSplashFramesIgnored,
+            drainedFrames: 0,
+            bitmapsClosed: this._bitmapsClosed,
+            releaseCount: this._releaseCount,
+            chromaOrder: sanitizeChromaOrder(this._chromaOrder) || CHROMA_ORDER.YUV,
+            loadOp: sanitizeLoadOp(this._loadOp) || LOAD_OP.CLEAR,
+            lastChromaOrder: sanitizeChromaOrder(this._lastChromaOrder),
+            lastLoadOp: sanitizeLoadOp(this._lastLoadOp),
+          };
+        }
+      }
+
       this._guestFirstPresent = true;
       const shouldSuppress =
-        options && options.suppress !== undefined
-          ? Boolean(options.suppress)
+        opts.suppress !== undefined
+          ? Boolean(opts.suppress)
           : this._suppressSplashAfterFirstPresent;
       let drainedFrames = 0;
       if (shouldSuppress) {
@@ -708,9 +1405,49 @@
         drainedFrames = this._drainQueueAsIgnored();
         this._releaseSplashResourcesInternal();
       }
+
+      let firstVisibleFrameEmitted = false;
+      if (!this._firstVisibleFrameSent) {
+        this._firstVisibleFrameSent = true;
+        firstVisibleFrameEmitted = true;
+        if (typeof this._onFirstVisibleFrame === 'function') {
+          this._onFirstVisibleFrame({
+            type: 'first-visible-frame',
+            source: 'guest-handoff',
+            width: sanitizeCounter(
+              opts.width ||
+                (opts.imageData && opts.imageData.width) ||
+                (opts.frame && opts.frame.width) ||
+                this._lastFrameWidth
+            ),
+            height: sanitizeCounter(
+              opts.height ||
+                (opts.imageData && opts.imageData.height) ||
+                (opts.frame && opts.frame.height) ||
+                this._lastFrameHeight
+            ),
+            firstVisibleFrame: true,
+            guestFirstPresent: true,
+            splashSuppressed: this._splashSuppressed,
+            suppressedBlackFrames: sanitizeCounter(this._suppressedBlackFrames),
+            lastSampledMaxLuma: sanitizeLuma(this._lastSampledMaxLuma),
+            sampledMaxLuma,
+            visiblePixels: sampledVisiblePixels,
+            sampledPixels: sampledTotalPixels,
+          });
+        }
+      }
+
       return {
         guestFirstPresent: this._guestFirstPresent,
         splashSuppressed: this._splashSuppressed,
+        firstVisibleFrame: this._firstVisibleFrameSent,
+        firstVisibleFrameEmitted,
+        firstVisibleFrameSent: this._firstVisibleFrameSent,
+        suppressedBlackFrame: false,
+        suppressedBlackFrames: sanitizeCounter(this._suppressedBlackFrames),
+        lastSampledMaxLuma: sanitizeLuma(this._lastSampledMaxLuma),
+        reason: 'ok',
         framesBeforeFirstPresent: this._framesBeforeFirstPresent,
         lateSplashFramesIgnored: this._lateSplashFramesIgnored,
         drainedFrames,
@@ -1635,10 +2372,40 @@
         sanitizeLoadOp(this._loadOp) ||
         LOAD_OP.CLEAR;
 
+      const hasExplicitProbe = Boolean(
+        opts &&
+          (opts.pixelData !== undefined ||
+            opts.imageData !== undefined ||
+            opts.rgba !== undefined ||
+            opts.pixels !== undefined ||
+            typeof opts.pixelProbe === 'function' ||
+            typeof opts.canvasProbe === 'function')
+      );
+      const checkNonBlack =
+        opts && opts.requireNonBlackPixels !== undefined
+          ? Boolean(opts.requireNonBlackPixels)
+          : this._requireNonBlackPixels || hasExplicitProbe;
+
       let uploadResult;
       let presentResult;
       let sanitizedFormat;
+      let probeChecked = false;
+      let frameVisible = true;
+      let sampledMaxLuma = 0;
+      let sampledVisiblePixels = 0;
+      let sampledTotalPixels = 0;
       try {
+        // W307: Run non-black visibility probe BEFORE finally releases planes / closes bitmaps.
+        if (checkNonBlack) {
+          probeChecked = true;
+          const probe = this._probeFrameNonBlack(frame, opts);
+          frameVisible = probe.visible;
+          sampledMaxLuma = probe.maxLuma;
+          sampledVisiblePixels = probe.visiblePixels;
+          sampledTotalPixels = probe.sampledPixels;
+          this._lastSampledMaxLuma = sampledMaxLuma;
+        }
+
         uploadResult = this._uploadFrame(presenter, device, frame);
         this._lastSource = frame.source;
         sanitizedFormat = sanitizeFrameFormat(frame.telemetryFormat || frame.format);
@@ -1739,6 +2506,30 @@
         }
       }
 
+      let firstVisibleFrameEmitted = false;
+      let suppressedBlackFrame = false;
+      if (!this._firstVisibleFrameSent) {
+        if (probeChecked && !frameVisible) {
+          this._suppressedBlackFrames += 1;
+          suppressedBlackFrame = true;
+        } else {
+          this._firstVisibleFrameSent = true;
+          firstVisibleFrameEmitted = true;
+          if (typeof this._onFirstVisibleFrame === 'function') {
+            this._onFirstVisibleFrame({
+              type: 'first-visible-frame',
+              ...presentInfo,
+              firstVisibleFrame: true,
+              suppressedBlackFrames: sanitizeCounter(this._suppressedBlackFrames),
+              lastSampledMaxLuma: sanitizeLuma(this._lastSampledMaxLuma),
+              sampledMaxLuma,
+              visiblePixels: sampledVisiblePixels,
+              sampledPixels: sampledTotalPixels,
+            });
+          }
+        }
+      }
+
       return {
         presented: Boolean(presentResult && presentResult.presented),
         reason: 'ok',
@@ -1754,6 +2545,12 @@
         underlayLoadFramesPresented: this._underlayLoadFramesPresented,
         zeroCopyFramesForwarded: this._zeroCopyFramesForwarded,
         firstPresentSent: this._firstPresentSent,
+        firstVisibleFrame: this._firstVisibleFrameSent,
+        firstVisibleFrameEmitted,
+        firstVisibleFrameSent: this._firstVisibleFrameSent,
+        suppressedBlackFrame,
+        suppressedBlackFrames: sanitizeCounter(this._suppressedBlackFrames),
+        lastSampledMaxLuma: sanitizeLuma(this._lastSampledMaxLuma),
       };
     }
 
@@ -1773,8 +2570,14 @@
         retainedBitmaps: this._retainedBitmaps.size,
         queueDepth: this._queue.length,
         firstPresentSent: Boolean(this._firstPresentSent),
+        firstVisibleFrameSent: Boolean(this._firstVisibleFrameSent),
         guestFirstPresent: Boolean(this._guestFirstPresent),
         splashSuppressed: Boolean(this._splashSuppressed),
+        requireNonBlackPixels: Boolean(this._requireNonBlackPixels),
+        minVisibleLuma: sanitizeLuma(this._minVisibleLuma),
+        minVisiblePixels: sanitizeCounter(this._minVisiblePixels),
+        suppressedBlackFrames: sanitizeCounter(this._suppressedBlackFrames),
+        lastSampledMaxLuma: sanitizeLuma(this._lastSampledMaxLuma),
         framesBeforeFirstPresent: sanitizeCounter(this._framesBeforeFirstPresent),
         lateSplashFramesIgnored: sanitizeCounter(this._lateSplashFramesIgnored),
         nv12FramesForwarded: sanitizeCounter(this._nv12FramesForwarded),
@@ -1823,8 +2626,14 @@
         releaseCount: sanitizeCounter(this._releaseCount),
         retainedBitmaps: this._retainedBitmaps.size,
         firstPresentSent: Boolean(this._firstPresentSent),
+        firstVisibleFrameSent: Boolean(this._firstVisibleFrameSent),
         guestFirstPresent: Boolean(this._guestFirstPresent),
         splashSuppressed: Boolean(this._splashSuppressed),
+        requireNonBlackPixels: Boolean(this._requireNonBlackPixels),
+        minVisibleLuma: sanitizeLuma(this._minVisibleLuma),
+        minVisiblePixels: sanitizeCounter(this._minVisiblePixels),
+        suppressedBlackFrames: sanitizeCounter(this._suppressedBlackFrames),
+        lastSampledMaxLuma: sanitizeLuma(this._lastSampledMaxLuma),
         framesBeforeFirstPresent: sanitizeCounter(this._framesBeforeFirstPresent),
         lateSplashFramesIgnored: sanitizeCounter(this._lateSplashFramesIgnored),
         lastFrameFormat: sanitizeFrameFormat(this._lastFrameFormat),
@@ -1849,6 +2658,8 @@
       this._releaseCount = 0;
       this._framesBeforeFirstPresent = 0;
       this._lateSplashFramesIgnored = 0;
+      this._suppressedBlackFrames = 0;
+      this._lastSampledMaxLuma = 0;
       this._nv12FramesForwarded = 0;
       this._yvuFramesForwarded = 0;
       this._underlayLoadFramesPresented = 0;
@@ -1881,11 +2692,14 @@
       this._bitmapsClosed = 0;
       this._releaseCount = 0;
       this._firstPresentSent = false;
+      this._firstVisibleFrameSent = false;
       this._guestFirstPresent = false;
       this._splashSuppressed = false;
       this._resourcesReleased = false;
       this._framesBeforeFirstPresent = 0;
       this._lateSplashFramesIgnored = 0;
+      this._suppressedBlackFrames = 0;
+      this._lastSampledMaxLuma = 0;
       this._nv12FramesForwarded = 0;
       this._yvuFramesForwarded = 0;
       this._underlayLoadFramesPresented = 0;
@@ -1928,6 +2742,8 @@
       this._presenter = null;
       this._pendingDevice = null;
       this._onFirstPresent = null;
+      this._onFirstVisibleFrame = null;
+      this._pixelProbe = null;
       this._stagingPool = null;
     }
 
@@ -1943,6 +2759,9 @@
     DEFAULT_MAX_QUEUE_DEPTH,
     DEFAULT_PRESENTATION_FORMAT,
     DEFAULT_TARGET_FPS,
+    DEFAULT_MIN_VISIBLE_LUMA,
+    DEFAULT_MIN_VISIBLE_PIXELS,
+    DEFAULT_NONBLACK_GRID_MAX_DIM,
     SPLASH_FRAME_SOURCE,
     PIXEL_FORMAT,
     PIXEL_FORMAT_ID,
@@ -1954,6 +2773,7 @@
     sanitizeFrameFormat,
     sanitizeChromaOrder,
     sanitizeLoadOp,
+    hasVisibleNonBlackPixels,
     generateDiagnosticSplashFrame,
     SplashFrameBridge,
   });
