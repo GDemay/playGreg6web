@@ -33,6 +33,7 @@
   const DEFAULT_BASE_RETRY_DELAY_MS = 50;
   const DEFAULT_AGING_THRESHOLD_MS = 0;
   const DEFAULT_AGING_INTERVAL_MS = 0;
+  const DEFAULT_AGING_WINDOW_MS = 2000;
   const DEFAULT_DEDUPE_IN_FLIGHT = true;
 
   const RETRYABLE_ERROR_CODES = new Set([
@@ -81,6 +82,7 @@
     'shaders.rpf',
     'textures.rpf',
     'levels.rpf',
+    'core_bvh4.rpf',
   ]);
 
   function normalizePathForClassification(pathOrRelPath) {
@@ -394,6 +396,19 @@
         Number.isFinite(options.agingIntervalMs) && options.agingIntervalMs > 0
           ? options.agingIntervalMs
           : DEFAULT_AGING_INTERVAL_MS;
+      if (
+        options.agingWindowMs === false ||
+        options.agingWindowMs === null ||
+        options.agingWindowMs === 0 ||
+        options.agingWindowMs === Infinity ||
+        (typeof options.agingWindowMs === 'number' && options.agingWindowMs <= 0)
+      ) {
+        this.agingWindowMs = 0;
+      } else if (Number.isFinite(options.agingWindowMs) && options.agingWindowMs > 0) {
+        this.agingWindowMs = options.agingWindowMs;
+      } else {
+        this.agingWindowMs = DEFAULT_AGING_WINDOW_MS;
+      }
       this.dedupeInFlight =
         options.dedupeInFlight !== undefined
           ? Boolean(options.dedupeInFlight)
@@ -401,7 +416,12 @@
             ? Boolean(options.dedupe)
             : DEFAULT_DEDUPE_IN_FLIGHT;
       this.sleep = typeof options.sleep === 'function' ? options.sleep : defaultSleep;
-      this.nowFn = typeof options.nowFn === 'function' ? options.nowFn : defaultNow;
+      this.nowFn =
+        typeof options.now === 'function'
+          ? options.now
+          : typeof options.nowFn === 'function'
+            ? options.nowFn
+            : defaultNow;
 
       this._queues = PRIORITY_LEVELS.map(() => []);
       this._activeByKey = new Map();
@@ -673,6 +693,7 @@
       const byPriority = {};
       const avgQueueWaitMsByPriority = {};
       const priorityCounts = {};
+      const activeByPriority = {};
       let queued = 0;
 
       for (let i = 0; i < PRIORITY_LEVELS.length; i += 1) {
@@ -685,6 +706,7 @@
         queued += levelQueued;
         avgQueueWaitMsByPriority[name] = avgQueueWaitMs;
         priorityCounts[name] = counters.scheduled;
+        activeByPriority[name] = counters.inFlight;
         byPriority[name] = {
           priority: level,
           scheduled: counters.scheduled,
@@ -701,6 +723,7 @@
           maxQueueWaitMs: counters.maxQueueWaitMs,
           agedPromotions: counters.agedPromotions,
           promotions: counters.agedPromotions,
+          promotedByAgingCount: counters.agedPromotions,
         };
       }
 
@@ -719,6 +742,7 @@
         deduped: this._stats.deduped,
         agedPromotions: this._stats.agedPromotions,
         promotions: this._stats.agedPromotions,
+        promotedByAgingCount: this._stats.agedPromotions,
         avgQueueWaitMs,
         maxQueueWaitMs: this._stats.maxQueueWaitMs,
         peakQueueDepth: this._stats.peakQueueDepth,
@@ -729,6 +753,7 @@
         binkVideoReads: this._stats.binkVideoReads,
         shaderPackReads: this._stats.shaderPackReads,
         uiFontReads: this._stats.uiFontReads,
+        activeByPriority,
         priorityCounts,
         avgQueueWaitMsByPriority,
         byPriority,
@@ -1069,6 +1094,58 @@
         }
       }
 
+      if (this.agingWindowMs > 0) {
+        // CRITICAL stays strictly highest so boot-critical shaders/metadata are never delayed.
+        if (strictLevel === IO_PRIORITY.CRITICAL) {
+          return {
+            task: this._queues[IO_PRIORITY.CRITICAL].shift(),
+            promoted: false,
+          };
+        }
+
+        let bestLevel = -1;
+        let bestEffectivePriority = Infinity;
+        let bestEnqueuedAtMs = Infinity;
+        let bestSeq = Infinity;
+
+        for (let i = 0; i < PRIORITY_LEVELS.length; i += 1) {
+          const level = PRIORITY_LEVELS[i];
+          if (level === IO_PRIORITY.CRITICAL) {
+            continue;
+          }
+          const queue = this._queues[level];
+          if (queue.length === 0) {
+            continue;
+          }
+          const head = queue[0];
+          const waitMs = Math.max(0, nowMs - head.enqueuedAtMs);
+          const steps = Math.floor(waitMs / this.agingWindowMs);
+          // Promote one priority tier per aging window, capped at HIGH (below CRITICAL).
+          const effectivePriority = Math.max(IO_PRIORITY.HIGH, level - steps);
+
+          if (
+            bestLevel === -1 ||
+            effectivePriority < bestEffectivePriority ||
+            (effectivePriority === bestEffectivePriority &&
+              (head.enqueuedAtMs < bestEnqueuedAtMs ||
+                (head.enqueuedAtMs === bestEnqueuedAtMs &&
+                  (level < bestLevel || (level === bestLevel && head.seq < bestSeq)))))
+          ) {
+            bestLevel = level;
+            bestEffectivePriority = effectivePriority;
+            bestEnqueuedAtMs = head.enqueuedAtMs;
+            bestSeq = head.seq;
+          }
+        }
+
+        if (bestLevel !== -1) {
+          return {
+            task: this._queues[bestLevel].shift(),
+            promoted: bestLevel > strictLevel,
+          };
+        }
+      }
+
       return {
         task: this._queues[strictLevel].shift(),
         promoted: false,
@@ -1302,6 +1379,7 @@
     DEFAULT_BASE_RETRY_DELAY_MS,
     DEFAULT_AGING_THRESHOLD_MS,
     DEFAULT_AGING_INTERVAL_MS,
+    DEFAULT_AGING_WINDOW_MS,
     DEFAULT_DEDUPE_IN_FLIGHT,
     makeReadKey,
     classifyIoPriority,
