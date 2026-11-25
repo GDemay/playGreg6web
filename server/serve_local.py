@@ -59,6 +59,7 @@ SAFE_SIDE_MODULE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.wasm$", re.
 DUMP_URL_PREFIX = "/__pg6_dump/"
 DEFAULT_MAX_DUMP_FILE_BYTES = 64 * 1024 * 1024  # 64 MiB default cap per dumped file
 _DUMP_WRITE_LOCK = threading.Lock()
+_LOG_LOCK = threading.Lock()
 
 STREAM_CHUNK_BYTES = 1024 * 1024  # 1 MiB streaming buffer for large .pgim/.wasm/Range reads
 STREAM_CHUNK_SIZE = STREAM_CHUNK_BYTES  # Backwards-compatible alias
@@ -931,6 +932,7 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
         max_dump_file_bytes: int = DEFAULT_MAX_DUMP_FILE_BYTES,
         keep_alive_timeout: float | None = None,
         stream_chunk_bytes: int | None = None,
+        quiet: bool = False,
         **kwargs,
     ):
         self.web_root = web_root
@@ -943,10 +945,41 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
         if keep_alive_timeout is not None:
             self.timeout = keep_alive_timeout
         self._stream_chunk_bytes = stream_chunk_bytes
+        self.quiet = bool(quiet)
         self._headers_sent = False
         self._connection_header_sent = False
         self._client_requested_close = False
         super().__init__(*args, **kwargs)
+
+    def _is_quiet(self) -> bool:
+        if getattr(self, "quiet", False):
+            return True
+        server = getattr(self, "server", None)
+        return bool(getattr(server, "quiet", False)) if server is not None else False
+
+    def log_message(self, format: str, *args: Any) -> None:
+        """Write a lock-serialized log line to stderr without aborting responses."""
+        if self._is_quiet():
+            return
+        stderr = sys.stderr
+        if stderr is None:
+            return
+        try:
+            message = format % args if args else str(format)
+            table = getattr(self, "_control_char_table", None)
+            if table is not None:
+                message = message.translate(table)
+            line = (
+                f"{self.address_string()} - - "
+                f"[{self.log_date_time_string()}] {message}\n"
+            )
+        except (OSError, ValueError):
+            return
+        with _LOG_LOCK:
+            try:
+                stderr.write(line)
+            except (OSError, ValueError):
+                return
 
     def setup(self) -> None:
         super().setup()
@@ -1648,6 +1681,8 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
 class QuietThreadingHTTPServer(ThreadingHTTPServer):
     """ThreadingHTTPServer that suppresses noisy tracebacks on client disconnects."""
 
+    request_queue_size = 256
+    daemon_threads = True
     block_on_close = False
 
     def __init__(
@@ -1657,9 +1692,11 @@ class QuietThreadingHTTPServer(ThreadingHTTPServer):
         bind_and_activate: bool = True,
         *,
         file_handle_cache_size: int = DEFAULT_FILE_HANDLE_CACHE_SIZE,
+        quiet: bool = False,
     ) -> None:
         if file_handle_cache_size < 0:
             raise ValueError("file_handle_cache_size must be >= 0")
+        self.quiet = bool(quiet)
         self.file_handle_cache: ReadOnlyFileHandleCache | None = (
             ReadOnlyFileHandleCache(max_entries=file_handle_cache_size)
             if file_handle_cache_size > 0
@@ -1681,7 +1718,11 @@ class QuietThreadingHTTPServer(ThreadingHTTPServer):
         exc = sys.exc_info()[1]
         if isinstance(exc, CLIENT_DISCONNECT_ERRORS):
             return
-        super().handle_error(request, client_address)
+        with _LOG_LOCK:
+            try:
+                super().handle_error(request, client_address)
+            except (OSError, ValueError):
+                return
 
 
 def create_server(
@@ -1698,6 +1739,7 @@ def create_server(
     keep_alive_timeout: float | None = None,
     stream_chunk_bytes: int | None = None,
     file_handle_cache_size: int = DEFAULT_FILE_HANDLE_CACHE_SIZE,
+    quiet: bool = False,
 ) -> QuietThreadingHTTPServer:
     if max_dump_file_bytes < 0:
         raise ValueError("max_dump_file_bytes must be >= 0")
@@ -1716,11 +1758,13 @@ def create_server(
         max_dump_file_bytes=max_dump_file_bytes,
         keep_alive_timeout=keep_alive_timeout,
         stream_chunk_bytes=stream_chunk_bytes,
+        quiet=quiet,
     )
     return QuietThreadingHTTPServer(
         (host, port),
         handler,
         file_handle_cache_size=file_handle_cache_size,
+        quiet=quiet,
     )
 
 
@@ -1797,6 +1841,11 @@ def main() -> None:
         default=DEFAULT_MAX_DUMP_FILE_BYTES,
         help=f"Maximum allowed byte size per file written via POST /__pg6_dump/ (default: {DEFAULT_MAX_DUMP_FILE_BYTES}).",
     )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress per-request HTTP access logs on stderr.",
+    )
     args = parser.parse_args()
 
     if args.max_dump_file_bytes < 0:
@@ -1820,6 +1869,7 @@ def main() -> None:
         boot_root=boot_root,
         dump_root=dump_root,
         max_dump_file_bytes=args.max_dump_file_bytes,
+        quiet=args.quiet,
     )
     dump_summary = (
         f", /__pg6_dump={dump_root} (max={args.max_dump_file_bytes}B)"

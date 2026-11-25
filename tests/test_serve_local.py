@@ -1,7 +1,9 @@
 import concurrent.futures
+import errno
 from functools import partial
 import hashlib
 import http.client
+import io
 import json
 import os
 from pathlib import Path
@@ -10,6 +12,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "server"))
@@ -783,6 +786,174 @@ class TestServeLocalRangeFastpath(unittest.TestCase):
         final_stats = cache.stats()
         self.assertEqual(final_stats["entries"], 0)
         self.assertEqual(final_stats["open_handles"], 0)
+
+    def test_server_request_queue_size_and_daemon_threads(self) -> None:
+        self.assertGreaterEqual(serve_local.QuietThreadingHTTPServer.request_queue_size, 256)
+        self.assertGreaterEqual(self.httpd.request_queue_size, 256)
+        self.assertIs(serve_local.QuietThreadingHTTPServer.daemon_threads, True)
+        self.assertIs(self.httpd.daemon_threads, True)
+        self.assertTrue(hasattr(serve_local._LOG_LOCK, "acquire"))
+        self.assertTrue(hasattr(serve_local._LOG_LOCK, "release"))
+
+    def test_log_message_stderr_enospc_and_closed_stream_do_not_break_responses(self) -> None:
+        write_calls = 0
+
+        class _FailingStderr:
+            def __init__(self, exc: Exception) -> None:
+                self._exc = exc
+
+            def write(self, _text: str) -> int:
+                nonlocal write_calls
+                write_calls += 1
+                raise self._exc
+
+        enospc = OSError(errno.ENOSPC, "No space left on device")
+        with mock.patch.object(sys, "stderr", _FailingStderr(enospc)):
+            st200, hdr200, body200 = self._request("GET", "/runtime.wasm")
+            self.assertEqual(st200, 200)
+            self._assert_coop_coep(hdr200)
+            self.assertEqual(body200, b"\x00asm\x01\x00\x00\x00")
+
+            st206, hdr206, body206 = self._request(
+                "GET", "/data/splash.wgsl.pack", {"Range": "bytes=0-4095"}
+            )
+            self.assertEqual(st206, 206)
+            self._assert_coop_coep(hdr206)
+            self.assertEqual(hdr206.get("Content-Range"), f"bytes 0-4095/{self.large_size}")
+            self.assertEqual(body206, self.large_payload[:4096])
+
+        self.assertGreaterEqual(write_calls, 2)
+
+        closed_err = ValueError("I/O operation on closed file")
+        with mock.patch.object(sys, "stderr", _FailingStderr(closed_err)):
+            st_val, hdr_val, body_val = self._request("GET", "/index.html")
+            self.assertEqual(st_val, 200)
+            self._assert_coop_coep(hdr_val)
+            self.assertEqual(body_val, b"<h1>playgta6web</h1>")
+
+        with mock.patch.object(sys, "stderr", None):
+            st_none, hdr_none, body_none = self._request(
+                "GET", "/data/splash.wgsl.pack", {"Range": "bytes=4096-8191"}
+            )
+            self.assertEqual(st_none, 206)
+            self._assert_coop_coep(hdr_none)
+            self.assertEqual(body_none, self.large_payload[4096:8192])
+
+    def test_log_message_serializes_concurrent_stderr_writes_under_log_lock(self) -> None:
+        in_write = False
+        overlap_detected = False
+        lines: list[str] = []
+
+        class _OverlapDetectingStderr:
+            def write(self, text: str) -> int:
+                nonlocal in_write, overlap_detected
+                if in_write:
+                    overlap_detected = True
+                in_write = True
+                try:
+                    lines.append(text)
+                    return len(text)
+                finally:
+                    in_write = False
+
+        with mock.patch.object(sys, "stderr", _OverlapDetectingStderr()):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                futures = [
+                    pool.submit(self._request, "GET", "/runtime.wasm") for _ in range(16)
+                ]
+                for fut in futures:
+                    st, hdr, body = fut.result()
+                    self.assertEqual(st, 200)
+                    self._assert_coop_coep(hdr)
+                    self.assertEqual(body, b"\x00asm\x01\x00\x00\x00")
+
+        self.assertFalse(overlap_detected, "_LOG_LOCK must serialize concurrent stderr writes")
+        self.assertGreaterEqual(len(lines), 16)
+
+    def test_quiet_option_suppresses_access_logs_and_cli_flag(self) -> None:
+        noisy_buf = io.StringIO()
+        with mock.patch.object(sys, "stderr", noisy_buf):
+            st_noisy, hdr_noisy, body_noisy = self._request("GET", "/index.html")
+        self.assertEqual(st_noisy, 200)
+        self._assert_coop_coep(hdr_noisy)
+        self.assertEqual(body_noisy, b"<h1>playgta6web</h1>")
+        self.assertIn("/index.html", noisy_buf.getvalue())
+
+        quiet_httpd = serve_local.create_server(
+            "127.0.0.1",
+            0,
+            self.web_root,
+            self.data_root,
+            quiet=True,
+        )
+        self.assertTrue(quiet_httpd.quiet)
+        quiet_port = quiet_httpd.server_address[1]
+        quiet_thread = threading.Thread(target=quiet_httpd.serve_forever, daemon=True)
+        quiet_thread.start()
+        try:
+            quiet_buf = io.StringIO()
+            with mock.patch.object(sys, "stderr", quiet_buf):
+                st200, hdr200, body200 = self._request("GET", "/index.html", port=quiet_port)
+                self.assertEqual(st200, 200)
+                self._assert_coop_coep(hdr200)
+                self.assertEqual(body200, b"<h1>playgta6web</h1>")
+
+                st206, hdr206, body206 = self._request(
+                    "GET",
+                    "/data/splash.wgsl.pack",
+                    {"Range": "bytes=0-63"},
+                    port=quiet_port,
+                )
+                self.assertEqual(st206, 206)
+                self._assert_coop_coep(hdr206)
+                self.assertEqual(body206, self.large_payload[:64])
+
+                st404, hdr404, body404 = self._request("GET", "/does-not-exist", port=quiet_port)
+                self.assertEqual(st404, 404)
+                self._assert_coop_coep(hdr404)
+                self.assertEqual(body404, b"")
+
+            self.assertEqual(quiet_buf.getvalue(), "")
+        finally:
+            quiet_httpd.shutdown()
+            quiet_httpd.server_close()
+            quiet_thread.join(timeout=2)
+
+        # Verify CLI --quiet flag forwards quiet=True (and defaults to quiet=False).
+        for argv_extra, expected_quiet in (([], False), (["--quiet"], True)):
+            with self.subTest(argv_extra=argv_extra):
+                captured_kwargs: dict[str, object] = {}
+
+                class _FakeServer:
+                    def serve_forever(self) -> None:
+                        raise KeyboardInterrupt
+
+                    def server_close(self) -> None:
+                        return None
+
+                def _fake_create_server(*args, **kwargs):
+                    captured_kwargs.update(kwargs)
+                    return _FakeServer()
+
+                argv = [
+                    "serve_local.py",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    "0",
+                    "--web",
+                    str(self.web_root),
+                    "--data",
+                    str(self.data_root),
+                    *argv_extra,
+                ]
+                with (
+                    mock.patch.object(sys, "argv", argv),
+                    mock.patch.object(serve_local, "create_server", side_effect=_fake_create_server),
+                    mock.patch("builtins.print"),
+                ):
+                    serve_local.main()
+                self.assertIs(captured_kwargs.get("quiet"), expected_quiet)
 
 
 if __name__ == "__main__":
