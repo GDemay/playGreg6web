@@ -58,9 +58,23 @@ function createMockWebGpu({ strictWebGpu = false, features = undefined } = {}) {
       const texture = {
         kind: 'GPUTexture',
         handle: nextHandle++,
+        format: desc.format,
         desc,
         destroyed: false,
         createView(viewDesc) {
+          if (
+            strictWebGpu &&
+            viewDesc &&
+            viewDesc.format &&
+            viewDesc.format !== desc.format
+          ) {
+            const allowed = Array.isArray(desc.viewFormats) ? desc.viewFormats : [];
+            if (!allowed.includes(viewDesc.format)) {
+              throw new Error(
+                `WebGPU validation: texture view format ${viewDesc.format} is not in texture viewFormats for ${desc.format}`
+              );
+            }
+          }
           return { kind: 'GPUTextureView', textureHandle: texture.handle, viewDesc };
         },
         destroy() {
@@ -148,6 +162,10 @@ function createMockWebGpu({ strictWebGpu = false, features = undefined } = {}) {
           dataLayout: { ...dataLayout },
           size: { ...size },
           isSab: typeof SharedArrayBuffer !== 'undefined' && data.buffer instanceof SharedArrayBuffer,
+          dataRef: data,
+          bufferRef: data.buffer,
+          byteOffset: data.byteOffset,
+          byteLength: data.byteLength,
           bytes: bytes.slice(),
         });
       },
@@ -307,6 +325,14 @@ test('CreateTexture2 creates a texture with format, samples and view formats in 
     sabCopyCount: 0,
     bc3dFallbacks: 0,
     bc3dFallbackUploadsSkipped: 0,
+    directZeroCopyUploads: 0,
+    repackedUploads: 0,
+    scratchBufferReuses: 0,
+    scratchBufferAllocations: 0,
+    scratchBufferBytes: 0,
+    r8unormUploads: 0,
+    bytesUploaded: 0,
+    srgbSiblingViewFormatsAdded: 0,
   });
   const [rt, tex] = gpu.calls.filter((c) => c.op === 'createTexture').map((c) => c.desc);
   assert.deepEqual(rt, {
@@ -584,6 +610,14 @@ test('staged WriteTexture & copyBufferToTexture repack unaligned bytesPerRow to 
     sabCopyCount: 1,
     bc3dFallbacks: 0,
     bc3dFallbackUploadsSkipped: 0,
+    directZeroCopyUploads: 0,
+    repackedUploads: 1,
+    scratchBufferReuses: 0,
+    scratchBufferAllocations: 1,
+    scratchBufferBytes: 1024,
+    r8unormUploads: 0,
+    bytesUploaded: 1024,
+    srgbSiblingViewFormatsAdded: 1,
   });
 });
 
@@ -638,6 +672,14 @@ test('direct queue.writeTexture safely copies SharedArrayBuffer views and tracks
     sabCopyCount: 1,
     bc3dFallbacks: 0,
     bc3dFallbackUploadsSkipped: 0,
+    directZeroCopyUploads: 1,
+    repackedUploads: 0,
+    scratchBufferReuses: 0,
+    scratchBufferAllocations: 1,
+    scratchBufferBytes: 16,
+    r8unormUploads: 0,
+    bytesUploaded: 32,
+    srgbSiblingViewFormatsAdded: 1,
   });
 });
 
@@ -711,6 +753,14 @@ test('handler.copyBufferToTexture repacks both CPU-backed and GPU-buffer-only un
     sabCopyCount: 1,
     bc3dFallbacks: 0,
     bc3dFallbackUploadsSkipped: 0,
+    directZeroCopyUploads: 0,
+    repackedUploads: 2,
+    scratchBufferReuses: 0,
+    scratchBufferAllocations: 1,
+    scratchBufferBytes: 512,
+    r8unormUploads: 0,
+    bytesUploaded: 1536,
+    srgbSiblingViewFormatsAdded: 1,
   });
   for (const [key, val] of Object.entries(stats)) {
     assert.equal(typeof val, 'number', `stat ${key} must be numeric`);
@@ -755,6 +805,10 @@ test('G31 classic-worker importScripts IIFE isolation preserves zero top-level l
       const repackRowsTo256 = null;
       const isBcCompressedFormat = null;
       const deviceSupportsBcSliced3d = null;
+      const SRGB_SIBLING_FORMATS = null;
+      const DEFAULT_MAX_SCRATCH_BYTES = 0;
+      const getSrgbSiblingFormat = null;
+      const resolveCompatibleViewFormats = null;
       class TexturePackets {}
       `,
       ctx
@@ -891,6 +945,14 @@ test('W108 (#734): 3D BC textures fall back to rgba8unorm without bc-sliced-3d a
     sabCopyCount: 0,
     bc3dFallbacks: 3,
     bc3dFallbackUploadsSkipped: 3,
+    directZeroCopyUploads: 0,
+    repackedUploads: 0,
+    scratchBufferReuses: 0,
+    scratchBufferAllocations: 0,
+    scratchBufferBytes: 0,
+    r8unormUploads: 0,
+    bytesUploaded: 0,
+    srgbSiblingViewFormatsAdded: 0,
   });
 });
 
@@ -1058,4 +1120,469 @@ test('W108 (#734): destroying or recreating a fallback texture ID clears fallbac
   assert.equal(wtCalls[0].bytes[0], 0x77);
   assert.equal(handler.stats.bc3dFallbacks, 2);
   assert.equal(handler.stats.bc3dFallbackUploadsSkipped, 0);
+});
+
+test('W164 (#871): 4K Bink2 3840x2160 r8unorm Y plane takes zero-copy direct queue.writeTexture path even with stagingPool', () => {
+  const gpu = createMockWebGpu({ strictWebGpu: true });
+  const stagingPool = new GpuStagingPool({ device: gpu.device, chunkSize: 4 * 1024 * 1024 });
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { stagingPool });
+  const handler = tp.installTexturePackets(processor);
+
+  const W = 3840;
+  const H = 2160;
+  assert.equal(W % 256, 0);
+
+  // Create 4K r8unorm (format code 1) Y plane texture.
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 300, width: W, height: H, usage: 0x06, format: 1 })
+  );
+  assert.equal(processor.textures.get(300).desc.format, 'r8unorm');
+  assert.equal(processor.textures.get(300).desc.viewFormats, undefined);
+
+  const yBytes = new Uint8Array(W * H);
+  yBytes[0] = 0x11;
+  yBytes[W - 1] = 0x22;
+  yBytes[(H - 1) * W] = 0x33;
+  yBytes[W * H - 1] = 0x44;
+
+  const pkt = writeTexturePacket({
+    textureId: 300,
+    width: W,
+    height: H,
+    bytesPerRow: W,
+    rowsPerImage: H,
+    data: yBytes,
+    useSab: false,
+  });
+
+  processor.executeCommandBuffer(pkt);
+
+  // Must go directly to queue.writeTexture with the exact command packet ArrayBuffer (zero-copy).
+  const wtCalls = gpu.calls.filter((c) => c.op === 'writeTexture');
+  const c2tCalls = gpu.calls.filter((c) => c.op === 'copyBufferToTexture');
+  assert.equal(wtCalls.length, 1);
+  assert.equal(c2tCalls.length, 0);
+  assert.equal(wtCalls[0].bufferRef, pkt.buffer, '3840x2160 aligned r8unorm upload must be zero-copy');
+  assert.equal(wtCalls[0].byteOffset, 8 + 48);
+  assert.equal(wtCalls[0].byteLength, W * H);
+  assert.equal(wtCalls[0].dataLayout.bytesPerRow, W);
+  assert.equal(wtCalls[0].dataLayout.rowsPerImage, H);
+  assert.equal(wtCalls[0].bytes[0], 0x11);
+  assert.equal(wtCalls[0].bytes[W - 1], 0x22);
+  assert.equal(wtCalls[0].bytes[(H - 1) * W], 0x33);
+  assert.equal(wtCalls[0].bytes[W * H - 1], 0x44);
+
+  // No staging buffer chunks allocated and no scratch buffer touched.
+  assert.equal(stagingPool.getStats().totalChunksAllocated, 0);
+  assert.deepEqual(handler.getStats(), {
+    created: 1,
+    errors: 0,
+    createTexture2Count: 1,
+    rowPitchRepackCount: 0,
+    sabCopyCount: 0,
+    bc3dFallbacks: 0,
+    bc3dFallbackUploadsSkipped: 0,
+    directZeroCopyUploads: 1,
+    repackedUploads: 0,
+    scratchBufferReuses: 0,
+    scratchBufferAllocations: 0,
+    scratchBufferBytes: 0,
+    r8unormUploads: 1,
+    bytesUploaded: W * H,
+    srgbSiblingViewFormatsAdded: 0,
+  });
+});
+
+test('W164 (#871): 4K Bink2 1920x1080 r8unorm Cr/Cb planes reuse persistent scratch Uint8Array across frames and zero padding tails', () => {
+  const gpu = createMockWebGpu({ strictWebGpu: true });
+  const stagingPool = new GpuStagingPool({
+    device: gpu.device,
+    chunkSize: 4 * 1024 * 1024,
+    maxPoolBytes: 64 * 1024 * 1024,
+  });
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { stagingPool });
+  const handler = tp.installTexturePackets(processor);
+
+  const YW = 3840;
+  const YH = 2160;
+  const CW = 1920;
+  const CH = 1080;
+  const ALIGNED_CW = 2048;
+  assert.equal(tp.alignBytesPerRow256(CW), ALIGNED_CW);
+
+  // Create Y, Cr, Cb r8unorm planes.
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 310, width: YW, height: YH, usage: 0x06, format: 1 })
+  );
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 311, width: CW, height: CH, usage: 0x06, format: 1 })
+  );
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 312, width: CW, height: CH, usage: 0x06, format: 1 })
+  );
+
+  const yData = new Uint8Array(YW * YH);
+  const crData = new Uint8Array(CW * CH);
+  const cbData = new Uint8Array(CW * CH);
+
+  // Simulate 3 frames at 30 FPS cadence: 3x Y (zero-copy) + 3x Cr + 3x Cb (scratch-reused repack).
+  const FRAMES = 3;
+  let firstScratchRef = null;
+  for (let frame = 0; frame < FRAMES; frame += 1) {
+    stagingPool.beginFrame(frame);
+    yData[0] = 0x10 + frame;
+    crData.fill(0xa0 + frame);
+    cbData.fill(0x50 + frame);
+    // Mark first and last active bytes of row 0 and last row.
+    crData[0] = 0xc0 + frame;
+    crData[CW - 1] = 0xd0 + frame;
+    cbData[0] = 0x60 + frame;
+    cbData[CW - 1] = 0x70 + frame;
+    cbData[(CH - 1) * CW + (CW - 1)] = 0x80 + frame;
+
+    processor.executeCommandBuffer(
+      writeTexturePacket({
+        textureId: 310,
+        width: YW,
+        height: YH,
+        bytesPerRow: YW,
+        rowsPerImage: YH,
+        data: yData,
+      })
+    );
+    processor.executeCommandBuffer(
+      writeTexturePacket({
+        textureId: 311,
+        width: CW,
+        height: CH,
+        bytesPerRow: CW,
+        rowsPerImage: CH,
+        data: crData,
+      })
+    );
+    if (frame === 0) {
+      firstScratchRef = handler._scratchBuffer;
+      assert.ok(firstScratchRef instanceof Uint8Array);
+      assert.equal(firstScratchRef.byteLength, ALIGNED_CW * CH);
+      // Poison padding tail in scratch buffer to verify next upload strictly zeroes it.
+      firstScratchRef.fill(0xff, CW, ALIGNED_CW);
+    }
+    processor.executeCommandBuffer(
+      writeTexturePacket({
+        textureId: 312,
+        width: CW,
+        height: CH,
+        bytesPerRow: CW,
+        rowsPerImage: CH,
+        data: cbData,
+      })
+    );
+    assert.equal(
+      handler._scratchBuffer,
+      firstScratchRef,
+      `Frame ${frame}: scratch Uint8Array must be reused without reallocating`
+    );
+    stagingPool.endFrame();
+  }
+
+  const wtCalls = gpu.calls.filter((c) => c.op === 'writeTexture');
+  const c2tCalls = gpu.calls.filter((c) => c.op === 'copyBufferToTexture');
+  assert.equal(wtCalls.length, FRAMES, 'Y plane uses direct zero-copy writeTexture each frame');
+  assert.equal(c2tCalls.length, FRAMES * 2, 'Cr + Cb planes stage repacked 2048B rows');
+
+  // Verify Cb frame 0 repacked rows have exact active pixels and strictly zeroed padding [1920..2048).
+  const cbFrame0 = c2tCalls[1];
+  assert.equal(cbFrame0.source.bytesPerRow, ALIGNED_CW);
+  assert.equal(cbFrame0.source.rowsPerImage, CH);
+  assert.equal(cbFrame0.bytes[0], 0x60);
+  assert.equal(cbFrame0.bytes[CW - 1], 0x70);
+  for (let p = CW; p < ALIGNED_CW; p += 1) {
+    assert.equal(cbFrame0.bytes[p], 0, `padding byte at offset ${p} must be zeroed`);
+  }
+  assert.equal(cbFrame0.bytes[(CH - 1) * ALIGNED_CW + (CW - 1)], 0x80);
+
+  const expectedBytes = FRAMES * (YW * YH) + FRAMES * 2 * (ALIGNED_CW * CH);
+  assert.deepEqual(handler.getStats(), {
+    created: 3,
+    errors: 0,
+    createTexture2Count: 3,
+    rowPitchRepackCount: FRAMES * 2,
+    sabCopyCount: 0,
+    bc3dFallbacks: 0,
+    bc3dFallbackUploadsSkipped: 0,
+    directZeroCopyUploads: FRAMES,
+    repackedUploads: FRAMES * 2,
+    scratchBufferReuses: FRAMES * 2 - 1,
+    scratchBufferAllocations: 1,
+    scratchBufferBytes: ALIGNED_CW * CH,
+    r8unormUploads: FRAMES * 3,
+    bytesUploaded: expectedBytes,
+    srgbSiblingViewFormatsAdded: 0,
+  });
+});
+
+test('W164 (#871): scratch buffer grows on demand, respects maxScratchBytes cap, and handles SAB-backed aligned uploads', () => {
+  const gpu = createMockWebGpu({ strictWebGpu: true });
+  const stagingPool = new GpuStagingPool({ device: gpu.device, chunkSize: 64 * 1024 });
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { stagingPool });
+  // Small cap (4096 bytes) to test growth + cap enforcement deterministically.
+  const handler = tp.installTexturePackets(processor, { maxScratchBytes: 4096 });
+
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 320, width: 16, height: 4, usage: 0x06, format: 1 }) // r8unorm
+  );
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 321, width: 16, height: 8, usage: 0x06, format: 1 }) // r8unorm
+  );
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 322, width: 16, height: 32, usage: 0x06, format: 1 }) // r8unorm -> 256*32=8192 > 4096 cap
+  );
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 323, width: 256, height: 8, usage: 0x06, format: 1 }) // aligned 256x8 = 2048B SAB
+  );
+
+  // 1) Initial 16x4 -> repacked 256*4 = 1024 bytes (alloc #1).
+  processor.executeCommandBuffer(
+    writeTexturePacket({ textureId: 320, width: 16, height: 4, bytesPerRow: 16, rowsPerImage: 4, data: new Uint8Array(64) })
+  );
+  assert.equal(handler.getStats().scratchBufferAllocations, 1);
+  assert.equal(handler.getStats().scratchBufferReuses, 0);
+  assert.equal(handler.getStats().scratchBufferBytes, 1024);
+
+  // 2) Same size -> reuses 1024B scratch (reuse #1).
+  processor.executeCommandBuffer(
+    writeTexturePacket({ textureId: 320, width: 16, height: 4, bytesPerRow: 16, rowsPerImage: 4, data: new Uint8Array(64) })
+  );
+  assert.equal(handler.getStats().scratchBufferAllocations, 1);
+  assert.equal(handler.getStats().scratchBufferReuses, 1);
+
+  // 3) Larger 16x8 -> repacked 256*8 = 2048 bytes <= 4096 cap -> grows (alloc #2).
+  processor.executeCommandBuffer(
+    writeTexturePacket({ textureId: 321, width: 16, height: 8, bytesPerRow: 16, rowsPerImage: 8, data: new Uint8Array(128) })
+  );
+  assert.equal(handler.getStats().scratchBufferAllocations, 2);
+  assert.equal(handler.getStats().scratchBufferBytes, 2048);
+
+  // 4) Oversized 16x32 -> repacked 256*32 = 8192 > 4096 cap -> one-off alloc, persistent scratch stays 2048B.
+  processor.executeCommandBuffer(
+    writeTexturePacket({ textureId: 322, width: 16, height: 32, bytesPerRow: 16, rowsPerImage: 32, data: new Uint8Array(512) })
+  );
+  assert.equal(handler.getStats().scratchBufferAllocations, 2);
+  assert.equal(handler.getStats().scratchBufferBytes, 2048);
+
+  // 5) SAB-backed aligned 256x8 (2048B) -> copies out of SAB using existing 2048B scratch (reuse #2), direct writeTexture!
+  const sabData = new Uint8Array(256 * 8);
+  sabData[0] = 0xab;
+  sabData[2047] = 0xcd;
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 323,
+      width: 256,
+      height: 8,
+      bytesPerRow: 256,
+      rowsPerImage: 8,
+      data: sabData,
+      useSab: true,
+    })
+  );
+  const wtCalls = gpu.calls.filter((c) => c.op === 'writeTexture');
+  assert.equal(wtCalls.length, 1);
+  assert.equal(wtCalls[0].isSab, false);
+  assert.equal(wtCalls[0].bytes[0], 0xab);
+  assert.equal(wtCalls[0].bytes[2047], 0xcd);
+  assert.equal(handler.getStats().sabCopyCount, 1);
+  assert.equal(handler.getStats().scratchBufferReuses, 2);
+  assert.equal(handler.getStats().directZeroCopyUploads, 0, 'SAB copy must not count as zero-copy');
+  assert.equal(handler.getStats().r8unormUploads, 5);
+});
+
+test('W164 (#871): CreateTexture and CreateTexture2 attach compatible sRGB/linear sibling viewFormats safely', () => {
+  // Unit check helper exports directly.
+  assert.equal(tp.getSrgbSiblingFormat('rgba8unorm'), 'rgba8unorm-srgb');
+  assert.equal(tp.getSrgbSiblingFormat('rgba8unorm-srgb'), 'rgba8unorm');
+  assert.equal(tp.getSrgbSiblingFormat('bgra8unorm'), 'bgra8unorm-srgb');
+  assert.equal(tp.getSrgbSiblingFormat('bgra8unorm-srgb'), 'bgra8unorm');
+  assert.equal(tp.getSrgbSiblingFormat('bc1-rgba-unorm'), 'bc1-rgba-unorm-srgb');
+  assert.equal(tp.getSrgbSiblingFormat('bc1-rgba-unorm-srgb'), 'bc1-rgba-unorm');
+  assert.equal(tp.getSrgbSiblingFormat('bc2-rgba-unorm'), 'bc2-rgba-unorm-srgb');
+  assert.equal(tp.getSrgbSiblingFormat('bc2-rgba-unorm-srgb'), 'bc2-rgba-unorm');
+  assert.equal(tp.getSrgbSiblingFormat('bc3-rgba-unorm'), 'bc3-rgba-unorm-srgb');
+  assert.equal(tp.getSrgbSiblingFormat('bc3-rgba-unorm-srgb'), 'bc3-rgba-unorm');
+  assert.equal(tp.getSrgbSiblingFormat('bc7-rgba-unorm'), 'bc7-rgba-unorm-srgb');
+  assert.equal(tp.getSrgbSiblingFormat('bc7-rgba-unorm-srgb'), 'bc7-rgba-unorm');
+  assert.equal(tp.getSrgbSiblingFormat('r8unorm'), null);
+  assert.equal(tp.getSrgbSiblingFormat('bc4-r-unorm'), null);
+  assert.equal(tp.getSrgbSiblingFormat('bc5-rg-unorm'), null);
+  assert.equal(tp.getSrgbSiblingFormat('bc6h-rgb-ufloat'), null);
+  assert.equal(tp.getSrgbSiblingFormat('rgba16float'), null);
+
+  // resolveCompatibleViewFormats strips incompatible formats and deduplicates.
+  assert.deepEqual(tp.resolveCompatibleViewFormats('rgba8unorm', ['rgba16float', 'rgba8unorm']), {
+    viewFormats: ['rgba8unorm', 'rgba8unorm-srgb'],
+    siblingAdded: true,
+  });
+  assert.deepEqual(tp.resolveCompatibleViewFormats('bgra8unorm', ['bgra8unorm-srgb', 'bgra8unorm-srgb']), {
+    viewFormats: ['bgra8unorm-srgb'],
+    siblingAdded: false,
+  });
+
+  const gpu = createMockWebGpu({
+    strictWebGpu: true,
+    features: new Set(['texture-compression-bc']),
+  });
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx);
+  const handler = tp.installTexturePackets(processor);
+
+  // v1 CreateTexture: rgba8unorm (0), bgra8unorm (1), rgba16float (2), bc7-rgba-unorm (5).
+  processor.executeCommandBuffer(createTexture1Packet({ id: 400, width: 64, height: 64, format: 0 }));
+  processor.executeCommandBuffer(createTexture1Packet({ id: 401, width: 64, height: 64, format: 1 }));
+  processor.executeCommandBuffer(createTexture1Packet({ id: 402, width: 64, height: 64, format: 2 }));
+  processor.executeCommandBuffer(createTexture1Packet({ id: 403, width: 64, height: 64, format: 5 }));
+
+  assert.deepEqual(processor.textures.get(400).desc.viewFormats, ['rgba8unorm-srgb']);
+  assert.deepEqual(processor.textures.get(401).desc.viewFormats, ['bgra8unorm-srgb']);
+  assert.equal(processor.textures.get(402).desc.viewFormats, undefined);
+  assert.deepEqual(processor.textures.get(403).desc.viewFormats, ['bc7-rgba-unorm-srgb']);
+
+  // Creating sRGB views on v1 linear textures must pass strict WebGPU validation.
+  assert.doesNotThrow(() => processor.textures.get(400).createView({ format: 'rgba8unorm-srgb' }));
+  assert.doesNotThrow(() => processor.textures.get(401).createView({ format: 'bgra8unorm-srgb' }));
+  assert.doesNotThrow(() => processor.textures.get(403).createView({ format: 'bc7-rgba-unorm-srgb' }));
+
+  // v2 CreateTexture2: all sRGB-capable pairs without explicit viewFormats.
+  const v2Pairs = [
+    [410, 22, 'rgba8unorm', 'rgba8unorm-srgb'],
+    [411, 23, 'rgba8unorm-srgb', 'rgba8unorm'],
+    [412, 27, 'bgra8unorm', 'bgra8unorm-srgb'],
+    [413, 28, 'bgra8unorm-srgb', 'bgra8unorm'],
+    [414, 50, 'bc1-rgba-unorm', 'bc1-rgba-unorm-srgb'],
+    [415, 51, 'bc1-rgba-unorm-srgb', 'bc1-rgba-unorm'],
+    [416, 52, 'bc2-rgba-unorm', 'bc2-rgba-unorm-srgb'],
+    [417, 53, 'bc2-rgba-unorm-srgb', 'bc2-rgba-unorm'],
+    [418, 54, 'bc3-rgba-unorm', 'bc3-rgba-unorm-srgb'],
+    [419, 55, 'bc3-rgba-unorm-srgb', 'bc3-rgba-unorm'],
+    [420, 62, 'bc7-rgba-unorm', 'bc7-rgba-unorm-srgb'],
+    [421, 63, 'bc7-rgba-unorm-srgb', 'bc7-rgba-unorm'],
+  ];
+  for (const [id, code, expectedFmt, expectedSibling] of v2Pairs) {
+    processor.executeCommandBuffer(
+      createTexture2Packet({ id, width: 16, height: 16, format: code, usage: 0x06 })
+    );
+    const tex = processor.textures.get(id);
+    assert.equal(tex.desc.format, expectedFmt);
+    assert.deepEqual(tex.desc.viewFormats, [expectedSibling]);
+    assert.doesNotThrow(() => tex.createView({ format: expectedSibling }));
+  }
+
+  // Incompatible viewFormat in packet payload is stripped safely while valid sibling is attached.
+  processor.executeCommandBuffer(
+    createTexture2Packet({
+      id: 430,
+      width: 16,
+      height: 16,
+      format: 22, // rgba8unorm
+      viewFormats: [40], // incompatible rgba16float
+      usage: 0x06,
+    })
+  );
+  assert.deepEqual(processor.textures.get(430).desc.viewFormats, ['rgba8unorm-srgb']);
+
+  // Formats without sRGB siblings (r8unorm, bc4, bc5, bc6h) keep viewFormats omitted.
+  for (const [id, code] of [
+    [440, 1], // r8unorm
+    [441, 56], // bc4-r-unorm
+    [442, 58], // bc5-rg-unorm
+    [443, 60], // bc6h-rgb-ufloat
+  ]) {
+    processor.executeCommandBuffer(
+      createTexture2Packet({ id, width: 16, height: 16, format: code, usage: 0x06 })
+    );
+    assert.equal(processor.textures.get(id).desc.viewFormats, undefined);
+  }
+
+  // 3 v1 textures + 12 v2 pairs + 1 stripped-incompatible v2 = 16 sibling viewFormats added.
+  assert.equal(handler.getStats().srgbSiblingViewFormatsAdded, 16);
+  assert.equal(handler.getStats().errors, 0);
+});
+
+test('W164 (#871): telemetry resets cleanly on reset(), destroy(), and processor.destroy()', () => {
+  const gpu = createMockWebGpu({ strictWebGpu: true });
+  const stagingPool = new GpuStagingPool({ device: gpu.device, chunkSize: 64 * 1024 });
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { stagingPool });
+  const handler = tp.installTexturePackets(processor);
+
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 500, width: 256, height: 4, usage: 0x06, format: 1 })
+  );
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 501, width: 16, height: 4, usage: 0x06, format: 1 })
+  );
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 502, width: 8, height: 8, usage: 0x06, format: 22 })
+  );
+  processor.executeCommandBuffer(
+    writeTexturePacket({ textureId: 500, width: 256, height: 4, bytesPerRow: 256, rowsPerImage: 4, data: new Uint8Array(1024) })
+  );
+  processor.executeCommandBuffer(
+    writeTexturePacket({ textureId: 501, width: 16, height: 4, bytesPerRow: 16, rowsPerImage: 4, data: new Uint8Array(64) })
+  );
+  processor.executeCommandBuffer(
+    writeTexturePacket({ textureId: 501, width: 16, height: 4, bytesPerRow: 16, rowsPerImage: 4, data: new Uint8Array(64) })
+  );
+
+  const beforeReset = handler.getStats();
+  assert.equal(beforeReset.created, 3);
+  assert.equal(beforeReset.directZeroCopyUploads, 1);
+  assert.equal(beforeReset.repackedUploads, 2);
+  assert.equal(beforeReset.scratchBufferAllocations, 1);
+  assert.equal(beforeReset.scratchBufferReuses, 1);
+  assert.equal(beforeReset.scratchBufferBytes, 1024);
+  assert.equal(beforeReset.r8unormUploads, 3);
+  assert.equal(beforeReset.bytesUploaded, 1024 + 1024 + 1024);
+  assert.equal(beforeReset.srgbSiblingViewFormatsAdded, 1);
+  for (const [key, val] of Object.entries(beforeReset)) {
+    assert.equal(typeof val, 'number', `stat ${key} must be numeric`);
+    assert.ok(Number.isInteger(val) && val >= 0, `stat ${key} must be a non-negative integer`);
+  }
+
+  const expectedZeroStats = {
+    created: 0,
+    errors: 0,
+    createTexture2Count: 0,
+    rowPitchRepackCount: 0,
+    sabCopyCount: 0,
+    bc3dFallbacks: 0,
+    bc3dFallbackUploadsSkipped: 0,
+    directZeroCopyUploads: 0,
+    repackedUploads: 0,
+    scratchBufferReuses: 0,
+    scratchBufferAllocations: 0,
+    scratchBufferBytes: 0,
+    r8unormUploads: 0,
+    bytesUploaded: 0,
+    srgbSiblingViewFormatsAdded: 0,
+  };
+
+  // 1) reset() clears counters and releases scratch buffer, while handler stays usable.
+  handler.reset();
+  assert.deepEqual(handler.getStats(), expectedZeroStats);
+  assert.equal(handler._scratchBuffer, null);
+  assert.equal(handler.lastError, null);
+
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 510, width: 256, height: 2, usage: 0x06, format: 1 })
+  );
+  processor.executeCommandBuffer(
+    writeTexturePacket({ textureId: 510, width: 256, height: 2, bytesPerRow: 256, rowsPerImage: 2, data: new Uint8Array(512) })
+  );
+  assert.equal(handler.getStats().directZeroCopyUploads, 1);
+  assert.equal(handler.getStats().r8unormUploads, 1);
+  assert.equal(handler.getStats().bytesUploaded, 512);
+
+  // 2) processor.destroy() triggers handler.destroy() cleanly and idempotently.
+  processor.destroy();
+  assert.deepEqual(handler.getStats(), expectedZeroStats);
+  assert.equal(handler._scratchBuffer, null);
+  handler.destroy();
+  assert.deepEqual(handler.getStats(), expectedZeroStats);
 });
