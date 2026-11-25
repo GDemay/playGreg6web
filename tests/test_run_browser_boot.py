@@ -972,5 +972,384 @@ class ServerAndCdpLifecycleTests(unittest.TestCase):
             self.assertIn("ffmpeg not found", warn or "")
 
 
+class BootFlagsAndOptionsTests(unittest.TestCase):
+    def test_new_flag_defaults_preserve_backwards_compatibility(self):
+        parser = rbb.build_arg_parser()
+        args = parser.parse_args([])
+        self.assertIsNone(args.input_script)
+        self.assertFalse(args.stream_shaders)
+        self.assertIsNone(args.stream_threshold_mb)
+        self.assertIsNone(args.boot_options)
+        self.assertFalse(args.report_to_log)
+        self.assertIsNone(args.max_wall_ms)
+
+        self.assertEqual(rbb.build_target_url("127.0.0.1", 8080), "http://127.0.0.1:8080/")
+        self.assertEqual(rbb.build_target_url("127.0.0.1", 8080, smoke=True), "http://127.0.0.1:8080/?smoke=1")
+
+    def test_input_script_and_stream_shader_url_building_and_validation(self):
+        self.assertEqual(rbb.sanitize_input_script_preset("start-screen"), "start-screen")
+        self.assertEqual(rbb.sanitize_input_script_preset("  START-SCREEN  "), "start-screen")
+        for bad in ("", "   ", "unknown", "../escape", "start-screen&evil=1", "start-screen\nx", 123, None):
+            self.assertIsNone(rbb.sanitize_input_script_preset(bad), f"expected None for {bad!r}")
+
+        self.assertEqual(
+            rbb.build_target_url("127.0.0.1", 8080, input_script="START-SCREEN"),
+            "http://127.0.0.1:8080/?inputScript=start-screen",
+        )
+        self.assertEqual(
+            rbb.build_target_url("127.0.0.1", 8080, stream_shaders=True),
+            "http://127.0.0.1:8080/?streamShaders=1",
+        )
+        self.assertEqual(
+            rbb.build_target_url("127.0.0.1", 8080, stream_threshold_mb=32.0),
+            "http://127.0.0.1:8080/?streamThresholdMb=32",
+        )
+        self.assertEqual(
+            rbb.build_target_url("127.0.0.1", 8080, stream_threshold_mb=0.00001),
+            "http://127.0.0.1:8080/?streamThresholdMb=0.00001",
+        )
+        self.assertEqual(
+            rbb.build_target_url(
+                "127.0.0.1",
+                8080,
+                smoke=True,
+                input_script="start-screen",
+                stream_shaders=True,
+                stream_threshold_mb=16.5,
+            ),
+            "http://127.0.0.1:8080/?smoke=1&inputScript=start-screen&streamShaders=1&streamThresholdMb=16.5",
+        )
+
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            for bad_args in (
+                ("--input-script", ""),
+                ("--input-script", "not-allowed"),
+                ("--input-script", "../escape"),
+                ("--input-script", "start-screen&foo=1"),
+                ("--stream-threshold-mb", "0"),
+                ("--stream-threshold-mb", "-4.5"),
+                ("--stream-threshold-mb", "nan"),
+                ("--stream-threshold-mb", "inf"),
+                ("--stream-threshold-mb", "-inf"),
+            ):
+                code, _, _, _, _ = fx.run_cli("--smoke", "--dry-run", *bad_args)
+                self.assertEqual(code, 2, f"expected exit 2 for {bad_args}")
+
+    def test_dry_run_includes_url_query_params_and_boot_options_without_writing(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            code, out, err, _, _ = fx.run_cli(
+                "--smoke",
+                "--dry-run",
+                "--name",
+                "flags-dry",
+                "--input-script",
+                "START-SCREEN",
+                "--stream-shaders",
+                "--stream-threshold-mb",
+                "24.5",
+                "--boot-options",
+                '{"arena_log_limit": 2048}',
+                "--report-to-log",
+                "--max-wall-ms",
+                "45000",
+            )
+            self.assertEqual(code, 0, err)
+            payload = json.loads(out)
+            self.assertEqual(
+                payload["url"],
+                "http://127.0.0.1:<ephemeral>/?smoke=1&inputScript=start-screen&streamShaders=1&streamThresholdMb=24.5",
+            )
+            self.assertEqual(payload["input_script"], "start-screen")
+            self.assertEqual(payload["inputScript"], "start-screen")
+            self.assertTrue(payload["stream_shaders"])
+            self.assertEqual(payload["stream_threshold_mb"], 24.5)
+            self.assertEqual(
+                payload["boot_options"],
+                {"arena_log_limit": 2048, "max_wall_ms": 45000, "report_to_log": True},
+            )
+            self.assertEqual(payload["boot_options_staging"]["action"], "plan_ephemeral")
+            self.assertFalse(payload["boot_options_staging"]["staged"])
+            # Dry-run must never write boot-options.json to boot_dir
+            self.assertFalse((fx.boot_dir / "boot-options.json").exists())
+
+    def test_boot_options_file_validation_errors_and_tracked_dir_guard(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            # Load from a UTF-8-BOM JSON file and override with CLI helpers
+            opts_file = Path(d) / "external" / "2026-boot-opts.json"
+            opts_file.write_text(
+                "\ufeff" + json.dumps({"max_wall_ms": 10000, "verify_window_marks": True}),
+                encoding="utf-8",
+            )
+            code, out, err, _, _ = fx.run_cli(
+                "--trust-build",
+                "--dry-run",
+                "--name",
+                "opts-file",
+                "--boot-options",
+                str(opts_file),
+                "--report-to-log",
+                "--max-wall-ms",
+                "90000",
+            )
+            self.assertEqual(code, 0, err)
+            payload = json.loads(out)
+            self.assertEqual(
+                payload["boot_options"],
+                {"max_wall_ms": 90000, "report_to_log": True, "verify_window_marks": True},
+            )
+            self.assertEqual(payload["boot_options_staging"]["action"], "plan_write")
+            self.assertFalse((fx.boot_dir / "boot-options.json").exists())
+            # Zero host paths leaked in dry-run JSON
+            self.assertNotIn(str(Path(d)), out)
+
+            # Reject malformed / invalid boot-options inputs
+            bad_json_file = Path(d) / "external" / "bad.json"
+            bad_json_file.write_text("{not valid json", encoding="utf-8")
+            for bad_args in (
+                ("--boot-options", ""),
+                ("--boot-options", "{bad"),
+                ("--boot-options", "[1, 2, 3]"),
+                ("--boot-options", "123"),
+                ("--boot-options", '{"unknown_key": 1}'),
+                ("--boot-options", '{"max_wall_ms": true}'),
+                ("--boot-options", '{"max_wall_ms": -5}'),
+                ("--boot-options", '{"report_to_log": "yes"}'),
+                ("--boot-options", str(Path(d) / "external" / "missing.json")),
+                ("--boot-options", str(bad_json_file)),
+                ("--max-wall-ms", "-1"),
+                ("--max-wall-ms", str(1 << 64)),
+            ):
+                code, _, err_text, _, _ = fx.run_cli("--smoke", "--dry-run", *bad_args)
+                self.assertEqual(code, 2, f"expected exit 2 for {bad_args}")
+                self.assertNotIn(str(Path(d)), err_text)
+
+            # Refuse writing boot-options.json into tracked repository directories (web/, tools/, repo root)
+            for tracked_dir in (fx.repo / "web", fx.repo / "tools", fx.repo):
+                code, _, err_text, _, _ = fx.run_cli(
+                    "--trust-build",
+                    "--dry-run",
+                    "--boot-dir",
+                    str(tracked_dir),
+                    "--report-to-log",
+                )
+                self.assertEqual(code, 2, f"expected refusal for tracked dir {tracked_dir}")
+                self.assertIn("tracked repository directory", err_text)
+                self.assertFalse((tracked_dir / "boot-options.json").exists())
+
+    def test_live_boot_options_staging_in_gitignored_boot_dir_and_smoke_ephemeral(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            # Real-game run stages boot-options.json into gitignored work/recomp_build
+            code, _, err, _, sessions = fx.run_cli(
+                "--trust-build",
+                "--name",
+                "real-opts",
+                "--boot-options",
+                '{"max_dispatches": 5000}',
+                "--report-to-log",
+                "--max-wall-ms",
+                "60000",
+                "--input-script",
+                "start-screen",
+                "--stream-shaders",
+                "--stream-threshold-mb",
+                "32",
+            )
+            self.assertEqual(code, 0, err)
+            staged_path = fx.boot_dir / "boot-options.json"
+            self.assertTrue(staged_path.is_file())
+            self.assertEqual(
+                json.loads(staged_path.read_text(encoding="utf-8")),
+                {"max_dispatches": 5000, "max_wall_ms": 60000, "report_to_log": True},
+            )
+            self.assertEqual(sessions[0]["input_script"], "start-screen")
+            self.assertTrue(sessions[0]["stream_shaders"])
+            self.assertEqual(sessions[0]["stream_threshold_mb"], 32.0)
+            self.assertEqual(
+                sessions[0]["boot_options"],
+                {"max_dispatches": 5000, "max_wall_ms": 60000, "report_to_log": True},
+            )
+
+            # Remove staged file and verify smoke run does NOT touch repo boot_dir
+            staged_path.unlink()
+            run_dir = fx.build / "runs" / "smoke-ephem"
+            run_dir.mkdir(parents=True)
+            navigated_urls: list[str] = []
+            observed_smoke_boot_opts: list[dict[str, Any]] = []
+
+            class FakeProc:
+                returncode = None
+
+                def poll(self):
+                    return self.returncode
+
+                def terminate(self):
+                    self.returncode = 0
+
+                def wait(self, timeout=None):
+                    return 0
+
+                def kill(self):
+                    self.returncode = -9
+
+            def fake_popen(cmd, **kwargs):
+                if "--boot" in cmd:
+                    boot_arg = Path(cmd[cmd.index("--boot") + 1])
+                    opts_in_boot = boot_arg / "boot-options.json"
+                    if opts_in_boot.is_file():
+                        observed_smoke_boot_opts.append(json.loads(opts_in_boot.read_text(encoding="utf-8")))
+                return FakeProc()
+
+            class FakeCdp:
+                def __init__(self, ws_url: str):
+                    pass
+
+                def connect(self):
+                    return None
+
+                def close(self):
+                    return None
+
+                def send(self, method: str, params=None, timeout=None):
+                    if method == "Page.navigate" and isinstance(params, dict):
+                        navigated_urls.append(str(params.get("url") or ""))
+                    if method == "Runtime.evaluate":
+                        probe = make_sample_probe(presents=2, real_draws=7, fallback_draws=1, validation_errors=2)
+                        probe["bootUrlOptions"] = {"inputScript": "start-screen"}
+                        return {"result": {"value": probe}}
+                    return {}
+
+                def drain_events(self, timeout: float = 0.0):
+                    return []
+
+            res = rbb.run_browser_session(
+                repo=fx.repo,
+                run_dir=run_dir,
+                chrome_path=fx.chrome,
+                port=0,
+                boot_dir=None,
+                game_dir=None,
+                shaders_dir=None,
+                duration_s=0.15,
+                headless=True,
+                smoke=True,
+                send_input=False,
+                capture_frames=False,
+                frame_interval_s=1.0,
+                encode_mp4=False,
+                input_script="start-screen",
+                stream_shaders=True,
+                stream_threshold_mb=48.0,
+                boot_options={"report_to_log": True, "max_wall_ms": 15000},
+                popen_fn=fake_popen,
+                cdp_factory=FakeCdp,
+                wait_server_fn=lambda *a, **k: {"status_code": 200, "coop": "same-origin", "coep": "require-corp"},
+                wait_cdp_fn=lambda *a, **k: "ws://127.0.0.1:9222/devtools/page/1",
+            )
+            self.assertTrue(res.ok)
+            self.assertEqual(len(navigated_urls), 1)
+            self.assertIn("smoke=1", navigated_urls[0])
+            self.assertIn("inputScript=start-screen", navigated_urls[0])
+            self.assertIn("streamShaders=1", navigated_urls[0])
+            self.assertIn("streamThresholdMb=48", navigated_urls[0])
+            self.assertEqual(observed_smoke_boot_opts, [{"max_wall_ms": 15000, "report_to_log": True}])
+            # Smoke mode must never touch repo boot_dir
+            self.assertFalse(staged_path.exists())
+
+    def test_report_and_telemetry_summary_fields_and_input_script_sanitization(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            probe = make_sample_probe(
+                boot_mode="real-wasm64",
+                session_state="running_wasm",
+                presents=6,
+                real_draws=14,
+                fallback_draws=2,
+                validation_errors=1,
+            )
+            # Untrusted probe value should be ignored in favor of sanitized allowlisted value
+            probe["inputScriptState"] = {"active": True, "preset": r"C:\Users\evil\script"}
+            probe["bootUrlOptions"] = {"inputScript": "START-SCREEN"}
+
+            session = make_fake_session_result(probe=probe)
+            code, out, err, _, _ = fx.run_cli(
+                "--smoke",
+                "--name",
+                "summary-check",
+                "--input-script",
+                "start-screen",
+                "--stream-shaders",
+                "--stream-threshold-mb",
+                "16",
+                "--report-to-log",
+                session_runner=lambda **kw: session,
+            )
+            self.assertEqual(code, 0, err)
+            run_dir = fx.build / "runs" / "summary-check"
+            report = json.loads((run_dir / "boot-report.json").read_text(encoding="utf-8"))
+            telemetry = json.loads((run_dir / "telemetry.json").read_text(encoding="utf-8"))
+            cmd_meta = json.loads((run_dir / "command.json").read_text(encoding="utf-8"))
+
+            expected_summary = {
+                "realPackDrawCount": 14,
+                "fallbackDrawCount": 2,
+                "validationErrorCount": 1,
+                "inputScript": "start-screen",
+                "streamShaders": True,
+                "streamThresholdMb": 16.0,
+            }
+            self.assertEqual(report["summary"], expected_summary)
+            self.assertEqual(report["inputScript"], "start-screen")
+            self.assertEqual(report["counters"]["real_pack_draws"], 14)
+            self.assertEqual(report["counters"]["fallback_draws"], 2)
+            self.assertEqual(report["counters"]["gpu_validation_errors"], 1)
+            self.assertEqual(report["boot_options"], {"report_to_log": True})
+
+            self.assertEqual(telemetry["summary"], expected_summary)
+            self.assertEqual(telemetry["inputScript"], "start-screen")
+            self.assertTrue(telemetry["stream_shaders"])
+            self.assertEqual(telemetry["stream_threshold_mb"], 16.0)
+            self.assertEqual(telemetry["boot_options"], {"report_to_log": True})
+
+            self.assertEqual(cmd_meta["input_script"], "start-screen")
+            self.assertEqual(cmd_meta["inputScript"], "start-screen")
+            self.assertTrue(cmd_meta["stream_shaders"])
+            self.assertEqual(cmd_meta["stream_threshold_mb"], 16.0)
+            self.assertEqual(cmd_meta["boot_options"], {"report_to_log": True})
+            self.assertIn("input_script: start-screen", out)
+
+            # Verify compare_boot_reports compatibility remains intact
+            code2, cmp_out, cmp_err, _, _ = fx.run_cli(
+                "--smoke",
+                "--name",
+                "summary-check-2",
+                "--baseline",
+                "summary-check",
+                "--input-script",
+                "start-screen",
+                session_runner=lambda **kw: session,
+            )
+            self.assertEqual(code2, 0, cmp_err)
+            self.assertIn("PASS", cmp_out)
+
+            # Verify untrusted probe inputScript with no CLI fallback resolves cleanly to None
+            bad_probe = make_sample_probe(real_draws=3, fallback_draws=0, validation_errors=0)
+            bad_probe["href"] = "http://127.0.0.1:8123/?inputScript=../escape"
+            bad_probe["bootState"]["inputScript"] = "evil-script"
+            rep_none = rbb.build_boot_report(
+                make_fake_session_result(probe=bad_probe),
+                smoke=True,
+                preset="smoke",
+            )
+            self.assertIsNone(rep_none["inputScript"])
+            self.assertIsNone(rep_none["summary"]["inputScript"])
+            self.assertEqual(rep_none["summary"]["realPackDrawCount"], 3)
+            self.assertEqual(rep_none["summary"]["fallbackDrawCount"], 0)
+            self.assertEqual(rep_none["summary"]["validationErrorCount"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
