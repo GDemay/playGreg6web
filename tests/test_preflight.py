@@ -1236,6 +1236,414 @@ class TestPreflight(unittest.TestCase):
             )
             self.assertNotEqual(proc_neg_ram.returncode, 0)
 
+    def test_disk_space_min_free_gib_pass_warn_fail_boundaries(self) -> None:
+        gib = preflight.BYTES_PER_GIB
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = self._create_repo_skeleton(base, include_server=True)
+            dist_dir = repo / "web" / "dist"
+            dist_dir.mkdir(parents=True)
+            (dist_dir / "runtime.js").write_text("export default {};\n", encoding="utf-8")
+            (dist_dir / "runtime.wasm").write_bytes(b"\x00asm\x01\x00\x00\x00")
+            custom_work = base / "work_drive_separate"
+            custom_work.mkdir()
+
+            # 1) Default informational mode (min_free_gib=None): reports free/total GiB and never sets failed=True.
+            info_pass = preflight.check_disk_space(
+                repo,
+                disk_usage_fn=lambda _p: _FakeDiskUsage(total=100 * gib, used=80 * gib, free=20 * gib),
+            )
+            self.assertEqual(info_pass["status"], "pass")
+            self.assertTrue(info_pass["ok"])
+            self.assertFalse(info_pass["warning"])
+            self.assertFalse(info_pass["failed"])
+            self.assertFalse(info_pass["enforced"])
+            self.assertIsNone(info_pass["minFreeGib"])
+            self.assertEqual(info_pass["freeGib"], 20.0)
+            self.assertEqual(info_pass["totalGib"], 100.0)
+            self.assertEqual(info_pass["totalBytes"], 100 * gib)
+            self.assertEqual(info_pass["workspace"]["freeGib"], 20.0)
+            self.assertEqual(info_pass["workspace"]["totalGib"], 100.0)
+            self.assertEqual(info_pass["workspace"]["status"], "pass")
+
+            info_warn = preflight.check_disk_space(
+                repo,
+                disk_usage_fn=lambda _p: _FakeDiskUsage(total=100 * gib, used=97 * gib, free=3 * gib),
+            )
+            self.assertEqual(info_warn["status"], "warn")
+            self.assertFalse(info_warn["ok"])
+            self.assertTrue(info_warn["warning"])
+            self.assertTrue(info_warn["lowSpace"])
+            self.assertFalse(info_warn["failed"])
+            self.assertFalse(info_warn["enforced"])
+
+            # 2) Explicit min_free_gib=10.0: exact boundary passes, 1 byte below fails.
+            exact_pass = preflight.check_disk_space(
+                repo,
+                min_free_gib=10.0,
+                disk_usage_fn=lambda _p: _FakeDiskUsage(total=100 * gib, used=90 * gib, free=10 * gib),
+            )
+            self.assertEqual(exact_pass["status"], "pass")
+            self.assertTrue(exact_pass["ok"])
+            self.assertFalse(exact_pass["warning"])
+            self.assertFalse(exact_pass["failed"])
+            self.assertTrue(exact_pass["enforced"])
+            self.assertEqual(exact_pass["minFreeGib"], 10.0)
+            self.assertEqual(exact_pass["freeGib"], 10.0)
+            self.assertEqual(exact_pass["totalGib"], 100.0)
+
+            below_fail = preflight.check_disk_space(
+                repo,
+                min_free_gib=10.0,
+                disk_usage_fn=lambda _p: _FakeDiskUsage(total=100 * gib, used=90 * gib + 1, free=10 * gib - 1),
+            )
+            self.assertEqual(below_fail["status"], "fail")
+            self.assertFalse(below_fail["ok"])
+            self.assertTrue(below_fail["warning"])
+            self.assertTrue(below_fail["lowSpace"])
+            self.assertTrue(below_fail["failed"])
+
+            # 3) Three-tier pass / warn / fail (warn at 20 GiB, fail at 10 GiB).
+            tier_pass = preflight.check_disk_space(
+                repo,
+                min_free_gb=20.0,
+                min_free_gib=10.0,
+                disk_usage_fn=lambda _p: _FakeDiskUsage(total=100 * gib, used=75 * gib, free=25 * gib),
+            )
+            self.assertEqual(tier_pass["status"], "pass")
+            self.assertTrue(tier_pass["ok"])
+            self.assertFalse(tier_pass["warning"])
+            self.assertFalse(tier_pass["failed"])
+
+            tier_warn = preflight.check_disk_space(
+                repo,
+                min_free_gb=20.0,
+                min_free_gib=10.0,
+                disk_usage_fn=lambda _p: _FakeDiskUsage(total=100 * gib, used=85 * gib, free=15 * gib),
+            )
+            self.assertEqual(tier_warn["status"], "warn")
+            self.assertFalse(tier_warn["ok"])
+            self.assertTrue(tier_warn["warning"])
+            self.assertTrue(tier_warn["lowSpace"])
+            self.assertFalse(tier_warn["failed"])
+
+            tier_warn_edge = preflight.check_disk_space(
+                repo,
+                min_free_gb=20.0,
+                min_free_gib=10.0,
+                disk_usage_fn=lambda _p: _FakeDiskUsage(total=100 * gib, used=90 * gib, free=10 * gib),
+            )
+            self.assertEqual(tier_warn_edge["status"], "warn")
+            self.assertFalse(tier_warn_edge["failed"])
+
+            tier_fail = preflight.check_disk_space(
+                repo,
+                min_free_gb=20.0,
+                min_free_gib=10.0,
+                disk_usage_fn=lambda _p: _FakeDiskUsage(total=100 * gib, used=90 * gib + 1, free=10 * gib - 1),
+            )
+            self.assertEqual(tier_fail["status"], "fail")
+            self.assertTrue(tier_fail["failed"])
+            self.assertTrue(tier_fail["warning"])
+
+            # 4) Separate work drive fails while workspace drive passes; readinessSummary & text reflect failure.
+            def split_usage(probe_path: Path) -> _FakeDiskUsage:
+                if probe_path.resolve() == custom_work.resolve():
+                    return _FakeDiskUsage(total=20 * gib, used=16 * gib, free=4 * gib)
+                return _FakeDiskUsage(total=100 * gib, used=50 * gib, free=50 * gib)
+
+            which_fn, version_fn = _make_fake_toolchains({"python": "Python 3.12.4"})
+            report = preflight.run_preflight(
+                repo,
+                env={"GTA6_WORK_DIR": str(custom_work)},
+                which_fn=which_fn,
+                version_fn=version_fn,
+                min_free_gib=5.0,
+                disk_usage_fn=split_usage,
+            )
+            self.assertFalse(report["ok"])
+            self.assertTrue(report["milestones"]["M1"]["ready"])
+            self.assertEqual(report["diskSpace"]["status"], "fail")
+            self.assertTrue(report["diskSpace"]["failed"])
+            self.assertEqual(report["diskSpace"]["freeGib"], 4.0)
+            self.assertEqual(report["diskSpace"]["totalGib"], 20.0)
+            self.assertEqual(report["diskSpace"]["workspace"]["status"], "pass")
+            self.assertEqual(report["diskSpace"]["work"]["status"], "fail")
+
+            summary = report["readinessSummary"]
+            self.assertEqual(summary["status"], "fail")
+            self.assertFalse(summary["ok"])
+            self.assertEqual(summary["diskStatus"], "fail")
+            self.assertEqual(summary["freeGib"], 4.0)
+            self.assertEqual(summary["totalGib"], 20.0)
+            self.assertEqual(summary["minFreeGib"], 5.0)
+            self.assertIn("diskSpace:minFreeGib", summary["failedChecks"])
+
+            rendered = preflight.format_report_text(report)
+            self.assertIn("[FAIL] work drive", rendered)
+            self.assertIn("4.00 / 20.00 GiB free", rendered)
+            self.assertNotIn(str(custom_work), rendered)
+
+            # 5) OSError with enforced min_free_gib marks check as failed without leaking paths.
+            def failing_usage(probe_path: Path) -> _FakeDiskUsage:
+                raise OSError(f"statvfs failed on {probe_path}")
+
+            err_enforced = preflight.check_disk_space(repo, min_free_gib=5.0, disk_usage_fn=failing_usage)
+            self.assertEqual(err_enforced["status"], "fail")
+            self.assertTrue(err_enforced["failed"])
+            self.assertTrue(err_enforced["warning"])
+            self.assertFalse(err_enforced["ok"])
+            self.assertEqual(err_enforced["workspace"]["error"], "disk usage unavailable")
+            self.assertNotIn(str(base), json.dumps(err_enforced))
+
+    def test_min_free_gib_zero_negative_and_non_finite_validation(self) -> None:
+        gib = preflight.BYTES_PER_GIB
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._create_repo_skeleton(Path(tmp), include_server=True)
+            dist_dir = repo / "web" / "dist"
+            dist_dir.mkdir(parents=True)
+            (dist_dir / "runtime.js").write_text("export default {};\n", encoding="utf-8")
+            (dist_dir / "runtime.wasm").write_bytes(b"\x00asm\x01\x00\x00\x00")
+            env_clean = {k: v for k, v in os.environ.items() if not k.startswith("GTA6_")}
+
+            # Python API: zero is valid and passes; negative / NaN / Inf raise ValueError.
+            zero_res = preflight.check_disk_space(
+                repo,
+                min_free_gib=0.0,
+                disk_usage_fn=lambda _p: _FakeDiskUsage(total=10 * gib, used=10 * gib, free=0),
+            )
+            self.assertEqual(zero_res["status"], "pass")
+            self.assertTrue(zero_res["ok"])
+            self.assertFalse(zero_res["failed"])
+            self.assertEqual(zero_res["minFreeGib"], 0.0)
+
+            for bad_val in (-0.01, -1.0, float("nan"), float("inf"), float("-inf")):
+                with self.assertRaises(ValueError):
+                    preflight.check_disk_space(repo, min_free_gib=bad_val)
+                with self.assertRaises(ValueError):
+                    preflight.check_disk_space(repo, min_free_gb=bad_val)
+
+            # CLI: --min-free-gib 0 --strict passes with exit 0 and reports freeGib/totalGib.
+            proc_zero = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "tools" / "preflight.py"),
+                    "--repo-root",
+                    str(repo),
+                    "--min-free-gib",
+                    "0",
+                    "--skip-server",
+                    "--json",
+                    "--strict",
+                ],
+                capture_output=True,
+                text=True,
+                env=env_clean,
+                check=False,
+            )
+            self.assertEqual(proc_zero.returncode, 0, msg=proc_zero.stderr)
+            doc_zero = json.loads(proc_zero.stdout)
+            self.assertEqual(doc_zero["diskSpace"]["status"], "pass")
+            self.assertFalse(doc_zero["diskSpace"]["failed"])
+            self.assertTrue(doc_zero["diskSpace"]["enforced"])
+            self.assertEqual(doc_zero["diskSpace"]["minFreeGib"], 0.0)
+            self.assertIsInstance(doc_zero["diskSpace"]["freeGib"], (int, float))
+            self.assertIsInstance(doc_zero["diskSpace"]["totalGib"], (int, float))
+            self.assertLessEqual(doc_zero["diskSpace"]["freeGib"], doc_zero["diskSpace"]["totalGib"])
+
+            # CLI: impossibly high --min-free-gib warns/fails in JSON (exit 0 without --strict, exit 1 with --strict).
+            proc_high_nonstrict = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "tools" / "preflight.py"),
+                    "--repo-root",
+                    str(repo),
+                    "--min-free-gib",
+                    "9999999",
+                    "--skip-server",
+                    "--json",
+                ],
+                capture_output=True,
+                text=True,
+                env=env_clean,
+                check=False,
+            )
+            self.assertEqual(proc_high_nonstrict.returncode, 0, msg=proc_high_nonstrict.stderr)
+            doc_high = json.loads(proc_high_nonstrict.stdout)
+            self.assertEqual(doc_high["diskSpace"]["status"], "fail")
+            self.assertTrue(doc_high["diskSpace"]["failed"])
+            self.assertFalse(doc_high["ok"])
+            self.assertEqual(doc_high["readinessSummary"]["status"], "fail")
+
+            proc_high_strict = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "tools" / "preflight.py"),
+                    "--repo-root",
+                    str(repo),
+                    "--min-free-gib",
+                    "9999999",
+                    "--skip-server",
+                    "--json",
+                    "--strict",
+                ],
+                capture_output=True,
+                text=True,
+                env=env_clean,
+                check=False,
+            )
+            self.assertEqual(proc_high_strict.returncode, 1)
+            doc_high_strict = json.loads(proc_high_strict.stdout)
+            self.assertTrue(doc_high_strict["diskSpace"]["failed"])
+            self.assertTrue(doc_high_strict["milestones"]["M1"]["ready"])
+
+            # CLI: negative / NaN / Inf --min-free-gib rejected by argument parser.
+            for bad_arg in ("-1", "-0.5", "nan", "inf", "-inf"):
+                proc_bad = subprocess.run(
+                    [
+                        sys.executable,
+                        str(REPO_ROOT / "tools" / "preflight.py"),
+                        "--repo-root",
+                        str(repo),
+                        "--min-free-gib",
+                        bad_arg,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    env=env_clean,
+                    check=False,
+                )
+                self.assertNotEqual(proc_bad.returncode, 0, msg=f"expected rejection for --min-free-gib {bad_arg}")
+
+    def test_strict_json_host_path_and_username_sanitization(self) -> None:
+        raw_payload = {
+            "schemaVersion": 1,
+            "toolchains": {
+                "python": {"available": True, "version": r"Python 3.12.4 (C:\Users\AliceSecret\AppData\python.exe)"},
+                "node": {"available": True, "version": "v22.5.0 (/home/bobsecret/bin/node)"},
+                "cmake": {"available": True, "version": r"cmake 3.30.0 (C:\Program Files\CMake\bin\cmake.exe)"},
+                "rustc": {"available": True, "version": r"rustc 1.85.0 (\\fileserver\Private Share\AliceSecret\rustc.exe)"},
+                "cargo": {"available": True, "version": "cargo 1.85.0 (//nas01/home/bobsecret/cargo)"},
+                "emcc": {"available": True, "version": "emcc 3.1.74 (file:///C:/Users/AliceSecret/emsdk/emcc)"},
+                "gh": {"available": True, "version": "gh 2.60.0 (~bobsecret/bin/gh)"},
+            },
+            "nested": [
+                r"failed at \\?\C:\Users\AliceSecret\My Folder\game.rpf",
+                "mac path /Users/Jane Doe/Library/Caches/playgta6 ok",
+                "wsl path /wsl.localhost/Ubuntu/home/bobsecret/repo ok",
+                "user AliceSecret logged in on host",
+                "relative web/dist/runtime.js and server/serve_local.py and https://example.com/docs",
+            ],
+            r"C:\Users\AliceSecret\hostile_key": "value_ok",
+        }
+        sanitized = preflight.sanitize_report(
+            raw_payload,
+            extra_usernames=("AliceSecret", "bobsecret"),
+        )
+        serialized = json.dumps(sanitized)
+
+        for forbidden in (
+            r"C:\Users",
+            "AliceSecret",
+            "bobsecret",
+            "fileserver",
+            "Private Share",
+            "nas01",
+            "Jane Doe",
+            "Program Files",
+            "wsl.localhost",
+            "/home/",
+            "/Users/",
+            "file://",
+            "~bobsecret",
+            "hostile_key",
+        ):
+            self.assertNotIn(forbidden, serialized, msg=f"leaked {forbidden!r} in {serialized}")
+
+        # Legitimate schema keys, relative repo paths, and HTTPS URLs remain intact.
+        self.assertIn("python", sanitized["toolchains"])
+        self.assertIn("node", sanitized["toolchains"])
+        self.assertIn("web/dist/runtime.js", serialized)
+        self.assertIn("server/serve_local.py", serialized)
+        self.assertIn("https://example.com/docs", serialized)
+        self.assertIn("<path>", sanitized)
+        self.assertEqual(sanitized["<path>"], "value_ok")
+
+        # End-to-end run_preflight with hostile version strings containing UNC/Windows/POSIX paths.
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = self._create_repo_skeleton(base, include_server=False)
+            which_fn, version_fn = _make_fake_toolchains(
+                {
+                    "python": r"Python 3.12.4 (\\corp-nas\Share Folder\SecretUser\python.exe)",
+                    "node": "v22.5.0 (/home/secretdev/nvm/node)",
+                    "rustc": r"rustc 1.85.0 (C:\Users\SecretUser\rust\rustc.exe)",
+                    "cargo": "cargo 1.85.0 (file:///home/secretdev/.cargo/bin/cargo)",
+                }
+            )
+            report = preflight.run_preflight(
+                repo,
+                env={},
+                which_fn=which_fn,
+                version_fn=version_fn,
+                skip_server_check=True,
+            )
+            dumped = json.dumps(report)
+            for forbidden in (str(base), "corp-nas", "Share Folder", "SecretUser", "secretdev", r"C:\Users", "/home/"):
+                self.assertNotIn(forbidden, dumped)
+
+    def test_backwards_compatibility_default_cli_flags_and_exit_codes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._create_repo_skeleton(Path(tmp), include_server=True)
+            dist_dir = repo / "web" / "dist"
+            dist_dir.mkdir(parents=True)
+            (dist_dir / "runtime.js").write_text("export default {};\n", encoding="utf-8")
+            (dist_dir / "runtime.wasm").write_bytes(b"\x00asm\x01\x00\x00\x00")
+            env_clean = {k: v for k, v in os.environ.items() if not k.startswith("GTA6_")}
+
+            # Without --min-free-gib, even an impossible --min-free-gb warning stays non-fatal under --strict.
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "tools" / "preflight.py"),
+                    "--repo-root",
+                    str(repo),
+                    "--min-free-gb",
+                    "9999999",
+                    "--json",
+                    "--strict",
+                ],
+                capture_output=True,
+                text=True,
+                env=env_clean,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+            doc = json.loads(proc.stdout)
+            for legacy_key in (
+                "schemaVersion",
+                "ok",
+                "toolchains",
+                "localEnv",
+                "diskSpace",
+                "memory",
+                "browser",
+                "artifacts",
+                "splashPack",
+                "fastBoot",
+                "server",
+                "milestones",
+                "nextCommands",
+            ):
+                self.assertIn(legacy_key, doc)
+            self.assertTrue(doc["ok"])
+            self.assertTrue(doc["milestones"]["M1"]["ready"])
+            self.assertFalse(doc["diskSpace"]["enforced"])
+            self.assertFalse(doc["diskSpace"]["failed"])
+            self.assertIsNone(doc["diskSpace"]["minFreeGib"])
+            self.assertEqual(doc["diskSpace"]["status"], "warn")
+            self.assertTrue(doc["diskSpace"]["warning"])
+
 
 if __name__ == "__main__":
     unittest.main()
