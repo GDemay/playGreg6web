@@ -7,14 +7,18 @@ const texMod = require('../web/workers/texture_formats.js');
 
 const {
   DXGI_FORMAT,
+  DXGI_FORMAT_NAMES,
   WEBGPU_BYTES_PER_ROW_ALIGNMENT,
   TEXTURE_COMPRESSION_BC_FEATURE,
   TEXTURE_COMPRESSION_BC_SLICED_3D_FEATURE,
   TEXTURE_FORMATS_TIER1_FEATURE,
+  CHROMIUM_UNORM16_FEATURE,
   DEPTH32FLOAT_STENCIL8_FEATURE,
+  BGRA8UNORM_STORAGE_FEATURE,
   mapDxgiFormatToWebGpu,
   getSrgbSiblingFormat,
   classifyTextureFormatSupport,
+  resolveStorageCompatibleFormat,
   calcMipSize,
   calcMipLayout,
   padTextureRowsForWriteTexture,
@@ -808,5 +812,347 @@ test('classifyTextureFormatSupport handles depth32float-stencil8 with depth24plu
         reason: null,
       }
     );
+  }
+});
+
+test('W163 DXGI_FORMAT includes Xbox Series UI, font, LUT, and video formats with official numeric codes', () => {
+  const expectedCodes = [
+    ['R32G32B32A32_UINT', 3],
+    ['R16G16B16A16_UNORM', 11],
+    ['R16G16B16A16_UINT', 12],
+    ['R16G16B16A16_SNORM', 13],
+    ['R32G32_FLOAT', 16],
+    ['R32G32_UINT', 17],
+    ['R16G16_UNORM', 35],
+    ['R16G16_UINT', 36],
+    ['R8G8_UINT', 50],
+    ['R16_UNORM', 56],
+    ['R16_UINT', 57],
+    ['R8_UINT', 62],
+    ['R8_SNORM', 63],
+    ['A8_UNORM', 65],
+  ];
+
+  for (const [name, code] of expectedCodes) {
+    assert.equal(DXGI_FORMAT[name], code, `DXGI_FORMAT.${name}`);
+    assert.equal(DXGI_FORMAT_NAMES[code], name, `DXGI_FORMAT_NAMES[${code}]`);
+  }
+});
+
+test('W163 mapDxgiFormatToWebGpu maps A8_UNORM font/mask atlas format with alpha-only swizzle metadata', () => {
+  const byCode = mapDxgiFormatToWebGpu(DXGI_FORMAT.A8_UNORM);
+  assert.equal(byCode.dxgiFormat, 65);
+  assert.equal(byCode.name, 'A8_UNORM');
+  assert.equal(byCode.webgpuFormat, 'r8unorm');
+  assert.equal(byCode.nativeWebgpuFormat, 'r8unorm');
+  assert.equal(byCode.blockWidth, 1);
+  assert.equal(byCode.blockHeight, 1);
+  assert.equal(byCode.bytesPerBlock, 1);
+  assert.equal(byCode.isCompressed, false);
+  assert.equal(byCode.isDepth, false);
+  assert.equal(byCode.isSrgb, false);
+  assert.equal(byCode.isAlphaOnly, true);
+  assert.equal(byCode.swizzle, '000r');
+  assert.equal(byCode.requiresFeature, null);
+  assert.equal(byCode.needsSoftwareDecode, false);
+
+  assert.deepEqual(mapDxgiFormatToWebGpu('A8_UNORM'), byCode);
+  assert.deepEqual(mapDxgiFormatToWebGpu('DXGI_FORMAT_A8_UNORM'), byCode);
+
+  // Non-alpha single-channel R8_UNORM keeps isAlphaOnly=false and swizzle=null
+  const r8 = mapDxgiFormatToWebGpu(DXGI_FORMAT.R8_UNORM);
+  assert.equal(r8.isAlphaOnly, false);
+  assert.equal(r8.swizzle, null);
+
+  // 256-byte row alignment for 100x32 A8 font atlas glyph strip
+  assert.deepEqual(calcMipLayout(DXGI_FORMAT.A8_UNORM, 100, 32), {
+    width: 100,
+    height: 32,
+    depthOrLayers: 1,
+    blocksX: 100,
+    blocksY: 32,
+    unalignedBytesPerRow: 100,
+    bytesPerRow: 256,
+    rowsPerImage: 32,
+    totalBytes: 256 * 32,
+  });
+});
+
+test('W163 mapDxgiFormatToWebGpu maps core integer, snorm, and 64/128-bit UI/LUT/video formats', () => {
+  const coreCases = [
+    [DXGI_FORMAT.R8_SNORM, 'r8snorm', 1],
+    [DXGI_FORMAT.R8_UINT, 'r8uint', 1],
+    [DXGI_FORMAT.R8G8_UINT, 'rg8uint', 2],
+    [DXGI_FORMAT.R16_UINT, 'r16uint', 2],
+    [DXGI_FORMAT.R16G16_UINT, 'rg16uint', 4],
+    [DXGI_FORMAT.R16G16B16A16_UINT, 'rgba16uint', 8],
+    [DXGI_FORMAT.R32G32_FLOAT, 'rg32float', 8],
+    [DXGI_FORMAT.R32G32_UINT, 'rg32uint', 8],
+    [DXGI_FORMAT.R32G32B32A32_UINT, 'rgba32uint', 16],
+  ];
+
+  for (const [dxgi, expectedFormat, bytesPerBlock] of coreCases) {
+    const info = mapDxgiFormatToWebGpu(dxgi);
+    assert.equal(info.webgpuFormat, expectedFormat);
+    assert.equal(info.nativeWebgpuFormat, expectedFormat);
+    assert.equal(info.blockWidth, 1);
+    assert.equal(info.blockHeight, 1);
+    assert.equal(info.bytesPerBlock, bytesPerBlock);
+    assert.equal(info.isCompressed, false);
+    assert.equal(info.isDepth, false);
+    assert.equal(info.isSrgb, false);
+    assert.equal(info.isAlphaOnly, false);
+    assert.equal(info.swizzle, null);
+    assert.equal(info.requiresFeature, null);
+    assert.equal(info.needsSoftwareDecode, false);
+
+    // Mip layout calculation works directly from DXGI code
+    const layout = calcMipLayout(dxgi, 17, 5);
+    assert.equal(layout.unalignedBytesPerRow, 17 * bytesPerBlock);
+    assert.equal(layout.bytesPerRow % WEBGPU_BYTES_PER_ROW_ALIGNMENT, 0);
+    assert.ok(layout.bytesPerRow >= layout.unalignedBytesPerRow);
+    assert.equal(layout.totalBytes, layout.bytesPerRow * 5);
+  }
+});
+
+test('W163 mapDxgiFormatToWebGpu maps 16-bit unorm/snorm formats with tier1/chromium feature and float16 fallback', () => {
+  const norm16Cases = [
+    [DXGI_FORMAT.R16_UNORM, 'r16unorm', 'r16float', 2],
+    [DXGI_FORMAT.R16G16_UNORM, 'rg16unorm', 'rg16float', 4],
+    [DXGI_FORMAT.R16G16B16A16_UNORM, 'rgba16unorm', 'rgba16float', 8],
+    [DXGI_FORMAT.R16G16B16A16_SNORM, 'rgba16snorm', 'rgba16float', 8],
+  ];
+
+  const tier1 = new Set([TEXTURE_FORMATS_TIER1_FEATURE]);
+  const chromium = [CHROMIUM_UNORM16_FEATURE];
+  const empty = new Set();
+
+  for (const [dxgi, nativeFmt, fallbackFmt, bytesPerBlock] of norm16Cases) {
+    const withTier1 = mapDxgiFormatToWebGpu(dxgi, tier1);
+    assert.equal(withTier1.webgpuFormat, nativeFmt);
+    assert.equal(withTier1.nativeWebgpuFormat, nativeFmt);
+    assert.equal(withTier1.bytesPerBlock, bytesPerBlock);
+    assert.equal(withTier1.requiresFeature, TEXTURE_FORMATS_TIER1_FEATURE);
+    assert.equal(withTier1.needsSoftwareDecode, false);
+
+    const withChromium = mapDxgiFormatToWebGpu(dxgi, chromium);
+    assert.equal(withChromium.webgpuFormat, nativeFmt);
+    assert.equal(withChromium.nativeWebgpuFormat, nativeFmt);
+
+    const withoutFeature = mapDxgiFormatToWebGpu(dxgi, empty);
+    assert.equal(withoutFeature.webgpuFormat, fallbackFmt);
+    assert.equal(withoutFeature.nativeWebgpuFormat, nativeFmt);
+    assert.equal(withoutFeature.bytesPerBlock, bytesPerBlock);
+    assert.equal(withoutFeature.requiresFeature, TEXTURE_FORMATS_TIER1_FEATURE);
+    assert.equal(withoutFeature.needsSoftwareDecode, false);
+
+    // Omitting supportedFeatures falls back cleanly too
+    const defaultMapped = mapDxgiFormatToWebGpu(dxgi);
+    assert.equal(defaultMapped.webgpuFormat, fallbackFmt);
+    assert.equal(defaultMapped.nativeWebgpuFormat, nativeFmt);
+
+    // Matches classifyTextureFormatSupport fallback
+    assert.equal(
+      classifyTextureFormatSupport(nativeFmt, { deviceFeatures: empty }).fallbackFormat,
+      fallbackFmt
+    );
+  }
+});
+
+test('W163 resolveStorageCompatibleFormat handles core WebGPU storage formats directly', () => {
+  const coreStorageFormats = [
+    'rgba8unorm',
+    'rgba8snorm',
+    'rgba8uint',
+    'rgba8sint',
+    'rgba16uint',
+    'rgba16sint',
+    'rgba16float',
+    'r32uint',
+    'r32sint',
+    'r32float',
+    'rg32uint',
+    'rg32sint',
+    'rg32float',
+    'rgba32uint',
+    'rgba32sint',
+    'rgba32float',
+  ];
+
+  for (const fmt of coreStorageFormats) {
+    assert.deepEqual(resolveStorageCompatibleFormat(fmt), {
+      storageFormat: fmt,
+      supportsStorageBinding: true,
+      needsLinearSiblingView: false,
+      reason: null,
+    });
+  }
+
+  // Case and whitespace normalization
+  assert.deepEqual(resolveStorageCompatibleFormat('  RGBA16FLOAT '), {
+    storageFormat: 'rgba16float',
+    supportsStorageBinding: true,
+    needsLinearSiblingView: false,
+    reason: null,
+  });
+});
+
+test('W163 resolveStorageCompatibleFormat maps sRGB UAV formats to linear siblings or rejects safely', () => {
+  // rgba8unorm-srgb -> linear sibling rgba8unorm view
+  assert.deepEqual(resolveStorageCompatibleFormat('rgba8unorm-srgb'), {
+    storageFormat: 'rgba8unorm',
+    supportsStorageBinding: true,
+    needsLinearSiblingView: true,
+    reason: 'srgb-requires-linear-view',
+  });
+  assert.deepEqual(resolveStorageCompatibleFormat(' RGBA8UNORM-SRGB '), {
+    storageFormat: 'rgba8unorm',
+    supportsStorageBinding: true,
+    needsLinearSiblingView: true,
+    reason: 'srgb-requires-linear-view',
+  });
+
+  // bgra8unorm-srgb and bgra8unorm require 'bgra8unorm-storage'
+  assert.equal(BGRA8UNORM_STORAGE_FEATURE, 'bgra8unorm-storage');
+  assert.deepEqual(resolveStorageCompatibleFormat('bgra8unorm-srgb'), {
+    storageFormat: null,
+    supportsStorageBinding: false,
+    needsLinearSiblingView: false,
+    reason: 'missing-bgra8unorm-storage',
+  });
+  assert.deepEqual(resolveStorageCompatibleFormat('bgra8unorm'), {
+    storageFormat: null,
+    supportsStorageBinding: false,
+    needsLinearSiblingView: false,
+    reason: 'missing-bgra8unorm-storage',
+  });
+
+  // When 'bgra8unorm-storage' is enabled, both bgra8unorm and bgra8unorm-srgb resolve cleanly
+  const bgraFeatureVariants = [
+    new Set([BGRA8UNORM_STORAGE_FEATURE]),
+    [BGRA8UNORM_STORAGE_FEATURE],
+    { has: (f) => f === BGRA8UNORM_STORAGE_FEATURE },
+    { deviceFeatures: new Set([BGRA8UNORM_STORAGE_FEATURE]) },
+    { supportedFeatures: [BGRA8UNORM_STORAGE_FEATURE] },
+  ];
+  for (const features of bgraFeatureVariants) {
+    assert.deepEqual(resolveStorageCompatibleFormat('bgra8unorm', features), {
+      storageFormat: 'bgra8unorm',
+      supportsStorageBinding: true,
+      needsLinearSiblingView: false,
+      reason: null,
+    });
+    assert.deepEqual(resolveStorageCompatibleFormat('bgra8unorm-srgb', features), {
+      storageFormat: 'bgra8unorm',
+      supportsStorageBinding: true,
+      needsLinearSiblingView: true,
+      reason: 'srgb-requires-linear-view',
+    });
+  }
+
+  // Unknown non-storage sRGB format
+  assert.deepEqual(resolveStorageCompatibleFormat('r8unorm-srgb'), {
+    storageFormat: null,
+    supportsStorageBinding: false,
+    needsLinearSiblingView: false,
+    reason: 'srgb-not-storage-compatible',
+  });
+});
+
+test('W163 resolveStorageCompatibleFormat rejects depth/stencil, compressed, optional tier1 without feature, and invalid formats', () => {
+  const depthStencilFormats = [
+    'depth16unorm',
+    'depth24plus',
+    'depth24plus-stencil8',
+    'depth32float',
+    'depth32float-stencil8',
+    'stencil8',
+  ];
+  for (const fmt of depthStencilFormats) {
+    assert.deepEqual(resolveStorageCompatibleFormat(fmt), {
+      storageFormat: null,
+      supportsStorageBinding: false,
+      needsLinearSiblingView: false,
+      reason: 'depth-stencil-not-storage-compatible',
+    });
+  }
+
+  const compressedFormats = [
+    'bc1-rgba-unorm',
+    'bc1-rgba-unorm-srgb',
+    'bc2-rgba-unorm',
+    'bc3-rgba-unorm-srgb',
+    'bc4-r-unorm',
+    'bc5-rg-unorm',
+    'bc6h-rgb-ufloat',
+    'bc7-rgba-unorm',
+    'bc7-rgba-unorm-srgb',
+    'etc2-rgb8unorm-srgb',
+    'eac-r11unorm',
+    'astc-4x4-unorm-srgb',
+  ];
+  for (const fmt of compressedFormats) {
+    assert.deepEqual(resolveStorageCompatibleFormat(fmt), {
+      storageFormat: null,
+      supportsStorageBinding: false,
+      needsLinearSiblingView: false,
+      reason: 'compressed-not-storage-compatible',
+    });
+  }
+
+  // Tier-1 storage formats require 'texture-formats-tier1'
+  const tier1Formats = [
+    'r8unorm',
+    'r8snorm',
+    'r8uint',
+    'rg8unorm',
+    'rg8uint',
+    'r16unorm',
+    'r16uint',
+    'r16float',
+    'rg16unorm',
+    'rg16uint',
+    'rg16float',
+    'rgba16unorm',
+    'rgba16snorm',
+    'rgb10a2unorm',
+    'rg11b10ufloat',
+  ];
+  for (const fmt of tier1Formats) {
+    assert.deepEqual(resolveStorageCompatibleFormat(fmt), {
+      storageFormat: null,
+      supportsStorageBinding: false,
+      needsLinearSiblingView: false,
+      reason: 'missing-texture-formats-tier1',
+    });
+    assert.deepEqual(
+      resolveStorageCompatibleFormat(fmt, { deviceFeatures: new Set([TEXTURE_FORMATS_TIER1_FEATURE]) }),
+      {
+        storageFormat: fmt,
+        supportsStorageBinding: true,
+        needsLinearSiblingView: false,
+        reason: null,
+      }
+    );
+  }
+
+  // Unsupported / non-storage core formats
+  for (const fmt of ['rgb9e5ufloat', 'not-a-format', 'toString', '__proto__']) {
+    assert.deepEqual(resolveStorageCompatibleFormat(fmt), {
+      storageFormat: null,
+      supportsStorageBinding: false,
+      needsLinearSiblingView: false,
+      reason: 'unsupported-storage-format',
+    });
+  }
+
+  // Invalid inputs
+  for (const bad of [null, undefined, '', '   ', 0, 28, {}, []]) {
+    assert.deepEqual(resolveStorageCompatibleFormat(bad), {
+      storageFormat: null,
+      supportsStorageBinding: false,
+      needsLinearSiblingView: false,
+      reason: 'invalid-format',
+    });
   }
 });
