@@ -3,7 +3,7 @@
   Build (if stale) and watch the browser build in a headed Chrome, locally.
   Thin wrapper around tools/run_browser_boot.py (local COOP/COEP server + Chrome with its own profile).
 .EXAMPLE
-  .\tools\play_local.ps1 -Exe D:\game\game.exe -GameDir D:\game\package -InputScript calibration-skip
+  .\tools\play_local.ps1 -Exe D:\game\game.exe -GameDir D:\game\package -ShaderPack D:\packsdna2.pack -InputScript calibration-skip
 .NOTES
   Stop: close the Chrome window or press Ctrl+C here; the server stops with this script.
   See docs/PLAY_LOCALLY.md. Game files stay outside the repo.
@@ -17,6 +17,7 @@ param(
     [ValidateSet("", "start-screen", "menu-flow", "calibration-skip", "intro-watch", "legal-notices", "chrome-menu-flow")]
     [string]$InputScript = "",
     [int]$DurationS = 7200,
+    [string]$ShaderPack = "",
     [switch]$NoBuild,
     [switch]$TrustBuild,
     [switch]$DryRun
@@ -29,6 +30,8 @@ $argv = @("tools/run_browser_boot.py", "--preset", "long", "--name", "play-local
           "--duration-s", $DurationS, "--report-to-log")
 if ($Chrome) { $argv += @("--chrome", $Chrome) }
 if ($InputScript) { $argv += @("--input-script", $InputScript) }
+if ($ShaderPack) { $argv += @("--shader-pack", $ShaderPack) }
+else { Write-Warning "No -ShaderPack given: the shader pack will be empty (0 packs) and NOTHING will render (every draw is dropped). Pass -ShaderPack <path-to-pack>; see docs/PLAY_LOCALLY.md." }
 if ($NoBuild) { $argv += "--no-build" }
 if ($TrustBuild) { $argv += "--trust-build" }
 if ($DryRun) { $argv += "--dry-run" }
