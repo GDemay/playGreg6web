@@ -3,7 +3,17 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const { RangeCache, opfsChunkFileName, isQuotaExceededError } = require('../web/workers/range_cache.js');
+const {
+  RangeCache,
+  DEFAULT_COALESCE_MAX_GAP_BYTES,
+  DEFAULT_COALESCE_MAX_MERGED_BYTES,
+  DEFAULT_MAX_READ_AHEAD_BYTES,
+  DEFAULT_SEQUENTIAL_STREAK_THRESHOLD,
+  opfsChunkFileName,
+  isQuotaExceededError,
+  coalesceAdjacentRanges,
+  detectSequentialRead,
+} = require('../web/workers/range_cache.js');
 
 function makePatternBytes(length, seed = 17) {
   const out = new Uint8Array(length);
@@ -227,8 +237,18 @@ test('RangeCache getStats exposes additive resilience counters and isQuotaExceed
   assert.equal(stats.quotaEvictions, 0);
   assert.equal(stats.quotaRetrySuccesses, 0);
   assert.equal(stats.corruptEvictions, 0);
+  assert.equal(stats.coalescedRangeCount, 0);
+  assert.equal(stats.sequentialHits, 0);
+  assert.equal(stats.prefetchHits, 0);
+  assert.equal(stats.prefetchBytes, 0);
+  assert.equal(stats.bytesSavedByCoalescing, 0);
   assert.equal(stats.bytesCached, 0);
   assert.equal(stats.entries, 0);
+
+  assert.equal(DEFAULT_COALESCE_MAX_GAP_BYTES, 64 * 1024);
+  assert.equal(DEFAULT_COALESCE_MAX_MERGED_BYTES, 2 * 1024 * 1024);
+  assert.equal(DEFAULT_MAX_READ_AHEAD_BYTES, 2 * 1024 * 1024);
+  assert.equal(DEFAULT_SEQUENTIAL_STREAK_THRESHOLD, 2);
 
   assert.equal(isQuotaExceededError(makeQuotaError('dom')), true);
   assert.equal(isQuotaExceededError(makeQuotaError('code22')), true);
@@ -551,4 +571,483 @@ test('RangeCache self-heals corrupt in-memory entry and preserves legitimate EOF
   const healedChunk2 = await cache.read('tail.rpf', 32, 16);
   assert.deepEqual(healedChunk2, fileBytes.subarray(32, 48));
   assert.equal(cache.getStats().corruptEvictions, 1);
+});
+
+// --- W181: Coalesced adjacent range merging & adaptive sequential read-ahead tests ---
+
+test('coalesceAdjacentRanges merges unsorted adjacent, overlapping, and small-gap ranges while respecting caps and paths', () => {
+  assert.deepEqual(coalesceAdjacentRanges(null), []);
+  assert.deepEqual(coalesceAdjacentRanges([]), []);
+
+  // Unsorted 64 KiB DirectStorage reads + small 16 KiB gap + separate file + huge gap split.
+  const KiB = 1024;
+  const input = [
+    { path: 'x64/stream.rpf', offset: 128 * KiB, length: 64 * KiB },
+    { path: 'movies/intro.bk2', offset: 0, length: 64 * KiB },
+    { path: 'x64/stream.rpf', offset: 0, length: 64 * KiB },
+    { path: 'x64/stream.rpf', offset: 64 * KiB, length: 64 * KiB },
+    // 16 KiB gap after 192 KiB -> bridges when maxGapBytes = 32 KiB
+    { path: 'x64/stream.rpf', offset: 208 * KiB, length: 64 * KiB },
+    // 256 KiB gap after 272 KiB -> exceeds maxGapBytes, starts new span
+    { path: 'x64/stream.rpf', offset: 528 * KiB, length: 64 * KiB },
+    // Second adjacent read on separate file
+    { path: 'movies/intro.bk2', offset: 64 * KiB, length: 64 * KiB },
+    // Invalid / zero-length entries should be skipped safely
+    { path: 'x64/stream.rpf', offset: -10, length: 64 },
+    { path: 'x64/stream.rpf', offset: 0, length: 0 },
+    null,
+  ];
+
+  const merged = coalesceAdjacentRanges(input, 32 * KiB, 512 * KiB);
+  assert.equal(merged.length, 3);
+
+  assert.equal(merged[0].path, 'x64/stream.rpf');
+  assert.equal(merged[0].offset, 0);
+  assert.equal(merged[0].length, 272 * KiB);
+  assert.equal(merged[0].end, 272 * KiB);
+  assert.equal(merged[0].mergedCount, 4);
+  assert.equal(merged[0].gapBytes, 16 * KiB);
+  assert.equal(merged[0].originalBytes, 256 * KiB);
+  assert.equal(merged[0].overlapBytes, 0);
+
+  assert.equal(merged[1].path, 'x64/stream.rpf');
+  assert.equal(merged[1].offset, 528 * KiB);
+  assert.equal(merged[1].length, 64 * KiB);
+  assert.equal(merged[1].mergedCount, 1);
+
+  assert.equal(merged[2].path, 'movies/intro.bk2');
+  assert.equal(merged[2].offset, 0);
+  assert.equal(merged[2].length, 128 * KiB);
+  assert.equal(merged[2].mergedCount, 2);
+
+  // Overlapping + contained ranges + maxMergedBytes split + pathless { start, end } support.
+  const overlapMerged = coalesceAdjacentRanges(
+    [
+      { start: 0, end: 100 },
+      { offset: 40, length: 80 }, // overlaps 60 bytes -> [0..120)
+      { offset: 10, length: 20 }, // fully contained -> overlaps 20 bytes
+      { start: 120, length: 80 }, // would make 200 > maxMerged 150 -> splits
+      { start: 200, length: 50 }, // merges with [120..200) -> [120..250) (130 <= 150)
+    ],
+    0,
+    150,
+  );
+  assert.equal(overlapMerged.length, 2);
+  assert.equal('path' in overlapMerged[0], false);
+  assert.equal(overlapMerged[0].offset, 0);
+  assert.equal(overlapMerged[0].length, 120);
+  assert.equal(overlapMerged[0].mergedCount, 3);
+  assert.equal(overlapMerged[0].overlapBytes, 80);
+
+  assert.equal(overlapMerged[1].offset, 120);
+  assert.equal(overlapMerged[1].length, 130);
+  assert.equal(overlapMerged[1].mergedCount, 2);
+  assert.equal(overlapMerged[1].overlapBytes, 0);
+});
+
+test('detectSequentialRead ramps read-ahead up to maxReadAheadBytes on consecutive 64 KiB reads and resets on random seek', () => {
+  const KiB = 1024;
+  const MiB = 1024 * 1024;
+  const opts = {
+    chunkSize: 256 * KiB,
+    maxGapBytes: 64 * KiB,
+    maxReadAheadBytes: 2 * MiB,
+    streakThreshold: 2,
+  };
+
+  let state = null;
+  const windows = [];
+
+  // 7 consecutive 64 KiB DirectStorage reads: [0..64K), [64K..128K), ...
+  for (let i = 0; i < 7; i += 1) {
+    const det = detectSequentialRead(state, i * 64 * KiB, 64 * KiB, opts);
+    state = det.nextState;
+    windows.push({
+      isSequential: det.isSequential,
+      streak: det.streak,
+      readAheadBytes: det.readAheadBytes,
+    });
+  }
+
+  assert.deepEqual(windows, [
+    { isSequential: false, streak: 0, readAheadBytes: 0 },
+    { isSequential: true, streak: 1, readAheadBytes: 0 },
+    { isSequential: true, streak: 2, readAheadBytes: 256 * KiB },
+    { isSequential: true, streak: 3, readAheadBytes: 512 * KiB },
+    { isSequential: true, streak: 4, readAheadBytes: MiB },
+    { isSequential: true, streak: 5, readAheadBytes: 2 * MiB },
+    { isSequential: true, streak: 6, readAheadBytes: 2 * MiB },
+  ]);
+
+  // Small forward gap (32 KiB <= 64 KiB) keeps sequential streak active.
+  const withSmallGap = detectSequentialRead(state, 7 * 64 * KiB + 32 * KiB, 64 * KiB, opts);
+  assert.equal(withSmallGap.isSequential, true);
+  assert.equal(withSmallGap.gapBytes, 32 * KiB);
+  assert.equal(withSmallGap.streak, 7);
+  assert.equal(withSmallGap.readAheadBytes, 2 * MiB);
+  state = withSmallGap.nextState;
+
+  // Large forward random seek resets immediately.
+  const forwardJump = detectSequentialRead(state, 20 * MiB, 64 * KiB, opts);
+  assert.equal(forwardJump.isSequential, false);
+  assert.equal(forwardJump.isRandomSeek, true);
+  assert.equal(forwardJump.streak, 0);
+  assert.equal(forwardJump.readAheadBytes, 0);
+  state = forwardJump.nextState;
+
+  // Backward seek also resets cleanly.
+  const seq1 = detectSequentialRead(state, 20 * MiB + 64 * KiB, 64 * KiB, opts);
+  assert.equal(seq1.isSequential, true);
+  assert.equal(seq1.streak, 1);
+  const backward = detectSequentialRead(seq1.nextState, 0, 64 * KiB, opts);
+  assert.equal(backward.isSequential, false);
+  assert.equal(backward.isRandomSeek, true);
+  assert.equal(backward.streak, 0);
+  assert.equal(backward.readAheadBytes, 0);
+
+  // maxReadAheadBytes: 0 disables read-ahead while still detecting sequential hits.
+  const disabled0 = detectSequentialRead(null, 0, 64 * KiB, { ...opts, maxReadAheadBytes: 0 });
+  const disabled1 = detectSequentialRead(disabled0.nextState, 64 * KiB, 64 * KiB, {
+    ...opts,
+    maxReadAheadBytes: 0,
+  });
+  const disabled2 = detectSequentialRead(disabled1.nextState, 128 * KiB, 64 * KiB, {
+    ...opts,
+    maxReadAheadBytes: 0,
+  });
+  assert.equal(disabled2.isSequential, true);
+  assert.equal(disabled2.streak, 2);
+  assert.equal(disabled2.readAheadBytes, 0);
+});
+
+test('RangeCache coalesces multi-chunk reads and batch readRanges into fewer HTTP 206 requests', async () => {
+  const KiB = 1024;
+  const fileBytes = makePatternBytes(1024 * KiB, 37); // 1 MiB archive (4 x 256 KiB chunks)
+  const mock = createMockRangeFetch(new Map([['x64/world.rpf', fileBytes]]));
+
+  const cache = new RangeCache({
+    chunkSize: 256 * KiB,
+    maxBytes: 8 * 1024 * KiB,
+    enableReadAhead: false,
+    coalesceAdjacent: true,
+    coalesceMaxGapBytes: 64 * KiB,
+    coalesceMaxMergedBytes: 2 * 1024 * KiB,
+    fetchImpl: mock.fetchImpl,
+  });
+
+  // Read across chunks 0..2 (700 KiB) -> coalesced into ONE HTTP 206 fetch bytes=0-786431!
+  const bigSlice = await cache.read('x64/world.rpf', 10 * KiB, 700 * KiB);
+  assert.deepEqual(bigSlice, fileBytes.subarray(10 * KiB, 710 * KiB));
+  assert.equal(mock.calls.length, 1);
+  assert.equal(mock.calls[0].rangeHeader, `bytes=0-${768 * KiB - 1}`);
+
+  const statsAfterRead = cache.getStats();
+  assert.equal(statsAfterRead.coalescedRangeCount, 1);
+  assert.ok(statsAfterRead.bytesSavedByCoalescing > 0);
+  assert.equal(statsAfterRead.entries, 3);
+
+  // Batch readRanges on a second file with 4 adjacent 64 KiB DirectStorage descriptors -> 1 HTTP 206 fetch!
+  const bk2Bytes = makePatternBytes(1024 * KiB, 61);
+  const mock2 = createMockRangeFetch(new Map([['movies/intro.bk2', bk2Bytes]]));
+  const batchCache = new RangeCache({
+    chunkSize: 64 * KiB,
+    maxBytes: 8 * 1024 * KiB,
+    enableReadAhead: false,
+    coalesceAdjacent: true,
+    fetchImpl: mock2.fetchImpl,
+  });
+
+  const slices = await batchCache.readRanges([
+    { path: 'movies/intro.bk2', offset: 128 * KiB, length: 64 * KiB },
+    { path: 'movies/intro.bk2', offset: 0, length: 64 * KiB },
+    { path: 'movies/intro.bk2', offset: 64 * KiB, length: 64 * KiB },
+    { path: 'movies/intro.bk2', offset: 192 * KiB, length: 64 * KiB },
+  ]);
+
+  assert.equal(slices.length, 4);
+  assert.deepEqual(slices[0], bk2Bytes.subarray(128 * KiB, 192 * KiB));
+  assert.deepEqual(slices[1], bk2Bytes.subarray(0, 64 * KiB));
+  assert.deepEqual(slices[2], bk2Bytes.subarray(64 * KiB, 128 * KiB));
+  assert.deepEqual(slices[3], bk2Bytes.subarray(192 * KiB, 256 * KiB));
+  assert.equal(mock2.calls.length, 1, '4 adjacent 64 KiB reads must coalesce into 1 HTTP 206 fetch');
+  assert.equal(mock2.calls[0].rangeHeader, `bytes=0-${256 * KiB - 1}`);
+
+  const batchStats = batchCache.getStats();
+  assert.equal(batchStats.coalescedRangeCount, 1);
+  assert.ok(batchStats.bytesSavedByCoalescing > 0);
+});
+
+test('RangeCache adaptive sequential read-ahead accelerates consecutive 64 KiB DirectStorage and .bk2 streams and resets on random seek', async () => {
+  const KiB = 1024;
+  const MiB = 1024 * 1024;
+  const totalBytes = 4 * MiB; // 16 chunks of 256 KiB
+  const streamBytes = makePatternBytes(totalBytes, 83);
+  const mock = createMockRangeFetch(new Map([['x64/dstorage_stream.rpf', streamBytes]]));
+
+  const cache = new RangeCache({
+    chunkSize: 256 * KiB,
+    maxBytes: 16 * MiB,
+    maxReadAheadBytes: 2 * MiB,
+    fetchImpl: mock.fetchImpl,
+  });
+
+  // Stream 32 consecutive 64 KiB DirectStorage reads (2 MiB total = 8 chunks).
+  for (let i = 0; i < 32; i += 1) {
+    const offset = i * 64 * KiB;
+    const out = await cache.read('x64/dstorage_stream.rpf', offset, 64 * KiB);
+    assert.deepEqual(out, streamBytes.subarray(offset, offset + 64 * KiB));
+    // Yield microtasks so background coalesced read-ahead completes ahead of next reads.
+    await cache.flushPrefetches();
+  }
+
+  const stats = cache.getStats();
+  assert.equal(stats.sequentialHits, 31);
+  assert.ok(stats.prefetchHits >= 6, `Expected >= 6 prefetchHits, got ${stats.prefetchHits}`);
+  assert.ok(stats.prefetchBytes >= 2 * MiB, `Expected >= 2 MiB prefetchBytes, got ${stats.prefetchBytes}`);
+  assert.ok(stats.coalescedRangeCount >= 1, `Expected coalesced read-ahead fetches, got ${stats.coalescedRangeCount}`);
+  assert.ok(stats.bytesSavedByCoalescing > 0);
+  // 16 chunks (4 MiB) fetched in far fewer HTTP calls than 16 individual chunk fetches!
+  assert.ok(
+    mock.calls.length <= 6,
+    `Expected <= 6 coalesced HTTP 206 requests for sequential stream, got ${mock.calls.length}`,
+  );
+  // Every single HTTP Range request must stay bounded by maxReadAheadBytes / coalesceMaxMergedBytes (2 MiB).
+  for (const call of mock.calls) {
+    const m = /^bytes=(\d+)-(\d+)$/.exec(call.rangeHeader);
+    assert.ok(m);
+    const span = Number(m[2]) - Number(m[1]) + 1;
+    assert.ok(span <= 2 * MiB, `Coalesced range ${call.rangeHeader} exceeded 2 MiB cap`);
+  }
+
+  const seqStateBeforeSeek = cache.getSequentialState('x64/dstorage_stream.rpf');
+  assert.equal(seqStateBeforeSeek.streak, 31);
+  assert.equal(seqStateBeforeSeek.readAheadBytes, 2 * MiB);
+
+  // Random seek back to offset 0 resets sequential streak & read-ahead window immediately.
+  const seekOut = await cache.read('x64/dstorage_stream.rpf', 0, 64 * KiB);
+  assert.deepEqual(seekOut, streamBytes.subarray(0, 64 * KiB));
+  const seqStateAfterSeek = cache.getSequentialState('x64/dstorage_stream.rpf');
+  assert.equal(seqStateAfterSeek.streak, 0);
+  assert.equal(seqStateAfterSeek.readAheadBytes, 0);
+});
+
+test('RangeCache deduplicates demand read against in-flight read-ahead without double-counting prefetchHits', async () => {
+  const KiB = 1024;
+  const fileBytes = makePatternBytes(1024 * KiB, 19); // 4 chunks of 256 KiB
+  const baseMock = createMockRangeFetch(new Map([['movies/cutscene_4k.bk2', fileBytes]]));
+
+  let releasePrefetch = null;
+  let delayedChunk1 = false;
+  const delayedFetch = async (url, init) => {
+    const range = init && init.headers && init.headers.Range;
+    if (range && range.startsWith(`bytes=${256 * KiB}-`) && !delayedChunk1) {
+      delayedChunk1 = true;
+      await new Promise((resolve) => {
+        releasePrefetch = resolve;
+      });
+    }
+    return baseMock.fetchImpl(url, init);
+  };
+
+  const cache = new RangeCache({
+    chunkSize: 256 * KiB,
+    maxBytes: 8 * 1024 * KiB,
+    maxReadAheadBytes: 256 * KiB,
+    fetchImpl: delayedFetch,
+  });
+
+  // 3 sequential 64 KiB reads inside chunk 0 trigger background read-ahead for chunk 1.
+  await cache.read('movies/cutscene_4k.bk2', 0, 64 * KiB);
+  await cache.read('movies/cutscene_4k.bk2', 64 * KiB, 64 * KiB);
+  await cache.read('movies/cutscene_4k.bk2', 128 * KiB, 64 * KiB);
+  await cache.read('movies/cutscene_4k.bk2', 192 * KiB, 64 * KiB);
+
+  assert.ok(typeof releasePrefetch === 'function', 'Chunk 1 background read-ahead should be in-flight');
+
+  // Foreground demand read for chunk 1 arrives while background prefetch is still pending!
+  const demandPromise = cache.read('movies/cutscene_4k.bk2', 256 * KiB, 64 * KiB);
+  releasePrefetch();
+  const slice = await demandPromise;
+  await cache.flushPrefetches();
+
+  assert.deepEqual(slice, fileBytes.subarray(256 * KiB, 320 * KiB));
+  // Chunk 1 must have been fetched ONLY once (deduplicated against in-flight prefetch).
+  const chunk1Calls = baseMock.calls.filter((c) => c.rangeHeader.startsWith(`bytes=${256 * KiB}-`));
+  assert.equal(chunk1Calls.length, 1);
+
+  // Repeat read inside chunk 1 must NOT double-count prefetchHits.
+  await cache.read('movies/cutscene_4k.bk2', 320 * KiB, 64 * KiB);
+  await cache.flushPrefetches();
+
+  // Chunk 1 was prefetched and consumed once (chunk 2 may also have been prefetched but not yet read).
+  assert.equal(cache.getStats().prefetchHits, 1);
+});
+
+test('RangeCache handles truncated 206 coalesced responses, 200 OK fallback, EOF clamping, and speculative prefetch errors safely', async () => {
+  const KiB = 1024;
+  const fileBytes = makePatternBytes(200 * KiB, 77); // 3 full 64 KiB chunks + 8 KiB tail chunk
+
+  // 1. Server truncates a multi-chunk 206 response to only 64 KiB -> RangeCache falls back for uncovered chunks.
+  const truncCalls = [];
+  const truncFetch = async (url, init = {}) => {
+    const range = init.headers && init.headers.Range;
+    truncCalls.push(range);
+    const m = /^bytes=(\d+)-(\d+)$/.exec(range || '');
+    const start = Number(m[1]);
+    const reqEnd = Number(m[2]);
+    // Cap response at 64 KiB per request to simulate proxy/CDN range truncation.
+    const actualEnd = Math.min(reqEnd, start + 64 * KiB - 1, fileBytes.byteLength - 1);
+    const slice = fileBytes.slice(start, actualEnd + 1);
+    return {
+      ok: true,
+      status: 206,
+      headers: new Map([['Content-Range', `bytes ${start}-${actualEnd}/${fileBytes.byteLength}`]]),
+      async arrayBuffer() {
+        return slice.buffer;
+      },
+    };
+  };
+
+  const truncCache = new RangeCache({
+    chunkSize: 64 * KiB,
+    maxBytes: 4 * 1024 * KiB,
+    enableReadAhead: false,
+    coalesceAdjacent: true,
+    fetchImpl: truncFetch,
+  });
+
+  const fullRead = await truncCache.read('trunc.rpf', 0, 200 * KiB);
+  assert.deepEqual(fullRead, fileBytes);
+  // First call requested all 4 chunks coalesced; fallback fetched the 3 uncovered chunks cleanly.
+  assert.equal(truncCalls[0], `bytes=0-${256 * KiB - 1}`);
+  assert.equal(truncCalls.length, 4);
+
+  // 2. Server returns 200 OK full body on a coalesced request -> slices all chunks with 1 fetch.
+  let ok200Calls = 0;
+  const ok200Cache = new RangeCache({
+    chunkSize: 64 * KiB,
+    maxBytes: 4 * 1024 * KiB,
+    enableReadAhead: false,
+    coalesceAdjacent: true,
+    fetchImpl: async () => {
+      ok200Calls += 1;
+      return {
+        ok: true,
+        status: 200,
+        headers: new Map(),
+        async arrayBuffer() {
+          return fileBytes.slice().buffer;
+        },
+      };
+    },
+  });
+  const ok200Out = await ok200Cache.read('full200.rpf', 10 * KiB, 150 * KiB);
+  assert.deepEqual(ok200Out, fileBytes.subarray(10 * KiB, 160 * KiB));
+  assert.equal(ok200Calls, 1);
+
+  // 3. Background read-ahead 503 error must NEVER reject foreground reads, and EOF clamping prevents past-EOF fetches.
+  let failChunk1 = true;
+  const errCalls = [];
+  const flakyFetch = async (url, init = {}) => {
+    const range = init.headers && init.headers.Range;
+    errCalls.push(range);
+    const m = /^bytes=(\d+)-(\d+)$/.exec(range || '');
+    const start = Number(m[1]);
+    const reqEnd = Number(m[2]);
+    if (start >= 64 * KiB && failChunk1) {
+      failChunk1 = false;
+      return {
+        ok: false,
+        status: 503,
+        headers: new Map(),
+        async arrayBuffer() {
+          return new ArrayBuffer(0);
+        },
+      };
+    }
+    const actualEnd = Math.min(reqEnd, fileBytes.byteLength - 1);
+    const slice = fileBytes.slice(start, actualEnd + 1);
+    return {
+      ok: true,
+      status: 206,
+      headers: new Map([['Content-Range', `bytes ${start}-${actualEnd}/${fileBytes.byteLength}`]]),
+      async arrayBuffer() {
+        return slice.buffer;
+      },
+    };
+  };
+
+  const resilientCache = new RangeCache({
+    chunkSize: 64 * KiB,
+    maxBytes: 4 * 1024 * KiB,
+    maxReadAheadBytes: 128 * KiB,
+    fetchImpl: flakyFetch,
+  });
+
+  // 3 sequential 16 KiB reads trigger read-ahead of chunk 1, which receives HTTP 503 and swallows cleanly.
+  assert.deepEqual(await resilientCache.read('flaky.bk2', 0, 16 * KiB), fileBytes.subarray(0, 16 * KiB));
+  assert.deepEqual(
+    await resilientCache.read('flaky.bk2', 16 * KiB, 16 * KiB),
+    fileBytes.subarray(16 * KiB, 32 * KiB),
+  );
+  assert.deepEqual(
+    await resilientCache.read('flaky.bk2', 32 * KiB, 16 * KiB),
+    fileBytes.subarray(32 * KiB, 48 * KiB),
+  );
+  await resilientCache.flushPrefetches();
+
+  // Subsequent demand read into chunk 1 retries cleanly and succeeds!
+  const chunk1Slice = await resilientCache.read('flaky.bk2', 64 * KiB, 16 * KiB);
+  assert.deepEqual(chunk1Slice, fileBytes.subarray(64 * KiB, 80 * KiB));
+  await resilientCache.flushPrefetches();
+
+  // Reading to EOF must not issue any range starting at or beyond fileBytes.byteLength (200 KiB).
+  const tailSlice = await resilientCache.read('flaky.bk2', 192 * KiB, 16 * KiB);
+  assert.deepEqual(tailSlice, fileBytes.subarray(192 * KiB, 200 * KiB));
+  await resilientCache.flushPrefetches();
+  for (const r of errCalls) {
+    const start = Number(/^bytes=(\d+)-/.exec(r)[1]);
+    assert.ok(start < fileBytes.byteLength, `Unexpected past-EOF Range request: ${r}`);
+  }
+});
+
+test('RangeCache prefetchBootset with coalesce merges adjacent bootset entries and tracks prefetch telemetry', async () => {
+  const KiB = 1024;
+  const archive = makePatternBytes(512 * KiB, 45);
+  const mock = createMockRangeFetch(new Map([['x64/boot.rpf', archive]]));
+
+  const cache = new RangeCache({
+    chunkSize: 64 * KiB,
+    maxBytes: 4 * 1024 * KiB,
+    enableReadAhead: false,
+    coalesceAdjacent: true,
+    fetchImpl: mock.fetchImpl,
+  });
+
+  const summary = await cache.prefetchBootset(
+    [
+      { path: 'x64/boot.rpf', offset: 0, length: 64 * KiB },
+      { path: 'x64/boot.rpf', offset: 64 * KiB, length: 64 * KiB },
+      { path: 'x64/boot.rpf', offset: 128 * KiB, length: 64 * KiB },
+      { path: 'x64/boot.rpf', offset: 160 * KiB, length: 64 * KiB }, // overlaps 32 KiB
+    ],
+    { coalesce: true },
+  );
+
+  assert.equal(summary.requestedEntries, 4);
+  assert.equal(summary.coalescedRanges, 1);
+  assert.equal(summary.uniqueChunks, 4);
+  assert.equal(summary.prefetched, 4);
+  assert.equal(summary.failed, 0);
+  assert.equal(mock.calls.length, 1, '4 adjacent/overlapping bootset entries must merge into 1 HTTP 206 fetch');
+
+  const statsBeforeRead = cache.getStats();
+  assert.equal(statsBeforeRead.coalescedRangeCount, 1);
+  assert.equal(statsBeforeRead.prefetchBytes, 256 * KiB);
+  assert.ok(statsBeforeRead.bytesSavedByCoalescing >= 32 * KiB);
+
+  const out = await cache.read('x64/boot.rpf', 0, 224 * KiB);
+  assert.deepEqual(out, archive.subarray(0, 224 * KiB));
+  assert.equal(mock.calls.length, 1);
+  assert.equal(cache.getStats().prefetchHits, 4);
 });
