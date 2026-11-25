@@ -203,6 +203,27 @@ class RunTests(unittest.TestCase):
             self.assertNotIn("heap_live_blocks", out)
             self.assertEqual(json.loads((run / "command.json").read_text())["harness_exit"], 9)
 
+    def test_menu_flow_preset(self):
+        self.assertEqual(rnb.PRESETS["menu-flow"]["max_ms"], 240_000)
+        script = rnb.input_script_text(240_000, "menu-flow").splitlines()
+        events = [line.split() for line in script if not line.startswith("#")]
+        self.assertEqual(events[0], ["20000", "A", "100"])
+        # Down, Down, A for LEGAL NOTICES' "Next >", every 12 s from 64 s.
+        i = events.index(["64000", "DDown", "150"])
+        self.assertEqual(events[i + 1], ["66000", "DDown", "150"])
+        self.assertEqual(events[i + 2], ["68500", "A", "100"])
+        times = [int(e[0]) for e in events]
+        self.assertEqual(times, sorted(times))
+        self.assertLess(times[-1], 240_000)
+        with tempfile.TemporaryDirectory() as d:
+            fx = Fixture(Path(d))
+            code, _, _, _ = fx.run("--preset", "menu-flow", "--name", "mf")
+            self.assertEqual(code, 0)
+            written = (fx.build / "runs" / "mf" / "input-script.txt").read_text().splitlines()
+            self.assertIn("68500 A 100", written)
+            args = json.loads((fx.build / "runs" / "mf" / "boot-report.json").read_text())["args"]
+            self.assertEqual(args[args.index("--max-ms") + 1], "240000")
+
     def test_presets(self):
         self.assertEqual(rnb.PRESETS["long"]["max_ms"], 600_000)
         self.assertFalse(rnb.PRESETS["smoke"]["input"])
