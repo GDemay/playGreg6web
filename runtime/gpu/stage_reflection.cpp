@@ -700,6 +700,22 @@ bool parse_stage_reflection_json(std::string_view json, StageReflectionIndex* ou
     return true;
 }
 
+int root_parameter_containing_user_sgpr(const d3d::RootSignatureDesc& rs, bool compute, uint32_t user_sgpr,
+                                        uint32_t* dword) {
+    uint32_t sgpr = compute ? kComputeUserDataBase : kGraphicsUserDataBase;
+    for (size_t i = 0; i < rs.parameters.size(); ++i) {
+        const uint32_t n = parameter_dwords(rs.parameters[i]);
+        if (user_sgpr >= sgpr && user_sgpr < sgpr + n) {
+            if (dword != nullptr) {
+                *dword = user_sgpr - sgpr;
+            }
+            return static_cast<int>(i);
+        }
+        sgpr += n;
+    }
+    return -1;
+}
+
 int root_parameter_for_user_sgpr(const d3d::RootSignatureDesc& rs, bool compute, uint32_t user_sgpr) {
     uint32_t sgpr = compute ? kComputeUserDataBase : kGraphicsUserDataBase;
     for (size_t i = 0; i < rs.parameters.size(); ++i) {
@@ -917,9 +933,16 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                     reg = space = d3d::kNoIndex;
                 }
             } else {
-                const int pi = root_parameter_for_user_sgpr(rs, compute, b.user_sgpr);
+                uint32_t into = 0;
+                const int pi = root_parameter_containing_user_sgpr(rs, compute, b.user_sgpr, &into);
                 if (pi < 0) {
-                    fail(b, "no root parameter starts at s" + std::to_string(b.user_sgpr));
+                    fail(b, "no root parameter covers s" + std::to_string(b.user_sgpr));
+                    continue;
+                }
+                if (into != 0 && (b.source == ReflectedSource::Table || b.source == ReflectedSource::RootDescriptor) &&
+                    rs.parameters[static_cast<size_t>(pi)].parameter_type != d3d::RootParameterType::DescriptorTable) {
+                    fail(b, "s" + std::to_string(b.user_sgpr) + " is dword " + std::to_string(into) + " of root parameter " +
+                                std::to_string(pi) + ", not a table pointer or root descriptor");
                     continue;
                 }
                 const d3d::RootParameterDesc& p = rs.parameters[static_cast<size_t>(pi)];
@@ -1205,6 +1228,11 @@ bool join_vertex_inputs(const StageReflection& vs, const pso::D3D12InputElementD
         }
         ReflectedComponentType cls;
         element_class(f.format, &cls);
+        if (cls != in.component_type && dword_components(f.format) != 0) {
+            // Same 32-bit bits, other class (f32 vs u32/i32): the vertex format is ours, so reinterpret it.
+            f.format = dword_format(in.component_type, dword_components(f.format));
+            cls = in.component_type;
+        }
         if (cls != in.component_type) {
             *report += key + ": the stage expects " + class_name(in.component_type) + ", the attribute gives " +
                        class_name(cls) + "\n";
