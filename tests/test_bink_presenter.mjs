@@ -11,6 +11,8 @@ const {
   UNIFORM_BUFFER_SIZE,
   UNIFORM_FLAG_FULL_RANGE,
   UNIFORM_FLAG_SWAP_CHROMA,
+  TARGET_FPS_30_INTERVAL_MS,
+  DEFAULT_BIND_GROUP_CACHE_CAPACITY,
   BINK_PIXEL_FORMAT,
   BINK_CHROMA_ORDER,
   BINK_LOAD_OP,
@@ -2374,4 +2376,349 @@ test('W241: resetStats() clears pacing and upload telemetry cleanly without inva
 
   presenter.destroy();
   assert.throws(() => presenter.resetStats(), /destroyed/i);
+});
+
+test('W280: bounded LRU GPUBindGroup cache hits across repeated 4K frames, evicts LRU at capacity, and reuses upload/present scratch descriptors', () => {
+  assert.equal(DEFAULT_BIND_GROUP_CACHE_CAPACITY, 16);
+  assertNear(TARGET_FPS_30_INTERVAL_MS, 1000 / 30, 1e-9);
+
+  const device = createMockWebGpuDevice();
+  assert.throws(
+    () => new BinkVideoPresenter({ device, bindGroupCacheCapacity: 0 }),
+    RangeError
+  );
+  assert.throws(
+    () => new BinkVideoPresenter({ device, bindGroupCacheCapacity: -4 }),
+    RangeError
+  );
+  assert.throws(
+    () => new BinkVideoPresenter({ device, bindGroupCacheCapacity: 2.5 }),
+    RangeError
+  );
+
+  // 1) Double-buffered 4K sustained playback: 2 warm misses + 18 cache hits = 0.90 hit rate,
+  //    zero extra bind groups created, and upload/present result & descriptor objects reused.
+  const presenter = new BinkVideoPresenter({
+    device,
+    doubleBuffer: true,
+    chromaOrder: BINK_CHROMA_ORDER.YVU,
+  });
+  const targetView = { kind: 'GPUTextureView', id: 'swap-w280-4k' };
+  const y = new Uint8Array(3840 * 2160);
+  const cr = new Uint8Array(1920 * 1080);
+  const cb = new Uint8Array(1920 * 1080);
+
+  let firstUploadRes = null;
+  let firstPresentRes = null;
+  let firstPassDesc = null;
+  for (let i = 0; i < 20; i += 1) {
+    const upRes = presenter.uploadYuv420Frame({ y, u: cr, v: cb, width: 3840, height: 2160 });
+    const enc = createMockCommandEncoder();
+    const presRes = presenter.present(enc, targetView, 3840, 2160, { nowMs: 1000 + i * 33 });
+    if (i === 0) {
+      firstUploadRes = upRes;
+      firstPresentRes = presRes;
+      firstPassDesc = enc.renderPasses[0].descriptor;
+    } else {
+      assert.equal(upRes, firstUploadRes, `frame ${i} uploadYuv420Frame must reuse result scratch`);
+      assert.equal(presRes, firstPresentRes, `frame ${i} present must reuse result scratch`);
+      assert.equal(
+        enc.renderPasses[0].descriptor,
+        firstPassDesc,
+        `frame ${i} present must reuse renderPassDescriptor scratch`
+      );
+    }
+  }
+
+  const stats = presenter.getStats();
+  assert.equal(device.createdBindGroups.length, 2);
+  assert.equal(stats.bindGroupCacheMisses, 2);
+  assert.equal(stats.bindGroupCacheHits, 18);
+  assertNear(stats.bindGroupHitRate, 18 / 20, 1e-9);
+  assertNear(presenter.bindGroupHitRate, 18 / 20, 1e-9);
+  assert.equal(stats.bindGroupCacheSize, 2);
+  assert.equal(stats.bindGroupCacheCapacity, 16);
+  assert.ok(stats.bindGroupHitRate >= 0 && stats.bindGroupHitRate <= 1);
+  assertNear(stats.targetFpsHitRate30, 1.0, 1e-9);
+  presenter.destroy();
+
+  // 2) Bounded LRU eviction at capacity (3 entries across 4 slots).
+  const lruDevice = createMockWebGpuDevice();
+  const lruPresenter = new BinkVideoPresenter({
+    device: lruDevice,
+    slotCount: 4,
+    bindGroupCacheCapacity: 3,
+  });
+  const smallY = new Uint8Array(16 * 8);
+  const smallC = new Uint8Array(8 * 4);
+  const smallTarget = { kind: 'GPUTextureView', id: 'swap-w280-lru' };
+
+  // Fill slots 0, 1, 2 -> 3 misses, cache order MRU->LRU is [2, 1, 0].
+  for (let i = 0; i < 3; i += 1) {
+    lruPresenter.uploadYuv420Frame({ y: smallY, u: smallC, v: smallC, width: 16, height: 8 });
+    lruPresenter.presentFrame(createMockCommandEncoder(), smallTarget, 320, 180);
+  }
+  assert.equal(lruDevice.createdBindGroups.length, 3);
+  assert.equal(lruPresenter.bindGroupCacheSize, 3);
+  assert.equal(lruPresenter.bindGroupCacheMisses, 3);
+  assert.equal(lruPresenter.bindGroupCacheHits, 0);
+
+  // Present slot 3 -> evicts LRU (slot 0), cache stays bounded at 3 entries [3, 2, 1].
+  lruPresenter.uploadYuv420Frame({ y: smallY, u: smallC, v: smallC, width: 16, height: 8 });
+  lruPresenter.presentFrame(createMockCommandEncoder(), smallTarget, 320, 180);
+  assert.equal(lruDevice.createdBindGroups.length, 4);
+  assert.equal(lruPresenter.bindGroupCacheSize, 3);
+  assert.equal(lruPresenter.bindGroupCacheMisses, 4);
+
+  // Cycling back to slot 0 misses because slot 0 was evicted as LRU; cache stays bounded at 3.
+  lruPresenter.uploadYuv420Frame({ y: smallY, u: smallC, v: smallC, width: 16, height: 8 });
+  lruPresenter.presentFrame(createMockCommandEncoder(), smallTarget, 320, 180);
+  assert.equal(lruDevice.createdBindGroups.length, 5);
+  assert.equal(lruPresenter.bindGroupCacheSize, 3);
+  assert.equal(lruPresenter.bindGroupCacheMisses, 5);
+
+  // Presenting the active slot (slot 0) again hits MRU immediately.
+  lruPresenter.presentFrame(createMockCommandEncoder(), smallTarget, 320, 180);
+  assert.equal(lruDevice.createdBindGroups.length, 5);
+  assert.equal(lruPresenter.bindGroupCacheHits, 1);
+  assertNear(lruPresenter.bindGroupHitRate, 1 / 6, 1e-9);
+  lruPresenter.destroy();
+
+  // 3) Default 16-entry LRU bound with 17 distinct slots.
+  const cap16Device = createMockWebGpuDevice();
+  const cap16Presenter = new BinkVideoPresenter({
+    device: cap16Device,
+    slotCount: 17,
+  });
+  for (let i = 0; i < 17; i += 1) {
+    cap16Presenter.uploadYuv420Frame({ y: smallY, u: smallC, v: smallC, width: 16, height: 8 });
+    cap16Presenter.presentFrame(createMockCommandEncoder(), smallTarget, 320, 180);
+  }
+  assert.equal(cap16Presenter.bindGroupCacheCapacity, 16);
+  assert.equal(cap16Presenter.bindGroupCacheSize, 16);
+  assert.equal(cap16Device.createdBindGroups.length, 17);
+  cap16Presenter.destroy();
+});
+
+test('W280: bindGroup cache invalidates automatically on plane view/sampler/uniformBuffer/device changes and on resize(), reset(), destroy()', () => {
+  const device1 = createMockWebGpuDevice();
+  const presenter = new BinkVideoPresenter({
+    device: device1,
+    doubleBuffer: false,
+  });
+  const targetView = { kind: 'GPUTextureView', id: 'swap-w280-inval' };
+  const y = new Uint8Array(32 * 16).fill(180);
+  const u = new Uint8Array(16 * 8).fill(128);
+  const v = new Uint8Array(16 * 8).fill(128);
+
+  // Warm frame + repeated present -> 1 miss, 1 hit.
+  presenter.uploadYuv420Frame({ y, u, v, width: 32, height: 16 });
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360);
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360);
+  assert.equal(device1.createdBindGroups.length, 1);
+  assert.equal(presenter.bindGroupCacheMisses, 1);
+  assert.equal(presenter.bindGroupCacheHits, 1);
+  assertNear(presenter.bindGroupHitRate, 0.5, 1e-9);
+
+  // Replace Y plane view identity without bumping slot generation -> automatic cache miss & rebind!
+  const replacedYView = { kind: 'GPUTextureView', id: 'replaced-y-view' };
+  presenter._slots[0].y.view = replacedYView;
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360);
+  assert.equal(device1.createdBindGroups.length, 2);
+  assert.equal(presenter.bindGroupCacheMisses, 2);
+  assert.equal(
+    device1.createdBindGroups[1].desc.entries.find((e) => e.binding === 2).resource,
+    replacedYView
+  );
+  // Repeating with replacedYView hits cache cleanly.
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360);
+  assert.equal(device1.createdBindGroups.length, 2);
+  assert.equal(presenter.bindGroupCacheHits, 2);
+
+  // Replace U plane view and V plane view -> each triggers an automatic cache miss!
+  const replacedUView = { kind: 'GPUTextureView', id: 'replaced-u-view' };
+  presenter._slots[0].u.view = replacedUView;
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360);
+  assert.equal(device1.createdBindGroups.length, 3);
+  assert.equal(
+    device1.createdBindGroups[2].desc.entries.find((e) => e.binding === 3).resource,
+    replacedUView
+  );
+
+  const replacedVView = { kind: 'GPUTextureView', id: 'replaced-v-view' };
+  presenter._slots[0].v.view = replacedVView;
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360);
+  assert.equal(device1.createdBindGroups.length, 4);
+  assert.equal(
+    device1.createdBindGroups[3].desc.entries.find((e) => e.binding === 4).resource,
+    replacedVView
+  );
+
+  // Replace sampler identity -> automatic cache miss & rebind!
+  const replacedSampler = { kind: 'GPUSampler', id: 'replaced-sampler' };
+  presenter._sampler = replacedSampler;
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360);
+  assert.equal(device1.createdBindGroups.length, 5);
+  assert.equal(
+    device1.createdBindGroups[4].desc.entries.find((e) => e.binding === 1).resource,
+    replacedSampler
+  );
+
+  // Replace uniformBuffer identity -> automatic cache miss & rebind!
+  const replacedUniformBuf = device1.createBuffer({
+    label: 'replaced-uniforms',
+    size: UNIFORM_BUFFER_SIZE,
+    usage: BUFFER_USAGE.UNIFORM | BUFFER_USAGE.COPY_DST,
+  });
+  presenter._uniformBuffer = replacedUniformBuf;
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360);
+  assert.equal(device1.createdBindGroups.length, 6);
+  assert.equal(
+    device1.createdBindGroups[5].desc.entries.find((e) => e.binding === 0).resource.buffer,
+    replacedUniformBuf
+  );
+
+  // resize() clears bindGroup cache cleanly while keeping active frame renderable.
+  assert.throws(() => presenter.resize(0, 360), RangeError);
+  assert.throws(() => presenter.resize(640, -1), RangeError);
+  presenter.resize(1280, 720);
+  assert.equal(presenter.bindGroupCacheSize, 0);
+  const resAfterResize = presenter.presentFrame(createMockCommandEncoder(), targetView, 1280, 720);
+  assert.equal(resAfterResize.presented, true);
+  assert.equal(device1.createdBindGroups.length, 7);
+  assert.equal(presenter.bindGroupCacheSize, 1);
+
+  // reset() destroys old slot textures and clears bindGroup cache while keeping same-device pipeline.
+  const texturesBeforeReset = device1.createdTextures.slice(0, 3);
+  presenter.reset();
+  assert.equal(presenter.bindGroupCacheSize, 0);
+  assert.equal(presenter.getStats().hasFrame, false);
+  assert.equal(presenter.getStats().pipelineReady, true);
+  for (const tex of texturesBeforeReset) {
+    assert.equal(tex.destroyed, true);
+  }
+  presenter.uploadYuv420Frame({ y, u, v, width: 32, height: 16 });
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 1280, 720);
+  assert.equal(device1.createdBindGroups.length, 8);
+  assert.equal(presenter.bindGroupCacheSize, 1);
+
+  // Device change via setDevice(device2) releases old device resources and invalidates cache.
+  const device2 = createMockWebGpuDevice();
+  assert.throws(() => presenter.setDevice(null), TypeError);
+  assert.throws(() => presenter.setDevice({}), TypeError);
+  presenter.setDevice(device2);
+  assert.equal(presenter.bindGroupCacheSize, 0);
+  assert.equal(presenter.getStats().pipelineReady, false);
+  assert.equal(presenter.getStats().hasFrame, false);
+
+  presenter.uploadYuv420Frame({ y, u, v, width: 32, height: 16 });
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 1280, 720);
+  assert.equal(device2.createdRenderPipelines.length, 1);
+  assert.equal(device2.createdBindGroups.length, 1);
+  assert.equal(presenter.bindGroupCacheSize, 1);
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 1280, 720);
+  assert.equal(device2.createdBindGroups.length, 1);
+
+  // Device change via reset(device3) also rebuilds cleanly on device3.
+  const device3 = createMockWebGpuDevice();
+  assert.throws(() => presenter.reset({}), TypeError);
+  presenter.reset(device3);
+  assert.equal(presenter.bindGroupCacheSize, 0);
+  assert.equal(presenter.getStats().pipelineReady, false);
+  presenter.uploadYuv420Frame({ y, u, v, width: 32, height: 16 });
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 1280, 720);
+  assert.equal(device3.createdBindGroups.length, 1);
+  assert.equal(presenter.bindGroupCacheSize, 1);
+
+  // destroy() clears bindGroup cache and blocks subsequent resize()/reset()/setDevice()/present().
+  presenter.destroy();
+  assert.equal(presenter.bindGroupCacheSize, 0);
+  assert.equal(presenter.getStats().bindGroupCacheSize, 0);
+  assert.throws(() => presenter.resize(640, 360), /destroyed/i);
+  assert.throws(() => presenter.reset(), /destroyed/i);
+  assert.throws(() => presenter.setDevice(device1), /destroyed/i);
+  assert.throws(
+    () => presenter.present(createMockCommandEncoder(), targetView, 640, 360),
+    /destroyed/i
+  );
+});
+
+test('W280: targetFpsHitRate30 tracks <= 33.333ms intervals, clamps to [0, 1], and resets cleanly in resetStats()', () => {
+  const device = createMockWebGpuDevice();
+  const presenter = new BinkVideoPresenter({
+    device,
+    doubleBuffer: false,
+    targetFps: 30,
+  });
+  const targetView = { kind: 'GPUTextureView', id: 'swap-w280-fps30' };
+  const y = new Uint8Array(16 * 8).fill(180);
+  const u = new Uint8Array(8 * 4).fill(128);
+  const v = new Uint8Array(8 * 4).fill(128);
+
+  // Before any frames: both hit rates are 0.
+  let stats = presenter.getStats();
+  assert.equal(stats.bindGroupHitRate, 0);
+  assert.equal(stats.targetFpsHitRate30, 0);
+  assert.equal(presenter.bindGroupHitRate, 0);
+  assert.equal(presenter.targetFpsHitRate30, 0);
+
+  presenter.uploadYuv420Frame({ y, u, v, width: 16, height: 8 });
+
+  // Frame 0 at t=1000.0 (initial baseline, 0 measured intervals -> targetFpsHitRate30 === 0).
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360, { nowMs: 1000.0 });
+  assert.equal(presenter.getStats().targetFpsHitRate30, 0);
+  assert.equal(presenter.getStats().bindGroupHitRate, 0);
+
+  // Frame 1 at t=1016.666 (delta=16.666ms <= 33.333ms -> hit 1/1 = 1.0).
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360, { nowMs: 1016.666 });
+  assertNear(presenter.getStats().targetFpsHitRate30, 1.0, 1e-9);
+  assertNear(presenter.getStats().bindGroupHitRate, 0.5, 1e-9);
+
+  // Frame 2 at t=1049.999 (delta=33.333ms <= 33.3333...ms -> hit 2/2 = 1.0).
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360, { nowMs: 1049.999 });
+  assertNear(presenter.getStats().targetFpsHitRate30, 1.0, 1e-9);
+
+  // Frame 3 at t=1083.333 (delta=33.334ms > 1000/30 -> miss 2/3).
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360, { nowMs: 1083.333 });
+  assertNear(presenter.getStats().targetFpsHitRate30, 2 / 3, 1e-9);
+
+  // Frame 4 at t=1133.333 (delta=50.0ms > 33.333ms -> miss 2/4 = 0.5).
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360, { nowMs: 1133.333 });
+  assertNear(presenter.getStats().targetFpsHitRate30, 0.5, 1e-9);
+
+  // Backwards clock (delta < 0) and zero-delta do not corrupt measured frame interval count.
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360, { nowMs: 1100.0 });
+  assertNear(presenter.getStats().targetFpsHitRate30, 0.5, 1e-9);
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360, { nowMs: 1100.0 });
+  assertNear(presenter.getStats().targetFpsHitRate30, 0.5, 1e-9);
+
+  // Frame 7 at t=1130.0 (delta=30.0ms <= 33.333ms -> hit 3/5 = 0.6).
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360, { nowMs: 1130.0 });
+  stats = presenter.getStats();
+  assertNear(stats.targetFpsHitRate30, 0.6, 1e-9);
+  assertNear(presenter.targetFpsHitRate30, 0.6, 1e-9);
+  assert.ok(stats.targetFpsHitRate30 >= 0 && stats.targetFpsHitRate30 <= 1);
+  assert.ok(stats.bindGroupHitRate >= 0 && stats.bindGroupHitRate <= 1);
+
+  // resetStats() clears bindGroupHitRate and targetFpsHitRate30 while preserving cached bind groups.
+  const bgCountBeforeReset = device.createdBindGroups.length;
+  presenter.resetStats();
+  stats = presenter.getStats();
+  assert.equal(stats.bindGroupCacheHits, 0);
+  assert.equal(stats.bindGroupCacheMisses, 0);
+  assert.equal(stats.bindGroupHitRate, 0);
+  assert.equal(stats.targetFpsHitRate30, 0);
+  assert.equal(stats.bindGroupCacheSize, 1);
+
+  // Fresh timing baseline + 100% cache hit after resetStats().
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360, { nowMs: 2000.0 });
+  assert.equal(device.createdBindGroups.length, bgCountBeforeReset);
+  assert.equal(presenter.getStats().bindGroupHitRate, 1);
+  assert.equal(presenter.getStats().targetFpsHitRate30, 0);
+
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360, { nowMs: 2032.0 });
+  assert.equal(presenter.getStats().bindGroupHitRate, 1);
+  assert.equal(presenter.getStats().targetFpsHitRate30, 1);
+
+  presenter.destroy();
 });
