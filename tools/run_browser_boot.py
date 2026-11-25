@@ -71,6 +71,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import urllib.error
 import urllib.request
@@ -116,14 +117,15 @@ CDP_READY_TIMEOUT_S = 15.0
 COPY_CHUNK_BYTES = 256 * 1024
 
 ALLOWED_INPUT_SCRIPT_PRESETS: dict[str, str] = {
-    "start-screen": "start-screen",
-    "menu-flow": "menu-flow",
     "calibration-skip": "calibration-skip",
+    "chrome-full-boot": "chrome-full-boot",
+    "chrome-menu-flow": "chrome-menu-flow",
+    "chrome-menu-flow-2": "chrome-menu-flow-2",
     "intro-watch": "intro-watch",
     "legal-notices": "legal-notices",
-    "chrome-menu-flow": "chrome-menu-flow",
-    "chrome-full-boot": "chrome-full-boot",
+    "menu-flow": "menu-flow",
     "menu-to-ingame": "menu-to-ingame",
+    "start-screen": "start-screen",
 }
 INPUT_SCRIPT_ALIASES: dict[str, str] = ALLOWED_INPUT_SCRIPT_PRESETS
 _SAFE_INPUT_SCRIPT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
@@ -3550,6 +3552,14 @@ def compare_with_baseline(args: argparse.Namespace, run_dir: Path, runs_dir: Pat
 # ---------------------------------------------------------------------------
 
 
+class _NoHyphenBreakHelpFormatter(argparse.HelpFormatter):
+    """Wrap help text on whitespace only so hyphenated preset/flag names stay intact."""
+
+    def _split_lines(self, text: str, width: int) -> list[str]:
+        text = self._whitespace_matcher.sub(" ", text).strip()
+        return textwrap.wrap(text, width, break_on_hyphens=False)
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
@@ -3557,6 +3567,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "collect logs/telemetry/boot-report.json, and optionally compare against a baseline."
         ),
         epilog="Exit code: 0 ok, 1 baseline differences, 2 usage or build error, 3 no report.",
+        formatter_class=_NoHyphenBreakHelpFormatter,
     )
     p.add_argument("--preset", choices=sorted(PRESETS), default="smoke")
     p.add_argument("--name", help="run name (default <preset>-<timestamp>)")
@@ -3636,8 +3647,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         metavar="PRESET",
         help=(
             "sanitized scripted-input preset appended as ?inputScript=<preset> "
-            "(allowed: start-screen, menu-flow, calibration-skip, intro-watch, "
-            "legal-notices, chrome-menu-flow, chrome-full-boot, menu-to-ingame)"
+            f"(allowed: {', '.join(sorted(ALLOWED_INPUT_SCRIPT_PRESETS.values()))})"
         ),
     )
     p.add_argument(

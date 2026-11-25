@@ -3198,5 +3198,58 @@ class MenuToIngameFpsAndQuietServerTests(unittest.TestCase):
             self.assertEqual(cmp_res.failures(), [])
 
 
+class ChromeMenuFlow2InputScriptTests(unittest.TestCase):
+    def test_chrome_menu_flow_2_preset_validation_url_help_and_cli(self):
+        self.assertEqual(rbb.ALLOWED_INPUT_SCRIPT_PRESETS.get("chrome-menu-flow-2"), "chrome-menu-flow-2")
+        self.assertEqual(rbb.INPUT_SCRIPT_ALIASES.get("chrome-menu-flow-2"), "chrome-menu-flow-2")
+        self.assertEqual(
+            list(rbb.ALLOWED_INPUT_SCRIPT_PRESETS.keys()),
+            sorted(rbb.ALLOWED_INPUT_SCRIPT_PRESETS.keys()),
+        )
+        self.assertEqual(rbb.sanitize_input_script_preset("chrome-menu-flow-2"), "chrome-menu-flow-2")
+        self.assertEqual(rbb.sanitize_input_script_preset("  CHROME-MENU-FLOW-2  "), "chrome-menu-flow-2")
+        self.assertEqual(rbb.validate_input_script_preset("chrome-menu-flow-2"), "chrome-menu-flow-2")
+        self.assertEqual(
+            rbb.build_target_url("127.0.0.1", 8080, input_script="chrome-menu-flow-2"),
+            "http://127.0.0.1:8080/?inputScript=chrome-menu-flow-2",
+        )
+
+        help_text = rbb.build_arg_parser().format_help()
+        self.assertIn("chrome-menu-flow-2", help_text)
+
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            code, out, err, _, _ = fx.run_cli(
+                "--smoke",
+                "--dry-run",
+                "--name",
+                "dry-chrome-menu-flow-2",
+                "--input-script",
+                "chrome-menu-flow-2",
+            )
+            self.assertEqual(code, 0, err)
+            payload = json.loads(out)
+            self.assertEqual(payload["input_script"], "chrome-menu-flow-2")
+            self.assertEqual(payload["inputScript"], "chrome-menu-flow-2")
+            self.assertEqual(
+                payload["url"],
+                "http://127.0.0.1:<ephemeral>/?smoke=1&inputScript=chrome-menu-flow-2",
+            )
+
+            code_cli, _, err_cli, _, sessions = fx.run_cli(
+                "--smoke",
+                "--name",
+                "run-chrome-menu-flow-2",
+                "--input-script",
+                "chrome-menu-flow-2",
+            )
+            self.assertEqual(code_cli, 0, err_cli)
+            self.assertEqual(sessions[0]["input_script"], "chrome-menu-flow-2")
+            cmd_meta = json.loads(
+                (fx.build / "runs" / "run-chrome-menu-flow-2" / "command.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(cmd_meta["input_script"], "chrome-menu-flow-2")
+
+
 if __name__ == "__main__":
     unittest.main()
