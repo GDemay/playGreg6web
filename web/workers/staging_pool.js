@@ -627,6 +627,15 @@
       this._currentChunk = null;
       this._pendingMapPromises = new Set();
       this._lastAcquireFresh = false;
+      this._internalSliceScratch = {
+        buffer: null,
+        offset: 0,
+        size: 0,
+        alignedSize: 0,
+        isLargeSlab: false,
+        slabBucketSize: 0,
+        view: undefined,
+      };
 
       // Pool-wide telemetry.
       this._totalChunksAllocated = 0;
@@ -657,6 +666,8 @@
       this._subAllocCoalesced = 0;
       this._idleSlabShrinks = 0;
       this._stallAvoidedCount = 0;
+      this._zeroAllocAcquires = 0;
+      this._sceneTransitionTrimBytes = 0;
 
       // Upload throughput & per-frame telemetry.
       this._framesCompleted = 0;
@@ -1123,6 +1134,115 @@
       }
 
       return { shrunkSlabs, shrunkBytes };
+    }
+
+    /**
+     * Aggressively destroy idle oversized staging slabs (`slab.size > maxRetainedSlabBytes`,
+     * defaulting to `this.chunkSize`) immediately after heavy scene transitions
+     * (e.g., 4K Bink2 intro -> 3D Main Menu -> In-Game), without touching active or
+     * in-flight slabs or warm standard chunks.
+     *
+     * @param {{ maxRetainedSlabBytes?: number, includeAllLargeSlabs?: boolean, reclaimCompletedFirst?: boolean, keepOversizedSlabs?: number }} [options]
+     * @returns {{ reclaimedSlabs: number, reclaimedBytes: number }}
+     */
+    trimForSceneTransition(options) {
+      this._assertNotDestroyed();
+
+      let maxRetainedSlabBytes = this.chunkSize;
+      let includeAllLargeSlabs = false;
+      let reclaimCompletedFirst = true;
+      let keepOversizedSlabs = 0;
+
+      if (options !== undefined && options !== null) {
+        if (typeof options !== 'object' || Array.isArray(options)) {
+          throw new TypeError('trimForSceneTransition options must be an object');
+        }
+        if (options.maxRetainedSlabBytes !== undefined) {
+          assertPositiveInteger(options.maxRetainedSlabBytes, 'maxRetainedSlabBytes');
+          maxRetainedSlabBytes = options.maxRetainedSlabBytes;
+        }
+        if (options.includeAllLargeSlabs !== undefined) {
+          if (typeof options.includeAllLargeSlabs !== 'boolean') {
+            throw new TypeError('includeAllLargeSlabs must be a boolean');
+          }
+          includeAllLargeSlabs = options.includeAllLargeSlabs;
+        }
+        if (options.reclaimCompletedFirst !== undefined) {
+          if (typeof options.reclaimCompletedFirst !== 'boolean') {
+            throw new TypeError('reclaimCompletedFirst must be a boolean');
+          }
+          reclaimCompletedFirst = options.reclaimCompletedFirst;
+        }
+        if (options.keepOversizedSlabs !== undefined) {
+          assertNonNegativeInteger(options.keepOversizedSlabs, 'keepOversizedSlabs');
+          keepOversizedSlabs = options.keepOversizedSlabs;
+        }
+      }
+
+      const reclaimedInFlight = reclaimCompletedFirst ? this._reclaimCompletedInFlight(false) : 0;
+
+      const candidates = [];
+      for (let i = 0; i < this._recycledChunks.length; i += 1) {
+        const chunk = this._recycledChunks[i];
+        if (
+          chunk &&
+          !chunk.destroyed &&
+          chunk.state === 'recycled' &&
+          (chunk.size > maxRetainedSlabBytes || (includeAllLargeSlabs && chunk.isLargeSlab))
+        ) {
+          candidates.push(chunk);
+        }
+      }
+
+      for (const bucket of this._largeSlabBuckets.values()) {
+        for (let i = 0; i < bucket.length; i += 1) {
+          const slab = bucket[i];
+          if (
+            slab &&
+            !slab.destroyed &&
+            slab.state === 'recycled' &&
+            (slab.size > maxRetainedSlabBytes || (includeAllLargeSlabs && slab.isLargeSlab))
+          ) {
+            candidates.push(slab);
+          }
+        }
+      }
+
+      let reclaimedSlabs = 0;
+      let reclaimedBytes = 0;
+
+      if (candidates.length > keepOversizedSlabs) {
+        candidates.sort(compareEvictionLru);
+        const destroyCount = candidates.length - keepOversizedSlabs;
+        for (let i = 0; i < destroyCount; i += 1) {
+          const chunk = candidates[i];
+          if (chunk.destroyed || chunk.state !== 'recycled') {
+            continue;
+          }
+          const byteSize = chunk.size;
+          const wasLargeSlab = chunk.isLargeSlab;
+          this._destroyChunk(chunk);
+          if (wasLargeSlab) {
+            this._largeSlabEvictions += 1;
+          }
+          this._evictedCount += 1;
+          this._evictedBytes += byteSize;
+          reclaimedSlabs += 1;
+          reclaimedBytes += byteSize;
+        }
+      }
+
+      if (reclaimedSlabs > 0) {
+        this._reclaimedChunks += reclaimedSlabs;
+        this._reclaimedBytes += reclaimedBytes;
+        this._sceneTransitionTrimBytes += reclaimedBytes;
+      }
+
+      if (reclaimedInFlight > 0) {
+        this._enforceLargeSlabCap();
+      }
+
+      return { reclaimedSlabs, reclaimedBytes };
     }
 
     /**
@@ -1776,19 +1896,7 @@
       return frameStats;
     }
 
-    /**
-     * Sub-allocate an aligned staging slice from the current active chunk, rolling
-     * over to a recycled or newly allocated chunk (or a persistent large-slab bucket /
-     * dedicated oversized chunk) within `maxPoolBytes`.
-     *
-     * Enforces WebGPU 4-byte minimum alignment for buffer reservation and offsets
-     * while preserving `slice.size === byteSize` for backwards compatibility.
-     *
-     * @param {number} byteSize
-     * @param {number} [alignment=4]
-     * @returns {{ buffer: GPUBuffer, offset: number, size: number, alignedSize: number, view?: Uint8Array }}
-     */
-    allocate(byteSize, alignment = WEBGPU_BUFFER_COPY_ALIGNMENT) {
+    _allocateInternal(byteSize, alignment, outTarget, countZeroAlloc) {
       this._assertNotDestroyed();
       assertPositiveInteger(byteSize, 'byteSize');
       assertPositiveInteger(alignment, 'alignment');
@@ -1868,6 +1976,32 @@
       this._frameAllocations += 1;
       this._frameBytesAllocated += byteSize;
 
+      if (outTarget !== null) {
+        outTarget.buffer = chunk.buffer;
+        outTarget.offset = offset;
+        outTarget.size = byteSize;
+        outTarget.alignedSize = alignedSize;
+        if (isLargeSlab) {
+          outTarget.isLargeSlab = true;
+          outTarget.slabBucketSize = chunk.slabBucketSize;
+        } else {
+          outTarget.isLargeSlab = false;
+          outTarget.slabBucketSize = 0;
+        }
+        if (chunk.isMapped && chunk.mappedView) {
+          outTarget.view = chunk.mappedView.subarray(offset, offset + byteSize);
+          if (alignedSize > byteSize) {
+            chunk.mappedView.fill(0, offset + byteSize, offset + alignedSize);
+          }
+        } else {
+          outTarget.view = undefined;
+        }
+        if (countZeroAlloc) {
+          this._zeroAllocAcquires += 1;
+        }
+        return outTarget;
+      }
+
       const slice = {
         buffer: chunk.buffer,
         offset,
@@ -1888,19 +2022,115 @@
     }
 
     /**
+     * Sub-allocate an aligned staging slice from the current active chunk, rolling
+     * over to a recycled or newly allocated chunk (or a persistent large-slab bucket /
+     * dedicated oversized chunk) within `maxPoolBytes`.
+     *
+     * Enforces WebGPU 4-byte minimum alignment for buffer reservation and offsets
+     * while preserving `slice.size === byteSize` for backwards compatibility.
+     *
+     * Pass an optional reusable `out` scratch object (as the 3rd argument or via
+     * `{ alignment, align, out }` options) to populate the slice in place with
+     * zero wrapper-object allocations on hot 30 FPS upload loops.
+     *
+     * @param {number} byteSize
+     * @param {number | { alignment?: number, align?: number, out?: object | null }} [alignmentOrOptions=4]
+     * @param {object | null} [out]
+     * @returns {{ buffer: GPUBuffer, offset: number, size: number, alignedSize: number, isLargeSlab?: boolean, slabBucketSize?: number, view?: Uint8Array }}
+     */
+    allocate(byteSize, alignmentOrOptions = WEBGPU_BUFFER_COPY_ALIGNMENT, out) {
+      let alignment = WEBGPU_BUFFER_COPY_ALIGNMENT;
+      let outTarget = null;
+
+      if (
+        alignmentOrOptions !== undefined &&
+        alignmentOrOptions !== null &&
+        typeof alignmentOrOptions === 'object' &&
+        !Array.isArray(alignmentOrOptions)
+      ) {
+        const opts = alignmentOrOptions;
+        if (
+          opts.alignment !== undefined &&
+          opts.align !== undefined &&
+          opts.alignment !== opts.align
+        ) {
+          throw new RangeError(
+            `Conflicting alignment (${opts.alignment}) and align (${opts.align})`
+          );
+        }
+        if (opts.alignment !== undefined) {
+          alignment = opts.alignment;
+        } else if (opts.align !== undefined) {
+          alignment = opts.align;
+        }
+        if (opts.out !== undefined && opts.out !== null) {
+          if (typeof opts.out !== 'object' || Array.isArray(opts.out)) {
+            throw new TypeError('out must be an object');
+          }
+          outTarget = opts.out;
+        }
+        if (out !== undefined && out !== null) {
+          if (typeof out !== 'object' || Array.isArray(out)) {
+            throw new TypeError('out must be an object');
+          }
+          if (outTarget !== null && outTarget !== out) {
+            throw new RangeError('Conflicting out scratch targets');
+          }
+          outTarget = out;
+        }
+      } else {
+        if (alignmentOrOptions !== undefined) {
+          alignment = alignmentOrOptions;
+        }
+        if (out !== undefined && out !== null) {
+          if (typeof out !== 'object' || Array.isArray(out)) {
+            throw new TypeError('out must be an object');
+          }
+          outTarget = out;
+        }
+      }
+
+      return this._allocateInternal(byteSize, alignment, outTarget, outTarget !== null);
+    }
+
+    /**
+     * Acquire a staging slice, supporting both positional `(size, align, out)` and
+     * options `(size, { alignment, align, out })` signatures for zero-alloc reuse.
+     */
+    acquire(byteSize, alignmentOrOptions = WEBGPU_BUFFER_COPY_ALIGNMENT, out) {
+      return this.allocate(byteSize, alignmentOrOptions, out);
+    }
+
+    /**
+     * Acquire an aligned staging slice into an optional reusable `out` scratch target.
+     */
+    acquireSlice(byteSize, alignmentOrOptions = WEBGPU_BUFFER_COPY_ALIGNMENT, out) {
+      return this.allocate(byteSize, alignmentOrOptions, out);
+    }
+
+    /**
+     * Acquire an aligned upload staging slice into an optional reusable `out` scratch target.
+     */
+    acquireUploadSlice(byteSize, alignmentOrOptions = WEBGPU_BUFFER_COPY_ALIGNMENT, out) {
+      return this.allocate(byteSize, alignmentOrOptions, out);
+    }
+
+    /**
      * Stage `srcBytes` into the pool (with 4-byte aligned length per WebGPU
      * `copyBufferToBuffer` requirements and SharedArrayBuffer-safe copies) and
      * record `encoder.copyBufferToBuffer(...)`.
      *
      * Supports both `device.queue.writeBuffer` staging-ring mode and mapped
-     * `copyBufferToBuffer` mode transparently.
+     * `copyBufferToBuffer` mode transparently. Pass an optional `out` scratch
+     * target (or `{ out }`) to avoid per-upload return wrapper allocations.
      *
      * @param {GPUCommandEncoder} encoder
      * @param {GPUBuffer} dstBuffer
      * @param {number} dstOffset
      * @param {Uint8Array | ArrayBufferView | ArrayBuffer | SharedArrayBuffer} srcBytes
+     * @param {object | { out?: object | null } | null} [outOrOptions]
      */
-    stageBufferUpload(encoder, dstBuffer, dstOffset, srcBytes) {
+    stageBufferUpload(encoder, dstBuffer, dstOffset, srcBytes, outOrOptions) {
       this._assertNotDestroyed();
       if (!encoder || typeof encoder.copyBufferToBuffer !== 'function') {
         throw new TypeError('stageBufferUpload requires an encoder with copyBufferToBuffer()');
@@ -1915,8 +2145,32 @@
         );
       }
 
+      let outTarget = null;
+      if (outOrOptions !== undefined && outOrOptions !== null) {
+        if (typeof outOrOptions !== 'object' || Array.isArray(outOrOptions)) {
+          throw new TypeError('out must be an object');
+        }
+        if (Object.prototype.hasOwnProperty.call(outOrOptions, 'out')) {
+          if (outOrOptions.out !== undefined && outOrOptions.out !== null) {
+            if (typeof outOrOptions.out !== 'object' || Array.isArray(outOrOptions.out)) {
+              throw new TypeError('out must be an object');
+            }
+            outTarget = outOrOptions.out;
+          }
+        } else {
+          outTarget = outOrOptions;
+        }
+      }
+
       const src = toUint8Array(srcBytes, 'stageBufferUpload');
       if (src.byteLength === 0) {
+        if (outTarget !== null) {
+          outTarget.buffer = null;
+          outTarget.offset = 0;
+          outTarget.size = 0;
+          outTarget.srcByteLength = 0;
+          return outTarget;
+        }
         return {
           buffer: null,
           offset: 0,
@@ -1927,12 +2181,22 @@
 
       const copySize = alignBufferSize(src.byteLength);
       const needsPad = copySize !== src.byteLength;
-      const slice = this.allocate(copySize, WEBGPU_BUFFER_COPY_ALIGNMENT);
+      const slice = this._allocateInternal(
+        copySize,
+        WEBGPU_BUFFER_COPY_ALIGNMENT,
+        this._internalSliceScratch,
+        false
+      );
+      const sliceBuffer = slice.buffer;
+      const sliceOffset = slice.offset;
+      const sliceView = slice.view;
+      this._internalSliceScratch.buffer = null;
+      this._internalSliceScratch.view = undefined;
 
-      if (slice.view) {
-        slice.view.set(src, 0);
+      if (sliceView) {
+        sliceView.set(src, 0);
         if (needsPad) {
-          slice.view.fill(0, src.byteLength, copySize);
+          sliceView.fill(0, src.byteLength, copySize);
           this._alignPadCount += 1;
         }
       } else {
@@ -1942,7 +2206,7 @@
           );
         }
         const prepared = sanitizeWriteBufferPayload(src);
-        this.device.queue.writeBuffer(slice.buffer, slice.offset, prepared.bytes);
+        this.device.queue.writeBuffer(sliceBuffer, sliceOffset, prepared.bytes);
         if (prepared.padded) {
           this._alignPadCount += 1;
         }
@@ -1951,15 +2215,24 @@
         }
       }
 
-      encoder.copyBufferToBuffer(slice.buffer, slice.offset, dstBuffer, dstOffset, copySize);
+      encoder.copyBufferToBuffer(sliceBuffer, sliceOffset, dstBuffer, dstOffset, copySize);
 
       this._bytesUploaded += copySize;
       this._frameBytesUploaded += copySize;
       this._recordActivityTime();
 
+      if (outTarget !== null) {
+        this._zeroAllocAcquires += 1;
+        outTarget.buffer = sliceBuffer;
+        outTarget.offset = sliceOffset;
+        outTarget.size = copySize;
+        outTarget.srcByteLength = src.byteLength;
+        return outTarget;
+      }
+
       return {
-        buffer: slice.buffer,
-        offset: slice.offset,
+        buffer: sliceBuffer,
+        offset: sliceOffset,
         size: copySize,
         srcByteLength: src.byteLength,
       };
@@ -1969,12 +2242,16 @@
      * Stage texture texel/block rows into the pool, enforcing WebGPU's 256-byte
      * `bytesPerRow` alignment, and record `encoder.copyBufferToTexture(...)`.
      *
+     * Pass an optional `out` scratch target (via `layout.out` or 5th argument) to
+     * avoid per-upload return wrapper allocations.
+     *
      * @param {GPUCommandEncoder} encoder
      * @param {GPUTexture} dstTexture
      * @param {Uint8Array | ArrayBufferView | ArrayBuffer | SharedArrayBuffer} srcBytes
-     * @param {{ width: number, height: number, depthOrLayers?: number, depthOrArrayLayers?: number, bytesPerRow?: number, rowsPerImage?: number, mipLevel?: number, origin?: { x?: number, y?: number, z?: number } | number[], aspect?: string }} layout
+     * @param {{ width: number, height: number, depthOrLayers?: number, depthOrArrayLayers?: number, bytesPerRow?: number, rowsPerImage?: number, mipLevel?: number, origin?: { x?: number, y?: number, z?: number } | number[], aspect?: string, out?: object | null }} layout
+     * @param {object | { out?: object | null } | null} [outOrOptions]
      */
-    stageTextureUpload(encoder, dstTexture, srcBytes, layout) {
+    stageTextureUpload(encoder, dstTexture, srcBytes, layout, outOrOptions) {
       this._assertNotDestroyed();
       if (!encoder || typeof encoder.copyBufferToTexture !== 'function') {
         throw new TypeError('stageTextureUpload requires an encoder with copyBufferToTexture()');
@@ -1984,6 +2261,36 @@
       }
       if (!layout || typeof layout !== 'object') {
         throw new TypeError('stageTextureUpload requires a layout options object');
+      }
+
+      let outTarget = null;
+      if (layout.out !== undefined && layout.out !== null) {
+        if (typeof layout.out !== 'object' || Array.isArray(layout.out)) {
+          throw new TypeError('out must be an object');
+        }
+        outTarget = layout.out;
+      }
+      if (outOrOptions !== undefined && outOrOptions !== null) {
+        if (typeof outOrOptions !== 'object' || Array.isArray(outOrOptions)) {
+          throw new TypeError('out must be an object');
+        }
+        let argOut = null;
+        if (Object.prototype.hasOwnProperty.call(outOrOptions, 'out')) {
+          if (outOrOptions.out !== undefined && outOrOptions.out !== null) {
+            if (typeof outOrOptions.out !== 'object' || Array.isArray(outOrOptions.out)) {
+              throw new TypeError('out must be an object');
+            }
+            argOut = outOrOptions.out;
+          }
+        } else {
+          argOut = outOrOptions;
+        }
+        if (argOut !== null) {
+          if (outTarget !== null && outTarget !== argOut) {
+            throw new RangeError('Conflicting out scratch targets');
+          }
+          outTarget = argOut;
+        }
       }
 
       const src = toUint8Array(srcBytes, 'stageTextureUpload');
@@ -2021,20 +2328,30 @@
 
       const alignedBytesPerRow = alignUp(unalignedBytesPerRow, WEBGPU_BYTES_PER_ROW_ALIGNMENT);
       const stagedBytes = alignedBytesPerRow * totalRows;
-      const slice = this.allocate(stagedBytes, WEBGPU_BYTES_PER_ROW_ALIGNMENT);
+      const slice = this._allocateInternal(
+        stagedBytes,
+        WEBGPU_BYTES_PER_ROW_ALIGNMENT,
+        this._internalSliceScratch,
+        false
+      );
+      const sliceBuffer = slice.buffer;
+      const sliceOffset = slice.offset;
+      const sliceView = slice.view;
+      this._internalSliceScratch.buffer = null;
+      this._internalSliceScratch.view = undefined;
 
-      if (slice.view) {
+      if (sliceView) {
         if (alignedBytesPerRow === unalignedBytesPerRow) {
-          slice.view.set(src.subarray(0, stagedBytes), 0);
+          sliceView.set(src.subarray(0, stagedBytes), 0);
         } else {
           for (let row = 0; row < totalRows; row += 1) {
             const srcRowStart = row * unalignedBytesPerRow;
             const dstRowStart = row * alignedBytesPerRow;
-            slice.view.set(
+            sliceView.set(
               src.subarray(srcRowStart, srcRowStart + unalignedBytesPerRow),
               dstRowStart
             );
-            slice.view.fill(0, dstRowStart + unalignedBytesPerRow, dstRowStart + alignedBytesPerRow);
+            sliceView.fill(0, dstRowStart + unalignedBytesPerRow, dstRowStart + alignedBytesPerRow);
           }
         }
       } else {
@@ -2062,15 +2379,15 @@
             );
           }
         }
-        this.device.queue.writeBuffer(slice.buffer, slice.offset, payload);
+        this.device.queue.writeBuffer(sliceBuffer, sliceOffset, payload);
         if (fromSab) {
           this._sabCopyCount += 1;
         }
       }
 
       const source = {
-        buffer: slice.buffer,
-        offset: slice.offset,
+        buffer: sliceBuffer,
+        offset: sliceOffset,
         bytesPerRow: alignedBytesPerRow,
         rowsPerImage,
       };
@@ -2094,9 +2411,23 @@
       this._frameBytesUploaded += stagedBytes;
       this._recordActivityTime();
 
+      if (outTarget !== null) {
+        this._zeroAllocAcquires += 1;
+        outTarget.buffer = sliceBuffer;
+        outTarget.offset = sliceOffset;
+        outTarget.size = stagedBytes;
+        outTarget.bytesPerRow = alignedBytesPerRow;
+        outTarget.unalignedBytesPerRow = unalignedBytesPerRow;
+        outTarget.rowsPerImage = rowsPerImage;
+        outTarget.width = width;
+        outTarget.height = height;
+        outTarget.depthOrArrayLayers = depthOrLayers;
+        return outTarget;
+      }
+
       return {
-        buffer: slice.buffer,
-        offset: slice.offset,
+        buffer: sliceBuffer,
+        offset: sliceOffset,
         size: stagedBytes,
         bytesPerRow: alignedBytesPerRow,
         unalignedBytesPerRow,
@@ -2110,15 +2441,15 @@
     /**
      * Alias for `stageBufferUpload`.
      */
-    writeBuffer(encoder, dstBuffer, dstOffset, srcBytes) {
-      return this.stageBufferUpload(encoder, dstBuffer, dstOffset, srcBytes);
+    writeBuffer(encoder, dstBuffer, dstOffset, srcBytes, outOrOptions) {
+      return this.stageBufferUpload(encoder, dstBuffer, dstOffset, srcBytes, outOrOptions);
     }
 
     /**
      * Alias for `stageTextureUpload`.
      */
-    writeTexture(encoder, dstTexture, srcBytes, layout) {
-      return this.stageTextureUpload(encoder, dstTexture, srcBytes, layout);
+    writeTexture(encoder, dstTexture, srcBytes, layout, outOrOptions) {
+      return this.stageTextureUpload(encoder, dstTexture, srcBytes, layout, outOrOptions);
     }
 
     /**
@@ -2154,6 +2485,7 @@
       const largeSlabMisses = sanitizeNonNegativeCounter(this._largeSlabMisses);
       const largeSlabTotal = largeSlabHits + largeSlabMisses;
       const peakAllocatedBytes = sanitizeNonNegativeCounter(this._peakAllocatedBytes);
+      const peakPoolUtilization = clampUnitRate(peakAllocatedBytes, this.maxPoolBytes);
       const lruEvictions = sanitizeNonNegativeCounter(this._evictedCount);
       const oversizedAllocations = sanitizeNonNegativeCounter(this._oversizeAllocations);
       const totalBytesStaged = sanitizeNonNegativeCounter(this._totalBytesStaged);
@@ -2185,6 +2517,7 @@
         peakBytesAllocated: peakAllocatedBytes,
         peakAllocationBytes: peakAllocatedBytes,
         peakSingleAllocationBytes: sanitizeNonNegativeCounter(this._peakSingleAllocationBytes),
+        peakPoolUtilization,
         maxPoolBytes: this.maxPoolBytes,
         maxPooledBytes: this.maxPoolBytes,
         reclaimedChunks: sanitizeNonNegativeCounter(this._reclaimedChunks),
@@ -2235,6 +2568,8 @@
         subAllocCoalesced: sanitizeNonNegativeCounter(this._subAllocCoalesced),
         idleSlabShrinks: sanitizeNonNegativeCounter(this._idleSlabShrinks),
         stallAvoidedCount: sanitizeNonNegativeCounter(this._stallAvoidedCount),
+        zeroAllocAcquires: sanitizeNonNegativeCounter(this._zeroAllocAcquires),
+        sceneTransitionTrimBytes: sanitizeNonNegativeCounter(this._sceneTransitionTrimBytes),
         destroyed: this._destroyed,
       };
     }
@@ -2242,8 +2577,8 @@
     /**
      * Reset cumulative telemetry counters while preserving live pooled GPUBuffers,
      * active/in-flight/recycled queues, and frame/LRU ordering state.
-     * Re-baselines `peakAllocatedBytes` to the current live `allocatedBytes` so
-     * `peakAllocatedBytes >= allocatedBytes` always holds.
+     * Re-baselines `peakAllocatedBytes` (and `peakPoolUtilization`) to the current
+     * live `allocatedBytes` so `peakAllocatedBytes >= allocatedBytes` always holds.
      */
     resetStats() {
       this._totalChunksAllocated = 0;
@@ -2272,6 +2607,8 @@
       this._subAllocCoalesced = 0;
       this._idleSlabShrinks = 0;
       this._stallAvoidedCount = 0;
+      this._zeroAllocAcquires = 0;
+      this._sceneTransitionTrimBytes = 0;
       this._framesCompleted = 0;
       this._lastFrameBytesUploaded = 0;
       this._peakFrameBytesUploaded = 0;
@@ -2307,6 +2644,8 @@
       this._recycledChunks = [];
       this._inFlightChunks = [];
       this._currentChunk = null;
+      this._internalSliceScratch.buffer = null;
+      this._internalSliceScratch.view = undefined;
       this._allocatedBytes = 0;
       this._inFrame = false;
     }
