@@ -17,6 +17,163 @@
 
   const BUFFER_ALIGNMENT_BYTES = 4;
   const UNIFORM_BUFFER_MIN_BYTES = 16;
+  const DEFAULT_FAST_SLOT_CAPACITY = 1024;
+
+  const SLOT_KIND_MAP = Object.freeze({
+    buffer: 'buffer',
+    gpubuffer: 'buffer',
+    uniform: 'buffer',
+    storage: 'buffer',
+    'read-only-storage': 'buffer',
+    texture: 'texture',
+    gputexture: 'texture',
+    storagetexture: 'texture',
+    'storage-texture': 'texture',
+    textureview: 'textureView',
+    'texture-view': 'textureView',
+    texture_view: 'textureView',
+    gputextureview: 'textureView',
+    sampler: 'sampler',
+    gpusampler: 'sampler',
+    shadermodule: 'shaderModule',
+    'shader-module': 'shaderModule',
+    shader_module: 'shaderModule',
+    gpushadermodule: 'shaderModule',
+    generic: 'generic',
+  });
+
+  const KNOWN_SLOT_DESCRIPTOR_KEYS = new Set([
+    'kind',
+    'handle',
+    'id',
+    'resourceId',
+    'resource',
+    'offset',
+    'size',
+    'format',
+    'dimension',
+    'aspect',
+    'baseMipLevel',
+    'mipLevelCount',
+    'baseArrayLayer',
+    'arrayLayerCount',
+    'usage',
+    'view',
+    'viewParams',
+  ]);
+
+  function isValidSlotIndex(slotIndex) {
+    return typeof slotIndex === 'number' && Number.isInteger(slotIndex) && slotIndex >= 0;
+  }
+
+  function isDirectGpuResource(value) {
+    if (!value || typeof value !== 'object') {
+      return false;
+    }
+    if (
+      value.kind === 'GPUBuffer' ||
+      value.kind === 'GPUTexture' ||
+      value.kind === 'GPUTextureView' ||
+      value.kind === 'GPUSampler' ||
+      value.kind === 'GPUShaderModule'
+    ) {
+      return true;
+    }
+    return typeof value.destroy === 'function' || typeof value.createView === 'function';
+  }
+
+  function normalizeSlotKind(rawKind, directResource) {
+    if (typeof rawKind === 'string' && rawKind.length > 0) {
+      const mapped = SLOT_KIND_MAP[rawKind.toLowerCase()];
+      if (mapped) {
+        return mapped;
+      }
+      return rawKind.toLowerCase();
+    }
+    if (directResource && typeof directResource === 'object') {
+      if (typeof directResource.kind === 'string') {
+        const mapped = SLOT_KIND_MAP[directResource.kind.toLowerCase()];
+        if (mapped) {
+          return mapped;
+        }
+      }
+      if (typeof directResource.createView === 'function') {
+        return 'texture';
+      }
+      if (typeof directResource.destroy === 'function') {
+        return 'buffer';
+      }
+    }
+    return 'generic';
+  }
+
+  function canonicalizeExtraValue(value, depth) {
+    if (value === null) return 'null';
+    if (value === undefined) return 'undefined';
+    const t = typeof value;
+    if (t === 'number' || t === 'boolean' || t === 'bigint') {
+      return `${t}:${String(value)}`;
+    }
+    if (t === 'string') {
+      return `s:${JSON.stringify(value)}`;
+    }
+    if (depth > 4) {
+      return '[depth]';
+    }
+    if (Array.isArray(value)) {
+      let out = '[';
+      for (let i = 0; i < value.length; i += 1) {
+        if (i > 0) out += ',';
+        out += canonicalizeExtraValue(value[i], depth + 1);
+      }
+      return out + ']';
+    }
+    if (ArrayBuffer.isView(value)) {
+      return `view:${value.constructor ? value.constructor.name : 'view'}:${value.byteLength}`;
+    }
+    if (t === 'object') {
+      const keys = Object.keys(value).sort();
+      let out = '{';
+      for (let i = 0; i < keys.length; i += 1) {
+        const k = keys[i];
+        if (i > 0) out += ',';
+        out += `${JSON.stringify(k)}:${canonicalizeExtraValue(value[k], depth + 1)}`;
+      }
+      return out + '}';
+    }
+    return `${t}:${String(value)}`;
+  }
+
+  function extractExtraViewParams(primaryObj, nestedViewObj) {
+    let extra = null;
+    if (primaryObj && typeof primaryObj === 'object') {
+      const keys = Object.keys(primaryObj);
+      for (let i = 0; i < keys.length; i += 1) {
+        const k = keys[i];
+        if (!KNOWN_SLOT_DESCRIPTOR_KEYS.has(k) && primaryObj[k] !== undefined) {
+          if (!extra) extra = Object.create(null);
+          extra[k] = primaryObj[k];
+        }
+      }
+    }
+    if (nestedViewObj && typeof nestedViewObj === 'object') {
+      const keys = Object.keys(nestedViewObj);
+      for (let i = 0; i < keys.length; i += 1) {
+        const k = keys[i];
+        if (!KNOWN_SLOT_DESCRIPTOR_KEYS.has(k) && nestedViewObj[k] !== undefined) {
+          if (!extra) extra = Object.create(null);
+          extra[k] = nestedViewObj[k];
+        }
+      }
+    }
+    if (!extra) {
+      return { extraViewParams: null, extraViewKey: '' };
+    }
+    return {
+      extraViewParams: extra,
+      extraViewKey: canonicalizeExtraValue(extra, 0),
+    };
+  }
 
   // WebGPU-compatible GPUBufferUsage bitmask values (runtime/abi/playgta6_abi.h).
   const GPU_BUFFER_USAGE = Object.freeze({
@@ -716,6 +873,141 @@
       this._missingLookups = 0;
       this._totalInserts = 0;
       this._totalDeletes = 0;
+
+      // Fast descriptor slot cache & monotonic versioned bind-group invalidation (W207).
+      const fastSlotCapacity =
+        options.fastSlotCapacity !== undefined
+          ? options.fastSlotCapacity
+          : DEFAULT_FAST_SLOT_CAPACITY;
+      if (!Number.isInteger(fastSlotCapacity) || fastSlotCapacity < 0) {
+        throw new RangeError(
+          `ResourceTable fastSlotCapacity must be a non-negative integer, got ${fastSlotCapacity}`
+        );
+      }
+      this._fastSlotCapacity = fastSlotCapacity;
+      /** @type {Array<object | undefined>} */
+      this._fastSlots = [];
+      /** @type {Map<number, object>} */
+      this._overflowSlots = new Map();
+      this._activeSlots = 0;
+      this._tableVersion = 0;
+      this._slotWrites = 0;
+      this._elidedNoOpWrites = 0;
+      this._slotLookups = 0;
+
+      // Per-resource monotonic version tracking & reverse slot index for O(1) invalidation.
+      this._nextResourceVersion = 1;
+      this._resourceVersions = {
+        buffer: new Map(),
+        texture: new Map(),
+        sampler: new Map(),
+        shaderModule: new Map(),
+      };
+      this._resourceSlotRefs = {
+        buffer: new Map(),
+        texture: new Map(),
+        sampler: new Map(),
+        shaderModule: new Map(),
+        generic: new Map(),
+      };
+    }
+
+    _getResourceVersionBucket(kind) {
+      if (kind === 'buffer') return 'buffer';
+      if (kind === 'texture' || kind === 'textureView') return 'texture';
+      if (kind === 'sampler') return 'sampler';
+      if (kind === 'shaderModule') return 'shaderModule';
+      return null;
+    }
+
+    _getResourceVersion(kind, handle) {
+      if (handle === null || handle === undefined) {
+        return 0;
+      }
+      const bucket = this._getResourceVersionBucket(kind);
+      if (bucket !== null) {
+        return this._resourceVersions[bucket].get(handle) || 0;
+      }
+      return (
+        this._resourceVersions.buffer.get(handle) ||
+        this._resourceVersions.texture.get(handle) ||
+        this._resourceVersions.sampler.get(handle) ||
+        this._resourceVersions.shaderModule.get(handle) ||
+        0
+      );
+    }
+
+    _bumpResourceVersion(bucket, id) {
+      const ver = this._nextResourceVersion;
+      this._nextResourceVersion += 1;
+      this._resourceVersions[bucket].set(id, ver);
+      return ver;
+    }
+
+    _addSlotResourceRef(kind, handle, slotIndex) {
+      if (handle === null || handle === undefined) {
+        return;
+      }
+      const bucket = this._getResourceVersionBucket(kind) || 'generic';
+      const refMap = this._resourceSlotRefs[bucket];
+      let slotSet = refMap.get(handle);
+      if (slotSet === undefined) {
+        slotSet = new Set();
+        refMap.set(handle, slotSet);
+      }
+      slotSet.add(slotIndex);
+    }
+
+    _removeSlotResourceRef(kind, handle, slotIndex) {
+      if (handle === null || handle === undefined) {
+        return;
+      }
+      const bucket = this._getResourceVersionBucket(kind) || 'generic';
+      const refMap = this._resourceSlotRefs[bucket];
+      const slotSet = refMap.get(handle);
+      if (slotSet !== undefined) {
+        slotSet.delete(slotIndex);
+        if (slotSet.size === 0) {
+          refMap.delete(handle);
+        }
+      }
+    }
+
+    _invalidateSlotsForResource(bucket, id, newResourceVersion) {
+      const typedSet = this._resourceSlotRefs[bucket].get(id);
+      const genericSet = this._resourceSlotRefs.generic.get(id);
+      if (typedSet === undefined && genericSet === undefined) {
+        return 0;
+      }
+      let invalidated = 0;
+      if (typedSet !== undefined) {
+        for (const slotIndex of typedSet) {
+          const entry = this._getSlotEntry(slotIndex);
+          if (entry && entry.bound) {
+            entry.resourceVersion = newResourceVersion;
+            entry.cachedView = null;
+            entry.snapshot = null;
+            entry.version += 1;
+            invalidated += 1;
+          }
+        }
+      }
+      if (genericSet !== undefined) {
+        for (const slotIndex of genericSet) {
+          const entry = this._getSlotEntry(slotIndex);
+          if (entry && entry.bound) {
+            entry.resourceVersion = this._getResourceVersion('generic', id);
+            entry.cachedView = null;
+            entry.snapshot = null;
+            entry.version += 1;
+            invalidated += 1;
+          }
+        }
+      }
+      if (invalidated > 0) {
+        this._tableVersion += 1;
+      }
+      return invalidated;
     }
 
     _getLiveHandleCount() {
@@ -821,6 +1113,8 @@
       } catch (err) {
         if (existed) {
           this._totalDeletes += 1;
+          this._resourceVersions.buffer.delete(id);
+          this._invalidateSlotsForResource('buffer', id, 0);
         }
         throw err;
       }
@@ -841,6 +1135,9 @@
           label,
         });
       }
+
+      const bufResVer = this._bumpResourceVersion('buffer', id);
+      this._invalidateSlotsForResource('buffer', id, bufResVer);
 
       this._buffersCreated += 1;
       this._recordInsert(existed);
@@ -950,6 +1247,8 @@
       } catch (err) {
         if (existed) {
           this._totalDeletes += 1;
+          this._resourceVersions.texture.delete(id);
+          this._invalidateSlotsForResource('texture', id, 0);
         }
         throw err;
       }
@@ -995,6 +1294,9 @@
           });
         }
       }
+
+      const texResVer = this._bumpResourceVersion('texture', id);
+      this._invalidateSlotsForResource('texture', id, texResVer);
 
       this._texturesCreated += 1;
       if (options.isTexture2) {
@@ -1073,6 +1375,8 @@
           label: descriptor.label || `sampler:${id}`,
         });
       }
+      const sampResVer = this._bumpResourceVersion('sampler', id);
+      this._invalidateSlotsForResource('sampler', id, sampResVer);
       this._samplersCreated += 1;
       this._recordInsert(existed);
       return sampler;
@@ -1088,6 +1392,8 @@
           label: (descriptor && descriptor.label) || `shaderModule:${id}`,
         });
       }
+      const modResVer = this._bumpResourceVersion('shaderModule', id);
+      this._invalidateSlotsForResource('shaderModule', id, modResVer);
       this._shaderModulesCreated += 1;
       this._recordInsert(existed);
       return mod;
@@ -1177,6 +1483,8 @@
       this._destroyCount += 1;
       if (countDelete) {
         this._totalDeletes += 1;
+        this._resourceVersions.buffer.delete(id);
+        this._invalidateSlotsForResource('buffer', id, 0);
       }
       return true;
     }
@@ -1207,6 +1515,8 @@
       this._destroyCount += 1;
       if (countDelete) {
         this._totalDeletes += 1;
+        this._resourceVersions.texture.delete(id);
+        this._invalidateSlotsForResource('texture', id, 0);
       }
       return true;
     }
@@ -1225,6 +1535,8 @@
         }
         this._destroyCount += 1;
         this._totalDeletes += 1;
+        this._resourceVersions.sampler.delete(id);
+        this._invalidateSlotsForResource('sampler', id, 0);
         count += 1;
       }
       if (this.shaderModules.delete(id)) {
@@ -1233,9 +1545,719 @@
         }
         this._destroyCount += 1;
         this._totalDeletes += 1;
+        this._resourceVersions.shaderModule.delete(id);
+        this._invalidateSlotsForResource('shaderModule', id, 0);
         count += 1;
       }
       return count;
+    }
+
+    // -------------------------------------------------------------------------
+    // Fast descriptor slot cache & monotonic versioned bind-group invalidation
+    // -------------------------------------------------------------------------
+
+    get tableVersion() {
+      return this._tableVersion;
+    }
+
+    getTableVersion() {
+      return this._tableVersion;
+    }
+
+    _getSlotEntry(slotIndex) {
+      if (!isValidSlotIndex(slotIndex)) {
+        return undefined;
+      }
+      return slotIndex < this._fastSlotCapacity
+        ? this._fastSlots[slotIndex]
+        : this._overflowSlots.get(slotIndex);
+    }
+
+    /**
+     * Fast O(1) monotonic version counter for a single descriptor slot.
+     * Returns `0` for slots that have never been written.
+     *
+     * @param {number} slotIndex
+     * @returns {number}
+     */
+    getSlotVersion(slotIndex) {
+      const entry = this._getSlotEntry(slotIndex);
+      return entry !== undefined ? entry.version : 0;
+    }
+
+    /**
+     * Fast O(1) existence check for a bound descriptor slot.
+     *
+     * @param {number} slotIndex
+     * @returns {boolean}
+     */
+    hasSlot(slotIndex) {
+      const entry = this._getSlotEntry(slotIndex);
+      return Boolean(entry && entry.bound);
+    }
+
+    _buildSlotSnapshot(entry) {
+      let frozenExtra = null;
+      if (entry.extraViewParams !== null) {
+        frozenExtra = Object.freeze({ ...entry.extraViewParams });
+      }
+      return Object.freeze({
+        slot: entry.slot,
+        version: entry.version,
+        kind: entry.kind,
+        handle: entry.handle,
+        resource: entry.resource,
+        resourceVersion: entry.resourceVersion,
+        offset: entry.offset,
+        size: entry.size,
+        format: entry.format,
+        dimension: entry.dimension,
+        aspect: entry.aspect,
+        baseMipLevel: entry.baseMipLevel,
+        mipLevelCount: entry.mipLevelCount,
+        baseArrayLayer: entry.baseArrayLayer,
+        arrayLayerCount: entry.arrayLayerCount,
+        usage: entry.usage,
+        viewParams: frozenExtra,
+      });
+    }
+
+    /**
+     * Fast O(1) lookup of a bound descriptor slot. Returns a cached frozen
+     * snapshot (zero-allocation on repeated reads) or `undefined` if unbound.
+     *
+     * @param {number} slotIndex
+     * @returns {Readonly<object> | undefined}
+     */
+    getSlot(slotIndex) {
+      this._slotLookups += 1;
+      const entry = this._getSlotEntry(slotIndex);
+      if (!entry || !entry.bound) {
+        return undefined;
+      }
+      if (entry.snapshot === null) {
+        entry.snapshot = this._buildSlotSnapshot(entry);
+      }
+      return entry.snapshot;
+    }
+
+    /**
+     * Bind or update a descriptor slot with fast no-op write elision.
+     *
+     * Accepts:
+     * - `setSlot(slotIndex, { kind, handle, offset, size, format, dimension, aspect, baseMipLevel, mipLevelCount, baseArrayLayer, arrayLayerCount, usage, view, viewParams })`
+     * - `setSlot(slotIndex, handleOrGpuResource, viewParams)`
+     * - `setSlot(slotIndex, null | undefined)` (unbinds the slot)
+     *
+     * Increments the slot's monotonic `version` and `tableVersion` ONLY when
+     * the normalized bound handle/resource or view parameters actually change.
+     * Returns `true` if the slot changed, or `false` if the write was elided.
+     *
+     * @param {number} slotIndex
+     * @param {object | number | null | undefined} descriptorOrHandle
+     * @param {object} [viewParamsArg]
+     * @returns {boolean}
+     */
+    setSlot(slotIndex, descriptorOrHandle, viewParamsArg) {
+      if (!isValidSlotIndex(slotIndex)) {
+        throw new RangeError(
+          `ResourceTable slotIndex must be a non-negative integer, got ${slotIndex}`
+        );
+      }
+
+      if (descriptorOrHandle === null || descriptorOrHandle === undefined) {
+        const cleared = this.clearSlot(slotIndex);
+        if (cleared) {
+          this._slotWrites += 1;
+          return true;
+        }
+        this._elidedNoOpWrites += 1;
+        return false;
+      }
+
+      let rawKind;
+      let rawHandle = null;
+      let directResource = null;
+      let primaryParams = null;
+      let nestedViewParams = null;
+
+      if (typeof descriptorOrHandle === 'number') {
+        rawHandle = descriptorOrHandle;
+        if (viewParamsArg && typeof viewParamsArg === 'object') {
+          primaryParams = viewParamsArg;
+          rawKind = viewParamsArg.kind;
+          nestedViewParams = viewParamsArg.view || viewParamsArg.viewParams || null;
+        }
+      } else if (typeof descriptorOrHandle === 'object') {
+        if (viewParamsArg !== undefined || isDirectGpuResource(descriptorOrHandle)) {
+          if (isDirectGpuResource(descriptorOrHandle)) {
+            directResource = descriptorOrHandle;
+            if (viewParamsArg && typeof viewParamsArg === 'object') {
+              primaryParams = viewParamsArg;
+              rawKind = viewParamsArg.kind;
+              nestedViewParams = viewParamsArg.view || viewParamsArg.viewParams || null;
+            }
+          } else {
+            primaryParams = descriptorOrHandle;
+            rawKind = descriptorOrHandle.kind;
+            if (descriptorOrHandle.resource && typeof descriptorOrHandle.resource === 'object') {
+              directResource = descriptorOrHandle.resource;
+            }
+            const candidateHandle =
+              descriptorOrHandle.handle !== undefined
+                ? descriptorOrHandle.handle
+                : descriptorOrHandle.id !== undefined
+                  ? descriptorOrHandle.id
+                  : descriptorOrHandle.resourceId;
+            if (typeof candidateHandle === 'number') {
+              rawHandle = candidateHandle;
+            } else if (candidateHandle && typeof candidateHandle === 'object') {
+              directResource = candidateHandle;
+            }
+            nestedViewParams =
+              (viewParamsArg && typeof viewParamsArg === 'object' ? viewParamsArg : null) ||
+              descriptorOrHandle.view ||
+              descriptorOrHandle.viewParams ||
+              null;
+          }
+        } else {
+          primaryParams = descriptorOrHandle;
+          rawKind = descriptorOrHandle.kind;
+          if (descriptorOrHandle.resource && typeof descriptorOrHandle.resource === 'object') {
+            directResource = descriptorOrHandle.resource;
+          }
+          const candidateHandle =
+            descriptorOrHandle.handle !== undefined
+              ? descriptorOrHandle.handle
+              : descriptorOrHandle.id !== undefined
+                ? descriptorOrHandle.id
+                : descriptorOrHandle.resourceId;
+          if (typeof candidateHandle === 'number') {
+            rawHandle = candidateHandle;
+          } else if (candidateHandle && typeof candidateHandle === 'object') {
+            directResource = candidateHandle;
+          }
+          nestedViewParams = descriptorOrHandle.view || descriptorOrHandle.viewParams || null;
+        }
+      } else {
+        throw new TypeError(
+          'ResourceTable setSlot expects a descriptor object, numeric handle, GPU resource, or null'
+        );
+      }
+
+      const kind = normalizeSlotKind(rawKind, directResource);
+      const handle =
+        rawHandle !== null && Number.isFinite(rawHandle) ? Math.floor(rawHandle) : null;
+      const resourceVersion =
+        directResource !== null ? 0 : this._getResourceVersion(kind, handle);
+
+      const srcA = primaryParams;
+      const srcB = nestedViewParams;
+
+      const rawOffset =
+        srcB && srcB.offset !== undefined
+          ? srcB.offset
+          : srcA && srcA.offset !== undefined
+            ? srcA.offset
+            : undefined;
+      const rawSize =
+        srcB && srcB.size !== undefined
+          ? srcB.size
+          : srcA && srcA.size !== undefined
+            ? srcA.size
+            : undefined;
+      const rawFormat =
+        srcB && srcB.format !== undefined
+          ? srcB.format
+          : srcA && srcA.format !== undefined
+            ? srcA.format
+            : undefined;
+      const rawDimension =
+        srcB && srcB.dimension !== undefined
+          ? srcB.dimension
+          : srcA && srcA.dimension !== undefined
+            ? srcA.dimension
+            : undefined;
+      const rawAspect =
+        srcB && srcB.aspect !== undefined
+          ? srcB.aspect
+          : srcA && srcA.aspect !== undefined
+            ? srcA.aspect
+            : undefined;
+      const rawBaseMip =
+        srcB && srcB.baseMipLevel !== undefined
+          ? srcB.baseMipLevel
+          : srcA && srcA.baseMipLevel !== undefined
+            ? srcA.baseMipLevel
+            : undefined;
+      const rawMipCnt =
+        srcB && srcB.mipLevelCount !== undefined
+          ? srcB.mipLevelCount
+          : srcA && srcA.mipLevelCount !== undefined
+            ? srcA.mipLevelCount
+            : undefined;
+      const rawBaseLayer =
+        srcB && srcB.baseArrayLayer !== undefined
+          ? srcB.baseArrayLayer
+          : srcA && srcA.baseArrayLayer !== undefined
+            ? srcA.baseArrayLayer
+            : undefined;
+      const rawLayerCnt =
+        srcB && srcB.arrayLayerCount !== undefined
+          ? srcB.arrayLayerCount
+          : srcA && srcA.arrayLayerCount !== undefined
+            ? srcA.arrayLayerCount
+            : undefined;
+      const rawUsage =
+        srcB && srcB.usage !== undefined
+          ? srcB.usage
+          : srcA && srcA.usage !== undefined
+            ? srcA.usage
+            : undefined;
+
+      const offset =
+        rawOffset !== undefined && rawOffset !== null && Number.isFinite(Number(rawOffset))
+          ? Math.max(0, Math.floor(Number(rawOffset)))
+          : 0;
+      const size =
+        rawSize !== undefined && rawSize !== null && Number.isFinite(Number(rawSize))
+          ? Math.max(0, Math.floor(Number(rawSize)))
+          : undefined;
+      const format =
+        typeof rawFormat === 'string' && rawFormat.length > 0
+          ? rawFormat.toLowerCase()
+          : undefined;
+      const dimension =
+        typeof rawDimension === 'string' && rawDimension.length > 0
+          ? rawDimension.toLowerCase()
+          : undefined;
+      const aspect =
+        typeof rawAspect === 'string' && rawAspect.length > 0
+          ? rawAspect.toLowerCase()
+          : undefined;
+      const baseMipLevel =
+        rawBaseMip !== undefined && rawBaseMip !== null && Number.isFinite(Number(rawBaseMip))
+          ? Math.max(0, Math.floor(Number(rawBaseMip)))
+          : 0;
+      const mipLevelCount =
+        rawMipCnt !== undefined && rawMipCnt !== null && Number.isFinite(Number(rawMipCnt))
+          ? Math.max(0, Math.floor(Number(rawMipCnt)))
+          : undefined;
+      const baseArrayLayer =
+        rawBaseLayer !== undefined &&
+        rawBaseLayer !== null &&
+        Number.isFinite(Number(rawBaseLayer))
+          ? Math.max(0, Math.floor(Number(rawBaseLayer)))
+          : 0;
+      const arrayLayerCount =
+        rawLayerCnt !== undefined &&
+        rawLayerCnt !== null &&
+        Number.isFinite(Number(rawLayerCnt))
+          ? Math.max(0, Math.floor(Number(rawLayerCnt)))
+          : undefined;
+      const usage =
+        rawUsage !== undefined && rawUsage !== null && Number.isFinite(Number(rawUsage))
+          ? Number(rawUsage) >>> 0
+          : undefined;
+
+      const { extraViewParams, extraViewKey } = extractExtraViewParams(srcA, srcB);
+
+      const useFastArray = slotIndex < this._fastSlotCapacity;
+      let entry = useFastArray
+        ? this._fastSlots[slotIndex]
+        : this._overflowSlots.get(slotIndex);
+
+      if (
+        entry !== undefined &&
+        entry.bound &&
+        entry.kind === kind &&
+        entry.handle === handle &&
+        entry.resource === directResource &&
+        entry.resourceVersion === resourceVersion &&
+        entry.offset === offset &&
+        entry.size === size &&
+        entry.format === format &&
+        entry.dimension === dimension &&
+        entry.aspect === aspect &&
+        entry.baseMipLevel === baseMipLevel &&
+        entry.mipLevelCount === mipLevelCount &&
+        entry.baseArrayLayer === baseArrayLayer &&
+        entry.arrayLayerCount === arrayLayerCount &&
+        entry.usage === usage &&
+        entry.extraViewKey === extraViewKey
+      ) {
+        this._elidedNoOpWrites += 1;
+        return false;
+      }
+
+      const wasBound = Boolean(entry && entry.bound);
+      const prevKind = wasBound ? entry.kind : null;
+      const prevHandle = wasBound ? entry.handle : null;
+      const refChanged = !wasBound || prevKind !== kind || prevHandle !== handle;
+      if (wasBound && prevHandle !== null && refChanged) {
+        this._removeSlotResourceRef(prevKind, prevHandle, slotIndex);
+      }
+
+      if (entry === undefined) {
+        entry = {
+          slot: slotIndex,
+          bound: true,
+          version: 1,
+          kind,
+          handle,
+          resource: directResource,
+          resourceVersion,
+          offset,
+          size,
+          format,
+          dimension,
+          aspect,
+          baseMipLevel,
+          mipLevelCount,
+          baseArrayLayer,
+          arrayLayerCount,
+          usage,
+          extraViewParams,
+          extraViewKey,
+          cachedView: null,
+          snapshot: null,
+        };
+        if (useFastArray) {
+          this._fastSlots[slotIndex] = entry;
+        } else {
+          this._overflowSlots.set(slotIndex, entry);
+        }
+      } else {
+        entry.bound = true;
+        entry.version += 1;
+        entry.kind = kind;
+        entry.handle = handle;
+        entry.resource = directResource;
+        entry.resourceVersion = resourceVersion;
+        entry.offset = offset;
+        entry.size = size;
+        entry.format = format;
+        entry.dimension = dimension;
+        entry.aspect = aspect;
+        entry.baseMipLevel = baseMipLevel;
+        entry.mipLevelCount = mipLevelCount;
+        entry.baseArrayLayer = baseArrayLayer;
+        entry.arrayLayerCount = arrayLayerCount;
+        entry.usage = usage;
+        entry.extraViewParams = extraViewParams;
+        entry.extraViewKey = extraViewKey;
+        entry.cachedView = null;
+        entry.snapshot = null;
+      }
+
+      if (handle !== null && refChanged) {
+        this._addSlotResourceRef(kind, handle, slotIndex);
+      }
+
+      if (!wasBound) {
+        this._activeSlots += 1;
+      }
+      this._tableVersion += 1;
+      this._slotWrites += 1;
+      return true;
+    }
+
+    /**
+     * Clear a single descriptor slot. Increments the slot's monotonic version
+     * and `tableVersion` if the slot was previously bound.
+     *
+     * @param {number} slotIndex
+     * @returns {boolean} `true` if a bound slot was cleared, `false` otherwise.
+     */
+    clearSlot(slotIndex) {
+      const entry = this._getSlotEntry(slotIndex);
+      if (!entry || !entry.bound) {
+        return false;
+      }
+      if (entry.handle !== null) {
+        this._removeSlotResourceRef(entry.kind, entry.handle, slotIndex);
+      }
+      entry.bound = false;
+      entry.handle = null;
+      entry.resource = null;
+      entry.resourceVersion = 0;
+      entry.offset = 0;
+      entry.size = undefined;
+      entry.format = undefined;
+      entry.dimension = undefined;
+      entry.aspect = undefined;
+      entry.baseMipLevel = 0;
+      entry.mipLevelCount = undefined;
+      entry.baseArrayLayer = 0;
+      entry.arrayLayerCount = undefined;
+      entry.usage = undefined;
+      entry.extraViewParams = null;
+      entry.extraViewKey = '';
+      entry.cachedView = null;
+      entry.snapshot = null;
+      entry.version += 1;
+      this._activeSlots -= 1;
+      this._tableVersion += 1;
+      return true;
+    }
+
+    /**
+     * Unbind all active descriptor slots while preserving strictly monotonic
+     * per-slot and per-table version counters for downstream bind-group caches.
+     *
+     * @returns {number} Number of previously active slots cleared.
+     */
+    clearSlots() {
+      if (this._activeSlots === 0) {
+        return 0;
+      }
+      let cleared = 0;
+      for (let i = 0; i < this._fastSlots.length; i += 1) {
+        const entry = this._fastSlots[i];
+        if (entry && entry.bound) {
+          entry.bound = false;
+          entry.handle = null;
+          entry.resource = null;
+          entry.resourceVersion = 0;
+          entry.offset = 0;
+          entry.size = undefined;
+          entry.format = undefined;
+          entry.dimension = undefined;
+          entry.aspect = undefined;
+          entry.baseMipLevel = 0;
+          entry.mipLevelCount = undefined;
+          entry.baseArrayLayer = 0;
+          entry.arrayLayerCount = undefined;
+          entry.usage = undefined;
+          entry.extraViewParams = null;
+          entry.extraViewKey = '';
+          entry.cachedView = null;
+          entry.snapshot = null;
+          entry.version += 1;
+          cleared += 1;
+        }
+      }
+      if (this._overflowSlots.size > 0) {
+        for (const entry of this._overflowSlots.values()) {
+          if (entry && entry.bound) {
+            entry.bound = false;
+            entry.handle = null;
+            entry.resource = null;
+            entry.resourceVersion = 0;
+            entry.offset = 0;
+            entry.size = undefined;
+            entry.format = undefined;
+            entry.dimension = undefined;
+            entry.aspect = undefined;
+            entry.baseMipLevel = 0;
+            entry.mipLevelCount = undefined;
+            entry.baseArrayLayer = 0;
+            entry.arrayLayerCount = undefined;
+            entry.usage = undefined;
+            entry.extraViewParams = null;
+            entry.extraViewKey = '';
+            entry.cachedView = null;
+            entry.snapshot = null;
+            entry.version += 1;
+            cleared += 1;
+          }
+        }
+      }
+      this._resourceSlotRefs.buffer.clear();
+      this._resourceSlotRefs.texture.clear();
+      this._resourceSlotRefs.sampler.clear();
+      this._resourceSlotRefs.shaderModule.clear();
+      this._resourceSlotRefs.generic.clear();
+      this._activeSlots = 0;
+      if (cleared > 0) {
+        this._tableVersion += 1;
+      }
+      return cleared;
+    }
+
+    /**
+     * Resolve the live WebGPU resource bound at `slotIndex`, lazily caching
+     * custom `GPUTextureView` objects until the slot or underlying texture changes.
+     *
+     * @param {number} slotIndex
+     * @returns {object | undefined}
+     */
+    resolveSlot(slotIndex) {
+      this._slotLookups += 1;
+      const entry = this._getSlotEntry(slotIndex);
+      if (!entry || !entry.bound) {
+        return undefined;
+      }
+      if (entry.resource !== null) {
+        return entry.resource;
+      }
+      if (entry.handle === null) {
+        return undefined;
+      }
+      if (entry.kind === 'buffer') {
+        return this.buffers.get(entry.handle);
+      }
+      if (entry.kind === 'texture' || entry.kind === 'textureView') {
+        const hasCustomView =
+          entry.format !== undefined ||
+          entry.dimension !== undefined ||
+          entry.aspect !== undefined ||
+          entry.baseMipLevel !== 0 ||
+          entry.mipLevelCount !== undefined ||
+          entry.baseArrayLayer !== 0 ||
+          entry.arrayLayerCount !== undefined ||
+          entry.usage !== undefined;
+        if (hasCustomView) {
+          if (entry.cachedView !== null) {
+            return entry.cachedView;
+          }
+          const tex = this.textures.get(entry.handle);
+          if (!tex || typeof tex.createView !== 'function') {
+            return undefined;
+          }
+          const viewDesc = {};
+          if (entry.format !== undefined) viewDesc.format = entry.format;
+          if (entry.dimension !== undefined) viewDesc.dimension = entry.dimension;
+          if (entry.aspect !== undefined) viewDesc.aspect = entry.aspect;
+          if (entry.baseMipLevel !== 0 || entry.mipLevelCount !== undefined) {
+            viewDesc.baseMipLevel = entry.baseMipLevel;
+          }
+          if (entry.mipLevelCount !== undefined) {
+            viewDesc.mipLevelCount = entry.mipLevelCount;
+          }
+          if (entry.baseArrayLayer !== 0 || entry.arrayLayerCount !== undefined) {
+            viewDesc.baseArrayLayer = entry.baseArrayLayer;
+          }
+          if (entry.arrayLayerCount !== undefined) {
+            viewDesc.arrayLayerCount = entry.arrayLayerCount;
+          }
+          if (entry.usage !== undefined) viewDesc.usage = entry.usage;
+          entry.cachedView = tex.createView(viewDesc);
+          return entry.cachedView;
+        }
+        return this.textureViews.get(entry.handle);
+      }
+      if (entry.kind === 'sampler') {
+        return this.samplers.get(entry.handle);
+      }
+      if (entry.kind === 'shaderModule') {
+        return this.shaderModules.get(entry.handle);
+      }
+      return (
+        this.buffers.get(entry.handle) ||
+        this.textureViews.get(entry.handle) ||
+        this.samplers.get(entry.handle) ||
+        this.shaderModules.get(entry.handle)
+      );
+    }
+
+    getSlotResource(slotIndex) {
+      return this.resolveSlot(slotIndex);
+    }
+
+    /**
+     * Build a WebGPU `GPUBindGroupEntry` (`{ binding, resource }`) for `slotIndex`.
+     * Returns `null` if the slot is unbound or its underlying resource is missing.
+     *
+     * @param {number} binding
+     * @param {number} slotIndex
+     * @returns {{ binding: number, resource: object } | null}
+     */
+    getBindGroupEntry(binding, slotIndex) {
+      const entry = this._getSlotEntry(slotIndex);
+      if (!entry || !entry.bound) {
+        this._slotLookups += 1;
+        return null;
+      }
+      const res = this.resolveSlot(slotIndex);
+      if (!res) {
+        return null;
+      }
+      if (entry.kind === 'buffer') {
+        const bufBinding = { buffer: res, offset: entry.offset };
+        if (entry.size !== undefined) {
+          bufBinding.size = entry.size;
+        }
+        return { binding, resource: bufBinding };
+      }
+      return { binding, resource: res };
+    }
+
+    /**
+     * Capture a compact version stamp for a list of descriptor slots so a
+     * downstream bind-group cache can validate in O(1) via `isBindGroupCacheValid`.
+     *
+     * @param {Array<number> | Uint32Array} slotIndices
+     * @returns {{ tableVersion: number, slots: number[], versions: number[] }}
+     */
+    captureSlotVersions(slotIndices) {
+      const len = slotIndices ? slotIndices.length : 0;
+      const slots = new Array(len);
+      const versions = new Array(len);
+      for (let i = 0; i < len; i += 1) {
+        const s = slotIndices[i];
+        slots[i] = s;
+        versions[i] = this.getSlotVersion(s);
+      }
+      return {
+        tableVersion: this._tableVersion,
+        slots,
+        versions,
+      };
+    }
+
+    /**
+     * O(1) bind-group cache validation against a version stamp returned by
+     * `captureSlotVersions()`. Fast-paths on a single `tableVersion` equality
+     * check; if an unrelated slot moved `tableVersion`, checks only the stamped
+     * slots and fast-forwards `snapshot.tableVersion` on match.
+     *
+     * @param {{ tableVersion: number, slots: number[], versions: number[] } | null | undefined} snapshot
+     * @returns {boolean}
+     */
+    isSlotSnapshotValid(snapshot) {
+      if (!snapshot || typeof snapshot !== 'object') {
+        return false;
+      }
+      if (snapshot.tableVersion === this._tableVersion) {
+        return true;
+      }
+      const slots = snapshot.slots;
+      const versions = snapshot.versions;
+      if (!Array.isArray(slots) || !Array.isArray(versions) || slots.length !== versions.length) {
+        return false;
+      }
+      for (let i = 0; i < slots.length; i += 1) {
+        if (this.getSlotVersion(slots[i]) !== versions[i]) {
+          return false;
+        }
+      }
+      snapshot.tableVersion = this._tableVersion;
+      return true;
+    }
+
+    isBindGroupCacheValid(snapshot) {
+      return this.isSlotSnapshotValid(snapshot);
+    }
+
+    /**
+     * Build a compact deterministic version key string for a list of slots
+     * (useful as an LRU bind-group cache key).
+     *
+     * @param {Array<number> | Uint32Array} slotIndices
+     * @returns {string}
+     */
+    getSlotVersionKey(slotIndices) {
+      if (!slotIndices || slotIndices.length === 0) {
+        return '';
+      }
+      let key = '';
+      for (let i = 0; i < slotIndices.length; i += 1) {
+        const s = slotIndices[i];
+        if (i > 0) key += '|';
+        key += `${s}:${this.getSlotVersion(s)}`;
+      }
+      return key;
     }
 
     destroyAll() {
@@ -1254,12 +2276,16 @@
     }
 
     /**
-     * Destroy all tracked GPU resources and clear internal handle/metadata maps.
+     * Destroy all tracked GPU resources, clear bound descriptor slots, and
+     * clear internal handle/metadata maps. Monotonic slot/table versions are
+     * preserved (and incremented when active slots are cleared) so downstream
+     * bind-group caches never observe stale version reuse.
      * Pass `{ resetStats: true }` to also reset telemetry counters.
      *
      * @param {{ resetStats?: boolean }} [options]
      */
     clear(options = {}) {
+      this.clearSlots();
       this.destroyAll();
       this._bufferMeta.clear();
       this.textureViews.clear();
@@ -1298,6 +2324,11 @@
         missingLookups: this._missingLookups,
         totalInserts: this._totalInserts,
         totalDeletes: this._totalDeletes,
+        slotWrites: this._slotWrites,
+        elidedNoOpWrites: this._elidedNoOpWrites,
+        slotLookups: this._slotLookups,
+        tableVersion: this._tableVersion,
+        activeSlots: this._activeSlots,
       };
     }
 
@@ -1321,6 +2352,9 @@
       this._missingLookups = 0;
       this._totalInserts = 0;
       this._totalDeletes = 0;
+      this._slotWrites = 0;
+      this._elidedNoOpWrites = 0;
+      this._slotLookups = 0;
     }
   }
 
@@ -1338,6 +2372,7 @@
     TEXTURE_COMPRESSION_BC_FEATURE,
     BUFFER_ALIGNMENT_BYTES,
     UNIFORM_BUFFER_MIN_BYTES,
+    DEFAULT_FAST_SLOT_CAPACITY,
     isBcFormat,
     deviceSupportsBc,
     computeMaxMipLevels,
@@ -1372,6 +2407,7 @@
       TEXTURE_COMPRESSION_BC_FEATURE,
       BUFFER_ALIGNMENT_BYTES,
       UNIFORM_BUFFER_MIN_BYTES,
+      DEFAULT_FAST_SLOT_CAPACITY,
       isBcFormat,
       deviceSupportsBc,
       computeMaxMipLevels,
