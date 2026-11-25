@@ -202,6 +202,12 @@ impl Model {
             return ALL_FLAGS;
         }
         let needed = |target: u64| summaries.get(&target).copied().unwrap_or(ALL_FLAGS);
+        self.block_live_in(needed)[self.entry]
+    }
+
+    /// Flags live at the start of every block, given the flags each direct callee or tail-jump
+    /// target needs (least fixed point).
+    fn block_live_in(&self, needed: impl Fn(u64) -> FlagMask) -> Vec<FlagMask> {
         let mut live_in = vec![0 as FlagMask; self.blocks.len()];
         loop {
             let mut changed = false;
@@ -227,10 +233,55 @@ impl Model {
                 }
             }
             if !changed {
-                return live_in[self.entry];
+                return live_in;
             }
         }
     }
+}
+
+/// Per modelled instruction of `func` (by address), the flags whose value is dead right after
+/// it: every path from there overwrites them before anything can observe them (an instruction
+/// that reads them, an unmodelled instruction, a call to a callee that may observe them, a
+/// return, trap, dispatcher or tail jump to a target that may observe them). The lifter skips
+/// computing and storing those flags. `summaries` must be the ones the lifter uses for its direct
+/// calls and tail jumps (`None`: every call and tail jump stores every flag).
+pub(super) fn dead_after(
+    func: &cfg::Function,
+    summaries: Option<&FlagSummaries>,
+) -> BTreeMap<u64, FlagMask> {
+    let needed = |target: u64| summaries.map_or(ALL_FLAGS, |s| s.needed_by(target));
+    let model = Model::new(func);
+    let live_in = model.block_live_in(needed);
+    let mut dead = BTreeMap::new();
+    for (block, model_block) in func.blocks.values().zip(&model.blocks) {
+        let mut live = 0;
+        for exit in &model_block.exits {
+            live |= match *exit {
+                Exit::Block(j) => live_in[j],
+                Exit::Function(target) => needed(target),
+                Exit::Everything => ALL_FLAGS,
+            };
+        }
+        let (body, transfer) = match block.instructions.split_last() {
+            Some((last, rest)) if ends_in_transfer(block.terminator) => (rest, Some(last)),
+            _ => (&block.instructions[..], None),
+        };
+        if let (Terminator::Branch, Some(ins)) = (block.terminator, transfer) {
+            live |= read_mask(ins);
+        }
+        for ins in body.iter().rev() {
+            live = match instruction_step(block, ins) {
+                Step::Effect { gen_, kill } => {
+                    if ins.mnemonic() != Mnemonic::Call && flag_effect(ins).is_some() {
+                        dead.insert(ins.ip(), ALL_FLAGS & !live);
+                    }
+                    gen_ | (live & !kill)
+                }
+                Step::Call(target) => needed(target),
+            };
+        }
+    }
+    dead
 }
 
 fn block_model(block: &cfg::BasicBlock, index: &BTreeMap<u64, usize>) -> BlockModel {

@@ -605,6 +605,30 @@ fn truncating_imul64_result_is_a_plain_mul() {
     assert!(ir.contains("@__playgta6_umul128("), "{ir}");
 }
 
+#[test]
+fn flags_overwritten_before_any_reader_are_not_materialised() {
+    let func = asm_function(0x1000, |a| {
+        // Every flag of the add (and the imul's CF/OF) is overwritten by the sub.
+        a.add(rax, rcx)?;
+        a.imul_2(rax, rcx)?;
+        a.sub(rax, rdx)?;
+        // dec keeps CF: the sub's CF stays live up to the return, its other flags do not.
+        a.dec(rax)?;
+        a.ret()
+    });
+    let lifted = lift_function(&func).expect("lifts");
+    let ir = &lifted.ir;
+    // One parity (dec's PF), one AF chain (dec's), one CF (the sub's), no 128-bit high half.
+    assert_eq!(ir.matches("@llvm.ctpop.i8(").count(), 1, "{ir}");
+    assert_eq!(ir.matches(" = and i64 ").count(), 1, "{ir}");
+    assert_eq!(ir.matches("icmp ult i64").count(), 1, "{ir}");
+    assert!(!ir.contains("@__playgta6_umul128("), "{ir}");
+    // Every flag still reaches the state at the return.
+    for flag in 0..6 {
+        assert!(ir.contains(&format!("i32 2, i64 {flag}\n")), "{ir}");
+    }
+}
+
 /// A block built by hand (for CFG shapes discovery never produces).
 fn block(
     start: u64,
