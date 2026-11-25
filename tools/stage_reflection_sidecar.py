@@ -39,6 +39,8 @@ from typing import Any
 
 SCHEMA = "playgta6-stage-reflection"
 VERSION = 1
+MAX_VERSION = 2
+SUPPORTED_VERSIONS = (1, 2)
 REPORT_SCHEMA = "playgta6-stage-reflection-missing-sources"
 REPORT_VERSION = 1
 DEFAULT_MAX_SAMPLE_HASHES = 5
@@ -153,6 +155,36 @@ def cbv_heap_source_ok(source: dict[str, Any]) -> bool | None:
     return _u32(bit_offset) and bit_offset < 32 and _u32(mask) and mask != 0 and _u32(stride)
 
 
+def root_descriptor_source_ok(source: dict[str, Any]) -> bool | None:
+    """None: not a root_descriptor source; else whether user_sgpr and optional v2 table_byte_offset
+    (multiple of 32, G62 / #1471 / #482) are valid."""
+    if source.get("root_descriptor") is not True:
+        return None
+    if not _u32(source.get("user_sgpr")):
+        return False
+    if "table_byte_offset" in source:
+        tbo = source["table_byte_offset"]
+        return _u32(tbo) and tbo % 32 == 0
+    return True
+
+
+def _stages_require_v2(stages: dict[str, Any]) -> bool:
+    """Return True when any stage binding carries a v2-only root_descriptor table_byte_offset."""
+    for stage_obj in stages.values():
+        if not isinstance(stage_obj, dict):
+            continue
+        bindings = stage_obj.get("bindings")
+        if not isinstance(bindings, list):
+            continue
+        for binding in bindings:
+            if not isinstance(binding, dict):
+                continue
+            source = binding.get("source")
+            if isinstance(source, dict) and source.get("root_descriptor") is True and "table_byte_offset" in source:
+                return True
+    return False
+
+
 def inline_sampler_ok(source: dict[str, Any]) -> bool | None:
     """None: not an inline sampler; else whether sdwords is four 32-bit unsigned integers."""
     if "inline_sampler" not in source:
@@ -174,6 +206,8 @@ def convert(entry: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None, s
         source = b.get("source")
         if not isinstance(source, dict):
             return key, None, "binding without source"
+        if root_descriptor_source_ok(source) is False:
+            return key, None, "malformed root_descriptor source"
         if heap_source_ok(source) is False:
             return key, None, "malformed heap source"
         if inline_sampler_ok(source) is False:
@@ -453,7 +487,7 @@ def verify_sidecar_against_pack(
 
 
 def _load_sidecar(path: Path, *, label: str, allow_missing: bool) -> dict[str, Any]:
-    """Load and validate a v1 sidecar JSON file."""
+    """Load and validate a v1/v2 sidecar JSON file."""
     if not path.exists():
         if allow_missing:
             return {}
@@ -470,8 +504,8 @@ def _load_sidecar(path: Path, *, label: str, allow_missing: bool) -> dict[str, A
     if doc.get("schema") != SCHEMA:
         raise ValueError(f"{label} schema must be {SCHEMA!r}, got {_sanitize_label(doc.get('schema'), fallback='<invalid>')!r}")
     version = doc.get("version")
-    if type(version) is not int or version != VERSION:
-        raise ValueError(f"{label} version must be {VERSION}, got {version!r}")
+    if type(version) is not int or version not in SUPPORTED_VERSIONS:
+        raise ValueError(f"{label} version must be in {SUPPORTED_VERSIONS}, got {version!r}")
     stages = doc.get("stages")
     if not isinstance(stages, dict):
         raise ValueError(f"{label} 'stages' must be an object")
@@ -487,8 +521,16 @@ def _load_sidecar(path: Path, *, label: str, allow_missing: bool) -> dict[str, A
                 f"{label} stage {safe_k!r} has invalid stage "
                 f"{_sanitize_label(v.get('stage'), fallback='<invalid>')!r}"
             )
-        if not isinstance(v.get("bindings"), list):
+        bindings = v.get("bindings")
+        if not isinstance(bindings, list):
             raise ValueError(f"{label} stage {safe_k!r} must have a 'bindings' list")
+        if version >= 2:
+            for b in bindings:
+                if isinstance(b, dict) and isinstance(b.get("source"), dict):
+                    if root_descriptor_source_ok(b["source"]) is False:
+                        raise ValueError(
+                            f"{label} stage {safe_k!r} has malformed v2 root_descriptor source"
+                        )
         validated[k] = v
     return validated
 
@@ -660,7 +702,8 @@ def build(docs: list[Any], existing_stages: dict[str, Any] | None = None) -> tup
                 skipped[why] = skipped.get(why, 0) + 1
                 continue
             stages[key] = stage
-    return {"schema": SCHEMA, "version": VERSION, "stages": stages}, skipped
+    out_version = MAX_VERSION if _stages_require_v2(stages) else VERSION
+    return {"schema": SCHEMA, "version": out_version, "stages": stages}, skipped
 
 
 def build_missing_sources_report(

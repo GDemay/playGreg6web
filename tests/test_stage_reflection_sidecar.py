@@ -383,7 +383,8 @@ class SidecarTests(unittest.TestCase):
             "{not valid json",
             json.dumps([1, 2, 3]),
             json.dumps({"schema": "wrong-schema", "version": 1, "stages": {}}),
-            json.dumps({"schema": "playgta6-stage-reflection", "version": 2, "stages": {}}),
+            json.dumps({"schema": "playgta6-stage-reflection", "version": 0, "stages": {}}),
+            json.dumps({"schema": "playgta6-stage-reflection", "version": 3, "stages": {}}),
             json.dumps({"schema": "playgta6-stage-reflection", "version": True, "stages": {}}),
             json.dumps({"schema": "playgta6-stage-reflection", "version": 1, "stages": []}),
             json.dumps({
@@ -1347,6 +1348,161 @@ class SidecarTests(unittest.TestCase):
             self.assertEqual(summary["pack_verification"]["reflection_stage_count"], 1)
             self.assertEqual(summary["pack_verification"]["matched_hashes"], 1)
             self.assertEqual(summary["pack_verification"]["coverage_pct"], 50.0)
+
+    def test_v2_root_descriptor_table_byte_offset_accepted_and_upgrades_version(self):
+        # G62 (#1471 / #482): v2 root_descriptor sources may include a 32-byte-aligned table_byte_offset.
+        v2_entry = {
+            "hash_fnv1a64": "0x00000000000000e1",
+            "stage": "fragment",
+            "bindings": [
+                {
+                    "group": 0,
+                    "binding": 32,
+                    "kind": "uniform",
+                    "source": {"user_sgpr": 8, "root_descriptor": True, "table_byte_offset": 64},
+                },
+                {
+                    "group": 0,
+                    "binding": 33,
+                    "kind": "uniform",
+                    "source": {"user_sgpr": 10, "root_descriptor": True},
+                },
+                {
+                    "group": 0,
+                    "binding": 34,
+                    "kind": "uniform",
+                    "source": {"user_sgpr": 12, "root_descriptor": True, "table_byte_offset": 0},
+                },
+            ],
+        }
+        doc, skipped = sidecar.build([v2_entry])
+        self.assertEqual(skipped, {})
+        self.assertEqual(doc["schema"], "playgta6-stage-reflection")
+        self.assertEqual(doc["version"], 2)
+        bindings = doc["stages"]["0x00000000000000e1"]["bindings"]
+        self.assertEqual(bindings[0]["source"], {"user_sgpr": 8, "root_descriptor": True, "table_byte_offset": 64})
+        self.assertEqual(bindings[1]["source"], {"user_sgpr": 10, "root_descriptor": True})
+        self.assertEqual(bindings[2]["source"], {"user_sgpr": 12, "root_descriptor": True, "table_byte_offset": 0})
+
+        # Pure v1 root_descriptor (without table_byte_offset) stays version 1 for backward compatibility.
+        v1_only = {
+            "hash_fnv1a64": "0x00000000000000e2",
+            "stage": "compute",
+            "bindings": [
+                {
+                    "group": 0,
+                    "binding": 0,
+                    "kind": "uniform",
+                    "source": {"user_sgpr": 4, "root_descriptor": True},
+                }
+            ],
+        }
+        doc_v1, skipped_v1 = sidecar.build([v1_only])
+        self.assertEqual(skipped_v1, {})
+        self.assertEqual(doc_v1["version"], 1)
+
+    def test_v2_root_descriptor_non_multiple_of_32_offset_is_rejected(self):
+        bad_sources = [
+            {"user_sgpr": 8, "root_descriptor": True, "table_byte_offset": 4},
+            {"user_sgpr": 8, "root_descriptor": True, "table_byte_offset": 16},
+            {"user_sgpr": 8, "root_descriptor": True, "table_byte_offset": 36},
+            {"user_sgpr": 8, "root_descriptor": True, "table_byte_offset": -32},
+            {"user_sgpr": 8, "root_descriptor": True, "table_byte_offset": "32"},
+            {"user_sgpr": 8, "root_descriptor": True, "table_byte_offset": True},
+            {"root_descriptor": True, "table_byte_offset": 32},
+        ]
+        for idx, source in enumerate(bad_sources):
+            entry = {
+                "hash_fnv1a64": f"0x{idx + 128:016x}",
+                "stage": "fragment",
+                "bindings": [{"group": 0, "binding": 0, "kind": "uniform", "source": source}],
+            }
+            doc, skipped = sidecar.build([entry])
+            self.assertEqual(doc["stages"], {}, source)
+            self.assertEqual(skipped, {"malformed root_descriptor source": 1}, source)
+
+    def test_v2_sidecar_merge_diff_and_standalone_verify_roundtrip(self):
+        v2_doc = {
+            "schema": "playgta6-stage-reflection",
+            "version": 2,
+            "stages": {
+                "0x00000000000000e1": {
+                    "stage": "fragment",
+                    "bindings": [
+                        {
+                            "group": 0,
+                            "binding": 32,
+                            "kind": "uniform",
+                            "source": {"user_sgpr": 8, "root_descriptor": True, "table_byte_offset": 32},
+                        }
+                    ],
+                }
+            },
+        }
+        pack_bytes = build_synthetic_wgpk([
+            (0x00000000000000A1, "vertex", b"// vs"),
+            (0x00000000000000E1, "fragment", b"// fs"),
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            existing_v2 = Path(tmp) / "existing_v2.reflect.json"
+            src_v1 = Path(tmp) / "in_v1.json"
+            out_merged = Path(tmp) / "merged.reflect.json"
+            pack_path = Path(tmp) / "test.wgsl.pack"
+            existing_v2.write_text(json.dumps(v2_doc), encoding="utf-8")
+            src_v1.write_text(json.dumps(vertex_entry(True)), encoding="utf-8")
+            pack_path.write_bytes(pack_bytes)
+
+            # Merging a v1 entry onto an existing v2 sidecar preserves v2 and bumps output version to 2
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                rc = sidecar.main([
+                    str(src_v1),
+                    "--out", str(out_merged),
+                    "--merge-existing", str(existing_v2),
+                    "--diff-baseline", str(existing_v2),
+                    "--verify-pack", str(pack_path),
+                    "--json",
+                ])
+            self.assertEqual(rc, 0)
+            written = json.loads(out_merged.read_text(encoding="utf-8"))
+            self.assertEqual(written["version"], 2)
+            self.assertEqual(
+                written["stages"]["0x00000000000000e1"]["bindings"][0]["source"],
+                {"user_sgpr": 8, "root_descriptor": True, "table_byte_offset": 32},
+            )
+            summary = json.loads(stdout.getvalue())
+            self.assertEqual(summary["pack_verification"]["matched_hashes"], 2)
+            self.assertEqual(summary["diff"]["added_count"], 1)
+
+            # Standalone --verify-pack accepts v2 sidecar directly
+            stdout2 = io.StringIO()
+            with redirect_stdout(stdout2):
+                rc2 = sidecar.main(["--out", str(out_merged), "--verify-pack", str(pack_path), "--json"])
+            self.assertEqual(rc2, 0)
+            self.assertEqual(json.loads(stdout2.getvalue())["pack_verification"]["coverage_pct"], 100.0)
+
+            # Loading a v2 sidecar with a misaligned root_descriptor table_byte_offset fails cleanly
+            bad_v2 = Path(tmp) / "bad_v2.reflect.json"
+            bad_v2.write_text(json.dumps({
+                "schema": "playgta6-stage-reflection",
+                "version": 2,
+                "stages": {
+                    "0x00000000000000e9": {
+                        "stage": "fragment",
+                        "bindings": [{
+                            "group": 0,
+                            "binding": 0,
+                            "kind": "uniform",
+                            "source": {"user_sgpr": 8, "root_descriptor": True, "table_byte_offset": 12},
+                        }],
+                    }
+                },
+            }), encoding="utf-8")
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                rc_bad = sidecar.main(["--out", str(bad_v2), "--verify-pack", str(pack_path), "--json"])
+            self.assertEqual(rc_bad, 1)
+            self.assertIn("malformed v2 root_descriptor source", stderr.getvalue())
 
 
 if __name__ == "__main__":
