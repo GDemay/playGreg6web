@@ -15,6 +15,11 @@ const {
   DEFAULT_MAX_FILE_BYTES,
   DEFAULT_MAX_TOTAL_BYTES,
   DEFAULT_MAX_FILE_COUNT,
+  DEFAULT_MAX_QUARANTINE_FILES,
+  DEFAULT_MAX_QUARANTINE_BYTES,
+  DEFAULT_MAX_QUOTA_CLEANUP_STEPS,
+  TEMP_SUFFIX,
+  QUARANTINE_PREFIX,
   USERDATA_PREFIX,
   ARCHIVE_FORMAT,
   ARCHIVE_VERSION,
@@ -22,6 +27,8 @@ const {
   validateUserdataPrefix,
   encodeBase64,
   decodeBase64,
+  computeChecksum,
+  isQuotaExceededError,
 } = userdataMod;
 
 function createMemoryBackend(options = {}) {
@@ -1092,20 +1099,21 @@ test('W223: quota-safe write validation enforces maxFileBytes, maxTotalBytes, ma
   assert.equal(store.getStats().writes, 0);
 
   // Two valid writes up to total 90 bytes (fileCount = 2).
+  // Each crash-safe atomic save performs 2 backend puts (staged .tmp sibling + live commit).
   await store.saveFile('/userdata/a.bin', new Uint8Array(50), 10);
   await store.saveFile('/userdata/b.bin', new Uint8Array(40), 20);
-  assert.equal(backend.counts.put, 2);
+  assert.equal(backend.counts.put, 4);
 
-  // Exceeding maxFileCount (3 > 2) is rejected atomically.
+  // Exceeding maxFileCount (3 > 2) is rejected atomically without touching backend.
   await assert.rejects(
     () => store.saveFile('/userdata/c.bin', new Uint8Array(5)),
     (err) => err.code === 'QUOTA_EXCEEDED',
   );
-  assert.equal(backend.counts.put, 2);
+  assert.equal(backend.counts.put, 4);
 
   // Overwriting existing file a.bin from 50 -> 60 bytes brings total to 100 (allowed!).
   await store.saveFile('/userdata/a.bin', new Uint8Array(60), 30);
-  assert.equal(backend.counts.put, 3);
+  assert.equal(backend.counts.put, 6);
   assert.equal((await store.getQuotaInfo()).remainingBytes, 0);
 
   // Overwriting b.bin from 40 -> 41 bytes would exceed maxTotalBytes (101 > 100) -> rejected!
@@ -1313,4 +1321,453 @@ test('W223: concurrent writes serialize quota checks without overshooting maxTot
   assert.equal(rejected.length, 1);
   assert.equal(rejected[0].reason.code, 'QUOTA_EXCEEDED');
   assert.equal((await store.getQuotaInfo()).usedBytes, 35);
+});
+
+// --- W273: Crash-safe atomic writes, corrupt-record quarantine/recovery, and quota resilience ---
+
+function createFullRecordBackend(hooks = {}) {
+  const map = new Map();
+  const ops = [];
+  let closed = false;
+
+  const cloneRecord = (record) => ({
+    ...record,
+    data: record.data instanceof Uint8Array ? record.data.slice() : record.data,
+  });
+
+  return {
+    map,
+    ops,
+    isClosed: () => closed,
+    async put(record) {
+      ops.push({ op: 'put', path: record.path, staging: Boolean(record.staging) });
+      if (typeof hooks.onPut === 'function') {
+        const handled = await hooks.onPut(record, map, cloneRecord);
+        if (handled === true) return;
+      }
+      map.set(record.path, cloneRecord(record));
+    },
+    async get(key) {
+      ops.push({ op: 'get', path: key });
+      if (typeof hooks.onGet === 'function') {
+        const res = await hooks.onGet(key, map, cloneRecord);
+        if (res !== undefined) return res;
+      }
+      const rec = map.get(key);
+      return rec ? cloneRecord(rec) : null;
+    },
+    async delete(key) {
+      ops.push({ op: 'delete', path: key });
+      if (typeof hooks.onDelete === 'function') {
+        const handled = await hooks.onDelete(key, map);
+        if (handled === true) return;
+      }
+      map.delete(key);
+    },
+    async getAll() {
+      ops.push({ op: 'getAll' });
+      return Array.from(map.values()).map(cloneRecord);
+    },
+    close() {
+      closed = true;
+    },
+  };
+}
+
+test('W273: atomic temp-write-verify-commit stages .tmp sibling, verifies integrity, commits live entry, and cleans up .tmp', async () => {
+  assert.equal(TEMP_SUFFIX, '.tmp');
+  assert.equal(QUARANTINE_PREFIX, '__quarantine__/');
+  assert.equal(typeof computeChecksum, 'function');
+  assert.equal(typeof isQuotaExceededError, 'function');
+  assert.ok(DEFAULT_MAX_QUARANTINE_FILES > 0);
+  assert.ok(DEFAULT_MAX_QUARANTINE_BYTES > 0);
+  assert.ok(DEFAULT_MAX_QUOTA_CLEANUP_STEPS > 0);
+
+  const backend = createFullRecordBackend();
+  const store = new UserdataStore({ backend });
+
+  const calibrationBytes = new TextEncoder().encode(
+    JSON.stringify({
+      navigationExperience: 'standard',
+      uiTextSize: 'large',
+      legalNoticesAccepted: true,
+    }),
+  );
+
+  const res = await store.saveFile(
+    '/userdata/profiles/p0/calibration.json',
+    calibrationBytes,
+    1700100000000,
+  );
+  assert.deepEqual(res, {
+    path: '/userdata/profiles/p0/calibration.json',
+    size: calibrationBytes.byteLength,
+    mtime: 1700100000000,
+  });
+
+  // Confirm exact atomic order: stage .tmp -> verify readback .tmp -> commit live -> delete .tmp.
+  const writeOps = backend.ops.filter((o) => o.op !== 'getAll');
+  assert.deepEqual(writeOps, [
+    { op: 'put', path: '/userdata/profiles/p0/calibration.json.tmp', staging: true },
+    { op: 'get', path: '/userdata/profiles/p0/calibration.json.tmp' },
+    { op: 'put', path: '/userdata/profiles/p0/calibration.json', staging: false },
+    { op: 'delete', path: '/userdata/profiles/p0/calibration.json.tmp' },
+  ]);
+
+  // Temp artifact must be cleaned up; live record carries verified size + checksum.
+  assert.equal(backend.map.has('/userdata/profiles/p0/calibration.json.tmp'), false);
+  const liveRec = backend.map.get('/userdata/profiles/p0/calibration.json');
+  assert.ok(liveRec);
+  assert.equal(liveRec.size, calibrationBytes.byteLength);
+  assert.equal(liveRec.checksum, computeChecksum(calibrationBytes));
+  assert.deepEqual(liveRec.data, calibrationBytes);
+
+  const stats = store.getStats();
+  assert.equal(stats.atomicWrites, 1);
+  assert.equal(stats.writeVerifyFailures, 0);
+  assert.equal(stats.corruptRecoveries, 0);
+  assert.equal(stats.quotaErrors, 0);
+  assert.equal(stats.storedBytes, calibrationBytes.byteLength);
+});
+
+test('W273: simulated mid-write crash, silent truncation/bit-flip, and commit failure preserve prior valid save', async () => {
+  let failMode = null;
+  const backend = createFullRecordBackend({
+    onPut(record, map, cloneRecord) {
+      if (failMode === 'crash-stage-partial' && record.path.endsWith(TEMP_SUFFIX)) {
+        // Simulate partial/truncated write into .tmp before crashing mid-write.
+        map.set(record.path, {
+          ...cloneRecord(record),
+          data: record.data.slice(0, 4),
+        });
+        throw new Error('Simulated mid-write disk failure during .tmp staging');
+      }
+      if (failMode === 'silent-truncate-stage' && record.path.endsWith(TEMP_SUFFIX)) {
+        // Simulate silent truncation of staged bytes without throwing.
+        map.set(record.path, {
+          ...cloneRecord(record),
+          data: record.data.slice(0, Math.max(0, record.data.byteLength - 5)),
+        });
+        return true;
+      }
+      if (failMode === 'silent-bitflip-stage' && record.path.endsWith(TEMP_SUFFIX)) {
+        // Simulate 1-byte corruption in staged payload without changing length.
+        const corrupted = record.data.slice();
+        corrupted[0] ^= 0xff;
+        map.set(record.path, {
+          ...cloneRecord(record),
+          data: corrupted,
+        });
+        return true;
+      }
+      if (failMode === 'crash-live-commit' && !record.path.endsWith(TEMP_SUFFIX)) {
+        throw new Error('Simulated transaction abort during live commit');
+      }
+      return false;
+    },
+  });
+
+  const store = new UserdataStore({ backend });
+  const savePath = '/userdata/xgs/profile0/slot0.sav';
+  const v1Bytes = new TextEncoder().encode('VALID_SAVE_V1_PAYLOAD_INTACT');
+  const v2Bytes = new TextEncoder().encode('NEW_SAVE_V2_PAYLOAD_THAT_FAILS_MIDWRITE');
+
+  await store.saveFile(savePath, v1Bytes, 1000);
+  assert.equal(store.getStats().atomicWrites, 1);
+  assert.equal(store.getStats().storedBytes, v1Bytes.byteLength);
+
+  // 1. Mid-write crash during .tmp staging leaves prior v1 save intact and cleans up partial .tmp.
+  failMode = 'crash-stage-partial';
+  await assert.rejects(() => store.saveFile(savePath, v2Bytes, 2000), /Simulated mid-write/);
+  assert.equal(backend.map.has(`${savePath}${TEMP_SUFFIX}`), false);
+  assert.deepEqual((await store.getFile(savePath)).data, v1Bytes);
+  assert.equal(store.getStats().storedBytes, v1Bytes.byteLength);
+
+  // 2. Silent truncation in .tmp fails verification, increments writeVerifyFailures, cleans up .tmp, preserves v1.
+  failMode = 'silent-truncate-stage';
+  await assert.rejects(
+    () => store.saveFile(savePath, v2Bytes, 2001),
+    (err) => err.code === 'WRITE_VERIFY_FAILED',
+  );
+  assert.equal(backend.map.has(`${savePath}${TEMP_SUFFIX}`), false);
+  assert.equal(store.getStats().writeVerifyFailures, 1);
+  assert.deepEqual((await store.getFile(savePath)).data, v1Bytes);
+
+  // 3. Silent bit-flip in .tmp (same byte length, bad checksum) fails verification and preserves v1.
+  failMode = 'silent-bitflip-stage';
+  await assert.rejects(
+    () => store.saveFile(savePath, v2Bytes, 2002),
+    (err) => err.code === 'WRITE_VERIFY_FAILED',
+  );
+  assert.equal(backend.map.has(`${savePath}${TEMP_SUFFIX}`), false);
+  assert.equal(store.getStats().writeVerifyFailures, 2);
+  assert.deepEqual((await store.getFile(savePath)).data, v1Bytes);
+
+  // 4. Crash during live commit cleans up .tmp and preserves v1.
+  failMode = 'crash-live-commit';
+  await assert.rejects(() => store.saveFile(savePath, v2Bytes, 2003), /Simulated transaction abort/);
+  assert.equal(backend.map.has(`${savePath}${TEMP_SUFFIX}`), false);
+  assert.deepEqual((await store.getFile(savePath)).data, v1Bytes);
+  assert.equal(store.getStats().atomicWrites, 1);
+  assert.equal(store.getStats().storedBytes, v1Bytes.byteLength);
+
+  // 5. Simulated sudden tab close leaving orphaned .tmp in storage: next boot restores v1 and cleans orphan.
+  failMode = null;
+  backend.map.set(`${savePath}${TEMP_SUFFIX}`, {
+    path: `${savePath}${TEMP_SUFFIX}`,
+    data: v2Bytes.slice(0, 7),
+    mtime: 2004,
+    size: v2Bytes.byteLength,
+    staging: true,
+  });
+
+  const reopened = new UserdataStore({ backend });
+  const fsAdapter = createMockFsAdapter({ useMkdirTree: true });
+  const restoreRes = await reopened.restoreAll(fsAdapter);
+  assert.deepEqual(restoreRes, { restored: 1, skipped: 0, timedOut: false, error: null });
+  assert.deepEqual(fsAdapter.files.get(savePath), v1Bytes);
+  assert.equal(backend.map.has(`${savePath}${TEMP_SUFFIX}`), false);
+  assert.equal(reopened.getStats().corruptRecoveries, 1);
+  assert.equal(reopened.getStats().storedBytes, v1Bytes.byteLength);
+});
+
+test('W273: corrupt metadata, truncated records, checksum mismatches, and bad payloads are quarantined with clean fallback recovery', async () => {
+  const backend = createFullRecordBackend();
+  const store = new UserdataStore({ backend, maxQuarantineFiles: 3 });
+
+  const healthyBytes = new TextEncoder().encode('{"uiTextSize":"medium"}');
+  const truncPath = '/userdata/xgs/slot0/truncated.sav';
+  const bitflipPath = '/userdata/xgs/slot1/bitflip.sav';
+  const badMetaPath = '/userdata/profiles/p0/bad_meta.json';
+  const badPayloadPath = '/userdata/profiles/p0/bad_payload.bin';
+
+  await store.saveFile('/userdata/profiles/p0/healthy.json', healthyBytes, 1000);
+  await store.saveFile(truncPath, new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]), 1001);
+  await store.saveFile(bitflipPath, new Uint8Array([10, 20, 30, 40]), 1002);
+
+  // Corrupt stored records directly in backend to simulate storage corruption / crash damage.
+  const truncRec = backend.map.get(truncPath);
+  truncRec.data = truncRec.data.slice(0, 3); // size metadata says 8, actual bytes = 3
+
+  const flipRec = backend.map.get(bitflipPath);
+  flipRec.data[2] ^= 0x55; // checksum mismatch
+
+  backend.map.set(badMetaPath, {
+    path: badMetaPath,
+    data: new TextEncoder().encode('{}'),
+    mtime: Number.NaN,
+  });
+  backend.map.set(badPayloadPath, {
+    path: badPayloadPath,
+    data: null,
+    mtime: 1003,
+  });
+
+  // 1. Direct getFile() on truncated record quarantines it and returns null cleanly for fallback regeneration.
+  assert.equal(await store.getFile(truncPath), null);
+  assert.equal(backend.map.has(truncPath), false);
+  assert.equal(store.getStats().corruptRecoveries, 1);
+  // Second read returns null without double-counting recovery.
+  assert.equal(await store.getFile(truncPath), null);
+  assert.equal(store.getStats().corruptRecoveries, 1);
+
+  // 2. Direct getFile() on checksum-mismatched record quarantines it and returns null.
+  assert.equal(await store.getFile(bitflipPath), null);
+  assert.equal(backend.map.has(bitflipPath), false);
+  assert.equal(store.getStats().corruptRecoveries, 2);
+
+  // 3. Reopen fresh instance and run restoreAll(): quarantines remaining corrupt records, restores healthy save!
+  const freshStore = new UserdataStore({ backend, maxQuarantineFiles: 3 });
+  const fsAdapter = createMockFsAdapter({ useMkdirTree: true });
+  const restoreRes = await freshStore.restoreAll(fsAdapter);
+  assert.deepEqual(restoreRes, { restored: 1, skipped: 2, timedOut: false, error: null });
+  assert.deepEqual(fsAdapter.files.get('/userdata/profiles/p0/healthy.json'), healthyBytes);
+  assert.equal(fsAdapter.files.has(badMetaPath), false);
+  assert.equal(fsAdapter.files.has(badPayloadPath), false);
+  assert.equal(freshStore.getStats().corruptRecoveries, 2);
+  assert.equal(freshStore.getStats().storedBytes, healthyBytes.byteLength);
+
+  // Quarantine must be bounded to maxQuarantineFiles (3) even though 4 total corrupt records were quarantined.
+  const quarantined = await freshStore.listQuarantined();
+  assert.equal(quarantined.length, 3);
+  for (const entry of quarantined) {
+    assert.ok(entry.quarantineKey.startsWith(QUARANTINE_PREFIX));
+    assert.ok(entry.originalPath.startsWith(USERDATA_PREFIX));
+    assert.equal(typeof entry.reason, 'string');
+  }
+
+  // Quarantined records must never appear in live listings or usage stats.
+  assert.deepEqual(await freshStore.listByPrefix('/userdata/'), ['/userdata/profiles/p0/healthy.json']);
+  assert.equal((await freshStore.getUsageStats()).fileCount, 1);
+
+  // Caller can cleanly regenerate a previously quarantined save path afterwards.
+  const regenerated = new Uint8Array([9, 8, 7, 6]);
+  await freshStore.saveFile(truncPath, regenerated, 2000);
+  assert.deepEqual((await freshStore.getFile(truncPath)).data, regenerated);
+
+  // purgeQuarantine removes all quarantined records cleanly.
+  const purged = await freshStore.purgeQuarantine();
+  assert.equal(purged.removed, 3);
+  assert.deepEqual(await freshStore.listQuarantined(), []);
+});
+
+test('W273: QuotaExceededError resilience preserves prior committed saves and runs bounded quota-pressure cleanup', async () => {
+  // Backend with hard physical byte limit simulating browser storage quota exhaustion.
+  let hardByteLimit = 180;
+  const totalBackendBytes = (map) => {
+    let sum = 0;
+    for (const rec of map.values()) {
+      sum += rec.data instanceof Uint8Array ? rec.data.byteLength : 0;
+    }
+    return sum;
+  };
+
+  let quotaErrorStyle = 'dom';
+  const backend = createFullRecordBackend({
+    onPut(record, map, cloneRecord) {
+      const existing = map.get(record.path);
+      const prevSize = existing && existing.data instanceof Uint8Array ? existing.data.byteLength : 0;
+      const nextSize = record.data instanceof Uint8Array ? record.data.byteLength : 0;
+      if (totalBackendBytes(map) - prevSize + nextSize > hardByteLimit) {
+        if (quotaErrorStyle === 'firefox') {
+          const err = new Error('Storage quota reached');
+          err.name = 'NS_ERROR_DOM_QUOTA_REACHED';
+          err.code = 1014;
+          throw err;
+        }
+        const err = new Error('QuotaExceededError: storage limit reached');
+        err.name = 'QuotaExceededError';
+        throw err;
+      }
+      map.set(record.path, cloneRecord(record));
+      return true;
+    },
+  });
+
+  const store = new UserdataStore({ backend });
+  const profilePath = '/userdata/profiles/p0/profile.bin';
+  const profileV1 = new Uint8Array(60).fill(0x2a);
+  await store.saveFile(profilePath, profileV1, 1000);
+
+  // Inject stale orphaned .tmp (50B) and an old quarantined corrupt record (60B): total = 170B / 180B.
+  backend.map.set('/userdata/xgs/stale.sav.tmp', {
+    path: '/userdata/xgs/stale.sav.tmp',
+    data: new Uint8Array(50).fill(0xee),
+    mtime: 500,
+    staging: true,
+  });
+  backend.map.set(`${QUARANTINE_PREFIX}400-1-checksum_mismatch/xgs/old_corrupt.sav`, {
+    path: `${QUARANTINE_PREFIX}400-1-checksum_mismatch/xgs/old_corrupt.sav`,
+    originalPath: '/userdata/xgs/old_corrupt.sav',
+    reason: 'checksum_mismatch',
+    quarantinedAt: 400,
+    data: new Uint8Array(60).fill(0xcc),
+    mtime: 400,
+    quarantined: true,
+  });
+
+  // Saving a 40B calibration file initially exceeds 180B (170 + 40 = 210 > 180),
+  // so bounded quota-pressure cleanup reclaims stale .tmp + quarantine artifacts and succeeds!
+  const calBytes = new Uint8Array(40).fill(0x7b);
+  await store.saveFile('/userdata/profiles/p0/calibration.bin', calBytes, 1100);
+  assert.equal(backend.map.has('/userdata/xgs/stale.sav.tmp'), false);
+  assert.deepEqual((await store.getFile('/userdata/profiles/p0/calibration.bin')).data, calBytes);
+  assert.deepEqual((await store.getFile(profilePath)).data, profileV1);
+  assert.ok(store.getStats().quotaCleanups >= 1);
+
+  // Now shrink hardByteLimit so NO reclaimable artifacts remain and overwriting profile.bin hits QuotaExceededError.
+  hardByteLimit = 120; // currently storing 60B + 40B = 100B; staging 60B needs 160B > 120B
+  quotaErrorStyle = 'dom';
+  const profileV2 = new Uint8Array(60).fill(0x99);
+  await assert.rejects(
+    () => store.saveFile(profilePath, profileV2, 1200),
+    (err) => isQuotaExceededError(err),
+  );
+  // Prior committed v1 save AND calibration save remain 100% intact, with zero .tmp left behind.
+  assert.equal(backend.map.has(`${profilePath}${TEMP_SUFFIX}`), false);
+  assert.deepEqual((await store.getFile(profilePath)).data, profileV1);
+  assert.deepEqual((await store.getFile('/userdata/profiles/p0/calibration.bin')).data, calBytes);
+  assert.equal(store.getStats().quotaErrors, 1);
+  assert.equal(store.getStats().storedBytes, 100);
+
+  // Also verify Firefox NS_ERROR_DOM_QUOTA_REACHED is cleanly detected and preserves prior saves.
+  quotaErrorStyle = 'firefox';
+  await assert.rejects(
+    () => store.saveFile(profilePath, profileV2, 1300),
+    (err) => isQuotaExceededError(err),
+  );
+  assert.equal(store.getStats().quotaErrors, 2);
+  assert.deepEqual((await store.getFile(profilePath)).data, profileV1);
+});
+
+test('W273: getStats() exposes atomicWrites, writeVerifyFailures, corruptRecoveries, quotaErrors, storedBytes with clean resetStats()', async () => {
+  let corruptNextStage = false;
+  const backend = createFullRecordBackend({
+    onPut(record, map, cloneRecord) {
+      if (corruptNextStage && record.path.endsWith(TEMP_SUFFIX)) {
+        corruptNextStage = false;
+        map.set(record.path, {
+          ...cloneRecord(record),
+          data: record.data.slice(0, 1),
+        });
+        return true;
+      }
+      return false;
+    },
+  });
+
+  const store = new UserdataStore({
+    backend,
+    maxFileBytes: 64,
+    maxTotalBytes: 128,
+  });
+
+  const initial = store.getStats();
+  assert.equal(initial.atomicWrites, 0);
+  assert.equal(initial.writeVerifyFailures, 0);
+  assert.equal(initial.corruptRecoveries, 0);
+  assert.equal(initial.quotaErrors, 0);
+  assert.equal(initial.storedBytes, 0);
+
+  // 1 atomic write (20B)
+  await store.saveFile('/userdata/a.sav', new Uint8Array(20).fill(1), 100);
+  // 1 write verify failure
+  corruptNextStage = true;
+  await assert.rejects(() => store.saveFile('/userdata/b.sav', new Uint8Array(10).fill(2), 101));
+  // 1 quota error
+  await assert.rejects(
+    () => store.saveFile('/userdata/too_big.sav', new Uint8Array(65)),
+    (err) => isQuotaExceededError(err),
+  );
+  // 1 corrupt recovery
+  backend.map.set('/userdata/corrupt.sav', {
+    path: '/userdata/corrupt.sav',
+    data: new Uint8Array(4),
+    size: 99,
+    mtime: 102,
+  });
+  store.invalidateIndex();
+  assert.equal(await store.getFile('/userdata/corrupt.sav'), null);
+
+  // Hydrate index so storedBytes reflects live store accurately (20B).
+  await store.listByPrefix('/userdata/');
+
+  const stats = store.getStats();
+  assert.equal(stats.atomicWrites, 1);
+  assert.equal(stats.writeVerifyFailures, 1);
+  assert.equal(stats.corruptRecoveries, 1);
+  assert.equal(stats.quotaErrors, 1);
+  assert.equal(stats.storedBytes, 20);
+
+  // resetStats() clears cumulative counters while preserving live storedBytes / index state.
+  store.resetStats();
+  const afterReset = store.getStats();
+  assert.equal(afterReset.atomicWrites, 0);
+  assert.equal(afterReset.writeVerifyFailures, 0);
+  assert.equal(afterReset.corruptRecoveries, 0);
+  assert.equal(afterReset.quotaErrors, 0);
+  assert.equal(afterReset.quotaCleanups, 0);
+  assert.equal(afterReset.storedBytes, 20);
+  assert.equal(afterReset.indexReady, true);
+  assert.equal(afterReset.indexedFiles, 1);
 });
