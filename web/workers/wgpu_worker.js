@@ -165,19 +165,25 @@ const DEFAULT_OVERSIZED_RT_RECLAIM_INTERVAL_FRAMES = 2;
 const MAX_ZERO_ALLOC_RING_DRAIN_BATCHES = 64;
 const WGSL_GROUP0_RE = /@group\(\s*0\s*\)/;
 
-// W338: Throttled non-black swapchain luminance probe constants.
-// Samples 4 small horizontal strips (<= 64 px wide, bytesPerRow = 256) at
-// y = 20%, 50%, 70%, 92% (bottom-right) so it detects full-screen video, center
-// 6-star loading animation, AND the bottom-right OFFLINEPLAYER [A] bar.
+// W338 / W350: Throttled non-black swapchain luminance probe constants.
+// Samples an 8-strip horizontal grid (<= 64 px wide, bytesPerRow = 256 -> 2048 bytes total,
+// < 0.02 ms) across y = [15%, 35%, 50%, 65%, 80%, 89%, 92%, 95%] spanning center, left,
+// right, and bottom-right bands so it reliably detects full-screen video, center 6-star
+// loading animation, sparse menus, AND the bottom-right OFFLINEPLAYER [A] bar.
 const SWAPCHAIN_PROBE_DEFAULT_INTERVAL_MS = 250;
 const SWAPCHAIN_PROBE_STRIP_MAX_WIDTH = 64;
 const SWAPCHAIN_PROBE_BYTES_PER_ROW = 256;
-const SWAPCHAIN_PROBE_DEFAULT_LUMA_THRESHOLD = 12;
+const SWAPCHAIN_PROBE_DEFAULT_LUMA_THRESHOLD = 8;
+const SWAPCHAIN_PROBE_MAX_CONSECUTIVE_ERRORS = 3;
 const SWAPCHAIN_PROBE_STRIPS = Object.freeze([
-  Object.freeze({ yFraction: 0.2, xFraction: 0.5 }),
+  Object.freeze({ yFraction: 0.15, xFraction: 0.5 }),
+  Object.freeze({ yFraction: 0.35, xFraction: 0.25 }),
   Object.freeze({ yFraction: 0.5, xFraction: 0.5 }),
-  Object.freeze({ yFraction: 0.7, xFraction: 0.5 }),
+  Object.freeze({ yFraction: 0.65, xFraction: 0.75 }),
+  Object.freeze({ yFraction: 0.8, xFraction: 0.5 }),
+  Object.freeze({ yFraction: 0.89, xFraction: 0.9 }),
   Object.freeze({ yFraction: 0.92, xFraction: 0.9 }),
+  Object.freeze({ yFraction: 0.95, xFraction: 0.9 }),
 ]);
 const SWAPCHAIN_PROBE_BUFFER_SIZE =
   SWAPCHAIN_PROBE_STRIPS.length * SWAPCHAIN_PROBE_BYTES_PER_ROW;
@@ -2008,6 +2014,9 @@ class WgpuCommandProcessor {
     this._swapchainProbeInFlight = false;
     this._swapchainProbeLastStartMs = -Infinity;
     this._swapchainProbeCount = 0;
+    this._swapchainProbeErrorCount = 0;
+    this._swapchainProbeConsecutiveErrors = 0;
+    this._swapchainProbeFallbackWarned = false;
     this._swapchainProbeGeneration = 0;
     this._uniformRingFrameIndex = -1;
     this._stagingSceneTransitionTrimBytes = 0;
@@ -2698,6 +2707,18 @@ class WgpuCommandProcessor {
 
   get swapchainProbeInFlight() {
     return this._swapchainProbeInFlight;
+  }
+
+  get swapchainProbeSupported() {
+    return this._swapchainProbeSupported;
+  }
+
+  get swapchainProbeErrorCount() {
+    return this._swapchainProbeErrorCount;
+  }
+
+  get swapchainProbeConsecutiveErrors() {
+    return this._swapchainProbeConsecutiveErrors;
   }
 
   setFrameLuminanceMeta(meta) {
@@ -5012,13 +5033,116 @@ class WgpuCommandProcessor {
   }
 
   /**
-   * W338: Encode 4 tiny 1-row horizontal strip copies from the presented swapchain texture
-   * into the pre-allocated 1024-byte staging buffer (y = 20%, 50%, 70%, 92% bottom-right).
+   * W350: Record a swapchain luminance probe copy/map/read error. After
+   * `SWAPCHAIN_PROBE_MAX_CONSECUTIVE_ERRORS` (3) consecutive failures, log a sanitized warning
+   * once, mark `_swapchainProbeSupported = false`, destroy the staging buffer, and fall back
+   * cleanly so the splash overlay can never hang permanently.
+   *
+   * @param {string} stage
+   * @param {unknown} err
+   * @param {object | null} [probeTarget]
+   * @returns {boolean} True when the probe was disabled after hitting the consecutive error cap.
+   */
+  _recordSwapchainProbeError(stage, err, probeTarget = null, opts = null) {
+    this._swapchainProbeErrorCount += 1;
+    this._swapchainProbeConsecutiveErrors += 1;
+    if (this._swapchainProbeConsecutiveErrors < SWAPCHAIN_PROBE_MAX_CONSECUTIVE_ERRORS) {
+      return false;
+    }
+    if (!this._swapchainProbeFallbackWarned) {
+      this._swapchainProbeFallbackWarned = true;
+      const detail = sanitizeValidationErrorMessage(sanitizeGpuErrorDetail(err));
+      this._logDiagnostic(
+        'warn',
+        `[wgpu_worker] swapchain luminance probe disabled after ${this._swapchainProbeConsecutiveErrors} consecutive ${stage || 'probe'} failures${detail ? `: ${detail}` : ''}`
+      );
+    }
+    this._swapchainProbeSupported = false;
+    this._destroySwapchainProbeBuffer();
+
+    const allowImmediateFallback = !(opts && opts.allowImmediateFallback === false);
+    const realPackDrawsThisFrame = probeTarget
+      ? toNonNegativeInt(probeTarget.realPackDrawsThisFrame, 0)
+      : 0;
+    const fallbackDrawsThisFrame = probeTarget
+      ? toNonNegativeInt(probeTarget.fallbackDrawsThisFrame, 0)
+      : 0;
+    const drawsThisFrame = probeTarget ? toNonNegativeInt(probeTarget.drawsThisFrame, 0) : 0;
+    const hasPresentedDraw =
+      this._presentCount > 0 &&
+      (this._realPackDrawCount > 0 ||
+        this._drawCallCount > 0 ||
+        realPackDrawsThisFrame > 0 ||
+        drawsThisFrame > 0);
+    if (
+      allowImmediateFallback &&
+      !this._destroyed &&
+      !this._firstVisibleFrameNotified &&
+      this._requireNonBlackFrameExplicit !== true &&
+      hasPresentedDraw
+    ) {
+      const visibleTs = this._getNowMs();
+      const firstPresentMs = this._firstPresentMs !== null ? this._firstPresentMs : visibleTs;
+      const blackLoadingMs = Math.max(0, visibleTs - firstPresentMs);
+      this._firstVisibleFrameMs = visibleTs;
+      this._blackLoadingMs = blackLoadingMs;
+      if (this._swapchain && !this._swapchain.isDestroyed) {
+        if (typeof this._swapchain.confirmVisibleFrame === 'function') {
+          try {
+            this._swapchain.confirmVisibleFrame({
+              timestampMs: visibleTs,
+              realPackDraws: realPackDrawsThisFrame || this._realPackDrawCount,
+            });
+          } catch (_) {
+            // Swapchain telemetry must never break frame presentation.
+          }
+        } else if (typeof this._swapchain.markFrameContent === 'function') {
+          try {
+            this._swapchain.markFrameContent({
+              hasVisibleContent: true,
+              hasDraws: true,
+              nonClearDraw: true,
+              realPackDraws: realPackDrawsThisFrame || this._realPackDrawCount,
+              timestampMs: visibleTs,
+            });
+          } catch (_) {
+            // Ignore custom mock swapchain errors.
+          }
+        }
+      }
+      this._notifyFirstVisibleFrame({
+        type: 'first-visible-frame',
+        firstVisibleFrame: true,
+        firstVisibleFrameMs: visibleTs,
+        firstPresentMs,
+        blackLoadingMs,
+        presentCount: this._presentCount,
+        realPackDrawsThisFrame,
+        fallbackDrawsThisFrame,
+        drawsThisFrame,
+        source: 'swapchain-probe-fallback',
+        maxLuma: this._lastSampledMaxLuma,
+        suppressedBlackFrames: this._suppressedBlackFrames,
+        swapchainProbeErrorCount: this._swapchainProbeErrorCount,
+        gpuAdapter: this._gpuAdapter ? { ...this._gpuAdapter } : null,
+      });
+    }
+    return true;
+  }
+
+  /**
+   * W338 / W350: Encode 8 tiny 1-row horizontal strip copies from the presented swapchain texture
+   * into the pre-allocated 2048-byte staging buffer covering center/left/right/bottom-right.
    */
   _encodeSwapchainProbeCopies(encoder, texture, probeCap, startMs, summary) {
     const { buffer, texWidth, texHeight } = probeCap;
     const stripWidth = Math.max(1, Math.min(SWAPCHAIN_PROBE_STRIP_MAX_WIDTH, texWidth));
     const maxOriginX = Math.max(0, texWidth - stripWidth);
+    const probeSummary = {
+      realPackDrawsThisFrame: summary ? summary.realPackDrawsThisFrame : 0,
+      fallbackDrawsThisFrame: summary ? summary.fallbackDrawsThisFrame : 0,
+      drawsThisFrame: summary ? summary.drawsThisFrame : 0,
+    };
     try {
       for (let s = 0; s < SWAPCHAIN_PROBE_STRIPS.length; s += 1) {
         const strip = SWAPCHAIN_PROBE_STRIPS[s];
@@ -5046,7 +5170,10 @@ class WgpuCommandProcessor {
           }
         );
       }
-    } catch (_) {
+    } catch (err) {
+      this._recordSwapchainProbeError('copyTextureToBuffer', err, probeSummary, {
+        allowImmediateFallback: false,
+      });
       return null;
     }
     return {
@@ -5054,14 +5181,14 @@ class WgpuCommandProcessor {
       stripWidth,
       stripCount: SWAPCHAIN_PROBE_STRIPS.length,
       startMs,
-      realPackDrawsThisFrame: summary ? summary.realPackDrawsThisFrame : 0,
-      fallbackDrawsThisFrame: summary ? summary.fallbackDrawsThisFrame : 0,
-      drawsThisFrame: summary ? summary.drawsThisFrame : 0,
+      realPackDrawsThisFrame: probeSummary.realPackDrawsThisFrame,
+      fallbackDrawsThisFrame: probeSummary.fallbackDrawsThisFrame,
+      drawsThisFrame: probeSummary.drawsThisFrame,
     };
   }
 
   /**
-   * W338: Start the non-overlapping async GPUBuffer.mapAsync readback after queue.submit().
+   * W338 / W350: Start the non-overlapping async GPUBuffer.mapAsync readback after queue.submit().
    * Scans RGB channels (i+0, i+1, i+2; ignoring alpha i+3) for both bgra8unorm and rgba8unorm.
    * Immediately emits `first-visible-frame` and destroys the staging buffer on any pixel > threshold.
    */
@@ -5090,15 +5217,17 @@ class WgpuCommandProcessor {
     let mapPromise;
     try {
       mapPromise = buf.mapAsync(mapReadMode);
-    } catch (_) {
+    } catch (err) {
       if (gen === this._swapchainProbeGeneration) {
         this._swapchainProbeInFlight = false;
+        this._recordSwapchainProbeError('mapAsync', err, probeTarget);
       }
       return false;
     }
     if (!mapPromise || typeof mapPromise.then !== 'function') {
       if (gen === this._swapchainProbeGeneration) {
         this._swapchainProbeInFlight = false;
+        this._recordSwapchainProbeError('mapAsync', 'mapAsync did not return a Promise', probeTarget);
       }
       return false;
     }
@@ -5130,6 +5259,7 @@ class WgpuCommandProcessor {
         let maxRgb = 0;
         let foundNonBlack = false;
         let readOk = false;
+        let readErr = null;
         try {
           const range = buf.getMappedRange(0, SWAPCHAIN_PROBE_BUFFER_SIZE);
           if (range) {
@@ -5152,8 +5282,8 @@ class WgpuCommandProcessor {
               }
             }
           }
-        } catch (_) {
-          // Ignore mapped range errors on lost/destroyed buffers.
+        } catch (err) {
+          readErr = err;
         } finally {
           try {
             if (!buf.destroyed && typeof buf.unmap === 'function') {
@@ -5167,10 +5297,19 @@ class WgpuCommandProcessor {
           }
         }
 
-        if (!readOk || this._destroyed || this._firstVisibleFrameNotified) {
+        if (this._destroyed || this._firstVisibleFrameNotified) {
+          return;
+        }
+        if (!readOk) {
+          this._recordSwapchainProbeError(
+            'getMappedRange',
+            readErr || 'getMappedRange returned empty range',
+            probeTarget
+          );
           return;
         }
 
+        this._swapchainProbeConsecutiveErrors = 0;
         this._lastSampledMaxLuma = maxRgb;
         if (foundNonBlack) {
           const visibleTs = this._getNowMs();
@@ -5224,9 +5363,12 @@ class WgpuCommandProcessor {
           this._suppressedBlackFrames += 1;
         }
       },
-      () => {
+      (err) => {
         if (gen === this._swapchainProbeGeneration) {
           this._swapchainProbeInFlight = false;
+          if (!this._destroyed && !this._firstVisibleFrameNotified) {
+            this._recordSwapchainProbeError('mapAsync', err || 'mapAsync rejected', probeTarget);
+          }
         }
       }
     );
@@ -6175,6 +6317,8 @@ class WgpuCommandProcessor {
     this._destroySwapchainProbeBuffer();
     this._swapchainProbeSupported = null;
     this._swapchainProbeLastStartMs = -Infinity;
+    this._swapchainProbeConsecutiveErrors = 0;
+    this._swapchainProbeFallbackWarned = false;
     this._pendingEncoder = null;
     this._hasPendingUploadCommands = false;
     this._passCommands = [];
@@ -9735,6 +9879,18 @@ class WgpuCommandProcessor {
         preSummary.realPackDrawsThisFrame > 0 ||
         preSummary.hasNonClearDraw;
       if (swapchainProbeActive || hasDrawCandidate) {
+        if (
+          activeSwapchain &&
+          typeof activeSwapchain.ensureCopySrcUsage === 'function' &&
+          activeSwapchain.hasCopySrcUsage === false &&
+          this._swapchainProbeSupported !== false
+        ) {
+          try {
+            activeSwapchain.ensureCopySrcUsage();
+          } catch (_) {
+            // Ignore best-effort COPY_SRC restore errors.
+          }
+        }
         const probeCap = this._resolveSwapchainProbeCapability(encoder, canvasTexture);
         if (probeCap !== null) {
           swapchainProbeActive = true;
@@ -9751,6 +9907,9 @@ class WgpuCommandProcessor {
                 probeNowMs,
                 preSummary
               );
+              if (this._swapchainProbeSupported === false) {
+                swapchainProbeActive = false;
+              }
             }
           }
         }
@@ -10659,6 +10818,8 @@ class WgpuCommandProcessor {
       lastSampledMaxLuma: this._lastSampledMaxLuma,
       swapchainProbeCount: this._swapchainProbeCount,
       swapchainProbeInFlight: this._swapchainProbeInFlight,
+      swapchainProbeSupported: this._swapchainProbeSupported,
+      swapchainProbeErrorCount: this._swapchainProbeErrorCount,
       gpuAdapter: this._gpuAdapter ? { ...this._gpuAdapter } : null,
       chunkedWriteBufferUploads: this._chunkedWriteBufferUploads,
       packetCount: this._packetCount,
@@ -11719,6 +11880,46 @@ function buildGpuTelemetrySnapshot(processor, options = {}) {
       stats && stats.gpuAdapter && typeof stats.gpuAdapter === 'object'
         ? sanitizeGpuAdapterInfo(stats.gpuAdapter)
         : null;
+    // W350: Surface swapchain luminance probe diagnostics directly in gpu-telemetry.
+    snapshot.swapchainProbeCount = toNonNegativeInt(
+      stats && stats.swapchainProbeCount !== undefined
+        ? stats.swapchainProbeCount
+        : processor && processor.swapchainProbeCount,
+      0
+    );
+    snapshot.swapchainProbeInFlight = Boolean(
+      stats && stats.swapchainProbeInFlight !== undefined
+        ? stats.swapchainProbeInFlight
+        : processor && processor.swapchainProbeInFlight
+    );
+    const rawProbeSupported =
+      stats && stats.swapchainProbeSupported !== undefined
+        ? stats.swapchainProbeSupported
+        : processor && processor.swapchainProbeSupported !== undefined
+          ? processor.swapchainProbeSupported
+          : null;
+    snapshot.swapchainProbeSupported =
+      typeof rawProbeSupported === 'boolean' ? rawProbeSupported : null;
+    snapshot.swapchainProbeErrorCount = toNonNegativeInt(
+      stats && stats.swapchainProbeErrorCount !== undefined
+        ? stats.swapchainProbeErrorCount
+        : processor && processor.swapchainProbeErrorCount,
+      0
+    );
+    const rawLastMaxLuma =
+      stats && stats.lastSampledMaxLuma !== undefined
+        ? stats.lastSampledMaxLuma
+        : processor && processor.lastSampledMaxLuma;
+    snapshot.lastSampledMaxLuma =
+      typeof rawLastMaxLuma === 'number' && Number.isFinite(rawLastMaxLuma)
+        ? Math.max(0, Math.min(255, Math.floor(rawLastMaxLuma)))
+        : 0;
+    snapshot.suppressedBlackFrames = toNonNegativeInt(
+      stats && stats.suppressedBlackFrames !== undefined
+        ? stats.suppressedBlackFrames
+        : processor && processor.suppressedBlackFrames,
+      0
+    );
     // W295: Sanitized 30 FPS hot-path telemetry (W286/W285/W284/W281/W268/W267).
     const perf30Fps = resolve30FpsTelemetry(processor, stats);
     snapshot.fps30ComplianceRate = perf30Fps.fps30ComplianceRate;
@@ -12402,6 +12603,12 @@ function createWgpuWorkerHandler(options = {}) {
     ) {
       payload.suppressedBlackFrames = toNonNegativeInt(info.suppressedBlackFrames, 0);
     }
+    if (
+      typeof info.swapchainProbeErrorCount === 'number' &&
+      Number.isFinite(info.swapchainProbeErrorCount)
+    ) {
+      payload.swapchainProbeErrorCount = toNonNegativeInt(info.swapchainProbeErrorCount, 0);
+    }
     postMessage(payload);
     if (onFirstVisibleFrame) {
       try {
@@ -13006,6 +13213,12 @@ function createWgpuWorkerHandler(options = {}) {
           ? options.swapchain
           : null;
 
+    const wantCopySrcForProbe =
+      initPayload.requireNonBlackFrame !== false &&
+      initPayload.requireNonBlackPixels !== false &&
+      options.requireNonBlackFrame !== false &&
+      options.requireNonBlackPixels !== false;
+
     let activeSwapchain = null;
     let ownsSwapchain = false;
     if (injectedSwapchain) {
@@ -13020,6 +13233,16 @@ function createWgpuWorkerHandler(options = {}) {
           devicePixelRatio: initPayload.devicePixelRatio || 1,
           format,
         });
+      } else if (
+        wantCopySrcForProbe &&
+        activeSwapchain.hasCopySrcUsage === false &&
+        typeof activeSwapchain.ensureCopySrcUsage === 'function'
+      ) {
+        try {
+          activeSwapchain.ensureCopySrcUsage();
+        } catch (_) {
+          // Ignore best-effort COPY_SRC enablement on injected swapchain.
+        }
       }
     } else if (enableSwapchain) {
       const injectedSwapchainCtor =
@@ -13050,6 +13273,7 @@ function createWgpuWorkerHandler(options = {}) {
                 : options.enableDepth !== undefined
                   ? Boolean(options.enableDepth)
                   : false,
+            preserveCopySrcUntilVisible: wantCopySrcForProbe,
             now: telemetryNow,
           };
           activeSwapchain = new SwapchainCtor(swapOpts);
@@ -13361,8 +13585,31 @@ function createWgpuWorkerHandler(options = {}) {
         ) {
           activeSwapchain.resize(nextW, nextH, payload.devicePixelRatio || 1);
         } else {
+          const dimChanged = canvas.width !== nextW || canvas.height !== nextH;
           canvas.width = nextW;
           canvas.height = nextH;
+          if (
+            dimChanged &&
+            processor &&
+            !processor.firstVisibleFrame &&
+            processor._swapchainProbeSupported !== false &&
+            processor.ctx &&
+            processor.device
+          ) {
+            const resizeCfg = {
+              device: processor.device,
+              format: processor.format,
+              alphaMode: 'opaque',
+            };
+            if (processor._swapchainViewFormat) {
+              resizeCfg.viewFormats = [processor._swapchainViewFormat];
+            }
+            try {
+              configureCanvasContextWithCopySrc(processor.ctx, resizeCfg);
+            } catch (_) {
+              // Ignore best-effort raw canvas reconfigure errors.
+            }
+          }
         }
         if (processor && typeof processor.onResize === 'function') {
           processor.onResize(nextW, nextH);
@@ -13491,6 +13738,22 @@ function createWgpuWorkerHandler(options = {}) {
               Number.isFinite(stats.blackLoadingMs)
                 ? stats.blackLoadingMs
                 : null,
+            swapchainProbeCount: stats ? toNonNegativeInt(stats.swapchainProbeCount, 0) : 0,
+            swapchainProbeInFlight: Boolean(stats && stats.swapchainProbeInFlight === true),
+            swapchainProbeSupported:
+              stats && typeof stats.swapchainProbeSupported === 'boolean'
+                ? stats.swapchainProbeSupported
+                : null,
+            swapchainProbeErrorCount: stats
+              ? toNonNegativeInt(stats.swapchainProbeErrorCount, 0)
+              : 0,
+            lastSampledMaxLuma:
+              stats &&
+              typeof stats.lastSampledMaxLuma === 'number' &&
+              Number.isFinite(stats.lastSampledMaxLuma)
+                ? Math.max(0, Math.min(255, Math.floor(stats.lastSampledMaxLuma)))
+                : 0,
+            suppressedBlackFrames: stats ? toNonNegativeInt(stats.suppressedBlackFrames, 0) : 0,
             gpuAdapter: (stats && stats.gpuAdapter) || getActiveGpuAdapter(),
             chunkedWriteBufferUploads: stats
               ? toNonNegativeInt(stats.chunkedWriteBufferUploads, 0)
@@ -13816,6 +14079,8 @@ const exportedApi = {
   buildMergedBinkPresenterOptions,
   configureCanvasContextWithCopySrc,
   SWAPCHAIN_PROBE_DEFAULT_INTERVAL_MS,
+  SWAPCHAIN_PROBE_DEFAULT_LUMA_THRESHOLD,
+  SWAPCHAIN_PROBE_MAX_CONSECUTIVE_ERRORS,
   SWAPCHAIN_PROBE_STRIPS,
   SWAPCHAIN_PROBE_BYTES_PER_ROW,
   SWAPCHAIN_PROBE_BUFFER_SIZE,

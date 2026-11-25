@@ -1851,6 +1851,12 @@ export function bootstrapPlayGta6App(options = {}) {
     firstVisibleFrameMs: null,
     blackLoadingMs: null,
     loadingAssets: false,
+    swapchainProbeCount: 0,
+    swapchainProbeInFlight: false,
+    swapchainProbeSupported: null,
+    swapchainProbeErrorCount: 0,
+    lastSampledMaxLuma: 0,
+    suppressedBlackFrames: 0,
   };
 
   const audioTelemetry = {
@@ -3682,6 +3688,12 @@ export function bootstrapPlayGta6App(options = {}) {
       lastValidationErrorMessage: gpuTelemetry.lastValidationErrorMessage,
       hasVisibleContent: gpuTelemetry.hasVisibleContent,
       loadingAssets,
+      swapchainProbeCount: gpuTelemetry.swapchainProbeCount,
+      swapchainProbeInFlight: gpuTelemetry.swapchainProbeInFlight,
+      swapchainProbeSupported: gpuTelemetry.swapchainProbeSupported,
+      swapchainProbeErrorCount: gpuTelemetry.swapchainProbeErrorCount,
+      lastSampledMaxLuma: gpuTelemetry.lastSampledMaxLuma,
+      suppressedBlackFrames: gpuTelemetry.suppressedBlackFrames,
     };
     if (gpuTelemetry.gpuAdapter !== null) {
       payload.gpuAdapter = gpuTelemetry.gpuAdapter;
@@ -4352,6 +4364,71 @@ export function bootstrapPlayGta6App(options = {}) {
       matchedW83Field = true;
     }
 
+    const probeCountField = pickFirstDefinedField(sources, [
+      'swapchainProbeCount',
+      'swapchain_probe_count',
+    ]);
+    if (probeCountField.found && probeCountField.value !== null) {
+      gpuTelemetry.swapchainProbeCount = toSafeNonNegativeInt(probeCountField.value, 0);
+      matchedW83Field = true;
+    }
+
+    const probeInFlightField = pickFirstDefinedField(sources, [
+      'swapchainProbeInFlight',
+      'swapchain_probe_in_flight',
+    ]);
+    if (probeInFlightField.found && typeof probeInFlightField.value === 'boolean') {
+      gpuTelemetry.swapchainProbeInFlight = probeInFlightField.value;
+      matchedW83Field = true;
+    }
+
+    const probeSupportedField = pickFirstDefinedField(sources, [
+      'swapchainProbeSupported',
+      'swapchain_probe_supported',
+    ]);
+    if (probeSupportedField.found) {
+      if (typeof probeSupportedField.value === 'boolean') {
+        gpuTelemetry.swapchainProbeSupported = probeSupportedField.value;
+        matchedW83Field = true;
+      } else if (probeSupportedField.value === null) {
+        gpuTelemetry.swapchainProbeSupported = null;
+      }
+    }
+
+    const probeErrorCountField = pickFirstDefinedField(sources, [
+      'swapchainProbeErrorCount',
+      'swapchain_probe_error_count',
+    ]);
+    if (probeErrorCountField.found && probeErrorCountField.value !== null) {
+      gpuTelemetry.swapchainProbeErrorCount = toSafeNonNegativeInt(probeErrorCountField.value, 0);
+      matchedW83Field = true;
+    }
+
+    const maxLumaField = pickFirstDefinedField(sources, [
+      'lastSampledMaxLuma',
+      'last_sampled_max_luma',
+      'maxLuma',
+      'max_luma',
+    ]);
+    if (
+      maxLumaField.found &&
+      typeof maxLumaField.value === 'number' &&
+      Number.isFinite(maxLumaField.value) &&
+      maxLumaField.value >= 0
+    ) {
+      gpuTelemetry.lastSampledMaxLuma = Math.min(255, Math.floor(maxLumaField.value));
+      matchedW83Field = true;
+    }
+
+    const suppressedBlackField = pickFirstDefinedField(sources, [
+      'suppressedBlackFrames',
+      'suppressed_black_frames',
+    ]);
+    if (suppressedBlackField.found && suppressedBlackField.value !== null) {
+      gpuTelemetry.suppressedBlackFrames = toSafeNonNegativeInt(suppressedBlackField.value, 0);
+      matchedW83Field = true;
+    }
+
     return matchedW83Field;
   }
 
@@ -5004,11 +5081,37 @@ export function bootstrapPlayGta6App(options = {}) {
         data.firstVisibleFrameMs !== undefined
           ? data.firstVisibleFrameMs
           : data.first_visible_frame_ms;
-      const rawMaxLuma = data.maxLuma !== undefined ? data.maxLuma : data.max_luma;
+      const rawMaxLuma =
+        data.maxLuma !== undefined
+          ? data.maxLuma
+          : data.max_luma !== undefined
+            ? data.max_luma
+            : data.lastSampledMaxLuma;
       const rawSuppressedBlackFrames =
         data.suppressedBlackFrames !== undefined
           ? data.suppressedBlackFrames
           : data.suppressed_black_frames;
+      const rawProbeErrorCount =
+        data.swapchainProbeErrorCount !== undefined
+          ? data.swapchainProbeErrorCount
+          : data.swapchain_probe_error_count;
+      if (typeof rawMaxLuma === 'number' && Number.isFinite(rawMaxLuma) && rawMaxLuma >= 0) {
+        gpuTelemetry.lastSampledMaxLuma = Math.min(255, Math.floor(rawMaxLuma));
+      }
+      if (
+        typeof rawSuppressedBlackFrames === 'number' &&
+        Number.isFinite(rawSuppressedBlackFrames) &&
+        rawSuppressedBlackFrames >= 0
+      ) {
+        gpuTelemetry.suppressedBlackFrames = Math.floor(rawSuppressedBlackFrames);
+      }
+      if (
+        typeof rawProbeErrorCount === 'number' &&
+        Number.isFinite(rawProbeErrorCount) &&
+        rawProbeErrorCount >= 0
+      ) {
+        gpuTelemetry.swapchainProbeErrorCount = Math.floor(rawProbeErrorCount);
+      }
       notifyFirstVisibleFrame({
         source: sanitizeDiagnosticText(data.source || data.type, 64) || data.type,
         ...(typeof data.elapsedMs === 'number' && Number.isFinite(data.elapsedMs) && data.elapsedMs >= 0
@@ -7711,6 +7814,18 @@ export function bootstrapPlayGta6App(options = {}) {
       hasVisibleContent: Boolean(gpuTelemetry.hasVisibleContent),
       firstVisibleFrameMs,
       blackLoadingMs,
+      swapchainProbeCount: toSafeNonNegativeInt(gpuTelemetry.swapchainProbeCount, 0),
+      swapchainProbeInFlight: Boolean(gpuTelemetry.swapchainProbeInFlight),
+      swapchainProbeSupported:
+        typeof gpuTelemetry.swapchainProbeSupported === 'boolean'
+          ? gpuTelemetry.swapchainProbeSupported
+          : null,
+      swapchainProbeErrorCount: toSafeNonNegativeInt(gpuTelemetry.swapchainProbeErrorCount, 0),
+      lastSampledMaxLuma: Math.max(
+        0,
+        Math.min(255, toSafeNonNegativeInt(gpuTelemetry.lastSampledMaxLuma, 0))
+      ),
+      suppressedBlackFrames: toSafeNonNegativeInt(gpuTelemetry.suppressedBlackFrames, 0),
       bootToStartScreenMs,
       bootToIntroVideoMs,
       bootToMainMenuMs,
@@ -7770,6 +7885,18 @@ export function bootstrapPlayGta6App(options = {}) {
       firstVisibleFrameMs,
       blackLoadingMs,
       loadingAssets,
+      swapchainProbeCount: toSafeNonNegativeInt(gpuTelemetry.swapchainProbeCount, 0),
+      swapchainProbeInFlight: Boolean(gpuTelemetry.swapchainProbeInFlight),
+      swapchainProbeSupported:
+        typeof gpuTelemetry.swapchainProbeSupported === 'boolean'
+          ? gpuTelemetry.swapchainProbeSupported
+          : null,
+      swapchainProbeErrorCount: toSafeNonNegativeInt(gpuTelemetry.swapchainProbeErrorCount, 0),
+      lastSampledMaxLuma: Math.max(
+        0,
+        Math.min(255, toSafeNonNegativeInt(gpuTelemetry.lastSampledMaxLuma, 0))
+      ),
+      suppressedBlackFrames: toSafeNonNegativeInt(gpuTelemetry.suppressedBlackFrames, 0),
     });
 
     const audio = Object.freeze({
@@ -7819,6 +7946,12 @@ export function bootstrapPlayGta6App(options = {}) {
       hasVisibleContent: gpu.hasVisibleContent,
       firstVisibleFrameMs: gpu.firstVisibleFrameMs,
       blackLoadingMs: gpu.blackLoadingMs,
+      swapchainProbeCount: gpu.swapchainProbeCount,
+      swapchainProbeInFlight: gpu.swapchainProbeInFlight,
+      swapchainProbeSupported: gpu.swapchainProbeSupported,
+      swapchainProbeErrorCount: gpu.swapchainProbeErrorCount,
+      lastSampledMaxLuma: gpu.lastSampledMaxLuma,
+      suppressedBlackFrames: gpu.suppressedBlackFrames,
       bootToStartScreenMs,
       bootToIntroVideoMs,
       bootToMainMenuMs,

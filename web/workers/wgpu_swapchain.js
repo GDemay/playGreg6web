@@ -437,6 +437,7 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
         onValidationError = null,
         onFirstVisibleFrame = null,
         maxErrorHistory = DEFAULT_MAX_ERROR_HISTORY,
+        preserveCopySrcUntilVisible = false,
       } = options;
 
       if (!canvas || typeof canvas !== 'object') {
@@ -534,6 +535,8 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       this._viewFormatsFallbackCount = 0;
       this._explicitUsage = resolvedExplicitUsage;
       this._usage = resolvedExplicitUsage !== null ? resolvedExplicitUsage : DEFAULT_USAGE;
+      this._preserveCopySrcUntilVisible = Boolean(preserveCopySrcUntilVisible);
+      this._copySrcSupported = null;
       this._appliedConfig = {
         device: null,
         format: '',
@@ -1264,6 +1267,7 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       this._lastFrameTimestamp = null;
       this._hasAppliedConfig = false;
       this._appliedConfig.device = null;
+      this._copySrcSupported = null;
 
       this._hookDeviceLost(newDevice);
       this._hookUncapturedError(newDevice);
@@ -1305,6 +1309,52 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       return true;
     }
 
+    _resolveEffectiveUsage() {
+      const baseUsage = this._explicitUsage !== null ? this._explicitUsage : DEFAULT_USAGE;
+      if (
+        this._preserveCopySrcUntilVisible &&
+        !this._firstVisibleFired &&
+        this._copySrcSupported !== false
+      ) {
+        return baseUsage | TEXTURE_USAGE_COPY_SRC;
+      }
+      return baseUsage;
+    }
+
+    /**
+     * W350: Ensure `GPUTextureUsage.COPY_SRC` is enabled on the configured swapchain canvas
+     * texture (e.g. for async non-black luminance probing prior to first-visible-frame).
+     * Returns `true` when `COPY_SRC` is active, or `false` if unsupported/unconfigured.
+     *
+     * @returns {boolean}
+     */
+    ensureCopySrcUsage() {
+      if (
+        this._destroyed ||
+        this._isDeviceLost ||
+        !this._configured ||
+        !this._device ||
+        !this._context
+      ) {
+        return false;
+      }
+      if ((this._usage & TEXTURE_USAGE_COPY_SRC) !== 0) {
+        this._copySrcSupported = true;
+        return true;
+      }
+      if (this._copySrcSupported === false) {
+        return false;
+      }
+      const nextUsage = (this._usage || DEFAULT_USAGE) | TEXTURE_USAGE_COPY_SRC;
+      try {
+        this.configure({ usage: nextUsage });
+        return this.hasCopySrcUsage;
+      } catch (_) {
+        this._copySrcSupported = false;
+        return false;
+      }
+    }
+
     _applyContextConfiguration() {
       if (this._canvas.width !== this._width) {
         this._canvas.width = this._width;
@@ -1314,40 +1364,99 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       }
       const effectiveViewFormats = this._resolveEffectiveViewFormats();
       const effectiveViewFormatsKey = this._resolveEffectiveViewFormatsKey();
+      const autoPreservingCopySrc = Boolean(
+        this._preserveCopySrcUntilVisible &&
+        !this._firstVisibleFired &&
+        this._copySrcSupported !== false
+      );
+      const explicitHasCopySrc = Boolean(
+        this._explicitUsage !== null && (this._explicitUsage & TEXTURE_USAGE_COPY_SRC) !== 0
+      );
+      let requestedUsage =
+        this._explicitUsage !== null ? this._explicitUsage : null;
+      if (autoPreservingCopySrc) {
+        requestedUsage =
+          (this._explicitUsage !== null ? this._explicitUsage : DEFAULT_USAGE) |
+          TEXTURE_USAGE_COPY_SRC;
+      }
       const cfg = {
         device: this._device,
         format: this._format,
         alphaMode: this._alphaMode,
       };
-      if (this._explicitUsage !== null) {
-        cfg.usage = this._explicitUsage;
+      if (requestedUsage !== null) {
+        cfg.usage = requestedUsage;
       }
       let appliedViewFormats = [];
       if (effectiveViewFormats && effectiveViewFormats.length > 0) {
         cfg.viewFormats = effectiveViewFormats.slice();
         appliedViewFormats = effectiveViewFormats.slice();
       }
+      const canFallbackDropAutoCopySrc = Boolean(
+        autoPreservingCopySrc && !explicitHasCopySrc && requestedUsage !== null
+      );
+      const configureWithFallback = (configObj, allowViewFormatsRetry) => {
+        try {
+          this._context.configure(configObj);
+          return {
+            viewFormats: configObj.viewFormats ? configObj.viewFormats.slice() : [],
+            usedViewFallback: false,
+          };
+        } catch (err) {
+          if (allowViewFormatsRetry && configObj.viewFormats) {
+            const fallbackCfg = {
+              device: this._device,
+              format: this._format,
+              alphaMode: this._alphaMode,
+            };
+            if (configObj.usage !== undefined) {
+              fallbackCfg.usage = configObj.usage;
+            }
+            this._context.configure(fallbackCfg);
+            return { viewFormats: [], usedViewFallback: true };
+          }
+          throw err;
+        }
+      };
+
+      let appliedUsage = requestedUsage !== null ? requestedUsage : DEFAULT_USAGE;
       try {
-        this._context.configure(cfg);
+        const res = configureWithFallback(cfg, true);
+        appliedViewFormats = res.viewFormats;
+        if (res.usedViewFallback) {
+          this._viewFormatsFallbackCount += 1;
+        }
+        if ((appliedUsage & TEXTURE_USAGE_COPY_SRC) !== 0) {
+          this._copySrcSupported = true;
+        }
       } catch (err) {
-        if (cfg.viewFormats) {
-          // Graceful retry without viewFormats if a mock or WebGPU device rejects them.
-          const fallbackCfg = {
+        if (canFallbackDropAutoCopySrc) {
+          const fallbackUsage =
+            this._explicitUsage !== null
+              ? this._explicitUsage
+              : requestedUsage & ~TEXTURE_USAGE_COPY_SRC || DEFAULT_USAGE;
+          const noCopyCfg = {
             device: this._device,
             format: this._format,
             alphaMode: this._alphaMode,
+            usage: fallbackUsage,
           };
-          if (this._explicitUsage !== null) {
-            fallbackCfg.usage = this._explicitUsage;
+          if (effectiveViewFormats && effectiveViewFormats.length > 0) {
+            noCopyCfg.viewFormats = effectiveViewFormats.slice();
           }
-          this._context.configure(fallbackCfg);
-          appliedViewFormats = [];
-          this._viewFormatsFallbackCount += 1;
+          const res = configureWithFallback(noCopyCfg, true);
+          appliedViewFormats = res.viewFormats;
+          if (res.usedViewFallback) {
+            this._viewFormatsFallbackCount += 1;
+          }
+          appliedUsage = fallbackUsage;
+          this._copySrcSupported = false;
         } else {
           throw err;
         }
       }
       this._configured = true;
+      this._usage = appliedUsage;
       this._activeViewFormats = appliedViewFormats;
       const applied = this._appliedConfig;
       applied.device = this._device;
@@ -1394,8 +1503,9 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
         const nextEffectiveKey = this._resolveEffectiveViewFormatsKey(streamFormat, null);
         const viewFormatsChanged = prevEffectiveKey !== nextEffectiveKey;
         const streamChanged = this._streamFormat !== streamFormat;
+        const usageChanged = this._usage !== this._resolveEffectiveUsage();
 
-        if (!hadBlit && !canvasChanged && !viewFormatsChanged && !streamChanged && this._configured) {
+        if (!hadBlit && !canvasChanged && !viewFormatsChanged && !streamChanged && !usageChanged && this._configured) {
           this._skippedRedundantReconfigures += 1;
           return false;
         }
@@ -1411,7 +1521,12 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
         this._viewFormats = null;
         this._explicitViewFormatsKey = '';
 
-        if (this._configured && this._device && this._context && (canvasChanged || viewFormatsChanged)) {
+        if (
+          this._configured &&
+          this._device &&
+          this._context &&
+          (canvasChanged || viewFormatsChanged || usageChanged)
+        ) {
           this._applyContextConfiguration();
         }
         return true;
@@ -1427,6 +1542,7 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       const nextEffectiveKey = this._resolveEffectiveViewFormatsKey(nextCanvasFormat, null);
       const viewFormatsChanged = prevEffectiveKey !== nextEffectiveKey;
       const streamChanged = this._streamFormat !== streamFormat;
+      const usageChanged = this._usage !== this._resolveEffectiveUsage();
       const needsIntermediateNow =
         this._configured &&
         this._width > 0 &&
@@ -1443,6 +1559,7 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
         !streamChanged &&
         !canvasChanged &&
         !viewFormatsChanged &&
+        !usageChanged &&
         !needsIntermediateNow
       ) {
         if (this._configured) {
@@ -1465,7 +1582,7 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       }
 
       if (this._configured && this._device && this._context) {
-        if (canvasChanged || viewFormatsChanged) {
+        if (canvasChanged || viewFormatsChanged || usageChanged) {
           this._applyContextConfiguration();
         } else {
           this._ensureIntermediateTexture();
@@ -1498,8 +1615,15 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       }
       const prevViewKey = this._resolveEffectiveViewFormatsKey();
       const nextViewKey = this._resolveEffectiveViewFormatsKey(format, nextExplicitViewFormats);
+      const nextEffectiveUsage = this._resolveEffectiveUsage();
       const hadBlit = this._usesBlitFallback;
-      if (!hadBlit && this._format === format && prevViewKey === nextViewKey && this._configured) {
+      if (
+        !hadBlit &&
+        this._format === format &&
+        prevViewKey === nextViewKey &&
+        this._usage === nextEffectiveUsage &&
+        this._configured
+      ) {
         this._skippedRedundantReconfigures += 1;
         return false;
       }
@@ -1526,7 +1650,7 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
           this._width,
           this._height,
           this._format,
-          this._usage,
+          nextEffectiveUsage,
           this._alphaMode,
           nextViewKey
         )
@@ -1612,6 +1736,7 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       const prevEnableDepth = this._enableDepth;
       const prevExplicitUsage = this._explicitUsage;
       const prevUsage = this._usage;
+      const prevCopySrcSupported = this._copySrcSupported;
 
       if (isReplacingDevice) {
         this._replaceDevice(config.device);
@@ -1716,11 +1841,12 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
         typeof dpr === 'number' && Number.isFinite(dpr) && dpr > 0 ? dpr : 1;
 
       const nextEffectiveVfKey = this._resolveEffectiveViewFormatsKey();
+      const nextEffectiveUsage = this._resolveEffectiveUsage();
       const sameCanvasConfig = this._isSameAppliedConfig(
         nextWidth,
         nextHeight,
         this._format,
-        this._usage,
+        nextEffectiveUsage,
         this._alphaMode,
         nextEffectiveVfKey
       );
@@ -1753,6 +1879,7 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
         } catch (err) {
           this._explicitUsage = prevExplicitUsage;
           this._usage = prevUsage;
+          this._copySrcSupported = prevCopySrcSupported;
           throw err;
         }
         if (dimensionsChanged) {
@@ -1812,6 +1939,7 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
         this._configured &&
         this._hasAppliedConfig &&
         this._appliedConfig.device === this._device &&
+        this._usage === this._resolveEffectiveUsage() &&
         nextWidth === this._width &&
         nextHeight === this._height
       ) {
