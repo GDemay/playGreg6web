@@ -20,6 +20,7 @@
 #include "gpu/descriptor_words.h"
 #include "gpu/present_pacing.h"
 #include "os/os_shim.h"
+#include "os/win32_kernel.h"
 #include "os/xmem_windows.h"
 
 namespace playgta6::gpu::d3d12_guest {
@@ -549,10 +550,66 @@ HResult Device::SetFrameIntervalX(uint64_t, uint32_t interval_us, uint32_t perio
     return kSOk;
 }
 
-HResult Device::ScheduleFrameEventX(uint32_t, uint32_t, uint64_t, uint32_t) {
-    // Events are ticks of the pacer; the type and offset only shift the event inside the frame.
+HResult Device::ScheduleFrameEventX(uint32_t type, uint32_t offset_us, uint64_t event_handle, uint32_t) {
+    // Events are ticks of the pacer; the offset shifts the event inside the frame. WaitFrameEventX
+    // waits on the pacer directly; a title that passes an event handle gets it signalled at every
+    // tick (`offset_us` in) by the frame-event thread, every scheduled type on each tick.
     count(xbox::Counter::FrameEventsScheduled);
+    if (event_handle == 0) {
+        return kSOk;
+    }
+    std::lock_guard<std::mutex> lock(frame_event_mutex_);
+    if (frame_event_stop_) {
+        return kSOk;
+    }
+    frame_events_[type] = ScheduledFrameEvent{std::min<uint32_t>(offset_us, xbox::FramePacer::kMaxIntervalUs),
+                                              event_handle};
+    if (!frame_event_thread_.joinable()) {
+        frame_event_thread_ = std::thread([this] { run_frame_events(); });
+    }
     return kSOk;
+}
+
+void Device::run_frame_events() {
+    for (;;) {
+        uint64_t frame = 0;
+        if (pacer_.wait_after(pacer_.current_frame(), kInfinite, &frame) == xbox::FramePacer::WaitResult::Shutdown) {
+            return;
+        }
+        const auto tick = std::chrono::steady_clock::now();
+        std::vector<ScheduledFrameEvent> due;
+        {
+            std::lock_guard<std::mutex> lock(frame_event_mutex_);
+            if (frame_event_stop_) {
+                return;
+            }
+            for (const auto& [type, event] : frame_events_) {
+                due.push_back(event);
+            }
+        }
+        std::sort(due.begin(), due.end(),
+                  [](const ScheduledFrameEvent& a, const ScheduledFrameEvent& b) { return a.offset_us < b.offset_us; });
+        for (const ScheduledFrameEvent& event : due) {
+            std::unique_lock<std::mutex> lock(frame_event_mutex_);
+            if (frame_event_cv_.wait_until(lock, tick + std::chrono::microseconds(event.offset_us),
+                                           [this] { return frame_event_stop_; })) {
+                return;
+            }
+            lock.unlock();
+            pg6_win32_set_event(event.handle);
+        }
+    }
+}
+
+void Device::stop_frame_event_thread() {
+    {
+        std::lock_guard<std::mutex> lock(frame_event_mutex_);
+        frame_event_stop_ = true;
+    }
+    frame_event_cv_.notify_all();
+    if (frame_event_thread_.joinable() && frame_event_thread_.get_id() != std::this_thread::get_id()) {
+        frame_event_thread_.join();
+    }
 }
 
 HResult Device::WaitFrameEventX(uint32_t type, uint32_t timeout_ms, uint64_t, uint32_t, GuestPtr<uint64_t> token) {
@@ -610,7 +667,9 @@ HResult Device::WaitFrameEventX(uint32_t type, uint32_t timeout_ms, uint64_t, ui
             const uint64_t out_tok = std::max<uint64_t>(std::max<uint64_t>(frame, 1),
                                                         last_frame_token_.load(std::memory_order_acquire));
             token.write(out_tok);
-            return static_cast<HResult>(0x887A0027u);  // DXGI_ERROR_WAIT_TIMEOUT
+            // A timed-out wait is not a failure: S_FALSE, as a WaitForSingleObject-style timeout
+            // (titles trap on a failed HRESULT from this call).
+            return kSFalse;
         }
     }
     // Always hand out a strictly monotonic, non-zero D3D12XBOX_FRAME_PIPELINE_TOKEN.
