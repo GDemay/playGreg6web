@@ -125,6 +125,8 @@ const BOOT_INIT_FORWARD_KEYS = Object.freeze([
   'bootBase',
   'gameBase',
   'programManifestUrl',
+  // #1077: opt-in `?opfsL2=0` bypass of the io_worker OPFS L2 hot-file cache.
+  'opfsL2Enabled',
 ]);
 const GAME_PACKAGE_HTTPFS_EXT_RE = /\.(?:rpf|ttpf|dll|png|xvd|xvc|bin|pri)$/i;
 const WIN32_DRIVE_PATH_RE = /^(?:\\\\[?.]\\|\/\/[?.]\/)?([A-Za-z]):(.*)$/;

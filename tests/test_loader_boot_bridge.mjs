@@ -262,7 +262,9 @@ test('collectBootBridgeInitFields and worker payloads omit optional URLs when ab
     'bootBase',
     'gameBase',
     'programManifestUrl',
+    'opfsL2Enabled',
   ]);
+  assert.deepEqual(collectBootBridgeInitFields({ opfsL2Enabled: false }), { opfsL2Enabled: false });
   assert.deepEqual(collectBootBridgeInitFields({ canvas: true, dataBase: '/data/' }), {});
   const payloads = createWorkerBootInitPayloads({
     canvas: 'offscreen',
