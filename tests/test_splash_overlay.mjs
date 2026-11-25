@@ -2125,26 +2125,59 @@ test('W230: holdFallbackTimeoutMs safety cap prevents infinite splash hang, 0 di
   manual.controller.destroy();
 });
 
-test('W230: frosted dark pill wraps .pg6-splash__status-row (spinner + stage text) with high-contrast CSS', () => {
+test('W252: sleek borderless transparent bottom bar + gradient vignette scrim replaces bulky frosted card/pill', () => {
   const doc = new MockDocument();
   const { controller } = createController({ documentObj: doc });
   const root = controller.getState().root;
 
+  const scrim = root.querySelector('.pg6-splash__scrim');
+  const panel = root.querySelector('.pg6-splash__panel');
   const statusRow = root.querySelector('.pg6-splash__status-row');
   const stageRow = root.querySelector('.pg6-splash__stage-row');
+  assert.ok(scrim, '.pg6-splash__scrim bottom vignette must exist');
+  assert.equal(scrim.getAttribute('aria-hidden'), 'true', '.pg6-splash__scrim must be aria-hidden');
+  assert.ok(panel, '.pg6-splash__panel must exist');
+  assert.ok(
+    root.children.indexOf(scrim) < root.children.indexOf(panel),
+    '.pg6-splash__scrim must sit behind .pg6-splash__panel'
+  );
   assert.ok(statusRow, '.pg6-splash__status-row must exist');
-  assert.equal(statusRow, stageRow, '.pg6-splash__status-row and .pg6-splash__stage-row alias the same pill row');
-  assert.ok(statusRow.querySelector('.pg6-splash__spinner'), 'spinner must be inside frosted status pill');
-  assert.ok(statusRow.querySelector('.pg6-splash__spinner-ring'), 'spinner ring must be inside frosted status pill');
-  assert.ok(statusRow.querySelector('.pg6-splash__greg'), 'Spinning Greg img must be inside frosted status pill');
-  assert.ok(statusRow.querySelector('.pg6-splash__stage'), 'stage text must be inside frosted status pill');
+  assert.equal(statusRow, stageRow, '.pg6-splash__status-row and .pg6-splash__stage-row alias the same row');
+  assert.ok(statusRow.querySelector('.pg6-splash__spinner'), 'spinner must be inside status row');
+  assert.ok(statusRow.querySelector('.pg6-splash__spinner-ring'), 'spinner ring must be inside status row');
+  assert.ok(statusRow.querySelector('.pg6-splash__greg'), 'Spinning Greg img must be inside status row');
+  assert.ok(statusRow.querySelector('.pg6-splash__stage'), 'stage text must be inside status row');
 
   const styleEl = doc.head.children.find((el) => el.getAttribute('data-pg6-splash-style') === '1');
   assert.ok(styleEl);
-  assert.match(styleEl.textContent, /\.pg6-splash__status-row/);
-  assert.match(styleEl.textContent, /backdrop-filter:\s*blur\(/);
-  assert.match(styleEl.textContent, /-webkit-backdrop-filter:\s*blur\(/);
-  assert.match(styleEl.textContent, /background:\s*rgba\(/);
-  assert.match(styleEl.textContent, /border-radius:\s*999px/);
+  const css = styleEl.textContent;
+
+  // Bottom-edge gradient vignette scrim (transparent over artwork, smoothly darkening bottom edge).
+  assert.match(
+    css,
+    /\.pg6-splash__scrim\{[^}]*pointer-events:\s*none[^}]*background:\s*linear-gradient\([^)]*rgba\(0,0,0,0\)/
+  );
+
+  // Zero bulky dark box / border / blur / shadow on panel and status/stage row.
+  const panelRule = /\.pg6-splash__panel\{([^}]*)\}/.exec(css);
+  assert.ok(panelRule, '.pg6-splash__panel rule must exist in shared CSS');
+  assert.match(panelRule[1], /\bbackground:\s*transparent\b/);
+  assert.match(panelRule[1], /\bborder:\s*none\b/);
+  assert.match(panelRule[1], /\bbox-shadow:\s*none\b/);
+  assert.match(panelRule[1], /\bbackdrop-filter:\s*none\b/);
+
+  const statusRowRule = /\.pg6-splash__stage-row,\.pg6-splash__status-row\{([^}]*)\}/.exec(css);
+  assert.ok(statusRowRule, '.pg6-splash__stage-row,.pg6-splash__status-row rule must exist in shared CSS');
+  assert.match(statusRowRule[1], /\bbackground:\s*transparent\b/);
+  assert.match(statusRowRule[1], /\bborder:\s*none\b/);
+  assert.match(statusRowRule[1], /\bbox-shadow:\s*none\b/);
+  assert.match(statusRowRule[1], /\bbackdrop-filter:\s*none\b/);
+  assert.doesNotMatch(css, /backdrop-filter:\s*blur\(/, 'shared splash CSS must not apply frosted blur');
+
+  // Sleek thin 3px-4px progress bar, crisp text-shadow, and drop-shadowed 22px-28px Spinning Greg.
+  assert.match(css, /\.pg6-splash__bar,\.pg6-splash__stream\{[^}]*height:\s*[34]px[^}]*border:\s*none/);
+  assert.match(css, /\.pg6-splash__stage\{[^}]*text-shadow:/);
+  assert.match(css, /\.pg6-splash__meta\{[^}]*text-shadow:/);
+  assert.match(css, /\.pg6-splash__greg\{[^}]*width:\s*2[2-8]px;height:\s*2[2-8]px;[^}]*filter:\s*drop-shadow\(/);
   controller.destroy();
 });

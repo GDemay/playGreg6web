@@ -450,23 +450,29 @@ test('W232 web/index.html defines a clean inline SVG data-URI favicon in <head> 
   assert.doesNotMatch(decodedSvg, /<script\b|on[a-z]+\s*=|https?:\/\/(?!www\.w3\.org\/2000\/svg)|\bid=/i);
 });
 
-test('W232 web/ui/overlay.css provides smooth fade-out helpers and frosted high-contrast splash backdrop classes', () => {
+test('W232 / W252 web/ui/overlay.css provides smooth fade-out helpers and sleek borderless bottom-vignette splash bar', () => {
   const rootBody = findRuleBody(parsedCss.rules, ':root');
   for (const token of [
     '--pg6-splash-fade',
     '--pg6-splash-ease',
-    '--pg6-splash-backdrop',
-    '--pg6-splash-backdrop-strong',
-    '--pg6-splash-pill-border',
+    '--pg6-splash-scrim-gradient',
+    '--pg6-splash-text-shadow',
+    '--pg6-splash-bar-track',
+    '--pg6-splash-bar-fill',
   ]) {
     assert.match(
       rootBody,
       new RegExp(`${token}\\s*:`),
-      `W232 custom property "${token}" must be defined in :root`
+      `Splash custom property "${token}" must be defined in :root`
     );
   }
+  assert.match(
+    rootBody,
+    /--pg6-splash-scrim-gradient\s*:\s*linear-gradient\([\s\S]*rgba\(\s*0\s*,\s*0\s*,\s*0\s*,\s*0\s*\)/,
+    '--pg6-splash-scrim-gradient must start completely transparent over the artwork'
+  );
 
-  // Smooth fade-out transition helpers.
+  // Smooth fade-out transition helpers remain intact.
   const fadeTransitionBody = findRuleBody(parsedCss.rules, '.pg6-fade-transition');
   assert.match(fadeTransitionBody, /\bopacity\s*:\s*1\s*;/);
   assert.match(fadeTransitionBody, /\btransition\s*:[\s\S]*opacity\s+var\(--pg6-splash-fade/);
@@ -486,34 +492,51 @@ test('W232 web/ui/overlay.css provides smooth fade-out helpers and frosted high-
   assert.match(splashRootFadingBody, /\bopacity\s*:\s*0\s*;/);
   assert.match(splashRootFadingBody, /\bpointer-events\s*:\s*none\s*;/);
 
-  // Frosted high-contrast backdrop classes for splash status pill & panel/spinner/Greg overlay.
-  const frostedBody = findRuleBody(parsedCss.rules, '.pg6-splash-frosted');
-  assert.match(frostedBody, /\bbackground\s*:\s*var\(--pg6-splash-backdrop\)\s*;/);
-  assert.match(frostedBody, /\bbackdrop-filter\s*:\s*blur\(/);
-  assert.match(frostedBody, /-webkit-backdrop-filter\s*:\s*blur\(/);
+  // Sleek bottom-edge gradient vignette scrim.
+  const scrimBody = findRuleBody(parsedCss.rules, '#splash-overlay-root .pg6-splash__scrim');
+  assert.match(scrimBody, /\bpointer-events\s*:\s*none\s*;/);
+  assert.match(scrimBody, /\bbackground\s*:\s*var\(--pg6-splash-scrim-gradient\)\s*;/);
 
-  const statusPillBody = findRuleBody(parsedCss.rules, '.pg6-splash-status-pill');
-  assert.match(statusPillBody, /\bborder-radius\s*:\s*var\(--radius-full\)\s*;/);
-  assert.match(statusPillBody, /\bbackground\s*:\s*var\(--pg6-splash-backdrop-strong\)\s*;/);
-  assert.match(statusPillBody, /\bcolor\s*:\s*var\(--color-text-strong\)\s*;/);
-  assert.match(statusPillBody, /\bbackdrop-filter\s*:\s*blur\(/);
-  assert.match(statusPillBody, /-webkit-backdrop-filter\s*:\s*blur\(/);
+  // W252: Splash panel and status/stage row must be completely transparent & borderless (no bulky card/pill).
+  for (const selector of [
+    '#splash-overlay-root .pg6-splash__panel',
+    '#splash-overlay-root .pg6-splash__stage-row',
+    '#splash-overlay-root .pg6-splash__status-row',
+  ]) {
+    const body = findRuleBody(parsedCss.rules, selector);
+    assert.ok(body.length > 0, `Expected sleek borderless rule for "${selector}"`);
+    assert.match(body, /\bbackground\s*:\s*transparent\s*;/, `${selector} must have transparent background`);
+    assert.match(body, /\bborder\s*:\s*none\s*;/, `${selector} must be borderless`);
+    assert.match(body, /\bbox-shadow\s*:\s*none\s*;/, `${selector} must have no card box-shadow`);
+    assert.match(body, /\bbackdrop-filter\s*:\s*none\s*;/, `${selector} must have no backdrop blur`);
+    assert.match(body, /-webkit-backdrop-filter\s*:\s*none\s*;/, `${selector} must have no webkit backdrop blur`);
+    assert.doesNotMatch(body, /backdrop-filter\s*:\s*blur\(/, `${selector} must not blur a bulky card`);
+  }
 
-  const splashPanelBody = findRuleBody(parsedCss.rules, '#splash-overlay-root .pg6-splash__panel');
-  assert.match(splashPanelBody, /\bbackground\s*:\s*var\(--pg6-splash-backdrop\)\s*;/);
-  assert.match(splashPanelBody, /\bbackdrop-filter\s*:\s*blur\(/);
-  assert.match(splashPanelBody, /\bcontain\s*:\s*layout\s+style\s+paint\s*;/);
-
+  // Crisp subtle text-shadow on stage & meta over the bottom vignette.
   const splashStageBody = findRuleBody(parsedCss.rules, '#splash-overlay-root .pg6-splash__stage');
   assert.match(splashStageBody, /\bcolor\s*:\s*var\(--color-text-strong\)\s*;/);
+  assert.match(splashStageBody, /\btext-shadow\s*:/);
 
+  const splashMetaBody = findRuleBody(parsedCss.rules, '#splash-overlay-root .pg6-splash__meta');
+  assert.match(splashMetaBody, /\btext-shadow\s*:/);
+
+  // Sleek thin 3px-4px borderless progress bar.
+  const splashBarBody = findRuleBody(parsedCss.rules, '#splash-overlay-root .pg6-splash__bar');
+  assert.match(splashBarBody, /\bheight\s*:\s*[34]px\s*;/);
+  assert.match(splashBarBody, /\bborder\s*:\s*none\s*;/);
+
+  // Clean minimal spinner & Spinning Greg (22px-28px with crisp drop-shadow, zero box-shadow/border).
   const splashSpinnerBody = findRuleBody(parsedCss.rules, '#splash-overlay-root .pg6-splash__spinner');
   assert.match(splashSpinnerBody, /\btransition\s*:/);
 
   const splashGregBody = findRuleBody(parsedCss.rules, '#splash-overlay-root .pg6-splash__greg');
-  assert.match(splashGregBody, /\bbox-shadow\s*:/);
+  assert.match(splashGregBody, /\bwidth\s*:\s*(?:2[2-8])px\s*;/);
+  assert.match(splashGregBody, /\bheight\s*:\s*(?:2[2-8])px\s*;/);
+  assert.match(splashGregBody, /\bbox-shadow\s*:\s*none\s*;/);
+  assert.match(splashGregBody, /\bfilter\s*:\s*drop-shadow\(/);
 
-  // Reduced-motion block must also disable transitions on the new W232 helpers.
+  // Reduced-motion block must also disable transitions on the splash fade helpers.
   const reducedMotionBlock = parsedCss.mediaBlocks.find((block) =>
     /@media\s*\(\s*prefers-reduced-motion\s*:\s*reduce\s*\)/i.test(block.prelude)
   );

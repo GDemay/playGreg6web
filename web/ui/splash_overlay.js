@@ -80,7 +80,7 @@
     ROOT_CLASS +
     '{' +
     'position:fixed;inset:0;z-index:9999;display:flex;flex-direction:column;align-items:center;' +
-    'justify-content:flex-end;box-sizing:border-box;padding:0 1.5rem 2.5rem;' +
+    'justify-content:flex-end;box-sizing:border-box;padding:0 1.5rem 1.75rem;' +
     'background:#0b1220;color:#e8eef7;font-family:Segoe UI,system-ui,sans-serif;' +
     'opacity:1;transition:opacity var(--pg6-splash-fade,400ms) ease;' +
     'pointer-events:auto;' +
@@ -96,6 +96,10 @@
     '__media{position:absolute;inset:0;overflow:hidden;}' +
     '.' +
     ROOT_CLASS +
+    '__scrim{position:absolute;inset:0;z-index:1;pointer-events:none;' +
+    'background:linear-gradient(to bottom,rgba(0,0,0,0) 0%,rgba(0,0,0,0) 76%,rgba(5,7,11,0.42) 89%,rgba(5,7,11,0.78) 100%);}' +
+    '.' +
+    ROOT_CLASS +
     '__img,.pg6-splash__fallback{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;}' +
     '.' +
     ROOT_CLASS +
@@ -105,17 +109,18 @@
     '__fallback svg{width:100%;height:100%;}' +
     '.' +
     ROOT_CLASS +
-    '__panel{position:relative;z-index:1;width:min(36rem,100%);display:flex;flex-direction:column;gap:0.55rem;}' +
+    '__panel{position:relative;z-index:2;width:min(36rem,100%);display:flex;flex-direction:column;gap:0.45rem;' +
+    'padding:0;border:none;border-radius:0;background:transparent;box-shadow:none;' +
+    'backdrop-filter:none;-webkit-backdrop-filter:none;}' +
     '.' +
     ROOT_CLASS +
     '__stage-row,.' +
     ROOT_CLASS +
     '__status-row{' +
-    'display:inline-flex;align-items:center;align-self:flex-start;gap:0.6rem;min-height:1.5rem;' +
-    'max-width:100%;box-sizing:border-box;padding:0.4rem 0.85rem 0.4rem 0.6rem;border-radius:999px;' +
-    'background:rgba(10,16,28,0.68);border:1px solid rgba(255,255,255,0.14);' +
-    'box-shadow:0 4px 18px rgba(0,0,0,0.32);' +
-    'backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);' +
+    'display:inline-flex;align-items:center;align-self:flex-start;gap:0.55rem;min-height:1.5rem;' +
+    'max-width:100%;box-sizing:border-box;padding:0;border:none;border-radius:0;' +
+    'background:transparent;box-shadow:none;' +
+    'backdrop-filter:none;-webkit-backdrop-filter:none;' +
     '}' +
     '.' +
     ROOT_CLASS +
@@ -123,14 +128,16 @@
     'align-items:center;justify-content:center;cursor:pointer;user-select:none;}' +
     '.' +
     ROOT_CLASS +
-    '__spinner--greg{width:1.65rem;height:1.65rem;}' +
+    '__spinner--greg{width:26px;height:26px;}' +
     '.' +
     ROOT_CLASS +
-    '__spinner-ring{box-sizing:border-box;width:1.1rem;height:1.1rem;border-radius:50%;' +
-    'border:2px solid rgba(255,255,255,0.22);border-top-color:#6db3ff;animation:pg6-spin 850ms linear infinite;}' +
+    '__spinner-ring{box-sizing:border-box;width:1rem;height:1rem;border-radius:50%;' +
+    'border:2px solid rgba(255,255,255,0.28);border-top-color:#ffffff;' +
+    'filter:drop-shadow(0 1px 4px rgba(0,0,0,0.65));animation:pg6-spin 850ms linear infinite;}' +
     '.' +
     ROOT_CLASS +
-    '__greg{width:1.65rem;height:1.65rem;object-fit:contain;border-radius:50%;' +
+    '__greg{width:26px;height:26px;object-fit:contain;border-radius:50%;border:none;box-shadow:none;' +
+    'filter:drop-shadow(0 2px 6px rgba(0,0,0,0.75));' +
     'display:block;animation:pg6-spin 1200ms linear infinite;}' +
     '.' +
     ROOT_CLASS +
@@ -141,15 +148,16 @@
     '__greg[hidden]{display:none!important;}' +
     '.' +
     ROOT_CLASS +
-    '__stage{font-size:0.95rem;font-weight:500;letter-spacing:0.04em;opacity:0.98;' +
-    'color:#f3f7ff;text-shadow:0 1px 2px rgba(0,0,0,0.45);}' +
+    '__stage{font-size:0.9rem;font-weight:500;letter-spacing:0.03em;opacity:0.98;' +
+    'color:#f5f7fa;text-shadow:0 1px 4px rgba(0,0,0,0.85),0 0 12px rgba(0,0,0,0.55);}' +
     '.' +
     ROOT_CLASS +
-    '__bar,.pg6-splash__stream{height:0.4rem;border-radius:999px;background:rgba(10,16,28,0.52);' +
-    'border:1px solid rgba(255,255,255,0.12);overflow:hidden;}' +
+    '__bar,.pg6-splash__stream{height:3px;border-radius:999px;background:rgba(255,255,255,0.18);' +
+    'border:none;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,0.45);}' +
     '.' +
     ROOT_CLASS +
-    '__bar-fill,.pg6-splash__stream-fill{height:100%;width:0%;background:#6db3ff;transition:width 180ms ease;}' +
+    '__bar-fill,.pg6-splash__stream-fill{height:100%;width:0%;background:rgba(255,255,255,0.92);' +
+    'border-radius:999px;transition:width 180ms ease;}' +
     '.' +
     ROOT_CLASS +
     '__stream{opacity:0.85;}' +
@@ -163,8 +171,9 @@
     'color:#c8e3ff;font-size:0.74rem;letter-spacing:0.03em;line-height:1.25;}' +
     '.' +
     ROOT_CLASS +
-    '__meta{display:flex;justify-content:space-between;gap:1rem;font-size:0.78rem;opacity:0.9;' +
-    'text-shadow:0 1px 3px rgba(0,0,0,0.65);}' +
+    '__meta{display:flex;justify-content:space-between;gap:1rem;font-size:0.75rem;opacity:0.9;' +
+    'color:rgba(245,247,250,0.84);font-variant-numeric:tabular-nums;' +
+    'text-shadow:0 1px 4px rgba(0,0,0,0.85),0 0 10px rgba(0,0,0,0.55);}' +
     '.' +
     ROOT_CLASS +
     '__badge{margin-top:0.15rem;padding:0.45rem 0.65rem;border-radius:0.4rem;' +
@@ -848,6 +857,10 @@
       media.appendChild(img);
       media.appendChild(fallback);
 
+      const scrim = createEl(doc, 'div', `${ROOT_CLASS}__scrim`, {
+        'aria-hidden': 'true',
+      });
+
       const panel = createEl(doc, 'div', `${ROOT_CLASS}__panel`);
       const scripted = createEl(doc, 'div', `${ROOT_CLASS}__scripted`, {
         'aria-hidden': 'true',
@@ -912,11 +925,13 @@
       panel.appendChild(badge);
 
       root.appendChild(media);
+      root.appendChild(scrim);
       root.appendChild(panel);
 
       this._els = {
         root,
         media,
+        scrim,
         img,
         fallback,
         scripted,
@@ -970,6 +985,7 @@
       if (!els.root) {
         this._els = {
           root: this._root,
+          scrim: this._root.querySelector ? this._root.querySelector(`.${ROOT_CLASS}__scrim`) : null,
           img: this._root.querySelector ? this._root.querySelector(`.${ROOT_CLASS}__img`) : null,
           fallback: this._root.querySelector ? this._root.querySelector(`.${ROOT_CLASS}__fallback`) : null,
           scripted: this._root.querySelector ? this._root.querySelector(`.${ROOT_CLASS}__scripted`) : null,
