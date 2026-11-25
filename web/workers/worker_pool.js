@@ -44,6 +44,8 @@ export const DEFAULT_CANCEL_GRACE_MS = 1000;
 export const DEFAULT_BREAKER_MAX_CRASHES = 5;
 export const DEFAULT_BREAKER_WINDOW_MS = 10000;
 export const DEFAULT_MAX_RESPAWNS_PER_SLOT = 16;
+export const DEFAULT_RESPAWN_BACKOFF_BASE_MS = 0;
+export const DEFAULT_RESPAWN_BACKOFF_MAX_MS = 5000;
 
 /** Base class for all errors raised by the pool itself. */
 export class WorkerPoolError extends Error {
@@ -232,6 +234,10 @@ export class WorkerPool {
    * @param {number} [options.taskTimeoutMs] Alias for `defaultTimeoutMs` (0 = disabled unless > 0).
    * @param {number} [options.maxRespawnsPerSlot=16] Max worker respawns per slot before capping (Infinity = unlimited).
    * @param {{ maxCrashes?: number, windowMs?: number }|false} [options.breaker] Circuit breaker; `false` disables.
+   * @param {number} [options.maxConsecutiveCrashes] Crash threshold within `crashWindowMs` before opening circuit (`0` disables; overrides `breaker.maxCrashes`).
+   * @param {number} [options.crashWindowMs] Sliding crash-rate window in ms (overrides `breaker.windowMs`).
+   * @param {number} [options.respawnBackoffBaseMs=0] Initial exponential backoff delay in ms before respawning a crashed worker (`0` = immediate).
+   * @param {number} [options.respawnBackoffMaxMs=5000] Upper bound in ms for exponential respawn backoff.
    * @param {() => number} [options.now] Clock in ms.
    * @param {Function} [options.setTimeout]
    * @param {Function} [options.clearTimeout]
@@ -252,6 +258,10 @@ export class WorkerPool {
       taskTimeoutMs,
       maxRespawnsPerSlot = DEFAULT_MAX_RESPAWNS_PER_SLOT,
       breaker = {},
+      maxConsecutiveCrashes,
+      crashWindowMs,
+      respawnBackoffBaseMs = DEFAULT_RESPAWN_BACKOFF_BASE_MS,
+      respawnBackoffMaxMs = DEFAULT_RESPAWN_BACKOFF_MAX_MS,
       now,
       setTimeout: setTimeoutFn,
       clearTimeout: clearTimeoutFn,
@@ -285,6 +295,43 @@ export class WorkerPool {
         `maxRespawnsPerSlot must be a non-negative integer or Infinity, got ${maxRespawnsPerSlot}`
       );
     }
+    if (
+      maxConsecutiveCrashes !== undefined &&
+      (!Number.isInteger(maxConsecutiveCrashes) || maxConsecutiveCrashes < 0)
+    ) {
+      throw new RangeError(
+        `maxConsecutiveCrashes must be a non-negative integer, got ${maxConsecutiveCrashes}`
+      );
+    }
+    if (
+      crashWindowMs !== undefined &&
+      (typeof crashWindowMs !== 'number' || Number.isNaN(crashWindowMs) || !Number.isFinite(crashWindowMs) || crashWindowMs < 0)
+    ) {
+      throw new RangeError(`crashWindowMs must be a finite non-negative number, got ${crashWindowMs}`);
+    }
+    if (
+      typeof respawnBackoffBaseMs !== 'number' ||
+      Number.isNaN(respawnBackoffBaseMs) ||
+      !Number.isFinite(respawnBackoffBaseMs) ||
+      respawnBackoffBaseMs < 0
+    ) {
+      throw new RangeError(
+        `respawnBackoffBaseMs must be a finite non-negative number, got ${respawnBackoffBaseMs}`
+      );
+    }
+    if (
+      typeof respawnBackoffMaxMs !== 'number' ||
+      Number.isNaN(respawnBackoffMaxMs) ||
+      !Number.isFinite(respawnBackoffMaxMs) ||
+      respawnBackoffMaxMs < 0
+    ) {
+      throw new RangeError(
+        `respawnBackoffMaxMs must be a finite non-negative number, got ${respawnBackoffMaxMs}`
+      );
+    }
+
+    const breakerObj = breaker && typeof breaker === 'object' ? breaker : null;
+    const breakerDisabled = breaker === false && maxConsecutiveCrashes === undefined;
 
     this._factory =
       typeof workerFactory === 'function' ? workerFactory : () => new Worker(url, workerOptions);
@@ -297,8 +344,14 @@ export class WorkerPool {
     this._retries = retries;
     this._defaultTimeoutMs = resolvedTimeoutMs;
     this._maxRespawnsPerSlot = maxRespawnsPerSlot;
-    this._breakerMax = breaker === false ? 0 : (breaker.maxCrashes ?? DEFAULT_BREAKER_MAX_CRASHES);
-    this._breakerWindow = breaker === false ? 0 : (breaker.windowMs ?? DEFAULT_BREAKER_WINDOW_MS);
+    this._breakerMax = breakerDisabled
+      ? 0
+      : (maxConsecutiveCrashes ?? (breakerObj ? breakerObj.maxCrashes : undefined) ?? DEFAULT_BREAKER_MAX_CRASHES);
+    this._breakerWindow = breakerDisabled
+      ? 0
+      : (crashWindowMs ?? (breakerObj ? breakerObj.windowMs : undefined) ?? DEFAULT_BREAKER_WINDOW_MS);
+    this._respawnBackoffBaseMs = respawnBackoffBaseMs;
+    this._respawnBackoffMaxMs = respawnBackoffMaxMs;
     this._now =
       now ||
       (() => (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now()));
@@ -308,6 +361,9 @@ export class WorkerPool {
     this._slots = new Set();
     this._slotRespawns = new Array(maxWorkers).fill(0);
     this._slotNeedsRespawn = new Array(maxWorkers).fill(false);
+    this._slotCrashStreak = new Array(maxWorkers).fill(0);
+    this._slotBackoffUntil = new Array(maxWorkers).fill(0);
+    this._slotBackoffTimers = new Array(maxWorkers).fill(null);
     this._queue = [];
     this._blocked = [];
     this._running = 0;
@@ -335,6 +391,8 @@ export class WorkerPool {
       warmReuses: 0,
       timedOutTasks: 0,
       respawnedWorkers: 0,
+      trimmedWorkers: 0,
+      circuitBreakerTrips: 0,
       peakQueueDepth: 0,
     };
     this._waitTotal = 0;
@@ -493,13 +551,54 @@ export class WorkerPool {
     return this._slots.size;
   }
 
-  /** Re-close an open circuit breaker and reset per-slot respawn budgets so new work is accepted again. */
-  resetCircuit() {
+  /**
+   * Terminate excess idle workers cleanly down to `minWarm` (least-recently-used first)
+   * to release renderer memory without disrupting active tasks.
+   * @param {number} [minWarm=0]
+   * @returns {{ trimmed: number, remainingIdle: number, active: number }}
+   */
+  trimIdleWorkers(minWarm = 0) {
+    if (typeof minWarm !== 'number' || !Number.isInteger(minWarm) || minWarm < 0) {
+      throw new RangeError(`trimIdleWorkers minWarm must be a non-negative integer, got ${minWarm}`);
+    }
+    const idleSlots = [];
+    let active = 0;
+    for (const slot of this._slots) {
+      if (slot.dead) continue;
+      if (slot.state === 'idle') idleSlots.push(slot);
+      else active++;
+    }
+    let trimmed = 0;
+    if (idleSlots.length > minWarm) {
+      idleSlots.sort((a, b) => a.lastIdleSeq - b.lastIdleSeq);
+      const toTrim = idleSlots.length - minWarm;
+      for (let i = 0; i < toTrim; i++) {
+        this._destroySlot(idleSlots[i]);
+        this._counters.trimmedWorkers++;
+        trimmed++;
+      }
+    }
+    return {
+      trimmed,
+      remainingIdle: idleSlots.length - trimmed,
+      active,
+    };
+  }
+
+  /** Re-close an open circuit breaker and reset per-slot respawn budgets and backoffs so new work is accepted again. */
+  resetCircuitBreaker() {
     this._circuitOpen = false;
     this._crashTimes = [];
     this._lastCrash = null;
     this._slotRespawns.fill(0);
     this._slotNeedsRespawn.fill(false);
+    this._slotCrashStreak.fill(0);
+    this._clearAllBackoffTimers();
+  }
+
+  /** Alias for `resetCircuitBreaker()`. */
+  resetCircuit() {
+    this.resetCircuitBreaker();
   }
 
   /** Snapshot of pool counters. Times are in clock milliseconds. */
@@ -534,7 +633,11 @@ export class WorkerPool {
       spawned: this._counters.spawned,
       warmReuses: this._counters.warmReuses,
       timedOutTasks: this._counters.timedOutTasks,
+      watchdogTimeouts: this._counters.timedOutTasks,
       respawnedWorkers: this._counters.respawnedWorkers,
+      respawnCount: this._counters.respawnedWorkers,
+      trimmedWorkers: this._counters.trimmedWorkers,
+      circuitBreakerTrips: this._counters.circuitBreakerTrips,
       peakQueueDepth: this._counters.peakQueueDepth,
       peakQueuedTasks: this._counters.peakQueueDepth,
       avgWaitMs: this._waitCount ? this._waitTotal / this._waitCount : 0,
@@ -770,15 +873,89 @@ export class WorkerPool {
     }
   }
 
+  _computeRespawnBackoffMs(streak) {
+    if (!(this._respawnBackoffBaseMs > 0) || streak <= 0) return 0;
+    const exp = Math.min(streak - 1, 30);
+    const delay = this._respawnBackoffBaseMs * Math.pow(2, exp);
+    return Math.min(this._respawnBackoffMaxMs, delay);
+  }
+
+  _clearSlotBackoffTimer(index) {
+    const timer = this._slotBackoffTimers[index];
+    if (timer !== null) {
+      this._clearTimeout(timer);
+      this._slotBackoffTimers[index] = null;
+    }
+    this._slotBackoffUntil[index] = 0;
+  }
+
+  _clearAllBackoffTimers() {
+    for (let i = 0; i < this._maxWorkers; i++) {
+      this._clearSlotBackoffTimer(i);
+    }
+  }
+
+  _isSlotInBackoff(index, now = this._now()) {
+    const until = this._slotBackoffUntil[index];
+    if (until <= 0) return false;
+    if (now >= until) {
+      this._clearSlotBackoffTimer(index);
+      return false;
+    }
+    return true;
+  }
+
+  _scheduleSlotBackoff(index) {
+    const canRunWhileClosed = Boolean(this._terminateState && this._terminateState.graceful);
+    if ((this._closed && !canRunWhileClosed) || this._circuitOpen) return;
+    if (this._slotBackoffTimers[index] !== null) return;
+    const remaining = this._slotBackoffUntil[index] - this._now();
+    if (remaining <= 0) {
+      this._slotBackoffUntil[index] = 0;
+      return;
+    }
+    this._slotBackoffTimers[index] = this._setTimeout(() => {
+      this._slotBackoffTimers[index] = null;
+      this._slotBackoffUntil[index] = 0;
+      const graceful = Boolean(this._terminateState && this._terminateState.graceful);
+      if (this._circuitOpen || (this._closed && !graceful)) return;
+      this._pump();
+      if (!this._closed) this._ensureMinWorkers();
+      this._checkIdle();
+    }, remaining);
+  }
+
+  _scheduleAnyBackoffSlots() {
+    const occupied = new Set();
+    for (const slot of this._slots) occupied.add(slot.index);
+    const now = this._now();
+    let anyInBackoff = false;
+    for (let i = 0; i < this._maxWorkers; i++) {
+      if (occupied.has(i)) continue;
+      if (
+        this._slotNeedsRespawn[i] &&
+        this._slotRespawns[i] < this._maxRespawnsPerSlot &&
+        this._isSlotInBackoff(i, now)
+      ) {
+        this._scheduleSlotBackoff(i);
+        anyInBackoff = true;
+      }
+    }
+    return anyInBackoff;
+  }
+
   _pickFreeSlotIndex() {
     const occupied = new Set();
     for (const slot of this._slots) occupied.add(slot.index);
+    const now = this._now();
     let freshCandidate = null;
     for (let i = 0; i < this._maxWorkers; i++) {
       if (occupied.has(i)) continue;
       if (this._slotNeedsRespawn[i]) {
         if (this._slotRespawns[i] < this._maxRespawnsPerSlot) {
-          return { index: i, isRespawn: true };
+          if (!this._isSlotInBackoff(i, now)) {
+            return { index: i, isRespawn: true };
+          }
         }
       } else if (freshCandidate === null) {
         freshCandidate = { index: i, isRespawn: false };
@@ -800,6 +977,13 @@ export class WorkerPool {
     } catch (err) {
       this._counters.spawned++;
       this._recordCrash(new WorkerCrashError('spawn failed: ' + (err && err.message), err));
+      if (isRespawn && this._slotRespawns[index] < this._maxRespawnsPerSlot) {
+        this._slotCrashStreak[index]++;
+        const delay = this._computeRespawnBackoffMs(this._slotCrashStreak[index]);
+        if (delay > 0) {
+          this._slotBackoffUntil[index] = this._now() + delay;
+        }
+      }
       return null;
     }
     this._counters.spawned++;
@@ -839,6 +1023,9 @@ export class WorkerPool {
       const slot = this._spawn();
       if (!slot) {
         this._checkBreaker();
+        if (!this._circuitOpen) {
+          this._scheduleAnyBackoffSlots();
+        }
         break;
       }
       this._armIdle(slot);
@@ -867,6 +1054,9 @@ export class WorkerPool {
       if (!slot) {
         if (this._slots.size >= this._maxWorkers) return;
         if (!this._pickFreeSlotIndex()) {
+          if (this._scheduleAnyBackoffSlots()) {
+            return;
+          }
           if (this._slots.size === 0) {
             const err = new WorkerCrashError(
               `Worker respawn limit exceeded (${this._maxRespawnsPerSlot} per slot)`,
@@ -883,6 +1073,7 @@ export class WorkerPool {
           if (this._circuitOpen) return;
           // Spawn failed but the breaker is still closed: fail one job rather than spin.
           this._settle(this._nextQueued(), 'fail', this._lastCrash);
+          this._checkBreaker();
           continue;
         }
       }
@@ -942,6 +1133,7 @@ export class WorkerPool {
       slot.idleTimer = this._setTimeout(() => {
         slot.idleTimer = null;
         if (!slot.dead && slot.state === 'idle' && this._slots.size > this._minWorkers) {
+          this._counters.trimmedWorkers++;
           this._destroySlot(slot);
         }
       }, this._idleTimeoutMs);
@@ -975,6 +1167,7 @@ export class WorkerPool {
     const job = slot.job;
     if (!job || job.settled || job.id !== id) return;
     if (data.ok === true) {
+      this._slotCrashStreak[slot.index] = 0;
       this._settle(job, 'ok', data.result);
       this._releaseSlot(slot);
     } else if (data.ok === false) {
@@ -1001,16 +1194,24 @@ export class WorkerPool {
     if (this._breakerMax > 0) {
       this._crashTimes.push(t);
       const cutoff = t - this._breakerWindow;
-      this._crashTimes = this._crashTimes.filter((c) => c > cutoff);
+      this._crashTimes = this._crashTimes.filter((c) => (this._breakerWindow === 0 ? c === t : c > cutoff));
     }
   }
 
   _onCrash(slot, error) {
     if (slot.dead) return;
     const job = slot.job;
-    this._slotNeedsRespawn[slot.index] = true;
+    const slotIndex = slot.index;
+    this._slotNeedsRespawn[slotIndex] = true;
     this._destroySlot(slot);
     this._recordCrash(error);
+    this._slotCrashStreak[slotIndex]++;
+    if (this._slotRespawns[slotIndex] < this._maxRespawnsPerSlot) {
+      const delay = this._computeRespawnBackoffMs(this._slotCrashStreak[slotIndex]);
+      if (delay > 0) {
+        this._slotBackoffUntil[slotIndex] = this._now() + delay;
+      }
+    }
     if (job && !job.settled) {
       job.slot = null;
       if (job.crashRetries < this._retries && job.transfer.length === 0 && !this._closed) {
@@ -1039,6 +1240,8 @@ export class WorkerPool {
     if (this._circuitOpen || this._breakerMax <= 0) return;
     if (this._crashTimes.length >= this._breakerMax) {
       this._circuitOpen = true;
+      this._counters.circuitBreakerTrips++;
+      this._clearAllBackoffTimers();
       const pending = [...this._drainQueued(), ...this._blocked];
       this._blocked = [];
       for (const job of pending) this._settle(job, 'fail', this._circuitError());
@@ -1047,6 +1250,14 @@ export class WorkerPool {
 
   _checkIdle() {
     if (!this._isIdle()) return;
+    if (this._slots.size >= this._minWorkers) {
+      for (let i = 0; i < this._maxWorkers; i++) {
+        if (this._slotBackoffTimers[i] !== null) {
+          this._clearTimeout(this._slotBackoffTimers[i]);
+          this._slotBackoffTimers[i] = null;
+        }
+      }
+    }
     const waiters = this._drainWaiters;
     this._drainWaiters = [];
     for (const resolve of waiters) resolve();
@@ -1056,6 +1267,7 @@ export class WorkerPool {
 
   _finishImmediate() {
     const st = this._terminateState;
+    this._clearAllBackoffTimers();
     const pending = [...this._drainQueued(), ...this._blocked];
     this._blocked = [];
     const running = [];
