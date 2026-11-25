@@ -45,6 +45,7 @@ add_library(playgta6_core STATIC
     gpu/d3d12_guest_resources.cpp
     gpu/d3d12_guest_command_list.cpp
     gpu/d3d12_xs_xbox.cpp
+    gpu/present_pacing.cpp
     gpu/d3d12_xs_dump.cpp
     gpu/shader_pack_index.cpp
     gpu/stage_reflection.cpp
@@ -259,6 +260,9 @@ else()
     add_executable(playgta6_boot guest/boot_main.cpp)
     target_link_libraries(playgta6_boot PRIVATE playgta6_core)
 
+    add_executable(test_present_pacing ../tests/test_present_pacing.cpp)
+    target_link_libraries(test_present_pacing PRIVATE playgta6_core)
+    add_test(NAME playgta6_present_pacing_tests COMMAND test_present_pacing)
     add_executable(test_log_rate_limiter ../tests/test_log_rate_limiter.cpp)
     target_link_libraries(test_log_rate_limiter PRIVATE playgta6_core)
     add_test(NAME playgta6_log_rate_limiter_tests COMMAND test_log_rate_limiter)

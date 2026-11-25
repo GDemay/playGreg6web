@@ -15,6 +15,7 @@
 #include <thread>
 #include <utility>
 
+#include "gpu/present_pacing.h"
 #include "guest/com_bridge.h"
 #include "guest/guest_crt_exit.h"
 #include "guest/guest_exceptions.h"
@@ -1940,6 +1941,16 @@ std::string build_report() {
              (os::guest_window::write_marks_verified() ? "true" : "false") +
              ", \"write_mark_misses\": " + std::to_string(os::guest_window::verify_misses()) + "}},\n";
     }
+    // O36: present pacing (gpu/present_pacing.h).
+    {
+        const gpu::PresentPacer::Stats ps = gpu::present_pacer().stats();
+        o += std::string("  \"present_pacing\": {\"enabled\": ") +
+             (gpu::present_pacer().enabled() ? "true" : "false") + ", \"presents\": " + std::to_string(ps.presents) +
+             ", \"immediate\": " + std::to_string(ps.immediate) + ", \"vblank_waits\": " + std::to_string(ps.waits) +
+             ", \"wait_ms\": " + std::to_string(ps.wait_us / 1000) +
+             ", \"missed_vblanks\": " + std::to_string(ps.missed_vblanks) +
+             ", \"last_interval\": " + std::to_string(ps.last_interval) + "},\n";
+    }
     // Schema 2: the import calls up to the first Present, per guest thread and import (null until a
     // Present was reported through mark_first_present), then the extension's members (per-Present samples).
     {
@@ -2517,6 +2528,10 @@ bool apply_boot_options_json(std::string_view json, BootConfig& config) {
     if (verify == "true" || verify == "false") {
         config.verify_window_marks = verify == "true";
     }
+    const std::string_view pacing = json_value(json, "present_pacing");
+    if (pacing == "true" || pacing == "false") {
+        config.present_pacing = pacing == "true";
+    }
     const std::string_view to_log = json_value(json, "report_to_log");
     if (to_log == "true") {
         config.report_sink = [](std::string_view report) { log_report_json(report); };
@@ -2741,6 +2756,7 @@ BootResult run_boot(const BootConfig& config) {
     b.off_thread_fault = config.off_thread_fault;
     b.report_sink = config.report_sink;
     os::guest_window::set_write_marks_verified(config.verify_window_marks);
+    gpu::present_pacer().set_enabled(config.present_pacing);
     b.guest_thread_started = config.guest_thread_started;
     {
         std::lock_guard<std::mutex> lock(b.arena_mutex);

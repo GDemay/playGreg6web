@@ -480,6 +480,9 @@ struct BootConfig {
     // O37: readers that use the translated window's write marks also compare the unmarked slots
     // and count the changes found there (report: memory.window.write_mark_misses).
     bool verify_window_marks = false;
+    // O36: presents wait for the title's sync interval on a 60 Hz display (gpu/present_pacing.h);
+    // off for benchmarks (report: present_pacing).
+    bool present_pacing = true;
 };
 
 struct BootResult {
@@ -495,7 +498,8 @@ BootResult run_boot(const BootConfig& config);
 
 // O36: run options of a boot that has no command line (the browser boot), as a JSON object:
 //   {"max_wall_ms": 300000, "max_dispatches": 0, "arena_log_limit": 4096,
-//    "import_trace_limit": 0, "report_to_log": true, "verify_window_marks": false}
+//    "import_trace_limit": 0, "report_to_log": true, "verify_window_marks": false,
+//    "present_pacing": true}
 // Every key is optional, unknown keys are ignored; "report_to_log" sets report_sink to
 // log_report_json. False (config unchanged) if `json` is not a JSON object.
 bool apply_boot_options_json(std::string_view json, BootConfig& config);

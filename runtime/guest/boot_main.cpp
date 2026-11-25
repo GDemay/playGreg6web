@@ -21,6 +21,7 @@
 //   --max-calls <n>      stop after n dispatched calls (0 = unbounded)
 //   --max-ms <n>         stop after n ms, checked at dispatches (0 = unbounded)
 //   --watchdog-ms <n>    hard limit: report and terminate even without dispatches (default 0)
+//   --no-present-pacing  presents do not wait for the 60 Hz vblank (benchmarks; gpu/present_pacing.h)
 //   --stack <bytes>      guest stack size (default: the image's SizeOfStackReserve)
 //   --host-stack-mb <n>  host stack of the boot thread (default 4096: lifted guest calls nest
 //                        host calls, so deep guest recursion needs a deep host stack)
@@ -183,6 +184,7 @@ struct Options {
     bool tls_callbacks = true;
     bool entry = true;
     bool quiet = false;
+    bool present_pacing = true;  // O36: --no-present-pacing turns it off (benchmarks)
 };
 
 Options g_options;
@@ -229,6 +231,8 @@ bool parse(int argc, char** argv, Options& o) {
             o.entry = false;
         } else if (a == "--quiet") {
             o.quiet = true;
+        } else if (a == "--no-present-pacing") {
+            o.present_pacing = false;
         } else if (a == "--gpu-capture-payloads") {
             o.gpu_capture_payloads = true;
         } else if (a == "--native-pipelines") {
@@ -826,6 +830,7 @@ void run_boot_thread() {
     cfg.survey_return = g_options.survey_return;
     cfg.max_dispatches = g_options.max_calls;
     cfg.max_wall_ms = g_options.max_ms;
+    cfg.present_pacing = g_options.present_pacing;
     cfg.run_tls_callbacks = g_options.tls_callbacks;
     cfg.call_entry = g_options.entry;
     cfg.log_progress = !g_options.quiet;

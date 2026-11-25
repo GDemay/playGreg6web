@@ -54,6 +54,7 @@
 // every interface are logging stubs with SlotPolicy::ReturnNotImpl (first call logged with the slot
 // index, every call counted in com::stub_hit_report()).
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -699,6 +700,12 @@ public:
 
     // ---- Xbox frame model (d3d12_xs_xbox.h) ----
     xbox::FramePacer& frame_pacer() { return pacer_; }
+    // O36: the sync interval of a PresentX in 60 Hz vblanks: the frame interval the title set
+    // (slot 78), rounded, at least one.
+    uint32_t present_interval_vblanks() const {
+        const uint32_t us = pacer_.interval_us();
+        return std::max<uint32_t>(1, (us + 8333) / 16667);
+    }
     // Wakes every WaitFrameEventX and makes later ones return at once (shutdown, tests).
     void shutdown_frame_events() { pacer_.shutdown(); }
     void count(xbox::Counter c, uint64_t n = 1) { xbox_counters_[static_cast<size_t>(c)].fetch_add(n); }
