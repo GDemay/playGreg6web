@@ -251,6 +251,9 @@ constexpr Guid kUserExt = com::make_guid("cef4fac0-7676-4a94-a119-4c43f9eb5b74")
 constexpr Guid kFeature = com::make_guid("8836fe87-edb9-4fe3-8dad-05f0d2cd5b40");
 constexpr Guid kSystemProvider = com::make_guid("e349bd1a-fc20-4e40-b99c-4178cc6b409f");
 constexpr Guid kSystemIid = com::make_guid("1861cf2e-e18b-4834-a9f5-b4a4e6efb4cf");
+constexpr Guid kStoreProvider = com::make_guid("0dd112ac-7c24-448c-b92b-3960fb5bd30c");
+constexpr Guid kStoreIid = com::make_guid("b09d803c-2414-4a05-82c6-66dfdc9e9a44");
+constexpr Guid kStoreExtIid = com::make_guid("2d42fea5-e71d-4b76-97cd-c50afbb3ae5d");
 constexpr Guid kPackageProvider = com::make_guid("af406016-e850-4aa8-a88d-2f3dcb9dac7e");
 constexpr Guid kPackageIid = com::make_guid("0b9d556e-ab70-43f4-baa0-9999ac4cb040");
 constexpr Guid kPlsProvider = com::make_guid("f4faf4d4-2d04-4fce-b3e0-474a713a3e84");
@@ -955,6 +958,86 @@ void test_http_client_thunks() {
     CHECK(fx.state().gpr[GuestReg::Rsp] == fx.thread.stack_top);
 }
 
+// XStoreExt (O37): slot 71 AcquireLicenseForDurablesAsync and partner slot 72 Result return a
+// truthful synchronous E_NOTIMPL offline failure (zero ownership/entitlement), while all other
+// slots remain trapping stubs.
+void test_store_ext_slots() {
+    Fixture fx;
+    int32_t hr = -1;
+    const uint64_t store = fx.query(kStoreProvider, kStoreIid, &hr);
+    CHECK(hr == 0 && store != 0);
+    const uint64_t store_ext = fx.query(kStoreProvider, kStoreExtIid, &hr);
+    CHECK(hr == 0 && store_ext != 0 && store_ext != store);
+
+    // Create a valid XStoreContextHandle via XStore slot 3.
+    const uint64_t ctx_out = fx.alloc(8);
+    CHECK(hr32(fx.vcall(store, 3, {0, ctx_out})) == 0);
+    const uint64_t ctx = load64(ctx_out);
+    CHECK(ctx != 0);
+
+    const uint64_t store_id = fx.cstring("9NBLGGH42RLT");
+    const uint64_t block = make_guest_block(fx, 0);
+    g_done_block = 0;
+
+    // Slot 71: truthful synchronous offline failure (E_NOTIMPL), no async shadow or fake completion.
+    const int32_t acquire_hr = hr32(fx.vcall(store_ext, 71, {ctx, store_id, block}));
+    CHECK(acquire_hr == com::E_NOTIMPL_HR);
+    CHECK(acquire_hr < 0);
+    CHECK(cbk::live_async_shadows() == 0);
+    CHECK(g_done_block == 0);
+
+    // Slot 71 argument validation: bogus/null context, null store_id, null async_block.
+    com::clear_diagnostics();
+    CHECK(hr32(fx.vcall(store_ext, 71, {0x1234, store_id, block})) == com::E_INVALIDARG_HR);
+    CHECK(diag_contains("invalid XStoreContextHandle"));
+    CHECK(hr32(fx.vcall(store_ext, 71, {0, store_id, block})) == com::E_INVALIDARG_HR);
+    CHECK(hr32(fx.vcall(store_ext, 71, {ctx, 0, block})) == com::E_INVALIDARG_HR);
+    CHECK(hr32(fx.vcall(store_ext, 71, {ctx, store_id, 0})) == com::E_INVALIDARG_HR);
+
+    // Slot 72: clears out license handle if non-null and returns E_NOTIMPL.
+    const uint64_t license_out = fx.alloc(8);
+    CHECK(com::write_guest(license_out, uint64_t{0xDEADBEEFULL}));
+    CHECK(hr32(fx.vcall(store_ext, 72, {block, license_out})) == com::E_NOTIMPL_HR);
+    CHECK(load64(license_out) == 0);
+    CHECK(hr32(fx.vcall(store_ext, 72, {block, 0})) == com::E_NOTIMPL_HR);
+    CHECK(hr32(fx.vcall(store_ext, 72, {0, license_out})) == com::E_NOTIMPL_HR);
+
+    // Unimplemented slots on XStoreExt (both before 71 and after 72) still trap unchanged.
+    for (uint32_t slot : {70u, 73u}) {
+        GuestFault fault{};
+        bool trapped = false;
+        try {
+            fx.vcall(store_ext, slot, {ctx, store_id, block});
+        } catch (const GuestFault& f) {
+            fault = f;
+            trapped = true;
+        }
+        fx.restore_stack();
+        CHECK(trapped);
+        CHECK(fault.info.kind == static_cast<uint32_t>(FaultKind::UnimplementedSlot));
+        CHECK(fault.info.detail == slot);
+    }
+    bool hit70 = false;
+    bool hit73 = false;
+    for (const com::StubHit& hit : com::stub_hit_report()) {
+        if (hit.iid == kStoreExtIid && hit.slot == 70 && hit.hits == 1) {
+            hit70 = true;
+        }
+        if (hit.iid == kStoreExtIid && hit.slot == 73 && hit.hits == 1) {
+            hit73 = true;
+        }
+    }
+    CHECK(hit70 && hit73);
+
+    // Closing the context makes subsequent slot 71 calls reject the stale handle.
+    fx.vcall(store, 4, {ctx});
+    CHECK(hr32(fx.vcall(store_ext, 71, {ctx, store_id, block})) == com::E_INVALIDARG_HR);
+
+    CHECK(fx.vcall(store_ext, 2) >= 1);
+    CHECK(fx.vcall(store, 2) >= 1);
+    CHECK(fx.state().gpr[GuestReg::Rsp] == fx.thread.stack_top);
+}
+
 }  // namespace
 
 int main() {
@@ -965,6 +1048,7 @@ int main() {
     test_unimplemented_slots();
     test_async_provider_slots();
     test_http_client_thunks();
+    test_store_ext_slots();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_xgameruntime_provider: %d failure(s)\n", g_failures);
         return 1;
