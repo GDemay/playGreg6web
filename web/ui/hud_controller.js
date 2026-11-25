@@ -80,6 +80,8 @@ const PTHREAD_TELEMETRY_FIELD_KEYS = Object.freeze([
 
 export const DEFAULT_MAX_VALIDATION_ERRORS = 32;
 export const MAX_VALIDATION_ERROR_MESSAGE_LENGTH = 256;
+export const DEFAULT_TOGGLE_KEY = 'F3';
+const SCRIPTED_INPUT_PRESET_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/i;
 const MAX_SIDE_MODULE_NAMES = 64;
 const SIDE_MODULE_LAYOUT_RE =
   /\bsplit-module\b[^()\r\n]*?\(\s*(\d+)\s+side\s+modules?\s*\)/i;
@@ -148,6 +150,12 @@ const BOOT_MODE_META = Object.freeze({
 });
 
 const SUPPORTED_DISPLAY_ELEMENTS = Object.freeze([
+  'hudRootEl',
+  'rootEl',
+  'hudRoot',
+  'scriptedInputBadge',
+  'scriptedInputBadgeEl',
+  'scriptedInputStatusEl',
   'bootModeBadge',
   'bootStatusEl',
   'sideModuleStatusEl',
@@ -863,6 +871,58 @@ function safeSetStyleWidth(el, width) {
   }
 }
 
+/**
+ * Strictly sanitizes a scripted-input preset identifier for HUD display.
+ * Accepts only `/^[a-z0-9][a-z0-9_-]{0,31}$/i` (rejecting paths, URLs,
+ * control characters, and arbitrary text to `null`).
+ *
+ * @param {unknown} raw
+ * @returns {string|null}
+ */
+export function sanitizeScriptedInputPreset(raw) {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const trimmed = raw.trim();
+  if (!trimmed || /[\x00-\x1F\x7F]/.test(trimmed)) {
+    return null;
+  }
+  if (!SCRIPTED_INPUT_PRESET_RE.test(trimmed)) {
+    return null;
+  }
+  return trimmed;
+}
+
+function isEditableEventTarget(target) {
+  if (!target || typeof target !== 'object') {
+    return false;
+  }
+  const tagName = typeof target.tagName === 'string' ? target.tagName.toUpperCase() : '';
+  if (tagName === 'INPUT' || tagName === 'TEXTAREA' || tagName === 'SELECT') {
+    return true;
+  }
+  if (target.isContentEditable === true) {
+    return true;
+  }
+  if (typeof target.getAttribute === 'function') {
+    try {
+      const ce = target.getAttribute('contenteditable');
+      if (ce !== null && ce !== undefined && String(ce).toLowerCase() !== 'false') {
+        return true;
+      }
+    } catch {
+      // Ignore mock getAttribute errors.
+    }
+  }
+  if (typeof target.contentEditable === 'string') {
+    const ce = target.contentEditable.toLowerCase();
+    if (ce === 'true' || ce === 'plaintext-only') {
+      return true;
+    }
+  }
+  return false;
+}
+
 export class HudController {
   /**
    * @param {object} [options]
@@ -902,6 +962,19 @@ export class HudController {
       bootMode = null,
       displayElements = null,
       elements = null,
+      hudRootEl = null,
+      rootEl = null,
+      hudRoot = null,
+      scriptedInputBadge = null,
+      scriptedInputBadgeEl = null,
+      scriptedInputStatusEl = null,
+      visible = true,
+      scriptedInputPreset = null,
+      enableToggleShortcut = false,
+      toggleShortcutTarget = undefined,
+      keyTarget = undefined,
+      toggleShortcutKey = undefined,
+      toggleKey = undefined,
       maxValidationErrors = DEFAULT_MAX_VALIDATION_ERRORS,
       maxValidationMessageLength = MAX_VALIDATION_ERROR_MESSAGE_LENGTH,
     } = options;
@@ -945,6 +1018,23 @@ export class HudController {
     this._boundListeners = [];
     this._boundElements = {};
     this._displayElements = {};
+    this._hudRootEl =
+      (hudRootEl && typeof hudRootEl === 'object' ? hudRootEl : null) ||
+      (rootEl && typeof rootEl === 'object' ? rootEl : null) ||
+      (hudRoot && typeof hudRoot === 'object' ? hudRoot : null) ||
+      null;
+    this._scriptedInputBadgeEl =
+      (scriptedInputBadge && typeof scriptedInputBadge === 'object' ? scriptedInputBadge : null) ||
+      (scriptedInputBadgeEl && typeof scriptedInputBadgeEl === 'object'
+        ? scriptedInputBadgeEl
+        : null) ||
+      (scriptedInputStatusEl && typeof scriptedInputStatusEl === 'object'
+        ? scriptedInputStatusEl
+        : null) ||
+      null;
+    this._visible = visible !== undefined ? Boolean(visible) : true;
+    this._scriptedInputPreset = sanitizeScriptedInputPreset(scriptedInputPreset);
+    this._toggleKeyBinding = null;
     this._exportingMissingShaders = false;
     this._destroyed = false;
 
@@ -1015,6 +1105,18 @@ export class HudController {
         : null;
     if (initialDisplayEls) {
       this.bindDisplayElements(initialDisplayEls);
+    } else {
+      this._renderVisibility();
+      if (this._scriptedInputBadgeEl) {
+        this._renderScriptedInputBadge();
+      }
+    }
+    if (enableToggleShortcut === true) {
+      const resolvedShortcutTarget =
+        toggleShortcutTarget !== undefined ? toggleShortcutTarget : keyTarget;
+      const resolvedShortcutKey =
+        toggleShortcutKey !== undefined ? toggleShortcutKey : toggleKey;
+      this.bindToggleKey(resolvedShortcutTarget, resolvedShortcutKey);
     }
     this._attachHudLogObserver();
     this._attachHudMetricsObserver();
@@ -4093,6 +4195,9 @@ export class HudController {
         `${validation.count} WebGPU validation error${validation.count === 1 ? '' : 's'}`
       );
     }
+    if (this._scriptedInputPreset) {
+      parts.push(`Scripted input: ${this._scriptedInputPreset}`);
+    }
 
     const statusLevel = validation.hasErrors ? 'error' : meta.statusLevel;
 
@@ -4105,6 +4210,8 @@ export class HudController {
       isRealWasm64: bootMode === BOOT_MODE.REAL_WASM64,
       isSmoke: bootMode === BOOT_MODE.SMOKE,
       isIdle: bootMode === BOOT_MODE.IDLE,
+      visible: this._visible,
+      scriptedInputPreset: this._scriptedInputPreset,
       milestone: this._bootStage,
       bootStage: this._bootStage || 'BOOTING',
       progressPct: this._bootProgressPct,
@@ -4294,6 +4401,9 @@ export class HudController {
       safeSetText(els.bootElapsedEl, formatElapsedSeconds(this._bootElapsedMs));
     }
 
+    this._renderVisibility();
+    this._renderScriptedInputBadge();
+
     if (
       options &&
       options.updateHudStatus === true &&
@@ -4304,6 +4414,260 @@ export class HudController {
     }
 
     return status;
+  }
+
+  // --- HUD Visibility Toggle & Scripted-Input Status Indicator (W143) ---
+
+  _getHudRootElement() {
+    const els = this._displayElements;
+    return els.hudRootEl || els.rootEl || els.hudRoot || this._hudRootEl || null;
+  }
+
+  _getScriptedInputBadgeElement() {
+    const els = this._displayElements;
+    return (
+      els.scriptedInputBadge ||
+      els.scriptedInputBadgeEl ||
+      els.scriptedInputStatusEl ||
+      this._scriptedInputBadgeEl ||
+      null
+    );
+  }
+
+  _renderVisibility() {
+    const rootEl = this._getHudRootElement();
+    if (!rootEl) {
+      return;
+    }
+    const hidden = !this._visible;
+    safeSetHidden(rootEl, hidden);
+    safeSetAttribute(rootEl, 'aria-hidden', hidden ? 'true' : 'false');
+    safeSetDataset(rootEl, 'hudVisible', this._visible ? 'true' : 'false');
+  }
+
+  _renderScriptedInputBadge() {
+    const badgeEl = this._getScriptedInputBadgeElement();
+    if (!badgeEl) {
+      return;
+    }
+    const preset = this._scriptedInputPreset;
+    if (preset) {
+      const label = `Scripted input: ${preset}`;
+      safeSetHidden(badgeEl, false);
+      safeSetAttribute(badgeEl, 'aria-hidden', 'false');
+      safeSetText(badgeEl, label);
+      safeSetDataset(badgeEl, 'preset', preset);
+      safeSetDataset(badgeEl, 'active', 'true');
+      safeSetDataset(badgeEl, 'state', 'info');
+      safeSetTitle(badgeEl, label);
+    } else {
+      safeSetHidden(badgeEl, true);
+      safeSetAttribute(badgeEl, 'aria-hidden', 'true');
+      safeSetText(badgeEl, '');
+      safeSetDataset(badgeEl, 'preset', '');
+      safeSetDataset(badgeEl, 'active', 'false');
+      safeSetDataset(badgeEl, 'state', '');
+      safeSetTitle(badgeEl, '');
+    }
+  }
+
+  /**
+   * Returns whether the HUD root container is currently visible (default `true`).
+   *
+   * @returns {boolean}
+   */
+  isVisible() {
+    return this._visible;
+  }
+
+  /**
+   * Sets HUD visibility, updating the bound root HUD element's `hidden`,
+   * `aria-hidden`, and `data-hud-visible` attributes cleanly. Safe no-op when
+   * no DOM root element is bound or after `destroy()`.
+   *
+   * @param {boolean} visible
+   * @returns {boolean} Current HUD visibility.
+   */
+  setVisible(visible) {
+    if (this._destroyed) {
+      return this._visible;
+    }
+    this._visible = Boolean(visible);
+    this._renderVisibility();
+    if (this._hud && typeof this._hud.setVisible === 'function') {
+      try {
+        this._hud.setVisible(this._visible);
+      } catch {
+        // Ignore optional HUD visibility callback errors.
+      }
+    }
+    return this._visible;
+  }
+
+  /**
+   * Toggles HUD visibility between visible and hidden.
+   *
+   * @returns {boolean} New HUD visibility.
+   */
+  toggleVisible() {
+    if (this._destroyed) {
+      return this._visible;
+    }
+    return this.setVisible(!this._visible);
+  }
+
+  /**
+   * Alias for `toggleVisible()`.
+   *
+   * @returns {boolean} New HUD visibility.
+   */
+  toggleVisibility() {
+    return this.toggleVisible();
+  }
+
+  /**
+   * Attaches a `keydown` listener on `target` (defaulting to `window` or `document`
+   * when available) that toggles HUD visibility on `key` (default `'F3'`) without
+   * interfering with text inputs (`<input>`, `<textarea>`, `<select>`, or
+   * `contenteditable` targets) or modifier chords. Replaces any previous toggle
+   * key binding to prevent duplicate listeners.
+   *
+   * @param {EventTarget|null|undefined} [target]
+   * @param {string} [key='F3']
+   * @returns {() => void} Idempotent unbind function.
+   */
+  bindToggleKey(target, key = DEFAULT_TOGGLE_KEY) {
+    if (this._destroyed) {
+      return () => {};
+    }
+
+    let resolvedTarget = target;
+    if (resolvedTarget === undefined) {
+      if (typeof window !== 'undefined' && window) {
+        resolvedTarget = window;
+      } else if (typeof document !== 'undefined' && document) {
+        resolvedTarget = document;
+      } else {
+        resolvedTarget = null;
+      }
+    }
+
+    if (resolvedTarget === null) {
+      this.unbindToggleKey();
+      return () => {};
+    }
+
+    if (
+      typeof resolvedTarget !== 'object' ||
+      typeof resolvedTarget.addEventListener !== 'function' ||
+      typeof resolvedTarget.removeEventListener !== 'function'
+    ) {
+      throw new TypeError(
+        'bindToggleKey requires an EventTarget with addEventListener/removeEventListener'
+      );
+    }
+
+    const normalizedKey =
+      typeof key === 'string' && key.trim().length > 0 ? key.trim() : DEFAULT_TOGGLE_KEY;
+    const expectedKeyLower = normalizedKey.toLowerCase();
+
+    this.unbindToggleKey();
+
+    const handler = (event) => {
+      if (this._destroyed || !event || typeof event !== 'object') {
+        return;
+      }
+      if (event.defaultPrevented || event.repeat) {
+        return;
+      }
+      if (event.ctrlKey || event.altKey || event.metaKey) {
+        return;
+      }
+      const eventKey = typeof event.key === 'string' ? event.key : '';
+      const eventCode = typeof event.code === 'string' ? event.code : '';
+      const matchesKey =
+        eventKey.toLowerCase() === expectedKeyLower ||
+        (expectedKeyLower === 'f3' && eventCode.toLowerCase() === 'f3');
+      if (!matchesKey) {
+        return;
+      }
+      if (isEditableEventTarget(event.target)) {
+        return;
+      }
+      if (typeof event.preventDefault === 'function') {
+        try {
+          event.preventDefault();
+        } catch {
+          // Ignore preventDefault errors on synthetic events.
+        }
+      }
+      this.toggleVisible();
+    };
+
+    resolvedTarget.addEventListener('keydown', handler);
+    this._toggleKeyBinding = {
+      target: resolvedTarget,
+      key: normalizedKey,
+      handler,
+    };
+
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      if (this._toggleKeyBinding && this._toggleKeyBinding.handler === handler) {
+        this.unbindToggleKey();
+      }
+    };
+  }
+
+  /**
+   * Removes any `keydown` shortcut listener previously attached via `bindToggleKey()`.
+   * Idempotent.
+   */
+  unbindToggleKey() {
+    const binding = this._toggleKeyBinding;
+    this._toggleKeyBinding = null;
+    if (!binding) {
+      return;
+    }
+    try {
+      binding.target.removeEventListener('keydown', binding.handler);
+    } catch {
+      // Ignore teardown errors from detached/mock targets.
+    }
+  }
+
+  /**
+   * Returns the currently active sanitized scripted-input preset name, or `null`
+   * when no scripted-input playback is active.
+   *
+   * @returns {string|null}
+   */
+  getScriptedInputStatus() {
+    return this._scriptedInputPreset;
+  }
+
+  /**
+   * Updates the scripted-input status indicator. Strictly validates preset names
+   * against `/^[a-z0-9][a-z0-9_-]{0,31}$/i` (rejecting paths, URLs, or arbitrary
+   * text to `null`), stores `scriptedInputPreset`, and renders cleanly into any
+   * bound badge element and HUD status line.
+   *
+   * @param {string|null|undefined} presetOrNull
+   * @param {{ updateHudStatus?: boolean }} [options]
+   * @returns {string|null} Sanitized active preset name or `null`.
+   */
+  setScriptedInputStatus(presetOrNull, options = {}) {
+    if (this._destroyed) {
+      return this._scriptedInputPreset;
+    }
+    const opts = isPlainObject(options) ? options : {};
+    this._scriptedInputPreset = sanitizeScriptedInputPreset(presetOrNull);
+    this._renderBootDiagnostics({
+      updateHudStatus: opts.updateHudStatus !== false,
+    });
+    return this._scriptedInputPreset;
   }
 
   /**
@@ -4701,8 +5065,11 @@ export class HudController {
     this._detachHudLogObserver();
     this._detachHudMetricsObserver();
     this._detachHudStatusObserver();
+    this.unbindToggleKey();
     this.unbindButtons();
     this.unbindDisplayElements();
+    this._hudRootEl = null;
+    this._scriptedInputBadgeEl = null;
     this._destroyed = true;
   }
 
@@ -4725,12 +5092,14 @@ export class HudController {
   }
 
   /**
-   * Returns a complete defensive HUD snapshot including control state, boot
-   * diagnostics, and honest GPU/Audio/Pthread telemetry.
+   * Returns a complete defensive HUD snapshot including control state, visibility,
+   * scripted-input status, boot diagnostics, and honest GPU/Audio/Pthread telemetry.
    */
   getSnapshot() {
     return {
       ...this.getState(),
+      visible: this._visible,
+      scriptedInputPreset: this._scriptedInputPreset,
       bootStatus: this.getBootStatus(),
       telemetry: this.getTelemetry(),
     };
