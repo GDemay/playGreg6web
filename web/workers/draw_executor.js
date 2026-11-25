@@ -46,6 +46,22 @@
   const DEFAULT_MAX_BIND_GROUP_CACHE_ENTRIES = 512;
   const DEFAULT_MAX_WGSL_HASH_CACHE_ENTRIES = 256;
 
+  // Fixed-slot fast paths for WebGPU guaranteed minimum slots (0..7 VBs, 0..3 BGs)
+  // enabling O(1) bitmask dirty tracking and zero-allocation hot draw execution (W282).
+  const MAX_FAST_VB_SLOTS = 8;
+  const MAX_FAST_BG_SLOTS = 4;
+  const MAX_FAST_DYN_OFFSETS = 8;
+
+  // Integer status codes for zero-allocation index/indirect buffer validation & pass binding.
+  const IB_STATUS_INVALID = 0;
+  const IB_STATUS_INVALID_RANGE = 1;
+  const IB_STATUS_EMITTED = 2;
+  const IB_STATUS_ELIDED = 3;
+
+  const INDIRECT_STATUS_INVALID = 0;
+  const INDIRECT_STATUS_INVALID_RANGE = 1;
+  const INDIRECT_STATUS_OK = 2;
+
   // Bitmask flags cached per pipeline object for zero-allocation UI/glyph/video draw accounting.
   const PIPE_FLAG_ALPHA_BLEND = 1 << 0;
   const PIPE_FLAG_UI_QUAD = 1 << 1;
@@ -694,12 +710,12 @@
     return true;
   }
 
-  function validateIndirectBuffer(indirectBuffer, indirectOffset, indexed) {
+  function validateIndirectBufferStatus(indirectBuffer, indirectOffset, indexed) {
     if (!isValidGpuBuffer(indirectBuffer, BUFFER_USAGE.INDIRECT)) {
-      return { ok: false, invalidRange: false };
+      return INDIRECT_STATUS_INVALID;
     }
     if (!Number.isInteger(indirectOffset) || indirectOffset < 0 || indirectOffset % 4 !== 0) {
-      return { ok: false, invalidRange: true };
+      return INDIRECT_STATUS_INVALID_RANGE;
     }
     const minBytes = indexed ? 20 : 16;
     const bufSize =
@@ -708,14 +724,14 @@
         : null;
     if (bufSize !== null) {
       if (bufSize < minBytes || indirectOffset + minBytes > bufSize) {
-        return { ok: false, invalidRange: true };
+        return INDIRECT_STATUS_INVALID_RANGE;
       }
     }
-    return { ok: true, invalidRange: false };
+    return INDIRECT_STATUS_OK;
   }
 
   function isValidIndirectBuffer(indirectBuffer, indirectOffset, indexed) {
-    return validateIndirectBuffer(indirectBuffer, indirectOffset, indexed).ok;
+    return validateIndirectBufferStatus(indirectBuffer, indirectOffset, indexed) === INDIRECT_STATUS_OK;
   }
 
   function isValidCbvBinding(entry) {
@@ -748,39 +764,39 @@
     return true;
   }
 
-  function isValidVertexBufferBinding(entry, requiredBytes, expectedStride) {
-    if (!entry) {
-      return false;
-    }
-    const buffer = entry.buffer !== undefined ? entry.buffer : entry;
+  function isValidVertexBufferParts(buffer, offset, size, stride, requiredBytes, expectedStride) {
     if (!isValidGpuBuffer(buffer, BUFFER_USAGE.VERTEX)) {
       return false;
     }
-    const offset = entry.offset !== undefined ? entry.offset : 0;
-    if (!Number.isInteger(offset) || offset < 0 || offset % VERTEX_OFFSET_ALIGNMENT !== 0) {
+    const normOffset = offset !== undefined ? offset : 0;
+    if (
+      !Number.isInteger(normOffset) ||
+      normOffset < 0 ||
+      normOffset % VERTEX_OFFSET_ALIGNMENT !== 0
+    ) {
       return false;
     }
     if (
       expectedStride !== undefined &&
       expectedStride !== null &&
-      entry.stride !== undefined &&
-      entry.stride !== null
+      stride !== undefined &&
+      stride !== null
     ) {
-      if (!Number.isFinite(entry.stride) || entry.stride <= 0 || entry.stride !== expectedStride) {
+      if (!Number.isFinite(stride) || stride <= 0 || stride !== expectedStride) {
         return false;
       }
     }
-    const bufSize = typeof buffer.size === 'number' && Number.isFinite(buffer.size) ? buffer.size : null;
+    const bufSize =
+      typeof buffer.size === 'number' && Number.isFinite(buffer.size) ? buffer.size : null;
     if (bufSize !== null) {
-      if (bufSize <= 0 || offset >= bufSize) {
+      if (bufSize <= 0 || normOffset >= bufSize) {
         return false;
       }
-      const explicitSize =
-        entry.size !== undefined && entry.size !== null ? entry.size : bufSize - offset;
+      const explicitSize = size !== undefined && size !== null ? size : bufSize - normOffset;
       if (!Number.isFinite(explicitSize) || explicitSize <= 0) {
         return false;
       }
-      if (offset + explicitSize > bufSize) {
+      if (normOffset + explicitSize > bufSize) {
         return false;
       }
       if (requiredBytes > 0 && explicitSize < requiredBytes) {
@@ -788,6 +804,21 @@
       }
     }
     return true;
+  }
+
+  function isValidVertexBufferBinding(entry, requiredBytes, expectedStride) {
+    if (!entry) {
+      return false;
+    }
+    const buffer = entry.buffer !== undefined ? entry.buffer : entry;
+    return isValidVertexBufferParts(
+      buffer,
+      entry.offset,
+      entry.size,
+      entry.stride,
+      requiredBytes,
+      expectedStride
+    );
   }
 
   function isValidTextureOrView(resource) {
@@ -942,7 +973,7 @@
     );
   }
 
-  function normalizeViewportArgs(xOrDesc, y, width, height, minDepth, maxDepth) {
+  function normalizeViewportArgsInto(out, xOrDesc, y, width, height, minDepth, maxDepth) {
     let vx;
     let vy;
     let vw;
@@ -985,12 +1016,18 @@
       vMax > 1 ||
       vMin > vMax
     ) {
-      return null;
+      return false;
     }
-    return { x: vx, y: vy, width: vw, height: vh, minDepth: vMin, maxDepth: vMax };
+    out.x = vx;
+    out.y = vy;
+    out.width = vw;
+    out.height = vh;
+    out.minDepth = vMin;
+    out.maxDepth = vMax;
+    return true;
   }
 
-  function normalizeScissorRectArgs(xOrDesc, y, width, height) {
+  function normalizeScissorRectArgsInto(out, xOrDesc, y, width, height) {
     let sx;
     let sy;
     let sw;
@@ -1016,19 +1053,23 @@
       !Number.isInteger(sh) ||
       sh < 0
     ) {
-      return null;
+      return false;
     }
-    return { x: sx, y: sy, width: sw, height: sh };
+    out.x = sx;
+    out.y = sy;
+    out.width = sw;
+    out.height = sh;
+    return true;
   }
 
-  function normalizeBlendConstantArgs(colorOrR, g, b, a) {
+  function normalizeBlendConstantArgsInto(out, colorOrR, g, b, a) {
     let cr;
     let cg;
     let cb;
     let ca;
     if (Array.isArray(colorOrR) || ArrayBuffer.isView(colorOrR)) {
       if (colorOrR.length < 4) {
-        return null;
+        return false;
       }
       cr = colorOrR[0];
       cg = colorOrR[1];
@@ -1055,9 +1096,13 @@
       typeof ca !== 'number' ||
       !Number.isFinite(ca)
     ) {
-      return null;
+      return false;
     }
-    return { r: cr, g: cg, b: cb, a: ca };
+    out.r = cr;
+    out.g = cg;
+    out.b = cb;
+    out.a = ca;
+    return true;
   }
 
   function normalizeStencilReference(reference) {
@@ -1065,6 +1110,95 @@
       return null;
     }
     return reference;
+  }
+
+  function createDrawResultObject(indexed, indirect, count, instanceCount, indirectOffset) {
+    if (indirect) {
+      return {
+        executed: false,
+        skipped: false,
+        reason: null,
+        isFallback: false,
+        profile: null,
+        effectiveProfile: null,
+        indexed,
+        indirect: true,
+        indirectOffset,
+        pipelineElided: false,
+        bindGroupsElided: 0,
+        vertexBuffersElided: 0,
+        indexBufferElided: false,
+        viewportElided: false,
+        scissorElided: false,
+        blendConstantElided: false,
+        stencilReferenceElided: false,
+        bindGroupCacheHit: false,
+        vertexCount: 0,
+        indexCount: 0,
+        instanceCount: 0,
+        substitutedCbv: false,
+        substitutedTexture: false,
+        substitutedSampler: false,
+        substitutedVertexBuffer: false,
+      };
+    }
+    return {
+      executed: false,
+      skipped: false,
+      reason: null,
+      isFallback: false,
+      profile: null,
+      effectiveProfile: null,
+      indexed,
+      indirect: false,
+      pipelineElided: false,
+      bindGroupsElided: 0,
+      vertexBuffersElided: 0,
+      indexBufferElided: false,
+      viewportElided: false,
+      scissorElided: false,
+      blendConstantElided: false,
+      stencilReferenceElided: false,
+      bindGroupCacheHit: false,
+      vertexCount: indexed ? 0 : count,
+      indexCount: indexed ? count : 0,
+      instanceCount,
+      substitutedCbv: false,
+      substitutedTexture: false,
+      substitutedSampler: false,
+      substitutedVertexBuffer: false,
+    };
+  }
+
+  function resetDrawResultInPlace(out, indexed, indirect, count, instanceCount, indirectOffset) {
+    out.executed = false;
+    out.skipped = false;
+    out.reason = null;
+    out.isFallback = false;
+    out.profile = null;
+    out.effectiveProfile = null;
+    out.indexed = indexed;
+    out.indirect = indirect;
+    if (indirect) {
+      out.indirectOffset = indirectOffset;
+    }
+    out.pipelineElided = false;
+    out.bindGroupsElided = 0;
+    out.vertexBuffersElided = 0;
+    out.indexBufferElided = false;
+    out.viewportElided = false;
+    out.scissorElided = false;
+    out.blendConstantElided = false;
+    out.stencilReferenceElided = false;
+    out.bindGroupCacheHit = false;
+    out.vertexCount = indirect || indexed ? 0 : count;
+    out.indexCount = indirect || !indexed ? 0 : count;
+    out.instanceCount = indirect ? 0 : instanceCount;
+    out.substitutedCbv = false;
+    out.substitutedTexture = false;
+    out.substitutedSampler = false;
+    out.substitutedVertexBuffer = false;
+    return out;
   }
 
   function createZeroedStats() {
@@ -1221,6 +1355,7 @@
         opts.elideRedundantBlendStencil !== undefined
           ? Boolean(opts.elideRedundantBlendStencil)
           : defaultElide;
+      this._reuseDrawResult = opts.reuseDrawResult === true;
       this._onWarning = typeof opts.onWarning === 'function' ? opts.onWarning : null;
 
       if (opts.shaderFallbackRouter !== undefined) {
@@ -1232,27 +1367,94 @@
         this._shaderFallbackRouter = null;
       }
 
-      // Active per-pass draw state.
+      // Active per-pass draw state (fixed-slot parallel arrays + bitmasks for O(1) dirty elision).
       this._activePipeline = null;
       this._boundPass = null;
       this._boundPipeline = null;
-      this._boundBindGroups = new Map();
-      this._boundVertexBuffers = new Map();
-      this._boundIndexBuffer = null;
-      this._boundViewport = null;
-      this._boundScissorRect = null;
-      this._boundBlendConstant = null;
+
+      // Fast bind-group slots 0..3 (WebGPU guaranteed minimum) + lazy overflow Map for slots >= 4.
+      this._stagedBgMask = 0;
+      this._stagedBgRaw = new Array(MAX_FAST_BG_SLOTS).fill(null);
+      this._stagedBgGroups = new Array(MAX_FAST_BG_SLOTS).fill(null);
+      this._stagedBgMeta = new Array(MAX_FAST_BG_SLOTS).fill(null);
+      this._stagedBgHasDyn = new Uint8Array(MAX_FAST_BG_SLOTS);
+      this._stagedBgDynSource = new Array(MAX_FAST_BG_SLOTS).fill(null);
+      this._stagedBgDynStart = new Int32Array(MAX_FAST_BG_SLOTS);
+      this._stagedBgDynLength = new Int32Array(MAX_FAST_BG_SLOTS);
+      this._stagedBgOverflow = null;
+
+      this._boundBgMask = 0;
+      this._dirtyBgMask = 0;
+      this._boundBgGroups = new Array(MAX_FAST_BG_SLOTS).fill(null);
+      this._boundBgHasDyn = new Uint8Array(MAX_FAST_BG_SLOTS);
+      this._boundBgDynLen = new Int32Array(MAX_FAST_BG_SLOTS);
+      this._boundBgDynOffsets = new Float64Array(MAX_FAST_BG_SLOTS * MAX_FAST_DYN_OFFSETS);
+      this._boundBgDynOverflow = new Array(MAX_FAST_BG_SLOTS).fill(null);
+      this._boundBgOverflow = null;
+
+      // Fast vertex-buffer slots 0..7 (WebGPU guaranteed minimum) + lazy overflow Map for slots >= 8.
+      this._stagedVbMask = 0;
+      this._stagedVbBuffers = new Array(MAX_FAST_VB_SLOTS).fill(null);
+      this._stagedVbOffsets = new Float64Array(MAX_FAST_VB_SLOTS);
+      this._stagedVbSizes = new Array(MAX_FAST_VB_SLOTS).fill(null);
+      this._stagedVbStrides = new Array(MAX_FAST_VB_SLOTS).fill(null);
+      this._stagedVbOverflow = null;
+
+      this._boundVbMask = 0;
+      this._dirtyVbMask = 0;
+      this._boundVbBuffers = new Array(MAX_FAST_VB_SLOTS).fill(null);
+      this._boundVbOffsets = new Float64Array(MAX_FAST_VB_SLOTS);
+      this._boundVbSizes = new Array(MAX_FAST_VB_SLOTS).fill(null);
+      this._boundVbOverflow = null;
+
+      // Preallocated staged & bound index-buffer / dynamic-state slots (zero per-call allocation).
+      this._hasStagedIb = false;
+      this._stagedIbBuffer = null;
+      this._stagedIbFormat = 'uint16';
+      this._stagedIbOffset = 0;
+      this._stagedIbSize = null;
+      this._hasBoundIb = false;
+      this._dirtyIb = false;
+      this._boundIbBuffer = null;
+      this._boundIbFormat = null;
+      this._boundIbOffset = 0;
+      this._boundIbSize = null;
+
+      this._hasStagedViewport = false;
+      this._stagedViewport = { x: 0, y: 0, width: 0, height: 0, minDepth: 0, maxDepth: 1 };
+      this._hasBoundViewport = false;
+      this._boundViewportData = { x: 0, y: 0, width: 0, height: 0, minDepth: 0, maxDepth: 1 };
+      this._tmpViewport = { x: 0, y: 0, width: 0, height: 0, minDepth: 0, maxDepth: 1 };
+
+      this._hasStagedScissor = false;
+      this._stagedScissor = { x: 0, y: 0, width: 0, height: 0 };
+      this._hasBoundScissor = false;
+      this._boundScissorData = { x: 0, y: 0, width: 0, height: 0 };
+      this._tmpScissor = { x: 0, y: 0, width: 0, height: 0 };
+
+      this._hasStagedBlendConstant = false;
+      this._stagedBlendConstant = { r: 0, g: 0, b: 0, a: 1 };
+      this._hasBoundBlendConstant = false;
+      this._boundBlendConstantData = { r: 0, g: 0, b: 0, a: 1 };
+      this._tmpBlendConstant = { r: 0, g: 0, b: 0, a: 1 };
+
+      this._stencilReference = null;
       this._boundStencilReference = null;
-      this._vertexBuffers = new Map();
-      this._indexBuffer = null;
-      this._bindGroups = new Map();
+
+      // Fallback auxiliary resource maps.
       this._cbvs = new Map();
       this._textures = new Map();
       this._samplers = new Map();
-      this._viewport = null;
-      this._scissorRect = null;
-      this._blendConstant = null;
-      this._stencilReference = null;
+
+      // Reusable draw result & frame-summary snapshots (zero-alloc opt-in paths).
+      this._reusableDrawResult = createDrawResultObject(false, false, 0, 1, 0);
+      this._reusableIndirectResult = createDrawResultObject(false, true, 0, 0, 0);
+      this._reusableFrameSummary = {
+        hasNonClearDraw: false,
+        realPackDrawsThisFrame: 0,
+        fallbackDrawsThisFrame: 0,
+        drawsThisFrame: 0,
+      };
 
       // Device-scoped resource caches & object identity maps (WeakMap avoids retention leaks).
       this._fallbackPipelineCache = new Map();
@@ -1521,10 +1723,12 @@
       return raw >= 1 ? 1 : raw;
     }
 
-    _recordSkip(reason, options) {
+    _recordSkip(reason, invalidRange) {
       this._stats.skippedDraws += 1;
       const key = typeof reason === 'string' && reason.length > 0 ? reason : 'unknown';
       this._stats.skippedByReason[key] = (this._stats.skippedByReason[key] || 0) + 1;
+      const isInvalidRange =
+        invalidRange === true || (invalidRange && invalidRange.invalidRange === true);
 
       if (key === 'executor-destroyed') {
         this._stats.skippedDestroyed += 1;
@@ -1541,12 +1745,12 @@
         this._stats.skippedNoPipeline += 1;
       } else if (key === 'invalid-index-buffer') {
         this._stats.skippedInvalidIndexBuffer += 1;
-        if (options && options.invalidRange === true) {
+        if (isInvalidRange) {
           this._stats.skippedInvalidRange += 1;
         }
       } else if (key === 'invalid-indirect-buffer') {
         this._stats.skippedInvalidIndirectBuffer += 1;
-        if (options && options.invalidRange === true) {
+        if (isInvalidRange) {
           this._stats.skippedInvalidRange += 1;
         }
       } else if (
@@ -1561,29 +1765,61 @@
       }
     }
 
+    _clearBoundBindGroups() {
+      let bgMask = this._boundBgMask;
+      while (bgMask !== 0) {
+        const bit = bgMask & -bgMask;
+        const slot = 31 - Math.clz32(bit);
+        bgMask ^= bit;
+        this._boundBgGroups[slot] = null;
+        this._boundBgHasDyn[slot] = 0;
+        this._boundBgDynLen[slot] = 0;
+      }
+      this._boundBgMask = 0;
+      this._dirtyBgMask = this._stagedBgMask;
+      if (this._boundBgOverflow !== null && this._boundBgOverflow.size > 0) {
+        this._boundBgOverflow.clear();
+      }
+    }
+
+    _clearBoundVertexBuffers() {
+      let vbMask = this._boundVbMask;
+      while (vbMask !== 0) {
+        const bit = vbMask & -vbMask;
+        const slot = 31 - Math.clz32(bit);
+        vbMask ^= bit;
+        this._boundVbBuffers[slot] = null;
+        this._boundVbOffsets[slot] = 0;
+        this._boundVbSizes[slot] = null;
+      }
+      this._boundVbMask = 0;
+      this._dirtyVbMask = this._stagedVbMask;
+      if (this._boundVbOverflow !== null && this._boundVbOverflow.size > 0) {
+        this._boundVbOverflow.clear();
+      }
+    }
+
     _clearBoundPassState() {
       this._boundPass = null;
       this._boundPipeline = null;
-      this._boundBindGroups.clear();
-      this._boundVertexBuffers.clear();
-      this._boundIndexBuffer = null;
-      this._boundViewport = null;
-      this._boundScissorRect = null;
-      this._boundBlendConstant = null;
+      this._clearBoundBindGroups();
+      this._clearBoundVertexBuffers();
+      this._hasBoundIb = false;
+      this._boundIbBuffer = null;
+      this._boundIbFormat = null;
+      this._boundIbOffset = 0;
+      this._boundIbSize = null;
+      this._dirtyIb = this._hasStagedIb;
+      this._hasBoundViewport = false;
+      this._hasBoundScissor = false;
+      this._hasBoundBlendConstant = false;
       this._boundStencilReference = null;
     }
 
     _syncPassTracking(pass) {
       if (this._boundPass !== pass) {
+        this._clearBoundPassState();
         this._boundPass = pass;
-        this._boundPipeline = null;
-        this._boundBindGroups.clear();
-        this._boundVertexBuffers.clear();
-        this._boundIndexBuffer = null;
-        this._boundViewport = null;
-        this._boundScissorRect = null;
-        this._boundBlendConstant = null;
-        this._boundStencilReference = null;
       }
     }
 
@@ -1594,7 +1830,7 @@
       this._bindGroupCache.clear();
       this._textureViewCache = new WeakMap();
       this._bindGroupLayoutCache = new WeakMap();
-      this._boundBindGroups.clear();
+      this._clearBoundBindGroups();
     }
 
     _getOrCreateCachedBindGroupInternal(cacheKey, getLayoutFn, label, entries, trackedResources) {
@@ -1757,6 +1993,11 @@
      * Return a JSON-serializable summary of draws executed in the current frame
      * for swapchain visible-frame readiness tracking (W251 -> W231).
      *
+     * Pass `true` or `{ reuse: true }` to fill and return a single preallocated
+     * mutable snapshot object (zero heap allocation), or pass a caller-owned target
+     * object to populate in place. Omit arguments for a fresh 4-field snapshot.
+     *
+     * @param {boolean | { reuse?: boolean } | object} [targetOrOptions]
      * @returns {{
      *   hasNonClearDraw: boolean,
      *   realPackDrawsThisFrame: number,
@@ -1764,7 +2005,24 @@
      *   drawsThisFrame: number,
      * }}
      */
-    getFrameDrawSummary() {
+    getFrameDrawSummary(targetOrOptions) {
+      if (targetOrOptions === true) {
+        const out = this._reusableFrameSummary;
+        out.hasNonClearDraw = this._frameHasNonClearDraw;
+        out.realPackDrawsThisFrame = this._frameRealPackDraws;
+        out.fallbackDrawsThisFrame = this._frameFallbackDraws;
+        out.drawsThisFrame = this._frameDraws;
+        return out;
+      }
+      if (targetOrOptions !== null && typeof targetOrOptions === 'object') {
+        const out =
+          targetOrOptions.reuse === true ? this._reusableFrameSummary : targetOrOptions;
+        out.hasNonClearDraw = this._frameHasNonClearDraw;
+        out.realPackDrawsThisFrame = this._frameRealPackDraws;
+        out.fallbackDrawsThisFrame = this._frameFallbackDraws;
+        out.drawsThisFrame = this._frameDraws;
+        return out;
+      }
       return {
         hasNonClearDraw: this._frameHasNonClearDraw,
         realPackDrawsThisFrame: this._frameRealPackDraws,
@@ -1803,16 +2061,54 @@
      */
     resetState() {
       this._activePipeline = null;
+
+      let vbMask = this._stagedVbMask;
+      while (vbMask !== 0) {
+        const bit = vbMask & -vbMask;
+        const slot = 31 - Math.clz32(bit);
+        vbMask ^= bit;
+        this._stagedVbBuffers[slot] = null;
+        this._stagedVbOffsets[slot] = 0;
+        this._stagedVbSizes[slot] = null;
+        this._stagedVbStrides[slot] = null;
+      }
+      this._stagedVbMask = 0;
+      if (this._stagedVbOverflow !== null && this._stagedVbOverflow.size > 0) {
+        this._stagedVbOverflow.clear();
+      }
+
+      let bgMask = this._stagedBgMask;
+      while (bgMask !== 0) {
+        const bit = bgMask & -bgMask;
+        const slot = 31 - Math.clz32(bit);
+        bgMask ^= bit;
+        this._stagedBgRaw[slot] = null;
+        this._stagedBgGroups[slot] = null;
+        this._stagedBgMeta[slot] = null;
+        this._stagedBgHasDyn[slot] = 0;
+        this._stagedBgDynSource[slot] = null;
+        this._stagedBgDynStart[slot] = 0;
+        this._stagedBgDynLength[slot] = -1;
+      }
+      this._stagedBgMask = 0;
+      if (this._stagedBgOverflow !== null && this._stagedBgOverflow.size > 0) {
+        this._stagedBgOverflow.clear();
+      }
+
+      this._hasStagedIb = false;
+      this._stagedIbBuffer = null;
+      this._stagedIbFormat = 'uint16';
+      this._stagedIbOffset = 0;
+      this._stagedIbSize = null;
+      this._dirtyIb = false;
+
       this._clearBoundPassState();
-      this._vertexBuffers.clear();
-      this._indexBuffer = null;
-      this._bindGroups.clear();
       this._cbvs.clear();
       this._textures.clear();
       this._samplers.clear();
-      this._viewport = null;
-      this._scissorRect = null;
-      this._blendConstant = null;
+      this._hasStagedViewport = false;
+      this._hasStagedScissor = false;
+      this._hasStagedBlendConstant = false;
       this._stencilReference = null;
     }
 
@@ -1832,6 +2128,71 @@
           this._fallbackShaderModuleCache.clear();
           this._wgslHashCache.clear();
         }
+      }
+    }
+
+    _fastDynamicOffsetsEqual(slot, hasDyn, src, start, explicitLen) {
+      if (this._boundBgHasDyn[slot] !== hasDyn) {
+        return false;
+      }
+      if (hasDyn === 0) {
+        return true;
+      }
+      const len = explicitLen >= 0 ? explicitLen : src.length;
+      if (this._boundBgDynLen[slot] !== len) {
+        return false;
+      }
+      if (len === 0) {
+        return true;
+      }
+      if (len <= MAX_FAST_DYN_OFFSETS) {
+        const snap = this._boundBgDynOffsets;
+        const base = slot * MAX_FAST_DYN_OFFSETS;
+        for (let i = 0; i < len; i += 1) {
+          if (snap[base + i] !== src[start + i]) {
+            return false;
+          }
+        }
+        return true;
+      }
+      const overflow = this._boundBgDynOverflow[slot];
+      if (!overflow || overflow.length < len) {
+        return false;
+      }
+      for (let i = 0; i < len; i += 1) {
+        if (overflow[i] !== src[start + i]) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    _copyFastDynamicOffsets(slot, hasDyn, src, start, explicitLen) {
+      this._boundBgHasDyn[slot] = hasDyn;
+      if (hasDyn === 0) {
+        this._boundBgDynLen[slot] = 0;
+        return;
+      }
+      const len = explicitLen >= 0 ? explicitLen : src.length;
+      this._boundBgDynLen[slot] = len;
+      if (len === 0) {
+        return;
+      }
+      if (len <= MAX_FAST_DYN_OFFSETS) {
+        const snap = this._boundBgDynOffsets;
+        const base = slot * MAX_FAST_DYN_OFFSETS;
+        for (let i = 0; i < len; i += 1) {
+          snap[base + i] = src[start + i];
+        }
+        return;
+      }
+      let overflow = this._boundBgDynOverflow[slot];
+      if (!overflow || overflow.length < len) {
+        overflow = new Float64Array(len);
+        this._boundBgDynOverflow[slot] = overflow;
+      }
+      for (let i = 0; i < len; i += 1) {
+        overflow[i] = src[start + i];
       }
     }
 
@@ -1855,16 +2216,82 @@
       return true;
     }
 
-    _bindBindGroupOnPass(pass, groupIndex, bindGroup, dynamicOffsets) {
-      this._syncPassTracking(pass);
-      const offsets = dynamicOffsets !== undefined ? dynamicOffsets : null;
+    _bindFastBindGroupOnPassSynced(pass, slot, bit, bindGroup, hasDyn, src, start, explicitLen) {
       if (
         this._elideRedundantBindGroups &&
+        (this._boundBgMask & bit) !== 0 &&
+        bindGroup !== null &&
+        bindGroup !== undefined &&
+        bindGroup.destroyed !== true &&
+        this._boundBgGroups[slot] === bindGroup &&
+        this._fastDynamicOffsetsEqual(slot, hasDyn, src, start, explicitLen)
+      ) {
+        this._dirtyBgMask &= ~bit;
+        return false;
+      }
+      if (hasDyn === 1) {
+        const len = explicitLen >= 0 ? explicitLen : src.length;
+        if (start === 0 && len === src.length) {
+          pass.setBindGroup(slot, bindGroup, src);
+        } else {
+          const slice =
+            typeof src.subarray === 'function'
+              ? src.subarray(start, start + len)
+              : Array.prototype.slice.call(src, start, start + len);
+          pass.setBindGroup(slot, bindGroup, slice);
+        }
+      } else {
+        pass.setBindGroup(slot, bindGroup);
+      }
+      this._totalStateCalls += 1;
+      this._boundBgMask |= bit;
+      this._boundBgGroups[slot] = bindGroup;
+      this._copyFastDynamicOffsets(slot, hasDyn, src, start, explicitLen);
+      if (
+        (this._stagedBgMask & bit) !== 0 &&
+        this._stagedBgGroups[slot] === bindGroup &&
+        this._stagedBgHasDyn[slot] === hasDyn
+      ) {
+        this._dirtyBgMask &= ~bit;
+      } else if ((this._stagedBgMask & bit) !== 0) {
+        this._dirtyBgMask |= bit;
+      }
+      return true;
+    }
+
+    _bindBindGroupOnPass(pass, groupIndex, bindGroup, dynamicOffsets) {
+      this._syncPassTracking(pass);
+      const hasDyn = dynamicOffsets !== null && dynamicOffsets !== undefined ? 1 : 0;
+      if (groupIndex >= 0 && groupIndex < MAX_FAST_BG_SLOTS) {
+        const bit = 1 << groupIndex;
+        const bound = this._bindFastBindGroupOnPassSynced(
+          pass,
+          groupIndex,
+          bit,
+          bindGroup,
+          hasDyn,
+          hasDyn === 1 ? dynamicOffsets : null,
+          0,
+          -1
+        );
+        if (!bound) {
+          this._stats.redundantBindGroupSkips += 1;
+          this._stats.elidedBindGroupSets += 1;
+          this._stats.totalElidedStateCalls += 1;
+          this._totalStateCalls += 1;
+        }
+        return bound;
+      }
+
+      const offsets = hasDyn === 1 ? dynamicOffsets : null;
+      if (
+        this._elideRedundantBindGroups &&
+        this._boundBgOverflow !== null &&
         bindGroup !== null &&
         bindGroup !== undefined &&
         bindGroup.destroyed !== true
       ) {
-        const bound = this._boundBindGroups.get(groupIndex);
+        const bound = this._boundBgOverflow.get(groupIndex);
         if (bound && bound.bindGroup === bindGroup && dynamicOffsetsEqual(bound, offsets)) {
           this._stats.redundantBindGroupSkips += 1;
           this._stats.elidedBindGroupSets += 1;
@@ -1879,7 +2306,10 @@
         pass.setBindGroup(groupIndex, bindGroup);
       }
       this._totalStateCalls += 1;
-      let record = this._boundBindGroups.get(groupIndex);
+      if (this._boundBgOverflow === null) {
+        this._boundBgOverflow = new Map();
+      }
+      let record = this._boundBgOverflow.get(groupIndex);
       if (!record) {
         record = {
           bindGroup,
@@ -1887,7 +2317,7 @@
           dynamicOffsetsLength: 0,
           dynamicOffsetsSnapshot: null,
         };
-        this._boundBindGroups.set(groupIndex, record);
+        this._boundBgOverflow.set(groupIndex, record);
       } else {
         record.bindGroup = bindGroup;
       }
@@ -1895,18 +2325,71 @@
       return true;
     }
 
-    _bindVertexBufferOnPass(pass, slot, buffer, offset, size) {
-      this._syncPassTracking(pass);
+    _bindFastVertexBufferOnPassSynced(pass, slot, bit, buffer, offset, size) {
       const normOffset = offset || 0;
       const hasSize = size !== undefined && size !== null;
       const normSize = hasSize ? size : null;
       if (
         this._elideRedundantVertexBuffers &&
+        (this._boundVbMask & bit) !== 0 &&
+        buffer !== null &&
+        buffer !== undefined &&
+        buffer.destroyed !== true &&
+        this._boundVbBuffers[slot] === buffer &&
+        this._boundVbOffsets[slot] === normOffset &&
+        this._boundVbSizes[slot] === normSize
+      ) {
+        this._dirtyVbMask &= ~bit;
+        return false;
+      }
+      if (hasSize) {
+        pass.setVertexBuffer(slot, buffer, normOffset, size);
+      } else {
+        pass.setVertexBuffer(slot, buffer, normOffset);
+      }
+      this._totalStateCalls += 1;
+      this._boundVbMask |= bit;
+      this._boundVbBuffers[slot] = buffer;
+      this._boundVbOffsets[slot] = normOffset;
+      this._boundVbSizes[slot] = normSize;
+      if (
+        (this._stagedVbMask & bit) !== 0 &&
+        this._stagedVbBuffers[slot] === buffer &&
+        (this._stagedVbOffsets[slot] || 0) === normOffset &&
+        this._stagedVbSizes[slot] === normSize
+      ) {
+        this._dirtyVbMask &= ~bit;
+      } else if ((this._stagedVbMask & bit) !== 0) {
+        this._dirtyVbMask |= bit;
+      }
+      return true;
+    }
+
+    _bindVertexBufferOnPass(pass, slot, buffer, offset, size) {
+      this._syncPassTracking(pass);
+      if (slot >= 0 && slot < MAX_FAST_VB_SLOTS) {
+        const bit = 1 << slot;
+        const bound = this._bindFastVertexBufferOnPassSynced(pass, slot, bit, buffer, offset, size);
+        if (!bound) {
+          this._stats.redundantVertexBufferSkips += 1;
+          this._stats.elidedVertexBufferSets += 1;
+          this._stats.totalElidedStateCalls += 1;
+          this._totalStateCalls += 1;
+        }
+        return bound;
+      }
+
+      const normOffset = offset || 0;
+      const hasSize = size !== undefined && size !== null;
+      const normSize = hasSize ? size : null;
+      if (
+        this._elideRedundantVertexBuffers &&
+        this._boundVbOverflow !== null &&
         buffer !== null &&
         buffer !== undefined &&
         buffer.destroyed !== true
       ) {
-        const bound = this._boundVertexBuffers.get(slot);
+        const bound = this._boundVbOverflow.get(slot);
         if (
           bound &&
           bound.buffer === buffer &&
@@ -1926,10 +2409,13 @@
         pass.setVertexBuffer(slot, buffer, normOffset);
       }
       this._totalStateCalls += 1;
-      let record = this._boundVertexBuffers.get(slot);
+      if (this._boundVbOverflow === null) {
+        this._boundVbOverflow = new Map();
+      }
+      let record = this._boundVbOverflow.get(slot);
       if (!record) {
         record = { buffer, offset: normOffset, size: normSize };
-        this._boundVertexBuffers.set(slot, record);
+        this._boundVbOverflow.set(slot, record);
       } else {
         record.buffer = buffer;
         record.offset = normOffset;
@@ -1945,15 +2431,16 @@
       const normSize = hasSize ? size : null;
       if (
         this._elideRedundantIndexBuffers &&
-        this._boundIndexBuffer &&
-        this._boundIndexBuffer.buffer === buffer &&
-        this._boundIndexBuffer.indexFormat === indexFormat &&
-        this._boundIndexBuffer.offset === normOffset &&
-        this._boundIndexBuffer.size === normSize &&
+        this._hasBoundIb &&
+        this._boundIbBuffer === buffer &&
+        this._boundIbFormat === indexFormat &&
+        this._boundIbOffset === normOffset &&
+        this._boundIbSize === normSize &&
         buffer !== null &&
         buffer !== undefined &&
         buffer.destroyed !== true
       ) {
+        this._dirtyIb = false;
         this._stats.redundantIndexBufferSkips += 1;
         this._stats.elidedIndexBufferSets += 1;
         this._stats.totalElidedStateCalls += 1;
@@ -1966,19 +2453,12 @@
         pass.setIndexBuffer(buffer, indexFormat, normOffset);
       }
       this._totalStateCalls += 1;
-      if (!this._boundIndexBuffer) {
-        this._boundIndexBuffer = {
-          buffer,
-          indexFormat,
-          offset: normOffset,
-          size: normSize,
-        };
-      } else {
-        this._boundIndexBuffer.buffer = buffer;
-        this._boundIndexBuffer.indexFormat = indexFormat;
-        this._boundIndexBuffer.offset = normOffset;
-        this._boundIndexBuffer.size = normSize;
-      }
+      this._hasBoundIb = true;
+      this._boundIbBuffer = buffer;
+      this._boundIbFormat = indexFormat;
+      this._boundIbOffset = normOffset;
+      this._boundIbSize = normSize;
+      this._dirtyIb = false;
       return true;
     }
 
@@ -1987,41 +2467,32 @@
       if (typeof pass.setViewport !== 'function') {
         return BIND_STATUS_UNSUPPORTED;
       }
-      const bound = this._boundViewport;
-      if (
-        this._elideRedundantViewportScissor &&
-        bound !== null &&
-        bound.x === vp.x &&
-        bound.y === vp.y &&
-        bound.width === vp.width &&
-        bound.height === vp.height &&
-        bound.minDepth === vp.minDepth &&
-        bound.maxDepth === vp.maxDepth
-      ) {
-        this._stats.elidedViewportScissorSets += 1;
-        this._stats.totalElidedStateCalls += 1;
-        this._totalStateCalls += 1;
-        return BIND_STATUS_ELIDED;
+      if (this._elideRedundantViewportScissor && this._hasBoundViewport) {
+        const bound = this._boundViewportData;
+        if (
+          bound.x === vp.x &&
+          bound.y === vp.y &&
+          bound.width === vp.width &&
+          bound.height === vp.height &&
+          bound.minDepth === vp.minDepth &&
+          bound.maxDepth === vp.maxDepth
+        ) {
+          this._stats.elidedViewportScissorSets += 1;
+          this._stats.totalElidedStateCalls += 1;
+          this._totalStateCalls += 1;
+          return BIND_STATUS_ELIDED;
+        }
       }
       pass.setViewport(vp.x, vp.y, vp.width, vp.height, vp.minDepth, vp.maxDepth);
       this._totalStateCalls += 1;
-      if (!this._boundViewport) {
-        this._boundViewport = {
-          x: vp.x,
-          y: vp.y,
-          width: vp.width,
-          height: vp.height,
-          minDepth: vp.minDepth,
-          maxDepth: vp.maxDepth,
-        };
-      } else {
-        this._boundViewport.x = vp.x;
-        this._boundViewport.y = vp.y;
-        this._boundViewport.width = vp.width;
-        this._boundViewport.height = vp.height;
-        this._boundViewport.minDepth = vp.minDepth;
-        this._boundViewport.maxDepth = vp.maxDepth;
-      }
+      const bound = this._boundViewportData;
+      bound.x = vp.x;
+      bound.y = vp.y;
+      bound.width = vp.width;
+      bound.height = vp.height;
+      bound.minDepth = vp.minDepth;
+      bound.maxDepth = vp.maxDepth;
+      this._hasBoundViewport = true;
       return BIND_STATUS_EMITTED;
     }
 
@@ -2030,35 +2501,28 @@
       if (typeof pass.setScissorRect !== 'function') {
         return BIND_STATUS_UNSUPPORTED;
       }
-      const bound = this._boundScissorRect;
-      if (
-        this._elideRedundantViewportScissor &&
-        bound !== null &&
-        bound.x === sc.x &&
-        bound.y === sc.y &&
-        bound.width === sc.width &&
-        bound.height === sc.height
-      ) {
-        this._stats.elidedViewportScissorSets += 1;
-        this._stats.totalElidedStateCalls += 1;
-        this._totalStateCalls += 1;
-        return BIND_STATUS_ELIDED;
+      if (this._elideRedundantViewportScissor && this._hasBoundScissor) {
+        const bound = this._boundScissorData;
+        if (
+          bound.x === sc.x &&
+          bound.y === sc.y &&
+          bound.width === sc.width &&
+          bound.height === sc.height
+        ) {
+          this._stats.elidedViewportScissorSets += 1;
+          this._stats.totalElidedStateCalls += 1;
+          this._totalStateCalls += 1;
+          return BIND_STATUS_ELIDED;
+        }
       }
       pass.setScissorRect(sc.x, sc.y, sc.width, sc.height);
       this._totalStateCalls += 1;
-      if (!this._boundScissorRect) {
-        this._boundScissorRect = {
-          x: sc.x,
-          y: sc.y,
-          width: sc.width,
-          height: sc.height,
-        };
-      } else {
-        this._boundScissorRect.x = sc.x;
-        this._boundScissorRect.y = sc.y;
-        this._boundScissorRect.width = sc.width;
-        this._boundScissorRect.height = sc.height;
-      }
+      const bound = this._boundScissorData;
+      bound.x = sc.x;
+      bound.y = sc.y;
+      bound.width = sc.width;
+      bound.height = sc.height;
+      this._hasBoundScissor = true;
       return BIND_STATUS_EMITTED;
     }
 
@@ -2067,30 +2531,23 @@
       if (typeof pass.setBlendConstant !== 'function') {
         return BIND_STATUS_UNSUPPORTED;
       }
-      const bound = this._boundBlendConstant;
-      if (
-        this._elideRedundantBlendStencil &&
-        bound !== null &&
-        bound.r === bc.r &&
-        bound.g === bc.g &&
-        bound.b === bc.b &&
-        bound.a === bc.a
-      ) {
-        this._stats.elidedBlendConstantSets += 1;
-        this._stats.totalElidedStateCalls += 1;
-        this._totalStateCalls += 1;
-        return BIND_STATUS_ELIDED;
+      if (this._elideRedundantBlendStencil && this._hasBoundBlendConstant) {
+        const bound = this._boundBlendConstantData;
+        if (bound.r === bc.r && bound.g === bc.g && bound.b === bc.b && bound.a === bc.a) {
+          this._stats.elidedBlendConstantSets += 1;
+          this._stats.totalElidedStateCalls += 1;
+          this._totalStateCalls += 1;
+          return BIND_STATUS_ELIDED;
+        }
       }
       pass.setBlendConstant({ r: bc.r, g: bc.g, b: bc.b, a: bc.a });
       this._totalStateCalls += 1;
-      if (!this._boundBlendConstant) {
-        this._boundBlendConstant = { r: bc.r, g: bc.g, b: bc.b, a: bc.a };
-      } else {
-        this._boundBlendConstant.r = bc.r;
-        this._boundBlendConstant.g = bc.g;
-        this._boundBlendConstant.b = bc.b;
-        this._boundBlendConstant.a = bc.a;
-      }
+      const bound = this._boundBlendConstantData;
+      bound.r = bc.r;
+      bound.g = bc.g;
+      bound.b = bc.b;
+      bound.a = bc.a;
+      this._hasBoundBlendConstant = true;
       return BIND_STATUS_EMITTED;
     }
 
@@ -2112,50 +2569,86 @@
     }
 
     _bindPassDynamicState(pass, args, result) {
-      const vp =
-        args && args.viewport !== undefined
-          ? args.viewport === null
-            ? null
-            : normalizeViewportArgs(args.viewport)
-          : this._viewport;
-      if (vp !== null) {
-        if (this._bindViewportOnPass(pass, vp) === BIND_STATUS_ELIDED) {
+      if (args === null) {
+        if (this._hasStagedViewport) {
+          if (this._bindViewportOnPass(pass, this._stagedViewport) === BIND_STATUS_ELIDED) {
+            result.viewportElided = true;
+          }
+        }
+        if (this._hasStagedScissor) {
+          if (this._bindScissorRectOnPass(pass, this._stagedScissor) === BIND_STATUS_ELIDED) {
+            result.scissorElided = true;
+          }
+        }
+        if (this._hasStagedBlendConstant) {
+          if (
+            this._bindBlendConstantOnPass(pass, this._stagedBlendConstant) === BIND_STATUS_ELIDED
+          ) {
+            result.blendConstantElided = true;
+          }
+        }
+        if (this._stencilReference !== null) {
+          if (
+            this._bindStencilReferenceOnPass(pass, this._stencilReference) === BIND_STATUS_ELIDED
+          ) {
+            result.stencilReferenceElided = true;
+          }
+        }
+        return;
+      }
+
+      if (args.viewport !== undefined) {
+        if (
+          args.viewport !== null &&
+          normalizeViewportArgsInto(this._tmpViewport, args.viewport)
+        ) {
+          if (this._bindViewportOnPass(pass, this._tmpViewport) === BIND_STATUS_ELIDED) {
+            result.viewportElided = true;
+          }
+        }
+      } else if (this._hasStagedViewport) {
+        if (this._bindViewportOnPass(pass, this._stagedViewport) === BIND_STATUS_ELIDED) {
           result.viewportElided = true;
         }
       }
 
       const rawScissor =
-        args && args.scissorRect !== undefined
+        args.scissorRect !== undefined
           ? args.scissorRect
-          : args && args.scissor !== undefined
+          : args.scissor !== undefined
             ? args.scissor
             : undefined;
-      const sc =
-        rawScissor !== undefined
-          ? rawScissor === null
-            ? null
-            : normalizeScissorRectArgs(rawScissor)
-          : this._scissorRect;
-      if (sc !== null) {
-        if (this._bindScissorRectOnPass(pass, sc) === BIND_STATUS_ELIDED) {
+      if (rawScissor !== undefined) {
+        if (rawScissor !== null && normalizeScissorRectArgsInto(this._tmpScissor, rawScissor)) {
+          if (this._bindScissorRectOnPass(pass, this._tmpScissor) === BIND_STATUS_ELIDED) {
+            result.scissorElided = true;
+          }
+        }
+      } else if (this._hasStagedScissor) {
+        if (this._bindScissorRectOnPass(pass, this._stagedScissor) === BIND_STATUS_ELIDED) {
           result.scissorElided = true;
         }
       }
 
-      const bc =
-        args && args.blendConstant !== undefined
-          ? args.blendConstant === null
-            ? null
-            : normalizeBlendConstantArgs(args.blendConstant)
-          : this._blendConstant;
-      if (bc !== null) {
-        if (this._bindBlendConstantOnPass(pass, bc) === BIND_STATUS_ELIDED) {
+      if (args.blendConstant !== undefined) {
+        if (
+          args.blendConstant !== null &&
+          normalizeBlendConstantArgsInto(this._tmpBlendConstant, args.blendConstant)
+        ) {
+          if (
+            this._bindBlendConstantOnPass(pass, this._tmpBlendConstant) === BIND_STATUS_ELIDED
+          ) {
+            result.blendConstantElided = true;
+          }
+        }
+      } else if (this._hasStagedBlendConstant) {
+        if (this._bindBlendConstantOnPass(pass, this._stagedBlendConstant) === BIND_STATUS_ELIDED) {
           result.blendConstantElided = true;
         }
       }
 
       const sr =
-        args && args.stencilReference !== undefined
+        args.stencilReference !== undefined
           ? args.stencilReference === null
             ? null
             : normalizeStencilReference(args.stencilReference)
@@ -2177,9 +2670,79 @@
         this._stats.skippedVertexBufferBindings += 1;
         return false;
       }
+      if (slot < MAX_FAST_VB_SLOTS) {
+        const bit = 1 << slot;
+        if (buffer === null || buffer === undefined) {
+          this._stagedVbMask &= ~bit;
+          this._dirtyVbMask &= ~bit;
+          this._boundVbMask &= ~bit;
+          this._stagedVbBuffers[slot] = null;
+          this._stagedVbOffsets[slot] = 0;
+          this._stagedVbSizes[slot] = null;
+          this._stagedVbStrides[slot] = null;
+          this._boundVbBuffers[slot] = null;
+          this._boundVbOffsets[slot] = 0;
+          this._boundVbSizes[slot] = null;
+          return true;
+        }
+        let offset = 0;
+        let explicitSize = size !== undefined ? size : null;
+        let stride = null;
+
+        if (typeof offsetOrOptions === 'number') {
+          offset = offsetOrOptions;
+        } else if (typeof offsetOrOptions === 'object' && offsetOrOptions !== null) {
+          offset = offsetOrOptions.offset !== undefined ? offsetOrOptions.offset : 0;
+          if (offsetOrOptions.size !== undefined) {
+            explicitSize = offsetOrOptions.size;
+          }
+          if (offsetOrOptions.stride !== undefined) {
+            stride = offsetOrOptions.stride;
+          } else if (offsetOrOptions.arrayStride !== undefined) {
+            stride = offsetOrOptions.arrayStride;
+          }
+        }
+
+        if (stride === null && typeof buffer === 'object') {
+          if (typeof buffer.stride === 'number') {
+            stride = buffer.stride;
+          } else if (typeof buffer.arrayStride === 'number') {
+            stride = buffer.arrayStride;
+          }
+        }
+
+        const storedOffset = typeof offset === 'number' ? offset : NaN;
+        const normOffset = storedOffset || 0;
+        const normSize = explicitSize !== undefined && explicitSize !== null ? explicitSize : null;
+        this._stagedVbBuffers[slot] = buffer;
+        this._stagedVbOffsets[slot] = storedOffset;
+        this._stagedVbSizes[slot] = explicitSize;
+        this._stagedVbStrides[slot] = stride;
+        this._stagedVbMask |= bit;
+
+        if (
+          (this._boundVbMask & bit) !== 0 &&
+          this._boundVbBuffers[slot] === buffer &&
+          this._boundVbOffsets[slot] === normOffset &&
+          this._boundVbSizes[slot] === normSize &&
+          Number.isInteger(storedOffset) &&
+          storedOffset >= 0 &&
+          storedOffset % VERTEX_OFFSET_ALIGNMENT === 0
+        ) {
+          this._dirtyVbMask &= ~bit;
+        } else {
+          this._dirtyVbMask |= bit;
+        }
+        return true;
+      }
+
       if (buffer === null || buffer === undefined) {
-        this._vertexBuffers.delete(slot);
-        this._boundVertexBuffers.delete(slot);
+        if (this._stagedVbOverflow !== null) {
+          this._stagedVbOverflow.delete(slot);
+        }
+        if (this._boundVbOverflow !== null) {
+          this._boundVbOverflow.delete(slot);
+        }
         return true;
       }
       let offset = 0;
@@ -2208,7 +2771,10 @@
         }
       }
 
-      this._vertexBuffers.set(slot, {
+      if (this._stagedVbOverflow === null) {
+        this._stagedVbOverflow = new Map();
+      }
+      this._stagedVbOverflow.set(slot, {
         slot,
         buffer,
         offset,
@@ -2220,16 +2786,33 @@
 
     setIndexBuffer(buffer, indexFormat = 'uint16', offset = 0, size = null) {
       if (buffer === null || buffer === undefined) {
-        this._indexBuffer = null;
-        this._boundIndexBuffer = null;
+        this._hasStagedIb = false;
+        this._stagedIbBuffer = null;
+        this._stagedIbFormat = 'uint16';
+        this._stagedIbOffset = 0;
+        this._stagedIbSize = null;
+        this._hasBoundIb = false;
+        this._boundIbBuffer = null;
+        this._boundIbFormat = null;
+        this._boundIbOffset = 0;
+        this._boundIbSize = null;
+        this._dirtyIb = false;
         return true;
       }
-      this._indexBuffer = {
-        buffer,
-        indexFormat,
-        offset,
-        size,
-      };
+      this._hasStagedIb = true;
+      this._stagedIbBuffer = buffer;
+      this._stagedIbFormat = indexFormat;
+      this._stagedIbOffset = offset;
+      this._stagedIbSize = size;
+      const normOffset = offset || 0;
+      const normSize = size !== undefined && size !== null ? size : null;
+      this._dirtyIb = !(
+        this._hasBoundIb &&
+        this._boundIbBuffer === buffer &&
+        this._boundIbFormat === indexFormat &&
+        this._boundIbOffset === normOffset &&
+        this._boundIbSize === normSize
+      );
       return true;
     }
 
@@ -2245,9 +2828,95 @@
         this._stats.skippedBindGroupBindings += 1;
         return false;
       }
+      if (groupIndex < MAX_FAST_BG_SLOTS) {
+        const bit = 1 << groupIndex;
+        if (bindGroup === null || bindGroup === undefined) {
+          this._stagedBgMask &= ~bit;
+          this._dirtyBgMask &= ~bit;
+          this._boundBgMask &= ~bit;
+          this._stagedBgRaw[groupIndex] = null;
+          this._stagedBgGroups[groupIndex] = null;
+          this._stagedBgMeta[groupIndex] = null;
+          this._stagedBgHasDyn[groupIndex] = 0;
+          this._stagedBgDynSource[groupIndex] = null;
+          this._stagedBgDynStart[groupIndex] = 0;
+          this._stagedBgDynLength[groupIndex] = -1;
+          this._boundBgGroups[groupIndex] = null;
+          this._boundBgHasDyn[groupIndex] = 0;
+          this._boundBgDynLen[groupIndex] = 0;
+          return true;
+        }
+
+        let hasDyn = 0;
+        let dynSrc = null;
+        let dynStart = 0;
+        let dynLen = -1;
+        let meta = null;
+
+        if (dynamicOffsetsOrMeta !== undefined && dynamicOffsetsOrMeta !== null) {
+          if (Array.isArray(dynamicOffsetsOrMeta) || ArrayBuffer.isView(dynamicOffsetsOrMeta)) {
+            hasDyn = 1;
+            dynSrc = dynamicOffsetsOrMeta;
+            if (
+              ArrayBuffer.isView(dynamicOffsetsOrMeta) &&
+              typeof dynamicOffsetsDataStart === 'number' &&
+              Number.isInteger(dynamicOffsetsDataStart) &&
+              dynamicOffsetsDataStart >= 0
+            ) {
+              const srcLen = dynamicOffsetsOrMeta.length;
+              const clampedStart =
+                dynamicOffsetsDataStart > srcLen ? srcLen : dynamicOffsetsDataStart;
+              const rawEnd =
+                typeof dynamicOffsetsDataLength === 'number' &&
+                Number.isInteger(dynamicOffsetsDataLength) &&
+                dynamicOffsetsDataLength >= 0
+                  ? clampedStart + dynamicOffsetsDataLength
+                  : srcLen;
+              const clampedEnd = rawEnd > srcLen ? srcLen : rawEnd;
+              dynStart = clampedStart;
+              dynLen = clampedEnd - clampedStart;
+            }
+          } else if (typeof dynamicOffsetsOrMeta === 'object') {
+            meta = dynamicOffsetsOrMeta;
+            if (
+              Array.isArray(dynamicOffsetsOrMeta.dynamicOffsets) ||
+              ArrayBuffer.isView(dynamicOffsetsOrMeta.dynamicOffsets)
+            ) {
+              hasDyn = 1;
+              dynSrc = dynamicOffsetsOrMeta.dynamicOffsets;
+            }
+          }
+        }
+
+        const actualBg = bindGroup.bindGroup !== undefined ? bindGroup.bindGroup : bindGroup;
+        this._stagedBgRaw[groupIndex] = bindGroup;
+        this._stagedBgGroups[groupIndex] = actualBg;
+        this._stagedBgMeta[groupIndex] = meta;
+        this._stagedBgHasDyn[groupIndex] = hasDyn;
+        this._stagedBgDynSource[groupIndex] = dynSrc;
+        this._stagedBgDynStart[groupIndex] = dynStart;
+        this._stagedBgDynLength[groupIndex] = dynLen;
+        this._stagedBgMask |= bit;
+
+        if (
+          (this._boundBgMask & bit) !== 0 &&
+          this._boundBgGroups[groupIndex] === actualBg &&
+          this._fastDynamicOffsetsEqual(groupIndex, hasDyn, dynSrc, dynStart, dynLen)
+        ) {
+          this._dirtyBgMask &= ~bit;
+        } else {
+          this._dirtyBgMask |= bit;
+        }
+        return true;
+      }
+
       if (bindGroup === null || bindGroup === undefined) {
-        this._bindGroups.delete(groupIndex);
-        this._boundBindGroups.delete(groupIndex);
+        if (this._stagedBgOverflow !== null) {
+          this._stagedBgOverflow.delete(groupIndex);
+        }
+        if (this._boundBgOverflow !== null) {
+          this._boundBgOverflow.delete(groupIndex);
+        }
         return true;
       }
       let dynamicOffsets = null;
@@ -2282,7 +2951,10 @@
         }
       }
 
-      this._bindGroups.set(groupIndex, {
+      if (this._stagedBgOverflow === null) {
+        this._stagedBgOverflow = new Map();
+      }
+      this._stagedBgOverflow.set(groupIndex, {
         groupIndex,
         bindGroup: bindGroup.bindGroup !== undefined ? bindGroup.bindGroup : bindGroup,
         dynamicOffsets,
@@ -2367,21 +3039,30 @@
      */
     setViewport(xOrPass, y, width, height, minDepth, maxDepth) {
       if (xOrPass === null || xOrPass === undefined) {
-        this._viewport = null;
-        this._boundViewport = null;
+        this._hasStagedViewport = false;
+        this._hasBoundViewport = false;
         return true;
       }
       if (isRenderPassObject(xOrPass, 'setViewport')) {
         if (this._destroyed) {
           return false;
         }
-        const vp = normalizeViewportArgs(y, width, height, minDepth, maxDepth, arguments[6]);
-        if (!vp) {
+        if (
+          !normalizeViewportArgsInto(
+            this._tmpViewport,
+            y,
+            width,
+            height,
+            minDepth,
+            maxDepth,
+            arguments[6]
+          )
+        ) {
           return false;
         }
-        this._viewport = null;
+        this._hasStagedViewport = false;
         try {
-          return this._bindViewportOnPass(xOrPass, vp) !== BIND_STATUS_UNSUPPORTED;
+          return this._bindViewportOnPass(xOrPass, this._tmpViewport) !== BIND_STATUS_UNSUPPORTED;
         } catch (err) {
           this._stats.passErrors += 1;
           this._warn('setViewport failed on pass', {
@@ -2390,11 +3071,20 @@
           return false;
         }
       }
-      const vp = normalizeViewportArgs(xOrPass, y, width, height, minDepth, maxDepth);
-      if (!vp) {
+      if (
+        !normalizeViewportArgsInto(this._tmpViewport, xOrPass, y, width, height, minDepth, maxDepth)
+      ) {
         return false;
       }
-      this._viewport = vp;
+      const dst = this._stagedViewport;
+      const src = this._tmpViewport;
+      dst.x = src.x;
+      dst.y = src.y;
+      dst.width = src.width;
+      dst.height = src.height;
+      dst.minDepth = src.minDepth;
+      dst.maxDepth = src.maxDepth;
+      this._hasStagedViewport = true;
       return true;
     }
 
@@ -2411,21 +3101,20 @@
      */
     setScissorRect(xOrPass, y, width, height) {
       if (xOrPass === null || xOrPass === undefined) {
-        this._scissorRect = null;
-        this._boundScissorRect = null;
+        this._hasStagedScissor = false;
+        this._hasBoundScissor = false;
         return true;
       }
       if (isRenderPassObject(xOrPass, 'setScissorRect')) {
         if (this._destroyed) {
           return false;
         }
-        const sc = normalizeScissorRectArgs(y, width, height, arguments[4]);
-        if (!sc) {
+        if (!normalizeScissorRectArgsInto(this._tmpScissor, y, width, height, arguments[4])) {
           return false;
         }
-        this._scissorRect = null;
+        this._hasStagedScissor = false;
         try {
-          return this._bindScissorRectOnPass(xOrPass, sc) !== BIND_STATUS_UNSUPPORTED;
+          return this._bindScissorRectOnPass(xOrPass, this._tmpScissor) !== BIND_STATUS_UNSUPPORTED;
         } catch (err) {
           this._stats.passErrors += 1;
           this._warn('setScissorRect failed on pass', {
@@ -2434,11 +3123,16 @@
           return false;
         }
       }
-      const sc = normalizeScissorRectArgs(xOrPass, y, width, height);
-      if (!sc) {
+      if (!normalizeScissorRectArgsInto(this._tmpScissor, xOrPass, y, width, height)) {
         return false;
       }
-      this._scissorRect = sc;
+      const dst = this._stagedScissor;
+      const src = this._tmpScissor;
+      dst.x = src.x;
+      dst.y = src.y;
+      dst.width = src.width;
+      dst.height = src.height;
+      this._hasStagedScissor = true;
       return true;
     }
 
@@ -2448,21 +3142,23 @@
      */
     setBlendConstant(colorOrPass, g, b, a) {
       if (colorOrPass === null || colorOrPass === undefined) {
-        this._blendConstant = null;
-        this._boundBlendConstant = null;
+        this._hasStagedBlendConstant = false;
+        this._hasBoundBlendConstant = false;
         return true;
       }
       if (isRenderPassObject(colorOrPass, 'setBlendConstant')) {
         if (this._destroyed) {
           return false;
         }
-        const bc = normalizeBlendConstantArgs(g, b, a, arguments[4]);
-        if (!bc) {
+        if (!normalizeBlendConstantArgsInto(this._tmpBlendConstant, g, b, a, arguments[4])) {
           return false;
         }
-        this._blendConstant = null;
+        this._hasStagedBlendConstant = false;
         try {
-          return this._bindBlendConstantOnPass(colorOrPass, bc) !== BIND_STATUS_UNSUPPORTED;
+          return (
+            this._bindBlendConstantOnPass(colorOrPass, this._tmpBlendConstant) !==
+            BIND_STATUS_UNSUPPORTED
+          );
         } catch (err) {
           this._stats.passErrors += 1;
           this._warn('setBlendConstant failed on pass', {
@@ -2471,11 +3167,16 @@
           return false;
         }
       }
-      const bc = normalizeBlendConstantArgs(colorOrPass, g, b, a);
-      if (!bc) {
+      if (!normalizeBlendConstantArgsInto(this._tmpBlendConstant, colorOrPass, g, b, a)) {
         return false;
       }
-      this._blendConstant = bc;
+      const dst = this._stagedBlendConstant;
+      const src = this._tmpBlendConstant;
+      dst.r = src.r;
+      dst.g = src.g;
+      dst.b = src.b;
+      dst.a = src.a;
+      this._hasStagedBlendConstant = true;
       return true;
     }
 
@@ -2516,38 +3217,128 @@
       return true;
     }
 
+    _materializeStagedBindGroupDescriptor(slot) {
+      const bit = 1 << slot;
+      if ((this._stagedBgMask & bit) === 0) {
+        return null;
+      }
+      const raw = this._stagedBgRaw[slot];
+      const meta = this._stagedBgMeta[slot];
+      let dynamicOffsets = null;
+      if (this._stagedBgHasDyn[slot] === 1) {
+        const src = this._stagedBgDynSource[slot];
+        const start = this._stagedBgDynStart[slot];
+        const explicitLen = this._stagedBgDynLength[slot];
+        const len = explicitLen >= 0 ? explicitLen : src.length;
+        if (start === 0 && len === src.length) {
+          dynamicOffsets = src;
+        } else {
+          dynamicOffsets =
+            typeof src.subarray === 'function'
+              ? src.subarray(start, start + len)
+              : Array.prototype.slice.call(src, start, start + len);
+        }
+      }
+      return {
+        groupIndex: slot,
+        bindGroup: this._stagedBgGroups[slot],
+        dynamicOffsets,
+        entries:
+          (meta && meta.entries) ||
+          (raw && raw.entries) ||
+          (raw && raw.desc && raw.desc.entries) ||
+          null,
+        hasCbv: Boolean((meta && meta.hasCbv) || (raw && raw.hasCbv)),
+        hasTexture: Boolean((meta && meta.hasTexture) || (raw && raw.hasTexture)),
+        hasSampler: Boolean((meta && meta.hasSampler) || (raw && raw.hasSampler)),
+        cbvBuffer: (meta && meta.cbvBuffer) || (raw && raw.cbvBuffer) || null,
+        textureView: (meta && meta.textureView) || (raw && raw.textureView) || null,
+        sampler: (meta && meta.sampler) || (raw && raw.sampler) || null,
+      };
+    }
+
     /**
      * Return a shallow snapshot of the state currently tracked as bound on the active render pass.
      */
     getBoundPassState() {
       const bindGroups = {};
-      for (const [groupIndex, rec] of this._boundBindGroups.entries()) {
-        bindGroups[groupIndex] = {
-          bindGroup: rec.bindGroup,
-          dynamicOffsets: rec.hasDynamicOffsets
-            ? rec.dynamicOffsetsSnapshot
-              ? rec.dynamicOffsetsSnapshot.slice(0, rec.dynamicOffsetsLength)
-              : []
-            : null,
+      let bgMask = this._boundBgMask;
+      while (bgMask !== 0) {
+        const bit = bgMask & -bgMask;
+        const slot = 31 - Math.clz32(bit);
+        bgMask ^= bit;
+        let dynCopy = null;
+        if (this._boundBgHasDyn[slot] === 1) {
+          const len = this._boundBgDynLen[slot];
+          dynCopy = new Array(len);
+          if (len <= MAX_FAST_DYN_OFFSETS) {
+            const base = slot * MAX_FAST_DYN_OFFSETS;
+            for (let i = 0; i < len; i += 1) {
+              dynCopy[i] = this._boundBgDynOffsets[base + i];
+            }
+          } else {
+            const overflow = this._boundBgDynOverflow[slot];
+            for (let i = 0; i < len; i += 1) {
+              dynCopy[i] = overflow[i];
+            }
+          }
+        }
+        bindGroups[slot] = {
+          bindGroup: this._boundBgGroups[slot],
+          dynamicOffsets: dynCopy,
         };
       }
+      if (this._boundBgOverflow !== null && this._boundBgOverflow.size > 0) {
+        for (const [groupIndex, rec] of this._boundBgOverflow.entries()) {
+          bindGroups[groupIndex] = {
+            bindGroup: rec.bindGroup,
+            dynamicOffsets: rec.hasDynamicOffsets
+              ? rec.dynamicOffsetsSnapshot
+                ? rec.dynamicOffsetsSnapshot.slice(0, rec.dynamicOffsetsLength)
+                : []
+              : null,
+          };
+        }
+      }
+
       const vertexBuffers = {};
-      for (const [slot, rec] of this._boundVertexBuffers.entries()) {
+      let vbMask = this._boundVbMask;
+      while (vbMask !== 0) {
+        const bit = vbMask & -vbMask;
+        const slot = 31 - Math.clz32(bit);
+        vbMask ^= bit;
         vertexBuffers[slot] = {
-          buffer: rec.buffer,
-          offset: rec.offset,
-          size: rec.size,
+          buffer: this._boundVbBuffers[slot],
+          offset: this._boundVbOffsets[slot],
+          size: this._boundVbSizes[slot],
         };
       }
+      if (this._boundVbOverflow !== null && this._boundVbOverflow.size > 0) {
+        for (const [slot, rec] of this._boundVbOverflow.entries()) {
+          vertexBuffers[slot] = {
+            buffer: rec.buffer,
+            offset: rec.offset,
+            size: rec.size,
+          };
+        }
+      }
+
       return {
         hasActivePass: this._boundPass !== null,
         pipeline: this._boundPipeline,
         bindGroups,
         vertexBuffers,
-        indexBuffer: this._boundIndexBuffer ? { ...this._boundIndexBuffer } : null,
-        viewport: this._boundViewport ? { ...this._boundViewport } : null,
-        scissorRect: this._boundScissorRect ? { ...this._boundScissorRect } : null,
-        blendConstant: this._boundBlendConstant ? { ...this._boundBlendConstant } : null,
+        indexBuffer: this._hasBoundIb
+          ? {
+              buffer: this._boundIbBuffer,
+              indexFormat: this._boundIbFormat,
+              offset: this._boundIbOffset,
+              size: this._boundIbSize,
+            }
+          : null,
+        viewport: this._hasBoundViewport ? { ...this._boundViewportData } : null,
+        scissorRect: this._hasBoundScissor ? { ...this._boundScissorData } : null,
+        blendConstant: this._hasBoundBlendConstant ? { ...this._boundBlendConstantData } : null,
         stencilReference: this._boundStencilReference,
       };
     }
@@ -2560,8 +3351,23 @@
       const pipe = ov.pipeline !== undefined ? ov.pipeline : this._activePipeline;
 
       const vertexBuffers = [];
-      for (const vb of this._vertexBuffers.values()) {
-        vertexBuffers.push({ ...vb });
+      let vbMask = this._stagedVbMask;
+      while (vbMask !== 0) {
+        const bit = vbMask & -vbMask;
+        const slot = 31 - Math.clz32(bit);
+        vbMask ^= bit;
+        vertexBuffers.push({
+          slot,
+          buffer: this._stagedVbBuffers[slot],
+          offset: this._stagedVbOffsets[slot],
+          size: this._stagedVbSizes[slot],
+          stride: this._stagedVbStrides[slot],
+        });
+      }
+      if (this._stagedVbOverflow !== null && this._stagedVbOverflow.size > 0) {
+        for (const vb of this._stagedVbOverflow.values()) {
+          vertexBuffers.push({ ...vb });
+        }
       }
       if (Array.isArray(ov.vertexBuffers)) {
         for (let i = 0; i < ov.vertexBuffers.length; i += 1) {
@@ -2572,8 +3378,17 @@
       }
 
       const bindGroups = [];
-      for (const bg of this._bindGroups.values()) {
-        bindGroups.push(bg);
+      let bgMask = this._stagedBgMask;
+      while (bgMask !== 0) {
+        const bit = bgMask & -bgMask;
+        const slot = 31 - Math.clz32(bit);
+        bgMask ^= bit;
+        bindGroups.push(this._materializeStagedBindGroupDescriptor(slot));
+      }
+      if (this._stagedBgOverflow !== null && this._stagedBgOverflow.size > 0) {
+        for (const bg of this._stagedBgOverflow.values()) {
+          bindGroups.push(bg);
+        }
       }
       if (Array.isArray(ov.bindGroups)) {
         for (let i = 0; i < ov.bindGroups.length; i += 1) {
@@ -2593,10 +3408,9 @@
           : pipe && typeof pipe === 'object' && typeof pipe.vertexStride === 'number'
             ? pipe.vertexStride
             : null;
-      if (vertexStride === null) {
-        const slot0 = this._vertexBuffers.get(0);
-        if (slot0 && typeof slot0.stride === 'number') {
-          vertexStride = slot0.stride;
+      if (vertexStride === null && (this._stagedVbMask & 1) !== 0) {
+        if (typeof this._stagedVbStrides[0] === 'number') {
+          vertexStride = this._stagedVbStrides[0];
         }
       }
 
@@ -2623,22 +3437,22 @@
         viewport:
           ov.viewport !== undefined
             ? ov.viewport
-            : this._viewport
-              ? { ...this._viewport }
+            : this._hasStagedViewport
+              ? { ...this._stagedViewport }
               : null,
         scissorRect:
           ov.scissorRect !== undefined
             ? ov.scissorRect
             : ov.scissor !== undefined
               ? ov.scissor
-              : this._scissorRect
-                ? { ...this._scissorRect }
+              : this._hasStagedScissor
+                ? { ...this._stagedScissor }
                 : null,
         blendConstant:
           ov.blendConstant !== undefined
             ? ov.blendConstant
-            : this._blendConstant
-              ? { ...this._blendConstant }
+            : this._hasStagedBlendConstant
+              ? { ...this._stagedBlendConstant }
               : null,
         stencilReference:
           ov.stencilReference !== undefined ? ov.stencilReference : this._stencilReference,
@@ -2717,7 +3531,7 @@
     }
 
     _needsFallbackRoutingFast(args, pipe) {
-      if (args.isFallback === true || args.usesFallbackShaders === true) {
+      if (args !== null && (args.isFallback === true || args.usesFallbackShaders === true)) {
         return true;
       }
       if (!pipe) {
@@ -2727,8 +3541,8 @@
         if (pipe.isFallback === true || pipe.usesFallbackShaders === true || pipe.missingShaders === true) {
           return true;
         }
-        const vs = args.vertexShader || pipe.vertexShader;
-        const fs = args.fragmentShader || pipe.fragmentShader;
+        const vs = (args !== null && args.vertexShader) || pipe.vertexShader;
+        const fs = (args !== null && args.fragmentShader) || pipe.fragmentShader;
         if (
           (vs && (vs.missing === true || vs.isFallback === true || vs.source === 'builtin' || vs.source === 'fallback')) ||
           (fs && (fs.missing === true || fs.isFallback === true || fs.source === 'builtin' || fs.source === 'fallback'))
@@ -3183,7 +3997,7 @@
       for (const entry of this._cbvs.values()) {
         return entry;
       }
-      const bg0 = this._bindGroups.get(0);
+      const bg0 = this._materializeStagedBindGroupDescriptor(0);
       if (bg0 && bg0.cbvBuffer) {
         return { buffer: bg0.cbvBuffer, offset: 0, size: null };
       }
@@ -3210,7 +4024,7 @@
       for (const tex of this._textures.values()) {
         return tex;
       }
-      const bg0 = this._bindGroups.get(0);
+      const bg0 = this._materializeStagedBindGroupDescriptor(0);
       if (bg0 && bg0.textureView) return bg0.textureView;
       if (bg0 && Array.isArray(bg0.entries)) {
         for (let i = 0; i < bg0.entries.length; i += 1) {
@@ -3240,7 +4054,7 @@
       for (const s of this._samplers.values()) {
         return s;
       }
-      const bg0 = this._bindGroups.get(0);
+      const bg0 = this._materializeStagedBindGroupDescriptor(0);
       if (bg0 && bg0.sampler) return bg0.sampler;
       if (bg0 && Array.isArray(bg0.entries)) {
         for (let i = 0; i < bg0.entries.length; i += 1) {
@@ -3425,16 +4239,37 @@
     }
 
     _bindFallbackVertexBuffer24B(pass, drawState, vertexCount, firstVertex) {
-      const slot0 = this._vertexBuffers.get(0) || (Array.isArray(drawState.vertexBuffers) ? drawState.vertexBuffers[0] : null);
+      const hasSlot0 = (this._stagedVbMask & 1) !== 0;
+      const fallbackSlot0 = !hasSlot0 && Array.isArray(drawState.vertexBuffers)
+        ? drawState.vertexBuffers[0]
+        : null;
       const requiredBytes = drawState.indexed
         ? TEXTURED_QUAD_VERTEX_STRIDE
         : (firstVertex + vertexCount) * TEXTURED_QUAD_VERTEX_STRIDE;
 
-      if (slot0 && isValidVertexBufferBinding(slot0, requiredBytes, TEXTURED_QUAD_VERTEX_STRIDE)) {
-        const buffer = slot0.buffer !== undefined ? slot0.buffer : slot0;
-        const offset = slot0.offset || 0;
+      const slot0Valid = hasSlot0
+        ? isValidVertexBufferParts(
+            this._stagedVbBuffers[0],
+            this._stagedVbOffsets[0],
+            this._stagedVbSizes[0],
+            this._stagedVbStrides[0],
+            requiredBytes,
+            TEXTURED_QUAD_VERTEX_STRIDE
+          )
+        : fallbackSlot0
+          ? isValidVertexBufferBinding(fallbackSlot0, requiredBytes, TEXTURED_QUAD_VERTEX_STRIDE)
+          : false;
+
+      if (slot0Valid) {
+        const buffer = hasSlot0
+          ? this._stagedVbBuffers[0]
+          : fallbackSlot0.buffer !== undefined
+            ? fallbackSlot0.buffer
+            : fallbackSlot0;
+        const offset = hasSlot0 ? this._stagedVbOffsets[0] || 0 : fallbackSlot0.offset || 0;
+        const size = hasSlot0 ? this._stagedVbSizes[0] : fallbackSlot0.size;
         try {
-          const bound = this._bindVertexBufferOnPass(pass, 0, buffer, offset, slot0.size);
+          const bound = this._bindVertexBufferOnPass(pass, 0, buffer, offset, size);
           return {
             ok: true,
             substitutedVertexBuffer: false,
@@ -3623,18 +4458,37 @@
     }
 
     _bindFallbackVertexBufferSplashRect24B(pass, drawState, vertexCount, firstVertex) {
-      const slot0 =
-        this._vertexBuffers.get(0) ||
-        (Array.isArray(drawState.vertexBuffers) ? drawState.vertexBuffers[0] : null);
+      const hasSlot0 = (this._stagedVbMask & 1) !== 0;
+      const fallbackSlot0 = !hasSlot0 && Array.isArray(drawState.vertexBuffers)
+        ? drawState.vertexBuffers[0]
+        : null;
       const requiredBytes = drawState.indexed
         ? TEXTURED_QUAD_VERTEX_STRIDE
         : (firstVertex + vertexCount) * TEXTURED_QUAD_VERTEX_STRIDE;
 
-      if (slot0 && isValidVertexBufferBinding(slot0, requiredBytes, TEXTURED_QUAD_VERTEX_STRIDE)) {
-        const buffer = slot0.buffer !== undefined ? slot0.buffer : slot0;
-        const offset = slot0.offset || 0;
+      const slot0Valid = hasSlot0
+        ? isValidVertexBufferParts(
+            this._stagedVbBuffers[0],
+            this._stagedVbOffsets[0],
+            this._stagedVbSizes[0],
+            this._stagedVbStrides[0],
+            requiredBytes,
+            TEXTURED_QUAD_VERTEX_STRIDE
+          )
+        : fallbackSlot0
+          ? isValidVertexBufferBinding(fallbackSlot0, requiredBytes, TEXTURED_QUAD_VERTEX_STRIDE)
+          : false;
+
+      if (slot0Valid) {
+        const buffer = hasSlot0
+          ? this._stagedVbBuffers[0]
+          : fallbackSlot0.buffer !== undefined
+            ? fallbackSlot0.buffer
+            : fallbackSlot0;
+        const offset = hasSlot0 ? this._stagedVbOffsets[0] || 0 : fallbackSlot0.offset || 0;
+        const size = hasSlot0 ? this._stagedVbSizes[0] : fallbackSlot0.size;
         try {
-          const bound = this._bindVertexBufferOnPass(pass, 0, buffer, offset, slot0.size);
+          const bound = this._bindVertexBufferOnPass(pass, 0, buffer, offset, size);
           return {
             ok: true,
             substitutedVertexBuffer: false,
@@ -3694,109 +4548,296 @@
       }
     }
 
-    _bindNormalResources(pass) {
+    _bindNormalResources(pass, result) {
+      this._syncPassTracking(pass);
       let vertexBuffersElided = 0;
       let bindGroupsElided = 0;
 
-      // Bind validated vertex buffers.
-      for (const [slot, entry] of this._vertexBuffers.entries()) {
-        if (!isValidVertexBufferBinding(entry, 0, null)) {
-          this._boundVertexBuffers.delete(slot);
-          this._stats.invalidVertexBufferGuards += 1;
-          this._stats.skippedVertexBufferBindings += 1;
-          continue;
-        }
-        try {
-          const bound = this._bindVertexBufferOnPass(
-            pass,
-            slot,
-            entry.buffer,
-            entry.offset || 0,
-            entry.size
-          );
-          if (!bound) {
+      // 1. Fast O(1) bitmask vertex-buffer binding for slots 0..7 (zero Map/object churn).
+      let vbMask = this._stagedVbMask;
+      if (vbMask !== 0) {
+        const elideVb = this._elideRedundantVertexBuffers;
+        const dirtyVb = this._dirtyVbMask;
+        const boundVb = this._boundVbMask;
+        const vbBufs = this._stagedVbBuffers;
+        const vbOffs = this._stagedVbOffsets;
+        const vbSizes = this._stagedVbSizes;
+        const vbStrides = this._stagedVbStrides;
+
+        while (vbMask !== 0) {
+          const bit = vbMask & -vbMask;
+          const slot = 31 - Math.clz32(bit);
+          vbMask ^= bit;
+          const buf = vbBufs[slot];
+
+          if (
+            elideVb &&
+            (dirtyVb & bit) === 0 &&
+            (boundVb & bit) !== 0 &&
+            buf !== null &&
+            buf.destroyed !== true
+          ) {
             vertexBuffersElided += 1;
+            continue;
           }
-        } catch (err) {
-          this._stats.passErrors += 1;
-          this._stats.invalidVertexBufferGuards += 1;
-          this._stats.skippedVertexBufferBindings += 1;
-          this._warn('setVertexBuffer failed on normal draw', {
-            slot,
-            error: String(err && err.message ? err.message : err),
-          });
+
+          const off = vbOffs[slot];
+          const sz = vbSizes[slot];
+          if (!isValidVertexBufferParts(buf, off, sz, vbStrides[slot], 0, null)) {
+            this._boundVbMask &= ~bit;
+            this._boundVbBuffers[slot] = null;
+            this._boundVbOffsets[slot] = 0;
+            this._boundVbSizes[slot] = null;
+            this._dirtyVbMask |= bit;
+            this._stats.invalidVertexBufferGuards += 1;
+            this._stats.skippedVertexBufferBindings += 1;
+            continue;
+          }
+          try {
+            const bound = this._bindFastVertexBufferOnPassSynced(
+              pass,
+              slot,
+              bit,
+              buf,
+              off || 0,
+              sz
+            );
+            if (!bound) {
+              vertexBuffersElided += 1;
+            }
+          } catch (err) {
+            this._stats.passErrors += 1;
+            this._stats.invalidVertexBufferGuards += 1;
+            this._stats.skippedVertexBufferBindings += 1;
+            this._warn('setVertexBuffer failed on normal draw', {
+              slot,
+              error: String(err && err.message ? err.message : err),
+            });
+          }
         }
       }
 
-      // Bind validated bind groups.
-      for (const [groupIndex, entry] of this._bindGroups.entries()) {
-        if (!entry || !entry.bindGroup || entry.bindGroup.destroyed === true) {
-          this._boundBindGroups.delete(groupIndex);
-          this._stats.bindGroupGuards += 1;
-          this._stats.skippedBindGroupBindings += 1;
-          continue;
+      if (vertexBuffersElided > 0) {
+        this._stats.redundantVertexBufferSkips += vertexBuffersElided;
+        this._stats.elidedVertexBufferSets += vertexBuffersElided;
+        this._stats.totalElidedStateCalls += vertexBuffersElided;
+        this._totalStateCalls += vertexBuffersElided;
+      }
+
+      if (this._stagedVbOverflow !== null && this._stagedVbOverflow.size > 0) {
+        for (const [slot, entry] of this._stagedVbOverflow.entries()) {
+          if (!isValidVertexBufferBinding(entry, 0, null)) {
+            if (this._boundVbOverflow !== null) {
+              this._boundVbOverflow.delete(slot);
+            }
+            this._stats.invalidVertexBufferGuards += 1;
+            this._stats.skippedVertexBufferBindings += 1;
+            continue;
+          }
+          try {
+            const bound = this._bindVertexBufferOnPass(
+              pass,
+              slot,
+              entry.buffer,
+              entry.offset || 0,
+              entry.size
+            );
+            if (!bound) {
+              vertexBuffersElided += 1;
+            }
+          } catch (err) {
+            this._stats.passErrors += 1;
+            this._stats.invalidVertexBufferGuards += 1;
+            this._stats.skippedVertexBufferBindings += 1;
+            this._warn('setVertexBuffer failed on normal draw', {
+              slot,
+              error: String(err && err.message ? err.message : err),
+            });
+          }
         }
-        try {
-          const bound = this._bindBindGroupOnPass(
-            pass,
-            groupIndex,
-            entry.bindGroup,
-            entry.dynamicOffsets || null
-          );
-          if (!bound) {
+      }
+
+      // 2. Fast O(1) bitmask bind-group binding for slots 0..3 (zero Map/object/string/array churn).
+      let bgMask = this._stagedBgMask;
+      if (bgMask !== 0) {
+        const elideBg = this._elideRedundantBindGroups;
+        const dirtyBg = this._dirtyBgMask;
+        const boundBg = this._boundBgMask;
+        const bgGroups = this._stagedBgGroups;
+        const bgHasDyn = this._stagedBgHasDyn;
+        const bgDynSrc = this._stagedBgDynSource;
+        const bgDynStart = this._stagedBgDynStart;
+        const bgDynLen = this._stagedBgDynLength;
+
+        while (bgMask !== 0) {
+          const bit = bgMask & -bgMask;
+          const slot = 31 - Math.clz32(bit);
+          bgMask ^= bit;
+          const bg = bgGroups[slot];
+          if (!bg || bg.destroyed === true) {
+            this._boundBgMask &= ~bit;
+            this._boundBgGroups[slot] = null;
+            this._boundBgHasDyn[slot] = 0;
+            this._boundBgDynLen[slot] = 0;
+            this._dirtyBgMask |= bit;
+            this._stats.bindGroupGuards += 1;
+            this._stats.skippedBindGroupBindings += 1;
+            continue;
+          }
+
+          const hasDyn = bgHasDyn[slot];
+          if (
+            elideBg &&
+            (dirtyBg & bit) === 0 &&
+            (boundBg & bit) !== 0 &&
+            (hasDyn === 0 ||
+              this._fastDynamicOffsetsEqual(
+                slot,
+                1,
+                bgDynSrc[slot],
+                bgDynStart[slot],
+                bgDynLen[slot]
+              ))
+          ) {
             bindGroupsElided += 1;
+            continue;
           }
-        } catch (err) {
-          this._stats.passErrors += 1;
-          this._stats.bindGroupGuards += 1;
-          this._stats.skippedBindGroupBindings += 1;
-          this._warn('setBindGroup failed on normal draw', {
-            groupIndex,
-            error: String(err && err.message ? err.message : err),
-          });
+
+          try {
+            const bound = this._bindFastBindGroupOnPassSynced(
+              pass,
+              slot,
+              bit,
+              bg,
+              hasDyn,
+              bgDynSrc[slot],
+              bgDynStart[slot],
+              bgDynLen[slot]
+            );
+            if (!bound) {
+              bindGroupsElided += 1;
+            }
+          } catch (err) {
+            this._stats.passErrors += 1;
+            this._stats.bindGroupGuards += 1;
+            this._stats.skippedBindGroupBindings += 1;
+            this._warn('setBindGroup failed on normal draw', {
+              groupIndex: slot,
+              error: String(err && err.message ? err.message : err),
+            });
+          }
         }
       }
 
-      return { vertexBuffersElided, bindGroupsElided };
+      if (bindGroupsElided > 0) {
+        this._stats.redundantBindGroupSkips += bindGroupsElided;
+        this._stats.elidedBindGroupSets += bindGroupsElided;
+        this._stats.totalElidedStateCalls += bindGroupsElided;
+        this._totalStateCalls += bindGroupsElided;
+      }
+
+      if (this._stagedBgOverflow !== null && this._stagedBgOverflow.size > 0) {
+        for (const [groupIndex, entry] of this._stagedBgOverflow.entries()) {
+          if (!entry || !entry.bindGroup || entry.bindGroup.destroyed === true) {
+            if (this._boundBgOverflow !== null) {
+              this._boundBgOverflow.delete(groupIndex);
+            }
+            this._stats.bindGroupGuards += 1;
+            this._stats.skippedBindGroupBindings += 1;
+            continue;
+          }
+          try {
+            const bound = this._bindBindGroupOnPass(
+              pass,
+              groupIndex,
+              entry.bindGroup,
+              entry.dynamicOffsets || null
+            );
+            if (!bound) {
+              bindGroupsElided += 1;
+            }
+          } catch (err) {
+            this._stats.passErrors += 1;
+            this._stats.bindGroupGuards += 1;
+            this._stats.skippedBindGroupBindings += 1;
+            this._warn('setBindGroup failed on normal draw', {
+              groupIndex,
+              error: String(err && err.message ? err.message : err),
+            });
+          }
+        }
+      }
+
+      result.vertexBuffersElided = vertexBuffersElided;
+      result.bindGroupsElided = bindGroupsElided;
     }
 
     _validateAndBindIndexBuffer(pass, indexCount, firstIndex) {
-      const ib = this._indexBuffer;
-      if (!ib || !isValidGpuBuffer(ib.buffer, BUFFER_USAGE.INDEX)) {
-        this._boundIndexBuffer = null;
-        return { ok: false, elided: false, invalidRange: false };
+      if (!this._hasStagedIb) {
+        this._hasBoundIb = false;
+        this._boundIbBuffer = null;
+        return IB_STATUS_INVALID;
       }
-      const format = ib.indexFormat === 'uint32' ? 'uint32' : ib.indexFormat === 'uint16' ? 'uint16' : null;
-      if (!format) {
-        this._boundIndexBuffer = null;
-        return { ok: false, elided: false, invalidRange: false };
+      const buf = this._stagedIbBuffer;
+      const format =
+        this._stagedIbFormat === 'uint32'
+          ? 'uint32'
+          : this._stagedIbFormat === 'uint16'
+            ? 'uint16'
+            : null;
+      if (!format || !isValidGpuBuffer(buf, BUFFER_USAGE.INDEX)) {
+        this._hasBoundIb = false;
+        this._boundIbBuffer = null;
+        return IB_STATUS_INVALID;
       }
       const elemBytes = format === 'uint32' ? 4 : 2;
-      const offset = ib.offset || 0;
+      const offset = this._stagedIbOffset || 0;
       if (!Number.isInteger(offset) || offset < 0 || offset % elemBytes !== 0) {
-        return { ok: false, elided: false, invalidRange: true };
+        return IB_STATUS_INVALID_RANGE;
       }
-      const bufSize = typeof ib.buffer.size === 'number' && Number.isFinite(ib.buffer.size) ? ib.buffer.size : null;
+      const bufSize = typeof buf.size === 'number' && Number.isFinite(buf.size) ? buf.size : null;
       if (bufSize !== null) {
-        const effectiveSize = ib.size !== undefined && ib.size !== null ? ib.size : bufSize - offset;
+        const sz = this._stagedIbSize;
+        const effectiveSize = sz !== undefined && sz !== null ? sz : bufSize - offset;
         if (offset >= bufSize || offset + effectiveSize > bufSize) {
-          return { ok: false, elided: false, invalidRange: true };
+          return IB_STATUS_INVALID_RANGE;
         }
         const neededBytes = (firstIndex + indexCount) * elemBytes;
         if (effectiveSize < neededBytes) {
-          return { ok: false, elided: false, invalidRange: true };
+          return IB_STATUS_INVALID_RANGE;
         }
       }
+      if (this._elideRedundantIndexBuffers && !this._dirtyIb && this._hasBoundIb) {
+        this._stats.redundantIndexBufferSkips += 1;
+        this._stats.elidedIndexBufferSets += 1;
+        this._stats.totalElidedStateCalls += 1;
+        this._totalStateCalls += 1;
+        return IB_STATUS_ELIDED;
+      }
       try {
-        const bound = this._bindIndexBufferOnPass(pass, ib.buffer, format, offset, ib.size);
-        return { ok: true, elided: !bound, invalidRange: false };
+        const bound = this._bindIndexBufferOnPass(pass, buf, format, offset, this._stagedIbSize);
+        return bound ? IB_STATUS_EMITTED : IB_STATUS_ELIDED;
       } catch (err) {
         this._stats.passErrors += 1;
         this._warn('setIndexBuffer failed', {
           error: String(err && err.message ? err.message : err),
         });
-        return { ok: false, elided: false, invalidRange: false };
+        return IB_STATUS_INVALID;
       }
+    }
+
+    _acquireDrawResult(indexed, indirect, count, instanceCount, indirectOffset, reuseOverride) {
+      if (this._reuseDrawResult || reuseOverride === true) {
+        return resetDrawResultInPlace(
+          indirect ? this._reusableIndirectResult : this._reusableDrawResult,
+          indexed,
+          indirect,
+          count,
+          instanceCount,
+          indirectOffset
+        );
+      }
+      return createDrawResultObject(indexed, indirect, count, instanceCount, indirectOffset);
     }
 
     /**
@@ -3844,86 +4885,88 @@
     }
 
     /**
-     * Positional convenience wrapper for `executeDraw`.
+     * Positional convenience wrapper for `executeDraw` (zero-alloc argument path).
      */
     draw(pass, vertexCount, instanceCount = 1, firstVertex = 0, firstInstance = 0) {
-      return this.executeDraw(pass, {
-        vertexCount,
-        instanceCount,
-        firstVertex,
-        firstInstance,
-      });
+      return this._executeDrawCore(
+        pass,
+        null,
+        false,
+        toNonNegativeInt(vertexCount, 0),
+        toNonNegativeInt(instanceCount, 0),
+        toNonNegativeInt(firstVertex, 0),
+        0,
+        0,
+        toNonNegativeInt(firstInstance, 0)
+      );
     }
 
     /**
-     * Positional convenience wrapper for `executeDrawIndexed`.
+     * Positional convenience wrapper for `executeDrawIndexed` (zero-alloc argument path).
      */
     drawIndexed(pass, indexCount, instanceCount = 1, firstIndex = 0, baseVertex = 0, firstInstance = 0) {
-      return this.executeDrawIndexed(pass, {
-        indexCount,
-        instanceCount,
-        firstIndex,
-        baseVertex,
-        firstInstance,
-      });
+      return this._executeDrawCore(
+        pass,
+        null,
+        true,
+        toNonNegativeInt(indexCount, 0),
+        toNonNegativeInt(instanceCount, 0),
+        0,
+        toNonNegativeInt(firstIndex, 0),
+        Number.isInteger(baseVertex) ? baseVertex : 0,
+        toNonNegativeInt(firstInstance, 0)
+      );
     }
 
     /**
-     * Positional convenience wrapper for `executeDrawIndirect`.
+     * Positional convenience wrapper for `executeDrawIndirect` (zero-alloc argument path).
      */
     drawIndirect(pass, indirectBuffer, indirectOffset = 0) {
-      return this.executeDrawIndirect(pass, {
-        indirectBuffer,
-        indirectOffset,
-      });
+      return this._executeDrawIndirectCore(
+        pass,
+        null,
+        false,
+        indirectBuffer !== undefined ? indirectBuffer : null,
+        indirectOffset !== undefined ? indirectOffset : 0
+      );
     }
 
     /**
-     * Positional convenience wrapper for `executeDrawIndexedIndirect`.
+     * Positional convenience wrapper for `executeDrawIndexedIndirect` (zero-alloc argument path).
      */
     drawIndexedIndirect(pass, indirectBuffer, indirectOffset = 0) {
-      return this.executeDrawIndexedIndirect(pass, {
-        indirectBuffer,
-        indirectOffset,
-      });
+      return this._executeDrawIndirectCore(
+        pass,
+        null,
+        true,
+        indirectBuffer !== undefined ? indirectBuffer : null,
+        indirectOffset !== undefined ? indirectOffset : 0
+      );
     }
 
     _executeDrawIndirectInternal(pass, drawArgs, indexed) {
-      const args = drawArgs && typeof drawArgs === 'object' ? drawArgs : {};
-      const indirectBuffer = args.indirectBuffer !== undefined ? args.indirectBuffer : null;
-      const indirectOffset = args.indirectOffset !== undefined ? args.indirectOffset : 0;
+      const args = drawArgs && typeof drawArgs === 'object' ? drawArgs : null;
+      const indirectBuffer =
+        args !== null && args.indirectBuffer !== undefined ? args.indirectBuffer : null;
+      const indirectOffset =
+        args !== null && args.indirectOffset !== undefined ? args.indirectOffset : 0;
+      return this._executeDrawIndirectCore(pass, args, indexed, indirectBuffer, indirectOffset);
+    }
 
-      const result = {
-        executed: false,
-        skipped: false,
-        reason: null,
-        isFallback: false,
-        profile: null,
-        effectiveProfile: null,
+    _executeDrawIndirectCore(pass, args, indexed, indirectBuffer, indirectOffset) {
+      const safeOffset =
+        Number.isInteger(indirectOffset) && indirectOffset >= 0 ? indirectOffset : 0;
+      const result = this._acquireDrawResult(
         indexed,
-        indirect: true,
-        indirectOffset:
-          Number.isInteger(indirectOffset) && indirectOffset >= 0 ? indirectOffset : 0,
-        pipelineElided: false,
-        bindGroupsElided: 0,
-        vertexBuffersElided: 0,
-        indexBufferElided: false,
-        viewportElided: false,
-        scissorElided: false,
-        blendConstantElided: false,
-        stencilReferenceElided: false,
-        bindGroupCacheHit: false,
-        vertexCount: 0,
-        indexCount: 0,
-        instanceCount: 0,
-        substitutedCbv: false,
-        substitutedTexture: false,
-        substitutedSampler: false,
-        substitutedVertexBuffer: false,
-      };
+        true,
+        0,
+        0,
+        safeOffset,
+        args !== null ? args.reuseResult : false
+      );
 
       if (this._destroyed) {
-        this._recordSkip('executor-destroyed');
+        this._recordSkip('executor-destroyed', false);
         result.skipped = true;
         result.reason = 'executor-destroyed';
         return result;
@@ -3936,21 +4979,22 @@
         typeof pass.setPipeline !== 'function' ||
         typeof pass[drawMethod] !== 'function'
       ) {
-        this._recordSkip('invalid-render-pass');
+        this._recordSkip('invalid-render-pass', false);
         result.skipped = true;
         result.reason = 'invalid-render-pass';
         return result;
       }
 
-      const indCheck = validateIndirectBuffer(indirectBuffer, indirectOffset, indexed);
-      if (!indCheck.ok) {
-        this._recordSkip('invalid-indirect-buffer', { invalidRange: indCheck.invalidRange });
+      const indStatus = validateIndirectBufferStatus(indirectBuffer, indirectOffset, indexed);
+      if (indStatus !== INDIRECT_STATUS_OK) {
+        this._recordSkip('invalid-indirect-buffer', indStatus === INDIRECT_STATUS_INVALID_RANGE);
         result.skipped = true;
         result.reason = 'invalid-indirect-buffer';
         return result;
       }
 
-      const activePipe = args.pipeline !== undefined ? args.pipeline : this._activePipeline;
+      const activePipe =
+        args !== null && args.pipeline !== undefined ? args.pipeline : this._activePipeline;
       const isFallback = this._needsFallbackRoutingFast(args, activePipe);
       result.isFallback = isFallback;
 
@@ -3962,18 +5006,16 @@
           const bound = this._bindPipelineOnPass(pass, realPipeline);
           result.pipelineElided = !bound;
           this._bindPassDynamicState(pass, args, result);
-          const resBind = this._bindNormalResources(pass);
-          result.vertexBuffersElided = resBind.vertexBuffersElided;
-          result.bindGroupsElided = resBind.bindGroupsElided;
+          this._bindNormalResources(pass, result);
           if (indexed) {
-            const ibRes = this._validateAndBindIndexBuffer(pass, 1, 0);
-            if (!ibRes.ok) {
-              this._recordSkip('invalid-index-buffer', { invalidRange: ibRes.invalidRange });
+            const ibStatus = this._validateAndBindIndexBuffer(pass, 1, 0);
+            if (ibStatus === IB_STATUS_INVALID || ibStatus === IB_STATUS_INVALID_RANGE) {
+              this._recordSkip('invalid-index-buffer', ibStatus === IB_STATUS_INVALID_RANGE);
               result.skipped = true;
               result.reason = 'invalid-index-buffer';
               return result;
             }
-            result.indexBufferElided = ibRes.elided;
+            result.indexBufferElided = ibStatus === IB_STATUS_ELIDED;
             pass.drawIndexedIndirect(indirectBuffer, indirectOffset);
           } else {
             pass.drawIndirect(indirectBuffer, indirectOffset);
@@ -3987,7 +5029,7 @@
           return result;
         } catch (err) {
           this._stats.passErrors += 1;
-          this._recordSkip('pass-error');
+          this._recordSkip('pass-error', false);
           this._warn('Normal indirect draw execution failed', {
             error: String(err && err.message ? err.message : err),
           });
@@ -3998,24 +5040,24 @@
       }
 
       if (!this._enableShaderFallback && !this._shaderFallbackRouter) {
-        this._recordSkip('no-pipeline');
+        this._recordSkip('no-pipeline', false);
         result.skipped = true;
         result.reason = 'no-pipeline';
         return result;
       }
 
       const drawState = this.getDrawState({
-        ...args,
+        ...(args !== null ? args : {}),
         indexed,
         indirect: true,
-        vertexCount: args.vertexCount !== undefined ? args.vertexCount : 0,
+        vertexCount: args !== null && args.vertexCount !== undefined ? args.vertexCount : 0,
         indexCount: 0,
         instanceCount: 1,
       });
 
       const resolved = this.resolveFallbackShaders(drawState);
       if (!resolved) {
-        this._recordSkip('shader-resolve-failed');
+        this._recordSkip('shader-resolve-failed', false);
         result.skipped = true;
         result.reason = 'shader-resolve-failed';
         return result;
@@ -4026,7 +5068,7 @@
 
       const fallbackPipeline = this._getOrCreateFallbackPipeline(resolved, drawState);
       if (!fallbackPipeline) {
-        this._recordSkip('pipeline-creation-failed');
+        this._recordSkip('pipeline-creation-failed', false);
         result.skipped = true;
         result.reason = 'pipeline-creation-failed';
         return result;
@@ -4037,7 +5079,7 @@
         result.pipelineElided = !bound;
       } catch (err) {
         this._stats.passErrors += 1;
-        this._recordSkip('pass-error');
+        this._recordSkip('pass-error', false);
         this._warn('pass.setPipeline failed on fallback indirect draw', {
           profile: resolved.effectiveProfile,
           error: String(err && err.message ? err.message : err),
@@ -4053,7 +5095,7 @@
         result.bindGroupCacheHit = bgRes.cacheHit;
         if (bgRes.bindGroupElided) result.bindGroupsElided += 1;
         if (!bgRes.ok) {
-          this._recordSkip('fallback-cbv-bind-failed');
+          this._recordSkip('fallback-cbv-bind-failed', false);
           result.skipped = true;
           result.reason = 'fallback-cbv-bind-failed';
           return result;
@@ -4065,7 +5107,7 @@
         result.bindGroupCacheHit = bgRes.cacheHit;
         if (bgRes.bindGroupElided) result.bindGroupsElided += 1;
         if (!bgRes.ok) {
-          this._recordSkip('fallback-texture-bind-failed');
+          this._recordSkip('fallback-texture-bind-failed', false);
           result.skipped = true;
           result.reason = 'fallback-texture-bind-failed';
           return result;
@@ -4075,7 +5117,7 @@
         result.substitutedVertexBuffer = vbRes.substitutedVertexBuffer;
         if (vbRes.vertexBufferElided) result.vertexBuffersElided += 1;
         if (!vbRes.ok) {
-          this._recordSkip('fallback-vb-bind-failed');
+          this._recordSkip('fallback-vb-bind-failed', false);
           result.skipped = true;
           result.reason = 'fallback-vb-bind-failed';
           return result;
@@ -4088,7 +5130,7 @@
         result.bindGroupCacheHit = bgRes.cacheHit;
         if (bgRes.bindGroupElided) result.bindGroupsElided += 1;
         if (!bgRes.ok) {
-          this._recordSkip('fallback-splash-bind-failed');
+          this._recordSkip('fallback-splash-bind-failed', false);
           result.skipped = true;
           result.reason = 'fallback-splash-bind-failed';
           return result;
@@ -4098,7 +5140,7 @@
         result.substitutedVertexBuffer = vbRes.substitutedVertexBuffer;
         if (vbRes.vertexBufferElided) result.vertexBuffersElided += 1;
         if (!vbRes.ok) {
-          this._recordSkip('fallback-vb-bind-failed');
+          this._recordSkip('fallback-vb-bind-failed', false);
           result.skipped = true;
           result.reason = 'fallback-vb-bind-failed';
           return result;
@@ -4108,21 +5150,21 @@
       try {
         this._bindPassDynamicState(pass, args, result);
         if (indexed) {
-          const ibRes = this._validateAndBindIndexBuffer(pass, 1, 0);
-          if (!ibRes.ok) {
-            this._recordSkip('invalid-index-buffer', { invalidRange: ibRes.invalidRange });
+          const ibStatus = this._validateAndBindIndexBuffer(pass, 1, 0);
+          if (ibStatus === IB_STATUS_INVALID || ibStatus === IB_STATUS_INVALID_RANGE) {
+            this._recordSkip('invalid-index-buffer', ibStatus === IB_STATUS_INVALID_RANGE);
             result.skipped = true;
             result.reason = 'invalid-index-buffer';
             return result;
           }
-          result.indexBufferElided = ibRes.elided;
+          result.indexBufferElided = ibStatus === IB_STATUS_ELIDED;
           pass.drawIndexedIndirect(indirectBuffer, indirectOffset);
         } else {
           pass.drawIndirect(indirectBuffer, indirectOffset);
         }
       } catch (err) {
         this._stats.passErrors += 1;
-        this._recordSkip('pass-error');
+        this._recordSkip('pass-error', false);
         this._warn('Fallback indirect draw submission failed', {
           profile: resolved.effectiveProfile,
           error: String(err && err.message ? err.message : err),
@@ -4150,51 +5192,60 @@
     }
 
     _executeDrawInternal(pass, drawArgs, indexed) {
-      const args = drawArgs && typeof drawArgs === 'object' ? drawArgs : {};
-      if (args.indirect === true) {
+      const args = drawArgs && typeof drawArgs === 'object' ? drawArgs : null;
+      if (args !== null && args.indirect === true) {
         return this._executeDrawIndirectInternal(pass, args, indexed);
       }
-      const count = indexed
-        ? toNonNegativeInt(args.indexCount, 0)
-        : toNonNegativeInt(args.vertexCount, 0);
-      const instanceCount = toNonNegativeInt(
-        args.instanceCount !== undefined ? args.instanceCount : 1,
-        0
-      );
-      const firstVertex = toNonNegativeInt(args.firstVertex, 0);
-      const firstIndex = toNonNegativeInt(args.firstIndex, 0);
-      const baseVertex = Number.isInteger(args.baseVertex) ? args.baseVertex : 0;
-      const firstInstance = toNonNegativeInt(args.firstInstance, 0);
+      const count =
+        args === null
+          ? 0
+          : indexed
+            ? toNonNegativeInt(args.indexCount, 0)
+            : toNonNegativeInt(args.vertexCount, 0);
+      const instanceCount =
+        args === null
+          ? 1
+          : toNonNegativeInt(args.instanceCount !== undefined ? args.instanceCount : 1, 0);
+      const firstVertex = args === null ? 0 : toNonNegativeInt(args.firstVertex, 0);
+      const firstIndex = args === null ? 0 : toNonNegativeInt(args.firstIndex, 0);
+      const baseVertex = args !== null && Number.isInteger(args.baseVertex) ? args.baseVertex : 0;
+      const firstInstance = args === null ? 0 : toNonNegativeInt(args.firstInstance, 0);
 
-      const result = {
-        executed: false,
-        skipped: false,
-        reason: null,
-        isFallback: false,
-        profile: null,
-        effectiveProfile: null,
+      return this._executeDrawCore(
+        pass,
+        args,
         indexed,
-        indirect: false,
-        pipelineElided: false,
-        bindGroupsElided: 0,
-        vertexBuffersElided: 0,
-        indexBufferElided: false,
-        viewportElided: false,
-        scissorElided: false,
-        blendConstantElided: false,
-        stencilReferenceElided: false,
-        bindGroupCacheHit: false,
-        vertexCount: indexed ? 0 : count,
-        indexCount: indexed ? count : 0,
+        count,
         instanceCount,
-        substitutedCbv: false,
-        substitutedTexture: false,
-        substitutedSampler: false,
-        substitutedVertexBuffer: false,
-      };
+        firstVertex,
+        firstIndex,
+        baseVertex,
+        firstInstance
+      );
+    }
+
+    _executeDrawCore(
+      pass,
+      args,
+      indexed,
+      count,
+      instanceCount,
+      firstVertex,
+      firstIndex,
+      baseVertex,
+      firstInstance
+    ) {
+      const result = this._acquireDrawResult(
+        indexed,
+        false,
+        count,
+        instanceCount,
+        0,
+        args !== null ? args.reuseResult : false
+      );
 
       if (this._destroyed) {
-        this._recordSkip('executor-destroyed');
+        this._recordSkip('executor-destroyed', false);
         result.skipped = true;
         result.reason = 'executor-destroyed';
         return result;
@@ -4206,20 +5257,21 @@
         typeof pass.setPipeline !== 'function' ||
         typeof (indexed ? pass.drawIndexed : pass.draw) !== 'function'
       ) {
-        this._recordSkip('invalid-render-pass');
+        this._recordSkip('invalid-render-pass', false);
         result.skipped = true;
         result.reason = 'invalid-render-pass';
         return result;
       }
 
       if (count <= 0 || instanceCount <= 0) {
-        this._recordSkip('zero-draw-count');
+        this._recordSkip('zero-draw-count', false);
         result.skipped = true;
         result.reason = 'zero-draw-count';
         return result;
       }
 
-      const activePipe = args.pipeline !== undefined ? args.pipeline : this._activePipeline;
+      const activePipe =
+        args !== null && args.pipeline !== undefined ? args.pipeline : this._activePipeline;
       const isFallback = this._needsFallbackRoutingFast(args, activePipe);
       result.isFallback = isFallback;
 
@@ -4231,18 +5283,16 @@
           const bound = this._bindPipelineOnPass(pass, realPipeline);
           result.pipelineElided = !bound;
           this._bindPassDynamicState(pass, args, result);
-          const resBind = this._bindNormalResources(pass);
-          result.vertexBuffersElided = resBind.vertexBuffersElided;
-          result.bindGroupsElided = resBind.bindGroupsElided;
+          this._bindNormalResources(pass, result);
           if (indexed) {
-            const ibRes = this._validateAndBindIndexBuffer(pass, count, firstIndex);
-            if (!ibRes.ok) {
-              this._recordSkip('invalid-index-buffer', { invalidRange: ibRes.invalidRange });
+            const ibStatus = this._validateAndBindIndexBuffer(pass, count, firstIndex);
+            if (ibStatus === IB_STATUS_INVALID || ibStatus === IB_STATUS_INVALID_RANGE) {
+              this._recordSkip('invalid-index-buffer', ibStatus === IB_STATUS_INVALID_RANGE);
               result.skipped = true;
               result.reason = 'invalid-index-buffer';
               return result;
             }
-            result.indexBufferElided = ibRes.elided;
+            result.indexBufferElided = ibStatus === IB_STATUS_ELIDED;
             pass.drawIndexed(count, instanceCount, firstIndex, baseVertex, firstInstance);
             this._stats.indexedDraws += 1;
           } else {
@@ -4257,7 +5307,7 @@
           return result;
         } catch (err) {
           this._stats.passErrors += 1;
-          this._recordSkip('pass-error');
+          this._recordSkip('pass-error', false);
           this._warn('Normal draw execution failed', {
             error: String(err && err.message ? err.message : err),
           });
@@ -4268,16 +5318,16 @@
       }
 
       if (!this._enableShaderFallback && !this._shaderFallbackRouter) {
-        this._recordSkip('no-pipeline');
+        this._recordSkip('no-pipeline', false);
         result.skipped = true;
         result.reason = 'no-pipeline';
         return result;
       }
 
       const drawState = this.getDrawState({
-        ...args,
+        ...(args !== null ? args : {}),
         indexed,
-        vertexCount: indexed ? args.vertexCount || 0 : count,
+        vertexCount: indexed ? (args !== null && args.vertexCount ? args.vertexCount : 0) : count,
         indexCount: indexed ? count : 0,
         instanceCount,
         firstVertex,
@@ -4290,7 +5340,7 @@
       // and harden bind-group & vertex-buffer bindings.
       const resolved = this.resolveFallbackShaders(drawState);
       if (!resolved) {
-        this._recordSkip('shader-resolve-failed');
+        this._recordSkip('shader-resolve-failed', false);
         result.skipped = true;
         result.reason = 'shader-resolve-failed';
         return result;
@@ -4301,7 +5351,7 @@
 
       const fallbackPipeline = this._getOrCreateFallbackPipeline(resolved, drawState);
       if (!fallbackPipeline) {
-        this._recordSkip('pipeline-creation-failed');
+        this._recordSkip('pipeline-creation-failed', false);
         result.skipped = true;
         result.reason = 'pipeline-creation-failed';
         return result;
@@ -4312,7 +5362,7 @@
         result.pipelineElided = !bound;
       } catch (err) {
         this._stats.passErrors += 1;
-        this._recordSkip('pass-error');
+        this._recordSkip('pass-error', false);
         this._warn('pass.setPipeline failed on fallback draw', {
           profile: resolved.effectiveProfile,
           error: String(err && err.message ? err.message : err),
@@ -4331,7 +5381,7 @@
         result.bindGroupCacheHit = bgRes.cacheHit;
         if (bgRes.bindGroupElided) result.bindGroupsElided += 1;
         if (!bgRes.ok) {
-          this._recordSkip('fallback-cbv-bind-failed');
+          this._recordSkip('fallback-cbv-bind-failed', false);
           result.skipped = true;
           result.reason = 'fallback-cbv-bind-failed';
           return result;
@@ -4343,7 +5393,7 @@
         result.bindGroupCacheHit = bgRes.cacheHit;
         if (bgRes.bindGroupElided) result.bindGroupsElided += 1;
         if (!bgRes.ok) {
-          this._recordSkip('fallback-texture-bind-failed');
+          this._recordSkip('fallback-texture-bind-failed', false);
           result.skipped = true;
           result.reason = 'fallback-texture-bind-failed';
           return result;
@@ -4353,7 +5403,7 @@
         result.substitutedVertexBuffer = vbRes.substitutedVertexBuffer;
         if (vbRes.vertexBufferElided) result.vertexBuffersElided += 1;
         if (!vbRes.ok) {
-          this._recordSkip('fallback-vb-bind-failed');
+          this._recordSkip('fallback-vb-bind-failed', false);
           result.skipped = true;
           result.reason = 'fallback-vb-bind-failed';
           return result;
@@ -4368,7 +5418,7 @@
         result.bindGroupCacheHit = bgRes.cacheHit;
         if (bgRes.bindGroupElided) result.bindGroupsElided += 1;
         if (!bgRes.ok) {
-          this._recordSkip('fallback-splash-bind-failed');
+          this._recordSkip('fallback-splash-bind-failed', false);
           result.skipped = true;
           result.reason = 'fallback-splash-bind-failed';
           return result;
@@ -4383,7 +5433,7 @@
         result.substitutedVertexBuffer = vbRes.substitutedVertexBuffer;
         if (vbRes.vertexBufferElided) result.vertexBuffersElided += 1;
         if (!vbRes.ok) {
-          this._recordSkip('fallback-vb-bind-failed');
+          this._recordSkip('fallback-vb-bind-failed', false);
           result.skipped = true;
           result.reason = 'fallback-vb-bind-failed';
           return result;
@@ -4395,14 +5445,14 @@
       try {
         this._bindPassDynamicState(pass, args, result);
         if (indexed) {
-          const ibRes = this._validateAndBindIndexBuffer(pass, effectiveCount, firstIndex);
-          if (!ibRes.ok) {
-            this._recordSkip('invalid-index-buffer', { invalidRange: ibRes.invalidRange });
+          const ibStatus = this._validateAndBindIndexBuffer(pass, effectiveCount, firstIndex);
+          if (ibStatus === IB_STATUS_INVALID || ibStatus === IB_STATUS_INVALID_RANGE) {
+            this._recordSkip('invalid-index-buffer', ibStatus === IB_STATUS_INVALID_RANGE);
             result.skipped = true;
             result.reason = 'invalid-index-buffer';
             return result;
           }
-          result.indexBufferElided = ibRes.elided;
+          result.indexBufferElided = ibStatus === IB_STATUS_ELIDED;
           pass.drawIndexed(effectiveCount, instanceCount, firstIndex, baseVertex, firstInstance);
           this._stats.indexedDraws += 1;
         } else {
@@ -4411,7 +5461,7 @@
         }
       } catch (err) {
         this._stats.passErrors += 1;
-        this._recordSkip('pass-error');
+        this._recordSkip('pass-error', false);
         this._warn('Fallback draw submission failed', {
           profile: resolved.effectiveProfile,
           error: String(err && err.message ? err.message : err),

@@ -2701,3 +2701,342 @@ test('W251 fallback-only frame still latches hasNonClearDraw and integrates clea
   assert.equal(swapchain.getStats().visiblePresentsTotal, 1);
   assert.equal(swapchain.getStats().firstVisiblePresentIndex, 2);
 });
+
+// ---------------------------------------------------------------------------
+// W282 O(1) dirty-slot bind-group (0..3) / VB (0..7) elision & zero-alloc hot path
+// ---------------------------------------------------------------------------
+
+test('W282 O(1) bind-group elision across slots 0..3 with dynamic offsets (identical elided, changed/mutated re-bound)', () => {
+  const { device, pass, calls } = createMockWebGpu();
+  const router = new ShaderFallbackRouter();
+  const executor = new DrawExecutor({ device, shaderFallbackRouter: router });
+
+  const pipe = {
+    kind: 'GPURenderPipeline',
+    handle: 9101,
+    getBindGroupLayout: () => ({ kind: 'GPUBindGroupLayout' }),
+  };
+  const bgs = [0, 1, 2, 3, 4].map((i) => ({ kind: 'GPUBindGroup', handle: 9200 + i }));
+  const bgAlt = { kind: 'GPUBindGroup', handle: 9299 };
+
+  executor.beginPass();
+  executor.setPipeline(pipe);
+
+  const dyn0 = new Uint32Array([0, 256]);
+  const dynSliceBuf = new Uint32Array([0, 256, 512, 768, 1024, 1280]);
+  const longDyn = new Uint32Array([0, 256, 512, 768, 1024, 1280, 1536, 1792, 2048, 2304]); // 10 offsets (> 8 inline cap)
+
+  executor.setBindGroup(0, bgs[0], dyn0);
+  executor.setBindGroup(1, bgs[1], dynSliceBuf, 2, 2); // [512, 768]
+  executor.setBindGroup(2, bgs[2]); // static (no dynamic offsets)
+  executor.setBindGroup(3, bgs[3], longDyn); // > 8 dynamic offsets overflow snapshot
+  executor.setBindGroup(4, bgs[4], [64]); // overflow slot >= 4
+
+  // Draw 1: cold pass binds all 5 groups once.
+  const d1 = executor.draw(pass, 6, 1);
+  assert.equal(d1.executed, true);
+  assert.equal(d1.bindGroupsElided, 0);
+  assert.equal(calls.pass.filter((c) => c.op === 'setBindGroup').length, 5);
+
+  // Draw 2: identical values across all 5 slots (including Array vs Uint32Array & 5-arg slice) elides all 5!
+  executor.setBindGroup(0, bgs[0], [0, 256]);
+  executor.setBindGroup(1, bgs[1], dynSliceBuf, 2, 2);
+  executor.setBindGroup(2, bgs[2]);
+  executor.setBindGroup(3, bgs[3], longDyn);
+  executor.setBindGroup(4, bgs[4], new Uint32Array([64]));
+  const d2 = executor.draw(pass, 6, 1);
+  assert.equal(d2.executed, true);
+  assert.equal(d2.bindGroupsElided, 5);
+  assert.equal(calls.pass.filter((c) => c.op === 'setBindGroup').length, 5);
+
+  // Draw 3: change ONLY slot 1 5-arg slice ([512, 768] -> [1024, 1280]) -> 4 elided, 1 re-bound.
+  executor.setBindGroup(1, bgs[1], dynSliceBuf, 4, 2);
+  const d3 = executor.draw(pass, 6, 1);
+  assert.equal(d3.executed, true);
+  assert.equal(d3.bindGroupsElided, 4);
+  const bgOpsAfterD3 = calls.pass.filter((c) => c.op === 'setBindGroup');
+  assert.equal(bgOpsAfterD3.length, 6);
+  assert.equal(bgOpsAfterD3[5].groupIndex, 1);
+  assert.deepEqual(Array.from(bgOpsAfterD3[5].dynamicOffsets), [1024, 1280]);
+
+  // Draw 4: mutate slot 3's 10-element Uint32Array IN PLACE without calling setBindGroup -> only slot 3 re-binds!
+  longDyn[9] = 2560;
+  const d4 = executor.draw(pass, 6, 1);
+  assert.equal(d4.executed, true);
+  assert.equal(d4.bindGroupsElided, 4);
+  const bgOpsAfterD4 = calls.pass.filter((c) => c.op === 'setBindGroup');
+  assert.equal(bgOpsAfterD4.length, 7);
+  assert.equal(bgOpsAfterD4[6].groupIndex, 3);
+
+  // Draw 5: dirty slot 2 then revert back to already-bound bgs[2] before draw -> still elides all 5!
+  executor.setBindGroup(2, bgAlt);
+  executor.setBindGroup(2, bgs[2]);
+  const d5 = executor.draw(pass, 6, 1);
+  assert.equal(d5.executed, true);
+  assert.equal(d5.bindGroupsElided, 5);
+  assert.equal(calls.pass.filter((c) => c.op === 'setBindGroup').length, 7);
+
+  // Draw 6: change slot 0 dynamic offset length ([0, 256] -> [0]) -> only slot 0 re-binds!
+  executor.setBindGroup(0, bgs[0], [0]);
+  const d6 = executor.draw(pass, 6, 1);
+  assert.equal(d6.executed, true);
+  assert.equal(d6.bindGroupsElided, 4);
+  assert.equal(calls.pass.filter((c) => c.op === 'setBindGroup').length, 8);
+
+  // getBoundPassState accurately reflects all 4 fast slots + overflow slot 4.
+  const bound = executor.getBoundPassState();
+  assert.deepEqual(bound.bindGroups[0].dynamicOffsets, [0]);
+  assert.deepEqual(bound.bindGroups[1].dynamicOffsets, [1024, 1280]);
+  assert.equal(bound.bindGroups[2].dynamicOffsets, null);
+  assert.equal(bound.bindGroups[3].dynamicOffsets.length, 10);
+  assert.equal(bound.bindGroups[3].dynamicOffsets[9], 2560);
+  assert.deepEqual(bound.bindGroups[4].dynamicOffsets, [64]);
+});
+
+test('W282 O(1) multi-slot vertex-buffer elision across slots 0..7 (plus overflow slot 8 & mid-pass destroy guard)', () => {
+  const { device, pass, calls } = createMockWebGpu();
+  const router = new ShaderFallbackRouter();
+  const executor = new DrawExecutor({ device, shaderFallbackRouter: router });
+
+  const pipe = {
+    kind: 'GPURenderPipeline',
+    handle: 9301,
+    getBindGroupLayout: () => ({ kind: 'GPUBindGroupLayout' }),
+  };
+  const vbs = [];
+  for (let i = 0; i < 9; i += 1) {
+    vbs.push(device.createBuffer({ size: 512, usage: BUFFER_USAGE.VERTEX }));
+  }
+  const replacementVb = device.createBuffer({ size: 512, usage: BUFFER_USAGE.VERTEX });
+
+  executor.beginPass();
+  executor.setPipeline(pipe);
+  for (let slot = 0; slot < 8; slot += 1) {
+    executor.setVertexBuffer(slot, vbs[slot], slot * 16, 256);
+  }
+  executor.setVertexBuffer(8, vbs[8], 0, 128); // overflow slot >= 8
+
+  // Draw 1: cold pass binds all 9 slots once in ascending slot order.
+  const d1 = executor.draw(pass, 12, 1);
+  assert.equal(d1.executed, true);
+  assert.equal(d1.vertexBuffersElided, 0);
+  const firstVbOps = calls.pass.filter((c) => c.op === 'setVertexBuffer');
+  assert.equal(firstVbOps.length, 9);
+  assert.deepEqual(
+    firstVbOps.map((c) => c.slot),
+    [0, 1, 2, 3, 4, 5, 6, 7, 8]
+  );
+
+  // Draw 2: identical state elides all 9 slots in O(1).
+  const d2 = executor.draw(pass, 12, 1);
+  assert.equal(d2.executed, true);
+  assert.equal(d2.vertexBuffersElided, 9);
+  assert.equal(calls.pass.filter((c) => c.op === 'setVertexBuffer').length, 9);
+
+  // Draw 3: redundantly re-staging identical slots 0..7 via options objects still elides all 9!
+  for (let slot = 0; slot < 8; slot += 1) {
+    executor.setVertexBuffer(slot, vbs[slot], { offset: slot * 16, size: 256 });
+  }
+  const d3 = executor.draw(pass, 12, 1);
+  assert.equal(d3.executed, true);
+  assert.equal(d3.vertexBuffersElided, 9);
+  assert.equal(calls.pass.filter((c) => c.op === 'setVertexBuffer').length, 9);
+
+  // Draw 4: mutate ONLY slot 5 offset and slot 7 size -> 7 elided, ONLY slots 5 and 7 re-bound!
+  executor.setVertexBuffer(5, vbs[5], 128, 256);
+  executor.setVertexBuffer(7, vbs[7], 7 * 16, 128);
+  const d4 = executor.draw(pass, 12, 1);
+  assert.equal(d4.executed, true);
+  assert.equal(d4.vertexBuffersElided, 7);
+  const vbOpsAfterD4 = calls.pass.filter((c) => c.op === 'setVertexBuffer');
+  assert.equal(vbOpsAfterD4.length, 11);
+  assert.deepEqual(
+    vbOpsAfterD4.slice(9).map((c) => ({ slot: c.slot, offset: c.offset, size: c.size })),
+    [
+      { slot: 5, offset: 128, size: 256 },
+      { slot: 7, offset: 112, size: 128 },
+    ]
+  );
+
+  // Draw 5: mid-pass .destroy() on clean slot 4 is caught immediately without eliding it.
+  vbs[4].destroy();
+  const d5 = executor.draw(pass, 12, 1);
+  assert.equal(d5.executed, true);
+  assert.equal(d5.vertexBuffersElided, 8); // slots 0..3, 5..8 elided; slot 4 guarded & skipped
+  assert.equal(executor.getStats().skippedVertexBufferBindings, 1);
+
+  // Draw 6: replace slot 4 with valid buffer + unbind/rebind slot 2 -> only slots 2 and 4 re-bind!
+  executor.setVertexBuffer(4, replacementVb, 0, 256);
+  executor.setVertexBuffer(2, null);
+  executor.setVertexBuffer(2, vbs[2], 32, 256);
+  const d6 = executor.draw(pass, 12, 1);
+  assert.equal(d6.executed, true);
+  assert.equal(d6.vertexBuffersElided, 7);
+  const vbOpsAfterD6 = calls.pass.filter((c) => c.op === 'setVertexBuffer');
+  assert.equal(vbOpsAfterD6.length, 13);
+  assert.deepEqual(
+    vbOpsAfterD6.slice(11).map((c) => c.slot),
+    [2, 4]
+  );
+
+  // Snapshot verifies all 9 bound slots.
+  const bound = executor.getBoundPassState();
+  assert.equal(bound.vertexBuffers[4].buffer, replacementVb);
+  assert.equal(bound.vertexBuffers[5].offset, 128);
+  assert.equal(bound.vertexBuffers[7].size, 128);
+  assert.equal(bound.vertexBuffers[8].buffer, vbs[8]);
+});
+
+test('W282 500-draw 30 FPS burst accuracy, zero-alloc reuseDrawResult & getFrameDrawSummary reuse, and zero W251 regression', () => {
+  const { device, pass, calls } = createMockWebGpu();
+  const router = new ShaderFallbackRouter();
+  const executor = new DrawExecutor({
+    device,
+    shaderFallbackRouter: router,
+    reuseDrawResult: true,
+  });
+
+  const pipe = {
+    kind: 'GPURenderPipeline',
+    handle: 9401,
+    getBindGroupLayout: () => ({ kind: 'GPUBindGroupLayout' }),
+  };
+  const vbs = Array.from({ length: 8 }, () =>
+    device.createBuffer({ size: 4096, usage: BUFFER_USAGE.VERTEX })
+  );
+  const ib = device.createBuffer({ size: 4096, usage: BUFFER_USAGE.INDEX });
+  const indirectBuf = device.createBuffer({ size: 128, usage: BUFFER_USAGE.INDIRECT });
+  const bgs = Array.from({ length: 4 }, (_, i) => ({ kind: 'GPUBindGroup', handle: 9500 + i }));
+  const dynOffsets = new Uint32Array([0, 256]);
+
+  executor.beginFrame();
+  executor.beginPass();
+  executor.setPipeline(pipe);
+  for (let slot = 0; slot < 8; slot += 1) {
+    executor.setVertexBuffer(slot, vbs[slot], 0, 1024);
+  }
+  executor.setIndexBuffer(ib, 'uint16', 0, 2048);
+  executor.setBindGroup(0, bgs[0], dynOffsets);
+  executor.setBindGroup(1, bgs[1]);
+  executor.setBindGroup(2, bgs[2]);
+  executor.setBindGroup(3, bgs[3]);
+  executor.setViewport(0, 0, 1920, 1080, 0, 1);
+  executor.setScissorRect(0, 0, 1920, 1080);
+  executor.setBlendConstant({ r: 0, g: 0, b: 0, a: 1 });
+  executor.setStencilReference(1);
+
+  // 500 consecutive draws: 400 drawIndexed + 80 draw + 10 drawIndirect + 10 drawIndexedIndirect.
+  // Dynamic offset on BG0 advances every 50 draws (10 unique values across 500 draws).
+  let firstDirectRef = null;
+  let firstIndirectRef = null;
+  for (let i = 0; i < 500; i += 1) {
+    dynOffsets[0] = Math.floor(i / 50) * 256;
+    let res;
+    if (i < 400) {
+      res = executor.drawIndexed(pass, 12, 1, 0, 0, 0);
+      if (firstDirectRef === null) firstDirectRef = res;
+      assert.equal(res, firstDirectRef);
+    } else if (i < 480) {
+      res = executor.draw(pass, 6, 1, 0, 0);
+      assert.equal(res, firstDirectRef);
+    } else if (i < 490) {
+      res = executor.drawIndirect(pass, indirectBuf, 0);
+      if (firstIndirectRef === null) firstIndirectRef = res;
+      assert.equal(res, firstIndirectRef);
+    } else {
+      res = executor.drawIndexedIndirect(pass, indirectBuf, 20);
+      assert.equal(res, firstIndirectRef);
+    }
+    assert.equal(res.executed, true);
+    if (i > 0) {
+      assert.equal(res.pipelineElided, true);
+      assert.equal(res.vertexBuffersElided, 8);
+      assert.equal(res.viewportElided, true);
+      assert.equal(res.scissorElided, true);
+      assert.equal(res.blendConstantElided, true);
+      assert.equal(res.stencilReferenceElided, true);
+      const expectedBgElided = i % 50 === 0 ? 3 : 4;
+      assert.equal(res.bindGroupsElided, expectedBgElided);
+    }
+  }
+
+  // Exact WebGPU pass call counts across 500 draws:
+  assert.equal(calls.pass.filter((c) => c.op === 'setPipeline').length, 1);
+  assert.equal(calls.pass.filter((c) => c.op === 'setVertexBuffer').length, 8);
+  assert.equal(calls.pass.filter((c) => c.op === 'setBindGroup').length, 13); // 10 BG0 + 3 static (BG1..BG3)
+  assert.equal(calls.pass.filter((c) => c.op === 'setIndexBuffer').length, 1);
+  assert.equal(calls.pass.filter((c) => c.op === 'setViewport').length, 1);
+  assert.equal(calls.pass.filter((c) => c.op === 'setScissorRect').length, 1);
+  assert.equal(calls.pass.filter((c) => c.op === 'setBlendConstant').length, 1);
+  assert.equal(calls.pass.filter((c) => c.op === 'setStencilReference').length, 1);
+  assert.equal(calls.pass.filter((c) => c.op === 'drawIndexed').length, 400);
+  assert.equal(calls.pass.filter((c) => c.op === 'draw').length, 80);
+  assert.equal(calls.pass.filter((c) => c.op === 'drawIndirect').length, 10);
+  assert.equal(calls.pass.filter((c) => c.op === 'drawIndexedIndirect').length, 10);
+
+  const stats = executor.getStats();
+  assert.equal(stats.totalDraws, 500);
+  assert.equal(stats.totalDrawsExecuted, 500);
+  assert.equal(stats.normalDraws, 500);
+  assert.equal(stats.elidedPipelineSets, 499);
+  assert.equal(stats.elidedVertexBufferSets, 499 * 8);
+  assert.equal(stats.elidedBindGroupSets, 500 * 4 - 13);
+  assert.equal(stats.elidedIndexBufferSets, 409); // 400 drawIndexed + 10 drawIndexedIndirect - 1 initial bind
+  assert.equal(stats.elidedViewportScissorSets, 499 * 2);
+  assert.equal(stats.elidedBlendConstantSets, 499);
+  assert.equal(stats.elidedStencilReferenceSets, 499);
+  // Total state calls: 500*(1+8+4+2+1+1) + 410 IB = 8910; emitted = 27; elided = 8883 -> hit rate > 0.996!
+  assert.equal(stats.totalElidedStateCalls, 8883);
+  assert.ok(Math.abs(stats.stateElisionHitRate - 8883 / 8910) < 1e-12);
+  assert.ok(stats.stateElisionHitRate > 0.99);
+
+  // Zero-alloc reusable frame summary snapshot matches exact W251 shape & values.
+  const reused1 = executor.getFrameDrawSummary(true);
+  const reused2 = executor.getFrameDrawSummary({ reuse: true });
+  assert.equal(reused1, reused2);
+  assert.deepEqual(reused1, {
+    hasNonClearDraw: true,
+    realPackDrawsThisFrame: 500,
+    fallbackDrawsThisFrame: 0,
+    drawsThisFrame: 500,
+  });
+
+  // Caller-owned target reuse works without allocating.
+  const callerTarget = {
+    hasNonClearDraw: false,
+    realPackDrawsThisFrame: 0,
+    fallbackDrawsThisFrame: 0,
+    drawsThisFrame: 0,
+  };
+  const populated = executor.getFrameDrawSummary(callerTarget);
+  assert.equal(populated, callerTarget);
+  assert.deepEqual(populated, reused1);
+
+  // Default no-arg getFrameDrawSummary() still returns a fresh isolated object (W251 contract).
+  const fresh = executor.getFrameDrawSummary();
+  assert.notEqual(fresh, reused1);
+  assert.deepEqual(fresh, reused1);
+
+  // Mutating reused snapshot cannot corrupt internal W251 frame tracking.
+  reused1.hasNonClearDraw = false;
+  reused1.drawsThisFrame = 0;
+  assert.deepEqual(executor.getFrameDrawSummary(true), {
+    hasNonClearDraw: true,
+    realPackDrawsThisFrame: 500,
+    fallbackDrawsThisFrame: 0,
+    drawsThisFrame: 500,
+  });
+
+  // beginFrame() resets per-frame W251 counters cleanly while keeping cumulative totals intact.
+  executor.beginFrame();
+  assert.deepEqual(executor.getFrameDrawSummary(true), {
+    hasNonClearDraw: false,
+    realPackDrawsThisFrame: 0,
+    fallbackDrawsThisFrame: 0,
+    drawsThisFrame: 0,
+  });
+  assert.equal(executor.getStats().totalDrawsExecuted, 500);
+  // Fresh snapshot captured before beginFrame() was NOT mutated by beginFrame().
+  assert.equal(fresh.drawsThisFrame, 500);
+  assert.equal(fresh.hasNonClearDraw, true);
+});
