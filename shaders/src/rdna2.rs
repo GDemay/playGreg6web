@@ -454,19 +454,58 @@ impl Rdna2ProgramSummary {
 }
 
 // ---------------------------------------------------------------------------
-// Low-level decoding helpers
+// Low-level decoding helpers & bounds/stepping guards
 // ---------------------------------------------------------------------------
 
+/// Minimum size in bytes of any encoded RDNA2 instruction (one 32-bit dword).
+pub const MIN_RDNA2_INST_BYTES: usize = 4;
+
+/// Maximum size in bytes of any encoded RDNA2 instruction (64-bit `MIMG` + 3 NSA dwords).
+pub const MAX_RDNA2_INST_BYTES: usize = 20;
+
+/// Default hard upper bound on decoded instructions per program to prevent unbounded
+/// work or memory growth on adversarial or corrupted shader blobs (1M instructions = 4+ MiB).
+pub const DEFAULT_MAX_INSTRUCTIONS: usize = 1_048_576;
+
 fn read_u32_le(bytes: &[u8], offset: usize) -> Option<u32> {
-    let end = offset.checked_add(4)?;
+    let end = offset.checked_add(MIN_RDNA2_INST_BYTES)?;
     let slice = bytes.get(offset..end)?;
-    Some(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+    let arr: [u8; 4] = slice.try_into().ok()?;
+    Some(u32::from_le_bytes(arr))
+}
+
+/// Read the `word_index`-th 32-bit little-endian instruction word starting at `offset`
+/// using overflow-checked byte arithmetic and bounds-checked slice access.
+fn read_inst_word(bytes: &[u8], offset: usize, word_index: usize) -> Option<u32> {
+    let byte_delta = word_index.checked_mul(MIN_RDNA2_INST_BYTES)?;
+    let word_offset = offset.checked_add(byte_delta)?;
+    read_u32_le(bytes, word_offset)
+}
+
+/// Advance an instruction byte cursor while guaranteeing strict forward progress
+/// (`next > offset`), valid 4-byte-aligned RDNA2 instruction sizing, overflow safety,
+/// and `next <= buf_len`.
+fn checked_step_offset(offset: usize, inst_size: usize, buf_len: usize) -> Option<usize> {
+    let step = if (MIN_RDNA2_INST_BYTES..=MAX_RDNA2_INST_BYTES).contains(&inst_size)
+        && inst_size % MIN_RDNA2_INST_BYTES == 0
+    {
+        inst_size
+    } else {
+        MIN_RDNA2_INST_BYTES
+    };
+    let next = offset.checked_add(step)?;
+    if next <= offset || next > buf_len {
+        return None;
+    }
+    Some(next)
 }
 
 /// Compute relative SOPP/SOPK branch target byte offset: `pc + 4 + sext(simm16) * 4`.
 fn compute_branch_target(offset: usize, simm16: u16) -> i64 {
+    let base = i64::try_from(offset).unwrap_or(i64::MAX);
     let rel_dwords = i64::from(simm16 as i16);
-    (offset as i64).saturating_add(4).saturating_add(rel_dwords.saturating_mul(4))
+    base.saturating_add(4)
+        .saturating_add(rel_dwords.saturating_mul(4))
 }
 
 /// Sign-extend a 21-bit signed SMEM offset to `i32`.
@@ -1556,7 +1595,7 @@ fn decode_sopc(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
     let ssrc0 = (w0 & 0xFF) as u8;
     let needs_lit = ssrc0 == 0xFF || ssrc1 == 0xFF;
     let (literal, size, truncated) = if needs_lit {
-        match read_u32_le(bytes, offset.saturating_add(4)) {
+        match read_inst_word(bytes, offset, 1) {
             Some(lit) => (Some(lit), 8, false),
             None => (None, 4, true),
         }
@@ -1594,7 +1633,7 @@ fn decode_sop1(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
     let ssrc0 = (w0 & 0xFF) as u8;
     let needs_lit = ssrc0 == 0xFF;
     let (literal, size, truncated) = if needs_lit {
-        match read_u32_le(bytes, offset.saturating_add(4)) {
+        match read_inst_word(bytes, offset, 1) {
             Some(lit) => (Some(lit), 8, false),
             None => (None, 4, true),
         }
@@ -1641,7 +1680,7 @@ fn decode_sopk(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
     let (mnemonic, has_imm32, is_branch) = sopk_mnemonic(op);
 
     let (literal, size, truncated) = if has_imm32 {
-        match read_u32_le(bytes, offset.saturating_add(4)) {
+        match read_inst_word(bytes, offset, 1) {
             Some(lit) => (Some(lit), 8, false),
             None => (None, 4, true),
         }
@@ -1661,8 +1700,11 @@ fn decode_sopk(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
         format_sdst(sdst)
     };
 
-    let operands = if let Some(lit) = literal {
-        format!("hwreg(0x{simm16:04x}), 0x{lit:08x}")
+    let operands = if has_imm32 {
+        match literal {
+            Some(lit) => format!("hwreg(0x{simm16:04x}), 0x{lit:08x}"),
+            None => format!("hwreg(0x{simm16:04x}), <lit>"),
+        }
     } else if let Some(target) = branch_target {
         let rel = simm16 as i16;
         if target >= 0 {
@@ -1700,7 +1742,7 @@ fn decode_sop2(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
     let ssrc0 = (w0 & 0xFF) as u8;
     let needs_lit = ssrc0 == 0xFF || ssrc1 == 0xFF;
     let (literal, size, truncated) = if needs_lit {
-        match read_u32_le(bytes, offset.saturating_add(4)) {
+        match read_inst_word(bytes, offset, 1) {
             Some(lit) => (Some(lit), 8, false),
             None => (None, 4, true),
         }
@@ -1746,7 +1788,7 @@ fn decode_smem(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
     let sbase = (w0 & 0x3F) as u8;
     let (mnemonic, sdata_count, is_buffer) = smem_info(op);
 
-    let (w1, size, truncated) = match read_u32_le(bytes, offset.saturating_add(4)) {
+    let (w1, size, truncated) = match read_inst_word(bytes, offset, 1) {
         Some(w1) => (w1, 8, false),
         None => (0, 4, true),
     };
@@ -1804,7 +1846,7 @@ fn decode_vop1(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
     let src0 = (w0 & 0x1FF) as u16;
     let needs_extra = src_uses_extra_word(src0);
     let (literal, size, truncated) = if needs_extra {
-        match read_u32_le(bytes, offset.saturating_add(4)) {
+        match read_inst_word(bytes, offset, 1) {
             Some(lit) => (Some(lit), 8, false),
             None => (None, 4, true),
         }
@@ -1844,7 +1886,7 @@ fn decode_vopc(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
     let src0 = (w0 & 0x1FF) as u16;
     let needs_extra = src_uses_extra_word(src0);
     let (literal, size, truncated) = if needs_extra {
-        match read_u32_le(bytes, offset.saturating_add(4)) {
+        match read_inst_word(bytes, offset, 1) {
             Some(lit) => (Some(lit), 8, false),
             None => (None, 4, true),
         }
@@ -1881,7 +1923,7 @@ fn decode_vop2(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
     let needs_extra = always_lit || src_uses_extra_word(src0);
 
     let (literal, size, truncated) = if needs_extra {
-        match read_u32_le(bytes, offset.saturating_add(4)) {
+        match read_inst_word(bytes, offset, 1) {
             Some(lit) => (Some(lit), 8, false),
             None => (None, 4, true),
         }
@@ -1954,9 +1996,9 @@ fn decode_vop3(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
         (abs_or_sdst_raw & 0x7, None)
     };
 
-    let (w1, mut size, mut truncated) = match read_u32_le(bytes, offset.saturating_add(4)) {
-        Some(w1) => (w1, 8, false),
-        None => (0, 4, true),
+    let (w1, mut size, mut truncated) = match read_inst_word(bytes, offset, 1) {
+        Some(w1) => (w1, 8usize, false),
+        None => (0, 4usize, true),
     };
 
     let neg = ((w1 >> 29) & 0x7) as u8;
@@ -1971,7 +2013,7 @@ fn decode_vop3(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
             || (num_srcs >= 2 && src1 == 0xFF)
             || (num_srcs >= 3 && src2 == 0xFF));
     let literal = if uses_lit {
-        match read_u32_le(bytes, offset.saturating_add(8)) {
+        match read_inst_word(bytes, offset, 2) {
             Some(lit) => {
                 size = 12;
                 Some(lit)
@@ -2073,9 +2115,9 @@ fn decode_vop3p(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
     let vdst = (w0 & 0xFF) as u8;
     let mnemonic = vop3p_mnemonic(op);
 
-    let (w1, mut size, mut truncated) = match read_u32_le(bytes, offset.saturating_add(4)) {
-        Some(w1) => (w1, 8, false),
-        None => (0, 4, true),
+    let (w1, mut size, mut truncated) = match read_inst_word(bytes, offset, 1) {
+        Some(w1) => (w1, 8usize, false),
+        None => (0, 4usize, true),
     };
 
     let neg_lo = ((w1 >> 29) & 0x7) as u8;
@@ -2087,7 +2129,7 @@ fn decode_vop3p(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
     let num_srcs = vop3p_num_srcs(op);
     let uses_lit = !truncated && (src0 == 0xFF || src1 == 0xFF || (num_srcs >= 3 && src2 == 0xFF));
     let literal = if uses_lit {
-        match read_u32_le(bytes, offset.saturating_add(8)) {
+        match read_inst_word(bytes, offset, 2) {
             Some(lit) => {
                 size = 12;
                 Some(lit)
@@ -2284,7 +2326,7 @@ fn decode_exp(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
     let en = (w0 & 0xF) as u8;
     let target = Rdna2ExportTarget::from_raw(target_raw);
 
-    let (w1, size, truncated) = match read_u32_le(bytes, offset.saturating_add(4)) {
+    let (w1, size, truncated) = match read_inst_word(bytes, offset, 1) {
         Some(w1) => (w1, 8, false),
         None => (0, 4, true),
     };
@@ -2359,7 +2401,7 @@ fn decode_mubuf(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
     let inst_offset = (w0 & 0xFFF) as u16;
     let mnemonic = mubuf_mnemonic(op);
 
-    let (w1, size, truncated) = match read_u32_le(bytes, offset.saturating_add(4)) {
+    let (w1, size, truncated) = match read_inst_word(bytes, offset, 1) {
         Some(w1) => (w1, 8, false),
         None => (0, 4, true),
     };
@@ -2445,7 +2487,7 @@ fn decode_mtbuf(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
     let offen = ((w0 >> 12) & 0x1) != 0;
     let inst_offset = (w0 & 0xFFF) as u16;
 
-    let (w1, size, truncated) = match read_u32_le(bytes, offset.saturating_add(4)) {
+    let (w1, size, truncated) = match read_inst_word(bytes, offset, 1) {
         Some(w1) => (w1, 8, false),
         None => (0, 4, true),
     };
@@ -2537,25 +2579,20 @@ fn decode_mimg(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
 
     let (mnemonic, uses_sampler) = mimg_info(op);
 
-    let (w1, mut size, mut truncated) = match read_u32_le(bytes, offset.saturating_add(4)) {
-        Some(w1) => (w1, 8, false),
-        None => (0, 4, true),
+    let (w1, mut size, mut truncated) = match read_inst_word(bytes, offset, 1) {
+        Some(w1) => (w1, 8usize, false),
+        None => (0, 4usize, true),
     };
 
-    // Consume GFX10 NSA extra address words if present (nsize in 1..=3).
+    // Consume GFX10 NSA extra address words if present (nsize in 1..=3) via checked word reads.
     if !truncated && nsize > 0 {
-        let extra_bytes = usize::from(nsize) * 4;
-        if offset
-            .checked_add(8)
-            .and_then(|end| end.checked_add(extra_bytes))
-            .is_some_and(|total_end| total_end <= bytes.len())
-        {
-            size += extra_bytes;
-        } else {
-            // Advance through any complete remaining words without going out of bounds.
-            let avail_words = bytes.len().saturating_sub(offset.saturating_add(8)) / 4;
-            size += avail_words.min(usize::from(nsize)) * 4;
-            truncated = true;
+        for extra_idx in 0..usize::from(nsize) {
+            if read_inst_word(bytes, offset, 2 + extra_idx).is_some() {
+                size = size.saturating_add(MIN_RDNA2_INST_BYTES);
+            } else {
+                truncated = true;
+                break;
+            }
         }
     }
 
@@ -2653,7 +2690,7 @@ fn decode_flat(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
     };
     let mnemonic = flat_mnemonic(seg, op);
 
-    let (w1, size, truncated) = match read_u32_le(bytes, offset.saturating_add(4)) {
+    let (w1, size, truncated) = match read_inst_word(bytes, offset, 1) {
         Some(w1) => (w1, 8, false),
         None => (0, 4, true),
     };
@@ -2725,7 +2762,7 @@ fn decode_ds(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
     let offset0 = (w0 & 0xFF) as u8;
     let mnemonic = ds_mnemonic(op);
 
-    let (w1, size, truncated) = match read_u32_le(bytes, offset.saturating_add(4)) {
+    let (w1, size, truncated) = match read_inst_word(bytes, offset, 1) {
         Some(w1) => (w1, 8, false),
         None => (0, 4, true),
     };
@@ -2810,10 +2847,10 @@ fn is_xbox_preamble_record(bytes: &[u8], offset: usize) -> bool {
     if end > bytes.len() {
         return false;
     }
-    let Some(w0) = read_u32_le(bytes, offset) else {
+    let Some(w0) = read_inst_word(bytes, offset, 0) else {
         return false;
     };
-    let Some(w1) = read_u32_le(bytes, offset + 4) else {
+    let Some(w1) = read_inst_word(bytes, offset, 1) else {
         return false;
     };
     (w0 & XBOX_PREAMBLE_RECORD_W0_MASK) == XBOX_PREAMBLE_RECORD_W0_VAL
@@ -2835,18 +2872,18 @@ fn is_xbox_preamble_record(bytes: &[u8], offset: usize) -> bool {
 /// instructions (clobbering registers or fabricating inputs), so it is skipped when the exact
 /// signature matches. Returns `0` for every other input (bare synthetic programs are unchanged).
 pub fn rdna2_code_start_offset(bytes: &[u8]) -> usize {
-    if bytes.len() >= XBOX_SHADER_PREAMBLE_LEN + 4 {
+    if bytes.len() >= XBOX_SHADER_PREAMBLE_LEN + MIN_RDNA2_INST_BYTES {
         let tail_matches = XBOX_SHADER_PREAMBLE_TAIL
             .iter()
             .enumerate()
-            .all(|(i, &word)| read_u32_le(bytes, 0x18 + i * 4) == Some(word));
+            .all(|(i, &word)| read_inst_word(bytes, 0x18, i) == Some(word));
         if tail_matches
             && read_u32_le(bytes, XBOX_SHADER_PREAMBLE_LEN) == Some(XBOX_SHADER_ENTRY_INST)
         {
             return XBOX_SHADER_PREAMBLE_LEN;
         }
     }
-    if bytes.len() >= XBOX_SHADER_SHORT_PREAMBLE_LEN + 4
+    if bytes.len() >= XBOX_SHADER_SHORT_PREAMBLE_LEN + MIN_RDNA2_INST_BYTES
         && is_xbox_preamble_record(bytes, 0)
         && is_xbox_preamble_record(bytes, XBOX_PREAMBLE_RECORD_LEN)
         && read_u32_le(bytes, XBOX_SHADER_SHORT_PREAMBLE_LEN) == Some(XBOX_SHADER_ENTRY_INST)
@@ -2856,28 +2893,43 @@ pub fn rdna2_code_start_offset(bytes: &[u8]) -> usize {
     0
 }
 
-/// Decode all RDNA2 instructions in `bytes` up to `max_instructions` (or the entire buffer).
+/// Decode all RDNA2 instructions in `bytes` up to `max_instructions` (capped by
+/// [`DEFAULT_MAX_INSTRUCTIONS`]).
 ///
 /// Decoding starts at [`rdna2_code_start_offset`] (skipping the Xbox Series preamble when
 /// present); instruction offsets stay absolute within `bytes`.
+///
+/// Enforces checked instruction-word stepping, monotonic forward progress, and bounded
+/// iteration so empty, odd-length, truncated, or malformed buffers can never panic or loop.
 pub fn decode_program_limited(
     bytes: &[u8],
     max_instructions: Option<usize>,
 ) -> Vec<Rdna2Instruction> {
     let mut out = Vec::new();
     let mut offset = rdna2_code_start_offset(bytes);
-    let limit = max_instructions.unwrap_or(usize::MAX);
+    if offset >= bytes.len() {
+        return out;
+    }
+
+    let requested_limit = max_instructions.unwrap_or(DEFAULT_MAX_INSTRUCTIONS);
+    let max_possible = bytes.len() / MIN_RDNA2_INST_BYTES;
+    let limit = requested_limit
+        .min(DEFAULT_MAX_INSTRUCTIONS)
+        .min(max_possible);
 
     while out.len() < limit {
         let Some(inst) = decode_instruction(bytes, offset) else {
             break;
         };
-        // Guarantee strict forward progress (never stalls even on malformed inputs).
-        let step = inst.size.max(4);
+        let was_truncated = inst.truncated;
+        let next_offset = checked_step_offset(offset, inst.size, bytes.len());
         out.push(inst);
-        match offset.checked_add(step) {
-            Some(next) if next <= bytes.len() => offset = next,
-            _ => break,
+        if was_truncated {
+            break;
+        }
+        match next_offset {
+            Some(next) => offset = next,
+            None => break,
         }
     }
 
@@ -2980,9 +3032,9 @@ pub fn analyze_instructions(
             } => {
                 if matches!(op, 0x01 | 0x1B | 0x1E) {
                     endpgm_count += 1;
-                    if first_endpgm_offset.is_none() {
-                        first_endpgm_offset = Some(inst.offset);
-                    }
+                    first_endpgm_offset = Some(
+                        first_endpgm_offset.map_or(inst.offset, |cur| cur.min(inst.offset)),
+                    );
                 }
                 if *op == 0x0A {
                     has_barriers = true;
@@ -3360,6 +3412,13 @@ pub fn analyze_instructions(
             Rdna2Detail::Unknown { .. } => {}
         }
     }
+
+    // Enforce canonical ascending instruction-offset ordering across all summary lists
+    // so callers passing pre-decoded slices always obtain deterministic outputs.
+    exports.sort_by_key(|e| e.offset);
+    smem_refs.sort_by_key(|r| r.offset);
+    resource_refs.sort_by_key(|r| r.offset);
+    branches.sort_by_key(|b| b.offset);
 
     let inferred_stage = if has_pixel_export || has_vintrp {
         Rdna2InferredStage::Pixel
@@ -5051,5 +5110,379 @@ mod tests {
         assert_eq!(summary.max_vgpr, Some(40));
         assert_eq!(summary.max_sgpr, Some(14));
         assert_eq!(summary.truncated_instructions, 0);
+    }
+
+    #[test]
+    fn s58_empty_odd_length_and_truncated_buffers_never_panic() {
+        // Empty and sub-dword buffers (0..=3 bytes)
+        for len in 0..=3 {
+            let buf = vec![0xFFu8; len];
+            assert!(decode_instruction(&buf, 0).is_none());
+            assert!(decode_program(&buf).is_empty());
+            let summary = analyze_program(&buf);
+            assert_eq!(summary.byte_len, len);
+            assert_eq!(summary.trailing_bytes, len);
+            assert_eq!(summary.instruction_count, 0);
+            assert_eq!(summary.truncated_instructions, 0);
+            assert_eq!(summary.unknown_instructions, 0);
+            assert_eq!(summary.inferred_stage, Rdna2InferredStage::Unknown);
+            assert!(!format_disasm(&buf, None).is_empty());
+            assert!(summary.to_json().contains("\"instruction_count\": 0"));
+        }
+
+        // Overflow and out-of-bounds offsets passed directly to decode_instruction / read_inst_word
+        let single_nop = words_to_bytes(&[enc_sopp(0x00, 0)]);
+        for bad_off in [
+            1usize,
+            2,
+            3,
+            4,
+            1024,
+            usize::MAX - 3,
+            usize::MAX - 1,
+            usize::MAX,
+        ] {
+            assert!(
+                decode_instruction(&single_nop, bad_off).is_none(),
+                "offset {bad_off} must return None"
+            );
+            assert!(read_inst_word(&single_nop, bad_off, 0).is_none());
+            assert!(read_inst_word(&single_nop, bad_off, 1).is_none());
+        }
+        assert!(read_inst_word(&single_nop, 0, usize::MAX).is_none());
+
+        // Truncated SOPK s_setreg_imm32_b32 (op 0x15) with odd trailing bytes
+        let mut trunc_sopk = enc_sopk(0x15, 0, 0x0042).to_le_bytes().to_vec();
+        trunc_sopk.extend_from_slice(&[0xDE, 0xAD, 0xBE]); // 7 bytes total (3 odd trailing)
+        let insts = decode_program(&trunc_sopk);
+        assert_eq!(insts.len(), 1);
+        assert!(insts[0].truncated);
+        assert_eq!(insts[0].size, 4);
+        assert_eq!(
+            insts[0].format_text(),
+            "s_setreg_imm32_b32 hwreg(0x0042), <lit> ; <truncated>"
+        );
+        let summary = analyze_program(&trunc_sopk);
+        assert_eq!(summary.truncated_instructions, 1);
+        assert_eq!(summary.trailing_bytes, 3);
+
+        // Odd-length buffer with valid 32-bit instruction + 1..=3 trailing bytes
+        for tail in 1..=3 {
+            let mut buf = words_to_bytes(&[enc_vop1(0x01, 2, 128 + 7), enc_sopp(0x01, 0)]);
+            buf.extend(std::iter::repeat_n(0xCCu8, tail));
+            let insts = decode_program(&buf);
+            assert_eq!(insts.len(), 2);
+            assert!(!insts[0].truncated);
+            assert!(!insts[1].truncated);
+            let summary = analyze_program(&buf);
+            assert_eq!(summary.trailing_bytes, tail);
+            assert_eq!(summary.truncated_instructions, 0);
+            assert_eq!(summary.endpgm_count, 1);
+        }
+    }
+
+    #[test]
+    fn s58_checked_word_stepping_32bit_64bit_and_literal_boundaries() {
+        // Construct a stream exercising every instruction-length class:
+        //   4 bytes:  SOPP, VINTRP, VOP1, VOP2
+        //   8 bytes:  SOP1+lit, SOP2+dual-0xFF(shared single lit!), SOPC+lit, SOPK imm32,
+        //             VOP1 SDWA (0xF9), VOP1 DPP16 (0xFA), VOP1 DPP8 (0xE9), VOP1 DPP8FI (0xEA),
+        //             VOP2 *mk* (0x2C), SMEM, VOP3 (no lit), VOP3P (no lit), EXP
+        //   12 bytes: VOP3+lit, VOP3P+lit, MIMG(nsize=1)
+        //   16 bytes: MIMG(nsize=2)
+        //   20 bytes: MIMG(nsize=3)
+        let mut words: Vec<u32> = Vec::new();
+        let mut expected_sizes: Vec<usize> = Vec::new();
+
+        // 4-byte instructions
+        words.push(enc_sopp(0x00, 0));
+        expected_sizes.push(4);
+        words.push(enc_vintrp(0, 1, 0, 0, 0));
+        expected_sizes.push(4);
+
+        // 8-byte literal / extra-word encodings
+        words.push(enc_sop1(0x03, 1, 0xFF));
+        words.push(0x1111_2222);
+        expected_sizes.push(8);
+
+        // Both ssrc0 and ssrc1 == 0xFF share ONE 32-bit literal word in RDNA2 -> 8 bytes!
+        words.push(enc_sop2(0x00, 2, 0xFF, 0xFF));
+        words.push(0x3333_4444);
+        expected_sizes.push(8);
+
+        words.push(enc_sopc(0x06, 0xFF, 2));
+        words.push(0x5555_6666);
+        expected_sizes.push(8);
+
+        words.push(enc_sopk(0x15, 0, 0x0010));
+        words.push(0x7777_8888);
+        expected_sizes.push(8);
+
+        for extra_src in [0xF9u16, 0xFA, 0xE9, 0xEA] {
+            words.push(enc_vop1(0x01, 3, extra_src));
+            words.push(0x0000_0001);
+            expected_sizes.push(8);
+        }
+
+        words.push(enc_vop2(0x2C, 4, 256 + 1, 2)); // v_fmamk_f32
+        words.push(0x3F80_0000);
+        expected_sizes.push(8);
+
+        words.extend_from_slice(&enc_smem(0x00, 4, 0, 0x7D, 0x10, false, false));
+        expected_sizes.push(8);
+
+        // 12-byte VOP3 + literal
+        words.extend_from_slice(&enc_vop3(0x14B, 5, 256 + 1, 0xFF, 256 + 2, false, 0, 0, 0));
+        words.push(0x4000_0000);
+        expected_sizes.push(12);
+
+        // 12-byte VOP3P + literal
+        words.extend_from_slice(&enc_vop3p(0x0E, 6, 256 + 1, 256 + 2, 0xFF, false, 0, 0b111, 0, 0));
+        words.push(0x3C00_3C00);
+        expected_sizes.push(12);
+
+        // 12/16/20-byte MIMG with NSA nsize=1, 2, 3
+        for nsize in 1u32..=3 {
+            let mut mimg = enc_mimg(0x20, 0xF, 1, 2, 8, 2, 1);
+            mimg[0] |= (nsize & 0x3) << 1;
+            words.extend_from_slice(&mimg);
+            for k in 0..nsize {
+                words.push(0x0403_0201 + k);
+            }
+            expected_sizes.push(8 + (nsize as usize) * 4);
+        }
+
+        words.push(enc_sopp(0x01, 0));
+        expected_sizes.push(4);
+
+        let bytes = words_to_bytes(&words);
+        let insts = decode_program(&bytes);
+        assert_eq!(insts.len(), expected_sizes.len());
+
+        let mut expected_off = 0usize;
+        for (inst, &exp_size) in insts.iter().zip(expected_sizes.iter()) {
+            assert_eq!(inst.offset, expected_off, "offset mismatch for {}", inst.mnemonic);
+            assert_eq!(inst.size, exp_size, "size mismatch for {}", inst.mnemonic);
+            assert!(!inst.truncated, "unexpected truncation for {}", inst.mnemonic);
+            expected_off += exp_size;
+        }
+        assert_eq!(expected_off, bytes.len());
+        assert_eq!(
+            insts[3].format_text(),
+            "s_add_u32 s2, 0x33334444, 0x33334444"
+        );
+
+        // Prefix-sweep: slicing at EVERY byte boundary 0..=bytes.len() must never panic
+        // and must preserve strict monotonic offset + size <= prefix.len().
+        for prefix_len in 0..=bytes.len() {
+            let prefix = &bytes[..prefix_len];
+            let decoded = decode_program(prefix);
+            let mut prev_end = 0usize;
+            for (idx, inst) in decoded.iter().enumerate() {
+                assert!(inst.offset >= prev_end);
+                assert!(inst.size >= MIN_RDNA2_INST_BYTES);
+                assert!(inst.size <= MAX_RDNA2_INST_BYTES);
+                assert_eq!(inst.size % 4, 0);
+                let end = inst.offset.checked_add(inst.size).expect("no overflow");
+                assert!(end <= prefix_len);
+                if inst.truncated {
+                    assert_eq!(idx + 1, decoded.len(), "truncated inst must be last");
+                }
+                prev_end = end;
+            }
+        }
+    }
+
+    #[test]
+    fn s58_mimg_nsa_and_vop3_literal_partial_truncation_boundaries() {
+        // MIMG with nsize=3 requires 20 bytes (w0, w1, nsa0, nsa1, nsa2).
+        let mut mimg = enc_mimg(0x20, 0xF, 1, 2, 4, 2, 1);
+        mimg[0] |= 3u32 << 1; // nsize = 3
+        let full_mimg = words_to_bytes(&[mimg[0], mimg[1], 0x0102_0304, 0x0506_0708, 0x090A_0B0C]);
+        assert_eq!(full_mimg.len(), 20);
+
+        let expected_mimg: [(usize, usize, bool); 9] = [
+            (4, 4, true),
+            (7, 4, true),
+            (8, 8, true),
+            (11, 8, true),
+            (12, 12, true),
+            (15, 12, true),
+            (16, 16, true),
+            (19, 16, true),
+            (20, 20, false),
+        ];
+        for (len, exp_size, exp_trunc) in expected_mimg {
+            let insts = decode_program(&full_mimg[..len]);
+            assert_eq!(insts.len(), 1, "mimg len {len}");
+            assert_eq!(insts[0].encoding, Rdna2Encoding::Mimg);
+            assert_eq!(insts[0].size, exp_size, "mimg len {len}");
+            assert_eq!(insts[0].truncated, exp_trunc, "mimg len {len}");
+        }
+
+        // VOP3 with literal requires 12 bytes (w0, w1, lit).
+        let vop3 = enc_vop3(0x14B, 1, 0xFF, 256 + 2, 256 + 3, false, 0, 0, 0);
+        let full_vop3 = words_to_bytes(&[vop3[0], vop3[1], 0x3F80_0000]);
+        for (len, exp_size, exp_trunc) in [(4, 4, true), (7, 4, true), (8, 8, true), (11, 8, true), (12, 12, false)] {
+            let insts = decode_program(&full_vop3[..len]);
+            assert_eq!(insts.len(), 1, "vop3 len {len}");
+            assert_eq!(insts[0].size, exp_size, "vop3 len {len}");
+            assert_eq!(insts[0].truncated, exp_trunc, "vop3 len {len}");
+        }
+
+        // VOP3P with literal requires 12 bytes (w0, w1, lit).
+        let vop3p = enc_vop3p(0x0E, 1, 256 + 2, 0xFF, 256 + 3, false, 0, 0b111, 0, 0);
+        let full_vop3p = words_to_bytes(&[vop3p[0], vop3p[1], 0x3C00_3C00]);
+        for (len, exp_size, exp_trunc) in [(4, 4, true), (8, 8, true), (10, 8, true), (12, 12, false)] {
+            let insts = decode_program(&full_vop3p[..len]);
+            assert_eq!(insts.len(), 1, "vop3p len {len}");
+            assert_eq!(insts[0].size, exp_size, "vop3p len {len}");
+            assert_eq!(insts[0].truncated, exp_trunc, "vop3p len {len}");
+        }
+    }
+
+    #[test]
+    fn s58_malformed_and_unknown_opcodes_make_strict_forward_progress() {
+        let mut words = Vec::new();
+        // All unassigned 6-bit 0b11xxxx prefixes -> Rdna2Encoding::Unknown (4 bytes each)
+        let unknown_prefixes: [u32; 6] = [
+            0b110000, 0b110001, 0b110100, 0b111001, 0b111011, 0b111111,
+        ];
+        for p in unknown_prefixes {
+            words.push((p << 26) | 0x00AA_55FF);
+        }
+        // Unassigned opcodes within known encoding families
+        words.push(enc_sopp(0x7F, 0xBEEF));
+        words.push(enc_sopc(0x7F, 1, 2));
+        words.push(enc_sop1(0xFF, 1, 2));
+        words.push(enc_sopk(0x13, 1, 0x1234));
+        words.push(enc_sop2(0x5F, 1, 2, 3));
+        words.push(enc_vop1(0xFF, 1, 256 + 2));
+        words.push(enc_vopc(0xAF, 256 + 1, 2));
+        words.push(enc_vop2(0x3D, 1, 256 + 2, 3));
+        words.push(enc_vintrp(3, 1, 2, 3, 4));
+        words.extend_from_slice(&enc_vop3(0x3FF, 1, 256 + 2, 256 + 3, 256 + 4, false, 0, 0, 0));
+        words.extend_from_slice(&enc_vop3p(0x7F, 1, 256 + 2, 256 + 3, 256 + 4, false, 0, 0, 0, 0));
+        words.extend_from_slice(&enc_smem(0xFF, 2, 0, 0x7D, 0, false, false));
+        // Extreme all-zeros and all-ones words
+        words.push(0x0000_0000);
+        words.push(0xFFFF_FFFF);
+
+        let bytes = words_to_bytes(&words);
+        let insts = decode_program(&bytes);
+        assert_eq!(insts.len(), 20);
+        for pair in insts.windows(2) {
+            assert!(
+                pair[1].offset > pair[0].offset,
+                "decoder must strictly advance offset"
+            );
+            assert_eq!(pair[0].offset + pair[0].size, pair[1].offset);
+        }
+
+        let summary = analyze_program(&bytes);
+        // 6 unknown prefixes + trailing 0xFFFF_FFFF (prefix 0b111111) = 7 Unknown encodings
+        assert_eq!(summary.unknown_instructions, 7);
+        assert_eq!(summary.truncated_instructions, 0);
+        assert!(insts[0].mnemonic.starts_with("unknown_enc_"));
+        assert!(insts[6].mnemonic.starts_with("sopp_op_"));
+        assert!(insts[7].mnemonic.starts_with("sopc_op_"));
+        assert!(insts[8].mnemonic.starts_with("sop1_op_"));
+        assert!(insts[9].mnemonic.starts_with("sopk_op_"));
+        assert!(insts[10].mnemonic.starts_with("sop2_op_"));
+        assert!(insts[11].mnemonic.starts_with("vop1_op_"));
+        assert!(insts[12].mnemonic.starts_with("vopc_op_"));
+        assert!(insts[13].mnemonic.starts_with("vop2_op_"));
+        assert!(insts[14].mnemonic.starts_with("vintrp_op_"));
+        assert!(insts[15].mnemonic.starts_with("vop3_op_"));
+        assert!(insts[16].mnemonic.starts_with("vop3p_op_"));
+        assert!(insts[17].mnemonic.starts_with("smem_op_"));
+    }
+
+    #[test]
+    fn s58_max_instruction_guard_and_checked_step_offset_invariants() {
+        // checked_step_offset guards against zero/unaligned/oversized steps, overflow, and OOB
+        assert_eq!(checked_step_offset(0, 0, 16), Some(4));
+        assert_eq!(checked_step_offset(0, 3, 16), Some(4));
+        assert_eq!(checked_step_offset(0, 5, 16), Some(4));
+        assert_eq!(checked_step_offset(0, MAX_RDNA2_INST_BYTES + 4, 64), Some(4));
+        assert_eq!(checked_step_offset(0, 4, 16), Some(4));
+        assert_eq!(checked_step_offset(0, 8, 16), Some(8));
+        assert_eq!(checked_step_offset(0, 12, 16), Some(12));
+        assert_eq!(checked_step_offset(0, 20, 20), Some(20));
+        assert_eq!(checked_step_offset(16, 4, 19), None);
+        assert_eq!(checked_step_offset(usize::MAX - 2, 4, usize::MAX), None);
+        assert_eq!(checked_step_offset(usize::MAX, 4, usize::MAX), None);
+
+        // decode_program_limited enforces exact instruction caps (0, partial, full, >len)
+        let words: Vec<u32> = (0..32).map(|i| enc_sopp(0x00, i)).collect();
+        let bytes = words_to_bytes(&words);
+        assert!(decode_program_limited(&bytes, Some(0)).is_empty());
+        assert_eq!(decode_program_limited(&bytes, Some(1)).len(), 1);
+        assert_eq!(decode_program_limited(&bytes, Some(7)).len(), 7);
+        assert_eq!(decode_program_limited(&bytes, Some(32)).len(), 32);
+        assert_eq!(decode_program_limited(&bytes, Some(10_000)).len(), 32);
+        assert_eq!(decode_program_limited(&bytes, Some(usize::MAX)).len(), 32);
+        assert_eq!(decode_program(&bytes).len(), 32);
+
+        // Disassembly & JSON max_instructions truncation notice
+        let limited_text = format_disasm(&bytes, Some(5));
+        assert!(limited_text.contains("27 more instruction(s) omitted"));
+        let summary = analyze_program(&bytes);
+        let all_insts = decode_program(&bytes);
+        let limited_json = to_json_with_disasm(&summary, &all_insts, Some(5));
+        assert!(limited_json.contains("\"shown_instructions\": 5,"));
+    }
+
+    #[test]
+    fn s58_repeated_run_determinism_and_canonical_summary_ordering() {
+        // Deliberately emit SMEM base SGPRs out of ascending order with duplicates
+        // (s[16:17], s[4:5], s[0:1], s[4:5]) alongside exports, resources, branches,
+        // and unknown opcodes to verify canonical BTreeMap/BTreeSet summary ordering.
+        let mut words = Vec::new();
+        words.extend_from_slice(&enc_smem(0x02, 20, 8, 0x7D, 0x40, false, false)); // sbase=16
+        words.extend_from_slice(&enc_smem(0x01, 10, 2, 0x7D, 0x20, true, false)); // sbase=4
+        words.extend_from_slice(&enc_smem(0x00, 6, 0, 0x7D, 0x00, false, true)); // sbase=0
+        words.extend_from_slice(&enc_smem(0x00, 7, 2, 0x7D, 0x04, false, false)); // dup sbase=4
+        words.push(enc_sopp(0x05, 2)); // conditional branch
+        words.extend_from_slice(&enc_mimg(0x20, 0xF, 1, 2, 4, 2, 1));
+        words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [4, 5, 6, 7]));
+        words.push(0xFFFF_FFFF); // Unknown prefix
+        words.push(enc_sopp(0x01, 0)); // s_endpgm #1
+        words.push(enc_sopp(0x01, 0)); // s_endpgm #2
+
+        let bytes = words_to_bytes(&words);
+        let baseline_insts = decode_program(&bytes);
+        let baseline_summary = analyze_program(&bytes);
+        let baseline_disasm = format_disasm(&bytes, None);
+        let baseline_json = to_json_with_disasm(&baseline_summary, &baseline_insts, None);
+
+        // Canonical ascending deduplicated SMEM base SGPR list (from BTreeSet)
+        assert_eq!(baseline_summary.smem_base_sgprs, vec![0, 4, 16]);
+        // Canonical BTreeMap ordering for encoding_counts
+        let enc_keys: Vec<Rdna2Encoding> =
+            baseline_summary.encoding_counts.keys().copied().collect();
+        let mut sorted_keys = enc_keys.clone();
+        sorted_keys.sort();
+        assert_eq!(enc_keys, sorted_keys);
+
+        // Repeated runs must produce identical structs, disassembly, and JSON
+        for _ in 0..16 {
+            let insts = decode_program(&bytes);
+            let summary = analyze_program(&bytes);
+            let disasm = format_disasm(&bytes, None);
+            let json = to_json_with_disasm(&summary, &insts, None);
+            assert_eq!(insts, baseline_insts);
+            assert_eq!(summary, baseline_summary);
+            assert_eq!(disasm, baseline_disasm);
+            assert_eq!(json, baseline_json);
+        }
+
+        // Reversed instruction input to analyze_instructions must still produce
+        // byte-for-byte identical canonical summary and JSON.
+        let mut reversed_insts = baseline_insts.clone();
+        reversed_insts.reverse();
+        let reversed_summary = analyze_instructions(&bytes, &reversed_insts);
+        assert_eq!(reversed_summary, baseline_summary);
+        assert_eq!(reversed_summary.to_json(), baseline_summary.to_json());
     }
 }
