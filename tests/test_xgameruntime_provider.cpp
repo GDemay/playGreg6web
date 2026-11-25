@@ -206,12 +206,33 @@ void sub_enum_cb(GuestState* s) {
     ret(s);
 }
 
+// bool callback(const XGameSaveBlobInfo*, void* context): records name and size.
+constexpr uint64_t kBlobCb = 0x140020600ULL;
+std::vector<std::string> g_blob_names;
+std::vector<uint32_t> g_blob_sizes;
+
+void sub_blob_cb(GuestState* s) {
+    const uint64_t info = s->gpr[GuestReg::Rcx];
+    uint64_t name_ptr = 0;
+    uint32_t size = 0;
+    CHECK(g_arena->read(info, &name_ptr, sizeof(name_ptr)));
+    CHECK(g_arena->read(info + 8, &size, sizeof(size)));
+    char name[64] = {};
+    CHECK(g_arena->read(name_ptr, name, sizeof(name) - 1));
+    g_blob_names.push_back(name);
+    g_blob_sizes.push_back(size);
+    CHECK(s->gpr[GuestReg::Rdx] == 0xB10B);
+    s->gpr[GuestReg::Rax] = 1;
+    ret(s);
+}
+
 const LiftedFunctionEntry kFunctions[] = {
     {kRecord, sub_record},
     {kAsyncDone, sub_async_done},
     {kProvider, sub_provider},
     {kWorkFn, sub_work},
     {kEnumCb, sub_enum_cb},
+    {kBlobCb, sub_blob_cb},
 };
 
 struct GuestFault {
@@ -559,6 +580,151 @@ void test_query_api() {
             CHECK(hr32(fx.vcall(save, 14, {h2, 0xE11E, 0})) == com::E_INVALIDARG_HR);
             fx.vcall(save, 6, {h2});
             CHECK(hr32(fx.vcall(save, 14, {h2, 0xE11E, kEnumCb})) == com::E_INVALIDARG_HR);  // closed
+        }
+
+        // R40: containers, blobs and updates (s16..s29) as the title's save manager uses them.
+        {
+            namespace gsr = playgta6::os::gdk::gamesave;
+            const int32_t kIllegalCall = static_cast<int32_t>(0x8000000Eu);
+            const uint64_t p3 = fx.alloc(8);
+            CHECK(hr32(fx.vcall(save, 3, {0x10, cfg, 0, p3})) == 0);
+            const uint64_t prov3 = load64(p3);
+            const uint64_t out = fx.alloc(8);
+            auto u32_at = [&](uint64_t va) {
+                uint32_t v = 0;
+                CHECK(com::read_guest(va, v));
+                return v;
+            };
+            auto run_queue = [&](uint64_t blk) {
+                g_done_block = 0;
+                CHECK((fx.vcall(queue_api, 16, {queue, 0, 0}) & 0xFF) == 1);  // DoWork
+                CHECK((fx.vcall(queue_api, 16, {queue, 1, 0}) & 0xFF) == 1);  // completion
+                CHECK(g_done_block == blk);
+            };
+            // s16: a handle for a new name; nothing is created until an update is submitted.
+            const uint64_t slot_name = fx.cstring("Slot1");
+            CHECK(hr32(fx.vcall(save, 16, {prov3, slot_name, out})) == 0);
+            const uint64_t c1 = load64(out);
+            CHECK(c1 != 0);
+            g_enum_names.clear();
+            CHECK(hr32(fx.vcall(save, 13, {prov3, slot_name, 0xE11E, kEnumCb})) == 0 && g_enum_names.empty());
+            CHECK(hr32(fx.vcall(save, 16, {prov3, fx.cstring(""), out})) == gsr::E_GS_INVALID_CONTAINER_NAME);
+            CHECK(load64(out) == 0);
+            CHECK(hr32(fx.vcall(save, 16, {0x777, slot_name, out})) == com::E_INVALIDARG_HR);
+            CHECK(hr32(fx.vcall(save, 16, {prov3, slot_name, 0})) == com::E_POINTER_HR);
+            const uint64_t header_name = fx.cstring("Save Game Header");
+            g_blob_names.clear();
+            CHECK(hr32(fx.vcall(save, 19, {c1, header_name, 0xB10B, kBlobCb})) == 0 && g_blob_names.empty());
+
+            // s23/s25/s26/s28/s29: header + payload through the async submit.
+            CHECK(hr32(fx.vcall(save, 23, {c1, fx.cstring("Slot one"), out})) == 0);
+            const uint64_t u1 = load64(out);
+            std::vector<uint8_t> header(0x128);
+            for (size_t i = 0; i < header.size(); ++i) {
+                header[i] = static_cast<uint8_t>(i);
+            }
+            const uint64_t hdr_data = fx.alloc(header.size());
+            CHECK(com::write_guest(hdr_data, header.data(), header.size()));
+            const uint64_t payload = fx.cstring("payload-bytes");
+            CHECK(hr32(fx.vcall(save, 25, {u1, header_name, hdr_data, header.size()})) == 0);
+            CHECK(hr32(fx.vcall(save, 25, {u1, fx.cstring("Save Game Data"), payload, 13})) == 0);
+            CHECK(hr32(fx.vcall(save, 25, {u1, fx.cstring(""), payload, 13})) == com::E_INVALIDARG_HR);
+            CHECK(hr32(fx.vcall(save, 25, {u1, fx.cstring("Junk"), payload, 3})) == 0);
+            CHECK(hr32(fx.vcall(save, 26, {u1, fx.cstring("Junk")})) == 0);  // the delete drops the write
+            const uint64_t b2 = make_guest_block(fx, queue);
+            CHECK(hr32(fx.vcall(save, 28, {u1, b2})) == 0);
+            CHECK(hr32(fx.vcall(save, 29, {b2})) == playgta6::os::gdk::E_PENDING_HR);
+            run_queue(b2);
+            CHECK(hr32(fx.vcall(save, 29, {b2})) == 0);
+            CHECK(hr32(fx.vcall(save, 25, {u1, header_name, hdr_data, 4})) == kIllegalCall);  // submitted
+            fx.vcall(save, 24, {u1});
+            CHECK(hr32(fx.vcall(save, 27, {u1})) == com::E_INVALIDARG_HR);  // closed
+
+            // On disk: the container exists now, with its display name and two blobs.
+            g_enum_names.clear();
+            g_enum_blobs.clear();
+            CHECK(hr32(fx.vcall(save, 13, {prov3, slot_name, 0xE11E, kEnumCb})) == 0);
+            CHECK(g_enum_names.size() == 1 && g_enum_names[0] == "Slot1" && g_enum_blobs[0] == 2);
+            std::vector<gsr::ContainerInfo> infos;
+            gs::Store store = gs::open_store("00000000-0000-0000-0000-000000000001");
+            CHECK(store.enumerate_containers("Slot1", &infos) == 0);
+            CHECK(infos.size() == 1 && infos[0].display_name == "Slot one" && infos[0].total_size == 0x128 + 13);
+
+            // s19: the title's header lookup (prefix match, size reported); s18 lists all.
+            g_blob_names.clear();
+            g_blob_sizes.clear();
+            CHECK(hr32(fx.vcall(save, 19, {c1, header_name, 0xB10B, kBlobCb})) == 0);
+            CHECK(g_blob_names.size() == 1 && g_blob_names[0] == "Save Game Header" && g_blob_sizes[0] == 0x128);
+            g_blob_names.clear();
+            CHECK(hr32(fx.vcall(save, 18, {c1, 0xB10B, kBlobCb})) == 0 && g_blob_names.size() == 2);
+
+            // s20: read the header into an exactly sized buffer (24 + strlen + 1 + size).
+            const uint64_t names = fx.alloc(16);
+            CHECK(com::write_guest(names, header_name));
+            const uint64_t count = fx.alloc(4);
+            const uint64_t need = 24 + 16 + 1 + 0x128;
+            const uint64_t buf = fx.alloc(need);
+            CHECK(com::write_guest(count, uint32_t{1}));
+            CHECK(hr32(fx.vcall(save, 20, {c1, names, count, need - 1, buf})) == gsr::E_GS_PROVIDED_BUFFER_TOO_SMALL);
+            CHECK(com::write_guest(count, uint32_t{1}));
+            CHECK(hr32(fx.vcall(save, 20, {c1, names, count, need, buf})) == 0);
+            CHECK(u32_at(count) == 1);
+            CHECK(u32_at(buf + 8) == 0x128);
+            const uint64_t data_ptr = load64(buf + 16);
+            CHECK(data_ptr >= buf + 24 && data_ptr + 0x128 <= buf + need);
+            std::vector<uint8_t> back(0x128);
+            CHECK(com::read_guest(data_ptr, back.data(), back.size()) && back == header);
+            char got[32] = {};
+            CHECK(com::read_guest(load64(buf), got, 17) && std::strcmp(got, "Save Game Header") == 0);
+            CHECK(com::write_guest(names + 8, fx.cstring("Missing")));
+            CHECK(com::write_guest(count, uint32_t{2}));
+            CHECK(hr32(fx.vcall(save, 20, {c1, names, count, 4096, fx.alloc(4096)})) == gsr::E_GS_BLOB_NOT_FOUND);
+            CHECK(u32_at(count) == 0);
+
+            // s21/s22: async read of both blobs; the buffer size comes from XAsyncGetResultSize (s4).
+            CHECK(com::write_guest(names + 8, fx.cstring("Save Game Data")));
+            const uint64_t b3 = make_guest_block(fx, queue);
+            CHECK(hr32(fx.vcall(save, 21, {c1, names, 2, b3})) == 0);
+            run_queue(b3);
+            const uint64_t size_out = fx.alloc(8);
+            CHECK(hr32(fx.vcall(queue_api, 4, {b3, size_out})) == 0);
+            const uint64_t need2 = need + 24 + 15 + 13;
+            CHECK(load64(size_out) == need2);
+            const uint64_t buf2 = fx.alloc(need2);
+            CHECK(hr32(fx.vcall(save, 22, {b3, need2 - 1, buf2, count})) == gsr::E_GS_PROVIDED_BUFFER_TOO_SMALL);
+            CHECK(hr32(fx.vcall(save, 22, {b3, need2, buf2, count})) == 0);
+            CHECK(u32_at(count) == 2);
+            CHECK(u32_at(buf2 + 24 + 8) == 13);
+            char text[16] = {};
+            CHECK(com::read_guest(load64(buf2 + 24 + 16), text, 13) && std::strcmp(text, "payload-bytes") == 0);
+
+            // s17 closes; s8/s9 quota; s11/s12 delete; a closed handle is invalid.
+            fx.vcall(save, 17, {c1});
+            CHECK(hr32(fx.vcall(save, 19, {c1, header_name, 0xB10B, kBlobCb})) == com::E_INVALIDARG_HR);
+            const uint64_t b4 = make_guest_block(fx, queue);
+            CHECK(hr32(fx.vcall(save, 8, {prov3, b4})) == 0);
+            run_queue(b4);
+            const uint64_t quota = fx.alloc(8);
+            CHECK(hr32(fx.vcall(save, 9, {b4, quota})) == 0);
+            CHECK(load64(quota) == gsr::kDefaultQuotaBytes - (0x128 + 13 + 3));  // "Player" holds 3 bytes
+            const uint64_t b5 = make_guest_block(fx, queue);
+            CHECK(hr32(fx.vcall(save, 11, {prov3, slot_name, b5})) == 0);
+            run_queue(b5);
+            CHECK(hr32(fx.vcall(save, 12, {b5})) == 0);
+            g_enum_names.clear();
+            CHECK(hr32(fx.vcall(save, 13, {prov3, slot_name, 0xE11E, kEnumCb})) == 0 && g_enum_names.empty());
+
+            // An oversized blob is refused up front; an empty update creates the container.
+            CHECK(hr32(fx.vcall(save, 16, {prov3, fx.cstring("Fresh"), out})) == 0);
+            const uint64_t c2 = load64(out);
+            CHECK(hr32(fx.vcall(save, 23, {c2, 0, out})) == 0);
+            const uint64_t u2 = load64(out);
+            CHECK(hr32(fx.vcall(save, 25, {u2, header_name, hdr_data, gsr::kMaxBlobBytes + 1})) == com::E_INVALIDARG_HR);
+            CHECK(hr32(fx.vcall(save, 27, {u2})) == 0);
+            CHECK(store.enumerate_containers("Fresh", &infos) == 0 && infos.size() == 1 && infos[0].blob_count == 0);
+            fx.vcall(save, 24, {u2});
+            fx.vcall(save, 17, {c2});
+            fx.vcall(save, 6, {prov3});
         }
         std::filesystem::remove_all(dir);
         gs::set_save_dir("");

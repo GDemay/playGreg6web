@@ -175,6 +175,25 @@ void test_persistence_and_stale_temps(const fs::path& base) {
     CHECK(gs::save_dir() == "pg6-saves");
 }
 
+void test_display_name(const fs::path& base) {
+    gs::Store store((base / "d").string());
+    CHECK(store.set_display_name("Missing", "x") == gs::E_GS_NO_SUCH_CONTAINER);
+    CHECK(store.set_display_name("", "x") == gs::E_GS_INVALID_CONTAINER_NAME);
+    CHECK(store.create_container("Slot") == S_OK_HR);
+    CHECK(store.set_display_name("Slot", std::string(gs::kMaxDisplayNameChars + 1, 'a')) == E_INVALIDARG_HR);
+    CHECK(store.submit_update("Slot", {{"b", bytes("123")}}, {}) == S_OK_HR);
+    CHECK(store.set_display_name("Slot", "Story save 1") == S_OK_HR);
+    std::vector<gs::ContainerInfo> containers;
+    CHECK(store.enumerate_containers("Slot", &containers) == S_OK_HR && containers.size() == 1 &&
+          containers[0].display_name == "Story save 1" && containers[0].blob_count == 1 &&
+          containers[0].total_size == 3);  // the display name is neither a blob nor quota
+    int64_t quota = 0;
+    CHECK(store.remaining_quota(&quota) == S_OK_HR && quota == static_cast<int64_t>(gs::kDefaultQuotaBytes - 3));
+    gs::Store again((base / "d").string());  // kept across a provider re-init
+    CHECK(again.enumerate_containers("Slot", &containers) == S_OK_HR && containers[0].display_name == "Story save 1");
+    CHECK(count_temps(base / "d") == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -185,6 +204,7 @@ int main() {
     test_errors(base);
     test_quota_and_atomicity(base);
     test_persistence_and_stale_temps(base);
+    test_display_name(base);
     fs::remove_all(base);
     if (g_failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
