@@ -10,6 +10,7 @@
   const DEFAULT_MAX_BIND_GROUP_LAYOUTS = 512;
   const DEFAULT_PREWARM_CONCURRENCY = 4;
   const DEFAULT_MAX_ERROR_HISTORY = 32;
+  const DEFAULT_MAX_QUARANTINED_KEYS = 512;
   const MAX_PIPELINE_ERROR_MESSAGE_LENGTH = 512;
   const MAX_PIPELINE_ERROR_KEY_LENGTH = 64;
   const DEFAULT_MAX_VERTEX_BUFFERS = 8;
@@ -1507,9 +1508,12 @@
      *   maxComputePipelines?: number,
      *   maxBindGroupLayouts?: number,
      *   maxErrorHistory?: number,
+     *   quarantineFailedKeys?: boolean,
+     *   maxQuarantinedKeys?: number,
      *   defaultColorFormat?: string,
      *   onPipelineError?: (record: object) => void,
      *   now?: () => number,
+     *   nowFn?: () => number,
      * }} options
      */
     constructor(options = {}) {
@@ -1546,10 +1550,29 @@
         'maxErrorHistory'
       );
 
+      if (
+        options.quarantineFailedKeys !== undefined &&
+        typeof options.quarantineFailedKeys !== 'boolean'
+      ) {
+        throw new TypeError('options.quarantineFailedKeys must be a boolean when provided');
+      }
+      this._quarantineFailedKeys =
+        options.quarantineFailedKeys !== undefined ? options.quarantineFailedKeys : true;
+
+      this._maxQuarantinedKeys = validatePositiveInt(
+        options.maxQuarantinedKeys !== undefined
+          ? options.maxQuarantinedKeys
+          : DEFAULT_MAX_QUARANTINED_KEYS,
+        'maxQuarantinedKeys'
+      );
+
       if (options.now !== undefined && typeof options.now !== 'function') {
         throw new TypeError('options.now must be a function when provided');
       }
-      this._now = options.now || defaultNow;
+      if (options.nowFn !== undefined && typeof options.nowFn !== 'function') {
+        throw new TypeError('options.nowFn must be a function when provided');
+      }
+      this._now = options.now || options.nowFn || defaultNow;
 
       if (
         options.onPipelineError !== undefined &&
@@ -1572,6 +1595,7 @@
       this._fallbackPipelineLayouts = new Map();
       this._inFlightRender = new Map();
       this._inFlightCompute = new Map();
+      this._quarantinedKeys = new Map();
       this._generation = 0;
 
       this._pipelineErrors = [];
@@ -1586,7 +1610,10 @@
         layoutMisses: 0,
         inFlightDedupes: 0,
         evictions: 0,
+        compileCount: 0,
         totalCompileMs: 0,
+        maxCompileMs: 0,
+        quarantineHits: 0,
         fallbackNormalizedCount: 0,
         vertexLayoutNormalizedCount: 0,
         layoutNormalizedCount: 0,
@@ -1844,6 +1871,192 @@
       }
     }
 
+    _recordCompileTiming(compileMs) {
+      const durationMs =
+        typeof compileMs === 'number' && Number.isFinite(compileMs) && compileMs > 0
+          ? compileMs
+          : 0;
+      this._stats.compileCount += 1;
+      this._stats.totalCompileMs += durationMs;
+      if (durationMs > this._stats.maxCompileMs) {
+        this._stats.maxCompileMs = durationMs;
+      }
+    }
+
+    _quarantineKey(key, kind, err) {
+      if (!this._quarantineFailedKeys) {
+        return;
+      }
+      const ts = this._now();
+      const sanitizedReason =
+        sanitizePipelineErrorMessage(err) || `${kind} pipeline creation failed`;
+      const errorType = classifyPipelineErrorType(err);
+      const existing = this._quarantinedKeys.get(key);
+      if (existing !== undefined) {
+        existing.kind = kind;
+        existing.reason = sanitizedReason;
+        existing.errorType = errorType;
+        existing.failureCount += 1;
+        existing.lastFailedAt = ts;
+        // Refresh recency in bounded LRU/FIFO quarantine map.
+        this._quarantinedKeys.delete(key);
+        this._quarantinedKeys.set(key, existing);
+        return;
+      }
+
+      this._quarantinedKeys.set(key, {
+        key,
+        kind,
+        reason: sanitizedReason,
+        errorType,
+        failureCount: 1,
+        hitCount: 0,
+        quarantinedAt: ts,
+        lastFailedAt: ts,
+        lastHitAt: null,
+      });
+
+      while (this._quarantinedKeys.size > this._maxQuarantinedKeys) {
+        const oldestKey = this._quarantinedKeys.keys().next().value;
+        this._quarantinedKeys.delete(oldestKey);
+      }
+    }
+
+    _isQuarantinedKey(key, kind) {
+      if (!this._quarantineFailedKeys || this._quarantinedKeys.size === 0) {
+        return false;
+      }
+      const entry = this._quarantinedKeys.get(key);
+      if (entry === undefined) {
+        return false;
+      }
+      if (kind && entry.kind && entry.kind !== kind) {
+        return false;
+      }
+      return true;
+    }
+
+    _hitQuarantine(key, kind) {
+      if (!this._quarantineFailedKeys || this._quarantinedKeys.size === 0) {
+        return false;
+      }
+      const entry = this._quarantinedKeys.get(key);
+      if (entry === undefined) {
+        return false;
+      }
+      if (kind && entry.kind && entry.kind !== kind) {
+        return false;
+      }
+      entry.hitCount += 1;
+      entry.lastHitAt = this._now();
+      // Refresh recency so actively-hit quarantined keys stay protected from eviction.
+      this._quarantinedKeys.delete(key);
+      this._quarantinedKeys.set(key, entry);
+      this._stats.quarantineHits += 1;
+      return true;
+    }
+
+    /**
+     * Check whether a canonical pipeline key, keyHint, or pipeline descriptor is currently
+     * quarantined due to a previous failed compilation.
+     *
+     * @param {string | bigint | number | object} keyOrDescriptor
+     * @param {string | bigint | number | object} [keyHint]
+     * @returns {boolean}
+     */
+    isQuarantined(keyOrDescriptor, keyHint) {
+      if (this._quarantinedKeys.size === 0) {
+        return false;
+      }
+      if (keyHint !== undefined && keyHint !== null) {
+        try {
+          return this._quarantinedKeys.has(this._resolveKey(keyOrDescriptor, keyHint));
+        } catch (_err) {
+          return false;
+        }
+      }
+      if (typeof keyOrDescriptor === 'string') {
+        return keyOrDescriptor.length > 0 && this._quarantinedKeys.has(keyOrDescriptor);
+      }
+      if (typeof keyOrDescriptor === 'bigint' || typeof keyOrDescriptor === 'number') {
+        try {
+          return this._quarantinedKeys.has(this._resolveKey(null, keyOrDescriptor));
+        } catch (_err) {
+          return false;
+        }
+      }
+      if (keyOrDescriptor && typeof keyOrDescriptor === 'object' && !Array.isArray(keyOrDescriptor)) {
+        try {
+          const directKey = hashDescriptorKey(keyOrDescriptor);
+          if (this._quarantinedKeys.has(directKey)) {
+            return true;
+          }
+          if (
+            Object.prototype.hasOwnProperty.call(keyOrDescriptor, 'vertex') ||
+            Object.prototype.hasOwnProperty.call(keyOrDescriptor, 'fragment')
+          ) {
+            const norm = this.normalizeRenderDescriptor(keyOrDescriptor);
+            if (this._quarantinedKeys.has(hashDescriptorKey(norm.descriptor))) {
+              return true;
+            }
+          }
+          if (Object.prototype.hasOwnProperty.call(keyOrDescriptor, 'compute')) {
+            const norm = normalizeComputePipelineDescriptor(keyOrDescriptor);
+            if (this._quarantinedKeys.has(hashDescriptorKey(norm.descriptor))) {
+              return true;
+            }
+          }
+        } catch (_err) {
+          return false;
+        }
+      }
+      return false;
+    }
+
+    /**
+     * Return shallow sanitized copies of currently quarantined pipeline key records.
+     *
+     * @returns {Array<{
+     *   key: string,
+     *   kind: string,
+     *   reason: string,
+     *   errorType: string,
+     *   failureCount: number,
+     *   hitCount: number,
+     *   quarantinedAt: number,
+     *   lastFailedAt: number,
+     *   lastHitAt: number | null,
+     * }>}
+     */
+    getQuarantinedKeys() {
+      const out = [];
+      for (const entry of this._quarantinedKeys.values()) {
+        out.push({
+          key: sanitizePipelineErrorMessage(entry.key, MAX_PIPELINE_ERROR_KEY_LENGTH),
+          kind: entry.kind,
+          reason: entry.reason,
+          errorType: entry.errorType,
+          failureCount: entry.failureCount,
+          hitCount: entry.hitCount,
+          quarantinedAt: entry.quarantinedAt,
+          lastFailedAt: entry.lastFailedAt,
+          lastHitAt: entry.lastHitAt,
+        });
+      }
+      return out;
+    }
+
+    /**
+     * Clear all quarantined failed pipeline keys so future lookups may retry compilation.
+     *
+     * @returns {number} Number of quarantined entries removed
+     */
+    clearQuarantine() {
+      const removed = this._quarantinedKeys.size;
+      this._quarantinedKeys.clear();
+      return removed;
+    }
+
     /**
      * Return a cached `GPUBindGroupLayout` or create and cache it via `device.createBindGroupLayout`.
      *
@@ -1876,7 +2089,7 @@
         throw err;
       }
       const compileMs = Math.max(0, this._now() - t0);
-      this._stats.totalCompileMs += compileMs;
+      this._recordCompileTiming(compileMs);
 
       if (layout && (typeof layout === 'object' || typeof layout === 'function')) {
         registeredObjectIds.set(layout, `bgl:${key}`);
@@ -1964,6 +2177,10 @@
         return cached;
       }
 
+      if (this._hitQuarantine(key, 'render')) {
+        return null;
+      }
+
       this._stats.renderMisses += 1;
       this._recordNormalizationStats(norm);
 
@@ -1983,6 +2200,21 @@
           };
           try {
             pipeline = this._device.createRenderPipeline(retryDescriptor);
+            if (!pipeline) {
+              const emptyErr = new Error('createRenderPipeline returned empty pipeline');
+              this._recordPipelineError('render', err, {
+                key,
+                fallbackProfile: norm.fallbackProfile,
+                recovered: false,
+              });
+              this._recordPipelineError('render', emptyErr, {
+                key,
+                fallbackProfile: norm.fallbackProfile,
+                recovered: false,
+              });
+              this._quarantineKey(key, 'render', emptyErr);
+              return null;
+            }
             this._recordPipelineError('render', err, {
               key,
               fallbackProfile: norm.fallbackProfile,
@@ -2006,6 +2238,7 @@
               fallbackProfile: norm.fallbackProfile,
               recovered: false,
             });
+            this._quarantineKey(key, 'render', retryErr);
             throw retryErr;
           }
         } else {
@@ -2014,12 +2247,62 @@
             fallbackProfile: norm.fallbackProfile,
             recovered: false,
           });
+          this._quarantineKey(key, 'render', err);
           throw err;
         }
       }
 
+      if (!pipeline) {
+        const emptyErr = new Error('createRenderPipeline returned empty pipeline');
+        if (canRetryAutoLayout) {
+          const retryDescriptor = {
+            ...effectiveDescriptor,
+            layout: 'auto',
+          };
+          try {
+            pipeline = this._device.createRenderPipeline(retryDescriptor);
+          } catch (retryErr) {
+            this._recordPipelineError('render', emptyErr, {
+              key,
+              fallbackProfile: norm.fallbackProfile,
+              recovered: false,
+            });
+            this._recordPipelineError('render', retryErr, {
+              key,
+              fallbackProfile: norm.fallbackProfile,
+              recovered: false,
+            });
+            this._quarantineKey(key, 'render', retryErr);
+            throw retryErr;
+          }
+          if (pipeline) {
+            this._recordPipelineError('render', emptyErr, {
+              key,
+              fallbackProfile: norm.fallbackProfile,
+              recovered: true,
+            });
+            this._stats.fallbackRecoveryCount += 1;
+            if (!norm.layoutNormalized) {
+              this._stats.layoutNormalizedCount += 1;
+            }
+            if (!norm.normalized) {
+              this._stats.fallbackNormalizedCount += 1;
+            }
+          }
+        }
+        if (!pipeline) {
+          this._recordPipelineError('render', emptyErr, {
+            key,
+            fallbackProfile: norm.fallbackProfile,
+            recovered: false,
+          });
+          this._quarantineKey(key, 'render', emptyErr);
+          return null;
+        }
+      }
+
       const compileMs = Math.max(0, this._now() - t0);
-      this._stats.totalCompileMs += compileMs;
+      this._recordCompileTiming(compileMs);
 
       this._setLru(this._renderPipelines, key, pipeline, compileMs, this._maxRenderPipelines);
       return pipeline;
@@ -2033,7 +2316,7 @@
      * @param {GPURenderPipelineDescriptor} descriptor
      * @param {string | bigint | number | object} [keyHint]
      * @param {object} [options]
-     * @returns {Promise<GPURenderPipeline>}
+     * @returns {Promise<GPURenderPipeline | null>}
      */
     getOrCreateRenderPipelineAsync(descriptor, keyHint, options) {
       if (!descriptor || typeof descriptor !== 'object') {
@@ -2065,6 +2348,10 @@
         return existing;
       }
 
+      if (this._hitQuarantine(key, 'render')) {
+        return Promise.resolve(null);
+      }
+
       const hasAsync = typeof this._device.createRenderPipelineAsync === 'function';
       const hasSync = typeof this._device.createRenderPipeline === 'function';
       if (!hasAsync && !hasSync) {
@@ -2094,11 +2381,27 @@
                 fallbackProfile: norm.fallbackProfile,
                 recovered: false,
               });
+              this._quarantineKey(key, 'render', err);
               throw err;
             }
             const retryDescriptor = { ...effectiveDescriptor, layout: 'auto' };
             try {
               pipeline = this._device.createRenderPipeline(retryDescriptor);
+              if (!pipeline) {
+                const emptyErr = new Error('createRenderPipeline returned empty pipeline');
+                this._recordPipelineError('render', err, {
+                  key,
+                  fallbackProfile: norm.fallbackProfile,
+                  recovered: false,
+                });
+                this._recordPipelineError('render', emptyErr, {
+                  key,
+                  fallbackProfile: norm.fallbackProfile,
+                  recovered: false,
+                });
+                this._quarantineKey(key, 'render', emptyErr);
+                return Promise.resolve(null);
+              }
               this._recordPipelineError('render', err, {
                 key,
                 fallbackProfile: norm.fallbackProfile,
@@ -2122,11 +2425,22 @@
                 fallbackProfile: norm.fallbackProfile,
                 recovered: false,
               });
+              this._quarantineKey(key, 'render', retryErr);
               throw retryErr;
             }
           }
+          if (!pipeline) {
+            const emptyErr = new Error('createRenderPipeline returned empty pipeline');
+            this._recordPipelineError('render', emptyErr, {
+              key,
+              fallbackProfile: norm.fallbackProfile,
+              recovered: false,
+            });
+            this._quarantineKey(key, 'render', emptyErr);
+            return Promise.resolve(null);
+          }
           const compileMs = Math.max(0, this._now() - t0);
-          this._stats.totalCompileMs += compileMs;
+          this._recordCompileTiming(compileMs);
           this._setLru(this._renderPipelines, key, pipeline, compileMs, this._maxRenderPipelines);
           return Promise.resolve(pipeline);
         } catch (err) {
@@ -2147,8 +2461,20 @@
         if (this._inFlightRender.get(key) === trackedPromise) {
           this._inFlightRender.delete(key);
         }
+        if (!pipeline) {
+          const emptyErr = new Error('createRenderPipelineAsync returned empty pipeline');
+          this._recordPipelineError('render', emptyErr, {
+            key,
+            fallbackProfile: norm.fallbackProfile,
+            recovered: false,
+          });
+          if (generation === this._generation) {
+            this._quarantineKey(key, 'render', emptyErr);
+          }
+          return null;
+        }
         const compileMs = Math.max(0, this._now() - t0);
-        this._stats.totalCompileMs += compileMs;
+        this._recordCompileTiming(compileMs);
         if (generation === this._generation) {
           this._setLru(this._renderPipelines, key, pipeline, compileMs, this._maxRenderPipelines);
         }
@@ -2162,6 +2488,26 @@
             const retryDescriptor = { ...effectiveDescriptor, layout: 'auto' };
             return invokeCreateAsync(retryDescriptor).then(
               (recoveredPipeline) => {
+                if (!recoveredPipeline) {
+                  if (this._inFlightRender.get(key) === trackedPromise) {
+                    this._inFlightRender.delete(key);
+                  }
+                  const emptyErr = new Error('createRenderPipelineAsync returned empty pipeline');
+                  this._recordPipelineError('render', err, {
+                    key,
+                    fallbackProfile: norm.fallbackProfile,
+                    recovered: false,
+                  });
+                  this._recordPipelineError('render', emptyErr, {
+                    key,
+                    fallbackProfile: norm.fallbackProfile,
+                    recovered: false,
+                  });
+                  if (generation === this._generation) {
+                    this._quarantineKey(key, 'render', emptyErr);
+                  }
+                  return null;
+                }
                 this._recordPipelineError('render', err, {
                   key,
                   fallbackProfile: norm.fallbackProfile,
@@ -2190,6 +2536,9 @@
                   fallbackProfile: norm.fallbackProfile,
                   recovered: false,
                 });
+                if (generation === this._generation) {
+                  this._quarantineKey(key, 'render', retryErr);
+                }
                 throw retryErr;
               }
             );
@@ -2203,6 +2552,9 @@
             fallbackProfile: norm.fallbackProfile,
             recovered: false,
           });
+          if (generation === this._generation) {
+            this._quarantineKey(key, 'render', err);
+          }
           throw err;
         }
       );
@@ -2275,6 +2627,10 @@
         return cached;
       }
 
+      if (this._hitQuarantine(key, 'compute')) {
+        return null;
+      }
+
       this._stats.computeMisses += 1;
       this._recordNormalizationStats(norm);
 
@@ -2284,10 +2640,17 @@
         pipeline = this._device.createComputePipeline(effectiveDescriptor);
       } catch (err) {
         this._recordPipelineError('compute', err, { key });
+        this._quarantineKey(key, 'compute', err);
         throw err;
       }
+      if (!pipeline) {
+        const emptyErr = new Error('createComputePipeline returned empty pipeline');
+        this._recordPipelineError('compute', emptyErr, { key });
+        this._quarantineKey(key, 'compute', emptyErr);
+        return null;
+      }
       const compileMs = Math.max(0, this._now() - t0);
-      this._stats.totalCompileMs += compileMs;
+      this._recordCompileTiming(compileMs);
 
       this._setLru(this._computePipelines, key, pipeline, compileMs, this._maxComputePipelines);
       return pipeline;
@@ -2300,7 +2663,7 @@
      *
      * @param {GPUComputePipelineDescriptor} descriptor
      * @param {string | bigint | number | object} [keyHint]
-     * @returns {Promise<GPUComputePipeline>}
+     * @returns {Promise<GPUComputePipeline | null>}
      */
     getOrCreateComputePipelineAsync(descriptor, keyHint) {
       if (!descriptor || typeof descriptor !== 'object') {
@@ -2331,6 +2694,10 @@
         return existing;
       }
 
+      if (this._hitQuarantine(key, 'compute')) {
+        return Promise.resolve(null);
+      }
+
       const hasAsync = typeof this._device.createComputePipelineAsync === 'function';
       const hasSync = typeof this._device.createComputePipeline === 'function';
       if (!hasAsync && !hasSync) {
@@ -2346,12 +2713,19 @@
       if (!hasAsync) {
         try {
           const pipeline = this._device.createComputePipeline(effectiveDescriptor);
+          if (!pipeline) {
+            const emptyErr = new Error('createComputePipeline returned empty pipeline');
+            this._recordPipelineError('compute', emptyErr, { key });
+            this._quarantineKey(key, 'compute', emptyErr);
+            return Promise.resolve(null);
+          }
           const compileMs = Math.max(0, this._now() - t0);
-          this._stats.totalCompileMs += compileMs;
+          this._recordCompileTiming(compileMs);
           this._setLru(this._computePipelines, key, pipeline, compileMs, this._maxComputePipelines);
           return Promise.resolve(pipeline);
         } catch (err) {
           this._recordPipelineError('compute', err, { key });
+          this._quarantineKey(key, 'compute', err);
           return Promise.reject(err);
         }
       }
@@ -2362,6 +2736,7 @@
         rawPromise = Promise.resolve(this._device.createComputePipelineAsync(effectiveDescriptor));
       } catch (err) {
         this._recordPipelineError('compute', err, { key });
+        this._quarantineKey(key, 'compute', err);
         return Promise.reject(err);
       }
 
@@ -2370,8 +2745,16 @@
           if (this._inFlightCompute.get(key) === trackedPromise) {
             this._inFlightCompute.delete(key);
           }
+          if (!pipeline) {
+            const emptyErr = new Error('createComputePipelineAsync returned empty pipeline');
+            this._recordPipelineError('compute', emptyErr, { key });
+            if (generation === this._generation) {
+              this._quarantineKey(key, 'compute', emptyErr);
+            }
+            return null;
+          }
           const compileMs = Math.max(0, this._now() - t0);
-          this._stats.totalCompileMs += compileMs;
+          this._recordCompileTiming(compileMs);
           if (generation === this._generation) {
             this._setLru(this._computePipelines, key, pipeline, compileMs, this._maxComputePipelines);
           }
@@ -2382,6 +2765,9 @@
             this._inFlightCompute.delete(key);
           }
           this._recordPipelineError('compute', err, { key });
+          if (generation === this._generation) {
+            this._quarantineKey(key, 'compute', err);
+          }
           throw err;
         }
       );
@@ -2417,6 +2803,8 @@
           const key = this._resolveKey(effectiveDesc, keyHint);
           const wasCached = cacheMap.has(key);
           const wasInFlight = !wasCached && inFlightMap.has(key);
+          const wasQuarantined =
+            !wasCached && !wasInFlight && this._isQuarantinedKey(key, isRender ? 'render' : 'compute');
           const pipeline = isRender
             ? await getterAsync.call(this, desc, key, itemOpts)
             : await getterAsync.call(this, desc, key);
@@ -2425,7 +2813,7 @@
             cached += 1;
           } else if (wasInFlight) {
             deduped += 1;
-          } else {
+          } else if (!wasQuarantined && pipeline !== null && pipeline !== undefined) {
             compiled += 1;
           }
         }
@@ -2516,7 +2904,8 @@
 
     /**
      * Clear all cached render pipelines, compute pipelines, bind group layouts,
-     * and detach any in-flight compilations so stale results cannot repopulate the cache.
+     * quarantined failed keys, and detach any in-flight compilations so stale results
+     * cannot repopulate the cache.
      *
      * @param {{ resetStats?: boolean }} [options]
      */
@@ -2528,6 +2917,7 @@
       this._fallbackPipelineLayouts.clear();
       this._inFlightRender.clear();
       this._inFlightCompute.clear();
+      this._quarantinedKeys.clear();
 
       if (options && options.resetStats) {
         this._stats.renderHits = 0;
@@ -2538,7 +2928,10 @@
         this._stats.layoutMisses = 0;
         this._stats.inFlightDedupes = 0;
         this._stats.evictions = 0;
+        this._stats.compileCount = 0;
         this._stats.totalCompileMs = 0;
+        this._stats.maxCompileMs = 0;
+        this._stats.quarantineHits = 0;
         this._stats.fallbackNormalizedCount = 0;
         this._stats.vertexLayoutNormalizedCount = 0;
         this._stats.layoutNormalizedCount = 0;
@@ -2550,8 +2943,46 @@
     }
 
     /**
-     * Return a snapshot of cache hit/miss, deduplication, eviction, count, normalization,
-     * error tracking, and compile-time telemetry.
+     * Reset all cached pipelines, layouts, in-flight promises, and quarantined keys.
+     *
+     * @param {{ resetStats?: boolean }} [options]
+     */
+    reset(options = {}) {
+      this.clear(options);
+    }
+
+    /**
+     * Handle WebGPU device loss by clearing all device-owned caches, in-flight entries,
+     * and quarantined failed keys.
+     *
+     * @param {{ resetStats?: boolean }} [options]
+     */
+    onDeviceLost(options = {}) {
+      this.clear(options);
+    }
+
+    /**
+     * Swap the underlying `GPUDevice` and clear all device-owned caches and quarantined keys.
+     *
+     * @param {GPUDevice} device
+     * @param {{ resetStats?: boolean, force?: boolean }} [options]
+     * @returns {boolean} True when the device was replaced or cache cleared
+     */
+    setDevice(device, options = {}) {
+      if (!device || typeof device !== 'object') {
+        throw new TypeError('setDevice requires a valid GPUDevice object');
+      }
+      if (device === this._device && !(options && options.force)) {
+        return false;
+      }
+      this._device = device;
+      this.clear(options);
+      return true;
+    }
+
+    /**
+     * Return a snapshot of cache hit/miss, deduplication, eviction, count, quarantine,
+     * normalization, error tracking, and compile-time telemetry.
      */
     getStats() {
       return {
@@ -2566,7 +2997,11 @@
         renderCount: this._renderPipelines.size,
         computeCount: this._computePipelines.size,
         layoutCount: this._bindGroupLayouts.size,
+        compileCount: this._stats.compileCount,
         totalCompileMs: this._stats.totalCompileMs,
+        maxCompileMs: this._stats.maxCompileMs,
+        quarantineHits: this._stats.quarantineHits,
+        quarantinedKeys: this._quarantinedKeys.size,
         fallbackNormalizedCount: this._stats.fallbackNormalizedCount,
         vertexLayoutNormalizedCount: this._stats.vertexLayoutNormalizedCount,
         layoutNormalizedCount: this._stats.layoutNormalizedCount,
@@ -2584,6 +3019,7 @@
     DEFAULT_MAX_BIND_GROUP_LAYOUTS,
     DEFAULT_PREWARM_CONCURRENCY,
     DEFAULT_MAX_ERROR_HISTORY,
+    DEFAULT_MAX_QUARANTINED_KEYS,
     MAX_PIPELINE_ERROR_MESSAGE_LENGTH,
     DEFAULT_MAX_VERTEX_BUFFERS,
     DEFAULT_MAX_VERTEX_ATTRIBUTES,

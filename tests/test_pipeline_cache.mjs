@@ -10,6 +10,7 @@ const pipelineCacheMod = require('../web/workers/pipeline_cache.js');
 const shaderFallbackMod = require('../web/workers/shader_fallback_router.js');
 const {
   DEFAULT_MAX_ERROR_HISTORY,
+  DEFAULT_MAX_QUARANTINED_KEYS,
   MAX_PIPELINE_ERROR_MESSAGE_LENGTH,
   FRAME1_VERTEX_STRIDE_24B,
   FRAME1_CBV_MIN_BINDING_SIZE,
@@ -333,7 +334,11 @@ test('sync render, compute, and bindGroupLayout cache hits, misses, and telemetr
     renderCount: 2,
     computeCount: 1,
     layoutCount: 1,
+    compileCount: 4,
     totalCompileMs: 1.5 + 4.0 + 2.5 + 4.0,
+    maxCompileMs: 4.0,
+    quarantineHits: 0,
+    quarantinedKeys: 0,
     fallbackNormalizedCount: 0,
     vertexLayoutNormalizedCount: 0,
     layoutNormalizedCount: 0,
@@ -430,7 +435,7 @@ test('rejected async pipeline promises are cleaned up and do not poison the cach
     },
   });
 
-  const cache = new WebGpuPipelineCache({ device });
+  const cache = new WebGpuPipelineCache({ device, quarantineFailedKeys: false });
   const vs = device.createShaderModule({ code: 'vs' });
   const cs = device.createShaderModule({ code: 'cs' });
   const renderDesc = { layout: 'auto', vertex: { module: vs, entryPoint: 'vs_main' } };
@@ -773,7 +778,11 @@ test('evictOlderThan and clear manage lifecycle and isolate stale in-flight comp
     renderCount: 0,
     computeCount: 0,
     layoutCount: 0,
+    compileCount: 0,
     totalCompileMs: 0,
+    maxCompileMs: 0,
+    quarantineHits: 0,
+    quarantinedKeys: 0,
     fallbackNormalizedCount: 0,
     vertexLayoutNormalizedCount: 0,
     layoutNormalizedCount: 0,
@@ -1466,4 +1475,398 @@ test('G36 prewarmRenderPipelines deduplicates normalized fallback descriptors wi
   );
   assert.equal(hit, summary.pipelines[0]);
   assert.equal(device.calls.createRenderPipeline.length, 0);
+});
+
+// --- W118: Failed-Pipeline Quarantine Cache & Compile-Latency Telemetry Tests ---
+
+test('W118 failed render and compute pipelines are quarantined by default and skip repeat device calls', async () => {
+  assert.equal(DEFAULT_MAX_QUARANTINED_KEYS, 512);
+
+  let renderSyncCalls = 0;
+  let computeSyncCalls = 0;
+  let renderAsyncCalls = 0;
+  let computeAsyncCalls = 0;
+
+  const device = createMockGpuDevice({
+    renderSyncImpl: () => {
+      renderSyncCalls += 1;
+      const err = new Error('Validation failed at C:\\Users\\dev\\shader.wgsl');
+      err.name = 'GPUValidationError';
+      throw err;
+    },
+    computeSyncImpl: () => {
+      computeSyncCalls += 1;
+      throw new Error('Invalid workgroup size');
+    },
+    renderAsyncImpl: async () => {
+      renderAsyncCalls += 1;
+      throw new Error('Async render validation failure');
+    },
+    computeAsyncImpl: async () => {
+      computeAsyncCalls += 1;
+      throw new Error('Async compute validation failure');
+    },
+  });
+
+  let clock = 100;
+  const cache = new WebGpuPipelineCache({ device, nowFn: () => clock });
+  const vs = device.createShaderModule({ label: 'wgpk:vertex:0x0000000000000101', code: 'vs' });
+  const cs = device.createShaderModule({ label: 'wgpk:compute:0x0000000000000102', code: 'cs' });
+
+  const renderDescA = { layout: 'auto', vertex: { module: vs, entryPoint: 'vs_fail_sync' } };
+  const renderDescAReordered = { vertex: { entryPoint: 'vs_fail_sync', module: vs }, layout: 'auto' };
+  const renderKeyA = hashDescriptorKey(renderDescA);
+
+  // First sync render failure throws and quarantines the canonical key
+  assert.throws(() => cache.getOrCreateRenderPipeline(renderDescA), /Validation failed/);
+  assert.equal(renderSyncCalls, 1);
+  assert.equal(cache.isQuarantined(renderKeyA), true);
+  assert.equal(cache.isQuarantined(renderDescAReordered), true);
+
+  // Subsequent sync requests for identical descriptor return null without invoking device
+  clock += 5;
+  assert.equal(cache.getOrCreateRenderPipeline(renderDescA), null);
+  assert.equal(cache.getOrCreateRenderPipeline(renderDescAReordered), null);
+  assert.equal(renderSyncCalls, 1);
+
+  // First sync compute failure throws and quarantines
+  const computeDescA = { layout: 'auto', compute: { module: cs, entryPoint: 'cs_fail_sync' } };
+  assert.throws(() => cache.getOrCreateComputePipeline(computeDescA), /Invalid workgroup size/);
+  assert.equal(computeSyncCalls, 1);
+  assert.equal(cache.isQuarantined(computeDescA), true);
+
+  // Repeat compute lookup hits quarantine
+  assert.equal(cache.getOrCreateComputePipeline(computeDescA), null);
+  assert.equal(computeSyncCalls, 1);
+
+  // Async render failure rejects once, then subsequent async calls resolve to null
+  const renderDescAsync = { layout: 'auto', vertex: { module: vs, entryPoint: 'vs_fail_async' } };
+  await assert.rejects(
+    cache.getOrCreateRenderPipelineAsync(renderDescAsync),
+    /Async render validation failure/
+  );
+  assert.equal(renderAsyncCalls, 1);
+  assert.equal(await cache.getOrCreateRenderPipelineAsync(renderDescAsync), null);
+  assert.equal(renderAsyncCalls, 1);
+
+  // Async compute failure rejects once, then subsequent async calls resolve to null
+  const computeDescAsync = { layout: 'auto', compute: { module: cs, entryPoint: 'cs_fail_async' } };
+  await assert.rejects(
+    cache.getOrCreateComputePipelineAsync(computeDescAsync),
+    /Async compute validation failure/
+  );
+  assert.equal(computeAsyncCalls, 1);
+  assert.equal(await cache.getOrCreateComputePipelineAsync(computeDescAsync), null);
+  assert.equal(computeAsyncCalls, 1);
+
+  const stats = cache.getStats();
+  assert.equal(stats.quarantinedKeys, 4);
+  assert.equal(stats.quarantineHits, 5);
+  assert.equal(stats.compileCount, 0);
+  assert.equal(stats.totalCompileMs, 0);
+  assert.equal(stats.maxCompileMs, 0);
+
+  // Quarantined records sanitize host paths and track failure/hit counts
+  const records = cache.getQuarantinedKeys();
+  assert.equal(records.length, 4);
+  const renderRec = records.find((r) => r.key === renderKeyA);
+  assert.ok(renderRec);
+  assert.equal(renderRec.kind, 'render');
+  assert.equal(renderRec.failureCount, 1);
+  assert.equal(renderRec.hitCount, 2);
+  assert.doesNotMatch(renderRec.reason, /Users\\dev/);
+  assert.match(renderRec.reason, /<path>/);
+});
+
+test('W118 empty/null pipeline creation results are quarantined and never cached as valid pipelines', async () => {
+  let syncCalls = 0;
+  let asyncCalls = 0;
+  const device = createMockGpuDevice({
+    renderSyncImpl: () => {
+      syncCalls += 1;
+      return null;
+    },
+    computeAsyncImpl: async () => {
+      asyncCalls += 1;
+      return null;
+    },
+  });
+
+  const cache = new WebGpuPipelineCache({ device });
+  const vs = device.createShaderModule({ code: 'vs' });
+  const cs = device.createShaderModule({ code: 'cs' });
+
+  const renderDesc = { layout: 'auto', vertex: { module: vs, entryPoint: 'vs_null' } };
+  assert.equal(cache.getOrCreateRenderPipeline(renderDesc), null);
+  assert.equal(cache.getOrCreateRenderPipeline(renderDesc), null);
+  assert.equal(syncCalls, 1);
+  assert.equal(cache.getStats().renderCount, 0);
+  assert.equal(cache.isQuarantined(renderDesc), true);
+
+  const computeDesc = { layout: 'auto', compute: { module: cs, entryPoint: 'cs_null' } };
+  assert.equal(await cache.getOrCreateComputePipelineAsync(computeDesc), null);
+  assert.equal(await cache.getOrCreateComputePipelineAsync(computeDesc), null);
+  assert.equal(asyncCalls, 1);
+  assert.equal(cache.getStats().computeCount, 0);
+  assert.equal(cache.isQuarantined(computeDesc), true);
+  assert.equal(cache.getStats().quarantineHits, 2);
+});
+
+test('W118 clearQuarantine, clear, reset, onDeviceLost, and setDevice clear quarantine and allow retries', async () => {
+  let shouldFail = true;
+  let calls = 0;
+  const makeDevice = () =>
+    createMockGpuDevice({
+      renderSyncImpl: (desc, id) => {
+        calls += 1;
+        if (shouldFail) {
+          throw new Error('compile error');
+        }
+        return { kind: 'GPURenderPipeline', id, desc };
+      },
+    });
+
+  const device1 = makeDevice();
+  const cache = new WebGpuPipelineCache({ device: device1 });
+  const vs = device1.createShaderModule({ code: 'vs' });
+  const desc = { layout: 'auto', vertex: { module: vs, entryPoint: 'vs_retry' } };
+
+  // 1. Fail -> quarantined -> clearQuarantine() allows retry to succeed
+  assert.throws(() => cache.getOrCreateRenderPipeline(desc), /compile error/);
+  assert.equal(cache.getOrCreateRenderPipeline(desc), null);
+  assert.equal(calls, 1);
+  assert.equal(cache.isQuarantined(desc), true);
+
+  assert.equal(cache.clearQuarantine(), 1);
+  assert.equal(cache.isQuarantined(desc), false);
+  assert.equal(cache.getStats().quarantinedKeys, 0);
+
+  shouldFail = false;
+  const ok1 = cache.getOrCreateRenderPipeline(desc);
+  assert.equal(ok1.kind, 'GPURenderPipeline');
+  assert.equal(calls, 2);
+
+  // 2. clear() clears quarantine
+  shouldFail = true;
+  const desc2 = { layout: 'auto', vertex: { module: vs, entryPoint: 'vs_clear' } };
+  assert.throws(() => cache.getOrCreateRenderPipeline(desc2), /compile error/);
+  assert.equal(cache.isQuarantined(desc2), true);
+  cache.clear();
+  assert.equal(cache.isQuarantined(desc2), false);
+  shouldFail = false;
+  assert.equal(cache.getOrCreateRenderPipeline(desc2).kind, 'GPURenderPipeline');
+
+  // 3. reset() clears quarantine
+  shouldFail = true;
+  const desc3 = { layout: 'auto', vertex: { module: vs, entryPoint: 'vs_reset' } };
+  assert.throws(() => cache.getOrCreateRenderPipeline(desc3), /compile error/);
+  assert.equal(cache.isQuarantined(desc3), true);
+  cache.reset();
+  assert.equal(cache.isQuarantined(desc3), false);
+
+  // 4. onDeviceLost() clears quarantine
+  const desc4 = { layout: 'auto', vertex: { module: vs, entryPoint: 'vs_lost' } };
+  assert.throws(() => cache.getOrCreateRenderPipeline(desc4), /compile error/);
+  assert.equal(cache.isQuarantined(desc4), true);
+  cache.onDeviceLost();
+  assert.equal(cache.isQuarantined(desc4), false);
+
+  // 5. setDevice() swaps device, clears quarantine, and compiles on new device
+  const desc5 = { layout: 'auto', vertex: { module: vs, entryPoint: 'vs_swap' } };
+  assert.throws(() => cache.getOrCreateRenderPipeline(desc5), /compile error/);
+  assert.equal(cache.isQuarantined(desc5), true);
+
+  shouldFail = false;
+  const device2 = makeDevice();
+  assert.equal(cache.setDevice(device1), false);
+  assert.equal(cache.setDevice(device2), true);
+  assert.equal(cache.isQuarantined(desc5), false);
+  const okAfterSwap = cache.getOrCreateRenderPipeline(desc5);
+  assert.equal(okAfterSwap.kind, 'GPURenderPipeline');
+  assert.equal(device2.calls.createRenderPipeline.length, 1);
+
+  // 6. Stale pre-clear async rejection does not poison post-clear quarantine
+  const pendingFail = createDeferred();
+  const asyncDevice = createMockGpuDevice({
+    renderAsyncImpl: async () => {
+      await pendingFail.promise;
+      throw new Error('stale pre-clear failure');
+    },
+  });
+  const asyncCache = new WebGpuPipelineCache({ device: asyncDevice });
+  const asyncDesc = { layout: 'auto', vertex: { module: vs, entryPoint: 'vs_stale' } };
+  const pStale = asyncCache.getOrCreateRenderPipelineAsync(asyncDesc);
+  asyncCache.onDeviceLost();
+  pendingFail.resolve();
+  await assert.rejects(pStale, /stale pre-clear failure/);
+  assert.equal(asyncCache.isQuarantined(asyncDesc), false);
+  assert.equal(asyncCache.getStats().quarantinedKeys, 0);
+});
+
+test('W118 maxQuarantinedKeys bounds quarantine map and evicts oldest quarantined key', () => {
+  let calls = 0;
+  const device = createMockGpuDevice({
+    renderSyncImpl: () => {
+      calls += 1;
+      throw new Error('bad descriptor');
+    },
+  });
+
+  const cache = new WebGpuPipelineCache({ device, maxQuarantinedKeys: 2 });
+  const vs = device.createShaderModule({ code: 'vs' });
+  const d1 = { layout: 'auto', vertex: { module: vs, entryPoint: 'vs_q1' } };
+  const d2 = { layout: 'auto', vertex: { module: vs, entryPoint: 'vs_q2' } };
+  const d3 = { layout: 'auto', vertex: { module: vs, entryPoint: 'vs_q3' } };
+
+  assert.throws(() => cache.getOrCreateRenderPipeline(d1), /bad descriptor/);
+  assert.throws(() => cache.getOrCreateRenderPipeline(d2), /bad descriptor/);
+  assert.equal(cache.getStats().quarantinedKeys, 2);
+  assert.equal(cache.isQuarantined(d1), true);
+  assert.equal(cache.isQuarantined(d2), true);
+
+  // Adding d3 evicts oldest quarantined key (d1)
+  assert.throws(() => cache.getOrCreateRenderPipeline(d3), /bad descriptor/);
+  assert.equal(cache.getStats().quarantinedKeys, 2);
+  assert.equal(cache.isQuarantined(d1), false);
+  assert.equal(cache.isQuarantined(d2), true);
+  assert.equal(cache.isQuarantined(d3), true);
+
+  // d2 and d3 still hit quarantine without device calls
+  assert.equal(cache.getOrCreateRenderPipeline(d2), null);
+  assert.equal(cache.getOrCreateRenderPipeline(d3), null);
+  assert.equal(calls, 3);
+
+  // Evicted d1 retries compilation on the device
+  assert.throws(() => cache.getOrCreateRenderPipeline(d1), /bad descriptor/);
+  assert.equal(calls, 4);
+  assert.equal(cache.getStats().quarantinedKeys, 2);
+});
+
+test('W118 quarantineFailedKeys: false disables quarantine and retries normally', () => {
+  let renderAttempts = 0;
+  let computeAttempts = 0;
+  const device = createMockGpuDevice({
+    renderSyncImpl: (desc, id) => {
+      renderAttempts += 1;
+      if (renderAttempts < 3) {
+        throw new Error('transient render error');
+      }
+      return { kind: 'GPURenderPipeline', id, desc };
+    },
+    computeSyncImpl: (desc, id) => {
+      computeAttempts += 1;
+      if (computeAttempts < 2) {
+        throw new Error('transient compute error');
+      }
+      return { kind: 'GPUComputePipeline', id, desc };
+    },
+  });
+
+  const cache = new WebGpuPipelineCache({ device, quarantineFailedKeys: false });
+  const vs = device.createShaderModule({ code: 'vs' });
+  const cs = device.createShaderModule({ code: 'cs' });
+  const renderDesc = { layout: 'auto', vertex: { module: vs, entryPoint: 'vs_no_q' } };
+  const computeDesc = { layout: 'auto', compute: { module: cs, entryPoint: 'cs_no_q' } };
+
+  assert.throws(() => cache.getOrCreateRenderPipeline(renderDesc), /transient render error/);
+  assert.equal(cache.isQuarantined(renderDesc), false);
+  assert.throws(() => cache.getOrCreateRenderPipeline(renderDesc), /transient render error/);
+  const rp = cache.getOrCreateRenderPipeline(renderDesc);
+  assert.equal(rp.kind, 'GPURenderPipeline');
+  assert.equal(renderAttempts, 3);
+
+  assert.throws(() => cache.getOrCreateComputePipeline(computeDesc), /transient compute error/);
+  assert.equal(cache.isQuarantined(computeDesc), false);
+  const cp = cache.getOrCreateComputePipeline(computeDesc);
+  assert.equal(cp.kind, 'GPUComputePipeline');
+  assert.equal(computeAttempts, 2);
+
+  assert.equal(cache.getStats().quarantinedKeys, 0);
+  assert.equal(cache.getStats().quarantineHits, 0);
+});
+
+test('W118 compile-latency telemetry tracks compileCount, totalCompileMs, and maxCompileMs via injectable clock', async () => {
+  let clock = 500;
+  const renderDurations = [3.5, 18.25];
+  const computeDurations = [7.0, 12.5];
+
+  const device = createMockGpuDevice({
+    renderSyncImpl: (desc, id) => {
+      clock += renderDurations.shift();
+      return { kind: 'GPURenderPipeline', id, desc };
+    },
+    renderAsyncImpl: async (desc, id) => {
+      clock += renderDurations.shift();
+      return { kind: 'GPURenderPipeline', id, desc };
+    },
+    computeSyncImpl: (desc, id) => {
+      clock += computeDurations.shift();
+      return { kind: 'GPUComputePipeline', id, desc };
+    },
+    computeAsyncImpl: async (desc, id) => {
+      clock += computeDurations.shift();
+      return { kind: 'GPUComputePipeline', id, desc };
+    },
+  });
+
+  const cache = new WebGpuPipelineCache({ device, nowFn: () => clock });
+  const vs = device.createShaderModule({ code: 'vs' });
+  const cs = device.createShaderModule({ code: 'cs' });
+
+  // 1. Sync render compile: 3.5ms
+  const r1 = { layout: 'auto', vertex: { module: vs, entryPoint: 'vs_t1' } };
+  cache.getOrCreateRenderPipeline(r1);
+  // Cache hit should NOT increment compileCount or change timing
+  cache.getOrCreateRenderPipeline(r1);
+
+  assert.equal(cache.getStats().compileCount, 1);
+  assert.equal(cache.getStats().totalCompileMs, 3.5);
+  assert.equal(cache.getStats().maxCompileMs, 3.5);
+
+  // 2. Async render compile: 18.25ms (new max)
+  await cache.getOrCreateRenderPipelineAsync({
+    layout: 'auto',
+    vertex: { module: vs, entryPoint: 'vs_t2' },
+  });
+  assert.equal(cache.getStats().compileCount, 2);
+  assert.equal(cache.getStats().totalCompileMs, 21.75);
+  assert.equal(cache.getStats().maxCompileMs, 18.25);
+
+  // 3. Sync compute compile: 7.0ms (max stays 18.25)
+  cache.getOrCreateComputePipeline({
+    layout: 'auto',
+    compute: { module: cs, entryPoint: 'cs_t1' },
+  });
+  assert.equal(cache.getStats().compileCount, 3);
+  assert.equal(cache.getStats().totalCompileMs, 28.75);
+  assert.equal(cache.getStats().maxCompileMs, 18.25);
+
+  // 4. Async compute compile: 12.5ms
+  await cache.getOrCreateComputePipelineAsync({
+    layout: 'auto',
+    compute: { module: cs, entryPoint: 'cs_t2' },
+  });
+  assert.equal(cache.getStats().compileCount, 4);
+  assert.equal(cache.getStats().totalCompileMs, 41.25);
+  assert.equal(cache.getStats().maxCompileMs, 18.25);
+
+  // Reset stats clears compile timing telemetry
+  cache.clear({ resetStats: true });
+  assert.equal(cache.getStats().compileCount, 0);
+  assert.equal(cache.getStats().totalCompileMs, 0);
+  assert.equal(cache.getStats().maxCompileMs, 0);
+
+  // Constructor option validation checks
+  assert.throws(
+    () => new WebGpuPipelineCache({ device, quarantineFailedKeys: 'yes' }),
+    /quarantineFailedKeys must be a boolean/
+  );
+  assert.throws(
+    () => new WebGpuPipelineCache({ device, maxQuarantinedKeys: 0 }),
+    /maxQuarantinedKeys must be a positive integer/
+  );
+  assert.throws(
+    () => new WebGpuPipelineCache({ device, nowFn: 'not-a-fn' }),
+    /nowFn must be a function/
+  );
 });
