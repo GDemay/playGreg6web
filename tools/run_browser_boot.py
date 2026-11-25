@@ -126,6 +126,53 @@ INPUT_SCRIPT_ALIASES: dict[str, str] = ALLOWED_INPUT_SCRIPT_PRESETS
 _SAFE_INPUT_SCRIPT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 MAX_GPU_ADAPTER_LEN = 96
 _WGPU_ADAPTER_LOG_RE = re.compile(r"\[wgpu_worker\]\s+WebGPU adapter:\s*([^\r\n]+)", re.IGNORECASE)
+_LOG_ELAPSED_PREFIX_RE = re.compile(r"^\s*\[\s*(\d+(?:\.\d+)?)\s*s\s*\]")
+_FIRST_VISIBLE_FRAME_LOG_RE = re.compile(
+    r"\bFIRST_VISIBLE_FRAME\b|\bfirst[\s_-]*(?:visible|non[\s_-]*black)[\s_-]*frame\b",
+    re.IGNORECASE,
+)
+_FIRST_VISIBLE_FRAME_MS_RE = re.compile(
+    r"\b(?:first_visible_frame_ms|firstVisibleFrameMs)\s*[=:]\s*(\d+(?:\.\d+)?)\b"
+)
+_FIRST_VISIBLE_FRAME_S_RE = re.compile(
+    r"\b(?:first_visible_frame_s|firstVisibleFrameS)\s*[=:]\s*(\d+(?:\.\d+)?)\b"
+)
+_MILESTONE_FIRST_VISIBLE_AT_RE = re.compile(
+    r"\bFIRST_VISIBLE_FRAME\b[^\r\n]{0,64}?\bat\s+(\d+(?:\.\d+)?)\s*(ms|s)\b",
+    re.IGNORECASE,
+)
+_BLACK_LOADING_MS_RE = re.compile(
+    r"\b(?:black_loading_ms|blackLoadingMs)\s*[=:]\s*(\d+(?:\.\d+)?)\b"
+)
+_BLACK_LOADING_S_RE = re.compile(
+    r"\b(?:black_loading_s|blackLoadingS)\s*[=:]\s*(\d+(?:\.\d+)?)\b"
+)
+_AUDIO_RING_CONTEXT_RE = re.compile(
+    r"audio_worker|audio_ring|guest[\s_-]*pcm[\s_-]*ring|guestRing|guestFramesDrained|playgta6_audio_ring",
+    re.IGNORECASE,
+)
+_AUDIO_RING_ATTACHED_KV_RE = re.compile(
+    r"\b(?:audio_ring_attached|audioRingAttached|guest_ring_attached|guestRingAttached|pcm_ring_attached|pcmRingAttached)\s*[=:]\s*(true|false|yes|no|1|0)\b",
+    re.IGNORECASE,
+)
+_AUDIO_RING_ATTACHED_EVENT_RE = re.compile(
+    r"\b(?:attach-guest-pcm-ring|guest[\s_-]*pcm[\s_-]*ring[\s_-]*attached|playgta6_audio_ring[^\r\n]{0,40}\battached)\b",
+    re.IGNORECASE,
+)
+_AUDIO_RING_ATTACH_FAIL_RE = re.compile(
+    r"\b(?:failed|error|detached|not\s+attached|false)\b",
+    re.IGNORECASE,
+)
+_AUDIO_RING_DETACHED_EVENT_RE = re.compile(
+    r"\b(?:detach-guest-pcm-ring|guest[\s_-]*pcm[\s_-]*ring[\s_-]*detached)\b",
+    re.IGNORECASE,
+)
+_AUDIO_GUEST_FRAMES_DRAINED_KV_RE = re.compile(
+    r"\b(?:audio_frames_drained|audioFramesDrained|guest_frames_drained|guestFramesDrained)\s*[=:]\s*(\d+)\b"
+)
+_AUDIO_GENERIC_FRAMES_DRAINED_KV_RE = re.compile(
+    r"\b(?:frames_drained|framesDrained)\s*[=:]\s*(\d+)\b"
+)
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _PNG_IEND_CHUNK = b"\x00\x00\x00\x00IEND\xaeB`\x82"
 
@@ -1584,6 +1631,29 @@ TELEMETRY_PROBE_JS = r"""(() => {
       inputScriptState = JSON.parse(JSON.stringify(window.playgta6App.inputBridge.getScriptState()));
     }
   } catch {}
+  let memory = null;
+  try {
+    const pm = typeof performance !== 'undefined' && performance && performance.memory;
+    if (pm && typeof pm === 'object') {
+      const used = Number(pm.usedJSHeapSize);
+      const total = Number(pm.totalJSHeapSize);
+      const limit = Number(pm.jsHeapSizeLimit);
+      memory = {
+        usedJSHeapSize: Number.isFinite(used) && used >= 0 ? used : null,
+        totalJSHeapSize: Number.isFinite(total) && total >= 0 ? total : null,
+        jsHeapSizeLimit: Number.isFinite(limit) && limit >= 0 ? limit : null,
+      };
+    }
+  } catch {}
+  let audioStats = null;
+  try {
+    const ae = window.playgta6App && window.playgta6App.audioEngine;
+    if (ae && typeof ae.getStats === 'function') {
+      audioStats = JSON.parse(JSON.stringify(ae.getStats()));
+    } else if (ae && typeof ae.getTelemetry === 'function') {
+      audioStats = JSON.parse(JSON.stringify(ae.getTelemetry()));
+    }
+  } catch {}
   const hudLog = [];
   try {
     const logRoot = document.getElementById('hud-log');
@@ -1606,6 +1676,8 @@ TELEMETRY_PROBE_JS = r"""(() => {
     tracerSummary,
     bootUrlOptions,
     inputScriptState,
+    memory,
+    audioStats,
     hud: {
       stage: safeText('hud-boot-stage'),
       status: safeText('hud-status'),
@@ -1673,6 +1745,12 @@ class BrowserSessionResult:
     stream_threshold_mb: float | None = None
     boot_options: dict[str, Any] | None = None
     gpu_adapter: str | None = None
+    first_visible_frame_s: float | None = None
+    black_loading_s: float | None = None
+    js_heap_used_mb: float | None = None
+    js_heap_total_mb: float | None = None
+    audio_ring_attached: bool | None = None
+    audio_frames_drained: int | None = None
 
 
 def _format_console_event(params: Mapping[str, Any], elapsed_s: float) -> tuple[str, bool]:
@@ -1875,6 +1953,410 @@ def _extract_gpu_adapter(
             if val is not None:
                 return val
     return None
+
+
+def _sanitize_non_negative_float(value: Any, *, digits: int | None = None) -> float | None:
+    """Return a finite non-negative float (optionally rounded), rejecting bools/strings/NaN/Inf."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    fval = float(value)
+    if not math.isfinite(fval) or fval < 0.0:
+        return None
+    if digits is not None:
+        fval = round(fval, digits)
+    return 0.0 if fval == 0.0 else fval
+
+
+def _sanitize_optional_non_negative_int(value: Any) -> int | None:
+    """Return a finite non-negative integer, rejecting bools/strings/NaN/Inf/negatives."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float):
+        if math.isfinite(value) and value >= 0.0 and value.is_integer():
+            return int(value)
+        return None
+    return None
+
+
+def _sanitize_optional_bool(value: Any) -> bool | None:
+    """Return a boolean only when the input is an actual bool."""
+    return value if isinstance(value, bool) else None
+
+
+def sanitize_js_heap_mb_from_bytes(raw_bytes: Any) -> float | None:
+    """Convert non-negative finite JS heap byte counts into MiB rounded to 1 decimal place."""
+    val = _sanitize_non_negative_float(raw_bytes)
+    if val is None:
+        return None
+    mb = round(val / (1024.0 * 1024.0), 1)
+    return 0.0 if mb == 0.0 else mb
+
+
+def extract_js_heap_mb_from_probe(probe: Mapping[str, Any] | None) -> tuple[float | None, float | None]:
+    """Extract sanitized `(js_heap_used_mb, js_heap_total_mb)` from a browser telemetry probe."""
+    if not isinstance(probe, Mapping):
+        return None, None
+    used_mb: float | None = None
+    total_mb: float | None = None
+
+    boot_state = probe.get("bootState") if isinstance(probe.get("bootState"), Mapping) else {}
+    diag = probe.get("diagnostics") if isinstance(probe.get("diagnostics"), Mapping) else {}
+    memory_sources: list[Mapping[str, Any]] = []
+    for candidate in (
+        probe.get("memory"),
+        boot_state.get("memory"),
+        diag.get("memory"),
+        probe,
+        boot_state,
+        diag,
+    ):
+        if isinstance(candidate, Mapping):
+            memory_sources.append(candidate)
+
+    for src in memory_sources:
+        if used_mb is None:
+            for key in ("js_heap_used_mb", "jsHeapUsedMb"):
+                val = _sanitize_non_negative_float(src.get(key), digits=1)
+                if val is not None:
+                    used_mb = val
+                    break
+        if used_mb is None:
+            for key in ("usedJSHeapSize", "used_js_heap_size"):
+                val = sanitize_js_heap_mb_from_bytes(src.get(key))
+                if val is not None:
+                    used_mb = val
+                    break
+        if total_mb is None:
+            for key in ("js_heap_total_mb", "jsHeapTotalMb"):
+                val = _sanitize_non_negative_float(src.get(key), digits=1)
+                if val is not None:
+                    total_mb = val
+                    break
+        if total_mb is None:
+            for key in ("totalJSHeapSize", "total_js_heap_size"):
+                val = sanitize_js_heap_mb_from_bytes(src.get(key))
+                if val is not None:
+                    total_mb = val
+                    break
+        if used_mb is not None and total_mb is not None:
+            break
+    return used_mb, total_mb
+
+
+def _extract_js_heap_mb(
+    session: BrowserSessionResult,
+    probe: Mapping[str, Any] | None = None,
+) -> tuple[float | None, float | None]:
+    """Resolve sanitized `(js_heap_used_mb, js_heap_total_mb)` from session or telemetry probe."""
+    used_mb = _sanitize_non_negative_float(session.js_heap_used_mb, digits=1)
+    total_mb = _sanitize_non_negative_float(session.js_heap_total_mb, digits=1)
+    if used_mb is not None and total_mb is not None:
+        return used_mb, total_mb
+    probe_map = probe if isinstance(probe, Mapping) else (
+        session.final_probe if isinstance(session.final_probe, Mapping) else {}
+    )
+    p_used, p_total = extract_js_heap_mb_from_probe(probe_map)
+    return (
+        used_mb if used_mb is not None else p_used,
+        total_mb if total_mb is not None else p_total,
+    )
+
+
+def extract_visible_frame_timing_from_console_lines(
+    lines: Sequence[str] | None,
+) -> tuple[float | None, float | None]:
+    """Scan console/HUD log lines for `FIRST_VISIBLE_FRAME` and `black_loading` timing in seconds."""
+    if not lines:
+        return None, None
+    first_visible_s: float | None = None
+    black_loading_s: float | None = None
+    for raw_line in lines:
+        if not isinstance(raw_line, str):
+            continue
+        if first_visible_s is None:
+            m_ms = _FIRST_VISIBLE_FRAME_MS_RE.search(raw_line)
+            if m_ms is not None:
+                val = _sanitize_non_negative_float(float(m_ms.group(1)) / 1000.0, digits=3)
+                if val is not None:
+                    first_visible_s = val
+        if first_visible_s is None:
+            m_s = _FIRST_VISIBLE_FRAME_S_RE.search(raw_line)
+            if m_s is not None:
+                val = _sanitize_non_negative_float(float(m_s.group(1)), digits=3)
+                if val is not None:
+                    first_visible_s = val
+        if first_visible_s is None:
+            m_at = _MILESTONE_FIRST_VISIBLE_AT_RE.search(raw_line)
+            if m_at is not None:
+                raw_num = float(m_at.group(1))
+                unit = m_at.group(2).lower()
+                secs = raw_num / 1000.0 if unit == "ms" else raw_num
+                val = _sanitize_non_negative_float(secs, digits=3)
+                if val is not None:
+                    first_visible_s = val
+        if first_visible_s is None and _FIRST_VISIBLE_FRAME_LOG_RE.search(raw_line):
+            m_prefix = _LOG_ELAPSED_PREFIX_RE.search(raw_line)
+            if m_prefix is not None:
+                val = _sanitize_non_negative_float(float(m_prefix.group(1)), digits=3)
+                if val is not None:
+                    first_visible_s = val
+        if black_loading_s is None:
+            m_bl_ms = _BLACK_LOADING_MS_RE.search(raw_line)
+            if m_bl_ms is not None:
+                val = _sanitize_non_negative_float(float(m_bl_ms.group(1)) / 1000.0, digits=3)
+                if val is not None:
+                    black_loading_s = val
+        if black_loading_s is None:
+            m_bl_s = _BLACK_LOADING_S_RE.search(raw_line)
+            if m_bl_s is not None:
+                val = _sanitize_non_negative_float(float(m_bl_s.group(1)), digits=3)
+                if val is not None:
+                    black_loading_s = val
+        if first_visible_s is not None and black_loading_s is not None:
+            break
+    return first_visible_s, black_loading_s
+
+
+def _extract_visible_frame_timing(
+    session: BrowserSessionResult,
+    probe: Mapping[str, Any] | None = None,
+) -> tuple[float | None, float | None]:
+    """Resolve `(first_visible_frame_s, black_loading_s)` from session, probe telemetry, or logs."""
+    first_visible_ms: float | None = None
+    black_loading_ms: float | None = None
+
+    direct_fvf_s = _sanitize_non_negative_float(session.first_visible_frame_s, digits=3)
+    if direct_fvf_s is not None:
+        first_visible_ms = direct_fvf_s * 1000.0
+    direct_bl_s = _sanitize_non_negative_float(session.black_loading_s, digits=3)
+    if direct_bl_s is not None:
+        black_loading_ms = direct_bl_s * 1000.0
+
+    probe_map = probe if isinstance(probe, Mapping) else (
+        session.final_probe if isinstance(session.final_probe, Mapping) else {}
+    )
+    boot_state = probe_map.get("bootState") if isinstance(probe_map.get("bootState"), Mapping) else {}
+    gpu = boot_state.get("gpu") if isinstance(boot_state.get("gpu"), Mapping) else {}
+    diag = probe_map.get("diagnostics") if isinstance(probe_map.get("diagnostics"), Mapping) else {}
+    tracer = probe_map.get("tracerSummary") if isinstance(probe_map.get("tracerSummary"), Mapping) else {}
+
+    timing_sources = (gpu, boot_state, diag, tracer, probe_map)
+    for src in timing_sources:
+        if first_visible_ms is None:
+            for key in ("firstVisibleFrameMs", "first_visible_frame_ms"):
+                val = _sanitize_non_negative_float(src.get(key))
+                if val is not None:
+                    first_visible_ms = val
+                    break
+        if first_visible_ms is None:
+            for key in ("firstVisibleFrameS", "first_visible_frame_s"):
+                val = _sanitize_non_negative_float(src.get(key))
+                if val is not None:
+                    first_visible_ms = val * 1000.0
+                    break
+        if black_loading_ms is None:
+            for key in ("blackLoadingMs", "black_loading_ms"):
+                val = _sanitize_non_negative_float(src.get(key))
+                if val is not None:
+                    black_loading_ms = val
+                    break
+        if black_loading_ms is None:
+            for key in ("blackLoadingS", "black_loading_s"):
+                val = _sanitize_non_negative_float(src.get(key))
+                if val is not None:
+                    black_loading_ms = val * 1000.0
+                    break
+
+    first_present_ms: float | None = None
+    for src in timing_sources:
+        for key in ("firstPresentMs", "first_present_ms"):
+            val = _sanitize_non_negative_float(src.get(key))
+            if val is not None:
+                first_present_ms = val
+                break
+        if first_present_ms is not None:
+            break
+
+    raw_milestones = tracer.get("milestones")
+    if isinstance(raw_milestones, list):
+        for m in raw_milestones:
+            if not isinstance(m, Mapping):
+                continue
+            if "reached" in m and m.get("reached") is not True:
+                continue
+            name = m.get("milestone")
+            elapsed = _sanitize_non_negative_float(
+                m.get("elapsedMs") if "elapsedMs" in m else m.get("elapsed_ms")
+            )
+            if elapsed is None:
+                continue
+            if name == "FIRST_VISIBLE_FRAME" and first_visible_ms is None:
+                first_visible_ms = elapsed
+            elif name == "FIRST_PRESENT" and first_present_ms is None:
+                first_present_ms = elapsed
+
+    if first_visible_ms is None or black_loading_ms is None:
+        log_fvf_s, log_bl_s = extract_visible_frame_timing_from_console_lines(session.console_lines)
+        if first_visible_ms is None and log_fvf_s is not None:
+            first_visible_ms = log_fvf_s * 1000.0
+        if black_loading_ms is None and log_bl_s is not None:
+            black_loading_ms = log_bl_s * 1000.0
+
+    if first_visible_ms is None or black_loading_ms is None:
+        hud = probe_map.get("hud")
+        if isinstance(hud, Mapping) and isinstance(hud.get("logLines"), list):
+            hud_fvf_s, hud_bl_s = extract_visible_frame_timing_from_console_lines(
+                [str(x) for x in hud["logLines"]]
+            )
+            if first_visible_ms is None and hud_fvf_s is not None:
+                first_visible_ms = hud_fvf_s * 1000.0
+            if black_loading_ms is None and hud_bl_s is not None:
+                black_loading_ms = hud_bl_s * 1000.0
+
+    if first_present_ms is None:
+        first_present_ms = _sanitize_non_negative_float(session.first_present_ms)
+
+    if black_loading_ms is None and first_visible_ms is not None and first_present_ms is not None:
+        if first_visible_ms >= first_present_ms:
+            black_loading_ms = first_visible_ms - first_present_ms
+
+    first_visible_s = (
+        direct_fvf_s
+        if direct_fvf_s is not None
+        else (
+            _sanitize_non_negative_float(first_visible_ms / 1000.0, digits=3)
+            if first_visible_ms is not None
+            else None
+        )
+    )
+    black_loading_s = (
+        direct_bl_s
+        if direct_bl_s is not None
+        else (
+            _sanitize_non_negative_float(black_loading_ms / 1000.0, digits=3)
+            if black_loading_ms is not None
+            else None
+        )
+    )
+    return first_visible_s, black_loading_s
+
+
+def extract_audio_ring_summary_from_console_lines(
+    lines: Sequence[str] | None,
+) -> tuple[bool | None, int | None]:
+    """Scan console/HUD log lines for `#1028` guest audio PCM ring attachment and drained frame counts."""
+    if not lines:
+        return None, None
+    attached: bool | None = None
+    frames_drained: int | None = None
+    for raw_line in lines:
+        if not isinstance(raw_line, str):
+            continue
+        kv_att = _AUDIO_RING_ATTACHED_KV_RE.search(raw_line)
+        if kv_att is not None:
+            token = kv_att.group(1).lower()
+            attached = token in ("true", "yes", "1")
+        elif _AUDIO_RING_DETACHED_EVENT_RE.search(raw_line):
+            attached = False
+        elif _AUDIO_RING_ATTACHED_EVENT_RE.search(raw_line) and not _AUDIO_RING_ATTACH_FAIL_RE.search(raw_line):
+            attached = True
+
+        kv_guest = _AUDIO_GUEST_FRAMES_DRAINED_KV_RE.search(raw_line)
+        if kv_guest is not None:
+            frames_drained = int(kv_guest.group(1))
+        elif _AUDIO_RING_CONTEXT_RE.search(raw_line):
+            kv_gen = _AUDIO_GENERIC_FRAMES_DRAINED_KV_RE.search(raw_line)
+            if kv_gen is not None:
+                frames_drained = int(kv_gen.group(1))
+    return attached, frames_drained
+
+
+def _extract_audio_ring_summary(
+    session: BrowserSessionResult,
+    probe: Mapping[str, Any] | None = None,
+) -> tuple[bool | None, int | None]:
+    """Resolve `#1028` `(audio_ring_attached, audio_frames_drained)` from session, probe, or logs."""
+    attached = _sanitize_optional_bool(session.audio_ring_attached)
+    frames_drained = _sanitize_optional_non_negative_int(session.audio_frames_drained)
+    if attached is not None and frames_drained is not None:
+        return attached, frames_drained
+
+    probe_map = probe if isinstance(probe, Mapping) else (
+        session.final_probe if isinstance(session.final_probe, Mapping) else {}
+    )
+    boot_state = probe_map.get("bootState") if isinstance(probe_map.get("bootState"), Mapping) else {}
+    diag = probe_map.get("diagnostics") if isinstance(probe_map.get("diagnostics"), Mapping) else {}
+
+    audio_sources: list[Mapping[str, Any]] = []
+    for candidate in (
+        probe_map.get("audioStats"),
+        probe_map.get("audio"),
+        boot_state.get("audio"),
+        diag.get("audio"),
+        boot_state,
+        diag,
+    ):
+        if isinstance(candidate, Mapping):
+            audio_sources.append(candidate)
+
+    for src in audio_sources:
+        if attached is None:
+            for key in (
+                "audio_ring_attached",
+                "audioRingAttached",
+                "guestRingAttached",
+                "guest_ring_attached",
+                "pcmRingAttached",
+                "ringAttached",
+            ):
+                val = _sanitize_optional_bool(src.get(key))
+                if val is not None:
+                    attached = val
+                    break
+        if frames_drained is None:
+            for key in (
+                "audio_frames_drained",
+                "audioFramesDrained",
+                "guestFramesDrained",
+                "guest_frames_drained",
+                "guestDrainedFrames",
+            ):
+                val = _sanitize_optional_non_negative_int(src.get(key))
+                if val is not None:
+                    frames_drained = val
+                    break
+
+    if frames_drained is None:
+        for src in audio_sources:
+            for key in ("framesDrained", "frames_drained"):
+                val = _sanitize_optional_non_negative_int(src.get(key))
+                if val is not None:
+                    frames_drained = val
+                    break
+            if frames_drained is not None:
+                break
+
+    if attached is None or frames_drained is None:
+        log_att, log_drained = extract_audio_ring_summary_from_console_lines(session.console_lines)
+        if attached is None:
+            attached = log_att
+        if frames_drained is None:
+            frames_drained = log_drained
+
+    if attached is None or frames_drained is None:
+        hud = probe_map.get("hud")
+        if isinstance(hud, Mapping) and isinstance(hud.get("logLines"), list):
+            hud_att, hud_drained = extract_audio_ring_summary_from_console_lines(
+                [str(x) for x in hud["logLines"]]
+            )
+            if attached is None:
+                attached = hud_att
+            if frames_drained is None:
+                frames_drained = hud_drained
+
+    return attached, frames_drained
 
 
 def _sample_present_record(probe: Mapping[str, Any], index: int, wall_ms: float) -> dict[str, Any]:
@@ -2493,6 +2975,9 @@ def run_browser_session(
                     result.gpu_adapter = extract_gpu_adapter_from_console_lines(chrome_log_lines)
             except OSError:
                 pass
+        result.first_visible_frame_s, result.black_loading_s = _extract_visible_frame_timing(result)
+        result.js_heap_used_mb, result.js_heap_total_mb = _extract_js_heap_mb(result)
+        result.audio_ring_attached, result.audio_frames_drained = _extract_audio_ring_summary(result)
         if result.crashed:
             result.ok = False
             result.exit_code = 1
@@ -2575,6 +3060,9 @@ def build_boot_report(
     )
     effective_boot_options = boot_options if boot_options is not None else session.boot_options
     effective_gpu_adapter = _extract_gpu_adapter(session, probe)
+    effective_first_visible_frame_s, effective_black_loading_s = _extract_visible_frame_timing(session, probe)
+    effective_js_heap_used_mb, effective_js_heap_total_mb = _extract_js_heap_mb(session, probe)
+    effective_audio_ring_attached, effective_audio_frames_drained = _extract_audio_ring_summary(session, probe)
 
     milestones: list[dict[str, Any]] = []
     raw_milestones = tracer.get("milestones")
@@ -2645,6 +3133,20 @@ def build_boot_report(
         summary["nonBlackCanvasFrames"] = session.non_black_canvas_frames
     if effective_gpu_adapter is not None:
         summary["gpu_adapter"] = effective_gpu_adapter
+    if effective_first_visible_frame_s is not None:
+        summary["first_visible_frame_s"] = effective_first_visible_frame_s
+        summary["first_visible_frame_ms"] = round(effective_first_visible_frame_s * 1000.0, 2)
+    if effective_black_loading_s is not None:
+        summary["black_loading_s"] = effective_black_loading_s
+        summary["black_loading_ms"] = round(effective_black_loading_s * 1000.0, 2)
+    if effective_js_heap_used_mb is not None:
+        summary["js_heap_used_mb"] = effective_js_heap_used_mb
+    if effective_js_heap_total_mb is not None:
+        summary["js_heap_total_mb"] = effective_js_heap_total_mb
+    if effective_audio_ring_attached is not None:
+        summary["audio_ring_attached"] = effective_audio_ring_attached
+    if effective_audio_frames_drained is not None:
+        summary["audio_frames_drained"] = effective_audio_frames_drained
 
     report: dict[str, Any] = {
         "schema": REPORT_SCHEMA,
@@ -2655,6 +3157,12 @@ def build_boot_report(
         "smoke": bool(smoke),
         "inputScript": effective_input_script,
         "gpu_adapter": effective_gpu_adapter,
+        "first_visible_frame_s": effective_first_visible_frame_s,
+        "black_loading_s": effective_black_loading_s,
+        "js_heap_used_mb": effective_js_heap_used_mb,
+        "js_heap_total_mb": effective_js_heap_total_mb,
+        "audio_ring_attached": effective_audio_ring_attached,
+        "audio_frames_drained": effective_audio_frames_drained,
         "status": status,
         "phase": phase,
         "exit_code": session.exit_code,
@@ -2720,6 +3228,9 @@ def build_telemetry_payload(
     )
     effective_boot_options = boot_options if boot_options is not None else session.boot_options
     effective_gpu_adapter = _extract_gpu_adapter(session, probe)
+    effective_first_visible_frame_s, effective_black_loading_s = _extract_visible_frame_timing(session, probe)
+    effective_js_heap_used_mb, effective_js_heap_total_mb = _extract_js_heap_mb(session, probe)
+    effective_audio_ring_attached, effective_audio_frames_drained = _extract_audio_ring_summary(session, probe)
     effective_hide_hud = bool(hide_hud or session.hide_hud)
     effective_mp4_fps = mp4_fps if mp4_fps is not None else session.mp4_fps
     effective_mp4_skip_black = bool(mp4_skip_black or session.mp4_skip_black)
@@ -2738,6 +3249,20 @@ def build_telemetry_payload(
         summary["nonBlackCanvasFrames"] = session.non_black_canvas_frames
     if effective_gpu_adapter is not None:
         summary["gpu_adapter"] = effective_gpu_adapter
+    if effective_first_visible_frame_s is not None:
+        summary["first_visible_frame_s"] = effective_first_visible_frame_s
+        summary["first_visible_frame_ms"] = round(effective_first_visible_frame_s * 1000.0, 2)
+    if effective_black_loading_s is not None:
+        summary["black_loading_s"] = effective_black_loading_s
+        summary["black_loading_ms"] = round(effective_black_loading_s * 1000.0, 2)
+    if effective_js_heap_used_mb is not None:
+        summary["js_heap_used_mb"] = effective_js_heap_used_mb
+    if effective_js_heap_total_mb is not None:
+        summary["js_heap_total_mb"] = effective_js_heap_total_mb
+    if effective_audio_ring_attached is not None:
+        summary["audio_ring_attached"] = effective_audio_ring_attached
+    if effective_audio_frames_drained is not None:
+        summary["audio_frames_drained"] = effective_audio_frames_drained
     return sanitize_value(
         {
             "schema": "playgta6-browser-telemetry",
@@ -2748,6 +3273,12 @@ def build_telemetry_payload(
             "hide_hud": effective_hide_hud,
             "inputScript": effective_input_script,
             "gpu_adapter": effective_gpu_adapter,
+            "first_visible_frame_s": effective_first_visible_frame_s,
+            "black_loading_s": effective_black_loading_s,
+            "js_heap_used_mb": effective_js_heap_used_mb,
+            "js_heap_total_mb": effective_js_heap_total_mb,
+            "audio_ring_attached": effective_audio_ring_attached,
+            "audio_frames_drained": effective_audio_frames_drained,
             "stream_shaders": effective_stream_shaders,
             "stream_threshold_mb": effective_stream_threshold_mb,
             "boot_options": dict(effective_boot_options) if effective_boot_options is not None else None,
@@ -2826,6 +3357,71 @@ def digest(report: dict[str, Any], exit_code: int, max_counters: int = 12) -> st
     gpu_adapter = sanitize_gpu_adapter(report.get("gpu_adapter") or summary.get("gpu_adapter"))
     if gpu_adapter:
         lines.append(f"gpu_adapter: {gpu_adapter}")
+    first_visible_frame_s = _sanitize_non_negative_float(
+        report.get("first_visible_frame_s"), digits=3
+    )
+    if first_visible_frame_s is None:
+        first_visible_frame_s = _sanitize_non_negative_float(
+            summary.get("first_visible_frame_s"), digits=3
+        )
+    if first_visible_frame_s is None:
+        for ms_val in (
+            report.get("first_visible_frame_ms"),
+            summary.get("first_visible_frame_ms"),
+            summary.get("firstVisibleFrameMs"),
+        ):
+            clean_ms = _sanitize_non_negative_float(ms_val)
+            if clean_ms is not None:
+                first_visible_frame_s = _sanitize_non_negative_float(clean_ms / 1000.0, digits=3)
+                break
+    black_loading_s = _sanitize_non_negative_float(report.get("black_loading_s"), digits=3)
+    if black_loading_s is None:
+        black_loading_s = _sanitize_non_negative_float(summary.get("black_loading_s"), digits=3)
+    if black_loading_s is None:
+        for ms_val in (
+            report.get("black_loading_ms"),
+            summary.get("black_loading_ms"),
+            summary.get("blackLoadingMs"),
+        ):
+            clean_ms = _sanitize_non_negative_float(ms_val)
+            if clean_ms is not None:
+                black_loading_s = _sanitize_non_negative_float(clean_ms / 1000.0, digits=3)
+                break
+    if first_visible_frame_s is not None:
+        if black_loading_s is not None:
+            lines.append(
+                f"first_visible_frame_s: {first_visible_frame_s} (black_loading_s={black_loading_s})"
+            )
+        else:
+            lines.append(f"first_visible_frame_s: {first_visible_frame_s}")
+    elif black_loading_s is not None:
+        lines.append(f"black_loading_s: {black_loading_s}")
+    js_heap_used_mb = _sanitize_non_negative_float(report.get("js_heap_used_mb"), digits=1)
+    if js_heap_used_mb is None:
+        js_heap_used_mb = _sanitize_non_negative_float(summary.get("js_heap_used_mb"), digits=1)
+    js_heap_total_mb = _sanitize_non_negative_float(report.get("js_heap_total_mb"), digits=1)
+    if js_heap_total_mb is None:
+        js_heap_total_mb = _sanitize_non_negative_float(summary.get("js_heap_total_mb"), digits=1)
+    heap_parts: list[str] = []
+    if js_heap_used_mb is not None:
+        heap_parts.append(f"used={js_heap_used_mb:.1f}")
+    if js_heap_total_mb is not None:
+        heap_parts.append(f"total={js_heap_total_mb:.1f}")
+    if heap_parts:
+        lines.append(f"js_heap_mb: {', '.join(heap_parts)}")
+    audio_ring_attached = _sanitize_optional_bool(report.get("audio_ring_attached"))
+    if audio_ring_attached is None:
+        audio_ring_attached = _sanitize_optional_bool(summary.get("audio_ring_attached"))
+    audio_frames_drained = _sanitize_optional_non_negative_int(report.get("audio_frames_drained"))
+    if audio_frames_drained is None:
+        audio_frames_drained = _sanitize_optional_non_negative_int(summary.get("audio_frames_drained"))
+    audio_parts: list[str] = []
+    if audio_ring_attached is not None:
+        audio_parts.append(f"attached={'true' if audio_ring_attached else 'false'}")
+    if audio_frames_drained is not None:
+        audio_parts.append(f"frames_drained={audio_frames_drained}")
+    if audio_parts:
+        lines.append(f"audio_ring: {', '.join(audio_parts)}")
     input_script = report.get("inputScript") or summary.get("inputScript")
     if input_script:
         lines.append(f"input_script: {input_script}")

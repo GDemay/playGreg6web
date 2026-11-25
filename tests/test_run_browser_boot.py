@@ -2520,5 +2520,335 @@ class ChromeFullBootGpuAdapterAndMp4HardeningTests(unittest.TestCase):
             self.assertEqual(len(ffmpeg_cmds), calls_before)
 
 
+class VisibleFrameHeapAndAudioRingMetricsTests(unittest.TestCase):
+    def test_telemetry_probe_js_includes_memory_and_audio_hooks(self):
+        self.assertIn("performance.memory", rbb.TELEMETRY_PROBE_JS)
+        self.assertIn("usedJSHeapSize", rbb.TELEMETRY_PROBE_JS)
+        self.assertIn("totalJSHeapSize", rbb.TELEMETRY_PROBE_JS)
+        self.assertIn("audioEngine", rbb.TELEMETRY_PROBE_JS)
+        self.assertIn("audioStats", rbb.TELEMETRY_PROBE_JS)
+
+    def test_visible_frame_timing_extraction_from_probe_milestones_and_logs(self):
+        # 1. Explicit bootState.gpu stats (W257 wgpu_worker telemetry)
+        probe_gpu = make_sample_probe()
+        probe_gpu["bootState"]["gpu"]["firstVisibleFrameMs"] = 4250.0
+        probe_gpu["bootState"]["gpu"]["blackLoadingMs"] = 1200.0
+        sess_gpu = make_fake_session_result(probe=probe_gpu, first_present_ms=3050.0)
+        fvf_s, bl_s = rbb._extract_visible_frame_timing(sess_gpu)
+        self.assertEqual(fvf_s, 4.25)
+        self.assertEqual(bl_s, 1.2)
+
+        # 2. Tracer milestones derive black_loading_s when explicit blackLoadingMs is absent
+        probe_ms = make_sample_probe(
+            stage="FIRST_VISIBLE_FRAME",
+            milestones=[
+                {"milestone": "PGIM_LOAD", "index": 0, "reached": True, "elapsedMs": 10.0},
+                {"milestone": "FIRST_PRESENT", "index": 8, "reached": True, "elapsedMs": 1500.0},
+                {"milestone": "FIRST_VISIBLE_FRAME", "index": 9, "reached": True, "elapsedMs": 5750.0},
+            ],
+        )
+        sess_ms = make_fake_session_result(probe=probe_ms, first_present_ms=1500.0)
+        fvf_s, bl_s = rbb._extract_visible_frame_timing(sess_ms)
+        self.assertEqual(fvf_s, 5.75)
+        self.assertEqual(bl_s, 4.25)
+
+        # 3. Console log milestone formats (boot_tracer "reached at ...ms", explicit kv, and prefix timestamp)
+        self.assertEqual(
+            rbb.extract_visible_frame_timing_from_console_lines(
+                ["[   6.10s] [console.info] [boot_tracer] milestone FIRST_VISIBLE_FRAME reached at 5850.0ms"]
+            ),
+            (5.85, None),
+        )
+        self.assertEqual(
+            rbb.extract_visible_frame_timing_from_console_lines(
+                ["[   5.12s] [console.info] [wgpu_worker] FIRST_VISIBLE_FRAME (blackLoadingMs=2100)"]
+            ),
+            (5.12, 2.1),
+        )
+        self.assertEqual(
+            rbb.extract_visible_frame_timing_from_console_lines(
+                [
+                    "[   4.00s] [console.info] [wgpu_worker] first_visible_frame_s=3.75 black_loading_s=1.25",
+                    "[   9.00s] [console.info] [wgpu_worker] first_visible_frame_s=9.99 black_loading_s=8.88",
+                ]
+            ),
+            (3.75, 1.25),
+        )
+
+        # 4. Invalid / negative / NaN / Inf / bool / path strings resolve cleanly to None
+        bad_probe = make_sample_probe()
+        bad_probe["bootState"]["gpu"]["firstVisibleFrameMs"] = -10.0
+        bad_probe["bootState"]["firstVisibleFrameMs"] = float("nan")
+        bad_probe["diagnostics"]["firstVisibleFrameMs"] = True
+        bad_probe["bootState"]["gpu"]["blackLoadingMs"] = r"C:\Users\secret\black.bin"
+        bad_probe["diagnostics"]["blackLoadingMs"] = float("inf")
+        sess_bad = make_fake_session_result(probe=bad_probe, console_lines=["[  1.00s] [console.log] ok"])
+        self.assertEqual(rbb._extract_visible_frame_timing(sess_bad), (None, None))
+
+    def test_js_heap_mb_extraction_and_sanitization(self):
+        # Bytes -> MiB rounded to 1 decimal place
+        self.assertEqual(rbb.sanitize_js_heap_mb_from_bytes(128 * 1024 * 1024), 128.0)
+        self.assertEqual(rbb.sanitize_js_heap_mb_from_bytes(int(128.44 * 1024 * 1024)), 128.4)
+        self.assertEqual(rbb.sanitize_js_heap_mb_from_bytes(0), 0.0)
+        for bad in (None, True, False, -1, -0.5, float("nan"), float("inf"), float("-inf"), "128", r"C:\Users\bob\heap"):
+            self.assertIsNone(rbb.sanitize_js_heap_mb_from_bytes(bad), f"expected None for {bad!r}")
+
+        probe_mem = make_sample_probe()
+        probe_mem["memory"] = {
+            "usedJSHeapSize": int(142.36 * 1024 * 1024),
+            "totalJSHeapSize": int(256.04 * 1024 * 1024),
+            "jsHeapSizeLimit": int(4096 * 1024 * 1024),
+        }
+        self.assertEqual(rbb.extract_js_heap_mb_from_probe(probe_mem), (142.4, 256.0))
+
+        # Partial memory (only used exposed, total invalid)
+        probe_partial = {
+            "memory": {
+                "usedJSHeapSize": 64 * 1024 * 1024,
+                "totalJSHeapSize": r"/Users/alice/bad",
+            }
+        }
+        self.assertEqual(rbb.extract_js_heap_mb_from_probe(probe_partial), (64.0, None))
+        self.assertEqual(rbb.extract_js_heap_mb_from_probe(make_sample_probe()), (None, None))
+
+    def test_audio_ring_summary_extraction_from_probe_and_console_logs(self):
+        # 1. Structured probe.audioStats (from audioEngine.getStats())
+        probe_audio = make_sample_probe()
+        probe_audio["audioStats"] = {
+            "outputState": "running",
+            "guestRingAttached": True,
+            "guestFramesDrained": 4800,
+        }
+        sess_audio = make_fake_session_result(probe=probe_audio)
+        self.assertEqual(rbb._extract_audio_ring_summary(sess_audio), (True, 4800))
+
+        # 2. Explicit False and 0 are preserved (not conflated with None)
+        probe_zero = make_sample_probe()
+        probe_zero["bootState"]["audio"] = {
+            "outputState": "suspended",
+            "guestRingAttached": False,
+            "guestFramesDrained": 0,
+        }
+        sess_zero = make_fake_session_result(probe=probe_zero)
+        self.assertEqual(rbb._extract_audio_ring_summary(sess_zero), (False, 0))
+
+        # 3. Console log extraction (lifecycle updates, attach/detach, failed attach ignored)
+        self.assertEqual(
+            rbb.extract_audio_ring_summary_from_console_lines(
+                [
+                    "[   1.00s] [console.info] [loader] attach-guest-pcm-ring attached (48000 Hz, 2 ch)",
+                    "[   2.00s] [console.info] [audio_worker] guestRingAttached=yes guestFramesDrained=960",
+                    "[   3.00s] [console.info] [audio_worker] framesDrained=2880",
+                ]
+            ),
+            (True, 2880),
+        )
+        self.assertEqual(
+            rbb.extract_audio_ring_summary_from_console_lines(
+                [
+                    "[   1.00s] [console.info] [loader] attach-guest-pcm-ring attached",
+                    "[   2.00s] [console.info] [audio_worker] detach-guest-pcm-ring",
+                ]
+            ),
+            (False, None),
+        )
+        self.assertEqual(
+            rbb.extract_audio_ring_summary_from_console_lines(
+                ["[   1.00s] [console.warn] [loader] attach-guest-pcm-ring failed: non-shared-buffer"]
+            ),
+            (None, None),
+        )
+
+        # 4. Absent everywhere -> (None, None)
+        sess_none = make_fake_session_result()
+        self.assertEqual(rbb._extract_audio_ring_summary(sess_none), (None, None))
+
+    def test_report_telemetry_digest_and_compare_boot_reports_integration(self):
+        class FakeProc:
+            returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = 0
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                self.returncode = -9
+
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            run_dir = fx.build / "runs" / "t61-sess"
+            run_dir.mkdir(parents=True)
+            fake_clock = {"t": 4000.0}
+
+            rich_probe = make_sample_probe(
+                boot_mode="real-wasm64",
+                session_state="running_wasm",
+                stage="FIRST_VISIBLE_FRAME",
+                presents=12,
+                real_draws=30,
+                fallback_draws=0,
+                milestones=[
+                    {"milestone": "PGIM_LOAD", "index": 0, "reached": True, "elapsedMs": 15.0},
+                    {"milestone": "FIRST_PRESENT", "index": 8, "reached": True, "elapsedMs": 1250.0},
+                    {"milestone": "FIRST_VISIBLE_FRAME", "index": 9, "reached": True, "elapsedMs": 4250.0},
+                ],
+            )
+            rich_probe["bootState"]["gpu"]["firstVisibleFrameMs"] = 4250.0
+            rich_probe["bootState"]["gpu"]["blackLoadingMs"] = 3000.0
+            rich_probe["memory"] = {
+                "usedJSHeapSize": int(128.4 * 1024 * 1024),
+                "totalJSHeapSize": int(256.0 * 1024 * 1024),
+            }
+            rich_probe["audioStats"] = {
+                "outputState": "running",
+                "guestRingAttached": True,
+                "guestFramesDrained": 4800,
+            }
+
+            class FakeCdp:
+                def __init__(self, ws_url: str) -> None:
+                    self.ws_url = ws_url
+
+                def connect(self):
+                    return None
+
+                def close(self):
+                    return None
+
+                def send(self, method: str, params=None, timeout=None):
+                    if method == "Runtime.evaluate":
+                        return {"result": {"value": rich_probe}}
+                    return {}
+
+                def drain_events(self, timeout: float = 0.0):
+                    fake_clock["t"] += 0.1
+                    return []
+
+            with mock.patch.object(rbb.time, "monotonic", side_effect=lambda: fake_clock["t"]):
+                sess = rbb.run_browser_session(
+                    repo=fx.repo,
+                    run_dir=run_dir,
+                    chrome_path=fx.chrome,
+                    port=0,
+                    boot_dir=None,
+                    game_dir=None,
+                    shaders_dir=None,
+                    duration_s=0.15,
+                    headless=True,
+                    smoke=True,
+                    send_input=False,
+                    capture_frames=False,
+                    frame_interval_s=1.0,
+                    encode_mp4=False,
+                    popen_fn=lambda cmd, **kw: FakeProc(),
+                    cdp_factory=FakeCdp,
+                    wait_server_fn=lambda *a, **k: {"status_code": 200, "coop": "same-origin", "coep": "require-corp"},
+                    wait_cdp_fn=lambda *a, **k: "ws://127.0.0.1:9222/devtools/page/1",
+                )
+
+            self.assertEqual(sess.first_visible_frame_s, 4.25)
+            self.assertEqual(sess.black_loading_s, 3.0)
+            self.assertEqual(sess.js_heap_used_mb, 128.4)
+            self.assertEqual(sess.js_heap_total_mb, 256.0)
+            self.assertIs(sess.audio_ring_attached, True)
+            self.assertEqual(sess.audio_frames_drained, 4800)
+
+            # End-to-end CLI run -> boot-report.json, telemetry.json, digest.txt
+            code, out, err, _, _ = fx.run_cli(
+                "--smoke",
+                "--name",
+                "t61-cli-full",
+                session_runner=lambda **kw: sess,
+            )
+            self.assertEqual(code, 0, err)
+            cli_dir = fx.build / "runs" / "t61-cli-full"
+            report = json.loads((cli_dir / "boot-report.json").read_text(encoding="utf-8"))
+            telemetry = json.loads((cli_dir / "telemetry.json").read_text(encoding="utf-8"))
+            digest_text = (cli_dir / "digest.txt").read_text(encoding="utf-8")
+
+            # Verify boot-report.json preserves schema v2 + new top-level & summary keys
+            self.assertEqual(report["schema"], compare_boot_reports.REPORT_SCHEMA)
+            self.assertEqual(report["schema_version"], 2)
+            self.assertEqual(report["first_visible_frame_s"], 4.25)
+            self.assertEqual(report["black_loading_s"], 3.0)
+            self.assertEqual(report["js_heap_used_mb"], 128.4)
+            self.assertEqual(report["js_heap_total_mb"], 256.0)
+            self.assertIs(report["audio_ring_attached"], True)
+            self.assertEqual(report["audio_frames_drained"], 4800)
+            self.assertEqual(report["summary"]["first_visible_frame_s"], 4.25)
+            self.assertEqual(report["summary"]["first_visible_frame_ms"], 4250.0)
+            self.assertEqual(report["summary"]["black_loading_s"], 3.0)
+            self.assertEqual(report["summary"]["black_loading_ms"], 3000.0)
+            self.assertEqual(report["summary"]["js_heap_used_mb"], 128.4)
+            self.assertEqual(report["summary"]["js_heap_total_mb"], 256.0)
+            self.assertIs(report["summary"]["audio_ring_attached"], True)
+            self.assertEqual(report["summary"]["audio_frames_drained"], 4800)
+
+            # Verify telemetry.json parity
+            self.assertEqual(telemetry["first_visible_frame_s"], 4.25)
+            self.assertEqual(telemetry["black_loading_s"], 3.0)
+            self.assertEqual(telemetry["js_heap_used_mb"], 128.4)
+            self.assertEqual(telemetry["js_heap_total_mb"], 256.0)
+            self.assertIs(telemetry["audio_ring_attached"], True)
+            self.assertEqual(telemetry["audio_frames_drained"], 4800)
+
+            # Verify concise digest.txt formatting
+            self.assertIn("first_visible_frame_s: 4.25 (black_loading_s=3.0)", digest_text)
+            self.assertIn("js_heap_mb: used=128.4, total=256.0", digest_text)
+            self.assertIn("audio_ring: attached=true, frames_drained=4800", digest_text)
+            self.assertIn("first_visible_frame_s: 4.25 (black_loading_s=3.0)", out)
+
+            # Verify compare_boot_reports compatibility & gpu_delta integration
+            cmp_res = compare_boot_reports.compare(report, report, compare_boot_reports.Tolerances())
+            self.assertEqual(cmp_res.failures(), [])
+            self.assertEqual(cmp_res.gpu_delta["first_visible_frame_ms"]["a"], 4250.0)
+            self.assertEqual(cmp_res.gpu_delta["black_loading_ms"]["a"], 3000.0)
+
+            # Zero host paths leaked across all artifacts
+            for fname in ("boot-report.json", "telemetry.json", "digest.txt", "console.log"):
+                text = (cli_dir / fname).read_text(encoding="utf-8")
+                self.assertNotIn(str(Path(d)), text, f"host path leaked in {fname}")
+
+            # Graceful None / missing handling: omitted from summary & digest.txt
+            minimal_session = make_fake_session_result()
+            rep_min = rbb.build_boot_report(minimal_session, smoke=True, preset="smoke")
+            tel_min = rbb.build_telemetry_payload(minimal_session, smoke=True, preset="smoke", headless=True)
+            for key in (
+                "first_visible_frame_s",
+                "black_loading_s",
+                "js_heap_used_mb",
+                "js_heap_total_mb",
+                "audio_ring_attached",
+                "audio_frames_drained",
+            ):
+                self.assertIsNone(rep_min[key])
+                self.assertNotIn(key, rep_min["summary"])
+                self.assertIsNone(tel_min[key])
+                self.assertNotIn(key, tel_min["summary"])
+            dig_min = rbb.digest(rep_min, 0)
+            self.assertNotIn("first_visible_frame_s:", dig_min)
+            self.assertNotIn("black_loading_s:", dig_min)
+            self.assertNotIn("js_heap_mb:", dig_min)
+            self.assertNotIn("audio_ring:", dig_min)
+
+            # Partial digest formatting (single fields & false/0 edge cases)
+            partial_rep = dict(rep_min)
+            partial_rep["first_visible_frame_s"] = 2.5
+            partial_rep["js_heap_used_mb"] = 99.5
+            partial_rep["audio_ring_attached"] = False
+            partial_rep["audio_frames_drained"] = 0
+            dig_partial = rbb.digest(partial_rep, 0)
+            self.assertIn("first_visible_frame_s: 2.5", dig_partial)
+            self.assertNotIn("black_loading_s=", dig_partial)
+            self.assertIn("js_heap_mb: used=99.5", dig_partial)
+            self.assertNotIn("total=", dig_partial)
+            self.assertIn("audio_ring: attached=false, frames_drained=0", dig_partial)
+
+
 if __name__ == "__main__":
     unittest.main()
