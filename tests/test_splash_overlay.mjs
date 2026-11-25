@@ -21,8 +21,12 @@ const {
   sanitizeDismissReason,
   isHudHiddenQuery,
   isGregQuery,
+  isSplashHoldQuery,
   SplashOverlayController,
   DEFAULT_FADE_MS,
+  DEFAULT_VISIBLE_FRAME_FADE_MS,
+  DEFAULT_HOLD_FALLBACK_TIMEOUT_MS,
+  DEFAULT_LOADING_ASSETS_MESSAGE,
   DEFAULT_GREG_IMAGE_URL,
   DEFAULT_GREG_CLICK_THRESHOLD,
   GREG_SECRET_WORD,
@@ -283,6 +287,9 @@ function createTimer() {
       const entries = Array.from(pending.entries());
       pending.clear();
       for (const [, entry] of entries) entry.fn();
+    },
+    delays() {
+      return Array.from(pending.values()).map((entry) => entry.ms);
     },
     get size() {
       return pending.size;
@@ -1729,4 +1736,415 @@ test('W228: setGregMode and toggleGregMode update DOM & telemetry cleanly and ar
   assert.doesNotThrow(() => controller.toggleGregMode());
   assert.equal(controller.getStats().gregMode, false);
   assert.equal(controller.getStats().destroyed, true);
+});
+
+test('W230: exports isSplashHoldQuery, W230 constants, and dismiss reasons on module and UMD global', () => {
+  assert.equal(typeof isSplashHoldQuery, 'function');
+  assert.equal(DEFAULT_VISIBLE_FRAME_FADE_MS, 450);
+  assert.equal(DEFAULT_HOLD_FALLBACK_TIMEOUT_MS, 240000);
+  assert.equal(DEFAULT_LOADING_ASSETS_MESSAGE, 'Loading game assets...');
+  assert.equal(DISMISS_REASONS.FIRST_VISIBLE_FRAME, 'first_visible_frame');
+  assert.equal(DISMISS_REASONS.HOLD_FALLBACK_TIMEOUT, 'hold_fallback_timeout');
+  assert.equal(globalThis.PlayGta6SplashOverlay.isSplashHoldQuery, isSplashHoldQuery);
+  assert.equal(
+    globalThis.PlayGta6SplashOverlay.DEFAULT_VISIBLE_FRAME_FADE_MS,
+    DEFAULT_VISIBLE_FRAME_FADE_MS
+  );
+  assert.equal(
+    globalThis.PlayGta6SplashOverlay.DEFAULT_HOLD_FALLBACK_TIMEOUT_MS,
+    DEFAULT_HOLD_FALLBACK_TIMEOUT_MS
+  );
+  assert.equal(
+    globalThis.PlayGta6SplashOverlay.DEFAULT_LOADING_ASSETS_MESSAGE,
+    DEFAULT_LOADING_ASSETS_MESSAGE
+  );
+
+  // isSplashHoldQuery parsing across string, URLSearchParams, Location, and full URLs.
+  assert.equal(isSplashHoldQuery('?splashHold=1'), true);
+  assert.equal(isSplashHoldQuery('splashHold=1'), true);
+  assert.equal(isSplashHoldQuery('?SPLASHHOLD=TRUE'), true);
+  assert.equal(isSplashHoldQuery('?splashhold=true'), true);
+  assert.equal(isSplashHoldQuery('?splashHold=on'), true);
+  assert.equal(isSplashHoldQuery('?splashHold=yes'), true);
+  assert.equal(isSplashHoldQuery('?foo=1&splashHold=1&bar=2'), true);
+  assert.equal(isSplashHoldQuery('?splashHold=0&splashHold=1'), true);
+  assert.equal(isSplashHoldQuery('?splashHold=1&splashHold=0'), false);
+  assert.equal(isSplashHoldQuery('?splashHold=0'), false);
+  assert.equal(isSplashHoldQuery('?splashHold=false'), false);
+  assert.equal(isSplashHoldQuery('?splashHold='), false);
+  assert.equal(isSplashHoldQuery(''), false);
+  assert.equal(isSplashHoldQuery(null), false);
+  assert.equal(isSplashHoldQuery(undefined), false);
+  assert.equal(isSplashHoldQuery(new URLSearchParams('?splashHold=1')), true);
+  assert.equal(isSplashHoldQuery(new URLSearchParams('?splashHold=0')), false);
+  assert.equal(isSplashHoldQuery({ search: '?splashHold=true' }), true);
+  assert.equal(isSplashHoldQuery('http://localhost:8000/?splashHold=1#top'), true);
+  assert.equal(isSplashHoldQuery('http://localhost:8000/?splashHold=0#?splashHold=1'), false);
+});
+
+test('W230: validates holdUntilVisible options, defaults false for backwards compatibility, and honors ?splashHold=1', () => {
+  assert.throws(
+    () => new SplashOverlayController({ documentObj: new MockDocument(), holdUntilVisible: 'yes' }),
+    TypeError
+  );
+  assert.throws(
+    () => new SplashOverlayController({ documentObj: new MockDocument(), holdFallbackTimeoutMs: -1 }),
+    TypeError
+  );
+  assert.throws(
+    () =>
+      new SplashOverlayController({
+        documentObj: new MockDocument(),
+        holdFallbackTimeoutMs: Number.POSITIVE_INFINITY,
+      }),
+    TypeError
+  );
+  assert.throws(
+    () => new SplashOverlayController({ documentObj: new MockDocument(), holdFallbackTimeoutMs: '240000' }),
+    TypeError
+  );
+  assert.throws(
+    () => new SplashOverlayController({ documentObj: new MockDocument(), visibleFrameFadeMs: -5 }),
+    TypeError
+  );
+  assert.throws(
+    () => new SplashOverlayController({ documentObj: new MockDocument(), visibleFrameFadeMs: '450' }),
+    TypeError
+  );
+
+  // Backwards compatibility: default holdUntilVisible is false and onFirstPresent dismisses immediately/fades.
+  let now = 1000;
+  const compat = createController({ fadeMs: 40, nowFn: () => now });
+  assert.equal(compat.controller.getStats().holdUntilVisible, false);
+  assert.equal(compat.controller.getStats().holdingForVisibleFrame, false);
+  assert.equal(compat.controller.getStats().heldForVisibleFrame, false);
+  assert.equal(compat.controller.getStats().firstVisibleFrameMs, null);
+  assert.equal(compat.controller.getStats().blackPresentsWhileHeld, 0);
+  compat.controller.onFirstPresent();
+  assert.equal(compat.controller.getStats().dismissed, true);
+  assert.equal(compat.controller.getStats().fading, true);
+  assert.equal(compat.controller.getStats().heldForVisibleFrame, false);
+  now = 1040;
+  compat.timer.flush();
+  assert.equal(compat.controller.getStats().visible, false);
+  assert.equal(compat.controller.getStats().dismissReason, DISMISS_REASONS.FIRST_PRESENT);
+  assert.equal(compat.controller.getStats().heldForVisibleFrame, false);
+  assert.equal(compat.controller.getStats().firstVisibleFrameMs, null);
+  assert.equal(compat.controller.getStats().blackPresentsWhileHeld, 0);
+  assert.equal(compat.dismissCalls.length, 1);
+  compat.controller.destroy();
+
+  // ?splashHold=1 via locationSearch enables holdUntilVisible automatically.
+  const viaQuery = createController({ locationSearch: '?splashHold=1' });
+  assert.equal(viaQuery.controller.getStats().holdUntilVisible, true);
+  assert.equal(viaQuery.controller.getState().holdUntilVisible, true);
+  viaQuery.controller.destroy();
+
+  // ?splashHold=1 via windowObj.location.search enables holdUntilVisible automatically.
+  const viaWindow = createController({ windowObj: { location: { search: '?foo=1&splashHold=true' } } });
+  assert.equal(viaWindow.controller.getStats().holdUntilVisible, true);
+  viaWindow.controller.destroy();
+
+  // Explicit holdUntilVisible: false overrides ?splashHold=1 query.
+  const explicitOff = createController({ locationSearch: '?splashHold=1', holdUntilVisible: false });
+  assert.equal(explicitOff.controller.getStats().holdUntilVisible, false);
+  explicitOff.controller.destroy();
+
+  // ?hud=0 still hides the overlay cleanly even when combined with ?splashHold=1.
+  const hudHidden = createController({ locationSearch: '?hud=0&splashHold=1', nowFn: () => 2000 });
+  assert.equal(hudHidden.controller.getStats().visible, false);
+  assert.equal(hudHidden.controller.getStats().dismissed, true);
+  assert.equal(hudHidden.controller.getStats().holdUntilVisible, true);
+  hudHidden.controller.onFirstPresent();
+  assert.equal(hudHidden.controller.getStats().visible, false);
+  assert.equal(hudHidden.controller.getStats().holdingForVisibleFrame, false);
+  assert.equal(hudHidden.timer.size, 0);
+  hudHidden.controller.destroy();
+});
+
+test('W230: holdUntilVisible holds past FIRST_PRESENT, updates loading progress, preserves Spinning Greg, and fades out smoothly on notifyFirstVisibleFrame', () => {
+  let now = 45000;
+  const { controller, documentObj, timer, dismissCalls } = createController({
+    holdUntilVisible: true,
+    nowFn: () => now,
+  });
+  const root = controller.getState().root;
+  const stageEl = root.querySelector('.pg6-splash__stage');
+  const spinner = root.querySelector('.pg6-splash__spinner');
+  const gregImg = root.querySelector('.pg6-splash__greg');
+
+  // Pre-FIRST_PRESENT boot progress works normally.
+  controller.updateBootState({ stage: 'BINK_OPEN', progressPct: 89, elapsedMs: 42000 });
+  assert.equal(controller.getStats().holdingForVisibleFrame, false);
+  assert.equal(controller.getStats().heldForVisibleFrame, false);
+
+  // FIRST_PRESENT enters smooth hold phase instead of dismissing.
+  const heldState = controller.onFirstPresent();
+  assert.equal(heldState.visible, true);
+  assert.equal(heldState.dismissed, false);
+  assert.equal(heldState.fading, false);
+  assert.equal(heldState.holdingForVisibleFrame, true);
+  assert.equal(heldState.heldForVisibleFrame, true);
+  assert.equal(heldState.blackPresentsWhileHeld, 1);
+  assert.equal(heldState.statusText, 'Loading game assets...');
+  assert.equal(stageEl.textContent, 'Loading game assets...');
+  assert.equal(heldState.progressPct, 90);
+  assert.equal(root.getAttribute('aria-busy'), 'true');
+  assert.equal(root.getAttribute('data-holding-for-visible'), 'true');
+  assert.equal(root.classList.contains('pg6-splash--holding'), true);
+  assert.equal(spinner.hidden, false);
+  assert.equal(dismissCalls.length, 0);
+  // Default 240000 ms fallback safety timer is armed.
+  assert.deepEqual(timer.delays(), [240000]);
+
+  // setLoadingAssetsProgress updates status text and progress smoothly without dismissing.
+  const p1 = controller.setLoadingAssetsProgress({ presents: 30, realPackDraws: 0 });
+  assert.equal(p1.visible, true);
+  assert.equal(p1.dismissed, false);
+  assert.equal(p1.holdingForVisibleFrame, true);
+  assert.equal(p1.blackPresentsWhileHeld, 30);
+  assert.equal(p1.loadingRealPackDraws, 0);
+  assert.match(p1.statusText, /Loading game assets\.\.\..*30 frames/);
+  assert.ok(p1.progressPct >= 90 && p1.progressPct <= 99);
+
+  const p2 = controller.setLoadingAssetsProgress({
+    presents: 120,
+    realPackDraws: 18,
+    elapsedMs: 110000,
+  });
+  assert.equal(p2.blackPresentsWhileHeld, 120);
+  assert.equal(p2.loadingRealPackDraws, 18);
+  assert.equal(p2.elapsedMs, 110000);
+  assert.match(p2.statusText, /Loading game assets\.\.\..*18 draws.*120 frames/);
+  assert.ok(p2.progressPct >= p1.progressPct && p2.progressPct <= 99);
+
+  // Explicit custom message is rendered verbatim (sanitized of control chars).
+  const p3 = controller.setLoadingAssetsProgress({
+    presents: 180,
+    realPackDraws: 42,
+    message: 'Streaming shaders.rpf & levels.rpf...',
+  });
+  assert.equal(p3.statusText, 'Streaming shaders.rpf & levels.rpf...');
+  assert.equal(stageEl.textContent, 'Streaming shaders.rpf & levels.rpf...');
+  assert.equal(p3.blackPresentsWhileHeld, 180);
+
+  // Late BootTracer FIRST_PRESENT snapshot does not overwrite loading-assets text or jump to 100%.
+  controller.updateBootState({ stage: 'FIRST_PRESENT', progressPct: 100, elapsedMs: 125000 });
+  assert.equal(controller.getState().statusText, 'Streaming shaders.rpf & levels.rpf...');
+  assert.ok(controller.getState().progressPct <= 99);
+  assert.equal(controller.getState().dismissed, false);
+
+  // W228 Spinning Greg triggers still work while held!
+  spinner.dispatch('click');
+  spinner.dispatch('click');
+  spinner.dispatch('click');
+  assert.equal(controller.getStats().gregMode, true);
+  assert.equal(gregImg.hidden, false);
+  for (const ch of 'greg') {
+    documentObj.dispatch('keydown', { key: ch });
+  }
+  assert.equal(controller.getStats().gregMode, false);
+  assert.equal(gregImg.hidden, true);
+
+  // notifyFirstVisibleFrame() cancels fallback timer and fades out smoothly (450 ms default).
+  now = 195000;
+  const fadingState = controller.notifyFirstVisibleFrame();
+  assert.equal(fadingState.visible, true);
+  assert.equal(fadingState.dismissed, true);
+  assert.equal(fadingState.fading, true);
+  assert.equal(fadingState.holdingForVisibleFrame, false);
+  assert.equal(fadingState.heldForVisibleFrame, true);
+  assert.equal(fadingState.firstVisibleFrameMs, 195000);
+  assert.equal(fadingState.blackPresentsWhileHeld, 180);
+  assert.equal(fadingState.progressPct, 100);
+  assert.equal(root.classList.contains('pg6-splash--fading'), true);
+  assert.equal(root.classList.contains('pg6-splash--holding'), false);
+  assert.equal(root.getAttribute('data-holding-for-visible'), 'false');
+  assert.equal(root.getAttribute('aria-busy'), 'false');
+  assert.equal(root.style.getPropertyValue('--pg6-splash-fade'), '450ms');
+  // Fallback timer was cancelled; only the 450 ms fade timer remains.
+  assert.deepEqual(timer.delays(), [450]);
+  assert.equal(dismissCalls.length, 0);
+
+  // Complete fade transition.
+  now = 195450;
+  timer.flush();
+  const doneStats = controller.getStats();
+  assert.equal(doneStats.visible, false);
+  assert.equal(doneStats.dismissed, true);
+  assert.equal(doneStats.fading, false);
+  assert.equal(doneStats.dismissCount, 1);
+  assert.equal(doneStats.dismissReason, DISMISS_REASONS.FIRST_VISIBLE_FRAME);
+  assert.equal(doneStats.fadeDurationMs, 450);
+  assert.equal(doneStats.heldForVisibleFrame, true);
+  assert.equal(doneStats.firstVisibleFrameMs, 195000);
+  assert.equal(doneStats.blackPresentsWhileHeld, 180);
+  assert.equal(doneStats.holdFallbackTimedOut, false);
+  assert.equal(dismissCalls.length, 1);
+  assert.doesNotThrow(() => JSON.stringify(doneStats));
+
+  // Idempotent second notifyFirstVisibleFrame & setLoadingAssetsProgress after dismiss.
+  now = 210000;
+  controller.notifyFirstVisibleFrame();
+  controller.setLoadingAssetsProgress({ presents: 999, message: 'Should be ignored' });
+  assert.equal(controller.getStats().firstVisibleFrameMs, 195000);
+  assert.equal(controller.getStats().blackPresentsWhileHeld, 180);
+  assert.equal(controller.getStats().dismissCount, 1);
+  assert.equal(dismissCalls.length, 1);
+
+  // show({ reset: true }) resets hold telemetry for a fresh boot cycle.
+  const resetState = controller.show({ reset: true });
+  assert.equal(resetState.visible, true);
+  assert.equal(resetState.dismissed, false);
+  assert.equal(resetState.holdingForVisibleFrame, false);
+  assert.equal(resetState.heldForVisibleFrame, false);
+  assert.equal(resetState.firstVisibleFrameMs, null);
+  assert.equal(resetState.blackPresentsWhileHeld, 0);
+  assert.equal(resetState.loadingRealPackDraws, 0);
+  controller.destroy();
+});
+
+test('W230: notifyFirstVisibleFrame supports custom fadeDurationMs, immediate, and reducedMotion', () => {
+  // 1) Custom fadeDurationMs override.
+  let now = 5000;
+  const custom = createController({ holdUntilVisible: true, nowFn: () => now });
+  custom.controller.onFirstPresent();
+  now = 6000;
+  custom.controller.notifyFirstVisibleFrame({ fadeDurationMs: 600 });
+  assert.deepEqual(custom.timer.delays(), [600]);
+  assert.equal(custom.controller.getState().root.style.getPropertyValue('--pg6-splash-fade'), '600ms');
+  now = 6600;
+  custom.timer.flush();
+  assert.equal(custom.controller.getStats().fadeDurationMs, 600);
+  assert.equal(custom.controller.getStats().visible, false);
+  custom.controller.destroy();
+
+  // 2) fadeDurationMs: 0 hides synchronously without scheduling a fade timer.
+  const zero = createController({ holdUntilVisible: true, nowFn: () => 7000 });
+  zero.controller.onFirstPresent();
+  zero.controller.notifyFirstVisibleFrame({ fadeDurationMs: 0 });
+  assert.equal(zero.timer.size, 0);
+  assert.equal(zero.controller.getStats().visible, false);
+  assert.equal(zero.controller.getStats().fadeDurationMs, 0);
+  assert.equal(zero.controller.getStats().firstVisibleFrameMs, 7000);
+  assert.equal(zero.dismissCalls.length, 1);
+  zero.controller.destroy();
+
+  // 3) reducedMotion skips transition delay on notifyFirstVisibleFrame.
+  const reduced = createController({
+    holdUntilVisible: true,
+    reducedMotion: true,
+    nowFn: () => 8000,
+  });
+  reduced.controller.onFirstPresent();
+  assert.equal(reduced.controller.getStats().holdingForVisibleFrame, true);
+  reduced.controller.notifyFirstVisibleFrame();
+  assert.equal(reduced.timer.size, 0);
+  assert.equal(reduced.controller.getStats().visible, false);
+  assert.equal(reduced.controller.getStats().fadeDurationMs, 0);
+  assert.equal(reduced.controller.getStats().dismissReason, DISMISS_REASONS.FIRST_VISIBLE_FRAME);
+  assert.equal(reduced.dismissCalls.length, 1);
+  reduced.controller.destroy();
+});
+
+test('W230: holdFallbackTimeoutMs safety cap prevents infinite splash hang, 0 disables, and destroy/dismiss cancel it', () => {
+  // 1) Custom fallback timeout fires smooth fade-out if notifyFirstVisibleFrame is never called.
+  let now = 10000;
+  const fallback = createController({
+    holdUntilVisible: true,
+    holdFallbackTimeoutMs: 15000,
+    nowFn: () => now,
+  });
+  fallback.controller.onFirstPresent();
+  fallback.controller.setLoadingAssetsProgress({ presents: 45, realPackDraws: 2 });
+  assert.deepEqual(fallback.timer.delays(), [15000]);
+  assert.equal(fallback.dismissCalls.length, 0);
+
+  // Trigger the fallback timeout.
+  now = 25000;
+  fallback.timer.flush();
+  assert.equal(fallback.controller.getStats().holdFallbackTimedOut, true);
+  assert.equal(fallback.controller.getStats().holdingForVisibleFrame, false);
+  assert.equal(fallback.controller.getStats().heldForVisibleFrame, true);
+  assert.equal(fallback.controller.getStats().fading, true);
+  assert.equal(fallback.controller.getStats().visible, true);
+  assert.deepEqual(fallback.timer.delays(), [450]);
+
+  // Complete fade transition.
+  now = 25450;
+  fallback.timer.flush();
+  const stats = fallback.controller.getStats();
+  assert.equal(stats.visible, false);
+  assert.equal(stats.dismissed, true);
+  assert.equal(stats.dismissReason, DISMISS_REASONS.HOLD_FALLBACK_TIMEOUT);
+  assert.equal(stats.holdFallbackTimedOut, true);
+  assert.equal(stats.firstVisibleFrameMs, null);
+  assert.equal(stats.blackPresentsWhileHeld, 45);
+  assert.equal(fallback.dismissCalls.length, 1);
+  fallback.controller.destroy();
+
+  // 2) holdFallbackTimeoutMs: 0 disables fallback timer completely.
+  const disabled = createController({
+    holdUntilVisible: true,
+    holdFallbackTimeoutMs: 0,
+  });
+  disabled.controller.onFirstPresent();
+  disabled.controller.setLoadingAssetsProgress({ presents: 10 });
+  assert.equal(disabled.timer.size, 0);
+  assert.equal(disabled.controller.getStats().holdFallbackTimeoutMs, 0);
+  assert.equal(disabled.controller.getStats().holdingForVisibleFrame, true);
+  disabled.controller.destroy();
+
+  // 3) destroy() cancels pending fallback timer cleanly.
+  const destroyed = createController({
+    holdUntilVisible: true,
+    holdFallbackTimeoutMs: 5000,
+  });
+  destroyed.controller.onFirstPresent();
+  assert.equal(destroyed.timer.size, 1);
+  destroyed.controller.destroy();
+  assert.equal(destroyed.timer.size, 0);
+  destroyed.timer.flush();
+  assert.equal(destroyed.dismissCalls.length, 0);
+
+  // 4) Manual dismissImmediate() during hold cancels pending fallback timer cleanly.
+  const manual = createController({
+    holdUntilVisible: true,
+    holdFallbackTimeoutMs: 5000,
+    nowFn: () => 33000,
+  });
+  manual.controller.onFirstPresent();
+  assert.equal(manual.timer.size, 1);
+  manual.controller.dismissImmediate('user_skip');
+  assert.equal(manual.timer.size, 0);
+  assert.equal(manual.controller.getStats().visible, false);
+  assert.equal(manual.controller.getStats().dismissReason, 'user_skip');
+  assert.equal(manual.controller.getStats().heldForVisibleFrame, true);
+  assert.equal(manual.controller.getStats().holdFallbackTimedOut, false);
+  assert.equal(manual.dismissCalls.length, 1);
+  manual.controller.destroy();
+});
+
+test('W230: frosted dark pill wraps .pg6-splash__status-row (spinner + stage text) with high-contrast CSS', () => {
+  const doc = new MockDocument();
+  const { controller } = createController({ documentObj: doc });
+  const root = controller.getState().root;
+
+  const statusRow = root.querySelector('.pg6-splash__status-row');
+  const stageRow = root.querySelector('.pg6-splash__stage-row');
+  assert.ok(statusRow, '.pg6-splash__status-row must exist');
+  assert.equal(statusRow, stageRow, '.pg6-splash__status-row and .pg6-splash__stage-row alias the same pill row');
+  assert.ok(statusRow.querySelector('.pg6-splash__spinner'), 'spinner must be inside frosted status pill');
+  assert.ok(statusRow.querySelector('.pg6-splash__spinner-ring'), 'spinner ring must be inside frosted status pill');
+  assert.ok(statusRow.querySelector('.pg6-splash__greg'), 'Spinning Greg img must be inside frosted status pill');
+  assert.ok(statusRow.querySelector('.pg6-splash__stage'), 'stage text must be inside frosted status pill');
+
+  const styleEl = doc.head.children.find((el) => el.getAttribute('data-pg6-splash-style') === '1');
+  assert.ok(styleEl);
+  assert.match(styleEl.textContent, /\.pg6-splash__status-row/);
+  assert.match(styleEl.textContent, /backdrop-filter:\s*blur\(/);
+  assert.match(styleEl.textContent, /-webkit-backdrop-filter:\s*blur\(/);
+  assert.match(styleEl.textContent, /background:\s*rgba\(/);
+  assert.match(styleEl.textContent, /border-radius:\s*999px/);
+  controller.destroy();
 });

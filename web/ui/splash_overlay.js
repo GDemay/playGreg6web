@@ -38,6 +38,9 @@
   });
 
   const DEFAULT_FADE_MS = 400;
+  const DEFAULT_VISIBLE_FRAME_FADE_MS = 450;
+  const DEFAULT_HOLD_FALLBACK_TIMEOUT_MS = 240000;
+  const DEFAULT_LOADING_ASSETS_MESSAGE = 'Loading game assets...';
   const DEFAULT_GREG_IMAGE_URL = './assets/greg.png';
   const DEFAULT_GREG_CLICK_THRESHOLD = 3;
   const GREG_SECRET_WORD = 'greg';
@@ -49,8 +52,11 @@
   const DISMISS_REASON_RE = /^[a-z0-9][a-z0-9_.:-]{0,63}$/i;
   const HUD_HIDDEN_VALUES = new Set(['0', 'false', 'off', 'no', 'none', 'hidden']);
   const GREG_ENABLED_VALUES = new Set(['1', 'true', 'on', 'yes']);
+  const SPLASH_HOLD_ENABLED_VALUES = new Set(['1', 'true', 'on', 'yes']);
   const DISMISS_REASONS = Object.freeze({
     FIRST_PRESENT: 'first_present',
+    FIRST_VISIBLE_FRAME: 'first_visible_frame',
+    HOLD_FALLBACK_TIMEOUT: 'hold_fallback_timeout',
     IMMEDIATE: 'immediate',
     HUD_HIDDEN: 'hud_hidden',
     INSTANT_HIDE: 'instant_hide',
@@ -102,7 +108,15 @@
     '__panel{position:relative;z-index:1;width:min(36rem,100%);display:flex;flex-direction:column;gap:0.55rem;}' +
     '.' +
     ROOT_CLASS +
-    '__stage-row{display:flex;align-items:center;gap:0.6rem;min-height:1.5rem;}' +
+    '__stage-row,.' +
+    ROOT_CLASS +
+    '__status-row{' +
+    'display:inline-flex;align-items:center;align-self:flex-start;gap:0.6rem;min-height:1.5rem;' +
+    'max-width:100%;box-sizing:border-box;padding:0.4rem 0.85rem 0.4rem 0.6rem;border-radius:999px;' +
+    'background:rgba(10,16,28,0.68);border:1px solid rgba(255,255,255,0.14);' +
+    'box-shadow:0 4px 18px rgba(0,0,0,0.32);' +
+    'backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);' +
+    '}' +
     '.' +
     ROOT_CLASS +
     '__spinner{position:relative;flex:0 0 auto;width:1.25rem;height:1.25rem;display:inline-flex;' +
@@ -113,7 +127,7 @@
     '.' +
     ROOT_CLASS +
     '__spinner-ring{box-sizing:border-box;width:1.1rem;height:1.1rem;border-radius:50%;' +
-    'border:2px solid rgba(255,255,255,0.18);border-top-color:#6db3ff;animation:pg6-spin 850ms linear infinite;}' +
+    'border:2px solid rgba(255,255,255,0.22);border-top-color:#6db3ff;animation:pg6-spin 850ms linear infinite;}' +
     '.' +
     ROOT_CLASS +
     '__greg{width:1.65rem;height:1.65rem;object-fit:contain;border-radius:50%;' +
@@ -127,10 +141,12 @@
     '__greg[hidden]{display:none!important;}' +
     '.' +
     ROOT_CLASS +
-    '__stage{font-size:0.95rem;letter-spacing:0.04em;opacity:0.95;}' +
+    '__stage{font-size:0.95rem;font-weight:500;letter-spacing:0.04em;opacity:0.98;' +
+    'color:#f3f7ff;text-shadow:0 1px 2px rgba(0,0,0,0.45);}' +
     '.' +
     ROOT_CLASS +
-    '__bar,.pg6-splash__stream{height:0.4rem;border-radius:999px;background:rgba(255,255,255,0.12);overflow:hidden;}' +
+    '__bar,.pg6-splash__stream{height:0.4rem;border-radius:999px;background:rgba(10,16,28,0.52);' +
+    'border:1px solid rgba(255,255,255,0.12);overflow:hidden;}' +
     '.' +
     ROOT_CLASS +
     '__bar-fill,.pg6-splash__stream-fill{height:100%;width:0%;background:#6db3ff;transition:width 180ms ease;}' +
@@ -147,7 +163,8 @@
     'color:#c8e3ff;font-size:0.74rem;letter-spacing:0.03em;line-height:1.25;}' +
     '.' +
     ROOT_CLASS +
-    '__meta{display:flex;justify-content:space-between;gap:1rem;font-size:0.78rem;opacity:0.8;}' +
+    '__meta{display:flex;justify-content:space-between;gap:1rem;font-size:0.78rem;opacity:0.9;' +
+    'text-shadow:0 1px 3px rgba(0,0,0,0.65);}' +
     '.' +
     ROOT_CLASS +
     '__badge{margin-top:0.15rem;padding:0.45rem 0.65rem;border-radius:0.4rem;' +
@@ -300,6 +317,20 @@
   function isGregQuery(search) {
     const value = readLastQueryParam(search, 'greg');
     return value !== null && GREG_ENABLED_VALUES.has(value);
+  }
+
+  /**
+   * Detect whether a URL query string / URLSearchParams / Location enables holding
+   * the splash overlay past `FIRST_PRESENT` until `notifyFirstVisibleFrame()`
+   * (e.g. `?splashHold=1`, `?splashHold=true`, `?splashHold=on`, `?splashHold=yes`).
+   * Never throws.
+   *
+   * @param {unknown} search
+   * @returns {boolean}
+   */
+  function isSplashHoldQuery(search) {
+    const value = readLastQueryParam(search, 'splashhold');
+    return value !== null && SPLASH_HOLD_ENABLED_VALUES.has(value);
   }
 
   function isEditableEventTarget(target) {
@@ -532,6 +563,9 @@
      * @param {boolean} [options.gregMode]
      * @param {number} [options.gregClickThreshold=3]
      * @param {string|null} [options.gregImageUrl]
+     * @param {boolean} [options.holdUntilVisible=false]
+     * @param {number} [options.holdFallbackTimeoutMs=240000]
+     * @param {number} [options.visibleFrameFadeMs=450]
      * @param {boolean} [options.autoMount=true]
      * @param {boolean} [options.visible=true]
      */
@@ -611,6 +645,31 @@
       ) {
         throw new TypeError('gregImageUrl must be a string or null');
       }
+      if (
+        opts.holdUntilVisible !== undefined &&
+        opts.holdUntilVisible !== null &&
+        typeof opts.holdUntilVisible !== 'boolean'
+      ) {
+        throw new TypeError('holdUntilVisible must be a boolean');
+      }
+      if (
+        opts.holdFallbackTimeoutMs !== undefined &&
+        opts.holdFallbackTimeoutMs !== null &&
+        (typeof opts.holdFallbackTimeoutMs !== 'number' ||
+          !Number.isFinite(opts.holdFallbackTimeoutMs) ||
+          opts.holdFallbackTimeoutMs < 0)
+      ) {
+        throw new TypeError('holdFallbackTimeoutMs must be a non-negative finite number');
+      }
+      if (
+        opts.visibleFrameFadeMs !== undefined &&
+        opts.visibleFrameFadeMs !== null &&
+        (typeof opts.visibleFrameFadeMs !== 'number' ||
+          !Number.isFinite(opts.visibleFrameFadeMs) ||
+          opts.visibleFrameFadeMs < 0)
+      ) {
+        throw new TypeError('visibleFrameFadeMs must be a non-negative finite number');
+      }
 
       this._document = doc;
       this._window = opts.windowObj && typeof opts.windowObj === 'object' ? opts.windowObj : null;
@@ -635,6 +694,14 @@
         typeof opts.fadeMs === 'number' && Number.isFinite(opts.fadeMs) && opts.fadeMs >= 0
           ? opts.fadeMs
           : DEFAULT_FADE_MS;
+      this._visibleFrameFadeMs =
+        typeof opts.visibleFrameFadeMs === 'number'
+          ? opts.visibleFrameFadeMs
+          : DEFAULT_VISIBLE_FRAME_FADE_MS;
+      this._holdFallbackTimeoutMs =
+        typeof opts.holdFallbackTimeoutMs === 'number'
+          ? opts.holdFallbackTimeoutMs
+          : DEFAULT_HOLD_FALLBACK_TIMEOUT_MS;
       this._onDismiss = typeof opts.onDismiss === 'function' ? opts.onDismiss : null;
       this._setTimeout =
         typeof opts.setTimeout === 'function'
@@ -662,6 +729,10 @@
         typeof opts.instantHide === 'boolean' ? opts.instantHide : this._hudHidden;
       this._gregMode =
         typeof opts.gregMode === 'boolean' ? opts.gregMode : isGregQuery(searchSource);
+      this._holdUntilVisible =
+        typeof opts.holdUntilVisible === 'boolean'
+          ? opts.holdUntilVisible
+          : isSplashHoldQuery(searchSource);
       this._gregClickCount = 0;
       this._gregKeyBuffer = '';
       this._onSpinnerClick = null;
@@ -676,6 +747,15 @@
       this._dismissed = autoHiddenByHud;
       this._fading = false;
       this._fadeTimer = null;
+      this._holdFallbackTimer = null;
+      this._holdingForVisibleFrame = false;
+      this._heldForVisibleFrame = false;
+      this._holdStartedAtMs = null;
+      this._firstVisibleFrameMs = null;
+      this._blackPresentsWhileHeld = 0;
+      this._loadingPresents = 0;
+      this._loadingRealPackDraws = 0;
+      this._holdFallbackTimedOut = false;
       this._pendingDismissReason = null;
       this._dismissedAtMs = autoHiddenByHud ? this._safeNow() : null;
       this._dismissCount = autoHiddenByHud ? 1 : 0;
@@ -776,7 +856,11 @@
       scripted.hidden = true;
       if (scripted.style) scripted.style.display = 'none';
 
-      const stageRow = createEl(doc, 'div', `${ROOT_CLASS}__stage-row`);
+      const stageRow = createEl(
+        doc,
+        'div',
+        `${ROOT_CLASS}__stage-row ${ROOT_CLASS}__status-row`
+      );
       const spinner = createEl(doc, 'span', `${ROOT_CLASS}__spinner`, {
         'aria-hidden': 'true',
         'data-greg-mode': 'false',
@@ -889,7 +973,10 @@
           img: this._root.querySelector ? this._root.querySelector(`.${ROOT_CLASS}__img`) : null,
           fallback: this._root.querySelector ? this._root.querySelector(`.${ROOT_CLASS}__fallback`) : null,
           scripted: this._root.querySelector ? this._root.querySelector(`.${ROOT_CLASS}__scripted`) : null,
-          stageRow: this._root.querySelector ? this._root.querySelector(`.${ROOT_CLASS}__stage-row`) : null,
+          stageRow: this._root.querySelector
+            ? this._root.querySelector(`.${ROOT_CLASS}__stage-row`) ||
+              this._root.querySelector(`.${ROOT_CLASS}__status-row`)
+            : null,
           spinner: this._root.querySelector ? this._root.querySelector(`.${ROOT_CLASS}__spinner`) : null,
           spinnerRing: this._root.querySelector
             ? this._root.querySelector(`.${ROOT_CLASS}__spinner-ring`)
@@ -1191,8 +1278,30 @@
 
       if (this._root) {
         try {
-          this._root.setAttribute('aria-busy', this._dismissed || this._readyForSplash ? 'false' : 'true');
+          const isBusy =
+            !this._dismissed && (this._holdingForVisibleFrame || !this._readyForSplash);
+          this._root.setAttribute('aria-busy', isBusy ? 'true' : 'false');
           this._root.setAttribute('aria-label', stageText);
+          this._root.setAttribute(
+            'data-holding-for-visible',
+            this._holdingForVisibleFrame ? 'true' : 'false'
+          );
+          const holdClass = `${ROOT_CLASS}--holding`;
+          if (
+            this._root.classList &&
+            typeof this._root.classList.add === 'function' &&
+            typeof this._root.classList.remove === 'function'
+          ) {
+            if (this._holdingForVisibleFrame) {
+              this._root.classList.add(holdClass);
+            } else {
+              this._root.classList.remove(holdClass);
+            }
+          } else if (typeof this._root.className === 'string') {
+            const tokens = this._root.className.split(/\s+/).filter((c) => c && c !== holdClass);
+            if (this._holdingForVisibleFrame) tokens.push(holdClass);
+            this._root.className = tokens.join(' ');
+          }
         } catch {
           // ignore
         }
@@ -1209,6 +1318,43 @@
         this._fadeTimer = null;
       }
       this._fading = false;
+    }
+
+    _clearHoldFallbackTimer() {
+      if (this._holdFallbackTimer !== null && this._holdFallbackTimer !== undefined) {
+        try {
+          this._clearTimeout(this._holdFallbackTimer);
+        } catch {
+          // ignore
+        }
+        this._holdFallbackTimer = null;
+      }
+    }
+
+    _ensureHoldFallbackTimer() {
+      if (
+        this._destroyed ||
+        this._dismissed ||
+        !this._holdingForVisibleFrame ||
+        this._holdFallbackTimer !== null ||
+        this._holdFallbackTimeoutMs <= 0
+      ) {
+        return;
+      }
+      this._holdFallbackTimer = this._setTimeout(() => {
+        this._holdFallbackTimer = null;
+        if (this._destroyed || this._dismissed || !this._holdingForVisibleFrame) {
+          return;
+        }
+        this._holdingForVisibleFrame = false;
+        this._holdFallbackTimedOut = true;
+        this._progressPct = 100;
+        this._syncChrome();
+        this.dismiss({
+          fadeMs: this._visibleFrameFadeMs,
+          reason: DISMISS_REASONS.HOLD_FALLBACK_TIMEOUT,
+        });
+      }, this._holdFallbackTimeoutMs);
     }
 
     _fireDismiss() {
@@ -1239,7 +1385,10 @@
           ? snap.stage.trim().toUpperCase()
           : STAGE_NOT_STARTED;
       this._stageLabel = labelForStage(this._stage);
-      this._progressPct = computeBootProgress(snap);
+      const nextProgress = computeBootProgress(snap);
+      this._progressPct = this._holdingForVisibleFrame
+        ? Math.min(99, Math.max(this._progressPct, nextProgress))
+        : nextProgress;
       this._elapsedMs =
         typeof snap.elapsedMs === 'number' && Number.isFinite(snap.elapsedMs) ? snap.elapsedMs : 0;
       this._readyForSplash = Boolean(snap.readyForSplash) || this._stage === 'FIRST_PRESENT';
@@ -1250,7 +1399,7 @@
 
       if (typeof snap.statusText === 'string' && snap.statusText.trim().length > 0) {
         this._statusText = snap.statusText.trim();
-      } else {
+      } else if (!this._holdingForVisibleFrame) {
         this._statusText = this._stageLabel;
       }
 
@@ -1356,16 +1505,170 @@
     }
 
     /**
-     * Signal that the first WebGPU / Bink frame has been presented and dismiss the overlay.
+     * Update splash stage text and progress while the game streams archives
+     * (e.g. RPF loading between `FIRST_PRESENT` and the first visible frame).
+     * Never dismisses the overlay when `holdUntilVisible` is active.
+     *
+     * @param {{ presents?: number, realPackDraws?: number, message?: string, elapsedMs?: number, progressPct?: number }} [progress]
+     * @returns {object} Current controller state.
+     */
+    setLoadingAssetsProgress(progress = {}) {
+      if (this._destroyed || this._dismissed) {
+        return this.getState();
+      }
+
+      const info = progress && typeof progress === 'object' ? progress : {};
+      if (
+        typeof info.presents === 'number' &&
+        Number.isFinite(info.presents) &&
+        info.presents >= 0
+      ) {
+        this._loadingPresents = Math.floor(info.presents);
+        if (this._holdUntilVisible || this._holdingForVisibleFrame) {
+          this._blackPresentsWhileHeld = this._loadingPresents;
+        }
+      }
+      if (
+        typeof info.realPackDraws === 'number' &&
+        Number.isFinite(info.realPackDraws) &&
+        info.realPackDraws >= 0
+      ) {
+        this._loadingRealPackDraws = Math.floor(info.realPackDraws);
+      }
+      if (
+        typeof info.elapsedMs === 'number' &&
+        Number.isFinite(info.elapsedMs) &&
+        info.elapsedMs >= 0
+      ) {
+        this._elapsedMs = info.elapsedMs;
+      }
+
+      if (this._holdUntilVisible) {
+        this._holdingForVisibleFrame = true;
+        this._heldForVisibleFrame = true;
+        if (this._holdStartedAtMs === null) {
+          this._holdStartedAtMs = this._safeNow();
+        }
+        this._ensureHoldFallbackTimer();
+      }
+
+      if (typeof info.progressPct === 'number' && Number.isFinite(info.progressPct)) {
+        this._progressPct = clampPct(info.progressPct);
+      } else {
+        const presentFactor = Math.min(this._loadingPresents, 300) / 300;
+        const drawFactor = Math.min(this._loadingRealPackDraws, 60) / 60;
+        const computed = 90 + Math.round((drawFactor * 0.7 + presentFactor * 0.3) * 9);
+        this._progressPct = Math.min(99, Math.max(this._progressPct, computed));
+      }
+
+      const cleanMsg =
+        typeof info.message === 'string'
+          ? info.message.replace(/[\x00-\x1F\x7F]+/g, ' ').trim()
+          : '';
+      if (cleanMsg.length > 0) {
+        this._statusText = cleanMsg;
+      } else if (this._loadingRealPackDraws > 0 && this._loadingPresents > 0) {
+        this._statusText = `${DEFAULT_LOADING_ASSETS_MESSAGE} (${this._loadingRealPackDraws} draws, ${this._loadingPresents} frames)`;
+      } else if (this._loadingRealPackDraws > 0) {
+        this._statusText = `${DEFAULT_LOADING_ASSETS_MESSAGE} (${this._loadingRealPackDraws} draws)`;
+      } else if (this._loadingPresents > 0) {
+        this._statusText = `${DEFAULT_LOADING_ASSETS_MESSAGE} (${this._loadingPresents} frames)`;
+      } else {
+        this._statusText = DEFAULT_LOADING_ASSETS_MESSAGE;
+      }
+
+      this._syncChrome();
+      return this.getState();
+    }
+
+    /**
+     * Signal that the first non-black visible frame has rendered and smoothly fade
+     * out the splash overlay (default 450 ms CSS opacity fade). Records
+     * `heldForVisibleFrame`, `firstVisibleFrameMs`, and `blackPresentsWhileHeld`
+     * telemetry. Idempotent once dismissed.
+     *
+     * @param {{ fadeDurationMs?: number, fadeMs?: number, reducedMotion?: boolean, immediate?: boolean, instant?: boolean, instantHide?: boolean, reason?: string }} [options]
+     * @returns {object} Current controller state.
+     */
+    notifyFirstVisibleFrame(options) {
+      if (this._destroyed) {
+        return this.getState();
+      }
+
+      this._clearHoldFallbackTimer();
+      this._holdingForVisibleFrame = false;
+
+      if (this._firstVisibleFrameMs === null) {
+        this._firstVisibleFrameMs = this._safeNow();
+      }
+
+      this._readyForSplash = true;
+      this._stage = 'FIRST_PRESENT';
+      this._stageLabel = labelForStage(this._stage);
+      this._progressPct = 100;
+      if (!this._dismissed) {
+        this._statusText = this._stageLabel;
+        this._syncChrome();
+      }
+
+      const opts = options && typeof options === 'object' ? { ...options } : {};
+      let resolvedFadeMs = this._visibleFrameFadeMs;
+      if (typeof opts.fadeDurationMs === 'number' && Number.isFinite(opts.fadeDurationMs)) {
+        resolvedFadeMs = Math.max(0, opts.fadeDurationMs);
+      } else if (typeof opts.fadeMs === 'number' && Number.isFinite(opts.fadeMs)) {
+        resolvedFadeMs = Math.max(0, opts.fadeMs);
+      }
+      opts.fadeMs = resolvedFadeMs;
+      if (opts.reason === undefined) {
+        opts.reason = DISMISS_REASONS.FIRST_VISIBLE_FRAME;
+      }
+
+      return this.dismiss(opts);
+    }
+
+    /**
+     * Signal that the first WebGPU / Bink frame has been presented and dismiss the overlay
+     * (or enter the smooth loading-assets hold phase when `holdUntilVisible` is enabled).
      * Supports immediate dismissal via `{ immediate: true }`, `{ instant: true }`,
      * `{ instantHide: true }`, `{ fadeMs: 0 }`, constructor `instantHide: true`,
      * `?hud=0`, or `prefers-reduced-motion`.
      *
-     * @param {{ fadeMs?: number, reducedMotion?: boolean, immediate?: boolean, instant?: boolean, instantHide?: boolean, reason?: string }} [options]
+     * @param {{ fadeMs?: number, reducedMotion?: boolean, immediate?: boolean, instant?: boolean, instantHide?: boolean, reason?: string, message?: string }} [options]
      * @returns {object}
      */
     onFirstPresent(options) {
       if (this._destroyed) {
+        return this.getState();
+      }
+      if (this._holdUntilVisible && !this._dismissed) {
+        const opts = options && typeof options === 'object' ? options : {};
+        this._readyForSplash = true;
+        this._stage = 'FIRST_PRESENT';
+        this._stageLabel = labelForStage(this._stage);
+        this._holdingForVisibleFrame = true;
+        this._heldForVisibleFrame = true;
+        if (this._holdStartedAtMs === null) {
+          this._holdStartedAtMs = this._safeNow();
+        }
+        this._blackPresentsWhileHeld += 1;
+        this._loadingPresents = Math.max(this._loadingPresents, this._blackPresentsWhileHeld);
+        this._progressPct = Math.min(99, Math.max(this._progressPct, 90));
+        const customMessage =
+          typeof opts.message === 'string'
+            ? opts.message.replace(/[\x00-\x1F\x7F]+/g, ' ').trim()
+            : '';
+        if (customMessage.length > 0) {
+          this._statusText = customMessage;
+        } else if (
+          !this._statusText ||
+          this._statusText === BOOT_STAGE_LABELS.NOT_STARTED ||
+          this._statusText === this._stageLabel ||
+          Object.values(BOOT_STAGE_LABELS).includes(this._statusText)
+        ) {
+          this._statusText = DEFAULT_LOADING_ASSETS_MESSAGE;
+        }
+        this._ensureHoldFallbackTimer();
+        this._syncChrome();
         return this.getState();
       }
       this._readyForSplash = true;
@@ -1482,13 +1785,19 @@
       const startedAtMs = this._safeNow();
 
       this._dismissed = true;
+      this._holdingForVisibleFrame = false;
       this._pendingDismissReason = resolvedReason;
       this._clearFadeTimer();
+      this._clearHoldFallbackTimer();
       this._syncSpinner();
 
       if (this._root) {
         try {
           this._root.style && this._root.style.setProperty('--pg6-splash-fade', `${effectiveFadeMs}ms`);
+          this._root.setAttribute('data-holding-for-visible', 'false');
+          if (this._root.classList && typeof this._root.classList.remove === 'function') {
+            this._root.classList.remove(`${ROOT_CLASS}--holding`);
+          }
           if (effectiveFadeMs > 0) {
             if (this._root.classList && typeof this._root.classList.add === 'function') {
               this._root.classList.add('pg6-splash--fading');
@@ -1533,8 +1842,10 @@
         return this.getState();
       }
       this._clearFadeTimer();
+      this._clearHoldFallbackTimer();
       this._dismissed = false;
       this._fading = false;
+      this._holdingForVisibleFrame = false;
       this._pendingDismissReason = null;
       if (reset) {
         this._stage = STAGE_NOT_STARTED;
@@ -1545,6 +1856,13 @@
         this._elapsedMs = 0;
         this._badgeText = '';
         this._readyForSplash = false;
+        this._heldForVisibleFrame = false;
+        this._holdStartedAtMs = null;
+        this._firstVisibleFrameMs = null;
+        this._blackPresentsWhileHeld = 0;
+        this._loadingPresents = 0;
+        this._loadingRealPackDraws = 0;
+        this._holdFallbackTimedOut = false;
       }
       if (this._root && this._root.style && typeof this._root.style.setProperty === 'function') {
         try {
@@ -1567,7 +1885,9 @@
       }
       const wasFading = this._fading;
       this._clearFadeTimer();
+      this._clearHoldFallbackTimer();
       this._fading = false;
+      this._holdingForVisibleFrame = false;
       this._pendingDismissReason = null;
       if (wasFading) {
         this._dismissed = false;
@@ -1613,6 +1933,30 @@
         readyForSplash: Boolean(this._readyForSplash),
         scriptedInputPreset: this._scriptedInputPreset,
         gregMode: Boolean(this._gregMode),
+        holdUntilVisible: Boolean(this._holdUntilVisible),
+        holdingForVisibleFrame: Boolean(this._holdingForVisibleFrame),
+        heldForVisibleFrame: Boolean(this._heldForVisibleFrame),
+        firstVisibleFrameMs:
+          typeof this._firstVisibleFrameMs === 'number' &&
+          Number.isFinite(this._firstVisibleFrameMs) &&
+          this._firstVisibleFrameMs >= 0
+            ? this._firstVisibleFrameMs
+            : null,
+        blackPresentsWhileHeld:
+          typeof this._blackPresentsWhileHeld === 'number' &&
+          Number.isFinite(this._blackPresentsWhileHeld) &&
+          this._blackPresentsWhileHeld >= 0
+            ? Math.floor(this._blackPresentsWhileHeld)
+            : 0,
+        loadingRealPackDraws:
+          typeof this._loadingRealPackDraws === 'number' &&
+          Number.isFinite(this._loadingRealPackDraws) &&
+          this._loadingRealPackDraws >= 0
+            ? Math.floor(this._loadingRealPackDraws)
+            : 0,
+        holdFallbackTimeoutMs: this._holdFallbackTimeoutMs,
+        holdFallbackTimedOut: Boolean(this._holdFallbackTimedOut),
+        visibleFrameFadeMs: this._visibleFrameFadeMs,
       };
     }
 
@@ -1646,6 +1990,15 @@
         reducedMotion: this._isReducedMotion(),
         scriptedInputPreset: this._scriptedInputPreset,
         gregMode: Boolean(this._gregMode),
+        holdUntilVisible: Boolean(this._holdUntilVisible),
+        holdingForVisibleFrame: Boolean(this._holdingForVisibleFrame),
+        heldForVisibleFrame: Boolean(this._heldForVisibleFrame),
+        firstVisibleFrameMs: this._firstVisibleFrameMs,
+        blackPresentsWhileHeld: this._blackPresentsWhileHeld,
+        loadingRealPackDraws: this._loadingRealPackDraws,
+        holdFallbackTimeoutMs: this._holdFallbackTimeoutMs,
+        holdFallbackTimedOut: Boolean(this._holdFallbackTimedOut),
+        visibleFrameFadeMs: this._visibleFrameFadeMs,
         root: this._root,
       };
     }
@@ -1657,6 +2010,8 @@
       }
       this._destroyed = true;
       this._clearFadeTimer();
+      this._clearHoldFallbackTimer();
+      this._holdingForVisibleFrame = false;
       this._pendingDismissReason = null;
       this._gregClickCount = 0;
       this._gregKeyBuffer = '';
@@ -1722,8 +2077,12 @@
     sanitizeDismissReason,
     isHudHiddenQuery,
     isGregQuery,
+    isSplashHoldQuery,
     SplashOverlayController,
     DEFAULT_FADE_MS,
+    DEFAULT_VISIBLE_FRAME_FADE_MS,
+    DEFAULT_HOLD_FALLBACK_TIMEOUT_MS,
+    DEFAULT_LOADING_ASSETS_MESSAGE,
     DEFAULT_GREG_IMAGE_URL,
     DEFAULT_GREG_CLICK_THRESHOLD,
     GREG_SECRET_WORD,
