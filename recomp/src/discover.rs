@@ -35,7 +35,7 @@
 //! `O(log n + block length)` and the per-instruction hot path does no heap formatting. Each
 //! jump-table round costs one `O(blocks)` predecessor pass.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use iced_x86::{Decoder, DecoderError, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind};
 
@@ -43,7 +43,7 @@ use crate::cfg::{
     BasicBlock, CallSite, CallTarget, Diagnostic, DiagnosticKind, Edge, Function, JumpTable,
     Terminator, UnresolvedJump,
 };
-use crate::code_image::{CodeImage, Region};
+use crate::code_image::CodeImage;
 use crate::jump_table::{self, Step};
 use crate::reach;
 use crate::reloc::{RelocKind, Relocation, RelocationMap, instruction_relocations};
@@ -51,8 +51,9 @@ use crate::reloc::{RelocKind, Relocation, RelocationMap, instruction_relocations
 /// `int 0x29` is the Windows `__fastfail` trap and never returns.
 const FASTFAIL_VECTOR: u8 = 0x29;
 
-/// Preceding blocks examined when looking for the block that contains an address.
-const CONTAINING_BLOCK_SCAN: usize = 8;
+/// Preceding blocks examined when looking for the block that contains an address (16 covers the
+/// full 15-byte maximum x86-64 instruction width plus the containing block).
+const CONTAINING_BLOCK_SCAN: usize = 16;
 
 /// Longest chain of blocks (the jump's block plus sole predecessors) sliced for a jump table.
 const MAX_TRACE_BLOCKS: usize = 4;
@@ -109,7 +110,7 @@ pub fn discover(image: &CodeImage<'_>) -> Analysis {
         state.add_function(entry);
     }
     for &(owner, target) in &image.eh.resume_targets {
-        state.add_resume_target(owner, target);
+        state.seed_resume_target(owner, target);
     }
     state.run();
     loop {
@@ -156,29 +157,40 @@ fn jump_table_relocations(image: &CodeImage<'_>, table: &JumpTable, out: &mut Ve
     if let Some(index) = table.index {
         push(index.load_site, RelocKind::JumpTableIndex, index.table);
     }
-    for (slot, &target) in (table.table..).step_by(4).zip(&table.targets) {
+    for (index, &target) in table.targets.iter().enumerate() {
+        let Some(offset) = u64::try_from(index).ok().and_then(|i| i.checked_mul(4)) else {
+            break;
+        };
+        let Some(slot) = table.table.checked_add(offset) else {
+            break;
+        };
         push(slot, RelocKind::JumpTableEntry, target);
     }
 }
 
 struct Discovery<'i, 'a> {
     image: &'i CodeImage<'a>,
-    no_return: HashSet<u64>,
+    no_return: BTreeSet<u64>,
     /// Every block decoded so far, keyed by start VA.
     blocks: BTreeMap<u64, BasicBlock>,
     /// Every known block start (decoded or still queued).
     leaders: BTreeSet<u64>,
-    worklist: Vec<u64>,
+    /// Pending block starts popped in ascending VA order for input-order independence.
+    worklist: BTreeSet<u64>,
     entries: BTreeSet<u64>,
     /// `jmp reg` sites decoded since the last jump-table round.
     pending_jumps: BTreeSet<u64>,
     jump_tables: BTreeMap<u64, JumpTable>,
     /// How often each resolved table was revised (see `revise_jump_tables`).
-    table_revisions: HashMap<u64, u32>,
+    table_revisions: BTreeMap<u64, u32>,
     /// `setjmp`-family IAT slots ([`CodeImage::eh`]).
-    setjmp_slots: HashSet<u64>,
+    setjmp_slots: BTreeSet<u64>,
     /// Resume targets with their owning function: `(owner entry, target)`.
     resume_roots: BTreeSet<(u64, u64)>,
+    /// Distinct resume target VAs across [`Self::resume_roots`] for `O(log n)` entry checks.
+    resume_targets: BTreeSet<u64>,
+    /// EH resume targets whose owner has not been discovered as a function entry yet.
+    deferred_resume_targets: BTreeSet<(u64, u64)>,
     /// Return sites of `setjmp`-family calls (owned by every function containing the block).
     return_sites: BTreeSet<u64>,
 }
@@ -190,29 +202,53 @@ impl<'i, 'a> Discovery<'i, 'a> {
             no_return: image.no_return.iter().copied().collect(),
             blocks: BTreeMap::new(),
             leaders: BTreeSet::new(),
-            worklist: Vec::new(),
+            worklist: BTreeSet::new(),
             entries: BTreeSet::new(),
             pending_jumps: BTreeSet::new(),
             jump_tables: BTreeMap::new(),
-            table_revisions: HashMap::new(),
+            table_revisions: BTreeMap::new(),
             setjmp_slots: image.eh.setjmp_slots.iter().copied().collect(),
             resume_roots: BTreeSet::new(),
+            resume_targets: BTreeSet::new(),
+            deferred_resume_targets: BTreeSet::new(),
             return_sites: BTreeSet::new(),
         }
     }
 
+    /// Seeds an EH resume target `(owner, target)`. Non-decodable or out-of-range VAs are ignored;
+    /// targets whose owner is not yet a known function entry are deferred until `owner` is
+    /// discovered so malformed seeds never decode orphan blocks.
+    fn seed_resume_target(&mut self, owner: u64, target: u64) {
+        if self.image.code_bytes(owner).is_err() || self.image.code_bytes(target).is_err() {
+            return;
+        }
+        if self.entries.contains(&owner) {
+            self.add_resume_target(owner, target);
+        } else {
+            self.deferred_resume_targets.insert((owner, target));
+        }
+    }
+
     /// Records `target` as a resume target of `owner` (ignored when it is another function's
-    /// entry). Returns whether it was new.
+    /// entry or not backed by executable bytes). Returns whether it was new.
     fn add_resume_target(&mut self, owner: u64, target: u64) -> bool {
-        if target != owner && self.entries.contains(&target) {
+        if (target != owner && self.entries.contains(&target))
+            || self.image.code_bytes(owner).is_err()
+            || self.image.code_bytes(target).is_err()
+        {
             return false;
         }
         self.add_leader(target);
+        self.resume_targets.insert(target);
         self.resume_roots.insert((owner, target))
     }
 
-    /// Records the return site of a `setjmp`-family call. Returns whether it was new.
+    /// Records the return site of a `setjmp`-family call when it maps to executable code.
+    /// Returns whether it was new.
     fn add_return_site(&mut self, va: u64) -> bool {
+        if self.image.code_bytes(va).is_err() {
+            return false;
+        }
         self.add_leader(va);
         self.return_sites.insert(va)
     }
@@ -226,25 +262,42 @@ impl<'i, 'a> Discovery<'i, 'a> {
         })
     }
 
-    /// Resume targets that need the complete block map: return sites of direct calls to
-    /// `setjmp` thunks and address-taken interior code (see the module docs). Returns whether
-    /// anything new was found.
+    /// Resume targets that need the complete block map: deferred EH resume targets whose owner
+    /// was discovered via calls, return sites of direct calls to `setjmp` thunks, and
+    /// address-taken interior code (see the module docs). Returns whether anything new was found.
     fn add_late_resume_targets(&mut self) -> bool {
+        let mut progress = false;
+        if !self.deferred_resume_targets.is_empty() {
+            let ready: Vec<(u64, u64)> = self
+                .deferred_resume_targets
+                .iter()
+                .copied()
+                .filter(|(owner, _)| self.entries.contains(owner))
+                .collect();
+            for pair in ready {
+                self.deferred_resume_targets.remove(&pair);
+                progress |= self.add_resume_target(pair.0, pair.1);
+            }
+        }
         let table = &self.image.function_table;
         if table.is_empty() && self.setjmp_slots.is_empty() {
-            return false;
+            return progress;
         }
         let mut sites = Vec::new();
         let mut interior = Vec::new();
         for block in self.blocks.values() {
             for call in &block.calls {
                 if let CallTarget::Direct(target) = call.target
+                    && !self.no_return.contains(&target)
                     && self.is_setjmp_thunk(target)
                     && let Ok(index) = block
                         .instructions
                         .binary_search_by_key(&call.site, Instruction::ip)
                 {
-                    sites.push(block.instructions[index].next_ip());
+                    let instr = &block.instructions[index];
+                    if let Some(next) = instr.ip().checked_add(instr.len() as u64) {
+                        sites.push(next);
+                    }
                 }
             }
             if table.is_empty() {
@@ -256,7 +309,7 @@ impl<'i, 'a> Discovery<'i, 'a> {
                 }
                 let target = instr.ip_rel_memory_address();
                 if self.entries.contains(&target)
-                    || self.image.region_of(target) != Region::Code
+                    || self.image.code_bytes(target).is_err()
                     || matches!(self.locate(target), Decoded::InsideInstruction)
                 {
                     continue;
@@ -268,7 +321,6 @@ impl<'i, 'a> Discovery<'i, 'a> {
                 }
             }
         }
-        let mut progress = false;
         for site in sites {
             progress |= self.add_return_site(site);
         }
@@ -280,7 +332,7 @@ impl<'i, 'a> Discovery<'i, 'a> {
 
     fn add_leader(&mut self, va: u64) {
         if self.leaders.insert(va) {
-            self.worklist.push(va);
+            self.worklist.insert(va);
         }
     }
 
@@ -290,7 +342,7 @@ impl<'i, 'a> Discovery<'i, 'a> {
     }
 
     fn run(&mut self) {
-        while let Some(va) = self.worklist.pop() {
+        while let Some(va) = self.worklist.pop_first() {
             if self.blocks.contains_key(&va) {
                 continue;
             }
@@ -328,13 +380,23 @@ impl<'i, 'a> Discovery<'i, 'a> {
 
     /// Split the block at `start` so that its `index`-th instruction starts a new block.
     fn split(&mut self, start: u64, index: usize) {
+        if index == 0 {
+            return;
+        }
+        let Some(at) = self
+            .blocks
+            .get(&start)
+            .and_then(|head| head.instructions.get(index))
+            .map(Instruction::ip)
+        else {
+            return;
+        };
+        if self.blocks.contains_key(&at) {
+            return;
+        }
         let Some(head) = self.blocks.get_mut(&start) else {
             return;
         };
-        if index == 0 || index >= head.instructions.len() {
-            return;
-        }
-        let at = head.instructions[index].ip();
         let call_split = head.calls.partition_point(|c| c.site < at);
         let diag_split = head.diagnostics.partition_point(|d| d.site < at);
         let tail = BasicBlock {
@@ -351,9 +413,9 @@ impl<'i, 'a> Discovery<'i, 'a> {
         self.blocks.insert(at, tail);
     }
 
-    /// First known leader at or after `va` (`u64::MAX` if none).
-    fn next_leader_from(&self, va: u64) -> u64 {
-        self.leaders.range(va..).next().copied().unwrap_or(u64::MAX)
+    /// First known leader at or after `va`, if any.
+    fn next_leader_from(&self, va: u64) -> Option<u64> {
+        self.leaders.range(va..).next().copied()
     }
 
     fn decode_block(&mut self, start: u64, overlaps: bool) {
@@ -371,6 +433,10 @@ impl<'i, 'a> Discovery<'i, 'a> {
                 return;
             }
         };
+        // Clamp to the end of the 64-bit address space so instruction IPs cannot wrap past
+        // `u64::MAX`.
+        let max_len = usize::try_from(u64::MAX - start).unwrap_or(usize::MAX);
+        let bytes = &bytes[..bytes.len().min(max_len)];
         if overlaps {
             block.diagnostics.push(Diagnostic {
                 site: start,
@@ -383,13 +449,13 @@ impl<'i, 'a> Discovery<'i, 'a> {
         let mut instr = Instruction::default();
         let mut stop_at = start
             .checked_add(1)
-            .map_or(u64::MAX, |va| self.next_leader_from(va));
+            .and_then(|va| self.next_leader_from(va));
         // Set once this stream is out of step with already decoded code; it then stops as soon as
         // it lands on an existing instruction boundary instead of duplicating that block's tail.
         let mut misaligned = overlaps;
         loop {
             let ip = decoder.ip();
-            if ip == stop_at {
+            if stop_at == Some(ip) {
                 block.successors.push(Edge::Fallthrough(ip));
                 break;
             }
@@ -427,12 +493,23 @@ impl<'i, 'a> Discovery<'i, 'a> {
                 });
                 break;
             }
-            let next = instr.next_ip();
-            if stop_at > ip && stop_at < next {
+            let Some(next) = ip.checked_add(instr.len() as u64) else {
+                block.terminator = Terminator::Invalid;
+                block.diagnostics.push(Diagnostic {
+                    site: ip,
+                    address: ip,
+                    kind: DiagnosticKind::TruncatedInstruction,
+                });
+                break;
+            };
+            if let Some(leader) = stop_at
+                && leader > ip
+                && leader < next
+            {
                 // This instruction straddles a known leader: keep decoding this stream.
                 block.diagnostics.push(Diagnostic {
                     site: ip,
-                    address: stop_at,
+                    address: leader,
                     kind: DiagnosticKind::OverlappingInstruction,
                 });
                 stop_at = self.next_leader_from(next);
@@ -441,7 +518,7 @@ impl<'i, 'a> Discovery<'i, 'a> {
             block.instructions.push(instr);
             block.end = next;
 
-            if let Some(terminator) = self.classify(&instr, &mut block, &mut stop_at) {
+            if let Some(terminator) = self.classify(&instr, next, &mut block, &mut stop_at) {
                 block.terminator = terminator;
                 break;
             }
@@ -454,8 +531,9 @@ impl<'i, 'a> Discovery<'i, 'a> {
     fn classify(
         &mut self,
         instr: &Instruction,
+        next: u64,
         block: &mut BasicBlock,
-        stop_at: &mut u64,
+        stop_at: &mut Option<u64>,
     ) -> Option<Terminator> {
         let ip = instr.ip();
         match instr.flow_control() {
@@ -468,8 +546,8 @@ impl<'i, 'a> Discovery<'i, 'a> {
                 match self.image.code_bytes(target) {
                     Ok(_) => {
                         self.add_function(target);
-                        if target > ip && target < *stop_at {
-                            *stop_at = target;
+                        if target >= next && stop_at.is_none_or(|s| target < s) {
+                            *stop_at = Some(target);
                         }
                     }
                     Err(kind) => block.diagnostics.push(Diagnostic {
@@ -488,13 +566,14 @@ impl<'i, 'a> Discovery<'i, 'a> {
                     site: ip,
                     target: CallTarget::Indirect { slot },
                 });
-                if slot.is_some_and(|s| self.setjmp_slots.contains(&s)) {
-                    let next = instr.next_ip();
-                    self.add_return_site(next);
-                    *stop_at = (*stop_at).min(next);
+                let is_no_return = slot.is_some_and(|s| self.no_return.contains(&s));
+                if !is_no_return
+                    && slot.is_some_and(|s| self.setjmp_slots.contains(&s))
+                    && self.add_return_site(next)
+                {
+                    *stop_at = Some(stop_at.map_or(next, |s| s.min(next)));
                 }
-                slot.filter(|s| self.no_return.contains(s))
-                    .map(|_| Terminator::NoReturnCall)
+                is_no_return.then_some(Terminator::NoReturnCall)
             }
             FlowControl::UnconditionalBranch if instr.op_kind(0) == OpKind::NearBranch64 => {
                 let target = instr.near_branch64();
@@ -511,9 +590,9 @@ impl<'i, 'a> Discovery<'i, 'a> {
                 }
                 Some(Terminator::IndirectJump)
             }
-            FlowControl::ConditionalBranch => self.branch(instr, block),
+            FlowControl::ConditionalBranch => self.branch(instr, next, block),
             FlowControl::XbeginXabortXend if instr.mnemonic() == Mnemonic::Xbegin => {
-                self.branch(instr, block)
+                self.branch(instr, next, block)
             }
             FlowControl::Return => {
                 block.successors.push(Edge::Return);
@@ -534,9 +613,13 @@ impl<'i, 'a> Discovery<'i, 'a> {
         }
     }
 
-    fn branch(&mut self, instr: &Instruction, block: &mut BasicBlock) -> Option<Terminator> {
+    fn branch(
+        &mut self,
+        instr: &Instruction,
+        next: u64,
+        block: &mut BasicBlock,
+    ) -> Option<Terminator> {
         let taken = instr.near_branch_target();
-        let next = instr.next_ip();
         block.successors.push(Edge::Taken(taken));
         block.successors.push(Edge::Fallthrough(next));
         self.add_leader(taken);
@@ -545,15 +628,15 @@ impl<'i, 'a> Discovery<'i, 'a> {
     }
 
     /// Incoming intra-function edges of every block.
-    fn predecessors(&self) -> HashMap<u64, Pred> {
-        let mut preds: HashMap<u64, Pred> = HashMap::new();
+    fn predecessors(&self) -> BTreeMap<u64, Pred> {
+        let mut preds: BTreeMap<u64, Pred> = BTreeMap::new();
         for (&from, block) in &self.blocks {
             for &edge in &block.successors {
                 if let Some(target) = edge.intra_target() {
                     preds
                         .entry(target)
                         .and_modify(|p| {
-                            p.count += 1;
+                            p.count = p.count.saturating_add(1);
                             p.others.push(from);
                         })
                         .or_insert(Pred {
@@ -580,7 +663,7 @@ impl<'i, 'a> Discovery<'i, 'a> {
 
     /// The jump at `site` together with its chain of sole predecessors, and the first block of
     /// that chain.
-    fn jump_trace(&self, site: u64, preds: &HashMap<u64, Pred>) -> Option<(Vec<Step<'_>>, u64)> {
+    fn jump_trace(&self, site: u64, preds: &BTreeMap<u64, Pred>) -> Option<(Vec<Step<'_>>, u64)> {
         let start = self.jump_block(site)?;
         let mut chain = vec![(self.blocks.get(&start)?, None)];
         let mut current = start;
@@ -588,6 +671,9 @@ impl<'i, 'a> Discovery<'i, 'a> {
             let Some(pred) = preds.get(&current).filter(|p| p.count == 1) else {
                 break;
             };
+            if chain.iter().any(|(b, _)| b.start == pred.from) {
+                break;
+            }
             let Some(prev) = self.blocks.get(&pred.from) else {
                 break;
             };
@@ -628,7 +714,7 @@ impl<'i, 'a> Discovery<'i, 'a> {
         &self,
         trace: &[Step<'_>],
         first_block: u64,
-        preds: &HashMap<u64, Pred>,
+        preds: &BTreeMap<u64, Pred>,
     ) -> Option<(Vec<(Instruction, bool)>, Vec<(Instruction, bool)>)> {
         let live = live_in_registers(trace);
         if live.is_empty() {
@@ -645,7 +731,7 @@ impl<'i, 'a> Discovery<'i, 'a> {
         let is_entry = |b: u64| {
             self.entries.contains(&b)
                 || self.return_sites.contains(&b)
-                || self.resume_roots.iter().any(|&(_, target)| target == b)
+                || self.resume_targets.contains(&b)
         };
         let values =
             reach::reaching_values(&self.blocks, &preds_of, &is_entry, first_block, &live)?;
@@ -666,12 +752,13 @@ impl<'i, 'a> Discovery<'i, 'a> {
     /// the extent of a leaf function, which has no `.pdata` range ([`jump_table::resolve_in`]).
     fn leaf_extent(&self, site: u64) -> Option<(u64, u64)> {
         let entry = *self.entries.range(..=site).next_back()?;
-        let next = *self.entries.range(site + 1..).next()?;
+        let after = site.checked_add(1)?;
+        let next = *self.entries.range(after..).next()?;
         Some((entry, next))
     }
 
     /// Slice the jump at `site` together with its chain of sole predecessors.
-    fn match_jump_table(&self, site: u64, preds: &HashMap<u64, Pred>) -> Option<JumpTable> {
+    fn match_jump_table(&self, site: u64, preds: &BTreeMap<u64, Pred>) -> Option<JumpTable> {
         let (trace, first_block) = self.jump_trace(site, preds)?;
         let leaf = self.leaf_extent(site);
         let direct = jump_table::resolve_in(self.image, &trace, leaf);
@@ -789,7 +876,8 @@ impl<'i, 'a> Discovery<'i, 'a> {
             .collect();
         let progress = !changed.is_empty();
         for table in changed {
-            *self.table_revisions.entry(table.site).or_insert(0) += 1;
+            let revisions = self.table_revisions.entry(table.site).or_insert(0);
+            *revisions = revisions.saturating_add(1);
             if let Some(block) = self
                 .jump_block(table.site)
                 .and_then(|start| self.blocks.get_mut(&start))
@@ -836,7 +924,7 @@ impl<'i, 'a> Discovery<'i, 'a> {
     /// Phase 2: assign blocks to functions and classify tail calls.
     fn into_functions(mut self) -> BTreeMap<u64, Function> {
         let entries: Vec<u64> = self.entries.iter().copied().collect();
-        let mut roots: HashMap<u64, Vec<u64>> = HashMap::new();
+        let mut roots: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
         // A target that became another function's entry after it was recorded is that
         // function's entry, not a resume target.
         for &(owner, target) in &self.resume_roots {
@@ -847,8 +935,8 @@ impl<'i, 'a> Discovery<'i, 'a> {
 
         // Membership: blocks reachable from each entry through intra-function edges.
         let mut members: Vec<Vec<u64>> = Vec::with_capacity(entries.len());
-        let mut refcount: HashMap<u64, u32> = HashMap::new();
-        let mut seen: HashSet<u64> = HashSet::new();
+        let mut refcount: BTreeMap<u64, usize> = BTreeMap::new();
+        let mut seen: BTreeSet<u64> = BTreeSet::new();
         let mut stack: Vec<u64> = Vec::new();
         for &entry in &entries {
             seen.clear();
@@ -872,7 +960,8 @@ impl<'i, 'a> Discovery<'i, 'a> {
                 }
             }
             for &va in &list {
-                *refcount.entry(va).or_default() += 1;
+                let count = refcount.entry(va).or_default();
+                *count = count.saturating_add(1);
             }
             members.push(list);
         }
@@ -888,7 +977,7 @@ impl<'i, 'a> Discovery<'i, 'a> {
             };
             for va in list {
                 let remaining = refcount.get_mut(&va).map(|count| {
-                    *count -= 1;
+                    *count = count.saturating_sub(1);
                     *count
                 });
                 let block = if remaining == Some(0) {
@@ -941,9 +1030,6 @@ fn prefixed<'a>(prefix: &'a [(Instruction, bool)], trace: &[Step<'a>]) -> Vec<St
     out
 }
 
-/// Slot VA read by a RIP-relative indirect `call`/`jmp`.
-/// `lea reg, [rip+X]` with `ip_rel_memory_address() == va`, decoded from its encoding (`disp32`
-/// 0 at `ip = va - 7`), so the slicer sees exactly what such an instruction in the image would be.
 /// 64-bit general purpose registers (other than `rsp`) the trace reads before it writes them.
 fn live_in_registers(trace: &[Step<'_>]) -> Vec<iced_x86::Register> {
     use iced_x86::OpAccess;
@@ -967,7 +1053,10 @@ fn live_in_registers(trace: &[Step<'_>]) -> Vec<iced_x86::Register> {
         }
         for u in &used {
             let full = u.register().full_register();
-            if full.is_gpr64() && matches!(u.access(), OpAccess::Write | OpAccess::ReadWrite) {
+            if full.is_gpr64()
+                && matches!(u.access(), OpAccess::Write | OpAccess::ReadWrite)
+                && !written.contains(&full)
+            {
                 written.push(full);
             }
         }
@@ -975,6 +1064,7 @@ fn live_in_registers(trace: &[Step<'_>]) -> Vec<iced_x86::Register> {
     live
 }
 
+/// Slot VA read by a RIP-relative indirect `call`/`jmp`.
 fn rip_slot(instr: &Instruction) -> Option<u64> {
     (instr.op_count() > 0 && instr.op_kind(0) == OpKind::Memory && instr.is_ip_rel_memory_operand())
         .then(|| instr.ip_rel_memory_address())
@@ -1815,5 +1905,294 @@ mod tests {
             first.callees.iter().copied().collect::<Vec<_>>(),
             [TEXT + 6]
         );
+    }
+
+    #[test]
+    fn overlapping_entries_are_order_independent() {
+        // 0: mov eax, 0xc3 (bytes 0..5; byte 1 is also `ret`), 5: ret.
+        let code = [0xb8, 0xc3, 0x00, 0x00, 0x00, 0xc3];
+        let forward = analyze(&code, &[0, 1]);
+        let reversed = analyze(&code, &[1, 0]);
+        let duplicated = analyze(&code, &[1, 0, 1, 0]);
+        assert_eq!(forward, reversed);
+        assert_eq!(forward, duplicated);
+
+        let f0 = func(&forward, 0);
+        let f1 = func(&forward, 1);
+        assert!(
+            f0.diagnostics()
+                .any(|d| d.kind == DiagnosticKind::OverlappingInstruction && d.address == TEXT + 1)
+        );
+        assert!(
+            f1.diagnostics()
+                .any(|d| d.kind == DiagnosticKind::OverlappingInstruction && d.address == TEXT + 1)
+        );
+        assert_eq!(block(f1, 1).terminator, Terminator::Return);
+    }
+
+    #[test]
+    fn direct_call_into_own_interior_preserves_subsequent_leader_boundary() {
+        // 0: call TEXT+1 (5 bytes: e8 fc ff ff ff), 5: nop, 6: ret.
+        let code = [0xe8, 0xfc, 0xff, 0xff, 0xff, 0x90, 0xc3];
+        let forward = analyze(&code, &[0, 6]);
+        let reversed = analyze(&code, &[6, 0]);
+        assert_eq!(forward, reversed);
+
+        let f0 = func(&forward, 0);
+        assert_eq!(block_starts(f0), [0]);
+        let b0 = block(f0, 0);
+        assert_eq!(instr_offsets(b0), [0, 5]);
+        assert_eq!(b0.end, TEXT + 6);
+        assert_eq!(b0.terminator, Terminator::Fallthrough);
+        assert_eq!(b0.successors, [Edge::TailCall(TEXT + 6)]);
+
+        let f1 = func(&forward, 1);
+        assert!(
+            f1.diagnostics()
+                .any(|d| d.kind == DiagnosticKind::OverlappingInstruction && d.address == TEXT + 1)
+        );
+        assert_eq!(block_starts(func(&forward, 6)), [6]);
+    }
+
+    #[test]
+    fn malformed_eh_resume_targets_are_ignored_and_deferred_callees_are_attached() {
+        // 0: call 0x10; ret; 10: nop; nop; ret; 18: mov eax, 1; jmp 0x11
+        let code = [
+            0xe8, 0x0b, 0x00, 0x00, 0x00, // 0: call 0x10
+            0xc3, // 5: ret
+            0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, // 6..f: padding
+            0x90, // 10: nop (callee entry, discovered via call)
+            0x90, // 11: nop
+            0xc3, // 12: ret
+            0xcc, 0xcc, 0xcc, 0xcc, 0xcc, // 13..17: padding
+            0xb8, 0x01, 0x00, 0x00, 0x00, // 18: mov eax, 1 (unwinder-only continuation)
+            0xeb, 0xf2, // 1d: jmp 0x11
+        ];
+        let mut text_section = CodeSection::new(TEXT, &code, true);
+        // Executable zero-fill tail at TEXT+0x20..TEXT+0x100 (Region::Code, not decodable).
+        text_section.virtual_size = 0x100;
+
+        let build = |resume_targets: Vec<(u64, u64)>, entries: Vec<u64>| {
+            let mut image = CodeImage::new(
+                BASE,
+                vec![text_section, CodeSection::new(DATA, &DATA_BYTES, false)],
+                entries,
+            );
+            image.eh = crate::eh::EhSeeds {
+                resume_targets,
+                ..Default::default()
+            };
+            discover(&image)
+        };
+
+        let valid_deferred = (TEXT + 0x10, TEXT + 0x18);
+        let seeds_a = vec![
+            valid_deferred,
+            (TEXT, DATA),                  // non-executable target
+            (TEXT, 0),                     // unmapped target
+            (TEXT, u64::MAX),              // max VA target
+            (TEXT, TEXT + 0x40),           // zero-fill executable tail
+            (DATA, TEXT + 0x11),           // non-executable owner
+            (u64::MAX, TEXT + 0x11),       // unmapped owner
+            (TEXT + 0x13, TEXT + 0x18),    // uncalled code owner (never a function)
+            valid_deferred,                // duplicate
+        ];
+        let mut seeds_b = seeds_a.clone();
+        seeds_b.reverse();
+
+        let a = build(seeds_a, vec![TEXT]);
+        let b = build(seeds_b, vec![TEXT, TEXT]);
+        assert_eq!(a, b);
+
+        assert_eq!(
+            a.functions.keys().copied().collect::<Vec<_>>(),
+            [TEXT, TEXT + 0x10]
+        );
+        assert!(func(&a, 0).resume_targets.is_empty());
+        assert_eq!(func(&a, 0).diagnostics().count(), 0);
+        let callee = func(&a, 0x10);
+        assert_eq!(resume_offsets(callee), [0x18]);
+        assert_eq!(block_starts(callee), [0x10, 0x11, 0x18]);
+        assert_eq!(callee.diagnostics().count(), 0);
+    }
+
+    #[test]
+    fn late_lea_into_zero_fill_tail_and_setjmp_at_eof_are_bounds_checked() {
+        // 0: lea rax, [rip + 0x39] -> TEXT + 0x40 (zero-fill tail of .text)
+        // 7: call [rip + slot] -> DATA (setjmp at section EOF)
+        let slot_call = (DATA as i64 - (TEXT as i64 + 0xd)) as i32;
+        let code = [
+            &[0x48, 0x8d, 0x05, 0x39, 0x00, 0x00, 0x00][..],
+            &[0xff, 0x15],
+            &slot_call.to_le_bytes(),
+        ]
+        .concat();
+        let mut text_section = CodeSection::new(TEXT, &code, true);
+        text_section.virtual_size = 0x100;
+        let mut image = CodeImage::new(
+            BASE,
+            vec![text_section, CodeSection::new(DATA, &DATA_BYTES, false)],
+            vec![TEXT],
+        );
+        image.eh = crate::eh::EhSeeds {
+            setjmp_slots: vec![DATA],
+            ..Default::default()
+        };
+        image.function_table = crate::pdata::FunctionTable::new(vec![crate::pdata::FunctionRange {
+            start: TEXT,
+            end: TEXT + 0x100,
+            function: TEXT,
+        }]);
+
+        let analysis = discover(&image);
+        let f = func(&analysis, 0);
+        assert!(
+            f.resume_targets.is_empty(),
+            "unmapped EOF and zero-fill targets must not be resume targets"
+        );
+        assert_eq!(block_starts(f), [0, 0xd]);
+        assert_eq!(
+            block(f, 0xd).diagnostics[0].kind,
+            DiagnosticKind::NotExecutable
+        );
+    }
+
+    #[test]
+    fn addresses_near_u64_max_do_not_overflow_or_wrap() {
+        // 3 bytes placed at u64::MAX - 2: byte 2 would sit at u64::MAX and wrap to 0 if decoded.
+        let high_start = u64::MAX - 2;
+        let nops = [0x90, 0x90, 0x90];
+        let image = CodeImage::new(
+            high_start,
+            vec![CodeSection::new(high_start, &nops, true)],
+            vec![high_start, 0],
+        );
+        let analysis = discover(&image);
+
+        let f_high = analysis.function(high_start).expect("high function");
+        let b_high = f_high.blocks.get(&high_start).expect("high block");
+        assert_eq!(b_high.start, high_start);
+        assert_eq!(b_high.end, u64::MAX);
+        assert_eq!(b_high.instructions.len(), 2);
+        assert_eq!(b_high.successors, [Edge::Fallthrough(u64::MAX)]);
+
+        let b_max = f_high.blocks.get(&u64::MAX).expect("u64::MAX block");
+        assert_eq!(b_max.terminator, Terminator::Invalid);
+        assert_eq!(b_max.diagnostics[0].kind, DiagnosticKind::Unmapped);
+
+        // When u64::MAX is itself an entry point, fallthrough becomes a tail call cleanly.
+        let image_with_max = CodeImage::new(
+            high_start,
+            vec![CodeSection::new(high_start, &nops, true)],
+            vec![high_start, u64::MAX, 0],
+        );
+        let analysis_with_max = discover(&image_with_max);
+        assert_eq!(
+            analysis_with_max
+                .function(high_start)
+                .and_then(|f| f.entry_block())
+                .map(|b| b.successors.as_slice()),
+            Some(&[Edge::TailCall(u64::MAX)][..])
+        );
+        assert_eq!(
+            analysis_with_max
+                .function(u64::MAX)
+                .and_then(|f| f.entry_block())
+                .map(|b| b.diagnostics[0].kind),
+            Some(DiagnosticKind::Unmapped)
+        );
+
+        assert_eq!(
+            analysis
+                .function(0)
+                .and_then(|f| f.entry_block())
+                .map(|b| b.terminator),
+            Some(Terminator::Invalid)
+        );
+
+        // Multi-byte instruction crossing u64::MAX becomes TruncatedInstruction, never wraps.
+        let trunc_start = u64::MAX - 1;
+        let mov = [0x48, 0x89, 0xc8];
+        let trunc_image = CodeImage::new(
+            trunc_start,
+            vec![CodeSection::new(trunc_start, &mov, true)],
+            vec![trunc_start],
+        );
+        let trunc_analysis = discover(&trunc_image);
+        let b_trunc = trunc_analysis
+            .function(trunc_start)
+            .and_then(|f| f.entry_block())
+            .expect("truncated block");
+        assert!(b_trunc.instructions.is_empty());
+        assert_eq!(b_trunc.terminator, Terminator::Invalid);
+        assert_eq!(
+            b_trunc.diagnostics[0].kind,
+            DiagnosticKind::TruncatedInstruction
+        );
+
+        // `leaf_extent` at u64::MAX must not overflow `site + 1`.
+        let mut state = Discovery::new(&image);
+        state.add_function(high_start);
+        state.add_function(u64::MAX);
+        assert_eq!(state.leaf_extent(u64::MAX), None);
+
+        // `jump_table_relocations` near u64::MAX must not overflow `(table.table..).step_by(4)`.
+        let table = JumpTable {
+            site: high_start,
+            load_site: high_start,
+            table: u64::MAX - 2,
+            targets: vec![high_start, high_start + 1, high_start + 2],
+            index: None,
+            inferred: false,
+        };
+        let mut relocs = Vec::new();
+        jump_table_relocations(&image, &table, &mut relocs);
+        assert_eq!(
+            relocs
+                .iter()
+                .filter(|r| r.kind == RelocKind::JumpTableEntry)
+                .map(|r| r.site)
+                .collect::<Vec<_>>(),
+            vec![u64::MAX - 2]
+        );
+    }
+
+    #[test]
+    fn jump_trace_breaks_cycles_without_duplicating_blocks() {
+        // 0: ret (entry)
+        // 2: jmp 4 (unwinder-only cycle head; sole predecessor is block 4)
+        // 4: test ecx, ecx; je 2; jmp rax (sole predecessor is block 2)
+        let code = [
+            0xc3, // 0: ret
+            0xcc, // 1: padding
+            0xeb, 0x00, // 2: jmp 4
+            0x85, 0xc9, // 4: test ecx, ecx
+            0x74, 0xfa, // 6: je 2
+            0xff, 0xe0, // 8: jmp rax
+        ];
+        let eh = crate::eh::EhSeeds {
+            resume_targets: vec![(TEXT, TEXT + 2)],
+            ..Default::default()
+        };
+        let mut image = CodeImage::new(
+            BASE,
+            vec![
+                CodeSection::new(TEXT, &code, true),
+                CodeSection::new(DATA, &DATA_BYTES, false),
+            ],
+            vec![TEXT],
+        );
+        image.eh = eh;
+        let mut state = Discovery::new(&image);
+        state.add_function(TEXT);
+        state.seed_resume_target(TEXT, TEXT + 2);
+        state.run();
+        let preds = state.predecessors();
+        let (trace, first_block) = state
+            .jump_trace(TEXT + 8, &preds)
+            .expect("jump trace exists");
+        assert_eq!(first_block, TEXT + 2);
+        let ips: Vec<u64> = trace.iter().map(|s| s.instr.ip() - TEXT).collect();
+        assert_eq!(ips, [2, 4, 6, 8]);
     }
 }
