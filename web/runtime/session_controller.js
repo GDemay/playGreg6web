@@ -28,8 +28,10 @@ export const BOOT_MODE = Object.freeze({
 
 export const DEFAULT_STATUS_URL = '/api/status';
 export const DEFAULT_MAX_VALIDATION_ERRORS = 32;
+export const DEFAULT_MAX_TRANSITION_HISTORY = 64;
 
 const MAX_VALIDATION_ERROR_MESSAGE_LENGTH = 512;
+const MAX_TRANSITION_REASON_LENGTH = 256;
 const MAX_SIDE_MODULE_URLS = 256;
 const HOST_UNIX_PATH_PREFIX_RE =
   /^\/(?:Users|home|var|tmp|private|etc|opt|usr|Volumes|mnt|root|Library|Applications|System)(?:\/|$)/i;
@@ -467,6 +469,26 @@ function evaluateRequirements(capabilities) {
   return { missing, reasons };
 }
 
+function createEmptyStateDurations() {
+  return {
+    [SESSION_STATE.IDLE]: 0,
+    [SESSION_STATE.PROBING]: 0,
+    [SESSION_STATE.STARTING]: 0,
+    [SESSION_STATE.RUNNING_WASM]: 0,
+    [SESSION_STATE.RUNNING_SMOKE]: 0,
+    [SESSION_STATE.STOPPED]: 0,
+    [SESSION_STATE.ERROR]: 0,
+  };
+}
+
+function sanitizeTransitionReason(rawReason) {
+  if (typeof rawReason !== 'string') {
+    return null;
+  }
+  const clean = sanitizeDiagnosticText(rawReason, MAX_TRANSITION_REASON_LENGTH);
+  return clean.length > 0 ? clean : null;
+}
+
 function defaultFetchImpl() {
   if (typeof globalThis !== 'undefined' && typeof globalThis.fetch === 'function') {
     return globalThis.fetch.bind(globalThis);
@@ -489,6 +511,8 @@ export class RuntimeSessionController {
    * @param {Function|null} [options.startSmokeDemo=null]
    * @param {Function|null} [options.capabilityProbe=null]
    * @param {() => number} [options.now]
+   * @param {() => number} [options.nowFn]
+   * @param {number} [options.maxTransitionHistory=64]
    * @param {number} [options.hudIntervalMs]
    * @param {EventTarget} [options.audioGestureTarget]
    */
@@ -509,11 +533,13 @@ export class RuntimeSessionController {
       startWasmRuntime = null,
       startSmokeDemo = null,
       capabilityProbe = null,
-      now = () => Date.now(),
+      now,
+      nowFn,
       hudIntervalMs,
       audioGestureTarget,
       wgpuWorker = null,
       maxValidationErrors = DEFAULT_MAX_VALIDATION_ERRORS,
+      maxTransitionHistory = DEFAULT_MAX_TRANSITION_HISTORY,
       onStatusUpdate = null,
       onTelemetry = null,
       onValidationError = null,
@@ -526,9 +552,13 @@ export class RuntimeSessionController {
     if (typeof statusUrl !== 'string' || statusUrl.length === 0) {
       throw new TypeError('statusUrl must be a non-empty string');
     }
-    if (typeof now !== 'function') {
+    if (now !== undefined && typeof now !== 'function') {
       throw new TypeError('now must be a function returning milliseconds');
     }
+    if (nowFn !== undefined && typeof nowFn !== 'function') {
+      throw new TypeError('nowFn must be a function returning milliseconds');
+    }
+    const resolvedNow = now !== undefined ? now : nowFn !== undefined ? nowFn : () => Date.now();
     if (startWasmRuntime !== null && typeof startWasmRuntime !== 'function') {
       throw new TypeError('startWasmRuntime must be a function or null');
     }
@@ -544,6 +574,11 @@ export class RuntimeSessionController {
     if (!Number.isInteger(maxValidationErrors) || maxValidationErrors < 1) {
       throw new RangeError(
         `maxValidationErrors must be a positive integer, got ${maxValidationErrors}`
+      );
+    }
+    if (!Number.isInteger(maxTransitionHistory) || maxTransitionHistory < 1) {
+      throw new RangeError(
+        `maxTransitionHistory must be a positive integer, got ${maxTransitionHistory}`
       );
     }
     if (onStatusUpdate !== null && typeof onStatusUpdate !== 'function') {
@@ -570,11 +605,12 @@ export class RuntimeSessionController {
     this._startWasmRuntime = startWasmRuntime || null;
     this._startSmokeDemo = startSmokeDemo || null;
     this._capabilityProbe = capabilityProbe || null;
-    this._now = now;
+    this._now = resolvedNow;
     this._hudIntervalMs = hudIntervalMs;
     this._audioGestureTarget = audioGestureTarget;
     this._wgpuWorker = wgpuWorker || null;
     this._maxValidationErrors = maxValidationErrors;
+    this._maxTransitionHistory = maxTransitionHistory;
 
     this._state = SESSION_STATE.IDLE;
     this._mode = SESSION_MODE.NONE;
@@ -588,6 +624,17 @@ export class RuntimeSessionController {
     this._diagnosticReasons = [];
     this._lastError = null;
     this._startedAtMs = null;
+
+    this._transitionHistoryBuf = new Array(maxTransitionHistory);
+    this._transitionHistoryHead = 0;
+    this._transitionHistorySize = 0;
+    this._transitionSeq = 0;
+    this._transitionEvictedCount = 0;
+    this._lastTransitionReason = null;
+    this._restartCount = 0;
+    this._recoveryCount = 0;
+    this._stateDurationsMs = createEmptyStateDurations();
+    this._stateEnteredAtMs = this._readNowMs();
 
     this._validationErrorCount = 0;
     this._validationErrorSeq = 0;
@@ -665,6 +712,54 @@ export class RuntimeSessionController {
       firstPresented: this._firstSplashPresented,
       lastFrame: this._lastSplashFrame ? { ...this._lastSplashFrame } : null,
     };
+  }
+
+  getTransitionHistory() {
+    const out = new Array(this._transitionHistorySize);
+    for (let i = 0; i < this._transitionHistorySize; i += 1) {
+      const idx = (this._transitionHistoryHead + i) % this._maxTransitionHistory;
+      out[i] = { ...this._transitionHistoryBuf[idx] };
+    }
+    return out;
+  }
+
+  clearTransitionHistory() {
+    this._transitionHistoryBuf.fill(undefined);
+    this._transitionHistoryHead = 0;
+    this._transitionHistorySize = 0;
+  }
+
+  resetTelemetry() {
+    this._transitionHistoryBuf.fill(undefined);
+    this._transitionHistoryHead = 0;
+    this._transitionHistorySize = 0;
+    this._transitionSeq = 0;
+    this._transitionEvictedCount = 0;
+    this._lastTransitionReason = null;
+    this._restartCount = 0;
+    this._recoveryCount = 0;
+    this._stateDurationsMs = createEmptyStateDurations();
+    this._stateEnteredAtMs = this._readNowMs();
+  }
+
+  getSessionUptimeMs(nowMs) {
+    return this._computeUptimeMs(nowMs);
+  }
+
+  getStateDurations(nowMs) {
+    const durations = { ...this._stateDurationsMs };
+    const currentNow = this._resolveNowMs(nowMs);
+    const activeElapsedMs = Math.max(0, currentNow - this._stateEnteredAtMs);
+    durations[this._state] = (durations[this._state] || 0) + activeElapsedMs;
+    return durations;
+  }
+
+  getRestartCount() {
+    return this._restartCount;
+  }
+
+  getLastTransitionReason() {
+    return this._lastTransitionReason;
   }
 
   /**
@@ -776,15 +871,31 @@ export class RuntimeSessionController {
     };
   }
 
-  _computeUptimeMs() {
-    const isRunning =
-      this._state === SESSION_STATE.RUNNING_WASM || this._state === SESSION_STATE.RUNNING_SMOKE;
-    return isRunning && this._startedAtMs !== null
-      ? Math.max(0, this._now() - this._startedAtMs)
-      : 0;
+  _readNowMs() {
+    const value = this._now();
+    return typeof value === 'number' && Number.isFinite(value) ? value : Date.now();
   }
 
-  getSnapshot() {
+  _resolveNowMs(nowMs) {
+    if (typeof nowMs === 'number' && Number.isFinite(nowMs)) {
+      return nowMs;
+    }
+    return this._readNowMs();
+  }
+
+  _computeUptimeMs(nowMs) {
+    const isRunning =
+      this._state === SESSION_STATE.RUNNING_WASM || this._state === SESSION_STATE.RUNNING_SMOKE;
+    if (!isRunning || this._startedAtMs === null) {
+      return 0;
+    }
+    const currentNow = this._resolveNowMs(nowMs);
+    return Math.max(0, currentNow - this._startedAtMs);
+  }
+
+  getSnapshot(nowMs) {
+    const resolvedNow = this._resolveNowMs(nowMs);
+    const uptimeMs = this._computeUptimeMs(resolvedNow);
     return {
       state: this._state,
       mode: this._mode,
@@ -801,14 +912,24 @@ export class RuntimeSessionController {
       capabilities: this._capabilities ? { ...this._capabilities } : null,
       serverStatus: this._cloneServerStatus(),
       storageSummary: this._storageSummary,
-      uptimeMs: this._computeUptimeMs(),
+      uptimeMs,
+      sessionUptimeMs: uptimeMs,
+      stateDurations: this.getStateDurations(resolvedNow),
+      transitionHistory: this.getTransitionHistory(),
+      transitionCount: this._transitionSeq,
+      transitionHistorySize: this._transitionHistorySize,
+      transitionEvictedCount: this._transitionEvictedCount,
+      maxTransitionHistory: this._maxTransitionHistory,
+      lastTransitionReason: this._lastTransitionReason,
+      restartCount: this._restartCount,
+      recoveryCount: this._recoveryCount,
       fallbackReason: this._fallbackReason,
       diagnosticReasons: [...this._diagnosticReasons],
       lastError: this._lastError ? this._lastError.message : null,
     };
   }
 
-  getDiagnostics() {
+  getDiagnostics(nowMs) {
     let perfSnapshot = null;
     if (this._perfMonitor && typeof this._perfMonitor.getSnapshot === 'function') {
       try {
@@ -822,19 +943,103 @@ export class RuntimeSessionController {
     }
 
     return {
-      ...this.getSnapshot(),
+      ...this.getSnapshot(nowMs),
       perfSnapshot,
     };
   }
 
   // --- Internal Helpers ---
 
+  _pushTransitionRecord(record) {
+    if (this._transitionHistorySize < this._maxTransitionHistory) {
+      const writeIdx =
+        (this._transitionHistoryHead + this._transitionHistorySize) %
+        this._maxTransitionHistory;
+      this._transitionHistoryBuf[writeIdx] = record;
+      this._transitionHistorySize += 1;
+    } else {
+      this._transitionHistoryBuf[this._transitionHistoryHead] = record;
+      this._transitionHistoryHead =
+        (this._transitionHistoryHead + 1) % this._maxTransitionHistory;
+      this._transitionEvictedCount += 1;
+    }
+  }
+
+  _extractTransitionReason(nextState, detail) {
+    if (detail && typeof detail === 'object') {
+      if (typeof detail.reason === 'string' && detail.reason.trim().length > 0) {
+        return sanitizeTransitionReason(detail.reason);
+      }
+      if (typeof detail.fallbackReason === 'string' && detail.fallbackReason.trim().length > 0) {
+        return sanitizeTransitionReason(detail.fallbackReason);
+      }
+      if (
+        detail.error &&
+        typeof detail.error === 'object' &&
+        typeof detail.error.message === 'string'
+      ) {
+        return sanitizeTransitionReason(detail.error.message);
+      }
+      if (typeof detail.error === 'string' && detail.error.trim().length > 0) {
+        return sanitizeTransitionReason(detail.error);
+      }
+      if (
+        Array.isArray(detail.reasons) &&
+        detail.reasons.length > 0 &&
+        typeof detail.reasons[0] === 'string'
+      ) {
+        return sanitizeTransitionReason(detail.reasons[0]);
+      }
+      if (nextState === SESSION_STATE.STARTING && detail.targetMode) {
+        return detail.targetMode === SESSION_MODE.WASM
+          ? 'Starting Wasm64 runtime'
+          : detail.targetMode === SESSION_MODE.SMOKE
+            ? 'Starting smoke demo'
+            : 'No runtime launcher available';
+      }
+      if (nextState === SESSION_STATE.RUNNING_WASM) {
+        return 'Wasm64 runtime running';
+      }
+      if (nextState === SESSION_STATE.RUNNING_SMOKE) {
+        return 'Smoke demo running';
+      }
+    }
+    return null;
+  }
+
   _transition(nextState, detail = null) {
     const previousState = this._state;
     if (previousState === nextState) {
       return;
     }
+
+    const atMs = this._readNowMs();
+    const durationInPrevMs = Math.max(0, atMs - this._stateEnteredAtMs);
+    this._stateDurationsMs[previousState] =
+      (this._stateDurationsMs[previousState] || 0) + durationInPrevMs;
+    this._stateEnteredAtMs = atMs;
     this._state = nextState;
+
+    if (
+      nextState === SESSION_STATE.RUNNING_WASM ||
+      nextState === SESSION_STATE.RUNNING_SMOKE
+    ) {
+      this._startedAtMs = atMs;
+    }
+
+    const reason = this._extractTransitionReason(nextState, detail);
+    this._transitionSeq += 1;
+    this._lastTransitionReason = reason;
+
+    const record = {
+      seq: this._transitionSeq,
+      from: previousState,
+      to: nextState,
+      atMs,
+      durationInPrevMs,
+      reason,
+    };
+    this._pushTransitionRecord(record);
 
     const event = {
       state: nextState,
@@ -843,7 +1048,9 @@ export class RuntimeSessionController {
       bootMode: this._bootMode,
       sideModuleCount: this._sideModuleCount,
       sideModuleUrls: [...this._sideModuleUrls],
-      timestampMs: this._now(),
+      timestampMs: atMs,
+      durationInPrevMs,
+      transitionSeq: record.seq,
       ...(detail && typeof detail === 'object' ? detail : {}),
     };
 
@@ -882,6 +1089,8 @@ export class RuntimeSessionController {
   }
 
   _buildStatusSnapshot(reason = null) {
+    const nowMs = this._readNowMs();
+    const sessionUptimeMs = this._computeUptimeMs(nowMs);
     return {
       state: this._state,
       mode: this._mode,
@@ -893,8 +1102,24 @@ export class RuntimeSessionController {
       validationErrorCount: this._validationErrorCount,
       splashFramesPresented: this._splashFramesPresented,
       firstSplashPresented: this._firstSplashPresented,
+      sessionUptimeMs,
+      stateDurations: this.getStateDurations(nowMs),
+      transitionHistory: this.getTransitionHistory(),
+      transitionCount: this._transitionSeq,
+      lastTransitionReason: this._lastTransitionReason,
+      restartCount: this._restartCount,
+      recoveryCount: this._recoveryCount,
       reason,
-      timestampMs: this._now(),
+      timestampMs: nowMs,
+    };
+  }
+
+  _cloneStatusForObserver(snapshot) {
+    return {
+      ...snapshot,
+      sideModuleUrls: [...snapshot.sideModuleUrls],
+      stateDurations: { ...snapshot.stateDurations },
+      transitionHistory: snapshot.transitionHistory.map((entry) => ({ ...entry })),
     };
   }
 
@@ -906,10 +1131,7 @@ export class RuntimeSessionController {
       for (const fnName of hudStatusFns) {
         if (typeof this._hud[fnName] === 'function') {
           try {
-            this._hud[fnName]({
-              ...snapshot,
-              sideModuleUrls: [...snapshot.sideModuleUrls],
-            });
+            this._hud[fnName](this._cloneStatusForObserver(snapshot));
           } catch {
             // Isolate HUD callback errors.
           }
@@ -932,10 +1154,7 @@ export class RuntimeSessionController {
 
     for (const listener of [...this._statusListeners]) {
       try {
-        listener({
-          ...snapshot,
-          sideModuleUrls: [...snapshot.sideModuleUrls],
-        });
+        listener(this._cloneStatusForObserver(snapshot));
       } catch {
         // Never allow status observers to throw into session lifecycle.
       }
@@ -945,8 +1164,7 @@ export class RuntimeSessionController {
       try {
         listener({
           type: 'boot-status',
-          ...snapshot,
-          sideModuleUrls: [...snapshot.sideModuleUrls],
+          ...this._cloneStatusForObserver(snapshot),
         });
       } catch {
         // Never allow telemetry observers to throw into session lifecycle.
@@ -1723,6 +1941,10 @@ export class RuntimeSessionController {
     this._firstSplashPresented = false;
     this._lastSplashFrame = null;
 
+    if (this._state === SESSION_STATE.ERROR) {
+      this._recoveryCount += 1;
+    }
+
     this._transition(SESSION_STATE.PROBING, {
       reason: 'Probing browser capabilities and server readiness',
     });
@@ -2070,7 +2292,6 @@ export class RuntimeSessionController {
     if (!callbackReportedBootMode || this._bootMode === BOOT_MODE.IDLE) {
       this._bootMode = targetBootMode;
     }
-    this._startedAtMs = this._now();
 
     const runningState =
       targetMode === SESSION_MODE.WASM
@@ -2160,6 +2381,7 @@ export class RuntimeSessionController {
    * @param {{ preferSmoke?: boolean }} [options]
    */
   async restart(options = {}) {
+    this._restartCount += 1;
     await this.stop();
     return this.start(options);
   }
