@@ -7,9 +7,13 @@ import { fileURLToPath } from 'node:url';
 import PerfMonitorDefault, {
   DEFAULT_WINDOW_SIZE,
   DEFAULT_JANK_THRESHOLD_MS,
+  DEFAULT_TARGET_FPS,
+  DEFAULT_FRAME_BUDGET_MS,
   DEFAULT_HUD_INTERVAL_MS,
   BYTES_PER_MB,
   PERF_PHASES,
+  FRAME_BOTTLENECKS,
+  classifyFrameBottleneck,
   PerfMonitor,
 } from '../web/telemetry/perf_monitor.js';
 
@@ -1158,4 +1162,348 @@ test('W242: reset clears all phase histograms, restores initial phase, and guard
   assert.equal(guarded.p99FrameMs, 25);
   assert.equal(guarded.maxFrameMs, 25);
   assert.ok(Math.abs(guarded.onePercentLowFps - 40) < 1e-9);
+});
+
+test('W287: classifyFrameBottleneck exports canonical constants, classifies all 5 buckets, breaks ties deterministically, and sanitizes NaN/negative inputs', () => {
+  assert.equal(DEFAULT_TARGET_FPS, 30);
+  assert.equal(DEFAULT_FRAME_BUDGET_MS, 33.333);
+  assert.deepEqual(FRAME_BOTTLENECKS, {
+    WITHIN_BUDGET: 'within_budget',
+    IO_BOUND: 'io_bound',
+    SHADER_COMPILE_BOUND: 'shader_compile_bound',
+    GPU_BOUND: 'gpu_bound',
+    CPU_BOUND: 'cpu_bound',
+  });
+  assert.equal(Object.isFrozen(FRAME_BOTTLENECKS), true);
+
+  // Within budget (including exact 33.333 ms boundary and 0 ms).
+  assert.equal(classifyFrameBottleneck({ frameMs: 0 }), 'within_budget');
+  assert.equal(classifyFrameBottleneck({ frameMs: 16.6, gpuMs: 12, cpuMs: 4.6 }), 'within_budget');
+  assert.equal(
+    classifyFrameBottleneck({ frameMs: 33.333, ioWaitMs: 25, gpuMs: 8 }),
+    'within_budget'
+  );
+
+  // Over budget: each dominant bottleneck category.
+  assert.equal(
+    classifyFrameBottleneck({
+      frameMs: 48,
+      ioWaitMs: 22,
+      shaderCompileMs: 5,
+      gpuMs: 12,
+      cpuMs: 9,
+    }),
+    'io_bound'
+  );
+  assert.equal(
+    classifyFrameBottleneck({
+      frameMs: 55,
+      ioWaitMs: 4,
+      shaderCompileMs: 31,
+      gpuMs: 10,
+      cpuMs: 10,
+    }),
+    'shader_compile_bound'
+  );
+  assert.equal(
+    classifyFrameBottleneck({
+      frameMs: 42,
+      ioWaitMs: 2,
+      shaderCompileMs: 1,
+      gpuMs: 27,
+      cpuMs: 12,
+    }),
+    'gpu_bound'
+  );
+  assert.equal(
+    classifyFrameBottleneck({
+      frameMs: 40,
+      ioWaitMs: 1,
+      shaderCompileMs: 2,
+      gpuMs: 11,
+      cpuMs: 26,
+    }),
+    'cpu_bound'
+  );
+
+  // Over budget with no stage breakdown (or all zeros) defaults deterministically to cpu_bound.
+  assert.equal(classifyFrameBottleneck({ frameMs: 33.334 }), 'cpu_bound');
+  assert.equal(
+    classifyFrameBottleneck({
+      frameMs: 50,
+      ioWaitMs: 0,
+      shaderCompileMs: 0,
+      gpuMs: 0,
+      cpuMs: 0,
+    }),
+    'cpu_bound'
+  );
+
+  // Deterministic tie-breaking priority: io_bound > shader_compile_bound > gpu_bound > cpu_bound.
+  assert.equal(
+    classifyFrameBottleneck({
+      frameMs: 60,
+      ioWaitMs: 15,
+      shaderCompileMs: 15,
+      gpuMs: 15,
+      cpuMs: 15,
+    }),
+    'io_bound'
+  );
+  assert.equal(
+    classifyFrameBottleneck({
+      frameMs: 60,
+      ioWaitMs: 5,
+      shaderCompileMs: 20,
+      gpuMs: 20,
+      cpuMs: 20,
+    }),
+    'shader_compile_bound'
+  );
+  assert.equal(
+    classifyFrameBottleneck({
+      frameMs: 60,
+      ioWaitMs: 5,
+      shaderCompileMs: 5,
+      gpuMs: 25,
+      cpuMs: 25,
+    }),
+    'gpu_bound'
+  );
+
+  // Custom budgetMs support (e.g., 60 FPS = 16.667 ms).
+  assert.equal(classifyFrameBottleneck({ frameMs: 20, gpuMs: 14, cpuMs: 6 }, 16.667), 'gpu_bound');
+  assert.equal(
+    classifyFrameBottleneck({ frameMs: 16.667, gpuMs: 14, cpuMs: 2.6 }, 16.667),
+    'within_budget'
+  );
+
+  // Omitted frameMs derives total from sanitized stage components.
+  assert.equal(classifyFrameBottleneck({ ioWaitMs: 30, cpuMs: 10 }), 'io_bound');
+  assert.equal(classifyFrameBottleneck({ gpuMs: 10, cpuMs: 10 }), 'within_budget');
+
+  // NaN, negative, Infinity, null/undefined, and invalid budgetMs sanitization.
+  assert.equal(classifyFrameBottleneck(null), 'within_budget');
+  assert.equal(classifyFrameBottleneck(undefined), 'within_budget');
+  assert.equal(classifyFrameBottleneck({}), 'within_budget');
+  assert.equal(classifyFrameBottleneck({ frameMs: Number.NaN, ioWaitMs: 50 }), 'within_budget');
+  assert.equal(classifyFrameBottleneck({ frameMs: -10, gpuMs: 50 }), 'within_budget');
+  assert.equal(
+    classifyFrameBottleneck({ frameMs: Number.POSITIVE_INFINITY, cpuMs: 40 }),
+    'within_budget'
+  );
+  assert.equal(
+    classifyFrameBottleneck({
+      frameMs: 45,
+      ioWaitMs: Number.NaN,
+      shaderCompileMs: -99,
+      gpuMs: Number.POSITIVE_INFINITY,
+      cpuMs: 12,
+    }),
+    'cpu_bound'
+  );
+  assert.equal(
+    classifyFrameBottleneck({ frameMs: 45, gpuMs: 30 }, Number.NaN),
+    'gpu_bound'
+  );
+  assert.equal(
+    classifyFrameBottleneck({ frameMs: 20, gpuMs: 15 }, -10),
+    'within_budget'
+  );
+  assert.equal(
+    classifyFrameBottleneck({ frameMs: 40, ioWaitMs: 25 }, 0),
+    'io_bound'
+  );
+});
+
+test('W287: PerfMonitor tracks 30 FPS budget compliance, bottleneck counts, and dominantBottleneck via recordDetailedFrame and recordFrame', () => {
+  const clock = createDeterministicClock(100);
+  const monitor = new PerfMonitor({ windowSize: 32, now: clock.now });
+
+  // Constructor defaults and validation.
+  assert.equal(monitor.targetFps, 30);
+  assert.equal(monitor.budgetMs, 33.333);
+  assert.throws(() => new PerfMonitor({ targetFps: 0 }), RangeError);
+  assert.throws(() => new PerfMonitor({ targetFps: -30 }), RangeError);
+  assert.throws(() => new PerfMonitor({ targetFps: Number.NaN }), RangeError);
+  assert.throws(() => new PerfMonitor({ budgetMs: 0 }), RangeError);
+  assert.throws(() => new PerfMonitor({ budgetMs: -16 }), RangeError);
+  assert.throws(() => new PerfMonitor({ budgetMs: Number.POSITIVE_INFINITY }), RangeError);
+
+  const custom60 = new PerfMonitor({ targetFps: 60 });
+  assert.equal(custom60.targetFps, 60);
+  assert.equal(custom60.budgetMs, 16.667);
+
+  // Empty initial state across getStats(), getSnapshot(), getSummary(), and toHudMetrics().
+  const initStats = monitor.getStats();
+  const initSnap = monitor.getSnapshot();
+  assert.deepEqual(initStats, initSnap);
+  assert.equal(initStats.targetFps, 30);
+  assert.equal(initStats.budgetMs, 33.333);
+  assert.equal(initStats.framesWithin30FpsBudget, 0);
+  assert.equal(initStats.framesOver30FpsBudget, 0);
+  assert.equal(initStats.fps30ComplianceRate, 0);
+  assert.equal(initStats.dominantBottleneck, 'within_budget');
+  assert.deepEqual(initStats.bottleneckCounts, {
+    within_budget: 0,
+    io_bound: 0,
+    shader_compile_bound: 0,
+    gpu_bound: 0,
+    cpu_bound: 0,
+  });
+
+  // Record 5 within-budget frames and 5 over-budget frames across all 4 bottlenecks:
+  //   5 within_budget, 1 io_bound, 2 shader_compile_bound, 1 gpu_bound, 1 cpu_bound.
+  assert.equal(
+    monitor.recordDetailedFrame({ frameMs: 16.5, gpuMs: 10, cpuMs: 6.5 }),
+    'within_budget'
+  );
+  assert.equal(
+    monitor.recordDetailedFrame({ frameMs: 28, ioWaitMs: 5, gpuMs: 15, cpuMs: 8 }),
+    'within_budget'
+  );
+  assert.equal(
+    monitor.recordDetailedFrame({ frameMs: 33.333, gpuMs: 20, cpuMs: 13.333 }),
+    'within_budget'
+  );
+  assert.equal(
+    monitor.recordDetailedFrame({ frameMs: 65, ioWaitMs: 42, gpuMs: 13, cpuMs: 10 }),
+    'io_bound'
+  );
+  assert.equal(
+    monitor.recordDetailedFrame({ frameMs: 90, shaderCompileMs: 60, gpuMs: 18, cpuMs: 12 }),
+    'shader_compile_bound'
+  );
+  assert.equal(
+    monitor.recordDetailedFrame({ frameMs: 75, shaderCompileMs: 48, gpuMs: 15, cpuMs: 12 }),
+    'shader_compile_bound'
+  );
+  assert.equal(
+    monitor.recordDetailedFrame({ frameMs: 44, ioWaitMs: 2, gpuMs: 31, cpuMs: 11 }),
+    'gpu_bound'
+  );
+  assert.equal(
+    monitor.recordDetailedFrame({ frameMs: 41, ioWaitMs: 1, gpuMs: 10, cpuMs: 30 }),
+    'cpu_bound'
+  );
+
+  // Also test recordFrame timestamp delta wiring (baseline + 2 within-budget frames).
+  monitor.recordFrame(1000); // baseline resets timestamp delta chain only when null; here _lastFrameTimestamp is null
+  assert.equal(monitor.recordFrame(1020), 20);
+  assert.equal(monitor.recordFrame(1045, { gpuMs: 12 }), 25);
+
+  const stats = monitor.getStats();
+  const snap = monitor.getSnapshot();
+  const summary = monitor.getSummary();
+  const hud = monitor.toHudMetrics();
+
+  assert.equal(stats.framesWithin30FpsBudget, 5);
+  assert.equal(stats.framesOver30FpsBudget, 5);
+  assert.equal(stats.fps30ComplianceRate, 0.5);
+  assert.equal(stats.dominantBottleneck, 'shader_compile_bound');
+  assert.deepEqual(stats.bottleneckCounts, {
+    within_budget: 5,
+    io_bound: 1,
+    shader_compile_bound: 2,
+    gpu_bound: 1,
+    cpu_bound: 1,
+  });
+
+  // Consistent across snapshot (top-level, budget, frames), summary, and HUD metrics.
+  for (const view of [snap, snap.budget, snap.frames, summary, hud]) {
+    assert.equal(view.targetFps, 30);
+    assert.equal(view.budgetMs, 33.333);
+    assert.equal(view.framesWithin30FpsBudget, 5);
+    assert.equal(view.framesOver30FpsBudget, 5);
+    assert.equal(view.fps30ComplianceRate, 0.5);
+    assert.equal(view.dominantBottleneck, 'shader_compile_bound');
+    assert.deepEqual(view.bottleneckCounts, {
+      within_budget: 5,
+      io_bound: 1,
+      shader_compile_bound: 2,
+      gpu_bound: 1,
+      cpu_bound: 1,
+    });
+  }
+
+  // Returned bottleneckCounts is a defensive copy (mutation cannot corrupt internal state).
+  stats.bottleneckCounts.gpu_bound = 9999;
+  assert.equal(monitor.getStats().bottleneckCounts.gpu_bound, 1);
+  assert.equal(monitor.getStats().dominantBottleneck, 'shader_compile_bound');
+});
+
+test('W287: recordFrame timestamp mode, recordDetailedFrame timestamp/invalid inputs, tie-breaking, and reset()', () => {
+  const monitor = new PerfMonitor({ windowSize: 16 });
+  const initialRingRef = monitor._frameDeltas;
+  const initialCountsRef = monitor._bottleneckCounts;
+
+  // Non-object sample to recordDetailedFrame is a safe no-op returning null.
+  assert.equal(monitor.recordDetailedFrame(null), null);
+  assert.equal(monitor.recordDetailedFrame(undefined), null);
+  assert.equal(monitor.getStats().frames.totalFrames, 0);
+
+  // recordDetailedFrame using timestampMs when frameMs is omitted.
+  assert.equal(monitor.recordDetailedFrame({ timestampMs: 500, gpuMs: 25 }), null);
+  assert.equal(monitor.recordDetailedFrame({ timestampMs: 545, gpuMs: 30, cpuMs: 15 }), 'gpu_bound');
+  assert.equal(monitor.recordDetailedFrame({ timestampMs: 590, ioWaitMs: 35, cpuMs: 10 }), 'io_bound');
+
+  // Equal counts between io_bound (1) and gpu_bound (1) break tie to io_bound.
+  let stats = monitor.getStats();
+  assert.equal(stats.framesWithin30FpsBudget, 0);
+  assert.equal(stats.framesOver30FpsBudget, 2);
+  assert.equal(stats.fps30ComplianceRate, 0);
+  assert.equal(stats.dominantBottleneck, 'io_bound');
+  assert.equal(stats.budget.lastBottleneck, 'io_bound');
+
+  // recordFrame without breakdown attributes over-budget deltas to cpu_bound.
+  assert.equal(monitor.recordFrame(640), 50);
+  assert.equal(monitor.recordFrame(690), 50);
+  stats = monitor.getStats();
+  assert.equal(stats.framesOver30FpsBudget, 4);
+  assert.equal(stats.bottleneckCounts.cpu_bound, 2);
+  assert.equal(stats.dominantBottleneck, 'cpu_bound');
+
+  // Sanitized NaN/negative frameMs in recordDetailedFrame counts as 0ms (within_budget).
+  assert.equal(
+    monitor.recordDetailedFrame({ frameMs: Number.NaN, ioWaitMs: -12, gpuMs: Number.POSITIVE_INFINITY }),
+    'within_budget'
+  );
+  stats = monitor.getStats();
+  assert.equal(stats.framesWithin30FpsBudget, 1);
+  assert.equal(stats.framesOver30FpsBudget, 4);
+  assert.ok(Math.abs(stats.fps30ComplianceRate - 0.2) < 1e-9);
+  assert.ok(stats.fps30ComplianceRate >= 0 && stats.fps30ComplianceRate <= 1);
+
+  // Zero-allocation invariant: pre-allocated structures stay the same instances.
+  assert.equal(monitor._frameDeltas, initialRingRef);
+  assert.equal(monitor._bottleneckCounts, initialCountsRef);
+
+  // reset() zeroes all budget & bottleneck counters cleanly without reallocating.
+  monitor.reset();
+  assert.equal(monitor._bottleneckCounts, initialCountsRef);
+
+  const resetStats = monitor.getStats();
+  assert.equal(resetStats.targetFps, 30);
+  assert.equal(resetStats.budgetMs, 33.333);
+  assert.equal(resetStats.framesWithin30FpsBudget, 0);
+  assert.equal(resetStats.framesOver30FpsBudget, 0);
+  assert.equal(resetStats.fps30ComplianceRate, 0);
+  assert.equal(resetStats.dominantBottleneck, 'within_budget');
+  assert.equal(resetStats.budget.lastBottleneck, 'within_budget');
+  assert.deepEqual(resetStats.bottleneckCounts, {
+    within_budget: 0,
+    io_bound: 0,
+    shader_compile_bound: 0,
+    gpu_bound: 0,
+    cpu_bound: 0,
+  });
+
+  // Post-reset smooth frames yield 100% compliance (1.0) and within_budget dominantBottleneck.
+  monitor.recordDetailedFrame({ frameMs: 16.6, gpuMs: 10, cpuMs: 6.6 });
+  monitor.recordDetailedFrame({ frameMs: 30, gpuMs: 18, cpuMs: 12 });
+  const postReset = monitor.getStats();
+  assert.equal(postReset.framesWithin30FpsBudget, 2);
+  assert.equal(postReset.framesOver30FpsBudget, 0);
+  assert.equal(postReset.fps30ComplianceRate, 1);
+  assert.equal(postReset.dominantBottleneck, 'within_budget');
 });
