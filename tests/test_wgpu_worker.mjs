@@ -2724,21 +2724,30 @@ test('W338 all-black swapchain frames hold first-visible-frame until non-black p
       cmdBuffer: buildRealPackDrawStream(vsHash, fsHash, { includeSetup: true }),
     });
     await flushMicrotasks();
-    assert.equal(env.copyCalls.length, 4);
+    assert.equal(env.copyCalls.length, 8);
     assert.equal(processor.firstVisibleFrame, false);
     assert.equal(processor.suppressedBlackFrames, 1);
     assert.equal(posted.filter((m) => m.type === 'first-visible-frame').length, 0);
 
-    // Verify sampled strips match 4 horizontal strips at y = 20%, 50%, 70%, 92%, width <= 64, bytesPerRow = 256.
+    // Verify sampled strips match 8 horizontal strips at y = [15%, 35%, 50%, 65%, 80%, 89%, 92%, 95%], width <= 64, bytesPerRow = 256.
     assert.deepEqual(
       env.copyCalls.map((c) => c.source.origin.y),
-      [Math.floor(720 * 0.2), Math.floor(720 * 0.5), Math.floor(720 * 0.7), Math.floor(720 * 0.92)]
+      [
+        Math.floor(720 * 0.15),
+        Math.floor(720 * 0.35),
+        Math.floor(720 * 0.5),
+        Math.floor(720 * 0.65),
+        Math.floor(720 * 0.8),
+        Math.floor(720 * 0.89),
+        Math.floor(720 * 0.92),
+        Math.floor(720 * 0.95),
+      ]
     );
     assert.ok(env.copyCalls.every((c) => c.copySize.width === 64 && c.copySize.height === 1));
     assert.ok(env.copyCalls.every((c) => c.destination.bytesPerRow === 256));
     assert.deepEqual(
       env.copyCalls.map((c) => c.destination.offset),
-      [0, 256, 512, 768]
+      [0, 256, 512, 768, 1024, 1280, 1536, 1792]
     );
 
     // Draw #2 with near-black noise (8,8,8,255) — threshold is strictly > 8, still held!
@@ -2814,7 +2823,7 @@ test('W338 throttles probes (>= 250ms) and enforces strictly non-overlapping in-
   processor.execute(buildRealPackDrawStream(vsHash, fsHash, { includeSetup: true }));
   assert.equal(processor.swapchainProbeInFlight, true);
   assert.equal(processor.swapchainProbeCount, 1);
-  assert.equal(env.copyCalls.length, 4);
+  assert.equal(env.copyCalls.length, 8);
   assert.equal(env.pendingMaps.length, 1);
   assert.equal(processor.firstVisibleFrame, false);
 
@@ -2824,7 +2833,7 @@ test('W338 throttles probes (>= 250ms) and enforces strictly non-overlapping in-
   processor.execute(buildRealPackDrawStream(vsHash, fsHash, { includeSetup: false }));
   fakeNow = 1500;
   processor.execute(buildRealPackDrawStream(vsHash, fsHash, { includeSetup: false }));
-  assert.equal(env.copyCalls.length, 4);
+  assert.equal(env.copyCalls.length, 8);
   assert.equal(env.pendingMaps.length, 1);
   assert.equal(processor.swapchainProbeCount, 1);
   assert.equal(env.probeBuffers[0].doubleMapDetected, false);
@@ -2840,7 +2849,7 @@ test('W338 throttles probes (>= 250ms) and enforces strictly non-overlapping in-
   // Frame 4 at t=1200ms (< 250ms since startMs=1000ms): throttled, no copy/mapAsync!
   fakeNow = 1200;
   processor.execute(buildRealPackDrawStream(vsHash, fsHash, { includeSetup: false }));
-  assert.equal(env.copyCalls.length, 4);
+  assert.equal(env.copyCalls.length, 8);
   assert.equal(env.pendingMaps.length, 0);
   assert.equal(processor.swapchainProbeCount, 1);
   assert.equal(processor.firstVisibleFrame, false);
@@ -2850,7 +2859,7 @@ test('W338 throttles probes (>= 250ms) and enforces strictly non-overlapping in-
   env.setPixel(640, Math.floor(720 * 0.5), 140, 200, 255, 255);
   processor.execute(buildRealPackDrawStream(vsHash, fsHash, { includeSetup: false }));
   assert.equal(env.probeBuffers.length, 1);
-  assert.equal(env.copyCalls.length, 8);
+  assert.equal(env.copyCalls.length, 16);
   assert.equal(env.pendingMaps.length, 1);
   assert.equal(processor.swapchainProbeCount, 2);
 
@@ -2877,12 +2886,12 @@ test('W338 reuses single 1024-byte probe buffer and destroys it cleanly on first
       wgslPackBuffer: packBuffer,
     });
 
-    // Black frame allocates one 1024-byte MAP_READ | COPY_DST buffer.
+    // Black frame allocates one 2048-byte (8 * 256) MAP_READ | COPY_DST buffer.
     processor.execute(buildRealPackDrawStream(vsHash, fsHash, { includeSetup: true }));
     await flushMicrotasks();
     assert.equal(env.probeBuffers.length, 1);
     const probeBuf = env.probeBuffers[0];
-    assert.equal(probeBuf.size, 4 * 256);
+    assert.equal(probeBuf.size, 8 * 256);
     assert.equal(probeBuf.usage, BUFFER_USAGE.MAP_READ | BUFFER_USAGE.COPY_DST);
     assert.equal(probeBuf.destroyed, false);
 
@@ -2895,7 +2904,7 @@ test('W338 reuses single 1024-byte probe buffer and destroys it cleanly on first
 
     // Non-black frame fires first-visible-frame -> unmaps THEN destroys staging buffer.
     fakeNow = 1600;
-    env.setPixel(640, Math.floor(720 * 0.2), 255, 255, 255, 255);
+    env.setPixel(640, Math.floor(720 * 0.15), 255, 255, 255, 255);
     processor.execute(buildRealPackDrawStream(vsHash, fsHash, { includeSetup: false }));
     await flushMicrotasks();
     assert.equal(processor.firstVisibleFrame, true);
@@ -4177,15 +4186,15 @@ test('W348 black frames on COPY_SRC device with WgpuSwapchain never leak firstVi
     overrideTextureUsage = null;
     assertStillNotVisible('after transient missing-COPY_SRC frame #4');
 
-    // Frame 5: dim near-black frame (12,12,12,255) at default threshold 12 -> still held!
+    // Frame 5: dim near-black frame (8,8,8,255) at default threshold 8 -> still held!
     fakeNow = 1700;
-    env.clearPixels(12, 12, 12, 255);
+    env.clearPixels(8, 8, 8, 255);
     await handler.handleMessage({
       cmdBuffer: buildRealPackDrawStream(vsHash, fsHash, { includeSetup: false }),
     });
     await flushMicrotasks();
-    assert.equal(processor.lastSampledMaxLuma, 12);
-    assertStillNotVisible('after luma=12 dim frame #5');
+    assert.equal(processor.lastSampledMaxLuma, 8);
+    assertStillNotVisible('after luma=8 dim frame #5');
 
     // Also request explicit gpu-stats while black -> must report firstVisibleFrame: false and swapchain.hasVisibleContent: false.
     await handler.handleMessage({ type: 'gpu-stats', id: 'w348-black-stats' });
