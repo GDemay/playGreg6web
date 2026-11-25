@@ -111,7 +111,8 @@
 //     SubmitBlobWrite(update, name, data, size) h (header 0x128 bytes + payload), s28/s29
 //     SubmitUpdateAsync(update, block) / Result(block) h, s8/s9 GetRemainingQuotaAsync/Result h,
 //     s11/s12 DeleteContainerAsync/Result h; s7, s10, s18, s26, s27 (no title wrappers) by the
-//     same order m. s15 (no wrapper; GetContainerInfo) stays a logging stub.
+//     same order m. s15 (no wrapper; GetContainerInfo; the public header has no such function, so
+//     its signature is unknown) answers E_NOTIMPL without touching any argument.
 //   Stub-only (every slot logs and traps, so the first boot reports what it needs):
 //     XGameEventWrite {bbfbdcc7-...}, {1b339674-...} (XDisplay?), and unmapped
 //     {a4f1aee2-...}, {dfcd4649-...}.
@@ -1613,6 +1614,12 @@ public:
         return EnumerateContainers(provider, std::string(), context, callback);
     }
 
+    // s15: no public XGameSave function, signature unknown: documented E_NOTIMPL, arguments untouched.
+    int32_t GetContainerInfoUnsupported() {
+        log_once("XGameSave slot 15 (GetContainerInfo)");
+        return E_NOTIMPL_HR;
+    }
+
     // s16: XGameSaveCreateContainer(provider, containerName, XGameSaveContainerHandle*). The title
     // opens every container it reads or writes this way (handle kept in its save manager, closed
     // through s17 before the next one is opened).
@@ -2139,6 +2146,7 @@ constexpr auto kGameSaveTable = slot_table<27>({
     {12, GS::method<&GameSaveApi::DeleteContainerResult>("XGameSaveDeleteContainerResult")},
     {13, GS::method<&GameSaveApi::EnumerateContainerInfoByName>("XGameSaveEnumerateContainerInfoByName")},
     {14, GS::method<&GameSaveApi::EnumerateContainerInfo>("XGameSaveEnumerateContainerInfo")},
+    {15, GS::method<&GameSaveApi::GetContainerInfoUnsupported>("XGameSaveGetContainerInfo")},
     {16, GS::method<&GameSaveApi::CreateContainer>("XGameSaveCreateContainer")},
     {17, GS::method<&GameSaveApi::CloseContainer>("XGameSaveCloseContainer")},
     {18, GS::method<&GameSaveApi::EnumerateBlobInfo>("XGameSaveEnumerateBlobInfo")},
