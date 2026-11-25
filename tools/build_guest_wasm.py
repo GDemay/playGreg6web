@@ -2852,7 +2852,11 @@ def resolve_link_flags(
             if strip_flag not in flags:
                 flags.append(strip_flag)
 
+    if assertions_val is None and not any(f.startswith(ASSERTIONS_PREFIX) for f in flags):
+        # Release default: no runtime checks (pass --assertions 1 for a debug build).
+        flags.extend(["-sASSERTIONS=0", "-sSAFE_HEAP=0"])
     if assertions_val is not None:
+        flags = [f for f in flags if not f.startswith(ASSERTIONS_PREFIX)]
         assertions_flag = f"{ASSERTIONS_PREFIX}{assertions_val}"
         if assertions_flag not in flags:
             flags.append(assertions_flag)
