@@ -11073,7 +11073,7 @@ function createWgpuWorkerHandler(options = {}) {
         const result = processor.drainRing();
         if (result.presents > 0) {
           if (prevFrames === 0 && result.frameCount >= 1) {
-            const firstPresentInfo = {
+            notifyHandlerFirstPresent({
               type: 'first-present',
               firstPresent: true,
               source: 'command-buffer',
@@ -11081,10 +11081,7 @@ function createWgpuWorkerHandler(options = {}) {
               framesPresented: result.frameCount,
               timestamp: telemetryNow(),
               gpuAdapter: getActiveGpuAdapter(),
-            };
-            if (notifyHandlerFirstPresent(firstPresentInfo)) {
-              postMessage(firstPresentInfo);
-            }
+            });
           }
           postMessage({ frame: result.frameCount });
           maybeEmitFrameTelemetry(prevFrames, result.frameCount);
@@ -11101,7 +11098,7 @@ function createWgpuWorkerHandler(options = {}) {
         const result = processor.executeCommandBuffer(batchBuffer);
         if (result.presents > 0) {
           if (prevFrames === 0 && result.frameCount >= 1) {
-            const firstPresentInfo = {
+            notifyHandlerFirstPresent({
               type: 'first-present',
               firstPresent: true,
               source: 'command-buffer',
@@ -11109,10 +11106,7 @@ function createWgpuWorkerHandler(options = {}) {
               framesPresented: result.frameCount,
               timestamp: telemetryNow(),
               gpuAdapter: getActiveGpuAdapter(),
-            };
-            if (notifyHandlerFirstPresent(firstPresentInfo)) {
-              postMessage(firstPresentInfo);
-            }
+            });
           }
           postMessage({ frame: result.frameCount });
           maybeEmitFrameTelemetry(prevFrames, result.frameCount);

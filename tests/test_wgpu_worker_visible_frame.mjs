@@ -302,6 +302,7 @@ test('W257 clear-only frames do NOT trigger first-visible-frame, while first non
 
   const processorCallbacks = [];
   const handlerCallbacks = [];
+  const firstPresentCallbacks = [];
   const posted = [];
 
   const processor = new WgpuCommandProcessor(device, ctx, {
@@ -321,6 +322,7 @@ test('W257 clear-only frames do NOT trigger first-visible-frame, while first non
     processor,
     postMessage: (msg) => posted.push(msg),
     now: nowFn,
+    onFirstPresent: (info) => firstPresentCallbacks.push(info),
     onFirstVisibleFrame: (info) => handlerCallbacks.push(info),
   });
 
@@ -343,9 +345,8 @@ test('W257 clear-only frames do NOT trigger first-visible-frame, while first non
   assert.equal(swapchain.hasVisibleContent, false);
   assert.equal(swapchain.blackPresentsTotal, 1);
 
-  const firstPresentMsgs = posted.filter((m) => m.type === 'first-present');
-  assert.equal(firstPresentMsgs.length, 1);
-  assert.equal(firstPresentMsgs[0].gpuAdapter.vendor, 'nvidia');
+  assert.equal(firstPresentCallbacks.length, 1);
+  assert.equal(firstPresentCallbacks[0].gpuAdapter.vendor, 'nvidia');
 
   // Frame 2 (still clear-only at t=1120): still no first-visible-frame.
   fakeNow = 1120;
@@ -622,6 +623,23 @@ test('W257 worker init emits sanitized gpuAdapter on ready, stats, and first-pre
     assert.ok(statsMsg);
     assert.equal(statsMsg.gpuAdapter.vendor, 'amd');
     assert.equal(statsMsg.stats.gpuAdapter.vendor, 'amd');
+
+    // Splash first-present message also carries sanitized gpuAdapter.
+    handler.processor.presentSplashFrame = () => ({
+      ok: true,
+      presented: true,
+      firstPresent: true,
+      frameIndex: 0,
+      framesPresented: 1,
+      width: 1280,
+      height: 720,
+      source: 'splash',
+    });
+    await handler.handleMessage({ type: 'present-splash-frame', width: 1280, height: 720 });
+    const firstPresentMsg = posted.find((m) => m && m.type === 'first-present');
+    assert.ok(firstPresentMsg, 'splash first-present message must be posted');
+    assert.equal(firstPresentMsg.gpuAdapter.vendor, 'amd');
+    assert.equal(firstPresentMsg.gpuAdapter.architecture, 'rdna3');
   } finally {
     if (prevNavigator === undefined) {
       delete globalThis.navigator;
