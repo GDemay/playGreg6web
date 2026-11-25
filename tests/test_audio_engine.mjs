@@ -15,8 +15,15 @@ import {
   MAX_GAIN_RAMP_MS,
   DEFAULT_UNLOCK_FADE_IN_MS,
   MAX_ERROR_MESSAGE_LENGTH,
+  MIN_TARGET_LATENCY_MS,
+  MAX_TARGET_LATENCY_MS,
+  DEFAULT_TARGET_LATENCY_MS,
+  AUDIO_PREFS_STORAGE_KEY,
   clampVolume,
   clampGain,
+  clampTargetLatencyMs,
+  saveAudioPreferences,
+  loadAudioPreferences,
   sanitizeResumeError,
   createAudioRingSab,
   HDR_UNDERRUNS,
@@ -2210,4 +2217,548 @@ test('W238: updateGuestAudioTelemetry sanitizes guest PCM metrics and surfaces t
   assert.equal(engine.getStats().guestRingAttached, false);
 
   await engine.destroy();
+});
+
+test('W293: AudioContext statechange interruption arms gesture auto-recovery, avoids unhandled rejections, and cleans up in dispose/destroy/close', async () => {
+  let failNextResume = false;
+  const workerMsgs = [];
+
+  class InterruptibleAudioContext {
+    constructor(opts = {}) {
+      this.sampleRate = opts.sampleRate ?? 48000;
+      this.state = 'suspended';
+      this.destination = { kind: 'mock-destination' };
+      this.resumeCalls = 0;
+      this.suspendCalls = 0;
+      this.closeCalls = 0;
+      this._listeners = new Map();
+      this.audioWorklet = { addModule: async () => {} };
+    }
+    addEventListener(type, fn) {
+      if (!this._listeners.has(type)) this._listeners.set(type, new Set());
+      this._listeners.get(type).add(fn);
+    }
+    removeEventListener(type, fn) {
+      const set = this._listeners.get(type);
+      if (set) set.delete(fn);
+    }
+    listenerCount(type) {
+      return this._listeners.has(type) ? this._listeners.get(type).size : 0;
+    }
+    _emit(type) {
+      const set = this._listeners.get(type);
+      if (!set) return;
+      for (const fn of Array.from(set)) fn({ target: this });
+    }
+    async resume() {
+      this.resumeCalls += 1;
+      if (failNextResume) {
+        failNextResume = false;
+        throw new Error('NotAllowedError: gesture needed after interruption');
+      }
+      this.state = 'running';
+      this._emit('statechange');
+    }
+    async suspend() {
+      this.suspendCalls += 1;
+      this.state = 'suspended';
+      this._emit('statechange');
+    }
+    async close() {
+      this.closeCalls += 1;
+      this.state = 'closed';
+      this._emit('statechange');
+    }
+  }
+
+  const { MockAudioWorkletNode } = createMockWebAudioEnv();
+  const target = createMockEventTarget();
+  const engine = new AudioEngine({
+    audioWorker: { postMessage: (m) => workerMsgs.push(m) },
+    AudioContextCtor: InterruptibleAudioContext,
+    AudioWorkletNodeCtor: MockAudioWorkletNode,
+  });
+
+  await engine.start();
+  const ctx = engine.context;
+  assert.equal(ctx.listenerCount('statechange'), 1);
+  assert.equal(engine.getStats().interruptionCount, 0);
+  assert.equal(engine.getStats().autoRecoveryCount, 0);
+  assert.equal(engine.getStats().pendingAutoRecovery, false);
+
+  // Initial user gesture unlocks the suspended context (not an interruption).
+  engine.resumeOnUserGesture(target);
+  target.dispatch('pointerdown');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(engine.outputState, 'running');
+  assert.equal(engine.interruptionCount, 0);
+  assert.equal(engine.autoRecoveryCount, 0);
+  assert.equal(target.listenerCount('pointerdown'), 0);
+
+  // Unexpected OS audio interruption while playing -> increments interruptionCount once & re-arms gesture recovery.
+  ctx.state = 'interrupted';
+  ctx._emit('statechange');
+  assert.equal(engine.interruptionCount, 1);
+  assert.equal(engine.autoRecoveryCount, 0);
+  assert.equal(engine.pendingAutoRecovery, true);
+  assert.equal(engine.getStats().interruptionCount, 1);
+  assert.equal(engine.getStats().autoRecoveryCount, 0);
+  assert.equal(engine.getStats().pendingAutoRecovery, true);
+  assert.equal(target.listenerCount('pointerdown'), 1);
+  assert.equal(target.listenerCount('keydown'), 1);
+  assert.equal(
+    workerMsgs.some((m) => m.type === 'audio-context-state' && m.outputState === 'suspended' && m.interrupted === true),
+    true
+  );
+
+  // Duplicate statechange or interrupted->suspended transition does not double-count interruptionCount.
+  ctx._emit('statechange');
+  ctx.state = 'suspended';
+  ctx._emit('statechange');
+  assert.equal(engine.interruptionCount, 1);
+
+  // Next user gesture recovers automatically, updates autoRecoveryCount, and cleans up gesture listeners.
+  target.dispatch('click');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(engine.outputState, 'running');
+  assert.equal(engine.interruptionCount, 1);
+  assert.equal(engine.autoRecoveryCount, 1);
+  assert.equal(engine.pendingAutoRecovery, false);
+  assert.equal(target.listenerCount('pointerdown'), 0);
+  assert.equal(target.listenerCount('click'), 0);
+  assert.equal(
+    workerMsgs.some(
+      (m) => m.type === 'audio-context-state' && m.outputState === 'active' && m.recoveredFromInterruption === true
+    ),
+    true
+  );
+
+  // Unexpected drop directly to 'suspended' while running also triggers recovery; failed gesture retries cleanly.
+  ctx.state = 'suspended';
+  ctx._emit('statechange');
+  assert.equal(engine.interruptionCount, 2);
+  assert.equal(engine.pendingAutoRecovery, true);
+  assert.equal(target.listenerCount('keydown'), 1);
+
+  failNextResume = true;
+  target.dispatch('keydown');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(engine.autoRecoveryCount, 1);
+  assert.equal(engine.pendingAutoRecovery, true);
+  assert.equal(target.listenerCount('keydown'), 1);
+
+  target.dispatch('keydown');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(engine.outputState, 'running');
+  assert.equal(engine.interruptionCount, 2);
+  assert.equal(engine.autoRecoveryCount, 2);
+  assert.equal(engine.pendingAutoRecovery, false);
+  assert.equal(target.listenerCount('keydown'), 0);
+
+  // Intentional engine.suspend() must NOT be miscounted as an unexpected interruption or arm gesture listeners.
+  assert.equal(await engine.suspend(), true);
+  assert.equal(engine.interruptionCount, 2);
+  assert.equal(engine.pendingAutoRecovery, false);
+  assert.equal(target.listenerCount('pointerdown'), 0);
+
+  // Resume, then interrupt again and verify dispose() removes both statechange and armed gesture listeners.
+  assert.equal(await engine.resume(), true);
+  ctx.state = 'interrupted';
+  ctx._emit('statechange');
+  assert.equal(engine.interruptionCount, 3);
+  assert.equal(target.listenerCount('pointerdown'), 1);
+
+  await engine.dispose();
+  assert.equal(engine.outputState, 'closed');
+  assert.equal(ctx.listenerCount('statechange'), 0);
+  assert.equal(target.listenerCount('pointerdown'), 0);
+  assert.equal(target.listenerCount('keydown'), 0);
+
+  // Emitting statechange on the closed context after dispose() is a safe no-op.
+  ctx.state = 'interrupted';
+  ctx._emit('statechange');
+  assert.equal(engine.interruptionCount, 3);
+});
+
+test('W293: recoverFromInterruption handles explicit recovery, click-free GainNode fade-in, spontaneous OS resume, and error/reset edge cases', async () => {
+  const env = createGainNodeMockWebAudioEnv({
+    initialState: 'running',
+    initialCurrentTime: 5.0,
+  });
+  const target = createMockEventTarget();
+  const engine = new AudioEngine({
+    volume: 0.75,
+    gestureTarget: target,
+    AudioContextCtor: env.MockAudioContext,
+    AudioWorkletNodeCtor: env.MockAudioWorkletNode,
+  });
+
+  // Before start() -> fails gracefully.
+  const preStart = await engine.recoverFromInterruption();
+  assert.equal(preStart.ok, false);
+  assert.equal(preStart.recovered, false);
+  assert.equal(preStart.reason, 'not-started');
+
+  await engine.start();
+  const ctx = env.events.contexts[0];
+  const gainNode = env.events.gainNodes[0];
+
+  // Already running -> idempotent no-op.
+  const already = await engine.recoverFromInterruption();
+  assert.equal(already.ok, true);
+  assert.equal(already.recovered, false);
+  assert.equal(already.alreadyRunning, true);
+  assert.equal(already.autoRecoveryCount, 0);
+
+  // Interrupt running context -> explicit recoverFromInterruption() restores cleanly with GainNode ramp.
+  ctx.state = 'interrupted';
+  ctx._emit('statechange');
+  assert.equal(engine.interruptionCount, 1);
+  assert.equal(target.listenerCount('pointerdown'), 1);
+
+  ctx.currentTime = 6.0;
+  const recRes = await engine.recoverFromInterruption({ fadeInMs: 30 });
+  assert.equal(recRes.ok, true);
+  assert.equal(recRes.recovered, true);
+  assert.equal(recRes.alreadyRunning, false);
+  assert.equal(recRes.state, 'running');
+  assert.equal(recRes.interruptionCount, 1);
+  assert.equal(recRes.autoRecoveryCount, 1);
+  assert.equal(recRes.reason, null);
+  assert.equal(engine.pendingAutoRecovery, false);
+  assert.equal(target.listenerCount('pointerdown'), 0);
+
+  const rampOps = gainNode.ops.slice(-3);
+  assert.equal(rampOps[0].op, 'cancel');
+  assert.equal(rampOps[1].op, 'set');
+  assert.equal(rampOps[1].value, 0.0);
+  assert.equal(rampOps[2].op, 'linearRamp');
+  assert.equal(rampOps[2].value, 0.75);
+  assert.ok(Math.abs(rampOps[2].endTime - 6.03) < 1e-9);
+
+  // Spontaneous OS/browser resume via statechange increments autoRecoveryCount once and disarms gesture listeners.
+  ctx.state = 'interrupted';
+  ctx._emit('statechange');
+  assert.equal(engine.interruptionCount, 2);
+  assert.equal(target.listenerCount('pointerdown'), 1);
+
+  ctx.state = 'running';
+  ctx._emit('statechange');
+  assert.equal(engine.interruptionCount, 2);
+  assert.equal(engine.autoRecoveryCount, 2);
+  assert.equal(engine.pendingAutoRecovery, false);
+  assert.equal(target.listenerCount('pointerdown'), 0);
+
+  // reset({ preserveStats: true }) keeps interruption/recovery counts; full reset() clears them.
+  engine.reset({ preserveStats: true });
+  assert.equal(engine.getStats().interruptionCount, 2);
+  assert.equal(engine.getStats().autoRecoveryCount, 2);
+
+  engine.reset();
+  assert.equal(engine.getStats().interruptionCount, 0);
+  assert.equal(engine.getStats().autoRecoveryCount, 0);
+  assert.equal(engine.getAudioStats().interruptionCount, 0);
+  assert.equal(engine.getAudioStats().autoRecoveryCount, 0);
+
+  // Failed explicit recovery returns structured error and arms gesture fallback without unhandled rejection.
+  const failEnv = createMockWebAudioEnv({
+    initialState: 'running',
+    resumeError: new Error('NotAllowedError: blocked'),
+  });
+  const failTarget = createMockEventTarget();
+  const failEngine = new AudioEngine({
+    gestureTarget: failTarget,
+    AudioContextCtor: failEnv.MockAudioContext,
+    AudioWorkletNodeCtor: failEnv.MockAudioWorkletNode,
+  });
+  await failEngine.start();
+  failEnv.events.contexts[0].state = 'interrupted';
+  failEnv.events.contexts[0]._emit('statechange');
+
+  const failRec = await failEngine.recoverFromInterruption();
+  assert.equal(failRec.ok, false);
+  assert.equal(failRec.recovered, false);
+  assert.equal(failRec.reason, 'resume-failed');
+  assert.equal(failRec.interruptionCount, 1);
+  assert.equal(failRec.autoRecoveryCount, 0);
+  assert.match(failRec.error, /NotAllowedError/);
+  assert.equal(failTarget.listenerCount('pointerdown'), 1);
+
+  await failEngine.close();
+  assert.equal(failTarget.listenerCount('pointerdown'), 0);
+
+  await engine.dispose();
+  const closedRec = await engine.recoverFromInterruption();
+  assert.equal(closedRec.ok, false);
+  assert.equal(closedRec.reason, 'closed');
+});
+
+test('W293: setTargetLatencyMs clamps [10, 120] (default 30), forwards control message to audioWorker, and surfaces in getStats()', async () => {
+  assert.equal(MIN_TARGET_LATENCY_MS, 10);
+  assert.equal(MAX_TARGET_LATENCY_MS, 120);
+  assert.equal(DEFAULT_TARGET_LATENCY_MS, 30);
+
+  // Standalone clampTargetLatencyMs guardrails.
+  assert.equal(clampTargetLatencyMs(30), 30);
+  assert.equal(clampTargetLatencyMs(10), 10);
+  assert.equal(clampTargetLatencyMs(120), 120);
+  assert.equal(clampTargetLatencyMs(0), 10);
+  assert.equal(clampTargetLatencyMs(-50), 10);
+  assert.equal(clampTargetLatencyMs(-0), 10);
+  assert.equal(clampTargetLatencyMs(250), 120);
+  assert.equal(clampTargetLatencyMs(Number.NaN), 30);
+  assert.equal(clampTargetLatencyMs(Number.POSITIVE_INFINITY), 30);
+  assert.equal(clampTargetLatencyMs(Number.NEGATIVE_INFINITY), 30);
+  assert.equal(clampTargetLatencyMs('45'), 30);
+  assert.equal(clampTargetLatencyMs(Number.NaN, 50), 50);
+  assert.equal(clampTargetLatencyMs(Number.NaN, 2), 10);
+  assert.equal(clampTargetLatencyMs(Number.NaN, 999), 120);
+
+  // Constructor default and clamping.
+  assert.equal(new AudioEngine().targetLatencyMs, 30);
+  assert.equal(new AudioEngine({ targetLatencyMs: 5 }).targetLatencyMs, 10);
+  assert.equal(new AudioEngine({ targetLatencyMs: 300 }).targetLatencyMs, 120);
+  assert.equal(new AudioEngine({ targetLatencyMs: Number.NaN }).targetLatencyMs, 30);
+  assert.equal(new AudioEngine({ targetLatencyMs: 45 }).getStats().targetLatencyMs, 45);
+
+  // Worker postMessage forwarding & non-finite rejection.
+  const workerMsgs = [];
+  const engine = new AudioEngine({
+    sampleRate: 48000,
+    audioWorker: { postMessage: (msg) => workerMsgs.push(msg) },
+  });
+
+  assert.equal(engine.targetLatencyMs, 30);
+  assert.equal(engine.getStats().targetLatencyMs, 30);
+  assert.equal(engine.getAudioStats().targetLatencyMs, 30);
+  assert.equal(engine.getTelemetry().targetLatencyMs, 30);
+
+  assert.equal(engine.setTargetLatencyMs(33.33), 33.33);
+  assert.equal(engine.setTargetLatencyMs(4), 10);
+  assert.equal(engine.setTargetLatencyMs(500), 120);
+
+  // Non-finite / non-number inputs preserve active value and never forward.
+  const msgCountBeforeInvalid = workerMsgs.length;
+  assert.equal(engine.setTargetLatencyMs(Number.NaN), 120);
+  assert.equal(engine.setTargetLatencyMs(Number.POSITIVE_INFINITY), 120);
+  assert.equal(engine.setTargetLatencyMs(Number.NEGATIVE_INFINITY), 120);
+  assert.equal(engine.setTargetLatencyMs('25'), 120);
+  assert.equal(engine.setTargetLatencyMs(null), 120);
+  assert.equal(engine.setTargetLatencyMs(undefined), 120);
+  assert.equal(workerMsgs.length, msgCountBeforeInvalid);
+
+  assert.deepEqual(workerMsgs, [
+    {
+      type: 'setTargetLatencyMs',
+      setTargetLatencyMs: true,
+      targetLatencyMs: 33.33,
+      targetLatencyFrames: Math.round((33.33 / 1000) * 48000),
+      sampleRate: 48000,
+    },
+    {
+      type: 'setTargetLatencyMs',
+      setTargetLatencyMs: true,
+      targetLatencyMs: 10,
+      targetLatencyFrames: 480,
+      sampleRate: 48000,
+    },
+    {
+      type: 'setTargetLatencyMs',
+      setTargetLatencyMs: true,
+      targetLatencyMs: 120,
+      targetLatencyFrames: 5760,
+      sampleRate: 48000,
+    },
+  ]);
+
+  // Defensive getStats() snapshot cannot corrupt internal targetLatencyMs.
+  const snap = engine.getStats();
+  assert.equal(snap.targetLatencyMs, 120);
+  snap.targetLatencyMs = -999;
+  assert.equal(engine.getStats().targetLatencyMs, 120);
+
+  // Direct bridge method forwarding.
+  const bridgeCalls = [];
+  engine.setAudioWorker({
+    setTargetLatencyMs(ms) {
+      bridgeCalls.push(ms);
+    },
+  });
+  assert.equal(engine.setTargetLatencyMs(24), 24);
+  assert.deepEqual(bridgeCalls, [24]);
+
+  await engine.destroy();
+});
+
+test('W293: saveAudioPreferences / loadAudioPreferences persist sanitized { muted, volume } under playgta6:audio:prefs:v1 and handle storage errors gracefully', async () => {
+  assert.equal(AUDIO_PREFS_STORAGE_KEY, 'playgta6:audio:prefs:v1');
+
+  const storeMap = new Map();
+  const mockStorage = {
+    getItem(key) {
+      return storeMap.has(key) ? storeMap.get(key) : null;
+    },
+    setItem(key, value) {
+      storeMap.set(key, String(value));
+    },
+  };
+
+  // Empty storage returns not-found without throwing or mutating engine state.
+  const engine1 = new AudioEngine({ volume: 0.65, muted: false });
+  const emptyLoad = engine1.loadAudioPreferences(mockStorage);
+  assert.equal(emptyLoad.ok, true);
+  assert.equal(emptyLoad.loaded, false);
+  assert.equal(emptyLoad.applied, false);
+  assert.equal(emptyLoad.prefs, null);
+  assert.equal(emptyLoad.reason, 'not-found');
+  assert.equal(engine1.volume, 0.65);
+  assert.equal(engine1.muted, false);
+
+  // Save engine preferences -> stored JSON contains strictly sanitized { muted, volume }.
+  engine1.setVolume(0.42);
+  engine1.setMuted(true);
+  const saveRes = engine1.saveAudioPreferences(mockStorage);
+  assert.equal(saveRes.ok, true);
+  assert.equal(saveRes.saved, true);
+  assert.equal(saveRes.key, 'playgta6:audio:prefs:v1');
+  assert.deepEqual(saveRes.prefs, { muted: true, volume: 0.42 });
+
+  const rawStored = storeMap.get('playgta6:audio:prefs:v1');
+  assert.equal(typeof rawStored, 'string');
+  const parsedStored = JSON.parse(rawStored);
+  assert.deepEqual(Object.keys(parsedStored).sort(), ['muted', 'volume']);
+  assert.deepEqual(parsedStored, { muted: true, volume: 0.42 });
+
+  // Load into a fresh AudioEngine session and verify worklet/worker receive applied values.
+  const workerMsgs = [];
+  const { MockAudioContext, MockAudioWorkletNode, events } = createMockWebAudioEnv({
+    initialState: 'running',
+  });
+  const engine2 = new AudioEngine({
+    volume: 1.0,
+    muted: false,
+    audioWorker: { postMessage: (m) => workerMsgs.push(m) },
+    AudioContextCtor: MockAudioContext,
+    AudioWorkletNodeCtor: MockAudioWorkletNode,
+  });
+  await engine2.start();
+
+  const inspectOnly = engine2.loadAudioPreferences(mockStorage, { apply: false });
+  assert.equal(inspectOnly.ok, true);
+  assert.equal(inspectOnly.loaded, true);
+  assert.equal(inspectOnly.applied, false);
+  assert.deepEqual(inspectOnly.prefs, { muted: true, volume: 0.42 });
+  assert.equal(engine2.volume, 1.0);
+  assert.equal(engine2.muted, false);
+
+  const loadRes = engine2.loadAudioPreferences(mockStorage);
+  assert.equal(loadRes.ok, true);
+  assert.equal(loadRes.loaded, true);
+  assert.equal(loadRes.applied, true);
+  assert.deepEqual(loadRes.prefs, { muted: true, volume: 0.42 });
+  assert.equal(engine2.volume, 0.42);
+  assert.equal(engine2.muted, true);
+  assert.equal(engine2.getStats().effectiveGain, 0.0);
+  assert.deepEqual(events.nodes[0].postedMessages, [
+    { type: 'setGain', gain: 0.42 },
+    { type: 'setMuted', muted: true },
+  ]);
+  assert.equal(workerMsgs.some((m) => m.type === 'setMasterGain' && m.volume === 0.42), true);
+  assert.equal(workerMsgs.some((m) => m.type === 'setMuted' && m.muted === true), true);
+
+  // Corrupted JSON, non-object JSON, invalid-typed payloads, and extra fields are sanitized safely.
+  storeMap.set('playgta6:audio:prefs:v1', '{not valid json');
+  const badJson = engine2.loadAudioPreferences(mockStorage);
+  assert.equal(badJson.ok, false);
+  assert.equal(badJson.loaded, false);
+  assert.equal(badJson.reason, 'invalid-data');
+  assert.equal(engine2.volume, 0.42);
+  assert.equal(engine2.muted, true);
+
+  storeMap.set('playgta6:audio:prefs:v1', JSON.stringify([1, 2, 3]));
+  assert.equal(engine2.loadAudioPreferences(mockStorage).reason, 'invalid-data');
+
+  storeMap.set('playgta6:audio:prefs:v1', JSON.stringify({ muted: 'yes', volume: 'loud', secret: 'xyz' }));
+  assert.equal(engine2.loadAudioPreferences(mockStorage).reason, 'invalid-data');
+  assert.equal(engine2.volume, 0.42);
+  assert.equal(engine2.muted, true);
+
+  // Extra fields are stripped and out-of-range volume is clamped on load.
+  storeMap.set(
+    'playgta6:audio:prefs:v1',
+    JSON.stringify({ muted: false, volume: 5.5, token: 'secret-value', extra: 123 })
+  );
+  const clampedLoad = engine2.loadAudioPreferences(mockStorage);
+  assert.equal(clampedLoad.ok, true);
+  assert.equal(clampedLoad.loaded, true);
+  assert.deepEqual(clampedLoad.prefs, { muted: false, volume: 1.0 });
+  assert.deepEqual(Object.keys(clampedLoad.prefs).sort(), ['muted', 'volume']);
+  assert.equal(engine2.volume, 1.0);
+  assert.equal(engine2.muted, false);
+
+  // SecurityError / QuotaExceededError / unavailable storage are caught cleanly without throwing.
+  const securityErrorStorage = {
+    getItem() {
+      const err = new Error('The operation is insecure');
+      err.name = 'SecurityError';
+      throw err;
+    },
+    setItem() {
+      const err = new Error('The operation is insecure');
+      err.name = 'SecurityError';
+      throw err;
+    },
+  };
+  const secSave = engine2.saveAudioPreferences(securityErrorStorage);
+  assert.equal(secSave.ok, false);
+  assert.equal(secSave.saved, false);
+  assert.equal(secSave.reason, 'storage-error');
+  assert.match(secSave.error, /SecurityError/);
+
+  const secLoad = engine2.loadAudioPreferences(securityErrorStorage);
+  assert.equal(secLoad.ok, false);
+  assert.equal(secLoad.loaded, false);
+  assert.equal(secLoad.reason, 'storage-error');
+  assert.match(secLoad.error, /SecurityError/);
+
+  // Explicit null storage -> storage-unavailable without throwing.
+  assert.equal(engine2.saveAudioPreferences(null).reason, 'storage-unavailable');
+  assert.equal(engine2.loadAudioPreferences(null).reason, 'storage-unavailable');
+
+  // Standalone exported helpers strip extra fields and guard throwing globalThis.localStorage getter.
+  const standaloneSave = saveAudioPreferences(
+    { muted: 1, volume: -3.0, leakedPath: 'C:\\Users\\secret' },
+    mockStorage
+  );
+  assert.equal(standaloneSave.ok, true);
+  assert.deepEqual(standaloneSave.prefs, { muted: true, volume: 0.0 });
+  assert.deepEqual(JSON.parse(storeMap.get('playgta6:audio:prefs:v1')), { muted: true, volume: 0.0 });
+
+  const standaloneLoad = loadAudioPreferences(mockStorage);
+  assert.equal(standaloneLoad.ok, true);
+  assert.equal(standaloneLoad.loaded, true);
+  assert.deepEqual(standaloneLoad.prefs, { muted: true, volume: 0.0 });
+
+  const prevDesc = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  try {
+    Object.defineProperty(globalThis, 'localStorage', {
+      configurable: true,
+      get() {
+        const err = new Error('Storage access denied');
+        err.name = 'SecurityError';
+        throw err;
+      },
+    });
+    assert.equal(engine2.saveAudioPreferences().reason, 'storage-unavailable');
+    assert.equal(engine2.loadAudioPreferences().reason, 'storage-unavailable');
+  } finally {
+    if (prevDesc) {
+      Object.defineProperty(globalThis, 'localStorage', prevDesc);
+    } else {
+      delete globalThis.localStorage;
+    }
+  }
+
+  await engine1.destroy();
+  await engine2.destroy();
 });

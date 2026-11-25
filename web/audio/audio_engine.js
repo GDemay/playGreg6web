@@ -31,6 +31,10 @@ export const DEFAULT_GAIN_RAMP_MS = 15;
 export const MAX_GAIN_RAMP_MS = 5000;
 export const DEFAULT_UNLOCK_FADE_IN_MS = 25;
 export const MAX_GUEST_PCM_CHANNELS = 8;
+export const MIN_TARGET_LATENCY_MS = 10;
+export const MAX_TARGET_LATENCY_MS = 120;
+export const DEFAULT_TARGET_LATENCY_MS = 30;
+export const AUDIO_PREFS_STORAGE_KEY = 'playgta6:audio:prefs:v1';
 export const DEFAULT_GESTURE_EVENTS = Object.freeze([
   'pointerdown',
   'keydown',
@@ -566,6 +570,215 @@ export function clampVolume(value, fallback = 1.0) {
 
 export const clampGain = clampVolume;
 
+/**
+ * Clamps a jitter-buffer latency target in milliseconds to [MIN_TARGET_LATENCY_MS, MAX_TARGET_LATENCY_MS]
+ * ([10, 120], default 30 ms). Non-number and non-finite inputs resolve to the sanitized fallback.
+ *
+ * @param {unknown} value
+ * @param {number} [fallback=DEFAULT_TARGET_LATENCY_MS]
+ * @returns {number}
+ */
+export function clampTargetLatencyMs(value, fallback = DEFAULT_TARGET_LATENCY_MS) {
+  const safeFallback =
+    typeof fallback === 'number' && Number.isFinite(fallback)
+      ? fallback <= MIN_TARGET_LATENCY_MS
+        ? MIN_TARGET_LATENCY_MS
+        : fallback >= MAX_TARGET_LATENCY_MS
+          ? MAX_TARGET_LATENCY_MS
+          : fallback
+      : DEFAULT_TARGET_LATENCY_MS;
+
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return safeFallback;
+  }
+  if (value <= MIN_TARGET_LATENCY_MS) {
+    return MIN_TARGET_LATENCY_MS;
+  }
+  if (value >= MAX_TARGET_LATENCY_MS) {
+    return MAX_TARGET_LATENCY_MS;
+  }
+  return value;
+}
+
+function resolveStorageCandidate(storage) {
+  if (storage !== undefined) {
+    return storage && typeof storage === 'object' ? storage : null;
+  }
+  try {
+    if (typeof globalThis !== 'undefined' && globalThis.localStorage) {
+      return globalThis.localStorage;
+    }
+  } catch {
+    // Accessing localStorage can throw SecurityError in sandboxed/opaque contexts.
+  }
+  return null;
+}
+
+/**
+ * Persists strictly sanitized `{ muted, volume }` preferences under
+ * `AUDIO_PREFS_STORAGE_KEY` (`'playgta6:audio:prefs:v1'`), catching
+ * `SecurityError`, `QuotaExceededError`, and unavailable storage gracefully.
+ *
+ * @param {{ muted?: boolean, volume?: number }} prefs
+ * @param {Storage|null} [storage]
+ * @returns {{ ok: boolean, saved: boolean, prefs: { muted: boolean, volume: number }|null, key: string, reason: string|null, error?: string|null }}
+ */
+export function saveAudioPreferences(prefs, storage = undefined) {
+  const targetStorage = resolveStorageCandidate(storage);
+  if (!targetStorage || typeof targetStorage.setItem !== 'function') {
+    return {
+      ok: false,
+      saved: false,
+      prefs: null,
+      key: AUDIO_PREFS_STORAGE_KEY,
+      reason: 'storage-unavailable',
+    };
+  }
+
+  let rawMuted = false;
+  let rawVolume = 1.0;
+  if (prefs && typeof prefs === 'object') {
+    try {
+      rawMuted = prefs.muted;
+    } catch {
+      rawMuted = false;
+    }
+    try {
+      rawVolume = prefs.volume;
+    } catch {
+      rawVolume = 1.0;
+    }
+  }
+
+  const sanitized = {
+    muted: Boolean(rawMuted),
+    volume: clampVolume(rawVolume, 1.0),
+  };
+
+  try {
+    targetStorage.setItem(AUDIO_PREFS_STORAGE_KEY, JSON.stringify(sanitized));
+    return {
+      ok: true,
+      saved: true,
+      prefs: { muted: sanitized.muted, volume: sanitized.volume },
+      key: AUDIO_PREFS_STORAGE_KEY,
+      reason: null,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      saved: false,
+      prefs: null,
+      key: AUDIO_PREFS_STORAGE_KEY,
+      reason: 'storage-error',
+      error: sanitizeResumeError(err),
+    };
+  }
+}
+
+/**
+ * Loads and sanitizes `{ muted, volume }` preferences stored under
+ * `AUDIO_PREFS_STORAGE_KEY` (`'playgta6:audio:prefs:v1'`), catching
+ * `SecurityError`, corrupted JSON, and unavailable storage gracefully.
+ *
+ * @param {Storage|null} [storage]
+ * @returns {{ ok: boolean, loaded: boolean, prefs: { muted: boolean, volume: number }|null, key: string, reason: string|null, error?: string|null }}
+ */
+export function loadAudioPreferences(storage = undefined) {
+  const targetStorage = resolveStorageCandidate(storage);
+  if (!targetStorage || typeof targetStorage.getItem !== 'function') {
+    return {
+      ok: false,
+      loaded: false,
+      prefs: null,
+      key: AUDIO_PREFS_STORAGE_KEY,
+      reason: 'storage-unavailable',
+    };
+  }
+
+  let raw;
+  try {
+    raw = targetStorage.getItem(AUDIO_PREFS_STORAGE_KEY);
+  } catch (err) {
+    return {
+      ok: false,
+      loaded: false,
+      prefs: null,
+      key: AUDIO_PREFS_STORAGE_KEY,
+      reason: 'storage-error',
+      error: sanitizeResumeError(err),
+    };
+  }
+
+  if (raw === null || raw === undefined) {
+    return {
+      ok: true,
+      loaded: false,
+      prefs: null,
+      key: AUDIO_PREFS_STORAGE_KEY,
+      reason: 'not-found',
+    };
+  }
+
+  if (typeof raw !== 'string' || raw.trim().length === 0) {
+    return {
+      ok: false,
+      loaded: false,
+      prefs: null,
+      key: AUDIO_PREFS_STORAGE_KEY,
+      reason: 'invalid-data',
+    };
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return {
+      ok: false,
+      loaded: false,
+      prefs: null,
+      key: AUDIO_PREFS_STORAGE_KEY,
+      reason: 'invalid-data',
+    };
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return {
+      ok: false,
+      loaded: false,
+      prefs: null,
+      key: AUDIO_PREFS_STORAGE_KEY,
+      reason: 'invalid-data',
+    };
+  }
+
+  const hasMuted = typeof parsed.muted === 'boolean';
+  const hasVolume = typeof parsed.volume === 'number' && Number.isFinite(parsed.volume);
+  if (!hasMuted && !hasVolume) {
+    return {
+      ok: false,
+      loaded: false,
+      prefs: null,
+      key: AUDIO_PREFS_STORAGE_KEY,
+      reason: 'invalid-data',
+    };
+  }
+
+  return {
+    ok: true,
+    loaded: true,
+    prefs: {
+      muted: hasMuted ? parsed.muted : false,
+      volume: hasVolume ? clampVolume(parsed.volume, 1.0) : 1.0,
+    },
+    hasMuted,
+    hasVolume,
+    key: AUDIO_PREFS_STORAGE_KEY,
+    reason: null,
+  };
+}
+
 export function audioRingByteLength(
   capacityFrames = DEFAULT_CAPACITY_FRAMES,
   channels = DEFAULT_CHANNELS
@@ -704,6 +917,11 @@ export class AudioEngine {
     this._muted = Boolean(opts.muted);
     this._audioWorker = opts.audioWorker || opts.worker || opts.bridge || null;
     this._unlockFadeInMs = sanitizeRampMs(opts.unlockFadeInMs, DEFAULT_UNLOCK_FADE_IN_MS);
+    this._targetLatencyMs = clampTargetLatencyMs(
+      opts.targetLatencyMs,
+      DEFAULT_TARGET_LATENCY_MS
+    );
+    this._autoRecoverOnInterruption = opts.autoRecoverOnInterruption !== false;
 
     this._sab = null;
     this._ctrl = null;
@@ -724,12 +942,19 @@ export class AudioEngine {
     this._masterGainRampMs = 0;
     this._masterGainHeldSilent = false;
     this._unlockedOnGesture = false;
+    this._wasPlaying = false;
+    this._explicitlySuspended = false;
+    this._pendingAutoRecovery = false;
+    this._inAutoRecovery = false;
+    this._inManualResume = false;
     this._status = 'idle';
     this._error = null;
     this._destroyed = false;
     this._startPromise = null;
     this._resumePromise = null;
     this._gestureCleanup = null;
+    this._lastGestureTarget = opts.gestureTarget || null;
+    this._lastGestureOptions = null;
     this._boundContextStateChange = null;
 
     this._guestPcmRing = null;
@@ -742,6 +967,8 @@ export class AudioEngine {
     this._resumeAttempts = 0;
     this._resumeSuccesses = 0;
     this._resumeFailures = 0;
+    this._interruptionCount = 0;
+    this._autoRecoveryCount = 0;
     this._stateTransitions = 0;
     this._lastResumeError = null;
     this._lastTrackedState = 'idle';
@@ -810,6 +1037,22 @@ export class AudioEngine {
 
   get muted() {
     return this._muted;
+  }
+
+  get targetLatencyMs() {
+    return this._targetLatencyMs;
+  }
+
+  get interruptionCount() {
+    return this._interruptionCount;
+  }
+
+  get autoRecoveryCount() {
+    return this._autoRecoveryCount;
+  }
+
+  get pendingAutoRecovery() {
+    return this._pendingAutoRecovery;
   }
 
   get error() {
@@ -1319,15 +1562,75 @@ export class AudioEngine {
     this._masterGainNode = masterGainNode;
     this._masterGainHeldSilent = holdSilentUntilResume;
     this._status = initialCtxState || 'running';
+    this._wasPlaying = this._status === 'running';
+    this._explicitlySuspended = false;
+    this._pendingAutoRecovery = false;
 
     this._boundContextStateChange = () => {
-      if (!this._destroyed && this._context) {
-        const liveState = this._readContextState(this._context);
-        if (liveState !== null) {
-          this._status = liveState;
-        }
-        this._emitStateChange();
+      if (this._destroyed || !this._context) {
+        return;
       }
+      const prevState = this._lastTrackedState;
+      const liveState = this._readContextState(this._context);
+      if (liveState !== null) {
+        this._status = liveState;
+      }
+      const nextState = sanitizeOutputState(this.state);
+
+      if (nextState === 'running') {
+        this._wasPlaying = true;
+        this._explicitlySuspended = false;
+        if (this._pendingAutoRecovery) {
+          if (this._inManualResume && !this._inAutoRecovery) {
+            this._pendingAutoRecovery = false;
+            this._clearGestureListeners();
+          } else {
+            this._markInterruptionRecovered();
+          }
+          if (
+            this._masterGainNode &&
+            this._masterGainHeldSilent &&
+            !this._inUnlockGesture &&
+            !this._inAutoRecovery
+          ) {
+            this._masterGainHeldSilent = false;
+            this._scheduleMasterGainRamp(
+              this._muted ? 0.0 : this._volume,
+              this._unlockFadeInMs,
+              0.0
+            );
+          }
+        }
+      } else if (
+        (nextState === 'interrupted' || nextState === 'suspended') &&
+        !this._explicitlySuspended &&
+        !this._pendingAutoRecovery &&
+        (prevState === 'running' || this._wasPlaying || this._unlockedOnGesture)
+      ) {
+        this._interruptionCount += 1;
+        this._pendingAutoRecovery = true;
+        if (this._masterGainNode) {
+          this._masterGainHeldSilent = true;
+        }
+        this._forwardToAudioWorker(
+          'setOutputState',
+          {
+            type: 'audio-context-state',
+            setOutputState: true,
+            outputState: 'suspended',
+            interrupted: nextState === 'interrupted',
+          },
+          ['suspended']
+        );
+        if (this._autoRecoverOnInterruption) {
+          this._armInterruptionRecovery();
+        }
+      } else if (nextState === 'closed') {
+        this._pendingAutoRecovery = false;
+        this._clearGestureListeners();
+      }
+
+      this._emitStateChange();
     };
     try {
       if (typeof ctx.addEventListener === 'function') {
@@ -1355,6 +1658,53 @@ export class AudioEngine {
       sab: this._sab,
       error: null,
     };
+  }
+
+  _clearGestureListeners() {
+    if (this._gestureCleanup) {
+      const fn = this._gestureCleanup;
+      this._gestureCleanup = null;
+      try {
+        fn();
+      } catch {
+        // Ignore teardown errors on gesture cleanup.
+      }
+    }
+  }
+
+  _markInterruptionRecovered() {
+    if (!this._pendingAutoRecovery) {
+      return false;
+    }
+    this._pendingAutoRecovery = false;
+    this._autoRecoveryCount += 1;
+    this._clearGestureListeners();
+    this._forwardToAudioWorker(
+      'setOutputState',
+      {
+        type: 'audio-context-state',
+        setOutputState: true,
+        outputState: 'active',
+        recoveredFromInterruption: true,
+      },
+      ['active']
+    );
+    return true;
+  }
+
+  _armInterruptionRecovery(target = undefined, options = undefined) {
+    if (this._destroyed || !this._context) {
+      return () => {};
+    }
+    const recoveryTarget =
+      target !== undefined ? target : this._lastGestureTarget || this._gestureTarget;
+    const recoveryOptions =
+      options !== undefined ? options : this._lastGestureOptions || {};
+    try {
+      return this.resumeOnUserGesture(recoveryTarget, recoveryOptions);
+    } catch {
+      return () => {};
+    }
   }
 
   /**
@@ -1385,7 +1735,14 @@ export class AudioEngine {
     const maxRetries = sanitizeFiniteNonNegInt(opts.maxRetries, 0);
     const retryDelayMs = sanitizeFiniteNonNegInt(opts.retryDelayMs, 0);
 
+    const isManual = !this._inAutoRecovery;
+    if (isManual) {
+      this._inManualResume = true;
+    }
     const promise = this._resumeInternal(maxRetries, retryDelayMs).finally(() => {
+      if (isManual) {
+        this._inManualResume = false;
+      }
       if (this._resumePromise === promise) {
         this._resumePromise = null;
       }
@@ -1443,7 +1800,22 @@ export class AudioEngine {
           this._resumeSuccesses += 1;
           this._lastResumeError = null;
           this._error = null;
-          if (this._masterGainNode && this._masterGainHeldSilent && !this._inUnlockGesture) {
+          this._wasPlaying = true;
+          this._explicitlySuspended = false;
+          if (this._pendingAutoRecovery) {
+            if (this._inManualResume && !this._inAutoRecovery) {
+              this._pendingAutoRecovery = false;
+              this._clearGestureListeners();
+            } else {
+              this._markInterruptionRecovered();
+            }
+          }
+          if (
+            this._masterGainNode &&
+            this._masterGainHeldSilent &&
+            !this._inUnlockGesture &&
+            !this._inAutoRecovery
+          ) {
             this._masterGainHeldSilent = false;
             this._scheduleMasterGainRamp(
               this._muted ? 0.0 : this._volume,
@@ -1484,6 +1856,139 @@ export class AudioEngine {
   }
 
   /**
+   * Explicitly recovers an interrupted or unexpectedly suspended `AudioContext`,
+   * updating `autoRecoveryCount`, fading master gain back in cleanly without
+   * clicks, and arming gesture fallback if autoplay still blocks immediate resume.
+   * Never throws or produces unhandled promise rejections.
+   *
+   * @param {object} [options]
+   * @param {number} [options.maxRetries=0]
+   * @param {number} [options.retryDelayMs=0]
+   * @param {number} [options.fadeInMs]
+   * @param {EventTarget} [options.gestureTarget]
+   * @param {boolean} [options.armGestureFallback=true]
+   * @returns {Promise<{ ok: boolean, recovered: boolean, alreadyRunning: boolean, state: string, interruptionCount: number, autoRecoveryCount: number, reason: string|null, error?: string|null }>}
+   */
+  async recoverFromInterruption(options = {}) {
+    const opts = options && typeof options === 'object' ? options : {};
+
+    if (this._destroyed) {
+      return {
+        ok: false,
+        recovered: false,
+        alreadyRunning: false,
+        state: 'closed',
+        interruptionCount: this._interruptionCount,
+        autoRecoveryCount: this._autoRecoveryCount,
+        reason: 'closed',
+      };
+    }
+
+    if (!this._context) {
+      return {
+        ok: false,
+        recovered: false,
+        alreadyRunning: false,
+        state: this.state,
+        interruptionCount: this._interruptionCount,
+        autoRecoveryCount: this._autoRecoveryCount,
+        reason: 'not-started',
+      };
+    }
+
+    const currentState = this._readContextState();
+    if (currentState === 'closed') {
+      return {
+        ok: false,
+        recovered: false,
+        alreadyRunning: false,
+        state: 'closed',
+        interruptionCount: this._interruptionCount,
+        autoRecoveryCount: this._autoRecoveryCount,
+        reason: 'closed',
+      };
+    }
+
+    if (currentState === 'running') {
+      const recoveredPending = this._markInterruptionRecovered();
+      return {
+        ok: true,
+        recovered: recoveredPending,
+        alreadyRunning: true,
+        state: 'running',
+        interruptionCount: this._interruptionCount,
+        autoRecoveryCount: this._autoRecoveryCount,
+        reason: null,
+      };
+    }
+
+    if (currentState === 'interrupted' || currentState === 'suspended') {
+      if (!this._pendingAutoRecovery) {
+        if (currentState === 'interrupted') {
+          this._interruptionCount += 1;
+        }
+        this._pendingAutoRecovery = true;
+      }
+      this._explicitlySuspended = false;
+    }
+
+    const fadeInMs = sanitizeRampMs(
+      opts.fadeInMs !== undefined ? opts.fadeInMs : opts.rampMs,
+      this._unlockFadeInMs
+    );
+    if (this._masterGainNode) {
+      this._scheduleMasterGainRamp(0.0, 0, 0.0);
+      this._masterGainHeldSilent = true;
+    }
+
+    const prevInAutoRecovery = this._inAutoRecovery;
+    this._inAutoRecovery = true;
+    let resumed = false;
+    try {
+      resumed = await this.resume({
+        maxRetries: opts.maxRetries,
+        retryDelayMs: opts.retryDelayMs,
+      });
+    } catch {
+      resumed = false;
+    } finally {
+      this._inAutoRecovery = prevInAutoRecovery;
+    }
+
+    if (!resumed || this._destroyed || !this._context) {
+      if (!this._destroyed && this._context && opts.armGestureFallback !== false) {
+        this._armInterruptionRecovery(opts.gestureTarget);
+      }
+      return {
+        ok: false,
+        recovered: false,
+        alreadyRunning: false,
+        state: this.state,
+        interruptionCount: this._interruptionCount,
+        autoRecoveryCount: this._autoRecoveryCount,
+        reason: this._destroyed ? 'closed' : 'resume-failed',
+        error: this._lastResumeError,
+      };
+    }
+
+    this._markInterruptionRecovered();
+    if (this._masterGainNode && this._masterGainHeldSilent) {
+      this._masterGainHeldSilent = false;
+      this._scheduleMasterGainRamp(this._muted ? 0.0 : this._volume, fadeInMs, 0.0);
+    }
+
+    return {
+      ok: true,
+      recovered: true,
+      alreadyRunning: false,
+      state: 'running',
+      interruptionCount: this._interruptionCount,
+      autoRecoveryCount: this._autoRecoveryCount,
+      reason: null,
+    };
+  }
+
+  /**
    * Safely suspends a running AudioContext without throwing in headless,
    * unsupported, or closed states.
    *
@@ -1495,11 +2000,13 @@ export class AudioEngine {
     }
     const currentState = this._readContextState();
     if (currentState === 'suspended') {
+      this._explicitlySuspended = true;
       return true;
     }
     if (currentState === 'closed' || typeof this._context.suspend !== 'function') {
       return false;
     }
+    this._explicitlySuspended = true;
     try {
       await this._context.suspend();
       if (this._destroyed || !this._context) {
@@ -1507,9 +2014,13 @@ export class AudioEngine {
       }
       const nextState = sanitizeOutputState(this._readContextState() || 'suspended');
       this._status = nextState;
+      if (nextState !== 'suspended') {
+        this._explicitlySuspended = false;
+      }
       this._emitStateChange();
       return nextState === 'suspended';
     } catch (err) {
+      this._explicitlySuspended = false;
       this._error =
         err instanceof Error
           ? err
@@ -1598,6 +2109,12 @@ export class AudioEngine {
       return () => {};
     }
 
+    this._lastGestureTarget = resolvedTarget;
+    this._lastGestureOptions = {
+      events: events.slice(),
+      maxRetries: retriesRemaining,
+    };
+
     const removeListeners = () => {
       if (activeCleanup) {
         const fn = activeCleanup;
@@ -1636,6 +2153,11 @@ export class AudioEngine {
           }
           return;
         }
+        const recovering = this._pendingAutoRecovery;
+        const prevInAutoRecovery = this._inAutoRecovery;
+        if (recovering) {
+          this._inAutoRecovery = true;
+        }
         let resumePromise;
         try {
           resumePromise = Promise.resolve(this.resume());
@@ -1645,9 +2167,13 @@ export class AudioEngine {
         resumePromise
           .catch(() => false)
           .then((resumed) => {
+            if (recovering) {
+              this._inAutoRecovery = prevInAutoRecovery;
+            }
             const postState = this._readContextState();
             if (resumed) {
               this._unlockedOnGesture = true;
+              const markedRecovery = recovering ? this._markInterruptionRecovered() : false;
               if (this._masterGainNode && this._masterGainHeldSilent) {
                 this._masterGainHeldSilent = false;
                 this._scheduleMasterGainRamp(
@@ -1656,16 +2182,19 @@ export class AudioEngine {
                   0.0
                 );
               }
-              this._forwardToAudioWorker(
-                'setOutputState',
-                {
-                  type: 'audio-context-state',
-                  setOutputState: true,
-                  outputState: 'active',
-                  unlockedOnGesture: true,
-                },
-                ['active']
-              );
+              if (!markedRecovery) {
+                this._forwardToAudioWorker(
+                  'setOutputState',
+                  {
+                    type: 'audio-context-state',
+                    setOutputState: true,
+                    outputState: 'active',
+                    unlockedOnGesture: true,
+                    ...(recovering ? { recoveredFromInterruption: true } : {}),
+                  },
+                  ['active']
+                );
+              }
             }
             if (
               !resumed &&
@@ -2327,6 +2856,110 @@ export class AudioEngine {
   }
 
   /**
+   * Sets the bounded low-latency jitter-buffer target in milliseconds,
+   * clamped to `[MIN_TARGET_LATENCY_MS, MAX_TARGET_LATENCY_MS]` (`[10, 120]`,
+   * default `30`), and forwards a control message to `audioWorker` when attached.
+   * Non-finite / non-number inputs are ignored without mutating the active target.
+   *
+   * @param {number} ms
+   * @returns {number} Active sanitized target latency in ms.
+   */
+  setTargetLatencyMs(ms) {
+    if (typeof ms !== 'number' || !Number.isFinite(ms)) {
+      return this._targetLatencyMs;
+    }
+
+    const clamped = clampTargetLatencyMs(ms, this._targetLatencyMs);
+    this._targetLatencyMs = clamped;
+    const sampleRate = sanitizePositiveFiniteNumber(
+      this.sampleRate,
+      this._requestedSampleRate
+    );
+    const targetLatencyFrames = Math.max(1, Math.round((clamped / 1000) * sampleRate));
+
+    this._forwardToAudioWorker(
+      'setTargetLatencyMs',
+      {
+        type: 'setTargetLatencyMs',
+        setTargetLatencyMs: true,
+        targetLatencyMs: clamped,
+        targetLatencyFrames,
+        sampleRate,
+      },
+      [clamped]
+    );
+
+    return this._targetLatencyMs;
+  }
+
+  /**
+   * Persists sanitized `{ muted, volume }` preferences for this engine under
+   * `'playgta6:audio:prefs:v1'`, gracefully catching `SecurityError` or
+   * unavailable storage.
+   *
+   * @param {Storage|null} [storage]
+   * @returns {{ ok: boolean, saved: boolean, prefs: { muted: boolean, volume: number }|null, key: string, reason: string|null, error?: string|null }}
+   */
+  saveAudioPreferences(storage = undefined) {
+    return saveAudioPreferences(
+      { muted: this._muted, volume: this._volume },
+      storage
+    );
+  }
+
+  /**
+   * Loads sanitized `{ muted, volume }` preferences from `'playgta6:audio:prefs:v1'`
+   * and applies them to this engine unless `options.apply === false`.
+   * Gracefully catches `SecurityError`, corrupted JSON, and unavailable storage.
+   *
+   * @param {Storage|null} [storage]
+   * @param {{ apply?: boolean }} [options]
+   * @returns {{ ok: boolean, loaded: boolean, applied: boolean, prefs: { muted: boolean, volume: number }|null, key: string, reason: string|null, error?: string|null }}
+   */
+  loadAudioPreferences(storage = undefined, options = {}) {
+    const res = loadAudioPreferences(storage);
+    if (!res.loaded || !res.prefs) {
+      const out = {
+        ok: res.ok,
+        loaded: false,
+        applied: false,
+        prefs: null,
+        key: AUDIO_PREFS_STORAGE_KEY,
+        reason: res.reason,
+      };
+      if (res.error !== undefined) {
+        out.error = res.error;
+      }
+      return out;
+    }
+
+    const opts = options && typeof options === 'object' ? options : {};
+    const shouldApply = opts.apply !== false;
+    const nextPrefs = {
+      muted: res.hasMuted ? res.prefs.muted : this._muted,
+      volume: res.hasVolume ? res.prefs.volume : this._volume,
+    };
+
+    if (shouldApply) {
+      if (res.hasVolume) {
+        this.setVolume(nextPrefs.volume);
+      }
+      if (res.hasMuted) {
+        this.setMuted(nextPrefs.muted);
+      }
+    }
+
+    return {
+      ok: true,
+      loaded: true,
+      applied: shouldApply,
+      prefs: nextPrefs,
+      key: AUDIO_PREFS_STORAGE_KEY,
+      reason: null,
+    };
+  }
+
+  /**
    * Returns the number of currently queued PCM frames in the bounded ring buffer.
    * @returns {number}
    */
@@ -2720,6 +3353,8 @@ export class AudioEngine {
       this._resumeAttempts = 0;
       this._resumeSuccesses = 0;
       this._resumeFailures = 0;
+      this._interruptionCount = 0;
+      this._autoRecoveryCount = 0;
       this._lastResumeError = null;
       this._error = null;
       this._gainClamps = 0;
@@ -2783,6 +3418,13 @@ export class AudioEngine {
     const guestOverruns = sanitizeFiniteNonNegInt(this._guestOverruns, 0);
     const guestPeakLevel = clampPeakLevel(this._guestPeakLevel, 0);
     const unlockedOnGesture = Boolean(this._unlockedOnGesture);
+    const targetLatencyMs = clampTargetLatencyMs(
+      this._targetLatencyMs,
+      DEFAULT_TARGET_LATENCY_MS
+    );
+    const interruptionCount = sanitizeFiniteNonNegInt(this._interruptionCount, 0);
+    const autoRecoveryCount = sanitizeFiniteNonNegInt(this._autoRecoveryCount, 0);
+    const pendingAutoRecovery = Boolean(this._pendingAutoRecovery);
 
     return {
       sampleRate: sanitizePositiveFiniteNumber(this.sampleRate, this._requestedSampleRate),
@@ -2806,11 +3448,15 @@ export class AudioEngine {
       masterGain: gain,
       muted,
       effectiveGain,
+      targetLatencyMs,
       gainClamps: sanitizeFiniteNonNegInt(this._gainClamps, 0),
       invalidGainInputs: sanitizeFiniteNonNegInt(this._invalidGainInputs, 0),
       resumeAttempts: sanitizeFiniteNonNegInt(this._resumeAttempts, 0),
       resumeSuccesses: sanitizeFiniteNonNegInt(this._resumeSuccesses, 0),
       resumeFailures: sanitizeFiniteNonNegInt(this._resumeFailures, 0),
+      interruptionCount,
+      autoRecoveryCount,
+      pendingAutoRecovery,
       stateTransitions: sanitizeFiniteNonNegInt(this._stateTransitions, 0),
       lastResumeError: this._lastResumeError,
       error: this._error ? sanitizeResumeError(this._error) : null,
@@ -2852,11 +3498,15 @@ export class AudioEngine {
       masterGain: telemetry.masterGain,
       muted: telemetry.muted,
       effectiveGain: telemetry.effectiveGain,
+      targetLatencyMs: telemetry.targetLatencyMs,
       gainClamps: telemetry.gainClamps,
       invalidGainInputs: telemetry.invalidGainInputs,
       resumeAttempts: telemetry.resumeAttempts,
       resumeSuccesses: telemetry.resumeSuccesses,
       resumeFailures: telemetry.resumeFailures,
+      interruptionCount: telemetry.interruptionCount,
+      autoRecoveryCount: telemetry.autoRecoveryCount,
+      pendingAutoRecovery: telemetry.pendingAutoRecovery,
       stateTransitions: telemetry.stateTransitions,
       lastResumeError: telemetry.lastResumeError,
       error: telemetry.error,
@@ -2888,6 +3538,7 @@ export class AudioEngine {
       volume: telemetry.volume,
       masterGain: telemetry.masterGain,
       effectiveGain: telemetry.effectiveGain,
+      targetLatencyMs: telemetry.targetLatencyMs,
       channels: telemetry.channels,
       capacityFrames: telemetry.capacityFrames,
       bufferedFrames: telemetry.bufferedFrames,
@@ -2897,6 +3548,9 @@ export class AudioEngine {
       resumeAttempts: telemetry.resumeAttempts,
       resumeSuccesses: telemetry.resumeSuccesses,
       resumeFailures: telemetry.resumeFailures,
+      interruptionCount: telemetry.interruptionCount,
+      autoRecoveryCount: telemetry.autoRecoveryCount,
+      pendingAutoRecovery: telemetry.pendingAutoRecovery,
       lastResumeError: telemetry.lastResumeError,
       guestRingAttached: telemetry.guestRingAttached,
       guestFramesDrained: telemetry.guestFramesDrained,
@@ -2912,6 +3566,14 @@ export class AudioEngine {
    * listeners, disconnects nodes, and closes the AudioContext.
    */
   async close() {
+    return this.destroy();
+  }
+
+  /**
+   * Alias for `destroy()`: idempotently stops the worklet, removes `statechange`
+   * and gesture listeners, disconnects nodes, and closes the AudioContext.
+   */
+  async dispose() {
     return this.destroy();
   }
 
@@ -2934,15 +3596,11 @@ export class AudioEngine {
     this._status = 'closed';
     this._resumePromise = null;
     this._masterGainHeldSilent = false;
+    this._pendingAutoRecovery = false;
+    this._wasPlaying = false;
+    this._explicitlySuspended = false;
 
-    if (this._gestureCleanup) {
-      try {
-        this._gestureCleanup();
-      } catch {
-        // Ignore teardown errors on gesture cleanup.
-      }
-      this._gestureCleanup = null;
-    }
+    this._clearGestureListeners();
 
     const node = this._node;
     this._node = null;
