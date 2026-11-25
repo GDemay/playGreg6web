@@ -1797,4 +1797,443 @@ test('W272: AudioMixer tracks underrunFadeOuts, recoveryFadeIns, softClippedSamp
   assert.equal(after.nonFiniteSanitized, 0);
 });
 
+// ---------------------------------------------------------------------------
+// W326: Zero-Alloc Stereo Bus Scratch Buffers, Volume/Mute Gain Ramping & Telemetry
+// ---------------------------------------------------------------------------
+
+test('W326: pre-allocated stereo bus scratch Float32Arrays achieve strict zero-allocation mixing across consecutive quanta', () => {
+  const mixer = new AudioMixer({
+    sampleRate: 48000,
+    quantumFrames: 128,
+    reuseOutputBuffer: true,
+  });
+
+  // Pre-allocated stereo bus scratch buffers share the _mixScratch backing store.
+  assert.ok(mixer._busLeftScratch instanceof Float32Array);
+  assert.ok(mixer._busRightScratch instanceof Float32Array);
+  assert.equal(mixer._busLeftScratch.length, 128);
+  assert.equal(mixer._busRightScratch.length, 128);
+  assert.equal(mixer._busLeftScratch.buffer, mixer._mixScratch.buffer);
+  assert.equal(mixer._busRightScratch.buffer, mixer._mixScratch.buffer);
+  assert.equal(mixer.getStats().zeroAllocMixQuanta, 0);
+
+  // Add mono, stereo, 5.1 surround, and 44.1 kHz resampled voices to exercise every mix loop.
+  const waveMono = new Float32Array(256);
+  const waveStereo = new Float32Array(256 * 2);
+  const wave51 = new Float32Array(256 * 6);
+  for (let f = 0; f < 256; f++) {
+    waveMono[f] = 0.15 * Math.sin((2 * Math.PI * 440 * f) / 48000);
+    waveStereo[f * 2] = 0.12 * Math.cos((2 * Math.PI * 220 * f) / 48000);
+    waveStereo[f * 2 + 1] = -0.1 * Math.sin((2 * Math.PI * 330 * f) / 48000);
+    wave51[f * 6] = 0.08;
+    wave51[f * 6 + 1] = -0.06;
+    wave51[f * 6 + 2] = 0.05;
+  }
+  mixer.createVoice({ samples: waveMono, sampleRate: 48000, channels: 1, gain: 0.8, pan: -0.4, loop: true });
+  mixer.createVoice({ samples: waveStereo, sampleRate: 48000, channels: 2, gain: 0.7, pan: 0.0, loop: true });
+  mixer.createVoice({ samples: wave51, sampleRate: 44100, channels: 6, gain: 0.5, pan: 0.25, loop: true });
+
+  const callerInterleaved = new Float32Array(128 * 2);
+  const planarLeft = new Float32Array(128);
+  const planarRight = new Float32Array(128);
+  const stereoRing = AudioRingBuffer.create(256, 2);
+  const drainStereo = new Float32Array(128 * 2);
+  const monoRing = AudioRingBuffer.create(256, 1);
+  const drainMono = new Float32Array(128);
+
+  const initialMixBuf = mixer._mixScratch.buffer;
+  const origFloat32 = globalThis.Float32Array;
+  let float32Allocs = 0;
+  let tracking = false;
+  globalThis.Float32Array = new Proxy(origFloat32, {
+    construct(target, args, newTarget) {
+      if (tracking) float32Allocs += 1;
+      return Reflect.construct(target, args, newTarget);
+    },
+  });
+
+  try {
+    tracking = true;
+    for (let q = 0; q < 32; q++) {
+      mixer.renderFrames(128);
+      mixer.mixInto(callerInterleaved, 128);
+      mixer.mixIntoPlanar(planarLeft, planarRight, 128);
+      assert.equal(mixer.pumpToRing(stereoRing, 128), 128);
+      assert.equal(stereoRing.pullSamples(drainStereo), 128);
+      assert.equal(mixer.pumpToRing(monoRing, 128), 128);
+      assert.equal(monoRing.pullSamples(drainMono), 128);
+    }
+    tracking = false;
+  } finally {
+    tracking = false;
+    globalThis.Float32Array = origFloat32;
+  }
+
+  assert.equal(float32Allocs, 0, `Expected 0 Float32Array allocations in hot mix loop, got ${float32Allocs}`);
+  assert.equal(mixer._mixScratch.buffer, initialMixBuf);
+  assert.equal(mixer._busLeftScratch.buffer, initialMixBuf);
+  assert.equal(mixer._busRightScratch.buffer, initialMixBuf);
+
+  let stats = mixer.getStats();
+  assert.equal(stats.scratchReallocations, 0);
+  assert.equal(stats.quantaMixed, 160);
+  assert.equal(stats.zeroAllocMixQuanta, 160);
+
+  // Verify planar output matches interleaved output bit-for-bit for identical voice state.
+  const refInterleaved = new AudioMixer({ sampleRate: 48000, quantumFrames: 128 });
+  const refPlanar = new AudioMixer({ sampleRate: 48000, quantumFrames: 128 });
+  refInterleaved.createVoice({ samples: waveStereo, channels: 2, gain: 0.9, pan: 0.0, loop: true });
+  refPlanar.createVoice({ samples: waveStereo, channels: 2, gain: 0.9, pan: 0.0, loop: true });
+  const outInt = new Float32Array(128 * 2);
+  const outL = new Float32Array(128);
+  const outR = new Float32Array(128);
+  refInterleaved.mixInto(outInt, 128);
+  refPlanar.mixIntoPlanar(outL, outR, 128);
+  for (let f = 0; f < 128; f++) {
+    assert.equal(outL[f], outInt[f * 2]);
+    assert.equal(outR[f], outInt[f * 2 + 1]);
+  }
+
+  // Growing beyond initial 128-frame capacity reallocates once and does NOT count that quantum as zero-alloc.
+  mixer.renderFrames(256);
+  stats = mixer.getStats();
+  assert.equal(stats.scratchReallocations, 1);
+  assert.equal(stats.quantaMixed, 161);
+  assert.equal(stats.zeroAllocMixQuanta, 160);
+  assert.equal(mixer._busLeftScratch.length, 256);
+  assert.equal(mixer._busRightScratch.length, 256);
+
+  // Subsequent 256-frame quanta run strictly zero-alloc again.
+  const grownBuf = mixer._mixScratch.buffer;
+  globalThis.Float32Array = new Proxy(origFloat32, {
+    construct(target, args, newTarget) {
+      if (tracking) float32Allocs += 1;
+      return Reflect.construct(target, args, newTarget);
+    },
+  });
+  try {
+    tracking = true;
+    for (let q = 0; q < 8; q++) {
+      mixer.renderFrames(256);
+    }
+    tracking = false;
+  } finally {
+    tracking = false;
+    globalThis.Float32Array = origFloat32;
+  }
+  assert.equal(float32Allocs, 0);
+  assert.equal(mixer._mixScratch.buffer, grownBuf);
+  stats = mixer.getStats();
+  assert.equal(stats.scratchReallocations, 1);
+  assert.equal(stats.quantaMixed, 169);
+  assert.equal(stats.zeroAllocMixQuanta, 168);
+});
+
+test('W326: smooth linear per-sample gain ramping on volume and mute changes eliminates clicks and zipper noise', () => {
+  const mixer = new AudioMixer({ sampleRate: 48000, softClip: true });
+  const dcStereo = new Float32Array(256 * 2);
+  for (let f = 0; f < 256; f++) {
+    dcStereo[f * 2] = 0.8;
+    dcStereo[f * 2 + 1] = -0.4;
+  }
+  const vId = mixer.createVoice({ samples: dcStereo, channels: 2, gain: 1.0, pan: 0.0, loop: true });
+
+  // 1. setVolume(0.25) defaults to 64-frame smooth linear ramp from 1.0 -> 0.25.
+  assert.equal(mixer.volume, 1.0);
+  assert.equal(mixer.muted, false);
+  assert.equal(mixer.setVolume(0.25), 0.25);
+  assert.equal(mixer.getStats().gainRampActive, true);
+
+  const volQ1 = mixer.renderFrames(32);
+  assert.equal(mixer.getStats().gainRampActive, true);
+  assert.ok(Math.abs(mixer.effectiveGain - 0.625) < 1e-6);
+
+  const volQ2 = mixer.renderFrames(32);
+  assert.equal(mixer.getStats().gainRampActive, false);
+  assert.ok(Math.abs(mixer.effectiveGain - 0.25) < 1e-6);
+  assert.equal(mixer.volume, 0.25);
+
+  // Verify bounded sample-to-sample step across all 64 frames (no click / zipper jump).
+  const expectedStepL = 0.8 * (0.75 / 64);
+  let prevL = 0.8;
+  let prevR = -0.4;
+  for (let f = 0; f < 64; f++) {
+    const l = f < 32 ? volQ1[f * 2] : volQ2[(f - 32) * 2];
+    const r = f < 32 ? volQ1[f * 2 + 1] : volQ2[(f - 32) * 2 + 1];
+    assert.ok(Math.abs(l - prevL) <= expectedStepL + 1e-5, `Volume ramp click on L frame ${f}`);
+    assert.ok(Math.abs(r - prevR) <= expectedStepL * 0.5 + 1e-5, `Volume ramp click on R frame ${f}`);
+    prevL = l;
+    prevR = r;
+  }
+  assert.ok(Math.abs(prevL - 0.2) < 1e-6);
+  assert.ok(Math.abs(prevR - -0.1) < 1e-6);
+
+  // 2. setMuted(true) ramps smoothly from 0.25 -> 0.0 over 64 frames while preserving logical volume.
+  assert.equal(mixer.setMuted(true), true);
+  assert.equal(mixer.muted, true);
+  assert.equal(mixer.volume, 0.25);
+  const muteOut = mixer.renderFrames(64);
+  let mutePrevL = 0.2;
+  const maxMuteStepL = 0.2 / 64;
+  for (let f = 0; f < 64; f++) {
+    const l = muteOut[f * 2];
+    assert.ok(Math.abs(l - mutePrevL) <= maxMuteStepL + 1e-5, `Mute ramp click at frame ${f}`);
+    assert.ok(l <= mutePrevL + 1e-6);
+    mutePrevL = l;
+  }
+  assert.equal(muteOut[63 * 2], 0.0);
+  assert.equal(muteOut[63 * 2 + 1], 0.0);
+  assert.equal(mixer.effectiveGain, 0.0);
+
+  // Changing volume while muted stores new volume without unmuting or emitting audio.
+  assert.equal(mixer.setVolume(0.8), 0.8);
+  assert.equal(mixer.muted, true);
+  const stillSilent = mixer.renderFrames(8);
+  assert.ok(stillSilent.every((s) => s === 0.0));
+
+  // 3. Unmuting ramps smoothly 0.0 -> 0.8, and mid-ramp mute reversal stays click-free.
+  assert.equal(mixer.setMute(false, 32), false);
+  const unmuteHalf = mixer.renderFrames(16); // reaches gain 0.4
+  assert.ok(Math.abs(mixer.effectiveGain - 0.4) < 1e-6);
+  // Reverse back to muted over 16 frames directly from instantaneous gain 0.4.
+  assert.equal(mixer.setMuted(true, 16), true);
+  const reverseHalf = mixer.renderFrames(16);
+  let revPrev = 0.0;
+  const maxUnmuteStep = (0.8 * 0.8) / 32;
+  for (let f = 0; f < 16; f++) {
+    const l = unmuteHalf[f * 2];
+    assert.ok(Math.abs(l - revPrev) <= maxUnmuteStep + 1e-5);
+    revPrev = l;
+  }
+  for (let f = 0; f < 16; f++) {
+    const l = reverseHalf[f * 2];
+    assert.ok(Math.abs(l - revPrev) <= maxUnmuteStep + 1e-5);
+    revPrev = l;
+  }
+  assert.equal(reverseHalf[15 * 2], 0.0);
+
+  // 4. Instant snap with explicit rampFrames = 0 and non-finite input safety.
+  mixer.setMuted(false, 0);
+  assert.ok(Math.abs(mixer.effectiveGain - 0.8) < 1e-6);
+  mixer.setVolume(Number.NaN);
+  assert.ok(Math.abs(mixer.volume - 0.8) < 1e-6);
+  mixer.setVolume(-1.0, 0);
+  assert.equal(mixer.volume, 0.0);
+  assert.equal(mixer.effectiveGain, 0.0);
+  mixer.rampMasterGain(1.0, 4);
+  const rampMasterOut = mixer.renderFrames(4);
+  assert.ok(Math.abs(rampMasterOut[3 * 2] - 0.8) < 1e-6);
+
+  // 5. Per-voice smooth mute/unmute ramping preserves unmutedGain across mute.
+  assert.equal(mixer.setVoiceMuted(vId, true, 8), true);
+  const voiceMuteOut = mixer.renderFrames(8);
+  assert.ok(voiceMuteOut[0] > 0.6 && voiceMuteOut[0] < 0.8);
+  assert.equal(voiceMuteOut[7 * 2], 0.0);
+  assert.equal(mixer.setVoiceGain(vId, 0.5, 0), true); // updates unmutedGain while muted
+  assert.equal(mixer.renderFrames(2)[0], 0.0);
+  assert.equal(mixer.setVoiceMuted(vId, false, 4), true);
+  const voiceUnmuteOut = mixer.renderFrames(4);
+  assert.ok(Math.abs(voiceUnmuteOut[3 * 2] - 0.4) < 1e-6);
+
+  // 6. Constructor supports { volume, muted } options directly.
+  const preMuted = new AudioMixer({ sampleRate: 48000, volume: 0.6, muted: true });
+  assert.equal(preMuted.volume, 0.6);
+  assert.equal(preMuted.muted, true);
+  assert.equal(preMuted.effectiveGain, 0.0);
+});
+
+test('W326: sanitized per-bus peak/RMS/clip telemetry in getStats() and clean resetStats() preserving voices & scratch', () => {
+  const mixer = new AudioMixer({
+    sampleRate: 48000,
+    softClip: true,
+    limiterKnee: 0.95,
+    quantumFrames: 128,
+    reuseOutputBuffer: true,
+  });
+
+  // 1. Asymmetric stereo DC voices: L = 0.8, R = -0.3 -> distinct peakLeft/peakRight & rmsLeft/rmsRight.
+  const vL = mixer.createVoice({
+    samples: new Float32Array(128).fill(0.8),
+    channels: 1,
+    pan: -1.0,
+    loop: true,
+  });
+  const vR = mixer.createVoice({
+    samples: new Float32Array(128).fill(-0.3),
+    channels: 1,
+    pan: 1.0,
+    loop: true,
+  });
+
+  mixer.renderFrames(128);
+  let stats = mixer.getStats();
+  assert.ok(Math.abs(stats.peakLeft - 0.8) < 1e-6);
+  assert.ok(Math.abs(stats.peakRight - 0.3) < 1e-6);
+  assert.ok(Math.abs(stats.rmsLeft - 0.8) < 1e-6);
+  assert.ok(Math.abs(stats.rmsRight - 0.3) < 1e-6);
+  assert.equal(stats.peakLevel, stats.peakLeft);
+  assert.equal(stats.clippedLeft, 0);
+  assert.equal(stats.clippedRight, 0);
+  assert.equal(stats.clippedSamples, 0);
+  assert.equal(stats.zeroAllocMixQuanta, 1);
+
+  // 2. Asymmetric clipping on Left bus + NaN injection on Right bus.
+  mixer.createVoice({
+    samples: new Float32Array(128).fill(0.5),
+    channels: 1,
+    pan: -1.0,
+    loop: false,
+  });
+  const badR = new Float32Array(128).fill(0.0);
+  badR[0] = Number.NaN;
+  badR[1] = Number.POSITIVE_INFINITY;
+  mixer.createVoice({ samples: badR, channels: 1, pan: 1.0, loop: false });
+
+  mixer.renderFrames(128);
+  stats = mixer.getStats();
+  const expectedClippedPeak = softClipSample(Math.fround(0.8) + Math.fround(0.5), 0.95);
+  assert.ok(Math.abs(stats.peakLeft - expectedClippedPeak) < 1e-5);
+  assert.ok(stats.peakLeft <= 1.0 && stats.peakRight <= 0.3 + 1e-6);
+  assert.equal(stats.clippedLeft, 128);
+  assert.equal(stats.clippedRight, 0);
+  assert.equal(stats.clippedSamples, 128);
+  assert.equal(stats.sanitizedNonFiniteSamples, 2);
+  assert.equal(stats.zeroAllocMixQuanta, 2);
+
+  // 3. Verify resetStats() clears all telemetry counters cleanly WITHOUT destroying voices, volume, or scratch buffers.
+  const mixBufBefore = mixer._mixScratch.buffer;
+  mixer.setVolume(0.5, 0);
+  mixer.resetStats();
+
+  const cleared = mixer.getStats();
+  assert.equal(cleared.peakLeft, 0);
+  assert.equal(cleared.peakRight, 0);
+  assert.equal(cleared.rmsLeft, 0);
+  assert.equal(cleared.rmsRight, 0);
+  assert.equal(cleared.peakLevel, 0);
+  assert.equal(cleared.peakOutputLevel, 0);
+  assert.equal(cleared.clippedLeft, 0);
+  assert.equal(cleared.clippedRight, 0);
+  assert.equal(cleared.clippedSamples, 0);
+  assert.equal(cleared.softClippedSamples, 0);
+  assert.equal(cleared.sanitizedNonFiniteSamples, 0);
+  assert.equal(cleared.framesMixed, 0);
+  assert.equal(cleared.renderedFrames, 0);
+  assert.equal(cleared.quantaMixed, 0);
+  assert.equal(cleared.zeroAllocMixQuanta, 0);
+  assert.equal(cleared.underrunQuanta, 0);
+  assert.equal(cleared.underrunFadeOuts, 0);
+  assert.equal(cleared.recoveryFadeIns, 0);
+  assert.equal(cleared.scratchReallocations, 0);
+  assert.equal(cleared.gainRampsStarted, 0);
+  // Active voices, volume, and scratch buffers remain intact.
+  assert.equal(mixer.hasVoice(vL), true);
+  assert.equal(mixer.hasVoice(vR), true);
+  assert.equal(cleared.activeVoices, 2);
+  assert.equal(cleared.volume, 0.5);
+  assert.equal(mixer._mixScratch.buffer, mixBufBefore);
+
+  // 4. Verify exact sine RMS (amplitude / sqrt(2)) on fresh post-resetStats window.
+  mixer.destroyVoice(vL);
+  mixer.destroyVoice(vR);
+  mixer.setVolume(1.0, 0);
+  const sineFrames = 480; // 10 cycles of 1 kHz at 48 kHz
+  const sineStereo = new Float32Array(sineFrames * 2);
+  for (let f = 0; f < sineFrames; f++) {
+    const theta = (2 * Math.PI * 1000 * f) / 48000;
+    sineStereo[f * 2] = 0.6 * Math.sin(theta);
+    sineStereo[f * 2 + 1] = 0.4 * Math.cos(theta);
+  }
+  mixer.createVoice({ samples: sineStereo, channels: 2, gain: 1.0, pan: 0.0, loop: false });
+  mixer.resetStats();
+  mixer.renderFrames(sineFrames);
+  const sineStats = mixer.getStats();
+  assert.ok(Math.abs(sineStats.rmsLeft - 0.6 * Math.SQRT1_2) < 1e-3);
+  assert.ok(Math.abs(sineStats.rmsRight - 0.4 * Math.SQRT1_2) < 1e-3);
+  assert.ok(Math.abs(sineStats.peakLeft - 0.6) < 1e-3);
+  assert.ok(Math.abs(sineStats.peakRight - 0.4) < 1e-3);
+
+  // 5. Telemetry sanitization guards against corrupted internal NaN/Infinity/negative values.
+  mixer._peakLeft = Number.NaN;
+  mixer._peakRight = Number.POSITIVE_INFINITY;
+  mixer._rmsLeftSumSq = -5;
+  mixer._clippedSamples = Number.NaN;
+  mixer._zeroAllocMixQuanta = -10;
+  const sanitizedStats = mixer.getStats();
+  assert.equal(sanitizedStats.peakLeft, 0);
+  assert.equal(sanitizedStats.peakRight, 0);
+  assert.equal(sanitizedStats.rmsLeft, 0);
+  assert.equal(sanitizedStats.clippedSamples, 0);
+  assert.equal(sanitizedStats.zeroAllocMixQuanta, 0);
+
+  // 6. resetStats() does not cause pumpToRing to falsely re-trigger underrun recovery for historical ring underruns.
+  const ring = AudioRingBuffer.create(256, 2);
+  ring.pullSamples(new Float32Array(32 * 2)); // 1 historical underrun
+  mixer.createVoice({ samples: new Float32Array(128).fill(0.4), channels: 1, pan: -1.0, loop: true });
+  mixer.pumpToRing(ring, 64);
+  assert.equal(mixer.getStats().underrunQuanta, 1);
+  assert.equal(mixer.getStats().recoveryFadeIns, 1);
+  ring.pullSamples(new Float32Array(64 * 2));
+  mixer.resetStats();
+  mixer.pumpToRing(ring, 64);
+  const postRingReset = mixer.getStats();
+  assert.equal(postRingReset.underrunQuanta, 0);
+  assert.equal(postRingReset.recoveryFadeIns, 0);
+});
+
+test('W326: W272 regression check — cosine underrun fade-out, planar recovery fade-in, NaN/Inf sanitization, and soft-clipping', () => {
+  const mixer = new AudioMixer({
+    sampleRate: 48000,
+    softClip: true,
+    limiterKnee: 0.9,
+    underrunRampFrames: 64,
+    quantumFrames: 128,
+  });
+
+  const src = new Float32Array(128 * 2);
+  for (let f = 0; f < 128; f++) {
+    src[f * 2] = 0.7;
+    src[f * 2 + 1] = -0.5;
+  }
+  src[0] = 2.2; // soft-clipped on L
+  src[1] = Number.NEGATIVE_INFINITY; // sanitized on R
+  mixer.createVoice({ samples: src, channels: 2, gain: 1.0, pan: 0.0, loop: true });
+
+  // Steady-state planar mix with NaN/Inf sanitization and soft-clipping.
+  const outL = new Float32Array(128);
+  const outR = new Float32Array(128);
+  assert.equal(mixer.mixIntoPlanar(outL, outR, 128), 128);
+  assert.ok(outL[0] > 0.9 && outL[0] <= 1.0);
+  assert.equal(outR[0], 0.0);
+  assert.equal(outL[10], Math.fround(0.7));
+  assert.equal(outR[10], Math.fround(-0.5));
+
+  // W272 cosine fade-out from last stereo sample to exact 0.0.
+  const fadeOut = new Float32Array(64 * 2);
+  assert.equal(mixer.renderUnderrunFadeOut(fadeOut, 64), 64);
+  assert.ok(Math.abs(fadeOut[0] - Math.fround(0.7)) < 1e-6);
+  assert.ok(Math.abs(fadeOut[1] - Math.fround(-0.5)) < 1e-6);
+  assert.equal(fadeOut[63 * 2], 0.0);
+  assert.equal(fadeOut[63 * 2 + 1], 0.0);
+
+  // W272 cosine recovery fade-in on planar mixIntoPlanar (0.0 -> full amplitude over 64 frames).
+  mixer.resetStats();
+  assert.equal(mixer.mixIntoPlanar(outL, outR, 128), 128);
+  assert.equal(outL[0], 0.0);
+  assert.equal(outR[0], 0.0);
+  const midCos = 0.5 * (1.0 - Math.cos((31 * Math.PI) / 63));
+  assert.ok(Math.abs(outL[31] - Math.fround(0.7) * midCos) < 1e-5);
+  assert.ok(Math.abs(outR[31] - Math.fround(-0.5) * midCos) < 1e-5);
+  assert.equal(outL[63], Math.fround(0.7));
+  assert.equal(outR[63], Math.fround(-0.5));
+
+  const recStats = mixer.getStats();
+  assert.equal(recStats.zeroAllocMixQuanta, 1);
+  assert.ok(recStats.peakLeft <= 1.0 && recStats.peakLeft >= 0.69);
+  assert.ok(recStats.peakRight <= 0.51 && recStats.peakRight >= 0.49);
+  assert.ok(recStats.rmsLeft > 0 && recStats.rmsLeft < 0.7);
+  assert.ok(recStats.rmsRight > 0 && recStats.rmsRight < 0.5);
+});
+
+
 
