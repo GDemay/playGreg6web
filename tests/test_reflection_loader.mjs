@@ -8,6 +8,7 @@ const pipelineCacheMod = require('../web/workers/pipeline_cache.js');
 
 const {
   LAYOUT_MANIFEST_SCHEMA_VERSION,
+  MAX_HEAP_INDEX_SHIFT,
   SHADER_STAGE_BITS,
   VERTEX_FORMAT_BYTE_SIZES,
   ReflectionError,
@@ -19,6 +20,7 @@ const {
   formatShaderHash,
   computeBindGroupLayoutHash,
   computePipelineLayoutHash,
+  parseBindingSource,
   parseReflectionManifest,
   buildBindGroupLayoutDescriptors,
   buildVertexBufferLayouts,
@@ -940,4 +942,511 @@ test('parseReflectionManifest rejects malformed JSON, bad schema versions, inval
       }),
     (err) => err instanceof ManifestValidationError && /unknown shader/.test(err.message)
   );
+});
+
+test('parseBindingSource parses and normalizes S34 sampler_heap, resource_heap, and legacy binding sources', () => {
+  assert.equal(MAX_HEAP_INDEX_SHIFT, 31);
+  assert.equal(parseBindingSource(undefined), null);
+  assert.equal(parseBindingSource(null), null);
+
+  // S34 sampler_heap & resource_heap matching shaders/src/rdna2_to_wgsl.rs & tools/stage_reflection_sidecar.py
+  assert.deepEqual(
+    parseBindingSource({
+      sampler_heap: {
+        base_user_sgpr: 11,
+        stride: 16,
+        index: { user_sgpr: 9, shift: 4 },
+      },
+    }),
+    {
+      kind: 'sampler_heap',
+      baseUserSgpr: 11,
+      stride: 16,
+      indexUserSgpr: 9,
+      indexShift: 4,
+    }
+  );
+
+  assert.deepEqual(
+    parseBindingSource({
+      resource_heap: {
+        base_user_sgpr: 4,
+        stride: 32,
+        index: { user_sgpr: 5, shift: 5 },
+      },
+    }),
+    {
+      kind: 'resource_heap',
+      baseUserSgpr: 4,
+      stride: 32,
+      indexUserSgpr: 5,
+      indexShift: 5,
+    }
+  );
+
+  // Boundary values: 0 base/index/shift, stride 1, and max shift 31
+  assert.deepEqual(
+    parseBindingSource({
+      sampler_heap: {
+        base_user_sgpr: 0,
+        stride: 1,
+        index: { user_sgpr: 0, shift: 0 },
+      },
+    }),
+    {
+      kind: 'sampler_heap',
+      baseUserSgpr: 0,
+      stride: 1,
+      indexUserSgpr: 0,
+      indexShift: 0,
+    }
+  );
+  assert.deepEqual(
+    parseBindingSource({
+      resource_heap: {
+        base_user_sgpr: 15,
+        stride: 64,
+        index: { user_sgpr: 12, shift: 31 },
+      },
+    }),
+    {
+      kind: 'resource_heap',
+      baseUserSgpr: 15,
+      stride: 64,
+      indexUserSgpr: 12,
+      indexShift: 31,
+    }
+  );
+
+  // Existing table, root_constants, root_descriptor, and static_sampler sources
+  assert.deepEqual(parseBindingSource({ user_sgpr: 8, table_byte_offset: 32 }), {
+    kind: 'table',
+    userSgpr: 8,
+    tableByteOffset: 32,
+  });
+  assert.deepEqual(parseBindingSource({ user_sgpr: 4, root_constants: true }), {
+    kind: 'root_constants',
+    userSgpr: 4,
+  });
+  assert.deepEqual(parseBindingSource({ user_sgpr: 11, root_descriptor: true }), {
+    kind: 'root_descriptor',
+    userSgpr: 11,
+  });
+  assert.deepEqual(parseBindingSource({ static_sampler: 0 }), {
+    kind: 'static_sampler',
+    index: 0,
+  });
+});
+
+test('parseReflectionManifest and ReflectionRegistry preserve S34 heap sources and expose additive heap stats', () => {
+  const bglG0 = {
+    entries: [
+      {
+        binding: 0,
+        visibility: SHADER_STAGE_BITS.FRAGMENT,
+        buffer: { type: 'uniform', hasDynamicOffset: false, minBindingSize: 64 },
+      },
+      {
+        binding: 1,
+        visibility: SHADER_STAGE_BITS.FRAGMENT,
+        texture: { sampleType: 'float', viewDimension: '2d-array', multisampled: false },
+      },
+      {
+        binding: 2,
+        visibility: SHADER_STAGE_BITS.FRAGMENT,
+        sampler: { type: 'filtering' },
+      },
+      {
+        binding: 3,
+        visibility: SHADER_STAGE_BITS.FRAGMENT,
+        sampler: { type: 'comparison' },
+      },
+    ],
+  };
+  const bglCs = {
+    entries: [
+      {
+        binding: 0,
+        visibility: SHADER_STAGE_BITS.COMPUTE,
+        buffer: { type: 'read-only-storage', hasDynamicOffset: false, minBindingSize: 16 },
+      },
+      {
+        binding: 1,
+        visibility: SHADER_STAGE_BITS.COMPUTE,
+        buffer: { type: 'uniform', hasDynamicOffset: false, minBindingSize: 16 },
+      },
+    ],
+  };
+
+  const idG0 = computeBindGroupLayoutHash(bglG0);
+  const idCs = computeBindGroupLayoutHash(bglCs);
+  const plFs = computePipelineLayoutHash([idG0]);
+  const plCs = computePipelineLayoutHash([idCs]);
+
+  const s34Manifest = {
+    schema_version: 1,
+    bind_group_layouts: {
+      [idG0]: bglG0,
+      [idCs]: bglCs,
+    },
+    pipeline_layouts: {
+      [plFs]: { bindGroupLayouts: [idG0] },
+      [plCs]: { bindGroupLayouts: [idCs] },
+    },
+    shaders: {
+      '0x000000000000a001': {
+        stage: 'fragment',
+        entry_point: 'fs_s34_heaps',
+        pipeline_layout: plFs,
+        bind_group_layouts: [idG0],
+        layout_complete: true,
+        workgroup_size: null,
+        bindings: [
+          {
+            group: 0,
+            binding: 0,
+            name: 'cb_frame',
+            resource: 'buffer',
+            in_layout: true,
+            source: { user_sgpr: 8, table_byte_offset: 0 },
+          },
+          {
+            group: 0,
+            binding: 1,
+            name: 'dyn_tex',
+            resource: 'texture',
+            in_layout: true,
+            source: {
+              resource_heap: {
+                base_user_sgpr: 11,
+                stride: 32,
+                index: { user_sgpr: 10, shift: 5 },
+              },
+            },
+          },
+          {
+            group: 0,
+            binding: 2,
+            name: 'dyn_smp',
+            resource: 'sampler',
+            in_layout: true,
+            source: {
+              sampler_heap: {
+                base_user_sgpr: 11,
+                stride: 16,
+                index: { user_sgpr: 9, shift: 4 },
+              },
+            },
+          },
+          {
+            group: 0,
+            binding: 3,
+            name: 'static_cmp',
+            resource: 'sampler',
+            in_layout: true,
+            source: { static_sampler: 0 },
+          },
+        ],
+        vertex_inputs: [],
+        fragment_outputs: [{ location: 0, type: 'vec4<f32>' }],
+      },
+      '0x000000000000a002': {
+        stage: 'compute',
+        entry_point: 'cs_s34_resource_heap',
+        pipeline_layout: plCs,
+        bind_group_layouts: [idCs],
+        layout_complete: true,
+        workgroup_size: [64, 1, 1],
+        bindings: [
+          {
+            group: 0,
+            binding: 0,
+            name: 'dyn_srv_buf',
+            resource: 'buffer',
+            in_layout: true,
+            source: {
+              resource_heap: {
+                base_user_sgpr: 4,
+                stride: 16,
+                index: { user_sgpr: 6, shift: 4 },
+              },
+            },
+          },
+          {
+            group: 0,
+            binding: 1,
+            name: 'root_cbv',
+            resource: 'buffer',
+            in_layout: true,
+            source: { user_sgpr: 12, root_descriptor: true },
+          },
+        ],
+      },
+    },
+  };
+
+  const parsed = parseReflectionManifest(s34Manifest);
+  assert.equal(parsed.samplerHeapBindings, 1);
+  assert.equal(parsed.resourceHeapBindings, 2);
+  assert.deepEqual(parsed.summary, {
+    shaderCount: 2,
+    bindGroupLayoutCount: 2,
+    pipelineLayoutCount: 2,
+    pipelineCount: 0,
+    samplerHeapBindings: 1,
+    resourceHeapBindings: 2,
+  });
+
+  const fs = parsed.shadersByHash.get(0xa001n);
+  assert.equal(fs.samplerHeapBindings, 1);
+  assert.equal(fs.resourceHeapBindings, 1);
+  assert.deepEqual(fs.bindings[0].source, {
+    kind: 'table',
+    userSgpr: 8,
+    tableByteOffset: 0,
+  });
+  assert.deepEqual(fs.bindings[1].source, {
+    kind: 'resource_heap',
+    baseUserSgpr: 11,
+    stride: 32,
+    indexUserSgpr: 10,
+    indexShift: 5,
+  });
+  assert.deepEqual(fs.bindings[2].source, {
+    kind: 'sampler_heap',
+    baseUserSgpr: 11,
+    stride: 16,
+    indexUserSgpr: 9,
+    indexShift: 4,
+  });
+  assert.deepEqual(fs.bindings[3].source, {
+    kind: 'static_sampler',
+    index: 0,
+  });
+
+  const cs = parsed.shadersByHash.get(0xa002n);
+  assert.equal(cs.samplerHeapBindings, 0);
+  assert.equal(cs.resourceHeapBindings, 1);
+  assert.deepEqual(cs.bindings[0].source, {
+    kind: 'resource_heap',
+    baseUserSgpr: 4,
+    stride: 16,
+    indexUserSgpr: 6,
+    indexShift: 4,
+  });
+  assert.deepEqual(cs.bindings[1].source, {
+    kind: 'root_descriptor',
+    userSgpr: 12,
+  });
+
+  // Existing manifests without `source` remain 100% compatible with zero heap counts
+  const registry = new ReflectionRegistry();
+  const legacyParsed = registry.loadManifest(createS6ManifestFixture());
+  assert.equal(legacyParsed.samplerHeapBindings, 0);
+  assert.equal(legacyParsed.resourceHeapBindings, 0);
+  assert.equal(legacyParsed.shadersByHash.get(0x3333n).bindings[0].source, null);
+  assert.equal(registry.getStats().samplerHeapBindings, 0);
+  assert.equal(registry.getStats().resourceHeapBindings, 0);
+
+  // Loading S34 manifest accumulates heap stats cleanly and still builds WebGPU layouts
+  registry.loadManifest(s34Manifest);
+  assert.equal(registry.getStats().samplerHeapBindings, 1);
+  assert.equal(registry.getStats().resourceHeapBindings, 2);
+
+  const descriptors = registry.buildBindGroupLayoutDescriptors([0xa001n]);
+  assert.equal(descriptors.length, 1);
+  assert.equal(descriptors[0].entries.length, 4);
+
+  // Overwriting an existing shader hash updates heap stats without double-counting
+  registry.loadManifest({
+    schema_version: 1,
+    bind_group_layouts: { [idCs]: bglCs },
+    pipeline_layouts: { [plCs]: { bindGroupLayouts: [idCs] } },
+    shaders: {
+      '0x000000000000a002': {
+        stage: 'compute',
+        entry_point: 'cs_s34_resource_heap_replaced',
+        pipeline_layout: plCs,
+        bind_group_layouts: [idCs],
+        bindings: [
+          {
+            group: 0,
+            binding: 0,
+            name: 'table_buf',
+            resource: 'buffer',
+            in_layout: true,
+            source: { user_sgpr: 4, table_byte_offset: 0 },
+          },
+          {
+            group: 0,
+            binding: 1,
+            name: 'root_cbv',
+            resource: 'buffer',
+            in_layout: true,
+            source: { user_sgpr: 12, root_constants: true },
+          },
+        ],
+      },
+    },
+  });
+  assert.equal(registry.getStats().samplerHeapBindings, 1);
+  assert.equal(registry.getStats().resourceHeapBindings, 1);
+
+  // Clearing registry resets live heap binding counts
+  registry.clear();
+  assert.equal(registry.getStats().samplerHeapBindings, 0);
+  assert.equal(registry.getStats().resourceHeapBindings, 0);
+});
+
+test('parseReflectionManifest and parseBindingSource reject malformed S34 heap and legacy sources cleanly', () => {
+  const wrapInManifest = (source) => ({
+    schema_version: 1,
+    bind_group_layouts: {},
+    pipeline_layouts: {},
+    shaders: {
+      '0x000000000000b001': {
+        stage: 'fragment',
+        entry_point: 'fs_bad_source',
+        bindings: [
+          {
+            group: 0,
+            binding: 0,
+            name: 'bad_binding',
+            resource: 'sampler',
+            in_layout: true,
+            source,
+          },
+        ],
+      },
+    },
+  });
+
+  const invalidCases = [
+    // Non-object or empty source
+    ['not_an_object', /binding source must be an object or null/],
+    [42, /binding source must be an object or null/],
+    [[], /binding source must be an object or null/],
+    [{}, /unrecognized binding source/],
+    // Non-object heap payload
+    [{ sampler_heap: null }, /sampler_heap must be an object/],
+    [{ sampler_heap: 3 }, /sampler_heap must be an object/],
+    [{ resource_heap: [] }, /resource_heap must be an object/],
+    [{ resource_heap: 'heap' }, /resource_heap must be an object/],
+    // Ambiguous / conflicting source fields
+    [
+      {
+        sampler_heap: { base_user_sgpr: 11, stride: 16, index: { user_sgpr: 9, shift: 4 } },
+        resource_heap: { base_user_sgpr: 4, stride: 32, index: { user_sgpr: 5, shift: 5 } },
+      },
+      /cannot define both sampler_heap and resource_heap/,
+    ],
+    [
+      {
+        sampler_heap: { base_user_sgpr: 11, stride: 16, index: { user_sgpr: 9, shift: 4 } },
+        static_sampler: 0,
+      },
+      /cannot be combined with other binding source fields/,
+    ],
+    // Invalid base_user_sgpr
+    [
+      { sampler_heap: { stride: 16, index: { user_sgpr: 9, shift: 4 } } },
+      /sampler_heap\.base_user_sgpr/,
+    ],
+    [
+      { resource_heap: { base_user_sgpr: -1, stride: 32, index: { user_sgpr: 5, shift: 5 } } },
+      /resource_heap\.base_user_sgpr/,
+    ],
+    [
+      { resource_heap: { base_user_sgpr: '4', stride: 32, index: { user_sgpr: 5, shift: 5 } } },
+      /resource_heap\.base_user_sgpr/,
+    ],
+    [
+      { sampler_heap: { base_user_sgpr: 1.5, stride: 16, index: { user_sgpr: 9, shift: 4 } } },
+      /sampler_heap\.base_user_sgpr/,
+    ],
+    [
+      { sampler_heap: { base_user_sgpr: true, stride: 16, index: { user_sgpr: 9, shift: 4 } } },
+      /sampler_heap\.base_user_sgpr/,
+    ],
+    [
+      {
+        sampler_heap: {
+          base_user_sgpr: Number.MAX_SAFE_INTEGER + 1,
+          stride: 16,
+          index: { user_sgpr: 9, shift: 4 },
+        },
+      },
+      /sampler_heap\.base_user_sgpr/,
+    ],
+    // Invalid stride (must be > 0 safe uint32 int)
+    [
+      { sampler_heap: { base_user_sgpr: 11, stride: 0, index: { user_sgpr: 9, shift: 4 } } },
+      /sampler_heap\.stride/,
+    ],
+    [
+      { resource_heap: { base_user_sgpr: 4, stride: -32, index: { user_sgpr: 5, shift: 5 } } },
+      /resource_heap\.stride/,
+    ],
+    [
+      { sampler_heap: { base_user_sgpr: 11, stride: NaN, index: { user_sgpr: 9, shift: 4 } } },
+      /sampler_heap\.stride/,
+    ],
+    [
+      { resource_heap: { base_user_sgpr: 4, stride: Infinity, index: { user_sgpr: 5, shift: 5 } } },
+      /resource_heap\.stride/,
+    ],
+    // Missing or malformed index object
+    [{ sampler_heap: { base_user_sgpr: 11, stride: 16 } }, /sampler_heap\.index/],
+    [{ resource_heap: { base_user_sgpr: 4, stride: 32, index: null } }, /resource_heap\.index/],
+    [{ sampler_heap: { base_user_sgpr: 11, stride: 16, index: [] } }, /sampler_heap\.index/],
+    // Invalid index.user_sgpr
+    [
+      { sampler_heap: { base_user_sgpr: 11, stride: 16, index: { shift: 4 } } },
+      /sampler_heap\.index\.user_sgpr/,
+    ],
+    [
+      { resource_heap: { base_user_sgpr: 4, stride: 32, index: { user_sgpr: -2, shift: 5 } } },
+      /resource_heap\.index\.user_sgpr/,
+    ],
+    // Invalid index.shift (must be integer in 0..31)
+    [
+      { sampler_heap: { base_user_sgpr: 11, stride: 16, index: { user_sgpr: 9 } } },
+      /sampler_heap\.index\.shift/,
+    ],
+    [
+      { resource_heap: { base_user_sgpr: 4, stride: 32, index: { user_sgpr: 5, shift: 32 } } },
+      /resource_heap\.index\.shift/,
+    ],
+    [
+      { resource_heap: { base_user_sgpr: 4, stride: 32, index: { user_sgpr: 5, shift: 40 } } },
+      /resource_heap\.index\.shift/,
+    ],
+    [
+      { sampler_heap: { base_user_sgpr: 11, stride: 16, index: { user_sgpr: 9, shift: -1 } } },
+      /sampler_heap\.index\.shift/,
+    ],
+    [
+      { sampler_heap: { base_user_sgpr: 11, stride: 16, index: { user_sgpr: 9, shift: 2.5 } } },
+      /sampler_heap\.index\.shift/,
+    ],
+    // Malformed non-heap sources
+    [{ static_sampler: -1 }, /static_sampler/],
+    [{ user_sgpr: 8 }, /user_sgpr source must specify exactly one/],
+    [{ user_sgpr: 8, root_constants: true, root_descriptor: true }, /user_sgpr source must specify exactly one/],
+    [{ user_sgpr: 8, table_byte_offset: -4 }, /table_byte_offset/],
+    [{ table_byte_offset: 16 }, /requires user_sgpr/],
+  ];
+
+  for (const [badSource, expectedPattern] of invalidCases) {
+    assert.throws(
+      () => parseBindingSource(badSource, 'test.source'),
+      (err) => err instanceof ManifestValidationError && expectedPattern.test(err.message),
+      `Expected parseBindingSource(${JSON.stringify(badSource)}) to match ${expectedPattern}`
+    );
+    assert.throws(
+      () => parseReflectionManifest(wrapInManifest(badSource)),
+      (err) => err instanceof ManifestValidationError && expectedPattern.test(err.message),
+      `Expected parseReflectionManifest with source ${JSON.stringify(badSource)} to match ${expectedPattern}`
+    );
+  }
 });

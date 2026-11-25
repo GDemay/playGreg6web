@@ -15,6 +15,9 @@
   /** Reflection sanity ceiling matching MAX_REFLECTED_GROUPS in shaders/src/reflect.rs. */
   const MAX_REFLECTED_GROUPS = 64;
 
+  /** Maximum valid bit-shift for S34 dynamic descriptor-heap index calculations (0..31). */
+  const MAX_HEAP_INDEX_SHIFT = 31;
+
   /** WebGPU GPUShaderStage bitmask constants with headless/Node fallbacks. */
   const SHADER_STAGE_BITS = Object.freeze({
     VERTEX:
@@ -205,7 +208,11 @@
   }
 
   function isNonNegativeInt(val) {
-    return typeof val === 'number' && Number.isInteger(val) && val >= 0 && val <= U32_MAX;
+    return typeof val === 'number' && Number.isSafeInteger(val) && val >= 0 && val <= U32_MAX;
+  }
+
+  function hasOwn(obj, key) {
+    return Object.prototype.hasOwnProperty.call(obj, key);
   }
 
   /**
@@ -647,6 +654,193 @@
     return { source, shifts };
   }
 
+  function parseHeapBindingSource(kind, rawHeap, path) {
+    if (!isPlainObject(rawHeap)) {
+      throw new ManifestValidationError(`${kind} must be an object`, path);
+    }
+    if (!isNonNegativeInt(rawHeap.base_user_sgpr)) {
+      throw new ManifestValidationError(
+        `${kind}.base_user_sgpr must be a non-negative uint32 safe integer, got ${JSON.stringify(rawHeap.base_user_sgpr)}`,
+        `${path}.base_user_sgpr`
+      );
+    }
+    if (!isNonNegativeInt(rawHeap.stride) || rawHeap.stride <= 0) {
+      throw new ManifestValidationError(
+        `${kind}.stride must be a positive uint32 safe integer (> 0), got ${JSON.stringify(rawHeap.stride)}`,
+        `${path}.stride`
+      );
+    }
+    if (!isPlainObject(rawHeap.index)) {
+      throw new ManifestValidationError(
+        `${kind}.index must be an object with user_sgpr and shift`,
+        `${path}.index`
+      );
+    }
+    if (!isNonNegativeInt(rawHeap.index.user_sgpr)) {
+      throw new ManifestValidationError(
+        `${kind}.index.user_sgpr must be a non-negative uint32 safe integer, got ${JSON.stringify(rawHeap.index.user_sgpr)}`,
+        `${path}.index.user_sgpr`
+      );
+    }
+    if (!isNonNegativeInt(rawHeap.index.shift) || rawHeap.index.shift > MAX_HEAP_INDEX_SHIFT) {
+      throw new ManifestValidationError(
+        `${kind}.index.shift must be an integer in 0..${MAX_HEAP_INDEX_SHIFT}, got ${JSON.stringify(rawHeap.index.shift)}`,
+        `${path}.index.shift`
+      );
+    }
+    return {
+      kind,
+      baseUserSgpr: rawHeap.base_user_sgpr,
+      stride: rawHeap.stride,
+      indexUserSgpr: rawHeap.index.user_sgpr,
+      indexShift: rawHeap.index.shift,
+    };
+  }
+
+  /**
+   * Parse and normalize a binding `source` entry matching `WgslBindingSource` in
+   * `shaders/src/rdna2_to_wgsl.rs` and `tools/stage_reflection_sidecar.py`:
+   * - `{"sampler_heap": {"base_user_sgpr", "stride", "index": {"user_sgpr", "shift"}}}`
+   * - `{"resource_heap": {"base_user_sgpr", "stride", "index": {"user_sgpr", "shift"}}}`
+   * - `{"user_sgpr", "table_byte_offset"}`
+   * - `{"user_sgpr", "root_constants": true}`
+   * - `{"user_sgpr", "root_descriptor": true}`
+   * - `{"static_sampler": <u32>}`
+   *
+   * Returns `null` when `rawSource` is `undefined` or `null`.
+   *
+   * @param {unknown} rawSource
+   * @param {string} [path]
+   * @returns {object | null}
+   */
+  function parseBindingSource(rawSource, path = 'source') {
+    if (rawSource === undefined || rawSource === null) {
+      return null;
+    }
+    if (!isPlainObject(rawSource)) {
+      throw new ManifestValidationError('binding source must be an object or null', path);
+    }
+
+    const hasSamplerHeap = hasOwn(rawSource, 'sampler_heap');
+    const hasResourceHeap = hasOwn(rawSource, 'resource_heap');
+    const hasStaticSampler = hasOwn(rawSource, 'static_sampler');
+    const hasUserSgpr = hasOwn(rawSource, 'user_sgpr');
+    const hasTableByteOffset = hasOwn(rawSource, 'table_byte_offset');
+    const hasRootConstants = hasOwn(rawSource, 'root_constants');
+    const hasRootDescriptor = hasOwn(rawSource, 'root_descriptor');
+
+    if (hasSamplerHeap && hasResourceHeap) {
+      throw new ManifestValidationError(
+        'binding source cannot define both sampler_heap and resource_heap',
+        path
+      );
+    }
+
+    if (hasSamplerHeap || hasResourceHeap) {
+      const heapKey = hasSamplerHeap ? 'sampler_heap' : 'resource_heap';
+      if (
+        hasStaticSampler ||
+        hasUserSgpr ||
+        hasTableByteOffset ||
+        hasRootConstants ||
+        hasRootDescriptor
+      ) {
+        throw new ManifestValidationError(
+          `${heapKey} source cannot be combined with other binding source fields`,
+          path
+        );
+      }
+      return parseHeapBindingSource(heapKey, rawSource[heapKey], `${path}.${heapKey}`);
+    }
+
+    if (hasStaticSampler) {
+      if (hasUserSgpr || hasTableByteOffset || hasRootConstants || hasRootDescriptor) {
+        throw new ManifestValidationError(
+          'static_sampler source cannot be combined with user_sgpr source fields',
+          path
+        );
+      }
+      if (!isNonNegativeInt(rawSource.static_sampler)) {
+        throw new ManifestValidationError(
+          `static_sampler must be a non-negative uint32 safe integer, got ${JSON.stringify(rawSource.static_sampler)}`,
+          `${path}.static_sampler`
+        );
+      }
+      return {
+        kind: 'static_sampler',
+        index: rawSource.static_sampler,
+      };
+    }
+
+    if (hasUserSgpr) {
+      if (!isNonNegativeInt(rawSource.user_sgpr)) {
+        throw new ManifestValidationError(
+          `user_sgpr must be a non-negative uint32 safe integer, got ${JSON.stringify(rawSource.user_sgpr)}`,
+          `${path}.user_sgpr`
+        );
+      }
+      if (hasRootConstants && typeof rawSource.root_constants !== 'boolean') {
+        throw new ManifestValidationError(
+          'root_constants must be a boolean',
+          `${path}.root_constants`
+        );
+      }
+      if (hasRootDescriptor && typeof rawSource.root_descriptor !== 'boolean') {
+        throw new ManifestValidationError(
+          'root_descriptor must be a boolean',
+          `${path}.root_descriptor`
+        );
+      }
+
+      const isRootConstants = rawSource.root_constants === true;
+      const isRootDescriptor = rawSource.root_descriptor === true;
+      const isTable = hasTableByteOffset && rawSource.table_byte_offset !== undefined;
+      const modeCount = (isRootConstants ? 1 : 0) + (isRootDescriptor ? 1 : 0) + (isTable ? 1 : 0);
+
+      if (modeCount !== 1) {
+        throw new ManifestValidationError(
+          'user_sgpr source must specify exactly one of table_byte_offset, root_constants: true, or root_descriptor: true',
+          path
+        );
+      }
+      if (isRootConstants) {
+        return {
+          kind: 'root_constants',
+          userSgpr: rawSource.user_sgpr,
+        };
+      }
+      if (isRootDescriptor) {
+        return {
+          kind: 'root_descriptor',
+          userSgpr: rawSource.user_sgpr,
+        };
+      }
+      if (!isNonNegativeInt(rawSource.table_byte_offset)) {
+        throw new ManifestValidationError(
+          `table_byte_offset must be a non-negative uint32 safe integer, got ${JSON.stringify(rawSource.table_byte_offset)}`,
+          `${path}.table_byte_offset`
+        );
+      }
+      return {
+        kind: 'table',
+        userSgpr: rawSource.user_sgpr,
+        tableByteOffset: rawSource.table_byte_offset,
+      };
+    }
+
+    if (hasTableByteOffset || hasRootConstants || hasRootDescriptor) {
+      throw new ManifestValidationError(
+        'binding source requires user_sgpr alongside table_byte_offset, root_constants, or root_descriptor',
+        path
+      );
+    }
+
+    throw new ManifestValidationError(
+      'unrecognized binding source (expected sampler_heap, resource_heap, static_sampler, or user_sgpr)',
+      path
+    );
+  }
+
   function parseBindingRecord(raw, path) {
     if (!isPlainObject(raw)) {
       throw new ManifestValidationError('binding record must be an object', path);
@@ -727,6 +921,8 @@
       bindingArray = { count };
     }
 
+    const source = parseBindingSource(raw.source, `${path}.source`);
+
     return {
       group: raw.group,
       binding: raw.binding,
@@ -740,6 +936,7 @@
       rootConstants,
       binding_array: bindingArray,
       bindingArray,
+      source,
       layoutEntry: null,
     };
   }
@@ -949,6 +1146,8 @@
     const shaders = new Map();
     const shadersByHash = new Map();
     const shadersByName = new Map();
+    let totalSamplerHeapBindings = 0;
+    let totalResourceHeapBindings = 0;
 
     for (const [rawHash, rawShader] of Object.entries(raw.shaders)) {
       const shPath = `shaders[${JSON.stringify(rawHash)}]`;
@@ -1058,6 +1257,8 @@
 
       // Parse bindings metadata and cross-link with resolved bind_group_layouts entries
       const bindings = [];
+      let shaderSamplerHeapBindings = 0;
+      let shaderResourceHeapBindings = 0;
       if (rawShader.bindings !== undefined) {
         if (!Array.isArray(rawShader.bindings)) {
           throw new ManifestValidationError('bindings must be an array', `${shPath}.bindings`);
@@ -1071,9 +1272,18 @@
               rec.layoutEntry = cloneLayoutEntry(matched);
             }
           }
+          if (rec.source) {
+            if (rec.source.kind === 'sampler_heap') {
+              shaderSamplerHeapBindings += 1;
+            } else if (rec.source.kind === 'resource_heap') {
+              shaderResourceHeapBindings += 1;
+            }
+          }
           bindings.push(rec);
         }
       }
+      totalSamplerHeapBindings += shaderSamplerHeapBindings;
+      totalResourceHeapBindings += shaderResourceHeapBindings;
 
       // Parse vertex_inputs
       const vertexInputs = [];
@@ -1168,6 +1378,8 @@
         requires_lowering: requiresLowering,
         limitViolations,
         limit_violations: limitViolations,
+        samplerHeapBindings: shaderSamplerHeapBindings,
+        resourceHeapBindings: shaderResourceHeapBindings,
       };
 
       shaders.set(hashHex, shaderRecord);
@@ -1311,6 +1523,15 @@
       }
     }
 
+    const summary = {
+      shaderCount: shaders.size,
+      bindGroupLayoutCount: bindGroupLayouts.size,
+      pipelineLayoutCount: pipelineLayouts.size,
+      pipelineCount: pipelines.size,
+      samplerHeapBindings: totalSamplerHeapBindings,
+      resourceHeapBindings: totalResourceHeapBindings,
+    };
+
     return {
       schemaVersion: LAYOUT_MANIFEST_SCHEMA_VERSION,
       schema_version: LAYOUT_MANIFEST_SCHEMA_VERSION,
@@ -1324,6 +1545,9 @@
       shadersByHash,
       shadersByName,
       pipelines,
+      samplerHeapBindings: totalSamplerHeapBindings,
+      resourceHeapBindings: totalResourceHeapBindings,
+      summary,
     };
   }
 
@@ -1885,6 +2109,8 @@
       this._pipelineLayouts = new Map();
       this._pipelines = new Map();
       this._registerConvention = { source: 'dxc-spirv', shifts: { b: 0, t: 0, u: 0, s: 0 } };
+      this._samplerHeapBindings = 0;
+      this._resourceHeapBindings = 0;
 
       this._stats = {
         manifestsLoaded: 0,
@@ -1915,6 +2141,13 @@
         this._pipelineLayouts.set(idHex, pl);
       }
       for (const [hashHex, shader] of parsed.shaders.entries()) {
+        const previous = this._shadersByHash.get(shader.hash);
+        if (previous) {
+          this._samplerHeapBindings -= previous.samplerHeapBindings || 0;
+          this._resourceHeapBindings -= previous.resourceHeapBindings || 0;
+        }
+        this._samplerHeapBindings += shader.samplerHeapBindings || 0;
+        this._resourceHeapBindings += shader.resourceHeapBindings || 0;
         this._shadersByHash.set(shader.hash, shader);
         this._shadersByHex.set(hashHex, shader);
         this._indexShaderName(shader.entryPoint, shader);
@@ -2209,6 +2442,8 @@
       this._bindGroupLayouts.clear();
       this._pipelineLayouts.clear();
       this._pipelines.clear();
+      this._samplerHeapBindings = 0;
+      this._resourceHeapBindings = 0;
 
       if (options && options.resetStats) {
         this._stats.manifestsLoaded = 0;
@@ -2237,6 +2472,8 @@
         lookupHits: this._stats.lookupHits,
         lookupMisses: this._stats.lookupMisses,
         bindingConflicts: this._stats.bindingConflicts,
+        samplerHeapBindings: this._samplerHeapBindings,
+        resourceHeapBindings: this._resourceHeapBindings,
       };
     }
   }
@@ -2244,6 +2481,7 @@
   const exportedApi = {
     LAYOUT_MANIFEST_SCHEMA_VERSION,
     MAX_WEBGPU_BIND_GROUPS,
+    MAX_HEAP_INDEX_SHIFT,
     SHADER_STAGE_BITS,
     VERTEX_FORMAT_BYTE_SIZES,
     ReflectionError,
@@ -2256,6 +2494,7 @@
     formatShaderHash,
     computeBindGroupLayoutHash,
     computePipelineLayoutHash,
+    parseBindingSource,
     parseReflectionManifest,
     buildBindGroupLayoutDescriptors,
     buildVertexBufferLayouts,
