@@ -16,7 +16,10 @@ const {
   DEFAULT_TEXTURE_USAGE,
   FORMAT_BYTES_PER_PIXEL,
   DXGI_FORMAT_ALIASES,
+  COMPATIBLE_VIEW_FORMATS,
   normalizeRenderTargetFormat,
+  isCompatibleViewFormat,
+  normalizeViewFormats,
   normalizeSampleCount,
   sanitizeRenderTargetDesc,
   normalizeRenderTargetDesc,
@@ -84,7 +87,7 @@ test('UMD export attaches PlayGta6RenderTargetPool on globalThis and module.expo
   assert.equal(typeof normalizeRenderTargetDesc, 'function');
   assert.equal(typeof makeRenderTargetKey, 'function');
   assert.equal(DEFAULT_IDLE_FRAME_TTL, 8);
-  assert.equal(DEFAULT_MAX_POOL_BYTES, 256 * 1024 * 1024);
+  assert.equal(DEFAULT_MAX_POOL_BYTES, 512 * 1024 * 1024);
   assert.equal(DEFAULT_TEXTURE_USAGE, TEXTURE_USAGE.RENDER_ATTACHMENT | TEXTURE_USAGE.TEXTURE_BINDING);
   assert.ok(Object.isFrozen(rtPoolMod));
   assert.ok(Object.isFrozen(FORMAT_BYTES_PER_PIXEL));
@@ -1452,4 +1455,422 @@ test('W128 telemetry tracks peakPooledBytes, reuseRatio, budgetEvictions, and id
   assert.equal(postDestroy.budgetEvictions, 1);
   assert.equal(postDestroy.idleEvictions, 2);
   assert.equal(postDestroy.totalBytes, 0);
+});
+
+// ---------------------------------------------------------------------------
+// W175: 4K Scene Plane 1 + 1080p UI Plane 0 Multi-Plane Reuse, viewFormats &
+//       Memory-Budget Eviction Guards + Additive Telemetry
+// ---------------------------------------------------------------------------
+
+test('W175 distinguishes compatible viewFormats in pool keys, normalizes aliases, and sanitizes incompatible viewFormats', () => {
+  assert.ok(Object.isFrozen(COMPATIBLE_VIEW_FORMATS));
+  assert.equal(typeof isCompatibleViewFormat, 'function');
+  assert.equal(typeof normalizeViewFormats, 'function');
+
+  assert.equal(isCompatibleViewFormat('rgba8unorm', 'rgba8unorm-srgb'), true);
+  assert.equal(isCompatibleViewFormat('rgba8unorm-srgb', 'rgba8unorm'), true);
+  assert.equal(isCompatibleViewFormat('bgra8unorm', 'bgra8unorm-srgb'), true);
+  assert.equal(isCompatibleViewFormat('rgba8unorm', 'DXGI_FORMAT_R8G8B8A8_UNORM_SRGB'), true);
+  assert.equal(isCompatibleViewFormat('rgba8unorm', 'rgba8unorm'), true);
+  assert.equal(isCompatibleViewFormat('rgba16float', 'rgba8unorm-srgb'), false);
+  assert.equal(isCompatibleViewFormat('depth32float-stencil8', 'rgba8unorm'), false);
+
+  const usage = TEXTURE_USAGE.RENDER_ATTACHMENT | TEXTURE_USAGE.TEXTURE_BINDING;
+  const base4k = { width: 3840, height: 2160, format: 'rgba8unorm', sampleCount: 1, usage };
+
+  // Keys must distinguish plain rgba8unorm vs rgba8unorm with sRGB viewFormat.
+  const keyNoVf = makeRenderTargetKey(base4k);
+  const keyWithSrgbVf = makeRenderTargetKey({ ...base4k, viewFormats: ['rgba8unorm-srgb'] });
+  assert.notEqual(keyNoVf, keyWithSrgbVf);
+
+  // Self-format, duplicates, DXGI aliases, and ordering canonicalize to identical keys.
+  assert.equal(
+    makeRenderTargetKey({ ...base4k, viewFormats: ['rgba8unorm'] }),
+    keyNoVf,
+    'self-format in viewFormats is redundant and matches default key'
+  );
+  assert.equal(
+    makeRenderTargetKey({
+      ...base4k,
+      viewFormats: ['DXGI_FORMAT_R8G8B8A8_UNORM_SRGB', 'rgba8unorm', 'rgba8unorm-srgb'],
+    }),
+    keyWithSrgbVf
+  );
+  assert.equal(
+    makeRenderTargetKey({ ...base4k, viewFormats: new Set(['rgba8unorm-srgb']) }),
+    keyWithSrgbVf
+  );
+
+  // Strict normalizeRenderTargetDesc rejects malformed or incompatible viewFormats.
+  assert.throws(
+    () => normalizeRenderTargetDesc({ ...base4k, viewFormats: 'rgba8unorm-srgb' }),
+    TypeError
+  );
+  assert.throws(
+    () => normalizeRenderTargetDesc({ ...base4k, viewFormats: 42 }),
+    TypeError
+  );
+  assert.throws(
+    () => normalizeRenderTargetDesc({ ...base4k, viewFormats: [''] }),
+    TypeError
+  );
+  assert.throws(
+    () =>
+      normalizeRenderTargetDesc({
+        width: 3840,
+        height: 2160,
+        format: 'rgba16float',
+        viewFormats: ['rgba8unorm-srgb'],
+      }),
+    RangeError
+  );
+
+  // Pool acquisition keeps viewFormats-enabled targets isolated from plain targets and passes
+  // viewFormats to device.createTexture() only when non-empty.
+  const { device, createdTextures } = createMockGpuDevice();
+  const pool = new RenderTargetPool({ device });
+
+  const plain4k = pool.acquire(base4k, 'plane1-plain');
+  assert.deepEqual(plain4k.desc.viewFormats, []);
+  assert.equal('viewFormats' in createdTextures[0].descriptor, false);
+  pool.release(plain4k);
+
+  // Requesting the same 4K rgba8unorm WITH viewFormats: ['rgba8unorm-srgb'] must MISS plain4k.
+  const srgbView4k = pool.acquire(
+    { ...base4k, viewFormats: ['rgba8unorm-srgb'] },
+    'plane1-srgb-view'
+  );
+  assert.equal(srgbView4k.reused, false);
+  assert.notEqual(srgbView4k.texture, plain4k.texture);
+  assert.deepEqual(srgbView4k.desc.viewFormats, ['rgba8unorm-srgb']);
+  assert.deepEqual(createdTextures[1].descriptor.viewFormats, ['rgba8unorm-srgb']);
+  pool.release(srgbView4k);
+
+  // Re-acquiring via DXGI alias + redundant self-format hits srgbView4k cleanly!
+  const aliasHit = pool.acquire(
+    { ...base4k, format: 'r8g8b8a8_unorm', viewFormats: ['r8g8b8a8_unorm_srgb', 'rgba8unorm'] },
+    'plane1-srgb-alias-hit'
+  );
+  assert.equal(aliasHit.reused, true);
+  assert.equal(aliasHit.texture, srgbView4k.texture);
+  pool.release(aliasHit);
+
+  // Pool acquire() sanitizes incompatible viewFormats on rgba16float & depth32float-stencil8
+  // instead of forwarding invalid viewFormats to device.createTexture().
+  const hdr4k = pool.acquire(
+    { width: 3840, height: 2160, format: 'rgba16float', viewFormats: ['rgba8unorm-srgb'] },
+    'plane1-hdr-sanitized'
+  );
+  assert.deepEqual(hdr4k.desc.viewFormats, []);
+  assert.equal('viewFormats' in createdTextures[2].descriptor, false);
+
+  const depth4k = pool.acquire(
+    {
+      width: 3840,
+      height: 2160,
+      format: 'depth32float-stencil8',
+      viewFormats: ['rgba8unorm'],
+    },
+    'plane1-depth-sanitized'
+  );
+  assert.deepEqual(depth4k.desc.viewFormats, []);
+  assert.equal('viewFormats' in createdTextures[3].descriptor, false);
+
+  pool.release(hdr4k);
+  pool.release(depth4k);
+  pool.destroy();
+});
+
+test('W175 simultaneous 4K scene plane 1 and 1080p UI plane 0 coexist without thrashing under default budget', () => {
+  const { device, createdTextures } = createMockGpuDevice();
+  // Uses default maxPoolBytes (512 MiB) — must fit full 4K scene plane 1 + 1080p UI plane 0 set.
+  const pool = new RenderTargetPool({ device });
+  assert.equal(pool.maxPoolBytes, 512 * 1024 * 1024);
+
+  const colorUsage =
+    TEXTURE_USAGE.RENDER_ATTACHMENT | TEXTURE_USAGE.TEXTURE_BINDING | TEXTURE_USAGE.COPY_SRC;
+  const depthUsage = TEXTURE_USAGE.RENDER_ATTACHMENT | TEXTURE_USAGE.TEXTURE_BINDING;
+
+  // Plane 1 (4K 3840x2160 scene) + Plane 0 (1080p 1920x1080 UI) across all 4 required formats.
+  const multiPlaneSpecs = [
+    // 4K Scene Plane 1
+    {
+      label: 'plane1-4k-hdr-a',
+      desc: { width: 3840, height: 2160, format: 'rgba16float', usage: colorUsage, sampleCount: 1 },
+      expectedBytes: 3840 * 2160 * 8,
+    },
+    {
+      label: 'plane1-4k-hdr-b',
+      desc: { width: 3840, height: 2160, format: 'rgba16float', usage: colorUsage, sampleCount: 1 },
+      expectedBytes: 3840 * 2160 * 8,
+    },
+    {
+      label: 'plane1-4k-depth',
+      desc: {
+        width: 3840,
+        height: 2160,
+        format: 'depth32float-stencil8',
+        usage: depthUsage,
+        sampleCount: 1,
+      },
+      expectedBytes: 3840 * 2160 * 8,
+    },
+    {
+      label: 'plane1-4k-gbuffer-linear',
+      desc: {
+        width: 3840,
+        height: 2160,
+        format: 'rgba8unorm',
+        usage: colorUsage,
+        sampleCount: 1,
+        viewFormats: ['rgba8unorm-srgb'],
+      },
+      expectedBytes: 3840 * 2160 * 4,
+    },
+    {
+      label: 'plane1-4k-tonemapped-srgb',
+      desc: {
+        width: 3840,
+        height: 2160,
+        format: 'rgba8unorm-srgb',
+        usage: colorUsage,
+        sampleCount: 1,
+        viewFormats: ['rgba8unorm'],
+      },
+      expectedBytes: 3840 * 2160 * 4,
+    },
+    // 1080p UI Plane 0
+    {
+      label: 'plane0-1080p-ui-srgb',
+      desc: {
+        width: 1920,
+        height: 1080,
+        format: 'rgba8unorm-srgb',
+        usage: colorUsage,
+        sampleCount: 1,
+      },
+      expectedBytes: 1920 * 1080 * 4,
+    },
+    {
+      label: 'plane0-1080p-ui-linear',
+      desc: {
+        width: 1920,
+        height: 1080,
+        format: 'rgba8unorm',
+        usage: colorUsage,
+        sampleCount: 1,
+        viewFormats: ['rgba8unorm-srgb'],
+      },
+      expectedBytes: 1920 * 1080 * 4,
+    },
+    {
+      label: 'plane0-1080p-ui-hdr',
+      desc: { width: 1920, height: 1080, format: 'rgba16float', usage: colorUsage, sampleCount: 1 },
+      expectedBytes: 1920 * 1080 * 8,
+    },
+    {
+      label: 'plane0-1080p-ui-depth',
+      desc: {
+        width: 1920,
+        height: 1080,
+        format: 'depth32float-stencil8',
+        usage: depthUsage,
+        sampleCount: 1,
+      },
+      expectedBytes: 1920 * 1080 * 8,
+    },
+  ];
+
+  const expectedWorkingSetBytes = multiPlaneSpecs.reduce((acc, s) => acc + s.expectedBytes, 0);
+  assert.equal(expectedWorkingSetBytes, 315_187_200); // ~300.6 MiB (exceeds legacy 256 MiB, fits 512 MiB)
+
+  const frames = 6;
+  const firstFrameTexIds = [];
+
+  for (let frame = 0; frame < frames; frame += 1) {
+    const acquired = multiPlaneSpecs.map((spec) => {
+      const rt = pool.acquire(spec.desc, spec.label);
+      assert.equal(rt.byteSize, spec.expectedBytes, `byteSize mismatch for ${spec.label}`);
+      assert.equal(rt.reused, frame > 0, `frame ${frame} ${spec.label} reuse mismatch`);
+      return rt;
+    });
+
+    // All 9 targets are simultaneously checked out (active).
+    const midStats = pool.getStats();
+    assert.equal(midStats.activeTargets, multiPlaneSpecs.length);
+    assert.equal(midStats.activeCount, multiPlaneSpecs.length);
+    assert.equal(midStats.idleTargets, 0);
+    assert.equal(midStats.idleCount, 0);
+    assert.equal(midStats.estimatedBytes, expectedWorkingSetBytes);
+    assert.equal(midStats.peakEstimatedBytes, expectedWorkingSetBytes);
+
+    // Every simultaneously checked-out target must have a distinct physical GPUTexture.
+    const uniqueTex = new Set(acquired.map((rt) => rt.texture));
+    assert.equal(uniqueTex.size, multiPlaneSpecs.length);
+
+    if (frame === 0) {
+      for (const rt of acquired) {
+        firstFrameTexIds.push(rt.texture.mockId);
+      }
+    } else {
+      const frameTexIds = new Set(acquired.map((rt) => rt.texture.mockId));
+      for (const id of firstFrameTexIds) {
+        assert.ok(frameTexIds.has(id), `expected texture #${id} to be reused on frame ${frame}`);
+      }
+    }
+
+    for (const rt of acquired) {
+      assert.equal(pool.release(rt), true);
+    }
+
+    const endRes = pool.endFrame();
+    assert.equal(endRes.evictedCount, 0);
+    assert.equal(endRes.leakedCount, 0);
+  }
+
+  // Only 9 physical GPUTextures ever allocated across 54 total acquires (0 thrashing, 0 evictions).
+  assert.equal(createdTextures.length, multiPlaneSpecs.length);
+
+  const stats = pool.getStats();
+  assert.equal(stats.poolMisses, multiPlaneSpecs.length);
+  assert.equal(stats.misses, multiPlaneSpecs.length);
+  assert.equal(stats.poolHits, multiPlaneSpecs.length * (frames - 1));
+  assert.equal(stats.hits, multiPlaneSpecs.length * (frames - 1));
+  assert.equal(stats.evictions, 0);
+  assert.equal(stats.budgetEvictions, 0);
+  assert.equal(stats.activeTargets, 0);
+  assert.equal(stats.idleTargets, multiPlaneSpecs.length);
+  assert.equal(stats.estimatedBytes, expectedWorkingSetBytes);
+  assert.equal(stats.peakEstimatedBytes, expectedWorkingSetBytes);
+  assert.equal(stats.maxPoolBytes, 512 * 1024 * 1024);
+
+  pool.destroy();
+  const postDestroy = pool.getStats();
+  assert.equal(postDestroy.activeTargets, 0);
+  assert.equal(postDestroy.idleTargets, 0);
+  assert.equal(postDestroy.estimatedBytes, 0);
+  assert.equal(postDestroy.peakEstimatedBytes, expectedWorkingSetBytes);
+  assert.equal(postDestroy.poolHits, multiPlaneSpecs.length * (frames - 1));
+  assert.equal(postDestroy.poolMisses, multiPlaneSpecs.length);
+});
+
+test('W175 memory-budget LRU eviction guards evict only idle targets and never destroy active 4K/1080p targets', () => {
+  const bytes4kRgba8 = 3840 * 2160 * 4; // 33,177,600 B
+  const bytes4kHdr = 3840 * 2160 * 8; // 66,355,200 B
+  const bytes1080Rgba8 = 1920 * 1080 * 4; // 8,294,400 B
+
+  // 1. Tight budget under strictBudget: true evicts LRU idle targets while keeping active targets alive.
+  {
+    const { device, createdTextures } = createMockGpuDevice();
+    // Budget fits 4K HDR (66.35 MB) + 4K rgba8 (33.18 MB) + 1080p rgba8 (8.29 MB) = 107,827,200 B
+    const budget = bytes4kHdr + bytes4kRgba8 + bytes1080Rgba8;
+    const pool = new RenderTargetPool({ device, maxPoolBytes: budget, strictBudget: true });
+
+    const plane1Hdr = pool.acquire({ width: 3840, height: 2160, format: 'rgba16float' }, 'p1-hdr');
+    const plane1Color = pool.acquire({ width: 3840, height: 2160, format: 'rgba8unorm' }, 'p1-color');
+    const plane0Ui = pool.acquire({ width: 1920, height: 1080, format: 'rgba8unorm-srgb' }, 'p0-ui');
+
+    // Release plane1Color first (oldest LRU), then plane0Ui (newer LRU). Keep plane1Hdr ACTIVE!
+    pool.release(plane1Color);
+    pool.release(plane0Ui);
+
+    // Acquiring 4K rgba8unorm-srgb (33.18 MB) needs 33.18 MB -> must LRU-evict plane1Color (oldest idle),
+    // keeping plane0Ui (newer idle) AND plane1Hdr (active) untouched!
+    const plane1Srgb = pool.acquire(
+      { width: 3840, height: 2160, format: 'rgba8unorm-srgb' },
+      'p1-srgb'
+    );
+    assert.equal(plane1Srgb.reused, false);
+    assert.equal(createdTextures[0].destroyed, false, 'active 4K HDR target must never be evicted');
+    assert.equal(createdTextures[1].destroyed, true, 'oldest idle target must be LRU-evicted');
+    assert.equal(createdTextures[2].destroyed, false, 'newer idle 1080p UI target must survive');
+    assert.equal(plane1Hdr.destroyed, false);
+    assert.ok(plane1Hdr.view !== null);
+
+    let stats = pool.getStats();
+    assert.equal(stats.activeTargets, 2);
+    assert.equal(stats.idleTargets, 1);
+    assert.equal(stats.evictions, 1);
+    assert.equal(stats.budgetEvictions, 1);
+    assert.equal(stats.estimatedBytes, budget);
+    assert.equal(stats.peakEstimatedBytes, budget);
+
+    // Runtime setMaxPoolBytes below active bytes evicts idle targets ONLY, never destroys active targets!
+    const shrinkRes = pool.setMaxPoolBytes(bytes4kRgba8);
+    assert.deepEqual(shrinkRes, { evictedCount: 1, evictedBytes: bytes1080Rgba8 });
+    assert.equal(createdTextures[2].destroyed, true, 'idle 1080p UI evicted when budget shrinks');
+    assert.equal(createdTextures[0].destroyed, false, 'checked-out 4K HDR stays alive');
+    assert.equal(createdTextures[3].destroyed, false, 'checked-out 4K sRGB stays alive');
+
+    stats = pool.getStats();
+    assert.equal(stats.maxPoolBytes, bytes4kRgba8);
+    assert.equal(stats.activeTargets, 2);
+    assert.equal(stats.idleTargets, 0);
+    assert.equal(stats.evictions, 2);
+    assert.equal(stats.budgetEvictions, 2);
+    assert.equal(stats.estimatedBytes, bytes4kHdr + bytes4kRgba8);
+
+    // Invalid setMaxPoolBytes values throw RangeError.
+    assert.throws(() => pool.setMaxPoolBytes(0), RangeError);
+    assert.throws(() => pool.setMaxPoolBytes(-1024), RangeError);
+    assert.throws(() => pool.setMaxPoolBytes(1.5), RangeError);
+    assert.throws(() => pool.setMaxPoolBytes(Number.NaN), RangeError);
+
+    pool.release(plane1Hdr);
+    pool.release(plane1Srgb);
+    pool.destroy();
+    assert.throws(() => pool.setMaxPoolBytes(bytes4kRgba8), /destroyed/i);
+  }
+
+  // 2. strictBudget: false permits burst active allocation above maxPoolBytes, then trims excess idle
+  //    targets in LRU order at endFrame() while still leaving any checked-out targets untouched.
+  {
+    const { device, createdTextures } = createMockGpuDevice();
+    const pool = new RenderTargetPool({
+      device,
+      maxPoolBytes: bytes4kRgba8, // 33.18 MB budget
+      strictBudget: false,
+      autoReleaseLeaked: false,
+      onLeak: () => {},
+    });
+
+    // Allocate 3 simultaneous targets exceeding budget: 4K HDR (active across frame), 4K rgba8, 1080p UI.
+    const activeHdr = pool.acquire({ width: 3840, height: 2160, format: 'rgba16float' }, 'burst-hdr');
+    const released4k = pool.acquire({ width: 3840, height: 2160, format: 'rgba8unorm' }, 'burst-4k');
+    const released1080 = pool.acquire(
+      { width: 1920, height: 1080, format: 'rgba8unorm-srgb' },
+      'burst-1080p'
+    );
+
+    const peakExpected = bytes4kHdr + bytes4kRgba8 + bytes1080Rgba8;
+    let stats = pool.getStats();
+    assert.equal(stats.activeTargets, 3);
+    assert.equal(stats.estimatedBytes, peakExpected);
+    assert.equal(stats.peakEstimatedBytes, peakExpected);
+
+    // Release the two non-active targets; keep activeHdr checked out.
+    pool.release(released4k);
+    pool.release(released1080);
+
+    // endFrame() must LRU-trim both excess idle targets because activeBytes alone exceeds maxPoolBytes,
+    // while NEVER destroying activeHdr!
+    const endRes = pool.endFrame();
+    assert.equal(endRes.evictedCount, 2);
+    assert.equal(createdTextures[0].destroyed, false, 'active 4K HDR must never be destroyed by endFrame budget trim');
+    assert.equal(createdTextures[1].destroyed, true);
+    assert.equal(createdTextures[2].destroyed, true);
+    assert.equal(activeHdr.destroyed, false);
+    assert.ok(activeHdr.view !== null);
+
+    stats = pool.getStats();
+    assert.equal(stats.activeTargets, 1);
+    assert.equal(stats.idleTargets, 0);
+    assert.equal(stats.evictions, 2);
+    assert.equal(stats.budgetEvictions, 2);
+    assert.equal(stats.estimatedBytes, bytes4kHdr);
+    assert.equal(stats.peakEstimatedBytes, peakExpected);
+
+    pool.release(activeHdr);
+    pool.destroy();
+  }
 });
