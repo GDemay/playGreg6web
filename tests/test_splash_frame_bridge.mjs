@@ -10,6 +10,11 @@ const {
   DEFAULT_MAX_QUEUE_DEPTH,
   SPLASH_FRAME_SOURCE,
   PIXEL_FORMAT,
+  PIXEL_FORMAT_ID,
+  ALLOWED_FRAME_FORMATS,
+  COLOR_SPACE,
+  COLOR_RANGE,
+  sanitizeFrameFormat,
   generateDiagnosticSplashFrame,
   SplashFrameBridge,
 } = bridgeMod;
@@ -711,4 +716,410 @@ test('injected presenter is reused and not destroyed by bridge.destroy()', () =>
   assert.equal(presenter.isDestroyed, false);
   presenter.destroy();
   assert.equal(presenter.isDestroyed, true);
+});
+
+function makeNv12Planes(width, height, options = {}) {
+  const uvW = Math.ceil(width / 2);
+  const uvH = Math.ceil(height / 2);
+  const yStride = options.yStride !== undefined ? options.yStride : width;
+  const uvStride = options.uvStride !== undefined ? options.uvStride : uvW * 2;
+  const yFill = options.yFill !== undefined ? options.yFill : 0xa5;
+  const uFill = options.uFill !== undefined ? options.uFill : 0x60;
+  const vFill = options.vFill !== undefined ? options.vFill : 0x90;
+
+  const yPlane = new Uint8Array(yStride * height);
+  for (let row = 0; row < height; row += 1) {
+    yPlane.fill(yFill, row * yStride, row * yStride + width);
+  }
+
+  const uvPlane = new Uint8Array(uvStride * uvH);
+  for (let row = 0; row < uvH; row += 1) {
+    for (let col = 0; col < uvW; col += 1) {
+      const idx = row * uvStride + col * 2;
+      uvPlane[idx] = uFill;
+      uvPlane[idx + 1] = vFill;
+    }
+  }
+
+  return { yPlane, uvPlane, yStride, uvStride };
+}
+
+test('pushRawFrame forwards NV12 payloads (yPlane/uvPlane, strides, colorSpace, colorRange) to BinkVideoPresenter.uploadNv12Frame', () => {
+  const device = createMockWebGpuDevice();
+  const presenter = new BinkVideoPresenter({ device, targetFps: 120 });
+  const bridge = new SplashFrameBridge({ presenter, maxQueueDepth: 3 });
+
+  assert.equal(PIXEL_FORMAT.NV12, BINK_PIXEL_FORMAT.NV12);
+  assert.equal(PIXEL_FORMAT_ID[3], PIXEL_FORMAT.NV12);
+  assert.equal(COLOR_SPACE.BT601, 'bt601');
+  assert.equal(COLOR_RANGE.FULL, 'full');
+
+  const { yPlane, uvPlane, yStride, uvStride } = makeNv12Planes(16, 8, {
+    yStride: 24,
+    uvStride: 20,
+    yFill: 0xb2,
+    uFill: 0x44,
+    vFill: 0xcc,
+  });
+
+  bridge.pushRawFrame({
+    width: 16,
+    height: 8,
+    format: 'nv12',
+    yPlane,
+    uvPlane,
+    yStride,
+    uvStride,
+    colorSpace: 'bt601',
+    colorRange: 'full',
+    timestampMs: 0,
+  });
+
+  // Mutating caller buffers after enqueue must not affect uploaded plane bytes.
+  yPlane.fill(0);
+  uvPlane.fill(0);
+
+  const result = bridge.renderFrame(device, { kind: 'GPUTextureView' }, 640, 360, 0);
+  assert.equal(result.presented, true);
+  assert.equal(result.format, ALLOWED_FRAME_FORMATS.NV12);
+  assert.equal(result.colorSpace, 'bt601');
+  assert.equal(result.colorRange, 'full');
+  assert.equal(presenter.pixelFormat, BINK_PIXEL_FORMAT.NV12);
+  assert.equal(presenter.colorSpace, 'bt601');
+  assert.equal(presenter.colorRange, 'full');
+
+  const yUpload = device.writeTextureCalls.find(
+    (call) => call.size.width === 16 && call.size.height === 8 && call.data[0] === 0xb2
+  );
+  const uvUpload = device.writeTextureCalls.find(
+    (call) =>
+      call.size.width === 8 &&
+      call.size.height === 4 &&
+      call.data[0] === 0x44 &&
+      call.data[1] === 0xcc
+  );
+  assert.ok(yUpload, 'expected cloned NV12 Y plane upload');
+  assert.ok(uvUpload, 'expected cloned NV12 interleaved UV plane upload');
+
+  const stats = bridge.getStats();
+  assert.equal(stats.nv12FramesForwarded, 1);
+  assert.equal(stats.lastFrameFormat, 'nv12');
+  assert.equal(stats.framesBeforeFirstPresent, 1);
+});
+
+test('NV12 numeric format 3 and uploadFrame fallback forward cleanly without counting dropped frames', () => {
+  const device = createMockWebGpuDevice();
+  const uploadedFrames = [];
+  const mockPresenter = {
+    uploadFrame(frame) {
+      uploadedFrames.push(frame);
+      return { format: frame.format };
+    },
+    presentFrame() {
+      return {
+        presented: true,
+        viewport: { x: 0, y: 0, width: 320, height: 180 },
+        colorSpace: 'bt709',
+        colorRange: 'limited',
+      };
+    },
+  };
+
+  const bridge = new SplashFrameBridge({ presenter: mockPresenter, maxQueueDepth: 1 });
+  const droppedNv12 = makeNv12Planes(8, 4, { yFill: 0x10 });
+  const keptNv12 = makeNv12Planes(8, 4, { yStride: 12, uvStride: 10, yFill: 0x77 });
+
+  // First NV12 frame will be evicted by maxQueueDepth=1 before forwarding.
+  bridge.pushRawFrame({
+    width: 8,
+    height: 4,
+    format: 3,
+    planes: { y: droppedNv12.yPlane, uv: droppedNv12.uvPlane },
+    frameIndex: 0,
+    timestampMs: 0,
+  });
+  bridge.pushNv12Frame({
+    width: 8,
+    height: 4,
+    yPlane: keptNv12.yPlane,
+    uvPlane: keptNv12.uvPlane,
+    yStride: 12,
+    uvStride: 10,
+    colorSpace: 'bt709',
+    colorRange: 'limited',
+    frameIndex: 1,
+    timestampMs: 1,
+  });
+
+  const result = bridge.renderFrame(device, { kind: 'GPUTextureView' }, 320, 180, 1);
+  assert.equal(result.presented, true);
+  assert.equal(result.frameIndex, 1);
+  assert.equal(uploadedFrames.length, 1);
+  assert.equal(uploadedFrames[0].format, 'nv12');
+  assert.equal(uploadedFrames[0].y[0], 0x77);
+  assert.equal(uploadedFrames[0].yStride, 12);
+  assert.equal(uploadedFrames[0].uvStride, 10);
+  assert.equal(uploadedFrames[0].colorSpace, 'bt709');
+  assert.equal(uploadedFrames[0].colorRange, 'limited');
+
+  const stats = bridge.getStats();
+  assert.equal(stats.droppedFrames, 1);
+  assert.equal(stats.nv12FramesForwarded, 1);
+  assert.equal(stats.lastFrameFormat, 'nv12');
+});
+
+test('YUV420P and YUVA420P propagate colorSpace, colorRange, and optional strides into BinkVideoPresenter', () => {
+  const device = createMockWebGpuDevice();
+  const bridge = new SplashFrameBridge({
+    device,
+    targetFps: 1000,
+    colorSpace: 'bt709',
+    colorRange: 'full',
+  });
+
+  const planes = makeYuv420Planes(16, 8);
+  bridge.pushRawFrame({
+    width: 16,
+    height: 8,
+    format: 1,
+    planes,
+    colorSpace: 'bt601',
+    colorRange: 'full',
+    timestampMs: 0,
+  });
+
+  const r0 = bridge.renderFrame(device, { kind: 'GPUTextureView' }, 320, 180, 0);
+  assert.equal(r0.presented, true);
+  assert.equal(r0.colorSpace, 'bt601');
+  assert.equal(r0.colorRange, 'full');
+  assert.equal(bridge.presenter.colorSpace, 'bt601');
+  assert.equal(bridge.presenter.colorRange, 'full');
+  assert.equal(bridge.getStats().lastFrameFormat, 'yuv420p');
+
+  const alpha = new Uint8Array(16 * 8).fill(200);
+  bridge.pushRawFrame({
+    width: 16,
+    height: 8,
+    format: PIXEL_FORMAT.YUVA420P,
+    planes: { ...planes, a: alpha },
+    colorSpace: 'bt709',
+    colorRange: 'limited',
+    timestampMs: 10,
+  });
+
+  const r1 = bridge.renderFrame(device, { kind: 'GPUTextureView' }, 320, 180, 10);
+  assert.equal(r1.presented, true);
+  assert.equal(bridge.presenter.pixelFormat, BINK_PIXEL_FORMAT.YUVA420P);
+  assert.equal(bridge.presenter.colorSpace, 'bt709');
+  assert.equal(bridge.presenter.colorRange, 'limited');
+  // YUVA420P maps to allowlisted 'yuv420p' token in telemetry.
+  assert.equal(bridge.getStats().lastFrameFormat, 'yuv420p');
+
+  assert.throws(
+    () =>
+      bridge.pushRawFrame({
+        width: 8,
+        height: 4,
+        format: 'nv12',
+        yPlane: new Uint8Array(32),
+        uvPlane: new Uint8Array(16),
+        colorRange: 'invalid-range',
+      }),
+    RangeError
+  );
+  assert.throws(
+    () =>
+      bridge.pushRawFrame({
+        width: 8,
+        height: 4,
+        format: 'nv12',
+        yPlane: new Uint8Array(32),
+      }),
+    TypeError
+  );
+});
+
+test('lastFrameFormat is strictly sanitized to allowlisted tokens across all formats and invalid inputs', () => {
+  assert.equal(sanitizeFrameFormat('rgba8'), 'rgba8');
+  assert.equal(sanitizeFrameFormat('RGBA8UNORM'), 'rgba8');
+  assert.equal(sanitizeFrameFormat(0), 'rgba8');
+  assert.equal(sanitizeFrameFormat('yuv420p'), 'yuv420p');
+  assert.equal(sanitizeFrameFormat('YUVA420P'), 'yuv420p');
+  assert.equal(sanitizeFrameFormat(1), 'yuv420p');
+  assert.equal(sanitizeFrameFormat(2), 'yuv420p');
+  assert.equal(sanitizeFrameFormat('NV12'), 'nv12');
+  assert.equal(sanitizeFrameFormat(3), 'nv12');
+  assert.equal(sanitizeFrameFormat('ImageBitmap'), 'imagebitmap');
+  assert.equal(sanitizeFrameFormat('image_bitmap'), 'imagebitmap');
+
+  // Non-allowlisted / adversarial values (including host paths & URLs) must sanitize to null.
+  assert.equal(sanitizeFrameFormat(null), null);
+  assert.equal(sanitizeFrameFormat(undefined), null);
+  assert.equal(sanitizeFrameFormat(99), null);
+  assert.equal(sanitizeFrameFormat({}), null);
+  assert.equal(sanitizeFrameFormat('C:\\Users\\player\\Movies\\intro.bk2'), null);
+  assert.equal(sanitizeFrameFormat('/home/user/dump.nv12'), null);
+  assert.equal(sanitizeFrameFormat('https://example.invalid/frame.raw'), null);
+  assert.equal(sanitizeFrameFormat('bgra10_xr'), null);
+
+  const device = createMockWebGpuDevice();
+  const bridge = new SplashFrameBridge({ device, targetFps: 1000 });
+  assert.equal(bridge.getStats().lastFrameFormat, null);
+
+  bridge.pushDiagnosticFrame(8, 4, 0, { timestampMs: 0 });
+  bridge.renderFrame(device, { kind: 'GPUTextureView' }, 64, 32, 0);
+  assert.equal(bridge.getStats().lastFrameFormat, 'rgba8');
+
+  bridge.pushRawFrame({
+    width: 8,
+    height: 4,
+    format: PIXEL_FORMAT.YUV420P,
+    planes: makeYuv420Planes(8, 4),
+    timestampMs: 10,
+  });
+  bridge.renderFrame(device, { kind: 'GPUTextureView' }, 64, 32, 10);
+  assert.equal(bridge.getStats().lastFrameFormat, 'yuv420p');
+
+  const nv12 = makeNv12Planes(8, 4);
+  bridge.pushRawFrame({
+    width: 8,
+    height: 4,
+    format: 'nv12',
+    yPlane: nv12.yPlane,
+    uvPlane: nv12.uvPlane,
+    timestampMs: 20,
+  });
+  bridge.renderFrame(device, { kind: 'GPUTextureView' }, 64, 32, 20);
+  assert.equal(bridge.getStats().lastFrameFormat, 'nv12');
+
+  bridge.pushExternalImage(
+    { width: 4, height: 4, data: makeRgbaFrame(4, 4, 0x55) },
+    { timestampMs: 30 }
+  );
+  bridge.renderFrame(device, { kind: 'GPUTextureView' }, 64, 32, 30);
+  assert.equal(bridge.getStats().lastFrameFormat, 'imagebitmap');
+
+  // Even if internal state were corrupted with an arbitrary path, getStats() sanitizes it.
+  bridge._lastFrameFormat = 'C:\\secret\\host\\path.bin';
+  assert.equal(bridge.getStats().lastFrameFormat, null);
+});
+
+test('framesBeforeFirstPresent and lateSplashFramesIgnored track splash-to-first-present handoff and suppression', () => {
+  const device = createMockWebGpuDevice();
+  const bridge = new SplashFrameBridge({ device, targetFps: 1000, maxQueueDepth: 4 });
+
+  // Present 2 splash frames before live guest FIRST_PRESENT handoff.
+  bridge.pushDiagnosticFrame(8, 4, 0, { timestampMs: 0 });
+  bridge.renderFrame(device, { kind: 'GPUTextureView' }, 128, 72, 0);
+
+  const nv12 = makeNv12Planes(8, 4);
+  bridge.pushRawFrame({
+    width: 8,
+    height: 4,
+    format: 'nv12',
+    yPlane: nv12.yPlane,
+    uvPlane: nv12.uvPlane,
+    timestampMs: 10,
+  });
+  bridge.renderFrame(device, { kind: 'GPUTextureView' }, 128, 72, 10);
+
+  // Queue one more splash frame right before handoff.
+  bridge.pushDiagnosticFrame(8, 4, 2, { timestampMs: 20 });
+
+  let stats = bridge.getStats();
+  assert.equal(stats.framesPresented, 2);
+  assert.equal(stats.framesBeforeFirstPresent, 2);
+  assert.equal(stats.lateSplashFramesIgnored, 0);
+  assert.equal(stats.nv12FramesForwarded, 1);
+  assert.equal(stats.guestFirstPresent, false);
+  assert.equal(stats.splashSuppressed, false);
+
+  // Signal live guest FIRST_PRESENT handoff (default splash suppression enabled).
+  const handoff = bridge.notifyGuestFirstPresent();
+  assert.equal(handoff.guestFirstPresent, true);
+  assert.equal(handoff.splashSuppressed, true);
+  assert.equal(handoff.framesBeforeFirstPresent, 2);
+  assert.equal(handoff.drainedFrames, 1);
+  assert.equal(handoff.lateSplashFramesIgnored, 1);
+
+  const encodersBefore = device.createdEncoders.length;
+  const submitsBefore = device.submitCalls.length;
+
+  // Late splash frames pushed after handoff are ignored without uploading or presenting.
+  const lateRaw = bridge.pushRawFrame({
+    width: 8,
+    height: 4,
+    format: 3,
+    yPlane: nv12.yPlane,
+    uvPlane: nv12.uvPlane,
+    timestampMs: 30,
+  });
+  assert.equal(lateRaw.ignored, true);
+  assert.equal(lateRaw.reason, 'suppressed');
+
+  const lateDiag = bridge.pushDiagnosticFrame(8, 4, 4, { timestampMs: 40 });
+  assert.equal(lateDiag.ignored, true);
+  assert.equal(lateDiag.reason, 'suppressed');
+
+  const lateExt = bridge.pushExternalImage(
+    { width: 4, height: 4, data: makeRgbaFrame(4, 4) },
+    { timestampMs: 50 }
+  );
+  assert.equal(lateExt.ignored, true);
+  assert.equal(lateExt.reason, 'suppressed');
+
+  const suppressedRender = bridge.renderFrame(device, { kind: 'GPUTextureView' }, 128, 72, 60);
+  assert.equal(suppressedRender.presented, false);
+  assert.equal(suppressedRender.reason, 'suppressed');
+  assert.equal(device.createdEncoders.length, encodersBefore);
+  assert.equal(device.submitCalls.length, submitsBefore);
+
+  stats = bridge.getStats();
+  assert.equal(stats.framesPresented, 2);
+  assert.equal(stats.framesBeforeFirstPresent, 2);
+  assert.equal(stats.lateSplashFramesIgnored, 4);
+  assert.equal(stats.nv12FramesForwarded, 1);
+  assert.equal(stats.lastFrameFormat, 'nv12');
+  assert.equal(stats.queueDepth, 0);
+
+  // Reset clears handoff, suppression, and format telemetry.
+  bridge.reset();
+  stats = bridge.getStats();
+  assert.equal(stats.framesBeforeFirstPresent, 0);
+  assert.equal(stats.lateSplashFramesIgnored, 0);
+  assert.equal(stats.nv12FramesForwarded, 0);
+  assert.equal(stats.lastFrameFormat, null);
+  assert.equal(stats.guestFirstPresent, false);
+  assert.equal(stats.splashSuppressed, false);
+});
+
+test('notifyGuestFirstPresent without suppression freezes framesBeforeFirstPresent until suppression is enabled', () => {
+  const device = createMockWebGpuDevice();
+  const bridge = new SplashFrameBridge({
+    device,
+    targetFps: 1000,
+    suppressSplashAfterFirstPresent: false,
+  });
+
+  bridge.pushDiagnosticFrame(8, 4, 0, { timestampMs: 0 });
+  bridge.renderFrame(device, { kind: 'GPUTextureView' }, 100, 50, 0);
+  assert.equal(bridge.getStats().framesBeforeFirstPresent, 1);
+
+  const handoff = bridge.notifyGuestFirstPresent();
+  assert.equal(handoff.guestFirstPresent, true);
+  assert.equal(handoff.splashSuppressed, false);
+
+  // Without suppression active, splash presentation can continue while framesBeforeFirstPresent stays frozen.
+  bridge.pushDiagnosticFrame(8, 4, 1, { timestampMs: 10 });
+  const r1 = bridge.renderFrame(device, { kind: 'GPUTextureView' }, 100, 50, 10);
+  assert.equal(r1.presented, true);
+  assert.equal(bridge.getStats().framesPresented, 2);
+  assert.equal(bridge.getStats().framesBeforeFirstPresent, 1);
+  assert.equal(bridge.getStats().lateSplashFramesIgnored, 0);
+
+  // Enabling suppression later ignores subsequent splash frames.
+  bridge.setSplashSuppressed(true);
+  const ignored = bridge.pushDiagnosticFrame(8, 4, 2, { timestampMs: 20 });
+  assert.equal(ignored.ignored, true);
+  assert.equal(bridge.getStats().lateSplashFramesIgnored, 1);
 });
