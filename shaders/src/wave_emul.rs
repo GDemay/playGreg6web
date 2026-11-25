@@ -173,8 +173,46 @@ use naga::{
 use crate::compat::{CompatAudit, CompatIssue, CompatIssueKind, CompatSeverity, SpirvStreamError};
 use crate::convert::SPIRV_MAGIC;
 
+/// Lane count for RDNA2 Wave32 mode.
+pub const WAVE32_LANE_COUNT: u32 = 32;
+
 /// Lane count assumed by `--wave64-emulate` (RDNA2 Wave64).
 pub const WAVE64_LANE_COUNT: u32 = 64;
+
+/// RDNA2 wave width emulated by [`WaveStrategy::WorkgroupEmulation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum WaveSize {
+    Wave32,
+    #[default]
+    Wave64,
+}
+
+impl WaveSize {
+    pub const fn lane_count(self) -> u32 {
+        match self {
+            Self::Wave32 => WAVE32_LANE_COUNT,
+            Self::Wave64 => WAVE64_LANE_COUNT,
+        }
+    }
+
+    /// Bitmask clamping a lane index to `0..31` (Wave32) or `0..63` (Wave64).
+    pub const fn lane_mask(self) -> u32 {
+        self.lane_count() - 1
+    }
+
+    /// Bit shift dividing `local_invocation_index` into its wave index (`5` or `6`).
+    pub const fn wave_shift(self) -> u32 {
+        match self {
+            Self::Wave32 => 5,
+            Self::Wave64 => 6,
+        }
+    }
+
+    /// Bitmask rounding `local_invocation_index` down to the start of its wave.
+    pub const fn wave_base_mask(self) -> u32 {
+        !self.lane_mask()
+    }
+}
 
 /// Default identifier prefix for generated helper functions, globals, and WGSL declarations.
 pub const DEFAULT_HELPER_PREFIX: &str = "pg6w_";
@@ -1408,6 +1446,7 @@ fn ballot_count_scan(
     let lane_var = decls.lane_index_var();
     let zero = decls.uint_const(0);
     let one = decls.uint_const(1);
+    let thirty_one = decls.uint_const(31);
     let thirty_two = decls.uint_const(32);
     let all_ones = decls.uint_const(u32::MAX);
 
@@ -1430,13 +1469,15 @@ fn ballot_count_scan(
         let diff = decls.ids.fresh();
         let bits = decls.ids.fresh();
         let full = decls.ids.fresh();
+        let shift_bits = decls.ids.fresh();
         let shifted = decls.ids.fresh();
         let partial = decls.ids.fresh();
         let mask = decls.ids.fresh();
         let word = decls.ids.fresh();
         let masked = decls.ids.fresh();
         let count = decls.ids.fresh();
-        // bits = clamp(k - 32c, 0, ..); mask = bits >= 32 ? ~0 : (1 << bits) - 1
+        // bits = clamp(k - 32c, 0, ..); mask = bits >= 32 ? ~0 : (1 << (bits & 31)) - 1
+        // Masking shift_bits to 0..=31 avoids SPIR-V/WGSL out-of-range shift UB when bits >= 32.
         sequence.push(make_inst(
             OP_UGREATER_THAN_EQUAL,
             &[bool_ty, ge, k, low_lane],
@@ -1448,8 +1489,12 @@ fn ballot_count_scan(
             &[bool_ty, full, bits, thirty_two],
         ));
         sequence.push(make_inst(
+            OP_BITWISE_AND,
+            &[uint, shift_bits, bits, thirty_one],
+        ));
+        sequence.push(make_inst(
             OP_SHIFT_LEFT_LOGICAL,
-            &[uint, shifted, one, bits],
+            &[uint, shifted, one, shift_bits],
         ));
         sequence.push(make_inst(OP_ISUB, &[uint, partial, shifted, one]));
         sequence.push(make_inst(OP_SELECT, &[uint, mask, full, all_ones, partial]));
@@ -1553,6 +1598,8 @@ impl fmt::Display for LoweringCondition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WaveLoweringOptions {
     pub strategy: WaveStrategy,
+    /// Emulated wave width (`Wave64` by default, or `Wave32` for RDNA2 Wave32 shaders).
+    pub wave_size: WaveSize,
     /// Accept [`LoweringCondition::Wave1Model`] approximations under [`WaveStrategy::SingleLane`].
     pub allow_wave1_model: bool,
     /// Prefix for generated identifiers; made unique against the module's names.
@@ -1566,6 +1613,7 @@ impl WaveLoweringOptions {
     pub fn new(strategy: WaveStrategy) -> Self {
         Self {
             strategy,
+            wave_size: WaveSize::Wave64,
             allow_wave1_model: false,
             helper_prefix: DEFAULT_HELPER_PREFIX.to_string(),
             max_workgroup_storage_bytes: WEBGPU_MAX_COMPUTE_WORKGROUP_STORAGE_SIZE,
@@ -2841,7 +2889,7 @@ impl Planner<'_> {
                 }
                 WaveStrategy::WorkgroupEmulation => match intrinsic {
                     WaveIntrinsic::LaneCount => (
-                        BuiltinAction::Literal(WAVE64_LANE_COUNT),
+                        BuiltinAction::Literal(self.options.wave_size.lane_count()),
                         LoweringCondition::Exact,
                     ),
                     _ if !compute => {
@@ -2862,7 +2910,8 @@ impl Planner<'_> {
                     }
                     WaveIntrinsic::NumWaves => (
                         BuiltinAction::Literal(
-                            workgroup_invocations(ep.workgroup_size).div_ceil(WAVE64_LANE_COUNT),
+                            workgroup_invocations(ep.workgroup_size)
+                                .div_ceil(self.options.wave_size.lane_count()),
                         ),
                         LoweringCondition::Exact,
                     ),
@@ -3082,10 +3131,28 @@ fn unique_ir_prefix(module: &Module, base: &str) -> String {
 }
 
 fn unique_prefix_among<'a>(names: impl Iterator<Item = &'a str> + Clone, base: &str) -> String {
-    let stem = base.trim_end_matches('_');
-    let mut candidate = base.to_string();
+    // Reject empty, double-underscore, digit-leading, non-identifier, or reserved bases so
+    // generated WGSL identifiers are always valid and never shadow keywords/builtins.
+    let valid_base = !base.is_empty()
+        && !base.starts_with("__")
+        && base
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && base.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !base.trim_end_matches('_').is_empty()
+        && !WGSL_RESERVED.contains(&base);
+    let safe_base = if valid_base {
+        base
+    } else {
+        DEFAULT_HELPER_PREFIX
+    };
+    let stem = safe_base.trim_end_matches('_');
+    let mut candidate = safe_base.to_string();
     let mut counter = 1u32;
-    while names.clone().any(|name| name.starts_with(&candidate)) {
+    while WGSL_RESERVED.contains(&candidate.as_str())
+        || names.clone().any(|name| name.starts_with(&candidate))
+    {
         candidate = format!("{stem}{counter}_");
         counter += 1;
     }
@@ -3105,6 +3172,7 @@ pub fn unique_wgsl_prefix(existing_wgsl: &str, base: &str) -> String {
 
 struct LoweringGlobals {
     prefix: String,
+    wave_size: WaveSize,
     u32_ty: Handle<Type>,
     i32_ty: Handle<Type>,
     bool_ty: Handle<Type>,
@@ -3234,6 +3302,7 @@ fn materialize(
 
     let globals = LoweringGlobals {
         prefix: prefix.clone(),
+        wave_size: options.wave_size,
         u32_ty,
         i32_ty,
         bool_ty,
@@ -3673,10 +3742,17 @@ impl FnBuilder {
         self.push(Statement::Return { value: Some(value) });
     }
 
-    /// `for (var j = start; j < 64u; j++) { body(j) }` â€” a uniform, constant trip count.
-    fn lane_loop(&mut self, start: u32, body: impl FnOnce(&mut Self, Handle<Expression>)) {
+    /// `for (var <var_name> = start; <var_name> < end; <var_name>++) { body(i) }`.
+    /// Caller guarantees `end > start` and `end <= 64`.
+    fn bounded_lane_loop(
+        &mut self,
+        var_name: &str,
+        start: u32,
+        end: Handle<Expression>,
+        body: impl FnOnce(&mut Self, Handle<Expression>),
+    ) {
         let u32_ty = self.u32_ty;
-        let counter = self.local("j", u32_ty);
+        let counter = self.local(var_name, u32_ty);
         let first = self.u32(start);
         self.store(counter, first);
         self.open();
@@ -3688,8 +3764,7 @@ impl FnBuilder {
         let one = self.u32(1);
         let next = self.binary(BinaryOperator::Add, current, one);
         self.store(counter, next);
-        let limit = self.u32(WAVE64_LANE_COUNT);
-        let done = self.binary(BinaryOperator::GreaterEqual, next, limit);
+        let done = self.binary(BinaryOperator::GreaterEqual, next, end);
         let continuing = self.close();
         self.push(Statement::Loop {
             body: body_block,
@@ -3727,10 +3802,10 @@ fn wave_coords(b: &mut FnBuilder, globals: &LoweringGlobals) -> WaveCoords {
     let pointer = b.global(total_g);
     let count = b.load(pointer);
     let count = b.named("invocations", count);
-    let wave_mask = b.u32(!(WAVE64_LANE_COUNT - 1));
+    let wave_mask = b.u32(globals.wave_size.wave_base_mask());
     let base = b.binary(BinaryOperator::And, local_index, wave_mask);
     let base = b.named("wave_base", base);
-    let lane_mask = b.u32(WAVE64_LANE_COUNT - 1);
+    let lane_mask = b.u32(globals.wave_size.lane_mask());
     let lane = b.binary(BinaryOperator::And, local_index, lane_mask);
     let lane = b.named("lane", lane);
     WaveCoords {
@@ -3877,7 +3952,7 @@ fn build_helper(key: HelperKey, globals: &LoweringGlobals, types: &UniqueArena<T
             let value = if key == HelperKey::EmuLaneIndex {
                 coords.lane
             } else {
-                let shift = b.u32(6);
+                let shift = b.u32(globals.wave_size.wave_shift());
                 b.binary(BinaryOperator::ShiftRight, coords.local_index, shift)
             };
             b.ret(value);
@@ -3903,42 +3978,66 @@ fn build_emulated_ballot(name: String, globals: &LoweringGlobals) -> Function {
     let encoded = encode(&mut b, predicate, true);
     let scratch = globals.scratch[&ScratchElement::U32];
     let array = publish(&mut b, &coords, scratch, encoded);
+
+    // Exact active lane count for this wave (always in 1..=wave_lanes); splitting low/high 32-lane
+    // halves removes all inner branches and eliminates high-word work on Wave32 and partial waves.
+    let remaining = b.binary(BinaryOperator::Subtract, coords.count, coords.base);
+    let wave_lanes = b.u32(globals.wave_size.lane_count());
+    let wave_len = b.math2(MathFunction::Min, wave_lanes, remaining);
+    let wave_len = b.named("wave_len", wave_len);
+
     let low = b.local("low", u32_ty);
-    let high = b.local("high", u32_ty);
     let zero = b.u32(0);
     b.store(low, zero);
-    b.store(high, zero);
-    b.lane_loop(0, |b, j| {
+
+    let thirty_two = b.u32(32);
+    let low_end = b.math2(MathFunction::Min, wave_len, thirty_two);
+    let low_end = b.named("low_end", low_end);
+    b.bounded_lane_loop("j", 0, low_end, |b, j| {
         let slot_index = b.binary(BinaryOperator::Add, coords.base, j);
-        let in_range = b.binary(BinaryOperator::Less, slot_index, coords.count);
-        b.open();
         let slot = b.index(array, slot_index);
         let value = b.load(slot);
-        let zero = b.u32(0);
-        let set = b.binary(BinaryOperator::NotEqual, value, zero);
-        b.open();
+        let one = b.u32(1);
+        let bit_val = b.binary(BinaryOperator::And, value, one);
         let mask31 = b.u32(31);
         let shift = b.binary(BinaryOperator::And, j, mask31);
-        let one = b.u32(1);
-        let bit = b.binary(BinaryOperator::ShiftLeft, one, shift);
-        let thirty_two = b.u32(32);
-        let is_low = b.binary(BinaryOperator::Less, j, thirty_two);
-        let zero = b.u32(0);
-        let low_bit = b.select(is_low, bit, zero);
-        let high_bit = b.select(is_low, zero, bit);
+        let bit = b.binary(BinaryOperator::ShiftLeft, bit_val, shift);
         let current = b.load(low);
-        let updated = b.binary(BinaryOperator::InclusiveOr, current, low_bit);
+        let updated = b.binary(BinaryOperator::InclusiveOr, current, bit);
         b.store(low, updated);
-        let current = b.load(high);
-        let updated = b.binary(BinaryOperator::InclusiveOr, current, high_bit);
-        b.store(high, updated);
-        let set_block = b.close();
-        b.if_then(set, set_block);
-        let in_range_block = b.close();
-        b.if_then(in_range, in_range_block);
     });
+
+    let high_value = if globals.wave_size == WaveSize::Wave64 {
+        let high = b.local("high", u32_ty);
+        let zero = b.u32(0);
+        b.store(high, zero);
+        let has_high = b.binary(BinaryOperator::Greater, wave_len, thirty_two);
+        b.open();
+        let hi_end = b.binary(BinaryOperator::Subtract, wave_len, thirty_two);
+        let hi_end = b.named("hi_end", hi_end);
+        let hi_base = b.binary(BinaryOperator::Add, coords.base, thirty_two);
+        let hi_base = b.named("hi_base", hi_base);
+        b.bounded_lane_loop("k", 0, hi_end, |b, k| {
+            let slot_index = b.binary(BinaryOperator::Add, hi_base, k);
+            let slot = b.index(array, slot_index);
+            let value = b.load(slot);
+            let one = b.u32(1);
+            let bit_val = b.binary(BinaryOperator::And, value, one);
+            let mask31 = b.u32(31);
+            let shift = b.binary(BinaryOperator::And, k, mask31);
+            let bit = b.binary(BinaryOperator::ShiftLeft, bit_val, shift);
+            let current = b.load(high);
+            let updated = b.binary(BinaryOperator::InclusiveOr, current, bit);
+            b.store(high, updated);
+        });
+        let high_block = b.close();
+        b.if_then(has_high, high_block);
+        b.load(high)
+    } else {
+        b.u32(0)
+    };
+
     let low_value = b.load(low);
-    let high_value = b.load(high);
     let zero = b.u32(0);
     let mask = b.expr(Expression::Compose {
         ty: globals.vec4_u32_ty,
@@ -3965,31 +4064,43 @@ fn build_emulated_collective(
     let array = publish(&mut b, &coords, scratch, encoded);
 
     // Every lane combines in ascending lane order starting at lane 0, so all lanes of a wave
-    // compute bit-identical reductions.
+    // compute bit-identical reductions. Bounding the loop to the exact active range eliminates
+    // inner branches and cuts scan/partial-wave work without changing evaluation order.
     let acc = b.local("acc", ty);
     let first_slot = b.index(array, coords.base);
     let first = b.load(first_slot);
     let first = decode(&mut b, first, is_bool);
     b.store(acc, first);
-    b.lane_loop(1, |b, j| {
+
+    let limit = match collective {
+        CollectiveOperation::Reduce => {
+            let remaining = b.binary(BinaryOperator::Subtract, coords.count, coords.base);
+            let wave_lanes = b.u32(globals.wave_size.lane_count());
+            let wave_len = b.math2(MathFunction::Min, wave_lanes, remaining);
+            b.named("wave_len", wave_len)
+        }
+        CollectiveOperation::InclusiveScan => {
+            let one = b.u32(1);
+            let scan_limit = b.binary(BinaryOperator::Add, coords.lane, one);
+            b.named("scan_limit", scan_limit)
+        }
+        CollectiveOperation::ExclusiveScan => coords.lane,
+    };
+    let one = b.u32(1);
+    let has_more = b.binary(BinaryOperator::Greater, limit, one);
+    b.open();
+    b.bounded_lane_loop("j", 1, limit, |b, j| {
         let slot_index = b.binary(BinaryOperator::Add, coords.base, j);
-        let include = match collective {
-            CollectiveOperation::Reduce => b.binary(BinaryOperator::Less, slot_index, coords.count),
-            CollectiveOperation::InclusiveScan => {
-                b.binary(BinaryOperator::LessEqual, j, coords.lane)
-            }
-            CollectiveOperation::ExclusiveScan => b.binary(BinaryOperator::Less, j, coords.lane),
-        };
-        b.open();
         let slot = b.index(array, slot_index);
         let lane_value = b.load(slot);
         let lane_value = decode(b, lane_value, is_bool);
         let current = b.load(acc);
         let combined = combine(b, op, is_bool, current, lane_value);
         b.store(acc, combined);
-        let block = b.close();
-        b.if_then(include, block);
     });
+    let loop_block = b.close();
+    b.if_then(has_more, loop_block);
+
     let result = b.load(acc);
     if collective == CollectiveOperation::ExclusiveScan {
         let identity = identity_value(&mut b, types, op, ty);
@@ -4038,7 +4149,17 @@ fn build_emulated_gather(
     let scratch = globals.scratch[&ScratchElement::Of(ty)];
     let array = publish(&mut b, &coords, scratch, encoded);
 
-    let lanes = b.u32(WAVE64_LANE_COUNT);
+    // BroadcastFirst (readfirstlane): under uniform control flow lane 0 (coords.base) is always
+    // active and strictly in-bounds, so load it directly without bounds/select overhead.
+    if kind == GatherKind::BroadcastFirst {
+        let first_slot = b.index(array, coords.base);
+        let loaded = b.load(first_slot);
+        let loaded = decode(&mut b, loaded, is_bool);
+        b.ret(loaded);
+        return b.finish();
+    }
+
+    let lanes = b.u32(globals.wave_size.lane_count());
     let (source, valid) = match (kind, index) {
         (GatherKind::Broadcast | GatherKind::Shuffle, Some(i)) => {
             let valid = b.binary(BinaryOperator::Less, i, lanes);
@@ -4060,10 +4181,9 @@ fn build_emulated_gather(
             let source = b.binary(BinaryOperator::Subtract, coords.lane, i);
             (source, Some(valid))
         }
-        // BroadcastFirst: under uniform control flow every lane is active, so lane 0 is first.
         _ => (b.u32(0), None),
     };
-    let lane_mask = b.u32(WAVE64_LANE_COUNT - 1);
+    let lane_mask = b.u32(globals.wave_size.lane_mask());
     let wrapped = b.binary(BinaryOperator::And, source, lane_mask);
     let slot_index = b.binary(BinaryOperator::Add, coords.base, wrapped);
     let one = b.u32(1);
@@ -4200,6 +4320,129 @@ impl U64Helper {
 /// `{prefix}u64_*`. Helpers are independent, so any subset is self-contained.
 pub fn u64_helpers_wgsl(prefix: &str, helpers: &[U64Helper]) -> String {
     let selected: BTreeSet<U64Helper> = helpers.iter().copied().collect();
+    let mut out = String::new();
+    for (index, helper) in selected.into_iter().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        out.push_str(&helper.source(prefix));
+    }
+    out
+}
+
+/// Standalone RDNA2 Wave32/Wave64 WGSL lane-mask, ballot-bit, `mbcnt`, `swizzle`, and `permute`
+/// helpers emitted by [`rdna_wave_helpers_wgsl`].
+///
+/// Every helper is pure WGSL (no workgroup memory, barriers, or module-scope `let`), masks all
+/// shift counts to `0..=31` (`& 31u`) to avoid out-of-range shift UB/validation warnings, and is
+/// valid in both compute and fragment shaders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RdnaWaveHelper {
+    /// Wave32 lower-lane mask `(1u << lane) - 1u`; `lane >= 32u` yields `0xffffffffu`.
+    Wave32LaneMask,
+    /// Wave32 single-lane bit `1u << lane`; `lane >= 32u` yields `0u`.
+    Wave32LaneBit,
+    /// Wave64 lower-lane mask `(1 << lane) - 1` as `vec2<u32>`; `lane >= 64u` yields all ones.
+    Wave64LaneMask,
+    /// Wave64 single-lane bit `1 << lane` as `vec2<u32>`; `lane >= 64u` yields `vec2<u32>(0u)`.
+    Wave64LaneBit,
+    /// Single-lane Wave32 ballot bit contribution for `predicate` at `lane` (`< 32u`).
+    Ballot32Bit,
+    /// Single-lane Wave64 ballot bit contribution as `vec2<u32>` for `predicate` at `lane` (`< 64u`).
+    Ballot64Bit,
+    /// RDNA2 `v_mbcnt_lo_u32_b32`: `countOneBits(mask & low_lane_mask(lane)) + acc`.
+    MbcntLo,
+    /// RDNA2 `v_mbcnt_hi_u32_b32`: `countOneBits(mask & high_lane_mask(lane)) + acc`.
+    MbcntHi,
+    /// Combined Wave64 `mbcnt`: count set bits in `mask: vec2<u32>` strictly below `lane`.
+    Mbcnt64,
+    /// RDNA2 `ds_swizzle_b32` source lane (QDMode and 32-lane Bitmode), masked to `0..=63`.
+    SwizzleLane,
+    /// RDNA2 `ds_bpermute_b32` / `ds_permute_b32` byte address to masked lane (`0..=31` / `0..=63`).
+    PermuteLane,
+}
+
+impl RdnaWaveHelper {
+    pub const ALL: [Self; 11] = [
+        Self::Wave32LaneMask,
+        Self::Wave32LaneBit,
+        Self::Wave64LaneMask,
+        Self::Wave64LaneBit,
+        Self::Ballot32Bit,
+        Self::Ballot64Bit,
+        Self::MbcntLo,
+        Self::MbcntHi,
+        Self::Mbcnt64,
+        Self::SwizzleLane,
+        Self::PermuteLane,
+    ];
+
+    /// Function name without the prefix.
+    pub const fn function_suffix(self) -> &'static str {
+        match self {
+            Self::Wave32LaneMask => "wave32_lane_mask",
+            Self::Wave32LaneBit => "wave32_lane_bit",
+            Self::Wave64LaneMask => "wave64_lane_mask",
+            Self::Wave64LaneBit => "wave64_lane_bit",
+            Self::Ballot32Bit => "ballot32_bit",
+            Self::Ballot64Bit => "ballot64_bit",
+            Self::MbcntLo => "mbcnt_lo",
+            Self::MbcntHi => "mbcnt_hi",
+            Self::Mbcnt64 => "mbcnt64",
+            Self::SwizzleLane => "swizzle_lane",
+            Self::PermuteLane => "permute_lane",
+        }
+    }
+
+    pub fn function_name(self, prefix: &str) -> String {
+        format!("{prefix}{}", self.function_suffix())
+    }
+
+    fn source(self, prefix: &str) -> String {
+        let name = self.function_name(prefix);
+        let body = match self {
+            Self::Wave32LaneMask => {
+                "(lane: u32) -> u32 {\n    let partial = (1u << (lane & 31u)) - 1u;\n    return select(partial, 0xffffffffu, lane >= 32u);\n}"
+            }
+            Self::Wave32LaneBit => {
+                "(lane: u32) -> u32 {\n    return select(0u, 1u << (lane & 31u), lane < 32u);\n}"
+            }
+            Self::Wave64LaneMask => {
+                "(lane: u32) -> vec2<u32> {\n    let partial = (1u << (lane & 31u)) - 1u;\n    let lo = select(partial, 0xffffffffu, lane >= 32u);\n    let hi = select(select(0u, partial, lane >= 32u), 0xffffffffu, lane >= 64u);\n    return vec2<u32>(lo, hi);\n}"
+            }
+            Self::Wave64LaneBit => {
+                "(lane: u32) -> vec2<u32> {\n    let bit = 1u << (lane & 31u);\n    let pair = select(vec2<u32>(0u, bit), vec2<u32>(bit, 0u), lane < 32u);\n    return select(vec2<u32>(0u, 0u), pair, lane < 64u);\n}"
+            }
+            Self::Ballot32Bit => {
+                "(predicate: bool, lane: u32) -> u32 {\n    let bit = select(0u, 1u, predicate) << (lane & 31u);\n    return select(0u, bit, lane < 32u);\n}"
+            }
+            Self::Ballot64Bit => {
+                "(predicate: bool, lane: u32) -> vec2<u32> {\n    let bit = select(0u, 1u, predicate) << (lane & 31u);\n    let pair = select(vec2<u32>(0u, bit), vec2<u32>(bit, 0u), lane < 32u);\n    return select(vec2<u32>(0u, 0u), pair, lane < 64u);\n}"
+            }
+            Self::MbcntLo => {
+                "(mask: u32, acc: u32, lane: u32) -> u32 {\n    let partial = (1u << (lane & 31u)) - 1u;\n    let low_mask = select(partial, 0xffffffffu, lane >= 32u);\n    return countOneBits(mask & low_mask) + acc;\n}"
+            }
+            Self::MbcntHi => {
+                "(mask: u32, acc: u32, lane: u32) -> u32 {\n    let partial = (1u << (lane & 31u)) - 1u;\n    let hi_mask = select(select(0u, partial, lane >= 32u), 0xffffffffu, lane >= 64u);\n    return countOneBits(mask & hi_mask) + acc;\n}"
+            }
+            Self::Mbcnt64 => {
+                "(mask: vec2<u32>, lane: u32) -> u32 {\n    let partial = (1u << (lane & 31u)) - 1u;\n    let lo_mask = select(partial, 0xffffffffu, lane >= 32u);\n    let hi_mask = select(select(0u, partial, lane >= 32u), 0xffffffffu, lane >= 64u);\n    return countOneBits(mask.x & lo_mask) + countOneBits(mask.y & hi_mask);\n}"
+            }
+            Self::SwizzleLane => {
+                "(lane: u32, offset: u32) -> u32 {\n    let clamped_lane = lane & 63u;\n    let qd_shift = (clamped_lane & 3u) * 2u;\n    let qd_lane = (clamped_lane & 0x3cu) | ((offset >> qd_shift) & 3u);\n    let and_mask = offset & 31u;\n    let or_mask = (offset >> 5u) & 31u;\n    let xor_mask = (offset >> 10u) & 31u;\n    let bit_lane = (clamped_lane & 32u) | ((((clamped_lane & 31u) & and_mask) | or_mask) ^ xor_mask);\n    return select(bit_lane, qd_lane, (offset & 0x8000u) != 0u);\n}"
+            }
+            Self::PermuteLane => {
+                "(byte_addr: u32, lane_mask: u32) -> u32 {\n    return (byte_addr >> 2u) & (lane_mask & 63u);\n}"
+            }
+        };
+        format!("fn {name}{body}\n")
+    }
+}
+
+/// WGSL source of the requested RDNA2 wave helpers (deduplicated, canonical order), each named
+/// `{prefix}<suffix>`. Helpers are independent, so any subset is self-contained.
+pub fn rdna_wave_helpers_wgsl(prefix: &str, helpers: &[RdnaWaveHelper]) -> String {
+    let selected: BTreeSet<RdnaWaveHelper> = helpers.iter().copied().collect();
     let mut out = String::new();
     for (index, helper) in selected.into_iter().enumerate() {
         if index > 0 {
@@ -4562,15 +4805,67 @@ const WGSL_RESERVED: &[&str] = &[
     "f32",
     "i32",
     "mat2x2",
+    "mat2x3",
+    "mat2x4",
+    "mat3x2",
     "mat3x3",
+    "mat3x4",
+    "mat4x2",
+    "mat4x3",
     "mat4x4",
     "ptr",
     "sampler",
+    "sampler_comparison",
+    "texture_1d",
     "texture_2d",
+    "texture_2d_array",
+    "texture_3d",
+    "texture_cube",
+    "texture_cube_array",
+    "texture_depth_2d",
+    "texture_multisampled_2d",
+    "texture_storage_2d",
     "u32",
     "vec2",
+    "vec2f",
+    "vec2h",
+    "vec2i",
+    "vec2u",
     "vec3",
+    "vec3f",
+    "vec3h",
+    "vec3i",
+    "vec3u",
     "vec4",
+    "vec4f",
+    "vec4h",
+    "vec4i",
+    "vec4u",
+    "NULL",
+    "Self",
+    "abstract",
+    "active",
+    "alignas",
+    "alignof",
+    "as",
+    "asm",
+    "async",
+    "await",
+    "class",
+    "enum",
+    "macro",
+    "module",
+    "mut",
+    "null",
+    "ref",
+    "self",
+    "static",
+    "super",
+    "trait",
+    "type",
+    "use",
+    "where",
+    "yield",
 ];
 
 fn is_wgsl_identifier(name: &str) -> bool {
@@ -7491,5 +7786,514 @@ fn finalize() {
         let queue = memory.get(&module, "pg6m_mesh_tasks");
         let parents: Vec<u32> = queue.comps()[1].comps()[..6].iter().map(Val::u).collect();
         assert_eq!(parents, vec![0, 1, 1, 2, 2, 2]);
+    }
+
+    // ----- S50 wave/subgroup WGSL hardening & optimization tests ------------------------------
+
+    /// Builtin function names that emitted WGSL helpers must never shadow with function,
+    /// parameter, or local variable declarations.
+    const WGSL_SHADOW_FORBIDDEN_BUILTINS: &[&str] = &[
+        "min",
+        "max",
+        "clamp",
+        "select",
+        "dot",
+        "abs",
+        "all",
+        "any",
+        "countOneBits",
+        "firstTrailingBit",
+        "firstLeadingBit",
+        "workgroupBarrier",
+        "storageBarrier",
+        "bitcast",
+        "arrayLength",
+    ];
+
+    fn assert_no_module_scope_let_or_shadowed_builtins(source: &str, label: &str) {
+        let mut depth: i32 = 0;
+        for (line_no, raw_line) in source.lines().enumerate() {
+            let line = raw_line.split("//").next().unwrap_or("").trim();
+            if depth == 0 && (line.starts_with("let ") || line.starts_with("let\t")) {
+                panic!(
+                    "{label}: invalid module-scope `let` on line {}: {raw_line}",
+                    line_no + 1
+                );
+            }
+            for ch in line.chars() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(depth, 0, "{label}: unbalanced braces in emitted WGSL");
+
+        // Parse and inspect every declared function name, argument name, and local variable name
+        // in the Naga IR so lexical edge cases cannot slip through string matching.
+        let module = parse_wgsl(source);
+        for (_, function) in module.functions.iter() {
+            if let Some(name) = &function.name {
+                assert!(
+                    !WGSL_SHADOW_FORBIDDEN_BUILTINS.contains(&name.as_str()),
+                    "{label}: function '{name}' shadows WGSL builtin"
+                );
+            }
+            for arg in &function.arguments {
+                if let Some(name) = &arg.name {
+                    assert!(
+                        !WGSL_SHADOW_FORBIDDEN_BUILTINS.contains(&name.as_str()),
+                        "{label}: parameter '{name}' shadows WGSL builtin"
+                    );
+                }
+            }
+            for (_, local) in function.local_variables.iter() {
+                if let Some(name) = &local.name {
+                    assert!(
+                        !WGSL_SHADOW_FORBIDDEN_BUILTINS.contains(&name.as_str()),
+                        "{label}: local '{name}' shadows WGSL builtin"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn emitted_wgsl_wave_helpers_validate_in_compute_and_fragment_wrappers() {
+        let helpers = format!(
+            "{}\n{}",
+            u64_helpers_wgsl("pg6w_", &U64Helper::ALL),
+            rdna_wave_helpers_wgsl("pg6w_", &RdnaWaveHelper::ALL),
+        );
+        let call_body = r#"
+    let a = vec2<u32>(seed, seed ^ 0xa5a5a5a5u);
+    let b = vec2<u32>(seed + 7u, ~seed);
+    let m0 = pg6w_u64_and(a, b);
+    let m1 = pg6w_u64_or(m0, pg6w_u64_xor(a, pg6w_u64_not(b)));
+    let m2 = pg6w_u64_shl(m1, seed);
+    let m3 = pg6w_u64_shr(m2, seed + 19u);
+    let m4 = pg6w_u64_add(m3, pg6w_u64_lane_mask(seed));
+    let c0 = pg6w_u64_count_one_bits(m4)
+        + pg6w_u64_first_trailing_bit(m4)
+        + pg6w_u64_first_leading_bit(m4);
+    let b0 = pg6w_u64_equal(m3, m4) || pg6w_u64_less_than(m3, m4) || pg6w_u64_test_bit(m4, seed);
+
+    let w32_mask = pg6w_wave32_lane_mask(seed) | pg6w_wave32_lane_bit(seed);
+    let w64_mask = pg6w_wave64_lane_mask(seed) ^ pg6w_wave64_lane_bit(seed);
+    let bal32 = pg6w_ballot32_bit(b0, seed);
+    let bal64 = pg6w_ballot64_bit(b0, seed);
+    let mb_lo = pg6w_mbcnt_lo(w32_mask | bal32, c0, seed);
+    let mb_hi = pg6w_mbcnt_hi(w64_mask.y | bal64.y, mb_lo, seed);
+    let mb64 = pg6w_mbcnt64(w64_mask | bal64, seed);
+    let swz = pg6w_swizzle_lane(seed, 0x801bu) ^ pg6w_swizzle_lane(seed, 0x041fu);
+    let prm = pg6w_permute_lane(seed * 4u, 63u) ^ pg6w_permute_lane(seed * 4u, 31u);
+    let acc = mb_hi ^ mb64 ^ swz ^ prm ^ m4.x ^ m4.y;
+"#;
+
+        let compute_wrapper = format!(
+            "{helpers}\n@group(0) @binding(0) var<storage, read_write> out: array<u32, 64>;\n\n@compute @workgroup_size(64)\nfn cs_main(@builtin(local_invocation_index) seed: u32) {{\n{call_body}    out[seed] = acc;\n}}\n"
+        );
+        validate_wgsl_baseline(&compute_wrapper);
+        assert_no_module_scope_let_or_shadowed_builtins(&compute_wrapper, "compute wrapper");
+
+        let fragment_wrapper = format!(
+            "{helpers}\n@fragment\nfn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {{\n    let seed = u32(pos.x) ^ (u32(pos.y) << 4u);\n{call_body}    return vec4<f32>(f32(acc & 255u) / 255.0, 0.0, 0.0, 1.0);\n}}\n"
+        );
+        validate_wgsl_baseline(&fragment_wrapper);
+        assert_no_module_scope_let_or_shadowed_builtins(&fragment_wrapper, "fragment wrapper");
+    }
+
+    #[test]
+    fn emitted_wgsl_has_no_module_scope_let_or_shadowed_builtins() {
+        let u64_src = u64_helpers_wgsl("pg6w_", &U64Helper::ALL);
+        validate_wgsl_baseline(&u64_src);
+        assert_no_module_scope_let_or_shadowed_builtins(&u64_src, "u64_helpers_wgsl");
+
+        let rdna_src = rdna_wave_helpers_wgsl("pg6w_", &RdnaWaveHelper::ALL);
+        validate_wgsl_baseline(&rdna_src);
+        assert_no_module_scope_let_or_shadowed_builtins(&rdna_src, "rdna_wave_helpers_wgsl");
+
+        let mesh_src = mesh_output_wgsl(
+            &sample_signature(MeshTopology::Triangles, true),
+            &MeshBindings {
+                amplification: Some((4, 5)),
+                ..MeshBindings::default()
+            },
+            "pg6m_",
+        )
+        .expect("valid mesh signature");
+        validate_wgsl_baseline(&mesh_src);
+        assert_no_module_scope_let_or_shadowed_builtins(&mesh_src, "mesh_output_wgsl");
+
+        for (label, opts) in [
+            ("wave64 emulation", emulation()),
+            (
+                "wave32 emulation",
+                WaveLoweringOptions {
+                    wave_size: WaveSize::Wave32,
+                    ..emulation()
+                },
+            ),
+            ("single lane wave1", single_lane(true)),
+        ] {
+            let (module, report) = lower(&emulation_probe(64), &opts);
+            assert!(report.applied, "{label}: {:?}", report.blockers);
+            let (wgsl_src, _) = emit_and_reparse(&module, &report);
+            assert_no_module_scope_let_or_shadowed_builtins(&wgsl_src, label);
+        }
+    }
+
+    fn wave_lanes_sized(index: u32, total: u32, wave_size: WaveSize) -> std::ops::Range<u32> {
+        let width = wave_size.lane_count();
+        let base = index & wave_size.wave_base_mask();
+        base..(base + width).min(total)
+    }
+
+    fn probe_reference_sized(
+        i: u32,
+        total: u32,
+        uniform_value: u32,
+        wave_size: WaveSize,
+    ) -> Vec<u32> {
+        let width = wave_size.lane_count();
+        let lanes = wave_lanes_sized(i, total, wave_size);
+        let lane = i - lanes.start;
+        let xs: Vec<u32> = lanes.clone().map(probe_value).collect();
+        let own = xs[lane as usize];
+        let read = |source: u32| -> Option<u32> {
+            (source < width && lanes.start + source < lanes.end).then(|| xs[source as usize])
+        };
+        let sum = |values: &[u32]| values.iter().fold(0u32, |a, v| a.wrapping_add(*v));
+        let ballot: u64 = xs
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| *v & 3 == 0)
+            .fold(0, |mask, (l, _)| mask | (1u64 << l));
+        let mut float_sum = xs[0] as f32 * 0.5;
+        for v in &xs[1..] {
+            float_sum += *v as f32 * 0.5;
+        }
+        let inclusive = sum(&xs[..=lane as usize]);
+        vec![
+            sum(&xs),
+            sum(&xs[..lane as usize]),
+            inclusive,
+            xs.iter().fold(1u32, |a, v| a.wrapping_mul(v | 1)),
+            *xs.iter().min().expect("non-empty wave"),
+            *xs.iter().max().expect("non-empty wave"),
+            xs.iter().fold(u32::MAX, |a, v| a & (v | 0xf0)),
+            xs.iter().fold(0, |a, v| a | v),
+            xs.iter().fold(0, |a, v| a ^ v),
+            ballot as u32,
+            (ballot >> 32) as u32,
+            u32::from(xs.iter().all(|v| *v < 3000)),
+            u32::from(xs.contains(&7)),
+            xs[0],
+            read(37).unwrap_or(own),
+            read((lane * 5 + 3) & 63).unwrap_or(own),
+            read(lane ^ 5).unwrap_or(own),
+            lane.checked_sub(3).and_then(read).unwrap_or(own),
+            read(lane + 2).unwrap_or(own),
+            lane,
+            width,
+            float_sum.to_bits(),
+            xs.iter()
+                .map(|v| *v as i32 - 2000)
+                .min()
+                .expect("non-empty") as u32,
+            inclusive ^ ((lane + 1) << 16),
+            uniform_value,
+            xs.iter().fold(0, |a, v| a | v),
+        ]
+    }
+
+    #[test]
+    fn wave32_workgroup_emulation_executes_every_wave_op_and_validates_wgsl() {
+        let wave32_opts = WaveLoweringOptions {
+            wave_size: WaveSize::Wave32,
+            ..emulation()
+        };
+        for total in [64u32, 50] {
+            let (module, report) = lower(&emulation_probe(total), &wave32_opts);
+            assert!(report.applied, "{:?}", report.blockers);
+            assert!(!report.requires_subgroups_feature);
+            let (source, module) = emit_and_reparse(&module, &report);
+            assert!(!source.contains("subgroup"), "{source}");
+
+            let memory = Memory::new(&module);
+            memory.set(&module, "params", Val::C(vec![Val::U(0xbeef), Val::U(1)]));
+            run_compute(&module, &memory, "main", [1, 1, 1]);
+            let out = words_of(&memory, &module, "out");
+            for i in 0..total {
+                let start = (i * PROBE_SLOTS) as usize;
+                let got = &out[start..start + PROBE_SLOTS as usize];
+                let expected = probe_reference_sized(i, total, 0xbeef, WaveSize::Wave32);
+                assert_eq!(got[10], 0, "Wave32 ballot high word must always be 0");
+                for (slot, (g, e)) in got.iter().zip(&expected).enumerate() {
+                    assert_eq!(
+                        g, e,
+                        "wave32 workgroup {total}, invocation {i}, slot {slot}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gather_helpers_clamp_out_of_range_lane_indices_safely() {
+        let shader = r#"
+@group(0) @binding(0) var<storage, read_write> out: array<u32, 576>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_index) li: u32) {
+    let x = li + 100u;
+    let o = li * 9u;
+    // Out-of-range constant and dynamic lane operands (including u32::MAX) must fall back safely to `x`.
+    out[o + 0u] = subgroupBroadcast(x, 64u);
+    out[o + 1u] = subgroupShuffle(x, 1000u);
+    out[o + 2u] = subgroupShuffle(x, 0xffffffffu);
+    out[o + 3u] = subgroupShuffle(x, li + 64u);
+    out[o + 4u] = subgroupShuffleXor(x, 128u);
+    out[o + 5u] = subgroupShuffleUp(x, 64u);
+    out[o + 6u] = subgroupShuffleDown(x, 64u);
+    out[o + 7u] = subgroupBroadcast(x, 32u);
+    out[o + 8u] = subgroupBroadcastFirst(x);
+}
+"#;
+        for wave_size in [WaveSize::Wave32, WaveSize::Wave64] {
+            let opts = WaveLoweringOptions {
+                wave_size,
+                ..emulation()
+            };
+            let (module, report) = lower(shader, &opts);
+            assert!(report.applied, "{wave_size:?}: {:?}", report.blockers);
+            let (source, module) = emit_and_reparse(&module, &report);
+            assert_no_module_scope_let_or_shadowed_builtins(&source, "gather bounds");
+
+            let memory = Memory::new(&module);
+            run_compute(&module, &memory, "main", [1, 1, 1]);
+            let out = words_of(&memory, &module, "out");
+            for li in 0..64u32 {
+                let x = li + 100;
+                let o = (li * 9) as usize;
+                let wave_base = li & wave_size.wave_base_mask();
+                // Slots 0..=6 are out-of-range for both Wave32 and Wave64 -> caller's own value.
+                for slot in 0..=6 {
+                    assert_eq!(out[o + slot], x, "{wave_size:?} lane {li} slot {slot}");
+                }
+                // Slot 7: broadcast lane 32 -> out-of-range in Wave32 (own value), valid in Wave64.
+                let expected_b32 = match wave_size {
+                    WaveSize::Wave32 => x,
+                    WaveSize::Wave64 => wave_base + 32 + 100,
+                };
+                assert_eq!(out[o + 7], expected_b32, "{wave_size:?} lane {li} slot 7");
+                // Slot 8: readfirstlane -> lane 0 of current wave.
+                assert_eq!(
+                    out[o + 8],
+                    wave_base + 100,
+                    "{wave_size:?} lane {li} slot 8"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn canonicalized_ballot_count_scan_masks_shift_counts_to_0_31() {
+        let words = build_ballot_count_spv(100, false);
+        let canonical = canonicalize_wave_spirv(&words).expect("valid SPIR-V");
+        let mut module = parse_spv(&canonical.words).expect("canonical SPIR-V parses");
+        let report = lower_wave_ops(&mut module, &emulation());
+        assert!(report.applied, "{:?}", report.blockers);
+        let (wgsl_src, _) = emit_and_reparse(&module, &report);
+        assert_no_module_scope_let_or_shadowed_builtins(&wgsl_src, "canonicalized ballot scan");
+        // Verify the canonicalized scan sequence masks the shift operand with 31u before `<<`
+        // rather than shifting directly by an unbounded lane difference (`>= 32`).
+        assert!(
+            wgsl_src.contains("& 31u)"),
+            "expected masked shift amount `& 31u` in emitted WGSL:\n{wgsl_src}"
+        );
+        // No unmasked shift by a raw difference variable should remain in the lowered shader.
+        for line in wgsl_src.lines() {
+            if let Some((_, rhs)) = line.split_once("<<") {
+                let rhs = rhs.trim();
+                let is_const_under_32 = rhs
+                    .trim_end_matches(&[';', ')'][..])
+                    .strip_suffix('u')
+                    .and_then(|n| n.parse::<u32>().ok())
+                    .is_some_and(|n| n < 32);
+                let is_masked = rhs.contains("& 31u") || line.contains("& 31u");
+                assert!(
+                    is_const_under_32 || is_masked,
+                    "shift in emitted WGSL is not proven < 32: {line}\nfull WGSL:\n{wgsl_src}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rdna_wave_helpers_execute_mbcnt_swizzle_permute_and_masks_exactly() {
+        let source = rdna_wave_helpers_wgsl("r_", &RdnaWaveHelper::ALL);
+        let module = validate_wgsl_baseline(&source);
+        assert_eq!(source.matches("fn ").count(), RdnaWaveHelper::ALL.len());
+        let call = |helper: RdnaWaveHelper, args: Vec<Val>| {
+            call_function(&module, &helper.function_name("r_"), args)
+        };
+
+        let lanes = [0u32, 1, 2, 15, 31, 32, 33, 48, 63, 64, 65, 127, u32::MAX];
+        let masks = [
+            0u64,
+            1,
+            0x8000_0000,
+            0xffff_ffff,
+            0x1_0000_0000,
+            0x8000_0000_0000_0000,
+            0x0123_4567_89ab_cdef,
+            u64::MAX,
+        ];
+
+        for &lane in &lanes {
+            let expected_w32_mask = if lane >= 32 {
+                u32::MAX
+            } else {
+                (1u32 << lane) - 1
+            };
+            assert_eq!(
+                call(RdnaWaveHelper::Wave32LaneMask, vec![Val::U(lane)]).u(),
+                expected_w32_mask,
+                "wave32_lane_mask({lane})"
+            );
+
+            let expected_w32_bit = if lane < 32 { 1u32 << lane } else { 0 };
+            assert_eq!(
+                call(RdnaWaveHelper::Wave32LaneBit, vec![Val::U(lane)]).u(),
+                expected_w32_bit,
+                "wave32_lane_bit({lane})"
+            );
+
+            let expected_w64_mask = if lane >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << lane) - 1
+            };
+            assert_eq!(
+                call(RdnaWaveHelper::Wave64LaneMask, vec![Val::U(lane)]).to_u64(),
+                expected_w64_mask,
+                "wave64_lane_mask({lane})"
+            );
+
+            let expected_w64_bit = if lane < 64 { 1u64 << lane } else { 0 };
+            assert_eq!(
+                call(RdnaWaveHelper::Wave64LaneBit, vec![Val::U(lane)]).to_u64(),
+                expected_w64_bit,
+                "wave64_lane_bit({lane})"
+            );
+
+            for pred in [false, true] {
+                assert_eq!(
+                    call(
+                        RdnaWaveHelper::Ballot32Bit,
+                        vec![Val::B(pred), Val::U(lane)]
+                    )
+                    .u(),
+                    if pred { expected_w32_bit } else { 0 },
+                    "ballot32_bit({pred}, {lane})"
+                );
+                assert_eq!(
+                    call(
+                        RdnaWaveHelper::Ballot64Bit,
+                        vec![Val::B(pred), Val::U(lane)]
+                    )
+                    .to_u64(),
+                    if pred { expected_w64_bit } else { 0 },
+                    "ballot64_bit({pred}, {lane})"
+                );
+            }
+
+            for &mask in &masks {
+                let lo = mask as u32;
+                let hi = (mask >> 32) as u32;
+                let acc = 7u32;
+                let expected_lo = (lo & expected_w32_mask).count_ones() + acc;
+                let hi_mask = (expected_w64_mask >> 32) as u32;
+                let expected_hi = (hi & hi_mask).count_ones() + expected_lo;
+                let got_lo = call(
+                    RdnaWaveHelper::MbcntLo,
+                    vec![Val::U(lo), Val::U(acc), Val::U(lane)],
+                )
+                .u();
+                let got_hi = call(
+                    RdnaWaveHelper::MbcntHi,
+                    vec![Val::U(hi), Val::U(got_lo), Val::U(lane)],
+                )
+                .u();
+                assert_eq!(got_lo, expected_lo, "mbcnt_lo({lo:#x}, {acc}, {lane})");
+                assert_eq!(got_hi, expected_hi, "mbcnt_hi({hi:#x}, {got_lo}, {lane})");
+
+                let expected_mb64 = (mask & expected_w64_mask).count_ones();
+                assert_eq!(
+                    call(
+                        RdnaWaveHelper::Mbcnt64,
+                        vec![Val::u64_pair(mask), Val::U(lane)]
+                    )
+                    .u(),
+                    expected_mb64,
+                    "mbcnt64({mask:#x}, {lane})"
+                );
+            }
+
+            // Swizzle: QDMode (bit 15 set, reverse quad 0b00_01_10_11 = 0x1b) and Bitmode (XOR 1).
+            let clamped = lane & 63;
+            let qd_rev = call(
+                RdnaWaveHelper::SwizzleLane,
+                vec![Val::U(lane), Val::U(0x801b)],
+            )
+            .u();
+            assert_eq!(
+                qd_rev,
+                (clamped & !3) | (3 - (clamped & 3)),
+                "qd swizzle {lane}"
+            );
+            // Bitmode: and_mask = 31 (0x1f), or_mask = 0, xor_mask = 1 -> offset = (1 << 10) | 31 = 0x041f.
+            let bit_xor1 = call(
+                RdnaWaveHelper::SwizzleLane,
+                vec![Val::U(lane), Val::U(0x041f)],
+            )
+            .u();
+            assert_eq!(bit_xor1, clamped ^ 1, "bitmode xor1 swizzle {lane}");
+
+            // Permute: byte address `lane * 4` masked to Wave32 (31), Wave64 (63), or overwide (0xff).
+            let addr = lane.wrapping_mul(4);
+            assert_eq!(
+                call(RdnaWaveHelper::PermuteLane, vec![Val::U(addr), Val::U(31)]).u(),
+                (addr >> 2) & 31
+            );
+            assert_eq!(
+                call(RdnaWaveHelper::PermuteLane, vec![Val::U(addr), Val::U(63)]).u(),
+                (addr >> 2) & 63
+            );
+            assert_eq!(
+                call(
+                    RdnaWaveHelper::PermuteLane,
+                    vec![Val::U(addr), Val::U(0xff)]
+                )
+                .u(),
+                (addr >> 2) & 63
+            );
+        }
+    }
+
+    #[test]
+    fn unique_wgsl_prefix_sanitizes_invalid_and_reserved_prefixes() {
+        for bad in ["", "_", "__", "__bad_", "9x_", "let", "vec4"] {
+            let prefix = unique_wgsl_prefix("fn main() {}", bad);
+            assert_eq!(prefix, DEFAULT_HELPER_PREFIX, "bad prefix '{bad}'");
+            let combined = format!(
+                "{}\n{}",
+                u64_helpers_wgsl(&prefix, &U64Helper::ALL),
+                rdna_wave_helpers_wgsl(&prefix, &RdnaWaveHelper::ALL),
+            );
+            validate_wgsl_baseline(&combined);
+        }
     }
 }
