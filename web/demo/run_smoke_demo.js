@@ -21,6 +21,10 @@ const DEFAULT_HEIGHT = 360;
 const DEFAULT_FORMAT = 'bgra8unorm';
 const DEFAULT_RING_CAPACITY_BYTES = 256 * 1024;
 const PACKET_HEADER_BYTES = 8;
+const DEFAULT_BUDGET_WINDOW_SIZE = 300;
+
+export const DEFAULT_TARGET_FPS = 30;
+export const DEFAULT_FRAME_BUDGET_MS = 33.333;
 
 function defaultNow() {
   if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
@@ -42,6 +46,62 @@ function defaultCancelRaf(handle) {
     return;
   }
   globalThis.clearTimeout(handle);
+}
+
+function defaultSetTimeout(callback, ms) {
+  return globalThis.setTimeout(callback, ms);
+}
+
+function defaultClearTimeout(handle) {
+  globalThis.clearTimeout(handle);
+}
+
+function round3(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return 0;
+  }
+  return Math.round(value * 1000) / 1000;
+}
+
+function roundPct(withinCount, totalCount) {
+  if (
+    typeof withinCount !== 'number' ||
+    typeof totalCount !== 'number' ||
+    !Number.isFinite(withinCount) ||
+    !Number.isFinite(totalCount) ||
+    totalCount <= 0
+  ) {
+    return 0;
+  }
+  const pct = Math.round((withinCount / totalCount) * 10000) / 100;
+  return pct < 0 ? 0 : pct > 100 ? 100 : pct;
+}
+
+function sanitizeNonNegativeInt(value, fallback = 0) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    return fallback;
+  }
+  return Math.floor(value);
+}
+
+function validateAbortSignalOption(signal, label = 'signal') {
+  if (signal === null || signal === undefined) {
+    return null;
+  }
+  if (typeof signal !== 'object' || typeof signal.aborted !== 'boolean') {
+    throw new TypeError(`${label} must be an AbortSignal-compatible object or null`);
+  }
+  return signal;
+}
+
+function validateTimeoutMsOption(timeoutMs, label = 'timeoutMs') {
+  if (timeoutMs === null || timeoutMs === undefined) {
+    return null;
+  }
+  if (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new RangeError(`${label} must be a positive finite number, got ${timeoutMs}`);
+  }
+  return timeoutMs;
 }
 
 function resolveGpuRingBuffer() {
@@ -117,6 +177,130 @@ export function inspectCommandBuffer(bytes) {
 }
 
 /**
+ * Deterministically computes 30 FPS frame-budget summary telemetry from per-frame
+ * delta durations in milliseconds, with explicit zero-frame and invalid-sample guards.
+ *
+ * @param {ArrayLike<number>|Iterable<number>|null|undefined} frameDeltasMs
+ * @param {object} [options]
+ * @param {number} [options.frameBudgetMs=33.333] Target per-frame budget in milliseconds.
+ * @param {number} [options.totalFrames] Total presented frames (defaults to valid delta count).
+ * @param {number} [options.nonBlackFrames=0] Count of verified non-black presented frames.
+ * @param {boolean} [options.nonBlackFrameVerified] Explicit non-black verification flag.
+ * @returns {{
+ *   frameBudgetMs: number,
+ *   targetFps: number,
+ *   totalFrames: number,
+ *   sampleCount: number,
+ *   presentFpsAvg: number,
+ *   avgFrameMs: number,
+ *   minFrameMs: number,
+ *   maxFrameMs: number,
+ *   p95FrameMs: number,
+ *   framesWithinBudget: number,
+ *   framesOverBudget: number,
+ *   budgetCompliancePct: number,
+ *   nonBlackFrames: number,
+ *   nonBlackFrameVerified: boolean,
+ * }}
+ */
+export function computeFrameBudgetSummary(frameDeltasMs, options = {}) {
+  const opts = options && typeof options === 'object' ? options : {};
+  const effectiveBudgetMs =
+    typeof opts.frameBudgetMs === 'number' &&
+    Number.isFinite(opts.frameBudgetMs) &&
+    opts.frameBudgetMs > 0
+      ? opts.frameBudgetMs
+      : DEFAULT_FRAME_BUDGET_MS;
+  const targetFps =
+    effectiveBudgetMs === DEFAULT_FRAME_BUDGET_MS
+      ? DEFAULT_TARGET_FPS
+      : round3(1000 / effectiveBudgetMs);
+
+  const validDeltas = [];
+  if (frameDeltasMs !== null && frameDeltasMs !== undefined && typeof frameDeltasMs !== 'string') {
+    if (Array.isArray(frameDeltasMs) || ArrayBuffer.isView(frameDeltasMs)) {
+      for (let i = 0; i < frameDeltasMs.length; i += 1) {
+        const dt = frameDeltasMs[i];
+        if (typeof dt === 'number' && Number.isFinite(dt) && dt >= 0) {
+          validDeltas.push(dt);
+        }
+      }
+    } else if (typeof frameDeltasMs[Symbol.iterator] === 'function') {
+      for (const dt of frameDeltasMs) {
+        if (typeof dt === 'number' && Number.isFinite(dt) && dt >= 0) {
+          validDeltas.push(dt);
+        }
+      }
+    }
+  }
+
+  const sampleCount = validDeltas.length;
+  const totalFrames =
+    opts.totalFrames !== undefined
+      ? sanitizeNonNegativeInt(opts.totalFrames, sampleCount)
+      : sampleCount;
+  const nonBlackFrames = sanitizeNonNegativeInt(opts.nonBlackFrames, 0);
+  const nonBlackFrameVerified =
+    typeof opts.nonBlackFrameVerified === 'boolean'
+      ? opts.nonBlackFrameVerified
+      : nonBlackFrames > 0;
+
+  if (sampleCount === 0) {
+    return {
+      frameBudgetMs: effectiveBudgetMs,
+      targetFps,
+      totalFrames,
+      sampleCount: 0,
+      presentFpsAvg: 0,
+      avgFrameMs: 0,
+      minFrameMs: 0,
+      maxFrameMs: 0,
+      p95FrameMs: 0,
+      framesWithinBudget: 0,
+      framesOverBudget: 0,
+      budgetCompliancePct: 0,
+      nonBlackFrames,
+      nonBlackFrameVerified,
+    };
+  }
+
+  let sumMs = 0;
+  let framesWithinBudget = 0;
+  let framesOverBudget = 0;
+  for (let i = 0; i < sampleCount; i += 1) {
+    const dt = validDeltas[i];
+    sumMs += dt;
+    if (dt <= effectiveBudgetMs) {
+      framesWithinBudget += 1;
+    } else {
+      framesOverBudget += 1;
+    }
+  }
+
+  validDeltas.sort((a, b) => a - b);
+  const p95Index = Math.min(sampleCount - 1, Math.max(0, Math.ceil(0.95 * sampleCount) - 1));
+  const rawAvgFrameMs = sumMs / sampleCount;
+  const presentFpsAvg = rawAvgFrameMs > 0 ? round3(1000 / rawAvgFrameMs) : 0;
+
+  return {
+    frameBudgetMs: effectiveBudgetMs,
+    targetFps,
+    totalFrames,
+    sampleCount,
+    presentFpsAvg,
+    avgFrameMs: round3(rawAvgFrameMs),
+    minFrameMs: round3(validDeltas[0]),
+    maxFrameMs: round3(validDeltas[sampleCount - 1]),
+    p95FrameMs: round3(validDeltas[p95Index]),
+    framesWithinBudget,
+    framesOverBudget,
+    budgetCompliancePct: roundPct(framesWithinBudget, sampleCount),
+    nonBlackFrames,
+    nonBlackFrameVerified,
+  };
+}
+
+/**
  * Turnkey WebGPU smoke demo driver connecting:
  * - SmokeSceneController (G5 binary command encoder)
  * - GpuRingBuffer (SharedArrayBuffer SPSC command ring)
@@ -148,6 +332,14 @@ export class SmokeDemoRunner {
    * @param {(cb: (ts: number) => void) => any} [options.raf]
    * @param {(handle: any) => void} [options.cancelRaf]
    * @param {() => number} [options.now]
+   * @param {number} [options.frameBudgetMs=33.333]
+   * @param {number} [options.budgetWindowSize=300]
+   * @param {AbortSignal|null} [options.signal=null]
+   * @param {number|null} [options.timeoutMs=null]
+   * @param {(cb: () => void, ms: number) => any} [options.setTimeout]
+   * @param {(handle: any) => void} [options.clearTimeout]
+   * @param {(info: object) => void|null} [options.onTeardown=null]
+   * @param {(frameInfo: object) => boolean|null} [options.verifyNonBlackFrame=null]
    */
   constructor(options = {}) {
     if (!options || typeof options !== 'object') {
@@ -175,6 +367,14 @@ export class SmokeDemoRunner {
       raf = defaultRaf,
       cancelRaf = defaultCancelRaf,
       now = defaultNow,
+      frameBudgetMs = DEFAULT_FRAME_BUDGET_MS,
+      budgetWindowSize = DEFAULT_BUDGET_WINDOW_SIZE,
+      signal = null,
+      timeoutMs = null,
+      setTimeout: setTimeoutImpl = defaultSetTimeout,
+      clearTimeout: clearTimeoutImpl = defaultClearTimeout,
+      onTeardown = null,
+      verifyNonBlackFrame = null,
     } = options;
 
     if (!device || typeof device !== 'object') {
@@ -203,6 +403,36 @@ export class SmokeDemoRunner {
     }
     if (typeof now !== 'function') {
       throw new TypeError('now must be a function returning milliseconds');
+    }
+    if (
+      typeof frameBudgetMs !== 'number' ||
+      !Number.isFinite(frameBudgetMs) ||
+      frameBudgetMs <= 0
+    ) {
+      throw new RangeError(`frameBudgetMs must be a positive finite number, got ${frameBudgetMs}`);
+    }
+    if (!Number.isInteger(budgetWindowSize) || budgetWindowSize < 1) {
+      throw new RangeError(
+        `budgetWindowSize must be a positive integer, got ${budgetWindowSize}`
+      );
+    }
+    const resolvedSignal = validateAbortSignalOption(signal, 'signal');
+    const resolvedTimeoutMs = validateTimeoutMsOption(timeoutMs, 'timeoutMs');
+    if (typeof setTimeoutImpl !== 'function') {
+      throw new TypeError('setTimeout must be a function');
+    }
+    if (typeof clearTimeoutImpl !== 'function') {
+      throw new TypeError('clearTimeout must be a function');
+    }
+    if (onTeardown !== null && onTeardown !== undefined && typeof onTeardown !== 'function') {
+      throw new TypeError('onTeardown must be a function or null');
+    }
+    if (
+      verifyNonBlackFrame !== null &&
+      verifyNonBlackFrame !== undefined &&
+      typeof verifyNonBlackFrame !== 'function'
+    ) {
+      throw new TypeError('verifyNonBlackFrame must be a function or null');
     }
     if (hud !== null && hud !== undefined) {
       if (typeof hud !== 'object' || typeof hud.updateMetrics !== 'function') {
@@ -251,13 +481,43 @@ export class SmokeDemoRunner {
     this._raf = raf;
     this._cancelRaf = cancelRaf;
     this._now = now;
+    this._setTimeout = setTimeoutImpl;
+    this._clearTimeout = clearTimeoutImpl;
     this._inputSab = inputSab;
     this._perfMonitor = resolvedPerfMonitor;
     this._hud = hud || null;
+    this._verifyNonBlackFrame = verifyNonBlackFrame || null;
 
     this._width = width;
     this._height = height;
     this._devicePixelRatio = devicePixelRatio;
+
+    this._frameBudgetMs = frameBudgetMs;
+    this._frameDeltasRing = new Float64Array(budgetWindowSize);
+    this._frameDeltaHead = 0;
+    this._frameDeltaRingCount = 0;
+    this._totalDeltaSamples = 0;
+    this._totalDeltaSumMs = 0;
+    this._minDeltaMs = Infinity;
+    this._maxDeltaMs = 0;
+    this._framesWithinBudget = 0;
+    this._framesOverBudget = 0;
+    this._nonBlackFrames = 0;
+    this._nonBlackFrameVerified = false;
+
+    this._signal = resolvedSignal;
+    this._runSignal = null;
+    this._timeoutMs = resolvedTimeoutMs;
+    this._timeoutHandle = null;
+    this._aborted = false;
+    this._timedOut = false;
+    this._teardownReason = null;
+    this._teardownError = null;
+    this._teardownNotified = false;
+    this._onTeardown = onTeardown || null;
+    this._boundAbortHandler = () => {
+      this._handleAbort();
+    };
 
     this._ring = GpuRingBuffer.create(ringCapacityBytes);
 
@@ -307,6 +567,14 @@ export class SmokeDemoRunner {
     if (enableRecorder) {
       this._ensureRecorder(true);
     }
+
+    if (this._signal) {
+      if (this._signal.aborted) {
+        this._handleAbort();
+      } else if (typeof this._signal.addEventListener === 'function') {
+        this._signal.addEventListener('abort', this._boundAbortHandler, { once: true });
+      }
+    }
   }
 
   get initialized() {
@@ -319,6 +587,22 @@ export class SmokeDemoRunner {
 
   get destroyed() {
     return this._destroyed;
+  }
+
+  get aborted() {
+    return this._aborted;
+  }
+
+  get timedOut() {
+    return this._timedOut;
+  }
+
+  get teardownReason() {
+    return this._teardownReason;
+  }
+
+  get frameBudgetMs() {
+    return this._frameBudgetMs;
   }
 
   get frameIndex() {
@@ -360,6 +644,74 @@ export class SmokeDemoRunner {
   _assertNotDestroyed(action) {
     if (this._destroyed) {
       throw new Error(`Cannot ${action} a destroyed SmokeDemoRunner`);
+    }
+  }
+
+  _clearTimeoutHandle() {
+    if (this._timeoutHandle !== null) {
+      const handle = this._timeoutHandle;
+      this._timeoutHandle = null;
+      this._clearTimeout(handle);
+    }
+  }
+
+  _detachConstructorSignal() {
+    if (this._signal && typeof this._signal.removeEventListener === 'function') {
+      this._signal.removeEventListener('abort', this._boundAbortHandler);
+    }
+    this._signal = null;
+  }
+
+  _detachRunSignal() {
+    if (this._runSignal && typeof this._runSignal.removeEventListener === 'function') {
+      this._runSignal.removeEventListener('abort', this._boundAbortHandler);
+    }
+    this._runSignal = null;
+  }
+
+  _isAnySignalAborted() {
+    return Boolean(
+      (this._signal && this._signal.aborted) || (this._runSignal && this._runSignal.aborted)
+    );
+  }
+
+  _handleAbort() {
+    if (this._destroyed) {
+      return;
+    }
+    this._aborted = true;
+    this.destroy('abort');
+  }
+
+  _handleTimeout() {
+    this._timeoutHandle = null;
+    if (this._destroyed) {
+      return;
+    }
+    this._timedOut = true;
+    this.destroy('timeout');
+  }
+
+  _recordFrameDelta(deltaMs) {
+    const safeDt = typeof deltaMs === 'number' && Number.isFinite(deltaMs) && deltaMs >= 0 ? deltaMs : 0;
+    const ring = this._frameDeltasRing;
+    ring[this._frameDeltaHead] = safeDt;
+    this._frameDeltaHead = (this._frameDeltaHead + 1) % ring.length;
+    if (this._frameDeltaRingCount < ring.length) {
+      this._frameDeltaRingCount += 1;
+    }
+    this._totalDeltaSamples += 1;
+    this._totalDeltaSumMs += safeDt;
+    if (safeDt < this._minDeltaMs) {
+      this._minDeltaMs = safeDt;
+    }
+    if (safeDt > this._maxDeltaMs) {
+      this._maxDeltaMs = safeDt;
+    }
+    if (safeDt <= this._frameBudgetMs) {
+      this._framesWithinBudget += 1;
+    } else {
+      this._framesOverBudget += 1;
     }
   }
 
@@ -464,6 +816,12 @@ export class SmokeDemoRunner {
     }
 
     const drained = this._processor.drainRing();
+    let frameDeltaMs = null;
+    if (this._lastTimestampMs !== null) {
+      const rawDelta = ts - this._lastTimestampMs;
+      frameDeltaMs = Number.isFinite(rawDelta) && rawDelta > 0 ? rawDelta : 0;
+      this._recordFrameDelta(frameDeltaMs);
+    }
     this._frameIndex += 1;
     this._lastTimestampMs = ts;
 
@@ -471,7 +829,29 @@ export class SmokeDemoRunner {
     this._totalGpuPackets += batch.packets;
     this._totalGpuBytes += batch.bytes;
 
-    const swapTelemetry = this._swapchain.recordFramePresented(ts);
+    const frameNonBlack = this._verifyNonBlackFrame
+      ? Boolean(
+          this._verifyNonBlackFrame({
+            frameIndex: currentFrameIndex,
+            timestampMs: ts,
+            presents: drained.presents,
+            drawCalls: batch.drawCalls,
+            computeDispatches: batch.computeDispatches,
+            packets: batch.packets,
+            bytes: frameBytes,
+          })
+        )
+      : drained.presents > 0 && batch.drawCalls > 0;
+
+    if (frameNonBlack) {
+      this._nonBlackFrames += 1;
+      this._nonBlackFrameVerified = true;
+    }
+
+    const swapTelemetry = this._swapchain.recordFramePresented(ts, {
+      hasVisibleContent: frameNonBlack,
+      hasDraws: batch.drawCalls > 0,
+    });
 
     if (this._perfMonitor) {
       if (typeof this._perfMonitor.recordGpuBatch === 'function') {
@@ -506,27 +886,63 @@ export class SmokeDemoRunner {
       frameIndex: currentFrameIndex,
       timestampMs: ts,
       timeSec,
+      frameDeltaMs,
       bytesSubmitted: frameBytes.byteLength,
       bytesDrained: drained.bytesDrained,
       presents: drained.presents,
       packets: batch.packets,
       drawCalls: batch.drawCalls,
       computeDispatches: batch.computeDispatches,
+      nonBlackFrameVerified: frameNonBlack,
     };
   }
 
   /**
    * Starts the requestAnimationFrame render loop. Safe against double-start.
+   * Optionally accepts per-run `{ signal, timeoutMs }` abort/timeout teardown guards.
    *
+   * @param {{ signal?: AbortSignal|null, timeoutMs?: number|null }|null} [startOptions]
    * @returns {boolean} True if loop transitioned from stopped to running.
    */
-  start() {
+  start(startOptions = null) {
+    if (startOptions !== null && startOptions !== undefined && typeof startOptions !== 'object') {
+      throw new TypeError('start options must be an object or null');
+    }
+    const runSignal =
+      startOptions && startOptions.signal !== undefined
+        ? validateAbortSignalOption(startOptions.signal, 'startOptions.signal')
+        : null;
+    const startTimeoutMs =
+      startOptions && startOptions.timeoutMs !== undefined
+        ? validateTimeoutMsOption(startOptions.timeoutMs, 'startOptions.timeoutMs')
+        : null;
+
     this._assertNotDestroyed('start');
     if (this._running) {
       return false;
     }
+    if ((this._signal && this._signal.aborted) || (runSignal && runSignal.aborted)) {
+      this._handleAbort();
+      return false;
+    }
     if (!this._initialized) {
       this.init();
+    }
+
+    this._detachRunSignal();
+    if (runSignal && runSignal !== this._signal) {
+      this._runSignal = runSignal;
+      if (typeof runSignal.addEventListener === 'function') {
+        runSignal.addEventListener('abort', this._boundAbortHandler, { once: true });
+      }
+    }
+
+    this._clearTimeoutHandle();
+    const effectiveTimeoutMs = startTimeoutMs !== null ? startTimeoutMs : this._timeoutMs;
+    if (effectiveTimeoutMs !== null) {
+      this._timeoutHandle = this._setTimeout(() => {
+        this._handleTimeout();
+      }, effectiveTimeoutMs);
     }
 
     this._running = true;
@@ -535,12 +951,21 @@ export class SmokeDemoRunner {
       if (!this._running || this._destroyed) {
         return;
       }
+      if (this._isAnySignalAborted()) {
+        this._handleAbort();
+        return;
+      }
       this._rafHandle = null;
       const ts =
         typeof rafTimestamp === 'number' && Number.isFinite(rafTimestamp)
           ? rafTimestamp
           : this._now();
-      this.stepFrame(ts);
+      try {
+        this.stepFrame(ts);
+      } catch (err) {
+        this.stop();
+        throw err;
+      }
       if (this._running && !this._destroyed) {
         this._rafHandle = this._raf(tick);
       }
@@ -551,7 +976,8 @@ export class SmokeDemoRunner {
   }
 
   /**
-   * Stops the requestAnimationFrame render loop. Safe against double-stop.
+   * Stops the requestAnimationFrame render loop and clears any pending timeout
+   * or per-run abort subscription. Safe against double-stop.
    *
    * @returns {boolean} True if loop transitioned from running to stopped.
    */
@@ -563,6 +989,8 @@ export class SmokeDemoRunner {
       this._rafHandle = null;
       this._cancelRaf(handle);
     }
+    this._clearTimeoutHandle();
+    this._detachRunSignal();
     return wasRunning;
   }
 
@@ -641,44 +1069,144 @@ export class SmokeDemoRunner {
   }
 
   /**
-   * Stops the render loop, submits and drains scene teardown commands to free
-   * GPU resources, destroys the swapchain, and detaches the frame recorder.
-   * Safe to call multiple times (idempotent).
+   * Stops the render loop, clears timeout/abort guards, submits and drains scene
+   * teardown commands to free GPU resources, destroys the swapchain, and detaches
+   * the frame recorder. Safe to call multiple times (idempotent).
+   *
+   * @param {string} [reason='manual'] Teardown reason (e.g. `'manual'`, `'abort'`, `'timeout'`).
    */
-  destroy() {
+  destroy(reason = 'manual') {
     if (this._destroyed) {
       return;
     }
 
+    const normalizedReason = typeof reason === 'string' && reason.length > 0 ? reason : 'manual';
+    this._teardownReason = normalizedReason;
+    if (normalizedReason === 'abort') {
+      this._aborted = true;
+    } else if (normalizedReason === 'timeout') {
+      this._timedOut = true;
+    }
+
     this.stop();
+    this._detachConstructorSignal();
     this._destroyed = true;
 
+    let teardownError = null;
     if (this._initialized) {
-      const teardownBytes = this._scene.buildTeardownCommandBuffer();
-      if (this._ring && this._processor) {
-        if (this._ring.availableBytes() > 0) {
-          this._processor.drainRing();
+      try {
+        const teardownBytes = this._scene.buildTeardownCommandBuffer();
+        if (this._ring && this._processor) {
+          if (this._ring.availableBytes() > 0) {
+            this._processor.drainRing();
+          }
+          if (submitToRing(this._ring, teardownBytes)) {
+            this._processor.drainRing();
+          } else {
+            this._processor.executeCommandBuffer(teardownBytes);
+          }
         }
-        if (submitToRing(this._ring, teardownBytes)) {
-          this._processor.drainRing();
-        } else {
-          this._processor.executeCommandBuffer(teardownBytes);
-        }
+      } catch (err) {
+        teardownError = err;
+      } finally {
+        this._initialized = false;
       }
-      this._initialized = false;
     }
 
     if (this._recorder) {
-      this._recorder.stop();
+      try {
+        this._recorder.stop();
+      } catch (err) {
+        if (!teardownError) {
+          teardownError = err;
+        }
+      }
     }
     if (this._recorderHandle) {
-      this._recorderHandle.detach();
+      const handle = this._recorderHandle;
       this._recorderHandle = null;
+      try {
+        handle.detach();
+      } catch (err) {
+        if (!teardownError) {
+          teardownError = err;
+        }
+      }
     }
 
     if (this._swapchain) {
-      this._swapchain.destroy();
+      try {
+        this._swapchain.destroy();
+      } catch (err) {
+        if (!teardownError) {
+          teardownError = err;
+        }
+      }
     }
+
+    this._teardownError = teardownError;
+
+    if (this._onTeardown && !this._teardownNotified) {
+      this._teardownNotified = true;
+      const cb = this._onTeardown;
+      this._onTeardown = null;
+      try {
+        cb({
+          reason: this._teardownReason,
+          aborted: this._aborted,
+          timedOut: this._timedOut,
+          destroyed: this._destroyed,
+          summary: this.getBudgetSummary(),
+          teardownError,
+        });
+      } catch {
+        // Isolate observer exceptions so teardown stays deterministic.
+      }
+    }
+  }
+
+  /**
+   * Returns a deterministic 30 FPS frame-budget summary across all stepped frames,
+   * safe to call before init (zero-frame guard), during execution, or after teardown.
+   */
+  getBudgetSummary() {
+    if (this._totalDeltaSamples === 0) {
+      return computeFrameBudgetSummary(null, {
+        frameBudgetMs: this._frameBudgetMs,
+        totalFrames: this._frameIndex,
+        nonBlackFrames: this._nonBlackFrames,
+        nonBlackFrameVerified: this._nonBlackFrameVerified,
+      });
+    }
+
+    const ringCount = this._frameDeltaRingCount;
+    if (this._totalDeltaSamples <= ringCount) {
+      return computeFrameBudgetSummary(this._frameDeltasRing.subarray(0, ringCount), {
+        frameBudgetMs: this._frameBudgetMs,
+        totalFrames: this._frameIndex,
+        nonBlackFrames: this._nonBlackFrames,
+        nonBlackFrameVerified: this._nonBlackFrameVerified,
+      });
+    }
+
+    const rollingSummary = computeFrameBudgetSummary(this._frameDeltasRing.subarray(0, ringCount), {
+      frameBudgetMs: this._frameBudgetMs,
+      totalFrames: this._frameIndex,
+      nonBlackFrames: this._nonBlackFrames,
+      nonBlackFrameVerified: this._nonBlackFrameVerified,
+    });
+    const rawAvgFrameMs = this._totalDeltaSumMs / this._totalDeltaSamples;
+    return {
+      ...rollingSummary,
+      sampleCount: this._totalDeltaSamples,
+      presentFpsAvg: rawAvgFrameMs > 0 ? round3(1000 / rawAvgFrameMs) : 0,
+      avgFrameMs: round3(rawAvgFrameMs),
+      minFrameMs: Number.isFinite(this._minDeltaMs) ? round3(this._minDeltaMs) : 0,
+      maxFrameMs: round3(this._maxDeltaMs),
+      framesWithinBudget: this._framesWithinBudget,
+      framesOverBudget: this._framesOverBudget,
+      budgetCompliancePct: roundPct(this._framesWithinBudget, this._totalDeltaSamples),
+    };
   }
 
   /**
@@ -688,7 +1216,12 @@ export class SmokeDemoRunner {
     return {
       initialized: this._initialized,
       running: this._running,
+      destroyed: this._destroyed,
+      aborted: this._aborted,
+      timedOut: this._timedOut,
+      teardownReason: this._teardownReason,
       frameIndex: this._frameIndex,
+      budgetSummary: this.getBudgetSummary(),
       swapchain: this._swapchain ? this._swapchain.getTelemetry() : null,
       perf: this._perfMonitor ? this._perfMonitor.getSnapshot() : null,
       recorder: this._recorder ? this._recorder.exportMetadata() : null,
