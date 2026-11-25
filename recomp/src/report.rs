@@ -5,6 +5,10 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
+use playgta6_recomp::summary::{
+    CoverageSummary, RankedCount, format_top_n, percentage_2dp, rank_top_n, sanitize_label,
+};
+
 use crate::pe::{ImportedSymbol, Pe64};
 
 /// Renders a sanitized Markdown report (headers, sections, TLS callbacks, grouped imports,
@@ -717,6 +721,324 @@ pub fn json_str(input: &str) -> String {
     out
 }
 
+/// Sanitizes a report source label (stripping host directory prefixes and control characters).
+#[allow(dead_code)]
+pub fn sanitize_source_label(raw: &str) -> String {
+    sanitize_label(raw)
+}
+
+/// Percentage of discovered functions lifted (`0.00..=100.00`, zero-division safe).
+#[allow(dead_code)]
+pub fn lifted_function_pct(lifted: usize, total: usize) -> f64 {
+    percentage_2dp(lifted, total)
+}
+
+/// Percentage of instructions decoded/supported (`0.00..=100.00`, zero-division safe).
+#[allow(dead_code)]
+pub fn decoded_instruction_pct(decoded: usize, total: usize) -> f64 {
+    percentage_2dp(decoded, total)
+}
+
+/// Percentage of imports bound to shims or guest modules (`0.00..=100.00`, zero-division safe).
+#[allow(dead_code)]
+pub fn bound_import_pct(bound: usize, total: usize) -> f64 {
+    percentage_2dp(bound, total)
+}
+
+/// Formats a deterministic, sanitized one-line top-N breakdown (`"a (5), b (2), +1 more"`).
+#[allow(dead_code)]
+pub fn format_top_n_breakdown<I, S>(entries: I, limit: usize) -> String
+where
+    I: IntoIterator<Item = (S, usize)>,
+    S: AsRef<str>,
+{
+    format_top_n(entries, limit)
+}
+
+/// Sanitized instruction-coverage & unresolved-import breakdown for CLI/program reports.
+///
+/// Holds counts, percentages, and sanitized labels only — never host paths or raw binary bytes.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverageReport {
+    pub source: String,
+    pub summary: CoverageSummary,
+    pub unresolved_by_dll: Vec<RankedCount>,
+    pub unsupported_mnemonics: Vec<RankedCount>,
+}
+
+#[allow(dead_code)]
+impl CoverageReport {
+    /// Creates a new sanitized coverage report from a source label and [`CoverageSummary`].
+    pub fn new(source_label: &str, summary: CoverageSummary) -> Self {
+        Self {
+            source: sanitize_source_label(source_label),
+            summary,
+            unresolved_by_dll: Vec::new(),
+            unsupported_mnemonics: Vec::new(),
+        }
+    }
+
+    /// Attaches a sanitized, deterministically ordered unresolved-import breakdown by DLL.
+    pub fn with_unresolved_imports<I, S>(mut self, entries: I) -> Self
+    where
+        I: IntoIterator<Item = (S, usize)>,
+        S: AsRef<str>,
+    {
+        self.unresolved_by_dll = rank_top_n(entries, usize::MAX);
+        self
+    }
+
+    /// Attaches a sanitized, deterministically ordered unsupported-mnemonic breakdown.
+    pub fn with_unsupported_mnemonics<I, S>(mut self, entries: I) -> Self
+    where
+        I: IntoIterator<Item = (S, usize)>,
+        S: AsRef<str>,
+    {
+        self.unsupported_mnemonics = rank_top_n(entries, usize::MAX);
+        self
+    }
+
+    /// Builds an import-coverage breakdown directly from a parsed [`Pe64`] (combining standard
+    /// and delay-load imports) and a per-DLL map of bound import counts (matched
+    /// case-insensitively by DLL name).
+    pub fn from_pe_import_counts(
+        pe: &Pe64,
+        source_label: &str,
+        bound_by_dll: &BTreeMap<String, usize>,
+    ) -> Self {
+        let mut bound_lookup: BTreeMap<String, usize> = BTreeMap::new();
+        for (dll, &count) in bound_by_dll {
+            let key = sanitize_label(dll).to_ascii_lowercase();
+            let slot = bound_lookup.entry(key).or_insert(0);
+            *slot = slot.saturating_add(count);
+        }
+
+        let mut totals_by_dll: BTreeMap<String, (String, usize)> = BTreeMap::new();
+        for module in &pe.imports {
+            let clean = sanitize_label(&module.dll_name);
+            let key = clean.to_ascii_lowercase();
+            let entry = totals_by_dll.entry(key).or_insert((clean, 0));
+            entry.1 = entry.1.saturating_add(module.symbols.len());
+        }
+        for module in &pe.delay_imports {
+            let clean = sanitize_label(&module.dll_name);
+            let key = clean.to_ascii_lowercase();
+            let entry = totals_by_dll.entry(key).or_insert((clean, 0));
+            entry.1 = entry.1.saturating_add(module.symbols.len());
+        }
+
+        let mut total_imports = 0usize;
+        let mut bound_imports = 0usize;
+        let mut unresolved = Vec::new();
+        for (key, (display_dll, count)) in totals_by_dll {
+            let bound = bound_lookup.get(&key).copied().unwrap_or(0).min(count);
+            let missing = count.saturating_sub(bound);
+            total_imports = total_imports.saturating_add(count);
+            bound_imports = bound_imports.saturating_add(bound);
+            if missing > 0 {
+                unresolved.push((display_dll, missing));
+            }
+        }
+
+        let summary = CoverageSummary::default().with_imports(total_imports, bound_imports);
+        Self::new(source_label, summary).with_unresolved_imports(unresolved)
+    }
+
+    /// Percentage of discovered functions lifted (`0.00..=100.00`).
+    pub fn lifted_function_pct(&self) -> f64 {
+        self.summary.lifted_function_pct()
+    }
+
+    /// Percentage of instructions decoded/supported (`0.00..=100.00`).
+    pub fn decoded_instruction_pct(&self) -> f64 {
+        self.summary.decoded_instruction_pct()
+    }
+
+    /// Percentage of imports bound (`0.00..=100.00`).
+    pub fn bound_import_pct(&self) -> f64 {
+        self.summary.bound_import_pct()
+    }
+
+    /// Formats a crisp one-line progress ratio prefixed with the sanitized source label.
+    pub fn render_one_line(&self) -> String {
+        format!("[{}] {}", self.source, self.summary.format_one_line())
+    }
+
+    /// Formats a crisp one-line progress ratio plus deterministic top-N unresolved-import and
+    /// unsupported-mnemonic breakdowns.
+    pub fn render_breakdown_line(&self, top_n: usize) -> String {
+        let mut out = self.render_one_line();
+        if !self.unresolved_by_dll.is_empty() {
+            let top = format_top_n(
+                self.unresolved_by_dll
+                    .iter()
+                    .map(|r| (r.label.as_str(), r.count)),
+                top_n,
+            );
+            let _ = write!(out, " | top unresolved: {top}");
+        }
+        if !self.unsupported_mnemonics.is_empty() {
+            let top = format_top_n(
+                self.unsupported_mnemonics
+                    .iter()
+                    .map(|r| (r.label.as_str(), r.count)),
+                top_n,
+            );
+            let _ = write!(out, " | top unsupported: {top}");
+        }
+        out
+    }
+
+    /// Renders a sanitized Markdown coverage summary with deterministic top-N breakdown tables.
+    pub fn render_coverage_markdown(&self, top_n: usize) -> String {
+        let mut out = String::with_capacity(512);
+        let _ = writeln!(out, "## Coverage Summary — `{}`", md_inline(&self.source));
+        let _ = writeln!(out);
+        let _ = writeln!(out, "- {}", self.summary.format_one_line());
+        let _ = writeln!(out);
+        let _ = writeln!(out, "| Metric | Covered | Total | Coverage |");
+        let _ = writeln!(out, "| --- | ---: | ---: | ---: |");
+        let _ = writeln!(
+            out,
+            "| Lifted Functions | {} | {} | {:.2}% |",
+            self.summary.lifted_functions,
+            self.summary.total_functions,
+            self.lifted_function_pct()
+        );
+        let _ = writeln!(
+            out,
+            "| Decoded Instructions | {} | {} | {:.2}% |",
+            self.summary.decoded_instructions,
+            self.summary.total_instructions,
+            self.decoded_instruction_pct()
+        );
+        let _ = writeln!(
+            out,
+            "| Bound Imports | {} | {} | {:.2}% |",
+            self.summary.bound_imports,
+            self.summary.total_imports,
+            self.bound_import_pct()
+        );
+
+        let top_unresolved = format_top_n(
+            self.unresolved_by_dll
+                .iter()
+                .map(|r| (r.label.as_str(), r.count)),
+            top_n,
+        );
+        let top_unsupported = format_top_n(
+            self.unsupported_mnemonics
+                .iter()
+                .map(|r| (r.label.as_str(), r.count)),
+            top_n,
+        );
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "- Top Unresolved Imports (top {top_n}): {}",
+            md_inline(&top_unresolved)
+        );
+        let _ = writeln!(
+            out,
+            "- Top Unsupported Mnemonics (top {top_n}): {}",
+            md_inline(&top_unsupported)
+        );
+        out
+    }
+
+    /// Renders a sanitized RFC 8259 JSON coverage summary with deterministic top-N breakdowns.
+    pub fn render_coverage_json(&self, top_n: usize) -> String {
+        let mut out = String::with_capacity(512);
+        let _ = writeln!(out, "{{");
+        let _ = writeln!(out, "  \"source\": {},", json_str(&self.source));
+        let _ = writeln!(
+            out,
+            "  \"summary_line\": {},",
+            json_str(&self.render_breakdown_line(top_n))
+        );
+        let _ = writeln!(
+            out,
+            "  \"total_functions\": {},",
+            self.summary.total_functions
+        );
+        let _ = writeln!(
+            out,
+            "  \"lifted_functions\": {},",
+            self.summary.lifted_functions
+        );
+        let _ = writeln!(
+            out,
+            "  \"lifted_function_pct\": {:.2},",
+            self.lifted_function_pct()
+        );
+        let _ = writeln!(
+            out,
+            "  \"total_instructions\": {},",
+            self.summary.total_instructions
+        );
+        let _ = writeln!(
+            out,
+            "  \"decoded_instructions\": {},",
+            self.summary.decoded_instructions
+        );
+        let _ = writeln!(
+            out,
+            "  \"decoded_instruction_pct\": {:.2},",
+            self.decoded_instruction_pct()
+        );
+        let _ = writeln!(out, "  \"total_imports\": {},", self.summary.total_imports);
+        let _ = writeln!(out, "  \"bound_imports\": {},", self.summary.bound_imports);
+        let _ = writeln!(
+            out,
+            "  \"unresolved_imports\": {},",
+            self.summary.unresolved_imports()
+        );
+        let _ = writeln!(
+            out,
+            "  \"bound_import_pct\": {:.2},",
+            self.bound_import_pct()
+        );
+        write_ranked_json(&mut out, "top_unresolved_imports", &self.unresolved_by_dll, top_n, true);
+        write_ranked_json(
+            &mut out,
+            "top_unsupported_mnemonics",
+            &self.unsupported_mnemonics,
+            top_n,
+            false,
+        );
+        let _ = writeln!(out, "}}");
+        out
+    }
+}
+
+#[allow(dead_code)]
+fn write_ranked_json(
+    out: &mut String,
+    key: &str,
+    items: &[RankedCount],
+    top_n: usize,
+    trailing_comma: bool,
+) {
+    let comma_end = if trailing_comma { "," } else { "" };
+    let shown = items.len().min(top_n);
+    if shown == 0 {
+        let _ = writeln!(out, "  \"{key}\": []{comma_end}");
+        return;
+    }
+    let _ = writeln!(out, "  \"{key}\": [");
+    for (idx, item) in items.iter().take(shown).enumerate() {
+        let comma = if idx + 1 < shown { "," } else { "" };
+        let _ = writeln!(
+            out,
+            "    {{\"label\": {}, \"count\": {}}}{comma}",
+            json_str(&item.label),
+            item.count
+        );
+    }
+    let _ = writeln!(out, "  ]{comma_end}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -908,6 +1230,16 @@ mod tests {
             if self.pos == start {
                 return Err(format!("invalid number at {}", self.pos));
             }
+            if self.bytes.get(self.pos) == Some(&b'.') {
+                self.pos += 1;
+                let frac_start = self.pos;
+                while self.pos < self.bytes.len() && self.bytes[self.pos].is_ascii_digit() {
+                    self.pos += 1;
+                }
+                if self.pos == frac_start {
+                    return Err(format!("invalid fractional number at {}", self.pos));
+                }
+            }
             Ok(())
         }
     }
@@ -964,5 +1296,124 @@ mod tests {
         JsonValidator::validate(&json_many).expect("multi-PE JSON array must be valid");
         assert!(json_many.contains("\"source\": \"a.exe\""));
         assert!(json_many.contains("\"source\": \"b.exe\""));
+    }
+
+    #[test]
+    fn coverage_pct_helpers_handle_zero_division_and_rounding() {
+        assert_eq!(lifted_function_pct(0, 0), 0.0);
+        assert_eq!(decoded_instruction_pct(10, 0), 0.0);
+        assert_eq!(bound_import_pct(0, 0), 0.0);
+
+        assert_eq!(lifted_function_pct(1, 3), 33.33);
+        assert_eq!(decoded_instruction_pct(2, 3), 66.67);
+        assert_eq!(bound_import_pct(3, 8), 37.5);
+        assert_eq!(lifted_function_pct(9, 5), 100.0);
+        assert_eq!(decoded_instruction_pct(1, 20_000), 0.01);
+        assert_eq!(bound_import_pct(1, 40_000), 0.0);
+    }
+
+    #[test]
+    fn coverage_report_from_pe_computes_deterministic_sanitized_breakdowns() {
+        let raw = build_synthetic_pe64(false);
+        let pe = Pe64::parse(&raw).expect("synthetic PE should parse");
+
+        // Synthetic PE has:
+        //   KERNEL32.dll: 2 standard imports
+        //   xgameruntime.dll: 1 standard import
+        //   d3d12_xs.dll: 2 delay-load imports
+        let mut bound = BTreeMap::new();
+        bound.insert("kernel32.dll".to_string(), 1);
+        bound.insert("xgameruntime.dll".to_string(), 1);
+
+        let report = CoverageReport::from_pe_import_counts(
+            &pe,
+            r"C:\Private\HostPath\SyntheticGame.exe",
+            &bound,
+        )
+        .with_unsupported_mnemonics(vec![
+            ("vmovdqu", 3),
+            ("aesenc", 7),
+            ("cpuid", 7),
+            ("zero_op", 0),
+        ]);
+
+        // Host path must never appear in any output.
+        assert_eq!(report.source, "SyntheticGame.exe");
+        assert_eq!(report.summary.total_imports, 5);
+        assert_eq!(report.summary.bound_imports, 2);
+        assert_eq!(report.summary.unresolved_imports(), 3);
+        assert_eq!(report.bound_import_pct(), 40.0);
+        assert_eq!(report.lifted_function_pct(), 0.0);
+        assert_eq!(report.decoded_instruction_pct(), 0.0);
+
+        let one_line = report.render_one_line();
+        assert_eq!(
+            one_line,
+            "[SyntheticGame.exe] functions 0/0 (0.00%) | instructions 0/0 (0.00%) | imports 2/5 (40.00%, 3 unresolved)"
+        );
+        assert!(!one_line.contains("Private"));
+        assert!(!one_line.contains("HostPath"));
+
+        let breakdown_top1 = report.render_breakdown_line(1);
+        assert_eq!(
+            breakdown_top1,
+            "[SyntheticGame.exe] functions 0/0 (0.00%) | instructions 0/0 (0.00%) | imports 2/5 (40.00%, 3 unresolved) | top unresolved: d3d12_xs.dll (2), +1 more | top unsupported: aesenc (7), +2 more"
+        );
+
+        let breakdown_all = report.render_breakdown_line(5);
+        assert!(breakdown_all.contains("top unresolved: d3d12_xs.dll (2), KERNEL32.dll (1)"));
+        assert!(breakdown_all.contains("top unsupported: aesenc (7), cpuid (7), vmovdqu (3)"));
+
+        let md = report.render_coverage_markdown(2);
+        assert!(md.contains("## Coverage Summary — `SyntheticGame.exe`"));
+        assert!(md.contains("| Bound Imports | 2 | 5 | 40.00% |"));
+        assert!(md.contains("- Top Unresolved Imports (top 2): d3d12_xs.dll (2), KERNEL32.dll (1)"));
+        assert!(md.contains("- Top Unsupported Mnemonics (top 2): aesenc (7), cpuid (7), +1 more"));
+        assert!(!md.contains("Private"));
+
+        let json = report.render_coverage_json(2);
+        JsonValidator::validate(&json).expect("coverage report JSON must be valid RFC 8259 JSON");
+        assert!(json.contains("\"source\": \"SyntheticGame.exe\""));
+        assert!(json.contains("\"bound_import_pct\": 40.00"));
+        assert!(json.contains("\"unresolved_imports\": 3"));
+        assert!(json.contains("{\"label\": \"d3d12_xs.dll\", \"count\": 2}"));
+        assert!(json.contains("{\"label\": \"aesenc\", \"count\": 7}"));
+        assert!(!json.contains("Private"));
+    }
+
+    #[test]
+    fn coverage_report_top_n_order_is_independent_of_input_order_and_handles_zero_limit() {
+        let summary = CoverageSummary {
+            total_functions: 12,
+            lifted_functions: 10,
+            total_instructions: 300,
+            decoded_instructions: 299,
+            total_imports: 8,
+            bound_imports: 6,
+        };
+        let r1 = CoverageReport::new("/tmp/secret/game.exe", summary)
+            .with_unresolved_imports(vec![("b.dll", 2), ("a.dll", 2), ("c.dll", 5)]);
+        let r2 = CoverageReport::new(r"C:\tmp\secret\game.exe", summary)
+            .with_unresolved_imports(vec![("a.dll", 2), ("c.dll", 5), ("b.dll", 2)]);
+
+        assert_eq!(r1, r2);
+        assert_eq!(r1.render_breakdown_line(2), r2.render_breakdown_line(2));
+        assert_eq!(
+            r1.render_breakdown_line(2),
+            "[game.exe] functions 10/12 (83.33%) | instructions 299/300 (99.67%) | imports 6/8 (75.00%, 2 unresolved) | top unresolved: c.dll (5), a.dll (2), +1 more"
+        );
+        assert_eq!(
+            r1.render_breakdown_line(0),
+            "[game.exe] functions 10/12 (83.33%) | instructions 299/300 (99.67%) | imports 6/8 (75.00%, 2 unresolved) | top unresolved: none"
+        );
+        assert_eq!(
+            format_top_n_breakdown(vec![("z", 1), ("a", 1)], 2),
+            "a (1), z (1)"
+        );
+
+        let json_zero = r1.render_coverage_json(0);
+        JsonValidator::validate(&json_zero).expect("zero top-N JSON must be valid");
+        assert!(json_zero.contains("\"top_unresolved_imports\": []"));
+        assert!(json_zero.contains("\"top_unsupported_mnemonics\": []"));
     }
 }
