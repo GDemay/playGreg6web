@@ -486,6 +486,7 @@ function sanitizeTextureDescriptor(rawDescriptor, device) {
   const strippedUsages = [];
   const warnings = [];
 
+  const is3d = (rawDescriptor.dimension || '2d') === '3d';
   if (wasBc && !deviceHasFeature(device, 'texture-compression-bc')) {
     bcFallback = true;
     formatFallback = true;
@@ -493,6 +494,15 @@ function sanitizeTextureDescriptor(rawDescriptor, device) {
     warnings.push({
       key: `bc-unsupported:${originalFormat}`,
       message: `texture format ${originalFormat} unavailable without texture-compression-bc; falling back to ${effectiveFormat}`,
+    });
+  } else if (wasBc && is3d && !deviceHasFeature(device, 'texture-compression-bc-sliced-3d')) {
+    // W107 (#695): WebGPU rejects 3D BC-compressed textures without texture-compression-bc-sliced-3d.
+    bcFallback = true;
+    formatFallback = true;
+    effectiveFormat = isSrgbTextureFormat(originalFormat) ? 'rgba8unorm-srgb' : 'rgba8unorm';
+    warnings.push({
+      key: `bc-3d-unsupported:${originalFormat}`,
+      message: `3d texture format ${originalFormat} unavailable without texture-compression-bc-sliced-3d; falling back to ${effectiveFormat}`,
     });
   } else if (
     originalFormat === 'depth32float-stencil8' &&
@@ -3264,6 +3274,16 @@ class RenderStatePackets {
     const decoded = decodeBeginRenderPass(view, offset);
     const resolvers = { colors: [], depthStencil: null };
     for (const c of decoded.colors) {
+      if (
+        c &&
+        c.textureId === SWAPCHAIN_TEXTURE_ID &&
+        c.view &&
+        c.view.format &&
+        typeof this.processor.setSwapchainFormat === 'function'
+      ) {
+        // #709: match canvas swapchain format to the stream's declared attachment format.
+        this.processor.setSwapchainFormat(c.view.format);
+      }
       const resolver = c ? this._attachmentView(c.textureId, c.view) : null;
       if (c && !resolver) {
         return this._missingRenderPassTexture(c.textureId);

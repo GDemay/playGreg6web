@@ -3437,3 +3437,72 @@ test('W101 compute auto-layout remap honours root-constant dynamicOffsets on dis
     ]
   );
 });
+
+test('W107 (#695): sanitizeTextureDescriptor falls back on 3D BC textures without texture-compression-bc-sliced-3d', () => {
+  const bc2dOnlyDevice = { features: new Set(['texture-compression-bc']) };
+  const bc3dDevice = {
+    features: new Set(['texture-compression-bc', 'texture-compression-bc-sliced-3d']),
+  };
+  const raw3d = {
+    size: { width: 16, height: 16, depthOrArrayLayers: 4 },
+    mipLevelCount: 1,
+    sampleCount: 1,
+    dimension: '3d',
+    format: 'bc5-rg-unorm',
+    usage: 0x0006,
+  };
+  const fallback = rs.sanitizeTextureDescriptor(raw3d, bc2dOnlyDevice);
+  assert.equal(fallback.bcFallback, true);
+  assert.equal(fallback.effectiveFormat, 'rgba8unorm');
+  assert.equal(fallback.descriptor.format, 'rgba8unorm');
+  assert.equal(fallback.descriptor.dimension, '3d');
+  assert.ok(fallback.warnings.some((w) => w.key === 'bc-3d-unsupported:bc5-rg-unorm'));
+
+  // With texture-compression-bc-sliced-3d, 3D BC textures stay untouched.
+  const preserved = rs.sanitizeTextureDescriptor(raw3d, bc3dDevice);
+  assert.equal(preserved.bcFallback, false);
+  assert.equal(preserved.descriptor.format, 'bc5-rg-unorm');
+
+  // 2D BC textures remain untouched when only texture-compression-bc is present.
+  const raw2d = { ...raw3d, dimension: '2d' };
+  const kept2d = rs.sanitizeTextureDescriptor(raw2d, bc2dOnlyDevice);
+  assert.equal(kept2d.bcFallback, false);
+  assert.equal(kept2d.descriptor.format, 'bc5-rg-unorm');
+});
+
+test('#709: BeginRenderPass reconfigures swapchain context to stream-declared rgba8unorm format', () => {
+  const gpu = createMockWebGpu();
+  const configured = [];
+  gpu.ctx.configure = (cfg) => configured.push(cfg);
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { format: 'bgra8unorm' });
+  const handler = installRenderStatePackets(processor);
+  // BeginRenderPass targeting SWAPCHAIN_TEXTURE_ID (0xffffffff) with view format code 22 (rgba8unorm).
+  const rp = new Uint8Array(368);
+  const v = new DataView(rp.buffer);
+  v.setUint32(0, 1, true); // colorCount = 1
+  v.setUint32(8, 0xffffffff, true); // SWAPCHAIN_TEXTURE_ID
+  v.setUint8(12, 2); // loadOp = clear
+  v.setUint8(13, 1); // storeOp = store
+  v.setUint8(16, 22); // view.format = rgba8unorm
+  const pkt = new Uint8Array(8 + rp.byteLength);
+  const pv = new DataView(pkt.buffer);
+  pv.setUint32(0, 26, true); // BEGIN_RENDER_PASS
+  pv.setUint32(4, rp.byteLength, true);
+  pkt.set(rp, 8);
+  const endPkt = new Uint8Array(8);
+  new DataView(endPkt.buffer).setUint32(0, 27, true); // END_RENDER_PASS
+
+  processor.executeCommandBuffer(
+    concat(
+      new Stream().packet(OPCODES.BEGIN_FRAME).bytes(),
+      pkt,
+      endPkt,
+      new Stream().packet(OPCODES.PRESENT).bytes()
+    )
+  );
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  assert.equal(processor.format, 'rgba8unorm');
+  assert.equal(configured.length, 1);
+  assert.equal(configured[0].format, 'rgba8unorm');
+  assert.equal(configured[0].device, gpu.device);
+});
