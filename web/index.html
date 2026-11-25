@@ -5,12 +5,18 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>playgta6web</title>
   <link rel="stylesheet" href="./ui/overlay.css" />
+  <style>
+    #hud[hidden],
+    #scripted-input-badge[hidden] {
+      display: none !important;
+    }
+  </style>
 </head>
 <body>
   <canvas id="viewport"></canvas>
   <div id="splash-overlay-root"></div>
 
-  <div id="hud" class="astryx-card" role="region" aria-label="playgta6web diagnostics HUD">
+  <div id="hud" class="astryx-card" data-hud-visible="true" role="region" aria-label="playgta6web diagnostics HUD">
     <!-- Section 1: Header Bar -->
     <div class="hud-header">
       <div class="hud-title-group">
@@ -32,7 +38,7 @@
         </span>
       </div>
       <div class="hud-actions">
-        <button id="hud-toggle" class="astryx-button" data-variant="ghost" data-size="xs" type="button" title="Toggle HUD (F9)">Hide</button>
+        <button id="hud-toggle" class="astryx-button" data-variant="ghost" data-size="xs" type="button" title="Collapse HUD (F9) · Hide HUD (F3)">Hide</button>
       </div>
     </div>
 
@@ -73,6 +79,16 @@
           role="status"
           aria-live="polite"
         >No split modules</div>
+        <span
+          id="scripted-input-badge"
+          class="astryx-badge"
+          data-active="false"
+          data-preset=""
+          role="status"
+          aria-live="polite"
+          aria-hidden="true"
+          hidden
+        ></span>
       </section>
 
       <!-- Section 3: Compact 3-Metric Row -->
@@ -195,6 +211,18 @@
                 <span class="kv-label">Gamepad</span>
                 <span id="metric-gamepad" class="kv-value">None</span>
               </div>
+              <div class="kv-row">
+                <span class="kv-label">Shader Hit Rate</span>
+                <span id="metric-shader-hit-rate" class="kv-value">-</span>
+              </div>
+              <div class="kv-row">
+                <span class="kv-label">GPU Compat</span>
+                <span id="metric-gpu-compat" class="kv-value">-</span>
+              </div>
+              <div class="kv-row">
+                <span class="kv-label">HTTPFS / Cache</span>
+                <span id="metric-httpfs-summary" class="kv-value">-</span>
+              </div>
             </div>
           </section>
 
@@ -242,6 +270,7 @@
     const statusDotEl = document.getElementById('hud-status-dot');
     const bootModeBadgeEl = document.getElementById('boot-mode-badge');
     const sideModuleStatusEl = document.getElementById('side-module-status');
+    const scriptedInputBadgeEl = document.getElementById('scripted-input-badge');
     const gpuValidationErrorsEl = document.getElementById('gpu-validation-errors');
     const statusEl = document.getElementById('hud-status');
     const pillFpsEl = document.getElementById('hud-pill-fps');
@@ -293,14 +322,374 @@
       opfsCacheHits: document.getElementById('metric-opfs-hits'),
       pointerLock: document.getElementById('metric-pointer-lock'),
       gamepad: document.getElementById('metric-gamepad'),
+      shaderHitRate: document.getElementById('metric-shader-hit-rate'),
+      gpuCompat: document.getElementById('metric-gpu-compat'),
+      httpfsSummary: document.getElementById('metric-httpfs-summary'),
     };
 
     const MAX_LOG_LINES = 200;
+    const SCRIPTED_INPUT_PRESET_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/i;
+    const SAFE_SWAPCHAIN_FORMAT_RE = /^[a-z0-9-]{1,32}$/i;
+    const GPU_BOOT_TELEMETRY_KEYS = Object.freeze([
+      'bootSummary',
+      'missingShaders',
+      'fallbackStats',
+      'frameStats',
+      'compatStats',
+      'gpuCompatStats',
+      'compat',
+      'gpu',
+      'renderStateStats',
+      'textureStats',
+      'swapchainStats',
+      'swapchain',
+      'bindGroupKindMismatches',
+      'autoLayoutFallbacks',
+      'bc3dFallbacks',
+      'bc3dFallbackUploadsSkipped',
+      'swapchainFormat',
+      'usesBlitFallback',
+      'blitCount',
+      'ioStats',
+      'httpfsStats',
+      'httpfs',
+      'io',
+      'pgimFullFetches',
+      'slabCacheHits',
+      'slabCacheMisses',
+      'syncFastPathHits',
+    ]);
     let lastValidationEventKey = null;
     const bootStartedAt = typeof performance !== 'undefined' && typeof performance.now === 'function'
       ? performance.now()
       : Date.now();
     let bootCompleted = false;
+    let hudVisible = true;
+    let inSetHudVisible = false;
+    let currentScriptedInputPreset = null;
+
+    function sanitizeScriptedInputPreset(raw) {
+      if (typeof raw !== 'string') return null;
+      const trimmed = raw.trim();
+      if (!trimmed || /[\x00-\x1F\x7F]/.test(trimmed)) return null;
+      return SCRIPTED_INPUT_PRESET_RE.test(trimmed) ? trimmed : null;
+    }
+
+    function isEditableEventTarget(target) {
+      if (!target || typeof target !== 'object') return false;
+      const tagName = typeof target.tagName === 'string' ? target.tagName.toUpperCase() : '';
+      if (tagName === 'INPUT' || tagName === 'TEXTAREA' || tagName === 'SELECT') {
+        return true;
+      }
+      if (target.isContentEditable === true) return true;
+      if (typeof target.getAttribute === 'function') {
+        try {
+          const ce = target.getAttribute('contenteditable');
+          if (ce !== null && ce !== undefined && String(ce).toLowerCase() !== 'false') {
+            return true;
+          }
+        } catch {
+          // Ignore mock getAttribute errors.
+        }
+      }
+      if (typeof target.contentEditable === 'string') {
+        const ce = target.contentEditable.toLowerCase();
+        if (ce === 'true' || ce === 'plaintext-only') return true;
+      }
+      return false;
+    }
+
+    function parseHudQueryOptions(search = typeof location !== 'undefined' && location ? location.search : '') {
+      let hudVisibleResult = true;
+      let inputScript = null;
+      if (typeof search !== 'string' || search.length === 0) {
+        return { hudVisible: hudVisibleResult, inputScript };
+      }
+      try {
+        const query = search.startsWith('?') ? search.slice(1) : search;
+        const params = new URLSearchParams(query);
+        const getInsensitive = (name) => {
+          if (params.has(name)) return params.get(name);
+          const lower = name.toLowerCase();
+          for (const [k, v] of params.entries()) {
+            if (k.toLowerCase() === lower) return v;
+          }
+          return null;
+        };
+
+        const rawHud = getInsensitive('hud');
+        if (typeof rawHud === 'string') {
+          const v = rawHud.trim().toLowerCase();
+          if (v === '0' || v === 'false' || v === 'no' || v === 'off' || v === 'hidden') {
+            hudVisibleResult = false;
+          } else if (v === '1' || v === 'true' || v === 'yes' || v === 'on' || v === 'visible') {
+            hudVisibleResult = true;
+          }
+        }
+
+        const rawHideHud = getInsensitive('hideHud') ?? getInsensitive('hide_hud');
+        if (typeof rawHideHud === 'string') {
+          const v = rawHideHud.trim().toLowerCase();
+          if (v === '1' || v === 'true' || v === 'yes' || v === 'on') {
+            hudVisibleResult = false;
+          } else if (v === '0' || v === 'false' || v === 'no' || v === 'off') {
+            hudVisibleResult = true;
+          }
+        }
+
+        inputScript = sanitizeScriptedInputPreset(getInsensitive('inputScript'));
+      } catch {
+        // Ignore malformed query strings cleanly.
+      }
+      return { hudVisible: hudVisibleResult, inputScript };
+    }
+
+    function applyHudVisibilityDom(visible) {
+      hudVisible = Boolean(visible);
+      if (!hudEl) return hudVisible;
+      const hidden = !hudVisible;
+      hudEl.hidden = hidden;
+      hudEl.setAttribute('aria-hidden', hidden ? 'true' : 'false');
+      hudEl.dataset.hudVisible = hudVisible ? 'true' : 'false';
+      if (hudEl.style) {
+        hudEl.style.display = hidden ? 'none' : '';
+      }
+      return hudVisible;
+    }
+
+    function setHudVisible(visible) {
+      const next = Boolean(visible);
+      applyHudVisibilityDom(next);
+      if (inSetHudVisible) {
+        return hudVisible;
+      }
+      inSetHudVisible = true;
+      try {
+        if (
+          activeHudController &&
+          typeof activeHudController.setVisible === 'function' &&
+          typeof activeHudController.isVisible === 'function' &&
+          activeHudController.isVisible() !== next
+        ) {
+          activeHudController.setVisible(next);
+        }
+      } finally {
+        inSetHudVisible = false;
+      }
+      return hudVisible;
+    }
+
+    function toggleHudVisible() {
+      if (activeHudController && typeof activeHudController.toggleVisible === 'function') {
+        return activeHudController.toggleVisible();
+      }
+      return setHudVisible(!hudVisible);
+    }
+
+    function updateScriptedInputDisplay(presetOrNull, opts = {}) {
+      const sanitized = sanitizeScriptedInputPreset(presetOrNull);
+      currentScriptedInputPreset = sanitized;
+      if (activeHudController && typeof activeHudController.setScriptedInputStatus === 'function') {
+        return activeHudController.setScriptedInputStatus(sanitized, {
+          updateHudStatus: false,
+          ...opts,
+        });
+      }
+      if (!scriptedInputBadgeEl) return sanitized;
+      if (sanitized) {
+        const label = `Scripted input: ${sanitized}`;
+        scriptedInputBadgeEl.hidden = false;
+        scriptedInputBadgeEl.setAttribute('aria-hidden', 'false');
+        scriptedInputBadgeEl.textContent = label;
+        scriptedInputBadgeEl.dataset.preset = sanitized;
+        scriptedInputBadgeEl.dataset.active = 'true';
+        scriptedInputBadgeEl.dataset.state = 'info';
+        scriptedInputBadgeEl.title = label;
+      } else {
+        scriptedInputBadgeEl.hidden = true;
+        scriptedInputBadgeEl.setAttribute('aria-hidden', 'true');
+        scriptedInputBadgeEl.textContent = '';
+        scriptedInputBadgeEl.dataset.preset = '';
+        scriptedInputBadgeEl.dataset.active = 'false';
+        scriptedInputBadgeEl.dataset.state = '';
+        scriptedInputBadgeEl.title = '';
+      }
+      return sanitized;
+    }
+
+    function toNonNegativeCount(value) {
+      if (value === undefined || value === null || value === '' || typeof value === 'boolean') {
+        return null;
+      }
+      const n = typeof value === 'number' ? value : Number(value);
+      return Number.isFinite(n) && n >= 0 ? Math.floor(n) : null;
+    }
+
+    function buildGpuBootTelemetryPayload(source) {
+      if (!source || typeof source !== 'object') return null;
+      const payload = {};
+      let hasAny = false;
+      for (let i = 0; i < GPU_BOOT_TELEMETRY_KEYS.length; i += 1) {
+        const key = GPU_BOOT_TELEMETRY_KEYS[i];
+        if (source[key] !== undefined) {
+          payload[key] = source[key];
+          hasAny = true;
+        }
+      }
+      if (!hasAny) return null;
+      if (payload.compat !== undefined && payload.compatStats === undefined) {
+        payload.compatStats = payload.compat;
+      }
+      if (payload.httpfs !== undefined && payload.httpfsStats === undefined) {
+        payload.httpfsStats = payload.httpfs;
+      }
+      return payload;
+    }
+
+    function updateDiagnosticsTelemetrySummary(source, panelState = null) {
+      const src = source && typeof source === 'object' ? source : {};
+      const state = panelState && typeof panelState === 'object' ? panelState : null;
+
+      // 1. Shader Hit Rate summary slot
+      if (metricEls.shaderHitRate && (src.fallbackStats !== undefined || state?.fallbackStats)) {
+        const fb = state?.fallbackStats || src.fallbackStats;
+        if (fb && typeof fb === 'object') {
+          const total = toNonNegativeCount(fb.totalLookups) ??
+            ((toNonNegativeCount(fb.packHits) ?? 0) +
+              (toNonNegativeCount(fb.fallbackHits) ?? 0) +
+              (toNonNegativeCount(fb.builtinHits) ?? 0));
+          const packHits = toNonNegativeCount(fb.packHits) ?? 0;
+          const rawPct = typeof fb.hitRatePct === 'number' && Number.isFinite(fb.hitRatePct)
+            ? Math.max(0, Math.min(100, fb.hitRatePct))
+            : total > 0
+              ? (packHits / total) * 100
+              : null;
+          if (rawPct !== null && (total > 0 || fb.hitRatePct !== undefined)) {
+            const pctText = `${rawPct.toFixed(1)}%`;
+            const display = total > 0 ? `${pctText} (${packHits}/${total})` : pctText;
+            const tone = rawPct >= 80 ? 'ok' : rawPct > 0 ? 'warn' : 'info';
+            setValue(metricEls.shaderHitRate, display, tone);
+          }
+        }
+      }
+
+      // 2. GPU Compat / Swapchain summary slot
+      const hasCompatInput =
+        src.compatStats !== undefined ||
+        src.gpuCompatStats !== undefined ||
+        src.compat !== undefined ||
+        src.gpu !== undefined ||
+        src.renderStateStats !== undefined ||
+        src.textureStats !== undefined ||
+        src.swapchainStats !== undefined ||
+        src.swapchain !== undefined ||
+        src.bindGroupKindMismatches !== undefined ||
+        src.autoLayoutFallbacks !== undefined ||
+        src.bc3dFallbacks !== undefined ||
+        src.bc3dFallbackUploadsSkipped !== undefined ||
+        src.swapchainFormat !== undefined ||
+        src.usesBlitFallback !== undefined ||
+        src.blitCount !== undefined;
+      if (metricEls.gpuCompat && hasCompatInput) {
+        const compatObj =
+          (state && state.compatStats) ||
+          (src.compatStats && typeof src.compatStats === 'object' ? src.compatStats : null) ||
+          (src.gpuCompatStats && typeof src.gpuCompatStats === 'object' ? src.gpuCompatStats : null) ||
+          (src.compat && typeof src.compat === 'object' ? src.compat : null) ||
+          (src.gpu && typeof src.gpu === 'object' ? src.gpu : null) ||
+          {};
+        const swapObj =
+          (src.swapchainStats && typeof src.swapchainStats === 'object' ? src.swapchainStats : null) ||
+          (src.swapchain && typeof src.swapchain === 'object' ? src.swapchain : null) ||
+          {};
+        const rsObj = src.renderStateStats && typeof src.renderStateStats === 'object' ? src.renderStateStats : {};
+        const texObj = src.textureStats && typeof src.textureStats === 'object' ? src.textureStats : {};
+
+        const rawFmt =
+          compatObj.swapchainFormat ??
+          src.swapchainFormat ??
+          swapObj.swapchainFormat ??
+          swapObj.streamFormat ??
+          swapObj.format ??
+          null;
+        const cleanFmt =
+          typeof rawFmt === 'string' && SAFE_SWAPCHAIN_FORMAT_RE.test(rawFmt.trim())
+            ? rawFmt.trim().toLowerCase()
+            : null;
+        const usesBlit = Boolean(compatObj.usesBlitFallback ?? src.usesBlitFallback ?? swapObj.usesBlitFallback);
+        const blitCount = toNonNegativeCount(compatObj.blitCount ?? src.blitCount ?? swapObj.blitCount) ?? 0;
+        const mismatches =
+          toNonNegativeCount(
+            compatObj.bindGroupKindMismatches ?? src.bindGroupKindMismatches ?? rsObj.bindGroupKindMismatches
+          ) ?? 0;
+        const autoLayout =
+          toNonNegativeCount(
+            compatObj.autoLayoutFallbacks ?? src.autoLayoutFallbacks ?? rsObj.autoLayoutFallbacks
+          ) ?? 0;
+        const bc3d =
+          toNonNegativeCount(compatObj.bc3dFallbacks ?? src.bc3dFallbacks ?? texObj.bc3dFallbacks) ?? 0;
+        const totalFallbacks = mismatches + autoLayout + bc3d;
+
+        const parts = [];
+        if (cleanFmt) parts.push(cleanFmt);
+        if (usesBlit || blitCount > 0) {
+          parts.push(usesBlit ? `Blit (${blitCount})` : `Direct (${blitCount})`);
+        } else if (cleanFmt) {
+          parts.push('Direct');
+        }
+        if (totalFallbacks > 0) {
+          parts.push(`${totalFallbacks} fb`);
+        } else if (parts.length === 0) {
+          parts.push('0 fb');
+        }
+        const tone = mismatches > 0 || usesBlit || bc3d > 0 ? 'warn' : 'ok';
+        setValue(metricEls.gpuCompat, parts.join(' · '), tone);
+      }
+
+      // 3. HTTPFS / Cache summary slot
+      const hasIoInput =
+        src.ioStats !== undefined ||
+        src.httpfsStats !== undefined ||
+        src.httpfs !== undefined ||
+        src.io !== undefined ||
+        src.pgimFullFetches !== undefined ||
+        src.slabCacheHits !== undefined ||
+        src.slabCacheMisses !== undefined ||
+        src.syncFastPathHits !== undefined;
+      if (metricEls.httpfsSummary && hasIoInput) {
+        const ioObj =
+          (state && state.ioStats) ||
+          (src.ioStats && typeof src.ioStats === 'object' ? src.ioStats : null) ||
+          (src.httpfsStats && typeof src.httpfsStats === 'object' ? src.httpfsStats : null) ||
+          (src.httpfs && typeof src.httpfs === 'object' ? src.httpfs : null) ||
+          (src.io && typeof src.io === 'object' ? src.io : null) ||
+          {};
+        const pgim = toNonNegativeCount(ioObj.pgimFullFetches ?? src.pgimFullFetches) ?? 0;
+        const slabHits = toNonNegativeCount(ioObj.slabCacheHits ?? src.slabCacheHits) ?? 0;
+        const slabMisses = toNonNegativeCount(ioObj.slabCacheMisses ?? src.slabCacheMisses) ?? 0;
+        const syncFast = toNonNegativeCount(ioObj.syncFastPathHits ?? src.syncFastPathHits) ?? 0;
+        const summaryText = `PGIM ${pgim} · Slab ${slabHits}/${slabHits + slabMisses} · Fast ${syncFast}`;
+        const tone = slabHits > 0 || syncFast > 0 || pgim > 0 ? 'ok' : 'info';
+        setValue(metricEls.httpfsSummary, summaryText, tone);
+      }
+    }
+
+    function forwardGpuBootTelemetry(source) {
+      const gpuBootPayload = buildGpuBootTelemetryPayload(source);
+      if (!gpuBootPayload) return null;
+      let panelState = null;
+      if (activeHudController && typeof activeHudController.updateGpuBootTelemetry === 'function') {
+        panelState = activeHudController.updateGpuBootTelemetry(gpuBootPayload);
+        syncValidationPillTooltip(activeHudController.getValidationSummary());
+      } else if (
+        window.playgta6GpuBootPanel &&
+        typeof window.playgta6GpuBootPanel.update === 'function'
+      ) {
+        panelState = window.playgta6GpuBootPanel.update(gpuBootPayload);
+      }
+      updateDiagnosticsTelemetrySummary(gpuBootPayload, panelState);
+      return panelState;
+    }
 
     function syncValidationPillTooltip(summary) {
       if (!gpuValidationErrorsEl || !summary || typeof summary !== 'object') return;
@@ -630,6 +1019,10 @@
         });
       }
 
+      if (metrics.scriptedInputPreset !== undefined || metrics.inputScript !== undefined) {
+        updateScriptedInputDisplay(metrics.scriptedInputPreset ?? metrics.inputScript);
+      }
+
       if (Array.isArray(metrics.validationErrors) && activeHudController) {
         const summary = activeHudController.setValidationErrors(metrics.validationErrors, {
           totalCount: metrics.validationErrorCount,
@@ -639,21 +1032,7 @@
         recordGpuValidationErrorDisplay(metrics.validationError);
       }
 
-      if (
-        activeHudController &&
-        (metrics.bootSummary !== undefined ||
-          metrics.missingShaders !== undefined ||
-          metrics.fallbackStats !== undefined ||
-          metrics.frameStats !== undefined)
-      ) {
-        activeHudController.updateGpuBootTelemetry({
-          bootSummary: metrics.bootSummary,
-          missingShaders: metrics.missingShaders,
-          fallbackStats: metrics.fallbackStats,
-          frameStats: metrics.frameStats,
-        });
-        syncValidationPillTooltip(activeHudController.getValidationSummary());
-      }
+      forwardGpuBootTelemetry(metrics);
     }
 
     function downloadJsonFile(filename, data) {
@@ -742,12 +1121,23 @@
     }
 
     let activeHudController = null;
+    const initialHudQuery = parseHudQueryOptions();
+    applyHudVisibilityDom(initialHudQuery.hudVisible);
+    if (initialHudQuery.inputScript) {
+      updateScriptedInputDisplay(initialHudQuery.inputScript);
+    }
+
     const hudApi = {
       setStatus,
       appendLog,
       updateMetrics,
       refreshServerStatus,
       setCollapsed,
+      isVisible: () => (activeHudController ? activeHudController.isVisible() : hudVisible),
+      setVisible: setHudVisible,
+      toggleVisible: toggleHudVisible,
+      setScriptedInputStatus: updateScriptedInputDisplay,
+      updateGpuBootTelemetry: forwardGpuBootTelemetry,
       setBootMode: updateBootModeDisplay,
       updateBootStatus: updateBootStatusDisplay,
       setSideModules: updateSideModuleDisplay,
@@ -777,8 +1167,23 @@
 
     window.addEventListener('keydown', (ev) => {
       if (ev.code === 'F9') {
+        if (ev.repeat || isEditableEventTarget(ev.target)) return;
         ev.preventDefault();
         setCollapsed(!hudEl.classList.contains('collapsed'));
+        return;
+      }
+      if (
+        !activeHudController &&
+        !ev.defaultPrevented &&
+        !ev.repeat &&
+        !ev.ctrlKey &&
+        !ev.altKey &&
+        !ev.metaKey &&
+        (ev.code === 'F3' || ev.key === 'F3') &&
+        !isEditableEventTarget(ev.target)
+      ) {
+        ev.preventDefault();
+        toggleHudVisible();
       }
     });
 
@@ -979,6 +1384,9 @@
         },
       };
 
+      const initialScriptedInputPreset =
+        app.bootUrlOptions?.inputScript ?? currentScriptedInputPreset ?? initialHudQuery.inputScript;
+
       hudController = new HudController({
         app,
         sessionController: app.session,
@@ -989,7 +1397,14 @@
         inputProfiles: app.inputProfiles,
         gpuBootPanel,
         hud: hudApi,
+        visible: hudVisible,
+        scriptedInputPreset: initialScriptedInputPreset,
+        enableToggleShortcut: true,
+        toggleShortcutTarget: window,
+        toggleShortcutKey: 'F3',
         displayElements: {
+          hudRootEl: hudEl,
+          scriptedInputBadge: scriptedInputBadgeEl,
           bootModeBadge: bootModeBadgeEl,
           sideModuleStatusEl,
           validationCountEl: gpuValidationErrorsEl,
@@ -1035,7 +1450,14 @@
         if (app.bootTracer && typeof app.bootTracer.getSummary === 'function') {
           const summary = app.bootTracer.getSummary();
           updateBootProgress(summary);
-          hudController.updateGpuBootTelemetry({ bootSummary: summary });
+          forwardGpuBootTelemetry({ bootSummary: summary });
+        }
+        const activeScript =
+          (typeof app.getBootTelemetry === 'function' ? app.getBootTelemetry()?.inputScript : null) ??
+          app.bootUrlOptions?.inputScript ??
+          null;
+        if (activeScript !== hudController.getScriptedInputStatus()) {
+          hudController.setScriptedInputStatus(activeScript, { updateHudStatus: false });
         }
         syncBootDiagnosticDisplay();
       };
@@ -1069,12 +1491,16 @@
         appendLog('WebGPU is unavailable in this browser.', 'error');
       } else {
         setStatus('Booting runtime...', 'info');
-        app.start().catch((err) => {
-          bootCompleted = true;
-          window.clearInterval(elapsedTimer);
-          setStatus('Startup error', 'error');
-          appendLog(`Runtime startup failed: ${err?.message || err}`, 'error');
-        });
+        app.start()
+          .then(() => {
+            syncControlStates();
+          })
+          .catch((err) => {
+            bootCompleted = true;
+            window.clearInterval(elapsedTimer);
+            setStatus('Startup error', 'error');
+            appendLog(`Runtime startup failed: ${err?.message || err}`, 'error');
+          });
       }
     }
   </script>

@@ -12,9 +12,13 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
-import { HudController, BOOT_MODE } from '../web/ui/hud_controller.js';
+import { HudController, BOOT_MODE, DEFAULT_TOGGLE_KEY } from '../web/ui/hud_controller.js';
+
+const require = createRequire(import.meta.url);
+const { GpuBootPanelController } = require('../web/ui/gpu_boot_panel.js');
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
@@ -448,4 +452,328 @@ test('W76 HUD defaults to 4 clean visible sections with Diagnostics & Tools coll
       `Secondary diagnostic element id="${id}" must be tucked inside collapsed #hud-diagnostics-disclosure`
     );
   }
+});
+
+test('W145 web/index.html defines scripted-input badge, F3/?hud=0 visibility hooks, and Diagnostics & Tools telemetry summary slots', () => {
+  const hudStart = indexHtml.indexOf('<div id="hud"');
+  const scriptStart = indexHtml.indexOf('<script src="./runtime/pgim_preloader.js">');
+  assert.ok(hudStart !== -1 && scriptStart > hudStart, 'Expected #hud container before scripts');
+  const hudMarkup = indexHtml.slice(hudStart, scriptStart);
+
+  // Clean [hidden] guard for #hud and #scripted-input-badge.
+  assert.match(indexHtml, /#hud\[hidden\][\s\S]*display:\s*none\s*!important/);
+  assert.match(indexHtml, /#scripted-input-badge\[hidden\][\s\S]*display:\s*none\s*!important/);
+  assert.match(indexHtml, /<div\s+id="hud"[^>]*data-hud-visible="true"/);
+
+  // Scripted-input badge starts hidden and accessible inside #hud.
+  const scriptBadge = extractElementById(hudMarkup, 'scripted-input-badge');
+  assert.ok(scriptBadge, '#scripted-input-badge must be nested inside #hud');
+  assert.equal(scriptBadge.attrs['data-active'], 'false');
+  assert.equal(scriptBadge.attrs['data-preset'], '');
+  assert.equal(scriptBadge.attrs.role, 'status');
+  assert.equal(scriptBadge.attrs['aria-live'], 'polite');
+  assert.equal(scriptBadge.attrs['aria-hidden'], 'true');
+  assert.match(scriptBadge.raw, /\bhidden\b/);
+  assert.equal(scriptBadge.innerText, '');
+
+  // GPU compat, HTTPFS/cache, and shader hit-rate summary slots live inside collapsed Diagnostics & Tools and default to '-'.
+  const diagBlock = extractTagBlock(
+    indexHtml,
+    /<details\s+id="hud-diagnostics-disclosure"[^>]*>/,
+    '</details>'
+  );
+  for (const id of ['metric-shader-hit-rate', 'metric-gpu-compat', 'metric-httpfs-summary']) {
+    const slot = extractElementById(diagBlock, id);
+    assert.ok(slot, `#${id} must be tucked inside collapsed #hud-diagnostics-disclosure`);
+    assert.equal(slot.innerText, '-', `#${id} must default gracefully to '-' before telemetry arrives`);
+  }
+
+  // Inline module wires F3 shortcut, ?hud=0 / ?hideHud=1, scriptedInputBadge, and W114 compat/swapchain/httpfs forwarding.
+  const moduleScript = extractModuleScript(indexHtml);
+  assert.match(moduleScript, /getElementById\(\s*['"]scripted-input-badge['"]\s*\)/);
+  assert.match(moduleScript, /getElementById\(\s*['"]metric-shader-hit-rate['"]\s*\)/);
+  assert.match(moduleScript, /getElementById\(\s*['"]metric-gpu-compat['"]\s*\)/);
+  assert.match(moduleScript, /getElementById\(\s*['"]metric-httpfs-summary['"]\s*\)/);
+  assert.match(moduleScript, /enableToggleShortcut:\s*true/);
+  assert.match(moduleScript, /toggleShortcutKey:\s*['"]F3['"]/);
+  assert.match(moduleScript, /hudRootEl:\s*hudEl/);
+  assert.match(moduleScript, /scriptedInputBadge:\s*scriptedInputBadgeEl/);
+  assert.match(moduleScript, /\bisVisible\b/);
+  assert.match(moduleScript, /\bsetVisible\b/);
+  assert.match(moduleScript, /\btoggleVisible\b/);
+  assert.match(moduleScript, /\bsetScriptedInputStatus\b/);
+  assert.match(moduleScript, /\bupdateGpuBootTelemetry\b/);
+  assert.match(moduleScript, /\bcompatStats\b/);
+  assert.match(moduleScript, /\bswapchain\b/);
+  assert.match(moduleScript, /\bhttpfsStats\b/);
+});
+
+test('W145 inline helpers parse ?hud=0 / ?hideHud=1 / ?inputScript, guard editable targets, and normalize GPU compat/HTTPFS payloads', () => {
+  const moduleScript = extractModuleScript(indexHtml);
+
+  const helperSliceMatch =
+    /const SCRIPTED_INPUT_PRESET_RE[\s\S]*?function buildGpuBootTelemetryPayload\([\s\S]*?\r?\n    \}/.exec(
+      moduleScript
+    );
+  assert.ok(helperSliceMatch, 'Expected W145 helper block in web/index.html inline script');
+
+  const factory = new Function(
+    `${helperSliceMatch[0]}\nreturn { parseHudQueryOptions, isEditableEventTarget, buildGpuBootTelemetryPayload, sanitizeScriptedInputPreset };`
+  );
+  const {
+    parseHudQueryOptions,
+    isEditableEventTarget,
+    buildGpuBootTelemetryPayload,
+  } = factory();
+
+  // 1. Clean capture URL flags (?hud=0, ?hideHud=1, case-insensitive) and ?inputScript=<name>.
+  assert.deepEqual(parseHudQueryOptions(''), { hudVisible: true, inputScript: null });
+  assert.deepEqual(parseHudQueryOptions('?hud=0'), { hudVisible: false, inputScript: null });
+  assert.deepEqual(parseHudQueryOptions('?HUD=false'), { hudVisible: false, inputScript: null });
+  assert.deepEqual(parseHudQueryOptions('?hud=off'), { hudVisible: false, inputScript: null });
+  assert.deepEqual(parseHudQueryOptions('?hud=hidden'), { hudVisible: false, inputScript: null });
+  assert.deepEqual(parseHudQueryOptions('?hideHud=1'), { hudVisible: false, inputScript: null });
+  assert.deepEqual(parseHudQueryOptions('?hide_hud=true'), { hudVisible: false, inputScript: null });
+  assert.deepEqual(parseHudQueryOptions('?hud=1'), { hudVisible: true, inputScript: null });
+  assert.deepEqual(parseHudQueryOptions('?hud=0&inputScript=start-screen'), {
+    hudVisible: false,
+    inputScript: 'start-screen',
+  });
+  assert.deepEqual(parseHudQueryOptions('?inputScript=menu-flow'), {
+    hudVisible: true,
+    inputScript: 'menu-flow',
+  });
+  // Reject path-traversal / script injection in ?inputScript.
+  assert.deepEqual(parseHudQueryOptions('?inputScript=../../secret'), {
+    hudVisible: true,
+    inputScript: null,
+  });
+  assert.deepEqual(parseHudQueryOptions('?inputScript=<script>alert(1)</script>'), {
+    hudVisible: true,
+    inputScript: null,
+  });
+
+  // 2. Editable target guard for F3/F9 keyboard shortcuts.
+  assert.equal(isEditableEventTarget({ tagName: 'INPUT' }), true);
+  assert.equal(isEditableEventTarget({ tagName: 'textarea' }), true);
+  assert.equal(isEditableEventTarget({ tagName: 'SELECT' }), true);
+  assert.equal(isEditableEventTarget({ tagName: 'DIV', isContentEditable: true }), true);
+  assert.equal(
+    isEditableEventTarget({
+      tagName: 'DIV',
+      getAttribute: (name) => (name === 'contenteditable' ? 'true' : null),
+    }),
+    true
+  );
+  assert.equal(isEditableEventTarget({ tagName: 'CANVAS' }), false);
+  assert.equal(isEditableEventTarget({ tagName: 'BODY' }), false);
+  assert.equal(isEditableEventTarget(null), false);
+
+  // 3. Telemetry forwarding payload normalization (compat -> compatStats, httpfs -> httpfsStats).
+  assert.equal(buildGpuBootTelemetryPayload({ fps: 60, gpuPackets: 10 }), null);
+  const normalized = buildGpuBootTelemetryPayload({
+    compat: { bindGroupKindMismatches: 2, autoLayoutFallbacks: 1, bc3dFallbacks: 3 },
+    swapchain: { format: 'bgra8unorm', usesBlitFallback: true, blitCount: 4 },
+    httpfs: { pgimFullFetches: 1, slabCacheHits: 12, slabCacheMisses: 2, syncFastPathHits: 7 },
+    fallbackStats: { totalLookups: 20, packHits: 17, fallbackHits: 3, builtinHits: 0 },
+  });
+  assert.ok(normalized);
+  assert.deepEqual(normalized.compatStats, {
+    bindGroupKindMismatches: 2,
+    autoLayoutFallbacks: 1,
+    bc3dFallbacks: 3,
+  });
+  assert.deepEqual(normalized.swapchain, {
+    format: 'bgra8unorm',
+    usesBlitFallback: true,
+    blitCount: 4,
+  });
+  assert.deepEqual(normalized.httpfsStats, {
+    pgimFullFetches: 1,
+    slabCacheHits: 12,
+    slabCacheMisses: 2,
+    syncFastPathHits: 7,
+  });
+  assert.equal(normalized.fallbackStats.packHits, 17);
+});
+
+test('W145 integration: F3 toggle, ?hud=0 clean capture, scripted-input badge, and compat/swapchain/httpfs forwarding into GpuBootPanelController', () => {
+  const hudRootEl = createMockDisplayElement({
+    dataset: { hudVisible: 'true' },
+  });
+  const scriptedInputBadge = createMockDisplayElement({
+    hidden: true,
+    dataset: { active: 'false', preset: '' },
+  });
+
+  const listeners = new Map();
+  const keyTarget = {
+    addEventListener(type, fn) {
+      if (!listeners.has(type)) listeners.set(type, new Set());
+      listeners.get(type).add(fn);
+    },
+    removeEventListener(type, fn) {
+      listeners.get(type)?.delete(fn);
+    },
+    dispatch(type, event) {
+      for (const fn of [...(listeners.get(type) || [])]) {
+        fn(event);
+      }
+    },
+    listenerCount(type) {
+      return listeners.get(type)?.size ?? 0;
+    },
+  };
+
+  function makePanelEl(tagName = 'DIV') {
+    const attrs = new Map();
+    const el = {
+      tagName: tagName.toUpperCase(),
+      className: '',
+      textContent: '',
+      hidden: false,
+      style: {},
+      children: [],
+      parentNode: null,
+      setAttribute(k, v) {
+        attrs.set(k, String(v));
+      },
+      getAttribute(k) {
+        return attrs.has(k) ? attrs.get(k) : null;
+      },
+      appendChild(child) {
+        if (child && typeof child === 'object') child.parentNode = el;
+        el.children.push(child);
+        return child;
+      },
+      removeChild(child) {
+        const idx = el.children.indexOf(child);
+        if (idx !== -1) el.children.splice(idx, 1);
+        if (child && typeof child === 'object') child.parentNode = null;
+        return child;
+      },
+      addEventListener() {},
+      removeEventListener() {},
+    };
+    return el;
+  }
+
+  const panelRoot = makePanelEl('DIV');
+  const panelDoc = {
+    head: makePanelEl('HEAD'),
+    body: makePanelEl('BODY'),
+    createElement: (tag) => makePanelEl(tag),
+    querySelector: () => null,
+  };
+
+  const gpuBootPanel = new GpuBootPanelController({
+    container: panelRoot,
+    documentObj: panelDoc,
+    collapsed: true,
+    now: () => 1700000000000,
+  });
+
+  // Start hidden as in `?hud=0&inputScript=menu-flow`.
+  const controller = new HudController({
+    gpuBootPanel,
+    visible: false,
+    scriptedInputPreset: 'menu-flow',
+    enableToggleShortcut: true,
+    toggleShortcutTarget: keyTarget,
+    toggleShortcutKey: DEFAULT_TOGGLE_KEY,
+    displayElements: {
+      hudRootEl,
+      scriptedInputBadge,
+    },
+  });
+
+  // Initial `?hud=0` state hides HUD cleanly while scripted-input badge is populated.
+  assert.equal(controller.isVisible(), false);
+  assert.equal(hudRootEl.hidden, true);
+  assert.equal(hudRootEl.getAttribute('aria-hidden'), 'true');
+  assert.equal(hudRootEl.dataset.hudVisible, 'false');
+  assert.equal(scriptedInputBadge.hidden, false);
+  assert.equal(scriptedInputBadge.textContent, 'Scripted input: menu-flow');
+  assert.equal(scriptedInputBadge.dataset.active, 'true');
+  assert.equal(scriptedInputBadge.dataset.preset, 'menu-flow');
+
+  // F3 repeat and text inputs must be ignored.
+  let prevented = false;
+  keyTarget.dispatch('keydown', {
+    key: 'F3',
+    code: 'F3',
+    repeat: true,
+    target: { tagName: 'BODY' },
+    preventDefault() {
+      prevented = true;
+    },
+  });
+  assert.equal(controller.isVisible(), false);
+  assert.equal(prevented, false);
+
+  keyTarget.dispatch('keydown', {
+    key: 'F3',
+    code: 'F3',
+    repeat: false,
+    target: { tagName: 'INPUT' },
+    preventDefault() {
+      prevented = true;
+    },
+  });
+  assert.equal(controller.isVisible(), false);
+  assert.equal(prevented, false);
+
+  // Clean F3 press shows the HUD, second F3 press hides it again.
+  keyTarget.dispatch('keydown', {
+    key: 'F3',
+    code: 'F3',
+    repeat: false,
+    target: { tagName: 'CANVAS' },
+    preventDefault() {
+      prevented = true;
+    },
+  });
+  assert.equal(prevented, true);
+  assert.equal(controller.isVisible(), true);
+  assert.equal(hudRootEl.hidden, false);
+  assert.equal(hudRootEl.dataset.hudVisible, 'true');
+
+  keyTarget.dispatch('keydown', {
+    key: 'F3',
+    code: 'F3',
+    repeat: false,
+    target: { tagName: 'CANVAS' },
+    preventDefault() {},
+  });
+  assert.equal(controller.isVisible(), false);
+  assert.equal(hudRootEl.hidden, true);
+
+  // Clearing scripted input hides the badge cleanly.
+  controller.setScriptedInputStatus(null, { updateHudStatus: false });
+  assert.equal(scriptedInputBadge.hidden, true);
+  assert.equal(scriptedInputBadge.dataset.active, 'false');
+
+  // Forwarding compat, swapchain, httpfs, and fallbackStats updates GpuBootPanelController state.
+  const panelState = controller.updateGpuBootTelemetry({
+    compatStats: { bindGroupKindMismatches: 1, autoLayoutFallbacks: 2, bc3dFallbacks: 1 },
+    swapchain: { format: 'bgra8unorm', usesBlitFallback: true, blitCount: 5 },
+    httpfsStats: { pgimFullFetches: 1, slabCacheHits: 18, slabCacheMisses: 2, syncFastPathHits: 9 },
+    fallbackStats: { totalLookups: 10, packHits: 9, fallbackHits: 1, builtinHits: 0 },
+  });
+  assert.ok(panelState);
+  assert.equal(panelState.compatStats.bindGroupKindMismatches, 1);
+  assert.equal(panelState.compatStats.autoLayoutFallbacks, 2);
+  assert.equal(panelState.compatStats.bc3dFallbacks, 1);
+  assert.equal(panelState.compatStats.swapchainFormat, 'bgra8unorm');
+  assert.equal(panelState.compatStats.usesBlitFallback, true);
+  assert.equal(panelState.compatStats.blitCount, 5);
+  assert.equal(panelState.ioStats.pgimFullFetches, 1);
+  assert.equal(panelState.ioStats.slabCacheHits, 18);
+  assert.equal(panelState.ioStats.slabCacheMisses, 2);
+  assert.equal(panelState.ioStats.syncFastPathHits, 9);
+  assert.equal(panelState.hitRateText, '90.0%');
+
+  controller.destroy();
+  gpuBootPanel.destroy();
+  assert.equal(keyTarget.listenerCount('keydown'), 0);
 });
