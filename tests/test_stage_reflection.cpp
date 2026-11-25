@@ -643,6 +643,89 @@ void test_cbv_indexed_heap_sources() {
     CHECK(report.find("no root parameter starts at s12") != std::string::npos);
 }
 
+// G62 (#482): lane-indexed heap windows (VGPR / waterfall bindless) parse and validate, and the
+// join refuses them with their own, counted reason until the bridge can bind descriptor arrays.
+void test_lane_indexed_heap_sources() {
+    const char* doc = R"({
+  "schema": "playgta6-stage-reflection", "version": 1,
+  "stages": {
+    "0x00000000000000c5": {
+      "stage": "fragment",
+      "bindings": [
+        {"group": 0, "binding": 0, "kind": "texture",
+         "source": {"lane_indexed_resource_heap": {"max_count": 64, "shift": 5, "stride": 32}}},
+        {"group": 0, "binding": 1, "kind": "sampler",
+         "source": {"lane_indexed_sampler_heap": {"max_count": 16, "shift": 4,
+                    "window_base": {"cbv": {"user_sgpr": 11, "root_descriptor": true}, "byte_offset": 8,
+                                    "bit_offset": 8, "mask": 255}}}}
+      ]
+    }
+  }
+})";
+    StageReflectionIndex index;
+    std::string error;
+    CHECK(parse_stage_reflection_json(doc, &index, &error));
+    const StageReflection& ps = index.at(0xc5);
+    CHECK(ps.bindings.size() == 2);
+    const ReflectedBinding& b0 = ps.bindings[0];
+    CHECK(b0.source == ReflectedSource::LaneIndexedResourceHeap && b0.lane_max_count == 64 && b0.heap_shift == 5 &&
+          b0.heap_stride == 32 && !b0.lane_has_window_base);
+    const ReflectedBinding& b1 = ps.bindings[1];
+    CHECK(b1.source == ReflectedSource::LaneIndexedSamplerHeap && b1.lane_max_count == 16 && b1.heap_shift == 4 &&
+          b1.lane_has_window_base && b1.cbv == ReflectedCbv::RootDescriptor && b1.user_sgpr == 11 &&
+          b1.cb_byte_offset == 8 && b1.cb_bit_offset == 8 && b1.cb_mask == 255);
+
+    // Malformed: no max_count, zero or oversized window, shift out of range, bad window base.
+    for (const char* src :
+         {R"({"lane_indexed_resource_heap": {"shift": 5}})",
+          R"({"lane_indexed_resource_heap": {"max_count": 0, "shift": 5}})",
+          R"({"lane_indexed_resource_heap": {"max_count": 257, "shift": 5}})",
+          R"({"lane_indexed_resource_heap": {"max_count": 8, "shift": 32}})",
+          R"({"lane_indexed_resource_heap": {"max_count": 8, "shift": 5, "window_base": {"byte_offset": 0}}})",
+          R"({"lane_indexed_resource_heap": {"max_count": 8, "shift": 5, "window_base": {"cbv": {"user_sgpr": 11, "root_descriptor": true}, "byte_offset": 6}}})",
+          R"({"lane_indexed_resource_heap": 3})"}) {
+        const std::string bad_doc = std::string(R"({"schema": "playgta6-stage-reflection", "version": 1, "stages": {"0x1": {"stage": "fragment", "bindings": [{"group": 0, "binding": 0, "kind": "texture", "source": )") +
+                                    src + "}]}}}";
+        StageReflectionIndex bad;
+        error.clear();
+        CHECK(!parse_stage_reflection_json(bad_doc, &bad, &error));
+        CHECK(error.find("lane_indexed_resource_heap needs") != std::string::npos);
+    }
+
+    // Well formed: the join fails with the lane-indexed reason and counts both bindings.
+    const d3d::RootSignatureDesc rs = ui_root_signature();
+    bridge::PipelineLayoutDesc layout;
+    std::string report;
+    JoinStats stats;
+    CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &ps}}, &layout, &report, &stats));
+    CHECK(stats.lane_indexed_bindings == 2 && stats.table_slots_outside_rs == 0);
+    CHECK(report.find("lane-indexed heap window of 64 descriptors needs a binding array") != std::string::npos);
+    CHECK(report.find("lane-indexed heap window of 16 descriptors") != std::string::npos);
+    CHECK(report.find("resource heap[(0 + lane) << 5] x 64") != std::string::npos);
+    CHECK(report.find("sampler heap[(cb(root CBV at s11)[8] + lane) << 4] x 16") != std::string::npos);
+
+    // Malformed joins are not counted as lane-indexed: wrong heap for the kind, a window base that is
+    // not a root CBV.
+    StageReflection wrong = ps;
+    wrong.bindings[0].source = ReflectedSource::LaneIndexedSamplerHeap;
+    wrong.bindings[1].user_sgpr = 9;  // root constants, not a root CBV
+    report.clear();
+    JoinStats wrong_stats;
+    CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &wrong}}, &layout, &report, &wrong_stats));
+    CHECK(wrong_stats.lane_indexed_bindings == 0);
+    CHECK(report.find("cannot come from the sampler heap") != std::string::npos);
+    CHECK(report.find("window base: root parameter 1 is not a root CBV") != std::string::npos);
+
+    // A stage without lane-indexed bindings joined next to one with them still fails the whole join.
+    StageReflection vs;
+    vs.stage = ReflectedStage::Vertex;
+    report.clear();
+    JoinStats mixed;
+    CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Vertex, &vs}, {GpuShaderStageBits::Fragment, &ps}},
+                                &layout, &report, &mixed));
+    CHECK(mixed.lane_indexed_bindings == 2);
+}
+
 int main() {
     test_parse();
     test_user_data_rule();
@@ -651,6 +734,7 @@ int main() {
     test_plan_direct_slot();
     test_heap_sources();
     test_cbv_indexed_heap_sources();
+    test_lane_indexed_heap_sources();
     test_inline_sampler();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_stage_reflection: %d failure(s)\n", g_failures);
