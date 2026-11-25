@@ -24,6 +24,7 @@ const {
   TEXTURE_COMPRESSION_BC_FEATURE,
   BUFFER_ALIGNMENT_BYTES,
   UNIFORM_BUFFER_MIN_BYTES,
+  DEFAULT_FAST_SLOT_CAPACITY,
   isBcFormat,
   deviceSupportsBc,
   computeMaxMipLevels,
@@ -882,6 +883,349 @@ test('ResourceTable resetStats() preserves live handles with peak=currentLive an
   assert.equal(afterClearReset.totalInserts, 0);
   assert.equal(afterClearReset.totalDeletes, 0);
   assert.equal(afterClearReset.destroyCount, 0);
+
+  for (const [k, v] of Object.entries(afterClearReset)) {
+    assert.equal(typeof v, 'number', `stat ${k} must be numeric`);
+    assert.ok(Number.isFinite(v), `stat ${k} must be finite`);
+  }
+});
+
+test('ResourceTable fast descriptor slot cache elides no-op writes and increments versions monotonically on real changes (W207)', () => {
+  const { device } = createMockDevice();
+  const table = new ResourceTable(device);
+
+  assert.equal(DEFAULT_FAST_SLOT_CAPACITY, 1024);
+  assert.equal(table.tableVersion, 0);
+  assert.equal(table.getTableVersion(), 0);
+  assert.equal(table.getSlotVersion(0), 0);
+  assert.equal(table.hasSlot(0), false);
+  assert.equal(table.getSlot(0), undefined);
+
+  const buf1 = table.createBuffer(1, { size: 256, usage: GPU_BUFFER_USAGE.UNIFORM });
+  const buf2 = table.createBuffer(2, { size: 256, usage: GPU_BUFFER_USAGE.UNIFORM });
+  table.createTexture(10, { size: { width: 64, height: 64 }, mipLevelCount: 4, format: 'rgba8unorm' });
+  // Creating resources that are not referenced by any slot must NOT bump tableVersion.
+  assert.equal(table.tableVersion, 0);
+
+  // Initial write to slot 0 increments slot version and tableVersion.
+  assert.equal(table.setSlot(0, { kind: 'buffer', handle: 1, offset: 0, size: 64 }), true);
+  assert.equal(table.hasSlot(0), true);
+  assert.equal(table.getSlotVersion(0), 1);
+  assert.equal(table.tableVersion, 1);
+
+  // Identical overwrite (including default offset omission) is elided as a no-op.
+  assert.equal(table.setSlot(0, { kind: 'buffer', handle: 1, offset: 0, size: 64 }), false);
+  assert.equal(table.setSlot(0, { kind: 'buffer', handle: 1, size: 64 }), false);
+  assert.equal(table.setSlot(0, 1, { kind: 'buffer', offset: 0, size: 64 }), false);
+  assert.equal(table.getSlotVersion(0), 1);
+  assert.equal(table.tableVersion, 1);
+
+  let stats = table.getStats();
+  assert.equal(stats.slotWrites, 1);
+  assert.equal(stats.elidedNoOpWrites, 3);
+  assert.equal(stats.tableVersion, 1);
+  assert.equal(stats.activeSlots, 1);
+
+  // Real view-param change (offset 0 -> 64) increments both versions.
+  assert.equal(table.setSlot(0, { kind: 'buffer', handle: 1, offset: 64, size: 64 }), true);
+  assert.equal(table.getSlotVersion(0), 2);
+  assert.equal(table.tableVersion, 2);
+
+  // Real handle change (1 -> 2) increments both versions.
+  assert.equal(table.setSlot(0, { kind: 'buffer', handle: 2, offset: 64, size: 64 }), true);
+  assert.equal(table.getSlotVersion(0), 3);
+  assert.equal(table.tableVersion, 3);
+
+  // Real kind change on same numeric id increments both versions.
+  assert.equal(table.setSlot(0, { kind: 'texture', handle: 2 }), true);
+  assert.equal(table.getSlotVersion(0), 4);
+  assert.equal(table.tableVersion, 4);
+
+  // Texture view-param normalization: case-insensitive format + flat vs nested viewParams + key order.
+  assert.equal(
+    table.setSlot(1, {
+      kind: 'texture',
+      handle: 10,
+      format: 'RGBA8Unorm',
+      dimension: '2D',
+      aspect: 'ALL',
+      baseMipLevel: 1,
+      mipLevelCount: 2,
+      viewParams: { swizzleR: 'r', swizzleG: 'g' },
+    }),
+    true
+  );
+  assert.equal(table.getSlotVersion(1), 1);
+  assert.equal(table.tableVersion, 5);
+
+  // Equivalent descriptor with flat/nested representation & reversed extra key order -> elided.
+  assert.equal(
+    table.setSlot(1, {
+      kind: 'texture',
+      handle: 10,
+      view: {
+        format: 'rgba8unorm',
+        dimension: '2d',
+        aspect: 'all',
+        baseMipLevel: 1,
+        mipLevelCount: 2,
+        swizzleG: 'g',
+        swizzleR: 'r',
+      },
+    }),
+    false
+  );
+  assert.equal(table.getSlotVersion(1), 1);
+  assert.equal(table.tableVersion, 5);
+
+  // Mutating an extra viewParam triggers a real version bump.
+  assert.equal(
+    table.setSlot(1, {
+      kind: 'texture',
+      handle: 10,
+      format: 'rgba8unorm',
+      dimension: '2d',
+      aspect: 'all',
+      baseMipLevel: 1,
+      mipLevelCount: 2,
+      viewParams: { swizzleR: 'b', swizzleG: 'g' },
+    }),
+    true
+  );
+  assert.equal(table.getSlotVersion(1), 2);
+  assert.equal(table.tableVersion, 6);
+
+  // Direct GPU resource reference equality & elision.
+  assert.equal(table.setSlot(2, buf1, { offset: 0, size: 128 }), true);
+  assert.equal(table.setSlot(2, buf1, { offset: 0, size: 128 }), false);
+  assert.equal(table.setSlot(2, buf2, { offset: 0, size: 128 }), true);
+  assert.equal(table.resolveSlot(2), buf2);
+
+  // Unbinding an already-empty slot via setSlot(idx, null) is elided; unbinding occupied slot mutates.
+  assert.equal(table.setSlot(99, null), false);
+  assert.equal(table.getSlotVersion(99), 0);
+  const beforeUnbindTableVer = table.tableVersion;
+  assert.equal(table.setSlot(2, null), true);
+  assert.equal(table.hasSlot(2), false);
+  assert.equal(table.getSlotVersion(2), 3);
+  assert.equal(table.tableVersion, beforeUnbindTableVer + 1);
+
+  // Repeated getSlot returns the exact same cached frozen snapshot object until mutated.
+  const snapA = table.getSlot(1);
+  const snapB = table.getSlot(1);
+  assert.strictEqual(snapA, snapB);
+  assert.equal(Object.isFrozen(snapA), true);
+  assert.equal(snapA.version, 2);
+
+  // Validation on bad slot indices.
+  assert.throws(() => table.setSlot(-1, { kind: 'buffer', handle: 1 }), RangeError);
+  assert.throws(() => table.setSlot(1.5, { kind: 'buffer', handle: 1 }), RangeError);
+  assert.equal(table.getSlot(-1), undefined);
+  assert.equal(table.hasSlot(-1), false);
+  assert.equal(table.getSlotVersion(-1), 0);
+  assert.equal(table.clearSlot(-1), false);
+
+  stats = table.getStats();
+  assert.equal(stats.activeSlots, 2);
+  assert.equal(stats.slotWrites, 9);
+  assert.equal(stats.elidedNoOpWrites, 6);
+  assert.equal(stats.tableVersion, table.tableVersion);
+});
+
+test('ResourceTable O(1) bind-group version validation, resource-lifecycle invalidation, and custom view caching (W207)', () => {
+  const { device } = createMockDevice();
+  let customViewCreates = 0;
+  const origCreateTexture = device.createTexture.bind(device);
+  device.createTexture = (desc) => {
+    const tex = origCreateTexture(desc);
+    const origCreateView = tex.createView.bind(tex);
+    tex.createView = (viewDesc) => {
+      if (viewDesc !== undefined) {
+        customViewCreates += 1;
+      }
+      return origCreateView(viewDesc);
+    };
+    return tex;
+  };
+
+  const table = new ResourceTable(device, { fastSlotCapacity: 8 });
+  const b1 = table.createBuffer(1, { size: 128, usage: GPU_BUFFER_USAGE.UNIFORM });
+  table.createTexture(2, { size: { width: 64, height: 64 }, mipLevelCount: 4, format: 'rgba8unorm' });
+  const s1 = table.createSampler(3, { magFilter: 'linear' });
+
+  // Bind dense fast slots (0, 1, 2) and an overflow slot (64 >= fastSlotCapacity 8).
+  table.setSlot(0, { kind: 'buffer', handle: 1, offset: 16, size: 64 });
+  table.setSlot(1, { kind: 'texture', handle: 2, baseMipLevel: 1, mipLevelCount: 2 });
+  table.setSlot(2, { kind: 'sampler', handle: 3 });
+  table.setSlot(64, { kind: 'buffer', handle: 1, offset: 0, size: 32 });
+
+  // Custom texture view is lazily created once and reused across lookups & elided writes.
+  const view1 = table.resolveSlot(1);
+  const view2 = table.getSlotResource(1);
+  assert.strictEqual(view1, view2);
+  assert.equal(customViewCreates, 1);
+  assert.equal(table.setSlot(1, { kind: 'texture', handle: 2, baseMipLevel: 1, mipLevelCount: 2 }), false);
+  assert.strictEqual(table.resolveSlot(1), view1);
+  assert.equal(customViewCreates, 1);
+
+  // getBindGroupEntry returns valid WebGPU bind group entries.
+  assert.deepEqual(table.getBindGroupEntry(0, 0), {
+    binding: 0,
+    resource: { buffer: b1, offset: 16, size: 64 },
+  });
+  assert.deepEqual(table.getBindGroupEntry(1, 1), {
+    binding: 1,
+    resource: view1,
+  });
+  assert.deepEqual(table.getBindGroupEntry(2, 2), {
+    binding: 2,
+    resource: s1,
+  });
+  assert.equal(table.getBindGroupEntry(3, 5), null);
+
+  // Capture bind-group version stamp for slots [0, 1, 2].
+  const bgSnap = table.captureSlotVersions([0, 1, 2]);
+  const keyBefore = table.getSlotVersionKey([0, 1, 2]);
+  assert.equal(table.isBindGroupCacheValid(bgSnap), true);
+
+  // Mutating an UNRELATED overflow slot (64) advances tableVersion, but bgSnap remains valid
+  // and fast-forwards its tableVersion for subsequent O(1) checks.
+  assert.equal(table.setSlot(64, { kind: 'buffer', handle: 1, offset: 32, size: 32 }), true);
+  assert.notEqual(bgSnap.tableVersion, table.tableVersion);
+  assert.equal(table.isBindGroupCacheValid(bgSnap), true);
+  assert.equal(bgSnap.tableVersion, table.tableVersion);
+  assert.equal(table.getSlotVersionKey([0, 1, 2]), keyBefore);
+
+  // Overwriting buffer handle 1 automatically invalidates slot 0 (and slot 64) and bgSnap!
+  const v0Before = table.getSlotVersion(0);
+  const v64Before = table.getSlotVersion(64);
+  const b1New = table.createBuffer(1, { size: 256, usage: GPU_BUFFER_USAGE.UNIFORM });
+  assert.equal(table.getSlotVersion(0), v0Before + 1);
+  assert.equal(table.getSlotVersion(64), v64Before + 1);
+  assert.equal(table.isBindGroupCacheValid(bgSnap), false);
+  assert.notEqual(table.getSlotVersionKey([0, 1, 2]), keyBefore);
+  assert.strictEqual(table.resolveSlot(0), b1New);
+
+  // Re-capturing after rebuild stays valid; repeating identical setSlot on slot 0 is elided.
+  const bgSnap2 = table.captureSlotVersions([0, 1, 2]);
+  assert.equal(table.setSlot(0, { kind: 'buffer', handle: 1, offset: 16, size: 64 }), false);
+  assert.equal(table.isBindGroupCacheValid(bgSnap2), true);
+
+  // Overwriting texture handle 2 invalidates slot 1 AND clears its cached custom view.
+  const v1Before = table.getSlotVersion(1);
+  table.createTexture(2, { size: { width: 128, height: 128 }, mipLevelCount: 5, format: 'rgba8unorm' });
+  assert.equal(table.getSlotVersion(1), v1Before + 1);
+  assert.equal(table.isBindGroupCacheValid(bgSnap2), false);
+  const view3 = table.resolveSlot(1);
+  assert.notStrictEqual(view3, view1);
+  assert.equal(customViewCreates, 2);
+
+  // Destroying sampler handle 3 invalidates slot 2.
+  const bgSnap3 = table.captureSlotVersions([0, 1, 2]);
+  const v2Before = table.getSlotVersion(2);
+  assert.equal(table.destroy(3), 1);
+  assert.equal(table.getSlotVersion(2), v2Before + 1);
+  assert.equal(table.isBindGroupCacheValid(bgSnap3), false);
+  assert.equal(table.resolveSlot(2), undefined);
+});
+
+test('ResourceTable clearSlot, clearSlots, clear(), and resetStats() preserve monotonic versions and stats (W207)', () => {
+  const { device } = createMockDevice();
+  const table = new ResourceTable(device, { fastSlotCapacity: 4 });
+
+  table.createBuffer(1, { size: 64, usage: GPU_BUFFER_USAGE.UNIFORM });
+  table.createBuffer(2, { size: 64, usage: GPU_BUFFER_USAGE.UNIFORM });
+
+  // Bind dense slot 0, dense slot 1, and overflow slot 10.
+  table.setSlot(0, { kind: 'buffer', handle: 1, offset: 0, size: 32 });
+  table.setSlot(1, { kind: 'buffer', handle: 2, offset: 0, size: 64 });
+  table.setSlot(10, { kind: 'buffer', handle: 1, offset: 32, size: 32 });
+  // Trigger a no-op write.
+  table.setSlot(0, { kind: 'buffer', handle: 1, offset: 0, size: 32 });
+
+  const snapAll = table.captureSlotVersions([0, 1, 10]);
+  assert.equal(table.getStats().activeSlots, 3);
+  assert.equal(table.getStats().slotWrites, 3);
+  assert.equal(table.getStats().elidedNoOpWrites, 1);
+
+  // clearSlot on occupied slot increments its version & tableVersion; second call is a no-op.
+  const v0BeforeClear = table.getSlotVersion(0);
+  const tvBeforeClear = table.tableVersion;
+  assert.equal(table.clearSlot(0), true);
+  assert.equal(table.hasSlot(0), false);
+  assert.equal(table.getSlot(0), undefined);
+  assert.equal(table.getSlotVersion(0), v0BeforeClear + 1);
+  assert.equal(table.tableVersion, tvBeforeClear + 1);
+  assert.equal(table.getStats().activeSlots, 2);
+  assert.equal(table.isBindGroupCacheValid(snapAll), false);
+
+  // Repeated clearSlot on already-unbound slot does NOT bump version.
+  assert.equal(table.clearSlot(0), false);
+  assert.equal(table.getSlotVersion(0), v0BeforeClear + 1);
+  assert.equal(table.tableVersion, tvBeforeClear + 1);
+
+  // Re-binding slot 0 after clearSlot yields strictly higher version (no ABA reuse).
+  assert.equal(table.setSlot(0, { kind: 'buffer', handle: 1, offset: 0, size: 32 }), true);
+  assert.equal(table.getSlotVersion(0), v0BeforeClear + 2);
+  assert.equal(table.getStats().activeSlots, 3);
+
+  // resetStats() zeroes slotWrites & elidedNoOpWrites while preserving activeSlots & monotonic versions.
+  const tvBeforeReset = table.tableVersion;
+  const v1BeforeReset = table.getSlotVersion(1);
+  table.resetStats();
+  const afterReset = table.getStats();
+  assert.equal(afterReset.slotWrites, 0);
+  assert.equal(afterReset.elidedNoOpWrites, 0);
+  assert.equal(afterReset.activeSlots, 3);
+  assert.equal(afterReset.tableVersion, tvBeforeReset);
+  assert.equal(table.getSlotVersion(1), v1BeforeReset);
+  assert.equal(table.hasSlot(0), true);
+  assert.equal(table.hasSlot(10), true);
+
+  // clearSlots() clears all dense + overflow active slots and bumps their versions monotonically.
+  const snapBeforeBulkClear = table.captureSlotVersions([0, 1, 10]);
+  const v10BeforeBulkClear = table.getSlotVersion(10);
+  assert.equal(table.clearSlots(), 3);
+  assert.equal(table.getStats().activeSlots, 0);
+  assert.equal(table.hasSlot(0), false);
+  assert.equal(table.hasSlot(1), false);
+  assert.equal(table.hasSlot(10), false);
+  assert.equal(table.getSlotVersion(10), v10BeforeBulkClear + 1);
+  assert.equal(table.tableVersion, tvBeforeReset + 1);
+  assert.equal(table.isBindGroupCacheValid(snapBeforeBulkClear), false);
+
+  // Calling clearSlots() when already empty is a no-op (no version bump).
+  assert.equal(table.clearSlots(), 0);
+  assert.equal(table.tableVersion, tvBeforeReset + 1);
+
+  // Re-populate and test clear() and clear({ resetStats: true }).
+  table.setSlot(0, { kind: 'buffer', handle: 1, offset: 0, size: 32 });
+  table.setSlot(0, { kind: 'buffer', handle: 1, offset: 0, size: 32 }); // no-op
+  const snapBeforeClear = table.captureSlotVersions([0]);
+  const tvBeforeFullClear = table.tableVersion;
+  table.clear();
+  const afterClear = table.getStats();
+  assert.equal(afterClear.activeSlots, 0);
+  assert.equal(afterClear.liveHandles, 0);
+  assert.equal(afterClear.slotWrites, 1);
+  assert.equal(afterClear.elidedNoOpWrites, 1);
+  assert.ok(afterClear.tableVersion > tvBeforeFullClear);
+  assert.equal(table.isBindGroupCacheValid(snapBeforeClear), false);
+
+  // clear({ resetStats: true }) resets telemetry counters while keeping tableVersion strictly monotonic.
+  table.createBuffer(5, { size: 64, usage: GPU_BUFFER_USAGE.UNIFORM });
+  table.setSlot(0, { kind: 'buffer', handle: 5 });
+  table.setSlot(0, { kind: 'buffer', handle: 5 }); // no-op
+  const tvBeforeClearReset = table.tableVersion;
+  const v0BeforeClearReset = table.getSlotVersion(0);
+  table.clear({ resetStats: true });
+
+  const afterClearReset = table.getStats();
+  assert.equal(afterClearReset.activeSlots, 0);
+  assert.equal(afterClearReset.slotWrites, 0);
+  assert.equal(afterClearReset.elidedNoOpWrites, 0);
+  assert.ok(afterClearReset.tableVersion > tvBeforeClearReset);
+  assert.ok(table.getSlotVersion(0) > v0BeforeClearReset);
 
   for (const [k, v] of Object.entries(afterClearReset)) {
     assert.equal(typeof v, 'number', `stat ${k} must be numeric`);
