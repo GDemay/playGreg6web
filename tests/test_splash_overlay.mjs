@@ -8,8 +8,11 @@ const splashMod = require('../web/ui/splash_overlay.js');
 const {
   BOOT_STAGE_ORDER,
   BOOT_STAGE_LABELS,
+  DISMISS_REASONS,
   computeBootProgress,
   sanitizeScriptedInputPreset,
+  sanitizeDismissReason,
+  isHudHiddenQuery,
   SplashOverlayController,
   DEFAULT_FADE_MS,
   REDUCED_MOTION_QUERY,
@@ -937,4 +940,406 @@ test('W151: setScriptedInput renders sanitized indicator pill, hides on null, an
   controller.destroy();
   assert.doesNotThrow(() => controller.setScriptedInput('start-screen'));
   assert.equal(controller.getStats().destroyed, true);
+});
+
+test('W213: exports DISMISS_REASONS, sanitizeDismissReason, and isHudHiddenQuery on module and UMD global', () => {
+  assert.ok(Object.isFrozen(DISMISS_REASONS));
+  assert.equal(DISMISS_REASONS.FIRST_PRESENT, 'first_present');
+  assert.equal(DISMISS_REASONS.IMMEDIATE, 'immediate');
+  assert.equal(DISMISS_REASONS.HUD_HIDDEN, 'hud_hidden');
+  assert.equal(DISMISS_REASONS.INSTANT_HIDE, 'instant_hide');
+  assert.equal(DISMISS_REASONS.REDUCED_MOTION, 'reduced_motion');
+  assert.equal(DISMISS_REASONS.MANUAL, 'manual');
+  assert.equal(typeof sanitizeDismissReason, 'function');
+  assert.equal(typeof isHudHiddenQuery, 'function');
+  assert.equal(globalThis.PlayGta6SplashOverlay.DISMISS_REASONS, DISMISS_REASONS);
+  assert.equal(globalThis.PlayGta6SplashOverlay.sanitizeDismissReason, sanitizeDismissReason);
+  assert.equal(globalThis.PlayGta6SplashOverlay.isHudHiddenQuery, isHudHiddenQuery);
+
+  // sanitizeDismissReason allowlist & injection protection.
+  assert.equal(sanitizeDismissReason('first_present'), 'first_present');
+  assert.equal(sanitizeDismissReason('  bink.frame:0-ready  '), 'bink.frame:0-ready');
+  assert.equal(sanitizeDismissReason(''), null);
+  assert.equal(sanitizeDismissReason(null), null);
+  assert.equal(sanitizeDismissReason(42), null);
+  assert.equal(sanitizeDismissReason('../etc/passwd'), null);
+  assert.equal(sanitizeDismissReason('C:\\Users\\secret\\file'), null);
+  assert.equal(sanitizeDismissReason('<script>alert(1)</script>'), null);
+  assert.equal(sanitizeDismissReason('reason with spaces'), null);
+  assert.equal(sanitizeDismissReason('reason\ninjection'), null);
+  assert.equal(sanitizeDismissReason('a'.repeat(65)), null);
+
+  // isHudHiddenQuery parsing across string, URLSearchParams, Location, and full URLs.
+  assert.equal(isHudHiddenQuery('?hud=0'), true);
+  assert.equal(isHudHiddenQuery('hud=0'), true);
+  assert.equal(isHudHiddenQuery('?HUD=0'), true);
+  assert.equal(isHudHiddenQuery('?foo=1&hud=0&bar=2'), true);
+  assert.equal(isHudHiddenQuery('?hud=false'), true);
+  assert.equal(isHudHiddenQuery('?hud=off'), true);
+  assert.equal(isHudHiddenQuery('?hud=no'), true);
+  assert.equal(isHudHiddenQuery('?hud=1&hud=0'), true);
+  assert.equal(isHudHiddenQuery('?hud=0&hud=1'), false);
+  assert.equal(isHudHiddenQuery('?hud=1'), false);
+  assert.equal(isHudHiddenQuery('?hud=true'), false);
+  assert.equal(isHudHiddenQuery('?hud='), false);
+  assert.equal(isHudHiddenQuery(''), false);
+  assert.equal(isHudHiddenQuery(null), false);
+  assert.equal(isHudHiddenQuery(undefined), false);
+  assert.equal(isHudHiddenQuery(new URLSearchParams('?hud=0')), true);
+  assert.equal(isHudHiddenQuery(new URLSearchParams('?hud=1')), false);
+  assert.equal(isHudHiddenQuery({ search: '?hud=0' }), true);
+  assert.equal(isHudHiddenQuery('http://localhost:8000/?hud=0#top'), true);
+  assert.equal(isHudHiddenQuery('http://localhost:8000/?hud=1#?hud=0'), false);
+});
+
+test('W213: validates instantHide and windowObj constructor options', () => {
+  assert.throws(
+    () => new SplashOverlayController({ documentObj: new MockDocument(), instantHide: 'yes' }),
+    TypeError
+  );
+  assert.throws(
+    () => new SplashOverlayController({ documentObj: new MockDocument(), windowObj: 'not-an-obj' }),
+    TypeError
+  );
+  assert.doesNotThrow(() => {
+    const c = new SplashOverlayController({
+      documentObj: new MockDocument(),
+      instantHide: null,
+      windowObj: null,
+    });
+    c.destroy();
+  });
+});
+
+test('W213: dismissImmediate and instant-hide options dismiss synchronously vs animated dismiss', () => {
+  // 1) dismissImmediate() bypasses CSS fade and timer completely.
+  let now = 1200;
+  const imm = createController({ fadeMs: 400, nowFn: () => now });
+  const immState = imm.controller.dismissImmediate();
+  assert.equal(immState.visible, false);
+  assert.equal(immState.dismissed, true);
+  assert.equal(immState.fading, false);
+  assert.equal(immState.root.hidden, true);
+  assert.equal(immState.root.style.display, 'none');
+  assert.equal(immState.root.style.getPropertyValue('--pg6-splash-fade'), '0ms');
+  assert.equal(immState.root.classList.contains('pg6-splash--fading'), false);
+  assert.equal(immState.root.getAttribute('aria-busy'), 'false');
+  assert.equal(imm.timer.size, 0);
+  assert.equal(imm.dismissCalls.length, 1);
+
+  const immStats = imm.controller.getStats();
+  assert.equal(immStats.visible, false);
+  assert.equal(immStats.dismissedAtMs, 1200);
+  assert.equal(immStats.dismissReason, DISMISS_REASONS.IMMEDIATE);
+  assert.equal(immStats.fadeDurationMs, 0);
+  assert.equal(immStats.dismissCount, 1);
+
+  // Idempotent second dismissImmediate does not double-fire or mutate telemetry.
+  now = 1900;
+  imm.controller.dismissImmediate('later_reason');
+  assert.equal(imm.dismissCalls.length, 1);
+  assert.equal(imm.controller.getStats().dismissedAtMs, 1200);
+  assert.equal(imm.controller.getStats().dismissReason, DISMISS_REASONS.IMMEDIATE);
+  assert.equal(imm.controller.getStats().dismissCount, 1);
+  imm.controller.destroy();
+
+  // 2) dismissImmediate accepts custom reason string or object and sanitizes malicious values.
+  const custom = createController({ fadeMs: 400, nowFn: () => 2200 });
+  custom.controller.dismissImmediate('bink2_first_frame');
+  assert.equal(custom.controller.getStats().dismissReason, 'bink2_first_frame');
+  custom.controller.show();
+  custom.controller.dismissImmediate({ reason: '../bad/path' });
+  assert.equal(custom.controller.getStats().dismissReason, DISMISS_REASONS.IMMEDIATE);
+  custom.controller.destroy();
+
+  // 3) Constructor instantHide: true starts visible and dismisses immediately on FIRST_PRESENT.
+  const instantOpt = createController({ fadeMs: 400, instantHide: true, nowFn: () => 3100 });
+  assert.equal(instantOpt.controller.getStats().visible, true);
+  assert.equal(instantOpt.controller.getStats().instantHide, true);
+  assert.equal(instantOpt.controller.getStats().hudHidden, false);
+  assert.equal(
+    instantOpt.controller.getState().root.style.getPropertyValue('--pg6-splash-fade'),
+    '0ms'
+  );
+  instantOpt.controller.onFirstPresent();
+  assert.equal(instantOpt.timer.size, 0);
+  assert.equal(instantOpt.dismissCalls.length, 1);
+  assert.equal(instantOpt.controller.getStats().visible, false);
+  assert.equal(instantOpt.controller.getStats().dismissedAtMs, 3100);
+  assert.equal(instantOpt.controller.getStats().dismissReason, DISMISS_REASONS.FIRST_PRESENT);
+  assert.equal(instantOpt.controller.getStats().fadeDurationMs, 0);
+
+  // Per-call immediate: false can still opt into animated fade.
+  instantOpt.controller.show();
+  instantOpt.controller.dismiss({ immediate: false, fadeMs: 35, reason: 'manual_fade' });
+  assert.equal(instantOpt.timer.size, 1);
+  assert.equal(instantOpt.controller.getStats().fading, true);
+  assert.equal(instantOpt.controller.getStats().visible, true);
+  instantOpt.timer.flush();
+  assert.equal(instantOpt.controller.getStats().visible, false);
+  assert.equal(instantOpt.controller.getStats().dismissReason, 'manual_fade');
+  assert.equal(instantOpt.controller.getStats().fadeDurationMs, 35);
+  instantOpt.controller.destroy();
+
+  // 4) Animated onFirstPresent() vs immediate onFirstPresent({ immediate: true }).
+  let animNow = 4000;
+  const anim = createController({ fadeMs: 80, nowFn: () => animNow });
+  anim.controller.onFirstPresent();
+  assert.equal(anim.timer.size, 1);
+  assert.equal(anim.controller.getStats().visible, true);
+  assert.equal(anim.controller.getStats().fading, true);
+  assert.equal(anim.controller.getStats().dismissedAtMs, null);
+  assert.equal(anim.controller.getStats().dismissReason, null);
+  animNow = 4082;
+  anim.timer.flush();
+  assert.equal(anim.controller.getStats().visible, false);
+  assert.equal(anim.controller.getStats().dismissedAtMs, 4082);
+  assert.equal(anim.controller.getStats().dismissReason, DISMISS_REASONS.FIRST_PRESENT);
+  assert.equal(anim.controller.getStats().fadeDurationMs, 82);
+  anim.controller.destroy();
+
+  const immFirstPresent = createController({ fadeMs: 400, nowFn: () => 5000 });
+  immFirstPresent.controller.onFirstPresent({ immediate: true });
+  assert.equal(immFirstPresent.timer.size, 0);
+  assert.equal(immFirstPresent.dismissCalls.length, 1);
+  assert.equal(immFirstPresent.controller.getStats().visible, false);
+  assert.equal(immFirstPresent.controller.getStats().dismissedAtMs, 5000);
+  assert.equal(immFirstPresent.controller.getStats().dismissReason, DISMISS_REASONS.FIRST_PRESENT);
+  assert.equal(immFirstPresent.controller.getStats().fadeDurationMs, 0);
+  immFirstPresent.controller.destroy();
+
+  // 5) Upgrading an in-flight animated fade via dismissImmediate cancels timer & fires onDismiss once.
+  let upgradeNow = 6000;
+  const upgrade = createController({ fadeMs: 250, nowFn: () => upgradeNow });
+  upgrade.controller.onFirstPresent();
+  assert.equal(upgrade.timer.size, 1);
+  assert.equal(upgrade.controller.getStats().fading, true);
+  assert.equal(upgrade.dismissCalls.length, 0);
+
+  upgradeNow = 6012;
+  upgrade.controller.dismissImmediate({ reason: 'capture_override' });
+  assert.equal(upgrade.timer.size, 0);
+  assert.equal(upgrade.dismissCalls.length, 1);
+  assert.equal(upgrade.controller.getStats().visible, false);
+  assert.equal(upgrade.controller.getStats().fading, false);
+  assert.equal(upgrade.controller.getStats().dismissedAtMs, 6012);
+  assert.equal(upgrade.controller.getStats().dismissReason, 'capture_override');
+  assert.equal(upgrade.controller.getStats().fadeDurationMs, 0);
+  assert.equal(upgrade.controller.getStats().dismissCount, 1);
+
+  // Flushing timers after cancellation never double-fires.
+  upgrade.timer.flush();
+  assert.equal(upgrade.dismissCalls.length, 1);
+  upgrade.controller.destroy();
+});
+
+test('W213: ?hud=0 query instantly hides overlay on construction and avoids fade occlusion', () => {
+  // 1) Detected via windowObj.location.search (matches web/app_bootstrap.js wiring).
+  const viaWindow = createController({
+    fadeMs: 400,
+    nowFn: () => 7100,
+    windowObj: { location: { search: '?inputScript=intro-watch&hud=0' } },
+  });
+  const stats = viaWindow.controller.getStats();
+  const state = viaWindow.controller.getState();
+  assert.equal(stats.visible, false);
+  assert.equal(stats.dismissed, true);
+  assert.equal(stats.fading, false);
+  assert.equal(stats.hudHidden, true);
+  assert.equal(stats.instantHide, true);
+  assert.equal(stats.dismissedAtMs, 7100);
+  assert.equal(stats.dismissReason, DISMISS_REASONS.HUD_HIDDEN);
+  assert.equal(stats.fadeDurationMs, 0);
+  assert.equal(stats.dismissCount, 1);
+  assert.equal(state.root.hidden, true);
+  assert.equal(state.root.style.display, 'none');
+  assert.equal(state.root.style.getPropertyValue('--pg6-splash-fade'), '0ms');
+  assert.equal(state.root.getAttribute('aria-busy'), 'false');
+  assert.equal(viaWindow.timer.size, 0);
+
+  // Subsequent onFirstPresent is an idempotent no-op and never schedules a fade.
+  viaWindow.controller.onFirstPresent();
+  assert.equal(viaWindow.timer.size, 0);
+  assert.equal(viaWindow.controller.getStats().visible, false);
+  assert.equal(viaWindow.controller.getStats().dismissReason, DISMISS_REASONS.HUD_HIDDEN);
+  assert.equal(viaWindow.controller.getStats().dismissCount, 1);
+  viaWindow.controller.destroy();
+
+  // 2) Detected via documentObj.defaultView.location.search.
+  const docWithLoc = new MockDocument();
+  docWithLoc.defaultView = { location: { search: '?hud=false' } };
+  const viaDoc = createController({ documentObj: docWithLoc, nowFn: () => 7200 });
+  assert.equal(viaDoc.controller.getStats().visible, false);
+  assert.equal(viaDoc.controller.getStats().hudHidden, true);
+  assert.equal(viaDoc.controller.getStats().dismissReason, DISMISS_REASONS.HUD_HIDDEN);
+  viaDoc.controller.destroy();
+
+  // 3) Explicit visible: true with ?hud=0 keeps overlay visible initially but dismisses instantly.
+  const visibleHud0 = createController({
+    locationSearch: '?hud=0',
+    visible: true,
+    fadeMs: 400,
+    nowFn: () => 7300,
+  });
+  assert.equal(visibleHud0.controller.getStats().visible, true);
+  assert.equal(visibleHud0.controller.getStats().hudHidden, true);
+  assert.equal(visibleHud0.controller.getStats().instantHide, true);
+  visibleHud0.controller.onFirstPresent();
+  assert.equal(visibleHud0.timer.size, 0);
+  assert.equal(visibleHud0.controller.getStats().visible, false);
+  assert.equal(visibleHud0.controller.getStats().dismissReason, DISMISS_REASONS.FIRST_PRESENT);
+  visibleHud0.controller.destroy();
+
+  // 4) Explicit instantHide: false overrides ?hud=0 auto-hide.
+  const overrideHud0 = createController({
+    locationSearch: '?hud=0',
+    instantHide: false,
+    fadeMs: 50,
+  });
+  assert.equal(overrideHud0.controller.getStats().visible, true);
+  assert.equal(overrideHud0.controller.getStats().instantHide, false);
+  overrideHud0.controller.onFirstPresent();
+  assert.equal(overrideHud0.timer.size, 1);
+  overrideHud0.controller.destroy();
+
+  // 5) Throwing location getter never breaks construction.
+  const hostileWindow = {};
+  Object.defineProperty(hostileWindow, 'location', {
+    get() {
+      throw new Error('SecurityError');
+    },
+  });
+  assert.doesNotThrow(() => {
+    const safe = createController({ windowObj: hostileWindow });
+    assert.equal(safe.controller.getStats().visible, true);
+    assert.equal(safe.controller.getStats().hudHidden, false);
+    safe.controller.destroy();
+  });
+});
+
+test('W213: idempotent double-hide and double-show guards avoid redundant DOM writes', () => {
+  const { controller, timer, dismissCalls } = createController({ fadeMs: 60, nowFn: () => 8000 });
+  const root = controller.getState().root;
+
+  let hiddenWrites = 0;
+  let backingHidden = root._hidden;
+  Object.defineProperty(root, 'hidden', {
+    configurable: true,
+    get() {
+      return backingHidden;
+    },
+    set(v) {
+      hiddenWrites += 1;
+      backingHidden = Boolean(v);
+      root._hidden = backingHidden;
+    },
+  });
+
+  // Already visible & active: show() is a no-op with zero DOM writes.
+  controller.show();
+  controller.show();
+  assert.equal(hiddenWrites, 0);
+  assert.equal(controller.getStats().visible, true);
+
+  // First hide() transitions DOM once; second hide() is an idempotent no-op.
+  controller.hide();
+  assert.equal(hiddenWrites, 1);
+  assert.equal(controller.getStats().visible, false);
+  assert.equal(controller.getStats().dismissed, false);
+  assert.equal(dismissCalls.length, 0);
+
+  controller.hide();
+  controller.hide();
+  assert.equal(hiddenWrites, 1);
+  assert.equal(controller.getStats().visible, false);
+
+  // Re-show writes once; duplicate show() does not write again.
+  controller.show();
+  assert.equal(hiddenWrites, 2);
+  assert.equal(controller.getStats().visible, true);
+  controller.show();
+  assert.equal(hiddenWrites, 2);
+
+  // hide() during an in-flight fade cancels the timer without firing onDismiss.
+  controller.onFirstPresent();
+  assert.equal(timer.size, 1);
+  assert.equal(controller.getStats().fading, true);
+  controller.hide();
+  assert.equal(timer.size, 0);
+  assert.equal(controller.getStats().visible, false);
+  assert.equal(controller.getStats().fading, false);
+  assert.equal(controller.getStats().dismissed, false);
+  timer.flush();
+  assert.equal(dismissCalls.length, 0);
+
+  // hide() after completed dismiss is also a no-op and preserves dismissal telemetry.
+  controller.show();
+  controller.dismissImmediate('manual_hide_guard');
+  const writesAfterDismiss = hiddenWrites;
+  controller.hide();
+  assert.equal(hiddenWrites, writesAfterDismiss);
+  assert.equal(controller.getStats().dismissed, true);
+  assert.equal(controller.getStats().dismissReason, 'manual_hide_guard');
+  assert.equal(controller.getStats().dismissedAtMs, 8000);
+  controller.destroy();
+});
+
+test('W213: re-show on restart cleanly restores overlay and tracks subsequent dismissal telemetry', () => {
+  let now = 9000;
+  const { controller, timer, dismissCalls } = createController({ fadeMs: 120, nowFn: () => now });
+
+  // First boot reaches FIRST_PRESENT and dismisses immediately.
+  controller.updateBootState({ stage: 'BINK_OPEN', progressPct: 89, traps: [{ kind: 'WARN' }] });
+  controller.onFirstPresent({ immediate: true });
+  assert.equal(controller.getStats().visible, false);
+  assert.equal(controller.getStats().dismissed, true);
+  assert.equal(controller.getStats().dismissedAtMs, 9000);
+  assert.equal(controller.getStats().dismissReason, DISMISS_REASONS.FIRST_PRESENT);
+  assert.equal(controller.getStats().dismissCount, 1);
+  assert.equal(dismissCalls.length, 1);
+
+  // Restart with show({ reset: true }) restores visibility and resets boot progress, keeping historical telemetry.
+  const restarted = controller.show({ reset: true });
+  assert.equal(restarted.visible, true);
+  assert.equal(restarted.dismissed, false);
+  assert.equal(restarted.fading, false);
+  assert.equal(restarted.stage, 'NOT_STARTED');
+  assert.equal(restarted.progressPct, 0);
+  assert.equal(restarted.readyForSplash, false);
+  assert.equal(restarted.badgeText, '');
+  assert.equal(restarted.root.hidden, false);
+  assert.equal(restarted.root.style.display, '');
+  assert.equal(restarted.root.classList.contains('pg6-splash--fading'), false);
+  assert.equal(restarted.root.style.getPropertyValue('--pg6-splash-fade'), '120ms');
+  assert.equal(restarted.root.getAttribute('aria-busy'), 'true');
+  assert.equal(restarted.dismissCount, 1);
+  assert.equal(restarted.dismissedAtMs, 9000);
+  assert.equal(restarted.dismissReason, DISMISS_REASONS.FIRST_PRESENT);
+
+  // Mid-fade restart cancels pending fade so onDismiss does not fire spuriously.
+  now = 9500;
+  controller.onFirstPresent();
+  assert.equal(timer.size, 1);
+  assert.equal(controller.getStats().fading, true);
+  controller.show({ reset: true });
+  assert.equal(timer.size, 0);
+  assert.equal(controller.getStats().visible, true);
+  assert.equal(controller.getStats().fading, false);
+  assert.equal(controller.getStats().dismissed, false);
+  timer.flush();
+  assert.equal(dismissCalls.length, 1);
+
+  // Second completed dismissal updates telemetry accurately.
+  now = 10250;
+  controller.dismissImmediate({ reason: 'second_boot_ready' });
+  const finalStats = controller.getStats();
+  assert.equal(finalStats.visible, false);
+  assert.equal(finalStats.dismissed, true);
+  assert.equal(finalStats.dismissCount, 2);
+  assert.equal(finalStats.dismissedAtMs, 10250);
+  assert.equal(finalStats.dismissReason, 'second_boot_ready');
+  assert.equal(finalStats.fadeDurationMs, 0);
+  assert.equal(dismissCalls.length, 2);
+  assert.doesNotThrow(() => JSON.stringify(finalStats));
+  controller.destroy();
 });
