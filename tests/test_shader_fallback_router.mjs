@@ -19,6 +19,7 @@ const {
   DEFAULT_MAX_TRACKED_MISSING,
   DEFAULT_MAX_TRACKED_MISSING_HASHES,
   DEFAULT_MAX_CATEGORIZED_MISSING_HASHES,
+  DEFAULT_MAX_RESOLVE_CACHE_ENTRIES,
   DEFAULT_TOP_MISSING_LIMIT,
   DEFAULT_MISSING_SUMMARY_TOP_LIMIT,
   normalizeShaderHash,
@@ -825,11 +826,11 @@ test('W133 getTopMissingShaders ranks descending by count with deterministic has
 
   // Verify descending count order and deterministic hashHex (then stage) ascending tie-breaking.
   assert.deepEqual(topDefault.slice(0, 5), [
-    { hashHex: hHigh, stage: 'vertex', count: 5 },
-    { hashHex: hTieA, stage: 'fragment', count: 2 },
-    { hashHex: hTieA, stage: 'vertex', count: 2 },
-    { hashHex: hTieB, stage: 'compute', count: 2 },
-    { hashHex: hTieC, stage: 'fragment', count: 2 },
+    { hash: hHigh, hashHex: hHigh, stage: 'vertex', count: 5, firstSeenFrame: 0, lastSeenFrame: 0 },
+    { hash: hTieA, hashHex: hTieA, stage: 'fragment', count: 2, firstSeenFrame: 0, lastSeenFrame: 0 },
+    { hash: hTieA, hashHex: hTieA, stage: 'vertex', count: 2, firstSeenFrame: 0, lastSeenFrame: 0 },
+    { hash: hTieB, hashHex: hTieB, stage: 'compute', count: 2, firstSeenFrame: 0, lastSeenFrame: 0 },
+    { hash: hTieC, hashHex: hTieC, stage: 'fragment', count: 2, firstSeenFrame: 0, lastSeenFrame: 0 },
   ]);
 
   // Explicit limit subsets cleanly and limit=0 returns empty array.
@@ -838,12 +839,23 @@ test('W133 getTopMissingShaders ranks descending by count with deterministic has
   assert.equal(router.getTopMissingShaders(null).length, 16);
   assert.equal(router.getTopMissingShaders(100).length, 20);
 
-  // Every record is strictly sanitized: only { hashHex, stage, count }, no paths or WGSL text.
+  // Every record is strictly sanitized: only { hash, hashHex, stage, count, firstSeenFrame, lastSeenFrame },
+  // no paths, binary dumps, or WGSL text.
   for (const row of topDefault) {
-    assert.deepEqual(Object.keys(row).sort(), ['count', 'hashHex', 'stage']);
+    assert.deepEqual(Object.keys(row).sort(), [
+      'count',
+      'firstSeenFrame',
+      'hash',
+      'hashHex',
+      'lastSeenFrame',
+      'stage',
+    ]);
+    assert.equal(row.hash, row.hashHex);
     assert.match(row.hashHex, /^0x[0-9a-f]{16}$/);
     assert.ok(['vertex', 'fragment', 'compute'].includes(row.stage));
     assert.equal(Number.isInteger(row.count) && row.count > 0, true);
+    assert.equal(Number.isInteger(row.firstSeenFrame) && row.firstSeenFrame >= 0, true);
+    assert.equal(Number.isInteger(row.lastSeenFrame) && row.lastSeenFrame >= row.firstSeenFrame, true);
   }
   const serialized = JSON.stringify(topDefault);
   assert.equal(serialized.includes('@vertex'), false);
@@ -883,7 +895,14 @@ test('W133 maxTrackedMissingHashes defaults to 2048, caps map, tracks overflowMi
   assert.equal(defaultRouter.getStats().uniqueMissing, 2048);
   assert.equal(defaultRouter.getStats().overflowMissingHashes, 1);
   assert.deepEqual(defaultRouter.getTopMissingShaders(1), [
-    { hashHex: '0x0000000000000001', stage: 'vertex', count: 2 },
+    {
+      hash: '0x0000000000000001',
+      hashHex: '0x0000000000000001',
+      stage: 'vertex',
+      count: 2,
+      firstSeenFrame: 0,
+      lastSeenFrame: 0,
+    },
   ]);
 
   // Custom small cap via maxTrackedMissingHashes.
@@ -910,9 +929,30 @@ test('W133 maxTrackedMissingHashes defaults to 2048, caps map, tracks overflowMi
   assert.equal(stats.overflowMissingHashes, 3);
   assert.equal(stats.overflowMissingCount, 3);
   assert.deepEqual(capped.getTopMissingShaders(), [
-    { hashHex: '0x0000000000000020', stage: 'fragment', count: 3 },
-    { hashHex: '0x0000000000000030', stage: 'compute', count: 2 },
-    { hashHex: '0x0000000000000010', stage: 'vertex', count: 1 },
+    {
+      hash: '0x0000000000000020',
+      hashHex: '0x0000000000000020',
+      stage: 'fragment',
+      count: 3,
+      firstSeenFrame: 0,
+      lastSeenFrame: 0,
+    },
+    {
+      hash: '0x0000000000000030',
+      hashHex: '0x0000000000000030',
+      stage: 'compute',
+      count: 2,
+      firstSeenFrame: 0,
+      lastSeenFrame: 0,
+    },
+    {
+      hash: '0x0000000000000010',
+      hashHex: '0x0000000000000010',
+      stage: 'vertex',
+      count: 1,
+      firstSeenFrame: 0,
+      lastSeenFrame: 0,
+    },
   ]);
 
   // Zero cap tracks nothing and counts every miss as overflow.
@@ -1448,4 +1488,456 @@ test('W179 classic Worker importScripts isolation exposes new APIs with zero glo
   assert.equal(typeof r.registerRealShader, 'function');
   assert.equal(typeof r.hasRealShader, 'function');
   assert.equal(typeof r.canFallbackOverride, 'function');
+});
+
+// ---------------------------------------------------------------------------
+// W204 Fast-path memoization, pack-reload invalidation, O(1) missing tracking,
+//      frame-indexed top-N ranking, and resetMissingTelemetry()
+// ---------------------------------------------------------------------------
+
+test('W204 fast-path resolve memoization returns identical frozen results with 0 pack lookups on cache hits', () => {
+  assert.equal(DEFAULT_MAX_RESOLVE_CACHE_ENTRIES, 8192);
+
+  let packLookupCalls = 0;
+  const packHashHex = '0x000000000000cafe';
+  const packHashBig = 0xcafen;
+  const missHashHex = '0x000000000000beef';
+  const fallbackMissHex = '0x000000000000fade';
+
+  const backing = createMapPackLoader({
+    [packHashHex]: PACK_VS_WGSL,
+    [S9_FALLBACK_HASHES.fragment]: S9_FALLBACK_WGSL.fragment,
+  });
+  const countingLoader = {
+    getSource(key) {
+      packLookupCalls += 1;
+      return backing.get(key);
+    },
+  };
+
+  let clock = 100;
+  const router = new ShaderFallbackRouter({
+    packLoader: countingLoader,
+    fallbackHashes: { fragment: S9_FALLBACK_HASHES.fragment },
+    now: () => {
+      clock += 1;
+      return clock;
+    },
+  });
+
+  // 1) Pack hit: first lookup queries packLoader once; repeat lookups across BigInt/hex/number hit cache
+  //    returning the exact same frozen result object reference (0 temporary object allocations).
+  const p1 = router.resolve(packHashHex, 'vertex');
+  assert.equal(p1.source, 'pack');
+  assert.equal(p1.wgsl, PACK_VS_WGSL);
+  assert.equal(Object.isFrozen(p1), true);
+  const callsAfterFirstPackHit = packLookupCalls;
+  assert.ok(callsAfterFirstPackHit >= 1);
+
+  for (let i = 0; i < 100; i += 1) {
+    const pHitHex = router.resolve(packHashHex, 'vertex');
+    const pHitBig = router.resolve(packHashBig, SHADER_STAGE.VERTEX);
+    const pHitAlias = router.resolve(packHashHex, 'vs');
+    assert.strictEqual(pHitHex, p1);
+    assert.strictEqual(pHitBig, p1);
+    assert.strictEqual(pHitAlias, p1);
+  }
+  assert.equal(packLookupCalls, callsAfterFirstPackHit, 'packLoader must not be queried on cache hits');
+
+  // Pack hit ignores profile option and still hits fast-path cache.
+  const pWithProfile = router.resolve(packHashHex, 'vertex', { profile: 'splash_rect_24b' });
+  assert.strictEqual(pWithProfile, p1);
+  assert.equal(packLookupCalls, callsAfterFirstPackHit);
+
+  // 2) S9 fallback hit: memoized with identical frozen object reference and O(1) missing count updates.
+  const f1 = router.resolve(fallbackMissHex, 'fragment');
+  assert.equal(f1.source, 'fallback');
+  assert.equal(Object.isFrozen(f1), true);
+  const callsAfterFallbackMiss = packLookupCalls;
+
+  for (let i = 0; i < 10; i += 1) {
+    const fHit = router.resolve(fallbackMissHex, 'fs');
+    assert.strictEqual(fHit, f1);
+  }
+  assert.equal(packLookupCalls, callsAfterFallbackMiss, 'fallback cache hits must not re-query packLoader');
+
+  // 3) Builtin hit with profile: memoized for matching profile, re-resolves cleanly for a different profile.
+  const b1 = router.resolve(missHashHex, 'vertex', { profile: 'splash_rect_24b' });
+  assert.equal(b1.source, 'builtin');
+  assert.equal(b1.profile, 'splash_rect_24b');
+  assert.equal(Object.isFrozen(b1), true);
+  const callsAfterBuiltinMiss = packLookupCalls;
+
+  const b2 = router.resolve(missHashHex, 'vertex', { profile: 'splash_rect_24b' });
+  assert.strictEqual(b2, b1);
+  assert.equal(packLookupCalls, callsAfterBuiltinMiss);
+
+  // Requesting a different profile must NOT return stale cached profile.
+  const bOtherProfile = router.resolve(missHashHex, 'vertex', { profile: 'textured_quad_24b' });
+  assert.equal(bOtherProfile.source, 'builtin');
+  assert.equal(bOtherProfile.profile, 'textured_quad_24b');
+  assert.notStrictEqual(bOtherProfile, b1);
+
+  // Verify aggregate stats and resolve cache telemetry.
+  const stats = router.getStats();
+  assert.equal(stats.packHits, 302);
+  assert.equal(stats.fallbackHits, 11);
+  assert.equal(stats.builtinHits, 3);
+  assert.equal(stats.totalLookups, 316);
+  assert.equal(stats.uniqueMissing, 2);
+
+  const cacheStats = router.getResolveCacheStats();
+  assert.equal(cacheStats.entries, 3);
+  assert.equal(cacheStats.maxEntries, DEFAULT_MAX_RESOLVE_CACHE_ENTRIES);
+  assert.equal(cacheStats.invalidations, 0);
+  assert.equal(cacheStats.hits, 312);
+  assert.equal(cacheStats.misses, 4);
+  assert.ok(cacheStats.hitRatio > 0.98 && cacheStats.hitRatio <= 1);
+});
+
+test('W204 resolve cache invalidates cleanly on pack reload (setPackLoader, version bump, Map mutation, onPackReload, fallbackHashes, realShaders)', () => {
+  const h1 = '0x000000000000a001';
+  const h2 = '0x000000000000a002';
+  const v1Wgsl = '@vertex fn vs_v1() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }';
+  const v2Wgsl = '@vertex fn vs_v2() -> @builtin(position) vec4<f32> { return vec4<f32>(1.0); }';
+
+  // 1) Explicit setPackLoader reload: previously missing h2 becomes a pack hit; h1 gets updated WGSL.
+  const router = new ShaderFallbackRouter({
+    packLoader: createGetSourcePackLoader({ [h1]: v1Wgsl }),
+    now: () => 10,
+  });
+
+  const beforeH1 = router.resolve(h1, 'vertex');
+  assert.equal(beforeH1.source, 'pack');
+  assert.equal(beforeH1.wgsl, v1Wgsl);
+  const beforeH2 = router.resolve(h2, 'vertex');
+  assert.equal(beforeH2.source, 'builtin');
+  assert.equal(router.getResolveCacheStats().entries, 2);
+
+  router.setPackLoader(createGetSourcePackLoader({ [h1]: v2Wgsl, [h2]: PACK_VS_WGSL }));
+  assert.equal(router.getResolveCacheStats().entries, 0);
+  assert.equal(router.getResolveCacheStats().invalidations, 1);
+
+  const afterH1 = router.resolve(h1, 'vertex');
+  assert.equal(afterH1.source, 'pack');
+  assert.equal(afterH1.wgsl, v2Wgsl);
+  assert.equal(afterH1.entryPoint, 'vs_v2');
+
+  const afterH2 = router.resolve(h2, 'vertex');
+  assert.equal(afterH2.source, 'pack');
+  assert.equal(afterH2.wgsl, PACK_VS_WGSL);
+
+  // 2) Versioned in-place pack reload automatically detected on next resolve().
+  const versionedEntries = new Map([[h1, v1Wgsl]]);
+  const versionedLoader = {
+    version: 1,
+    getSource(key) {
+      return versionedEntries.get(typeof key === 'bigint' ? formatShaderHash(key) : key);
+    },
+  };
+  router.setPackLoader(versionedLoader);
+  assert.equal(router.resolve(h1, 'vertex').wgsl, v1Wgsl);
+  assert.equal(router.resolve(h2, 'vertex').source, 'builtin');
+
+  versionedEntries.set(h1, v2Wgsl);
+  versionedEntries.set(h2, PACK_VS_WGSL);
+  versionedLoader.version = 2;
+
+  assert.equal(router.resolve(h1, 'vertex').wgsl, v2Wgsl);
+  assert.equal(router.resolve(h2, 'vertex').source, 'pack');
+
+  // 3) Map packLoader size change automatically invalidates cache.
+  const mapPack = new Map([[h1, v1Wgsl]]);
+  router.setPackLoader(mapPack);
+  assert.equal(router.resolve(h2, 'vertex').source, 'builtin');
+  mapPack.set(h2, PACK_VS_WGSL);
+  assert.equal(router.resolve(h2, 'vertex').source, 'pack');
+
+  // 4) Same-size in-place reload invalidated explicitly via onPackReload() / invalidateCache().
+  mapPack.set(h1, v2Wgsl);
+  router.onPackReload();
+  assert.equal(router.resolve(h1, 'vertex').wgsl, v2Wgsl);
+
+  // 5) setFallbackHashes and registerRealShader / unregisterRealShader invalidate cached misses.
+  const fbRouter = new ShaderFallbackRouter({
+    packLoader: createS9PackLoader(),
+    now: () => 20,
+  });
+  assert.equal(fbRouter.resolve(h1, 'vertex').source, 'builtin');
+  fbRouter.setFallbackHashes({ vertex: S9_FALLBACK_HASHES.vertex });
+  assert.equal(fbRouter.resolve(h1, 'vertex').source, 'fallback');
+
+  fbRouter.registerRealShader(h1, 'vertex', { wgsl: PACK_VS_WGSL, entryPoint: 'vs_main' });
+  const guarded = fbRouter.resolve(h1, 'vertex');
+  assert.equal(guarded.source, 'real');
+  assert.equal(guarded.fallbackBlocked, true);
+
+  fbRouter.unregisterRealShader(h1, 'vertex');
+  assert.equal(fbRouter.resolve(h1, 'vertex').source, 'fallback');
+
+  // 6) Ranged-mode WGPK entries whose payload is still in flight are not negatively cached,
+  //    so once the HTTP 206 Range payload lands in LRU, the next resolve() returns 'pack'.
+  const rangedKey = normalizeShaderHash(h1);
+  const rangedLru = new Map();
+  const rangedPackStub = { mode: 'ranged' };
+  const rangedLoader = {
+    _shaderEntries: new Map([[rangedKey, { pack: rangedPackStub }]]),
+    getWgsl(key) {
+      return rangedLru.get(normalizeShaderHash(key));
+    },
+  };
+  const rangedRouter = new ShaderFallbackRouter({ packLoader: rangedLoader, now: () => 30 });
+  assert.equal(rangedRouter.resolve(h1, 'vertex').source, 'builtin');
+  assert.equal(rangedRouter.getResolveCacheStats().entries, 0);
+  rangedLru.set(rangedKey, PACK_VS_WGSL);
+  const rangedReady = rangedRouter.resolve(h1, 'vertex');
+  assert.equal(rangedReady.source, 'pack');
+  assert.equal(rangedReady.wgsl, PACK_VS_WGSL);
+  assert.equal(rangedRouter.getResolveCacheStats().entries, 1);
+});
+
+test('W204 bounded resolve cache eviction and option validation', () => {
+  assert.throws(
+    () => new ShaderFallbackRouter({ maxResolveCacheEntries: -1 }),
+    /maxResolveCacheEntries/
+  );
+  assert.throws(
+    () => new ShaderFallbackRouter({ maxResolveCacheEntries: 1.5 }),
+    /maxResolveCacheEntries/
+  );
+
+  let lookups = 0;
+  const backing = createMapPackLoader({
+    '0x0000000000000001': PACK_VS_WGSL,
+    '0x0000000000000002': PACK_VS_WGSL,
+    '0x0000000000000003': PACK_VS_WGSL,
+  });
+  const router = new ShaderFallbackRouter({
+    maxResolveCacheEntries: 2,
+    packLoader: {
+      getSource(key) {
+        lookups += 1;
+        return backing.get(key);
+      },
+    },
+  });
+
+  router.resolve('0x0000000000000001', 'vertex');
+  router.resolve('0x0000000000000002', 'vertex');
+  assert.equal(router.getResolveCacheStats().entries, 2);
+
+  // Both 1 and 2 are cached (even across BigInt/hex formats).
+  const beforeHits = lookups;
+  router.resolve(1n, 'vertex');
+  router.resolve(2n, 'vertex');
+  assert.equal(lookups, beforeHits);
+
+  // Adding a 3rd entry evicts oldest (1), keeping entries capped at 2.
+  router.resolve('0x0000000000000003', 'vertex');
+  assert.equal(router.getResolveCacheStats().entries, 2);
+
+  // 2 and 3 hit cache without querying packLoader; 1 misses and re-queries.
+  const after3 = lookups;
+  router.resolve('0x0000000000000002', 'vertex');
+  router.resolve('0x0000000000000003', 'vertex');
+  assert.equal(lookups, after3);
+  router.resolve('0x0000000000000001', 'vertex');
+  assert.ok(lookups > after3);
+
+  // maxResolveCacheEntries: 0 disables memoization cleanly.
+  let uncachedLookups = 0;
+  const uncached = new ShaderFallbackRouter({
+    maxResolveCacheEntries: 0,
+    packLoader: {
+      getSource(key) {
+        uncachedLookups += 1;
+        return backing.get(key);
+      },
+    },
+  });
+  uncached.resolve('0x0000000000000001', 'vertex');
+  uncached.resolve('0x0000000000000001', 'vertex');
+  assert.equal(uncachedLookups, 2);
+  assert.equal(uncached.getResolveCacheStats().entries, 0);
+  assert.equal(uncached.getResolveCacheStats().hits, 0);
+});
+
+test('W204 frame tracking and fast min-heap getTopMissingShaders ranking accuracy across 500+ hashes', () => {
+  const router = new ShaderFallbackRouter({ initialFrame: 1, now: () => 500 });
+  assert.equal(router.getCurrentFrame(), 1);
+
+  assert.throws(() => router.setFrame(-1), RangeError);
+  assert.throws(() => router.setFrame(1.5), RangeError);
+  assert.throws(() => router.advanceFrame(-1), RangeError);
+
+  const stages = ['vertex', 'fragment', 'compute'];
+  const expected = [];
+
+  // Populate 520 unique missing (hash, stage) pairs across multiple frames with deterministic counts.
+  for (let i = 1; i <= 520; i += 1) {
+    const hashBig = BigInt(0x10000 + i);
+    const hashHex = formatShaderHash(hashBig);
+    const stage = stages[i % 3];
+    const count = (i % 17 === 0) ? 20 + (i % 7) : (i % 5) + 1;
+    const firstFrame = i;
+    const lastFrame = i + count - 1;
+
+    for (let c = 0; c < count; c += 1) {
+      router.setFrame(firstFrame + c);
+      router.resolve(hashBig, stage);
+    }
+    expected.push({
+      hash: hashHex,
+      hashHex,
+      stage,
+      count,
+      firstSeenFrame: firstFrame,
+      lastSeenFrame: lastFrame,
+    });
+  }
+
+  // Also test advanceFrame() and per-call { frame } override on an existing hot missing hash.
+  router.setFrame(900);
+  assert.equal(router.advanceFrame(), 901);
+  assert.equal(router.advanceFrame(4), 905);
+  const hotEntry = expected[0];
+  router.resolve(hotEntry.hash, hotEntry.stage, { frame: 999 });
+  hotEntry.count += 1;
+  hotEntry.lastSeenFrame = 999;
+
+  expected.sort(
+    (a, b) =>
+      b.count - a.count ||
+      (a.hash < b.hash ? -1 : a.hash > b.hash ? 1 : 0) ||
+      (a.stage < b.stage ? -1 : a.stage > b.stage ? 1 : 0)
+  );
+
+  // Verify exact top-N match against full sort for small, medium, and full limits.
+  for (const limit of [1, 5, 16, 32, 100, 520, 1000]) {
+    const actual = router.getTopMissingShaders(limit);
+    assert.deepEqual(actual, expected.slice(0, limit));
+  }
+
+  // Strictly sanitized: zero host paths, binary dumps, or WGSL text.
+  const top16 = router.getTopMissingShaders(16);
+  const json = JSON.stringify(top16);
+  assert.deepEqual(JSON.parse(json), top16);
+  assert.equal(json.includes('@vertex'), false);
+  assert.equal(json.includes('@fragment'), false);
+  assert.equal(json.includes('C:\\'), false);
+  assert.equal(json.includes('/Users/'), false);
+});
+
+test('W204 resetMissingTelemetry clears missing tracking while preserving pack cache, real shaders, and lookup stats', () => {
+  const packHash = '0x000000000000aa11';
+  const realHash = '0x000000000000bb22';
+  const missA = '0x000000000000cc33';
+  const missB = '0x000000000000dd44';
+  const missOverflow = '0x000000000000ee55';
+
+  let packCalls = 0;
+  const backing = createMapPackLoader({ [packHash]: PACK_VS_WGSL });
+  const router = new ShaderFallbackRouter({
+    packLoader: {
+      getSource(key) {
+        packCalls += 1;
+        return backing.get(key);
+      },
+    },
+    maxTrackedMissingHashes: 2,
+    initialFrame: 10,
+    now: () => 1000,
+  });
+
+  router.registerRealShader(realHash, 'fragment', { wgsl: MENU_UI_PS_WGSL });
+
+  // Warm pack hit + fill bounded missing cap + trigger overflow.
+  router.resolve(packHash, 'vertex');
+  router.resolve(missA, 'vertex');
+  router.resolve(missA, 'vertex');
+  router.resolve(missB, 'fragment');
+  router.resolve(missOverflow, 'compute'); // overflows cap of 2
+  router.resolve(missOverflow, 'compute'); // cached miss hit while overflowed -> still increments overflow!
+  const callsBeforeReset = packCalls;
+
+  assert.equal(router.getStats().uniqueMissing, 2);
+  assert.equal(router.getStats().overflowMissingHashes, 2);
+  assert.equal(router.getTopMissingShaders().length, 2);
+  assert.equal(router.getMissingShaderSummary().totalMissingEvents, 5);
+
+  // resetMissingTelemetry() clears missing & categorized telemetry only.
+  router.resetMissingTelemetry();
+  assert.equal(router.getStats().uniqueMissing, 0);
+  assert.equal(router.getStats().overflowMissingHashes, 0);
+  assert.equal(router.getStats().overflowMissingCount, 0);
+  assert.equal(router.getStats().packHits, 1, 'packHits preserved by resetMissingTelemetry');
+  assert.equal(router.getStats().totalLookups, 6, 'totalLookups preserved by resetMissingTelemetry');
+  assert.deepEqual(router.getTopMissingShaders(), []);
+  assert.deepEqual(router.getMissingReport(), []);
+  assert.equal(router.getMissingShaderSummary().totalMissingEvents, 0);
+  assert.equal(router.hasRealShader(realHash, 'fragment'), true);
+
+  // Memoized pack shader still hits fast-path cache without re-querying packLoader.
+  router.resolve(packHash, 'vertex');
+  assert.equal(packCalls, callsBeforeReset);
+
+  // Previously cached & overflowed missing hashes re-track cleanly with new frame numbers.
+  router.setFrame(42);
+  router.resolve(missOverflow, 'compute');
+  router.setFrame(45);
+  router.resolve(missOverflow, 'compute');
+  router.resolve(missA, 'vertex');
+
+  assert.deepEqual(router.getTopMissingShaders(), [
+    {
+      hash: missOverflow,
+      hashHex: missOverflow,
+      stage: 'compute',
+      count: 2,
+      firstSeenFrame: 42,
+      lastSeenFrame: 45,
+    },
+    {
+      hash: missA,
+      hashHex: missA,
+      stage: 'vertex',
+      count: 1,
+      firstSeenFrame: 45,
+      lastSeenFrame: 45,
+    },
+  ]);
+  assert.equal(router.getStats().uniqueMissing, 2);
+  assert.equal(router.getStats().overflowMissingHashes, 0);
+});
+
+test('W204 classic Worker importScripts isolation exposes W204 APIs with zero global leaks', () => {
+  const source = readFileSync(ROUTER_PATH, 'utf8');
+  const sandbox = { console, performance };
+  const vmCtx = vm.createContext(sandbox);
+  vmCtx.self = vmCtx;
+
+  vm.runInContext(source, vmCtx, { filename: ROUTER_PATH });
+  vm.runInContext(source, vmCtx, { filename: ROUTER_PATH });
+
+  assert.doesNotThrow(() => {
+    vm.runInContext(
+      `
+      const DEFAULT_MAX_RESOLVE_CACHE_ENTRIES = 0;
+      const ENTRY_POINT_REGEXES = {};
+      const FALLBACK_FN_REGEX = /x/;
+      `,
+      vmCtx
+    );
+  });
+
+  const api = vmCtx.PlayGta6ShaderFallbackRouter;
+  assert.equal(api.DEFAULT_MAX_RESOLVE_CACHE_ENTRIES, 8192);
+  const r = new api.ShaderFallbackRouter();
+  assert.equal(typeof r.resetMissingTelemetry, 'function');
+  assert.equal(typeof r.invalidateCache, 'function');
+  assert.equal(typeof r.onPackReload, 'function');
+  assert.equal(typeof r.getResolveCacheStats, 'function');
+  assert.equal(typeof r.setFrame, 'function');
+  assert.equal(typeof r.advanceFrame, 'function');
+  assert.equal(typeof r.getCurrentFrame, 'function');
 });
