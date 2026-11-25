@@ -37,6 +37,7 @@ const {
   RPF_ENTRY_FLAG_RESOURCE,
   RPF_ENTRY_FLAG_ENCRYPTED,
   DEFAULT_PATH_CACHE_CAPACITY,
+  DEFAULT_NEGATIVE_CACHE_CAPACITY,
   DEFAULT_DIR_CACHE_CAPACITY,
   DEFAULT_TOC_CACHE_CAPACITY,
   RpfFormatError,
@@ -818,6 +819,10 @@ test('web/workers/rpf9_vfs.js loads cleanly in a classic Web Worker global conte
   assert.equal(typeof sandbox.PlayGta6Rpf9Vfs.RpfVfsMountTable, 'function');
   assert.equal(typeof sandbox.PlayGta6Rpf9Vfs.buildSyntheticRpf9Buffer, 'function');
   assert.equal(sandbox.PlayGta6Rpf9Vfs.DEFAULT_PATH_CACHE_CAPACITY, DEFAULT_PATH_CACHE_CAPACITY);
+  assert.equal(
+    sandbox.PlayGta6Rpf9Vfs.DEFAULT_NEGATIVE_CACHE_CAPACITY,
+    DEFAULT_NEGATIVE_CACHE_CAPACITY
+  );
   assert.equal(sandbox.PlayGta6Rpf9Vfs.DEFAULT_TOC_CACHE_CAPACITY, DEFAULT_TOC_CACHE_CAPACITY);
 });
 
@@ -1584,5 +1589,263 @@ test('Large synthetic TOC (5,200+ entries) O(1) hash/path lookup correctness and
       assert.equal(typeof val, 'number', `Stat field ${key} must be numeric`);
       assert.ok(Number.isFinite(val) && val >= 0);
     }
+  }
+});
+
+test('RpfArchiveVfs O(1) pathIndexHits, bounded negative-lookup LRU cache, eviction, and reset/reload invalidation', async () => {
+  assert.equal(DEFAULT_NEGATIVE_CACHE_CAPACITY, 2048);
+
+  const archiveV1 = buildSyntheticRpf9Buffer([
+    { path: 'x64/Textures/Hud_Main.ytd', data: 'HUD_V1_DATA' },
+    { path: 'common/Data/GameConfig.xml', data: '<cfg v="1"/>' },
+  ]);
+  const archiveV2 = buildSyntheticRpf9Buffer([
+    { path: 'x64/Textures/Hud_Main.ytd', data: 'HUD_V2_DATA' },
+    { path: 'common/Data/GameConfig.xml', data: '<cfg v="2"/>' },
+    { path: 'x64/Textures/New_Banner.ytd', data: 'BANNER_V2' },
+  ]);
+
+  const vfs = await RpfArchiveVfs.open(
+    createTrackingRangeReader(archiveV1).readRange,
+    archiveV1.byteLength,
+    {
+      archivePath: 'x64/ui_neg_test.rpf',
+      pathCacheCapacity: 2,
+      maxNegativeEntries: 3,
+    }
+  );
+
+  const init = vfs.getStats();
+  assert.equal(init.pathIndexHits, 0);
+  assert.equal(init.negativeLookupHits, 0);
+  assert.equal(init.negativeLookupEntries, 0);
+  assert.equal(init.negativeLookupCapacity, 3);
+  assert.equal(init.negativeLookupEvictions, 0);
+  assert.ok(init.indexedEntries >= 5);
+
+  // Case-insensitive + backslash-normalized O(1) lookups increment pathIndexHits.
+  assert.ok(vfs.stat('///X64\\\\TEXTURES\\hud_main.ytd'));
+  assert.ok(vfs.open('\\COMMON\\data\\./GAMECONFIG.XML'));
+  assert.equal(vfs.getStats().pathIndexHits, 2);
+  assert.equal(vfs.getStats().resolvedPathCacheSize, 2);
+
+  // Hash-only lookup increments lookupHits without inflating pathIndexHits.
+  const hudHash = hashVirtualPath('x64/textures/hud_main.ytd');
+  assert.ok(vfs.lookupByHash(hudHash));
+  assert.equal(vfs.getStats().pathIndexHits, 2);
+  assert.equal(vfs.getStats().lookupHits, 3);
+
+  // Probe 3 distinct missing paths with mixed-case/backslash variants -> bounded negative cache fills to 3
+  // without polluting or evicting the 2 positive entries in resolvedPathCache!
+  assert.equal(vfs.stat('\\X64\\Missing\\One.ytd'), null);
+  assert.equal(vfs.stat('X64/Missing/Two.ytd'), null);
+  assert.throws(
+    () => vfs.open('///x64\\\\missing//THREE.YTD'),
+    (err) => err instanceof RpfFormatError && err.code === 'PATH_NOT_FOUND'
+  );
+  assert.equal(vfs.getStats().negativeLookupEntries, 3);
+  assert.equal(vfs.getStats().negativeLookupHits, 0);
+  assert.equal(vfs.getStats().negativeLookupEvictions, 0);
+  assert.equal(vfs.getStats().resolvedPathCacheSize, 2);
+  assert.equal(vfs.getStats().resolvedPathCacheEvictions, 0);
+
+  // Repeat M1 with exact same raw spelling (zero re-normalization) AND an alternate normalized variant:
+  // both hit negative cache, promote M1 to MRU, and keep negativeLookupEntries at exactly 3.
+  assert.equal(vfs.stat('\\X64\\Missing\\One.ytd'), null);
+  assert.equal(vfs.stat('/x64/MISSING/one.ytd'), null);
+  assert.equal(vfs.getStats().negativeLookupHits, 2);
+  assert.equal(vfs.getStats().negativeLookupEntries, 3);
+
+  // Insert M4 -> evicts LRU M2 (and its raw aliases), keeping M3, M1, M4.
+  assert.equal(vfs.stat('x64/missing/four.ytd'), null);
+  assert.equal(vfs.getStats().negativeLookupEntries, 3);
+  assert.equal(vfs.getStats().negativeLookupEvictions, 1);
+
+  // M1 (including both raw spellings) is still cached -> negativeLookupHits increments to 4.
+  assert.equal(vfs.stat('\\X64\\Missing\\One.ytd'), null);
+  assert.equal(vfs.stat('/x64/MISSING/one.ytd'), null);
+  assert.equal(vfs.getStats().negativeLookupHits, 4);
+
+  // M2 was evicted -> probing it is a miss (negativeLookupHits stays 4) and evicts M3 (evictions = 2).
+  assert.equal(vfs.stat('X64/Missing/Two.ytd'), null);
+  assert.equal(vfs.getStats().negativeLookupHits, 4);
+  assert.equal(vfs.getStats().negativeLookupEvictions, 2);
+
+  // Invalid paths are never cached negatively and always throw INVALID_PATH.
+  assert.throws(
+    () => vfs.stat('../escape/missing.ytd'),
+    (err) => err instanceof RpfFormatError && err.code === 'INVALID_PATH'
+  );
+  assert.throws(
+    () => vfs.stat('x64/bad\0path.ytd'),
+    (err) => err instanceof RpfFormatError && err.code === 'INVALID_PATH'
+  );
+
+  // clearCaches() clears both positive & negative caches without dropping indexedEntries.
+  vfs.clearCaches();
+  assert.equal(vfs.getStats().negativeLookupEntries, 0);
+  assert.equal(vfs.getStats().resolvedPathCacheSize, 0);
+  assert.ok(vfs.getStats().indexedEntries >= 5);
+
+  // reset() clears caches and zeroes telemetry counters while keeping archive operational.
+  assert.equal(vfs.stat('x64/missing/after_clear.ytd'), null);
+  assert.equal(vfs.getStats().negativeLookupEntries, 1);
+  vfs.reset();
+  const afterReset = vfs.getStats();
+  assert.equal(afterReset.pathIndexHits, 0);
+  assert.equal(afterReset.negativeLookupHits, 0);
+  assert.equal(afterReset.negativeLookupEntries, 0);
+  assert.equal(afterReset.negativeLookupEvictions, 0);
+  assert.equal(afterReset.resolvedPathCacheSize, 0);
+  assert.ok(afterReset.indexedEntries >= 5);
+
+  // Capacity 0 disables negative lookup caching cleanly.
+  const noNegVfs = await RpfArchiveVfs.open(
+    createTrackingRangeReader(archiveV1).readRange,
+    archiveV1.byteLength,
+    { maxNegativeEntries: 0 }
+  );
+  assert.equal(noNegVfs.stat('x64/missing/disabled.ytd'), null);
+  assert.equal(noNegVfs.stat('x64/missing/disabled.ytd'), null);
+  assert.equal(noNegVfs.getStats().negativeLookupCapacity, 0);
+  assert.equal(noNegVfs.getStats().negativeLookupEntries, 0);
+  assert.equal(noNegVfs.getStats().negativeLookupHits, 0);
+
+  // RpfArchiveVfs.open(..., { tocCache, reload: true }) bypasses stale TOC cache and refreshes index.
+  const tocCache = new RpfTocCache({ capacity: 4 });
+  const r1 = await RpfArchiveVfs.open(createTrackingRangeReader(archiveV1).readRange, archiveV1.byteLength, {
+    archivePath: 'x64/reloadable.rpf',
+    tocCacheKey: 'reloadable',
+    tocCache,
+  });
+  assert.equal(r1.stat('x64/textures/new_banner.ytd'), null);
+
+  const r2 = await RpfArchiveVfs.open(createTrackingRangeReader(archiveV2).readRange, archiveV2.byteLength, {
+    archivePath: 'x64/reloadable.rpf',
+    tocCacheKey: 'reloadable',
+    tocCache,
+    reload: true,
+  });
+  assert.ok(r2.stat('x64/textures/new_banner.ytd'));
+  assert.equal(decoder.decode(await r2.readFile('x64/textures/hud_main.ytd')), 'HUD_V2_DATA');
+
+  // Subsequent cached open sees refreshed v2 TOC with zero range reads.
+  const trackerV2Cached = createTrackingRangeReader(archiveV2);
+  const r3 = await RpfArchiveVfs.open(trackerV2Cached.readRange, archiveV2.byteLength, {
+    archivePath: 'x64/reloadable.rpf',
+    tocCacheKey: 'reloadable',
+    tocCache,
+  });
+  assert.equal(trackerV2Cached.reads.length, 0);
+  assert.ok(r3.stat('x64/textures/new_banner.ytd'));
+});
+
+test('RpfVfsMountTable O(1) normalized-path index, negative LRU eviction, and mount/unmount/reload/reset invalidation', async () => {
+  const baseBuf = buildSyntheticRpf9Buffer([
+    { path: 'Textures/Hud.ytd', data: 'BASE_HUD' },
+    { path: 'Data/Base.meta', data: '<base/>' },
+  ]);
+  const dlcBuf = buildSyntheticRpf9Buffer([
+    { path: 'Textures/Hud.ytd', data: 'DLC_HUD_V2' },
+    { path: 'Textures/Dlc_Only.ytd', data: 'DLC_ONLY_BYTES' },
+  ]);
+  const reloadedBaseBuf = buildSyntheticRpf9Buffer([
+    { path: 'Textures/Hud.ytd', data: 'RELOADED_BASE_HUD' },
+    { path: 'Data/Reloaded.meta', data: '<reloaded/>' },
+  ]);
+
+  const baseVfs = await RpfArchiveVfs.open(createTrackingRangeReader(baseBuf).readRange, baseBuf.byteLength);
+  const dlcVfs = await RpfArchiveVfs.open(createTrackingRangeReader(dlcBuf).readRange, dlcBuf.byteLength);
+  const reloadedBaseVfs = await RpfArchiveVfs.open(
+    createTrackingRangeReader(reloadedBaseBuf).readRange,
+    reloadedBaseBuf.byteLength
+  );
+
+  const table = new RpfVfsMountTable({
+    pathCacheCapacity: 4,
+    maxNegativeEntries: 2,
+  });
+  const mBase = table.mount('x64/', baseVfs, { priority: 10 });
+
+  // O(1) normalized lookups increment pathIndexHits.
+  assert.ok(table.stat('///X64\\\\TEXTURES\\HUD.YTD'));
+  const hudHandle = table.open('\\x64/textures\\hud.ytd');
+  assert.equal(decoder.decode(await hudHandle.readAll()), 'BASE_HUD');
+  assert.equal(table.getStats().pathIndexHits, 2);
+
+  // Negative lookup cache hits across mixed-case/backslash variants and evicts LRU at capacity = 2.
+  assert.equal(table.stat('X64\\Textures\\Dlc_Only.ytd'), null);
+  assert.equal(table.stat('x64/textures/never_exists.ytd'), null);
+  assert.equal(table.getStats().negativeLookupEntries, 2);
+  assert.equal(table.getStats().negativeLookupHits, 0);
+
+  // Touch Dlc_Only with different casing -> negative cache hit + MRU promotion.
+  assert.equal(table.stat('/x64/TEXTURES/dlc_only.ytd'), null);
+  assert.throws(
+    () => table.open('X64\\Textures\\Dlc_Only.ytd'),
+    (err) => err instanceof RpfFormatError && err.code === 'PATH_NOT_FOUND'
+  );
+  assert.equal(table.getStats().negativeLookupHits, 2);
+
+  // Insert 3rd missing path -> evicts 'x64/textures/never_exists.ytd' (LRU).
+  assert.equal(table.stat('x64/textures/another_miss.ytd'), null);
+  assert.equal(table.getStats().negativeLookupEntries, 2);
+  assert.equal(table.getStats().negativeLookupEvictions, 1);
+
+  // Mounting dlcVfs invalidates negative cache so previously missing Dlc_Only.ytd resolves immediately!
+  const mDlc = table.mount('x64/', dlcVfs, { priority: 20 });
+  assert.equal(table.getStats().negativeLookupEntries, 0);
+  assert.equal(table.getStats().resolvedPathCacheSize, 0);
+  const dlcStat = table.stat('X64\\Textures\\Dlc_Only.ytd');
+  assert.ok(dlcStat);
+  assert.equal(dlcStat.mountId, mDlc.id);
+  assert.equal(decoder.decode(await table.readFile('x64/textures/dlc_only.ytd')), 'DLC_ONLY_BYTES');
+
+  // Populate negative cache again, then unmount dlcVfs -> negative & positive caches invalidated cleanly.
+  assert.equal(table.stat('x64/textures/missing_before_unmount.ytd'), null);
+  assert.equal(table.getStats().negativeLookupEntries, 1);
+  assert.equal(table.unmount(mDlc.id), true);
+  assert.equal(table.getStats().negativeLookupEntries, 0);
+  assert.equal(table.getStats().resolvedPathCacheSize, 0);
+  assert.equal(table.stat('x64/textures/dlc_only.ytd'), null);
+  assert.equal(decoder.decode(await table.readFile('x64/textures/hud.ytd')), 'BASE_HUD');
+
+  // Probe missing Data/Reloaded.meta -> cached negatively, then reload mBase -> cache invalidated & file found!
+  assert.equal(table.stat('x64/data/reloaded.meta'), null);
+  assert.equal(table.stat('X64\\DATA\\RELOADED.META'), null);
+  assert.ok(table.getStats().negativeLookupHits >= 3);
+  assert.equal(table.reload('nonexistent_mount', reloadedBaseVfs), false);
+  assert.equal(table.reload(mBase.id, reloadedBaseVfs), true);
+  assert.equal(table.getStats().negativeLookupEntries, 0);
+  assert.equal(table.getStats().resolvedPathCacheSize, 0);
+  assert.equal(table.stat('x64/data/base.meta'), null);
+  assert.equal(decoder.decode(await table.readFile('x64/data/reloaded.meta')), '<reloaded/>');
+  assert.equal(decoder.decode(await table.readFile('x64/textures/hud.ytd')), 'RELOADED_BASE_HUD');
+
+  // clearPathCache() / clearCaches() clears negative cache while preserving mounts & index.
+  assert.equal(table.stat('x64/data/still_missing.meta'), null);
+  assert.ok(table.getStats().negativeLookupEntries >= 1);
+  table.clearCaches();
+  assert.equal(table.getStats().negativeLookupEntries, 0);
+  assert.equal(table.getStats().resolvedPathCacheSize, 0);
+  assert.equal(table.getStats().mountedArchives, 1);
+
+  // reset() unmounts all archives, clears index & caches, and resets all counters to 0.
+  table.reset();
+  const resetStats = table.getStats();
+  assert.equal(resetStats.mountedArchives, 0);
+  assert.equal(resetStats.indexedEntries, 0);
+  assert.equal(resetStats.pathIndexHits, 0);
+  assert.equal(resetStats.negativeLookupHits, 0);
+  assert.equal(resetStats.negativeLookupEntries, 0);
+  assert.equal(resetStats.negativeLookupEvictions, 0);
+  assert.equal(resetStats.resolvedPathCacheSize, 0);
+  assert.equal(resetStats.lookupHits, 0);
+  assert.equal(resetStats.lookupMisses, 0);
+
+  // Verify strict numeric-only sanitization on all stats fields.
+  for (const [key, val] of Object.entries(resetStats)) {
+    assert.equal(typeof val, 'number', `RpfVfsMountTable.getStats().${key} must be numeric`);
+    assert.ok(Number.isFinite(val) && val >= 0);
   }
 });

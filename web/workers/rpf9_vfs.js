@@ -78,6 +78,7 @@ const MAX_U64_BIGINT = 0xffffffffffffffffn;
 const MAX_SAFE_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
 
 const DEFAULT_PATH_CACHE_CAPACITY = 1024;
+const DEFAULT_NEGATIVE_CACHE_CAPACITY = 2048;
 const DEFAULT_DIR_CACHE_CAPACITY = 256;
 const DEFAULT_TOC_CACHE_CAPACITY = 64;
 
@@ -219,6 +220,24 @@ class BoundedLruCache {
     return val;
   }
 
+  getIfPresent(key) {
+    if (this._capacity <= 0) {
+      return undefined;
+    }
+    const val = this._map.get(key);
+    if (val === undefined) {
+      return undefined;
+    }
+    this._map.delete(key);
+    this._map.set(key, val);
+    this._hits += 1;
+    return val;
+  }
+
+  recordMiss() {
+    this._misses += 1;
+  }
+
   set(key, value) {
     if (this._capacity <= 0 || value === undefined) {
       return;
@@ -243,6 +262,168 @@ class BoundedLruCache {
 
   clear() {
     this._map.clear();
+  }
+
+  resetStats() {
+    this._hits = 0;
+    this._misses = 0;
+    this._evictions = 0;
+  }
+}
+
+/**
+ * O(1) bounded LRU negative-lookup cache backed by JavaScript Map insertion order.
+ * Keyed by normalized lowercase virtual path with bounded non-canonical raw-path
+ * aliases so repeated missing probes (canonical or mixed-case/backslash) resolve
+ * in O(1) without repeating path normalization or polluting the positive cache.
+ */
+class BoundedNegativeLookupCache {
+  constructor(capacity = DEFAULT_NEGATIVE_CACHE_CAPACITY) {
+    this._capacity = normalizeCacheCapacity(capacity, DEFAULT_NEGATIVE_CACHE_CAPACITY);
+    this._map = new Map();
+    this._rawToNorm = new Map();
+    this._hits = 0;
+    this._misses = 0;
+    this._evictions = 0;
+  }
+
+  get capacity() {
+    return this._capacity;
+  }
+
+  get size() {
+    return this._map.size;
+  }
+
+  get hits() {
+    return this._hits;
+  }
+
+  get misses() {
+    return this._misses;
+  }
+
+  get evictions() {
+    return this._evictions;
+  }
+
+  _deleteRawAliases(aliases) {
+    if (aliases === null || aliases === undefined) {
+      return;
+    }
+    if (typeof aliases === 'string') {
+      this._rawToNorm.delete(aliases);
+      return;
+    }
+    for (const raw of aliases) {
+      this._rawToNorm.delete(raw);
+    }
+  }
+
+  _attachRawAlias(normKey, rawKey) {
+    if (typeof rawKey !== 'string' || rawKey === normKey || this._rawToNorm.has(rawKey)) {
+      return;
+    }
+    const aliases = this._map.get(normKey);
+    if (aliases === undefined) {
+      return;
+    }
+    if (aliases === null) {
+      this._map.set(normKey, rawKey);
+      this._rawToNorm.set(rawKey, normKey);
+    } else if (typeof aliases === 'string') {
+      const set = new Set([aliases, rawKey]);
+      this._map.set(normKey, set);
+      this._rawToNorm.set(rawKey, normKey);
+    } else if (aliases.size < 4) {
+      aliases.add(rawKey);
+      this._rawToNorm.set(rawKey, normKey);
+    }
+  }
+
+  getByRaw(rawKey) {
+    if (this._capacity <= 0) {
+      return null;
+    }
+    if (this._map.has(rawKey)) {
+      const aliases = this._map.get(rawKey);
+      this._map.delete(rawKey);
+      this._map.set(rawKey, aliases);
+      this._hits += 1;
+      return rawKey;
+    }
+    const normKey = this._rawToNorm.get(rawKey);
+    if (normKey !== undefined) {
+      const aliases = this._map.get(normKey);
+      if (aliases !== undefined) {
+        this._map.delete(normKey);
+        this._map.set(normKey, aliases);
+        this._hits += 1;
+        return normKey;
+      }
+      this._rawToNorm.delete(rawKey);
+    }
+    return null;
+  }
+
+  getByNormalized(normKey, rawKey = undefined) {
+    if (this._capacity <= 0) {
+      return false;
+    }
+    const aliases = this._map.get(normKey);
+    if (aliases === undefined) {
+      return false;
+    }
+    this._map.delete(normKey);
+    this._map.set(normKey, aliases);
+    if (rawKey !== undefined && rawKey !== normKey) {
+      this._attachRawAlias(normKey, rawKey);
+    }
+    this._hits += 1;
+    return true;
+  }
+
+  set(normKey, rawKey = undefined) {
+    this._misses += 1;
+    if (this._capacity <= 0) {
+      return;
+    }
+    if (this._map.has(normKey)) {
+      const aliases = this._map.get(normKey);
+      this._map.delete(normKey);
+      this._map.set(normKey, aliases);
+    } else {
+      if (this._map.size >= this._capacity) {
+        const oldestKey = this._map.keys().next().value;
+        const oldestAliases = this._map.get(oldestKey);
+        this._map.delete(oldestKey);
+        this._deleteRawAliases(oldestAliases);
+        this._evictions += 1;
+      }
+      this._map.set(normKey, null);
+    }
+    if (rawKey !== undefined && rawKey !== normKey) {
+      this._attachRawAlias(normKey, rawKey);
+    }
+  }
+
+  has(normKey) {
+    return this._capacity > 0 && this._map.has(normKey);
+  }
+
+  delete(normKey) {
+    const aliases = this._map.get(normKey);
+    if (aliases === undefined) {
+      return false;
+    }
+    this._map.delete(normKey);
+    this._deleteRawAliases(aliases);
+    return true;
+  }
+
+  clear() {
+    this._map.clear();
+    this._rawToNorm.clear();
   }
 
   resetStats() {
@@ -741,10 +922,21 @@ class RpfArchiveVfs {
         : options.resolvedPathCacheSize,
       DEFAULT_PATH_CACHE_CAPACITY
     );
+    const negativeCacheCap = normalizeCacheCapacity(
+      options.maxNegativeEntries !== undefined
+        ? options.maxNegativeEntries
+        : options.negativeCacheCapacity !== undefined
+          ? options.negativeCacheCapacity
+          : options.negativeLookupCacheCapacity,
+      DEFAULT_NEGATIVE_CACHE_CAPACITY
+    );
     this._resolvedPathCache = new BoundedLruCache(pathCacheCap);
+    this._negativeLookupCache = new BoundedNegativeLookupCache(negativeCacheCap);
     this._stats = {
       lookupHits: 0,
       lookupMisses: 0,
+      pathIndexHits: 0,
+      negativeLookupHits: 0,
       tocCacheHits: options._fromTocCache ? 1 : 0,
       compressedEntriesRead: 0,
       rawEntriesRead: 0,
@@ -772,8 +964,8 @@ class RpfArchiveVfs {
   }
 
   /**
-   * Returns sanitized numeric-only lookup, hash-index, TOC-cache, and read telemetry
-   * counters (zero filenames, archive paths, or host paths).
+   * Returns sanitized numeric-only lookup, hash-index, negative-cache, TOC-cache,
+   * and read telemetry counters (zero filenames, archive paths, or host paths).
    *
    * @returns {{
    *   entryCount: number,
@@ -783,6 +975,11 @@ class RpfArchiveVfs {
    *   hashCollisions: number,
    *   lookupHits: number,
    *   lookupMisses: number,
+   *   pathIndexHits: number,
+   *   negativeLookupHits: number,
+   *   negativeLookupEntries: number,
+   *   negativeLookupCapacity: number,
+   *   negativeLookupEvictions: number,
    *   tocCacheHits: number,
    *   tocCacheMisses: number,
    *   resolvedPathCacheSize: number,
@@ -803,6 +1000,11 @@ class RpfArchiveVfs {
       hashCollisions: this._hashCollisions,
       lookupHits: this._stats.lookupHits,
       lookupMisses: this._stats.lookupMisses,
+      pathIndexHits: this._stats.pathIndexHits,
+      negativeLookupHits: this._stats.negativeLookupHits,
+      negativeLookupEntries: this._negativeLookupCache.size,
+      negativeLookupCapacity: this._negativeLookupCache.capacity,
+      negativeLookupEvictions: this._negativeLookupCache.evictions,
       tocCacheHits: this._stats.tocCacheHits,
       tocCacheMisses: this._resolvedPathCache.misses,
       resolvedPathCacheSize: this._resolvedPathCache.size,
@@ -817,19 +1019,29 @@ class RpfArchiveVfs {
   resetStats() {
     this._stats.lookupHits = 0;
     this._stats.lookupMisses = 0;
+    this._stats.pathIndexHits = 0;
+    this._stats.negativeLookupHits = 0;
     this._stats.tocCacheHits = 0;
     this._stats.compressedEntriesRead = 0;
     this._stats.rawEntriesRead = 0;
     this._stats.bytesRead = 0;
     this._resolvedPathCache.resetStats();
+    this._negativeLookupCache.resetStats();
   }
 
   clearPathCache() {
     this._resolvedPathCache.clear();
+    this._negativeLookupCache.clear();
   }
 
   clearCaches() {
     this._resolvedPathCache.clear();
+    this._negativeLookupCache.clear();
+  }
+
+  reset() {
+    this.clearCaches();
+    this.resetStats();
   }
 
   _insertHashIndex(hash, node) {
@@ -988,7 +1200,8 @@ class RpfArchiveVfs {
       }
     }
 
-    if (tocCache && tocCacheKey) {
+    const forceReload = Boolean(options && (options.reload || options.forceReload));
+    if (tocCache && tocCacheKey && !forceReload) {
       const cachedToc = tocCache.get(tocCacheKey);
       if (cachedToc) {
         if (cachedToc.header.isEncrypted && !decryptBlock) {
@@ -1118,16 +1331,38 @@ class RpfArchiveVfs {
       return null;
     }
 
-    const cached = this._resolvedPathCache.get(rawKey);
+    const cached = this._resolvedPathCache.getIfPresent(rawKey);
     if (cached !== undefined) {
       this._stats.tocCacheHits += 1;
+      if (cached.node !== null) {
+        this._stats.pathIndexHits += 1;
+      }
       return cached.node;
     }
 
+    if (this._negativeLookupCache.getByRaw(rawKey) !== null) {
+      this._stats.negativeLookupHits += 1;
+      this._stats.tocCacheHits += 1;
+      return null;
+    }
+
     const norm = normalizeVirtualPath(rawKey);
+    if (norm.key !== rawKey && this._negativeLookupCache.getByNormalized(norm.key, rawKey)) {
+      this._stats.negativeLookupHits += 1;
+      this._stats.tocCacheHits += 1;
+      return null;
+    }
+
+    this._resolvedPathCache.recordMiss();
     const node = this._nodesByKey.get(norm.key) || null;
-    this._resolvedPathCache.set(rawKey, { key: norm.key, node });
-    return node;
+    if (node !== null) {
+      this._stats.pathIndexHits += 1;
+      this._resolvedPathCache.set(rawKey, { key: norm.key, node });
+      return node;
+    }
+
+    this._negativeLookupCache.set(norm.key, rawKey);
+    return null;
   }
 
   _lookupNodesByHash(pathHash) {
@@ -1479,16 +1714,27 @@ class RpfVfsMountTable {
         : options && options.resolvedPathCacheSize,
       DEFAULT_PATH_CACHE_CAPACITY
     );
+    const negativeCacheCap = normalizeCacheCapacity(
+      options && options.maxNegativeEntries !== undefined
+        ? options.maxNegativeEntries
+        : options && options.negativeCacheCapacity !== undefined
+          ? options.negativeCacheCapacity
+          : options && options.negativeLookupCacheCapacity,
+      DEFAULT_NEGATIVE_CACHE_CAPACITY
+    );
     const dirCacheCap = normalizeCacheCapacity(
       options && options.dirCacheCapacity,
       DEFAULT_DIR_CACHE_CAPACITY
     );
     this._resolvedPathCache = new BoundedLruCache(pathCacheCap);
+    this._negativeLookupCache = new BoundedNegativeLookupCache(negativeCacheCap);
     this._dirListingCache = new BoundedLruCache(dirCacheCap);
     this._tocCache = options && options.tocCache ? options.tocCache : null;
     this._stats = {
       lookupHits: 0,
       lookupMisses: 0,
+      pathIndexHits: 0,
+      negativeLookupHits: 0,
       tocCacheHits: 0,
       compressedEntriesRead: 0,
       rawEntriesRead: 0,
@@ -1509,8 +1755,8 @@ class RpfVfsMountTable {
   }
 
   /**
-   * Returns sanitized numeric-only mount table lookup, hash-index, TOC-cache,
-   * and read telemetry (zero filenames, mount prefixes, archive paths, or host paths).
+   * Returns sanitized numeric-only mount table lookup, hash-index, negative-cache,
+   * TOC-cache, and read telemetry (zero filenames, mount prefixes, archive paths, or host paths).
    *
    * @returns {{
    *   mountedArchives: number,
@@ -1520,6 +1766,11 @@ class RpfVfsMountTable {
    *   hashCollisions: number,
    *   lookupHits: number,
    *   lookupMisses: number,
+   *   pathIndexHits: number,
+   *   negativeLookupHits: number,
+   *   negativeLookupEntries: number,
+   *   negativeLookupCapacity: number,
+   *   negativeLookupEvictions: number,
    *   tocCacheHits: number,
    *   tocCacheMisses: number,
    *   resolvedPathCacheSize: number,
@@ -1541,6 +1792,11 @@ class RpfVfsMountTable {
       hashCollisions: this._hashCollisions,
       lookupHits: this._stats.lookupHits,
       lookupMisses: this._stats.lookupMisses,
+      pathIndexHits: this._stats.pathIndexHits,
+      negativeLookupHits: this._stats.negativeLookupHits,
+      negativeLookupEntries: this._negativeLookupCache.size,
+      negativeLookupCapacity: this._negativeLookupCache.capacity,
+      negativeLookupEvictions: this._negativeLookupCache.evictions,
       tocCacheHits: this._stats.tocCacheHits,
       tocCacheMisses: this._resolvedPathCache.misses + this._dirListingCache.misses,
       resolvedPathCacheSize: this._resolvedPathCache.size,
@@ -1556,22 +1812,33 @@ class RpfVfsMountTable {
   resetStats() {
     this._stats.lookupHits = 0;
     this._stats.lookupMisses = 0;
+    this._stats.pathIndexHits = 0;
+    this._stats.negativeLookupHits = 0;
     this._stats.tocCacheHits = 0;
     this._stats.compressedEntriesRead = 0;
     this._stats.rawEntriesRead = 0;
     this._stats.bytesRead = 0;
     this._resolvedPathCache.resetStats();
+    this._negativeLookupCache.resetStats();
     this._dirListingCache.resetStats();
   }
 
   clearPathCache() {
     this._resolvedPathCache.clear();
+    this._negativeLookupCache.clear();
     this._dirListingCache.clear();
   }
 
   clearCaches() {
     this._resolvedPathCache.clear();
+    this._negativeLookupCache.clear();
     this._dirListingCache.clear();
+  }
+
+  reset() {
+    this._mounts = [];
+    this._rebuildIndex();
+    this.resetStats();
   }
 
   _upsertHashIndex(pathHash, fullKey, record) {
@@ -1718,6 +1985,7 @@ class RpfVfsMountTable {
     this._hashCollisions = 0;
     this._virtualDirIndex.clear();
     this._resolvedPathCache.clear();
+    this._negativeLookupCache.clear();
     this._dirListingCache.clear();
     this._unindexedMounts = [];
     this._seedRootVirtualDir();
@@ -1827,6 +2095,7 @@ class RpfVfsMountTable {
       this._indexMount(record, true);
       this._indexVirtualPrefix(record);
       this._resolvedPathCache.clear();
+      this._negativeLookupCache.clear();
       this._dirListingCache.clear();
     } else {
       this._rebuildIndex();
@@ -1837,6 +2106,34 @@ class RpfVfsMountTable {
       priority: record.priority,
       order: record.order,
     };
+  }
+
+  reload(idOrVfs = undefined, newVfs = undefined) {
+    if (idOrVfs === undefined || idOrVfs === null) {
+      this._rebuildIndex();
+      return true;
+    }
+    const target = this._mounts.find((m) => m.id === idOrVfs || m.vfs === idOrVfs);
+    if (!target) {
+      return false;
+    }
+    if (newVfs !== undefined) {
+      if (
+        !newVfs ||
+        typeof newVfs.exists !== 'function' ||
+        typeof newVfs.stat !== 'function' ||
+        typeof newVfs.listDir !== 'function' ||
+        typeof newVfs.readFileRange !== 'function'
+      ) {
+        throw new RpfFormatError(
+          'INVALID_MOUNT',
+          'reload() requires an RpfArchiveVfs-compatible instance'
+        );
+      }
+      target.vfs = newVfs;
+    }
+    this._rebuildIndex();
+    return true;
   }
 
   unmount(idOrVfs, options = {}) {
@@ -1902,20 +2199,64 @@ class RpfVfsMountTable {
       return { key: '', indexed: null, virtualDir: null };
     }
 
-    const cached = this._resolvedPathCache.get(rawKey);
+    const cached = this._resolvedPathCache.getIfPresent(rawKey);
     if (cached !== undefined) {
       this._stats.tocCacheHits += 1;
+      if (cached.indexed !== null && cached.fromPathIndex !== false) {
+        this._stats.pathIndexHits += 1;
+      }
       return cached;
     }
 
-    const norm = normalizeVirtualPath(rawKey);
-    const indexed = this._lookupEntry(norm);
-    const virtualDir = indexed ? null : this._virtualDirIndex.get(norm.key) || null;
-    const entry = { key: norm.key, indexed, virtualDir };
-    if (this._unindexedMounts.length === 0 || indexed !== null) {
-      this._resolvedPathCache.set(rawKey, entry);
+    const canCacheNegatives = this._unindexedMounts.length === 0;
+    if (canCacheNegatives) {
+      const negRawKey = this._negativeLookupCache.getByRaw(rawKey);
+      if (negRawKey !== null) {
+        this._stats.negativeLookupHits += 1;
+        this._stats.tocCacheHits += 1;
+        return { key: negRawKey, indexed: null, virtualDir: null };
+      }
     }
-    return entry;
+
+    const norm = normalizeVirtualPath(rawKey);
+    if (
+      canCacheNegatives &&
+      norm.key !== rawKey &&
+      this._negativeLookupCache.getByNormalized(norm.key, rawKey)
+    ) {
+      this._stats.negativeLookupHits += 1;
+      this._stats.tocCacheHits += 1;
+      return { key: norm.key, indexed: null, virtualDir: null };
+    }
+
+    this._resolvedPathCache.recordMiss();
+    let indexed = this._pathIndex.get(norm.key) || null;
+    let fromPathIndex = indexed !== null;
+    if (!indexed && !canCacheNegatives) {
+      indexed = this._lookupEntry(norm);
+    }
+    if (indexed !== null) {
+      if (fromPathIndex) {
+        this._stats.pathIndexHits += 1;
+      }
+      const entry = { key: norm.key, indexed, virtualDir: null, fromPathIndex };
+      this._resolvedPathCache.set(rawKey, entry);
+      return entry;
+    }
+
+    const virtualDir = this._virtualDirIndex.get(norm.key) || null;
+    if (virtualDir !== null) {
+      const entry = { key: norm.key, indexed: null, virtualDir, fromPathIndex: false };
+      if (canCacheNegatives) {
+        this._resolvedPathCache.set(rawKey, entry);
+      }
+      return entry;
+    }
+
+    if (canCacheNegatives) {
+      this._negativeLookupCache.set(norm.key, rawKey);
+    }
+    return { key: norm.key, indexed: null, virtualDir: null };
   }
 
   _lookupRecordsByHash(pathHash) {
@@ -2557,6 +2898,7 @@ const exportedApi = {
   RPF_ENTRY_FLAG_ENCRYPTED,
   RPF_ENTRY_FLAG_OFFSET_SHIFT9,
   DEFAULT_PATH_CACHE_CAPACITY,
+  DEFAULT_NEGATIVE_CACHE_CAPACITY,
   DEFAULT_DIR_CACHE_CAPACITY,
   DEFAULT_TOC_CACHE_CAPACITY,
   RpfFormatError,
