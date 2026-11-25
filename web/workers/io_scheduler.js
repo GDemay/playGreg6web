@@ -69,6 +69,98 @@
     );
   }
 
+  const SPECULATIVE_PREFETCH_RE = /(?:^|\/)(?:prefetch|speculative)(?:\/|$)|\.prefetch$/i;
+  const UI_FONT_PATH_RE =
+    /(?:^|[/._-])(?:ui|hud|fonts?|scaleform|frontend|menu|splash)(?:[/._-]|$)/i;
+
+  function normalizePathForClassification(pathOrRelPath) {
+    if (typeof pathOrRelPath !== 'string') {
+      return '';
+    }
+    let s = pathOrRelPath.trim();
+    if (!s) {
+      return '';
+    }
+    const qIdx = s.indexOf('?');
+    if (qIdx !== -1) {
+      s = s.slice(0, qIdx);
+    }
+    const hIdx = s.indexOf('#');
+    if (hIdx !== -1) {
+      s = s.slice(0, hIdx);
+    }
+    return s.replace(/\\/g, '/').toLowerCase();
+  }
+
+  function isBinkVideoPath(pathOrRelPath) {
+    const norm = normalizePathForClassification(pathOrRelPath);
+    return norm.endsWith('.bk2') || norm.endsWith('.bik');
+  }
+
+  function isShaderPackPath(pathOrRelPath) {
+    const norm = normalizePathForClassification(pathOrRelPath);
+    return norm.endsWith('.wgsl.pack');
+  }
+
+  function isUiFontRpfPath(pathOrRelPath) {
+    const norm = normalizePathForClassification(pathOrRelPath);
+    if (!norm) {
+      return false;
+    }
+    if (norm.endsWith('.rpf') || norm.endsWith('.ttpf') || norm.includes('.rpf/')) {
+      return UI_FONT_PATH_RE.test(norm);
+    }
+    return false;
+  }
+
+  function isDirectFontOrUiAssetPath(norm) {
+    return (
+      norm.endsWith('.ttf') ||
+      norm.endsWith('.otf') ||
+      norm.endsWith('.woff') ||
+      norm.endsWith('.woff2') ||
+      norm.endsWith('.gfx')
+    );
+  }
+
+  function classifyIoPriority(pathOrRelPath, explicitPriority) {
+    if (isValidPriority(explicitPriority)) {
+      return explicitPriority;
+    }
+
+    const norm = normalizePathForClassification(pathOrRelPath);
+    if (!norm) {
+      return IO_PRIORITY.NORMAL;
+    }
+
+    if (SPECULATIVE_PREFETCH_RE.test(norm)) {
+      return IO_PRIORITY.PREFETCH;
+    }
+
+    const lastSlash = norm.lastIndexOf('/');
+    const basename = lastSlash === -1 ? norm : norm.slice(lastSlash + 1);
+
+    if (
+      norm.endsWith('.wgsl.pack') ||
+      norm.endsWith('.reflect.json') ||
+      basename === 'boot-options.json' ||
+      norm.endsWith('.pgim')
+    ) {
+      return IO_PRIORITY.CRITICAL;
+    }
+
+    if (
+      norm.endsWith('.bk2') ||
+      norm.endsWith('.bik') ||
+      isUiFontRpfPath(norm) ||
+      isDirectFontOrUiAssetPath(norm)
+    ) {
+      return IO_PRIORITY.HIGH;
+    }
+
+    return IO_PRIORITY.NORMAL;
+  }
+
   function isAbortError(err) {
     return Boolean(
       err &&
@@ -243,9 +335,13 @@
         retries: 0,
         agedPromotions: 0,
         maxQueueWaitMs: 0,
+        binkVideoReads: 0,
+        shaderPackReads: 0,
+        uiFontReads: 0,
       };
 
       this._byPriority = PRIORITY_LEVELS.map(() => ({
+        scheduled: 0,
         inFlight: 0,
         completed: 0,
         failed: 0,
@@ -260,13 +356,19 @@
 
     scheduleRead(path, offset, length, options = {}) {
       const opts = options && typeof options === 'object' ? options : {};
-      const priority = opts.priority === undefined ? IO_PRIORITY.NORMAL : opts.priority;
+      const hasExplicitPriority = opts.priority !== undefined;
       const signal = opts.signal || null;
 
-      if (!isValidPriority(priority)) {
+      if (hasExplicitPriority && !isValidPriority(opts.priority)) {
         this._stats.failed += 1;
-        return Promise.reject(new RangeError(`Invalid IO priority: ${priority}`));
+        return Promise.reject(new RangeError(`Invalid IO priority: ${opts.priority}`));
       }
+
+      const priority = hasExplicitPriority
+        ? opts.priority
+        : opts.prefetch === true
+          ? IO_PRIORITY.PREFETCH
+          : classifyIoPriority(path);
 
       try {
         validateReadArgs(path, offset, length);
@@ -280,6 +382,15 @@
         this._stats.cancelled += 1;
         this._byPriority[priority].cancelled += 1;
         return Promise.reject(createAbortError(signal.reason));
+      }
+
+      this._byPriority[priority].scheduled += 1;
+      if (isBinkVideoPath(path)) {
+        this._stats.binkVideoReads += 1;
+      } else if (isShaderPackPath(path)) {
+        this._stats.shaderPackReads += 1;
+      } else if (isUiFontRpfPath(path)) {
+        this._stats.uiFontReads += 1;
       }
 
       return new Promise((resolve, reject) => {
@@ -414,6 +525,7 @@
     getStats() {
       const byPriority = {};
       const avgQueueWaitMsByPriority = {};
+      const priorityCounts = {};
       let queued = 0;
 
       for (let i = 0; i < PRIORITY_LEVELS.length; i += 1) {
@@ -425,8 +537,10 @@
           counters.dispatched > 0 ? counters.totalQueueWaitMs / counters.dispatched : 0;
         queued += levelQueued;
         avgQueueWaitMsByPriority[name] = avgQueueWaitMs;
+        priorityCounts[name] = counters.scheduled;
         byPriority[name] = {
           priority: level,
+          scheduled: counters.scheduled,
           queued: levelQueued,
           inFlight: counters.inFlight,
           completed: counters.completed,
@@ -437,6 +551,7 @@
           avgQueueWaitMs,
           maxQueueWaitMs: counters.maxQueueWaitMs,
           agedPromotions: counters.agedPromotions,
+          promotions: counters.agedPromotions,
         };
       }
 
@@ -448,7 +563,12 @@
         cancelled: this._stats.cancelled,
         retries: this._stats.retries,
         agedPromotions: this._stats.agedPromotions,
+        promotions: this._stats.agedPromotions,
         maxQueueWaitMs: this._stats.maxQueueWaitMs,
+        binkVideoReads: this._stats.binkVideoReads,
+        shaderPackReads: this._stats.shaderPackReads,
+        uiFontReads: this._stats.uiFontReads,
+        priorityCounts,
         avgQueueWaitMsByPriority,
         byPriority,
       };
@@ -466,9 +586,13 @@
       this._stats.retries = 0;
       this._stats.agedPromotions = 0;
       this._stats.maxQueueWaitMs = 0;
+      this._stats.binkVideoReads = 0;
+      this._stats.shaderPackReads = 0;
+      this._stats.uiFontReads = 0;
 
       for (let i = 0; i < PRIORITY_LEVELS.length; i += 1) {
         const counters = this._byPriority[PRIORITY_LEVELS[i]];
+        counters.scheduled = 0;
         counters.completed = 0;
         counters.failed = 0;
         counters.cancelled = 0;
@@ -763,6 +887,10 @@
     DEFAULT_MAX_RETRIES,
     DEFAULT_BASE_RETRY_DELAY_MS,
     DEFAULT_AGING_THRESHOLD_MS,
+    classifyIoPriority,
+    isBinkVideoPath,
+    isShaderPackPath,
+    isUiFontRpfPath,
     isRetryableError,
     isAbortError,
     createAbortError,
