@@ -273,6 +273,12 @@ public:
     bool texture_info(uint32_t resource_id, TextureInfo* out) const;
     // The texture whose descriptor address (TextureInfo::gpu_va) is exactly `gpu_va` (0 if none).
     uint32_t texture_at(uint64_t gpu_va) const;
+    // G66 (#691): ids of textures / buffers unregistered since they were registered (destroyed by the
+    // device: guest Release, address-texture LRU, relocation teardown). A bind group built while
+    // such a resource lived still names it: a cached hit must not bind it again, as WebGPU then
+    // rejects the whole submit ("Destroyed texture used in a submit"). The epoch bumps on every one.
+    bool retired(uint32_t resource_id) const;
+    uint64_t retire_epoch() const noexcept { return retire_epoch_.load(std::memory_order_acquire); }
 
 private:
     friend class CommandListBridge;
@@ -350,6 +356,8 @@ private:
     std::unordered_map<uint32_t, uint64_t> buffer_va_;                  // id -> va
     std::unordered_map<uint32_t, uint64_t> buffer_allocated_;           // id -> WebGPU buffer size
     std::unordered_map<uint64_t, uint32_t> textures_by_va_;             // descriptor address -> id
+    std::unordered_set<uint32_t> retired_resources_;  // see retired(); an id registered again leaves it
+    std::atomic<uint64_t> retire_epoch_{0};
     std::unordered_map<uint64_t, uint32_t> shader_modules_;
 
     mutable std::mutex views_mutex_;
@@ -429,6 +437,8 @@ struct BridgeStats {
     uint64_t bind_groups_created = 0;
     uint64_t bind_groups_retired = 0;
     uint64_t bind_groups_relocation_moved = 0;  // G66: cache hits re-created, a relocated home moved
+    uint64_t bind_groups_resource_retired = 0;  // G66: cache hits re-built, a bound resource was destroyed
+    uint64_t retired_resources_nulled = 0;      // G66: bindings of destroyed textures/buffers bound null
     uint64_t bind_group_cache_hits = 0;    // G66: bind group lookups answered without a CreateBindGroup
     uint64_t bind_group_cache_misses = 0;  // ... rebuilt (first use or changed descriptors)
     uint64_t memory_bind_groups = 0;            // bind groups over descriptor memory (recorded)
@@ -578,6 +588,8 @@ private:
                      CommandEncoder& side, std::vector<GpuBindGroupEntry2>* out);
     // G66 (#691): true when a relocation `cached` was emitted with now resolves to another home.
     bool relocations_moved(d3d::CachedBindGroup* cached);
+    // G66 (#691): true when `cached` binds a texture or buffer the device destroyed since it was built.
+    bool binds_retired(d3d::CachedBindGroup* cached) const;
     // Relocations the last gpu_entries call made.
     std::vector<d3d::CachedBindGroup::Relocation> pending_relocations_;
     void sync_bound_textures(const StateBridgeDevice::GroupLayoutRecord& group, const d3d::CachedBindGroup& cached,
