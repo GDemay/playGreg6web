@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   WorkerPool,
   PRIORITY,
+  DEFAULT_MAX_RESPAWNS_PER_SLOT,
   WorkerPoolError,
   PoolTerminatedError,
   QueueFullError,
@@ -1015,4 +1016,279 @@ test('serveWorkerPool reports a result that cannot be cloned as a job error', as
   assert.equal(sent[0].id, 5);
   assert.equal(sent[0].ok, false);
   assert.equal(sent[0].error.name, 'DataCloneError');
+});
+
+// ---- W140: taskTimeoutMs watchdog, respawn cap & saturation telemetry -----
+
+test('W140: constructor validates taskTimeoutMs and maxRespawnsPerSlot', () => {
+  assert.equal(DEFAULT_MAX_RESPAWNS_PER_SLOT, 16);
+  assert.throws(() => new WorkerPool({ workerFactory: () => ({}), taskTimeoutMs: -1 }), RangeError);
+  assert.throws(() => new WorkerPool({ workerFactory: () => ({}), taskTimeoutMs: NaN }), RangeError);
+  assert.throws(() => new WorkerPool({ workerFactory: () => ({}), maxRespawnsPerSlot: -1 }), RangeError);
+  assert.throws(() => new WorkerPool({ workerFactory: () => ({}), maxRespawnsPerSlot: 1.5 }), RangeError);
+});
+
+test('W140: hung task times out with TASK_TIMEOUT, respawns worker, and runs queued task', async () => {
+  const { pool, workers, clock } = setup({
+    maxWorkers: 1,
+    taskTimeoutMs: 50,
+    cancelGraceMs: 0,
+  });
+
+  const hung = pool.submit('hang', 'job-1');
+  const next = pool.submit('work', 'job-2');
+  assert.equal(workers.length, 1);
+  assert.equal(pool.getStats().peakQueueDepth, 1);
+
+  clock.advance(50);
+  await assert.rejects(
+    hung,
+    (err) => err instanceof JobTimeoutError && err.code === 'TASK_TIMEOUT' && err.timeoutMs === 50
+  );
+
+  // Wedged worker was terminated and replacement worker took the queued job.
+  assert.equal(workers[0].terminated, true);
+  assert.equal(workers.length, 2);
+  assert.equal(workers[1].last().payload, 'job-2');
+
+  workers[1].reply({ id: 2, ok: true, result: 'ok-2' });
+  assert.equal(await next, 'ok-2');
+
+  const stats = pool.getStats();
+  assert.deepEqual(stats, pool.stats());
+  assert.equal(stats.timedOutTasks, 1);
+  assert.equal(stats.respawnedWorkers, 1);
+  assert.equal(stats.peakQueueDepth, 1);
+  assert.equal(stats.hardKills, 1);
+  assert.equal(stats.completed, 1);
+  assert.equal(clock.pending, 0);
+
+  await pool.terminate();
+  assert.equal(clock.pending, 0);
+});
+
+test('W140: per-task options.timeoutMs overrides or disables pool taskTimeoutMs', async () => {
+  const { pool, workers, clock } = setup({
+    maxWorkers: 1,
+    taskTimeoutMs: 100,
+    cancelGraceMs: 0,
+  });
+
+  // Shorter per-task override fires at 25ms instead of 100ms.
+  const shortTask = pool.submit('slow', 1, { timeoutMs: 25 });
+  clock.advance(25);
+  await assert.rejects(
+    shortTask,
+    (err) => err instanceof JobTimeoutError && err.code === 'TASK_TIMEOUT' && err.timeoutMs === 25
+  );
+  assert.equal(pool.getStats().timedOutTasks, 1);
+
+  // timeoutMs: 0 disables timeout even when pool taskTimeoutMs > 0.
+  const noTimeoutTask = pool.submit('long', 2, { timeoutMs: 0 });
+  assert.equal(workers.length, 2);
+  assert.equal(pool.getStats().respawnedWorkers, 1);
+  clock.advance(500);
+  assert.equal(clock.pending, 0);
+  workers[1].reply({ id: 2, ok: true, result: 'finished-late' });
+  assert.equal(await noTimeoutTask, 'finished-late');
+  assert.equal(pool.getStats().timedOutTasks, 1);
+
+  await pool.terminate();
+  assert.equal(clock.pending, 0);
+});
+
+test('W140: worker error triggers clean respawn, drains queued work, and honors maxRespawnsPerSlot', async () => {
+  const { pool, workers, clock } = setup({
+    maxWorkers: 1,
+    maxRespawnsPerSlot: 2,
+    breaker: false,
+  });
+
+  const t1 = pool.submit('t', 1);
+  const t2 = pool.submit('t', 2);
+  const t3 = pool.submit('t', 3);
+  const t4 = pool.submit('t', 4);
+  assert.equal(pool.getStats().peakQueueDepth, 3);
+
+  // Crash #1 -> respawn #1 picks up t2.
+  workers[0].emit('error', { message: 'crash-1' });
+  await assert.rejects(t1, WorkerCrashError);
+  assert.equal(workers[0].terminated, true);
+  assert.equal(workers.length, 2);
+  assert.equal(workers[1].last().payload, 2);
+  assert.equal(pool.getStats().respawnedWorkers, 1);
+
+  // Crash #2 -> respawn #2 picks up t3.
+  workers[1].emit('error', { message: 'crash-2' });
+  await assert.rejects(t2, WorkerCrashError);
+  assert.equal(workers.length, 3);
+  assert.equal(workers[2].last().payload, 3);
+  assert.equal(pool.getStats().respawnedWorkers, 2);
+
+  // Crash #3 -> slot exhausted maxRespawnsPerSlot (2); no 4th worker spawned, t4 fails cleanly.
+  workers[2].emit('error', { message: 'crash-3' });
+  await assert.rejects(t3, WorkerCrashError);
+  await assert.rejects(t4, (err) => err instanceof WorkerCrashError && /respawn limit/.test(err.reason));
+  assert.equal(workers.length, 3);
+  assert.equal(pool.getStats().respawnedWorkers, 2);
+  assert.equal(pool.getStats().workers, 0);
+
+  // resetCircuit() restores respawn budget.
+  pool.resetCircuit();
+  const t5 = pool.submit('t', 5);
+  assert.equal(workers.length, 4);
+  workers[3].reply({ id: 5, ok: true, result: 'recovered' });
+  assert.equal(await t5, 'recovered');
+
+  await pool.terminate();
+  assert.equal(clock.pending, 0);
+});
+
+test('W140: worker error with minWorkers > 0 eagerly respawns and idle shrink does not count as respawn', async () => {
+  const { pool, workers, clock } = setup({
+    maxWorkers: 2,
+    minWorkers: 1,
+    idleTimeoutMs: 100,
+  });
+
+  // Spawn 2 workers, complete both, then let surplus worker shrink via idle timeout.
+  const a = pool.submit('t', 1);
+  const b = pool.submit('t', 2);
+  workers[0].reply({ id: 1, ok: true, result: 1 });
+  workers[1].reply({ id: 2, ok: true, result: 2 });
+  await Promise.all([a, b]);
+  clock.advance(100);
+  assert.equal(pool.getStats().workers, 1);
+  assert.equal(pool.getStats().respawnedWorkers, 0);
+
+  // Re-expanding after normal idle shrink does NOT count as a crash/timeout respawn.
+  const c = pool.submit('t', 3);
+  const d = pool.submit('t', 4);
+  assert.equal(pool.getStats().workers, 2);
+  assert.equal(pool.getStats().respawnedWorkers, 0);
+  const alive = workers.filter((w) => !w.terminated);
+  alive[0].reply({ id: alive[0].last().id, ok: true, result: 'c' });
+  alive[1].reply({ id: alive[1].last().id, ok: true, result: 'd' });
+  await Promise.all([c, d]);
+
+  // Shrink back down to minWorkers (1), then crash that sole remaining worker.
+  clock.advance(100);
+  assert.equal(pool.getStats().workers, 1);
+  const sole = workers.find((w) => !w.terminated);
+  sole.emit('error', { message: 'unexpected crash' });
+  // Eagerly respawned back to minWorkers === 1.
+  assert.equal(pool.getStats().workers, 1);
+  assert.equal(pool.getStats().respawnedWorkers, 1);
+
+  await pool.terminate();
+  assert.equal(clock.pending, 0);
+});
+
+test('W140: peakQueueDepth tracks max pending queue length across normal, reject, and wait policies', async () => {
+  const { pool, workers } = setup({ maxWorkers: 2 });
+  // First 2 jobs dispatch immediately without waiting in queue.
+  const j1 = pool.submit('t', 1);
+  const j2 = pool.submit('t', 2);
+  assert.equal(pool.getStats().peakQueueDepth, 0);
+
+  // Next 3 jobs queue up.
+  const j3 = pool.submit('t', 3);
+  const j4 = pool.submit('t', 4);
+  const j5 = pool.submit('t', 5);
+  assert.equal(pool.getStats().queued, 3);
+  assert.equal(pool.getStats().peakQueueDepth, 3);
+
+  // Complete all jobs; peakQueueDepth remains 3.
+  workers[0].reply({ id: 1, ok: true, result: 1 });
+  workers[1].reply({ id: 2, ok: true, result: 2 });
+  workers[0].reply({ id: 3, ok: true, result: 3 });
+  workers[1].reply({ id: 4, ok: true, result: 4 });
+  workers[0].reply({ id: 5, ok: true, result: 5 });
+  await Promise.all([j1, j2, j3, j4, j5]);
+  assert.equal(pool.getStats().queued, 0);
+  assert.equal(pool.getStats().peakQueueDepth, 3);
+  await pool.terminate();
+
+  // Rejected overflow jobs must not inflate peakQueueDepth.
+  const { pool: rejectPool, workers: rWorkers } = setup({ maxWorkers: 1, maxQueue: 1, overflow: 'reject' });
+  const r1 = rejectPool.submit('t', 1);
+  const r2 = rejectPool.submit('t', 2);
+  await assert.rejects(rejectPool.submit('t', 3), QueueFullError);
+  assert.equal(rejectPool.getStats().peakQueueDepth, 1);
+  rWorkers[0].reply({ id: 1, ok: true, result: 1 });
+  rWorkers[0].reply({ id: 2, ok: true, result: 2 });
+  await Promise.all([r1, r2]);
+  await rejectPool.terminate();
+
+  // Wait overflow policy includes blocked pending tasks in peakQueueDepth.
+  const { pool: waitPool, workers: wWorkers } = setup({ maxWorkers: 1, maxQueue: 1, overflow: 'wait' });
+  const w1 = waitPool.submit('t', 1);
+  const w2 = waitPool.submit('t', 2);
+  const w3 = waitPool.submit('t', 3);
+  const w4 = waitPool.submit('t', 4);
+  assert.equal(waitPool.getStats().peakQueueDepth, 3);
+  for (let i = 1; i <= 4; i++) {
+    wWorkers[0].reply({ id: i, ok: true, result: i });
+    await flush();
+  }
+  await Promise.all([w1, w2, w3, w4]);
+  assert.equal(waitPool.getStats().peakQueueDepth, 3);
+  await waitPool.terminate();
+});
+
+test('W140: terminate() and destroy() clear all pending watchdog timers with zero leaked handles', async () => {
+  // Manual clock: verify all timers (timeout, grace, idle) are cleared.
+  const { pool, workers, clock } = setup({
+    maxWorkers: 2,
+    taskTimeoutMs: 5000,
+    cancelGraceMs: 5000,
+    idleTimeoutMs: 5000,
+  });
+  const running = settleState(pool.submit('t', 1));
+  const doneJob = pool.submit('t', 2);
+  workers[1].reply({ id: 2, ok: true, result: 'done' });
+  await doneJob;
+  // Worker 0 has task timeout timer, worker 1 has idle timer.
+  assert.equal(clock.pending, 2);
+  await pool.destroy();
+  await flush();
+  assert.equal(running.status, 'rejected');
+  assert.ok(running.value instanceof PoolTerminatedError);
+  assert.equal(clock.pending, 0);
+  assert.equal(workers[0].terminated, true);
+  assert.equal(workers[1].terminated, true);
+
+  // Real Node timers: verify destroy/terminate clear long-lived setTimeouts cleanly.
+  let activeTimers = 0;
+  const realTimers = new Set();
+  const realPool = new WorkerPool({
+    workerFactory: () => new FakeWorker(),
+    maxWorkers: 2,
+    taskTimeoutMs: 60000,
+    cancelGraceMs: 60000,
+    idleTimeoutMs: 60000,
+    setTimeout: (fn, ms) => {
+      activeTimers++;
+      const handle = globalThis.setTimeout(() => {
+        realTimers.delete(handle);
+        activeTimers--;
+        fn();
+      }, ms);
+      realTimers.add(handle);
+      return handle;
+    },
+    clearTimeout: (handle) => {
+      if (realTimers.delete(handle)) activeTimers--;
+      globalThis.clearTimeout(handle);
+    },
+  });
+  const p1 = settleState(realPool.submit('hang', 1));
+  const p2 = settleState(realPool.submit('hang', 2));
+  assert.equal(activeTimers, 2);
+  await realPool.terminate();
+  await flush();
+  assert.equal(p1.status, 'rejected');
+  assert.equal(p2.status, 'rejected');
+  assert.equal(activeTimers, 0);
+  assert.equal(realTimers.size, 0);
 });
