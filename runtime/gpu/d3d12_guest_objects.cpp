@@ -331,7 +331,7 @@ void Device::register_lag_fence(Fence* fence) {
         lag_publisher_ = std::thread([this] {
             std::unique_lock<std::mutex> l(lag_mutex_);
             while (!lag_stop_) {
-                lag_cv_.wait_for(l, std::chrono::milliseconds(8));
+                lag_cv_.wait_for(l, std::chrono::milliseconds(4));
                 if (lag_stop_) {
                     break;
                 }
@@ -357,11 +357,12 @@ void Device::publish_fences() {
     uint64_t by_present = 0, by_cap = 0, lag = 0;
     const auto now = std::chrono::steady_clock::now();
     const uint64_t epoch = present_epoch();
+    const uint32_t min_lag_frames = fence_publish_lag_frames();
     const std::chrono::milliseconds cap(options_.fence_publish_cap_ms);
     {
         std::lock_guard<std::mutex> lock(lag_mutex_);
         for (Fence* f : lag_fences_) {
-            f->publish_due(epoch, now, cap, &by_present, &by_cap, &lag);
+            f->publish_due(epoch, min_lag_frames, now, cap, &by_present, &by_cap, &lag);
         }
     }
     if (by_present != 0) {
@@ -2044,15 +2045,16 @@ bool Fence::publish_for_wait(uint64_t value) {
     return was_pending;
 }
 
-void Fence::publish_due(uint64_t present_epoch, std::chrono::steady_clock::time_point now,
+void Fence::publish_due(uint64_t present_epoch, uint32_t min_lag_frames, std::chrono::steady_clock::time_point now,
                         std::chrono::milliseconds cap, uint64_t* by_present, uint64_t* by_cap, uint64_t* lag_frames) {
     std::lock_guard<std::mutex> lock(mutex_);
     uint64_t target = 0;
     while (!pending_.empty()) {
         const PendingSignal& p = pending_.front();
-        if (present_epoch >= p.epoch + 2) {
+        const uint64_t elapsed_presents = present_epoch >= p.epoch ? (present_epoch - p.epoch) : 0;
+        if (elapsed_presents >= min_lag_frames) {
             ++*by_present;
-            *lag_frames += present_epoch - p.epoch - 1;
+            *lag_frames += elapsed_presents;
         } else if (now - p.at >= cap) {
             ++*by_cap;
         } else {
