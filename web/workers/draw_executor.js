@@ -928,6 +928,144 @@
     return false;
   }
 
+  // Status codes for zero-allocation pass state binding helpers.
+  const BIND_STATUS_UNSUPPORTED = -1;
+  const BIND_STATUS_ELIDED = 0;
+  const BIND_STATUS_EMITTED = 1;
+
+  function isRenderPassObject(value, methodName) {
+    return (
+      value !== null &&
+      typeof value === 'object' &&
+      typeof value[methodName] === 'function'
+    );
+  }
+
+  function normalizeViewportArgs(xOrDesc, y, width, height, minDepth, maxDepth) {
+    let vx;
+    let vy;
+    let vw;
+    let vh;
+    let vMin;
+    let vMax;
+    if (xOrDesc && typeof xOrDesc === 'object') {
+      vx = xOrDesc.x;
+      vy = xOrDesc.y;
+      vw = xOrDesc.width;
+      vh = xOrDesc.height;
+      vMin = xOrDesc.minDepth !== undefined ? xOrDesc.minDepth : 0;
+      vMax = xOrDesc.maxDepth !== undefined ? xOrDesc.maxDepth : 1;
+    } else {
+      vx = xOrDesc;
+      vy = y;
+      vw = width;
+      vh = height;
+      vMin = minDepth !== undefined ? minDepth : 0;
+      vMax = maxDepth !== undefined ? maxDepth : 1;
+    }
+    if (
+      typeof vx !== 'number' ||
+      !Number.isFinite(vx) ||
+      typeof vy !== 'number' ||
+      !Number.isFinite(vy) ||
+      typeof vw !== 'number' ||
+      !Number.isFinite(vw) ||
+      vw < 0 ||
+      typeof vh !== 'number' ||
+      !Number.isFinite(vh) ||
+      vh < 0 ||
+      typeof vMin !== 'number' ||
+      !Number.isFinite(vMin) ||
+      vMin < 0 ||
+      vMin > 1 ||
+      typeof vMax !== 'number' ||
+      !Number.isFinite(vMax) ||
+      vMax < 0 ||
+      vMax > 1 ||
+      vMin > vMax
+    ) {
+      return null;
+    }
+    return { x: vx, y: vy, width: vw, height: vh, minDepth: vMin, maxDepth: vMax };
+  }
+
+  function normalizeScissorRectArgs(xOrDesc, y, width, height) {
+    let sx;
+    let sy;
+    let sw;
+    let sh;
+    if (xOrDesc && typeof xOrDesc === 'object') {
+      sx = xOrDesc.x;
+      sy = xOrDesc.y;
+      sw = xOrDesc.width;
+      sh = xOrDesc.height;
+    } else {
+      sx = xOrDesc;
+      sy = y;
+      sw = width;
+      sh = height;
+    }
+    if (
+      !Number.isInteger(sx) ||
+      sx < 0 ||
+      !Number.isInteger(sy) ||
+      sy < 0 ||
+      !Number.isInteger(sw) ||
+      sw < 0 ||
+      !Number.isInteger(sh) ||
+      sh < 0
+    ) {
+      return null;
+    }
+    return { x: sx, y: sy, width: sw, height: sh };
+  }
+
+  function normalizeBlendConstantArgs(colorOrR, g, b, a) {
+    let cr;
+    let cg;
+    let cb;
+    let ca;
+    if (Array.isArray(colorOrR) || ArrayBuffer.isView(colorOrR)) {
+      if (colorOrR.length < 4) {
+        return null;
+      }
+      cr = colorOrR[0];
+      cg = colorOrR[1];
+      cb = colorOrR[2];
+      ca = colorOrR[3];
+    } else if (colorOrR && typeof colorOrR === 'object') {
+      cr = colorOrR.r;
+      cg = colorOrR.g;
+      cb = colorOrR.b;
+      ca = colorOrR.a;
+    } else {
+      cr = colorOrR;
+      cg = g;
+      cb = b;
+      ca = a;
+    }
+    if (
+      typeof cr !== 'number' ||
+      !Number.isFinite(cr) ||
+      typeof cg !== 'number' ||
+      !Number.isFinite(cg) ||
+      typeof cb !== 'number' ||
+      !Number.isFinite(cb) ||
+      typeof ca !== 'number' ||
+      !Number.isFinite(ca)
+    ) {
+      return null;
+    }
+    return { r: cr, g: cg, b: cb, a: ca };
+  }
+
+  function normalizeStencilReference(reference) {
+    if (!Number.isInteger(reference) || reference < 0 || reference > 0xffffffff) {
+      return null;
+    }
+    return reference;
+  }
+
   function createZeroedStats() {
     return {
       totalDraws: 0,
@@ -951,6 +1089,14 @@
       redundantBindGroupSkips: 0,
       redundantVertexBufferSkips: 0,
       redundantIndexBufferSkips: 0,
+      elidedPipelineSets: 0,
+      elidedBindGroupSets: 0,
+      elidedVertexBufferSets: 0,
+      elidedIndexBufferSets: 0,
+      elidedViewportScissorSets: 0,
+      elidedBlendConstantSets: 0,
+      elidedStencilReferenceSets: 0,
+      totalElidedStateCalls: 0,
       bindGroupCacheHits: 0,
       bindGroupCacheMisses: 0,
       bindGroupCacheEvictions: 0,
@@ -1002,6 +1148,8 @@
      *   elideRedundantBindGroups?: boolean,
      *   elideRedundantVertexBuffers?: boolean,
      *   elideRedundantIndexBuffers?: boolean,
+     *   elideRedundantViewportScissor?: boolean,
+     *   elideRedundantBlendStencil?: boolean,
      *   onWarning?: (message: string, meta?: object) => void,
      * }} [options]
      */
@@ -1063,6 +1211,14 @@
         opts.elideRedundantIndexBuffers !== undefined
           ? Boolean(opts.elideRedundantIndexBuffers)
           : defaultElide;
+      this._elideRedundantViewportScissor =
+        opts.elideRedundantViewportScissor !== undefined
+          ? Boolean(opts.elideRedundantViewportScissor)
+          : defaultElide;
+      this._elideRedundantBlendStencil =
+        opts.elideRedundantBlendStencil !== undefined
+          ? Boolean(opts.elideRedundantBlendStencil)
+          : defaultElide;
       this._onWarning = typeof opts.onWarning === 'function' ? opts.onWarning : null;
 
       if (opts.shaderFallbackRouter !== undefined) {
@@ -1081,12 +1237,20 @@
       this._boundBindGroups = new Map();
       this._boundVertexBuffers = new Map();
       this._boundIndexBuffer = null;
+      this._boundViewport = null;
+      this._boundScissorRect = null;
+      this._boundBlendConstant = null;
+      this._boundStencilReference = null;
       this._vertexBuffers = new Map();
       this._indexBuffer = null;
       this._bindGroups = new Map();
       this._cbvs = new Map();
       this._textures = new Map();
       this._samplers = new Map();
+      this._viewport = null;
+      this._scissorRect = null;
+      this._blendConstant = null;
+      this._stencilReference = null;
 
       // Device-scoped resource caches & object identity maps (WeakMap avoids retention leaks).
       this._fallbackPipelineCache = new Map();
@@ -1359,6 +1523,10 @@
       this._boundBindGroups.clear();
       this._boundVertexBuffers.clear();
       this._boundIndexBuffer = null;
+      this._boundViewport = null;
+      this._boundScissorRect = null;
+      this._boundBlendConstant = null;
+      this._boundStencilReference = null;
     }
 
     _syncPassTracking(pass) {
@@ -1368,6 +1536,10 @@
         this._boundBindGroups.clear();
         this._boundVertexBuffers.clear();
         this._boundIndexBuffer = null;
+        this._boundViewport = null;
+        this._boundScissorRect = null;
+        this._boundBlendConstant = null;
+        this._boundStencilReference = null;
       }
     }
 
@@ -1563,6 +1735,10 @@
       this._cbvs.clear();
       this._textures.clear();
       this._samplers.clear();
+      this._viewport = null;
+      this._scissorRect = null;
+      this._blendConstant = null;
+      this._stencilReference = null;
     }
 
     /**
@@ -1593,6 +1769,8 @@
         gpuPipeline !== undefined
       ) {
         this._stats.redundantPipelineSkips += 1;
+        this._stats.elidedPipelineSets += 1;
+        this._stats.totalElidedStateCalls += 1;
         return false;
       }
       pass.setPipeline(gpuPipeline);
@@ -1612,6 +1790,8 @@
         const bound = this._boundBindGroups.get(groupIndex);
         if (bound && bound.bindGroup === bindGroup && dynamicOffsetsEqual(bound, offsets)) {
           this._stats.redundantBindGroupSkips += 1;
+          this._stats.elidedBindGroupSets += 1;
+          this._stats.totalElidedStateCalls += 1;
           return false;
         }
       }
@@ -1655,6 +1835,8 @@
           bound.size === normSize
         ) {
           this._stats.redundantVertexBufferSkips += 1;
+          this._stats.elidedVertexBufferSets += 1;
+          this._stats.totalElidedStateCalls += 1;
           return false;
         }
       }
@@ -1692,6 +1874,8 @@
         buffer.destroyed !== true
       ) {
         this._stats.redundantIndexBufferSkips += 1;
+        this._stats.elidedIndexBufferSets += 1;
+        this._stats.totalElidedStateCalls += 1;
         return false;
       }
       if (hasSize) {
@@ -1713,6 +1897,183 @@
         this._boundIndexBuffer.size = normSize;
       }
       return true;
+    }
+
+    _bindViewportOnPass(pass, vp) {
+      this._syncPassTracking(pass);
+      if (typeof pass.setViewport !== 'function') {
+        return BIND_STATUS_UNSUPPORTED;
+      }
+      const bound = this._boundViewport;
+      if (
+        this._elideRedundantViewportScissor &&
+        bound !== null &&
+        bound.x === vp.x &&
+        bound.y === vp.y &&
+        bound.width === vp.width &&
+        bound.height === vp.height &&
+        bound.minDepth === vp.minDepth &&
+        bound.maxDepth === vp.maxDepth
+      ) {
+        this._stats.elidedViewportScissorSets += 1;
+        this._stats.totalElidedStateCalls += 1;
+        return BIND_STATUS_ELIDED;
+      }
+      pass.setViewport(vp.x, vp.y, vp.width, vp.height, vp.minDepth, vp.maxDepth);
+      if (!this._boundViewport) {
+        this._boundViewport = {
+          x: vp.x,
+          y: vp.y,
+          width: vp.width,
+          height: vp.height,
+          minDepth: vp.minDepth,
+          maxDepth: vp.maxDepth,
+        };
+      } else {
+        this._boundViewport.x = vp.x;
+        this._boundViewport.y = vp.y;
+        this._boundViewport.width = vp.width;
+        this._boundViewport.height = vp.height;
+        this._boundViewport.minDepth = vp.minDepth;
+        this._boundViewport.maxDepth = vp.maxDepth;
+      }
+      return BIND_STATUS_EMITTED;
+    }
+
+    _bindScissorRectOnPass(pass, sc) {
+      this._syncPassTracking(pass);
+      if (typeof pass.setScissorRect !== 'function') {
+        return BIND_STATUS_UNSUPPORTED;
+      }
+      const bound = this._boundScissorRect;
+      if (
+        this._elideRedundantViewportScissor &&
+        bound !== null &&
+        bound.x === sc.x &&
+        bound.y === sc.y &&
+        bound.width === sc.width &&
+        bound.height === sc.height
+      ) {
+        this._stats.elidedViewportScissorSets += 1;
+        this._stats.totalElidedStateCalls += 1;
+        return BIND_STATUS_ELIDED;
+      }
+      pass.setScissorRect(sc.x, sc.y, sc.width, sc.height);
+      if (!this._boundScissorRect) {
+        this._boundScissorRect = {
+          x: sc.x,
+          y: sc.y,
+          width: sc.width,
+          height: sc.height,
+        };
+      } else {
+        this._boundScissorRect.x = sc.x;
+        this._boundScissorRect.y = sc.y;
+        this._boundScissorRect.width = sc.width;
+        this._boundScissorRect.height = sc.height;
+      }
+      return BIND_STATUS_EMITTED;
+    }
+
+    _bindBlendConstantOnPass(pass, bc) {
+      this._syncPassTracking(pass);
+      if (typeof pass.setBlendConstant !== 'function') {
+        return BIND_STATUS_UNSUPPORTED;
+      }
+      const bound = this._boundBlendConstant;
+      if (
+        this._elideRedundantBlendStencil &&
+        bound !== null &&
+        bound.r === bc.r &&
+        bound.g === bc.g &&
+        bound.b === bc.b &&
+        bound.a === bc.a
+      ) {
+        this._stats.elidedBlendConstantSets += 1;
+        this._stats.totalElidedStateCalls += 1;
+        return BIND_STATUS_ELIDED;
+      }
+      pass.setBlendConstant({ r: bc.r, g: bc.g, b: bc.b, a: bc.a });
+      if (!this._boundBlendConstant) {
+        this._boundBlendConstant = { r: bc.r, g: bc.g, b: bc.b, a: bc.a };
+      } else {
+        this._boundBlendConstant.r = bc.r;
+        this._boundBlendConstant.g = bc.g;
+        this._boundBlendConstant.b = bc.b;
+        this._boundBlendConstant.a = bc.a;
+      }
+      return BIND_STATUS_EMITTED;
+    }
+
+    _bindStencilReferenceOnPass(pass, ref) {
+      this._syncPassTracking(pass);
+      if (typeof pass.setStencilReference !== 'function') {
+        return BIND_STATUS_UNSUPPORTED;
+      }
+      if (this._elideRedundantBlendStencil && this._boundStencilReference === ref) {
+        this._stats.elidedStencilReferenceSets += 1;
+        this._stats.totalElidedStateCalls += 1;
+        return BIND_STATUS_ELIDED;
+      }
+      pass.setStencilReference(ref);
+      this._boundStencilReference = ref;
+      return BIND_STATUS_EMITTED;
+    }
+
+    _bindPassDynamicState(pass, args, result) {
+      const vp =
+        args && args.viewport !== undefined
+          ? args.viewport === null
+            ? null
+            : normalizeViewportArgs(args.viewport)
+          : this._viewport;
+      if (vp !== null) {
+        if (this._bindViewportOnPass(pass, vp) === BIND_STATUS_ELIDED) {
+          result.viewportElided = true;
+        }
+      }
+
+      const rawScissor =
+        args && args.scissorRect !== undefined
+          ? args.scissorRect
+          : args && args.scissor !== undefined
+            ? args.scissor
+            : undefined;
+      const sc =
+        rawScissor !== undefined
+          ? rawScissor === null
+            ? null
+            : normalizeScissorRectArgs(rawScissor)
+          : this._scissorRect;
+      if (sc !== null) {
+        if (this._bindScissorRectOnPass(pass, sc) === BIND_STATUS_ELIDED) {
+          result.scissorElided = true;
+        }
+      }
+
+      const bc =
+        args && args.blendConstant !== undefined
+          ? args.blendConstant === null
+            ? null
+            : normalizeBlendConstantArgs(args.blendConstant)
+          : this._blendConstant;
+      if (bc !== null) {
+        if (this._bindBlendConstantOnPass(pass, bc) === BIND_STATUS_ELIDED) {
+          result.blendConstantElided = true;
+        }
+      }
+
+      const sr =
+        args && args.stencilReference !== undefined
+          ? args.stencilReference === null
+            ? null
+            : normalizeStencilReference(args.stencilReference)
+          : this._stencilReference;
+      if (sr !== null) {
+        if (this._bindStencilReferenceOnPass(pass, sr) === BIND_STATUS_ELIDED) {
+          result.stencilReferenceElided = true;
+        }
+      }
     }
 
     setPipeline(pipelineOrDesc) {
@@ -1781,7 +2142,13 @@
       return true;
     }
 
-    setBindGroup(groupIndex, bindGroup, dynamicOffsetsOrMeta) {
+    setBindGroup(
+      groupIndex,
+      bindGroup,
+      dynamicOffsetsOrMeta,
+      dynamicOffsetsDataStart,
+      dynamicOffsetsDataLength
+    ) {
       if (!Number.isInteger(groupIndex) || groupIndex < 0) {
         this._stats.bindGroupGuards += 1;
         this._stats.skippedBindGroupBindings += 1;
@@ -1795,7 +2162,25 @@
       let dynamicOffsets = null;
       let meta = null;
       if (Array.isArray(dynamicOffsetsOrMeta) || ArrayBuffer.isView(dynamicOffsetsOrMeta)) {
-        dynamicOffsets = dynamicOffsetsOrMeta;
+        if (
+          ArrayBuffer.isView(dynamicOffsetsOrMeta) &&
+          typeof dynamicOffsetsDataStart === 'number' &&
+          Number.isInteger(dynamicOffsetsDataStart) &&
+          dynamicOffsetsDataStart >= 0
+        ) {
+          const end =
+            typeof dynamicOffsetsDataLength === 'number' &&
+            Number.isInteger(dynamicOffsetsDataLength) &&
+            dynamicOffsetsDataLength >= 0
+              ? dynamicOffsetsDataStart + dynamicOffsetsDataLength
+              : dynamicOffsetsOrMeta.length;
+          dynamicOffsets =
+            typeof dynamicOffsetsOrMeta.subarray === 'function'
+              ? dynamicOffsetsOrMeta.subarray(dynamicOffsetsDataStart, end)
+              : Array.prototype.slice.call(dynamicOffsetsOrMeta, dynamicOffsetsDataStart, end);
+        } else {
+          dynamicOffsets = dynamicOffsetsOrMeta;
+        }
       } else if (dynamicOffsetsOrMeta && typeof dynamicOffsetsOrMeta === 'object') {
         meta = dynamicOffsetsOrMeta;
         if (
@@ -1879,6 +2264,204 @@
     }
 
     /**
+     * Stage viewport state for subsequent draws in the active pass, or emit immediately with
+     * elision when a `GPURenderPassEncoder` is supplied as the first argument.
+     *
+     * Overloads:
+     * - `setViewport(x, y, width, height, minDepth = 0, maxDepth = 1)`
+     * - `setViewport({ x, y, width, height, minDepth?, maxDepth? })`
+     * - `setViewport(pass, x, y, width, height, minDepth = 0, maxDepth = 1)`
+     * - `setViewport(pass, { x, y, width, height, minDepth?, maxDepth? })`
+     * - `setViewport(null)` to clear staged & bound viewport state
+     */
+    setViewport(xOrPass, y, width, height, minDepth, maxDepth) {
+      if (xOrPass === null || xOrPass === undefined) {
+        this._viewport = null;
+        this._boundViewport = null;
+        return true;
+      }
+      if (isRenderPassObject(xOrPass, 'setViewport')) {
+        if (this._destroyed) {
+          return false;
+        }
+        const vp = normalizeViewportArgs(y, width, height, minDepth, maxDepth, arguments[6]);
+        if (!vp) {
+          return false;
+        }
+        this._viewport = null;
+        try {
+          return this._bindViewportOnPass(xOrPass, vp) !== BIND_STATUS_UNSUPPORTED;
+        } catch (err) {
+          this._stats.passErrors += 1;
+          this._warn('setViewport failed on pass', {
+            error: String(err && err.message ? err.message : err),
+          });
+          return false;
+        }
+      }
+      const vp = normalizeViewportArgs(xOrPass, y, width, height, minDepth, maxDepth);
+      if (!vp) {
+        return false;
+      }
+      this._viewport = vp;
+      return true;
+    }
+
+    /**
+     * Stage scissor rect state for subsequent draws in the active pass, or emit immediately with
+     * elision when a `GPURenderPassEncoder` is supplied as the first argument.
+     *
+     * Overloads:
+     * - `setScissorRect(x, y, width, height)`
+     * - `setScissorRect({ x, y, width, height })`
+     * - `setScissorRect(pass, x, y, width, height)`
+     * - `setScissorRect(pass, { x, y, width, height })`
+     * - `setScissorRect(null)` to clear staged & bound scissor state
+     */
+    setScissorRect(xOrPass, y, width, height) {
+      if (xOrPass === null || xOrPass === undefined) {
+        this._scissorRect = null;
+        this._boundScissorRect = null;
+        return true;
+      }
+      if (isRenderPassObject(xOrPass, 'setScissorRect')) {
+        if (this._destroyed) {
+          return false;
+        }
+        const sc = normalizeScissorRectArgs(y, width, height, arguments[4]);
+        if (!sc) {
+          return false;
+        }
+        this._scissorRect = null;
+        try {
+          return this._bindScissorRectOnPass(xOrPass, sc) !== BIND_STATUS_UNSUPPORTED;
+        } catch (err) {
+          this._stats.passErrors += 1;
+          this._warn('setScissorRect failed on pass', {
+            error: String(err && err.message ? err.message : err),
+          });
+          return false;
+        }
+      }
+      const sc = normalizeScissorRectArgs(xOrPass, y, width, height);
+      if (!sc) {
+        return false;
+      }
+      this._scissorRect = sc;
+      return true;
+    }
+
+    /**
+     * Stage blend constant color for subsequent draws in the active pass, or emit immediately
+     * with elision when a `GPURenderPassEncoder` is supplied as the first argument.
+     */
+    setBlendConstant(colorOrPass, g, b, a) {
+      if (colorOrPass === null || colorOrPass === undefined) {
+        this._blendConstant = null;
+        this._boundBlendConstant = null;
+        return true;
+      }
+      if (isRenderPassObject(colorOrPass, 'setBlendConstant')) {
+        if (this._destroyed) {
+          return false;
+        }
+        const bc = normalizeBlendConstantArgs(g, b, a, arguments[4]);
+        if (!bc) {
+          return false;
+        }
+        this._blendConstant = null;
+        try {
+          return this._bindBlendConstantOnPass(colorOrPass, bc) !== BIND_STATUS_UNSUPPORTED;
+        } catch (err) {
+          this._stats.passErrors += 1;
+          this._warn('setBlendConstant failed on pass', {
+            error: String(err && err.message ? err.message : err),
+          });
+          return false;
+        }
+      }
+      const bc = normalizeBlendConstantArgs(colorOrPass, g, b, a);
+      if (!bc) {
+        return false;
+      }
+      this._blendConstant = bc;
+      return true;
+    }
+
+    /**
+     * Stage stencil reference value for subsequent draws in the active pass, or emit immediately
+     * with elision when a `GPURenderPassEncoder` is supplied as the first argument.
+     */
+    setStencilReference(refOrPass, reference) {
+      if (refOrPass === null || refOrPass === undefined) {
+        this._stencilReference = null;
+        this._boundStencilReference = null;
+        return true;
+      }
+      if (isRenderPassObject(refOrPass, 'setStencilReference')) {
+        if (this._destroyed) {
+          return false;
+        }
+        const sr = normalizeStencilReference(reference);
+        if (sr === null) {
+          return false;
+        }
+        this._stencilReference = null;
+        try {
+          return this._bindStencilReferenceOnPass(refOrPass, sr) !== BIND_STATUS_UNSUPPORTED;
+        } catch (err) {
+          this._stats.passErrors += 1;
+          this._warn('setStencilReference failed on pass', {
+            error: String(err && err.message ? err.message : err),
+          });
+          return false;
+        }
+      }
+      const sr = normalizeStencilReference(refOrPass);
+      if (sr === null) {
+        return false;
+      }
+      this._stencilReference = sr;
+      return true;
+    }
+
+    /**
+     * Return a shallow snapshot of the state currently tracked as bound on the active render pass.
+     */
+    getBoundPassState() {
+      const bindGroups = {};
+      for (const [groupIndex, rec] of this._boundBindGroups.entries()) {
+        bindGroups[groupIndex] = {
+          bindGroup: rec.bindGroup,
+          dynamicOffsets: rec.hasDynamicOffsets
+            ? rec.dynamicOffsetsSnapshot
+              ? rec.dynamicOffsetsSnapshot.slice(0, rec.dynamicOffsetsLength)
+              : []
+            : null,
+        };
+      }
+      const vertexBuffers = {};
+      for (const [slot, rec] of this._boundVertexBuffers.entries()) {
+        vertexBuffers[slot] = {
+          buffer: rec.buffer,
+          offset: rec.offset,
+          size: rec.size,
+        };
+      }
+      return {
+        hasActivePass: this._boundPass !== null,
+        pipeline: this._boundPipeline,
+        bindGroups,
+        vertexBuffers,
+        indexBuffer: this._boundIndexBuffer ? { ...this._boundIndexBuffer } : null,
+        viewport: this._boundViewport ? { ...this._boundViewport } : null,
+        scissorRect: this._boundScissorRect ? { ...this._boundScissorRect } : null,
+        blendConstant: this._boundBlendConstant ? { ...this._boundBlendConstant } : null,
+        stencilReference: this._boundStencilReference,
+      };
+    }
+
+    /**
      * Snapshot active draw state merged with optional per-draw overrides.
      */
     getDrawState(overrides) {
@@ -1946,6 +2529,28 @@
         cbvs,
         textures,
         samplers,
+        viewport:
+          ov.viewport !== undefined
+            ? ov.viewport
+            : this._viewport
+              ? { ...this._viewport }
+              : null,
+        scissorRect:
+          ov.scissorRect !== undefined
+            ? ov.scissorRect
+            : ov.scissor !== undefined
+              ? ov.scissor
+              : this._scissorRect
+                ? { ...this._scissorRect }
+                : null,
+        blendConstant:
+          ov.blendConstant !== undefined
+            ? ov.blendConstant
+            : this._blendConstant
+              ? { ...this._blendConstant }
+              : null,
+        stencilReference:
+          ov.stencilReference !== undefined ? ov.stencilReference : this._stencilReference,
       };
 
       // Propagate explicit override hints when passed directly to executeDraw / resolve.
@@ -3212,6 +3817,10 @@
         bindGroupsElided: 0,
         vertexBuffersElided: 0,
         indexBufferElided: false,
+        viewportElided: false,
+        scissorElided: false,
+        blendConstantElided: false,
+        stencilReferenceElided: false,
         bindGroupCacheHit: false,
         vertexCount: 0,
         indexCount: 0,
@@ -3261,6 +3870,7 @@
         try {
           const bound = this._bindPipelineOnPass(pass, realPipeline);
           result.pipelineElided = !bound;
+          this._bindPassDynamicState(pass, args, result);
           const resBind = this._bindNormalResources(pass);
           result.vertexBuffersElided = resBind.vertexBuffersElided;
           result.bindGroupsElided = resBind.bindGroupsElided;
@@ -3404,6 +4014,7 @@
       }
 
       try {
+        this._bindPassDynamicState(pass, args, result);
         if (indexed) {
           const ibRes = this._validateAndBindIndexBuffer(pass, 1, 0);
           if (!ibRes.ok) {
@@ -3475,6 +4086,10 @@
         bindGroupsElided: 0,
         vertexBuffersElided: 0,
         indexBufferElided: false,
+        viewportElided: false,
+        scissorElided: false,
+        blendConstantElided: false,
+        stencilReferenceElided: false,
         bindGroupCacheHit: false,
         vertexCount: indexed ? 0 : count,
         indexCount: indexed ? count : 0,
@@ -3522,6 +4137,7 @@
         try {
           const bound = this._bindPipelineOnPass(pass, realPipeline);
           result.pipelineElided = !bound;
+          this._bindPassDynamicState(pass, args, result);
           const resBind = this._bindNormalResources(pass);
           result.vertexBuffersElided = resBind.vertexBuffersElided;
           result.bindGroupsElided = resBind.bindGroupsElided;
@@ -3683,6 +4299,7 @@
       }
 
       try {
+        this._bindPassDynamicState(pass, args, result);
         if (indexed) {
           const ibRes = this._validateAndBindIndexBuffer(pass, effectiveCount, firstIndex);
           if (!ibRes.ok) {
@@ -3761,6 +4378,14 @@
         redundantBindGroupSkips: this._stats.redundantBindGroupSkips,
         redundantVertexBufferSkips: this._stats.redundantVertexBufferSkips,
         redundantIndexBufferSkips: this._stats.redundantIndexBufferSkips,
+        elidedPipelineSets: this._stats.elidedPipelineSets,
+        elidedBindGroupSets: this._stats.elidedBindGroupSets,
+        elidedVertexBufferSets: this._stats.elidedVertexBufferSets,
+        elidedIndexBufferSets: this._stats.elidedIndexBufferSets,
+        elidedViewportScissorSets: this._stats.elidedViewportScissorSets,
+        elidedBlendConstantSets: this._stats.elidedBlendConstantSets,
+        elidedStencilReferenceSets: this._stats.elidedStencilReferenceSets,
+        totalElidedStateCalls: this._stats.totalElidedStateCalls,
         bindGroupCacheHits: this._stats.bindGroupCacheHits,
         bindGroupCacheMisses: this._stats.bindGroupCacheMisses,
         bindGroupCacheEvictions: this._stats.bindGroupCacheEvictions,

@@ -164,6 +164,30 @@ function createMockWebGpu(overrides = {}) {
     setBindGroup(groupIndex, bindGroup, dynamicOffsets) {
       calls.pass.push({ op: 'setBindGroup', groupIndex, bindGroup, dynamicOffsets });
     },
+    setViewport(x, y, width, height, minDepth, maxDepth) {
+      if (overrides.failSetViewport) {
+        throw new Error('mock setViewport failure');
+      }
+      calls.pass.push({ op: 'setViewport', x, y, width, height, minDepth, maxDepth });
+    },
+    setScissorRect(x, y, width, height) {
+      if (overrides.failSetScissorRect) {
+        throw new Error('mock setScissorRect failure');
+      }
+      calls.pass.push({ op: 'setScissorRect', x, y, width, height });
+    },
+    setBlendConstant(color) {
+      if (overrides.failSetBlendConstant) {
+        throw new Error('mock setBlendConstant failure');
+      }
+      calls.pass.push({ op: 'setBlendConstant', color });
+    },
+    setStencilReference(reference) {
+      if (overrides.failSetStencilReference) {
+        throw new Error('mock setStencilReference failure');
+      }
+      calls.pass.push({ op: 'setStencilReference', reference });
+    },
     draw(vertexCount, instanceCount, firstVertex, firstInstance) {
       if (overrides.failDraw) {
         throw new Error('mock draw failure');
@@ -1883,4 +1907,453 @@ test('W166 high-frequency menu, font-glyph, and intro-video burst (5,000+ draws)
   assert.equal(stats.redundantVertexBufferSkips, 5009);
   assert.equal(stats.redundantIndexBufferSkips, 4999);
   assert.equal(stats.redundantBindGroupSkips, 4978);
+});
+
+// ---------------------------------------------------------------------------
+// W194 Full render-pass state elision (pipeline, bindGroups + dynamicOffsets,
+// vertexBuffers, indexBuffer, viewport, scissor, blendConstant, stencilReference)
+// and elided* telemetry counters
+// ---------------------------------------------------------------------------
+
+test('W194 elides redundant pipeline, bindGroup, vertexBuffer, indexBuffer, viewport, scissor, blendConstant, and stencilReference on identical consecutive draws', () => {
+  const { device, pass, calls } = createMockWebGpu();
+  const router = new ShaderFallbackRouter();
+  const executor = new DrawExecutor({ device, shaderFallbackRouter: router });
+
+  const pipe = {
+    kind: 'GPURenderPipeline',
+    handle: 7001,
+    getBindGroupLayout: () => ({ kind: 'GPUBindGroupLayout' }),
+  };
+  const vb0 = device.createBuffer({ size: 512, usage: BUFFER_USAGE.VERTEX });
+  const vb1 = device.createBuffer({ size: 256, usage: BUFFER_USAGE.VERTEX });
+  const ib = device.createBuffer({ size: 256, usage: BUFFER_USAGE.INDEX });
+  const bg0 = { kind: 'GPUBindGroup', handle: 7100 };
+  const bg1 = { kind: 'GPUBindGroup', handle: 7101 };
+
+  executor.beginPass();
+  executor.setPipeline(pipe);
+  executor.setVertexBuffer(0, vb0, 0, 256);
+  executor.setVertexBuffer(1, vb1, 32, 128);
+  executor.setIndexBuffer(ib, 'uint16', 0, 128);
+  executor.setBindGroup(0, bg0, [0, 256]);
+  executor.setBindGroup(1, bg1);
+  assert.equal(executor.setViewport(0, 0, 1280, 720, 0, 1), true);
+  assert.equal(executor.setScissorRect(0, 0, 1280, 720), true);
+  assert.equal(executor.setBlendConstant({ r: 0.25, g: 0.5, b: 0.75, a: 1.0 }), true);
+  assert.equal(executor.setStencilReference(0x1a), true);
+
+  // Draw 1: emits every state call exactly once.
+  const d1 = executor.drawIndexed(pass, 6, 1, 0, 0, 0);
+  assert.equal(d1.executed, true);
+  assert.equal(d1.pipelineElided, false);
+  assert.equal(d1.bindGroupsElided, 0);
+  assert.equal(d1.vertexBuffersElided, 0);
+  assert.equal(d1.indexBufferElided, false);
+  assert.equal(d1.viewportElided, false);
+  assert.equal(d1.scissorElided, false);
+  assert.equal(d1.blendConstantElided, false);
+  assert.equal(d1.stencilReferenceElided, false);
+
+  assert.equal(calls.pass.filter((c) => c.op === 'setPipeline').length, 1);
+  assert.equal(calls.pass.filter((c) => c.op === 'setBindGroup').length, 2);
+  assert.equal(calls.pass.filter((c) => c.op === 'setVertexBuffer').length, 2);
+  assert.equal(calls.pass.filter((c) => c.op === 'setIndexBuffer').length, 1);
+  assert.equal(calls.pass.filter((c) => c.op === 'setViewport').length, 1);
+  assert.equal(calls.pass.filter((c) => c.op === 'setScissorRect').length, 1);
+  assert.equal(calls.pass.filter((c) => c.op === 'setBlendConstant').length, 1);
+  assert.equal(calls.pass.filter((c) => c.op === 'setStencilReference').length, 1);
+
+  // Inspect bound pass snapshot.
+  const bound = executor.getBoundPassState();
+  assert.equal(bound.hasActivePass, true);
+  assert.equal(bound.pipeline, pipe);
+  assert.deepEqual(bound.viewport, { x: 0, y: 0, width: 1280, height: 720, minDepth: 0, maxDepth: 1 });
+  assert.deepEqual(bound.scissorRect, { x: 0, y: 0, width: 1280, height: 720 });
+  assert.deepEqual(bound.blendConstant, { r: 0.25, g: 0.5, b: 0.75, a: 1.0 });
+  assert.equal(bound.stencilReference, 0x1a);
+  assert.deepEqual(bound.bindGroups[0].dynamicOffsets, [0, 256]);
+  assert.equal(bound.bindGroups[1].dynamicOffsets, null);
+
+  // Draw 2: redundantly re-specifying identical state via alternate shapes still elides every call.
+  executor.setPipeline(pipe);
+  executor.setVertexBuffer(0, vb0, { offset: 0, size: 256 });
+  executor.setVertexBuffer(1, vb1, 32, 128);
+  executor.setIndexBuffer(ib, 'uint16', 0, 128);
+  executor.setBindGroup(0, bg0, new Uint32Array([0, 256]));
+  executor.setBindGroup(1, bg1);
+  executor.setViewport({ x: 0, y: 0, width: 1280, height: 720 }); // minDepth/maxDepth default to 0, 1
+  executor.setScissorRect({ x: 0, y: 0, width: 1280, height: 720 });
+  executor.setBlendConstant([0.25, 0.5, 0.75, 1.0]);
+  executor.setStencilReference(0x1a);
+
+  const passOpsBeforeD2 = calls.pass.length;
+  const d2 = executor.drawIndexed(pass, 6, 1, 6, 0, 0);
+  assert.equal(d2.executed, true);
+  assert.equal(d2.pipelineElided, true);
+  assert.equal(d2.bindGroupsElided, 2);
+  assert.equal(d2.vertexBuffersElided, 2);
+  assert.equal(d2.indexBufferElided, true);
+  assert.equal(d2.viewportElided, true);
+  assert.equal(d2.scissorElided, true);
+  assert.equal(d2.blendConstantElided, true);
+  assert.equal(d2.stencilReferenceElided, true);
+
+  // ONLY drawIndexed was emitted on pass during draw 2!
+  assert.deepEqual(
+    calls.pass.slice(passOpsBeforeD2).map((c) => c.op),
+    ['drawIndexed']
+  );
+
+  // Draw 3: another identical draw elides all 10 state calls again.
+  const d3 = executor.drawIndexed(pass, 6, 1, 12, 0, 0);
+  assert.equal(d3.executed, true);
+  assert.equal(d3.viewportElided, true);
+  assert.equal(d3.scissorElided, true);
+  assert.equal(d3.blendConstantElided, true);
+  assert.equal(d3.stencilReferenceElided, true);
+
+  const stats = executor.getStats();
+  assert.equal(stats.elidedPipelineSets, 2);
+  assert.equal(stats.elidedBindGroupSets, 4);
+  assert.equal(stats.elidedVertexBufferSets, 4);
+  assert.equal(stats.elidedIndexBufferSets, 2);
+  assert.equal(stats.elidedViewportScissorSets, 4); // 2 viewport + 2 scissor
+  assert.equal(stats.elidedBlendConstantSets, 2);
+  assert.equal(stats.elidedStencilReferenceSets, 2);
+  assert.equal(
+    stats.totalElidedStateCalls,
+    stats.elidedPipelineSets +
+      stats.elidedBindGroupSets +
+      stats.elidedVertexBufferSets +
+      stats.elidedIndexBufferSets +
+      stats.elidedViewportScissorSets +
+      stats.elidedBlendConstantSets +
+      stats.elidedStencilReferenceSets
+  );
+  assert.equal(stats.totalElidedStateCalls, 20);
+  // Existing W130/W166 counters remain strictly aligned.
+  assert.equal(stats.redundantPipelineSkips, stats.elidedPipelineSets);
+  assert.equal(stats.redundantBindGroupSkips, stats.elidedBindGroupSets);
+  assert.equal(stats.redundantVertexBufferSkips, stats.elidedVertexBufferSets);
+  assert.equal(stats.redundantIndexBufferSkips, stats.elidedIndexBufferSets);
+});
+
+test('W194 re-emits state whenever any single viewport, scissor, blendConstant, stencilReference, buffer, or dynamic-offset field changes', () => {
+  const { device, pass, calls } = createMockWebGpu();
+  const router = new ShaderFallbackRouter();
+  const executor = new DrawExecutor({ device, shaderFallbackRouter: router });
+
+  const pipe = {
+    kind: 'GPURenderPipeline',
+    handle: 7201,
+    getBindGroupLayout: () => ({ kind: 'GPUBindGroupLayout' }),
+  };
+  const vb = device.createBuffer({ size: 512, usage: BUFFER_USAGE.VERTEX });
+  const ib = device.createBuffer({ size: 256, usage: BUFFER_USAGE.INDEX });
+  const bg = { kind: 'GPUBindGroup', handle: 7202 };
+
+  executor.beginPass();
+  executor.setPipeline(pipe);
+  executor.setVertexBuffer(0, vb, 0, 256);
+  executor.setIndexBuffer(ib, 'uint16', 0, 128);
+  const offsetSliceBuf = new Uint32Array([0, 256, 512, 768]);
+  executor.setBindGroup(0, bg, offsetSliceBuf, 0, 2); // [0, 256]
+  executor.setViewport(0, 0, 1280, 720, 0, 1);
+  executor.setScissorRect(0, 0, 1280, 720);
+  executor.setBlendConstant(0.1, 0.2, 0.3, 1.0);
+  executor.setStencilReference(1);
+
+  assert.equal(executor.drawIndexed(pass, 6, 1, 0, 0, 0).executed, true);
+  assert.equal(calls.pass.filter((c) => c.op === 'setViewport').length, 1);
+  assert.equal(calls.pass.filter((c) => c.op === 'setScissorRect').length, 1);
+  assert.equal(calls.pass.filter((c) => c.op === 'setBlendConstant').length, 1);
+  assert.equal(calls.pass.filter((c) => c.op === 'setStencilReference').length, 1);
+  assert.equal(calls.pass.filter((c) => c.op === 'setBindGroup').length, 1);
+
+  // Every single viewport field change triggers re-emission.
+  const vpMutations = [
+    [10, 0, 1280, 720, 0, 1],     // x
+    [10, 20, 1280, 720, 0, 1],    // y
+    [10, 20, 640, 720, 0, 1],     // width
+    [10, 20, 640, 360, 0, 1],     // height
+    [10, 20, 640, 360, 0.1, 1],   // minDepth
+    [10, 20, 640, 360, 0.1, 0.9], // maxDepth
+  ];
+  for (let i = 0; i < vpMutations.length; i += 1) {
+    executor.setViewport(...vpMutations[i]);
+    const r = executor.drawIndexed(pass, 6, 1, 0, 0, 0);
+    assert.equal(r.viewportElided, false);
+    assert.equal(r.scissorElided, true);
+    assert.equal(r.blendConstantElided, true);
+    assert.equal(r.stencilReferenceElided, true);
+  }
+  assert.equal(calls.pass.filter((c) => c.op === 'setViewport').length, 1 + vpMutations.length);
+
+  // Every single scissor field change triggers re-emission.
+  const scMutations = [
+    [4, 0, 1280, 720],   // x
+    [4, 8, 1280, 720],   // y
+    [4, 8, 640, 720],    // width
+    [4, 8, 640, 360],    // height
+  ];
+  for (let i = 0; i < scMutations.length; i += 1) {
+    executor.setScissorRect(...scMutations[i]);
+    const r = executor.drawIndexed(pass, 6, 1, 0, 0, 0);
+    assert.equal(r.scissorElided, false);
+    assert.equal(r.viewportElided, true);
+  }
+  assert.equal(calls.pass.filter((c) => c.op === 'setScissorRect').length, 1 + scMutations.length);
+
+  // Every single blendConstant channel change triggers re-emission.
+  const bcMutations = [
+    [0.5, 0.2, 0.3, 1.0], // r
+    [0.5, 0.6, 0.3, 1.0], // g
+    [0.5, 0.6, 0.7, 1.0], // b
+    [0.5, 0.6, 0.7, 0.8], // a
+  ];
+  for (let i = 0; i < bcMutations.length; i += 1) {
+    executor.setBlendConstant(new Float32Array(bcMutations[i]));
+    const r = executor.drawIndexed(pass, 6, 1, 0, 0, 0);
+    assert.equal(r.blendConstantElided, false);
+  }
+  assert.equal(calls.pass.filter((c) => c.op === 'setBlendConstant').length, 1 + bcMutations.length);
+
+  // Stencil reference change triggers re-emission.
+  executor.setStencilReference(255);
+  assert.equal(executor.drawIndexed(pass, 6, 1, 0, 0, 0).stencilReferenceElided, false);
+  assert.equal(calls.pass.filter((c) => c.op === 'setStencilReference').length, 2);
+
+  // Vertex buffer size change (same buffer + offset) triggers re-emission.
+  executor.setVertexBuffer(0, vb, 0, 128);
+  assert.equal(executor.drawIndexed(pass, 6, 1, 0, 0, 0).vertexBuffersElided, 0);
+  assert.equal(calls.pass.filter((c) => c.op === 'setVertexBuffer').length, 2);
+
+  // Index buffer offset and size changes trigger re-emission.
+  executor.setIndexBuffer(ib, 'uint16', 4, 128);
+  assert.equal(executor.drawIndexed(pass, 6, 1, 0, 0, 0).indexBufferElided, false);
+  executor.setIndexBuffer(ib, 'uint16', 4, 64);
+  assert.equal(executor.drawIndexed(pass, 6, 1, 0, 0, 0).indexBufferElided, false);
+  assert.equal(calls.pass.filter((c) => c.op === 'setIndexBuffer').length, 3);
+
+  // Bind group 5-arg dynamic offset slice change ([0, 256] -> [512, 768]) triggers re-emission.
+  executor.setBindGroup(0, bg, offsetSliceBuf, 2, 2);
+  assert.equal(executor.drawIndexed(pass, 6, 1, 0, 0, 0).bindGroupsElided, 0);
+  assert.equal(calls.pass.filter((c) => c.op === 'setBindGroup').length, 2);
+});
+
+test('W194 resets all bound pass state cleanly across beginPass, endPass, implicit pass switch, and resetStats', () => {
+  const env1 = createMockWebGpu();
+  const env2 = createMockWebGpu();
+  const router = new ShaderFallbackRouter();
+  const executor = new DrawExecutor({ device: env1.device, shaderFallbackRouter: router });
+
+  const pipe = {
+    kind: 'GPURenderPipeline',
+    handle: 7301,
+    getBindGroupLayout: () => ({ kind: 'GPUBindGroupLayout' }),
+  };
+  const vb = env1.device.createBuffer({ size: 256, usage: BUFFER_USAGE.VERTEX });
+  const ib = env1.device.createBuffer({ size: 128, usage: BUFFER_USAGE.INDEX });
+  const bg = { kind: 'GPUBindGroup', handle: 7302 };
+
+  // Pass 1: emit once, then elide once.
+  executor.beginPass();
+  executor.setPipeline(pipe);
+  executor.setVertexBuffer(0, vb, 0);
+  executor.setIndexBuffer(ib, 'uint16', 0);
+  executor.setBindGroup(0, bg, [0]);
+  executor.setViewport(0, 0, 1920, 1080, 0, 1);
+  executor.setScissorRect(0, 0, 1920, 1080);
+  executor.setBlendConstant({ r: 1, g: 1, b: 1, a: 1 });
+  executor.setStencilReference(7);
+
+  executor.drawIndexed(env1.pass, 6, 1, 0, 0, 0);
+  const elided1 = executor.drawIndexed(env1.pass, 6, 1, 0, 0, 0);
+  assert.equal(elided1.pipelineElided, true);
+  assert.equal(elided1.bindGroupsElided, 1);
+  assert.equal(elided1.vertexBuffersElided, 1);
+  assert.equal(elided1.indexBufferElided, true);
+  assert.equal(elided1.viewportElided, true);
+  assert.equal(elided1.scissorElided, true);
+  assert.equal(elided1.blendConstantElided, true);
+  assert.equal(elided1.stencilReferenceElided, true);
+
+  // Implicit pass-object switch to env2.pass MUST re-emit every single state call!
+  const onPass2 = executor.drawIndexed(env2.pass, 6, 1, 0, 0, 0);
+  assert.equal(onPass2.executed, true);
+  assert.equal(onPass2.pipelineElided, false);
+  assert.equal(onPass2.bindGroupsElided, 0);
+  assert.equal(onPass2.vertexBuffersElided, 0);
+  assert.equal(onPass2.indexBufferElided, false);
+  assert.equal(onPass2.viewportElided, false);
+  assert.equal(onPass2.scissorElided, false);
+  assert.equal(onPass2.blendConstantElided, false);
+  assert.equal(onPass2.stencilReferenceElided, false);
+  assert.equal(env2.calls.pass.filter((c) => c.op === 'setViewport').length, 1);
+  assert.equal(env2.calls.pass.filter((c) => c.op === 'setScissorRect').length, 1);
+  assert.equal(env2.calls.pass.filter((c) => c.op === 'setBlendConstant').length, 1);
+  assert.equal(env2.calls.pass.filter((c) => c.op === 'setStencilReference').length, 1);
+
+  // endPass() clears all bound state even when drawing again on env2.pass.
+  executor.endPass();
+  const clearedBound = executor.getBoundPassState();
+  assert.equal(clearedBound.hasActivePass, false);
+  assert.equal(clearedBound.pipeline, null);
+  assert.equal(clearedBound.viewport, null);
+  assert.equal(clearedBound.scissorRect, null);
+  assert.equal(clearedBound.blendConstant, null);
+  assert.equal(clearedBound.stencilReference, null);
+
+  const afterEnd = executor.drawIndexed(env2.pass, 6, 1, 0, 0, 0);
+  assert.equal(afterEnd.viewportElided, false);
+  assert.equal(afterEnd.scissorElided, false);
+  assert.equal(afterEnd.blendConstantElided, false);
+  assert.equal(afterEnd.stencilReferenceElided, false);
+  assert.equal(env2.calls.pass.filter((c) => c.op === 'setViewport').length, 2);
+  assert.equal(env2.calls.pass.filter((c) => c.op === 'setScissorRect').length, 2);
+  assert.equal(env2.calls.pass.filter((c) => c.op === 'setBlendConstant').length, 2);
+  assert.equal(env2.calls.pass.filter((c) => c.op === 'setStencilReference').length, 2);
+
+  // beginPass() resets both staged and bound state so previous viewport/scissor do not leak.
+  executor.beginPass();
+  executor.setPipeline(pipe);
+  executor.draw(env2.pass, 3, 1);
+  assert.equal(env2.calls.pass.filter((c) => c.op === 'setViewport').length, 2);
+  assert.equal(env2.calls.pass.filter((c) => c.op === 'setScissorRect').length, 2);
+
+  // resetStats() zeroes all W194 telemetry counters cleanly.
+  assert.ok(executor.getStats().totalElidedStateCalls > 0);
+  executor.resetStats();
+  const zeroed = executor.getStats();
+  assert.equal(zeroed.elidedPipelineSets, 0);
+  assert.equal(zeroed.elidedBindGroupSets, 0);
+  assert.equal(zeroed.elidedVertexBufferSets, 0);
+  assert.equal(zeroed.elidedIndexBufferSets, 0);
+  assert.equal(zeroed.elidedViewportScissorSets, 0);
+  assert.equal(zeroed.elidedBlendConstantSets, 0);
+  assert.equal(zeroed.elidedStencilReferenceSets, 0);
+  assert.equal(zeroed.totalElidedStateCalls, 0);
+});
+
+test('W194 immediate pass-directed setViewport/setScissorRect/setBlendConstant/setStencilReference, fallback & indirect paths, validation, and opt-out flags', () => {
+  const { device, pass, calls } = createMockWebGpu();
+  const router = new ShaderFallbackRouter();
+  const executor = new DrawExecutor({ device, shaderFallbackRouter: router });
+
+  // 1. Immediate pass-directed calls elide duplicates without double-counting on subsequent draw.
+  assert.equal(executor.setViewport(pass, 0, 0, 800, 600, 0, 1), true);
+  assert.equal(executor.setViewport(pass, 0, 0, 800, 600, 0, 1), true); // elided
+  assert.equal(executor.setScissorRect(pass, 0, 0, 800, 600), true);
+  assert.equal(executor.setScissorRect(pass, { x: 0, y: 0, width: 800, height: 600 }), true); // elided
+  assert.equal(executor.setBlendConstant(pass, { r: 0, g: 0, b: 0, a: 1 }), true);
+  assert.equal(executor.setBlendConstant(pass, [0, 0, 0, 1]), true); // elided
+  assert.equal(executor.setStencilReference(pass, 12), true);
+  assert.equal(executor.setStencilReference(pass, 12), true); // elided
+
+  assert.equal(calls.pass.filter((c) => c.op === 'setViewport').length, 1);
+  assert.equal(calls.pass.filter((c) => c.op === 'setScissorRect').length, 1);
+  assert.equal(calls.pass.filter((c) => c.op === 'setBlendConstant').length, 1);
+  assert.equal(calls.pass.filter((c) => c.op === 'setStencilReference').length, 1);
+
+  // Subsequent fallback draw does not double-count elisions for immediate calls.
+  const cbv = device.createBuffer({ size: 256, usage: BUFFER_USAGE.UNIFORM });
+  executor.setConstantBuffer(0, cbv);
+  const fb1 = executor.draw(pass, 3, 1);
+  assert.equal(fb1.executed, true);
+  assert.equal(fb1.viewportElided, false);
+  assert.equal(fb1.scissorElided, false);
+  assert.equal(executor.getStats().elidedViewportScissorSets, 2);
+  assert.equal(executor.getStats().elidedBlendConstantSets, 1);
+  assert.equal(executor.getStats().elidedStencilReferenceSets, 1);
+  assert.equal(executor.getStats().totalElidedStateCalls, 4);
+
+  // Per-draw overrides matching currently bound pass state elide cleanly on fallback + indirect draws!
+  const fb2 = executor.executeDraw(pass, {
+    vertexCount: 3,
+    viewport: { x: 0, y: 0, width: 800, height: 600, minDepth: 0, maxDepth: 1 },
+    scissorRect: { x: 0, y: 0, width: 800, height: 600 },
+  });
+  assert.equal(fb2.executed, true);
+  assert.equal(fb2.viewportElided, true);
+  assert.equal(fb2.scissorElided, true);
+  assert.equal(executor.getStats().elidedViewportScissorSets, 4);
+
+  // Indirect draw also applies & elides staged viewport/scissor.
+  const indirectBuf = device.createBuffer({ size: 64, usage: BUFFER_USAGE.INDIRECT });
+  executor.setViewport(16, 16, 400, 300, 0, 1);
+  executor.setScissorRect(16, 16, 400, 300);
+  const ind1 = executor.drawIndirect(pass, indirectBuf, 0);
+  assert.equal(ind1.executed, true);
+  assert.equal(ind1.viewportElided, false);
+  assert.equal(ind1.scissorElided, false);
+  const ind2 = executor.drawIndirect(pass, indirectBuf, 0);
+  assert.equal(ind2.executed, true);
+  assert.equal(ind2.viewportElided, true);
+  assert.equal(ind2.scissorElided, true);
+  assert.equal(calls.pass.filter((c) => c.op === 'setViewport').length, 2);
+  assert.equal(calls.pass.filter((c) => c.op === 'setScissorRect').length, 2);
+
+  // 2. Invalid arguments return false cleanly without throwing or corrupting bound state.
+  assert.equal(executor.setViewport(0, 0, -10, 100, 0, 1), false);
+  assert.equal(executor.setViewport(0, 0, 100, 100, 0.8, 0.2), false); // minDepth > maxDepth
+  assert.equal(executor.setViewport(NaN, 0, 100, 100, 0, 1), false);
+  assert.equal(executor.setScissorRect(-1, 0, 100, 100), false);
+  assert.equal(executor.setScissorRect(0, 0, 12.5, 100), false);
+  assert.equal(executor.setBlendConstant([1, 2]), false);
+  assert.equal(executor.setBlendConstant({ r: Infinity, g: 0, b: 0, a: 1 }), false);
+  assert.equal(executor.setStencilReference(-1), false);
+  assert.equal(executor.setStencilReference(1.5), false);
+
+  // 3. Throwing pass method is caught safely and does not corrupt bound state.
+  const failVpEnv = createMockWebGpu({ failSetViewport: true });
+  const failVpExec = new DrawExecutor({ device: failVpEnv.device, shaderFallbackRouter: router });
+  assert.equal(failVpExec.setViewport(failVpEnv.pass, 0, 0, 640, 480, 0, 1), false);
+  assert.equal(failVpExec.getBoundPassState().viewport, null);
+  assert.equal(failVpExec.getStats().passErrors, 1);
+
+  // 4. Opt-out via elideRedundantState: false disables viewport/scissor/blend/stencil elision too.
+  const noElideEnv = createMockWebGpu();
+  const noElideExec = new DrawExecutor({
+    device: noElideEnv.device,
+    shaderFallbackRouter: router,
+    elideRedundantState: false,
+  });
+  const pipe = {
+    kind: 'GPURenderPipeline',
+    handle: 7401,
+    getBindGroupLayout: () => ({ kind: 'GPUBindGroupLayout' }),
+  };
+  noElideExec.beginPass();
+  noElideExec.setPipeline(pipe);
+  noElideExec.setViewport(0, 0, 640, 480, 0, 1);
+  noElideExec.setScissorRect(0, 0, 640, 480);
+  noElideExec.setBlendConstant({ r: 0, g: 0, b: 0, a: 1 });
+  noElideExec.setStencilReference(3);
+  noElideExec.draw(noElideEnv.pass, 3, 1);
+  noElideExec.draw(noElideEnv.pass, 3, 1);
+  assert.equal(noElideEnv.calls.pass.filter((c) => c.op === 'setViewport').length, 2);
+  assert.equal(noElideEnv.calls.pass.filter((c) => c.op === 'setScissorRect').length, 2);
+  assert.equal(noElideEnv.calls.pass.filter((c) => c.op === 'setBlendConstant').length, 2);
+  assert.equal(noElideEnv.calls.pass.filter((c) => c.op === 'setStencilReference').length, 2);
+  assert.equal(noElideExec.getStats().elidedViewportScissorSets, 0);
+  assert.equal(noElideExec.getStats().totalElidedStateCalls, 0);
+
+  // 5. Minimal pass missing optional setViewport/setScissorRect/setBlendConstant/setStencilReference still works cleanly.
+  const minimalPass = {
+    ops: [],
+    setPipeline(p) { this.ops.push(['setPipeline', p]); },
+    draw(v, i) { this.ops.push(['draw', v, i]); },
+  };
+  const minExec = new DrawExecutor({ device, shaderFallbackRouter: router });
+  minExec.beginPass();
+  minExec.setPipeline(pipe);
+  minExec.setViewport(0, 0, 640, 480, 0, 1);
+  minExec.setScissorRect(0, 0, 640, 480);
+  minExec.setBlendConstant({ r: 0, g: 0, b: 0, a: 1 });
+  minExec.setStencilReference(1);
+  const minRes = minExec.draw(minimalPass, 3, 1);
+  assert.equal(minRes.executed, true);
+  assert.equal(minRes.viewportElided, false);
+  assert.equal(minExec.getStats().elidedViewportScissorSets, 0);
 });
