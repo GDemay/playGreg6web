@@ -13,8 +13,10 @@ const {
   DEFAULT_STATUS_URL,
   DEFAULT_STAGE_TIMEOUT_MS,
   DEFAULT_PARALLEL_PRELOAD,
+  DEFAULT_RELEASE_PRELOAD_BUFFERS,
   discoverBootAssets,
   isRealGuestBoot,
+  releaseBootBundleBytes,
 } = orchestratorMod;
 
 function createMockFetch(payload, { ok = true, status = 200, throwError = null, delayMs = 0 } = {}) {
@@ -205,6 +207,7 @@ function createOrchestrator(overrides = {}) {
     nowFn: overrides.nowFn,
     stageTimeoutMs: overrides.stageTimeoutMs,
     parallelPreload: overrides.parallelPreload,
+    releasePreloadBuffers: overrides.releasePreloadBuffers,
     preloadTasks: overrides.preloadTasks,
   });
   return { orchestrator, overlay, bootTracer, phases, launches, fallbacks, firstPresents };
@@ -1983,4 +1986,341 @@ test('W225 overlaps non-PGIM shaderPack + reflection preload and records positiv
   assert.deepEqual(resetStats.phaseTimingsMs, {});
   assert.deepEqual(resetStats.preloadTaskTimingsMs, {});
   assert.equal(resetStats.preloadStats.taskCount, 0);
+});
+
+// ---------------------------------------------------------------------------
+// W258: Release large preload ArrayBuffer / Uint8Array references after handoff
+// ---------------------------------------------------------------------------
+
+test('W258 releaseBootBundleBytes nulls binary payloads without double-counting, preserves metadata, and is defensive/idempotent', () => {
+  assert.equal(typeof releaseBootBundleBytes, 'function');
+  assert.equal(DEFAULT_RELEASE_PRELOAD_BUFFERS, true);
+
+  // Defensive on null, undefined, primitives, and frozen objects.
+  for (const input of [null, undefined, 0, 42, 'bundle', true, Symbol('x')]) {
+    assert.deepEqual(releaseBootBundleBytes(input), { releasedFields: [], releasedBytes: 0 });
+  }
+  const frozenBundle = Object.freeze({
+    shaderPackBytes: new Uint8Array(64),
+    pgim: Object.freeze({ bytes: new Uint8Array(32), bytesLoaded: 32 }),
+    bytesLoaded: 96,
+  });
+  assert.deepEqual(releaseBootBundleBytes(frozenBundle), { releasedFields: [], releasedBytes: 0 });
+  assert.equal(frozenBundle.shaderPackBytes.byteLength, 64);
+
+  // Full boot bundle with aliased pgim backing buffer + shaderPackBytes + reflectionManifest + reflectionSidecar + sidecars.
+  const pgimBuf = new ArrayBuffer(128);
+  const pgimBytes = new Uint8Array(pgimBuf);
+  const shaderPackBytes = new Uint8Array(256);
+  const reflBytes = new Uint8Array(48);
+  const sidecarBuf = new ArrayBuffer(64);
+  const sidecarBytes = new Uint8Array(sidecarBuf);
+  const customBuf = new ArrayBuffer(32);
+  const customBytes = new Uint8Array(customBuf);
+  const customDirect = new Uint8Array(16);
+
+  const bundle = {
+    buffer: pgimBuf,
+    pgimBytes,
+    pgim: {
+      bytes: pgimBytes,
+      buffer: pgimBuf,
+      header: { magic: 'PGIM', entryPointRva: 0x1000 },
+      bytesLoaded: 128,
+      totalBytes: 128,
+      transport: 'range',
+      timingMs: 12,
+      durationMs: 12,
+    },
+    shaderPackBytes,
+    shaderPackIndex: {
+      entryCount: 42,
+      bytes: new Uint8Array(24),
+      bytesLoaded: 24,
+    },
+    reflectionManifest: {
+      manifest: { schema_version: 1, shaders: { a: {} } },
+      bytes: reflBytes,
+      bytesLoaded: 48,
+      totalBytes: 48,
+      durationMs: 4,
+    },
+    reflectionSidecar: {
+      manifest: { stages: 4 },
+      bytes: sidecarBytes,
+      buffer: sidecarBuf,
+      bytesLoaded: 64,
+    },
+    sidecars: {
+      extraObj: { bytes: customBytes, buffer: customBuf, bytesLoaded: 32, tag: 'ok' },
+      extraRaw: customDirect,
+    },
+    bytesLoaded: 568,
+    totalBytes: 568,
+    timingMs: { pgim: 12, shaderPack: 20, reflection: 4, total: 20 },
+    durationMs: 20,
+  };
+
+  const expectedUniqueBytes = 128 + 256 + 24 + 48 + 64 + 32 + 16;
+  const first = releaseBootBundleBytes(bundle);
+  assert.equal(first.releasedBytes, expectedUniqueBytes);
+  assert.ok(first.releasedFields.includes('buffer'));
+  assert.ok(first.releasedFields.includes('pgimBytes'));
+  assert.ok(first.releasedFields.includes('shaderPackBytes'));
+  assert.ok(first.releasedFields.includes('pgim.bytes'));
+  assert.ok(first.releasedFields.includes('pgim.buffer'));
+  assert.ok(first.releasedFields.includes('shaderPackIndex.bytes'));
+  assert.ok(first.releasedFields.includes('reflectionManifest.bytes'));
+  assert.ok(first.releasedFields.includes('reflectionSidecar.bytes'));
+  assert.ok(first.releasedFields.includes('reflectionSidecar.buffer'));
+  assert.ok(first.releasedFields.includes('sidecars.extraObj.bytes'));
+  assert.ok(first.releasedFields.includes('sidecars.extraObj.buffer'));
+  assert.ok(first.releasedFields.includes('sidecars.extraRaw'));
+
+  // All binary payloads must be nulled.
+  assert.equal(bundle.buffer, null);
+  assert.equal(bundle.pgimBytes, null);
+  assert.equal(bundle.shaderPackBytes, null);
+  assert.equal(bundle.pgim.bytes, null);
+  assert.equal(bundle.pgim.buffer, null);
+  assert.equal(bundle.shaderPackIndex.bytes, null);
+  assert.equal(bundle.reflectionManifest.bytes, null);
+  assert.equal(bundle.reflectionSidecar.bytes, null);
+  assert.equal(bundle.reflectionSidecar.buffer, null);
+  assert.equal(bundle.sidecars.extraObj.bytes, null);
+  assert.equal(bundle.sidecars.extraObj.buffer, null);
+  assert.equal(bundle.sidecars.extraRaw, null);
+
+  // Lightweight metadata must remain intact.
+  assert.equal(bundle.bytesLoaded, 568);
+  assert.equal(bundle.totalBytes, 568);
+  assert.deepEqual(bundle.timingMs, { pgim: 12, shaderPack: 20, reflection: 4, total: 20 });
+  assert.equal(bundle.durationMs, 20);
+  assert.equal(bundle.pgim.header.magic, 'PGIM');
+  assert.equal(bundle.pgim.bytesLoaded, 128);
+  assert.equal(bundle.pgim.transport, 'range');
+  assert.equal(bundle.shaderPackIndex.entryCount, 42);
+  assert.deepEqual(bundle.reflectionManifest.manifest, { schema_version: 1, shaders: { a: {} } });
+  assert.equal(bundle.reflectionManifest.bytesLoaded, 48);
+  assert.deepEqual(bundle.reflectionSidecar.manifest, { stages: 4 });
+  assert.equal(bundle.sidecars.extraObj.bytesLoaded, 32);
+  assert.equal(bundle.sidecars.extraObj.tag, 'ok');
+
+  // Calling twice is idempotent and reports 0 released bytes.
+  const second = releaseBootBundleBytes(bundle);
+  assert.deepEqual(second, { releasedFields: [], releasedBytes: 0 });
+});
+
+test('W258 BootOrchestrator hands intact buffers to onLaunchRuntime and releases them after handoff by default', async () => {
+  assert.throws(() => new BootOrchestrator({ releasePreloadBuffers: 'yes' }), TypeError);
+  assert.throws(() => new BootOrchestrator({ releasePreloadBuffers: 1 }), TypeError);
+
+  const pgimBuf = new ArrayBuffer(256);
+  const shaderBuf = new ArrayBuffer(512);
+  const reflBytes = new Uint8Array(64);
+  const sidecarBytes = new Uint8Array(96);
+
+  const granularPreloader = {
+    preloadPgim: async () => ({
+      header: { magic: 'PGIM' },
+      bytes: new Uint8Array(pgimBuf),
+      buffer: pgimBuf,
+      bytesLoaded: 256,
+      totalBytes: 256,
+      transport: 'range',
+    }),
+    preloadShaderPack: async () => ({
+      bytes: new Uint8Array(shaderBuf),
+      buffer: shaderBuf,
+      bytesLoaded: 512,
+      totalBytes: 512,
+      transport: 'range',
+    }),
+    preloadReflectionManifest: async () => ({
+      manifest: { schema_version: 1 },
+      bytes: reflBytes,
+      bytesLoaded: 64,
+    }),
+    preloadReflectionSidecar: async () => ({
+      manifest: { stageCount: 2 },
+      bytes: sidecarBytes,
+      bytesLoaded: 96,
+    }),
+  };
+
+  let observedDuringLaunch = null;
+  const { orchestrator, launches } = createOrchestrator({
+    fetchImpl: createMockFetch(
+      readyStatus({
+        reflectionSidecarUrl: '/data/shaders/stage-reflection.json',
+      })
+    ),
+    preloader: granularPreloader,
+    onLaunchRuntime: async (payload) => {
+      launches.push(payload);
+      observedDuringLaunch = {
+        pgimLen: payload.bundle.pgim.bytes.byteLength,
+        pgimBufLen: payload.bundle.pgim.buffer.byteLength,
+        shaderLen: payload.bundle.shaderPackBytes.bytes.byteLength,
+        shaderBufLen: payload.bundle.shaderPackBytes.buffer.byteLength,
+        reflLen: payload.bundle.reflectionManifest.bytes.byteLength,
+        sidecarLen: payload.bundle.reflectionSidecar.bytes.byteLength,
+      };
+    },
+  });
+
+  const result = await orchestrator.start();
+  assert.equal(result.ok, true);
+
+  // Inside onLaunchRuntime, all binary payloads were intact for worker handoff.
+  assert.deepEqual(observedDuringLaunch, {
+    pgimLen: 256,
+    pgimBufLen: 256,
+    shaderLen: 512,
+    shaderBufLen: 512,
+    reflLen: 64,
+    sidecarLen: 96,
+  });
+
+  // After onLaunchRuntime resolves, internal bundle reference is cleared and binary fields are nulled.
+  assert.equal(orchestrator.getState().bundle, null);
+  assert.equal(launches[0].bundle.pgim.bytes, null);
+  assert.equal(launches[0].bundle.pgim.buffer, null);
+  assert.equal(launches[0].bundle.shaderPackBytes.bytes, null);
+  assert.equal(launches[0].bundle.shaderPackBytes.buffer, null);
+  assert.equal(launches[0].bundle.reflectionManifest.bytes, null);
+  assert.equal(launches[0].bundle.reflectionSidecar.bytes, null);
+
+  // Metadata, getPreloadStats(), getState(), and assets remain intact.
+  assert.equal(launches[0].bundle.pgim.header.magic, 'PGIM');
+  assert.equal(launches[0].bundle.pgim.bytesLoaded, 256);
+  assert.equal(launches[0].bundle.shaderPackBytes.bytesLoaded, 512);
+  assert.deepEqual(launches[0].bundle.reflectionManifest.manifest, { schema_version: 1 });
+  assert.deepEqual(launches[0].bundle.reflectionSidecar.manifest, { stageCount: 2 });
+  assert.equal(orchestrator.getPreloadStats().completedCount, 4);
+  assert.equal(orchestrator.getState().assets.pgimUrl, '/data/boot/GTA6.pgim');
+
+  // Calling releasePreloadBuffers() again is a safe idempotent no-op.
+  assert.deepEqual(orchestrator.releasePreloadBuffers(), { releasedFields: [], releasedBytes: 0 });
+});
+
+test('W258 BootOrchestrator.releasePreloadBuffers() and dispose() release retained references while preserving getPreloadStats()', async () => {
+  // 1. Explicit releasePreloadBuffers() when auto-release is opted out (`releasePreloadBuffers: false`).
+  {
+    const retainedBundle = {
+      pgim: {
+        header: { magic: 'PGIM' },
+        bytes: new Uint8Array(128),
+        buffer: null,
+        bytesLoaded: 128,
+      },
+      shaderPackBytes: new Uint8Array(1024),
+      reflectionManifest: {
+        manifest: { schema_version: 1 },
+        bytes: new Uint8Array(40),
+        bytesLoaded: 40,
+      },
+      reflectionSidecar: {
+        manifest: { ok: true },
+        bytes: new Uint8Array(32),
+        bytesLoaded: 32,
+      },
+      bytesLoaded: 1224,
+    };
+    retainedBundle.pgim.buffer = retainedBundle.pgim.bytes.buffer;
+
+    const { orchestrator } = createOrchestrator({
+      preloader: createPreloader({ bundle: retainedBundle }),
+      releasePreloadBuffers: false,
+    });
+
+    await orchestrator.start();
+    assert.equal(orchestrator.getState().bundle, retainedBundle);
+    assert.equal(retainedBundle.shaderPackBytes.byteLength, 1024);
+
+    const released = orchestrator.releasePreloadBuffers();
+    assert.equal(released.releasedBytes, 128 + 1024 + 40 + 32);
+    assert.equal(orchestrator.getState().bundle, null);
+    assert.equal(retainedBundle.shaderPackBytes, null);
+    assert.equal(retainedBundle.pgim.bytes, null);
+    assert.equal(retainedBundle.pgim.buffer, null);
+    assert.equal(retainedBundle.reflectionManifest.bytes, null);
+    assert.equal(retainedBundle.reflectionSidecar.bytes, null);
+
+    // Lightweight metadata, getPreloadStats(), getState(), and assets remain intact.
+    assert.equal(retainedBundle.bytesLoaded, 1224);
+    assert.deepEqual(retainedBundle.reflectionManifest.manifest, { schema_version: 1 });
+    assert.equal(orchestrator.getPreloadStats().completedCount, 1);
+    assert.equal(orchestrator.getState().phase, BOOT_PHASE.LAUNCHING_RUNTIME);
+    assert.equal(orchestrator.getState().assets.pgimUrl, '/data/boot/GTA6.pgim');
+
+    // Second release is idempotent.
+    assert.deepEqual(orchestrator.releasePreloadBuffers(), { releasedFields: [], releasedBytes: 0 });
+  }
+
+  // 2. dispose() releases retained preload buffers while preserving getPreloadStats() and assets.
+  {
+    const retainedBundle = {
+      pgim: {
+        header: { magic: 'PGIM' },
+        bytes: new Uint8Array(200),
+        bytesLoaded: 200,
+      },
+      shaderPackBytes: new Uint8Array(800),
+      reflectionManifest: {
+        manifest: { schema_version: 1 },
+        bytes: new Uint8Array(50),
+        bytesLoaded: 50,
+      },
+      bytesLoaded: 1050,
+    };
+
+    const { orchestrator, overlay } = createOrchestrator({
+      preloader: createPreloader({ bundle: retainedBundle }),
+      releasePreloadBuffers: false,
+    });
+
+    await orchestrator.start();
+    assert.equal(orchestrator.getState().bundle, retainedBundle);
+
+    const disposeRes = orchestrator.dispose();
+    assert.equal(disposeRes.ok, true);
+    assert.equal(disposeRes.alreadyDestroyed, false);
+    assert.equal(disposeRes.phase, BOOT_PHASE.DESTROYED);
+    assert.equal(overlay.destroys, 1);
+
+    assert.equal(orchestrator.getState().bundle, null);
+    assert.equal(retainedBundle.shaderPackBytes, null);
+    assert.equal(retainedBundle.pgim.bytes, null);
+    assert.equal(retainedBundle.reflectionManifest.bytes, null);
+
+    assert.equal(orchestrator.getPreloadStats().completedCount, 1);
+    assert.equal(orchestrator.getState().assets.pgimUrl, '/data/boot/GTA6.pgim');
+    assert.equal(orchestrator.getState().destroyed, true);
+    assert.equal(orchestrator.dispose().alreadyDestroyed, true);
+  }
+
+  // 3. Without onLaunchRuntime, buffers stay available on start() return until notifyFirstPresent() or releasePreloadBuffers().
+  {
+    const retainedBundle = {
+      pgim: { header: { magic: 'PGIM' }, bytes: new Uint8Array(64), bytesLoaded: 64 },
+      shaderPackBytes: new Uint8Array(128),
+      bytesLoaded: 192,
+    };
+    const { orchestrator } = createOrchestrator({
+      preloader: createPreloader({ bundle: retainedBundle }),
+      onLaunchRuntime: null,
+    });
+
+    const result = await orchestrator.start();
+    assert.equal(result.ok, true);
+    assert.equal(result.bundle.shaderPackBytes.byteLength, 128);
+    assert.equal(orchestrator.getState().bundle, retainedBundle);
+
+    orchestrator.notifyFirstPresent({ frameIndex: 1 });
+    assert.equal(orchestrator.getState().bundle, null);
+    assert.equal(retainedBundle.shaderPackBytes, null);
+    assert.equal(retainedBundle.pgim.bytes, null);
+    assert.equal(orchestrator.getPreloadStats().completedCount, 1);
+  }
 });

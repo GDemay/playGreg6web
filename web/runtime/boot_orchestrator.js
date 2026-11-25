@@ -11,6 +11,7 @@
   const DEFAULT_STATUS_URL = '/api/status';
   const DEFAULT_STAGE_TIMEOUT_MS = 0;
   const DEFAULT_PARALLEL_PRELOAD = true;
+  const DEFAULT_RELEASE_PRELOAD_BUFFERS = true;
   const MAX_DIAGNOSTIC_TEXT_LENGTH = 512;
   const FORBIDDEN_TASK_NAMES = Object.freeze(new Set(['__proto__', 'constructor', 'prototype']));
 
@@ -72,6 +73,197 @@
       throw new TypeError('parallelPreload must be a boolean');
     }
     return value;
+  }
+
+  function normalizeReleasePreloadBuffers(value) {
+    if (value === undefined) return DEFAULT_RELEASE_PRELOAD_BUFFERS;
+    if (typeof value !== 'boolean') {
+      throw new TypeError('releasePreloadBuffers must be a boolean');
+    }
+    return value;
+  }
+
+  function getBinaryBufferInfo(value) {
+    if (value instanceof ArrayBuffer) {
+      return { backingBuffer: value, byteLength: value.byteLength };
+    }
+    if (typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer) {
+      return { backingBuffer: value, byteLength: value.byteLength };
+    }
+    if (ArrayBuffer.isView(value)) {
+      return { backingBuffer: value.buffer, byteLength: value.byteLength };
+    }
+    return null;
+  }
+
+  function isWritableOwnProperty(obj, key) {
+    if (!obj || typeof obj !== 'object') return false;
+    if (!Object.prototype.hasOwnProperty.call(obj, key)) return false;
+    const desc = Object.getOwnPropertyDescriptor(obj, key);
+    if (!desc) return false;
+    if ('get' in desc || 'set' in desc) {
+      return typeof desc.set === 'function';
+    }
+    return desc.writable === true;
+  }
+
+  /**
+   * Release large binary payload references (`ArrayBuffer`, `SharedArrayBuffer`, or TypedArray views)
+   * held on a preloaded boot bundle (or single-asset preload result) while preserving lightweight
+   * metadata (`bytesLoaded`, `totalBytes`, `entryCount`, `manifest`, `header`, `timingMs`,
+   * `durationMs`, `transport`). Defensive and idempotent: never throws on null, primitive, or
+   * frozen inputs.
+   *
+   * @param {unknown} bundle
+   * @returns {{ releasedFields: string[], releasedBytes: number }}
+   */
+  function releaseBootBundleBytes(bundle) {
+    const releasedFields = [];
+    let releasedBytes = 0;
+    if (!bundle || typeof bundle !== 'object') {
+      return { releasedFields, releasedBytes };
+    }
+
+    const countedByBuffer = new Map();
+    const visitedObjects = new Set();
+
+    const recordBufferBytes = (info) => {
+      if (!info || !info.backingBuffer) return;
+      const len =
+        typeof info.byteLength === 'number' && Number.isFinite(info.byteLength) && info.byteLength > 0
+          ? info.byteLength
+          : 0;
+      const prev = countedByBuffer.get(info.backingBuffer) || 0;
+      if (len > prev) {
+        releasedBytes += len - prev;
+        countedByBuffer.set(info.backingBuffer, len);
+      }
+    };
+
+    const nullBinaryProp = (obj, key, path) => {
+      if (!isWritableOwnProperty(obj, key)) return false;
+      let val;
+      try {
+        val = obj[key];
+      } catch {
+        return false;
+      }
+      const info = getBinaryBufferInfo(val);
+      if (!info) return false;
+      try {
+        obj[key] = null;
+      } catch {
+        return false;
+      }
+      releasedFields.push(path);
+      recordBufferBytes(info);
+      return true;
+    };
+
+    const releasePayloadContainer = (obj, prefix) => {
+      if (!obj || typeof obj !== 'object' || visitedObjects.has(obj)) return;
+      visitedObjects.add(obj);
+      nullBinaryProp(obj, 'bytes', `${prefix}.bytes`);
+      nullBinaryProp(obj, 'buffer', `${prefix}.buffer`);
+    };
+
+    const releaseAssetSlot = (parent, key, prefix) => {
+      if (!parent || typeof parent !== 'object' || !Object.prototype.hasOwnProperty.call(parent, key)) {
+        return;
+      }
+      let val;
+      try {
+        val = parent[key];
+      } catch {
+        return;
+      }
+      if (!val || typeof val !== 'object') return;
+      if (getBinaryBufferInfo(val)) {
+        nullBinaryProp(parent, key, prefix);
+        return;
+      }
+      releasePayloadContainer(val, prefix);
+    };
+
+    const releaseModuleList = (list, prefix) => {
+      if (!Array.isArray(list) || visitedObjects.has(list)) return;
+      visitedObjects.add(list);
+      for (let i = 0; i < list.length; i += 1) {
+        const item = list[i];
+        if (!item || typeof item !== 'object') continue;
+        if (getBinaryBufferInfo(item)) {
+          nullBinaryProp(list, String(i), `${prefix}[${i}]`);
+        } else {
+          releasePayloadContainer(item, `${prefix}[${i}]`);
+        }
+      }
+    };
+
+    const releaseModuleMap = (map, prefix) => {
+      if (!map || typeof map !== 'object' || Array.isArray(map) || visitedObjects.has(map)) return;
+      visitedObjects.add(map);
+      for (const key of Object.keys(map)) {
+        releaseAssetSlot(map, key, `${prefix}.${key}`);
+      }
+    };
+
+    visitedObjects.add(bundle);
+
+    nullBinaryProp(bundle, 'buffer', 'buffer');
+    nullBinaryProp(bundle, 'bytes', 'bytes');
+    nullBinaryProp(bundle, 'pgimBytes', 'pgimBytes');
+
+    releaseAssetSlot(bundle, 'shaderPackBytes', 'shaderPackBytes');
+    releaseAssetSlot(bundle, 'pgim', 'pgim');
+    releaseAssetSlot(bundle, 'shaderPackIndex', 'shaderPackIndex');
+    releaseAssetSlot(bundle, 'reflectionManifest', 'reflectionManifest');
+    releaseAssetSlot(bundle, 'reflectionSidecar', 'reflectionSidecar');
+
+    if (Object.prototype.hasOwnProperty.call(bundle, 'modules')) {
+      releaseModuleList(bundle.modules, 'modules');
+    }
+    if (Object.prototype.hasOwnProperty.call(bundle, 'modulesByName')) {
+      releaseModuleMap(bundle.modulesByName, 'modulesByName');
+    }
+    if (Object.prototype.hasOwnProperty.call(bundle, 'mainModule')) {
+      releaseAssetSlot(bundle, 'mainModule', 'mainModule');
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(bundle, 'program') &&
+      bundle.program &&
+      typeof bundle.program === 'object' &&
+      !visitedObjects.has(bundle.program)
+    ) {
+      const program = bundle.program;
+      visitedObjects.add(program);
+      nullBinaryProp(program, 'bytes', 'program.bytes');
+      nullBinaryProp(program, 'buffer', 'program.buffer');
+      if (Object.prototype.hasOwnProperty.call(program, 'mainModule')) {
+        releaseAssetSlot(program, 'mainModule', 'program.mainModule');
+      }
+      if (Object.prototype.hasOwnProperty.call(program, 'modules')) {
+        releaseModuleList(program.modules, 'program.modules');
+      }
+      if (Object.prototype.hasOwnProperty.call(program, 'modulesByName')) {
+        releaseModuleMap(program.modulesByName, 'program.modulesByName');
+      }
+    }
+
+    if (
+      Object.prototype.hasOwnProperty.call(bundle, 'sidecars') &&
+      bundle.sidecars &&
+      typeof bundle.sidecars === 'object' &&
+      !Array.isArray(bundle.sidecars) &&
+      !visitedObjects.has(bundle.sidecars)
+    ) {
+      const sidecars = bundle.sidecars;
+      visitedObjects.add(sidecars);
+      for (const key of Object.keys(sidecars)) {
+        releaseAssetSlot(sidecars, key, `sidecars.${key}`);
+      }
+    }
+
+    return { releasedFields, releasedBytes };
   }
 
   function normalizePreloadTasks(value) {
@@ -533,6 +725,7 @@
      * @param {(() => number)|null} [options.nowFn]
      * @param {number|null} [options.stageTimeoutMs=0]
      * @param {boolean} [options.parallelPreload=true]
+     * @param {boolean} [options.releasePreloadBuffers=true]
      * @param {Array<{name: string, run: Function, optional?: boolean, asset?: string}>|null} [options.preloadTasks=null]
      */
     constructor(options = {}) {
@@ -554,6 +747,7 @@
         nowFn = null,
         stageTimeoutMs = DEFAULT_STAGE_TIMEOUT_MS,
         parallelPreload = DEFAULT_PARALLEL_PRELOAD,
+        releasePreloadBuffers = DEFAULT_RELEASE_PRELOAD_BUFFERS,
         preloadTasks = null,
       } = options;
 
@@ -566,6 +760,7 @@
       const resolvedNowFn = optionalFn(nowFn, 'nowFn') || defaultNow;
       const resolvedStageTimeoutMs = normalizeStageTimeoutMs(stageTimeoutMs);
       const resolvedParallelPreload = normalizeParallelPreload(parallelPreload);
+      const resolvedReleasePreloadBuffers = normalizeReleasePreloadBuffers(releasePreloadBuffers);
       const resolvedPreloadTasks = normalizePreloadTasks(preloadTasks);
 
       this._fetchImpl = fetchImpl || null;
@@ -581,6 +776,7 @@
       this._nowFn = resolvedNowFn;
       this._stageTimeoutMs = resolvedStageTimeoutMs;
       this._parallelPreload = resolvedParallelPreload;
+      this._releasePreloadBuffers = resolvedReleasePreloadBuffers;
       this._preloadTasks = resolvedPreloadTasks;
       this._lastClockMs = 0;
 
@@ -680,6 +876,30 @@
         preloadTaskTimingsMs: timing.preloadTaskTimingsMs,
         preloadStats: timing.preloadStats,
       };
+    }
+
+    /**
+     * Return a cloned snapshot of parallel preload timing and task status statistics.
+     */
+    getPreloadStats() {
+      return clonePreloadStats(this._preloadStats);
+    }
+
+    /**
+     * Release any retained large binary preload buffers (`shaderPackBytes`, `pgim.bytes`/`buffer`,
+     * `reflectionManifest.bytes`, `reflectionSidecar.bytes`, `sidecars[k].bytes`/`buffer`) and
+     * drop internal bundle references while preserving `getPreloadStats()`, `getState()`, and
+     * `assets`. Idempotent: calling again returns `{ releasedFields: [], releasedBytes: 0 }`.
+     *
+     * @returns {{ releasedFields: string[], releasedBytes: number }}
+     */
+    releasePreloadBuffers() {
+      const bundle = this._bundle;
+      this._bundle = null;
+      if (!bundle) {
+        return { releasedFields: [], releasedBytes: 0 };
+      }
+      return releaseBootBundleBytes(bundle);
     }
 
     _evaluateWatchdog(now = this._readNow()) {
@@ -1524,6 +1744,9 @@
           };
           this._setPhase(BOOT_PHASE.LAUNCHING_RUNTIME);
           await invokeQuietAsync(this._onLaunchRuntime, launchPayload);
+          if (this._releasePreloadBuffers && this._onLaunchRuntime) {
+            this.releasePreloadBuffers();
+          }
           const timing = this._buildTimingSnapshot();
           return {
             ok: true,
@@ -1539,7 +1762,7 @@
         this._status = { ...this._status, bootMode: this._bootMode };
         this._fallbackReason = this._fallbackReasonFor(this._assets);
         this._setPhase(BOOT_PHASE.FALLBACK_SMOKE_DEMO, { reason: this._fallbackReason });
-        await invokeQuietAsync(this._onFallbackSmokeDemo, {
+        const fallbackPayload = {
           bootMode: this._bootMode,
           programManifestUrl: this._assets.programManifestUrl,
           gameBase: this._assets.gameBase,
@@ -1548,7 +1771,11 @@
           reason: this._fallbackReason,
           assets: this._assets,
           bootTracer: this._bootTracer,
-        });
+        };
+        await invokeQuietAsync(this._onFallbackSmokeDemo, fallbackPayload);
+        if (this._releasePreloadBuffers && this._onFallbackSmokeDemo) {
+          this.releasePreloadBuffers();
+        }
         const timing = this._buildTimingSnapshot();
         return {
           ok: true,
@@ -1558,7 +1785,7 @@
           programManifestUrl: this._assets.programManifestUrl,
           gameBase: this._assets.gameBase,
           status: this._status,
-          bundle: this._bundle,
+          bundle: fallbackPayload.bundle,
           assets: this._assets,
           reason: this._fallbackReason,
           fallbackReason: this._fallbackReason,
@@ -1568,6 +1795,7 @@
         };
       } catch (err) {
         if (this._destroyed) {
+          this.releasePreloadBuffers();
           return { ok: false, destroyed: true, phase: BOOT_PHASE.DESTROYED, bootMode: this._bootMode };
         }
         if (token !== this._sessionToken) {
@@ -1579,6 +1807,7 @@
             error: toError(err, 'Boot pipeline aborted'),
           };
         }
+        this.releasePreloadBuffers();
         if (signal.aborted || isAbortError(err)) {
           this._aborted = true;
           this._setPhase(BOOT_PHASE.CANCELLED);
@@ -1669,6 +1898,9 @@
 
       this._firstPresent = true;
       this._firstPresentSource = firstPresentSource;
+      if (this._releasePreloadBuffers && this._bundle) {
+        this.releasePreloadBuffers();
+      }
       if (this._bootTracer && typeof this._bootTracer.markMilestone === 'function') {
         const tracer = tracerSnapshot(this._bootTracer);
         if (!tracer || tracer.readyForSplash !== true) {
@@ -1741,11 +1973,11 @@
         this._abortUnlink = null;
       }
       this._controller = new AbortController();
+      this.releasePreloadBuffers();
       this._phase = BOOT_PHASE.IDLE;
       this._bootMode = BOOT_MODE.PENDING;
       this._status = null;
       this._assets = null;
-      this._bundle = null;
       this._progress = null;
       this._fallbackReason = null;
       this._error = null;
@@ -1762,8 +1994,8 @@
     }
 
     /**
-     * Abort in-flight work, destroy the overlay, and freeze the orchestrator.
-     * Safe to call more than once.
+     * Abort in-flight work, release retained preload buffers, destroy the overlay, and freeze
+     * the orchestrator. Safe to call more than once.
      */
     destroy() {
       if (this._destroyed) {
@@ -1772,6 +2004,7 @@
       this._destroyed = true;
       this._sessionToken += 1;
       this._startPromise = null;
+      this.releasePreloadBuffers();
       try {
         if (this._controller && typeof this._controller.abort === 'function' && !this._controller.signal.aborted) {
           this._controller.abort(abortReason(this._controller.signal));
@@ -1791,6 +2024,13 @@
       this._setPhase(BOOT_PHASE.DESTROYED);
       return { ok: true, alreadyDestroyed: false, phase: this._phase };
     }
+
+    /**
+     * Alias for `destroy()` that releases retained preload buffers and tears down the orchestrator.
+     */
+    dispose() {
+      return this.destroy();
+    }
   }
 
   const exportedApi = Object.freeze({
@@ -1799,9 +2039,11 @@
     DEFAULT_STATUS_URL,
     DEFAULT_STAGE_TIMEOUT_MS,
     DEFAULT_PARALLEL_PRELOAD,
+    DEFAULT_RELEASE_PRELOAD_BUFFERS,
     BootOrchestrator,
     discoverBootAssets,
     isRealGuestBoot,
+    releaseBootBundleBytes,
     default: BootOrchestrator,
   });
 

@@ -24,6 +24,7 @@ const {
   parseProgramManifest,
   parseBootManifest,
   preloadProgramModules,
+  releaseBootBundleBytes,
   pgimFnv1a64,
 } = pgimMod;
 import { buildWgslPackBuffer, parseWgslPack } from '../web/workers/wgsl_pack_loader.js';
@@ -2324,4 +2325,208 @@ test('W208 aborts in-flight parallel Range chunk stream readers cleanly', async 
   assert.equal(stats.state, 'aborted');
   assert.equal(stats.abortedCount, 1);
   assert.equal(stats.chunksFetched, 1); // only chunk 0 completed before abort
+});
+
+// ---------------------------------------------------------------------------------------------
+// W258: Release preload ArrayBuffers & zero-copy / zero-retention audit
+// ---------------------------------------------------------------------------------------------
+
+function hasBinaryBufferReference(value, seen = new Set()) {
+  if (!value || typeof value !== 'object') return false;
+  if (
+    value instanceof ArrayBuffer ||
+    (typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer) ||
+    ArrayBuffer.isView(value)
+  ) {
+    return true;
+  }
+  if (seen.has(value)) return false;
+  seen.add(value);
+  for (const key of Object.getOwnPropertyNames(value)) {
+    let child;
+    try {
+      child = value[key];
+    } catch {
+      continue;
+    }
+    if (hasBinaryBufferReference(child, seen)) return true;
+  }
+  return false;
+}
+
+test('W258 releaseBootBundleBytes releases real preloadBootBundle and preloadShaderPack payloads cleanly and idempotently', async () => {
+  assert.equal(typeof releaseBootBundleBytes, 'function');
+  assert.equal(globalThis.PlayGta6PgimPreloader.releaseBootBundleBytes, releaseBootBundleBytes);
+
+  // Defensive checks on non-objects and frozen objects.
+  assert.deepEqual(releaseBootBundleBytes(null), { releasedFields: [], releasedBytes: 0 });
+  assert.deepEqual(releaseBootBundleBytes(undefined), { releasedFields: [], releasedBytes: 0 });
+  assert.deepEqual(releaseBootBundleBytes('nope'), { releasedFields: [], releasedBytes: 0 });
+  assert.deepEqual(releaseBootBundleBytes(Object.freeze({ shaderPackBytes: new Uint8Array(16) })), {
+    releasedFields: [],
+    releasedBytes: 0,
+  });
+
+  const image = buildLargePgim();
+  const pack = new Uint8Array(
+    buildWgslPackBuffer([
+      { hash: 0x1122334455667788n, stage: 'vertex', wgsl: '@vertex fn main() -> @builtin(position) vec4f { return vec4f(); }' },
+      { hash: 0x99aabbccddeeff00n, stage: 'fragment', wgsl: '@fragment fn main() {}' },
+    ])
+  );
+  const manifest = s6Manifest();
+  const server = createServer({
+    '/w258/game.pgim': image,
+    '/w258/boot.wgsl.pack': pack,
+    '/w258/reflection.json': new TextEncoder().encode(JSON.stringify(manifest)),
+  });
+  const preloader = new PgimPreloader({ fetchImpl: server.fetchImpl, chunkSize: 4096 });
+
+  const bundle = await preloader.preloadBootBundle({
+    pgimUrl: '/w258/game.pgim',
+    shaderPackUrl: '/w258/boot.wgsl.pack',
+    reflectionUrl: '/w258/reflection.json',
+  });
+
+  const first = releaseBootBundleBytes(bundle);
+  assert.equal(first.releasedBytes, image.byteLength + pack.byteLength);
+  assert.equal(bundle.buffer, null);
+  assert.equal(bundle.pgimBytes, null);
+  assert.equal(bundle.pgim.bytes, null);
+  assert.equal(bundle.pgim.buffer, null);
+  assert.equal(bundle.shaderPackBytes, null);
+
+  // Metadata preserved.
+  assert.equal(bundle.bytesLoaded, image.byteLength);
+  assert.equal(bundle.pgimHeader.magic, 'PGIM');
+  assert.deepEqual(bundle.reflectionManifest, manifest);
+  assert.equal(typeof bundle.timingMs.total, 'number');
+  assert.equal(typeof bundle.durationMs, 'number');
+
+  // Idempotent second call.
+  assert.deepEqual(releaseBootBundleBytes(bundle), { releasedFields: [], releasedBytes: 0 });
+
+  // Also works directly on preloadReflectionManifest() and preloadShaderPack() results.
+  const refl = await preloader.preloadReflectionManifest('/w258/reflection.json');
+  const reflLen = refl.bytes.byteLength;
+  const reflReleased = releaseBootBundleBytes(refl);
+  assert.equal(reflReleased.releasedBytes, reflLen);
+  assert.equal(refl.bytes, null);
+  assert.deepEqual(refl.manifest, manifest);
+  assert.equal(refl.bytesLoaded, reflLen);
+  assert.deepEqual(releaseBootBundleBytes(refl), { releasedFields: [], releasedBytes: 0 });
+});
+
+test('W258 preloadShaderPack avoids extra ArrayBuffer copy on aligned buffers and shrinks subarray slabs', async () => {
+  const pack = new Uint8Array(
+    buildWgslPackBuffer([
+      { hash: 0x1n, stage: 'vertex', wgsl: '@vertex fn main() -> @builtin(position) vec4f { return vec4f(); }' },
+      { hash: 0x2n, stage: 'fragment', wgsl: '@fragment fn main() {}' },
+    ])
+  );
+
+  // 1. Non-streaming exact ArrayBuffer response -> buffer === bytes.buffer === sourceBuffer (zero copy).
+  {
+    const sourceBuffer = pack.slice().buffer;
+    const fetchImpl = async () => ({
+      ok: true,
+      status: 200,
+      headers: new Headers({ 'content-length': String(sourceBuffer.byteLength) }),
+      body: null,
+      async arrayBuffer() {
+        return sourceBuffer;
+      },
+    });
+    const preloader = new PgimPreloader({ fetchImpl, concurrency: 1 });
+    const res = await preloader.preloadShaderPack('/w258/exact.wgsl.pack');
+    assert.equal(res.buffer, sourceBuffer, 'must reuse exact ArrayBuffer without copying');
+    assert.equal(res.bytes.buffer, sourceBuffer);
+    assert.equal(res.bytes.byteOffset, 0);
+    assert.equal(res.bytes.byteLength, sourceBuffer.byteLength);
+  }
+
+  // 2. Single-chunk subarray inside a larger slab -> sliced once and bytes.buffer === buffer so slab is not retained.
+  {
+    const slab = new Uint8Array(pack.byteLength + 512);
+    slab.set(pack, 128);
+    const subview = slab.subarray(128, 128 + pack.byteLength);
+    const fetchImpl = async () => {
+      let sent = false;
+      const stream = new ReadableStream({
+        pull(controller) {
+          if (!sent) {
+            sent = true;
+            controller.enqueue(subview);
+          } else {
+            controller.close();
+          }
+        },
+      });
+      return new Response(stream, { status: 200 });
+    };
+    const preloader = new PgimPreloader({ fetchImpl, concurrency: 1 });
+    const res = await preloader.preloadShaderPack('/w258/slab.wgsl.pack');
+    assert.equal(res.buffer.byteLength, pack.byteLength);
+    assert.equal(res.bytes.buffer, res.buffer, 'bytes must reference tightened buffer, not the oversized slab');
+    assert.notEqual(res.bytes.buffer, slab.buffer);
+    assert.deepEqual(res.bytes, pack);
+  }
+
+  // 3. Multi-chunk streaming with Content-Length -> pre-allocates single exact ArrayBuffer (no 2x peak copy).
+  {
+    const fetchImpl = async () => {
+      const mid = Math.floor(pack.byteLength / 2);
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(pack.subarray(0, mid));
+          controller.enqueue(pack.subarray(mid));
+          controller.close();
+        },
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { 'content-length': String(pack.byteLength) },
+      });
+    };
+    const preloader = new PgimPreloader({ fetchImpl, concurrency: 1 });
+    const res = await preloader.preloadShaderPack('/w258/streamed.wgsl.pack');
+    assert.equal(res.buffer, res.bytes.buffer);
+    assert.equal(res.buffer.byteLength, pack.byteLength);
+    assert.deepEqual(res.bytes, pack);
+  }
+});
+
+test('W258 PgimPreloader retains zero fetched ArrayBuffer or Uint8Array references on instance properties after resolution', async () => {
+  const image = buildLargePgim();
+  const pack = new Uint8Array(
+    buildWgslPackBuffer([
+      { hash: 0xaaaabbbbccccddddn, stage: 'compute', wgsl: '@compute @workgroup_size(1) fn main() {}' },
+    ])
+  );
+  const manifest = s6Manifest();
+  const server = createServer({
+    '/w258/img.pgim': image,
+    '/w258/pack.wgsl.pack': pack,
+    '/w258/refl.json': new TextEncoder().encode(JSON.stringify(manifest)),
+  });
+
+  const preloader = new PgimPreloader({ fetchImpl: server.fetchImpl, chunkSize: 4096, concurrency: 3 });
+
+  await preloader.preloadShaderPack('/w258/pack.wgsl.pack');
+  assert.equal(hasBinaryBufferReference(preloader), false, 'preloadShaderPack must not retain binary buffers on instance');
+
+  await preloader.preloadGuestImage('/w258/img.pgim');
+  assert.equal(hasBinaryBufferReference(preloader), false, 'preloadGuestImage must not retain binary buffers on instance');
+
+  await preloader.preloadReflectionManifest('/w258/refl.json');
+  assert.equal(hasBinaryBufferReference(preloader), false, 'preloadReflectionManifest must not retain binary buffers on instance');
+
+  await preloader.preloadBootBundle({
+    pgimUrl: '/w258/img.pgim',
+    shaderPackUrl: '/w258/pack.wgsl.pack',
+    reflectionUrl: '/w258/refl.json',
+  });
+  assert.equal(hasBinaryBufferReference(preloader), false, 'preloadBootBundle must not retain binary buffers on instance');
+  assert.equal(preloader.getStats().state, 'complete');
+  assert.ok(preloader.getStats().bytesLoaded >= image.byteLength + pack.byteLength);
 });
