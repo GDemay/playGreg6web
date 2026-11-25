@@ -11,7 +11,8 @@
 //     <time_ms> <buttons> [hold_ms]
 //
 // `time_ms` counts from the start of the player; `buttons` is `+`-separated names (A, B, X, Y,
-// LB, RB, Menu, View; Up, Down, Left, Right push the left stick) or a number (hex with 0x) of
+// LB, RB, Menu, View, LS, RS; DUp, DDown, DLeft, DRight the D-pad; Up, Down, Left, Right push the
+// left stick) or a number (hex with 0x) of
 // playgta6::os::input_button bits; `hold_ms`
 // (default 100) is how long the buttons stay down before they are released.
 

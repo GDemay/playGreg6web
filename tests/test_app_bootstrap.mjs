@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import bootstrapDefault, {
+  DEFAULT_DUMP_ENDPOINT,
   DEFAULT_LOADER_URL,
   DEFAULT_MAX_VALIDATION_ERRORS,
   DEFAULT_SHADER_PACK_URL,
@@ -2412,6 +2413,9 @@ test('W117 parseBootUrlOptions and sanitizeInputScriptPreset parse valid options
       streamShaders: false,
       streamThresholdMb: null,
       streamThresholdBytes: null,
+      dumpPipelines: false,
+      allowDumpWrites: false,
+      dumpEndpoint: null,
     });
   }
 
@@ -2470,6 +2474,9 @@ test('W117 parseBootUrlOptions and sanitizeInputScriptPreset parse valid options
       streamShaders: true,
       streamThresholdMb: 64,
       streamThresholdBytes: 64 * 1024 * 1024,
+      dumpPipelines: false,
+      allowDumpWrites: false,
+      dumpEndpoint: null,
     });
   }
 
@@ -2479,12 +2486,18 @@ test('W117 parseBootUrlOptions and sanitizeInputScriptPreset parse valid options
     streamShaders: true,
     streamThresholdMb: 32,
     streamThresholdBytes: 32 * 1024 * 1024,
+    dumpPipelines: false,
+    allowDumpWrites: false,
+    dumpEndpoint: null,
   });
   assert.deepEqual(parseBootUrlOptions('?streamThresholdMb=32'), {
     inputScript: null,
     streamShaders: true,
     streamThresholdMb: 32,
     streamThresholdBytes: 32 * 1024 * 1024,
+    dumpPipelines: false,
+    allowDumpWrites: false,
+    dumpEndpoint: null,
   });
 
   // Fractional MB and boundary clamping.
@@ -2493,12 +2506,18 @@ test('W117 parseBootUrlOptions and sanitizeInputScriptPreset parse valid options
     streamShaders: true,
     streamThresholdMb: 0.5,
     streamThresholdBytes: 512 * 1024,
+    dumpPipelines: false,
+    allowDumpWrites: false,
+    dumpEndpoint: null,
   });
   assert.deepEqual(parseBootUrlOptions('?streamThresholdMb=999999'), {
     inputScript: null,
     streamShaders: true,
     streamThresholdMb: MAX_STREAM_THRESHOLD_MB,
     streamThresholdBytes: MAX_STREAM_THRESHOLD_BYTES,
+    dumpPipelines: false,
+    allowDumpWrites: false,
+    dumpEndpoint: null,
   });
   const tiny = parseBootUrlOptions('?streamThresholdMb=0.00000001');
   assert.equal(tiny.streamShaders, true);
@@ -2510,12 +2529,18 @@ test('W117 parseBootUrlOptions and sanitizeInputScriptPreset parse valid options
     streamShaders: false,
     streamThresholdMb: null,
     streamThresholdBytes: null,
+    dumpPipelines: false,
+    allowDumpWrites: false,
+    dumpEndpoint: null,
   });
   assert.deepEqual(parseBootUrlOptions('?streamShaders=false'), {
     inputScript: null,
     streamShaders: false,
     streamThresholdMb: null,
     streamThresholdBytes: null,
+    dumpPipelines: false,
+    allowDumpWrites: false,
+    dumpEndpoint: null,
   });
 
   // Invalid streamThresholdMb values are ignored without crashing.
@@ -2525,6 +2550,9 @@ test('W117 parseBootUrlOptions and sanitizeInputScriptPreset parse valid options
       streamShaders: false,
       streamThresholdMb: null,
       streamThresholdBytes: null,
+      dumpPipelines: false,
+      allowDumpWrites: false,
+      dumpEndpoint: null,
     });
   }
   // Invalid streamThresholdMb with valid streamShaders=1 falls back to default 64 MiB.
@@ -2533,6 +2561,9 @@ test('W117 parseBootUrlOptions and sanitizeInputScriptPreset parse valid options
     streamShaders: true,
     streamThresholdMb: 64,
     streamThresholdBytes: 64 * 1024 * 1024,
+    dumpPipelines: false,
+    allowDumpWrites: false,
+    dumpEndpoint: null,
   });
 
   // Combined inputScript + streamShaders + streamThresholdMb.
@@ -2541,6 +2572,9 @@ test('W117 parseBootUrlOptions and sanitizeInputScriptPreset parse valid options
     streamShaders: true,
     streamThresholdMb: 32,
     streamThresholdBytes: 32 * 1024 * 1024,
+    dumpPipelines: false,
+    allowDumpWrites: false,
+    dumpEndpoint: null,
   });
 });
 
@@ -2812,4 +2846,389 @@ test('W117 ?streamShaders=1 and ?streamThresholdMb=32 forward streamThresholdByt
   assert.equal(perStartLaunch.workerCall.streamThresholdBytes, 16 * 1024 * 1024);
   assert.equal(perStartLaunch.initPayload.streamShaders, true);
   assert.equal(perStartLaunch.initPayload.streamThresholdBytes, 16 * 1024 * 1024);
+});
+
+test('W184 parseBootUrlOptions and sanitizeInputScriptPreset support menu-flow, calibration-skip, intro-watch, dumpPipelines, and allowDumpWrites', () => {
+  assert.equal(DEFAULT_DUMP_ENDPOINT, '/__pg6_dump/');
+
+  // All W174 presets plus start-screen are accepted case-insensitively and canonicalized.
+  const presets = ['start-screen', 'menu-flow', 'calibration-skip', 'intro-watch'];
+  for (const preset of presets) {
+    assert.equal(sanitizeInputScriptPreset(preset), preset);
+    assert.equal(sanitizeInputScriptPreset(preset.toUpperCase()), preset);
+    assert.equal(sanitizeInputScriptPreset(`  ${preset}  `), preset);
+    assert.equal(parseBootUrlOptions(`?inputScript=${preset}`).inputScript, preset);
+    assert.equal(
+      parseBootUrlOptions(`https://playgta6.local/?inputscript=${preset.toUpperCase()}#boot`).inputScript,
+      preset
+    );
+    assert.equal(
+      parseBootUrlOptions(new URLSearchParams(`inputScript=${preset}`)).inputScript,
+      preset
+    );
+  }
+
+  // dumpPipelines=1 / true / yes / on enables dumpPipelines without turning on allowDumpWrites.
+  for (const q of ['?dumpPipelines=1', '?dumpPipelines=true', '?dumpPipelines=TRUE', '?dumppipelines=yes', '?dumpPipelines=on']) {
+    const parsed = parseBootUrlOptions(q);
+    assert.equal(Object.isFrozen(parsed), true);
+    assert.deepEqual(parsed, {
+      inputScript: null,
+      streamShaders: false,
+      streamThresholdMb: null,
+      streamThresholdBytes: null,
+      dumpPipelines: true,
+      allowDumpWrites: false,
+      dumpEndpoint: null,
+    });
+  }
+
+  // dumpPipelines=0 / false / invalid stays false.
+  for (const q of ['?dumpPipelines=0', '?dumpPipelines=false', '?dumpPipelines=no', '?dumpPipelines=off', '?dumpPipelines=maybe', '?dumpPipelines=']) {
+    assert.equal(parseBootUrlOptions(q).dumpPipelines, false);
+    assert.equal(parseBootUrlOptions(q).allowDumpWrites, false);
+    assert.equal(parseBootUrlOptions(q).dumpEndpoint, null);
+  }
+
+  // allowDumpWrites=1 / true / yes / on enables allowDumpWrites and sets default '/__pg6_dump/' endpoint.
+  for (const q of ['?allowDumpWrites=1', '?allowDumpWrites=true', '?allowDumpWrites=TRUE', '?allowdumpwrites=yes', '?allowDumpWrites=on']) {
+    const parsed = parseBootUrlOptions(q);
+    assert.equal(Object.isFrozen(parsed), true);
+    assert.deepEqual(parsed, {
+      inputScript: null,
+      streamShaders: false,
+      streamThresholdMb: null,
+      streamThresholdBytes: null,
+      dumpPipelines: false,
+      allowDumpWrites: true,
+      dumpEndpoint: '/__pg6_dump/',
+    });
+  }
+
+  // allowDumpWrites=0 / false / invalid stays false with null endpoint.
+  for (const q of ['?allowDumpWrites=0', '?allowDumpWrites=false', '?allowDumpWrites=no', '?allowDumpWrites=off', '?allowDumpWrites=nope', '?allowDumpWrites=']) {
+    assert.equal(parseBootUrlOptions(q).allowDumpWrites, false);
+    assert.equal(parseBootUrlOptions(q).dumpEndpoint, null);
+  }
+
+  // Combined query with all options active.
+  assert.deepEqual(
+    parseBootUrlOptions(
+      '?inputScript=Menu-Flow&dumpPipelines=1&allowDumpWrites=true&streamShaders=1&streamThresholdMb=16'
+    ),
+    {
+      inputScript: 'menu-flow',
+      streamShaders: true,
+      streamThresholdMb: 16,
+      streamThresholdBytes: 16 * 1024 * 1024,
+      dumpPipelines: true,
+      allowDumpWrites: true,
+      dumpEndpoint: '/__pg6_dump/',
+    }
+  );
+});
+
+test('W184 forwards dumpPipelines to loader.js and allowDumpWrites/dumpEndpoint to io_worker.js init config only when enabled', async () => {
+  const { createRequire } = await import('node:module');
+  const require = createRequire(import.meta.url);
+  const { resolveDumpConfig } = require('../web/workers/io_worker.js');
+
+  async function launchWithDumpUrl({ search, bootstrapOptions = {}, startOpts = undefined } = {}) {
+    const clock = createClock(35000);
+    const raf = createFakeRaf(clock);
+    const timers = createFakeTimers();
+    const webgpu = createMockWebGpuEnv();
+    const hud = createMockHud();
+
+    const offscreenCanvas = { kind: 'MockOffscreenCanvas' };
+    webgpu.canvas.transferControlToOffscreen = () => offscreenCanvas;
+
+    const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+      clock,
+      raf,
+      timers,
+      gpu: webgpu.gpu,
+    });
+    if (search !== undefined) {
+      windowObj.location = { origin: 'https://playgta6.local', search };
+    }
+
+    const workerCalls = [];
+    const postedMessages = [];
+    const mockWorker = createFakeEventTarget({
+      postMessage(payload, transfer) {
+        postedMessages.push({ payload, transfer });
+      },
+      terminate() {},
+    });
+
+    const app = bootstrapPlayGta6App({
+      windowObj,
+      documentObj,
+      navigatorObj,
+      fetchImpl: createMockFetch({
+        ok: true,
+        coopCoep: true,
+        hasWasmBinary: true,
+      }),
+      canvas: webgpu.canvas,
+      hud,
+      now: clock.now,
+      setInterval: timers.setInterval,
+      clearInterval: timers.clearInterval,
+      createWasmWorker(args) {
+        workerCalls.push(args);
+        return mockWorker;
+      },
+      ...bootstrapOptions,
+    });
+
+    try {
+      const started = await app.start(startOpts);
+      assert.equal(started.ok, true);
+      assert.equal(started.mode, SESSION_MODE.WASM);
+      assert.equal(workerCalls.length, 1);
+      assert.equal(postedMessages.length, 1);
+      return {
+        bootUrlOptions: app.bootUrlOptions,
+        workerCall: workerCalls[0],
+        initPayload: postedMessages[0].payload,
+        diagnostics: app.getDiagnosticsSnapshot(),
+        telemetry: app.getBootTelemetry(),
+        globalDiagnostics: windowObj.__playgta6.getDiagnosticsSnapshot(),
+        globalBootState: windowObj.__playgta6BootState,
+      };
+    } finally {
+      await app.destroy();
+    }
+  }
+
+  // 1. Default (omitted): dumpPipelines/allowDumpWrites/dumpEndpoint absent from launch payloads.
+  const defaultLaunch = await launchWithDumpUrl({ search: '' });
+  assert.equal(defaultLaunch.bootUrlOptions.dumpPipelines, false);
+  assert.equal(defaultLaunch.bootUrlOptions.allowDumpWrites, false);
+  assert.equal(defaultLaunch.bootUrlOptions.dumpEndpoint, null);
+  assert.equal('dumpPipelines' in defaultLaunch.workerCall, false);
+  assert.equal('allowDumpWrites' in defaultLaunch.workerCall, false);
+  assert.equal('dumpEndpoint' in defaultLaunch.workerCall, false);
+  assert.equal('dumpPipelines' in defaultLaunch.initPayload, false);
+  assert.equal('allowDumpWrites' in defaultLaunch.initPayload, false);
+  assert.equal('dumpEndpoint' in defaultLaunch.initPayload, false);
+  assert.deepEqual(resolveDumpConfig(defaultLaunch.initPayload), {
+    allowDumpWrites: false,
+    dumpEndpoint: null,
+  });
+  assert.equal(defaultLaunch.diagnostics.dumpPipelines, false);
+  assert.equal(defaultLaunch.diagnostics.allowDumpWrites, false);
+  assert.equal(defaultLaunch.diagnostics.inputScript, null);
+  assert.equal(defaultLaunch.telemetry.dumpPipelines, false);
+  assert.equal(defaultLaunch.telemetry.allowDumpWrites, false);
+  assert.equal(defaultLaunch.telemetry.inputScript, null);
+
+  // 2. ?dumpPipelines=1 alone forwards dumpPipelines: true without enabling allowDumpWrites.
+  const dumpOnlyLaunch = await launchWithDumpUrl({ search: '?dumpPipelines=1' });
+  assert.equal(dumpOnlyLaunch.bootUrlOptions.dumpPipelines, true);
+  assert.equal(dumpOnlyLaunch.bootUrlOptions.allowDumpWrites, false);
+  assert.equal(dumpOnlyLaunch.workerCall.dumpPipelines, true);
+  assert.equal('allowDumpWrites' in dumpOnlyLaunch.workerCall, false);
+  assert.equal('dumpEndpoint' in dumpOnlyLaunch.workerCall, false);
+  assert.equal(dumpOnlyLaunch.initPayload.dumpPipelines, true);
+  assert.equal('allowDumpWrites' in dumpOnlyLaunch.initPayload, false);
+  assert.equal('dumpEndpoint' in dumpOnlyLaunch.initPayload, false);
+  assert.deepEqual(resolveDumpConfig(dumpOnlyLaunch.initPayload), {
+    allowDumpWrites: false,
+    dumpEndpoint: null,
+  });
+  assert.equal(dumpOnlyLaunch.diagnostics.dumpPipelines, true);
+  assert.equal(dumpOnlyLaunch.diagnostics.allowDumpWrites, false);
+  assert.equal(dumpOnlyLaunch.telemetry.dumpPipelines, true);
+  assert.equal(dumpOnlyLaunch.globalDiagnostics.dumpPipelines, true);
+  assert.equal(dumpOnlyLaunch.globalBootState.dumpPipelines, true);
+
+  // 3. ?allowDumpWrites=1 alone forwards allowDumpWrites: true + dumpEndpoint: '/__pg6_dump/' to io_worker config.
+  const writeOnlyLaunch = await launchWithDumpUrl({ search: '?allowDumpWrites=1' });
+  assert.equal(writeOnlyLaunch.bootUrlOptions.dumpPipelines, false);
+  assert.equal(writeOnlyLaunch.bootUrlOptions.allowDumpWrites, true);
+  assert.equal(writeOnlyLaunch.bootUrlOptions.dumpEndpoint, '/__pg6_dump/');
+  assert.equal('dumpPipelines' in writeOnlyLaunch.workerCall, false);
+  assert.equal(writeOnlyLaunch.workerCall.allowDumpWrites, true);
+  assert.equal(writeOnlyLaunch.workerCall.dumpEndpoint, '/__pg6_dump/');
+  assert.equal('dumpPipelines' in writeOnlyLaunch.initPayload, false);
+  assert.equal(writeOnlyLaunch.initPayload.allowDumpWrites, true);
+  assert.equal(writeOnlyLaunch.initPayload.dumpEndpoint, '/__pg6_dump/');
+  assert.deepEqual(resolveDumpConfig(writeOnlyLaunch.initPayload), {
+    allowDumpWrites: true,
+    dumpEndpoint: '/__pg6_dump/',
+  });
+  assert.equal(writeOnlyLaunch.diagnostics.dumpPipelines, false);
+  assert.equal(writeOnlyLaunch.diagnostics.allowDumpWrites, true);
+
+  // 4. Both ?dumpPipelines=true&allowDumpWrites=true enabled together.
+  const bothLaunch = await launchWithDumpUrl({
+    search: '?dumpPipelines=true&allowDumpWrites=true&inputScript=intro-watch',
+  });
+  assert.equal(bothLaunch.workerCall.dumpPipelines, true);
+  assert.equal(bothLaunch.workerCall.allowDumpWrites, true);
+  assert.equal(bothLaunch.workerCall.dumpEndpoint, '/__pg6_dump/');
+  assert.equal(bothLaunch.initPayload.dumpPipelines, true);
+  assert.equal(bothLaunch.initPayload.allowDumpWrites, true);
+  assert.equal(bothLaunch.initPayload.dumpEndpoint, '/__pg6_dump/');
+  assert.deepEqual(resolveDumpConfig(bothLaunch.initPayload), {
+    allowDumpWrites: true,
+    dumpEndpoint: '/__pg6_dump/',
+  });
+  assert.equal(bothLaunch.diagnostics.dumpPipelines, true);
+  assert.equal(bothLaunch.diagnostics.allowDumpWrites, true);
+  assert.equal(bothLaunch.diagnostics.inputScript, 'intro-watch');
+  assert.equal(bothLaunch.telemetry.dumpPipelines, true);
+  assert.equal(bothLaunch.telemetry.allowDumpWrites, true);
+  assert.equal(bothLaunch.telemetry.inputScript, 'intro-watch');
+
+  // 5. Explicit programmatic overrides: false disables URL flags, unsafe dumpEndpoint falls back safely.
+  const disabledLaunch = await launchWithDumpUrl({
+    search: '?dumpPipelines=1&allowDumpWrites=1',
+    bootstrapOptions: { dumpPipelines: false, allowDumpWrites: false },
+  });
+  assert.equal(disabledLaunch.bootUrlOptions.dumpPipelines, false);
+  assert.equal(disabledLaunch.bootUrlOptions.allowDumpWrites, false);
+  assert.equal('dumpPipelines' in disabledLaunch.initPayload, false);
+  assert.equal('allowDumpWrites' in disabledLaunch.initPayload, false);
+  assert.equal('dumpEndpoint' in disabledLaunch.initPayload, false);
+
+  const sanitizedEndpointLaunch = await launchWithDumpUrl({
+    search: '',
+    startOpts: {
+      dumpPipelines: true,
+      allowDumpWrites: true,
+      dumpEndpoint: 'C:\\Users\\alice\\secret_dump',
+    },
+  });
+  assert.equal(sanitizedEndpointLaunch.initPayload.dumpPipelines, true);
+  assert.equal(sanitizedEndpointLaunch.initPayload.allowDumpWrites, true);
+  assert.equal(sanitizedEndpointLaunch.initPayload.dumpEndpoint, '/__pg6_dump/');
+  assert.ok(!JSON.stringify(sanitizedEndpointLaunch.diagnostics).includes('alice'));
+  assert.ok(!JSON.stringify(sanitizedEndpointLaunch.telemetry).includes('alice'));
+});
+
+test('W184 ?inputScript=menu-flow, calibration-skip, and intro-watch auto-start InputBridge presets and expose sanitized diagnostics', async () => {
+  for (const preset of ['menu-flow', 'calibration-skip', 'intro-watch']) {
+    const clock = createClock(40000);
+    const raf = createFakeRaf(clock);
+    const timers = createFakeTimers();
+    const webgpu = createMockWebGpuEnv();
+    const hud = createMockHud();
+
+    const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+      clock,
+      raf,
+      timers,
+      gpu: webgpu.gpu,
+    });
+    windowObj.location = {
+      origin: 'https://playgta6.local',
+      search: `?inputScript=${preset.toUpperCase()}&dumpPipelines=1`,
+    };
+
+    const mockWorker = createFakeEventTarget({
+      postMessage() {},
+      terminate() {},
+    });
+
+    const app = bootstrapPlayGta6App({
+      windowObj,
+      documentObj,
+      navigatorObj,
+      fetchImpl: createMockFetch({ ok: true, coopCoep: true, hasWasmBinary: true }),
+      canvas: webgpu.canvas,
+      hud,
+      now: clock.now,
+      raf: raf.raf,
+      cancelRaf: raf.cancelRaf,
+      setInterval: timers.setInterval,
+      clearInterval: timers.clearInterval,
+      createWasmWorker() {
+        return mockWorker;
+      },
+    });
+
+    try {
+      assert.equal(app.bootUrlOptions.inputScript, preset);
+      assert.equal(app.bootUrlOptions.dumpPipelines, true);
+      assert.equal(app.getDiagnosticsSnapshot().inputScript, preset);
+      assert.equal(app.getDiagnosticsSnapshot().dumpPipelines, true);
+      assert.equal(app.getBootTelemetry().inputScript, preset);
+      assert.equal(app.getBootTelemetry().dumpPipelines, true);
+
+      const started = await app.start();
+      assert.equal(started.ok, true);
+      assert.equal(app.inputBridge.getScriptState().active, true);
+      assert.equal(app.inputBridge.getScriptState().preset, preset);
+      assert.equal(app.getDiagnosticsSnapshot().inputScript, preset);
+      assert.equal(windowObj.__playgta6.getDiagnosticsSnapshot().inputScript, preset);
+      assert.equal(windowObj.__playgta6BootState.inputScript, preset);
+      assert.equal(globalThis.__playgta6Telemetry().inputScript, preset);
+
+      // Per-start override cleanly switches preset and updates diagnostics.
+      await app.stop();
+      assert.equal(app.inputBridge.getScriptState().active, false);
+
+      const switched = await app.start({ inputScript: 'start-screen', dumpPipelines: false });
+      assert.equal(switched.ok, true);
+      assert.equal(app.inputBridge.getScriptState().active, true);
+      assert.equal(app.inputBridge.getScriptState().preset, 'start-screen');
+      assert.equal(app.getDiagnosticsSnapshot().inputScript, 'start-screen');
+      assert.equal(app.getDiagnosticsSnapshot().dumpPipelines, false);
+    } finally {
+      await app.destroy();
+    }
+    assert.equal(app.inputBridge.getScriptState().active, false);
+  }
+
+  // Hostile host paths in query params never leak into diagnostics or telemetry.
+  const clock = createClock(41000);
+  const raf = createFakeRaf(clock);
+  const timers = createFakeTimers();
+  const webgpu = createMockWebGpuEnv();
+  const hud = createMockHud();
+  const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+    clock,
+    raf,
+    timers,
+    gpu: webgpu.gpu,
+  });
+  windowObj.location = {
+    origin: 'https://playgta6.local',
+    search: '?inputScript=C%3A%5CUsers%5Calice%5Cmenu-flow&dumpPipelines=%2Fhome%2Falice%2Fdump&allowDumpWrites=C%3A%5Csecret',
+  };
+
+  const hostileApp = bootstrapPlayGta6App({
+    windowObj,
+    documentObj,
+    navigatorObj,
+    fetchImpl: createMockFetch({ ok: true, coopCoep: true, hasWasmBinary: true }),
+    canvas: webgpu.canvas,
+    hud,
+    now: clock.now,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+    createWasmWorker() {
+      return createFakeEventTarget({ postMessage() {}, terminate() {} });
+    },
+  });
+
+  try {
+    const diag = hostileApp.getDiagnosticsSnapshot();
+    const telem = hostileApp.getBootTelemetry();
+    assert.equal(diag.inputScript, null);
+    assert.equal(diag.dumpPipelines, false);
+    assert.equal(diag.allowDumpWrites, false);
+    assert.equal(telem.inputScript, null);
+    assert.equal(telem.dumpPipelines, false);
+    assert.equal(telem.allowDumpWrites, false);
+    assert.ok(!JSON.stringify(diag).includes('alice'));
+    assert.ok(!JSON.stringify(telem).includes('alice'));
+    assert.ok(!JSON.stringify(hostileApp.bootUrlOptions).includes('alice'));
+  } finally {
+    await hostileApp.destroy();
+  }
 });

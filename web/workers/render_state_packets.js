@@ -111,8 +111,82 @@ const MAX_TELEMETRY_WARNINGS = 32;
 // W101: upper bound on cached layout:'auto' remapped bind groups. Root-constant ring offsets rotate
 // per draw, so the (pipeline, bind group, dynamic offsets) key space is unbounded; evict LRU-first.
 const REMAPPED_BIND_GROUP_CACHE_LIMIT = 2048;
+// W186: upper bound on cached PresentX multi-plane (planeTextureId, viewFormat, sampler, pipeline/layout)
+// texture views & bind groups across frames; LRU-evicted and invalidated on handle/device/reset changes.
+const PRESENTX_BIND_GROUP_CACHE_LIMIT = 256;
 // W104: bound on distinct missing render-pass textures remembered for error deduplication.
 const MISSING_TEXTURE_REPORT_LIMIT = 4096;
+
+let _cachedTextureFormatsModule = null;
+const _gpuObjectIds = new WeakMap();
+let _nextGpuObjectId = 1;
+
+function gpuObjectId(obj) {
+  if (!obj || (typeof obj !== 'object' && typeof obj !== 'function')) return 0;
+  let id = _gpuObjectIds.get(obj);
+  if (id === undefined) {
+    id = _nextGpuObjectId;
+    _nextGpuObjectId += 1;
+    _gpuObjectIds.set(obj, id);
+  }
+  return id;
+}
+
+function buildTextureViewKey(desc) {
+  if (!desc || typeof desc !== 'object') return '';
+  const fmt = desc.format || '';
+  const dim = desc.dimension || '';
+  const aspect = desc.aspect || '';
+  const baseMip = desc.baseMipLevel || 0;
+  const mipCount = desc.mipLevelCount || 0;
+  const baseLayer = desc.baseArrayLayer || 0;
+  const layerCount = desc.arrayLayerCount || 0;
+  if (!fmt && !dim && !aspect && !baseMip && !mipCount && !baseLayer && !layerCount) {
+    return '';
+  }
+  return `${fmt}|${dim}|${aspect}|${baseMip}|${mipCount}|${baseLayer}|${layerCount}`;
+}
+
+function getResolveStorageCompatibleFormatFn(options) {
+  if (options && typeof options.resolveStorageCompatibleFormat === 'function') {
+    return options.resolveStorageCompatibleFormat;
+  }
+  if (
+    options &&
+    options.textureFormats &&
+    typeof options.textureFormats.resolveStorageCompatibleFormat === 'function'
+  ) {
+    return options.textureFormats.resolveStorageCompatibleFormat;
+  }
+  if (
+    typeof globalThis !== 'undefined' &&
+    globalThis.PlayGta6TextureFormats &&
+    typeof globalThis.PlayGta6TextureFormats.resolveStorageCompatibleFormat === 'function'
+  ) {
+    return globalThis.PlayGta6TextureFormats.resolveStorageCompatibleFormat;
+  }
+  if (
+    globalScope &&
+    globalScope.PlayGta6TextureFormats &&
+    typeof globalScope.PlayGta6TextureFormats.resolveStorageCompatibleFormat === 'function'
+  ) {
+    return globalScope.PlayGta6TextureFormats.resolveStorageCompatibleFormat;
+  }
+  if (_cachedTextureFormatsModule === null && typeof require === 'function') {
+    try {
+      _cachedTextureFormatsModule = require('./texture_formats.js') || false;
+    } catch (_) {
+      _cachedTextureFormatsModule = false;
+    }
+  }
+  if (
+    _cachedTextureFormatsModule &&
+    typeof _cachedTextureFormatsModule.resolveStorageCompatibleFormat === 'function'
+  ) {
+    return _cachedTextureFormatsModule.resolveStorageCompatibleFormat;
+  }
+  return null;
+}
 const DEFAULT_MAX_COMPUTE_WORKGROUPS_PER_DIMENSION = 65535;
 const VALID_WGSL_IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const WGSL_GROUP0_RE = /@group\(\s*0\s*\)/;
@@ -293,22 +367,125 @@ function deviceHasFeature(device, featureName) {
   return false;
 }
 
-function isStorageBindingSupported(format, device) {
-  if (typeof format !== 'string' || format.length === 0 || format === 'undefined') return false;
-  if (
-    isSrgbTextureFormat(format) ||
-    isDepthOrStencilTextureFormat(format) ||
-    isBcCompressedFormat(format) ||
-    format === 'rgb9e5ufloat'
-  ) {
-    return false;
+// W163/W186: resolves storage-texture compatibility using texture_formats.js's
+// resolveStorageCompatibleFormat when loaded, falling back to built-in tables in isolated VMs.
+function resolveStorageTextureFormat(format, device, options) {
+  if (typeof format !== 'string' || format.length === 0 || format === 'undefined') {
+    return {
+      storageFormat: null,
+      supportsStorageBinding: false,
+      needsLinearSiblingView: false,
+      reason: 'invalid-format',
+    };
   }
-  if (CORE_STORAGE_TEXTURE_FORMATS.has(format)) return true;
-  if (format === 'bgra8unorm') return deviceHasFeature(device, 'bgra8unorm-storage');
-  if (TIER1_STORAGE_TEXTURE_FORMATS.has(format)) {
-    return deviceHasFeature(device, 'texture-formats-tier1');
+  const helper = getResolveStorageCompatibleFormatFn(options);
+  if (helper) {
+    try {
+      const resolved = helper(format, { deviceFeatures: device && device.features });
+      if (resolved && typeof resolved === 'object') {
+        return {
+          storageFormat: typeof resolved.storageFormat === 'string' ? resolved.storageFormat : null,
+          supportsStorageBinding: Boolean(resolved.supportsStorageBinding),
+          needsLinearSiblingView: Boolean(resolved.needsLinearSiblingView),
+          reason: typeof resolved.reason === 'string' ? resolved.reason : null,
+        };
+      }
+    } catch (_) {
+      // Fall through to built-in format tables if an injected helper throws.
+    }
   }
-  return false;
+  const normalized = format.trim().toLowerCase();
+  if (isDepthOrStencilTextureFormat(normalized)) {
+    return {
+      storageFormat: null,
+      supportsStorageBinding: false,
+      needsLinearSiblingView: false,
+      reason: 'depth-stencil-not-storage-compatible',
+    };
+  }
+  if (isBcCompressedFormat(normalized)) {
+    return {
+      storageFormat: null,
+      supportsStorageBinding: false,
+      needsLinearSiblingView: false,
+      reason: 'compressed-not-storage-compatible',
+    };
+  }
+  if (CORE_STORAGE_TEXTURE_FORMATS.has(normalized)) {
+    return {
+      storageFormat: normalized,
+      supportsStorageBinding: true,
+      needsLinearSiblingView: false,
+      reason: null,
+    };
+  }
+  if (normalized === 'bgra8unorm') {
+    if (deviceHasFeature(device, 'bgra8unorm-storage')) {
+      return {
+        storageFormat: 'bgra8unorm',
+        supportsStorageBinding: true,
+        needsLinearSiblingView: false,
+        reason: null,
+      };
+    }
+    return {
+      storageFormat: null,
+      supportsStorageBinding: false,
+      needsLinearSiblingView: false,
+      reason: 'missing-bgra8unorm-storage',
+    };
+  }
+  if (TIER1_STORAGE_TEXTURE_FORMATS.has(normalized)) {
+    if (deviceHasFeature(device, 'texture-formats-tier1')) {
+      return {
+        storageFormat: normalized,
+        supportsStorageBinding: true,
+        needsLinearSiblingView: false,
+        reason: null,
+      };
+    }
+    return {
+      storageFormat: null,
+      supportsStorageBinding: false,
+      needsLinearSiblingView: false,
+      reason: 'missing-texture-formats-tier1',
+    };
+  }
+  if (normalized === 'rgba8unorm-srgb') {
+    return {
+      storageFormat: 'rgba8unorm',
+      supportsStorageBinding: true,
+      needsLinearSiblingView: true,
+      reason: 'srgb-requires-linear-view',
+    };
+  }
+  if (normalized === 'bgra8unorm-srgb') {
+    if (deviceHasFeature(device, 'bgra8unorm-storage')) {
+      return {
+        storageFormat: 'bgra8unorm',
+        supportsStorageBinding: true,
+        needsLinearSiblingView: true,
+        reason: 'srgb-requires-linear-view',
+      };
+    }
+    return {
+      storageFormat: null,
+      supportsStorageBinding: false,
+      needsLinearSiblingView: false,
+      reason: 'missing-bgra8unorm-storage',
+    };
+  }
+  return {
+    storageFormat: null,
+    supportsStorageBinding: false,
+    needsLinearSiblingView: false,
+    reason: 'unsupported-storage-format',
+  };
+}
+
+function isStorageBindingSupported(format, device, options) {
+  const resolved = resolveStorageTextureFormat(format, device, options);
+  return Boolean(resolved.supportsStorageBinding && !resolved.needsLinearSiblingView);
 }
 
 function isRenderAttachmentSupported(format, device) {
@@ -475,7 +652,7 @@ function decodeCreateTexture2(view, offset = 0, payloadBytes) {
 // Sanitizes a GPUTextureDescriptor against WebGPU format & device capability constraints
 // (stripping illegal STORAGE_BINDING / RENDER_ATTACHMENT usages and falling back cleanly on
 // unsupported BC compressed or optional depth formats).
-function sanitizeTextureDescriptor(rawDescriptor, device) {
+function sanitizeTextureDescriptor(rawDescriptor, device, options) {
   const originalFormat = rawDescriptor.format;
   const wasBc = isBcCompressedFormat(originalFormat);
   let effectiveFormat = originalFormat;
@@ -518,7 +695,7 @@ function sanitizeTextureDescriptor(rawDescriptor, device) {
 
   if (
     (usage & GPU_TEXTURE_USAGE_STORAGE_BINDING) !== 0 &&
-    (wasBc || !isStorageBindingSupported(effectiveFormat, device))
+    (wasBc || !isStorageBindingSupported(effectiveFormat, device, options))
   ) {
     usage &= ~GPU_TEXTURE_USAGE_STORAGE_BINDING;
     strippedUsages.push('STORAGE_BINDING');
@@ -1402,10 +1579,24 @@ class RenderStatePackets {
   constructor(processor, options = {}) {
     this.processor = processor;
     this.device = processor.device;
+    this._cachedDeviceGeneration =
+      processor && Number.isInteger(processor._deviceGeneration) ? processor._deviceGeneration : 0;
     // Optional: (kind 'bindGroupLayout' | 'pipelineLayout', contentId: bigint) => GPU object, for
     // ManifestReference layouts loaded from layout-manifest.json (e.g. by reflection_loader.js).
     this.resolveManifestLayout =
       typeof options.resolveManifestLayout === 'function' ? options.resolveManifestLayout : null;
+    // W167/W186: optional pipelineCache override (falls back to processor.pipelineCache).
+    this.pipelineCache =
+      options.pipelineCache && typeof options.pipelineCache === 'object' ? options.pipelineCache : null;
+    // W163/W186: optional textureFormats / resolveStorageCompatibleFormat override.
+    this._textureFormatsOptions =
+      typeof options.resolveStorageCompatibleFormat === 'function' ||
+      (options.textureFormats && typeof options.textureFormats === 'object')
+        ? {
+            resolveStorageCompatibleFormat: options.resolveStorageCompatibleFormat,
+            textureFormats: options.textureFormats,
+          }
+        : null;
     this.bindGroupLayouts = new Map(); // id -> { layout, entries, sequentialBindings }
     this.pipelineLayouts = new Map(); // id -> GPUPipelineLayout
     this.pipelineLayoutMeta = new Map(); // id -> { groupCount, isSingleGroup0, sequentialGroup0, group0HasEntries, group0Entries }
@@ -1419,6 +1610,15 @@ class RenderStatePackets {
       Number.isInteger(options.remappedBindGroupCacheLimit) && options.remappedBindGroupCacheLimit > 0
         ? options.remappedBindGroupCacheLimit
         : REMAPPED_BIND_GROUP_CACHE_LIMIT;
+    // W186: hot-path PresentX multi-plane cache keyed by (planeTextureId, viewFormat, sampler, pipeline/layout).
+    this.presentxBindGroupCache = new Map();
+    this.presentxBindGroupCacheLimit =
+      Number.isInteger(options.presentxBindGroupCacheLimit) && options.presentxBindGroupCacheLimit > 0
+        ? options.presentxBindGroupCacheLimit
+        : PRESENTX_BIND_GROUP_CACHE_LIMIT;
+    this._textureGenerations = new Map(); // textureId -> monotonic generation
+    this._textureViewOwners = new Map(); // textureId -> GPUTexture handle for silent-replacement detection
+    this._destroyed = false;
     this._lastBuiltRenderPipelineAutoLayout = null;
     // W103: pipeline id -> token for compiles still running in processor.asyncPipelineCache. A
     // pipeline stays "pending" here until its result is installed, so flushes never see a gap.
@@ -1452,6 +1652,9 @@ class RenderStatePackets {
       asyncPipelineFailures: 0,
       pendingAsyncPipelineSkips: 0,
       suppressedMissingTextureErrors: 0,
+      presentxBindGroupCacheHits: 0,
+      presentxBindGroupCacheMisses: 0,
+      fallbackSamplersBound: 0,
       warnings: [],
     };
     this._seenWarningKeys = new Set();
@@ -1481,6 +1684,9 @@ class RenderStatePackets {
       bcFormatFallbacks: this.telemetry.bcFormatFallbacks,
       usageStrips: this.telemetry.usageStrips,
       unfilterableFloatFallbacks: this.telemetry.unfilterableFloatFallbacks,
+      presentxBindGroupCacheHits: this.telemetry.presentxBindGroupCacheHits,
+      presentxBindGroupCacheMisses: this.telemetry.presentxBindGroupCacheMisses,
+      fallbackSamplersBound: this.telemetry.fallbackSamplersBound,
     };
   }
 
@@ -1506,6 +1712,9 @@ class RenderStatePackets {
       asyncPipelineFailures: this.telemetry.asyncPipelineFailures,
       pendingAsyncPipelineSkips: this.telemetry.pendingAsyncPipelineSkips,
       suppressedMissingTextureErrors: this.telemetry.suppressedMissingTextureErrors,
+      presentxBindGroupCacheHits: this.telemetry.presentxBindGroupCacheHits,
+      presentxBindGroupCacheMisses: this.telemetry.presentxBindGroupCacheMisses,
+      fallbackSamplersBound: this.telemetry.fallbackSamplersBound,
       warnings: this.telemetry.warnings.slice(),
     };
   }
@@ -1539,6 +1748,7 @@ class RenderStatePackets {
 
   // Returns true when the opcode belongs to ABI v2 (handled, possibly with an error recorded).
   handlePacket(opcode, view, offset, payloadBytes) {
+    this._syncDeviceGeneration();
     this._packetError = null;
     this._suppressPacketError = false;
     switch (opcode) {
@@ -1671,6 +1881,308 @@ class RenderStatePackets {
     }
   }
 
+  // W186: detect GPUDevice replacement or device-generation bump and flush device-bound caches.
+  _syncDeviceGeneration() {
+    const liveDevice = (this.processor && this.processor.device) || this.device;
+    const liveGen =
+      this.processor && Number.isInteger(this.processor._deviceGeneration)
+        ? this.processor._deviceGeneration
+        : this._cachedDeviceGeneration;
+    if (liveDevice !== this.device || liveGen !== this._cachedDeviceGeneration) {
+      this.invalidatePresentXCache();
+      this.textureViews.clear();
+      this._textureViewOwners.clear();
+      this.dummies.clear();
+      this.remappedBindGroups.clear();
+      this.emptyLayout = null;
+      this.emptyFragment = null;
+      this.device = liveDevice;
+      this._cachedDeviceGeneration = liveGen;
+      return true;
+    }
+    return false;
+  }
+
+  _bumpTextureGeneration(textureId) {
+    const next = (this._textureGenerations.get(textureId) || 0) + 1;
+    this._textureGenerations.set(textureId, next);
+    return next;
+  }
+
+  _getTextureGeneration(textureId, liveTexture) {
+    const prevOwner = this._textureViewOwners.get(textureId);
+    if (liveTexture && prevOwner && prevOwner !== liveTexture) {
+      this.textureViews.delete(textureId);
+      this._invalidatePresentXCacheForResource(textureId);
+      this._textureViewOwners.set(textureId, liveTexture);
+      return this._bumpTextureGeneration(textureId);
+    }
+    if (liveTexture && !prevOwner) {
+      this._textureViewOwners.set(textureId, liveTexture);
+    }
+    return this._textureGenerations.get(textureId) || 0;
+  }
+
+  _getPipelineCache() {
+    if (this.pipelineCache && typeof this.pipelineCache === 'object') {
+      return this.pipelineCache;
+    }
+    if (this.processor && this.processor.pipelineCache && typeof this.processor.pipelineCache === 'object') {
+      return this.processor.pipelineCache;
+    }
+    return null;
+  }
+
+  _resolveDefaultSamplerFromCache(samplerKind) {
+    const cache = this._getPipelineCache();
+    if (!cache || typeof cache.getOrCreateDefaultSampler !== 'function') {
+      return null;
+    }
+    const kind =
+      samplerKind === 'comparison' || samplerKind === 'non-filtering' || samplerKind === 'filtering'
+        ? samplerKind
+        : 'filtering';
+    try {
+      const sampler = cache.getOrCreateDefaultSampler(kind);
+      return sampler || null;
+    } catch (err) {
+      this._recordTelemetryWarningOnce(
+        `fallback-sampler-error:${kind}`,
+        `pipelineCache.getOrCreateDefaultSampler(${kind}) failed: ${String(err && err.message ? err.message : err)}`
+      );
+      return null;
+    }
+  }
+
+  _resolveStorageFormat(format) {
+    return resolveStorageTextureFormat(format, this.device, this._textureFormatsOptions);
+  }
+
+  _cachePresentXBindGroup(cacheKey, entry) {
+    if (this.presentxBindGroupCache.has(cacheKey)) {
+      this.presentxBindGroupCache.delete(cacheKey);
+    }
+    this.presentxBindGroupCache.set(cacheKey, entry);
+    while (this.presentxBindGroupCache.size > this.presentxBindGroupCacheLimit) {
+      const oldest = this.presentxBindGroupCache.keys().next().value;
+      this.presentxBindGroupCache.delete(oldest);
+    }
+  }
+
+  _invalidatePresentXCacheForResource(resourceId) {
+    if (this.presentxBindGroupCache.size === 0) return 0;
+    let removed = 0;
+    for (const [key, entry] of Array.from(this.presentxBindGroupCache.entries())) {
+      if (
+        entry.planeTextureId === resourceId ||
+        entry.samplerId === resourceId ||
+        entry.layoutId === resourceId ||
+        entry.pipelineId === resourceId
+      ) {
+        this.presentxBindGroupCache.delete(key);
+        removed += 1;
+      }
+    }
+    return removed;
+  }
+
+  invalidatePresentXCache(filter = null) {
+    if (!filter || typeof filter !== 'object') {
+      const count = this.presentxBindGroupCache.size;
+      this.presentxBindGroupCache.clear();
+      return count;
+    }
+    let removed = 0;
+    for (const [key, entry] of Array.from(this.presentxBindGroupCache.entries())) {
+      if (
+        (filter.planeTextureId !== undefined && entry.planeTextureId === filter.planeTextureId) ||
+        (filter.samplerId !== undefined && entry.samplerId === filter.samplerId) ||
+        (filter.sampler !== undefined && entry.sampler === filter.sampler) ||
+        (filter.layoutId !== undefined && entry.layoutId === filter.layoutId) ||
+        (filter.layout !== undefined && entry.layout === filter.layout) ||
+        (filter.pipelineId !== undefined && entry.pipelineId === filter.pipelineId) ||
+        (filter.pipeline !== undefined && entry.pipeline === filter.pipeline)
+      ) {
+        this.presentxBindGroupCache.delete(key);
+        removed += 1;
+      }
+    }
+    return removed;
+  }
+
+  // W186: hot-path PresentX multi-plane bind-group + texture-view cache.
+  // Caches per-(planeTextureId, viewFormat, sampler, pipeline/layout) across frames and invalidates
+  // automatically on texture handle/generation change, device change, reset, or destroy.
+  getOrCreatePresentXPlaneBindGroup(params) {
+    if (this._destroyed || !params || typeof params !== 'object') return null;
+    this._syncDeviceGeneration();
+    if (!this.device || typeof this.device.createBindGroup !== 'function') return null;
+
+    const planeTextureId = params.planeTextureId;
+    if (!Number.isInteger(planeTextureId) || planeTextureId <= 0 || planeTextureId === SWAPCHAIN_TEXTURE_ID) {
+      return null;
+    }
+    const texture =
+      this.processor && this.processor.textures ? this.processor.textures.get(planeTextureId) : null;
+    if (!texture || typeof texture.createView !== 'function') return null;
+
+    const texGen = this._getTextureGeneration(planeTextureId, texture);
+    const baseViewDesc =
+      params.viewDesc && typeof params.viewDesc === 'object' ? { ...params.viewDesc } : {};
+    if (
+      typeof params.viewFormat === 'string' &&
+      params.viewFormat.length > 0 &&
+      params.viewFormat !== 'undefined' &&
+      !baseViewDesc.format
+    ) {
+      baseViewDesc.format = params.viewFormat;
+    }
+    const resolvedViewFormat =
+      this._resolveTextureFormat(planeTextureId, baseViewDesc) ||
+      (typeof params.viewFormat === 'string' && params.viewFormat !== 'undefined'
+        ? params.viewFormat
+        : 'default');
+    const viewDescKey = buildTextureViewKey(baseViewDesc);
+
+    const samplerId = Number.isInteger(params.samplerId) && params.samplerId > 0 ? params.samplerId : 0;
+    let samplerObj = params.sampler || null;
+    let usedFallbackSampler = false;
+    if (!samplerObj && samplerId > 0 && this.processor && this.processor.samplers) {
+      samplerObj = this.processor.samplers.get(samplerId) || null;
+    }
+    if (!samplerObj) {
+      const samplerKind =
+        params.samplerKind === 'comparison' || params.samplerKind === 'non-filtering'
+          ? params.samplerKind
+          : 'filtering';
+      samplerObj = this._resolveDefaultSamplerFromCache(samplerKind);
+      if (samplerObj) {
+        usedFallbackSampler = true;
+      } else {
+        samplerObj = this._dummyResource({ sampler: { type: samplerKind } });
+      }
+    }
+    if (!samplerObj) return null;
+
+    const pipelineId = Number.isInteger(params.pipelineId) && params.pipelineId > 0 ? params.pipelineId : 0;
+    let pipelineObj = params.pipeline || null;
+    if (!pipelineObj && pipelineId > 0 && this.processor && this.processor.pipelines) {
+      pipelineObj = this.processor.pipelines.get(pipelineId) || null;
+    }
+
+    const layoutId = Number.isInteger(params.layoutId) && params.layoutId > 0 ? params.layoutId : 0;
+    let bindGroupLayout = params.layout || null;
+    if (!bindGroupLayout && layoutId > 0) {
+      const bglRec = this.bindGroupLayouts.get(layoutId);
+      bindGroupLayout = bglRec ? bglRec.layout : null;
+    }
+    if (!bindGroupLayout && pipelineObj && typeof pipelineObj.getBindGroupLayout === 'function') {
+      try {
+        bindGroupLayout = pipelineObj.getBindGroupLayout(0);
+      } catch (_) {
+        bindGroupLayout = null;
+      }
+    }
+    if (!bindGroupLayout) return null;
+
+    const textureBinding = Number.isInteger(params.textureBinding) ? params.textureBinding : 0;
+    const samplerBinding = Number.isInteger(params.samplerBinding) ? params.samplerBinding : 1;
+    const cacheKey = `px:${planeTextureId}:${texGen}:${resolvedViewFormat}:${viewDescKey}:s=${gpuObjectId(
+      samplerObj
+    )}:p=${gpuObjectId(pipelineObj)}:l=${gpuObjectId(bindGroupLayout)}:b=${textureBinding},${samplerBinding}`;
+
+    const cached = this.presentxBindGroupCache.get(cacheKey);
+    if (
+      cached &&
+      cached.device === this.device &&
+      cached.deviceGeneration === this._cachedDeviceGeneration &&
+      cached.texture === texture &&
+      cached.textureGen === texGen &&
+      cached.sampler === samplerObj &&
+      cached.layout === bindGroupLayout &&
+      cached.pipeline === (pipelineObj || null)
+    ) {
+      this._cachePresentXBindGroup(cacheKey, cached);
+      this.telemetry.presentxBindGroupCacheHits += 1;
+      if (usedFallbackSampler) {
+        this.telemetry.fallbackSamplersBound += 1;
+      }
+      return { view: cached.view, bindGroup: cached.bindGroup, hit: true, cacheKey };
+    }
+
+    const view = this._textureView(planeTextureId, baseViewDesc);
+    if (!view) return null;
+
+    let bindGroup;
+    try {
+      bindGroup = this.device.createBindGroup({
+        layout: bindGroupLayout,
+        entries: [
+          { binding: textureBinding, resource: view },
+          { binding: samplerBinding, resource: samplerObj },
+        ],
+      });
+    } catch (err) {
+      this._packetError = `PresentX bind group (texture ${planeTextureId}): ${String(
+        err && err.message ? err.message : err
+      )}`;
+      return null;
+    }
+
+    if (usedFallbackSampler) {
+      this.telemetry.fallbackSamplersBound += 1;
+    }
+    this.telemetry.presentxBindGroupCacheMisses += 1;
+    const entry = {
+      view,
+      bindGroup,
+      planeTextureId,
+      texture,
+      textureGen: texGen,
+      viewFormat: resolvedViewFormat,
+      viewDescKey,
+      samplerId,
+      sampler: samplerObj,
+      layoutId,
+      layout: bindGroupLayout,
+      pipelineId,
+      pipeline: pipelineObj || null,
+      device: this.device,
+      deviceGeneration: this._cachedDeviceGeneration,
+    };
+    this._cachePresentXBindGroup(cacheKey, entry);
+    return { view, bindGroup, hit: false, cacheKey };
+  }
+
+  reset() {
+    this.invalidatePresentXCache();
+    this.textureViews.clear();
+    this._textureViewOwners.clear();
+    this.remappedBindGroups.clear();
+    this.dummies.clear();
+    this.emptyLayout = null;
+    this.emptyFragment = null;
+    this._activePass = null;
+    this._activePassTargetSize = null;
+  }
+
+  destroy() {
+    this.reset();
+    this.bindGroupLayouts.clear();
+    this.pipelineLayouts.clear();
+    this.pipelineLayoutMeta.clear();
+    this.computePipelineMeta.clear();
+    this.renderPipelineAutoLayoutMeta.clear();
+    this.pendingAsyncRenderPipelines.clear();
+    this.pendingAsyncComputePipelines.clear();
+    this.bindGroupDescriptors.clear();
+    this.layoutsByContent.clear();
+    this.textureMeta.clear();
+    this._textureGenerations.clear();
+    this._reportedMissingTextures.clear();
+    this._destroyed = true;
+  }
+
   // DestroyResource hook: forget layouts, metadata and cached views of `id`.
   destroyResource(id) {
     this.bindGroupLayouts.delete(id);
@@ -1684,6 +2196,9 @@ class RenderStatePackets {
     this._invalidateRemappedBindGroupsForPipeline(id, true);
     this._invalidateRemappedBindGroupsForPipeline(id, false);
     this._invalidateRemappedBindGroupsForBindGroup(id);
+    this._invalidatePresentXCacheForResource(id);
+    this._bumpTextureGeneration(id);
+    this._textureViewOwners.delete(id);
     this.textureViews.delete(id);
     this.textureMeta.delete(id);
     if (
@@ -1734,12 +2249,23 @@ class RenderStatePackets {
         return false;
       }
       if (entry.storageTexture) {
-        if (!isStorageBindingSupported(entry.storageTexture.format, this.device)) {
-          const origFmt = entry.storageTexture.format;
+        const origFmt = entry.storageTexture.format;
+        const resolvedStorage = this._resolveStorageFormat(origFmt);
+        if (resolvedStorage.supportsStorageBinding && resolvedStorage.storageFormat) {
+          if (resolvedStorage.storageFormat !== origFmt) {
+            entry.storageTexture.format = resolvedStorage.storageFormat;
+            this._recordTelemetryWarningOnce(
+              `bgl-storage-format:${origFmt}`,
+              `bind group layout storageTexture format ${origFmt} remapped to linear sibling ${resolvedStorage.storageFormat}`
+            );
+          }
+        } else {
           entry.storageTexture.format = 'rgba8unorm';
           this._recordTelemetryWarningOnce(
             `bgl-storage-format:${origFmt}`,
-            `bind group layout storageTexture format ${origFmt} unsupported; falling back to rgba8unorm`
+            `bind group layout storageTexture format ${origFmt} unsupported${
+              resolvedStorage.reason ? ` (${resolvedStorage.reason})` : ''
+            }; falling back to rgba8unorm`
           );
         }
         if (
@@ -2096,6 +2622,7 @@ class RenderStatePackets {
     const { vsId, fsId, layoutId } = info;
     this.processor.pipelines.set(id, pipeline);
     this._invalidateRemappedBindGroupsForPipeline(id, false);
+    this._invalidatePresentXCacheForResource(id);
     if (info.autoLayoutRemap) {
       this.renderPipelineAutoLayoutMeta.set(id, {
         id,
@@ -2429,6 +2956,45 @@ class RenderStatePackets {
 
     const available =
       bindGroupDesc && Array.isArray(bindGroupDesc.resources) ? bindGroupDesc.resources : [];
+
+    // W186: fast path for 2-binding PresentX plane blits (texture_2d<f32> + sampler) on layout:'auto'
+    // render pipelines: reuse the per-(planeTextureId, viewFormat, sampler, pipeline) cache even when
+    // bindGroupId rotates every frame.
+    if (!isCompute && wgslBindings.length === 2) {
+      const texBinding = wgslBindings.find(
+        (b) =>
+          b &&
+          b.kind === 'texture' &&
+          !b.multisampled &&
+          (b.viewDimension || '2d') === '2d' &&
+          (!b.sampleType || b.sampleType === 'float')
+      );
+      const smpBinding = wgslBindings.find((b) => b && b.kind === 'sampler');
+      if (texBinding && smpBinding) {
+        const texRes = available.find(
+          (r) => r && r.kind === 'texture' && !r.isDummy && Number.isInteger(r.planeTextureId) && r.planeTextureId > 0
+        );
+        const smpRes = available.find((r) => r && r.kind === 'sampler' && !r.isDummy && r.resource);
+        if (texRes) {
+          const cachedPx = this.getOrCreatePresentXPlaneBindGroup({
+            planeTextureId: texRes.planeTextureId,
+            viewDesc: texRes.viewDesc || null,
+            viewFormat: texRes.textureFormat || null,
+            sampler: smpRes ? smpRes.resource : null,
+            samplerId: smpRes && Number.isInteger(smpRes.samplerId) ? smpRes.samplerId : 0,
+            samplerKind: smpBinding.comparison ? 'comparison' : 'filtering',
+            pipeline,
+            pipelineId,
+            textureBinding: texBinding.binding,
+            samplerBinding: smpBinding.binding,
+          });
+          if (cachedPx && cachedPx.bindGroup) {
+            return { status: 'ok', bindGroup: cachedPx.bindGroup };
+          }
+        }
+      }
+    }
+
     const dynOffsets = normalizeDynamicOffsets(dynamicOffsets);
     const dynOffsetFor = (r) =>
       r &&
@@ -2645,6 +3211,14 @@ class RenderStatePackets {
           }
         }
       }
+      if (b.kind === 'sampler') {
+        const samplerKind = b.comparison ? 'comparison' : 'filtering';
+        const fallbackSampler = this._resolveDefaultSamplerFromCache(samplerKind);
+        if (fallbackSampler) {
+          this.telemetry.fallbackSamplersBound += 1;
+          return fallbackSampler;
+        }
+      }
       return this._dummyResource(synthLayoutEntryForWgslBinding(b));
     };
 
@@ -2658,10 +3232,20 @@ class RenderStatePackets {
       remapped = this.device.createBindGroup({ layout: autoBgl, entries });
     } catch (_) {
       try {
-        const fallbackEntries = wgslBindings.map((b) => ({
-          binding: b.binding,
-          resource: this._dummyResource(synthLayoutEntryForWgslBinding(b)),
-        }));
+        const fallbackEntries = wgslBindings.map((b) => {
+          if (b.kind === 'sampler') {
+            const samplerKind = b.comparison ? 'comparison' : 'filtering';
+            const fallbackSampler = this._resolveDefaultSamplerFromCache(samplerKind);
+            if (fallbackSampler) {
+              this.telemetry.fallbackSamplersBound += 1;
+              return { binding: b.binding, resource: fallbackSampler };
+            }
+          }
+          return {
+            binding: b.binding,
+            resource: this._dummyResource(synthLayoutEntryForWgslBinding(b)),
+          };
+        });
         remapped = this.device.createBindGroup({ layout: autoBgl, entries: fallbackEntries });
       } catch (_err2) {
         remapped = null;
@@ -2678,6 +3262,7 @@ class RenderStatePackets {
   // compute pipelines, and remaps @group(0) bind groups for pipelines that fell back to layout:'auto',
   // immediately before WgpuCommandProcessor._flushPresent() executes them.
   _preparePassCommandsForFlush() {
+    this._syncDeviceGeneration();
     const cmds = this.processor && this.processor._passCommands;
     if (!Array.isArray(cmds) || cmds.length === 0) return;
 
@@ -3012,7 +3597,11 @@ class RenderStatePackets {
       this._packetError = decoded.error;
       return false;
     }
-    const sanitized = sanitizeTextureDescriptor(decoded.descriptor, this.device);
+    const sanitized = sanitizeTextureDescriptor(
+      decoded.descriptor,
+      this.device,
+      this._textureFormatsOptions
+    );
     for (let i = 0; i < sanitized.warnings.length; i += 1) {
       const w = sanitized.warnings[i];
       this._recordTelemetryWarningOnce(w.key, w.message);
@@ -3028,6 +3617,9 @@ class RenderStatePackets {
     if (typeof this.processor._destroyTextureIfPresent === 'function') {
       this.processor._destroyTextureIfPresent(id);
     }
+    this._invalidatePresentXCacheForResource(id);
+    this._bumpTextureGeneration(id);
+    this._textureViewOwners.delete(id);
     this.textureViews.delete(id);
     this.textureMeta.delete(id);
 
@@ -3039,6 +3631,7 @@ class RenderStatePackets {
       return false;
     }
     this.processor.textures.set(id, texture);
+    this._textureViewOwners.set(id, texture);
     let defaultView = null;
     if (texture && typeof texture.createView === 'function') {
       try {
@@ -3105,8 +3698,10 @@ class RenderStatePackets {
   }
 
   _textureView(textureId, desc) {
+    this._syncDeviceGeneration();
     const texture = this.processor.textures.get(textureId);
     if (!texture || typeof texture.createView !== 'function') return null;
+    this._getTextureGeneration(textureId, texture);
     let effectiveDesc = desc;
     const meta = this.textureMeta.get(textureId);
     if (effectiveDesc && typeof effectiveDesc.format === 'string' && meta) {
@@ -3120,7 +3715,7 @@ class RenderStatePackets {
         effectiveDesc = { ...effectiveDesc, format: meta.format };
       }
     }
-    const key = JSON.stringify(effectiveDesc);
+    const key = buildTextureViewKey(effectiveDesc);
     let views = this.textureViews.get(textureId);
     if (!views) {
       views = new Map();
@@ -3393,8 +3988,12 @@ class RenderStatePackets {
           tex.sampleType
         ] || 'rgba8unorm';
     }
-    if (layoutEntry.storageTexture && !isStorageBindingSupported(format, this.device)) {
-      format = 'rgba8unorm';
+    if (layoutEntry.storageTexture) {
+      const resolvedStorage = this._resolveStorageFormat(format);
+      format =
+        resolvedStorage.supportsStorageBinding && resolvedStorage.storageFormat
+          ? resolvedStorage.storageFormat
+          : 'rgba8unorm';
     }
     const multisampled = Boolean(layoutEntry.texture && layoutEntry.texture.multisampled);
     if (multisampled && !isMultisampleSupported(format, this.device)) {
@@ -3461,10 +4060,26 @@ class RenderStatePackets {
       let textureFormat = null;
       let textureViewDimension = null;
       let textureMultisampled = null;
+      let textureViewDescUsed = null;
       let samplerComparison = null;
       if (resourceId === 0) {
-        entryResource = layoutEntry ? this._dummyResource(layoutEntry) : null;
-        if (entryResource) entryUsedDummy = true;
+        if (layoutExpectsSampler || type === BIND_RESOURCE_TYPE.SAMPLER) {
+          const samplerKind =
+            (layoutEntry && layoutEntry.sampler && layoutEntry.sampler.type) || 'filtering';
+          const fallbackSampler = this._resolveDefaultSamplerFromCache(samplerKind);
+          if (fallbackSampler) {
+            entryResource = fallbackSampler;
+            entryUsedDummy = true;
+            samplerComparison = samplerKind === 'comparison';
+            this.telemetry.fallbackSamplersBound += 1;
+          } else if (layoutEntry) {
+            entryResource = this._dummyResource(layoutEntry);
+            if (entryResource) entryUsedDummy = true;
+          }
+        } else {
+          entryResource = layoutEntry ? this._dummyResource(layoutEntry) : null;
+          if (entryResource) entryUsedDummy = true;
+        }
       } else if (type === BIND_RESOURCE_TYPE.BUFFER) {
         const buffer = this.processor.buffers.get(resourceId);
         if (buffer) {
@@ -3605,7 +4220,48 @@ class RenderStatePackets {
         if (sampleCount !== null) {
           textureMultisampled = sampleCount > 1;
         }
+        textureViewDescUsed = viewDesc;
         if (
+          !kindMismatch &&
+          layoutEntry &&
+          layoutEntry.storageTexture &&
+          texFormat
+        ) {
+          const resolvedStorage = this._resolveStorageFormat(texFormat);
+          if (!resolvedStorage.supportsStorageBinding || !resolvedStorage.storageFormat) {
+            this._recordTelemetryWarningOnce(
+              `bg-storage-format-unsupported:${texFormat}:${binding}`,
+              `bind group ${id}: binding ${binding} storageTexture format ${texFormat} unsupported${
+                resolvedStorage.reason ? ` (${resolvedStorage.reason})` : ''
+              }; substituting dummy storage texture`
+            );
+            entryResource = this._dummyResource(layoutEntry);
+            entryUsedDummy = true;
+          } else if (resolvedStorage.needsLinearSiblingView) {
+            const linearViewDesc = { ...viewDesc, format: resolvedStorage.storageFormat };
+            const linearView = this._textureView(resourceId, linearViewDesc);
+            if (linearView) {
+              realResource = linearView;
+              entryResource = linearView;
+              textureFormat = resolvedStorage.storageFormat;
+              textureViewDescUsed = linearViewDesc;
+            } else {
+              this._packetError = null;
+              this._recordTelemetryWarningOnce(
+                `bg-storage-linear-view-fallback:${texFormat}:${binding}`,
+                `bind group ${id}: binding ${binding} linear sibling view ${resolvedStorage.storageFormat} unavailable for ${texFormat}; substituting dummy storage texture`
+              );
+              entryResource = this._dummyResource(layoutEntry);
+              entryUsedDummy = true;
+            }
+          } else {
+            const resolvedView = this._textureView(resourceId, viewDesc);
+            if (resolvedView) {
+              realResource = resolvedView;
+              entryResource = resolvedView;
+            }
+          }
+        } else if (
           !kindMismatch &&
           layoutEntry &&
           layoutEntry.texture &&
@@ -3658,6 +4314,20 @@ class RenderStatePackets {
           } else {
             entryResource = sampler;
           }
+        } else if (!kindMismatch) {
+          const samplerKind =
+            (layoutEntry && layoutEntry.sampler && layoutEntry.sampler.type) || 'filtering';
+          const fallbackSampler = this._resolveDefaultSamplerFromCache(samplerKind);
+          if (fallbackSampler) {
+            entryResource = fallbackSampler;
+            entryUsedDummy = true;
+            samplerComparison = samplerKind === 'comparison';
+            this.telemetry.fallbackSamplersBound += 1;
+            this._recordTelemetryWarningOnce(
+              `bg-missing-sampler:${layoutId}:${binding}:${resourceId}`,
+              `bind group ${id}: binding ${binding} sampler ${resourceId} unavailable; bound default ${samplerKind} sampler`
+            );
+          }
         }
       }
       if (!entryResource) {
@@ -3685,6 +4355,11 @@ class RenderStatePackets {
             if (samplerComparison === null) {
               samplerComparison = layoutEntry.sampler.type === 'comparison';
             }
+          }
+        } else if (type === BIND_RESOURCE_TYPE.SAMPLER) {
+          resourceKind = 'sampler';
+          if (samplerComparison === null) {
+            samplerComparison = false;
           }
         }
       } else if (type === BIND_RESOURCE_TYPE.BUFFER) {
@@ -3725,6 +4400,13 @@ class RenderStatePackets {
         if (textureFormat !== null && !descIsDummy) descEntry.textureFormat = textureFormat;
         if (textureViewDimension !== null && !descIsDummy) descEntry.viewDimension = textureViewDimension;
         if (textureMultisampled !== null && !descIsDummy) descEntry.multisampled = textureMultisampled;
+        if (type === BIND_RESOURCE_TYPE.TEXTURE_VIEW && !descIsDummy && resourceId !== 0) {
+          descEntry.planeTextureId = resourceId;
+          if (textureViewDescUsed) descEntry.viewDesc = textureViewDescUsed;
+        }
+        if (type === BIND_RESOURCE_TYPE.SAMPLER && !descIsDummy && resourceId !== 0) {
+          descEntry.samplerId = resourceId;
+        }
         if (samplerComparison !== null) descEntry.comparison = samplerComparison;
         if (type === BIND_RESOURCE_TYPE.BUFFER && !descIsDummy) {
           if (bufferSizeKnown !== null) descEntry.bufferSize = bufferSizeKnown;
@@ -3742,12 +4424,129 @@ class RenderStatePackets {
         descriptorResources.push(descEntry);
       }
     }
-    let bindGroup;
-    try {
-      bindGroup = this.device.createBindGroup({ layout: record.layout, entries });
-    } catch (err) {
-      this._packetError = `bind group ${id}: ${String(err && err.message ? err.message : err)}`;
-      return false;
+
+    // W167/W186: if the layout declares sampler slots omitted from CreateBindGroup2 (e.g. static
+    // samplers baked into a root signature) and pipelineCache.getOrCreateDefaultSampler is available,
+    // synthesize safe default samplers so the bind group creation succeeds instead of failing.
+    if (Array.isArray(record.entries) && this._getPipelineCache()) {
+      for (let i = 0; i < record.entries.length; i += 1) {
+        const le = record.entries[i];
+        if (!le || !le.sampler || seenBindings.has(le.binding)) continue;
+        const samplerKind = le.sampler.type || 'filtering';
+        const fallbackSampler = this._resolveDefaultSamplerFromCache(samplerKind);
+        if (!fallbackSampler) continue;
+        seenBindings.add(le.binding);
+        entries.push({ binding: le.binding, resource: fallbackSampler });
+        descriptorResources.push({
+          binding: le.binding,
+          kind: 'sampler',
+          resource: fallbackSampler,
+          isDummy: true,
+          comparison: samplerKind === 'comparison',
+        });
+        this.telemetry.fallbackSamplersBound += 1;
+        this._recordTelemetryWarningOnce(
+          `bg-omitted-sampler:${layoutId}:${le.binding}`,
+          `bind group ${id}: omitted sampler binding ${le.binding}; bound default ${samplerKind} sampler`
+        );
+      }
+    }
+
+    // W186: hot-path PresentX multi-plane bind-group cache for 2-entry (2D float texture + sampler)
+    // plane-blit bind groups, keyed by (planeTextureId, viewFormat, sampler, layout) and invalidated
+    // on texture/sampler/layout/device changes.
+    let presentxCacheKey = null;
+    let presentxCacheMeta = null;
+    if (
+      entries.length === 2 &&
+      Array.isArray(record.entries) &&
+      record.entries.length === 2 &&
+      descriptorResources.length === 2
+    ) {
+      const texLayout = record.entries.find(
+        (le) =>
+          le &&
+          le.texture &&
+          !le.texture.multisampled &&
+          le.texture.viewDimension === '2d' &&
+          le.texture.sampleType === 'float'
+      );
+      const smpLayout = record.entries.find((le) => le && le.sampler);
+      if (texLayout && smpLayout) {
+        const texDesc = descriptorResources.find(
+          (r) =>
+            r &&
+            r.binding === texLayout.binding &&
+            r.kind === 'texture' &&
+            !r.isDummy &&
+            Number.isInteger(r.planeTextureId) &&
+            r.planeTextureId > 0
+        );
+        const smpDesc = descriptorResources.find(
+          (r) => r && r.binding === smpLayout.binding && r.kind === 'sampler' && r.resource
+        );
+        if (texDesc && smpDesc) {
+          const liveTexture = this.processor.textures.get(texDesc.planeTextureId) || null;
+          if (liveTexture) {
+            const texGen = this._getTextureGeneration(texDesc.planeTextureId, liveTexture);
+            const viewFormat = texDesc.textureFormat || 'default';
+            const viewDescKey = buildTextureViewKey(texDesc.viewDesc);
+            presentxCacheKey = `px:${texDesc.planeTextureId}:${texGen}:${viewFormat}:${viewDescKey}:s=${gpuObjectId(
+              smpDesc.resource
+            )}:p=0:l=${gpuObjectId(record.layout)}:b=${texDesc.binding},${smpDesc.binding}`;
+            presentxCacheMeta = {
+              view: texDesc.resource,
+              planeTextureId: texDesc.planeTextureId,
+              texture: liveTexture,
+              textureGen: texGen,
+              viewFormat,
+              viewDescKey,
+              samplerId: Number.isInteger(smpDesc.samplerId) ? smpDesc.samplerId : 0,
+              sampler: smpDesc.resource,
+              layoutId,
+              layout: record.layout,
+              pipelineId: 0,
+              pipeline: null,
+              device: this.device,
+              deviceGeneration: this._cachedDeviceGeneration,
+            };
+          }
+        }
+      }
+    }
+
+    let bindGroup = null;
+    if (presentxCacheKey && presentxCacheMeta) {
+      const cached = this.presentxBindGroupCache.get(presentxCacheKey);
+      if (
+        cached &&
+        cached.device === this.device &&
+        cached.deviceGeneration === this._cachedDeviceGeneration &&
+        cached.texture === presentxCacheMeta.texture &&
+        cached.textureGen === presentxCacheMeta.textureGen &&
+        cached.sampler === presentxCacheMeta.sampler &&
+        cached.layout === presentxCacheMeta.layout
+      ) {
+        this._cachePresentXBindGroup(presentxCacheKey, cached);
+        this.telemetry.presentxBindGroupCacheHits += 1;
+        bindGroup = cached.bindGroup;
+      }
+    }
+
+    if (!bindGroup) {
+      try {
+        bindGroup = this.device.createBindGroup({ layout: record.layout, entries });
+      } catch (err) {
+        this._packetError = `bind group ${id}: ${String(err && err.message ? err.message : err)}`;
+        return false;
+      }
+      if (presentxCacheKey && presentxCacheMeta) {
+        this.telemetry.presentxBindGroupCacheMisses += 1;
+        this._cachePresentXBindGroup(presentxCacheKey, {
+          ...presentxCacheMeta,
+          bindGroup,
+        });
+      }
     }
     this.processor.bindGroups.set(id, bindGroup);
     this.bindGroupDescriptors.set(id, { id, layoutId, resources: descriptorResources });
@@ -3814,6 +4613,7 @@ class RenderStatePackets {
       return false;
     }
     this.processor.samplers.set(id, sampler);
+    this._invalidatePresentXCacheForResource(id);
     return true;
   }
 }
@@ -3879,6 +4679,7 @@ const exportedApi = {
   isDepthOrStencilTextureFormat,
   isFloat32TextureFormat,
   isStorageBindingSupported,
+  resolveStorageTextureFormat,
   isRenderAttachmentSupported,
   isMultisampleSupported,
   resolveTextureSampleType,

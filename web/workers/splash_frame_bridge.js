@@ -3,8 +3,9 @@
 // Splash / Bink2 frame presentation bridge.
 // Zero external dependencies; UMD export for Web Workers (globalThis.PlayGta6SplashFrameBridge)
 // and Node.js (module.exports). Queues decoded RGBA8 / YUV420P / YUVA420P / NV12 / ImageBitmap
-// frames into BinkVideoPresenter (W38/W115) for letterboxed WebGPU presentation with
-// FIRST_PRESENT handoff telemetry.
+// frames into BinkVideoPresenter (W38/W115/W165) for letterboxed WebGPU presentation with
+// Bink2Scarlett YVU (Y/Cr/Cb) plane-order forwarding, underlay loadOp control, optional
+// zero-copy 4K typed-array handoff, and FIRST_PRESENT telemetry.
 
 (function (root) {
   const DEFAULT_MAX_QUEUE_DEPTH = 3;
@@ -48,6 +49,16 @@
   const COLOR_RANGE = Object.freeze({
     LIMITED: 'limited',
     FULL: 'full',
+  });
+
+  const CHROMA_ORDER = Object.freeze({
+    YUV: 'yuv',
+    YVU: 'yvu',
+  });
+
+  const LOAD_OP = Object.freeze({
+    CLEAR: 'clear',
+    LOAD: 'load',
   });
 
   const TEXTURE_USAGE = Object.freeze({
@@ -161,6 +172,64 @@
     );
   }
 
+  function normalizeChromaOrder(chromaOrder) {
+    if (chromaOrder === undefined || chromaOrder === null || chromaOrder === '') {
+      return null;
+    }
+    if (typeof chromaOrder === 'string') {
+      const key = chromaOrder.trim().toLowerCase();
+      if (key === CHROMA_ORDER.YUV) {
+        return CHROMA_ORDER.YUV;
+      }
+      if (key === CHROMA_ORDER.YVU) {
+        return CHROMA_ORDER.YVU;
+      }
+    }
+    throw new RangeError(
+      `Unsupported chromaOrder "${chromaOrder}"; expected "${CHROMA_ORDER.YUV}" or "${CHROMA_ORDER.YVU}"`
+    );
+  }
+
+  function normalizeLoadOp(loadOp) {
+    if (loadOp === undefined || loadOp === null || loadOp === '') {
+      return null;
+    }
+    if (typeof loadOp === 'string') {
+      const key = loadOp.trim().toLowerCase();
+      if (key === LOAD_OP.CLEAR) {
+        return LOAD_OP.CLEAR;
+      }
+      if (key === LOAD_OP.LOAD) {
+        return LOAD_OP.LOAD;
+      }
+    }
+    throw new RangeError(
+      `Unsupported loadOp "${loadOp}"; expected "${LOAD_OP.CLEAR}" or "${LOAD_OP.LOAD}"`
+    );
+  }
+
+  function sanitizeChromaOrder(chromaOrder) {
+    if (typeof chromaOrder !== 'string') {
+      return null;
+    }
+    const token = chromaOrder.trim().toLowerCase();
+    if (token === CHROMA_ORDER.YUV || token === CHROMA_ORDER.YVU) {
+      return token;
+    }
+    return null;
+  }
+
+  function sanitizeLoadOp(loadOp) {
+    if (typeof loadOp !== 'string') {
+      return null;
+    }
+    const token = loadOp.trim().toLowerCase();
+    if (token === LOAD_OP.CLEAR || token === LOAD_OP.LOAD) {
+      return token;
+    }
+    return null;
+  }
+
   /**
    * Sanitize a frame format value into the strict allowlisted telemetry token set:
    * `'rgba8' | 'yuv420p' | 'nv12' | 'imagebitmap' | null`.
@@ -206,9 +275,22 @@
     return val;
   }
 
-  function clonePlaneBytes(input, label) {
-    const src = toUint8Array(input, label);
-    return new Uint8Array(src);
+  function resolveZeroCopyOption(frame, defaultZeroCopy) {
+    if (frame && frame.zeroCopy !== undefined && frame.zeroCopy !== null) {
+      return Boolean(frame.zeroCopy);
+    }
+    if (frame && frame.copyPlanes !== undefined && frame.copyPlanes !== null) {
+      return !Boolean(frame.copyPlanes);
+    }
+    if (frame && frame.clonePlanes !== undefined && frame.clonePlanes !== null) {
+      return !Boolean(frame.clonePlanes);
+    }
+    return defaultZeroCopy;
+  }
+
+  function acquirePlaneBytes(input, label, zeroCopy) {
+    const view = toUint8Array(input, label);
+    return zeroCopy ? view : new Uint8Array(view);
   }
 
   function resolveBinkVideoPresenterCtor(injected) {
@@ -384,6 +466,19 @@
         opts.colorRange !== undefined && opts.colorRange !== null
           ? normalizeColorRange(opts.colorRange)
           : COLOR_RANGE.LIMITED;
+      const normalizedChromaOrder = normalizeChromaOrder(opts.chromaOrder);
+      const presenterChromaOrder =
+        opts.presenter && typeof opts.presenter === 'object'
+          ? sanitizeChromaOrder(opts.presenter.chromaOrder)
+          : null;
+      this._chromaOrder = normalizedChromaOrder || presenterChromaOrder || CHROMA_ORDER.YUV;
+      const normalizedLoadOp = normalizeLoadOp(opts.loadOp);
+      const presenterLoadOp =
+        opts.presenter && typeof opts.presenter === 'object'
+          ? sanitizeLoadOp(opts.presenter.loadOp)
+          : null;
+      this._loadOp = normalizedLoadOp || presenterLoadOp || LOAD_OP.CLEAR;
+      this._zeroCopy = resolveZeroCopyOption(opts, false);
       this._targetFps = opts.targetFps || DEFAULT_TARGET_FPS;
       this._BinkVideoPresenterCtor = opts.BinkVideoPresenter || null;
       this._presenterOptions = opts.presenterOptions || null;
@@ -403,7 +498,14 @@
       this._framesBeforeFirstPresent = 0;
       this._lateSplashFramesIgnored = 0;
       this._nv12FramesForwarded = 0;
+      this._yvuFramesForwarded = 0;
+      this._underlayLoadFramesPresented = 0;
+      this._zeroCopyFramesForwarded = 0;
       this._lastFrameFormat = null;
+      this._lastChromaOrder = null;
+      this._lastLoadOp = null;
+      this._lastFrameWidth = 0;
+      this._lastFrameHeight = 0;
       this._lastSource = null;
       this._nextFrameIndex = 0;
       this._destroyed = false;
@@ -448,6 +550,58 @@
       return this._splashSuppressed;
     }
 
+    get chromaOrder() {
+      return this._chromaOrder;
+    }
+
+    get loadOp() {
+      return this._loadOp;
+    }
+
+    get zeroCopy() {
+      return this._zeroCopy;
+    }
+
+    /**
+     * Switch default chroma plane ordering (`'yuv'` for Y/Cb/Cr or `'yvu'` for Bink2Scarlett Y/Cr/Cb).
+     *
+     * @param {'yuv' | 'yvu'} chromaOrder
+     */
+    setChromaOrder(chromaOrder) {
+      this._assertNotDestroyed();
+      const normalized = normalizeChromaOrder(chromaOrder);
+      if (!normalized) {
+        throw new RangeError(
+          `Unsupported chromaOrder "${chromaOrder}"; expected "${CHROMA_ORDER.YUV}" or "${CHROMA_ORDER.YVU}"`
+        );
+      }
+      this._chromaOrder = normalized;
+      if (this._presenter && typeof this._presenter.setChromaOrder === 'function') {
+        this._presenter.setChromaOrder(normalized);
+      }
+      return this._chromaOrder;
+    }
+
+    /**
+     * Switch default render-pass `loadOp` (`'clear'` or `'load'` for menu/UI underlay composition).
+     *
+     * @param {'clear' | 'load'} loadOp
+     */
+    setLoadOp(loadOp) {
+      this._assertNotDestroyed();
+      const normalized = normalizeLoadOp(loadOp);
+      if (!normalized) {
+        throw new RangeError(
+          `Unsupported loadOp "${loadOp}"; expected "${LOAD_OP.CLEAR}" or "${LOAD_OP.LOAD}"`
+        );
+      }
+      this._loadOp = normalized;
+      if (this._presenter && typeof this._presenter.setLoadOp === 'function') {
+        this._presenter.setLoadOp(normalized);
+      }
+      return this._loadOp;
+    }
+
     _assertNotDestroyed() {
       if (this._destroyed) {
         throw new Error('SplashFrameBridge has been destroyed');
@@ -471,6 +625,8 @@
         stagingPool: this._stagingPool,
         colorSpace: this._colorSpace,
         colorRange: this._colorRange,
+        chromaOrder: this._chromaOrder,
+        loadOp: this._loadOp,
         targetFps: this._targetFps,
         ...(this._presenterOptions || {}),
       };
@@ -530,6 +686,10 @@
         framesBeforeFirstPresent: this._framesBeforeFirstPresent,
         lateSplashFramesIgnored: this._lateSplashFramesIgnored,
         drainedFrames,
+        chromaOrder: sanitizeChromaOrder(this._chromaOrder) || CHROMA_ORDER.YUV,
+        loadOp: sanitizeLoadOp(this._loadOp) || LOAD_OP.CLEAR,
+        lastChromaOrder: sanitizeChromaOrder(this._lastChromaOrder),
+        lastLoadOp: sanitizeLoadOp(this._lastLoadOp),
       };
     }
 
@@ -561,6 +721,9 @@
         queueDepth: this._queue.length,
         droppedFrames: this._droppedFrames,
         frameIndex: entry.frameIndex,
+        chromaOrder: entry.chromaOrder || this._chromaOrder,
+        loadOp: entry.loadOp || this._loadOp,
+        zeroCopy: Boolean(entry.zeroCopy),
       };
     }
 
@@ -581,6 +744,9 @@
      * Push a raw planar/semi-planar/RGBA frame into the bounded queue.
      * Supports RGBA8 (`'rgba8' | 0`), YUV420P (`'yuv420p' | 1`), YUVA420P (`'yuva420p' | 2`),
      * and NV12 (`'nv12' | 3`, with `yPlane`/`uvPlane` or `planes: { y, uv }`).
+     * Supports Bink2Scarlett `chromaOrder: 'yvu'` (Y/Cr/Cb) via either `{ y, u: cr, v: cb }` or
+     * `{ y, cr, cb }`, per-frame `loadOp` (`'clear' | 'load'`), and `zeroCopy: true` to preserve
+     * caller typed-array views without copying 4K payloads.
      *
      * @param {{
      *   width: number,
@@ -591,26 +757,47 @@
      *     y?: Uint8Array|ArrayBufferView|ArrayBuffer,
      *     u?: Uint8Array|ArrayBufferView|ArrayBuffer,
      *     v?: Uint8Array|ArrayBufferView|ArrayBuffer,
+     *     cr?: Uint8Array|ArrayBufferView|ArrayBuffer,
+     *     cb?: Uint8Array|ArrayBufferView|ArrayBuffer,
      *     uv?: Uint8Array|ArrayBufferView|ArrayBuffer,
      *     yPlane?: Uint8Array|ArrayBufferView|ArrayBuffer,
+     *     uPlane?: Uint8Array|ArrayBufferView|ArrayBuffer,
+     *     vPlane?: Uint8Array|ArrayBufferView|ArrayBuffer,
+     *     crPlane?: Uint8Array|ArrayBufferView|ArrayBuffer,
+     *     cbPlane?: Uint8Array|ArrayBufferView|ArrayBuffer,
      *     uvPlane?: Uint8Array|ArrayBufferView|ArrayBuffer,
      *     a?: Uint8Array|ArrayBufferView|ArrayBuffer|null,
      *   },
      *   yPlane?: Uint8Array|ArrayBufferView|ArrayBuffer,
+     *   uPlane?: Uint8Array|ArrayBufferView|ArrayBuffer,
+     *   vPlane?: Uint8Array|ArrayBufferView|ArrayBuffer,
+     *   crPlane?: Uint8Array|ArrayBufferView|ArrayBuffer,
+     *   cbPlane?: Uint8Array|ArrayBufferView|ArrayBuffer,
      *   uvPlane?: Uint8Array|ArrayBufferView|ArrayBuffer,
      *   y?: Uint8Array|ArrayBufferView|ArrayBuffer,
      *   u?: Uint8Array|ArrayBufferView|ArrayBuffer,
      *   v?: Uint8Array|ArrayBufferView|ArrayBuffer,
+     *   cr?: Uint8Array|ArrayBufferView|ArrayBuffer,
+     *   cb?: Uint8Array|ArrayBufferView|ArrayBuffer,
      *   uv?: Uint8Array|ArrayBufferView|ArrayBuffer,
      *   a?: Uint8Array|ArrayBufferView|ArrayBuffer|null,
      *   rgba?: Uint8Array|ArrayBufferView|ArrayBuffer,
      *   yStride?: number,
      *   uvStride?: number,
+     *   uStride?: number,
+     *   vStride?: number,
+     *   crStride?: number,
+     *   cbStride?: number,
      *   aStride?: number,
      *   strideBytes?: number,
      *   timestampMs?: number,
      *   colorSpace?: string,
      *   colorRange?: string,
+     *   chromaOrder?: 'yuv'|'yvu',
+     *   loadOp?: 'clear'|'load',
+     *   zeroCopy?: boolean,
+     *   copyPlanes?: boolean,
+     *   clonePlanes?: boolean,
      *   source?: string,
      *   frameIndex?: number,
      * }} frame
@@ -627,6 +814,10 @@
       const format = normalizePixelFormat(frame.format);
       const colorSpace = normalizeColorSpace(frame.colorSpace);
       const colorRange = normalizeColorRange(frame.colorRange);
+      const explicitChromaOrder = normalizeChromaOrder(frame.chromaOrder);
+      const chromaOrder = explicitChromaOrder || this._chromaOrder;
+      const loadOp = normalizeLoadOp(frame.loadOp);
+      const zeroCopy = resolveZeroCopyOption(frame, this._zeroCopy);
 
       if (frame.planes !== undefined && frame.planes !== null && typeof frame.planes !== 'object') {
         throw new TypeError('pushRawFrame requires a planes object when planes is provided');
@@ -650,6 +841,8 @@
       let ownedPlanes;
       let yStride = null;
       let uvStride = null;
+      let uStride = null;
+      let vStride = null;
       let aStride = null;
       let strideBytes = null;
 
@@ -663,7 +856,7 @@
         if (rgbaInput === undefined || rgbaInput === null) {
           throw new TypeError('RGBA8 frames require planes.rgba');
         }
-        ownedPlanes = { rgba: clonePlaneBytes(rgbaInput, 'planes.rgba') };
+        ownedPlanes = { rgba: acquirePlaneBytes(rgbaInput, 'planes.rgba', zeroCopy) };
         strideBytes = resolveOptionalStride(
           frame.strideBytes,
           planes && planes.strideBytes,
@@ -690,8 +883,8 @@
           throw new TypeError('NV12 frames require yPlane/planes.y and uvPlane/planes.uv');
         }
         ownedPlanes = {
-          y: clonePlaneBytes(yInput, 'yPlane'),
-          uv: clonePlaneBytes(uvInput, 'uvPlane'),
+          y: acquirePlaneBytes(yInput, 'yPlane', zeroCopy),
+          uv: acquirePlaneBytes(uvInput, 'uvPlane', zeroCopy),
         };
         yStride = resolveOptionalStride(frame.yStride, planes && planes.yStride, 'yStride');
         uvStride = resolveOptionalStride(frame.uvStride, planes && planes.uvStride, 'uvStride');
@@ -704,7 +897,7 @@
               : frame.yPlane !== undefined
                 ? frame.yPlane
                 : frame.y;
-        const uInput =
+        const rawUInput =
           planes && planes.u !== undefined
             ? planes.u
             : planes && planes.uPlane !== undefined
@@ -712,7 +905,7 @@
               : frame.uPlane !== undefined
                 ? frame.uPlane
                 : frame.u;
-        const vInput =
+        const rawVInput =
           planes && planes.v !== undefined
             ? planes.v
             : planes && planes.vPlane !== undefined
@@ -720,6 +913,44 @@
               : frame.vPlane !== undefined
                 ? frame.vPlane
                 : frame.v;
+        const rawCrInput =
+          planes && planes.cr !== undefined
+            ? planes.cr
+            : planes && planes.crPlane !== undefined
+              ? planes.crPlane
+              : frame.crPlane !== undefined
+                ? frame.crPlane
+                : frame.cr;
+        const rawCbInput =
+          planes && planes.cb !== undefined
+            ? planes.cb
+            : planes && planes.cbPlane !== undefined
+              ? planes.cbPlane
+              : frame.cbPlane !== undefined
+                ? frame.cbPlane
+                : frame.cb;
+
+        let uInput = rawUInput;
+        let vInput = rawVInput;
+        let usedCrCbAliases = false;
+        if (
+          (uInput === undefined || uInput === null || vInput === undefined || vInput === null) &&
+          rawCrInput !== undefined &&
+          rawCrInput !== null &&
+          rawCbInput !== undefined &&
+          rawCbInput !== null
+        ) {
+          usedCrCbAliases = true;
+          if (chromaOrder === CHROMA_ORDER.YVU) {
+            // Bink2Scarlett native Y/Cr/Cb: first chroma slot (u) holds Cr, second (v) holds Cb.
+            uInput = rawCrInput;
+            vInput = rawCbInput;
+          } else {
+            uInput = rawCbInput;
+            vInput = rawCrInput;
+          }
+        }
+
         if (
           yInput === undefined ||
           yInput === null ||
@@ -731,9 +962,9 @@
           throw new TypeError('YUV frames require planes.y, planes.u, and planes.v');
         }
         ownedPlanes = {
-          y: clonePlaneBytes(yInput, 'planes.y'),
-          u: clonePlaneBytes(uInput, 'planes.u'),
-          v: clonePlaneBytes(vInput, 'planes.v'),
+          y: acquirePlaneBytes(yInput, 'planes.y', zeroCopy),
+          u: acquirePlaneBytes(uInput, 'planes.u', zeroCopy),
+          v: acquirePlaneBytes(vInput, 'planes.v', zeroCopy),
         };
         if (format === PIXEL_FORMAT.YUVA420P) {
           const aInput =
@@ -747,11 +978,31 @@
           if (aInput === undefined || aInput === null) {
             throw new TypeError('YUVA420P frames require planes.a');
           }
-          ownedPlanes.a = clonePlaneBytes(aInput, 'planes.a');
+          ownedPlanes.a = acquirePlaneBytes(aInput, 'planes.a', zeroCopy);
           aStride = resolveOptionalStride(frame.aStride, planes && planes.aStride, 'aStride');
         }
         yStride = resolveOptionalStride(frame.yStride, planes && planes.yStride, 'yStride');
         uvStride = resolveOptionalStride(frame.uvStride, planes && planes.uvStride, 'uvStride');
+        uStride = resolveOptionalStride(frame.uStride, planes && planes.uStride, 'uStride');
+        vStride = resolveOptionalStride(frame.vStride, planes && planes.vStride, 'vStride');
+        if (usedCrCbAliases) {
+          const crStride = resolveOptionalStride(
+            frame.crStride,
+            planes && planes.crStride,
+            'crStride'
+          );
+          const cbStride = resolveOptionalStride(
+            frame.cbStride,
+            planes && planes.cbStride,
+            'cbStride'
+          );
+          if (uStride === null) {
+            uStride = chromaOrder === CHROMA_ORDER.YVU ? crStride : cbStride;
+          }
+          if (vStride === null) {
+            vStride = chromaOrder === CHROMA_ORDER.YVU ? cbStride : crStride;
+          }
+        }
       }
 
       return this._enqueue({
@@ -763,12 +1014,17 @@
         planes: ownedPlanes,
         yStride,
         uvStride,
+        uStride,
+        vStride,
         aStride,
         strideBytes,
         timestampMs:
           typeof timestampMs === 'number' && Number.isFinite(timestampMs) ? timestampMs : null,
         colorSpace,
         colorRange,
+        chromaOrder,
+        loadOp,
+        zeroCopy,
         frameIndex,
         image: null,
       });
@@ -821,6 +1077,8 @@
       assertPositiveInteger(width, 'width');
       assertPositiveInteger(height, 'height');
 
+      const loadOp = normalizeLoadOp(options && options.loadOp);
+
       const frameIndex =
         options && options.frameIndex !== undefined
           ? options.frameIndex
@@ -848,11 +1106,16 @@
         planes: extracted ? { rgba: extracted } : { rgba: null },
         yStride: null,
         uvStride: null,
+        uStride: null,
+        vStride: null,
         aStride: null,
         strideBytes: null,
         timestampMs,
         colorSpace: null,
         colorRange: null,
+        chromaOrder: this._chromaOrder,
+        loadOp,
+        zeroCopy: false,
         frameIndex,
         image: extracted ? null : imageBitmap,
         preferCopyExternal: true,
@@ -868,12 +1131,13 @@
      * @param {number} width
      * @param {number} height
      * @param {number} [frameIndex]
-     * @param {{ timestampMs?: number }} [options]
+     * @param {{ timestampMs?: number, loadOp?: 'clear'|'load' }} [options]
      */
     pushDiagnosticFrame(width, height, frameIndex, options = {}) {
       this._assertNotDestroyed();
       assertPositiveInteger(width, 'width');
       assertPositiveInteger(height, 'height');
+      const loadOp = normalizeLoadOp(options && options.loadOp);
       const index = frameIndex !== undefined ? frameIndex : this._nextFrameIndex;
       assertNonNegativeInteger(index, 'frameIndex');
       if (this._splashSuppressed) {
@@ -887,6 +1151,7 @@
         format: generated.format,
         planes: generated.planes,
         timestampMs: options && options.timestampMs,
+        loadOp,
         source: SPLASH_FRAME_SOURCE.DIAGNOSTIC,
         frameIndex: generated.frameIndex,
       });
@@ -1000,6 +1265,7 @@
           uv: frame.planes.uv,
           width: frame.width,
           height: frame.height,
+          chromaOrder: frame.chromaOrder || this._chromaOrder,
         };
         if (frame.yStride !== null && frame.yStride !== undefined) {
           nv12.yStride = frame.yStride;
@@ -1031,6 +1297,7 @@
         v: frame.planes.v,
         width: frame.width,
         height: frame.height,
+        chromaOrder: frame.chromaOrder || this._chromaOrder,
       };
       if (frame.format === PIXEL_FORMAT.YUVA420P) {
         yuv.a = frame.planes.a;
@@ -1040,6 +1307,12 @@
       }
       if (frame.uvStride !== null && frame.uvStride !== undefined) {
         yuv.uvStride = frame.uvStride;
+      }
+      if (frame.uStride !== null && frame.uStride !== undefined) {
+        yuv.uStride = frame.uStride;
+      }
+      if (frame.vStride !== null && frame.vStride !== undefined) {
+        yuv.vStride = frame.vStride;
       }
       if (frame.aStride !== null && frame.aStride !== undefined) {
         yuv.aStride = frame.aStride;
@@ -1069,9 +1342,15 @@
      * @param {GPUTextureView} targetView
      * @param {number} targetWidth
      * @param {number} targetHeight
-     * @param {number} [nowMs]
+     * @param {number|object} [nowMs]
+     * @param {{
+     *   loadOp?: 'clear'|'load',
+     *   clearColor?: { r: number, g: number, b: number, a: number }|number[],
+     *   storeOp?: 'store'|'discard',
+     *   opacity?: number,
+     * }} [renderOptions]
      */
-    renderFrame(device, targetView, targetWidth, targetHeight, nowMs) {
+    renderFrame(device, targetView, targetWidth, targetHeight, nowMs, renderOptions) {
       this._assertNotDestroyed();
       if (!device || typeof device !== 'object') {
         throw new TypeError('renderFrame requires a WebGPU device');
@@ -1081,6 +1360,22 @@
       }
       assertPositiveInteger(Math.floor(targetWidth), 'targetWidth');
       assertPositiveInteger(Math.floor(targetHeight), 'targetHeight');
+
+      let resolvedNowMs = nowMs;
+      let opts = renderOptions;
+      if (
+        nowMs !== undefined &&
+        nowMs !== null &&
+        typeof nowMs === 'object' &&
+        renderOptions === undefined
+      ) {
+        opts = nowMs;
+        resolvedNowMs = opts.nowMs;
+      }
+      if (opts !== undefined && opts !== null && typeof opts !== 'object') {
+        throw new TypeError('renderFrame options must be an object');
+      }
+      const renderLoadOp = opts ? normalizeLoadOp(opts.loadOp) : null;
 
       if (this._splashSuppressed) {
         if (this._queue.length > 0) {
@@ -1098,8 +1393,8 @@
 
       const presenter = this._ensurePresenter(device);
       const timestamp =
-        typeof nowMs === 'number' && Number.isFinite(nowMs)
-          ? nowMs
+        typeof resolvedNowMs === 'number' && Number.isFinite(resolvedNowMs)
+          ? resolvedNowMs
           : typeof performance !== 'undefined' && typeof performance.now === 'function'
             ? performance.now()
             : Date.now();
@@ -1133,12 +1428,32 @@
         };
       }
 
-      this._uploadFrame(presenter, device, frame);
+      const effectiveChromaOrder =
+        sanitizeChromaOrder(frame.chromaOrder) ||
+        sanitizeChromaOrder(this._chromaOrder) ||
+        CHROMA_ORDER.YUV;
+      const effectiveLoadOp =
+        renderLoadOp ||
+        sanitizeLoadOp(frame.loadOp) ||
+        sanitizeLoadOp(this._loadOp) ||
+        LOAD_OP.CLEAR;
+
+      const uploadResult = this._uploadFrame(presenter, device, frame);
       this._lastSource = frame.source;
       const sanitizedFormat = sanitizeFrameFormat(frame.telemetryFormat || frame.format);
       this._lastFrameFormat = sanitizedFormat;
+      this._lastChromaOrder = effectiveChromaOrder;
+      this._lastLoadOp = effectiveLoadOp;
+      this._lastFrameWidth = frame.width;
+      this._lastFrameHeight = frame.height;
       if (frame.format === PIXEL_FORMAT.NV12) {
         this._nv12FramesForwarded += 1;
+      }
+      if (effectiveChromaOrder === CHROMA_ORDER.YVU) {
+        this._yvuFramesForwarded += 1;
+      }
+      if (frame.zeroCopy) {
+        this._zeroCopyFramesForwarded += 1;
       }
 
       if (typeof device.createCommandEncoder !== 'function') {
@@ -1147,11 +1462,26 @@
       const encoder = device.createCommandEncoder({
         label: 'playgta6-splash-frame-bridge-encoder',
       });
+      const presentOptions = {
+        loadOp: effectiveLoadOp,
+      };
+      if (opts) {
+        if (opts.clearColor !== undefined) {
+          presentOptions.clearColor = opts.clearColor;
+        }
+        if (opts.storeOp !== undefined) {
+          presentOptions.storeOp = opts.storeOp;
+        }
+        if (opts.opacity !== undefined) {
+          presentOptions.opacity = opts.opacity;
+        }
+      }
       const presentResult = presenter.presentFrame(
         encoder,
         targetView,
         targetWidth,
-        targetHeight
+        targetHeight,
+        presentOptions
       );
 
       if (device.queue && typeof device.queue.submit === 'function') {
@@ -1161,10 +1491,23 @@
       }
 
       this._framesPresented += 1;
+      if (effectiveLoadOp === LOAD_OP.LOAD) {
+        this._underlayLoadFramesPresented += 1;
+      }
       if (!this._guestFirstPresent) {
         this._framesBeforeFirstPresent += 1;
       }
       this._releaseQueuedExternal(frame);
+
+      const resolvedChromaOrder =
+        sanitizeChromaOrder(effectiveChromaOrder) ||
+        (uploadResult && sanitizeChromaOrder(uploadResult.chromaOrder)) ||
+        (presentResult && sanitizeChromaOrder(presentResult.chromaOrder)) ||
+        CHROMA_ORDER.YUV;
+      const resolvedLoadOp =
+        sanitizeLoadOp(effectiveLoadOp) ||
+        (presentResult && sanitizeLoadOp(presentResult.loadOp)) ||
+        LOAD_OP.CLEAR;
 
       const presentInfo = {
         frameIndex: frame.frameIndex,
@@ -1176,6 +1519,9 @@
           frame.colorSpace || (presentResult && presentResult.colorSpace) || null,
         colorRange:
           frame.colorRange || (presentResult && presentResult.colorRange) || null,
+        chromaOrder: resolvedChromaOrder,
+        loadOp: resolvedLoadOp,
+        zeroCopy: Boolean(frame.zeroCopy),
         timestampMs:
           frame.timestampMs !== null && frame.timestampMs !== undefined
             ? frame.timestampMs
@@ -1198,6 +1544,9 @@
         framesPresented: this._framesPresented,
         framesBeforeFirstPresent: this._framesBeforeFirstPresent,
         nv12FramesForwarded: this._nv12FramesForwarded,
+        yvuFramesForwarded: this._yvuFramesForwarded,
+        underlayLoadFramesPresented: this._underlayLoadFramesPresented,
+        zeroCopyFramesForwarded: this._zeroCopyFramesForwarded,
         firstPresentSent: this._firstPresentSent,
       };
     }
@@ -1206,6 +1555,8 @@
      * Telemetry snapshot for HUD / BootTracer FIRST_PRESENT wiring.
      */
     getStats() {
+      const chromaOrder = sanitizeChromaOrder(this._chromaOrder) || CHROMA_ORDER.YUV;
+      const loadOp = sanitizeLoadOp(this._loadOp) || LOAD_OP.CLEAR;
       return {
         framesPresented: this._framesPresented,
         droppedFrames: this._droppedFrames,
@@ -1216,14 +1567,55 @@
         framesBeforeFirstPresent: this._framesBeforeFirstPresent,
         lateSplashFramesIgnored: this._lateSplashFramesIgnored,
         nv12FramesForwarded: this._nv12FramesForwarded,
+        yvuFramesForwarded: this._yvuFramesForwarded,
+        underlayLoadFramesPresented: this._underlayLoadFramesPresented,
+        zeroCopyFramesForwarded: this._zeroCopyFramesForwarded,
+        chromaOrder,
+        loadOp,
+        lastChromaOrder: sanitizeChromaOrder(this._lastChromaOrder),
+        lastLoadOp: sanitizeLoadOp(this._lastLoadOp),
+        lastFrameWidth: this._lastFrameWidth,
+        lastFrameHeight: this._lastFrameHeight,
         lastFrameFormat: sanitizeFrameFormat(this._lastFrameFormat),
         lastSource: this._lastSource,
         maxQueueDepth: this._maxQueueDepth,
+        zeroCopy: this._zeroCopy,
         destroyed: this._destroyed,
         presenterStats:
           this._presenter && typeof this._presenter.getStats === 'function'
             ? this._presenter.getStats()
             : null,
+      };
+    }
+
+    /**
+     * Configuration and splash-to-guest handoff state snapshot.
+     */
+    getState() {
+      const chromaOrder = sanitizeChromaOrder(this._chromaOrder) || CHROMA_ORDER.YUV;
+      const loadOp = sanitizeLoadOp(this._loadOp) || LOAD_OP.CLEAR;
+      return {
+        chromaOrder,
+        loadOp,
+        lastChromaOrder: sanitizeChromaOrder(this._lastChromaOrder),
+        lastLoadOp: sanitizeLoadOp(this._lastLoadOp),
+        colorSpace: this._colorSpace,
+        colorRange: this._colorRange,
+        zeroCopy: this._zeroCopy,
+        maxQueueDepth: this._maxQueueDepth,
+        queueDepth: this._queue.length,
+        framesPresented: this._framesPresented,
+        droppedFrames: this._droppedFrames,
+        firstPresentSent: this._firstPresentSent,
+        guestFirstPresent: this._guestFirstPresent,
+        splashSuppressed: this._splashSuppressed,
+        framesBeforeFirstPresent: this._framesBeforeFirstPresent,
+        lateSplashFramesIgnored: this._lateSplashFramesIgnored,
+        lastFrameFormat: sanitizeFrameFormat(this._lastFrameFormat),
+        lastFrameWidth: this._lastFrameWidth,
+        lastFrameHeight: this._lastFrameHeight,
+        lastSource: this._lastSource,
+        destroyed: this._destroyed,
       };
     }
 
@@ -1244,7 +1636,14 @@
       this._framesBeforeFirstPresent = 0;
       this._lateSplashFramesIgnored = 0;
       this._nv12FramesForwarded = 0;
+      this._yvuFramesForwarded = 0;
+      this._underlayLoadFramesPresented = 0;
+      this._zeroCopyFramesForwarded = 0;
       this._lastFrameFormat = null;
+      this._lastChromaOrder = null;
+      this._lastLoadOp = null;
+      this._lastFrameWidth = 0;
+      this._lastFrameHeight = 0;
       this._lastSource = null;
       this._nextFrameIndex = 0;
 
@@ -1308,7 +1707,11 @@
     ALLOWED_FRAME_FORMATS,
     COLOR_SPACE,
     COLOR_RANGE,
+    CHROMA_ORDER,
+    LOAD_OP,
     sanitizeFrameFormat,
+    sanitizeChromaOrder,
+    sanitizeLoadOp,
     generateDiagnosticSplashFrame,
     SplashFrameBridge,
   });

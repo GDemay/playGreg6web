@@ -50,6 +50,14 @@ void test_parse() {
         CHECK(ev[1].buttons == (button::kMoveForward | button::kGamepadA));
         CHECK(ev[2].buttons == button::kMoveLeft && ev[3].buttons == button::kMoveRight);
     }
+    // D-pad and stick clicks.
+    CHECK(parse_input_script("10 DDown\n20 DUp+A\n30 DLeft\n40 DRight\n50 LS+RS\n", ev, error) && ev.size() == 5);
+    if (ev.size() == 5) {
+        CHECK(ev[0].buttons == button::kDPadDown);
+        CHECK(ev[1].buttons == (button::kDPadUp | button::kGamepadA));
+        CHECK(ev[2].buttons == button::kDPadLeft && ev[3].buttons == button::kDPadRight);
+        CHECK(ev[4].buttons == (button::kLeftStickPress | button::kRightStickPress));
+    }
 
     // Malformed lines are refused with their line number.
     CHECK(!parse_input_script("1000 A\nsoon A\n", ev, error) && error.rfind("line 2:", 0) == 0);

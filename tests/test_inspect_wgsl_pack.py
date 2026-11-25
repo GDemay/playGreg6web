@@ -537,5 +537,487 @@ class TestCliAndSanitization(unittest.TestCase):
             self.assertNotIn(sensitive_segment, diff_text)
 
 
+class TestDiffDumpCoverage(unittest.TestCase):
+    """Tests for --diff-dump pipeline dump coverage audit (T45 / #931)."""
+
+    def _write_reflect(self, path: Path, stages: dict[str, str]) -> Path:
+        payload = {
+            "schema": "playgta6-stage-reflection",
+            "version": 1,
+            "stages": {
+                hash_key: {"stage": stage_name, "bindings": []}
+                for hash_key, stage_name in stages.items()
+            },
+        }
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return path
+
+    def test_parse_wgpk_toc_matches_pack_entries_and_errors(self) -> None:
+        raw = wgpk.build_wgpk(
+            [
+                (0x1111, "vertex", MINIMAL_VERTEX_WGSL),
+                (0x2222, "fragment", MINIMAL_FRAGMENT_WGSL),
+                (0x3333, "compute", MINIMAL_COMPUTE_WGSL),
+            ],
+            flags=7,
+        )
+        toc = wgpk.parse_wgpk_toc(raw)
+        self.assertEqual(toc.version, 1)
+        self.assertEqual(toc.flags, 7)
+        self.assertEqual(toc.entry_count, 3)
+        self.assertEqual(toc.hashes, frozenset({0x1111, 0x2222, 0x3333}))
+        self.assertEqual(toc.entries[0].stage, wgpk.ShaderStage.VERTEX)
+        self.assertEqual(toc.entries[1].stage, wgpk.ShaderStage.FRAGMENT)
+        self.assertEqual(toc.entries[2].stage, wgpk.ShaderStage.COMPUTE)
+
+        with self.assertRaises(wgpk.WgpkParseError) as ctx:
+            wgpk.parse_wgpk_toc(b"BAD!" + raw[4:])
+        self.assertEqual(ctx.exception.code, "invalid_magic")
+
+    def test_diff_dump_manifest_native_dxil_dedup_and_auto_reflect(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            pack_path = root / "game.wgsl.pack"
+            reflect_path = Path(f"{pack_path}.reflect.json")
+            dump_dir = root / "live_dump"
+            (dump_dir / "native").mkdir(parents=True)
+            (dump_dir / "dxil").mkdir(parents=True)
+
+            h_vs_in_both = 0x1000000000000001
+            h_ps_pack_only = 0x1000000000000002
+            h_cs_missing_both = 0x1000000000000003
+            h_dxil_vs_in_pack = 0x2000000000000001
+            h_dxil_ps_missing = 0x2000000000000002
+            h_extra_bin_missing = 0x3000000000000001
+
+            pack_path.write_bytes(
+                wgpk.build_wgpk(
+                    [
+                        (h_vs_in_both, "vertex", MINIMAL_VERTEX_WGSL),
+                        (h_ps_pack_only, "fragment", MINIMAL_FRAGMENT_WGSL),
+                        (h_dxil_vs_in_pack, "vertex", MINIMAL_VERTEX_WGSL),
+                        (0x9999999999999999, "compute", MINIMAL_COMPUTE_WGSL),
+                    ]
+                )
+            )
+            self._write_reflect(
+                reflect_path,
+                {
+                    wgpk.format_shader_hash(h_vs_in_both): "vertex",
+                    "0x9999999999999999": "compute",
+                },
+            )
+
+            # Manifest with duplicate code_identity for h_vs_in_both (two metadata layouts)
+            manifest = {
+                "schema": "playgta6-pipeline-dump",
+                "schema_version": 1,
+                "native_stages": [
+                    {
+                        "code_identity": wgpk.format_shader_hash(h_vs_in_both),
+                        "identity": "0xaaaaaaaaaaaaaaaa",
+                        "stage": "vertex",
+                        "layout": "A",
+                        "code_bytes": 16,
+                        "metadata_bytes": 4,
+                        "code_file": f"native/{wgpk.format_shader_hash(h_vs_in_both)}.bin",
+                        "metadata_file": f"native/{wgpk.format_shader_hash(h_vs_in_both)}.meta",
+                    },
+                    {
+                        "code_identity": wgpk.format_shader_hash(h_vs_in_both),
+                        "identity": "0xbbbbbbbbbbbbbbbb",
+                        "stage": "vertex",
+                        "layout": "B",
+                        "code_bytes": 16,
+                        "metadata_bytes": 4,
+                        "code_file": f"native/{wgpk.format_shader_hash(h_vs_in_both)}.bin",
+                        "metadata_file": f"native/{wgpk.format_shader_hash(h_vs_in_both)}-0xbbbbbbbbbbbbbbbb.meta",
+                    },
+                    {
+                        "code_identity": wgpk.format_shader_hash(h_ps_pack_only),
+                        "identity": "0xcccccccccccccccc",
+                        "stage": "pixel",
+                        "layout": "A",
+                        "code_bytes": 16,
+                        "metadata_bytes": 4,
+                        "code_file": f"native/{wgpk.format_shader_hash(h_ps_pack_only)}.bin",
+                        "metadata_file": f"native/{wgpk.format_shader_hash(h_ps_pack_only)}.meta",
+                    },
+                    {
+                        "code_identity": wgpk.format_shader_hash(h_cs_missing_both),
+                        "identity": "0xdddddddddddddddd",
+                        "stage": "compute",
+                        "layout": "A",
+                        "code_bytes": 16,
+                        "metadata_bytes": 4,
+                        "code_file": f"native/{wgpk.format_shader_hash(h_cs_missing_both)}.bin",
+                        "metadata_file": f"native/{wgpk.format_shader_hash(h_cs_missing_both)}.meta",
+                    },
+                ],
+                "dxil": [
+                    {
+                        "identity": wgpk.format_shader_hash(h_dxil_vs_in_pack),
+                        "hash_digest": "",
+                        "kind": 1,
+                        "bytes": 32,
+                        "file": f"dxil/{wgpk.format_shader_hash(h_dxil_vs_in_pack)}.dxbc",
+                    },
+                    {
+                        "identity": wgpk.format_shader_hash(h_dxil_ps_missing),
+                        "hash_digest": "",
+                        "kind": 0,
+                        "bytes": 32,
+                        "file": f"dxil/{wgpk.format_shader_hash(h_dxil_ps_missing)}.dxbc",
+                    },
+                ],
+            }
+            (dump_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+            # Also create an extra native .bin not yet flushed to manifest.json + an ignored .meta
+            (dump_dir / "native" / f"{wgpk.format_shader_hash(h_vs_in_both)}.bin").write_bytes(b"\x00" * 16)
+            (dump_dir / "native" / f"{wgpk.format_shader_hash(h_vs_in_both)}.meta").write_bytes(b"\x00" * 4)
+            (dump_dir / "native" / f"{wgpk.format_shader_hash(h_extra_bin_missing)}.bin").write_bytes(b"\x00" * 16)
+            (dump_dir / "native" / "not_a_hash.bin").write_bytes(b"\x00" * 8)
+
+            report = wgpk.diff_pack_against_dump(pack_path, dump_dir)
+            self.assertTrue(report.manifest_loaded)
+            self.assertTrue(report.reflect_loaded)
+            self.assertEqual(report.reflect_source, "game.wgsl.pack.reflect.json")
+            self.assertEqual(report.pack_entry_count, 4)
+            self.assertEqual(report.reflect_stage_count, 2)
+            self.assertEqual(report.dump_total_stages, 6)
+            self.assertEqual(report.in_pack, 3)
+            self.assertEqual(report.missing_from_pack, 3)
+            self.assertEqual(report.in_reflect, 1)
+            self.assertEqual(report.missing_from_reflect, 5)
+            self.assertEqual(report.in_pack_missing_from_reflect, 2)
+            self.assertFalse(report.clean)
+
+            self.assertEqual(
+                report.by_stage["vertex"],
+                wgpk.StageCoverageCounts(2, 2, 0, 1, 1),
+            )
+            self.assertEqual(
+                report.by_stage["fragment"],
+                wgpk.StageCoverageCounts(2, 1, 1, 0, 2),
+            )
+            self.assertEqual(
+                report.by_stage["compute"],
+                wgpk.StageCoverageCounts(1, 0, 1, 0, 1),
+            )
+            self.assertEqual(
+                report.by_stage["unknown"],
+                wgpk.StageCoverageCounts(1, 0, 1, 0, 1),
+            )
+            self.assertEqual(
+                report.by_origin["native"],
+                wgpk.StageCoverageCounts(4, 2, 2, 1, 3),
+            )
+            self.assertEqual(
+                report.by_origin["dxil"],
+                wgpk.StageCoverageCounts(2, 1, 1, 0, 2),
+            )
+            self.assertEqual(
+                report.sample_missing_pack_hashes,
+                (
+                    wgpk.format_shader_hash(h_cs_missing_both),
+                    wgpk.format_shader_hash(h_dxil_ps_missing),
+                    wgpk.format_shader_hash(h_extra_bin_missing),
+                ),
+            )
+            self.assertEqual(
+                report.sample_missing_reflect_hashes,
+                (
+                    wgpk.format_shader_hash(h_ps_pack_only),
+                    wgpk.format_shader_hash(h_cs_missing_both),
+                    wgpk.format_shader_hash(h_dxil_vs_in_pack),
+                    wgpk.format_shader_hash(h_dxil_ps_missing),
+                    wgpk.format_shader_hash(h_extra_bin_missing),
+                ),
+            )
+
+    def test_diff_dump_scan_native_bins_without_manifest_and_sample_capping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            pack_path = root / "pack.wgsl.pack"
+            dump_dir = root / "raw_dump"
+            native_dir = dump_dir / "native"
+            native_dir.mkdir(parents=True)
+
+            hashes = [0x0000000000000010 + i for i in range(6)]
+            for h in hashes:
+                (native_dir / f"{wgpk.format_shader_hash(h)}.bin").write_bytes(b"\x01\x02\x03\x04")
+                (native_dir / f"{wgpk.format_shader_hash(h)}.meta").write_bytes(b"\x05\x06")
+
+            # Pack contains only the first 2 hashes; no reflect sidecar present.
+            pack_path.write_bytes(
+                wgpk.build_wgpk(
+                    [
+                        (hashes[0], "vertex", MINIMAL_VERTEX_WGSL),
+                        (hashes[1], "fragment", MINIMAL_FRAGMENT_WGSL),
+                    ]
+                )
+            )
+
+            report = wgpk.diff_pack_against_dump(pack_path, dump_dir, max_samples=2)
+            self.assertFalse(report.manifest_loaded)
+            self.assertFalse(report.reflect_loaded)
+            self.assertIsNone(report.reflect_source)
+            self.assertEqual(report.dump_total_stages, 6)
+            self.assertEqual(report.in_pack, 2)
+            self.assertEqual(report.missing_from_pack, 4)
+            self.assertEqual(report.in_reflect, 0)
+            self.assertEqual(report.missing_from_reflect, 6)
+            self.assertEqual(report.by_stage["unknown"].dump_total, 6)
+            self.assertEqual(
+                report.sample_missing_pack_hashes,
+                (wgpk.format_shader_hash(hashes[2]), wgpk.format_shader_hash(hashes[3])),
+            )
+            self.assertEqual(
+                report.sample_missing_reflect_hashes,
+                (wgpk.format_shader_hash(hashes[0]), wgpk.format_shader_hash(hashes[1])),
+            )
+
+            as_dict = report.to_dict()
+            self.assertTrue(as_dict["missing_pack_hashes_truncated"])
+            self.assertTrue(as_dict["missing_reflect_hashes_truncated"])
+
+            # Direct bare native directory works too (with optional stage prefixes)
+            bare_dir = root / "bare_native"
+            bare_dir.mkdir()
+            (bare_dir / f"vs_{wgpk.format_shader_hash(hashes[0])}.bin").write_bytes(b"\x00")
+            (bare_dir / f"ps_{wgpk.format_shader_hash(hashes[1])}.bin").write_bytes(b"\x00")
+            bare_report = wgpk.diff_pack_against_dump(pack_path, bare_dir, max_samples=0)
+            self.assertEqual(bare_report.dump_total_stages, 2)
+            self.assertEqual(bare_report.in_pack, 2)
+            self.assertEqual(bare_report.missing_from_pack, 0)
+            self.assertTrue(bare_report.clean)
+            self.assertEqual(bare_report.by_stage["vertex"].in_pack, 1)
+            self.assertEqual(bare_report.by_stage["fragment"].in_pack, 1)
+            self.assertEqual(bare_report.sample_missing_reflect_hashes, ())
+
+    def test_cli_diff_dump_json_text_strict_override_and_sanitization(self) -> None:
+        sensitive_segment = "secret_host_user_9f8e7d"
+        secret_wgsl_marker = "SECRET_WGSL_SOURCE_BYTES_NEVER_LEAK"
+        secret_bin_marker = "SECRET_NATIVE_BLOB_BYTES_NEVER_LEAK"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nested = Path(tmpdir) / sensitive_segment / "private_dir"
+            nested.mkdir(parents=True)
+
+            h_vs = 0x000000000000aa01
+            h_ps = 0x000000000000aa02
+            h_cs = 0x000000000000aa03
+
+            pack_path = nested / "staged.wgsl.pack"
+            pack_path.write_bytes(
+                wgpk.build_wgpk(
+                    [
+                        (h_vs, "vertex", f"// {secret_wgsl_marker}\n" + MINIMAL_VERTEX_WGSL),
+                        (h_ps, "fragment", MINIMAL_FRAGMENT_WGSL),
+                    ]
+                )
+            )
+            auto_reflect = Path(f"{pack_path}.reflect.json")
+            self._write_reflect(auto_reflect, {wgpk.format_shader_hash(h_vs): "vertex"})
+
+            override_reflect = nested / "custom_override.reflect.json"
+            self._write_reflect(
+                override_reflect,
+                {
+                    wgpk.format_shader_hash(h_vs): "vertex",
+                    wgpk.format_shader_hash(h_ps): "fragment",
+                },
+            )
+
+            dump_dir = nested / "chrome_dump_01"
+            (dump_dir / "native").mkdir(parents=True)
+            (dump_dir / "native" / f"{wgpk.format_shader_hash(h_vs)}.bin").write_bytes(
+                secret_bin_marker.encode("utf-8")
+            )
+            (dump_dir / "native" / f"{wgpk.format_shader_hash(h_ps)}.bin").write_bytes(
+                secret_bin_marker.encode("utf-8")
+            )
+            (dump_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "playgta6-pipeline-dump",
+                        "schema_version": 1,
+                        "native_stages": [
+                            {"code_identity": wgpk.format_shader_hash(h_vs), "stage": "vertex"},
+                            {"code_identity": wgpk.format_shader_hash(h_ps), "stage": "pixel"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            # 1. Auto-detected sidecar: h_ps missing from reflect -> non-strict exits 0, strict exits 1
+            code, out, err = _run_cli(
+                ["inspect", str(pack_path), "--diff-dump", str(dump_dir), "--json"]
+            )
+            self.assertEqual(code, 0, msg=err)
+            payload = json.loads(out)
+            self.assertTrue(payload["ok"])
+            self.assertFalse(payload["clean"])
+            self.assertEqual(payload["source"], "staged.wgsl.pack")
+            self.assertEqual(payload["dump_source"], "chrome_dump_01")
+            self.assertEqual(payload["reflect_source"], "staged.wgsl.pack.reflect.json")
+            self.assertEqual(payload["dump_total_stages"], 2)
+            self.assertEqual(payload["in_pack"], 2)
+            self.assertEqual(payload["missing_from_pack"], 0)
+            self.assertEqual(payload["in_reflect"], 1)
+            self.assertEqual(payload["missing_from_reflect"], 1)
+            self.assertEqual(payload["sample_missing_pack_hashes"], [])
+            self.assertEqual(
+                payload["sample_missing_reflect_hashes"],
+                [wgpk.format_shader_hash(h_ps)],
+            )
+            for forbidden in (sensitive_segment, "private_dir", tmpdir, secret_wgsl_marker, secret_bin_marker):
+                self.assertNotIn(forbidden, out)
+
+            code, out_strict, _ = _run_cli(
+                ["inspect", str(pack_path), "--diff-dump", str(dump_dir), "--json", "--strict"]
+            )
+            self.assertEqual(code, 1)
+            self.assertFalse(json.loads(out_strict)["ok"])
+
+            # 2. Explicit --reflect override covers both stages -> --strict exits 0 (also test shorthand CLI!)
+            code, out_override, err = _run_cli(
+                [
+                    str(pack_path),
+                    "--diff-dump",
+                    str(dump_dir),
+                    "--reflect",
+                    str(override_reflect),
+                    "--json",
+                    "--strict",
+                ]
+            )
+            self.assertEqual(code, 0, msg=err)
+            payload_ov = json.loads(out_override)
+            self.assertTrue(payload_ov["ok"])
+            self.assertTrue(payload_ov["clean"])
+            self.assertEqual(payload_ov["reflect_source"], "custom_override.reflect.json")
+            self.assertEqual(payload_ov["in_reflect"], 2)
+            self.assertEqual(payload_ov["missing_from_reflect"], 0)
+            for forbidden in (sensitive_segment, "private_dir", tmpdir, secret_wgsl_marker, secret_bin_marker):
+                self.assertNotIn(forbidden, out_override)
+
+            # 3. Human-readable text mode contains key counts & sanitized basenames only
+            (dump_dir / "native" / f"{wgpk.format_shader_hash(h_cs)}.bin").write_bytes(b"\x00" * 8)
+            code, text_out, err = _run_cli(
+                ["inspect", str(pack_path), "--diff-dump", str(dump_dir), "--max-samples", "5"]
+            )
+            self.assertEqual(code, 0, msg=err)
+            self.assertIn("staged.wgsl.pack vs chrome_dump_01", text_out)
+            self.assertIn("Dump total stages:     3", text_out)
+            self.assertIn("Missing from pack:     1", text_out)
+            self.assertIn(wgpk.format_shader_hash(h_cs), text_out)
+            for forbidden in (sensitive_segment, "private_dir", tmpdir, secret_wgsl_marker, secret_bin_marker):
+                self.assertNotIn(forbidden, text_out)
+
+    def test_cli_diff_dump_errors_are_sanitized(self) -> None:
+        sensitive_segment = "secret_host_user_err_42"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nested = Path(tmpdir) / sensitive_segment / "private_dir"
+            nested.mkdir(parents=True)
+
+            pack_path = nested / "ok.wgsl.pack"
+            pack_path.write_bytes(wgpk.build_wgpk([(0x1, "vertex", MINIMAL_VERTEX_WGSL)]))
+
+            # 1. Missing dump dir
+            missing_dump = nested / "no_such_dump"
+            code, out, _ = _run_cli(
+                ["inspect", str(pack_path), "--diff-dump", str(missing_dump), "--json"]
+            )
+            self.assertEqual(code, 1)
+            payload = json.loads(out)
+            self.assertFalse(payload["ok"])
+            self.assertEqual(payload["errorCode"], "dump_not_found")
+            self.assertEqual(payload["source"], "no_such_dump")
+            self.assertNotIn(sensitive_segment, out)
+            self.assertNotIn(tmpdir, out)
+
+            # 2. Invalid manifest schema
+            bad_manifest_dir = nested / "bad_dump"
+            bad_manifest_dir.mkdir()
+            (bad_manifest_dir / "manifest.json").write_text(
+                json.dumps({"schema": "other-schema", "schema_version": 1}),
+                encoding="utf-8",
+            )
+            code, out, _ = _run_cli(
+                ["inspect", str(pack_path), "--diff-dump", str(bad_manifest_dir), "--json"]
+            )
+            self.assertEqual(code, 1)
+            payload = json.loads(out)
+            self.assertEqual(payload["errorCode"], "invalid_manifest")
+            self.assertNotIn(sensitive_segment, out)
+
+            # 3. Invalid manifest schema_version
+            (bad_manifest_dir / "manifest.json").write_text(
+                json.dumps({"schema": "playgta6-pipeline-dump", "schema_version": 99}),
+                encoding="utf-8",
+            )
+            code, out, _ = _run_cli(
+                ["inspect", str(pack_path), "--diff-dump", str(bad_manifest_dir), "--json"]
+            )
+            self.assertEqual(code, 1)
+            self.assertEqual(json.loads(out)["errorCode"], "invalid_manifest")
+
+            # 4. Missing explicit --reflect sidecar
+            empty_dump = nested / "empty_dump"
+            empty_dump.mkdir()
+            missing_reflect = nested / "missing.reflect.json"
+            code, out, _ = _run_cli(
+                [
+                    "inspect",
+                    str(pack_path),
+                    "--diff-dump",
+                    str(empty_dump),
+                    "--reflect",
+                    str(missing_reflect),
+                    "--json",
+                ]
+            )
+            self.assertEqual(code, 1)
+            payload = json.loads(out)
+            self.assertEqual(payload["errorCode"], "reflect_not_found")
+            self.assertEqual(payload["source"], "missing.reflect.json")
+            self.assertNotIn(sensitive_segment, out)
+
+            # 5. Corrupt --reflect JSON
+            bad_reflect = nested / "bad.reflect.json"
+            bad_reflect.write_text("{not json", encoding="utf-8")
+            code, out, _ = _run_cli(
+                [
+                    "inspect",
+                    str(pack_path),
+                    "--diff-dump",
+                    str(empty_dump),
+                    "--reflect",
+                    str(bad_reflect),
+                    "--json",
+                ]
+            )
+            self.assertEqual(code, 1)
+            self.assertEqual(json.loads(out)["errorCode"], "invalid_reflect_sidecar")
+            self.assertNotIn(sensitive_segment, out)
+
+            # 6. --reflect without --diff-dump -> error
+            code, out, _ = _run_cli(
+                ["inspect", str(pack_path), "--reflect", str(bad_reflect), "--json"]
+            )
+            self.assertEqual(code, 1)
+            self.assertEqual(json.loads(out)["errorCode"], "invalid_argument")
+
+            # 7. Negative --max-samples -> error
+            code, out, _ = _run_cli(
+                ["inspect", str(pack_path), "--diff-dump", str(empty_dump), "--max-samples", "-1", "--json"]
+            )
+            self.assertEqual(code, 1)
+            self.assertEqual(json.loads(out)["errorCode"], "invalid_argument")
+
+
 if __name__ == "__main__":
     unittest.main()

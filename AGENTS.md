@@ -29,6 +29,13 @@ Follow these steps whenever starting a session with a new or returning contribut
    - Run `cargo test --workspace`, `python -m unittest discover -s tests -v`, `node --check` on modified JS files, `node --test tests/*.mjs`, and `ctest` on `runtime/` if CMake is installed.
    - Run `git status` and confirm zero game files, dumps, or `.env` are staged.
 
+## Cross-Contributor Communication (GitHub Issues & PRs)
+Multiple humans and AI agents work on this repository in parallel across tracks (`recomp/`, `runtime/`, `shaders/`, `web/`, `tools/`). Communicate proactively through GitHub Issues and PRs so everyone can move faster without colliding:
+- **Post findings early and often:** When you uncover a blocker, root cause, live boot/replay metric, shader/reflection mismatch, or cross-track contract gap, post a concise comment on the relevant open issue (or file a new issue and cross-reference it with `#<num>`).
+- **Read and reply to active threads:** Check recent comments on related issues before proposing or changing cross-track behavior, answer open questions from other contributors, and clearly note which folders/files you are (and are not) touching.
+- **Coordinate cross-track contracts:** When a fix spans tracks (e.g. `shaders/` reflection ↔ `runtime/gpu/` binding, or `runtime/` ↔ `web/`), propose the minimal JSON/ABI shape on the tracking issue before making breaking changes.
+- **Always stay sanitized:** In all GitHub issues, comments, and PRs, share only counts, hashes, instruction mnemonics, ABI/register offsets, and error summaries — **never** paste copyrighted game files, binary dumps, generated game shaders/IR, or local host paths.
+
 ## Folder Responsibilities
 - `web/` — Browser frontend (`index.html`, `loader.js`), dedicated workers (`web/workers/`), and input bridge (`web/input/`). Keep the main thread non-blocking; require Cross-Origin Isolation (`COOP`/`COEP`) for `SharedArrayBuffer`.
 - `recomp/` — **Rust** static `x86-64 -> LLVM IR -> Wasm64` recompilation pipeline.
