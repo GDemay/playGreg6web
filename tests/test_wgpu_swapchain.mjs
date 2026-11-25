@@ -9,6 +9,7 @@ const {
   COMPATIBLE_VIEW_FORMATS,
   DEFAULT_DEPTH_FORMAT,
   DEFAULT_DROPPED_FRAME_THRESHOLD_MS,
+  TARGET_30FPS_BUDGET_MS,
   DEFAULT_MAX_ERROR_HISTORY,
   DEFAULT_USAGE,
   DROPPED_FRAME_CADENCE_MULTIPLIER,
@@ -2617,4 +2618,268 @@ test('W231 validates onFirstVisibleFrame option, sanitizes invalid inputs, and h
   assert.equal(swapchain.present({ hasVisibleContent: true }), false);
   assert.equal(swapchain.getStats().hasVisibleContent, true);
   assert.equal(swapchain.getStats().firstVisiblePresentIndex, 2);
+});
+
+// ---------------------------------------------------------------------------
+// W286 (#1177): Zero-alloc present blit descriptor reuse, (view, sampler) bind
+// group caching/invalidation, and 30 FPS compliance/jitter/stall telemetry
+// ---------------------------------------------------------------------------
+
+test('W286 reuses pre-allocated blit pass & bind-group descriptors with zero per-frame descriptor allocations in steady-state present()', () => {
+  const { canvas, context, device, events } = createMockWebGpuEnv();
+  attachMockBlitCapabilities(device, events);
+
+  let clockMs = 1000;
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'bgra8unorm',
+    enableDepth: false,
+    nowFn: () => clockMs,
+  });
+  swapchain.configure({ width: 1280, height: 720 });
+  swapchain.configureForStreamFormat('rgb10a2unorm');
+
+  const encoder = createMockCommandEncoder();
+  const view1 = { kind: 'GPUTextureView', id: 'canvas-view-1' };
+  const view2 = { kind: 'GPUTextureView', id: 'canvas-view-2' };
+
+  assert.equal(swapchain.present(encoder, view1), true);
+  const firstPassDesc = encoder.passes[0].desc;
+  const firstAttachments = firstPassDesc.colorAttachments;
+  const firstColorAttachment = firstAttachments[0];
+  const firstClearValue = firstColorAttachment.clearValue;
+  const firstBindGroup = encoder.passes[0].bindGroups[0].bindGroup;
+  const firstBindGroupDesc = device.createdBindGroups[0].desc;
+
+  assert.strictEqual(firstColorAttachment.view, view1);
+  assert.equal(device.createdBindGroups.length, 1);
+
+  // Run 100 steady-state presents at 30 FPS (33ms): every pass reuses exact descriptor objects & bind group.
+  for (let i = 0; i < 100; i += 1) {
+    clockMs += 33;
+    const frameView = i % 2 === 0 ? view2 : view1;
+    assert.equal(swapchain.present(encoder, frameView), true);
+    const pass = encoder.passes[encoder.passes.length - 1];
+    assert.strictEqual(pass.desc, firstPassDesc);
+    assert.strictEqual(pass.desc.colorAttachments, firstAttachments);
+    assert.strictEqual(pass.desc.colorAttachments[0], firstColorAttachment);
+    assert.strictEqual(pass.desc.colorAttachments[0].clearValue, firstClearValue);
+    assert.strictEqual(pass.desc.colorAttachments[0].view, frameView);
+    assert.strictEqual(pass.bindGroups[0].bindGroup, firstBindGroup);
+  }
+
+  assert.equal(device.createdBindGroups.length, 1);
+  assert.equal(device.createdRenderPipelines.length, 1);
+  assert.equal(swapchain.blitCount, 101);
+
+  // Redundant resize/configure no-ops must preserve cached bind group with zero rebuilds.
+  assert.equal(swapchain.resize(1280, 720, 1), false);
+  swapchain.configure({ width: 1280, height: 720, format: 'rgb10a2unorm' });
+  clockMs += 33;
+  assert.equal(swapchain.present(encoder, view1), true);
+  assert.equal(device.createdBindGroups.length, 1);
+
+  // Real resize invalidates bind group, clears stale view ref, and reuses pre-allocated descriptor containers.
+  assert.equal(swapchain.resize(1920, 1080, 1), true);
+  assert.equal(firstColorAttachment.view, null);
+  assert.equal(swapchain._blitBindGroup, null);
+  assert.equal(swapchain._blitBindGroupCache.size, 0);
+
+  clockMs += 33;
+  assert.equal(swapchain.present(encoder, view2), true);
+  assert.equal(device.createdBindGroups.length, 2);
+  assert.strictEqual(device.createdBindGroups[1].desc, firstBindGroupDesc);
+  assert.strictEqual(encoder.passes[encoder.passes.length - 1].desc, firstPassDesc);
+  assert.strictEqual(firstColorAttachment.view, view2);
+});
+
+test('W286 keys cached blit bind groups by (sourceView, sampler) identity and invalidates cleanly on reconfigure, device-loss, and destroy()', async () => {
+  const { canvas, context, device, events, makeDevice } = createMockWebGpuEnv();
+  attachMockBlitCapabilities(device, events);
+
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'bgra8unorm',
+    enableDepth: false,
+  });
+  swapchain.configure({ width: 1280, height: 720 });
+  swapchain.configureForStreamFormat('rgb10a2unorm');
+
+  // Prime pipeline and primary bind group.
+  const enc = createMockCommandEncoder();
+  assert.equal(swapchain.present(enc), true);
+  assert.equal(device.createdBindGroups.length, 1);
+
+  const viewA = swapchain.intermediateTextureView;
+  const sampler1 = swapchain._blitSampler;
+  const viewB = { kind: 'GPUTextureView', id: 'alt-source-view-b' };
+  const sampler2 = { kind: 'GPUSampler', id: 'alt-sampler-2' };
+
+  // Alternating (sourceView, sampler) identities cache independently and hit without rebuilding.
+  const bgA1 = swapchain._ensureBlitBindGroup(viewA, sampler1);
+  const bgB1 = swapchain._ensureBlitBindGroup(viewB, sampler1);
+  const bgA2 = swapchain._ensureBlitBindGroup(viewA, sampler2);
+  assert.equal(device.createdBindGroups.length, 3);
+  assert.notStrictEqual(bgA1, bgB1);
+  assert.notStrictEqual(bgA1, bgA2);
+  assert.notStrictEqual(bgB1, bgA2);
+
+  // Returning to previously seen (view, sampler) pairs hits cache with zero createBindGroup calls.
+  assert.strictEqual(swapchain._ensureBlitBindGroup(viewA, sampler1), bgA1);
+  assert.strictEqual(swapchain._ensureBlitBindGroup(viewB, sampler1), bgB1);
+  assert.strictEqual(swapchain._ensureBlitBindGroup(viewA, sampler2), bgA2);
+  assert.equal(device.createdBindGroups.length, 3);
+
+  // Reconfigure (alphaMode change without resize) cleanly invalidates bind-group cache and target view.
+  swapchain.configure({ alphaMode: 'premultiplied' });
+  assert.equal(swapchain._blitBindGroup, null);
+  assert.equal(swapchain._blitBindGroupCache.size, 0);
+  assert.equal(swapchain._blitColorAttachment.view, null);
+
+  assert.equal(swapchain.present(enc), true);
+  assert.equal(device.createdBindGroups.length, 4);
+
+  // Device loss invalidates bind-group cache, pipeline, and stale view/descriptor references.
+  device.triggerLost({ reason: 'unknown', message: 'simulated gpu reset' });
+  await device.lost;
+  await Promise.resolve();
+  assert.equal(swapchain._blitBindGroup, null);
+  assert.equal(swapchain._blitBindGroupCache.size, 0);
+  assert.equal(swapchain._blitColorAttachment.view, null);
+  assert.equal(swapchain._blitBindGroupEntry0.resource, null);
+  assert.equal(swapchain._blitBindGroupEntry1.resource, null);
+
+  // Recovery rebuilds cleanly on the new device while reusing pre-allocated pass descriptor.
+  const passDescRef = swapchain._blitPassDescriptor;
+  const newDevice = attachMockBlitCapabilities(makeDevice('device-1'), events);
+  swapchain.recover(newDevice, 'rgba8unorm');
+  assert.equal(swapchain.present(enc), true);
+  assert.equal(newDevice.createdBindGroups.length, 1);
+  assert.strictEqual(enc.passes[enc.passes.length - 1].desc, passDescRef);
+
+  // destroy() clears all cached bind groups and descriptor resource/view references.
+  swapchain.destroy();
+  assert.equal(swapchain._blitBindGroup, null);
+  assert.equal(swapchain._blitBindGroupCache.size, 0);
+  assert.equal(swapchain._blitColorAttachment.view, null);
+  assert.equal(swapchain._blitBindGroupEntry0.resource, null);
+  assert.equal(swapchain._blitBindGroupEntry1.resource, null);
+});
+
+test('W286 tracks 30 FPS compliance rate, rolling frameJitterMs, and longestStallMs in getStats() with clean resetStats()', () => {
+  assert.ok(Math.abs(TARGET_30FPS_BUDGET_MS - 1000 / 30) < 1e-12);
+
+  const { canvas, context, device } = createMockWebGpuEnv();
+  let clockMs = 1000;
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'bgra8unorm',
+    nowFn: () => clockMs,
+    frameWindowSize: 4,
+  });
+  swapchain.configure({ width: 1280, height: 720 });
+
+  // Initial state before any frames.
+  let stats = swapchain.getStats();
+  assert.equal(stats.fps30ComplianceRate, 0);
+  assert.equal(stats.frameJitterMs, 0);
+  assert.equal(stats.longestStallMs, 0);
+  assert.equal(swapchain.fps30ComplianceRate, 0);
+  assert.equal(swapchain.frameJitterMs, 0);
+  assert.equal(swapchain.longestStallMs, 0);
+
+  // Frame 1 establishes baseline timestamp (still no inter-frame interval).
+  swapchain.markFrameContent({ hasDraws: true, realPackDraws: 3 });
+  swapchain.recordFramePresented();
+  stats = swapchain.getStats();
+  assert.equal(stats.fps30ComplianceRate, 0);
+  assert.equal(stats.frameJitterMs, 0);
+  assert.equal(stats.longestStallMs, 0);
+  assert.equal(stats.hasVisibleContent, true);
+
+  // Steady 30 FPS boundary intervals (33.333ms and 1000/30ms): 100% compliant, zero stalls.
+  clockMs += 33.333;
+  swapchain.recordFramePresented();
+  clockMs += 1000 / 30;
+  swapchain.recordFramePresented();
+  stats = swapchain.getStats();
+  assert.equal(stats.fps30ComplianceRate, 1);
+  assert.equal(stats.longestStallMs, 0);
+  assert.ok(stats.frameJitterMs >= 0 && stats.frameJitterMs < 1e-3);
+
+  // Reset and feed a known 4-frame window: [16, 33.333, 40, 80] -> 2/4 compliant = 0.5, longestStall = 80.
+  swapchain.resetStats();
+  stats = swapchain.getStats();
+  assert.equal(stats.fps30ComplianceRate, 0);
+  assert.equal(stats.frameJitterMs, 0);
+  assert.equal(stats.longestStallMs, 0);
+  assert.equal(stats.hasVisibleContent, false);
+
+  const deltas = [16, 33.333, 40, 80];
+  swapchain.recordFramePresented(clockMs);
+  for (const dt of deltas) {
+    clockMs += dt;
+    swapchain.recordFramePresented(clockMs);
+  }
+
+  const expectedMean = deltas.reduce((a, b) => a + b, 0) / deltas.length;
+  const expectedStdDev = Math.sqrt(
+    deltas.reduce((acc, dt) => acc + (dt - expectedMean) ** 2, 0) / deltas.length
+  );
+
+  stats = swapchain.getStats();
+  assert.equal(stats.fps30ComplianceRate, 0.5);
+  assert.ok(Math.abs(stats.frameJitterMs - expectedStdDev) < 1e-9);
+  assert.equal(stats.longestStallMs, 80);
+  assert.equal(swapchain.fps30ComplianceRate, 0.5);
+  assert.ok(Math.abs(swapchain.frameJitterMs - expectedStdDev) < 1e-9);
+  assert.equal(swapchain.longestStallMs, 80);
+
+  // Just-over-30fps-budget boundary (33.334ms) is non-compliant; a 120ms spike updates longestStallMs.
+  clockMs += 33.334; // ring: [33.333, 40, 80, 33.334] -> 1/4 compliant = 0.25
+  swapchain.recordFramePresented(clockMs);
+  assert.equal(swapchain.getStats().fps30ComplianceRate, 0.25);
+  assert.equal(swapchain.getStats().longestStallMs, 80);
+
+  clockMs += 120; // ring: [40, 80, 33.334, 120] -> 0/4 compliant = 0, longestStall = 120
+  swapchain.recordFramePresented(clockMs);
+  stats = swapchain.getStats();
+  assert.equal(stats.fps30ComplianceRate, 0);
+  assert.equal(stats.longestStallMs, 120);
+
+  // Rolling eviction: 4 steady 16ms frames recover compliance to 1 and jitter to 0, while longestStallMs stays 120.
+  for (let i = 0; i < 4; i += 1) {
+    clockMs += 16;
+    swapchain.recordFramePresented(clockMs);
+  }
+  stats = swapchain.getStats();
+  assert.equal(stats.fps30ComplianceRate, 1);
+  assert.equal(stats.frameJitterMs, 0);
+  assert.equal(stats.maxFrameMs, 16);
+  assert.equal(stats.longestStallMs, 120);
+
+  // resetStats() clears longestStallMs, compliance, and jitter back to 0 cleanly.
+  swapchain.resetStats();
+  stats = swapchain.getStats();
+  assert.equal(stats.fps30ComplianceRate, 0);
+  assert.equal(stats.frameJitterMs, 0);
+  assert.equal(stats.longestStallMs, 0);
+
+  // New session after resetStats(): 2 steady 20ms intervals -> compliance 1, jitter 0, longestStall 0.
+  clockMs += 100;
+  swapchain.recordFramePresented(clockMs);
+  clockMs += 20;
+  swapchain.recordFramePresented(clockMs);
+  clockMs += 20;
+  swapchain.recordFramePresented(clockMs);
+  stats = swapchain.getStats();
+  assert.equal(stats.fps30ComplianceRate, 1);
+  assert.equal(stats.frameJitterMs, 0);
+  assert.equal(stats.longestStallMs, 0);
 });

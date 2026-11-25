@@ -42,8 +42,10 @@
   const DEFAULT_FRAME_WINDOW = 60;
   const DEFAULT_MAX_ERROR_HISTORY = 32;
   const DEFAULT_DROPPED_FRAME_THRESHOLD_MS = 1000 / 30;
+  const TARGET_30FPS_BUDGET_MS = 1000 / 30;
   const DROPPED_FRAME_CADENCE_MULTIPLIER = 1.5;
   const MAX_VALIDATION_ERROR_MESSAGE_LENGTH = 512;
+  const MAX_BLIT_BIND_GROUP_CACHE = 8;
 
   // WebGPU GPUTextureUsage constants with numeric fallbacks for Node/headless tests.
   const TEXTURE_USAGE_COPY_SRC =
@@ -573,7 +575,32 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       this._blitPipeline = null;
       this._blitPipelineMeta = null;
       this._blitBindGroup = null;
-      this._blitBindGroupMeta = null;
+      this._blitBindGroupMeta = {
+        texture: null,
+        view: null,
+        sampler: null,
+        pipeline: null,
+        device: null,
+      };
+      this._blitBindGroupCache = new Map();
+      this._blitBindGroupEntry0 = { binding: 0, resource: null };
+      this._blitBindGroupEntry1 = { binding: 1, resource: null };
+      this._blitBindGroupDescriptor = {
+        label: 'playgta6-swapchain-blit-bg',
+        layout: undefined,
+        entries: [this._blitBindGroupEntry0, this._blitBindGroupEntry1],
+      };
+      this._blitClearColor = Object.freeze({ r: 0, g: 0, b: 0, a: 1 });
+      this._blitColorAttachment = {
+        view: null,
+        clearValue: this._blitClearColor,
+        loadOp: 'clear',
+        storeOp: 'store',
+      };
+      this._blitPassDescriptor = {
+        label: 'playgta6-swapchain-blit-pass',
+        colorAttachments: [this._blitColorAttachment],
+      };
       this._blitCount = 0;
 
       this._isDeviceLost = false;
@@ -600,6 +627,9 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       this._avgFrameMs = 0;
       this._maxFrameMs = 0;
       this._fps = 0;
+      this._fps30ComplianceRate = 0;
+      this._frameJitterMs = 0;
+      this._longestStallMs = 0;
       this._frameDeltaRing = new Float64Array(frameWindowSize);
       this._frameDeltaHead = 0;
       this._frameDeltaCount = 0;
@@ -677,6 +707,18 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
 
     get maxFrameMs() {
       return this._maxFrameMs;
+    }
+
+    get fps30ComplianceRate() {
+      return this._fps30ComplianceRate;
+    }
+
+    get frameJitterMs() {
+      return this._frameJitterMs;
+    }
+
+    get longestStallMs() {
+      return this._longestStallMs;
     }
 
     get hasVisibleContent() {
@@ -835,7 +877,22 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
 
     _invalidateBlitBindGroup() {
       this._blitBindGroup = null;
-      this._blitBindGroupMeta = null;
+      const meta = this._blitBindGroupMeta;
+      meta.texture = null;
+      meta.view = null;
+      meta.sampler = null;
+      meta.pipeline = null;
+      meta.device = null;
+      if (this._blitBindGroupCache.size > 0) {
+        for (const bySampler of this._blitBindGroupCache.values()) {
+          bySampler.clear();
+        }
+        this._blitBindGroupCache.clear();
+      }
+      this._blitBindGroupDescriptor.layout = undefined;
+      this._blitBindGroupEntry0.resource = null;
+      this._blitBindGroupEntry1.resource = null;
+      this._blitColorAttachment.view = null;
     }
 
     _destroyIntermediateTexture() {
@@ -958,40 +1015,75 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       return this._blitPipeline;
     }
 
-    _ensureBlitBindGroup() {
+    _ensureBlitBindGroup(
+      sourceView = this._intermediateTextureView,
+      sampler = this._blitSampler
+    ) {
+      const pipeline = this._blitPipeline;
+      const device = this._device;
+      const texture =
+        sourceView === this._intermediateTextureView ? this._intermediateTexture : null;
       const meta = this._blitBindGroupMeta;
+
       if (
         this._blitBindGroup &&
-        meta &&
-        meta.texture === this._intermediateTexture &&
-        meta.view === this._intermediateTextureView &&
-        meta.pipeline === this._blitPipeline &&
-        meta.device === this._device
+        meta.view === sourceView &&
+        meta.sampler === sampler &&
+        meta.pipeline === pipeline &&
+        meta.device === device &&
+        meta.texture === texture
       ) {
         return this._blitBindGroup;
       }
 
+      let bySampler = this._blitBindGroupCache.get(sourceView);
+      if (bySampler) {
+        const cached = bySampler.get(sampler);
+        if (cached && cached.pipeline === pipeline && cached.device === device) {
+          this._blitBindGroup = cached.bindGroup;
+          meta.texture = texture;
+          meta.view = sourceView;
+          meta.sampler = sampler;
+          meta.pipeline = pipeline;
+          meta.device = device;
+          return cached.bindGroup;
+        }
+      }
+
       const layout =
-        this._blitPipeline && typeof this._blitPipeline.getBindGroupLayout === 'function'
-          ? this._blitPipeline.getBindGroupLayout(0)
+        pipeline && typeof pipeline.getBindGroupLayout === 'function'
+          ? pipeline.getBindGroupLayout(0)
           : undefined;
 
-      const bindGroup = this._device.createBindGroup({
-        label: 'playgta6-swapchain-blit-bg',
-        layout,
-        entries: [
-          { binding: 0, resource: this._intermediateTextureView },
-          { binding: 1, resource: this._blitSampler },
-        ],
-      });
+      this._blitBindGroupDescriptor.layout = layout;
+      this._blitBindGroupEntry0.resource = sourceView;
+      this._blitBindGroupEntry1.resource = sampler;
+
+      const bindGroup = device.createBindGroup(this._blitBindGroupDescriptor);
+
+      let totalCached = 0;
+      for (const map of this._blitBindGroupCache.values()) {
+        totalCached += map.size;
+      }
+      if (totalCached >= MAX_BLIT_BIND_GROUP_CACHE) {
+        for (const map of this._blitBindGroupCache.values()) {
+          map.clear();
+        }
+        this._blitBindGroupCache.clear();
+        bySampler = undefined;
+      }
+      if (!bySampler) {
+        bySampler = new Map();
+        this._blitBindGroupCache.set(sourceView, bySampler);
+      }
+      bySampler.set(sampler, { pipeline, device, bindGroup });
 
       this._blitBindGroup = bindGroup;
-      this._blitBindGroupMeta = {
-        texture: this._intermediateTexture,
-        view: this._intermediateTextureView,
-        pipeline: this._blitPipeline,
-        device: this._device,
-      };
+      meta.texture = texture;
+      meta.view = sourceView;
+      meta.sampler = sampler;
+      meta.pipeline = pipeline;
+      meta.device = device;
       return bindGroup;
     }
 
@@ -1263,6 +1355,7 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       applied.viewFormatsKey = effectiveViewFormatsKey;
       this._hasAppliedConfig = true;
       this._reconfigureCount += 1;
+      this._invalidateBlitBindGroup();
       this._ensureDepthTexture();
       if (this._usesBlitFallback) {
         this._ensureIntermediateTexture();
@@ -1790,17 +1883,8 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       const pipeline = this._ensureBlitPipeline();
       const bindGroup = this._ensureBlitBindGroup();
 
-      const pass = commandEncoder.beginRenderPass({
-        label: 'playgta6-swapchain-blit-pass',
-        colorAttachments: [
-          {
-            view: targetView,
-            clearValue: { r: 0, g: 0, b: 0, a: 1 },
-            loadOp: 'clear',
-            storeOp: 'store',
-          },
-        ],
-      });
+      this._blitColorAttachment.view = targetView;
+      const pass = commandEncoder.beginRenderPass(this._blitPassDescriptor);
       pass.setPipeline(pipeline);
       pass.setBindGroup(0, bindGroup);
       pass.draw(3);
@@ -2226,17 +2310,33 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
         const count = this._frameDeltaCount;
         let sum = 0;
         let max = 0;
+        let compliant30Count = 0;
         for (let i = 0; i < count; i += 1) {
           const dt = ring[i];
           sum += dt;
           if (dt > max) {
             max = dt;
           }
+          if (dt <= TARGET_30FPS_BUDGET_MS) {
+            compliant30Count += 1;
+          }
         }
         const avg = sum / count;
+        let sumSqDiff = 0;
+        for (let i = 0; i < count; i += 1) {
+          const diff = ring[i] - avg;
+          sumSqDiff += diff * diff;
+        }
+        const rawCompliance = compliant30Count / count;
         this._avgFrameMs = avg;
         this._maxFrameMs = max;
         this._fps = avg > 0 ? 1000 / avg : 0;
+        this._fps30ComplianceRate =
+          rawCompliance < 0 ? 0 : rawCompliance > 1 ? 1 : rawCompliance;
+        this._frameJitterMs = Math.sqrt(sumSqDiff / count);
+        if (deltaMs > TARGET_30FPS_BUDGET_MS && deltaMs > this._longestStallMs) {
+          this._longestStallMs = deltaMs;
+        }
 
         const thresholdMs = this._getDroppedFrameThresholdMs();
         if (explicitDropped || (thresholdMs > 0 && deltaMs > thresholdMs)) {
@@ -2352,6 +2452,9 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
         viewFormats: this._activeViewFormats.slice(),
         viewFormatsFallbackCount: this._viewFormatsFallbackCount,
         blitCount: this._blitCount,
+        fps30ComplianceRate: this._fps30ComplianceRate,
+        frameJitterMs: this._frameJitterMs,
+        longestStallMs: this._longestStallMs,
       };
     }
 
@@ -2390,6 +2493,9 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       this._avgFrameMs = 0;
       this._maxFrameMs = 0;
       this._fps = 0;
+      this._fps30ComplianceRate = 0;
+      this._frameJitterMs = 0;
+      this._longestStallMs = 0;
       this._frameDeltaRing.fill(0);
       this._frameDeltaHead = 0;
       this._frameDeltaCount = 0;
@@ -2556,6 +2662,7 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
     DEFAULT_FRAME_WINDOW,
     DEFAULT_MAX_ERROR_HISTORY,
     DEFAULT_DROPPED_FRAME_THRESHOLD_MS,
+    TARGET_30FPS_BUDGET_MS,
     DROPPED_FRAME_CADENCE_MULTIPLIER,
     MAX_VALIDATION_ERROR_MESSAGE_LENGTH,
     TEXTURE_USAGE_COPY_SRC,
