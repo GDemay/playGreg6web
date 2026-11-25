@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """One-command native boot runner: rebuild what is stale, run `playgta6_boot`, keep the run.
 
-    python tools/run_native_boot.py [--preset smoke|start-screen|long] [--name NAME]
+    python tools/run_native_boot.py [--preset smoke|start-screen|menu-flow|long] [--name NAME]
         [--exe PATH] [--game-dir DIR] [options] [-- extra playgta6_boot options]
 
 What it does, in order:
@@ -19,7 +19,8 @@ What it does, in order:
    program and harness as they are (for a build made elsewhere, e.g. from another checkout).
 2. Run `playgta6_boot --program-dir <program> --name <exe name> --game-dir <game-dir>` with a
    preset or explicit options. Presets: `smoke` (60 s limit, 90 s watchdog), `start-screen`
-   (120 s limit; an input script pressing A for 100 ms once a second from 5 s on), `long`
+   (120 s limit; an input script pressing A for 100 ms once a second from 5 s on), `menu-flow`
+   (240 s limit; A every 2.5 s from 20 s, then D-pad Down, Down, A through LEGAL NOTICES), `long`
    (600 s limit, 630 s watchdog). `--max-ms`, `--watchdog-ms`, `--input-script FILE`,
    `--shader-pack FILE`, `--gpu-capture-frames N` (captures into the run directory),
    `--gpu-capture-payloads`, `--dump-pipelines DIR` and everything after `--` are passed through.
@@ -61,9 +62,10 @@ EXE_SUFFIX = ".exe" if sys.platform == "win32" else ""
 SOURCE_SUFFIXES = {".cpp", ".h", ".hpp", ".c", ".cmake", ".txt", ".rs", ".toml"}
 
 PRESETS: dict[str, dict] = {
-    "smoke": {"max_ms": 60_000, "watchdog_ms": 90_000, "input": False},
-    "start-screen": {"max_ms": 120_000, "watchdog_ms": 150_000, "input": True},
-    "long": {"max_ms": 600_000, "watchdog_ms": 630_000, "input": False},
+    "smoke": {"max_ms": 60_000, "watchdog_ms": 90_000, "input": None},
+    "start-screen": {"max_ms": 120_000, "watchdog_ms": 150_000, "input": "start-screen"},
+    "menu-flow": {"max_ms": 240_000, "watchdog_ms": 270_000, "input": "menu-flow"},
+    "long": {"max_ms": 600_000, "watchdog_ms": 630_000, "input": None},
 }
 INPUT_START_MS = 5_000
 INPUT_PERIOD_MS = 1_000
@@ -191,7 +193,23 @@ def make_plan(repo: Path, build_dir: Path, exe: Path | None, game_dir: Path | No
 # ---------------------------------------------------------------------------
 
 
-def input_script_text(duration_ms: int) -> str:
+def menu_flow_script_text(duration_ms: int) -> str:
+    """The menu-flow preset: past the intro movie (about 20 s) A every 2.5 s through the start
+    screen, loading and UI TEXT SIZE; then D-pad Down, Down, A (the "Next >" entry of LEGAL
+    NOTICES) every 12 s, which lands whatever the exact arrival time; then A every 3 s."""
+    lines = ["# menu-flow (tools/run_native_boot.py): A every 2.5 s from 20 s; Down, Down, A every 12 s",
+             "# from 64 s (LEGAL NOTICES -> Next >); then A every 3 s"]
+    events = [(t, "A", INPUT_HOLD_MS) for t in range(20_000, 60_000, 2_500)]
+    for t in range(64_000, 124_000, 12_000):
+        events += [(t, "DDown", 150), (t + 2_000, "DDown", 150), (t + 4_500, "A", INPUT_HOLD_MS)]
+    events += [(t, "A", INPUT_HOLD_MS) for t in range(130_000, duration_ms, 3_000)]
+    lines += [f"{t} {b} {h}" for t, b, h in events if t < duration_ms]
+    return "\n".join(lines) + "\n"
+
+
+def input_script_text(duration_ms: int, kind: str = "start-screen") -> str:
+    if kind == "menu-flow":
+        return menu_flow_script_text(duration_ms)
     lines = ["# A pressed once a second from 5 s (tools/run_native_boot.py, start-screen preset)"]
     t = INPUT_START_MS
     while t < duration_ms:
@@ -361,7 +379,7 @@ def _run(args, extra: list[str], runner: Runner, env: Mapping[str, str], repo: P
 
     run_dir.mkdir(parents=True, exist_ok=True)
     if preset["input"] and not args.input_script:
-        script_path.write_text(input_script_text(max_ms), encoding="utf-8")
+        script_path.write_text(input_script_text(max_ms, preset["input"]), encoding="utf-8")
     print(f"[run] {run_dir}", file=sys.stderr, flush=True)
     code = runner(cmd, repo, run_dir / "boot.log", watchdog_ms / 1000 + 60)
     report = load_report(run_dir / "boot-report.json")
