@@ -9,6 +9,7 @@ import {
   BOOT_MODE,
   AUDIO_OUTPUT_STATE,
   INDIRECT_DISPATCH_MODE,
+  DOMINANT_BOTTLENECK,
   DEFAULT_MAX_VALIDATION_ERRORS,
   MAX_VALIDATION_ERROR_MESSAGE_LENGTH,
   MAX_GPU_ADAPTER_LABEL_LENGTH,
@@ -17,9 +18,12 @@ import {
   normalizeBootMode,
   normalizeAudioOutputState,
   normalizeIndirectDispatchMode,
+  normalizeDominantBottleneck,
   sanitizeValidationErrorMessage,
   sanitizeScriptedInputPreset,
   sanitizeGpuAdapterLabel,
+  sanitizeFps30ComplianceRate,
+  sanitizeMailboxLanes,
   parseSideModuleProgressLabel,
   formatFpsDisplay,
   formatOnePercentLowFps,
@@ -31,6 +35,10 @@ import {
   formatFirstVisibleFrameMs,
   formatLoadingStatus,
   formatGuestAudioStatus,
+  formatFrameBudgetStatus,
+  formatMemoryStats,
+  formatIoMailboxLanes,
+  formatDiagnosticsSummary,
   setTextIfChanged,
 } from '../web/ui/hud_controller.js';
 import { bootstrapPlayGta6App } from '../web/app_bootstrap.js';
@@ -4127,4 +4135,444 @@ test('W237: guest audio PCM ring counters update via updateAudioStats and update
 
   await sessionController.stop();
   controller.destroy();
+});
+
+// --- W289: 30 FPS Frame-Budget Status, Dominant Bottleneck, JS Heap MB & HTTPFS Mailbox Lanes ---
+
+test('W289: sanitizers and formatters strictly clamp fps30ComplianceRate, allowlist dominantBottleneck, and validate jsHeapUsedMb & mailboxLanes', () => {
+  assert.deepEqual(DOMINANT_BOTTLENECK, {
+    WITHIN_BUDGET: 'within_budget',
+    IO_BOUND: 'io_bound',
+    SHADER_COMPILE_BOUND: 'shader_compile_bound',
+    GPU_BOUND: 'gpu_bound',
+    CPU_BOUND: 'cpu_bound',
+  });
+
+  // fps30ComplianceRate: clamped [0, 1], non-finite/invalid -> null.
+  assert.equal(sanitizeFps30ComplianceRate(0.964), 0.964);
+  assert.equal(sanitizeFps30ComplianceRate(0), 0);
+  assert.equal(sanitizeFps30ComplianceRate(-0), 0);
+  assert.equal(sanitizeFps30ComplianceRate(1), 1);
+  assert.equal(sanitizeFps30ComplianceRate(-0.25), 0);
+  assert.equal(sanitizeFps30ComplianceRate(1.75), 1);
+  assert.equal(sanitizeFps30ComplianceRate('0.85'), 0.85);
+  assert.equal(sanitizeFps30ComplianceRate(null), null);
+  assert.equal(sanitizeFps30ComplianceRate(undefined), null);
+  assert.equal(sanitizeFps30ComplianceRate(''), null);
+  assert.equal(sanitizeFps30ComplianceRate(Number.NaN), null);
+  assert.equal(sanitizeFps30ComplianceRate(Number.POSITIVE_INFINITY), null);
+  assert.equal(sanitizeFps30ComplianceRate(Number.NEGATIVE_INFINITY), null);
+  assert.equal(sanitizeFps30ComplianceRate(true), null);
+  assert.equal(sanitizeFps30ComplianceRate({}), null);
+
+  // dominantBottleneck: strict allowlist.
+  assert.equal(normalizeDominantBottleneck('within_budget'), 'within_budget');
+  assert.equal(normalizeDominantBottleneck('io_bound'), 'io_bound');
+  assert.equal(normalizeDominantBottleneck('shader_compile_bound'), 'shader_compile_bound');
+  assert.equal(normalizeDominantBottleneck('gpu_bound'), 'gpu_bound');
+  assert.equal(normalizeDominantBottleneck('cpu_bound'), 'cpu_bound');
+  assert.equal(normalizeDominantBottleneck('  GPU-BOUND  '), 'gpu_bound');
+  assert.equal(normalizeDominantBottleneck('Shader Compile Bound'), 'shader_compile_bound');
+  assert.equal(normalizeDominantBottleneck('network_bound'), null);
+  assert.equal(normalizeDominantBottleneck('C:\\Users\\secretuser\\gta6.exe'), null);
+  assert.equal(normalizeDominantBottleneck('<script>alert(1)</script>'), null);
+  assert.equal(normalizeDominantBottleneck(''), null);
+  assert.equal(normalizeDominantBottleneck(null), null);
+  assert.equal(normalizeDominantBottleneck(42), null);
+  assert.equal(normalizeDominantBottleneck(true), null);
+
+  // mailboxLanes: positive integer (>= 1) or null.
+  assert.equal(sanitizeMailboxLanes(1), 1);
+  assert.equal(sanitizeMailboxLanes(4), 4);
+  assert.equal(sanitizeMailboxLanes(8n), 8);
+  assert.equal(sanitizeMailboxLanes('6'), 6);
+  assert.equal(sanitizeMailboxLanes(4.9), 4);
+  assert.equal(sanitizeMailboxLanes(0), null);
+  assert.equal(sanitizeMailboxLanes(0n), null);
+  assert.equal(sanitizeMailboxLanes(-3), null);
+  assert.equal(sanitizeMailboxLanes(0.5), null);
+  assert.equal(sanitizeMailboxLanes(Number.NaN), null);
+  assert.equal(sanitizeMailboxLanes(Number.POSITIVE_INFINITY), null);
+  assert.equal(sanitizeMailboxLanes(null), null);
+  assert.equal(sanitizeMailboxLanes(undefined), null);
+  assert.equal(sanitizeMailboxLanes('invalid'), null);
+  assert.equal(sanitizeMailboxLanes(true), null);
+  assert.equal(sanitizeMailboxLanes({}), null);
+
+  // Concise formatters.
+  assert.equal(
+    formatFrameBudgetStatus({ fps30ComplianceRate: 0.964, dominantBottleneck: 'gpu_bound' }),
+    '30 FPS budget: 96.4% (gpu_bound)'
+  );
+  assert.equal(
+    formatFrameBudgetStatus({ fps30ComplianceRate: 1, dominantBottleneck: 'within_budget' }),
+    '30 FPS budget: 100% (within_budget)'
+  );
+  assert.equal(formatFrameBudgetStatus({ fps30ComplianceRate: 0.85 }), '30 FPS budget: 85%');
+  assert.equal(formatFrameBudgetStatus({ dominantBottleneck: 'io_bound' }), '30 FPS budget: io_bound');
+  assert.equal(formatFrameBudgetStatus({}), '');
+  assert.equal(formatFrameBudgetStatus(null), '');
+
+  assert.equal(formatMemoryStats({ jsHeapUsedMb: 256, jsHeapTotalMb: 512 }), 'JS heap: 256 / 512 MB');
+  assert.equal(formatMemoryStats({ jsHeapUsedMb: 42.54 }), 'JS heap: 42.5 MB');
+  assert.equal(formatMemoryStats({ jsHeapTotalMb: 1024 }), 'JS heap: -- / 1024 MB');
+  assert.equal(formatMemoryStats({ jsHeapUsedMb: -5, jsHeapTotalMb: Number.NaN }), '');
+  assert.equal(formatMemoryStats(null), '');
+
+  assert.equal(formatIoMailboxLanes(4), 'I/O lanes: 4');
+  assert.equal(formatIoMailboxLanes({ mailboxLanes: 8 }), 'I/O lanes: 8');
+  assert.equal(formatIoMailboxLanes(0), '');
+  assert.equal(formatIoMailboxLanes(null), '');
+
+  assert.equal(
+    formatDiagnosticsSummary({
+      frameBudget: { fps30ComplianceRate: 0.95, dominantBottleneck: 'within_budget' },
+      memory: { jsHeapUsedMb: 312.4, jsHeapTotalMb: 512 },
+      io: { mailboxLanes: 4 },
+    }),
+    '30 FPS budget: 95% (within_budget) · JS heap: 312.4 / 512 MB · I/O lanes: 4'
+  );
+  assert.equal(formatDiagnosticsSummary({}), '');
+  assert.equal(formatDiagnosticsSummary(null), '');
+});
+
+test('W289: setFrameBudgetStats, setMemoryStats, setIoMailboxLanes, updateGpuStats, updatePerfStats, and updateTelemetry populate getDiagnosticsSnapshot() while preserving getState() and compact primary HUD', async () => {
+  const bootModeBadge = createSpyDisplayElement();
+  const bootStatusEl = createSpyDisplayElement();
+  const framesEl = createSpyDisplayElement();
+  const fpsEl = createSpyDisplayElement();
+  const pillFpsEl = createSpyDisplayElement();
+  const frameBudgetEl = createSpyDisplayElement();
+  const dominantBottleneckEl = createSpyDisplayElement();
+  const memoryStatsEl = createSpyDisplayElement();
+  const ioMailboxLanesEl = createSpyDisplayElement();
+  const diagnosticsSummaryEl = createSpyDisplayElement();
+
+  const sessionController = new RuntimeSessionController({
+    capabilityProbe: async () => createFullCapabilities(),
+    fetchImpl: createMockFetch({ hasWasmBinary: true }),
+    startWasmRuntime: async () => ({ stop() {} }),
+    startSmokeDemo: async () => ({ stop() {} }),
+  });
+
+  const controller = new HudController({
+    hud: createMockHud(),
+    sessionController,
+    bootMode: 'real-wasm64',
+    displayElements: {
+      bootModeBadge,
+      bootStatusEl,
+      framesEl,
+      fpsEl,
+      pillFpsEl,
+      frameBudgetEl,
+      dominantBottleneckEl,
+      memoryStatsEl,
+      ioMailboxLanesEl,
+      diagnosticsSummaryEl,
+    },
+  });
+
+  // Initial defaults are null / '--' and do not clutter compact primary HUD.
+  const initDiag = controller.getDiagnosticsSnapshot();
+  assert.equal(initDiag.fps30ComplianceRate, null);
+  assert.equal(initDiag.dominantBottleneck, null);
+  assert.equal(initDiag.jsHeapUsedMb, null);
+  assert.equal(initDiag.jsHeapTotalMb, null);
+  assert.equal(initDiag.mailboxLanes, null);
+  assert.equal(initDiag.diagnosticsSummaryText, '');
+  assert.equal(frameBudgetEl.textContent, '--');
+  assert.equal(dominantBottleneckEl.textContent, '--');
+  assert.equal(memoryStatsEl.textContent, '--');
+  assert.equal(ioMailboxLanesEl.textContent, '--');
+  assert.equal(diagnosticsSummaryEl.textContent, '--');
+  assert.equal(bootStatusEl.textContent, 'Real Wasm64 Guest');
+
+  // 1. Direct setter calls with sanitization.
+  const fbRes = controller.setFrameBudgetStats({
+    fps30ComplianceRate: 1.25, // clamps to 1
+    dominantBottleneck: 'within_budget',
+  });
+  assert.equal(fbRes.fps30ComplianceRate, 1);
+  assert.equal(fbRes.dominantBottleneck, 'within_budget');
+  assert.equal(fbRes.state, 'ok');
+  assert.equal(frameBudgetEl.textContent, '30 FPS budget: 100% (within_budget)');
+  assert.equal(frameBudgetEl.dataset.fps30ComplianceRate, '1');
+  assert.equal(frameBudgetEl.dataset.dominantBottleneck, 'within_budget');
+  assert.equal(frameBudgetEl.dataset.state, 'ok');
+  assert.equal(dominantBottleneckEl.textContent, 'within_budget');
+  assert.equal(dominantBottleneckEl.dataset.state, 'ok');
+
+  const memRes = controller.setMemoryStats({ jsHeapUsedMb: 248.6, jsHeapTotalMb: 512 });
+  assert.equal(memRes.jsHeapUsedMb, 248.6);
+  assert.equal(memRes.jsHeapTotalMb, 512);
+  assert.equal(memRes.state, 'ok');
+  assert.equal(memoryStatsEl.textContent, 'JS heap: 248.6 / 512 MB');
+  assert.equal(memoryStatsEl.dataset.jsHeapUsedMb, '248.6');
+  assert.equal(memoryStatsEl.dataset.jsHeapTotalMb, '512');
+  assert.equal(memoryStatsEl.dataset.state, 'ok');
+
+  const ioRes = controller.setIoMailboxLanes(4);
+  assert.equal(ioRes.mailboxLanes, 4);
+  assert.equal(ioRes.state, 'ok');
+  assert.equal(ioMailboxLanesEl.textContent, 'I/O lanes: 4');
+  assert.equal(ioMailboxLanesEl.dataset.mailboxLanes, '4');
+  assert.equal(ioMailboxLanesEl.dataset.state, 'ok');
+
+  // Primary top-left HUD elements remain completely unbloated!
+  assert.equal(bootModeBadge.textContent, 'Real Wasm64');
+  assert.equal(bootStatusEl.textContent, 'Real Wasm64 Guest');
+  assert.equal(framesEl.textContent, '0');
+  assert.equal(fpsEl.textContent, '0.0');
+  assert.equal(pillFpsEl.textContent, '0.0 fps');
+
+  // Combined Diagnostics summary + getDiagnosticsSnapshot() + getSnapshot().
+  const diag1 = controller.getDiagnosticsSnapshot();
+  assert.equal(diag1.fps30ComplianceRate, 1);
+  assert.equal(diag1.dominantBottleneck, 'within_budget');
+  assert.equal(diag1.jsHeapUsedMb, 248.6);
+  assert.equal(diag1.jsHeapTotalMb, 512);
+  assert.equal(diag1.mailboxLanes, 4);
+  assert.equal(
+    diag1.diagnosticsSummaryText,
+    '30 FPS budget: 100% (within_budget) · JS heap: 248.6 / 512 MB · I/O lanes: 4'
+  );
+  assert.equal(diagnosticsSummaryEl.textContent, diag1.diagnosticsSummaryText);
+  assert.equal(diagnosticsSummaryEl.dataset.state, 'ok');
+
+  // Dirty-check elides redundant DOM writes on identical setter calls.
+  const writesBeforeSame = frameBudgetEl.counts.textWrites;
+  controller.setFrameBudgetStats({ fps30ComplianceRate: 1, dominantBottleneck: 'within_budget' });
+  assert.equal(frameBudgetEl.counts.textWrites, writesBeforeSame);
+
+  // 2. updateGpuStats accepts frame-budget, memory, and mailboxLanes when present.
+  controller.updateGpuStats({
+    realPackDrawCount: 15,
+    presentCount: 30,
+    fps: 32,
+    fps30ComplianceRate: 0.88,
+    dominantBottleneck: 'shader_compile_bound',
+    jsHeapUsedMb: 1280,
+    mailboxLanes: 1,
+  });
+  const diag2 = controller.getDiagnosticsSnapshot();
+  assert.equal(diag2.fps30ComplianceRate, 0.88);
+  assert.equal(diag2.dominantBottleneck, 'shader_compile_bound');
+  assert.equal(diag2.jsHeapUsedMb, 1280);
+  assert.equal(diag2.mailboxLanes, 1);
+  assert.equal(frameBudgetEl.dataset.state, 'warn');
+  assert.equal(memoryStatsEl.dataset.state, 'warn');
+  assert.equal(ioMailboxLanesEl.dataset.state, 'warn');
+  assert.equal(diagnosticsSummaryEl.dataset.state, 'warn');
+
+  // 3. updatePerfStats accepts both flat and nested perf/memory/io payloads.
+  controller.updatePerfStats({
+    fps: 24,
+    onePercentLowFps: 18.5,
+    p99FrameMs: 44.2,
+    frameBudget: { fps30ComplianceRate: 0.62, dominantBottleneck: 'io_bound' },
+    memory: { usedJSHeapSize: 512 * 1024 * 1024, totalJSHeapSize: 1024 * 1024 * 1024 },
+    io: { mailboxLanes: 8 },
+  });
+  const diag3 = controller.getDiagnosticsSnapshot();
+  assert.equal(diag3.fps30ComplianceRate, 0.62);
+  assert.equal(diag3.dominantBottleneck, 'io_bound');
+  assert.equal(diag3.jsHeapUsedMb, 512);
+  assert.equal(diag3.jsHeapTotalMb, 1024);
+  assert.equal(diag3.mailboxLanes, 8);
+  assert.equal(diag3.telemetry.gpu.onePercentLowFps, 18.5);
+  assert.equal(diag3.telemetry.gpu.p99FrameMs, 44.2);
+  assert.equal(frameBudgetEl.dataset.state, 'err');
+  assert.equal(diagnosticsSummaryEl.dataset.state, 'err');
+
+  // 4. updateTelemetry accepts snake_case & nested httpfs/heap payloads.
+  controller.updateTelemetry({
+    fps30_compliance_rate: 0.972,
+    dominant_bottleneck: 'cpu_bound',
+    heap: { js_heap_used_mb: 190.2, js_heap_total_mb: 384 },
+    httpfs: { mailbox_lanes: 6 },
+  });
+  const diag4 = controller.getDiagnosticsSnapshot();
+  assert.equal(diag4.fps30ComplianceRate, 0.972);
+  assert.equal(diag4.dominantBottleneck, 'cpu_bound');
+  assert.equal(diag4.jsHeapUsedMb, 190.2);
+  assert.equal(diag4.jsHeapTotalMb, 384);
+  assert.equal(diag4.mailboxLanes, 6);
+  assert.equal(frameBudgetEl.textContent, '30 FPS budget: 97.2% (cpu_bound)');
+  assert.equal(memoryStatsEl.textContent, 'JS heap: 190.2 / 384 MB');
+  assert.equal(ioMailboxLanesEl.textContent, 'I/O lanes: 6');
+
+  // 5. Hostile / invalid inputs sanitize safely without throwing or leaking host paths.
+  assert.doesNotThrow(() => {
+    controller.setFrameBudgetStats({
+      fps30ComplianceRate: Number.NaN,
+      dominantBottleneck: 'C:\\Users\\secretuser\\gta6.exe',
+      get evil() {
+        throw new Error('boom');
+      },
+    });
+    controller.setMemoryStats({
+      jsHeapUsedMb: -400,
+      jsHeapTotalMb: Number.POSITIVE_INFINITY,
+    });
+    controller.setIoMailboxLanes(0);
+  });
+  const hostileDiag = controller.getDiagnosticsSnapshot();
+  assert.equal(hostileDiag.fps30ComplianceRate, null);
+  assert.equal(hostileDiag.dominantBottleneck, null);
+  assert.equal(hostileDiag.jsHeapUsedMb, null);
+  assert.equal(hostileDiag.jsHeapTotalMb, null);
+  assert.equal(hostileDiag.mailboxLanes, null);
+  assert.equal(frameBudgetEl.textContent, '--');
+  assert.equal(memoryStatsEl.textContent, '--');
+  assert.equal(ioMailboxLanesEl.textContent, '--');
+  assert.doesNotMatch(JSON.stringify(hostileDiag), /secretuser|gta6\.exe/i);
+
+  // 6. getState() preserves exact 7-key control state contract.
+  assert.deepEqual(Object.keys(controller.getState()).sort(), [
+    'activeProfileId',
+    'boundControlCount',
+    'destroyed',
+    'isRecording',
+    'lastAction',
+    'sessionMode',
+    'sessionState',
+  ]);
+
+  // 7. resetTelemetry and restartSession reset W289 diagnostics cleanly.
+  controller.setFrameBudgetStats({ fps30ComplianceRate: 0.91, dominantBottleneck: 'gpu_bound' });
+  controller.setMemoryStats({ jsHeapUsedMb: 300, jsHeapTotalMb: 600 });
+  controller.setIoMailboxLanes(4);
+  controller.resetTelemetry();
+  assert.equal(controller.getDiagnosticsSnapshot().fps30ComplianceRate, null);
+  assert.equal(controller.getDiagnosticsSnapshot().dominantBottleneck, null);
+  assert.equal(controller.getDiagnosticsSnapshot().jsHeapUsedMb, null);
+  assert.equal(controller.getDiagnosticsSnapshot().mailboxLanes, null);
+
+  controller.setFrameBudgetStats({ fps30ComplianceRate: 0.99, dominantBottleneck: 'within_budget' });
+  controller.setMemoryStats({ jsHeapUsedMb: 420 });
+  controller.setIoMailboxLanes(4);
+  const restartRes = await controller.restartSession({ preferSmoke: false });
+  assert.equal(restartRes.ok, true);
+  const afterRestart = controller.getDiagnosticsSnapshot();
+  assert.equal(afterRestart.fps30ComplianceRate, null);
+  assert.equal(afterRestart.dominantBottleneck, null);
+  assert.equal(afterRestart.jsHeapUsedMb, null);
+  assert.equal(afterRestart.jsHeapTotalMb, null);
+  assert.equal(afterRestart.mailboxLanes, null);
+
+  await sessionController.stop();
+  controller.destroy();
+
+  // After destroy(), setters safely no-op.
+  controller.setFrameBudgetStats({ fps30ComplianceRate: 0.5, dominantBottleneck: 'cpu_bound' });
+  controller.setMemoryStats({ jsHeapUsedMb: 123 });
+  controller.setIoMailboxLanes(4);
+  assert.equal(controller.getDiagnosticsSnapshot().fps30ComplianceRate, null);
+  assert.equal(controller.getDiagnosticsSnapshot().jsHeapUsedMb, null);
+  assert.equal(controller.getDiagnosticsSnapshot().mailboxLanes, null);
+});
+
+test('W289: mounts concise Astryx Diagnostics section inside collapsible diagnostics container and unmounts cleanly on destroy', () => {
+  function makeMockNode(tagName, ownerDocument) {
+    const attrs = new Map();
+    const node = {
+      tagName: tagName.toUpperCase(),
+      className: '',
+      textContent: '',
+      title: '',
+      hidden: false,
+      dataset: {},
+      children: [],
+      parentNode: null,
+      ownerDocument,
+      setAttribute(name, value) {
+        attrs.set(name, String(value));
+      },
+      getAttribute(name) {
+        return attrs.has(name) ? attrs.get(name) : null;
+      },
+      appendChild(child) {
+        child.parentNode = node;
+        node.children.push(child);
+        return child;
+      },
+      removeChild(child) {
+        const idx = node.children.indexOf(child);
+        if (idx !== -1) {
+          node.children.splice(idx, 1);
+          child.parentNode = null;
+        }
+        return child;
+      },
+    };
+    return node;
+  }
+
+  const mockDoc = {
+    createElement(tag) {
+      return makeMockNode(tag, mockDoc);
+    },
+  };
+
+  const collapsibleContent = makeMockNode('div', mockDoc);
+  collapsibleContent.className = 'astryx-collapsible-content';
+  const hudRootEl = makeMockNode('div', mockDoc);
+  hudRootEl.querySelector = (selector) => {
+    if (selector === '#hud-diagnostics-disclosure .astryx-collapsible-content') {
+      return collapsibleContent;
+    }
+    return null;
+  };
+
+  const controller = new HudController({
+    displayElements: { hudRootEl },
+  });
+
+  // Before any W289 telemetry arrives, collapsible Diagnostics stays untouched.
+  assert.equal(collapsibleContent.children.length, 0);
+
+  // Supply W289 telemetry -> mounts single Astryx .diag-group inside collapsible Diagnostics.
+  controller.updateTelemetry({
+    fps30ComplianceRate: 0.964,
+    dominantBottleneck: 'gpu_bound',
+    jsHeapUsedMb: 384.5,
+    jsHeapTotalMb: 768,
+    mailboxLanes: 4,
+  });
+
+  assert.equal(collapsibleContent.children.length, 1);
+  const section = collapsibleContent.children[0];
+  assert.equal(section.className, 'diag-group');
+  assert.equal(section.getAttribute('data-hud-section'), 'w289-diagnostics');
+
+  const kvList = section.children[1];
+  assert.equal(kvList.className, 'kv-list');
+  assert.equal(kvList.children.length, 3);
+
+  const [budgetRow, heapRow, lanesRow] = kvList.children;
+  assert.equal(budgetRow.className, 'kv-row');
+  assert.equal(budgetRow.children[0].className, 'kv-label');
+  assert.equal(budgetRow.children[0].textContent, '30 FPS Budget');
+  assert.equal(budgetRow.children[1].className, 'kv-value');
+  assert.equal(budgetRow.children[1].textContent, '96.4% (gpu_bound)');
+  assert.equal(budgetRow.children[1].dataset.state, 'warn');
+
+  assert.equal(heapRow.children[0].textContent, 'JS Heap');
+  assert.equal(heapRow.children[1].textContent, '384.5 / 768 MB');
+  assert.equal(heapRow.children[1].dataset.state, 'ok');
+
+  assert.equal(lanesRow.children[0].textContent, 'I/O Lanes');
+  assert.equal(lanesRow.children[1].textContent, '4');
+  assert.equal(lanesRow.children[1].dataset.state, 'ok');
+
+  // Subsequent updates reuse the exact same mounted section (no duplicate DOM nodes).
+  controller.setFrameBudgetStats({ fps30ComplianceRate: 1, dominantBottleneck: 'within_budget' });
+  assert.equal(collapsibleContent.children.length, 1);
+  assert.equal(budgetRow.children[1].textContent, '100% (within_budget)');
+  assert.equal(budgetRow.children[1].dataset.state, 'ok');
+
+  // Clean unmount on destroy().
+  controller.destroy();
+  assert.equal(collapsibleContent.children.length, 0);
 });
