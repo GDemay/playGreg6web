@@ -3908,3 +3908,618 @@ test('W253 forwards sanitized WebGPU adapter labels from logs, telemetry, and sm
     await smokeApp.destroy();
   }
 });
+
+test('W261 defaultHoldUntilVisible holds splash until W257 first-visible-frame feeds blackLoadingMs + gpuAdapter, and ?splashHold=0 overrides it cleanly', async () => {
+  const fs = await import('node:fs');
+  const { createRequire } = await import('node:module');
+  const require = createRequire(import.meta.url);
+  const { SplashOverlayController, DISMISS_REASONS } = require('../web/ui/splash_overlay.js');
+  const { BootOrchestrator } = require('../web/runtime/boot_orchestrator.js');
+  const { HudController } = await import('../web/ui/hud_controller.js');
+
+  function makeMockNode(tag = 'div') {
+    const attrs = new Map();
+    const styles = new Map();
+    const node = {
+      tagName: String(tag).toUpperCase(),
+      className: '',
+      hidden: false,
+      textContent: '',
+      innerHTML: '',
+      parentNode: null,
+      children: [],
+      style: {
+        setProperty(k, v) {
+          styles.set(k, String(v));
+        },
+        getPropertyValue(k) {
+          return styles.get(k) || '';
+        },
+      },
+      classList: {
+        add(c) {
+          const set = new Set(String(node.className || '').split(/\s+/).filter(Boolean));
+          set.add(c);
+          node.className = [...set].join(' ');
+        },
+        remove(c) {
+          const set = new Set(String(node.className || '').split(/\s+/).filter(Boolean));
+          set.delete(c);
+          node.className = [...set].join(' ');
+        },
+        contains(c) {
+          return String(node.className || '').split(/\s+/).includes(c);
+        },
+      },
+      setAttribute(k, v) {
+        attrs.set(k, String(v));
+      },
+      getAttribute(k) {
+        return attrs.has(k) ? attrs.get(k) : null;
+      },
+      removeAttribute(k) {
+        attrs.delete(k);
+      },
+      appendChild(child) {
+        child.parentNode = node;
+        node.children.push(child);
+        return child;
+      },
+      removeChild(child) {
+        const idx = node.children.indexOf(child);
+        if (idx >= 0) node.children.splice(idx, 1);
+        child.parentNode = null;
+        return child;
+      },
+      addEventListener() {},
+      removeEventListener() {},
+      querySelector() {
+        return null;
+      },
+    };
+    return node;
+  }
+
+  // Verify web/index.html enables smooth Astryx splash hold by default in real browser boots.
+  const indexHtmlPath = new URL('../web/index.html', import.meta.url);
+  const indexHtml = fs.readFileSync(indexHtmlPath, 'utf8');
+  assert.match(indexHtml, /bootstrapPlayGta6App\(\{[\s\S]*defaultHoldUntilVisible:\s*true/);
+
+  // 1. defaultHoldUntilVisible: true holds splash on FIRST_PRESENT until W257 first-visible-frame arrives.
+  const clock = createClock(1000);
+  const raf = createFakeRaf(clock);
+  const timers = createFakeTimers();
+  const webgpu = createMockWebGpuEnv();
+  const hud = createMockHud();
+  const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+    clock,
+    raf,
+    timers,
+    gpu: webgpu.gpu,
+  });
+  windowObj.location = { origin: 'http://127.0.0.1:8080', search: '' };
+  documentObj.head = makeMockNode('head');
+  documentObj.createElement = (tag) => makeMockNode(tag);
+  documentObj.querySelector = () => null;
+
+  const mockWorker = createFakeEventTarget({
+    postMessage() {},
+    terminate() {},
+  });
+
+  const hudController = new HudController({ hud, now: clock.now });
+  const app = bootstrapPlayGta6App({
+    windowObj,
+    documentObj,
+    navigatorObj,
+    fetchImpl: createMockFetch({
+      ok: true,
+      coopCoep: true,
+      hasWasmBinary: true,
+      pgimUrl: '/boot/guest.pgim',
+      splashImage: '/game/xbs_splash.png',
+    }),
+    canvas: webgpu.canvas,
+    hud,
+    hudController,
+    splashContainer: makeMockNode('div'),
+    SplashOverlayCtor: SplashOverlayController,
+    BootOrchestratorCtor: BootOrchestrator,
+    pgimPreloader: {
+      async preloadBootBundle() {
+        return { pgim: new Uint8Array(4), shaderPackBytes: null, reflectionManifest: null, bytesLoaded: 4 };
+      },
+    },
+    splashOverlayOptions: { fadeMs: 0, visibleFrameFadeMs: 0, nowFn: clock.now },
+    defaultHoldUntilVisible: true,
+    now: clock.now,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+    createWasmWorker() {
+      return mockWorker;
+    },
+  });
+
+  try {
+    assert.equal(app.bootUrlOptions.splashHold, null);
+    assert.equal(app.bootUrlOptions.holdUntilVisible, true);
+    assert.equal(app.splashOverlay.getState().holdUntilVisible, true);
+
+    const started = await app.start();
+    assert.equal(started.ok, true);
+
+    // FIRST_PRESENT arrives -> splash stays visible & held waiting for first-visible-frame.
+    clock.advance(500);
+    mockWorker.dispatch('message', {
+      data: { type: 'first-present', framesPresented: 1 },
+    });
+    assert.equal(app.splashOverlay.getState().holdingForVisibleFrame, true);
+    assert.equal(app.splashOverlay.getState().visible, true);
+    assert.equal(app.splashOverlay.getState().dismissed, false);
+
+    // W257 first-visible-frame arrives with blackLoadingMs & raw gpuAdapter -> updates all 3 targets.
+    mockWorker.dispatch('message', {
+      data: {
+        type: 'first-visible-frame',
+        firstVisibleFrame: true,
+        firstVisibleFrameMs: 4200,
+        firstPresentMs: 500,
+        blackLoadingMs: 3700,
+        gpuAdapter: 'NVIDIA / Turing (C:\\Users\\alice\\nvwgf2umx.dll)',
+        framesPresented: 18,
+        realPackDrawCount: 4,
+      },
+    });
+
+    const summary = app.bootTracer.getSummary();
+    assert.equal(summary.stage, 'FIRST_VISIBLE_FRAME');
+    assert.equal(summary.firstPresentMs, 500);
+    assert.equal(summary.firstVisibleFrameMs, 4200);
+    assert.equal(summary.blackLoadingMs, 3700);
+    assert.equal(summary.gpuAdapter, 'nvidia / turing');
+
+    const splashState = app.splashOverlay.getState();
+    assert.equal(splashState.holdingForVisibleFrame, false);
+    assert.equal(splashState.dismissed, true);
+    assert.equal(splashState.visible, false);
+    assert.equal(splashState.dismissReason, DISMISS_REASONS.FIRST_VISIBLE_FRAME);
+
+    assert.equal(hudController.getGpuAdapter(), 'nvidia / turing');
+    assert.equal(hudController.getTelemetry().gpu.blackLoadingMs, 3700);
+    assert.equal(app.getBootTelemetry().blackLoadingMs, 3700);
+    assert.equal(app.getBootTelemetry().gpuAdapter, 'nvidia / turing');
+    assert.ok(!JSON.stringify(app.getBootTelemetry()).includes('alice'));
+  } finally {
+    hudController.destroy();
+    await app.destroy();
+  }
+
+  // 2. ?splashHold=0 cleanly overrides defaultHoldUntilVisible: true.
+  const optOutClock = createClock(2000);
+  const optOutRaf = createFakeRaf(optOutClock);
+  const optOutTimers = createFakeTimers();
+  const optOutWebgpu = createMockWebGpuEnv();
+  const optOutHost = createMockBrowserHost({
+    clock: optOutClock,
+    raf: optOutRaf,
+    timers: optOutTimers,
+    gpu: optOutWebgpu.gpu,
+  });
+  optOutHost.windowObj.location = { origin: 'http://127.0.0.1:8080', search: '?splashHold=0' };
+  optOutHost.documentObj.head = makeMockNode('head');
+  optOutHost.documentObj.createElement = (tag) => makeMockNode(tag);
+  optOutHost.documentObj.querySelector = () => null;
+  const optOutWorker = createFakeEventTarget({ postMessage() {}, terminate() {} });
+
+  const optOutApp = bootstrapPlayGta6App({
+    windowObj: optOutHost.windowObj,
+    documentObj: optOutHost.documentObj,
+    navigatorObj: optOutHost.navigatorObj,
+    fetchImpl: createMockFetch({
+      ok: true,
+      coopCoep: true,
+      hasWasmBinary: true,
+      pgimUrl: '/boot/guest.pgim',
+    }),
+    canvas: optOutWebgpu.canvas,
+    hud: createMockHud(),
+    splashContainer: makeMockNode('div'),
+    SplashOverlayCtor: SplashOverlayController,
+    BootOrchestratorCtor: BootOrchestrator,
+    pgimPreloader: {
+      async preloadBootBundle() {
+        return { pgim: new Uint8Array(4), shaderPackBytes: null, reflectionManifest: null, bytesLoaded: 4 };
+      },
+    },
+    splashOverlayOptions: { fadeMs: 0, visibleFrameFadeMs: 0, nowFn: optOutClock.now },
+    defaultHoldUntilVisible: true,
+    now: optOutClock.now,
+    setInterval: optOutTimers.setInterval,
+    clearInterval: optOutTimers.clearInterval,
+    createWasmWorker() {
+      return optOutWorker;
+    },
+  });
+
+  try {
+    assert.equal(optOutApp.bootUrlOptions.splashHold, false);
+    assert.equal(optOutApp.bootUrlOptions.holdUntilVisible, false);
+    await optOutApp.start();
+    optOutClock.advance(200);
+    optOutWorker.dispatch('message', { data: { type: 'first-present', framesPresented: 1 } });
+    const st = optOutApp.splashOverlay.getState();
+    assert.equal(st.holdingForVisibleFrame, false);
+    assert.equal(st.dismissed, true);
+    assert.equal(st.visible, false);
+    assert.equal(st.dismissReason, DISMISS_REASONS.FIRST_PRESENT);
+  } finally {
+    await optOutApp.destroy();
+  }
+
+  // 3. Smoke demo under defaultHoldUntilVisible: true transitions past hold cleanly without hanging.
+  const smokeClock = createClock(3000);
+  const smokeRaf = createFakeRaf(smokeClock);
+  const smokeTimers = createFakeTimers();
+  const smokeWebgpu = createMockWebGpuEnv();
+  const smokeHost = createMockBrowserHost({
+    clock: smokeClock,
+    raf: smokeRaf,
+    timers: smokeTimers,
+    gpu: smokeWebgpu.gpu,
+  });
+  smokeHost.windowObj.location = { origin: 'http://127.0.0.1:8080', search: '' };
+  smokeHost.documentObj.head = makeMockNode('head');
+  smokeHost.documentObj.createElement = (tag) => makeMockNode(tag);
+  smokeHost.documentObj.querySelector = () => null;
+
+  const smokeApp = bootstrapPlayGta6App({
+    windowObj: smokeHost.windowObj,
+    documentObj: smokeHost.documentObj,
+    navigatorObj: smokeHost.navigatorObj,
+    fetchImpl: createMockFetch({ ok: true, coopCoep: true, hasWasmBinary: false }),
+    canvas: smokeWebgpu.canvas,
+    hud: createMockHud(),
+    splashContainer: makeMockNode('div'),
+    SplashOverlayCtor: SplashOverlayController,
+    BootOrchestratorCtor: BootOrchestrator,
+    splashOverlayOptions: { fadeMs: 0, visibleFrameFadeMs: 0, nowFn: smokeClock.now },
+    defaultHoldUntilVisible: true,
+    now: smokeClock.now,
+    raf: smokeRaf.raf,
+    cancelRaf: smokeRaf.cancelRaf,
+    setInterval: smokeTimers.setInterval,
+    clearInterval: smokeTimers.clearInterval,
+  });
+
+  try {
+    const res = await smokeApp.start();
+    assert.equal(res.ok, true);
+    assert.equal(smokeApp.splashOverlay.getState().holdingForVisibleFrame, false);
+    assert.equal(smokeApp.splashOverlay.getState().dismissed, true);
+    assert.equal(smokeApp.splashOverlay.getState().visible, false);
+  } finally {
+    await smokeApp.destroy();
+  }
+});
+
+test('W261 first-user-gesture (pointerdown / keydown) unlocks audioEngine once and removes listeners cleanly on destroy()', async () => {
+  function createTrackingTarget(extra = {}) {
+    const listeners = new Map();
+    const registrations = [];
+    return {
+      ...extra,
+      registrations,
+      addEventListener(type, fn, opts) {
+        registrations.push({ type, opts: opts ? { ...opts } : null });
+        if (!listeners.has(type)) {
+          listeners.set(type, new Set());
+        }
+        listeners.get(type).add({ fn, once: Boolean(opts && opts.once) });
+      },
+      removeEventListener(type, fn) {
+        const set = listeners.get(type);
+        if (!set) return;
+        for (const entry of set) {
+          if (entry.fn === fn) {
+            set.delete(entry);
+          }
+        }
+      },
+      dispatch(type, event = {}) {
+        const set = listeners.get(type);
+        if (!set) return;
+        for (const entry of [...set]) {
+          if (entry.once) {
+            set.delete(entry);
+          }
+          entry.fn({ type, ...event });
+        }
+      },
+      listenerCount(type) {
+        if (type) {
+          return listeners.get(type)?.size ?? 0;
+        }
+        let total = 0;
+        for (const set of listeners.values()) {
+          total += set.size;
+        }
+        return total;
+      },
+    };
+  }
+
+  // 1. pointerdown calls unlockOnUserGesture() once with { passive: true, once: true } and disarms keydown too.
+  {
+    const clock = createClock(1000);
+    const raf = createFakeRaf(clock);
+    const timers = createFakeTimers();
+    const webgpu = createMockWebGpuEnv();
+    const windowObj = createTrackingTarget({
+      crossOriginIsolated: true,
+      innerWidth: 800,
+      innerHeight: 600,
+      devicePixelRatio: 1,
+      location: { origin: 'http://127.0.0.1:8080', search: '' },
+      localStorage: createMemoryStorage(),
+      requestAnimationFrame: raf.raf,
+      cancelAnimationFrame: raf.cancelRaf,
+      setInterval: timers.setInterval,
+      clearInterval: timers.clearInterval,
+    });
+    const documentObj = createTrackingTarget({ pointerLockElement: null });
+    let unlockCalls = 0;
+    let resumeCalls = 0;
+    const mockAudioEngine = {
+      sab: null,
+      state: 'suspended',
+      async unlockOnUserGesture() {
+        unlockCalls += 1;
+        this.state = 'running';
+        return true;
+      },
+      async resume() {
+        resumeCalls += 1;
+        return true;
+      },
+      async destroy() {
+        this.state = 'closed';
+      },
+    };
+
+    const app = bootstrapPlayGta6App({
+      windowObj,
+      documentObj,
+      navigatorObj: { gpu: webgpu.gpu, getGamepads: () => [] },
+      fetchImpl: createMockFetch({ ok: true, hasWasmBinary: false }),
+      canvas: webgpu.canvas,
+      hud: createMockHud(),
+      audioEngine: mockAudioEngine,
+      now: clock.now,
+      setInterval: timers.setInterval,
+      clearInterval: timers.clearInterval,
+    });
+
+    try {
+      const pointerReg = windowObj.registrations.find(
+        (r) => r.type === 'pointerdown' && r.opts && r.opts.once === true
+      );
+      const keyReg = windowObj.registrations.find(
+        (r) => r.type === 'keydown' && r.opts && r.opts.once === true
+      );
+      assert.deepEqual(pointerReg?.opts, { passive: true, once: true });
+      assert.deepEqual(keyReg?.opts, { passive: true, once: true });
+
+      const keydownBefore = windowObj.listenerCount('keydown');
+      assert.equal(windowObj.listenerCount('pointerdown'), 1);
+
+      windowObj.dispatch('pointerdown');
+      assert.equal(unlockCalls, 1);
+      assert.equal(resumeCalls, 0);
+      assert.equal(windowObj.listenerCount('pointerdown'), 0);
+      assert.equal(windowObj.listenerCount('keydown'), keydownBefore - 1);
+
+      // Subsequent gestures must not re-invoke unlock.
+      windowObj.dispatch('pointerdown');
+      windowObj.dispatch('keydown', { code: 'KeyW' });
+      assert.equal(unlockCalls, 1);
+      assert.equal(resumeCalls, 0);
+    } finally {
+      await app.destroy();
+    }
+    assert.equal(windowObj.listenerCount(), 0);
+    assert.equal(documentObj.listenerCount(), 0);
+  }
+
+  // 2. keydown falls back to audioEngine.resume() once when unlockOnUserGesture/unlockOnGesture are absent.
+  {
+    const clock = createClock(2000);
+    const raf = createFakeRaf(clock);
+    const timers = createFakeTimers();
+    const webgpu = createMockWebGpuEnv();
+    const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+      clock,
+      raf,
+      timers,
+      gpu: webgpu.gpu,
+    });
+    let resumeCalls = 0;
+    const resumeOnlyAudio = {
+      sab: null,
+      state: 'suspended',
+      async resume() {
+        resumeCalls += 1;
+        this.state = 'running';
+        return true;
+      },
+      async destroy() {
+        this.state = 'closed';
+      },
+    };
+
+    const app = bootstrapPlayGta6App({
+      windowObj,
+      documentObj,
+      navigatorObj,
+      fetchImpl: createMockFetch({ ok: true, hasWasmBinary: false }),
+      canvas: webgpu.canvas,
+      hud: createMockHud(),
+      audioEngine: resumeOnlyAudio,
+      now: clock.now,
+      setInterval: timers.setInterval,
+      clearInterval: timers.clearInterval,
+    });
+
+    try {
+      assert.equal(windowObj.listenerCount('pointerdown'), 1);
+      windowObj.dispatch('keydown', { code: 'Space' });
+      assert.equal(resumeCalls, 1);
+      assert.equal(windowObj.listenerCount('pointerdown'), 0);
+
+      // Second gesture is a no-op.
+      windowObj.dispatch('keydown', { code: 'KeyE' });
+      windowObj.dispatch('pointerdown');
+      assert.equal(resumeCalls, 1);
+    } finally {
+      await app.destroy();
+    }
+    assert.equal(windowObj.listenerCount(), 0);
+    assert.equal(documentObj.listenerCount(), 0);
+  }
+
+  // 3. Real AudioEngine with mocked AudioContext + AudioWorkletNode lazily starts and unlocks on first pointerdown.
+  {
+    const clock = createClock(3000);
+    const raf = createFakeRaf(clock);
+    const timers = createFakeTimers();
+    const webgpu = createMockWebGpuEnv();
+    let resumeCount = 0;
+    let addModuleCount = 0;
+    class MockAudioContext {
+      constructor() {
+        this.state = 'suspended';
+        this.sampleRate = 48000;
+        this.currentTime = 0;
+        this.destination = { kind: 'destination' };
+        this.audioWorklet = {
+          async addModule() {
+            addModuleCount += 1;
+          },
+        };
+      }
+      createGain() {
+        return {
+          gain: {
+            value: 1,
+            setValueAtTime(v) {
+              this.value = v;
+            },
+            linearRampToValueAtTime(v) {
+              this.value = v;
+            },
+            cancelScheduledValues() {},
+          },
+          connect() {},
+          disconnect() {},
+        };
+      }
+      async resume() {
+        resumeCount += 1;
+        this.state = 'running';
+      }
+      async close() {
+        this.state = 'closed';
+      }
+    }
+    class MockAudioWorkletNode {
+      constructor() {
+        this.port = { postMessage() {}, close() {} };
+      }
+      connect() {}
+      disconnect() {}
+    }
+
+    const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+      clock,
+      raf,
+      timers,
+      gpu: webgpu.gpu,
+    });
+    windowObj.AudioContext = MockAudioContext;
+    windowObj.AudioWorkletNode = MockAudioWorkletNode;
+
+    const app = bootstrapPlayGta6App({
+      windowObj,
+      documentObj,
+      navigatorObj,
+      fetchImpl: createMockFetch({ ok: true, hasWasmBinary: false }),
+      canvas: webgpu.canvas,
+      hud: createMockHud(),
+      now: clock.now,
+      setInterval: timers.setInterval,
+      clearInterval: timers.clearInterval,
+    });
+
+    try {
+      assert.equal(app.audioEngine.state, 'idle');
+      windowObj.dispatch('pointerdown');
+      // Let lazy AudioEngine.start() + unlockOnGesture() promises settle cleanly.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      assert.equal(addModuleCount, 1);
+      assert.equal(resumeCount, 1);
+      assert.equal(app.audioEngine.state, 'running');
+      assert.equal(app.audioEngine.getStats().unlockedOnGesture, true);
+    } finally {
+      await app.destroy();
+    }
+    assert.equal(windowObj.listenerCount(), 0);
+    assert.equal(documentObj.listenerCount(), 0);
+  }
+
+  // 4. destroy() before any user gesture removes pointerdown/keydown listeners cleanly and prevents late unlock.
+  {
+    const clock = createClock(4000);
+    const raf = createFakeRaf(clock);
+    const timers = createFakeTimers();
+    const webgpu = createMockWebGpuEnv();
+    const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+      clock,
+      raf,
+      timers,
+      gpu: webgpu.gpu,
+    });
+    let unlockCalls = 0;
+    const mockAudioEngine = {
+      sab: null,
+      state: 'suspended',
+      async unlockOnUserGesture() {
+        unlockCalls += 1;
+        return true;
+      },
+      async destroy() {
+        this.state = 'closed';
+      },
+    };
+
+    const app = bootstrapPlayGta6App({
+      windowObj,
+      documentObj,
+      navigatorObj,
+      fetchImpl: createMockFetch({ ok: true, hasWasmBinary: false }),
+      canvas: webgpu.canvas,
+      hud: createMockHud(),
+      audioEngine: mockAudioEngine,
+      now: clock.now,
+      setInterval: timers.setInterval,
+      clearInterval: timers.clearInterval,
+    });
+
+    assert.equal(windowObj.listenerCount('pointerdown'), 1);
+    await app.destroy();
+    assert.equal(windowObj.listenerCount(), 0);
+    assert.equal(documentObj.listenerCount(), 0);
+
+    windowObj.dispatch('pointerdown');
+    windowObj.dispatch('keydown', { code: 'Enter' });
+    assert.equal(unlockCalls, 0);
+  }
+});
