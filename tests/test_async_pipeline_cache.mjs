@@ -1,4 +1,5 @@
-// W203: concurrency throttling, priority-lane deduplication & stall telemetry tests
+// W203 / W263: concurrency throttling, canonical coalescing, priority-lane scheduling,
+// device-loss recovery, bounded compile-latency percentiles & stall telemetry tests
 // for web/workers/async_pipeline_cache.js.
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -12,9 +13,12 @@ const {
   DEFAULT_MAX_CONCURRENT_PIPELINES,
   DEFAULT_PIPELINE_PRIORITY,
   DEFAULT_COMPILE_STALL_THRESHOLD_MS,
+  DEFAULT_COMPILE_LATENCY_RING_SIZE,
   PIPELINE_KIND,
   PIPELINE_PRIORITY_LANE,
   PIPELINE_STATUS,
+  canonicalizePipelineKey,
+  isDeviceLostError,
 } = require('../web/workers/async_pipeline_cache.js');
 
 const unhandledRejections = [];
@@ -520,5 +524,355 @@ test('W203: classic Web Worker UMD export attaches PlayGta6AsyncPipelineCache wi
   assert.equal(typeof instance.getTelemetry, 'function');
   assert.equal(typeof instance.promote, 'function');
   assert.equal(typeof instance.setMaxConcurrentCompiles, 'function');
+  assert.equal(typeof instance.resetStats, 'function');
+  assert.equal(exported.DEFAULT_COMPILE_LATENCY_RING_SIZE, 128);
+  assert.equal(typeof exported.canonicalizePipelineKey, 'function');
+  assert.equal(typeof exported.isDeviceLostError, 'function');
+  assert.equal(exported.PIPELINE_PRIORITY_LANE.DEMAND, 100);
+  assert.equal(exported.PIPELINE_PRIORITY_LANE.WARMUP, -10);
+  assert.deepEqual(unhandledRejections, []);
+});
+
+test('W263: canonical key coalescing prevents duplicate concurrent render/compute compiles and tracks coalescedCompiles', async () => {
+  class MockShaderModule {
+    constructor(name) {
+      this.name = name;
+    }
+  }
+  const vsMod = new MockShaderModule('vs_main');
+  const fsMod = new MockShaderModule('fs_main');
+  const csMod = new MockShaderModule('cs_main');
+  const otherVsMod = new MockShaderModule('vs_other');
+
+  // Verify deterministic canonicalization regardless of object key order, opaque modules, or cycles.
+  const keyA = canonicalizePipelineKey({ vs: vsMod, fs: fsMod, targets: [{ format: 'bgra8unorm', blend: null }] });
+  const keyB = canonicalizePipelineKey({ targets: [{ blend: null, format: 'bgra8unorm' }], fs: fsMod, vs: vsMod });
+  const keyC = canonicalizePipelineKey({ vs: otherVsMod, fs: fsMod, targets: [{ format: 'bgra8unorm', blend: null }] });
+  assert.equal(keyA, keyB);
+  assert.notEqual(keyA, keyC);
+
+  const cyclic = { name: 'cycle' };
+  cyclic.self = cyclic;
+  assert.equal(typeof canonicalizePipelineKey(cyclic), 'string');
+
+  const device = createManualDevice();
+  const cache = new AsyncPipelineCache({ device, maxConcurrentCompiles: 4 });
+
+  // Concurrent render compiles using equivalent structured canonicalKey objects (different property order).
+  const r1 = cache.compileRenderPipeline(
+    'render_1',
+    { label: 'draw_1' },
+    { canonicalKey: { vs: vsMod, fs: fsMod, format: 'bgra8unorm', topology: 'triangle-list' } },
+  );
+  const r2 = cache.compileRenderPipeline(
+    'render_2',
+    { label: 'draw_2' },
+    { canonicalKey: { topology: 'triangle-list', format: 'bgra8unorm', fs: fsMod, vs: vsMod } },
+  );
+  const r1SameId = cache.compileRenderPipeline(
+    'render_1',
+    { label: 'draw_1_repeat' },
+    { canonicalKey: { vs: vsMod, fs: fsMod, format: 'bgra8unorm', topology: 'triangle-list' } },
+  );
+
+  // Concurrent compute compiles using the same canonicalKey shape stay isolated in compute namespace.
+  const c1 = cache.compileComputePipeline(
+    'compute_1',
+    { label: 'cs_1' },
+    { canonicalKey: { cs: csMod, entry: 'cs_main' } },
+  );
+  const c2 = cache.compileComputePipeline(
+    'compute_2',
+    { label: 'cs_2' },
+    { canonicalKey: { entry: 'cs_main', cs: csMod } },
+  );
+
+  assert.strictEqual(r1SameId, r1);
+  assert.equal(device.calls.length, 2, 'Tint only compiles 1 render + 1 compute PSO concurrently');
+  assert.equal(cache.getStats().activeCompiles, 2);
+  assert.equal(cache.getStats().coalescedCompiles, 3, 'r2 + r1SameId + c2 coalesced');
+  assert.equal(cache.getTelemetry().coalescedCompiles, 3);
+
+  device.calls[0].resolve();
+  device.calls[1].resolve();
+  const [resR1, resR2, resC1, resC2] = await Promise.all([r1, r2, c1, c2]);
+  await cache.whenIdle();
+
+  assert.strictEqual(resR1.pipeline, resR2.pipeline);
+  assert.strictEqual(resC1.pipeline, resC2.pipeline);
+  assert.notStrictEqual(resR1.pipeline, resC1.pipeline);
+
+  // Post-completion cache reuse hits dedupeHits without inflating concurrent coalescedCompiles.
+  const r3 = await cache.compileRenderPipeline(
+    'render_3',
+    { label: 'draw_3' },
+    { canonicalKey: { format: 'bgra8unorm', fs: fsMod, topology: 'triangle-list', vs: vsMod } },
+  );
+  assert.strictEqual(r3.pipeline, resR1.pipeline);
+  assert.equal(device.calls.length, 2);
+  assert.equal(cache.getStats().coalescedCompiles, 3);
+  assert.equal(cache.getStats().dedupeHits, 3);
+
+  // Opt-in coalesceByDescriptor ignores cosmetic top-level label and coalesces identical descriptors.
+  const descDevice = createManualDevice();
+  const descCache = new AsyncPipelineCache({
+    device: descDevice,
+    maxConcurrentCompiles: 4,
+    coalesceByDescriptor: true,
+  });
+  const d1 = descCache.compileRenderPipeline('d1', {
+    label: 'pass_a',
+    layout: 'auto',
+    vertex: { module: vsMod, entryPoint: 'vs_main' },
+    fragment: { module: fsMod, entryPoint: 'fs_main', targets: [{ format: 'bgra8unorm' }] },
+  });
+  const d2 = descCache.compileRenderPipeline('d2', {
+    label: 'pass_b',
+    fragment: { targets: [{ format: 'bgra8unorm' }], entryPoint: 'fs_main', module: fsMod },
+    vertex: { entryPoint: 'vs_main', module: vsMod },
+    layout: 'auto',
+  });
+  assert.equal(descDevice.calls.length, 1, 'identical descriptors with different labels coalesce');
+  assert.equal(descCache.getStats().coalescedCompiles, 1);
+  descDevice.calls[0].resolve();
+  const [rd1, rd2] = await Promise.all([d1, d2]);
+  assert.strictEqual(rd1.pipeline, rd2.pipeline);
+});
+
+test('W263: bounded concurrency prioritizes demand draws ahead of background warmups and promotes coalesced warmups', async () => {
+  const device = createManualDevice();
+  const cache = new AsyncPipelineCache({ device, maxConcurrentCompiles: 2 });
+
+  // Fill both active compile slots.
+  const active0 = cache.compileRenderPipeline('active_0', { label: 'active_0' });
+  const active1 = cache.compileRenderPipeline('active_1', { label: 'active_1' });
+
+  // Queue 3 speculative/background warmups.
+  const warm0 = cache.compileRenderPipeline('warm_0', { label: 'warm_0' }, { warmup: true, canonicalKey: 'warm-0' });
+  const warm1 = cache.compileRenderPipeline('warm_1', { label: 'warm_1' }, { priority: 'warmup', canonicalKey: 'warm-1' });
+  const warm2 = cache.compileComputePipeline('warm_2', { label: 'warm_2' }, { lane: 'speculative', canonicalKey: 'warm-2' });
+
+  // A visible demand draw arrives for a brand-new PSO AND another demand draw hits queued warm_1!
+  const demandNew = cache.compileRenderPipeline('demand_new', { label: 'demand_new' }, { demand: true });
+  const demandHitWarm1 = cache.compileRenderPipeline(
+    'demand_warm1_draw',
+    { label: 'warm_1' },
+    { canonicalKey: 'warm-1', priority: 'demand' },
+  );
+
+  assert.equal(device.calls.length, 2, 'strictly respects maxConcurrentCompiles=2');
+  assert.equal(cache.getStats().activeCompiles, 2);
+  assert.equal(cache.getStats().coalescedCompiles, 1);
+  assert.equal(cache.getTelemetry().queueByLane.urgent, 2);
+  assert.equal(cache.getTelemetry().queueByLane.background, 2);
+
+  // Drain all slots while checking concurrency cap at every step.
+  let idx = 0;
+  while (idx < device.calls.length) {
+    assert.ok(device.inFlight <= 2, `concurrency cap violated: ${device.inFlight}`);
+    device.calls[idx].resolve();
+    idx += 1;
+    await tick();
+  }
+  await Promise.all([active0, active1, warm0, warm1, warm2, demandNew, demandHitWarm1]);
+  await cache.whenIdle();
+
+  // warm_1 (seq 4, promoted to demand) and demand_new (seq 6, demand) MUST dispatch ahead of warm_0 and warm_2!
+  assert.deepEqual(
+    device.calls.map((c) => c.descriptor.label),
+    ['active_0', 'active_1', 'warm_1', 'demand_new', 'warm_0', 'warm_2'],
+  );
+  assert.equal(device.peakInFlight, 2);
+  assert.equal(cache.getStats().activeCompiles, 0);
+});
+
+test('W263: device-loss and compile rejections remove failed in-flight keys, increment compileErrors, allow recovery, and leak zero unhandled rejections', async () => {
+  assert.equal(isDeviceLostError(new Error('GPUDevice lost during compile')), true);
+  assert.equal(isDeviceLostError({ reason: 'destroyed', message: 'destroyed' }), true);
+  assert.equal(isDeviceLostError(new Error('WGSL syntax error')), false);
+
+  const errors = [];
+  const device = createManualDevice('dev-v1');
+  const cache = new AsyncPipelineCache({
+    device,
+    maxConcurrentCompiles: 2,
+    onError: (id, err) => errors.push({ id, msg: err.message }),
+  });
+
+  // Launch a render compile with a coalesced waiter and a fallbackDescriptor; reject with device-loss.
+  const lostErr = Object.assign(new Error('GPUDevice was lost'), { name: 'GPUDeviceLostError' });
+  const pLost1 = cache.compileRenderPipeline(
+    'pso_lost_1',
+    { label: 'pso_lost' },
+    { canonicalKey: 'key-lost', fallbackDescriptor: { label: 'pso_lost_fallback' } },
+  );
+  const pLost2 = cache.compileRenderPipeline(
+    'pso_lost_2',
+    { label: 'pso_lost' },
+    { canonicalKey: 'key-lost' },
+  );
+  const pValErr = cache.compileComputePipeline(
+    'pso_bad_wgsl',
+    { label: 'pso_bad_wgsl' },
+    { canonicalKey: 'key-bad' },
+  );
+
+  // Device-lost rejection must NOT trigger fallbackDescriptor retry on the dead device.
+  device.calls[0].reject(lostErr);
+  device.calls[1].reject(new Error('Tint WGSL validation failed'));
+  const [rLost1, rLost2, rValErr] = await Promise.all([pLost1, pLost2, pValErr]);
+  await cache.whenIdle();
+
+  assert.equal(device.calls.length, 2, 'device-lost rejection skipped pointless fallbackDescriptor retry');
+  assert.equal(rLost1.status, PIPELINE_STATUS.FAILED);
+  assert.equal(rLost2.status, PIPELINE_STATUS.FAILED);
+  assert.equal(rValErr.status, PIPELINE_STATUS.FAILED);
+  assert.equal(cache.getStats().activeCompiles, 0);
+  assert.equal(cache.getStats().compileErrors, 2);
+  assert.equal(cache.getStats().coalescedCompiles, 1);
+  assert.equal(cache.getStats().deviceLostRejections, 1);
+  assert.equal(cache.getStats().autoLayoutRetries, 0);
+  assert.equal(errors.length, 3);
+
+  // Failed in-flight keys were cleanly evicted so immediate retries on a recovered device succeed!
+  const recoveredDevice = createManualDevice('dev-v2');
+  cache.device = recoveredDevice;
+  const retryLost = cache.compileRenderPipeline('pso_lost_1', { label: 'pso_lost_retry' }, { canonicalKey: 'key-lost' });
+  const retryBad = cache.compileComputePipeline('pso_bad_wgsl', { label: 'pso_bad_retry' }, { canonicalKey: 'key-bad' });
+  assert.equal(recoveredDevice.calls.length, 2);
+  recoveredDevice.calls[0].resolve();
+  recoveredDevice.calls[1].resolve();
+  const [resRetryLost, resRetryBad] = await Promise.all([retryLost, retryBad]);
+  assert.equal(resRetryLost.status, PIPELINE_STATUS.READY);
+  assert.equal(resRetryBad.status, PIPELINE_STATUS.READY);
+  assert.equal(resRetryLost.pipeline.device, 'dev-v2');
+
+  // Mid-queue device vanishing (device = null) fails queued compiles cleanly without crashing or leaking rejections.
+  const activeGood = cache.compileRenderPipeline('g0', { label: 'g0' });
+  const activeGood2 = cache.compileRenderPipeline('g1', { label: 'g1' });
+  const queuedWhenNull = cache.compileRenderPipeline('g2_null', { label: 'g2_null' }, { canonicalKey: 'key-null' });
+  cache.device = null;
+  recoveredDevice.calls[2].resolve();
+  recoveredDevice.calls[3].resolve();
+  const resQueuedNull = await queuedWhenNull;
+  await Promise.all([activeGood, activeGood2]);
+  await cache.whenIdle();
+
+  assert.equal(resQueuedNull.status, PIPELINE_STATUS.FAILED);
+  assert.match(resQueuedNull.error.message, /unavailable or lost/);
+  assert.equal(cache.getStats().compileErrors, 3);
+  assert.equal(cache.getStats().activeCompiles, 0);
+
+  // Device reset with late old-device rejection never leaks unhandled rejections and allows fresh compile.
+  const devV3 = createManualDevice('dev-v3');
+  cache.reset(devV3);
+  const pReset = cache.compileRenderPipeline('after_reset', { label: 'after_reset' }, { canonicalKey: 'key-null' });
+  const devV4 = createManualDevice('dev-v4');
+  cache.reset(devV4);
+  devV3.calls[0].reject(new Error('GPUDevice lost late'));
+  assert.equal((await pReset).status, PIPELINE_STATUS.STALE);
+
+  const pFresh = cache.compileRenderPipeline('after_reset', { label: 'after_reset_v4' }, { canonicalKey: 'key-null' });
+  devV4.calls[0].resolve();
+  assert.equal((await pFresh).status, PIPELINE_STATUS.READY);
+  await tick();
+  assert.deepEqual(unhandledRejections, []);
+});
+
+test('W263: bounded compile-latency ring computes p50CompileMs/p95CompileMs, wraps cleanly, and resetStats() resets telemetry without dropping live state', async () => {
+  let now = 0;
+  const device = createManualDevice();
+  const cache = new AsyncPipelineCache({
+    device,
+    maxConcurrentCompiles: 1,
+    compileLatencyRingSize: 20,
+    nowFn: () => now,
+  });
+
+  // Initial stats before any samples.
+  assert.equal(DEFAULT_COMPILE_LATENCY_RING_SIZE, 128);
+  let stats = cache.getStats();
+  assert.equal(stats.p50CompileMs, 0);
+  assert.equal(stats.p95CompileMs, 0);
+  assert.equal(stats.activeCompiles, 0);
+  assert.equal(stats.coalescedCompiles, 0);
+  assert.equal(stats.compileErrors, 0);
+  assert.equal(stats.compileLatencyRingSize, 20);
+  assert.equal(stats.compileLatencySampleCount, 0);
+
+  // Record 20 deterministic compiles with latencies [1, 2, ..., 20] ms.
+  for (let i = 1; i <= 20; i += 1) {
+    const start = now;
+    const p = cache.compileRenderPipeline(`lat_${i}`, { label: `lat_${i}` });
+    now = start + i;
+    device.calls[device.calls.length - 1].resolve();
+    await p;
+  }
+
+  stats = cache.getStats();
+  assert.equal(stats.compileLatencySampleCount, 20);
+  assert.equal(stats.p50CompileMs, 10);
+  assert.equal(stats.p95CompileMs, 19);
+  assert.equal(stats.maxCompileMs, 20);
+
+  let tel = cache.getTelemetry();
+  assert.equal(tel.p50CompileMs, 10);
+  assert.equal(tel.p95CompileMs, 19);
+  assert.equal(tel.compileLatencySampleCount, 20);
+
+  // Overwrite all 20 ring slots with slower/different latencies (ring stays bounded at 20).
+  // Push 20 samples of [5, 5, ..., 5, 50] (19 samples of 5ms, 1 sample of 50ms -> p50=5, p95=5, max in ring=50).
+  // Wait: nearest-rank p95 of 20 items is index ceil(0.95*20)-1 = 18 (19th item).
+  // So pushing 18 samples of 4ms and 2 samples of 40ms yields sorted [4 x 18, 40, 40] -> p50=4, p95=40!
+  for (let i = 0; i < 20; i += 1) {
+    const dur = i < 18 ? 4 : 40;
+    const start = now;
+    const p = cache.compileComputePipeline(`wrap_${i}`, { label: `wrap_${i}` });
+    now = start + dur;
+    device.calls[device.calls.length - 1].resolve();
+    await p;
+  }
+
+  stats = cache.getStats();
+  assert.equal(stats.compileLatencySampleCount, 20, 'ring buffer capacity strictly bounded at 20');
+  assert.equal(stats.p50CompileMs, 4);
+  assert.equal(stats.p95CompileMs, 40);
+
+  // Verify resetStats() clears all cumulative counters & latency ring while keeping cached pipelines and active work live!
+  const inFlightP = cache.compileRenderPipeline('live_inflight', { label: 'live_inflight' }, { canonicalKey: 'live-key' });
+  const coalescedLive = cache.compileRenderPipeline('live_alias', { label: 'live_inflight' }, { canonicalKey: 'live-key' });
+  assert.equal(cache.getStats().activeCompiles, 1);
+  assert.equal(cache.getStats().coalescedCompiles, 1);
+
+  cache.resetStats();
+
+  stats = cache.getStats();
+  assert.equal(stats.activeCompiles, 1, 'live activeCompiles preserved across resetStats()');
+  assert.equal(stats.coalescedCompiles, 0);
+  assert.equal(stats.compileErrors, 0);
+  assert.equal(stats.compiled, 0);
+  assert.equal(stats.failed, 0);
+  assert.equal(stats.p50CompileMs, 0);
+  assert.equal(stats.p95CompileMs, 0);
+  assert.equal(stats.avgCompileMs, 0);
+  assert.equal(stats.maxCompileMs, 0);
+  assert.equal(stats.compileLatencySampleCount, 0);
+  assert.equal(stats.stallCount, 0);
+  assert.equal(stats.deviceLostRejections, 0);
+  assert.ok(cache.get('lat_1') !== null, 'cached pipelines preserved across resetStats()');
+
+  // Complete the in-flight compile after resetStats() -> records cleanly into fresh stats.
+  now += 12;
+  device.calls[device.calls.length - 1].resolve();
+  const [rLive, rAlias] = await Promise.all([inFlightP, coalescedLive]);
+  await cache.whenIdle();
+
+  assert.strictEqual(rLive.pipeline, rAlias.pipeline);
+  stats = cache.getStats();
+  assert.equal(stats.activeCompiles, 0);
+  assert.equal(stats.compiled, 1);
+  assert.equal(stats.compileLatencySampleCount, 1);
+  assert.equal(stats.p50CompileMs, 12);
+  assert.equal(stats.p95CompileMs, 12);
   assert.deepEqual(unhandledRejections, []);
 });
