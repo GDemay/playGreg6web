@@ -610,6 +610,285 @@ test('reset clears all rings and counters while keeping HUD attached', () => {
   timers.tickAll();
   assert.equal(pushed.length, 1);
   assert.equal(pushed[0].fps, 0);
+  assert.equal(pushed[0].onePercentLowFps, 0);
+  assert.equal(pushed[0].fps1PctLow, 0);
+  assert.equal(pushed[0].p50FrameMs, 0);
+  assert.equal(pushed[0].p95FrameMs, 0);
+  assert.equal(pushed[0].p99FrameMs, 0);
+  assert.equal(pushed[0].jankFrameCount, 0);
   assert.equal(pushed[0].gpuPackets, 0);
   assert.equal(pushed[0].opfsCacheHits, 0);
+});
+
+test('W149: empty state returns zeroed P50/P95/P99, 1% low FPS, and jank counters across snapshot, summary, and HUD', () => {
+  const clock = createDeterministicClock(250);
+  const monitor = new PerfMonitor({ windowSize: 300, jankThresholdMs: 50, now: clock.now });
+
+  assert.equal(monitor.windowSize, 300);
+  assert.equal(monitor.jankThresholdMs, 50);
+  assert.ok(monitor._frameDeltas instanceof Float64Array);
+  assert.equal(monitor._frameDeltas.length, 300);
+
+  const snap = monitor.getSnapshot();
+  const summary = monitor.getSummary();
+  const hud = monitor.toHudMetrics();
+
+  for (const view of [snap.frames, summary, hud]) {
+    assert.equal(view.fps, 0);
+    assert.equal(view.onePercentLowFps, 0);
+    assert.equal(view.fps1PctLow, 0);
+    assert.equal(view.p50FrameTimeMs, 0);
+    assert.equal(view.p95FrameTimeMs, 0);
+    assert.equal(view.p99FrameTimeMs, 0);
+    assert.equal(view.p50FrameMs, 0);
+    assert.equal(view.p95FrameMs, 0);
+    assert.equal(view.p99FrameMs, 0);
+    assert.equal(view.p50Ms, 0);
+    assert.equal(view.p95Ms, 0);
+    assert.equal(view.p99Ms, 0);
+    assert.equal(view.jankFrames, 0);
+    assert.equal(view.jankFrameCount, 0);
+    assert.equal(view.windowJankFrames, 0);
+  }
+
+  assert.equal(summary.timestampMs, 250);
+  assert.equal(summary.windowSize, 300);
+  assert.equal(summary.jankThresholdMs, 50);
+  assert.equal(summary.sampleCount, 0);
+  assert.equal(summary.totalFrames, 0);
+
+  // Baseline timestamp frame (no delta recorded yet) must keep percentiles and 1% low FPS at 0.
+  assert.equal(monitor.recordFrame(1000), null);
+  const afterBaseline = monitor.getSummary();
+  assert.equal(afterBaseline.totalFrames, 1);
+  assert.equal(afterBaseline.sampleCount, 0);
+  assert.equal(afterBaseline.p50FrameMs, 0);
+  assert.equal(afterBaseline.p95FrameMs, 0);
+  assert.equal(afterBaseline.p99FrameMs, 0);
+  assert.equal(afterBaseline.onePercentLowFps, 0);
+  assert.equal(afterBaseline.jankFrameCount, 0);
+});
+
+test('W149: single sample computes exact P50/P95/P99, 1% low FPS, jank threshold, and zero-delta guard', () => {
+  const smooth = new PerfMonitor({ windowSize: 300, jankThresholdMs: 50 });
+  smooth.recordFrameTimeMs(16);
+
+  const smoothSummary = smooth.getSummary();
+  assert.equal(smoothSummary.sampleCount, 1);
+  assert.equal(smoothSummary.p50FrameMs, 16);
+  assert.equal(smoothSummary.p95FrameMs, 16);
+  assert.equal(smoothSummary.p99FrameMs, 16);
+  assert.equal(smoothSummary.p50Ms, 16);
+  assert.equal(smoothSummary.p95Ms, 16);
+  assert.equal(smoothSummary.p99Ms, 16);
+  assert.ok(Math.abs(smoothSummary.fps - 62.5) < 1e-9);
+  assert.ok(Math.abs(smoothSummary.onePercentLowFps - 62.5) < 1e-9);
+  assert.ok(Math.abs(smoothSummary.fps1PctLow - 62.5) < 1e-9);
+  assert.equal(smoothSummary.jankFrames, 0);
+  assert.equal(smoothSummary.jankFrameCount, 0);
+  assert.equal(smoothSummary.windowJankFrames, 0);
+
+  // Single jank sample above 50ms threshold.
+  const janky = new PerfMonitor({ windowSize: 300, jankThresholdMs: 50 });
+  janky.recordFrameTimeMs(64);
+  const jankySummary = janky.getSummary();
+  assert.equal(jankySummary.p50FrameMs, 64);
+  assert.equal(jankySummary.p95FrameMs, 64);
+  assert.equal(jankySummary.p99FrameMs, 64);
+  assert.ok(Math.abs(jankySummary.fps - 15.625) < 1e-9);
+  assert.ok(Math.abs(jankySummary.onePercentLowFps - 15.625) < 1e-9);
+  assert.equal(jankySummary.jankFrames, 1);
+  assert.equal(jankySummary.jankFrameCount, 1);
+  assert.equal(jankySummary.windowJankFrames, 1);
+
+  // Boundary: exactly equal to 50ms is NOT jank.
+  const boundary = new PerfMonitor({ windowSize: 300, jankThresholdMs: 50 });
+  boundary.recordFrameTimeMs(50);
+  assert.equal(boundary.getSummary().jankFrameCount, 0);
+  boundary.recordFrameTimeMs(50.001);
+  assert.equal(boundary.getSummary().jankFrameCount, 1);
+
+  // Single 0ms delta must not divide by zero into Infinity or NaN.
+  const zeroDt = new PerfMonitor({ windowSize: 10 });
+  zeroDt.recordFrameTimeMs(0);
+  const zeroSummary = zeroDt.getSummary();
+  assert.equal(zeroSummary.p50FrameMs, 0);
+  assert.equal(zeroSummary.p95FrameMs, 0);
+  assert.equal(zeroSummary.p99FrameMs, 0);
+  assert.equal(zeroSummary.fps, 0);
+  assert.equal(zeroSummary.onePercentLowFps, 0);
+  assert.equal(zeroSummary.fps1PctLow, 0);
+  assert.ok(Number.isFinite(zeroSummary.onePercentLowFps));
+});
+
+test('W149: 300-sample Float64Array ring computes exact P50/P95/P99, 1% low FPS, and jank without reallocating buffers', () => {
+  const monitor = new PerfMonitor({ windowSize: 300, jankThresholdMs: 50 });
+  const initialRingRef = monitor._frameDeltas;
+  const initialScratchRef = monitor._scratchSorted;
+
+  // 300 samples in unsorted order:
+  //   250 @ 16ms, 35 @ 20ms, 10 @ 35ms, 3 @ 60ms (jank), 2 @ 100ms (jank)
+  const samples = [
+    ...Array(2).fill(100),
+    ...Array(35).fill(20),
+    ...Array(3).fill(60),
+    ...Array(250).fill(16),
+    ...Array(10).fill(35),
+  ];
+  assert.equal(samples.length, 300);
+
+  for (const dt of samples) {
+    monitor.recordFrameTimeMs(dt);
+  }
+
+  // Zero-allocation check: typed arrays remain the exact pre-allocated instances.
+  assert.equal(monitor._frameDeltas, initialRingRef);
+  assert.equal(monitor._scratchSorted, initialScratchRef);
+
+  // Sorted indices (0..299):
+  //   0..249 => 16, 250..284 => 20, 285..294 => 35, 295..297 => 60, 298..299 => 100
+  // Nearest-rank indices:
+  //   p50 => ceil(0.50 * 300) - 1 = 149 => 16
+  //   p95 => ceil(0.95 * 300) - 1 = 284 => 20
+  //   p99 => ceil(0.99 * 300) - 1 = 296 => 60
+  const expectedAvg = (250 * 16 + 35 * 20 + 10 * 35 + 3 * 60 + 2 * 100) / 300;
+  const expectedFps = 1000 / expectedAvg;
+  const expected1PctLow = 1000 / 60;
+
+  const snap = monitor.getSnapshot();
+  const summary = monitor.getSummary();
+  const hud = monitor.toHudMetrics();
+
+  for (const view of [snap.frames, summary, hud]) {
+    assert.ok(Math.abs(view.avgFrameTimeMs - expectedAvg) < 1e-9);
+    assert.ok(Math.abs(view.fps - expectedFps) < 1e-9);
+    assert.equal(view.p50FrameTimeMs, 16);
+    assert.equal(view.p95FrameTimeMs, 20);
+    assert.equal(view.p99FrameTimeMs, 60);
+    assert.equal(view.p50FrameMs, 16);
+    assert.equal(view.p95FrameMs, 20);
+    assert.equal(view.p99FrameMs, 60);
+    assert.equal(view.p50Ms, 16);
+    assert.equal(view.p95Ms, 20);
+    assert.equal(view.p99Ms, 60);
+    assert.ok(Math.abs(view.onePercentLowFps - expected1PctLow) < 1e-9);
+    assert.ok(Math.abs(view.fps1PctLow - expected1PctLow) < 1e-9);
+    assert.equal(view.jankFrames, 5);
+    assert.equal(view.jankFrameCount, 5);
+    assert.equal(view.windowJankFrames, 5);
+  }
+  assert.equal(snap.frames.minFrameTimeMs, 16);
+  assert.equal(snap.frames.maxFrameTimeMs, 100);
+  assert.equal(snap.frames.sampleCount, 300);
+});
+
+test('W149: wrap-around ring buffer updates P50/P95/P99, 1% low FPS, and rolling vs cumulative jank cleanly', () => {
+  const monitor = new PerfMonitor({ windowSize: 10, jankThresholdMs: 50 });
+
+  // Fill ring with 10 slow 100ms frames.
+  for (let i = 0; i < 10; i += 1) {
+    monitor.recordFrameTimeMs(100);
+  }
+  let summary = monitor.getSummary();
+  assert.equal(summary.sampleCount, 10);
+  assert.equal(summary.p50FrameMs, 100);
+  assert.equal(summary.p95FrameMs, 100);
+  assert.equal(summary.p99FrameMs, 100);
+  assert.ok(Math.abs(summary.onePercentLowFps - 10) < 1e-9);
+  assert.equal(summary.jankFrameCount, 10);
+  assert.equal(summary.windowJankFrames, 10);
+
+  // Partial wrap: overwrite 5 entries with 16ms frames -> ring holds [16 x5, 100 x5].
+  for (let i = 0; i < 5; i += 1) {
+    monitor.recordFrameTimeMs(16);
+  }
+  summary = monitor.getSummary();
+  assert.equal(summary.totalFrames, 15);
+  assert.equal(summary.sampleCount, 10);
+  // Sorted indices 0..4 => 16, 5..9 => 100. p50 => idx 4 (16), p95/p99 => idx 9 (100).
+  assert.equal(summary.p50FrameMs, 16);
+  assert.equal(summary.p95FrameMs, 100);
+  assert.equal(summary.p99FrameMs, 100);
+  assert.ok(Math.abs(summary.onePercentLowFps - 10) < 1e-9);
+  assert.equal(summary.jankFrameCount, 10);
+  assert.equal(summary.windowJankFrames, 5);
+
+  // Full wrap: overwrite remaining 5 entries with 16ms frames -> ring holds [16 x10].
+  for (let i = 0; i < 5; i += 1) {
+    monitor.recordFrameTimeMs(16);
+  }
+  summary = monitor.getSummary();
+  assert.equal(summary.totalFrames, 20);
+  assert.equal(summary.sampleCount, 10);
+  assert.equal(summary.p50FrameMs, 16);
+  assert.equal(summary.p95FrameMs, 16);
+  assert.equal(summary.p99FrameMs, 16);
+  assert.ok(Math.abs(summary.onePercentLowFps - 62.5) < 1e-9);
+  assert.equal(summary.jankFrameCount, 10);
+  assert.equal(summary.windowJankFrames, 0);
+
+  // Reset clears everything cleanly and subsequent samples work from scratch.
+  monitor.reset();
+  const resetSummary = monitor.getSummary();
+  assert.equal(resetSummary.totalFrames, 0);
+  assert.equal(resetSummary.sampleCount, 0);
+  assert.equal(resetSummary.p50FrameMs, 0);
+  assert.equal(resetSummary.p95FrameMs, 0);
+  assert.equal(resetSummary.p99FrameMs, 0);
+  assert.equal(resetSummary.onePercentLowFps, 0);
+  assert.equal(resetSummary.fps1PctLow, 0);
+  assert.equal(resetSummary.jankFrames, 0);
+  assert.equal(resetSummary.jankFrameCount, 0);
+  assert.equal(resetSummary.windowJankFrames, 0);
+
+  monitor.recordFrameTimeMs(25);
+  const postReset = monitor.getSummary();
+  assert.equal(postReset.totalFrames, 1);
+  assert.equal(postReset.sampleCount, 1);
+  assert.equal(postReset.p50FrameMs, 25);
+  assert.equal(postReset.p95FrameMs, 25);
+  assert.equal(postReset.p99FrameMs, 25);
+  assert.ok(Math.abs(postReset.onePercentLowFps - 40) < 1e-9);
+  assert.equal(postReset.jankFrameCount, 0);
+});
+
+test('W149: guards against NaN, Infinity, negative, and extreme frame times', () => {
+  const monitor = new PerfMonitor({ windowSize: 8, jankThresholdMs: 50 });
+
+  // Extreme timestamp delta overflow in recordFrame clamps safely to 0.
+  monitor.recordFrame(-Number.MAX_VALUE);
+  assert.equal(monitor.recordFrame(Number.MAX_VALUE), 0);
+
+  // Subnormal tiny frame delta must not produce Infinity FPS / 1% low FPS.
+  monitor.recordFrameTimeMs(1e-320);
+
+  // Even if internal ring buffer slots are externally corrupted, snapshot/summary stay sanitized.
+  monitor._frameDeltas[0] = Number.NaN;
+  monitor._frameDeltas[1] = Number.POSITIVE_INFINITY;
+  monitor._frameDeltas[2] = -42;
+  monitor._frameCount = 4;
+  monitor._frameDeltas[3] = 20;
+
+  const summary = monitor.getSummary();
+  for (const key of [
+    'fps',
+    'onePercentLowFps',
+    'fps1PctLow',
+    'avgFrameTimeMs',
+    'minFrameTimeMs',
+    'p50FrameMs',
+    'p95FrameMs',
+    'p99FrameMs',
+    'p50Ms',
+    'p95Ms',
+    'p99Ms',
+    'maxFrameTimeMs',
+  ]) {
+    assert.ok(Number.isFinite(summary[key]), `${key} must be finite, got ${summary[key]}`);
+    assert.ok(summary[key] >= 0, `${key} must be non-negative, got ${summary[key]}`);
+  }
+  assert.equal(summary.p50Ms, 0);
+  assert.equal(summary.p95Ms, 20);
+  assert.equal(summary.p99Ms, 20);
+  assert.ok(Math.abs(summary.onePercentLowFps - 50) < 1e-9);
 });
