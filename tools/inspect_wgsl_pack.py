@@ -25,13 +25,17 @@ importable library and as a CLI:
 
     python tools/inspect_wgsl_pack.py inspect <pack> [--json] [--strict]
     python tools/inspect_wgsl_pack.py inspect <pack> --diff-dump <dir> [--reflect <reflect.json>] [--max-samples N] [--json] [--strict]
+    python tools/inspect_wgsl_pack.py inspect <pack> --verify-wgsl-syntax [--json]
+    python tools/inspect_wgsl_pack.py inspect [<pack>] --emit-priority-hashes <out.txt> [--from-boot-log <boot.log>] [--json]
     python tools/inspect_wgsl_pack.py diff <packA> <packB> [--json]
 """
 
 from __future__ import annotations
 
 import argparse
+import io
 import json
+import os
 import re
 import struct
 import sys
@@ -39,7 +43,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, BinaryIO, Mapping, Sequence
 
 # ---------------------------------------------------------------------------
 # WGPK binary format constants (matching shaders/src/pack.rs byte-for-byte)
@@ -107,6 +111,10 @@ REFLECT_SIDECAR_SCHEMA = "playgta6-stage-reflection"
 REFLECT_SIDECAR_VERSION = 1
 DUMP_DIFF_REPORT_SCHEMA = "playgta6-wgpk-dump-diff"
 DUMP_DIFF_REPORT_VERSION = 1
+SYNTAX_VERIFY_REPORT_SCHEMA = "playgta6-wgpk-syntax-verify"
+SYNTAX_VERIFY_REPORT_VERSION = 1
+PRIORITY_HASH_EXPORT_SCHEMA = "playgta6-priority-hashes"
+PRIORITY_HASH_EXPORT_VERSION = 1
 DEFAULT_MAX_MISSING_SAMPLES = 25
 
 DUMP_STAGE_ORDER: tuple[str, ...] = ("vertex", "fragment", "compute", "unknown")
@@ -2604,6 +2612,706 @@ def diff_pack_against_dump(
 
 
 # ---------------------------------------------------------------------------
+# Streaming WGPK syntax/bounds pre-flight validation & priority-hash export (T66 / #1210)
+# ---------------------------------------------------------------------------
+
+_WGSL_SYNTAX_TOKEN_RE = re.compile(
+    r"//|/\*|\*/|\n|[{}]|\blet\b(?=\s+[A-Za-z_][A-Za-z0-9_]*|\s*/\*)"
+)
+
+_LOG_HEX0X16_RE = re.compile(r"(?<![0-9a-fA-F])0[xX]([0-9a-fA-F]{16})(?![0-9a-fA-F])")
+_LOG_BARE_HEX16_RE = re.compile(r"(?<![0-9a-fA-F])([0-9a-fA-F]{16})(?![0-9a-fA-F])")
+_LOG_SHADER_CONTEXT_RE = re.compile(
+    r"\b(?:miss|hit|misses|hits|shader|shaders|wgsl|wgpk|pack|hash|hashes|"
+    r"pipeline|pso|fallback|stage|identity|code_identity|vertex|fragment|pixel|compute|"
+    r"vs|ps|fs|cs)\b",
+    re.IGNORECASE,
+)
+_LOG_KEYED_BARE_HEX16_RE = re.compile(
+    r"(?:miss|hit|hash|identity|code_identity|shader|vs|ps|fs|cs)[\s:=_-]+"
+    r"(?:0[xX])?([0-9a-fA-F]{16})(?![0-9a-fA-F])",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class SyntaxViolation:
+    """Single strictly sanitized violation from streaming WGPK pre-flight validation."""
+
+    code: str
+    message: str
+    entry_index: int | None = None
+    shader_hash: int | None = None
+    line: int | None = None
+    offset: int | None = None
+
+    @property
+    def hash_hex(self) -> str | None:
+        return format_shader_hash(self.shader_hash) if self.shader_hash is not None else None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "code": self.code,
+            "message": self.message,
+        }
+        if self.entry_index is not None:
+            payload["entryIndex"] = self.entry_index
+        if self.shader_hash is not None:
+            payload["hash"] = format_shader_hash(self.shader_hash)
+        if self.line is not None:
+            payload["line"] = self.line
+        if self.offset is not None:
+            payload["offset"] = self.offset
+        return payload
+
+
+@dataclass(frozen=True)
+class SyntaxVerifyReport:
+    """Sanitized report from streaming `--verify-wgsl-syntax` pre-flight validation."""
+
+    source: str
+    version: int | None
+    flags: int | None
+    pack_bytes: int
+    entry_count: int
+    entries_checked: int
+    wgsl_bytes_scanned: int
+    duplicate_hash_count: int
+    module_scope_let_count: int
+    violations_by_code: dict[str, int]
+    violations: tuple[SyntaxViolation, ...]
+
+    @property
+    def clean(self) -> bool:
+        return len(self.violations) == 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": SYNTAX_VERIFY_REPORT_SCHEMA,
+            "version": SYNTAX_VERIFY_REPORT_VERSION,
+            "source": self.source,
+            "packVersion": self.version,
+            "flags": self.flags,
+            "packBytes": self.pack_bytes,
+            "entryCount": self.entry_count,
+            "entriesChecked": self.entries_checked,
+            "wgslBytesScanned": self.wgsl_bytes_scanned,
+            "duplicateHashCount": self.duplicate_hash_count,
+            "moduleScopeLetCount": self.module_scope_let_count,
+            "violationCount": len(self.violations),
+            "violationsByCode": dict(self.violations_by_code),
+            "violations": [v.to_dict() for v in self.violations],
+            "clean": self.clean,
+        }
+
+
+@dataclass(frozen=True)
+class PriorityHashExportReport:
+    """Sanitized report from `--emit-priority-hashes` extraction and export."""
+
+    output: str
+    pack_source: str | None
+    boot_log_sources: tuple[str, ...]
+    pack_hash_count: int
+    boot_log_hash_count: int
+    unique_hash_count: int
+    hashes: tuple[int, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        sample = [format_shader_hash(h) for h in self.hashes[:DEFAULT_MAX_MISSING_SAMPLES]]
+        return {
+            "schema": PRIORITY_HASH_EXPORT_SCHEMA,
+            "version": PRIORITY_HASH_EXPORT_VERSION,
+            "output": self.output,
+            "packSource": self.pack_source,
+            "bootLogSources": list(self.boot_log_sources),
+            "packHashCount": self.pack_hash_count,
+            "bootLogHashCount": self.boot_log_hash_count,
+            "uniqueHashCount": self.unique_hash_count,
+            "sampleHashes": sample,
+            "hashesTruncated": len(self.hashes) > len(sample),
+        }
+
+
+def find_module_scope_let_lines(source: str) -> tuple[int, ...]:
+    """Return 1-based line numbers of invalid module-scope `let <ident>` declarations.
+
+    Scans WGSL using a single C-speed regex pass that respects `//` line comments,
+    nested `/* ... */` block comments, and `{}` brace nesting depth without allocating
+    a comment-stripped copy of `source`. Never returns shader source code or identifiers.
+    """
+    if "let" not in source:
+        return ()
+
+    bad_lines: list[int] = []
+    line_no = 1
+    brace_depth = 0
+    block_comment_depth = 0
+    in_line_comment = False
+
+    for match in _WGSL_SYNTAX_TOKEN_RE.finditer(source):
+        tok = match.group(0)
+        if tok == "\n":
+            line_no += 1
+            in_line_comment = False
+            continue
+        if in_line_comment:
+            continue
+        if tok == "/*":
+            block_comment_depth += 1
+            continue
+        if tok == "*/":
+            if block_comment_depth > 0:
+                block_comment_depth -= 1
+            continue
+        if block_comment_depth > 0:
+            continue
+        if tok == "//":
+            in_line_comment = True
+            continue
+        if tok == "{":
+            brace_depth += 1
+            continue
+        if tok == "}":
+            if brace_depth > 0:
+                brace_depth -= 1
+            continue
+        if brace_depth == 0:
+            bad_lines.append(line_no)
+
+    return tuple(bad_lines)
+
+
+def _read_exact(stream: BinaryIO, count: int) -> bytes:
+    """Read up to `count` bytes from a binary stream, looping over short reads."""
+    if count <= 0:
+        return b""
+    chunks: list[bytes] = []
+    remaining = count
+    while remaining > 0:
+        chunk = stream.read(remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    if not chunks:
+        return b""
+    return chunks[0] if len(chunks) == 1 else b"".join(chunks)
+
+
+def _verify_wgpk_stream(
+    stream: BinaryIO,
+    total_len: int,
+    source_label: str,
+) -> SyntaxVerifyReport:
+    """Stream-validate a WGPK header, TOC, payload bounds, hashes, and WGSL syntax."""
+    violations: list[SyntaxViolation] = []
+
+    def _finish(
+        *,
+        version: int | None = None,
+        flags: int | None = None,
+        entry_count: int = 0,
+        entries_checked: int = 0,
+        wgsl_bytes_scanned: int = 0,
+        duplicate_hash_count: int = 0,
+        module_scope_let_count: int = 0,
+    ) -> SyntaxVerifyReport:
+        ordered = tuple(
+            sorted(
+                violations,
+                key=lambda v: (
+                    v.entry_index if v.entry_index is not None else -1,
+                    v.line if v.line is not None else 0,
+                    v.code,
+                    v.offset if v.offset is not None else 0,
+                ),
+            )
+        )
+        by_code = dict(sorted(Counter(v.code for v in ordered).items()))
+        return SyntaxVerifyReport(
+            source=source_label,
+            version=version,
+            flags=flags,
+            pack_bytes=total_len,
+            entry_count=entry_count,
+            entries_checked=entries_checked,
+            wgsl_bytes_scanned=wgsl_bytes_scanned,
+            duplicate_hash_count=duplicate_hash_count,
+            module_scope_let_count=module_scope_let_count,
+            violations_by_code=by_code,
+            violations=ordered,
+        )
+
+    stream.seek(0)
+    if total_len < PACK_HEADER_BYTES:
+        violations.append(
+            SyntaxViolation(
+                code="truncated_header",
+                message=(
+                    f"WGPK pack truncated: {total_len} bytes "
+                    f"(minimum header size: {PACK_HEADER_BYTES})"
+                ),
+                offset=0,
+            )
+        )
+        return _finish()
+
+    header_bytes = _read_exact(stream, PACK_HEADER_BYTES)
+    if len(header_bytes) < PACK_HEADER_BYTES:
+        violations.append(
+            SyntaxViolation(
+                code="truncated_header",
+                message=(
+                    f"WGPK header short read: {len(header_bytes)} bytes "
+                    f"(expected {PACK_HEADER_BYTES})"
+                ),
+                offset=0,
+            )
+        )
+        return _finish()
+
+    magic, version, entry_count, flags = PACK_HEADER_STRUCT.unpack_from(header_bytes, 0)
+    if magic != PACK_MAGIC:
+        violations.append(
+            SyntaxViolation(
+                code="invalid_magic",
+                message=f"invalid WGPK magic (expected {PACK_MAGIC!r})",
+                offset=0,
+            )
+        )
+        return _finish()
+
+    if version != PACK_VERSION:
+        violations.append(
+            SyntaxViolation(
+                code="unsupported_version",
+                message=f"unsupported WGPK version {version} (expected {PACK_VERSION})",
+                offset=4,
+            )
+        )
+        return _finish(version=version, flags=flags, entry_count=entry_count)
+
+    table_bytes = entry_count * PACK_ENTRY_BYTES
+    data_start = PACK_HEADER_BYTES + table_bytes
+    if total_len < data_start:
+        violations.append(
+            SyntaxViolation(
+                code="truncated_table",
+                message=(
+                    f"WGPK pack truncated: {total_len} bytes "
+                    f"(header + {entry_count} entry records require {data_start} bytes)"
+                ),
+                offset=PACK_HEADER_BYTES,
+            )
+        )
+        return _finish(version=version, flags=flags, entry_count=entry_count)
+
+    table_buf = _read_exact(stream, table_bytes)
+    if len(table_buf) < table_bytes:
+        violations.append(
+            SyntaxViolation(
+                code="truncated_table",
+                message=(
+                    f"WGPK entry table short read: {len(table_buf)} bytes "
+                    f"(expected {table_bytes})"
+                ),
+                offset=PACK_HEADER_BYTES,
+            )
+        )
+        return _finish(version=version, flags=flags, entry_count=entry_count)
+
+    seen_hashes: dict[int, int] = {}
+    duplicate_hash_count = 0
+    # Tuples of (offset, end, entry_index, shader_hash, length) for valid non-empty payloads.
+    valid_payload_entries: list[tuple[int, int, int, int, int]] = []
+
+    for idx in range(entry_count):
+        rec_off = idx * PACK_ENTRY_BYTES
+        file_rec_off = PACK_HEADER_BYTES + rec_off
+        shader_hash, stage_raw, _reserved, offset, length = PACK_ENTRY_STRUCT.unpack_from(
+            table_buf, rec_off
+        )
+
+        if shader_hash in seen_hashes:
+            duplicate_hash_count += 1
+            violations.append(
+                SyntaxViolation(
+                    code="duplicate_shader_hash",
+                    message=(
+                        f"entry {idx} duplicates shader hash {format_shader_hash(shader_hash)} "
+                        f"(first seen at entry {seen_hashes[shader_hash]})"
+                    ),
+                    entry_index=idx,
+                    shader_hash=shader_hash,
+                    offset=file_rec_off,
+                )
+            )
+        else:
+            seen_hashes[shader_hash] = idx
+
+        if stage_raw not in (1, 2, 3):
+            violations.append(
+                SyntaxViolation(
+                    code="invalid_stage",
+                    message=f"entry {idx} has invalid shader stage code {stage_raw}",
+                    entry_index=idx,
+                    shader_hash=shader_hash,
+                    offset=file_rec_off + 8,
+                )
+            )
+
+        if length == 0:
+            violations.append(
+                SyntaxViolation(
+                    code="zero_length_payload",
+                    message=f"entry {idx} has zero-length WGSL payload",
+                    entry_index=idx,
+                    shader_hash=shader_hash,
+                    offset=offset,
+                )
+            )
+
+        end = offset + length
+        if offset < data_start or end > total_len:
+            violations.append(
+                SyntaxViolation(
+                    code="out_of_bounds",
+                    message=(
+                        f"entry {idx} payload [{offset}..+{length}] exceeds pack bounds "
+                        f"(valid payload range: [{data_start}..{total_len}])"
+                    ),
+                    entry_index=idx,
+                    shader_hash=shader_hash,
+                    offset=offset,
+                )
+            )
+        elif length > 0:
+            valid_payload_entries.append((offset, end, idx, shader_hash, length))
+
+    # Sort by ascending file offset: enables both sweep-line overlap detection and sequential I/O.
+    valid_payload_entries.sort(key=lambda item: (item[0], item[1], item[2]))
+    if len(valid_payload_entries) > 1:
+        prev_off, prev_end, prev_idx, _prev_hash, _prev_len = valid_payload_entries[0]
+        for curr_off, curr_end, curr_idx, curr_hash, _curr_len in valid_payload_entries[1:]:
+            if curr_off < prev_end:
+                violations.append(
+                    SyntaxViolation(
+                        code="overlapping_payloads",
+                        message=(
+                            f"entry {curr_idx} payload [{curr_off}..{curr_end}) overlaps "
+                            f"entry {prev_idx} payload [{prev_off}..{prev_end})"
+                        ),
+                        entry_index=curr_idx,
+                        shader_hash=curr_hash,
+                        offset=curr_off,
+                    )
+                )
+            if curr_end > prev_end:
+                prev_off, prev_end, prev_idx = curr_off, curr_end, curr_idx
+
+    # Stream each in-bounds non-empty payload sequentially and validate UTF-8 + WGSL syntax.
+    entries_checked = 0
+    wgsl_bytes_scanned = 0
+    module_scope_let_count = 0
+    stream_pos = data_start
+
+    for offset, _end, idx, shader_hash, length in valid_payload_entries:
+        if offset != stream_pos:
+            stream.seek(offset)
+            stream_pos = offset
+        payload_bytes = _read_exact(stream, length)
+        stream_pos += len(payload_bytes)
+        if len(payload_bytes) != length:
+            violations.append(
+                SyntaxViolation(
+                    code="out_of_bounds",
+                    message=(
+                        f"entry {idx} payload short read: {len(payload_bytes)} bytes "
+                        f"(expected {length})"
+                    ),
+                    entry_index=idx,
+                    shader_hash=shader_hash,
+                    offset=offset,
+                )
+            )
+            continue
+
+        entries_checked += 1
+        wgsl_bytes_scanned += length
+
+        try:
+            wgsl_text = payload_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            violations.append(
+                SyntaxViolation(
+                    code="invalid_utf8",
+                    message=f"entry {idx} payload is not valid UTF-8: {exc.reason}",
+                    entry_index=idx,
+                    shader_hash=shader_hash,
+                    offset=offset + exc.start,
+                )
+            )
+            continue
+
+        bad_lines = find_module_scope_let_lines(wgsl_text)
+        for line_no in bad_lines:
+            module_scope_let_count += 1
+            violations.append(
+                SyntaxViolation(
+                    code="module_scope_let",
+                    message=(
+                        f"entry {idx} contains invalid module-scope 'let' declaration "
+                        f"at line {line_no}"
+                    ),
+                    entry_index=idx,
+                    shader_hash=shader_hash,
+                    line=line_no,
+                )
+            )
+
+    return _finish(
+        version=version,
+        flags=flags,
+        entry_count=entry_count,
+        entries_checked=entries_checked,
+        wgsl_bytes_scanned=wgsl_bytes_scanned,
+        duplicate_hash_count=duplicate_hash_count,
+        module_scope_let_count=module_scope_let_count,
+    )
+
+
+def verify_wgsl_pack_syntax(
+    path_or_bytes: str | Path | bytes | bytearray | memoryview,
+    *,
+    source_label: str | None = None,
+) -> SyntaxVerifyReport:
+    """Run fast streaming WGPK pre-flight validation on a file path or in-memory buffer.
+
+    Checks header magic/version/entry-count consistency, file-size bounds, non-overlapping
+    non-empty payload ranges, duplicate shader hashes, UTF-8 validity, and invalid
+    module-scope `let` declarations. Never returns shader source text or host paths.
+    """
+    if isinstance(path_or_bytes, (bytes, bytearray, memoryview)):
+        label = sanitize_source_label(source_label)
+        buf = io.BytesIO(path_or_bytes)
+        return _verify_wgpk_stream(buf, len(path_or_bytes), label)
+    if isinstance(path_or_bytes, (str, Path)):
+        path = Path(path_or_bytes)
+        label = sanitize_source_label(source_label if source_label is not None else path)
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            total_len = fh.tell()
+            return _verify_wgpk_stream(fh, total_len, label)
+    raise TypeError(
+        f"expected path or bytes-like buffer, got {type(path_or_bytes).__name__}"
+    )
+
+
+def load_wgpk_toc_streaming(
+    path_or_bytes: str | Path | bytes | bytearray | memoryview | WgpkBundle | WgpkToc,
+    *,
+    source_label: str | None = None,
+) -> tuple[WgpkToc, str]:
+    """Read and validate only the WGPK header + TOC without loading WGSL payload bytes."""
+    if isinstance(path_or_bytes, (WgpkToc, WgpkBundle, bytes, bytearray, memoryview)):
+        return _load_toc(path_or_bytes, source_label=source_label)
+    if isinstance(path_or_bytes, (str, Path)):
+        path = Path(path_or_bytes)
+        label = sanitize_source_label(source_label if source_label is not None else path)
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            total_len = fh.tell()
+            fh.seek(0)
+            if total_len < PACK_HEADER_BYTES:
+                raise WgpkParseError(
+                    f"WGPK pack truncated: {total_len} bytes (minimum header size: {PACK_HEADER_BYTES})",
+                    code="truncated_header",
+                    offset=0,
+                )
+            header = _read_exact(fh, PACK_HEADER_BYTES)
+            magic, version, entry_count, flags = PACK_HEADER_STRUCT.unpack_from(header, 0)
+            if magic != PACK_MAGIC:
+                raise WgpkParseError(
+                    f"invalid WGPK magic {magic!r} (expected {PACK_MAGIC!r})",
+                    code="invalid_magic",
+                    offset=0,
+                )
+            if version != PACK_VERSION:
+                raise WgpkParseError(
+                    f"unsupported WGPK version {version} (expected {PACK_VERSION})",
+                    code="unsupported_version",
+                    offset=4,
+                )
+            table_bytes = entry_count * PACK_ENTRY_BYTES
+            data_start = PACK_HEADER_BYTES + table_bytes
+            if total_len < data_start:
+                raise WgpkParseError(
+                    f"WGPK pack truncated: {total_len} bytes "
+                    f"(header + {entry_count} entry records require {data_start} bytes)",
+                    code="truncated_table",
+                    offset=PACK_HEADER_BYTES,
+                )
+            table_buf = _read_exact(fh, table_bytes)
+            if len(table_buf) < table_bytes:
+                raise WgpkParseError(
+                    f"WGPK entry table truncated: read {len(table_buf)} of {table_bytes} bytes",
+                    code="truncated_table",
+                    offset=PACK_HEADER_BYTES,
+                )
+
+        entries: list[WgpkTocEntry] = []
+        non_empty_ranges: list[tuple[int, int, int]] = []
+        for idx in range(entry_count):
+            rec_off = idx * PACK_ENTRY_BYTES
+            shader_hash, stage_raw, _reserved, offset, length = PACK_ENTRY_STRUCT.unpack_from(
+                table_buf, rec_off
+            )
+            try:
+                stage = ShaderStage(stage_raw)
+            except ValueError as exc:
+                raise WgpkParseError(
+                    f"invalid shader stage value {stage_raw} at entry {idx}",
+                    code="invalid_stage",
+                    entry_index=idx,
+                    offset=PACK_HEADER_BYTES + rec_off + 8,
+                ) from exc
+            end = offset + length
+            if offset < data_start or end > total_len:
+                raise WgpkParseError(
+                    f"entry {idx} payload [{offset}..+{length}] exceeds pack bounds "
+                    f"(valid payload range: [{data_start}..{total_len}])",
+                    code="out_of_bounds",
+                    entry_index=idx,
+                    offset=PACK_HEADER_BYTES + rec_off + 12,
+                )
+            if length > 0:
+                non_empty_ranges.append((offset, end, idx))
+            entries.append(
+                WgpkTocEntry(hash=shader_hash, stage=stage, offset=offset, length=length)
+            )
+
+        if len(non_empty_ranges) > 1:
+            non_empty_ranges.sort(key=lambda item: (item[0], item[1]))
+            for prev, curr in zip(non_empty_ranges, non_empty_ranges[1:]):
+                if curr[0] < prev[1]:
+                    raise WgpkParseError(
+                        f"overlapping payload ranges between entry {prev[2]} [{prev[0]}..{prev[1]}) "
+                        f"and entry {curr[2]} [{curr[0]}..{curr[1]})",
+                        code="overlapping_payloads",
+                        entry_index=curr[2],
+                        offset=curr[0],
+                    )
+
+        return (
+            WgpkToc(
+                version=version,
+                flags=flags,
+                byte_length=total_len,
+                entries=tuple(entries),
+            ),
+            label,
+        )
+    raise TypeError(
+        f"expected path, bytes-like buffer, WgpkBundle, or WgpkToc, got {type(path_or_bytes).__name__}"
+    )
+
+
+def _extract_hashes_from_log_line(line: str, hashes: set[int]) -> None:
+    """Extract unique 64-bit (16-hex) shader hashes from a single sanitized log line."""
+    # 1. Standalone priority-hash-file line: `[0x]<16-hex>` with optional `#` comment.
+    stripped = line.split("#", 1)[0].strip()
+    if stripped:
+        standalone = _FILENAME_HEX16_RE.fullmatch(stripped)
+        if standalone:
+            hashes.add(int(standalone.group(1), 16))
+            return
+
+    # 2. Explicit `0x<16-hex>` shader hash references anywhere on the line.
+    for match in _LOG_HEX0X16_RE.finditer(line):
+        hashes.add(int(match.group(1), 16))
+
+    # 3. Bare 16-hex shader hashes on shader/miss/hit/pipeline log lines.
+    if _LOG_SHADER_CONTEXT_RE.search(line):
+        for match in _LOG_KEYED_BARE_HEX16_RE.finditer(line):
+            hashes.add(int(match.group(1), 16))
+        for match in _LOG_BARE_HEX16_RE.finditer(line):
+            token = match.group(1)
+            # Require at least one hex letter [a-fA-F] for unkeyed bare tokens so
+            # 16-digit decimal timestamps/counters on the same line are not captured.
+            if any(ch in "abcdefABCDEF" for ch in token):
+                hashes.add(int(token, 16))
+
+
+def extract_shader_hashes_from_log_text(text: str) -> tuple[int, ...]:
+    """Extract deduplicated, sorted 64-bit shader hashes from sanitized boot log text."""
+    cleaned = text.lstrip("\ufeff")
+    hashes: set[int] = set()
+    for line in cleaned.splitlines():
+        _extract_hashes_from_log_line(line, hashes)
+    return tuple(sorted(hashes))
+
+
+def extract_shader_hashes_from_boot_log(log_path: str | Path) -> tuple[int, ...]:
+    """Stream a sanitized browser/native boot log and extract unique sorted 64-bit shader hashes."""
+    path = Path(log_path)
+    hashes: set[int] = set()
+    with path.open("r", encoding="utf-8-sig", errors="replace") as fh:
+        for line in fh:
+            _extract_hashes_from_log_line(line, hashes)
+    return tuple(sorted(hashes))
+
+
+def emit_priority_hashes(
+    out_path: str | Path,
+    *,
+    pack_or_bytes: str | Path | bytes | bytearray | memoryview | WgpkBundle | WgpkToc | None = None,
+    boot_logs: Sequence[str | Path] = (),
+    pack_label: str | None = None,
+) -> PriorityHashExportReport:
+    """Extract unique 16-hex shader hashes from a WGPK pack and/or boot logs and write
+    a deduplicated sorted priority-hash file compatible with
+    `playgta6-shaders pack-rdna2 --priority-hashes`.
+    """
+    if pack_or_bytes is None and not boot_logs:
+        raise ValueError("emit_priority_hashes requires a WGPK pack and/or at least one boot log")
+
+    pack_hashes: set[int] = set()
+    resolved_pack_label: str | None = None
+    if pack_or_bytes is not None:
+        toc, resolved_pack_label = load_wgpk_toc_streaming(
+            pack_or_bytes,
+            source_label=pack_label,
+        )
+        pack_hashes.update(toc.hashes)
+
+    boot_log_hashes: set[int] = set()
+    boot_log_labels: list[str] = []
+    for log_item in boot_logs:
+        boot_log_labels.append(sanitize_source_label(log_item))
+        boot_log_hashes.update(extract_shader_hashes_from_boot_log(log_item))
+
+    merged = tuple(sorted(pack_hashes | boot_log_hashes))
+
+    target = Path(out_path)
+    if target.parent and str(target.parent) not in ("", "."):
+        target.parent.mkdir(parents=True, exist_ok=True)
+    body = "".join(f"{format_shader_hash(h)}\n" for h in merged)
+    with target.open("w", encoding="utf-8", newline="\n") as fh:
+        fh.write(body)
+
+    return PriorityHashExportReport(
+        output=sanitize_source_label(target),
+        pack_source=resolved_pack_label,
+        boot_log_sources=tuple(boot_log_labels),
+        pack_hash_count=len(pack_hashes),
+        boot_log_hash_count=len(boot_log_hashes),
+        unique_hash_count=len(merged),
+        hashes=merged,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Human-readable text formatters
 # ---------------------------------------------------------------------------
 
@@ -2738,6 +3446,56 @@ def format_dump_diff_text(report: DumpDiffReport) -> str:
     return "\n".join(lines)
 
 
+def format_syntax_verify_text(report: SyntaxVerifyReport) -> str:
+    """Format a strictly sanitized human-readable summary of a `SyntaxVerifyReport`."""
+    status = "OK" if report.clean else "FAILED"
+    version_str = (
+        f"{report.version} (flags=0x{report.flags:08x})"
+        if report.version is not None and report.flags is not None
+        else "(invalid)"
+    )
+    lines = [
+        f"WGPK Syntax Pre-flight [{status}]: {report.source}",
+        f"  Version:            {version_str}",
+        f"  Pack size:          {report.pack_bytes} bytes",
+        f"  Entries:            {report.entry_count} (payloads scanned: {report.entries_checked}, "
+        f"wgsl bytes: {report.wgsl_bytes_scanned})",
+        f"  Duplicate hashes:   {report.duplicate_hash_count}",
+        f"  Module-scope lets:  {report.module_scope_let_count}",
+        f"  Violations:         {len(report.violations)}",
+    ]
+    if report.violations_by_code:
+        cats = ", ".join(f"{code}={count}" for code, count in report.violations_by_code.items())
+        lines.append(f"  Categories:         {cats}")
+    if report.violations:
+        lines.append("")
+        lines.append("Violations:")
+        for v in report.violations:
+            tags: list[str] = []
+            if v.entry_index is not None:
+                tags.append(f"entry={v.entry_index}")
+            if v.hash_hex is not None:
+                tags.append(v.hash_hex)
+            if v.line is not None:
+                tags.append(f"line={v.line}")
+            tag_prefix = f"[{' '.join(tags)}] " if tags else ""
+            lines.append(f"  - {tag_prefix}{v.code}: {v.message}")
+    return "\n".join(lines)
+
+
+def format_priority_hash_export_text(report: PriorityHashExportReport) -> str:
+    """Format a strictly sanitized human-readable summary of a `PriorityHashExportReport`."""
+    pack_str = report.pack_source if report.pack_source is not None else "(none)"
+    logs_str = ", ".join(report.boot_log_sources) if report.boot_log_sources else "(none)"
+    lines = [
+        f"WGPK Priority Hashes Exported: {report.output}",
+        f"  Pack source:        {pack_str} ({report.pack_hash_count} unique hashes)",
+        f"  Boot log sources:   {logs_str} ({report.boot_log_hash_count} unique hashes)",
+        f"  Emitted unique:     {report.unique_hash_count}",
+    ]
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # CLI entrypoint
 # ---------------------------------------------------------------------------
@@ -2747,19 +3505,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="inspect_wgsl_pack.py",
         description=(
-            "Inspect, validate WebGPU limits, diff binary WGPK (.wgsl.pack) "
-            "shader bundles, and audit coverage against pipeline dumps."
+            "Inspect, pre-flight verify WGSL syntax/bounds, export priority hashes, "
+            "validate WebGPU limits, diff binary WGPK (.wgsl.pack) shader bundles, "
+            "and audit coverage against pipeline dumps."
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     inspect_parser = subparsers.add_parser(
         "inspect",
-        help="Inspect a single .wgsl.pack bundle, audit WebGPU limits, or diff against a pipeline dump.",
+        help=(
+            "Inspect a .wgsl.pack bundle, run --verify-wgsl-syntax, export "
+            "--emit-priority-hashes, or diff against a pipeline dump."
+        ),
     )
     inspect_parser.add_argument(
         "pack",
-        help="Path to the .wgsl.pack file (or '-' to read binary bytes from stdin).",
+        nargs="?",
+        default=None,
+        help=(
+            "Path to the .wgsl.pack file (or '-' to read binary bytes from stdin). "
+            "Optional only when --emit-priority-hashes is paired with --from-boot-log."
+        ),
     )
     inspect_parser.add_argument(
         "--json",
@@ -2773,6 +3540,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Exit with code 1 if any WebGPU limit violation is detected, or (with --diff-dump) "
             "if any dump stage is missing from the pack or loaded reflection sidecar."
+        ),
+    )
+    inspect_parser.add_argument(
+        "--verify-wgsl-syntax",
+        action="store_true",
+        dest="verify_wgsl_syntax",
+        help=(
+            "Run fast streaming WGPK pre-flight validation (header/bounds/overlap/"
+            "zero-length/duplicate-hash/UTF-8/module-scope 'let' checks) and exit non-zero "
+            "when any violation is found."
+        ),
+    )
+    inspect_parser.add_argument(
+        "--emit-priority-hashes",
+        dest="emit_priority_hashes",
+        default=None,
+        metavar="OUT_PATH",
+        help=(
+            "Extract unique 16-hex shader hashes from the WGPK pack and/or --from-boot-log "
+            "and write a deduplicated sorted priority-hash list for "
+            "`playgta6-shaders pack-rdna2 --priority-hashes`."
+        ),
+    )
+    inspect_parser.add_argument(
+        "--from-boot-log",
+        dest="from_boot_log",
+        action="append",
+        default=[],
+        metavar="LOG_PATH",
+        help=(
+            "Optional sanitized browser/native boot log containing shader hash references "
+            "(miss/hit/0x...) to merge into --emit-priority-hashes (repeatable)."
         ),
     )
     inspect_parser.add_argument(
@@ -2918,11 +3717,162 @@ def _cmd_inspect_diff_dump(args: argparse.Namespace) -> int:
     return 0 if passed else 1
 
 
+def _cmd_inspect_verify_syntax(args: argparse.Namespace) -> int:
+    source_label = sanitize_source_label(args.pack)
+    if args.pack is None:
+        return _emit_error(
+            as_json=args.as_json,
+            command="inspect",
+            source_label="<none>",
+            error_code="invalid_argument",
+            message="--verify-wgsl-syntax requires a <pack> path",
+        )
+
+    raw_stdin: bytes | None = None
+    try:
+        if args.pack == "-":
+            raw_stdin = sys.stdin.buffer.read()
+            report = verify_wgsl_pack_syntax(raw_stdin, source_label="<stdin>")
+        else:
+            report = verify_wgsl_pack_syntax(Path(args.pack), source_label=source_label)
+    except OSError as exc:
+        return _emit_error(
+            as_json=args.as_json,
+            command="inspect",
+            source_label=source_label,
+            error_code="io_error",
+            message=_sanitize_os_error(args.pack, exc),
+        )
+
+    export_report: PriorityHashExportReport | None = None
+    if report.clean and args.emit_priority_hashes is not None:
+        pack_input: Path | bytes = raw_stdin if raw_stdin is not None else Path(args.pack)
+        try:
+            export_report = emit_priority_hashes(
+                Path(args.emit_priority_hashes),
+                pack_or_bytes=pack_input,
+                boot_logs=[Path(p) for p in args.from_boot_log],
+                pack_label="<stdin>" if raw_stdin is not None else source_label,
+            )
+        except OSError as exc:
+            err_target = exc.filename if getattr(exc, "filename", None) else args.emit_priority_hashes
+            return _emit_error(
+                as_json=args.as_json,
+                command="inspect",
+                source_label=sanitize_source_label(err_target),
+                error_code="io_error",
+                message=_sanitize_os_error(err_target, exc),
+            )
+        except WgpkParseError as exc:
+            return _emit_error(
+                as_json=args.as_json,
+                command="inspect",
+                source_label=source_label,
+                error_code=exc.code,
+                message=exc.message,
+            )
+
+    if args.as_json:
+        payload = report.to_dict()
+        payload["ok"] = report.clean
+        if export_report is not None:
+            payload["priorityHashes"] = export_report.to_dict()
+        print(json.dumps(payload, indent=2))
+    else:
+        print(format_syntax_verify_text(report))
+        if export_report is not None:
+            print("")
+            print(format_priority_hash_export_text(export_report))
+
+    return 0 if report.clean else 1
+
+
+def _cmd_inspect_emit_priority_hashes(args: argparse.Namespace) -> int:
+    source_label = sanitize_source_label(args.pack) if args.pack is not None else sanitize_source_label(args.emit_priority_hashes)
+    if args.pack is None and not args.from_boot_log:
+        return _emit_error(
+            as_json=args.as_json,
+            command="inspect",
+            source_label=source_label,
+            error_code="invalid_argument",
+            message="--emit-priority-hashes requires a <pack> path and/or --from-boot-log",
+        )
+
+    pack_input: Path | bytes | None = None
+    pack_label: str | None = None
+    try:
+        if args.pack == "-":
+            pack_input = sys.stdin.buffer.read()
+            pack_label = "<stdin>"
+        elif args.pack is not None:
+            pack_input = Path(args.pack)
+            pack_label = sanitize_source_label(args.pack)
+
+        report = emit_priority_hashes(
+            Path(args.emit_priority_hashes),
+            pack_or_bytes=pack_input,
+            boot_logs=[Path(p) for p in args.from_boot_log],
+            pack_label=pack_label,
+        )
+    except OSError as exc:
+        err_target = exc.filename if getattr(exc, "filename", None) else (args.pack or args.emit_priority_hashes)
+        return _emit_error(
+            as_json=args.as_json,
+            command="inspect",
+            source_label=sanitize_source_label(err_target),
+            error_code="io_error",
+            message=_sanitize_os_error(err_target, exc),
+        )
+    except WgpkParseError as exc:
+        return _emit_error(
+            as_json=args.as_json,
+            command="inspect",
+            source_label=pack_label or source_label,
+            error_code=exc.code,
+            message=exc.message,
+        )
+
+    if args.as_json:
+        payload = report.to_dict()
+        payload["ok"] = True
+        print(json.dumps(payload, indent=2))
+    else:
+        print(format_priority_hash_export_text(report))
+
+    return 0
+
+
 def _cmd_inspect(args: argparse.Namespace) -> int:
+    source_label = sanitize_source_label(args.pack) if args.pack is not None else "<none>"
+
+    if args.from_boot_log and args.emit_priority_hashes is None:
+        return _emit_error(
+            as_json=args.as_json,
+            command="inspect",
+            source_label=source_label,
+            error_code="invalid_argument",
+            message="--from-boot-log requires --emit-priority-hashes",
+        )
+
     if args.diff_dump is not None:
+        if args.verify_wgsl_syntax or args.emit_priority_hashes is not None:
+            return _emit_error(
+                as_json=args.as_json,
+                command="inspect",
+                source_label=source_label,
+                error_code="invalid_argument",
+                message="--diff-dump cannot be combined with --verify-wgsl-syntax or --emit-priority-hashes",
+            )
+        if args.pack is None:
+            return _emit_error(
+                as_json=args.as_json,
+                command="inspect",
+                source_label=source_label,
+                error_code="invalid_argument",
+                message="--diff-dump requires a <pack> path",
+            )
         return _cmd_inspect_diff_dump(args)
 
-    source_label = sanitize_source_label(args.pack)
     if args.reflect is not None:
         return _emit_error(
             as_json=args.as_json,
@@ -2930,6 +3880,21 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
             source_label=source_label,
             error_code="invalid_argument",
             message="--reflect requires --diff-dump",
+        )
+
+    if args.verify_wgsl_syntax:
+        return _cmd_inspect_verify_syntax(args)
+
+    if args.emit_priority_hashes is not None:
+        return _cmd_inspect_emit_priority_hashes(args)
+
+    if args.pack is None:
+        return _emit_error(
+            as_json=args.as_json,
+            command="inspect",
+            source_label=source_label,
+            error_code="invalid_argument",
+            message="inspect requires a <pack> path",
         )
 
     try:
@@ -3027,13 +3992,23 @@ def _cmd_diff(args: argparse.Namespace) -> int:
 
 
 def _normalize_cli_argv(argv: Sequence[str]) -> list[str]:
-    """Allow `<pack> --diff-dump <dir>` shorthand in addition to `inspect <pack> --diff-dump <dir>`."""
+    """Allow shorthand flags (`--diff-dump`, `--verify-wgsl-syntax`, `--emit-priority-hashes`,
+    `--from-boot-log`) in addition to explicit `inspect ...`."""
     tokens = list(argv)
     if not tokens:
         return tokens
     if tokens[0] in ("inspect", "diff", "-h", "--help"):
         return tokens
-    if any(tok == "--diff-dump" or tok.startswith("--diff-dump=") for tok in tokens):
+    shorthand_flags = (
+        "--diff-dump",
+        "--verify-wgsl-syntax",
+        "--emit-priority-hashes",
+        "--from-boot-log",
+    )
+    if any(
+        tok in shorthand_flags or any(tok.startswith(f"{flag}=") for flag in shorthand_flags)
+        for tok in tokens
+    ):
         return ["inspect", *tokens]
     return tokens
 
