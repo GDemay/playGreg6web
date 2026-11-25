@@ -7,6 +7,7 @@ const mod = require('../web/workers/indirect_draw.js');
 
 const {
   U32_MAX,
+  DEFAULT_MAX_INDIRECT_BATCH_COUNT,
   BUFFER_USAGE,
   INDIRECT_KIND,
   DRAW_INDIRECT_LAYOUT,
@@ -24,11 +25,18 @@ const {
   decodeDispatchIndirect,
   encodeBatch,
   validateIndirectRange,
+  validateIndirectBatch,
   validateDispatchCounts,
   planDispatches,
   encodeDispatches,
   encodeDispatchForItems,
+  encodeIndirectDraw,
+  encodeIndirectDrawIndexed,
+  encodeIndirectDispatch,
   encodeMultiDraw,
+  encodeMultiDispatchIndirect,
+  getStats,
+  resetStats,
   IndirectArgsBuffer,
 } = mod;
 
@@ -90,6 +98,7 @@ function createMockPass(withNative = false) {
     drawIndirect: (b, o) => calls.push(['drawIndirect', o]),
     drawIndexedIndirect: (b, o) => calls.push(['drawIndexedIndirect', o]),
     dispatchWorkgroups: (x, y, z) => calls.push(['dispatchWorkgroups', x, y, z]),
+    dispatchWorkgroupsIndirect: (b, o) => calls.push(['dispatchWorkgroupsIndirect', o]),
   };
   if (withNative) {
     pass.multiDrawIndirect = (b, o, n) => calls.push(['multiDrawIndirect', o, n]);
@@ -573,4 +582,298 @@ test('IndirectArgsBuffer.encodeDraws covers handed-out slots by default', () => 
   const r = args.encodeDraws(pass, { visibility: [true, false] });
   assert.deepEqual(pass.calls, [['drawIndexedIndirect', 0]]);
   assert.equal(r.skipped, 1);
+});
+
+test('bounds & alignment validation rejects unaligned and out-of-bounds offsets and increments boundsRejectedCount', () => {
+  resetStats();
+  const pass = createMockPass();
+
+  // drawIndirect requires 16 bytes, 4-byte aligned
+  assert.throws(
+    () => encodeIndirectDraw(pass, indirectBuf(32), 2),
+    (e) => e instanceof IndirectDrawError && e.code === 'MISALIGNED_OFFSET'
+  );
+  assert.throws(
+    () => encodeIndirectDraw(pass, indirectBuf(32), 20),
+    (e) => e instanceof IndirectDrawError && e.code === 'OUT_OF_BOUNDS'
+  );
+
+  // drawIndexedIndirect requires 20 bytes
+  assert.throws(
+    () => encodeIndirectDrawIndexed(pass, indirectBuf(32), 16),
+    (e) => e instanceof IndirectDrawError && e.code === 'OUT_OF_BOUNDS'
+  );
+  assert.throws(
+    () => encodeIndirectDrawIndexed(pass, indirectBuf(64), 6),
+    (e) => e instanceof IndirectDrawError && e.code === 'MISALIGNED_OFFSET'
+  );
+
+  // dispatchWorkgroupsIndirect requires 12 bytes
+  assert.throws(
+    () => encodeIndirectDispatch(pass, indirectBuf(20), 12),
+    (e) => e instanceof IndirectDrawError && e.code === 'OUT_OF_BOUNDS'
+  );
+  assert.throws(
+    () => encodeIndirectDispatch(pass, indirectBuf(20), 1),
+    (e) => e instanceof IndirectDrawError && e.code === 'MISALIGNED_OFFSET'
+  );
+
+  // Explicit bufferSize option works even when buffer.size is omitted, and cannot exceed buffer.size
+  assert.throws(
+    () => encodeIndirectDispatch(pass, { usage: BUFFER_USAGE.INDIRECT }, 8, { bufferSize: 16 }),
+    (e) => e instanceof IndirectDrawError && e.code === 'OUT_OF_BOUNDS'
+  );
+  assert.throws(
+    () => encodeIndirectDraw(pass, indirectBuf(16), 4, { bufferSize: 64 }),
+    (e) => e instanceof IndirectDrawError && e.code === 'OUT_OF_BOUNDS'
+  );
+
+  // Unknown bufferSize still enforces 4-byte alignment
+  assert.throws(
+    () => encodeIndirectDraw(pass, { usage: BUFFER_USAGE.INDIRECT }, 2),
+    (e) => e instanceof IndirectDrawError && e.code === 'MISALIGNED_OFFSET'
+  );
+
+  assert.equal(pass.calls.length, 0, 'no pass calls emitted for rejected offsets');
+  assert.equal(getStats().boundsRejectedCount, 9);
+
+  // Exact-fit calls succeed for all three record sizes (16 / 20 / 12) and unknown bufferSize when aligned
+  encodeIndirectDraw(pass, indirectBuf(32), 16);
+  encodeIndirectDrawIndexed(pass, indirectBuf(40), 20);
+  encodeIndirectDispatch(pass, { usage: BUFFER_USAGE.INDIRECT }, 8, { bufferSize: 20 });
+  encodeIndirectDispatch(pass, { usage: BUFFER_USAGE.INDIRECT }, 4);
+  assert.deepEqual(pass.calls, [
+    ['drawIndirect', 16],
+    ['drawIndexedIndirect', 20],
+    ['dispatchWorkgroupsIndirect', 8],
+    ['dispatchWorkgroupsIndirect', 4],
+  ]);
+  const s = getStats();
+  assert.equal(s.indirectDrawsEncoded, 1);
+  assert.equal(s.indirectIndexedDrawsEncoded, 1);
+  assert.equal(s.indirectDispatchesEncoded, 2);
+  assert.equal(s.boundsRejectedCount, 9);
+});
+
+test('multi-draw and multi-dispatch validate full batch atomically before issuing pass calls', () => {
+  resetStats();
+  const pass = createMockPass();
+
+  // Slot 0 fits (0..20 <= 30) but slot 1 overflows (20..40 > 30): zero draws should be emitted
+  assert.throws(
+    () => encodeMultiDraw(pass, indirectBuf(30), { indexed: true, count: 2 }),
+    (e) => e instanceof IndirectDrawError && e.code === 'OUT_OF_BOUNDS'
+  );
+  assert.equal(pass.calls.length, 0);
+
+  // Multi-dispatch atomic bounds rejection (stride 16, count 3 -> 16*2 + 12 = 44 > 40)
+  assert.throws(
+    () => encodeMultiDispatchIndirect(pass, indirectBuf(40), { count: 3, stride: 16 }),
+    (e) => e instanceof IndirectDrawError && e.code === 'OUT_OF_BOUNDS'
+  );
+  assert.equal(pass.calls.length, 0);
+
+  // Stride misalignment rejection increments boundsRejectedCount
+  assert.throws(
+    () => encodeMultiDispatchIndirect(pass, indirectBuf(128), { count: 2, stride: 14 }),
+    RangeError
+  );
+  assert.equal(getStats().boundsRejectedCount, 3);
+});
+
+test('maxIndirectBatchCount rejects oversized batches by default and clamps when clampBatch is true', () => {
+  resetStats();
+  assert.equal(DEFAULT_MAX_INDIRECT_BATCH_COUNT, 4096);
+  const pass = createMockPass();
+
+  // encodeMultiDraw rejects count > maxIndirectBatchCount
+  assert.throws(
+    () => encodeMultiDraw(pass, indirectBuf(1024), { count: 5, maxIndirectBatchCount: 3 }),
+    (e) => e instanceof IndirectDrawError && e.code === 'BATCH_LIMIT_EXCEEDED'
+  );
+  assert.equal(pass.calls.length, 0);
+  assert.equal(getStats().boundsRejectedCount, 1);
+  assert.equal(getStats().batchLimitRejectedCount, 1);
+
+  // encodeMultiDraw with clampBatch: true bounds execution to maxIndirectBatchCount
+  const clampedDraw = encodeMultiDraw(pass, indirectBuf(1024), {
+    count: 5,
+    maxIndirectBatchCount: 3,
+    clampBatch: true,
+  });
+  assert.deepEqual(clampedDraw, { calls: 3, draws: 3, skipped: 0, native: false });
+  assert.equal(pass.calls.length, 3);
+  assert.equal(getStats().batchClampedCount, 1);
+  assert.equal(getStats().indirectDrawsEncoded, 3);
+
+  // encodeMultiDispatchIndirect enforces maxIndirectBatchCount (reject + clamp)
+  pass.calls.length = 0;
+  assert.throws(
+    () => encodeMultiDispatchIndirect(pass, indirectBuf(1024), { count: 4, maxIndirectBatchCount: 2 }),
+    (e) => e instanceof IndirectDrawError && e.code === 'BATCH_LIMIT_EXCEEDED'
+  );
+  assert.equal(pass.calls.length, 0);
+  const clampedDispatch = encodeMultiDispatchIndirect(pass, indirectBuf(1024), {
+    count: 4,
+    maxIndirectBatchCount: 2,
+    clampBatch: true,
+  });
+  assert.deepEqual(clampedDispatch, { calls: 2, dispatches: 2, skipped: 0, clamped: true });
+  assert.deepEqual(pass.calls, [
+    ['dispatchWorkgroupsIndirect', 0],
+    ['dispatchWorkgroupsIndirect', 12],
+  ]);
+
+  // encodeBatch enforces maxIndirectBatchCount (reject + clamp)
+  assert.throws(
+    () => encodeBatch(INDIRECT_KIND.DRAW_INDEXED, [rec(1), rec(2), rec(3)], { maxIndirectBatchCount: 2 }),
+    (e) => e instanceof IndirectDrawError && e.code === 'BATCH_LIMIT_EXCEEDED'
+  );
+  const clampedBatch = encodeBatch(INDIRECT_KIND.DRAW_INDEXED, [rec(1), rec(2), rec(3)], {
+    maxIndirectBatchCount: 2,
+    clampBatch: true,
+  });
+  assert.equal(clampedBatch.bytes.byteLength, 40);
+
+  // validateIndirectBatch enforces maxIndirectBatchCount and validates spanned bytes
+  assert.throws(
+    () => validateIndirectBatch(indirectBuf(1024), { kind: INDIRECT_KIND.DISPATCH, count: 10, maxIndirectBatchCount: 4 }),
+    (e) => e instanceof IndirectDrawError && e.code === 'BATCH_LIMIT_EXCEEDED'
+  );
+  const validated = validateIndirectBatch(indirectBuf(64), {
+    kind: INDIRECT_KIND.DISPATCH,
+    count: 10,
+    maxIndirectBatchCount: 4,
+    clampBatch: true,
+  });
+  assert.deepEqual(validated, {
+    count: 4,
+    requestedCount: 10,
+    clamped: true,
+    recordSize: 12,
+    stride: 12,
+    firstOffset: 0,
+    requiredBytes: 48,
+  });
+
+  // Invalid maxIndirectBatchCount throws RangeError
+  assert.throws(
+    () => encodeMultiDraw(pass, indirectBuf(64), { count: 1, maxIndirectBatchCount: 0 }),
+    RangeError
+  );
+});
+
+test('count === 0 batches cleanly skip without GPU calls and increment zeroBatchSkips', () => {
+  resetStats();
+  const pass = createMockPass();
+
+  const r1 = encodeMultiDraw(pass, indirectBuf(0), { count: 0 });
+  assert.deepEqual(r1, { calls: 0, draws: 0, skipped: 0, native: false });
+
+  const r2 = encodeMultiDispatchIndirect(pass, indirectBuf(0), { count: 0 });
+  assert.deepEqual(r2, { calls: 0, dispatches: 0, skipped: 0, clamped: false });
+
+  const r3 = encodeBatch(INDIRECT_KIND.DRAW, []);
+  assert.equal(r3.bytes.byteLength, 0);
+  assert.deepEqual(r3.patched, []);
+
+  const { device } = createMockDevice();
+  const args = new IndirectArgsBuffer({ device, capacity: 4 });
+  const r4 = args.encodeDraws(pass);
+  assert.deepEqual(r4, { calls: 0, draws: 0, skipped: 0, native: false });
+
+  assert.equal(pass.calls.length, 0);
+  assert.equal(getStats().zeroBatchSkips, 4);
+  assert.equal(args.getStats().zeroBatchSkips, 1);
+});
+
+test('telemetry tracks drawIndirect, drawIndexedIndirect, dispatchWorkgroupsIndirect and resetStats zeroes all counters', () => {
+  resetStats();
+  const pass = createMockPass(true);
+
+  // Single-call helpers
+  encodeIndirectDraw(pass, indirectBuf(64), 0);
+  encodeIndirectDrawIndexed(pass, indirectBuf(64), 20);
+  encodeIndirectDispatch(pass, indirectBuf(64), 12);
+
+  // Batched helpers (emulated + native + visibility-masked dispatch)
+  encodeMultiDraw(pass, indirectBuf(128), { indexed: false, count: 3 });
+  encodeMultiDraw(pass, indirectBuf(200), {
+    indexed: true,
+    useNative: true,
+    count: 5,
+    visibility: [1, 1, 0, 1, 1],
+  });
+  encodeMultiDispatchIndirect(pass, indirectBuf(128), {
+    count: 4,
+    visibility: [true, false, true, true],
+  });
+
+  // Zero-batch skip + bounds rejection
+  encodeMultiDraw(pass, indirectBuf(64), { count: 0 });
+  assert.throws(
+    () => encodeIndirectDraw(pass, indirectBuf(16), 4),
+    (e) => e.code === 'OUT_OF_BOUNDS'
+  );
+
+  const snapshot = getStats();
+  assert.equal(snapshot.indirectDrawsEncoded, 4);
+  assert.equal(snapshot.indirectIndexedDrawsEncoded, 5);
+  assert.equal(snapshot.indirectDispatchesEncoded, 4);
+  assert.equal(snapshot.boundsRejectedCount, 1);
+  assert.equal(snapshot.zeroBatchSkips, 1);
+
+  // Returned snapshot is sanitized (finite non-negative integers only) and detached
+  for (const [key, val] of Object.entries(snapshot)) {
+    assert.equal(typeof val, 'number', `stat ${key} must be numeric`);
+    assert.ok(Number.isInteger(val) && val >= 0, `stat ${key} must be a non-negative integer`);
+  }
+  snapshot.indirectDrawsEncoded = 999999;
+  assert.equal(getStats().indirectDrawsEncoded, 4);
+
+  // resetStats zeroes module counters
+  resetStats();
+  assert.deepEqual(getStats(), {
+    indirectDrawsEncoded: 0,
+    indirectIndexedDrawsEncoded: 0,
+    indirectDispatchesEncoded: 0,
+    boundsRejectedCount: 0,
+    zeroBatchSkips: 0,
+    batchLimitRejectedCount: 0,
+    batchClampedCount: 0,
+  });
+
+  // IndirectArgsBuffer instance telemetry + maxIndirectBatchCount + resetStats
+  const { device } = createMockDevice();
+  const args = new IndirectArgsBuffer({ device, capacity: 8, maxIndirectBatchCount: 2 });
+  args.allocate(rec(1));
+  args.allocate(rec(2));
+  args.allocate(rec(3));
+
+  assert.throws(
+    () => args.encodeDraws(pass),
+    (e) => e instanceof IndirectDrawError && e.code === 'BATCH_LIMIT_EXCEEDED'
+  );
+  args.encodeDraws(pass, { clampBatch: true });
+  args.encodeDraws(pass, { count: 0 });
+
+  const bufStats = args.getStats();
+  assert.equal(bufStats.indirectIndexedDrawsEncoded, 2);
+  assert.equal(bufStats.indirectDrawsEncoded, 0);
+  assert.equal(bufStats.indirectDispatchesEncoded, 0);
+  assert.equal(bufStats.boundsRejectedCount, 1);
+  assert.equal(bufStats.batchLimitRejectedCount, 1);
+  assert.equal(bufStats.batchClampedCount, 1);
+  assert.equal(bufStats.zeroBatchSkips, 1);
+  assert.equal(bufStats.liveSlots, 3);
+  assert.equal(bufStats.maxIndirectBatchCount, 2);
+
+  args.resetStats();
+  const clearedBufStats = args.getStats();
+  assert.equal(clearedBufStats.indirectIndexedDrawsEncoded, 0);
+  assert.equal(clearedBufStats.boundsRejectedCount, 0);
+  assert.equal(clearedBufStats.zeroBatchSkips, 0);
+  assert.equal(clearedBufStats.batchLimitRejectedCount, 0);
+  assert.equal(clearedBufStats.batchClampedCount, 0);
+  assert.equal(clearedBufStats.liveSlots, 3, 'resetStats preserves live slot metadata');
 });
