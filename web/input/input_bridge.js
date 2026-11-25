@@ -221,6 +221,11 @@ function buildPeriodicButtonEvents(startMs, endMs, periodMs, holdMs, button) {
 //   video & Rockstar logo play unskipped before spaced A every 2500 ms from 235000 ms through
 //   295000 ms, then loops DPAD_DOWN, DPAD_DOWN, A, A, A every 12000 ms from 298000 ms to advance
 //   LEGAL NOTICES ("Next >") and subsequent setup screens (never presses B or DPAD_UP).
+// - 'menu-to-ingame': Bounded, deterministic 5-phase Chrome automation preset driving
+//   Start Screen A confirm -> Calibration/Legal accepts (DPAD_DOWN x2 + A for "Next >") ->
+//   Intro cinematic skip (hold A / MENU) -> Main Menu Story/Play selection -> brief in-game
+//   left stick, right stick, and LT/RT trigger movement (runtime #1139), completing cleanly
+//   at 59300 ms with all inputs released (never presses B or DPAD_UP).
 export const INPUT_SCRIPT_PRESETS = Object.freeze({
   'start-screen': Object.freeze({
     name: 'start-screen',
@@ -328,6 +333,67 @@ export const INPUT_SCRIPT_PRESETS = Object.freeze({
       ]),
     }),
   }),
+  'menu-to-ingame': Object.freeze({
+    name: 'menu-to-ingame',
+    events: Object.freeze([
+      // Phase 1: Start Screen ("PRESS A TO START") confirmations.
+      Object.freeze({ atMs: 5000, holdMs: 100, button: INPUT_BUTTONS.A }),
+      Object.freeze({ atMs: 7000, holdMs: 100, button: INPUT_BUTTONS.A }),
+      Object.freeze({ atMs: 9000, holdMs: 100, button: INPUT_BUTTONS.A }),
+      // Phase 2: Calibration screens (CONTINUE / UI TEXT SIZE / Display) & Legal Notices ("Next >").
+      Object.freeze({ atMs: 12000, holdMs: 100, button: INPUT_BUTTONS.A }),
+      Object.freeze({ atMs: 14500, holdMs: 100, button: INPUT_BUTTONS.A }),
+      Object.freeze({ atMs: 17000, holdMs: 100, button: INPUT_BUTTONS.A }),
+      Object.freeze({ atMs: 20000, holdMs: 100, button: INPUT_BUTTONS.DPAD_DOWN }),
+      Object.freeze({ atMs: 20500, holdMs: 100, button: INPUT_BUTTONS.DPAD_DOWN }),
+      Object.freeze({ atMs: 21200, holdMs: 100, button: INPUT_BUTTONS.A }),
+      Object.freeze({ atMs: 24000, holdMs: 100, button: INPUT_BUTTONS.A }),
+      Object.freeze({ atMs: 26500, holdMs: 100, button: INPUT_BUTTONS.A }),
+      // Phase 3: Intro cinematic skip (hold-A skip, MENU skip fallback, confirm A).
+      Object.freeze({ atMs: 30000, holdMs: 600, button: INPUT_BUTTONS.A }),
+      Object.freeze({ atMs: 32500, holdMs: 150, button: INPUT_BUTTONS.MENU }),
+      Object.freeze({ atMs: 34500, holdMs: 100, button: INPUT_BUTTONS.A }),
+      // Phase 4: Main Menu Story/Play selection & New Game / Continue confirmations.
+      Object.freeze({ atMs: 38000, holdMs: 100, button: INPUT_BUTTONS.A }),
+      Object.freeze({ atMs: 40500, holdMs: 100, button: INPUT_BUTTONS.A }),
+      Object.freeze({ atMs: 43000, holdMs: 100, button: INPUT_BUTTONS.A }),
+      Object.freeze({ atMs: 45500, holdMs: 100, button: INPUT_BUTTONS.A }),
+      // Phase 5: Brief in-game camera & movement (left stick, right stick, and LT/RT triggers).
+      Object.freeze({
+        atMs: 50000,
+        holdMs: 1500,
+        sticks: Object.freeze({ lx: 0, ly: 0.85 }),
+      }),
+      Object.freeze({
+        atMs: 52000,
+        holdMs: 1200,
+        sticks: Object.freeze({ rx: 0.75, ry: 0.25 }),
+      }),
+      Object.freeze({
+        atMs: 53700,
+        holdMs: 1200,
+        sticks: Object.freeze({ lx: 0.6, ly: 0.4, rx: -0.75, ry: -0.2 }),
+      }),
+      Object.freeze({
+        atMs: 55500,
+        holdMs: 1000,
+        sticks: Object.freeze({ rx: 0.35, ry: 0 }),
+        triggers: Object.freeze({ lt: 0.85 }),
+      }),
+      Object.freeze({
+        atMs: 57000,
+        holdMs: 1000,
+        sticks: Object.freeze({ lx: 0, ly: 0.9 }),
+        triggers: Object.freeze({ rt: 0.9 }),
+      }),
+      Object.freeze({
+        atMs: 58500,
+        holdMs: 800,
+        sticks: Object.freeze({ lx: -0.5, ly: 0.5, rx: 0.5, ry: 0 }),
+        triggers: Object.freeze({ lt: 0.5, rt: 0.75 }),
+      }),
+    ]),
+  }),
 });
 
 export const INPUT_SCRIPT_PRESET_NAMES = Object.freeze(Object.keys(INPUT_SCRIPT_PRESETS));
@@ -432,6 +498,40 @@ function scriptSticksEqual(a, b) {
   const brx = b ? b.rx : 0;
   const bry = b ? b.ry : 0;
   return alx === blx && aly === bly && arx === brx && ary === bry;
+}
+
+function normalizeScriptTriggers(triggers) {
+  if (triggers === undefined || triggers === null) return null;
+  if (typeof triggers !== 'object') {
+    throw new TypeError('Scripted input triggers must be an object');
+  }
+  const rawLt =
+    triggers.lt !== undefined
+      ? triggers.lt
+      : triggers.left !== undefined
+        ? triggers.left
+        : triggers.leftTrigger;
+  const rawRt =
+    triggers.rt !== undefined
+      ? triggers.rt
+      : triggers.right !== undefined
+        ? triggers.right
+        : triggers.rightTrigger;
+
+  const lt = rawLt !== undefined && rawLt !== null ? clamp(rawLt, 0, 1) : null;
+  const rt = rawRt !== undefined && rawRt !== null ? clamp(rawRt, 0, 1) : null;
+
+  if (lt === null && rt === null) return null;
+  return Object.freeze({ lt, rt });
+}
+
+function scriptTriggersEqual(a, b) {
+  if (a === b) return true;
+  const alt = a ? a.lt : 0;
+  const art = a ? a.rt : 0;
+  const blt = b ? b.lt : 0;
+  const brt = b ? b.rt : 0;
+  return alt === blt && art === brt;
 }
 
 function defaultNowMs() {
@@ -544,7 +644,8 @@ export class ScriptedInputPlayer {
         const holdMs = validatePositiveFinite(ev.holdMs, `events[${index}].holdMs`);
         const buttonsMask = resolveScriptButtonMask(ev.button, ev.buttonsMask);
         const sticks = normalizeScriptSticks(ev.sticks);
-        return { index, atMs, holdMs, buttonsMask, sticks };
+        const triggers = normalizeScriptTriggers(ev.triggers);
+        return { index, atMs, holdMs, buttonsMask, sticks, triggers };
       });
 
       indexed.sort((a, b) => (a.atMs !== b.atMs ? a.atMs - b.atMs : a.index - b.index));
@@ -563,6 +664,7 @@ export class ScriptedInputPlayer {
             endMs: evEnd,
             buttonsMask: ev.buttonsMask,
             sticks: ev.sticks,
+            triggers: ev.triggers,
           })
         );
       }
@@ -594,7 +696,8 @@ export class ScriptedInputPlayer {
           const holdMs = validatePositiveFinite(ev.holdMs, `loop.events[${index}].holdMs`);
           const buttonsMask = resolveScriptButtonMask(ev.button, ev.buttonsMask);
           const sticks = normalizeScriptSticks(ev.sticks);
-          return { index, offsetMs, holdMs, buttonsMask, sticks };
+          const triggers = normalizeScriptTriggers(ev.triggers);
+          return { index, offsetMs, holdMs, buttonsMask, sticks, triggers };
         });
 
         loopIndexed.sort((a, b) =>
@@ -620,6 +723,7 @@ export class ScriptedInputPlayer {
                   holdMs: ev.holdMs,
                   buttonsMask: ev.buttonsMask,
                   sticks: ev.sticks,
+                  triggers: ev.triggers,
                 })
               )
             ),
@@ -643,6 +747,7 @@ export class ScriptedInputPlayer {
       );
       const buttonsMask = resolveScriptButtonMask(spec.button, spec.buttonsMask);
       const sticks = normalizeScriptSticks(spec.sticks);
+      const triggers = normalizeScriptTriggers(spec.triggers);
 
       if (!presetName) {
         if (typeof spec.preset === 'string') presetName = spec.preset;
@@ -658,6 +763,7 @@ export class ScriptedInputPlayer {
         maxPresses,
         buttonsMask,
         sticks,
+        triggers,
       });
       this._events = EMPTY_ARRAY;
       this._loop = null;
@@ -720,6 +826,7 @@ export class ScriptedInputPlayer {
     this._lastScriptedButton = null;
     this._currentMask = 0;
     this._currentSticks = null;
+    this._currentTriggers = null;
     this._timerId = null;
     this._intervalId = null;
     this._runToken = 0;
@@ -731,7 +838,7 @@ export class ScriptedInputPlayer {
 
   /**
    * Pure deterministic evaluation at `elapsedMs` (ms since playback start).
-   * Returns `{ buttonsMask, activeEventCount }` (plus `sticks` when an active event sets sticks).
+   * Returns `{ buttonsMask, activeEventCount }` (plus `sticks` / `triggers` when set by an active event).
    */
   sampleAt(elapsedMs) {
     if (!Number.isFinite(elapsedMs) || elapsedMs < 0) {
@@ -739,7 +846,8 @@ export class ScriptedInputPlayer {
     }
 
     if (this._mode === 'repeating') {
-      const { startMs, holdMs, periodMs, endMs, maxPresses, buttonsMask, sticks } = this._rule;
+      const { startMs, holdMs, periodMs, endMs, maxPresses, buttonsMask, sticks, triggers } =
+        this._rule;
       if (maxPresses === 0 || elapsedMs < startMs) {
         return { buttonsMask: 0, activeEventCount: 0 };
       }
@@ -775,19 +883,22 @@ export class ScriptedInputPlayer {
         activeEventCount = Math.max(1, maxK - lowK + 1);
       }
 
+      const result = { buttonsMask, activeEventCount };
       if (sticks) {
-        return {
-          buttonsMask,
-          activeEventCount,
-          sticks: {
-            lx: sticks.lx ?? 0,
-            ly: sticks.ly ?? 0,
-            rx: sticks.rx ?? 0,
-            ry: sticks.ry ?? 0,
-          },
+        result.sticks = {
+          lx: sticks.lx ?? 0,
+          ly: sticks.ly ?? 0,
+          rx: sticks.rx ?? 0,
+          ry: sticks.ry ?? 0,
         };
       }
-      return { buttonsMask, activeEventCount };
+      if (triggers) {
+        result.triggers = {
+          lt: triggers.lt ?? 0,
+          rt: triggers.rt ?? 0,
+        };
+      }
+      return result;
     }
 
     let buttonsMask = 0;
@@ -797,6 +908,9 @@ export class ScriptedInputPlayer {
     let ly = 0;
     let rx = 0;
     let ry = 0;
+    let hasTriggers = false;
+    let lt = 0;
+    let rt = 0;
 
     for (let i = 0; i < this._events.length; i++) {
       const ev = this._events[i];
@@ -810,6 +924,11 @@ export class ScriptedInputPlayer {
           if (ev.sticks.ly !== null) ly = ev.sticks.ly;
           if (ev.sticks.rx !== null) rx = ev.sticks.rx;
           if (ev.sticks.ry !== null) ry = ev.sticks.ry;
+        }
+        if (ev.triggers) {
+          hasTriggers = true;
+          if (ev.triggers.lt !== null) lt = ev.triggers.lt;
+          if (ev.triggers.rt !== null) rt = ev.triggers.rt;
         }
       }
     }
@@ -861,17 +980,22 @@ export class ScriptedInputPlayer {
           if (ev.sticks.rx !== null) rx = ev.sticks.rx;
           if (ev.sticks.ry !== null) ry = ev.sticks.ry;
         }
+        if (ev.triggers) {
+          hasTriggers = true;
+          if (ev.triggers.lt !== null) lt = ev.triggers.lt;
+          if (ev.triggers.rt !== null) rt = ev.triggers.rt;
+        }
       }
     }
 
+    const result = { buttonsMask, activeEventCount };
     if (hasSticks) {
-      return {
-        buttonsMask,
-        activeEventCount,
-        sticks: { lx, ly, rx, ry },
-      };
+      result.sticks = { lx, ly, rx, ry };
     }
-    return { buttonsMask, activeEventCount };
+    if (hasTriggers) {
+      result.triggers = { lt, rt };
+    }
+    return result;
   }
 
   /**
@@ -1072,12 +1196,16 @@ export class ScriptedInputPlayer {
 
     const nextMask = sample.buttonsMask >>> 0;
     const nextSticks = sample.sticks || null;
+    const nextTriggers = sample.triggers || null;
     const changed =
-      nextMask !== prevMask || !scriptSticksEqual(nextSticks, this._currentSticks);
+      nextMask !== prevMask ||
+      !scriptSticksEqual(nextSticks, this._currentSticks) ||
+      !scriptTriggersEqual(nextTriggers, this._currentTriggers);
 
     if (changed) {
       this._currentMask = nextMask;
       this._currentSticks = nextSticks;
+      this._currentTriggers = nextTriggers;
       if (nextMask !== 0) {
         const newlyPressed = (nextMask & ~prevMask) >>> 0;
         if (newlyPressed !== 0) {
@@ -1121,7 +1249,10 @@ export class ScriptedInputPlayer {
    * Starts timer-driven playback from `elapsedMs = 0`.
    */
   start() {
-    const hadHeldState = this._currentMask !== 0 || this._currentSticks !== null;
+    const hadHeldState =
+      this._currentMask !== 0 ||
+      this._currentSticks !== null ||
+      this._currentTriggers !== null;
     this._clearTimers();
     this._runToken += 1;
     const token = this._runToken;
@@ -1133,6 +1264,7 @@ export class ScriptedInputPlayer {
     this._lastScriptedButton = null;
     this._currentMask = 0;
     this._currentSticks = null;
+    this._currentTriggers = null;
     this._active = true;
 
     this._tick(token, 0);
@@ -1141,6 +1273,7 @@ export class ScriptedInputPlayer {
       hadHeldState &&
       this._currentMask === 0 &&
       this._currentSticks === null &&
+      this._currentTriggers === null &&
       token === this._runToken
     ) {
       this._emitSample({ buttonsMask: 0, activeEventCount: 0 });
@@ -1172,6 +1305,7 @@ export class ScriptedInputPlayer {
         elapsedMs !== undefined ? elapsedMs : Math.max(0, this._nowFn() - this._startedAt)
       ).activeEventCount,
       ...(this._currentSticks ? { sticks: { ...this._currentSticks } } : null),
+      ...(this._currentTriggers ? { triggers: { ...this._currentTriggers } } : null),
     };
   }
 
@@ -1184,13 +1318,17 @@ export class ScriptedInputPlayer {
     }
     this._currentMask = 0;
     this._currentSticks = null;
+    this._currentTriggers = null;
   }
 
   /**
    * Stops playback, cancels timers, and clears any held scripted buttons immediately.
    */
   stop() {
-    const hadHeldState = this._currentMask !== 0 || this._currentSticks !== null;
+    const hadHeldState =
+      this._currentMask !== 0 ||
+      this._currentSticks !== null ||
+      this._currentTriggers !== null;
     this._stopWithoutSink();
     if (hadHeldState) {
       this._emitSample({ buttonsMask: 0, activeEventCount: 0 });
@@ -1334,8 +1472,12 @@ export class InputBridge {
     this._onPointerLockChangeCallback =
       typeof opts.onPointerLockChange === 'function' ? opts.onPointerLockChange : null;
 
-    // Input hardening & hot-plug telemetry
+    // Input hardening, hot-plug & zero-alloc snapshot telemetry
     this._blurResets = 0;
+    this._stuckResetCount = 0;
+    this._pollsCount = 0;
+    this._writesCount = 0;
+    this._scriptedEventsDispatched = 0;
     this._gamepadConnects = 0;
     this._gamepadDisconnects = 0;
     this._activeGamepadIndex = null;
@@ -1366,10 +1508,38 @@ export class InputBridge {
     this._scriptLy = 0;
     this._scriptRx = 0;
     this._scriptRy = 0;
+    this._scriptLt = 0;
+    this._scriptRt = 0;
 
-    // Pre-allocated scratch objects for zero-allocation 60/120Hz gamepad polling.
+    // Pre-allocated scratch objects for zero-allocation 60/120Hz polling, snapshots & telemetry.
     this._leftStickScratch = { x: 0, y: 0 };
     this._rightStickScratch = { x: 0, y: 0 };
+    this._selectedGamepadScratch = { pad: null, index: -1 };
+    this._snapshotScratch = {
+      seq: 0,
+      buttons: 0,
+      mouse_dx: 0,
+      mouse_dy: 0,
+      lx: 0,
+      ly: 0,
+      rx: 0,
+      ry: 0,
+      lt: 0,
+      rt: 0,
+      pointerLocked: false,
+      wheelDelta: 0,
+    };
+    this._telemetryScratch = {
+      pollsCount: 0,
+      writesCount: 0,
+      stuckResetCount: 0,
+      activePreset: null,
+      scriptedEventsDispatched: 0,
+      seq: 0,
+      buttons: 0,
+      pointerLocked: false,
+      activeGamepadIndex: null,
+    };
 
     // Last committed merged state (stored as IEEE-754 int32 bits for fast change detection).
     this.buttons = 0;
@@ -1534,6 +1704,7 @@ export class InputBridge {
       if (dx !== 0) this._atomicAddI32(INPUT_WORD_INDICES.MOUSE_DX, dx);
       if (dy !== 0) this._atomicAddI32(INPUT_WORD_INDICES.MOUSE_DY, dy);
       this._atomicAddU32(INPUT_WORD_INDICES.SEQ, 1);
+      this._writesCount += 1;
     });
 
     this._addListener(this._window, 'mousedown', (e) => {
@@ -1629,10 +1800,14 @@ export class InputBridge {
         this._activeGamepadIndex = eventPadIndex;
       }
 
-      const selected =
-        this._selectGamepadEntry() ||
-        (eventPadAllowed ? { pad: eventPad, index: eventPadIndex ?? 0 } : null);
+      let selected = this._selectGamepadEntry();
+      if (!selected && eventPadAllowed) {
+        this._selectedGamepadScratch.pad = eventPad;
+        this._selectedGamepadScratch.index = eventPadIndex ?? 0;
+        selected = this._selectedGamepadScratch;
+      }
       this._pollSelectedGamepadEntry(selected, false);
+      this._selectedGamepadScratch.pad = null;
       if (this._autoStartOnGamepad && !this.running) {
         this._startLoop(false);
       }
@@ -1654,6 +1829,7 @@ export class InputBridge {
       const remaining = this._selectGamepadEntry(disconnectedIndex);
       if (remaining) {
         this._pollSelectedGamepadEntry(remaining, true);
+        this._selectedGamepadScratch.pad = null;
       } else {
         this._activeGamepadIndex = null;
         this._commitMergedState(true);
@@ -1723,6 +1899,7 @@ export class InputBridge {
   _clearTransientInputs() {
     if (this.disposed) return;
     this._blurResets += 1;
+    this._stuckResetCount += 1;
 
     this._pressedKeys.clear();
     this._recomputeKeyboardState();
@@ -1732,6 +1909,9 @@ export class InputBridge {
   }
 
   _selectGamepadEntry(excludeIndex = null) {
+    this._selectedGamepadScratch.pad = null;
+    this._selectedGamepadScratch.index = -1;
+
     if (!this._navigator || typeof this._navigator.getGamepads !== 'function') {
       return null;
     }
@@ -1751,12 +1931,18 @@ export class InputBridge {
       if (!target || target.connected === false) return null;
       const idx = typeof target.index === 'number' ? target.index : this._gamepadIndex;
       if (excludeIndex !== null && idx === excludeIndex) return null;
-      return { pad: target, index: idx };
+      this._selectedGamepadScratch.pad = target;
+      this._selectedGamepadScratch.index = idx;
+      return this._selectedGamepadScratch;
     }
 
-    let activeEntry = null;
-    let firstStandard = null;
-    let fallback = null;
+    let activePad = null;
+    let activeIdx = -1;
+    let firstStandardPad = null;
+    let firstStandardIdx = -1;
+    let fallbackPad = null;
+    let fallbackIdx = -1;
+
     for (let i = 0; i < pads.length; i++) {
       const pad = pads[i];
       if (!pad || pad.connected === false) continue;
@@ -1764,25 +1950,42 @@ export class InputBridge {
       if (excludeIndex !== null && idx === excludeIndex) continue;
 
       if (this._activeGamepadIndex !== null && idx === this._activeGamepadIndex) {
-        activeEntry = { pad, index: idx };
+        activePad = pad;
+        activeIdx = idx;
       }
-      if (pad.mapping === 'standard' && !firstStandard) {
-        firstStandard = { pad, index: idx };
+      if (pad.mapping === 'standard' && firstStandardPad === null) {
+        firstStandardPad = pad;
+        firstStandardIdx = idx;
       }
-      if (!fallback) {
-        fallback = { pad, index: idx };
+      if (fallbackPad === null) {
+        fallbackPad = pad;
+        fallbackIdx = idx;
       }
     }
 
-    if (activeEntry && (activeEntry.pad.mapping === 'standard' || !firstStandard)) {
-      return activeEntry;
+    if (activePad !== null && (activePad.mapping === 'standard' || firstStandardPad === null)) {
+      this._selectedGamepadScratch.pad = activePad;
+      this._selectedGamepadScratch.index = activeIdx;
+      return this._selectedGamepadScratch;
     }
-    return firstStandard || fallback;
+    if (firstStandardPad !== null) {
+      this._selectedGamepadScratch.pad = firstStandardPad;
+      this._selectedGamepadScratch.index = firstStandardIdx;
+      return this._selectedGamepadScratch;
+    }
+    if (fallbackPad !== null) {
+      this._selectedGamepadScratch.pad = fallbackPad;
+      this._selectedGamepadScratch.index = fallbackIdx;
+      return this._selectedGamepadScratch;
+    }
+    return null;
   }
 
   _selectGamepad(excludeIndex = null) {
     const entry = this._selectGamepadEntry(excludeIndex);
-    return entry ? entry.pad : null;
+    const pad = entry ? entry.pad : null;
+    this._selectedGamepadScratch.pad = null;
+    return pad;
   }
 
   _pollSelectedGamepadEntry(entry, forceCommit = false) {
@@ -1848,7 +2051,10 @@ export class InputBridge {
    */
   pollGamepads() {
     if (this.disposed) return false;
-    return this._pollSelectedGamepadEntry(this._selectGamepadEntry(), false);
+    this._pollsCount += 1;
+    const committed = this._pollSelectedGamepadEntry(this._selectGamepadEntry(), false);
+    this._selectedGamepadScratch.pad = null;
+    return committed;
   }
 
   _commitMergedState(force = false, clearMouseDelta = false) {
@@ -1869,8 +2075,8 @@ export class InputBridge {
     const rx = clamp(this._gpRx !== 0 ? this._gpRx : this._scriptRx, -1, 1);
     const ry = clamp(this._gpRy !== 0 ? this._gpRy : this._scriptRy, -1, 1);
 
-    const lt = clamp(Math.max(this._mouseLt, this._gpLt), 0, 1);
-    const rt = clamp(Math.max(this._mouseRt, this._gpRt), 0, 1);
+    const lt = clamp(Math.max(this._mouseLt, this._gpLt, this._scriptLt), 0, 1);
+    const rt = clamp(Math.max(this._mouseRt, this._gpRt, this._scriptRt), 0, 1);
 
     // Compare IEEE-754 float32 representations so sub-f32 noise does not cause spurious writes.
     const lxBits = f32ToI32(lx);
@@ -1925,6 +2131,7 @@ export class InputBridge {
     this._atomicStoreI32(INPUT_WORD_INDICES.LEFT_TRIGGER, ltBits);
     this._atomicStoreI32(INPUT_WORD_INDICES.RIGHT_TRIGGER, rtBits);
     this._atomicAddU32(INPUT_WORD_INDICES.SEQ, 1);
+    this._writesCount += 1;
 
     return true;
   }
@@ -1962,11 +2169,35 @@ export class InputBridge {
     const nextButtons =
       sample && typeof sample.buttonsMask === 'number' ? sample.buttonsMask >>> 0 : 0;
     const sticks = sample && sample.sticks ? sample.sticks : null;
+    const triggers = sample && sample.triggers ? sample.triggers : null;
+    const nextLx = sticks && Number.isFinite(sticks.lx) ? clamp(sticks.lx, -1, 1) : 0;
+    const nextLy = sticks && Number.isFinite(sticks.ly) ? clamp(sticks.ly, -1, 1) : 0;
+    const nextRx = sticks && Number.isFinite(sticks.rx) ? clamp(sticks.rx, -1, 1) : 0;
+    const nextRy = sticks && Number.isFinite(sticks.ry) ? clamp(sticks.ry, -1, 1) : 0;
+    const nextLt = triggers && Number.isFinite(triggers.lt) ? clamp(triggers.lt, 0, 1) : 0;
+    const nextRt = triggers && Number.isFinite(triggers.rt) ? clamp(triggers.rt, 0, 1) : 0;
+
+    if (
+      sample &&
+      (sample.activeEventCount > 0 ||
+        nextButtons !== 0 ||
+        nextLx !== 0 ||
+        nextLy !== 0 ||
+        nextRx !== 0 ||
+        nextRy !== 0 ||
+        nextLt !== 0 ||
+        nextRt !== 0)
+    ) {
+      this._scriptedEventsDispatched += 1;
+    }
+
     this._scriptButtons = nextButtons;
-    this._scriptLx = sticks && Number.isFinite(sticks.lx) ? clamp(sticks.lx, -1, 1) : 0;
-    this._scriptLy = sticks && Number.isFinite(sticks.ly) ? clamp(sticks.ly, -1, 1) : 0;
-    this._scriptRx = sticks && Number.isFinite(sticks.rx) ? clamp(sticks.rx, -1, 1) : 0;
-    this._scriptRy = sticks && Number.isFinite(sticks.ry) ? clamp(sticks.ry, -1, 1) : 0;
+    this._scriptLx = nextLx;
+    this._scriptLy = nextLy;
+    this._scriptRx = nextRx;
+    this._scriptRy = nextRy;
+    this._scriptLt = nextLt;
+    this._scriptRt = nextRt;
     return this._commitMergedState(false);
   }
 
@@ -2012,12 +2243,16 @@ export class InputBridge {
       this._scriptLx !== 0 ||
       this._scriptLy !== 0 ||
       this._scriptRx !== 0 ||
-      this._scriptRy !== 0;
+      this._scriptRy !== 0 ||
+      this._scriptLt !== 0 ||
+      this._scriptRt !== 0;
     this._scriptButtons = 0;
     this._scriptLx = 0;
     this._scriptLy = 0;
     this._scriptRx = 0;
     this._scriptRy = 0;
+    this._scriptLt = 0;
+    this._scriptRt = 0;
     if (hadScriptState && !this.disposed) {
       this._commitMergedState(false);
     }
@@ -2066,6 +2301,10 @@ export class InputBridge {
       currentScriptMask: script.currentMask,
       availablePresets: INPUT_SCRIPT_PRESET_NAMES,
       blurResets: this._blurResets,
+      stuckResetCount: this._stuckResetCount,
+      pollsCount: this._pollsCount,
+      writesCount: this._writesCount,
+      scriptedEventsDispatched: this._scriptedEventsDispatched,
       gamepadConnects: this._gamepadConnects,
       gamepadDisconnects: this._gamepadDisconnects,
       activeGamepadIndex: this._activeGamepadIndex,
@@ -2077,6 +2316,49 @@ export class InputBridge {
    */
   getStatus() {
     return this.getStats();
+  }
+
+  /**
+   * Returns hot-path input-state telemetry (`pollsCount`, `writesCount`, `stuckResetCount`,
+   * `activePreset`, `scriptedEventsDispatched`, `seq`, `buttons`, `pointerLocked`,
+   * `activeGamepadIndex`).
+   * Pass `{ reuse: true }` or a pre-allocated target object (`out`) for zero-allocation reads.
+   */
+  getInputTelemetry(optionsOrOut = null) {
+    let target = null;
+    if (optionsOrOut && typeof optionsOrOut === 'object') {
+      if (typeof optionsOrOut.reuse === 'boolean' || 'out' in optionsOrOut) {
+        if (optionsOrOut.out && typeof optionsOrOut.out === 'object') {
+          target = optionsOrOut.out;
+        } else if (optionsOrOut.reuse === true) {
+          target = this._telemetryScratch;
+        }
+      } else {
+        target = optionsOrOut;
+      }
+    }
+    const out = target || {
+      pollsCount: 0,
+      writesCount: 0,
+      stuckResetCount: 0,
+      activePreset: null,
+      scriptedEventsDispatched: 0,
+      seq: 0,
+      buttons: 0,
+      pointerLocked: false,
+      activeGamepadIndex: null,
+    };
+    out.pollsCount = this._pollsCount;
+    out.writesCount = this._writesCount;
+    out.stuckResetCount = this._stuckResetCount;
+    out.activePreset =
+      this._scriptPlayer && this._scriptPlayer._active ? this._scriptPlayer.preset : null;
+    out.scriptedEventsDispatched = this._scriptedEventsDispatched;
+    out.seq = this._atomicLoadU32(INPUT_WORD_INDICES.SEQ);
+    out.buttons = this.buttons;
+    out.pointerLocked = this.isPointerLocked();
+    out.activeGamepadIndex = this._activeGamepadIndex;
+    return out;
   }
 
   consumeWheelDelta() {
@@ -2094,6 +2376,8 @@ export class InputBridge {
     this._scriptLy = 0;
     this._scriptRx = 0;
     this._scriptRy = 0;
+    this._scriptLt = 0;
+    this._scriptRt = 0;
 
     this._pressedKeys.clear();
     this._recomputeKeyboardState();
@@ -2128,14 +2412,32 @@ export class InputBridge {
     this._atomicStoreI32(INPUT_WORD_INDICES.LEFT_TRIGGER, 0);
     this._atomicStoreI32(INPUT_WORD_INDICES.RIGHT_TRIGGER, 0);
     this._atomicAddU32(INPUT_WORD_INDICES.SEQ, 1);
+    this._writesCount += 1;
   }
 
   /**
    * Captures a consistent snapshot from the 40-byte SharedArrayBuffer using the same
    * even/odd seqlock protocol as playgta6::os::GameInputReader::read_snapshot().
-   * Pass a pre-allocated `out` object to avoid per-frame allocations.
+   * Pass `{ reuse: true }` (zero-alloc internal scratch) or a pre-allocated `out` object
+   * to avoid per-frame allocations.
    */
-  getSnapshot(maxRetries = 64, out = null) {
+  getSnapshot(maxRetriesOrOptions = 64, out = null) {
+    let maxRetries = 64;
+    let target = out;
+
+    if (maxRetriesOrOptions && typeof maxRetriesOrOptions === 'object') {
+      if (typeof maxRetriesOrOptions.maxRetries === 'number') {
+        maxRetries = maxRetriesOrOptions.maxRetries;
+      }
+      if (maxRetriesOrOptions.out && typeof maxRetriesOrOptions.out === 'object') {
+        target = maxRetriesOrOptions.out;
+      } else if (maxRetriesOrOptions.reuse === true) {
+        target = this._snapshotScratch;
+      }
+    } else if (typeof maxRetriesOrOptions === 'number') {
+      maxRetries = maxRetriesOrOptions;
+    }
+
     const attempts = maxRetries > 0 ? maxRetries : 1;
     for (let i = 0; i < attempts; i++) {
       const seqBefore = this._atomicLoadU32(INPUT_WORD_INDICES.SEQ);
@@ -2153,7 +2455,20 @@ export class InputBridge {
 
       const seqAfter = this._atomicLoadU32(INPUT_WORD_INDICES.SEQ);
       if (seqBefore === seqAfter) {
-        const snap = out || {};
+        const snap = target || {
+          seq: 0,
+          buttons: 0,
+          mouse_dx: 0,
+          mouse_dy: 0,
+          lx: 0,
+          ly: 0,
+          rx: 0,
+          ry: 0,
+          lt: 0,
+          rt: 0,
+          pointerLocked: false,
+          wheelDelta: 0,
+        };
         snap.seq = seqBefore;
         snap.buttons = buttons;
         snap.mouse_dx = mouse_dx;
