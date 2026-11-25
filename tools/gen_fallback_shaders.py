@@ -27,7 +27,10 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
+import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -80,6 +83,299 @@ class UnsafeOutputPathError(FallbackShaderError):
 
     def __init__(self, message: str) -> None:
         super().__init__(message, code="unsafe_output_path")
+
+
+@dataclass(frozen=True)
+class WgslHygieneIssue:
+    """Single sanitized WGSL syntax hygiene violation (never contains raw source)."""
+
+    code: str
+    line: int
+    message: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "code": self.code,
+            "line": self.line,
+            "message": sanitize_text(self.message),
+        }
+
+
+class WgslHygieneError(FallbackShaderError):
+    """Raised when a fallback WGSL source fails syntax hygiene validation."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        issues: Sequence[WgslHygieneIssue] = (),
+        shader_key: str | None = None,
+    ) -> None:
+        super().__init__(sanitize_text(message), code="wgsl_hygiene_error")
+        self.issues: tuple[WgslHygieneIssue, ...] = tuple(issues)
+        self.shader_key: str | None = sanitize_text(shader_key) if shader_key is not None else None
+
+
+# ---------------------------------------------------------------------------
+# Sanitization helpers (zero host paths or usernames in JSON / diagnostics)
+# ---------------------------------------------------------------------------
+
+_FILE_URL_RE = re.compile(r"\bfile://[^\s\"'<>|,;()\[\]]+", re.IGNORECASE)
+_UNC_BS_PATH_RE = re.compile(r"\\\\[^\s\"'<>|,;()\[\]]+")
+_UNC_FS_PATH_RE = re.compile(r"(?<![A-Za-z0-9_:])//[^\s\"'<>|,;()\[\]]+")
+_WINDOWS_PATH_RE = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z]:[\\/][^\s\"'<>|,;()\[\]]*")
+_POSIX_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_./])/(?:Users|home|tmp|var|opt|root|mnt|private|etc|usr|Library|Volumes|proc|run|srv)/[^\s\"'<>|,;()\[\]]*"
+)
+
+
+def _current_usernames(extra_usernames: Sequence[str] = ()) -> list[str]:
+    """Return active OS username candidates (length >= 3) for redaction."""
+    candidates: list[str] = [
+        os.environ.get("USERNAME", ""),
+        os.environ.get("USER", ""),
+        os.environ.get("LOGNAME", ""),
+        *extra_usernames,
+    ]
+    try:
+        candidates.append(getpass.getuser())
+    except (OSError, KeyError, RuntimeError):
+        pass
+    try:
+        candidates.append(Path.home().name)
+    except (OSError, RuntimeError):
+        pass
+
+    names: list[str] = []
+    for candidate in candidates:
+        cleaned = str(candidate).strip()
+        if len(cleaned) >= 3 and cleaned not in names:
+            names.append(cleaned)
+    return names
+
+
+def _home_path_variants() -> list[str]:
+    """Return concrete home directory path strings (native + POSIX) for pre-redaction."""
+    variants: list[str] = []
+    try:
+        home = Path.home()
+        for raw in (str(home), home.as_posix()):
+            cleaned = raw.rstrip("/\\")
+            if len(cleaned) >= 4 and cleaned not in variants:
+                variants.append(cleaned)
+    except (OSError, RuntimeError):
+        pass
+    return variants
+
+
+def sanitize_text(raw: str | None, *, extra_usernames: Sequence[str] = ()) -> str:
+    """Strip host paths, drive letters, UNC paths, POSIX roots, and active usernames."""
+    if raw is None:
+        return ""
+    text = str(raw)
+    text = _FILE_URL_RE.sub("<path>", text)
+    for home_str in _home_path_variants():
+        text = re.sub(re.escape(home_str), "<path>", text, flags=re.IGNORECASE)
+    text = _UNC_BS_PATH_RE.sub("<path>", text)
+    text = _WINDOWS_PATH_RE.sub("<path>", text)
+    text = _UNC_FS_PATH_RE.sub("<path>", text)
+    text = _POSIX_PATH_RE.sub("<path>", text)
+    for username in _current_usernames(extra_usernames):
+        pattern = re.compile(
+            rf"(?<![A-Za-z0-9_]){re.escape(username)}(?![A-Za-z0-9_])",
+            re.IGNORECASE,
+        )
+        text = pattern.sub("<user>", text)
+    return text
+
+
+def sanitize_source_label(source: str | Path | None) -> str:
+    """Return a strictly sanitized basename-only label (never a host path)."""
+    if source is None:
+        return "<unknown>"
+    raw = str(source).strip()
+    if not raw:
+        return "<unknown>"
+    if raw.startswith("<") and raw.endswith(">"):
+        return sanitize_text(raw)
+    stripped = raw.rstrip("/\\")
+    if not stripped:
+        return "<unknown>"
+    parts = re.split(r"[/\\]+", stripped)
+    base = parts[-1]
+    if not base or (len(base) == 2 and base[1] == ":"):
+        return "<unknown>"
+    return sanitize_text(base)
+
+
+def sanitize_value(value: Any, *, extra_usernames: Sequence[str] = ()) -> Any:
+    """Recursively sanitize strings/paths and redact raw bytes in JSON metadata."""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return f"<bytes:{len(value)}>"
+    if isinstance(value, str):
+        return sanitize_text(value, extra_usernames=extra_usernames)
+    if isinstance(value, Path):
+        return sanitize_source_label(value)
+    if isinstance(value, Mapping):
+        return {
+            sanitize_text(str(k), extra_usernames=extra_usernames): sanitize_value(
+                v, extra_usernames=extra_usernames
+            )
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [sanitize_value(v, extra_usernames=extra_usernames) for v in value]
+    return value
+
+
+# ---------------------------------------------------------------------------
+# WGSL syntax hygiene validation
+# ---------------------------------------------------------------------------
+
+_WGSL_HYGIENE_TOKEN_RE = re.compile(r"/\*|\*/|//|\n|\{|\}|\blet\b")
+
+
+def check_wgsl_hygiene(source: str) -> tuple[WgslHygieneIssue, ...]:
+    """Validate WGSL syntax hygiene and return any deterministic issues found.
+
+    Checks enforced:
+      - Non-empty WGSL source.
+      - LF newlines only (rejects CRLF `\\r\\n` and bare CR `\\r`).
+      - Closed and matched nested `/* ... */` block comments (respecting `//` line comments).
+      - Balanced `{}` braces outside comments.
+      - No module-scope `let` declarations (WGSL requires `const` or `override` at module scope).
+    """
+    if not isinstance(source, str):
+        raise TypeError(f"expected WGSL source str, got {type(source).__name__}")
+
+    issues: list[WgslHygieneIssue] = []
+    if not source.strip():
+        issues.append(
+            WgslHygieneIssue(
+                code="empty_source",
+                line=1,
+                message="WGSL source must not be empty",
+            )
+        )
+        return tuple(issues)
+
+    # 1. Enforce LF-only newlines and build an LF-normalized view for line-accurate scanning.
+    line_no = 1
+    idx = 0
+    length = len(source)
+    while idx < length:
+        ch = source[idx]
+        if ch == "\r":
+            issues.append(
+                WgslHygieneIssue(
+                    code="non_lf_newline",
+                    line=line_no,
+                    message="WGSL source must use LF newlines only (found CR)",
+                )
+            )
+            if idx + 1 < length and source[idx + 1] == "\n":
+                idx += 2
+            else:
+                idx += 1
+            line_no += 1
+            continue
+        if ch == "\n":
+            line_no += 1
+        idx += 1
+
+    normalized = source.replace("\r\n", "\n").replace("\r", "\n")
+
+    # 2. Single-pass lexical hygiene scan for comments, braces, and module-scope `let`.
+    scan_line = 1
+    in_line_comment = False
+    open_comment_lines: list[int] = []
+    open_brace_lines: list[int] = []
+
+    for match in _WGSL_HYGIENE_TOKEN_RE.finditer(normalized):
+        tok = match.group(0)
+        if tok == "\n":
+            scan_line += 1
+            in_line_comment = False
+            continue
+        if in_line_comment:
+            continue
+        if tok == "/*":
+            open_comment_lines.append(scan_line)
+            continue
+        if tok == "*/":
+            if open_comment_lines:
+                open_comment_lines.pop()
+            else:
+                issues.append(
+                    WgslHygieneIssue(
+                        code="unmatched_block_comment_close",
+                        line=scan_line,
+                        message="unexpected closing block comment '*/'",
+                    )
+                )
+            continue
+        if open_comment_lines:
+            continue
+        if tok == "//":
+            in_line_comment = True
+            continue
+        if tok == "{":
+            open_brace_lines.append(scan_line)
+            continue
+        if tok == "}":
+            if open_brace_lines:
+                open_brace_lines.pop()
+            else:
+                issues.append(
+                    WgslHygieneIssue(
+                        code="unbalanced_braces",
+                        line=scan_line,
+                        message="unexpected closing brace '}'",
+                    )
+                )
+            continue
+        if tok == "let" and not open_brace_lines:
+            issues.append(
+                WgslHygieneIssue(
+                    code="module_scope_let",
+                    line=scan_line,
+                    message="module-scope 'let' declaration is invalid in WGSL (use 'const' or 'override')",
+                )
+            )
+
+    for open_line in open_comment_lines:
+        issues.append(
+            WgslHygieneIssue(
+                code="unclosed_block_comment",
+                line=open_line,
+                message="unclosed block comment '/*'",
+            )
+        )
+    for open_line in open_brace_lines:
+        issues.append(
+            WgslHygieneIssue(
+                code="unbalanced_braces",
+                line=open_line,
+                message="unclosed opening brace '{'",
+            )
+        )
+
+    issues.sort(key=lambda item: (item.line, item.code, item.message))
+    return tuple(issues)
+
+
+def validate_wgsl_hygiene(source: str, *, shader_key: str | None = None) -> None:
+    """Raise `WgslHygieneError` if `source` fails any WGSL syntax hygiene check."""
+    issues = check_wgsl_hygiene(source)
+    if not issues:
+        return
+    label = f"shader '{sanitize_text(shader_key)}'" if shader_key else "WGSL shader"
+    details = "; ".join(f"line {issue.line} [{issue.code}]: {issue.message}" for issue in issues)
+    raise WgslHygieneError(
+        f"{label} failed WGSL hygiene validation ({len(issues)} issue(s)): {details}",
+        issues=issues,
+        shader_key=shader_key,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -640,15 +936,60 @@ def builtin_fallback_shaders() -> tuple[FallbackShader, ...]:
         workgroup_size=(64, 1, 1),
         pipeline_key=None,
     )
-    return (
-        splash_vs,
-        splash_fs,
-        debug_vs,
-        debug_fs,
-        unlit_vs,
-        unlit_fs,
-        compute,
+    return canonicalize_shader_catalog(
+        (
+            splash_vs,
+            splash_fs,
+            debug_vs,
+            debug_fs,
+            unlit_vs,
+            unlit_fs,
+            compute,
+        )
     )
+
+
+def is_canonical_shader_order(shaders: Sequence[FallbackShader]) -> bool:
+    """Return True iff `shaders` are in strictly ascending 64-bit hash order."""
+    previous_hash: int | None = None
+    for shader in shaders:
+        current = shader.hash
+        if previous_hash is not None and current <= previous_hash:
+            return False
+        previous_hash = current
+    return True
+
+
+def canonicalize_shader_catalog(
+    shaders: Sequence[FallbackShader],
+) -> tuple[FallbackShader, ...]:
+    """Validate WGSL hygiene, stage names, and hash uniqueness, then sort canonically.
+
+    Canonical generation order matches `shaders/src/pack.rs` (`is_canonical_hash_order`):
+    strictly ascending unsigned 64-bit FNV-1a shader hash.
+    """
+    validated: list[FallbackShader] = []
+    seen_hashes: dict[int, str] = {}
+
+    for shader in shaders:
+        if shader.stage not in STAGE_ORDER:
+            raise FallbackShaderError(
+                f"invalid shader stage for '{sanitize_text(shader.key)}': {sanitize_text(shader.stage)!r}",
+                code="invalid_shader_stage",
+            )
+        validate_wgsl_hygiene(shader.wgsl, shader_key=shader.key)
+        shader_hash = shader.hash
+        if shader_hash in seen_hashes:
+            raise FallbackShaderError(
+                f"duplicate shader hash {format_shader_hash(shader_hash)} "
+                f"for '{sanitize_text(seen_hashes[shader_hash])}' and '{sanitize_text(shader.key)}'",
+                code="duplicate_shader_hash",
+            )
+        seen_hashes[shader_hash] = shader.key
+        validated.append(shader)
+
+    validated.sort(key=lambda item: (item.hash, STAGE_ORDER[item.stage], item.key))
+    return tuple(validated)
 
 
 # ---------------------------------------------------------------------------
@@ -710,23 +1051,28 @@ class GeneratedFallbackArtifacts:
     reflection_manifest_text: str = ""
 
     def summary(self) -> dict[str, Any]:
-        return {
-            "ok": True,
-            "packName": self.pack_name,
-            "packBytes": len(self.pack_bytes),
-            "entryCount": len(self.shaders),
-            "shaderHashes": [shader.hash_hex for shader in self.shaders],
-            "stageCounts": {
-                "vertex": sum(1 for s in self.shaders if s.stage == "vertex"),
-                "fragment": sum(1 for s in self.shaders if s.stage == "fragment"),
-                "compute": sum(1 for s in self.shaders if s.stage == "compute"),
-            },
-            "outputs": [
-                self.pack_name,
-                SHADER_INDEX_FILE_NAME,
-                REFLECTION_MANIFEST_FILE_NAME,
-            ],
-        }
+        safe_pack_name = sanitize_source_label(self.pack_name)
+        return sanitize_value(
+            {
+                "ok": True,
+                "packName": safe_pack_name,
+                "packBytes": len(self.pack_bytes),
+                "entryCount": len(self.shaders),
+                "shaderHashes": [shader.hash_hex for shader in self.shaders],
+                "canonicalOrder": is_canonical_shader_order(self.shaders),
+                "wgslHygieneChecked": True,
+                "stageCounts": {
+                    "vertex": sum(1 for s in self.shaders if s.stage == "vertex"),
+                    "fragment": sum(1 for s in self.shaders if s.stage == "fragment"),
+                    "compute": sum(1 for s in self.shaders if s.stage == "compute"),
+                },
+                "outputs": [
+                    safe_pack_name,
+                    SHADER_INDEX_FILE_NAME,
+                    REFLECTION_MANIFEST_FILE_NAME,
+                ],
+            }
+        )
 
 
 def _stage_group_layouts(shader: FallbackShader) -> list[list[dict[str, Any]]]:
@@ -755,15 +1101,35 @@ def _intern_pipeline_layout(
 
 
 def build_reflection_manifest(shaders: Sequence[FallbackShader]) -> dict[str, Any]:
-    """Build an S6 schema_version=1 reflection manifest for the fallback catalog."""
+    """Build a canonical, sanitized S6 schema_version=1 reflection manifest."""
+    ordered_shaders = sorted(
+        shaders,
+        key=lambda item: (item.hash, STAGE_ORDER.get(item.stage, 99), item.key),
+    )
     bind_group_layouts: dict[str, dict[str, Any]] = {}
     pipeline_layouts: dict[str, dict[str, Any]] = {}
     shader_records: dict[str, dict[str, Any]] = {}
 
-    for shader in shaders:
+    for shader in ordered_shaders:
         groups = [{"entries": entries} for entries in _stage_group_layouts(shader)]
         # Dense group list: no groups => empty pipeline layout (no bind groups).
         pl_id, bgl_ids = _intern_pipeline_layout(bind_group_layouts, pipeline_layouts, groups)
+        sorted_bindings = sorted(
+            (dict(b) for b in shader.bindings),
+            key=lambda item: (
+                int(item.get("group", 0)),
+                int(item.get("binding", 0)),
+                str(item.get("name", "")),
+            ),
+        )
+        sorted_vertex_inputs = sorted(
+            (dict(v) for v in shader.vertex_inputs),
+            key=lambda item: int(item.get("location", 0)),
+        )
+        sorted_fragment_outputs = sorted(
+            (dict(f) for f in shader.fragment_outputs),
+            key=lambda item: int(item.get("location", 0)),
+        )
         record: dict[str, Any] = {
             "stage": shader.stage,
             "entry_point": shader.entry_point,
@@ -771,9 +1137,9 @@ def build_reflection_manifest(shaders: Sequence[FallbackShader]) -> dict[str, An
             "bind_group_layouts": bgl_ids,
             "layout_complete": True,
             "workgroup_size": list(shader.workgroup_size) if shader.workgroup_size else None,
-            "bindings": [dict(b) for b in shader.bindings],
-            "vertex_inputs": [dict(v) for v in shader.vertex_inputs],
-            "fragment_outputs": [dict(f) for f in shader.fragment_outputs],
+            "bindings": sorted_bindings,
+            "vertex_inputs": sorted_vertex_inputs,
+            "fragment_outputs": sorted_fragment_outputs,
             "requires_lowering": [],
             "limit_violations": [],
         }
@@ -782,11 +1148,12 @@ def build_reflection_manifest(shaders: Sequence[FallbackShader]) -> dict[str, An
     # Pre-merged graphics pipelines for each vs+fs pair.
     pipelines: dict[str, dict[str, Any]] = {}
     by_pipeline: dict[str, list[FallbackShader]] = {}
-    for shader in shaders:
+    for shader in ordered_shaders:
         if shader.pipeline_key:
             by_pipeline.setdefault(shader.pipeline_key, []).append(shader)
 
-    for members in by_pipeline.values():
+    for pipeline_name in sorted(by_pipeline):
+        members = by_pipeline[pipeline_name]
         if len(members) < 2:
             continue
         ordered = sorted(members, key=lambda s: (STAGE_ORDER[s.stage], s.hash))
@@ -808,7 +1175,7 @@ def build_reflection_manifest(shaders: Sequence[FallbackShader]) -> dict[str, An
         }
 
     # Deterministic key ordering via sorted insertion into plain dicts for json.dumps.
-    return {
+    manifest = {
         "schema_version": LAYOUT_MANIFEST_SCHEMA_VERSION,
         "register_convention": {
             "source": "dxc-spirv",
@@ -827,6 +1194,7 @@ def build_reflection_manifest(shaders: Sequence[FallbackShader]) -> dict[str, An
             key: pipelines[key] for key in sorted(pipelines)
         },
     }
+    return sanitize_value(manifest)
 
 
 def render_shader_index_json(
@@ -834,7 +1202,8 @@ def render_shader_index_json(
     shaders: Sequence[FallbackShader],
     ranges: Sequence[tuple[int, int]],
 ) -> str:
-    """Render `shader-index.json` matching `shaders/src/pack.rs` / docs/gpu_commands.md."""
+    """Render sanitized `shader-index.json` matching `shaders/src/pack.rs` / docs/gpu_commands.md."""
+    safe_pack_name = sanitize_source_label(pack_name)
     entries = sorted(
         zip(shaders, ranges, strict=True),
         key=lambda item: item[0].hash,
@@ -843,7 +1212,7 @@ def render_shader_index_json(
     lines: list[str] = [
         "{",
         f'  "abi_version": {SHADER_INDEX_ABI_VERSION},',
-        f'  "pack": {json.dumps(pack_name)},',
+        f'  "pack": {json.dumps(safe_pack_name)},',
     ]
     if not entries:
         lines.append('  "shaders": {}')
@@ -854,9 +1223,9 @@ def render_shader_index_json(
             wgsl_path = f"shaders/{format_wgsl_filename(shader.hash)}"
             block = [
                 f"    {json.dumps(key)}: {{",
-                f'      "stage": {json.dumps(shader.stage)},',
+                f'      "stage": {json.dumps(sanitize_text(shader.stage))},',
                 f'      "wgsl": {json.dumps(wgsl_path)},',
-                f'      "entry_point": {json.dumps(shader.entry_point)},',
+                f'      "entry_point": {json.dumps(sanitize_text(shader.entry_point))},',
                 f'      "pack_offset": {offset},',
                 f'      "pack_length": {length}',
                 "    }",
@@ -872,8 +1241,8 @@ def render_shader_index_json(
 
 
 def render_reflection_manifest_json(manifest: Mapping[str, Any]) -> str:
-    """Pretty-print the reflection manifest with stable 2-space indentation."""
-    return json.dumps(manifest, indent=2, sort_keys=False) + "\n"
+    """Pretty-print the sanitized reflection manifest with stable 2-space indentation."""
+    return json.dumps(sanitize_value(manifest), indent=2, sort_keys=False) + "\n"
 
 
 def build_fallback_artifacts(
@@ -882,7 +1251,6 @@ def build_fallback_artifacts(
     shaders: Sequence[FallbackShader] | None = None,
 ) -> GeneratedFallbackArtifacts:
     """Build in-memory pack bytes + index + reflection manifest (no disk I/O)."""
-    catalog = tuple(shaders) if shaders is not None else builtin_fallback_shaders()
     if not pack_name or "/" in pack_name or "\\" in pack_name:
         raise FallbackShaderError(
             "pack-name must be a plain file name (no directory separators)",
@@ -893,6 +1261,9 @@ def build_fallback_artifacts(
             "pack-name must end with .wgsl.pack",
             code="invalid_pack_name",
         )
+
+    raw_catalog = shaders if shaders is not None else builtin_fallback_shaders()
+    catalog = canonicalize_shader_catalog(raw_catalog)
 
     pack_entries = [
         {"hash": shader.hash, "stage": shader.stage, "wgsl": shader.wgsl}
@@ -994,45 +1365,45 @@ def main(argv: Sequence[str] | None = None) -> int:
             repo_root=args.repo_root,
         )
     except UnsafeOutputPathError as exc:
+        error_payload = sanitize_value(
+            {
+                "ok": False,
+                "errorCode": exc.code,
+                "error": exc.message,
+            }
+        )
         if args.as_json:
-            print(
-                json.dumps(
-                    {
-                        "ok": False,
-                        "errorCode": exc.code,
-                        "error": exc.message,
-                    },
-                    indent=2,
-                )
-            )
+            print(json.dumps(error_payload, indent=2))
         else:
-            print(f"Error: {exc.message}", file=sys.stderr)
+            print(f"Error: {error_payload['error']}", file=sys.stderr)
         return 1
     except FallbackShaderError as exc:
+        error_payload = sanitize_value(
+            {
+                "ok": False,
+                "errorCode": exc.code,
+                "error": exc.message,
+            }
+        )
         if args.as_json:
-            print(
-                json.dumps(
-                    {
-                        "ok": False,
-                        "errorCode": exc.code,
-                        "error": exc.message,
-                    },
-                    indent=2,
-                )
-            )
+            print(json.dumps(error_payload, indent=2))
         else:
-            print(f"Error: {exc.message}", file=sys.stderr)
+            print(f"Error: {error_payload['error']}", file=sys.stderr)
         return 1
     except OSError as exc:
-        message = f"failed to write fallback shader artifacts: {exc.strerror or type(exc).__name__}"
+        message = sanitize_text(
+            f"failed to write fallback shader artifacts: {exc.strerror or type(exc).__name__}"
+        )
         if args.as_json:
             print(
                 json.dumps(
-                    {
-                        "ok": False,
-                        "errorCode": "io_error",
-                        "error": message,
-                    },
+                    sanitize_value(
+                        {
+                            "ok": False,
+                            "errorCode": "io_error",
+                            "error": message,
+                        }
+                    ),
                     indent=2,
                 )
             )
@@ -1045,9 +1416,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(summary, indent=2))
     else:
         print(
-            f"Wrote {summary['entryCount']} fallback shaders -> {args.pack_name} "
-            f"({summary['packBytes']} bytes), {SHADER_INDEX_FILE_NAME}, "
-            f"{REFLECTION_MANIFEST_FILE_NAME}"
+            sanitize_text(
+                f"Wrote {summary['entryCount']} fallback shaders -> {summary['packName']} "
+                f"({summary['packBytes']} bytes), {SHADER_INDEX_FILE_NAME}, "
+                f"{REFLECTION_MANIFEST_FILE_NAME}"
+            )
         )
         print(
             "  stages: "
