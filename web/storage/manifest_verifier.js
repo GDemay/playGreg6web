@@ -7,6 +7,12 @@ export const MANIFEST_ABI_VERSION = 1;
 export const DEFAULT_SAMPLE_COUNT = 5;
 export const DEFAULT_RANGE_PROBE_BYTES = 1;
 
+export const MISMATCH_CATEGORIES = Object.freeze({
+  MISSING: 'missing',
+  SIZE_MISMATCH: 'size_mismatch',
+  HASH_MISMATCH: 'hash_mismatch',
+});
+
 // Case-insensitive temporary download suffixes matching tools/src/scan.rs (INCOMPLETE_SUFFIXES).
 export const INCOMPLETE_DOWNLOAD_SUFFIXES = Object.freeze([
   '.!qb',
@@ -37,6 +43,200 @@ const WINDOWS_DRIVE_RE = /^[A-Za-z]:/;
 const CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
 const CONTENT_RANGE_RE = /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i;
 const QUOTED_ETAG_RE = /^(?:W\/)?"[^"]*"$/;
+
+const FILE_URI_RE = /file:\/\/[^\s'")\]]+/gi;
+const WINDOWS_UNC_PATH_RE = /\\\\[^\s'")\]]+/g;
+const QUOTED_WINDOWS_ABS_PATH_RE = /(?<=['"])[A-Za-z]:[\\/][^'"\r\n]+(?=['"])/g;
+const WINDOWS_ABS_PATH_RE = /\b[A-Za-z]:[\\/][^\s'")\]]*/g;
+const QUOTED_POSIX_HOST_PATH_RE =
+  /(?<=['"])\/(?:Users|home|tmp|var|etc|opt|mnt|Volumes|private|root|proc|sys|dev|usr)\/[^'"\r\n]+(?=['"])/g;
+const POSIX_HOST_PATH_RE =
+  /(?:^|(?<=[\s'"(=:\[,]))\/(?:Users|home|tmp|var|etc|opt|mnt|Volumes|private|root|proc|sys|dev|usr)\/[^\s'")\]]*/g;
+const MAX_DIAGNOSTIC_TEXT_LEN = 256;
+
+function defaultNow() {
+  if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
+    return performance.now();
+  }
+  return Date.now();
+}
+
+function resolveNowFn(nowFn) {
+  return typeof nowFn === 'function' ? nowFn : defaultNow;
+}
+
+function computeElapsedMs(startTime, endTime) {
+  if (
+    typeof startTime !== 'number' ||
+    typeof endTime !== 'number' ||
+    !Number.isFinite(startTime) ||
+    !Number.isFinite(endTime)
+  ) {
+    return 0;
+  }
+  const delta = endTime - startTime;
+  if (delta <= 0) {
+    return 0;
+  }
+  return Math.round(delta * 1000) / 1000;
+}
+
+function computeBytesPerSecond(bytesVerified, elapsedMs) {
+  if (
+    typeof bytesVerified !== 'number' ||
+    !Number.isFinite(bytesVerified) ||
+    bytesVerified <= 0
+  ) {
+    return 0;
+  }
+  if (typeof elapsedMs !== 'number' || !Number.isFinite(elapsedMs) || elapsedMs <= 0) {
+    return 0;
+  }
+  return Math.round((bytesVerified / (elapsedMs / 1000)) * 100) / 100;
+}
+
+function createMismatchesByCategory() {
+  return {
+    [MISMATCH_CATEGORIES.MISSING]: 0,
+    [MISMATCH_CATEGORIES.SIZE_MISMATCH]: 0,
+    [MISMATCH_CATEGORIES.HASH_MISMATCH]: 0,
+  };
+}
+
+function countMismatches(mismatchesByCategory) {
+  return (
+    (mismatchesByCategory[MISMATCH_CATEGORIES.MISSING] || 0) +
+    (mismatchesByCategory[MISMATCH_CATEGORIES.SIZE_MISMATCH] || 0) +
+    (mismatchesByCategory[MISMATCH_CATEGORIES.HASH_MISMATCH] || 0)
+  );
+}
+
+function buildTelemetry({
+  elapsedMs,
+  bytesVerified,
+  filesVerified,
+  mismatchesByCategory,
+  aborted,
+}) {
+  const categories = {
+    [MISMATCH_CATEGORIES.MISSING]: mismatchesByCategory[MISMATCH_CATEGORIES.MISSING] || 0,
+    [MISMATCH_CATEGORIES.SIZE_MISMATCH]:
+      mismatchesByCategory[MISMATCH_CATEGORIES.SIZE_MISMATCH] || 0,
+    [MISMATCH_CATEGORIES.HASH_MISMATCH]:
+      mismatchesByCategory[MISMATCH_CATEGORIES.HASH_MISMATCH] || 0,
+  };
+  const mismatchCount = countMismatches(categories);
+  const safeBytes =
+    typeof bytesVerified === 'number' && Number.isFinite(bytesVerified) && bytesVerified > 0
+      ? Math.floor(bytesVerified)
+      : 0;
+  const safeFiles =
+    typeof filesVerified === 'number' && Number.isFinite(filesVerified) && filesVerified > 0
+      ? Math.floor(filesVerified)
+      : 0;
+  const safeElapsed =
+    typeof elapsedMs === 'number' && Number.isFinite(elapsedMs) && elapsedMs > 0 ? elapsedMs : 0;
+  return {
+    elapsedMs: safeElapsed,
+    bytesVerified: safeBytes,
+    filesVerified: safeFiles,
+    bytesPerSecond: computeBytesPerSecond(safeBytes, safeElapsed),
+    mismatchCount,
+    mismatchesByCategory: categories,
+    aborted: Boolean(aborted),
+  };
+}
+
+function sanitizeDiagnosticText(value, maxLen = MAX_DIAGNOSTIC_TEXT_LEN) {
+  if (value === null || value === undefined) {
+    return '';
+  }
+  let text = String(value);
+  text = text
+    .replace(FILE_URI_RE, '<redacted-path>')
+    .replace(WINDOWS_UNC_PATH_RE, '<redacted-path>')
+    .replace(QUOTED_WINDOWS_ABS_PATH_RE, '<redacted-path>')
+    .replace(WINDOWS_ABS_PATH_RE, '<redacted-path>')
+    .replace(QUOTED_POSIX_HOST_PATH_RE, '<redacted-path>')
+    .replace(POSIX_HOST_PATH_RE, '<redacted-path>')
+    .replace(/[\x00-\x1f\x7f]+/g, ' ')
+    .trim();
+  if (text.length > maxLen) {
+    return `${text.slice(0, Math.max(0, maxLen - 3))}...`;
+  }
+  return text;
+}
+
+function createAbortError(signal) {
+  if (signal && signal.reason instanceof Error) {
+    return signal.reason;
+  }
+  const err = new Error('Verification aborted');
+  err.name = 'AbortError';
+  return err;
+}
+
+function isAbortError(err) {
+  return Boolean(
+    err &&
+      typeof err === 'object' &&
+      (err.name === 'AbortError' || err.code === 'ABORT_ERR'),
+  );
+}
+
+async function raceWithAbort(promise, signal) {
+  if (!signal) {
+    return promise;
+  }
+  if (signal.aborted) {
+    Promise.resolve(promise).catch(() => {});
+    throw createAbortError(signal);
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      Promise.resolve(promise).catch(() => {});
+      reject(createAbortError(signal));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    Promise.resolve(promise).then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (err) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener('abort', onAbort);
+        reject(err);
+      },
+    );
+  });
+}
+
+async function computeSha256Hex(bytes) {
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle || typeof subtle.digest !== 'function') {
+    throw new Error('SHA-256 verification requires Web Crypto crypto.subtle.digest or a custom hashFn');
+  }
+  const view =
+    bytes instanceof Uint8Array
+      ? bytes
+      : bytes instanceof ArrayBuffer
+        ? new Uint8Array(bytes)
+        : new Uint8Array(0);
+  const digest = await subtle.digest('SHA-256', view);
+  const out = new Uint8Array(digest);
+  let hex = '';
+  for (let i = 0; i < out.length; i += 1) {
+    hex += out[i].toString(16).padStart(2, '0');
+  }
+  return hex;
+}
 
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -248,6 +448,7 @@ function emptyManifestSummary() {
  * `docs/io_manifest.md` and `tools/src/main.rs`.
  *
  * @param {unknown} manifestInput
+ * @param {{ signal?: AbortSignal | null, nowFn?: (() => number) | null }} [options]
  * @returns {{
  *   ok: boolean,
  *   errors: string[],
@@ -274,28 +475,79 @@ function emptyManifestSummary() {
  *     hashedFiles: number,
  *     etagFiles: number,
  *     duplicateCount: number,
- *   }
+ *   },
+ *   aborted: boolean,
+ *   elapsedMs: number,
+ *   bytesVerified: number,
+ *   filesVerified: number,
+ *   mismatchCount: number,
+ *   mismatchesByCategory: { missing: number, size_mismatch: number, hash_mismatch: number },
+ *   telemetry: {
+ *     elapsedMs: number,
+ *     bytesVerified: number,
+ *     filesVerified: number,
+ *     bytesPerSecond: number,
+ *     mismatchCount: number,
+ *     mismatchesByCategory: { missing: number, size_mismatch: number, hash_mismatch: number },
+ *     aborted: boolean,
+ *   },
  * }}
  */
-export function validateDataManifest(manifestInput) {
+export function validateDataManifest(manifestInput, options = {}) {
+  const { signal = null, nowFn = null } = isPlainObject(options) ? options : {};
+  const now = resolveNowFn(nowFn);
+  const startTime = now();
+
   const errors = [];
   const warnings = [];
   const fileMap = new Map();
   const summary = emptyManifestSummary();
+  const mismatchesByCategory = createMismatchesByCategory();
+
+  const finalize = (aborted = false) => {
+    const elapsedMs = computeElapsedMs(startTime, now());
+    const telemetry = buildTelemetry({
+      elapsedMs,
+      bytesVerified: summary.totalBytes,
+      filesVerified: summary.fileCount,
+      mismatchesByCategory,
+      aborted,
+    });
+    return {
+      ok: !aborted && errors.length === 0,
+      errors,
+      warnings,
+      fileMap,
+      summary,
+      aborted: telemetry.aborted,
+      elapsedMs: telemetry.elapsedMs,
+      bytesVerified: telemetry.bytesVerified,
+      filesVerified: telemetry.filesVerified,
+      mismatchCount: telemetry.mismatchCount,
+      mismatchesByCategory: { ...telemetry.mismatchesByCategory },
+      telemetry,
+    };
+  };
+
+  if (signal?.aborted) {
+    return finalize(true);
+  }
 
   let manifest = manifestInput;
   if (typeof manifestInput === 'string') {
     try {
       manifest = JSON.parse(manifestInput);
     } catch (err) {
-      errors.push(`Manifest JSON parse error: ${err instanceof Error ? err.message : String(err)}`);
-      return { ok: false, errors, warnings, fileMap, summary };
+      errors.push(
+        `Manifest JSON parse error: ${sanitizeDiagnosticText(err instanceof Error ? err.message : String(err))}`,
+      );
+      return finalize(false);
     }
   }
 
   if (!isPlainObject(manifest)) {
     errors.push('Manifest must be a JSON object');
-    return { ok: false, errors, warnings, fileMap, summary };
+    return finalize(false);
   }
 
   // Version validation: canonical field is `abi_version`, with optional fallback to `version`.
@@ -357,7 +609,7 @@ export function validateDataManifest(manifestInput) {
 
   if (!Array.isArray(manifest.files)) {
     errors.push('Manifest "files" must be an array');
-    return { ok: false, errors, warnings, fileMap, summary };
+    return finalize(false);
   }
 
   if (manifest.files.length === 0) {
@@ -375,6 +627,9 @@ export function validateDataManifest(manifestInput) {
   let sumAllValidSizes = 0;
 
   for (let i = 0; i < manifest.files.length; i += 1) {
+    if (signal?.aborted) {
+      return finalize(true);
+    }
     const raw = manifest.files[i];
     const label = `files[${i}]`;
 
@@ -540,22 +795,17 @@ export function validateDataManifest(manifestInput) {
 
   if (summary.declaredTotalBytes !== null && allSizesValid) {
     if (summary.declaredTotalBytes !== sumAllValidSizes) {
+      mismatchesByCategory[MISMATCH_CATEGORIES.SIZE_MISMATCH] += 1;
       errors.push(
         `Manifest "total_bytes" (${summary.declaredTotalBytes}) does not match sum of file sizes (${sumAllValidSizes})`,
       );
     }
   }
 
-  return {
-    ok: errors.length === 0,
-    errors,
-    warnings,
-    fileMap,
-    summary,
-  };
+  return finalize(Boolean(signal?.aborted));
 }
 
-function resolveManifestFileMap(manifest) {
+function resolveManifestFileMap(manifest, options = {}) {
   if (manifest === null || manifest === undefined) {
     return null;
   }
@@ -565,7 +815,7 @@ function resolveManifestFileMap(manifest) {
   if (isPlainObject(manifest) && manifest.fileMap instanceof Map) {
     return manifest.fileMap;
   }
-  return validateDataManifest(manifest).fileMap;
+  return validateDataManifest(manifest, options).fileMap;
 }
 
 /**
@@ -576,6 +826,7 @@ function resolveManifestFileMap(manifest) {
  *
  * @param {unknown} bootsetInput
  * @param {unknown} [manifest=null]
+ * @param {{ signal?: AbortSignal | null, nowFn?: (() => number) | null }} [options]
  * @returns {{
  *   ok: boolean,
  *   errors: string[],
@@ -595,9 +846,28 @@ function resolveManifestFileMap(manifest) {
  *   totalBytes: number,
  *   uniqueBytes: number,
  *   overlapBytes: number,
+ *   aborted: boolean,
+ *   elapsedMs: number,
+ *   bytesVerified: number,
+ *   filesVerified: number,
+ *   mismatchCount: number,
+ *   mismatchesByCategory: { missing: number, size_mismatch: number, hash_mismatch: number },
+ *   telemetry: {
+ *     elapsedMs: number,
+ *     bytesVerified: number,
+ *     filesVerified: number,
+ *     bytesPerSecond: number,
+ *     mismatchCount: number,
+ *     mismatchesByCategory: { missing: number, size_mismatch: number, hash_mismatch: number },
+ *     aborted: boolean,
+ *   },
  * }}
  */
-export function validateBootset(bootsetInput, manifest = null) {
+export function validateBootset(bootsetInput, manifest = null, options = {}) {
+  const { signal = null, nowFn = null } = isPlainObject(options) ? options : {};
+  const now = resolveNowFn(nowFn);
+  const startTime = now();
+
   const errors = [];
   const warnings = [];
   const entries = [];
@@ -607,28 +877,60 @@ export function validateBootset(bootsetInput, manifest = null) {
   const overlaps = [];
   const missingSet = new Set();
   const incompleteSet = new Set();
+  const rangesByPath = new Map();
+  const mismatchesByCategory = createMismatchesByCategory();
+  let totalBytes = 0;
+  let uniqueBytes = 0;
+
+  const finalize = (aborted = false) => {
+    const missingFiles = Array.from(missingSet).sort(compareAscii);
+    const incompleteFiles = Array.from(incompleteSet).sort(compareAscii);
+    const overlapBytes = Math.max(0, totalBytes - uniqueBytes);
+    const elapsedMs = computeElapsedMs(startTime, now());
+    const telemetry = buildTelemetry({
+      elapsedMs,
+      bytesVerified: uniqueBytes,
+      filesVerified: rangesByPath.size,
+      mismatchesByCategory,
+      aborted,
+    });
+    return {
+      ok: !aborted && errors.length === 0,
+      errors,
+      warnings,
+      entries,
+      deduplicatedEntries,
+      mergedRanges,
+      duplicates,
+      overlaps,
+      missingFiles,
+      incompleteFiles,
+      totalBytes,
+      uniqueBytes,
+      overlapBytes,
+      aborted: telemetry.aborted,
+      elapsedMs: telemetry.elapsedMs,
+      bytesVerified: telemetry.bytesVerified,
+      filesVerified: telemetry.filesVerified,
+      mismatchCount: telemetry.mismatchCount,
+      mismatchesByCategory: { ...telemetry.mismatchesByCategory },
+      telemetry,
+    };
+  };
+
+  if (signal?.aborted) {
+    return finalize(true);
+  }
 
   let parsed = bootsetInput;
   if (typeof bootsetInput === 'string') {
     try {
       parsed = JSON.parse(bootsetInput);
     } catch (err) {
-      errors.push(`Bootset JSON parse error: ${err instanceof Error ? err.message : String(err)}`);
-      return {
-        ok: false,
-        errors,
-        warnings,
-        entries,
-        deduplicatedEntries,
-        mergedRanges,
-        duplicates,
-        overlaps,
-        missingFiles: [],
-        incompleteFiles: [],
-        totalBytes: 0,
-        uniqueBytes: 0,
-        overlapBytes: 0,
-      };
+      errors.push(
+        `Bootset JSON parse error: ${sanitizeDiagnosticText(err instanceof Error ? err.message : String(err))}`,
+      );
+      return finalize(false);
     }
   }
 
@@ -639,29 +941,19 @@ export function validateBootset(bootsetInput, manifest = null) {
     rawEntries = parsed.entries;
   } else {
     errors.push('Bootset must be an array of range entries or an object with an "entries" array');
-    return {
-      ok: false,
-      errors,
-      warnings,
-      entries,
-      deduplicatedEntries,
-      mergedRanges,
-      duplicates,
-      overlaps,
-      missingFiles: [],
-      incompleteFiles: [],
-      totalBytes: 0,
-      uniqueBytes: 0,
-      overlapBytes: 0,
-    };
+    return finalize(false);
   }
 
-  const fileMap = resolveManifestFileMap(manifest);
+  const fileMap = resolveManifestFileMap(manifest, { signal, nowFn });
+  if (signal?.aborted) {
+    return finalize(true);
+  }
   const seenExact = new Set();
-  const rangesByPath = new Map();
-  let totalBytes = 0;
 
   for (let i = 0; i < rawEntries.length; i += 1) {
+    if (signal?.aborted) {
+      return finalize(true);
+    }
     const raw = rawEntries[i];
     const label = `bootset[${i}]`;
 
@@ -705,6 +997,7 @@ export function validateBootset(bootsetInput, manifest = null) {
       const manifestFile = fileMap.get(relPath);
       if (!manifestFile) {
         missingSet.add(relPath);
+        mismatchesByCategory[MISMATCH_CATEGORIES.MISSING] += 1;
         errors.push(`${label} references file missing from manifest: "${relPath}"`);
         continue;
       }
@@ -713,6 +1006,7 @@ export function validateBootset(bootsetInput, manifest = null) {
         warnings.push(`${label} references incomplete manifest file: "${relPath}"`);
       }
       if (end > manifestFile.size) {
+        mismatchesByCategory[MISMATCH_CATEGORIES.SIZE_MISMATCH] += 1;
         errors.push(
           `${label} range [${raw.offset}, ${end}) exceeds manifest file size ${manifestFile.size} for "${relPath}"`,
         );
@@ -744,10 +1038,12 @@ export function validateBootset(bootsetInput, manifest = null) {
   }
 
   // Detect overlapping ranges and merge intervals per path for exact unique byte budget.
-  let uniqueBytes = 0;
   const sortedPaths = Array.from(rangesByPath.keys()).sort(compareAscii);
 
   for (const relPath of sortedPaths) {
+    if (signal?.aborted) {
+      return finalize(true);
+    }
     const pathRanges = rangesByPath.get(relPath);
     pathRanges.sort((a, b) => a.offset - b.offset || a.end - b.end);
 
@@ -795,25 +1091,7 @@ export function validateBootset(bootsetInput, manifest = null) {
     uniqueBytes += current.length;
   }
 
-  const missingFiles = Array.from(missingSet).sort(compareAscii);
-  const incompleteFiles = Array.from(incompleteSet).sort(compareAscii);
-  const overlapBytes = Math.max(0, totalBytes - uniqueBytes);
-
-  return {
-    ok: errors.length === 0,
-    errors,
-    warnings,
-    entries,
-    deduplicatedEntries,
-    mergedRanges,
-    duplicates,
-    overlaps,
-    missingFiles,
-    incompleteFiles,
-    totalBytes,
-    uniqueBytes,
-    overlapBytes,
-  };
+  return finalize(Boolean(signal?.aborted));
 }
 
 /**
@@ -822,6 +1100,7 @@ export function validateBootset(bootsetInput, manifest = null) {
  *
  * @param {unknown} manifest
  * @param {unknown} [bootset=null]
+ * @param {{ signal?: AbortSignal | null, nowFn?: (() => number) | null }} [options]
  * @returns {{
  *   manifestValid: boolean,
  *   bootsetValid: boolean,
@@ -838,9 +1117,64 @@ export function validateBootset(bootsetInput, manifest = null) {
  *   missingBootsetFiles: string[],
  *   incompleteBootsetFiles: string[],
  *   issues: Array<{ severity: 'error' | 'warning', source: 'manifest' | 'bootset', message: string }>,
+ *   aborted: boolean,
+ *   elapsedMs: number,
+ *   bytesVerified: number,
+ *   filesVerified: number,
+ *   mismatchCount: number,
+ *   mismatchesByCategory: { missing: number, size_mismatch: number, hash_mismatch: number },
+ *   telemetry: {
+ *     elapsedMs: number,
+ *     bytesVerified: number,
+ *     filesVerified: number,
+ *     bytesPerSecond: number,
+ *     mismatchCount: number,
+ *     mismatchesByCategory: { missing: number, size_mismatch: number, hash_mismatch: number },
+ *     aborted: boolean,
+ *   },
  * }}
  */
-export function computeStreamingReadiness(manifest, bootset = null) {
+export function computeStreamingReadiness(manifest, bootset = null, options = {}) {
+  const { signal = null, nowFn = null } = isPlainObject(options) ? options : {};
+  const now = resolveNowFn(nowFn);
+  const startTime = now();
+  const mismatchesByCategory = createMismatchesByCategory();
+
+  if (signal?.aborted) {
+    const elapsedMs = computeElapsedMs(startTime, now());
+    const telemetry = buildTelemetry({
+      elapsedMs,
+      bytesVerified: 0,
+      filesVerified: 0,
+      mismatchesByCategory,
+      aborted: true,
+    });
+    return {
+      manifestValid: false,
+      bootsetValid: false,
+      totalFiles: 0,
+      completeFiles: 0,
+      incompleteFiles: 0,
+      totalBytes: 0,
+      readyBytes: 0,
+      incompleteBytes: 0,
+      readinessPct: 0,
+      bootsetReady: false,
+      bootsetBytes: 0,
+      bootsetRawBytes: 0,
+      missingBootsetFiles: [],
+      incompleteBootsetFiles: [],
+      issues: [],
+      aborted: true,
+      elapsedMs: telemetry.elapsedMs,
+      bytesVerified: telemetry.bytesVerified,
+      filesVerified: telemetry.filesVerified,
+      mismatchCount: telemetry.mismatchCount,
+      mismatchesByCategory: { ...telemetry.mismatchesByCategory },
+      telemetry,
+    };
+  }
+
   const manifestResult =
     isPlainObject(manifest) &&
     manifest.fileMap instanceof Map &&
@@ -848,7 +1182,16 @@ export function computeStreamingReadiness(manifest, bootset = null) {
     Array.isArray(manifest.errors) &&
     Array.isArray(manifest.warnings)
       ? manifest
-      : validateDataManifest(manifest);
+      : validateDataManifest(manifest, { signal, nowFn });
+
+  if (isPlainObject(manifestResult.mismatchesByCategory)) {
+    mismatchesByCategory[MISMATCH_CATEGORIES.MISSING] +=
+      manifestResult.mismatchesByCategory[MISMATCH_CATEGORIES.MISSING] || 0;
+    mismatchesByCategory[MISMATCH_CATEGORIES.SIZE_MISMATCH] +=
+      manifestResult.mismatchesByCategory[MISMATCH_CATEGORIES.SIZE_MISMATCH] || 0;
+    mismatchesByCategory[MISMATCH_CATEGORIES.HASH_MISMATCH] +=
+      manifestResult.mismatchesByCategory[MISMATCH_CATEGORIES.HASH_MISMATCH] || 0;
+  }
 
   const issues = [];
   for (const msg of manifestResult.errors) {
@@ -872,20 +1215,31 @@ export function computeStreamingReadiness(manifest, bootset = null) {
     readinessPct = Math.round((completeFiles / totalFiles) * 10000) / 100;
   }
 
-  let bootsetValid = true;
-  let bootsetReady = manifestResult.ok && completeFiles > 0;
+  let aborted = Boolean(signal?.aborted || manifestResult.aborted);
+  let bootsetValid = !aborted;
+  let bootsetReady = !aborted && manifestResult.ok && completeFiles > 0;
   let bootsetBytes = 0;
   let bootsetRawBytes = 0;
   let missingBootsetFiles = [];
   let incompleteBootsetFiles = [];
 
-  if (bootset !== null && bootset !== undefined) {
-    const bootsetResult = validateBootset(bootset, manifestResult);
+  if (!aborted && bootset !== null && bootset !== undefined) {
+    const bootsetResult = validateBootset(bootset, manifestResult, { signal, nowFn });
+    aborted = Boolean(signal?.aborted || bootsetResult.aborted);
     bootsetValid = bootsetResult.ok;
     bootsetBytes = bootsetResult.uniqueBytes;
     bootsetRawBytes = bootsetResult.totalBytes;
     missingBootsetFiles = bootsetResult.missingFiles;
     incompleteBootsetFiles = bootsetResult.incompleteFiles;
+
+    if (isPlainObject(bootsetResult.mismatchesByCategory)) {
+      mismatchesByCategory[MISMATCH_CATEGORIES.MISSING] +=
+        bootsetResult.mismatchesByCategory[MISMATCH_CATEGORIES.MISSING] || 0;
+      mismatchesByCategory[MISMATCH_CATEGORIES.SIZE_MISMATCH] +=
+        bootsetResult.mismatchesByCategory[MISMATCH_CATEGORIES.SIZE_MISMATCH] || 0;
+      mismatchesByCategory[MISMATCH_CATEGORIES.HASH_MISMATCH] +=
+        bootsetResult.mismatchesByCategory[MISMATCH_CATEGORIES.HASH_MISMATCH] || 0;
+    }
 
     for (const msg of bootsetResult.errors) {
       issues.push({ severity: 'error', source: 'bootset', message: msg });
@@ -895,15 +1249,25 @@ export function computeStreamingReadiness(manifest, bootset = null) {
     }
 
     bootsetReady =
+      !aborted &&
       manifestResult.ok &&
       bootsetResult.ok &&
       missingBootsetFiles.length === 0 &&
       incompleteBootsetFiles.length === 0;
   }
 
+  const elapsedMs = computeElapsedMs(startTime, now());
+  const telemetry = buildTelemetry({
+    elapsedMs,
+    bytesVerified: readyBytes,
+    filesVerified: completeFiles,
+    mismatchesByCategory,
+    aborted,
+  });
+
   return {
-    manifestValid: manifestResult.ok,
-    bootsetValid,
+    manifestValid: !aborted && manifestResult.ok,
+    bootsetValid: !aborted && bootsetValid,
     totalFiles,
     completeFiles,
     incompleteFiles,
@@ -911,20 +1275,31 @@ export function computeStreamingReadiness(manifest, bootset = null) {
     readyBytes,
     incompleteBytes,
     readinessPct,
-    bootsetReady,
+    bootsetReady: !aborted && bootsetReady,
     bootsetBytes,
     bootsetRawBytes,
     missingBootsetFiles,
     incompleteBootsetFiles,
     issues,
+    aborted: telemetry.aborted,
+    elapsedMs: telemetry.elapsedMs,
+    bytesVerified: telemetry.bytesVerified,
+    filesVerified: telemetry.filesVerified,
+    mismatchCount: telemetry.mismatchCount,
+    mismatchesByCategory: { ...telemetry.mismatchesByCategory },
+    telemetry,
   };
 }
 
-async function consumeResponseBytes(res) {
-  if (!res) return null;
+async function consumeResponseBuffer(res) {
+  if (!res) return { byteLength: null, bytes: null };
   if (typeof res.arrayBuffer === 'function') {
     const buf = await res.arrayBuffer();
-    return buf ? buf.byteLength : 0;
+    if (!buf) {
+      return { byteLength: 0, bytes: new Uint8Array(0) };
+    }
+    const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+    return { byteLength: bytes.byteLength, bytes };
   }
   if (res.body && typeof res.body.cancel === 'function') {
     try {
@@ -933,7 +1308,7 @@ async function consumeResponseBytes(res) {
       // Ignore stream cancellation errors.
     }
   }
-  return null;
+  return { byteLength: null, bytes: null };
 }
 
 function hasCoopCoepHeaders(headers) {
@@ -951,7 +1326,11 @@ function hasCoopCoepHeaders(headers) {
  * Probes up to `sampleCount` complete manifest files against a live HTTP endpoint using
  * `HEAD` and `GET Range: bytes=0-<end>` requests. Verifies `206 Partial Content`,
  * `Accept-Ranges: bytes`, `Content-Range` total length matching the manifest size,
- * response byte count, and `ETag` presence/consistency.
+ * response byte count, `ETag` presence/consistency, and optional SHA-256 content hashes.
+ *
+ * Supports optional `AbortSignal` cancellation (`signal`) and injectable clock (`nowFn`),
+ * returning sanitized additive throughput/timing telemetry and structured mismatch categories
+ * without leaking host paths or raw file bytes.
  *
  * @param {object} options
  * @param {typeof fetch} [options.fetchImpl] Injectable fetch implementation (defaults to globalThis.fetch).
@@ -960,6 +1339,10 @@ function hasCoopCoepHeaders(headers) {
  * @param {number} [options.sampleCount=5] Maximum number of complete files to probe.
  * @param {number} [options.probeBytes=1] Number of prefix bytes to request in the Range probe (1 -> bytes=0-0).
  * @param {boolean} [options.checkCoopCoep=false] When true, fail probes missing COOP/COEP headers.
+ * @param {boolean} [options.verifyHashes=false] When true, verify SHA-256 digests for entries declaring `sha256`.
+ * @param {((bytes: Uint8Array) => Promise<string> | string) | null} [options.hashFn=null] Optional SHA-256 hex digest provider.
+ * @param {AbortSignal | null} [options.signal=null] Optional AbortSignal to cancel in-flight verification.
+ * @param {(() => number) | null} [options.nowFn=null] Optional injectable monotonic clock in milliseconds.
  * @returns {Promise<{
  *   ok: boolean,
  *   probed: number,
@@ -968,6 +1351,22 @@ function hasCoopCoepHeaders(headers) {
  *   skippedIncomplete: number,
  *   errors: string[],
  *   results: Array<object>,
+ *   aborted: boolean,
+ *   elapsedMs: number,
+ *   bytesVerified: number,
+ *   filesVerified: number,
+ *   mismatchCount: number,
+ *   mismatchesByCategory: { missing: number, size_mismatch: number, hash_mismatch: number },
+ *   mismatches: Array<{ path: string, category: 'missing' | 'size_mismatch' | 'hash_mismatch', detail: string }>,
+ *   telemetry: {
+ *     elapsedMs: number,
+ *     bytesVerified: number,
+ *     filesVerified: number,
+ *     bytesPerSecond: number,
+ *     mismatchCount: number,
+ *     mismatchesByCategory: { missing: number, size_mismatch: number, hash_mismatch: number },
+ *     aborted: boolean,
+ *   },
  * }>}
  */
 export async function verifyLiveEndpoints(options = {}) {
@@ -978,10 +1377,60 @@ export async function verifyLiveEndpoints(options = {}) {
     sampleCount = DEFAULT_SAMPLE_COUNT,
     probeBytes = DEFAULT_RANGE_PROBE_BYTES,
     checkCoopCoep = false,
+    verifyHashes = false,
+    hashFn = null,
+    signal = null,
+    nowFn = null,
   } = options || {};
 
   if (typeof fetchImpl !== 'function') {
     throw new TypeError('verifyLiveEndpoints requires a fetchImpl function');
+  }
+
+  const now = resolveNowFn(nowFn);
+  const startTime = now();
+
+  const mismatchesByCategory = createMismatchesByCategory();
+  const mismatches = [];
+  const results = [];
+  let passed = 0;
+  let failed = 0;
+  let skippedIncomplete = 0;
+  let bytesVerified = 0;
+  let filesVerified = 0;
+  let aborted = false;
+
+  const finalize = (manifestOk, topErrors) => {
+    const elapsedMs = computeElapsedMs(startTime, now());
+    const telemetry = buildTelemetry({
+      elapsedMs,
+      bytesVerified,
+      filesVerified,
+      mismatchesByCategory,
+      aborted,
+    });
+    return {
+      ok: !aborted && manifestOk && failed === 0,
+      probed: results.length,
+      passed,
+      failed,
+      skippedIncomplete,
+      errors: topErrors,
+      results,
+      aborted: telemetry.aborted,
+      elapsedMs: telemetry.elapsedMs,
+      bytesVerified: telemetry.bytesVerified,
+      filesVerified: telemetry.filesVerified,
+      mismatchCount: telemetry.mismatchCount,
+      mismatchesByCategory: { ...telemetry.mismatchesByCategory },
+      mismatches,
+      telemetry,
+    };
+  };
+
+  if (signal?.aborted) {
+    aborted = true;
+    return finalize(false, []);
   }
 
   const manifestResult =
@@ -990,9 +1439,15 @@ export async function verifyLiveEndpoints(options = {}) {
     isPlainObject(manifest.summary) &&
     Array.isArray(manifest.errors)
       ? manifest
-      : validateDataManifest(manifest);
+      : validateDataManifest(manifest, { signal, nowFn });
 
   const topErrors = [...manifestResult.errors];
+
+  if (signal?.aborted || manifestResult.aborted) {
+    aborted = true;
+    return finalize(manifestResult.ok, topErrors);
+  }
+
   const base = normalizeDataBase(dataBase);
   const maxSamples =
     typeof sampleCount === 'number' && Number.isFinite(sampleCount)
@@ -1004,7 +1459,6 @@ export async function verifyLiveEndpoints(options = {}) {
       : DEFAULT_RANGE_PROBE_BYTES;
 
   const completeEntries = [];
-  let skippedIncomplete = 0;
   for (const entry of manifestResult.fileMap.values()) {
     if (entry.incomplete) {
       skippedIncomplete += 1;
@@ -1014,13 +1468,31 @@ export async function verifyLiveEndpoints(options = {}) {
   }
 
   const selected = completeEntries.slice(0, maxSamples);
-  const results = [];
-  let passed = 0;
-  let failed = 0;
 
   for (const entry of selected) {
+    if (signal?.aborted) {
+      aborted = true;
+      break;
+    }
+
+    const fileStart = now();
+    const safePath = validateManifestPath(entry.path).ok ? entry.path : '<invalid-path>';
     const url = `${base}${encodeRelPathForUrl(entry.path)}`;
     const fileErrors = [];
+    const fileCategories = new Set();
+    const fileMismatches = [];
+
+    const recordFileMismatch = (category, detail) => {
+      if (fileCategories.has(category)) {
+        return;
+      }
+      fileCategories.add(category);
+      fileMismatches.push({
+        path: safePath,
+        category,
+        detail: sanitizeDiagnosticText(detail),
+      });
+    };
 
     const headInfo = {
       status: null,
@@ -1039,57 +1511,79 @@ export async function verifyLiveEndpoints(options = {}) {
       acceptRanges: null,
       etag: null,
     };
+    let hashInfo = null;
 
     let headCoopCoep = false;
     let rangeCoopCoep = false;
+    let fileBytesVerified = 0;
+    let rangeBytes = null;
+    let rangeEndByte = -1;
+    let entryAborted = false;
 
     // 1. HEAD probe
     try {
-      const headRes = await fetchImpl(url, { method: 'HEAD' });
-      headInfo.status = headRes ? headRes.status : null;
-      headInfo.acceptRanges = getHeader(headRes?.headers, 'accept-ranges');
-      headInfo.etag = getHeader(headRes?.headers, 'etag');
-      const headLenRaw = getHeader(headRes?.headers, 'content-length');
-      headInfo.contentLength =
-        headLenRaw !== null && /^\d+$/.test(headLenRaw.trim()) ? Number(headLenRaw.trim()) : null;
-      headCoopCoep = hasCoopCoepHeaders(headRes?.headers);
-
-      if (headRes?.body && typeof headRes.body.cancel === 'function') {
-        try {
-          await headRes.body.cancel();
-        } catch {
-          // Ignore body cancel errors on HEAD.
-        }
-      }
-
-      if (headInfo.status !== 200) {
-        fileErrors.push(`HEAD ${entry.path} returned HTTP ${headInfo.status} (expected 200)`);
+      const headInit = signal ? { method: 'HEAD', signal } : { method: 'HEAD' };
+      const headRes = await raceWithAbort(fetchImpl(url, headInit), signal);
+      if (signal?.aborted) {
+        entryAborted = true;
       } else {
-        if (!headInfo.acceptRanges || !/\bbytes\b/i.test(headInfo.acceptRanges)) {
-          fileErrors.push(
-            `HEAD ${entry.path} missing Accept-Ranges: bytes (got ${JSON.stringify(headInfo.acceptRanges)})`,
-          );
+        headInfo.status = headRes ? headRes.status : null;
+        headInfo.acceptRanges = getHeader(headRes?.headers, 'accept-ranges');
+        headInfo.etag = getHeader(headRes?.headers, 'etag');
+        const headLenRaw = getHeader(headRes?.headers, 'content-length');
+        headInfo.contentLength =
+          headLenRaw !== null && /^\d+$/.test(headLenRaw.trim()) ? Number(headLenRaw.trim()) : null;
+        headCoopCoep = hasCoopCoepHeaders(headRes?.headers);
+
+        if (headRes?.body && typeof headRes.body.cancel === 'function') {
+          try {
+            await headRes.body.cancel();
+          } catch {
+            // Ignore body cancel errors on HEAD.
+          }
         }
-        if (headInfo.contentLength !== null && headInfo.contentLength !== entry.size) {
-          fileErrors.push(
-            `HEAD ${entry.path} Content-Length (${headInfo.contentLength}) does not match manifest size (${entry.size})`,
-          );
-        }
-        if (!headInfo.etag || headInfo.etag.trim().length === 0) {
-          fileErrors.push(`HEAD ${entry.path} missing ETag header`);
-        } else if (entry.etag && headInfo.etag.trim() !== entry.etag) {
-          fileErrors.push(
-            `HEAD ${entry.path} ETag (${headInfo.etag.trim()}) does not match manifest ETag (${entry.etag})`,
-          );
-        }
-        if (checkCoopCoep && !headCoopCoep) {
-          fileErrors.push(`HEAD ${entry.path} missing required COOP/COEP headers`);
+
+        if (headInfo.status !== 200) {
+          const msg = `HEAD ${safePath} returned HTTP ${headInfo.status} (expected 200)`;
+          fileErrors.push(msg);
+          if (headInfo.status === 404 || headInfo.status === 410) {
+            recordFileMismatch(MISMATCH_CATEGORIES.MISSING, msg);
+          }
+        } else {
+          if (!headInfo.acceptRanges || !/\bbytes\b/i.test(headInfo.acceptRanges)) {
+            fileErrors.push(
+              `HEAD ${safePath} missing Accept-Ranges: bytes (got ${JSON.stringify(headInfo.acceptRanges)})`,
+            );
+          }
+          if (headInfo.contentLength !== null && headInfo.contentLength !== entry.size) {
+            const msg = `HEAD ${safePath} Content-Length (${headInfo.contentLength}) does not match manifest size (${entry.size})`;
+            fileErrors.push(msg);
+            recordFileMismatch(MISMATCH_CATEGORIES.SIZE_MISMATCH, msg);
+          }
+          if (!headInfo.etag || headInfo.etag.trim().length === 0) {
+            fileErrors.push(`HEAD ${safePath} missing ETag header`);
+          } else if (entry.etag && headInfo.etag.trim() !== entry.etag) {
+            const msg = `HEAD ${safePath} ETag (${sanitizeDiagnosticText(headInfo.etag.trim(), 96)}) does not match manifest ETag (${sanitizeDiagnosticText(entry.etag, 96)})`;
+            fileErrors.push(msg);
+            recordFileMismatch(MISMATCH_CATEGORIES.HASH_MISMATCH, msg);
+          }
+          if (checkCoopCoep && !headCoopCoep) {
+            fileErrors.push(`HEAD ${safePath} missing required COOP/COEP headers`);
+          }
         }
       }
     } catch (err) {
-      fileErrors.push(
-        `HEAD ${entry.path} request failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      if (signal?.aborted || isAbortError(err)) {
+        entryAborted = true;
+      } else {
+        const safeErr = sanitizeDiagnosticText(err instanceof Error ? err.message : String(err));
+        fileErrors.push(`HEAD ${safePath} request failed: ${safeErr}`);
+      }
+    }
+
+    if (entryAborted || signal?.aborted) {
+      aborted = true;
+      break;
     }
 
     // 2. Range GET probe (only when file has at least 1 byte; 0-byte files cannot satisfy bytes=0-0)
@@ -1098,92 +1592,221 @@ export async function verifyLiveEndpoints(options = {}) {
       const expectedLength = endByte + 1;
       const rangeHeader = `bytes=0-${endByte}`;
       rangeInfo.requested = rangeHeader;
+      rangeEndByte = endByte;
 
       try {
-        const rangeRes = await fetchImpl(url, {
-          method: 'GET',
-          headers: { Range: rangeHeader },
-        });
-        rangeInfo.status = rangeRes ? rangeRes.status : null;
-        rangeInfo.acceptRanges = getHeader(rangeRes?.headers, 'accept-ranges');
-        rangeInfo.contentRange = getHeader(rangeRes?.headers, 'content-range');
-        rangeInfo.etag = getHeader(rangeRes?.headers, 'etag');
-        const rangeLenRaw = getHeader(rangeRes?.headers, 'content-length');
-        rangeInfo.contentLength =
-          rangeLenRaw !== null && /^\d+$/.test(rangeLenRaw.trim())
-            ? Number(rangeLenRaw.trim())
-            : null;
-        rangeCoopCoep = hasCoopCoepHeaders(rangeRes?.headers);
-
-        rangeInfo.receivedBytes = await consumeResponseBytes(rangeRes);
-
-        if (rangeInfo.status !== 206) {
-          fileErrors.push(
-            `GET ${entry.path} (${rangeHeader}) returned HTTP ${rangeInfo.status} (expected 206 Partial Content)`,
-          );
+        const rangeInit = signal
+          ? { method: 'GET', headers: { Range: rangeHeader }, signal }
+          : { method: 'GET', headers: { Range: rangeHeader } };
+        const rangeRes = await raceWithAbort(fetchImpl(url, rangeInit), signal);
+        if (signal?.aborted) {
+          entryAborted = true;
         } else {
-          if (!rangeInfo.acceptRanges || !/\bbytes\b/i.test(rangeInfo.acceptRanges)) {
-            fileErrors.push(
-              `GET ${entry.path} (${rangeHeader}) missing Accept-Ranges: bytes (got ${JSON.stringify(rangeInfo.acceptRanges)})`,
-            );
-          }
+          rangeInfo.status = rangeRes ? rangeRes.status : null;
+          rangeInfo.acceptRanges = getHeader(rangeRes?.headers, 'accept-ranges');
+          rangeInfo.contentRange = getHeader(rangeRes?.headers, 'content-range');
+          rangeInfo.etag = getHeader(rangeRes?.headers, 'etag');
+          const rangeLenRaw = getHeader(rangeRes?.headers, 'content-length');
+          rangeInfo.contentLength =
+            rangeLenRaw !== null && /^\d+$/.test(rangeLenRaw.trim())
+              ? Number(rangeLenRaw.trim())
+              : null;
+          rangeCoopCoep = hasCoopCoepHeaders(rangeRes?.headers);
 
-          const parsedCr = parseContentRange(rangeInfo.contentRange);
-          rangeInfo.parsedContentRange = parsedCr;
-          if (!parsedCr) {
-            fileErrors.push(
-              `GET ${entry.path} (${rangeHeader}) returned missing or invalid Content-Range: ${JSON.stringify(rangeInfo.contentRange)}`,
-            );
+          const consumed = await raceWithAbort(consumeResponseBuffer(rangeRes), signal);
+          if (signal?.aborted) {
+            entryAborted = true;
           } else {
-            if (parsedCr.start !== 0 || parsedCr.end !== endByte) {
-              fileErrors.push(
-                `GET ${entry.path} (${rangeHeader}) Content-Range span ${parsedCr.start}-${parsedCr.end} does not match requested 0-${endByte}`,
-              );
-            }
-            if (parsedCr.total !== entry.size) {
-              fileErrors.push(
-                `GET ${entry.path} (${rangeHeader}) Content-Range total (${parsedCr.total}) does not match manifest size (${entry.size})`,
-              );
-            }
-          }
+            rangeInfo.receivedBytes = consumed.byteLength;
+            rangeBytes = consumed.bytes;
 
-          if (rangeInfo.contentLength !== null && rangeInfo.contentLength !== expectedLength) {
-            fileErrors.push(
-              `GET ${entry.path} (${rangeHeader}) Content-Length (${rangeInfo.contentLength}) does not match expected ${expectedLength}`,
-            );
-          }
+            if (rangeInfo.status !== 206) {
+              const msg = `GET ${safePath} (${rangeHeader}) returned HTTP ${rangeInfo.status} (expected 206 Partial Content)`;
+              fileErrors.push(msg);
+              if (rangeInfo.status === 404 || rangeInfo.status === 410) {
+                recordFileMismatch(MISMATCH_CATEGORIES.MISSING, msg);
+              } else if (rangeInfo.status === 416) {
+                recordFileMismatch(MISMATCH_CATEGORIES.SIZE_MISMATCH, msg);
+              }
+            } else {
+              if (rangeInfo.receivedBytes !== null && rangeInfo.receivedBytes > 0) {
+                fileBytesVerified += rangeInfo.receivedBytes;
+              }
+              if (!rangeInfo.acceptRanges || !/\bbytes\b/i.test(rangeInfo.acceptRanges)) {
+                fileErrors.push(
+                  `GET ${safePath} (${rangeHeader}) missing Accept-Ranges: bytes (got ${JSON.stringify(rangeInfo.acceptRanges)})`,
+                );
+              }
 
-          if (rangeInfo.receivedBytes !== null && rangeInfo.receivedBytes !== expectedLength) {
-            fileErrors.push(
-              `GET ${entry.path} (${rangeHeader}) returned ${rangeInfo.receivedBytes} bytes (expected ${expectedLength})`,
-            );
-          }
+              const parsedCr = parseContentRange(rangeInfo.contentRange);
+              rangeInfo.parsedContentRange = parsedCr;
+              if (!parsedCr) {
+                fileErrors.push(
+                  `GET ${safePath} (${rangeHeader}) returned missing or invalid Content-Range: ${JSON.stringify(rangeInfo.contentRange)}`,
+                );
+              } else {
+                if (parsedCr.start !== 0 || parsedCr.end !== endByte) {
+                  fileErrors.push(
+                    `GET ${safePath} (${rangeHeader}) Content-Range span ${parsedCr.start}-${parsedCr.end} does not match requested 0-${endByte}`,
+                  );
+                }
+                if (parsedCr.total !== entry.size) {
+                  const msg = `GET ${safePath} (${rangeHeader}) Content-Range total (${parsedCr.total}) does not match manifest size (${entry.size})`;
+                  fileErrors.push(msg);
+                  recordFileMismatch(MISMATCH_CATEGORIES.SIZE_MISMATCH, msg);
+                }
+              }
 
-          if (!rangeInfo.etag || rangeInfo.etag.trim().length === 0) {
-            fileErrors.push(`GET ${entry.path} (${rangeHeader}) missing ETag header`);
-          } else {
-            if (headInfo.etag && rangeInfo.etag.trim() !== headInfo.etag.trim()) {
-              fileErrors.push(
-                `GET ${entry.path} ETag (${rangeInfo.etag.trim()}) differs from HEAD ETag (${headInfo.etag.trim()})`,
-              );
+              if (rangeInfo.contentLength !== null && rangeInfo.contentLength !== expectedLength) {
+                const msg = `GET ${safePath} (${rangeHeader}) Content-Length (${rangeInfo.contentLength}) does not match expected ${expectedLength}`;
+                fileErrors.push(msg);
+                recordFileMismatch(MISMATCH_CATEGORIES.SIZE_MISMATCH, msg);
+              }
+
+              if (rangeInfo.receivedBytes !== null && rangeInfo.receivedBytes !== expectedLength) {
+                const msg = `GET ${safePath} (${rangeHeader}) returned ${rangeInfo.receivedBytes} bytes (expected ${expectedLength})`;
+                fileErrors.push(msg);
+                recordFileMismatch(MISMATCH_CATEGORIES.SIZE_MISMATCH, msg);
+              }
+
+              if (!rangeInfo.etag || rangeInfo.etag.trim().length === 0) {
+                fileErrors.push(`GET ${safePath} (${rangeHeader}) missing ETag header`);
+              } else {
+                if (headInfo.etag && rangeInfo.etag.trim() !== headInfo.etag.trim()) {
+                  const msg = `GET ${safePath} ETag (${sanitizeDiagnosticText(rangeInfo.etag.trim(), 96)}) differs from HEAD ETag (${sanitizeDiagnosticText(headInfo.etag.trim(), 96)})`;
+                  fileErrors.push(msg);
+                  recordFileMismatch(MISMATCH_CATEGORIES.HASH_MISMATCH, msg);
+                }
+                if (entry.etag && rangeInfo.etag.trim() !== entry.etag) {
+                  const msg = `GET ${safePath} ETag (${sanitizeDiagnosticText(rangeInfo.etag.trim(), 96)}) does not match manifest ETag (${sanitizeDiagnosticText(entry.etag, 96)})`;
+                  fileErrors.push(msg);
+                  recordFileMismatch(MISMATCH_CATEGORIES.HASH_MISMATCH, msg);
+                }
+              }
+
+              if (checkCoopCoep && !rangeCoopCoep) {
+                fileErrors.push(
+                  `GET ${safePath} (${rangeHeader}) missing required COOP/COEP headers`,
+                );
+              }
             }
-            if (entry.etag && rangeInfo.etag.trim() !== entry.etag) {
-              fileErrors.push(
-                `GET ${entry.path} ETag (${rangeInfo.etag.trim()}) does not match manifest ETag (${entry.etag})`,
-              );
-            }
-          }
-
-          if (checkCoopCoep && !rangeCoopCoep) {
-            fileErrors.push(`GET ${entry.path} (${rangeHeader}) missing required COOP/COEP headers`);
           }
         }
       } catch (err) {
-        fileErrors.push(
-          `GET ${entry.path} (${rangeHeader}) request failed: ${err instanceof Error ? err.message : String(err)}`,
-        );
+        if (signal?.aborted || isAbortError(err)) {
+          entryAborted = true;
+        } else {
+          const safeErr = sanitizeDiagnosticText(err instanceof Error ? err.message : String(err));
+          fileErrors.push(`GET ${safePath} (${rangeHeader}) request failed: ${safeErr}`);
+        }
       }
     }
+
+    if (entryAborted || signal?.aborted) {
+      aborted = true;
+      break;
+    }
+
+    // 3. Optional SHA-256 content hash verification (never stores or returns raw bytes)
+    if (
+      verifyHashes &&
+      entry.sha256 !== null &&
+      !fileCategories.has(MISMATCH_CATEGORIES.MISSING)
+    ) {
+      let bytesToHash = null;
+      try {
+        if (entry.size === 0) {
+          bytesToHash = new Uint8Array(0);
+        } else if (
+          rangeInfo.status === 206 &&
+          rangeBytes !== null &&
+          rangeEndByte === entry.size - 1 &&
+          rangeBytes.byteLength === entry.size
+        ) {
+          bytesToHash = rangeBytes;
+        } else {
+          const fullInit = signal ? { method: 'GET', signal } : { method: 'GET' };
+          const fullRes = await raceWithAbort(fetchImpl(url, fullInit), signal);
+          if (signal?.aborted) {
+            entryAborted = true;
+          } else {
+            const fullStatus = fullRes ? fullRes.status : null;
+            const fullConsumed = await raceWithAbort(consumeResponseBuffer(fullRes), signal);
+            if (signal?.aborted) {
+              entryAborted = true;
+            } else if (fullStatus === 404 || fullStatus === 410) {
+              const msg = `GET ${safePath} (sha256) returned HTTP ${fullStatus} (expected 200)`;
+              fileErrors.push(msg);
+              recordFileMismatch(MISMATCH_CATEGORIES.MISSING, msg);
+            } else if (fullStatus !== 200) {
+              fileErrors.push(
+                `GET ${safePath} (sha256) returned HTTP ${fullStatus} (expected 200)`,
+              );
+            } else if (fullConsumed.bytes !== null) {
+              fileBytesVerified = Math.max(fileBytesVerified, fullConsumed.byteLength);
+              if (fullConsumed.byteLength !== entry.size) {
+                const msg = `GET ${safePath} (sha256) returned ${fullConsumed.byteLength} bytes (expected ${entry.size})`;
+                fileErrors.push(msg);
+                recordFileMismatch(MISMATCH_CATEGORIES.SIZE_MISMATCH, msg);
+              }
+              bytesToHash = fullConsumed.bytes;
+            }
+          }
+        }
+
+        if (!entryAborted && !signal?.aborted && bytesToHash !== null) {
+          const rawDigest = await raceWithAbort(
+            Promise.resolve(
+              typeof hashFn === 'function' ? hashFn(bytesToHash) : computeSha256Hex(bytesToHash),
+            ),
+            signal,
+          );
+          if (signal?.aborted) {
+            entryAborted = true;
+          } else {
+            const actualHex =
+              typeof rawDigest === 'string' && SHA256_HEX_RE.test(rawDigest.trim())
+                ? rawDigest.trim().toLowerCase()
+                : null;
+            const verified = actualHex !== null && actualHex === entry.sha256;
+            hashInfo = {
+              expected: entry.sha256,
+              actual: actualHex,
+              verified,
+            };
+            if (!verified) {
+              const msg = `SHA-256 ${safePath} digest (${actualHex || 'invalid'}) does not match manifest sha256 (${entry.sha256})`;
+              fileErrors.push(msg);
+              recordFileMismatch(MISMATCH_CATEGORIES.HASH_MISMATCH, msg);
+            }
+          }
+        }
+      } catch (err) {
+        if (signal?.aborted || isAbortError(err)) {
+          entryAborted = true;
+        } else {
+          const safeErr = sanitizeDiagnosticText(err instanceof Error ? err.message : String(err));
+          fileErrors.push(`SHA-256 ${safePath} verification failed: ${safeErr}`);
+        }
+      }
+    }
+
+    // Drop any reference to raw file bytes before finalizing diagnostics.
+    rangeBytes = null;
+
+    if (entryAborted || signal?.aborted) {
+      aborted = true;
+      break;
+    }
+
+    for (const m of fileMismatches) {
+      mismatchesByCategory[m.category] += 1;
+      mismatches.push(m);
+    }
+
+    const fileElapsedMs = computeElapsedMs(fileStart, now());
+    filesVerified += 1;
+    bytesVerified += fileBytesVerified;
 
     const fileOk = fileErrors.length === 0;
     if (fileOk) {
@@ -1200,18 +1823,14 @@ export async function verifyLiveEndpoints(options = {}) {
       errors: fileErrors,
       head: headInfo,
       range: rangeInfo,
+      hash: hashInfo,
       etag: rangeInfo.etag || headInfo.etag || null,
       coopCoep: entry.size > 0 ? headCoopCoep && rangeCoopCoep : headCoopCoep,
+      elapsedMs: fileElapsedMs,
+      bytesVerified: fileBytesVerified,
+      mismatchCategories: Array.from(fileCategories),
     });
   }
 
-  return {
-    ok: manifestResult.ok && failed === 0,
-    probed: results.length,
-    passed,
-    failed,
-    skippedIncomplete,
-    errors: topErrors,
-    results,
-  };
+  return finalize(manifestResult.ok, topErrors);
 }
