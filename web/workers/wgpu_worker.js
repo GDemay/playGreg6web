@@ -883,6 +883,46 @@ function lookupFromPackCache(packCache, hash) {
   return null;
 }
 
+const DEFAULT_STREAM_SHADERS_THRESHOLD_BYTES = 64 * 1024 * 1024;
+const SWAPCHAIN_FORMAT_TOKEN_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
+
+function sanitizeSwapchainFormatToken(raw) {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const token = raw.trim().toLowerCase();
+  if (token.length === 0 || !SWAPCHAIN_FORMAT_TOKEN_RE.test(token)) {
+    return null;
+  }
+  return token;
+}
+
+function resolveShaderPackStreamThresholdBytes(primary, fallback) {
+  const rawThreshold =
+    primary && primary.streamThresholdBytes !== undefined
+      ? primary.streamThresholdBytes
+      : fallback && fallback.streamThresholdBytes !== undefined
+        ? fallback.streamThresholdBytes
+        : undefined;
+  if (
+    typeof rawThreshold === 'number' &&
+    Number.isInteger(rawThreshold) &&
+    rawThreshold >= 0
+  ) {
+    return rawThreshold;
+  }
+  const rawStreamFlag =
+    primary && primary.streamShaders !== undefined
+      ? primary.streamShaders
+      : fallback && fallback.streamShaders !== undefined
+        ? fallback.streamShaders
+        : undefined;
+  if (rawStreamFlag === true) {
+    return DEFAULT_STREAM_SHADERS_THRESHOLD_BYTES;
+  }
+  return undefined;
+}
+
 function loadWgslPackIntoCache(packCache, buffer, packName) {
   if (!packCache) {
     return null;
@@ -1718,7 +1758,8 @@ class WgpuCommandProcessor {
       this.loadReflectionManifest(options.reflectionManifest);
     }
 
-    // 7. WgslPackCache + ShaderFallbackRouter (G28 / S12)
+    // 7. WgslPackCache + ShaderFallbackRouter (G28 / S12 / W109 / W121)
+    this._shaderPackStreamThresholdBytes = resolveShaderPackStreamThresholdBytes(options, null);
     this._ownsWgslPackCache = false;
     this.wgslPackCache = null;
     if (options.wgslPackCache && typeof options.wgslPackCache === 'object') {
@@ -2254,6 +2295,36 @@ class WgpuCommandProcessor {
     return null;
   }
 
+  _getTexturePacketsExtension() {
+    let ext = this.extension;
+    while (ext) {
+      if (
+        typeof ext.getStats === 'function' &&
+        (ext._bc3dFallbackTextures instanceof Set ||
+          (ext.stats &&
+            typeof ext.stats === 'object' &&
+            ext.stats.bc3dFallbacks !== undefined))
+      ) {
+        return ext;
+      }
+      ext = ext.next || null;
+    }
+    return null;
+  }
+
+  _getRenderTargetFormat() {
+    if (
+      this._swapchain &&
+      !this._swapchain.isDestroyed &&
+      this._swapchain.usesBlitFallback === true &&
+      typeof this._swapchain.streamFormat === 'string' &&
+      this._swapchain.streamFormat.length > 0
+    ) {
+      return this._swapchain.streamFormat;
+    }
+    return this.format;
+  }
+
   /**
    * Select a G34 fallback shader profile for a draw state (`fullscreen_triangle_cbv`,
    * `textured_quad_24b`, or `default`).
@@ -2594,7 +2665,7 @@ class WgpuCommandProcessor {
       descriptor.fragment = {
         module: fsModule,
         entryPoint: fsEntryPoint,
-        targets: [{ format: this.format }],
+        targets: [{ format: this._getRenderTargetFormat() }],
       };
     }
 
@@ -4138,10 +4209,14 @@ class WgpuCommandProcessor {
   }
 
   /**
-   * #709: Reconfigure the WebGPU canvas context / swapchain to match the swapchain attachment
-   * format declared by the command stream (e.g. 'rgba8unorm' instead of Windows's default
-   * 'bgra8unorm' from getPreferredCanvasFormat()), preventing RenderPipeline vs RenderPassEncoder
-   * attachment format mismatches on Present.
+   * #709 / W112 / W121: Configure the WebGPU canvas context / swapchain to match the swapchain
+   * attachment format declared by the command stream.
+   *
+   * When an attached `WgpuSwapchain` supports `configureForStreamFormat()`, valid direct canvas
+   * formats (`bgra8unorm`, `rgba8unorm`, `rgba16float`) stay on the zero-overhead direct canvas
+   * path, while non-canvas formats (e.g. `rgb10a2unorm`, `rg11b10ufloat`, `rgba8unorm-srgb`,
+   * `rgba16unorm`) automatically activate the W112 offscreen intermediate texture + fullscreen
+   * blit fallback.
    *
    * @param {string} declaredFormat
    * @returns {boolean}
@@ -4150,6 +4225,26 @@ class WgpuCommandProcessor {
     if (typeof declaredFormat !== 'string' || declaredFormat.length === 0) {
       return false;
     }
+    const swapchain =
+      this._swapchain && !this._swapchain.isDestroyed ? this._swapchain : null;
+    if (swapchain && typeof swapchain.configureForStreamFormat === 'function') {
+      try {
+        swapchain.configureForStreamFormat(declaredFormat);
+      } catch (err) {
+        this._logDiagnostic(
+          'warn',
+          `[wgpu_worker] failed to configure swapchain for stream format ${declaredFormat}: ${sanitizeGpuErrorDetail(err)}`
+        );
+        return false;
+      }
+      this._streamSwapchainFormat = declaredFormat;
+      this._swapchainViewFormat = null;
+      if (typeof swapchain.format === 'string' && swapchain.format.length > 0) {
+        this.format = swapchain.format;
+      }
+      return true;
+    }
+
     const isSrgb = declaredFormat.endsWith('-srgb');
     const baseFormat = isSrgb ? declaredFormat.slice(0, -5) : declaredFormat;
     if (
@@ -4167,13 +4262,9 @@ class WgpuCommandProcessor {
     this.format = baseFormat;
     this._swapchainViewFormat = viewFormat;
     const viewFormats = viewFormat ? [viewFormat] : null;
-    if (
-      this._swapchain &&
-      !this._swapchain.isDestroyed &&
-      typeof this._swapchain.setFormat === 'function'
-    ) {
+    if (swapchain && typeof swapchain.setFormat === 'function') {
       try {
-        this._swapchain.setFormat(baseFormat, viewFormats);
+        swapchain.setFormat(baseFormat, viewFormats);
       } catch (err) {
         this._logDiagnostic(
           'warn',
@@ -4204,6 +4295,17 @@ class WgpuCommandProcessor {
       return true;
     }
     return true;
+  }
+
+  /**
+   * W121: Configure the swapchain for a stream-declared back-buffer format
+   * (alias for `setSwapchainFormat(declaredFormat)`).
+   *
+   * @param {string} declaredFormat
+   * @returns {boolean}
+   */
+  configureForStreamFormat(declaredFormat) {
+    return this.setSwapchainFormat(declaredFormat);
   }
 
   /**
@@ -4238,12 +4340,22 @@ class WgpuCommandProcessor {
         options.recoverSwapchain !== false
     );
     const effectiveFormat = this._streamSwapchainFormat
-      ? this.format
+      ? swapchainRecovers
+        ? this._streamSwapchainFormat
+        : this.format
       : options.format;
     this.bindDevice(newDevice, {
       format: effectiveFormat,
       recoverSwapchain: options.recoverSwapchain,
     });
+    if (
+      swapchainRecovers &&
+      this._swapchain &&
+      typeof this._swapchain.format === 'string' &&
+      this._swapchain.format.length > 0
+    ) {
+      this.format = this._swapchain.format;
+    }
     if (!swapchainRecovers && this.ctx && typeof this.ctx.configure === 'function') {
       const cfg = {
         device: newDevice,
@@ -4421,6 +4533,128 @@ class WgpuCommandProcessor {
       this.shaderFallbackRouter.setPackLoader(this.wgslPackCache);
     }
     return result;
+  }
+
+  /**
+   * W109 / W121: Fetch and load a `.wgsl.pack` URL into `wgslPackCache`, forwarding optional
+   * `streamThresholdBytes` (or `streamShaders: true`) into `WgslPackCache.loadPackUrl(url, opts)`.
+   * When omitted, preserves full-buffer loading behavior.
+   *
+   * @param {string} url
+   * @param {{
+   *   fetch?: typeof fetch,
+   *   packName?: string,
+   *   streamThresholdBytes?: number,
+   *   streamShaders?: boolean,
+   *   initialRangeBytes?: number,
+   *   maxCachedWgslBytes?: number,
+   *   fetchInit?: RequestInit,
+   *   lazyDecode?: boolean,
+   * }} [opts]
+   */
+  async loadShaderPackUrl(url, opts = {}) {
+    if (this._destroyed) {
+      throw new Error('WgpuCommandProcessor has been destroyed');
+    }
+    if (typeof url !== 'string' || url.trim().length === 0) {
+      throw new TypeError('loadShaderPackUrl requires a non-empty URL string');
+    }
+    const options = opts && typeof opts === 'object' ? opts : {};
+    const activeFetch =
+      typeof options.fetch === 'function'
+        ? options.fetch
+        : typeof globalThis !== 'undefined' && typeof globalThis.fetch === 'function'
+          ? globalThis.fetch
+          : null;
+    if (!activeFetch) {
+      throw new Error('No fetch implementation available for loadShaderPackUrl');
+    }
+    const resolvedUrl = url.trim();
+    const packName =
+      typeof options.packName === 'string' && options.packName.length > 0
+        ? options.packName
+        : resolvedUrl;
+    const streamThresholdBytes = resolveShaderPackStreamThresholdBytes(options, {
+      streamThresholdBytes: this._shaderPackStreamThresholdBytes,
+    });
+
+    if (
+      streamThresholdBytes !== undefined &&
+      streamThresholdBytes > 0 &&
+      this._ownsWgslPackCache &&
+      (!this.wgslPackCache || typeof this.wgslPackCache.loadPackUrl !== 'function')
+    ) {
+      try {
+        const mod = await import('./wgsl_pack_loader.js');
+        if (mod && typeof mod.WgslPackCache === 'function') {
+          const prevCache = this.wgslPackCache;
+          const nextCache = new mod.WgslPackCache({
+            fetch: activeFetch,
+            streamThresholdBytes,
+          });
+          this.wgslPackCache = nextCache;
+          if (
+            this.shaderFallbackRouter &&
+            typeof this.shaderFallbackRouter.setPackLoader === 'function' &&
+            (this.shaderFallbackRouter._packLoader == null ||
+              this.shaderFallbackRouter._packLoader === prevCache)
+          ) {
+            this.shaderFallbackRouter.setPackLoader(nextCache);
+          }
+        }
+      } catch (_) {
+        // Fall through to full-buffer fetch when dynamic ESM import is unavailable.
+      }
+    }
+
+    if (this.wgslPackCache && typeof this.wgslPackCache.loadPackUrl === 'function') {
+      const loadOpts = {
+        fetch: activeFetch,
+        packName,
+      };
+      if (streamThresholdBytes !== undefined) {
+        loadOpts.streamThresholdBytes = streamThresholdBytes;
+      }
+      if (
+        Number.isInteger(options.initialRangeBytes) &&
+        options.initialRangeBytes >= WGPK_HEADER_BYTES
+      ) {
+        loadOpts.initialRangeBytes = options.initialRangeBytes;
+      }
+      if (Number.isInteger(options.maxCachedWgslBytes) && options.maxCachedWgslBytes >= 0) {
+        loadOpts.maxCachedWgslBytes = options.maxCachedWgslBytes;
+      }
+      if (options.fetchInit !== undefined) {
+        loadOpts.fetchInit = options.fetchInit;
+      }
+      if (options.lazyDecode !== undefined) {
+        loadOpts.lazyDecode = Boolean(options.lazyDecode);
+      }
+      const result = await this.wgslPackCache.loadPackUrl(resolvedUrl, loadOpts);
+      if (
+        this.shaderFallbackRouter &&
+        this.shaderFallbackRouter._packLoader == null &&
+        typeof this.shaderFallbackRouter.setPackLoader === 'function'
+      ) {
+        this.shaderFallbackRouter.setPackLoader(this.wgslPackCache);
+      }
+      return result;
+    }
+
+    const resp = await activeFetch(resolvedUrl, options.fetchInit);
+    if (!resp || !resp.ok || typeof resp.arrayBuffer !== 'function') {
+      const status = resp ? resp.status : 'unknown';
+      throw new Error(`Failed to fetch WGSL pack from "${resolvedUrl}": HTTP ${status}`);
+    }
+    const buffer = await resp.arrayBuffer();
+    return this.loadWgslPack(buffer, packName);
+  }
+
+  /**
+   * Alias for `loadShaderPackUrl(url, opts)`.
+   */
+  loadShaderPack(url, opts = {}) {
+    return this.loadShaderPackUrl(url, opts);
   }
 
   /**
@@ -5059,7 +5293,7 @@ class WgpuCommandProcessor {
       descriptor.fragment = {
         module: fsEntry.module,
         entryPoint: fsRefl && fsRefl.entryPoint ? fsRefl.entryPoint : 'fs_main',
-        targets: [{ format: this.format }],
+        targets: [{ format: this._getRenderTargetFormat() }],
       };
     }
 
@@ -5755,18 +5989,39 @@ class WgpuCommandProcessor {
 
     // W99: a torn-down WebGPU instance throws `OperationError` from createCommandEncoder /
     // getCurrentTexture; record it and drop the frame instead of crashing the message loop.
+    // W112 / W121: when WgpuSwapchain activates offscreen blit fallback for a non-canvas
+    // stream format, bind the intermediate render-target view for SWAPCHAIN_TEXTURE_ID passes
+    // and keep the canvas view handy to blit right before encoder.finish() / queue.submit().
+    const activeSwapchain =
+      this._swapchain && !this._swapchain.isDestroyed ? this._swapchain : null;
+    const useSwapchainBlitFallback = Boolean(
+      activeSwapchain &&
+        activeSwapchain.usesBlitFallback === true &&
+        activeSwapchain.isConfigured !== false &&
+        typeof activeSwapchain.getRenderTargetView === 'function'
+    );
+
     let encoder;
     let swapchainTexture;
     let swapchainView;
+    let canvasTexture = null;
+    let canvasView = null;
     try {
       encoder = pendingEncoder || this.device.createCommandEncoder();
-      swapchainTexture = this.ctx.getCurrentTexture();
-      swapchainView =
-        swapchainTexture && typeof swapchainTexture.createView === 'function'
-          ? this._swapchainViewFormat
-            ? swapchainTexture.createView({ format: this._swapchainViewFormat })
-            : swapchainTexture.createView()
-          : swapchainTexture;
+      canvasTexture = this.ctx.getCurrentTexture();
+      canvasView =
+        canvasTexture && typeof canvasTexture.createView === 'function'
+          ? this._swapchainViewFormat && !useSwapchainBlitFallback
+            ? canvasTexture.createView({ format: this._swapchainViewFormat })
+            : canvasTexture.createView()
+          : canvasTexture;
+      if (useSwapchainBlitFallback) {
+        swapchainView = activeSwapchain.getRenderTargetView();
+        swapchainTexture = activeSwapchain.intermediateTexture || canvasTexture;
+      } else {
+        swapchainTexture = canvasTexture;
+        swapchainView = canvasView;
+      }
     } catch (err) {
       this._notePresentSubmitFailure(err);
       this._endSubsystemsForFrame(null);
@@ -5856,6 +6111,10 @@ class WgpuCommandProcessor {
       swapchainView,
       canvasWidth: this._viewportWidth > 0 ? this._viewportWidth : undefined,
       canvasHeight: this._viewportHeight > 0 ? this._viewportHeight : undefined,
+      swapchainWidth:
+        activeSwapchain && activeSwapchain.width > 0 ? activeSwapchain.width : undefined,
+      swapchainHeight:
+        activeSwapchain && activeSwapchain.height > 0 ? activeSwapchain.height : undefined,
       get pass() { return activePass; },
       get passKind() { return activePassKind; },
       endPass: endActivePass,
@@ -6140,6 +6399,20 @@ class WgpuCommandProcessor {
         this._recordOpValidationError('BeginRenderPass', sanitizeGpuErrorDetail(err));
       }
       endActivePass();
+    }
+
+    // W112 / W121: Blit the offscreen intermediate render-target texture onto the canvas
+    // right before finishing and submitting when blit fallback is active (zero overhead
+    // when usesBlitFallback === false).
+    if (
+      useSwapchainBlitFallback &&
+      typeof activeSwapchain.blitToCanvasIfNeeded === 'function'
+    ) {
+      try {
+        activeSwapchain.blitToCanvasIfNeeded(encoder, canvasView);
+      } catch (err) {
+        this._recordOpValidationError('SwapchainBlit', sanitizeGpuErrorDetail(err));
+      }
     }
 
     let timerResolved = false;
@@ -6595,6 +6868,46 @@ class WgpuCommandProcessor {
         : splashBridge && splashBridge.presenterStats
           ? splashBridge.presenterStats
           : null;
+    let swapchain = null;
+    if (this._swapchain && typeof this._swapchain.getStats === 'function') {
+      try {
+        swapchain = this._swapchain.getStats();
+      } catch (_) {
+        swapchain = null;
+      }
+    }
+    const texturePacketsExt = this._getTexturePacketsExtension();
+    let texturePackets = null;
+    if (texturePacketsExt && typeof texturePacketsExt.getStats === 'function') {
+      try {
+        texturePackets = texturePacketsExt.getStats();
+      } catch (_) {
+        texturePackets = null;
+      }
+    }
+    const swapchainFormat = sanitizeSwapchainFormatToken(
+      (swapchain && (swapchain.streamFormat || swapchain.format)) ||
+        this._streamSwapchainFormat ||
+        this.format
+    );
+    const usesBlitFallback = Boolean(
+      (swapchain && swapchain.usesBlitFallback === true) ||
+        (this._swapchain && this._swapchain.usesBlitFallback === true)
+    );
+    const blitCount = toNonNegativeInt(
+      swapchain && swapchain.blitCount !== undefined
+        ? swapchain.blitCount
+        : this._swapchain && this._swapchain.blitCount,
+      0
+    );
+    const bc3dFallbacks = toNonNegativeInt(
+      texturePackets && texturePackets.bc3dFallbacks,
+      0
+    );
+    const bc3dFallbackUploadsSkipped = toNonNegativeInt(
+      texturePackets && texturePackets.bc3dFallbackUploadsSkipped,
+      0
+    );
 
     return {
       frameCount: this.frameCount,
@@ -6640,6 +6953,13 @@ class WgpuCommandProcessor {
       wgslPackCache,
       splashBridge,
       binkPresenter,
+      swapchain,
+      swapchainFormat,
+      usesBlitFallback,
+      blitCount,
+      texturePackets,
+      bc3dFallbacks,
+      bc3dFallbackUploadsSkipped,
     };
   }
 
@@ -7083,8 +7403,187 @@ function buildGpuTelemetrySnapshot(processor, options = {}) {
     snapshot.deviceStats = resolveDeviceLossTelemetry(processor, stats);
     // W103: async pipeline compile queue counters (null when async compilation is disabled).
     snapshot.asyncPipelineStats = resolveAsyncPipelineTelemetry(processor);
+    // W121: swapchain format/blit (W112), 3D-BC texture fallback (W108), and WGSL pack mode (W109).
+    snapshot.swapchainStats = resolveSwapchainTelemetry(processor, stats);
+    snapshot.textureStats = resolveTextureTelemetry(processor, stats);
+    snapshot.shaderPackStats = resolveShaderPackTelemetry(processor, stats);
   }
   return snapshot;
+}
+
+/**
+ * W121: sanitized swapchain format and W112 offscreen blit-fallback counters.
+ *
+ * @returns {{ swapchainFormat: string | null, canvasFormat: string | null, usesBlitFallback: boolean, blitCount: number }}
+ */
+function resolveSwapchainTelemetry(processor, stats) {
+  let raw = null;
+  try {
+    const swap =
+      (processor && processor.swapchain) ||
+      (processor && processor._swapchain) ||
+      null;
+    if (swap && typeof swap.getStats === 'function') {
+      raw = swap.getStats();
+    } else if (swap && typeof swap === 'object') {
+      raw = swap;
+    }
+  } catch (_) {
+    raw = null;
+  }
+  if (!raw || typeof raw !== 'object') {
+    if (stats && stats.swapchainStats && typeof stats.swapchainStats === 'object') {
+      raw = stats.swapchainStats;
+    } else if (stats && stats.swapchain && typeof stats.swapchain === 'object') {
+      raw = stats.swapchain;
+    }
+  }
+  const src = raw && typeof raw === 'object' ? raw : {};
+  const swapchainFormat = sanitizeSwapchainFormatToken(
+    src.swapchainFormat ||
+      src.streamFormat ||
+      src.format ||
+      (stats && stats.swapchainFormat) ||
+      (processor && processor._streamSwapchainFormat) ||
+      (processor && processor.format) ||
+      null
+  );
+  const canvasFormat = sanitizeSwapchainFormatToken(
+    src.canvasFormat ||
+      src.format ||
+      (processor && processor.format) ||
+      swapchainFormat ||
+      null
+  );
+  const usesBlitFallback = Boolean(
+    src.usesBlitFallback === true ||
+      (stats && stats.usesBlitFallback === true)
+  );
+  const blitCount = toNonNegativeInt(
+    src.blitCount !== undefined
+      ? src.blitCount
+      : stats && stats.blitCount,
+    0
+  );
+  return {
+    swapchainFormat,
+    canvasFormat,
+    usesBlitFallback,
+    blitCount,
+  };
+}
+
+/**
+ * W121: sanitized W108 3D-BC texture fallback counters from `TexturePackets.getStats()`.
+ *
+ * @returns {{ bc3dFallbacks: number, bc3dFallbackUploadsSkipped: number }}
+ */
+function resolveTextureTelemetry(processor, stats) {
+  let raw = null;
+  const readSource = (source) => {
+    if (!source || typeof source !== 'object') {
+      return null;
+    }
+    try {
+      if (typeof source.getStats === 'function') {
+        const s = source.getStats();
+        if (
+          s &&
+          typeof s === 'object' &&
+          (s.bc3dFallbacks !== undefined || s.bc3dFallbackUploadsSkipped !== undefined)
+        ) {
+          return s;
+        }
+      }
+      if (
+        source.stats &&
+        typeof source.stats === 'object' &&
+        (source.stats.bc3dFallbacks !== undefined ||
+          source.stats.bc3dFallbackUploadsSkipped !== undefined)
+      ) {
+        return source.stats;
+      }
+      if (
+        source.bc3dFallbacks !== undefined ||
+        source.bc3dFallbackUploadsSkipped !== undefined
+      ) {
+        return source;
+      }
+    } catch (_) {
+      return null;
+    }
+    return null;
+  };
+
+  if (stats && typeof stats === 'object') {
+    raw = readSource(stats.textureStats) || readSource(stats.texturePackets);
+  }
+  if (!raw && processor && typeof processor === 'object') {
+    const candidates = [processor.texturePackets, processor._texturePackets];
+    if (typeof processor._getTexturePacketsExtension === 'function') {
+      try {
+        candidates.push(processor._getTexturePacketsExtension());
+      } catch (_) {
+        // ignore
+      }
+    } else if (processor.extension && typeof processor.extension === 'object') {
+      let ext = processor.extension;
+      while (ext) {
+        candidates.push(ext);
+        ext = ext.next || null;
+      }
+    }
+    for (let i = 0; i < candidates.length; i += 1) {
+      const found = readSource(candidates[i]);
+      if (found) {
+        raw = found;
+        break;
+      }
+    }
+  }
+  if (!raw && stats && typeof stats === 'object') {
+    raw = readSource(stats);
+  }
+
+  return {
+    bc3dFallbacks: toNonNegativeInt(raw && raw.bc3dFallbacks, 0),
+    bc3dFallbackUploadsSkipped: toNonNegativeInt(raw && raw.bc3dFallbackUploadsSkipped, 0),
+  };
+}
+
+/**
+ * W121: sanitized W109 WGSL pack mode & ranged-fetch counters, or null when unavailable.
+ *
+ * @returns {{ mode: 'buffer' | 'ranged' | 'mixed', packCount: number, shaderCount: number, rangeFetches: number, cachedWgslBytes: number } | null}
+ */
+function resolveShaderPackTelemetry(processor, stats) {
+  let raw = null;
+  try {
+    if (
+      processor &&
+      processor.wgslPackCache &&
+      typeof processor.wgslPackCache.getStats === 'function'
+    ) {
+      raw = processor.wgslPackCache.getStats();
+    } else if (stats && stats.wgslPackCache && typeof stats.wgslPackCache === 'object') {
+      raw = stats.wgslPackCache;
+    }
+  } catch (_) {
+    raw = null;
+  }
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+  const rawMode = typeof raw.mode === 'string' ? raw.mode.trim().toLowerCase() : 'buffer';
+  const mode =
+    rawMode === 'ranged' || rawMode === 'mixed' || rawMode === 'buffer' ? rawMode : 'buffer';
+  return {
+    mode,
+    packCount: toNonNegativeInt(raw.packCount, 0),
+    shaderCount: toNonNegativeInt(raw.shaderCount, 0),
+    rangeFetches: toNonNegativeInt(raw.rangeFetches, 0),
+    cachedWgslBytes: toNonNegativeInt(raw.cachedWgslBytes, 0),
+  };
 }
 
 const ASYNC_PIPELINE_TELEMETRY_KEYS = Object.freeze([
@@ -7458,6 +7957,17 @@ function createWgpuWorkerHandler(options = {}) {
       typeof initPayload.shaderPackUrl === 'string' && initPayload.shaderPackUrl.trim().length > 0
         ? initPayload.shaderPackUrl.trim()
         : null;
+    const streamThresholdBytes = resolveShaderPackStreamThresholdBytes(initPayload, options);
+    const initialRangeBytes =
+      initPayload.initialRangeBytes !== undefined
+        ? initPayload.initialRangeBytes
+        : options.initialRangeBytes;
+    const maxCachedWgslBytes =
+      initPayload.maxCachedWgslBytes !== undefined
+        ? initPayload.maxCachedWgslBytes
+        : options.maxCachedWgslBytes;
+    const fetchInit =
+      initPayload.fetchInit !== undefined ? initPayload.fetchInit : options.fetchInit;
     const reflectionManifestUrl =
       typeof initPayload.reflectionManifestUrl === 'string' &&
       initPayload.reflectionManifestUrl.trim().length > 0
@@ -7470,15 +7980,62 @@ function createWgpuWorkerHandler(options = {}) {
       tasks.push(
         (async () => {
           try {
-            const resp = await activeFetch(shaderPackUrl);
-            if (!resp || !resp.ok || typeof resp.arrayBuffer !== 'function') {
-              return;
-            }
-            const buffer = await resp.arrayBuffer();
-            if (typeof targetProcessor.loadWgslPack === 'function') {
-              targetProcessor.loadWgslPack(buffer, shaderPackUrl);
-            } else if (targetProcessor.wgslPackCache) {
-              loadWgslPackIntoCache(targetProcessor.wgslPackCache, buffer, shaderPackUrl);
+            const hasLoadPackUrl = Boolean(
+              targetProcessor.wgslPackCache &&
+                typeof targetProcessor.wgslPackCache.loadPackUrl === 'function'
+            );
+            if (hasLoadPackUrl) {
+              const loadOpts = {
+                fetch: activeFetch,
+                packName: shaderPackUrl,
+              };
+              if (streamThresholdBytes !== undefined) {
+                loadOpts.streamThresholdBytes = streamThresholdBytes;
+              }
+              if (
+                Number.isInteger(initialRangeBytes) &&
+                initialRangeBytes >= WGPK_HEADER_BYTES
+              ) {
+                loadOpts.initialRangeBytes = initialRangeBytes;
+              }
+              if (Number.isInteger(maxCachedWgslBytes) && maxCachedWgslBytes >= 0) {
+                loadOpts.maxCachedWgslBytes = maxCachedWgslBytes;
+              }
+              if (fetchInit !== undefined) {
+                loadOpts.fetchInit = fetchInit;
+              }
+              await targetProcessor.wgslPackCache.loadPackUrl(shaderPackUrl, loadOpts);
+              if (
+                targetProcessor.shaderFallbackRouter &&
+                targetProcessor.shaderFallbackRouter._packLoader == null &&
+                typeof targetProcessor.shaderFallbackRouter.setPackLoader === 'function'
+              ) {
+                targetProcessor.shaderFallbackRouter.setPackLoader(targetProcessor.wgslPackCache);
+              }
+            } else if (
+              streamThresholdBytes !== undefined &&
+              streamThresholdBytes > 0 &&
+              typeof targetProcessor.loadShaderPackUrl === 'function'
+            ) {
+              await targetProcessor.loadShaderPackUrl(shaderPackUrl, {
+                fetch: activeFetch,
+                packName: shaderPackUrl,
+                streamThresholdBytes,
+                initialRangeBytes,
+                maxCachedWgslBytes,
+                fetchInit,
+              });
+            } else {
+              const resp = await activeFetch(shaderPackUrl);
+              if (!resp || !resp.ok || typeof resp.arrayBuffer !== 'function') {
+                return;
+              }
+              const buffer = await resp.arrayBuffer();
+              if (typeof targetProcessor.loadWgslPack === 'function') {
+                targetProcessor.loadWgslPack(buffer, shaderPackUrl);
+              } else if (targetProcessor.wgslPackCache) {
+                loadWgslPackIntoCache(targetProcessor.wgslPackCache, buffer, shaderPackUrl);
+              }
             }
             summary.shaderPackLoaded = true;
             if (
@@ -7898,8 +8455,11 @@ function createWgpuWorkerHandler(options = {}) {
       resourceRegistry: options.resourceRegistry,
       rtPool: options.rtPool,
       pipelineCache: options.pipelineCache,
-      wgslPackCache: options.wgslPackCache,
+      wgslPackCache: initPayload.wgslPackCache ?? options.wgslPackCache,
       wgslPackBuffer: initPayload.wgslPackBuffer ?? options.wgslPackBuffer,
+      streamThresholdBytes:
+        initPayload.streamThresholdBytes ?? options.streamThresholdBytes,
+      streamShaders: initPayload.streamShaders ?? options.streamShaders,
       shaderFallbackRouter: options.shaderFallbackRouter,
       ShaderFallbackRouter: options.ShaderFallbackRouter,
       shaderFallbackRouterOptions: options.shaderFallbackRouterOptions,
@@ -8036,6 +8596,36 @@ function createWgpuWorkerHandler(options = {}) {
           id: payload.id,
           reflectionLoaded: true,
           shaderCount: stats.reflectionShaderCount,
+        });
+      } else if (
+        (payload.loadShaderPack ||
+          payload.type === 'load-shader-pack' ||
+          payload.type === 'loadShaderPack') &&
+        processor
+      ) {
+        const packUrl =
+          typeof payload.loadShaderPack === 'string'
+            ? payload.loadShaderPack
+            : typeof payload.shaderPackUrl === 'string'
+              ? payload.shaderPackUrl
+              : typeof payload.url === 'string'
+                ? payload.url
+                : null;
+        const loadSummary = packUrl
+          ? await preloadBootShaderAssets(processor, {
+              ...payload,
+              shaderPackUrl: packUrl,
+            })
+          : { shaderPackLoaded: false, shaderPackShaders: 0 };
+        const packStats =
+          processor.wgslPackCache && typeof processor.wgslPackCache.getStats === 'function'
+            ? processor.wgslPackCache.getStats()
+            : null;
+        postMessage({
+          id: payload.id,
+          shaderPackLoaded: loadSummary.shaderPackLoaded,
+          shaderCount: loadSummary.shaderPackShaders,
+          mode: packStats && typeof packStats.mode === 'string' ? packStats.mode : 'buffer',
         });
       } else if (payload.type === 'request-gpu-telemetry') {
         emitTelemetry({

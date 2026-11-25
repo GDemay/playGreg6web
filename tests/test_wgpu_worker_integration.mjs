@@ -1,6 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import {
+  WgslPackCache,
+  SHADER_STAGE as WGPK_SHADER_STAGE,
+  buildWgslPackBuffer,
+  fnv1a64 as wgpkFnv1a64,
+  formatHashHex as wgpkFormatHashHex,
+} from '../web/workers/wgsl_pack_loader.js';
 
 const require = createRequire(import.meta.url);
 
@@ -12,10 +19,14 @@ const reflectionMod = require('../web/workers/reflection_loader.js');
 const registryMod = require('../web/workers/resource_registry.js');
 const rtPoolMod = require('../web/workers/rt_pool.js');
 const pipelineCacheMod = require('../web/workers/pipeline_cache.js');
+const swapchainMod = require('../web/workers/wgpu_swapchain.js');
+const renderStateMod = require('../web/workers/render_state_packets.js');
+const texturePacketsMod = require('../web/workers/texture_packets.js');
 
 const {
   WgpuCommandProcessor,
   createWgpuWorkerHandler,
+  buildGpuTelemetrySnapshot,
   OPCODES,
   SHADER_STAGE,
   PRIMITIVE_TOPOLOGY,
@@ -28,6 +39,14 @@ const {
   BIND_RESOURCE_TYPE,
   INDEX_FORMAT,
 } = wgpuMod;
+
+const { WgpuSwapchain } = swapchainMod;
+const {
+  installRenderStatePackets,
+  SWAPCHAIN_TEXTURE_ID,
+  TEXTURE_FORMAT_NAMES: RS_TEXTURE_FORMAT_NAMES,
+} = renderStateMod;
+const { installTexturePackets, CREATE_TEXTURE2 } = texturePacketsMod;
 
 const { GpuStagingPool } = stagingMod;
 const { DynamicUniformRing } = uniformMod;
@@ -1372,4 +1391,410 @@ test('G23 createWgpuWorkerHandler wires loadReflectionManifest, resize -> rtPool
   const destroyMsg = posted.find((m) => m.id === 3);
   assert.equal(destroyMsg.destroyed, true);
   assert.equal(processor.destroyed, true);
+});
+
+// ---------------------------------------------------------------------------
+// 5. W121: W112 swapchain offscreen blit fallback & W109 ranged pack threshold
+// ---------------------------------------------------------------------------
+
+function buildSwapchainBeginRenderPassPayload(formatName, clearRgba = [0.1, 0.2, 0.3, 1.0]) {
+  const formatCode = RS_TEXTURE_FORMAT_NAMES.indexOf(formatName);
+  assert.ok(formatCode > 0, `Unknown render_state_packets format: ${formatName}`);
+  const buf = new ArrayBuffer(368);
+  const view = new DataView(buf);
+  view.setUint32(0, 1, true); // colorCount = 1
+  const o = 8;
+  view.setUint32(o, SWAPCHAIN_TEXTURE_ID, true);
+  view.setUint8(o + 4, 1); // loadOp = 'clear'
+  view.setUint8(o + 5, 1); // storeOp = 'store'
+  view.setUint8(o + 8, formatCode); // view.format
+  view.setFloat32(o + 24, clearRgba[0], true);
+  view.setFloat32(o + 28, clearRgba[1], true);
+  view.setFloat32(o + 32, clearRgba[2], true);
+  view.setFloat32(o + 36, clearRgba[3], true);
+  return new Uint8Array(buf);
+}
+
+function createBlitAwareMockWebGpu() {
+  const base = createFullMockWebGpu({ timestampQuery: false });
+  const configuredCalls = [];
+  const canvasViews = [];
+  let canvasCounter = 0;
+
+  const ctx = {
+    configure(cfg) {
+      configuredCalls.push({ ...cfg });
+    },
+    unconfigure() {},
+    getCurrentTexture() {
+      const view = { kind: 'GPUTextureView', id: `canvas-view-${canvasCounter++}` };
+      canvasViews.push(view);
+      return {
+        width: 1280,
+        height: 720,
+        createView() {
+          return view;
+        },
+      };
+    },
+  };
+
+  const canvas = {
+    width: 1280,
+    height: 720,
+    getContext(kind) {
+      return kind === 'webgpu' ? ctx : null;
+    },
+  };
+
+  return {
+    ...base,
+    ctx,
+    canvas,
+    configuredCalls,
+    canvasViews,
+  };
+}
+
+test('W121 non-canvas swapchain format (rgb10a2unorm) renders into intermediate view and blits on Present', () => {
+  const mock = createBlitAwareMockWebGpu();
+  const swapchain = new WgpuSwapchain({
+    canvas: mock.canvas,
+    device: mock.device,
+    context: mock.ctx,
+    format: 'bgra8unorm',
+    enableDepth: false,
+  });
+  swapchain.configure({ width: 1280, height: 720 });
+
+  const processor = new WgpuCommandProcessor(mock.device, mock.ctx, {
+    format: 'bgra8unorm',
+    swapchain,
+  });
+  installRenderStatePackets(processor);
+  installTexturePackets(processor);
+
+  const vsWgsl = '@vertex fn vs_main() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }';
+  const fsWgsl = '@fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }';
+
+  const builder = new BinaryCommandBuilder();
+  builder
+    .beginFrame()
+    .createShaderModule(1, SHADER_STAGE.VERTEX, vsWgsl)
+    .createShaderModule(2, SHADER_STAGE.FRAGMENT, fsWgsl)
+    .createRenderPipeline(3, 1, 2, 0);
+  builder._pushPacket(OPCODES.BEGIN_RENDER_PASS, buildSwapchainBeginRenderPassPayload('rgb10a2unorm'));
+  builder.setPipeline(3).draw(6, 1, 0, 0);
+  builder._pushPacket(OPCODES.END_RENDER_PASS, new Uint8Array(0));
+  builder.present();
+
+  const res = processor.executeCommandBuffer(builder.finish());
+  assert.deepEqual(res, { frameCount: 1, presents: 1 });
+
+  // Swapchain switched into W112 blit fallback while keeping canvas configured in a valid format.
+  assert.equal(swapchain.usesBlitFallback, true);
+  assert.equal(swapchain.streamFormat, 'rgb10a2unorm');
+  assert.equal(swapchain.format, 'bgra8unorm');
+  assert.equal(swapchain.blitCount, 1);
+  assert.ok(swapchain.intermediateTexture, 'Expected offscreen intermediate texture');
+  assert.equal(swapchain.intermediateTexture.desc.format, 'rgb10a2unorm');
+
+  // Verify scene render pass bound the intermediate texture view and Present ran the blit pass (draw(3)) into the canvas view.
+  const passCalls = mock.calls.filter((c) => c.op === 'beginRenderPass');
+  assert.equal(passCalls.length, 2, 'Expected 1 scene render pass + 1 blit pass');
+  assert.equal(
+    passCalls[0].desc.colorAttachments[0].view,
+    swapchain.intermediateTextureView,
+    'SWAPCHAIN_TEXTURE_ID pass must target intermediate texture view'
+  );
+  assert.equal(passCalls[1].desc.label, 'playgta6-swapchain-blit-pass');
+  assert.equal(
+    passCalls[1].desc.colorAttachments[0].view,
+    mock.canvasViews[0],
+    'Blit pass must target the acquired canvas view'
+  );
+
+  const drawCalls = mock.calls.filter((c) => c.op === 'renderPass.draw');
+  assert.equal(drawCalls.length, 2);
+  assert.equal(drawCalls[0].vertexCount, 6);
+  assert.equal(drawCalls[1].vertexCount, 3, 'Fullscreen blit pass must issue draw(3)');
+
+  const finishIdx = mock.calls.findIndex((c) => c.op === 'encoder.finish');
+  const submitIdx = mock.calls.findIndex((c) => c.op === 'queue.submit');
+  const blitPassIdx = mock.calls.findIndex(
+    (c) => c.op === 'beginRenderPass' && c.desc && c.desc.label === 'playgta6-swapchain-blit-pass'
+  );
+  assert.ok(blitPassIdx > 0 && blitPassIdx < finishIdx && finishIdx < submitIdx);
+
+  // Telemetry & stats surface swapchainFormat / usesBlitFallback / blitCount cleanly.
+  const stats = processor.getStats();
+  assert.equal(stats.swapchainFormat, 'rgb10a2unorm');
+  assert.equal(stats.usesBlitFallback, true);
+  assert.equal(stats.blitCount, 1);
+
+  const snap = buildGpuTelemetrySnapshot(processor, { timestamp: 12345 });
+  assert.deepEqual(snap.swapchainStats, {
+    swapchainFormat: 'rgb10a2unorm',
+    canvasFormat: 'bgra8unorm',
+    usesBlitFallback: true,
+    blitCount: 1,
+  });
+  assert.deepEqual(snap.textureStats, {
+    bc3dFallbacks: 0,
+    bc3dFallbackUploadsSkipped: 0,
+  });
+
+  processor.destroy();
+  swapchain.destroy();
+});
+
+test('W121 direct canvas format (rgba8unorm) stays direct with zero blit overhead (blitCount === 0)', () => {
+  const mock = createBlitAwareMockWebGpu();
+  const swapchain = new WgpuSwapchain({
+    canvas: mock.canvas,
+    device: mock.device,
+    context: mock.ctx,
+    format: 'bgra8unorm',
+    enableDepth: false,
+  });
+  swapchain.configure({ width: 1280, height: 720 });
+
+  const processor = new WgpuCommandProcessor(mock.device, mock.ctx, {
+    format: 'bgra8unorm',
+    swapchain,
+  });
+  installRenderStatePackets(processor);
+
+  const builder = new BinaryCommandBuilder();
+  builder.beginFrame();
+  builder._pushPacket(OPCODES.BEGIN_RENDER_PASS, buildSwapchainBeginRenderPassPayload('rgba8unorm'));
+  builder._pushPacket(OPCODES.END_RENDER_PASS, new Uint8Array(0));
+  builder.present();
+
+  const res = processor.executeCommandBuffer(builder.finish());
+  assert.deepEqual(res, { frameCount: 1, presents: 1 });
+
+  assert.equal(swapchain.usesBlitFallback, false);
+  assert.equal(swapchain.streamFormat, 'rgba8unorm');
+  assert.equal(swapchain.format, 'rgba8unorm');
+  assert.equal(swapchain.blitCount, 0);
+  assert.equal(swapchain.intermediateTexture, null);
+
+  const passCalls = mock.calls.filter((c) => c.op === 'beginRenderPass');
+  assert.equal(passCalls.length, 1, 'Direct canvas format must not record a blit pass');
+  assert.equal(passCalls[0].desc.colorAttachments[0].view, mock.canvasViews[0]);
+
+  const snap = buildGpuTelemetrySnapshot(processor, { timestamp: 22222 });
+  assert.deepEqual(snap.swapchainStats, {
+    swapchainFormat: 'rgba8unorm',
+    canvasFormat: 'rgba8unorm',
+    usesBlitFallback: false,
+    blitCount: 0,
+  });
+
+  processor.destroy();
+  swapchain.destroy();
+});
+
+test('W121 worker init and loadShaderPack forward streamThresholdBytes to WgslPackCache.loadPackUrl', async () => {
+  const vsWgsl = '@vertex fn vs_main() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }\n';
+  const fsWgsl = '@fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(0.4, 0.7, 1.0, 1.0); }\n';
+  const vsHash = wgpkFormatHashHex(wgpkFnv1a64(vsWgsl));
+  const fsHash = wgpkFormatHashHex(wgpkFnv1a64(fsWgsl));
+  const packBuffer = buildWgslPackBuffer([
+    { hash: vsHash, stage: WGPK_SHADER_STAGE.VERTEX, wgsl: vsWgsl },
+    { hash: fsHash, stage: WGPK_SHADER_STAGE.FRAGMENT, wgsl: fsWgsl },
+  ]);
+  const packBytes = new Uint8Array(packBuffer);
+
+  // 1. Spy cache verifies exact options forwarding from init + loadShaderPack messages.
+  const recordedCalls = [];
+  const spyCache = {
+    async loadPackUrl(url, opts) {
+      recordedCalls.push({ url, opts });
+      return { size: 2 };
+    },
+    getStats() {
+      return { mode: 'ranged', packCount: 1, shaderCount: 2, rangeFetches: 1, cachedWgslBytes: 0 };
+    },
+  };
+  const mockA = createFullMockWebGpu({ timestampQuery: false });
+  const procA = new WgpuCommandProcessor(mockA.device, mockA.ctx, { wgslPackCache: spyCache });
+  const dummyFetch = async () => ({ ok: true, status: 200, arrayBuffer: async () => packBuffer.slice(0) });
+  const postedA = [];
+  const handlerA = createWgpuWorkerHandler({
+    processor: procA,
+    fetch: dummyFetch,
+    postMessage: (m) => postedA.push(m),
+  });
+
+  await handlerA.handleMessage({
+    init: true,
+    shaderPackUrl: '/shaders/game.wgsl.pack',
+    streamThresholdBytes: 128,
+  });
+  assert.equal(recordedCalls.length, 1);
+  assert.equal(recordedCalls[0].url, '/shaders/game.wgsl.pack');
+  assert.equal(recordedCalls[0].opts.streamThresholdBytes, 128);
+  assert.equal(recordedCalls[0].opts.fetch, dummyFetch);
+
+  // loadShaderPack message with streamShaders: true forwards default threshold (64 MiB).
+  await handlerA.handleMessage({
+    id: 99,
+    type: 'loadShaderPack',
+    url: '/shaders/extra.wgsl.pack',
+    streamShaders: true,
+  });
+  assert.equal(recordedCalls.length, 2);
+  assert.equal(recordedCalls[1].url, '/shaders/extra.wgsl.pack');
+  assert.equal(recordedCalls[1].opts.streamThresholdBytes, 64 * 1024 * 1024);
+  const loadReply = postedA.find((m) => m.id === 99);
+  assert.equal(loadReply.shaderPackLoaded, true);
+  assert.equal(loadReply.mode, 'ranged');
+
+  // 2. Real WgslPackCache + HTTP Range mock proves ranged mode activates when pack > streamThresholdBytes
+  //    and stays in full-buffer mode when streamThresholdBytes is omitted.
+  const createRangeFetch = () => {
+    const requests = [];
+    const fetchImpl = async (url, init = {}) => {
+      const method = (init && init.method ? String(init.method) : 'GET').toUpperCase();
+      const headers = init && init.headers ? init.headers : {};
+      const rangeHeader = headers.Range || headers.range || null;
+      requests.push({ url, method, rangeHeader });
+
+      if (method === 'HEAD') {
+        return {
+          ok: true,
+          status: 200,
+          headers: new Map([
+            ['content-length', String(packBytes.byteLength)],
+            ['accept-ranges', 'bytes'],
+          ]),
+        };
+      }
+      if (rangeHeader) {
+        const m = /^bytes=(\d+)-(\d+)$/.exec(rangeHeader);
+        assert.ok(m, `Unexpected Range header: ${rangeHeader}`);
+        const start = Number(m[1]);
+        const end = Math.min(Number(m[2]), packBytes.byteLength - 1);
+        const slice = packBytes.slice(start, end + 1);
+        return {
+          ok: true,
+          status: 206,
+          headers: new Map([
+            ['content-range', `bytes ${start}-${end}/${packBytes.byteLength}`],
+            ['content-length', String(slice.byteLength)],
+          ]),
+          async arrayBuffer() {
+            return slice.buffer.slice(slice.byteOffset, slice.byteOffset + slice.byteLength);
+          },
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        headers: new Map([['content-length', String(packBytes.byteLength)]]),
+        async arrayBuffer() {
+          return packBuffer.slice(0);
+        },
+      };
+    };
+    return { requests, fetchImpl };
+  };
+
+  // Ranged mode when pack exceeds streamThresholdBytes.
+  const rangedNet = createRangeFetch();
+  const realRangedCache = new WgslPackCache();
+  const mockRanged = createFullMockWebGpu({ timestampQuery: false });
+  const procRanged = new WgpuCommandProcessor(mockRanged.device, mockRanged.ctx, {
+    wgslPackCache: realRangedCache,
+  });
+  const handlerRanged = createWgpuWorkerHandler({
+    processor: procRanged,
+    fetch: rangedNet.fetchImpl,
+  });
+  await handlerRanged.handleMessage({
+    init: true,
+    shaderPackUrl: '/shaders/ranged.wgsl.pack',
+    streamThresholdBytes: 32,
+  });
+  const rangedSnap = buildGpuTelemetrySnapshot(procRanged, { timestamp: 33333 });
+  assert.equal(rangedSnap.shaderPackStats.mode, 'ranged');
+  assert.equal(rangedSnap.shaderPackStats.shaderCount, 2);
+  assert.ok(rangedSnap.shaderPackStats.rangeFetches >= 1);
+  assert.ok(
+    rangedNet.requests.some((r) => r.rangeHeader !== null),
+    'Expected HTTP Range request when pack size exceeds streamThresholdBytes'
+  );
+
+  // Default full-buffer mode unchanged when streamThresholdBytes is omitted.
+  const fullNet = createRangeFetch();
+  const realFullCache = new WgslPackCache();
+  const mockFull = createFullMockWebGpu({ timestampQuery: false });
+  const procFull = new WgpuCommandProcessor(mockFull.device, mockFull.ctx, {
+    wgslPackCache: realFullCache,
+  });
+  const handlerFull = createWgpuWorkerHandler({
+    processor: procFull,
+    fetch: fullNet.fetchImpl,
+  });
+  await handlerFull.handleMessage({
+    init: true,
+    shaderPackUrl: '/shaders/full.wgsl.pack',
+  });
+  const fullSnap = buildGpuTelemetrySnapshot(procFull, { timestamp: 44444 });
+  assert.equal(fullSnap.shaderPackStats.mode, 'buffer');
+  assert.equal(fullSnap.shaderPackStats.shaderCount, 2);
+  assert.equal(fullSnap.shaderPackStats.rangeFetches, 0);
+  assert.equal(
+    fullNet.requests.filter((r) => r.rangeHeader !== null).length,
+    0,
+    'Omitting streamThresholdBytes must preserve default full-buffer GET'
+  );
+
+  procA.destroy();
+  procRanged.destroy();
+  procFull.destroy();
+});
+
+test('W121 telemetry surfaces TexturePackets bc3dFallbacks and bc3dFallbackUploadsSkipped', () => {
+  const mock = createFullMockWebGpu({ timestampQuery: false });
+  // Device has BC compression but NOT texture-compression-bc-sliced-3d.
+  mock.device.features = new Set(['texture-compression-bc']);
+
+  const processor = new WgpuCommandProcessor(mock.device, mock.ctx, { format: 'bgra8unorm' });
+  installRenderStatePackets(processor);
+  installTexturePackets(processor);
+
+  // Build CREATE_TEXTURE2 payload for a 3D BC7 texture (4x4x4) -> triggers W108 fallback.
+  const tex2Buf = new ArrayBuffer(40);
+  const tex2View = new DataView(tex2Buf);
+  tex2View.setUint32(0, 77, true); // id
+  tex2View.setUint32(4, 4, true); // width
+  tex2View.setUint32(8, 4, true); // height
+  tex2View.setUint32(12, 4, true); // depthOrArrayLayers
+  tex2View.setUint32(16, 1, true); // mipLevelCount
+  tex2View.setUint32(20, 1, true); // sampleCount
+  tex2View.setUint32(24, TEXTURE_USAGE.TEXTURE_BINDING | TEXTURE_USAGE.COPY_DST, true); // usage
+  tex2View.setUint8(28, 2); // dimension = '3d'
+  tex2View.setUint8(29, RS_TEXTURE_FORMAT_NAMES.indexOf('bc7-rgba-unorm')); // format
+  tex2View.setUint8(30, 0); // viewFormatCount
+
+  const builder = new BinaryCommandBuilder();
+  builder._pushPacket(CREATE_TEXTURE2, new Uint8Array(tex2Buf));
+  builder.writeTexture(77, 0, 0, 0, 0, 4, 4, 4, 16, 4, new Uint8Array(64));
+
+  processor.executeCommandBuffer(builder.finish());
+
+  const stats = processor.getStats();
+  assert.equal(stats.bc3dFallbacks, 1);
+  assert.equal(stats.bc3dFallbackUploadsSkipped, 1);
+
+  const snap = buildGpuTelemetrySnapshot(processor, { timestamp: 55555 });
+  assert.deepEqual(snap.textureStats, {
+    bc3dFallbacks: 1,
+    bc3dFallbackUploadsSkipped: 1,
+  });
+
+  processor.destroy();
 });
