@@ -66,6 +66,15 @@ const SIG_V0_ELEMENT_BYTES: usize = 24;
 /// Maximum byte length allowed for a NUL-terminated signature semantic name.
 const MAX_SEMANTIC_NAME_LEN: usize = 256;
 
+/// Minimum `DxilProgramHeader` size in bytes (6 x `u32`).
+const DXIL_PROGRAM_HEADER_BYTES: usize = 24;
+
+/// Minimum legacy `SHDR`/`SHEX` header size in bytes (version token + dword count).
+const LEGACY_SHADER_HEADER_BYTES: usize = 8;
+
+/// Minimum `PSVRuntimeInfo0` payload size in bytes (`sizeof(PSVRuntimeInfo0)`).
+const PSV_MIN_RUNTIME_INFO_BYTES: usize = 24;
+
 /// Upper bound on total descriptor ranges parsed across all tables in a single `RTS0` chunk
 /// (defends against pointer-aliasing amplification from crafted inputs).
 const MAX_TOTAL_DESCRIPTOR_RANGES: usize = 65_536;
@@ -129,6 +138,19 @@ pub enum DxilReflectError {
         fourcc: &'static str,
         element_index: usize,
         offset: u32,
+    },
+    InvalidResourceBounds {
+        fourcc: &'static str,
+        index: usize,
+        lower_bound: u32,
+        upper_bound: u32,
+    },
+    DuplicateRegister {
+        register: D3dRegister,
+        detail: String,
+    },
+    BindingSpaceExhausted {
+        group: u32,
     },
     HashCollision {
         table: &'static str,
@@ -194,6 +216,26 @@ impl fmt::Display for DxilReflectError {
             } => write!(
                 f,
                 "{fourcc} element {element_index} has invalid/unterminated semantic name at offset {offset}"
+            ),
+            Self::InvalidResourceBounds {
+                fourcc,
+                index,
+                lower_bound,
+                upper_bound,
+            } => write!(
+                f,
+                "{fourcc} resource binding {index} has inverted register bounds [{lower_bound}..={upper_bound}]"
+            ),
+            Self::DuplicateRegister { register, detail } => write!(
+                f,
+                "duplicate or conflicting D3D12 register {}{} space{}: {detail}",
+                register.class.as_str(),
+                register.index,
+                register.space
+            ),
+            Self::BindingSpaceExhausted { group } => write!(
+                f,
+                "WebGPU bind group {group} has no remaining allocatable binding indices"
             ),
             Self::HashCollision { table, hash } => write!(
                 f,
@@ -272,6 +314,22 @@ impl D3dShaderVisibility {
             Self::Pixel => "pixel",
             Self::Amplification => "amplification",
             Self::Mesh => "mesh",
+        }
+    }
+
+    /// Bitmask of D3D12 shader stages covered by this visibility value.
+    /// Used to detect illegal overlapping register declarations within the same D3D12 stage
+    /// while permitting valid disjoint cross-stage sharing (e.g. Vertex + Pixel).
+    const fn d3d_stage_mask(self) -> u8 {
+        match self {
+            Self::Vertex => 1 << 0,
+            Self::Hull => 1 << 1,
+            Self::Domain => 1 << 2,
+            Self::Geometry => 1 << 3,
+            Self::Pixel => 1 << 4,
+            Self::Amplification => 1 << 5,
+            Self::Mesh => 1 << 6,
+            Self::All => 0x7F,
         }
     }
 }
@@ -645,6 +703,26 @@ pub struct DxilShaderReflection {
     pub bind_group_remaps: Vec<DxilBindGroupRemap>,
 }
 
+impl DxilShaderReflection {
+    /// Return a copy with all reflected bindings, bind group layout entries, remaps, and
+    /// stage IO collections in canonical deterministic order.
+    pub fn canonicalized(&self) -> Self {
+        let mut out = self.clone();
+        out.entry = out.entry.canonicalized();
+        out.pipeline_layout = PipelineLayoutDesc {
+            bind_group_layouts: out
+                .pipeline_layout
+                .bind_group_layouts
+                .iter()
+                .map(BindGroupLayoutDesc::canonicalized)
+                .collect(),
+        };
+        out.bind_group_remaps.sort();
+        out.bind_group_remaps.dedup();
+        out
+    }
+}
+
 /// Sanitized error record for batch directory reflection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DxilReflectionErrorRecord {
@@ -670,10 +748,62 @@ pub struct DxilReflectionManifest {
 // Low-level Safe Readers
 // ---------------------------------------------------------------------------
 
-fn read_u32_le(bytes: &[u8], offset: usize) -> Option<u32> {
-    let end = offset.checked_add(4)?;
-    let slice = bytes.get(offset..end)?;
-    Some(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+fn checked_add_offset(
+    fourcc: &'static str,
+    base: usize,
+    delta: usize,
+    detail: &str,
+) -> Result<usize, DxilReflectError> {
+    base.checked_add(delta)
+        .ok_or_else(|| DxilReflectError::Overflow {
+            fourcc,
+            detail: detail.to_string(),
+        })
+}
+
+fn checked_mul_size(
+    fourcc: &'static str,
+    count: usize,
+    stride: usize,
+    detail: &str,
+) -> Result<usize, DxilReflectError> {
+    count
+        .checked_mul(stride)
+        .ok_or_else(|| DxilReflectError::Overflow {
+            fourcc,
+            detail: detail.to_string(),
+        })
+}
+
+fn read_u32_checked(
+    fourcc: &'static str,
+    bytes: &[u8],
+    offset: usize,
+) -> Result<u32, DxilReflectError> {
+    let end = checked_add_offset(fourcc, offset, 4, "u32 read offset overflow")?;
+    let slice = bytes.get(offset..end).ok_or(DxilReflectError::OutOfBounds {
+        fourcc,
+        offset,
+        length: 4,
+        chunk_len: bytes.len(),
+    })?;
+    Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+fn read_u8_checked(
+    fourcc: &'static str,
+    bytes: &[u8],
+    offset: usize,
+) -> Result<u8, DxilReflectError> {
+    bytes
+        .get(offset)
+        .copied()
+        .ok_or(DxilReflectError::OutOfBounds {
+            fourcc,
+            offset,
+            length: 1,
+            chunk_len: bytes.len(),
+        })
 }
 
 fn ensure_slice(
@@ -701,11 +831,12 @@ fn read_bounded_c_string(
     fourcc: &'static str,
     bytes: &[u8],
     offset: u32,
+    min_offset: usize,
     element_index: usize,
     max_len: usize,
 ) -> Result<String, DxilReflectError> {
     let off = offset as usize;
-    if off >= bytes.len() {
+    if off < min_offset || off >= bytes.len() {
         return Err(DxilReflectError::InvalidSignatureString {
             fourcc,
             element_index,
@@ -746,8 +877,45 @@ fn read_bounded_c_string(
 }
 
 // ---------------------------------------------------------------------------
-// Chunk Parsers: RTS0, ISG1/OSG1, PSV0
+// Chunk Validators & Parsers: DXIL, SHDR/SHEX, RTS0, ISG1/OSG1, PSV0
 // ---------------------------------------------------------------------------
+
+fn validate_dxil_chunk(payload: &[u8]) -> Result<(), DxilReflectError> {
+    const TAG: &str = "DXIL";
+    if payload.len() < DXIL_PROGRAM_HEADER_BYTES {
+        return Err(DxilReflectError::TruncatedChunk {
+            fourcc: TAG,
+            actual: payload.len(),
+            expected_min: DXIL_PROGRAM_HEADER_BYTES,
+        });
+    }
+    let size_in_uint32 = read_u32_checked(TAG, payload, 4)? as usize;
+    if size_in_uint32 > 0 {
+        let program_bytes =
+            checked_mul_size(TAG, size_in_uint32, 4, "DXIL program dword size overflow")?;
+        ensure_slice(TAG, payload, 0, program_bytes)?;
+    }
+    let bitcode_offset = read_u32_checked(TAG, payload, 16)? as usize;
+    let bitcode_size = read_u32_checked(TAG, payload, 20)? as usize;
+    let bitcode_start =
+        checked_add_offset(TAG, 8, bitcode_offset, "DXIL bitcode offset overflow")?;
+    ensure_slice(TAG, payload, bitcode_start, bitcode_size)?;
+    Ok(())
+}
+
+fn validate_legacy_shader_chunk(
+    fourcc: &'static str,
+    payload: &[u8],
+) -> Result<(), DxilReflectError> {
+    if payload.len() < LEGACY_SHADER_HEADER_BYTES {
+        return Err(DxilReflectError::TruncatedChunk {
+            fourcc,
+            actual: payload.len(),
+            expected_min: LEGACY_SHADER_HEADER_BYTES,
+        });
+    }
+    Ok(())
+}
 
 /// Parse an `RTS0` serialized D3D12 root signature chunk (v1.0 or v1.1).
 ///
@@ -762,17 +930,17 @@ pub fn parse_rts0_chunk(payload: &[u8]) -> Result<RootSignature, DxilReflectErro
         });
     }
 
-    let raw_version = read_u32_le(payload, 0).unwrap();
+    let raw_version = read_u32_checked(TAG, payload, 0)?;
     let version = match raw_version {
         1 => RootSignatureVersion::V1_0,
         2 => RootSignatureVersion::V1_1,
         other => return Err(DxilReflectError::UnsupportedRootSignatureVersion(other)),
     };
-    let num_parameters = read_u32_le(payload, 4).unwrap() as usize;
-    let parameters_offset = read_u32_le(payload, 8).unwrap() as usize;
-    let num_static_samplers = read_u32_le(payload, 12).unwrap() as usize;
-    let static_samplers_offset = read_u32_le(payload, 16).unwrap() as usize;
-    let flags = read_u32_le(payload, 20).unwrap();
+    let num_parameters = read_u32_checked(TAG, payload, 4)? as usize;
+    let parameters_offset = read_u32_checked(TAG, payload, 8)? as usize;
+    let num_static_samplers = read_u32_checked(TAG, payload, 12)? as usize;
+    let static_samplers_offset = read_u32_checked(TAG, payload, 16)? as usize;
+    let flags = read_u32_checked(TAG, payload, 20)?;
 
     let mut parameters = Vec::new();
     if num_parameters > 0 {
@@ -784,12 +952,12 @@ pub fn parse_rts0_chunk(payload: &[u8]) -> Result<RootSignature, DxilReflectErro
                 chunk_len: payload.len(),
             });
         }
-        let table_bytes = num_parameters
-            .checked_mul(RTS0_PARAM_HEADER_BYTES)
-            .ok_or_else(|| DxilReflectError::Overflow {
-                fourcc: TAG,
-                detail: "parameter header table size overflow".to_string(),
-            })?;
+        let table_bytes = checked_mul_size(
+            TAG,
+            num_parameters,
+            RTS0_PARAM_HEADER_BYTES,
+            "parameter header table size overflow",
+        )?;
         ensure_slice(TAG, payload, parameters_offset, table_bytes)?;
 
         parameters.reserve(num_parameters);
@@ -804,10 +972,29 @@ pub fn parse_rts0_chunk(payload: &[u8]) -> Result<RootSignature, DxilReflectErro
         };
 
         for idx in 0..num_parameters {
-            let entry_off = parameters_offset + idx * RTS0_PARAM_HEADER_BYTES;
-            let param_type = read_u32_le(payload, entry_off).unwrap();
-            let raw_vis = read_u32_le(payload, entry_off + 4).unwrap();
-            let data_off = read_u32_le(payload, entry_off + 8).unwrap() as usize;
+            let entry_delta = checked_mul_size(
+                TAG,
+                idx,
+                RTS0_PARAM_HEADER_BYTES,
+                "parameter entry offset overflow",
+            )?;
+            let entry_off = checked_add_offset(
+                TAG,
+                parameters_offset,
+                entry_delta,
+                "parameter entry offset overflow",
+            )?;
+            let param_type = read_u32_checked(TAG, payload, entry_off)?;
+            let raw_vis = read_u32_checked(
+                TAG,
+                payload,
+                checked_add_offset(TAG, entry_off, 4, "parameter visibility offset overflow")?,
+            )?;
+            let data_off = read_u32_checked(
+                TAG,
+                payload,
+                checked_add_offset(TAG, entry_off, 8, "parameter data offset overflow")?,
+            )? as usize;
 
             let visibility = D3dShaderVisibility::from_u32(raw_vis).ok_or(
                 DxilReflectError::InvalidShaderVisibility {
@@ -820,9 +1007,21 @@ pub fn parse_rts0_chunk(payload: &[u8]) -> Result<RootSignature, DxilReflectErro
             let kind = match param_type {
                 0 => {
                     // D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE
+                    if data_off < RTS0_HEADER_BYTES {
+                        return Err(DxilReflectError::OutOfBounds {
+                            fourcc: TAG,
+                            offset: data_off,
+                            length: 8,
+                            chunk_len: payload.len(),
+                        });
+                    }
                     ensure_slice(TAG, payload, data_off, 8)?;
-                    let num_ranges = read_u32_le(payload, data_off).unwrap() as usize;
-                    let ranges_off = read_u32_le(payload, data_off + 4).unwrap() as usize;
+                    let num_ranges = read_u32_checked(TAG, payload, data_off)? as usize;
+                    let ranges_off = read_u32_checked(
+                        TAG,
+                        payload,
+                        checked_add_offset(TAG, data_off, 4, "descriptor table ranges_off overflow")?,
+                    )? as usize;
 
                     total_ranges =
                         total_ranges
@@ -840,21 +1039,37 @@ pub fn parse_rts0_chunk(payload: &[u8]) -> Result<RootSignature, DxilReflectErro
 
                     let mut ranges = Vec::new();
                     if num_ranges > 0 {
-                        let ranges_bytes =
-                            num_ranges
-                                .checked_mul(range_stride)
-                                .ok_or_else(|| DxilReflectError::Overflow {
-                                    fourcc: TAG,
-                                    detail: format!(
-                                        "parameter {idx} descriptor ranges size overflow"
-                                    ),
-                                })?;
+                        if ranges_off < RTS0_HEADER_BYTES {
+                            return Err(DxilReflectError::OutOfBounds {
+                                fourcc: TAG,
+                                offset: ranges_off,
+                                length: range_stride,
+                                chunk_len: payload.len(),
+                            });
+                        }
+                        let ranges_bytes = checked_mul_size(
+                            TAG,
+                            num_ranges,
+                            range_stride,
+                            &format!("parameter {idx} descriptor ranges size overflow"),
+                        )?;
                         ensure_slice(TAG, payload, ranges_off, ranges_bytes)?;
 
                         ranges.reserve(num_ranges);
                         for r_idx in 0..num_ranges {
-                            let r_off = ranges_off + r_idx * range_stride;
-                            let raw_range_type = read_u32_le(payload, r_off).unwrap();
+                            let r_delta = checked_mul_size(
+                                TAG,
+                                r_idx,
+                                range_stride,
+                                "descriptor range offset overflow",
+                            )?;
+                            let r_off = checked_add_offset(
+                                TAG,
+                                ranges_off,
+                                r_delta,
+                                "descriptor range offset overflow",
+                            )?;
+                            let raw_range_type = read_u32_checked(TAG, payload, r_off)?;
                             let range_type = DescriptorRangeType::from_u32(raw_range_type).ok_or(
                                 DxilReflectError::InvalidDescriptorRangeType {
                                     param_index: idx,
@@ -862,16 +1077,64 @@ pub fn parse_rts0_chunk(payload: &[u8]) -> Result<RootSignature, DxilReflectErro
                                     raw: raw_range_type,
                                 },
                             )?;
-                            let num_descriptors = read_u32_le(payload, r_off + 4).unwrap();
-                            let base_shader_register = read_u32_le(payload, r_off + 8).unwrap();
-                            let register_space = read_u32_le(payload, r_off + 12).unwrap();
+                            let num_descriptors = read_u32_checked(
+                                TAG,
+                                payload,
+                                checked_add_offset(TAG, r_off, 4, "range count offset overflow")?,
+                            )?;
+                            let base_shader_register = read_u32_checked(
+                                TAG,
+                                payload,
+                                checked_add_offset(TAG, r_off, 8, "range base register offset overflow")?,
+                            )?;
+                            let register_space = read_u32_checked(
+                                TAG,
+                                payload,
+                                checked_add_offset(TAG, r_off, 12, "range space offset overflow")?,
+                            )?;
+                            if num_descriptors > 0
+                                && num_descriptors != u32::MAX
+                                && base_shader_register
+                                    .checked_add(num_descriptors - 1)
+                                    .is_none()
+                            {
+                                return Err(DxilReflectError::Overflow {
+                                    fourcc: TAG,
+                                    detail: format!(
+                                        "parameter {idx} descriptor range {r_idx} register index overflow (base={base_shader_register}, count={num_descriptors})"
+                                    ),
+                                });
+                            }
                             let (range_flags, offset_from_start) = match version {
-                                RootSignatureVersion::V1_0 => {
-                                    (0u32, read_u32_le(payload, r_off + 16).unwrap())
-                                }
+                                RootSignatureVersion::V1_0 => (
+                                    0u32,
+                                    read_u32_checked(
+                                        TAG,
+                                        payload,
+                                        checked_add_offset(
+                                            TAG,
+                                            r_off,
+                                            16,
+                                            "range table offset overflow",
+                                        )?,
+                                    )?,
+                                ),
                                 RootSignatureVersion::V1_1 => (
-                                    read_u32_le(payload, r_off + 16).unwrap(),
-                                    read_u32_le(payload, r_off + 20).unwrap(),
+                                    read_u32_checked(
+                                        TAG,
+                                        payload,
+                                        checked_add_offset(TAG, r_off, 16, "range flags offset overflow")?,
+                                    )?,
+                                    read_u32_checked(
+                                        TAG,
+                                        payload,
+                                        checked_add_offset(
+                                            TAG,
+                                            r_off,
+                                            20,
+                                            "range table offset overflow",
+                                        )?,
+                                    )?,
                                 ),
                             };
                             ranges.push(DescriptorRange {
@@ -888,21 +1151,53 @@ pub fn parse_rts0_chunk(payload: &[u8]) -> Result<RootSignature, DxilReflectErro
                 }
                 1 => {
                     // D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS
+                    if data_off < RTS0_HEADER_BYTES {
+                        return Err(DxilReflectError::OutOfBounds {
+                            fourcc: TAG,
+                            offset: data_off,
+                            length: 12,
+                            chunk_len: payload.len(),
+                        });
+                    }
                     ensure_slice(TAG, payload, data_off, 12)?;
                     RootParameterKind::Constants32Bit {
-                        shader_register: read_u32_le(payload, data_off).unwrap(),
-                        register_space: read_u32_le(payload, data_off + 4).unwrap(),
-                        num_32bit_values: read_u32_le(payload, data_off + 8).unwrap(),
+                        shader_register: read_u32_checked(TAG, payload, data_off)?,
+                        register_space: read_u32_checked(
+                            TAG,
+                            payload,
+                            checked_add_offset(TAG, data_off, 4, "root constants space offset overflow")?,
+                        )?,
+                        num_32bit_values: read_u32_checked(
+                            TAG,
+                            payload,
+                            checked_add_offset(TAG, data_off, 8, "root constants count offset overflow")?,
+                        )?,
                     }
                 }
                 2 | 3 | 4 => {
                     // Root CBV / SRV / UAV
+                    if data_off < RTS0_HEADER_BYTES {
+                        return Err(DxilReflectError::OutOfBounds {
+                            fourcc: TAG,
+                            offset: data_off,
+                            length: root_desc_bytes,
+                            chunk_len: payload.len(),
+                        });
+                    }
                     ensure_slice(TAG, payload, data_off, root_desc_bytes)?;
-                    let shader_register = read_u32_le(payload, data_off).unwrap();
-                    let register_space = read_u32_le(payload, data_off + 4).unwrap();
+                    let shader_register = read_u32_checked(TAG, payload, data_off)?;
+                    let register_space = read_u32_checked(
+                        TAG,
+                        payload,
+                        checked_add_offset(TAG, data_off, 4, "root descriptor space offset overflow")?,
+                    )?;
                     let desc_flags = match version {
                         RootSignatureVersion::V1_0 => 0u32,
-                        RootSignatureVersion::V1_1 => read_u32_le(payload, data_off + 8).unwrap(),
+                        RootSignatureVersion::V1_1 => read_u32_checked(
+                            TAG,
+                            payload,
+                            checked_add_offset(TAG, data_off, 8, "root descriptor flags offset overflow")?,
+                        )?,
                     };
                     match param_type {
                         2 => RootParameterKind::Cbv {
@@ -941,18 +1236,33 @@ pub fn parse_rts0_chunk(payload: &[u8]) -> Result<RootSignature, DxilReflectErro
                 chunk_len: payload.len(),
             });
         }
-        let samplers_bytes = num_static_samplers
-            .checked_mul(RTS0_STATIC_SAMPLER_BYTES)
-            .ok_or_else(|| DxilReflectError::Overflow {
-                fourcc: TAG,
-                detail: "static samplers table size overflow".to_string(),
-            })?;
+        let samplers_bytes = checked_mul_size(
+            TAG,
+            num_static_samplers,
+            RTS0_STATIC_SAMPLER_BYTES,
+            "static samplers table size overflow",
+        )?;
         ensure_slice(TAG, payload, static_samplers_offset, samplers_bytes)?;
 
         static_samplers.reserve(num_static_samplers);
         for idx in 0..num_static_samplers {
-            let s_off = static_samplers_offset + idx * RTS0_STATIC_SAMPLER_BYTES;
-            let raw_vis = read_u32_le(payload, s_off + 48).unwrap();
+            let s_delta = checked_mul_size(
+                TAG,
+                idx,
+                RTS0_STATIC_SAMPLER_BYTES,
+                "static sampler entry offset overflow",
+            )?;
+            let s_off = checked_add_offset(
+                TAG,
+                static_samplers_offset,
+                s_delta,
+                "static sampler entry offset overflow",
+            )?;
+            let raw_vis = read_u32_checked(
+                TAG,
+                payload,
+                checked_add_offset(TAG, s_off, 48, "static sampler visibility offset overflow")?,
+            )?;
             let shader_visibility = D3dShaderVisibility::from_u32(raw_vis).ok_or(
                 DxilReflectError::InvalidShaderVisibility {
                     context: "static_sampler",
@@ -961,18 +1271,18 @@ pub fn parse_rts0_chunk(payload: &[u8]) -> Result<RootSignature, DxilReflectErro
                 },
             )?;
             static_samplers.push(StaticSamplerDesc {
-                filter: read_u32_le(payload, s_off).unwrap(),
-                address_u: read_u32_le(payload, s_off + 4).unwrap(),
-                address_v: read_u32_le(payload, s_off + 8).unwrap(),
-                address_w: read_u32_le(payload, s_off + 12).unwrap(),
-                mip_lod_bias_bits: read_u32_le(payload, s_off + 16).unwrap(),
-                max_anisotropy: read_u32_le(payload, s_off + 20).unwrap(),
-                comparison_func: read_u32_le(payload, s_off + 24).unwrap(),
-                border_color: read_u32_le(payload, s_off + 28).unwrap(),
-                min_lod_bits: read_u32_le(payload, s_off + 32).unwrap(),
-                max_lod_bits: read_u32_le(payload, s_off + 36).unwrap(),
-                shader_register: read_u32_le(payload, s_off + 40).unwrap(),
-                register_space: read_u32_le(payload, s_off + 44).unwrap(),
+                filter: read_u32_checked(TAG, payload, s_off)?,
+                address_u: read_u32_checked(TAG, payload, s_off + 4)?,
+                address_v: read_u32_checked(TAG, payload, s_off + 8)?,
+                address_w: read_u32_checked(TAG, payload, s_off + 12)?,
+                mip_lod_bias_bits: read_u32_checked(TAG, payload, s_off + 16)?,
+                max_anisotropy: read_u32_checked(TAG, payload, s_off + 20)?,
+                comparison_func: read_u32_checked(TAG, payload, s_off + 24)?,
+                border_color: read_u32_checked(TAG, payload, s_off + 28)?,
+                min_lod_bits: read_u32_checked(TAG, payload, s_off + 32)?,
+                max_lod_bits: read_u32_checked(TAG, payload, s_off + 36)?,
+                shader_register: read_u32_checked(TAG, payload, s_off + 40)?,
+                register_space: read_u32_checked(TAG, payload, s_off + 44)?,
                 shader_visibility,
             });
         }
@@ -1011,8 +1321,8 @@ pub fn parse_signature_elements(
         });
     }
 
-    let element_count = read_u32_le(payload, 0).unwrap() as usize;
-    let param_offset = read_u32_le(payload, 4).unwrap() as usize;
+    let element_count = read_u32_checked(tag, payload, 0)? as usize;
+    let param_offset = read_u32_checked(tag, payload, 4)? as usize;
     let stride = if is_v1 {
         SIG_V1_ELEMENT_BYTES
     } else {
@@ -1029,17 +1339,23 @@ pub fn parse_signature_elements(
                 chunk_len: payload.len(),
             });
         }
-        let table_bytes = element_count
-            .checked_mul(stride)
-            .ok_or_else(|| DxilReflectError::Overflow {
-                fourcc: tag,
-                detail: "signature element table size overflow".to_string(),
-            })?;
+        let table_bytes = checked_mul_size(
+            tag,
+            element_count,
+            stride,
+            "signature element table size overflow",
+        )?;
         ensure_slice(tag, payload, param_offset, table_bytes)?;
 
         elements.reserve(element_count);
         for idx in 0..element_count {
-            let off = param_offset + idx * stride;
+            let elem_delta = checked_mul_size(tag, idx, stride, "signature element offset overflow")?;
+            let off = checked_add_offset(
+                tag,
+                param_offset,
+                elem_delta,
+                "signature element offset overflow",
+            )?;
             let (
                 stream,
                 name_offset,
@@ -1052,32 +1368,38 @@ pub fn parse_signature_elements(
                 min_precision,
             ) = if is_v1 {
                 (
-                    read_u32_le(payload, off).unwrap(),
-                    read_u32_le(payload, off + 4).unwrap(),
-                    read_u32_le(payload, off + 8).unwrap(),
-                    read_u32_le(payload, off + 12).unwrap(),
-                    read_u32_le(payload, off + 16).unwrap(),
-                    read_u32_le(payload, off + 20).unwrap(),
-                    payload[off + 24],
-                    payload[off + 25],
-                    read_u32_le(payload, off + 28).unwrap(),
+                    read_u32_checked(tag, payload, off)?,
+                    read_u32_checked(tag, payload, off + 4)?,
+                    read_u32_checked(tag, payload, off + 8)?,
+                    read_u32_checked(tag, payload, off + 12)?,
+                    read_u32_checked(tag, payload, off + 16)?,
+                    read_u32_checked(tag, payload, off + 20)?,
+                    read_u8_checked(tag, payload, off + 24)?,
+                    read_u8_checked(tag, payload, off + 25)?,
+                    read_u32_checked(tag, payload, off + 28)?,
                 )
             } else {
                 (
                     0u32,
-                    read_u32_le(payload, off).unwrap(),
-                    read_u32_le(payload, off + 4).unwrap(),
-                    read_u32_le(payload, off + 8).unwrap(),
-                    read_u32_le(payload, off + 12).unwrap(),
-                    read_u32_le(payload, off + 16).unwrap(),
-                    payload[off + 20],
-                    payload[off + 21],
+                    read_u32_checked(tag, payload, off)?,
+                    read_u32_checked(tag, payload, off + 4)?,
+                    read_u32_checked(tag, payload, off + 8)?,
+                    read_u32_checked(tag, payload, off + 12)?,
+                    read_u32_checked(tag, payload, off + 16)?,
+                    read_u8_checked(tag, payload, off + 20)?,
+                    read_u8_checked(tag, payload, off + 21)?,
                     0u32,
                 )
             };
 
-            let semantic_name =
-                read_bounded_c_string(tag, payload, name_offset, idx, MAX_SEMANTIC_NAME_LEN)?;
+            let semantic_name = read_bounded_c_string(
+                tag,
+                payload,
+                name_offset,
+                SIG_HEADER_BYTES,
+                idx,
+                MAX_SEMANTIC_NAME_LEN,
+            )?;
             elements.push(SignatureElement {
                 stream,
                 semantic_name,
@@ -1107,11 +1429,19 @@ pub fn parse_psv0_chunk(payload: &[u8]) -> Result<PsvInfo, DxilReflectError> {
         });
     }
 
-    let runtime_info_size = read_u32_le(payload, 0).unwrap();
+    let runtime_info_size = read_u32_checked(TAG, payload, 0)?;
     let rt_size = runtime_info_size as usize;
+    if rt_size < PSV_MIN_RUNTIME_INFO_BYTES {
+        return Err(DxilReflectError::TruncatedChunk {
+            fourcc: TAG,
+            actual: rt_size,
+            expected_min: PSV_MIN_RUNTIME_INFO_BYTES,
+        });
+    }
     ensure_slice(TAG, payload, 4, rt_size)?;
 
-    let rt = &payload[4..4 + rt_size];
+    let after_rt = checked_add_offset(TAG, 4, rt_size, "PSV0 runtime info end offset overflow")?;
+    let rt = &payload[4..after_rt];
     let shader_stage = if rt.len() >= 25 {
         Some(DxilShaderKind::from_u16(u16::from(rt[24])))
     } else {
@@ -1130,9 +1460,9 @@ pub fn parse_psv0_chunk(payload: &[u8]) -> Result<PsvInfo, DxilReflectError> {
                     | DxilShaderKind::Amplification
             )
         ) {
-        let x = read_u32_le(rt, 36).unwrap();
-        let y = read_u32_le(rt, 40).unwrap();
-        let z = read_u32_le(rt, 44).unwrap();
+        let x = read_u32_checked(TAG, rt, 36)?;
+        let y = read_u32_checked(TAG, rt, 40)?;
+        let z = read_u32_checked(TAG, rt, 44)?;
         if x >= 1 && y >= 1 && z >= 1 {
             Some([x, y, z])
         } else {
@@ -1143,12 +1473,27 @@ pub fn parse_psv0_chunk(payload: &[u8]) -> Result<PsvInfo, DxilReflectError> {
     };
 
     let mut resources = Vec::new();
-    let after_rt = 4 + rt_size;
-    if after_rt + 4 <= payload.len() {
-        let resource_count = read_u32_le(payload, after_rt).unwrap() as usize;
+    let remaining_after_rt = payload.len().saturating_sub(after_rt);
+    if remaining_after_rt > 0 && remaining_after_rt < 4 {
+        return Err(DxilReflectError::TruncatedChunk {
+            fourcc: TAG,
+            actual: remaining_after_rt,
+            expected_min: 4,
+        });
+    }
+    if remaining_after_rt >= 4 {
+        let resource_count = read_u32_checked(TAG, payload, after_rt)? as usize;
+        if resource_count > MAX_TOTAL_DESCRIPTOR_RANGES {
+            return Err(DxilReflectError::TooManyDescriptorRanges {
+                count: resource_count,
+                max: MAX_TOTAL_DESCRIPTOR_RANGES,
+            });
+        }
         if resource_count > 0 {
-            ensure_slice(TAG, payload, after_rt + 4, 4)?;
-            let bind_info_size = read_u32_le(payload, after_rt + 4).unwrap() as usize;
+            let bind_size_off =
+                checked_add_offset(TAG, after_rt, 4, "PSV0 bind_info_size offset overflow")?;
+            ensure_slice(TAG, payload, bind_size_off, 4)?;
+            let bind_info_size = read_u32_checked(TAG, payload, bind_size_off)? as usize;
             if bind_info_size < 16 {
                 return Err(DxilReflectError::TruncatedChunk {
                     fourcc: TAG,
@@ -1156,26 +1501,46 @@ pub fn parse_psv0_chunk(payload: &[u8]) -> Result<PsvInfo, DxilReflectError> {
                     expected_min: 16,
                 });
             }
-            let table_start = after_rt + 8;
-            let table_bytes = resource_count
-                .checked_mul(bind_info_size)
-                .ok_or_else(|| DxilReflectError::Overflow {
-                    fourcc: TAG,
-                    detail: "PSV0 resource binding table size overflow".to_string(),
-                })?;
+            let table_start =
+                checked_add_offset(TAG, after_rt, 8, "PSV0 resource table start overflow")?;
+            let table_bytes = checked_mul_size(
+                TAG,
+                resource_count,
+                bind_info_size,
+                "PSV0 resource binding table size overflow",
+            )?;
             ensure_slice(TAG, payload, table_start, table_bytes)?;
 
             resources.reserve(resource_count);
             for i in 0..resource_count {
-                let off = table_start + i * bind_info_size;
-                let res_type = read_u32_le(payload, off).unwrap();
-                let space = read_u32_le(payload, off + 4).unwrap();
-                let lower_bound = read_u32_le(payload, off + 8).unwrap();
-                let upper_bound = read_u32_le(payload, off + 12).unwrap();
+                let entry_delta = checked_mul_size(
+                    TAG,
+                    i,
+                    bind_info_size,
+                    "PSV0 resource entry offset overflow",
+                )?;
+                let off = checked_add_offset(
+                    TAG,
+                    table_start,
+                    entry_delta,
+                    "PSV0 resource entry offset overflow",
+                )?;
+                let res_type = read_u32_checked(TAG, payload, off)?;
+                let space = read_u32_checked(TAG, payload, off + 4)?;
+                let lower_bound = read_u32_checked(TAG, payload, off + 8)?;
+                let upper_bound = read_u32_checked(TAG, payload, off + 12)?;
+                if lower_bound > upper_bound {
+                    return Err(DxilReflectError::InvalidResourceBounds {
+                        fourcc: TAG,
+                        index: i,
+                        lower_bound,
+                        upper_bound,
+                    });
+                }
                 let (res_kind, res_flags) = if bind_info_size >= 24 {
                     (
-                        read_u32_le(payload, off + 16),
-                        read_u32_le(payload, off + 20),
+                        Some(read_u32_checked(TAG, payload, off + 16)?),
+                        Some(read_u32_checked(TAG, payload, off + 20)?),
                     )
                 } else {
                     (None, None)
@@ -1206,10 +1571,17 @@ pub fn parse_psv0_chunk(payload: &[u8]) -> Result<PsvInfo, DxilReflectError> {
 // Deterministic Lowering: RTS0 + ISG1/OSG1 + PSV0 -> S6 WebGPU BindGroupLayouts
 // ---------------------------------------------------------------------------
 
-/// Intermediate D3D12 resource slot extracted from `RTS0` before WebGPU group/binding assignment.
+/// Intermediate D3D12 resource slot extracted from `RTS0` or `PSV0` before WebGPU group/binding
+/// assignment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExtractedSlot {
     register: D3dRegister,
+    /// Inclusive upper register index covered by this slot (`register.index` for single bindings,
+    /// `register.index + count - 1` for unexpanded fixed arrays, `u32::MAX` for unbounded ranges).
+    range_end: u32,
+    /// D3D12 shader stage visibility mask (`D3dShaderVisibility::d3d_stage_mask`) used to reject
+    /// illegal same-stage duplicate/overlapping register indices.
+    d3d_visibility_mask: u8,
     name: String,
     visibility: u32,
     resource: ResourceKind,
@@ -1245,6 +1617,15 @@ pub fn reflect_dxil_bytes_with_options(
 
     for chunk in chunk_refs {
         match &chunk.fourcc {
+            b"DXIL" => {
+                validate_dxil_chunk(chunk.payload)?;
+            }
+            b"SHDR" => {
+                validate_legacy_shader_chunk("SHDR", chunk.payload)?;
+            }
+            b"SHEX" => {
+                validate_legacy_shader_chunk("SHEX", chunk.payload)?;
+            }
             b"RTS0" => {
                 if root_signature.is_none() {
                     root_signature = Some(parse_rts0_chunk(chunk.payload)?);
@@ -1311,16 +1692,16 @@ pub fn reflect_dxil_bytes_with_options(
 
     // Extract D3D12 resource slots from RTS0 (authoritative) or fallback to PSV0 if RTS0 absent.
     let extracted = if let Some(rs) = &root_signature {
-        extract_slots_from_rts0(rs, stage, shader_kind, psv_resources)
+        extract_slots_from_rts0(rs, stage, shader_kind, psv_resources)?
     } else if !psv_resources.is_empty() {
-        extract_slots_from_psv0(psv_resources, stage)
+        extract_slots_from_psv0(psv_resources, stage)?
     } else {
         Vec::new()
     };
 
     // Deterministically lower extracted slots into WebGPU groups 0..=3.
     let (bindings, pipeline_layout, bind_group_remaps, slot_lowering) =
-        lower_slots_to_webgpu(extracted, convention);
+        lower_slots_to_webgpu(extracted, convention)?;
     requires_lowering.extend(slot_lowering);
 
     // Lower ISG1/OSG1 stage signatures to S6 vertex_inputs / fragment_outputs.
@@ -1485,7 +1866,17 @@ fn find_psv_resource(
 ) -> Option<&PsvResourceBinding> {
     psv_resources
         .iter()
-        .find(|r| r.matches(class, index, space))
+        .filter(|r| r.matches(class, index, space))
+        .min_by_key(|r| {
+            (
+                r.upper_bound.saturating_sub(r.lower_bound),
+                r.res_type,
+                r.lower_bound,
+                r.upper_bound,
+                r.res_kind,
+                r.res_flags,
+            )
+        })
 }
 
 fn classify_table_range_resource(
@@ -1569,11 +1960,12 @@ fn extract_slots_from_rts0(
     container_stage: ShaderStage,
     shader_kind: Option<DxilShaderKind>,
     psv_resources: &[PsvResourceBinding],
-) -> Vec<ExtractedSlot> {
+) -> Result<Vec<ExtractedSlot>, DxilReflectError> {
     let mut slots = Vec::new();
 
     for param in &rs.parameters {
         let vis = map_visibility(param.visibility, rs.flags, container_stage, shader_kind);
+        let d3d_vis = param.visibility.d3d_stage_mask();
         match &param.kind {
             RootParameterKind::Constants32Bit {
                 shader_register,
@@ -1587,6 +1979,8 @@ fn extract_slots_from_rts0(
                         index: *shader_register,
                         space: *register_space,
                     },
+                    range_end: *shader_register,
+                    d3d_visibility_mask: d3d_vis,
                     name: format!("root_const_b{shader_register}_space{register_space}"),
                     visibility: vis,
                     resource: ResourceKind::Buffer,
@@ -1611,6 +2005,8 @@ fn extract_slots_from_rts0(
                         index: *shader_register,
                         space: *register_space,
                     },
+                    range_end: *shader_register,
+                    d3d_visibility_mask: d3d_vis,
                     name: format!("root_cbv_b{shader_register}_space{register_space}"),
                     visibility: vis,
                     resource: ResourceKind::Buffer,
@@ -1636,6 +2032,8 @@ fn extract_slots_from_rts0(
                         index: *shader_register,
                         space: *register_space,
                     },
+                    range_end: *shader_register,
+                    d3d_visibility_mask: d3d_vis,
                     name: format!("root_srv_t{shader_register}_space{register_space}"),
                     visibility: vis,
                     resource: ResourceKind::Buffer,
@@ -1661,6 +2059,8 @@ fn extract_slots_from_rts0(
                         index: *shader_register,
                         space: *register_space,
                     },
+                    range_end: *shader_register,
+                    d3d_visibility_mask: d3d_vis,
                     name: format!("root_uav_u{shader_register}_space{register_space}"),
                     visibility: vis,
                     resource: ResourceKind::Buffer,
@@ -1700,6 +2100,8 @@ fn extract_slots_from_rts0(
                                 index: range.base_shader_register,
                                 space: range.register_space,
                             },
+                            range_end: u32::MAX,
+                            d3d_visibility_mask: d3d_vis,
                             name: name.clone(),
                             visibility: vis,
                             resource,
@@ -1716,75 +2118,97 @@ fn extract_slots_from_rts0(
                                 ),
                             )),
                         });
-                    } else if range.num_descriptors > MAX_EXPANDED_RANGE_DESCRIPTORS {
-                        let (resource, _) = classify_table_range_resource(
-                            range.range_type,
-                            range.base_shader_register,
-                            range.register_space,
-                            psv_resources,
-                        );
-                        let name = format!(
-                            "table_{}_{}{}_space{}",
-                            range.range_type.as_str(),
-                            class.as_str(),
-                            range.base_shader_register,
-                            range.register_space
-                        );
-                        slots.push(ExtractedSlot {
-                            register: D3dRegister {
-                                class,
-                                index: range.base_shader_register,
-                                space: range.register_space,
-                            },
-                            name: name.clone(),
-                            visibility: vis,
-                            resource,
-                            layout: None,
-                            root_constants: false,
-                            binding_array: Some(BindingArraySize::Fixed(range.num_descriptors)),
-                            lowering_need: Some((
-                                LoweringKind::BindingArray,
-                                format!(
-                                    "'{name}': descriptor range of {} elements ({}{}, space{}) exceeds WebGPU expansion limit ({MAX_EXPANDED_RANGE_DESCRIPTORS})",
-                                    range.num_descriptors,
-                                    class.as_str(),
-                                    range.base_shader_register,
-                                    range.register_space
-                                ),
-                            )),
-                        });
                     } else {
-                        for offset in 0..range.num_descriptors {
-                            let Some(reg_idx) = range.base_shader_register.checked_add(offset)
-                            else {
-                                break;
-                            };
-                            let (resource, layout) = classify_table_range_resource(
+                        let range_end = range
+                            .base_shader_register
+                            .checked_add(range.num_descriptors - 1)
+                            .ok_or_else(|| DxilReflectError::Overflow {
+                                fourcc: "RTS0",
+                                detail: format!(
+                                    "descriptor range register index overflow (base={}, count={})",
+                                    range.base_shader_register, range.num_descriptors
+                                ),
+                            })?;
+                        if range.num_descriptors > MAX_EXPANDED_RANGE_DESCRIPTORS {
+                            let (resource, _) = classify_table_range_resource(
                                 range.range_type,
-                                reg_idx,
+                                range.base_shader_register,
                                 range.register_space,
                                 psv_resources,
+                            );
+                            let name = format!(
+                                "table_{}_{}{}_space{}",
+                                range.range_type.as_str(),
+                                class.as_str(),
+                                range.base_shader_register,
+                                range.register_space
                             );
                             slots.push(ExtractedSlot {
                                 register: D3dRegister {
                                     class,
-                                    index: reg_idx,
+                                    index: range.base_shader_register,
                                     space: range.register_space,
                                 },
-                                name: format!(
-                                    "{}_{}{}_space{}",
-                                    range.range_type.as_str(),
-                                    class.as_str(),
-                                    reg_idx,
-                                    range.register_space
-                                ),
+                                range_end,
+                                d3d_visibility_mask: d3d_vis,
+                                name: name.clone(),
                                 visibility: vis,
                                 resource,
-                                layout: Some(layout),
+                                layout: None,
                                 root_constants: false,
-                                binding_array: None,
-                                lowering_need: None,
+                                binding_array: Some(BindingArraySize::Fixed(range.num_descriptors)),
+                                lowering_need: Some((
+                                    LoweringKind::BindingArray,
+                                    format!(
+                                        "'{name}': descriptor range of {} elements ({}{}, space{}) exceeds WebGPU expansion limit ({MAX_EXPANDED_RANGE_DESCRIPTORS})",
+                                        range.num_descriptors,
+                                        class.as_str(),
+                                        range.base_shader_register,
+                                        range.register_space
+                                    ),
+                                )),
                             });
+                        } else {
+                            for offset in 0..range.num_descriptors {
+                                let reg_idx = range
+                                    .base_shader_register
+                                    .checked_add(offset)
+                                    .ok_or_else(|| DxilReflectError::Overflow {
+                                        fourcc: "RTS0",
+                                        detail: format!(
+                                            "descriptor range register index overflow (base={}, offset={offset})",
+                                            range.base_shader_register
+                                        ),
+                                    })?;
+                                let (resource, layout) = classify_table_range_resource(
+                                    range.range_type,
+                                    reg_idx,
+                                    range.register_space,
+                                    psv_resources,
+                                );
+                                slots.push(ExtractedSlot {
+                                    register: D3dRegister {
+                                        class,
+                                        index: reg_idx,
+                                        space: range.register_space,
+                                    },
+                                    range_end: reg_idx,
+                                    d3d_visibility_mask: d3d_vis,
+                                    name: format!(
+                                        "{}_{}{}_space{}",
+                                        range.range_type.as_str(),
+                                        class.as_str(),
+                                        reg_idx,
+                                        range.register_space
+                                    ),
+                                    visibility: vis,
+                                    resource,
+                                    layout: Some(layout),
+                                    root_constants: false,
+                                    binding_array: None,
+                                    lowering_need: None,
+                                });
+                            }
                         }
                     }
                 }
@@ -1805,6 +2229,8 @@ fn extract_slots_from_rts0(
                 index: sampler.shader_register,
                 space: sampler.register_space,
             },
+            range_end: sampler.shader_register,
+            d3d_visibility_mask: sampler.shader_visibility.d3d_stage_mask(),
             name: format!(
                 "static_sampler_s{}_space{}",
                 sampler.shader_register, sampler.register_space
@@ -1820,29 +2246,37 @@ fn extract_slots_from_rts0(
         });
     }
 
-    slots
+    Ok(slots)
 }
 
 fn extract_slots_from_psv0(
     psv_resources: &[PsvResourceBinding],
     container_stage: ShaderStage,
-) -> Vec<ExtractedSlot> {
-    let vis = match container_stage {
-        ShaderStage::Vertex => VISIBILITY_VERTEX,
-        ShaderStage::Fragment => VISIBILITY_FRAGMENT,
-        ShaderStage::Compute => VISIBILITY_COMPUTE,
+) -> Result<Vec<ExtractedSlot>, DxilReflectError> {
+    let (vis, d3d_vis) = match container_stage {
+        ShaderStage::Vertex => (VISIBILITY_VERTEX, D3dShaderVisibility::Vertex.d3d_stage_mask()),
+        ShaderStage::Fragment => (VISIBILITY_FRAGMENT, D3dShaderVisibility::Pixel.d3d_stage_mask()),
+        ShaderStage::Compute => (VISIBILITY_COMPUTE, D3dShaderVisibility::All.d3d_stage_mask()),
     };
     let mut slots = Vec::new();
-    for res in psv_resources {
+    for (idx, res) in psv_resources.iter().enumerate() {
+        if res.upper_bound < res.lower_bound {
+            return Err(DxilReflectError::InvalidResourceBounds {
+                fourcc: "PSV0",
+                index: idx,
+                lower_bound: res.lower_bound,
+                upper_bound: res.upper_bound,
+            });
+        }
         let range_type = match res.res_type {
             1 => DescriptorRangeType::Sampler,
             2 => DescriptorRangeType::Cbv,
-            3 | 4 | 5 => DescriptorRangeType::Srv,
-            6 | 7 | 8 | 9 => DescriptorRangeType::Uav,
+            3 | 4 | 5 | 10 => DescriptorRangeType::Srv,
+            6 | 7 | 8 | 9 | 11 => DescriptorRangeType::Uav,
             _ => continue,
         };
         let class = range_type.register_class();
-        if res.upper_bound == u32::MAX || res.upper_bound < res.lower_bound {
+        if res.upper_bound == u32::MAX {
             let (resource, _) =
                 classify_table_range_resource(range_type, res.lower_bound, res.space, psv_resources);
             let name = format!("psv_{}{}_space{}", class.as_str(), res.lower_bound, res.space);
@@ -1852,6 +2286,8 @@ fn extract_slots_from_psv0(
                     index: res.lower_bound,
                     space: res.space,
                 },
+                range_end: u32::MAX,
+                d3d_visibility_mask: d3d_vis,
                 name: name.clone(),
                 visibility: vis,
                 resource,
@@ -1865,7 +2301,15 @@ fn extract_slots_from_psv0(
             });
             continue;
         }
-        let count = res.upper_bound - res.lower_bound + 1;
+        let count = (res.upper_bound - res.lower_bound)
+            .checked_add(1)
+            .ok_or_else(|| DxilReflectError::Overflow {
+                fourcc: "PSV0",
+                detail: format!(
+                    "PSV0 resource {idx} binding count overflow ({}..={})",
+                    res.lower_bound, res.upper_bound
+                ),
+            })?;
         if count > MAX_EXPANDED_RANGE_DESCRIPTORS {
             let (resource, _) =
                 classify_table_range_resource(range_type, res.lower_bound, res.space, psv_resources);
@@ -1876,6 +2320,8 @@ fn extract_slots_from_psv0(
                     index: res.lower_bound,
                     space: res.space,
                 },
+                range_end: res.upper_bound,
+                d3d_visibility_mask: d3d_vis,
                 name: name.clone(),
                 visibility: vis,
                 resource,
@@ -1890,7 +2336,16 @@ fn extract_slots_from_psv0(
             continue;
         }
         for offset in 0..count {
-            let reg_idx = res.lower_bound + offset;
+            let reg_idx = res
+                .lower_bound
+                .checked_add(offset)
+                .ok_or_else(|| DxilReflectError::Overflow {
+                    fourcc: "PSV0",
+                    detail: format!(
+                        "PSV0 resource {idx} register index overflow (base={}, offset={offset})",
+                        res.lower_bound
+                    ),
+                })?;
             let (resource, layout) =
                 classify_table_range_resource(range_type, reg_idx, res.space, psv_resources);
             slots.push(ExtractedSlot {
@@ -1899,6 +2354,8 @@ fn extract_slots_from_psv0(
                     index: reg_idx,
                     space: res.space,
                 },
+                range_end: reg_idx,
+                d3d_visibility_mask: d3d_vis,
                 name: format!("psv_{}{}_space{}", class.as_str(), reg_idx, res.space),
                 visibility: vis,
                 resource,
@@ -1909,28 +2366,115 @@ fn extract_slots_from_psv0(
             });
         }
     }
-    slots
+    Ok(slots)
 }
 
-/// Deduplicate identical D3D registers `(space, class, index)` by OR-ing visibility and keeping
-/// canonical deterministic order, then assign WebGPU `(group in 0..4, binding)` cleanly.
+fn slots_layout_compatible(a: &ExtractedSlot, b: &ExtractedSlot) -> bool {
+    if a.resource != b.resource || a.binding_array != b.binding_array {
+        return false;
+    }
+    match (a.layout, b.layout) {
+        (None, None) => true,
+        (
+            Some(BindingLayout::Buffer {
+                ty: ty_a,
+                has_dynamic_offset: dyn_a,
+                ..
+            }),
+            Some(BindingLayout::Buffer {
+                ty: ty_b,
+                has_dynamic_offset: dyn_b,
+                ..
+            }),
+        ) => ty_a == ty_b && dyn_a == dyn_b,
+        (Some(la), Some(lb)) => la == lb,
+        _ => false,
+    }
+}
+
+/// Detect illegal overlapping or duplicate register ranges sharing any D3D12 shader stage
+/// visibility within the same `(register_space, RegisterClass)`.
+fn validate_no_overlapping_same_stage_registers(
+    raw_slots: &[ExtractedSlot],
+) -> Result<(), DxilReflectError> {
+    let mut by_space_class: BTreeMap<(u32, RegisterClass), Vec<(u32, u32, u8)>> = BTreeMap::new();
+    for slot in raw_slots {
+        by_space_class
+            .entry((slot.register.space, slot.register.class))
+            .or_default()
+            .push((slot.register.index, slot.range_end, slot.d3d_visibility_mask));
+    }
+
+    for ((space, class), mut intervals) in by_space_class {
+        intervals.sort_unstable();
+        let mut active_max_end: [Option<(u32, u32)>; 7] = [None; 7];
+        for (start, end, stage_mask) in intervals {
+            for (bit_idx, active) in active_max_end.iter_mut().enumerate() {
+                if (stage_mask & (1u8 << bit_idx)) == 0 {
+                    continue;
+                }
+                if let Some((prev_start, prev_end)) = *active
+                    && prev_end >= start
+                {
+                    return Err(DxilReflectError::DuplicateRegister {
+                        register: D3dRegister {
+                            class,
+                            index: start,
+                            space,
+                        },
+                        detail: format!(
+                            "register range [{}..={}] overlaps existing range [{}..={}] with overlapping shader stage visibility",
+                            start, end, prev_start, prev_end
+                        ),
+                    });
+                }
+                *active = Some((start, end));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Deduplicate identical D3D registers `(space, class, index)` across disjoint shader stages by
+/// OR-ing visibility and keeping canonical deterministic order, reject illegal same-stage or
+/// incompatible duplicates, and assign WebGPU `(group in 0..4, binding)` cleanly.
 fn lower_slots_to_webgpu(
     raw_slots: Vec<ExtractedSlot>,
     convention: &RegisterConvention,
-) -> (
-    Vec<ReflectedBinding>,
-    PipelineLayoutDesc,
-    Vec<DxilBindGroupRemap>,
-    Vec<LoweringNeed>,
-) {
-    // 1. Canonical sort + dedup by (space, class, index).
+) -> Result<
+    (
+        Vec<ReflectedBinding>,
+        PipelineLayoutDesc,
+        Vec<DxilBindGroupRemap>,
+        Vec<LoweringNeed>,
+    ),
+    DxilReflectError,
+> {
+    // 0. Reject any overlapping/duplicate registers that share D3D12 stage visibility.
+    validate_no_overlapping_same_stage_registers(&raw_slots)?;
+
+    // 1. Canonical sort + disjoint-stage merge by (space, class, index).
     let mut by_reg: BTreeMap<(u32, RegisterClass, u32), ExtractedSlot> = BTreeMap::new();
     for slot in raw_slots {
         let key = (slot.register.space, slot.register.class, slot.register.index);
         match by_reg.get_mut(&key) {
             Some(existing) => {
+                if existing.range_end != slot.range_end || !slots_layout_compatible(existing, &slot)
+                {
+                    return Err(DxilReflectError::DuplicateRegister {
+                        register: slot.register,
+                        detail: format!(
+                            "conflicting resource/layout declarations ('{}' vs '{}')",
+                            existing.name, slot.name
+                        ),
+                    });
+                }
                 existing.visibility |= slot.visibility;
+                existing.d3d_visibility_mask |= slot.d3d_visibility_mask;
                 existing.root_constants |= slot.root_constants;
+                if slot.name < existing.name {
+                    existing.name = slot.name;
+                }
                 if let (
                     Some(BindingLayout::Buffer {
                         min_binding_size: a,
@@ -1943,6 +2487,11 @@ fn lower_slots_to_webgpu(
                 ) = (&mut existing.layout, &slot.layout)
                 {
                     *a = (*a).max(*b);
+                }
+                match (&mut existing.lowering_need, slot.lowering_need) {
+                    (None, Some(need)) => existing.lowering_need = Some(need),
+                    (Some(cur), Some(cand)) if cand < *cur => *cur = cand,
+                    _ => {}
                 }
             }
             None => {
@@ -1975,7 +2524,8 @@ fn lower_slots_to_webgpu(
             .register
             .index
             .checked_add(convention.shift(slot.register.class));
-        let binding = allocate_preferred_or_next(&mut used[group as usize], preferred_binding);
+        let binding =
+            allocate_preferred_or_next(group, &mut used[group as usize], preferred_binding)?;
 
         if let Some((kind, detail)) = slot.lowering_need {
             lowering_needs.push(LoweringNeed {
@@ -2016,7 +2566,7 @@ fn lower_slots_to_webgpu(
             if used[target_group as usize].len() >= WEBGPU_MAX_BINDINGS_PER_GROUP {
                 target_group = select_least_populated_group(&used);
             }
-            let binding = allocate_next_binding(&mut used[target_group as usize]);
+            let binding = allocate_next_binding(target_group, &mut used[target_group as usize])?;
 
             remaps.push(DxilBindGroupRemap {
                 register: slot.register,
@@ -2057,8 +2607,11 @@ fn lower_slots_to_webgpu(
         }
     }
 
-    bindings.sort_by(|a, b| (a.group, a.binding, &a.name).cmp(&(b.group, b.binding, &b.name)));
+    // Total canonical sort matching EntryPointReflection::canonicalized().
+    bindings.sort();
     remaps.sort();
+    lowering_needs.sort();
+    lowering_needs.dedup();
 
     // Build dense PipelineLayoutDesc over 0..=highest_used_group (guaranteed <= 4).
     let highest_group = group_entries
@@ -2076,12 +2629,12 @@ fn lower_slots_to_webgpu(
             .collect(),
     };
 
-    (
+    Ok((
         bindings,
         PipelineLayoutDesc { bind_group_layouts },
         remaps,
         lowering_needs,
-    )
+    ))
 }
 
 fn select_least_populated_group(used: &[BTreeSet<u32>; WEBGPU_MAX_BIND_GROUPS as usize]) -> u32 {
@@ -2090,32 +2643,47 @@ fn select_least_populated_group(used: &[BTreeSet<u32>; WEBGPU_MAX_BIND_GROUPS as
         .unwrap_or(0) as u32
 }
 
-fn allocate_preferred_or_next(occupied: &mut BTreeSet<u32>, preferred: Option<u32>) -> u32 {
+fn allocate_preferred_or_next(
+    group: u32,
+    occupied: &mut BTreeSet<u32>,
+    preferred: Option<u32>,
+) -> Result<u32, DxilReflectError> {
     if let Some(slot) = preferred
         && !occupied.contains(&slot)
     {
         occupied.insert(slot);
-        return slot;
+        return Ok(slot);
     }
-    allocate_next_binding(occupied)
+    allocate_next_binding(group, occupied)
 }
 
-fn allocate_next_binding(occupied: &mut BTreeSet<u32>) -> u32 {
+fn allocate_next_binding(
+    group: u32,
+    occupied: &mut BTreeSet<u32>,
+) -> Result<u32, DxilReflectError> {
     let candidate = match occupied.last().copied() {
         None => 0,
         Some(max_existing) => match max_existing.checked_add(1) {
             Some(next) => next,
             None => {
+                let mut found = None;
                 let mut slot = 0u32;
-                while occupied.contains(&slot) {
-                    slot = slot.wrapping_add(1);
+                loop {
+                    if !occupied.contains(&slot) {
+                        found = Some(slot);
+                        break;
+                    }
+                    let Some(next) = slot.checked_add(1) else {
+                        break;
+                    };
+                    slot = next;
                 }
-                slot
+                found.ok_or(DxilReflectError::BindingSpaceExhausted { group })?
             }
         },
     };
     occupied.insert(candidate);
-    candidate
+    Ok(candidate)
 }
 
 fn lower_stage_io(
@@ -2130,8 +2698,25 @@ fn lower_stage_io(
     match stage {
         ShaderStage::Vertex => {
             if let Some(isig) = input_sig {
+                let mut ordered: Vec<&SignatureElement> = isig.elements.iter().collect();
+                ordered.sort_by(|a, b| {
+                    (
+                        a.register,
+                        a.semantic_name.as_str(),
+                        a.semantic_index,
+                        a.mask,
+                        a.component_type,
+                    )
+                        .cmp(&(
+                            b.register,
+                            b.semantic_name.as_str(),
+                            b.semantic_index,
+                            b.mask,
+                            b.component_type,
+                        ))
+                });
                 let mut seen_locations = BTreeSet::new();
-                for elem in &isig.elements {
+                for elem in ordered {
                     if elem.is_system_value() || elem.component_count() == 0 {
                         continue;
                     }
@@ -2156,13 +2741,30 @@ fn lower_stage_io(
                         vertex_format,
                     });
                 }
-                vertex_inputs.sort_by_key(|io| io.location);
+                vertex_inputs.sort();
             }
         }
         ShaderStage::Fragment => {
             if let Some(osig) = output_sig {
+                let mut ordered: Vec<&SignatureElement> = osig.elements.iter().collect();
+                ordered.sort_by(|a, b| {
+                    (
+                        a.semantic_index,
+                        a.register,
+                        a.semantic_name.as_str(),
+                        a.mask,
+                        a.component_type,
+                    )
+                        .cmp(&(
+                            b.semantic_index,
+                            b.register,
+                            b.semantic_name.as_str(),
+                            b.mask,
+                            b.component_type,
+                        ))
+                });
                 let mut seen_locations = BTreeSet::new();
-                for elem in &osig.elements {
+                for elem in ordered {
                     if !elem.is_render_target() || elem.component_count() == 0 {
                         continue;
                     }
@@ -2177,7 +2779,7 @@ fn lower_stage_io(
                         vertex_format: None,
                     });
                 }
-                fragment_outputs.sort_by_key(|io| io.location);
+                fragment_outputs.sort();
             }
         }
         ShaderStage::Compute => {}
@@ -2255,9 +2857,10 @@ pub fn build_dxil_reflection_manifest(
     for refl in reflections {
         let mut bgl_ids = Vec::with_capacity(refl.pipeline_layout.bind_group_layouts.len());
         for bgl in &refl.pipeline_layout.bind_group_layouts {
-            let id = bgl.content_hash();
+            let canonical_bgl = bgl.canonicalized();
+            let id = canonical_bgl.content_hash();
             match manifest.bind_group_layouts.get(&id) {
-                Some(existing) if existing != bgl => {
+                Some(existing) if *existing != canonical_bgl => {
                     return Err(DxilReflectError::HashCollision {
                         table: "bind_group_layouts",
                         hash: id,
@@ -2265,7 +2868,7 @@ pub fn build_dxil_reflection_manifest(
                 }
                 Some(_) => {}
                 None => {
-                    manifest.bind_group_layouts.insert(id, bgl.clone());
+                    manifest.bind_group_layouts.insert(id, canonical_bgl);
                 }
             }
             bgl_ids.push(id);
@@ -2283,14 +2886,34 @@ pub fn build_dxil_reflection_manifest(
                 manifest.pipeline_layouts.insert(pl_id, bgl_ids);
             }
         }
-        manifest
-            .shaders
-            .entry(refl.hash)
-            .or_insert_with(|| refl.clone());
+        let canonical_refl = refl.canonicalized();
+        match manifest.shaders.get_mut(&canonical_refl.hash) {
+            Some(existing) => {
+                if existing.pipeline_layout != canonical_refl.pipeline_layout
+                    || existing.entry != canonical_refl.entry
+                {
+                    return Err(DxilReflectError::HashCollision {
+                        table: "shaders",
+                        hash: canonical_refl.hash,
+                    });
+                }
+                // Deterministic canonical source tie-breaker when identical containers appear
+                // under multiple sanitized filenames.
+                match (&existing.source, &canonical_refl.source) {
+                    (None, Some(src)) => existing.source = Some(src.clone()),
+                    (Some(cur), Some(cand)) if cand < cur => existing.source = Some(cand.clone()),
+                    _ => {}
+                }
+            }
+            None => {
+                manifest.shaders.insert(canonical_refl.hash, canonical_refl);
+            }
+        }
     }
 
     let mut sorted_errors = errors.to_vec();
     sorted_errors.sort_by(|a, b| (&a.source, &a.error).cmp(&(&b.source, &b.error)));
+    sorted_errors.dedup();
     manifest.errors = sorted_errors;
 
     Ok(manifest)
@@ -3810,5 +4433,1091 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn deterministic_binding_sort_order_invariant_to_rts0_psv0_and_signature_permutation() {
+        let params_forward = vec![
+            // Disjoint cross-stage shared b0 space0 (Vertex root constants + Pixel root CBV)
+            RootParameter {
+                visibility: D3dShaderVisibility::Vertex,
+                kind: RootParameterKind::Constants32Bit {
+                    shader_register: 0,
+                    register_space: 0,
+                    num_32bit_values: 8,
+                },
+            },
+            RootParameter {
+                visibility: D3dShaderVisibility::Pixel,
+                kind: RootParameterKind::Cbv {
+                    shader_register: 0,
+                    register_space: 0,
+                    flags: 0,
+                },
+            },
+            RootParameter {
+                visibility: D3dShaderVisibility::Pixel,
+                kind: RootParameterKind::Srv {
+                    shader_register: 2,
+                    register_space: 1,
+                    flags: 0,
+                },
+            },
+            RootParameter {
+                visibility: D3dShaderVisibility::All,
+                kind: RootParameterKind::Uav {
+                    shader_register: 1,
+                    register_space: 2,
+                    flags: 0,
+                },
+            },
+            RootParameter {
+                visibility: D3dShaderVisibility::Pixel,
+                kind: RootParameterKind::DescriptorTable(vec![
+                    DescriptorRange {
+                        range_type: DescriptorRangeType::Sampler,
+                        num_descriptors: 1,
+                        base_shader_register: 0,
+                        register_space: 0,
+                        flags: 0,
+                        offset_in_descriptors_from_table_start: 0,
+                    },
+                    DescriptorRange {
+                        range_type: DescriptorRangeType::Uav,
+                        num_descriptors: 1,
+                        base_shader_register: 0,
+                        register_space: 0,
+                        flags: 0,
+                        offset_in_descriptors_from_table_start: 1,
+                    },
+                    DescriptorRange {
+                        range_type: DescriptorRangeType::Srv,
+                        num_descriptors: 2,
+                        base_shader_register: 0,
+                        register_space: 0,
+                        flags: 0,
+                        offset_in_descriptors_from_table_start: 2,
+                    },
+                    DescriptorRange {
+                        range_type: DescriptorRangeType::Cbv,
+                        num_descriptors: 1,
+                        base_shader_register: 1,
+                        register_space: 0,
+                        flags: 0,
+                        offset_in_descriptors_from_table_start: 4,
+                    },
+                ]),
+            },
+            // Overflow spaces in non-sorted order (space 9 before space 4)
+            RootParameter {
+                visibility: D3dShaderVisibility::Pixel,
+                kind: RootParameterKind::Srv {
+                    shader_register: 0,
+                    register_space: 9,
+                    flags: 0,
+                },
+            },
+            RootParameter {
+                visibility: D3dShaderVisibility::Pixel,
+                kind: RootParameterKind::Cbv {
+                    shader_register: 0,
+                    register_space: 4,
+                    flags: 0,
+                },
+            },
+        ];
+
+        // Reverse parameter list AND reverse ranges inside the descriptor table.
+        let mut params_reversed = params_forward.clone();
+        params_reversed.reverse();
+        for p in &mut params_reversed {
+            if let RootParameterKind::DescriptorTable(ranges) = &mut p.kind {
+                ranges.reverse();
+            }
+        }
+
+        let samplers_forward = vec![
+            sample_static_sampler(1, 3, D3dShaderVisibility::Pixel, false),
+            sample_static_sampler(0, 3, D3dShaderVisibility::Pixel, true),
+        ];
+        let mut samplers_reversed = samplers_forward.clone();
+        samplers_reversed.reverse();
+
+        let psv_forward = vec![
+            PsvResourceBinding {
+                res_type: 5, // SRVStructured
+                space: 0,
+                lower_bound: 0,
+                upper_bound: 0,
+                res_kind: Some(12),
+                res_flags: Some(0),
+            },
+            PsvResourceBinding {
+                res_type: 3, // SRVTyped Cube
+                space: 0,
+                lower_bound: 1,
+                upper_bound: 1,
+                res_kind: Some(5),
+                res_flags: Some(0),
+            },
+            // Broader range covering t0..=t1; narrower exact entries above must always win regardless of order.
+            PsvResourceBinding {
+                res_type: 3,
+                space: 0,
+                lower_bound: 0,
+                upper_bound: 1,
+                res_kind: Some(2),
+                res_flags: Some(0),
+            },
+        ];
+        let mut psv_reversed = psv_forward.clone();
+        psv_reversed.reverse();
+
+        let isg_forward = vec![
+            sig_elem("COLOR", 0, 0, SignatureComponentType::Float32, 2, 0xF),
+            sig_elem("POSITION", 0, 0, SignatureComponentType::Float32, 0, 0x7),
+            sig_elem("TEXCOORD", 0, 0, SignatureComponentType::Float32, 1, 0x3),
+        ];
+        let mut isg_reversed = isg_forward.clone();
+        isg_reversed.reverse();
+
+        let rs_a = RootSignature {
+            version: RootSignatureVersion::V1_1,
+            flags: 0,
+            parameters: params_forward,
+            static_samplers: samplers_forward,
+        };
+        let rs_b = RootSignature {
+            version: RootSignatureVersion::V1_1,
+            flags: 0,
+            parameters: params_reversed,
+            static_samplers: samplers_reversed,
+        };
+
+        let dxil = build_dxil_chunk(1, 6, 6); // vs_6_6
+        let container_a = build_container(&[
+            (*b"DXIL", &dxil),
+            (*b"RTS0", &encode_rts0(&rs_a)),
+            (*b"PSV0", &encode_psv0(1, [0, 0, 0], &psv_forward)),
+            (*b"ISG1", &encode_signature(true, &isg_forward)),
+        ]);
+        let container_b = build_container(&[
+            (*b"DXIL", &dxil),
+            (*b"RTS0", &encode_rts0(&rs_b)),
+            (*b"PSV0", &encode_psv0(1, [0, 0, 0], &psv_reversed)),
+            (*b"ISG1", &encode_signature(true, &isg_reversed)),
+        ]);
+
+        let refl_a = reflect_dxil_bytes(&container_a).expect("forward reflection should succeed");
+        let refl_b = reflect_dxil_bytes(&container_b).expect("reversed reflection should succeed");
+
+        assert_eq!(refl_a.entry, refl_b.entry);
+        assert_eq!(refl_a.pipeline_layout, refl_b.pipeline_layout);
+        assert_eq!(refl_a.bind_group_remaps, refl_b.bind_group_remaps);
+        assert_eq!(refl_a.limit_violations, refl_b.limit_violations);
+
+        // Verify strict canonical ascending (group, binding) ordering across all emitted bindings.
+        for pair in refl_a.entry.bindings.windows(2) {
+            assert!(
+                (pair[0].group, pair[0].binding) < (pair[1].group, pair[1].binding),
+                "bindings must be strictly ascending by (group, binding): {:?} vs {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+
+        // Verify space 0 canonical class order: B(b0, b1) -> T(t0, t1) -> U(u0) -> S(s0).
+        let group0_regs: Vec<D3dRegister> = refl_a
+            .entry
+            .bindings
+            .iter()
+            .filter(|b| b.group == 0 && b.register.is_some_and(|r| r.space == 0))
+            .map(|b| b.register.unwrap())
+            .collect();
+        assert_eq!(
+            group0_regs,
+            vec![
+                D3dRegister { class: RegisterClass::B, index: 0, space: 0 },
+                D3dRegister { class: RegisterClass::B, index: 1, space: 0 },
+                D3dRegister { class: RegisterClass::T, index: 0, space: 0 },
+                D3dRegister { class: RegisterClass::T, index: 1, space: 0 },
+                D3dRegister { class: RegisterClass::U, index: 0, space: 0 },
+                D3dRegister { class: RegisterClass::S, index: 0, space: 0 },
+            ]
+        );
+
+        // Cross-stage merged b0 must preserve root_constants, max min_binding_size (32B),
+        // merged visibility (VERTEX | FRAGMENT), and canonical name independent of parameter order.
+        let b0 = refl_a
+            .entry
+            .bindings
+            .iter()
+            .find(|b| b.register == Some(D3dRegister { class: RegisterClass::B, index: 0, space: 0 }))
+            .unwrap();
+        assert!(b0.root_constants);
+        assert_eq!(b0.name.as_deref(), Some("root_cbv_b0_space0"));
+        assert_eq!(
+            b0.layout,
+            Some(BindingLayout::Buffer {
+                ty: BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: 32,
+            })
+        );
+        let g0_b0 = refl_a.pipeline_layout.bind_group_layouts[0]
+            .entries
+            .iter()
+            .find(|e| e.binding == b0.binding)
+            .unwrap();
+        assert_eq!(g0_b0.visibility, VISIBILITY_VERTEX | VISIBILITY_FRAGMENT);
+    }
+
+    #[test]
+    fn rejects_duplicate_and_overlapping_register_indices_with_clean_diagnostics() {
+        let dxil = build_dxil_chunk(0, 6, 6); // ps_6_6
+
+        // 1. Two root CBVs targeting b0 space0 with overlapping visibility (All + Pixel).
+        let dup_cbv = RootSignature {
+            version: RootSignatureVersion::V1_1,
+            flags: 0,
+            parameters: vec![
+                RootParameter {
+                    visibility: D3dShaderVisibility::All,
+                    kind: RootParameterKind::Cbv {
+                        shader_register: 0,
+                        register_space: 0,
+                        flags: 0,
+                    },
+                },
+                RootParameter {
+                    visibility: D3dShaderVisibility::Pixel,
+                    kind: RootParameterKind::Cbv {
+                        shader_register: 0,
+                        register_space: 0,
+                        flags: 0,
+                    },
+                },
+            ],
+            static_samplers: vec![],
+        };
+        let c1 = build_container(&[(*b"DXIL", &dxil), (*b"RTS0", &encode_rts0(&dup_cbv))]);
+        assert!(matches!(
+            reflect_dxil_bytes(&c1),
+            Err(DxilReflectError::DuplicateRegister {
+                register: D3dRegister {
+                    class: RegisterClass::B,
+                    index: 0,
+                    space: 0,
+                },
+                ..
+            })
+        ));
+
+        // 2. Overlapping descriptor table ranges within the same visibility (t0..=t2 and t2..=t3).
+        let overlap_ranges = RootSignature {
+            version: RootSignatureVersion::V1_1,
+            flags: 0,
+            parameters: vec![RootParameter {
+                visibility: D3dShaderVisibility::Pixel,
+                kind: RootParameterKind::DescriptorTable(vec![
+                    DescriptorRange {
+                        range_type: DescriptorRangeType::Srv,
+                        num_descriptors: 3,
+                        base_shader_register: 0,
+                        register_space: 0,
+                        flags: 0,
+                        offset_in_descriptors_from_table_start: 0,
+                    },
+                    DescriptorRange {
+                        range_type: DescriptorRangeType::Srv,
+                        num_descriptors: 2,
+                        base_shader_register: 2,
+                        register_space: 0,
+                        flags: 0,
+                        offset_in_descriptors_from_table_start: 3,
+                    },
+                ]),
+            }],
+            static_samplers: vec![],
+        };
+        let c2 = build_container(&[(*b"DXIL", &dxil), (*b"RTS0", &encode_rts0(&overlap_ranges))]);
+        assert!(matches!(
+            reflect_dxil_bytes(&c2),
+            Err(DxilReflectError::DuplicateRegister {
+                register: D3dRegister {
+                    class: RegisterClass::T,
+                    index: 2,
+                    space: 0,
+                },
+                ..
+            })
+        ));
+
+        // 3. Unbounded descriptor range overlapping a concrete SRV on the same stage.
+        let overlap_unbounded = RootSignature {
+            version: RootSignatureVersion::V1_1,
+            flags: 0,
+            parameters: vec![
+                RootParameter {
+                    visibility: D3dShaderVisibility::All,
+                    kind: RootParameterKind::DescriptorTable(vec![DescriptorRange {
+                        range_type: DescriptorRangeType::Srv,
+                        num_descriptors: u32::MAX,
+                        base_shader_register: 0,
+                        register_space: 1,
+                        flags: 0,
+                        offset_in_descriptors_from_table_start: 0,
+                    }]),
+                },
+                RootParameter {
+                    visibility: D3dShaderVisibility::All,
+                    kind: RootParameterKind::Srv {
+                        shader_register: 5,
+                        register_space: 1,
+                        flags: 0,
+                    },
+                },
+            ],
+            static_samplers: vec![],
+        };
+        let c3 = build_container(&[
+            (*b"DXIL", &dxil),
+            (*b"RTS0", &encode_rts0(&overlap_unbounded)),
+        ]);
+        assert!(matches!(
+            reflect_dxil_bytes(&c3),
+            Err(DxilReflectError::DuplicateRegister {
+                register: D3dRegister {
+                    class: RegisterClass::T,
+                    index: 5,
+                    space: 1,
+                },
+                ..
+            })
+        ));
+
+        // 4. Table sampler colliding with static sampler on the same stage and register.
+        let dup_sampler = RootSignature {
+            version: RootSignatureVersion::V1_1,
+            flags: 0,
+            parameters: vec![RootParameter {
+                visibility: D3dShaderVisibility::Pixel,
+                kind: RootParameterKind::DescriptorTable(vec![DescriptorRange {
+                    range_type: DescriptorRangeType::Sampler,
+                    num_descriptors: 1,
+                    base_shader_register: 0,
+                    register_space: 0,
+                    flags: 0,
+                    offset_in_descriptors_from_table_start: 0,
+                }]),
+            }],
+            static_samplers: vec![sample_static_sampler(
+                0,
+                0,
+                D3dShaderVisibility::Pixel,
+                false,
+            )],
+        };
+        let c4 = build_container(&[(*b"DXIL", &dxil), (*b"RTS0", &encode_rts0(&dup_sampler))]);
+        assert!(matches!(
+            reflect_dxil_bytes(&c4),
+            Err(DxilReflectError::DuplicateRegister {
+                register: D3dRegister {
+                    class: RegisterClass::S,
+                    index: 0,
+                    space: 0,
+                },
+                ..
+            })
+        ));
+
+        // 5. Disjoint stages (Vertex vs Pixel) with INCOMPATIBLE layouts on the same t0 space0
+        // (root SRV buffer vs table SRV texture) must return DuplicateRegister.
+        let incompatible_cross_stage = RootSignature {
+            version: RootSignatureVersion::V1_1,
+            flags: 0,
+            parameters: vec![
+                RootParameter {
+                    visibility: D3dShaderVisibility::Vertex,
+                    kind: RootParameterKind::Srv {
+                        shader_register: 0,
+                        register_space: 0,
+                        flags: 0,
+                    },
+                },
+                RootParameter {
+                    visibility: D3dShaderVisibility::Pixel,
+                    kind: RootParameterKind::DescriptorTable(vec![DescriptorRange {
+                        range_type: DescriptorRangeType::Srv,
+                        num_descriptors: 1,
+                        base_shader_register: 0,
+                        register_space: 0,
+                        flags: 0,
+                        offset_in_descriptors_from_table_start: 0,
+                    }]),
+                },
+            ],
+            static_samplers: vec![],
+        };
+        let c5 = build_container(&[
+            (*b"DXIL", &dxil),
+            (*b"RTS0", &encode_rts0(&incompatible_cross_stage)),
+        ]);
+        assert!(matches!(
+            reflect_dxil_bytes(&c5),
+            Err(DxilReflectError::DuplicateRegister {
+                register: D3dRegister {
+                    class: RegisterClass::T,
+                    index: 0,
+                    space: 0,
+                },
+                ..
+            })
+        ));
+
+        // 6. PSV0-only container with overlapping resource bindings must fail cleanly.
+        let psv_dup = encode_psv0(
+            0,
+            [0, 0, 0],
+            &[
+                PsvResourceBinding {
+                    res_type: 2, // CBV
+                    space: 0,
+                    lower_bound: 0,
+                    upper_bound: 2,
+                    res_kind: Some(0),
+                    res_flags: Some(0),
+                },
+                PsvResourceBinding {
+                    res_type: 2, // CBV overlapping b1
+                    space: 0,
+                    lower_bound: 1,
+                    upper_bound: 1,
+                    res_kind: Some(0),
+                    res_flags: Some(0),
+                },
+            ],
+        );
+        let c6 = build_container(&[(*b"DXIL", &dxil), (*b"PSV0", &psv_dup)]);
+        assert!(matches!(
+            reflect_dxil_bytes(&c6),
+            Err(DxilReflectError::DuplicateRegister {
+                register: D3dRegister {
+                    class: RegisterClass::B,
+                    index: 1,
+                    space: 0,
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn guards_truncated_malformed_and_overflowing_chunks_against_panics() {
+        // 1. Truncated DXIL chunk (< 24B) inside a valid DXBC container.
+        let trunc_dxil = build_container(&[(*b"DXIL", &[0u8; 12])]);
+        assert!(matches!(
+            reflect_dxil_bytes(&trunc_dxil),
+            Err(DxilReflectError::TruncatedChunk {
+                fourcc: "DXIL",
+                actual: 12,
+                expected_min: 24,
+            })
+        ));
+
+        // 2. DXIL chunk with out-of-range / overflowing bitcode_offset.
+        let mut bad_dxil = build_dxil_chunk(0, 6, 6);
+        bad_dxil[16..20].copy_from_slice(&u32::MAX.to_le_bytes()); // bitcode_offset = u32::MAX
+        let bad_dxil_container = build_container(&[(*b"DXIL", &bad_dxil)]);
+        assert!(matches!(
+            reflect_dxil_bytes(&bad_dxil_container),
+            Err(DxilReflectError::OutOfBounds { fourcc: "DXIL", .. }
+                | DxilReflectError::Overflow { fourcc: "DXIL", .. })
+        ));
+
+        // 3. Truncated SHDR chunk (< 8B).
+        let trunc_shdr = build_container(&[(*b"SHDR", &[1, 2, 3, 4])]);
+        assert!(matches!(
+            reflect_dxil_bytes(&trunc_shdr),
+            Err(DxilReflectError::TruncatedChunk {
+                fourcc: "SHDR",
+                actual: 4,
+                expected_min: 8,
+            })
+        ));
+
+        // 4. RTS0 parameter data_off pointing inside header (< 24).
+        let mut header_alias_param = vec![0u8; 36];
+        header_alias_param[0..4].copy_from_slice(&2u32.to_le_bytes());
+        header_alias_param[4..8].copy_from_slice(&1u32.to_le_bytes());
+        header_alias_param[8..12].copy_from_slice(&24u32.to_le_bytes());
+        header_alias_param[24..28].copy_from_slice(&2u32.to_le_bytes()); // Root CBV
+        header_alias_param[28..32].copy_from_slice(&0u32.to_le_bytes()); // All
+        header_alias_param[32..36].copy_from_slice(&4u32.to_le_bytes()); // inside header!
+        assert!(matches!(
+            parse_rts0_chunk(&header_alias_param),
+            Err(DxilReflectError::OutOfBounds { fourcc: "RTS0", .. })
+        ));
+
+        // 5. RTS0 descriptor range register-index overflow (base = u32::MAX, count = 2).
+        let overflow_rs = RootSignature {
+            version: RootSignatureVersion::V1_1,
+            flags: 0,
+            parameters: vec![RootParameter {
+                visibility: D3dShaderVisibility::All,
+                kind: RootParameterKind::DescriptorTable(vec![DescriptorRange {
+                    range_type: DescriptorRangeType::Srv,
+                    num_descriptors: 2,
+                    base_shader_register: u32::MAX,
+                    register_space: 0,
+                    flags: 0,
+                    offset_in_descriptors_from_table_start: 0,
+                }]),
+            }],
+            static_samplers: vec![],
+        };
+        assert!(matches!(
+            parse_rts0_chunk(&encode_rts0(&overflow_rs)),
+            Err(DxilReflectError::Overflow { fourcc: "RTS0", .. })
+        ));
+
+        // 6. RTS0 invalid descriptor range type (raw = 9).
+        let mut bad_range_type = encode_rts0(&RootSignature {
+            version: RootSignatureVersion::V1_1,
+            flags: 0,
+            parameters: vec![RootParameter {
+                visibility: D3dShaderVisibility::All,
+                kind: RootParameterKind::DescriptorTable(vec![DescriptorRange {
+                    range_type: DescriptorRangeType::Srv,
+                    num_descriptors: 1,
+                    base_shader_register: 0,
+                    register_space: 0,
+                    flags: 0,
+                    offset_in_descriptors_from_table_start: 0,
+                }]),
+            }],
+            static_samplers: vec![],
+        });
+        // Header (24) + 1 param header (12) + table header (8) = byte 44 is range_type.
+        bad_range_type[44..48].copy_from_slice(&9u32.to_le_bytes());
+        assert!(matches!(
+            parse_rts0_chunk(&bad_range_type),
+            Err(DxilReflectError::InvalidDescriptorRangeType {
+                param_index: 0,
+                range_index: 0,
+                raw: 9,
+            })
+        ));
+
+        // 7. ISG1 semantic name offset pointing into header (< 8).
+        let mut header_alias_sig = encode_signature(
+            true,
+            &[sig_elem("POSITION", 0, 0, SignatureComponentType::Float32, 0, 0x7)],
+        );
+        // Header (8) + stream (4) = byte 12 is name_offset in ISG1.
+        header_alias_sig[12..16].copy_from_slice(&0u32.to_le_bytes());
+        assert!(matches!(
+            parse_signature_elements(*b"ISG1", &header_alias_sig),
+            Err(DxilReflectError::InvalidSignatureString { fourcc: "ISG1", .. })
+        ));
+
+        // 8. PSV0 runtime_info_size < 24.
+        let mut tiny_psv = vec![0u8; 20];
+        tiny_psv[0..4].copy_from_slice(&12u32.to_le_bytes());
+        assert!(matches!(
+            parse_psv0_chunk(&tiny_psv),
+            Err(DxilReflectError::TruncatedChunk {
+                fourcc: "PSV0",
+                actual: 12,
+                expected_min: 24,
+            })
+        ));
+
+        // 9. PSV0 truncated trailing resource_count (2 bytes after runtime info).
+        let mut trunc_psv_tail = vec![0u8; 4 + 48 + 2];
+        trunc_psv_tail[0..4].copy_from_slice(&48u32.to_le_bytes());
+        assert!(matches!(
+            parse_psv0_chunk(&trunc_psv_tail),
+            Err(DxilReflectError::TruncatedChunk {
+                fourcc: "PSV0",
+                actual: 2,
+                expected_min: 4,
+            })
+        ));
+
+        // 10. PSV0 inverted register bounds (lower_bound > upper_bound).
+        let inverted_psv = encode_psv0(
+            0,
+            [0, 0, 0],
+            &[PsvResourceBinding {
+                res_type: 3,
+                space: 0,
+                lower_bound: 8,
+                upper_bound: 3,
+                res_kind: Some(2),
+                res_flags: Some(0),
+            }],
+        );
+        assert!(matches!(
+            parse_psv0_chunk(&inverted_psv),
+            Err(DxilReflectError::InvalidResourceBounds {
+                fourcc: "PSV0",
+                index: 0,
+                lower_bound: 8,
+                upper_bound: 3,
+            })
+        ));
+
+        // 11. Exhaustive prefix-truncation sweep over a full valid container and every chunk
+        // payload: every strict prefix must return Err(...) and never panic.
+        let full_rs = RootSignature {
+            version: RootSignatureVersion::V1_1,
+            flags: 0,
+            parameters: vec![
+                RootParameter {
+                    visibility: D3dShaderVisibility::Vertex,
+                    kind: RootParameterKind::Constants32Bit {
+                        shader_register: 0,
+                        register_space: 0,
+                        num_32bit_values: 4,
+                    },
+                },
+                RootParameter {
+                    visibility: D3dShaderVisibility::Pixel,
+                    kind: RootParameterKind::DescriptorTable(vec![DescriptorRange {
+                        range_type: DescriptorRangeType::Srv,
+                        num_descriptors: 2,
+                        base_shader_register: 0,
+                        register_space: 0,
+                        flags: 0,
+                        offset_in_descriptors_from_table_start: 0,
+                    }]),
+                },
+            ],
+            static_samplers: vec![sample_static_sampler(0, 1, D3dShaderVisibility::Pixel, false)],
+        };
+        let rts0 = encode_rts0(&full_rs);
+        let isg1 = encode_signature(
+            true,
+            &[sig_elem("POSITION", 0, 0, SignatureComponentType::Float32, 0, 0x7)],
+        );
+        let psv0 = encode_psv0(
+            5,
+            [8, 8, 1],
+            &[PsvResourceBinding {
+                res_type: 5,
+                space: 0,
+                lower_bound: 0,
+                upper_bound: 0,
+                res_kind: Some(12),
+                res_flags: Some(0),
+            }],
+        );
+        let dxil = build_dxil_chunk(5, 6, 6);
+        let full_container = build_container(&[
+            (*b"DXIL", &dxil),
+            (*b"RTS0", &rts0),
+            (*b"ISG1", &isg1),
+            (*b"PSV0", &psv0),
+        ]);
+
+        for cut in 0..rts0.len() {
+            assert!(
+                parse_rts0_chunk(&rts0[..cut]).is_err(),
+                "truncated RTS0 prefix of {cut} bytes must fail cleanly"
+            );
+        }
+        for cut in 0..isg1.len() {
+            assert!(
+                parse_signature_elements(*b"ISG1", &isg1[..cut]).is_err(),
+                "truncated ISG1 prefix of {cut} bytes must fail cleanly"
+            );
+        }
+        for cut in 0..psv0.len() {
+            // Note: exact cut at 4 + 48 = 52 is a valid PSV0 with zero trailing resource table.
+            if cut == 52 {
+                assert!(parse_psv0_chunk(&psv0[..cut]).is_ok());
+            } else {
+                assert!(
+                    parse_psv0_chunk(&psv0[..cut]).is_err(),
+                    "truncated PSV0 prefix of {cut} bytes must fail cleanly"
+                );
+            }
+        }
+        for cut in 0..full_container.len() {
+            assert!(
+                reflect_dxil_bytes(&full_container[..cut]).is_err(),
+                "truncated DXBC container prefix of {cut} bytes must fail cleanly"
+            );
+        }
+    }
+
+    #[test]
+    fn classifies_cbv_srv_uav_and_sampler_variants_across_rts0_and_psv0() {
+        // Part A: Full RTS0 + PSV0 classification covering CBV, SRV (buffer + texture dims + MSAA),
+        // UAV, and Sampler (table filtering + static filtering + static comparison).
+        let rs = RootSignature {
+            version: RootSignatureVersion::V1_1,
+            flags: 0,
+            parameters: vec![
+                RootParameter {
+                    visibility: D3dShaderVisibility::All,
+                    kind: RootParameterKind::Constants32Bit {
+                        shader_register: 0,
+                        register_space: 0,
+                        num_32bit_values: 12,
+                    },
+                },
+                RootParameter {
+                    visibility: D3dShaderVisibility::All,
+                    kind: RootParameterKind::Cbv {
+                        shader_register: 1,
+                        register_space: 0,
+                        flags: 0,
+                    },
+                },
+                RootParameter {
+                    visibility: D3dShaderVisibility::All,
+                    kind: RootParameterKind::Srv {
+                        shader_register: 0,
+                        register_space: 1,
+                        flags: 0,
+                    },
+                },
+                RootParameter {
+                    visibility: D3dShaderVisibility::All,
+                    kind: RootParameterKind::Uav {
+                        shader_register: 0,
+                        register_space: 2,
+                        flags: 0,
+                    },
+                },
+                RootParameter {
+                    visibility: D3dShaderVisibility::All,
+                    kind: RootParameterKind::DescriptorTable(vec![
+                        DescriptorRange {
+                            range_type: DescriptorRangeType::Cbv,
+                            num_descriptors: 1,
+                            base_shader_register: 2,
+                            register_space: 0,
+                            flags: 0,
+                            offset_in_descriptors_from_table_start: 0,
+                        },
+                        DescriptorRange {
+                            range_type: DescriptorRangeType::Srv,
+                            num_descriptors: 6,
+                            base_shader_register: 1,
+                            register_space: 1,
+                            flags: 0,
+                            offset_in_descriptors_from_table_start: 1,
+                        },
+                        DescriptorRange {
+                            range_type: DescriptorRangeType::Uav,
+                            num_descriptors: 1,
+                            base_shader_register: 1,
+                            register_space: 2,
+                            flags: 0,
+                            offset_in_descriptors_from_table_start: 7,
+                        },
+                        DescriptorRange {
+                            range_type: DescriptorRangeType::Sampler,
+                            num_descriptors: 1,
+                            base_shader_register: 0,
+                            register_space: 3,
+                            flags: 0,
+                            offset_in_descriptors_from_table_start: 8,
+                        },
+                    ]),
+                },
+            ],
+            static_samplers: vec![
+                sample_static_sampler(1, 3, D3dShaderVisibility::All, false),
+                sample_static_sampler(2, 3, D3dShaderVisibility::All, true),
+            ],
+        };
+
+        let psv0 = encode_psv0(
+            0,
+            [0, 0, 0],
+            &[
+                PsvResourceBinding {
+                    res_type: 4, // SRVRaw -> ReadOnlyStorage buffer
+                    space: 1,
+                    lower_bound: 1,
+                    upper_bound: 1,
+                    res_kind: Some(10),
+                    res_flags: Some(0),
+                },
+                PsvResourceBinding {
+                    res_type: 3, // Texture1D
+                    space: 1,
+                    lower_bound: 2,
+                    upper_bound: 2,
+                    res_kind: Some(1),
+                    res_flags: Some(0),
+                },
+                PsvResourceBinding {
+                    res_type: 3, // Texture2DMS -> multisampled D2 UnfilterableFloat
+                    space: 1,
+                    lower_bound: 3,
+                    upper_bound: 3,
+                    res_kind: Some(3),
+                    res_flags: Some(0),
+                },
+                PsvResourceBinding {
+                    res_type: 3, // Texture3D
+                    space: 1,
+                    lower_bound: 4,
+                    upper_bound: 4,
+                    res_kind: Some(4),
+                    res_flags: Some(0),
+                },
+                PsvResourceBinding {
+                    res_type: 3, // TextureCubeArray
+                    space: 1,
+                    lower_bound: 5,
+                    upper_bound: 5,
+                    res_kind: Some(9),
+                    res_flags: Some(0),
+                },
+                // t6 has no PSV0 annotation -> defaults to Texture2D Float
+            ],
+        );
+
+        let container = build_container(&[
+            (*b"DXIL", &build_dxil_chunk(0, 6, 6)),
+            (*b"RTS0", &encode_rts0(&rs)),
+            (*b"PSV0", &psv0),
+        ]);
+        let refl = reflect_dxil_bytes(&container).expect("classification test should succeed");
+
+        let find_reg = |class: RegisterClass, index: u32, space: u32| {
+            refl.entry
+                .bindings
+                .iter()
+                .find(|b| b.register == Some(D3dRegister { class, index, space }))
+                .expect("expected reflected binding")
+        };
+
+        // CBVs (group 0)
+        assert_eq!(
+            find_reg(RegisterClass::B, 0, 0).layout,
+            Some(BindingLayout::Buffer {
+                ty: BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: 48,
+            })
+        );
+        assert!(find_reg(RegisterClass::B, 0, 0).root_constants);
+        assert_eq!(find_reg(RegisterClass::B, 1, 0).resource, ResourceKind::Buffer);
+        assert_eq!(find_reg(RegisterClass::B, 2, 0).resource, ResourceKind::Buffer);
+
+        // SRVs (group 1)
+        assert_eq!(
+            find_reg(RegisterClass::T, 0, 1).layout,
+            Some(BindingLayout::Buffer {
+                ty: BufferBindingType::ReadOnlyStorage,
+                has_dynamic_offset: false,
+                min_binding_size: 0,
+            })
+        );
+        assert_eq!(
+            find_reg(RegisterClass::T, 1, 1).layout,
+            Some(BindingLayout::Buffer {
+                ty: BufferBindingType::ReadOnlyStorage,
+                has_dynamic_offset: false,
+                min_binding_size: 0,
+            })
+        );
+        assert_eq!(
+            find_reg(RegisterClass::T, 2, 1).layout,
+            Some(BindingLayout::Texture {
+                sample_type: TextureSampleType::Float,
+                view_dimension: TextureViewDimension::D1,
+                multisampled: false,
+            })
+        );
+        assert_eq!(
+            find_reg(RegisterClass::T, 3, 1).layout,
+            Some(BindingLayout::Texture {
+                sample_type: TextureSampleType::UnfilterableFloat,
+                view_dimension: TextureViewDimension::D2,
+                multisampled: true,
+            })
+        );
+        assert_eq!(
+            find_reg(RegisterClass::T, 4, 1).layout,
+            Some(BindingLayout::Texture {
+                sample_type: TextureSampleType::Float,
+                view_dimension: TextureViewDimension::D3,
+                multisampled: false,
+            })
+        );
+        assert_eq!(
+            find_reg(RegisterClass::T, 5, 1).layout,
+            Some(BindingLayout::Texture {
+                sample_type: TextureSampleType::Float,
+                view_dimension: TextureViewDimension::CubeArray,
+                multisampled: false,
+            })
+        );
+        assert_eq!(
+            find_reg(RegisterClass::T, 6, 1).layout,
+            Some(BindingLayout::Texture {
+                sample_type: TextureSampleType::Float,
+                view_dimension: TextureViewDimension::D2,
+                multisampled: false,
+            })
+        );
+
+        // UAVs (group 2)
+        for idx in [0u32, 1u32] {
+            assert_eq!(
+                find_reg(RegisterClass::U, idx, 2).layout,
+                Some(BindingLayout::Buffer {
+                    ty: BufferBindingType::Storage,
+                    has_dynamic_offset: false,
+                    min_binding_size: 0,
+                })
+            );
+        }
+
+        // Samplers (group 3)
+        assert_eq!(
+            find_reg(RegisterClass::S, 0, 3).layout,
+            Some(BindingLayout::Sampler {
+                ty: SamplerBindingType::Filtering,
+            })
+        );
+        assert_eq!(
+            find_reg(RegisterClass::S, 1, 3).layout,
+            Some(BindingLayout::Sampler {
+                ty: SamplerBindingType::Filtering,
+            })
+        );
+        assert_eq!(
+            find_reg(RegisterClass::S, 2, 3).layout,
+            Some(BindingLayout::Sampler {
+                ty: SamplerBindingType::Comparison,
+            })
+        );
+
+        // Part B: PSV0-only fallback (no RTS0 chunk) classifies all 4 register classes canonically.
+        let psv_only = encode_psv0(
+            5,
+            [16, 4, 1],
+            &[
+                PsvResourceBinding {
+                    res_type: 1, // Sampler s0
+                    space: 0,
+                    lower_bound: 0,
+                    upper_bound: 0,
+                    res_kind: Some(14),
+                    res_flags: Some(0),
+                },
+                PsvResourceBinding {
+                    res_type: 8, // UAVStructured u0
+                    space: 0,
+                    lower_bound: 0,
+                    upper_bound: 0,
+                    res_kind: Some(12),
+                    res_flags: Some(0),
+                },
+                PsvResourceBinding {
+                    res_type: 5, // SRVStructured t0
+                    space: 0,
+                    lower_bound: 0,
+                    upper_bound: 0,
+                    res_kind: Some(12),
+                    res_flags: Some(0),
+                },
+                PsvResourceBinding {
+                    res_type: 2, // CBV b0
+                    space: 0,
+                    lower_bound: 0,
+                    upper_bound: 0,
+                    res_kind: Some(13),
+                    res_flags: Some(0),
+                },
+            ],
+        );
+        let psv_container =
+            build_container(&[(*b"DXIL", &build_dxil_chunk(5, 6, 6)), (*b"PSV0", &psv_only)]);
+        let psv_refl = reflect_dxil_bytes(&psv_container).expect("PSV0-only reflection should succeed");
+        assert_eq!(psv_refl.entry.stage, ShaderStage::Compute);
+        assert_eq!(psv_refl.entry.workgroup_size, Some([16, 4, 1]));
+        let classes: Vec<RegisterClass> = psv_refl
+            .entry
+            .bindings
+            .iter()
+            .map(|b| b.register.unwrap().class)
+            .collect();
+        // Canonical order: B (CBV) -> T (SRV) -> U (UAV) -> S (Sampler)
+        assert_eq!(
+            classes,
+            vec![
+                RegisterClass::B,
+                RegisterClass::T,
+                RegisterClass::U,
+                RegisterClass::S,
+            ]
+        );
+    }
+
+    #[test]
+    fn manifest_dedup_is_order_independent_and_detects_shader_hash_collisions() {
+        let rs = RootSignature {
+            version: RootSignatureVersion::V1_1,
+            flags: 0,
+            parameters: vec![RootParameter {
+                visibility: D3dShaderVisibility::All,
+                kind: RootParameterKind::Cbv {
+                    shader_register: 0,
+                    register_space: 0,
+                    flags: 0,
+                },
+            }],
+            static_samplers: vec![],
+        };
+        let bytes = build_container(&[
+            (*b"DXIL", &build_dxil_chunk(5, 6, 6)),
+            (*b"RTS0", &encode_rts0(&rs)),
+        ]);
+        let conv = RegisterConvention::default();
+        let refl_z = reflect_dxil_bytes_with_options(&bytes, Some("z_menu.dxil"), &conv).unwrap();
+        let refl_a = reflect_dxil_bytes_with_options(&bytes, Some("a_menu.dxil"), &conv).unwrap();
+
+        let errs = vec![
+            DxilReflectionErrorRecord {
+                source: "bad.dxil".to_string(),
+                error: "truncated".to_string(),
+            },
+            DxilReflectionErrorRecord {
+                source: "bad.dxil".to_string(),
+                error: "truncated".to_string(),
+            },
+        ];
+
+        let m_za =
+            build_dxil_reflection_manifest(&[refl_z.clone(), refl_a.clone()], &errs, &conv).unwrap();
+        let m_az =
+            build_dxil_reflection_manifest(&[refl_a.clone(), refl_z.clone()], &errs, &conv).unwrap();
+        assert_eq!(m_za.render_json(), m_az.render_json());
+        assert_eq!(
+            m_za.shaders.values().next().unwrap().source.as_deref(),
+            Some("a_menu.dxil")
+        );
+        assert_eq!(m_za.errors.len(), 1);
+
+        // Synthetic hash collision (same hash, different entry stage) must error cleanly.
+        let mut collided = refl_a.clone();
+        collided.entry.stage = ShaderStage::Fragment;
+        assert!(matches!(
+            build_dxil_reflection_manifest(&[refl_a, collided], &[], &conv),
+            Err(DxilReflectError::HashCollision {
+                table: "shaders",
+                ..
+            })
+        ));
     }
 }
