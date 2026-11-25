@@ -134,6 +134,24 @@
 
   const DEFAULT_CLEAR_COLOR = Object.freeze({ r: 0, g: 0, b: 0, a: 1 });
   const DEFAULT_UV_TRANSFORM = Object.freeze([1, 1, 0, 0]);
+  const EMPTY_OBJECT = Object.freeze({});
+
+  function defaultNowMs() {
+    if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
+      return performance.now();
+    }
+    return Date.now();
+  }
+
+  function sanitizeNonNegativeNumber(value) {
+    return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
+  }
+
+  function sanitizeNonNegativeInteger(value) {
+    return typeof value === 'number' && Number.isFinite(value) && value > 0
+      ? Math.floor(value)
+      : 0;
+  }
 
   const BINK_PRESENTER_WGSL = /* wgsl */ `
 struct PresenterUniforms {
@@ -324,37 +342,33 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     );
   }
 
-  function normalizeClearColor(clearColor) {
+  function writeClearColor(clearColor, out) {
     if (!clearColor) {
-      return { ...DEFAULT_CLEAR_COLOR };
+      out.r = DEFAULT_CLEAR_COLOR.r;
+      out.g = DEFAULT_CLEAR_COLOR.g;
+      out.b = DEFAULT_CLEAR_COLOR.b;
+      out.a = DEFAULT_CLEAR_COLOR.a;
+      return out;
     }
     if (Array.isArray(clearColor) && clearColor.length >= 4) {
-      return {
-        r: clearColor[0],
-        g: clearColor[1],
-        b: clearColor[2],
-        a: clearColor[3],
-      };
+      out.r = clearColor[0];
+      out.g = clearColor[1];
+      out.b = clearColor[2];
+      out.a = clearColor[3];
+      return out;
     }
-    return {
-      r: typeof clearColor.r === 'number' ? clearColor.r : DEFAULT_CLEAR_COLOR.r,
-      g: typeof clearColor.g === 'number' ? clearColor.g : DEFAULT_CLEAR_COLOR.g,
-      b: typeof clearColor.b === 'number' ? clearColor.b : DEFAULT_CLEAR_COLOR.b,
-      a: typeof clearColor.a === 'number' ? clearColor.a : DEFAULT_CLEAR_COLOR.a,
-    };
+    out.r = typeof clearColor.r === 'number' ? clearColor.r : DEFAULT_CLEAR_COLOR.r;
+    out.g = typeof clearColor.g === 'number' ? clearColor.g : DEFAULT_CLEAR_COLOR.g;
+    out.b = typeof clearColor.b === 'number' ? clearColor.b : DEFAULT_CLEAR_COLOR.b;
+    out.a = typeof clearColor.a === 'number' ? clearColor.a : DEFAULT_CLEAR_COLOR.a;
+    return out;
   }
 
   /**
    * Compute a centered letterbox/pillarbox viewport inside `(dstWidth, dstHeight)` that
-   * preserves the exact aspect ratio of `(srcWidth, srcHeight)`.
-   *
-   * @param {number} srcWidth
-   * @param {number} srcHeight
-   * @param {number} dstWidth
-   * @param {number} dstHeight
-   * @returns {{ x: number, y: number, width: number, height: number, scaleX: number, scaleY: number }}
+   * preserves the exact aspect ratio of `(srcWidth, srcHeight)`, writing into `out`.
    */
-  function computeLetterboxViewport(srcWidth, srcHeight, dstWidth, dstHeight) {
+  function writeLetterboxViewport(srcWidth, srcHeight, dstWidth, dstHeight, out) {
     assertPositiveFinite(srcWidth, 'srcWidth');
     assertPositiveFinite(srcHeight, 'srcHeight');
     assertPositiveFinite(dstWidth, 'dstWidth');
@@ -384,14 +398,34 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       }
     }
 
-    return {
-      x,
-      y,
-      width,
-      height,
-      scaleX: width / dstWidth,
-      scaleY: height / dstHeight,
-    };
+    out.x = x;
+    out.y = y;
+    out.width = width;
+    out.height = height;
+    out.scaleX = width / dstWidth;
+    out.scaleY = height / dstHeight;
+    return out;
+  }
+
+  /**
+   * Compute a centered letterbox/pillarbox viewport inside `(dstWidth, dstHeight)` that
+   * preserves the exact aspect ratio of `(srcWidth, srcHeight)`.
+   *
+   * @param {number} srcWidth
+   * @param {number} srcHeight
+   * @param {number} dstWidth
+   * @param {number} dstHeight
+   * @returns {{ x: number, y: number, width: number, height: number, scaleX: number, scaleY: number }}
+   */
+  function computeLetterboxViewport(srcWidth, srcHeight, dstWidth, dstHeight) {
+    return writeLetterboxViewport(srcWidth, srcHeight, dstWidth, dstHeight, {
+      x: 0,
+      y: 0,
+      width: 0,
+      height: 0,
+      scaleX: 0,
+      scaleY: 0,
+    });
   }
 
   /**
@@ -518,7 +552,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     height,
     srcStride,
     label,
-    scratchBuffer = null
+    scratchBuffer = null,
+    out = null
   ) {
     validatePlaneBuffer(src, tightRowBytes, height, srcStride, label);
 
@@ -528,6 +563,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     if (isSrcStrideAligned && src.byteLength >= directTotalBytes) {
       const slice = src.byteLength === directTotalBytes ? src : src.subarray(0, directTotalBytes);
+      if (out) {
+        out.data = slice;
+        out.bytesPerRow = srcStride;
+        out.totalBytes = directTotalBytes;
+        out.padded = false;
+        out.usesScratch = false;
+        return out;
+      }
       return {
         data: slice,
         bytesPerRow: srcStride,
@@ -556,6 +599,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       }
     }
 
+    if (out) {
+      out.data = dst;
+      out.bytesPerRow = alignedBytesPerRow;
+      out.totalBytes = totalBytes;
+      out.padded = true;
+      out.usesScratch = canReuseScratch;
+      return out;
+    }
+
     return {
       data: dst,
       bytesPerRow: alignedBytesPerRow,
@@ -580,7 +632,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       uv: null,
       a: null,
       bindGroup: null,
-      bindGroupKey: null,
+      bindGroupGeneration: 0,
+      bindGroupFormat: null,
+      bindGroupWidth: 0,
+      bindGroupHeight: 0,
+      bindGroupChromaOrder: null,
     };
   }
 
@@ -604,7 +660,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     slot.uv = null;
     slot.a = null;
     slot.bindGroup = null;
-    slot.bindGroupKey = null;
+    slot.bindGroupGeneration = 0;
+    slot.bindGroupFormat = null;
+    slot.bindGroupWidth = 0;
+    slot.bindGroupHeight = 0;
+    slot.bindGroupChromaOrder = null;
     slot.generation = 0;
     slot.format = null;
     slot.width = 0;
@@ -633,6 +693,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         targetFps = DEFAULT_TARGET_FPS,
         doubleBuffer = true,
         slotCount,
+        now = defaultNowMs,
       } = options;
 
       if (!device || typeof device.createTexture !== 'function') {
@@ -647,6 +708,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         (typeof stagingPool !== 'object' || typeof stagingPool.stageTextureUpload !== 'function')
       ) {
         throw new TypeError('stagingPool must be null or provide stageTextureUpload()');
+      }
+      if (typeof now !== 'function') {
+        throw new TypeError('now must be a function returning a finite timestamp in milliseconds');
       }
       validateColorSpace(colorSpace);
       validateColorRange(colorRange);
@@ -666,6 +730,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       this._chromaOrder = chromaOrder;
       this._loadOp = loadOp;
       this._targetFps = targetFps;
+      this._now = now;
 
       // Reusable plane texture slots (double-buffered by default).
       this._slots = [];
@@ -688,6 +753,90 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       // Reusable scratch buffer for 256-byte row-pitch alignment.
       this._uploadScratch = null;
       this._scratchAllocations = 0;
+
+      // Pre-allocated upload & present descriptor scratch objects for zero-alloc hot paths.
+      this._preparedPlaneScratch = {
+        data: null,
+        bytesPerRow: 0,
+        totalBytes: 0,
+        padded: false,
+        usesScratch: false,
+      };
+      this._uploadOriginScratch = { x: 0, y: 0, z: 0 };
+      this._uploadDestinationScratch = {
+        texture: null,
+        mipLevel: 0,
+        origin: this._uploadOriginScratch,
+      };
+      this._uploadDataLayoutScratch = {
+        offset: 0,
+        bytesPerRow: 0,
+        rowsPerImage: 0,
+      };
+      this._uploadSizeScratch = {
+        width: 0,
+        height: 0,
+        depthOrArrayLayers: 1,
+      };
+      this._stagingLayoutScratch = {
+        width: 0,
+        height: 0,
+        bytesPerRow: 0,
+        rowsPerImage: 0,
+      };
+      this._uniformParamsScratch = {
+        pixelFormat: BINK_PIXEL_FORMAT.RGBA8,
+        colorSpace: this._colorSpace,
+        colorRange: this._colorRange,
+        chromaOrder: this._chromaOrder,
+        opacity: 1.0,
+        uvTransform: this._uvTransform,
+      };
+      this._clearColorValueScratch = {
+        r: DEFAULT_CLEAR_COLOR.r,
+        g: DEFAULT_CLEAR_COLOR.g,
+        b: DEFAULT_CLEAR_COLOR.b,
+        a: DEFAULT_CLEAR_COLOR.a,
+      };
+      this._clearColorAttachmentScratch = {
+        view: null,
+        loadOp: BINK_LOAD_OP.CLEAR,
+        storeOp: 'store',
+        clearValue: this._clearColorValueScratch,
+      };
+      this._clearRenderPassDescScratch = {
+        label: 'playgta6-bink-present-pass',
+        colorAttachments: [this._clearColorAttachmentScratch],
+      };
+      this._loadColorAttachmentScratch = {
+        view: null,
+        loadOp: BINK_LOAD_OP.LOAD,
+        storeOp: 'store',
+      };
+      this._loadRenderPassDescScratch = {
+        label: 'playgta6-bink-present-pass',
+        colorAttachments: [this._loadColorAttachmentScratch],
+      };
+      this._viewportScratch = {
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+        scaleX: 0,
+        scaleY: 0,
+      };
+      this._presentResultScratch = {
+        presented: false,
+        viewport: null,
+        format: null,
+        colorSpace: this._colorSpace,
+        colorRange: this._colorRange,
+        chromaOrder: this._chromaOrder,
+        loadOp: this._loadOp,
+        slotIndex: 0,
+        presentedFrames: 0,
+        framesPresented: 0,
+      };
 
       // Lazily constructed GPU pipeline resources.
       this._shaderModule = null;
@@ -717,6 +866,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       this._looping = false;
       this._skipped = false;
       this._lastAdvanceMs = null;
+      this._lastPresentMs = null;
 
       // Telemetry.
       this._uploadedFrames = 0;
@@ -730,6 +880,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       this._bindGroupCacheHits = 0;
       this._bindGroupCacheMisses = 0;
       this._uniformWritesSkipped = 0;
+      this._uploadTimingCount = 0;
+      this._totalUploadMs = 0;
+      this._maxUploadMs = 0;
+      this._lastUploadMs = 0;
+      this._lastFrameIntervalMs = 0;
       this._destroyed = false;
     }
 
@@ -789,6 +944,28 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       return this._presentedFrames;
     }
 
+    get presentedFrames() {
+      return this._presentedFrames;
+    }
+
+    get droppedFrames() {
+      return this._droppedFrames;
+    }
+
+    get avgUploadMs() {
+      return this._uploadTimingCount > 0
+        ? sanitizeNonNegativeNumber(this._totalUploadMs / this._uploadTimingCount)
+        : 0;
+    }
+
+    get maxUploadMs() {
+      return sanitizeNonNegativeNumber(this._maxUploadMs);
+    }
+
+    get lastFrameIntervalMs() {
+      return sanitizeNonNegativeNumber(this._lastFrameIntervalMs);
+    }
+
     get bindGroupCacheHits() {
       return this._bindGroupCacheHits;
     }
@@ -799,6 +976,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     get uniformWritesSkipped() {
       return this._uniformWritesSkipped;
+    }
+
+    _recordUploadDuration(startMs, endMs) {
+      const raw = endMs - startMs;
+      const durationMs = Number.isFinite(raw) && raw > 0 ? raw : 0;
+      this._uploadTimingCount += 1;
+      this._totalUploadMs += durationMs;
+      this._lastUploadMs = durationMs;
+      if (durationMs > this._maxUploadMs) {
+        this._maxUploadMs = durationMs;
+      }
+      return durationMs;
     }
 
     _assertNotDestroyed() {
@@ -828,8 +1017,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     _invalidateBindGroupCache() {
       for (let i = 0; i < this._slots.length; i += 1) {
-        this._slots[i].bindGroup = null;
-        this._slots[i].bindGroupKey = null;
+        const slot = this._slots[i];
+        slot.bindGroup = null;
+        slot.bindGroupGeneration = 0;
+        slot.bindGroupFormat = null;
+        slot.bindGroupWidth = 0;
+        slot.bindGroupHeight = 0;
+        slot.bindGroupChromaOrder = null;
       }
     }
 
@@ -940,7 +1134,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       slot.uvWidth = uvWidth;
       slot.uvHeight = uvHeight;
       slot.bindGroup = null;
-      slot.bindGroupKey = null;
+      slot.bindGroupGeneration = 0;
+      slot.bindGroupFormat = null;
+      slot.bindGroupWidth = 0;
+      slot.bindGroupHeight = 0;
+      slot.bindGroupChromaOrder = null;
       return slot;
     }
 
@@ -952,7 +1150,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       const directTotalBytes = srcStride * height;
 
       if (isSrcStrideAligned && src.byteLength >= directTotalBytes) {
-        return prepareAlignedPlaneData(src, tightRowBytes, height, srcStride, label);
+        return prepareAlignedPlaneData(
+          src,
+          tightRowBytes,
+          height,
+          srcStride,
+          label,
+          null,
+          this._preparedPlaneScratch
+        );
       }
 
       const alignedBytesPerRow = alignUp(tightRowBytes, WEBGPU_BYTES_PER_ROW_ALIGNMENT);
@@ -969,21 +1175,54 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         height,
         srcStride,
         label,
-        this._uploadScratch
+        this._uploadScratch,
+        this._preparedPlaneScratch
+      );
+    }
+
+    _writeTextureWithScratch(dstTexture, data, bytesPerRow, rowsPerImage, width, height) {
+      this._uploadDestinationScratch.texture = dstTexture;
+      this._uploadDestinationScratch.mipLevel = 0;
+      this._uploadOriginScratch.x = 0;
+      this._uploadOriginScratch.y = 0;
+      this._uploadOriginScratch.z = 0;
+
+      this._uploadDataLayoutScratch.offset = 0;
+      this._uploadDataLayoutScratch.bytesPerRow = bytesPerRow;
+      this._uploadDataLayoutScratch.rowsPerImage = rowsPerImage;
+
+      this._uploadSizeScratch.width = width;
+      this._uploadSizeScratch.height = height;
+      this._uploadSizeScratch.depthOrArrayLayers = 1;
+
+      this._device.queue.writeTexture(
+        this._uploadDestinationScratch,
+        data,
+        this._uploadDataLayoutScratch,
+        this._uploadSizeScratch
       );
     }
 
     _uploadPlane(slotIndex, dstTexture, prepared, width, height, commandEncoder, isChroma = false) {
       if (this._stagingPool) {
-        const layout = {
-          width,
-          height,
-          bytesPerRow: prepared.bytesPerRow,
-          rowsPerImage: height,
-        };
         if (commandEncoder) {
-          this._stagingPool.stageTextureUpload(commandEncoder, dstTexture, prepared.data, layout);
+          this._stagingLayoutScratch.width = width;
+          this._stagingLayoutScratch.height = height;
+          this._stagingLayoutScratch.bytesPerRow = prepared.bytesPerRow;
+          this._stagingLayoutScratch.rowsPerImage = height;
+          this._stagingPool.stageTextureUpload(
+            commandEncoder,
+            dstTexture,
+            prepared.data,
+            this._stagingLayoutScratch
+          );
         } else {
+          const layout = {
+            width,
+            height,
+            bytesPerRow: prepared.bytesPerRow,
+            rowsPerImage: height,
+          };
           // Clone non-owned or scratch-backed data so subsequent plane uploads cannot overwrite it.
           const ownedData =
             prepared.padded && !prepared.usesScratch ? prepared.data : new Uint8Array(prepared.data);
@@ -1000,11 +1239,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             'BinkVideoPresenter requires device.queue.writeTexture() when no stagingPool is supplied'
           );
         }
-        this._device.queue.writeTexture(
-          { texture: dstTexture, mipLevel: 0, origin: { x: 0, y: 0, z: 0 } },
+        this._writeTextureWithScratch(
+          dstTexture,
           prepared.data,
-          { offset: 0, bytesPerRow: prepared.bytesPerRow, rowsPerImage: height },
-          { width, height, depthOrArrayLayers: 1 }
+          prepared.bytesPerRow,
+          height,
+          width,
+          height
         );
       }
 
@@ -1041,6 +1282,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         );
       }
 
+      const uploadStartMs = this._now();
       const pending = this._pendingUploads;
       this._pendingUploads = [];
       for (let i = 0; i < pending.length; i += 1) {
@@ -1051,6 +1293,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
           item.data,
           item.layout
         );
+      }
+      const flushDurationRaw = this._now() - uploadStartMs;
+      const flushMs =
+        Number.isFinite(flushDurationRaw) && flushDurationRaw > 0 ? flushDurationRaw : 0;
+      if (flushMs > 0 && this._uploadTimingCount > 0) {
+        this._totalUploadMs += flushMs;
+        this._lastUploadMs += flushMs;
+        if (this._lastUploadMs > this._maxUploadMs) {
+          this._maxUploadMs = this._lastUploadMs;
+        }
       }
       return pending.length;
     }
@@ -1063,7 +1315,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
      * @param {number} height
      * @param {{ strideBytes?: number, commandEncoder?: GPUCommandEncoder, encoder?: GPUCommandEncoder }} [options]
      */
-    uploadRgbaFrame(rgbaBytes, width, height, options = {}) {
+    uploadRgbaFrame(rgbaBytes, width, height, options = null) {
       this._assertNotDestroyed();
       assertPositiveInteger(width, 'width');
       assertPositiveInteger(height, 'height');
@@ -1078,6 +1330,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
       validatePlaneBuffer(src, tightRowBytes, height, strideBytes, 'RGBA8');
 
+      const uploadStartMs = this._now();
+
       if (this._unpresentedFrame) {
         this._droppedFrames += 1;
       }
@@ -1087,7 +1341,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       this._dropPendingUploadsForSlot(writeSlotIndex);
 
       const prepared = this._preparePlaneForUpload(src, tightRowBytes, height, strideBytes, 'RGBA8');
+      const bytesPerRow = prepared.bytesPerRow;
+      const totalBytes = prepared.totalBytes;
+      const padded = prepared.padded;
       this._uploadPlane(writeSlotIndex, slot.rgba.texture, prepared, width, height, commandEncoder);
+
+      const uploadMs = this._recordUploadDuration(uploadStartMs, this._now());
 
       if (this._pixelFormat !== BINK_PIXEL_FORMAT.RGBA8) {
         this._uniformsDirty = true;
@@ -1104,11 +1363,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         format: BINK_PIXEL_FORMAT.RGBA8,
         width,
         height,
-        bytesPerRow: prepared.bytesPerRow,
-        bytesUploaded: prepared.totalBytes,
-        zeroCopy: !prepared.padded,
+        bytesPerRow,
+        bytesUploaded: totalBytes,
+        zeroCopy: !padded,
         slotIndex: writeSlotIndex,
         uploadedFrames: this._uploadedFrames,
+        uploadMs,
       };
     }
 
@@ -1196,6 +1456,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         validatePlaneBuffer(aSrc, width, height, resolvedAStride, 'A plane');
       }
 
+      const uploadStartMs = this._now();
+
       if (this._unpresentedFrame) {
         this._droppedFrames += 1;
       }
@@ -1211,6 +1473,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         resolvedYStride,
         'Y plane'
       );
+      const yBytesPerRow = preparedY.bytesPerRow;
+      const yTotalBytes = preparedY.totalBytes;
+      const yPadded = preparedY.padded;
       this._uploadPlane(
         writeSlotIndex,
         slot.y.texture,
@@ -1228,6 +1493,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         resolvedUStride,
         'U plane'
       );
+      const uBytesPerRow = preparedU.bytesPerRow;
+      const uTotalBytes = preparedU.totalBytes;
+      const uPadded = preparedU.padded;
       this._uploadPlane(
         writeSlotIndex,
         slot.u.texture,
@@ -1245,6 +1513,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         resolvedVStride,
         'V plane'
       );
+      const vTotalBytes = preparedV.totalBytes;
+      const vPadded = preparedV.padded;
       this._uploadPlane(
         writeSlotIndex,
         slot.v.texture,
@@ -1255,15 +1525,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         true
       );
 
-      let preparedA = null;
+      let aBytesPerRow = null;
+      let aTotalBytes = 0;
       if (hasAlpha && aSrc) {
-        preparedA = this._preparePlaneForUpload(
+        const preparedA = this._preparePlaneForUpload(
           aSrc,
           width,
           height,
           resolvedAStride,
           'A plane'
         );
+        aBytesPerRow = preparedA.bytesPerRow;
+        aTotalBytes = preparedA.totalBytes;
         this._uploadPlane(
           writeSlotIndex,
           slot.a.texture,
@@ -1274,6 +1547,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
           false
         );
       }
+
+      const uploadMs = this._recordUploadDuration(uploadStartMs, this._now());
 
       if (colorSpace !== undefined && colorSpace !== null && colorSpace !== this._colorSpace) {
         this._colorSpace = colorSpace;
@@ -1300,11 +1575,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       this._unpresentedFrame = true;
       this._uploadedFrames += 1;
 
-      const bytesUploaded =
-        preparedY.totalBytes +
-        preparedU.totalBytes +
-        preparedV.totalBytes +
-        (preparedA ? preparedA.totalBytes : 0);
+      const bytesUploaded = yTotalBytes + uTotalBytes + vTotalBytes + aTotalBytes;
 
       return {
         format,
@@ -1315,14 +1586,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         height,
         uvWidth,
         uvHeight,
-        yBytesPerRow: preparedY.bytesPerRow,
-        uvBytesPerRow: preparedU.bytesPerRow,
-        aBytesPerRow: preparedA ? preparedA.bytesPerRow : null,
-        yZeroCopy: !preparedY.padded,
-        chromaZeroCopy: !preparedU.padded && !preparedV.padded,
+        yBytesPerRow,
+        uvBytesPerRow: uBytesPerRow,
+        aBytesPerRow,
+        yZeroCopy: !yPadded,
+        chromaZeroCopy: !uPadded && !vPadded,
         bytesUploaded,
         slotIndex: writeSlotIndex,
         uploadedFrames: this._uploadedFrames,
+        uploadMs,
       };
     }
 
@@ -1388,6 +1660,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       validatePlaneBuffer(ySrc, width, height, resolvedYStride, 'Y plane');
       validatePlaneBuffer(uvSrc, uvTightRowBytes, uvHeight, resolvedUvStride, 'UV plane');
 
+      const uploadStartMs = this._now();
+
       if (this._unpresentedFrame) {
         this._droppedFrames += 1;
       }
@@ -1403,6 +1677,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         resolvedYStride,
         'Y plane'
       );
+      const yBytesPerRow = preparedY.bytesPerRow;
+      const yTotalBytes = preparedY.totalBytes;
+      const yPadded = preparedY.padded;
       this._uploadPlane(
         writeSlotIndex,
         slot.y.texture,
@@ -1420,6 +1697,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         resolvedUvStride,
         'UV plane'
       );
+      const uvBytesPerRow = preparedUv.bytesPerRow;
+      const uvTotalBytes = preparedUv.totalBytes;
+      const uvPadded = preparedUv.padded;
       this._uploadPlane(
         writeSlotIndex,
         slot.uv.texture,
@@ -1429,6 +1709,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         commandEncoder,
         true
       );
+
+      const uploadMs = this._recordUploadDuration(uploadStartMs, this._now());
 
       if (colorSpace !== undefined && colorSpace !== null && colorSpace !== this._colorSpace) {
         this._colorSpace = colorSpace;
@@ -1455,7 +1737,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       this._unpresentedFrame = true;
       this._uploadedFrames += 1;
 
-      const bytesUploaded = preparedY.totalBytes + preparedUv.totalBytes;
+      const bytesUploaded = yTotalBytes + uvTotalBytes;
 
       return {
         format: BINK_PIXEL_FORMAT.NV12,
@@ -1466,13 +1748,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         height,
         uvWidth,
         uvHeight,
-        yBytesPerRow: preparedY.bytesPerRow,
-        uvBytesPerRow: preparedUv.bytesPerRow,
-        yZeroCopy: !preparedY.padded,
-        chromaZeroCopy: !preparedUv.padded,
+        yBytesPerRow,
+        uvBytesPerRow,
+        yZeroCopy: !yPadded,
+        chromaZeroCopy: !uvPadded,
         bytesUploaded,
         slotIndex: writeSlotIndex,
         uploadedFrames: this._uploadedFrames,
+        uploadMs,
       };
     }
 
@@ -1624,11 +1907,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       if (this._device.queue && typeof this._device.queue.writeTexture === 'function') {
         const dummyBytes = new Uint8Array(WEBGPU_BYTES_PER_ROW_ALIGNMENT);
         dummyBytes[0] = 0xff;
-        this._device.queue.writeTexture(
-          { texture: this._dummyTexture, mipLevel: 0, origin: { x: 0, y: 0, z: 0 } },
+        this._writeTextureWithScratch(
+          this._dummyTexture,
           dummyBytes,
-          { offset: 0, bytesPerRow: WEBGPU_BYTES_PER_ROW_ALIGNMENT, rowsPerImage: 1 },
-          { width: 1, height: 1, depthOrArrayLayers: 1 }
+          WEBGPU_BYTES_PER_ROW_ALIGNMENT,
+          1,
+          1,
+          1
         );
       }
 
@@ -1637,8 +1922,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     _ensureSlotBindGroup(slotIndex) {
       const slot = this._slots[slotIndex];
-      const bindGroupKey = `${slot.generation}|${slot.format}|${slot.width}x${slot.height}|${this._chromaOrder}`;
-      if (slot.bindGroup && slot.bindGroupKey === bindGroupKey) {
+      if (
+        slot.bindGroup &&
+        slot.bindGroupGeneration === slot.generation &&
+        slot.bindGroupFormat === slot.format &&
+        slot.bindGroupWidth === slot.width &&
+        slot.bindGroupHeight === slot.height &&
+        slot.bindGroupChromaOrder === this._chromaOrder
+      ) {
         this._bindGroupCacheHits += 1;
         return slot.bindGroup;
       }
@@ -1674,7 +1965,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
           { binding: 5, resource: aView },
         ],
       });
-      slot.bindGroupKey = bindGroupKey;
+      slot.bindGroupGeneration = slot.generation;
+      slot.bindGroupFormat = slot.format;
+      slot.bindGroupWidth = slot.width;
+      slot.bindGroupHeight = slot.height;
+      slot.bindGroupChromaOrder = this._chromaOrder;
 
       return slot.bindGroup;
     }
@@ -1685,15 +1980,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         return false;
       }
 
+      const uniformParams = this._uniformParamsScratch;
+      uniformParams.pixelFormat = this._pixelFormat || BINK_PIXEL_FORMAT.RGBA8;
+      uniformParams.colorSpace = this._colorSpace;
+      uniformParams.colorRange = this._colorRange;
+      uniformParams.chromaOrder = this._chromaOrder;
+      uniformParams.opacity = opacity;
+      uniformParams.uvTransform = this._uvTransform;
+
       writePresenterUniforms(
-        {
-          pixelFormat: this._pixelFormat || BINK_PIXEL_FORMAT.RGBA8,
-          colorSpace: this._colorSpace,
-          colorRange: this._colorRange,
-          chromaOrder: this._chromaOrder,
-          opacity,
-          uvTransform: this._uvTransform,
-        },
+        uniformParams,
         this._uniformScratchF32,
         this._uniformScratchU32
       );
@@ -1738,9 +2034,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
      *   loadOp?: 'clear' | 'load',
      *   storeOp?: 'store' | 'discard',
      *   opacity?: number,
+     *   nowMs?: number,
      * }} [options]
      */
-    presentFrame(commandEncoder, targetView, dstWidth, dstHeight, options = {}) {
+    presentFrame(commandEncoder, targetView, dstWidth, dstHeight, options = null) {
       this._assertNotDestroyed();
       if (!commandEncoder || typeof commandEncoder.beginRenderPass !== 'function') {
         throw new TypeError('presentFrame requires a GPUCommandEncoder with beginRenderPass()');
@@ -1754,15 +2051,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         throw new TypeError('presentFrame options must be an object');
       }
 
-      const opts = options || {};
+      const opts = options || EMPTY_OBJECT;
       const clearColor = opts.clearColor !== undefined ? opts.clearColor : DEFAULT_CLEAR_COLOR;
       const loadOp = opts.loadOp !== undefined ? opts.loadOp : this._loadOp;
       const storeOp = opts.storeOp !== undefined ? opts.storeOp : 'store';
       const opacity = opts.opacity !== undefined ? opts.opacity : 1.0;
+      const explicitNowMs = opts.nowMs;
 
       validateLoadOp(loadOp);
       validateStoreOp(storeOp);
       validateOpacity(opacity);
+      if (explicitNowMs !== undefined && (typeof explicitNowMs !== 'number' || !Number.isFinite(explicitNowMs))) {
+        throw new RangeError(`nowMs must be a finite number, got ${explicitNowMs}`);
+      }
 
       // Flush any deferred staging uploads before starting the render pass.
       if (this._stagingPool && this._pendingUploads.length > 0) {
@@ -1771,41 +2072,42 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
       this._ensurePipelineResources();
 
-      const colorAttachment = {
-        view: targetView,
-        loadOp,
-        storeOp,
-      };
+      let renderPassDesc;
       if (loadOp === BINK_LOAD_OP.CLEAR) {
-        colorAttachment.clearValue = normalizeClearColor(clearColor);
+        writeClearColor(clearColor, this._clearColorValueScratch);
+        this._clearColorAttachmentScratch.view = targetView;
+        this._clearColorAttachmentScratch.storeOp = storeOp;
+        renderPassDesc = this._clearRenderPassDescScratch;
+      } else {
+        this._loadColorAttachmentScratch.view = targetView;
+        this._loadColorAttachmentScratch.storeOp = storeOp;
+        renderPassDesc = this._loadRenderPassDescScratch;
       }
 
-      const pass = commandEncoder.beginRenderPass({
-        label: 'playgta6-bink-present-pass',
-        colorAttachments: [colorAttachment],
-      });
+      const pass = commandEncoder.beginRenderPass(renderPassDesc);
 
       if (!this._hasFrame) {
         pass.end();
-        return {
-          presented: false,
-          viewport: null,
-          format: this._pixelFormat,
-          colorSpace: this._colorSpace,
-          colorRange: this._colorRange,
-          chromaOrder: this._chromaOrder,
-          loadOp,
-          slotIndex: this._activeSlotIndex,
-          presentedFrames: this._presentedFrames,
-          framesPresented: this._presentedFrames,
-        };
+        const res = this._presentResultScratch;
+        res.presented = false;
+        res.viewport = null;
+        res.format = this._pixelFormat;
+        res.colorSpace = this._colorSpace;
+        res.colorRange = this._colorRange;
+        res.chromaOrder = this._chromaOrder;
+        res.loadOp = loadOp;
+        res.slotIndex = this._activeSlotIndex;
+        res.presentedFrames = this._presentedFrames;
+        res.framesPresented = this._presentedFrames;
+        return res;
       }
 
-      const viewport = computeLetterboxViewport(
+      const viewport = writeLetterboxViewport(
         this._frameWidth,
         this._frameHeight,
         dstWidth,
-        dstHeight
+        dstHeight,
+        this._viewportScratch
       );
 
       this._syncUniformBuffer(opacity);
@@ -1824,21 +2126,28 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       pass.draw(3, 1, 0, 0);
       pass.end();
 
+      const presentNowMs = explicitNowMs !== undefined ? explicitNowMs : this._now();
+      if (this._lastPresentMs !== null) {
+        const deltaMs = presentNowMs - this._lastPresentMs;
+        this._lastFrameIntervalMs =
+          Number.isFinite(deltaMs) && deltaMs > 0 ? deltaMs : 0;
+      }
+      this._lastPresentMs = Number.isFinite(presentNowMs) ? presentNowMs : this._lastPresentMs;
       this._presentedFrames += 1;
       this._unpresentedFrame = false;
 
-      return {
-        presented: true,
-        viewport,
-        format: this._pixelFormat,
-        colorSpace: this._colorSpace,
-        colorRange: this._colorRange,
-        chromaOrder: this._chromaOrder,
-        loadOp,
-        slotIndex: this._activeSlotIndex,
-        presentedFrames: this._presentedFrames,
-        framesPresented: this._presentedFrames,
-      };
+      const res = this._presentResultScratch;
+      res.presented = true;
+      res.viewport = viewport;
+      res.format = this._pixelFormat;
+      res.colorSpace = this._colorSpace;
+      res.colorRange = this._colorRange;
+      res.chromaOrder = this._chromaOrder;
+      res.loadOp = loadOp;
+      res.slotIndex = this._activeSlotIndex;
+      res.presentedFrames = this._presentedFrames;
+      res.framesPresented = this._presentedFrames;
+      return res;
     }
 
     /**
@@ -2014,9 +2323,69 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     /**
+     * Return sanitized frame-pacing and upload timing telemetry.
+     */
+    getPacingStats() {
+      const targetFps = sanitizeNonNegativeNumber(this._targetFps);
+      const targetFrameIntervalMs = targetFps > 0 ? 1000 / targetFps : 0;
+      const presentedFrames = sanitizeNonNegativeInteger(this._presentedFrames);
+      const droppedFrames = sanitizeNonNegativeInteger(this._droppedFrames);
+      const totalFrames = presentedFrames + droppedFrames;
+      const dropRate = totalFrames > 0 ? droppedFrames / totalFrames : 0;
+      const uploadSamples = sanitizeNonNegativeInteger(this._uploadTimingCount);
+      const avgUploadMs =
+        uploadSamples > 0
+          ? sanitizeNonNegativeNumber(this._totalUploadMs / uploadSamples)
+          : 0;
+      const maxUploadMs = sanitizeNonNegativeNumber(this._maxUploadMs);
+      const lastUploadMs = sanitizeNonNegativeNumber(this._lastUploadMs);
+      const lastFrameIntervalMs = sanitizeNonNegativeNumber(this._lastFrameIntervalMs);
+
+      return {
+        targetFps,
+        targetFrameIntervalMs,
+        presentedFrames,
+        droppedFrames,
+        dropRate,
+        uploadSamples,
+        avgUploadMs,
+        maxUploadMs,
+        lastUploadMs,
+        lastFrameIntervalMs,
+      };
+    }
+
+    /**
+     * Reset telemetry counters and pacing timing accumulators without disrupting
+     * allocated GPU textures, bind-group caches, or playback configuration.
+     */
+    resetStats() {
+      this._assertNotDestroyed();
+      this._uploadedFrames = 0;
+      this._presentedFrames = 0;
+      this._droppedFrames = 0;
+      this._resizeCount = 0;
+      this._planeReallocations = 0;
+      this._scratchAllocations = 0;
+      this._bytesUploaded = 0;
+      this._directZeroCopyUploads = 0;
+      this._chromaRepackUploads = 0;
+      this._bindGroupCacheHits = 0;
+      this._bindGroupCacheMisses = 0;
+      this._uniformWritesSkipped = 0;
+      this._uploadTimingCount = 0;
+      this._totalUploadMs = 0;
+      this._maxUploadMs = 0;
+      this._lastUploadMs = 0;
+      this._lastFrameIntervalMs = 0;
+      this._lastPresentMs = null;
+    }
+
+    /**
      * Return presenter state and frame/upload telemetry.
      */
     getStats() {
+      const pacing = this.getPacingStats();
       return {
         pixelFormat: this._pixelFormat,
         colorSpace: this._colorSpace,
@@ -2028,12 +2397,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         frameHeight: this._frameHeight,
         lastFrameWidth: this._frameWidth,
         lastFrameHeight: this._frameHeight,
-        targetFps: this._targetFps,
-        frameIntervalMs: 1000 / this._targetFps,
+        targetFps: pacing.targetFps,
+        frameIntervalMs: pacing.targetFrameIntervalMs,
+        targetFrameIntervalMs: pacing.targetFrameIntervalMs,
         uploadedFrames: this._uploadedFrames,
-        presentedFrames: this._presentedFrames,
-        framesPresented: this._presentedFrames,
-        droppedFrames: this._droppedFrames,
+        presentedFrames: pacing.presentedFrames,
+        framesPresented: pacing.presentedFrames,
+        droppedFrames: pacing.droppedFrames,
+        dropRate: pacing.dropRate,
+        uploadSamples: pacing.uploadSamples,
+        avgUploadMs: pacing.avgUploadMs,
+        maxUploadMs: pacing.maxUploadMs,
+        lastUploadMs: pacing.lastUploadMs,
+        lastFrameIntervalMs: pacing.lastFrameIntervalMs,
         resizeCount: this._resizeCount,
         planeReallocations: this._planeReallocations,
         scratchAllocations: this._scratchAllocations,
@@ -2082,6 +2458,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       this._lastUniformOpacity = null;
 
       this._uploadScratch = null;
+      this._preparedPlaneScratch.data = null;
+      this._uploadDestinationScratch.texture = null;
+      this._clearColorAttachmentScratch.view = null;
+      this._loadColorAttachmentScratch.view = null;
+      this._presentResultScratch.viewport = null;
       this._shaderModule = null;
       this._bindGroupLayout = null;
       this._pipelineLayout = null;
@@ -2090,6 +2471,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       this._hasFrame = false;
       this._unpresentedFrame = false;
       this._lastAdvanceMs = null;
+      this._lastPresentMs = null;
       this._device = null;
       this._stagingPool = null;
     }

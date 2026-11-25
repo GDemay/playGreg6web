@@ -59,10 +59,14 @@ function createMockWebGpuDevice() {
           : new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength);
       writeTextureCalls.push({
         dest: { ...dest, origin: dest.origin ? { ...dest.origin } : undefined },
+        rawDest: dest,
+        rawOrigin: dest ? dest.origin : undefined,
         data: bytes,
         rawData: data,
         dataLayout: { ...dataLayout },
+        rawDataLayout: dataLayout,
         size: { ...size },
+        rawSize: size,
       });
     },
     writeBuffer(buffer, bufferOffset, data) {
@@ -1984,4 +1988,390 @@ test('W192: uniform scratch Float32Array is pre-allocated and reused across upda
   assert.equal(presenter.getStats().framesPresented, 7);
 
   presenter.destroy();
+});
+
+test('W241: 4K Bink2 pacing telemetry tracks avgUploadMs, maxUploadMs, lastFrameIntervalMs, droppedFrames, and targetFps accurately', () => {
+  const device = createMockWebGpuDevice();
+  let clockMs = 1000;
+  let perPlaneUploadMs = 0;
+
+  const origWriteTexture = device.queue.writeTexture.bind(device.queue);
+  device.queue.writeTexture = (dest, data, dataLayout, size) => {
+    origWriteTexture(dest, data, dataLayout, size);
+    if (dest.texture && dest.texture.label !== 'playgta6-bink-presenter-dummy') {
+      clockMs += perPlaneUploadMs;
+    }
+  };
+
+  assert.throws(() => new BinkVideoPresenter({ device, now: 'not-a-fn' }), TypeError);
+
+  const presenter = new BinkVideoPresenter({
+    device,
+    targetFps: 60,
+    doubleBuffer: false,
+    chromaOrder: BINK_CHROMA_ORDER.YVU,
+    now: () => clockMs,
+  });
+
+  // Initial pacing stats are sanitized zeros while reflecting configured targetFps.
+  const initialPacing = presenter.getPacingStats();
+  assert.equal(initialPacing.targetFps, 60);
+  assertNear(initialPacing.targetFrameIntervalMs, 1000 / 60, 1e-6);
+  assert.equal(initialPacing.presentedFrames, 0);
+  assert.equal(initialPacing.droppedFrames, 0);
+  assert.equal(initialPacing.dropRate, 0);
+  assert.equal(initialPacing.uploadSamples, 0);
+  assert.equal(initialPacing.avgUploadMs, 0);
+  assert.equal(initialPacing.maxUploadMs, 0);
+  assert.equal(initialPacing.lastUploadMs, 0);
+  assert.equal(initialPacing.lastFrameIntervalMs, 0);
+
+  const y = new Uint8Array(3840 * 2160);
+  const cr = new Uint8Array(1920 * 1080);
+  const cb = new Uint8Array(1920 * 1080);
+  const targetView = { kind: 'GPUTextureView', id: 'swap-w241-pacing' };
+
+  // Frame 0: 3 planes * 1.5ms = 4.5ms upload, presented at t=1004.5 -> first frame interval stays 0.
+  perPlaneUploadMs = 1.5;
+  const up0 = presenter.uploadYuv420Frame({ y, u: cr, v: cb, width: 3840, height: 2160 });
+  assertNear(up0.uploadMs, 4.5, 1e-6);
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 3840, 2160);
+
+  let pacing = presenter.getPacingStats();
+  assert.equal(pacing.presentedFrames, 1);
+  assert.equal(pacing.droppedFrames, 0);
+  assert.equal(pacing.uploadSamples, 1);
+  assertNear(pacing.avgUploadMs, 4.5, 1e-6);
+  assertNear(pacing.maxUploadMs, 4.5, 1e-6);
+  assertNear(pacing.lastUploadMs, 4.5, 1e-6);
+  assert.equal(pacing.lastFrameIntervalMs, 0);
+
+  // Frame 1: advance clock to t=1020.0, upload takes 3 * 0.5ms = 1.5ms -> present at t=1021.5 -> interval = 17.0ms.
+  clockMs = 1020.0;
+  perPlaneUploadMs = 0.5;
+  const up1 = presenter.uploadYuv420Frame({ y, u: cr, v: cb, width: 3840, height: 2160 });
+  assertNear(up1.uploadMs, 1.5, 1e-6);
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 3840, 2160);
+
+  pacing = presenter.getPacingStats();
+  assert.equal(pacing.presentedFrames, 2);
+  assert.equal(pacing.uploadSamples, 2);
+  assertNear(pacing.avgUploadMs, 3.0, 1e-6); // (4.5 + 1.5) / 2
+  assertNear(pacing.maxUploadMs, 4.5, 1e-6);
+  assertNear(pacing.lastUploadMs, 1.5, 1e-6);
+  assertNear(pacing.lastFrameIntervalMs, 17.0, 1e-6);
+
+  // Frame 2: advance clock to t=1050.0, upload takes 3 * 2.0ms = 6.0ms, present with explicit nowMs=1055.0 -> interval = 33.5ms.
+  clockMs = 1050.0;
+  perPlaneUploadMs = 2.0;
+  presenter.uploadYuv420Frame({ y, u: cr, v: cb, width: 3840, height: 2160 });
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 3840, 2160, { nowMs: 1055.0 });
+  presenter.recordDroppedFrame(1);
+
+  pacing = presenter.getPacingStats();
+  const fullStats = presenter.getStats();
+  assert.equal(pacing.presentedFrames, 3);
+  assert.equal(pacing.droppedFrames, 1);
+  assertNear(pacing.dropRate, 0.25, 1e-6);
+  assert.equal(pacing.uploadSamples, 3);
+  assertNear(pacing.avgUploadMs, 4.0, 1e-6); // (4.5 + 1.5 + 6.0) / 3
+  assertNear(pacing.maxUploadMs, 6.0, 1e-6);
+  assertNear(pacing.lastUploadMs, 6.0, 1e-6);
+  assertNear(pacing.lastFrameIntervalMs, 33.5, 1e-6);
+
+  // Verify getStats() and convenience getters match getPacingStats().
+  assert.equal(fullStats.targetFps, pacing.targetFps);
+  assertNear(fullStats.targetFrameIntervalMs, pacing.targetFrameIntervalMs, 1e-6);
+  assert.equal(fullStats.presentedFrames, pacing.presentedFrames);
+  assert.equal(fullStats.droppedFrames, pacing.droppedFrames);
+  assertNear(fullStats.dropRate, pacing.dropRate, 1e-6);
+  assertNear(fullStats.avgUploadMs, pacing.avgUploadMs, 1e-6);
+  assertNear(fullStats.maxUploadMs, pacing.maxUploadMs, 1e-6);
+  assertNear(fullStats.lastUploadMs, pacing.lastUploadMs, 1e-6);
+  assertNear(fullStats.lastFrameIntervalMs, pacing.lastFrameIntervalMs, 1e-6);
+  assert.equal(presenter.presentedFrames, 3);
+  assert.equal(presenter.droppedFrames, 1);
+  assertNear(presenter.avgUploadMs, 4.0, 1e-6);
+  assertNear(presenter.maxUploadMs, 6.0, 1e-6);
+  assertNear(presenter.lastFrameIntervalMs, 33.5, 1e-6);
+
+  // Mutating returned snapshot objects does not mutate presenter internals.
+  pacing.presentedFrames = 999;
+  pacing.avgUploadMs = -42;
+  assert.equal(presenter.getPacingStats().presentedFrames, 3);
+  assertNear(presenter.getPacingStats().avgUploadMs, 4.0, 1e-6);
+
+  // Backwards clock / non-finite explicit nowMs handling.
+  assert.throws(
+    () => presenter.presentFrame(createMockCommandEncoder(), targetView, 3840, 2160, { nowMs: NaN }),
+    RangeError
+  );
+  assert.throws(
+    () =>
+      presenter.presentFrame(createMockCommandEncoder(), targetView, 3840, 2160, {
+        nowMs: Infinity,
+      }),
+    RangeError
+  );
+  // Clock moving backwards sanitizes lastFrameIntervalMs to 0 (never negative).
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 3840, 2160, { nowMs: 1000.0 });
+  assert.equal(presenter.getPacingStats().lastFrameIntervalMs, 0);
+
+  presenter.destroy();
+});
+
+test('W241: writeTexture destination/origin/dataLayout/size and presentFrame descriptors reuse scratch objects with zero steady-state allocations', () => {
+  const device = createMockWebGpuDevice();
+  const presenter = new BinkVideoPresenter({
+    device,
+    doubleBuffer: false,
+    chromaOrder: BINK_CHROMA_ORDER.YVU,
+  });
+  const targetView = { kind: 'GPUTextureView', id: 'swap-w241-zero-alloc' };
+
+  const y4k = new Uint8Array(3840 * 2160);
+  const cr4k = new Uint8Array(1920 * 1080);
+  const cb4k = new Uint8Array(1920 * 1080);
+
+  // Run 4 consecutive 4K YUV420P frames (12 plane writeTexture calls + 1 dummy texture writeTexture).
+  const clearEncoders = [];
+  const clearResults = [];
+  for (let i = 0; i < 4; i += 1) {
+    presenter.uploadYuv420Frame({ y: y4k, u: cr4k, v: cb4k, width: 3840, height: 2160 });
+    const enc = createMockCommandEncoder();
+    const res = presenter.presentFrame(enc, targetView, 3840, 2160, {
+      clearColor: { r: 0.01 * i, g: 0.02, b: 0.03, a: 1 },
+    });
+    clearEncoders.push(enc);
+    clearResults.push(res);
+  }
+
+  // Also upload 4K NV12 and RGBA8 frames to confirm scratch descriptor reuse across all formats.
+  presenter.uploadNv12Frame({
+    y: y4k,
+    uv: new Uint8Array(3840 * 1080),
+    width: 3840,
+    height: 2160,
+  });
+  presenter.uploadRgbaFrame(new Uint8Array(64 * 32 * 4), 64, 32);
+
+  // Every single writeTexture call must reuse the exact same destination, origin, dataLayout, and size objects.
+  assert.ok(device.writeTextureCalls.length >= 16);
+  const firstCall = device.writeTextureCalls[0];
+  for (let i = 1; i < device.writeTextureCalls.length; i += 1) {
+    const call = device.writeTextureCalls[i];
+    assert.equal(call.rawDest, firstCall.rawDest, `writeTexture[${i}] must reuse destination scratch`);
+    assert.equal(call.rawOrigin, firstCall.rawOrigin, `writeTexture[${i}] must reuse origin scratch`);
+    assert.equal(
+      call.rawDataLayout,
+      firstCall.rawDataLayout,
+      `writeTexture[${i}] must reuse dataLayout scratch`
+    );
+    assert.equal(call.rawSize, firstCall.rawSize, `writeTexture[${i}] must reuse size scratch`);
+  }
+
+  // Verify the recorded snapshot values were still distinct and accurate per plane.
+  const yCall0 = device.writeTextureCalls[0];
+  const crCall0 = device.writeTextureCalls[1];
+  assert.equal(yCall0.size.width, 3840);
+  assert.equal(yCall0.size.height, 2160);
+  assert.equal(yCall0.dataLayout.bytesPerRow, 3840);
+  assert.equal(crCall0.size.width, 1920);
+  assert.equal(crCall0.size.height, 1080);
+  assert.equal(crCall0.dataLayout.bytesPerRow, 2048);
+
+  // Every clear-mode presentFrame() call reuses the exact same renderPassDescriptor, colorAttachments,
+  // colorAttachment, clearValue, result object, and viewport object.
+  const pass0Desc = clearEncoders[0].renderPasses[0].descriptor;
+  for (let i = 1; i < clearEncoders.length; i += 1) {
+    const passDesc = clearEncoders[i].renderPasses[0].descriptor;
+    assert.equal(passDesc, pass0Desc, `presentFrame[${i}] must reuse clear renderPassDescriptor`);
+    assert.equal(
+      passDesc.colorAttachments,
+      pass0Desc.colorAttachments,
+      `presentFrame[${i}] must reuse colorAttachments array`
+    );
+    assert.equal(
+      passDesc.colorAttachments[0],
+      pass0Desc.colorAttachments[0],
+      `presentFrame[${i}] must reuse colorAttachment scratch`
+    );
+    assert.equal(
+      passDesc.colorAttachments[0].clearValue,
+      pass0Desc.colorAttachments[0].clearValue,
+      `presentFrame[${i}] must reuse clearValue scratch`
+    );
+    assert.equal(clearResults[i], clearResults[0], `presentFrame[${i}] must reuse result scratch`);
+    assert.equal(
+      clearResults[i].viewport,
+      clearResults[0].viewport,
+      `presentFrame[${i}] must reuse viewport scratch`
+    );
+  }
+
+  // Load-mode presentFrame() reuses its own dedicated descriptor without clearValue key.
+  const loadEnc0 = createMockCommandEncoder();
+  const loadEnc1 = createMockCommandEncoder();
+  presenter.presentFrame(loadEnc0, targetView, 1920, 1080, { loadOp: BINK_LOAD_OP.LOAD });
+  presenter.presentFrame(loadEnc1, targetView, 1920, 1080, { loadOp: BINK_LOAD_OP.LOAD });
+  const loadDesc0 = loadEnc0.renderPasses[0].descriptor;
+  const loadDesc1 = loadEnc1.renderPasses[0].descriptor;
+  assert.equal(loadDesc1, loadDesc0);
+  assert.equal(loadDesc1.colorAttachments, loadDesc0.colorAttachments);
+  assert.equal(loadDesc1.colorAttachments[0], loadDesc0.colorAttachments[0]);
+  assert.equal('clearValue' in loadDesc0.colorAttachments[0], false);
+  assert.notEqual(loadDesc0, pass0Desc);
+
+  // Staging pool immediate-encoder uploads reuse layout scratch; deferred uploads keep distinct layouts.
+  const stagedLayouts = [];
+  const fakeStagingPool = {
+    stageTextureUpload(_encoder, _texture, _data, layout) {
+      stagedLayouts.push({ raw: layout, snapshot: { ...layout } });
+    },
+  };
+  const stagedPresenter = new BinkVideoPresenter({
+    device,
+    stagingPool: fakeStagingPool,
+    doubleBuffer: false,
+  });
+  const syncEnc = createMockCommandEncoder();
+  stagedPresenter.uploadYuv420Frame({
+    y: new Uint8Array(16 * 8),
+    u: new Uint8Array(8 * 4),
+    v: new Uint8Array(8 * 4),
+    width: 16,
+    height: 8,
+    commandEncoder: syncEnc,
+  });
+  assert.equal(stagedLayouts.length, 3);
+  assert.equal(stagedLayouts[1].raw, stagedLayouts[0].raw);
+  assert.equal(stagedLayouts[2].raw, stagedLayouts[0].raw);
+  assert.equal(stagedLayouts[0].snapshot.width, 16);
+  assert.equal(stagedLayouts[1].snapshot.width, 8);
+
+  // Deferred staging (no commandEncoder) keeps independent layouts until flushPendingUploads().
+  stagedLayouts.length = 0;
+  stagedPresenter.uploadYuv420Frame({
+    y: new Uint8Array(16 * 8),
+    u: new Uint8Array(8 * 4),
+    v: new Uint8Array(8 * 4),
+    width: 16,
+    height: 8,
+  });
+  stagedPresenter.flushPendingUploads(createMockCommandEncoder());
+  assert.equal(stagedLayouts.length, 3);
+  assert.notEqual(stagedLayouts[1].raw, stagedLayouts[0].raw);
+  assert.equal(stagedLayouts[0].snapshot.width, 16);
+  assert.equal(stagedLayouts[1].snapshot.width, 8);
+  assert.equal(stagedLayouts[2].snapshot.width, 8);
+
+  stagedPresenter.destroy();
+  presenter.destroy();
+});
+
+test('W241: resetStats() clears pacing and upload telemetry cleanly without invalidating cached 4K GPU resources', () => {
+  const device = createMockWebGpuDevice();
+  let clockMs = 500;
+  let uploadStepMs = 2.0;
+
+  const origWriteTexture = device.queue.writeTexture.bind(device.queue);
+  device.queue.writeTexture = (dest, data, dataLayout, size) => {
+    origWriteTexture(dest, data, dataLayout, size);
+    if (dest.texture && dest.texture.label !== 'playgta6-bink-presenter-dummy') {
+      clockMs += uploadStepMs;
+    }
+  };
+
+  const presenter = new BinkVideoPresenter({
+    device,
+    targetFps: 30,
+    doubleBuffer: false,
+    chromaOrder: BINK_CHROMA_ORDER.YVU,
+    now: () => clockMs,
+  });
+  const targetView = { kind: 'GPUTextureView', id: 'swap-w241-reset' };
+  const y = new Uint8Array(3840 * 2160);
+  const cr = new Uint8Array(1920 * 1080);
+  const cb = new Uint8Array(1920 * 1080);
+
+  // Present 2 frames and record 2 dropped frames.
+  presenter.uploadYuv420Frame({ y, u: cr, v: cb, width: 3840, height: 2160 });
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 3840, 2160);
+  clockMs += 30;
+  presenter.uploadYuv420Frame({ y, u: cr, v: cb, width: 3840, height: 2160 });
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 3840, 2160);
+  presenter.recordDroppedFrame(2);
+
+  const texCountBefore = device.createdTextures.length;
+  const viewCountBefore = device.createdViews.length;
+  const bgCountBefore = device.createdBindGroups.length;
+  const uniformWritesBefore = device.writeBufferCalls.length;
+
+  assert.equal(presenter.getPacingStats().presentedFrames, 2);
+  assert.equal(presenter.getPacingStats().droppedFrames, 2);
+  assert.ok(presenter.getPacingStats().avgUploadMs > 0);
+  assert.ok(presenter.getPacingStats().maxUploadMs > 0);
+  assert.ok(presenter.getPacingStats().lastFrameIntervalMs > 0);
+
+  // Reset telemetry counters & timing accumulators.
+  presenter.resetStats();
+
+  const pacingAfterReset = presenter.getPacingStats();
+  assert.deepEqual(pacingAfterReset, {
+    targetFps: 30,
+    targetFrameIntervalMs: 1000 / 30,
+    presentedFrames: 0,
+    droppedFrames: 0,
+    dropRate: 0,
+    uploadSamples: 0,
+    avgUploadMs: 0,
+    maxUploadMs: 0,
+    lastUploadMs: 0,
+    lastFrameIntervalMs: 0,
+  });
+
+  const statsAfterReset = presenter.getStats();
+  assert.equal(statsAfterReset.uploadedFrames, 0);
+  assert.equal(statsAfterReset.presentedFrames, 0);
+  assert.equal(statsAfterReset.droppedFrames, 0);
+  assert.equal(statsAfterReset.bytesUploaded, 0);
+  assert.equal(statsAfterReset.bindGroupCacheHits, 0);
+  assert.equal(statsAfterReset.bindGroupCacheMisses, 0);
+  assert.equal(statsAfterReset.uniformWritesSkipped, 0);
+  assert.equal(statsAfterReset.resizeCount, 0);
+  assert.equal(statsAfterReset.planeReallocations, 0);
+  assert.equal(statsAfterReset.scratchAllocations, 0);
+  // Configuration and cached GPU state remain intact.
+  assert.equal(statsAfterReset.targetFps, 30);
+  assert.equal(statsAfterReset.chromaOrder, 'yvu');
+  assert.equal(statsAfterReset.frameWidth, 3840);
+  assert.equal(statsAfterReset.frameHeight, 2160);
+  assert.equal(statsAfterReset.hasFrame, true);
+  assert.equal(statsAfterReset.pipelineReady, true);
+
+  // Subsequent 4K frames reuse all GPU resources with 0 allocations and track fresh pacing metrics.
+  clockMs = 2000;
+  uploadStepMs = 1.0; // 3 planes = 3.0ms
+  presenter.uploadYuv420Frame({ y, u: cr, v: cb, width: 3840, height: 2160 });
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 3840, 2160);
+
+  assert.equal(device.createdTextures.length, texCountBefore);
+  assert.equal(device.createdViews.length, viewCountBefore);
+  assert.equal(device.createdBindGroups.length, bgCountBefore);
+  assert.equal(device.writeBufferCalls.length, uniformWritesBefore);
+  assert.equal(presenter.getPacingStats().presentedFrames, 1);
+  assert.equal(presenter.getPacingStats().lastFrameIntervalMs, 0); // fresh baseline after resetStats()
+  assertNear(presenter.getPacingStats().avgUploadMs, 3.0, 1e-6);
+  assertNear(presenter.getPacingStats().maxUploadMs, 3.0, 1e-6);
+  assert.equal(presenter.getStats().bindGroupCacheHits, 1);
+  assert.equal(presenter.getStats().uniformWritesSkipped, 1);
+
+  clockMs = 2035.0; // upload takes 3.0ms -> present at 2038.0 vs previous 2003.0 -> 35.0ms interval
+  presenter.uploadYuv420Frame({ y, u: cr, v: cb, width: 3840, height: 2160 });
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 3840, 2160);
+  assert.equal(presenter.getPacingStats().presentedFrames, 2);
+  assertNear(presenter.getPacingStats().lastFrameIntervalMs, 35.0, 1e-6);
+
+  presenter.destroy();
+  assert.throws(() => presenter.resetStats(), /destroyed/i);
 });
