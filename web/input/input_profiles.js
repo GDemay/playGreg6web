@@ -1,11 +1,62 @@
 // Input profile management, stick response curves, key remapping, and JSON/storage
 // persistence designed to integrate directly with InputBridge (web/input/input_bridge.js).
 
-import {
-  INPUT_BUTTONS,
-  DEFAULT_KEY_BINDINGS,
-  applyDeadzone,
-} from './input_bridge.js';
+// Button bitmasks matching runtime/os/game_input.h (bits 0..5 & 8..15) plus
+// non-overlapping Xbox GameInput extensions (bits 16..22).
+export const INPUT_BUTTONS = Object.freeze({
+  // Movement & legacy keyboard bits 0..5 (runtime/os/game_input.h)
+  MOVE_FORWARD: 1 << 0,   // kMoveForward  (KeyW)
+  MOVE_BACKWARD: 1 << 1,  // kMoveBackward (KeyS)
+  MOVE_LEFT: 1 << 2,      // kMoveLeft     (KeyA)
+  MOVE_RIGHT: 1 << 3,     // kMoveRight    (KeyD)
+  JUMP: 1 << 4,           // kJump         (Space)
+  SPRINT: 1 << 5,         // kSprint       (ShiftLeft)
+
+  // Xbox GameInput buttons bits 8..15 (runtime/os/game_input.h)
+  A: 1 << 8,              // kGamepadA
+  B: 1 << 9,              // kGamepadB
+  X: 1 << 10,             // kGamepadX
+  Y: 1 << 11,             // kGamepadY
+  LB: 1 << 12,            // kLeftBumper
+  RB: 1 << 13,            // kRightBumper
+  MENU: 1 << 14,          // kMenu (Start)
+  VIEW: 1 << 15,          // kView (Back / Select)
+
+  // Extended Xbox GameInput buttons bits 16..22
+  LS: 1 << 16,            // Left Stick press (L3)
+  RS: 1 << 17,            // Right Stick press (R3)
+  DPAD_UP: 1 << 18,       // D-Pad Up
+  DPAD_DOWN: 1 << 19,     // D-Pad Down
+  DPAD_LEFT: 1 << 20,     // D-Pad Left
+  DPAD_RIGHT: 1 << 21,    // D-Pad Right
+  GUIDE: 1 << 22,         // Xbox Guide / Home button
+});
+
+export const DEFAULT_KEY_BINDINGS = Object.freeze({
+  KeyW: INPUT_BUTTONS.MOVE_FORWARD,
+  KeyS: INPUT_BUTTONS.MOVE_BACKWARD,
+  KeyA: INPUT_BUTTONS.MOVE_LEFT,
+  KeyD: INPUT_BUTTONS.MOVE_RIGHT,
+  Space: INPUT_BUTTONS.JUMP | INPUT_BUTTONS.A,
+  Enter: INPUT_BUTTONS.A,
+  NumpadEnter: INPUT_BUTTONS.A,
+  ShiftLeft: INPUT_BUTTONS.SPRINT | INPUT_BUTTONS.LS,
+  ShiftRight: INPUT_BUTTONS.SPRINT | INPUT_BUTTONS.LS,
+  ControlLeft: INPUT_BUTTONS.B,
+  ControlRight: INPUT_BUTTONS.B,
+  Backspace: INPUT_BUTTONS.B,
+  KeyC: INPUT_BUTTONS.RS,
+  KeyR: INPUT_BUTTONS.X,
+  KeyF: INPUT_BUTTONS.Y,
+  KeyQ: INPUT_BUTTONS.LB,
+  KeyE: INPUT_BUTTONS.RB,
+  Tab: INPUT_BUTTONS.VIEW,
+  Escape: INPUT_BUTTONS.B | INPUT_BUTTONS.MENU,
+  ArrowUp: INPUT_BUTTONS.DPAD_UP,
+  ArrowDown: INPUT_BUTTONS.DPAD_DOWN,
+  ArrowLeft: INPUT_BUTTONS.DPAD_LEFT,
+  ArrowRight: INPUT_BUTTONS.DPAD_RIGHT,
+});
 
 export const RESPONSE_CURVES = Object.freeze({
   LINEAR: 'linear',
@@ -610,86 +661,138 @@ export function applyResponseCurve(value, curve = RESPONSE_CURVES.LINEAR, expone
   return normalizeZero(clamp(sign * curved, -1, 1));
 }
 
-function applyRadialStickCurve(x, y, curve, exponent) {
-  const mag = Math.hypot(x, y);
-  if (mag <= 0 || !Number.isFinite(mag)) {
-    return { x: 0, y: 0 };
-  }
-  const clampedMag = Math.min(mag, 1);
-  const curvedMag = applyResponseCurve(clampedMag, curve, exponent);
-  const scale = curvedMag / mag;
-  return {
-    x: normalizeZero(clamp(x * scale, -1, 1)),
-    y: normalizeZero(clamp(y * scale, -1, 1)),
-  };
-}
-
 /**
- * Applies a circular (radial) stick deadzone followed by a symmetric radial
- * response curve ('linear' | 'cubic' | 'expo'), matching InputBridge's
- * outer deadzone normalization and clamping outputs cleanly onto the unit disk.
+ * Applies a circular (radial) stick deadzone with smooth radial rescaling from
+ * `[innerDeadzone, outerDeadzone]` into `[0, 1]`, clamping non-finite inputs to `0`
+ * and outputs cleanly onto the unit disk.
+ *
+ * Supports both signatures:
+ * - `applyRadialDeadzone(x, y, innerDeadzone = 0.15, outerDeadzone = 0.98, out = null)`
+ * - `applyRadialDeadzone(x, y, deadzone = 0.15, curve = 'linear', exponentOrOptions)`
  */
 export function applyRadialDeadzone(
   x,
   y,
-  deadzone = 0.15,
-  curve = RESPONSE_CURVES.LINEAR,
-  exponentOrOptions
+  innerDeadzone = 0.15,
+  outerDeadzoneOrCurve = 0.98,
+  exponentOrOptionsOrOut
 ) {
-  if (!VALID_CURVES.has(curve)) {
-    throw new RangeError(`Unknown response curve: ${String(curve)}`);
+  let curve = RESPONSE_CURVES.LINEAR;
+  let outer = 0.98;
+  let exponent;
+  let target = null;
+
+  if (typeof outerDeadzoneOrCurve === 'number') {
+    outer = Number.isFinite(outerDeadzoneOrCurve) ? outerDeadzoneOrCurve : 0.98;
+    if (typeof exponentOrOptionsOrOut === 'string') {
+      if (!VALID_CURVES.has(exponentOrOptionsOrOut)) {
+        throw new RangeError(`Unknown response curve: ${String(exponentOrOptionsOrOut)}`);
+      }
+      curve = exponentOrOptionsOrOut;
+    } else if (
+      exponentOrOptionsOrOut !== null &&
+      typeof exponentOrOptionsOrOut === 'object' &&
+      !Array.isArray(exponentOrOptionsOrOut)
+    ) {
+      if ('x' in exponentOrOptionsOrOut && 'y' in exponentOrOptionsOrOut) {
+        target = exponentOrOptionsOrOut;
+      } else {
+        if (exponentOrOptionsOrOut.curve !== undefined) {
+          if (!VALID_CURVES.has(exponentOrOptionsOrOut.curve)) {
+            throw new RangeError(
+              `Unknown response curve: ${String(exponentOrOptionsOrOut.curve)}`
+            );
+          }
+          curve = exponentOrOptionsOrOut.curve;
+        }
+        exponent = exponentOrOptionsOrOut.exponent;
+        if (
+          exponentOrOptionsOrOut.out !== null &&
+          typeof exponentOrOptionsOrOut.out === 'object'
+        ) {
+          target = exponentOrOptionsOrOut.out;
+        }
+      }
+    }
+  } else if (outerDeadzoneOrCurve !== undefined) {
+    if (!VALID_CURVES.has(outerDeadzoneOrCurve)) {
+      throw new RangeError(`Unknown response curve: ${String(outerDeadzoneOrCurve)}`);
+    }
+    curve = outerDeadzoneOrCurve;
+    if (typeof exponentOrOptionsOrOut === 'number') {
+      exponent = exponentOrOptionsOrOut;
+    } else if (isPlainObject(exponentOrOptionsOrOut)) {
+      exponent = exponentOrOptionsOrOut.exponent;
+      if (
+        typeof exponentOrOptionsOrOut.outerDeadzone === 'number' &&
+        Number.isFinite(exponentOrOptionsOrOut.outerDeadzone)
+      ) {
+        outer = exponentOrOptionsOrOut.outerDeadzone;
+      }
+      if (
+        exponentOrOptionsOrOut.out !== null &&
+        typeof exponentOrOptionsOrOut.out === 'object'
+      ) {
+        target = exponentOrOptionsOrOut.out;
+      }
+    }
   }
+
+  const out = target || { x: 0, y: 0 };
+
   if (
     typeof x !== 'number' ||
     !Number.isFinite(x) ||
     typeof y !== 'number' ||
     !Number.isFinite(y)
   ) {
-    return { x: 0, y: 0 };
+    out.x = 0;
+    out.y = 0;
+    return out;
   }
 
   const inner = clamp(
-    typeof deadzone === 'number' && Number.isFinite(deadzone) ? deadzone : 0.15,
+    typeof innerDeadzone === 'number' && Number.isFinite(innerDeadzone) ? innerDeadzone : 0.15,
     PROFILE_LIMITS.MIN_DEADZONE,
     PROFILE_LIMITS.MAX_DEADZONE
   );
-
-  let exponent;
-  let outer = 0.98;
-  if (typeof exponentOrOptions === 'number') {
-    exponent = exponentOrOptions;
-  } else if (isPlainObject(exponentOrOptions)) {
-    exponent = exponentOrOptions.exponent;
-    if (
-      typeof exponentOrOptions.outerDeadzone === 'number' &&
-      Number.isFinite(exponentOrOptions.outerDeadzone)
-    ) {
-      outer = exponentOrOptions.outerDeadzone;
-    }
-  }
   outer = clamp(outer, inner + 1e-4, 1);
 
   const mag = Math.hypot(x, y);
   if (!Number.isFinite(mag)) {
     const maxAbs = Math.max(Math.abs(x), Math.abs(y));
-    if (maxAbs <= 0) return { x: 0, y: 0 };
+    if (maxAbs <= 0) {
+      out.x = 0;
+      out.y = 0;
+      return out;
+    }
     const sx = x / maxAbs;
     const sy = y / maxAbs;
     const smag = Math.hypot(sx, sy);
-    const curvedMag = applyResponseCurve(1, curve, exponent);
+    const curvedMag =
+      curve === RESPONSE_CURVES.LINEAR ? 1 : applyResponseCurve(1, curve, exponent);
     const scale = curvedMag / smag;
-    return {
-      x: normalizeZero(clamp(sx * scale, -1, 1)),
-      y: normalizeZero(clamp(sy * scale, -1, 1)),
-    };
+    out.x = normalizeZero(clamp(sx * scale, -1, 1));
+    out.y = normalizeZero(clamp(sy * scale, -1, 1));
+    return out;
   }
 
-  const norm = applyDeadzone(x, y, inner, outer);
-  if (norm.x === 0 && norm.y === 0) {
-    return { x: 0, y: 0 };
+  if (mag <= inner || mag <= 0) {
+    out.x = 0;
+    out.y = 0;
+    return out;
   }
 
-  return applyRadialStickCurve(norm.x, norm.y, curve, exponent);
+  const clampedMag = Math.min(mag, outer);
+  const normalizedMag = clamp((clampedMag - inner) / (outer - inner), 0, 1);
+  const finalMag =
+    curve === RESPONSE_CURVES.LINEAR
+      ? normalizedMag
+      : applyResponseCurve(normalizedMag, curve, exponent);
+  const scale = finalMag / mag;
+  out.x = normalizeZero(clamp(x * scale, -1, 1));
+  out.y = normalizeZero(clamp(y * scale, -1, 1));
+  return out;
 }
 
 const LEFTY_KB_BINDINGS = {
