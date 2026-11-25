@@ -422,8 +422,9 @@ pub struct Rdna2ProgramSummary {
     pub fnv1a_hash: u64,
     pub byte_len: usize,
     /// Byte offset of the first decoded instruction (`0x24` when the 36-byte Xbox Series
-    /// microcode preamble was detected and skipped, otherwise `0`). The hash always covers
-    /// the full blob including the preamble.
+    /// microcode preamble was detected and skipped, `0x18` when the 24-byte two-record
+    /// preamble was detected and skipped, otherwise `0`). The hash always covers the full
+    /// blob including the preamble.
     pub code_start_offset: usize,
     pub trailing_bytes: usize,
     pub instruction_count: usize,
@@ -2772,37 +2773,87 @@ fn decode_ds(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
     }
 }
 
-/// Size in bytes of the Xbox Series (Scarlett / RDNA2) shader microcode preamble.
+/// Size in bytes of the standard 3-record Xbox Series (Scarlett / RDNA2) shader microcode preamble.
 pub const XBOX_SHADER_PREAMBLE_LEN: usize = 0x24;
 
-/// Fixed trailing dwords of the Xbox Series shader preamble at byte offsets `0x18..0x24`.
+/// Size in bytes of the short 2-record Xbox Series (Scarlett / RDNA2) shader microcode preamble.
+pub const XBOX_SHADER_SHORT_PREAMBLE_LEN: usize = 0x18;
+
+/// Size in bytes of one Xbox Series shader preamble metadata carrier record (3 dwords).
+const XBOX_PREAMBLE_RECORD_LEN: usize = 0x0c;
+
+/// Fixed bits of word 0 in each 12-byte Xbox preamble metadata record:
+/// VOP3 encoding (`0b110101` in `[31:26]`) with opcode `0x180` (`v_nop` in `[25:16]`).
+/// The low 16 bits carry embedded metadata payload.
+const XBOX_PREAMBLE_RECORD_W0_MASK: u32 = 0xFFFF_0000;
+const XBOX_PREAMBLE_RECORD_W0_VAL: u32 = 0xd580_0000;
+
+/// Fixed bits of word 1 in each 12-byte Xbox preamble metadata record:
+/// `neg = 0` (`[31:29]`), `omod = 0` (`[28:27]`), `src2 = 0xFF` literal (`[26:18]`),
+/// `src1[8] = 1` VGPR select (bit 17), and `src0[8] = 1` VGPR select (bit 8).
+/// The remaining 16 bits (`[16:9]` and `[7:0]`) carry embedded metadata payload.
+const XBOX_PREAMBLE_RECORD_W1_MASK: u32 = 0xFFFE_0100;
+const XBOX_PREAMBLE_RECORD_W1_VAL: u32 = 0x03fe_0100;
+
+/// Fixed trailing dwords of the 36-byte Xbox Series shader preamble at byte offsets `0x18..0x24`.
 const XBOX_SHADER_PREAMBLE_TAIL: [u32; 3] = [0xd580_0000, 0x03fe_0100, 0x0000_0ac0];
 
 /// `s_inst_prefetch 0x3`: the first real instruction following the Xbox preamble.
 const XBOX_SHADER_ENTRY_INST: u32 = 0xbfa0_0003;
 
+/// Whether `bytes[offset..offset + 12]` matches one 3-dword Xbox Scarlett `v_nop_e64`
+/// preamble metadata carrier record.
+fn is_xbox_preamble_record(bytes: &[u8], offset: usize) -> bool {
+    let Some(end) = offset.checked_add(XBOX_PREAMBLE_RECORD_LEN) else {
+        return false;
+    };
+    if end > bytes.len() {
+        return false;
+    }
+    let Some(w0) = read_u32_le(bytes, offset) else {
+        return false;
+    };
+    let Some(w1) = read_u32_le(bytes, offset + 4) else {
+        return false;
+    };
+    (w0 & XBOX_PREAMBLE_RECORD_W0_MASK) == XBOX_PREAMBLE_RECORD_W0_VAL
+        && (w1 & XBOX_PREAMBLE_RECORD_W1_MASK) == XBOX_PREAMBLE_RECORD_W1_VAL
+}
+
 /// Byte offset at which the machine code of `bytes` starts.
 ///
-/// Native Xbox Series shader blobs begin with a 36-byte header (`0x00..0x24`) whose last
-/// three dwords are always `[0xd5800000, 0x03fe0100, 0x00000ac0]`, followed by the real
-/// entry point `s_inst_prefetch 0x3` (`0xbfa00003`) at `0x24`. Decoding that header as
-/// instructions would emit a bogus `v_cndmask_b32 v0, 64, v5, vcc` (clobbering the vertex
-/// index and fabricating a `v5` vertex input), so it is skipped when the exact signature
-/// matches. Returns `0` for every other input (bare synthetic programs are unchanged).
+/// Native Xbox Series shader blobs begin with either:
+/// * A 36-byte (`0x24`) 3-record header whose last three dwords at `0x18..0x24` are always
+///   `[0xd5800000, 0x03fe0100, 0x00000ac0]`, followed by `s_inst_prefetch 0x3` (`0xbfa00003`)
+///   at `0x24`.
+/// * A 24-byte (`0x18`) 2-record header consisting of two 12-byte `v_nop_e64` metadata carrier
+///   records (`(w0 & 0xffff0000) == 0xd5800000`, `(w1 & 0xfffe0100) == 0x03fe0100`, arbitrary
+///   32-bit literal `w2`) at `0x00..0x0c` and `0x0c..0x18`, followed directly by
+///   `s_inst_prefetch 0x3` (`0xbfa00003`) at `0x18`.
+///
+/// Decoding either header as instructions would misdecode metadata payload words as bogus
+/// instructions (clobbering registers or fabricating inputs), so it is skipped when the exact
+/// signature matches. Returns `0` for every other input (bare synthetic programs are unchanged).
 pub fn rdna2_code_start_offset(bytes: &[u8]) -> usize {
-    if bytes.len() < XBOX_SHADER_PREAMBLE_LEN + 4 {
-        return 0;
+    if bytes.len() >= XBOX_SHADER_PREAMBLE_LEN + 4 {
+        let tail_matches = XBOX_SHADER_PREAMBLE_TAIL
+            .iter()
+            .enumerate()
+            .all(|(i, &word)| read_u32_le(bytes, 0x18 + i * 4) == Some(word));
+        if tail_matches
+            && read_u32_le(bytes, XBOX_SHADER_PREAMBLE_LEN) == Some(XBOX_SHADER_ENTRY_INST)
+        {
+            return XBOX_SHADER_PREAMBLE_LEN;
+        }
     }
-    let tail_matches = XBOX_SHADER_PREAMBLE_TAIL
-        .iter()
-        .enumerate()
-        .all(|(i, &word)| read_u32_le(bytes, 0x18 + i * 4) == Some(word));
-    if tail_matches && read_u32_le(bytes, XBOX_SHADER_PREAMBLE_LEN) == Some(XBOX_SHADER_ENTRY_INST)
+    if bytes.len() >= XBOX_SHADER_SHORT_PREAMBLE_LEN + 4
+        && is_xbox_preamble_record(bytes, 0)
+        && is_xbox_preamble_record(bytes, XBOX_PREAMBLE_RECORD_LEN)
+        && read_u32_le(bytes, XBOX_SHADER_SHORT_PREAMBLE_LEN) == Some(XBOX_SHADER_ENTRY_INST)
     {
-        XBOX_SHADER_PREAMBLE_LEN
-    } else {
-        0
+        return XBOX_SHADER_SHORT_PREAMBLE_LEN;
     }
+    0
 }
 
 /// Decode all RDNA2 instructions in `bytes` up to `max_instructions` (or the entire buffer).
@@ -4638,6 +4689,142 @@ mod tests {
                 .to_json()
                 .contains("\"code_start_offset\": 0,")
         );
+    }
+
+    /// Synthetic 24-byte (2-record) Xbox Series preamble with non-zero payload bits in
+    /// both `v_nop_e64` metadata carrier records.
+    fn xbox_short_preamble_words() -> Vec<u32> {
+        vec![
+            0xd580_1234, // record 0 w0: fixed 0xd580_0000 | payload 0x1234
+            0x03ff_57a9, // record 0 w1: fixed 0x03fe_0100 | payload in bits [16:9] & [7:0]
+            0xCAFE_BABE, // record 0 w2: arbitrary 32-bit literal payload
+            0xd580_ABCD, // record 1 w0: fixed 0xd580_0000 | payload 0xABCD
+            0x03fe_0142, // record 1 w1: fixed 0x03fe_0100 | payload in bits [16:9] & [7:0]
+            0x0000_0ac0, // record 1 w2: payload that would decode as v_cndmask_b32 if not skipped
+        ]
+    }
+
+    #[test]
+    fn detects_and_skips_xbox_24byte_preamble_and_hashes_full_blob() {
+        let mut words = xbox_short_preamble_words();
+        words.push(0xbfa0_0003); // s_inst_prefetch 0x3 at 0x18
+        words.push(0xBF81_0000); // s_endpgm at 0x1c
+        let bytes = words_to_bytes(&words);
+
+        assert_eq!(
+            rdna2_code_start_offset(&bytes),
+            XBOX_SHADER_SHORT_PREAMBLE_LEN
+        );
+        let insts = decode_program(&bytes);
+        assert_eq!(insts.len(), 2);
+        assert_eq!(insts[0].offset, 0x18);
+        assert_eq!(insts[0].mnemonic, "s_inst_prefetch");
+        assert_eq!(insts[1].offset, 0x1c);
+        assert_eq!(insts[1].mnemonic, "s_endpgm");
+
+        let summary = analyze_program(&bytes);
+        assert_eq!(summary.fnv1a_hash, fnv1a_64(&bytes));
+        assert_ne!(
+            summary.fnv1a_hash,
+            fnv1a_64(&bytes[XBOX_SHADER_SHORT_PREAMBLE_LEN..])
+        );
+        assert_eq!(summary.byte_len, bytes.len());
+        assert_eq!(summary.code_start_offset, 0x18);
+        assert_eq!(summary.unknown_instructions, 0);
+        assert_eq!(
+            summary.max_vgpr, None,
+            "24-byte preamble must not fabricate VGPR usage"
+        );
+        assert_eq!(
+            summary.max_sgpr, None,
+            "24-byte preamble must not fabricate SGPR usage"
+        );
+        assert!(format_disasm(&bytes, None).contains("; code start:   0x0018"));
+        assert!(summary.to_json().contains("\"code_start_offset\": 24,"));
+
+        // Flipping every non-fixed payload bit across both records still matches 0x18.
+        let mut toggled = words.clone();
+        toggled[0] ^= !XBOX_PREAMBLE_RECORD_W0_MASK;
+        toggled[1] ^= !XBOX_PREAMBLE_RECORD_W1_MASK;
+        toggled[2] ^= 0xFFFF_FFFF;
+        toggled[3] ^= !XBOX_PREAMBLE_RECORD_W0_MASK;
+        toggled[4] ^= !XBOX_PREAMBLE_RECORD_W1_MASK;
+        toggled[5] ^= 0xFFFF_FFFF;
+        assert_eq!(
+            rdna2_code_start_offset(&words_to_bytes(&toggled)),
+            XBOX_SHADER_SHORT_PREAMBLE_LEN
+        );
+
+        // Real 36-byte preamble whose first two records also match the 12-byte record
+        // shape must still resolve to 0x24 (not 0x18).
+        let mut full36 = xbox_short_preamble_words();
+        full36.extend_from_slice(&XBOX_SHADER_PREAMBLE_TAIL);
+        full36.push(0xbfa0_0003);
+        full36.push(0xBF81_0000);
+        assert_eq!(
+            rdna2_code_start_offset(&words_to_bytes(&full36)),
+            XBOX_SHADER_PREAMBLE_LEN
+        );
+    }
+
+    #[test]
+    fn near_miss_24byte_preambles_decode_from_offset_zero() {
+        let mut good = xbox_short_preamble_words();
+        good.push(0xbfa0_0003);
+        good.push(0xBF81_0000);
+
+        // Mutating any fixed bit in record 0 (w0/w1), record 1 (w3/w4), or the entry word
+        // at 0x18 (w6) must disable skipping.
+        let fixed_mutations: [(usize, u32); 13] = [
+            (0, 0x0001_0000), // w0 low fixed bit
+            (0, 0x8000_0000), // w0 top fixed bit
+            (1, 0x0000_0100), // w1 src0[8] VGPR bit
+            (1, 0x0002_0000), // w1 src1[8] VGPR bit
+            (1, 0x0004_0000), // w1 src2 literal bit
+            (1, 0x8000_0000), // w1 neg bit
+            (3, 0x0001_0000), // w3 low fixed bit
+            (3, 0x4000_0000), // w3 prefix bit
+            (4, 0x0000_0100), // w4 src0[8] VGPR bit
+            (4, 0x0002_0000), // w4 src1[8] VGPR bit
+            (4, 0x0200_0000), // w4 src2 literal bit
+            (4, 0x0800_0000), // w4 omod bit
+            (6, 0x0000_0001), // entry inst s_inst_prefetch imm
+        ];
+        for (idx, mask) in fixed_mutations {
+            let mut words = good.clone();
+            words[idx] ^= mask;
+            let bytes = words_to_bytes(&words);
+            assert_eq!(
+                rdna2_code_start_offset(&bytes),
+                0,
+                "dword {idx} fixed bit {mask:#010x} mutated"
+            );
+            let insts = decode_program(&bytes);
+            assert_eq!(insts[0].offset, 0);
+            assert_eq!(analyze_program(&bytes).code_start_offset, 0);
+        }
+
+        // Exact length boundary: 27 bytes (truncated entry word) returns 0; 28 bytes returns 0x18.
+        let full = words_to_bytes(&good);
+        assert_eq!(rdna2_code_start_offset(&full[..27]), 0);
+        assert_eq!(rdna2_code_start_offset(&full[..28]), 0x18);
+
+        // Single 12-byte record followed by s_inst_prefetch 0x3 must NOT be skipped.
+        let one_record = words_to_bytes(&[0xd580_1234, 0x03fe_0100, 0x1122_3344, 0xbfa0_0003, 0xBF81_0000]);
+        assert_eq!(rdna2_code_start_offset(&one_record), 0);
+
+        // Two arbitrary non-carrier dwords before s_inst_prefetch 0x3 must NOT be skipped.
+        let non_carrier = words_to_bytes(&[
+            0x0000_0001,
+            0x0000_0018,
+            0x1234_5678,
+            0x0000_0000,
+            0xCAFE_F00D,
+            0x0000_0100,
+            0xbfa0_0003,
+            0xBF81_0000,
+        ]);
+        assert_eq!(rdna2_code_start_offset(&non_carrier), 0);
     }
 
     #[allow(clippy::too_many_arguments)]
