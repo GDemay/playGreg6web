@@ -1,5 +1,6 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -11,6 +12,7 @@ import {
   DEFAULT_SAMPLE_COUNT,
   INCOMPLETE_DOWNLOAD_SUFFIXES,
   MANIFEST_ABI_VERSION,
+  MISMATCH_CATEGORIES,
   computeStreamingReadiness,
   hasIncompleteSuffix,
   parseContentRange,
@@ -941,5 +943,405 @@ describe('verifyLiveEndpoints against live ephemeral server/serve_local.py', () 
     assert.equal(report.failed, 1);
     assert.ok(report.results[0].errors.some((e) => /Content-Length \(16384\)/.test(e)));
     assert.ok(report.results[0].errors.some((e) => /Content-Range total \(16384\)/.test(e)));
+    assert.equal(report.mismatchesByCategory.size_mismatch, 1);
+    assert.equal(report.mismatchCount, 1);
+  });
+});
+
+function sha256Hex(bytes) {
+  return crypto.createHash('sha256').update(bytes).digest('hex');
+}
+
+describe('verification telemetry, mismatch categories, AbortSignal, and sanitization (W155)', () => {
+  it('exports canonical MISMATCH_CATEGORIES constants', () => {
+    assert.deepEqual(MISMATCH_CATEGORIES, {
+      MISSING: 'missing',
+      SIZE_MISMATCH: 'size_mismatch',
+      HASH_MISMATCH: 'hash_mismatch',
+    });
+    assert.equal(Object.isFrozen(MISMATCH_CATEGORIES), true);
+  });
+
+  it('produces deterministic timing and mismatch telemetry for sync routines via injectable nowFn', () => {
+    let clock = 1000;
+    const stepClock = () => {
+      clock += 25;
+      return clock;
+    };
+
+    const manifest = {
+      abi_version: 1,
+      file_count: 2,
+      total_bytes: 999, // intentional aggregate size mismatch vs 300
+      files: [
+        { path: 'a.bin', size: 100 },
+        { path: 'b.bin', size: 200 },
+      ],
+    };
+
+    const manifestRes = validateDataManifest(manifest, { nowFn: stepClock });
+    assert.equal(manifestRes.ok, false);
+    assert.equal(manifestRes.aborted, false);
+    assert.equal(manifestRes.elapsedMs, 25);
+    assert.equal(manifestRes.filesVerified, 2);
+    assert.equal(manifestRes.bytesVerified, 300);
+    assert.equal(manifestRes.mismatchCount, 1);
+    assert.deepEqual(manifestRes.mismatchesByCategory, {
+      missing: 0,
+      size_mismatch: 1,
+      hash_mismatch: 0,
+    });
+    assert.equal(manifestRes.telemetry.elapsedMs, 25);
+    assert.equal(manifestRes.telemetry.bytesVerified, 300);
+    assert.equal(manifestRes.telemetry.filesVerified, 2);
+    assert.equal(manifestRes.telemetry.bytesPerSecond, 12000);
+    assert.equal(manifestRes.telemetry.aborted, false);
+
+    // Backwards-jumping clock must clamp elapsedMs to 0 and bytesPerSecond to 0.
+    const ticks = [500, 400];
+    let idx = 0;
+    const backwardsRes = validateDataManifest(makeValidManifest(), {
+      nowFn: () => ticks[Math.min(idx++, ticks.length - 1)],
+    });
+    assert.equal(backwardsRes.elapsedMs, 0);
+    assert.equal(backwardsRes.telemetry.bytesPerSecond, 0);
+
+    // validateBootset records missing + size_mismatch categories and deterministic timing.
+    let bootClock = 100;
+    const bootRes = validateBootset(
+      [
+        { path: 'MicrosoftGame.Config', offset: 0, length: 576 },
+        { path: 'x64/missing.rpf', offset: 0, length: 64 },
+        { path: 'MicrosoftGame.Config', offset: 0, length: 1024 }, // exceeds 576
+      ],
+      makeValidManifest(),
+      {
+        nowFn: () => {
+          bootClock += 10;
+          return bootClock;
+        },
+      },
+    );
+    assert.equal(bootRes.ok, false);
+    assert.equal(bootRes.aborted, false);
+    assert.equal(bootRes.filesVerified, 1);
+    assert.equal(bootRes.bytesVerified, 576);
+    assert.equal(bootRes.mismatchCount, 2);
+    assert.deepEqual(bootRes.mismatchesByCategory, {
+      missing: 1,
+      size_mismatch: 1,
+      hash_mismatch: 0,
+    });
+    assert.ok(bootRes.elapsedMs >= 10);
+
+    // computeStreamingReadiness aggregates mismatches and timing across manifest + bootset.
+    let readyClock = 0;
+    const readiness = computeStreamingReadiness(
+      manifest,
+      [{ path: 'missing.bin', offset: 0, length: 16 }],
+      {
+        nowFn: () => {
+          readyClock += 5;
+          return readyClock;
+        },
+      },
+    );
+    assert.equal(readiness.aborted, false);
+    assert.equal(readiness.mismatchCount, 2);
+    assert.deepEqual(readiness.mismatchesByCategory, {
+      missing: 1,
+      size_mismatch: 1,
+      hash_mismatch: 0,
+    });
+    assert.equal(readiness.filesVerified, 2);
+    assert.equal(readiness.bytesVerified, 300);
+    assert.ok(readiness.elapsedMs > 0);
+  });
+
+  it('tracks live verification timing, throughput, and all mismatch categories (missing, size_mismatch, hash_mismatch)', async () => {
+    const okBytes = new Uint8Array(64).fill(0x41);
+    const badSizeBytes = new Uint8Array(32).fill(0x42);
+    const badHashBytes = new Uint8Array(48).fill(0x43);
+    const etagDriftBytes = new Uint8Array(24).fill(0x44);
+
+    const manifest = makeValidManifest({
+      files: [
+        { path: 'ok.bin', size: okBytes.byteLength, sha256: sha256Hex(okBytes), etag: '"ok-1"' },
+        { path: 'missing.bin', size: 128, etag: '"miss-1"' },
+        { path: 'size_drift.bin', size: 100, etag: '"size-1"' },
+        {
+          path: 'hash_drift.bin',
+          size: badHashBytes.byteLength,
+          sha256: '0'.repeat(64),
+          etag: '"hash-1"',
+        },
+        { path: 'etag_drift.bin', size: etagDriftBytes.byteLength, etag: '"expected-etag"' },
+      ],
+    });
+
+    const backing = new Map([
+      ['ok.bin', { bytes: okBytes, etag: '"ok-1"' }],
+      // missing.bin omitted -> 404
+      ['size_drift.bin', { bytes: badSizeBytes, etag: '"size-1"' }],
+      ['hash_drift.bin', { bytes: badHashBytes, etag: '"hash-1"' }],
+      ['etag_drift.bin', { bytes: etagDriftBytes, etag: '"server-etag-other"' }],
+    ]);
+
+    let nowMs = 5000;
+    const { fetchImpl } = createMockDataFetch(backing, {
+      onRequest: async () => {
+        nowMs += 20;
+        return null;
+      },
+    });
+
+    const report = await verifyLiveEndpoints({
+      fetchImpl,
+      dataBase: '/data/',
+      manifest,
+      sampleCount: 10,
+      probeBytes: 1,
+      verifyHashes: true,
+      nowFn: () => nowMs,
+    });
+
+    assert.equal(report.ok, false);
+    assert.equal(report.aborted, false);
+    assert.equal(report.probed, 5);
+    assert.equal(report.passed, 1);
+    assert.equal(report.failed, 4);
+    assert.equal(report.filesVerified, 5);
+    // ok.bin (64 full via sha256 GET) + missing.bin (0) + size_drift.bin (1 via 206)
+    // + hash_drift.bin (48 full via sha256 GET) + etag_drift.bin (1 via 206) = 114 bytes
+    assert.equal(report.bytesVerified, 64 + 0 + 1 + 48 + 1);
+    assert.ok(report.elapsedMs > 0);
+    assert.equal(report.telemetry.elapsedMs, report.elapsedMs);
+    assert.equal(report.telemetry.bytesVerified, report.bytesVerified);
+    assert.equal(report.telemetry.filesVerified, 5);
+    assert.ok(report.telemetry.bytesPerSecond > 0);
+    assert.equal(report.telemetry.aborted, false);
+
+    assert.deepEqual(report.mismatchesByCategory, {
+      missing: 1,
+      size_mismatch: 1,
+      hash_mismatch: 2,
+    });
+    assert.equal(report.mismatchCount, 4);
+    assert.equal(report.mismatches.length, 4);
+    assert.deepEqual(report.telemetry.mismatchesByCategory, report.mismatchesByCategory);
+    assert.equal(report.telemetry.mismatchCount, 4);
+
+    const byPath = new Map(report.results.map((r) => [r.path, r]));
+    assert.equal(byPath.get('ok.bin').ok, true);
+    assert.equal(byPath.get('ok.bin').hash.verified, true);
+    assert.equal(byPath.get('ok.bin').bytesVerified, 64);
+    assert.deepEqual(byPath.get('ok.bin').mismatchCategories, []);
+
+    assert.deepEqual(byPath.get('missing.bin').mismatchCategories, ['missing']);
+    assert.equal(byPath.get('missing.bin').bytesVerified, 0);
+
+    assert.deepEqual(byPath.get('size_drift.bin').mismatchCategories, ['size_mismatch']);
+
+    assert.deepEqual(byPath.get('hash_drift.bin').mismatchCategories, ['hash_mismatch']);
+    assert.equal(byPath.get('hash_drift.bin').hash.verified, false);
+    assert.equal(byPath.get('hash_drift.bin').hash.actual, sha256Hex(badHashBytes));
+
+    assert.deepEqual(byPath.get('etag_drift.bin').mismatchCategories, ['hash_mismatch']);
+  });
+
+  it('reuses Range GET bytes for SHA-256 verification when full file fits within probeBytes and supports 0-byte files + custom hashFn', async () => {
+    const smallBytes = new Uint8Array([10, 20, 30, 40]);
+    const emptyBytes = new Uint8Array(0);
+    const backing = new Map([
+      ['small.bin', { bytes: smallBytes, etag: '"s1"' }],
+      ['empty.bin', { bytes: emptyBytes, etag: '"e0"' }],
+    ]);
+    const manifest = makeValidManifest({
+      files: [
+        { path: 'small.bin', size: 4, sha256: sha256Hex(smallBytes), etag: '"s1"' },
+        { path: 'empty.bin', size: 0, sha256: sha256Hex(emptyBytes), etag: '"e0"' },
+      ],
+    });
+
+    const { fetchImpl, calls } = createMockDataFetch(backing);
+    let hashInvocations = 0;
+    const report = await verifyLiveEndpoints({
+      fetchImpl,
+      dataBase: '/data/',
+      manifest,
+      sampleCount: 5,
+      probeBytes: 16,
+      verifyHashes: true,
+      hashFn: (bytes) => {
+        hashInvocations += 1;
+        return sha256Hex(bytes);
+      },
+    });
+
+    assert.equal(report.ok, true);
+    assert.equal(report.filesVerified, 2);
+    assert.equal(report.bytesVerified, 4);
+    assert.equal(report.mismatchCount, 0);
+    assert.equal(hashInvocations, 2);
+    // small.bin: HEAD + Range GET (no extra full GET needed); empty.bin: HEAD only.
+    assert.equal(calls.length, 3);
+    assert.equal(report.results[0].hash.verified, true);
+    assert.equal(report.results[1].hash.verified, true);
+  });
+
+  it('supports pre-aborted AbortSignal across sync and async verification routines without issuing fetches', async () => {
+    const controller = new AbortController();
+    controller.abort(new Error('user cancelled'));
+
+    const manifest = makeValidManifest();
+    const manifestRes = validateDataManifest(manifest, { signal: controller.signal });
+    assert.equal(manifestRes.ok, false);
+    assert.equal(manifestRes.aborted, true);
+    assert.equal(manifestRes.telemetry.aborted, true);
+    assert.equal(manifestRes.filesVerified, 0);
+
+    const bootsetRes = validateBootset(
+      [{ path: 'MicrosoftGame.Config', offset: 0, length: 16 }],
+      manifest,
+      { signal: controller.signal },
+    );
+    assert.equal(bootsetRes.ok, false);
+    assert.equal(bootsetRes.aborted, true);
+    assert.equal(bootsetRes.telemetry.aborted, true);
+
+    const readiness = computeStreamingReadiness(manifest, null, { signal: controller.signal });
+    assert.equal(readiness.aborted, true);
+    assert.equal(readiness.bootsetReady, false);
+    assert.equal(readiness.telemetry.aborted, true);
+
+    const backing = new Map([
+      ['MicrosoftGame.Config', { bytes: new Uint8Array(576), etag: '"a"' }],
+    ]);
+    const { fetchImpl, calls } = createMockDataFetch(backing);
+    const liveReport = await verifyLiveEndpoints({
+      fetchImpl,
+      dataBase: '/data/',
+      manifest,
+      signal: controller.signal,
+    });
+
+    assert.equal(liveReport.ok, false);
+    assert.equal(liveReport.aborted, true);
+    assert.equal(liveReport.telemetry.aborted, true);
+    assert.equal(liveReport.probed, 0);
+    assert.equal(liveReport.filesVerified, 0);
+    assert.equal(liveReport.bytesVerified, 0);
+    assert.equal(calls.length, 0);
+  });
+
+  it('cancels verifyLiveEndpoints mid-run and mid-request via AbortSignal and forwards signal to fetchImpl', async () => {
+    const backing = new Map([
+      ['f0.bin', { bytes: new Uint8Array(64).fill(1), etag: '"e0"' }],
+      ['f1.bin', { bytes: new Uint8Array(64).fill(2), etag: '"e1"' }],
+      ['f2.bin', { bytes: new Uint8Array(64).fill(3), etag: '"e2"' }],
+    ]);
+    const manifest = makeValidManifest({
+      files: [
+        { path: 'f0.bin', size: 64, etag: '"e0"' },
+        { path: 'f1.bin', size: 64, etag: '"e1"' },
+        { path: 'f2.bin', size: 64, etag: '"e2"' },
+      ],
+    });
+
+    // Case 1: Abort during f1.bin HEAD request; fetchImpl ignores signal and hangs forever,
+    // verifying raceWithAbort cancels promptly and preserves completed f0.bin telemetry.
+    const controller = new AbortController();
+    const seenSignals = [];
+    const seenPaths = [];
+    const { fetchImpl: baseFetch } = createMockDataFetch(backing);
+
+    const fetchWithHang = async (url, init = {}) => {
+      seenSignals.push(init.signal);
+      seenPaths.push(`${init.method || 'GET'} ${url}`);
+      if (url.endsWith('f1.bin') && init.method === 'HEAD') {
+        setTimeout(() => controller.abort(), 5);
+        return new Promise(() => {}); // Never settles on its own
+      }
+      return baseFetch(url, init);
+    };
+
+    const report = await verifyLiveEndpoints({
+      fetchImpl: fetchWithHang,
+      dataBase: '/data/',
+      manifest,
+      sampleCount: 3,
+      signal: controller.signal,
+    });
+
+    assert.equal(report.ok, false);
+    assert.equal(report.aborted, true);
+    assert.equal(report.telemetry.aborted, true);
+    assert.equal(report.probed, 1);
+    assert.equal(report.passed, 1);
+    assert.equal(report.failed, 0);
+    assert.equal(report.filesVerified, 1);
+    assert.equal(report.bytesVerified, 1);
+    assert.equal(report.mismatchCount, 0);
+    assert.ok(seenSignals.every((s) => s === controller.signal));
+    assert.ok(seenPaths.every((p) => !p.includes('f2.bin')));
+    assert.ok(seenPaths.every((p) => !(p.startsWith('GET') && p.includes('f1.bin'))));
+  });
+
+  it('never leaks host filesystem paths or raw file bytes in verification diagnostics or telemetry', async () => {
+    const rawSecretPayload = 'RAW_SECRET_FILE_PAYLOAD_BYTES_DO_NOT_LEAK_987654321';
+    const secretBytes = new TextEncoder().encode(rawSecretPayload);
+    const backing = new Map([
+      ['secret.bin', { bytes: secretBytes, etag: '"sec-1"' }],
+      ['win_err.bin', { bytes: new Uint8Array(16), etag: '"w1"' }],
+      ['posix_err.bin', { bytes: new Uint8Array(16), etag: '"p1"' }],
+    ]);
+    const manifest = makeValidManifest({
+      files: [
+        {
+          path: 'secret.bin',
+          size: secretBytes.byteLength,
+          sha256: 'f'.repeat(64), // intentional hash mismatch
+          etag: '"sec-1"',
+        },
+        { path: 'win_err.bin', size: 16, etag: '"w1"' },
+        { path: 'posix_err.bin', size: 16, etag: '"p1"' },
+      ],
+    });
+
+    const { fetchImpl } = createMockDataFetch(backing, {
+      onRequest: async ({ relPath }) => {
+        if (relPath === 'win_err.bin') {
+          throw new Error(
+            "ENOENT: failed reading 'C:\\Users\\Alice Smith\\Games\\GTA6\\x64\\levels.rpf' and \\\\fileserver\\private\\dump.bin\x00\x01",
+          );
+        }
+        if (relPath === 'posix_err.bin') {
+          throw new Error(
+            'EACCES: open "/Users/bob/private/gta6/levels.rpf" or file:///home/dev/secret.rpf',
+          );
+        }
+        return null;
+      },
+    });
+
+    const report = await verifyLiveEndpoints({
+      fetchImpl,
+      dataBase: '/data/',
+      manifest,
+      sampleCount: 5,
+      verifyHashes: true,
+    });
+
+    const serialized = JSON.stringify(report);
+    assert.equal(serialized.includes(rawSecretPayload), false);
+    assert.equal(serialized.includes('C:\\Users'), false);
+    assert.equal(serialized.includes('Alice Smith'), false);
+    assert.equal(serialized.includes('fileserver'), false);
+    assert.equal(serialized.includes('/Users/bob'), false);
+    assert.equal(serialized.includes('/home/dev'), false);
+    assert.equal(serialized.includes('file://'), false);
+    assert.equal(/[\x00-\x1f\x7f]/.test(serialized), false);
+    assert.ok(serialized.includes('<redacted-path>'));
+    assert.equal(report.mismatchesByCategory.hash_mismatch, 1);
   });
 });
