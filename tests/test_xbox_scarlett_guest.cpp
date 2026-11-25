@@ -2047,6 +2047,29 @@ void test_xapu() {
     CHECK(static_cast<uint32_t>(fx.dcall(count, {I(handle), I(0)})) == 0);
 }
 
+// O36: a title that never dequeues cannot grow the result queue without limit.
+void test_xapu_bounded_queue() {
+    Fixture fx;
+    const uint64_t connect = fx.export_address("xapu.dll", "XApuConnect");
+    const uint64_t enqueue = fx.export_address("xapu.dll", "XApuEnqueueCommand");
+    const uint64_t count = fx.export_address("xapu.dll", "XApuGetResultCount");
+    const uint64_t disconnect = fx.export_address("xapu.dll", "XApuDisconnect");
+    const uint64_t params = com::guest_alloc(0x18);
+    const uint64_t p2 = com::guest_alloc(0x10);
+    const uint64_t out = fx.out_slot();
+    CHECK(as_hr(fx.dcall(connect, {I(params), I(p2), I(out)})) == 0);
+    const uint64_t handle = load64(out);
+    const uint64_t c = com::guest_alloc(0x40);
+    for (uint32_t n = 0; n < 20000; ++n) {
+        const uint32_t head[2] = {5, n & 0x7F};
+        CHECK(com::write_guest(c, head, sizeof(head)));
+        CHECK(as_hr(fx.dcall(enqueue, {I(handle), I(c), I(0)})) == 0);
+        CHECK(static_cast<uint32_t>(fx.dcall(count, {I(handle), I(0)})) <= 4096);
+    }
+    CHECK(static_cast<uint32_t>(fx.dcall(count, {I(handle), I(0)})) == 4096);
+    CHECK(as_hr(fx.dcall(disconnect, {I(handle)})) == 0);
+}
+
 bool xapu_opus_available() { return playgta6::os::xapu_opus::available(); }
 
 // Synthetic Opus packets: `count` 20 ms frames of a 440 Hz sine at 48 kHz, encoded here (no game
@@ -2219,6 +2242,7 @@ int main() {
     test_acp_hal();
     test_xdsp();
     test_xapu();
+    test_xapu_bounded_queue();
     test_xapu_decode();
     test_mmdevice();
     if (g_failures != 0) {

@@ -1255,6 +1255,12 @@ void test_resources() {
     const dg::TextureProbeTotals probe3 = dg::probe_texture_contents(1 << 20);
     CHECK(probe3.views_with_data == probe2.views_with_data + 1 && probe3.with_data == probe2.with_data + 1);
     CHECK(dg::probe_texture_contents(1 << 20).views_with_data == probe3.views_with_data);
+    // O36: address-only textures are bounded: N distinct VAs keep the table at its cap.
+    for (uint64_t n = 0; n < dg::Device::kMaxAddressTextures + 300; ++n) {
+        CHECK(dev->ensure_address_texture(view_memory + 0x100000 + n * 0x1000, 77, 4, 4, 1, 1, 0x105,
+                                          GpuTextureDimension::Dim2D, false) != 0);
+        CHECK(dev->address_texture_count() <= dg::Device::kMaxAddressTextures);
+    }
     // An Xbox D16_UNORM_S8_UINT (118) depth-stencil texture at title memory is accepted.
     dg::GuestResourceDesc d16s8 = texture_desc(256, 256, 118, 0x2);
     const uint64_t ds16 = fx.create(device, Slot2::CreatePlacedResourceX, {I(tex_memory), I(put(d16s8)), I(0), I(0)},

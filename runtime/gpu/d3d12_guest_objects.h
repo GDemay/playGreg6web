@@ -848,6 +848,9 @@ public:
     // reading past a small constant buffer reads whatever memory follows).
     bool relocate_uniform(uint64_t va, uint64_t size, uint64_t binding_size, uint32_t* buffer_id, uint64_t* offset);
     size_t relocated_uniform_count() const;
+    // O36: textures known only by a view at an address (bounded; least recently used dropped).
+    static constexpr size_t kMaxAddressTextures = 2048;
+    size_t address_texture_count() const;
     // Storage buffer views at unaligned offsets or address-only GPU VAs (G51): the bytes at
     // [va, va + size) (readable guest/alias memory only) get a 256-byte aligned home (or a
     // dedicated offset-0 buffer when `require_zero_offset` is true, e.g. element stride does not
@@ -1182,7 +1185,12 @@ private:
         }
     };
     mutable std::mutex address_textures_mutex_;
-    std::unordered_map<AddressTextureKey, uint32_t, AddressTextureKeyHash> address_textures_;
+    struct AddressTextureEntry {
+        uint32_t id = 0;
+        uint64_t last_use = 0;
+    };
+    std::unordered_map<AddressTextureKey, AddressTextureEntry, AddressTextureKeyHash> address_textures_;
+    uint64_t address_texture_tick_ = 0;  // under address_textures_mutex_
     mutable std::mutex detile_mutex_;
     DetileFn detile_texture_;
     std::atomic<uint64_t> upload_bytes_{0};

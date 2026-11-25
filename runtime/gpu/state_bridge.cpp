@@ -237,6 +237,7 @@ void StateBridgeDevice::unregister_resource(uint32_t resource_id) {
         }
         buffer_allocated_.erase(resource_id);
     }
+    retire_views(resource_id);
     retire_intermediates(resource_id);
 }
 
@@ -632,10 +633,47 @@ uint32_t StateBridgeDevice::intern_view(const ViewRecord& record) const {
     if (const auto it = view_ids_.find(key); it != view_ids_.end()) {
         return it->second;
     }
-    views_.push_back(record);
-    const auto id = static_cast<uint32_t>(views_.size());
+    uint32_t id = 0;
+    if (!free_views_.empty()) {
+        id = free_views_.back();
+        free_views_.pop_back();
+        views_[id - 1] = record;
+    } else {
+        views_.push_back(record);
+        view_keys_.emplace_back();
+        id = static_cast<uint32_t>(views_.size());
+    }
+    view_keys_[id - 1] = key;
     view_ids_.emplace(std::move(key), id);
+    views_by_texture_[record.texture_id].push_back(id);
+    if (record.resource_id != 0 && record.resource_id != record.texture_id) {
+        views_by_texture_[record.resource_id].push_back(id);
+    }
     return id;
+}
+
+void StateBridgeDevice::retire_views(uint32_t texture_id) {
+    std::lock_guard lock(views_mutex_);
+    const auto it = views_by_texture_.find(texture_id);
+    if (it == views_by_texture_.end()) {
+        return;
+    }
+    const std::vector<uint32_t> ids = std::move(it->second);
+    views_by_texture_.erase(it);
+    for (const uint32_t id : ids) {
+        if (id == 0 || id > view_keys_.size() || view_keys_[id - 1].empty()) {
+            continue;  // already retired through its other texture id
+        }
+        view_ids_.erase(view_keys_[id - 1]);
+        view_keys_[id - 1].clear();
+        views_[id - 1] = ViewRecord{};
+        free_views_.push_back(id);
+    }
+}
+
+size_t StateBridgeDevice::live_view_count() const {
+    std::lock_guard lock(views_mutex_);
+    return view_ids_.size();
 }
 
 const ViewRecord* StateBridgeDevice::view(uint32_t view_id) const {
