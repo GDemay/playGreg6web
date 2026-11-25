@@ -3741,3 +3741,16 @@ test('W349 loader.js gpuWorker.onmessage forwards firstVisibleFrame: false telem
   assert.equal(mainMessages[1].suppressedBlackFrames, 2699);
   assert.equal(mainMessages[1].gpuAdapter.label, 'nvidia turing');
 });
+
+test('guestRelaunchPayload only answers the self-relaunch exit code', () => {
+  const { guestRelaunchPayload, RELAUNCH_SELF_EXIT_CODE, GUEST_RELAUNCH_MESSAGE_TYPE } = require('../web/loader.js');
+  assert.equal(RELAUNCH_SELF_EXIT_CODE, 0x52454c4e);
+  assert.deepEqual(guestRelaunchPayload(0x52454c4e), {
+    type: GUEST_RELAUNCH_MESSAGE_TYPE,
+    exitCode: RELAUNCH_SELF_EXIT_CODE,
+  });
+  assert.equal(guestRelaunchPayload(0), null);
+  assert.equal(guestRelaunchPayload(1), null);
+  assert.equal(guestRelaunchPayload(undefined), null);
+  assert.equal(guestRelaunchPayload(Number.NaN), null);
+});

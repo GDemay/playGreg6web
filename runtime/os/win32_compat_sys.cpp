@@ -10,6 +10,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include "os/host_sleep.h"
 #include "os/os_shim.h"
@@ -94,13 +95,14 @@ void fill_system_info(Pg6SystemInfo* info) {
 // ---- app lifecycle notifications ---------------------------------------------------------
 
 struct AppRegistration {
+    AppNotificationKind kind;
     uint64_t routine;
     uint64_t context;
 };
 
 struct AppRegistry {
     std::mutex mutex;
-    std::map<uint64_t, AppRegistration> entries;
+    std::map<uint64_t, AppRegistration> entries;  // token order = registration order
     uint64_t next = 1;
 };
 
@@ -109,7 +111,10 @@ AppRegistry& app_registry() {
     return r;
 }
 
-uint32_t register_app_notification(uint64_t routine, uint64_t context, uint64_t* registration) {
+uint32_t register_app_notification(AppNotificationKind kind,
+                                   uint64_t routine,
+                                   uint64_t context,
+                                   uint64_t* registration) {
     if (registration != nullptr) {
         *registration = 0;
     }
@@ -119,15 +124,40 @@ uint32_t register_app_notification(uint64_t routine, uint64_t context, uint64_t*
     auto& r = app_registry();
     std::lock_guard<std::mutex> lock(r.mutex);
     const uint64_t token = 0x4150500000000000ULL + (r.next++ << 4);
-    r.entries.emplace(token, AppRegistration{routine, context});
+    r.entries.emplace(token, AppRegistration{kind, routine, context});
     *registration = token;
     return ERROR_SUCCESS;
 }
 
-void unregister_app_notification(uint64_t registration) {
+void unregister_app_notification(AppNotificationKind kind, uint64_t registration) {
     auto& r = app_registry();
     std::lock_guard<std::mutex> lock(r.mutex);
-    r.entries.erase(registration);
+    const auto it = r.entries.find(registration);
+    if (it != r.entries.end() && it->second.kind == kind) {
+        r.entries.erase(it);
+    }
+}
+
+// Calls every live registration of `kind` (registration order) with `flag`. The list is copied
+// first so a callback may unregister itself or others without deadlocking.
+size_t invoke_app_notifications(AppNotificationKind kind,
+                                uint8_t flag,
+                                AppNotificationInvoker invoker,
+                                void* user) {
+    std::vector<AppRegistration> targets;
+    {
+        auto& r = app_registry();
+        std::lock_guard<std::mutex> lock(r.mutex);
+        for (const auto& [token, entry] : r.entries) {
+            if (entry.kind == kind) {
+                targets.push_back(entry);
+            }
+        }
+    }
+    for (const AppRegistration& t : targets) {
+        invoker(AppNotification{t.kind, t.routine, flag, t.context}, user);
+    }
+    return targets.size();
 }
 
 // ---- civil date helpers -------------------------------------------------------------------
@@ -209,6 +239,34 @@ size_t app_notification_registration_count() {
     auto& r = app_registry();
     std::lock_guard<std::mutex> lock(r.mutex);
     return r.entries.size();
+}
+
+size_t app_notification_registration_count(AppNotificationKind kind) {
+    auto& r = app_registry();
+    std::lock_guard<std::mutex> lock(r.mutex);
+    return static_cast<size_t>(std::count_if(r.entries.begin(), r.entries.end(),
+                                             [kind](const auto& e) { return e.second.kind == kind; }));
+}
+
+// GDK PLM order. Suspend: the constrained-change routines run first (constrained = TRUE), then the
+// app-state routines (quiesced = TRUE), whose handler suspends and must find the title already
+// constrained. Resume mirrors it: app-state (quiesced = FALSE), then constrained (FALSE).
+size_t dispatch_app_suspend(AppNotificationInvoker invoker, void* user) {
+    if (invoker == nullptr) {
+        return 0;
+    }
+    size_t n = invoke_app_notifications(AppNotificationKind::Constrained, 1, invoker, user);
+    n += invoke_app_notifications(AppNotificationKind::State, 1, invoker, user);
+    return n;
+}
+
+size_t dispatch_app_resume(AppNotificationInvoker invoker, void* user) {
+    if (invoker == nullptr) {
+        return 0;
+    }
+    size_t n = invoke_app_notifications(AppNotificationKind::State, 0, invoker, user);
+    n += invoke_app_notifications(AppNotificationKind::Constrained, 0, invoker, user);
+    return n;
 }
 
 namespace compat_detail {
@@ -767,21 +825,22 @@ int32_t pg6_win32_unhandled_exception_filter(void*) {
 uint32_t pg6_win32_register_app_state_change_notification(uint64_t routine,
                                                           uint64_t context,
                                                           uint64_t* registration) {
-    return win32::register_app_notification(routine, context, registration);
+    return win32::register_app_notification(win32::AppNotificationKind::State, routine, context, registration);
 }
 
 void pg6_win32_unregister_app_state_change_notification(uint64_t registration) {
-    win32::unregister_app_notification(registration);
+    win32::unregister_app_notification(win32::AppNotificationKind::State, registration);
 }
 
 uint32_t pg6_win32_register_app_constrained_change_notification(uint64_t routine,
                                                                 uint64_t context,
                                                                 uint64_t* registration) {
-    return win32::register_app_notification(routine, context, registration);
+    return win32::register_app_notification(win32::AppNotificationKind::Constrained, routine, context,
+                                            registration);
 }
 
 void pg6_win32_unregister_app_constrained_change_notification(uint64_t registration) {
-    win32::unregister_app_notification(registration);
+    win32::unregister_app_notification(win32::AppNotificationKind::Constrained, registration);
 }
 
 int32_t pg6_win32_wer_register_file(const char16_t* file, uint32_t file_type, uint32_t flags) {

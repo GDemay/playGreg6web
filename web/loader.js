@@ -97,6 +97,23 @@ if (typeof importScripts === 'function') {
   importScripts('./workers/httpfs_mailbox.js');
 }
 
+// kRelaunchSelfExitCode (runtime/os/win32_compat.h, ASCII "RELN"): the title called XLaunchNewGame
+// on itself. The runtime exits with it and the page relaunches the boot with the same URL/arguments.
+const RELAUNCH_SELF_EXIT_CODE = 0x52454c4e;
+const GUEST_RELAUNCH_MESSAGE_TYPE = 'guest-relaunch';
+
+/** Progress payload asking the page to relaunch the guest, or null for any other exit status. */
+function guestRelaunchPayload(status) {
+  // Emscripten may report the int32 status sign-extended; compare as uint32.
+  if (typeof status !== 'number' || !Number.isFinite(status)) {
+    return null;
+  }
+  if (status >>> 0 !== RELAUNCH_SELF_EXIT_CODE) {
+    return null;
+  }
+  return { type: GUEST_RELAUNCH_MESSAGE_TYPE, exitCode: RELAUNCH_SELF_EXIT_CODE };
+}
+
 function postProgress(payload) {
   if (typeof self === 'undefined') {
     return false;
@@ -6755,7 +6772,11 @@ async function tryBootWasmRuntime() {
         onFirstPresent: () => {
           coordinatorFirstPresentEmitted = true;
         },
-        onExit: () => {
+        onExit: (status) => {
+          const relaunch = guestRelaunchPayload(status);
+          if (relaunch) {
+            postProgress(relaunch);
+          }
           coordinatorPthreadPool.closeTxPorts();
           activeCoordinatorRuntimeModule = null;
           activeCoordinatorModuleConfig = null;
@@ -7223,6 +7244,9 @@ const exportedApi = {
   postBroadcastOnce,
   toTransferableArrayBuffer,
   ptrToNumber,
+  RELAUNCH_SELF_EXIT_CODE,
+  GUEST_RELAUNCH_MESSAGE_TYPE,
+  guestRelaunchPayload,
 };
 
 if (typeof globalThis !== 'undefined') {

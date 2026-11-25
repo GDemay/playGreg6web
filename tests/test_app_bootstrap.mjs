@@ -2,6 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import bootstrapDefault, {
+  GUEST_RELAUNCH_MESSAGE_TYPE,
+  MAX_GUEST_RELAUNCHES,
+  resetGuestRelaunchCount,
+  shouldRelaunchGuest,
   DEFAULT_DUMP_ENDPOINT,
   DEFAULT_LOADER_URL,
   DEFAULT_MAX_VALIDATION_ERRORS,
@@ -5965,4 +5969,24 @@ test('W349 gpu-telemetry with firstVisibleFrame: false holds splash despite real
   } finally {
     await legacy.app.destroy();
   }
+});
+
+test('shouldRelaunchGuest caps self-relaunches per session and resets after a present', () => {
+  const store = new Map();
+  const win = {
+    sessionStorage: {
+      getItem: (k) => (store.has(k) ? store.get(k) : null),
+      setItem: (k, v) => store.set(k, String(v)),
+      removeItem: (k) => store.delete(k),
+    },
+  };
+  assert.equal(GUEST_RELAUNCH_MESSAGE_TYPE, 'guest-relaunch');
+  for (let i = 0; i < MAX_GUEST_RELAUNCHES; i += 1) {
+    assert.equal(shouldRelaunchGuest(win), true);
+  }
+  assert.equal(shouldRelaunchGuest(win), false);
+  resetGuestRelaunchCount(win);
+  assert.equal(shouldRelaunchGuest(win), true);
+  assert.equal(shouldRelaunchGuest({}), true);
+  assert.equal(shouldRelaunchGuest(null), true);
 });

@@ -15,6 +15,7 @@
 #include "guest/guest_callbacks.h"
 #include "guest/guest_runtime.h"
 #include "os/vmem.h"
+#include "os/win32_compat.h"
 #include "os/win32_kernel.h"
 #include "os/shim_exports.h"
 #include "os/win32_loader.h"
@@ -283,6 +284,8 @@ constexpr Guid kHdrProvider = com::make_guid("03f0fe74-fdd9-4e5c-b630-f9339c47ac
 constexpr Guid kHdrIid = com::make_guid("35f07670-706e-4bfb-9476-090798c5ebf3");
 constexpr Guid kUnmappedProvider = com::make_guid("dfcd4649-4ff8-4043-ba07-35d607df98b0");
 constexpr Guid kUnmappedIid = com::make_guid("eaf669df-5542-4590-99a3-8dc061f837cc");
+constexpr Guid kGameProvider = com::make_guid("973a344e-24bf-4d0f-8457-56c534892b29");
+constexpr Guid kGameIid = com::make_guid("2549f142-6419-4a06-97b5-931aab7c2f34");
 constexpr Guid kBogus = com::make_guid("12345678-1234-1234-1234-123456789abc");
 
 struct Fixture {
@@ -1206,6 +1209,45 @@ void test_store_ext_slots() {
 
 }  // namespace
 
+uint32_t g_exit_code = 0;
+int g_exit_calls = 0;
+void record_exit(uint32_t code, void*) {
+    g_exit_code = code;
+    ++g_exit_calls;
+}
+
+// XGame s4 XLaunchNewGame: the running title relaunching itself stops the guest with the relaunch
+// exit code (the harness restarts it); another title stays E_NOTIMPL.
+void test_launch_new_game() {
+    CHECK(prov::is_self_launch_target("game.exe", "game.exe"));
+    CHECK(prov::is_self_launch_target("D:\\Title\\GAME.EXE", "\"C:\\x y\\game.exe\" -arg 1"));
+    CHECK(prov::is_self_launch_target("./game.exe", "game.exe -foo"));
+    CHECK(!prov::is_self_launch_target("other.exe", "game.exe"));
+    CHECK(!prov::is_self_launch_target("game.exe", ""));
+    CHECK(!prov::is_self_launch_target("", "game.exe"));
+
+    Fixture fx;
+    int32_t hr = -1;
+    const uint64_t game = fx.query(kGameProvider, kGameIid, &hr);
+    CHECK(hr == 0 && game != 0);
+    playgta6::os::win32::set_command_line("Title.exe -mode 2");
+    playgta6::os::win32::reset_process_exit_state();
+    playgta6::os::win32::set_process_exit_handler(&record_exit, nullptr);
+    g_exit_calls = 0;
+
+    CHECK(hr32(fx.vcall(game, 4, {fx.cstring("Other.exe"), fx.cstring(""), 0})) == com::E_NOTIMPL_HR);
+    CHECK(g_exit_calls == 0);
+    CHECK(hr32(fx.vcall(game, 4, {0, 0, 0})) == static_cast<int32_t>(0x80070057u));
+    CHECK(hr32(fx.vcall(game, 4, {fx.cstring("title.exe"), fx.cstring("-mode 2"), 0})) == 0);
+    CHECK(g_exit_calls == 1 && g_exit_code == playgta6::os::win32::kRelaunchSelfExitCode);
+    uint32_t code = 0;
+    CHECK(playgta6::os::win32::process_exit_requested(&code) && code == playgta6::os::win32::kRelaunchSelfExitCode);
+
+    playgta6::os::win32::set_process_exit_handler(nullptr, nullptr);
+    playgta6::os::win32::reset_process_exit_state();
+    playgta6::os::win32::set_command_line("game.exe");
+}
+
 int main() {
     test_module_and_exports();
     test_query_api();
@@ -1215,6 +1257,7 @@ int main() {
     test_async_provider_slots();
     test_http_client_thunks();
     test_store_ext_slots();
+    test_launch_new_game();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_xgameruntime_provider: %d failure(s)\n", g_failures);
         return 1;
