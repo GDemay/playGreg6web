@@ -25,12 +25,13 @@
 //! that register. Blocks that cannot reach the merge never contribute (the analysis only sees the
 //! backward-reachable subgraph), so a register reused for something else there does not matter.
 //!
-//! Cost: one backward walk to collect at most [`MAX_REACH_BLOCKS`] blocks, then a worklist over
-//! them; every block's input can change at most `WIDEN_AFTER + 1` times per register before it is
-//! unknown, so the work is `O(blocks * instructions per block * (WIDEN_AFTER + 1) * 16)` per
-//! queried merge.
+//! Cost: one deterministic backward BFS to collect at most [`MAX_REACH_BLOCKS`] blocks within
+//! [`MAX_REACH_DEPTH`] hops, then a bounded deterministic worklist over them; every block's input
+//! can change at most `WIDEN_AFTER + 1` times per register before it is unknown, so the work is
+//! `O(blocks * instructions per block * (WIDEN_AFTER + 1) * 16)` per queried merge (capped by
+//! [`MAX_WORKLIST_STEPS`]).
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use iced_x86::{
     Decoder, DecoderOptions, FlowControl, Instruction, InstructionInfoFactory, Mnemonic, OpAccess,
@@ -42,8 +43,17 @@ use crate::cfg::{BasicBlock, Edge, Terminator};
 /// Blocks of the backward-reachable subgraph examined for one merge (beyond: no result).
 pub(crate) const MAX_REACH_BLOCKS: usize = 4096;
 
+/// Maximum backward BFS hop depth from the target block before bailing out.
+pub(crate) const MAX_REACH_DEPTH: usize = MAX_REACH_BLOCKS;
+
 /// Input changes of one block after which still-changing intervals widen to unknown.
 const WIDEN_AFTER: u32 = 8;
+
+/// Hard upper bound on forward worklist pops per query (defensive livelock/cycle guard).
+/// Each block in a monotone `GPR_COUNT`-register lattice with widening after `WIDEN_AFTER`
+/// updates can change at most `WIDEN_AFTER + GPR_COUNT` times after its initial visit.
+pub(crate) const MAX_WORKLIST_STEPS: usize =
+    MAX_REACH_BLOCKS * (WIDEN_AFTER as usize + GPR_COUNT + 2);
 
 /// What is known about a full 64-bit register on every path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,10 +143,77 @@ fn mask(bits: u32) -> u64 {
     }
 }
 
+/// Deterministic backward-reachable subgraph collected by [`collect_backward_subgraph_bounded`].
+struct BackwardSubgraph {
+    /// Every block reachable backward from `target`, strictly sorted by VA.
+    blocks: BTreeSet<u64>,
+    /// Forward-analysis seed blocks (function entries and predecessor-less blocks), sorted by VA.
+    roots: BTreeSet<u64>,
+}
+
+/// Deterministic backward BFS from `target` over intra-function predecessors, stopping at
+/// `is_entry` blocks. Guarantees sorted `BTreeSet` membership, deduplicates and sorts predecessor
+/// lists so results are invariant to caller ordering, skips self-loops and cycles cleanly, and
+/// returns `None` if `target` or any backward-reachable predecessor is missing from `blocks` or if
+/// `max_blocks` or `max_depth` would be exceeded.
+fn collect_backward_subgraph_bounded(
+    blocks: &BTreeMap<u64, BasicBlock>,
+    preds: &dyn Fn(u64) -> Vec<u64>,
+    is_entry: &dyn Fn(u64) -> bool,
+    target: u64,
+    max_blocks: usize,
+    max_depth: usize,
+) -> Option<BackwardSubgraph> {
+    if max_blocks == 0 {
+        return None;
+    }
+    blocks.get(&target)?;
+
+    let mut sub: BTreeSet<u64> = BTreeSet::new();
+    let mut roots: BTreeSet<u64> = BTreeSet::new();
+    let mut queue: VecDeque<(u64, usize)> = VecDeque::new();
+    sub.insert(target);
+    queue.push_back((target, 0));
+
+    while let Some((b, depth)) = queue.pop_front() {
+        if is_entry(b) {
+            roots.insert(b);
+            continue;
+        }
+        let mut pred_list = preds(b);
+        if pred_list.is_empty() {
+            // Blocks whose predecessors are all outside the function's known code (no entry above
+            // them) can still start a path: treat a block without predecessors as unknown on entry.
+            roots.insert(b);
+            continue;
+        }
+        pred_list.sort_unstable();
+        pred_list.dedup();
+
+        for p in pred_list {
+            // Self-loops (`p == b`) and back-edges to already-discovered blocks are skipped without
+            // growing the queue or advancing depth.
+            if sub.contains(&p) {
+                continue;
+            }
+            blocks.get(&p)?;
+            let next_depth = depth.checked_add(1)?;
+            if next_depth > max_depth || sub.len() >= max_blocks {
+                return None;
+            }
+            sub.insert(p);
+            queue.push_back((p, next_depth));
+        }
+    }
+
+    Some(BackwardSubgraph { blocks: sub, roots })
+}
+
 /// Values of `regs` on entry to `target`, over every intra-function path that reaches it.
 /// `preds(b)` lists the blocks with an intra-function edge into `b`; `is_entry(b)` marks function
 /// entries (where every register is unknown). `None` when the reachable subgraph exceeds
-/// [`MAX_REACH_BLOCKS`] or `target` is unknown.
+/// [`MAX_REACH_BLOCKS`] / [`MAX_REACH_DEPTH`], the worklist exceeds [`MAX_WORKLIST_STEPS`], or
+/// `target` (or a backward-reachable predecessor) is unknown.
 pub(crate) fn reaching_values(
     blocks: &BTreeMap<u64, BasicBlock>,
     preds: &dyn Fn(u64) -> Vec<u64>,
@@ -144,57 +221,72 @@ pub(crate) fn reaching_values(
     target: u64,
     regs: &[Register],
 ) -> Option<Vec<(Register, Known)>> {
-    blocks.get(&target)?;
-    // Backward-reachable subgraph (closed under predecessors; stops at function entries).
-    let mut sub: HashSet<u64> = HashSet::new();
-    let mut stack = vec![target];
-    while let Some(b) = stack.pop() {
-        if !sub.insert(b) {
-            continue;
-        }
-        if sub.len() > MAX_REACH_BLOCKS {
-            return None;
-        }
-        blocks.get(&b)?;
-        if is_entry(b) {
-            continue;
-        }
-        stack.extend(preds(b));
-    }
+    reaching_values_bounded(
+        blocks,
+        preds,
+        is_entry,
+        target,
+        regs,
+        MAX_REACH_BLOCKS,
+        MAX_REACH_DEPTH,
+        MAX_WORKLIST_STEPS,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reaching_values_bounded(
+    blocks: &BTreeMap<u64, BasicBlock>,
+    preds: &dyn Fn(u64) -> Vec<u64>,
+    is_entry: &dyn Fn(u64) -> bool,
+    target: u64,
+    regs: &[Register],
+    max_blocks: usize,
+    max_depth: usize,
+    max_worklist_steps: usize,
+) -> Option<Vec<(Register, Known)>> {
+    let BackwardSubgraph { blocks: sub, roots } =
+        collect_backward_subgraph_bounded(blocks, preds, is_entry, target, max_blocks, max_depth)?;
 
     let mut info = InstructionInfoFactory::new();
-    let mut inputs: HashMap<u64, State> = sub.iter().map(|&b| (b, State::unvisited())).collect();
-    let mut changes: HashMap<u64, u32> = HashMap::new();
+    let mut inputs: BTreeMap<u64, State> = sub.iter().map(|&b| (b, State::unvisited())).collect();
+    let mut changes: BTreeMap<u64, u32> = BTreeMap::new();
     let mut queue: VecDeque<u64> = VecDeque::new();
-    let mut queued: HashSet<u64> = HashSet::new();
-    for &b in &sub {
-        if is_entry(b) {
-            inputs.insert(b, State::unknown());
+    let mut queued: BTreeSet<u64> = BTreeSet::new();
+
+    // Seed all root blocks in strictly ascending VA order (deterministic worklist start).
+    for b in roots {
+        inputs.insert(b, State::unknown());
+        if queued.insert(b) {
             queue.push_back(b);
-            queued.insert(b);
-        }
-    }
-    // Blocks whose predecessors are all outside the function's known code (no entry above them)
-    // can still start a path: treat a block without predecessors as unknown on entry.
-    for &b in &sub {
-        if !is_entry(b) && preds(b).is_empty() {
-            inputs.insert(b, State::unknown());
-            if queued.insert(b) {
-                queue.push_back(b);
-            }
         }
     }
 
+    let mut steps: usize = 0;
     while let Some(b) = queue.pop_front() {
         queued.remove(&b);
+        if steps >= max_worklist_steps {
+            return None;
+        }
+        steps += 1;
         let Some(block) = blocks.get(&b) else {
             continue;
         };
-        let mut state = inputs[&b];
+        let mut state = inputs.get(&b).copied().unwrap_or_else(State::unvisited);
         for instr in &block.instructions {
             transfer(&mut info, instr, &mut state);
         }
-        for edge in &block.successors {
+        // Sort and deduplicate outgoing intra-function edges so traversal and widening order
+        // never depend on how a caller populated `block.successors`.
+        let mut intra_edges: Vec<Edge> = block
+            .successors
+            .iter()
+            .copied()
+            .filter(|edge| edge.intra_target().is_some())
+            .collect();
+        intra_edges.sort_unstable();
+        intra_edges.dedup();
+
+        for edge in intra_edges {
             let Some(next) = edge.intra_target() else {
                 continue;
             };
@@ -203,9 +295,9 @@ pub(crate) fn reaching_values(
             }
             let mut out = state;
             if block.terminator == Terminator::Branch {
-                refine_edge(&mut info, block, *edge, &mut out);
+                refine_edge(&mut info, block, edge, &mut out);
             }
-            let old = inputs[&next];
+            let old = inputs.get(&next).copied().unwrap_or_else(State::unvisited);
             let mut new = old.join(&out);
             if new == old {
                 continue;
@@ -226,7 +318,7 @@ pub(crate) fn reaching_values(
         }
     }
 
-    let input = inputs[&target];
+    let input = inputs.get(&target).copied().unwrap_or_else(State::unvisited);
     Some(
         regs.iter()
             .map(|&r| {
@@ -689,6 +781,59 @@ fn decode(bytes: &[u8], ip: u64) -> Option<Instruction> {
 mod tests {
     use super::*;
 
+    fn decode_seq(ip: u64, bytes: &[u8]) -> Vec<Instruction> {
+        let mut decoder = Decoder::with_ip(64, bytes, ip, DecoderOptions::NONE);
+        let mut out = Vec::new();
+        while decoder.can_decode() {
+            let instr = decoder.decode();
+            assert!(!instr.is_invalid(), "invalid test instruction at {ip:#x}");
+            out.push(instr);
+        }
+        out
+    }
+
+    /// Encode `lea reg64, [rip + disp32]` targeting `target_va` from `ip` (7 bytes).
+    fn encode_lea_rip(reg: Register, ip: u64, target_va: u64) -> [u8; 7] {
+        let n = reg.full_register().number() as u8;
+        let delta = (target_va as i128) - (ip.wrapping_add(7) as i128);
+        let disp = i32::try_from(delta).expect("RIP-relative displacement must fit in i32");
+        let [d0, d1, d2, d3] = disp.to_le_bytes();
+        [
+            0x48 | ((n >> 3) << 2),
+            0x8D,
+            ((n & 7) << 3) | 0x05,
+            d0,
+            d1,
+            d2,
+            d3,
+        ]
+    }
+
+    fn make_block(
+        start: u64,
+        bytes: &[u8],
+        terminator: Terminator,
+        successors: Vec<Edge>,
+    ) -> BasicBlock {
+        let instructions = decode_seq(start, bytes);
+        let end = instructions
+            .last()
+            .map_or(start, Instruction::next_ip);
+        BasicBlock {
+            start,
+            end,
+            instructions,
+            terminator,
+            successors,
+            calls: Vec::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn empty_blocks(addrs: &[u64]) -> BTreeMap<u64, BasicBlock> {
+        addrs.iter().map(|&a| (a, BasicBlock::new(a))).collect()
+    }
+
     #[test]
     fn not_equal_edge_trims_an_end_of_the_range() {
         // `cmp r, 15; je` fallthrough / `jne` taken on [0, 15]: [0, 14].
@@ -707,6 +852,431 @@ mod tests {
         assert_eq!(
             unsigned_fact(Mnemonic::Jne, false, 15, 0, 15),
             Some((15, 15))
+        );
+    }
+
+    #[test]
+    fn backward_subgraph_is_sorted_and_invariant_to_pred_order_and_duplicates() {
+        // Diamond + back-edge + unrelated dead block 0x9000:
+        //   0x1000 (entry) -> 0x2000, 0x3000 -> 0x4000 (target)
+        //   0x4000 -> 0x2000 (cycle), 0x4000 -> 0x4000 (self-loop)
+        let blocks = empty_blocks(&[0x1000, 0x2000, 0x3000, 0x4000, 0x9000]);
+        let is_entry = |b: u64| b == 0x1000;
+
+        let preds_fwd = |b: u64| match b {
+            0x2000 => vec![0x1000, 0x4000],
+            0x3000 => vec![0x1000],
+            0x4000 => vec![0x2000, 0x3000, 0x4000],
+            _ => Vec::new(),
+        };
+        let preds_rev_dup = |b: u64| match b {
+            0x2000 => vec![0x4000, 0x1000, 0x4000, 0x1000],
+            0x3000 => vec![0x1000, 0x1000],
+            0x4000 => vec![0x4000, 0x3000, 0x2000, 0x3000, 0x4000],
+            _ => Vec::new(),
+        };
+
+        let a = collect_backward_subgraph_bounded(
+            &blocks,
+            &preds_fwd,
+            &is_entry,
+            0x4000,
+            MAX_REACH_BLOCKS,
+            MAX_REACH_DEPTH,
+        )
+        .expect("forward subgraph");
+        let b = collect_backward_subgraph_bounded(
+            &blocks,
+            &preds_rev_dup,
+            &is_entry,
+            0x4000,
+            MAX_REACH_BLOCKS,
+            MAX_REACH_DEPTH,
+        )
+        .expect("reversed+duplicated subgraph");
+
+        let expected: BTreeSet<u64> = [0x1000, 0x2000, 0x3000, 0x4000].into_iter().collect();
+        assert_eq!(a.blocks, expected);
+        assert_eq!(b.blocks, expected);
+        assert_eq!(a.roots, BTreeSet::from([0x1000]));
+        assert_eq!(b.roots, BTreeSet::from([0x1000]));
+
+        // Confirm strictly ascending deterministic order.
+        let ordered: Vec<u64> = a.blocks.iter().copied().collect();
+        assert_eq!(ordered, vec![0x1000, 0x2000, 0x3000, 0x4000]);
+    }
+
+    #[test]
+    fn backward_subgraph_handles_self_loop_and_mutual_cycles_at_tight_bounds() {
+        // Isolated self-loop on target: must succeed even at max_blocks=1, max_depth=0.
+        let self_blocks = empty_blocks(&[0x2000]);
+        let self_preds = |b: u64| if b == 0x2000 { vec![0x2000, 0x2000] } else { Vec::new() };
+        let sub = collect_backward_subgraph_bounded(
+            &self_blocks,
+            &self_preds,
+            &|_| false,
+            0x2000,
+            1,
+            0,
+        )
+        .expect("self-loop must not exceed tight block/depth bounds");
+        assert_eq!(sub.blocks, BTreeSet::from([0x2000]));
+        assert!(sub.roots.is_empty());
+
+        // Mutual 2-cycle 0x2000 <-> 0x3000: must succeed at max_blocks=2, max_depth=1.
+        let cycle_blocks = empty_blocks(&[0x2000, 0x3000]);
+        let cycle_preds = |b: u64| match b {
+            0x2000 => vec![0x3000, 0x2000],
+            0x3000 => vec![0x2000, 0x3000],
+            _ => Vec::new(),
+        };
+        let sub = collect_backward_subgraph_bounded(
+            &cycle_blocks,
+            &cycle_preds,
+            &|_| false,
+            0x2000,
+            2,
+            1,
+        )
+        .expect("2-cycle must not loop or falsely trigger bounds");
+        assert_eq!(sub.blocks, BTreeSet::from([0x2000, 0x3000]));
+        assert!(sub.roots.is_empty());
+    }
+
+    #[test]
+    fn backward_subgraph_enforces_block_depth_and_missing_block_guards() {
+        // Linear chain: 0x1000 -> 0x1010 -> 0x1020 -> 0x1030 -> 0x1040 (depth 4, 5 blocks).
+        let chain = [0x1000, 0x1010, 0x1020, 0x1030, 0x1040];
+        let blocks = empty_blocks(&chain);
+        let preds = |b: u64| match b {
+            0x1010 => vec![0x1000],
+            0x1020 => vec![0x1010],
+            0x1030 => vec![0x1020],
+            0x1040 => vec![0x1030],
+            _ => Vec::new(),
+        };
+        let is_entry = |b: u64| b == 0x1000;
+
+        // Exact depth & block limits succeed.
+        let ok = collect_backward_subgraph_bounded(&blocks, &preds, &is_entry, 0x1040, 5, 4)
+            .expect("exact limits should succeed");
+        assert_eq!(ok.blocks, chain.into_iter().collect());
+
+        // Depth limit 3 rejects the 4-hop chain.
+        assert!(
+            collect_backward_subgraph_bounded(&blocks, &preds, &is_entry, 0x1040, 5, 3).is_none()
+        );
+        // Block limit 4 rejects the 5-block chain.
+        assert!(
+            collect_backward_subgraph_bounded(&blocks, &preds, &is_entry, 0x1040, 4, 10).is_none()
+        );
+        // Zero block budget rejects immediately.
+        assert!(
+            collect_backward_subgraph_bounded(&blocks, &preds, &is_entry, 0x1040, 0, 10).is_none()
+        );
+        // Missing target block returns None.
+        assert!(
+            collect_backward_subgraph_bounded(&blocks, &preds, &is_entry, 0xDEAD, 10, 10).is_none()
+        );
+        // Missing predecessor block returns None.
+        let broken_preds = |b: u64| if b == 0x1040 { vec![0xBEEF] } else { Vec::new() };
+        assert!(
+            collect_backward_subgraph_bounded(&blocks, &broken_preds, &is_entry, 0x1040, 10, 10)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reaching_values_self_loop_preserves_invariant_and_widens_counter() {
+        // 0x14000_1000 (entry): lea rsi, [rip -> 0x14000_2000]; xor ecx, ecx; -> Jump(0x14000_2000)
+        // 0x14000_2000 (loop):  add rcx, 1; -> Jump(0x14000_2000) (self-loop!)
+        let entry_va = 0x14000_1000u64;
+        let loop_va = 0x14000_2000u64;
+        let table_va = 0x14000_8000u64;
+        let mut entry_bytes = Vec::new();
+        entry_bytes.extend_from_slice(&encode_lea_rip(Register::RSI, entry_va, table_va));
+        entry_bytes.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx
+
+        let mut blocks = BTreeMap::new();
+        blocks.insert(
+            entry_va,
+            make_block(entry_va, &entry_bytes, Terminator::Jump, vec![Edge::Jump(loop_va)]),
+        );
+        blocks.insert(
+            loop_va,
+            make_block(
+                loop_va,
+                &[0x48, 0x83, 0xC1, 0x01], // add rcx, 1
+                Terminator::Jump,
+                vec![Edge::Jump(loop_va)],
+            ),
+        );
+
+        let preds = |b: u64| match b {
+            x if x == loop_va => vec![loop_va, entry_va],
+            _ => Vec::new(),
+        };
+        let result = reaching_values(
+            &blocks,
+            &preds,
+            &|b| b == entry_va,
+            loop_va,
+            &[Register::RSI, Register::RCX],
+        )
+        .expect("self-loop must converge via widening");
+
+        assert_eq!(
+            result,
+            vec![
+                (Register::RSI, Known::exact(table_va)),
+                (Register::RCX, Known::Unknown),
+            ]
+        );
+    }
+
+    #[test]
+    fn reaching_values_mutual_cycle_preserves_invariant_and_bounds_constants() {
+        // 0x14000_1000 (entry): lea rbx, [rip -> 0x14000_9000]; mov eax, 1 -> Jump(0x14000_2000)
+        // 0x14000_2000 (merge): nop -> Jump(0x14000_3000), Jump(0x14000_4000)
+        // 0x14000_3000:         mov eax, 3 -> Jump(0x14000_2000)
+        // 0x14000_4000:         mov eax, 5 -> Jump(0x14000_2000)
+        let entry_va = 0x14000_1000u64;
+        let merge_va = 0x14000_2000u64;
+        let left_va = 0x14000_3000u64;
+        let right_va = 0x14000_4000u64;
+        let table_va = 0x14000_9000u64;
+        let mut entry_bytes = Vec::new();
+        entry_bytes.extend_from_slice(&encode_lea_rip(Register::RBX, entry_va, table_va));
+        entry_bytes.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]); // mov eax, 1
+
+        let mut blocks = BTreeMap::new();
+        blocks.insert(
+            entry_va,
+            make_block(entry_va, &entry_bytes, Terminator::Jump, vec![Edge::Jump(merge_va)]),
+        );
+        blocks.insert(
+            merge_va,
+            make_block(
+                merge_va,
+                &[0x90], // nop
+                Terminator::Jump,
+                vec![Edge::Jump(right_va), Edge::Jump(left_va)],
+            ),
+        );
+        blocks.insert(
+            left_va,
+            make_block(
+                left_va,
+                &[0xB8, 0x03, 0x00, 0x00, 0x00], // mov eax, 3
+                Terminator::Jump,
+                vec![Edge::Jump(merge_va)],
+            ),
+        );
+        blocks.insert(
+            right_va,
+            make_block(
+                right_va,
+                &[0xB8, 0x05, 0x00, 0x00, 0x00], // mov eax, 5
+                Terminator::Jump,
+                vec![Edge::Jump(merge_va)],
+            ),
+        );
+
+        let preds = |b: u64| match b {
+            x if x == merge_va => vec![right_va, entry_va, left_va],
+            x if x == left_va || x == right_va => vec![merge_va],
+            _ => Vec::new(),
+        };
+        let result = reaching_values(
+            &blocks,
+            &preds,
+            &|b| b == entry_va,
+            merge_va,
+            &[Register::RBX, Register::RAX],
+        )
+        .expect("mutual cycle must converge");
+
+        assert_eq!(
+            result,
+            vec![
+                (Register::RBX, Known::exact(table_va)),
+                (Register::RAX, Known::Range { lo: 1, hi: 5 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn reaching_values_isolated_cycle_without_entry_yields_unknown() {
+        // Pure 2-cycle 0x2000 <-> 0x3000 with no entry and no pred-less block.
+        let mut blocks = BTreeMap::new();
+        blocks.insert(
+            0x2000,
+            make_block(
+                0x2000,
+                &[0xB8, 0x07, 0x00, 0x00, 0x00], // mov eax, 7
+                Terminator::Jump,
+                vec![Edge::Jump(0x3000)],
+            ),
+        );
+        blocks.insert(
+            0x3000,
+            make_block(0x3000, &[0x90], Terminator::Jump, vec![Edge::Jump(0x2000)]),
+        );
+        let preds = |b: u64| match b {
+            0x2000 => vec![0x3000],
+            0x3000 => vec![0x2000],
+            _ => Vec::new(),
+        };
+        let result = reaching_values(
+            &blocks,
+            &preds,
+            &|_| false,
+            0x2000,
+            &[Register::RAX, Register::RBX],
+        )
+        .expect("isolated cycle must terminate cleanly");
+
+        assert_eq!(
+            result,
+            vec![
+                (Register::RAX, Known::Unknown),
+                (Register::RBX, Known::Unknown),
+            ]
+        );
+    }
+
+    #[test]
+    fn reaching_values_is_deterministic_across_pred_and_successor_permutations() {
+        // Multi-entry diamond feeding a loop merge: test that reversing/duplicating both
+        // predecessor lists and block successor lists produces identical results.
+        let build_blocks = |reverse_edges: bool| {
+            let mut blocks = BTreeMap::new();
+            let mut e1_edges = vec![Edge::Jump(0x3000), Edge::Jump(0x4000)];
+            let mut e2_edges = vec![Edge::Jump(0x3000), Edge::Jump(0x4000)];
+            if reverse_edges {
+                e1_edges.reverse();
+                e1_edges.push(Edge::Jump(0x3000));
+                e2_edges.reverse();
+                e2_edges.push(Edge::Jump(0x4000));
+            }
+            blocks.insert(
+                0x1000,
+                make_block(
+                    0x1000,
+                    &[0xB8, 0x02, 0x00, 0x00, 0x00], // mov eax, 2
+                    Terminator::Jump,
+                    e1_edges,
+                ),
+            );
+            blocks.insert(
+                0x2000,
+                make_block(
+                    0x2000,
+                    &[0xB8, 0x06, 0x00, 0x00, 0x00], // mov eax, 6
+                    Terminator::Jump,
+                    e2_edges,
+                ),
+            );
+            blocks.insert(
+                0x3000,
+                make_block(
+                    0x3000,
+                    &[0x48, 0x83, 0xC0, 0x01], // add rax, 1
+                    Terminator::Jump,
+                    vec![Edge::Jump(0x5000)],
+                ),
+            );
+            blocks.insert(
+                0x4000,
+                make_block(
+                    0x4000,
+                    &[0x48, 0x83, 0xE8, 0x01], // sub rax, 1
+                    Terminator::Jump,
+                    vec![Edge::Jump(0x5000)],
+                ),
+            );
+            blocks.insert(
+                0x5000,
+                make_block(0x5000, &[0x90], Terminator::Return, vec![Edge::Return]),
+            );
+            blocks
+        };
+
+        let preds_a = |b: u64| match b {
+            0x3000 | 0x4000 => vec![0x1000, 0x2000],
+            0x5000 => vec![0x3000, 0x4000],
+            _ => Vec::new(),
+        };
+        let preds_b = |b: u64| match b {
+            0x3000 | 0x4000 => vec![0x2000, 0x1000, 0x2000],
+            0x5000 => vec![0x4000, 0x3000, 0x4000],
+            _ => Vec::new(),
+        };
+        let is_entry = |b: u64| b == 0x1000 || b == 0x2000;
+
+        let r1 = reaching_values(&build_blocks(false), &preds_a, &is_entry, 0x5000, &[Register::RAX])
+            .expect("canonical run");
+        let r2 = reaching_values(&build_blocks(true), &preds_b, &is_entry, 0x5000, &[Register::RAX])
+            .expect("permuted run");
+
+        assert_eq!(r1, r2);
+        // Entry paths yield 2 and 6; 0x3000 adds 1 -> [3, 7], 0x4000 subs 1 -> [1, 5]; hull is [1, 7].
+        assert_eq!(r1, vec![(Register::RAX, Known::Range { lo: 1, hi: 7 })]);
+    }
+
+    #[test]
+    fn reaching_values_worklist_step_guard_bails_out_cleanly() {
+        // Widening self-loop requires > 3 worklist pops to reach fixpoint.
+        let mut blocks = BTreeMap::new();
+        blocks.insert(
+            0x1000,
+            make_block(
+                0x1000,
+                &[0x31, 0xC9], // xor ecx, ecx
+                Terminator::Jump,
+                vec![Edge::Jump(0x2000)],
+            ),
+        );
+        blocks.insert(
+            0x2000,
+            make_block(
+                0x2000,
+                &[0x48, 0x83, 0xC1, 0x01], // add rcx, 1
+                Terminator::Jump,
+                vec![Edge::Jump(0x2000)],
+            ),
+        );
+        let preds = |b: u64| match b {
+            0x2000 => vec![0x1000, 0x2000],
+            _ => Vec::new(),
+        };
+        let is_entry = |b: u64| b == 0x1000;
+
+        assert!(
+            reaching_values_bounded(
+                &blocks,
+                &preds,
+                &is_entry,
+                0x2000,
+                &[Register::RCX],
+                MAX_REACH_BLOCKS,
+                MAX_REACH_DEPTH,
+                3,
+            )
+            .is_none()
+        );
+        assert_eq!(
+            reaching_values_bounded(
+                &blocks,
+                &preds,
+                &is_entry,
+                0x2000,
+                &[Register::RCX],
+                MAX_REACH_BLOCKS,
+                MAX_REACH_DEPTH,
+                MAX_WORKLIST_STEPS,
+            ),
+            Some(vec![(Register::RCX, Known::Unknown)])
         );
     }
 }
