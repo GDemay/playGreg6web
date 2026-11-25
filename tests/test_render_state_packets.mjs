@@ -3633,3 +3633,545 @@ test('#659: bindGroupKindMismatches counts buffer, texture, storageTexture, and 
   assert.equal(handler.getTelemetry().bindGroupKindMismatches, 9);
   assert.equal(handler.getStats().bindGroupKindMismatches, 9);
 });
+
+// ---------------------------------------------------------------------------------------------
+// W161 (#855 / #809): Multi-plane PresentX canvas composition audit & hardening
+// ---------------------------------------------------------------------------------------------
+
+const PRESENT_BLIT_VS_WGSL = `struct VsOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) uv: vec2<f32>,
+};
+@vertex fn vs_main(@builtin(vertex_index) i: u32) -> VsOut {
+  let x = f32((i << 1u) & 2u);
+  let y = f32(i & 2u);
+  var o: VsOut;
+  o.pos = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
+  o.uv = vec2<f32>(x, y);
+  return o;
+}
+`;
+
+const PRESENT_BLIT_FS_WGSL = `@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var smp: sampler;
+@fragment fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+  return textureSampleLevel(src, smp, uv, 0.0);
+}
+`;
+
+function buildPresentBlitPipelineKey({ canvasFormatCode, blended = false }) {
+  const key = new Uint8Array(376);
+  const v = new DataView(key.buffer);
+  v.setUint32(20, 1, true); // color_target_count = 1
+  key[24] = canvasFormatCode;
+  key[25] = blended ? 1 : 0; // blend_enabled
+  key[26] = 0x0f; // write_mask = RGBA
+  if (blended) {
+    // Premultiplied alpha over planes below: Add(One, OneMinusSrcAlpha) for both color & alpha.
+    key.set([0, 1, 5, 0], 28); // color: op=Add(0), src=One(1), dst=OneMinusSrcAlpha(5)
+    key.set([0, 1, 5, 0], 32); // alpha: op=Add(0), src=One(1), dst=OneMinusSrcAlpha(5)
+  }
+  key[152] = 0; // primitive.topology = triangle-list
+  v.setUint32(160, 1, true); // multisample.count = 1
+  v.setUint32(164, 0xffffffff, true); // multisample.mask = 0xFFFFFFFF
+  return key;
+}
+
+function presentBeginRenderPassPacket({
+  textureId = SWAPCHAIN_TEXTURE_ID,
+  loadOp = 2, // Clear
+  storeOp = 1, // Store
+  formatCode = 0,
+  clearValue = [0, 0, 0, 1],
+} = {}) {
+  const payload = new Uint8Array(368);
+  const v = new DataView(payload.buffer);
+  v.setUint32(0, 1, true); // color_count = 1
+  v.setUint32(8, textureId, true);
+  v.setUint8(12, loadOp);
+  v.setUint8(13, storeOp);
+  payload.set(viewDesc({ format: formatCode, dimension: 2, mipCount: 1, layerCount: 1 }), 16);
+  v.setFloat32(32, clearValue[0], true);
+  v.setFloat32(36, clearValue[1], true);
+  v.setFloat32(40, clearValue[2], true);
+  v.setFloat32(44, clearValue[3], true);
+  return header(V2_OPCODES.BEGIN_RENDER_PASS, payload);
+}
+
+function evalBlendFactor(factor, src, dst) {
+  switch (factor) {
+    case 'zero':
+      return [0, 0, 0, 0];
+    case 'one':
+      return [1, 1, 1, 1];
+    case 'src-alpha':
+      return [src[3], src[3], src[3], src[3]];
+    case 'one-minus-src-alpha': {
+      const k = 1 - src[3];
+      return [k, k, k, k];
+    }
+    default:
+      throw new Error(`unexpected blend factor ${factor}`);
+  }
+}
+
+function evalWebGpuTargetBlend(targetDesc, src, dst) {
+  if (!targetDesc.blend) return [...src];
+  const evalChannel = (comp, c) => {
+    const sf = evalBlendFactor(comp.srcFactor, src, dst)[c];
+    const df = evalBlendFactor(comp.dstFactor, src, dst)[c];
+    if (comp.operation === 'add') return src[c] * sf + dst[c] * df;
+    throw new Error(`unexpected blend op ${comp.operation}`);
+  };
+  return [
+    evalChannel(targetDesc.blend.color, 0),
+    evalChannel(targetDesc.blend.color, 1),
+    evalChannel(targetDesc.blend.color, 2),
+    evalChannel(targetDesc.blend.alpha, 3),
+  ];
+}
+
+test('W161 (#855 / #809): PresentX 2-plane canvas composition replays exact #809 sequence (opaque plane 1 + premultiplied-alpha plane 0)', () => {
+  const gpu = createMockWebGpu();
+  gpu.ctx.canvas = { width: 1280, height: 720 };
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { format: 'bgra8unorm' });
+  const handler = installRenderStatePackets(processor);
+
+  const bgraCode = formatCodeOf('bgra8unorm');
+  const rgbaCode = formatCodeOf('rgba8unorm');
+
+  // Exact sampler emitted by Device::emit_present_planes: linear mag/min, nearest mip, clamp-to-edge, lod 0..32.
+  const presentSamplerPayload = new Uint8Array(24);
+  const sv = new DataView(presentSamplerPayload.buffer);
+  sv.setUint32(0, 105, true);
+  presentSamplerPayload.set([0, 0, 0, 1, 1, 0, 0], 4);
+  sv.setUint16(12, 1, true);
+  sv.setFloat32(16, 0, true);
+  sv.setFloat32(20, 32, true);
+
+  // Frame 1: Plane 1 = 4K scene (#2, bgra8unorm), Plane 0 = 1080p UI overlay (#10, rgba8unorm).
+  const frame1 = concat(
+    createTexture2Packet({ id: 2, width: 3840, height: 2160, format: bgraCode, usage: 0x14 }),
+    createTexture2Packet({ id: 3, width: 3840, height: 2160, format: bgraCode, usage: 0x14 }),
+    createTexture2Packet({ id: 10, width: 1920, height: 1080, format: rgbaCode, usage: 0x14 }),
+    new Stream()
+      .packet(OPCODES.BEGIN_FRAME)
+      .shader(101, 0, PRESENT_BLIT_VS_WGSL)
+      .shader(102, 1, PRESENT_BLIT_FS_WGSL)
+      .bytes(),
+    bindGroupLayoutPacket(103, [
+      { binding: 0, visibility: 2, type: 2, subtype: 0, dimension: 2 },
+      { binding: 1, visibility: 2, type: 1, subtype: 0 },
+    ]),
+    pipelineLayoutPacket(104, [103]),
+    header(V2_OPCODES.CREATE_SAMPLER2, presentSamplerPayload),
+    renderPipeline2Packet(110, 101, 102, 104, buildPresentBlitPipelineKey({ canvasFormatCode: bgraCode, blended: false })),
+    bindGroup2Packet(120, 103, [
+      { binding: 0, type: 1, id: 2, view: viewDesc({ dimension: 2, mipCount: 1, layerCount: 1 }) },
+      { binding: 1, type: 2, id: 105 },
+    ]),
+    renderPipeline2Packet(111, 101, 102, 104, buildPresentBlitPipelineKey({ canvasFormatCode: bgraCode, blended: true })),
+    bindGroup2Packet(121, 103, [
+      { binding: 0, type: 1, id: 10, view: viewDesc({ dimension: 2, mipCount: 1, layerCount: 1 }) },
+      { binding: 1, type: 2, id: 105 },
+    ]),
+    presentBeginRenderPassPacket({ formatCode: bgraCode, loadOp: 2, storeOp: 1, clearValue: [0, 0, 0, 1] }),
+    new Stream().u32s(OPCODES.SET_PIPELINE, [110]).bytes(),
+    setBindGroup2Packet(0, 120, []),
+    new Stream().u32s(OPCODES.DRAW, [3, 1, 0, 0]).bytes(),
+    new Stream().u32s(OPCODES.SET_PIPELINE, [111]).bytes(),
+    setBindGroup2Packet(0, 121, []),
+    new Stream().u32s(OPCODES.DRAW, [3, 1, 0, 0]).bytes(),
+    header(V2_OPCODES.END_RENDER_PASS, new Uint8Array(0)),
+    new Stream().packet(OPCODES.PRESENT).bytes()
+  );
+
+  const res1 = processor.executeCommandBuffer(frame1);
+  assert.equal(res1.presents, 1);
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  assert.equal(processor.skippedDrawCount, 0);
+  assert.equal(processor.unboundBindGroupCount, 0);
+  assert.equal(processor._drawCallCount, 2);
+  assert.equal(handler.telemetry.autoLayoutFallbacks, 0, 'PresentX explicit layout must match WGSL without auto remap');
+
+  // Verify exact sampler, bind group layout, pipeline layout, and both pipelines.
+  const [samplerCall] = gpu.results('createSampler');
+  assert.deepEqual(samplerCall.desc, {
+    addressModeU: 'clamp-to-edge',
+    addressModeV: 'clamp-to-edge',
+    addressModeW: 'clamp-to-edge',
+    magFilter: 'linear',
+    minFilter: 'linear',
+    mipmapFilter: 'nearest',
+    lodMinClamp: 0,
+    lodMaxClamp: 32,
+    maxAnisotropy: 1,
+  });
+
+  const [plCall] = gpu.results('createPipelineLayout');
+  const pipelines = gpu.results('createRenderPipeline');
+  assert.equal(pipelines.length, 2);
+  const opaqueTarget = pipelines[0].desc.fragment.targets[0];
+  const blendedTarget = pipelines[1].desc.fragment.targets[0];
+  assert.equal(pipelines[0].desc.layout, plCall.result);
+  assert.equal(pipelines[1].desc.layout, plCall.result);
+  assert.deepEqual(opaqueTarget, { format: 'bgra8unorm', writeMask: 15 });
+  assert.deepEqual(blendedTarget, {
+    format: 'bgra8unorm',
+    writeMask: 15,
+    blend: {
+      color: { operation: 'add', srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
+      alpha: { operation: 'add', srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
+    },
+  });
+
+  // Verify exact pass command sequence: single canvas pass clearing to opaque black, then
+  // plane 1 (opaque scene #2) followed by plane 0 (premultiplied-alpha UI #10).
+  const [bgPlane1, bgPlane0] = gpu.results('createBindGroup').map((c) => c.result);
+  assert.deepEqual(gpu.passCalls, [
+    {
+      pass: 'render',
+      op: 'beginRenderPass',
+      args: [
+        {
+          colorAttachments: [
+            { view: gpu.swapchainView, loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } },
+          ],
+        },
+      ],
+    },
+    { pass: 'render', op: 'setPipeline', args: [pipelines[0].result] },
+    { pass: 'render', op: 'setBindGroup', args: [0, bgPlane1, []] },
+    { pass: 'render', op: 'draw', args: [3, 1, 0, 0] },
+    { pass: 'render', op: 'setPipeline', args: [pipelines[1].result] },
+    { pass: 'render', op: 'setBindGroup', args: [0, bgPlane0, []] },
+    { pass: 'render', op: 'draw', args: [3, 1, 0, 0] },
+    { pass: 'render', op: 'end', args: [] },
+  ]);
+
+  // Software-verify the decoded blend descriptors preserve plane 1 under transparent black plane 0
+  // and composite premultiplied UI correctly.
+  const cleared = [0, 0, 0, 1];
+  const scenePixel = [0.8, 0.4, 0.2, 1.0];
+  const afterPlane1 = evalWebGpuTargetBlend(opaqueTarget, scenePixel, cleared);
+  assert.deepEqual(afterPlane1, scenePixel);
+  const afterTransparentUi = evalWebGpuTargetBlend(blendedTarget, [0, 0, 0, 0], afterPlane1);
+  assert.deepEqual(afterTransparentUi, scenePixel, 'transparent black plane 0 must leave plane 1 intact');
+  const afterSemiOpaqueUi = evalWebGpuTargetBlend(blendedTarget, [0.5, 0.25, 0.0, 0.5], afterPlane1);
+  assert.deepEqual(afterSemiOpaqueUi, [0.9, 0.45, 0.1, 1.0]);
+
+  // Frame 2: plane 1 alternates to scene #3, reusing both pipelines and creating only 1 new bind group.
+  const passStart = gpu.passCalls.length;
+  const frame2 = concat(
+    new Stream().packet(OPCODES.BEGIN_FRAME).bytes(),
+    bindGroup2Packet(122, 103, [
+      { binding: 0, type: 1, id: 3, view: viewDesc({ dimension: 2, mipCount: 1, layerCount: 1 }) },
+      { binding: 1, type: 2, id: 105 },
+    ]),
+    presentBeginRenderPassPacket({ formatCode: bgraCode, loadOp: 2, storeOp: 1, clearValue: [0, 0, 0, 1] }),
+    new Stream().u32s(OPCODES.SET_PIPELINE, [110]).bytes(),
+    setBindGroup2Packet(0, 122, []),
+    new Stream().u32s(OPCODES.DRAW, [3, 1, 0, 0]).bytes(),
+    new Stream().u32s(OPCODES.SET_PIPELINE, [111]).bytes(),
+    setBindGroup2Packet(0, 121, []),
+    new Stream().u32s(OPCODES.DRAW, [3, 1, 0, 0]).bytes(),
+    header(V2_OPCODES.END_RENDER_PASS, new Uint8Array(0)),
+    new Stream().packet(OPCODES.PRESENT).bytes()
+  );
+  const res2 = processor.executeCommandBuffer(frame2);
+  assert.equal(res2.presents, 1);
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  assert.equal(gpu.results('createRenderPipeline').length, 2, 'frame 2 must reuse cached pipelines');
+  const bgPlane1Alt = gpu.results('createBindGroup')[2].result;
+  const frame2Ops = gpu.passCalls.slice(passStart);
+  assert.equal(frame2Ops[2].args[1], bgPlane1Alt);
+  assert.equal(frame2Ops[5].args[1], bgPlane0);
+});
+
+test('W161 (#855 / #809): multi-plane canvas pass clamps 4K/1080p viewports to real swapchainTexture, guards float32 overflow & invalid loadOp/storeOp', () => {
+  const gpu = createMockWebGpu();
+  // Real swapchain GPUTexture is 1280x720 while processor options carry a stale 4K _viewportWidth/_viewportHeight.
+  gpu.ctx.getCurrentTexture = () => ({
+    width: 1280,
+    height: 720,
+    createView: () => gpu.swapchainView,
+  });
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, {
+    format: 'rgba8unorm',
+    width: 3840,
+    height: 2160,
+  });
+  const handler = installRenderStatePackets(processor);
+  const rgbaCode = formatCodeOf('rgba8unorm');
+
+  // Float32 rounding edge case: x=1e-6, width=1280 -> Math.fround(x) + Math.fround(width) must never exceed 1280.
+  const f32Edge = clampViewportToTarget(
+    { x: 1e-6, y: 1e-6, width: 1280, height: 720, minDepth: 0, maxDepth: 1 },
+    { width: 1280, height: 720 }
+  );
+  assert.ok(f32Edge.width > 0 && f32Edge.height > 0);
+  assert.ok(Math.fround(f32Edge.x) + Math.fround(f32Edge.width) <= 1280);
+  assert.ok(Math.fround(f32Edge.y) + Math.fround(f32Edge.height) <= 720);
+
+  const stream = concat(
+    createTexture2Packet({ id: 2, width: 3840, height: 2160, format: rgbaCode, usage: 0x14 }),
+    createTexture2Packet({ id: 10, width: 1920, height: 1080, format: rgbaCode, usage: 0x14 }),
+    new Stream()
+      .packet(OPCODES.BEGIN_FRAME)
+      .shader(1, 0, PRESENT_BLIT_VS_WGSL)
+      .shader(2, 1, PRESENT_BLIT_FS_WGSL)
+      .bytes(),
+    bindGroupLayoutPacket(20, [
+      { binding: 0, visibility: 2, type: 2, subtype: 0, dimension: 2 },
+      { binding: 1, visibility: 2, type: 1, subtype: 0 },
+    ]),
+    pipelineLayoutPacket(21, [20]),
+    createSampler2Packet(22, { filter: 1 }),
+    renderPipeline2Packet(30, 1, 2, 21, buildPresentBlitPipelineKey({ canvasFormatCode: rgbaCode, blended: false })),
+    renderPipeline2Packet(31, 1, 2, 21, buildPresentBlitPipelineKey({ canvasFormatCode: rgbaCode, blended: true })),
+    bindGroup2Packet(40, 20, [
+      { binding: 0, type: 1, id: 2, view: viewDesc({ dimension: 2, mipCount: 1, layerCount: 1 }) },
+      { binding: 1, type: 2, id: 22 },
+    ]),
+    bindGroup2Packet(41, 20, [
+      { binding: 0, type: 1, id: 10, view: viewDesc({ dimension: 2, mipCount: 1, layerCount: 1 }) },
+      { binding: 1, type: 2, id: 22 },
+    ]),
+    // Pass 1: Clear canvas with NaN clearValue channels (sanitized), draw plane 1 (4K vp/scissor) + plane 0 (1080p vp/scissor).
+    presentBeginRenderPassPacket({
+      formatCode: rgbaCode,
+      loadOp: 2,
+      storeOp: 1,
+      clearValue: [Number.NaN, Number.POSITIVE_INFINITY, -0, Number.NaN],
+    }),
+    new Stream().u32s(OPCODES.SET_PIPELINE, [30]).bytes(),
+    setBindGroup2Packet(0, 40, []),
+    setViewportPacket(0, 0, 3840, 2160, 0, 1),
+    setScissorPacket(0, 0, 3840, 2160),
+    new Stream().u32s(OPCODES.DRAW, [3, 1, 0, 0]).bytes(),
+    new Stream().u32s(OPCODES.SET_PIPELINE, [31]).bytes(),
+    setBindGroup2Packet(0, 41, []),
+    setViewportPacket(0, 0, 1920, 1080, 0, 1),
+    setScissorPacket(0, 0, 1920, 1080),
+    new Stream().u32s(OPCODES.DRAW, [3, 1, 0, 0]).bytes(),
+    header(V2_OPCODES.END_RENDER_PASS, new Uint8Array(0)),
+    // Pass 2: Second canvas pass with loadOp=0 (undefined) / storeOp=0 (undefined) -> normalized to 'load'/'store' without clearValue.
+    presentBeginRenderPassPacket({ formatCode: rgbaCode, loadOp: 0, storeOp: 0, clearValue: [1, 0, 0, 1] }),
+    new Stream().u32s(OPCODES.SET_PIPELINE, [31]).bytes(),
+    setBindGroup2Packet(0, 41, []),
+    new Stream().u32s(OPCODES.DRAW, [3, 1, 0, 0]).bytes(),
+    header(V2_OPCODES.END_RENDER_PASS, new Uint8Array(0)),
+    new Stream().packet(OPCODES.PRESENT).bytes()
+  );
+
+  const res = processor.executeCommandBuffer(stream);
+  assert.equal(res.presents, 1);
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  assert.equal(processor._drawCallCount, 3);
+
+  const begins = gpu.passCalls.filter((c) => c.op === 'beginRenderPass');
+  assert.equal(begins.length, 2);
+  assert.deepEqual(begins[0].args[0].colorAttachments[0], {
+    view: gpu.swapchainView,
+    loadOp: 'clear',
+    storeOp: 'store',
+    clearValue: { r: 0, g: 0, b: 0, a: 1 },
+  });
+  assert.deepEqual(begins[1].args[0].colorAttachments[0], {
+    view: gpu.swapchainView,
+    loadOp: 'load',
+    storeOp: 'store',
+  });
+  assert.equal('clearValue' in begins[1].args[0].colorAttachments[0], false);
+
+  // Both plane 1 (4K) and plane 0 (1080p) viewports/scissors clamped to actual swapchainTexture 1280x720.
+  assert.deepEqual(
+    gpu.passCalls.filter((c) => c.op === 'setViewport').map((c) => c.args),
+    [
+      [0, 0, 1280, 720, 0, 1],
+      [0, 0, 1280, 720, 0, 1],
+    ]
+  );
+  assert.deepEqual(
+    gpu.passCalls.filter((c) => c.op === 'setScissorRect').map((c) => c.args),
+    [
+      [0, 0, 1280, 720],
+      [0, 0, 1280, 720],
+    ]
+  );
+});
+
+test('W161 (#855 / #809): PresentX handles sRGB direct canvas views, WgpuSwapchain blit fallback, and mixed linear+sRGB passes', () => {
+  const { WgpuSwapchain } = require('../web/workers/wgpu_swapchain.js');
+  const rgbaSrgbCode = formatCodeOf('rgba8unorm-srgb');
+  const bgraSrgbCode = formatCodeOf('bgra8unorm-srgb');
+  const rgbaCode = formatCodeOf('rgba8unorm');
+  const rgba16fCode = formatCodeOf('rgba16float');
+
+  // Subtest A: Direct canvas context (no WgpuSwapchain) with rgba8unorm-srgb + mixed linear pass in same frame.
+  {
+    const gpu = createMockWebGpu();
+    const configured = [];
+    const createdCanvasViews = [];
+    gpu.ctx.configure = (cfg) => configured.push(cfg);
+    gpu.ctx.getCurrentTexture = () => ({
+      width: 1280,
+      height: 720,
+      createView(desc) {
+        const view = { kind: 'GPUTextureView', canvasViewDesc: desc || null };
+        createdCanvasViews.push(view);
+        return view;
+      },
+    });
+    const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { format: 'bgra8unorm' });
+    const handler = installRenderStatePackets(processor);
+
+    const stream = concat(
+      createTexture2Packet({ id: 2, width: 3840, height: 2160, format: rgbaSrgbCode, usage: 0x14 }),
+      createTexture2Packet({ id: 10, width: 1920, height: 1080, format: rgbaCode, usage: 0x14 }),
+      new Stream()
+        .packet(OPCODES.BEGIN_FRAME)
+        .shader(1, 0, PRESENT_BLIT_VS_WGSL)
+        .shader(2, 1, PRESENT_BLIT_FS_WGSL)
+        .bytes(),
+      bindGroupLayoutPacket(20, [
+        { binding: 0, visibility: 2, type: 2, subtype: 0, dimension: 2 },
+        { binding: 1, visibility: 2, type: 1, subtype: 0 },
+      ]),
+      pipelineLayoutPacket(21, [20]),
+      createSampler2Packet(22, { filter: 1 }),
+      renderPipeline2Packet(30, 1, 2, 21, buildPresentBlitPipelineKey({ canvasFormatCode: rgbaSrgbCode, blended: false })),
+      renderPipeline2Packet(31, 1, 2, 21, buildPresentBlitPipelineKey({ canvasFormatCode: rgbaSrgbCode, blended: true })),
+      bindGroup2Packet(40, 20, [
+        { binding: 0, type: 1, id: 2, view: viewDesc({ dimension: 2, mipCount: 1, layerCount: 1 }) },
+        { binding: 1, type: 2, id: 22 },
+      ]),
+      bindGroup2Packet(41, 20, [
+        { binding: 0, type: 1, id: 10, view: viewDesc({ dimension: 2, mipCount: 1, layerCount: 1 }) },
+        { binding: 1, type: 2, id: 22 },
+      ]),
+      // Pass 1: linear rgba8unorm swapchain pass, followed by Pass 2: PresentX rgba8unorm-srgb multi-plane pass.
+      presentBeginRenderPassPacket({ formatCode: rgbaCode, loadOp: 2, storeOp: 1, clearValue: [0, 0, 0, 1] }),
+      header(V2_OPCODES.END_RENDER_PASS, new Uint8Array(0)),
+      presentBeginRenderPassPacket({ formatCode: rgbaSrgbCode, loadOp: 2, storeOp: 1, clearValue: [0, 0, 0, 1] }),
+      new Stream().u32s(OPCODES.SET_PIPELINE, [30]).bytes(),
+      setBindGroup2Packet(0, 40, []),
+      new Stream().u32s(OPCODES.DRAW, [3, 1, 0, 0]).bytes(),
+      new Stream().u32s(OPCODES.SET_PIPELINE, [31]).bytes(),
+      setBindGroup2Packet(0, 41, []),
+      new Stream().u32s(OPCODES.DRAW, [3, 1, 0, 0]).bytes(),
+      header(V2_OPCODES.END_RENDER_PASS, new Uint8Array(0)),
+      new Stream().packet(OPCODES.PRESENT).bytes()
+    );
+
+    const res = processor.executeCommandBuffer(stream);
+    assert.equal(res.presents, 1);
+    assert.equal(handler.stats.errors, 0, handler.lastError);
+    assert.equal(processor.format, 'rgba8unorm');
+    assert.equal(processor._swapchainViewFormat, 'rgba8unorm-srgb');
+    assert.deepEqual(configured.at(-1), {
+      device: gpu.device,
+      format: 'rgba8unorm',
+      alphaMode: 'opaque',
+      viewFormats: ['rgba8unorm-srgb'],
+    });
+    const begins = gpu.passCalls.filter((c) => c.op === 'beginRenderPass');
+    assert.equal(begins.length, 2);
+    assert.deepEqual(begins[0].args[0].colorAttachments[0].view.canvasViewDesc, { format: 'rgba8unorm' });
+    assert.deepEqual(begins[1].args[0].colorAttachments[0].view.canvasViewDesc, { format: 'rgba8unorm-srgb' });
+  }
+
+  // Subtest B: WgpuSwapchain attached — bgra8unorm-srgb activates offscreen blit fallback,
+  // composes both planes onto the sRGB intermediate texture, blits to canvas, and switches cleanly to rgba16float.
+  {
+    const gpu = createMockWebGpu();
+    const origCreateRender = gpu.device.createRenderPipeline.bind(gpu.device);
+    gpu.device.createRenderPipeline = (desc) => {
+      const pipe = origCreateRender(desc);
+      pipe.getBindGroupLayout = () => ({ kind: 'GPUBindGroupLayout', autoFor: pipe.handle });
+      return pipe;
+    };
+    gpu.ctx.configure = () => {};
+    const canvas = { width: 1280, height: 720, getContext: () => gpu.ctx };
+    const swapchain = new WgpuSwapchain({
+      canvas,
+      device: gpu.device,
+      context: gpu.ctx,
+      format: 'bgra8unorm',
+      enableDepth: false,
+    });
+    swapchain.configure({ width: 1280, height: 720, devicePixelRatio: 1 });
+
+    const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, {
+      format: 'bgra8unorm',
+      swapchain,
+    });
+    const handler = installRenderStatePackets(processor);
+
+    const frameSrgb = concat(
+      createTexture2Packet({ id: 2, width: 3840, height: 2160, format: bgraSrgbCode, usage: 0x14 }),
+      createTexture2Packet({ id: 10, width: 1920, height: 1080, format: rgbaCode, usage: 0x14 }),
+      new Stream()
+        .packet(OPCODES.BEGIN_FRAME)
+        .shader(1, 0, PRESENT_BLIT_VS_WGSL)
+        .shader(2, 1, PRESENT_BLIT_FS_WGSL)
+        .bytes(),
+      bindGroupLayoutPacket(20, [
+        { binding: 0, visibility: 2, type: 2, subtype: 0, dimension: 2 },
+        { binding: 1, visibility: 2, type: 1, subtype: 0 },
+      ]),
+      pipelineLayoutPacket(21, [20]),
+      createSampler2Packet(22, { filter: 1 }),
+      renderPipeline2Packet(30, 1, 2, 21, buildPresentBlitPipelineKey({ canvasFormatCode: bgraSrgbCode, blended: false })),
+      renderPipeline2Packet(31, 1, 2, 21, buildPresentBlitPipelineKey({ canvasFormatCode: bgraSrgbCode, blended: true })),
+      bindGroup2Packet(40, 20, [
+        { binding: 0, type: 1, id: 2, view: viewDesc({ dimension: 2, mipCount: 1, layerCount: 1 }) },
+        { binding: 1, type: 2, id: 22 },
+      ]),
+      bindGroup2Packet(41, 20, [
+        { binding: 0, type: 1, id: 10, view: viewDesc({ dimension: 2, mipCount: 1, layerCount: 1 }) },
+        { binding: 1, type: 2, id: 22 },
+      ]),
+      presentBeginRenderPassPacket({ formatCode: bgraSrgbCode, loadOp: 2, storeOp: 1, clearValue: [0, 0, 0, 1] }),
+      new Stream().u32s(OPCODES.SET_PIPELINE, [30]).bytes(),
+      setBindGroup2Packet(0, 40, []),
+      new Stream().u32s(OPCODES.DRAW, [3, 1, 0, 0]).bytes(),
+      new Stream().u32s(OPCODES.SET_PIPELINE, [31]).bytes(),
+      setBindGroup2Packet(0, 41, []),
+      new Stream().u32s(OPCODES.DRAW, [3, 1, 0, 0]).bytes(),
+      header(V2_OPCODES.END_RENDER_PASS, new Uint8Array(0)),
+      new Stream().packet(OPCODES.PRESENT).bytes()
+    );
+
+    const resSrgb = processor.executeCommandBuffer(frameSrgb);
+    assert.equal(resSrgb.presents, 1);
+    assert.equal(handler.stats.errors, 0, handler.lastError);
+    assert.equal(swapchain.usesBlitFallback, true);
+    assert.equal(swapchain.streamFormat, 'bgra8unorm-srgb');
+    assert.equal(swapchain.blitCount, 1);
+
+    // Composition pass targeted the intermediate bgra8unorm-srgb view, followed by the blit pass onto canvas.
+    const begins = gpu.passCalls.filter((c) => c.op === 'beginRenderPass');
+    assert.equal(begins.length, 2);
+    assert.equal(begins[0].args[0].colorAttachments[0].view, swapchain.intermediateTextureView);
+    assert.equal(begins[1].args[0].colorAttachments[0].view, gpu.swapchainView);
+
+    // Frame 2: HDR rgba16float direct canvas format disables blit fallback cleanly.
+    const frameHdr = concat(
+      new Stream().packet(OPCODES.BEGIN_FRAME).bytes(),
+      renderPipeline2Packet(32, 1, 2, 21, buildPresentBlitPipelineKey({ canvasFormatCode: rgba16fCode, blended: false })),
+      presentBeginRenderPassPacket({ formatCode: rgba16fCode, loadOp: 2, storeOp: 1, clearValue: [0, 0, 0, 1] }),
+      new Stream().u32s(OPCODES.SET_PIPELINE, [32]).bytes(),
+      setBindGroup2Packet(0, 40, []),
+      new Stream().u32s(OPCODES.DRAW, [3, 1, 0, 0]).bytes(),
+      header(V2_OPCODES.END_RENDER_PASS, new Uint8Array(0)),
+      new Stream().packet(OPCODES.PRESENT).bytes()
+    );
+    const resHdr = processor.executeCommandBuffer(frameHdr);
+    assert.equal(resHdr.presents, 1);
+    assert.equal(handler.stats.errors, 0, handler.lastError);
+    assert.equal(swapchain.usesBlitFallback, false);
+    assert.equal(swapchain.format, 'rgba16float');
+    assert.equal(swapchain.blitCount, 1);
+  }
+});

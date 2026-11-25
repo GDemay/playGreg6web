@@ -1092,7 +1092,9 @@ function clampViewportToTarget(viewport, targetSize) {
     rawW >= 0 &&
     rawH >= 0 &&
     rawX + rawW <= targetWidth &&
-    rawY + rawH <= targetHeight
+    rawY + rawH <= targetHeight &&
+    Math.fround(rawX) + Math.fround(rawW) <= targetWidth &&
+    Math.fround(rawY) + Math.fround(rawH) <= targetHeight
   ) {
     return {
       x: rawX || 0,
@@ -1108,8 +1110,12 @@ function clampViewportToTarget(viewport, targetSize) {
   const y = Math.min(Math.max(0, rawY), targetHeight) || 0;
   let width = Math.min(Math.max(0, rawW), targetWidth - x) || 0;
   let height = Math.min(Math.max(0, rawH), targetHeight - y) || 0;
-  if (x + width > targetWidth) width = Math.max(0, targetWidth - x) || 0;
-  if (y + height > targetHeight) height = Math.max(0, targetHeight - y) || 0;
+  if (x + width > targetWidth || Math.fround(x) + Math.fround(width) > targetWidth) {
+    width = Math.max(0, Math.floor(targetWidth - Math.fround(x))) || 0;
+  }
+  if (y + height > targetHeight || Math.fround(y) + Math.fround(height) > targetHeight) {
+    height = Math.max(0, Math.floor(targetHeight - Math.fround(y))) || 0;
+  }
   return { x, y, width, height, minDepth, maxDepth };
 }
 
@@ -1550,6 +1556,7 @@ class RenderStatePackets {
         const endCmd = {
           type: 'renderState',
           _rsPassOp: 'endRenderPass',
+          _wgpuMeta: { kind: 'endRenderPass' },
           run: (ctl) => {
             if (ctl.passKind === 'render') ctl.endPass();
             this._activePass = null;
@@ -3136,7 +3143,29 @@ class RenderStatePackets {
 
   // Attachment view resolver; the canvas texture only exists at Present (ctl.swapchainView).
   _attachmentView(textureId, desc) {
-    if (textureId === SWAPCHAIN_TEXTURE_ID) return (ctl) => ctl.swapchainView;
+    if (textureId === SWAPCHAIN_TEXTURE_ID) {
+      const requestedFormat =
+        desc && typeof desc.format === 'string' && desc.format !== 'undefined' ? desc.format : null;
+      return (ctl) => {
+        if (
+          requestedFormat &&
+          ctl &&
+          ctl.swapchainTexture &&
+          typeof ctl.swapchainTexture.createView === 'function' &&
+          this.processor &&
+          this.processor._swapchainViewFormat &&
+          this.processor._swapchainViewFormat !== requestedFormat &&
+          (!this.processor._swapchain || !this.processor._swapchain.usesBlitFallback)
+        ) {
+          try {
+            return ctl.swapchainTexture.createView({ format: requestedFormat });
+          } catch (_) {
+            // Fall back to ctl.swapchainView if the swapchain texture does not support requestedFormat.
+          }
+        }
+        return ctl.swapchainView;
+      };
+    }
     const textureView = this._textureView(textureId, desc);
     return textureView ? () => textureView : null;
   }
@@ -3161,14 +3190,14 @@ class RenderStatePackets {
 
   _resolveSwapchainSize(ctl) {
     if (ctl) {
-      const fromCtl =
-        validTargetSize(ctl.canvasWidth, ctl.canvasHeight) ||
-        validTargetSize(ctl.swapchainWidth, ctl.swapchainHeight);
-      if (fromCtl) return fromCtl;
       if (ctl.swapchainTexture) {
         const fromTex = validTargetSize(ctl.swapchainTexture.width, ctl.swapchainTexture.height);
         if (fromTex) return fromTex;
       }
+      const fromCtl =
+        validTargetSize(ctl.swapchainWidth, ctl.swapchainHeight) ||
+        validTargetSize(ctl.canvasWidth, ctl.canvasHeight);
+      if (fromCtl) return fromCtl;
       if (typeof ctl.getCanvasTexture === 'function') {
         try {
           const tex = ctl.getCanvasTexture();
@@ -3190,6 +3219,10 @@ class RenderStatePackets {
     }
     const proc = this.processor;
     if (proc) {
+      if (proc._swapchain && !proc._swapchain.isDestroyed) {
+        const fromSwapchain = validTargetSize(proc._swapchain.width, proc._swapchain.height);
+        if (fromSwapchain) return fromSwapchain;
+      }
       if (proc.canvas) {
         const fromProcCanvas = validTargetSize(proc.canvas.width, proc.canvas.height);
         if (fromProcCanvas) return fromProcCanvas;
@@ -3228,8 +3261,17 @@ class RenderStatePackets {
   buildRenderPassDescriptor(decoded, resolvers, ctl) {
     const colorAttachments = decoded.colors.map((c, i) => {
       if (!c) return null;
-      const attachment = { view: resolvers.colors[i](ctl), loadOp: c.loadOp, storeOp: c.storeOp };
-      if (c.loadOp === 'clear') attachment.clearValue = c.clearValue;
+      const loadOp = c.loadOp === 'clear' || c.loadOp === 'load' ? c.loadOp : 'load';
+      const storeOp = c.storeOp === 'discard' || c.storeOp === 'store' ? c.storeOp : 'store';
+      const attachment = { view: resolvers.colors[i](ctl), loadOp, storeOp };
+      if (loadOp === 'clear') {
+        attachment.clearValue = {
+          r: finiteOr(c.clearValue && c.clearValue.r, 0) || 0,
+          g: finiteOr(c.clearValue && c.clearValue.g, 0) || 0,
+          b: finiteOr(c.clearValue && c.clearValue.b, 0) || 0,
+          a: finiteOr(c.clearValue && c.clearValue.a, 1) || 0,
+        };
+      }
       return attachment;
     });
     const descriptor = { colorAttachments };
@@ -3282,6 +3324,7 @@ class RenderStatePackets {
         c.textureId === SWAPCHAIN_TEXTURE_ID &&
         c.view &&
         c.view.format &&
+        c.view.format !== 'undefined' &&
         typeof this.processor.setSwapchainFormat === 'function'
       ) {
         // #709: match canvas swapchain format to the stream's declared attachment format.
@@ -3312,6 +3355,7 @@ class RenderStatePackets {
     this.processor._passCommands.push({
       type: 'renderState',
       _rsPassOp: 'beginRenderPass',
+      _wgpuMeta: { kind: 'beginRenderPass' },
       run: (ctl) => {
         const pass = ctl.beginRenderPass(this.buildRenderPassDescriptor(decoded, resolvers, ctl));
         this._activePass = pass || ctl.pass || null;
@@ -3734,6 +3778,11 @@ class RenderStatePackets {
         bindGroup,
         bindGroupDesc,
         offsets,
+      },
+      _wgpuMeta: {
+        kind: 'setBindGroup2',
+        groupIndex: index,
+        bindGroupId,
       },
       run: (ctl) => {
         if (ctl.pass) ctl.pass.setBindGroup(index, bindGroup, offsets);
