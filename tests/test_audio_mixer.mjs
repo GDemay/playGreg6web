@@ -11,10 +11,19 @@ const {
   decodePcm16,
   decodeImaAdpcm,
   softClipSample,
+  downmixToStereo,
+  resampleLinear,
   DEFAULT_SAMPLE_RATE,
+  MIN_SAMPLE_RATE,
+  MAX_SAMPLE_RATE,
+  MAX_RESAMPLE_RATIO,
   DEFAULT_CHANNELS,
   DEFAULT_MAX_VOICES,
   DEFAULT_SOFT_CLIP_KNEE,
+  ITU_BS775_CENTER_GAIN,
+  ITU_BS775_SURROUND_GAIN,
+  ITU_BS775_LFE_GAIN,
+  SUPPORTED_VOICE_CHANNELS,
   IMA_INDEX_TABLE,
   IMA_STEP_TABLE,
 } = mixerMod;
@@ -755,5 +764,244 @@ test('W139: getStats() tracks peakOutputLevel, activeVoicePeak, clippedSamples, 
   assert.equal(postResetStats.clippedSamples, 0);
   assert.equal(postResetStats.sanitizedNonFiniteSamples, 0);
   assert.ok(Math.abs(postResetStats.peakOutputLevel - 0.5) < 1e-6);
+});
+
+// ---------------------------------------------------------------------------
+// W170: ITU-R BS.775 5.1 / 7.1 Downmix, 44.1<->48 kHz Resampling & Telemetry
+// ---------------------------------------------------------------------------
+
+test('W170: downmixToStereo applies ITU-R BS.775 5.1 & 7.1 weights, soft-clip guard, and per-channel NaN sanitization', () => {
+  assert.equal(typeof downmixToStereo, 'function');
+  assert.equal(globalThis.PlayGta6AudioMixer.downmixToStereo, downmixToStereo);
+  assert.ok(Math.abs(ITU_BS775_CENTER_GAIN - 0.70710678) < 1e-7);
+  assert.ok(Math.abs(ITU_BS775_SURROUND_GAIN - 0.70710678) < 1e-7);
+  assert.equal(ITU_BS775_LFE_GAIN, 0.0);
+  assert.deepEqual(Array.from(SUPPORTED_VOICE_CHANNELS), [1, 2, 4, 6, 8]);
+
+  // 6 isolated 5.1 frames: FL, FR, FC, LFE, BL, BR
+  const isolated51 = new Float32Array([
+    0.5, 0.0, 0.0, 0.0, 0.0, 0.0, // frame 0: FL
+    0.0, 0.5, 0.0, 0.0, 0.0, 0.0, // frame 1: FR
+    0.0, 0.0, 0.8, 0.0, 0.0, 0.0, // frame 2: FC -> 0.8 * 0.70710678 on L & R
+    0.0, 0.0, 0.0, 0.9, 0.0, 0.0, // frame 3: LFE -> 0.0 by default
+    0.0, 0.0, 0.0, 0.0, 0.6, 0.0, // frame 4: BL -> 0.6 * 0.70710678 on L
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.6, // frame 5: BR -> 0.6 * 0.70710678 on R
+  ]);
+  const stats51 = {};
+  const out51 = downmixToStereo(isolated51, 6, { stats: stats51 });
+  assert.equal(out51.length, 6 * 2);
+
+  assert.ok(Math.abs(out51[0] - 0.5) < 1e-6 && out51[1] === 0.0);
+  assert.ok(out51[2] === 0.0 && Math.abs(out51[3] - 0.5) < 1e-6);
+  assert.ok(Math.abs(out51[4] - 0.8 * ITU_BS775_CENTER_GAIN) < 1e-6);
+  assert.ok(Math.abs(out51[5] - 0.8 * ITU_BS775_CENTER_GAIN) < 1e-6);
+  assert.equal(out51[6], 0.0);
+  assert.equal(out51[7], 0.0);
+  assert.ok(Math.abs(out51[8] - 0.6 * ITU_BS775_SURROUND_GAIN) < 1e-6 && out51[9] === 0.0);
+  assert.ok(out51[10] === 0.0 && Math.abs(out51[11] - 0.6 * ITU_BS775_SURROUND_GAIN) < 1e-6);
+  assert.equal(stats51.downmixedFrames, 6);
+  assert.equal(stats51.clippedSamples, 0);
+  assert.equal(stats51.nanSanitizedSamples, 0);
+
+  // Explicit LFE gain override routes LFE cleanly into L & R.
+  const out51Lfe = downmixToStereo(new Float32Array([0, 0, 0, 0.8, 0, 0]), 6, { lfeGain: 0.5 });
+  assert.ok(Math.abs(out51Lfe[0] - 0.4) < 1e-6);
+  assert.ok(Math.abs(out51Lfe[1] - 0.4) < 1e-6);
+
+  // 7.1 (8ch: FL, FR, FC, LFE, BL, BR, SL, SR) routing + combined surround check.
+  const input71 = new Float32Array([
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.6, 0.0, // frame 0: SL only
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.6, // frame 1: SR only
+    0.2, -0.2, 0.2, 0.9, 0.2, -0.2, 0.2, -0.2, // frame 2: combined
+  ]);
+  const stats71 = {};
+  const out71 = downmixToStereo(input71, 8, { stats: stats71 });
+  assert.equal(out71.length, 3 * 2);
+  assert.ok(Math.abs(out71[0] - 0.6 * ITU_BS775_SURROUND_GAIN) < 1e-6 && out71[1] === 0.0);
+  assert.ok(out71[2] === 0.0 && Math.abs(out71[3] - 0.6 * ITU_BS775_SURROUND_GAIN) < 1e-6);
+  const expectedL = 0.2 + 0.2 * ITU_BS775_CENTER_GAIN + 0.4 * ITU_BS775_SURROUND_GAIN;
+  const expectedR = -0.2 + 0.2 * ITU_BS775_CENTER_GAIN - 0.4 * ITU_BS775_SURROUND_GAIN;
+  assert.ok(Math.abs(out71[4] - expectedL) < 1e-6);
+  assert.ok(Math.abs(out71[5] - expectedR) < 1e-6);
+  assert.equal(stats71.downmixedFrames, 3);
+
+  // Full-scale 5.1 & 7.1 peaks soft-clip smoothly inside (0.95, 1.0] without hard-clipping.
+  const hotStats = {};
+  const hot51 = downmixToStereo(new Float32Array([1, 1, 1, 1, 1, 1]), 6, { stats: hotStats });
+  const hot71 = downmixToStereo(new Float32Array([1, 1, 1, 1, 1, 1, 1, 1]), 8, { stats: hotStats });
+  assert.ok(hot51[0] > 0.95 && hot51[0] <= 1.0);
+  assert.ok(hot71[0] > 0.95 && hot71[0] <= 1.0);
+  assert.equal(hotStats.clippedSamples, 4);
+  assert.equal(hotStats.downmixedFrames, 2);
+
+  // Per-channel NaN / +-Infinity isolation: bad FC/LFE/BL must NOT poison FL/FR/BR.
+  const nanStats = {};
+  const bad51 = new Float32Array([
+    0.5, -0.4, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 0.2,
+  ]);
+  const cleanOut = downmixToStereo(bad51, 6, { stats: nanStats });
+  assert.ok(Math.abs(cleanOut[0] - 0.5) < 1e-6);
+  assert.ok(Math.abs(cleanOut[1] - (-0.4 + 0.2 * ITU_BS775_SURROUND_GAIN)) < 1e-6);
+  assert.equal(nanStats.nanSanitizedSamples, 3);
+
+  // Unsupported channel counts throw RangeError.
+  assert.throws(() => downmixToStereo(new Float32Array(9), 3), RangeError);
+  assert.throws(() => downmixToStereo(new Float32Array(10), 5), RangeError);
+  assert.throws(() => downmixToStereo(new Float32Array(18), 9), RangeError);
+  assert.throws(() => downmixToStereo(new Float32Array(6), 0), RangeError);
+});
+
+test('W170: AudioMixer mixes 5.1 & 7.1 Bink2/XAudio2 voices with 44.1->48 kHz resampling, soft-clipping, and full telemetry', () => {
+  const mixer = new AudioMixer({ sampleRate: 48000, softClip: true });
+
+  // 1. Isolated 5.1 voice @ 48 kHz verifies exact ITU-R BS.775 rendering in mixer.
+  const voice51 = new Float32Array([
+    0.4, -0.2, 0.3, 0.9, 0.2, -0.1,
+    0.4, -0.2, 0.3, 0.9, 0.2, -0.1,
+  ]);
+  mixer.createVoice({ samples: voice51, sampleRate: 48000, channels: 6, loop: false });
+  const out51 = mixer.renderFrames(2);
+  const expL = 0.4 + 0.3 * ITU_BS775_CENTER_GAIN + 0.2 * ITU_BS775_SURROUND_GAIN;
+  const expR = -0.2 + 0.3 * ITU_BS775_CENTER_GAIN - 0.1 * ITU_BS775_SURROUND_GAIN;
+  assert.ok(Math.abs(out51[0] - expL) < 1e-6);
+  assert.ok(Math.abs(out51[1] - expR) < 1e-6);
+
+  let stats = mixer.getStats();
+  assert.equal(stats.downmixedFrames, 2);
+  assert.equal(stats.resampledFrames, 0);
+  assert.equal(stats.clippedSamples, 0);
+  assert.equal(stats.nanSanitizedSamples, 0);
+  assert.equal(stats.activeVoicePeak, 1);
+
+  // 2. Concurrent 5.1 @ 44.1 kHz (Bink2 intro) + 7.1 @ 48 kHz (menu XAudio2) with hot peaks + NaN surround.
+  const binkFrames = 16;
+  const bink51 = new Float32Array(binkFrames * 6);
+  for (let f = 0; f < binkFrames; f++) {
+    bink51[f * 6 + 0] = 0.7; // FL
+    bink51[f * 6 + 1] = 0.7; // FR
+    bink51[f * 6 + 2] = f === 0 ? Number.NaN : 0.6; // FC (NaN on frame 0 must not poison FL/FR)
+    bink51[f * 6 + 3] = 0.5; // LFE
+    bink51[f * 6 + 4] = 0.5; // BL
+    bink51[f * 6 + 5] = 0.5; // BR
+  }
+  const menu71 = new Float32Array(16 * 8);
+  for (let f = 0; f < 16; f++) {
+    menu71[f * 8 + 0] = 0.4;
+    menu71[f * 8 + 1] = 0.4;
+    menu71[f * 8 + 2] = 0.3;
+    menu71[f * 8 + 4] = 0.2;
+    menu71[f * 8 + 5] = 0.2;
+    menu71[f * 8 + 6] = 0.2;
+    menu71[f * 8 + 7] = 0.2;
+  }
+
+  mixer.createVoice({ samples: bink51, sampleRate: 44100, channels: 6, loop: true });
+  mixer.createVoice({ samples: menu71, sampleRate: 48000, channels: 8, loop: true });
+
+  const mixed = mixer.renderFrames(8);
+  for (let i = 0; i < mixed.length; i++) {
+    assert.ok(Number.isFinite(mixed[i]), `Mixed sample ${i} must be finite`);
+    assert.ok(mixed[i] >= -1.0 && mixed[i] <= 1.0, `Mixed sample ${i} out of [-1, 1]: ${mixed[i]}`);
+  }
+
+  // Pump into an AudioRingBuffer that already experienced an underrun so underrunCount syncs cleanly.
+  const ring = AudioRingBuffer.create(16, 2);
+  ring.pullSamples(new Float32Array(4 * 2)); // triggers 1 underrun on ring
+  assert.equal(ring.underrunCount, 1);
+  const pumped = mixer.pumpToRing(ring, 8);
+  assert.equal(pumped, 8);
+
+  stats = mixer.getStats();
+  assert.equal(stats.activeVoicePeak, 2);
+  assert.ok(stats.downmixedFrames >= 2 + 16 + 16);
+  assert.ok(stats.resampledFrames >= 16);
+  assert.ok(stats.clippedSamples > 0, 'Expected soft-clip limiter to engage on summed 5.1+7.1 voices');
+  assert.ok(stats.nanSanitizedSamples >= 1, 'Expected NaN in FC channel to be sanitized and counted');
+  assert.equal(stats.nanSanitizedSamples, stats.sanitizedNonFiniteSamples);
+  assert.equal(stats.underrunCount, 1);
+
+  // reset() clears all W170 counters cleanly.
+  mixer.reset();
+  const afterReset = mixer.getStats();
+  assert.equal(afterReset.downmixedFrames, 0);
+  assert.equal(afterReset.resampledFrames, 0);
+  assert.equal(afterReset.clippedSamples, 0);
+  assert.equal(afterReset.nanSanitizedSamples, 0);
+  assert.equal(afterReset.underrunCount, 0);
+  assert.equal(afterReset.activeVoicePeak, 0);
+});
+
+test('W170: resampleLinear handles 44.1 kHz <-> 48 kHz accurately with streaming phase continuity and safeguards', () => {
+  assert.equal(typeof resampleLinear, 'function');
+  assert.equal(globalThis.PlayGta6AudioMixer.resampleLinear, resampleLinear);
+  assert.equal(MIN_SAMPLE_RATE, 8000);
+  assert.equal(MAX_SAMPLE_RATE, 384000);
+  assert.equal(MAX_RESAMPLE_RATIO, 16);
+
+  // 1. 44.1 kHz -> 48 kHz: 441 frames (10 ms) of 1 kHz stereo sine -> exact 480 frames.
+  const freq = 1000;
+  const src441 = new Float32Array(441 * 2);
+  for (let f = 0; f < 441; f++) {
+    src441[f * 2] = Math.sin((2 * Math.PI * freq * f) / 44100) * 0.7;
+    src441[f * 2 + 1] = Math.cos((2 * Math.PI * freq * f) / 44100) * 0.5;
+  }
+  const rsUpStats = {};
+  const up48 = resampleLinear(src441, 2, 44100, 48000, { stats: rsUpStats });
+  assert.equal(up48.length, 480 * 2);
+  assert.equal(rsUpStats.resampledFrames, 480);
+
+  const ref48 = new Float32Array(480 * 2);
+  for (let f = 0; f < 480; f++) {
+    ref48[f * 2] = Math.sin((2 * Math.PI * freq * f) / 48000) * 0.7;
+    ref48[f * 2 + 1] = Math.cos((2 * Math.PI * freq * f) / 48000) * 0.5;
+  }
+  const upRms = computeRmsError(up48, ref48, 0, (480 - 2) * 2);
+  assert.ok(upRms < 0.005, `44.1 -> 48 kHz RMS error too high: ${upRms}`);
+
+  // 2. 48 kHz -> 44.1 kHz: 480 frames (10 ms) -> exact 441 frames.
+  const rsDownStats = {};
+  const down441 = resampleLinear(ref48, 2, 48000, 44100, { stats: rsDownStats });
+  assert.equal(down441.length, 441 * 2);
+  assert.equal(rsDownStats.resampledFrames, 441);
+  const downRms = computeRmsError(down441, src441, 0, (441 - 2) * 2);
+  assert.ok(downRms < 0.005, `48 -> 44.1 kHz RMS error too high: ${downRms}`);
+
+  // 3. Streaming chunk phase continuity: 20 chunks of 512 frames @ 44.1 kHz -> 48 kHz has zero drift.
+  const streamState = { phase: 0.0 };
+  let totalOutFrames = 0;
+  for (let chunk = 0; chunk < 20; chunk++) {
+    const buf = new Float32Array(512 * 2);
+    for (let f = 0; f < 512; f++) {
+      const globalF = chunk * 512 + f;
+      buf[f * 2] = Math.sin((2 * Math.PI * 440 * globalF) / 44100) * 0.5;
+      buf[f * 2 + 1] = -buf[f * 2];
+    }
+    const res = resampleLinear(buf, 2, 44100, 48000, { state: streamState });
+    totalOutFrames += res.length / 2;
+  }
+  const expectedTotal = Math.round((20 * 512 * 48000) / 44100);
+  assert.ok(
+    Math.abs(totalOutFrames - expectedTotal) <= 1,
+    `Expected drift-free total ~${expectedTotal}, got ${totalOutFrames}`
+  );
+
+  // 4. NaN / +-Infinity sanitization during resampling.
+  const nanStats = {};
+  const bad = new Float32Array([0.2, Number.NaN, 0.4, Number.POSITIVE_INFINITY, 0.6, -0.6]);
+  const safeRes = resampleLinear(bad, 2, 44100, 48000, { stats: nanStats });
+  for (let i = 0; i < safeRes.length; i++) {
+    assert.ok(Number.isFinite(safeRes[i]), `Expected finite resampled value at ${i}`);
+  }
+  assert.ok(nanStats.nanSanitizedSamples >= 2);
+
+  // 5. Safeguards reject out-of-range sample rates, >16x ratio, and excessive output allocations.
+  assert.throws(() => resampleLinear(src441, 2, 0, 48000), RangeError);
+  assert.throws(() => resampleLinear(src441, 2, 44100, Number.NaN), RangeError);
+  assert.throws(() => resampleLinear(src441, 2, 4000, 48000), RangeError);
+  assert.throws(() => resampleLinear(src441, 2, 44100, 500000), RangeError);
+  assert.throws(() => resampleLinear(src441, 2, 8000, 384000), RangeError); // 48x > 16x guard
+  assert.throws(() => resampleLinear(src441, 2, 44100, 48000, { maxOutputFrames: 100 }), RangeError);
+  assert.throws(() => resampleLinear(src441, 0, 44100, 48000), RangeError);
+  assert.throws(() => resampleLinear(src441, 9, 44100, 48000), RangeError);
 });
 

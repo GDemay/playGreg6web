@@ -2,10 +2,20 @@
 
 (function (root) {
   const DEFAULT_SAMPLE_RATE = 48000;
+  const MIN_SAMPLE_RATE = 8000;
+  const MAX_SAMPLE_RATE = 384000;
+  const MAX_RESAMPLE_RATIO = 16;
+  const DEFAULT_MAX_RESAMPLE_FRAMES = 524288;
   const DEFAULT_CHANNELS = 2;
   const DEFAULT_MAX_VOICES = 64;
   const DEFAULT_SOFT_CLIP_KNEE = 0.95;
   const DEFAULT_LIMITER_KNEE = DEFAULT_SOFT_CLIP_KNEE;
+
+  // ITU-R BS.775-3 multi-channel to stereo downmix weights (-3 dB center & surround, LFE omitted by default).
+  const ITU_BS775_CENTER_GAIN = Math.SQRT1_2;
+  const ITU_BS775_SURROUND_GAIN = Math.SQRT1_2;
+  const ITU_BS775_LFE_GAIN = 0.0;
+  const SUPPORTED_VOICE_CHANNELS = Object.freeze([1, 2, 4, 6, 8]);
 
   // Standard IMA / DVI ADPCM step-index adjustment table (16 4-bit nibble values).
   const IMA_INDEX_TABLE = Object.freeze([
@@ -332,6 +342,383 @@
     return x < 0 ? -bounded : bounded;
   }
 
+  function validateDownmixGain(value, fallback, name) {
+    if (value === undefined) {
+      return fallback;
+    }
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+      throw new RangeError(`${name} must be a non-negative finite number, got ${value}`);
+    }
+    return value;
+  }
+
+  /**
+   * Downmixes interleaved multi-channel PCM (1, 2, 4, 5.1 [6ch], or 7.1 [8ch])
+   * into interleaved stereo Float32 PCM using ITU-R BS.775 weights:
+   *   - 5.1 (FL, FR, FC, LFE, BL, BR):
+   *       L = FL + 0.70710678 * FC + 0.70710678 * BL (+ lfeGain * LFE)
+   *       R = FR + 0.70710678 * FC + 0.70710678 * BR (+ lfeGain * LFE)
+   *   - 7.1 (FL, FR, FC, LFE, BL, BR, SL, SR):
+   *       L = FL + 0.70710678 * FC + 0.70710678 * (BL + SL) (+ lfeGain * LFE)
+   *       R = FR + 0.70710678 * FC + 0.70710678 * (BR + SR) (+ lfeGain * LFE)
+   *
+   * Sanitizes non-finite input samples per channel before summation so NaN/Infinity
+   * in any channel never poisons the stereo mix, and applies the smooth tanh
+   * soft-clip peak limiter by default so multi-channel Bink2/XAudio2 voices never
+   * hard-clip.
+   *
+   * @param {Float32Array|ArrayBuffer|ArrayBufferView|number[]} samples
+   * @param {number} channels Source interleaved channel count (1, 2, 4, 6, or 8).
+   * @param {object} [options]
+   * @returns {Float32Array} Interleaved stereo Float32Array (length = frameCount * 2).
+   */
+  function downmixToStereo(samples, channels, options = {}) {
+    if (!Number.isInteger(channels) || !SUPPORTED_VOICE_CHANNELS.includes(channels)) {
+      throw new RangeError(
+        `downmixToStereo channels must be one of ${SUPPORTED_VOICE_CHANNELS.join(', ')}, got ${channels}`
+      );
+    }
+
+    const opts = options && typeof options === 'object' ? options : {};
+    const centerGain = validateDownmixGain(
+      opts.centerGain !== undefined ? opts.centerGain : opts.centerWeight,
+      ITU_BS775_CENTER_GAIN,
+      'centerGain'
+    );
+    const surroundGain = validateDownmixGain(
+      opts.surroundGain !== undefined ? opts.surroundGain : opts.surroundWeight,
+      ITU_BS775_SURROUND_GAIN,
+      'surroundGain'
+    );
+    const lfeGain = validateDownmixGain(
+      opts.lfeGain !== undefined ? opts.lfeGain : opts.lfeWeight,
+      ITU_BS775_LFE_GAIN,
+      'lfeGain'
+    );
+    const softClip = opts.softClip !== undefined ? Boolean(opts.softClip) : true;
+    const knee =
+      opts.limiterKnee !== undefined
+        ? opts.limiterKnee
+        : opts.knee !== undefined
+          ? opts.knee
+          : DEFAULT_LIMITER_KNEE;
+    if (typeof knee !== 'number' || !Number.isFinite(knee) || knee < 0 || knee >= 1.0) {
+      throw new RangeError(`limiterKnee must be in [0, 1), got ${knee}`);
+    }
+
+    const src = toFloat32Samples(samples);
+    const frameCount = Math.floor(src.length / channels);
+    const out = new Float32Array(frameCount * 2);
+
+    let nanSanitized = 0;
+    let clipped = 0;
+    let peak = 0.0;
+
+    for (let f = 0; f < frameCount; f++) {
+      const base = f * channels;
+      let rawL;
+      let rawR;
+
+      if (channels === 6) {
+        let fl = src[base];
+        let fr = src[base + 1];
+        let fc = src[base + 2];
+        let lfe = src[base + 3];
+        let bl = src[base + 4];
+        let br = src[base + 5];
+
+        if (!Number.isFinite(fl)) { fl = 0.0; nanSanitized += 1; }
+        if (!Number.isFinite(fr)) { fr = 0.0; nanSanitized += 1; }
+        if (!Number.isFinite(fc)) { fc = 0.0; nanSanitized += 1; }
+        if (!Number.isFinite(lfe)) { lfe = 0.0; nanSanitized += 1; }
+        if (!Number.isFinite(bl)) { bl = 0.0; nanSanitized += 1; }
+        if (!Number.isFinite(br)) { br = 0.0; nanSanitized += 1; }
+
+        rawL = fl + fc * centerGain + bl * surroundGain + lfe * lfeGain;
+        rawR = fr + fc * centerGain + br * surroundGain + lfe * lfeGain;
+      } else if (channels === 8) {
+        let fl = src[base];
+        let fr = src[base + 1];
+        let fc = src[base + 2];
+        let lfe = src[base + 3];
+        let bl = src[base + 4];
+        let br = src[base + 5];
+        let sl = src[base + 6];
+        let sr = src[base + 7];
+
+        if (!Number.isFinite(fl)) { fl = 0.0; nanSanitized += 1; }
+        if (!Number.isFinite(fr)) { fr = 0.0; nanSanitized += 1; }
+        if (!Number.isFinite(fc)) { fc = 0.0; nanSanitized += 1; }
+        if (!Number.isFinite(lfe)) { lfe = 0.0; nanSanitized += 1; }
+        if (!Number.isFinite(bl)) { bl = 0.0; nanSanitized += 1; }
+        if (!Number.isFinite(br)) { br = 0.0; nanSanitized += 1; }
+        if (!Number.isFinite(sl)) { sl = 0.0; nanSanitized += 1; }
+        if (!Number.isFinite(sr)) { sr = 0.0; nanSanitized += 1; }
+
+        rawL = fl + fc * centerGain + (bl + sl) * surroundGain + lfe * lfeGain;
+        rawR = fr + fc * centerGain + (br + sr) * surroundGain + lfe * lfeGain;
+      } else if (channels === 4) {
+        let fl = src[base];
+        let fr = src[base + 1];
+        let bl = src[base + 2];
+        let br = src[base + 3];
+
+        if (!Number.isFinite(fl)) { fl = 0.0; nanSanitized += 1; }
+        if (!Number.isFinite(fr)) { fr = 0.0; nanSanitized += 1; }
+        if (!Number.isFinite(bl)) { bl = 0.0; nanSanitized += 1; }
+        if (!Number.isFinite(br)) { br = 0.0; nanSanitized += 1; }
+
+        rawL = fl + bl * surroundGain;
+        rawR = fr + br * surroundGain;
+      } else if (channels === 2) {
+        let fl = src[base];
+        let fr = src[base + 1];
+        if (!Number.isFinite(fl)) { fl = 0.0; nanSanitized += 1; }
+        if (!Number.isFinite(fr)) { fr = 0.0; nanSanitized += 1; }
+        rawL = fl;
+        rawR = fr;
+      } else {
+        let m = src[base];
+        if (!Number.isFinite(m)) { m = 0.0; nanSanitized += 1; }
+        rawL = m;
+        rawR = m;
+      }
+
+      if (!Number.isFinite(rawL)) { rawL = 0.0; nanSanitized += 1; }
+      if (!Number.isFinite(rawR)) { rawR = 0.0; nanSanitized += 1; }
+
+      let outL;
+      let outR;
+      if (softClip) {
+        if (rawL > knee || rawL < -knee) clipped += 1;
+        if (rawR > knee || rawR < -knee) clipped += 1;
+        outL = softClipSample(rawL, knee);
+        outR = softClipSample(rawR, knee);
+      } else {
+        if (rawL > 1.0 || rawL < -1.0) clipped += 1;
+        if (rawR > 1.0 || rawR < -1.0) clipped += 1;
+        outL = clamp(rawL, -1.0, 1.0);
+        outR = clamp(rawR, -1.0, 1.0);
+      }
+
+      const absL = Math.abs(outL);
+      const absR = Math.abs(outR);
+      if (absL > peak) peak = absL;
+      if (absR > peak) peak = absR;
+
+      const outIdx = f * 2;
+      out[outIdx] = outL;
+      out[outIdx + 1] = outR;
+    }
+
+    if (opts.stats && typeof opts.stats === 'object') {
+      const dmFrames = channels > 2 ? frameCount : 0;
+      opts.stats.downmixedFrames = (opts.stats.downmixedFrames || 0) + dmFrames;
+      opts.stats.clippedSamples = (opts.stats.clippedSamples || 0) + clipped;
+      opts.stats.nanSanitizedSamples = (opts.stats.nanSanitizedSamples || 0) + nanSanitized;
+      opts.stats.peakLevel = Math.max(opts.stats.peakLevel || 0.0, peak);
+    }
+
+    return out;
+  }
+
+  /**
+   * Smooth linear PCM resampler with safeguards for 44.1 kHz <-> 48 kHz and
+   * general Xbox Series Bink2 / XAudio2 sample-rate conversions.
+   *
+   * Safeguards:
+   * - Validates channel count, sample-rate range [8 kHz, 384 kHz], max conversion
+   *   ratio (16x), and maximum output frame budget to prevent OOM allocations.
+   * - Sanitizes non-finite input samples (NaN / +-Infinity) to 0.0 per channel
+   *   before interpolation.
+   * - Supports optional `options.state = { phase }` for drift-free fractional
+   *   phase continuity across sequential audio chunks.
+   *
+   * @param {Float32Array|ArrayBuffer|ArrayBufferView|number[]} samples
+   * @param {number} channels Interleaved channel count (1..8).
+   * @param {number} srcSampleRate Source sample rate in Hz.
+   * @param {number} dstSampleRate Destination sample rate in Hz.
+   * @param {object} [options]
+   * @returns {Float32Array}
+   */
+  function resampleLinear(samples, channels, srcSampleRate, dstSampleRate, options = {}) {
+    if (!Number.isInteger(channels) || channels < 1 || channels > 8) {
+      throw new RangeError(`resampleLinear channels must be an integer in [1, 8], got ${channels}`);
+    }
+    if (
+      typeof srcSampleRate !== 'number' ||
+      !Number.isFinite(srcSampleRate) ||
+      srcSampleRate < MIN_SAMPLE_RATE ||
+      srcSampleRate > MAX_SAMPLE_RATE
+    ) {
+      throw new RangeError(
+        `srcSampleRate must be in [${MIN_SAMPLE_RATE}, ${MAX_SAMPLE_RATE}], got ${srcSampleRate}`
+      );
+    }
+    if (
+      typeof dstSampleRate !== 'number' ||
+      !Number.isFinite(dstSampleRate) ||
+      dstSampleRate < MIN_SAMPLE_RATE ||
+      dstSampleRate > MAX_SAMPLE_RATE
+    ) {
+      throw new RangeError(
+        `dstSampleRate must be in [${MIN_SAMPLE_RATE}, ${MAX_SAMPLE_RATE}], got ${dstSampleRate}`
+      );
+    }
+
+    const ratio = dstSampleRate / srcSampleRate;
+    if (
+      !Number.isFinite(ratio) ||
+      ratio <= 0 ||
+      ratio > MAX_RESAMPLE_RATIO ||
+      1.0 / ratio > MAX_RESAMPLE_RATIO
+    ) {
+      throw new RangeError(
+        `Resample ratio (${srcSampleRate} -> ${dstSampleRate}) exceeds max guard (${MAX_RESAMPLE_RATIO}x)`
+      );
+    }
+
+    const opts = options && typeof options === 'object' ? options : {};
+    const maxOutputFrames =
+      typeof opts.maxOutputFrames === 'number' &&
+      Number.isFinite(opts.maxOutputFrames) &&
+      opts.maxOutputFrames > 0
+        ? Math.floor(opts.maxOutputFrames)
+        : DEFAULT_MAX_RESAMPLE_FRAMES;
+    const softClip = Boolean(opts.softClip);
+    const knee =
+      opts.limiterKnee !== undefined
+        ? opts.limiterKnee
+        : opts.knee !== undefined
+          ? opts.knee
+          : DEFAULT_LIMITER_KNEE;
+    if (softClip && (typeof knee !== 'number' || !Number.isFinite(knee) || knee < 0 || knee >= 1.0)) {
+      throw new RangeError(`limiterKnee must be in [0, 1), got ${knee}`);
+    }
+
+    const src = toFloat32Samples(samples);
+    const srcFrames = Math.floor(src.length / channels);
+    if (srcFrames <= 0) {
+      return new Float32Array(0);
+    }
+
+    const state = opts.state && typeof opts.state === 'object' ? opts.state : null;
+    const EPS = 1e-12;
+    let nanSanitized = 0;
+    let clipped = 0;
+
+    // Fast same-rate passthrough when no fractional phase carry is active.
+    const startPhase =
+      state && typeof state.phase === 'number' && Number.isFinite(state.phase) && state.phase >= 0
+        ? state.phase
+        : 0.0;
+
+    if (srcSampleRate === dstSampleRate && startPhase < EPS) {
+      if (srcFrames > maxOutputFrames) {
+        throw new RangeError(
+          `Resampled output (${srcFrames} frames) exceeds maxOutputFrames (${maxOutputFrames})`
+        );
+      }
+      const totalSamples = srcFrames * channels;
+      const out = new Float32Array(totalSamples);
+      for (let i = 0; i < totalSamples; i++) {
+        let v = src[i];
+        if (!Number.isFinite(v)) {
+          v = 0.0;
+          nanSanitized += 1;
+        }
+        if (softClip) {
+          if (v > knee || v < -knee) clipped += 1;
+          v = softClipSample(v, knee);
+        }
+        out[i] = v;
+      }
+      if (state) {
+        state.phase = 0.0;
+      }
+      if (opts.stats && typeof opts.stats === 'object') {
+        opts.stats.nanSanitizedSamples = (opts.stats.nanSanitizedSamples || 0) + nanSanitized;
+        opts.stats.clippedSamples = (opts.stats.clippedSamples || 0) + clipped;
+      }
+      return out;
+    }
+
+    const step = srcSampleRate / dstSampleRate;
+    if (srcFrames - startPhase <= EPS) {
+      if (state) {
+        const rem = startPhase - srcFrames;
+        state.phase = rem > EPS ? rem : 0.0;
+      }
+      return new Float32Array(0);
+    }
+
+    const outFrames = Math.floor((srcFrames - startPhase - EPS) / step) + 1;
+    if (outFrames > maxOutputFrames) {
+      throw new RangeError(
+        `Resampled output (${outFrames} frames) exceeds maxOutputFrames (${maxOutputFrames})`
+      );
+    }
+
+    const out = new Float32Array(outFrames * channels);
+    const lastFrame = srcFrames - 1;
+
+    for (let f = 0; f < outFrames; f++) {
+      const pos = startPhase + f * step;
+      let i0 = Math.floor(pos);
+      if (i0 < 0) i0 = 0;
+      else if (i0 > lastFrame) i0 = lastFrame;
+      const frac = pos - i0;
+      const i1 = i0 < lastFrame ? i0 + 1 : lastFrame;
+      const base0 = i0 * channels;
+      const base1 = i1 * channels;
+      const outBase = f * channels;
+
+      for (let c = 0; c < channels; c++) {
+        let s0 = src[base0 + c];
+        if (!Number.isFinite(s0)) {
+          s0 = 0.0;
+          nanSanitized += 1;
+        }
+        let val;
+        if (frac <= 0 || i1 === i0) {
+          val = s0;
+        } else {
+          let s1 = src[base1 + c];
+          if (!Number.isFinite(s1)) {
+            s1 = 0.0;
+            nanSanitized += 1;
+          }
+          val = s0 + (s1 - s0) * frac;
+          if (!Number.isFinite(val)) {
+            val = 0.0;
+            nanSanitized += 1;
+          }
+        }
+        if (softClip) {
+          if (val > knee || val < -knee) clipped += 1;
+          val = softClipSample(val, knee);
+        }
+        out[outBase + c] = val;
+      }
+    }
+
+    if (state) {
+      let nextPhase = startPhase + outFrames * step - srcFrames;
+      if (!Number.isFinite(nextPhase) || nextPhase < EPS) {
+        nextPhase = 0.0;
+      }
+      state.phase = nextPhase;
+    }
+
+    if (opts.stats && typeof opts.stats === 'object') {
+      opts.stats.resampledFrames = (opts.stats.resampledFrames || 0) + outFrames;
+      opts.stats.nanSanitizedSamples = (opts.stats.nanSanitizedSamples || 0) + nanSanitized;
+      opts.stats.clippedSamples = (opts.stats.clippedSamples || 0) + clipped;
+    }
+
+    return out;
+  }
+
   /**
    * Lock-free multi-voice stereo audio mixer with equal-power panning,
    * linear resampling, seamless looping, non-finite sample sanitization,
@@ -388,6 +775,9 @@
       this._mixScratch = new Float64Array(0);
 
       this._renderedFrames = 0;
+      this._downmixedFrames = 0;
+      this._resampledFrames = 0;
+      this._underrunCount = 0;
       this._peakOutputLevel = 0.0;
       this._clippedSamples = 0;
       this._sanitizedNonFiniteSamples = 0;
@@ -453,9 +843,27 @@
       }
 
       const channels = config.channels !== undefined ? config.channels : 1;
-      if (channels !== 1 && channels !== 2) {
-        throw new RangeError(`voice channels must be 1 or 2, got ${channels}`);
+      if (!Number.isInteger(channels) || !SUPPORTED_VOICE_CHANNELS.includes(channels)) {
+        throw new RangeError(
+          `voice channels must be one of ${SUPPORTED_VOICE_CHANNELS.join(', ')}, got ${channels}`
+        );
       }
+
+      const centerGain = validateDownmixGain(
+        config.centerGain !== undefined ? config.centerGain : config.centerWeight,
+        ITU_BS775_CENTER_GAIN,
+        'voice centerGain'
+      );
+      const surroundGain = validateDownmixGain(
+        config.surroundGain !== undefined ? config.surroundGain : config.surroundWeight,
+        ITU_BS775_SURROUND_GAIN,
+        'voice surroundGain'
+      );
+      const lfeGain = validateDownmixGain(
+        config.lfeGain !== undefined ? config.lfeGain : config.lfeWeight,
+        ITU_BS775_LFE_GAIN,
+        'voice lfeGain'
+      );
 
       const gain =
         typeof config.gain === 'number' && Number.isFinite(config.gain)
@@ -472,6 +880,12 @@
       if (typeof pitch !== 'number' || !Number.isFinite(pitch) || pitch <= 0) {
         throw new RangeError(`voice pitch must be a positive finite number, got ${pitch}`);
       }
+      const stepCheck = (sampleRate * pitch) / this.sampleRate;
+      if (!Number.isFinite(stepCheck) || stepCheck <= 0) {
+        throw new RangeError(
+          `voice resampling step is non-finite or non-positive (sampleRate=${sampleRate}, pitch=${pitch})`
+        );
+      }
 
       const loop = Boolean(config.loop);
       const frameCount = Math.floor(samples.length / channels);
@@ -483,6 +897,9 @@
         frameCount,
         sampleRate,
         channels,
+        centerGain,
+        surroundGain,
+        lfeGain,
         gain,
         pan,
         loop,
@@ -589,6 +1006,8 @@
       const finishedIds = [];
       const outSampleRate = this.sampleRate;
       let sanitized = 0;
+      let downmixed = 0;
+      let resampled = 0;
 
       this._updateActiveVoicePeak();
 
@@ -608,9 +1027,11 @@
 
         const src = voice.samples;
         const step = (voice.sampleRate * voice.pitch) / outSampleRate;
+        const isResampling = voice.sampleRate !== outSampleRate || voice.pitch !== 1.0;
         const gain = voice.gain;
         const loop = voice.loop;
         let pos = voice.position;
+        let voiceRendered = 0;
 
         if (voice.channels === 1) {
           const panGains = computeMonoPanGains(voice.pan);
@@ -652,6 +1073,7 @@
             mix[outIdx] += sample * gL;
             mix[outIdx + 1] += sample * gR;
 
+            voiceRendered += 1;
             pos += step;
           }
 
@@ -662,7 +1084,7 @@
             pos %= srcFrames;
           }
           voice.position = pos;
-        } else {
+        } else if (voice.channels === 2) {
           // Stereo input with W3C Web Audio StereoPannerNode equal-power panning.
           const p = voice.pan;
           let ll, lr, rl, rr;
@@ -729,6 +1151,7 @@
             mix[outIdx] += sL * ll + sR * lr;
             mix[outIdx + 1] += sL * rl + sR * rr;
 
+            voiceRendered += 1;
             pos += step;
           }
 
@@ -739,6 +1162,141 @@
             pos %= srcFrames;
           }
           voice.position = pos;
+        } else {
+          // Multi-channel surround (4ch quad, 6ch 5.1, 8ch 7.1) ITU-R BS.775 downmix to stereo.
+          const chCount = voice.channels;
+          const centerGain = voice.centerGain;
+          const surroundGain = voice.surroundGain;
+          const lfeGain = voice.lfeGain;
+
+          const p = voice.pan;
+          let ll, lr, rl, rr;
+          if (p <= -1.0) {
+            ll = 1.0; lr = 1.0; rl = 0.0; rr = 0.0;
+          } else if (p >= 1.0) {
+            ll = 0.0; lr = 0.0; rl = 1.0; rr = 1.0;
+          } else if (p <= 0.0) {
+            const x = (p + 1.0) * (Math.PI * 0.5);
+            ll = 1.0;
+            lr = Math.cos(x);
+            rl = 0.0;
+            rr = Math.sin(x);
+          } else {
+            const x = p * (Math.PI * 0.5);
+            ll = Math.cos(x);
+            lr = 0.0;
+            rl = Math.sin(x);
+            rr = 1.0;
+          }
+
+          for (let f = 0; f < frameCount; f++) {
+            if (pos >= srcFrames) {
+              if (loop) {
+                pos %= srcFrames;
+              } else {
+                voice.finished = true;
+                finishedIds.push(voice.id);
+                break;
+              }
+            }
+
+            const i0 = Math.floor(pos);
+            const frac = pos - i0;
+            const base0 = i0 * chCount;
+            let base1 = base0;
+            if (frac !== 0) {
+              let i1 = i0 + 1;
+              if (i1 >= srcFrames) {
+                i1 = loop ? 0 : srcFrames - 1;
+              }
+              base1 = i1 * chCount;
+            }
+
+            let rawL;
+            let rawR;
+
+            if (chCount === 6) {
+              // 5.1: FL, FR, FC, LFE, BL, BR
+              let fl = frac === 0 ? src[base0] : src[base0] + (src[base1] - src[base0]) * frac;
+              let fr = frac === 0 ? src[base0 + 1] : src[base0 + 1] + (src[base1 + 1] - src[base0 + 1]) * frac;
+              let fc = frac === 0 ? src[base0 + 2] : src[base0 + 2] + (src[base1 + 2] - src[base0 + 2]) * frac;
+              let lfe = frac === 0 ? src[base0 + 3] : src[base0 + 3] + (src[base1 + 3] - src[base0 + 3]) * frac;
+              let bl = frac === 0 ? src[base0 + 4] : src[base0 + 4] + (src[base1 + 4] - src[base0 + 4]) * frac;
+              let br = frac === 0 ? src[base0 + 5] : src[base0 + 5] + (src[base1 + 5] - src[base0 + 5]) * frac;
+
+              if (!Number.isFinite(fl)) { fl = 0.0; sanitized += 1; }
+              if (!Number.isFinite(fr)) { fr = 0.0; sanitized += 1; }
+              if (!Number.isFinite(fc)) { fc = 0.0; sanitized += 1; }
+              if (!Number.isFinite(lfe)) { lfe = 0.0; sanitized += 1; }
+              if (!Number.isFinite(bl)) { bl = 0.0; sanitized += 1; }
+              if (!Number.isFinite(br)) { br = 0.0; sanitized += 1; }
+
+              rawL = fl + fc * centerGain + bl * surroundGain + lfe * lfeGain;
+              rawR = fr + fc * centerGain + br * surroundGain + lfe * lfeGain;
+            } else if (chCount === 8) {
+              // 7.1: FL, FR, FC, LFE, BL, BR, SL, SR
+              let fl = frac === 0 ? src[base0] : src[base0] + (src[base1] - src[base0]) * frac;
+              let fr = frac === 0 ? src[base0 + 1] : src[base0 + 1] + (src[base1 + 1] - src[base0 + 1]) * frac;
+              let fc = frac === 0 ? src[base0 + 2] : src[base0 + 2] + (src[base1 + 2] - src[base0 + 2]) * frac;
+              let lfe = frac === 0 ? src[base0 + 3] : src[base0 + 3] + (src[base1 + 3] - src[base0 + 3]) * frac;
+              let bl = frac === 0 ? src[base0 + 4] : src[base0 + 4] + (src[base1 + 4] - src[base0 + 4]) * frac;
+              let br = frac === 0 ? src[base0 + 5] : src[base0 + 5] + (src[base1 + 5] - src[base0 + 5]) * frac;
+              let sl = frac === 0 ? src[base0 + 6] : src[base0 + 6] + (src[base1 + 6] - src[base0 + 6]) * frac;
+              let sr = frac === 0 ? src[base0 + 7] : src[base0 + 7] + (src[base1 + 7] - src[base0 + 7]) * frac;
+
+              if (!Number.isFinite(fl)) { fl = 0.0; sanitized += 1; }
+              if (!Number.isFinite(fr)) { fr = 0.0; sanitized += 1; }
+              if (!Number.isFinite(fc)) { fc = 0.0; sanitized += 1; }
+              if (!Number.isFinite(lfe)) { lfe = 0.0; sanitized += 1; }
+              if (!Number.isFinite(bl)) { bl = 0.0; sanitized += 1; }
+              if (!Number.isFinite(br)) { br = 0.0; sanitized += 1; }
+              if (!Number.isFinite(sl)) { sl = 0.0; sanitized += 1; }
+              if (!Number.isFinite(sr)) { sr = 0.0; sanitized += 1; }
+
+              rawL = fl + fc * centerGain + (bl + sl) * surroundGain + lfe * lfeGain;
+              rawR = fr + fc * centerGain + (br + sr) * surroundGain + lfe * lfeGain;
+            } else {
+              // Quad (4ch): FL, FR, BL, BR
+              let fl = frac === 0 ? src[base0] : src[base0] + (src[base1] - src[base0]) * frac;
+              let fr = frac === 0 ? src[base0 + 1] : src[base0 + 1] + (src[base1 + 1] - src[base0 + 1]) * frac;
+              let bl = frac === 0 ? src[base0 + 2] : src[base0 + 2] + (src[base1 + 2] - src[base0 + 2]) * frac;
+              let br = frac === 0 ? src[base0 + 3] : src[base0 + 3] + (src[base1 + 3] - src[base0 + 3]) * frac;
+
+              if (!Number.isFinite(fl)) { fl = 0.0; sanitized += 1; }
+              if (!Number.isFinite(fr)) { fr = 0.0; sanitized += 1; }
+              if (!Number.isFinite(bl)) { bl = 0.0; sanitized += 1; }
+              if (!Number.isFinite(br)) { br = 0.0; sanitized += 1; }
+
+              rawL = fl + bl * surroundGain;
+              rawR = fr + br * surroundGain;
+            }
+
+            if (!Number.isFinite(rawL)) { rawL = 0.0; sanitized += 1; }
+            if (!Number.isFinite(rawR)) { rawR = 0.0; sanitized += 1; }
+
+            const sL = rawL * gain;
+            const sR = rawR * gain;
+
+            const outIdx = f * 2;
+            mix[outIdx] += sL * ll + sR * lr;
+            mix[outIdx + 1] += sL * rl + sR * rr;
+
+            downmixed += 1;
+            voiceRendered += 1;
+            pos += step;
+          }
+
+          if (!voice.finished && !loop && pos >= srcFrames) {
+            voice.finished = true;
+            finishedIds.push(voice.id);
+          } else if (loop && pos >= srcFrames) {
+            pos %= srcFrames;
+          }
+          voice.position = pos;
+        }
+
+        if (isResampling && voiceRendered > 0) {
+          resampled += voiceRendered;
         }
       }
 
@@ -784,6 +1342,8 @@
       this._peakOutputLevel = peak;
       this._clippedSamples += clipped;
       this._sanitizedNonFiniteSamples += sanitized;
+      this._downmixedFrames += downmixed;
+      this._resampledFrames += resampled;
       this._renderedFrames += frameCount;
 
       return output;
@@ -801,6 +1361,20 @@
     pumpToRing(audioRingBuffer, maxFrames) {
       if (!audioRingBuffer || typeof audioRingBuffer !== 'object') {
         throw new TypeError('pumpToRing requires an AudioRingBuffer instance');
+      }
+
+      const ringUnderruns =
+        typeof audioRingBuffer.underrunCount === 'number' &&
+        Number.isFinite(audioRingBuffer.underrunCount) &&
+        audioRingBuffer.underrunCount >= 0
+          ? Math.floor(audioRingBuffer.underrunCount)
+          : typeof audioRingBuffer.underruns === 'number' &&
+              Number.isFinite(audioRingBuffer.underruns) &&
+              audioRingBuffer.underruns >= 0
+            ? Math.floor(audioRingBuffer.underruns)
+            : null;
+      if (ringUnderruns !== null) {
+        this._underrunCount = ringUnderruns;
       }
 
       const writer =
@@ -878,6 +1452,9 @@
         this._mixScratch.fill(0.0);
       }
       this._renderedFrames = 0;
+      this._downmixedFrames = 0;
+      this._resampledFrames = 0;
+      this._underrunCount = 0;
       this._peakOutputLevel = 0.0;
       this._clippedSamples = 0;
       this._sanitizedNonFiniteSamples = 0;
@@ -914,10 +1491,14 @@
         softClip: this._softClip,
         limiterKnee: this._limiterKnee,
         renderedFrames: this._renderedFrames,
+        downmixedFrames: this._downmixedFrames,
+        resampledFrames: this._resampledFrames,
+        underrunCount: this._underrunCount,
         peakLevel: this._peakOutputLevel,
         peakOutputLevel: this._peakOutputLevel,
         clippedSamples: this._clippedSamples,
         sanitizedNonFiniteSamples: this._sanitizedNonFiniteSamples,
+        nanSanitizedSamples: this._sanitizedNonFiniteSamples,
         activeVoicePeak: this._activeVoicePeak,
       };
     }
@@ -928,10 +1509,20 @@
     decodePcm16,
     decodeImaAdpcm,
     softClipSample,
+    downmixToStereo,
+    resampleLinear,
     DEFAULT_SAMPLE_RATE,
+    MIN_SAMPLE_RATE,
+    MAX_SAMPLE_RATE,
+    MAX_RESAMPLE_RATIO,
+    DEFAULT_MAX_RESAMPLE_FRAMES,
     DEFAULT_CHANNELS,
     DEFAULT_MAX_VOICES,
     DEFAULT_SOFT_CLIP_KNEE,
+    ITU_BS775_CENTER_GAIN,
+    ITU_BS775_SURROUND_GAIN,
+    ITU_BS775_LFE_GAIN,
+    SUPPORTED_VOICE_CHANNELS,
     IMA_INDEX_TABLE,
     IMA_STEP_TABLE,
   };
