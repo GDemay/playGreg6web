@@ -15,12 +15,13 @@ const tp = require('../web/workers/texture_packets.js');
 const WORKERS_DIR = fileURLToPath(new URL('../web/workers/', import.meta.url));
 const repoFile = (rel) => readFileSync(new URL(`../${rel}`, import.meta.url), 'utf8');
 
-function createMockWebGpu({ strictWebGpu = false } = {}) {
+function createMockWebGpu({ strictWebGpu = false, features = undefined } = {}) {
   const calls = [];
   const buffers = new Map();
   let nextHandle = 1;
 
   const device = {
+    ...(features !== undefined ? { features } : {}),
     createBuffer(desc) {
       const backing = new Uint8Array(desc.size);
       const buffer = {
@@ -42,6 +43,17 @@ function createMockWebGpu({ strictWebGpu = false } = {}) {
     createTexture(desc) {
       if (desc.format === 'bc7-rgba-unorm' && desc.sampleCount > 1) {
         throw new Error('not multisampleable');
+      }
+      if (
+        strictWebGpu &&
+        desc.dimension === '3d' &&
+        typeof desc.format === 'string' &&
+        desc.format.startsWith('bc') &&
+        !(features && typeof features.has === 'function' && features.has('texture-compression-bc-sliced-3d'))
+      ) {
+        throw new Error(
+          `WebGPU validation: 3d texture format ${desc.format} requires texture-compression-bc-sliced-3d`
+        );
       }
       const texture = {
         kind: 'GPUTexture',
@@ -293,6 +305,8 @@ test('CreateTexture2 creates a texture with format, samples and view formats in 
     createTexture2Count: 2,
     rowPitchRepackCount: 0,
     sabCopyCount: 0,
+    bc3dFallbacks: 0,
+    bc3dFallbackUploadsSkipped: 0,
   });
   const [rt, tex] = gpu.calls.filter((c) => c.op === 'createTexture').map((c) => c.desc);
   assert.deepEqual(rt, {
@@ -568,6 +582,8 @@ test('staged WriteTexture & copyBufferToTexture repack unaligned bytesPerRow to 
     createTexture2Count: 1,
     rowPitchRepackCount: 1,
     sabCopyCount: 1,
+    bc3dFallbacks: 0,
+    bc3dFallbackUploadsSkipped: 0,
   });
 });
 
@@ -620,6 +636,8 @@ test('direct queue.writeTexture safely copies SharedArrayBuffer views and tracks
     createTexture2Count: 1,
     rowPitchRepackCount: 0,
     sabCopyCount: 1,
+    bc3dFallbacks: 0,
+    bc3dFallbackUploadsSkipped: 0,
   });
 });
 
@@ -691,6 +709,8 @@ test('handler.copyBufferToTexture repacks both CPU-backed and GPU-buffer-only un
     createTexture2Count: 1,
     rowPitchRepackCount: 2,
     sabCopyCount: 1,
+    bc3dFallbacks: 0,
+    bc3dFallbackUploadsSkipped: 0,
   });
   for (const [key, val] of Object.entries(stats)) {
     assert.equal(typeof val, 'number', `stat ${key} must be numeric`);
@@ -733,6 +753,8 @@ test('G31 classic-worker importScripts IIFE isolation preserves zero top-level l
       const TEXTURE_FORMAT_NAMES = [];
       const alignBytesPerRow256 = null;
       const repackRowsTo256 = null;
+      const isBcCompressedFormat = null;
+      const deviceSupportsBcSliced3d = null;
       class TexturePackets {}
       `,
       ctx
@@ -742,4 +764,298 @@ test('G31 classic-worker importScripts IIFE isolation preserves zero top-level l
   assert.equal(typeof ctx.PlayGta6TexturePackets.alignBytesPerRow256, 'function');
   assert.equal(typeof ctx.PlayGta6TexturePackets.repackRowsTo256, 'function');
   assert.equal(ctx.PlayGta6TexturePackets.alignBytesPerRow256(16), 256);
+});
+
+test('W108 (#734): 3D BC textures fall back to rgba8unorm without bc-sliced-3d and skip compressed uploads', () => {
+  const gpu = createMockWebGpu({
+    strictWebGpu: true,
+    features: new Set(['texture-compression-bc']),
+  });
+  const stagingPool = new GpuStagingPool({ device: gpu.device, chunkSize: 64 * 1024 });
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { stagingPool });
+  const rsHandler = installRenderStatePackets(processor);
+  const handler = tp.installTexturePackets(processor);
+
+  // CreateTexture2: 3D bc5-rg-unorm (code 58) with incompatible bc5 viewFormats.
+  processor.executeCommandBuffer(
+    createTexture2Packet({
+      id: 201,
+      width: 16,
+      height: 16,
+      layers: 4,
+      mips: 1,
+      dimension: 2, // 3d
+      format: 58, // bc5-rg-unorm
+      usage: 0x06,
+      viewFormats: [58, 59], // bc5-rg-unorm, bc5-rg-snorm
+    })
+  );
+  // CreateTexture2: 3D bc7-rgba-unorm (code 62) with bc7-rgba-unorm-srgb (code 63) viewFormat.
+  processor.executeCommandBuffer(
+    createTexture2Packet({
+      id: 202,
+      width: 8,
+      height: 8,
+      layers: 4,
+      mips: 1,
+      dimension: 2, // 3d
+      format: 62, // bc7-rgba-unorm
+      usage: 0x06,
+      viewFormats: [63], // bc7-rgba-unorm-srgb
+    })
+  );
+  // v1 CreateTexture: 3D bc7-rgba-unorm (v1 format code 5).
+  processor.executeCommandBuffer(
+    createTexture1Packet({
+      id: 203,
+      width: 8,
+      height: 8,
+      layers: 2,
+      mips: 1,
+      dimension: 2, // 3d
+      format: 5, // bc7-rgba-unorm
+      usage: 0x06,
+    })
+  );
+
+  const tex201 = processor.textures.get(201);
+  const tex202 = processor.textures.get(202);
+  const tex203 = processor.textures.get(203);
+  assert.ok(tex201 && tex202 && tex203);
+  assert.equal(tex201.desc.format, 'rgba8unorm');
+  assert.equal(tex201.desc.dimension, '3d');
+  assert.equal(tex201.desc.viewFormats, undefined);
+  assert.equal(tex202.desc.format, 'rgba8unorm');
+  assert.equal(tex202.desc.viewFormats, undefined);
+  assert.equal(tex203.desc.format, 'rgba8unorm');
+  assert.equal(tex203.desc.dimension, '3d');
+  assert.equal(handler._bc3dFallbackTextures.has(201), true);
+  assert.equal(handler._bc3dFallbackTextures.has(202), true);
+  assert.equal(handler._bc3dFallbackTextures.has(203), true);
+  assert.equal(handler.stats.bc3dFallbacks, 3);
+  assert.equal(handler.stats.errors, 0);
+
+  // Chained RenderStatePackets view creation must not pass bc* format against the rgba8unorm fallback.
+  const view201 = rsHandler._textureView(201, {
+    format: 'bc5-rg-unorm',
+    dimension: '3d',
+    baseMipLevel: 0,
+    mipLevelCount: 1,
+    baseArrayLayer: 0,
+    arrayLayerCount: 1,
+    aspect: 'all',
+  });
+  assert.ok(view201);
+  assert.equal(view201.viewDesc.format, 'rgba8unorm');
+
+  // Compressed WriteTexture uploads to fallback 3D textures must be skipped cleanly (both staged and direct).
+  const bc5Bytes = new Uint8Array(4 * 4 * 16 * 4); // 16x16x4 BC5 blocks
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 201,
+      width: 16,
+      height: 16,
+      layers: 4,
+      bytesPerRow: 64,
+      rowsPerImage: 4,
+      data: bc5Bytes,
+    })
+  );
+  // Direct writeTexture() and copyBufferToTexture() wrappers also skip fallback texture objects.
+  const directWt = handler.writeTexture(
+    { texture: tex202, mipLevel: 0, origin: { x: 0, y: 0, z: 0 } },
+    new Uint8Array(64),
+    { offset: 0, bytesPerRow: 32, rowsPerImage: 2 },
+    { width: 8, height: 8, depthOrArrayLayers: 4 }
+  );
+  assert.equal(directWt.uploaded, false);
+  assert.equal(directWt.skippedBc3dFallback, true);
+
+  const encoder = gpu.device.createCommandEncoder();
+  const directC2t = handler.copyBufferToTexture(
+    encoder,
+    { bytesPerRow: 32, rowsPerImage: 2 },
+    { texture: tex202, mipLevel: 0, origin: { x: 0, y: 0, z: 0 } },
+    { width: 8, height: 8, depthOrArrayLayers: 4 },
+    new Uint8Array(256)
+  );
+  assert.equal(directC2t.skippedBc3dFallback, true);
+
+  assert.equal(gpu.calls.filter((c) => c.op === 'writeTexture').length, 0);
+  assert.equal(gpu.calls.filter((c) => c.op === 'copyBufferToTexture').length, 0);
+  assert.deepEqual(handler.getStats(), {
+    created: 3,
+    errors: 0,
+    createTexture2Count: 2,
+    rowPitchRepackCount: 0,
+    sabCopyCount: 0,
+    bc3dFallbacks: 3,
+    bc3dFallbackUploadsSkipped: 3,
+  });
+});
+
+test('W108 (#734): 3D BC textures preserve original format and upload normally when bc-sliced-3d is present', () => {
+  const gpu = createMockWebGpu({
+    strictWebGpu: true,
+    features: new Set(['texture-compression-bc', 'texture-compression-bc-sliced-3d']),
+  });
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx);
+  const handler = tp.installTexturePackets(processor);
+
+  processor.executeCommandBuffer(
+    createTexture2Packet({
+      id: 210,
+      width: 16,
+      height: 16,
+      layers: 4,
+      mips: 1,
+      dimension: 2, // 3d
+      format: 58, // bc5-rg-unorm
+      usage: 0x06,
+    })
+  );
+  processor.executeCommandBuffer(
+    createTexture2Packet({
+      id: 211,
+      width: 8,
+      height: 8,
+      layers: 2,
+      mips: 1,
+      dimension: 2, // 3d
+      format: 62, // bc7-rgba-unorm
+      usage: 0x06,
+      viewFormats: [63], // bc7-rgba-unorm-srgb
+    })
+  );
+
+  assert.equal(processor.textures.get(210).desc.format, 'bc5-rg-unorm');
+  assert.equal(processor.textures.get(211).desc.format, 'bc7-rgba-unorm');
+  assert.deepEqual(processor.textures.get(211).desc.viewFormats, ['bc7-rgba-unorm-srgb']);
+  assert.equal(handler._bc3dFallbackTextures.size, 0);
+  assert.equal(handler.stats.bc3dFallbacks, 0);
+
+  const bc5Bytes = new Uint8Array(4 * 4 * 16 * 4);
+  bc5Bytes[0] = 0x5a;
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 210,
+      width: 16,
+      height: 16,
+      layers: 4,
+      bytesPerRow: 64,
+      rowsPerImage: 4,
+      data: bc5Bytes,
+    })
+  );
+
+  const wtCalls = gpu.calls.filter((c) => c.op === 'writeTexture');
+  assert.equal(wtCalls.length, 1);
+  assert.equal(wtCalls[0].bytes[0], 0x5a);
+  assert.equal(handler.stats.bc3dFallbackUploadsSkipped, 0);
+  assert.equal(handler.stats.errors, 0);
+});
+
+test('W108 (#734): 2D BC textures remain unaffected when bc-sliced-3d is absent', () => {
+  const gpu = createMockWebGpu({
+    strictWebGpu: true,
+    features: new Set(['texture-compression-bc']),
+  });
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx);
+  const handler = tp.installTexturePackets(processor);
+
+  processor.executeCommandBuffer(
+    createTexture2Packet({
+      id: 220,
+      width: 16,
+      height: 16,
+      layers: 1,
+      mips: 1,
+      dimension: 1, // 2d
+      format: 58, // bc5-rg-unorm
+      usage: 0x06,
+    })
+  );
+  processor.executeCommandBuffer(
+    createTexture2Packet({
+      id: 221,
+      width: 16,
+      height: 16,
+      layers: 6,
+      mips: 1,
+      dimension: 1, // 2d array
+      format: 62, // bc7-rgba-unorm
+      usage: 0x06,
+      viewFormats: [63],
+    })
+  );
+
+  assert.equal(processor.textures.get(220).desc.format, 'bc5-rg-unorm');
+  assert.equal(processor.textures.get(221).desc.format, 'bc7-rgba-unorm');
+  assert.deepEqual(processor.textures.get(221).desc.viewFormats, ['bc7-rgba-unorm-srgb']);
+  assert.equal(handler._bc3dFallbackTextures.size, 0);
+  assert.equal(handler.stats.bc3dFallbacks, 0);
+
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 220,
+      width: 16,
+      height: 16,
+      layers: 1,
+      bytesPerRow: 64,
+      rowsPerImage: 4,
+      data: new Uint8Array(256),
+    })
+  );
+  assert.equal(gpu.calls.filter((c) => c.op === 'writeTexture').length, 1);
+  assert.equal(handler.stats.bc3dFallbackUploadsSkipped, 0);
+});
+
+test('W108 (#734): destroying or recreating a fallback texture ID clears fallback tracking', () => {
+  const gpu = createMockWebGpu({
+    strictWebGpu: true,
+    features: new Set(['texture-compression-bc']),
+  });
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx);
+  const handler = tp.installTexturePackets(processor);
+
+  // Create two 3D BC fallback textures.
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 230, width: 8, height: 8, layers: 4, dimension: 2, format: 58, usage: 0x06 })
+  );
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 231, width: 8, height: 8, layers: 4, dimension: 2, format: 62, usage: 0x06 })
+  );
+  assert.equal(handler._bc3dFallbackTextures.has(230), true);
+  assert.equal(handler._bc3dFallbackTextures.has(231), true);
+
+  // 1) DestroyResource removes ID 230 from the fallback tracking set.
+  processor.executeCommandBuffer(destroyPacket(230));
+  assert.equal(handler._bc3dFallbackTextures.has(230), false);
+  assert.equal(handler._bc3dFallbackTextures.has(231), true);
+
+  // 2) Recreating ID 231 with a non-3D/non-BC format clears it and allows normal uploads.
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 231, width: 4, height: 4, layers: 1, dimension: 1, format: 22, usage: 0x06 })
+  );
+  assert.equal(handler._bc3dFallbackTextures.has(231), false);
+  assert.equal(processor.textures.get(231).desc.format, 'rgba8unorm');
+
+  const rgbaBytes = new Uint8Array(4 * 4 * 4);
+  rgbaBytes[0] = 0x77;
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 231,
+      width: 4,
+      height: 4,
+      layers: 1,
+      bytesPerRow: 16,
+      rowsPerImage: 4,
+      data: rgbaBytes,
+    })
+  );
+  const wtCalls = gpu.calls.filter((c) => c.op === 'writeTexture');
+  assert.equal(wtCalls.length, 1);
+  assert.equal(wtCalls[0].bytes[0], 0x77);
+  assert.equal(handler.stats.bc3dFallbacks, 2);
+  assert.equal(handler.stats.bc3dFallbackUploadsSkipped, 0);
 });
