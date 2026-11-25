@@ -150,6 +150,76 @@ const DEFAULT_OVERSIZED_RT_RECLAIM_INTERVAL_FRAMES = 2;
 const MAX_ZERO_ALLOC_RING_DRAIN_BATCHES = 64;
 const WGSL_GROUP0_RE = /@group\(\s*0\s*\)/;
 
+// W338: Throttled non-black swapchain luminance probe constants.
+// Samples 4 small horizontal strips (<= 64 px wide, bytesPerRow = 256) at
+// y = 20%, 50%, 70%, 92% (bottom-right) so it detects full-screen video, center
+// 6-star loading animation, AND the bottom-right OFFLINEPLAYER [A] bar.
+const SWAPCHAIN_PROBE_DEFAULT_INTERVAL_MS = 250;
+const SWAPCHAIN_PROBE_STRIP_MAX_WIDTH = 64;
+const SWAPCHAIN_PROBE_BYTES_PER_ROW = 256;
+const SWAPCHAIN_PROBE_DEFAULT_LUMA_THRESHOLD = 8;
+const SWAPCHAIN_PROBE_STRIPS = Object.freeze([
+  Object.freeze({ yFraction: 0.2, xFraction: 0.5 }),
+  Object.freeze({ yFraction: 0.5, xFraction: 0.5 }),
+  Object.freeze({ yFraction: 0.7, xFraction: 0.5 }),
+  Object.freeze({ yFraction: 0.92, xFraction: 0.9 }),
+]);
+const SWAPCHAIN_PROBE_BUFFER_SIZE =
+  SWAPCHAIN_PROBE_STRIPS.length * SWAPCHAIN_PROBE_BYTES_PER_ROW;
+
+function resolveSwapchainCopySrcUsage() {
+  if (
+    typeof GPUTextureUsage !== 'undefined' &&
+    typeof GPUTextureUsage.RENDER_ATTACHMENT === 'number' &&
+    typeof GPUTextureUsage.COPY_SRC === 'number'
+  ) {
+    return {
+      withCopySrc: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+      renderOnly: GPUTextureUsage.RENDER_ATTACHMENT,
+    };
+  }
+  return null;
+}
+
+function configureCanvasContextWithCopySrc(ctx, baseConfig) {
+  if (!ctx || typeof ctx.configure !== 'function') {
+    return { configured: false, copySrcEnabled: false };
+  }
+  const usageSpec = resolveSwapchainCopySrcUsage();
+  if (!usageSpec || (baseConfig && baseConfig.usage !== undefined)) {
+    ctx.configure(baseConfig);
+    const hasCopySrc = Boolean(
+      usageSpec &&
+        baseConfig &&
+        typeof baseConfig.usage === 'number' &&
+        (baseConfig.usage & usageSpec.withCopySrc) === usageSpec.withCopySrc
+    );
+    return { configured: true, copySrcEnabled: hasCopySrc };
+  }
+  try {
+    ctx.configure({ ...baseConfig, usage: usageSpec.withCopySrc });
+    return { configured: true, copySrcEnabled: true };
+  } catch (_) {
+    ctx.configure({ ...baseConfig, usage: usageSpec.renderOnly });
+    return { configured: true, copySrcEnabled: false };
+  }
+}
+
+function configureSwapchainWithCopySrc(targetSwapchain, config) {
+  const usageSpec = resolveSwapchainCopySrcUsage();
+  if (!usageSpec || (config && config.usage !== undefined)) {
+    targetSwapchain.configure(config);
+    return { copySrcEnabled: false };
+  }
+  try {
+    targetSwapchain.configure({ ...config, usage: usageSpec.withCopySrc });
+    return { copySrcEnabled: true };
+  } catch (_) {
+    targetSwapchain.configure({ ...config, usage: usageSpec.renderOnly });
+    return { copySrcEnabled: false };
+  }
+}
+
 const OPCODE_NAMES = Object.freeze({
   [OPCODES.NOP]: 'Nop',
   [OPCODES.BEGIN_FRAME]: 'BeginFrame',
@@ -1872,16 +1942,20 @@ class WgpuCommandProcessor {
     this._firstVisibleFrameNotified = false;
     this._firstVisibleFrameMs = null;
     this._blackLoadingMs = null;
-    this._requireNonBlackFrame = Boolean(
-      options.requireNonBlackFrame === true || options.requireNonBlackPixels === true
-    );
+    this._requireNonBlackFrameExplicit =
+      options.requireNonBlackFrame === false || options.requireNonBlackPixels === false
+        ? false
+        : options.requireNonBlackFrame === true || options.requireNonBlackPixels === true
+          ? true
+          : null;
+    this._requireNonBlackFrame = this._requireNonBlackFrameExplicit === true;
     this._minVisibleLuma =
       typeof options.minVisibleLuma === 'number' &&
       Number.isFinite(options.minVisibleLuma) &&
       options.minVisibleLuma >= 0 &&
       options.minVisibleLuma <= 255
         ? options.minVisibleLuma
-        : 8;
+        : SWAPCHAIN_PROBE_DEFAULT_LUMA_THRESHOLD;
     this._minVisiblePixels = resolvePositiveIntOption(options.minVisiblePixels, 4);
     this._nonBlackPixelProbe =
       typeof options.nonBlackPixelProbe === 'function'
@@ -1898,6 +1972,20 @@ class WgpuCommandProcessor {
       visiblePixels: 0,
       sampledPixels: 0,
     };
+    // W338: Throttled, non-overlapping async swapchain luminance readback probe state.
+    this._swapchainProbeIntervalMs =
+      typeof options.swapchainProbeIntervalMs === 'number' &&
+      Number.isFinite(options.swapchainProbeIntervalMs) &&
+      options.swapchainProbeIntervalMs >= 0
+        ? options.swapchainProbeIntervalMs
+        : SWAPCHAIN_PROBE_DEFAULT_INTERVAL_MS;
+    this._swapchainProbeBuffer = null;
+    this._swapchainProbeBufferDevice = null;
+    this._swapchainProbeSupported = null;
+    this._swapchainProbeInFlight = false;
+    this._swapchainProbeLastStartMs = -Infinity;
+    this._swapchainProbeCount = 0;
+    this._swapchainProbeGeneration = 0;
     this._uniformRingFrameIndex = -1;
     this._stagingSceneTransitionTrimBytes = 0;
     this._frameStartMs = null;
@@ -2568,6 +2656,14 @@ class WgpuCommandProcessor {
 
   get lastSampledMaxLuma() {
     return this._lastSampledMaxLuma;
+  }
+
+  get swapchainProbeCount() {
+    return this._swapchainProbeCount;
+  }
+
+  get swapchainProbeInFlight() {
+    return this._swapchainProbeInFlight;
   }
 
   setFrameLuminanceMeta(meta) {
@@ -3478,6 +3574,9 @@ class WgpuCommandProcessor {
       return false;
     }
     this._firstVisibleFrameNotified = true;
+    // W338: Destroy the pre-allocated swapchain luminance probe buffer immediately
+    // once first-visible-frame fires so there is zero steady-state overhead.
+    this._destroySwapchainProbeBuffer();
     if (typeof this._onFirstVisibleFrame === 'function') {
       try {
         this._onFirstVisibleFrame(info);
@@ -4053,7 +4152,21 @@ class WgpuCommandProcessor {
               timestampMs: renderResult.timestampMs,
             });
           }
-          if (this._requireNonBlackFrame && !this._firstVisibleFrameNotified) {
+          const hasBinkYuvPlanes = Boolean(
+            framePayload &&
+              typeof framePayload === 'object' &&
+              ((framePayload.planes &&
+                typeof framePayload.planes === 'object' &&
+                (framePayload.planes.y !== undefined ||
+                  framePayload.planes.yPlane !== undefined)) ||
+                framePayload.y !== undefined ||
+                framePayload.yPlane !== undefined)
+          );
+          if (
+            !this._firstVisibleFrameNotified &&
+            (this._requireNonBlackFrame ||
+              (this._requireNonBlackFrameExplicit !== false && hasBinkYuvPlanes))
+          ) {
             if (
               typeof renderResult.lastSampledMaxLuma === 'number' &&
               Number.isFinite(renderResult.lastSampledMaxLuma)
@@ -4077,12 +4190,15 @@ class WgpuCommandProcessor {
                 this._suppressedBlackFrames = 1;
               }
             } else {
-              const bridgeAlreadyVerified =
-                renderResult.firstVisibleFrameEmitted === true ||
-                renderResult.firstVisibleFrame === true;
+              const bridgeAlreadyVerified = Boolean(
+                bridge &&
+                  bridge.requireNonBlackPixels === true &&
+                  (renderResult.firstVisibleFrameEmitted === true ||
+                    renderResult.firstVisibleFrame === true)
+              );
               const splashCheck = bridgeAlreadyVerified
                 ? { evaluated: true, visible: true, maxLuma: this._lastSampledMaxLuma }
-                : isDiagnostic
+                : isDiagnostic && this._requireNonBlackFrame
                   ? { evaluated: true, visible: true, maxLuma: 235 }
                   : this._evaluateNonBlackLuminance(
                       framePayload,
@@ -4117,7 +4233,7 @@ class WgpuCommandProcessor {
                   suppressedBlackFrames: this._suppressedBlackFrames,
                   gpuAdapter: this._gpuAdapter ? { ...this._gpuAdapter } : null,
                 });
-              } else {
+              } else if (this._requireNonBlackFrame || splashCheck.evaluated) {
                 this._suppressedBlackFrames += 1;
               }
             }
@@ -4302,10 +4418,25 @@ class WgpuCommandProcessor {
             timestampMs,
           });
         }
-        if (this._requireNonBlackFrame && !this._firstVisibleFrameNotified) {
-          const directCheck = isDiagnostic
-            ? { evaluated: true, visible: true, maxLuma: 235 }
-            : this._evaluateNonBlackLuminance(framePayload, width, height);
+        const hasDirectBinkYuvPlanes = Boolean(
+          framePayload &&
+            typeof framePayload === 'object' &&
+            ((framePayload.planes &&
+              typeof framePayload.planes === 'object' &&
+              (framePayload.planes.y !== undefined ||
+                framePayload.planes.yPlane !== undefined)) ||
+              framePayload.y !== undefined ||
+              framePayload.yPlane !== undefined)
+        );
+        if (
+          !this._firstVisibleFrameNotified &&
+          (this._requireNonBlackFrame ||
+            (this._requireNonBlackFrameExplicit !== false && hasDirectBinkYuvPlanes))
+        ) {
+          const directCheck =
+            isDiagnostic && this._requireNonBlackFrame
+              ? { evaluated: true, visible: true, maxLuma: 235 }
+              : this._evaluateNonBlackLuminance(framePayload, width, height);
           if (directCheck.evaluated) {
             this._lastSampledMaxLuma = Math.max(
               0,
@@ -4334,7 +4465,7 @@ class WgpuCommandProcessor {
               suppressedBlackFrames: this._suppressedBlackFrames,
               gpuAdapter: this._gpuAdapter ? { ...this._gpuAdapter } : null,
             });
-          } else {
+          } else if (this._requireNonBlackFrame || directCheck.evaluated) {
             this._suppressedBlackFrames += 1;
           }
         }
@@ -4677,6 +4808,353 @@ class WgpuCommandProcessor {
     }
 
     return { evaluated: false, visible: false, maxLuma: 0 };
+  }
+
+  /**
+   * W338: Destroy the pre-allocated staging GPUBuffer used by the throttled async
+   * swapchain non-black luminance probe. Called automatically as soon as
+   * `first-visible-frame` fires, on device reset, and on `destroy()`.
+   */
+  _destroySwapchainProbeBuffer() {
+    this._swapchainProbeGeneration += 1;
+    this._swapchainProbeInFlight = false;
+    const buf = this._swapchainProbeBuffer;
+    this._swapchainProbeBuffer = null;
+    this._swapchainProbeBufferDevice = null;
+    if (buf && typeof buf.destroy === 'function') {
+      try {
+        buf.destroy();
+      } catch (_) {
+        // Ignore teardown errors on already-destroyed or lost GPUBuffers.
+      }
+    }
+  }
+
+  /**
+   * W338: Lazily pre-allocate and reuse a single 1024-byte (4 * 256) MAP_READ | COPY_DST
+   * GPUBuffer for swapchain luminance probing. Returns null (and caches unsupported) if
+   * the device or buffer mock does not expose mapAsync/getMappedRange/unmap.
+   */
+  _ensureSwapchainProbeBuffer() {
+    if (this._destroyed || this._firstVisibleFrameNotified) {
+      return null;
+    }
+    if (
+      this._swapchainProbeBuffer &&
+      this._swapchainProbeBufferDevice === this.device &&
+      !this._swapchainProbeBuffer.destroyed
+    ) {
+      return this._swapchainProbeBuffer;
+    }
+    if (this._swapchainProbeBuffer) {
+      this._destroySwapchainProbeBuffer();
+    }
+    if (this._swapchainProbeSupported === false) {
+      return null;
+    }
+    if (!this.device || typeof this.device.createBuffer !== 'function') {
+      this._swapchainProbeSupported = false;
+      return null;
+    }
+    const mapReadFlag =
+      typeof GPUBufferUsage !== 'undefined' && typeof GPUBufferUsage.MAP_READ === 'number'
+        ? GPUBufferUsage.MAP_READ
+        : BUFFER_USAGE.MAP_READ;
+    const copyDstFlag =
+      typeof GPUBufferUsage !== 'undefined' && typeof GPUBufferUsage.COPY_DST === 'number'
+        ? GPUBufferUsage.COPY_DST
+        : BUFFER_USAGE.COPY_DST;
+    let buf = null;
+    try {
+      buf = this.device.createBuffer({
+        label: 'playgta6-swapchain-luma-probe',
+        size: SWAPCHAIN_PROBE_BUFFER_SIZE,
+        usage: mapReadFlag | copyDstFlag,
+      });
+    } catch (_) {
+      this._swapchainProbeSupported = false;
+      return null;
+    }
+    if (
+      !buf ||
+      typeof buf.mapAsync !== 'function' ||
+      typeof buf.getMappedRange !== 'function' ||
+      typeof buf.unmap !== 'function'
+    ) {
+      if (buf && typeof buf.destroy === 'function') {
+        try {
+          buf.destroy();
+        } catch (_) {
+          // Ignore cleanup errors on mock buffers.
+        }
+      }
+      this._swapchainProbeSupported = false;
+      return null;
+    }
+    this._swapchainProbeBuffer = buf;
+    this._swapchainProbeBufferDevice = this.device;
+    this._swapchainProbeSupported = true;
+    return buf;
+  }
+
+  /**
+   * W338: Check whether the active WebGPU device, command encoder, and swapchain texture
+   * support non-black GPU readback probing (copyTextureToBuffer + COPY_SRC + MAP_READ).
+   * Returns null on mock/headless devices without making any extra createBuffer calls.
+   */
+  _resolveSwapchainProbeCapability(encoder, texture) {
+    if (
+      this._destroyed ||
+      this._firstVisibleFrameNotified ||
+      this._requireNonBlackFrameExplicit === false ||
+      this._swapchainProbeSupported === false
+    ) {
+      return null;
+    }
+    if (
+      !encoder ||
+      typeof encoder.copyTextureToBuffer !== 'function' ||
+      !this.device ||
+      typeof this.device.createBuffer !== 'function'
+    ) {
+      return null;
+    }
+    const copySrcBit =
+      typeof GPUTextureUsage !== 'undefined' && typeof GPUTextureUsage.COPY_SRC === 'number'
+        ? GPUTextureUsage.COPY_SRC
+        : TEXTURE_USAGE.COPY_SRC;
+    if (!texture || typeof texture.usage !== 'number' || (texture.usage & copySrcBit) === 0) {
+      return null;
+    }
+    const fmt =
+      typeof texture.format === 'string' && texture.format.length > 0
+        ? texture.format
+        : this.format;
+    if (
+      fmt !== 'bgra8unorm' &&
+      fmt !== 'rgba8unorm' &&
+      fmt !== 'bgra8unorm-srgb' &&
+      fmt !== 'rgba8unorm-srgb'
+    ) {
+      return null;
+    }
+    const texWidth =
+      typeof texture.width === 'number' && Number.isFinite(texture.width) && texture.width > 0
+        ? Math.floor(texture.width)
+        : this._viewportWidth > 0
+          ? this._viewportWidth
+          : 0;
+    const texHeight =
+      typeof texture.height === 'number' && Number.isFinite(texture.height) && texture.height > 0
+        ? Math.floor(texture.height)
+        : this._viewportHeight > 0
+          ? this._viewportHeight
+          : 0;
+    if (texWidth < 1 || texHeight < 1) {
+      return null;
+    }
+    const buffer = this._ensureSwapchainProbeBuffer();
+    if (!buffer) {
+      return null;
+    }
+    return { buffer, texWidth, texHeight };
+  }
+
+  /**
+   * W338: Encode 4 tiny 1-row horizontal strip copies from the presented swapchain texture
+   * into the pre-allocated 1024-byte staging buffer (y = 20%, 50%, 70%, 92% bottom-right).
+   */
+  _encodeSwapchainProbeCopies(encoder, texture, probeCap, startMs, summary) {
+    const { buffer, texWidth, texHeight } = probeCap;
+    const stripWidth = Math.max(1, Math.min(SWAPCHAIN_PROBE_STRIP_MAX_WIDTH, texWidth));
+    const maxOriginX = Math.max(0, texWidth - stripWidth);
+    try {
+      for (let s = 0; s < SWAPCHAIN_PROBE_STRIPS.length; s += 1) {
+        const strip = SWAPCHAIN_PROBE_STRIPS[s];
+        const originX = Math.max(0, Math.min(maxOriginX, Math.floor(maxOriginX * strip.xFraction)));
+        const originY = Math.max(
+          0,
+          Math.min(texHeight - 1, Math.floor(texHeight * strip.yFraction))
+        );
+        encoder.copyTextureToBuffer(
+          {
+            texture,
+            mipLevel: 0,
+            origin: { x: originX, y: originY, z: 0 },
+          },
+          {
+            buffer,
+            offset: s * SWAPCHAIN_PROBE_BYTES_PER_ROW,
+            bytesPerRow: SWAPCHAIN_PROBE_BYTES_PER_ROW,
+            rowsPerImage: 1,
+          },
+          {
+            width: stripWidth,
+            height: 1,
+            depthOrArrayLayers: 1,
+          }
+        );
+      }
+    } catch (_) {
+      return null;
+    }
+    return {
+      buffer,
+      stripWidth,
+      stripCount: SWAPCHAIN_PROBE_STRIPS.length,
+      startMs,
+      realPackDrawsThisFrame: summary ? summary.realPackDrawsThisFrame : 0,
+      fallbackDrawsThisFrame: summary ? summary.fallbackDrawsThisFrame : 0,
+      drawsThisFrame: summary ? summary.drawsThisFrame : 0,
+    };
+  }
+
+  /**
+   * W338: Start the non-overlapping async GPUBuffer.mapAsync readback after queue.submit().
+   * Scans RGB channels (i+0, i+1, i+2; ignoring alpha i+3) for both bgra8unorm and rgba8unorm.
+   * Immediately emits `first-visible-frame` and destroys the staging buffer on any pixel > threshold.
+   */
+  _startSwapchainProbeReadback(probeTarget) {
+    if (
+      !probeTarget ||
+      this._destroyed ||
+      this._firstVisibleFrameNotified ||
+      this._swapchainProbeInFlight
+    ) {
+      return false;
+    }
+    const buf = probeTarget.buffer;
+    if (!buf || buf !== this._swapchainProbeBuffer || buf.destroyed) {
+      return false;
+    }
+    const gen = this._swapchainProbeGeneration;
+    const mapReadMode =
+      typeof GPUMapMode !== 'undefined' && typeof GPUMapMode.READ === 'number'
+        ? GPUMapMode.READ
+        : 0x0001;
+    this._swapchainProbeInFlight = true;
+    this._swapchainProbeLastStartMs = probeTarget.startMs;
+    this._swapchainProbeCount += 1;
+
+    let mapPromise;
+    try {
+      mapPromise = buf.mapAsync(mapReadMode);
+    } catch (_) {
+      if (gen === this._swapchainProbeGeneration) {
+        this._swapchainProbeInFlight = false;
+      }
+      return false;
+    }
+    if (!mapPromise || typeof mapPromise.then !== 'function') {
+      if (gen === this._swapchainProbeGeneration) {
+        this._swapchainProbeInFlight = false;
+      }
+      return false;
+    }
+
+    const threshold = this._minVisibleLuma;
+    const stripWidth = probeTarget.stripWidth;
+    const stripCount = probeTarget.stripCount;
+
+    mapPromise.then(
+      () => {
+        if (
+          this._destroyed ||
+          gen !== this._swapchainProbeGeneration ||
+          buf !== this._swapchainProbeBuffer
+        ) {
+          try {
+            if (!buf.destroyed && typeof buf.unmap === 'function') {
+              buf.unmap();
+            }
+          } catch (_) {
+            // Ignore unmap on already-destroyed buffer.
+          }
+          if (gen === this._swapchainProbeGeneration) {
+            this._swapchainProbeInFlight = false;
+          }
+          return;
+        }
+
+        let maxRgb = 0;
+        let foundNonBlack = false;
+        let readOk = false;
+        try {
+          const range = buf.getMappedRange(0, SWAPCHAIN_PROBE_BUFFER_SIZE);
+          if (range) {
+            const bytes = new Uint8Array(range);
+            readOk = true;
+            for (let s = 0; s < stripCount; s += 1) {
+              const rowBase = s * SWAPCHAIN_PROBE_BYTES_PER_ROW;
+              const rowEnd = Math.min(bytes.byteLength, rowBase + stripWidth * 4);
+              for (let i = rowBase; i + 2 < rowEnd; i += 4) {
+                const c0 = bytes[i];
+                const c1 = bytes[i + 1];
+                const c2 = bytes[i + 2];
+                const pxMax = c0 >= c1 ? (c0 >= c2 ? c0 : c2) : c1 >= c2 ? c1 : c2;
+                if (pxMax > maxRgb) {
+                  maxRgb = pxMax;
+                }
+                if (pxMax > threshold) {
+                  foundNonBlack = true;
+                }
+              }
+            }
+          }
+        } catch (_) {
+          // Ignore mapped range errors on lost/destroyed buffers.
+        } finally {
+          try {
+            if (!buf.destroyed && typeof buf.unmap === 'function') {
+              buf.unmap();
+            }
+          } catch (_) {
+            // Ignore unmap failures on lost/destroyed buffers.
+          }
+          if (gen === this._swapchainProbeGeneration) {
+            this._swapchainProbeInFlight = false;
+          }
+        }
+
+        if (!readOk || this._destroyed || this._firstVisibleFrameNotified) {
+          return;
+        }
+
+        this._lastSampledMaxLuma = maxRgb;
+        if (foundNonBlack) {
+          const visibleTs = this._getNowMs();
+          const firstPresentMs =
+            this._firstPresentMs !== null ? this._firstPresentMs : visibleTs;
+          const blackLoadingMs = Math.max(0, visibleTs - firstPresentMs);
+          this._firstVisibleFrameMs = visibleTs;
+          this._blackLoadingMs = blackLoadingMs;
+          this._notifyFirstVisibleFrame({
+            type: 'first-visible-frame',
+            firstVisibleFrame: true,
+            firstVisibleFrameMs: visibleTs,
+            firstPresentMs,
+            blackLoadingMs,
+            presentCount: this._presentCount,
+            realPackDrawsThisFrame: probeTarget.realPackDrawsThisFrame,
+            fallbackDrawsThisFrame: probeTarget.fallbackDrawsThisFrame,
+            drawsThisFrame: probeTarget.drawsThisFrame,
+            source: 'swapchain-probe',
+            maxLuma: maxRgb,
+            suppressedBlackFrames: this._suppressedBlackFrames,
+            gpuAdapter: this._gpuAdapter ? { ...this._gpuAdapter } : null,
+          });
+        } else {
+          this._suppressedBlackFrames += 1;
+        }
+      },
+      () => {
+        if (gen === this._swapchainProbeGeneration) {
+          this._swapchainProbeInFlight = false;
+        }
+      }
+    );
+
+    return true;
   }
 
   _beginSubsystemsForFrame(frameIndex) {
@@ -5557,6 +6035,9 @@ class WgpuCommandProcessor {
    * paths instead of throwing. Shader WGSL sources in the pack cache are preserved.
    */
   _resetDeviceResources() {
+    this._destroySwapchainProbeBuffer();
+    this._swapchainProbeSupported = null;
+    this._swapchainProbeLastStartMs = -Infinity;
     this._pendingEncoder = null;
     this._hasPendingUploadCommands = false;
     this._passCommands = [];
@@ -5752,7 +6233,7 @@ class WgpuCommandProcessor {
         if (viewFormats) {
           cfg.viewFormats = viewFormats;
         }
-        this.ctx.configure(cfg);
+        configureCanvasContextWithCopySrc(this.ctx, cfg);
       } catch (err) {
         this._logDiagnostic(
           'warn',
@@ -5841,7 +6322,7 @@ class WgpuCommandProcessor {
       if (this._swapchainViewFormat) {
         cfg.viewFormats = [this._swapchainViewFormat];
       }
-      this.ctx.configure(cfg);
+      configureCanvasContextWithCopySrc(this.ctx, cfg);
     }
     this._recreateOwnedSubsystems(newDevice);
     this._hookDeviceLost(newDevice);
@@ -8792,6 +9273,81 @@ class WgpuCommandProcessor {
       }
     }
 
+    let cachedFrameSummary = null;
+    const ensureFrameDrawSummary = () => {
+      if (cachedFrameSummary !== null) {
+        return cachedFrameSummary;
+      }
+      let rawSummary = null;
+      if (this.drawExecutor && typeof this.drawExecutor.getFrameDrawSummary === 'function') {
+        try {
+          rawSummary = this.drawExecutor.getFrameDrawSummary(this._frameDrawSummaryOpts);
+        } catch (_) {
+          rawSummary = this.drawExecutor.getFrameDrawSummary();
+        }
+      }
+      cachedFrameSummary = this._frameSummaryScratch;
+      if (rawSummary && typeof rawSummary === 'object') {
+        cachedFrameSummary.hasNonClearDraw =
+          Boolean(rawSummary.hasNonClearDraw === true) ||
+          this._frameNonClearDrawsThisFrame > 0;
+        cachedFrameSummary.realPackDrawsThisFrame =
+          toNonNegativeInt(rawSummary.realPackDrawsThisFrame, 0) +
+          this._frameRealPackDrawsThisFrame;
+        cachedFrameSummary.fallbackDrawsThisFrame =
+          toNonNegativeInt(rawSummary.fallbackDrawsThisFrame, 0) +
+          this._frameFallbackDrawsThisFrame;
+        cachedFrameSummary.drawsThisFrame =
+          toNonNegativeInt(rawSummary.drawsThisFrame, 0) + this._frameDrawsThisFrame;
+      } else {
+        cachedFrameSummary.hasNonClearDraw = this._frameNonClearDrawsThisFrame > 0;
+        cachedFrameSummary.realPackDrawsThisFrame = this._frameRealPackDrawsThisFrame;
+        cachedFrameSummary.fallbackDrawsThisFrame = this._frameFallbackDrawsThisFrame;
+        cachedFrameSummary.drawsThisFrame = this._frameDrawsThisFrame;
+      }
+      return cachedFrameSummary;
+    };
+
+    // W338: While waiting for first-visible-frame on a real WebGPU device with COPY_SRC
+    // swapchain readback support, encode 4 small horizontal strip copies before encoder.finish()
+    // (throttled to >= 250 ms and strictly non-overlapping; zero work once first-visible-frame fires).
+    let swapchainProbeActive = false;
+    let pendingSwapchainProbe = null;
+    if (
+      !this._firstVisibleFrameNotified &&
+      this._requireNonBlackFrameExplicit !== false &&
+      this._swapchainProbeSupported !== false &&
+      encoder &&
+      typeof encoder.copyTextureToBuffer === 'function'
+    ) {
+      const preSummary = ensureFrameDrawSummary();
+      const hasDrawCandidate =
+        this._realPackDrawCount > 0 ||
+        preSummary.realPackDrawsThisFrame > 0 ||
+        preSummary.hasNonClearDraw;
+      if (hasDrawCandidate) {
+        const probeCap = this._resolveSwapchainProbeCapability(encoder, canvasTexture);
+        if (probeCap !== null) {
+          swapchainProbeActive = true;
+          if (this._pendingFrameLuminance === null && !this._swapchainProbeInFlight) {
+            const probeNowMs = this._getNowMs();
+            const intervalElapsed =
+              !Number.isFinite(this._swapchainProbeLastStartMs) ||
+              probeNowMs - this._swapchainProbeLastStartMs >= this._swapchainProbeIntervalMs;
+            if (intervalElapsed) {
+              pendingSwapchainProbe = this._encodeSwapchainProbeCopies(
+                encoder,
+                canvasTexture,
+                probeCap,
+                probeNowMs,
+                preSummary
+              );
+            }
+          }
+        }
+      }
+    }
+
     let timerResolved = false;
     if (timerSupported && typeof this.passTimer.resolveFrame === 'function') {
       timerResolved = Boolean(this.passTimer.resolveFrame(encoder));
@@ -8887,33 +9443,7 @@ class WgpuCommandProcessor {
         });
       }
 
-      let rawSummary = null;
-      if (this.drawExecutor && typeof this.drawExecutor.getFrameDrawSummary === 'function') {
-        try {
-          rawSummary = this.drawExecutor.getFrameDrawSummary(this._frameDrawSummaryOpts);
-        } catch (_) {
-          rawSummary = this.drawExecutor.getFrameDrawSummary();
-        }
-      }
-      const summary = this._frameSummaryScratch;
-      if (rawSummary && typeof rawSummary === 'object') {
-        summary.hasNonClearDraw =
-          Boolean(rawSummary.hasNonClearDraw === true) ||
-          this._frameNonClearDrawsThisFrame > 0;
-        summary.realPackDrawsThisFrame =
-          toNonNegativeInt(rawSummary.realPackDrawsThisFrame, 0) +
-          this._frameRealPackDrawsThisFrame;
-        summary.fallbackDrawsThisFrame =
-          toNonNegativeInt(rawSummary.fallbackDrawsThisFrame, 0) +
-          this._frameFallbackDrawsThisFrame;
-        summary.drawsThisFrame =
-          toNonNegativeInt(rawSummary.drawsThisFrame, 0) + this._frameDrawsThisFrame;
-      } else {
-        summary.hasNonClearDraw = this._frameNonClearDrawsThisFrame > 0;
-        summary.realPackDrawsThisFrame = this._frameRealPackDrawsThisFrame;
-        summary.fallbackDrawsThisFrame = this._frameFallbackDrawsThisFrame;
-        summary.drawsThisFrame = this._frameDrawsThisFrame;
-      }
+      const summary = ensureFrameDrawSummary();
       presentIsIdleFrame = summary.drawsThisFrame === 0;
 
       let swapchainReportedFirstVisible = false;
@@ -8967,7 +9497,48 @@ class WgpuCommandProcessor {
         }
       }
 
-      if (
+      if (swapchainProbeActive && !this._firstVisibleFrameNotified) {
+        let syncEmitted = false;
+        if (this._pendingFrameLuminance !== null || this._nonBlackPixelProbe !== null) {
+          const gate = this._evaluateCommandBufferNonBlackGate(
+            markResult,
+            activeSwapchain,
+            curWidth,
+            curHeight,
+            summary
+          );
+          if (gate.evaluated) {
+            this._lastSampledMaxLuma = Math.max(0, Math.min(255, Math.floor(gate.maxLuma || 0)));
+            if (gate.visible) {
+              const firstPresentMs =
+                this._firstPresentMs !== null ? this._firstPresentMs : presentTs;
+              const blackLoadingMs = Math.max(0, presentTs - firstPresentMs);
+              this._firstVisibleFrameMs = presentTs;
+              this._blackLoadingMs = blackLoadingMs;
+              this._notifyFirstVisibleFrame({
+                type: 'first-visible-frame',
+                firstVisibleFrame: true,
+                firstVisibleFrameMs: presentTs,
+                firstPresentMs,
+                blackLoadingMs,
+                presentCount: this._presentCount,
+                realPackDrawsThisFrame: summary.realPackDrawsThisFrame,
+                fallbackDrawsThisFrame: summary.fallbackDrawsThisFrame,
+                drawsThisFrame: summary.drawsThisFrame,
+                maxLuma: this._lastSampledMaxLuma,
+                suppressedBlackFrames: this._suppressedBlackFrames,
+                gpuAdapter: this._gpuAdapter ? { ...this._gpuAdapter } : null,
+              });
+              syncEmitted = true;
+            } else {
+              this._suppressedBlackFrames += 1;
+            }
+          }
+        }
+        if (!syncEmitted && !this._firstVisibleFrameNotified && pendingSwapchainProbe !== null) {
+          this._startSwapchainProbeReadback(pendingSwapchainProbe);
+        }
+      } else if (
         (summary.hasNonClearDraw || swapchainReportedFirstVisible) &&
         !this._firstVisibleFrameNotified
       ) {
@@ -9627,6 +10198,8 @@ class WgpuCommandProcessor {
       requireNonBlackFrame: this._requireNonBlackFrame,
       suppressedBlackFrames: this._suppressedBlackFrames,
       lastSampledMaxLuma: this._lastSampledMaxLuma,
+      swapchainProbeCount: this._swapchainProbeCount,
+      swapchainProbeInFlight: this._swapchainProbeInFlight,
       gpuAdapter: this._gpuAdapter ? { ...this._gpuAdapter } : null,
       chunkedWriteBufferUploads: this._chunkedWriteBufferUploads,
       packetCount: this._packetCount,
@@ -9716,6 +10289,8 @@ class WgpuCommandProcessor {
       return;
     }
     this._destroyed = true;
+    // W338: release swapchain luminance probe staging buffer cleanly on worker destroy.
+    this._destroySwapchainProbeBuffer();
     // W103: settle queued/in-flight pipeline compiles so nothing writes into a torn-down processor.
     this._resetAsyncPipelineCache(null);
     // W100: intentional teardown — never treat the subsequent `device.lost` as a loss.
@@ -11969,7 +12544,7 @@ function createWgpuWorkerHandler(options = {}) {
         !activeSwapchain.isConfigured &&
         typeof activeSwapchain.configure === 'function'
       ) {
-        activeSwapchain.configure({
+        configureSwapchainWithCopySrc(activeSwapchain, {
           width,
           height,
           devicePixelRatio: initPayload.devicePixelRatio || 1,
@@ -12008,11 +12583,16 @@ function createWgpuWorkerHandler(options = {}) {
             now: telemetryNow,
           };
           activeSwapchain = new SwapchainCtor(swapOpts);
-          activeSwapchain.configure({
+          const swapConfigureOpts = {
             width,
             height,
             devicePixelRatio: initPayload.devicePixelRatio || 1,
-          });
+          };
+          if (swapOpts.usage !== undefined) {
+            activeSwapchain.configure(swapConfigureOpts);
+          } else {
+            configureSwapchainWithCopySrc(activeSwapchain, swapConfigureOpts);
+          }
           ownsSwapchain = true;
         } catch (_) {
           if (activeSwapchain && typeof activeSwapchain.destroy === 'function') {
@@ -12029,7 +12609,7 @@ function createWgpuWorkerHandler(options = {}) {
     }
 
     if (!activeSwapchain) {
-      ctx.configure({ device, format, alphaMode: 'opaque' });
+      configureCanvasContextWithCopySrc(ctx, { device, format, alphaMode: 'opaque' });
     }
     swapchain = activeSwapchain;
 
@@ -12086,6 +12666,10 @@ function createWgpuWorkerHandler(options = {}) {
         initPayload.requireNonBlackFrame !== undefined
           ? initPayload.requireNonBlackFrame
           : options.requireNonBlackFrame,
+      swapchainProbeIntervalMs:
+        initPayload.swapchainProbeIntervalMs !== undefined
+          ? initPayload.swapchainProbeIntervalMs
+          : options.swapchainProbeIntervalMs,
       minVisibleLuma: initPayload.minVisibleLuma ?? options.minVisibleLuma,
       minVisiblePixels: initPayload.minVisiblePixels ?? options.minVisiblePixels,
       nonBlackPixelProbe:
@@ -12739,6 +13323,11 @@ const exportedApi = {
   createWgpuWorkerHandler,
   buildGpuTelemetrySnapshot,
   buildMergedBinkPresenterOptions,
+  configureCanvasContextWithCopySrc,
+  SWAPCHAIN_PROBE_DEFAULT_INTERVAL_MS,
+  SWAPCHAIN_PROBE_STRIPS,
+  SWAPCHAIN_PROBE_BYTES_PER_ROW,
+  SWAPCHAIN_PROBE_BUFFER_SIZE,
   selectSupportedAdapterFeatures,
   OPTIONAL_ADAPTER_FEATURES,
   selectSupportedAdapterLimits,
