@@ -34,6 +34,7 @@ const BUFFER_USAGE = Object.freeze({
   INDEX: 0x0010,
   VERTEX: 0x0020,
   UNIFORM: 0x0040,
+  INDIRECT: 0x0100,
 });
 
 function createMockWebGpu(overrides = {}) {
@@ -180,6 +181,26 @@ function createMockWebGpu(overrides = {}) {
         firstIndex,
         baseVertex,
         firstInstance,
+      });
+    },
+    drawIndirect(indirectBuffer, indirectOffset) {
+      if (overrides.failDrawIndirect) {
+        throw new Error('mock drawIndirect failure');
+      }
+      calls.pass.push({
+        op: 'drawIndirect',
+        indirectBuffer,
+        indirectOffset,
+      });
+    },
+    drawIndexedIndirect(indirectBuffer, indirectOffset) {
+      if (overrides.failDrawIndexedIndirect) {
+        throw new Error('mock drawIndexedIndirect failure');
+      }
+      calls.pass.push({
+        op: 'drawIndexedIndirect',
+        indirectBuffer,
+        indirectOffset,
       });
     },
   };
@@ -1099,4 +1120,207 @@ test('G47 DrawExecutor executes rect-list 24B draws via splash_rect_24b with tri
   );
   assert.ok(synthSplashVb);
   assert.equal(synthSplashVb.desc.size, 144);
+});
+
+// ---------------------------------------------------------------------------
+// W130 Redundant pipeline elision, zero-count draw guard & per-kind telemetry
+// ---------------------------------------------------------------------------
+
+test('W130 redundant setPipeline in one pass elides pass.setPipeline and re-binds cleanly on new pass / endPass / reset', () => {
+  const { device, pass, calls } = createMockWebGpu();
+  const router = new ShaderFallbackRouter();
+  const executor = new DrawExecutor({ device, shaderFallbackRouter: router });
+
+  const pipeA = {
+    kind: 'GPURenderPipeline',
+    handle: 1001,
+    getBindGroupLayout: () => ({ kind: 'GPUBindGroupLayout' }),
+  };
+  const pipeB = {
+    kind: 'GPURenderPipeline',
+    handle: 1002,
+    getBindGroupLayout: () => ({ kind: 'GPUBindGroupLayout' }),
+  };
+
+  // Pass 1: redundant setPipeline(pipeA) elides pass.setPipeline once.
+  executor.beginPass();
+  executor.setPipeline(pipeA);
+  const d1 = executor.draw(pass, 3, 1);
+  assert.equal(d1.executed, true);
+  assert.equal(d1.pipelineElided, false);
+
+  executor.setPipeline(pipeA);
+  const d2 = executor.draw(pass, 3, 1);
+  assert.equal(d2.executed, true);
+  assert.equal(d2.pipelineElided, true);
+
+  let setPipeOps = calls.pass.filter((c) => c.op === 'setPipeline');
+  assert.equal(setPipeOps.length, 1);
+  assert.equal(setPipeOps[0].pipeline, pipeA);
+  assert.equal(executor.getStats().redundantPipelineSkips, 1);
+
+  // Switching to a different pipeline binds it immediately.
+  executor.setPipeline(pipeB);
+  const d3 = executor.draw(pass, 6, 1);
+  assert.equal(d3.executed, true);
+  assert.equal(d3.pipelineElided, false);
+  setPipeOps = calls.pass.filter((c) => c.op === 'setPipeline');
+  assert.equal(setPipeOps.length, 2);
+  assert.equal(setPipeOps[1].pipeline, pipeB);
+  assert.equal(executor.getStats().redundantPipelineSkips, 1);
+
+  // Starting a new pass resets bound pipeline tracking so pipeB binds again.
+  executor.beginPass();
+  executor.setPipeline(pipeB);
+  const d4 = executor.draw(pass, 6, 1);
+  assert.equal(d4.executed, true);
+  assert.equal(d4.pipelineElided, false);
+  setPipeOps = calls.pass.filter((c) => c.op === 'setPipeline');
+  assert.equal(setPipeOps.length, 3);
+  assert.equal(executor.getStats().redundantPipelineSkips, 1);
+
+  // endPass() also clears bound pipeline tracking even when the same pass object is reused.
+  executor.endPass();
+  const d5 = executor.draw(pass, 6, 1);
+  assert.equal(d5.executed, true);
+  assert.equal(d5.pipelineElided, false);
+  setPipeOps = calls.pass.filter((c) => c.op === 'setPipeline');
+  assert.equal(setPipeOps.length, 4);
+
+  // reset() clears bound pipeline state without wiping telemetry unless { stats: true }.
+  executor.reset();
+  executor.setPipeline(pipeA);
+  const d6 = executor.draw(pass, 3, 1);
+  assert.equal(d6.executed, true);
+  assert.equal(d6.pipelineElided, false);
+  setPipeOps = calls.pass.filter((c) => c.op === 'setPipeline');
+  assert.equal(setPipeOps.length, 5);
+  assert.equal(executor.getStats().redundantPipelineSkips, 1);
+
+  // Opt-out option elideRedundantPipelines: false always calls pass.setPipeline.
+  const noElideEnv = createMockWebGpu();
+  const noElideExec = new DrawExecutor({
+    device: noElideEnv.device,
+    shaderFallbackRouter: router,
+    elideRedundantPipelines: false,
+  });
+  noElideExec.beginPass();
+  noElideExec.setPipeline(pipeA);
+  noElideExec.draw(noElideEnv.pass, 3, 1);
+  noElideExec.setPipeline(pipeA);
+  noElideExec.draw(noElideEnv.pass, 3, 1);
+  assert.equal(
+    noElideEnv.calls.pass.filter((c) => c.op === 'setPipeline').length,
+    2
+  );
+  assert.equal(noElideExec.getStats().redundantPipelineSkips, 0);
+});
+
+test('W130 zero-count draw guard skips zero vertex, index, and instance draws cleanly', () => {
+  const { device, pass, calls } = createMockWebGpu();
+  const router = new ShaderFallbackRouter();
+  const executor = new DrawExecutor({ device, shaderFallbackRouter: router });
+
+  const pipe = {
+    kind: 'GPURenderPipeline',
+    handle: 2001,
+    getBindGroupLayout: () => ({ kind: 'GPUBindGroupLayout' }),
+  };
+  const ib = device.createBuffer({ size: 64, usage: BUFFER_USAGE.INDEX });
+
+  executor.beginPass();
+  executor.setPipeline(pipe);
+  executor.setIndexBuffer(ib, 'uint16', 0);
+
+  const zVert = executor.draw(pass, 0, 1);
+  const zVertInst = executor.draw(pass, 6, 0);
+  const zIdx = executor.drawIndexed(pass, 0, 1);
+  const zIdxInst = executor.drawIndexed(pass, 12, 0);
+
+  for (const res of [zVert, zVertInst, zIdx, zIdxInst]) {
+    assert.equal(res.executed, false);
+    assert.equal(res.skipped, true);
+    assert.equal(res.reason, 'zero-draw-count');
+  }
+
+  // Zero WebGPU draw or setPipeline calls issued.
+  assert.equal(calls.pass.length, 0);
+
+  const stats = executor.getStats();
+  assert.equal(stats.zeroCountDrawsSkipped, 4);
+  assert.equal(stats.skippedDraws, 4);
+  assert.equal(stats.totalDraws, 0);
+  assert.equal(stats.indexedDraws, 0);
+  assert.equal(stats.nonIndexedDraws, 0);
+  assert.equal(stats.indirectDraws, 0);
+});
+
+test('W130 per-kind draw telemetry tracks indexedDraws, nonIndexedDraws, and indirectDraws across mixed draws', () => {
+  const { device, pass, calls } = createMockWebGpu();
+  const router = new ShaderFallbackRouter();
+  const executor = new DrawExecutor({ device, shaderFallbackRouter: router });
+
+  const pipe = {
+    kind: 'GPURenderPipeline',
+    handle: 3001,
+    getBindGroupLayout: () => ({ kind: 'GPUBindGroupLayout' }),
+  };
+  const vb = device.createBuffer({ size: 256, usage: BUFFER_USAGE.VERTEX });
+  const ib = device.createBuffer({ size: 128, usage: BUFFER_USAGE.INDEX });
+  const indirectBuf = device.createBuffer({ size: 64, usage: BUFFER_USAGE.INDIRECT });
+
+  executor.beginPass();
+  executor.setPipeline(pipe);
+  executor.setVertexBuffer(0, vb, 0);
+  executor.setIndexBuffer(ib, 'uint16', 0);
+
+  // 2 non-indexed draws
+  assert.equal(executor.draw(pass, 3, 1).executed, true);
+  assert.equal(executor.draw(pass, 6, 2).executed, true);
+
+  // 2 indexed draws
+  assert.equal(executor.drawIndexed(pass, 12, 1, 0, 0, 0).executed, true);
+  assert.equal(executor.drawIndexed(pass, 18, 2, 0, 0, 0).executed, true);
+
+  // 2 indirect draws (1 non-indexed indirect, 1 indexed indirect)
+  const ind1 = executor.drawIndirect(pass, indirectBuf, 0);
+  assert.equal(ind1.executed, true);
+  assert.equal(ind1.indirect, true);
+  assert.equal(ind1.indexed, false);
+
+  const ind2 = executor.drawIndexedIndirect(pass, indirectBuf, 20);
+  assert.equal(ind2.executed, true);
+  assert.equal(ind2.indirect, true);
+  assert.equal(ind2.indexed, true);
+
+  // Invalid indirect buffer (undersized / misaligned) skips cleanly without throwing.
+  const badInd = executor.drawIndirect(pass, indirectBuf, 2); // misaligned offset
+  assert.equal(badInd.executed, false);
+  assert.equal(badInd.skipped, true);
+  assert.equal(badInd.reason, 'invalid-indirect-buffer');
+
+  const stats = executor.getStats();
+  assert.equal(stats.totalDraws, 6);
+  assert.equal(stats.normalDraws, 6);
+  assert.equal(stats.nonIndexedDraws, 2);
+  assert.equal(stats.indexedDraws, 2);
+  assert.equal(stats.indirectDraws, 2);
+  assert.equal(stats.skippedDraws, 1);
+  assert.equal(stats.zeroCountDrawsSkipped, 0);
+  // All 6 draws shared the same pipeline in one pass -> 1 bind, 5 elided.
+  assert.equal(stats.redundantPipelineSkips, 5);
+  assert.equal(calls.pass.filter((c) => c.op === 'setPipeline').length, 1);
+  assert.equal(calls.pass.filter((c) => c.op === 'draw').length, 2);
+  assert.equal(calls.pass.filter((c) => c.op === 'drawIndexed').length, 2);
+  assert.equal(calls.pass.filter((c) => c.op === 'drawIndirect').length, 1);
+  assert.equal(calls.pass.filter((c) => c.op === 'drawIndexedIndirect').length, 1);
+
+  // resetStats() zeroes all new telemetry counters as well.
+  executor.resetStats();
+  const cleared = executor.getStats();
+  assert.equal(cleared.indexedDraws, 0);
+  assert.equal(cleared.nonIndexedDraws, 0);
+  assert.equal(cleared.indirectDraws, 0);
+  assert.equal(cleared.redundantPipelineSkips, 0);
+  assert.equal(cleared.zeroCountDrawsSkipped, 0);
 });
