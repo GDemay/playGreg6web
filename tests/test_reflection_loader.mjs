@@ -17,6 +17,7 @@ const {
   TABLE_SLOT_BYTES,
   UNIFORM_MIN_BINDING_SIZE_ALIGNMENT,
   STORAGE_MIN_BINDING_SIZE_ALIGNMENT,
+  DEFAULT_NEGATIVE_LOOKUP_CACHE_SIZE,
   DIAGNOSTIC_CODES,
   SHADER_STAGE_BITS,
   VERTEX_FORMAT_BYTE_SIZES,
@@ -2486,6 +2487,9 @@ test('W215 parseStageReflectionSidecar parses splash.wgsl.pack.reflect.json form
     lookupHits: 0,
     lookupMisses: 0,
     lookupHitRate: 0,
+    fastHashLookups: 0,
+    fastHashHits: 0,
+    negativeLookupHits: 0,
   });
 
   // O(1) normalized-hash lookup across '0x...', uppercase '0X...', bare 16-hex, short hex, BigInt, safe int
@@ -3358,4 +3362,428 @@ test('W275 indexes 9,574-stage sidecar (splash.wgsl.pack.reflect.json scale) wit
   assert.equal(stats.lookupHits, 0);
   assert.equal(stats.lookupMisses, 0);
   assert.equal(stats.lookupHitRate, 0);
+  assert.equal(stats.fastHashLookups, 0);
+  assert.equal(stats.fastHashHits, 0);
+  assert.equal(stats.negativeLookupHits, 0);
+});
+
+// ---------------------------------------------------------------------------
+// W318: Zero-alloc O(1) BigInt / safe-integer fast lookup path, bounded
+// negative-miss caching, sanitized telemetry, and 9,574-stage interning parity
+// ---------------------------------------------------------------------------
+
+test('W318 getStageByHashFast performs zero-alloc O(1) BigInt and safe-integer lookups without string formatting', () => {
+  assert.equal(DEFAULT_NEGATIVE_LOOKUP_CACHE_SIZE, 2048);
+
+  const sidecar = {
+    schema: 'playgta6-stage-reflection',
+    version: 1,
+    stages: {
+      '0x0000000000003333': {
+        stage: 'vertex',
+        bindings: [
+          { group: 0, binding: 0, kind: 'uniform', min_binding_size_bytes: 64, source: { user_sgpr: 8, table_byte_offset: 0 } },
+        ],
+      },
+      '0xdeadbeef12345678': {
+        stage: 'fragment',
+        bindings: [
+          { group: 0, binding: 0, kind: 'texture', view_dimension: '2d', sample_type: 'float', source: { resource_heap: true } },
+          { group: 0, binding: 1, kind: 'sampler', source: { inline_sampler: { sdwords: [146, 15728640, 139460608, 0] } } },
+        ],
+      },
+      '0xfedcba9876543210': {
+        stage: 'compute',
+        bindings: [
+          { group: 0, binding: 0, kind: 'storage', min_binding_size_bytes: 16, source: { user_sgpr: 4, table_byte_offset: 0 } },
+        ],
+      },
+    },
+  };
+
+  const parsed = parseStageReflectionSidecar(JSON.stringify(sidecar));
+  const registry = new ReflectionRegistry();
+  registry.loadStageReflection(JSON.stringify(sidecar));
+
+  // _byHashBigInt is populated alongside the compact store without duplicating the Map
+  assert.ok(parsed._byHashBigInt instanceof Map);
+  assert.equal(parsed._byHashBigInt, parsed.stagesByHash);
+  assert.equal(parsed._byHashBigInt.size, 3);
+  assert.ok(registry._byHashBigInt instanceof Map);
+  assert.equal(registry._byHashBigInt, registry._shadersByHash);
+  assert.equal(registry._byHashBigInt.size, 3);
+
+  const expectedVs = registry.getStageReflection('0x0000000000003333');
+  const expectedFs = registry.getStageReflection('0xdeadbeef12345678');
+  const expectedCs = registry.getStageReflection('0xfedcba9876543210');
+  registry.resetStats();
+
+  // Temporarily trap string-formatting/normalization methods to prove ZERO string formatting on fast lookups
+  const origBigIntToString = BigInt.prototype.toString;
+  const origNumberToString = Number.prototype.toString;
+  const origToLowerCase = String.prototype.toLowerCase;
+  const origPadStart = String.prototype.padStart;
+
+  let formatCalls = 0;
+  BigInt.prototype.toString = function trappedBigIntToString(...args) {
+    formatCalls += 1;
+    return origBigIntToString.apply(this, args);
+  };
+  Number.prototype.toString = function trappedNumberToString(...args) {
+    formatCalls += 1;
+    return origNumberToString.apply(this, args);
+  };
+  String.prototype.toLowerCase = function trappedToLowerCase(...args) {
+    formatCalls += 1;
+    return origToLowerCase.apply(this, args);
+  };
+  String.prototype.padStart = function trappedPadStart(...args) {
+    formatCalls += 1;
+    return origPadStart.apply(this, args);
+  };
+
+  let regVsBigInt;
+  let regVsNum;
+  let regFsBigInt;
+  let regFsPixel;
+  let regCsMask;
+  let regStageMismatch;
+  let regUnknownFirst;
+  let regUnknownSecond;
+  let parsedFsBigInt;
+  let parsedVsNum;
+  let parsedUnknownFirst;
+  let parsedUnknownSecond;
+
+  try {
+    regVsBigInt = registry.getStageByHashFast(0x3333n, 'vertex');
+    regVsNum = registry.getStageByHashFast(0x3333, 'vertex');
+    regFsBigInt = registry.getStageByHashFast(0xdeadbeef12345678n, 'fragment');
+    regFsPixel = registry.getStageByHashFast(0xdeadbeef12345678n, 'pixel');
+    regCsMask = registry.getStageByHashFast(0xfedcba9876543210n, SHADER_STAGE_BITS.COMPUTE);
+    // Stage mismatch on a known hash must return undefined without formatting or negative-caching
+    regStageMismatch = registry.getStageByHashFast(0x3333n, 'fragment');
+    // Unknown 64-bit hash miss + cached negative hit must also perform zero string formatting
+    regUnknownFirst = registry.getStageByHashFast(0x9999999999999999n, 'fragment');
+    regUnknownSecond = registry.getStageByHashFast(0x9999999999999999n, 'fragment');
+
+    parsedFsBigInt = parsed.getStageByHashFast(0xdeadbeef12345678n, 'fragment');
+    parsedVsNum = parsed.getStageByHashFast(0x3333);
+    parsedUnknownFirst = parsed.getStageByHashFast(0x7777777777777777n);
+    parsedUnknownSecond = parsed.getStageByHashFast(0x7777777777777777n);
+  } finally {
+    BigInt.prototype.toString = origBigIntToString;
+    Number.prototype.toString = origNumberToString;
+    String.prototype.toLowerCase = origToLowerCase;
+    String.prototype.padStart = origPadStart;
+  }
+
+  assert.equal(formatCalls, 0, 'getStageByHashFast must not invoke hex/string formatting or normalization');
+
+  assert.equal(regVsBigInt, expectedVs);
+  assert.equal(regVsNum, expectedVs);
+  assert.equal(regFsBigInt, expectedFs);
+  assert.equal(regFsPixel, expectedFs);
+  assert.equal(regCsMask, expectedCs);
+  assert.equal(regStageMismatch, undefined);
+  assert.equal(regUnknownFirst, undefined);
+  assert.equal(regUnknownSecond, undefined);
+
+  assert.equal(parsedFsBigInt.hash, 0xdeadbeef12345678n);
+  assert.equal(parsedVsNum.hash, 0x3333n);
+  assert.equal(parsedUnknownFirst, undefined);
+  assert.equal(parsedUnknownSecond, undefined);
+
+  // Stage mismatch on 0x3333n did NOT poison the negative cache; subsequent vertex lookup hits
+  assert.equal(registry.getStageByHashFast(0x3333n, 'vertex'), expectedVs);
+  assert.equal(registry.getStageByHashFast(0x3333n, '  VERTEX  '), expectedVs);
+
+  const regStats = registry.getStats();
+  assert.equal(regStats.fastHashLookups, 10);
+  assert.equal(regStats.fastHashHits, 7);
+  assert.equal(regStats.negativeLookupHits, 1);
+  assert.equal(regStats.lookupHits, 7);
+  assert.equal(regStats.lookupMisses, 3);
+  assert.ok(Math.abs(regStats.lookupHitRate - 0.7) < 1e-12);
+
+  const parsedStats = parsed.getStats();
+  assert.equal(parsedStats.fastHashLookups, 4);
+  assert.equal(parsedStats.fastHashHits, 2);
+  assert.equal(parsedStats.negativeLookupHits, 1);
+  assert.equal(parsedStats.lookupHits, 2);
+  assert.equal(parsedStats.lookupMisses, 2);
+  assert.equal(parsedStats.lookupHitRate, 0.5);
+
+  // Invalid/malformed arguments never throw and never pollute the negative cache
+  const invalidInputs = [
+    -1n,
+    0x10000000000000000n,
+    -1,
+    1.5,
+    NaN,
+    Infinity,
+    Number.MAX_SAFE_INTEGER + 1,
+    '0x0000000000003333',
+    null,
+    undefined,
+    {},
+  ];
+  const beforeNegHits = registry.getStats().negativeLookupHits;
+  for (const bad of invalidInputs) {
+    assert.equal(registry.getStageByHashFast(bad), undefined);
+    assert.equal(registry.getStageByHashFast(bad), undefined);
+  }
+  assert.equal(registry.getStats().negativeLookupHits, beforeNegHits);
+});
+
+test('W318 bounded negative-miss cache enforces LRU cap, invalidates on load, and supports disable mode', () => {
+  const registry = new ReflectionRegistry({ maxNegativeLookupCacheSize: 3 });
+  registry.loadStageReflection({
+    schema: 'playgta6-stage-reflection',
+    version: 1,
+    stages: {
+      '0x0000000000000001': {
+        stage: 'vertex',
+        bindings: [
+          { group: 0, binding: 0, kind: 'uniform', source: { user_sgpr: 8, table_byte_offset: 0 } },
+        ],
+      },
+    },
+  });
+
+  // First miss caches A, B, C (cap = 3)
+  assert.equal(registry.getStageByHashFast(0xaaaa000000000001n), undefined);
+  assert.equal(registry.getStageByHashFast(0xbbbb000000000002n), undefined);
+  assert.equal(registry.getStageByHashFast(0x00000000000000ccn), undefined); // safe-int range BigInt
+  assert.equal(registry.getStats().negativeLookupHits, 0);
+
+  // Cross-type parity: 0xcc (number) hits the negative entry inserted by 0xccn (BigInt)
+  assert.equal(registry.getStageByHashFast(0xcc), undefined);
+  assert.equal(registry.getStats().negativeLookupHits, 1);
+
+  // Touch A to promote it to MRU so B becomes LRU
+  assert.equal(registry.getStageByHashFast(0xaaaa000000000001n), undefined);
+  assert.equal(registry.getStats().negativeLookupHits, 2);
+
+  // Insert D -> evicts LRU entry B while keeping A, C, D within bound 3
+  assert.equal(registry.getStageByHashFast(0xdddd000000000004n), undefined);
+  assert.equal(registry._negativeHashCache.size, 3);
+  assert.equal(registry.getStats().negativeLookupHits, 2);
+
+  // A and D are still negative-cache hits
+  assert.equal(registry.getStageByHashFast(0xaaaa000000000001n), undefined);
+  assert.equal(registry.getStageByHashFast(0xdddd000000000004n), undefined);
+  assert.equal(registry.getStats().negativeLookupHits, 4);
+
+  // B was evicted, so first re-probe of B is NOT a negative hit, and second re-probe IS
+  assert.equal(registry.getStageByHashFast(0xbbbb000000000002n), undefined);
+  assert.equal(registry.getStats().negativeLookupHits, 4);
+  assert.equal(registry.getStageByHashFast(0xbbbb000000000002n), undefined);
+  assert.equal(registry.getStats().negativeLookupHits, 5);
+  assert.equal(registry._negativeHashCache.size, 3);
+
+  // String negative lookup cache hits on repeat unknown strings
+  assert.equal(registry.getShaderReflection('0xdeadbeef00000000'), undefined);
+  assert.equal(registry.getStats().negativeLookupHits, 5);
+  assert.equal(registry.getShaderReflection('0xdeadbeef00000000'), undefined);
+  assert.equal(registry.getStats().negativeLookupHits, 6);
+
+  // Loading a sidecar containing previously negatively-cached hash B invalidates both caches cleanly
+  registry.loadStageReflection({
+    schema: 'playgta6-stage-reflection',
+    version: 1,
+    stages: {
+      '0xbbbb000000000002': {
+        stage: 'fragment',
+        bindings: [
+          { group: 0, binding: 0, kind: 'sampler', source: { inline_sampler: { sdwords: [1, 2, 3, 4] } } },
+        ],
+      },
+      '0xdeadbeef00000000': {
+        stage: 'compute',
+        bindings: [
+          { group: 0, binding: 0, kind: 'storage', source: { user_sgpr: 4, table_byte_offset: 0 } },
+        ],
+      },
+    },
+  });
+
+  const loadedB = registry.getStageByHashFast(0xbbbb000000000002n, 'fragment');
+  assert.ok(loadedB);
+  assert.equal(loadedB.stage, 'fragment');
+  assert.ok(registry.getShaderReflection('0xdeadbeef00000000'));
+
+  // Disabling negative cache with maxNegativeLookupCacheSize: 0 keeps negativeLookupHits === 0
+  const noNegReg = new ReflectionRegistry({ maxNegativeLookupCacheSize: 0 });
+  assert.equal(noNegReg.getStageByHashFast(0x123456n), undefined);
+  assert.equal(noNegReg.getStageByHashFast(0x123456n), undefined);
+  assert.equal(noNegReg.getShaderReflection('0x123456'), undefined);
+  assert.equal(noNegReg.getShaderReflection('0x123456'), undefined);
+  assert.equal(noNegReg.getStats().negativeLookupHits, 0);
+  assert.equal(noNegReg.getStats().lookupMisses, 4);
+
+  // Standalone sidecar also honors maxNegativeLookupCacheSize option & validation
+  const boundedSidecar = parseStageReflectionSidecar(
+    {
+      schema: 'playgta6-stage-reflection',
+      version: 1,
+      stages: {
+        '0x0000000000000010': { stage: 'vertex', bindings: [] },
+      },
+    },
+    { maxNegativeLookupCacheSize: 2 }
+  );
+  assert.equal(boundedSidecar.getStageByHashFast(0x101n), undefined);
+  assert.equal(boundedSidecar.getStageByHashFast(0x102n), undefined);
+  assert.equal(boundedSidecar.getStageByHashFast(0x103n), undefined); // evicts 0x101n
+  assert.equal(boundedSidecar.getStats().negativeLookupHits, 0);
+  assert.equal(boundedSidecar.getStageByHashFast(0x102n), undefined); // still cached
+  assert.equal(boundedSidecar.getStats().negativeLookupHits, 1);
+  assert.equal(boundedSidecar.getStageByHashFast(0x101n), undefined); // evicted -> not a hit
+  assert.equal(boundedSidecar.getStats().negativeLookupHits, 1);
+
+  assert.throws(() => new ReflectionRegistry({ maxNegativeLookupCacheSize: -1 }), RangeError);
+  assert.throws(() => new ReflectionRegistry({ maxNegativeLookupCacheSize: 1.5 }), RangeError);
+  assert.throws(
+    () => parseStageReflectionSidecar({ schema: 'playgta6-stage-reflection', version: 1, stages: {} }, 'bad'),
+    TypeError
+  );
+  assert.throws(
+    () =>
+      parseStageReflectionSidecar(
+        { schema: 'playgta6-stage-reflection', version: 1, stages: {} },
+        { maxNegativeLookupCacheSize: -5 }
+      ),
+    RangeError
+  );
+});
+
+test('W318 preserves W275 9,574-stage interning parity, fast-path telemetry sanitization, and clean resetStats()', () => {
+  const STAGE_COUNT = 9574;
+  const BASE_HASH = 0x2000000000000000n;
+  const rawStages = {};
+
+  for (let i = 0; i < STAGE_COUNT; i += 1) {
+    const hashHex = `0x${(BASE_HASH + BigInt(i)).toString(16)}`;
+    const stageType = i % 3 === 0 ? 'vertex' : i % 3 === 1 ? 'fragment' : 'compute';
+    const bindings = [
+      {
+        group: 0,
+        binding: 0,
+        kind: 'uniform',
+        min_binding_size_bytes: 64,
+        source: { user_sgpr: 8, table_byte_offset: 0 },
+      },
+    ];
+    if (i % 4 === 0) {
+      bindings.push({
+        group: 0,
+        binding: 1,
+        kind: 'texture',
+        view_dimension: '2d',
+        sample_type: 'float',
+        source: { resource_heap: true },
+      });
+    }
+    if (i % 5 === 0) {
+      bindings.push({
+        group: 0,
+        binding: 2,
+        kind: 'sampler',
+        source: { inline_sampler: { sdwords: [146, 15728640, 139460608, 0] } },
+      });
+    }
+    rawStages[hashHex] = { stage: stageType, bindings };
+  }
+
+  const payload = JSON.stringify({
+    schema: 'playgta6-stage-reflection',
+    version: 1,
+    stages: rawStages,
+  });
+
+  const registry = new ReflectionRegistry();
+  const parsed = registry.loadStageReflection(payload);
+
+  // Full 64-bit hashes keep _byHashSafeInt empty (zero memory overhead at 9,574-stage scale)
+  assert.equal(registry._byHashBigInt.size, STAGE_COUNT);
+  assert.equal(registry._byHashBigInt, registry._shadersByHash);
+  assert.equal(registry._byHashSafeInt.size, 0);
+  assert.equal(parsed._byHashBigInt.size, STAGE_COUNT);
+
+  // Verify W275 interning parity via getStageByHashFast across distant stages (i=0 and i=120)
+  const s0 = registry.getStageByHashFast(BASE_HASH, 'vertex');
+  const s120 = registry.getStageByHashFast(BASE_HASH + 120n, 'vertex');
+  const sLast = registry.getStageByHashFast(BASE_HASH + BigInt(STAGE_COUNT - 1));
+  assert.ok(s0 && s120 && sLast);
+  assert.equal(s0, registry.getStageReflection(`0x${BASE_HASH.toString(16)}`));
+  assert.equal(s0.bindings[0].source, s120.bindings[0].source);
+  assert.equal(s0.bindings[1].source, s120.bindings[1].source);
+  assert.equal(s0.bindings[2].source, s120.bindings[2].source);
+  assert.equal(s0.bindings[0].layoutEntry, s120.bindings[0].layoutEntry);
+  assert.equal(s0.bindGroupLayouts[0], s120.bindGroupLayouts[0]);
+  assert.equal(s0.bindGroupLayoutIds, s120.bindGroupLayoutIds);
+  assert.equal(s0.fragmentOutputs, s120.fragmentOutputs);
+
+  // Probe unknown hashes repeatedly (first miss + 5 negative-cache hits)
+  const unknownHash = 0xffffffffffffff00n;
+  for (let r = 0; r < 6; r += 1) {
+    assert.equal(registry.getStageByHashFast(unknownHash, 'fragment'), undefined);
+  }
+
+  let stats = registry.getStats();
+  assert.equal(stats.stagesIndexed, STAGE_COUNT);
+  assert.equal(stats.fastHashLookups, 9);
+  assert.equal(stats.fastHashHits, 3);
+  assert.equal(stats.negativeLookupHits, 5);
+  assert.equal(stats.lookupHits, 4); // 3 fast + 1 hex string lookup
+  assert.equal(stats.lookupMisses, 6);
+  assert.ok(Number.isFinite(stats.lookupHitRate) && stats.lookupHitRate >= 0 && stats.lookupHitRate <= 1);
+  assert.ok(stats.fastHashHits <= stats.fastHashLookups);
+  assert.ok(stats.negativeLookupHits <= stats.lookupMisses);
+
+  // resetStats() zeroes all fast-path & lookup telemetry while preserving indexed stages
+  registry.resetStats();
+  stats = registry.getStats();
+  assert.equal(stats.stagesIndexed, STAGE_COUNT);
+  assert.equal(stats.fastHashLookups, 0);
+  assert.equal(stats.fastHashHits, 0);
+  assert.equal(stats.negativeLookupHits, 0);
+  assert.equal(stats.lookupHits, 0);
+  assert.equal(stats.lookupMisses, 0);
+  assert.equal(stats.lookupHitRate, 0);
+
+  // Warm indexes and negative cache continue operating cleanly after resetStats()
+  assert.equal(registry.getStageByHashFast(BASE_HASH + 1n, 'fragment').stage, 'fragment');
+  assert.equal(registry.getStageByHashFast(unknownHash, 'fragment'), undefined);
+  stats = registry.getStats();
+  assert.equal(stats.fastHashLookups, 2);
+  assert.equal(stats.fastHashHits, 1);
+  assert.equal(stats.negativeLookupHits, 1);
+  assert.equal(stats.lookupHits, 1);
+  assert.equal(stats.lookupMisses, 1);
+  assert.equal(stats.lookupHitRate, 0.5);
+
+  // Standalone sidecar resetStats() also zeroes fast-path telemetry cleanly
+  assert.ok(parsed.getStageByHashFast(BASE_HASH, 'vertex'));
+  assert.equal(parsed.getStageByHashFast(unknownHash), undefined);
+  assert.equal(parsed.getStageByHashFast(unknownHash), undefined);
+  assert.equal(parsed.getStats().fastHashLookups, 3);
+  assert.equal(parsed.getStats().fastHashHits, 1);
+  assert.equal(parsed.getStats().negativeLookupHits, 1);
+  parsed.resetStats();
+  assert.equal(parsed.getStats().fastHashLookups, 0);
+  assert.equal(parsed.getStats().fastHashHits, 0);
+  assert.equal(parsed.getStats().negativeLookupHits, 0);
+  assert.equal(parsed.getStats().stagesIndexed, STAGE_COUNT);
+
+  // clear({ resetStats: true }) empties _byHashBigInt, negative cache, and counters
+  registry.clear({ resetStats: true });
+  assert.equal(registry._byHashBigInt.size, 0);
+  assert.equal(registry._negativeHashCache.size, 0);
+  stats = registry.getStats();
+  assert.equal(stats.stagesIndexed, 0);
+  assert.equal(stats.fastHashLookups, 0);
+  assert.equal(stats.fastHashHits, 0);
+  assert.equal(stats.negativeLookupHits, 0);
 });

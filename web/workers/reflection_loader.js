@@ -160,6 +160,12 @@
 
   const COMPACT_STRING_POOL_LIMIT = 4096;
 
+  /** Default bounded negative-miss cache size for unknown shader/stage hashes (W318). */
+  const DEFAULT_NEGATIVE_LOOKUP_CACHE_SIZE = 2048;
+
+  /** Maximum length of unknown string queries cached in the bounded negative-miss cache. */
+  const MAX_NEGATIVE_STRING_KEY_LENGTH = 128;
+
   /** Complete WebGPU GPUVertexFormat byte sizes (covers all S6 io_type outputs + packed formats). */
   const VERTEX_FORMAT_BYTE_SIZES = Object.freeze({
     uint8: 1,
@@ -209,6 +215,7 @@
   const FNV1A_64_OFFSET_BASIS = 0xcbf29ce484222325n;
   const FNV1A_64_PRIME = 0x00000100000001b3n;
   const U64_MAX = 0xffffffffffffffffn;
+  const MAX_SAFE_INTEGER_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
   const U32_MAX = 0xffffffff;
 
   const textEncoder = new TextEncoder();
@@ -358,6 +365,152 @@
       }
       return detached;
     };
+  }
+
+  /**
+   * Sanitize a telemetry counter into a finite non-negative integer.
+   *
+   * @param {unknown} value
+   * @returns {number}
+   */
+  function sanitizeNonNegativeInt(value) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+      return 0;
+    }
+    return Math.floor(value);
+  }
+
+  /**
+   * Insert a key into a bounded LRU negative-miss Set, evicting the oldest entry at capacity.
+   *
+   * @param {Set<any>} cache
+   * @param {any} key
+   * @param {number} maxSize
+   */
+  function rememberBoundedNegativeKey(cache, key, maxSize) {
+    if (maxSize <= 0) {
+      return;
+    }
+    if (cache.size >= maxSize) {
+      const oldest = cache.values().next().value;
+      cache.delete(oldest);
+    }
+    cache.add(key);
+  }
+
+  /**
+   * Zero-allocation stage filter check for `getStageByHashFast(hashBigIntOrNum, stage)`.
+   * Accepts `undefined`/`null` (match any stage), canonical stage strings (`'vertex'`,
+   * `'fragment'`, `'pixel'`, `'compute'`), non-canonical stage strings, or `SHADER_STAGE_BITS`.
+   *
+   * @param {object} record
+   * @param {string | number | null | undefined} stage
+   * @returns {boolean}
+   */
+  function matchesStageFilter(record, stage) {
+    if (stage === undefined || stage === null) {
+      return true;
+    }
+    if (typeof stage === 'string') {
+      if (stage === record.stage) {
+        return true;
+      }
+      if (stage === 'pixel') {
+        return record.stage === 'fragment';
+      }
+      if (stage === 'vertex' || stage === 'fragment' || stage === 'compute') {
+        return false;
+      }
+      const normalized = normalizeDiagnosticStage(stage);
+      return normalized !== null && record.stage === normalized;
+    }
+    if (typeof stage === 'number') {
+      return (
+        Number.isInteger(stage) &&
+        stage > 0 &&
+        (stage & ~VALID_VISIBILITY_MASK) === 0 &&
+        (record.visibility & stage) !== 0
+      );
+    }
+    return false;
+  }
+
+  /**
+   * Zero-allocation O(1) `BigInt` / safe-integer shader-hash lookup fast path with optional
+   * stage filtering and bounded LRU negative-miss caching for unknown hashes (W318).
+   *
+   * @param {bigint | number} hashBigIntOrNum
+   * @param {string | number | null | undefined} stage
+   * @param {Map<bigint, any>} byHashBigInt
+   * @param {Map<number, any>} byHashSafeInt
+   * @param {Set<bigint | number>} negativeHashCache
+   * @param {number} maxNegativeCacheSize
+   * @param {{ fastHashLookups: number, fastHashHits: number, negativeLookupHits: number, lookupHits: number, lookupMisses: number }} stats
+   * @returns {any}
+   */
+  function lookupFastHash(
+    hashBigIntOrNum,
+    stage,
+    byHashBigInt,
+    byHashSafeInt,
+    negativeHashCache,
+    maxNegativeCacheSize,
+    stats
+  ) {
+    stats.fastHashLookups += 1;
+
+    let found;
+    let negativeKey;
+    let cacheable = false;
+
+    if (typeof hashBigIntOrNum === 'bigint') {
+      if (hashBigIntOrNum < 0n || hashBigIntOrNum > U64_MAX) {
+        stats.lookupMisses += 1;
+        return undefined;
+      }
+      found = byHashBigInt.get(hashBigIntOrNum);
+      if (found === undefined) {
+        negativeKey =
+          hashBigIntOrNum <= MAX_SAFE_INTEGER_BIGINT ? Number(hashBigIntOrNum) : hashBigIntOrNum;
+        cacheable = true;
+      }
+    } else if (typeof hashBigIntOrNum === 'number') {
+      if (!Number.isSafeInteger(hashBigIntOrNum) || hashBigIntOrNum < 0) {
+        stats.lookupMisses += 1;
+        return undefined;
+      }
+      found = byHashSafeInt.get(hashBigIntOrNum);
+      if (found === undefined) {
+        negativeKey = hashBigIntOrNum;
+        cacheable = true;
+      }
+    } else {
+      stats.lookupMisses += 1;
+      return undefined;
+    }
+
+    if (found !== undefined) {
+      if (matchesStageFilter(found, stage)) {
+        stats.fastHashHits += 1;
+        stats.lookupHits += 1;
+        return found;
+      }
+      stats.lookupMisses += 1;
+      return undefined;
+    }
+
+    if (cacheable && maxNegativeCacheSize > 0) {
+      if (negativeHashCache.has(negativeKey)) {
+        negativeHashCache.delete(negativeKey);
+        negativeHashCache.add(negativeKey);
+        stats.negativeLookupHits += 1;
+      } else {
+        rememberBoundedNegativeKey(negativeHashCache, negativeKey, maxNegativeCacheSize);
+      }
+    }
+
+    stats.lookupMisses += 1;
+    return undefined;
   }
 
   /**
@@ -531,7 +684,14 @@
    * @param {Map<string, any> | null} [byName]
    * @returns {any}
    */
-  function lookupByNormalizedHash(query, byHex, byBareHex, byHash, byName = null) {
+  function lookupByNormalizedHash(
+    query,
+    byHex,
+    byBareHex,
+    byHash,
+    byName = null,
+    bySafeInt = null
+  ) {
     if (typeof query === 'string') {
       // Zero-allocation O(1) fast paths for already-canonical 0x+16 or bare 16-char lowercase keys.
       if (query.length === 18 && query.charCodeAt(0) === 48) {
@@ -596,6 +756,9 @@
 
     if (typeof query === 'number') {
       if (Number.isSafeInteger(query) && query >= 0) {
+        if (bySafeInt !== null) {
+          return bySafeInt.get(query);
+        }
         return byHash.get(BigInt(query));
       }
       return undefined;
@@ -2298,10 +2461,17 @@
 
   /**
    * Construct the public sidecar index API object in an isolated scope so its closures
-   * (`getStage`, `hasStage`, `getStats`, `resetStats`) cannot retain any raw JSON payload
-   * or parse-time interning tables after `parseStageReflectionSidecar` returns.
+   * (`getStage`, `getStageByHashFast`, `hasStage`, `getStats`, `resetStats`) cannot retain any
+   * raw JSON payload or parse-time interning tables after `parseStageReflectionSidecar` returns.
    */
-  function createParsedStageSidecar(stages, stagesByHash, stagesByBareHex, totals) {
+  function createParsedStageSidecar(
+    stages,
+    stagesByHash,
+    stagesByBareHex,
+    stagesBySafeInt,
+    totals,
+    maxNegativeCacheSize
+  ) {
     const stageCount = stages.size;
     const inlineSamplerStages = totals.inlineSamplerStages;
     const inlineSamplerBindings = totals.inlineSamplerBindings;
@@ -2310,9 +2480,15 @@
     const samplerHeapBindings = totals.samplerHeapBindings;
     const vertexIndexStages = totals.vertexIndexStages;
 
+    const negativeHashCache = new Set();
+    const negativeQueryCache = new Set();
+
     const lookupStats = {
       lookupHits: 0,
       lookupMisses: 0,
+      fastHashLookups: 0,
+      fastHashHits: 0,
+      negativeLookupHits: 0,
     };
 
     const summary = {
@@ -2331,6 +2507,7 @@
       version: STAGE_REFLECTION_VERSION,
       stages,
       stagesByHash,
+      _byHashBigInt: stagesByHash,
       stagesByHex: stages,
       stagesByBareHex,
       stageCount,
@@ -2342,23 +2519,98 @@
       samplerHeapBindings,
       vertexIndexStages,
       summary,
+      getStageByHashFast(hashBigIntOrNum, stage) {
+        return lookupFastHash(
+          hashBigIntOrNum,
+          stage,
+          stagesByHash,
+          stagesBySafeInt,
+          negativeHashCache,
+          maxNegativeCacheSize,
+          lookupStats
+        );
+      },
       getStage(hashKey) {
-        const found = lookupByNormalizedHash(hashKey, stages, stagesByBareHex, stagesByHash, null);
+        if (typeof hashKey === 'bigint' || typeof hashKey === 'number') {
+          return lookupFastHash(
+            hashKey,
+            undefined,
+            stagesByHash,
+            stagesBySafeInt,
+            negativeHashCache,
+            maxNegativeCacheSize,
+            lookupStats
+          );
+        }
+
+        if (
+          typeof hashKey === 'string' &&
+          maxNegativeCacheSize > 0 &&
+          hashKey.length > 0 &&
+          hashKey.length <= MAX_NEGATIVE_STRING_KEY_LENGTH &&
+          negativeQueryCache.has(hashKey)
+        ) {
+          negativeQueryCache.delete(hashKey);
+          negativeQueryCache.add(hashKey);
+          lookupStats.negativeLookupHits += 1;
+          lookupStats.lookupMisses += 1;
+          return undefined;
+        }
+
+        const found = lookupByNormalizedHash(
+          hashKey,
+          stages,
+          stagesByBareHex,
+          stagesByHash,
+          null,
+          stagesBySafeInt
+        );
         if (found !== undefined) {
           lookupStats.lookupHits += 1;
         } else {
+          if (
+            typeof hashKey === 'string' &&
+            maxNegativeCacheSize > 0 &&
+            hashKey.length > 0 &&
+            hashKey.length <= MAX_NEGATIVE_STRING_KEY_LENGTH
+          ) {
+            rememberBoundedNegativeKey(negativeQueryCache, hashKey, maxNegativeCacheSize);
+          }
           lookupStats.lookupMisses += 1;
         }
         return found;
       },
       hasStage(hashKey) {
-        return lookupByNormalizedHash(hashKey, stages, stagesByBareHex, stagesByHash, null) !== undefined;
+        return (
+          lookupByNormalizedHash(
+            hashKey,
+            stages,
+            stagesByBareHex,
+            stagesByHash,
+            null,
+            stagesBySafeInt
+          ) !== undefined
+        );
       },
       resetStats() {
         lookupStats.lookupHits = 0;
         lookupStats.lookupMisses = 0;
+        lookupStats.fastHashLookups = 0;
+        lookupStats.fastHashHits = 0;
+        lookupStats.negativeLookupHits = 0;
       },
       getStats() {
+        const lookupHits = sanitizeNonNegativeInt(lookupStats.lookupHits);
+        const lookupMisses = sanitizeNonNegativeInt(lookupStats.lookupMisses);
+        const fastHashLookups = sanitizeNonNegativeInt(lookupStats.fastHashLookups);
+        const fastHashHits = Math.min(
+          sanitizeNonNegativeInt(lookupStats.fastHashHits),
+          fastHashLookups
+        );
+        const negativeLookupHits = Math.min(
+          sanitizeNonNegativeInt(lookupStats.negativeLookupHits),
+          lookupMisses
+        );
         return {
           stageCount,
           stagesIndexed: stageCount,
@@ -2368,9 +2620,12 @@
           resourceHeapBindings,
           samplerHeapBindings,
           vertexIndexStages,
-          lookupHits: lookupStats.lookupHits,
-          lookupMisses: lookupStats.lookupMisses,
-          lookupHitRate: computeLookupHitRate(lookupStats.lookupHits, lookupStats.lookupMisses),
+          lookupHits,
+          lookupMisses,
+          lookupHitRate: computeLookupHitRate(lookupHits, lookupMisses),
+          fastHashLookups,
+          fastHashHits,
+          negativeLookupHits,
         };
       },
     };
@@ -2384,14 +2639,29 @@
    * Validates all binding sources including `#950` / `S43` `inline_sampler: { sdwords: [d0, d1, d2, d3] }`
    * and `#482` `resource_heap` metadata (`{ base_user_sgpr, stride, index }` and `resource_heap: true`),
    * compacts parsed stage entries with parse-local string/source/layout interning while discarding
-   * unused raw JSON wrappers after indexing, builds O(1) normalized-hash lookup maps (`'0x...'`,
-   * bare 16-hex-char, and `BigInt`), and exposes telemetry (`stagesIndexed`, `inlineSamplerStages`,
-   * `resourceHeapStages`, `lookupHits`, `lookupMisses`, `lookupHitRate`) with `resetStats()`.
+   * unused raw JSON wrappers after indexing, builds O(1) normalized-hash & zero-alloc `BigInt`/safe-int
+   * lookup indexes (`_byHashBigInt`, `getStageByHashFast`) with bounded negative-miss caching, and
+   * exposes sanitized telemetry (`stagesIndexed`, `inlineSamplerStages`, `resourceHeapStages`,
+   * `lookupHits`, `lookupMisses`, `lookupHitRate`, `fastHashLookups`, `fastHashHits`,
+   * `negativeLookupHits`) with `resetStats()`.
    *
    * @param {string | object} jsonOrObject
+   * @param {{ maxNegativeLookupCacheSize?: number }} [options]
    * @returns {object}
    */
-  function parseStageReflectionSidecar(jsonOrObject) {
+  function parseStageReflectionSidecar(jsonOrObject, options = {}) {
+    if (options !== undefined && !isPlainObject(options)) {
+      throw new TypeError('parseStageReflectionSidecar options must be an object');
+    }
+    const maxNegativeCacheSize =
+      options && options.maxNegativeLookupCacheSize !== undefined
+        ? options.maxNegativeLookupCacheSize
+        : DEFAULT_NEGATIVE_LOOKUP_CACHE_SIZE;
+    if (!Number.isInteger(maxNegativeCacheSize) || maxNegativeCacheSize < 0) {
+      throw new RangeError(
+        `maxNegativeLookupCacheSize must be a non-negative integer, got ${maxNegativeCacheSize}`
+      );
+    }
     let raw;
     if (typeof jsonOrObject === 'string') {
       try {
@@ -2427,6 +2697,7 @@
     const stages = new Map();
     const stagesByHash = new Map();
     const stagesByBareHex = new Map();
+    const stagesBySafeInt = new Map();
 
     // Parse-local interning pools: deduplicate repeated strings, sources, layout entries,
     // and bind group layouts across 9,574+ stages, then become immediately GC-eligible.
@@ -2790,6 +3061,9 @@
       stages.set(hashHex, stageRecord);
       stagesByHash.set(hash, stageRecord);
       stagesByBareHex.set(bareHashHex, stageRecord);
+      if (hash <= MAX_SAFE_INTEGER_BIGINT) {
+        stagesBySafeInt.set(Number(hash), stageRecord);
+      }
     }
 
     // Drop raw payload references and parse-local scratch collections before building the index view.
@@ -2802,14 +3076,21 @@
     bglPool.clear();
     bglIdsPool.clear();
 
-    return createParsedStageSidecar(stages, stagesByHash, stagesByBareHex, {
-      inlineSamplerStages: totalInlineSamplerStages,
-      inlineSamplerBindings: totalInlineSamplerBindings,
-      resourceHeapStages: totalResourceHeapStages,
-      resourceHeapBindings: totalResourceHeapBindings,
-      samplerHeapBindings: totalSamplerHeapBindings,
-      vertexIndexStages: totalVertexIndexStages,
-    });
+    return createParsedStageSidecar(
+      stages,
+      stagesByHash,
+      stagesByBareHex,
+      stagesBySafeInt,
+      {
+        inlineSamplerStages: totalInlineSamplerStages,
+        inlineSamplerBindings: totalInlineSamplerBindings,
+        resourceHeapStages: totalResourceHeapStages,
+        resourceHeapBindings: totalResourceHeapBindings,
+        samplerHeapBindings: totalSamplerHeapBindings,
+        vertexIndexStages: totalVertexIndexStages,
+      },
+      maxNegativeCacheSize
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -4825,7 +5106,7 @@
    */
   class ReflectionRegistry {
     /**
-     * @param {{ fetch?: typeof fetch, maxBindGroups?: number }} [options]
+     * @param {{ fetch?: typeof fetch, maxBindGroups?: number, maxNegativeLookupCacheSize?: number }} [options]
      */
     constructor(options = {}) {
       if (options !== undefined && !isPlainObject(options)) {
@@ -4843,11 +5124,27 @@
           `maxBindGroups must be an integer in 1..${MAX_REFLECTED_GROUPS}, got ${this._maxBindGroups}`
         );
       }
+      this._maxNegativeLookupCacheSize =
+        options.maxNegativeLookupCacheSize !== undefined
+          ? options.maxNegativeLookupCacheSize
+          : DEFAULT_NEGATIVE_LOOKUP_CACHE_SIZE;
+      if (
+        !Number.isInteger(this._maxNegativeLookupCacheSize) ||
+        this._maxNegativeLookupCacheSize < 0
+      ) {
+        throw new RangeError(
+          `maxNegativeLookupCacheSize must be a non-negative integer, got ${this._maxNegativeLookupCacheSize}`
+        );
+      }
 
       this._shadersByHash = new Map();
+      this._byHashBigInt = this._shadersByHash;
+      this._byHashSafeInt = new Map();
       this._shadersByHex = new Map();
       this._shadersByBareHex = new Map();
       this._shadersByName = new Map();
+      this._negativeHashCache = new Set();
+      this._negativeQueryCache = new Set();
       this._bindGroupLayouts = new Map();
       this._pipelineLayouts = new Map();
       this._pipelines = new Map();
@@ -4867,6 +5164,9 @@
         vertexLayoutsBuilt: 0,
         lookupHits: 0,
         lookupMisses: 0,
+        fastHashLookups: 0,
+        fastHashHits: 0,
+        negativeLookupHits: 0,
         bindingConflicts: 0,
       };
     }
@@ -4903,6 +5203,13 @@
 
       const bareHex = shader.bareHashHex || shader.hashHex.slice(2);
       this._shadersByHash.set(shader.hash, shader);
+      if (shader.hash <= MAX_SAFE_INTEGER_BIGINT) {
+        const safeInt = Number(shader.hash);
+        this._byHashSafeInt.set(safeInt, shader);
+        this._negativeHashCache.delete(safeInt);
+      } else {
+        this._negativeHashCache.delete(shader.hash);
+      }
       this._shadersByHex.set(shader.hashHex, shader);
       this._shadersByBareHex.set(bareHex, shader);
 
@@ -4959,6 +5266,9 @@
       for (const shader of parsed.shaders.values()) {
         this._registerShaderRecord(shader, true);
       }
+      if (this._negativeQueryCache.size > 0) {
+        this._negativeQueryCache.clear();
+      }
       for (const [key, pipeline] of parsed.pipelines.entries()) {
         this._pipelines.set(key, pipeline);
       }
@@ -4974,9 +5284,14 @@
      * @returns {object} Parsed stage reflection sidecar
      */
     loadStageReflection(jsonOrObject) {
-      const parsed = parseStageReflectionSidecar(jsonOrObject);
+      const parsed = parseStageReflectionSidecar(jsonOrObject, {
+        maxNegativeLookupCacheSize: this._maxNegativeLookupCacheSize,
+      });
       for (const stage of parsed.stages.values()) {
         this._registerShaderRecord(stage, false);
+      }
+      if (this._negativeQueryCache.size > 0) {
+        this._negativeQueryCache.clear();
       }
       this._stats.manifestsLoaded += 1;
       this._stats.sidecarsLoaded += 1;
@@ -5057,6 +5372,30 @@
     }
 
     /**
+     * Zero-allocation O(1) lookup of a registered shader/stage reflection by `BigInt` or
+     * non-negative safe-integer hash, avoiding `'0x...'` hex string formatting and
+     * normalization on hot PSO creation and draw probes (W318).
+     *
+     * Optionally filters by `stage` (`'vertex'`, `'fragment'`, `'pixel'`, `'compute'`, or
+     * `SHADER_STAGE_BITS` bitmask). Unknown hashes are cached in a bounded negative-miss cache.
+     *
+     * @param {bigint | number} hashBigIntOrNum
+     * @param {string | number | null | undefined} [stage]
+     * @returns {object | undefined}
+     */
+    getStageByHashFast(hashBigIntOrNum, stage) {
+      return lookupFastHash(
+        hashBigIntOrNum,
+        stage,
+        this._byHashBigInt,
+        this._byHashSafeInt,
+        this._negativeHashCache,
+        this._maxNegativeLookupCacheSize,
+        this._stats
+      );
+    }
+
+    /**
      * Fast O(1) lookup of a registered shader/stage reflection by `BigInt` hash, safe integer,
      * `'0x...'` hex string, bare 16-hex-char string, short hex string, or shader `name` /
      * `entry_point` / `"<stage>:<entry_point>"`.
@@ -5065,17 +5404,48 @@
      * @returns {object | undefined}
      */
     getShaderReflection(hashOrName) {
+      if (typeof hashOrName === 'bigint' || typeof hashOrName === 'number') {
+        return this.getStageByHashFast(hashOrName);
+      }
+
+      if (
+        typeof hashOrName === 'string' &&
+        this._maxNegativeLookupCacheSize > 0 &&
+        hashOrName.length > 0 &&
+        hashOrName.length <= MAX_NEGATIVE_STRING_KEY_LENGTH &&
+        this._negativeQueryCache.has(hashOrName)
+      ) {
+        this._negativeQueryCache.delete(hashOrName);
+        this._negativeQueryCache.add(hashOrName);
+        this._stats.negativeLookupHits += 1;
+        this._stats.lookupMisses += 1;
+        return undefined;
+      }
+
       const found = lookupByNormalizedHash(
         hashOrName,
         this._shadersByHex,
         this._shadersByBareHex,
         this._shadersByHash,
-        this._shadersByName
+        this._shadersByName,
+        this._byHashSafeInt
       );
 
       if (found !== undefined) {
         this._stats.lookupHits += 1;
       } else {
+        if (
+          typeof hashOrName === 'string' &&
+          this._maxNegativeLookupCacheSize > 0 &&
+          hashOrName.length > 0 &&
+          hashOrName.length <= MAX_NEGATIVE_STRING_KEY_LENGTH
+        ) {
+          rememberBoundedNegativeKey(
+            this._negativeQueryCache,
+            hashOrName,
+            this._maxNegativeLookupCacheSize
+          );
+        }
         this._stats.lookupMisses += 1;
       }
       return found;
@@ -5299,9 +5669,10 @@
     }
 
     /**
-     * Reset cumulative telemetry counters (`lookupHits`, `lookupMisses`, `manifestsLoaded`,
-     * `sidecarsLoaded`, `layoutsBuilt`, `pipelineLayoutsBuilt`, `vertexLayoutsBuilt`,
-     * `bindingConflicts`) without clearing indexed shaders or stages.
+     * Reset cumulative telemetry counters (`lookupHits`, `lookupMisses`, `fastHashLookups`,
+     * `fastHashHits`, `negativeLookupHits`, `manifestsLoaded`, `sidecarsLoaded`,
+     * `layoutsBuilt`, `pipelineLayoutsBuilt`, `vertexLayoutsBuilt`, `bindingConflicts`)
+     * without clearing indexed shaders or stages.
      */
     resetStats() {
       this._stats.manifestsLoaded = 0;
@@ -5311,6 +5682,9 @@
       this._stats.vertexLayoutsBuilt = 0;
       this._stats.lookupHits = 0;
       this._stats.lookupMisses = 0;
+      this._stats.fastHashLookups = 0;
+      this._stats.fastHashHits = 0;
+      this._stats.negativeLookupHits = 0;
       this._stats.bindingConflicts = 0;
     }
 
@@ -5321,9 +5695,12 @@
      */
     clear(options = {}) {
       this._shadersByHash.clear();
+      this._byHashSafeInt.clear();
       this._shadersByHex.clear();
       this._shadersByBareHex.clear();
       this._shadersByName.clear();
+      this._negativeHashCache.clear();
+      this._negativeQueryCache.clear();
       this._bindGroupLayouts.clear();
       this._pipelineLayouts.clear();
       this._pipelines.clear();
@@ -5344,6 +5721,17 @@
      */
     getStats() {
       const stagesIndexed = this._shadersByHash.size;
+      const lookupHits = sanitizeNonNegativeInt(this._stats.lookupHits);
+      const lookupMisses = sanitizeNonNegativeInt(this._stats.lookupMisses);
+      const fastHashLookups = sanitizeNonNegativeInt(this._stats.fastHashLookups);
+      const fastHashHits = Math.min(
+        sanitizeNonNegativeInt(this._stats.fastHashHits),
+        fastHashLookups
+      );
+      const negativeLookupHits = Math.min(
+        sanitizeNonNegativeInt(this._stats.negativeLookupHits),
+        lookupMisses
+      );
       return {
         manifestsLoaded: this._stats.manifestsLoaded,
         sidecarsLoaded: this._stats.sidecarsLoaded,
@@ -5356,9 +5744,12 @@
         layoutsBuilt: this._stats.layoutsBuilt,
         pipelineLayoutsBuilt: this._stats.pipelineLayoutsBuilt,
         vertexLayoutsBuilt: this._stats.vertexLayoutsBuilt,
-        lookupHits: this._stats.lookupHits,
-        lookupMisses: this._stats.lookupMisses,
-        lookupHitRate: computeLookupHitRate(this._stats.lookupHits, this._stats.lookupMisses),
+        lookupHits,
+        lookupMisses,
+        lookupHitRate: computeLookupHitRate(lookupHits, lookupMisses),
+        fastHashLookups,
+        fastHashHits,
+        negativeLookupHits,
         bindingConflicts: this._stats.bindingConflicts,
         samplerHeapBindings: this._samplerHeapBindings,
         resourceHeapStages: this._resourceHeapStages,
@@ -5382,6 +5773,7 @@
     TABLE_SLOT_BYTES,
     UNIFORM_MIN_BINDING_SIZE_ALIGNMENT,
     STORAGE_MIN_BINDING_SIZE_ALIGNMENT,
+    DEFAULT_NEGATIVE_LOOKUP_CACHE_SIZE,
     DIAGNOSTIC_CODES,
     SHADER_STAGE_BITS,
     VERTEX_FORMAT_BYTE_SIZES,
