@@ -7,6 +7,7 @@ import RuntimeSessionControllerDefault, {
   DEFAULT_MAX_VALIDATION_ERRORS,
   DEFAULT_STATUS_URL,
   SESSION_MODE,
+  SESSION_PHASE,
   SESSION_STATE,
   RuntimeSessionController,
   detectWasm64,
@@ -2514,6 +2515,491 @@ test('W276 cleanShutdownCount does not increment when handle teardown throws', a
   assert.equal(stopRes.state, SESSION_STATE.STOPPED);
   assert.equal(controller.getStats().cleanShutdownCount, 0);
   assert.ok(reported.some((r) => r.ctx.source === 'runtimeHandle'));
+});
+
+// --- W321: Session Phase Durations & Soft Memory-Pressure Reclaim Hooks ---
+
+test('W321 exports, option validation, and initial phase/reclaim telemetry in getSnapshot() and getStats()', () => {
+  assert.deepEqual(SESSION_PHASE, {
+    BOOT: 'boot',
+    START_SCREEN: 'start_screen',
+    INTRO_VIDEO: 'intro_video',
+    MAIN_MENU: 'main_menu',
+    IN_GAME: 'in_game',
+  });
+
+  assert.throws(() => new RuntimeSessionController({ onMemoryReclaim: 'bad' }), TypeError);
+  assert.throws(() => new RuntimeSessionController({ onMemoryReclaim: 42 }), TypeError);
+
+  const clock = createClock(1000);
+  const controller = new RuntimeSessionController({
+    fetchImpl: null,
+    now: clock.now,
+  });
+
+  assert.throws(() => controller.registerReclaimHook('nope'), TypeError);
+  assert.throws(() => controller.onMemoryReclaim({}), TypeError);
+
+  const expectedEmptyPhases = {
+    boot: 0,
+    start_screen: 0,
+    intro_video: 0,
+    main_menu: 0,
+    in_game: 0,
+  };
+
+  assert.equal(controller.getCurrentPhase(), null);
+  assert.deepEqual(controller.getPhaseDurations(), expectedEmptyPhases);
+
+  const stats = controller.getStats();
+  assert.equal(stats.currentPhase, null);
+  assert.deepEqual(stats.phaseDurationsMs, expectedEmptyPhases);
+  assert.equal(stats.phaseTransitionCount, 0);
+  assert.equal(stats.reclaimRuns, 0);
+  assert.equal(stats.reclaimFailures, 0);
+  assert.equal(stats.reclaimInFlight, false);
+  assert.equal(stats.reclaimHookCount, 0);
+  assert.equal(stats.lastReclaimReason, null);
+  assert.equal(stats.lastReclaimAtMs, null);
+
+  const snap = controller.getSnapshot();
+  assert.equal(snap.currentPhase, null);
+  assert.deepEqual(snap.phaseDurationsMs, expectedEmptyPhases);
+  assert.equal(snap.phaseTransitionCount, 0);
+  assert.equal(snap.reclaimRuns, 0);
+  assert.equal(snap.reclaimFailures, 0);
+  assert.equal(snap.reclaimInFlight, false);
+  assert.equal(snap.reclaimHookCount, 0);
+  assert.equal(snap.lastReclaimReason, null);
+  assert.equal(snap.lastReclaimAtMs, null);
+});
+
+test('W321 recordPhase tracks sanitized phase durations across boot -> start_screen -> intro_video -> main_menu -> in_game', async () => {
+  const clock = createClock(10_000);
+  const worker = createMockWorker();
+  const statusUpdates = [];
+  let capturedLaunchCtx = null;
+
+  const controller = new RuntimeSessionController({
+    fetchImpl: createMockFetch(readyStatus({ hasWasmBinary: true })),
+    wgpuWorker: worker,
+    now: clock.now,
+    capabilityProbe: () => fullCapabilities(),
+    onStatusUpdate: (ev) => statusUpdates.push(ev),
+    startWasmRuntime: async (ctx) => {
+      capturedLaunchCtx = ctx;
+      return { stop() {} };
+    },
+  });
+
+  // 1. Standalone explicit-timestamp progression + alias normalization + sanitization.
+  const rBoot = controller.recordPhase('boot', 1000);
+  assert.equal(rBoot.ok, true);
+  assert.equal(rBoot.changed, true);
+  assert.equal(rBoot.phase, SESSION_PHASE.BOOT);
+  assert.equal(rBoot.previousPhase, null);
+
+  // Duplicate same phase is a no-op and does not alter elapsed baseline.
+  const rDup = controller.recordPhase('BOOT', 1200);
+  assert.equal(rDup.ok, true);
+  assert.equal(rDup.changed, false);
+  assert.equal(rDup.durationInPrevMs, 0);
+
+  // Unsafe / invalid phases are rejected cleanly without polluting phaseDurationsMs.
+  for (const badPhase of [null, undefined, '', 123, '../../etc/passwd', 'C:\\Users\\alice', '__proto__', 'unknown']) {
+    const badRes = controller.recordPhase(badPhase, 1300);
+    assert.equal(badRes.ok, false);
+    assert.equal(badRes.changed, false);
+    assert.equal(badRes.phase, null);
+    assert.equal(controller.getCurrentPhase(), SESSION_PHASE.BOOT);
+  }
+
+  const rStart = controller.recordPhase('Start Screen', 1500);
+  assert.equal(rStart.ok, true);
+  assert.equal(rStart.changed, true);
+  assert.equal(rStart.phase, SESSION_PHASE.START_SCREEN);
+  assert.equal(rStart.durationInPrevMs, 500);
+
+  const rIntro = controller.recordPhase('intro-video', 2200);
+  assert.equal(rIntro.phase, SESSION_PHASE.INTRO_VIDEO);
+  assert.equal(rIntro.durationInPrevMs, 700);
+
+  const rMenu = controller.recordPhase({ phase: 'main menu', timestampMs: 3000 });
+  assert.equal(rMenu.phase, SESSION_PHASE.MAIN_MENU);
+  assert.equal(rMenu.durationInPrevMs, 800);
+
+  // Out-of-order earlier timestamp clamps duration to 0 (never negative).
+  const rInGame = controller.recordPhase('in-game', 2900);
+  assert.equal(rInGame.ok, true);
+  assert.equal(rInGame.phase, SESSION_PHASE.IN_GAME);
+  assert.equal(rInGame.durationInPrevMs, 0);
+
+  const explicitSnap = controller.getSnapshot(3400);
+  assert.equal(explicitSnap.currentPhase, SESSION_PHASE.IN_GAME);
+  assert.deepEqual(explicitSnap.phaseDurationsMs, {
+    boot: 500,
+    start_screen: 700,
+    intro_video: 800,
+    main_menu: 0,
+    in_game: 500,
+  });
+
+  // Defensive clone immutability.
+  explicitSnap.phaseDurationsMs.boot = 999_999;
+  const freshStats = controller.getStats(3400);
+  assert.equal(freshStats.phaseDurationsMs.boot, 500);
+  assert.equal(freshStats.currentPhase, SESSION_PHASE.IN_GAME);
+
+  // 2. Clock-driven session lifecycle: start() resets phases and enters 'boot'.
+  await controller.start();
+  assert.equal(controller.getCurrentPhase(), SESSION_PHASE.BOOT);
+  assert.deepEqual(controller.getPhaseDurations(), {
+    boot: 0,
+    start_screen: 0,
+    intro_video: 0,
+    main_menu: 0,
+    in_game: 0,
+  });
+
+  clock.advance(400);
+  capturedLaunchCtx.recordPhase(SESSION_PHASE.START_SCREEN);
+  clock.advance(600);
+  worker.emitMessage({ type: 'session-phase', phase: 'intro_video' });
+  clock.advance(350);
+  worker.emitMessage({ type: 'phase-transition', phase: 'main_menu' });
+  clock.advance(900);
+  controller.recordPhase(SESSION_PHASE.IN_GAME);
+  clock.advance(1250);
+
+  const runningStats = controller.getStats();
+  assert.equal(runningStats.currentPhase, SESSION_PHASE.IN_GAME);
+  assert.deepEqual(runningStats.phaseDurationsMs, {
+    boot: 400,
+    start_screen: 600,
+    intro_video: 350,
+    main_menu: 900,
+    in_game: 1250,
+  });
+  assert.ok(statusUpdates.some((u) => u.reason === 'phase:in_game' && u.currentPhase === 'in_game'));
+
+  // 3. stop() finalizes active phase duration and freezes accumulation while stopped.
+  await controller.stop();
+  assert.equal(controller.getCurrentPhase(), null);
+  clock.advance(5000);
+  assert.deepEqual(controller.getSnapshot().phaseDurationsMs, {
+    boot: 400,
+    start_screen: 600,
+    intro_video: 350,
+    main_menu: 900,
+    in_game: 1250,
+  });
+
+  // Stale launchContext.recordPhase after stop() is ignored.
+  const stalePhase = capturedLaunchCtx.recordPhase(SESSION_PHASE.MAIN_MENU);
+  assert.equal(stalePhase.ok, false);
+  assert.equal(controller.getCurrentPhase(), null);
+});
+
+test('W321 requestMemoryReclaim executes sync & async hooks, isolates errors, coalesces concurrent calls, and guards re-entrancy', async () => {
+  const clock = createClock(20_000);
+  const hud = createMockHud();
+  const reported = [];
+  const telemetryEvents = [];
+  const invoked = [];
+
+  const controller = new RuntimeSessionController({
+    fetchImpl: createMockFetch(readyStatus({ hasWasmBinary: true })),
+    hud,
+    crashReporter: {
+      captureError(err, ctx) {
+        reported.push({ message: err.message, ctx });
+      },
+    },
+    now: clock.now,
+    capabilityProbe: () => fullCapabilities(),
+    onTelemetry: (ev) => telemetryEvents.push(ev),
+    onMemoryReclaim: (ctx) => {
+      invoked.push({ hook: 'ctor-rt-pool', reason: ctx.reason, phase: ctx.currentPhase });
+    },
+    startWasmRuntime: async () => ({ stop() {} }),
+  });
+
+  await controller.start();
+  clock.advance(100);
+  controller.recordPhase(SESSION_PHASE.IN_GAME);
+
+  const hexBlob = 'ab'.repeat(32);
+  let releaseAsyncHook;
+  let asyncHookGateArmed = false;
+
+  const unsubStaging = controller.registerReclaimHook((ctx) => {
+    invoked.push({ hook: 'staging-trim', reason: ctx.reason });
+    // Verify synchronous re-entrancy is safely rejected without deadlock.
+    const nested = controller.requestMemoryReclaim('nested-reentrant');
+    nested.then((res) => {
+      invoked.push({ hook: 'nested-result', ok: res.ok, skipped: res.skipped, reentrant: res.reentrant });
+    });
+  });
+
+  const unsubBadSync = controller.onMemoryReclaim(() => {
+    invoked.push({ hook: 'bad-sync' });
+    throw new Error(`RT pool fault at C:\\Users\\alice\\pool.js dump=${hexBlob}\n`);
+  });
+
+  const unsubBadAsync = controller.registerReclaimHook(async () => {
+    invoked.push({ hook: 'bad-async' });
+    throw new Error('OPFS eviction rejected at /Users/alice/cache.bin');
+  });
+
+  const unsubOpfs = controller.registerReclaimHook(async (ctx) => {
+    invoked.push({ hook: 'opfs-evict', reason: ctx.reason });
+    if (asyncHookGateArmed) {
+      asyncHookGateArmed = false;
+      await new Promise((resolve) => {
+        releaseAsyncHook = resolve;
+      });
+    }
+  });
+
+  assert.equal(controller.getStats().reclaimHookCount, 5);
+
+  // 1. Run reclaim with mixed passing and failing hooks (sync + async).
+  const res1 = await controller.requestMemoryReclaim('gpu-oom at /Users/alice/heap.bin');
+  assert.equal(res1.ok, false);
+  assert.equal(res1.hooksInvoked, 5);
+  assert.equal(res1.hooksSucceeded, 3);
+  assert.equal(res1.hooksFailed, 2);
+  assert.equal(res1.reclaimRuns, 1);
+  assert.equal(res1.reclaimFailures, 2);
+  assert.doesNotMatch(res1.reason, /alice|\/Users/);
+  assert.match(res1.reason, /<path>/);
+  assert.equal(res1.errors.length, 2);
+  assert.doesNotMatch(res1.errors[0], /alice|C:\\|abababab|[\r\n]/);
+  assert.match(res1.errors[0], /<path>/);
+  assert.match(res1.errors[0], /<buffer>/);
+  assert.doesNotMatch(res1.errors[1], /alice|\/Users/);
+
+  // Re-entrant sync call inside hook did not deadlock and reported reentrant: true.
+  const nestedEntry = invoked.find((entry) => entry.hook === 'nested-result');
+  assert.ok(nestedEntry);
+  assert.equal(nestedEntry.ok, false);
+  assert.equal(nestedEntry.skipped, true);
+  assert.equal(nestedEntry.reentrant, true);
+
+  // All 5 hooks ran in order despite 2 failures.
+  assert.deepEqual(
+    invoked.filter((e) => e.hook !== 'nested-result').map((e) => e.hook),
+    ['ctor-rt-pool', 'staging-trim', 'bad-sync', 'bad-async', 'opfs-evict']
+  );
+
+  // CrashReporter, HUD, and telemetry received sanitized notifications.
+  assert.equal(reported.filter((r) => r.ctx.source === 'memoryReclaim').length, 2);
+  assert.ok(hud.logs.some((l) => l.level === 'warn' && /Memory reclaim hook warning/i.test(l.message)));
+  assert.ok(telemetryEvents.some((e) => e.type === 'memory-reclaim' && e.reclaimRuns === 1 && e.reclaimFailures === 2));
+
+  // 2. Unregister failing hooks (idempotent) -> clean run succeeds and coalesces concurrent calls.
+  unsubBadSync();
+  unsubBadSync();
+  unsubBadAsync();
+  assert.equal(controller.getStats().reclaimHookCount, 3);
+
+  invoked.length = 0;
+  asyncHookGateArmed = true;
+  const p1 = controller.requestMemoryReclaim('pressure-burst');
+  const p2 = controller.requestMemoryReclaim('pressure-burst-2');
+  assert.equal(controller.getStats().reclaimInFlight, true);
+
+  await new Promise((r) => setTimeout(r, 5));
+  releaseAsyncHook();
+  const [c1, c2] = await Promise.all([p1, p2]);
+
+  assert.equal(c1.ok, true);
+  assert.equal(c1.hooksInvoked, 3);
+  assert.equal(c1.hooksSucceeded, 3);
+  assert.equal(c1.hooksFailed, 0);
+  assert.equal(c1.reclaimRuns, 2);
+  assert.equal(c1.reclaimFailures, 2);
+  assert.equal(c2.ok, true);
+  assert.equal(c2.coalesced, true);
+  assert.equal(c2.reclaimRuns, 2);
+  assert.equal(controller.getStats().reclaimInFlight, false);
+
+  // Only one execution of each remaining hook occurred across both coalesced calls.
+  assert.deepEqual(
+    invoked.filter((e) => e.hook !== 'nested-result').map((e) => e.hook),
+    ['ctor-rt-pool', 'staging-trim', 'opfs-evict']
+  );
+
+  unsubStaging();
+  unsubOpfs();
+  assert.equal(controller.getStats().reclaimHookCount, 1);
+
+  await controller.stop();
+});
+
+test('W321 restart invokes soft reclaim before teardown, maintains phase reset parity, and cleans up hooks on destroy()', async () => {
+  const clock = createClock(50_000);
+  const trace = [];
+  let launchSeq = 0;
+  let releasePreRestartReclaim = null;
+  let gatePreRestartReclaim = false;
+
+  const bootOrchestrator = {
+    releasePreloadBuffers() {
+      trace.push('preload:release');
+    },
+  };
+
+  const controller = new RuntimeSessionController({
+    fetchImpl: createMockFetch(readyStatus({ hasWasmBinary: true })),
+    bootOrchestrator,
+    now: clock.now,
+    capabilityProbe: () => fullCapabilities(),
+    onMemoryReclaim: async (ctx) => {
+      trace.push(`reclaim:controller:${ctx.reason}`);
+      if (gatePreRestartReclaim) {
+        gatePreRestartReclaim = false;
+        await new Promise((resolve) => {
+          releasePreRestartReclaim = resolve;
+        });
+      }
+    },
+    startWasmRuntime: async (ctx) => {
+      const id = ++launchSeq;
+      trace.push(`launch:${id}`);
+      // Register a session-scoped reclaim hook (e.g. per-session RT pool + staging trim).
+      ctx.registerReclaimHook((reclaimCtx) => {
+        trace.push(`reclaim:session-${id}:${reclaimCtx.reason}`);
+      });
+      return {
+        stop() {
+          trace.push(`handle:stop:${id}`);
+        },
+      };
+    },
+  });
+
+  // 1. Initial start enters 'boot', progresses through all phases.
+  await controller.start();
+  assert.equal(controller.getStats().reclaimHookCount, 2);
+  clock.advance(300);
+  controller.recordPhase(SESSION_PHASE.START_SCREEN);
+  clock.advance(450);
+  controller.recordPhase(SESSION_PHASE.INTRO_VIDEO);
+  clock.advance(250);
+  controller.recordPhase(SESSION_PHASE.MAIN_MENU);
+  clock.advance(800);
+  controller.recordPhase(SESSION_PHASE.IN_GAME);
+  clock.advance(1000);
+
+  assert.deepEqual(controller.getSnapshot().phaseDurationsMs, {
+    boot: 300,
+    start_screen: 450,
+    intro_video: 250,
+    main_menu: 800,
+    in_game: 1000,
+  });
+
+  // 2. restart() invokes soft reclaim BEFORE stopping handles/preload release,
+  //    cleans up session-1 reclaim hook, and resets phase durations to fresh 'boot' parity.
+  trace.length = 0;
+  const r1 = await controller.restart();
+  assert.equal(r1.ok, true);
+  assert.deepEqual(trace, [
+    'reclaim:controller:restart',
+    'reclaim:session-1:restart',
+    'handle:stop:1',
+    'preload:release',
+    'launch:2',
+  ]);
+
+  // Session-1 hook was torn down; only controller hook + session-2 hook remain (zero leaks).
+  const statsAfterRestart = controller.getStats();
+  assert.equal(statsAfterRestart.reclaimRuns, 1);
+  assert.equal(statsAfterRestart.reclaimFailures, 0);
+  assert.equal(statsAfterRestart.reclaimHookCount, 2);
+  assert.equal(statsAfterRestart.currentPhase, SESSION_PHASE.BOOT);
+  assert.deepEqual(statsAfterRestart.phaseDurationsMs, {
+    boot: 0,
+    start_screen: 0,
+    intro_video: 0,
+    main_menu: 0,
+    in_game: 0,
+  });
+
+  // 3. restart({ skipReclaim: true }) skips soft reclaim while still resetting phase parity.
+  clock.advance(200);
+  controller.recordPhase(SESSION_PHASE.START_SCREEN);
+  clock.advance(150);
+  trace.length = 0;
+  const r2 = await controller.restart({ skipReclaim: true });
+  assert.equal(r2.ok, true);
+  assert.deepEqual(trace, ['handle:stop:2', 'preload:release', 'launch:3']);
+  assert.equal(controller.getStats().reclaimRuns, 1);
+  assert.equal(controller.getStats().reclaimHookCount, 2);
+  assert.equal(controller.getStats().currentPhase, SESSION_PHASE.BOOT);
+  assert.deepEqual(controller.getSnapshot().phaseDurationsMs, {
+    boot: 0,
+    start_screen: 0,
+    intro_video: 0,
+    main_menu: 0,
+    in_game: 0,
+  });
+
+  // 4. External stop() during in-flight pre-restart soft reclaim aborts restart cleanly.
+  gatePreRestartReclaim = true;
+  const abortedRestartPromise = controller.restart();
+  await new Promise((r) => setTimeout(r, 5));
+  const externalStopPromise = controller.stop();
+  releasePreRestartReclaim();
+
+  const [abortedRes, stopRes] = await Promise.all([abortedRestartPromise, externalStopPromise]);
+  assert.equal(abortedRes.ok, false);
+  assert.equal(abortedRes.aborted, true);
+  assert.equal(stopRes.ok, true);
+  assert.equal(controller.getState(), SESSION_STATE.STOPPED);
+  assert.equal(launchSeq, 3);
+  // Session-3 hook was cleaned up on stop; only controller hook remains.
+  assert.equal(controller.getStats().reclaimHookCount, 1);
+
+  // 5. resetTelemetry() clears reclaim counters and resets active phase baseline without losing currentPhase.
+  await controller.start();
+  clock.advance(120);
+  controller.recordPhase(SESSION_PHASE.MAIN_MENU);
+  clock.advance(80);
+  controller.resetTelemetry();
+  const afterReset = controller.getStats();
+  assert.equal(afterReset.reclaimRuns, 0);
+  assert.equal(afterReset.reclaimFailures, 0);
+  assert.equal(afterReset.lastReclaimReason, null);
+  assert.equal(afterReset.currentPhase, SESSION_PHASE.MAIN_MENU);
+  assert.deepEqual(afterReset.phaseDurationsMs, {
+    boot: 0,
+    start_screen: 0,
+    intro_video: 0,
+    main_menu: 0,
+    in_game: 0,
+  });
+  clock.advance(45);
+  assert.equal(controller.getPhaseDurations().main_menu, 45);
+
+  // 6. destroy() clears all reclaim hooks, blocks future requestMemoryReclaim(), and ignores post-destroy registrations.
+  await controller.destroy();
+  assert.equal(controller.getStats().reclaimHookCount, 0);
+  assert.equal(controller.getCurrentPhase(), null);
+
+  let postDestroyCalled = false;
+  const noopUnsub = controller.registerReclaimHook(() => {
+    postDestroyCalled = true;
+  });
+  noopUnsub();
+  assert.equal(controller.getStats().reclaimHookCount, 0);
+
+  const postDestroyReclaim = await controller.requestMemoryReclaim('after-destroy');
+  assert.equal(postDestroyReclaim.ok, false);
+  assert.equal(postDestroyReclaim.destroyed, true);
+  assert.equal(postDestroyReclaim.hooksInvoked, 0);
+  assert.equal(postDestroyCalled, false);
 });
 
 
