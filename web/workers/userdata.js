@@ -14,6 +14,12 @@ const ARCHIVE_VERSION = 1;
 const DEFAULT_MAX_FILE_BYTES = 16 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES = 256 * 1024 * 1024;
 const DEFAULT_MAX_FILE_COUNT = 4096;
+const TEMP_SUFFIX = '.tmp';
+const QUARANTINE_PREFIX = '__quarantine__/';
+const DEFAULT_MAX_QUARANTINE_FILES = 32;
+const DEFAULT_MAX_QUARANTINE_BYTES = 8 * 1024 * 1024;
+const DEFAULT_MAX_QUOTA_CLEANUP_STEPS = 64;
+const MAX_QUARANTINE_RECORD_BYTES = 256 * 1024;
 
 const BASE64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 const BASE64_LOOKUP = (() => {
@@ -239,6 +245,176 @@ function createQuotaError(message, details) {
   return err;
 }
 
+function createWriteVerifyError(message, details) {
+  const err = new Error(message);
+  err.name = 'WriteVerifyError';
+  err.code = 'WRITE_VERIFY_FAILED';
+  if (details && typeof details === 'object') {
+    err.details = details;
+  }
+  return err;
+}
+
+function isQuotaExceededError(err) {
+  if (!err || typeof err !== 'object') {
+    return false;
+  }
+  if (
+    err.name === 'QuotaExceededError' ||
+    err.name === 'NS_ERROR_DOM_QUOTA_REACHED' ||
+    err.code === 'QUOTA_EXCEEDED' ||
+    err.code === 22 ||
+    err.code === 1014
+  ) {
+    return true;
+  }
+  if (typeof err.message === 'string' && /quota\s*exceeded|storage\s*quota/i.test(err.message)) {
+    return true;
+  }
+  return false;
+}
+
+function normalizeQuotaError(err, fallbackMessage) {
+  if (err && typeof err === 'object') {
+    try {
+      if (err.code === undefined) {
+        err.code = 'QUOTA_EXCEEDED';
+      }
+      if (err.name !== 'QuotaExceededError') {
+        err.name = 'QuotaExceededError';
+      }
+    } catch {
+      // Ignore read-only properties on host DOMException instances.
+    }
+    return err;
+  }
+  return createQuotaError(fallbackMessage || 'Storage quota exceeded');
+}
+
+function computeChecksum(input) {
+  const bytes = input instanceof Uint8Array ? input : toUint8Array(input);
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < bytes.byteLength; i += 1) {
+    hash ^= bytes[i];
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash >>> 0;
+}
+
+function isTempPath(path) {
+  return typeof path === 'string' && path.length > TEMP_SUFFIX.length && path.endsWith(TEMP_SUFFIX);
+}
+
+function makeTempPath(validPath) {
+  return `${validPath}${TEMP_SUFFIX}`;
+}
+
+function isQuarantinePath(path) {
+  return typeof path === 'string' && path.startsWith(QUARANTINE_PREFIX);
+}
+
+function sanitizeReasonToken(reason) {
+  const raw = typeof reason === 'string' && reason.length > 0 ? reason : 'corrupt';
+  return raw.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 40) || 'corrupt';
+}
+
+function buildQuarantineKey(validPath, reason, ts, seq) {
+  const rel = validPath.startsWith(USERDATA_PREFIX)
+    ? validPath.slice(USERDATA_PREFIX.length)
+    : validPath.replace(/^\/+/, '');
+  const safeTs = Number.isFinite(ts) && ts >= 0 ? Math.floor(ts) : 0;
+  const safeSeq = Number.isInteger(seq) && seq >= 0 ? seq : 0;
+  return `${QUARANTINE_PREFIX}${safeTs}-${safeSeq}-${sanitizeReasonToken(reason)}/${rel}`;
+}
+
+function parseQuarantineMetadata(rec) {
+  const key = typeof rec.path === 'string' ? rec.path : '';
+  const body = key.startsWith(QUARANTINE_PREFIX) ? key.slice(QUARANTINE_PREFIX.length) : key;
+  const slashIdx = body.indexOf('/');
+  const header = slashIdx === -1 ? body : body.slice(0, slashIdx);
+  const rel = slashIdx === -1 ? '' : body.slice(slashIdx + 1);
+  const headerParts = header.split('-');
+  const parsedTs = headerParts.length > 0 ? Number(headerParts[0]) : 0;
+  const parsedReason = headerParts.length >= 3 ? headerParts.slice(2).join('-') : 'corrupt';
+
+  const originalPath =
+    typeof rec.originalPath === 'string' && rec.originalPath.length > 0
+      ? rec.originalPath
+      : rel.length > 0
+        ? `${USERDATA_PREFIX}${rel}`
+        : USERDATA_PREFIX;
+  const reason =
+    typeof rec.reason === 'string' && rec.reason.length > 0 ? rec.reason : parsedReason;
+  const quarantinedAt = Number.isFinite(rec.quarantinedAt)
+    ? rec.quarantinedAt
+    : Number.isFinite(rec.mtime)
+      ? rec.mtime
+      : Number.isFinite(parsedTs)
+        ? parsedTs
+        : 0;
+  let size = 0;
+  try {
+    size = getRecordByteLength(rec.data);
+  } catch {
+    size = 0;
+  }
+  return {
+    quarantineKey: key,
+    originalPath,
+    reason,
+    quarantinedAt,
+    size,
+  };
+}
+
+function validateStoredRecord(rec) {
+  if (!rec || typeof rec !== 'object') {
+    return { ok: false, reason: 'invalid_record' };
+  }
+  if (typeof rec.path !== 'string') {
+    return { ok: false, reason: 'invalid_path' };
+  }
+  let validPath;
+  try {
+    validPath = validateUserdataPath(rec.path);
+  } catch {
+    return { ok: false, reason: 'invalid_path' };
+  }
+  if (
+    rec.mtime !== undefined &&
+    (typeof rec.mtime !== 'number' || !Number.isFinite(rec.mtime) || rec.mtime < 0)
+  ) {
+    return { ok: false, reason: 'invalid_metadata', path: validPath };
+  }
+  let data;
+  try {
+    data = toUint8Array(rec.data);
+  } catch {
+    return { ok: false, reason: 'invalid_payload', path: validPath };
+  }
+  if (rec.size !== undefined) {
+    if (!Number.isInteger(rec.size) || rec.size < 0 || rec.size !== data.byteLength) {
+      return { ok: false, reason: 'size_mismatch', path: validPath, data };
+    }
+  }
+  if (rec.checksum !== undefined) {
+    if (
+      typeof rec.checksum !== 'number' ||
+      !Number.isFinite(rec.checksum) ||
+      (rec.checksum >>> 0) !== computeChecksum(data)
+    ) {
+      return { ok: false, reason: 'checksum_mismatch', path: validPath, data };
+    }
+  }
+  const mtime = typeof rec.mtime === 'number' && Number.isFinite(rec.mtime) ? rec.mtime : 0;
+  return {
+    ok: true,
+    path: validPath,
+    data,
+    mtime,
+  };
+}
+
 function getRecordByteLength(data) {
   if (data instanceof Uint8Array) {
     return data.byteLength;
@@ -314,6 +490,21 @@ class UserdataStore {
     this.maxFileBytes = parseQuotaLimit(options.maxFileBytes, DEFAULT_MAX_FILE_BYTES, 'maxFileBytes');
     this.maxTotalBytes = parseQuotaLimit(options.maxTotalBytes, DEFAULT_MAX_TOTAL_BYTES, 'maxTotalBytes');
     this.maxFileCount = parseQuotaLimit(options.maxFileCount, DEFAULT_MAX_FILE_COUNT, 'maxFileCount');
+    this.maxQuarantineFiles = parseQuotaLimit(
+      options.maxQuarantineFiles,
+      DEFAULT_MAX_QUARANTINE_FILES,
+      'maxQuarantineFiles',
+    );
+    this.maxQuarantineBytes = parseQuotaLimit(
+      options.maxQuarantineBytes,
+      DEFAULT_MAX_QUARANTINE_BYTES,
+      'maxQuarantineBytes',
+    );
+    this.maxQuotaCleanupSteps = parseQuotaLimit(
+      options.maxQuotaCleanupSteps,
+      DEFAULT_MAX_QUOTA_CLEANUP_STEPS,
+      'maxQuotaCleanupSteps',
+    );
     this.storageEstimate = typeof options.storageEstimate === 'function' ? options.storageEstimate : null;
 
     this._db = null;
@@ -324,9 +515,12 @@ class UserdataStore {
     this._dirIndex = new Map();
     this._containerBuckets = new Map();
     this._indexedTotalBytes = 0;
+    this._fallbackStoredBytes = 0;
+    this._fallbackSizes = new Map();
     this._indexReady = false;
     this._indexEpoch = 0;
     this._indexLoadPromise = null;
+    this._quarantineSeq = 0;
 
     // Serializes mutations so quota validation + persistence + index updates never race.
     this._mutationTail = Promise.resolve();
@@ -341,8 +535,13 @@ class UserdataStore {
       bytesWritten: 0,
       bytesRead: 0,
       quotaRejections: 0,
+      quotaErrors: 0,
+      quotaCleanups: 0,
       invalidations: 0,
       atomicCommits: 0,
+      atomicWrites: 0,
+      writeVerifyFailures: 0,
+      corruptRecoveries: 0,
       lastWriteDurationMs: 0,
     };
   }
@@ -361,6 +560,8 @@ class UserdataStore {
     this._dirIndex.clear();
     this._containerBuckets.clear();
     this._indexedTotalBytes = 0;
+    this._fallbackStoredBytes = 0;
+    this._fallbackSizes.clear();
     this._indexReady = false;
   }
 
@@ -444,27 +645,28 @@ class UserdataStore {
     this._indexReady = true;
   }
 
-  _populateIndexFromRecords(records) {
+  async _populateIndexFromRecords(records) {
     const entries = [];
     for (let i = 0; i < records.length; i += 1) {
       const rec = records[i];
       if (!rec || typeof rec.path !== 'string') continue;
-      let validPath;
-      try {
-        validPath = validateUserdataPath(rec.path);
-      } catch {
+      if (isQuarantinePath(rec.path)) continue;
+      if (isTempPath(rec.path)) {
+        await this._cleanupTempPath(rec.path);
+        this._stats.corruptRecoveries += 1;
         continue;
       }
-      let size;
-      try {
-        size = getRecordByteLength(rec.data);
-      } catch {
+      const checked = validateStoredRecord(rec);
+      if (!checked.ok) {
+        if (checked.reason !== 'invalid_path' && checked.path) {
+          await this._quarantineCorruptRecord(checked.path, rec, checked.reason);
+        }
         continue;
       }
       entries.push({
-        path: validPath,
-        size,
-        mtime: Number.isFinite(rec.mtime) ? rec.mtime : 0,
+        path: checked.path,
+        size: checked.data.byteLength,
+        mtime: checked.mtime,
       });
     }
     this._populateIndexFromEntries(entries);
@@ -497,7 +699,7 @@ class UserdataStore {
           this._stats.indexMisses += 1;
           const records = await this._getAllRecords();
           if (this._indexEpoch === startEpoch) {
-            this._populateIndexFromRecords(records);
+            await this._populateIndexFromRecords(records);
             return true;
           }
         }
@@ -516,6 +718,7 @@ class UserdataStore {
       const spec = writeSpecs[i];
       if (spec.size > this.maxFileBytes) {
         this._stats.quotaRejections += 1;
+        this._stats.quotaErrors += 1;
         throw createQuotaError(
           `Userdata file "${spec.path}" (${spec.size} bytes) exceeds maxFileBytes (${this.maxFileBytes})`,
           { path: spec.path, size: spec.size, maxFileBytes: this.maxFileBytes },
@@ -565,6 +768,7 @@ class UserdataStore {
 
     if (projectedBytes > this.maxTotalBytes) {
       this._stats.quotaRejections += 1;
+      this._stats.quotaErrors += 1;
       throw createQuotaError(
         `Userdata write would reach ${projectedBytes} bytes, exceeding maxTotalBytes (${this.maxTotalBytes})`,
         {
@@ -577,6 +781,7 @@ class UserdataStore {
 
     if (projectedCount > this.maxFileCount) {
       this._stats.quotaRejections += 1;
+      this._stats.quotaErrors += 1;
       throw createQuotaError(
         `Userdata write would reach ${projectedCount} files, exceeding maxFileCount (${this.maxFileCount})`,
         {
@@ -600,6 +805,7 @@ class UserdataStore {
       ) {
         if (estimate.usage + deltaBytes > estimate.quota) {
           this._stats.quotaRejections += 1;
+          this._stats.quotaErrors += 1;
           throw createQuotaError(
             `Browser storage quota exceeded: usage ${estimate.usage} + ${deltaBytes} > quota ${estimate.quota}`,
             {
@@ -755,6 +961,285 @@ class UserdataStore {
     return Array.isArray(records) ? records : [];
   }
 
+  async _putRawRecord(record) {
+    if (this.backend) {
+      await this.backend.put(record);
+      return;
+    }
+    await this._runTransaction('readwrite', (store) => store.put(record));
+  }
+
+  async _getRawRecord(key) {
+    if (this.backend) {
+      if (typeof this.backend.get === 'function') {
+        return await this.backend.get(key);
+      }
+      if (typeof this.backend.getAll === 'function') {
+        const records = await this._getAllRecords();
+        return records.find((r) => r && r.path === key) || null;
+      }
+      return null;
+    }
+    const rec = await this._runTransaction('readonly', (store) => {
+      if (typeof store.get === 'function') {
+        return store.get(key);
+      }
+      return store.getAll();
+    });
+    if (Array.isArray(rec)) {
+      return rec.find((r) => r && r.path === key) || null;
+    }
+    return rec || null;
+  }
+
+  async _deleteRawRecord(key) {
+    if (this.backend) {
+      if (typeof this.backend.delete === 'function') {
+        await this.backend.delete(key);
+      }
+      return;
+    }
+    await this._runTransaction('readwrite', (store) => store.delete(key));
+  }
+
+  async _cleanupTempPath(tmpPath) {
+    try {
+      await this._deleteRawRecord(tmpPath);
+    } catch {
+      // Best-effort cleanup of temp staging artifacts.
+    }
+  }
+
+  _verifyStagedRecord(staged, expectedSize, expectedChecksum) {
+    if (!staged || typeof staged !== 'object') {
+      return { ok: false, reason: 'missing_staged_record' };
+    }
+    let verifyData;
+    try {
+      verifyData = toUint8Array(staged.data);
+    } catch {
+      return { ok: false, reason: 'invalid_staged_payload' };
+    }
+    if (verifyData.byteLength !== expectedSize) {
+      return {
+        ok: false,
+        reason: 'staged_size_mismatch',
+        expectedSize,
+        actualSize: verifyData.byteLength,
+      };
+    }
+    if (staged.size !== undefined && (!Number.isInteger(staged.size) || staged.size !== expectedSize)) {
+      return {
+        ok: false,
+        reason: 'staged_metadata_size_mismatch',
+        expectedSize,
+        actualSize: staged.size,
+      };
+    }
+    const actualChecksum = computeChecksum(verifyData);
+    if (actualChecksum !== expectedChecksum) {
+      return {
+        ok: false,
+        reason: 'staged_checksum_mismatch',
+        expectedChecksum,
+        actualChecksum,
+      };
+    }
+    if (
+      staged.checksum !== undefined &&
+      (typeof staged.checksum !== 'number' || (staged.checksum >>> 0) !== expectedChecksum)
+    ) {
+      return {
+        ok: false,
+        reason: 'staged_metadata_checksum_mismatch',
+        expectedChecksum,
+        actualChecksum: staged.checksum,
+      };
+    }
+    return { ok: true };
+  }
+
+  async _enforceQuarantineBounds() {
+    if (this.maxQuarantineFiles === Infinity && this.maxQuarantineBytes === Infinity) {
+      return { removed: 0, reclaimedBytes: 0 };
+    }
+    let records;
+    try {
+      records = await this._getAllRecords();
+    } catch {
+      return { removed: 0, reclaimedBytes: 0 };
+    }
+    const quarantined = [];
+    for (let i = 0; i < records.length; i += 1) {
+      const rec = records[i];
+      if (!rec || typeof rec.path !== 'string' || !isQuarantinePath(rec.path)) continue;
+      quarantined.push(parseQuarantineMetadata(rec));
+    }
+    if (quarantined.length === 0) {
+      return { removed: 0, reclaimedBytes: 0 };
+    }
+
+    // Evict oldest quarantine entries first until both file count and byte budget are respected.
+    quarantined.sort((a, b) => {
+      if (a.quarantinedAt !== b.quarantinedAt) {
+        return a.quarantinedAt - b.quarantinedAt;
+      }
+      return compareAscii(a.quarantineKey, b.quarantineKey);
+    });
+
+    let totalFiles = quarantined.length;
+    let totalBytes = 0;
+    for (let i = 0; i < quarantined.length; i += 1) {
+      totalBytes += quarantined[i].size;
+    }
+
+    let removed = 0;
+    let reclaimedBytes = 0;
+    const stepCap =
+      this.maxQuotaCleanupSteps === Infinity ? quarantined.length : this.maxQuotaCleanupSteps;
+    for (let i = 0; i < quarantined.length && removed < stepCap; i += 1) {
+      if (totalFiles <= this.maxQuarantineFiles && totalBytes <= this.maxQuarantineBytes) {
+        break;
+      }
+      const entry = quarantined[i];
+      try {
+        await this._deleteRawRecord(entry.quarantineKey);
+        totalFiles -= 1;
+        totalBytes = Math.max(0, totalBytes - entry.size);
+        removed += 1;
+        reclaimedBytes += entry.size;
+      } catch {
+        // Best-effort bounded quarantine eviction.
+      }
+    }
+    return { removed, reclaimedBytes };
+  }
+
+  async _quarantineCorruptRecord(validPath, rec, reason) {
+    const quarantinedAt = Date.now();
+    this._quarantineSeq += 1;
+    const quarantineKey = buildQuarantineKey(validPath, reason, quarantinedAt, this._quarantineSeq);
+
+    let safeBytes = new Uint8Array(0);
+    if (rec && rec.data !== undefined && rec.data !== null) {
+      try {
+        const raw = toUint8Array(rec.data);
+        const cap = Math.min(
+          MAX_QUARANTINE_RECORD_BYTES,
+          this.maxQuarantineBytes === Infinity ? MAX_QUARANTINE_RECORD_BYTES : this.maxQuarantineBytes,
+        );
+        safeBytes = raw.byteLength > cap ? raw.slice(0, cap) : raw;
+      } catch {
+        safeBytes = new Uint8Array(0);
+      }
+    }
+
+    if (this.maxQuarantineFiles > 0 && this.maxQuarantineBytes >= safeBytes.byteLength) {
+      try {
+        await this._putRawRecord({
+          path: quarantineKey,
+          originalPath: validPath,
+          reason,
+          quarantinedAt,
+          data: safeBytes,
+          mtime: quarantinedAt,
+          quarantined: true,
+        });
+        await this._enforceQuarantineBounds();
+      } catch {
+        // Best-effort quarantine snapshot; still remove corrupt live key below.
+      }
+    }
+
+    try {
+      await this._deleteRawRecord(validPath);
+    } catch {
+      // Best-effort removal of corrupt live entry.
+    }
+
+    if (this._indexReady) {
+      this._indexDelete(validPath);
+    }
+    this._stats.corruptRecoveries += 1;
+    return quarantineKey;
+  }
+
+  async _reclaimStorageOnQuotaPressure(neededBytes = 0, excludePath = null) {
+    let records;
+    try {
+      records = await this._getAllRecords();
+    } catch {
+      return { removed: 0, removedTemps: 0, removedQuarantined: 0, reclaimedBytes: 0 };
+    }
+
+    const temps = [];
+    const quarantined = [];
+    for (let i = 0; i < records.length; i += 1) {
+      const rec = records[i];
+      if (!rec || typeof rec.path !== 'string') continue;
+      if (excludePath && rec.path === excludePath) continue;
+      let size = 0;
+      try {
+        size = getRecordByteLength(rec.data);
+      } catch {
+        size = 0;
+      }
+      if (isTempPath(rec.path)) {
+        temps.push({ path: rec.path, size });
+      } else if (isQuarantinePath(rec.path)) {
+        const meta = parseQuarantineMetadata(rec);
+        quarantined.push({ path: meta.quarantineKey, size: meta.size, quarantinedAt: meta.quarantinedAt });
+      }
+    }
+
+    temps.sort((a, b) => compareAscii(a.path, b.path));
+    quarantined.sort((a, b) => {
+      if (a.quarantinedAt !== b.quarantinedAt) {
+        return a.quarantinedAt - b.quarantinedAt;
+      }
+      return compareAscii(a.path, b.path);
+    });
+
+    const stepCap = this.maxQuotaCleanupSteps === Infinity ? Infinity : this.maxQuotaCleanupSteps;
+    let removed = 0;
+    let removedTemps = 0;
+    let removedQuarantined = 0;
+    let reclaimedBytes = 0;
+
+    // 1. Always reclaim orphaned .tmp artifacts first (never touches live user saves).
+    for (let i = 0; i < temps.length && removed < stepCap; i += 1) {
+      try {
+        await this._deleteRawRecord(temps[i].path);
+        removed += 1;
+        removedTemps += 1;
+        reclaimedBytes += temps[i].size;
+      } catch {
+        // Best-effort cleanup.
+      }
+    }
+
+    // 2. Evict oldest quarantined corrupt records until neededBytes is satisfied or stepCap hit.
+    for (let i = 0; i < quarantined.length && removed < stepCap; i += 1) {
+      if (neededBytes > 0 && reclaimedBytes >= neededBytes) {
+        break;
+      }
+      try {
+        await this._deleteRawRecord(quarantined[i].path);
+        removed += 1;
+        removedQuarantined += 1;
+        reclaimedBytes += quarantined[i].size;
+      } catch {
+        // Best-effort cleanup.
+      }
+    }
+
+    if (removed > 0) {
+      this._stats.quotaCleanups += 1;
+    }
+
+    return { removed, removedTemps, removedQuarantined, reclaimedBytes };
+  }
+
   async restoreAll(fsAdapter, options = {}) {
     const timeoutMs =
       Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
@@ -819,37 +1304,39 @@ class UserdataStore {
             skipped += 1;
             continue;
           }
-          let validPath;
-          try {
-            validPath = validateUserdataPath(rec.path);
-          } catch {
+          if (isQuarantinePath(rec.path)) {
+            continue;
+          }
+          if (isTempPath(rec.path)) {
+            await this._cleanupTempPath(rec.path);
+            this._stats.corruptRecoveries += 1;
+            continue;
+          }
+
+          const checked = validateStoredRecord(rec);
+          if (!checked.ok) {
+            if (checked.reason !== 'invalid_path' && checked.path) {
+              await this._quarantineCorruptRecord(checked.path, rec, checked.reason);
+            }
             skipped += 1;
             continue;
           }
 
-          let payload;
-          try {
-            payload = toUint8Array(rec.data);
-          } catch {
-            skipped += 1;
-            continue;
-          }
-
-          await ensureParentDirs(fsAdapter, validPath);
-          await fsAdapter.writeFile(validPath, payload, rec.mtime);
-          if (typeof fsAdapter.utime === 'function' && Number.isFinite(rec.mtime)) {
+          await ensureParentDirs(fsAdapter, checked.path);
+          await fsAdapter.writeFile(checked.path, checked.data, checked.mtime);
+          if (typeof fsAdapter.utime === 'function' && Number.isFinite(checked.mtime)) {
             try {
-              await fsAdapter.utime(validPath, rec.mtime, rec.mtime);
+              await fsAdapter.utime(checked.path, checked.mtime, checked.mtime);
             } catch {
               // Setting mtime is best-effort.
             }
           }
           this._stats.reads += 1;
-          this._stats.bytesRead += payload.byteLength;
+          this._stats.bytesRead += checked.data.byteLength;
           restoredEntries.push({
-            path: validPath,
-            size: payload.byteLength,
-            mtime: Number.isFinite(rec.mtime) ? rec.mtime : 0,
+            path: checked.path,
+            size: checked.data.byteLength,
+            mtime: checked.mtime,
           });
           restored += 1;
         }
@@ -875,33 +1362,128 @@ class UserdataStore {
 
   async _saveFileUnlocked(validPath, data, ts, options = {}) {
     const startMs = nowMs();
+    const expectedSize = data.byteLength;
+    const expectedChecksum = computeChecksum(data);
+
     if (!options.skipQuotaCheck) {
-      await this._validateQuotaForWrites([{ path: validPath, size: data.byteLength }], null);
+      await this._validateQuotaForWrites([{ path: validPath, size: expectedSize }], null);
     }
 
-    const record = { path: validPath, data, mtime: ts };
+    const tmpPath = makeTempPath(validPath);
+    const stagedRecord = {
+      path: tmpPath,
+      data,
+      mtime: ts,
+      size: expectedSize,
+      checksum: expectedChecksum,
+      staging: true,
+      targetPath: validPath,
+    };
+    const liveRecord = {
+      path: validPath,
+      data,
+      mtime: ts,
+      size: expectedSize,
+      checksum: expectedChecksum,
+    };
+
+    // Phase 1: Stage write into sibling .tmp entry without touching live entry.
     try {
-      if (this.backend) {
-        await this.backend.put(record);
-      } else {
-        await this._runTransaction('readwrite', (store) => store.put(record));
-      }
+      await this._putRawRecord(stagedRecord);
     } catch (err) {
-      if (err && (err.name === 'QuotaExceededError' || err.code === 'QUOTA_EXCEEDED')) {
-        this._stats.quotaRejections += 1;
+      if (isQuotaExceededError(err)) {
+        const reclaimed = await this._reclaimStorageOnQuotaPressure(expectedSize, tmpPath);
+        if (reclaimed.removed > 0) {
+          try {
+            await this._putRawRecord(stagedRecord);
+          } catch (retryErr) {
+            await this._cleanupTempPath(tmpPath);
+            if (isQuotaExceededError(retryErr)) {
+              this._stats.quotaRejections += 1;
+              this._stats.quotaErrors += 1;
+              throw normalizeQuotaError(retryErr);
+            }
+            throw retryErr;
+          }
+        } else {
+          await this._cleanupTempPath(tmpPath);
+          this._stats.quotaRejections += 1;
+          this._stats.quotaErrors += 1;
+          throw normalizeQuotaError(err);
+        }
+      } else {
+        await this._cleanupTempPath(tmpPath);
+        throw err;
       }
-      throw err;
     }
+
+    // Phase 2: Read back and verify staged byte length + checksum before touching live entry.
+    let stagedReadback;
+    try {
+      stagedReadback = await this._getRawRecord(tmpPath);
+    } catch (err) {
+      this._stats.writeVerifyFailures += 1;
+      await this._cleanupTempPath(tmpPath);
+      throw createWriteVerifyError(
+        `Failed to read back staged userdata record for "${validPath}": ${String(err)}`,
+        { path: validPath, tmpPath, cause: err },
+      );
+    }
+
+    const verification = this._verifyStagedRecord(stagedReadback, expectedSize, expectedChecksum);
+    if (!verification.ok) {
+      this._stats.writeVerifyFailures += 1;
+      await this._cleanupTempPath(tmpPath);
+      throw createWriteVerifyError(
+        `Staged userdata write verification failed for "${validPath}" (${verification.reason})`,
+        { path: validPath, tmpPath, ...verification },
+      );
+    }
+
+    // Phase 3: Commit verified record to live key, then remove .tmp sibling.
+    try {
+      await this._putRawRecord(liveRecord);
+    } catch (err) {
+      await this._cleanupTempPath(tmpPath);
+      if (isQuotaExceededError(err)) {
+        const reclaimed = await this._reclaimStorageOnQuotaPressure(expectedSize, null);
+        if (reclaimed.removed > 0) {
+          try {
+            await this._putRawRecord(liveRecord);
+          } catch (retryErr) {
+            if (isQuotaExceededError(retryErr)) {
+              this._stats.quotaRejections += 1;
+              this._stats.quotaErrors += 1;
+              throw normalizeQuotaError(retryErr);
+            }
+            throw retryErr;
+          }
+        } else {
+          this._stats.quotaRejections += 1;
+          this._stats.quotaErrors += 1;
+          throw normalizeQuotaError(err);
+        }
+      } else {
+        throw err;
+      }
+    }
+
+    await this._cleanupTempPath(tmpPath);
 
     this._indexEpoch += 1;
     if (this._indexReady) {
-      this._indexPut(validPath, data.byteLength, ts);
+      this._indexPut(validPath, expectedSize, ts);
+    } else {
+      const prevFallbackSize = this._fallbackSizes.get(validPath) || 0;
+      this._fallbackSizes.set(validPath, expectedSize);
+      this._fallbackStoredBytes = Math.max(0, this._fallbackStoredBytes - prevFallbackSize + expectedSize);
     }
     this._stats.writes += 1;
-    this._stats.bytesWritten += data.byteLength;
+    this._stats.atomicWrites += 1;
+    this._stats.bytesWritten += expectedSize;
     this._stats.lastWriteDurationMs = Math.max(0, nowMs() - startMs);
 
-    return { path: validPath, size: data.byteLength, mtime: ts };
+    return { path: validPath, size: expectedSize, mtime: ts };
   }
 
   async saveFile(path, bytes, mtime = Date.now()) {
@@ -920,26 +1502,7 @@ class UserdataStore {
       return null;
     }
 
-    let rec = null;
-
-    if (this.backend) {
-      if (typeof this.backend.get === 'function') {
-        rec = await this.backend.get(validPath);
-      } else {
-        const records = await this._getAllRecords();
-        rec = records.find((r) => r && r.path === validPath) || null;
-      }
-    } else {
-      rec = await this._runTransaction('readonly', (store) => {
-        if (typeof store.get === 'function') {
-          return store.get(validPath);
-        }
-        return store.getAll();
-      });
-      if (Array.isArray(rec)) {
-        rec = rec.find((r) => r && r.path === validPath) || null;
-      }
-    }
+    const rec = await this._getRawRecord(validPath);
 
     if (!rec || typeof rec !== 'object') {
       if (this._indexReady) {
@@ -948,27 +1511,37 @@ class UserdataStore {
       return null;
     }
 
-    const data = toUint8Array(rec.data);
-    const mtime = Number.isFinite(rec.mtime) ? rec.mtime : 0;
-    this._stats.bytesRead += data.byteLength;
+    const checked = validateStoredRecord(rec);
+    if (!checked.ok) {
+      await this._quarantineCorruptRecord(validPath, rec, checked.reason);
+      return null;
+    }
+
+    this._stats.bytesRead += checked.data.byteLength;
 
     return {
       path: validPath,
-      data,
-      mtime,
+      data: checked.data,
+      mtime: checked.mtime,
     };
   }
 
   async _deleteFileUnlocked(validPath) {
-    if (this.backend) {
-      await this.backend.delete(validPath);
-    } else {
-      await this._runTransaction('readwrite', (store) => store.delete(validPath));
-    }
+    const prevSize = this._indexReady && this._metaIndex.has(validPath)
+      ? this._metaIndex.get(validPath).size
+      : 0;
+    await this._deleteRawRecord(validPath);
+    await this._cleanupTempPath(makeTempPath(validPath));
 
     this._indexEpoch += 1;
     if (this._indexReady) {
       this._indexDelete(validPath);
+    } else if (this._fallbackSizes.has(validPath)) {
+      const prevFallbackSize = this._fallbackSizes.get(validPath) || 0;
+      this._fallbackSizes.delete(validPath);
+      this._fallbackStoredBytes = Math.max(0, this._fallbackStoredBytes - prevFallbackSize);
+    } else if (prevSize > 0) {
+      this._fallbackStoredBytes = Math.max(0, this._fallbackStoredBytes - prevSize);
     }
     this._stats.deletes += 1;
 
@@ -987,25 +1560,31 @@ class UserdataStore {
     const indexEntries = [];
     for (const rec of records) {
       if (!rec || typeof rec.path !== 'string') continue;
-      try {
-        const validPath = validateUserdataPath(rec.path);
-        const data = toUint8Array(rec.data);
-        const mtime = Number.isFinite(rec.mtime) ? rec.mtime : 0;
-        out.push({
-          path: validPath,
-          data,
-          mtime,
-        });
-        indexEntries.push({
-          path: validPath,
-          size: data.byteLength,
-          mtime,
-        });
-        this._stats.reads += 1;
-        this._stats.bytesRead += data.byteLength;
-      } catch {
-        // Skip invalid entries.
+      if (isQuarantinePath(rec.path)) continue;
+      if (isTempPath(rec.path)) {
+        await this._cleanupTempPath(rec.path);
+        this._stats.corruptRecoveries += 1;
+        continue;
       }
+      const checked = validateStoredRecord(rec);
+      if (!checked.ok) {
+        if (checked.reason !== 'invalid_path' && checked.path) {
+          await this._quarantineCorruptRecord(checked.path, rec, checked.reason);
+        }
+        continue;
+      }
+      out.push({
+        path: checked.path,
+        data: checked.data,
+        mtime: checked.mtime,
+      });
+      indexEntries.push({
+        path: checked.path,
+        size: checked.data.byteLength,
+        mtime: checked.mtime,
+      });
+      this._stats.reads += 1;
+      this._stats.bytesRead += checked.data.byteLength;
     }
 
     if (this._indexEpoch === startEpoch) {
@@ -1269,7 +1848,47 @@ class UserdataStore {
     };
   }
 
+  async listQuarantined() {
+    const records = await this._getAllRecords();
+    const out = [];
+    for (let i = 0; i < records.length; i += 1) {
+      const rec = records[i];
+      if (!rec || typeof rec.path !== 'string' || !isQuarantinePath(rec.path)) continue;
+      out.push(parseQuarantineMetadata(rec));
+    }
+    out.sort((a, b) => {
+      if (a.quarantinedAt !== b.quarantinedAt) {
+        return a.quarantinedAt - b.quarantinedAt;
+      }
+      return compareAscii(a.quarantineKey, b.quarantineKey);
+    });
+    return out;
+  }
+
+  async purgeQuarantine() {
+    return this._withMutationLock(async () => {
+      const entries = await this.listQuarantined();
+      let removed = 0;
+      let reclaimedBytes = 0;
+      for (let i = 0; i < entries.length; i += 1) {
+        await this._deleteRawRecord(entries[i].quarantineKey);
+        removed += 1;
+        reclaimedBytes += entries[i].size;
+      }
+      return { removed, reclaimedBytes };
+    });
+  }
+
+  async cleanupArtifacts(options = {}) {
+    const neededBytes =
+      options && Number.isFinite(options.neededBytes) && options.neededBytes > 0
+        ? Math.floor(options.neededBytes)
+        : Infinity;
+    return this._withMutationLock(() => this._reclaimStorageOnQuotaPressure(neededBytes, null));
+  }
+
   getStats() {
+    const storedBytes = this._indexReady ? this._indexedTotalBytes : this._fallbackStoredBytes;
     return {
       reads: this._stats.reads,
       writes: this._stats.writes,
@@ -1279,12 +1898,18 @@ class UserdataStore {
       bytesWritten: this._stats.bytesWritten,
       bytesRead: this._stats.bytesRead,
       quotaRejections: this._stats.quotaRejections,
+      quotaErrors: this._stats.quotaErrors,
+      quotaCleanups: this._stats.quotaCleanups,
       invalidations: this._stats.invalidations,
       atomicCommits: this._stats.atomicCommits,
+      atomicWrites: this._stats.atomicWrites,
+      writeVerifyFailures: this._stats.writeVerifyFailures,
+      corruptRecoveries: this._stats.corruptRecoveries,
       lastWriteDurationMs: this._stats.lastWriteDurationMs,
       indexReady: this._indexReady,
       indexedFiles: this._metaIndex.size,
       indexedBytes: this._indexedTotalBytes,
+      storedBytes,
     };
   }
 
@@ -1297,8 +1922,13 @@ class UserdataStore {
     this._stats.bytesWritten = 0;
     this._stats.bytesRead = 0;
     this._stats.quotaRejections = 0;
+    this._stats.quotaErrors = 0;
+    this._stats.quotaCleanups = 0;
     this._stats.invalidations = 0;
     this._stats.atomicCommits = 0;
+    this._stats.atomicWrites = 0;
+    this._stats.writeVerifyFailures = 0;
+    this._stats.corruptRecoveries = 0;
     this._stats.lastWriteDurationMs = 0;
   }
 
@@ -1513,6 +2143,11 @@ const exportedApi = {
   DEFAULT_MAX_FILE_BYTES,
   DEFAULT_MAX_TOTAL_BYTES,
   DEFAULT_MAX_FILE_COUNT,
+  DEFAULT_MAX_QUARANTINE_FILES,
+  DEFAULT_MAX_QUARANTINE_BYTES,
+  DEFAULT_MAX_QUOTA_CLEANUP_STEPS,
+  TEMP_SUFFIX,
+  QUARANTINE_PREFIX,
   USERDATA_PREFIX,
   ARCHIVE_FORMAT,
   ARCHIVE_VERSION,
@@ -1520,6 +2155,8 @@ const exportedApi = {
   validateUserdataPrefix,
   encodeBase64,
   decodeBase64,
+  computeChecksum,
+  isQuotaExceededError,
 };
 
 if (typeof globalThis !== 'undefined') {
