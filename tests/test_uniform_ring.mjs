@@ -12,6 +12,8 @@ const {
   DEFAULT_MIN_UNIFORM_BINDING_SIZE,
   DEFAULT_BYTE_SIZE,
   DEFAULT_MAX_BYTE_SIZE,
+  MIN_FRAMES_IN_FLIGHT,
+  MAX_FRAMES_IN_FLIGHT,
   DEFAULT_FRAMES_IN_FLIGHT,
   DEFAULT_MAX_BINDING_SIZE,
   DEFAULT_SHRINK_AFTER_IDLE_FRAMES,
@@ -2802,4 +2804,426 @@ test('W264: telemetry tracks peakVramBytes, shrinkCount, alignmentPaddingBytes, 
   assert.equal(ctx.PlayGta6UniformRing.DEFAULT_SHRINK_THRESHOLD_RATIO, 0.25);
 
   ring.destroy();
+});
+
+test('W314: 3-deep frame-in-flight partitioning clamps [1, 4], isolates N/N-1/N-2 GPU & shadow buffers, and tracks endFrame fences', async () => {
+  assert.equal(MIN_FRAMES_IN_FLIGHT, 1);
+  assert.equal(MAX_FRAMES_IN_FLIGHT, 4);
+  assert.equal(DEFAULT_FRAMES_IN_FLIGHT, 3);
+
+  const { device, createdBuffers } = createMockGpuDevice();
+
+  // Default framesInFlight is 3; values > 4 clamp cleanly to 4; values <= 0 reject with RangeError.
+  const defaultRing = new DynamicUniformRing({ device, byteSize: 1024 });
+  assert.equal(defaultRing.framesInFlight, 3);
+  assert.equal(defaultRing.getStats().framesInFlight, 3);
+  assert.equal(createdBuffers.length, 3);
+  defaultRing.destroy();
+
+  const clampedRing = new DynamicUniformRing({ device, byteSize: 1024, framesInFlight: 8 });
+  assert.equal(clampedRing.framesInFlight, 4);
+  assert.equal(clampedRing.getStats().framesInFlight, 4);
+  assert.equal(createdBuffers.length, 3 + 4);
+  clampedRing.destroy();
+
+  assert.throws(() => new DynamicUniformRing({ device, byteSize: 1024, framesInFlight: 0 }), RangeError);
+  assert.throws(() => new DynamicUniformRing({ device, byteSize: 1024, framesInFlight: -2 }), RangeError);
+  assert.throws(() => new DynamicUniformRing({ device, byteSize: 1024, framesInFlight: 2.5 }), RangeError);
+
+  // 3-deep non-overlap across frames 0, 1, 2 (both GPUBuffers and CPU shadow slabs) and rotation on frames 3..5.
+  const { device: dev3, createdBuffers: bufs3, queueWrites } = createMockGpuDevice();
+  const ring = new DynamicUniformRing({
+    device: dev3,
+    byteSize: 2048,
+    maxByteSize: 8192,
+  });
+  assert.equal(ring.framesInFlight, 3);
+  assert.equal(bufs3.length, 3);
+  assert.equal(ring.getStats().partitionRotations, 0);
+  assert.equal(ring.getStats().inFlightPartitions, 0);
+
+  const frameBuffers = [];
+  const frameShadows = [];
+  let resolveFence0;
+  const fence0 = new Promise((resolve) => {
+    resolveFence0 = resolve;
+  });
+
+  for (let frame = 0; frame < 6; frame += 1) {
+    const start = ring.beginFrame(frame);
+    assert.equal(start.frameIndex, frame);
+    assert.equal(start.slotIndex, frame % 3);
+    assert.equal(start.partitionIndex, frame % 3);
+    assert.equal(start.framesInFlight, 3);
+    assert.equal(ring.partitionIndex, frame % 3);
+
+    const a0 = ring.allocAligned(64);
+    assert.equal(a0.dynamicOffset, 0);
+    assert.equal(a0.buffer, start.buffer);
+    new Uint32Array(a0.shadow.buffer, a0.offset, 4).set([0xf000 + frame, frame * 13, 0xaa, 0xbb]);
+
+    const a1 = ring.allocAligned(48);
+    assert.equal(a1.dynamicOffset, 256);
+    new Uint32Array(a1.shadow.buffer, a1.offset, 4).set([0xe000 + frame, frame * 29, 0xcc, 0xdd]);
+
+    frameBuffers.push(a0.buffer);
+    frameShadows.push(a0.shadow);
+
+    ring.flush();
+    const end =
+      frame === 0
+        ? ring.endFrame(frame, { fence: fence0 })
+        : ring.endFrame(frame);
+    assert.equal(end.frameIndex, frame);
+    assert.equal(end.slotIndex, frame % 3);
+    assert.equal(end.partitionIndex, frame % 3);
+    assert.equal(end.frameBytes, 512);
+    assert.equal(end.inFlight, true);
+
+    // While frames 0..2 are in flight, verify prior frames' GPU & shadow bytes were NEVER clobbered!
+    if (frame === 1) {
+      assert.notEqual(frameBuffers[1], frameBuffers[0]);
+      assert.notEqual(frameShadows[1], frameShadows[0]);
+      assert.equal(new Uint32Array(frameBuffers[0]._data.buffer, 0, 1)[0], 0xf000);
+      assert.equal(new Uint32Array(frameShadows[0].buffer, 0, 1)[0], 0xf000);
+      assert.equal(ring.getStats().inFlightPartitions, 2);
+    } else if (frame === 2) {
+      assert.notEqual(frameBuffers[2], frameBuffers[0]);
+      assert.notEqual(frameBuffers[2], frameBuffers[1]);
+      assert.notEqual(frameShadows[2], frameShadows[0]);
+      assert.notEqual(frameShadows[2], frameShadows[1]);
+      assert.equal(new Uint32Array(frameBuffers[0]._data.buffer, 0, 1)[0], 0xf000);
+      assert.equal(new Uint32Array(frameBuffers[1]._data.buffer, 0, 1)[0], 0xf001);
+      assert.equal(new Uint32Array(frameShadows[0].buffer, 0, 1)[0], 0xf000);
+      assert.equal(new Uint32Array(frameShadows[1].buffer, 0, 1)[0], 0xf001);
+      assert.equal(ring.getStats().inFlightPartitions, 3);
+    }
+  }
+
+  // Frames 3, 4, 5 rotated back to partitions 0, 1, 2 with zero extra GPUBuffer allocations.
+  assert.equal(frameBuffers[3], frameBuffers[0]);
+  assert.equal(frameBuffers[4], frameBuffers[1]);
+  assert.equal(frameBuffers[5], frameBuffers[2]);
+  assert.equal(frameShadows[3], frameShadows[0]);
+  assert.equal(frameShadows[4], frameShadows[1]);
+  assert.equal(frameShadows[5], frameShadows[2]);
+  assert.equal(bufs3.length, 3);
+  assert.equal(queueWrites.length, 6);
+
+  // Late-resolving fence from Frame 0 must NOT clobber Frame 3's recycled partition 0 in-flight status!
+  resolveFence0();
+  await fence0;
+  assert.equal(ring.getStats().inFlightPartitions, 3);
+
+  // Active fence on latest frame DOES clear its partition's inFlight state when resolved.
+  let resolveFence6;
+  const fence6 = new Promise((resolve) => {
+    resolveFence6 = resolve;
+  });
+  ring.beginFrame(6);
+  ring.allocAligned(32);
+  ring.flush();
+  ring.endFrame(6, { fence: fence6 });
+  assert.equal(ring.getStats().inFlightPartitions, 3);
+  resolveFence6();
+  await fence6;
+  assert.equal(ring.getStats().inFlightPartitions, 2);
+
+  // Allocating directly after endFrame(6) without explicit beginFrame() auto-rotates to Frame 7 / partition 1!
+  const autoRotated = ring.allocAligned(32);
+  assert.equal(ring.frameIndex, 7);
+  assert.equal(ring.partitionIndex, 1);
+  assert.equal(autoRotated.buffer, frameBuffers[1]);
+  assert.equal(autoRotated.dynamicOffset, 0);
+
+  const stats = ring.getStats();
+  assert.equal(stats.framesInFlight, 3);
+  assert.equal(stats.partitionRotations, 7); // F0->F1->F2->F3->F4->F5->F6->F7
+  assert.equal(stats.wrapCount, 5); // F3, F4, F5, F6, F7
+  assert.equal(stats.peakFrameBytes, 512);
+
+  // endFrame() validation guards reject invalid arguments cleanly.
+  assert.throws(() => ring.endFrame(-1), RangeError);
+  assert.throws(() => ring.endFrame(1.5), RangeError);
+  assert.throws(() => ring.endFrame('bad'), TypeError);
+  assert.throws(() => ring.endFrame(7, 'bad-opts'), TypeError);
+  assert.throws(() => ring.endFrame(7, { fence: 'not-a-promise' }), TypeError);
+
+  ring.destroy();
+  for (const buf of bufs3) {
+    assert.equal(buf.destroyCount, 1);
+  }
+});
+
+test('W314: allocAligned(byteLength, out) and allocate(byteLength, { out }) zero-alloc parity, 256B WebGPU alignment, and sustained 30 FPS hot loop', () => {
+  const { device, createdBuffers, queueWrites } = createMockGpuDevice({
+    limits: { minUniformBufferOffsetAlignment: 256, maxUniformBufferBindingSize: 65536 },
+  });
+  const ring = new DynamicUniformRing({
+    device,
+    byteSize: 32 * 1024,
+    maxByteSize: 64 * 1024,
+    framesInFlight: 3,
+  });
+
+  ring.beginFrame(0);
+
+  // 1. Exact default return shape parity: allocAligned(len) vs allocate(len) vs allocAligned(len, out) vs allocate(len, { out }).
+  const freshAligned = ring.allocAligned(20);
+  const freshAllocate = ring.allocate(20);
+  assert.deepEqual(
+    Object.keys(freshAligned).sort(),
+    Object.keys(freshAllocate).sort(),
+    'allocAligned() and allocate() must produce identical default return shapes'
+  );
+  assert.equal(freshAligned.dynamicOffset, 0);
+  assert.equal(freshAllocate.dynamicOffset, 256);
+  assert.equal(freshAligned.alignedSize, 256);
+  assert.equal(freshAllocate.alignedSize, 256);
+  assert.equal(freshAligned.paddedSize, 20);
+  assert.equal(freshAllocate.paddedSize, 20);
+  assert.equal(ring.getStats().zeroAllocAllocs, 0, 'omitted out must not increment zeroAllocAllocs');
+
+  const scratch = {};
+  const zeroA = ring.allocAligned(20, scratch);
+  assert.equal(zeroA, scratch, 'allocAligned(len, out) must reuse out in place');
+  assert.deepEqual(
+    Object.keys(zeroA).sort(),
+    Object.keys(freshAligned).sort(),
+    'zero-alloc out object must match exact default return shape'
+  );
+  assert.equal(zeroA.dynamicOffset, 512);
+  assert.equal(zeroA.offset, 512);
+  assert.equal(zeroA.size, 20);
+  assert.equal(zeroA.paddedSize, 20);
+  assert.equal(zeroA.alignedSize, 256);
+  assert.equal(zeroA.overflow, false);
+  assert.equal(zeroA.isSpill, false);
+  assert.equal(zeroA.wrapped, false);
+  assert.equal(zeroA.sliceIndex, 0);
+  assert.ok(zeroA.shadow instanceof Uint8Array);
+
+  // Write bytes into zeroA and check zero-fill of alignment padding.
+  zeroA.shadow[zeroA.offset] = 0x5a;
+  zeroA.shadow[zeroA.offset + 19] = 0xa5;
+  assert.equal(zeroA.shadow[zeroA.offset + 20], 0);
+
+  const zeroB = ring.allocate(300, { out: scratch });
+  assert.equal(zeroB, scratch, 'allocate(len, { out }) must reuse out in place');
+  assert.equal(zeroB.dynamicOffset, 768);
+  assert.equal(zeroB.dynamicOffset % 256, 0);
+  assert.equal(zeroB.size, 300);
+  assert.equal(zeroB.paddedSize, 300);
+  assert.equal(zeroB.alignedSize, 512);
+
+  const zeroEmpty = ring.allocAligned(0, { allowEmpty: true, out: scratch });
+  assert.equal(zeroEmpty, scratch);
+  assert.equal(zeroEmpty.dynamicOffset, 1280);
+  assert.equal(zeroEmpty.size, 0);
+  assert.equal(zeroEmpty.paddedSize, 16);
+  assert.equal(zeroEmpty.alignedSize, 256);
+
+  // Passing null/undefined out falls back cleanly to default fresh return object without incrementing zeroAllocAllocs.
+  const freshNullOut = ring.allocAligned(16, null);
+  const freshOptNullOut = ring.allocate(16, { out: null });
+  assert.notEqual(freshNullOut, scratch);
+  assert.notEqual(freshOptNullOut, scratch);
+  assert.notEqual(freshNullOut, freshOptNullOut);
+  assert.equal(ring.getStats().zeroAllocAllocs, 3);
+
+  ring.flush();
+  ring.endFrame(0);
+
+  // Verify bytes landed accurately in GPU buffer.
+  assert.equal(zeroA.buffer._data[512], 0x5a);
+  assert.equal(zeroA.buffer._data[512 + 19], 0xa5);
+  assert.equal(zeroA.buffer._data[512 + 20], 0);
+
+  // 2. Sustained 30 FPS hot loop: 60 frames x 100 per-draw CBVs across 3-deep partitions with 1 scratch object.
+  ring.resetStats();
+  const initialBufCount = createdBuffers.length;
+  const writesBeforeLoop = queueWrites.length;
+  for (let frame = 1; frame <= 60; frame += 1) {
+    const fInfo = ring.beginFrame(frame);
+    for (let draw = 0; draw < 100; draw += 1) {
+      const res =
+        (draw & 1) === 0
+          ? ring.allocAligned(64, scratch)
+          : ring.allocate(64, { out: scratch });
+      assert.equal(res, scratch);
+      assert.equal(res.buffer, fInfo.buffer);
+      assert.equal(res.dynamicOffset, draw * 256);
+      assert.equal(res.dynamicOffset % 256, 0);
+      const u32Idx = res.offset >>> 2;
+      const u32View = new Uint32Array(res.shadow.buffer);
+      u32View[u32Idx] = frame;
+      u32View[u32Idx + 1] = draw;
+    }
+    const flushed = ring.flush();
+    assert.deepEqual(flushed, { uploadedBytes: 100 * 256, drawCount: 100 });
+    ring.endFrame(frame);
+  }
+
+  assert.equal(createdBuffers.length, initialBufCount, '60 steady-state frames must create 0 GPUBuffers');
+  assert.equal(queueWrites.length, writesBeforeLoop + 60, '1 writeBuffer per frame');
+
+  const loopStats = ring.getStats();
+  assert.equal(loopStats.framesInFlight, 3);
+  assert.equal(loopStats.partitionRotations, 60);
+  assert.equal(loopStats.zeroAllocAllocs, 6000);
+  assert.equal(loopStats.peakFrameBytes, 100 * 256);
+
+  // Spot-check the last 3 frames (58, 59, 60) still coexist intact in their 3 independent GPUBuffers!
+  for (const checkFrame of [58, 59, 60]) {
+    const slotBuf = createdBuffers[checkFrame % 3];
+    const gpuU32 = new Uint32Array(slotBuf._data.buffer);
+    assert.equal(gpuU32[0], checkFrame);
+    assert.equal(gpuU32[1], 0);
+    assert.equal(gpuU32[(99 * 256) >>> 2], checkFrame);
+    assert.equal(gpuU32[((99 * 256) >>> 2) + 1], 99);
+  }
+
+  // 3. Invalid `out` targets reject cleanly with TypeError across all scratch-capable methods.
+  ring.beginFrame(61);
+  assert.throws(() => ring.allocAligned(16, 'bad-out'), TypeError);
+  assert.throws(() => ring.allocAligned(16, { out: 123 }), TypeError);
+  assert.throws(() => ring.allocate(16, { out: 'bad-out' }), TypeError);
+  assert.throws(() => ring.pushConstants(new Uint32Array(4), { out: 42 }), TypeError);
+  assert.throws(() => ring.pushCbv(new Uint32Array(4), { out: false }), TypeError);
+  assert.throws(() => ring.writeStaged(0, new Uint32Array(4), { out: 'bad' }), TypeError);
+
+  // 4. Device minUniformBufferOffsetAlignment = 512 is honored by allocAligned().
+  const { device: dev512 } = createMockGpuDevice({
+    limits: { minUniformBufferOffsetAlignment: 512 },
+  });
+  const ring512 = new DynamicUniformRing({ device: dev512, byteSize: 2048, framesInFlight: 3 });
+  ring512.beginFrame(0);
+  const s512 = {};
+  ring512.allocAligned(32, s512);
+  assert.equal(s512.dynamicOffset, 0);
+  assert.equal(s512.alignedSize, 512);
+  ring512.allocAligned(32, s512);
+  assert.equal(s512.dynamicOffset, 512);
+  assert.equal(s512.alignedSize, 512);
+  ring512.destroy();
+
+  ring.destroy();
+  assert.throws(() => ring.allocAligned(16, scratch), /destroyed/i);
+});
+
+test('W314: 3-deep partitioning & zero-alloc allocAligned interoperate cleanly with W264 auto-shrink and resetStats()', () => {
+  const { device, createdBuffers } = createMockGpuDevice();
+  const ring = new DynamicUniformRing({
+    device,
+    byteSize: 1024,
+    minSlotBytes: 1024,
+    maxByteSize: 16384,
+    framesInFlight: 3,
+    shrinkAfterIdleFrames: 3,
+  });
+
+  const out = {};
+
+  // Frame 0: spike to 16384B (64 draws x 256B) via allocAligned(..., out).
+  ring.beginFrame(0);
+  for (let i = 0; i < 64; i += 1) {
+    const res = ring.allocAligned(64, out);
+    assert.equal(res, out);
+    assert.equal(res.dynamicOffset, i * 256);
+    new Uint32Array(res.shadow.buffer, res.offset, 1)[0] = i + 1;
+  }
+  ring.flush();
+  ring.endFrame(0);
+  assert.equal(ring.capacity, 16384);
+  assert.equal(ring.getStats().peakFrameBytes, 16384);
+  assert.equal(ring.getStats().zeroAllocAllocs, 64);
+
+  // Frames 1, 2, 3: 3 consecutive quiet frames (256B each) with beginFrame(f) / endFrame(f).
+  const largeSlotBuffers = [];
+  for (let f = 1; f <= 3; f += 1) {
+    const info = ring.beginFrame(f);
+    assert.equal(info.byteSize, 16384);
+    largeSlotBuffers.push(info.buffer);
+    ring.allocAligned(32, out);
+    ring.flush();
+    ring.endFrame(f);
+  }
+  assert.equal(ring.getStats().shrinkCount, 0);
+  assert.equal(ring.getStats().allocatedGpuBytes, 3 * 16384);
+
+  // Frame 4 (partition 1): W264 auto-shrink triggers! Partition 1 shrinks to 1024B while
+  // in-flight partitions 2 (Frame 2) and 0 (Frame 3) stay alive!
+  const f4 = ring.beginFrame(4);
+  assert.equal(f4.partitionIndex, 1);
+  assert.equal(f4.byteSize, 1024);
+  assert.equal(ring.capacity, 1024);
+  assert.equal(largeSlotBuffers[0].destroyCount, 1, 'recycled partition 1 buffer destroyed on shrink');
+  assert.equal(largeSlotBuffers[1].destroyCount, 0, 'in-flight partition 2 buffer stays alive');
+  assert.equal(largeSlotBuffers[2].destroyCount, 0, 'in-flight partition 0 buffer stays alive');
+  const a4 = ring.allocAligned(32, out);
+  assert.equal(a4.shadow.byteLength, 1024, 'recycled partition shadow slab also shrinks cleanly');
+  ring.flush();
+  ring.endFrame(4);
+
+  // Frames 5 & 6 rotate partitions 2 and 0 down to 1024B.
+  const f5 = ring.beginFrame(5);
+  assert.equal(f5.byteSize, 1024);
+  ring.allocAligned(32, out);
+  ring.flush();
+  ring.endFrame(5);
+
+  const f6 = ring.beginFrame(6);
+  assert.equal(f6.byteSize, 1024);
+  ring.allocAligned(32, out);
+  ring.flush();
+  ring.endFrame(6);
+
+  assert.equal(ring.getStats().allocatedGpuBytes, 3 * 1024);
+  assert.equal(ring.getStats().shrinkCount, 1);
+  assert.equal(ring.getStats().partitionRotations, 6);
+  assert.equal(ring.getStats().zeroAllocAllocs, 64 + 6);
+  assert.equal(ring.getStats().peakFrameBytes, 16384);
+
+  // resetStats() clears partitionRotations, zeroAllocAllocs, shrinkCount, and re-baselines peakFrameBytes!
+  ring.beginFrame(7); // empty frame (usedBytes === 0)
+  const afterReset = ring.resetStats();
+  assert.equal(afterReset.framesInFlight, 3);
+  assert.equal(afterReset.partitionRotations, 0);
+  assert.equal(afterReset.zeroAllocAllocs, 0);
+  assert.equal(afterReset.peakFrameBytes, 0);
+  assert.equal(afterReset.shrinkCount, 0);
+  assert.equal(afterReset.allocatedGpuBytes, 3 * 1024);
+  assert.equal(afterReset.peakVramBytes, 3 * 1024);
+
+  // Subsequent frame increments cleanly from zeroed baselines.
+  ring.allocAligned(48, out);
+  ring.flush();
+  ring.endFrame(7);
+  ring.beginFrame(8);
+  ring.allocAligned(48, out);
+  ring.flush();
+  ring.endFrame(8);
+
+  const postStats = ring.getStats();
+  assert.equal(postStats.framesInFlight, 3);
+  assert.equal(postStats.partitionRotations, 1);
+  assert.equal(postStats.zeroAllocAllocs, 2);
+  assert.equal(postStats.peakFrameBytes, 256);
+
+  // Classic-worker VM isolation holds with W314 exports & helpers.
+  const source = readFileSync(new URL('../web/workers/uniform_ring.js', import.meta.url), 'utf8');
+  const ctx = vm.createContext({ console });
+  ctx.self = ctx;
+  vm.runInContext(source, ctx, { filename: 'uniform_ring.js' });
+  vm.runInContext(
+    'const MIN_FRAMES_IN_FLIGHT = 0; const MAX_FRAMES_IN_FLIGHT = 0; const validateOutTarget = () => null;',
+    ctx
+  );
+  assert.equal(ctx.PlayGta6UniformRing.MIN_FRAMES_IN_FLIGHT, 1);
+  assert.equal(ctx.PlayGta6UniformRing.MAX_FRAMES_IN_FLIGHT, 4);
+
+  ring.destroy();
+  for (const buf of createdBuffers) {
+    assert.equal(buf.destroyCount, 1, `buffer ${buf.id} must be destroyed exactly once`);
+  }
 });
