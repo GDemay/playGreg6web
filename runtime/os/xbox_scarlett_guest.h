@@ -171,14 +171,40 @@ inline constexpr HResult kHrPending = static_cast<HResult>(0x8000000Au);
 inline constexpr HResult kHrAbort = static_cast<HResult>(0x80004004u);
 inline constexpr HResult kHrHandle = static_cast<HResult>(0x80070006u);
 
-inline constexpr uint64_t kDStorageOptionFormatMask = 0xFFu;
+// DSTORAGE_REQUEST_OPTIONS, public GDK layout:
+//   bit 0      ZlibDecompress
+//   bits 1-4   BcpackMode (BCPack: proprietary, no decoder here; such requests fail E_NOTIMPL)
+//   bit 21     DestinationIsPhysicalPages: `destination` is a guest array of physical page
+//              addresses (one per page of the destination) instead of a contiguous buffer
+//   bit 22     source is memory (not an IDStorageFile)
+// Any other bit set fails the request with E_NOTIMPL.
+inline constexpr uint64_t kDStorageOptionZlib = 1ull << 0;
+inline constexpr uint64_t kDStorageOptionBcpackShift = 1;
+inline constexpr uint64_t kDStorageOptionBcpackMask = 0xFull << kDStorageOptionBcpackShift;
+inline constexpr uint64_t kDStorageOptionDestinationIsPhysicalPages = 1ull << 21;
 inline constexpr uint64_t kDStorageOptionSourceMemory = 1ull << 22;
-// Bit 21: set by the title on zlib file requests (options 0x200001) of ttdb graphics/map pages
-// (4-64 KiB destinations, uncompressed size 0). The payloads inflate to exactly the destination
-// size, so the bit is accepted and ignored; before R40 these requests failed with E_NOTIMPL.
-inline constexpr uint64_t kDStorageOptionIgnoredFlag21 = 1ull << 21;
-inline constexpr uint32_t kDStorageFormatNone = 0;
-inline constexpr uint32_t kDStorageFormatZlib = 1;
+inline constexpr uint64_t kDStorageOptionKnownBits = kDStorageOptionZlib | kDStorageOptionBcpackMask |
+                                                     kDStorageOptionDestinationIsPhysicalPages |
+                                                     kDStorageOptionSourceMemory;
+
+struct DStorageOptions {
+    bool zlib = false;
+    uint32_t bcpack_mode = 0;  // 0: none
+    bool physical_pages = false;
+    bool source_memory = false;
+    uint64_t unknown_bits = 0;
+    bool compressed() const { return zlib || bcpack_mode != 0; }
+};
+
+constexpr DStorageOptions parse_dstorage_options(uint64_t options) {
+    DStorageOptions o;
+    o.zlib = (options & kDStorageOptionZlib) != 0;
+    o.bcpack_mode = static_cast<uint32_t>((options & kDStorageOptionBcpackMask) >> kDStorageOptionBcpackShift);
+    o.physical_pages = (options & kDStorageOptionDestinationIsPhysicalPages) != 0;
+    o.source_memory = (options & kDStorageOptionSourceMemory) != 0;
+    o.unknown_bits = options & ~kDStorageOptionKnownBits;
+    return o;
+}
 
 struct DStorageQueueDesc {
     uint64_t source_type;  // 0 file, 1 memory
@@ -264,7 +290,7 @@ struct DStorageStats {
     uint64_t decompressed_requests = 0;
     uint64_t submits = 0;             // explicit + automatic
     uint64_t live_queues = 0;
-    uint64_t flag21_requests = 0;     // requests carrying option bit 21 (accepted, ignored)
+    uint64_t physical_page_requests = 0;  // requests with DestinationIsPhysicalPages (option bit 21)
 };
 
 DStorageStats dstorage_stats();
