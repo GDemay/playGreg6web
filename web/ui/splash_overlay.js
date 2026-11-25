@@ -41,6 +41,8 @@
   const STAGE_NOT_STARTED = 'NOT_STARTED';
   const STYLE_ATTR = 'data-pg6-splash-style';
   const ROOT_CLASS = 'pg6-splash';
+  const REDUCED_MOTION_QUERY = '(prefers-reduced-motion: reduce)';
+  const SCRIPTED_INPUT_PRESET_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/i;
 
   const FALLBACK_SVG =
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360" role="img" aria-label="playgta6web">' +
@@ -98,7 +100,12 @@
     '__stream{opacity:0.85;}' +
     '.' +
     ROOT_CLASS +
-    '__stream[hidden],.pg6-splash__badge[hidden]{display:none!important;}' +
+    '__stream[hidden],.pg6-splash__badge[hidden],.pg6-splash__scripted[hidden]{display:none!important;}' +
+    '.' +
+    ROOT_CLASS +
+    '__scripted{align-self:flex-start;padding:0.2rem 0.55rem;border-radius:999px;' +
+    'background:rgba(109,179,255,0.16);border:1px solid rgba(109,179,255,0.4);' +
+    'color:#c8e3ff;font-size:0.74rem;letter-spacing:0.03em;line-height:1.25;}' +
     '.' +
     ROOT_CLASS +
     '__meta{display:flex;justify-content:space-between;gap:1rem;font-size:0.78rem;opacity:0.8;}' +
@@ -106,7 +113,36 @@
     ROOT_CLASS +
     '__badge{margin-top:0.15rem;padding:0.45rem 0.65rem;border-radius:0.4rem;' +
     'background:rgba(180,60,60,0.22);border:1px solid rgba(255,140,140,0.35);' +
-    'color:#ffc9c9;font-size:0.78rem;line-height:1.35;}';
+    'color:#ffc9c9;font-size:0.78rem;line-height:1.35;}' +
+    '@media (prefers-reduced-motion: reduce){.' +
+    ROOT_CLASS +
+    ',.' +
+    ROOT_CLASS +
+    '__bar-fill,.' +
+    ROOT_CLASS +
+    '__stream-fill{transition:none!important;}}';
+
+  /**
+   * Strictly validate a scripted-input preset identifier.
+   * Rejects paths, URLs, control characters, whitespace-containing text, and
+   * non-string values to `null`.
+   *
+   * @param {unknown} raw
+   * @returns {string|null}
+   */
+  function sanitizeScriptedInputPreset(raw) {
+    if (typeof raw !== 'string') {
+      return null;
+    }
+    const trimmed = raw.trim();
+    if (!trimmed || /[\x00-\x1F\x7F]/.test(trimmed)) {
+      return null;
+    }
+    if (!SCRIPTED_INPUT_PRESET_RE.test(trimmed)) {
+      return null;
+    }
+    return trimmed;
+  }
 
   function clampPct(value) {
     const n = typeof value === 'number' ? value : Number(value);
@@ -268,6 +304,10 @@
      * @param {(() => void)|null} [options.onDismiss]
      * @param {((fn: Function, ms: number) => any)} [options.setTimeout]
      * @param {((id: any) => void)} [options.clearTimeout]
+     * @param {(() => number)} [options.nowFn]
+     * @param {boolean} [options.reducedMotion]
+     * @param {((query: string) => { matches?: boolean } | null)} [options.matchMedia]
+     * @param {string|null} [options.scriptedInput]
      * @param {boolean} [options.autoMount=true]
      * @param {boolean} [options.visible=true]
      */
@@ -294,6 +334,23 @@
       }
       if (opts.clearTimeout !== undefined && typeof opts.clearTimeout !== 'function') {
         throw new TypeError('clearTimeout must be a function');
+      }
+      if (opts.nowFn !== undefined && opts.nowFn !== null && typeof opts.nowFn !== 'function') {
+        throw new TypeError('nowFn must be a function');
+      }
+      if (
+        opts.reducedMotion !== undefined &&
+        opts.reducedMotion !== null &&
+        typeof opts.reducedMotion !== 'boolean'
+      ) {
+        throw new TypeError('reducedMotion must be a boolean');
+      }
+      if (
+        opts.matchMedia !== undefined &&
+        opts.matchMedia !== null &&
+        typeof opts.matchMedia !== 'function'
+      ) {
+        throw new TypeError('matchMedia must be a function');
       }
 
       this._document = doc;
@@ -326,12 +383,20 @@
           : typeof clearTimeout === 'function'
             ? clearTimeout
             : () => {};
+      this._nowFn = typeof opts.nowFn === 'function' ? opts.nowFn : () => Date.now();
+      this._reducedMotionOverride =
+        typeof opts.reducedMotion === 'boolean' ? opts.reducedMotion : null;
+      this._matchMedia = typeof opts.matchMedia === 'function' ? opts.matchMedia : null;
 
       this._destroyed = false;
       this._visible = opts.visible !== false;
       this._dismissed = false;
       this._fading = false;
       this._fadeTimer = null;
+      this._dismissedAtMs = null;
+      this._dismissCount = 0;
+      this._fadeDurationMs = null;
+      this._scriptedInputPreset = sanitizeScriptedInputPreset(opts.scriptedInput);
       this._imageFailed = false;
       this._usingFallback = this._splashImageUrl === null;
       this._progressPct = 0;
@@ -360,6 +425,41 @@
       this._syncChrome();
     }
 
+    _safeNow() {
+      try {
+        const value = this._nowFn();
+        if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
+          return value;
+        }
+      } catch {
+        // Faulty injected clocks must never throw out of the overlay.
+      }
+      return 0;
+    }
+
+    _isReducedMotion() {
+      if (this._reducedMotionOverride !== null) {
+        return this._reducedMotionOverride;
+      }
+      let mediaFn = this._matchMedia;
+      if (!mediaFn && this._document && this._document.defaultView && typeof this._document.defaultView.matchMedia === 'function') {
+        mediaFn = this._document.defaultView.matchMedia.bind(this._document.defaultView);
+      } else if (!mediaFn && typeof window !== 'undefined' && window && typeof window.matchMedia === 'function') {
+        mediaFn = window.matchMedia.bind(window);
+      } else if (!mediaFn && root && typeof root.matchMedia === 'function') {
+        mediaFn = root.matchMedia.bind(root);
+      }
+      if (!mediaFn) {
+        return false;
+      }
+      try {
+        const result = mediaFn(REDUCED_MOTION_QUERY);
+        return Boolean(result && result.matches);
+      } catch {
+        return false;
+      }
+    }
+
     _buildDom() {
       const doc = this._document;
       const root = createEl(doc, 'div', ROOT_CLASS, {
@@ -368,7 +468,8 @@
         'aria-atomic': 'true',
         'aria-busy': 'true',
       });
-      root.style.setProperty('--pg6-splash-fade', `${this._fadeMs}ms`);
+      const initialFadeMs = this._isReducedMotion() ? 0 : this._fadeMs;
+      root.style.setProperty('--pg6-splash-fade', `${initialFadeMs}ms`);
 
       const media = createEl(doc, 'div', `${ROOT_CLASS}__media`);
       const img = createEl(doc, 'img', `${ROOT_CLASS}__img`, {
@@ -381,6 +482,13 @@
       media.appendChild(fallback);
 
       const panel = createEl(doc, 'div', `${ROOT_CLASS}__panel`);
+      const scripted = createEl(doc, 'div', `${ROOT_CLASS}__scripted`, {
+        'aria-hidden': 'true',
+        'data-active': 'false',
+      });
+      scripted.hidden = true;
+      if (scripted.style) scripted.style.display = 'none';
+
       const stage = createEl(doc, 'div', `${ROOT_CLASS}__stage`);
       const bar = createEl(doc, 'div', `${ROOT_CLASS}__bar`, {
         role: 'progressbar',
@@ -405,6 +513,7 @@
       const badge = createEl(doc, 'div', `${ROOT_CLASS}__badge`);
       badge.hidden = true;
 
+      panel.appendChild(scripted);
       panel.appendChild(stage);
       panel.appendChild(bar);
       panel.appendChild(stream);
@@ -419,6 +528,7 @@
         media,
         img,
         fallback,
+        scripted,
         stage,
         bar,
         barFill,
@@ -439,6 +549,7 @@
           root: this._root,
           img: this._root.querySelector ? this._root.querySelector(`.${ROOT_CLASS}__img`) : null,
           fallback: this._root.querySelector ? this._root.querySelector(`.${ROOT_CLASS}__fallback`) : null,
+          scripted: this._root.querySelector ? this._root.querySelector(`.${ROOT_CLASS}__scripted`) : null,
           stage: this._root.querySelector ? this._root.querySelector(`.${ROOT_CLASS}__stage`) : null,
           bar: this._root.querySelector ? this._root.querySelector(`.${ROOT_CLASS}__bar`) : null,
           barFill: this._root.querySelector ? this._root.querySelector(`.${ROOT_CLASS}__bar-fill`) : null,
@@ -573,6 +684,30 @@
         }
       }
 
+      if (els.scripted) {
+        try {
+          if (this._scriptedInputPreset) {
+            els.scripted.hidden = false;
+            if (els.scripted.style) els.scripted.style.display = '';
+            els.scripted.textContent = `Scripted input: ${this._scriptedInputPreset}`;
+            els.scripted.setAttribute('aria-hidden', 'false');
+            els.scripted.setAttribute('data-active', 'true');
+            els.scripted.setAttribute('data-preset', this._scriptedInputPreset);
+          } else {
+            els.scripted.hidden = true;
+            if (els.scripted.style) els.scripted.style.display = 'none';
+            els.scripted.textContent = '';
+            els.scripted.setAttribute('aria-hidden', 'true');
+            els.scripted.setAttribute('data-active', 'false');
+            if (typeof els.scripted.removeAttribute === 'function') {
+              els.scripted.removeAttribute('data-preset');
+            }
+          }
+        } catch {
+          // Scripted-input pill updates must never throw.
+        }
+      }
+
       if (this._root) {
         try {
           this._root.setAttribute('aria-busy', this._dismissed || this._readyForSplash ? 'false' : 'true');
@@ -673,12 +808,47 @@
     }
 
     /**
+     * Set or clear the optional scripted-input indicator pill. Strictly sanitizes
+     * the preset identifier against `/^[a-z0-9][a-z0-9_-]{0,31}$/i` (invalid values
+     * and `null`/`undefined` clear and hide the pill).
+     *
+     * @param {string|null|undefined} presetOrNull
+     * @returns {object} Current controller state.
+     */
+    setScriptedInput(presetOrNull) {
+      if (this._destroyed) {
+        return this.getState();
+      }
+      this._scriptedInputPreset = sanitizeScriptedInputPreset(presetOrNull);
+      this._syncChrome();
+      return this.getState();
+    }
+
+    _completeDismiss(effectiveFadeMs, startedAtMs) {
+      const completedAtMs = this._safeNow();
+      let fadeDurationMs = 0;
+      if (effectiveFadeMs > 0) {
+        const measured = completedAtMs - startedAtMs;
+        fadeDurationMs = Number.isFinite(measured) && measured > 0 ? measured : effectiveFadeMs;
+      }
+      this._dismissedAtMs = completedAtMs;
+      this._dismissCount += 1;
+      this._fadeDurationMs = fadeDurationMs;
+      this._fading = false;
+      this._applyVisibility(false);
+      this._fireDismiss();
+    }
+
+    /**
      * Signal that the first WebGPU / Bink frame has been presented and start the dismiss fade.
      *
-     * @param {{ fadeMs?: number }} [options]
+     * @param {{ fadeMs?: number, reducedMotion?: boolean }} [options]
      * @returns {object}
      */
     onFirstPresent(options) {
+      if (this._destroyed) {
+        return this.getState();
+      }
       this._readyForSplash = true;
       this._stage = 'FIRST_PRESENT';
       this._stageLabel = labelForStage(this._stage);
@@ -690,8 +860,10 @@
 
     /**
      * Smoothly cross-fade the overlay out, then hide it. Idempotent.
+     * Honors `prefers-reduced-motion` (or `reducedMotion: true`) by skipping
+     * transition delay and hiding immediately.
      *
-     * @param {{ fadeMs?: number }} [options]
+     * @param {{ fadeMs?: number, reducedMotion?: boolean }} [options]
      * @returns {object}
      */
     dismiss(options = {}) {
@@ -702,17 +874,23 @@
         return this.getState();
       }
 
-      const fadeMs =
+      const requestedFadeMs =
         options && typeof options === 'object' && typeof options.fadeMs === 'number' && Number.isFinite(options.fadeMs)
           ? Math.max(0, options.fadeMs)
           : this._fadeMs;
+      const reducedMotion =
+        options && typeof options === 'object' && typeof options.reducedMotion === 'boolean'
+          ? options.reducedMotion
+          : this._isReducedMotion();
+      const effectiveFadeMs = reducedMotion ? 0 : requestedFadeMs;
+      const startedAtMs = this._safeNow();
 
       this._dismissed = true;
       this._clearFadeTimer();
 
       if (this._root) {
         try {
-          this._root.style && this._root.style.setProperty('--pg6-splash-fade', `${fadeMs}ms`);
+          this._root.style && this._root.style.setProperty('--pg6-splash-fade', `${effectiveFadeMs}ms`);
           if (this._root.classList && typeof this._root.classList.add === 'function') {
             this._root.classList.add('pg6-splash--fading');
           } else if (typeof this._root.className === 'string') {
@@ -724,20 +902,19 @@
         }
       }
 
-      if (fadeMs <= 0) {
-        this._fading = false;
-        this._applyVisibility(false);
-        this._fireDismiss();
+      if (effectiveFadeMs <= 0) {
+        this._completeDismiss(0, startedAtMs);
         return this.getState();
       }
 
       this._fading = true;
       this._fadeTimer = this._setTimeout(() => {
         this._fadeTimer = null;
-        this._fading = false;
-        this._applyVisibility(false);
-        this._fireDismiss();
-      }, fadeMs);
+        if (this._destroyed) {
+          return;
+        }
+        this._completeDismiss(effectiveFadeMs, startedAtMs);
+      }, effectiveFadeMs);
 
       return this.getState();
     }
@@ -762,6 +939,41 @@
       return this.getState();
     }
 
+    /**
+     * Return a sanitized, JSON-safe telemetry snapshot of overlay visibility,
+     * dismissal timing/counts, reduced-motion state, and scripted-input preset.
+     *
+     * @returns {object}
+     */
+    getStats() {
+      return {
+        visible: Boolean(this._visible),
+        dismissed: Boolean(this._dismissed),
+        fading: Boolean(this._fading),
+        destroyed: Boolean(this._destroyed),
+        dismissedAtMs:
+          typeof this._dismissedAtMs === 'number' && Number.isFinite(this._dismissedAtMs) && this._dismissedAtMs >= 0
+            ? this._dismissedAtMs
+            : null,
+        dismissCount:
+          typeof this._dismissCount === 'number' && Number.isFinite(this._dismissCount) && this._dismissCount >= 0
+            ? Math.floor(this._dismissCount)
+            : 0,
+        fadeDurationMs:
+          typeof this._fadeDurationMs === 'number' &&
+          Number.isFinite(this._fadeDurationMs) &&
+          this._fadeDurationMs >= 0
+            ? this._fadeDurationMs
+            : null,
+        fadeMs: this._fadeMs,
+        reducedMotion: this._isReducedMotion(),
+        stage: this._stage,
+        progressPct: Math.round(clampPct(this._progressPct)),
+        readyForSplash: Boolean(this._readyForSplash),
+        scriptedInputPreset: this._scriptedInputPreset,
+      };
+    }
+
     /** @returns {object} */
     getState() {
       return {
@@ -783,6 +995,11 @@
         usingFallback: this._usingFallback,
         imageFailed: this._imageFailed,
         fadeMs: this._fadeMs,
+        dismissedAtMs: this._dismissedAtMs,
+        dismissCount: this._dismissCount,
+        fadeDurationMs: this._fadeDurationMs,
+        reducedMotion: this._isReducedMotion(),
+        scriptedInputPreset: this._scriptedInputPreset,
         root: this._root,
       };
     }
@@ -827,8 +1044,10 @@
     BOOT_STAGE_ORDER,
     BOOT_STAGE_LABELS,
     computeBootProgress,
+    sanitizeScriptedInputPreset,
     SplashOverlayController,
     DEFAULT_FADE_MS,
+    REDUCED_MOTION_QUERY,
   };
 
   if (typeof globalThis !== 'undefined') {
