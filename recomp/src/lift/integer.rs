@@ -7,7 +7,7 @@
 use iced_x86::{Code, Instruction, Mnemonic, OpKind, Register};
 
 use super::{Flag, FunctionLifter, R, RBP, RSP, imm, unsupported};
-use crate::lift::{GUEST_STATE_TYPE, RuntimeHelper, Support};
+use crate::lift::{RuntimeHelper, Support};
 
 pub(super) const RAX: usize = 0;
 pub(super) const RCX: usize = 1;
@@ -167,9 +167,7 @@ impl FunctionLifter<'_> {
     /// DF is not cached in an alloca: it lives only in the guest state (it changes rarely and
     /// is read only by string instructions and `pushfq`).
     fn df_ptr(&mut self) -> String {
-        self.val(&format!(
-            "getelementptr inbounds {GUEST_STATE_TYPE}, ptr %state, i64 0, i32 2, i64 {DF_INDEX}"
-        ))
+        self.state_ptr(2, Some(DF_INDEX as usize))
     }
 
     /// Loads DF as an `i1`.

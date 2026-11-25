@@ -54,7 +54,7 @@ use std::fmt::Write as _;
 
 use super::memory_access::UNLIKELY;
 use super::{FunctionLifter, block_label, imm};
-use crate::lift::{GUEST_STATE_TYPE, HELPER_TRAP};
+use crate::lift::HELPER_TRAP;
 
 /// Field indices of `%playgta6.GuestState` (see `GUEST_STATE_TYPE` in the parent module).
 const FIELD_GPR: u32 = 0;
@@ -80,9 +80,7 @@ impl FunctionLifter<'_> {
     /// block ends and lifting continues in a fresh block on the normal path.
     pub(super) fn guest_call(&mut self, call_text: &str) {
         self.emit(call_text);
-        let ptr = self.val(&format!(
-            "getelementptr inbounds {GUEST_STATE_TYPE}, ptr %state, i64 0, i32 {FIELD_UNWIND_PENDING}"
-        ));
+        let ptr = self.state_ptr(FIELD_UNWIND_PENDING, None);
         let pending = self.val(&format!("load i8, ptr {ptr}"));
         let taken = self.val(&format!("icmp ne i8 {pending}, 0"));
         let next = self.new_label("after_call");
@@ -98,9 +96,7 @@ impl FunctionLifter<'_> {
         if self.unwind_sites == 0 || !self.has_resume_targets() {
             return;
         }
-        let ptr = self.val(&format!(
-            "getelementptr inbounds {GUEST_STATE_TYPE}, ptr %state, i64 0, i32 {FIELD_GPR}, i64 {RSP}"
-        ));
+        let ptr = self.state_ptr(FIELD_GPR, Some(RSP as usize));
         self.emit(&format!("{ENTRY_RSP} = load i64, ptr {ptr}"));
     }
 
@@ -114,9 +110,7 @@ impl FunctionLifter<'_> {
             self.emit("ret void");
             return;
         }
-        let rsp_ptr = self.val(&format!(
-            "getelementptr inbounds {GUEST_STATE_TYPE}, ptr %state, i64 0, i32 {FIELD_GPR}, i64 {RSP}"
-        ));
+        let rsp_ptr = self.state_ptr(FIELD_GPR, Some(RSP as usize));
         let restored_rsp = self.val(&format!("load i64, ptr {rsp_ptr}"));
         let owner = self.val(&format!("icmp ugt i64 {ENTRY_RSP}, {restored_rsp}"));
         self.emit(&format!(
@@ -126,14 +120,10 @@ impl FunctionLifter<'_> {
         self.emit("ret void");
 
         self.start_block("resume");
-        let pending = self.val(&format!(
-            "getelementptr inbounds {GUEST_STATE_TYPE}, ptr %state, i64 0, i32 {FIELD_UNWIND_PENDING}"
-        ));
+        let pending = self.state_ptr(FIELD_UNWIND_PENDING, None);
         self.emit(&format!("store i8 0, ptr {pending}"));
         self.sync_in();
-        let rip_ptr = self.val(&format!(
-            "getelementptr inbounds {GUEST_STATE_TYPE}, ptr %state, i64 0, i32 {FIELD_RESUME_RIP}"
-        ));
+        let rip_ptr = self.state_ptr(FIELD_RESUME_RIP, None);
         let rip = self.val(&format!("load i64, ptr {rip_ptr}"));
         let mut arms = String::new();
         let targets: Vec<u64> = self

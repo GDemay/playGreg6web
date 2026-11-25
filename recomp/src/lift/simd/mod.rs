@@ -104,7 +104,7 @@ use std::fmt::Write as _;
 
 use iced_x86::{EncodingKind, Instruction, Mnemonic, OpKind, Register};
 
-use super::super::{GUEST_STATE_TYPE, Support};
+use super::super::Support;
 use super::{ColdTrapKind, FunctionLifter, R, imm, unsupported};
 
 /// Canonical type of an XMM register value (allocas and guest state slots).
@@ -487,9 +487,7 @@ impl FunctionLifter<'_> {
 
     /// Pointer to slot `idx` of state field 5 (`xmm`) or 6 (`ymm_hi`).
     fn state_vec_ptr(&mut self, field: u32, idx: usize) -> String {
-        self.val(&format!(
-            "getelementptr inbounds {GUEST_STATE_TYPE}, ptr %state, i64 0, i32 {field}, i64 {idx}"
-        ))
+        self.state_ptr(field, Some(idx))
     }
 
     fn vec_slots(&self) -> Vec<(u32, usize, String)> {
@@ -949,9 +947,7 @@ impl FunctionLifter<'_> {
     }
 
     fn state_mxcsr_ptr(&mut self) -> String {
-        self.val(&format!(
-            "getelementptr inbounds {GUEST_STATE_TYPE}, ptr %state, i64 0, i32 7"
-        ))
+        self.state_ptr(7, None)
     }
 
     /// `ldmxcsr m32`: stores the value in the guest state; only the default rounding mode is

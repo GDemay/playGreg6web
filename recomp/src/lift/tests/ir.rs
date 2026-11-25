@@ -241,7 +241,7 @@ fn calls_push_return_addresses_and_sync_state() {
         .find("call void @sub_5000(ptr %state)")
         .expect("call");
     let after = &lifted.ir[call_at..];
-    assert!(before.rfind("store i64").is_some() && after.contains("load i64, ptr %t"));
+    assert!(before.rfind("store i64").is_some() && after.contains("load i64, ptr %state.gpr"));
     assert_eq!(lifted.callees.iter().copied().collect::<Vec<_>>(), [0x5000]);
 }
 
@@ -625,7 +625,7 @@ fn flags_overwritten_before_any_reader_are_not_materialised() {
     assert!(!ir.contains("@__playgta6_umul128("), "{ir}");
     // Every flag still reaches the state at the return.
     for flag in 0..6 {
-        assert!(ir.contains(&format!("i32 2, i64 {flag}\n")), "{ir}");
+        assert!(ir.contains(&format!("ptr %state.flag{flag}\n")), "{ir}");
     }
 }
 
@@ -658,7 +658,46 @@ fn register_and_flag_allocas_are_forwarded_within_a_block() {
     assert_eq!(stores("rsp"), 1, "{ir}");
     assert_eq!(flag_stores(&body, "cf"), 1, "{ir}");
     // The final values still reach the state.
-    assert!(ir.contains("i32 0, i64 0\n"), "{ir}");
+    assert!(ir.contains("ptr %state.gpr0\n"), "{ir}");
+}
+
+#[test]
+fn state_pointers_are_computed_once_in_the_entry_block() {
+    // Two exits (ret and a tail jump) and a call: every one stores rax and the flags.
+    let program = Program::new()
+        .asm(0x1000, |a| {
+            let mut out = a.create_label();
+            a.add(rax, rcx)?;
+            a.call(0x5000)?;
+            a.test(rax, rax)?;
+            a.jne(out)?;
+            a.ret()?;
+            a.set_label(&mut out)?;
+            a.jmp(0x6000)
+        })
+        .asm(0x5000, |a| a.ret())
+        .asm(0x6000, |a| a.ret());
+    let lifted = lift_function(&program.function(0x1000)).expect("lifts");
+    let ir = &lifted.ir;
+    let entry_end = ir.find("\nbb_1000:").expect("first block");
+    for slot in ["gpr0", "gpr4", "flag0"] {
+        let def = format!("  %state.{slot} = getelementptr inbounds ");
+        // Defined exactly once, in `entry:`, and used by the later blocks.
+        assert_eq!(ir.matches(&def).count(), 1, "{slot}:\n{ir}");
+        assert!(ir.find(&def).unwrap() < entry_end, "{slot}:\n{ir}");
+        assert!(
+            ir[entry_end..]
+                .matches(&format!("ptr %state.{slot}\n"))
+                .count()
+                >= 2,
+            "{slot}:\n{ir}"
+        );
+    }
+    // No other state `getelementptr` remains in the lifted blocks.
+    assert!(
+        !ir[entry_end..].contains("getelementptr inbounds %playgta6.GuestState"),
+        "{ir}"
+    );
 }
 
 #[test]

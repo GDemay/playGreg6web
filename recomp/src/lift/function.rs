@@ -339,6 +339,7 @@ pub(super) fn lift(
         share_ret: return_blocks > 1,
         has_shared_ret: false,
         unwind_sites: 0,
+        state_ptrs: BTreeMap::new(),
         flag_summaries,
         dead_after: flag_liveness::dead_after(func, flag_summaries),
         dead_flags: 0,
@@ -478,6 +479,9 @@ struct FunctionLifter<'a> {
     has_shared_ret: bool,
     /// Calls followed by a resume-protocol check (see `unwind`).
     unwind_sites: u32,
+    /// Pointers into `%state` the function uses (name -> `getelementptr` text). Each is defined
+    /// once at the top of `entry:` (which dominates every block) instead of per use.
+    state_ptrs: BTreeMap<String, String>,
     /// Flags each known direct callee may observe on entry and the state it may touch
     /// (`flag_liveness`); without it every call and tail jump stores every tracked flag and
     /// register and every call reloads them.
@@ -739,6 +743,10 @@ impl FunctionLifter<'_> {
             );
             self.emit(&line);
         }
+        // Every state pointer the function uses, including the entry loads' just above.
+        for (name, gep) in &self.state_ptrs {
+            let _ = writeln!(ir, "  {name} = {gep}");
+        }
         ir.push_str(&std::mem::take(&mut self.body));
         // A loop can also span functions (tail jumps from one to the next and back). Once LLVM
         // inlines the callee, the self tail call becomes a loop whose head is this entry, so
@@ -930,17 +938,33 @@ impl FunctionLifter<'_> {
 
     // ----- guest state ---------------------------------------------------------------------------
 
+    /// Pointer to `%state` field `field` (element `idx` of it when given), named after the slot
+    /// (`%state.gpr3`, `%state.flag0`, `%state.xmm5`, `%state.f7`, ...). The `getelementptr` is
+    /// emitted once at the top of `entry:` by [`Self::finish`], so every use shares it.
+    pub(super) fn state_ptr(&mut self, field: u32, idx: Option<usize>) -> String {
+        let name = match (field, idx) {
+            (0, Some(i)) => format!("%state.gpr{i}"),
+            (2, Some(i)) => format!("%state.flag{i}"),
+            (5, Some(i)) => format!("%state.xmm{i}"),
+            (6, Some(i)) => format!("%state.ymmh{i}"),
+            (f, Some(i)) => format!("%state.f{f}.{i}"),
+            (f, None) => format!("%state.f{f}"),
+        };
+        self.state_ptrs.entry(name.clone()).or_insert_with(|| {
+            let elem = idx.map_or(String::new(), |i| format!(", i64 {i}"));
+            format!(
+                "getelementptr inbounds {GUEST_STATE_TYPE}, ptr %state, i64 0, i32 {field}{elem}"
+            )
+        });
+        name
+    }
+
     fn state_gpr_ptr(&mut self, idx: usize) -> String {
-        self.val(&format!(
-            "getelementptr inbounds {GUEST_STATE_TYPE}, ptr %state, i64 0, i32 0, i64 {idx}"
-        ))
+        self.state_ptr(0, Some(idx))
     }
 
     fn state_flag_ptr(&mut self, flag: Flag) -> String {
-        self.val(&format!(
-            "getelementptr inbounds {GUEST_STATE_TYPE}, ptr %state, i64 0, i32 2, i64 {}",
-            flag as usize
-        ))
+        self.state_ptr(2, Some(flag as usize))
     }
 
     /// Loads all tracked registers and flags from `%state` into their allocas.
@@ -1018,9 +1042,7 @@ impl FunctionLifter<'_> {
     }
 
     fn segment_base(&mut self, field: u32) -> String {
-        let ptr = self.val(&format!(
-            "getelementptr inbounds {GUEST_STATE_TYPE}, ptr %state, i64 0, i32 {field}"
-        ));
+        let ptr = self.state_ptr(field, None);
         self.val(&format!("load i64, ptr {ptr}"))
     }
 
