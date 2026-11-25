@@ -5477,6 +5477,25 @@ void test_window_write_marks_flush() {
         mark = fx.captured.size();
         scene.execute({list});
         CHECK(!writes(mark).empty());
+        // O36: two buffers sharing a slot both see its mark within one flush (the flush takes the
+        // marks once and answers both from that).
+        const uint64_t buf2 = fx.create(scene.device, Slot2::CreatePlacedResourceX,
+                                        {I(G + 4 * k64K + 0x8000), I(put(buffer_desc(0x1000))), I(0), I(0)},
+                                        dg::IID_ID3D12Resource, &result);
+        CHECK(result == 0 && object_of<dg::Resource>(buf2)->cpu_address() == C + 4 * k64K + 0x8000);
+        const uint32_t id2 = object_of<dg::Resource>(buf2)->id();
+        scene.execute({list});  // buf2's first flush (everything compared)
+        CHECK(com::write_guest(C + 4 * k64K + 0x200, one));
+        CHECK(com::write_guest(C + 4 * k64K + 0x8010, two));
+        mark = fx.captured.size();
+        scene.execute({list});
+        CHECK((writes(mark) == std::vector<uint32_t>{0, 0x8000}));  // (the second buffer lies inside the first)
+        bool second_uploaded = false;
+        for (const Packet& p : packets_since(fx, mark)) {
+            second_uploaded |= p.opcode == GpuOpcode::WriteBuffer && payload_as<GpuWriteBufferPayload>(p).id == id2;
+        }
+        CHECK(second_uploaded);
+        fx.vcall(buf2, Slot::Release);
         fx.vcall(buf, Slot::Release);
         fx.vcall(list, Slot::Release);
         scene.release_all();

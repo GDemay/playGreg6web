@@ -151,6 +151,38 @@ bool take_written(uint64_t va, size_t len, std::vector<uint64_t>* slot_offsets) 
     return true;
 }
 
+void MarkPass::begin() {
+    if (++pass_ == 0) {  // wrapped: forget every earlier pass
+        std::fill(pass_of_.begin(), pass_of_.end(), 0u);
+        pass_ = 1;
+    }
+}
+
+bool MarkPass::take(uint64_t va, size_t len, std::vector<uint64_t>* slot_offsets) {
+    if (!translated(va) || len == 0) {
+        return false;
+    }
+    if (pass_of_.empty()) {
+        pass_of_.assign(kWindowSlots, 0u);
+        marked_.assign(kWindowSlots, 0u);
+    }
+    if (pass_ == 0) {
+        pass_ = 1;
+    }
+    const uint64_t last_va = std::min<uint64_t>(va + (len - 1), kWindowBase + kWindowMaxSize - 1);
+    for (uint64_t slot = slot_of(va); slot <= slot_of(last_va); ++slot) {
+        if (pass_of_[slot] != pass_) {
+            pass_of_[slot] = pass_;
+            marked_[slot] = mark(slot).exchange(0, std::memory_order_acq_rel) != 0 ? 1 : 0;
+        }
+        if (marked_[slot] != 0 && slot_offsets != nullptr) {
+            const uint64_t start = slot_va(slot);
+            slot_offsets->push_back(start > va ? start - va : 0);
+        }
+    }
+    return true;
+}
+
 uint64_t map_runtime_range(void* host, uint64_t bytes) {
     const auto h = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(host));
     if (!enabled() || host == nullptr || bytes == 0 || (h & (kSlotBytes - 1)) != 0 ||

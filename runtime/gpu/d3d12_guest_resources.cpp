@@ -877,10 +877,21 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
 }
 
 void Device::flush_cpu_buffers(CommandEncoder& encoder) {
+    std::lock_guard<std::mutex> flush_lock(flush_mutex_);
+    // O36: one pass over the translated window's write marks for the buffers and the relocated
+    // ranges below. A relocated range in the window whose slots are unmarked has not been written
+    // since its bytes were last read (the same protocol as the buffers: marks taken before the
+    // read), so it is not read and compared again.
+    mark_pass_.begin();
+    std::vector<uint64_t> marked;
+    auto unwritten = [&](uint64_t cpu, uint64_t size) {
+        marked.clear();
+        return mark_pass_.take(cpu, static_cast<size_t>(size), &marked) && marked.empty();
+    };
     {
         std::lock_guard<std::mutex> lock(tracked_mutex_);
         for (Resource* r : tracked_) {
-            r->flush_shadow(encoder);
+            r->flush_shadow(encoder, &mark_pass_);
         }
     }
     // Relocated uniform ranges: refresh the aligned copies whose guest bytes changed.
@@ -888,8 +899,12 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
         std::lock_guard<std::mutex> lock(relocation_mutex_);
         std::vector<uint8_t> bytes;
         for (auto& [key, r] : relocations_) {
+            const uint64_t cpu = cpu_address_for_gpu(r.va);
+            if (unwritten(cpu, r.size) && !r.shadow.empty()) {
+                continue;
+            }
             bytes.resize(static_cast<size_t>(r.size));  // only the view's bytes: the home past them stays zero
-            if (!com::read_guest(cpu_address_for_gpu(r.va), bytes.data(), bytes.size()) || bytes == r.shadow) {
+            if (!com::read_guest(cpu, bytes.data(), bytes.size()) || bytes == r.shadow) {
                 continue;
             }
             encoder.write_buffer(r.buffer_id, static_cast<uint32_t>(r.offset), bytes.data(), static_cast<uint32_t>(r.size));
@@ -903,8 +918,12 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
         std::vector<uint8_t> bytes;
         for (auto& [key, r] : storage_relocations_) {
             const uint64_t write_len = align_up(r.size, 4u);
+            const uint64_t cpu = cpu_address_for_gpu(r.va);
+            if (unwritten(cpu, r.size) && r.ever_uploaded) {
+                continue;
+            }
             bytes.resize(static_cast<size_t>(r.size));
-            if (!read_guest_best_effort(cpu_address_for_gpu(r.va), bytes.data(), bytes.size())) {
+            if (!read_guest_best_effort(cpu, bytes.data(), bytes.size())) {
                 continue;
             }
             const uint64_t hash = content_hash(bytes.data(), bytes.size());
@@ -928,8 +947,12 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
         std::lock_guard<std::mutex> lock(ia_relocation_mutex_);
         std::vector<uint8_t> bytes;
         for (auto& [key, r] : ia_relocations_) {
+            const uint64_t cpu = cpu_address_for_gpu(key.first);
+            if (unwritten(cpu, key.second)) {
+                continue;  // (uploaded when it was created)
+            }
             bytes.assign(static_cast<size_t>(key.second), 0);
-            if (!read_guest_best_effort(cpu_address_for_gpu(key.first), bytes.data(), bytes.size())) {
+            if (!read_guest_best_effort(cpu, bytes.data(), bytes.size())) {
                 continue;
             }
             const uint64_t hash = content_hash(bytes.data(), bytes.size());
@@ -1589,7 +1612,7 @@ void Resource::mark_back_buffer() {
     back_buffer_.store(true);
 }
 
-void Resource::flush_shadow(CommandEncoder& encoder) {
+void Resource::flush_shadow(CommandEncoder& encoder, os::guest_window::MarkPass* marks) {
     if (cpu_va_ == 0 || shadow_.empty()) {
         return;
     }
@@ -1632,7 +1655,8 @@ void Resource::flush_shadow(CommandEncoder& encoder) {
     bool window_candidates = false;
     if (!tracked && os::guest_window::translated(cpu_va_)) {
         std::vector<uint64_t> slots;
-        const bool marked = os::guest_window::take_written(cpu_va_, static_cast<size_t>(size), &slots);
+        const bool marked = marks != nullptr ? marks->take(cpu_va_, static_cast<size_t>(size), &slots)
+                                             : os::guest_window::take_written(cpu_va_, static_cast<size_t>(size), &slots);
         if (marked && window_marked_) {
             candidate.assign(static_cast<size_t>((size + kShadowPage - 1) / kShadowPage), false);
             for (uint64_t off : slots) {
@@ -1663,6 +1687,36 @@ void Resource::flush_shadow(CommandEncoder& encoder) {
             uploaded += n;
         }
     };
+    if (!candidate.empty() && !verify) {
+        // O36: only the listed pages (a buffer of 100k pages with a handful written costs a
+        // handful of comparisons, not a walk over every page).
+        uint64_t run_end = 0;
+        for (auto it = std::find(candidate.begin(), candidate.end(), true); it != candidate.end();
+             it = std::find(it + 1, candidate.end(), true)) {
+            const uint64_t page = static_cast<uint64_t>(it - candidate.begin()) * kShadowPage;
+            const uint64_t n = std::min(kShadowPage, size - page);
+            if (same_bytes(shadow_.data() + page, live + page, static_cast<size_t>(n))) {
+                continue;
+            }
+            if (in_run && run_end == page) {
+                run_end = page + n;
+                continue;
+            }
+            if (in_run) {
+                emit(run_start, run_end);
+            }
+            run_start = page;
+            run_end = page + n;
+            in_run = true;
+        }
+        if (in_run) {
+            emit(run_start, run_end);
+        }
+        if (uploaded != 0) {
+            device_->note_upload(uploaded);
+        }
+        return;
+    }
     for (uint64_t page = 0; page < size; page += kShadowPage) {
         const uint64_t n = std::min(kShadowPage, size - page);
         const bool listed = candidate.empty() || candidate[static_cast<size_t>(page / kShadowPage)];
