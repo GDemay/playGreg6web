@@ -126,7 +126,10 @@ if(EMSCRIPTEN AND NOT PLAYGTA6_WASM_TESTS)
         SUFFIX ".js"
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../web/dist"
     )
-    target_compile_options(runtime PRIVATE -pthread -sMEMORY64=1)
+    target_compile_options(runtime PRIVATE -pthread -sMEMORY64=1 -msimd128 -mbulk-memory)
+    if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+        target_link_options(runtime PRIVATE -sASSERTIONS=0 -sSAFE_HEAP=0)
+    endif()
     target_link_options(runtime PRIVATE
         -pthread
         -sMEMORY64=1
