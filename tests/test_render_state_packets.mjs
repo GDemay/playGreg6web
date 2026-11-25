@@ -5723,3 +5723,240 @@ test('W302 (#1218): 30 FPS draw-heavy multi-frame render-state stream replays th
   const stencilCalls = gpu.passCalls.filter((c) => c.op === 'setStencilReference').map((c) => c.args[0]);
   assert.deepEqual(stencilCalls, [1, 255]);
 });
+
+// ---------------------------------------------------------------------------------------------
+// W347: Coerce promoted 1D->2D LUT texture view dimensions in RenderStatePackets._textureView
+// ---------------------------------------------------------------------------------------------
+
+test('W347: _textureView & CreateBindGroup2 coerce dimension:1d views to 2d on promoted 4096x1 2D LUT textures (sampled + storage)', () => {
+  const gpu = createMockWebGpu();
+  const validationErrors = [];
+  const viewCalls = [];
+
+  // Strict WebGPU dimension / layer / mip validator mirroring Chrome Dawn validation rules.
+  const makeValidatedTexture = ({ width, height, depthOrArrayLayers = 1, mipLevelCount = 1, format = 'rgba8unorm', dimension = '2d', usage = 0x04 | 0x08 }) => {
+    const tex = {
+      kind: 'GPUTexture',
+      handle: 9000 + viewCalls.length,
+      width,
+      height,
+      depthOrArrayLayers,
+      mipLevelCount,
+      format,
+      dimension,
+      usage,
+      createView(vd) {
+        const descCopy = vd ? { ...vd } : undefined;
+        viewCalls.push({ texDim: dimension, texFormat: format, desc: descCopy });
+        const requestedDim = descCopy && descCopy.dimension ? descCopy.dimension : dimension;
+        if (dimension === '2d' && requestedDim === '1d') {
+          const msg = `The dimension (TextureViewDimension::e1D) of the texture view is not compatible with the dimension (TextureDimension::e2D) of [Texture (unlabeled ${width}x${height} px, TextureFormat::${format})].`;
+          validationErrors.push(msg);
+          throw new Error(msg);
+        }
+        if (dimension === '1d' && requestedDim !== '1d') {
+          const msg = `The dimension (${requestedDim}) of the texture view is not compatible with the dimension (TextureDimension::e1D).`;
+          validationErrors.push(msg);
+          throw new Error(msg);
+        }
+        if (descCopy) {
+          const baseLayer = descCopy.baseArrayLayer ?? 0;
+          const layerCount = descCopy.arrayLayerCount ?? 1;
+          if (baseLayer < 0 || layerCount < 1 || baseLayer + layerCount > depthOrArrayLayers) {
+            const msg = `Invalid array layer range [${baseLayer}, ${baseLayer + layerCount}) for depthOrArrayLayers=${depthOrArrayLayers}`;
+            validationErrors.push(msg);
+            throw new Error(msg);
+          }
+          const baseMip = descCopy.baseMipLevel ?? 0;
+          const mipCount = descCopy.mipLevelCount ?? (mipLevelCount - baseMip);
+          if (baseMip < 0 || mipCount < 1 || baseMip + mipCount > mipLevelCount) {
+            const msg = `Invalid mip range [${baseMip}, ${baseMip + mipCount}) for mipLevelCount=${mipLevelCount}`;
+            validationErrors.push(msg);
+            throw new Error(msg);
+          }
+        }
+        return { kind: 'GPUTextureView', textureHandle: tex.handle, viewDesc: descCopy };
+      },
+      destroy() {},
+    };
+    return tex;
+  };
+
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { format: 'rgba8unorm' });
+  const handler = installRenderStatePackets(processor);
+
+  // Texture 101: W341/W342 promoted 1D->2D LUT (4096x1 rgba8unorm, dimension:'2d', promoted1DTo2D:true)
+  const lutPromoted = makeValidatedTexture({
+    width: 4096,
+    height: 1,
+    depthOrArrayLayers: 1,
+    mipLevelCount: 1,
+    format: 'rgba8unorm',
+    dimension: '2d',
+    usage: 0x04 | 0x08, // TEXTURE_BINDING | STORAGE_BINDING
+  });
+  processor.textures.set(101, lutPromoted);
+  handler.textureMeta.set(101, {
+    id: 101,
+    requestedFormat: 'rgba8unorm',
+    format: 'rgba8unorm',
+    requestedDimension: '1d',
+    dimension: '2d',
+    promoted1DTo2D: true,
+    usage: 0x04 | 0x08,
+    sampleCount: 1,
+    width: 4096,
+    height: 1,
+    depthOrArrayLayers: 1,
+  });
+
+  // Texture 102: 4096x1 r32float promoted 2D texture without textureMeta (relies solely on texture.dimension === '2d')
+  const lutByTexDim = makeValidatedTexture({
+    width: 4096,
+    height: 1,
+    depthOrArrayLayers: 1,
+    mipLevelCount: 1,
+    format: 'r32float',
+    dimension: '2d',
+    usage: 0x04,
+  });
+  processor.textures.set(102, lutByTexDim);
+
+  // Texture 103: Multi-mip 2D storage texture (256x256, 4 mips) bound to storageTexture binding without explicit mipLevelCount
+  const multiMipStorageTex = makeValidatedTexture({
+    width: 256,
+    height: 256,
+    depthOrArrayLayers: 1,
+    mipLevelCount: 4,
+    format: 'rgba8unorm',
+    dimension: '2d',
+    usage: 0x04 | 0x08,
+  });
+  processor.textures.set(103, multiMipStorageTex);
+
+  const rgba8Code = formatCodeOf('rgba8unorm');
+  const r32fCode = formatCodeOf('r32float');
+
+  const bglEntries = [
+    { binding: 0, visibility: 4, type: 2, subtype: 0, dimension: 2 }, // texture_2d<f32>
+    { binding: 1, visibility: 4, type: 2, subtype: 1, dimension: 2 }, // unfilterable texture_2d<f32>
+    { binding: 4, visibility: 4, type: 3, subtype: 0, dimension: 2, storageFormat: rgba8Code }, // write-only rgba8unorm 2d
+    { binding: 5, visibility: 4, type: 3, subtype: 0, dimension: 2, storageFormat: rgba8Code }, // write-only rgba8unorm 2d (multi-mip)
+  ];
+
+  const stream = concat(
+    bindGroupLayoutPacket(300, bglEntries),
+    bindGroup2Packet(301, 300, [
+      // Exact Chrome crash scenario: 4096x1 promoted 2D RGBA8Unorm texture with CreateBindGroup2 viewDimension:'1d' (code 1)
+      { binding: 0, type: 1, id: 101, view: viewDesc({ format: rgba8Code, dimension: 1 }) },
+      // 4096x1 promoted 2D R32Float texture (no meta) with viewDimension:'1d' and out-of-range array layer
+      { binding: 1, type: 1, id: 102, view: viewDesc({ format: r32fCode, dimension: 1, baseLayer: 2, layerCount: 4 }) },
+      // Storage binding 4 on promoted 4096x1 2D LUT requesting dimension:'1d'
+      { binding: 4, type: 1, id: 101, view: viewDesc({ format: rgba8Code, dimension: 1 }) },
+      // Storage binding 5 on 4-mip 2D texture omitting mipLevelCount -> must force mipLevelCount: 1
+      { binding: 5, type: 1, id: 103, view: viewDesc({ format: rgba8Code, dimension: 2 }) },
+    ])
+  );
+
+  processor.executeCommandBuffer(stream);
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  assert.deepEqual(validationErrors, [], 'zero WebGPU validation errors must occur');
+
+  const [bg] = gpu.results('createBindGroup');
+  assert.ok(bg, 'bind group 301 must be created');
+
+  // Binding 0: coerced 1d -> 2d with baseArrayLayer:0, arrayLayerCount:1, mipLevelCount:1
+  assert.equal(bg.desc.entries[0].resource.viewDesc.dimension, '2d');
+  assert.equal(bg.desc.entries[0].resource.viewDesc.baseArrayLayer, 0);
+  assert.equal(bg.desc.entries[0].resource.viewDesc.arrayLayerCount, 1);
+  assert.equal(bg.desc.entries[0].resource.viewDesc.mipLevelCount, 1);
+
+  // Binding 1: coerced 1d -> 2d even without textureMeta, and sanitized invalid baseLayer/layerCount
+  assert.equal(bg.desc.entries[1].resource.viewDesc.dimension, '2d');
+  assert.equal(bg.desc.entries[1].resource.viewDesc.baseArrayLayer, 0);
+  assert.equal(bg.desc.entries[1].resource.viewDesc.arrayLayerCount, 1);
+  assert.equal(bg.desc.entries[1].resource.viewDesc.mipLevelCount, 1);
+
+  // Binding 4 (storageTexture on promoted 1D->2D): dimension:'2d' & mipLevelCount:1
+  assert.equal(bg.desc.entries[2].resource.viewDesc.dimension, '2d');
+  assert.equal(bg.desc.entries[2].resource.viewDesc.mipLevelCount, 1);
+
+  // Binding 5 (storageTexture on 4-mip 2D texture): mipLevelCount forced to 1
+  assert.equal(bg.desc.entries[3].resource.viewDesc.dimension, '2d');
+  assert.equal(bg.desc.entries[3].resource.viewDesc.mipLevelCount, 1);
+
+  // bindGroupDescriptors records coerced '2d' viewDimension so W97 auto-layout remapping matches texture_2d
+  const bgDesc = handler.bindGroupDescriptors.get(301);
+  assert.ok(bgDesc);
+  assert.equal(bgDesc.resources[0].viewDimension, '2d');
+  assert.equal(bgDesc.resources[1].viewDimension, '2d');
+  assert.equal(bgDesc.resources[2].viewDimension, '2d');
+});
+
+test('W347: reverse guard coerces non-1d view descriptors to dimension:1d on actual WebGPU 1D textures', () => {
+  const gpu = createMockWebGpu();
+  const viewCalls = [];
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { format: 'rgba8unorm' });
+  const handler = installRenderStatePackets(processor);
+
+  // Real WebGPU 1D texture (e.g. when promote1DTo2D: false)
+  const real1dTex = {
+    kind: 'GPUTexture',
+    handle: 9500,
+    width: 4096,
+    height: 1,
+    depthOrArrayLayers: 1,
+    mipLevelCount: 1,
+    format: 'rgba8unorm',
+    dimension: '1d',
+    usage: 0x04,
+    createView(vd) {
+      const copy = vd ? { ...vd } : undefined;
+      viewCalls.push(copy);
+      if (copy && copy.dimension && copy.dimension !== '1d') {
+        throw new Error(`WebGPU validation error: cannot create ${copy.dimension} view of 1d texture`);
+      }
+      if (copy && ((copy.baseArrayLayer ?? 0) !== 0 || (copy.arrayLayerCount ?? 1) !== 1)) {
+        throw new Error('WebGPU validation error: invalid array layers for 1d view');
+      }
+      if (copy && ((copy.baseMipLevel ?? 0) !== 0 || (copy.mipLevelCount ?? 1) !== 1)) {
+        throw new Error('WebGPU validation error: invalid mip levels for 1d view');
+      }
+      return { kind: 'GPUTextureView', textureHandle: 9500, viewDesc: copy };
+    },
+    destroy() {},
+  };
+  processor.textures.set(201, real1dTex);
+
+  const rgba8Code = formatCodeOf('rgba8unorm');
+  const stream = concat(
+    bindGroupLayoutPacket(400, [
+      { binding: 0, visibility: 4, type: 2, subtype: 0, dimension: 1 }, // texture_1d<f32>
+    ]),
+    bindGroup2Packet(401, 400, [
+      // Caller erroneously requests dimension:'2d' (code 2) with out-of-range mip/layer fields on a 1D texture
+      {
+        binding: 0,
+        type: 1,
+        id: 201,
+        view: viewDesc({ format: rgba8Code, dimension: 2, baseMip: 1, mipCount: 3, baseLayer: 2, layerCount: 4 }),
+      },
+    ])
+  );
+
+  processor.executeCommandBuffer(stream);
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  assert.equal(viewCalls.length, 1);
+  assert.deepEqual(viewCalls[0], {
+    format: 'rgba8unorm',
+    dimension: '1d',
+    baseMipLevel: 0,
+    mipLevelCount: 1,
+    baseArrayLayer: 0,
+    arrayLayerCount: 1,
+  });
+
+  const bgDesc = handler.bindGroupDescriptors.get(401);
+  assert.ok(bgDesc);
+  assert.equal(bgDesc.resources[0].viewDimension, '1d');
+});
