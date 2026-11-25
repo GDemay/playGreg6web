@@ -6,6 +6,8 @@
         [--runs-dir DIR] [--port PORT] [--duration-s N] [--headless | --headed]
         [--chrome PATH] [--trust-build] [--rebuild] [--no-build] [--dry-run]
         [--capture-frames] [--mp4] [--baseline NAME|DIR]
+        [--input-script PRESET] [--stream-shaders] [--stream-threshold-mb MB]
+        [--boot-options JSON|FILE] [--report-to-log] [--max-wall-ms MS]
 
 What it does, in order:
 
@@ -56,6 +58,7 @@ import base64
 import hashlib
 import http.client
 import json
+import math
 import os
 import re
 import select
@@ -71,7 +74,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -105,6 +108,29 @@ SERVER_READY_TIMEOUT_S = 15.0
 CDP_READY_TIMEOUT_S = 15.0
 
 COPY_CHUNK_BYTES = 256 * 1024
+
+ALLOWED_INPUT_SCRIPT_PRESETS: dict[str, str] = {
+    "start-screen": "start-screen",
+}
+_SAFE_INPUT_SCRIPT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+BOOT_OPTIONS_NAME = "boot-options.json"
+BOOT_OPTIONS_UINT_KEYS: frozenset[str] = frozenset(
+    {
+        "max_wall_ms",
+        "max_dispatches",
+        "arena_log_limit",
+        "import_trace_limit",
+    }
+)
+BOOT_OPTIONS_BOOL_KEYS: frozenset[str] = frozenset(
+    {
+        "report_to_log",
+        "verify_window_marks",
+    }
+)
+BOOT_OPTIONS_ALLOWED_KEYS: frozenset[str] = BOOT_OPTIONS_UINT_KEYS | BOOT_OPTIONS_BOOL_KEYS
+_UINT64_MAX = (1 << 64) - 1
 
 _UNC_BS_PATH_RE = re.compile(r"\\\\[^\s\"'<>|,;()\[\]]+")
 _UNC_FS_PATH_RE = re.compile(r"(?<!:)//[^\s\"'<>|,;()\[\]]+")
@@ -655,6 +681,288 @@ def stage_shader_pack(shader_pack: Path, stage_dir: Path) -> list[dict[str, Any]
     return staged
 
 
+def atomic_write_bytes(payload: bytes, dst: Path) -> None:
+    """Atomically write `payload` to `dst` via a same-directory temp file and `os.replace`."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_str = tempfile.mkstemp(prefix=f".{dst.name}.", suffix=".tmp", dir=dst.parent)
+    tmp_path = Path(tmp_str)
+    try:
+        with os.fdopen(fd, "wb") as dst_fh:
+            dst_fh.write(payload)
+            dst_fh.flush()
+        os.replace(tmp_path, dst)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+# ---------------------------------------------------------------------------
+# URL query options (--input-script, --stream-shaders, --stream-threshold-mb)
+# & validated boot-options.json staging
+# ---------------------------------------------------------------------------
+
+
+def sanitize_input_script_preset(raw: Any) -> str | None:
+    """Sanitize and canonicalize an input-script preset against the allowlist.
+
+    Matches `sanitizeInputScriptPreset` in `web/app_bootstrap.js`.
+    """
+    if not isinstance(raw, str):
+        return None
+    trimmed = raw.strip()
+    if not trimmed or len(trimmed) > 64 or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in trimmed):
+        return None
+    lower = trimmed.lower()
+    if not _SAFE_INPUT_SCRIPT_RE.match(lower):
+        return None
+    return ALLOWED_INPUT_SCRIPT_PRESETS.get(lower)
+
+
+def validate_input_script_preset(raw: str | None) -> str | None:
+    """Validate `--input-script`; returns None if unset or raises RunnerError if disallowed."""
+    if raw is None:
+        return None
+    cleaned = sanitize_input_script_preset(raw)
+    if cleaned is None:
+        allowed = ", ".join(sorted(ALLOWED_INPUT_SCRIPT_PRESETS.values()))
+        raise RunnerError(f"invalid --input-script {sanitize_text(str(raw))!r} (allowed: {allowed})")
+    return cleaned
+
+
+def validate_stream_threshold_mb(raw: float | int | None) -> float | None:
+    """Validate `--stream-threshold-mb` as a positive finite number."""
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise RunnerError("--stream-threshold-mb must be a positive finite number")
+    value = float(raw)
+    if not math.isfinite(value) or value <= 0.0:
+        raise RunnerError("--stream-threshold-mb must be a positive finite number")
+    return value
+
+
+def format_stream_threshold_mb(value: float) -> str:
+    """Format a positive finite MiB threshold as a plain decimal string (no exponent)."""
+    if value == int(value):
+        return str(int(value))
+    text = f"{value:.10f}".rstrip("0").rstrip(".")
+    if not text or text == "0":
+        text = f"{value:.16f}".rstrip("0").rstrip(".")
+    return text
+
+
+def build_target_url(
+    host: str,
+    port: int | str,
+    *,
+    smoke: bool = False,
+    input_script: str | None = None,
+    stream_shaders: bool = False,
+    stream_threshold_mb: float | None = None,
+) -> str:
+    """Construct the local browser boot URL with sanitized query parameters."""
+    params: list[tuple[str, str]] = []
+    if smoke:
+        params.append(("smoke", "1"))
+    clean_script = validate_input_script_preset(input_script)
+    if clean_script is not None:
+        params.append(("inputScript", clean_script))
+    if stream_shaders:
+        params.append(("streamShaders", "1"))
+    clean_threshold = validate_stream_threshold_mb(stream_threshold_mb)
+    if clean_threshold is not None:
+        params.append(("streamThresholdMb", format_stream_threshold_mb(clean_threshold)))
+    base = f"http://{host}:{port}/"
+    if not params:
+        return base
+    return f"{base}?{urlencode(params)}"
+
+
+def validate_boot_dir_safety(boot_dir: Path, repo_root: Path) -> None:
+    """Refuse writing `boot-options.json` into tracked repository directories."""
+    resolved_repo = repo_root.resolve()
+    resolved_boot = boot_dir.resolve()
+    if not resolved_boot.is_relative_to(resolved_repo):
+        return
+    allowed_roots = (
+        resolved_repo / "work",
+        resolved_repo / "local-data",
+    )
+    if any(resolved_boot.is_relative_to(allowed) for allowed in allowed_roots):
+        return
+    label = repo_relative_label(resolved_boot, resolved_repo) or "<repo>"
+    raise RunnerError(
+        f"refusing to write {BOOT_OPTIONS_NAME} into tracked repository directory '{label}' "
+        "(must be under work/, local-data/, or outside the repository)"
+    )
+
+
+def parse_and_validate_boot_options(
+    *,
+    boot_options: Mapping[str, Any] | str | Path | None = None,
+    report_to_log: bool = False,
+    max_wall_ms: int | None = None,
+    repo_root: Path = REPO_ROOT,
+) -> dict[str, Any] | None:
+    """Parse and schema-validate `--boot-options`, `--report-to-log`, and `--max-wall-ms`."""
+    if boot_options is None and not report_to_log and max_wall_ms is None:
+        return None
+
+    resolved_repo = repo_root.resolve()
+    raw_obj: Any = {}
+
+    if boot_options is not None:
+        if isinstance(boot_options, Mapping):
+            raw_obj = dict(boot_options)
+        elif isinstance(boot_options, Path):
+            try:
+                raw_text = boot_options.read_text(encoding="utf-8-sig")
+            except (OSError, UnicodeDecodeError) as exc:
+                raise RunnerError(
+                    f"failed to read boot-options file {basename_label(boot_options)}: {sanitize_text(str(exc))}"
+                ) from exc
+            try:
+                raw_obj = json.loads(raw_text)
+            except json.JSONDecodeError as exc:
+                raise RunnerError(
+                    f"invalid JSON in boot-options file {basename_label(boot_options)} "
+                    f"(line {exc.lineno}, col {exc.colno}): {exc.msg}"
+                ) from exc
+        elif isinstance(boot_options, str):
+            stripped = boot_options.strip()
+            if not stripped:
+                raise RunnerError("invalid --boot-options: value must be a JSON object or file path")
+            candidate_path = (
+                None
+                if stripped.startswith(("{", "[", '"'))
+                else resolve_against_repo(boot_options, resolved_repo)
+            )
+            looks_like_json = (
+                stripped.startswith(("{", "[", '"'))
+                or stripped in ("true", "false", "null")
+                or (
+                    stripped[0] in "-0123456789"
+                    and (candidate_path is None or not candidate_path.is_file())
+                )
+            )
+            if looks_like_json:
+                try:
+                    raw_obj = json.loads(stripped)
+                except json.JSONDecodeError as exc:
+                    raise RunnerError(
+                        f"invalid inline --boot-options JSON (line {exc.lineno}, col {exc.colno}): {exc.msg}"
+                    ) from exc
+            else:
+                options_path = candidate_path if candidate_path is not None else resolve_against_repo(boot_options, resolved_repo)
+                if not options_path.is_file():
+                    raise RunnerError(
+                        f"boot-options JSON file not found: {repo_relative_label(options_path, resolved_repo)}"
+                    )
+                try:
+                    raw_text = options_path.read_text(encoding="utf-8-sig")
+                except (OSError, UnicodeDecodeError) as exc:
+                    raise RunnerError(
+                        f"failed to read boot-options file {basename_label(options_path)}: {sanitize_text(str(exc))}"
+                    ) from exc
+                try:
+                    raw_obj = json.loads(raw_text)
+                except json.JSONDecodeError as exc:
+                    raise RunnerError(
+                        f"invalid JSON in boot-options file {basename_label(options_path)} "
+                        f"(line {exc.lineno}, col {exc.colno}): {exc.msg}"
+                    ) from exc
+        else:
+            raise RunnerError("invalid --boot-options: expected JSON object, JSON string, or file path")
+
+    if not isinstance(raw_obj, dict):
+        raise RunnerError("invalid boot-options: top-level JSON value must be an object")
+
+    validated: dict[str, Any] = {}
+    for raw_key, value in raw_obj.items():
+        key = str(raw_key)
+        if key not in BOOT_OPTIONS_ALLOWED_KEYS:
+            allowed = ", ".join(sorted(BOOT_OPTIONS_ALLOWED_KEYS))
+            raise RunnerError(
+                f"invalid boot-options: unsupported key '{sanitize_text(key)}' (allowed: {allowed})"
+            )
+        if key in BOOT_OPTIONS_UINT_KEYS:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > _UINT64_MAX:
+                raise RunnerError(f"invalid boot-options: '{key}' must be a non-negative uint64 integer")
+            validated[key] = int(value)
+        elif key in BOOT_OPTIONS_BOOL_KEYS:
+            if not isinstance(value, bool):
+                raise RunnerError(f"invalid boot-options: '{key}' must be a boolean")
+            validated[key] = value
+
+    if report_to_log:
+        validated["report_to_log"] = True
+
+    if max_wall_ms is not None:
+        if isinstance(max_wall_ms, bool) or not isinstance(max_wall_ms, int) or max_wall_ms < 0 or max_wall_ms > _UINT64_MAX:
+            raise RunnerError("--max-wall-ms must be a non-negative uint64 integer")
+        validated["max_wall_ms"] = int(max_wall_ms)
+
+    return {key: validated[key] for key in sorted(validated)}
+
+
+def serialize_boot_options(options: Mapping[str, Any]) -> bytes:
+    """Serialize validated boot options to deterministic UTF-8 JSON bytes."""
+    return (json.dumps(dict(options), indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def stage_boot_options_file(
+    options: Mapping[str, Any],
+    boot_dir: Path,
+    *,
+    repo_root: Path = REPO_ROOT,
+    dry_run: bool = False,
+    check_safety: bool = True,
+) -> dict[str, Any]:
+    """Validate target directory safety and atomically stage `boot-options.json`."""
+    if check_safety:
+        validate_boot_dir_safety(boot_dir, repo_root)
+
+    ordered = {key: options[key] for key in sorted(options)}
+    payload = serialize_boot_options(ordered)
+    digest_hex = hashlib.sha256(payload).hexdigest()
+    dst_file = boot_dir / BOOT_OPTIONS_NAME
+
+    needs_write = True
+    if dst_file.exists() and not dst_file.is_symlink() and dst_file.is_file():
+        try:
+            if dst_file.read_bytes() == payload:
+                needs_write = False
+        except OSError:
+            needs_write = True
+
+    if needs_write and not dry_run:
+        try:
+            atomic_write_bytes(payload, dst_file)
+        except OSError as exc:
+            raise RunnerError(f"failed to stage {BOOT_OPTIONS_NAME}: {sanitize_text(str(exc))}") from exc
+
+    if not needs_write:
+        action = "unchanged"
+        staged = True
+    elif dry_run:
+        action = "plan_write"
+        staged = False
+    else:
+        action = "written"
+        staged = True
+
+    return sanitize_value(
+        {
+            "filename": BOOT_OPTIONS_NAME,
+            "staged": staged,
+            "action": action,
+            "size_bytes": len(payload),
+            "sha256": digest_hex,
+            "options": ordered,
+        }
+    )
+
+
 # ---------------------------------------------------------------------------
 # Chrome / Chromium / Edge discovery
 # ---------------------------------------------------------------------------
@@ -1164,6 +1472,18 @@ TELEMETRY_PROBE_JS = r"""(() => {
       tracerSummary = JSON.parse(JSON.stringify(window.playgta6App.bootTracer.getSummary()));
     }
   } catch {}
+  let bootUrlOptions = null;
+  try {
+    if (window.playgta6App && window.playgta6App.bootUrlOptions && typeof window.playgta6App.bootUrlOptions === 'object') {
+      bootUrlOptions = JSON.parse(JSON.stringify(window.playgta6App.bootUrlOptions));
+    }
+  } catch {}
+  let inputScriptState = null;
+  try {
+    if (window.playgta6App && window.playgta6App.inputBridge && typeof window.playgta6App.inputBridge.getScriptState === 'function') {
+      inputScriptState = JSON.parse(JSON.stringify(window.playgta6App.inputBridge.getScriptState()));
+    }
+  } catch {}
   const hudLog = [];
   try {
     const logRoot = document.getElementById('hud-log');
@@ -1184,6 +1504,8 @@ TELEMETRY_PROBE_JS = r"""(() => {
     bootState,
     diagnostics,
     tracerSummary,
+    bootUrlOptions,
+    inputScriptState,
     hud: {
       stage: safeText('hud-boot-stage'),
       status: safeText('hud-status'),
@@ -1239,6 +1561,11 @@ class BrowserSessionResult:
     scripted_inputs_sent: int = 0
     mp4_path: str | None = None
     warnings: list[str] = field(default_factory=list)
+    target_url: str = ""
+    input_script: str | None = None
+    stream_shaders: bool = False
+    stream_threshold_mb: float | None = None
+    boot_options: dict[str, Any] | None = None
 
 
 def _format_console_event(params: Mapping[str, Any], elapsed_s: float) -> tuple[str, bool]:
@@ -1286,19 +1613,89 @@ def _extract_present_count(probe: Mapping[str, Any]) -> int:
     return max(candidates) if candidates else 0
 
 
-def _sample_present_record(probe: Mapping[str, Any], index: int, wall_ms: float) -> dict[str, Any]:
+def _extract_non_negative_int(*candidates: Any) -> int:
+    for val in candidates:
+        if isinstance(val, bool) or val is None:
+            continue
+        if isinstance(val, (int, float)) and math.isfinite(val) and val >= 0:
+            return int(val)
+    return 0
+
+
+def _extract_gpu_counts(probe: Mapping[str, Any]) -> dict[str, int]:
     boot_state = probe.get("bootState") if isinstance(probe.get("bootState"), Mapping) else {}
-    gpu = boot_state.get("gpu") if isinstance(boot_state.get("gpu"), Mapping) else boot_state
+    gpu = boot_state.get("gpu") if isinstance(boot_state.get("gpu"), Mapping) else {}
+    diag = probe.get("diagnostics") if isinstance(probe.get("diagnostics"), Mapping) else {}
+    return {
+        "realPackDrawCount": _extract_non_negative_int(
+            gpu.get("realPackDrawCount"),
+            boot_state.get("realPackDrawCount"),
+        ),
+        "fallbackDrawCount": _extract_non_negative_int(
+            gpu.get("fallbackDrawCount"),
+            boot_state.get("fallbackDrawCount"),
+        ),
+        "unboundBindGroupCount": _extract_non_negative_int(
+            gpu.get("unboundBindGroupCount"),
+            boot_state.get("unboundBindGroupCount"),
+        ),
+        "skippedDrawCount": _extract_non_negative_int(
+            gpu.get("skippedDrawCount"),
+            boot_state.get("skippedDrawCount"),
+        ),
+        "validationErrorCount": _extract_non_negative_int(
+            gpu.get("validationErrorCount"),
+            boot_state.get("validationErrorCount"),
+            diag.get("validationErrorCount"),
+        ),
+    }
+
+
+def _extract_input_script(
+    probe: Mapping[str, Any],
+    fallback_input_script: str | None = None,
+) -> str | None:
+    """Extract and sanitize active input-script preset from probe or CLI fallback."""
+    candidates: list[Any] = []
+    script_state = probe.get("inputScriptState")
+    if isinstance(script_state, Mapping) and script_state.get("active") is not False:
+        candidates.append(script_state.get("preset"))
+        candidates.append(script_state.get("name"))
+    boot_url_opts = probe.get("bootUrlOptions")
+    if isinstance(boot_url_opts, Mapping):
+        candidates.append(boot_url_opts.get("inputScript"))
+    boot_state = probe.get("bootState")
+    if isinstance(boot_state, Mapping):
+        candidates.append(boot_state.get("inputScript"))
+    diag = probe.get("diagnostics")
+    if isinstance(diag, Mapping):
+        candidates.append(diag.get("inputScript"))
+    href = probe.get("href")
+    if isinstance(href, str) and "?" in href:
+        parsed = urlsplit(href)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=False):
+            if key.lower() == "inputscript":
+                candidates.append(value)
+    candidates.append(fallback_input_script)
+    for raw in candidates:
+        cleaned = sanitize_input_script_preset(raw)
+        if cleaned is not None:
+            return cleaned
+    return None
+
+
+def _sample_present_record(probe: Mapping[str, Any], index: int, wall_ms: float) -> dict[str, Any]:
+    counts = _extract_gpu_counts(probe)
     return {
         "index": index,
         "wall_ms": round(wall_ms, 2),
         "dispatches": 0,
         "import_calls": 0,
         "counters": {
-            "draws_real_pack": int(gpu.get("realPackDrawCount") or 0),
-            "draws_fallback": int(gpu.get("fallbackDrawCount") or 0),
-            "draws_skipped": int(gpu.get("skippedDrawCount") or 0),
-            "gpu_validation_errors": int(gpu.get("validationErrorCount") or 0),
+            "draws_real_pack": counts["realPackDrawCount"],
+            "draws_fallback": counts["fallbackDrawCount"],
+            "draws_skipped": counts["skippedDrawCount"],
+            "gpu_validation_errors": counts["validationErrorCount"],
         },
     }
 
@@ -1353,6 +1750,10 @@ def run_browser_session(
     capture_frames: bool,
     frame_interval_s: float,
     encode_mp4: bool,
+    input_script: str | None = None,
+    stream_shaders: bool = False,
+    stream_threshold_mb: float | None = None,
+    boot_options: Mapping[str, Any] | None = None,
     runner: CommandRunner = run_command,
     popen_fn: Callable[..., Any] = subprocess.Popen,
     cdp_factory: Callable[[str], CdpClient] = CdpClient,
@@ -1364,15 +1765,40 @@ def run_browser_session(
     host = "127.0.0.1"
     server_port = port if port > 0 else find_free_port(host)
     cdp_port = find_free_port(host)
-    target_url = f"http://{host}:{server_port}/{'?smoke=1' if smoke else ''}"
+    clean_input_script = validate_input_script_preset(input_script)
+    clean_threshold_mb = validate_stream_threshold_mb(stream_threshold_mb)
+    target_url = build_target_url(
+        host,
+        server_port,
+        smoke=smoke,
+        input_script=clean_input_script,
+        stream_shaders=stream_shaders,
+        stream_threshold_mb=clean_threshold_mb,
+    )
 
     profile_dir = Path(tempfile.mkdtemp(prefix="playgta6-chrome-profile-"))
     smoke_boot_dir: Path | None = None
     if smoke:
         smoke_boot_dir = Path(tempfile.mkdtemp(prefix="playgta6-smoke-boot-"))
+        if boot_options is not None:
+            stage_boot_options_file(
+                boot_options,
+                smoke_boot_dir,
+                repo_root=repo,
+                dry_run=False,
+                check_safety=False,
+            )
         effective_boot_dir: Path | None = smoke_boot_dir
         effective_game_dir: Path | None = None
     else:
+        if boot_options is not None and boot_dir is not None:
+            stage_boot_options_file(
+                boot_options,
+                boot_dir,
+                repo_root=repo,
+                dry_run=False,
+                check_safety=True,
+            )
         effective_boot_dir = boot_dir
         effective_game_dir = game_dir
 
@@ -1396,7 +1822,13 @@ def run_browser_session(
         initial_url="about:blank",
     )
 
-    result = BrowserSessionResult()
+    result = BrowserSessionResult(
+        target_url=target_url,
+        input_script=clean_input_script,
+        stream_shaders=bool(stream_shaders or clean_threshold_mb is not None),
+        stream_threshold_mb=clean_threshold_mb,
+        boot_options=dict(boot_options) if boot_options is not None else None,
+    )
     server_proc: Any = None
     chrome_proc: Any = None
     cdp: CdpClient | None = None
@@ -1626,13 +2058,28 @@ def build_boot_report(
     *,
     smoke: bool,
     preset: str,
+    input_script: str | None = None,
+    stream_shaders: bool = False,
+    stream_threshold_mb: float | None = None,
+    boot_options: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a sanitized `playgta6-boot-report` v2 dict compatible with `compare_boot_reports.py`."""
     probe = session.final_probe if isinstance(session.final_probe, Mapping) else {}
     boot_state = probe.get("bootState") if isinstance(probe.get("bootState"), Mapping) else {}
-    gpu = boot_state.get("gpu") if isinstance(boot_state.get("gpu"), Mapping) else boot_state
+    gpu_counts = _extract_gpu_counts(probe)
     tracer = probe.get("tracerSummary") if isinstance(probe.get("tracerSummary"), Mapping) else {}
     hud = probe.get("hud") if isinstance(probe.get("hud"), Mapping) else {}
+    effective_input_script = _extract_input_script(
+        probe,
+        input_script if input_script is not None else session.input_script,
+    )
+    effective_stream_threshold_mb = (
+        stream_threshold_mb if stream_threshold_mb is not None else session.stream_threshold_mb
+    )
+    effective_stream_shaders = bool(
+        stream_shaders or session.stream_shaders or effective_stream_threshold_mb is not None
+    )
+    effective_boot_options = boot_options if boot_options is not None else session.boot_options
 
     milestones: list[dict[str, Any]] = []
     raw_milestones = tracer.get("milestones")
@@ -1688,6 +2135,17 @@ def build_boot_report(
         }
 
     console_errors = sum(1 for line in session.console_lines if "[console.error]" in line)
+    summary: dict[str, Any] = {
+        "realPackDrawCount": gpu_counts["realPackDrawCount"],
+        "fallbackDrawCount": gpu_counts["fallbackDrawCount"],
+        "validationErrorCount": gpu_counts["validationErrorCount"],
+        "inputScript": effective_input_script,
+    }
+    if effective_stream_shaders:
+        summary["streamShaders"] = True
+    if effective_stream_threshold_mb is not None:
+        summary["streamThresholdMb"] = effective_stream_threshold_mb
+
     report: dict[str, Any] = {
         "schema": REPORT_SCHEMA,
         "schema_version": REPORT_SCHEMA_VERSION,
@@ -1695,6 +2153,7 @@ def build_boot_report(
         "preset": preset,
         "mode": boot_mode,
         "smoke": bool(smoke),
+        "inputScript": effective_input_script,
         "status": status,
         "phase": phase,
         "exit_code": session.exit_code,
@@ -1708,14 +2167,15 @@ def build_boot_report(
             "import_calls": 0,
             "imports": [],
             "presents": present_count,
-            "real_pack_draws": int(gpu.get("realPackDrawCount") or 0),
-            "fallback_draws": int(gpu.get("fallbackDrawCount") or 0),
-            "unbound_bind_groups": int(gpu.get("unboundBindGroupCount") or 0),
-            "skipped_draws": int(gpu.get("skippedDrawCount") or 0),
-            "gpu_validation_errors": int(gpu.get("validationErrorCount") or 0),
+            "real_pack_draws": gpu_counts["realPackDrawCount"],
+            "fallback_draws": gpu_counts["fallbackDrawCount"],
+            "unbound_bind_groups": gpu_counts["unboundBindGroupCount"],
+            "skipped_draws": gpu_counts["skippedDrawCount"],
+            "gpu_validation_errors": gpu_counts["validationErrorCount"],
             "page_errors": len(session.page_errors),
             "console_errors": console_errors,
         },
+        "summary": summary,
         "address_space": {
             "failures": 0,
             "reserved_peak": 0,
@@ -1725,6 +2185,8 @@ def build_boot_report(
         "presents": list(session.presents),
         "first_present": first_present,
     }
+    if effective_boot_options is not None:
+        report["boot_options"] = dict(effective_boot_options)
     return sanitize_value(report)
 
 
@@ -1734,9 +2196,35 @@ def build_telemetry_payload(
     smoke: bool,
     preset: str,
     headless: bool,
+    input_script: str | None = None,
+    stream_shaders: bool = False,
+    stream_threshold_mb: float | None = None,
+    boot_options: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build sanitized `telemetry.json` artifact."""
     probe = session.final_probe if isinstance(session.final_probe, Mapping) else {}
+    gpu_counts = _extract_gpu_counts(probe)
+    effective_input_script = _extract_input_script(
+        probe,
+        input_script if input_script is not None else session.input_script,
+    )
+    effective_stream_threshold_mb = (
+        stream_threshold_mb if stream_threshold_mb is not None else session.stream_threshold_mb
+    )
+    effective_stream_shaders = bool(
+        stream_shaders or session.stream_shaders or effective_stream_threshold_mb is not None
+    )
+    effective_boot_options = boot_options if boot_options is not None else session.boot_options
+    summary: dict[str, Any] = {
+        "realPackDrawCount": gpu_counts["realPackDrawCount"],
+        "fallbackDrawCount": gpu_counts["fallbackDrawCount"],
+        "validationErrorCount": gpu_counts["validationErrorCount"],
+        "inputScript": effective_input_script,
+    }
+    if effective_stream_shaders:
+        summary["streamShaders"] = True
+    if effective_stream_threshold_mb is not None:
+        summary["streamThresholdMb"] = effective_stream_threshold_mb
     return sanitize_value(
         {
             "schema": "playgta6-browser-telemetry",
@@ -1744,6 +2232,10 @@ def build_telemetry_payload(
             "preset": preset,
             "smoke": smoke,
             "headless": headless,
+            "inputScript": effective_input_script,
+            "stream_shaders": effective_stream_shaders,
+            "stream_threshold_mb": effective_stream_threshold_mb,
+            "boot_options": dict(effective_boot_options) if effective_boot_options is not None else None,
             "elapsed_ms": round(float(session.elapsed_ms), 2),
             "status": session.status,
             "crashed": session.crashed,
@@ -1753,6 +2245,7 @@ def build_telemetry_payload(
             "diagnostics": probe.get("diagnostics"),
             "boot_tracer": probe.get("tracerSummary"),
             "hud": probe.get("hud"),
+            "summary": summary,
             "presents_sampled": len(session.presents),
             "first_present_ms": session.first_present_ms,
             "scripted_inputs_sent": session.scripted_inputs_sent,
@@ -1809,6 +2302,10 @@ def digest(report: dict[str, Any], exit_code: int, max_counters: int = 12) -> st
         f"gpu_validation_errors={counters.get('gpu_validation_errors', 0)}, "
         f"page_errors={counters.get('page_errors', 0)}"
     )
+    summary = report.get("summary") if isinstance(report.get("summary"), Mapping) else {}
+    input_script = report.get("inputScript") or summary.get("inputScript")
+    if input_script:
+        lines.append(f"input_script: {input_script}")
     fault = report.get("fault")
     if isinstance(fault, dict):
         lines.append(f"stop: {fault.get('kind')} at {fault.get('va')} ({fault.get('detail')})")
@@ -1892,6 +2389,42 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--ignore", action="append", default=[], metavar="PATTERN", help="compare_boot_reports --ignore")
     p.add_argument("--time-tolerance", type=float, metavar="REL", help="compare_boot_reports --time-tolerance")
     p.add_argument("--count-tolerance", type=float, metavar="REL", help="compare_boot_reports --count-tolerance")
+    p.add_argument(
+        "--input-script",
+        default=None,
+        metavar="PRESET",
+        help="sanitized scripted-input preset appended as ?inputScript=<preset> (e.g. start-screen)",
+    )
+    p.add_argument(
+        "--stream-shaders",
+        action="store_true",
+        help="append streamShaders=1 to the target URL to enable ranged WGSL pack streaming",
+    )
+    p.add_argument(
+        "--stream-threshold-mb",
+        type=float,
+        default=None,
+        metavar="MB",
+        help="positive finite MiB threshold appended as streamThresholdMb=<N> to the target URL",
+    )
+    p.add_argument(
+        "--boot-options",
+        default=None,
+        metavar="JSON_OR_PATH",
+        help="inline JSON object or path to JSON file validated and staged as boot-options.json",
+    )
+    p.add_argument(
+        "--report-to-log",
+        action="store_true",
+        help="set report_to_log=true in validated boot-options.json",
+    )
+    p.add_argument(
+        "--max-wall-ms",
+        type=int,
+        default=None,
+        metavar="MS",
+        help="set max_wall_ms=<uint64> in validated boot-options.json",
+    )
     return p
 
 
@@ -1958,6 +2491,16 @@ def _run(
     if args.jobs < 1:
         raise RunnerError("--jobs must be >= 1")
 
+    input_script = validate_input_script_preset(args.input_script)
+    stream_shaders = bool(args.stream_shaders)
+    stream_threshold_mb = validate_stream_threshold_mb(args.stream_threshold_mb)
+    resolved_boot_options = parse_and_validate_boot_options(
+        boot_options=args.boot_options,
+        report_to_log=bool(args.report_to_log),
+        max_wall_ms=args.max_wall_ms,
+        repo_root=repo,
+    )
+
     preset_cfg = PRESETS[args.preset]
     if args.duration_s is not None:
         duration_s = float(args.duration_s)
@@ -2021,6 +2564,9 @@ def _run(
         print(f"[plan] {step['stage']}: {step['reason']}", file=sys.stderr)
 
     effective_shaders_dir = shader_stage_dir if shader_pack is not None else None
+    if resolved_boot_options is not None and not args.smoke:
+        validate_boot_dir_safety(boot_dir, repo)
+
     if args.dry_run:
         preview_port = args.port if args.port > 0 else 0
         server_preview = build_server_cmd(
@@ -2033,6 +2579,36 @@ def _run(
             game_dir=game_dir,
             shaders_dir=effective_shaders_dir,
         )
+        boot_options_staging_preview: dict[str, Any] | None = None
+        if resolved_boot_options is not None:
+            if args.smoke:
+                payload = serialize_boot_options(resolved_boot_options)
+                boot_options_staging_preview = sanitize_value(
+                    {
+                        "filename": BOOT_OPTIONS_NAME,
+                        "staged": False,
+                        "action": "plan_ephemeral",
+                        "size_bytes": len(payload),
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                        "options": resolved_boot_options,
+                    }
+                )
+            else:
+                boot_options_staging_preview = stage_boot_options_file(
+                    resolved_boot_options,
+                    boot_dir,
+                    repo_root=repo,
+                    dry_run=True,
+                    check_safety=True,
+                )
+        preview_url = build_target_url(
+            "127.0.0.1",
+            preview_port or "<ephemeral>",
+            smoke=args.smoke,
+            input_script=input_script,
+            stream_shaders=stream_shaders,
+            stream_threshold_mb=stream_threshold_mb,
+        )
         dry_payload = sanitize_value(
             {
                 "mode": "smoke" if args.smoke else "real-game",
@@ -2042,6 +2618,12 @@ def _run(
                 "duration_s": duration_s,
                 "headless": args.headless,
                 "send_input": send_input,
+                "input_script": input_script,
+                "inputScript": input_script,
+                "stream_shaders": stream_shaders,
+                "stream_threshold_mb": stream_threshold_mb,
+                "boot_options": resolved_boot_options,
+                "boot_options_staging": boot_options_staging_preview,
                 "capture_frames": bool(args.capture_frames or args.mp4),
                 "mp4": bool(args.mp4),
                 "trust_build": bool(args.trust_build),
@@ -2053,7 +2635,7 @@ def _run(
                     {"kind": s["kind"], "name": s["name"]} for s in shader_plan
                 ],
                 "server_command": sanitize_cmd(server_preview, repo),
-                "url": f"http://127.0.0.1:{preview_port or '<ephemeral>'}/{'?smoke=1' if args.smoke else ''}",
+                "url": preview_url,
             }
         )
         print(json.dumps(dry_payload, indent=2))
@@ -2076,6 +2658,16 @@ def _run(
     staged_shaders: list[dict[str, Any]] = []
     if shader_pack is not None:
         staged_shaders = stage_shader_pack(shader_pack, shader_stage_dir)
+
+    staged_boot_options: dict[str, Any] | None = None
+    if resolved_boot_options is not None and not args.smoke:
+        staged_boot_options = stage_boot_options_file(
+            resolved_boot_options,
+            boot_dir,
+            repo_root=repo,
+            dry_run=False,
+            check_safety=True,
+        )
 
     if not args.smoke and not (out_dir / "runtime.wasm").is_file():
         raise RunnerError(
@@ -2101,6 +2693,10 @@ def _run(
         capture_frames=bool(args.capture_frames),
         frame_interval_s=float(args.frame_interval_s),
         encode_mp4=bool(args.mp4),
+        input_script=input_script,
+        stream_shaders=stream_shaders,
+        stream_threshold_mb=stream_threshold_mb,
+        boot_options=resolved_boot_options,
         runner=runner,
     )
 
@@ -2120,6 +2716,10 @@ def _run(
         smoke=args.smoke,
         preset=args.preset,
         headless=args.headless,
+        input_script=input_script,
+        stream_shaders=stream_shaders,
+        stream_threshold_mb=stream_threshold_mb,
+        boot_options=resolved_boot_options,
     )
     (run_dir / "telemetry.json").write_text(json.dumps(telemetry_payload, indent=2) + "\n", encoding="utf-8")
 
@@ -2131,6 +2731,12 @@ def _run(
             "duration_s": duration_s,
             "headless": bool(args.headless),
             "send_input": send_input,
+            "input_script": input_script,
+            "inputScript": input_script,
+            "stream_shaders": stream_shaders,
+            "stream_threshold_mb": stream_threshold_mb,
+            "boot_options": resolved_boot_options,
+            "staged_boot_options": staged_boot_options,
             "capture_frames": bool(args.capture_frames or args.mp4),
             "mp4": bool(args.mp4),
             "trust_build": bool(args.trust_build),
@@ -2144,7 +2750,15 @@ def _run(
 
     report_path = run_dir / "boot-report.json"
     if session.ok or session.final_probe or session.presents or session.status in ("ok", "fault"):
-        report = build_boot_report(session, smoke=args.smoke, preset=args.preset)
+        report = build_boot_report(
+            session,
+            smoke=args.smoke,
+            preset=args.preset,
+            input_script=input_script,
+            stream_shaders=stream_shaders,
+            stream_threshold_mb=stream_threshold_mb,
+            boot_options=resolved_boot_options,
+        )
         report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
     loaded_report = load_report(report_path)
