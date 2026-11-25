@@ -1316,6 +1316,10 @@ bool Device::MemorySlotSource::snapshot(const d3d::DescriptorHeap& heap, uint32_
     return true;
 }
 
+bool Device::MemorySlotSource::read_gpu_memory(uint64_t gpu_address, void* out, size_t bytes) const {
+    return gpu_address != 0 && com::read_guest(device_.cpu_address_for_gpu(gpu_address), out, bytes);
+}
+
 void Device::MemorySlotSource::note(uint32_t kind, uint32_t status, uint64_t address) const {
     device_.slot_reads_[kind][status].fetch_add(1, std::memory_order_relaxed);
     if (status == static_cast<uint32_t>(bridge::DecodeStatus::Ok)) {

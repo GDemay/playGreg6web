@@ -32,7 +32,16 @@
 //                           {"user_sgpr", "root_descriptor": true} | {"static_sampler": <index>} |
 //                           {"sampler_heap" | "resource_heap": {"base_user_sgpr", "stride",
 //                                                               "index": {"user_sgpr", "shift"}}} |
-//                           {"inline_sampler": {"sdwords": [d0, d1, d2, d3]}}}]}}}
+//                           {"inline_sampler": {"sdwords": [d0, d1, d2, d3]}} |
+//                           {"cbv_indexed_resource_heap" | "cbv_indexed_sampler_heap": {
+//                               "cbv": {"user_sgpr", "root_descriptor": true} | {"user_sgpr", "table_byte_offset"} |
+//                                      {"user_sgpr", "root_constants": true},
+//                               "byte_offset", "shift", "bit_offset" (0), "mask" (0xffffffff), "stride" (opt.)}}}]}}}
+// A CB-indexed heap source (G62, #482; SM 6.6 ResourceDescriptorHeap[cb.index]): the index is the
+// 32-bit dword at "byte_offset" of a constant buffer: the root CBV, the CBV in a table slot or the
+// root constants of the root parameter whose user data starts at "cbv"."user_sgpr". The descriptor
+// is the one at byte offset ((dword >> bit_offset) & mask) << shift of the bound heap, read at
+// draw time; an index that cannot be read or falls outside the heap binds null (counted).
 // An inline sampler (#482): the stage builds the sampler from constants in its code; "sdwords" are
 // the four GFX10 S# dwords, decoded at the join (bridge::decode_sampler_words) and bound as that
 // sampler. Words that do not decode as a sampler fail the join.
@@ -87,7 +96,12 @@ enum class ReflectedSource : uint8_t {
     SamplerHeap,
     ResourceHeap,
     InlineSampler,  // the stage builds the S# from constants in its code (sampler_words)
+    CbvIndexedSamplerHeap,   // heap index read from a constant buffer (cb_*), G62
+    CbvIndexedResourceHeap,
 };
+
+// Where a CB-indexed heap source's constant buffer is (the root parameter at user_sgpr).
+enum class ReflectedCbv : uint8_t { RootDescriptor = 0, Table = 1, RootConstants = 2 };
 
 struct ReflectedBinding {
     uint32_t group = 0;
@@ -111,6 +125,13 @@ struct ReflectedBinding {
     uint32_t heap_shift = 0;
     // InlineSampler: the four GFX10 S# dwords the stage builds in SGPRs (decoded at the join).
     uint32_t sampler_words[4] = {0, 0, 0, 0};
+    // CbvIndexed*Heap: the CB is the root parameter at user_sgpr (a Table CB: the CBV at
+    // table_byte_offset); index = (dword at cb_byte_offset >> cb_bit_offset) & cb_mask, byte offset in
+    // the heap index << heap_shift; heap_stride as given (0 when not).
+    ReflectedCbv cbv = ReflectedCbv::RootDescriptor;
+    uint32_t cb_byte_offset = 0;
+    uint32_t cb_bit_offset = 0;
+    uint32_t cb_mask = 0xffffffffu;
 };
 
 enum class ReflectedStage : uint8_t { Vertex = 1, Fragment = 2, Compute = 3 };

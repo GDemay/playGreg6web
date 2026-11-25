@@ -1179,6 +1179,9 @@ private:
         d3d::ViewDescriptor view(const d3d::DescriptorHeap& heap, uint32_t index,
                                  d3d::DescriptorRangeType range) const override;
         bool sampler(const d3d::DescriptorHeap& heap, uint32_t index, d3d::SamplerDesc* out) const override;
+        // Constant-buffer contents for CB-indexed heap bindings (G62): guest memory at the CPU
+        // address the GPU address aliases (cpu_address_for_gpu).
+        bool read_gpu_memory(uint64_t gpu_address, void* out, size_t bytes) const override;
 
     private:
         void note(uint32_t kind, uint32_t status, uint64_t address) const;
