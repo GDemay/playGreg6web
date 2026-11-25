@@ -12,6 +12,30 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
 import stage_reflection_sidecar as sidecar  # noqa: E402
 
+_STAGE_TO_CODE = {"vertex": 1, "fragment": 2, "compute": 3}
+
+
+def build_synthetic_wgpk(entries: list[tuple[int, str, bytes]], *, flags: int = 0) -> bytes:
+    """Build a valid WGPK v1 binary archive from (hash_int, stage_name, payload_bytes) tuples."""
+    data_start = sidecar.WGPK_HEADER_BYTES + len(entries) * sidecar.WGPK_ENTRY_BYTES
+    header = sidecar.WGPK_HEADER_STRUCT.pack(sidecar.WGPK_MAGIC, sidecar.WGPK_VERSION, len(entries), flags)
+    toc = bytearray()
+    payloads = bytearray()
+    cursor = data_start
+    for hash_int, stage_name, payload in entries:
+        toc.extend(
+            sidecar.WGPK_ENTRY_STRUCT.pack(
+                hash_int,
+                _STAGE_TO_CODE[stage_name],
+                b"\x00\x00\x00",
+                cursor,
+                len(payload),
+            )
+        )
+        payloads.extend(payload)
+        cursor += len(payload)
+    return bytes(header) + bytes(toc) + bytes(payloads)
+
 
 def vertex_entry(with_keys: bool) -> dict:
     entry = {
@@ -888,6 +912,330 @@ class SidecarTests(unittest.TestCase):
         self.assertEqual(summary["diff"]["added_sample_hashes"], ["<redacted>"])
         self.assertEqual(summary["diff"]["removed_sample_hashes"], ["<redacted>"])
         self.assertEqual(summary["diff"]["changed_sample_hashes"], ["<redacted>"])
+
+    def test_verify_pack_100_percent_match_and_cli_output(self):
+        pack_bytes = build_synthetic_wgpk([
+            (0x00000000000000A1, "vertex", b"@vertex fn vs() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }"),
+            (0x00000000000000B2, "fragment", b"@fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }"),
+            (0x00000000000000C3, "compute", b"@compute @workgroup_size(1) fn cs() {}"),
+        ])
+        entries = {
+            "entries": [
+                # Uppercase hex hash verifies canonical hash matching against WGPK lowercase hex
+                {**vertex_entry(True), "hash_fnv1a64": "0x00000000000000A1"},
+                {
+                    "hash_fnv1a64": "0x00000000000000b2",
+                    "stage": "fragment",
+                    "bindings": [{"group": 0, "binding": 0, "kind": "sampler", "source": {"static_sampler": 0}}],
+                },
+                {
+                    "hash_fnv1a64": "0x00000000000000c3",
+                    "stage": "compute",
+                    "bindings": [{"group": 0, "binding": 0, "kind": "storage",
+                                  "source": {"user_sgpr": 4, "table_byte_offset": 0}}],
+                },
+            ]
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "in.json"
+            out = Path(tmp) / "shaders.wgsl.pack.reflect.json"
+            pack_path = Path(tmp) / "shaders.wgsl.pack"
+            src.write_text(json.dumps(entries), encoding="utf-8")
+            pack_path.write_bytes(pack_bytes)
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                rc = sidecar.main([
+                    str(src),
+                    "--out", str(out),
+                    "--verify-pack", str(pack_path),
+                    "--json",
+                ])
+            self.assertEqual(rc, 0)
+            summary = json.loads(stdout.getvalue())
+            self.assertEqual(summary["pack_verification"], {
+                "pack_label": "shaders.wgsl.pack",
+                "pack_entry_count": 3,
+                "reflection_stage_count": 3,
+                "matched_hashes": 3,
+                "missing_reflection_hashes": {"count": 0, "samples": []},
+                "extra_reflection_hashes": {"count": 0, "samples": []},
+                "coverage_pct": 100.0,
+                "pack_by_stage": {"vertex": 1, "fragment": 1, "compute": 1},
+                "missing_by_stage": {"vertex": 0, "fragment": 0, "compute": 0},
+                "stage_mismatches": 0,
+            })
+
+            # Human-readable output includes concise pack verification summary
+            stdout_text = io.StringIO()
+            with redirect_stdout(stdout_text):
+                rc_text = sidecar.main([
+                    str(src),
+                    "--out", str(out),
+                    "--verify-pack", str(pack_path),
+                ])
+            self.assertEqual(rc_text, 0)
+            self.assertIn(
+                "pack verify (shaders.wgsl.pack): 3/3 matched (100.00%), 0 missing, 0 extra",
+                stdout_text.getvalue(),
+            )
+
+    def test_verify_pack_partial_match_bounded_samples_extra_and_stage_mismatch(self):
+        # 8 pack entries: 2 matched (1 with stage mismatch), 6 missing (tests 5-sample cap)
+        pack_entries = [
+            (0x0000000000000001, "vertex", b"// vs1"),
+            (0x0000000000000002, "vertex", b"// vs2 - mismatched in sidecar"),
+        ] + [
+            (0x0000000000001000 + i, "fragment" if i < 4 else "compute", f"// miss {i}".encode("utf-8"))
+            for i in range(6)
+        ]
+        pack_bytes = build_synthetic_wgpk(pack_entries)
+
+        # 9 reflection stages: 2 matched + 7 extra (tests 5-sample cap on extra_reflection_hashes too)
+        stages = {
+            "0x0000000000000001": {"stage": "vertex", "bindings": []},
+            "0x0000000000000002": {"stage": "fragment", "bindings": []},
+            **{
+                f"0x000000000000200{i}": {"stage": "compute", "bindings": []}
+                for i in range(7)
+            },
+        }
+        toc = sidecar.parse_wgpk_toc_bytes(pack_bytes)
+        result = sidecar.verify_sidecar_against_pack(toc, stages, pack_label="partial.wgsl.pack")
+        self.assertEqual(result, {
+            "pack_label": "partial.wgsl.pack",
+            "pack_entry_count": 8,
+            "reflection_stage_count": 9,
+            "matched_hashes": 2,
+            "missing_reflection_hashes": {
+                "count": 6,
+                "samples": [f"0x000000000000100{i}" for i in range(5)],
+            },
+            "extra_reflection_hashes": {
+                "count": 7,
+                "samples": [f"0x000000000000200{i}" for i in range(5)],
+            },
+            "coverage_pct": 25.0,
+            "pack_by_stage": {"vertex": 2, "fragment": 4, "compute": 2},
+            "missing_by_stage": {"vertex": 0, "fragment": 4, "compute": 2},
+            "stage_mismatches": 1,
+        })
+
+    def test_verify_pack_empty_pack_zero_division_guard(self):
+        empty_pack = build_synthetic_wgpk([])
+        toc = sidecar.parse_wgpk_toc_bytes(empty_pack)
+        self.assertEqual(toc, [])
+
+        # Empty pack + empty sidecar -> 0.0% coverage (no ZeroDivisionError)
+        res_empty = sidecar.verify_sidecar_against_pack(toc, {}, pack_label="empty.wgsl.pack")
+        self.assertEqual(res_empty["pack_entry_count"], 0)
+        self.assertEqual(res_empty["reflection_stage_count"], 0)
+        self.assertEqual(res_empty["matched_hashes"], 0)
+        self.assertEqual(res_empty["missing_reflection_hashes"], {"count": 0, "samples": []})
+        self.assertEqual(res_empty["extra_reflection_hashes"], {"count": 0, "samples": []})
+        self.assertEqual(res_empty["coverage_pct"], 0.0)
+
+        # Empty pack + non-empty sidecar via CLI -> 0.0% coverage and extra hash reported
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "in.json"
+            out = Path(tmp) / "out.reflect.json"
+            pack_path = Path(tmp) / "empty.wgsl.pack"
+            src.write_text(json.dumps(vertex_entry(True)), encoding="utf-8")
+            pack_path.write_bytes(empty_pack)
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                rc = sidecar.main([str(src), "--out", str(out), "--verify-pack", str(pack_path), "--json"])
+            self.assertEqual(rc, 0)
+            verify = json.loads(stdout.getvalue())["pack_verification"]
+        self.assertEqual(verify["pack_entry_count"], 0)
+        self.assertEqual(verify["reflection_stage_count"], 1)
+        self.assertEqual(verify["matched_hashes"], 0)
+        self.assertEqual(verify["extra_reflection_hashes"], {"count": 1, "samples": ["0x00000000000000a1"]})
+        self.assertEqual(verify["coverage_pct"], 0.0)
+
+    def test_verify_pack_malformed_bounds_and_header_rejection(self):
+        bad_packs: list[tuple[str, bytes]] = [
+            ("truncated_header", b"WGPK\x01\x00"),
+            ("bad_magic", sidecar.WGPK_HEADER_STRUCT.pack(b"NOPE", 1, 0, 0)),
+            ("unsupported_version", sidecar.WGPK_HEADER_STRUCT.pack(b"WGPK", 2, 0, 0)),
+            ("truncated_toc", sidecar.WGPK_HEADER_STRUCT.pack(b"WGPK", 1, 2, 0)),
+            ("toc_u32_overflow", sidecar.WGPK_HEADER_STRUCT.pack(b"WGPK", 1, 0x10000000, 0)),
+            (
+                "invalid_stage",
+                sidecar.WGPK_HEADER_STRUCT.pack(b"WGPK", 1, 1, 0)
+                + sidecar.WGPK_ENTRY_STRUCT.pack(0x1, 4, b"\x00\x00\x00", 36, 4)
+                + b"abcd",
+            ),
+            (
+                "offset_overlaps_toc",
+                sidecar.WGPK_HEADER_STRUCT.pack(b"WGPK", 1, 1, 0)
+                + sidecar.WGPK_ENTRY_STRUCT.pack(0x1, 1, b"\x00\x00\x00", 12, 4)
+                + b"abcd",
+            ),
+            (
+                "payload_exceeds_eof",
+                sidecar.WGPK_HEADER_STRUCT.pack(b"WGPK", 1, 1, 0)
+                + sidecar.WGPK_ENTRY_STRUCT.pack(0x1, 1, b"\x00\x00\x00", 36, 16)
+                + b"abcd",
+            ),
+            (
+                "payload_range_u32_overflow",
+                sidecar.WGPK_HEADER_STRUCT.pack(b"WGPK", 1, 1, 0)
+                + sidecar.WGPK_ENTRY_STRUCT.pack(0x1, 1, b"\x00\x00\x00", 0xFFFFFFF0, 32)
+                + b"abcd",
+            ),
+            (
+                "overlapping_payloads",
+                sidecar.WGPK_HEADER_STRUCT.pack(b"WGPK", 1, 2, 0)
+                + sidecar.WGPK_ENTRY_STRUCT.pack(0x1, 1, b"\x00\x00\x00", 56, 6)
+                + sidecar.WGPK_ENTRY_STRUCT.pack(0x2, 2, b"\x00\x00\x00", 60, 4)
+                + b"0123456789",
+            ),
+            (
+                "duplicate_hash",
+                sidecar.WGPK_HEADER_STRUCT.pack(b"WGPK", 1, 2, 0)
+                + sidecar.WGPK_ENTRY_STRUCT.pack(0x99, 1, b"\x00\x00\x00", 56, 2)
+                + sidecar.WGPK_ENTRY_STRUCT.pack(0x99, 2, b"\x00\x00\x00", 58, 2)
+                + b"abcd",
+            ),
+        ]
+
+        for name, raw in bad_packs:
+            with self.subTest(case=name):
+                with self.assertRaises(ValueError):
+                    sidecar.parse_wgpk_toc_bytes(raw)
+
+        # CLI must fail cleanly with exit code 1 and not write --out on malformed/missing/directory pack
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "in.json"
+            src.write_text(json.dumps(vertex_entry(True)), encoding="utf-8")
+
+            for name, raw in bad_packs:
+                pack_path = Path(tmp) / f"{name}.wgsl.pack"
+                out_path = Path(tmp) / f"out_{name}.reflect.json"
+                pack_path.write_bytes(raw)
+                stderr = io.StringIO()
+                with redirect_stderr(stderr):
+                    rc = sidecar.main([str(src), "--out", str(out_path), "--verify-pack", str(pack_path), "--json"])
+                self.assertEqual(rc, 1, name)
+                self.assertIn("error: failed to load --verify-pack:", stderr.getvalue(), name)
+                self.assertFalse(out_path.exists(), name)
+
+            # Missing pack file and directory path
+            for label, bad_target in (
+                ("missing", Path(tmp) / "secret_user_dir" / "absent.wgsl.pack"),
+                ("directory", Path(tmp)),
+            ):
+                out_path = Path(tmp) / f"out_{label}.reflect.json"
+                stderr = io.StringIO()
+                with redirect_stderr(stderr):
+                    rc = sidecar.main([str(src), "--out", str(out_path), "--verify-pack", str(bad_target), "--json"])
+                self.assertEqual(rc, 1, label)
+                self.assertIn("error: failed to load --verify-pack:", stderr.getvalue(), label)
+                self.assertNotIn("secret_user_dir", stderr.getvalue(), label)
+                self.assertNotIn(str(tmp), stderr.getvalue(), label)
+                self.assertFalse(out_path.exists(), label)
+
+    def test_verify_pack_json_sanitizes_host_paths_and_usernames(self):
+        pack_bytes = build_synthetic_wgpk([
+            (0x00000000000000A1, "vertex", b"// vs"),
+            (0x00000000000000F9, "fragment", b"// fs"),
+        ])
+        hostile_entries = {
+            "input_path": r"C:\Users\secret_user\games\shaders.bin",
+            "entries": [
+                vertex_entry(True),
+                {
+                    "hash_fnv1a64": "/home/secret_user/extra_shader.wgsl",
+                    "stage": "compute",
+                    "wgsl": "@compute fn cs_secret() {}",
+                    "bindings": [{"group": 0, "binding": 0, "kind": "sampler", "source": {"static_sampler": 0}}],
+                },
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            secret_dir = Path(tmp) / "Users" / "secret_user" / "private_build"
+            secret_dir.mkdir(parents=True)
+            src = secret_dir / "in.json"
+            out = secret_dir / "out.reflect.json"
+            pack_path = secret_dir / "title_shaders.wgsl.pack"
+            src.write_text(json.dumps(hostile_entries), encoding="utf-8")
+            pack_path.write_bytes(pack_bytes)
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                rc = sidecar.main([
+                    str(src),
+                    "--out", str(out),
+                    "--verify-pack", str(pack_path),
+                    "--json",
+                ])
+            self.assertEqual(rc, 0)
+            raw_out = stdout.getvalue()
+            raw_err = stderr.getvalue()
+
+        for forbidden in (
+            "secret_user",
+            "private_build",
+            "cs_secret",
+            "@compute",
+            "/home/",
+            "C:\\Users",
+            str(tmp),
+            str(secret_dir),
+        ):
+            self.assertNotIn(forbidden, raw_out)
+            self.assertNotIn(forbidden, raw_err)
+
+        summary = json.loads(raw_out)
+        verify = summary["pack_verification"]
+        self.assertEqual(verify["pack_label"], "title_shaders.wgsl.pack")
+        self.assertEqual(verify["matched_hashes"], 1)
+        self.assertEqual(verify["missing_reflection_hashes"], {"count": 1, "samples": ["0x00000000000000f9"]})
+        self.assertEqual(verify["extra_reflection_hashes"], {"count": 1, "samples": ["<redacted>"]})
+        self.assertEqual(verify["coverage_pct"], 50.0)
+
+        # Path label sanitizer unit edge cases
+        self.assertEqual(sidecar._sanitize_path_label(r"C:\Users\alice\work\game.wgsl.pack"), "game.wgsl.pack")
+        self.assertEqual(sidecar._sanitize_path_label("/home/alice/work/game.wgsl.pack"), "game.wgsl.pack")
+        self.assertEqual(sidecar._sanitize_path_label(r"C:\Users\alice\my secret pack.pack"), "<redacted>")
+        self.assertEqual(sidecar._sanitize_path_label("C:\\"), "<unknown>")
+        self.assertEqual(sidecar._sanitize_path_label(".."), "<unknown>")
+
+    def test_verify_pack_standalone_existing_sidecar_and_omitted_without_flag(self):
+        pack_bytes = build_synthetic_wgpk([
+            (0x00000000000000A1, "vertex", b"// vs"),
+            (0x00000000000000B2, "fragment", b"// fs"),
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "in.json"
+            out = Path(tmp) / "existing.reflect.json"
+            pack_path = Path(tmp) / "pack.wgsl.pack"
+            src.write_text(json.dumps(vertex_entry(True)), encoding="utf-8")
+            pack_path.write_bytes(pack_bytes)
+
+            # Without --verify-pack: pack_verification key must be absent
+            stdout_plain = io.StringIO()
+            with redirect_stdout(stdout_plain):
+                rc_plain = sidecar.main([str(src), "--out", str(out), "--json"])
+            self.assertEqual(rc_plain, 0)
+            self.assertNotIn("pack_verification", json.loads(stdout_plain.getvalue()))
+            original_content = out.read_text(encoding="utf-8")
+
+            # Standalone verify mode (no positional inputs): reads --out without modifying it
+            stdout_verify = io.StringIO()
+            with redirect_stdout(stdout_verify):
+                rc_verify = sidecar.main(["--out", str(out), "--verify-pack", str(pack_path), "--json"])
+            self.assertEqual(rc_verify, 0)
+            self.assertEqual(out.read_text(encoding="utf-8"), original_content)
+            summary = json.loads(stdout_verify.getvalue())
+            self.assertEqual(summary["stages_written"], 0)
+            self.assertEqual(summary["pack_verification"]["pack_entry_count"], 2)
+            self.assertEqual(summary["pack_verification"]["reflection_stage_count"], 1)
+            self.assertEqual(summary["pack_verification"]["matched_hashes"], 1)
+            self.assertEqual(summary["pack_verification"]["coverage_pct"], 50.0)
 
 
 if __name__ == "__main__":
