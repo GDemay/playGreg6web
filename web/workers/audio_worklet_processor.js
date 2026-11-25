@@ -4,6 +4,9 @@
   const PROCESSOR_NAME = 'playgta6-audio-processor';
   const DEFAULT_CHANNELS = 2;
   const DEFAULT_SMOOTHING_FRAMES = 64;
+  const DEFAULT_DECLICK_FRAMES = 32;
+  const MAX_DECLICK_FRAMES = 4096;
+  const MAX_TRACKED_CHANNELS = 32;
 
   // Atomic Int32 header layout at byte offset 0..32 of the SharedArrayBuffer.
   // Must match web/workers/audio_worker.js byte-for-byte.
@@ -34,6 +37,16 @@
     }
     const n = Math.floor(value);
     return n < 0 ? 0 : n;
+  }
+
+  function sanitizeDeclickFrames(value, fallback) {
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      return fallback;
+    }
+    const n = Math.floor(value);
+    if (n < 0) return fallback;
+    if (n > MAX_DECLICK_FRAMES) return MAX_DECLICK_FRAMES;
+    return n;
   }
 
   const BaseAudioWorkletProcessor =
@@ -73,15 +86,30 @@
       this._gain = clampGain(procOpts.gain !== undefined ? procOpts.gain : 1.0);
       this._muted = Boolean(procOpts.muted);
       this._smoothingFrames = sanitizeSmoothingFrames(procOpts.smoothingFrames);
+      const rawDeclick =
+        procOpts.declickFrames !== undefined
+          ? procOpts.declickFrames
+          : procOpts.underrunFadeFrames;
+      this._declickFrames = sanitizeDeclickFrames(rawDeclick, 0);
 
       this._targetGain = this._muted ? 0.0 : this._gain;
       this._currentGain = this._targetGain;
       this._rampStep = 0.0;
       this._rampRemaining = 0;
 
+      // Pre-allocated fixed-size per-channel sample history for zero-GC underrun de-click fade-out.
+      this._lastSamples = new Float32Array(MAX_TRACKED_CHANNELS);
+      this._hasActiveAudio = false;
+      this._declickPos = 0;
+      this._declickTotal = 0;
+      this._declickFadeOuts = 0;
+
       this._stopped = false;
       this._processedQuanta = 0;
       this._processedFrames = 0;
+      this._sanitizedSamples = 0;
+      this._underruns = 0;
+      this._underrunFrames = 0;
 
       if (procOpts.sab !== undefined && procOpts.sab !== null) {
         this._attachSab(procOpts.sab);
@@ -94,7 +122,53 @@
       }
     }
 
+    get framesProcessed() {
+      return this._processedFrames;
+    }
+
+    get processedFrames() {
+      return this._processedFrames;
+    }
+
+    get sanitizedSamples() {
+      return this._sanitizedSamples;
+    }
+
+    get underruns() {
+      return this._ctrl ? Atomics.load(this._ctrl, HDR_UNDERRUNS) : this._underruns;
+    }
+
+    get underrunFrames() {
+      return this._ctrl ? Atomics.load(this._ctrl, HDR_UNDERRUN_FRAMES) : this._underrunFrames;
+    }
+
+    get declickFrames() {
+      return this._declickFrames;
+    }
+
+    get fadeOutCount() {
+      return this._declickFadeOuts;
+    }
+
+    setDeclickFrames(frames) {
+      this._declickFrames = sanitizeDeclickFrames(frames, this._declickFrames);
+      if (this._declickFrames === 0) {
+        this._declickPos = 0;
+        this._declickTotal = 0;
+      }
+      return this._declickFrames;
+    }
+
+    _resetDeclickState() {
+      this._lastSamples.fill(0);
+      this._hasActiveAudio = false;
+      this._declickPos = 0;
+      this._declickTotal = 0;
+    }
+
     _attachSab(sab) {
+      this._resetDeclickState();
+
       if (sab === null) {
         this._sab = null;
         this._ctrl = null;
@@ -172,6 +246,7 @@
 
     getStats() {
       const ctrl = this._ctrl;
+      const overflows = ctrl ? Atomics.load(ctrl, HDR_OVERFLOWS) : 0;
       return {
         attached: ctrl !== null,
         stopped: this._stopped,
@@ -179,15 +254,20 @@
         muted: this._muted,
         currentGain: this._currentGain,
         targetGain: this._targetGain,
+        declickFrames: this._declickFrames,
         capacityFrames: this._capacityFrames,
         channels: this._channels,
         bufferedFrames: this._computeBufferedFrames(),
-        underruns: ctrl ? Atomics.load(ctrl, HDR_UNDERRUNS) : 0,
-        underrunFrames: ctrl ? Atomics.load(ctrl, HDR_UNDERRUN_FRAMES) : 0,
-        overflows: ctrl ? Atomics.load(ctrl, HDR_OVERFLOWS) : 0,
+        underruns: ctrl ? Atomics.load(ctrl, HDR_UNDERRUNS) : this._underruns,
+        underrunFrames: ctrl ? Atomics.load(ctrl, HDR_UNDERRUN_FRAMES) : this._underrunFrames,
+        fadeOutCount: this._declickFadeOuts,
+        overflows,
+        overruns: overflows,
         droppedFrames: ctrl ? Atomics.load(ctrl, HDR_DROPPED_FRAMES) : 0,
         processedQuanta: this._processedQuanta,
         processedFrames: this._processedFrames,
+        framesProcessed: this._processedFrames,
+        sanitizedSamples: this._sanitizedSamples,
       };
     }
 
@@ -237,6 +317,25 @@
           break;
         }
 
+        case 'setDeclickFrames':
+        case 'setDeclick': {
+          const raw =
+            msg.declickFrames !== undefined
+              ? msg.declickFrames
+              : msg.frames !== undefined
+                ? msg.frames
+                : msg.underrunFadeFrames;
+          this.setDeclickFrames(raw);
+          if (msg.id !== undefined) {
+            this._post({
+              type: 'declickFrames',
+              declickFrames: this._declickFrames,
+              id: msg.id,
+            });
+          }
+          break;
+        }
+
         case 'stats': {
           const reply = Object.assign({ type: 'stats' }, this.getStats());
           if (msg.id !== undefined) reply.id = msg.id;
@@ -259,7 +358,10 @@
 
     /**
      * WebAudio AudioWorklet render callback.
-     * Strictly zero allocations on the hot audio thread.
+     * Strictly zero allocations and lock-free on the hot audio thread.
+     * Sanitizes any non-finite (`NaN`/`±Infinity`) PCM sample to `0.0` and,
+     * when `declickFrames > 0`, applies a short linear fade-out de-click ramp
+     * from the last emitted sample when an underrun begins.
      *
      * @param {Float32Array[][]} _inputs
      * @param {Float32Array[][]} outputs
@@ -308,13 +410,25 @@
       if (used < 0) {
         used += modulus;
       }
+      if (used > cap) {
+        used = cap;
+      }
 
       const framesToRead = quantumFrames <= used ? quantumFrames : used;
+      const lastSamples = this._lastSamples;
+      const trackedChannels =
+        outChannels < lastSamples.length ? outChannels : lastSamples.length;
 
       if (framesToRead > 0) {
+        // Fresh audio arrived: cancel any in-flight cross-quantum underrun fade-out.
+        this._declickPos = 0;
+        this._declickTotal = 0;
+
         const readSlot = read >= cap ? read - cap : read;
         const firstFrames = framesToRead <= cap - readSlot ? framesToRead : cap - readSlot;
         const secondFrames = framesToRead - firstFrames;
+        const copyChannels = inChannels < outChannels ? inChannels : outChannels;
+        let sanitized = 0;
 
         if (this._rampRemaining > 0) {
           // Smooth linear gain ramp (click-free volume/mute transition).
@@ -333,12 +447,22 @@
                 rem--;
                 if (rem === 0) gain = target;
               }
+              let sL = samples[src];
+              let sR = samples[src + 1];
+              if (sL - sL !== 0) {
+                sL = 0.0;
+                sanitized++;
+              }
+              if (sR - sR !== 0) {
+                sR = 0.0;
+                sanitized++;
+              }
               if (gain === 0.0) {
                 outL[f] = 0.0;
                 outR[f] = 0.0;
               } else {
-                outL[f] = samples[src] * gain;
-                outR[f] = samples[src + 1] * gain;
+                outL[f] = sL * gain;
+                outR[f] = sR * gain;
               }
               src += 2;
             }
@@ -351,14 +475,64 @@
                   if (rem === 0) gain = target;
                 }
                 const dst = firstFrames + f;
+                let sL = samples[src];
+                let sR = samples[src + 1];
+                if (sL - sL !== 0) {
+                  sL = 0.0;
+                  sanitized++;
+                }
+                if (sR - sR !== 0) {
+                  sR = 0.0;
+                  sanitized++;
+                }
                 if (gain === 0.0) {
                   outL[dst] = 0.0;
                   outR[dst] = 0.0;
                 } else {
-                  outL[dst] = samples[src] * gain;
-                  outR[dst] = samples[src + 1] * gain;
+                  outL[dst] = sL * gain;
+                  outR[dst] = sR * gain;
                 }
                 src += 2;
+              }
+            }
+          } else if (inChannels === 1) {
+            let src = readSlot;
+            for (let f = 0; f < firstFrames; f++) {
+              if (rem > 0) {
+                gain += step;
+                rem--;
+                if (rem === 0) gain = target;
+              }
+              let s = samples[src];
+              if (s - s !== 0) {
+                s = 0.0;
+                sanitized++;
+              }
+              const v = gain === 0.0 ? 0.0 : s * gain;
+              for (let c = 0; c < outChannels; c++) {
+                output[c][f] = v;
+              }
+              src++;
+            }
+            if (secondFrames > 0) {
+              src = 0;
+              for (let f = 0; f < secondFrames; f++) {
+                if (rem > 0) {
+                  gain += step;
+                  rem--;
+                  if (rem === 0) gain = target;
+                }
+                const dst = firstFrames + f;
+                let s = samples[src];
+                if (s - s !== 0) {
+                  s = 0.0;
+                  sanitized++;
+                }
+                const v = gain === 0.0 ? 0.0 : s * gain;
+                for (let c = 0; c < outChannels; c++) {
+                  output[c][dst] = v;
+                }
+                src++;
               }
             }
           } else {
@@ -369,14 +543,16 @@
                 rem--;
                 if (rem === 0) gain = target;
               }
-              for (let c = 0; c < outChannels; c++) {
-                if (gain === 0.0) {
-                  output[c][f] = 0.0;
-                } else {
-                  const s =
-                    c < inChannels ? samples[srcBase + c] : inChannels === 1 ? samples[srcBase] : 0.0;
-                  output[c][f] = s * gain;
+              for (let c = 0; c < copyChannels; c++) {
+                let s = samples[srcBase + c];
+                if (s - s !== 0) {
+                  s = 0.0;
+                  sanitized++;
                 }
+                output[c][f] = gain === 0.0 ? 0.0 : s * gain;
+              }
+              for (let c = copyChannels; c < outChannels; c++) {
+                output[c][f] = 0.0;
               }
               srcBase += inChannels;
             }
@@ -389,18 +565,16 @@
                   if (rem === 0) gain = target;
                 }
                 const dst = firstFrames + f;
-                for (let c = 0; c < outChannels; c++) {
-                  if (gain === 0.0) {
-                    output[c][dst] = 0.0;
-                  } else {
-                    const s =
-                      c < inChannels
-                        ? samples[srcBase + c]
-                        : inChannels === 1
-                          ? samples[srcBase]
-                          : 0.0;
-                    output[c][dst] = s * gain;
+                for (let c = 0; c < copyChannels; c++) {
+                  let s = samples[srcBase + c];
+                  if (s - s !== 0) {
+                    s = 0.0;
+                    sanitized++;
                   }
+                  output[c][dst] = gain === 0.0 ? 0.0 : s * gain;
+                }
+                for (let c = copyChannels; c < outChannels; c++) {
+                  output[c][dst] = 0.0;
                 }
                 srcBase += inChannels;
               }
@@ -417,35 +591,122 @@
             for (let c = 0; c < outChannels; c++) {
               output[c].fill(0, 0, framesToRead);
             }
+            // Scan consumed ring samples so sanitizedSamples telemetry stays exact while muted.
+            const scanChannels = inChannels === 1 ? 1 : copyChannels;
+            if (scanChannels === inChannels) {
+              const firstCount = firstFrames * inChannels;
+              let src = readSlot * inChannels;
+              for (let i = 0; i < firstCount; i++) {
+                const s = samples[src + i];
+                if (s - s !== 0) sanitized++;
+              }
+              if (secondFrames > 0) {
+                const secondCount = secondFrames * inChannels;
+                for (let i = 0; i < secondCount; i++) {
+                  const s = samples[i];
+                  if (s - s !== 0) sanitized++;
+                }
+              }
+            } else {
+              let srcBase = readSlot * inChannels;
+              for (let f = 0; f < firstFrames; f++) {
+                for (let c = 0; c < scanChannels; c++) {
+                  const s = samples[srcBase + c];
+                  if (s - s !== 0) sanitized++;
+                }
+                srcBase += inChannels;
+              }
+              if (secondFrames > 0) {
+                srcBase = 0;
+                for (let f = 0; f < secondFrames; f++) {
+                  for (let c = 0; c < scanChannels; c++) {
+                    const s = samples[srcBase + c];
+                    if (s - s !== 0) sanitized++;
+                  }
+                  srcBase += inChannels;
+                }
+              }
+            }
           } else if (gain === 1.0) {
             if (inChannels === 2 && outChannels === 2) {
               const outL = output[0];
               const outR = output[1];
               let src = readSlot * 2;
               for (let f = 0; f < firstFrames; f++) {
-                outL[f] = samples[src];
-                outR[f] = samples[src + 1];
+                let sL = samples[src];
+                let sR = samples[src + 1];
+                if (sL - sL !== 0) {
+                  sL = 0.0;
+                  sanitized++;
+                }
+                if (sR - sR !== 0) {
+                  sR = 0.0;
+                  sanitized++;
+                }
+                outL[f] = sL;
+                outR[f] = sR;
                 src += 2;
               }
               if (secondFrames > 0) {
                 src = 0;
                 for (let f = 0; f < secondFrames; f++) {
                   const dst = firstFrames + f;
-                  outL[dst] = samples[src];
-                  outR[dst] = samples[src + 1];
+                  let sL = samples[src];
+                  let sR = samples[src + 1];
+                  if (sL - sL !== 0) {
+                    sL = 0.0;
+                    sanitized++;
+                  }
+                  if (sR - sR !== 0) {
+                    sR = 0.0;
+                    sanitized++;
+                  }
+                  outL[dst] = sL;
+                  outR[dst] = sR;
                   src += 2;
+                }
+              }
+            } else if (inChannels === 1) {
+              let src = readSlot;
+              for (let f = 0; f < firstFrames; f++) {
+                let s = samples[src];
+                if (s - s !== 0) {
+                  s = 0.0;
+                  sanitized++;
+                }
+                for (let c = 0; c < outChannels; c++) {
+                  output[c][f] = s;
+                }
+                src++;
+              }
+              if (secondFrames > 0) {
+                src = 0;
+                for (let f = 0; f < secondFrames; f++) {
+                  const dst = firstFrames + f;
+                  let s = samples[src];
+                  if (s - s !== 0) {
+                    s = 0.0;
+                    sanitized++;
+                  }
+                  for (let c = 0; c < outChannels; c++) {
+                    output[c][dst] = s;
+                  }
+                  src++;
                 }
               }
             } else {
               let srcBase = readSlot * inChannels;
               for (let f = 0; f < firstFrames; f++) {
-                for (let c = 0; c < outChannels; c++) {
-                  output[c][f] =
-                    c < inChannels
-                      ? samples[srcBase + c]
-                      : inChannels === 1
-                        ? samples[srcBase]
-                        : 0.0;
+                for (let c = 0; c < copyChannels; c++) {
+                  let s = samples[srcBase + c];
+                  if (s - s !== 0) {
+                    s = 0.0;
+                    sanitized++;
+                  }
+                  output[c][f] = s;
+                }
+                for (let c = copyChannels; c < outChannels; c++) {
+                  output[c][f] = 0.0;
                 }
                 srcBase += inChannels;
               }
@@ -453,13 +714,16 @@
                 srcBase = 0;
                 for (let f = 0; f < secondFrames; f++) {
                   const dst = firstFrames + f;
-                  for (let c = 0; c < outChannels; c++) {
-                    output[c][dst] =
-                      c < inChannels
-                        ? samples[srcBase + c]
-                        : inChannels === 1
-                          ? samples[srcBase]
-                          : 0.0;
+                  for (let c = 0; c < copyChannels; c++) {
+                    let s = samples[srcBase + c];
+                    if (s - s !== 0) {
+                      s = 0.0;
+                      sanitized++;
+                    }
+                    output[c][dst] = s;
+                  }
+                  for (let c = copyChannels; c < outChannels; c++) {
+                    output[c][dst] = 0.0;
                   }
                   srcBase += inChannels;
                 }
@@ -471,30 +735,82 @@
               const outR = output[1];
               let src = readSlot * 2;
               for (let f = 0; f < firstFrames; f++) {
-                outL[f] = samples[src] * gain;
-                outR[f] = samples[src + 1] * gain;
+                let sL = samples[src];
+                let sR = samples[src + 1];
+                if (sL - sL !== 0) {
+                  sL = 0.0;
+                  sanitized++;
+                }
+                if (sR - sR !== 0) {
+                  sR = 0.0;
+                  sanitized++;
+                }
+                outL[f] = sL * gain;
+                outR[f] = sR * gain;
                 src += 2;
               }
               if (secondFrames > 0) {
                 src = 0;
                 for (let f = 0; f < secondFrames; f++) {
                   const dst = firstFrames + f;
-                  outL[dst] = samples[src] * gain;
-                  outR[dst] = samples[src + 1] * gain;
+                  let sL = samples[src];
+                  let sR = samples[src + 1];
+                  if (sL - sL !== 0) {
+                    sL = 0.0;
+                    sanitized++;
+                  }
+                  if (sR - sR !== 0) {
+                    sR = 0.0;
+                    sanitized++;
+                  }
+                  outL[dst] = sL * gain;
+                  outR[dst] = sR * gain;
                   src += 2;
+                }
+              }
+            } else if (inChannels === 1) {
+              let src = readSlot;
+              for (let f = 0; f < firstFrames; f++) {
+                let s = samples[src];
+                if (s - s !== 0) {
+                  s = 0.0;
+                  sanitized++;
+                }
+                const v = s * gain;
+                for (let c = 0; c < outChannels; c++) {
+                  output[c][f] = v;
+                }
+                src++;
+              }
+              if (secondFrames > 0) {
+                src = 0;
+                for (let f = 0; f < secondFrames; f++) {
+                  const dst = firstFrames + f;
+                  let s = samples[src];
+                  if (s - s !== 0) {
+                    s = 0.0;
+                    sanitized++;
+                  }
+                  const v = s * gain;
+                  for (let c = 0; c < outChannels; c++) {
+                    output[c][dst] = v;
+                  }
+                  src++;
                 }
               }
             } else {
               let srcBase = readSlot * inChannels;
               for (let f = 0; f < firstFrames; f++) {
-                for (let c = 0; c < outChannels; c++) {
-                  const s =
-                    c < inChannels
-                      ? samples[srcBase + c]
-                      : inChannels === 1
-                        ? samples[srcBase]
-                        : 0.0;
+                for (let c = 0; c < copyChannels; c++) {
+                  let s = samples[srcBase + c];
+                  if (s - s !== 0) {
+                    s = 0.0;
+                    sanitized++;
+                  }
                   output[c][f] = s * gain;
+                }
+                for (let c = copyChannels; c < outChannels; c++) {
+                  output[c][f] = 0.0;
                 }
                 srcBase += inChannels;
               }
@@ -502,14 +818,16 @@
                 srcBase = 0;
                 for (let f = 0; f < secondFrames; f++) {
                   const dst = firstFrames + f;
-                  for (let c = 0; c < outChannels; c++) {
-                    const s =
-                      c < inChannels
-                        ? samples[srcBase + c]
-                        : inChannels === 1
-                          ? samples[srcBase]
-                          : 0.0;
+                  for (let c = 0; c < copyChannels; c++) {
+                    let s = samples[srcBase + c];
+                    if (s - s !== 0) {
+                      s = 0.0;
+                      sanitized++;
+                    }
                     output[c][dst] = s * gain;
+                  }
+                  for (let c = copyChannels; c < outChannels; c++) {
+                    output[c][dst] = 0.0;
                   }
                   srcBase += inChannels;
                 }
@@ -518,17 +836,92 @@
           }
         }
 
+        if (sanitized > 0) {
+          this._sanitizedSamples += sanitized;
+        }
+
         let nextRead = read + framesToRead;
         if (nextRead >= modulus) {
           nextRead -= modulus;
         }
         Atomics.store(ctrl, HDR_READ_CURSOR, nextRead);
+
+        // Record the last emitted finite frame for smooth underrun de-click fade-out.
+        const lastIdx = framesToRead - 1;
+        let hasNonZero = false;
+        for (let c = 0; c < trackedChannels; c++) {
+          const v = output[c][lastIdx];
+          lastSamples[c] = v;
+          if (v !== 0.0) {
+            hasNonZero = true;
+          }
+        }
+        for (let c = trackedChannels; c < lastSamples.length; c++) {
+          lastSamples[c] = 0.0;
+        }
+        this._hasActiveAudio = hasNonZero;
       }
 
       if (framesToRead < quantumFrames) {
         const missingFrames = quantumFrames - framesToRead;
-        for (let c = 0; c < outChannels; c++) {
-          output[c].fill(0, framesToRead, quantumFrames);
+        const declickFrames = this._declickFrames;
+
+        if (declickFrames > 0) {
+          if (this._declickTotal === 0 && this._hasActiveAudio) {
+            this._declickPos = 0;
+            this._declickTotal = declickFrames;
+            this._declickFadeOuts++;
+            this._hasActiveAudio = false;
+          }
+
+          if (this._declickTotal > 0) {
+            const total = this._declickTotal;
+            const startPos = this._declickPos;
+            const remainingFade = total - startPos;
+            const fadeCount = missingFrames < remainingFade ? missingFrames : remainingFade;
+
+            for (let i = 0; i < fadeCount; i++) {
+              const scale = (total - 1 - (startPos + i)) / total;
+              const dst = framesToRead + i;
+              if (scale === 0.0) {
+                for (let c = 0; c < outChannels; c++) {
+                  output[c][dst] = 0.0;
+                }
+              } else {
+                for (let c = 0; c < trackedChannels; c++) {
+                  output[c][dst] = lastSamples[c] * scale;
+                }
+                for (let c = trackedChannels; c < outChannels; c++) {
+                  output[c][dst] = 0.0;
+                }
+              }
+            }
+
+            this._declickPos = startPos + fadeCount;
+            if (this._declickPos >= total) {
+              this._declickPos = 0;
+              this._declickTotal = 0;
+              lastSamples.fill(0);
+            }
+
+            if (framesToRead + fadeCount < quantumFrames) {
+              for (let c = 0; c < outChannels; c++) {
+                output[c].fill(0, framesToRead + fadeCount, quantumFrames);
+              }
+            }
+          } else {
+            for (let c = 0; c < outChannels; c++) {
+              output[c].fill(0, framesToRead, quantumFrames);
+            }
+          }
+        } else {
+          for (let c = 0; c < outChannels; c++) {
+            output[c].fill(0, framesToRead, quantumFrames);
+          }
+          this._hasActiveAudio = false;
+          this._declickPos = 0;
+          this._declickTotal = 0;
+          lastSamples.fill(0);
         }
 
         // Advance any in-flight gain ramp across the silent underrun tail so it
@@ -543,6 +936,8 @@
           }
         }
 
+        this._underruns++;
+        this._underrunFrames += missingFrames;
         Atomics.add(ctrl, HDR_UNDERRUNS, 1);
         Atomics.add(ctrl, HDR_UNDERRUN_FRAMES, missingFrames);
       }
@@ -562,6 +957,8 @@
     PROCESSOR_NAME,
     DEFAULT_CHANNELS,
     DEFAULT_SMOOTHING_FRAMES,
+    DEFAULT_DECLICK_FRAMES,
+    MAX_DECLICK_FRAMES,
     HDR_WRITE_CURSOR,
     HDR_READ_CURSOR,
     HDR_CAPACITY_FRAMES,
