@@ -7,9 +7,13 @@
 
   const ABI_VERSION = 1;
   const PACKET_HEADER_BYTES = 8;
+  const WRITE_TEXTURE_HEADER_BYTES = 48;
   const DEFAULT_START_FRAME = 0;
   const DEFAULT_MAX_FRAMES = 60;
   const DEFAULT_MAX_BYTES = 16 * 1024 * 1024;
+  const DEFAULT_MAX_RECORDED_BYTES = DEFAULT_MAX_BYTES;
+  const DEFAULT_SKIP_WRITE_TEXTURE_ABOVE_BYTES = 0;
+  const MAX_SKIPPED_UPLOAD_METADATA_ENTRIES = 256;
   const FRAME_CAPTURE_SCHEMA = 'playgta6-frame-capture';
   const FRAME_CAPTURE_SCHEMA_VERSION = 1;
 
@@ -151,40 +155,144 @@
     return out;
   }
 
+  function resolveMaxBytesOption(opts, fallback) {
+    const hasMaxBytes = opts.maxBytes !== undefined;
+    const hasMaxRecordedBytes = opts.maxRecordedBytes !== undefined;
+    if (hasMaxBytes) {
+      if (!Number.isInteger(opts.maxBytes) || opts.maxBytes < 1) {
+        throw new RangeError(`maxBytes must be a positive integer, got ${opts.maxBytes}`);
+      }
+    }
+    if (hasMaxRecordedBytes) {
+      if (!Number.isInteger(opts.maxRecordedBytes) || opts.maxRecordedBytes < 1) {
+        throw new RangeError(
+          `maxRecordedBytes must be a positive integer, got ${opts.maxRecordedBytes}`
+        );
+      }
+    }
+    if (hasMaxBytes && hasMaxRecordedBytes) {
+      return Math.min(opts.maxBytes, opts.maxRecordedBytes);
+    }
+    if (hasMaxRecordedBytes) {
+      return opts.maxRecordedBytes;
+    }
+    if (hasMaxBytes) {
+      return opts.maxBytes;
+    }
+    return fallback;
+  }
+
+  function resolveSkipWriteTextureAboveBytesOption(opts, fallback) {
+    const hasPrimary = opts.skipWriteTextureAboveBytes !== undefined;
+    const hasAlias = opts.skipLargeWriteTextureBytes !== undefined;
+    if (hasPrimary) {
+      if (
+        !Number.isInteger(opts.skipWriteTextureAboveBytes) ||
+        opts.skipWriteTextureAboveBytes < 0
+      ) {
+        throw new RangeError(
+          `skipWriteTextureAboveBytes must be a non-negative integer, got ${opts.skipWriteTextureAboveBytes}`
+        );
+      }
+    }
+    if (hasAlias) {
+      if (
+        !Number.isInteger(opts.skipLargeWriteTextureBytes) ||
+        opts.skipLargeWriteTextureBytes < 0
+      ) {
+        throw new RangeError(
+          `skipLargeWriteTextureBytes must be a non-negative integer, got ${opts.skipLargeWriteTextureBytes}`
+        );
+      }
+    }
+    if (hasPrimary) {
+      return opts.skipWriteTextureAboveBytes;
+    }
+    if (hasAlias) {
+      return opts.skipLargeWriteTextureBytes;
+    }
+    return fallback;
+  }
+
+  function parseWriteTextureMetadata(view, payloadOffset, payloadBytes, packetBytes, frameSequence) {
+    const texelBytes =
+      payloadBytes > WRITE_TEXTURE_HEADER_BYTES ? payloadBytes - WRITE_TEXTURE_HEADER_BYTES : 0;
+    return {
+      frameSequence,
+      textureId: view.getUint32(payloadOffset, true),
+      mipLevel: view.getUint32(payloadOffset + 4, true),
+      width: view.getUint32(payloadOffset + 20, true),
+      height: view.getUint32(payloadOffset + 24, true),
+      depthOrArrayLayers: view.getUint32(payloadOffset + 28, true),
+      bytesPerRow: view.getUint32(payloadOffset + 32, true),
+      rowsPerImage: view.getUint32(payloadOffset + 36, true),
+      dataLen: view.getUint32(payloadOffset + 40, true),
+      texelBytes,
+      packetBytes,
+    };
+  }
+
+  function cloneSkippedLargeUploads(entries) {
+    const out = new Array(entries.length);
+    for (let i = 0; i < entries.length; i++) {
+      const e = entries[i];
+      out[i] = {
+        frameSequence: e.frameSequence,
+        textureId: e.textureId,
+        mipLevel: e.mipLevel,
+        width: e.width,
+        height: e.height,
+        depthOrArrayLayers: e.depthOrArrayLayers,
+        bytesPerRow: e.bytesPerRow,
+        rowsPerImage: e.rowsPerImage,
+        dataLen: e.dataLen,
+        texelBytes: e.texelBytes,
+        packetBytes: e.packetBytes,
+      };
+    }
+    return out;
+  }
+
   /**
    * Bounded ring-buffered in-browser GPU command stream frame recorder.
    *
    * Parses raw `playgta6::GpuPacketHeader` (`<HHI`: opcode, flags, payload_bytes)
    * packets across arbitrarily chunked buffers, groups complete frames delimited by
    * `BeginFrame` (1) .. `Present` (7), evicts oldest frames when `maxFrames` or
-   * `maxBytes` caps are exceeded, and exports `.pg6trace` byte blobs compatible
-   * with `tools/gpu_trace.py`.
+   * `maxBytes`/`maxRecordedBytes` caps are exceeded, optionally skips oversized
+   * `WriteTexture` payloads above `skipWriteTextureAboveBytes` (recording metadata
+   * and counters instead), and exports `.pg6trace` byte blobs compatible with
+   * `tools/gpu_trace.py`.
    */
   class GpuFrameRecorder {
     static ABI_VERSION = ABI_VERSION;
     static PACKET_HEADER_BYTES = PACKET_HEADER_BYTES;
+    static WRITE_TEXTURE_HEADER_BYTES = WRITE_TEXTURE_HEADER_BYTES;
     static DEFAULT_START_FRAME = DEFAULT_START_FRAME;
     static DEFAULT_MAX_FRAMES = DEFAULT_MAX_FRAMES;
     static DEFAULT_MAX_BYTES = DEFAULT_MAX_BYTES;
+    static DEFAULT_MAX_RECORDED_BYTES = DEFAULT_MAX_RECORDED_BYTES;
+    static DEFAULT_SKIP_WRITE_TEXTURE_ABOVE_BYTES = DEFAULT_SKIP_WRITE_TEXTURE_ABOVE_BYTES;
     static OPCODES = OPCODES;
     static OPCODE_NAMES = OPCODE_NAMES;
 
     constructor(options = {}) {
       const opts = options || {};
       const maxFrames = opts.maxFrames !== undefined ? opts.maxFrames : DEFAULT_MAX_FRAMES;
-      const maxBytes = opts.maxBytes !== undefined ? opts.maxBytes : DEFAULT_MAX_BYTES;
+      const maxBytes = resolveMaxBytesOption(opts, DEFAULT_MAX_BYTES);
       const startFrame = opts.startFrame !== undefined ? opts.startFrame : DEFAULT_START_FRAME;
       const autoStart = opts.autoStart !== undefined ? Boolean(opts.autoStart) : false;
       const stopOnBudget =
         opts.stopOnBudget !== undefined
           ? Boolean(opts.stopOnBudget)
           : opts.startFrame !== undefined;
+      const skipWriteTextureAboveBytes = resolveSkipWriteTextureAboveBytesOption(
+        opts,
+        DEFAULT_SKIP_WRITE_TEXTURE_ABOVE_BYTES
+      );
 
       if (!Number.isInteger(maxFrames) || maxFrames < 1) {
         throw new RangeError(`maxFrames must be a positive integer, got ${maxFrames}`);
-      }
-      if (!Number.isInteger(maxBytes) || maxBytes < 1) {
-        throw new RangeError(`maxBytes must be a positive integer, got ${maxBytes}`);
       }
       if (!Number.isInteger(startFrame) || startFrame < 0) {
         throw new RangeError(`startFrame must be a non-negative integer, got ${startFrame}`);
@@ -194,6 +302,7 @@
       this._maxBytes = maxBytes;
       this._startFrame = startFrame;
       this._stopOnBudget = stopOnBudget;
+      this._skipWriteTextureAboveBytes = skipWriteTextureAboveBytes;
       this._recording = autoStart;
 
       this._frames = [];
@@ -202,17 +311,22 @@
       this._totalPackets = 0;
       this._opcodeCounts = {};
       this._droppedFrames = 0;
+      this._droppedRingPackets = 0;
       this._droppedBudgetFrames = 0;
       this._budgetReached = false;
       this._capturedFrames = 0;
       this._observedFrames = 0;
       this._skippedFrames = 0;
+      this._skippedLargeUploadPackets = 0;
+      this._skippedLargeUploadBytes = 0;
+      this._skippedLargeUploads = [];
       this._nextFrameSeq = 0;
 
       this._activeFrame = null;
       this._pendingChunks = [];
       this._pendingBytes = 0;
       this._pendingNeededBytes = PACKET_HEADER_BYTES;
+      this._skipBytesRemaining = 0;
     }
 
     _resetPartialState() {
@@ -220,6 +334,33 @@
       this._pendingChunks = [];
       this._pendingBytes = 0;
       this._pendingNeededBytes = PACKET_HEADER_BYTES;
+      this._skipBytesRemaining = 0;
+    }
+
+    _shouldSkipLargeWriteTexture(opcode, payloadBytes) {
+      if (this._skipWriteTextureAboveBytes <= 0 || opcode !== OPCODES.WRITE_TEXTURE) {
+        return false;
+      }
+      if (payloadBytes <= WRITE_TEXTURE_HEADER_BYTES) {
+        return false;
+      }
+      return payloadBytes - WRITE_TEXTURE_HEADER_BYTES > this._skipWriteTextureAboveBytes;
+    }
+
+    _recordSkippedLargeWriteTexture(view, payloadOffset, payloadBytes, packetLen) {
+      if (!this._activeFrame || this._activeFrame.skip) {
+        return false;
+      }
+      this._skippedLargeUploadPackets += 1;
+      this._skippedLargeUploadBytes += packetLen;
+      this._activeFrame.skippedLargeUploadPackets += 1;
+      this._activeFrame.skippedLargeUploadBytes += packetLen;
+      if (this._skippedLargeUploads.length < MAX_SKIPPED_UPLOAD_METADATA_ENTRIES) {
+        this._skippedLargeUploads.push(
+          parseWriteTextureMetadata(view, payloadOffset, payloadBytes, packetLen, this._nextFrameSeq)
+        );
+      }
+      return true;
     }
 
     _retainedFrameCount() {
@@ -240,8 +381,9 @@
     }
 
     /**
-     * Starts a bounded capture session with optional frame-window and byte-budget
-     * controls (`startFrame`, `maxFrames`, `maxBytes`). By default stops cleanly
+     * Starts a bounded capture session with optional frame-window, byte-budget,
+     * and large-upload filter controls (`startFrame`, `maxFrames`, `maxBytes` /
+     * `maxRecordedBytes`, `skipWriteTextureAboveBytes`). By default stops cleanly
      * once `maxFrames` or `maxBytes` would be exceeded (`stopOnBudget: true`) and
      * clears prior captured frames (`clear: true`).
      *
@@ -249,6 +391,9 @@
      *   startFrame?: number,
      *   maxFrames?: number,
      *   maxBytes?: number,
+     *   maxRecordedBytes?: number,
+     *   skipWriteTextureAboveBytes?: number,
+     *   skipLargeWriteTextureBytes?: number,
      *   stopOnBudget?: boolean,
      *   clear?: boolean
      * }} [options]
@@ -259,8 +404,11 @@
         opts.startFrame !== undefined ? opts.startFrame : this._startFrame;
       const nextMaxFrames =
         opts.maxFrames !== undefined ? opts.maxFrames : this._maxFrames;
-      const nextMaxBytes =
-        opts.maxBytes !== undefined ? opts.maxBytes : this._maxBytes;
+      const nextMaxBytes = resolveMaxBytesOption(opts, this._maxBytes);
+      const nextSkipWriteTextureAboveBytes = resolveSkipWriteTextureAboveBytesOption(
+        opts,
+        this._skipWriteTextureAboveBytes
+      );
       const nextStopOnBudget =
         opts.stopOnBudget !== undefined ? Boolean(opts.stopOnBudget) : true;
       const shouldClear = opts.clear !== undefined ? Boolean(opts.clear) : true;
@@ -273,13 +421,11 @@
       if (!Number.isInteger(nextMaxFrames) || nextMaxFrames < 1) {
         throw new RangeError(`maxFrames must be a positive integer, got ${nextMaxFrames}`);
       }
-      if (!Number.isInteger(nextMaxBytes) || nextMaxBytes < 1) {
-        throw new RangeError(`maxBytes must be a positive integer, got ${nextMaxBytes}`);
-      }
 
       this._startFrame = nextStartFrame;
       this._maxFrames = nextMaxFrames;
       this._maxBytes = nextMaxBytes;
+      this._skipWriteTextureAboveBytes = nextSkipWriteTextureAboveBytes;
       this._stopOnBudget = nextStopOnBudget;
 
       if (shouldClear) {
@@ -306,11 +452,15 @@
       this._totalPackets = 0;
       this._opcodeCounts = {};
       this._droppedFrames = 0;
+      this._droppedRingPackets = 0;
       this._droppedBudgetFrames = 0;
       this._budgetReached = false;
       this._capturedFrames = 0;
       this._observedFrames = 0;
       this._skippedFrames = 0;
+      this._skippedLargeUploadPackets = 0;
+      this._skippedLargeUploadBytes = 0;
+      this._skippedLargeUploads = [];
       this._nextFrameSeq = 0;
       this._resetPartialState();
       return this;
@@ -348,6 +498,7 @@
       }
 
       this._droppedFrames += 1;
+      this._droppedRingPackets += evicted.packetCount;
       return true;
     }
 
@@ -377,11 +528,14 @@
         byteLength: frameBytes.byteLength,
         packetCount: active.packetCount,
         opcodeCounts: active.opcodeCounts,
+        skippedLargeUploadPackets: active.skippedLargeUploadPackets,
+        skippedLargeUploadBytes: active.skippedLargeUploadBytes,
       };
       this._capturedFrames += 1;
 
       if (frame.byteLength > this._maxBytes) {
         this._droppedFrames += 1;
+        this._droppedRingPackets += frame.packetCount;
         return { completed: 1, dropped: 1 };
       }
 
@@ -420,6 +574,8 @@
               byteLength: 0,
               packetCount: 0,
               opcodeCounts: null,
+              skippedLargeUploadPackets: 0,
+              skippedLargeUploadBytes: 0,
             }
           : {
               skip: false,
@@ -427,6 +583,8 @@
               byteLength: 0,
               packetCount: 0,
               opcodeCounts: {},
+              skippedLargeUploadPackets: 0,
+              skippedLargeUploadBytes: 0,
             };
       }
 
@@ -464,7 +622,14 @@
      * Supports arbitrary splits across packet headers, payloads, and frame boundaries.
      *
      * @param {Uint8Array|ArrayBufferView|ArrayBuffer|SharedArrayBuffer} bytes
-     * @returns {{ recordedBytes: number, packetsParsed: number, completedFrames: number, droppedFrames: number }}
+     * @returns {{
+     *   recordedBytes: number,
+     *   packetsParsed: number,
+     *   completedFrames: number,
+     *   droppedFrames: number,
+     *   skippedLargeUploadPackets: number,
+     *   skippedLargeUploadBytes: number
+     * }}
      */
     recordChunk(bytes) {
       if (!this._recording) {
@@ -473,10 +638,12 @@
           packetsParsed: 0,
           completedFrames: 0,
           droppedFrames: 0,
+          skippedLargeUploadPackets: 0,
+          skippedLargeUploadBytes: 0,
         };
       }
 
-      const src = toUint8Array(bytes);
+      let src = toUint8Array(bytes);
       const srcLen = src.byteLength;
       if (srcLen === 0) {
         return {
@@ -484,12 +651,30 @@
           packetsParsed: 0,
           completedFrames: 0,
           droppedFrames: 0,
+          skippedLargeUploadPackets: 0,
+          skippedLargeUploadBytes: 0,
         };
+      }
+
+      if (this._skipBytesRemaining > 0) {
+        if (src.byteLength <= this._skipBytesRemaining) {
+          this._skipBytesRemaining -= src.byteLength;
+          return {
+            recordedBytes: srcLen,
+            packetsParsed: 0,
+            completedFrames: 0,
+            droppedFrames: 0,
+            skippedLargeUploadPackets: 0,
+            skippedLargeUploadBytes: 0,
+          };
+        }
+        src = src.subarray(this._skipBytesRemaining);
+        this._skipBytesRemaining = 0;
       }
 
       let buf;
       if (this._pendingBytes > 0) {
-        const combinedLen = this._pendingBytes + srcLen;
+        const combinedLen = this._pendingBytes + src.byteLength;
         if (combinedLen < this._pendingNeededBytes) {
           this._pendingChunks.push(copyBytes(src));
           this._pendingBytes = combinedLen;
@@ -498,6 +683,8 @@
             packetsParsed: 0,
             completedFrames: 0,
             droppedFrames: 0,
+            skippedLargeUploadPackets: 0,
+            skippedLargeUploadBytes: 0,
           };
         }
 
@@ -521,12 +708,44 @@
       let packetsParsed = 0;
       let completedFrames = 0;
       let droppedFrames = 0;
+      let chunkSkippedPackets = 0;
+      let chunkSkippedBytes = 0;
 
       while (offset + PACKET_HEADER_BYTES <= len) {
         const opcode = view.getUint16(offset, true);
         // flags at offset + 2 (uint16 LE) preserved verbatim in raw packet bytes.
         const payloadBytes = view.getUint32(offset + 4, true);
         const packetLen = PACKET_HEADER_BYTES + payloadBytes;
+        const skipLargeWriteTexture = this._shouldSkipLargeWriteTexture(opcode, payloadBytes);
+
+        if (skipLargeWriteTexture) {
+          const minHeaderLen = PACKET_HEADER_BYTES + WRITE_TEXTURE_HEADER_BYTES;
+          if (offset + minHeaderLen > len) {
+            this._pendingNeededBytes = minHeaderLen;
+            break;
+          }
+
+          if (
+            this._recordSkippedLargeWriteTexture(
+              view,
+              offset + PACKET_HEADER_BYTES,
+              payloadBytes,
+              packetLen
+            )
+          ) {
+            chunkSkippedPackets += 1;
+            chunkSkippedBytes += packetLen;
+          }
+          packetsParsed += 1;
+
+          if (offset + packetLen > len) {
+            this._skipBytesRemaining = packetLen - (len - offset);
+            offset = len;
+            break;
+          }
+          offset += packetLen;
+          continue;
+        }
 
         if (this._stopOnBudget) {
           if (opcode === OPCODES.BEGIN_FRAME) {
@@ -542,6 +761,8 @@
                   packetsParsed,
                   completedFrames,
                   droppedFrames,
+                  skippedLargeUploadPackets: chunkSkippedPackets,
+                  skippedLargeUploadBytes: chunkSkippedBytes,
                 };
               }
             }
@@ -554,6 +775,8 @@
                 packetsParsed,
                 completedFrames,
                 droppedFrames,
+                skippedLargeUploadPackets: chunkSkippedPackets,
+                skippedLargeUploadBytes: chunkSkippedBytes,
               };
             }
           }
@@ -585,6 +808,8 @@
             packetsParsed,
             completedFrames,
             droppedFrames,
+            skippedLargeUploadPackets: chunkSkippedPackets,
+            skippedLargeUploadBytes: chunkSkippedBytes,
           };
         }
       }
@@ -595,7 +820,13 @@
         this._pendingBytes = remainder.byteLength;
         if (remainder.byteLength >= PACKET_HEADER_BYTES) {
           const remView = new DataView(remainder.buffer, remainder.byteOffset, remainder.byteLength);
-          this._pendingNeededBytes = PACKET_HEADER_BYTES + remView.getUint32(4, true);
+          const remOpcode = remView.getUint16(0, true);
+          const remPayloadBytes = remView.getUint32(4, true);
+          if (this._shouldSkipLargeWriteTexture(remOpcode, remPayloadBytes)) {
+            this._pendingNeededBytes = PACKET_HEADER_BYTES + WRITE_TEXTURE_HEADER_BYTES;
+          } else {
+            this._pendingNeededBytes = PACKET_HEADER_BYTES + remPayloadBytes;
+          }
         } else {
           this._pendingNeededBytes = PACKET_HEADER_BYTES;
         }
@@ -606,6 +837,8 @@
         packetsParsed,
         completedFrames,
         droppedFrames,
+        skippedLargeUploadPackets: chunkSkippedPackets,
+        skippedLargeUploadBytes: chunkSkippedBytes,
       };
     }
 
@@ -658,7 +891,8 @@
     }
 
     /**
-     * Returns JSON-safe capture telemetry including frame-window and budget counters.
+     * Returns JSON-safe capture telemetry including frame-window, budget,
+     * ring-eviction, and large-WriteTexture-filter counters.
      */
     getStats() {
       const available = this._retainedFrameCount();
@@ -667,8 +901,11 @@
         frameCount: available,
         totalBytes: this._totalBytes,
         totalPackets: this._totalPackets,
+        recordedBytes: this._totalBytes,
+        recordedPackets: this._totalPackets,
         opcodeCounts: cloneCounts(this._opcodeCounts),
         droppedFrames: this._droppedFrames,
+        droppedRingPackets: this._droppedRingPackets,
         capturedFrames: this._capturedFrames,
         capturedBytes: this._totalBytes,
         droppedBudgetFrames: this._droppedBudgetFrames,
@@ -676,16 +913,21 @@
         startFrame: this._startFrame,
         observedFrames: this._observedFrames,
         skippedFrames: this._skippedFrames,
+        skippedLargeUploadPackets: this._skippedLargeUploadPackets,
+        skippedLargeUploadBytes: this._skippedLargeUploadBytes,
+        skipWriteTextureAboveBytes: this._skipWriteTextureAboveBytes,
         stopOnBudget: this._stopOnBudget,
         recording: this._recording,
         maxFrames: this._maxFrames,
         maxBytes: this._maxBytes,
+        maxRecordedBytes: this._maxBytes,
       };
     }
 
     /**
      * Returns a JSON-safe summary of recorded frames, byte usage, opcode histogram,
-     * dropped frame count, budget telemetry, and recording state.
+     * dropped frame/packet counts, skipped large-upload metadata, budget telemetry,
+     * and recording state.
      */
     exportMetadata() {
       const available = this._retainedFrameCount();
@@ -698,11 +940,14 @@
           byteLength: frame.byteLength,
           packetCount: frame.packetCount,
           opcodeCounts: cloneCounts(frame.opcodeCounts),
+          skippedLargeUploadPackets: frame.skippedLargeUploadPackets,
+          skippedLargeUploadBytes: frame.skippedLargeUploadBytes,
         };
       }
 
       const stats = this.getStats();
       stats.frames = frames;
+      stats.skippedLargeUploads = cloneSkippedLargeUploads(this._skippedLargeUploads);
       return stats;
     }
 
@@ -1479,9 +1724,12 @@
     FRAME_CAPTURE_SCHEMA_VERSION,
     ABI_VERSION,
     PACKET_HEADER_BYTES,
+    WRITE_TEXTURE_HEADER_BYTES,
     DEFAULT_START_FRAME,
     DEFAULT_MAX_FRAMES,
     DEFAULT_MAX_BYTES,
+    DEFAULT_MAX_RECORDED_BYTES,
+    DEFAULT_SKIP_WRITE_TEXTURE_ABOVE_BYTES,
     OPCODES,
     OPCODE_NAMES,
     getOpcodeName,
