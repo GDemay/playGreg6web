@@ -24,6 +24,7 @@ Pure Python 3.12 stdlib only (zero external dependencies). Usable both as an
 importable library and as a CLI:
 
     python tools/inspect_wgsl_pack.py inspect <pack> [--json] [--strict]
+    python tools/inspect_wgsl_pack.py inspect <pack> --diff-dump <dir> [--reflect <reflect.json>] [--max-samples N] [--json] [--strict]
     python tools/inspect_wgsl_pack.py diff <packA> <packB> [--json]
 """
 
@@ -100,6 +101,36 @@ STAGE_NAME_TO_ENUM: dict[str, ShaderStage] = {
 
 STAGE_ORDER: tuple[str, ...] = ("vertex", "fragment", "compute")
 
+PIPELINE_DUMP_SCHEMA = "playgta6-pipeline-dump"
+PIPELINE_DUMP_SCHEMA_VERSION = 1
+REFLECT_SIDECAR_SCHEMA = "playgta6-stage-reflection"
+REFLECT_SIDECAR_VERSION = 1
+DUMP_DIFF_REPORT_SCHEMA = "playgta6-wgpk-dump-diff"
+DUMP_DIFF_REPORT_VERSION = 1
+DEFAULT_MAX_MISSING_SAMPLES = 25
+
+DUMP_STAGE_ORDER: tuple[str, ...] = ("vertex", "fragment", "compute", "unknown")
+DUMP_ORIGIN_ORDER: tuple[str, ...] = ("native", "dxil")
+
+_DUMP_STAGE_ALIASES: dict[str, str] = {
+    "vertex": "vertex",
+    "vs": "vertex",
+    "fragment": "fragment",
+    "pixel": "fragment",
+    "ps": "fragment",
+    "fs": "fragment",
+    "compute": "compute",
+    "cs": "compute",
+}
+
+_DXIL_KIND_TO_STAGE: dict[int, str] = {
+    0: "fragment",
+    1: "vertex",
+    5: "compute",
+}
+
+_FILENAME_HEX16_RE = re.compile(r"^(?:0[xX])?([0-9a-fA-F]{16})$")
+
 
 class WgpkParseError(ValueError):
     """Raised when a binary WGPK shader pack is truncated, malformed, or invalid."""
@@ -116,6 +147,22 @@ class WgpkParseError(ValueError):
         self.code = code
         self.entry_index = entry_index
         self.offset = offset
+        super().__init__(message)
+
+
+class DumpDiffError(ValueError):
+    """Raised when a pipeline dump directory or reflection sidecar cannot be loaded."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "dump_diff_error",
+        source: str | None = None,
+    ) -> None:
+        self.message = message
+        self.code = code
+        self.source = source
         super().__init__(message)
 
 
@@ -249,6 +296,140 @@ class WgpkBundle:
             if entry.hash == target:
                 return entry
         return None
+
+
+@dataclass(frozen=True)
+class WgpkTocEntry:
+    """Single TOC entry from a `.wgsl.pack` (`WGPK`) archive (without WGSL source bytes)."""
+
+    hash: int
+    stage: ShaderStage
+    offset: int
+    length: int
+
+    @property
+    def hash_hex(self) -> str:
+        return format_shader_hash(self.hash)
+
+    @property
+    def stage_name(self) -> str:
+        return self.stage.as_str()
+
+
+@dataclass(frozen=True)
+class WgpkToc:
+    """Decoded header and entry table of a binary `.wgsl.pack` (`WGPK`) bundle."""
+
+    version: int
+    flags: int
+    byte_length: int
+    entries: tuple[WgpkTocEntry, ...]
+
+    @property
+    def entry_count(self) -> int:
+        return len(self.entries)
+
+    @property
+    def hashes(self) -> frozenset[int]:
+        return frozenset(entry.hash for entry in self.entries)
+
+
+def parse_wgpk_toc(data: bytes | bytearray | memoryview) -> WgpkToc:
+    """Parse and validate a `.wgsl.pack` header and entry table without decoding WGSL payloads."""
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        raise TypeError(f"expected bytes-like buffer, got {type(data).__name__}")
+
+    mv = memoryview(data)
+    total_len = len(mv)
+
+    if total_len < PACK_HEADER_BYTES:
+        raise WgpkParseError(
+            f"WGPK pack truncated: {total_len} bytes (minimum header size: {PACK_HEADER_BYTES})",
+            code="truncated_header",
+            offset=0,
+        )
+
+    magic, version, entry_count, flags = PACK_HEADER_STRUCT.unpack_from(mv, 0)
+    if magic != PACK_MAGIC:
+        raise WgpkParseError(
+            f"invalid WGPK magic {magic!r} (expected {PACK_MAGIC!r})",
+            code="invalid_magic",
+            offset=0,
+        )
+
+    if version != PACK_VERSION:
+        raise WgpkParseError(
+            f"unsupported WGPK version {version} (expected {PACK_VERSION})",
+            code="unsupported_version",
+            offset=4,
+        )
+
+    table_bytes = entry_count * PACK_ENTRY_BYTES
+    data_start = PACK_HEADER_BYTES + table_bytes
+    if total_len < data_start:
+        raise WgpkParseError(
+            f"WGPK pack truncated: {total_len} bytes (header + {entry_count} entry records require {data_start} bytes)",
+            code="truncated_table",
+            offset=PACK_HEADER_BYTES,
+        )
+
+    entries: list[WgpkTocEntry] = []
+    non_empty_ranges: list[tuple[int, int, int]] = []
+
+    for idx in range(entry_count):
+        base = PACK_HEADER_BYTES + idx * PACK_ENTRY_BYTES
+        shader_hash, stage_raw, _reserved, offset, length = PACK_ENTRY_STRUCT.unpack_from(mv, base)
+
+        try:
+            stage = ShaderStage(stage_raw)
+        except ValueError as exc:
+            raise WgpkParseError(
+                f"invalid shader stage value {stage_raw} at entry {idx}",
+                code="invalid_stage",
+                entry_index=idx,
+                offset=base + 8,
+            ) from exc
+
+        end = offset + length
+        if offset < data_start or end > total_len:
+            raise WgpkParseError(
+                f"entry {idx} payload [{offset}..+{length}] exceeds pack bounds "
+                f"(valid payload range: [{data_start}..{total_len}])",
+                code="out_of_bounds",
+                entry_index=idx,
+                offset=base + 12,
+            )
+
+        if length > 0:
+            non_empty_ranges.append((offset, end, idx))
+
+        entries.append(
+            WgpkTocEntry(
+                hash=shader_hash,
+                stage=stage,
+                offset=offset,
+                length=length,
+            )
+        )
+
+    if len(non_empty_ranges) > 1:
+        non_empty_ranges.sort(key=lambda item: (item[0], item[1]))
+        for prev, curr in zip(non_empty_ranges, non_empty_ranges[1:]):
+            if curr[0] < prev[1]:
+                raise WgpkParseError(
+                    f"overlapping payload ranges between entry {prev[2]} [{prev[0]}..{prev[1]}) "
+                    f"and entry {curr[2]} [{curr[0]}..{curr[1]})",
+                    code="overlapping_payloads",
+                    entry_index=curr[2],
+                    offset=curr[0],
+                )
+
+    return WgpkToc(
+        version=version,
+        flags=flags,
+        byte_length=total_len,
+        entries=tuple(entries),
+    )
 
 
 def parse_wgpk(data: bytes | bytearray | memoryview) -> WgpkBundle:
@@ -1694,6 +1875,735 @@ def diff_packs(
 
 
 # ---------------------------------------------------------------------------
+# Pipeline dump & reflection sidecar coverage diff (T45 / #931)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DumpStageIdentity:
+    """Single unique shader stage identity extracted from a pipeline dump."""
+
+    hash: int
+    stage: str   # vertex | fragment | compute | unknown
+    origin: str  # native | dxil
+
+    @property
+    def hash_hex(self) -> str:
+        return format_shader_hash(self.hash)
+
+
+@dataclass(frozen=True)
+class PipelineDumpSummary:
+    """Unique shader stage identities discovered in a pipeline dump directory."""
+
+    source: str
+    manifest_loaded: bool
+    stages: tuple[DumpStageIdentity, ...]
+
+
+@dataclass(frozen=True)
+class ReflectSidecarSummary:
+    """Validated stage-reflection sidecar (`<pack>.reflect.json`) hash index."""
+
+    source: str
+    schema: str | None
+    version: int | None
+    stage_hashes: frozenset[int]
+    stage_map: dict[int, str]
+
+
+@dataclass(frozen=True)
+class StageCoverageCounts:
+    """Coverage counts for one shader stage or origin bucket."""
+
+    dump_total: int
+    in_pack: int
+    missing_from_pack: int
+    in_reflect: int
+    missing_from_reflect: int
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "dump_total": self.dump_total,
+            "in_pack": self.in_pack,
+            "missing_from_pack": self.missing_from_pack,
+            "in_reflect": self.in_reflect,
+            "missing_from_reflect": self.missing_from_reflect,
+        }
+
+
+@dataclass(frozen=True)
+class DumpDiffReport:
+    """Sanitized coverage diff of a pipeline dump against a `.wgsl.pack` and `.reflect.json`."""
+
+    pack_source: str
+    dump_source: str
+    reflect_source: str | None
+    reflect_loaded: bool
+    manifest_loaded: bool
+    pack_entry_count: int
+    reflect_stage_count: int
+    dump_total_stages: int
+    in_pack: int
+    missing_from_pack: int
+    in_reflect: int
+    missing_from_reflect: int
+    in_pack_missing_from_reflect: int
+    by_stage: dict[str, StageCoverageCounts]
+    by_origin: dict[str, StageCoverageCounts]
+    max_samples: int
+    sample_missing_pack_hashes: tuple[str, ...]
+    sample_missing_reflect_hashes: tuple[str, ...]
+
+    @property
+    def pack_coverage_pct(self) -> float:
+        if self.dump_total_stages == 0:
+            return 100.0
+        return round((self.in_pack / self.dump_total_stages) * 100.0, 2)
+
+    @property
+    def reflect_coverage_pct(self) -> float:
+        if self.dump_total_stages == 0:
+            return 100.0
+        return round((self.in_reflect / self.dump_total_stages) * 100.0, 2)
+
+    @property
+    def clean(self) -> bool:
+        if self.missing_from_pack > 0:
+            return False
+        if self.reflect_loaded and self.missing_from_reflect > 0:
+            return False
+        return True
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": DUMP_DIFF_REPORT_SCHEMA,
+            "version": DUMP_DIFF_REPORT_VERSION,
+            "source": self.pack_source,
+            "dump_source": self.dump_source,
+            "reflect_source": self.reflect_source,
+            "reflect_loaded": self.reflect_loaded,
+            "manifest_loaded": self.manifest_loaded,
+            "pack_entry_count": self.pack_entry_count,
+            "reflect_stage_count": self.reflect_stage_count,
+            "dump_total_stages": self.dump_total_stages,
+            "in_pack": self.in_pack,
+            "missing_from_pack": self.missing_from_pack,
+            "in_reflect": self.in_reflect,
+            "missing_from_reflect": self.missing_from_reflect,
+            "in_pack_missing_from_reflect": self.in_pack_missing_from_reflect,
+            "pack_coverage_pct": self.pack_coverage_pct,
+            "reflect_coverage_pct": self.reflect_coverage_pct,
+            "by_stage": {
+                stage: self.by_stage[stage].to_dict()
+                for stage in DUMP_STAGE_ORDER
+                if stage in self.by_stage
+            },
+            "by_origin": {
+                origin: self.by_origin[origin].to_dict()
+                for origin in DUMP_ORIGIN_ORDER
+                if origin in self.by_origin
+            },
+            "max_samples": self.max_samples,
+            "sample_missing_pack_hashes": list(self.sample_missing_pack_hashes),
+            "sample_missing_reflect_hashes": list(self.sample_missing_reflect_hashes),
+            "missing_pack_hashes_truncated": self.missing_from_pack > len(self.sample_missing_pack_hashes),
+            "missing_reflect_hashes_truncated": (
+                self.missing_from_reflect > len(self.sample_missing_reflect_hashes)
+            ),
+            "clean": self.clean,
+        }
+
+
+def _normalize_dump_stage(raw: Any) -> str:
+    """Normalize a pipeline dump or reflection stage name into vertex|fragment|compute|unknown."""
+    if not isinstance(raw, str):
+        return "unknown"
+    return _DUMP_STAGE_ALIASES.get(raw.strip().lower(), "unknown")
+
+
+def _parse_dump_filename_identity(filename: str) -> tuple[int | None, str]:
+    """Parse a 64-bit hex shader hash and optional stage hint from a dump blob filename.
+
+    Supports canonical `0x<16-hex>.bin`, `<16-hex>.bin`, `0x<16-hex>.dxbc`, as well as
+    optional `<stage>_0x<16-hex>.bin` / `0x<16-hex>_<stage>.bin` prefixes/suffixes.
+    """
+    base = sanitize_source_label(filename)
+    if not base or base.startswith("<"):
+        return None, "unknown"
+    stem = base.rsplit(".", 1)[0] if "." in base else base
+    if not stem:
+        return None, "unknown"
+
+    direct = _FILENAME_HEX16_RE.fullmatch(stem)
+    if direct:
+        return int(direct.group(1), 16), "unknown"
+
+    parts = [part for part in re.split(r"[_-]+", stem) if part]
+    if len(parts) < 2:
+        return None, "unknown"
+
+    stage = "unknown"
+    remaining = parts
+    first_stage = _DUMP_STAGE_ALIASES.get(parts[0].lower())
+    if first_stage is not None:
+        stage = first_stage
+        remaining = parts[1:]
+    else:
+        last_stage = _DUMP_STAGE_ALIASES.get(parts[-1].lower())
+        if last_stage is not None:
+            stage = last_stage
+            remaining = parts[:-1]
+
+    if len(remaining) == 1:
+        match = _FILENAME_HEX16_RE.fullmatch(remaining[0])
+        if match:
+            return int(match.group(1), 16), stage
+    return None, "unknown"
+
+
+def _record_dump_stage(
+    stages: dict[int, DumpStageIdentity],
+    shader_hash: int,
+    stage: str,
+    origin: str,
+) -> None:
+    """Insert or refine a unique stage identity (preferring known stage and native origin)."""
+    existing = stages.get(shader_hash)
+    if existing is None:
+        stages[shader_hash] = DumpStageIdentity(hash=shader_hash, stage=stage, origin=origin)
+        return
+    resolved_stage = existing.stage if existing.stage != "unknown" else stage
+    resolved_origin = "native" if existing.origin == "native" or origin == "native" else existing.origin
+    if resolved_stage != existing.stage or resolved_origin != existing.origin:
+        stages[shader_hash] = DumpStageIdentity(
+            hash=shader_hash,
+            stage=resolved_stage,
+            origin=resolved_origin,
+        )
+
+
+def _scan_dump_blob_dir(
+    directory: Path,
+    *,
+    suffix: str,
+    origin: str,
+    stages: dict[int, DumpStageIdentity],
+    source_label: str,
+) -> None:
+    """Scan a dump subdirectory for shader blob filenames without reading shader bytes."""
+    try:
+        entries = sorted(directory.iterdir(), key=lambda p: p.name)
+    except OSError as exc:
+        raise DumpDiffError(
+            _sanitize_os_error(source_label, exc),
+            code="io_error",
+            source=source_label,
+        ) from exc
+
+    for child in entries:
+        if child.suffix.lower() != suffix:
+            continue
+        try:
+            if not child.is_file():
+                continue
+        except OSError:
+            continue
+        shader_hash, stage = _parse_dump_filename_identity(child.name)
+        if shader_hash is not None:
+            _record_dump_stage(stages, shader_hash, stage, origin)
+
+
+def load_pipeline_dump(
+    dump_dir: str | Path,
+    *,
+    source_label: str | None = None,
+) -> PipelineDumpSummary:
+    """Read unique native/DXIL stage identities from a `playgta6-pipeline-dump` v1 directory.
+
+    Reads `<dir>/manifest.json` (if present) and scans `<dir>/native/*.bin` and
+    `<dir>/dxil/*.dxbc` filenames (or `<dir>/*.bin`/`*.dxbc` directly when pointed at
+    a bare blob directory without `manifest.json` or `native/`/`dxil/` subdirs).
+    Never reads or returns raw shader binary bytes.
+    """
+    root = Path(dump_dir)
+    label = sanitize_source_label(source_label if source_label is not None else root)
+
+    if not root.exists():
+        raise DumpDiffError(
+            f"pipeline dump directory not found: {label}",
+            code="dump_not_found",
+            source=label,
+        )
+    if not root.is_dir():
+        raise DumpDiffError(
+            f"pipeline dump path is not a directory: {label}",
+            code="invalid_dump_dir",
+            source=label,
+        )
+
+    stages: dict[int, DumpStageIdentity] = {}
+    manifest_loaded = False
+    manifest_path = root / "manifest.json"
+
+    if manifest_path.exists():
+        manifest_label = sanitize_source_label(manifest_path)
+        if not manifest_path.is_file():
+            raise DumpDiffError(
+                f"invalid pipeline dump manifest {manifest_label}: path is not a file",
+                code="invalid_manifest",
+                source=label,
+            )
+        try:
+            raw_text = manifest_path.read_text(encoding="utf-8-sig")
+        except OSError as exc:
+            raise DumpDiffError(
+                _sanitize_os_error(manifest_label, exc),
+                code="io_error",
+                source=label,
+            ) from exc
+        except UnicodeDecodeError as exc:
+            raise DumpDiffError(
+                f"invalid UTF-8 in pipeline dump manifest {manifest_label}: {exc.reason}",
+                code="invalid_manifest",
+                source=label,
+            ) from exc
+
+        try:
+            doc = json.loads(raw_text)
+        except json.JSONDecodeError as exc:
+            raise DumpDiffError(
+                f"invalid JSON in pipeline dump manifest {manifest_label} "
+                f"(line {exc.lineno}, col {exc.colno}): {exc.msg}",
+                code="invalid_manifest",
+                source=label,
+            ) from exc
+
+        if not isinstance(doc, Mapping):
+            raise DumpDiffError(
+                f"invalid pipeline dump manifest {manifest_label}: top-level value must be a JSON object",
+                code="invalid_manifest",
+                source=label,
+            )
+
+        schema = doc.get("schema")
+        if schema != PIPELINE_DUMP_SCHEMA:
+            raise DumpDiffError(
+                f"unsupported pipeline dump manifest schema in {manifest_label} "
+                f"(expected {PIPELINE_DUMP_SCHEMA!r})",
+                code="invalid_manifest",
+                source=label,
+            )
+
+        if "schema_version" in doc:
+            ver = doc.get("schema_version")
+            if isinstance(ver, bool) or not isinstance(ver, int) or ver != PIPELINE_DUMP_SCHEMA_VERSION:
+                raise DumpDiffError(
+                    f"unsupported pipeline dump schema_version in {manifest_label} "
+                    f"(expected {PIPELINE_DUMP_SCHEMA_VERSION})",
+                    code="invalid_manifest",
+                    source=label,
+                )
+
+        native_stages = doc.get("native_stages")
+        if native_stages is not None:
+            if not isinstance(native_stages, list):
+                raise DumpDiffError(
+                    f"invalid pipeline dump manifest {manifest_label}: 'native_stages' must be a list",
+                    code="invalid_manifest",
+                    source=label,
+                )
+            for idx, item in enumerate(native_stages):
+                if not isinstance(item, Mapping):
+                    raise DumpDiffError(
+                        f"invalid pipeline dump manifest {manifest_label}: native_stages[{idx}] must be an object",
+                        code="invalid_manifest",
+                        source=label,
+                    )
+                raw_id = item.get("code_identity")
+                if raw_id is None or (isinstance(raw_id, str) and not raw_id.strip()):
+                    raw_id = item.get("identity")
+                if raw_id is None or (isinstance(raw_id, str) and not raw_id.strip()):
+                    continue
+                try:
+                    shader_hash = normalize_shader_hash(raw_id)
+                except (TypeError, ValueError) as exc:
+                    raise DumpDiffError(
+                        f"invalid shader identity at native_stages[{idx}] in {manifest_label}",
+                        code="invalid_manifest",
+                        source=label,
+                    ) from exc
+                stage = _normalize_dump_stage(item.get("stage"))
+                _record_dump_stage(stages, shader_hash, stage, "native")
+
+        dxil_entries = doc.get("dxil")
+        if dxil_entries is not None:
+            if not isinstance(dxil_entries, list):
+                raise DumpDiffError(
+                    f"invalid pipeline dump manifest {manifest_label}: 'dxil' must be a list",
+                    code="invalid_manifest",
+                    source=label,
+                )
+            for idx, item in enumerate(dxil_entries):
+                if not isinstance(item, Mapping):
+                    raise DumpDiffError(
+                        f"invalid pipeline dump manifest {manifest_label}: dxil[{idx}] must be an object",
+                        code="invalid_manifest",
+                        source=label,
+                    )
+                raw_id = item.get("identity")
+                if raw_id is None or (isinstance(raw_id, str) and not raw_id.strip()):
+                    continue
+                try:
+                    shader_hash = normalize_shader_hash(raw_id)
+                except (TypeError, ValueError) as exc:
+                    raise DumpDiffError(
+                        f"invalid shader identity at dxil[{idx}] in {manifest_label}",
+                        code="invalid_manifest",
+                        source=label,
+                    ) from exc
+
+                stage = _normalize_dump_stage(item.get("stage"))
+                if stage == "unknown":
+                    raw_kind = item.get("kind")
+                    if isinstance(raw_kind, int) and not isinstance(raw_kind, bool):
+                        stage = _DXIL_KIND_TO_STAGE.get(raw_kind, "unknown")
+                _record_dump_stage(stages, shader_hash, stage, "dxil")
+
+        manifest_loaded = True
+
+    native_dir = root / "native"
+    dxil_dir = root / "dxil"
+    has_native_subdir = native_dir.is_dir()
+    has_dxil_subdir = dxil_dir.is_dir()
+
+    if has_native_subdir:
+        _scan_dump_blob_dir(
+            native_dir,
+            suffix=".bin",
+            origin="native",
+            stages=stages,
+            source_label=label,
+        )
+    if has_dxil_subdir:
+        _scan_dump_blob_dir(
+            dxil_dir,
+            suffix=".dxbc",
+            origin="dxil",
+            stages=stages,
+            source_label=label,
+        )
+    if not manifest_loaded and not has_native_subdir and not has_dxil_subdir:
+        _scan_dump_blob_dir(
+            root,
+            suffix=".bin",
+            origin="native",
+            stages=stages,
+            source_label=label,
+        )
+        _scan_dump_blob_dir(
+            root,
+            suffix=".dxbc",
+            origin="dxil",
+            stages=stages,
+            source_label=label,
+        )
+
+    ordered = tuple(stages[h] for h in sorted(stages))
+    return PipelineDumpSummary(
+        source=label,
+        manifest_loaded=manifest_loaded,
+        stages=ordered,
+    )
+
+
+def resolve_reflect_sidecar_path(
+    pack_path: str | Path | None,
+    reflect_path: str | Path | None = None,
+) -> Path | None:
+    """Resolve an explicit `--reflect` path or auto-detect adjacent `<pack>.reflect.json`."""
+    if reflect_path is not None:
+        return Path(reflect_path)
+    if pack_path is None:
+        return None
+    raw = str(pack_path)
+    if raw == "-":
+        return None
+    base = Path(pack_path)
+    primary = Path(f"{raw}.reflect.json")
+    if primary.is_file():
+        return primary
+    alt = base.with_suffix(".reflect.json")
+    if alt != primary and alt.is_file():
+        return alt
+    return None
+
+
+def load_reflect_sidecar(
+    reflect_path: str | Path,
+    *,
+    source_label: str | None = None,
+) -> ReflectSidecarSummary:
+    """Load and validate a `<pack>.reflect.json` sidecar file and return its stage hash set."""
+    path = Path(reflect_path)
+    label = sanitize_source_label(source_label if source_label is not None else path)
+
+    if not path.exists():
+        raise DumpDiffError(
+            f"reflection sidecar not found: {label}",
+            code="reflect_not_found",
+            source=label,
+        )
+    if not path.is_file():
+        raise DumpDiffError(
+            f"reflection sidecar path is not a file: {label}",
+            code="invalid_reflect_sidecar",
+            source=label,
+        )
+
+    try:
+        raw_text = path.read_text(encoding="utf-8-sig")
+    except OSError as exc:
+        raise DumpDiffError(
+            _sanitize_os_error(label, exc),
+            code="io_error",
+            source=label,
+        ) from exc
+    except UnicodeDecodeError as exc:
+        raise DumpDiffError(
+            f"invalid UTF-8 in reflection sidecar {label}: {exc.reason}",
+            code="invalid_reflect_sidecar",
+            source=label,
+        ) from exc
+
+    try:
+        doc = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise DumpDiffError(
+            f"invalid JSON in reflection sidecar {label} "
+            f"(line {exc.lineno}, col {exc.colno}): {exc.msg}",
+            code="invalid_reflect_sidecar",
+            source=label,
+        ) from exc
+
+    if not isinstance(doc, Mapping):
+        raise DumpDiffError(
+            f"invalid reflection sidecar {label}: top-level value must be a JSON object",
+            code="invalid_reflect_sidecar",
+            source=label,
+        )
+
+    schema_val = doc.get("schema")
+    if schema_val is not None:
+        if not isinstance(schema_val, str) or schema_val != REFLECT_SIDECAR_SCHEMA:
+            raise DumpDiffError(
+                f"unsupported reflection sidecar schema in {label} "
+                f"(expected {REFLECT_SIDECAR_SCHEMA!r})",
+                code="invalid_reflect_sidecar",
+                source=label,
+            )
+
+    version_val = doc.get("version")
+    if version_val is not None:
+        if isinstance(version_val, bool) or not isinstance(version_val, int) or version_val != REFLECT_SIDECAR_VERSION:
+            raise DumpDiffError(
+                f"unsupported reflection sidecar version in {label} "
+                f"(expected {REFLECT_SIDECAR_VERSION})",
+                code="invalid_reflect_sidecar",
+                source=label,
+            )
+
+    stages_obj = doc.get("stages")
+    if not isinstance(stages_obj, Mapping):
+        raise DumpDiffError(
+            f"invalid reflection sidecar {label}: missing or non-object 'stages' map",
+            code="invalid_reflect_sidecar",
+            source=label,
+        )
+
+    stage_map: dict[int, str] = {}
+    for raw_key, raw_entry in stages_obj.items():
+        if not isinstance(raw_key, str) or not isinstance(raw_entry, Mapping):
+            raise DumpDiffError(
+                f"invalid reflection sidecar {label}: every 'stages' entry must map a hash string to an object",
+                code="invalid_reflect_sidecar",
+                source=label,
+            )
+        try:
+            stage_hash = normalize_shader_hash(raw_key)
+        except (TypeError, ValueError) as exc:
+            raise DumpDiffError(
+                f"invalid shader hash key in reflection sidecar {label}",
+                code="invalid_reflect_sidecar",
+                source=label,
+            ) from exc
+        stage_map[stage_hash] = _normalize_dump_stage(raw_entry.get("stage"))
+
+    return ReflectSidecarSummary(
+        source=label,
+        schema=schema_val,
+        version=version_val,
+        stage_hashes=frozenset(stage_map.keys()),
+        stage_map=stage_map,
+    )
+
+
+def _load_toc(
+    path_or_bytes: str | Path | bytes | bytearray | memoryview | WgpkBundle | WgpkToc,
+    *,
+    source_label: str | None = None,
+) -> tuple[WgpkToc, str]:
+    """Load a `WgpkToc` from a path, raw bytes, `WgpkBundle`, or `WgpkToc`."""
+    if isinstance(path_or_bytes, WgpkToc):
+        return path_or_bytes, sanitize_source_label(source_label)
+    if isinstance(path_or_bytes, WgpkBundle):
+        toc = WgpkToc(
+            version=path_or_bytes.version,
+            flags=path_or_bytes.flags,
+            byte_length=path_or_bytes.byte_length,
+            entries=tuple(
+                WgpkTocEntry(
+                    hash=e.hash,
+                    stage=e.stage,
+                    offset=e.offset,
+                    length=e.length,
+                )
+                for e in path_or_bytes.entries
+            ),
+        )
+        return toc, sanitize_source_label(source_label)
+    if isinstance(path_or_bytes, (bytes, bytearray, memoryview)):
+        return parse_wgpk_toc(path_or_bytes), sanitize_source_label(source_label)
+    if isinstance(path_or_bytes, (str, Path)):
+        path = Path(path_or_bytes)
+        label = sanitize_source_label(source_label if source_label is not None else path)
+        raw = path.read_bytes()
+        return parse_wgpk_toc(raw), label
+    raise TypeError(
+        f"expected path, bytes-like buffer, WgpkBundle, or WgpkToc, got {type(path_or_bytes).__name__}"
+    )
+
+
+def diff_pack_against_dump(
+    pack_or_bytes: str | Path | bytes | bytearray | memoryview | WgpkBundle | WgpkToc,
+    dump_dir: str | Path | PipelineDumpSummary,
+    *,
+    reflect_path: str | Path | ReflectSidecarSummary | None = None,
+    max_samples: int = DEFAULT_MAX_MISSING_SAMPLES,
+    pack_label: str | None = None,
+    dump_label: str | None = None,
+    reflect_label: str | None = None,
+) -> DumpDiffReport:
+    """Compare unique native/DXIL stage identities in a pipeline dump against a `.wgsl.pack`
+    TOC and optional `.reflect.json` sidecar (auto-detecting `<pack>.reflect.json` when
+    `pack_or_bytes` is a filesystem path and `reflect_path` is omitted).
+    """
+    if isinstance(max_samples, bool) or not isinstance(max_samples, int) or max_samples < 0:
+        raise DumpDiffError(
+            f"max_samples must be a non-negative integer, got {max_samples!r}",
+            code="invalid_argument",
+        )
+
+    toc, sanitized_pack = _load_toc(pack_or_bytes, source_label=pack_label)
+
+    if isinstance(dump_dir, PipelineDumpSummary):
+        dump_summary = dump_dir
+    else:
+        dump_summary = load_pipeline_dump(dump_dir, source_label=dump_label)
+
+    reflect_summary: ReflectSidecarSummary | None = None
+    if isinstance(reflect_path, ReflectSidecarSummary):
+        reflect_summary = reflect_path
+    else:
+        pack_path_hint = pack_or_bytes if isinstance(pack_or_bytes, (str, Path)) else None
+        resolved_reflect = resolve_reflect_sidecar_path(pack_path_hint, reflect_path)
+        if resolved_reflect is not None:
+            reflect_summary = load_reflect_sidecar(resolved_reflect, source_label=reflect_label)
+
+    pack_hashes = toc.hashes
+    reflect_hashes = reflect_summary.stage_hashes if reflect_summary is not None else frozenset()
+
+    stage_buckets: dict[str, list[int]] = {
+        stage: [0, 0, 0, 0, 0] for stage in DUMP_STAGE_ORDER
+    }
+    origin_buckets: dict[str, list[int]] = {
+        origin: [0, 0, 0, 0, 0] for origin in DUMP_ORIGIN_ORDER
+    }
+
+    in_pack = 0
+    missing_from_pack = 0
+    in_reflect = 0
+    missing_from_reflect = 0
+    in_pack_missing_from_reflect = 0
+    sample_missing_pack: list[str] = []
+    sample_missing_reflect: list[str] = []
+
+    for item in dump_summary.stages:
+        has_pack = item.hash in pack_hashes
+        has_reflect = item.hash in reflect_hashes
+
+        stage_key = item.stage if item.stage in stage_buckets else "unknown"
+        origin_key = item.origin if item.origin in origin_buckets else "native"
+
+        sb = stage_buckets[stage_key]
+        ob = origin_buckets[origin_key]
+        sb[0] += 1
+        ob[0] += 1
+
+        if has_pack:
+            in_pack += 1
+            sb[1] += 1
+            ob[1] += 1
+        else:
+            missing_from_pack += 1
+            sb[2] += 1
+            ob[2] += 1
+            if len(sample_missing_pack) < max_samples:
+                sample_missing_pack.append(item.hash_hex)
+
+        if has_reflect:
+            in_reflect += 1
+            sb[3] += 1
+            ob[3] += 1
+        else:
+            missing_from_reflect += 1
+            sb[4] += 1
+            ob[4] += 1
+            if len(sample_missing_reflect) < max_samples:
+                sample_missing_reflect.append(item.hash_hex)
+            if has_pack:
+                in_pack_missing_from_reflect += 1
+
+    by_stage = {
+        stage: StageCoverageCounts(*vals) for stage, vals in stage_buckets.items()
+    }
+    by_origin = {
+        origin: StageCoverageCounts(*vals) for origin, vals in origin_buckets.items()
+    }
+
+    return DumpDiffReport(
+        pack_source=sanitized_pack,
+        dump_source=dump_summary.source,
+        reflect_source=reflect_summary.source if reflect_summary is not None else None,
+        reflect_loaded=reflect_summary is not None,
+        manifest_loaded=dump_summary.manifest_loaded,
+        pack_entry_count=toc.entry_count,
+        reflect_stage_count=len(reflect_hashes),
+        dump_total_stages=len(dump_summary.stages),
+        in_pack=in_pack,
+        missing_from_pack=missing_from_pack,
+        in_reflect=in_reflect,
+        missing_from_reflect=missing_from_reflect,
+        in_pack_missing_from_reflect=in_pack_missing_from_reflect,
+        by_stage=by_stage,
+        by_origin=by_origin,
+        max_samples=max_samples,
+        sample_missing_pack_hashes=tuple(sample_missing_pack),
+        sample_missing_reflect_hashes=tuple(sample_missing_reflect),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Human-readable text formatters
 # ---------------------------------------------------------------------------
 
@@ -1757,6 +2667,77 @@ def format_diff_text(report: PackDiffReport) -> str:
     return "\n".join(lines)
 
 
+def format_dump_diff_text(report: DumpDiffReport) -> str:
+    """Format a strictly sanitized human-readable summary of a `DumpDiffReport`."""
+    manifest_status = (
+        f"loaded ({PIPELINE_DUMP_SCHEMA} v{PIPELINE_DUMP_SCHEMA_VERSION})"
+        if report.manifest_loaded
+        else "absent (scanned blob filenames)"
+    )
+    reflect_status = (
+        f"{report.reflect_source} ({report.reflect_stage_count} stages)"
+        if report.reflect_loaded and report.reflect_source is not None
+        else "(none)"
+    )
+    lines = [
+        f"WGPK Pipeline Dump Coverage: {report.pack_source} vs {report.dump_source}",
+        f"  Manifest:              {manifest_status}",
+        f"  Reflect sidecar:       {reflect_status}",
+        f"  Pack TOC entries:      {report.pack_entry_count}",
+        f"  Dump total stages:     {report.dump_total_stages}",
+        f"  In pack:               {report.in_pack} / {report.dump_total_stages} ({report.pack_coverage_pct:.2f}%)",
+        f"  Missing from pack:     {report.missing_from_pack}",
+        f"  In reflect:            {report.in_reflect} / {report.dump_total_stages} ({report.reflect_coverage_pct:.2f}%)",
+        f"  Missing from reflect:  {report.missing_from_reflect}"
+        f" (in pack but missing reflect: {report.in_pack_missing_from_reflect})",
+        "  By stage:",
+    ]
+    for stage in DUMP_STAGE_ORDER:
+        counts = report.by_stage[stage]
+        lines.append(
+            f"    {stage:<9} total={counts.dump_total}, in_pack={counts.in_pack}, "
+            f"missing_pack={counts.missing_from_pack}, in_reflect={counts.in_reflect}, "
+            f"missing_reflect={counts.missing_from_reflect}"
+        )
+
+    lines.append("  By origin:")
+    for origin in DUMP_ORIGIN_ORDER:
+        counts = report.by_origin[origin]
+        lines.append(
+            f"    {origin:<9} total={counts.dump_total}, in_pack={counts.in_pack}, "
+            f"missing_pack={counts.missing_from_pack}, in_reflect={counts.in_reflect}, "
+            f"missing_reflect={counts.missing_from_reflect}"
+        )
+
+    if report.sample_missing_pack_hashes:
+        shown = len(report.sample_missing_pack_hashes)
+        extra = report.missing_from_pack - shown
+        suffix = f" (+{extra} more)" if extra > 0 else ""
+        lines.append(
+            f"  Sample missing from pack ({shown} of {report.missing_from_pack}){suffix}:"
+        )
+        lines.append("    " + ", ".join(report.sample_missing_pack_hashes))
+    elif report.missing_from_pack > 0:
+        lines.append(
+            f"  Sample missing from pack (0 of {report.missing_from_pack}, max_samples={report.max_samples})"
+        )
+
+    if report.sample_missing_reflect_hashes:
+        shown = len(report.sample_missing_reflect_hashes)
+        extra = report.missing_from_reflect - shown
+        suffix = f" (+{extra} more)" if extra > 0 else ""
+        lines.append(
+            f"  Sample missing from reflect ({shown} of {report.missing_from_reflect}){suffix}:"
+        )
+        lines.append("    " + ", ".join(report.sample_missing_reflect_hashes))
+    elif report.missing_from_reflect > 0:
+        lines.append(
+            f"  Sample missing from reflect (0 of {report.missing_from_reflect}, max_samples={report.max_samples})"
+        )
+
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # CLI entrypoint
 # ---------------------------------------------------------------------------
@@ -1766,15 +2747,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="inspect_wgsl_pack.py",
         description=(
-            "Inspect, validate WebGPU limits, and diff binary WGPK (.wgsl.pack) "
-            "shader bundles."
+            "Inspect, validate WebGPU limits, diff binary WGPK (.wgsl.pack) "
+            "shader bundles, and audit coverage against pipeline dumps."
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     inspect_parser = subparsers.add_parser(
         "inspect",
-        help="Inspect a single .wgsl.pack bundle and audit WebGPU resource limits.",
+        help="Inspect a single .wgsl.pack bundle, audit WebGPU limits, or diff against a pipeline dump.",
     )
     inspect_parser.add_argument(
         "pack",
@@ -1789,7 +2770,41 @@ def build_arg_parser() -> argparse.ArgumentParser:
     inspect_parser.add_argument(
         "--strict",
         action="store_true",
-        help="Exit with code 1 if any WebGPU limit or policy violation is detected.",
+        help=(
+            "Exit with code 1 if any WebGPU limit violation is detected, or (with --diff-dump) "
+            "if any dump stage is missing from the pack or loaded reflection sidecar."
+        ),
+    )
+    inspect_parser.add_argument(
+        "--diff-dump",
+        dest="diff_dump",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Compare a playgta6-pipeline-dump directory (manifest.json and/or native/*.bin) "
+            "against this .wgsl.pack TOC and optional .reflect.json sidecar."
+        ),
+    )
+    inspect_parser.add_argument(
+        "--reflect",
+        dest="reflect",
+        default=None,
+        metavar="REFLECT_JSON",
+        help=(
+            "Optional path to a <pack>.reflect.json sidecar for --diff-dump "
+            "(auto-detects <pack>.reflect.json when omitted)."
+        ),
+    )
+    inspect_parser.add_argument(
+        "--max-samples",
+        dest="max_samples",
+        type=int,
+        default=DEFAULT_MAX_MISSING_SAMPLES,
+        metavar="N",
+        help=(
+            "Maximum number of missing shader hashes per sample list in --diff-dump mode "
+            f"(default: {DEFAULT_MAX_MISSING_SAMPLES})."
+        ),
     )
 
     diff_parser = subparsers.add_parser(
@@ -1830,8 +2845,93 @@ def _emit_error(
     return 1
 
 
-def _cmd_inspect(args: argparse.Namespace) -> int:
+def _cmd_inspect_diff_dump(args: argparse.Namespace) -> int:
     source_label = sanitize_source_label(args.pack)
+    dump_label = sanitize_source_label(args.diff_dump)
+    reflect_label = sanitize_source_label(args.reflect) if args.reflect is not None else None
+
+    if args.max_samples < 0:
+        return _emit_error(
+            as_json=args.as_json,
+            command="inspect",
+            source_label=source_label,
+            error_code="invalid_argument",
+            message=f"--max-samples must be non-negative, got {args.max_samples}",
+        )
+
+    try:
+        if args.pack == "-":
+            raw = sys.stdin.buffer.read()
+            report = diff_pack_against_dump(
+                raw,
+                Path(args.diff_dump),
+                reflect_path=Path(args.reflect) if args.reflect is not None else None,
+                max_samples=args.max_samples,
+                pack_label="<stdin>",
+                dump_label=dump_label,
+                reflect_label=reflect_label,
+            )
+        else:
+            report = diff_pack_against_dump(
+                Path(args.pack),
+                Path(args.diff_dump),
+                reflect_path=Path(args.reflect) if args.reflect is not None else None,
+                max_samples=args.max_samples,
+                pack_label=source_label,
+                dump_label=dump_label,
+                reflect_label=reflect_label,
+            )
+    except OSError as exc:
+        return _emit_error(
+            as_json=args.as_json,
+            command="inspect",
+            source_label=source_label,
+            error_code="io_error",
+            message=_sanitize_os_error(args.pack, exc),
+        )
+    except WgpkParseError as exc:
+        return _emit_error(
+            as_json=args.as_json,
+            command="inspect",
+            source_label=source_label,
+            error_code=exc.code,
+            message=exc.message,
+        )
+    except DumpDiffError as exc:
+        return _emit_error(
+            as_json=args.as_json,
+            command="inspect",
+            source_label=exc.source or dump_label,
+            error_code=exc.code,
+            message=exc.message,
+        )
+
+    passed = report.clean if args.strict else True
+    if args.as_json:
+        payload = report.to_dict()
+        payload["ok"] = passed
+        payload["strict"] = bool(args.strict)
+        print(json.dumps(payload, indent=2))
+    else:
+        print(format_dump_diff_text(report))
+
+    return 0 if passed else 1
+
+
+def _cmd_inspect(args: argparse.Namespace) -> int:
+    if args.diff_dump is not None:
+        return _cmd_inspect_diff_dump(args)
+
+    source_label = sanitize_source_label(args.pack)
+    if args.reflect is not None:
+        return _emit_error(
+            as_json=args.as_json,
+            command="inspect",
+            source_label=source_label,
+            error_code="invalid_argument",
+            message="--reflect requires --diff-dump",
+        )
+
     try:
         if args.pack == "-":
             raw = sys.stdin.buffer.read()
@@ -1926,9 +3026,22 @@ def _cmd_diff(args: argparse.Namespace) -> int:
     return 0
 
 
+def _normalize_cli_argv(argv: Sequence[str]) -> list[str]:
+    """Allow `<pack> --diff-dump <dir>` shorthand in addition to `inspect <pack> --diff-dump <dir>`."""
+    tokens = list(argv)
+    if not tokens:
+        return tokens
+    if tokens[0] in ("inspect", "diff", "-h", "--help"):
+        return tokens
+    if any(tok == "--diff-dump" or tok.startswith("--diff-dump=") for tok in tokens):
+        return ["inspect", *tokens]
+    return tokens
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_arg_parser()
-    args = parser.parse_args(argv)
+    raw_argv = sys.argv[1:] if argv is None else argv
+    args = parser.parse_args(_normalize_cli_argv(raw_argv))
     if args.command == "inspect":
         return _cmd_inspect(args)
     if args.command == "diff":
