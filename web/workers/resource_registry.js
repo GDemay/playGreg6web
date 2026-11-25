@@ -1,8 +1,10 @@
 'use strict';
 
-// WebGPU resource handle registry, frame-deferred garbage collector, and
-// Frame-1 hardened resource creation/upload helpers (CreateTexture2 ABI v2
-// opcode 35, BC1..BC7 fallback & 4x4 alignment, mip/sampleCount clamping,
+// WebGPU resource handle registry, frame-deferred garbage collector,
+// sRGB/linear sibling viewFormats & cached GPUTextureView manager with
+// generation-based stale-view invalidation, and Frame-1 hardened resource
+// creation/upload helpers (CreateTexture2 ABI v2 opcode 35, BC1..BC7 fallback
+// & 4x4 alignment, r8unorm Bink2 video textures, mip/sampleCount clamping,
 // and 4-byte WebGPU buffer size/write alignment).
 // Zero external dependencies; UMD/CommonJS/ESM compatible for Web Workers
 // (importScripts -> globalThis.PlayGta6ResourceRegistry), browsers, and
@@ -74,6 +76,65 @@
 
   // GpuTextureDimension enum names (runtime/abi/playgta6_abi.h).
   const TEXTURE_DIMENSION_NAMES = Object.freeze(['1d', '2d', '3d']);
+
+  // Valid WebGPU GPUTextureViewDimension and GPUTextureAspect values.
+  const TEXTURE_VIEW_DIMENSIONS = Object.freeze([
+    '1d',
+    '2d',
+    '2d-array',
+    'cube',
+    'cube-array',
+    '3d',
+  ]);
+  const TEXTURE_VIEW_DIMENSION_SET = new Set(TEXTURE_VIEW_DIMENSIONS);
+
+  const TEXTURE_VIEW_ASPECTS = Object.freeze(['all', 'stencil-only', 'depth-only']);
+  const TEXTURE_VIEW_ASPECT_SET = new Set(TEXTURE_VIEW_ASPECTS);
+
+  // WebGPU sRGB <-> linear view-compatible sibling format pairs.
+  // Note: single/dual-channel formats such as r8unorm (Bink2 Y/U/V/A planes)
+  // and rg8unorm (NV12 UV plane) have no sRGB sibling in WebGPU.
+  const SRGB_SIBLING_FORMATS = Object.freeze({
+    rgba8unorm: 'rgba8unorm-srgb',
+    'rgba8unorm-srgb': 'rgba8unorm',
+    bgra8unorm: 'bgra8unorm-srgb',
+    'bgra8unorm-srgb': 'bgra8unorm',
+    'bc1-rgba-unorm': 'bc1-rgba-unorm-srgb',
+    'bc1-rgba-unorm-srgb': 'bc1-rgba-unorm',
+    'bc2-rgba-unorm': 'bc2-rgba-unorm-srgb',
+    'bc2-rgba-unorm-srgb': 'bc2-rgba-unorm',
+    'bc3-rgba-unorm': 'bc3-rgba-unorm-srgb',
+    'bc3-rgba-unorm-srgb': 'bc3-rgba-unorm',
+    'bc7-rgba-unorm': 'bc7-rgba-unorm-srgb',
+    'bc7-rgba-unorm-srgb': 'bc7-rgba-unorm',
+  });
+
+  // Formats commonly used by Bink2 planar/semi-planar/RGBA video textures.
+  const BINK_VIDEO_TEXTURE_FORMATS = Object.freeze(['r8unorm', 'rg8unorm', 'rgba8unorm']);
+
+  // Depth/stencil aspect-specific view format mapping per WebGPU spec.
+  const DEPTH_STENCIL_ASPECT_FORMATS = Object.freeze({
+    'depth24plus-stencil8': Object.freeze({
+      'depth-only': 'depth24plus',
+      'stencil-only': 'stencil8',
+    }),
+    'depth32float-stencil8': Object.freeze({
+      'depth-only': 'depth32float',
+      'stencil-only': 'stencil8',
+    }),
+    depth16unorm: Object.freeze({
+      'depth-only': 'depth16unorm',
+    }),
+    depth24plus: Object.freeze({
+      'depth-only': 'depth24plus',
+    }),
+    depth32float: Object.freeze({
+      'depth-only': 'depth32float',
+    }),
+    stencil8: Object.freeze({
+      'stencil-only': 'stencil8',
+    }),
+  });
 
   // All WebGPU BC1..BC7 4x4 block-compressed texture formats.
   const BC_TEXTURE_FORMATS = Object.freeze([
@@ -247,6 +308,389 @@
 
   function isBcFormat(format) {
     return typeof format === 'string' && BC_FORMAT_SET.has(format.toLowerCase());
+  }
+
+  /**
+   * Return whether a WebGPU texture format name is an `-srgb` format.
+   *
+   * @param {string} format
+   * @returns {boolean}
+   */
+  function isSrgbFormat(format) {
+    return typeof format === 'string' && format.trim().toLowerCase().endsWith('-srgb');
+  }
+
+  /**
+   * Return the sRGB <-> linear sibling WebGPU format for `format`, or `null`
+   * when the format has no sRGB sibling (e.g. `r8unorm` Bink2 video planes,
+   * `rg8unorm`, `rgba16float`, depth/stencil formats).
+   *
+   * @param {string} format
+   * @returns {string | null}
+   */
+  function getSrgbSiblingFormat(format) {
+    if (typeof format !== 'string') {
+      return null;
+    }
+    const normalized = format.trim().toLowerCase();
+    if (Object.prototype.hasOwnProperty.call(SRGB_SIBLING_FORMATS, normalized)) {
+      return SRGB_SIBLING_FORMATS[normalized];
+    }
+    return null;
+  }
+
+  /**
+   * Check whether `viewFormat` is WebGPU view-compatible with `textureFormat`
+   * for the given `aspect` (`'all' | 'depth-only' | 'stencil-only'`).
+   *
+   * @param {string} textureFormat
+   * @param {string} viewFormat
+   * @param {string} [aspect='all']
+   * @returns {boolean}
+   */
+  function isViewFormatCompatible(textureFormat, viewFormat, aspect = 'all') {
+    if (typeof textureFormat !== 'string' || typeof viewFormat !== 'string') {
+      return false;
+    }
+    const texFmt = textureFormat.trim().toLowerCase();
+    const vf = viewFormat.trim().toLowerCase();
+    if (!texFmt || !vf) {
+      return false;
+    }
+    const normalizedAspect = typeof aspect === 'string' ? aspect.trim().toLowerCase() : 'all';
+    if (normalizedAspect === 'depth-only' || normalizedAspect === 'stencil-only') {
+      const aspectMap = Object.prototype.hasOwnProperty.call(DEPTH_STENCIL_ASPECT_FORMATS, texFmt)
+        ? DEPTH_STENCIL_ASPECT_FORMATS[texFmt]
+        : null;
+      if (!aspectMap || !Object.prototype.hasOwnProperty.call(aspectMap, normalizedAspect)) {
+        return false;
+      }
+      return vf === aspectMap[normalizedAspect];
+    }
+    return vf === texFmt || getSrgbSiblingFormat(texFmt) === vf;
+  }
+
+  /**
+   * Resolve, deduplicate, and filter `viewFormats` for a texture's effective
+   * WebGPU format, optionally appending its sRGB/linear sibling when one exists.
+   * Incompatible view formats (such as an sRGB view format on an `r8unorm`
+   * Bink2 video texture) are stripped and reported in `droppedViewFormats`.
+   *
+   * @param {string} effectiveFormat
+   * @param {Array<string | number> | null | undefined} requestedViewFormats
+   * @param {{
+   *   bcFormatFallback?: boolean,
+   *   includeSrgbSiblingViewFormat?: boolean,
+   *   includeSrgbSibling?: boolean,
+   * }} [options]
+   * @returns {{
+   *   viewFormats: string[],
+   *   siblingViewFormat: string | null,
+   *   droppedViewFormats: string[],
+   * }}
+   */
+  function resolveTextureViewFormats(effectiveFormat, requestedViewFormats, options = {}) {
+    const texFmt = resolveTextureFormat(effectiveFormat);
+    const siblingViewFormat = getSrgbSiblingFormat(texFmt);
+    const bcFormatFallback = Boolean(options && options.bcFormatFallback);
+    const includeSibling = Boolean(
+      options && (options.includeSrgbSiblingViewFormat || options.includeSrgbSibling)
+    );
+
+    const viewFormats = [];
+    const droppedViewFormats = [];
+    const seen = new Set();
+
+    if (Array.isArray(requestedViewFormats) && requestedViewFormats.length > 0) {
+      for (let i = 0; i < requestedViewFormats.length; i += 1) {
+        const rawVf = requestedViewFormats[i];
+        let vf =
+          typeof rawVf === 'string'
+            ? rawVf.trim().toLowerCase()
+            : typeof rawVf === 'number' && Number.isInteger(rawVf) && rawVf > 0
+              ? TEXTURE_FORMAT_NAMES[rawVf]
+              : undefined;
+        if (!vf || vf === 'undefined') {
+          continue;
+        }
+        if (bcFormatFallback && isBcFormat(vf)) {
+          vf = vf.endsWith('-srgb') ? BC_FALLBACK_SRGB_FORMAT : BC_FALLBACK_FORMAT;
+        }
+        if (!isViewFormatCompatible(texFmt, vf, 'all')) {
+          droppedViewFormats.push(vf);
+          continue;
+        }
+        if (!seen.has(vf) && viewFormats.length < MAX_TEXTURE_VIEW_FORMATS) {
+          seen.add(vf);
+          viewFormats.push(vf);
+        }
+      }
+    }
+
+    if (
+      includeSibling &&
+      siblingViewFormat &&
+      !seen.has(siblingViewFormat) &&
+      viewFormats.length < MAX_TEXTURE_VIEW_FORMATS
+    ) {
+      seen.add(siblingViewFormat);
+      viewFormats.push(siblingViewFormat);
+    }
+
+    return {
+      viewFormats,
+      siblingViewFormat,
+      droppedViewFormats,
+    };
+  }
+
+  /**
+   * Build the canonical 8-tuple cache key for a cached `GPUTextureView`:
+   * `(textureId, format, dimension, baseMipLevel, mipLevelCount, baseArrayLayer, arrayLayerCount, aspect)`.
+   *
+   * @param {number} textureId
+   * @param {{
+   *   format: string,
+   *   dimension: string,
+   *   baseMipLevel: number,
+   *   mipLevelCount: number | string,
+   *   baseArrayLayer: number,
+   *   arrayLayerCount: number | string,
+   *   aspect: string,
+   * }} normalized
+   * @returns {string}
+   */
+  function buildTextureViewCacheKey(textureId, normalized) {
+    return `${textureId}|${normalized.format}|${normalized.dimension}|${normalized.baseMipLevel}|${normalized.mipLevelCount}|${normalized.baseArrayLayer}|${normalized.arrayLayerCount}|${normalized.aspect}`;
+  }
+
+  /**
+   * Normalize a `GPUTextureViewDescriptor` (with optional texture metadata) into
+   * the canonical 8-tuple fields, cache key, and WebGPU `createView()` descriptor.
+   *
+   * @param {number} textureId
+   * @param {object | null | undefined} rawViewDesc
+   * @param {object | null | undefined} [textureMeta]
+   * @returns {{
+   *   textureId: number,
+   *   format: string,
+   *   dimension: string,
+   *   baseMipLevel: number,
+   *   mipLevelCount: number | string,
+   *   baseArrayLayer: number,
+   *   arrayLayerCount: number | string,
+   *   aspect: string,
+   *   key: string,
+   *   gpuViewDescriptor: object,
+   * }}
+   */
+  function normalizeTextureViewDescriptor(textureId, rawViewDesc, textureMeta = null) {
+    assertValidHandle(textureId);
+    if (rawViewDesc !== undefined && rawViewDesc !== null && typeof rawViewDesc !== 'object') {
+      throw new TypeError('texture view descriptor must be an object, null, or undefined');
+    }
+    const desc = rawViewDesc || {};
+    const meta = textureMeta && typeof textureMeta === 'object' ? textureMeta : null;
+
+    // 1. Aspect
+    let aspect = 'all';
+    if (desc.aspect !== undefined && desc.aspect !== null) {
+      if (typeof desc.aspect !== 'string') {
+        throw new RangeError(`Invalid texture view aspect: ${String(desc.aspect)}`);
+      }
+      const lowerAspect = desc.aspect.trim().toLowerCase();
+      if (!TEXTURE_VIEW_ASPECT_SET.has(lowerAspect)) {
+        throw new RangeError(
+          `Invalid texture view aspect: ${JSON.stringify(desc.aspect)} (expected one of ${TEXTURE_VIEW_ASPECTS.join(', ')})`
+        );
+      }
+      aspect = lowerAspect;
+    }
+
+    // 2. Format
+    let format = '';
+    if (desc.format !== undefined && desc.format !== null && desc.format !== 'undefined') {
+      if (typeof desc.format === 'string' && desc.format.trim().length > 0) {
+        format = desc.format.trim().toLowerCase();
+      } else if (
+        typeof desc.format === 'number' &&
+        Number.isInteger(desc.format) &&
+        desc.format > 0 &&
+        TEXTURE_FORMAT_NAMES[desc.format]
+      ) {
+        format = TEXTURE_FORMAT_NAMES[desc.format];
+      } else {
+        throw new RangeError(`Invalid texture view format: ${String(desc.format)}`);
+      }
+      if (meta && meta.bcFormatFallback && isBcFormat(format)) {
+        format = format.endsWith('-srgb') ? BC_FALLBACK_SRGB_FORMAT : BC_FALLBACK_FORMAT;
+      }
+    } else if (meta && typeof meta.format === 'string' && meta.format.length > 0) {
+      if (aspect === 'depth-only' || aspect === 'stencil-only') {
+        const aspectMap = Object.prototype.hasOwnProperty.call(
+          DEPTH_STENCIL_ASPECT_FORMATS,
+          meta.format
+        )
+          ? DEPTH_STENCIL_ASPECT_FORMATS[meta.format]
+          : null;
+        if (!aspectMap || !Object.prototype.hasOwnProperty.call(aspectMap, aspect)) {
+          throw new RangeError(
+            `Texture ${textureId} (${meta.format}) does not support aspect "${aspect}"`
+          );
+        }
+        format = aspectMap[aspect];
+      } else {
+        format = meta.format;
+      }
+    }
+
+    // 3. Mip levels
+    let baseMipLevel = 0;
+    if (desc.baseMipLevel !== undefined && desc.baseMipLevel !== null) {
+      assertNonNegativeInteger(desc.baseMipLevel, 'baseMipLevel');
+      baseMipLevel = desc.baseMipLevel;
+    }
+
+    let mipLevelCount;
+    if (desc.mipLevelCount !== undefined && desc.mipLevelCount !== null) {
+      assertPositiveInteger(desc.mipLevelCount, 'mipLevelCount');
+      mipLevelCount = desc.mipLevelCount;
+    } else if (meta && typeof meta.mipLevelCount === 'number' && meta.mipLevelCount >= 1) {
+      mipLevelCount = Math.max(1, meta.mipLevelCount - baseMipLevel);
+    } else {
+      mipLevelCount = 'all';
+    }
+
+    if (meta && typeof meta.mipLevelCount === 'number' && meta.mipLevelCount >= 1) {
+      if (baseMipLevel >= meta.mipLevelCount) {
+        throw new RangeError(
+          `baseMipLevel (${baseMipLevel}) out of bounds for texture ${textureId} (mipLevelCount=${meta.mipLevelCount})`
+        );
+      }
+      if (typeof mipLevelCount === 'number' && baseMipLevel + mipLevelCount > meta.mipLevelCount) {
+        throw new RangeError(
+          `baseMipLevel (${baseMipLevel}) + mipLevelCount (${mipLevelCount}) exceeds texture ${textureId} mipLevelCount (${meta.mipLevelCount})`
+        );
+      }
+    }
+
+    // 4. Dimension & array layers
+    const texDimension = meta && meta.dimension ? meta.dimension : '2d';
+    const maxArrayLayers =
+      meta && typeof meta.depthOrArrayLayers === 'number' && meta.depthOrArrayLayers >= 1
+        ? texDimension === '2d'
+          ? meta.depthOrArrayLayers
+          : 1
+        : null;
+
+    let baseArrayLayer = 0;
+    if (desc.baseArrayLayer !== undefined && desc.baseArrayLayer !== null) {
+      assertNonNegativeInteger(desc.baseArrayLayer, 'baseArrayLayer');
+      baseArrayLayer = desc.baseArrayLayer;
+    }
+
+    let explicitArrayLayerCount = null;
+    if (desc.arrayLayerCount !== undefined && desc.arrayLayerCount !== null) {
+      assertPositiveInteger(desc.arrayLayerCount, 'arrayLayerCount');
+      explicitArrayLayerCount = desc.arrayLayerCount;
+    }
+
+    let dimension;
+    if (desc.dimension !== undefined && desc.dimension !== null) {
+      if (typeof desc.dimension !== 'string') {
+        throw new RangeError(`Invalid texture view dimension: ${String(desc.dimension)}`);
+      }
+      const lowerDim = desc.dimension.trim().toLowerCase();
+      if (!TEXTURE_VIEW_DIMENSION_SET.has(lowerDim)) {
+        throw new RangeError(
+          `Invalid texture view dimension: ${JSON.stringify(desc.dimension)} (expected one of ${TEXTURE_VIEW_DIMENSIONS.join(', ')})`
+        );
+      }
+      dimension = lowerDim;
+    } else if (texDimension === '1d') {
+      dimension = '1d';
+    } else if (texDimension === '3d') {
+      dimension = '3d';
+    } else if (maxArrayLayers !== null && maxArrayLayers > 1 && explicitArrayLayerCount !== 1) {
+      dimension = '2d-array';
+    } else {
+      dimension = '2d';
+    }
+
+    let arrayLayerCount;
+    if (explicitArrayLayerCount !== null) {
+      arrayLayerCount = explicitArrayLayerCount;
+    } else if (dimension === 'cube') {
+      arrayLayerCount = 6;
+    } else if (dimension === '1d' || dimension === '2d' || dimension === '3d') {
+      arrayLayerCount = 1;
+    } else if (maxArrayLayers !== null) {
+      arrayLayerCount = Math.max(1, maxArrayLayers - baseArrayLayer);
+    } else {
+      arrayLayerCount = 'all';
+    }
+
+    if (dimension === 'cube' && typeof arrayLayerCount === 'number' && arrayLayerCount !== 6) {
+      throw new RangeError(`cube texture view requires arrayLayerCount === 6, got ${arrayLayerCount}`);
+    }
+    if (
+      dimension === 'cube-array' &&
+      typeof arrayLayerCount === 'number' &&
+      arrayLayerCount % 6 !== 0
+    ) {
+      throw new RangeError(
+        `cube-array texture view requires arrayLayerCount to be a multiple of 6, got ${arrayLayerCount}`
+      );
+    }
+    if (maxArrayLayers !== null) {
+      if (baseArrayLayer >= maxArrayLayers) {
+        throw new RangeError(
+          `baseArrayLayer (${baseArrayLayer}) out of bounds for texture ${textureId} (arrayLayers=${maxArrayLayers})`
+        );
+      }
+      if (typeof arrayLayerCount === 'number' && baseArrayLayer + arrayLayerCount > maxArrayLayers) {
+        throw new RangeError(
+          `baseArrayLayer (${baseArrayLayer}) + arrayLayerCount (${arrayLayerCount}) exceeds texture ${textureId} arrayLayers (${maxArrayLayers})`
+        );
+      }
+    }
+
+    const gpuViewDescriptor = {
+      dimension,
+      baseMipLevel,
+      baseArrayLayer,
+      aspect,
+    };
+    if (format) {
+      gpuViewDescriptor.format = format;
+    }
+    if (typeof mipLevelCount === 'number') {
+      gpuViewDescriptor.mipLevelCount = mipLevelCount;
+    }
+    if (typeof arrayLayerCount === 'number') {
+      gpuViewDescriptor.arrayLayerCount = arrayLayerCount;
+    }
+    if (typeof desc.label === 'string' && desc.label.length > 0) {
+      gpuViewDescriptor.label = desc.label;
+    }
+
+    const normalized = {
+      textureId,
+      format,
+      dimension,
+      baseMipLevel,
+      mipLevelCount,
+      baseArrayLayer,
+      arrayLayerCount,
+      aspect,
+    };
+    const key = buildTextureViewCacheKey(textureId, normalized);
+
+    return {
+      ...normalized,
+      key,
+      gpuViewDescriptor,
+    };
   }
 
   /**
@@ -847,37 +1291,26 @@
       rawDescriptor.viewFormats !== undefined
         ? rawDescriptor.viewFormats
         : rawDescriptor.view_formats;
-    if (Array.isArray(rawViewFormats) && rawViewFormats.length > 0) {
-      const normalizedViews = [];
-      const seen = new Set();
-      for (let i = 0; i < rawViewFormats.length; i += 1) {
-        const rawVf = rawViewFormats[i];
-        let vf =
-          typeof rawVf === 'string'
-            ? rawVf.toLowerCase()
-            : typeof rawVf === 'number' && rawVf > 0
-              ? TEXTURE_FORMAT_NAMES[rawVf]
-              : undefined;
-        if (!vf || vf === 'undefined') {
-          continue;
-        }
-        if (bcFormatFallback && isBcFormat(vf)) {
-          vf = vf.endsWith('-srgb') ? BC_FALLBACK_SRGB_FORMAT : BC_FALLBACK_FORMAT;
-        }
-        if (!seen.has(vf)) {
-          seen.add(vf);
-          normalizedViews.push(vf);
-        }
-      }
-      if (normalizedViews.length > 0) {
-        sanitizedDesc.viewFormats = normalizedViews;
-      }
+    const includeSrgbSiblingViewFormat = Boolean(
+      (options &&
+        (options.includeSrgbSiblingViewFormat || options.includeSrgbSibling)) ||
+        rawDescriptor.includeSrgbSiblingViewFormat ||
+        rawDescriptor.includeSrgbSibling
+    );
+    const resolvedViews = resolveTextureViewFormats(effectiveFormat, rawViewFormats, {
+      bcFormatFallback,
+      includeSrgbSiblingViewFormat,
+    });
+    if (resolvedViews.viewFormats.length > 0) {
+      sanitizedDesc.viewFormats = resolvedViews.viewFormats;
     }
 
     return {
       descriptor: sanitizedDesc,
       originalFormat,
       effectiveFormat,
+      siblingViewFormat: resolvedViews.siblingViewFormat,
+      droppedViewFormats: resolvedViews.droppedViewFormats,
       bcFormatFallback,
       bcDimensionAligned,
       mipClamped: mipResult.clamped,
@@ -928,6 +1361,7 @@
         framesInFlight = DEFAULT_FRAMES_IN_FLIGHT,
         softBudgetBytes = DEFAULT_SOFT_BUDGET_BYTES,
         device = null,
+        includeSrgbSiblingViewFormat = false,
         onBudgetWarning = null,
         onDestroyError = null,
         onSanitizeWarning = null,
@@ -957,6 +1391,7 @@
       this.framesInFlight = framesInFlight;
       this.softBudgetBytes = resolvedBudget;
       this.device = device;
+      this.includeSrgbSiblingViewFormat = Boolean(includeSrgbSiblingViewFormat);
       this._onBudgetWarning = onBudgetWarning;
       this._onDestroyError = onDestroyError;
       this._onSanitizeWarning = onSanitizeWarning;
@@ -975,6 +1410,18 @@
       this._bufferMeta = new Map();
       /** @type {Map<number, object>} */
       this._textureMeta = new Map();
+
+      // Per-texture generation counters and cached GPUTextureView tracking (W178).
+      /** @type {Map<number, number>} */
+      this._textureGenerationByHandle = new Map();
+      /** @type {Map<number, number>} */
+      this._activeTextureGeneration = new Map();
+      /** @type {Map<number, Map<string, object>>} */
+      this._textureViewCache = new Map();
+      /** @type {Map<number, Set<number>>} */
+      this._linkedViewHandlesByTexture = new Map();
+      /** @type {WeakMap<object, object>} */
+      this._viewMetadata = new WeakMap();
 
       /** @type {Array<object>} */
       this._pendingRetire = [];
@@ -1005,6 +1452,12 @@
       this._bufferAlignPadCount = 0;
       this._mipClampCount = 0;
       this._sampleClampCount = 0;
+
+      // Additive W178 view-cache and texture-recreation telemetry exposed on getStats().
+      this._staleViewsInvalidated = 0;
+      this._viewCacheHits = 0;
+      this._viewCacheMisses = 0;
+      this._textureRecreations = 0;
     }
 
     /**
@@ -1115,15 +1568,222 @@
       return true;
     }
 
+    _invalidateTextureViews(textureId, { retireLinkedTableViews = true } = {}) {
+      let invalidatedCount = 0;
+      const countedViews = new Set();
+
+      const perTexCache = this._textureViewCache.get(textureId);
+      if (perTexCache) {
+        for (const cached of perTexCache.values()) {
+          if (cached && cached.view && typeof cached.view === 'object') {
+            const viewMeta = this._viewMetadata.get(cached.view);
+            if (viewMeta) {
+              viewMeta.invalidated = true;
+            }
+            if (!countedViews.has(cached.view)) {
+              countedViews.add(cached.view);
+              invalidatedCount += 1;
+            }
+          } else {
+            invalidatedCount += 1;
+          }
+        }
+        this._textureViewCache.delete(textureId);
+      }
+
+      if (retireLinkedTableViews) {
+        const linkedHandles = this._linkedViewHandlesByTexture.get(textureId);
+        if (linkedHandles && linkedHandles.size > 0) {
+          const handlesCopy = Array.from(linkedHandles);
+          this._linkedViewHandlesByTexture.delete(textureId);
+          const viewTable = this._tables.get(RESOURCE_KIND.TEXTURE_VIEW);
+          for (let i = 0; i < handlesCopy.length; i += 1) {
+            const viewHandle = handlesCopy[i];
+            const viewEntry = viewTable.get(viewHandle);
+            if (viewEntry && viewEntry.textureId === textureId) {
+              const viewObj = viewEntry.resource;
+              if (viewObj && typeof viewObj === 'object') {
+                const viewMeta = this._viewMetadata.get(viewObj);
+                if (viewMeta) {
+                  viewMeta.invalidated = true;
+                }
+                if (!countedViews.has(viewObj)) {
+                  countedViews.add(viewObj);
+                  invalidatedCount += 1;
+                }
+              } else {
+                invalidatedCount += 1;
+              }
+              this.retire(RESOURCE_KIND.TEXTURE_VIEW, viewHandle);
+            }
+          }
+        }
+      }
+
+      if (invalidatedCount > 0) {
+        this._staleViewsInvalidated += invalidatedCount;
+      }
+      return invalidatedCount;
+    }
+
+    _maybeBuildTextureMetaFromRegistration(handle, resource, meta, byteSize, textureGeneration) {
+      if (meta && meta._skipAutoTextureMeta) {
+        return null;
+      }
+      const desc =
+        meta && meta.descriptor && typeof meta.descriptor === 'object' ? meta.descriptor : null;
+      const hasExplicitMeta =
+        Boolean(desc) ||
+        (meta &&
+          (meta.format !== undefined ||
+            meta.viewFormats !== undefined ||
+            meta.view_formats !== undefined ||
+            meta.width !== undefined ||
+            meta.height !== undefined ||
+            meta.includeSrgbSiblingViewFormat !== undefined));
+      const hasResourceFormat =
+        resource && typeof resource === 'object' && typeof resource.format === 'string' && resource.format.length > 0;
+
+      if (!hasExplicitMeta && !hasResourceFormat) {
+        return null;
+      }
+
+      const rawFormat =
+        desc && desc.format !== undefined
+          ? desc.format
+          : meta && meta.format !== undefined
+            ? meta.format
+            : hasResourceFormat
+              ? resource.format
+              : undefined;
+      const effectiveFormat = resolveTextureFormat(rawFormat);
+      const dimension = resolveTextureDimension(
+        desc && desc.dimension !== undefined
+          ? desc.dimension
+          : meta && meta.dimension !== undefined
+            ? meta.dimension
+            : resource && resource.dimension !== undefined
+              ? resource.dimension
+              : '2d'
+      );
+
+      const sizeSource = desc || meta || resource || {};
+      const extractedSize = extractTextureSize(sizeSource, dimension);
+      const mipLevelCount = clampMipLevelCount(
+        desc && desc.mipLevelCount !== undefined
+          ? desc.mipLevelCount
+          : meta && meta.mipLevelCount !== undefined
+            ? meta.mipLevelCount
+            : resource && resource.mipLevelCount !== undefined
+              ? resource.mipLevelCount
+              : 1,
+        extractedSize.width,
+        extractedSize.height,
+        extractedSize.depthOrArrayLayers,
+        dimension
+      ).mipLevelCount;
+      const sampleCount = clampSampleCount(
+        desc && desc.sampleCount !== undefined
+          ? desc.sampleCount
+          : meta && meta.sampleCount !== undefined
+            ? meta.sampleCount
+            : resource && resource.sampleCount !== undefined
+              ? resource.sampleCount
+              : 1,
+        {
+          mipLevelCount,
+          format: effectiveFormat,
+          dimension,
+          depthOrArrayLayers: extractedSize.depthOrArrayLayers,
+          usage:
+            desc && desc.usage !== undefined
+              ? desc.usage
+              : meta && meta.usage !== undefined
+                ? meta.usage
+                : resource && resource.usage !== undefined
+                  ? resource.usage
+                  : 0,
+        }
+      ).sampleCount;
+      const usage =
+        desc && desc.usage !== undefined
+          ? Number(desc.usage) >>> 0
+          : meta && meta.usage !== undefined
+            ? Number(meta.usage) >>> 0
+            : resource && resource.usage !== undefined
+              ? Number(resource.usage) >>> 0
+              : GPU_TEXTURE_USAGE.TEXTURE_BINDING | GPU_TEXTURE_USAGE.COPY_DST;
+
+      const rawViewFormats =
+        desc && desc.viewFormats !== undefined
+          ? desc.viewFormats
+          : desc && desc.view_formats !== undefined
+            ? desc.view_formats
+            : meta && meta.viewFormats !== undefined
+              ? meta.viewFormats
+              : meta && meta.view_formats !== undefined
+                ? meta.view_formats
+                : resource && Array.isArray(resource.viewFormats)
+                  ? resource.viewFormats
+                  : undefined;
+
+      const includeSibling = Boolean(
+        this.includeSrgbSiblingViewFormat ||
+          (meta && (meta.includeSrgbSiblingViewFormat || meta.includeSrgbSibling)) ||
+          (desc && (desc.includeSrgbSiblingViewFormat || desc.includeSrgbSibling))
+      );
+
+      const resolvedViews = resolveTextureViewFormats(effectiveFormat, rawViewFormats, {
+        bcFormatFallback: false,
+        includeSrgbSiblingViewFormat: includeSibling,
+      });
+
+      return {
+        handle,
+        width: extractedSize.width,
+        height: extractedSize.height,
+        depthOrArrayLayers: extractedSize.depthOrArrayLayers,
+        mipLevelCount,
+        sampleCount,
+        dimension,
+        format: effectiveFormat,
+        originalFormat: effectiveFormat,
+        usage,
+        viewFormats: resolvedViews.viewFormats,
+        siblingViewFormat: resolvedViews.siblingViewFormat,
+        textureGeneration,
+        bcFormatFallback: false,
+        bcDimensionAligned: false,
+        mipClamped: false,
+        sampleClamped: false,
+        isTexture2: Boolean(meta && meta.isTexture2),
+        byteSize,
+      };
+    }
+
     /**
      * Register a WebGPU resource under `(kind, handle)`.
      * If a different resource already occupies `(kind, handle)`, the prior resource
      * is retired for deferred destruction rather than leaked.
      *
+     * For `RESOURCE_KIND.TEXTURE`, replacing an active texture (or re-creating a
+     * previously retired handle) bumps its monotonic `textureGeneration`,
+     * increments `textureRecreations`, and automatically invalidates all cached
+     * and linked `GPUTextureView` handles for that texture ID.
+     *
      * @param {string} kind
      * @param {number} handle
      * @param {object} resource
-     * @param {{ byteSize?: number, label?: string, tag?: unknown }} [meta]
+     * @param {{
+     *   byteSize?: number,
+     *   label?: string,
+     *   tag?: unknown,
+     *   textureId?: number,
+     *   descriptor?: object,
+     *   format?: string | number,
+     *   viewFormats?: Array<string | number>,
+     *   includeSrgbSiblingViewFormat?: boolean,
+     * }} [meta]
      * @returns {object} The registered resource
      */
     register(kind, handle, resource, meta = {}) {
@@ -1143,6 +1803,16 @@
         throw new TypeError('register metadata.label must be a string');
       }
 
+      let linkedTextureId = null;
+      if (
+        kind === RESOURCE_KIND.TEXTURE_VIEW &&
+        meta.textureId !== undefined &&
+        meta.textureId !== null
+      ) {
+        assertValidHandle(meta.textureId);
+        linkedTextureId = meta.textureId;
+      }
+
       const table = this._tables.get(kind);
       const existing = table.get(handle);
 
@@ -1154,12 +1824,43 @@
           existing.byteSize = byteSize;
           existing.label = label;
           existing.tag = tag;
+
+          if (kind === RESOURCE_KIND.TEXTURE) {
+            const currentGen = this._activeTextureGeneration.get(handle) || 1;
+            const autoMeta = this._maybeBuildTextureMetaFromRegistration(
+              handle,
+              resource,
+              meta,
+              byteSize,
+              currentGen
+            );
+            if (autoMeta) {
+              this._textureMeta.set(handle, autoMeta);
+            }
+          }
+
           this._updatePeakBytes();
           this._checkBudget({ kind, handle, label });
           return resource;
         }
         // Cleanly retire the previous resource on handle overwrite so it is never leaked.
         this.retire(kind, handle);
+      }
+
+      let textureGeneration = 0;
+      if (kind === RESOURCE_KIND.TEXTURE) {
+        const prevGen = this._textureGenerationByHandle.get(handle) || 0;
+        const isRecreation = prevGen > 0;
+        textureGeneration = prevGen + 1;
+        this._textureGenerationByHandle.set(handle, textureGeneration);
+        this._activeTextureGeneration.set(handle, textureGeneration);
+        if (isRecreation) {
+          this._textureRecreations += 1;
+        }
+        // Defense-in-depth: ensure zero stale cached views exist for this handle.
+        this._invalidateTextureViews(handle, { retireLinkedTableViews: true });
+      } else if (kind === RESOURCE_KIND.TEXTURE_VIEW && linkedTextureId !== null) {
+        textureGeneration = this._activeTextureGeneration.get(linkedTextureId) || 0;
       }
 
       const entry = {
@@ -1177,10 +1878,41 @@
         fenceDone: false,
         fenceFailed: false,
         destroyed: false,
+        textureId: linkedTextureId,
+        textureGeneration,
       };
       this._nextRegistrationSeq += 1;
 
       table.set(handle, entry);
+
+      if (kind === RESOURCE_KIND.TEXTURE) {
+        const autoMeta = this._maybeBuildTextureMetaFromRegistration(
+          handle,
+          resource,
+          meta,
+          byteSize,
+          textureGeneration
+        );
+        if (autoMeta) {
+          this._textureMeta.set(handle, autoMeta);
+        }
+      } else if (kind === RESOURCE_KIND.TEXTURE_VIEW && linkedTextureId !== null) {
+        let linkedSet = this._linkedViewHandlesByTexture.get(linkedTextureId);
+        if (!linkedSet) {
+          linkedSet = new Set();
+          this._linkedViewHandlesByTexture.set(linkedTextureId, linkedSet);
+        }
+        linkedSet.add(handle);
+        this._viewMetadata.set(resource, {
+          textureId: linkedTextureId,
+          textureGeneration,
+          key: null,
+          descriptor: null,
+          invalidated: false,
+          isDefaultView: Boolean(meta._isDefaultView),
+        });
+      }
+
       this._activeBytes += byteSize;
       this._activeBytesByKind[kind] += byteSize;
       this._totalRegistered += 1;
@@ -1357,8 +2089,13 @@
     createTexture(handle, descriptor, options = {}) {
       assertValidHandle(handle);
       const device = this._resolveDevice(options && options.device, 'createTexture');
+      const includeSrgbSiblingViewFormat = Boolean(
+        this.includeSrgbSiblingViewFormat ||
+          (options && (options.includeSrgbSiblingViewFormat || options.includeSrgbSibling))
+      );
       const sanitized = sanitizeTextureDescriptor(descriptor, device, {
         useV1FormatTable: Boolean(options && options.useV1FormatTable),
+        includeSrgbSiblingViewFormat,
       });
 
       if (sanitized.bcFormatFallback) {
@@ -1393,6 +2130,13 @@
           `clamped sampleCount to ${sanitized.descriptor.sampleCount}`
         );
       }
+      if (sanitized.droppedViewFormats && sanitized.droppedViewFormats.length > 0) {
+        this._emitSanitizeWarning(
+          'view_format_drop',
+          handle,
+          `dropped incompatible viewFormats [${sanitized.droppedViewFormats.join(', ')}] for ${sanitized.effectiveFormat}`
+        );
+      }
 
       const texture = device.createTexture(sanitized.descriptor);
       const label =
@@ -1413,27 +2157,17 @@
               sanitized.descriptor.sampleCount
             );
 
-      // Registering on an existing handle automatically retires the prior texture safely.
+      // Registering on an existing handle automatically retires the prior texture,
+      // increments textureGeneration & textureRecreations, and invalidates all
+      // cached/linked views for `handle`.
       this.register(RESOURCE_KIND.TEXTURE, handle, texture, {
         byteSize: estimatedBytes,
         label,
         tag,
+        _skipAutoTextureMeta: true,
       });
 
-      if (
-        (!options || options.createView !== false) &&
-        texture &&
-        typeof texture.createView === 'function'
-      ) {
-        const textureView = texture.createView();
-        this.register(RESOURCE_KIND.TEXTURE_VIEW, handle, textureView, {
-          byteSize: 0,
-          label: `textureView:${handle}`,
-          tag,
-        });
-      } else {
-        this.retire(RESOURCE_KIND.TEXTURE_VIEW, handle);
-      }
+      const textureGeneration = this._activeTextureGeneration.get(handle) || 1;
 
       this._textureMeta.set(handle, {
         handle,
@@ -1449,6 +2183,8 @@
         viewFormats: sanitized.descriptor.viewFormats
           ? sanitized.descriptor.viewFormats.slice()
           : [],
+        siblingViewFormat: sanitized.siblingViewFormat,
+        textureGeneration,
         bcFormatFallback: sanitized.bcFormatFallback,
         bcDimensionAligned: sanitized.bcDimensionAligned,
         mipClamped: sanitized.mipClamped,
@@ -1456,6 +2192,23 @@
         isTexture2: Boolean(options && options.isTexture2),
         byteSize: estimatedBytes,
       });
+
+      if (
+        (!options || options.createView !== false) &&
+        texture &&
+        typeof texture.createView === 'function'
+      ) {
+        const textureView = texture.createView();
+        this.register(RESOURCE_KIND.TEXTURE_VIEW, handle, textureView, {
+          byteSize: 0,
+          label: `textureView:${handle}`,
+          tag,
+          textureId: handle,
+          _isDefaultView: true,
+        });
+      } else {
+        this.retire(RESOURCE_KIND.TEXTURE_VIEW, handle);
+      }
 
       return texture;
     }
@@ -1544,7 +2297,8 @@
     }
 
     /**
-     * Look up sanitized creation metadata for a texture created via `createTexture` / `createTexture2`.
+     * Look up sanitized creation metadata for a texture created via `createTexture` / `createTexture2`
+     * or registered with descriptor/format metadata via `register(RESOURCE_KIND.TEXTURE, ...)`.
      *
      * @param {number} handle
      * @returns {object | undefined}
@@ -1553,6 +2307,283 @@
       assertValidHandle(handle);
       const meta = this._textureMeta.get(handle);
       return meta ? { ...meta, viewFormats: meta.viewFormats.slice() } : undefined;
+    }
+
+    /**
+     * Return the current active generation counter for a registered texture ID,
+     * or `0` if no active texture is currently registered under `textureId`.
+     * Generation counters increase monotonically across replacements, retirements,
+     * and `destroyAll()` so stale draw-call handles can never alias a new texture.
+     *
+     * @param {number} textureId
+     * @returns {number}
+     */
+    getTextureGeneration(textureId) {
+      assertValidHandle(textureId);
+      return this._activeTextureGeneration.get(textureId) || 0;
+    }
+
+    /**
+     * Return whether `generation` matches the live texture currently registered
+     * under `textureId`.
+     *
+     * @param {number} textureId
+     * @param {number} generation
+     * @returns {boolean}
+     */
+    isTextureGenerationCurrent(textureId, generation) {
+      assertValidHandle(textureId);
+      if (typeof generation !== 'number' || !Number.isSafeInteger(generation) || generation < 1) {
+        return false;
+      }
+      return this._activeTextureGeneration.get(textureId) === generation;
+    }
+
+    /**
+     * Look up or lazily create a cached `GPUTextureView` for `textureId`, keyed by
+     * `(textureId, format, dimension, baseMipLevel, mipLevelCount, baseArrayLayer, arrayLayerCount, aspect)`.
+     *
+     * Automatically validates sibling sRGB/linear `viewFormats` compatibility,
+     * guards against stale generations (e.g. after 1080p <-> 4K recreation or
+     * texture destruction), and updates `viewCacheHits` / `viewCacheMisses`.
+     *
+     * Returns `undefined` when no live texture is registered under `textureId`.
+     *
+     * @param {number} textureId
+     * @param {{
+     *   format?: string | number,
+     *   dimension?: '1d' | '2d' | '2d-array' | 'cube' | 'cube-array' | '3d',
+     *   baseMipLevel?: number,
+     *   mipLevelCount?: number,
+     *   baseArrayLayer?: number,
+     *   arrayLayerCount?: number,
+     *   aspect?: 'all' | 'stencil-only' | 'depth-only',
+     *   label?: string,
+     * }} [viewDesc]
+     * @param {{ allowUndeclaredSibling?: boolean }} [options]
+     * @returns {object | undefined}
+     */
+    getTextureView(textureId, viewDesc = {}, options = {}) {
+      assertValidHandle(textureId);
+      const texture = this.get(RESOURCE_KIND.TEXTURE, textureId);
+      const currentGeneration = this._activeTextureGeneration.get(textureId) || 0;
+      if (!texture || currentGeneration === 0) {
+        if (this._textureViewCache.has(textureId)) {
+          this._invalidateTextureViews(textureId, { retireLinkedTableViews: true });
+        }
+        return undefined;
+      }
+
+      const texMeta = this._textureMeta.get(textureId) || null;
+      const normalized = normalizeTextureViewDescriptor(textureId, viewDesc, texMeta);
+
+      if (texMeta && texMeta.format && normalized.format) {
+        if (normalized.aspect === 'all') {
+          if (normalized.format !== texMeta.format) {
+            if (!isViewFormatCompatible(texMeta.format, normalized.format, 'all')) {
+              throw new RangeError(
+                `View format "${normalized.format}" is not compatible with texture ${textureId} format "${texMeta.format}"`
+              );
+            }
+            const declared =
+              Array.isArray(texMeta.viewFormats) &&
+              texMeta.viewFormats.includes(normalized.format);
+            if (!declared && !(options && options.allowUndeclaredSibling)) {
+              throw new RangeError(
+                `Texture ${textureId} (${texMeta.format}) does not declare viewFormat "${normalized.format}" in viewFormats`
+              );
+            }
+          }
+        } else if (
+          !isViewFormatCompatible(texMeta.format, normalized.format, normalized.aspect)
+        ) {
+          throw new RangeError(
+            `View format "${normalized.format}" with aspect "${normalized.aspect}" is not compatible with texture ${textureId} format "${texMeta.format}"`
+          );
+        }
+      }
+
+      const cacheKey = normalized.key;
+      let perTexCache = this._textureViewCache.get(textureId);
+      if (perTexCache && perTexCache.has(cacheKey)) {
+        const cached = perTexCache.get(cacheKey);
+        if (cached && cached.textureGeneration === currentGeneration) {
+          this._viewCacheHits += 1;
+          return cached.view;
+        }
+        // Defense-in-depth: evict any generation-mismatched entry.
+        if (cached && cached.view && typeof cached.view === 'object') {
+          const vm = this._viewMetadata.get(cached.view);
+          if (vm) {
+            vm.invalidated = true;
+          }
+        }
+        perTexCache.delete(cacheKey);
+        this._staleViewsInvalidated += 1;
+      }
+
+      this._viewCacheMisses += 1;
+
+      if (typeof texture.createView !== 'function') {
+        throw new TypeError(`Texture ${textureId} does not implement createView()`);
+      }
+
+      const view = texture.createView(normalized.gpuViewDescriptor);
+      if (view === null || typeof view !== 'object') {
+        throw new TypeError(`Texture ${textureId} createView() returned a non-object value`);
+      }
+
+      if (!perTexCache) {
+        perTexCache = new Map();
+        this._textureViewCache.set(textureId, perTexCache);
+      }
+
+      const descriptorSnapshot = {
+        format: normalized.format,
+        dimension: normalized.dimension,
+        baseMipLevel: normalized.baseMipLevel,
+        mipLevelCount: normalized.mipLevelCount,
+        baseArrayLayer: normalized.baseArrayLayer,
+        arrayLayerCount: normalized.arrayLayerCount,
+        aspect: normalized.aspect,
+      };
+
+      perTexCache.set(cacheKey, {
+        view,
+        key: cacheKey,
+        textureId,
+        textureGeneration: currentGeneration,
+        descriptor: descriptorSnapshot,
+        createdAtFrame: this._currentFrame,
+      });
+
+      this._viewMetadata.set(view, {
+        textureId,
+        textureGeneration: currentGeneration,
+        key: cacheKey,
+        descriptor: descriptorSnapshot,
+        invalidated: false,
+        isDefaultView: false,
+      });
+
+      return view;
+    }
+
+    /**
+     * Alias for `getTextureView(textureId, viewDesc, options)`.
+     *
+     * @param {number} textureId
+     * @param {object} [viewDesc]
+     * @param {object} [options]
+     * @returns {object | undefined}
+     */
+    getOrCreateTextureView(textureId, viewDesc = {}, options = {}) {
+      return this.getTextureView(textureId, viewDesc, options);
+    }
+
+    /**
+     * Explicitly invalidate all cached and linked `GPUTextureView` handles
+     * associated with `textureId`, incrementing `staleViewsInvalidated`.
+     *
+     * @param {number} textureId
+     * @returns {number} Number of invalidated views
+     */
+    invalidateTextureViews(textureId) {
+      assertValidHandle(textureId);
+      return this._invalidateTextureViews(textureId, { retireLinkedTableViews: true });
+    }
+
+    /**
+     * Check whether a `GPUTextureView` returned by this registry (via
+     * `getTextureView`, `createTexture`, or linked `register(TEXTURE_VIEW, ...)`)
+     * is still valid for the currently active texture generation.
+     *
+     * @param {object | null | undefined} view
+     * @returns {boolean}
+     */
+    isTextureViewValid(view) {
+      if (!view || typeof view !== 'object') {
+        return false;
+      }
+      const info = this._viewMetadata.get(view);
+      if (!info || info.invalidated || info.textureGeneration < 1) {
+        return false;
+      }
+      return this._activeTextureGeneration.get(info.textureId) === info.textureGeneration;
+    }
+
+    /**
+     * Alias for `isTextureViewValid(view)`.
+     *
+     * @param {object | null | undefined} view
+     * @returns {boolean}
+     */
+    isViewValid(view) {
+      return this.isTextureViewValid(view);
+    }
+
+    /**
+     * Return generation & validity metadata for a tracked `GPUTextureView`,
+     * or `null` if the view is not tracked by this registry.
+     *
+     * @param {object | null | undefined} view
+     * @returns {{
+     *   textureId: number,
+     *   textureGeneration: number,
+     *   currentGeneration: number,
+     *   valid: boolean,
+     *   key: string | null,
+     *   descriptor: object | null,
+     *   isDefaultView: boolean,
+     * } | null}
+     */
+    getTextureViewInfo(view) {
+      if (!view || typeof view !== 'object') {
+        return null;
+      }
+      const info = this._viewMetadata.get(view);
+      if (!info) {
+        return null;
+      }
+      const currentGeneration = this._activeTextureGeneration.get(info.textureId) || 0;
+      const valid =
+        !info.invalidated &&
+        info.textureGeneration >= 1 &&
+        currentGeneration === info.textureGeneration;
+      return {
+        textureId: info.textureId,
+        textureGeneration: info.textureGeneration,
+        currentGeneration,
+        valid,
+        key: info.key,
+        descriptor: info.descriptor ? { ...info.descriptor } : null,
+        isDefaultView: info.isDefaultView,
+      };
+    }
+
+    /**
+     * Return sanitized snapshots of all currently cached views for `textureId`.
+     *
+     * @param {number} textureId
+     * @returns {Array<{ key: string, textureId: number, textureGeneration: number, descriptor: object, createdAtFrame: number }>}
+     */
+    getCachedTextureViews(textureId) {
+      assertValidHandle(textureId);
+      const perTexCache = this._textureViewCache.get(textureId);
+      if (!perTexCache) {
+        return [];
+      }
+      const result = [];
+      for (const cached of perTexCache.values()) {
+        result.push({
+          key: cached.key,
+          textureId: cached.textureId,
+          textureGeneration: cached.textureGeneration,
+          descriptor: { ...cached.descriptor },
+          createdAtFrame: cached.createdAtFrame,
+        });
+      }
+      return result;
     }
 
     /**
@@ -1647,6 +2678,24 @@
         this._bufferMeta.delete(handle);
       } else if (kind === RESOURCE_KIND.TEXTURE) {
         this._textureMeta.delete(handle);
+        this._activeTextureGeneration.delete(handle);
+        this._invalidateTextureViews(handle, { retireLinkedTableViews: true });
+      } else if (kind === RESOURCE_KIND.TEXTURE_VIEW) {
+        if (entry.textureId !== undefined && entry.textureId !== null) {
+          const linkedSet = this._linkedViewHandlesByTexture.get(entry.textureId);
+          if (linkedSet) {
+            linkedSet.delete(handle);
+            if (linkedSet.size === 0) {
+              this._linkedViewHandlesByTexture.delete(entry.textureId);
+            }
+          }
+          if (entry.resource && typeof entry.resource === 'object') {
+            const viewMeta = this._viewMetadata.get(entry.resource);
+            if (viewMeta) {
+              viewMeta.invalidated = true;
+            }
+          }
+        }
       }
 
       this._activeBytes = Math.max(0, this._activeBytes - entry.byteSize);
@@ -1917,6 +2966,11 @@
         pendingCountsByKind[this._pendingRetire[i].kind] += 1;
       }
 
+      let cachedViewCount = 0;
+      for (const perTexCache of this._textureViewCache.values()) {
+        cachedViewCount += perTexCache.size;
+      }
+
       return {
         countsByKind,
         byKind,
@@ -1942,6 +2996,11 @@
         bufferAlignPadCount: this._bufferAlignPadCount,
         mipClampCount: this._mipClampCount,
         sampleClampCount: this._sampleClampCount,
+        staleViewsInvalidated: this._staleViewsInvalidated,
+        viewCacheHits: this._viewCacheHits,
+        viewCacheMisses: this._viewCacheMisses,
+        textureRecreations: this._textureRecreations,
+        cachedViewCount,
       };
     }
 
@@ -1954,6 +3013,50 @@
     destroyAll() {
       this._generation += 1;
       this._pendingFences.clear();
+
+      // Invalidate all cached views and linked TEXTURE_VIEW handles prior to clearing.
+      let invalidatedViews = 0;
+      const countedViews = new Set();
+      for (const perTexCache of this._textureViewCache.values()) {
+        for (const cached of perTexCache.values()) {
+          if (cached && cached.view && typeof cached.view === 'object') {
+            const viewMeta = this._viewMetadata.get(cached.view);
+            if (viewMeta) {
+              viewMeta.invalidated = true;
+            }
+            if (!countedViews.has(cached.view)) {
+              countedViews.add(cached.view);
+              invalidatedViews += 1;
+            }
+          } else {
+            invalidatedViews += 1;
+          }
+        }
+      }
+      const activeViewTable = this._tables.get(RESOURCE_KIND.TEXTURE_VIEW);
+      for (const viewEntry of activeViewTable.values()) {
+        if (viewEntry && viewEntry.textureId !== undefined && viewEntry.textureId !== null) {
+          const viewObj = viewEntry.resource;
+          if (viewObj && typeof viewObj === 'object') {
+            const viewMeta = this._viewMetadata.get(viewObj);
+            if (viewMeta) {
+              viewMeta.invalidated = true;
+            }
+            if (!countedViews.has(viewObj)) {
+              countedViews.add(viewObj);
+              invalidatedViews += 1;
+            }
+          } else {
+            invalidatedViews += 1;
+          }
+        }
+      }
+      if (invalidatedViews > 0) {
+        this._staleViewsInvalidated += invalidatedViews;
+      }
+      this._textureViewCache.clear();
+      this._linkedViewHandlesByTexture.clear();
+      this._activeTextureGeneration.clear();
 
       const toDestroy = [];
       for (let i = 0; i < RESOURCE_KINDS.length; i += 1) {
@@ -2006,6 +3109,10 @@
     V1_TEXTURE_FORMAT_NAMES,
     TEXTURE_FORMAT_NAMES,
     TEXTURE_DIMENSION_NAMES,
+    TEXTURE_VIEW_DIMENSIONS,
+    TEXTURE_VIEW_ASPECTS,
+    SRGB_SIBLING_FORMATS,
+    BINK_VIDEO_TEXTURE_FORMATS,
     BC_TEXTURE_FORMATS,
     BC_FALLBACK_FORMAT,
     TEXTURE_COMPRESSION_BC_FEATURE,
@@ -2014,6 +3121,12 @@
     RESOURCE_KIND,
     RESOURCE_KINDS,
     isBcFormat,
+    isSrgbFormat,
+    getSrgbSiblingFormat,
+    isViewFormatCompatible,
+    resolveTextureViewFormats,
+    buildTextureViewCacheKey,
+    normalizeTextureViewDescriptor,
     deviceSupportsBc,
     computeMaxMipLevels,
     clampMipLevelCount,
@@ -2045,6 +3158,10 @@
       V1_TEXTURE_FORMAT_NAMES,
       TEXTURE_FORMAT_NAMES,
       TEXTURE_DIMENSION_NAMES,
+      TEXTURE_VIEW_DIMENSIONS,
+      TEXTURE_VIEW_ASPECTS,
+      SRGB_SIBLING_FORMATS,
+      BINK_VIDEO_TEXTURE_FORMATS,
       BC_TEXTURE_FORMATS,
       BC_FALLBACK_FORMAT,
       TEXTURE_COMPRESSION_BC_FEATURE,
@@ -2053,6 +3170,12 @@
       RESOURCE_KIND,
       RESOURCE_KINDS,
       isBcFormat,
+      isSrgbFormat,
+      getSrgbSiblingFormat,
+      isViewFormatCompatible,
+      resolveTextureViewFormats,
+      buildTextureViewCacheKey,
+      normalizeTextureViewDescriptor,
       deviceSupportsBc,
       computeMaxMipLevels,
       clampMipLevelCount,

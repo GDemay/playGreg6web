@@ -18,12 +18,22 @@ const {
   GPU_BUFFER_USAGE,
   GPU_TEXTURE_USAGE,
   TEXTURE_FORMAT_NAMES,
+  TEXTURE_VIEW_DIMENSIONS,
+  TEXTURE_VIEW_ASPECTS,
+  SRGB_SIBLING_FORMATS,
+  BINK_VIDEO_TEXTURE_FORMATS,
   BC_TEXTURE_FORMATS,
   BC_FALLBACK_FORMAT,
   TEXTURE_COMPRESSION_BC_FEATURE,
   RESOURCE_KIND,
   RESOURCE_KINDS,
   isBcFormat,
+  isSrgbFormat,
+  getSrgbSiblingFormat,
+  isViewFormatCompatible,
+  resolveTextureViewFormats,
+  buildTextureViewCacheKey,
+  normalizeTextureViewDescriptor,
   deviceSupportsBc,
   computeMaxMipLevels,
   clampMipLevelCount,
@@ -1580,4 +1590,543 @@ test('W129 getOldestLiveResources(limit) orders by createdFrame then registratio
   // destroyAll clears live entries.
   reg.destroyAll();
   assert.deepEqual(reg.getOldestLiveResources(), []);
+});
+
+// ---------------------------------------------------------------------------
+// W178 (#885): sRGB/linear sibling viewFormats, r8unorm Bink2 video textures,
+// 8-tuple cached GPUTextureView lookup, textureGeneration tracking, and
+// automatic stale-view invalidation on 1080p <-> 4K texture recreation.
+// ---------------------------------------------------------------------------
+
+test('W178 sRGB/linear sibling format helpers and resolveTextureViewFormats handle all WebGPU pairs and r8unorm Bink2 planes', () => {
+  assert.ok(Object.isFrozen(SRGB_SIBLING_FORMATS));
+  assert.ok(Object.isFrozen(TEXTURE_VIEW_DIMENSIONS));
+  assert.ok(Object.isFrozen(TEXTURE_VIEW_ASPECTS));
+  assert.ok(Object.isFrozen(BINK_VIDEO_TEXTURE_FORMATS));
+  assert.ok(BINK_VIDEO_TEXTURE_FORMATS.includes('r8unorm'));
+
+  // All 6 WebGPU sRGB <-> linear pairs are bidirectional.
+  const expectedPairs = [
+    ['rgba8unorm', 'rgba8unorm-srgb'],
+    ['bgra8unorm', 'bgra8unorm-srgb'],
+    ['bc1-rgba-unorm', 'bc1-rgba-unorm-srgb'],
+    ['bc2-rgba-unorm', 'bc2-rgba-unorm-srgb'],
+    ['bc3-rgba-unorm', 'bc3-rgba-unorm-srgb'],
+    ['bc7-rgba-unorm', 'bc7-rgba-unorm-srgb'],
+  ];
+  for (const [linear, srgb] of expectedPairs) {
+    assert.equal(getSrgbSiblingFormat(linear), srgb);
+    assert.equal(getSrgbSiblingFormat(srgb), linear);
+    assert.equal(isSrgbFormat(linear), false);
+    assert.equal(isSrgbFormat(srgb), true);
+    assert.equal(isViewFormatCompatible(linear, srgb), true);
+    assert.equal(isViewFormatCompatible(srgb, linear), true);
+    assert.equal(isViewFormatCompatible(linear, linear), true);
+  }
+
+  // r8unorm (Bink2 video), rg8unorm, rgba16float, depth/stencil have NO sRGB sibling.
+  for (const nonSrgb of ['r8unorm', 'rg8unorm', 'rgba16float', 'depth24plus-stencil8', 'depth32float']) {
+    assert.equal(getSrgbSiblingFormat(nonSrgb), null);
+    assert.equal(isSrgbFormat(nonSrgb), false);
+  }
+  assert.equal(getSrgbSiblingFormat(null), null);
+  assert.equal(getSrgbSiblingFormat(123), null);
+
+  // Depth/stencil aspect compatibility.
+  assert.equal(isViewFormatCompatible('depth24plus-stencil8', 'depth24plus', 'depth-only'), true);
+  assert.equal(isViewFormatCompatible('depth24plus-stencil8', 'stencil8', 'stencil-only'), true);
+  assert.equal(isViewFormatCompatible('depth32float-stencil8', 'depth32float', 'depth-only'), true);
+  assert.equal(isViewFormatCompatible('depth32float-stencil8', 'stencil8', 'stencil-only'), true);
+  assert.equal(isViewFormatCompatible('r8unorm', 'rgba8unorm-srgb', 'all'), false);
+  assert.equal(isViewFormatCompatible('rgba8unorm', 'bgra8unorm-srgb', 'all'), false);
+
+  // resolveTextureViewFormats strips incompatible formats, deduplicates, and adds sibling when requested.
+  const resolvedRgba = resolveTextureViewFormats(
+    'rgba8unorm',
+    ['rgba8unorm', 23, 'bgra8unorm-srgb', 'r8unorm', 'rgba8unorm-srgb'],
+    { includeSrgbSiblingViewFormat: true }
+  );
+  assert.deepEqual(resolvedRgba.viewFormats, ['rgba8unorm', 'rgba8unorm-srgb']);
+  assert.equal(resolvedRgba.siblingViewFormat, 'rgba8unorm-srgb');
+  assert.deepEqual(resolvedRgba.droppedViewFormats, ['bgra8unorm-srgb', 'r8unorm']);
+
+  // r8unorm with includeSrgbSiblingViewFormat: true never gets a bogus sRGB viewFormat.
+  const resolvedR8 = resolveTextureViewFormats('r8unorm', ['rgba8unorm-srgb', 'r8unorm'], {
+    includeSrgbSiblingViewFormat: true,
+  });
+  assert.deepEqual(resolvedR8.viewFormats, ['r8unorm']);
+  assert.equal(resolvedR8.siblingViewFormat, null);
+  assert.deepEqual(resolvedR8.droppedViewFormats, ['rgba8unorm-srgb']);
+
+  // Classic-worker importScripts isolation also exposes all W178 exports without leaking top-level bindings.
+  const sandbox = { console, TextEncoder, TextDecoder };
+  const vmCtx = vm.createContext(sandbox);
+  vmCtx.self = vmCtx;
+  vmCtx.importScripts = (...urls) => {
+    for (const rel of urls) {
+      const fullPath = path.resolve(WORKERS_DIR, rel);
+      const source = readFileSync(fullPath, 'utf8');
+      vm.runInContext(source, vmCtx, { filename: fullPath });
+    }
+  };
+  vmCtx.importScripts('./texture_formats.js', './resource_registry.js');
+  assert.doesNotThrow(() => {
+    vm.runInContext(
+      `
+      const SRGB_SIBLING_FORMATS = {};
+      const TEXTURE_VIEW_DIMENSIONS = [];
+      const TEXTURE_VIEW_ASPECTS = [];
+      const BINK_VIDEO_TEXTURE_FORMATS = [];
+      function getSrgbSiblingFormat() {}
+      function resolveTextureViewFormats() {}
+      function normalizeTextureViewDescriptor() {}
+      `,
+      vmCtx
+    );
+  });
+  assert.equal(typeof vmCtx.PlayGta6ResourceRegistry.getSrgbSiblingFormat, 'function');
+  assert.equal(typeof vmCtx.PlayGta6ResourceRegistry.normalizeTextureViewDescriptor, 'function');
+  assert.equal(typeof vmCtx.PlayGta6ResourceRegistry.buildTextureViewCacheKey, 'function');
+});
+
+test('W178 r8unorm Bink2 video textures support CreateTexture2, 1-bpp VRAM accounting, view caching, and 1080p <-> 4K recreation', () => {
+  const { device, createdTextures } = createMockWebGpuDevice({
+    features: new Set([TEXTURE_COMPRESSION_BC_FEATURE]),
+  });
+  const warnings = [];
+  const reg = new GpuResourceRegistry({
+    framesInFlight: 2,
+    device,
+    includeSrgbSiblingViewFormat: true,
+    onSanitizeWarning: (w) => warnings.push(w),
+  });
+
+  // Binary CreateTexture2 packet for a 1080p Bink2 Y-plane (format code 1 = r8unorm).
+  const bink1080Payload = buildCreateTexture2Payload({
+    id: 500,
+    width: 1920,
+    height: 1080,
+    depthOrLayers: 1,
+    mipLevels: 1,
+    sampleCount: 1,
+    usageFlags: GPU_TEXTURE_USAGE.TEXTURE_BINDING | GPU_TEXTURE_USAGE.COPY_DST,
+    dimension: 1, // 2d
+    format: 1, // r8unorm
+    viewFormats: [23], // incompatible rgba8unorm-srgb must be cleanly dropped
+  });
+
+  const res1080 = reg.createTexture2(bink1080Payload, 0, CREATE_TEXTURE2_PAYLOAD_BYTES);
+  assert.equal(res1080.error, undefined);
+  assert.equal(res1080.id, 500);
+  assert.equal(createdTextures[0].desc.format, 'r8unorm');
+  assert.equal(createdTextures[0].desc.viewFormats, undefined);
+  assert.equal(res1080.meta.format, 'r8unorm');
+  assert.equal(res1080.meta.siblingViewFormat, null);
+  assert.deepEqual(res1080.meta.viewFormats, []);
+  assert.equal(res1080.meta.byteSize, 1920 * 1080); // 1 bpp = 2,073,600 bytes
+  assert.equal(res1080.meta.textureGeneration, 1);
+  assert.equal(reg.getTextureGeneration(500), 1);
+  assert.equal(warnings.some((w) => w.kind === 'view_format_drop' && w.handle === 500), true);
+
+  // Cached view lookup on r8unorm Bink2 plane: default and explicit 8-tuple hit the same entry.
+  let createViewCalls = 0;
+  const origCreateView0 = createdTextures[0].createView.bind(createdTextures[0]);
+  createdTextures[0].createView = (vd) => {
+    createViewCalls += 1;
+    return origCreateView0(vd);
+  };
+
+  const viewY1080 = reg.getTextureView(500);
+  assert.ok(viewY1080);
+  assert.equal(createViewCalls, 1);
+  assert.equal(viewY1080.textureInternalId, createdTextures[0].internalId);
+  assert.equal(viewY1080.viewDesc.format, 'r8unorm');
+  assert.equal(reg.isTextureViewValid(viewY1080), true);
+  assert.equal(reg.isViewValid(viewY1080), true);
+
+  const viewY1080Hit = reg.getOrCreateTextureView(500, {
+    format: 'r8unorm',
+    dimension: '2d',
+    baseMipLevel: 0,
+    mipLevelCount: 1,
+    baseArrayLayer: 0,
+    arrayLayerCount: 1,
+    aspect: 'all',
+  });
+  assert.equal(viewY1080Hit, viewY1080);
+  assert.equal(createViewCalls, 1);
+
+  // Requesting an sRGB view on an r8unorm texture is rejected.
+  assert.throws(() => reg.getTextureView(500, { format: 'rgba8unorm-srgb' }), RangeError);
+
+  let stats = reg.getStats();
+  assert.equal(stats.viewCacheMisses, 1);
+  assert.equal(stats.viewCacheHits, 1);
+  assert.equal(stats.textureRecreations, 0);
+  assert.equal(stats.staleViewsInvalidated, 0);
+
+  // Recreate Bink2 Y-plane at 4K (3840x2160) on the exact same texture ID 500.
+  const defaultView1080 = reg.get(RESOURCE_KIND.TEXTURE_VIEW, 500);
+  assert.equal(reg.isTextureViewValid(defaultView1080), true);
+
+  const tex4k = reg.createTexture2(500, {
+    width: 3840,
+    height: 2160,
+    mipLevels: 1,
+    format: 'r8unorm',
+    usage: GPU_TEXTURE_USAGE.TEXTURE_BINDING | GPU_TEXTURE_USAGE.COPY_DST,
+  });
+  assert.equal(tex4k, createdTextures[1]);
+  assert.equal(reg.getTextureGeneration(500), 2);
+  assert.equal(reg.isTextureGenerationCurrent(500, 1), false);
+  assert.equal(reg.isTextureGenerationCurrent(500, 2), true);
+  assert.equal(reg.getTextureMeta(500).byteSize, 3840 * 2160);
+  assert.equal(reg.getTextureMeta(500).textureGeneration, 2);
+
+  // Both the cached 1080p view and the old default view are immediately invalidated!
+  assert.equal(reg.isTextureViewValid(viewY1080), false);
+  assert.equal(reg.isTextureViewValid(defaultView1080), false);
+  assert.equal(reg.getTextureViewInfo(viewY1080).valid, false);
+  assert.equal(reg.getTextureViewInfo(viewY1080).textureGeneration, 1);
+  assert.equal(reg.getTextureViewInfo(viewY1080).currentGeneration, 2);
+
+  stats = reg.getStats();
+  assert.equal(stats.textureRecreations, 1);
+  assert.equal(stats.staleViewsInvalidated, 2); // 1 cached view + 1 default view
+  assert.equal(stats.cachedViewCount, 0);
+
+  // Next view lookup creates a fresh view bound to the 4K texture.
+  const viewY4k = reg.getTextureView(500, { format: 'r8unorm' });
+  assert.notEqual(viewY4k, viewY1080);
+  assert.equal(viewY4k.textureInternalId, createdTextures[1].internalId);
+  assert.equal(reg.isTextureViewValid(viewY4k), true);
+  assert.equal(reg.getStats().viewCacheMisses, 2);
+  assert.equal(reg.getStats().cachedViewCount, 1);
+});
+
+test('W178 sibling sRGB/linear viewFormats metadata and 8-tuple cached view lookup across format/dimension/mip/layer/aspect', () => {
+  const { device, createdTextures } = createMockWebGpuDevice({
+    features: new Set([TEXTURE_COMPRESSION_BC_FEATURE]),
+  });
+  const reg = new GpuResourceRegistry({ framesInFlight: 2, device });
+
+  // 1. 2D array texture (6 layers, 4 mips) with sibling sRGB viewFormat auto-included.
+  reg.createTexture2(
+    10,
+    {
+      width: 256,
+      height: 256,
+      arrayLayers: 6,
+      mipLevels: 4,
+      dimension: '2d',
+      format: 'rgba8unorm',
+      usage: GPU_TEXTURE_USAGE.TEXTURE_BINDING | GPU_TEXTURE_USAGE.RENDER_ATTACHMENT,
+    },
+    { includeSrgbSiblingViewFormat: true }
+  );
+
+  assert.deepEqual(createdTextures[0].desc.viewFormats, ['rgba8unorm-srgb']);
+  const meta10 = reg.getTextureMeta(10);
+  assert.equal(meta10.siblingViewFormat, 'rgba8unorm-srgb');
+  assert.deepEqual(meta10.viewFormats, ['rgba8unorm-srgb']);
+  assert.equal(meta10.textureGeneration, 1);
+
+  let viewCalls10 = 0;
+  const origCv10 = createdTextures[0].createView.bind(createdTextures[0]);
+  createdTextures[0].createView = (vd) => {
+    viewCalls10 += 1;
+    return origCv10(vd);
+  };
+
+  // Distinct keys by format (linear vs sRGB sibling).
+  const vLinearArray = reg.getTextureView(10);
+  const vSrgbArray = reg.getTextureView(10, { format: 'rgba8unorm-srgb' });
+  assert.notEqual(vLinearArray, vSrgbArray);
+  assert.equal(vLinearArray.viewDesc.format, 'rgba8unorm');
+  assert.equal(vLinearArray.viewDesc.dimension, '2d-array');
+  assert.equal(vLinearArray.viewDesc.arrayLayerCount, 6);
+  assert.equal(vLinearArray.viewDesc.mipLevelCount, 4);
+  assert.equal(vSrgbArray.viewDesc.format, 'rgba8unorm-srgb');
+
+  // Exact canonical 8-tuple hit for default view.
+  const vLinearArrayHit = reg.getTextureView(10, {
+    format: 'rgba8unorm',
+    dimension: '2d-array',
+    baseMipLevel: 0,
+    mipLevelCount: 4,
+    baseArrayLayer: 0,
+    arrayLayerCount: 6,
+    aspect: 'all',
+  });
+  assert.equal(vLinearArrayHit, vLinearArray);
+
+  // Distinct keys by dimension ('cube' vs '2d' single layer vs '2d-array'), mip slice, and layer slice.
+  const vCubeSrgb = reg.getTextureView(10, { format: 'rgba8unorm-srgb', dimension: 'cube' });
+  const vMip1 = reg.getTextureView(10, { dimension: '2d', baseMipLevel: 1, mipLevelCount: 2, baseArrayLayer: 3, arrayLayerCount: 1 });
+  const vMip2Remaining = reg.getTextureView(10, { dimension: '2d', baseMipLevel: 2, baseArrayLayer: 0 });
+  const vMip2Explicit = reg.getTextureView(10, { dimension: '2d', baseMipLevel: 2, mipLevelCount: 2, baseArrayLayer: 0, arrayLayerCount: 1 });
+  assert.equal(vMip2Explicit, vMip2Remaining);
+  assert.notEqual(vCubeSrgb, vSrgbArray);
+  assert.notEqual(vMip1, vMip2Remaining);
+  assert.equal(viewCalls10, 5);
+
+  const cached10 = reg.getCachedTextureViews(10);
+  assert.equal(cached10.length, 5);
+  assert.equal(
+    cached10.some(
+      (c) => c.key === buildTextureViewCacheKey(10, normalizeTextureViewDescriptor(10, { format: 'rgba8unorm-srgb', dimension: 'cube' }, meta10))
+    ),
+    true
+  );
+
+  // 2. Depth-stencil texture: distinct cached views by aspect ('all', 'depth-only', 'stencil-only').
+  reg.createTexture2(11, {
+    width: 1920,
+    height: 1080,
+    format: 'depth24plus-stencil8',
+    usage: GPU_TEXTURE_USAGE.RENDER_ATTACHMENT | GPU_TEXTURE_USAGE.TEXTURE_BINDING,
+  });
+  const vDepthAll = reg.getTextureView(11);
+  const vDepthOnly = reg.getTextureView(11, { aspect: 'depth-only' });
+  const vDepthOnlyHit = reg.getTextureView(11, { aspect: 'depth-only', format: 'depth24plus' });
+  const vStencilOnly = reg.getTextureView(11, { aspect: 'stencil-only' });
+  assert.equal(vDepthOnlyHit, vDepthOnly);
+  assert.equal(vDepthOnly.viewDesc.format, 'depth24plus');
+  assert.equal(vStencilOnly.viewDesc.format, 'stencil8');
+  assert.notEqual(vDepthAll, vDepthOnly);
+  assert.notEqual(vDepthOnly, vStencilOnly);
+
+  // 3. Undeclared sibling format rejected unless declared in viewFormats or allowUndeclaredSibling is true.
+  reg.createTexture2(12, {
+    width: 64,
+    height: 64,
+    format: 'bgra8unorm',
+    usage: GPU_TEXTURE_USAGE.RENDER_ATTACHMENT | GPU_TEXTURE_USAGE.TEXTURE_BINDING,
+  });
+  assert.throws(() => reg.getTextureView(12, { format: 'bgra8unorm-srgb' }), RangeError);
+  const vAllowed = reg.getTextureView(12, { format: 'bgra8unorm-srgb' }, { allowUndeclaredSibling: true });
+  assert.equal(vAllowed.viewDesc.format, 'bgra8unorm-srgb');
+
+  // 4. Out-of-bounds mip/layer/aspect/dimension validation throws RangeError.
+  assert.throws(() => reg.getTextureView(10, { baseMipLevel: 4 }), RangeError);
+  assert.throws(() => reg.getTextureView(10, { baseMipLevel: 2, mipLevelCount: 3 }), RangeError);
+  assert.throws(() => reg.getTextureView(10, { baseArrayLayer: 6 }), RangeError);
+  assert.throws(() => reg.getTextureView(10, { baseArrayLayer: 4, arrayLayerCount: 3 }), RangeError);
+  assert.throws(() => reg.getTextureView(10, { dimension: 'cube', arrayLayerCount: 4 }), RangeError);
+  assert.throws(() => reg.getTextureView(10, { aspect: 'bogus-aspect' }), RangeError);
+  assert.throws(() => reg.getTextureView(10, { dimension: '4d' }), RangeError);
+  assert.throws(() => reg.getTextureView(12, { aspect: 'depth-only' }), RangeError);
+
+  const stats = reg.getStats();
+  assert.equal(stats.viewCacheMisses, 9);
+  assert.equal(stats.viewCacheHits, 3);
+  assert.equal(stats.cachedViewCount, 9);
+});
+
+test('W178 automatic stale-view invalidation across 1080p <-> 4K recreation, format transition, retire, linked views, and destroyAll()', () => {
+  const { device, createdTextures } = createMockWebGpuDevice({
+    features: new Set([TEXTURE_COMPRESSION_BC_FEATURE]),
+  });
+  const reg = new GpuResourceRegistry({
+    framesInFlight: 2,
+    device,
+    includeSrgbSiblingViewFormat: true,
+  });
+
+  // Initial stats default to 0.
+  const initStats = reg.getStats();
+  assert.equal(initStats.staleViewsInvalidated, 0);
+  assert.equal(initStats.viewCacheHits, 0);
+  assert.equal(initStats.viewCacheMisses, 0);
+  assert.equal(initStats.textureRecreations, 0);
+  assert.equal(initStats.cachedViewCount, 0);
+
+  // Frame 1: Create 1080p bgra8unorm render target (with sibling bgra8unorm-srgb).
+  reg.beginFrame(1);
+  reg.createTexture(100, {
+    width: 1920,
+    height: 1080,
+    format: 'bgra8unorm',
+    usage: GPU_TEXTURE_USAGE.RENDER_ATTACHMENT | GPU_TEXTURE_USAGE.TEXTURE_BINDING,
+  });
+  const default1080 = reg.get(RESOURCE_KIND.TEXTURE_VIEW, 100);
+  const linear1080 = reg.getTextureView(100, { format: 'bgra8unorm' });
+  const srgb1080 = reg.getTextureView(100, { format: 'bgra8unorm-srgb' });
+
+  // Also register an explicitly linked external TEXTURE_VIEW handle bound to texture 100.
+  const externalLinkedView = createNonDestroyableMock('external-rt-view-1080');
+  reg.register(RESOURCE_KIND.TEXTURE_VIEW, 9001, externalLinkedView, {
+    textureId: 100,
+    label: 'rt-pass-view',
+  });
+  assert.equal(reg.isTextureViewValid(externalLinkedView), true);
+  assert.equal(reg.has(RESOURCE_KIND.TEXTURE_VIEW, 9001), true);
+
+  // Re-registering the exact same texture object in place does NOT invalidate views or bump generation.
+  reg.register(RESOURCE_KIND.TEXTURE, 100, createdTextures[0], {
+    byteSize: 1920 * 1080 * 4,
+    label: 'same-1080p-tex',
+  });
+  assert.equal(reg.getTextureGeneration(100), 1);
+  assert.equal(reg.getStats().textureRecreations, 0);
+  assert.equal(reg.isTextureViewValid(linear1080), true);
+  assert.equal(reg.isTextureViewValid(srgb1080), true);
+  assert.equal(reg.getTextureView(100, { format: 'bgra8unorm-srgb' }), srgb1080);
+  assert.equal(reg.getStats().viewCacheHits, 1);
+
+  // Frame 2: Resize 1080p -> 4K (3840x2160) on handle 100 (in-place replacement).
+  reg.beginFrame(2);
+  reg.createTexture(100, {
+    width: 3840,
+    height: 2160,
+    format: 'bgra8unorm',
+    usage: GPU_TEXTURE_USAGE.RENDER_ATTACHMENT | GPU_TEXTURE_USAGE.TEXTURE_BINDING,
+  });
+  assert.equal(reg.getTextureGeneration(100), 2);
+  assert.equal(reg.isTextureViewValid(default1080), false);
+  assert.equal(reg.isTextureViewValid(linear1080), false);
+  assert.equal(reg.isTextureViewValid(srgb1080), false);
+  assert.equal(reg.isTextureViewValid(externalLinkedView), false);
+  assert.equal(reg.has(RESOURCE_KIND.TEXTURE_VIEW, 9001), false); // linked view auto-retired
+
+  let stats = reg.getStats();
+  assert.equal(stats.textureRecreations, 1);
+  assert.equal(stats.staleViewsInvalidated, 4); // default1080 + linear1080 + srgb1080 + externalLinkedView
+  assert.equal(stats.cachedViewCount, 0);
+
+  const srgb4k = reg.getTextureView(100, { format: 'bgra8unorm-srgb' });
+  assert.notEqual(srgb4k, srgb1080);
+  assert.equal(srgb4k.textureInternalId, createdTextures[1].internalId);
+  assert.equal(reg.isTextureViewValid(srgb4k), true);
+
+  // Frame 3: Resize back 4K -> 1080p with a format transition (bgra8unorm -> rgba16float).
+  reg.beginFrame(3);
+  reg.createTexture(100, {
+    width: 1920,
+    height: 1080,
+    format: 'rgba16float',
+    usage: GPU_TEXTURE_USAGE.RENDER_ATTACHMENT | GPU_TEXTURE_USAGE.TEXTURE_BINDING,
+  });
+  assert.equal(reg.getTextureGeneration(100), 3);
+  assert.equal(reg.isTextureViewValid(srgb4k), false);
+  assert.equal(reg.getStats().textureRecreations, 2);
+  assert.equal(reg.getStats().staleViewsInvalidated, 6); // + default4k + srgb4k
+  assert.throws(() => reg.getTextureView(100, { format: 'bgra8unorm-srgb' }), RangeError);
+  const hdr1080 = reg.getTextureView(100, { format: 'rgba16float' });
+  assert.equal(hdr1080.textureInternalId, createdTextures[2].internalId);
+  assert.equal(reg.isTextureViewValid(hdr1080), true);
+
+  // Pattern B: Explicit retire(TEXTURE, 100) then recreate on handle 100.
+  assert.equal(reg.retire(RESOURCE_KIND.TEXTURE, 100), true);
+  assert.equal(reg.getTextureGeneration(100), 0);
+  assert.equal(reg.isTextureViewValid(hdr1080), false);
+  assert.equal(reg.get(RESOURCE_KIND.TEXTURE_VIEW, 100), undefined);
+  assert.equal(reg.getTextureView(100), undefined);
+  assert.equal(reg.getStats().staleViewsInvalidated, 8); // + defaultHdr1080 + hdr1080
+
+  // Recreate after explicit retirement bumps generation to 4 and counts as a recreation.
+  reg.createTexture(100, {
+    width: 3840,
+    height: 2160,
+    format: 'rgba8unorm',
+    usage: GPU_TEXTURE_USAGE.RENDER_ATTACHMENT | GPU_TEXTURE_USAGE.TEXTURE_BINDING,
+  });
+  assert.equal(reg.getTextureGeneration(100), 4);
+  assert.equal(reg.getStats().textureRecreations, 3);
+  const postRetireSrgb = reg.getTextureView(100, { format: 'rgba8unorm-srgb' });
+  assert.equal(reg.isTextureViewValid(postRetireSrgb), true);
+
+  // Manual invalidateTextureViews(100) clears cached & linked views immediately.
+  const manuallyInvalidated = reg.invalidateTextureViews(100);
+  assert.equal(manuallyInvalidated, 2); // default + postRetireSrgb
+  assert.equal(reg.isTextureViewValid(postRetireSrgb), false);
+  assert.equal(reg.getStats().cachedViewCount, 0);
+
+  // Cache a new view, then trigger destroyAll() (device.lost recovery).
+  const preLossView = reg.getTextureView(100, { format: 'rgba8unorm' });
+  assert.equal(reg.isTextureViewValid(preLossView), true);
+  const invalidatedBeforeLoss = reg.getStats().staleViewsInvalidated;
+
+  reg.destroyAll();
+  assert.equal(reg.getTextureGeneration(100), 0);
+  assert.equal(reg.isTextureViewValid(preLossView), false);
+  assert.equal(reg.getTextureView(100), undefined);
+  assert.equal(reg.getStats().cachedViewCount, 0);
+  assert.equal(reg.getStats().staleViewsInvalidated, invalidatedBeforeLoss + 1);
+
+  // Re-registering handle 100 after destroyAll() MUST advance generation monotonically (to 5)
+  // so pre-loss views/tokens can NEVER match the post-recovery texture.
+  reg.createTexture(100, {
+    width: 1920,
+    height: 1080,
+    format: 'rgba8unorm',
+    usage: GPU_TEXTURE_USAGE.TEXTURE_BINDING,
+  });
+  assert.equal(reg.getTextureGeneration(100), 5);
+  assert.equal(reg.isTextureViewValid(preLossView), false);
+  assert.equal(reg.isTextureGenerationCurrent(100, 4), false);
+  assert.equal(reg.isTextureGenerationCurrent(100, 5), true);
+});
+
+test('W178 direct register(RESOURCE_KIND.TEXTURE, ...) populates descriptor viewFormats metadata and invalidates cached views on overwrite', () => {
+  const reg = new GpuResourceRegistry({ framesInFlight: 2 });
+  let nextViewId = 1;
+  const makeTex = (label, format, width, height) => ({
+    label,
+    format,
+    width,
+    height,
+    destroyCount: 0,
+    createView(desc) {
+      return { viewId: nextViewId++, ownerLabel: label, desc };
+    },
+    destroy() {
+      this.destroyCount += 1;
+    },
+  });
+
+  const tex1 = makeTex('albedo-1080', 'rgba8unorm', 1920, 1080);
+  const tex2 = makeTex('albedo-4k', 'rgba8unorm', 3840, 2160);
+
+  reg.register(RESOURCE_KIND.TEXTURE, 7, tex1, {
+    byteSize: 1920 * 1080 * 4,
+    label: 'albedo',
+    descriptor: {
+      size: { width: 1920, height: 1080, depthOrArrayLayers: 1 },
+      format: 'rgba8unorm',
+      viewFormats: ['rgba8unorm-srgb'],
+    },
+  });
+
+  const meta1 = reg.getTextureMeta(7);
+  assert.equal(meta1.format, 'rgba8unorm');
+  assert.equal(meta1.siblingViewFormat, 'rgba8unorm-srgb');
+  assert.deepEqual(meta1.viewFormats, ['rgba8unorm-srgb']);
+  assert.equal(meta1.textureGeneration, 1);
+
+  const v1 = reg.getTextureView(7, { format: 'rgba8unorm-srgb' });
+  assert.equal(v1.ownerLabel, 'albedo-1080');
+  assert.equal(reg.isTextureViewValid(v1), true);
+
+  // Overwriting handle 7 via register() replaces tex1, bumps generation, and invalidates v1.
+  reg.register(RESOURCE_KIND.TEXTURE, 7, tex2, {
+    byteSize: 3840 * 2160 * 4,
+    label: 'albedo',
+    format: 'rgba8unorm',
+    width: 3840,
+    height: 2160,
+    viewFormats: ['rgba8unorm-srgb'],
+  });
+
+  assert.equal(reg.getTextureGeneration(7), 2);
+  assert.equal(reg.isTextureViewValid(v1), false);
+  assert.equal(reg.getStats().textureRecreations, 1);
+  assert.equal(reg.getStats().staleViewsInvalidated, 1);
+
+  const v2 = reg.getTextureView(7, { format: 'rgba8unorm-srgb' });
+  assert.equal(v2.ownerLabel, 'albedo-4k');
+  assert.equal(reg.isTextureViewValid(v2), true);
+  assert.equal(reg.getTextureViewInfo(null), null);
+  assert.equal(reg.isTextureViewValid(null), false);
+  assert.equal(reg.isTextureViewValid({}), false);
 });
