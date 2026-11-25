@@ -1173,7 +1173,25 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
     std::lock_guard<std::mutex> lock(address_textures_mutex_);
     const auto it = address_textures_.find(key);
     if (it != address_textures_.end()) {
-        return it->second;
+        it->second.last_use = ++address_texture_tick_;
+        return it->second.id;
+    }
+    // O36: bounded: the least recently used texture is dropped (and its GPU texture freed) before
+    // a new one is made, so a long session's streaming does not grow the table without limit.
+    while (address_textures_.size() >= kMaxAddressTextures) {
+        auto oldest = address_textures_.begin();
+        for (auto i = address_textures_.begin(); i != address_textures_.end(); ++i) {
+            if (i->second.last_use < oldest->second.last_use) {
+                oldest = i;
+            }
+        }
+        const uint32_t victim = oldest->second.id;
+        address_textures_.erase(oldest);
+        untrack_guest_texture(victim);
+        bridge_->unregister_resource(victim);
+        CommandEncoder drop;
+        drop.destroy_resource(victim);
+        submit(drop);
     }
 
     const uint32_t id = allocate_id();
@@ -1246,7 +1264,7 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
         }
     }
 
-    address_textures_.emplace(key, id);
+    address_textures_.emplace(key, AddressTextureEntry{id, ++address_texture_tick_});
     return id;
 }
 
@@ -1487,6 +1505,11 @@ bool Device::relocate_uniform(uint64_t va, uint64_t size, uint64_t binding_size,
     *buffer_id = it->second.buffer_id;
     *offset = it->second.offset;
     return true;
+}
+
+size_t Device::address_texture_count() const {
+    std::lock_guard<std::mutex> lock(address_textures_mutex_);
+    return address_textures_.size();
 }
 
 size_t Device::relocated_uniform_count() const {
@@ -2102,6 +2125,23 @@ void register_view_texture_probe(uint64_t cpu_address, uint64_t size) {
     }
     TextureProbe& p = texture_probe();
     std::lock_guard<std::mutex> lock(p.mutex);
+    // O36: one probe per address (an evicted-and-recreated texture reuses it), and the table is capped.
+    for (ViewProbe& existing : p.views) {
+        if (existing.cpu == cpu_address) {
+            return;
+        }
+    }
+    constexpr size_t kMaxViewProbes = 4096;
+    if (p.views.size() >= kMaxViewProbes) {
+        const size_t drop = kMaxViewProbes / 4;
+        for (size_t i = 0; i < drop; ++i) {
+            if (p.views[i].seen_data && p.views_with_data > 0) {
+                --p.views_with_data;
+            }
+        }
+        p.views.erase(p.views.begin(), p.views.begin() + static_cast<std::ptrdiff_t>(drop));
+        p.view_cursor = 0;
+    }
     p.views.push_back(ViewProbe{cpu_address, std::min<uint64_t>(64u << 10, std::max<uint64_t>(1, size)), false});
 }
 
