@@ -59,6 +59,20 @@ const MAX_WEBGPU_LOCATIONS: u8 = 16;
 /// Maximum color attachment count under WebGPU baseline limits.
 const MAX_WEBGPU_MRTS: u8 = 8;
 
+/// WebGPU texture format enum code for `rgba8unorm` (`pso::WgpuTextureFormat::Rgba8Unorm`,
+/// `docs/gpu_commands.md` / `runtime/gpu/stage_reflection.h`).
+pub const WGPU_STORAGE_FORMAT_RGBA8_UNORM: u8 = 22;
+
+/// Binding number offset applied to reflected fragment-stage bindings in `@group(0)` so
+/// independently translated vertex (`0..`) and fragment (`32..`) stages never collide on the
+/// same `@group(0) @binding(N)` with different descriptor-table sources during `join_pipeline_layout`.
+const FRAGMENT_REFLECTED_BINDING_OFFSET: u32 = 32;
+
+/// First extra binding index (`cb1`, `tex1`, `samp1`, `sbuf*`, `uav_tex*`) for unreflected
+/// fragment stages, kept disjoint from vertex extra bindings (`3..15`) so `layout:'auto'`
+/// never hits a vertex-vs-fragment binding type mismatch (e.g. buffer vs texture at `@binding(4)`).
+const FRAGMENT_EXTRA_BINDING_BASE: u32 = 16;
+
 /// Returns `true` iff `f` can be emitted directly as a WGSL `Literal::F32` without
 /// risking Naga decimal rounding overflow past `f32::MAX` (which Chrome/Dawn Tint
 /// rejects as unrepresentable), losing `-0.0`, or emitting subnormals / NaN / Inf.
@@ -189,6 +203,8 @@ pub struct WgslBindingInfo {
     pub name: String,
     /// Texture view dimension (`"2d"`, `"2d-array"`, etc.) for texture/storage-texture bindings.
     pub view_dimension: Option<&'static str>,
+    /// WebGPU texture format enum code for storage textures (e.g. `22` = `rgba8unorm`).
+    pub storage_format: Option<u8>,
     /// Minimum WebGPU uniform buffer binding size in bytes (`Some(N * 16)` for `"uniform"`
     /// bindings, `None` for non-buffer bindings such as textures and samplers).
     pub min_binding_size_bytes: Option<u32>,
@@ -222,6 +238,9 @@ pub(crate) fn write_wgsl_bindings_json(
         if let Some(dim) = b.view_dimension {
             out.push_str(", \"view_dimension\": ");
             write_json_string(out, dim);
+        }
+        if let Some(fmt) = b.storage_format {
+            let _ = write!(out, ", \"storage_format\": {fmt}");
         }
         if let Some(min_bytes) = b.min_binding_size_bytes {
             let _ = write!(out, ", \"min_binding_size_bytes\": {min_bytes}");
@@ -474,8 +493,19 @@ struct VertexInputAttr {
     byte_offset: Option<u16>,
     location: u32,
     name: String,
-    /// Vector component width (`1` -> `f32`, `2` -> `vec2<f32>`, `3` -> `vec3<f32>`, `4` -> `vec4<f32>`).
+    /// Vector component width (`1` -> scalar, `2` -> `vec2`, `3` -> `vec3`, `4` -> `vec4`).
     components: u8,
+    /// WGSL / WebGPU attribute scalar type (`"f32"`, `"u32"`, or `"i32"`).
+    component_type: &'static str,
+    /// Explicit WebGPU vertex format name when decoded from GFX10.3 `MTBUF` `format`.
+    fetch_format: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VertexFetchPlan {
+    components: u8,
+    component_type: &'static str,
+    fetch_format: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1648,6 +1678,61 @@ fn vertex_fetch_slot(is_mtbuf: bool, op: u8, format: u8, byte_offset: u16) -> (u
     }
 }
 
+/// Decode a GFX10.3 unified `MTBUF` `format` code into `(component_type, fetch_format)` for
+/// stage reflection (`runtime/gpu/stage_reflection.cpp::vertex_format_from_name`).
+fn mtbuf_vertex_format_info(format: u8, folded_4x8: bool) -> (&'static str, Option<&'static str>) {
+    if folded_4x8 {
+        return match format {
+            1 | 3 => ("f32", Some("unorm8x4")),
+            2 | 4 => ("f32", Some("snorm8x4")),
+            5 => ("u32", Some("uint8x4")),
+            6 => ("i32", Some("sint8x4")),
+            _ => ("f32", Some("unorm8x4")),
+        };
+    }
+    match format {
+        1 | 3 => ("f32", Some("unorm8")),
+        2 | 4 => ("f32", Some("snorm8")),
+        5 => ("u32", Some("uint8")),
+        6 => ("i32", Some("sint8")),
+        7 | 9 => ("f32", Some("unorm16")),
+        8 | 10 => ("f32", Some("snorm16")),
+        11 => ("u32", Some("uint16")),
+        12 => ("i32", Some("sint16")),
+        13 => ("f32", Some("float16")),
+        14 | 16 => ("f32", Some("unorm8x2")),
+        15 | 17 => ("f32", Some("snorm8x2")),
+        18 => ("u32", Some("uint8x2")),
+        19 => ("i32", Some("sint8x2")),
+        20 => ("u32", Some("uint32")),
+        21 => ("i32", Some("sint32")),
+        22 => ("f32", Some("float32")),
+        23 | 25 => ("f32", Some("unorm16x2")),
+        24 | 26 => ("f32", Some("snorm16x2")),
+        27 => ("u32", Some("uint16x2")),
+        28 => ("i32", Some("sint16x2")),
+        29 => ("f32", Some("float16x2")),
+        32 | 38 => ("f32", Some("unorm10-10-10-2")),
+        44 | 46 | 56 => ("f32", Some("unorm8x4")),
+        45 | 47 | 57 => ("f32", Some("snorm8x4")),
+        48 | 60 => ("u32", Some("uint8x4")),
+        49 | 61 => ("i32", Some("sint8x4")),
+        50 | 64 => ("u32", Some("uint32x2")),
+        51 | 65 => ("i32", Some("sint32x2")),
+        52 | 66 => ("f32", Some("float32x2")),
+        53 | 67 => ("f32", Some("unorm16x4")),
+        54 | 68 => ("f32", Some("snorm16x4")),
+        58 | 72 => ("f32", Some("float16x4")),
+        73 => ("u32", Some("uint32x3")),
+        74 => ("i32", Some("sint32x3")),
+        75 => ("f32", Some("float32x3")),
+        76 => ("u32", Some("uint32x4")),
+        77 => ("i32", Some("sint32x4")),
+        78 => ("f32", Some("float32x4")),
+        _ => ("f32", None),
+    }
+}
+
 fn plan_program(
     summary: &Rdna2ProgramSummary,
     instructions: &[Rdna2Instruction],
@@ -1693,7 +1778,7 @@ fn plan_program(
     let mut storage_tex_arrayed: BTreeSet<u8> = BTreeSet::new();
     let mut uses_lds = false;
     let mut has_buffer_fetch = false;
-    let mut vertex_buf_fetches: BTreeMap<(u32, u16), u8> = BTreeMap::new();
+    let mut vertex_buf_fetches: BTreeMap<(u32, u16), VertexFetchPlan> = BTreeMap::new();
     let mut frag_attr_set: BTreeSet<u8> = BTreeSet::new();
     let mut vs_param_set: BTreeSet<u8> = BTreeSet::new();
     let mut ps_mrt_set: BTreeSet<u8> = BTreeSet::new();
@@ -2302,8 +2387,12 @@ fn plan_program(
                         let vb_slot = vertex_fetch_vb_slots.get(&inst_idx).copied().unwrap_or(0);
                         vertex_buf_fetches
                             .entry((vb_slot, *offset))
-                            .and_modify(|c| *c = (*c).max(comps))
-                            .or_insert(comps);
+                            .and_modify(|p| p.components = p.components.max(comps))
+                            .or_insert(VertexFetchPlan {
+                                components: comps,
+                                component_type: "f32",
+                                fetch_format: None,
+                            });
                         for d in 0..comps {
                             let reg = vdata.saturating_add(d);
                             vgprs.insert(reg);
@@ -2373,10 +2462,21 @@ fn plan_program(
                         let vb_slot = vertex_fetch_vb_slots.get(&inst_idx).copied().unwrap_or(0);
                         let (attr_offset, shift) = vertex_fetch_slot(true, *op, *format, *offset);
                         let attr_comps = if shift != 0 { 4 } else { comps };
+                        let (comp_ty, fetch_fmt) = mtbuf_vertex_format_info(*format, shift != 0);
                         vertex_buf_fetches
                             .entry((vb_slot, attr_offset))
-                            .and_modify(|c| *c = (*c).max(attr_comps))
-                            .or_insert(attr_comps);
+                            .and_modify(|p| {
+                                p.components = p.components.max(attr_comps);
+                                if p.fetch_format.is_none() && fetch_fmt.is_some() {
+                                    p.component_type = comp_ty;
+                                    p.fetch_format = fetch_fmt;
+                                }
+                            })
+                            .or_insert(VertexFetchPlan {
+                                components: attr_comps,
+                                component_type: comp_ty,
+                                fetch_format: fetch_fmt,
+                            });
                         for d in 0..comps {
                             let reg = vdata.saturating_add(d);
                             vgprs.insert(reg);
@@ -2547,6 +2647,8 @@ fn plan_program(
                     location: 0,
                     name: "position".to_string(),
                     components: 4,
+                    component_type: "f32",
+                    fetch_format: None,
                 });
                 legacy_uv_attr_index = Some(vertex_attrs.len());
                 vertex_attrs.push(VertexInputAttr {
@@ -2555,31 +2657,50 @@ fn plan_program(
                     location: 1,
                     name: "uv".to_string(),
                     components: 2,
+                    component_type: "f32",
+                    fetch_format: None,
                 });
             } else {
                 // Map MUBUF/MTBUF vertex fetches deterministically by ascending (vb_slot, byte_offset):
-                //   (0, 0)  -> @location(0) position: vec3<f32> (3-comp) or vec4<f32>
-                //   (0, 12) -> @location(1) color: vec4<f32> (R8G8B8A8_UNORM at +12B)
-                //   (0, 16) -> @location(2) uv: vec2<f32> (R32G32_FLOAT at +16B)
+                //   (0, 0)  -> @location(0) position: vec3 (3-comp) or vec4
+                //   (0, 12) -> @location(1+) color: vec4<f32> (R8G8B8A8_UNORM) or exact integer width
+                //   (0, 16) -> @location(2+) uv: vec2<f32> (R32G32_FLOAT at +16B)
                 //   any other slot/offset -> deterministic sequential @location(N) attr_<offset>
                 let mut next_loc: u32 = 0;
-                for (&(vb_slot, byte_offset), &max_comps) in &vertex_buf_fetches {
+                for (&(vb_slot, byte_offset), &fetch) in &vertex_buf_fetches {
+                    let max_comps = fetch.components;
                     let (location, name, components) = match (vb_slot, byte_offset) {
                         (0, 0) => {
                             let loc = next_loc;
                             next_loc = loc + 1;
-                            let comps = if max_comps == 3 { 3 } else { 4 };
+                            let comps = if fetch.component_type != "f32" {
+                                max_comps.clamp(1, 4)
+                            } else if max_comps == 3 {
+                                3
+                            } else {
+                                4
+                            };
                             (loc, "position".to_string(), comps)
                         }
                         (0, 12) => {
                             let loc = next_loc.max(1);
                             next_loc = loc + 1;
-                            (loc, "color".to_string(), 4)
+                            let comps = if fetch.component_type != "f32" {
+                                max_comps.clamp(1, 4)
+                            } else {
+                                4
+                            };
+                            (loc, "color".to_string(), comps)
                         }
                         (0, 16) => {
                             let loc = next_loc.max(2);
                             next_loc = loc + 1;
-                            (loc, "uv".to_string(), 2)
+                            let comps = if fetch.component_type != "f32" {
+                                max_comps.clamp(1, 4)
+                            } else {
+                                2
+                            };
+                            (loc, "uv".to_string(), comps)
                         }
                         (0, other) => {
                             let loc = next_loc;
@@ -2599,6 +2720,8 @@ fn plan_program(
                             location,
                             name,
                             components,
+                            component_type: fetch.component_type,
+                            fetch_format: fetch.fetch_format,
                         });
                     }
                 }
@@ -2617,6 +2740,8 @@ fn plan_program(
                         location: next_loc,
                         name: "uv".to_string(),
                         components: 2,
+                        component_type: "f32",
+                        fetch_format: None,
                     });
                 }
             }
@@ -2797,8 +2922,8 @@ struct IrEmitter {
     frag_in_arg: Option<u32>,
     frag_attr_member_index: BTreeMap<u8, u32>,
     vs_in_arg: Option<u32>,
-    /// Map from `(vb_slot, vertex buffer byte offset)` -> `(VsIn member_index, attr_components)`.
-    vs_attr_by_offset: BTreeMap<(u32, u16), (u32, u8)>,
+    /// Map from `(vb_slot, vertex buffer byte offset)` -> `(VsIn member_index, attr_components, scalar_kind)`.
+    vs_attr_by_offset: BTreeMap<(u32, u16), (u32, u8, ScalarKind)>,
     has_buffer_fetch: bool,
     legacy_uv_member_index: Option<u32>,
     vertex_input_mode: VertexInputMode,
@@ -2898,7 +3023,44 @@ impl IrEmitter {
         let mut storage_buf_globals: BTreeMap<u8, (Handle<GlobalVariable>, bool)> = BTreeMap::new();
         let mut storage_tex_globals: BTreeMap<u8, (Handle<GlobalVariable>, bool)> = BTreeMap::new();
         let mut emitted_bindings: Vec<WgslBindingInfo> = Vec::new();
-        let mut next_extra_binding: u32 = 3;
+        let has_any_binding = !plan.cbv_slots.is_empty()
+            || !plan.tex_slots.is_empty()
+            || !plan.samp_slots.is_empty()
+            || !plan.storage_buf_slots.is_empty()
+            || !plan.storage_tex_slots.is_empty();
+        let all_bindings_reflected = has_any_binding
+            && plan
+                .cbv_slots
+                .iter()
+                .all(|s| plan.cbv_sources.contains_key(&s.key))
+            && plan
+                .tex_slots
+                .iter()
+                .all(|s| plan.tex_sources.contains_key(s))
+            && plan
+                .samp_slots
+                .iter()
+                .all(|s| plan.samp_sources.contains_key(s))
+            && plan
+                .storage_buf_slots
+                .iter()
+                .all(|s| plan.storage_buf_sources.contains_key(&s.srsrc))
+            && plan
+                .storage_tex_slots
+                .iter()
+                .all(|s| plan.storage_tex_sources.contains_key(s));
+        let binding_base: u32 =
+            if plan.stage == ShaderStage::Fragment && all_bindings_reflected {
+                FRAGMENT_REFLECTED_BINDING_OFFSET
+            } else {
+                0
+            };
+        let mut next_extra_binding: u32 =
+            if plan.stage == ShaderStage::Fragment && !all_bindings_reflected {
+                FRAGMENT_EXTRA_BINDING_BASE
+            } else {
+                3
+            };
 
         if !plan.cbv_slots.is_empty() {
             let mut cbv_struct_by_count: BTreeMap<u32, Handle<Type>> = BTreeMap::new();
@@ -2935,13 +3097,14 @@ impl IrEmitter {
                         },
                     )
                 });
-                let binding_num = if idx == 0 {
-                    0
-                } else {
-                    let b = next_extra_binding;
-                    next_extra_binding += 1;
-                    b
-                };
+                let binding_num = binding_base
+                    + if idx == 0 {
+                        0
+                    } else {
+                        let b = next_extra_binding;
+                        next_extra_binding += 1;
+                        b
+                    };
                 let name = format!("cb{idx}");
                 let g = module.global_variables.append(
                     GlobalVariable {
@@ -2964,6 +3127,7 @@ impl IrEmitter {
                     kind: "uniform",
                     name,
                     view_dimension: None,
+                    storage_format: None,
                     min_binding_size_bytes: Some(count.saturating_mul(16)),
                     highest_vec4_offset: Some(slot.highest_vec4_offset),
                     source: plan.cbv_sources.get(&slot.key).copied(),
@@ -3012,13 +3176,14 @@ impl IrEmitter {
                         )
                     })
                 };
-                let binding_num = if idx == 0 {
-                    1
-                } else {
-                    let b = next_extra_binding;
-                    next_extra_binding += 1;
-                    b
-                };
+                let binding_num = binding_base
+                    + if idx == 0 {
+                        1
+                    } else {
+                        let b = next_extra_binding;
+                        next_extra_binding += 1;
+                        b
+                    };
                 let name = format!("tex{idx}");
                 let g = module.global_variables.append(
                     GlobalVariable {
@@ -3041,19 +3206,21 @@ impl IrEmitter {
                     kind: "texture_2d",
                     name,
                     view_dimension: Some(if is_array { "2d-array" } else { "2d" }),
+                    storage_format: None,
                     min_binding_size_bytes: None,
                     highest_vec4_offset: None,
                     source: plan.tex_sources.get(&srsrc).copied(),
                 });
             }
             for (idx, &ssamp) in plan.samp_slots.iter().enumerate() {
-                let binding_num = if idx == 0 {
-                    2
-                } else {
-                    let b = next_extra_binding;
-                    next_extra_binding += 1;
-                    b
-                };
+                let binding_num = binding_base
+                    + if idx == 0 {
+                        2
+                    } else {
+                        let b = next_extra_binding;
+                        next_extra_binding += 1;
+                        b
+                    };
                 let name = format!("samp{idx}");
                 let g = module.global_variables.append(
                     GlobalVariable {
@@ -3076,6 +3243,7 @@ impl IrEmitter {
                     kind: "sampler",
                     name,
                     view_dimension: None,
+                    storage_format: None,
                     min_binding_size_bytes: None,
                     highest_vec4_offset: None,
                     source: plan.samp_sources.get(&ssamp).copied(),
@@ -3096,7 +3264,7 @@ impl IrEmitter {
             let mut srv_idx = 0u32;
             let mut uav_idx = 0u32;
             for slot in &plan.storage_buf_slots {
-                let binding_num = next_extra_binding;
+                let binding_num = binding_base + next_extra_binding;
                 next_extra_binding += 1;
                 let (name, access, kind) = if slot.writable {
                     let n = format!("uav_buf{uav_idx}");
@@ -3132,6 +3300,7 @@ impl IrEmitter {
                     kind,
                     name,
                     view_dimension: None,
+                    storage_format: None,
                     min_binding_size_bytes: None,
                     highest_vec4_offset: None,
                     source: plan.storage_buf_sources.get(&slot.srsrc).copied(),
@@ -3175,7 +3344,7 @@ impl IrEmitter {
                         )
                     })
                 };
-                let binding_num = next_extra_binding;
+                let binding_num = binding_base + next_extra_binding;
                 next_extra_binding += 1;
                 let name = format!("uav_tex{idx}");
                 let g = module.global_variables.append(
@@ -3199,6 +3368,7 @@ impl IrEmitter {
                     kind: "storage-texture",
                     name,
                     view_dimension: Some(if is_array { "2d-array" } else { "2d" }),
+                    storage_format: Some(WGPU_STORAGE_FORMAT_RGBA8_UNORM),
                     min_binding_size_bytes: None,
                     highest_vec4_offset: None,
                     source: plan.storage_tex_sources.get(&srsrc).copied(),
@@ -3241,7 +3411,7 @@ impl IrEmitter {
         };
 
         let mut vs_in_arg = None;
-        let mut vs_attr_by_offset: BTreeMap<(u32, u16), (u32, u8)> = BTreeMap::new();
+        let mut vs_attr_by_offset: BTreeMap<(u32, u16), (u32, u8, ScalarKind)> = BTreeMap::new();
         let mut legacy_uv_member_index: Option<u32> = None;
         let mut frag_in_arg = None;
         let mut frag_attr_member_index = BTreeMap::new();
@@ -3272,19 +3442,76 @@ impl IrEmitter {
                         }];
                         let mut cur_offset = 4u32;
                         let mut max_align = 4u32;
+                        let mut vec2_u32_ty: Option<Handle<Type>> = None;
+                        let mut vec3_i32_ty: Option<Handle<Type>> = None;
+                        let mut vec4_i32_ty: Option<Handle<Type>> = None;
                         for (attr_idx, attr) in plan.vertex_attrs.iter().enumerate() {
-                            let (ty, align, size) = match attr.components {
-                                1 => (f32_ty, 4u32, 4u32),
-                                2 => (vec2_f32_ty, 8u32, 8u32),
-                                3 => (vec3_f32_ty, 16u32, 12u32),
-                                _ => (vec4_f32_ty, 16u32, 16u32),
+                            let scalar_kind = match attr.component_type {
+                                "u32" => ScalarKind::Uint,
+                                "i32" => ScalarKind::Sint,
+                                _ => ScalarKind::Float,
+                            };
+                            let (ty, align, size) = match (scalar_kind, attr.components) {
+                                (ScalarKind::Uint, 1) => (u32_ty, 4u32, 4u32),
+                                (ScalarKind::Uint, 2) => (
+                                    *vec2_u32_ty.get_or_insert_with(|| {
+                                        insert_type(
+                                            &mut module,
+                                            None,
+                                            TypeInner::Vector {
+                                                size: VectorSize::Bi,
+                                                scalar: Scalar::U32,
+                                            },
+                                        )
+                                    }),
+                                    8u32,
+                                    8u32,
+                                ),
+                                (ScalarKind::Uint, 3) => (vec3_u32_ty, 16u32, 12u32),
+                                (ScalarKind::Uint, _) => (vec4_u32_ty, 16u32, 16u32),
+                                (ScalarKind::Sint, 1) => (i32_ty, 4u32, 4u32),
+                                (ScalarKind::Sint, 2) => (vec2_i32_ty, 8u32, 8u32),
+                                (ScalarKind::Sint, 3) => (
+                                    *vec3_i32_ty.get_or_insert_with(|| {
+                                        insert_type(
+                                            &mut module,
+                                            None,
+                                            TypeInner::Vector {
+                                                size: VectorSize::Tri,
+                                                scalar: Scalar::I32,
+                                            },
+                                        )
+                                    }),
+                                    16u32,
+                                    12u32,
+                                ),
+                                (ScalarKind::Sint, _) => (
+                                    *vec4_i32_ty.get_or_insert_with(|| {
+                                        insert_type(
+                                            &mut module,
+                                            None,
+                                            TypeInner::Vector {
+                                                size: VectorSize::Quad,
+                                                scalar: Scalar::I32,
+                                            },
+                                        )
+                                    }),
+                                    16u32,
+                                    16u32,
+                                ),
+                                (_, 1) => (f32_ty, 4u32, 4u32),
+                                (_, 2) => (vec2_f32_ty, 8u32, 8u32),
+                                (_, 3) => (vec3_f32_ty, 16u32, 12u32),
+                                (_, _) => (vec4_f32_ty, 16u32, 16u32),
                             };
                             cur_offset = align_up(cur_offset, align);
                             max_align = max_align.max(align);
                             let member_idx = members.len() as u32;
                             if let Some(byte_off) = attr.byte_offset {
-                                vs_attr_by_offset
-                                    .insert((attr.vb_slot, byte_off), (member_idx, attr.components));
+                                vs_attr_by_offset.insert(
+                                    (attr.vb_slot, byte_off),
+                                    (member_idx, attr.components, scalar_kind),
+                                );
                             }
                             if plan.legacy_uv_attr_index == Some(attr_idx) {
                                 legacy_uv_member_index = Some(member_idx);
@@ -9280,7 +9507,8 @@ impl IrEmitter {
             return false;
         };
         let (attr_offset, shift) = vertex_fetch_slot(is_mtbuf, op, format, byte_offset);
-        let Some(&(member_idx, attr_comps)) = self.vs_attr_by_offset.get(&(vb_slot, attr_offset))
+        let Some(&(member_idx, attr_comps, scalar_kind)) =
+            self.vs_attr_by_offset.get(&(vb_slot, attr_offset))
         else {
             return false;
         };
@@ -9291,25 +9519,32 @@ impl IrEmitter {
         });
         for c in 0..comps {
             let src_c = c.saturating_add(shift);
-            let val = if attr_comps == 1 {
-                if src_c == 0 {
+            if src_c < attr_comps {
+                let elem = if attr_comps == 1 {
                     attr_val
-                } else if c == 3 {
-                    self.lit_f32(1.0)
                 } else {
-                    self.lit_f32(0.0)
+                    self.emit_expr(Expression::AccessIndex {
+                        base: attr_val,
+                        index: u32::from(src_c),
+                    })
+                };
+                match scalar_kind {
+                    ScalarKind::Uint => self.store_vgpr_u32(vdata.saturating_add(c), elem),
+                    ScalarKind::Sint => self.store_vgpr_i32(vdata.saturating_add(c), elem),
+                    _ => self.store_vgpr_f32(vdata.saturating_add(c), elem),
                 }
-            } else if src_c < attr_comps {
-                self.emit_expr(Expression::AccessIndex {
-                    base: attr_val,
-                    index: u32::from(src_c),
-                })
-            } else if c == 3 {
-                self.lit_f32(1.0)
             } else {
-                self.lit_f32(0.0)
-            };
-            self.store_vgpr_f32(vdata.saturating_add(c), val);
+                let fallback = match scalar_kind {
+                    ScalarKind::Uint => self.lit_u32(if c == 3 { 1 } else { 0 }),
+                    ScalarKind::Sint => self.lit_i32(if c == 3 { 1 } else { 0 }),
+                    _ => self.lit_f32(if c == 3 { 1.0 } else { 0.0 }),
+                };
+                match scalar_kind {
+                    ScalarKind::Uint => self.store_vgpr_u32(vdata.saturating_add(c), fallback),
+                    ScalarKind::Sint => self.store_vgpr_i32(vdata.saturating_add(c), fallback),
+                    _ => self.store_vgpr_f32(vdata.saturating_add(c), fallback),
+                }
+            }
         }
         true
     }
@@ -10081,8 +10316,8 @@ pub fn translate_rdna2_to_wgsl(
                     vb_slot: attr.vb_slot,
                     byte_offset: u32::from(byte_offset),
                     components: attr.components,
-                    component_type: "f32",
-                    fetch_format: None,
+                    component_type: attr.component_type,
+                    fetch_format: attr.fetch_format,
                 })
             })
             .collect()
@@ -10365,6 +10600,7 @@ mod tests {
                     highest_vec4_offset: None,
                     view_dimension: Some("2d"),
                     source: None,
+                    storage_format: None,
                 },
                 WgslBindingInfo {
                     group: 0,
@@ -10375,6 +10611,7 @@ mod tests {
                     highest_vec4_offset: None,
                     view_dimension: None,
                     source: None,
+                    storage_format: None,
                 },
             ]
         );
@@ -10851,6 +11088,7 @@ mod tests {
                 highest_vec4_offset: Some(0),
                 view_dimension: None,
                 source: None,
+                storage_format: None,
             }]
         );
 
@@ -11150,6 +11388,7 @@ mod tests {
                     highest_vec4_offset: Some(0),
                     view_dimension: None,
                     source: None,
+                    storage_format: None,
                 },
                 WgslBindingInfo {
                     group: 0,
@@ -11160,6 +11399,7 @@ mod tests {
                     highest_vec4_offset: None,
                     view_dimension: Some("2d"),
                     source: None,
+                    storage_format: None,
                 },
                 WgslBindingInfo {
                     group: 0,
@@ -11170,6 +11410,7 @@ mod tests {
                     highest_vec4_offset: None,
                     view_dimension: None,
                     source: None,
+                    storage_format: None,
                 },
             ]
         );
@@ -11338,6 +11579,7 @@ mod tests {
                     highest_vec4_offset: None,
                     view_dimension: Some("2d"),
                     source: None,
+                    storage_format: None,
                 },
                 WgslBindingInfo {
                     group: 0,
@@ -11348,16 +11590,18 @@ mod tests {
                     highest_vec4_offset: None,
                     view_dimension: None,
                     source: None,
+                    storage_format: None,
                 },
                 WgslBindingInfo {
                     group: 0,
-                    binding: 3,
+                    binding: FRAGMENT_EXTRA_BINDING_BASE,
                     kind: "texture_2d",
                     name: "tex1".to_string(),
                     min_binding_size_bytes: None,
                     highest_vec4_offset: None,
                     view_dimension: Some("2d"),
                     source: None,
+                    storage_format: None,
                 },
             ]
         );
@@ -11465,6 +11709,7 @@ mod tests {
                 highest_vec4_offset: Some(2),
                 view_dimension: None,
                 source: None,
+                storage_format: None,
             }]
         );
         assert!(
@@ -11522,6 +11767,7 @@ mod tests {
                 highest_vec4_offset: Some(20),
                 view_dimension: None,
                 source: None,
+                storage_format: None,
             }]
         );
         assert!(
@@ -11573,16 +11819,18 @@ mod tests {
                     highest_vec4_offset: Some(1),
                     view_dimension: None,
                     source: None,
+                    storage_format: None,
                 },
                 WgslBindingInfo {
                     group: 0,
-                    binding: 3,
+                    binding: FRAGMENT_EXTRA_BINDING_BASE,
                     kind: "uniform",
                     name: "cb1".to_string(),
                     min_binding_size_bytes: Some(96),
                     highest_vec4_offset: Some(5),
                     view_dimension: None,
                     source: None,
+                    storage_format: None,
                 },
             ]
         );
@@ -11609,7 +11857,7 @@ mod tests {
         );
         assert!(
             json.contains(
-                "{\"group\": 0, \"binding\": 3, \"kind\": \"uniform\", \"name\": \"cb1\", \"min_binding_size_bytes\": 96, \"highest_vec4_offset\": 5}"
+                "{\"group\": 0, \"binding\": 16, \"kind\": \"uniform\", \"name\": \"cb1\", \"min_binding_size_bytes\": 96, \"highest_vec4_offset\": 5}"
             ),
             "JSON:\n{json}"
         );
@@ -11751,6 +11999,7 @@ mod tests {
                     highest_vec4_offset: None,
                     view_dimension: None,
                     source: None,
+                    storage_format: None,
                 },
                 WgslBindingInfo {
                     group: 0,
@@ -11761,6 +12010,7 @@ mod tests {
                     highest_vec4_offset: None,
                     view_dimension: None,
                     source: None,
+                    storage_format: None,
                 },
             ]
         );
@@ -11831,6 +12081,7 @@ mod tests {
                     highest_vec4_offset: None,
                     view_dimension: Some("2d"),
                     source: None,
+                    storage_format: None,
                 },
                 WgslBindingInfo {
                     group: 0,
@@ -11841,6 +12092,7 @@ mod tests {
                     highest_vec4_offset: None,
                     view_dimension: None,
                     source: None,
+                    storage_format: None,
                 },
                 WgslBindingInfo {
                     group: 0,
@@ -11851,6 +12103,7 @@ mod tests {
                     highest_vec4_offset: None,
                     view_dimension: Some("2d"),
                     source: None,
+                    storage_format: Some(WGPU_STORAGE_FORMAT_RGBA8_UNORM),
                 },
             ]
         );
@@ -12100,6 +12353,7 @@ mod tests {
                 highest_vec4_offset: Some(2),
                 view_dimension: None,
                 source: None,
+                storage_format: None,
             }]
         );
         assert_eq!(out.binding_summary.cbv_vec4_count, 3);
@@ -13585,6 +13839,145 @@ mod tests {
         words.push(enc_sopp(0x01, 0));
         let out = translate_as(&words, Rdna2StageOverride::Compute);
         assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn s32_storage_texture_exports_rgba8unorm_storage_format_22() {
+        // Compute shader writing a 2D UAV via image_store -> storage_format: 22 (Rgba8Unorm).
+        let mut words = Vec::new();
+        words.push(enc_vop1(0x01, 6, 242)); // v6 = 1.0
+        words.extend_from_slice(&enc_mimg(0x08, 0xF, 1, 0, 6, 4, 0)); // image_store -> uav_tex0
+        words.push(enc_sopp(0x01, 0));
+        let out = translate_as(&words, Rdna2StageOverride::Compute);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        let uav = out
+            .bindings
+            .iter()
+            .find(|b| b.kind == "storage-texture")
+            .expect("expected storage-texture binding");
+        assert_eq!(uav.storage_format, Some(WGPU_STORAGE_FORMAT_RGBA8_UNORM));
+        let json = out.to_json();
+        assert!(json.contains("\"storage_format\": 22"), "JSON:\n{json}");
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn s32_reflected_fragment_bindings_use_disjoint_offset_32() {
+        // Fragment shader loading CBV V# and T# descriptors from graphics user SGPR table s8
+        // (zero-extended s9=0) plus an inline static sampler -> all bindings must land at 32+ so
+        // VS (0..31) and PS (32+) never collide in join_pipeline_layout.
+        let mut words = Vec::new();
+        words.push(enc_sop1(0x03, 9, 0x80)); // s9 = 0 (zero-extend graphics user table ptr s8)
+        words.extend_from_slice(&enc_smem(0x02, 12, 4, 0x7D, 0x00, false, false)); // CBV0 V# @ +0x00
+        words.extend_from_slice(&enc_smem(0x02, 16, 4, 0x7D, 0x20, false, false)); // CBV1 V# @ +0x20
+        words.extend_from_slice(&enc_smem(0x03, 24, 4, 0x7D, 0x40, false, false)); // T# @ +0x40
+        words.extend_from_slice(&enc_smem(0x0A, 8, 6, 0x7D, 0x00, false, false)); // cb0 load
+        words.extend_from_slice(&enc_smem(0x0A, 4, 8, 0x7D, 0x00, false, false)); // cb1 load
+        words.push(enc_sop1(0x03, 20, 0x81)); // inline static sampler in s[20:23] (ssamp=5)
+        words.push(enc_sop1(0x03, 21, 0x82));
+        words.push(enc_sop1(0x03, 22, 0x83));
+        words.push(enc_sop1(0x03, 23, 0x84));
+        words.extend_from_slice(&enc_mimg(0x27, 0xF, 1, 0, 4, 6, 5)); // image_sample_lz tex0/samp0
+        words.push(enc_vop2(0x03, 4, 8, 4)); // v4 = s8 + v4
+        words.push(enc_vop2(0x03, 5, 4, 5)); // v5 = s4 + v5
+        words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [4, 5, 6, 7]));
+        words.push(enc_sopp(0x01, 0));
+
+        let out = translate_as(&words, Rdna2StageOverride::Pixel);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert!(
+            out.bindings.iter().all(|b| b.binding >= FRAGMENT_REFLECTED_BINDING_OFFSET),
+            "all reflected PS bindings must be >= 32: {:?}",
+            out.bindings
+        );
+        let cb0 = out.bindings.iter().find(|b| b.name == "cb0").unwrap();
+        let tex0 = out.bindings.iter().find(|b| b.name == "tex0").unwrap();
+        let samp0 = out.bindings.iter().find(|b| b.name == "samp0").unwrap();
+        let cb1 = out.bindings.iter().find(|b| b.name == "cb1").unwrap();
+        assert_eq!(cb0.binding, 32);
+        assert_eq!(tex0.binding, 33);
+        assert_eq!(samp0.binding, 34);
+        assert_eq!(cb1.binding, 35);
+        assert!(out.wgsl.contains("@group(0) @binding(32)"), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("@group(0) @binding(33)"), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("@group(0) @binding(34)"), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("@group(0) @binding(35)"), "WGSL:\n{}", out.wgsl);
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn s32_unreflected_fragment_extra_bindings_start_at_16_avoiding_vs_collision() {
+        // Unreflected VS with extra cb1 (binding 3) + unreflected PS with extra tex1 (binding 16)
+        // must never share a binding slot with mismatched resource types.
+        let mut vs_words = Vec::new();
+        vs_words.extend_from_slice(&enc_smem(0x0A, 4, 0, 0x7D, 0x00, false, false)); // cb0 @0
+        vs_words.extend_from_slice(&enc_smem(0x0A, 8, 2, 0x7D, 0x00, false, false)); // cb1 @3
+        vs_words.push(enc_vop1(0x01, 4, 4));
+        vs_words.push(enc_vop1(0x01, 5, 8));
+        vs_words.extend_from_slice(&enc_exp(12, 0xF, true, false, false, [4, 5, 4, 5]));
+        vs_words.push(enc_sopp(0x01, 0));
+        let vs_out = translate_as(&vs_words, Rdna2StageOverride::Vertex);
+        assert_eq!(vs_out.unsupported_op_count, 0, "VS WGSL:\n{}", vs_out.wgsl);
+        let vs_cb1 = vs_out.bindings.iter().find(|b| b.name == "cb1").unwrap();
+        assert_eq!(vs_cb1.binding, 3);
+
+        let mut ps_words = Vec::new();
+        ps_words.extend_from_slice(&enc_mimg(0x27, 0xF, 1, 0, 4, 2, 1)); // tex0 @1, samp0 @2
+        ps_words.extend_from_slice(&enc_mimg(0x27, 0xF, 1, 0, 8, 4, 1)); // tex1 @16
+        ps_words.push(enc_vop2(0x03, 4, 256 + 4, 8));
+        ps_words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [4, 5, 6, 7]));
+        ps_words.push(enc_sopp(0x01, 0));
+        let ps_out = translate_as(&ps_words, Rdna2StageOverride::Pixel);
+        assert_eq!(ps_out.unsupported_op_count, 0, "PS WGSL:\n{}", ps_out.wgsl);
+        let ps_tex1 = ps_out.bindings.iter().find(|b| b.name == "tex1").unwrap();
+        assert_eq!(ps_tex1.binding, FRAGMENT_EXTRA_BINDING_BASE);
+        assert_ne!(vs_cb1.binding, ps_tex1.binding);
+        assert_naga_wgsl_valid(&vs_out.wgsl);
+        assert_naga_wgsl_valid(&ps_out.wgsl);
+    }
+
+    #[test]
+    fn s32_mtbuf_integer_and_sub_element_vertex_inputs_emit_typed_vs_in_and_metadata() {
+        // Vertex shader fetching:
+        //   offset 0:  MTBUF format:56 (unorm8x4) -> vec4<f32>, component_type="f32", fetch_format="unorm8x4"
+        //   offset 8:  MTBUF format:14 (unorm8x2) -> vec2<f32>, component_type="f32", fetch_format="unorm8x2"
+        //   offset 12: MTBUF format:5  (uint8)    -> u32,       component_type="u32", fetch_format="uint8"
+        let mut words = Vec::new();
+        words.push(enc_sop1(0x04, 12, 0)); // s[12:13] = s[0:1] (VB table)
+        words.extend_from_slice(&enc_smem(0x02, 12, 6, 0x7D, 0, false, false)); // VB slot 0 V#
+        words.extend_from_slice(&enc_mtbuf(0x03, 56, 0, 4, 0, 3, true)); // xyzw unorm8x4 @ 0
+        words.extend_from_slice(&enc_mtbuf(0x01, 14, 8, 8, 0, 3, true)); // xy   unorm8x2 @ 8
+        words.extend_from_slice(&enc_mtbuf(0x00, 5, 12, 10, 0, 3, true)); // x    uint8    @ 12
+        words.push(enc_vop1(0x06, 11, 256 + 10)); // v_cvt_f32_u32 v11, v10
+        words.extend_from_slice(&enc_exp(12, 0xF, true, false, false, [4, 5, 8, 11]));
+        words.push(enc_sopp(0x01, 0));
+
+        let out = translate_as(&words, Rdna2StageOverride::Vertex);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert_eq!(out.vertex_inputs.len(), 3, "vertex_inputs: {:?}", out.vertex_inputs);
+
+        assert_eq!(out.vertex_inputs[0].byte_offset, 0);
+        assert_eq!(out.vertex_inputs[0].components, 4);
+        assert_eq!(out.vertex_inputs[0].component_type, "f32");
+        assert_eq!(out.vertex_inputs[0].fetch_format, Some("unorm8x4"));
+
+        assert_eq!(out.vertex_inputs[1].byte_offset, 8);
+        assert_eq!(out.vertex_inputs[1].components, 2);
+        assert_eq!(out.vertex_inputs[1].component_type, "f32");
+        assert_eq!(out.vertex_inputs[1].fetch_format, Some("unorm8x2"));
+
+        assert_eq!(out.vertex_inputs[2].byte_offset, 12);
+        assert_eq!(out.vertex_inputs[2].components, 1);
+        assert_eq!(out.vertex_inputs[2].component_type, "u32");
+        assert_eq!(out.vertex_inputs[2].fetch_format, Some("uint8"));
+
+        assert!(out.wgsl.contains("@location(1) attr_8_: vec2<f32>"), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("@location(2) color: u32"), "WGSL:\n{}", out.wgsl);
+        let json = out.to_json();
+        assert!(json.contains("\"component_type\": \"u32\""), "JSON:\n{json}");
+        assert!(json.contains("\"fetch_format\": \"uint8\""), "JSON:\n{json}");
+        assert!(json.contains("\"fetch_format\": \"unorm8x2\""), "JSON:\n{json}");
         assert_naga_wgsl_valid(&out.wgsl);
     }
 }
