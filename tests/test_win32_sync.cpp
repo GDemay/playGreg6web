@@ -1123,6 +1123,67 @@ void test_handle_errors() {
     CHECK(GetLastError() == ERROR_INVALID_HANDLE);
 }
 
+// Microbench (printed, loose bounds only): uncontended lock fast paths and an auto-reset event
+// ping-pong between two threads. Guest worker threads (Bink decode, render) hammer these.
+template <typename F>
+double ns_per_op(int iterations, F&& body) {
+    const auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < iterations; ++i) {
+        body();
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    return std::chrono::duration<double, std::nano>(elapsed).count() / iterations;
+}
+
+void test_sync_microbench() {
+    constexpr int kIters = 200000;
+
+    CriticalSection cs{};
+    InitializeCriticalSection(&cs);
+    const double cs_ns = ns_per_op(kIters, [&]() {
+        EnterCriticalSection(&cs);
+        LeaveCriticalSection(&cs);
+    });
+    CHECK(cs.recursion_count == 0 && cs.owning_thread == 0);
+    DeleteCriticalSection(&cs);
+
+    SrwLock srw{};
+    InitializeSRWLock(&srw);
+    const double srw_ns = ns_per_op(kIters, [&]() {
+        AcquireSRWLockExclusive(&srw);
+        ReleaseSRWLockExclusive(&srw);
+    });
+    const double srw_shared_ns = ns_per_op(kIters, [&]() {
+        AcquireSRWLockShared(&srw);
+        ReleaseSRWLockShared(&srw);
+    });
+
+    // Ping-pong: each round trip is two SetEvent -> WaitForSingleObject wakeups.
+    constexpr int kRounds = 5000;
+    const Handle ping = CreateEventW(nullptr, false, false, nullptr);
+    const Handle pong = CreateEventW(nullptr, false, false, nullptr);
+    std::thread partner([&]() {
+        for (int i = 0; i < kRounds; ++i) {
+            CHECK(WaitForSingleObject(ping, kLongWait) == WAIT_OBJECT_0);
+            CHECK(SetEvent(pong));
+        }
+    });
+    const double rt_ns = ns_per_op(kRounds, [&]() {
+        CHECK(SetEvent(ping));
+        CHECK(WaitForSingleObject(pong, kLongWait) == WAIT_OBJECT_0);
+    });
+    partner.join();
+    CloseHandle(ping);
+    CloseHandle(pong);
+
+    std::printf("sync microbench: CS enter+leave %.1f ns, SRW excl %.1f ns, SRW shared %.1f ns, "
+                "event ping-pong round trip %.0f ns\n",
+                cs_ns, srw_ns, srw_shared_ns, rt_ns);
+    // Generous sanity bounds (CI machines are noisy): an uncontended pair must stay sub-microsecond.
+    CHECK(cs_ns < 1000.0);
+    CHECK(srw_ns < 1000.0);
+}
+
 }  // namespace
 
 // Critical sections live in guest memory the runtime must not interpret: uninitialized bytes,
@@ -1190,6 +1251,7 @@ void test_critical_section_guest_storage() {
 
 int main() {
     test_critical_section_guest_storage();
+    test_sync_microbench();
     test_semaphores();
     test_live_kernel_handle_counts();
     test_mutexes();
