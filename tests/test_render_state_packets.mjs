@@ -3506,3 +3506,130 @@ test('#709: BeginRenderPass reconfigures swapchain context to stream-declared rg
   assert.equal(configured[0].format, 'rgba8unorm');
   assert.equal(configured[0].device, gpu.device);
 });
+
+test('#659: bindGroupKindMismatches counts buffer, texture, storageTexture, and sampler mismatches without altering dummy fallback behavior', () => {
+  const gpu = createMockWebGpu();
+  gpu.device.features = new Set(); // ensure float32-filterable is off to verify unfilterable fallback stays distinct
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { format: 'rgba8unorm' });
+  const handler = installRenderStatePackets(processor);
+
+  assert.equal(handler.telemetry.bindGroupKindMismatches, 0);
+  assert.equal(handler.getTelemetry().bindGroupKindMismatches, 0);
+  assert.equal(handler.getStats().bindGroupKindMismatches, 0);
+
+  // Layout declares:
+  //   0: uniform buffer
+  //   1: sampled texture (float)
+  //   2: storageTexture (rgba8unorm)
+  //   3: sampler (filtering)
+  const bglEntries = [
+    { binding: 0, visibility: 4, type: 0, subtype: 0, minBindingSize: 16 },
+    { binding: 1, visibility: 4, type: 2, subtype: 0, dimension: 2 },
+    { binding: 2, visibility: 4, type: 3, subtype: 0, dimension: 2, storageFormat: formatCodeOf('rgba8unorm') },
+    { binding: 3, visibility: 4, type: 1, subtype: 0 },
+  ];
+
+  // Create real resources + layout.
+  processor.executeCommandBuffer(
+    concat(
+      new Stream()
+        .buffer(101, 0x0040 | 0x0080 | 0x0008, 256) // UNIFORM | STORAGE buffer
+        .buffer(102, 0x0080 | 0x0008, 256) // STORAGE-only buffer (for usage mismatch check)
+        .bytes(),
+      createTexture2Packet({ id: 201, width: 8, height: 8, format: formatCodeOf('rgba8unorm'), usage: 0x04 | 0x08 }),
+      createTexture2Packet({ id: 202, width: 8, height: 8, format: formatCodeOf('r32float'), usage: 0x04 }),
+      createSampler2Packet(301, { filter: 1 }),
+      bindGroupLayoutPacket(20, bglEntries)
+    )
+  );
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+
+  // 1) Matching resources, resourceId=0 dummy slots, buffer usage mismatch, and unfilterable float fallback
+  //    must NOT increment bindGroupKindMismatches.
+  processor.executeCommandBuffer(
+    concat(
+      bindGroup2Packet(40, 20, [
+        { binding: 0, type: 0, id: 101, offset: 0, size: 256 },
+        { binding: 1, type: 1, id: 201 },
+        { binding: 2, type: 1, id: 201 },
+        { binding: 3, type: 2, id: 301 },
+      ]),
+      bindGroup2Packet(41, 20, [
+        { binding: 0, type: 0, id: 0 },
+        { binding: 1, type: 1, id: 0 },
+        { binding: 2, type: 1, id: 0 },
+        { binding: 3, type: 2, id: 0 },
+      ]),
+      bindGroup2Packet(42, 20, [
+        { binding: 0, type: 0, id: 102, offset: 0, size: 256 }, // usage mismatch (not kind mismatch)
+        { binding: 1, type: 1, id: 202 }, // unfilterable-float fallback (not kind mismatch)
+        { binding: 2, type: 1, id: 201 },
+        { binding: 3, type: 2, id: 301 },
+      ])
+    )
+  );
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  assert.equal(handler.telemetry.unfilterableFloatFallbacks, 1);
+  assert.equal(handler.telemetry.bindGroupKindMismatches, 0);
+
+  // 2) Buffer bound to texture (@1), storageTexture (@2), and sampler (@3) -> +3 mismatches.
+  processor.executeCommandBuffer(
+    bindGroup2Packet(43, 20, [
+      { binding: 0, type: 0, id: 101, offset: 0, size: 256 }, // ok
+      { binding: 1, type: 0, id: 101, offset: 0, size: 256 }, // buffer -> texture
+      { binding: 2, type: 0, id: 101, offset: 0, size: 256 }, // buffer -> storageTexture
+      { binding: 3, type: 0, id: 101, offset: 0, size: 256 }, // buffer -> sampler
+    ])
+  );
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  assert.equal(handler.telemetry.bindGroupKindMismatches, 3);
+  const bg43 = gpu.results('createBindGroup').at(-1);
+  assert.equal(bg43.desc.entries[1].resource.kind, 'GPUTextureView');
+  assert.equal(bg43.desc.entries[2].resource.kind, 'GPUTextureView');
+  assert.equal(bg43.desc.entries[3].resource.kind, 'GPUSampler');
+
+  // 3) Texture bound to buffer (@0) and sampler (@3) -> +2 mismatches (total 5).
+  processor.executeCommandBuffer(
+    bindGroup2Packet(44, 20, [
+      { binding: 0, type: 1, id: 201 }, // texture -> buffer
+      { binding: 1, type: 1, id: 201 }, // ok
+      { binding: 2, type: 1, id: 201 }, // ok
+      { binding: 3, type: 1, id: 201 }, // texture -> sampler
+    ])
+  );
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  assert.equal(handler.telemetry.bindGroupKindMismatches, 5);
+  const bg44 = gpu.results('createBindGroup').at(-1);
+  assert.ok(bg44.desc.entries[0].resource && 'buffer' in bg44.desc.entries[0].resource);
+  assert.equal(bg44.desc.entries[3].resource.kind, 'GPUSampler');
+
+  // 4) Sampler bound to buffer (@0), texture (@1), and storageTexture (@2) -> +3 mismatches (total 8).
+  processor.executeCommandBuffer(
+    bindGroup2Packet(45, 20, [
+      { binding: 0, type: 2, id: 301 }, // sampler -> buffer
+      { binding: 1, type: 2, id: 301 }, // sampler -> texture
+      { binding: 2, type: 2, id: 301 }, // sampler -> storageTexture
+      { binding: 3, type: 2, id: 301 }, // ok
+    ])
+  );
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  assert.equal(handler.telemetry.bindGroupKindMismatches, 8);
+  const bg45 = gpu.results('createBindGroup').at(-1);
+  assert.ok(bg45.desc.entries[0].resource && 'buffer' in bg45.desc.entries[0].resource);
+  assert.equal(bg45.desc.entries[1].resource.kind, 'GPUTextureView');
+  assert.equal(bg45.desc.entries[2].resource.kind, 'GPUTextureView');
+
+  // 5) Repeated mismatched bind group increments again (unlike deduplicated warnings) -> +1 (total 9).
+  processor.executeCommandBuffer(
+    bindGroup2Packet(46, 20, [
+      { binding: 0, type: 2, id: 301 }, // sampler -> buffer again
+      { binding: 1, type: 1, id: 201 },
+      { binding: 2, type: 1, id: 201 },
+      { binding: 3, type: 2, id: 301 },
+    ])
+  );
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  assert.equal(handler.telemetry.bindGroupKindMismatches, 9);
+  assert.equal(handler.getTelemetry().bindGroupKindMismatches, 9);
+  assert.equal(handler.getStats().bindGroupKindMismatches, 9);
+});

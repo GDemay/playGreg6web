@@ -745,3 +745,133 @@ test('G30 hash-only CreateShaderModule misses populate missingShaders and fallba
   assert.equal(byHash.get(missCsHash).stage, 'compute');
   assert.equal(byHash.get(missCsHash).hits, 1);
 });
+
+// ---------------------------------------------------------------------------
+// 6. Issue #659: bindGroupKindMismatches surfaces in GPU telemetry snapshots
+// ---------------------------------------------------------------------------
+
+test('#659 bindGroupKindMismatches propagates through buildGpuTelemetrySnapshot and createWgpuWorkerHandler', async () => {
+  const { installRenderStatePackets, V2_OPCODES } = require('../web/workers/render_state_packets.js');
+  const mock = createMockWebGpu();
+  let nextObj = 100;
+  mock.device.createBuffer = (desc) => ({
+    kind: 'GPUBuffer',
+    handle: nextObj++,
+    size: desc.size,
+    usage: desc.usage,
+    desc,
+  });
+  mock.device.createTexture = (desc) => {
+    const handle = nextObj++;
+    return {
+      kind: 'GPUTexture',
+      handle,
+      format: desc.format,
+      usage: desc.usage,
+      dimension: desc.dimension || '2d',
+      desc,
+      createView(viewDesc = {}) {
+        return { kind: 'GPUTextureView', handle: nextObj++, textureHandle: handle, desc: viewDesc };
+      },
+    };
+  };
+  mock.device.createSampler = (desc = {}) => ({ kind: 'GPUSampler', handle: nextObj++, desc });
+  mock.device.createBindGroupLayout = (desc) => ({
+    kind: 'GPUBindGroupLayout',
+    handle: nextObj++,
+    desc,
+  });
+  mock.device.createBindGroup = (desc) => ({ kind: 'GPUBindGroup', handle: nextObj++, desc });
+
+  const processor = new WgpuCommandProcessor(mock.device, mock.ctx, { format: 'rgba8unorm' });
+  const rsHandler = installRenderStatePackets(processor);
+
+  // Clean processor reports bindGroupKindMismatches === 0.
+  assert.equal(
+    buildGpuTelemetrySnapshot(processor, { timestamp: 100 }).renderStateStats.bindGroupKindMismatches,
+    0
+  );
+
+  // Helpers to build v2 CreateBindGroupLayout + CreateBindGroup2 packets.
+  const bglPayload = new ArrayBuffer(24 + 3 * 24);
+  const bglView = new DataView(bglPayload);
+  bglView.setUint32(0, 20, true); // id
+  bglView.setUint32(4, 3, true); // count
+  // Entry 0: uniform buffer @0
+  bglView.setUint32(24 + 0, 0, true);
+  bglView.setUint32(24 + 4, 4, true); // COMPUTE
+  bglView.setUint8(24 + 8, 0); // buffer
+  // Entry 1: texture @1
+  bglView.setUint32(24 + 24 + 0, 1, true);
+  bglView.setUint32(24 + 24 + 4, 4, true);
+  bglView.setUint8(24 + 24 + 8, 2); // texture
+  bglView.setUint8(24 + 24 + 10, 2); // 2d
+  // Entry 2: sampler @2
+  bglView.setUint32(24 + 48 + 0, 2, true);
+  bglView.setUint32(24 + 48 + 4, 4, true);
+  bglView.setUint8(24 + 48 + 8, 1); // sampler
+
+  const bgPayload = new ArrayBuffer(16 + 3 * 48);
+  const bgView = new DataView(bgPayload);
+  bgView.setUint32(0, 30, true); // id
+  bgView.setUint32(4, 20, true); // layoutId
+  bgView.setUint32(8, 3, true); // count
+  // Binding 0 (expects buffer) <- sampler 301
+  bgView.setUint32(16 + 0, 0, true);
+  bgView.setUint32(16 + 4, 2, true); // SAMPLER
+  bgView.setUint32(16 + 8, 301, true);
+  // Binding 1 (expects texture) <- buffer 101
+  bgView.setUint32(16 + 48 + 0, 1, true);
+  bgView.setUint32(16 + 48 + 4, 0, true); // BUFFER
+  bgView.setUint32(16 + 48 + 8, 101, true);
+  bgView.setBigUint64(16 + 48 + 24, 256n, true);
+  // Binding 2 (expects sampler) <- texture 201
+  bgView.setUint32(16 + 96 + 0, 2, true);
+  bgView.setUint32(16 + 96 + 4, 1, true); // TEXTURE_VIEW
+  bgView.setUint32(16 + 96 + 8, 201, true);
+
+  // Create buffer 101, texture 201, sampler 301 via processor maps & execute packets + Present.
+  processor.buffers.set(101, mock.device.createBuffer({ size: 256, usage: 0x0040 | 0x0080 | 0x0008 }));
+  processor.textures.set(
+    201,
+    mock.device.createTexture({ size: { width: 4, height: 4, depthOrArrayLayers: 1 }, format: 'rgba8unorm', usage: 0x04 })
+  );
+  processor.samplers.set(301, mock.device.createSampler({}));
+
+  const builder = new PacketBuilder();
+  builder._push(V2_OPCODES.CREATE_BIND_GROUP_LAYOUT, new Uint8Array(bglPayload));
+  builder._push(V2_OPCODES.CREATE_BIND_GROUP2, new Uint8Array(bgPayload));
+  builder.beginFrame().present();
+
+  const posted = [];
+  const workerHandler = createWgpuWorkerHandler({
+    processor,
+    postMessage: (msg) => posted.push(msg),
+    now: () => 9000,
+  });
+
+  await workerHandler.handleMessage({ cmdBuffer: builder.finish() });
+  assert.equal(rsHandler.stats.errors, 0, rsHandler.lastError);
+  assert.equal(rsHandler.telemetry.bindGroupKindMismatches, 3);
+
+  const emitted = posted.filter((m) => m.type === 'gpu-telemetry');
+  assert.equal(emitted.length, 1);
+  assert.equal(emitted[0].renderStateStats.bindGroupKindMismatches, 3);
+
+  // On-demand request-gpu-telemetry also reports bindGroupKindMismatches.
+  await workerHandler.handleMessage({ type: 'request-gpu-telemetry', id: 77 });
+  const requested = posted.filter((m) => m.type === 'gpu-telemetry' && m.id === 77);
+  assert.equal(requested.length, 1);
+  assert.equal(requested[0].renderStateStats.bindGroupKindMismatches, 3);
+
+  // A telemetry source exposing only bindGroupKindMismatches is recognized by RENDER_STATE_TELEMETRY_KEYS.
+  const onlyMismatches = buildGpuTelemetrySnapshot(
+    {
+      getStats: () => ({}),
+      renderStateProcessor: { getTelemetry: () => ({ bindGroupKindMismatches: 6.9 }) },
+    },
+    { timestamp: 9001 }
+  );
+  assert.equal(onlyMismatches.renderStateStats.bindGroupKindMismatches, 6);
+  assert.equal(onlyMismatches.renderStateStats.autoLayoutFallbacks, 0);
+});
