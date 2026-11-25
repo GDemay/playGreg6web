@@ -121,12 +121,12 @@
   const VIDEO_STREAM_EXT_RE = /\.(?:bk2|bik)$/i;
 
   const DEFAULT_IMMUTABLE_CHUNK_SIZE = 64 * 1024; // 64 KiB aligned chunks
-  const DEFAULT_IMMUTABLE_MAX_BYTES = 64 * 1024 * 1024; // 64 MiB RAM cap
+  const DEFAULT_IMMUTABLE_MAX_BYTES = 128 * 1024 * 1024; // 128 MiB RAM cap
   const DEFAULT_WHOLE_FILE_MAX_BYTES = 256 * 1024 * 1024; // 256 MiB safe cap for eager .pgim / manifest buffering
   const DEFAULT_SLAB_SIZE = 2 * 1024 * 1024; // 2 MiB aligned read-ahead slabs
-  const DEFAULT_SLAB_MAX_BYTES = 32 * 1024 * 1024; // 32 MiB bounded LRU cap for read-ahead slabs
+  const DEFAULT_SLAB_MAX_BYTES = 192 * 1024 * 1024; // 192 MiB bounded LRU cap (96 x 2 MiB slabs; holds ~115 MB shaders.rpf working set without thrashing)
   const MAX_SLAB_SIZE = 16 * 1024 * 1024; // 16 MiB upper safety cap per slab
-  const MAX_SLAB_CACHE_BYTES = 128 * 1024 * 1024; // 128 MiB upper safety cap for worker slab RAM
+  const MAX_SLAB_CACHE_BYTES = 256 * 1024 * 1024; // 256 MiB upper safety cap for worker slab RAM
   const DEFAULT_SLAB_PREFETCH_AHEAD = 0; // Opt-in/tunable sequential read-ahead slab count
   const MAX_SLAB_PREFETCH_AHEAD = 8;
   const DEFAULT_MAX_CONCURRENT_SLAB_FETCHES = 4;
@@ -150,7 +150,7 @@
     }),
     video4k: Object.freeze({
       slabSize: 4 * 1024 * 1024, // 4 MiB slabs for smooth 4K Bink2 sequential reads
-      slabMaxBytes: 48 * 1024 * 1024, // 48 MiB bounded LRU cap (12 slabs)
+      slabMaxBytes: 192 * 1024 * 1024, // 192 MiB bounded LRU cap (48 slabs; keeps shader/asset working set warm during 4K video playback)
       prefetchAheadSlabs: 2, // Bounded 2-slab sequential read-ahead
       maxConcurrentSlabFetches: 3, // Leaves HTTP/1.1 connection headroom for live dump POSTs
       sequentialThresholdReads: 2,
@@ -1193,6 +1193,10 @@
       return `${url}::slab::${slabIndex}`;
     }
 
+    _isSlabModeEnabled() {
+      return this.slabSize > 0 && this.slabMaxBytes >= this.slabSize;
+    }
+
     _touchMeta(url) {
       if (!this._fileMeta.has(url)) {
         return null;
@@ -1658,7 +1662,11 @@
       this._stats.metaMisses += 1;
       const openPromise = (async () => {
         try {
-          await this._getChunkRange(url, 0, 0);
+          if (this._isSlabModeEnabled()) {
+            await this._getSlabRange(url, 0, 0);
+          } else {
+            await this._getChunkRange(url, 0, 0);
+          }
           const meta = this._fileMeta.get(url);
           if (!meta) {
             this.setFileMetadata(url, null);
@@ -2046,7 +2054,7 @@
       this.maxConcurrentSlabFetches = merged.maxConcurrentSlabFetches;
       this.sequentialThresholdReads = merged.sequentialThresholdReads;
 
-      if (prevSlabSize !== this.slabSize || this.slabSize <= 0 || this.slabMaxBytes <= 0) {
+      if (prevSlabSize !== this.slabSize || !this._isSlabModeEnabled()) {
         this._slabs.clear();
         this._slabBytesCached = 0;
         this._streamTrackers.clear();
@@ -2070,28 +2078,57 @@
     }
 
     _getSlabRange(url, firstSlab, lastSlab) {
-      const totalSlabs = lastSlab - firstSlab + 1;
-      const slabPromises = new Array(totalSlabs);
-      for (let i = 0; i < totalSlabs; i += 1) {
-        const slabIndex = firstSlab + i;
+      const resolveSingleSlab = (slabIndex) => {
         const key = this._slabKey(url, slabIndex);
 
         const memHit = this._touchSlab(key);
         if (memHit !== null) {
           this._stats.slabHits += 1;
-          slabPromises[i] = Promise.resolve(memHit);
-          continue;
+          return Promise.resolve(memHit);
         }
 
         const inFlight = this._inFlightSlabs.get(key);
         if (inFlight) {
           this._stats.inFlightCoalesced += 1;
-          slabPromises[i] = inFlight;
-          continue;
+          return inFlight;
         }
 
         this._stats.slabMisses += 1;
-        slabPromises[i] = this._fetchSlab(url, slabIndex);
+        return this._fetchSlab(url, slabIndex);
+      };
+
+      const totalSlabs = lastSlab - firstSlab + 1;
+      if (totalSlabs > 1 && this.getFileSize(url) === null) {
+        return (async () => {
+          const firstBytes = await resolveSingleSlab(firstSlab);
+          const results = [firstBytes];
+          if (!firstBytes || firstBytes.byteLength < this.slabSize) {
+            return results;
+          }
+          const knownSize = this.getFileSize(url);
+          const clampedLast =
+            knownSize !== null
+              ? knownSize === 0
+                ? firstSlab
+                : Math.min(lastSlab, Math.floor((knownSize - 1) / this.slabSize))
+              : lastSlab;
+          if (clampedLast > firstSlab) {
+            const rest = [];
+            for (let s = firstSlab + 1; s <= clampedLast; s += 1) {
+              rest.push(resolveSingleSlab(s));
+            }
+            const restBytes = await Promise.all(rest);
+            for (let i = 0; i < restBytes.length; i += 1) {
+              results.push(restBytes[i]);
+            }
+          }
+          return results;
+        })();
+      }
+
+      const slabPromises = new Array(totalSlabs);
+      for (let i = 0; i < totalSlabs; i += 1) {
+        slabPromises[i] = resolveSingleSlab(firstSlab + i);
       }
       return Promise.all(slabPromises);
     }
@@ -2124,7 +2161,7 @@
 
       const copy = options.copy !== false;
 
-      if (this.slabSize > 0 && this.slabMaxBytes > 0 && this._slabs.size > 0) {
+      if (this._isSlabModeEnabled() && this._slabs.size > 0) {
         const firstSlab = Math.floor(offset / this.slabSize);
         const lastSlab = Math.floor((offset + effectiveLen - 1) / this.slabSize);
         let allSlabsPresent = true;
@@ -2252,7 +2289,7 @@
         return syncHit;
       }
 
-      if (this.slabSize > 0 && this.slabMaxBytes > 0) {
+      if (this._isSlabModeEnabled()) {
         const firstSlab = Math.floor(offset / this.slabSize);
         const lastSlab = Math.floor((offset + effectiveLen - 1) / this.slabSize);
         const slabs = await this._getSlabRange(url, firstSlab, lastSlab);
@@ -3039,7 +3076,8 @@
       const tuned = immCache.tuneSlabCache(profileOrOptions);
       this._immutableCacheOptions.slabSize = tuned.slabSize;
       this._immutableCacheOptions.slabMaxBytes = tuned.slabMaxBytes;
-      this._immutableCacheOptions.slabCacheEnabled = tuned.slabSize > 0 && tuned.slabMaxBytes > 0;
+      this._immutableCacheOptions.slabCacheEnabled =
+        tuned.slabSize > 0 && tuned.slabMaxBytes >= tuned.slabSize;
       this._immutableCacheOptions.prefetchAheadSlabs = tuned.prefetchAheadSlabs;
       this._immutableCacheOptions.maxConcurrentSlabFetches = tuned.maxConcurrentSlabFetches;
       this._immutableCacheOptions.sequentialThresholdReads = tuned.sequentialThresholdReads;
@@ -3719,6 +3757,17 @@
       if (group.route.isRpf) {
         return this._readRpfRange(group.route.url, group.offset, group.length, group.priority);
       }
+      if (this.immutableCache && this._shouldUseImmutableCache(group.route)) {
+        const hotImmutableBytes = this.immutableCache.tryReadSync(
+          group.route.url,
+          group.offset,
+          group.length,
+          { copy: true },
+        );
+        if (hotImmutableBytes !== null) {
+          return hotImmutableBytes;
+        }
+      }
       const cachePath = this._routeToCachePath(group.route);
       const cache = this.ensureRangeCache();
       if (
@@ -3762,10 +3811,24 @@
           if (!route.ok) {
             throw createErrnoError(-22, route.error);
           }
-          bytes = await this._scheduledRead(this._routeToCachePath(route), offset, length, {
-            priority,
-            signal: options.signal || null,
-          });
+          if (options.signal && options.signal.aborted) {
+            const abortErr = createErrnoError(-4, 'The operation was aborted');
+            abortErr.name = 'AbortError';
+            abortErr.code = 'ABORT_ERR';
+            throw abortErr;
+          }
+          const hotImmutableBytes =
+            this.immutableCache && this._shouldUseImmutableCache(route)
+              ? this.immutableCache.tryReadSync(route.url, offset, length, { copy: true })
+              : null;
+          if (hotImmutableBytes !== null) {
+            bytes = hotImmutableBytes;
+          } else {
+            bytes = await this._scheduledRead(this._routeToCachePath(route), offset, length, {
+              priority,
+              signal: options.signal || null,
+            });
+          }
         }
         const elapsedMs = Math.max(0, this._now() - startMs);
         this._recordReadSuccess(bytes ? bytes.byteLength : 0, elapsedMs);
