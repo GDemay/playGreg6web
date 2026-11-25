@@ -6,8 +6,15 @@ import { BootTracer, BOOT_MILESTONES } from '../web/telemetry/boot_tracer.js';
 
 const require = createRequire(import.meta.url);
 const orchestratorMod = require('../web/runtime/boot_orchestrator.js');
-const { BOOT_PHASE, BOOT_MODE, BootOrchestrator, DEFAULT_STATUS_URL, discoverBootAssets, isRealGuestBoot } =
-  orchestratorMod;
+const {
+  BOOT_PHASE,
+  BOOT_MODE,
+  BootOrchestrator,
+  DEFAULT_STATUS_URL,
+  DEFAULT_STAGE_TIMEOUT_MS,
+  discoverBootAssets,
+  isRealGuestBoot,
+} = orchestratorMod;
 
 function createMockFetch(payload, { ok = true, status = 200, throwError = null, delayMs = 0 } = {}) {
   const calls = [];
@@ -193,6 +200,9 @@ function createOrchestrator(overrides = {}) {
         : (meta) => {
             firstPresents.push(meta);
           },
+    onStageStall: overrides.onStageStall,
+    nowFn: overrides.nowFn,
+    stageTimeoutMs: overrides.stageTimeoutMs,
   });
   return { orchestrator, overlay, bootTracer, phases, launches, fallbacks, firstPresents };
 }
@@ -747,4 +757,559 @@ test('W56 tracks bootMode pending -> wasm-guest vs smoke-demo and tags firstPres
   assert.equal(failRes.bootMode, 'pending');
   assert.equal(failed.orchestrator.getState().bootMode, 'pending');
   assert.equal(failed.orchestrator.isRealGuestBoot(), false);
+});
+
+test('W146 validates nowFn, stageTimeoutMs, and onStageStall options and exports DEFAULT_STAGE_TIMEOUT_MS', () => {
+  assert.equal(DEFAULT_STAGE_TIMEOUT_MS, 0);
+  assert.throws(() => new BootOrchestrator({ nowFn: 123 }), TypeError);
+  assert.throws(() => new BootOrchestrator({ nowFn: 'clock' }), TypeError);
+  assert.throws(() => new BootOrchestrator({ onStageStall: {} }), TypeError);
+  assert.throws(() => new BootOrchestrator({ stageTimeoutMs: '500' }), TypeError);
+  assert.throws(() => new BootOrchestrator({ stageTimeoutMs: -1 }), RangeError);
+  assert.throws(() => new BootOrchestrator({ stageTimeoutMs: Number.NaN }), RangeError);
+  assert.throws(() => new BootOrchestrator({ stageTimeoutMs: Number.POSITIVE_INFINITY }), RangeError);
+  assert.throws(() => new BootOrchestrator({ stageTimeoutMs: Number.NEGATIVE_INFINITY }), RangeError);
+
+  const defaultOrch = new BootOrchestrator({ fetchImpl: async () => ({}) });
+  const initialState = defaultOrch.getState();
+  assert.deepEqual(initialState.stageDurationsMs, {});
+  assert.equal(initialState.currentStageElapsedMs, 0);
+  assert.equal(initialState.totalStageDurationMs, 0);
+  assert.equal(initialState.stageTimeoutMs, 0);
+  assert.equal(initialState.isStalled, false);
+  assert.equal(initialState.stalledStage, null);
+  assert.equal(initialState.stalledMs, 0);
+  assert.equal(initialState.stallCount, 0);
+
+  const nullOptsOrch = new BootOrchestrator({
+    fetchImpl: async () => ({}),
+    nowFn: null,
+    stageTimeoutMs: null,
+    onStageStall: null,
+  });
+  assert.equal(nullOptsOrch.getState().stageTimeoutMs, 0);
+});
+
+test('W146 tracks per-stage duration timing breakdown across transitions with injectable nowFn', async () => {
+  let now = 1000;
+  const nowFn = () => now;
+
+  let resolveFetch;
+  const deferredFetch = async () =>
+    new Promise((resolve) => {
+      resolveFetch = () =>
+        resolve({
+          ok: true,
+          status: 200,
+          async json() {
+            return readyStatus();
+          },
+        });
+    });
+
+  let resolvePreload;
+  const deferredPreloader = {
+    preloadBootBundle: async () =>
+      new Promise((resolve) => {
+        resolvePreload = () =>
+          resolve({
+            pgim: { header: { magic: 'PGIM' }, bytesLoaded: 64 },
+            shaderPackBytes: new Uint8Array([1, 2, 3]),
+            reflectionManifest: { schema_version: 1 },
+            bytesLoaded: 64,
+          });
+      }),
+  };
+
+  const phaseSnapshots = [];
+  const { orchestrator } = createOrchestrator({
+    fetchImpl: deferredFetch,
+    preloader: deferredPreloader,
+    nowFn,
+    onPhaseChange: (event) => phaseSnapshots.push({ phase: event.phase, durations: event.stageDurationsMs }),
+  });
+
+  // Idle time before start() does not pollute boot stage durations.
+  now = 2500;
+  assert.deepEqual(orchestrator.getState().stageDurationsMs, {});
+  assert.equal(orchestrator.getState().currentStageElapsedMs, 0);
+  assert.equal(orchestrator.getState().totalStageDurationMs, 0);
+
+  // Enter DISCOVERING at t=2500.
+  const startPromise = orchestrator.start();
+  assert.equal(orchestrator.getState().phase, BOOT_PHASE.DISCOVERING);
+
+  now = 2540;
+  assert.deepEqual(orchestrator.getState().stageDurationsMs, {});
+  assert.equal(orchestrator.getState().currentStageElapsedMs, 40);
+  assert.equal(orchestrator.getState().totalStageDurationMs, 40);
+
+  // Finish DISCOVERING at t=2620 (120ms) -> enters PRELOADING.
+  now = 2620;
+  resolveFetch();
+  // Wait for microtasks to transition into PRELOADING.
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(orchestrator.getState().phase, BOOT_PHASE.PRELOADING);
+  assert.deepEqual(orchestrator.getState().stageDurationsMs, { DISCOVERING: 120 });
+  assert.equal(orchestrator.getState().currentStageElapsedMs, 0);
+
+  // Mid-PRELOADING at t=2820 (200ms elapsed).
+  now = 2820;
+  assert.equal(orchestrator.getState().currentStageElapsedMs, 200);
+  assert.equal(orchestrator.getState().totalStageDurationMs, 320);
+
+  // Finish PRELOADING at t=2970 (350ms) -> enters LAUNCHING_RUNTIME.
+  now = 2970;
+  resolvePreload();
+  const result = await startPromise;
+  assert.equal(result.ok, true);
+  assert.equal(orchestrator.getState().phase, BOOT_PHASE.LAUNCHING_RUNTIME);
+  assert.deepEqual(orchestrator.getState().stageDurationsMs, {
+    DISCOVERING: 120,
+    PRELOADING: 350,
+  });
+  assert.equal(orchestrator.getState().currentStageElapsedMs, 0);
+
+  // Reach FIRST_PRESENT at t=3470 (500ms in LAUNCHING_RUNTIME) -> enters PRESENTING.
+  now = 3470;
+  orchestrator.notifyFirstPresent({ frameIndex: 1 });
+  assert.equal(orchestrator.getState().phase, BOOT_PHASE.PRESENTING);
+  const presentedState = orchestrator.getState();
+  assert.deepEqual(presentedState.stageDurationsMs, {
+    DISCOVERING: 120,
+    PRELOADING: 350,
+    LAUNCHING_RUNTIME: 500,
+  });
+  assert.equal(presentedState.currentStageElapsedMs, 0);
+  assert.equal(presentedState.totalStageDurationMs, 970);
+
+  // Defensive clone: mutating returned stageDurationsMs does not corrupt internal state.
+  presentedState.stageDurationsMs.DISCOVERING = 999999;
+  assert.equal(orchestrator.getState().stageDurationsMs.DISCOVERING, 120);
+
+  // Advancing clock while PRESENTING does not accumulate or mark stalled.
+  now = 99999;
+  assert.deepEqual(orchestrator.getState().stageDurationsMs, {
+    DISCOVERING: 120,
+    PRELOADING: 350,
+    LAUNCHING_RUNTIME: 500,
+  });
+  assert.equal(orchestrator.getState().currentStageElapsedMs, 0);
+  assert.equal(orchestrator.getState().totalStageDurationMs, 970);
+
+  // Phase change events carry stageDurationsMs snapshots.
+  const presentingEvent = phaseSnapshots.find((entry) => entry.phase === BOOT_PHASE.PRESENTING);
+  assert.ok(presentingEvent);
+  assert.deepEqual(presentingEvent.durations, {
+    DISCOVERING: 120,
+    PRELOADING: 350,
+    LAUNCHING_RUNTIME: 500,
+  });
+});
+
+test('W146 tracks smoke-demo fallback, error, abort, and destroy stage durations cleanly', async () => {
+  // 1. Smoke-demo fallback path.
+  let now = 100;
+  const smokeFetch = async () => {
+    now += 45;
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return readyStatus({ hasWasmBinary: false, runtimeWasm: null, pgimUrl: null, shaderPackUrl: null });
+      },
+    };
+  };
+  const smoke = createOrchestrator({ fetchImpl: smokeFetch, nowFn: () => now, stageTimeoutMs: 500 });
+  await smoke.orchestrator.start();
+  assert.equal(smoke.orchestrator.getState().phase, BOOT_PHASE.FALLBACK_SMOKE_DEMO);
+  assert.deepEqual(smoke.orchestrator.getState().stageDurationsMs, { DISCOVERING: 45 });
+  now += 80;
+  smoke.orchestrator.markFirstPresent({ source: 'smoke-demo' });
+  assert.deepEqual(smoke.orchestrator.getState().stageDurationsMs, {
+    DISCOVERING: 45,
+    FALLBACK_SMOKE_DEMO: 80,
+  });
+  assert.equal(smoke.orchestrator.getState().totalStageDurationMs, 125);
+
+  // 2. Network error during DISCOVERING.
+  let errNow = 500;
+  const errFetch = async () => {
+    errNow += 75;
+    throw new TypeError('network down');
+  };
+  const failed = createOrchestrator({ fetchImpl: errFetch, nowFn: () => errNow, stageTimeoutMs: 50 });
+  await failed.orchestrator.start();
+  assert.equal(failed.orchestrator.getState().phase, BOOT_PHASE.ERROR);
+  assert.deepEqual(failed.orchestrator.getState().stageDurationsMs, { DISCOVERING: 75 });
+  errNow += 10000;
+  assert.equal(failed.orchestrator.getState().isStalled, false);
+  assert.equal(failed.orchestrator.getState().stalledStage, null);
+  assert.equal(failed.orchestrator.getState().stalledMs, 0);
+
+  // 3. Abort during DISCOVERING.
+  let abortNow = 200;
+  const controller = new AbortController();
+  const abortFetch = async (_url, { signal }) =>
+    new Promise((_resolve, reject) => {
+      signal.addEventListener(
+        'abort',
+        () => {
+          const err = new Error('The operation was aborted.');
+          err.name = 'AbortError';
+          reject(err);
+        },
+        { once: true }
+      );
+    });
+  const cancelled = createOrchestrator({ fetchImpl: abortFetch, nowFn: () => abortNow, stageTimeoutMs: 100 });
+  const pendingCancel = cancelled.orchestrator.start({ signal: controller.signal });
+  abortNow += 60;
+  controller.abort();
+  await pendingCancel;
+  assert.equal(cancelled.orchestrator.getState().phase, BOOT_PHASE.CANCELLED);
+  assert.deepEqual(cancelled.orchestrator.getState().stageDurationsMs, { DISCOVERING: 60 });
+  abortNow += 5000;
+  assert.equal(cancelled.orchestrator.getState().isStalled, false);
+
+  // 4. Destroy during DISCOVERING.
+  let destroyNow = 300;
+  const destroyed = createOrchestrator({ fetchImpl: abortFetch, nowFn: () => destroyNow, stageTimeoutMs: 100 });
+  const pendingDestroy = destroyed.orchestrator.start();
+  destroyNow += 30;
+  destroyed.orchestrator.destroy();
+  await pendingDestroy;
+  assert.equal(destroyed.orchestrator.getState().phase, BOOT_PHASE.DESTROYED);
+  assert.deepEqual(destroyed.orchestrator.getState().stageDurationsMs, { DISCOVERING: 30 });
+  destroyNow += 5000;
+  assert.equal(destroyed.orchestrator.getState().isStalled, false);
+});
+
+test('W146 stalled-stage watchdog stays disabled when stageTimeoutMs=0 and detects/recovers cleanly when enabled', async () => {
+  // 1. Disabled watchdog (stageTimeoutMs = 0).
+  let disabledNow = 0;
+  let resolveDisabledFetch;
+  const disabledFetch = async () =>
+    new Promise((resolve) => {
+      resolveDisabledFetch = () =>
+        resolve({
+          ok: true,
+          status: 200,
+          async json() {
+            return readyStatus();
+          },
+        });
+    });
+  const disabled = createOrchestrator({ fetchImpl: disabledFetch, nowFn: () => disabledNow, stageTimeoutMs: 0 });
+  const disabledStart = disabled.orchestrator.start();
+  disabledNow = 600_000;
+  const disabledCheck = disabled.orchestrator.checkStageStall();
+  assert.equal(disabledCheck.isStalled, false);
+  assert.equal(disabledCheck.stalledStage, null);
+  assert.equal(disabledCheck.stalledMs, 0);
+  assert.equal(disabledCheck.currentStageElapsedMs, 600_000);
+  assert.equal(disabled.orchestrator.getState().isStalled, false);
+  resolveDisabledFetch();
+  await disabledStart;
+
+  // 2. Enabled watchdog (stageTimeoutMs = 500) with non-destructive recovery and onStageStall callback.
+  let now = 0;
+  let resolveFetch;
+  const deferredFetch = async () =>
+    new Promise((resolve) => {
+      resolveFetch = () =>
+        resolve({
+          ok: true,
+          status: 200,
+          async json() {
+            return readyStatus();
+          },
+        });
+    });
+  let resolvePreload;
+  const deferredPreloader = {
+    preloadBootBundle: async () =>
+      new Promise((resolve) => {
+        resolvePreload = () =>
+          resolve({
+            pgim: { header: { magic: 'PGIM' }, bytesLoaded: 64 },
+            shaderPackBytes: new Uint8Array([1, 2, 3]),
+            reflectionManifest: { schema_version: 1 },
+            bytesLoaded: 64,
+          });
+      }),
+  };
+
+  const stallEvents = [];
+  const { orchestrator } = createOrchestrator({
+    fetchImpl: deferredFetch,
+    preloader: deferredPreloader,
+    nowFn: () => now,
+    stageTimeoutMs: 500,
+    onStageStall: (event) => {
+      stallEvents.push(event);
+      // Verify throwing inside onStageStall never escapes checkStageStall().
+      if (stallEvents.length === 1) {
+        throw new Error('listener boom');
+      }
+    },
+  });
+
+  // Sitting in IDLE past stageTimeoutMs is never a stall.
+  now = 5000;
+  const idleCheck = orchestrator.checkStageStall();
+  assert.equal(idleCheck.isStalled, false);
+  assert.equal(idleCheck.stalledStage, null);
+  assert.equal(idleCheck.stalledMs, 0);
+  assert.equal(stallEvents.length, 0);
+
+  // Start DISCOVERING at t=5000.
+  const startPromise = orchestrator.start();
+
+  // Just below threshold (499ms).
+  now = 5499;
+  assert.equal(orchestrator.getState().isStalled, false);
+  assert.equal(orchestrator.checkStageStall().isStalled, false);
+  assert.equal(stallEvents.length, 0);
+
+  // At threshold (500ms) -> stalled!
+  now = 5500;
+  const liveState = orchestrator.getState();
+  assert.equal(liveState.isStalled, true);
+  assert.equal(liveState.stalledStage, BOOT_PHASE.DISCOVERING);
+  assert.equal(liveState.stalledMs, 500);
+  assert.equal(liveState.stageTimeoutMs, 500);
+
+  const stall1 = orchestrator.checkStageStall();
+  assert.equal(stall1.isStalled, true);
+  assert.equal(stall1.stalledStage, BOOT_PHASE.DISCOVERING);
+  assert.equal(stall1.stalledMs, 500);
+  assert.equal(stallEvents.length, 1);
+  assert.equal(orchestrator.getState().stallCount, 1);
+
+  // Repeated checkStageStall() while still in DISCOVERING updates stalledMs without duplicate callback.
+  now = 5750;
+  const stall1Again = orchestrator.checkStageStall();
+  assert.equal(stall1Again.isStalled, true);
+  assert.equal(stall1Again.stalledMs, 750);
+  assert.equal(stallEvents.length, 1);
+  assert.equal(orchestrator.getState().stallCount, 1);
+
+  // Stage recovers cleanly and transitions to PRELOADING at t=5800 (800ms total in DISCOVERING).
+  now = 5800;
+  resolveFetch();
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(orchestrator.getState().phase, BOOT_PHASE.PRELOADING);
+  assert.equal(orchestrator.getState().isStalled, false);
+  assert.equal(orchestrator.getState().stalledStage, null);
+  assert.equal(orchestrator.getState().stalledMs, 0);
+  assert.deepEqual(orchestrator.getState().stageDurationsMs, { DISCOVERING: 800 });
+
+  // Stall again in PRELOADING at t=6400 (600ms elapsed).
+  now = 6400;
+  const stall2 = orchestrator.checkStageStall();
+  assert.equal(stall2.isStalled, true);
+  assert.equal(stall2.stalledStage, BOOT_PHASE.PRELOADING);
+  assert.equal(stall2.stalledMs, 600);
+  assert.equal(stallEvents.length, 2);
+  assert.equal(orchestrator.getState().stallCount, 2);
+
+  // Complete preload and present -> clears stall and preserves full timing breakdown.
+  now = 6450;
+  resolvePreload();
+  await startPromise;
+  now = 6550;
+  orchestrator.notifyFirstPresent();
+  const finalState = orchestrator.getState();
+  assert.equal(finalState.phase, BOOT_PHASE.PRESENTING);
+  assert.equal(finalState.isStalled, false);
+  assert.equal(finalState.stalledStage, null);
+  assert.equal(finalState.stalledMs, 0);
+  assert.deepEqual(finalState.stageDurationsMs, {
+    DISCOVERING: 800,
+    PRELOADING: 650,
+    LAUNCHING_RUNTIME: 100,
+  });
+  assert.equal(finalState.stallCount, 2);
+});
+
+test('W146 tolerates backwards, non-finite, and throwing nowFn readings without producing NaN or negative ms', async () => {
+  const readings = [1000, 1000, 400, Number.NaN, Number.POSITIVE_INFINITY, 'bad', () => { throw new Error('clock fail'); }, 1250];
+  let idx = 0;
+  const nowFn = () => {
+    const entry = readings[Math.min(idx++, readings.length - 1)];
+    return typeof entry === 'function' ? entry() : entry;
+  };
+
+  let resolveFetch;
+  const deferredFetch = async () =>
+    new Promise((resolve) => {
+      resolveFetch = () =>
+        resolve({
+          ok: true,
+          status: 200,
+          async json() {
+            return readyStatus({ hasWasmBinary: false, runtimeWasm: null, pgimUrl: null, shaderPackUrl: null });
+          },
+        });
+    });
+
+  const { orchestrator } = createOrchestrator({ fetchImpl: deferredFetch, nowFn, stageTimeoutMs: 100 });
+  const pending = orchestrator.start();
+
+  // Backwards reading (400 < 1000), NaN, Infinity, non-number, and throwing clock all stay finite >= 0.
+  for (let i = 0; i < 5; i += 1) {
+    const state = orchestrator.getState();
+    assert.equal(Number.isFinite(state.currentStageElapsedMs), true);
+    assert.equal(state.currentStageElapsedMs >= 0, true);
+    assert.equal(Object.is(state.currentStageElapsedMs, -0), false);
+    assert.equal(Number.isFinite(state.stalledMs), true);
+    assert.equal(state.stalledMs >= 0, true);
+  }
+
+  resolveFetch();
+  await pending;
+  const after = orchestrator.getState();
+  assert.equal(Number.isFinite(after.stageDurationsMs.DISCOVERING), true);
+  assert.equal(after.stageDurationsMs.DISCOVERING >= 0, true);
+});
+
+test('W146 reset() clears stage durations, watchdog state, and in-flight work cleanly', async () => {
+  let now = 100;
+  let resolveSlowFetch;
+  let fetchCount = 0;
+  const fetchImpl = async (_url, { signal }) => {
+    fetchCount += 1;
+    if (fetchCount === 1) {
+      return new Promise((resolve, reject) => {
+        resolveSlowFetch = () =>
+          resolve({
+            ok: true,
+            status: 200,
+            async json() {
+              return readyStatus();
+            },
+          });
+        signal.addEventListener(
+          'abort',
+          () => {
+            const err = new Error('The operation was aborted.');
+            err.name = 'AbortError';
+            reject(err);
+          },
+          { once: true }
+        );
+      });
+    }
+    now += 25;
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return readyStatus({ pgimUrl: null, shaderPackUrl: null, programManifestUrl: '/boot/program-manifest.json' });
+      },
+    };
+  };
+
+  const { orchestrator } = createOrchestrator({ fetchImpl, nowFn: () => now, stageTimeoutMs: 200 });
+
+  // 1. Reset during an in-flight stalled DISCOVERING stage.
+  const firstRun = orchestrator.start();
+  now = 450; // 350ms >= 200ms -> stalled
+  assert.equal(orchestrator.checkStageStall().isStalled, true);
+  assert.equal(orchestrator.getState().stallCount, 1);
+
+  const resetRes = orchestrator.reset();
+  assert.equal(resetRes.ok, true);
+  assert.equal(resetRes.phase, BOOT_PHASE.IDLE);
+  assert.equal(resetRes.bootMode, BOOT_MODE.PENDING);
+
+  // Superseded firstRun settles without clobbering reset IDLE state.
+  const firstRunRes = await firstRun;
+  assert.equal(firstRunRes.ok, false);
+  assert.equal(firstRunRes.aborted, true);
+
+  const afterReset = orchestrator.getState();
+  assert.equal(afterReset.phase, BOOT_PHASE.IDLE);
+  assert.equal(afterReset.bootMode, BOOT_MODE.PENDING);
+  assert.equal(afterReset.aborted, false);
+  assert.equal(afterReset.firstPresent, false);
+  assert.equal(afterReset.error, null);
+  assert.deepEqual(afterReset.stageDurationsMs, {});
+  assert.equal(afterReset.currentStageElapsedMs, 0);
+  assert.equal(afterReset.totalStageDurationMs, 0);
+  assert.equal(afterReset.isStalled, false);
+  assert.equal(afterReset.stalledStage, null);
+  assert.equal(afterReset.stalledMs, 0);
+  assert.equal(afterReset.stallCount, 0);
+
+  // 2. Can start cleanly again after reset().
+  const secondRun = await orchestrator.start();
+  assert.equal(secondRun.ok, true);
+  assert.equal(secondRun.phase, BOOT_PHASE.LAUNCHING_RUNTIME);
+  assert.deepEqual(orchestrator.getState().stageDurationsMs, { DISCOVERING: 25 });
+  assert.equal(orchestrator.getState().isStalled, false);
+
+  // 3. Reset after PRESENTING returns cleanly to IDLE.
+  now += 40;
+  orchestrator.notifyFirstPresent();
+  assert.deepEqual(orchestrator.getState().stageDurationsMs, {
+    DISCOVERING: 25,
+    LAUNCHING_RUNTIME: 40,
+  });
+  orchestrator.reset();
+  assert.equal(orchestrator.getState().phase, BOOT_PHASE.IDLE);
+  assert.deepEqual(orchestrator.getState().stageDurationsMs, {});
+  assert.equal(orchestrator.getState().firstPresent, false);
+
+  // 4. Reset after destroy() is a no-op.
+  orchestrator.destroy();
+  const postDestroyReset = orchestrator.reset();
+  assert.equal(postDestroyReset.ok, false);
+  assert.equal(postDestroyReset.destroyed, true);
+  assert.equal(orchestrator.getState().phase, BOOT_PHASE.DESTROYED);
+  void resolveSlowFetch;
+});
+
+test('W146 getDiagnosticSnapshot exports JSON-safe sanitized telemetry without leaking paths or secrets', async () => {
+  let now = 1000;
+  const sensitiveError = new Error(
+    'Failed reading C:\\Users\\alice\\gta6\\game.bin and /Users/alice/secret.key from https://user:pass@example.com/api?token=supersecret (Bearer tok_12345 api_key=mykey)'
+  );
+  const errFetch = async () => {
+    now += 90;
+    throw sensitiveError;
+  };
+  const { orchestrator } = createOrchestrator({
+    fetchImpl: errFetch,
+    nowFn: () => now,
+    stageTimeoutMs: 500,
+  });
+
+  await orchestrator.start();
+  const snapshot = orchestrator.getDiagnosticSnapshot();
+
+  assert.equal(snapshot.phase, BOOT_PHASE.ERROR);
+  assert.equal(snapshot.bootMode, BOOT_MODE.PENDING);
+  assert.deepEqual(snapshot.stageDurationsMs, { DISCOVERING: 90 });
+  assert.equal(snapshot.totalStageDurationMs, 90);
+  assert.equal(snapshot.stageTimeoutMs, 500);
+  assert.equal(snapshot.isStalled, false);
+  assert.equal(snapshot.stalledStage, null);
+  assert.equal(snapshot.stalledMs, 0);
+  assert.equal('bundle' in snapshot, false);
+  assert.equal('status' in snapshot, false);
+
+  // Verify sanitization removed host paths, credentials, query tokens, and auth secrets.
+  assert.equal(snapshot.error.includes('alice'), false);
+  assert.equal(snapshot.error.includes('supersecret'), false);
+  assert.equal(snapshot.error.includes('tok_12345'), false);
+  assert.equal(snapshot.error.includes('mykey'), false);
+  assert.equal(snapshot.error.includes('user:pass'), false);
+  assert.match(snapshot.error, /\[REDACTED_PATH\]/);
+  assert.match(snapshot.error, /\[REDACTED\]/);
+
+  // Must serialize cleanly to JSON without throwing.
+  const roundTripped = JSON.parse(JSON.stringify(snapshot));
+  assert.deepEqual(roundTripped.stageDurationsMs, { DISCOVERING: 90 });
 });
