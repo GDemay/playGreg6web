@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -1258,6 +1259,21 @@ void test_heap_indexed_bind_groups() {
     CHECK(oob.status == Status::Ok && oob.bind_group != nullptr);
     CHECK(oob.bind_group->entries[0].kind == BindResourceKind::Null && oob.bind_group->entries[1].kind == BindResourceKind::Null);
     CHECK(oob.bind_group->null_entries == 2 && cache.heap_index_misses() == 2);
+
+    // O36 end_epoch: under the bound nothing is dropped; above it, entries this epoch did not use
+    // are dropped (their gpu ids retired), and a full epoch above the bound empties the cache.
+    {
+        std::vector<uint32_t> retired;
+        const size_t before = cache.size();
+        CHECK(before >= 3);
+        CHECK(cache.end_epoch(before, &retired) == 0 && retired.empty() && cache.size() == before);
+        CHECK(st.set_root_constants(G, 0, 2, k1, 0) == Status::Ok);
+        CHECK(!cache.get_or_build(st, G, plan, 1, test_resolver, nullptr).rebuilt);  // gpu id 51, used now
+        CHECK(cache.end_epoch(1, &retired) == before - 1 && cache.size() == 1);
+        CHECK(std::find(retired.begin(), retired.end(), 51u) == retired.end());
+        CHECK(cache.end_epoch(0, &retired) == 1 && cache.size() == 0);
+        CHECK(std::find(retired.begin(), retired.end(), 51u) != retired.end());
+    }
     CHECK(!cache.get_or_build(st, G, plan, 1, test_resolver, nullptr).rebuilt);  // cached, not re-counted
     CHECK(cache.heap_index_misses() == 2);
 

@@ -2223,6 +2223,7 @@ BindGroupLookup BindGroupCache::get_or_build(
     auto it = entries_.find(h);
     if (it != entries_.end() && it->second->key == scratch_key_) {
         CachedBindGroup& cached = *it->second;
+        cached.last_used_epoch = epoch_;
         bool changed = false;
         const std::vector<BindGroupPlan::TableWindow>& windows = plan.table_windows();
         for (size_t t = 0; t < windows.size() && !changed; ++t) {
@@ -2265,6 +2266,7 @@ BindGroupLookup BindGroupCache::get_or_build(
     }
     auto entry = std::make_unique<CachedBindGroup>();
     entry->layout_key = layout_key;
+    entry->last_used_epoch = epoch_;
     build_entries(state, bind_point, *signature, plan, resolver, resolver_user, entry.get());
     result.bind_group = entry.get();
     result.rebuilt = true;
@@ -2395,6 +2397,29 @@ void BindGroupCache::clear(std::vector<uint32_t>* retired) {
         }
     }
     entries_.clear();
+}
+
+size_t BindGroupCache::end_epoch(size_t max_entries, std::vector<uint32_t>* retired) {
+    size_t dropped = 0;
+    if (entries_.size() > max_entries) {
+        for (auto it = entries_.begin(); it != entries_.end();) {
+            if (it->second->last_used_epoch < epoch_) {
+                if (retired != nullptr && it->second->gpu_id != 0) {
+                    retired->push_back(it->second->gpu_id);
+                }
+                it = entries_.erase(it);
+                ++dropped;
+            } else {
+                ++it;
+            }
+        }
+        if (entries_.size() > max_entries) {
+            dropped += entries_.size();
+            clear(retired);
+        }
+    }
+    ++epoch_;
+    return dropped;
 }
 
 // ===========================================================================

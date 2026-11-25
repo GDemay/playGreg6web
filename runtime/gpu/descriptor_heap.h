@@ -991,6 +991,7 @@ struct CachedBindGroup {
     std::vector<BindGroupEntry> entries;  // sorted by binding
     uint32_t gpu_id = 0;  // WebGPU bind group id, assigned by the caller after a rebuild
     uint32_t null_entries = 0;
+    uint64_t last_used_epoch = 0;  // BindGroupCache epoch of the last lookup that returned it
 
     // Internal validity data.
     std::vector<uint64_t> key;
@@ -1046,6 +1047,14 @@ public:
 
     // Drops every entry, appending their gpu ids (if non-zero) to `retired`.
     void clear(std::vector<uint32_t>* retired);
+    // Bounds the cache between recordings (O36). Keys carry root-view GPU addresses and table base
+    // indices, which ring allocators change per draw, so without a bound the cache (and the WebGPU
+    // bind groups behind it) grows for the whole run. When more than `max_entries` are cached, drops
+    // the entries the current epoch did not use, then everything if still above the bound; the gpu
+    // ids of dropped entries go to `retired`. Then starts a new epoch. Only call it when no open
+    // recording references the entries (command-list Reset). Returns the number dropped.
+    size_t end_epoch(size_t max_entries, std::vector<uint32_t>* retired);
+    uint64_t epoch() const noexcept { return epoch_; }
     // Tables in heaps the source reads come from descriptor memory (nullptr: registry only).
     void set_slot_source(const DescriptorSlotSource* source) noexcept { slot_source_ = source; }
     const DescriptorSlotSource* slot_source() const noexcept { return slot_source_; }
@@ -1077,6 +1086,7 @@ private:
     std::vector<uint64_t> scratch_key_;
     std::vector<uint8_t> scratch_words_;
     const DescriptorSlotSource* slot_source_ = nullptr;
+    uint64_t epoch_ = 1;
     uint64_t hits_ = 0;
     uint64_t misses_ = 0;
     uint64_t heap_index_misses_ = 0;
