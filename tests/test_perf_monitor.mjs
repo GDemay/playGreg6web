@@ -9,6 +9,7 @@ import PerfMonitorDefault, {
   DEFAULT_JANK_THRESHOLD_MS,
   DEFAULT_HUD_INTERVAL_MS,
   BYTES_PER_MB,
+  PERF_PHASES,
   PerfMonitor,
 } from '../web/telemetry/perf_monitor.js';
 
@@ -891,4 +892,270 @@ test('W149: guards against NaN, Infinity, negative, and extreme frame times', ()
   assert.equal(summary.p95Ms, 20);
   assert.equal(summary.p99Ms, 20);
   assert.ok(Math.abs(summary.onePercentLowFps - 50) < 1e-9);
+});
+
+test('W242: PERF_PHASES exports canonical frozen phases and default snapshot phase state', () => {
+  assert.deepEqual(PERF_PHASES, {
+    BOOT: 'boot',
+    LOADING_ASSETS: 'loading_assets',
+    GAMEPLAY: 'gameplay',
+    MENU: 'menu',
+  });
+  assert.equal(Object.isFrozen(PERF_PHASES), true);
+
+  const monitor = new PerfMonitor({ windowSize: 60 });
+  assert.equal(monitor.currentPhase, PERF_PHASES.BOOT);
+
+  const snap = monitor.getSnapshot();
+  assert.equal(snap.currentPhase, PERF_PHASES.BOOT);
+  assert.deepEqual(Object.keys(snap.phases), ['boot', 'loading_assets', 'gameplay', 'menu']);
+
+  for (const phase of Object.values(PERF_PHASES)) {
+    assert.deepEqual(snap.phases[phase], {
+      frameCount: 0,
+      avgFps: 0,
+      onePercentLowFps: 0,
+      avgFrameMs: 0,
+      p95FrameMs: 0,
+      p99FrameMs: 0,
+      maxFrameMs: 0,
+    });
+  }
+
+  // Optional initialPhase constructor option is sanitized.
+  const gameplayStart = new PerfMonitor({ initialPhase: PERF_PHASES.GAMEPLAY });
+  assert.equal(gameplayStart.currentPhase, PERF_PHASES.GAMEPLAY);
+  assert.equal(gameplayStart.getSnapshot().currentPhase, PERF_PHASES.GAMEPLAY);
+
+  const invalidStart = new PerfMonitor({ initialPhase: '__proto__' });
+  assert.equal(invalidStart.currentPhase, PERF_PHASES.BOOT);
+  assert.equal(invalidStart.getSnapshot().currentPhase, PERF_PHASES.BOOT);
+});
+
+test('W242: setPhase sanitizes inputs and prevents prototype pollution or arbitrary keys', () => {
+  const monitor = new PerfMonitor({ windowSize: 16 });
+
+  assert.equal(monitor.setPhase('GAMEPLAY'), PERF_PHASES.GAMEPLAY);
+  assert.equal(monitor.currentPhase, 'gameplay');
+
+  assert.equal(monitor.setPhase('  loading-assets  '), PERF_PHASES.LOADING_ASSETS);
+  assert.equal(monitor.currentPhase, 'loading_assets');
+
+  assert.equal(monitor.setPhase('Loading Assets'), PERF_PHASES.LOADING_ASSETS);
+  assert.equal(monitor.currentPhase, 'loading_assets');
+
+  assert.equal(monitor.setPhase('Menu'), PERF_PHASES.MENU);
+  assert.equal(monitor.currentPhase, 'menu');
+
+  for (const invalid of [
+    undefined,
+    null,
+    '',
+    '   ',
+    42,
+    {},
+    [],
+    'unknown_phase',
+    '__proto__',
+    'constructor',
+    'toString',
+  ]) {
+    assert.equal(monitor.setPhase(invalid), PERF_PHASES.BOOT);
+    assert.equal(monitor.currentPhase, PERF_PHASES.BOOT);
+  }
+
+  // Even if internal _currentPhase is externally corrupted, snapshot and recording stay sanitized.
+  monitor._currentPhase = '__proto__';
+  monitor.recordFrameTimeMs(20);
+  const snap = monitor.getSnapshot();
+  assert.equal(snap.currentPhase, PERF_PHASES.BOOT);
+  assert.equal(snap.phases.boot.frameCount, 1);
+  assert.deepEqual(Object.keys(snap.phases), ['boot', 'loading_assets', 'gameplay', 'menu']);
+});
+
+test('W242: phase-segmented histograms isolate gameplay FPS & 1%-low from boot/loading stalls', () => {
+  const monitor = new PerfMonitor({ windowSize: 120, jankThresholdMs: 33.34 });
+
+  // Phase 1: boot stalls (5 frames @ 200ms)
+  assert.equal(monitor.currentPhase, PERF_PHASES.BOOT);
+  for (let i = 0; i < 5; i += 1) {
+    monitor.recordFrameTimeMs(200);
+  }
+
+  // Phase 2: loading_assets heavy RPF/Wasm stalls (10 frames: 8 @ 100ms, 1 @ 250ms, 1 @ 500ms)
+  monitor.setPhase(PERF_PHASES.LOADING_ASSETS);
+  for (let i = 0; i < 8; i += 1) {
+    monitor.recordFrameTimeMs(100);
+  }
+  monitor.recordFrameTimeMs(250);
+  monitor.recordFrameTimeMs(500);
+
+  // Phase 3: smooth gameplay (100 frames: 95 @ 16ms, 4 @ 20ms, 1 @ 25ms)
+  monitor.setPhase(PERF_PHASES.GAMEPLAY);
+  for (let i = 0; i < 95; i += 1) {
+    monitor.recordFrameTimeMs(16);
+  }
+  for (let i = 0; i < 4; i += 1) {
+    monitor.recordFrameTimeMs(20);
+  }
+  monitor.recordFrameTimeMs(25);
+
+  // Phase 4: menu (4 frames @ 32ms)
+  monitor.setPhase(PERF_PHASES.MENU);
+  for (let i = 0; i < 4; i += 1) {
+    monitor.recordFrameTimeMs(32);
+  }
+
+  const snap = monitor.getSnapshot();
+  assert.equal(snap.currentPhase, PERF_PHASES.MENU);
+
+  // Global stats still reflect ALL 119 frames (including boot/loading stalls).
+  assert.equal(snap.frames.totalFrames, 119);
+  assert.equal(snap.frames.sampleCount, 119);
+  assert.equal(snap.frames.maxFrameTimeMs, 500);
+  assert.ok(snap.frames.onePercentLowFps < 10, 'global 1%-low is skewed by loading stalls');
+
+  // Boot bucket: 5 frames @ 200ms => 5 FPS avg & 1%-low
+  assert.equal(snap.phases.boot.frameCount, 5);
+  assert.equal(snap.phases.boot.avgFrameMs, 200);
+  assert.equal(snap.phases.boot.p95FrameMs, 200);
+  assert.equal(snap.phases.boot.p99FrameMs, 200);
+  assert.equal(snap.phases.boot.maxFrameMs, 200);
+  assert.ok(Math.abs(snap.phases.boot.avgFps - 5) < 1e-9);
+  assert.ok(Math.abs(snap.phases.boot.onePercentLowFps - 5) < 1e-9);
+
+  // Loading assets bucket: [100 x8, 250, 500] => avg 155ms, p95=500 (ceil(9.5)-1=9), p99=500, max=500
+  assert.equal(snap.phases.loading_assets.frameCount, 10);
+  assert.equal(snap.phases.loading_assets.avgFrameMs, 155);
+  assert.equal(snap.phases.loading_assets.p95FrameMs, 500);
+  assert.equal(snap.phases.loading_assets.p99FrameMs, 500);
+  assert.equal(snap.phases.loading_assets.maxFrameMs, 500);
+  assert.ok(Math.abs(snap.phases.loading_assets.avgFps - 1000 / 155) < 1e-9);
+  assert.ok(Math.abs(snap.phases.loading_assets.onePercentLowFps - 2) < 1e-9);
+
+  // Gameplay bucket is completely unskewed by boot/loading stalls!
+  // Sorted indices (0..99): 0..94 => 16, 95..98 => 20, 99 => 25
+  // p95 => ceil(0.95 * 100) - 1 = 94 => 16
+  // p99 => ceil(0.99 * 100) - 1 = 98 => 20
+  const expectedGameplayAvg = (95 * 16 + 4 * 20 + 25) / 100; // 16.25
+  assert.equal(snap.phases.gameplay.frameCount, 100);
+  assert.ok(Math.abs(snap.phases.gameplay.avgFrameMs - expectedGameplayAvg) < 1e-9);
+  assert.ok(Math.abs(snap.phases.gameplay.avgFps - 1000 / expectedGameplayAvg) < 1e-9);
+  assert.equal(snap.phases.gameplay.p95FrameMs, 16);
+  assert.equal(snap.phases.gameplay.p99FrameMs, 20);
+  assert.equal(snap.phases.gameplay.maxFrameMs, 25);
+  assert.ok(Math.abs(snap.phases.gameplay.onePercentLowFps - 50) < 1e-9);
+
+  // Menu bucket: 4 frames @ 32ms => 31.25 FPS
+  assert.equal(snap.phases.menu.frameCount, 4);
+  assert.equal(snap.phases.menu.avgFrameMs, 32);
+  assert.equal(snap.phases.menu.p95FrameMs, 32);
+  assert.equal(snap.phases.menu.p99FrameMs, 32);
+  assert.equal(snap.phases.menu.maxFrameMs, 32);
+  assert.ok(Math.abs(snap.phases.menu.avgFps - 31.25) < 1e-9);
+  assert.ok(Math.abs(snap.phases.menu.onePercentLowFps - 31.25) < 1e-9);
+});
+
+test('W242: recordFrame timestamp deltas accumulate into active phase and wrap cleanly with zero reallocations', () => {
+  const monitor = new PerfMonitor({ windowSize: 4 });
+  const bootBufRef = monitor._phaseBuckets[PERF_PHASES.BOOT].deltas;
+  const gameplayBufRef = monitor._phaseBuckets[PERF_PHASES.GAMEPLAY].deltas;
+
+  // Baseline frame sets timestamp without recording a delta sample.
+  assert.equal(monitor.recordFrame(1000), null);
+  assert.equal(monitor.getSnapshot().phases.boot.frameCount, 0);
+
+  // Record 2 boot deltas: 100ms, 50ms
+  assert.equal(monitor.recordFrame(1100), 100);
+  assert.equal(monitor.recordFrame(1150), 50);
+
+  // Switch to gameplay and record 6 frames (exceeding windowSize = 4):
+  // First 2 are 80ms spikes, followed by 4 smooth 16ms frames which evict the spikes.
+  monitor.setPhase(PERF_PHASES.GAMEPLAY);
+  assert.equal(monitor.recordFrame(1230), 80);
+  assert.equal(monitor.recordFrame(1310), 80);
+  assert.equal(monitor.recordFrame(1326), 16);
+  assert.equal(monitor.recordFrame(1342), 16);
+  assert.equal(monitor.recordFrame(1358), 16);
+  assert.equal(monitor.recordFrame(1374), 16);
+
+  // Pre-allocated Float64Array buffers must never be reallocated.
+  assert.equal(monitor._phaseBuckets[PERF_PHASES.BOOT].deltas, bootBufRef);
+  assert.equal(monitor._phaseBuckets[PERF_PHASES.GAMEPLAY].deltas, gameplayBufRef);
+
+  const snap = monitor.getSnapshot();
+  assert.equal(snap.phases.boot.frameCount, 2);
+  assert.equal(snap.phases.boot.avgFrameMs, 75);
+  assert.equal(snap.phases.boot.maxFrameMs, 100);
+
+  // Gameplay wrapped past windowSize=4: frameCount tracks all 6 samples, rolling stats reflect last 4 @ 16ms.
+  assert.equal(snap.phases.gameplay.frameCount, 6);
+  assert.equal(snap.phases.gameplay.avgFrameMs, 16);
+  assert.equal(snap.phases.gameplay.p95FrameMs, 16);
+  assert.equal(snap.phases.gameplay.p99FrameMs, 16);
+  assert.equal(snap.phases.gameplay.maxFrameMs, 16);
+  assert.ok(Math.abs(snap.phases.gameplay.avgFps - 62.5) < 1e-9);
+  assert.ok(Math.abs(snap.phases.gameplay.onePercentLowFps - 62.5) < 1e-9);
+});
+
+test('W242: reset clears all phase histograms, restores initial phase, and guards corrupted/zero values', () => {
+  const monitor = new PerfMonitor({ windowSize: 8 });
+
+  monitor.setPhase(PERF_PHASES.LOADING_ASSETS);
+  monitor.recordFrameTimeMs(120);
+  monitor.setPhase(PERF_PHASES.GAMEPLAY);
+  monitor.recordFrameTimeMs(16);
+  monitor.recordFrameTimeMs(0);
+
+  let snap = monitor.getSnapshot();
+  assert.equal(snap.currentPhase, PERF_PHASES.GAMEPLAY);
+  assert.equal(snap.phases.loading_assets.frameCount, 1);
+  assert.equal(snap.phases.gameplay.frameCount, 2);
+
+  monitor.reset();
+
+  snap = monitor.getSnapshot();
+  assert.equal(monitor.currentPhase, PERF_PHASES.BOOT);
+  assert.equal(snap.currentPhase, PERF_PHASES.BOOT);
+  for (const phase of Object.values(PERF_PHASES)) {
+    assert.deepEqual(snap.phases[phase], {
+      frameCount: 0,
+      avgFps: 0,
+      onePercentLowFps: 0,
+      avgFrameMs: 0,
+      p95FrameMs: 0,
+      p99FrameMs: 0,
+      maxFrameMs: 0,
+    });
+  }
+
+  // Zero-delta and corrupted buffer slots stay finite and non-negative in phase stats.
+  monitor.setPhase(PERF_PHASES.GAMEPLAY);
+  monitor.recordFrameTimeMs(0);
+  monitor.recordFrameTimeMs(1e-320);
+  const bucket = monitor._phaseBuckets[PERF_PHASES.GAMEPLAY];
+  bucket.deltas[0] = Number.NaN;
+  bucket.deltas[1] = Number.POSITIVE_INFINITY;
+  bucket.deltas[2] = -50;
+  bucket.deltas[3] = 25;
+  bucket.sampleCount = 4;
+  bucket.frameCount = 4;
+
+  const guarded = monitor.getSnapshot().phases.gameplay;
+  for (const key of [
+    'frameCount',
+    'avgFps',
+    'onePercentLowFps',
+    'avgFrameMs',
+    'p95FrameMs',
+    'p99FrameMs',
+    'maxFrameMs',
+  ]) {
+    assert.ok(Number.isFinite(guarded[key]), `${key} must be finite, got ${guarded[key]}`);
+    assert.ok(guarded[key] >= 0, `${key} must be non-negative, got ${guarded[key]}`);
+  }
+  assert.equal(guarded.p95FrameMs, 25);
+  assert.equal(guarded.p99FrameMs, 25);
+  assert.equal(guarded.maxFrameMs, 25);
+  assert.ok(Math.abs(guarded.onePercentLowFps - 40) < 1e-9);
 });
