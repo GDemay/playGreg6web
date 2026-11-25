@@ -27,6 +27,10 @@ export const RING_HEADER_BYTES = RING_HEADER_INT32_COUNT * Int32Array.BYTES_PER_
 
 export const DEFAULT_MAX_RESUME_RETRIES = 5;
 export const MAX_ERROR_MESSAGE_LENGTH = 256;
+export const DEFAULT_GAIN_RAMP_MS = 15;
+export const MAX_GAIN_RAMP_MS = 5000;
+export const DEFAULT_UNLOCK_FADE_IN_MS = 25;
+export const MAX_GUEST_PCM_CHANNELS = 8;
 export const DEFAULT_GESTURE_EVENTS = Object.freeze([
   'pointerdown',
   'keydown',
@@ -147,6 +151,303 @@ function sanitizePositiveFiniteNumber(value, fallback) {
     return fallback;
   }
   return value;
+}
+
+function sanitizeRampMs(value, fallback = 0) {
+  const safeFallback =
+    typeof fallback === 'number' && Number.isFinite(fallback)
+      ? fallback <= 0
+        ? 0
+        : fallback >= MAX_GAIN_RAMP_MS
+          ? MAX_GAIN_RAMP_MS
+          : fallback
+      : 0;
+  if (value === undefined || value === null) {
+    return safeFallback;
+  }
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return safeFallback;
+  }
+  if (value <= 0) {
+    return 0;
+  }
+  if (value >= MAX_GAIN_RAMP_MS) {
+    return MAX_GAIN_RAMP_MS;
+  }
+  return value;
+}
+
+function clampPeakLevel(value, fallback = 0) {
+  const safeFallback =
+    typeof fallback === 'number' && Number.isFinite(fallback)
+      ? fallback <= 0
+        ? 0
+        : fallback >= 1
+          ? 1
+          : fallback
+      : 0;
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return safeFallback;
+  }
+  if (value <= 0) {
+    return 0;
+  }
+  if (value >= 1) {
+    return 1;
+  }
+  return value;
+}
+
+function isViewOnDetachedBuffer(view) {
+  if (!ArrayBuffer.isView(view)) {
+    return false;
+  }
+  try {
+    const buf = view.buffer;
+    if (!buf) {
+      return true;
+    }
+    return !isSharedArrayBufferValue(buf) && isDetachedArrayBuffer(buf);
+  } catch {
+    return true;
+  }
+}
+
+function normalizeGuestPcmRingDescriptor(ringDescriptor, fallbackSampleRate, fallbackChannels) {
+  if (!ringDescriptor || typeof ringDescriptor !== 'object') {
+    return { ok: false, reason: 'invalid-descriptor', ring: null };
+  }
+
+  let sab = null;
+  if (ringDescriptor.sab !== undefined && ringDescriptor.sab !== null) {
+    if (!isSharedArrayBufferValue(ringDescriptor.sab)) {
+      return { ok: false, reason: 'invalid-buffer', ring: null };
+    }
+    sab = ringDescriptor.sab;
+  }
+
+  let buffer = null;
+  if (ringDescriptor.buffer !== undefined && ringDescriptor.buffer !== null) {
+    if (isSharedArrayBufferValue(ringDescriptor.buffer)) {
+      buffer = ringDescriptor.buffer;
+    } else if (ringDescriptor.buffer instanceof ArrayBuffer) {
+      if (isDetachedArrayBuffer(ringDescriptor.buffer)) {
+        return { ok: false, reason: 'detached-buffer', ring: null };
+      }
+      buffer = ringDescriptor.buffer;
+    } else {
+      return { ok: false, reason: 'invalid-buffer', ring: null };
+    }
+  }
+
+  let memory = null;
+  if (ringDescriptor.memory !== undefined && ringDescriptor.memory !== null) {
+    if (typeof ringDescriptor.memory !== 'object') {
+      return { ok: false, reason: 'invalid-buffer', ring: null };
+    }
+    try {
+      const memBuf = ringDescriptor.memory.buffer;
+      if (memBuf instanceof ArrayBuffer && isDetachedArrayBuffer(memBuf)) {
+        return { ok: false, reason: 'detached-buffer', ring: null };
+      }
+      if (!memBuf || (!isSharedArrayBufferValue(memBuf) && !(memBuf instanceof ArrayBuffer))) {
+        return { ok: false, reason: 'invalid-buffer', ring: null };
+      }
+      memory = ringDescriptor.memory;
+    } catch {
+      return { ok: false, reason: 'detached-buffer', ring: null };
+    }
+  }
+
+  let samples = null;
+  if (ringDescriptor.samples !== undefined && ringDescriptor.samples !== null) {
+    if (!ArrayBuffer.isView(ringDescriptor.samples)) {
+      return { ok: false, reason: 'invalid-buffer', ring: null };
+    }
+    if (isViewOnDetachedBuffer(ringDescriptor.samples)) {
+      return { ok: false, reason: 'detached-buffer', ring: null };
+    }
+    samples = ringDescriptor.samples;
+  }
+
+  let data = null;
+  if (ringDescriptor.data !== undefined && ringDescriptor.data !== null) {
+    if (!ArrayBuffer.isView(ringDescriptor.data)) {
+      return { ok: false, reason: 'invalid-buffer', ring: null };
+    }
+    if (isViewOnDetachedBuffer(ringDescriptor.data)) {
+      return { ok: false, reason: 'detached-buffer', ring: null };
+    }
+    data = ringDescriptor.data;
+  }
+
+  const rawBase =
+    ringDescriptor.base !== undefined
+      ? ringDescriptor.base
+      : ringDescriptor.dataPtr !== undefined
+        ? ringDescriptor.dataPtr
+        : ringDescriptor.dataOffset !== undefined
+          ? ringDescriptor.dataOffset
+          : ringDescriptor.byteOffset;
+  let base = 0;
+  let hasExplicitBase = false;
+  if (rawBase !== undefined && rawBase !== null) {
+    if (typeof rawBase !== 'number' || !Number.isInteger(rawBase) || rawBase < 0) {
+      return { ok: false, reason: 'invalid-base', ring: null };
+    }
+    base = rawBase === 0 ? 0 : rawBase;
+    hasExplicitBase = true;
+  }
+
+  if (!sab && !buffer && !memory && !samples && !data && !hasExplicitBase) {
+    return { ok: false, reason: 'missing-buffer', ring: null };
+  }
+
+  let channels = fallbackChannels;
+  if (ringDescriptor.channels !== undefined && ringDescriptor.channels !== null) {
+    if (
+      typeof ringDescriptor.channels !== 'number' ||
+      !Number.isInteger(ringDescriptor.channels) ||
+      ringDescriptor.channels < 1 ||
+      ringDescriptor.channels > MAX_GUEST_PCM_CHANNELS
+    ) {
+      return { ok: false, reason: 'invalid-channels', ring: null };
+    }
+    channels = ringDescriptor.channels;
+  }
+
+  const rawSampleRate =
+    ringDescriptor.sampleRate !== undefined
+      ? ringDescriptor.sampleRate
+      : ringDescriptor.sample_rate;
+  let sampleRate = fallbackSampleRate;
+  if (rawSampleRate !== undefined && rawSampleRate !== null) {
+    if (typeof rawSampleRate !== 'number' || !Number.isFinite(rawSampleRate) || rawSampleRate <= 0) {
+      return { ok: false, reason: 'invalid-sample-rate', ring: null };
+    }
+    sampleRate = rawSampleRate;
+  }
+
+  const rawCapacitySamples =
+    ringDescriptor.capacity !== undefined
+      ? ringDescriptor.capacity
+      : ringDescriptor.capacitySamples;
+  const rawCapacityFrames = ringDescriptor.capacityFrames;
+
+  let capacity = 0;
+  let capacityFrames = 0;
+  if (rawCapacitySamples !== undefined && rawCapacitySamples !== null) {
+    if (
+      typeof rawCapacitySamples !== 'number' ||
+      !Number.isInteger(rawCapacitySamples) ||
+      rawCapacitySamples <= 0
+    ) {
+      return { ok: false, reason: 'invalid-capacity', ring: null };
+    }
+    capacity = rawCapacitySamples;
+    capacityFrames = Math.floor(capacity / channels);
+  } else if (rawCapacityFrames !== undefined && rawCapacityFrames !== null) {
+    if (
+      typeof rawCapacityFrames !== 'number' ||
+      !Number.isInteger(rawCapacityFrames) ||
+      rawCapacityFrames <= 0
+    ) {
+      return { ok: false, reason: 'invalid-capacity', ring: null };
+    }
+    capacityFrames = rawCapacityFrames;
+    capacity = rawCapacityFrames * channels;
+  } else if (samples && typeof samples.length === 'number' && samples.length > 0) {
+    capacity = samples.length;
+    capacityFrames = Math.floor(capacity / channels);
+  } else if (data && typeof data.length === 'number' && data.length > 0) {
+    capacity = data.length;
+    capacityFrames = Math.floor(capacity / channels);
+  } else {
+    return { ok: false, reason: 'invalid-capacity', ring: null };
+  }
+
+  if (capacityFrames <= 0) {
+    return { ok: false, reason: 'invalid-capacity', ring: null };
+  }
+
+  const rawReadIndexPtr =
+    ringDescriptor.readIndexPtr !== undefined
+      ? ringDescriptor.readIndexPtr
+      : ringDescriptor.read_index_ptr !== undefined
+        ? ringDescriptor.read_index_ptr
+        : ringDescriptor.readIndexOffset;
+  let readIndexPtr;
+  if (rawReadIndexPtr !== undefined && rawReadIndexPtr !== null) {
+    if (
+      typeof rawReadIndexPtr !== 'number' ||
+      !Number.isInteger(rawReadIndexPtr) ||
+      rawReadIndexPtr < 0
+    ) {
+      return { ok: false, reason: 'invalid-index-ptr', ring: null };
+    }
+    readIndexPtr = rawReadIndexPtr === 0 ? 0 : rawReadIndexPtr;
+  }
+
+  const rawWriteIndexPtr =
+    ringDescriptor.writeIndexPtr !== undefined
+      ? ringDescriptor.writeIndexPtr
+      : ringDescriptor.write_index_ptr !== undefined
+        ? ringDescriptor.write_index_ptr
+        : ringDescriptor.writeIndexOffset;
+  let writeIndexPtr;
+  if (rawWriteIndexPtr !== undefined && rawWriteIndexPtr !== null) {
+    if (
+      typeof rawWriteIndexPtr !== 'number' ||
+      !Number.isInteger(rawWriteIndexPtr) ||
+      rawWriteIndexPtr < 0
+    ) {
+      return { ok: false, reason: 'invalid-index-ptr', ring: null };
+    }
+    writeIndexPtr = rawWriteIndexPtr === 0 ? 0 : rawWriteIndexPtr;
+  }
+
+  let readIndex = null;
+  if (ringDescriptor.readIndex !== undefined && ringDescriptor.readIndex !== null) {
+    if (!ArrayBuffer.isView(ringDescriptor.readIndex) || isViewOnDetachedBuffer(ringDescriptor.readIndex)) {
+      return { ok: false, reason: 'invalid-index-view', ring: null };
+    }
+    readIndex = ringDescriptor.readIndex;
+  }
+
+  let writeIndex = null;
+  if (ringDescriptor.writeIndex !== undefined && ringDescriptor.writeIndex !== null) {
+    if (!ArrayBuffer.isView(ringDescriptor.writeIndex) || isViewOnDetachedBuffer(ringDescriptor.writeIndex)) {
+      return { ok: false, reason: 'invalid-index-view', ring: null };
+    }
+    writeIndex = ringDescriptor.writeIndex;
+  }
+
+  const normalized = {
+    base,
+    capacity,
+    capacitySamples: capacity,
+    capacityFrames,
+    channels,
+    sampleRate,
+    sample_rate: sampleRate,
+  };
+  if (sab) normalized.sab = sab;
+  if (buffer) normalized.buffer = buffer;
+  if (memory) normalized.memory = memory;
+  if (samples) normalized.samples = samples;
+  if (data) normalized.data = data;
+  if (readIndexPtr !== undefined) {
+    normalized.readIndexPtr = readIndexPtr;
+    normalized.read_index_ptr = readIndexPtr;
+  }
+  if (writeIndexPtr !== undefined) {
+    normalized.writeIndexPtr = writeIndexPtr;
+    normalized.write_index_ptr = writeIndexPtr;
+  }
+  if (readIndex) normalized.readIndex = readIndex;
+  if (writeIndex) normalized.writeIndex = writeIndex;
+
+  return { ok: true, reason: null, ring: normalized };
 }
 
 function sanitizeOutputState(state) {
@@ -392,9 +693,17 @@ export class AudioEngine {
       typeof opts.onWorkletMessage === 'function' ? opts.onWorkletMessage : null;
 
     const rawInitialVolume =
-      opts.volume !== undefined ? opts.volume : opts.gain !== undefined ? opts.gain : 1.0;
+      opts.volume !== undefined
+        ? opts.volume
+        : opts.gain !== undefined
+          ? opts.gain
+          : opts.masterGain !== undefined
+            ? opts.masterGain
+            : 1.0;
     this._volume = clampVolume(rawInitialVolume, 1.0);
     this._muted = Boolean(opts.muted);
+    this._audioWorker = opts.audioWorker || opts.worker || opts.bridge || null;
+    this._unlockFadeInMs = sanitizeRampMs(opts.unlockFadeInMs, DEFAULT_UNLOCK_FADE_IN_MS);
 
     this._sab = null;
     this._ctrl = null;
@@ -411,6 +720,10 @@ export class AudioEngine {
 
     this._context = null;
     this._node = null;
+    this._masterGainNode = null;
+    this._masterGainRampMs = 0;
+    this._masterGainHeldSilent = false;
+    this._unlockedOnGesture = false;
     this._status = 'idle';
     this._error = null;
     this._destroyed = false;
@@ -418,6 +731,13 @@ export class AudioEngine {
     this._resumePromise = null;
     this._gestureCleanup = null;
     this._boundContextStateChange = null;
+
+    this._guestPcmRing = null;
+    this._guestRingAttached = false;
+    this._guestFramesDrained = 0;
+    this._guestUnderruns = 0;
+    this._guestOverruns = 0;
+    this._guestPeakLevel = 0;
 
     this._resumeAttempts = 0;
     this._resumeSuccesses = 0;
@@ -464,12 +784,48 @@ export class AudioEngine {
     return this._volume;
   }
 
+  get masterGain() {
+    return this._volume;
+  }
+
+  get masterGainNode() {
+    return this._masterGainNode;
+  }
+
+  get audioWorker() {
+    return this._audioWorker;
+  }
+
+  get guestRingAttached() {
+    return this._guestRingAttached;
+  }
+
+  get guestPcmRing() {
+    return this._guestPcmRing ? { ...this._guestPcmRing } : null;
+  }
+
+  get unlockedOnGesture() {
+    return this._unlockedOnGesture;
+  }
+
   get muted() {
     return this._muted;
   }
 
   get error() {
     return this._error;
+  }
+
+  /**
+   * Attaches or replaces the host audio worker / bridge used to forward guest
+   * PCM ring attachment, detachment, and master gain/mute control messages.
+   *
+   * @param {object|null} workerOrBridge
+   * @returns {object|null}
+   */
+  setAudioWorker(workerOrBridge) {
+    this._audioWorker = workerOrBridge && typeof workerOrBridge === 'object' ? workerOrBridge : null;
+    return this._audioWorker;
   }
 
   _readContextState(ctx = this._context) {
@@ -846,10 +1202,29 @@ export class AudioEngine {
       };
     }
 
+    let masterGainNode = null;
+    if (typeof ctx.createGain === 'function') {
+      try {
+        const candidate = ctx.createGain();
+        if (candidate && candidate.gain && typeof candidate.connect === 'function') {
+          masterGainNode = candidate;
+        }
+      } catch {
+        masterGainNode = null;
+      }
+    }
+
+    const initialCtxState = this._readContextState(ctx);
+    const holdSilentUntilResume =
+      masterGainNode !== null &&
+      (initialCtxState === 'suspended' || initialCtxState === 'interrupted');
+
     const processorOptions = {
       sab: this._sab,
-      gain: this._volume,
-      muted: this._muted,
+      // Keep the worklet at unity gain when a WebAudio master GainNode owns
+      // gain/mute ramping so output is never double-attenuated.
+      gain: masterGainNode ? 1.0 : this._volume,
+      muted: masterGainNode ? false : this._muted,
     };
     if (this._smoothingFrames !== undefined) {
       processorOptions.smoothingFrames = this._smoothingFrames;
@@ -885,6 +1260,11 @@ export class AudioEngine {
               // Ignore callback errors.
             }
           }
+        } else if (
+          data &&
+          (data.type === 'guest-audio-telemetry' || data.type === 'audio-stats')
+        ) {
+          this.updateGuestAudioTelemetry(data.stats || data);
         }
         if (this._onWorkletMessage) {
           try {
@@ -897,12 +1277,36 @@ export class AudioEngine {
     }
 
     try {
-      if (typeof node.connect === 'function' && ctx.destination) {
+      if (masterGainNode && typeof node.connect === 'function' && ctx.destination) {
+        const initGain = holdSilentUntilResume ? 0.0 : this._muted ? 0.0 : this._volume;
+        const now =
+          typeof ctx.currentTime === 'number' && Number.isFinite(ctx.currentTime)
+            ? ctx.currentTime
+            : 0;
+        try {
+          if (typeof masterGainNode.gain.setValueAtTime === 'function') {
+            masterGainNode.gain.setValueAtTime(initGain, now);
+          } else {
+            masterGainNode.gain.value = initGain;
+          }
+        } catch {
+          // Ignore AudioParam init errors on restricted mocks.
+        }
+        node.connect(masterGainNode);
+        masterGainNode.connect(ctx.destination);
+      } else if (typeof node.connect === 'function' && ctx.destination) {
         node.connect(ctx.destination);
       }
     } catch (err) {
       try {
         if (typeof node.disconnect === 'function') node.disconnect();
+      } catch {
+        // Ignore.
+      }
+      try {
+        if (masterGainNode && typeof masterGainNode.disconnect === 'function') {
+          masterGainNode.disconnect();
+        }
       } catch {
         // Ignore.
       }
@@ -912,7 +1316,9 @@ export class AudioEngine {
 
     this._context = ctx;
     this._node = node;
-    this._status = this._readContextState(ctx) || 'running';
+    this._masterGainNode = masterGainNode;
+    this._masterGainHeldSilent = holdSilentUntilResume;
+    this._status = initialCtxState || 'running';
 
     this._boundContextStateChange = () => {
       if (!this._destroyed && this._context) {
@@ -1037,6 +1443,14 @@ export class AudioEngine {
           this._resumeSuccesses += 1;
           this._lastResumeError = null;
           this._error = null;
+          if (this._masterGainNode && this._masterGainHeldSilent && !this._inUnlockGesture) {
+            this._masterGainHeldSilent = false;
+            this._scheduleMasterGainRamp(
+              this._muted ? 0.0 : this._volume,
+              this._unlockFadeInMs,
+              0.0
+            );
+          }
           return true;
         }
 
@@ -1232,6 +1646,27 @@ export class AudioEngine {
           .catch(() => false)
           .then((resumed) => {
             const postState = this._readContextState();
+            if (resumed) {
+              this._unlockedOnGesture = true;
+              if (this._masterGainNode && this._masterGainHeldSilent) {
+                this._masterGainHeldSilent = false;
+                this._scheduleMasterGainRamp(
+                  this._muted ? 0.0 : this._volume,
+                  this._unlockFadeInMs,
+                  0.0
+                );
+              }
+              this._forwardToAudioWorker(
+                'setOutputState',
+                {
+                  type: 'audio-context-state',
+                  setOutputState: true,
+                  outputState: 'active',
+                  unlockedOnGesture: true,
+                },
+                ['active']
+              );
+            }
             if (
               !resumed &&
               !disposed &&
@@ -1282,6 +1717,431 @@ export class AudioEngine {
     return cleanup;
   }
 
+  _scheduleMasterGainRamp(targetGain, rampMs = 0, fromGain = undefined) {
+    const safeTarget = clampVolume(targetGain, 0.0);
+    const safeRampMs = sanitizeRampMs(rampMs, 0);
+    this._masterGainRampMs = safeRampMs;
+
+    const gainNode = this._masterGainNode;
+    if (!gainNode || !gainNode.gain) {
+      return false;
+    }
+
+    const param = gainNode.gain;
+    const now =
+      this._context &&
+      typeof this._context.currentTime === 'number' &&
+      Number.isFinite(this._context.currentTime)
+        ? this._context.currentTime
+        : 0;
+    const anchorGain =
+      fromGain !== undefined
+        ? clampVolume(fromGain, 0.0)
+        : typeof param.value === 'number' && Number.isFinite(param.value)
+          ? clampVolume(param.value, safeTarget)
+          : safeTarget;
+
+    try {
+      if (typeof param.cancelScheduledValues === 'function') {
+        param.cancelScheduledValues(now);
+      }
+      if (safeRampMs > 0 && typeof param.linearRampToValueAtTime === 'function') {
+        if (typeof param.setValueAtTime === 'function') {
+          param.setValueAtTime(anchorGain, now);
+        } else {
+          param.value = anchorGain;
+        }
+        param.linearRampToValueAtTime(safeTarget, now + safeRampMs / 1000);
+      } else if (typeof param.setValueAtTime === 'function') {
+        param.setValueAtTime(safeTarget, now);
+      } else {
+        param.value = safeTarget;
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  _forwardToAudioWorker(methodName, messagePayload, methodArgs = []) {
+    const worker = this._audioWorker;
+    if (!worker || typeof worker !== 'object') {
+      return false;
+    }
+    try {
+      if (methodName && typeof worker[methodName] === 'function') {
+        worker[methodName](...methodArgs);
+        return true;
+      }
+      if (typeof worker.postMessage === 'function') {
+        worker.postMessage(messagePayload);
+        return true;
+      }
+      return false;
+    } catch (err) {
+      if (this._onError) {
+        try {
+          this._onError(
+            err instanceof Error
+              ? err
+              : new Error(sanitizeResumeError(err) || 'Audio worker forwarding failed')
+          );
+        } catch {
+          // Ignore callback exceptions.
+        }
+      }
+      return false;
+    }
+  }
+
+  /**
+   * Attaches a #1027 guest stereo PCM ring descriptor (`Playgta6AudioRing` /
+   * `SharedArrayBuffer` / wasm linear memory ring), tracks attachment state
+   * locally, and forwards cleanly to the audio worker / bridge when present.
+   *
+   * Never throws on invalid descriptors or destroyed engines.
+   *
+   * @param {object} ringDescriptor
+   * @returns {{ ok: boolean, attached: boolean, forwarded: boolean, reason: string|null, ring: object|null }}
+   */
+  attachGuestPcmRing(ringDescriptor) {
+    if (this._destroyed) {
+      return {
+        ok: false,
+        attached: false,
+        forwarded: false,
+        reason: 'closed',
+        ring: null,
+      };
+    }
+
+    const parsed = normalizeGuestPcmRingDescriptor(
+      ringDescriptor,
+      this.sampleRate,
+      this._channels || DEFAULT_CHANNELS
+    );
+    if (!parsed.ok || !parsed.ring) {
+      return {
+        ok: false,
+        attached: this._guestRingAttached,
+        forwarded: false,
+        reason: parsed.reason || 'invalid-descriptor',
+        ring: null,
+      };
+    }
+
+    this._guestPcmRing = parsed.ring;
+    this._guestRingAttached = true;
+
+    const forwarded = this._forwardToAudioWorker(
+      'attachGuestPcmRing',
+      {
+        type: 'attachGuestPcmRing',
+        attachGuestPcmRing: true,
+        ring: parsed.ring,
+      },
+      [parsed.ring]
+    );
+
+    return {
+      ok: true,
+      attached: true,
+      forwarded,
+      reason: null,
+      ring: { ...parsed.ring },
+    };
+  }
+
+  /**
+   * Detaches the active guest stereo PCM ring locally and forwards detachment
+   * cleanly to the audio worker / bridge when present. Idempotent and safe
+   * to call when no ring is attached or after destroy.
+   *
+   * @returns {{ ok: boolean, attached: boolean, wasAttached: boolean, forwarded: boolean }}
+   */
+  detachGuestPcmRing() {
+    const wasAttached = this._guestRingAttached;
+    this._guestPcmRing = null;
+    this._guestRingAttached = false;
+
+    const forwarded = this._forwardToAudioWorker(
+      'detachGuestPcmRing',
+      {
+        type: 'detachGuestPcmRing',
+        detachGuestPcmRing: true,
+      },
+      []
+    );
+
+    return {
+      ok: true,
+      attached: false,
+      wasAttached,
+      forwarded,
+    };
+  }
+
+  /**
+   * Updates sanitized guest stereo PCM ring telemetry reported by the host
+   * audio worker / bridge (`guestRingAttached`, `guestFramesDrained`,
+   * `guestUnderruns`, `guestOverruns`, `guestPeakLevel`).
+   * Non-finite, negative, or hostile inputs are safely ignored/clamped.
+   *
+   * @param {object} stats
+   * @returns {{ guestRingAttached: boolean, guestFramesDrained: number, guestUnderruns: number, guestOverruns: number, guestPeakLevel: number, unlockedOnGesture: boolean, muted: boolean, masterGain: number }}
+   */
+  updateGuestAudioTelemetry(stats) {
+    if (stats && typeof stats === 'object') {
+      const src =
+        stats.stats && typeof stats.stats === 'object' ? stats.stats : stats;
+
+      try {
+        if (typeof src.guestRingAttached === 'boolean') {
+          this._guestRingAttached = src.guestRingAttached;
+          if (!src.guestRingAttached) {
+            this._guestPcmRing = null;
+          }
+        }
+      } catch {
+        // Ignore hostile getters.
+      }
+
+      try {
+        if (src.guestFramesDrained !== undefined) {
+          this._guestFramesDrained = sanitizeFiniteNonNegInt(
+            src.guestFramesDrained,
+            this._guestFramesDrained
+          );
+        }
+      } catch {
+        // Ignore hostile getters.
+      }
+
+      try {
+        if (src.guestUnderruns !== undefined) {
+          this._guestUnderruns = sanitizeFiniteNonNegInt(
+            src.guestUnderruns,
+            this._guestUnderruns
+          );
+        }
+      } catch {
+        // Ignore hostile getters.
+      }
+
+      try {
+        const rawOverruns =
+          src.guestOverruns !== undefined ? src.guestOverruns : src.guestOverflows;
+        if (rawOverruns !== undefined) {
+          this._guestOverruns = sanitizeFiniteNonNegInt(rawOverruns, this._guestOverruns);
+        }
+      } catch {
+        // Ignore hostile getters.
+      }
+
+      try {
+        if (src.guestPeakLevel !== undefined) {
+          this._guestPeakLevel = clampPeakLevel(src.guestPeakLevel, this._guestPeakLevel);
+        }
+      } catch {
+        // Ignore hostile getters.
+      }
+    }
+
+    return {
+      guestRingAttached: Boolean(this._guestRingAttached),
+      guestFramesDrained: sanitizeFiniteNonNegInt(this._guestFramesDrained, 0),
+      guestUnderruns: sanitizeFiniteNonNegInt(this._guestUnderruns, 0),
+      guestOverruns: sanitizeFiniteNonNegInt(this._guestOverruns, 0),
+      guestPeakLevel: clampPeakLevel(this._guestPeakLevel, 0),
+      unlockedOnGesture: Boolean(this._unlockedOnGesture),
+      muted: Boolean(this._muted),
+      masterGain: clampVolume(this._volume, 1.0),
+    };
+  }
+
+  /**
+   * Unlocks a suspended/interrupted `AudioContext` from a user gesture and
+   * smoothly fades master gain in from 0 to the active effective gain over
+   * `rampMs` / `fadeInMs` so playback resumes without clicks or pops.
+   *
+   * Safe when not started, already running, muted, or closed.
+   *
+   * @param {number|object} [options] Ramp duration in ms or options `{ rampMs, fadeInMs, maxRetries, retryDelayMs }`.
+   * @returns {Promise<{ ok: boolean, unlocked: boolean, alreadyRunning: boolean, state: string, fadeInMs: number, effectiveGain: number, reason?: string }>}
+   */
+  async unlockOnGesture(options = {}) {
+    const opts =
+      typeof options === 'number'
+        ? { fadeInMs: options }
+        : options && typeof options === 'object'
+          ? options
+          : {};
+    const rawFadeMs =
+      opts.fadeInMs !== undefined
+        ? opts.fadeInMs
+        : opts.rampMs !== undefined
+          ? opts.rampMs
+          : this._unlockFadeInMs;
+    const fadeInMs = sanitizeRampMs(rawFadeMs, this._unlockFadeInMs);
+
+    if (this._destroyed) {
+      return {
+        ok: false,
+        unlocked: false,
+        alreadyRunning: false,
+        state: 'closed',
+        fadeInMs,
+        effectiveGain: 0,
+        reason: 'closed',
+      };
+    }
+
+    if (!this._context) {
+      return {
+        ok: false,
+        unlocked: false,
+        alreadyRunning: false,
+        state: this.state,
+        fadeInMs,
+        effectiveGain: this._muted ? 0 : this._volume,
+        reason: 'not-started',
+      };
+    }
+
+    const currentState = this._readContextState();
+    if (currentState === 'closed') {
+      return {
+        ok: false,
+        unlocked: false,
+        alreadyRunning: false,
+        state: 'closed',
+        fadeInMs,
+        effectiveGain: 0,
+        reason: 'closed',
+      };
+    }
+
+    const effectiveTarget = this._muted ? 0.0 : this._volume;
+    if (currentState === 'running') {
+      this._unlockedOnGesture = true;
+      if (this._masterGainNode && this._masterGainHeldSilent) {
+        this._masterGainHeldSilent = false;
+        this._scheduleMasterGainRamp(effectiveTarget, fadeInMs, 0.0);
+      }
+      if (this._gestureCleanup) {
+        try {
+          this._gestureCleanup();
+        } catch {
+          // Ignore cleanup errors.
+        }
+        this._gestureCleanup = null;
+      }
+      return {
+        ok: true,
+        unlocked: true,
+        alreadyRunning: true,
+        state: 'running',
+        fadeInMs: 0,
+        effectiveGain: effectiveTarget,
+      };
+    }
+
+    // Anchor output at 0 before resuming so the audio graph never pops on unlock.
+    if (this._masterGainNode) {
+      this._scheduleMasterGainRamp(0.0, 0, 0.0);
+      this._masterGainHeldSilent = true;
+    } else if (
+      !this._muted &&
+      this._volume > 0 &&
+      this._node &&
+      this._node.port &&
+      typeof this._node.port.postMessage === 'function'
+    ) {
+      try {
+        this._node.port.postMessage({ type: 'setGain', gain: 0.0, immediate: true });
+      } catch {
+        // Ignore postMessage errors.
+      }
+    }
+
+    this._inUnlockGesture = true;
+    let resumed = false;
+    try {
+      resumed = await this.resume({
+        maxRetries: opts.maxRetries,
+        retryDelayMs: opts.retryDelayMs,
+      });
+    } finally {
+      this._inUnlockGesture = false;
+    }
+
+    if (!resumed || this._destroyed || !this._context) {
+      return {
+        ok: false,
+        unlocked: false,
+        alreadyRunning: false,
+        state: this.state,
+        fadeInMs,
+        effectiveGain: 0,
+        reason: this._destroyed ? 'closed' : 'resume-failed',
+      };
+    }
+
+    this._unlockedOnGesture = true;
+    const postEffective = this._muted ? 0.0 : this._volume;
+    if (this._masterGainNode) {
+      this._masterGainHeldSilent = false;
+      this._scheduleMasterGainRamp(postEffective, fadeInMs, 0.0);
+    } else if (
+      !this._muted &&
+      this._volume > 0 &&
+      this._node &&
+      this._node.port &&
+      typeof this._node.port.postMessage === 'function'
+    ) {
+      try {
+        const msg = { type: 'setGain', gain: this._volume, rampMs: fadeInMs };
+        if (fadeInMs === 0) {
+          msg.immediate = true;
+        } else {
+          msg.rampFrames = Math.max(1, Math.round((fadeInMs / 1000) * this.sampleRate));
+        }
+        this._node.port.postMessage(msg);
+      } catch {
+        // Ignore postMessage errors.
+      }
+    }
+
+    if (this._gestureCleanup) {
+      try {
+        this._gestureCleanup();
+      } catch {
+        // Ignore cleanup errors.
+      }
+      this._gestureCleanup = null;
+    }
+
+    this._forwardToAudioWorker(
+      'setOutputState',
+      {
+        type: 'audio-context-state',
+        setOutputState: true,
+        outputState: 'active',
+        unlockedOnGesture: true,
+      },
+      ['active']
+    );
+
+    return {
+      ok: true,
+      unlocked: true,
+      alreadyRunning: false,
+      state: 'running',
+      fadeInMs,
+      effectiveGain: postEffective,
+    };
+  }
+
   /**
    * Sets master output volume clamped to [0, 1] and forwards to the worklet.
    * Rejects non-finite (`NaN`, `±Infinity`) and non-number inputs without
@@ -1302,13 +2162,84 @@ export class AudioEngine {
     }
 
     this._volume = clamped;
-    if (this._node && this._node.port && typeof this._node.port.postMessage === 'function') {
+    if (this._masterGainNode) {
+      this._masterGainHeldSilent = false;
+      this._scheduleMasterGainRamp(this._muted ? 0.0 : this._volume, 0);
+    } else if (this._node && this._node.port && typeof this._node.port.postMessage === 'function') {
       try {
         this._node.port.postMessage({ type: 'setGain', gain: this._volume });
       } catch {
         // Ignore postMessage errors on closed/detached port.
       }
     }
+    this._forwardToAudioWorker(
+      'setMasterGain',
+      {
+        type: 'setMasterGain',
+        setVolume: true,
+        gain: this._volume,
+        volume: this._volume,
+      },
+      [this._volume, 0]
+    );
+    return this._volume;
+  }
+
+  /**
+   * Sets master gain clamped to [0, 1] with a smooth ramp (`rampMs`, default
+   * `DEFAULT_GAIN_RAMP_MS`) via the WebAudio master `GainNode` when present,
+   * or forwards ramped gain metadata to the worklet and audio worker.
+   * Rejects non-finite (`NaN`, `±Infinity`) and non-number gain inputs without
+   * mutating the active gain.
+   *
+   * @param {number} gain
+   * @param {number} [rampMs=DEFAULT_GAIN_RAMP_MS]
+   * @returns {number} Active sanitized master gain in [0, 1].
+   */
+  setMasterGain(gain, rampMs = DEFAULT_GAIN_RAMP_MS) {
+    if (typeof gain !== 'number' || !Number.isFinite(gain)) {
+      this._invalidGainInputs += 1;
+      return this._volume;
+    }
+
+    const clamped = clampVolume(gain, this._volume);
+    if (clamped !== gain || Object.is(gain, -0)) {
+      this._gainClamps += 1;
+    }
+
+    const safeRampMs = sanitizeRampMs(rampMs, DEFAULT_GAIN_RAMP_MS);
+    this._volume = clamped;
+    this._masterGainRampMs = safeRampMs;
+
+    if (this._masterGainNode) {
+      this._masterGainHeldSilent = false;
+      this._scheduleMasterGainRamp(this._muted ? 0.0 : this._volume, safeRampMs);
+    } else if (this._node && this._node.port && typeof this._node.port.postMessage === 'function') {
+      try {
+        const msg = { type: 'setGain', gain: this._volume, rampMs: safeRampMs };
+        if (safeRampMs === 0) {
+          msg.immediate = true;
+        } else {
+          msg.rampFrames = Math.max(1, Math.round((safeRampMs / 1000) * this.sampleRate));
+        }
+        this._node.port.postMessage(msg);
+      } catch {
+        // Ignore postMessage errors on closed/detached port.
+      }
+    }
+
+    this._forwardToAudioWorker(
+      'setMasterGain',
+      {
+        type: 'setMasterGain',
+        setVolume: true,
+        gain: this._volume,
+        volume: this._volume,
+        rampMs: safeRampMs,
+      },
+      [this._volume, safeRampMs]
+    );
+
     return this._volume;
   }
 
@@ -1323,19 +2254,51 @@ export class AudioEngine {
   }
 
   /**
-   * Sets mute state (strictly coerced to boolean) and forwards to the worklet.
+   * Sets mute state (strictly coerced to boolean) and forwards to the master
+   * GainNode / worklet / audio worker. When `rampMs` is provided, schedules a
+   * smooth linear ramp to avoid mute/unmute clicks.
+   *
    * @param {boolean} muted
+   * @param {number} [rampMs]
    * @returns {boolean}
    */
-  setMuted(muted) {
+  setMuted(muted, rampMs = undefined) {
     this._muted = Boolean(muted);
-    if (this._node && this._node.port && typeof this._node.port.postMessage === 'function') {
+    const hasExplicitRamp = rampMs !== undefined;
+    const safeRampMs = hasExplicitRamp ? sanitizeRampMs(rampMs, DEFAULT_GAIN_RAMP_MS) : 0;
+
+    if (this._masterGainNode) {
+      this._masterGainHeldSilent = false;
+      this._scheduleMasterGainRamp(
+        this._muted ? 0.0 : this._volume,
+        hasExplicitRamp ? safeRampMs : DEFAULT_GAIN_RAMP_MS
+      );
+    } else if (this._node && this._node.port && typeof this._node.port.postMessage === 'function') {
       try {
-        this._node.port.postMessage({ type: 'setMuted', muted: this._muted });
+        if (!hasExplicitRamp) {
+          this._node.port.postMessage({ type: 'setMuted', muted: this._muted });
+        } else {
+          const msg = { type: 'setMuted', muted: this._muted, rampMs: safeRampMs };
+          if (safeRampMs === 0) {
+            msg.immediate = true;
+          } else {
+            msg.rampFrames = Math.max(1, Math.round((safeRampMs / 1000) * this.sampleRate));
+          }
+          this._node.port.postMessage(msg);
+        }
       } catch {
         // Ignore postMessage errors on closed/detached port.
       }
     }
+
+    this._forwardToAudioWorker(
+      'setMuted',
+      hasExplicitRamp
+        ? { type: 'setMuted', setMute: true, muted: this._muted, rampMs: safeRampMs }
+        : { type: 'setMuted', setMute: true, muted: this._muted },
+      hasExplicitRamp ? [this._muted, safeRampMs] : [this._muted]
+    );
+
     return this._muted;
   }
 
@@ -1761,6 +2724,14 @@ export class AudioEngine {
       this._error = null;
       this._gainClamps = 0;
       this._invalidGainInputs = 0;
+      this._guestFramesDrained = 0;
+      this._guestUnderruns = 0;
+      this._guestOverruns = 0;
+      this._guestPeakLevel = 0;
+    }
+
+    if (opts.detachGuestRing) {
+      this.detachGuestPcmRing();
     }
 
     if (opts.resetGain) {
@@ -1806,6 +2777,12 @@ export class AudioEngine {
     const gain = clampVolume(this._volume, 1.0);
     const muted = Boolean(this._muted);
     const effectiveGain = muted ? 0.0 : gain;
+    const guestRingAttached = Boolean(this._guestRingAttached);
+    const guestFramesDrained = sanitizeFiniteNonNegInt(this._guestFramesDrained, 0);
+    const guestUnderruns = sanitizeFiniteNonNegInt(this._guestUnderruns, 0);
+    const guestOverruns = sanitizeFiniteNonNegInt(this._guestOverruns, 0);
+    const guestPeakLevel = clampPeakLevel(this._guestPeakLevel, 0);
+    const unlockedOnGesture = Boolean(this._unlockedOnGesture);
 
     return {
       sampleRate: sanitizePositiveFiniteNumber(this.sampleRate, this._requestedSampleRate),
@@ -1826,6 +2803,7 @@ export class AudioEngine {
       droppedFrames,
       volume: gain,
       gain,
+      masterGain: gain,
       muted,
       effectiveGain,
       gainClamps: sanitizeFiniteNonNegInt(this._gainClamps, 0),
@@ -1836,12 +2814,19 @@ export class AudioEngine {
       stateTransitions: sanitizeFiniteNonNegInt(this._stateTransitions, 0),
       lastResumeError: this._lastResumeError,
       error: this._error ? sanitizeResumeError(this._error) : null,
+      guestRingAttached,
+      guestFramesDrained,
+      guestUnderruns,
+      guestOverruns,
+      guestPeakLevel,
+      unlockedOnGesture,
     };
   }
 
   /**
    * Returns a sanitized, finite diagnostic snapshot of AudioContext resume/state
-   * telemetry, clamped gain/mute controls, and live SAB ring counters.
+   * telemetry, clamped gain/mute controls, live SAB ring counters, and #1027
+   * guest stereo PCM ring telemetry.
    */
   getStats() {
     const telemetry = this.getTelemetry();
@@ -1864,6 +2849,7 @@ export class AudioEngine {
       droppedFrames: telemetry.droppedFrames,
       gain: telemetry.gain,
       volume: telemetry.volume,
+      masterGain: telemetry.masterGain,
       muted: telemetry.muted,
       effectiveGain: telemetry.effectiveGain,
       gainClamps: telemetry.gainClamps,
@@ -1874,6 +2860,12 @@ export class AudioEngine {
       stateTransitions: telemetry.stateTransitions,
       lastResumeError: telemetry.lastResumeError,
       error: telemetry.error,
+      guestRingAttached: telemetry.guestRingAttached,
+      guestFramesDrained: telemetry.guestFramesDrained,
+      guestUnderruns: telemetry.guestUnderruns,
+      guestOverruns: telemetry.guestOverruns,
+      guestPeakLevel: telemetry.guestPeakLevel,
+      unlockedOnGesture: telemetry.unlockedOnGesture,
     };
   }
 
@@ -1894,6 +2886,7 @@ export class AudioEngine {
       sampleRate: telemetry.sampleRate,
       muted: telemetry.muted,
       volume: telemetry.volume,
+      masterGain: telemetry.masterGain,
       effectiveGain: telemetry.effectiveGain,
       channels: telemetry.channels,
       capacityFrames: telemetry.capacityFrames,
@@ -1905,6 +2898,12 @@ export class AudioEngine {
       resumeSuccesses: telemetry.resumeSuccesses,
       resumeFailures: telemetry.resumeFailures,
       lastResumeError: telemetry.lastResumeError,
+      guestRingAttached: telemetry.guestRingAttached,
+      guestFramesDrained: telemetry.guestFramesDrained,
+      guestUnderruns: telemetry.guestUnderruns,
+      guestOverruns: telemetry.guestOverruns,
+      guestPeakLevel: telemetry.guestPeakLevel,
+      unlockedOnGesture: telemetry.unlockedOnGesture,
     };
   }
 
@@ -1925,9 +2924,16 @@ export class AudioEngine {
       return;
     }
 
+    if (this._guestRingAttached) {
+      this.detachGuestPcmRing();
+    } else {
+      this._guestPcmRing = null;
+    }
+
     this._destroyed = true;
     this._status = 'closed';
     this._resumePromise = null;
+    this._masterGainHeldSilent = false;
 
     if (this._gestureCleanup) {
       try {
@@ -1960,6 +2966,18 @@ export class AudioEngine {
         }
       } catch {
         // Ignore teardown errors on disconnect.
+      }
+    }
+
+    const masterGainNode = this._masterGainNode;
+    this._masterGainNode = null;
+    if (masterGainNode) {
+      try {
+        if (typeof masterGainNode.disconnect === 'function') {
+          masterGainNode.disconnect();
+        }
+      } catch {
+        // Ignore teardown errors on master gain disconnect.
       }
     }
 
