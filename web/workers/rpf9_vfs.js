@@ -74,6 +74,7 @@ const RPF_ENTRY_FLAG_OFFSET_SHIFT9 = 0x08;
 
 const MAX_U24 = 0x00ffffff;
 const MAX_U32 = 0xffffffff;
+const MAX_U32_BIGINT = 0xffffffffn;
 const MAX_U64_BIGINT = 0xffffffffffffffffn;
 const MAX_SAFE_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
 
@@ -148,9 +149,57 @@ function hashVirtualPath(virtualPath) {
   return joaatHash(norm.key);
 }
 
+function isAsciiWhitespace(c) {
+  return c === 0x20 || (c >= 0x09 && c <= 0x0d);
+}
+
+/**
+ * Zero-allocation parser for an explicit `0x`-prefixed 32-bit hex hash string.
+ * Returns unsigned u32 `[0..0xFFFFFFFF]` on match, or `-1` otherwise.
+ */
+function parseExplicitHexHash(str) {
+  const len = str.length;
+  let start = 0;
+  let end = len;
+  while (start < end && isAsciiWhitespace(str.charCodeAt(start))) {
+    start += 1;
+  }
+  while (end > start && isAsciiWhitespace(str.charCodeAt(end - 1))) {
+    end -= 1;
+  }
+  if (
+    end - start < 3 ||
+    str.charCodeAt(start) !== 0x30 ||
+    (str.charCodeAt(start + 1) !== 0x78 && str.charCodeAt(start + 1) !== 0x58)
+  ) {
+    return -1;
+  }
+  start += 2;
+  const digitCount = end - start;
+  if (digitCount < 1 || digitCount > 8) {
+    return -1;
+  }
+  let acc = 0;
+  for (let i = start; i < end; i += 1) {
+    const c = str.charCodeAt(i);
+    let nibble;
+    if (c >= 0x30 && c <= 0x39) {
+      nibble = c - 0x30;
+    } else if (c >= 0x41 && c <= 0x46) {
+      nibble = c - 0x37;
+    } else if (c >= 0x61 && c <= 0x66) {
+      nibble = c - 0x57;
+    } else {
+      return -1;
+    }
+    acc = ((acc << 4) | nibble) >>> 0;
+  }
+  return acc;
+}
+
 function parseHashKey(hashInput) {
   if (typeof hashInput === 'number') {
-    if (!Number.isInteger(hashInput) || hashInput < 0 || hashInput > MAX_U32) {
+    if ((hashInput >>> 0) !== hashInput) {
       throw new RpfFormatError(
         'INVALID_HASH',
         `RPF entry hash must be an unsigned 32-bit integer: ${hashInput}`
@@ -158,17 +207,56 @@ function parseHashKey(hashInput) {
     }
     return hashInput >>> 0;
   }
+  if (typeof hashInput === 'bigint') {
+    if (hashInput < 0n || hashInput > MAX_U32_BIGINT) {
+      throw new RpfFormatError(
+        'INVALID_HASH',
+        `RPF entry hash BigInt must be an unsigned 32-bit integer: ${hashInput}`
+      );
+    }
+    return Number(hashInput) >>> 0;
+  }
   if (typeof hashInput === 'string') {
-    const trimmed = hashInput.trim();
-    const match = /^(?:0x)?([0-9a-fA-F]{1,8})$/.exec(trimmed);
-    if (!match) {
+    const len = hashInput.length;
+    let start = 0;
+    let end = len;
+    while (start < end && isAsciiWhitespace(hashInput.charCodeAt(start))) {
+      start += 1;
+    }
+    while (end > start && isAsciiWhitespace(hashInput.charCodeAt(end - 1))) {
+      end -= 1;
+    }
+    if (
+      end - start >= 2 &&
+      hashInput.charCodeAt(start) === 0x30 &&
+      (hashInput.charCodeAt(start + 1) === 0x78 || hashInput.charCodeAt(start + 1) === 0x58)
+    ) {
+      start += 2;
+    }
+    const digitCount = end - start;
+    if (digitCount < 1 || digitCount > 8) {
       throw new RpfFormatError('INVALID_HASH', `Invalid hex RPF entry hash: ${hashInput}`);
     }
-    return parseInt(match[1], 16) >>> 0;
+    let acc = 0;
+    for (let i = start; i < end; i += 1) {
+      const c = hashInput.charCodeAt(i);
+      let nibble;
+      if (c >= 0x30 && c <= 0x39) {
+        nibble = c - 0x30;
+      } else if (c >= 0x41 && c <= 0x46) {
+        nibble = c - 0x37;
+      } else if (c >= 0x61 && c <= 0x66) {
+        nibble = c - 0x57;
+      } else {
+        throw new RpfFormatError('INVALID_HASH', `Invalid hex RPF entry hash: ${hashInput}`);
+      }
+      acc = ((acc << 4) | nibble) >>> 0;
+    }
+    return acc;
   }
   throw new RpfFormatError(
     'INVALID_HASH',
-    'RPF entry hash must be an unsigned 32-bit integer or hex string'
+    'RPF entry hash must be an unsigned 32-bit integer, BigInt, or hex string'
   );
 }
 
@@ -852,6 +940,127 @@ function normalizeVirtualPath(virtualPath) {
   };
 }
 
+/**
+ * Zero-allocation fast path for extracting the normalized lowercase lookup key
+ * of a virtual RPF path. Returns `virtualPath` directly without splitting or
+ * allocating when it is already canonical lowercase ASCII with no leading,
+ * trailing, or duplicate slashes, backslashes, NUL bytes, or `.` / `..` segments.
+ *
+ * @param {string} virtualPath
+ * @returns {string}
+ */
+function normalizePathKeyFast(virtualPath) {
+  if (virtualPath === undefined || virtualPath === null || virtualPath === '') {
+    return '';
+  }
+  if (typeof virtualPath !== 'string') {
+    throw new RpfFormatError('INVALID_PATH', 'Virtual path must be a string');
+  }
+  const len = virtualPath.length;
+  let segStart = 0;
+  let isCanonical = true;
+  for (let i = 0; i < len; i += 1) {
+    const c = virtualPath.charCodeAt(i);
+    if (c === 0) {
+      throw new RpfFormatError('INVALID_PATH', `Virtual path contains NUL byte: ${virtualPath}`);
+    }
+    if (c === 0x2f) {
+      const segLen = i - segStart;
+      if (
+        segLen === 0 ||
+        (segLen === 1 && virtualPath.charCodeAt(segStart) === 0x2e) ||
+        (segLen === 2 &&
+          virtualPath.charCodeAt(segStart) === 0x2e &&
+          virtualPath.charCodeAt(segStart + 1) === 0x2e)
+      ) {
+        isCanonical = false;
+        break;
+      }
+      segStart = i + 1;
+    } else if (c === 0x5c || (c >= 0x41 && c <= 0x5a) || c >= 0x80) {
+      isCanonical = false;
+      break;
+    }
+  }
+  if (isCanonical) {
+    const tailLen = len - segStart;
+    if (
+      tailLen === 0 ||
+      (tailLen === 1 && virtualPath.charCodeAt(segStart) === 0x2e) ||
+      (tailLen === 2 &&
+        virtualPath.charCodeAt(segStart) === 0x2e &&
+        virtualPath.charCodeAt(segStart + 1) === 0x2e)
+    ) {
+      isCanonical = false;
+    }
+  }
+  if (isCanonical) {
+    return virtualPath;
+  }
+  return normalizeVirtualPath(virtualPath).key;
+}
+
+/**
+ * Writes a TOC node's stat fields into `target` in-place (zero allocations when
+ * `target` is a pre-allocated scratch object). Safely clears stale fields from
+ * the opposite entry kind if `target` is reused across file/directory probes.
+ */
+function writeNodeStat(
+  node,
+  target,
+  pathOverride = undefined,
+  hasMount = false,
+  mountId = undefined,
+  mountPrefix = undefined
+) {
+  const entry = node.entry;
+  const outPath = pathOverride !== undefined ? pathOverride : node.path;
+  if (entry.kind === 'directory') {
+    target.path = outPath;
+    target.name = node.name;
+    target.kind = 'directory';
+    target.isDirectory = true;
+    target.isFile = false;
+    target.entryIndex = entry.index;
+    target.firstChildIndex = entry.firstChildIndex;
+    target.childCount = entry.childCount;
+    target.flags = entry.flags;
+    if (target.dataOffset !== undefined) target.dataOffset = undefined;
+    if (target.size !== undefined) target.size = undefined;
+    if (target.uncompressedSize !== undefined) target.uncompressedSize = undefined;
+    if (target.compressedSize !== undefined) target.compressedSize = undefined;
+    if (target.storedSize !== undefined) target.storedSize = undefined;
+    if (target.isCompressed !== undefined) target.isCompressed = undefined;
+    if (target.isResource !== undefined) target.isResource = undefined;
+    if (target.isEncrypted !== undefined) target.isEncrypted = undefined;
+    if (target.virtual !== undefined) target.virtual = undefined;
+  } else {
+    target.path = outPath;
+    target.name = node.name;
+    target.kind = 'file';
+    target.isDirectory = false;
+    target.isFile = true;
+    target.entryIndex = entry.index;
+    target.dataOffset = entry.dataOffset;
+    target.size = entry.uncompressedSize;
+    target.uncompressedSize = entry.uncompressedSize;
+    target.compressedSize = entry.compressedSize;
+    target.storedSize = entry.storedSize;
+    target.flags = entry.flags;
+    target.isCompressed = entry.isCompressed;
+    target.isResource = entry.isResource;
+    target.isEncrypted = entry.isEncrypted;
+    if (target.firstChildIndex !== undefined) target.firstChildIndex = undefined;
+    if (target.childCount !== undefined) target.childCount = undefined;
+    if (target.virtual !== undefined) target.virtual = undefined;
+  }
+  if (hasMount) {
+    target.mountId = mountId;
+    target.mountPrefix = mountPrefix;
+  }
+  return target;
+}
+
 function cloneNodeStat(node, pathOverride = undefined, extra = undefined) {
   const entry = node.entry;
   const outPath = pathOverride !== undefined ? pathOverride : node.path;
@@ -937,6 +1146,9 @@ class RpfArchiveVfs {
       lookupMisses: 0,
       pathIndexHits: 0,
       negativeLookupHits: 0,
+      fastHashHits: 0,
+      batchStatCalls: 0,
+      batchStatHits: 0,
       tocCacheHits: options._fromTocCache ? 1 : 0,
       compressedEntriesRead: 0,
       rawEntriesRead: 0,
@@ -980,6 +1192,9 @@ class RpfArchiveVfs {
    *   negativeLookupEntries: number,
    *   negativeLookupCapacity: number,
    *   negativeLookupEvictions: number,
+   *   fastHashHits: number,
+   *   batchStatCalls: number,
+   *   batchStatHits: number,
    *   tocCacheHits: number,
    *   tocCacheMisses: number,
    *   resolvedPathCacheSize: number,
@@ -1005,6 +1220,9 @@ class RpfArchiveVfs {
       negativeLookupEntries: this._negativeLookupCache.size,
       negativeLookupCapacity: this._negativeLookupCache.capacity,
       negativeLookupEvictions: this._negativeLookupCache.evictions,
+      fastHashHits: this._stats.fastHashHits,
+      batchStatCalls: this._stats.batchStatCalls,
+      batchStatHits: this._stats.batchStatHits,
       tocCacheHits: this._stats.tocCacheHits,
       tocCacheMisses: this._resolvedPathCache.misses,
       resolvedPathCacheSize: this._resolvedPathCache.size,
@@ -1021,6 +1239,9 @@ class RpfArchiveVfs {
     this._stats.lookupMisses = 0;
     this._stats.pathIndexHits = 0;
     this._stats.negativeLookupHits = 0;
+    this._stats.fastHashHits = 0;
+    this._stats.batchStatCalls = 0;
+    this._stats.batchStatHits = 0;
     this._stats.tocCacheHits = 0;
     this._stats.compressedEntriesRead = 0;
     this._stats.rawEntriesRead = 0;
@@ -1334,10 +1555,8 @@ class RpfArchiveVfs {
     const cached = this._resolvedPathCache.getIfPresent(rawKey);
     if (cached !== undefined) {
       this._stats.tocCacheHits += 1;
-      if (cached.node !== null) {
-        this._stats.pathIndexHits += 1;
-      }
-      return cached.node;
+      this._stats.pathIndexHits += 1;
+      return cached;
     }
 
     if (this._negativeLookupCache.getByRaw(rawKey) !== null) {
@@ -1346,22 +1565,22 @@ class RpfArchiveVfs {
       return null;
     }
 
-    const norm = normalizeVirtualPath(rawKey);
-    if (norm.key !== rawKey && this._negativeLookupCache.getByNormalized(norm.key, rawKey)) {
+    const normKey = normalizePathKeyFast(rawKey);
+    if (normKey !== rawKey && this._negativeLookupCache.getByNormalized(normKey, rawKey)) {
       this._stats.negativeLookupHits += 1;
       this._stats.tocCacheHits += 1;
       return null;
     }
 
     this._resolvedPathCache.recordMiss();
-    const node = this._nodesByKey.get(norm.key) || null;
+    const node = this._nodesByKey.get(normKey) || null;
     if (node !== null) {
       this._stats.pathIndexHits += 1;
-      this._resolvedPathCache.set(rawKey, { key: norm.key, node });
+      this._resolvedPathCache.set(rawKey, node);
       return node;
     }
 
-    this._negativeLookupCache.set(norm.key, rawKey);
+    this._negativeLookupCache.set(normKey, rawKey);
     return null;
   }
 
@@ -1408,26 +1627,174 @@ class RpfArchiveVfs {
   }
 
   lookupByHash(pathHash) {
-    const nodes = this._lookupNodesByHash(pathHash);
-    if (!nodes) {
+    const h = parseHashKey(pathHash);
+    const bucket = this._nodesByHash.get(h);
+    if (bucket === undefined) {
       this._stats.lookupMisses += 1;
       return null;
     }
     this._stats.lookupHits += 1;
-    const node = nodes[0];
+    const isArr = Array.isArray(bucket);
+    const node = isArr ? bucket[0] : bucket;
     return {
       path: node.path,
       key: node.key,
       name: node.name,
       archivePath: node.path,
       pathHash: node.pathHash,
-      collisionCount: nodes.length > 1 ? nodes.length - 1 : 0,
+      collisionCount: isArr ? bucket.length - 1 : 0,
       stat: cloneNodeStat(node),
     };
   }
 
   resolveByHash(pathHash) {
     return this.lookupByHash(pathHash);
+  }
+
+  /**
+   * Zero-allocation O(1) hash lookup supporting uint32, BigInt u32, or hex string
+   * hashes and an optional pre-allocated `out` scratch result object (reusing
+   * `out.stat` when present). Preserves exact `resolveByHash()` return shape when
+   * `out` is omitted.
+   *
+   * @param {number|bigint|string} hashU32OrBigInt
+   * @param {object} [out]
+   * @returns {object|null}
+   */
+  resolveByHashFast(hashU32OrBigInt, out = undefined) {
+    const h = parseHashKey(hashU32OrBigInt);
+    const bucket = this._nodesByHash.get(h);
+    if (bucket === undefined) {
+      this._stats.lookupMisses += 1;
+      return null;
+    }
+    this._stats.lookupHits += 1;
+    this._stats.fastHashHits += 1;
+    let node;
+    let collisionCount;
+    if (Array.isArray(bucket)) {
+      node = bucket[0];
+      collisionCount = bucket.length - 1;
+    } else {
+      node = bucket;
+      collisionCount = 0;
+    }
+    const target = out !== undefined && out !== null && typeof out === 'object' ? out : {};
+    const statTarget =
+      target.stat !== undefined && target.stat !== null && typeof target.stat === 'object'
+        ? target.stat
+        : {};
+    writeNodeStat(node, statTarget);
+    target.path = node.path;
+    target.key = node.key;
+    target.name = node.name;
+    target.archivePath = node.path;
+    target.pathHash = node.pathHash;
+    target.collisionCount = collisionCount;
+    target.stat = statTarget;
+    return target;
+  }
+
+  _statByHashFast(h, out) {
+    const bucket = this._nodesByHash.get(h);
+    if (bucket === undefined) {
+      this._stats.lookupMisses += 1;
+      return null;
+    }
+    this._stats.lookupHits += 1;
+    this._stats.fastHashHits += 1;
+    const node = Array.isArray(bucket) ? bucket[0] : bucket;
+    const target = out !== undefined && out !== null && typeof out === 'object' ? out : {};
+    return writeNodeStat(node, target);
+  }
+
+  /**
+   * Zero-allocation O(1) stat probe accepting either a virtual path string or a
+   * 32-bit JOAAT hash (number, BigInt u32, or explicit `0x`-prefixed hex string),
+   * optionally writing into a pre-allocated `out` scratch object. Preserves exact
+   * `stat()` return shape when `out` is omitted.
+   *
+   * @param {string|number|bigint} pathOrHash
+   * @param {object} [out]
+   * @returns {object|null}
+   */
+  statEntryFast(pathOrHash, out = undefined) {
+    if (typeof pathOrHash === 'number' || typeof pathOrHash === 'bigint') {
+      return this._statByHashFast(parseHashKey(pathOrHash), out);
+    }
+    if (typeof pathOrHash === 'string') {
+      const explicitHash = parseExplicitHexHash(pathOrHash);
+      if (explicitHash >= 0) {
+        return this._statByHashFast(explicitHash, out);
+      }
+    }
+    const node = this._resolveNode(pathOrHash);
+    if (!node) {
+      this._stats.lookupMisses += 1;
+      return null;
+    }
+    this._stats.lookupHits += 1;
+    const target = out !== undefined && out !== null && typeof out === 'object' ? out : {};
+    return writeNodeStat(node, target);
+  }
+
+  /**
+   * Resolves a list (or iterable) of hot boot/menu RPF paths or hashes in a single
+   * pass using O(1) index hits and the bounded negative-lookup LRU cache.
+   *
+   * @param {Iterable<string|number|bigint>} paths
+   * @param {Array<object|null>} [out]
+   * @returns {Array<object|null>}
+   */
+  batchStat(paths, out = undefined) {
+    if (paths === null || paths === undefined) {
+      this._stats.batchStatCalls += 1;
+      if (Array.isArray(out)) {
+        out.length = 0;
+        return out;
+      }
+      return [];
+    }
+    const isArr = Array.isArray(paths);
+    if (!isArr && typeof paths[Symbol.iterator] !== 'function') {
+      throw new RpfFormatError(
+        'INVALID_PATH',
+        'batchStat() requires an array or iterable of virtual paths or hashes'
+      );
+    }
+    this._stats.batchStatCalls += 1;
+    const useOut = Array.isArray(out);
+    if (isArr) {
+      const len = paths.length;
+      const results = useOut ? out : new Array(len);
+      if (useOut) {
+        results.length = len;
+      }
+      for (let i = 0; i < len; i += 1) {
+        const slot =
+          useOut && results[i] !== null && typeof results[i] === 'object' ? results[i] : undefined;
+        const st = this.statEntryFast(paths[i], slot);
+        if (st !== null) {
+          this._stats.batchStatHits += 1;
+        }
+        results[i] = st;
+      }
+      return results;
+    }
+    const results = useOut ? out : [];
+    if (useOut) {
+      results.length = 0;
+    }
+    let idx = 0;
+    for (const item of paths) {
+      const st = this.statEntryFast(item);
+      if (st !== null) {
+        this._stats.batchStatHits += 1;
+      }
+      results[idx] = st;
+      idx += 1;
+    }
+    return results;
   }
 
   lookupAllByHash(pathHash) {
@@ -1735,6 +2102,9 @@ class RpfVfsMountTable {
       lookupMisses: 0,
       pathIndexHits: 0,
       negativeLookupHits: 0,
+      fastHashHits: 0,
+      batchStatCalls: 0,
+      batchStatHits: 0,
       tocCacheHits: 0,
       compressedEntriesRead: 0,
       rawEntriesRead: 0,
@@ -1771,6 +2141,9 @@ class RpfVfsMountTable {
    *   negativeLookupEntries: number,
    *   negativeLookupCapacity: number,
    *   negativeLookupEvictions: number,
+   *   fastHashHits: number,
+   *   batchStatCalls: number,
+   *   batchStatHits: number,
    *   tocCacheHits: number,
    *   tocCacheMisses: number,
    *   resolvedPathCacheSize: number,
@@ -1797,6 +2170,9 @@ class RpfVfsMountTable {
       negativeLookupEntries: this._negativeLookupCache.size,
       negativeLookupCapacity: this._negativeLookupCache.capacity,
       negativeLookupEvictions: this._negativeLookupCache.evictions,
+      fastHashHits: this._stats.fastHashHits,
+      batchStatCalls: this._stats.batchStatCalls,
+      batchStatHits: this._stats.batchStatHits,
       tocCacheHits: this._stats.tocCacheHits,
       tocCacheMisses: this._resolvedPathCache.misses + this._dirListingCache.misses,
       resolvedPathCacheSize: this._resolvedPathCache.size,
@@ -1814,6 +2190,9 @@ class RpfVfsMountTable {
     this._stats.lookupMisses = 0;
     this._stats.pathIndexHits = 0;
     this._stats.negativeLookupHits = 0;
+    this._stats.fastHashHits = 0;
+    this._stats.batchStatCalls = 0;
+    this._stats.batchStatHits = 0;
     this._stats.tocCacheHits = 0;
     this._stats.compressedEntriesRead = 0;
     this._stats.rawEntriesRead = 0;
@@ -1916,6 +2295,7 @@ class RpfVfsMountTable {
           pathHash,
           node,
           stat: null,
+          fromPathIndex: true,
         };
         this._pathIndex.set(fullKey, entryRecord);
         this._upsertHashIndex(pathHash, fullKey, entryRecord);
@@ -1960,6 +2340,7 @@ class RpfVfsMountTable {
             pathHash,
             node: null,
             stat: item.stat,
+            fromPathIndex: true,
           };
           this._pathIndex.set(fullKey, entryRecord);
           this._upsertHashIndex(pathHash, fullKey, entryRecord);
@@ -1996,18 +2377,51 @@ class RpfVfsMountTable {
     }
   }
 
-  _buildMountedStat(indexed) {
+  _writeMountedStat(indexed, target = {}) {
     if (indexed.node) {
-      return cloneNodeStat(indexed.node, indexed.fullPath, {
-        mountId: indexed.mountId,
-        mountPrefix: indexed.mountPrefix,
-      });
+      return writeNodeStat(
+        indexed.node,
+        target,
+        indexed.fullPath,
+        true,
+        indexed.mountId,
+        indexed.mountPrefix
+      );
     }
-    return Object.assign({}, indexed.stat, {
-      path: indexed.fullPath,
-      mountId: indexed.mountId,
-      mountPrefix: indexed.mountPrefix,
-    });
+    Object.assign(target, indexed.stat);
+    target.path = indexed.fullPath;
+    target.mountId = indexed.mountId;
+    target.mountPrefix = indexed.mountPrefix;
+    if (target.virtual !== undefined) target.virtual = undefined;
+    return target;
+  }
+
+  _writeVirtualDirStat(virtualDir, target = {}) {
+    target.path = virtualDir.path;
+    target.name = virtualDir.name;
+    target.kind = 'directory';
+    target.isDirectory = true;
+    target.isFile = false;
+    target.virtual = true;
+    if (target.entryIndex !== undefined) target.entryIndex = undefined;
+    if (target.firstChildIndex !== undefined) target.firstChildIndex = undefined;
+    if (target.childCount !== undefined) target.childCount = undefined;
+    if (target.dataOffset !== undefined) target.dataOffset = undefined;
+    if (target.size !== undefined) target.size = undefined;
+    if (target.uncompressedSize !== undefined) target.uncompressedSize = undefined;
+    if (target.compressedSize !== undefined) target.compressedSize = undefined;
+    if (target.storedSize !== undefined) target.storedSize = undefined;
+    if (target.flags !== undefined) target.flags = undefined;
+    if (target.isCompressed !== undefined) target.isCompressed = undefined;
+    if (target.isResource !== undefined) target.isResource = undefined;
+    if (target.isEncrypted !== undefined) target.isEncrypted = undefined;
+    if (target.mountId !== undefined) target.mountId = undefined;
+    if (target.mountPrefix !== undefined) target.mountPrefix = undefined;
+    return target;
+  }
+
+  _buildMountedStat(indexed) {
+    return this._writeMountedStat(indexed, {});
   }
 
   _getEntryMeta(indexed) {
@@ -2052,6 +2466,7 @@ class RpfVfsMountTable {
             fullPath,
             node: null,
             stat: st,
+            fromPathIndex: false,
           };
         }
       }
@@ -2188,7 +2603,7 @@ class RpfVfsMountTable {
     return this._virtualDirIndex.has(pathKey);
   }
 
-  _resolveCached(virtualPath) {
+  _resolveRaw(virtualPath) {
     let rawKey;
     if (virtualPath === undefined || virtualPath === null) {
       rawKey = '';
@@ -2196,13 +2611,13 @@ class RpfVfsMountTable {
       rawKey = virtualPath;
     } else {
       normalizeVirtualPath(virtualPath);
-      return { key: '', indexed: null, virtualDir: null };
+      return null;
     }
 
     const cached = this._resolvedPathCache.getIfPresent(rawKey);
     if (cached !== undefined) {
       this._stats.tocCacheHits += 1;
-      if (cached.indexed !== null && cached.fromPathIndex !== false) {
+      if (cached.vfs !== undefined && cached.fromPathIndex !== false) {
         this._stats.pathIndexHits += 1;
       }
       return cached;
@@ -2210,53 +2625,64 @@ class RpfVfsMountTable {
 
     const canCacheNegatives = this._unindexedMounts.length === 0;
     if (canCacheNegatives) {
-      const negRawKey = this._negativeLookupCache.getByRaw(rawKey);
-      if (negRawKey !== null) {
+      if (this._negativeLookupCache.getByRaw(rawKey) !== null) {
         this._stats.negativeLookupHits += 1;
         this._stats.tocCacheHits += 1;
-        return { key: negRawKey, indexed: null, virtualDir: null };
+        return null;
       }
     }
 
-    const norm = normalizeVirtualPath(rawKey);
+    const normKey = normalizePathKeyFast(rawKey);
     if (
       canCacheNegatives &&
-      norm.key !== rawKey &&
-      this._negativeLookupCache.getByNormalized(norm.key, rawKey)
+      normKey !== rawKey &&
+      this._negativeLookupCache.getByNormalized(normKey, rawKey)
     ) {
       this._stats.negativeLookupHits += 1;
       this._stats.tocCacheHits += 1;
-      return { key: norm.key, indexed: null, virtualDir: null };
+      return null;
     }
 
     this._resolvedPathCache.recordMiss();
-    let indexed = this._pathIndex.get(norm.key) || null;
-    let fromPathIndex = indexed !== null;
-    if (!indexed && !canCacheNegatives) {
-      indexed = this._lookupEntry(norm);
-    }
+    let indexed = this._pathIndex.get(normKey) || null;
     if (indexed !== null) {
-      if (fromPathIndex) {
-        this._stats.pathIndexHits += 1;
-      }
-      const entry = { key: norm.key, indexed, virtualDir: null, fromPathIndex };
-      this._resolvedPathCache.set(rawKey, entry);
-      return entry;
+      this._stats.pathIndexHits += 1;
+      this._resolvedPathCache.set(rawKey, indexed);
+      return indexed;
     }
 
-    const virtualDir = this._virtualDirIndex.get(norm.key) || null;
-    if (virtualDir !== null) {
-      const entry = { key: norm.key, indexed: null, virtualDir, fromPathIndex: false };
-      if (canCacheNegatives) {
-        this._resolvedPathCache.set(rawKey, entry);
+    if (!canCacheNegatives) {
+      const norm = normalizeVirtualPath(rawKey);
+      indexed = this._lookupEntry(norm);
+      if (indexed !== null) {
+        this._resolvedPathCache.set(rawKey, indexed);
+        return indexed;
       }
-      return entry;
+    }
+
+    const virtualDir = this._virtualDirIndex.get(normKey) || null;
+    if (virtualDir !== null) {
+      if (canCacheNegatives) {
+        this._resolvedPathCache.set(rawKey, virtualDir);
+      }
+      return virtualDir;
     }
 
     if (canCacheNegatives) {
-      this._negativeLookupCache.set(norm.key, rawKey);
+      this._negativeLookupCache.set(normKey, rawKey);
     }
-    return { key: norm.key, indexed: null, virtualDir: null };
+    return null;
+  }
+
+  _resolveCached(virtualPath) {
+    const resolved = this._resolveRaw(virtualPath);
+    if (!resolved) {
+      return { key: '', indexed: null, virtualDir: null };
+    }
+    if (resolved.vfs !== undefined) {
+      return { key: resolved.fullKey || '', indexed: resolved, virtualDir: null };
+    }
+    return { key: resolved.path ? resolved.path.toLowerCase() : '', indexed: null, virtualDir: resolved };
   }
 
   _lookupRecordsByHash(pathHash) {
@@ -2269,59 +2695,211 @@ class RpfVfsMountTable {
   }
 
   resolve(virtualPath) {
-    const { indexed } = this._resolveCached(virtualPath);
-    if (!indexed) {
+    const resolved = this._resolveRaw(virtualPath);
+    if (!resolved || resolved.vfs === undefined) {
       this._stats.lookupMisses += 1;
       return null;
     }
     this._stats.lookupHits += 1;
     return {
-      mountId: indexed.mountId,
-      mountPrefix: indexed.mountPrefix,
-      vfs: indexed.vfs,
-      archivePath: indexed.archivePath,
-      stat: this._buildMountedStat(indexed),
+      mountId: resolved.mountId,
+      mountPrefix: resolved.mountPrefix,
+      vfs: resolved.vfs,
+      archivePath: resolved.archivePath,
+      stat: this._buildMountedStat(resolved),
     };
   }
 
   lookupByPath(virtualPath) {
-    const { indexed } = this._resolveCached(virtualPath);
-    if (!indexed) {
+    const resolved = this._resolveRaw(virtualPath);
+    if (!resolved || resolved.vfs === undefined) {
       this._stats.lookupMisses += 1;
       return null;
     }
     this._stats.lookupHits += 1;
     return {
-      mountId: indexed.mountId,
-      mountPrefix: indexed.mountPrefix,
-      vfs: indexed.vfs,
-      archivePath: indexed.archivePath,
-      pathHash: indexed.pathHash,
-      stat: this._buildMountedStat(indexed),
+      mountId: resolved.mountId,
+      mountPrefix: resolved.mountPrefix,
+      vfs: resolved.vfs,
+      archivePath: resolved.archivePath,
+      pathHash: resolved.pathHash,
+      stat: this._buildMountedStat(resolved),
     };
   }
 
   lookupByHash(pathHash) {
-    const records = this._lookupRecordsByHash(pathHash);
-    if (!records) {
+    const h = parseHashKey(pathHash);
+    const bucket = this._hashIndex.get(h);
+    if (bucket === undefined) {
       this._stats.lookupMisses += 1;
       return null;
     }
     this._stats.lookupHits += 1;
-    const indexed = records[0];
+    const isArr = Array.isArray(bucket);
+    const indexed = isArr ? bucket[0] : bucket;
     return {
       mountId: indexed.mountId,
       mountPrefix: indexed.mountPrefix,
       vfs: indexed.vfs,
       archivePath: indexed.archivePath,
       pathHash: indexed.pathHash,
-      collisionCount: records.length > 1 ? records.length - 1 : 0,
+      collisionCount: isArr ? bucket.length - 1 : 0,
       stat: this._buildMountedStat(indexed),
     };
   }
 
   resolveByHash(pathHash) {
     return this.lookupByHash(pathHash);
+  }
+
+  /**
+   * Zero-allocation O(1) hash lookup across mounted archives supporting uint32,
+   * BigInt u32, or hex string hashes and an optional pre-allocated `out` scratch
+   * result object (reusing `out.stat` when present). Preserves exact
+   * `resolveByHash()` return shape when `out` is omitted.
+   *
+   * @param {number|bigint|string} hashU32OrBigInt
+   * @param {object} [out]
+   * @returns {object|null}
+   */
+  resolveByHashFast(hashU32OrBigInt, out = undefined) {
+    const h = parseHashKey(hashU32OrBigInt);
+    const bucket = this._hashIndex.get(h);
+    if (bucket === undefined) {
+      this._stats.lookupMisses += 1;
+      return null;
+    }
+    this._stats.lookupHits += 1;
+    this._stats.fastHashHits += 1;
+    let indexed;
+    let collisionCount;
+    if (Array.isArray(bucket)) {
+      indexed = bucket[0];
+      collisionCount = bucket.length - 1;
+    } else {
+      indexed = bucket;
+      collisionCount = 0;
+    }
+    const target = out !== undefined && out !== null && typeof out === 'object' ? out : {};
+    const statTarget =
+      target.stat !== undefined && target.stat !== null && typeof target.stat === 'object'
+        ? target.stat
+        : {};
+    this._writeMountedStat(indexed, statTarget);
+    target.mountId = indexed.mountId;
+    target.mountPrefix = indexed.mountPrefix;
+    target.vfs = indexed.vfs;
+    target.archivePath = indexed.archivePath;
+    target.pathHash = indexed.pathHash;
+    target.collisionCount = collisionCount;
+    target.stat = statTarget;
+    return target;
+  }
+
+  _statByHashFast(h, out) {
+    const bucket = this._hashIndex.get(h);
+    if (bucket === undefined) {
+      this._stats.lookupMisses += 1;
+      return null;
+    }
+    this._stats.lookupHits += 1;
+    this._stats.fastHashHits += 1;
+    const indexed = Array.isArray(bucket) ? bucket[0] : bucket;
+    const target = out !== undefined && out !== null && typeof out === 'object' ? out : {};
+    return this._writeMountedStat(indexed, target);
+  }
+
+  /**
+   * Zero-allocation O(1) stat probe across mounted archives accepting either a
+   * virtual path string or a 32-bit JOAAT hash (number, BigInt u32, or explicit
+   * `0x`-prefixed hex string), optionally writing into a pre-allocated `out`
+   * scratch object. Preserves exact `stat()` return shape when `out` is omitted.
+   *
+   * @param {string|number|bigint} pathOrHash
+   * @param {object} [out]
+   * @returns {object|null}
+   */
+  statEntryFast(pathOrHash, out = undefined) {
+    if (typeof pathOrHash === 'number' || typeof pathOrHash === 'bigint') {
+      return this._statByHashFast(parseHashKey(pathOrHash), out);
+    }
+    if (typeof pathOrHash === 'string') {
+      const explicitHash = parseExplicitHexHash(pathOrHash);
+      if (explicitHash >= 0) {
+        return this._statByHashFast(explicitHash, out);
+      }
+    }
+    const resolved = this._resolveRaw(pathOrHash);
+    if (!resolved) {
+      this._stats.lookupMisses += 1;
+      return null;
+    }
+    this._stats.lookupHits += 1;
+    const target = out !== undefined && out !== null && typeof out === 'object' ? out : {};
+    if (resolved.vfs !== undefined) {
+      return this._writeMountedStat(resolved, target);
+    }
+    return this._writeVirtualDirStat(resolved, target);
+  }
+
+  /**
+   * Resolves a list (or iterable) of hot boot/menu RPF paths or hashes across
+   * mounted archives in a single pass using O(1) index hits and the bounded
+   * negative-lookup LRU cache.
+   *
+   * @param {Iterable<string|number|bigint>} paths
+   * @param {Array<object|null>} [out]
+   * @returns {Array<object|null>}
+   */
+  batchStat(paths, out = undefined) {
+    if (paths === null || paths === undefined) {
+      this._stats.batchStatCalls += 1;
+      if (Array.isArray(out)) {
+        out.length = 0;
+        return out;
+      }
+      return [];
+    }
+    const isArr = Array.isArray(paths);
+    if (!isArr && typeof paths[Symbol.iterator] !== 'function') {
+      throw new RpfFormatError(
+        'INVALID_PATH',
+        'batchStat() requires an array or iterable of virtual paths or hashes'
+      );
+    }
+    this._stats.batchStatCalls += 1;
+    const useOut = Array.isArray(out);
+    if (isArr) {
+      const len = paths.length;
+      const results = useOut ? out : new Array(len);
+      if (useOut) {
+        results.length = len;
+      }
+      for (let i = 0; i < len; i += 1) {
+        const slot =
+          useOut && results[i] !== null && typeof results[i] === 'object' ? results[i] : undefined;
+        const st = this.statEntryFast(paths[i], slot);
+        if (st !== null) {
+          this._stats.batchStatHits += 1;
+        }
+        results[i] = st;
+      }
+      return results;
+    }
+    const results = useOut ? out : [];
+    if (useOut) {
+      results.length = 0;
+    }
+    let idx = 0;
+    for (const item of paths) {
+      const st = this.statEntryFast(item);
+      if (st !== null) {
+        this._stats.batchStatHits += 1;
+      }
+      results[idx] = st;
+      idx += 1;
+    }
+    return results;
   }
 
   lookupAllByHash(pathHash) {
@@ -2355,12 +2933,12 @@ class RpfVfsMountTable {
   exists(virtualPath) {
     let resolved;
     try {
-      resolved = this._resolveCached(virtualPath);
+      resolved = this._resolveRaw(virtualPath);
     } catch {
       this._stats.lookupMisses += 1;
       return false;
     }
-    if (resolved.indexed !== null || resolved.virtualDir !== null) {
+    if (resolved !== null) {
       this._stats.lookupHits += 1;
       return true;
     }
@@ -2369,27 +2947,26 @@ class RpfVfsMountTable {
   }
 
   stat(virtualPath) {
-    const { indexed, virtualDir } = this._resolveCached(virtualPath);
-    if (indexed) {
-      this._stats.lookupHits += 1;
-      return this._buildMountedStat(indexed);
+    const resolved = this._resolveRaw(virtualPath);
+    if (!resolved) {
+      this._stats.lookupMisses += 1;
+      return null;
     }
-    if (virtualDir) {
-      this._stats.lookupHits += 1;
-      return Object.assign({}, virtualDir);
+    this._stats.lookupHits += 1;
+    if (resolved.vfs !== undefined) {
+      return this._buildMountedStat(resolved);
     }
-    this._stats.lookupMisses += 1;
-    return null;
+    return Object.assign({}, resolved);
   }
 
   open(virtualPath) {
-    const { indexed } = this._resolveCached(virtualPath);
-    if (!indexed) {
+    const resolved = this._resolveRaw(virtualPath);
+    if (!resolved || resolved.vfs === undefined) {
       this._stats.lookupMisses += 1;
       throw new RpfFormatError('PATH_NOT_FOUND', `File not found in mount table: ${virtualPath}`);
     }
     this._stats.lookupHits += 1;
-    const stat = this._buildMountedStat(indexed);
+    const stat = this._buildMountedStat(resolved);
     if (!stat.isFile) {
       throw new RpfFormatError('NOT_A_FILE', `Path is a directory, not a file: ${virtualPath}`);
     }
@@ -2397,23 +2974,25 @@ class RpfVfsMountTable {
       path: stat.path,
       name: stat.name,
       size: stat.size,
-      mountId: indexed.mountId,
-      mountPrefix: indexed.mountPrefix,
-      archivePath: indexed.archivePath,
+      mountId: resolved.mountId,
+      mountPrefix: resolved.mountPrefix,
+      archivePath: resolved.archivePath,
       stat,
       read: (offset = 0, length = undefined, options = {}) =>
-        this._readIndexedRange(indexed, offset, length, options),
-      readAll: (options = {}) => this._readIndexedRange(indexed, 0, undefined, options),
+        this._readIndexedRange(resolved, offset, length, options),
+      readAll: (options = {}) => this._readIndexedRange(resolved, 0, undefined, options),
     };
   }
 
   listDir(dirPath = '') {
-    const norm = normalizeVirtualPath(dirPath);
-    const cachedDir = this._dirListingCache.get(norm.key);
+    const dirKey = normalizePathKeyFast(dirPath);
+    const cachedDir = this._dirListingCache.get(dirKey);
     if (cachedDir !== undefined) {
       this._stats.tocCacheHits += 1;
       return cachedDir.map((entry) => Object.assign({}, entry));
     }
+
+    const norm = normalizeVirtualPath(dirPath);
 
     const ordered = this._sortedMounts;
 
@@ -2537,16 +3116,16 @@ class RpfVfsMountTable {
   }
 
   async readFileRange(virtualPath, offset = 0, length = undefined, options = {}) {
-    const { indexed } = this._resolveCached(virtualPath);
-    if (!indexed) {
+    const resolved = this._resolveRaw(virtualPath);
+    if (!resolved || resolved.vfs === undefined) {
       this._stats.lookupMisses += 1;
       throw new RpfFormatError('PATH_NOT_FOUND', `File not found in mount table: ${virtualPath}`);
     }
     this._stats.lookupHits += 1;
-    if (!this._getEntryMeta(indexed).isFile) {
+    if (!this._getEntryMeta(resolved).isFile) {
       throw new RpfFormatError('NOT_A_FILE', `Path is a directory, not a file: ${virtualPath}`);
     }
-    return this._readIndexedRange(indexed, offset, length, options);
+    return this._readIndexedRange(resolved, offset, length, options);
   }
 
   async readFile(virtualPath, options = {}) {
