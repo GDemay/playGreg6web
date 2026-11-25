@@ -1412,11 +1412,36 @@ uint64_t console_layout_size(const GuestResourceDesc& d) {
     return surface * (is_3d ? 1u : std::max<uint32_t>(1u, d.DepthOrArraySize));
 }
 
+// D3D12 small-resource placement (D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT, 4 KiB): a texture
+// with D3D12_TEXTURE_LAYOUT_UNKNOWN that asks for it is laid out in 4 KiB swizzle blocks
+// (GFX10 SW_4KB_S, addrlib placement) and may use the 4 KiB alignment only while that whole
+// surface fits in 64 KiB (D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT). Title data for such a
+// texture is stored in that layout, so a 128x4 R16G16B16A16 texture takes four 4 KiB blocks
+// (16 KiB), not its 4 KiB of texels. Returns the surface size, or 0 when the description is not
+// such a texture or does not fit (the caller then uses the 64 KiB default).
+constexpr uint64_t kSmallPlacementAlignment = 4u << 10;
+constexpr uint64_t kDefaultPlacementAlignment = 64u << 10;
+constexpr uint32_t kSw4kbSLayout = gfx10::kConsoleLinearLayout | 5u;  // 0x105: SW_4KB_S
+
+uint64_t small_texture_size(const GuestResourceDesc& d) {
+    if (d.Dimension != ResourceDimension::Texture2D || d.Layout != 0 || d.Alignment != kSmallPlacementAlignment ||
+        d.SampleCount > 1) {
+        return 0;
+    }
+    GuestResourceDesc tiled = d;
+    tiled.Layout = kSw4kbSLayout;
+    const uint64_t size = console_layout_size(tiled);
+    return size <= kDefaultPlacementAlignment ? size : 0;
+}
+
 }  // namespace
 
 uint64_t resource_size_estimate(const GuestResourceDesc& d) {
     if (d.Dimension == ResourceDimension::Buffer) {
         return d.Width;
+    }
+    if (const uint64_t small = small_texture_size(d); small != 0) {
+        return small;
     }
     if (const uint64_t console = console_layout_size(d); console != 0) {
         return console;
@@ -1442,6 +1467,21 @@ uint64_t resource_size_estimate(const GuestResourceDesc& d) {
     return total * layers * std::max<uint32_t>(1, d.SampleCount);
 }
 
+ResourceAllocation resource_allocation(const GuestResourceDesc& d) {
+    if (d.Dimension == ResourceDimension::Texture2D && d.Layout == 0 && d.Alignment == kSmallPlacementAlignment &&
+        d.SampleCount <= 1) {
+        if (const uint64_t small = small_texture_size(d); small != 0) {
+            return {align_up(small, kSmallPlacementAlignment), kSmallPlacementAlignment};
+        }
+        // Too large for small placement: D3D12 answers with the default alignment instead.
+        GuestResourceDesc fallback = d;
+        fallback.Alignment = 0;
+        return resource_allocation(fallback);
+    }
+    const uint64_t alignment = d.Alignment != 0 ? d.Alignment : (d.SampleCount > 1 ? (4u << 20) : kDefaultPlacementAlignment);
+    return {align_up(resource_size_estimate(d), alignment), alignment};
+}
+
 GuestResourceAllocationInfo Device::GetResourceAllocationInfo(uint32_t, uint32_t count, uint64_t descs) {
     GuestResourceAllocationInfo info{0, 0};
     std::vector<GuestResourceDesc> list;
@@ -1456,9 +1496,9 @@ GuestResourceAllocationInfo Device::GetResourceAllocationInfo(uint32_t, uint32_t
             info.SizeInBytes = UINT64_MAX;
             return info;
         }
-        const uint64_t alignment = d.Alignment != 0 ? d.Alignment : (d.SampleCount > 1 ? (4u << 20) : (64u << 10));
-        info.SizeInBytes = align_up(info.SizeInBytes, alignment) + align_up(resource_size_estimate(d), alignment);
-        info.Alignment = std::max(info.Alignment, alignment);
+        const ResourceAllocation a = resource_allocation(d);
+        info.SizeInBytes = align_up(info.SizeInBytes, a.alignment) + a.size;
+        info.Alignment = std::max(info.Alignment, a.alignment);
     }
     return info;
 }
