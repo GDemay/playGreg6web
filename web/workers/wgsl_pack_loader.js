@@ -53,6 +53,15 @@ const FNV1A_64_OFFSET_BASIS = 0xcbf29ce484222325n;
 const FNV1A_64_PRIME = 0x00000100000001b3n;
 const U64_MAX = 0xffffffffffffffffn;
 const U32_MAX = 0xffffffff;
+const U32_RANGE_LIMIT = 0x100000000;
+
+function sanitizeNonNegativeInt(value, fallback = 0) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    return fallback;
+  }
+  const floored = Math.floor(value);
+  return Number.isSafeInteger(floored) ? floored : Number.MAX_SAFE_INTEGER;
+}
 
 const textEncoder = new TextEncoder();
 const textDecoderStrict = new TextDecoder('utf-8', { fatal: true });
@@ -266,13 +275,13 @@ function parseWgpkHeader(bytes) {
   }
 
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const version = view.getUint32(4, true);
+  const version = view.getUint32(4, true) >>> 0;
   if (version !== WGPK_VERSION) {
     throw new Error(`Unsupported WGPK pack version ${version} (expected ${WGPK_VERSION})`);
   }
 
-  const entryCount = view.getUint32(8, true);
-  const flags = view.getUint32(12, true);
+  const entryCount = view.getUint32(8, true) >>> 0;
+  const flags = view.getUint32(12, true) >>> 0;
   const tableBytes = entryCount * WGPK_ENTRY_BYTES;
   const dataStart = WGPK_HEADER_BYTES + tableBytes;
 
@@ -299,8 +308,10 @@ function parseWgpkEntryTable(bytes, header, totalFileBytes) {
   let totalPayloadBytes = 0;
   let maxEnd = dataStart;
 
+  // When totalFileBytes is unknown (e.g. Content-Range: bytes 0-N/*), allow full unsigned 32-bit
+  // byte indices [0..0xFFFFFFFF] up to the exact 4 GiB exclusive end (0x100000000).
   const upperBound =
-    totalFileBytes !== null && totalFileBytes !== undefined ? totalFileBytes : U32_MAX;
+    totalFileBytes !== null && totalFileBytes !== undefined ? totalFileBytes : U32_RANGE_LIMIT;
 
   for (let idx = 0; idx < entryCount; idx += 1) {
     const base = WGPK_HEADER_BYTES + idx * WGPK_ENTRY_BYTES;
@@ -311,11 +322,11 @@ function parseWgpkEntryTable(bytes, header, totalFileBytes) {
       throw new Error(`Invalid WGPK shader stage value ${stageCode} at entry ${idx}`);
     }
     // bytes[base + 9 .. base + 12] are reserved for forward compatibility.
-    const offset = view.getUint32(base + 12, true);
-    const length = view.getUint32(base + 16, true);
+    const offset = view.getUint32(base + 12, true) >>> 0;
+    const length = view.getUint32(base + 16, true) >>> 0;
     const end = offset + length;
 
-    if (offset < dataStart || end > upperBound) {
+    if (!Number.isSafeInteger(end) || offset < dataStart || end > upperBound) {
       throw new Error(
         `WGPK entry ${idx} payload [${offset}..+${length}] is out of bounds (valid payload range: [${dataStart}..${upperBound}])`
       );
@@ -362,6 +373,9 @@ function parseWgpkEntryTable(bytes, header, totalFileBytes) {
 }
 
 async function fetchRangeChunk(fetcher, url, start, end, fetchInit) {
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start) {
+    throw new RangeError(`Invalid HTTP byte range: bytes=${start}-${end}`);
+  }
   const rangeHeader = `bytes=${start}-${end}`;
   const response = await fetcher(url, mergeRequestInit(fetchInit, { headers: { Range: rangeHeader } }));
   if (!response || (!response.ok && response.status !== 206)) {
@@ -615,8 +629,8 @@ export function buildWgslPackBuffer(entries, options = {}) {
   out[1] = WGPK_MAGIC_BYTES[1];
   out[2] = WGPK_MAGIC_BYTES[2];
   out[3] = WGPK_MAGIC_BYTES[3];
-  view.setUint32(4, WGPK_VERSION, true);
-  view.setUint32(8, encodedEntries.length, true);
+  view.setUint32(4, WGPK_VERSION >>> 0, true);
+  view.setUint32(8, encodedEntries.length >>> 0, true);
   view.setUint32(12, flags >>> 0, true);
 
   // Entry table (20 bytes each) + payloads
@@ -630,8 +644,8 @@ export function buildWgslPackBuffer(entries, options = {}) {
     out[base + 9] = 0;
     out[base + 10] = 0;
     out[base + 11] = 0;
-    view.setUint32(base + 12, cursor, true);
-    view.setUint32(base + 16, payload.byteLength, true);
+    view.setUint32(base + 12, cursor >>> 0, true);
+    view.setUint32(base + 16, payload.byteLength >>> 0, true);
 
     out.set(payload, cursor);
     cursor += payload.byteLength;
@@ -665,6 +679,7 @@ export class WgslPack {
     fetchInit = undefined,
     maxCachedWgslBytes = DEFAULT_MAX_CACHED_WGSL_BYTES,
     initialRangeFetches = 0,
+    initialRangeBytesFetched = 0,
     wgslCache = null,
     rangedDecodeCounter = null,
   }) {
@@ -691,12 +706,13 @@ export class WgslPack {
       mode === 'ranged' ? validateMaxCachedWgslBytes(maxCachedWgslBytes) : null;
     this._wgslCache = wgslCache || new Map();
     this._cachedWgslBytes = 0;
-    this._inFlight = new Map();
-    this._rangeFetches = initialRangeFetches;
+    this._inFlightFetches = new Map();
+    this._rangeFetches = sanitizeNonNegativeInt(initialRangeFetches, 0);
+    this._rangeBytesFetched = sanitizeNonNegativeInt(initialRangeBytesFetched, 0);
     this._cacheHits = 0;
     this._cacheMisses = 0;
     this._wgslCacheEvictions = 0;
-    this._inFlightDeduplications = 0;
+    this._inFlightCoalesced = 0;
     this._rangedDecodeCounter = rangedDecodeCounter;
   }
 
@@ -997,16 +1013,17 @@ export class WgslPack {
     }
 
     // Zero-length payload needs no HTTP Range request.
-    if (staticEntry.length === 0) {
+    const length = staticEntry.length >>> 0;
+    if (length === 0) {
       this._cacheMisses += 1;
       this._putWgslCache(key, '', 0);
       return '';
     }
 
     // Deduplicate concurrent in-flight fetches for the same shader hash.
-    const existingPromise = this._inFlight.get(key);
+    const existingPromise = this._inFlightFetches.get(key);
     if (existingPromise !== undefined) {
-      this._inFlightDeduplications += 1;
+      this._inFlightCoalesced += 1;
       return existingPromise;
     }
 
@@ -1016,53 +1033,59 @@ export class WgslPack {
       throw new Error('No fetch implementation available for ranged getWgslAsync');
     }
 
-    const start = staticEntry.offset;
-    const end = staticEntry.offset + staticEntry.length - 1;
+    // Use unsigned 32-bit offsets + safe IEEE-754 float64 addition so offsets past 2 GiB
+    // (0x80000000..0xFFFFFFFF) never wrap negative.
+    const start = staticEntry.offset >>> 0;
+    const end = start + length - 1;
 
-    const fetchPromise = (async () => {
-      this._rangeFetches += 1;
-      const chunk = await fetchRangeChunk(fetcher, this.url, start, end, this._fetchInit);
+    let fetchPromise;
+    fetchPromise = (async () => {
+      try {
+        this._rangeFetches += 1;
+        const chunk = await fetchRangeChunk(fetcher, this.url, start, end, this._fetchInit);
+        this._rangeBytesFetched += sanitizeNonNegativeInt(chunk.bytes.byteLength, 0);
 
-      let payloadBytes;
-      if (chunk.status === 206) {
-        if (chunk.contentRange && chunk.contentRange.start !== start) {
-          throw new Error(
-            `WGPK ranged fetch mismatch for ${staticEntry.hashHex}: expected start byte ${start}, got ${chunk.contentRange.start}`
-          );
+        let payloadBytes;
+        if (chunk.status === 206) {
+          if (chunk.contentRange && chunk.contentRange.start !== start) {
+            throw new Error(
+              `WGPK ranged fetch mismatch for ${staticEntry.hashHex}: expected start byte ${start}, got ${chunk.contentRange.start}`
+            );
+          }
+          if (chunk.bytes.byteLength < length) {
+            throw new Error(
+              `WGPK ranged payload truncated for ${staticEntry.hashHex}: expected ${length} bytes, received ${chunk.bytes.byteLength}`
+            );
+          }
+          payloadBytes = chunk.bytes.subarray(0, length);
+        } else {
+          // Server returned 200 OK (entire pack) instead of 206 Partial Content.
+          const sliceEnd = start + length;
+          if (chunk.bytes.byteLength < sliceEnd) {
+            throw new Error(
+              `WGPK full response truncated for ${staticEntry.hashHex}: need byte range [${start}..${sliceEnd}), received ${chunk.bytes.byteLength} bytes`
+            );
+          }
+          payloadBytes = chunk.bytes.subarray(start, sliceEnd);
         }
-        if (chunk.bytes.byteLength < staticEntry.length) {
-          throw new Error(
-            `WGPK ranged payload truncated for ${staticEntry.hashHex}: expected ${staticEntry.length} bytes, received ${chunk.bytes.byteLength}`
-          );
+
+        const entryIdx =
+          staticEntry._index !== undefined ? staticEntry._index : staticEntry.hashHex;
+        const wgsl = decodeUtf8Strict(payloadBytes, entryIdx);
+        if (this._rangedDecodeCounter) {
+          this._rangedDecodeCounter.count += 1;
         }
-        payloadBytes = chunk.bytes.subarray(0, staticEntry.length);
-      } else {
-        // Server returned 200 OK (entire pack) instead of 206 Partial Content.
-        const sliceEnd = staticEntry.offset + staticEntry.length;
-        if (chunk.bytes.byteLength < sliceEnd) {
-          throw new Error(
-            `WGPK full response truncated for ${staticEntry.hashHex}: need byte range [${start}..${sliceEnd}), received ${chunk.bytes.byteLength} bytes`
-          );
+        this._putWgslCache(key, wgsl, length);
+        return wgsl;
+      } finally {
+        if (this._inFlightFetches.get(key) === fetchPromise) {
+          this._inFlightFetches.delete(key);
         }
-        payloadBytes = chunk.bytes.subarray(start, sliceEnd);
       }
-
-      const entryIdx =
-        staticEntry._index !== undefined ? staticEntry._index : staticEntry.hashHex;
-      const wgsl = decodeUtf8Strict(payloadBytes, entryIdx);
-      if (this._rangedDecodeCounter) {
-        this._rangedDecodeCounter.count += 1;
-      }
-      this._putWgslCache(key, wgsl, staticEntry.length);
-      return wgsl;
     })();
 
-    this._inFlight.set(key, fetchPromise);
-    try {
-      return await fetchPromise;
-    } finally {
-      this._inFlight.delete(key);
-    }
+    this._inFlightFetches.set(key, fetchPromise);
+    return fetchPromise;
   }
 
   /**
@@ -1154,6 +1177,16 @@ export class WgslPack {
       dynamicStageCounts[entry.stage] += 1;
     }
 
+    const rangeFetchCount = sanitizeNonNegativeInt(this._rangeFetches, 0);
+    const rangeBytesFetched = sanitizeNonNegativeInt(this._rangeBytesFetched, 0);
+    const cacheHits = sanitizeNonNegativeInt(this._cacheHits, 0);
+    const cacheMisses = sanitizeNonNegativeInt(this._cacheMisses, 0);
+    const cachedWgslBytes = sanitizeNonNegativeInt(this._cachedWgslBytes, 0);
+    const cachedWgslEntries = sanitizeNonNegativeInt(this._wgslCache.size, 0);
+    const lruEvictions = sanitizeNonNegativeInt(this._wgslCacheEvictions, 0);
+    const inFlightCoalesced = sanitizeNonNegativeInt(this._inFlightCoalesced, 0);
+    const inFlightCount = sanitizeNonNegativeInt(this._inFlightFetches.size, 0);
+
     return {
       version: this.version,
       flags: this.flags,
@@ -1171,14 +1204,19 @@ export class WgslPack {
       dynamicPayloadBytes,
       dynamicHits: this._dynamicHits,
       dynamicStageCounts,
-      rangeFetches: this._rangeFetches,
-      cacheHits: this._cacheHits,
-      cacheMisses: this._cacheMisses,
-      cachedWgslBytes: this._cachedWgslBytes,
-      cachedWgslEntries: this._wgslCache.size,
+      rangeFetches: rangeFetchCount,
+      rangeFetchCount,
+      rangeBytesFetched,
+      cacheHits,
+      cacheMisses,
+      cachedWgslBytes,
+      cachedWgslEntries,
       maxCachedWgslBytes: this._maxCachedWgslBytes,
-      wgslCacheEvictions: this._wgslCacheEvictions,
-      inFlightDeduplications: this._inFlightDeduplications,
+      wgslCacheEvictions: lruEvictions,
+      lruEvictions,
+      inFlightDeduplications: inFlightCoalesced,
+      inFlightCoalesced,
+      inFlightCount,
     };
   }
 
@@ -1352,8 +1390,14 @@ export function parseWgslPackIndex(indexBuffer, options = {}) {
   const maxCachedWgslBytes = validateMaxCachedWgslBytes(
     options ? options.maxCachedWgslBytes : undefined
   );
-  const initialRangeFetches =
-    options && typeof options.initialRangeFetches === 'number' ? options.initialRangeFetches : 0;
+  const initialRangeFetches = sanitizeNonNegativeInt(
+    options ? options.initialRangeFetches : 0,
+    0
+  );
+  const initialRangeBytesFetched = sanitizeNonNegativeInt(
+    options ? options.initialRangeBytesFetched : 0,
+    0
+  );
 
   return new WgslPack({
     version: header.version,
@@ -1373,6 +1417,7 @@ export function parseWgslPackIndex(indexBuffer, options = {}) {
     fetchInit: options ? options.fetchInit : undefined,
     maxCachedWgslBytes,
     initialRangeFetches,
+    initialRangeBytesFetched,
     wgslCache,
     rangedDecodeCounter,
   });
@@ -1397,6 +1442,7 @@ async function finishPackIndexFromInitialChunk(url, fetcher, initialChunk, optio
 
   let totalBytes = initialChunk.contentRange ? initialChunk.contentRange.total : null;
   let rangeFetches = 1;
+  let rangeBytesFetched = sanitizeNonNegativeInt(initialChunk.bytes.byteLength, 0);
 
   const header = parseWgpkHeader(initialChunk.bytes);
   const tableEnd = header.dataStart;
@@ -1426,6 +1472,8 @@ async function finishPackIndexFromInitialChunk(url, fetcher, initialChunk, optio
       if (remainder.status !== 206) {
         return parseWgslPack(remainder.bytes, { lazyDecode });
       }
+
+      rangeBytesFetched += sanitizeNonNegativeInt(remainder.bytes.byteLength, 0);
 
       if (remainder.contentRange) {
         if (remainder.contentRange.start !== have) {
@@ -1457,6 +1505,7 @@ async function finishPackIndexFromInitialChunk(url, fetcher, initialChunk, optio
     fetchInit: options.fetchInit,
     maxCachedWgslBytes,
     initialRangeFetches: rangeFetches,
+    initialRangeBytesFetched: rangeBytesFetched,
   });
 }
 
@@ -2684,25 +2733,29 @@ export class WgslPackCache {
 
     let totalPackBytes = 0;
     let rangeFetches = 0;
+    let rangeBytesFetched = 0;
     let cacheHits = 0;
     let cacheMisses = 0;
     let cachedWgslBytes = 0;
     let cachedWgslEntries = 0;
     let wgslCacheEvictions = 0;
     let inFlightDeduplications = 0;
+    let inFlightCount = 0;
     let hasBufferPack = false;
     let hasRangedPack = false;
     const packs = {};
     for (const [name, pack] of this._packs.entries()) {
       const s = pack.stats();
-      totalPackBytes += s.byteLength;
-      rangeFetches += s.rangeFetches;
-      cacheHits += s.cacheHits;
-      cacheMisses += s.cacheMisses;
-      cachedWgslBytes += s.cachedWgslBytes;
-      cachedWgslEntries += s.cachedWgslEntries;
-      wgslCacheEvictions += s.wgslCacheEvictions;
-      inFlightDeduplications += s.inFlightDeduplications;
+      totalPackBytes += sanitizeNonNegativeInt(s.byteLength, 0);
+      rangeFetches += sanitizeNonNegativeInt(s.rangeFetchCount, 0);
+      rangeBytesFetched += sanitizeNonNegativeInt(s.rangeBytesFetched, 0);
+      cacheHits += sanitizeNonNegativeInt(s.cacheHits, 0);
+      cacheMisses += sanitizeNonNegativeInt(s.cacheMisses, 0);
+      cachedWgslBytes += sanitizeNonNegativeInt(s.cachedWgslBytes, 0);
+      cachedWgslEntries += sanitizeNonNegativeInt(s.cachedWgslEntries, 0);
+      wgslCacheEvictions += sanitizeNonNegativeInt(s.lruEvictions, 0);
+      inFlightDeduplications += sanitizeNonNegativeInt(s.inFlightCoalesced, 0);
+      inFlightCount += sanitizeNonNegativeInt(s.inFlightCount, 0);
       if (s.mode === 'ranged') {
         hasRangedPack = true;
       } else {
@@ -2761,12 +2814,17 @@ export class WgslPackCache {
       dynamicHits: this._stats.dynamicHits,
       hitRate: totalLookups > 0 ? this._stats.hits / totalLookups : 0,
       rangeFetches,
+      rangeFetchCount: rangeFetches,
+      rangeBytesFetched,
       cacheHits,
       cacheMisses,
       cachedWgslBytes,
       cachedWgslEntries,
       wgslCacheEvictions,
+      lruEvictions: wgslCacheEvictions,
       inFlightDeduplications,
+      inFlightCoalesced: inFlightDeduplications,
+      inFlightCount,
       stageCounts,
       dynamicStageCounts,
       packs,
