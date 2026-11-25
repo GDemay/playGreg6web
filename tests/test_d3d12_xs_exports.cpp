@@ -2332,94 +2332,208 @@ void test_ring_reuse_waits_for_the_frame() {
     scene.release_all({list, fence});
 }
 
-// G66 (#691) fence completion latency: a queue signal's value is published (completed-value word,
-// GetCompletedValue) once the next frame has been presented, or after the cap; blocking waits
-// complete on the executed value and publish it.
+// G66 (#691) / G69 (#663, PR #1500) fence completion latency:
+// - Default (`fence_publish_lag_frames = 1`, `fence_publish_cap_ms = 33`): holds queue signals
+//   within the submitting frame's epoch to protect mid-frame upload-ring reads, then publishes on
+//   that frame's PresentX (unlocking 30+ FPS instead of stalling 2 presents / ~66 ms).
+// - Configurable `fence_publish_lag_frames = 2` retains the conservative 2-present lag.
+// - Configurable `fence_publish_lag_frames = 0` publishes at issue (same as --no-fence-lag).
+// - Blocking waits complete on the executed value and publish it at once.
 void test_fence_publish_lag() {
-    Fixture fx;
-    Scene scene(fx, /*register_shaders=*/true, /*name_back_buffer=*/false);
-    dg::Device* dev = host_device(scene.device);
-    CHECK(dev->fence_publish_lag());
-    const uint64_t list = scene.new_list();
-    const uint32_t vb_id = object_of<dg::Resource>(scene.vb)->id();
-    auto uploaded_first = [&](const std::vector<Packet>& ps) {
-        float v = std::numeric_limits<float>::quiet_NaN();
-        for (const Packet& p : ps) {
-            if (p.opcode == GpuOpcode::WriteBuffer && payload_as<GpuWriteBufferPayload>(p).id == vb_id &&
-                payload_as<GpuWriteBufferPayload>(p).dst_offset == 0) {
-                v = payload_as<float>(p, sizeof(GpuWriteBufferPayload));
+    // Part A: default behavior (lag_frames = 1, cap_ms = 33).
+    {
+        Fixture fx;
+        Scene scene(fx, /*register_shaders=*/true, /*name_back_buffer=*/false);
+        dg::Device* dev = host_device(scene.device);
+        CHECK(dev->fence_publish_lag());
+        CHECK(dev->fence_publish_lag_frames() == 1);
+        CHECK(dev->fence_publish_cap_ms() == 33);
+        const uint64_t list = scene.new_list();
+        const uint32_t vb_id = object_of<dg::Resource>(scene.vb)->id();
+        auto uploaded_first = [&](const std::vector<Packet>& ps) {
+            float v = std::numeric_limits<float>::quiet_NaN();
+            for (const Packet& p : ps) {
+                if (p.opcode == GpuOpcode::WriteBuffer && payload_as<GpuWriteBufferPayload>(p).id == vb_id &&
+                    payload_as<GpuWriteBufferPayload>(p).dst_offset == 0) {
+                    v = payload_as<float>(p, sizeof(GpuWriteBufferPayload));
+                }
             }
-        }
-        return v;
-    };
-    const uint64_t rt_slot = put<uint64_t>(scene.rt);
-    auto present = [&] {
-        dg::xbox::GuestPresentPlaneX plane{};
-        plane.ResourceCount = 1;
-        plane.ppResources = rt_slot;
-        CHECK(hr(fx.vcall(scene.queue, Slot::PresentX, {I(1), I(put(plane)), I(0)})) == 0);
-    };
-    int32_t result = -1;
-    const uint64_t fence = fx.create(scene.device, Slot::CreateFence, {I(0), I(0)}, dg::IID_ID3D12Fence, &result);
-    CHECK(result == 0 && fence != 0);
-    const uint64_t word = fx.vcall(fence, 12);  // Xbox slot 12: the completed-value word
-    CHECK(word != 0 && load64(word) == 0);
+            return v;
+        };
+        const uint64_t rt_slot = put<uint64_t>(scene.rt);
+        auto present = [&] {
+            dg::xbox::GuestPresentPlaneX plane{};
+            plane.ResourceCount = 1;
+            plane.ppResources = rt_slot;
+            CHECK(hr(fx.vcall(scene.queue, Slot::PresentX, {I(1), I(put(plane)), I(0)})) == 0);
+        };
+        int32_t result = -1;
+        const uint64_t fence = fx.create(scene.device, Slot::CreateFence, {I(0), I(0)}, dg::IID_ID3D12Fence, &result);
+        CHECK(result == 0 && fence != 0);
+        const uint64_t word = fx.vcall(fence, 12);  // Xbox slot 12: the completed-value word
+        CHECK(word != 0 && load64(word) == 0);
 
-    // 1. Ring reuse under polling: frame N signals 1 and presents; a worker polling the word reuses
-    // the ring once it sees 1. Frame N+1's submission (data written during N) must still upload
-    // its own data: 1 is published only once frame N+1 has been presented.
-    GuestThread worker{};
-    CHECK(create_guest_thread(fx.arena, 512 * 1024, worker));
-    std::atomic<bool> reused{false};
-    CHECK(hr(fx.vcall(scene.queue, Slot::QueueSignal, {I(fence), I(1)})) == 0);  // end of frame N
-    present();                                                                     // frame N
-    const float data = 111.0f;  // written during frame N for a list executed in frame N+1
-    CHECK(com::write_guest(scene.vb_cpu, &data, sizeof(data)));
-    std::thread poller([&] {
+        // 1. Mid-frame upload-ring protection + 1-present publish (30+ FPS):
+        // Frame N signals 1 mid-frame before its PresentX. While Frame N is still submitting later
+        // command lists (same epoch), 1 stays unpublished so a polling worker cannot overwrite the
+        // upload ring. As soon as Frame N's PresentX runs (epoch E -> E+1), 1 publishes at once.
+        GuestThread worker{};
+        CHECK(create_guest_thread(fx.arena, 512 * 1024, worker));
+        std::atomic<bool> reused{false};
+        CHECK(hr(fx.vcall(scene.queue, Slot::QueueSignal, {I(fence), I(1)})) == 0);  // mid-frame N (epoch E)
+        const float data = 111.0f;  // written during frame N for a later list in frame N
+        CHECK(com::write_guest(scene.vb_cpu, &data, sizeof(data)));
+        std::thread poller([&] {
+            const auto t0 = std::chrono::steady_clock::now();
+            while (load64(word) < 1 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5)) {
+                std::this_thread::yield();
+            }
+            const float next = 222.0f;
+            CHECK(com::write_guest(scene.vb_cpu, &next, sizeof(next)));
+            reused = true;
+        });
+        CHECK(!reused && load64(word) == 0 && hr(fx.vcall(fence, Slot::GetCompletedValue)) == 0);
+        scene.record(fx.thread, list);
+        size_t mark = fx.captured.size();
+        scene.execute({list});  // later list in frame N (still epoch E)
+        CHECK(uploaded_first(packets_since(fx, mark)) == 111.0f);
+        present();  // frame N presented (epoch E -> E+1): 1 is published immediately
+        poller.join();
+        CHECK(reused && load64(word) == 1 && fx.vcall(fence, Slot::GetCompletedValue) == 1);
+        CHECK(counter(dev, dg::xbox::Counter::FencePublishesByPresent) == 1);
+        CHECK(counter(dev, dg::xbox::Counter::FencePublishLagFrames) == 1);
+
+        // 2. A signal issued after Frame N's PresentX (already in epoch E+1) is held until Frame
+        // N+1's PresentX (epoch E+2) or the cap.
+        CHECK(hr(fx.vcall(scene.queue, Slot::QueueSignal, {I(fence), I(2)})) == 0);
+        CHECK(load64(word) == 1 && fx.vcall(fence, Slot::GetCompletedValue) == 1);
+        present();  // frame N+1 presented (epoch E+1 -> E+2): 2 is published
+        CHECK(load64(word) == 2 && fx.vcall(fence, Slot::GetCompletedValue) == 2);
+        CHECK(counter(dev, dg::xbox::Counter::FencePublishesByPresent) == 2);
+        CHECK(counter(dev, dg::xbox::Counter::FencePublishLagFrames) == 2);
+
+        // 3. A thread blocking on a value it later satisfies itself (CPU waits on the executed
+        // value): no deadlock, and the wait publishes the value at once (no present needed).
+        std::atomic<bool> woke{false};
+        std::thread blocker([&] {
+            CHECK(hr(fx.vcall_on(worker, fence, Slot::SetEventOnCompletion, {I(3), I(0)})) == 0);
+            woke = true;
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        CHECK(!woke);
+        CHECK(hr(fx.vcall(scene.queue, Slot::QueueSignal, {I(fence), I(3)})) == 0);
+        blocker.join();
+        CHECK(woke && load64(word) == 3 && counter(dev, dg::xbox::Counter::FencePublishesByWait) >= 1);
+
+        // 4. The cap (33 ms default) publishes with no presents.
+        CHECK(hr(fx.vcall(scene.queue, Slot::QueueSignal, {I(fence), I(4)})) == 0);
+        CHECK(load64(word) == 3);
         const auto t0 = std::chrono::steady_clock::now();
-        while (load64(word) < 1 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5)) {
-            std::this_thread::yield();
+        while (load64(word) < 4 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(2)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
-        const float next = 222.0f;
-        CHECK(com::write_guest(scene.vb_cpu, &next, sizeof(next)));
-        reused = true;
-    });
-    CHECK(!reused && load64(word) == 0 && hr(fx.vcall(fence, Slot::GetCompletedValue)) == 0);
-    scene.record(fx.thread, list);
-    size_t mark = fx.captured.size();
-    scene.execute({list});  // frame N+1
-    CHECK(uploaded_first(packets_since(fx, mark)) == 111.0f);
-    present();  // frame N+1 presented: 1 is published
-    poller.join();
-    CHECK(reused && load64(word) == 1);
-    CHECK(counter(dev, dg::xbox::Counter::FencePublishesByPresent) == 1);
+        CHECK(load64(word) == 4 && counter(dev, dg::xbox::Counter::FencePublishesByCap) == 1);
+        CHECK(std::chrono::steady_clock::now() - t0 >= std::chrono::milliseconds(20));
 
-    // 2. A thread blocking on a value it later satisfies itself (CPU waits on the executed value):
-    // no deadlock, and the wait publishes the value at once (no present needed).
-    std::atomic<bool> woke{false};
-    std::thread blocker([&] {
-        CHECK(hr(fx.vcall_on(worker, fence, Slot::SetEventOnCompletion, {I(2), I(0)})) == 0);
-        woke = true;
-    });
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    CHECK(!woke);
-    CHECK(hr(fx.vcall(scene.queue, Slot::QueueSignal, {I(fence), I(2)})) == 0);
-    blocker.join();
-    CHECK(woke && load64(word) == 2 && counter(dev, dg::xbox::Counter::FencePublishesByWait) >= 1);
-
-    // 3. The cap publishes with no presents.
-    CHECK(hr(fx.vcall(scene.queue, Slot::QueueSignal, {I(fence), I(3)})) == 0);
-    CHECK(load64(word) == 2);
-    const auto t0 = std::chrono::steady_clock::now();
-    while (load64(word) < 3 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(2)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        destroy_guest_thread(fx.arena, worker);
+        CHECK(t_balanced);
+        scene.release_all({list, fence});
     }
-    CHECK(load64(word) == 3 && counter(dev, dg::xbox::Counter::FencePublishesByCap) == 1);
-    CHECK(std::chrono::steady_clock::now() - t0 >= std::chrono::milliseconds(50));
 
-    destroy_guest_thread(fx.arena, worker);
-    CHECK(t_balanced);
-    scene.release_all({list, fence});
+    // Part B: configurable override `fence_publish_lag_frames = 2` (conservative 2-present lag).
+    {
+        Fixture fx;
+        dg::DeviceOptions options;
+        options.sink = [&fx](const uint8_t* data, size_t size) { fx.captured.emplace_back(data, data + size); };
+        options.fence_publish_lag = true;
+        options.fence_publish_lag_frames = 2;
+        options.fence_publish_cap_ms = 500;
+        dx::set_device_options(options);
+        Scene scene(fx, /*register_shaders=*/true, /*name_back_buffer=*/false);
+        dg::Device* dev = host_device(scene.device);
+        CHECK(dev->fence_publish_lag() && dev->fence_publish_lag_frames() == 2);
+        const uint64_t list = scene.new_list();
+        const uint32_t vb_id = object_of<dg::Resource>(scene.vb)->id();
+        auto uploaded_first = [&](const std::vector<Packet>& ps) {
+            float v = std::numeric_limits<float>::quiet_NaN();
+            for (const Packet& p : ps) {
+                if (p.opcode == GpuOpcode::WriteBuffer && payload_as<GpuWriteBufferPayload>(p).id == vb_id &&
+                    payload_as<GpuWriteBufferPayload>(p).dst_offset == 0) {
+                    v = payload_as<float>(p, sizeof(GpuWriteBufferPayload));
+                }
+            }
+            return v;
+        };
+        const uint64_t rt_slot = put<uint64_t>(scene.rt);
+        auto present = [&] {
+            dg::xbox::GuestPresentPlaneX plane{};
+            plane.ResourceCount = 1;
+            plane.ppResources = rt_slot;
+            CHECK(hr(fx.vcall(scene.queue, Slot::PresentX, {I(1), I(put(plane)), I(0)})) == 0);
+        };
+        int32_t result = -1;
+        const uint64_t fence = fx.create(scene.device, Slot::CreateFence, {I(0), I(0)}, dg::IID_ID3D12Fence, &result);
+        CHECK(result == 0 && fence != 0);
+        const uint64_t word = fx.vcall(fence, 12);
+        CHECK(word != 0 && load64(word) == 0);
+
+        std::atomic<bool> reused{false};
+        CHECK(hr(fx.vcall(scene.queue, Slot::QueueSignal, {I(fence), I(1)})) == 0);  // frame N
+        present();  // frame N presented (epoch 0 -> 1): held under lag_frames = 2
+        const float data = 111.0f;
+        CHECK(com::write_guest(scene.vb_cpu, &data, sizeof(data)));
+        std::thread poller([&] {
+            const auto t0 = std::chrono::steady_clock::now();
+            while (load64(word) < 1 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5)) {
+                std::this_thread::yield();
+            }
+            const float next = 222.0f;
+            CHECK(com::write_guest(scene.vb_cpu, &next, sizeof(next)));
+            reused = true;
+        });
+        CHECK(!reused && load64(word) == 0 && fx.vcall(fence, Slot::GetCompletedValue) == 0);
+        scene.record(fx.thread, list);
+        size_t mark = fx.captured.size();
+        scene.execute({list});  // frame N+1
+        CHECK(uploaded_first(packets_since(fx, mark)) == 111.0f);
+        present();  // frame N+1 presented (epoch 1 -> 2): 1 is published
+        poller.join();
+        CHECK(reused && load64(word) == 1);
+        CHECK(counter(dev, dg::xbox::Counter::FencePublishesByPresent) == 1);
+        CHECK(counter(dev, dg::xbox::Counter::FencePublishLagFrames) == 2);
+
+        CHECK(t_balanced);
+        scene.release_all({list, fence});
+    }
+
+    // Part C: configurable override `fence_publish_lag_frames = 0` publishes immediately at issue.
+    {
+        Fixture fx;
+        dg::DeviceOptions options;
+        options.sink = [&fx](const uint8_t* data, size_t size) { fx.captured.emplace_back(data, data + size); };
+        options.fence_publish_lag = true;
+        options.fence_publish_lag_frames = 0;
+        dx::set_device_options(options);
+        const uint64_t device = fx.create_device();
+        dg::Device* dev = host_device(device);
+        CHECK(!dev->fence_publish_lag() && dev->fence_publish_lag_frames() == 0);
+        int32_t result = -1;
+        const uint64_t queue =
+            fx.create(device, Slot::CreateCommandQueue, {I(put(dg::GuestCommandQueueDesc{}))}, dg::IID_ID3D12CommandQueue, &result);
+        CHECK(result == 0 && queue != 0);
+        const uint64_t fence = fx.create(device, Slot::CreateFence, {I(0), I(0)}, dg::IID_ID3D12Fence, &result);
+        CHECK(result == 0 && fence != 0);
+        const uint64_t word = fx.vcall(fence, 12);
+        CHECK(word != 0 && load64(word) == 0);
+        CHECK(hr(fx.vcall(queue, Slot::QueueSignal, {I(fence), I(1)})) == 0);
+        CHECK(load64(word) == 1 && fx.vcall(fence, Slot::GetCompletedValue) == 1);
+        CHECK(counter(dev, dg::xbox::Counter::FencePublishesByPresent) == 0);
+        CHECK(counter(dev, dg::xbox::Counter::FencePublishesByCap) == 0);
+        fx.vcall(fence, Slot::Release);
+        fx.vcall(queue, Slot::Release);
+        fx.vcall(device, Slot::Release);
+        CHECK(t_balanced);
+    }
 }
 
 void test_present_alternating_back_buffers() {

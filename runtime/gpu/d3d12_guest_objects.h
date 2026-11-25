@@ -611,16 +611,21 @@ struct DeviceOptions {
     std::shared_ptr<const StageReflectionIndex> stage_reflection;
     // Optional detiling hook for tiled console layouts (layout >= 0x101).
     DetileFn detile_texture;
-    // Fence completion latency (G66, #691): a queue Signal's value is published (the fence's
-    // completed-value word and GetCompletedValue) only once the next frame has been presented, as
-    // a GPU running about a frame behind the CPU would, or after `fence_publish_cap_ms` without
-    // that. Titles that write upload-ring data a frame ahead retire ring regions on the published
-    // value; this runtime reads that memory at ExecuteCommandLists, so a value published at issue
-    // lets them overwrite data a later submission still has to read. Blocking waits (fence events,
-    // a null-event SetEventOnCompletion, queue Wait) for an executed value complete at once and
-    // publish it. Off: values are published at issue. Boot harness: --no-fence-lag turns it off.
+    // Fence completion latency (G66, #691; G69, #663 / PR #1500): a queue Signal's value is
+    // published (the fence's completed-value word and GetCompletedValue) once `present_epoch` has
+    // advanced by `fence_publish_lag_frames` presents (default 1: on the frame's own PresentX,
+    // after all of its ExecuteCommandLists have already snapshotted upload-ring memory), or after
+    // `fence_publish_cap_ms` without a present (default 33 ms, one 30 Hz frame). Holding signals
+    // within the submitting frame's epoch prevents mid-frame overwrites between earlier and later
+    // ExecuteCommandLists, while publishing on that frame's PresentX avoids the 2-present (~66 ms)
+    // 15 FPS stall when the render worker polls the completed-value word. Set
+    // `fence_publish_lag_frames = 2` for the conservative next-frame lag, or `0` /
+    // `fence_publish_lag = false` (boot harness: --no-fence-lag) to publish at issue. Blocking
+    // waits (fence events, a null-event SetEventOnCompletion, queue Wait) for an executed value
+    // complete at once and publish it.
     bool fence_publish_lag = true;
-    uint32_t fence_publish_cap_ms = 100;
+    uint32_t fence_publish_lag_frames = 1;
+    uint32_t fence_publish_cap_ms = 33;
     // Lazy GPU objects (G66, #1077): a guest resource's CreateBuffer / CreateTexture2 packet is held
     // until the first submission that references its id (a bind group entry, render pass attachment,
     // vertex / index buffer, WriteBuffer / WriteTexture) and written right before that packet; a
@@ -776,7 +781,11 @@ public:
     static constexpr uint32_t kInfiniteFrameWait = 0xFFFFFFFFu;
     // Fence completion latency (DeviceOptions::fence_publish_lag): fences with pending queue
     // signals, the present epoch (PresentX count) and the publisher.
-    bool fence_publish_lag() const { return options_.fence_publish_lag; }
+    bool fence_publish_lag() const { return options_.fence_publish_lag && options_.fence_publish_lag_frames > 0; }
+    uint32_t fence_publish_lag_frames() const {
+        return options_.fence_publish_lag ? options_.fence_publish_lag_frames : 0u;
+    }
+    uint32_t fence_publish_cap_ms() const { return options_.fence_publish_cap_ms; }
     uint64_t present_epoch() const { return present_epoch_.load(std::memory_order_acquire); }
     void register_lag_fence(Fence* fence);
     void unregister_lag_fence(Fence* fence);
@@ -1301,10 +1310,10 @@ public:
     void signal_from_queue(uint64_t value, uint64_t present_epoch);
     // The executed value (what has really been handed off), and the published one.
     uint64_t executed_value() const { return value_.load(std::memory_order_acquire); }
-    // Publishes the pending queue signals the rule admits: signalled at an epoch at least two below
-    // `present_epoch` (the next frame has been presented), or older than `cap`. Returns the number
-    // of values published by the epoch rule and by the cap.
-    void publish_due(uint64_t present_epoch, std::chrono::steady_clock::time_point now,
+    // Publishes the pending queue signals the rule admits: signalled at an epoch at least
+    // `min_lag_frames` below `present_epoch` (default 1: the frame's own PresentX), or older than
+    // `cap`. Accumulates the counts published by present/cap and the total elapsed presents.
+    void publish_due(uint64_t present_epoch, uint32_t min_lag_frames, std::chrono::steady_clock::time_point now,
                      std::chrono::milliseconds cap, uint64_t* by_present, uint64_t* by_cap, uint64_t* lag_frames);
     // Publishes `value` (if executed) because a blocking wait needs it; true when it was pending.
     bool publish_for_wait(uint64_t value);
