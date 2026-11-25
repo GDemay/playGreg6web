@@ -208,6 +208,31 @@
     }
   }
 
+  function sanitizeNonNegativeCounter(value) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+      return 0;
+    }
+    return Math.floor(value);
+  }
+
+  function clampUnitRate(numerator, denominator) {
+    if (
+      typeof numerator !== 'number' ||
+      typeof denominator !== 'number' ||
+      !Number.isFinite(numerator) ||
+      !Number.isFinite(denominator) ||
+      denominator <= 0 ||
+      numerator <= 0
+    ) {
+      return 0;
+    }
+    const rate = numerator / denominator;
+    if (!Number.isFinite(rate) || rate <= 0) {
+      return 0;
+    }
+    return rate >= 1 ? 1 : rate;
+  }
+
   /**
    * Resolve the effective 2D texture dimension limit from a WebGPU device,
    * defaulting to `8192` when `device.limits.maxTextureDimension2D` is absent.
@@ -972,6 +997,7 @@
       // Telemetry counters
       this._hits = 0;
       this._misses = 0;
+      this._transientReuseCount = 0;
       this._viewsCached = 0;
       this._viewCacheHits = 0;
       this._viewCacheMisses = 0;
@@ -981,6 +1007,7 @@
       this._evictions = 0;
       this._budgetEvictions = 0;
       this._idleEvictions = 0;
+      this._oversizedEvictions = 0;
       this._leakedReleases = 0;
       this._dimensionClampCount = 0;
       this._formatNormalizeCount = 0;
@@ -1156,10 +1183,14 @@
       throw new TypeError(`${methodName}() requires an acquired entry object or numeric id`);
     }
 
+    _isOversizedRecord(record) {
+      return Boolean(record && record.byteSize >= this._oversizedTargetBytes);
+    }
+
     _effectiveIdleTtlForRecord(record) {
       if (
         this._oversizedIdleFrameTtl !== null &&
-        record.byteSize >= this._oversizedTargetBytes
+        this._isOversizedRecord(record)
       ) {
         return Math.min(this._idleFrameTtl, this._oversizedIdleFrameTtl);
       }
@@ -1172,6 +1203,9 @@
       this._idleBytes = Math.max(0, this._idleBytes - record.byteSize);
       if (this._destroyRecord(record)) {
         this._evictions += 1;
+        if (this._isOversizedRecord(record)) {
+          this._oversizedEvictions += 1;
+        }
         if (reason === 'budget') {
           this._budgetEvictions += 1;
         } else if (reason === 'idle') {
@@ -1320,6 +1354,9 @@
       this._activeBytes = Math.max(0, this._activeBytes - record.byteSize);
       if (this._destroyRecord(record)) {
         this._evictions += 1;
+        if (this._isOversizedRecord(record)) {
+          this._oversizedEvictions += 1;
+        }
         return true;
       }
       return false;
@@ -1418,6 +1455,9 @@
             this._idleBytes = Math.max(0, this._idleBytes - record.byteSize);
             if (this._destroyRecord(record)) {
               this._evictions += 1;
+              if (this._isOversizedRecord(record)) {
+                this._oversizedEvictions += 1;
+              }
             }
             continue;
           }
@@ -1432,6 +1472,7 @@
           this._idleBytes = Math.max(0, this._idleBytes - record.byteSize);
           this._activeBytes += record.byteSize;
           this._hits += 1;
+          this._transientReuseCount += 1;
           if (record.view !== null) {
             this._viewCacheHits += 1;
           }
@@ -1797,46 +1838,92 @@
      * Return pool hit-rate, occupancy, memory, sanitization, and lifecycle telemetry.
      */
     getStats() {
-      const totalRequests = this._hits + this._misses;
-      const totalBytes = this._activeBytes + this._idleBytes;
-      const hitRate = totalRequests > 0 ? this._hits / totalRequests : 0;
+      const poolHits = sanitizeNonNegativeCounter(this._hits);
+      const poolMisses = sanitizeNonNegativeCounter(this._misses);
+      const totalRequests = poolHits + poolMisses;
+      const hitRate = clampUnitRate(poolHits, totalRequests);
+
+      const viewCacheHits = sanitizeNonNegativeCounter(this._viewCacheHits);
+      const viewCacheMisses = sanitizeNonNegativeCounter(this._viewCacheMisses);
+      const viewCacheHitRate = clampUnitRate(viewCacheHits, viewCacheHits + viewCacheMisses);
+
+      const activeBytes = sanitizeNonNegativeCounter(this._activeBytes);
+      const idleBytes = sanitizeNonNegativeCounter(this._idleBytes);
+      const totalBytes = activeBytes + idleBytes;
+      const peakVramBytes = Math.max(totalBytes, sanitizeNonNegativeCounter(this._peakBytes));
+
+      const evictions = sanitizeNonNegativeCounter(this._evictions);
+      const budgetEvictions = sanitizeNonNegativeCounter(this._budgetEvictions);
+      const idleEvictions = sanitizeNonNegativeCounter(this._idleEvictions);
+      const oversizedEvictions = sanitizeNonNegativeCounter(this._oversizedEvictions);
+      const transientReuseCount = sanitizeNonNegativeCounter(this._transientReuseCount);
+
       return {
-        hits: this._hits,
-        misses: this._misses,
-        poolHits: this._hits,
-        poolMisses: this._misses,
-        viewsCached: this._viewsCached,
-        viewCacheHits: this._viewCacheHits,
-        viewCacheMisses: this._viewCacheMisses,
+        hits: poolHits,
+        misses: poolMisses,
+        poolHits,
+        poolMisses,
+        transientReuseCount,
+        viewsCached: sanitizeNonNegativeCounter(this._viewsCached),
+        viewCacheHits,
+        viewCacheMisses,
+        viewCacheHitRate,
         hitRate,
         reuseRatio: hitRate,
         activeCount: this._activeEntries.size,
         idleCount: this._idleLru.size,
         activeTargets: this._activeEntries.size,
         idleTargets: this._idleLru.size,
-        activeBytes: this._activeBytes,
-        idleBytes: this._idleBytes,
+        activeBytes,
+        idleBytes,
         totalBytes,
         estimatedBytes: totalBytes,
         estimatedVramBytes: totalBytes,
-        peakBytes: this._peakBytes,
-        peakPooledBytes: this._peakBytes,
-        peakEstimatedBytes: this._peakBytes,
-        peakVramBytes: this._peakBytes,
+        peakBytes: peakVramBytes,
+        peakPooledBytes: peakVramBytes,
+        peakEstimatedBytes: peakVramBytes,
+        peakVramBytes,
         maxPoolBytes: this._maxPoolBytes,
         idleFrameTtl: this._idleFrameTtl,
         oversizedTargetBytes: this._oversizedTargetBytes,
         oversizedIdleFrameTtl: this._oversizedIdleFrameTtl,
-        evictions: this._evictions,
-        budgetEvictions: this._budgetEvictions,
-        idleEvictions: this._idleEvictions,
-        leakedReleases: this._leakedReleases,
-        dimensionClampCount: this._dimensionClampCount,
-        formatNormalizeCount: this._formatNormalizeCount,
-        sampleCountNormalizeCount: this._sampleCountNormalizeCount,
+        evictions,
+        budgetEvictions,
+        idleEvictions,
+        oversizedEvictions,
+        leakedReleases: sanitizeNonNegativeCounter(this._leakedReleases),
+        dimensionClampCount: sanitizeNonNegativeCounter(this._dimensionClampCount),
+        formatNormalizeCount: sanitizeNonNegativeCounter(this._formatNormalizeCount),
+        sampleCountNormalizeCount: sanitizeNonNegativeCounter(this._sampleCountNormalizeCount),
         maxTextureDimension2D: this._effectiveMaxTextureDimension2D(),
-        currentFrame: this._currentFrame,
+        currentFrame: sanitizeNonNegativeCounter(this._currentFrame),
       };
+    }
+
+    /**
+     * Reset cumulative telemetry counters while preserving live pooled GPUTextures,
+     * cached GPUTextureViews, active/idle occupancy, and frame/TTL aging state.
+     * Re-baselines `peakVramBytes` (and peak aliases) to current live VRAM occupancy
+     * so `peakVramBytes >= estimatedVramBytes` always holds.
+     */
+    resetStats() {
+      this._hits = 0;
+      this._misses = 0;
+      this._transientReuseCount = 0;
+      this._viewCacheHits = 0;
+      this._viewCacheMisses = 0;
+      this._peakBytes =
+        sanitizeNonNegativeCounter(this._activeBytes) +
+        sanitizeNonNegativeCounter(this._idleBytes);
+      this._evictions = 0;
+      this._budgetEvictions = 0;
+      this._idleEvictions = 0;
+      this._oversizedEvictions = 0;
+      this._leakedReleases = 0;
+      this._dimensionClampCount = 0;
+      this._formatNormalizeCount = 0;
+      this._sampleCountNormalizeCount = 0;
+      return this.getStats();
     }
 
     /**
