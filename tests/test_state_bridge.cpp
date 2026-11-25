@@ -2941,6 +2941,127 @@ void test_vertex_mixed_storage_and_attachment_alias() {
     CHECK(list2.stats().storage_views_attachment_alias >= 1 && list2.stats().storage_conversions == 0);
 }
 
+// #691: a glyph atlas (A8_UNORM, console linear, widened to rgba8) the title fills a few glyphs at a
+// time uploads only the changed bands of kUploadBandRows rows, not the whole texture per glyph.
+void test_banded_texture_upload() {
+    namespace com = playgta6::guest::com;
+    namespace dg = playgta6::gpu::d3d12_guest;
+    namespace gfx10 = playgta6::gpu::gfx10;
+
+    os::VirtualMemoryArena arena;
+    com::reset_com_bridge();
+    com::set_guest_memory(&arena);
+    {
+        dg::DeviceOptions dev_opts;
+        dev_opts.sink = [](const uint8_t*, size_t) {};
+        auto device = com::create_object<dg::Device>(com::implements(dg::kID3D12Device), dev_opts);
+        CHECK(device);
+        device->initialize_guest_payload();
+
+        constexpr uint32_t kW = 256, kH = 256, kBand = dg::kUploadBandRows;
+        static_assert(kH == 4 * kBand, "four bands");
+        gfx10::TextureLayoutDesc g{};
+        g.dxgi_format = 65;  // A8_UNORM
+        g.width = kW;
+        g.height = kH;
+        g.mip_levels = 1;
+        g.d3d12_layout = 0x100;
+        const size_t surface_size = gfx10::surface_bytes(g);
+        CHECK(surface_size != 0 && surface_size <= (1u << 20));
+        std::vector<uint8_t> texels(size_t{kW} * kH, 0);
+        std::vector<uint8_t> surface(surface_size, 0);
+        const uint64_t mem = arena.virtual_alloc(0, 1u << 20, os::kMemReserve | os::kMemCommit, os::PageProtect::ReadWrite);
+        auto glyph = [&](uint32_t y0, uint32_t rows, uint8_t v) {
+            for (uint32_t y = y0; y < y0 + rows; ++y) {
+                for (uint32_t x = 10; x < 20; ++x) {
+                    texels[size_t{y} * kW + x] = v;
+                }
+            }
+            CHECK(gfx10::tile_surface_subresource(g, 0, 0, texels.data(), texels.size(), surface.data(), surface.size()));
+            CHECK(com::write_guest(mem, surface.data(), surface.size()));
+        };
+
+        dg::GuestResourceDesc d{};
+        d.Dimension = dg::ResourceDimension::Texture2D;
+        d.Width = kW;
+        d.Height = kH;
+        d.DepthOrArraySize = 1;
+        d.MipLevels = 1;
+        d.Format = 65;
+        d.SampleCount = 1;
+        d.Layout = 0x100;
+        dg::Resource::Placement pl{};
+        pl.address = mem;
+        auto tex = com::create_object<dg::Resource>(com::implements(dg::kID3D12Resource), dg::device_ref(device.get()),
+                                                    d, pl, 0u);
+        CHECK(tex && tex->initialize());
+
+        auto writes = [](const gpu::CommandEncoder& enc) {
+            std::vector<Packet> out;
+            for (const Packet& pk : decode(enc)) {
+                if (pk.opcode == GpuOpcode::WriteTexture) {
+                    out.push_back(pk);
+                }
+            }
+            return out;
+        };
+        // Every row of a write holds the widened texels (0, 0, 0, a) of its rows.
+        auto check_rows = [&](const Packet& pk, uint32_t y0, uint32_t rows) {
+            const auto wt = pod<GpuWriteTexturePayload>(pk);
+            CHECK(wt.texture_id == tex->id() && wt.origin_x == 0 && wt.origin_y == y0 && wt.width == kW &&
+                  wt.height == rows && wt.bytes_per_row == kW * 4u && wt.rows_per_image == rows);
+            bool same = pk.payload.size() >= sizeof(GpuWriteTexturePayload) + size_t{rows} * kW * 4u;
+            for (uint32_t y = 0; same && y < rows; ++y) {
+                const uint8_t* row = pk.payload.data() + sizeof(GpuWriteTexturePayload) + size_t{y} * kW * 4u;
+                for (uint32_t x = 0; same && x < kW; ++x) {
+                    same = row[x * 4u] == 0 && row[x * 4u + 1] == 0 && row[x * 4u + 2] == 0 &&
+                           row[x * 4u + 3] == texels[size_t{y0 + y} * kW + x];
+                }
+            }
+            CHECK(same);
+        };
+
+        // First glyph: the whole texture (never uploaded before).
+        glyph(2, 12, 200);
+        gpu::CommandEncoder e1;
+        CHECK(device->sync_bound_texture_memory(tex->id(), e1));
+        const auto w1 = writes(e1);
+        CHECK(w1.size() == 1);
+        if (w1.size() == 1) {
+            check_rows(w1[0], 0, kH);
+        }
+
+        // A glyph inside the second band: that band only.
+        glyph(kBand + 6, 12, 150);
+        gpu::CommandEncoder e2;
+        CHECK(device->sync_bound_texture_memory(tex->id(), e2));
+        const auto w2 = writes(e2);
+        CHECK(w2.size() == 1);
+        if (w2.size() == 1) {
+            check_rows(w2[0], kBand, kBand);
+        }
+
+        // One glyph across bands 2 and 3 plus one in band 0: two writes, the adjacent bands merged.
+        glyph(3 * kBand - 4, 8, 90);
+        glyph(30, 4, 60);
+        gpu::CommandEncoder e3;
+        CHECK(device->sync_bound_texture_memory(tex->id(), e3));
+        const auto w3 = writes(e3);
+        CHECK(w3.size() == 2);
+        if (w3.size() == 2) {
+            check_rows(w3[0], 0, kBand);
+            check_rows(w3[1], 2 * kBand, 2 * kBand);
+        }
+
+        // Steady state: nothing.
+        gpu::CommandEncoder e4;
+        CHECK(!device->sync_bound_texture_memory(tex->id(), e4));
+        CHECK(writes(e4).empty());
+    }
+    com::reset_com_bridge();
+    com::set_guest_memory(nullptr);
+}
+
 int main() {
     test_content_hash_change_detection();
     test_storage_texture_format_conversion();
@@ -2965,6 +3086,7 @@ int main() {
     test_concurrent_command_lists();
     test_dirty_texture_memory_upload();
     test_all_subresource_uploads();
+    test_banded_texture_upload();
     test_bc_texture_upload_needs_feature();
     test_norm16_address_texture_upload();
     test_fence_completion_and_ref_lifetime();

@@ -805,12 +805,16 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     }
 
     // Stage every placed subresource; only those whose texels changed since their last upload
-    // are written (per-subresource dirty tracking), so one changed mip costs one upload.
+    // are written (per-subresource dirty tracking), so one changed mip costs one upload. Inside a
+    // 2D subresource only the changed bands of kUploadBandRows block rows are written (#691: a
+    // glyph atlas the title fills a few glyphs at a time re-uploaded 16 MiB per new glyph).
     struct Staged {
         Sub sub;
         uint32_t copy_w, copy_h, copy_d, row_pitch, rows;
         uint64_t hash;
         std::vector<uint8_t> bytes;
+        std::vector<uint64_t> bands;  // hash per band of kUploadBandRows rows (2D only; empty: none)
+        std::vector<std::pair<uint32_t, uint32_t>> runs;  // block rows [first, first + count) to write
     };
     std::vector<Staged> staged;
     for (const Sub& sub : subs) {
@@ -884,7 +888,15 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
             st.bytes = std::move(converted);
             st.row_pitch = static_cast<uint32_t>(out_pitch);
         }
-        st.hash = content_hash(st.bytes.data(), st.bytes.size());
+        if (st.copy_d == 1u && st.rows > kUploadBandRows) {
+            for (uint32_t r = 0; r < st.rows; r += kUploadBandRows) {
+                const uint32_t n = std::min(kUploadBandRows, st.rows - r);
+                st.bands.push_back(content_hash(st.bytes.data() + size_t{r} * st.row_pitch, size_t{n} * st.row_pitch));
+            }
+            st.hash = content_hash(st.bands.data(), st.bands.size() * sizeof(uint64_t));
+        } else {
+            st.hash = content_hash(st.bytes.data(), st.bytes.size());
+        }
         staged.push_back(std::move(st));
     }
 
@@ -901,13 +913,34 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         cur.last_upload_hash = hash;
         cur.ever_uploaded = true;
         cur.subresource_hashes.resize(size_t{mips} * layers, 0);
+        cur.subresource_bands.resize(size_t{mips} * layers);
         auto out = staged.begin();
         for (Staged& st : staged) {
-            uint64_t& seen = cur.subresource_hashes[st.sub.mip + size_t{st.sub.slice} * mips];
+            const size_t index = st.sub.mip + size_t{st.sub.slice} * mips;
+            uint64_t& seen = cur.subresource_hashes[index];
             const bool zero = all_zero_bytes(st.bytes.data(), st.bytes.size());
             if (seen == st.hash || (seen == 0 && zero)) {
                 continue;  // unchanged, or still zero as the GPU texture was created
             }
+            std::vector<uint64_t>& prev = cur.subresource_bands[index];
+            if (seen != 0 && !st.bands.empty() && prev.size() == st.bands.size()) {
+                for (uint32_t b = 0; b < st.bands.size(); ++b) {
+                    if (prev[b] == st.bands[b]) {
+                        continue;
+                    }
+                    const uint32_t first = b * kUploadBandRows;
+                    const uint32_t count = std::min(kUploadBandRows, st.rows - first);
+                    if (!st.runs.empty() && st.runs.back().first + st.runs.back().second == first) {
+                        st.runs.back().second += count;  // adjacent changed bands: one write
+                    } else {
+                        st.runs.emplace_back(first, count);
+                    }
+                }
+            }
+            if (st.runs.empty()) {
+                st.runs.emplace_back(0u, st.rows);
+            }
+            prev = st.bands;
             seen = st.hash;
             if (&*out != &st) {
                 *out = std::move(st);
@@ -918,11 +951,17 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     }
 
     for (const Staged& st : staged) {
-        encoder.write_texture(resource_id, st.sub.mip, 0u, 0u, st.sub.slice, st.copy_w, st.copy_h, st.copy_d,
-                              st.row_pitch, st.rows, st.bytes.data(), static_cast<uint32_t>(st.bytes.size()));
-        count_work(Work::TextureUploads);
-        note_upload(st.bytes.size());
-        note_texture_upload();
+        for (const auto& [first, count] : st.runs) {
+            const uint32_t bh = st.copy_h / st.rows;  // block height (copy_h is whole blocks)
+            const uint8_t* data = st.bytes.data() + size_t{first} * st.row_pitch;
+            const uint32_t len = static_cast<uint32_t>(
+                count == st.rows ? st.bytes.size() : size_t{count} * st.row_pitch);
+            encoder.write_texture(resource_id, st.sub.mip, 0u, first * bh, st.sub.slice, st.copy_w, count * bh,
+                                  st.copy_d, st.row_pitch, count, data, len);
+            count_work(Work::TextureUploads);
+            note_upload(len);
+            note_texture_upload();
+        }
     }
     return !staged.empty();
 }
