@@ -467,6 +467,45 @@ struct ScopedDStorageWorkerThreads {
     ScopedDStorageWorkerThreads& operator=(const ScopedDStorageWorkerThreads&) = delete;
 };
 
+constexpr uint64_t kMaxShaderPackTocBytes = 64ULL * 1024 * 1024;
+
+enum class ExactReadStatus {
+    Ok,
+    IoError,
+    UnexpectedEof,
+};
+
+ExactReadStatus read_exact_from_handle(const WasmBootConfig& cfg,
+                                       int32_t handle,
+                                       uint64_t offset,
+                                       uint8_t* dst,
+                                       size_t want_bytes,
+                                       size_t* bytes_read_out = nullptr) {
+    const size_t chunk = cfg.read_chunk_bytes == 0 ? 65536 : cfg.read_chunk_bytes;
+    size_t got_total = 0;
+    while (got_total < want_bytes) {
+        const size_t step = std::min(chunk, want_bytes - got_total);
+        const int64_t n = read_path(cfg, handle, offset + got_total, dst + got_total, step);
+        if (n < 0 || static_cast<uint64_t>(n) > step) {
+            if (bytes_read_out != nullptr) {
+                *bytes_read_out = got_total;
+            }
+            return ExactReadStatus::IoError;
+        }
+        if (n == 0) {
+            if (bytes_read_out != nullptr) {
+                *bytes_read_out = got_total;
+            }
+            return ExactReadStatus::UnexpectedEof;
+        }
+        got_total += static_cast<size_t>(n);
+    }
+    if (bytes_read_out != nullptr) {
+        *bytes_read_out = got_total;
+    }
+    return ExactReadStatus::Ok;
+}
+
 bool try_load_shader_pack(const WasmBootConfig& cfg,
                           const std::string& path,
                           bool is_fallback,
@@ -474,14 +513,67 @@ bool try_load_shader_pack(const WasmBootConfig& cfg,
     if (path.empty()) {
         return false;
     }
-    std::vector<uint8_t> bytes;
-    std::string read_error;
-    if (!load_file_via_httpfs(cfg, path, bytes, read_error)) {
+
+    const int32_t handle = open_path(cfg, path);
+    if (handle < 0) {
         return false;
     }
-    auto index = std::make_shared<gpu::ShaderPackIndex>();
+    HandleCloser closer(cfg, handle);
+
+    uint8_t header[gpu::kShaderPackHeaderBytes]{};
+    size_t header_got = 0;
+    const ExactReadStatus header_status = read_exact_from_handle(
+        cfg, handle, 0, header, gpu::kShaderPackHeaderBytes, &header_got);
+    if (header_status == ExactReadStatus::IoError) {
+        return false;
+    }
+
+    uint32_t entry_count = 0;
     std::string parse_error;
-    if (!gpu::parse_shader_pack_index(bytes.data(), bytes.size(), index.get(), &parse_error)) {
+    if (!gpu::parse_shader_pack_header(header, header_got, &entry_count, &parse_error)) {
+        emit_boot_milestone(cfg, "SHADER_PACK", path + " invalid: " + parse_error);
+        return false;
+    }
+
+    const uint64_t entries_bytes =
+        uint64_t{entry_count} * uint64_t{gpu::kShaderPackEntryBytes};
+    const uint64_t toc_bytes = uint64_t{gpu::kShaderPackHeaderBytes} + entries_bytes;
+    const uint64_t toc_cap =
+        (cfg.max_file_bytes != 0 && cfg.max_file_bytes < kMaxShaderPackTocBytes)
+            ? static_cast<uint64_t>(cfg.max_file_bytes)
+            : kMaxShaderPackTocBytes;
+    if (toc_bytes > toc_cap) {
+        emit_boot_milestone(cfg, "SHADER_PACK",
+                            path + " invalid: WGPK TOC exceeds " + std::to_string(toc_cap) +
+                                " byte limit (" + std::to_string(toc_bytes) + " bytes)");
+        return false;
+    }
+
+    std::vector<uint8_t> toc(static_cast<size_t>(toc_bytes));
+    std::memcpy(toc.data(), header, gpu::kShaderPackHeaderBytes);
+    if (entries_bytes > 0) {
+        size_t entries_got = 0;
+        const ExactReadStatus toc_status = read_exact_from_handle(
+            cfg,
+            handle,
+            gpu::kShaderPackHeaderBytes,
+            toc.data() + gpu::kShaderPackHeaderBytes,
+            static_cast<size_t>(entries_bytes),
+            &entries_got);
+        if (toc_status == ExactReadStatus::IoError) {
+            return false;
+        }
+        if (toc_status == ExactReadStatus::UnexpectedEof) {
+            toc.resize(gpu::kShaderPackHeaderBytes + entries_got);
+        }
+    }
+
+    // Close the HTTPFS handle immediately; WGSL payloads are never read into Wasm64 memory.
+    closer.reset();
+
+    auto index = std::make_shared<gpu::ShaderPackIndex>();
+    if (!gpu::parse_shader_pack_index_toc(
+            toc.data(), toc.size(), /*total_file_size=*/0, index.get(), &parse_error)) {
         emit_boot_milestone(cfg, "SHADER_PACK", path + " invalid: " + parse_error);
         return false;
     }
