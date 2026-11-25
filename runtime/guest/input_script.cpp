@@ -29,6 +29,9 @@ bool button_bit(const std::string& name, uint32_t& bit) {
     static constexpr Name kNames[] = {
         {"A", b::kGamepadA},       {"B", b::kGamepadB},     {"X", b::kGamepadX},   {"Y", b::kGamepadY},
         {"LB", b::kLeftBumper},    {"RB", b::kRightBumper}, {"Menu", b::kMenu},    {"View", b::kView},
+        // Left stick pushed fully (the bridge's W/A/S/D bits, which the GameInput layer turns
+        // into the left thumbstick): menu navigation.
+        {"Up", b::kMoveForward},   {"Down", b::kMoveBackward}, {"Left", b::kMoveLeft}, {"Right", b::kMoveRight},
     };
     for (const Name& n : kNames) {
         if (name == n.text) {
