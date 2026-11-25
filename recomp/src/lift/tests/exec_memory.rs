@@ -464,10 +464,12 @@ fn stores_into_the_window_mark_their_slots() {
     if !exec_or_skip("stores_into_the_window_mark_their_slots") {
         return;
     }
-    // f(rcx, rdx): mov [rcx], rax; mov [rdx], eax; ret - one store into the window (or a
-    // straddling one), one outside.
+    // f(rcx, rdx): mov [rcx], rax; mov [rcx + 8], rax; mov [rdx], eax; ret - two stores into the
+    // same window slot (exercising both the clean -> dirty slow path and the already-dirty fast
+    // path) or a straddling store, plus one outside.
     let f = asm_function(CODE_BASE, |a| {
         a.mov(qword_ptr(rcx), rax)?;
+        a.mov(qword_ptr(rcx + 8), rax)?;
         a.mov(dword_ptr(rdx), eax)?;
         a.ret()
     });
@@ -480,14 +482,14 @@ fn stores_into_the_window_mark_their_slots() {
                 .reg(RAX, 0x1122_3344_5566_7788)
                 .reg(RCX, aligned)
                 .reg(RDX, FLAT_ADDR)
-                .read(aligned, 8),
+                .read(aligned, 16),
             // A straddling store: the slow path (or, with contiguous runs, the lifted code) marks
             // both slots.
             Case::new(CODE_BASE)
                 .reg(RAX, 0x0102_0304_0506_0708)
                 .reg(RCX, straddle)
                 .reg(RDX, FLAT_ADDR)
-                .read(straddle, 8),
+                .read(straddle, 16),
             // Both stores outside the window: no slot marked.
             Case::new(CODE_BASE)
                 .reg(RAX, 7)
@@ -496,8 +498,10 @@ fn stores_into_the_window_mark_their_slots() {
         ];
         let o = run(&built, &cases);
         ok(&o, name);
-        assert_eq!(le(&o[0].mem[0]), 0x1122_3344_5566_7788, "{name}");
-        assert_eq!(le(&o[1].mem[0]), 0x0102_0304_0506_0708, "{name}");
+        assert_eq!(le(&o[0].mem[0][..8]), 0x1122_3344_5566_7788, "{name}");
+        assert_eq!(le(&o[0].mem[0][8..16]), 0x1122_3344_5566_7788, "{name}");
+        assert_eq!(le(&o[1].mem[0][..8]), 0x0102_0304_0506_0708, "{name}");
+        assert_eq!(le(&o[1].mem[0][8..16]), 0x0102_0304_0506_0708, "{name}");
         assert_eq!(
             o[0].dirty,
             expected_marks(name, &[slot(aligned)], true),

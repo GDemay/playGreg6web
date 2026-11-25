@@ -1041,13 +1041,18 @@ fn r36_lossless_ir_size_optimizations_for_windowed_multi_block_functions() {
     assert_eq!(ir.matches("br label %ret_epilog").count(), 2, "{ir}");
 
     // Compact windowed accesses: 2 non-stack loads -> 2 `align 1` loads total (not 6!),
-    // 2 non-stack stores -> one `align 1` store on the flat and one on the window path each (O37:
-    // the window path marks its slot after the store, without a second branch) + outlined cold
-    // slow_store helpers.
+    // 2 non-stack stores -> one `align 1` store on the flat and one on the window path each
+    // (O37/R57: the window path checks its dirty slot with a monotonic load before the cold
+    // release store) + outlined cold slow_store helpers.
     assert_eq!(
         fn_ir.matches(", align 1\n").count(),
-        8,
-        "2 loads + 2 x 2 stores + 2 slot marks = 8 align-1 accesses total:\n{fn_ir}"
+        10,
+        "2 loads + 2 x 2 stores + 2 mark loads + 2 mark stores = 10 align-1 accesses total:\n{fn_ir}"
+    );
+    assert_eq!(
+        fn_ir.matches("load atomic i8, ptr ").count(),
+        2,
+        "each window store checks its dirty slot before storing:\n{fn_ir}"
     );
     assert_eq!(
         fn_ir.matches("store atomic i8 1, ptr ").count(),
@@ -1096,6 +1101,13 @@ fn r36_lossless_ir_size_optimizations_for_windowed_multi_block_functions() {
             "define internal void @__playgta6_wstore16_400000000(i64 noundef %va, <2 x i64> noundef %v) unnamed_addr noinline cold #0 {"
         ),
         "{}",
+        outlined.ir
+    );
+    assert!(
+        outlined
+            .ir
+            .contains("%cur = load atomic i8, ptr %m monotonic, align 1\n  %clean = icmp eq i8 %cur, 0\n  br i1 %clean, label %wm_set, label %wm_done, !prof !{!\"branch_weights\", i32 1, i32 2000}\nwm_set:\n  store atomic i8 1, ptr %m release, align 1\n  br label %wm_done\nwm_done:\n  ret void\n"),
+        "outlined wstore must guard the atomic release mark with a monotonic check:\n{}",
         outlined.ir
     );
     assert!(
