@@ -17,6 +17,7 @@ const {
   BUILTIN_FALLBACK_PROFILES,
   DEFAULT_ENTRY_POINTS,
   DEFAULT_MAX_TRACKED_MISSING,
+  DEFAULT_MAX_MISSING_HASHES,
   DEFAULT_MAX_TRACKED_MISSING_HASHES,
   DEFAULT_MAX_CATEGORIZED_MISSING_HASHES,
   DEFAULT_MAX_RESOLVE_CACHE_ENTRIES,
@@ -392,6 +393,8 @@ test('getStats reports hitRatePct from pack hits and reset clears telemetry', ()
     fallbackHits: 0,
     builtinHits: 0,
     uniqueMissing: 0,
+    missingUniqueHashes: 0,
+    fastPathHits: 0,
     overflowMissingCount: 0,
     overflowMissingHashes: 0,
     hitRatePct: 0,
@@ -2307,6 +2310,8 @@ test('W268 resetStats clears lookup stats and negative compile-failure cache whi
     fallbackHits: 0,
     builtinHits: 0,
     uniqueMissing: 0,
+    missingUniqueHashes: 0,
+    fastPathHits: 0,
     overflowMissingCount: 0,
     overflowMissingHashes: 0,
     hitRatePct: 0,
@@ -2350,4 +2355,425 @@ test('W268 classic Worker importScripts isolation exposes negative compile-failu
   assert.equal(typeof r.clearCompileFailures, 'function');
   assert.equal(typeof r.selectFallbackProfile, 'function');
   assert.equal(typeof r.resetStats, 'function');
+});
+
+// ---------------------------------------------------------------------------
+// W304 Zero-alloc O(1) numeric/BigInt fast path & S47 priority-hash export
+// ---------------------------------------------------------------------------
+
+/**
+ * Exact JS mirror of S47 `shaders/src/rdna2_pack.rs::parse_priority_hashes`
+ * to validate `exportPriorityHashesText()` compatibility end-to-end.
+ */
+function parseS47PriorityHashesText(text) {
+  assert.equal(typeof text, 'string');
+  const normalized = text.startsWith('\ufeff') ? text.slice(1) : text;
+  const hashes = [];
+  const seen = new Set();
+  const lines = normalized.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i += 1) {
+    const withoutComment = lines[i].split('#')[0];
+    const token = withoutComment.trim();
+    if (token.length === 0) {
+      continue;
+    }
+    assert.match(
+      token,
+      /^(?:0[xX])?[0-9a-fA-F]{16}$/,
+      `S47 line ${i + 1} must be a 16-hex-digit 64-bit hash, got: ${JSON.stringify(token)}`
+    );
+    const value = BigInt(token.startsWith('0x') || token.startsWith('0X') ? token : `0x${token}`);
+    if (!seen.has(value)) {
+      seen.add(value);
+      hashes.push(value);
+    }
+  }
+  return hashes;
+}
+
+test('W304 zero-alloc O(1) numeric and BigInt fast path avoids repeated hex string formatting on hot lookups', () => {
+  const packNum = 0x123456;
+  const packBig = BigInt(packNum);
+  const packHex = formatShaderHash(packBig);
+  const big64 = 0xfedcba9876543210n;
+  const big64Hex = formatShaderHash(big64);
+  const missNum = 0xabcdef;
+  const missBig = BigInt(missNum);
+  const brokenBig = 0x00000000badc0ffen;
+
+  let packCalls = 0;
+  const backing = createMapPackLoader({
+    [packHex]: PACK_VS_WGSL,
+    [big64Hex]: PACK_FS_WGSL,
+    [S9_FALLBACK_HASHES.vertex]: S9_FALLBACK_WGSL.vertex,
+  });
+  const router = new ShaderFallbackRouter({
+    packLoader: {
+      getSource(key) {
+        packCalls += 1;
+        return backing.get(key);
+      },
+    },
+    fallbackHashes: { vertex: S9_FALLBACK_HASHES.vertex },
+    now: () => 3040,
+  });
+
+  // Cold lookups warm the resolve cache across pack (safe integer & full u64 BigInt), S9 fallback, and builtin.
+  const pSmall = router.resolve(packHex, 'vertex');
+  const pBig64 = router.resolve(big64, 'fragment');
+  const fMiss = router.resolve(missBig, 'vertex');
+  const bMiss = router.resolve(0x4444n, 'fragment');
+  router.recordMissingShader(brokenBig, 'fragment', 'compile_failed');
+
+  assert.equal(pSmall.source, 'pack');
+  assert.equal(pBig64.source, 'pack');
+  assert.equal(fMiss.source, 'fallback');
+  assert.equal(bMiss.source, 'builtin');
+  assert.equal(router.getStats().fastPathHits, 0);
+
+  const callsAfterWarmup = packCalls;
+
+  // Spy on BigInt.prototype.toString to prove zero hex string formatting on hot repeated lookups.
+  const origBigIntToString = BigInt.prototype.toString;
+  let hexFormatCalls = 0;
+  BigInt.prototype.toString = function spyToString(...args) {
+    hexFormatCalls += 1;
+    return origBigIntToString.apply(this, args);
+  };
+
+  try {
+    for (let i = 0; i < 50; i += 1) {
+      // Cross-type O(1) hits: warmed with hex -> hit with JS number & BigInt; warmed with BigInt -> hit with number & BigInt.
+      assert.strictEqual(router.resolve(packNum, SHADER_STAGE.VERTEX), pSmall);
+      assert.strictEqual(router.resolve(packBig, 'vs'), pSmall);
+      assert.strictEqual(router.resolve(big64, SHADER_STAGE.FRAGMENT), pBig64);
+      assert.strictEqual(router.resolve(missNum, SHADER_STAGE.VERTEX), fMiss);
+      assert.strictEqual(router.resolve(missBig, 'vertex'), fMiss);
+      assert.strictEqual(router.resolve(0x4444, 'fs'), bMiss);
+      // W268 BigInt/numeric negative compile-failure checks also avoid hex formatting.
+      assert.equal(router.hasCompileFailure(brokenBig), true);
+      assert.equal(router.hasCompileFailure(0xbadc0ffe), true);
+      const cfRes = router.resolve(brokenBig, 'fragment');
+      assert.equal(cfRes.source, 'builtin');
+      assert.equal(cfRes.compileFailureCached, true);
+    }
+    // Non-canonical uppercase hex alias hits cached BigInt entry without re-formatting or querying packLoader.
+    assert.strictEqual(router.resolve('0x0000000000123456'.toUpperCase(), 'vertex'), pSmall);
+    assert.strictEqual(router.resolve('0x0000000000123456'.toUpperCase(), 'vertex'), pSmall);
+  } finally {
+    BigInt.prototype.toString = origBigIntToString;
+  }
+
+  assert.equal(hexFormatCalls, 0, 'hot repeated numeric/BigInt lookups must perform zero hex formatting');
+  assert.equal(packCalls, callsAfterWarmup, 'hot fast-path hits must perform zero packLoader lookups');
+
+  const stats = router.getStats();
+  // 50 iterations * 6 fast-path resolve calls + 2 uppercase alias fast-path hits = 302.
+  assert.equal(stats.fastPathHits, 302);
+  assert.equal(stats.compileFailureCacheHits, 150);
+  // Missing priority hashes: missBig (1 + 100 = 101), 0x4444 (1 + 50 = 51), brokenBig (1 + 50 = 51).
+  assert.equal(stats.missingUniqueHashes, 3);
+  const priority = router.getMissingShaderPriorityList();
+  assert.equal(priority[0].hash, formatShaderHash(missBig));
+  assert.equal(priority[0].hitCount, 101);
+});
+
+test('W304 missing-hash frequency sorting breaks ties deterministically by ascending hash and aggregates stages', () => {
+  let clock = 100;
+  const packHash = '0x0000000000009999';
+  const realHash = '0x0000000000008888';
+  const router = new ShaderFallbackRouter({
+    packLoader: createGetSourcePackLoader({
+      [packHash]: PACK_VS_WGSL,
+      [S9_FALLBACK_HASHES.fragment]: S9_FALLBACK_WGSL.fragment,
+    }),
+    fallbackHashes: { fragment: S9_FALLBACK_HASHES.fragment },
+    now: () => {
+      clock += 10;
+      return clock;
+    },
+  });
+  router.registerRealShader(realHash, 'vertex', { wgsl: PACK_VS_WGSL });
+
+  // Exact pack hits and guarded real shaders must NOT enter the missing priority table.
+  router.resolve(packHash, 'vertex');
+  router.resolve(packHash, 'vertex');
+  router.resolve(realHash, 'vertex');
+  assert.equal(router.getStats().missingUniqueHashes, 0);
+  assert.deepEqual(router.getMissingShaderPriorityList(), []);
+
+  // Insert out-of-order missing hashes with deliberate hit-count ties and multi-stage hits.
+  const hC = '0x00000000000000cc';
+  const hA = '0x00000000000000aa';
+  const hB = '0x00000000000000bb';
+  const hTop = '0x00000000000000ff';
+
+  // hC: 3 hits (fragment via S9 fallback)
+  router.resolve(hC, 'fragment');
+  router.resolve(0xccn, 'fragment');
+  router.resolve(0xcc, SHADER_STAGE.FRAGMENT);
+
+  // hTop: 5 hits across vertex (3) + fragment (2) -> aggregated as one unique hash
+  router.resolve(hTop, 'vertex');
+  router.resolve(hTop, 'vertex');
+  router.resolve(hTop, 'vertex');
+  router.resolve(hTop, 'fragment');
+  router.resolve(hTop, 'fragment');
+
+  // hB: 3 hits (compute)
+  for (let i = 0; i < 3; i += 1) router.resolve(hB, 'compute');
+
+  // hA: 3 hits (vertex + recordMissingShader)
+  router.resolve(hA, 'vertex');
+  router.resolve(hA, 'vertex');
+  router.recordMissingShader(hA, 'fragment', 'reflection_failed');
+
+  assert.equal(router.getStats().missingUniqueHashes, 4);
+
+  const list = router.getMissingShaderPriorityList();
+  assert.equal(list.length, 4);
+  assert.deepEqual(
+    list.map((r) => ({ hash: r.hash, hitCount: r.hitCount, stages: r.stages })),
+    [
+      { hash: hTop, hitCount: 5, stages: ['vertex', 'fragment'] },
+      { hash: hA, hitCount: 3, stages: ['vertex', 'fragment'] },
+      { hash: hB, hitCount: 3, stages: ['compute'] },
+      { hash: hC, hitCount: 3, stages: ['fragment'] },
+    ]
+  );
+
+  // Limit support (numeric & object), zero limit, validation, and mutation isolation.
+  assert.equal(router.getMissingShaderPriorityList(2).length, 2);
+  assert.equal(router.getMissingShaderPriorityList({ limit: 2 }).length, 2);
+  assert.deepEqual(router.getMissingShaderPriorityList(0), []);
+  assert.throws(() => router.getMissingShaderPriorityList(-1), RangeError);
+  assert.throws(() => router.getMissingShaderPriorityList(1.5), RangeError);
+  assert.throws(() => router.getMissingShaderPriorityList('2'), RangeError);
+
+  list[0].hitCount = 999999;
+  list[0].stages.push('compute');
+  const fresh = router.getMissingShaderPriorityList(1);
+  assert.equal(fresh[0].hitCount, 5);
+  assert.deepEqual(fresh[0].stages, ['vertex', 'fragment']);
+  assert.deepEqual(JSON.parse(JSON.stringify(list)), list);
+});
+
+test('W304 bounded cap eviction enforces maxMissingHashes (default 512) while preserving hot shaders', () => {
+  assert.equal(DEFAULT_MAX_MISSING_HASHES, 512);
+
+  // Option validation.
+  assert.throws(() => new ShaderFallbackRouter({ maxMissingHashes: -1 }), /maxMissingHashes/);
+  assert.throws(() => new ShaderFallbackRouter({ maxMissingHashes: 2.5 }), /maxMissingHashes/);
+  assert.throws(() => new ShaderFallbackRouter({ maxMissingHashes: '10' }), /maxMissingHashes/);
+
+  // Zero cap stores nothing cleanly.
+  const zeroCap = new ShaderFallbackRouter({ maxMissingHashes: 0, now: () => 1 });
+  zeroCap.resolve('0x0000000000000001', 'vertex');
+  assert.equal(zeroCap.getStats().missingUniqueHashes, 0);
+  assert.deepEqual(zeroCap.getMissingShaderPriorityList(), []);
+
+  // Small explicit cap: hot shaders survive eviction of cold lowest-hit-count / oldest entries.
+  let tick = 0;
+  const small = new ShaderFallbackRouter({
+    maxMissingHashes: 3,
+    now: () => {
+      tick += 1;
+      return tick;
+    },
+  });
+  const hHot1 = '0x0000000000000001';
+  const hHot2 = '0x0000000000000002';
+  const hColdA = '0x0000000000000003';
+  const hColdB = '0x0000000000000004';
+  const hNewMenu = '0x0000000000000005';
+
+  for (let i = 0; i < 10; i += 1) small.resolve(hHot1, 'vertex');
+  for (let i = 0; i < 5; i += 1) small.resolve(hHot2, 'fragment');
+  small.resolve(hColdA, 'compute'); // hitCount=1 (lowest)
+  assert.equal(small.getStats().missingUniqueHashes, 3);
+
+  // Adding hColdB evicts hColdA (lowest hitCount=1), preserving hHot1 (10) and hHot2 (5).
+  small.resolve(hColdB, 'vertex');
+  assert.equal(small.getStats().missingUniqueHashes, 3);
+  assert.deepEqual(
+    small.getMissingShaderPriorityList().map((r) => [r.hash, r.hitCount]),
+    [
+      [hHot1, 10],
+      [hHot2, 5],
+      [hColdB, 1],
+    ]
+  );
+
+  // Adding hNewMenu evicts hColdB (lowest hitCount=1), and repeated hits on hNewMenu climb to #2!
+  small.resolve(hNewMenu, 'fragment');
+  for (let i = 0; i < 7; i += 1) small.resolve(hNewMenu, 'fragment');
+  assert.equal(small.getStats().missingUniqueHashes, 3);
+  assert.deepEqual(
+    small.getMissingShaderPriorityList().map((r) => [r.hash, r.hitCount]),
+    [
+      [hHot1, 10],
+      [hNewMenu, 8],
+      [hHot2, 5],
+    ]
+  );
+
+  // An evicted hash that is still memoized in the resolve cache cleanly re-enters if hit again.
+  small.resolve(hColdA, 'compute');
+  assert.equal(small.getStats().missingUniqueHashes, 3);
+  assert.deepEqual(
+    small.getMissingShaderPriorityList().map((r) => r.hash),
+    [hHot1, hNewMenu, hColdA]
+  );
+
+  // Equal hit-count tie eviction: evicts oldest (LRU) entry first.
+  const lruTie = new ShaderFallbackRouter({ maxMissingHashes: 2, now: () => 5 });
+  lruTie.resolve(1n, 'vertex');
+  lruTie.resolve(2n, 'vertex');
+  lruTie.resolve(3n, 'vertex'); // evicts 1n (oldest with hitCount=1)
+  assert.deepEqual(
+    lruTie.getMissingShaderPriorityList().map((r) => r.hash),
+    ['0x0000000000000002', '0x0000000000000003']
+  );
+
+  // Default 512 cap stays strictly bounded at 512 across 600 unique hashes while retaining hot shaders.
+  const defaultCap = new ShaderFallbackRouter({ now: () => 10 });
+  const hotGuard = 0xfeedface00000001n;
+  for (let i = 0; i < 25; i += 1) defaultCap.resolve(hotGuard, 'fragment');
+  for (let i = 1; i <= 600; i += 1) {
+    defaultCap.resolve(BigInt(0x10000 + i), 'vertex');
+  }
+  assert.equal(defaultCap.getStats().missingUniqueHashes, 512);
+  const topDefault = defaultCap.getMissingShaderPriorityList(1);
+  assert.equal(topDefault[0].hash, formatShaderHash(hotGuard));
+  assert.equal(topDefault[0].hitCount, 25);
+});
+
+test('W304 exportPriorityHashesText emits S47-compatible # header + 0x<16-hex> lines', () => {
+  const router = new ShaderFallbackRouter({ now: () => 777 });
+
+  // Empty router still emits valid S47 header and parses to 0 hashes.
+  const emptyText = router.exportPriorityHashesText();
+  assert.ok(emptyText.startsWith('# '), 'export must start with # header');
+  assert.ok(emptyText.includes('# unique_hashes=0 total_hits=0'));
+  assert.ok(emptyText.endsWith('\n'));
+  assert.deepEqual(parseS47PriorityHashesText(emptyText), []);
+
+  // Populate missing shaders with distinct frequencies and ties.
+  const hHigh = 0x000000000000cafe0n;
+  const hTie1 = 0x0000000000001111n;
+  const hTie2 = 0x0000000000002222n;
+
+  for (let i = 0; i < 4; i += 1) router.resolve(hHigh, 'fragment');
+  for (let i = 0; i < 2; i += 1) router.resolve(hTie2, 'vertex');
+  for (let i = 0; i < 2; i += 1) router.resolve(hTie1, 'compute');
+
+  const text = router.exportPriorityHashesText();
+  const lines = text.trimEnd().split('\n');
+  assert.ok(lines[0].startsWith('# '));
+  assert.equal(lines[1], '# unique_hashes=3 total_hits=8');
+  assert.deepEqual(lines.slice(2), [
+    formatShaderHash(hHigh),
+    formatShaderHash(hTie1),
+    formatShaderHash(hTie2),
+  ]);
+  for (const hashLine of lines.slice(2)) {
+    assert.match(hashLine, /^0x[0-9a-f]{16}$/);
+  }
+  assert.deepEqual(parseS47PriorityHashesText(text), [hHigh, hTie1, hTie2]);
+
+  // Limit option trims exported list and keeps header totals consistent.
+  const limitedText = router.exportPriorityHashesText({ limit: 2 });
+  assert.ok(limitedText.includes('# unique_hashes=2 total_hits=6'));
+  assert.deepEqual(parseS47PriorityHashesText(limitedText), [hHigh, hTie1]);
+
+  // Optional inline hit comments remain 100% S47-parseable (S47 strips `#` comments).
+  const commentedText = router.exportPriorityHashesText({ includeHitComments: true });
+  assert.ok(commentedText.includes(`${formatShaderHash(hHigh)} # hits=4`));
+  assert.deepEqual(parseS47PriorityHashesText(commentedText), [hHigh, hTie1, hTie2]);
+
+  // Strictly sanitized: zero WGSL tokens or host paths.
+  assert.equal(text.includes('@vertex'), false);
+  assert.equal(text.includes('@fragment'), false);
+  assert.equal(text.includes('C:\\'), false);
+  assert.equal(text.includes('/Users/'), false);
+});
+
+test('W304 resetStats and resetMissingTelemetry clear missingUniqueHashes and fastPathHits cleanly', () => {
+  const packHash = 0x00000000aaaa0001n;
+  const missHash = 0x00000000bbbb0002n;
+  const badHash = 0x00000000cccc0003n;
+
+  const router = new ShaderFallbackRouter({
+    packLoader: createGetSourcePackLoader({ [formatShaderHash(packHash)]: PACK_VS_WGSL }),
+    now: () => 900,
+  });
+
+  // Warm pack hit + fast-path repeat + missing repeat + W268 compile failure.
+  router.resolve(packHash, 'vertex');
+  router.resolve(packHash, 'vertex');
+  router.resolve(missHash, 'fragment');
+  router.resolve(missHash, 'fragment');
+  router.recordMissingShader(badHash, 'compute', 'compile_failed');
+  router.resolve(badHash, 'compute');
+
+  let stats = router.getStats();
+  assert.equal(stats.fastPathHits, 2);
+  assert.equal(stats.missingUniqueHashes, 2);
+  assert.equal(stats.compileFailureEntries, 1);
+
+  // resetMissingTelemetry clears priority table while keeping fastPathHits and packHits.
+  router.resetMissingTelemetry();
+  stats = router.getStats();
+  assert.equal(stats.missingUniqueHashes, 0);
+  assert.equal(stats.fastPathHits, 2);
+  assert.deepEqual(router.getMissingShaderPriorityList(), []);
+  assert.deepEqual(parseS47PriorityHashesText(router.exportPriorityHashesText()), []);
+
+  // Re-hitting memoized missing hash after telemetry reset cleanly re-populates priority table.
+  router.resolve(missHash, 'fragment');
+  assert.equal(router.getStats().missingUniqueHashes, 1);
+  assert.equal(router.getStats().fastPathHits, 3);
+  assert.equal(router.getMissingShaderPriorityList()[0].hitCount, 1);
+
+  // resetStats clears everything including fastPathHits, missingUniqueHashes, and W268 compile failures.
+  router.resetStats();
+  stats = router.getStats();
+  assert.equal(stats.fastPathHits, 0);
+  assert.equal(stats.missingUniqueHashes, 0);
+  assert.equal(stats.totalLookups, 0);
+  assert.equal(stats.compileFailureEntries, 0);
+  assert.equal(router.hasCompileFailure(badHash), false);
+  assert.deepEqual(router.getMissingShaderPriorityList(), []);
+  assert.deepEqual(parseS47PriorityHashesText(router.exportPriorityHashesText()), []);
+
+  // PackLoader remains intact after resetStats().
+  assert.equal(router.resolve(packHash, 'vertex').source, 'pack');
+});
+
+test('W304 classic Worker importScripts isolation exposes W304 APIs with zero global leaks', () => {
+  const source = readFileSync(ROUTER_PATH, 'utf8');
+  const sandbox = { console, performance };
+  const vmCtx = vm.createContext(sandbox);
+  vmCtx.self = vmCtx;
+
+  vm.runInContext(source, vmCtx, { filename: ROUTER_PATH });
+  vm.runInContext(source, vmCtx, { filename: ROUTER_PATH });
+
+  assert.doesNotThrow(() => {
+    vm.runInContext(
+      `
+      const DEFAULT_MAX_MISSING_HASHES = 0;
+      const MAX_SAFE_INTEGER_BIGINT = 0n;
+      `,
+      vmCtx
+    );
+  });
+
+  const api = vmCtx.PlayGta6ShaderFallbackRouter;
+  assert.equal(api.DEFAULT_MAX_MISSING_HASHES, 512);
+  const r = new api.ShaderFallbackRouter();
+  assert.equal(typeof r.getMissingShaderPriorityList, 'function');
+  assert.equal(typeof r.exportPriorityHashesText, 'function');
+  assert.equal(r.getStats().missingUniqueHashes, 0);
+  assert.equal(r.getStats().fastPathHits, 0);
 });
