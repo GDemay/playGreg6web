@@ -2,7 +2,7 @@
 
 #include "gpu/present_pacing.h"
 
-#include <thread>
+#include "os/host_sleep.h"
 
 namespace playgta6::gpu {
 
@@ -14,7 +14,7 @@ void PresentPacer::reset_for_testing() {
     std::lock_guard<std::mutex> lock(mutex_);
     origin_ = Clock::now();
     now_ = [] { return Clock::now(); };
-    sleep_until_ = [](Clock::time_point t) { std::this_thread::sleep_until(t); };
+    sleep_until_ = [](Clock::time_point t) { os::host_sleep::sleep_until(t); };  // precise (R40)
     enabled_ = true;
     have_last_ = false;
     last_flip_ = 0;

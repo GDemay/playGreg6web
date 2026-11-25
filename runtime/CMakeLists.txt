@@ -16,6 +16,7 @@ add_library(playgta6_core STATIC
     os/win32_sync.cpp
     os/win32_compat_file.cpp
     os/win32_compat_sys.cpp
+    os/host_sleep.cpp
     os/win32_compat_text.cpp
     os/win32_compat_misc.cpp
     os/win32_rtl.cpp
