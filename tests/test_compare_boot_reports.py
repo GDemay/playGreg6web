@@ -1056,5 +1056,322 @@ class TelemetryDeltaTests(unittest.TestCase):
             self.assertIn("mutually exclusive", err2.getvalue())
 
 
+class PresentFpsAvgAndMinRatioTests(unittest.TestCase):
+    tol = cbr.Tolerances()
+
+    def run_cli(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = cbr.main([str(a) for a in args])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_present_fps_avg_improvement_regression_and_unchanged_outputs(self):
+        ra = make_browser_report()
+        rb = make_browser_report()
+        ra["present_fps_avg"] = 20.0
+        rb["present_fps_avg"] = 30.0
+
+        c_imp = cbr.compare(ra, rb, self.tol)
+        self.assertEqual(c_imp.failures(), [])
+        res_imp = cbr.to_result(c_imp)
+        self.assertEqual(res_imp["verdict"], "pass")
+        self.assertEqual(
+            res_imp["telemetry_delta"]["present_fps_avg"],
+            {
+                "a": 20.0,
+                "b": 30.0,
+                "delta": 10.0,
+                "pct": 50.0,
+                "formatted_delta": "+10.0 fps",
+                "better": "higher",
+                "status": "improved",
+            },
+        )
+        text_imp = cbr.format_text(c_imp)
+        self.assertIn("[telemetry_delta]", text_imp)
+        self.assertIn("present_fps_avg: 20.0 fps -> 30.0 fps (+10.0 fps, +50.0%, improved)", text_imp)
+        md_imp = cbr.format_markdown(c_imp)
+        self.assertIn("| `present_fps_avg` | 20.0 fps | 30.0 fps | +10.0 fps | +50.0% | improved |", md_imp)
+
+        # Regression without --min-fps-ratio stays backwards-compatible (pass verdict)
+        ra_reg = make_browser_report()
+        rb_reg = make_browser_report()
+        ra_reg["present_fps_avg"] = 30.0
+        rb_reg["present_fps_avg"] = 24.0
+        c_reg = cbr.compare(ra_reg, rb_reg, self.tol)
+        self.assertEqual(c_reg.failures(), [])
+        res_reg = cbr.to_result(c_reg)
+        self.assertEqual(res_reg["verdict"], "pass")
+        self.assertEqual(
+            res_reg["telemetry_delta"]["present_fps_avg"],
+            {
+                "a": 30.0,
+                "b": 24.0,
+                "delta": -6.0,
+                "pct": -20.0,
+                "formatted_delta": "-6.0 fps",
+                "better": "higher",
+                "status": "regressed",
+            },
+        )
+        self.assertIn(
+            "present_fps_avg: 30.0 fps -> 24.0 fps (-6.0 fps, -20.0%, regressed)",
+            cbr.format_text(c_reg),
+        )
+
+        # Unchanged and zero baseline
+        ra_same = make_browser_report()
+        rb_same = make_browser_report()
+        ra_same["present_fps_avg"] = 30.0
+        rb_same["present_fps_avg"] = 30.0
+        td_same = cbr.compute_telemetry_delta(ra_same, rb_same)
+        self.assertEqual(td_same["present_fps_avg"]["status"], "unchanged")
+        self.assertEqual(td_same["present_fps_avg"]["formatted_delta"], "0.0 fps")
+        self.assertEqual(td_same["present_fps_avg"]["pct"], 0.0)
+
+        ra_zero = make_browser_report()
+        rb_zero = make_browser_report()
+        ra_zero["present_fps_avg"] = 0.0
+        rb_zero["present_fps_avg"] = 30.0
+        td_zero = cbr.compute_telemetry_delta(ra_zero, rb_zero)
+        self.assertEqual(td_zero["present_fps_avg"]["status"], "improved")
+        self.assertIsNone(td_zero["present_fps_avg"]["pct"])
+        self.assertEqual(td_zero["present_fps_avg"]["formatted_delta"], "+30.0 fps")
+
+    def test_present_fps_avg_extraction_sources_priority_and_falsy_zero(self):
+        # Top-level wins over summary
+        r1 = make_browser_report()
+        r1["present_fps_avg"] = 29.876
+        r1["summary"]["present_fps_avg"] = 12.0
+        self.assertEqual(cbr.extract_present_fps_avg(r1), 29.88)
+
+        # Top-level None falls through to summary.present_fps_avg
+        r2 = make_browser_report()
+        r2["present_fps_avg"] = None
+        r2["summary"]["present_fps_avg"] = 24.5
+        self.assertEqual(cbr.extract_present_fps_avg(r2), 24.5)
+
+        # Top-level falsy 0.0 is preserved without falling through to summary
+        r3 = make_browser_report()
+        r3["present_fps_avg"] = 0.0
+        r3["summary"]["present_fps_avg"] = 60.0
+        self.assertEqual(cbr.extract_present_fps_avg(r3), 0.0)
+        self.assertEqual(cbr.extract_telemetry_metrics(r3)["present_fps_avg"], 0.0)
+
+        # Nested telemetry / counters / camelCase fallbacks
+        r4 = make_report()
+        r4["telemetry"] = {"presentFpsAvg": 27.25}
+        self.assertEqual(cbr.extract_present_fps_avg(r4), 27.25)
+
+        r5 = make_report()
+        r5["summary"] = {"presentFpsAvg": 18.5}
+        self.assertEqual(cbr.extract_present_fps_avg(r5), 18.5)
+
+    def test_min_fps_ratio_pass_boundary_fail_and_ignore_cli_exit_codes(self):
+        with tempfile.TemporaryDirectory() as d:
+            pa, pb = Path(d, "a.json"), Path(d, "b.json")
+            ra = make_browser_report()
+            rb = make_browser_report()
+            ra["present_fps_avg"] = 30.0
+            rb["summary"]["present_fps_avg"] = 25.5  # exact 0.85 boundary (30 * 0.85 = 25.5)
+            pa.write_text(json.dumps(ra), encoding="utf-8")
+            pb.write_text(json.dumps(rb), encoding="utf-8")
+
+            # Boundary pass -> exit 0
+            code, out, err = self.run_cli(pa, pb, "--min-fps-ratio", "0.85", "--json")
+            self.assertEqual(code, 0, err)
+            payload = json.loads(out)
+            self.assertEqual(payload["verdict"], "pass")
+            self.assertEqual(payload["differences"], 0)
+            self.assertEqual(payload["tolerances"]["min_fps_ratio"], 0.85)
+            self.assertEqual(payload["telemetry_delta"]["present_fps_avg"]["a"], 30.0)
+            self.assertEqual(payload["telemetry_delta"]["present_fps_avg"]["b"], 25.5)
+
+            # Floating-point boundary: 3.0 * 0.1 = 0.30000000000000004 vs 0.3 -> pass
+            ra_fp = make_browser_report()
+            rb_fp = make_browser_report()
+            ra_fp["present_fps_avg"] = 3.0
+            rb_fp["present_fps_avg"] = 0.3
+            pa.write_text(json.dumps(ra_fp), encoding="utf-8")
+            pb.write_text(json.dumps(rb_fp), encoding="utf-8")
+            code_fp, _, err_fp = self.run_cli(pa, pb, "--min-fps-ratio", "0.1")
+            self.assertEqual(code_fp, 0, err_fp)
+
+            # Regression below threshold (25.49 < 25.5) -> exit 1 in both text and JSON
+            ra["present_fps_avg"] = 30.0
+            rb = make_browser_report()
+            rb["present_fps_avg"] = 25.49
+            pa.write_text(json.dumps(ra), encoding="utf-8")
+            pb.write_text(json.dumps(rb), encoding="utf-8")
+
+            code_fail, out_json, err_json = self.run_cli(pa, pb, "--min-fps-ratio", "0.85", "--json")
+            self.assertEqual(code_fail, 1, err_json)
+            fail_payload = json.loads(out_json)
+            self.assertEqual(fail_payload["verdict"], "fail")
+            self.assertEqual(fail_payload["differences"], 1)
+            self.assertEqual(fail_payload["tolerances"]["min_fps_ratio"], 0.85)
+            self.assertEqual(
+                fail_payload["entries"],
+                [{"field": "telemetry.present_fps_avg", "a": 30.0, "b": 25.49, "mode": "min_fps_ratio", "ok": False}],
+            )
+            self.assertEqual(fail_payload["telemetry_delta"]["present_fps_avg"]["status"], "regressed")
+
+            code_txt, out_txt, err_txt = self.run_cli(pa, pb, "--min-fps-ratio", "0.85")
+            self.assertEqual(code_txt, 1, err_txt)
+            self.assertIn("[telemetry]", out_txt)
+            self.assertIn("DIFF telemetry.present_fps_avg: 30.0 != 25.49 (min_fps_ratio)", out_txt)
+            self.assertIn("present_fps_avg: 30.0 fps -> 25.49 fps (-4.51 fps, -15.0%, regressed)", out_txt)
+            self.assertIn("verdict: FAIL", out_txt)
+
+            # Without --min-fps-ratio the same pair passes (backwards compatibility)
+            code_default, out_default, err_default = self.run_cli(pa, pb, "--json")
+            self.assertEqual(code_default, 0, err_default)
+            default_payload = json.loads(out_default)
+            self.assertEqual(default_payload["verdict"], "pass")
+            self.assertNotIn("min_fps_ratio", default_payload["tolerances"])
+
+            # Ignorable via --ignore telemetry.present_fps_avg
+            code_ign, out_ign, err_ign = self.run_cli(
+                pa, pb, "--min-fps-ratio", "0.85", "--ignore", "telemetry.present_fps_avg", "--json"
+            )
+            self.assertEqual(code_ign, 0, err_ign)
+            ign_payload = json.loads(out_ign)
+            self.assertEqual(ign_payload["verdict"], "pass")
+            self.assertIn("present_fps_avg", ign_payload["telemetry_delta"])
+
+            # Zero baseline with --min-fps-ratio -> pass (0.0 >= 0.0)
+            ra_z, rb_z = make_browser_report(), make_browser_report()
+            ra_z["present_fps_avg"] = 0.0
+            rb_z["present_fps_avg"] = 0.0
+            pa.write_text(json.dumps(ra_z), encoding="utf-8")
+            pb.write_text(json.dumps(rb_z), encoding="utf-8")
+            code_z, _, err_z = self.run_cli(pa, pb, "--min-fps-ratio", "0.85")
+            self.assertEqual(code_z, 0, err_z)
+
+    def test_min_fps_ratio_invalid_values_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            pa, pb = Path(d, "a.json"), Path(d, "b.json")
+            pa.write_text(json.dumps(make_browser_report()), encoding="utf-8")
+            pb.write_text(json.dumps(make_browser_report()), encoding="utf-8")
+            for bad in ("0", "-0.5", "nan", "inf", "-inf"):
+                code, _, err = self.run_cli(pa, pb, "--min-fps-ratio", bad)
+                self.assertEqual(code, 2, f"expected exit 2 for --min-fps-ratio={bad}")
+                self.assertIn("min-fps-ratio", err)
+
+        for bad_val in (0, -0.1, float("nan"), float("inf"), True):
+            with self.assertRaises(ValueError):
+                cbr.compare(make_browser_report(), make_browser_report(), self.tol, min_fps_ratio=bad_val)
+
+    def test_missing_present_fps_avg_graceful_handling(self):
+        # 1. Both older reports missing present_fps_avg, without --min-fps-ratio
+        old_a, old_b = make_report(), make_report()
+        c_old = cbr.compare(old_a, old_b, self.tol)
+        res_old = cbr.to_result(c_old)
+        self.assertEqual(
+            set(res_old.keys()),
+            {"verdict", "checked", "differences", "tolerances", "ignore", "entries"},
+        )
+        self.assertEqual(set(res_old["tolerances"].keys()), {"time_rel", "time_floor_ms", "count_rel"})
+
+        # 2. Both older reports missing present_fps_avg, WITH --min-fps-ratio -> graceful pass + warning
+        with tempfile.TemporaryDirectory() as d:
+            pa, pb = Path(d, "a.json"), Path(d, "b.json")
+            pa.write_text(json.dumps(old_a), encoding="utf-8")
+            pb.write_text(json.dumps(old_b), encoding="utf-8")
+            code, out, err = self.run_cli(pa, pb, "--min-fps-ratio", "0.85", "--json")
+            self.assertEqual(code, 0, err)
+            payload = json.loads(out)
+            self.assertEqual(payload["verdict"], "pass")
+            self.assertNotIn("telemetry_delta", payload)
+            self.assertTrue(
+                any("baseline and candidate" in w for w in payload.get("warnings", [])),
+                payload.get("warnings"),
+            )
+
+            # 3. Baseline missing, candidate present -> added + warning, exit 0
+            cand = copy.deepcopy(old_b)
+            cand["present_fps_avg"] = 28.5
+            pb.write_text(json.dumps(cand), encoding="utf-8")
+            code_add, out_add, err_add = self.run_cli(pa, pb, "--min-fps-ratio", "0.85", "--json")
+            self.assertEqual(code_add, 0, err_add)
+            p_add = json.loads(out_add)
+            self.assertEqual(p_add["telemetry_delta"]["present_fps_avg"]["status"], "added")
+            self.assertIsNone(p_add["telemetry_delta"]["present_fps_avg"]["a"])
+            self.assertEqual(p_add["telemetry_delta"]["present_fps_avg"]["b"], 28.5)
+            self.assertTrue(any("missing from baseline" in w for w in p_add.get("warnings", [])))
+
+            # 4. Baseline present, candidate missing -> removed + warning, exit 0
+            code_rem, out_rem, err_rem = self.run_cli(pb, pa, "--min-fps-ratio", "0.85", "--json")
+            self.assertEqual(code_rem, 0, err_rem)
+            p_rem = json.loads(out_rem)
+            self.assertEqual(p_rem["telemetry_delta"]["present_fps_avg"]["status"], "removed")
+            self.assertEqual(p_rem["telemetry_delta"]["present_fps_avg"]["a"], 28.5)
+            self.assertIsNone(p_rem["telemetry_delta"]["present_fps_avg"]["b"])
+            self.assertTrue(any("missing from candidate" in w for w in p_rem.get("warnings", [])))
+
+    def test_present_fps_avg_sanitization_and_json_schema_stability_with_t61(self):
+        # Reject host paths, bools, strings, negatives, NaN, Inf
+        ra_bad = make_report()
+        rb_bad = make_report()
+        ra_bad["present_fps_avg"] = r"C:\Users\secret\fps.json"
+        ra_bad["summary"] = {"present_fps_avg": float("nan")}
+        rb_bad["present_fps_avg"] = "/home/alice/boot-report.json"
+        rb_bad["summary"] = {"present_fps_avg": -5.0}
+        c_bad = cbr.compare(ra_bad, rb_bad, self.tol, min_fps_ratio=0.85)
+        res_bad = cbr.to_result(c_bad)
+        self.assertEqual(res_bad["verdict"], "pass")
+        self.assertNotIn("telemetry_delta", res_bad)
+        for rendered in (json.dumps(res_bad), cbr.format_text(c_bad), cbr.format_markdown(c_bad)):
+            self.assertNotIn("secret", rendered)
+            self.assertNotIn("alice", rendered)
+
+        for invalid in (None, True, False, "30.0", -1.0, float("nan"), float("inf"), r"D:\game\a.rpf"):
+            r = make_report()
+            r["present_fps_avg"] = invalid
+            self.assertIsNone(cbr.extract_present_fps_avg(r), f"expected None for {invalid!r}")
+
+        # Invalid top-level falls through cleanly to valid summary.present_fps_avg
+        r_fall = make_report()
+        r_fall["present_fps_avg"] = r"C:\Users\secret\fps.json"
+        r_fall["summary"] = {"present_fps_avg": 29.5}
+        self.assertEqual(cbr.extract_present_fps_avg(r_fall), 29.5)
+
+        # Full T61 + T73 report JSON schema stability
+        ra = make_browser_report()
+        rb = make_browser_report()
+        ra.update({
+            "first_visible_frame_s": 18.0,
+            "black_loading_s": 6.0,
+            "js_heap_used_mb": 320.0,
+            "js_heap_total_mb": 512.0,
+            "audio_ring_attached": True,
+            "audio_frames_drained": 48000,
+            "present_fps_avg": 28.0,
+        })
+        rb.update({
+            "first_visible_frame_s": 14.0,
+            "black_loading_s": 4.0,
+            "js_heap_used_mb": 290.0,
+            "js_heap_total_mb": 512.0,
+            "audio_ring_attached": True,
+            "audio_frames_drained": 64000,
+            "present_fps_avg": 30.0,
+        })
+        c_full = cbr.compare(ra, rb, self.tol)
+        res_full = cbr.to_result(c_full)
+        self.assertEqual(
+            set(res_full.keys()),
+            {"verdict", "checked", "differences", "tolerances", "ignore", "entries", "gpu_delta", "telemetry_delta"},
+        )
+        self.assertEqual(
+            tuple(res_full["telemetry_delta"].keys()),
+            cbr.TELEMETRY_DELTA_METRICS,
+        )
+        self.assertEqual(
+            set(res_full["telemetry_delta"]["present_fps_avg"].keys()),
+            set(res_full["telemetry_delta"]["first_visible_frame_s"].keys()),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
