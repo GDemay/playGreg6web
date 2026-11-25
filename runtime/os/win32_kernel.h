@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -346,6 +347,25 @@ constexpr int64_t kHostStallThresholdNs = 50'000'000LL;
 void ReportHostStall(int64_t stall_ns);
 int64_t TotalHostStallNs();
 void ResetHostStallForTesting();
+
+// RAII: times a host-side region with a steady clock and reports it when >= the threshold.
+class HostStallScope {
+public:
+    HostStallScope() : start_(std::chrono::steady_clock::now()) {}
+    ~HostStallScope() {
+        const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now() - start_)
+                               .count();
+        if (ns >= kHostStallThresholdNs) {
+            ReportHostStall(ns);
+        }
+    }
+    HostStallScope(const HostStallScope&) = delete;
+    HostStallScope& operator=(const HostStallScope&) = delete;
+
+private:
+    std::chrono::steady_clock::time_point start_;
+};
 
 uint32_t GetLastError();
 void SetLastError(uint32_t error_code);
