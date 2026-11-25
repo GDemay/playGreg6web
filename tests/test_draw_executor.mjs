@@ -1324,3 +1324,563 @@ test('W130 per-kind draw telemetry tracks indexedDraws, nonIndexedDraws, and ind
   assert.equal(cleared.redundantPipelineSkips, 0);
   assert.equal(cleared.zeroCountDrawsSkipped, 0);
 });
+
+// ---------------------------------------------------------------------------
+// W166 High-frequency menu/video redundant-state elision, bind-group cache,
+// dynamic-offset safety, UI/glyph/video accounting, and per-reason skip stats
+// ---------------------------------------------------------------------------
+
+test('W166 redundant setBindGroup / setVertexBuffer / setIndexBuffer elision within one pass and invalidation on change or unbind', () => {
+  const { device, pass, calls } = createMockWebGpu();
+  const router = new ShaderFallbackRouter();
+  const executor = new DrawExecutor({ device, shaderFallbackRouter: router });
+
+  const pipe = {
+    kind: 'GPURenderPipeline',
+    handle: 4001,
+    getBindGroupLayout: () => ({ kind: 'GPUBindGroupLayout' }),
+  };
+  const vb0 = device.createBuffer({ size: 512, usage: BUFFER_USAGE.VERTEX });
+  const vb1 = device.createBuffer({ size: 512, usage: BUFFER_USAGE.VERTEX });
+  const ib0 = device.createBuffer({ size: 256, usage: BUFFER_USAGE.INDEX });
+  const ib1 = device.createBuffer({ size: 256, usage: BUFFER_USAGE.INDEX });
+  const bg0 = { kind: 'GPUBindGroup', handle: 4100 };
+  const bg1 = { kind: 'GPUBindGroup', handle: 4101 };
+  const bg2 = { kind: 'GPUBindGroup', handle: 4102 };
+
+  executor.beginPass();
+  executor.setPipeline(pipe);
+  executor.setVertexBuffer(0, vb0, 0, 256);
+  executor.setVertexBuffer(1, vb1, 16);
+  executor.setIndexBuffer(ib0, 'uint16', 0, 128);
+  executor.setBindGroup(0, bg0);
+  executor.setBindGroup(1, bg1);
+
+  // Draw 1: cold pass binds everything once.
+  const d1 = executor.drawIndexed(pass, 6, 1, 0, 0, 0);
+  assert.equal(d1.executed, true);
+  assert.equal(d1.pipelineElided, false);
+  assert.equal(d1.bindGroupsElided, 0);
+  assert.equal(d1.vertexBuffersElided, 0);
+  assert.equal(d1.indexBufferElided, false);
+
+  // Draw 2: identical state in same pass elides pipeline, both VBs, both BGs, and IB.
+  const d2 = executor.drawIndexed(pass, 6, 1, 6, 0, 0);
+  assert.equal(d2.executed, true);
+  assert.equal(d2.pipelineElided, true);
+  assert.equal(d2.bindGroupsElided, 2);
+  assert.equal(d2.vertexBuffersElided, 2);
+  assert.equal(d2.indexBufferElided, true);
+
+  assert.equal(calls.pass.filter((c) => c.op === 'setPipeline').length, 1);
+  assert.equal(calls.pass.filter((c) => c.op === 'setBindGroup').length, 2);
+  assert.equal(calls.pass.filter((c) => c.op === 'setVertexBuffer').length, 2);
+  assert.equal(calls.pass.filter((c) => c.op === 'setIndexBuffer').length, 1);
+
+  // Draw 3: changing VB0 offset, BG1 handle, and IB format forces ONLY those slots to re-bind.
+  executor.setVertexBuffer(0, vb0, 64, 256);
+  executor.setBindGroup(1, bg2);
+  executor.setIndexBuffer(ib0, 'uint32', 0, 128);
+  const d3 = executor.drawIndexed(pass, 6, 1, 0, 0, 0);
+  assert.equal(d3.executed, true);
+  assert.equal(d3.pipelineElided, true);
+  assert.equal(d3.bindGroupsElided, 1); // bg0 elided, bg2 bound
+  assert.equal(d3.vertexBuffersElided, 1); // vb1 elided, vb0 bound
+  assert.equal(d3.indexBufferElided, false); // uint16 -> uint32 bound
+
+  assert.equal(calls.pass.filter((c) => c.op === 'setBindGroup').length, 3);
+  assert.equal(calls.pass.filter((c) => c.op === 'setVertexBuffer').length, 3);
+  assert.equal(calls.pass.filter((c) => c.op === 'setIndexBuffer').length, 2);
+
+  // Draw 4: changing IB buffer (same format/offset) re-binds IB, elides rest.
+  executor.setIndexBuffer(ib1, 'uint32', 0, 128);
+  const d4 = executor.drawIndexed(pass, 6, 1, 0, 0, 0);
+  assert.equal(d4.executed, true);
+  assert.equal(d4.indexBufferElided, false);
+  assert.equal(calls.pass.filter((c) => c.op === 'setIndexBuffer').length, 3);
+
+  // Unbinding slot via null invalidates tracked pass binding for that slot.
+  executor.setBindGroup(0, null);
+  executor.setBindGroup(0, bg0);
+  const d5 = executor.drawIndexed(pass, 6, 1, 0, 0, 0);
+  assert.equal(d5.executed, true);
+  assert.equal(d5.bindGroupsElided, 1); // bg2 elided, bg0 re-bound after explicit null unbind
+  assert.equal(calls.pass.filter((c) => c.op === 'setBindGroup').length, 4);
+
+  const stats = executor.getStats();
+  assert.equal(stats.redundantPipelineSkips, 4);
+  assert.equal(stats.redundantBindGroupSkips, 6); // 2 + 1 + 2 + 1
+  assert.equal(stats.redundantVertexBufferSkips, 7); // 2 + 1 + 2 + 2
+  assert.equal(stats.redundantIndexBufferSkips, 2); // d2 + d5
+
+  // Opt-out via elideRedundantState: false disables all redundant-state elision.
+  const noElideEnv = createMockWebGpu();
+  const noElideExec = new DrawExecutor({
+    device: noElideEnv.device,
+    shaderFallbackRouter: router,
+    elideRedundantState: false,
+  });
+  noElideExec.beginPass();
+  noElideExec.setPipeline(pipe);
+  noElideExec.setVertexBuffer(0, vb0, 0);
+  noElideExec.setBindGroup(0, bg0);
+  noElideExec.setIndexBuffer(ib0, 'uint16', 0);
+  noElideExec.drawIndexed(noElideEnv.pass, 6, 1, 0, 0, 0);
+  noElideExec.drawIndexed(noElideEnv.pass, 6, 1, 0, 0, 0);
+  assert.equal(noElideEnv.calls.pass.filter((c) => c.op === 'setPipeline').length, 2);
+  assert.equal(noElideEnv.calls.pass.filter((c) => c.op === 'setBindGroup').length, 2);
+  assert.equal(noElideEnv.calls.pass.filter((c) => c.op === 'setVertexBuffer').length, 2);
+  assert.equal(noElideEnv.calls.pass.filter((c) => c.op === 'setIndexBuffer').length, 2);
+  const noElideStats = noElideExec.getStats();
+  assert.equal(noElideStats.redundantPipelineSkips, 0);
+  assert.equal(noElideStats.redundantBindGroupSkips, 0);
+  assert.equal(noElideStats.redundantVertexBufferSkips, 0);
+  assert.equal(noElideStats.redundantIndexBufferSkips, 0);
+});
+
+test('W166 pass-boundary invalidation re-binds all state on endPass, beginPass, and implicit pass-object switch', () => {
+  const env1 = createMockWebGpu();
+  const env2 = createMockWebGpu();
+  const router = new ShaderFallbackRouter();
+  const executor = new DrawExecutor({ device: env1.device, shaderFallbackRouter: router });
+
+  const pipe = {
+    kind: 'GPURenderPipeline',
+    handle: 4201,
+    getBindGroupLayout: () => ({ kind: 'GPUBindGroupLayout' }),
+  };
+  const vb = env1.device.createBuffer({ size: 256, usage: BUFFER_USAGE.VERTEX });
+  const ib = env1.device.createBuffer({ size: 128, usage: BUFFER_USAGE.INDEX });
+  const bg = { kind: 'GPUBindGroup', handle: 4202 };
+
+  executor.beginPass();
+  executor.setPipeline(pipe);
+  executor.setVertexBuffer(0, vb, 0);
+  executor.setIndexBuffer(ib, 'uint16', 0);
+  executor.setBindGroup(0, bg);
+
+  // Pass 1 draw 1 (binds) + draw 2 (elides everything).
+  executor.drawIndexed(env1.pass, 6, 1, 0, 0, 0);
+  const elided = executor.drawIndexed(env1.pass, 6, 1, 0, 0, 0);
+  assert.equal(elided.pipelineElided, true);
+  assert.equal(elided.bindGroupsElided, 1);
+  assert.equal(elided.vertexBuffersElided, 1);
+  assert.equal(elided.indexBufferElided, true);
+
+  // Implicitly switching to a second GPURenderPassEncoder without calling endPass() MUST re-bind everything!
+  const onPass2 = executor.drawIndexed(env2.pass, 6, 1, 0, 0, 0);
+  assert.equal(onPass2.executed, true);
+  assert.equal(onPass2.pipelineElided, false);
+  assert.equal(onPass2.bindGroupsElided, 0);
+  assert.equal(onPass2.vertexBuffersElided, 0);
+  assert.equal(onPass2.indexBufferElided, false);
+  assert.deepEqual(
+    env2.calls.pass.map((c) => c.op),
+    ['setPipeline', 'setVertexBuffer', 'setBindGroup', 'setIndexBuffer', 'drawIndexed']
+  );
+
+  // endPass() invalidates even when drawing again on the exact same pass2 object.
+  executor.endPass();
+  const afterEnd = executor.drawIndexed(env2.pass, 6, 1, 0, 0, 0);
+  assert.equal(afterEnd.executed, true);
+  assert.equal(afterEnd.pipelineElided, false);
+  assert.equal(afterEnd.bindGroupsElided, 0);
+  assert.equal(afterEnd.vertexBuffersElided, 0);
+  assert.equal(afterEnd.indexBufferElided, false);
+  assert.equal(env2.calls.pass.filter((c) => c.op === 'setBindGroup').length, 2);
+  assert.equal(env2.calls.pass.filter((c) => c.op === 'setVertexBuffer').length, 2);
+  assert.equal(env2.calls.pass.filter((c) => c.op === 'setIndexBuffer').length, 2);
+});
+
+test('W166 dynamic-offset correctness: never elides when dynamic offsets differ or are mutated in place', () => {
+  const { device, pass, calls } = createMockWebGpu();
+  const router = new ShaderFallbackRouter();
+  const executor = new DrawExecutor({ device, shaderFallbackRouter: router });
+
+  const pipe = {
+    kind: 'GPURenderPipeline',
+    handle: 4301,
+    getBindGroupLayout: () => ({ kind: 'GPUBindGroupLayout' }),
+  };
+  const bg = { kind: 'GPUBindGroup', handle: 4302 };
+
+  executor.beginPass();
+  executor.setPipeline(pipe);
+
+  // 1. Initial bind with Uint32Array([0, 256]).
+  const dynOffsets = new Uint32Array([0, 256]);
+  executor.setBindGroup(0, bg, dynOffsets);
+  const d1 = executor.draw(pass, 6, 1);
+  assert.equal(d1.bindGroupsElided, 0);
+
+  // 2. Identical values in a new Array instance -> safe to elide!
+  executor.setBindGroup(0, bg, [0, 256]);
+  const d2 = executor.draw(pass, 6, 1);
+  assert.equal(d2.bindGroupsElided, 1);
+
+  // 3. Different dynamic offset value -> MUST NOT elide!
+  executor.setBindGroup(0, bg, [256, 256]);
+  const d3 = executor.draw(pass, 6, 1);
+  assert.equal(d3.bindGroupsElided, 0);
+
+  // 4. Bind mutable Uint32Array, draw, then mutate IN PLACE without reallocating -> MUST NOT elide!
+  const mutableOffsets = new Uint32Array([512, 768]);
+  executor.setBindGroup(0, bg, mutableOffsets);
+  const d4 = executor.draw(pass, 6, 1);
+  assert.equal(d4.bindGroupsElided, 0);
+
+  // Mutate in place without calling setBindGroup again:
+  mutableOffsets[0] = 1024;
+  const d5 = executor.draw(pass, 6, 1);
+  assert.equal(d5.bindGroupsElided, 0);
+
+  // Re-calling setBindGroup with the same mutated reference & unchanged values -> safe to elide!
+  executor.setBindGroup(0, bg, mutableOffsets);
+  const d6 = executor.draw(pass, 6, 1);
+  assert.equal(d6.bindGroupsElided, 1);
+
+  // Mutate second slot in place and re-call setBindGroup -> MUST NOT elide!
+  mutableOffsets[1] = 1280;
+  executor.setBindGroup(0, bg, mutableOffsets);
+  const d7 = executor.draw(pass, 6, 1);
+  assert.equal(d7.bindGroupsElided, 0);
+
+  // 5. Different length ([1024] vs [1024, 1280]) -> MUST NOT elide!
+  executor.setBindGroup(0, bg, [1024]);
+  const d8 = executor.draw(pass, 6, 1);
+  assert.equal(d8.bindGroupsElided, 0);
+
+  // 6. Switching from dynamic offsets to no dynamic offsets (null) -> MUST NOT elide!
+  executor.setBindGroup(0, bg);
+  const d9 = executor.draw(pass, 6, 1);
+  assert.equal(d9.bindGroupsElided, 0);
+
+  // 7. Switching from null dynamic offsets to empty array [] -> MUST NOT elide!
+  executor.setBindGroup(0, bg, []);
+  const d10 = executor.draw(pass, 6, 1);
+  assert.equal(d10.bindGroupsElided, 0);
+
+  const bgCalls = calls.pass.filter((c) => c.op === 'setBindGroup');
+  assert.equal(bgCalls.length, 8);
+  assert.equal(executor.getStats().redundantBindGroupSkips, 2);
+});
+
+test('W166 bind-group reuse cache deduplicates fallback and custom bind groups, evicts LRU/destroyed resources, and respects clearBindGroupCache', () => {
+  const { device, pass, calls } = createMockWebGpu();
+  const router = new ShaderFallbackRouter();
+  const executor = new DrawExecutor({
+    device,
+    shaderFallbackRouter: router,
+    maxBindGroupCacheEntries: 3,
+  });
+
+  // 1. Fallback textured_quad_24b with GPUTexture passed directly: caches BOTH textureView and GPUBindGroup.
+  let createViewCalls = 0;
+  const vb = device.createBuffer({ size: 24 * 6, usage: BUFFER_USAGE.VERTEX });
+  const tex = device.createTexture({
+    size: { width: 64, height: 64, depthOrArrayLayers: 1 },
+    format: 'rgba8unorm',
+    usage: 0x04,
+  });
+  const origCreateView = tex.createView.bind(tex);
+  tex.createView = (desc) => {
+    createViewCalls += 1;
+    return origCreateView(desc);
+  };
+  const sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+
+  executor.beginPass();
+  executor.setPipeline({ vertexStride: 24, isFallback: true });
+  executor.setVertexBuffer(0, vb, { offset: 0, stride: 24 });
+  executor.setTexture(0, tex);
+  executor.setSampler(0, sampler);
+
+  for (let i = 0; i < 10; i += 1) {
+    const r = executor.draw(pass, 6, 1);
+    assert.equal(r.executed, true);
+    assert.equal(r.profile, 'textured_quad_24b');
+    assert.equal(r.bindGroupCacheHit, i > 0);
+  }
+
+  assert.equal(createViewCalls, 1);
+  assert.equal(calls.createBindGroup.length, 1);
+  assert.equal(calls.pass.filter((c) => c.op === 'setBindGroup').length, 1);
+  assert.equal(calls.pass.filter((c) => c.op === 'setVertexBuffer').length, 1);
+  assert.equal(executor.getStats().bindGroupCacheMisses, 1);
+  assert.equal(executor.getStats().bindGroupCacheHits, 9);
+  assert.equal(executor.getStats().redundantBindGroupSkips, 9);
+  assert.equal(executor.getStats().redundantVertexBufferSkips, 9);
+
+  // 2. clearBindGroupCache() forces recreation and re-binding on next draw.
+  executor.clearBindGroupCache();
+  assert.equal(executor.getStats().bindGroupCacheSize, 0);
+  const afterClear = executor.draw(pass, 6, 1);
+  assert.equal(afterClear.executed, true);
+  assert.equal(afterClear.bindGroupCacheHit, false);
+  assert.equal(calls.createBindGroup.length, 2);
+  assert.equal(calls.pass.filter((c) => c.op === 'setBindGroup').length, 2);
+
+  // 3. Public getOrCreateBindGroup deduplicates out-of-order entries, evicts LRU, and invalidates destroyed resources.
+  const layout = { kind: 'GPUBindGroupLayout', handle: 9001 };
+  const bufA = device.createBuffer({ size: 256, usage: BUFFER_USAGE.UNIFORM });
+  const bufB = device.createBuffer({ size: 256, usage: BUFFER_USAGE.UNIFORM });
+  const bufC = device.createBuffer({ size: 256, usage: BUFFER_USAGE.UNIFORM });
+  const bufD = device.createBuffer({ size: 256, usage: BUFFER_USAGE.UNIFORM });
+
+  executor.clearBindGroupCache();
+  const gA1 = executor.getOrCreateBindGroup(layout, [
+    { binding: 1, resource: sampler },
+    { binding: 0, resource: { buffer: bufA, offset: 0, size: 256 } },
+  ]);
+  const gA2 = executor.getOrCreateBindGroup(layout, [
+    { binding: 0, resource: { buffer: bufA, offset: 0, size: 256 } },
+    { binding: 1, resource: sampler },
+  ]);
+  assert.equal(gA1, gA2); // exact cached GPUBindGroup reused regardless of entry order!
+
+  // Different buffer offset produces distinct bind group.
+  const gAOff = executor.getOrCreateBindGroup(layout, [
+    { binding: 0, resource: { buffer: bufA, offset: 256, size: 256 } },
+    { binding: 1, resource: sampler },
+  ]);
+  assert.notEqual(gAOff, gA1);
+
+  // Fill to capacity (3) and trigger LRU eviction with 4th distinct entry.
+  const gB = executor.getOrCreateBindGroup(layout, [
+    { binding: 0, resource: { buffer: bufB, offset: 0, size: 256 } },
+  ]);
+  assert.ok(gB);
+  // Touch gA1 so gAOff becomes oldest LRU.
+  assert.equal(
+    executor.getOrCreateBindGroup(layout, [
+      { binding: 0, resource: { buffer: bufA, offset: 0, size: 256 } },
+      { binding: 1, resource: sampler },
+    ]),
+    gA1
+  );
+  const evictionsBefore = executor.getStats().bindGroupCacheEvictions;
+  const gC = executor.getOrCreateBindGroup(layout, [
+    { binding: 0, resource: { buffer: bufC, offset: 0, size: 256 } },
+  ]);
+  assert.ok(gC);
+  assert.equal(executor.getStats().bindGroupCacheSize, 3);
+  assert.equal(executor.getStats().bindGroupCacheEvictions, evictionsBefore + 1);
+
+  // Destroyed bind group in cache is automatically evicted & recreated on lookup.
+  gC.destroyed = true;
+  const gC2 = executor.getOrCreateBindGroup(layout, [
+    { binding: 0, resource: { buffer: bufC, offset: 0, size: 256 } },
+  ]);
+  assert.ok(gC2);
+  assert.notEqual(gC2, gC);
+  assert.equal(executor.getStats().bindGroupCacheEvictions, evictionsBefore + 2);
+
+  // Destroyed backing buffer is rejected cleanly without returning stale cache entry.
+  bufD.destroy();
+  assert.equal(
+    executor.getOrCreateBindGroup(layout, [
+      { binding: 0, resource: { buffer: bufD, offset: 0, size: 256 } },
+    ]),
+    null
+  );
+
+  // setDevice() clears bind-group cache cleanly.
+  const envOther = createMockWebGpu();
+  executor.setDevice(envOther.device);
+  assert.equal(executor.getStats().bindGroupCacheSize, 0);
+});
+
+test('W166 per-reason skipped-draw accounting tracks every skip cause and matches skippedDraws invariant', () => {
+  const router = new ShaderFallbackRouter();
+
+  // 1. enableShaderFallback: false with no pipeline -> 'no-pipeline'
+  const envNoPipe = createMockWebGpu();
+  const execNoPipe = new DrawExecutor({
+    device: envNoPipe.device,
+    enableShaderFallback: false,
+  });
+  const rNoPipe = execNoPipe.draw(envNoPipe.pass, 6, 1);
+  assert.equal(rNoPipe.skipped, true);
+  assert.equal(rNoPipe.reason, 'no-pipeline');
+  assert.equal(execNoPipe.getStats().skippedNoPipeline, 1);
+  assert.equal(execNoPipe.getStats().skippedByReason['no-pipeline'], 1);
+
+  // 2. Comprehensive multi-reason skips on a single executor.
+  const env = createMockWebGpu();
+  const exec = new DrawExecutor({ device: env.device, shaderFallbackRouter: router });
+  const pipe = {
+    kind: 'GPURenderPipeline',
+    handle: 5001,
+    getBindGroupLayout: () => ({ kind: 'GPUBindGroupLayout' }),
+  };
+  const smallIb = env.device.createBuffer({ size: 12, usage: BUFFER_USAGE.INDEX });
+  const smallInd = env.device.createBuffer({ size: 16, usage: BUFFER_USAGE.INDIRECT });
+
+  exec.beginPass();
+  exec.setPipeline(pipe);
+  exec.setIndexBuffer(smallIb, 'uint16', 0);
+
+  // Invalid pass -> skippedNoPass
+  assert.equal(exec.draw(null, 6, 1).reason, 'invalid-render-pass');
+  // Zero count -> skippedInvalidRange + zeroCountDrawsSkipped
+  assert.equal(exec.draw(env.pass, 0, 1).reason, 'zero-draw-count');
+  assert.equal(exec.draw(env.pass, 6, 0).reason, 'zero-draw-count');
+  // OOB index draw -> skippedInvalidIndexBuffer + skippedInvalidRange
+  assert.equal(exec.drawIndexed(env.pass, 100, 1, 0, 0, 0).reason, 'invalid-index-buffer');
+  // Misaligned indirect draw -> skippedInvalidIndirectBuffer + skippedInvalidRange
+  assert.equal(exec.drawIndirect(env.pass, smallInd, 2).reason, 'invalid-indirect-buffer');
+  // OOB indexed indirect draw (needs 20B, buffer is 16B) -> skippedInvalidIndirectBuffer + skippedInvalidRange
+  assert.equal(exec.drawIndexedIndirect(env.pass, smallInd, 0).reason, 'invalid-indirect-buffer');
+
+  // Throwing pass -> skippedPassError
+  const failingPass = { ...env.pass, draw() { throw new Error('boom'); } };
+  assert.equal(exec.draw(failingPass, 6, 1).reason, 'pass-error');
+
+  // Destroyed executor -> skippedDestroyed
+  exec.destroy();
+  assert.equal(exec.draw(env.pass, 6, 1).reason, 'executor-destroyed');
+
+  const stats = exec.getStats();
+  assert.equal(stats.skippedDraws, 8);
+  assert.equal(stats.skippedNoPass, 1);
+  assert.equal(stats.zeroCountDrawsSkipped, 2);
+  assert.equal(stats.skippedInvalidIndexBuffer, 1);
+  assert.equal(stats.skippedInvalidIndirectBuffer, 2);
+  assert.equal(stats.skippedInvalidRange, 5); // 2 zero-count + 1 OOB index + 2 invalid indirect range
+  assert.equal(stats.skippedPassError, 1);
+  assert.equal(stats.skippedDestroyed, 1);
+
+  const sumByReason = Object.values(stats.skippedByReason).reduce((a, b) => a + b, 0);
+  assert.equal(sumByReason, stats.skippedDraws);
+
+  // Defensive clone of skippedByReason
+  stats.skippedByReason['zero-draw-count'] = 9999;
+  assert.equal(exec.getStats().skippedByReason['zero-draw-count'], 2);
+
+  // Pipeline creation failure & bind failure counters
+  const failPipeEnv = createMockWebGpu({ failCreateRenderPipeline: true });
+  const execFailPipe = new DrawExecutor({ device: failPipeEnv.device, shaderFallbackRouter: router });
+  assert.equal(execFailPipe.draw(failPipeEnv.pass, 3, 1).reason, 'pipeline-creation-failed');
+  assert.equal(execFailPipe.getStats().skippedNoPipeline, 1);
+
+  const failBgEnv = createMockWebGpu({ failCreateBindGroup: true });
+  const execFailBg = new DrawExecutor({ device: failBgEnv.device, shaderFallbackRouter: router });
+  assert.equal(
+    execFailBg.executeDraw(failBgEnv.pass, { vertexCount: 3, hasBoundCbv: true }).reason,
+    'fallback-cbv-bind-failed'
+  );
+  assert.equal(execFailBg.getStats().skippedBindFailed, 1);
+
+  // resetStats() clears every skip counter and skippedByReason map.
+  exec.resetStats();
+  const cleared = exec.getStats();
+  assert.equal(cleared.skippedDraws, 0);
+  assert.equal(cleared.skippedNoPass, 0);
+  assert.equal(cleared.skippedNoPipeline, 0);
+  assert.equal(cleared.skippedInvalidRange, 0);
+  assert.equal(cleared.skippedInvalidIndexBuffer, 0);
+  assert.equal(cleared.skippedInvalidIndirectBuffer, 0);
+  assert.equal(cleared.skippedBindFailed, 0);
+  assert.equal(cleared.skippedPassError, 0);
+  assert.equal(cleared.skippedDestroyed, 0);
+  assert.deepEqual(cleared.skippedByReason, {});
+});
+
+test('W166 high-frequency menu, font-glyph, and intro-video burst (5,000+ draws) minimizes WebGPU bindings and tracks UI/glyph/video telemetry', () => {
+  const { device, pass, calls } = createMockWebGpu();
+  const router = new ShaderFallbackRouter();
+  const executor = new DrawExecutor({ device, shaderFallbackRouter: router });
+
+  const uiPipeline = {
+    kind: 'GPURenderPipeline',
+    handle: 6001,
+    label: 'menu_ui_quad_alpha',
+    desc: {
+      fragment: {
+        targets: [
+          {
+            format: 'bgra8unorm',
+            blend: {
+              color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' },
+              alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
+            },
+          },
+        ],
+      },
+    },
+    getBindGroupLayout: () => ({ kind: 'GPUBindGroupLayout', handle: 6101 }),
+  };
+
+  const glyphPipeline = {
+    kind: 'GPURenderPipeline',
+    handle: 6002,
+    label: 'scaleform_font_glyph',
+    alphaBlended: true,
+    getBindGroupLayout: () => ({ kind: 'GPUBindGroupLayout', handle: 6102 }),
+  };
+
+  const videoPipeline = {
+    kind: 'GPURenderPipeline',
+    handle: 6003,
+    label: 'bink_intro_video_nv12',
+    getBindGroupLayout: () => ({ kind: 'GPUBindGroupLayout', handle: 6103 }),
+  };
+
+  const vb = device.createBuffer({ size: 65536, usage: BUFFER_USAGE.VERTEX });
+  const ib = device.createBuffer({ size: 65536, usage: BUFFER_USAGE.INDEX });
+  const uiBg = { kind: 'GPUBindGroup', handle: 6201 };
+  const glyphBg = { kind: 'GPUBindGroup', handle: 6202 };
+  const videoBg = { kind: 'GPUBindGroup', handle: 6203 };
+
+  executor.beginPass();
+  executor.setVertexBuffer(0, vb, 0);
+  executor.setIndexBuffer(ib, 'uint16', 0);
+
+  // 1. 2,000 alpha-blended UI quad draws sharing one pipeline/BG/VB/IB.
+  executor.setPipeline(uiPipeline);
+  executor.setBindGroup(0, uiBg);
+  for (let i = 0; i < 2000; i += 1) {
+    const r = executor.drawIndexed(pass, 6, 1, 0, 0, 0);
+    assert.equal(r.executed, true);
+  }
+
+  // 2. 3,000 alpha-blended font glyph draws; dynamic offset changes every 100 glyphs (30 unique offsets).
+  executor.setPipeline(glyphPipeline);
+  const dynOffset = new Uint32Array([0]);
+  executor.setBindGroup(0, glyphBg, dynOffset);
+  for (let i = 0; i < 3000; i += 1) {
+    dynOffset[0] = Math.floor(i / 100) * 256;
+    const r = executor.drawIndexed(pass, 6, 1, 0, 0, 0);
+    assert.equal(r.executed, true);
+  }
+
+  // 3. 10 intro-video fullscreen draws.
+  executor.setPipeline(videoPipeline);
+  executor.setBindGroup(0, videoBg);
+  for (let i = 0; i < 10; i += 1) {
+    const r = executor.draw(pass, 3, 1);
+    assert.equal(r.executed, true);
+  }
+
+  const stats = executor.getStats();
+  assert.equal(stats.totalDraws, 5010);
+  assert.equal(stats.normalDraws, 5010);
+  assert.equal(stats.uiQuadDraws, 2000);
+  assert.equal(stats.fontGlyphDraws, 3000);
+  assert.equal(stats.videoDraws, 10);
+  assert.equal(stats.alphaBlendedDraws, 5000);
+
+  // Out of 5,010 draws:
+  // - setPipeline: called ONLY 3 times (5,007 elided!)
+  // - setVertexBuffer: called ONLY 1 time (5,009 elided!)
+  // - setIndexBuffer: called ONLY 1 time across 5,000 indexed draws (4,999 elided!)
+  // - setBindGroup: called ONLY 32 times (1 ui + 30 distinct glyph dynamic offsets + 1 video; 4,978 elided!)
+  assert.equal(calls.pass.filter((c) => c.op === 'setPipeline').length, 3);
+  assert.equal(calls.pass.filter((c) => c.op === 'setVertexBuffer').length, 1);
+  assert.equal(calls.pass.filter((c) => c.op === 'setIndexBuffer').length, 1);
+  assert.equal(calls.pass.filter((c) => c.op === 'setBindGroup').length, 32);
+  assert.equal(stats.redundantPipelineSkips, 5007);
+  assert.equal(stats.redundantVertexBufferSkips, 5009);
+  assert.equal(stats.redundantIndexBufferSkips, 4999);
+  assert.equal(stats.redundantBindGroupSkips, 4978);
+});
