@@ -3343,5 +3343,432 @@ class ChromeMenuFlow2InputScriptTests(unittest.TestCase):
             self.assertEqual(cmd_meta["input_script"], "chrome-menu-flow-2")
 
 
+class CdpTimeoutHoldUntilVisibleAndRollingFpsTests(unittest.TestCase):
+    def test_cdp_timeout_and_oserror_resilience_in_probe_capture_input_and_force_smoke(self):
+        class FakeProc:
+            returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = 0
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                self.returncode = -9
+
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            run_dir = fx.build / "runs" / "t94-timeout-resilience"
+            run_dir.mkdir(parents=True)
+            fake_clock = {"t": 1000.0}
+            probe_timeouts: list[float | None] = []
+            counts = {"probe": 0, "force_smoke": 0, "shot": 0, "key": 0}
+            fake_jpeg_b64 = base64.b64encode(b"\xff\xd8\xff\xe0test\xff\xd9").decode("ascii")
+
+            class FlakyCdp:
+                def __init__(self, ws_url: str) -> None:
+                    self.ws_url = ws_url
+
+                def connect(self):
+                    return None
+
+                def close(self):
+                    return None
+
+                def send(self, method: str, params=None, timeout=None):
+                    params = params or {}
+                    if method == "Runtime.evaluate":
+                        expr = params.get("expression", "")
+                        if expr == rbb.FORCE_SMOKE_JS:
+                            counts["force_smoke"] += 1
+                            raise TimeoutError("CDP WebSocket read timed out during force-smoke")
+                        probe_timeouts.append(timeout)
+                        counts["probe"] += 1
+                        if counts["probe"] == 1:
+                            raise TimeoutError("CDP WebSocket read timed out during wasm compile")
+                        if counts["probe"] == 2:
+                            raise OSError("temporary socket hiccup")
+                        if counts["probe"] == 3:
+                            return {
+                                "result": {
+                                    "value": make_sample_probe(
+                                        boot_mode="real-wasm64",
+                                        session_state="booting",
+                                        presents=10,
+                                    )
+                                }
+                            }
+                        return {
+                            "result": {
+                                "value": make_sample_probe(
+                                    boot_mode="smoke-demo",
+                                    session_state="running_smoke",
+                                    presents=40,
+                                )
+                            }
+                        }
+                    if method == "Page.captureScreenshot":
+                        counts["shot"] += 1
+                        if counts["shot"] == 1:
+                            raise TimeoutError("screenshot timeout")
+                        return {"data": fake_jpeg_b64}
+                    if method == "Input.dispatchKeyEvent":
+                        counts["key"] += 1
+                        if counts["key"] == 1:
+                            raise TimeoutError("key dispatch timeout")
+                        return {}
+                    return {}
+
+                def drain_events(self, timeout: float = 0.0):
+                    fake_clock["t"] += 0.6
+                    return []
+
+            with (
+                mock.patch.object(rbb.time, "monotonic", side_effect=lambda: fake_clock["t"]),
+                mock.patch.object(rbb.time, "sleep", side_effect=lambda _s: None),
+            ):
+                sess = rbb.run_browser_session(
+                    repo=fx.repo,
+                    run_dir=run_dir,
+                    chrome_path=fx.chrome,
+                    port=0,
+                    boot_dir=None,
+                    game_dir=None,
+                    shaders_dir=None,
+                    duration_s=7.0,
+                    headless=True,
+                    smoke=True,
+                    send_input=True,
+                    capture_frames=True,
+                    frame_interval_s=1.0,
+                    encode_mp4=False,
+                    popen_fn=lambda cmd, **kw: FakeProc(),
+                    cdp_factory=FlakyCdp,
+                    wait_server_fn=lambda *a, **k: {"status_code": 200, "coop": "same-origin", "coep": "require-corp"},
+                    wait_cdp_fn=lambda *a, **k: "ws://127.0.0.1:9222/devtools/page/1",
+                )
+
+            self.assertTrue(sess.ok)
+            self.assertFalse(sess.crashed)
+            self.assertEqual(sess.status, "ok")
+            self.assertGreaterEqual(counts["probe"], 4)
+            self.assertEqual(counts["force_smoke"], 1)
+            self.assertTrue(all(t == rbb.CDP_PROBE_TIMEOUT_S for t in probe_timeouts))
+            self.assertEqual(rbb.CDP_PROBE_TIMEOUT_S, 15.0)
+            self.assertGreaterEqual(len(sess.captured_frames), 1)
+            self.assertGreaterEqual(sess.scripted_inputs_sent, 1)
+            self.assertEqual(sess.final_probe["bootState"]["presentCount"], 40)
+            self.assertGreaterEqual(len(sess.presents), 2)
+            self.assertEqual(sess.presents[0]["present_count"], 10)
+            self.assertEqual(sess.presents[-1]["present_count"], 40)
+
+            # Startup TimeoutError during Page.navigate returns a clean error result instead of raising
+            class StartupTimeoutCdp(FlakyCdp):
+                def send(self, method: str, params=None, timeout=None):
+                    if method == "Page.navigate":
+                        raise TimeoutError("navigate timed out")
+                    return {}
+
+            run_dir2 = fx.build / "runs" / "t94-startup-timeout"
+            run_dir2.mkdir(parents=True)
+            sess_err = rbb.run_browser_session(
+                repo=fx.repo,
+                run_dir=run_dir2,
+                chrome_path=fx.chrome,
+                port=0,
+                boot_dir=None,
+                game_dir=None,
+                shaders_dir=None,
+                duration_s=1.0,
+                headless=True,
+                smoke=True,
+                send_input=False,
+                capture_frames=False,
+                frame_interval_s=1.0,
+                encode_mp4=False,
+                popen_fn=lambda cmd, **kw: FakeProc(),
+                cdp_factory=StartupTimeoutCdp,
+                wait_server_fn=lambda *a, **k: {"status_code": 200, "coop": "same-origin", "coep": "require-corp"},
+                wait_cdp_fn=lambda *a, **k: "ws://127.0.0.1:9222/devtools/page/1",
+            )
+            self.assertFalse(sess_err.ok)
+            self.assertTrue(sess_err.crashed)
+            self.assertEqual(sess_err.status, "error")
+            self.assertIn("navigate timed out", sess_err.message)
+
+    def test_hold_until_visible_flag_url_building_dry_run_and_cli(self):
+        parser = rbb.build_arg_parser()
+        self.assertIsNone(parser.parse_args([]).hold_until_visible)
+        self.assertEqual(parser.parse_args(["--hold-until-visible", "auto"]).hold_until_visible, "auto")
+        self.assertEqual(parser.parse_args(["--hold-until-visible", "on"]).hold_until_visible, "on")
+        self.assertEqual(parser.parse_args(["--hold-until-visible", "off"]).hold_until_visible, "off")
+        self.assertIn("--hold-until-visible", parser.format_help())
+
+        # URL building: omitted & auto omit query param; on -> 1; off -> 0
+        self.assertEqual(rbb.build_target_url("127.0.0.1", 8080), "http://127.0.0.1:8080/")
+        self.assertEqual(
+            rbb.build_target_url("127.0.0.1", 8080, hold_until_visible="auto"),
+            "http://127.0.0.1:8080/",
+        )
+        self.assertEqual(
+            rbb.build_target_url("127.0.0.1", 8080, hold_until_visible="on"),
+            "http://127.0.0.1:8080/?holdUntilVisible=1",
+        )
+        self.assertEqual(
+            rbb.build_target_url("127.0.0.1", 8080, hold_until_visible="off"),
+            "http://127.0.0.1:8080/?holdUntilVisible=0",
+        )
+        self.assertEqual(
+            rbb.build_target_url(
+                "127.0.0.1",
+                8080,
+                smoke=True,
+                input_script="chrome-menu-flow-2",
+                hide_hud=True,
+                hold_until_visible="off",
+            ),
+            "http://127.0.0.1:8080/?smoke=1&inputScript=chrome-menu-flow-2&hud=0&holdUntilVisible=0",
+        )
+        with self.assertRaises(rbb.RunnerError):
+            rbb.validate_hold_until_visible("maybe")
+
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+
+            # Invalid CLI value returns exit 2
+            bad_code, _, _, _, _ = fx.run_cli("--smoke", "--dry-run", "--hold-until-visible", "invalid")
+            self.assertEqual(bad_code, 2)
+
+            # Dry-run: omitted, auto, off, on
+            for flag_args, expected_val, expected_url in (
+                ([], None, "http://127.0.0.1:<ephemeral>/?smoke=1"),
+                (["--hold-until-visible", "auto"], "auto", "http://127.0.0.1:<ephemeral>/?smoke=1"),
+                (["--hold-until-visible", "off"], "off", "http://127.0.0.1:<ephemeral>/?smoke=1&holdUntilVisible=0"),
+                (["--hold-until-visible", "on"], "on", "http://127.0.0.1:<ephemeral>/?smoke=1&holdUntilVisible=1"),
+            ):
+                code, out, err, _, _ = fx.run_cli("--smoke", "--dry-run", "--name", "huv-dry", *flag_args)
+                self.assertEqual(code, 0, err)
+                payload = json.loads(out)
+                self.assertEqual(payload["hold_until_visible"], expected_val)
+                self.assertEqual(payload["url"], expected_url)
+
+            # Live CLI run forwards hold_until_visible to session_runner, command.json, and telemetry.json
+            code_cli, _, err_cli, _, sessions = fx.run_cli(
+                "--smoke",
+                "--name",
+                "huv-off",
+                "--hold-until-visible",
+                "off",
+            )
+            self.assertEqual(code_cli, 0, err_cli)
+            self.assertEqual(sessions[0]["hold_until_visible"], "off")
+            run_dir = fx.build / "runs" / "huv-off"
+            cmd_meta = json.loads((run_dir / "command.json").read_text(encoding="utf-8"))
+            telemetry = json.loads((run_dir / "telemetry.json").read_text(encoding="utf-8"))
+            self.assertEqual(cmd_meta["hold_until_visible"], "off")
+            self.assertEqual(telemetry["hold_until_visible"], "off")
+
+    def test_audio_ring_attached_extraction_from_boot_state_over_stale_audio_stats(self):
+        # Exact t84 repro: audioStats reports guestRingAttached=False while bootState.audioRingAttached=True
+        probe_t84 = make_sample_probe()
+        probe_t84["audioStats"] = {
+            "outputState": "running",
+            "guestRingAttached": False,
+            "guestFramesDrained": 0,
+        }
+        probe_t84["bootState"]["audioRingAttached"] = True
+        probe_t84["bootState"]["audio"] = {
+            "outputState": "running",
+            "framesDrained": 0,
+        }
+        probe_t84["diagnostics"]["audioRingAttached"] = True
+        sess_t84 = make_fake_session_result(probe=probe_t84)
+        self.assertEqual(rbb._extract_audio_ring_summary(sess_t84), (True, 0))
+
+        # Higher framesDrained in bootState.audio is also preserved over stale 0 in audioStats
+        probe_drained = make_sample_probe()
+        probe_drained["audioStats"] = {
+            "outputState": "running",
+            "guestRingAttached": False,
+            "guestFramesDrained": 0,
+        }
+        probe_drained["bootState"]["audioRingAttached"] = True
+        probe_drained["bootState"]["audio"] = {
+            "outputState": "running",
+            "framesDrained": 2400,
+        }
+        sess_drained = make_fake_session_result(probe=probe_drained)
+        self.assertEqual(rbb._extract_audio_ring_summary(sess_drained), (True, 2400))
+
+        # Snake-case telemetry-style boot_state is also accepted
+        sess_snake = make_fake_session_result(
+            probe={"boot_state": {"audioRingAttached": True, "audio": {"framesDrained": 960}}}
+        )
+        self.assertEqual(rbb._extract_audio_ring_summary(sess_snake), (True, 960))
+
+        # End-to-end report, telemetry, and digest reflect attached=true
+        rep = rbb.build_boot_report(sess_t84, smoke=False, preset="long")
+        tel = rbb.build_telemetry_payload(sess_t84, smoke=False, preset="long", headless=True)
+        dig = rbb.digest(rep, 0)
+        self.assertIs(rep["audio_ring_attached"], True)
+        self.assertIs(rep["summary"]["audio_ring_attached"], True)
+        self.assertIs(tel["audio_ring_attached"], True)
+        self.assertIs(tel["summary"]["audio_ring_attached"], True)
+        self.assertIn("audio_ring: attached=true, frames_drained=0", dig)
+
+        # Explicitly False across all sources remains attached=false
+        probe_false = make_sample_probe()
+        probe_false["audioStats"] = {"guestRingAttached": False, "guestFramesDrained": 0}
+        probe_false["bootState"]["audioRingAttached"] = False
+        sess_false = make_fake_session_result(probe=probe_false)
+        self.assertEqual(rbb._extract_audio_ring_summary(sess_false), (False, 0))
+
+    def test_rolling_fps_stats_and_swapchain_probe_telemetry_and_digest(self):
+        # 1. Ramp (0..10s @ 5 FPS) + steady state (10..50s @ 30 FPS) with explicit present_count
+        polled_samples: list[dict[str, Any]] = []
+        cum = 0
+        for sec in range(0, 51, 5):
+            if sec == 0:
+                cum = 0
+            elif sec <= 10:
+                cum += 25  # 5 FPS for 5s
+            else:
+                cum += 150  # 30 FPS for 5s
+            polled_samples.append({"index": len(polled_samples), "wall_ms": float(sec * 1000), "present_count": cum})
+        stats = rbb.compute_rolling_fps_stats(polled_samples)
+        self.assertEqual(stats["fps_steady_avg"], 30.0)
+        self.assertEqual(stats["fps_p50_window"], 30.0)
+        self.assertEqual(stats["fps_max_window"], 30.0)
+        self.assertEqual(stats["windows_ge_30fps_pct"], 80.0)
+
+        # 2. Mixed 5s windows: 10, 20, 30, 40 FPS -> median 25.0, max 40.0, 50.0% >= 30 FPS
+        mixed = [
+            {"wall_ms": 0.0, "present_count": 0},
+            {"wall_ms": 5000.0, "present_count": 50},    # 10 FPS
+            {"wall_ms": 10000.0, "present_count": 150},  # 20 FPS
+            {"wall_ms": 15000.0, "present_count": 300},  # 30 FPS
+            {"wall_ms": 20000.0, "present_count": 500},  # 40 FPS
+        ]
+        mixed_stats = rbb.compute_rolling_fps_stats(mixed)
+        self.assertEqual(mixed_stats["fps_p50_window"], 25.0)
+        self.assertEqual(mixed_stats["fps_max_window"], 40.0)
+        self.assertEqual(mixed_stats["windows_ge_30fps_pct"], 50.0)
+        self.assertEqual(mixed_stats["fps_steady_avg"], 30.0)
+
+        # 3. Per-present samples without present_count at 30 FPS for 10 seconds
+        per_present = [{"wall_ms": round(i * (1000.0 / 30.0), 3)} for i in range(301)]
+        pp_stats = rbb.compute_rolling_fps_stats(per_present)
+        self.assertEqual(pp_stats["fps_steady_avg"], 30.0)
+        self.assertEqual(pp_stats["fps_p50_window"], 30.0)
+        self.assertEqual(pp_stats["fps_max_window"], 30.0)
+        self.assertEqual(pp_stats["windows_ge_30fps_pct"], 100.0)
+
+        # 4. Subsampled samples without per-sample present_count return None (no bogus 1 FPS)
+        subsampled_no_counts = [{"wall_ms": 1000.0}, {"wall_ms": 2000.0}, {"wall_ms": 3000.0}]
+        sub_stats = rbb.compute_rolling_fps_stats(subsampled_no_counts, present_count=61)
+        self.assertEqual(
+            sub_stats,
+            {
+                "fps_steady_avg": None,
+                "fps_p50_window": None,
+                "fps_max_window": None,
+                "windows_ge_30fps_pct": None,
+            },
+        )
+
+        # 5. Degenerate / invalid inputs return all None
+        for bad in (None, [], [{"wall_ms": 1000.0}], [{"wall_ms": 1000.0}, {"wall_ms": 1000.0}]):
+            res_bad = rbb.compute_rolling_fps_stats(bad)
+            self.assertTrue(all(v is None for v in res_bad.values()), bad)
+
+        # 6. End-to-end telemetry.json, boot-report.json, and digest.txt with swapchain probe fields
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            probe = make_sample_probe(
+                boot_mode="real-wasm64",
+                session_state="running_wasm",
+                stage="FIRST_VISIBLE_FRAME",
+                presents=cum,
+                real_draws=500,
+                fallback_draws=0,
+            )
+            probe["bootState"]["audioRingAttached"] = True
+            probe["bootState"]["audio"] = {"framesDrained": 4800}
+            probe["audioStats"] = {"guestRingAttached": False, "guestFramesDrained": 0}
+            probe["bootState"]["gpu"]["swapchainProbeCount"] = 14
+            probe["bootState"]["gpu"]["lastSampledMaxLuma"] = 218
+            probe["bootState"]["gpu"]["suppressedBlackFrames"] = 6
+
+            session = make_fake_session_result(
+                probe=probe,
+                first_present_ms=0.0,
+                presents=polled_samples,
+            )
+            code, out, err, _, _ = fx.run_cli(
+                "--smoke",
+                "--name",
+                "t94-full",
+                session_runner=lambda **kw: session,
+            )
+            self.assertEqual(code, 0, err)
+            run_dir = fx.build / "runs" / "t94-full"
+            report = json.loads((run_dir / "boot-report.json").read_text(encoding="utf-8"))
+            telemetry = json.loads((run_dir / "telemetry.json").read_text(encoding="utf-8"))
+            digest_text = (run_dir / "digest.txt").read_text(encoding="utf-8")
+
+            for container in (report["summary"], telemetry["summary"]):
+                self.assertEqual(container["fps_steady_avg"], 30.0)
+                self.assertEqual(container["fps_p50_window"], 30.0)
+                self.assertEqual(container["fps_max_window"], 30.0)
+                self.assertEqual(container["windows_ge_30fps_pct"], 80.0)
+                self.assertEqual(container["swapchainProbeCount"], 14)
+                self.assertEqual(container["lastSampledMaxLuma"], 218)
+                self.assertEqual(container["suppressedBlackFrames"], 6)
+            self.assertEqual(telemetry["swapchainProbeCount"], 14)
+            self.assertEqual(telemetry["lastSampledMaxLuma"], 218)
+            self.assertEqual(telemetry["suppressedBlackFrames"], 6)
+            self.assertIn(
+                "fps_windows: fps_steady_avg=30.00, fps_p50_window=30.00, "
+                "fps_max_window=30.00, windows_ge_30fps_pct=80.0%",
+                digest_text,
+            )
+            self.assertIn(
+                "swapchain_probe: swapchainProbeCount=14, lastSampledMaxLuma=218, suppressedBlackFrames=6",
+                digest_text,
+            )
+            self.assertIn("audio_ring: attached=true, frames_drained=4800", digest_text)
+            self.assertIn("fps_windows:", out)
+
+            # Zero swapchain probe counters are surfaced when explicitly present; omitted when absent
+            probe_zeros = make_sample_probe()
+            probe_zeros["bootState"]["gpu"]["swapchainProbeCount"] = 0
+            probe_zeros["bootState"]["gpu"]["lastSampledMaxLuma"] = 0
+            probe_zeros["bootState"]["gpu"]["suppressedBlackFrames"] = 0
+            rep_z = rbb.build_boot_report(make_fake_session_result(probe=probe_zeros), smoke=True, preset="smoke")
+            self.assertEqual(rep_z["summary"]["swapchainProbeCount"], 0)
+            self.assertEqual(rep_z["summary"]["lastSampledMaxLuma"], 0)
+            self.assertEqual(rep_z["summary"]["suppressedBlackFrames"], 0)
+            self.assertIn(
+                "swapchain_probe: swapchainProbeCount=0, lastSampledMaxLuma=0, suppressedBlackFrames=0",
+                rbb.digest(rep_z, 0),
+            )
+
+            rep_absent = rbb.build_boot_report(make_fake_session_result(), smoke=True, preset="smoke")
+            tel_absent = rbb.build_telemetry_payload(make_fake_session_result(), smoke=True, preset="smoke", headless=True)
+            for k in ("swapchainProbeCount", "lastSampledMaxLuma", "suppressedBlackFrames"):
+                self.assertNotIn(k, rep_absent["summary"])
+                self.assertNotIn(k, tel_absent["summary"])
+                self.assertNotIn(k, tel_absent)
+            self.assertNotIn("swapchain_probe:", rbb.digest(rep_absent, 0))
+
+            # compare_boot_reports compatibility preserved
+            cmp_res = compare_boot_reports.compare(report, report, compare_boot_reports.Tolerances())
+            self.assertEqual(cmp_res.failures(), [])
+
+
 if __name__ == "__main__":
     unittest.main()
