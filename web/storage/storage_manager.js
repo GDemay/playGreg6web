@@ -4,6 +4,8 @@
 // from web/workers/userdata.js. Zero external dependencies; browser & Node testable.
 
 export const DEFAULT_OPFS_CACHE_DIR = 'playgta6-cache';
+export const DEFAULT_CACHE_INDEX_FILENAME = '.playgta6-cache-index.json';
+export const CACHE_INDEX_VERSION = 1;
 export const DEFAULT_USERDATA_DB_NAME = 'playgta6-userdata';
 export const DEFAULT_USERDATA_STORE_NAME = 'files';
 export const DEFAULT_USERDATA_DB_VERSION = 1;
@@ -12,11 +14,18 @@ export const SNAPSHOT_FORMAT = 'playgta6-userdata-snapshot';
 export const SNAPSHOT_VERSION = 1;
 export const DEFAULT_WARN_THRESHOLD_RATIO = 0.75;
 export const DEFAULT_CRITICAL_THRESHOLD_RATIO = 0.9;
+export const DEFAULT_QUOTA_BUDGET_RATIO = 0.6;
 export const QUOTA_PRESSURE_LEVELS = Object.freeze({
   OK: 'ok',
   WARN: 'warn',
   CRITICAL: 'critical',
   UNKNOWN: 'unknown',
+});
+export const CACHE_ENTRY_KINDS = Object.freeze({
+  SHADER_PACK: 'shader-pack',
+  PGIM: 'pgim',
+  RANGE_CHUNK: 'range-chunk',
+  GENERIC: 'generic',
 });
 
 const BYTE_UNITS = Object.freeze(['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB']);
@@ -367,6 +376,153 @@ function isNotFoundError(err) {
   return err.name === 'NotFoundError' || err.code === 8;
 }
 
+function isQuotaExceededError(err) {
+  if (!err) return false;
+  return (
+    err.name === 'QuotaExceededError' ||
+    err.code === 22 ||
+    err.code === 1014 ||
+    /quota/i.test(String(err.message || ''))
+  );
+}
+
+/**
+ * Validates that an OPFS cache entry key is a clean, relative, traversal-free path
+ * inside the cache directory and does not collide with the internal metadata index file.
+ *
+ * @param {string} key
+ * @param {string} [indexFileName=DEFAULT_CACHE_INDEX_FILENAME]
+ * @returns {string}
+ */
+export function validateCacheKey(key, indexFileName = DEFAULT_CACHE_INDEX_FILENAME) {
+  if (typeof key !== 'string' || key.length === 0) {
+    throw new Error('Cache key must be a non-empty string');
+  }
+  if (key.includes('\\') || key.includes('\0')) {
+    throw new Error(`Invalid cache key (forbidden character): ${key}`);
+  }
+  if (key.startsWith('/') || key.endsWith('/')) {
+    throw new Error(`Cache key must be a relative file path without leading/trailing slash: ${key}`);
+  }
+  const segments = key.split('/');
+  for (const seg of segments) {
+    if (!seg || seg === '.' || seg === '..') {
+      throw new Error(`Invalid cache key segment in: ${key}`);
+    }
+  }
+  if (key === indexFileName || key === DEFAULT_CACHE_INDEX_FILENAME) {
+    throw new Error(`Cache key "${key}" is reserved for the internal cache metadata index`);
+  }
+  return key;
+}
+
+/**
+ * Infers a coarse cache entry kind ('pgim', 'shader-pack', 'range-chunk', or 'generic')
+ * from a cache key.
+ *
+ * @param {string} key
+ * @returns {'pgim'|'shader-pack'|'range-chunk'|'generic'}
+ */
+export function inferCacheEntryKind(key) {
+  if (typeof key !== 'string' || key.length === 0) {
+    return CACHE_ENTRY_KINDS.GENERIC;
+  }
+  const lower = key.toLowerCase();
+  if (lower.endsWith('.pgim')) {
+    return CACHE_ENTRY_KINDS.PGIM;
+  }
+  if (
+    lower.endsWith('.wgsl.pack') ||
+    lower.endsWith('.wgsl') ||
+    lower.endsWith('.spv') ||
+    lower.endsWith('.spirv') ||
+    lower.endsWith('.shaderpack') ||
+    lower.startsWith('shaders/') ||
+    lower.includes('/shaders/')
+  ) {
+    return CACHE_ENTRY_KINDS.SHADER_PACK;
+  }
+  const leaf = key.includes('/') ? key.slice(key.lastIndexOf('/') + 1) : key;
+  if (/^c_\d+_\d+_.*\.bin$/.test(leaf)) {
+    return CACHE_ENTRY_KINDS.RANGE_CHUNK;
+  }
+  return CACHE_ENTRY_KINDS.GENERIC;
+}
+
+function normalizeOptionalTag(value) {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function normalizeCacheKind(kind, key) {
+  if (typeof kind === 'string') {
+    const trimmed = kind.trim();
+    if (
+      trimmed === CACHE_ENTRY_KINDS.PGIM ||
+      trimmed === CACHE_ENTRY_KINDS.SHADER_PACK ||
+      trimmed === CACHE_ENTRY_KINDS.RANGE_CHUNK ||
+      trimmed === CACHE_ENTRY_KINDS.GENERIC
+    ) {
+      return trimmed;
+    }
+  }
+  return inferCacheEntryKind(key);
+}
+
+function cloneCacheEntryMeta(entry) {
+  if (!entry) return null;
+  return {
+    key: entry.key,
+    sizeBytes: entry.sizeBytes,
+    lastAccessedMs: entry.lastAccessedMs,
+    createdAtMs: entry.createdAtMs,
+    etag: entry.etag,
+    versionKey: entry.versionKey,
+    pinned: entry.pinned,
+    kind: entry.kind,
+  };
+}
+
+async function readFileHandleBytes(handle) {
+  if (!handle || typeof handle.getFile !== 'function') {
+    return null;
+  }
+  const file = await handle.getFile();
+  if (!file) {
+    return null;
+  }
+  if (typeof file.arrayBuffer === 'function') {
+    const buf = await file.arrayBuffer();
+    return new Uint8Array(buf);
+  }
+  if (typeof file.text === 'function') {
+    return new TextEncoder().encode(await file.text());
+  }
+  return new Uint8Array(0);
+}
+
+async function readFileHandleMeta(handle) {
+  if (!handle || typeof handle.getFile !== 'function') {
+    return { size: 0, lastModified: 0 };
+  }
+  const file = await handle.getFile();
+  let size = 0;
+  if (file && Number.isFinite(file.size) && file.size >= 0) {
+    size = Math.floor(file.size);
+  } else if (file && typeof file.arrayBuffer === 'function') {
+    const buf = await file.arrayBuffer();
+    size = buf ? buf.byteLength : 0;
+  }
+  const lastModified =
+    file && typeof file.lastModified === 'number' && Number.isFinite(file.lastModified)
+      ? Math.max(0, Math.floor(file.lastModified))
+      : 0;
+  return { size, lastModified };
+}
+
 async function* iterateDirEntries(dirHandle) {
   if (!dirHandle) return;
   if (typeof dirHandle.entries === 'function') {
@@ -471,6 +627,29 @@ export class BrowserStorageManager {
     this.warnThresholdRatio = thresholds.warnThresholdRatio;
     this.criticalThresholdRatio = thresholds.criticalThresholdRatio;
 
+    this.maxCacheBytes =
+      typeof options.maxCacheBytes === 'number' &&
+      Number.isFinite(options.maxCacheBytes) &&
+      options.maxCacheBytes >= 0
+        ? Math.floor(options.maxCacheBytes)
+        : null;
+
+    this.quotaBudgetRatio =
+      typeof options.quotaBudgetRatio === 'number' && Number.isFinite(options.quotaBudgetRatio)
+        ? clampUnitRatio(options.quotaBudgetRatio, DEFAULT_QUOTA_BUDGET_RATIO)
+        : null;
+
+    this.cacheIndexFileName =
+      typeof options.cacheIndexFileName === 'string' &&
+      options.cacheIndexFileName.length > 0 &&
+      !options.cacheIndexFileName.includes('/') &&
+      !options.cacheIndexFileName.includes('\\') &&
+      !options.cacheIndexFileName.includes('\0')
+        ? options.cacheIndexFileName
+        : DEFAULT_CACHE_INDEX_FILENAME;
+
+    this.persistCacheIndex = options.persistCacheIndex !== false;
+
     this._evictedEntries = 0;
     this._evictedBytes = 0;
     this._cleanupCount = 0;
@@ -478,6 +657,22 @@ export class BrowserStorageManager {
     this._lastQuotaPressure = QUOTA_PRESSURE_LEVELS.UNKNOWN;
     this._lastQuotaUsageRatio = null;
     this._lastQuotaSampleAtMs = null;
+    this._lastQuotaBytes = 0;
+    this._lastQuotaUsageBytes = 0;
+
+    this._cacheEntries = new Map();
+    this._cacheIndexLoaded = false;
+    this._cacheAccessSeq = 0;
+    this._cacheEvictedEntries = 0;
+    this._cacheEvictedBytes = 0;
+    this._cacheHits = 0;
+    this._cacheMisses = 0;
+    this._cacheInvalidations = 0;
+  }
+
+  _nextAccessOrder() {
+    this._cacheAccessSeq += 1;
+    return this._cacheAccessSeq;
   }
 
   _readNowMs() {
@@ -511,6 +706,19 @@ export class BrowserStorageManager {
     this._lastQuotaPressure = pressure;
     this._lastQuotaUsageRatio = usageRatio;
     this._lastQuotaSampleAtMs = this._readNowMs();
+    if (
+      estimate &&
+      estimate.supported !== false &&
+      typeof estimate.quotaBytes === 'number' &&
+      Number.isFinite(estimate.quotaBytes) &&
+      estimate.quotaBytes > 0
+    ) {
+      this._lastQuotaBytes = Math.floor(estimate.quotaBytes);
+      this._lastQuotaUsageBytes = sanitizeNonNegativeInt(estimate.usageBytes);
+    } else {
+      this._lastQuotaBytes = 0;
+      this._lastQuotaUsageBytes = 0;
+    }
   }
 
   /**
@@ -582,6 +790,13 @@ export class BrowserStorageManager {
     this._lastQuotaPressure = QUOTA_PRESSURE_LEVELS.UNKNOWN;
     this._lastQuotaUsageRatio = null;
     this._lastQuotaSampleAtMs = null;
+    this._lastQuotaBytes = 0;
+    this._lastQuotaUsageBytes = 0;
+    this._cacheEvictedEntries = 0;
+    this._cacheEvictedBytes = 0;
+    this._cacheHits = 0;
+    this._cacheMisses = 0;
+    this._cacheInvalidations = 0;
     return this.getStats();
   }
 
@@ -680,6 +895,9 @@ export class BrowserStorageManager {
   async _collectOpfsEntries(dirHandle, prefix = '', out = []) {
     for await (const [name, handle] of iterateDirEntries(dirHandle)) {
       if (!handle || typeof name !== 'string') continue;
+      if (prefix === '' && name === this.cacheIndexFileName && handle.kind !== 'directory') {
+        continue;
+      }
       const relName = prefix ? `${prefix}/${name}` : name;
       if (handle.kind === 'directory') {
         await this._collectOpfsEntries(handle, relName, out);
@@ -689,6 +907,215 @@ export class BrowserStorageManager {
       }
     }
     return out;
+  }
+
+  async _collectOpfsEntriesWithMeta(dirHandle, prefix = '', out = []) {
+    for await (const [name, handle] of iterateDirEntries(dirHandle)) {
+      if (!handle || typeof name !== 'string') continue;
+      if (prefix === '' && name === this.cacheIndexFileName && handle.kind !== 'directory') {
+        continue;
+      }
+      const relName = prefix ? `${prefix}/${name}` : name;
+      if (handle.kind === 'directory') {
+        await this._collectOpfsEntriesWithMeta(handle, relName, out);
+      } else if (handle.kind === 'file' || typeof handle.getFile === 'function') {
+        const meta = await readFileHandleMeta(handle);
+        out.push({ name: relName, size: meta.size, lastModified: meta.lastModified });
+      }
+    }
+    return out;
+  }
+
+  async _ensureOpfsCacheDir({ create = false } = {}) {
+    const root = await this._resolveOpfsRoot();
+    if (!root) {
+      return { supported: false, dir: null };
+    }
+    try {
+      const dir = await root.getDirectoryHandle(this.opfsDirName, { create });
+      return { supported: true, dir };
+    } catch (err) {
+      if (!create && isNotFoundError(err)) {
+        return { supported: true, dir: null };
+      }
+      return { supported: false, dir: null };
+    }
+  }
+
+  async _getOpfsFileHandle(cacheDir, key, { create = false } = {}) {
+    const segments = key.split('/');
+    let dir = cacheDir;
+    for (let i = 0; i < segments.length - 1; i += 1) {
+      dir = await dir.getDirectoryHandle(segments[i], { create });
+    }
+    const leafName = segments[segments.length - 1];
+    return dir.getFileHandle(leafName, { create });
+  }
+
+  async _writeOpfsFile(cacheDir, key, bytes) {
+    const handle = await this._getOpfsFileHandle(cacheDir, key, { create: true });
+    if (!handle || typeof handle.createWritable !== 'function') {
+      throw new Error(`OPFS file handle for "${key}" does not support createWritable()`);
+    }
+    const writable = await handle.createWritable();
+    try {
+      await writable.write(bytes);
+      await writable.close();
+    } catch (err) {
+      if (typeof writable.abort === 'function') {
+        try {
+          await writable.abort();
+        } catch {
+          // Ignore abort errors.
+        }
+      }
+      throw err;
+    }
+  }
+
+  async _readOpfsFile(cacheDir, key) {
+    let handle;
+    try {
+      handle = await this._getOpfsFileHandle(cacheDir, key, { create: false });
+    } catch (err) {
+      if (isNotFoundError(err)) {
+        return null;
+      }
+      throw err;
+    }
+    return readFileHandleBytes(handle);
+  }
+
+  async _removeOpfsFile(cacheDir, key) {
+    const segments = key.split('/');
+    const dirChain = [{ dir: cacheDir, name: null }];
+    let dir = cacheDir;
+    for (let i = 0; i < segments.length - 1; i += 1) {
+      try {
+        dir = await dir.getDirectoryHandle(segments[i], { create: false });
+        dirChain.push({ dir, name: segments[i] });
+      } catch (err) {
+        if (isNotFoundError(err)) {
+          return false;
+        }
+        throw err;
+      }
+    }
+    const leafName = segments[segments.length - 1];
+    if (typeof dir.removeEntry !== 'function') {
+      return false;
+    }
+    let removed = false;
+    try {
+      await dir.removeEntry(leafName);
+      removed = true;
+    } catch (err) {
+      if (!isNotFoundError(err)) {
+        throw err;
+      }
+    }
+
+    // Best-effort prune of now-empty nested subdirectories (never removes cacheDir itself).
+    for (let i = dirChain.length - 1; i >= 1; i -= 1) {
+      const child = dirChain[i];
+      const parent = dirChain[i - 1].dir;
+      try {
+        let hasAny = false;
+        for await (const _ of iterateDirEntries(child.dir)) {
+          hasAny = true;
+          break;
+        }
+        if (!hasAny && typeof parent.removeEntry === 'function') {
+          await parent.removeEntry(child.name);
+        } else {
+          break;
+        }
+      } catch {
+        break;
+      }
+    }
+
+    return removed;
+  }
+
+  async _readCacheIndexFile(cacheDir) {
+    if (!this.persistCacheIndex || !cacheDir || typeof cacheDir.getFileHandle !== 'function') {
+      return null;
+    }
+    try {
+      const handle = await cacheDir.getFileHandle(this.cacheIndexFileName, { create: false });
+      const bytes = await readFileHandleBytes(handle);
+      if (!bytes || bytes.byteLength === 0) {
+        return null;
+      }
+      const parsed = JSON.parse(new TextDecoder().decode(bytes));
+      if (!parsed || typeof parsed !== 'object' || parsed.version !== CACHE_INDEX_VERSION) {
+        return null;
+      }
+      if (!Array.isArray(parsed.entries)) {
+        return null;
+      }
+      return parsed.entries;
+    } catch {
+      return null;
+    }
+  }
+
+  async _persistCacheIndex(cacheDir) {
+    if (!this.persistCacheIndex || !cacheDir || typeof cacheDir.getFileHandle !== 'function') {
+      return false;
+    }
+    try {
+      const entries = Array.from(this._cacheEntries.values())
+        .sort((a, b) => compareAscii(a.key, b.key))
+        .map((e) => ({
+          key: e.key,
+          sizeBytes: e.sizeBytes,
+          lastAccessedMs: e.lastAccessedMs,
+          createdAtMs: e.createdAtMs,
+          etag: e.etag,
+          versionKey: e.versionKey,
+          pinned: e.pinned,
+          kind: e.kind,
+          accessOrder: e.accessOrder,
+        }));
+      const payload = new TextEncoder().encode(
+        JSON.stringify({
+          version: CACHE_INDEX_VERSION,
+          entries,
+        })
+      );
+      await this._writeOpfsFile(cacheDir, this.cacheIndexFileName, payload);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  _computeCacheTotals() {
+    let totalBytes = 0;
+    let pinnedCount = 0;
+    let pinnedBytes = 0;
+    for (const entry of this._cacheEntries.values()) {
+      totalBytes += entry.sizeBytes;
+      if (entry.pinned) {
+        pinnedCount += 1;
+        pinnedBytes += entry.sizeBytes;
+      }
+    }
+    return {
+      entryCount: this._cacheEntries.size,
+      totalBytes,
+      pinnedCount,
+      pinnedBytes,
+    };
+  }
+
+  async _refreshQuotaEstimateIfAvailable() {
+    if (this.storageObj && typeof this.storageObj.estimate === 'function') {
+      return this.getQuotaEstimate();
+    }
+    return null;
   }
 
   async inspectOpfsCache() {
@@ -757,6 +1184,8 @@ export class BrowserStorageManager {
       cacheDir = await root.getDirectoryHandle(this.opfsDirName, { create: false });
     } catch (err) {
       if (isNotFoundError(err)) {
+        this._cacheEntries.clear();
+        this._cacheIndexLoaded = true;
         this._recordCleanup(0, 0);
         return { supported: true, removedCount: 0, freedBytes: 0 };
       }
@@ -769,8 +1198,13 @@ export class BrowserStorageManager {
 
     try {
       const topLevel = [];
+      let hasIndexFile = false;
       for await (const [name, handle] of iterateDirEntries(cacheDir)) {
         if (!handle || typeof name !== 'string') continue;
+        if (name === this.cacheIndexFileName && handle.kind !== 'directory') {
+          hasIndexFile = true;
+          continue;
+        }
         if (handle.kind === 'directory') {
           const nested = await this._collectOpfsEntries(handle);
           let nestedBytes = 0;
@@ -796,6 +1230,18 @@ export class BrowserStorageManager {
         freedBytes += item.bytes;
       }
 
+      if (hasIndexFile) {
+        try {
+          await cacheDir.removeEntry(this.cacheIndexFileName);
+        } catch {
+          // Ignore index removal error.
+        }
+      }
+
+      this._cacheEntries.clear();
+      this._cacheIndexLoaded = true;
+      this._cacheEvictedEntries += removedCount;
+      this._cacheEvictedBytes += freedBytes;
       this._recordCleanup(removedCount, freedBytes);
       return {
         supported: true,
@@ -805,6 +1251,1131 @@ export class BrowserStorageManager {
     } catch {
       return unsupported;
     }
+  }
+
+  // --- OPFS Quota-Aware LRU & Integrity-Keyed Shader/PGIM Cache Management ---
+
+  /**
+   * Hydrates persisted cache metadata from OPFS and reconciles it against actual
+   * files in the cache directory (discovering untracked files and pruning missing ones).
+   *
+   * @param {object} [options]
+   * @param {boolean} [options.force=false] Re-read persisted index file even if already loaded.
+   */
+  async syncCacheIndex(options = {}) {
+    const { force = false } = options;
+    const { supported, dir: cacheDir } = await this._ensureOpfsCacheDir({ create: false });
+    if (!supported) {
+      return {
+        supported: false,
+        entryCount: 0,
+        totalBytes: 0,
+        discoveredCount: 0,
+        prunedCount: 0,
+      };
+    }
+
+    if (!cacheDir) {
+      const prunedCount = this._cacheEntries.size;
+      this._cacheEntries.clear();
+      this._cacheIndexLoaded = true;
+      return {
+        supported: true,
+        entryCount: 0,
+        totalBytes: 0,
+        discoveredCount: 0,
+        prunedCount,
+      };
+    }
+
+    if (!this._cacheIndexLoaded || force) {
+      const storedEntries = await this._readCacheIndexFile(cacheDir);
+      if (storedEntries) {
+        if (force) {
+          this._cacheEntries.clear();
+        }
+        for (const raw of storedEntries) {
+          if (!raw || typeof raw !== 'object' || typeof raw.key !== 'string') continue;
+          let validKey;
+          try {
+            validKey = validateCacheKey(raw.key, this.cacheIndexFileName);
+          } catch {
+            continue;
+          }
+          if (this._cacheEntries.has(validKey) && !force) {
+            continue;
+          }
+          const accessOrder =
+            Number.isInteger(raw.accessOrder) && raw.accessOrder > 0
+              ? raw.accessOrder
+              : this._nextAccessOrder();
+          if (accessOrder > this._cacheAccessSeq) {
+            this._cacheAccessSeq = accessOrder;
+          }
+          const lastAccessedMs = sanitizeTimestampMs(raw.lastAccessedMs) ?? 0;
+          const createdAtMs = sanitizeTimestampMs(raw.createdAtMs) ?? lastAccessedMs;
+          this._cacheEntries.set(validKey, {
+            key: validKey,
+            sizeBytes: sanitizeNonNegativeInt(raw.sizeBytes),
+            lastAccessedMs,
+            createdAtMs,
+            etag: normalizeOptionalTag(raw.etag),
+            versionKey: normalizeOptionalTag(raw.versionKey),
+            pinned: Boolean(raw.pinned),
+            kind: normalizeCacheKind(raw.kind, validKey),
+            accessOrder,
+          });
+        }
+      }
+    }
+
+    const diskEntries = await this._collectOpfsEntriesWithMeta(cacheDir);
+    diskEntries.sort((a, b) => compareAscii(a.name, b.name));
+
+    const presentKeys = new Set();
+    let discoveredCount = 0;
+
+    for (const file of diskEntries) {
+      let validKey;
+      try {
+        validKey = validateCacheKey(file.name, this.cacheIndexFileName);
+      } catch {
+        continue;
+      }
+      presentKeys.add(validKey);
+      const existing = this._cacheEntries.get(validKey);
+      if (existing) {
+        existing.sizeBytes = file.size;
+      } else {
+        const ts = sanitizeTimestampMs(file.lastModified) ?? 0;
+        this._cacheEntries.set(validKey, {
+          key: validKey,
+          sizeBytes: file.size,
+          lastAccessedMs: ts,
+          createdAtMs: ts,
+          etag: null,
+          versionKey: null,
+          pinned: false,
+          kind: inferCacheEntryKind(validKey),
+          accessOrder: this._nextAccessOrder(),
+        });
+        discoveredCount += 1;
+      }
+    }
+
+    let prunedCount = 0;
+    for (const key of Array.from(this._cacheEntries.keys())) {
+      if (!presentKeys.has(key)) {
+        this._cacheEntries.delete(key);
+        prunedCount += 1;
+      }
+    }
+
+    this._cacheIndexLoaded = true;
+    const totals = this._computeCacheTotals();
+    return {
+      supported: true,
+      entryCount: totals.entryCount,
+      totalBytes: totals.totalBytes,
+      discoveredCount,
+      prunedCount,
+    };
+  }
+
+  /**
+   * Stores an entry (such as a `.pgim` boot image, `.wgsl.pack` shader pack, or chunk)
+   * into OPFS with integrity metadata (`etag`, `versionKey`, `pinned`, `sizeBytes`, `lastAccessedMs`).
+   * Automatically recovers from OPFS `QuotaExceededError` via LRU eviction and enforces
+   * configured cache/quota budgets when enabled.
+   *
+   * @param {string} key Relative OPFS cache key (e.g. 'boot.pgim', 'shaders/main.wgsl.pack').
+   * @param {Uint8Array|ArrayBufferView|ArrayBuffer|string} data Payload bytes.
+   * @param {object} [options]
+   * @param {string|null} [options.etag] Optional HTTP ETag / integrity digest.
+   * @param {string|null} [options.versionKey] Optional content/build version key.
+   * @param {boolean} [options.pinned=false] When true, protects entry from LRU eviction.
+   * @param {string} [options.kind] Optional cache kind ('pgim'|'shader-pack'|'range-chunk'|'generic').
+   * @param {number} [options.maxBytes] Optional budget override enforced after storing.
+   * @param {boolean} [options.autoEvict=true] Whether to enforce configured budget after write.
+   * @param {boolean} [options.enforceQuota=false] Whether to also enforce browser quota budget.
+   * @param {number} [options.targetUsageRatio] Optional target quota usage ratio when enforceQuota is active.
+   */
+  async putCacheEntry(key, data, options = {}) {
+    const validKey = validateCacheKey(key, this.cacheIndexFileName);
+    const bytes = toUint8Array(data);
+
+    const { supported, dir: cacheDir } = await this._ensureOpfsCacheDir({ create: true });
+    if (!supported || !cacheDir) {
+      return {
+        supported: false,
+        stored: false,
+        key: validKey,
+        sizeBytes: 0,
+        replaced: false,
+        versionChanged: false,
+        quotaRecovered: false,
+        evictedEntries: 0,
+        evictedBytes: 0,
+        meta: null,
+      };
+    }
+
+    if (!this._cacheIndexLoaded) {
+      await this.syncCacheIndex();
+    }
+
+    const existing = this._cacheEntries.get(validKey) || null;
+    const replaced = existing !== null;
+    const etag = normalizeOptionalTag(options.etag);
+    const versionKey = normalizeOptionalTag(options.versionKey);
+    const pinned = options.pinned !== undefined ? Boolean(options.pinned) : false;
+    const kind = normalizeCacheKind(options.kind, validKey);
+
+    const versionChanged =
+      replaced &&
+      ((existing.etag !== etag && (existing.etag !== null || etag !== null)) ||
+        (existing.versionKey !== versionKey &&
+          (existing.versionKey !== null || versionKey !== null)));
+
+    let evictedEntries = 0;
+    let evictedBytes = 0;
+    let quotaRecovered = false;
+
+    try {
+      await this._writeOpfsFile(cacheDir, validKey, bytes);
+    } catch (err) {
+      if (!isQuotaExceededError(err)) {
+        throw err;
+      }
+      const totals = this._computeCacheTotals();
+      const targetBudget = Math.max(0, totals.totalBytes - Math.max(bytes.byteLength, 1));
+      const recovery = await this.evictToBudget(targetBudget, { excludeKeys: [validKey] });
+      evictedEntries += recovery.evictedEntries;
+      evictedBytes += recovery.evictedBytes;
+      await this._writeOpfsFile(cacheDir, validKey, bytes);
+      quotaRecovered = true;
+    }
+
+    if (versionChanged) {
+      this._cacheInvalidations += 1;
+    }
+
+    const nowMs = this._readNowMs() ?? 0;
+    const meta = {
+      key: validKey,
+      sizeBytes: bytes.byteLength,
+      lastAccessedMs: nowMs,
+      createdAtMs: existing && !versionChanged ? existing.createdAtMs : nowMs,
+      etag,
+      versionKey,
+      pinned,
+      kind,
+      accessOrder: this._nextAccessOrder(),
+    };
+    this._cacheEntries.set(validKey, meta);
+    await this._persistCacheIndex(cacheDir);
+
+    if (options.autoEvict !== false) {
+      let effectiveBudget =
+        typeof options.maxBytes === 'number' &&
+        Number.isFinite(options.maxBytes) &&
+        options.maxBytes >= 0
+          ? Math.floor(options.maxBytes)
+          : this.maxCacheBytes;
+
+      if (options.enforceQuota === true || this.quotaBudgetRatio !== null) {
+        const quota = await this.getQuotaEstimate();
+        const quotaBudget = this.computeQuotaBudget(quota, {
+          targetUsageRatio: options.targetUsageRatio,
+          maxBytes: effectiveBudget,
+        });
+        if (quotaBudget !== null) {
+          effectiveBudget =
+            effectiveBudget === null ? quotaBudget : Math.min(effectiveBudget, quotaBudget);
+        }
+      }
+
+      if (effectiveBudget !== null) {
+        const ev = await this.evictToBudget(effectiveBudget, { excludeKeys: [validKey] });
+        evictedEntries += ev.evictedEntries;
+        evictedBytes += ev.evictedBytes;
+      } else {
+        await this._refreshQuotaEstimateIfAvailable();
+      }
+    } else {
+      await this._refreshQuotaEstimateIfAvailable();
+    }
+
+    return {
+      supported: true,
+      stored: true,
+      key: validKey,
+      sizeBytes: bytes.byteLength,
+      replaced,
+      versionChanged,
+      quotaRecovered,
+      evictedEntries,
+      evictedBytes,
+      meta: cloneCacheEntryMeta(this._cacheEntries.get(validKey) || meta),
+    };
+  }
+
+  /**
+   * Reads a cached entry from OPFS, validating optional `etag`, `versionKey`, and `expectedSizeBytes`.
+   * On version/ETag/size mismatch, automatically invalidates and removes the stale entry from OPFS.
+   * On hit, updates `lastAccessedMs` and LRU order (unless `touch: false`).
+   *
+   * @param {string} key
+   * @param {object} [options]
+   * @param {string|null} [options.etag] Expected ETag; mismatches trigger invalidation.
+   * @param {string|null} [options.expectedEtag] Alias for `etag`.
+   * @param {string|null} [options.versionKey] Expected version key; mismatches trigger invalidation.
+   * @param {string|null} [options.expectedVersionKey] Alias for `versionKey`.
+   * @param {number} [options.expectedSizeBytes] Optional expected byte length for integrity validation.
+   * @param {boolean} [options.touch=true] Update `lastAccessedMs` and LRU recency on hit.
+   */
+  async getCacheEntry(key, options = {}) {
+    const validKey = validateCacheKey(key, this.cacheIndexFileName);
+    const { supported, dir: cacheDir } = await this._ensureOpfsCacheDir({ create: false });
+    if (!supported) {
+      return {
+        supported: false,
+        hit: false,
+        invalidated: false,
+        reason: 'unsupported',
+        key: validKey,
+        data: null,
+        meta: null,
+      };
+    }
+
+    if (!cacheDir) {
+      this._cacheMisses += 1;
+      return {
+        supported: true,
+        hit: false,
+        invalidated: false,
+        reason: 'not-found',
+        key: validKey,
+        data: null,
+        meta: null,
+      };
+    }
+
+    if (!this._cacheIndexLoaded) {
+      await this.syncCacheIndex();
+    }
+
+    const expectedEtag =
+      options.etag !== undefined
+        ? normalizeOptionalTag(options.etag)
+        : options.expectedEtag !== undefined
+          ? normalizeOptionalTag(options.expectedEtag)
+          : null;
+    const expectedVersionKey =
+      options.versionKey !== undefined
+        ? normalizeOptionalTag(options.versionKey)
+        : options.expectedVersionKey !== undefined
+          ? normalizeOptionalTag(options.expectedVersionKey)
+          : null;
+
+    const existing = this._cacheEntries.get(validKey) || null;
+
+    if (existing) {
+      if (expectedEtag !== null && existing.etag !== expectedEtag) {
+        await this._removeOpfsFile(cacheDir, validKey);
+        this._cacheEntries.delete(validKey);
+        await this._persistCacheIndex(cacheDir);
+        this._cacheInvalidations += 1;
+        this._cacheMisses += 1;
+        return {
+          supported: true,
+          hit: false,
+          invalidated: true,
+          reason: 'etag-mismatch',
+          key: validKey,
+          data: null,
+          meta: null,
+        };
+      }
+      if (expectedVersionKey !== null && existing.versionKey !== expectedVersionKey) {
+        await this._removeOpfsFile(cacheDir, validKey);
+        this._cacheEntries.delete(validKey);
+        await this._persistCacheIndex(cacheDir);
+        this._cacheInvalidations += 1;
+        this._cacheMisses += 1;
+        return {
+          supported: true,
+          hit: false,
+          invalidated: true,
+          reason: 'version-mismatch',
+          key: validKey,
+          data: null,
+          meta: null,
+        };
+      }
+    }
+
+    const bytes = await this._readOpfsFile(cacheDir, validKey);
+    if (bytes === null) {
+      if (existing) {
+        this._cacheEntries.delete(validKey);
+        await this._persistCacheIndex(cacheDir);
+      }
+      this._cacheMisses += 1;
+      return {
+        supported: true,
+        hit: false,
+        invalidated: false,
+        reason: 'not-found',
+        key: validKey,
+        data: null,
+        meta: null,
+      };
+    }
+
+    if (!existing && (expectedEtag !== null || expectedVersionKey !== null)) {
+      await this._removeOpfsFile(cacheDir, validKey);
+      await this._persistCacheIndex(cacheDir);
+      this._cacheInvalidations += 1;
+      this._cacheMisses += 1;
+      return {
+        supported: true,
+        hit: false,
+        invalidated: true,
+        reason: expectedEtag !== null ? 'etag-mismatch' : 'version-mismatch',
+        key: validKey,
+        data: null,
+        meta: null,
+      };
+    }
+
+    if (
+      typeof options.expectedSizeBytes === 'number' &&
+      Number.isFinite(options.expectedSizeBytes) &&
+      bytes.byteLength !== Math.floor(options.expectedSizeBytes)
+    ) {
+      await this._removeOpfsFile(cacheDir, validKey);
+      this._cacheEntries.delete(validKey);
+      await this._persistCacheIndex(cacheDir);
+      this._cacheInvalidations += 1;
+      this._cacheMisses += 1;
+      return {
+        supported: true,
+        hit: false,
+        invalidated: true,
+        reason: 'size-mismatch',
+        key: validKey,
+        data: null,
+        meta: null,
+      };
+    }
+
+    const nowMs = this._readNowMs() ?? 0;
+    let meta = existing;
+    if (!meta) {
+      meta = {
+        key: validKey,
+        sizeBytes: bytes.byteLength,
+        lastAccessedMs: nowMs,
+        createdAtMs: nowMs,
+        etag: null,
+        versionKey: null,
+        pinned: false,
+        kind: inferCacheEntryKind(validKey),
+        accessOrder: this._nextAccessOrder(),
+      };
+      this._cacheEntries.set(validKey, meta);
+    } else {
+      meta.sizeBytes = bytes.byteLength;
+      if (options.touch !== false) {
+        meta.lastAccessedMs = nowMs;
+        meta.accessOrder = this._nextAccessOrder();
+      }
+    }
+
+    this._cacheHits += 1;
+    if (options.touch !== false || !existing) {
+      await this._persistCacheIndex(cacheDir);
+    }
+
+    return {
+      supported: true,
+      hit: true,
+      invalidated: false,
+      reason: null,
+      key: validKey,
+      data: bytes,
+      meta: cloneCacheEntryMeta(meta),
+    };
+  }
+
+  /**
+   * Registers or updates metadata for an existing OPFS cache entry without rewriting
+   * its payload (useful for tagging or pinning files written by RangeCache or other workers).
+   *
+   * @param {string} key
+   * @param {object} [options]
+   */
+  async registerCacheEntry(key, options = {}) {
+    const validKey = validateCacheKey(key, this.cacheIndexFileName);
+    const { supported, dir: cacheDir } = await this._ensureOpfsCacheDir({ create: false });
+    if (!supported) {
+      return { supported: false, found: false, key: validKey, meta: null };
+    }
+    if (!cacheDir) {
+      return { supported: true, found: false, key: validKey, meta: null };
+    }
+    if (!this._cacheIndexLoaded) {
+      await this.syncCacheIndex();
+    }
+
+    let sizeBytes = sanitizeNonNegativeInt(options.sizeBytes);
+    const existing = this._cacheEntries.get(validKey) || null;
+
+    try {
+      const handle = await this._getOpfsFileHandle(cacheDir, validKey, { create: false });
+      const fileMeta = await readFileHandleMeta(handle);
+      sizeBytes = fileMeta.size;
+    } catch (err) {
+      if (isNotFoundError(err)) {
+        if (existing) {
+          this._cacheEntries.delete(validKey);
+          await this._persistCacheIndex(cacheDir);
+        }
+        return { supported: true, found: false, key: validKey, meta: null };
+      }
+      throw err;
+    }
+
+    const nowMs = this._readNowMs() ?? 0;
+    const lastAccessedMs =
+      options.lastAccessedMs !== undefined
+        ? (sanitizeTimestampMs(options.lastAccessedMs) ?? nowMs)
+        : existing
+          ? existing.lastAccessedMs
+          : nowMs;
+    const meta = {
+      key: validKey,
+      sizeBytes,
+      lastAccessedMs,
+      createdAtMs: existing ? existing.createdAtMs : nowMs,
+      etag:
+        options.etag !== undefined
+          ? normalizeOptionalTag(options.etag)
+          : existing
+            ? existing.etag
+            : null,
+      versionKey:
+        options.versionKey !== undefined
+          ? normalizeOptionalTag(options.versionKey)
+          : existing
+            ? existing.versionKey
+            : null,
+      pinned:
+        options.pinned !== undefined
+          ? Boolean(options.pinned)
+          : existing
+            ? existing.pinned
+            : false,
+      kind:
+        options.kind !== undefined
+          ? normalizeCacheKind(options.kind, validKey)
+          : existing
+            ? existing.kind
+            : inferCacheEntryKind(validKey),
+      accessOrder: existing ? existing.accessOrder : this._nextAccessOrder(),
+    };
+    this._cacheEntries.set(validKey, meta);
+    await this._persistCacheIndex(cacheDir);
+
+    return {
+      supported: true,
+      found: true,
+      key: validKey,
+      meta: cloneCacheEntryMeta(meta),
+    };
+  }
+
+  /**
+   * Marks an existing cache entry as recently accessed without reading its payload.
+   *
+   * @param {string} key
+   */
+  async touchCacheEntry(key) {
+    const validKey = validateCacheKey(key, this.cacheIndexFileName);
+    const { supported, dir: cacheDir } = await this._ensureOpfsCacheDir({ create: false });
+    if (!supported || !cacheDir) {
+      return null;
+    }
+    if (!this._cacheIndexLoaded) {
+      await this.syncCacheIndex();
+    }
+    const existing = this._cacheEntries.get(validKey);
+    if (!existing) {
+      return null;
+    }
+    existing.lastAccessedMs = this._readNowMs() ?? existing.lastAccessedMs;
+    existing.accessOrder = this._nextAccessOrder();
+    await this._persistCacheIndex(cacheDir);
+    return cloneCacheEntryMeta(existing);
+  }
+
+  /**
+   * Sets or clears the `pinned` flag on a cached entry (pinned entries are skipped by `evictToBudget`).
+   *
+   * @param {string} key
+   * @param {boolean} pinned
+   */
+  async setCacheEntryPinned(key, pinned) {
+    const validKey = validateCacheKey(key, this.cacheIndexFileName);
+    const { supported, dir: cacheDir } = await this._ensureOpfsCacheDir({ create: false });
+    if (!supported) {
+      return { supported: false, found: false, key: validKey, pinned: false, meta: null };
+    }
+    if (!cacheDir) {
+      return { supported: true, found: false, key: validKey, pinned: false, meta: null };
+    }
+    if (!this._cacheIndexLoaded) {
+      await this.syncCacheIndex();
+    }
+    const existing = this._cacheEntries.get(validKey);
+    if (!existing) {
+      return { supported: true, found: false, key: validKey, pinned: false, meta: null };
+    }
+    existing.pinned = Boolean(pinned);
+    await this._persistCacheIndex(cacheDir);
+    return {
+      supported: true,
+      found: true,
+      key: validKey,
+      pinned: existing.pinned,
+      meta: cloneCacheEntryMeta(existing),
+    };
+  }
+
+  async pinCacheEntry(key) {
+    return this.setCacheEntryPinned(key, true);
+  }
+
+  async unpinCacheEntry(key) {
+    return this.setCacheEntryPinned(key, false);
+  }
+
+  /**
+   * Deletes a single cache entry from OPFS and metadata tracking.
+   *
+   * @param {string} key
+   * @param {object} [options]
+   * @param {boolean} [options.respectPinned=false] Skip deletion when entry is pinned.
+   * @param {boolean} [options.countInvalidation=false] Increment invalidation counter on removal.
+   */
+  async deleteCacheEntry(key, options = {}) {
+    const validKey = validateCacheKey(key, this.cacheIndexFileName);
+    const { respectPinned = false, countInvalidation = false } = options;
+    const { supported, dir: cacheDir } = await this._ensureOpfsCacheDir({ create: false });
+    if (!supported) {
+      return {
+        supported: false,
+        removed: false,
+        skippedPinned: false,
+        key: validKey,
+        freedBytes: 0,
+      };
+    }
+    if (!cacheDir) {
+      return {
+        supported: true,
+        removed: false,
+        skippedPinned: false,
+        key: validKey,
+        freedBytes: 0,
+      };
+    }
+    if (!this._cacheIndexLoaded) {
+      await this.syncCacheIndex();
+    }
+
+    const existing = this._cacheEntries.get(validKey) || null;
+    if (existing && respectPinned && existing.pinned) {
+      return {
+        supported: true,
+        removed: false,
+        skippedPinned: true,
+        key: validKey,
+        freedBytes: 0,
+      };
+    }
+
+    const removedFromDisk = await this._removeOpfsFile(cacheDir, validKey);
+    const freedBytes = existing ? existing.sizeBytes : 0;
+    const existed = existing !== null || removedFromDisk;
+    if (existing) {
+      this._cacheEntries.delete(validKey);
+    }
+    if (existed) {
+      await this._persistCacheIndex(cacheDir);
+      if (countInvalidation) {
+        this._cacheInvalidations += 1;
+      }
+    }
+
+    return {
+      supported: true,
+      removed: existed,
+      skippedPinned: false,
+      key: validKey,
+      freedBytes,
+    };
+  }
+
+  async invalidateCacheEntry(key, options = {}) {
+    return this.deleteCacheEntry(key, {
+      ...options,
+      countInvalidation: options.countInvalidation !== false,
+    });
+  }
+
+  /**
+   * Bulk-invalidates cached entries whose `versionKey` or `etag` no longer matches
+   * the expected integrity values.
+   *
+   * Supports either:
+   * - `{ expectedVersionKey?, expectedEtag?, versionKey?, etag?, kind?, prefix?, includePinned? }`
+   * - `{ entries: { [key]: { versionKey?, etag? } }, includePinned? }`
+   *
+   * @param {object} [expectations]
+   */
+  async invalidateStaleCacheEntries(expectations = {}) {
+    const { supported, dir: cacheDir } = await this._ensureOpfsCacheDir({ create: false });
+    if (!supported) {
+      return {
+        supported: false,
+        invalidatedCount: 0,
+        freedBytes: 0,
+        invalidatedKeys: [],
+        skippedPinnedCount: 0,
+      };
+    }
+    if (!cacheDir) {
+      return {
+        supported: true,
+        invalidatedCount: 0,
+        freedBytes: 0,
+        invalidatedKeys: [],
+        skippedPinnedCount: 0,
+      };
+    }
+    if (!this._cacheIndexLoaded) {
+      await this.syncCacheIndex();
+    }
+
+    const includePinned = expectations.includePinned !== false;
+    const toRemove = [];
+    let skippedPinnedCount = 0;
+
+    if (expectations.entries && typeof expectations.entries === 'object') {
+      const keys = Object.keys(expectations.entries).sort(compareAscii);
+      for (const rawKey of keys) {
+        let validKey;
+        try {
+          validKey = validateCacheKey(rawKey, this.cacheIndexFileName);
+        } catch {
+          continue;
+        }
+        const entry = this._cacheEntries.get(validKey);
+        if (!entry) continue;
+        const spec = expectations.entries[rawKey];
+        if (!spec || typeof spec !== 'object') continue;
+        const expVer = normalizeOptionalTag(spec.versionKey ?? spec.expectedVersionKey);
+        const expEtag = normalizeOptionalTag(spec.etag ?? spec.expectedEtag);
+        const mismatch =
+          (expVer !== null && entry.versionKey !== expVer) ||
+          (expEtag !== null && entry.etag !== expEtag);
+        if (!mismatch) continue;
+        if (entry.pinned && !includePinned) {
+          skippedPinnedCount += 1;
+          continue;
+        }
+        toRemove.push(entry);
+      }
+    } else {
+      const expVer = normalizeOptionalTag(
+        expectations.expectedVersionKey ?? expectations.versionKey
+      );
+      const expEtag = normalizeOptionalTag(expectations.expectedEtag ?? expectations.etag);
+      const filterKind = typeof expectations.kind === 'string' ? expectations.kind : null;
+      const filterPrefix = typeof expectations.prefix === 'string' ? expectations.prefix : null;
+
+      const sortedEntries = Array.from(this._cacheEntries.values()).sort((a, b) =>
+        compareAscii(a.key, b.key)
+      );
+      for (const entry of sortedEntries) {
+        if (filterKind && entry.kind !== filterKind) continue;
+        if (filterPrefix && !entry.key.startsWith(filterPrefix)) continue;
+        const mismatch =
+          (expVer !== null && entry.versionKey !== expVer) ||
+          (expEtag !== null && entry.etag !== expEtag);
+        if (!mismatch) continue;
+        if (entry.pinned && !includePinned) {
+          skippedPinnedCount += 1;
+          continue;
+        }
+        toRemove.push(entry);
+      }
+    }
+
+    let invalidatedCount = 0;
+    let freedBytes = 0;
+    const invalidatedKeys = [];
+
+    for (const entry of toRemove) {
+      await this._removeOpfsFile(cacheDir, entry.key);
+      this._cacheEntries.delete(entry.key);
+      invalidatedCount += 1;
+      freedBytes += entry.sizeBytes;
+      invalidatedKeys.push(entry.key);
+    }
+
+    if (invalidatedCount > 0) {
+      this._cacheInvalidations += invalidatedCount;
+      await this._persistCacheIndex(cacheDir);
+    }
+
+    return {
+      supported: true,
+      invalidatedCount,
+      freedBytes,
+      invalidatedKeys,
+      skippedPinnedCount,
+    };
+  }
+
+  /**
+   * Deterministically evicts the least-recently-used unpinned OPFS cache entries
+   * until total cache bytes are at or below `maxBytes`.
+   *
+   * Pinned entries (such as the active boot `.pgim` or active shader pack) are never evicted.
+   * Ties in `lastAccessedMs` break deterministically by monotonic access sequence, then ASCII key.
+   *
+   * @param {number} [maxBytes=this.maxCacheBytes] Target maximum total cache bytes (>= 0).
+   * @param {object} [options]
+   * @param {Iterable<string>} [options.excludeKeys] Additional keys to skip during this eviction pass.
+   * @param {boolean} [options.sync=false] Force re-sync with OPFS before evicting.
+   */
+  async evictToBudget(maxBytes = this.maxCacheBytes, options = {}) {
+    const rawBudget = maxBytes === undefined || maxBytes === null ? this.maxCacheBytes : maxBytes;
+    if (typeof rawBudget !== 'number' || !Number.isFinite(rawBudget) || rawBudget < 0) {
+      throw new RangeError('Cache eviction budget maxBytes must be a finite non-negative number');
+    }
+    const budgetBytes = Math.floor(rawBudget);
+
+    const { supported, dir: cacheDir } = await this._ensureOpfsCacheDir({ create: false });
+    if (!supported) {
+      return {
+        supported: false,
+        budgetBytes,
+        beforeBytes: 0,
+        afterBytes: 0,
+        evictedEntries: 0,
+        evictedBytes: 0,
+        evictedKeys: [],
+        skippedPinnedCount: 0,
+        skippedPinnedBytes: 0,
+        budgetMet: true,
+      };
+    }
+
+    if (!cacheDir) {
+      this._cacheEntries.clear();
+      this._cacheIndexLoaded = true;
+      await this._refreshQuotaEstimateIfAvailable();
+      return {
+        supported: true,
+        budgetBytes,
+        beforeBytes: 0,
+        afterBytes: 0,
+        evictedEntries: 0,
+        evictedBytes: 0,
+        evictedKeys: [],
+        skippedPinnedCount: 0,
+        skippedPinnedBytes: 0,
+        budgetMet: true,
+      };
+    }
+
+    if (!this._cacheIndexLoaded || options.sync === true) {
+      await this.syncCacheIndex({ force: options.sync === true });
+    }
+
+    const excludeSet = new Set();
+    if (options.excludeKeys && typeof options.excludeKeys[Symbol.iterator] === 'function') {
+      for (const k of options.excludeKeys) {
+        if (typeof k === 'string') {
+          excludeSet.add(k);
+        }
+      }
+    }
+
+    let beforeBytes = 0;
+    let skippedPinnedCount = 0;
+    let skippedPinnedBytes = 0;
+    const candidates = [];
+
+    for (const entry of this._cacheEntries.values()) {
+      beforeBytes += entry.sizeBytes;
+      if (entry.pinned) {
+        skippedPinnedCount += 1;
+        skippedPinnedBytes += entry.sizeBytes;
+        continue;
+      }
+      if (excludeSet.has(entry.key)) {
+        continue;
+      }
+      candidates.push(entry);
+    }
+
+    if (beforeBytes <= budgetBytes) {
+      await this._refreshQuotaEstimateIfAvailable();
+      return {
+        supported: true,
+        budgetBytes,
+        beforeBytes,
+        afterBytes: beforeBytes,
+        evictedEntries: 0,
+        evictedBytes: 0,
+        evictedKeys: [],
+        skippedPinnedCount,
+        skippedPinnedBytes,
+        budgetMet: true,
+      };
+    }
+
+    // Deterministic LRU sort: oldest lastAccessedMs -> oldest accessOrder -> ASCII key.
+    candidates.sort((a, b) => {
+      if (a.lastAccessedMs !== b.lastAccessedMs) {
+        return a.lastAccessedMs - b.lastAccessedMs;
+      }
+      if (a.accessOrder !== b.accessOrder) {
+        return a.accessOrder - b.accessOrder;
+      }
+      return compareAscii(a.key, b.key);
+    });
+
+    let currentBytes = beforeBytes;
+    let evictedEntries = 0;
+    let evictedBytes = 0;
+    const evictedKeys = [];
+
+    for (const candidate of candidates) {
+      if (currentBytes <= budgetBytes) {
+        break;
+      }
+      await this._removeOpfsFile(cacheDir, candidate.key);
+      this._cacheEntries.delete(candidate.key);
+      currentBytes = Math.max(0, currentBytes - candidate.sizeBytes);
+      evictedEntries += 1;
+      evictedBytes += candidate.sizeBytes;
+      evictedKeys.push(candidate.key);
+    }
+
+    if (evictedEntries > 0) {
+      this._cacheEvictedEntries += evictedEntries;
+      this._cacheEvictedBytes += evictedBytes;
+      this._recordCleanup(evictedEntries, evictedBytes);
+      await this._persistCacheIndex(cacheDir);
+    }
+
+    await this._refreshQuotaEstimateIfAvailable();
+
+    return {
+      supported: true,
+      budgetBytes,
+      beforeBytes,
+      afterBytes: currentBytes,
+      evictedEntries,
+      evictedBytes,
+      evictedKeys,
+      skippedPinnedCount,
+      skippedPinnedBytes,
+      budgetMet: currentBytes <= budgetBytes,
+    };
+  }
+
+  /**
+   * Computes an effective OPFS cache byte budget from a browser storage quota estimate
+   * and optional explicit `maxBytes` / `targetUsageRatio` limits.
+   *
+   * @param {object|null} quotaEstimate
+   * @param {object} [options]
+   * @returns {number|null}
+   */
+  computeQuotaBudget(quotaEstimate, options = {}) {
+    const explicitMax =
+      typeof options.maxBytes === 'number' && Number.isFinite(options.maxBytes) && options.maxBytes >= 0
+        ? Math.floor(options.maxBytes)
+        : this.maxCacheBytes;
+
+    let quotaBudget = null;
+    if (
+      quotaEstimate &&
+      quotaEstimate.supported !== false &&
+      typeof quotaEstimate.quotaBytes === 'number' &&
+      Number.isFinite(quotaEstimate.quotaBytes) &&
+      quotaEstimate.quotaBytes > 0
+    ) {
+      const targetRatio = clampUnitRatio(
+        options.targetUsageRatio !== undefined
+          ? options.targetUsageRatio
+          : this.quotaBudgetRatio !== null
+            ? this.quotaBudgetRatio
+            : DEFAULT_QUOTA_BUDGET_RATIO,
+        DEFAULT_QUOTA_BUDGET_RATIO
+      );
+      const targetTotalUsage = Math.floor(quotaEstimate.quotaBytes * targetRatio);
+      const cacheBytes = this._computeCacheTotals().totalBytes;
+      const reportedUsage = sanitizeNonNegativeInt(quotaEstimate.usageBytes);
+      const nonCacheUsage = Math.max(0, reportedUsage - cacheBytes);
+      quotaBudget = Math.max(0, targetTotalUsage - nonCacheUsage);
+    }
+
+    if (quotaBudget !== null && explicitMax !== null) {
+      return Math.min(quotaBudget, explicitMax);
+    }
+    return quotaBudget !== null ? quotaBudget : explicitMax;
+  }
+
+  /**
+   * Samples browser storage quota and evicts LRU OPFS cache entries to fit within
+   * the quota-derived budget (capped by `maxCacheBytes` if configured).
+   *
+   * @param {object} [options]
+   * @param {number} [options.targetUsageRatio] Target quota usage ratio in [0, 1].
+   * @param {number} [options.maxBytes] Optional hard cap on cache bytes.
+   * @param {boolean} [options.onlyUnderPressure=false] When true, only evict if pressure is 'warn' or 'critical'.
+   */
+  async enforceQuotaBudget(options = {}) {
+    if (!this._cacheIndexLoaded) {
+      await this.syncCacheIndex();
+    }
+    const quota = await this.getQuotaEstimate();
+    const pressure = this.classifyQuotaPressure(quota, options);
+    const targetBudgetBytes = this.computeQuotaBudget(quota, options);
+
+    if (targetBudgetBytes === null) {
+      return {
+        supported: false,
+        pressure,
+        quota,
+        targetBudgetBytes: null,
+        evictedEntries: 0,
+        evictedBytes: 0,
+        evictedKeys: [],
+        skippedPinnedCount: 0,
+        skippedPinnedBytes: 0,
+        budgetMet: true,
+      };
+    }
+
+    if (
+      options.onlyUnderPressure === true &&
+      pressure !== QUOTA_PRESSURE_LEVELS.WARN &&
+      pressure !== QUOTA_PRESSURE_LEVELS.CRITICAL
+    ) {
+      const totals = this._computeCacheTotals();
+      return {
+        supported: true,
+        pressure,
+        quota,
+        targetBudgetBytes,
+        beforeBytes: totals.totalBytes,
+        afterBytes: totals.totalBytes,
+        evictedEntries: 0,
+        evictedBytes: 0,
+        evictedKeys: [],
+        skippedPinnedCount: totals.pinnedCount,
+        skippedPinnedBytes: totals.pinnedBytes,
+        budgetMet: totals.totalBytes <= targetBudgetBytes,
+      };
+    }
+
+    const eviction = await this.evictToBudget(targetBudgetBytes, options);
+    return {
+      ...eviction,
+      pressure,
+      quota,
+      targetBudgetBytes,
+    };
+  }
+
+  /**
+   * Returns a cloned metadata record for a tracked cache entry, or `null` if untracked.
+   *
+   * @param {string} key
+   */
+  getCacheEntryMeta(key) {
+    const validKey = validateCacheKey(key, this.cacheIndexFileName);
+    return cloneCacheEntryMeta(this._cacheEntries.get(validKey) || null);
+  }
+
+  /**
+   * Lists cloned metadata records for all tracked cache entries.
+   *
+   * @param {object} [options]
+   * @param {'key'|'lru'} [options.sortBy='key']
+   */
+  listCacheEntries(options = {}) {
+    const entries = Array.from(this._cacheEntries.values());
+    if (options.sortBy === 'lru') {
+      entries.sort((a, b) => {
+        if (a.lastAccessedMs !== b.lastAccessedMs) {
+          return a.lastAccessedMs - b.lastAccessedMs;
+        }
+        if (a.accessOrder !== b.accessOrder) {
+          return a.accessOrder - b.accessOrder;
+        }
+        return compareAscii(a.key, b.key);
+      });
+    } else {
+      entries.sort((a, b) => compareAscii(a.key, b.key));
+    }
+    return entries.map(cloneCacheEntryMeta);
+  }
+
+  /**
+   * Returns a sanitized snapshot of OPFS cache occupancy, eviction telemetry, and quota usage %.
+   */
+  getCacheStats() {
+    const totals = this._computeCacheTotals();
+    const budgetUsagePct =
+      this.maxCacheBytes !== null && this.maxCacheBytes > 0
+        ? Math.min(100, Math.round((totals.totalBytes / this.maxCacheBytes) * 10000) / 100)
+        : null;
+
+    let quotaUsagePct = 0;
+    if (this._lastQuotaUsageRatio !== null) {
+      quotaUsagePct = Math.min(100, Math.round(this._lastQuotaUsageRatio * 10000) / 100);
+    } else if (budgetUsagePct !== null) {
+      quotaUsagePct = budgetUsagePct;
+    }
+
+    return {
+      entryCount: totals.entryCount,
+      totalBytes: totals.totalBytes,
+      totalFormatted: formatBytes(totals.totalBytes),
+      pinnedCount: totals.pinnedCount,
+      pinnedBytes: totals.pinnedBytes,
+      evictedEntries: this._cacheEvictedEntries,
+      evictedBytes: this._cacheEvictedBytes,
+      evictedFormatted: formatBytes(this._cacheEvictedBytes),
+      quotaUsagePct,
+      budgetUsagePct,
+      maxCacheBytes: this.maxCacheBytes,
+      quotaPressure: this._lastQuotaPressure,
+      hits: this._cacheHits,
+      misses: this._cacheMisses,
+      invalidations: this._cacheInvalidations,
+    };
   }
 
   // --- IndexedDB /userdata Save Management ('playgta6-userdata' / 'files') ---
