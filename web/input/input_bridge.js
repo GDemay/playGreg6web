@@ -266,6 +266,10 @@ function buildPeriodicButtonEvents(startMs, endMs, periodMs, holdMs, button) {
 // - 'chrome-menu-flow': Chrome-timed equivalent for real Wasm64 browser boot (waits through the
 //   4K Bink2 intro & shader init with spaced A every 2500 ms from 165000 ms through 215000 ms,
 //   then loops DPAD_DOWN, DPAD_DOWN, A, A, A every 12000 ms from 218000 ms; never presses B or DPAD_UP).
+// - 'chrome-full-boot': Real Wasm64 headless Chrome preset that lets the entire 4K Bink2 intro
+//   video & Rockstar logo play unskipped before spaced A every 2500 ms from 235000 ms through
+//   295000 ms, then loops DPAD_DOWN, DPAD_DOWN, A, A, A every 12000 ms from 298000 ms to advance
+//   LEGAL NOTICES ("Next >") and subsequent setup screens (never presses B or DPAD_UP).
 export const INPUT_SCRIPT_PRESETS = Object.freeze({
   'start-screen': Object.freeze({
     name: 'start-screen',
@@ -343,6 +347,26 @@ export const INPUT_SCRIPT_PRESETS = Object.freeze({
     // LEGAL NOTICES ("Next >") and subsequent list screens (never B or DPAD_UP).
     loop: Object.freeze({
       startMs: 218000,
+      periodMs: 12000,
+      events: Object.freeze([
+        Object.freeze({ offsetMs: 0, holdMs: 100, button: INPUT_BUTTONS.DPAD_DOWN }),
+        Object.freeze({ offsetMs: 500, holdMs: 100, button: INPUT_BUTTONS.DPAD_DOWN }),
+        Object.freeze({ offsetMs: 1200, holdMs: 100, button: INPUT_BUTTONS.A }),
+        Object.freeze({ offsetMs: 4500, holdMs: 100, button: INPUT_BUTTONS.A }),
+        Object.freeze({ offsetMs: 8000, holdMs: 100, button: INPUT_BUTTONS.A }),
+      ]),
+    }),
+  }),
+  'chrome-full-boot': Object.freeze({
+    name: 'chrome-full-boot',
+    // Phase 1: Wait through the entire 4K Bink2 intro video & Rockstar logo in real Wasm64
+    // headless Chrome without skipping it, then press A every 2500 ms from 235000 ms
+    // through 295000 ms.
+    events: buildPeriodicButtonEvents(235000, 295000, 2500, 100, INPUT_BUTTONS.A),
+    // Phase 2: Loop DPAD_DOWN, DPAD_DOWN, A, A, A every 12000 ms from 298000 ms to advance
+    // LEGAL NOTICES ("Next >") and subsequent setup screens (never B or DPAD_UP).
+    loop: Object.freeze({
+      startMs: 298000,
       periodMs: 12000,
       events: Object.freeze([
         Object.freeze({ offsetMs: 0, holdMs: 100, button: INPUT_BUTTONS.DPAD_DOWN }),
