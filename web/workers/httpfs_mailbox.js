@@ -434,6 +434,7 @@ function createEmptyCacheStats() {
     prefetchIssued: 0,
     prefetchHits: 0,
     coalescedReads: 0,
+    crossLaneCoalesced: 0,
     bytesServedFromCache: 0,
     bytesFetchedFromNetwork: 0,
   };
@@ -507,6 +508,7 @@ class HttpfsLruChunkCache {
       prefetchIssued: 0,
       prefetchHits: 0,
       coalescedReads: 0,
+      crossLaneCoalesced: 0,
       bytesServedFromCache: 0,
       bytesFetchedFromNetwork: 0,
     };
@@ -551,9 +553,22 @@ class HttpfsLruChunkCache {
       prefetchIssued: this._stats.prefetchIssued,
       prefetchHits: this._stats.prefetchHits,
       coalescedReads: this._stats.coalescedReads,
+      crossLaneCoalesced: this._stats.crossLaneCoalesced,
       bytesServedFromCache: this._stats.bytesServedFromCache,
       bytesFetchedFromNetwork: this._stats.bytesFetchedFromNetwork,
     };
+  }
+
+  resetStats() {
+    this._stats.cacheHits = 0;
+    this._stats.cacheMisses = 0;
+    this._stats.cacheEvictions = 0;
+    this._stats.prefetchIssued = 0;
+    this._stats.prefetchHits = 0;
+    this._stats.coalescedReads = 0;
+    this._stats.crossLaneCoalesced = 0;
+    this._stats.bytesServedFromCache = 0;
+    this._stats.bytesFetchedFromNetwork = 0;
   }
 
   clear(options = {}) {
@@ -564,14 +579,7 @@ class HttpfsLruChunkCache {
       this._fileSizes.clear();
     }
     if (options && options.resetStats) {
-      this._stats.cacheHits = 0;
-      this._stats.cacheMisses = 0;
-      this._stats.cacheEvictions = 0;
-      this._stats.prefetchIssued = 0;
-      this._stats.prefetchHits = 0;
-      this._stats.coalescedReads = 0;
-      this._stats.bytesServedFromCache = 0;
-      this._stats.bytesFetchedFromNetwork = 0;
+      this.resetStats();
     }
   }
 
@@ -766,12 +774,13 @@ class HttpfsLruChunkCache {
     return chunkBytes;
   }
 
-  _startChunkFetch(url, chunkIndex, isPrefetch) {
+  _startChunkFetch(url, chunkIndex, isPrefetch, originLane = -1) {
     const key = makeHttpfsChunkKey(url, chunkIndex);
     const inFlightEntry = {
       promise: null,
       isPrefetch: Boolean(isPrefetch),
       prefetchHitCounted: false,
+      originLane: typeof originLane === 'number' && originLane >= 0 ? Math.floor(originLane) : -1,
     };
 
     const promise = this._fetchChunkNetwork(url, chunkIndex).then(
@@ -984,6 +993,10 @@ class HttpfsLruChunkCache {
 
     const firstChunk = Math.floor(off / this._chunkSize);
     let lastChunk = Math.floor((effectiveEndBefore - 1) / this._chunkSize);
+    const laneIndex =
+      options && typeof options.laneIndex === 'number' && options.laneIndex >= 0
+        ? Math.floor(options.laneIndex)
+        : -1;
 
     const resolveChunk = (chunkIdx) => {
       const key = makeHttpfsChunkKey(url, chunkIdx);
@@ -1001,6 +1014,14 @@ class HttpfsLruChunkCache {
       const existingInFlight = this._inFlight.get(key);
       if (existingInFlight) {
         this._stats.coalescedReads += 1;
+        const sameExplicitDemandLane =
+          laneIndex >= 0 &&
+          existingInFlight.originLane >= 0 &&
+          existingInFlight.originLane === laneIndex &&
+          !existingInFlight.isPrefetch;
+        if (!sameExplicitDemandLane) {
+          this._stats.crossLaneCoalesced += 1;
+        }
         if (existingInFlight.isPrefetch && !existingInFlight.prefetchHitCounted) {
           existingInFlight.prefetchHitCounted = true;
           this._stats.prefetchHits += 1;
@@ -1008,7 +1029,7 @@ class HttpfsLruChunkCache {
         return { fromCache: false, bytes: null, promise: existingInFlight.promise };
       }
 
-      const promise = this._startChunkFetch(url, chunkIdx, false);
+      const promise = this._startChunkFetch(url, chunkIdx, false, laneIndex);
       return { fromCache: false, bytes: null, promise };
     };
 
@@ -1198,6 +1219,8 @@ function createSharedMailboxHostState(options = {}, defaultReadAheadEnabled = fa
       maxWaitMs: 0,
       activePendingSlots: 0,
       peakPendingSlots: 0,
+      activeLanes: 0,
+      peakActiveLanes: 0,
       readAheadBytesServed: 0,
       readAheadHits: 0,
       readAheadFetches: 0,
@@ -1420,6 +1443,11 @@ class HttpfsMailboxHost {
     this._slotRequests = 0;
     this._slotSyncFastPathHits = 0;
     this._slotAsyncPathHits = 0;
+    this._laneIndex =
+      Number.isInteger(options._laneIndex) && options._laneIndex >= 0 ? options._laneIndex : -1;
+    this._laneReadOptions = { laneIndex: this._laneIndex };
+    this._inFlight = false;
+    this._slotActive = false;
     this._pendingFinalize = null;
     this._running = false;
     this._loopPromise = null;
@@ -1530,10 +1558,47 @@ class HttpfsMailboxHost {
       prefetchIssued: cacheStats.prefetchIssued,
       prefetchHits: cacheStats.prefetchHits,
       coalescedReads: cacheStats.coalescedReads,
+      crossLaneCoalesced: cacheStats.crossLaneCoalesced,
       bytesServedFromCache: cacheStats.bytesServedFromCache,
       bytesFetchedFromNetwork: cacheStats.bytesFetchedFromNetwork,
       handles,
     };
+  }
+
+  resetStats() {
+    const st = this._stats;
+    st.requests = 0;
+    st.syncFastPathHits = 0;
+    st.asyncPathHits = 0;
+    st.burstReads = 0;
+    st.totalWaitMs = 0;
+    st.waitSamples = 0;
+    st.maxWaitMs = 0;
+    st.peakPendingSlots = st.activePendingSlots;
+    st.peakActiveLanes = st.activeLanes;
+    st.readAheadBytesServed = 0;
+    st.readAheadHits = 0;
+    st.readAheadFetches = 0;
+    st.coalescedSlotReads = 0;
+    this._slotRequests = 0;
+    this._slotSyncFastPathHits = 0;
+    this._slotAsyncPathHits = 0;
+    for (const rec of this._shared.handleRecords.values()) {
+      rec.reads = 0;
+      rec.burstReads = 0;
+      rec.totalWaitMs = 0;
+      rec.waitSamples = 0;
+      rec.maxWaitMs = 0;
+      rec.peakPendingSlots = rec.activePendingSlots;
+      rec.readAheadBytesServed = 0;
+      rec.readAheadHits = 0;
+      rec.readAheadFetches = 0;
+      rec.coalescedSlotReads = 0;
+    }
+    const cc = this._shared.chunkCache;
+    if (cc && typeof cc.resetStats === 'function') {
+      cc.resetStats();
+    }
   }
 
   _resolveRangeCache() {
@@ -1857,7 +1922,7 @@ class HttpfsMailboxHost {
         finishWithTelemetry(syncBytes, reqLen, false);
         return;
       }
-      return chunkCache.read(url, offset, reqLen).then((resolved) => {
+      return chunkCache.read(url, offset, reqLen, this._laneReadOptions).then((resolved) => {
         finishWithTelemetry(resolved, reqLen, false);
       });
     }
@@ -2001,11 +2066,16 @@ class HttpfsMailboxHost {
   }
 
   _dispatchOnce() {
+    if (this._inFlight) {
+      return false;
+    }
     const status = Atomics.load(this._statusView, 0);
     if (status !== HttpfsStatus.RequestReady) {
       return false;
     }
 
+    this._inFlight = true;
+    this._slotActive = true;
     this._stats.requests += 1;
     this._slotRequests += 1;
     const op = this._headerView.getUint32(HttpfsOffsets.OP, true);
@@ -2022,6 +2092,10 @@ class HttpfsMailboxHost {
     if (this._stats.activePendingSlots > this._stats.peakPendingSlots) {
       this._stats.peakPendingSlots = this._stats.activePendingSlots;
     }
+    this._stats.activeLanes += 1;
+    if (this._stats.activeLanes > this._stats.peakActiveLanes) {
+      this._stats.peakActiveLanes = this._stats.activeLanes;
+    }
     if (handleRec) {
       handleRec.activePendingSlots += 1;
       if (handleRec.activePendingSlots > handleRec.peakPendingSlots) {
@@ -2035,6 +2109,11 @@ class HttpfsMailboxHost {
         return;
       }
       finalized = true;
+      this._inFlight = false;
+      if (this._slotActive) {
+        this._slotActive = false;
+        this._stats.activeLanes = Math.max(0, this._stats.activeLanes - 1);
+      }
       const elapsed = Math.max(0, this._now() - startMs);
       this._stats.activePendingSlots = Math.max(0, this._stats.activePendingSlots - 1);
       this._stats.totalWaitMs += elapsed;
@@ -2130,6 +2209,7 @@ class HttpfsMailboxHost {
     this._running = true;
     this._loopPromise = (async () => {
       let syncBurst = 0;
+      const syncBurstLimit = this._shared.slotCount > 1 ? 16 : 128;
       while (this._running) {
         const status = Atomics.load(this._statusView, 0);
         if (status === HttpfsStatus.Shutdown) {
@@ -2142,7 +2222,7 @@ class HttpfsMailboxHost {
             await dispatched;
           } else {
             syncBurst += 1;
-            if (syncBurst >= 128) {
+            if (syncBurst >= syncBurstLimit) {
               syncBurst = 0;
               await Promise.resolve();
             }
@@ -2155,7 +2235,7 @@ class HttpfsMailboxHost {
           await waitResult;
         } else {
           syncBurst += 1;
-          if (syncBurst >= 128) {
+          if (syncBurst >= syncBurstLimit) {
             syncBurst = 0;
             await Promise.resolve();
           }
@@ -2492,8 +2572,33 @@ class HttpfsMailboxPoolHost {
     }
     this._shared = createSharedMailboxHostState(options, true, slotBuffers.length);
     this._slots = slotBuffers.map(
-      (sab) => new HttpfsMailboxHost(sab, { ...options, _sharedState: this._shared }),
+      (sab, index) =>
+        new HttpfsMailboxHost(sab, {
+          ...options,
+          _sharedState: this._shared,
+          _laneIndex: index,
+        }),
     );
+    // Pre-allocated scratch buffers for zero-allocation round-robin slot polling.
+    this._pollCursor = 0;
+    this._pollResults = new Array(slotBuffers.length).fill(false);
+    this._slotPromises = new Array(slotBuffers.length);
+  }
+
+  _syncSlotLaneIndices() {
+    const slots = this._slots;
+    const count = slots.length;
+    for (let i = 0; i < count; i += 1) {
+      const slot = slots[i];
+      if (slot._laneIndex !== i) {
+        slot._laneIndex = i;
+        if (slot._laneReadOptions) {
+          slot._laneReadOptions.laneIndex = i;
+        } else {
+          slot._laneReadOptions = { laneIndex: i };
+        }
+      }
+    }
   }
 
   get slotCount() {
@@ -2501,7 +2606,13 @@ class HttpfsMailboxPoolHost {
   }
 
   get isRunning() {
-    return this._slots.some((slot) => slot.isRunning);
+    const slots = this._slots;
+    for (let i = 0; i < slots.length; i += 1) {
+      if (slots[i].isRunning) {
+        return true;
+      }
+    }
+    return false;
   }
 
   get chunkCache() {
@@ -2517,35 +2628,150 @@ class HttpfsMailboxPoolHost {
   }
 
   getStats() {
-    const base = this._slots[0].getStats();
-    return {
-      ...base,
-      slotCount: this._slots.length,
-      perSlot: this._slots.map((slot, index) => ({
-        slotIndex: index,
-        requests: slot._slotRequests,
+    this._syncSlotLaneIndices();
+    const slots = this._slots;
+    const count = slots.length;
+    const base = slots[0].getStats();
+    const requestsByLane = new Array(count);
+    const perSlot = new Array(count);
+    let summedLaneRequests = 0;
+    for (let i = 0; i < count; i += 1) {
+      const slot = slots[i];
+      const laneReqs = slot._slotRequests;
+      requestsByLane[i] = laneReqs;
+      summedLaneRequests += laneReqs;
+      perSlot[i] = {
+        slotIndex: i,
+        requests: laneReqs,
         syncFastPathHits: slot._slotSyncFastPathHits,
         asyncPathHits: slot._slotAsyncPathHits,
-      })),
+      };
+    }
+    const totalRequests = Math.max(this._shared.stats.requests, summedLaneRequests);
+    return {
+      ...base,
+      slotCount: count,
+      totalRequests,
+      requestsByLane,
+      activeLanes: this._shared.stats.activeLanes,
+      peakActiveLanes: this._shared.stats.peakActiveLanes,
+      perSlot,
     };
   }
 
+  resetStats() {
+    this._syncSlotLaneIndices();
+    const slots = this._slots;
+    slots[0].resetStats();
+    for (let i = 1; i < slots.length; i += 1) {
+      slots[i]._slotRequests = 0;
+      slots[i]._slotSyncFastPathHits = 0;
+      slots[i]._slotAsyncPathHits = 0;
+    }
+    this._pollCursor = 0;
+  }
+
+  /**
+   * Fair, non-blocking, zero-allocation round-robin poll across all attached lanes.
+   * Skips already in-flight async lanes without stalling other lanes and advances the
+   * round-robin cursor past the last dispatched lane so no lane can starve siblings.
+   */
+  pollOnce(maxDispatches) {
+    this._syncSlotLaneIndices();
+    const slots = this._slots;
+    const count = slots.length;
+    const budget =
+      maxDispatches === undefined || maxDispatches === null
+        ? count
+        : Math.max(0, Math.min(count, Math.floor(Number(maxDispatches)) || 0));
+    if (budget === 0) {
+      return 0;
+    }
+    const start = this._pollCursor % count;
+    let dispatchedCount = 0;
+    let lastDispatched = -1;
+    for (let offset = 0; offset < count && dispatchedCount < budget; offset += 1) {
+      const idx = (start + offset) % count;
+      const slot = slots[idx];
+      if (slot._inFlight) {
+        continue;
+      }
+      if (Atomics.load(slot._statusView, 0) !== HttpfsStatus.RequestReady) {
+        continue;
+      }
+      const dispatched = slot._dispatchOnce();
+      if (dispatched !== false) {
+        dispatchedCount += 1;
+        lastDispatched = idx;
+      }
+    }
+    this._pollCursor = lastDispatched >= 0 ? (lastDispatched + 1) % count : (start + 1) % count;
+    return dispatchedCount;
+  }
+
   processOnce() {
-    return Promise.all(this._slots.map((slot) => slot.processOnce()));
+    this._syncSlotLaneIndices();
+    const slots = this._slots;
+    const count = slots.length;
+    if (this._pollResults.length !== count) {
+      this._pollResults = new Array(count).fill(false);
+    }
+    const start = this._pollCursor % count;
+    let hasPending = false;
+    let lastDispatched = -1;
+    for (let offset = 0; offset < count; offset += 1) {
+      const idx = (start + offset) % count;
+      const slot = slots[idx];
+      const dispatched = slot._dispatchOnce();
+      if (isThenable(dispatched)) {
+        hasPending = true;
+        this._pollResults[idx] = dispatched;
+        lastDispatched = idx;
+      } else {
+        const didDispatch = Boolean(dispatched);
+        this._pollResults[idx] = didDispatch;
+        if (didDispatch) {
+          lastDispatched = idx;
+        }
+      }
+    }
+    this._pollCursor = lastDispatched >= 0 ? (lastDispatched + 1) % count : (start + 1) % count;
+    if (!hasPending) {
+      return Promise.resolve(this._pollResults.slice());
+    }
+    return Promise.all(this._pollResults);
   }
 
   start() {
-    return Promise.all(this._slots.map((slot) => slot.start()));
+    this._syncSlotLaneIndices();
+    const slots = this._slots;
+    const count = slots.length;
+    if (this._slotPromises.length !== count) {
+      this._slotPromises = new Array(count);
+    }
+    for (let i = 0; i < count; i += 1) {
+      this._slotPromises[i] = slots[i].start();
+    }
+    return Promise.all(this._slotPromises);
   }
 
   shutdown() {
-    for (const slot of this._slots) {
-      slot.shutdown();
+    const slots = this._slots;
+    for (let i = 0; i < slots.length; i += 1) {
+      slots[i].shutdown();
     }
   }
 
   stop() {
-    return Promise.all(this._slots.map((slot) => slot.stop()));
+    const slots = this._slots;
+    const count = slots.length;
+    if (this._slotPromises.length !== count) {
+      this._slotPromises = new Array(count);
+    }
+    for (let i = 0; i < count; i += 1) {
+      this._slotPromises[i] = slots[i].stop();
+    }
+    return Promise.all(this._slotPromises);
   }
 }
 

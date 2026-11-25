@@ -978,3 +978,400 @@ test('cross-thread synchronous Atomics.wait reads via HttpfsMailboxHost LRU cach
     await host.stop();
   }
 });
+
+// ---------------------------------------------------------------------------
+// 9. W294: 8-lane pool peak-concurrency telemetry, fairness, cross-lane coalescing & resetStats
+// ---------------------------------------------------------------------------
+
+async function waitForCondition(predicate, timeoutMs = 3000, label = 'condition') {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out waiting for ${label}`);
+    }
+    await new Promise((r) => setTimeout(r, 2));
+  }
+}
+
+test('W294: 8-lane HttpfsMailboxPoolHost tracks peakActiveLanes >= 3, requestsByLane, totalRequests, and prevents head-of-line blocking', async () => {
+  const chunkSize = 8192;
+  const dsBytes = makePatternBytes(2 * chunkSize, 11);
+  const binkBytes = makePatternBytes(2 * chunkSize, 22);
+  const readFileBytes = makePatternBytes(2 * chunkSize, 33);
+  const lane3Bytes = makePatternBytes(2 * chunkSize, 44);
+  const lane4Bytes = makePatternBytes(2 * chunkSize, 55);
+  const lane5Bytes = makePatternBytes(2 * chunkSize, 66);
+
+  const dsGate = createDeferred();
+  const gate3 = createDeferred();
+  const gate4 = createDeferred();
+  const gate5 = createDeferred();
+  const gatesByUrl = new Map([
+    ['/game/directstorage.rpf', dsGate],
+    ['/game/stream3.rpf', gate3],
+    ['/game/stream4.rpf', gate4],
+    ['/game/stream5.rpf', gate5],
+  ]);
+  const arrivedGatedUrls = new Set();
+
+  const mock = createMockRangeFetch(
+    new Map([
+      ['/game/directstorage.rpf', dsBytes],
+      ['/game/bink2_intro.rpf', binkBytes],
+      ['/game/readfile_cfg.rpf', readFileBytes],
+      ['/game/stream3.rpf', lane3Bytes],
+      ['/game/stream4.rpf', lane4Bytes],
+      ['/game/stream5.rpf', lane5Bytes],
+    ]),
+    {
+      onRequest: async (req) => {
+        const gate = gatesByUrl.get(req.url);
+        if (gate) {
+          arrivedGatedUrls.add(req.url);
+          await gate.promise;
+        }
+      },
+    },
+  );
+
+  const slots = createHttpfsMailboxPool(8, 4096);
+  const poolHost = new HttpfsMailboxPoolHost(slots, {
+    fetchImpl: mock.fetchImpl,
+    cacheMaxBytes: 256 * 1024,
+    chunkSize,
+    readAheadChunks: 0,
+    probeOnOpen: false,
+  });
+  const clients = slots.map((sab) => new HttpfsMailboxClient(sab));
+
+  poolHost.start();
+  try {
+    const [hDs, hBink, hRf, h3, h4, h5] = await Promise.all([
+      clients[0].openAsync('game/directstorage.rpf'),
+      clients[1].openAsync('game/bink2_intro.rpf'),
+      clients[2].openAsync('game/readfile_cfg.rpf'),
+      clients[3].openAsync('game/stream3.rpf'),
+      clients[4].openAsync('game/stream4.rpf'),
+      clients[5].openAsync('game/stream5.rpf'),
+    ]);
+    assert.ok(hDs >= 1 && hBink >= 1 && hRf >= 1 && h3 >= 1 && h4 >= 1 && h5 >= 1);
+
+    // 1. Stall lane 0 (DirectStorage) on a slow HTTP Range fetch.
+    const dsOut = new Uint8Array(4096);
+    const dsReadPromise = clients[0].readAsync(hDs, 0n, dsOut, 4096);
+    await waitForCondition(
+      () => arrivedGatedUrls.has('/game/directstorage.rpf'),
+      3000,
+      'DirectStorage lane 0 in-flight',
+    );
+    assert.equal(poolHost.getStats().activeLanes, 1);
+
+    // 2. While lane 0 is blocked, lane 1 (Bink2) and lane 2 (ReadFile) must complete with zero head-of-line stall.
+    const binkOut1 = new Uint8Array(4096);
+    const binkOut2 = new Uint8Array(4096);
+    const rfOut1 = new Uint8Array(4096);
+    const [nBink1, nRf1] = await Promise.all([
+      clients[1].readAsync(hBink, 0n, binkOut1, 4096),
+      clients[2].readAsync(hRf, 0n, rfOut1, 4096),
+    ]);
+    const nBink2 = await clients[1].readAsync(hBink, 4096n, binkOut2, 4096);
+    assert.equal(nBink1, 4096);
+    assert.equal(nBink2, 4096);
+    assert.equal(nRf1, 4096);
+    assert.deepEqual(binkOut1, binkBytes.subarray(0, 4096));
+    assert.deepEqual(binkOut2, binkBytes.subarray(4096, 8192));
+    assert.deepEqual(rfOut1, readFileBytes.subarray(0, 4096));
+    assert.equal(poolHost.getStats().activeLanes, 1, 'Lane 0 must still be the sole active lane');
+
+    // 3. Simultaneously drive lanes 3, 4, 5 alongside blocked lane 0 -> 4 active lanes in-flight (>= 3).
+    const out3 = new Uint8Array(4096);
+    const out4 = new Uint8Array(4096);
+    const out5 = new Uint8Array(4096);
+    const p3 = clients[3].readAsync(h3, 0n, out3, 4096);
+    const p4 = clients[4].readAsync(h4, 0n, out4, 4096);
+    const p5 = clients[5].readAsync(h5, 0n, out5, 4096);
+
+    await waitForCondition(
+      () => arrivedGatedUrls.size === 4,
+      3000,
+      '4 concurrent gated lanes in-flight',
+    );
+
+    const midStats = poolHost.getStats();
+    assert.equal(midStats.slotCount, 8);
+    assert.equal(midStats.activeLanes, 4);
+    assert.ok(
+      midStats.peakActiveLanes >= 3,
+      `Expected peakActiveLanes >= 3, got ${midStats.peakActiveLanes}`,
+    );
+    assert.equal(midStats.peakActiveLanes, 4);
+
+    // Release all 4 gated lanes out of order.
+    gate5.resolve();
+    gate3.resolve();
+    gate4.resolve();
+    dsGate.resolve();
+
+    const [nDs, n3, n4, n5] = await Promise.all([dsReadPromise, p3, p4, p5]);
+    assert.deepEqual([nDs, n3, n4, n5], [4096, 4096, 4096, 4096]);
+    assert.deepEqual(dsOut, dsBytes.subarray(0, 4096));
+    assert.deepEqual(out3, lane3Bytes.subarray(0, 4096));
+    assert.deepEqual(out4, lane4Bytes.subarray(0, 4096));
+    assert.deepEqual(out5, lane5Bytes.subarray(0, 4096));
+
+    const stats = poolHost.getStats();
+    assert.equal(stats.slotCount, 8);
+    assert.equal(stats.activeLanes, 0);
+    assert.equal(stats.peakActiveLanes, 4);
+    // Requests per lane: lane 0 (open+read=2), lane 1 (open+2reads=3), lane 2 (open+read=2),
+    // lanes 3..5 (open+read=2 each), lanes 6..7 (unused=0).
+    assert.deepEqual(stats.requestsByLane, [2, 3, 2, 2, 2, 2, 0, 0]);
+    assert.equal(
+      stats.totalRequests,
+      stats.requestsByLane.reduce((acc, v) => acc + v, 0),
+    );
+    assert.equal(stats.totalRequests, 13);
+
+    // Verify zero path/URL leaks in sanitized telemetry JSON.
+    const serialized = JSON.stringify(stats);
+    assert.equal(serialized.includes('directstorage.rpf'), false);
+    assert.equal(serialized.includes('bink2_intro.rpf'), false);
+    assert.equal(serialized.includes('/game/'), false);
+  } finally {
+    await poolHost.stop();
+  }
+});
+
+test('W294: 8-lane HttpfsMailboxPoolHost round-robin polling distributes requestsByLane fairly and skips in-flight lanes without stalling', async () => {
+  const chunkSize = 4096;
+  const rpfBytes = makePatternBytes(4 * chunkSize, 77);
+  const slowGate = createDeferred();
+  let gateSlowLane0 = false;
+
+  const mock = createMockRangeFetch(new Map([['/game/fair_rr.rpf', rpfBytes]]), {
+    onRequest: async (req) => {
+      if (gateSlowLane0 && req.rangeHeader === 'bytes=4096-8191') {
+        await slowGate.promise;
+      }
+    },
+  });
+
+  const slots = createHttpfsMailboxPool(8, 4096);
+  const poolHost = new HttpfsMailboxPoolHost(slots, {
+    fetchImpl: mock.fetchImpl,
+    cacheMaxBytes: 64 * 1024,
+    chunkSize,
+    readAheadChunks: 0,
+    probeOnOpen: false,
+  });
+  const clients = slots.map((sab) => new HttpfsMailboxClient(sab));
+
+  // Warm chunk 0 and open handles on all 8 lanes using manual round-robin processOnce().
+  const openPromises = clients.map((c) => c.openAsync('game/fair_rr.rpf'));
+  const openDispatched = await poolHost.processOnce();
+  assert.deepEqual(openDispatched, [true, true, true, true, true, true, true, true]);
+  const handles = await Promise.all(openPromises);
+  assert.ok(handles.every((h) => h >= 1));
+
+  // Warm chunk 0 on lane 0 so subsequent chunk-0 reads complete synchronously.
+  const warmBuf = new Uint8Array(512);
+  const warmPromise = clients[0].readAsync(handles[0], 0n, warmBuf, 512);
+  await poolHost.processOnce();
+  assert.equal(await warmPromise, 512);
+
+  // Reset telemetry before fairness measurement.
+  poolHost.resetStats();
+  assert.deepEqual(poolHost.getStats().requestsByLane, [0, 0, 0, 0, 0, 0, 0, 0]);
+  assert.equal(poolHost.getStats().totalRequests, 0);
+  assert.equal(poolHost.getStats().peakActiveLanes, 0);
+
+  // Queue simultaneous reads on all 8 lanes, then step with pollOnce(1) to verify strict round-robin fairness.
+  const round1Bufs = clients.map(() => new Uint8Array(256));
+  const round1Promises = clients.map((c, i) =>
+    c.readAsync(handles[i], BigInt(i * 256), round1Bufs[i], 256),
+  );
+  for (let step = 0; step < 8; step += 1) {
+    const dispatched = poolHost.pollOnce(1);
+    assert.equal(dispatched, 1);
+    const snap = poolHost.getStats();
+    assert.equal(snap.requestsByLane[step], 1, `Step ${step} must fairly serve lane ${step}`);
+    for (let later = step + 1; later < 8; later += 1) {
+      assert.equal(snap.requestsByLane[later], 0);
+    }
+  }
+  assert.equal(poolHost.pollOnce(), 0, 'Idle pollOnce must return 0 with zero pending work');
+  const round1Lens = await Promise.all(round1Promises);
+  assert.deepEqual(round1Lens, [256, 256, 256, 256, 256, 256, 256, 256]);
+  for (let i = 0; i < 8; i += 1) {
+    assert.deepEqual(round1Bufs[i], rpfBytes.subarray(i * 256, (i + 1) * 256));
+  }
+  assert.deepEqual(poolHost.getStats().requestsByLane, [1, 1, 1, 1, 1, 1, 1, 1]);
+  assert.equal(poolHost.getStats().totalRequests, 8);
+
+  // Non-blocking pollOnce: stall lane 0 on uncached chunk 1 while lanes 1..7 read cached chunk 0.
+  gateSlowLane0 = true;
+  const slowOut = new Uint8Array(512);
+  const slowPromise = clients[0].readAsync(handles[0], 4096n, slowOut, 512);
+  assert.equal(poolHost.pollOnce(1), 1);
+  assert.equal(poolHost.getStats().activeLanes, 1);
+
+  // Calling pollOnce() again while lane 0 is in-flight must NOT re-dispatch lane 0 or stall siblings!
+  const fastBufs = clients.slice(1).map(() => new Uint8Array(256));
+  const fastPromises = clients.slice(1).map((c, idx) =>
+    c.readAsync(handles[idx + 1], BigInt(idx * 256), fastBufs[idx], 256),
+  );
+  assert.equal(poolHost.pollOnce(), 7, 'Must dispatch all 7 sibling lanes while skipping in-flight lane 0');
+  const fastLens = await Promise.all(fastPromises);
+  assert.deepEqual(fastLens, [256, 256, 256, 256, 256, 256, 256]);
+  assert.equal(poolHost.getStats().activeLanes, 1, 'Slow lane 0 still cleanly tracked in-flight');
+  assert.equal(poolHost.getStats().peakActiveLanes, 2);
+
+  slowGate.resolve();
+  assert.equal(await slowPromise, 512);
+  assert.deepEqual(slowOut, rpfBytes.subarray(4096, 4096 + 512));
+  assert.equal(poolHost.getStats().activeLanes, 0);
+  assert.deepEqual(poolHost.getStats().requestsByLane, [2, 2, 2, 2, 2, 2, 2, 2]);
+  assert.equal(poolHost.getStats().totalRequests, 16);
+});
+
+test('W294: cross-lane in-flight Range coalescing triggers strictly 1 network fetch, reports crossLaneCoalesced >= 1, and resets cleanly via resetStats()', async () => {
+  const chunkSize = 16 * 1024;
+  const rpfBytes = makePatternBytes(4 * chunkSize, 137);
+  const chunk1Gate = createDeferred();
+  let chunk1FetchStarted = false;
+
+  const mock = createMockRangeFetch(new Map([['/game/world_shared.rpf', rpfBytes]]), {
+    onRequest: async (req) => {
+      if (req.rangeHeader === 'bytes=16384-32767') {
+        chunk1FetchStarted = true;
+        await chunk1Gate.promise;
+      }
+    },
+  });
+
+  const slots = createHttpfsMailboxPool(8, 4096);
+  const poolHost = new HttpfsMailboxPoolHost(slots, {
+    fetchImpl: mock.fetchImpl,
+    cacheMaxBytes: 128 * 1024,
+    chunkSize,
+    readAheadChunks: 0,
+    probeOnOpen: false,
+  });
+  const clients = slots.map((sab) => new HttpfsMailboxClient(sab));
+
+  poolHost.start();
+  try {
+    const handles = await Promise.all(clients.map((c) => c.openAsync('game/world_shared.rpf')));
+    assert.ok(handles.every((h) => h >= 1));
+
+    // Issue 6 concurrent overlapping sub-range reads across lanes 0..5 targeting the SAME chunk 1 [16384..32768).
+    const readSpecs = [
+      { lane: 0, off: 16384, len: 4096 },
+      { lane: 1, off: 17408, len: 3072 },
+      { lane: 2, off: 18432, len: 4096 },
+      { lane: 3, off: 20480, len: 4096 },
+      { lane: 4, off: 24576, len: 4096 },
+      { lane: 5, off: 28672, len: 4096 },
+    ];
+    const bufs = readSpecs.map((s) => new Uint8Array(s.len));
+    const readPromises = readSpecs.map((s, idx) =>
+      clients[s.lane].readAsync(handles[s.lane], BigInt(s.off), bufs[idx], s.len),
+    );
+
+    await waitForCondition(
+      () => chunk1FetchStarted && poolHost.getStats().activeLanes === 6,
+      3000,
+      'all 6 lanes attached to in-flight chunk 1 fetch',
+    );
+
+    const midStats = poolHost.getStats();
+    assert.equal(mock.requests.length, 1, 'Concurrent multi-lane reads for chunk 1 must trigger strictly 1 network fetch');
+    assert.equal(midStats.activeLanes, 6);
+    assert.ok(midStats.peakActiveLanes >= 6);
+    assert.equal(midStats.crossLaneCoalesced, 5);
+    assert.equal(midStats.coalescedReads, 5);
+    assert.equal(poolHost.chunkCache.getStats().crossLaneCoalesced, 5);
+
+    chunk1Gate.resolve();
+    const readLens = await Promise.all(readPromises);
+    for (let i = 0; i < readSpecs.length; i += 1) {
+      assert.equal(readLens[i], readSpecs[i].len);
+      assert.deepEqual(
+        bufs[i],
+        rpfBytes.subarray(readSpecs[i].off, readSpecs[i].off + readSpecs[i].len),
+      );
+    }
+
+    // Strictly 1 HTTP fetch total across all 6 concurrent lanes!
+    assert.equal(mock.requests.length, 1);
+
+    const postStats = poolHost.getStats();
+    assert.equal(postStats.activeLanes, 0);
+    assert.ok(postStats.peakActiveLanes >= 6);
+    assert.ok(postStats.crossLaneCoalesced >= 1);
+    assert.equal(postStats.crossLaneCoalesced, 5);
+    assert.equal(postStats.cacheMisses, 1);
+    assert.equal(postStats.cacheBytes, chunkSize);
+    assert.deepEqual(postStats.requestsByLane, [2, 2, 2, 2, 2, 2, 1, 1]);
+    assert.equal(postStats.totalRequests, 14);
+
+    // resetStats() clears all cumulative pool & cache counters while preserving cached chunks and open handles.
+    poolHost.resetStats();
+    const resetSnap = poolHost.getStats();
+    assert.equal(resetSnap.totalRequests, 0);
+    assert.equal(resetSnap.requests, 0);
+    assert.deepEqual(resetSnap.requestsByLane, [0, 0, 0, 0, 0, 0, 0, 0]);
+    assert.equal(resetSnap.activeLanes, 0);
+    assert.equal(resetSnap.peakActiveLanes, 0);
+    assert.equal(resetSnap.crossLaneCoalesced, 0);
+    assert.equal(resetSnap.coalescedReads, 0);
+    assert.equal(resetSnap.cacheHits, 0);
+    assert.equal(resetSnap.cacheMisses, 0);
+    assert.equal(resetSnap.cacheBytes, chunkSize, 'Cached chunk must remain resident after resetStats()');
+    assert.ok(resetSnap.perSlot.every((s) => s.requests === 0));
+
+    // Subsequent read on lane 7 still serves cleanly from the resident cached chunk (still 1 network fetch total).
+    const lane7Buf = new Uint8Array(1024);
+    assert.equal(await clients[7].readAsync(handles[7], 20000n, lane7Buf, 1024), 1024);
+    assert.deepEqual(lane7Buf, rpfBytes.subarray(20000, 21024));
+    assert.equal(mock.requests.length, 1);
+    const afterCachedRead = poolHost.getStats();
+    assert.equal(afterCachedRead.totalRequests, 1);
+    assert.deepEqual(afterCachedRead.requestsByLane, [0, 0, 0, 0, 0, 0, 0, 1]);
+    assert.equal(afterCachedRead.cacheHits, 1);
+    assert.equal(afterCachedRead.peakActiveLanes, 1);
+  } finally {
+    await poolHost.stop();
+  }
+
+  // Direct HttpfsLruChunkCache check: concurrent multi-lane reads coalesce to 1 fetch and resetStats() clears counters.
+  const directGate = createDeferred();
+  const directMock = createMockRangeFetch(new Map([['/game/direct_coalesce.rpf', rpfBytes]]), {
+    onRequest: async () => {
+      await directGate.promise;
+    },
+  });
+  const directCache = new HttpfsLruChunkCache({
+    fetchImpl: directMock.fetchImpl,
+    cacheMaxBytes: 64 * 1024,
+    chunkSize: 4096,
+    readAheadChunks: 0,
+  });
+  const d0 = directCache.read('/game/direct_coalesce.rpf', 0, 512, { laneIndex: 0 });
+  const d1 = directCache.read('/game/direct_coalesce.rpf', 256, 1024, { laneIndex: 3 });
+  const d2 = directCache.read('/game/direct_coalesce.rpf', 1024, 512, { laneIndex: 7 });
+  assert.equal(directMock.requests.length, 1);
+  assert.equal(directCache.getStats().crossLaneCoalesced, 2);
+  directGate.resolve();
+  const [b0, b1, b2] = await Promise.all([d0, d1, d2]);
+  assert.deepEqual(b0, rpfBytes.subarray(0, 512));
+  assert.deepEqual(b1, rpfBytes.subarray(256, 1280));
+  assert.deepEqual(b2, rpfBytes.subarray(1024, 1536));
+  assert.equal(directMock.requests.length, 1);
+
+  directCache.resetStats();
+  assert.equal(directCache.getStats().crossLaneCoalesced, 0);
+  assert.equal(directCache.getStats().coalescedReads, 0);
+  assert.equal(directCache.getStats().cacheMisses, 0);
+  assert.equal(directCache.getStats().cacheBytes, 4096);
+});
