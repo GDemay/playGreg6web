@@ -18,7 +18,12 @@ What it does, in order:
      workspace sources (only when `program` needs to be built or `--exe` is provided).
    - `program`: `playgta6-recomp build-program <exe> --out <boot-dir> --target wasm64
      --memory-model window-runs --indirect-dispatch shard --jobs N` (+ `--dll-dir <game-dir>`)
-     when `<boot-dir>/program-manifest.json` is missing or stale.
+     when `<boot-dir>/program-manifest.json` is missing or stale. A stale program is first
+     looked up in the content-keyed lift cache shared with run_native_boot.py
+     (tools/lift_cache.py: `<object cache>-lift`, or `PLAYGTA6_LIFT_CACHE`; `off` disables):
+     a hit hard-links the cached lift in and skips the recomp build and the lift; a miss lifts
+     and stores it. Guest objects are reused per shard from `<build-dir>/wasm_obj_cache`, which
+     build_guest_wasm.py keys by source content and flags.
    - `runtime_configure` / `runtime_lib`: Release PIC `libplaygta6_core.a` built via
      `emcmake cmake` (`-sMEMORY64=1 -pthread -fPIC`) when missing or older than `runtime/`.
    - `guest_wasm`: `python tools/build_guest_wasm.py <boot-dir> --out-dir <out-dir> ...`
@@ -84,6 +89,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import compare_boot_reports  # noqa: E402
 import clean_build_dirs  # noqa: E402
+import lift_cache  # noqa: E402
 
 EXE_SUFFIX = ".exe" if sys.platform == "win32" else ""
 SOURCE_SUFFIXES = {".cpp", ".h", ".hpp", ".c", ".cmake", ".txt", ".rs", ".toml"}
@@ -504,9 +510,17 @@ def terminate_process(proc: Any, wait_s: float = 5.0) -> int | None:
 class Plan:
     def __init__(self) -> None:
         self.steps: list[dict[str, Any]] = []
+        # stage -> {"run": fn() (instead of the command), "before": fn(), "after": fn()}; not in the JSON.
+        self.hooks: dict[str, dict[str, Callable[[], None]]] = {}
 
-    def add(self, stage: str, reason: str, cmd: list[str]) -> None:
+    def add(self, stage: str, reason: str, cmd: list[str], **hooks: Callable[[], None]) -> None:
         self.steps.append({"stage": stage, "reason": reason, "cmd": cmd})
+        if hooks:
+            self.hooks[stage] = hooks
+
+    def drop(self, stage: str) -> None:
+        self.steps = [s for s in self.steps if s["stage"] != stage]
+        self.hooks.pop(stage, None)
 
     def has(self, stage: str) -> bool:
         return any(s["stage"] == stage for s in self.steps)
@@ -522,6 +536,24 @@ class Plan:
         ]
 
 
+# The browser lift: the key includes these, so it never collides with the native lift's entries.
+BROWSER_LIFT_OPTIONS = ("--target", "wasm64", "--memory-model", "window-runs", "--indirect-dispatch", "shard")
+# Files in the boot dir that are not lift output (kept across a cache restore, never stored).
+BOOT_DIR_KEEP = frozenset({lift_cache.LIFT_STAMP, BOOT_OPTIONS_NAME})
+
+
+def looks_like_program_dir(boot_dir: Path) -> bool:
+    """The lift cache clears the boot dir before a lift or a restore: only do that to a directory
+    that is missing, empty or already holds a lifted program (never an arbitrary --boot-dir)."""
+    if not boot_dir.exists():
+        return True
+    if not boot_dir.is_dir():
+        return False
+    return (boot_dir / "program-manifest.json").is_file() or not any(
+        e.name not in BOOT_DIR_KEEP for e in boot_dir.iterdir()
+    )
+
+
 def make_build_plan(
     *,
     repo: Path,
@@ -534,8 +566,15 @@ def make_build_plan(
     jobs: int,
     force: bool,
     smoke: bool,
+    lift_cache_dir: Path | None = None,
+    lift_cache_keep: int = lift_cache.LIFT_CACHE_KEEP,
 ) -> tuple[Plan, Path]:
     """Compute the staleness build plan for browser Wasm64 artifacts.
+
+    With `lift_cache_dir`, a stale program is first looked up there by the content hash of its
+    inputs (tools/lift_cache.py; the wasm64 lift options are part of the key, so native entries
+    never match): a hit hard-links the cached lift in instead of building the recompiler and
+    running the lift; a miss lifts and stores the result.
 
     Returns `(plan, runtime_lib_path)`.
     """
@@ -574,36 +613,58 @@ def make_build_plan(
             plan.add("recomp", recomp_reason, ["cargo", "build", "--release", "-p", "playgta6-recomp"])
 
         exe_time = mtime(exe) if exe else 0.0
+        shim_time = max([mtime(p) or 0.0 for p in lift_cache.shim_inputs(repo)] + [0.0])
         prog_reason = stale(
             manifest,
-            [("the recompiler", mtime(recomp) or 0.0), ("the exe", exe_time or 0.0)],
+            [("the recompiler", mtime(recomp) or 0.0), ("the exe", exe_time or 0.0),
+             ("the runtime shim headers or export tables", shim_time)],
         )
         if prog_reason is None and plan.has("recomp"):
             prog_reason = "the recompiler is rebuilt"
+        if prog_reason and exe is None:
+            raise RunnerError(
+                "program-manifest.json is missing or forced to rebuild, so --exe or PLAYGTA6_EXE "
+                "is required (or pass --smoke / --trust-build)"
+            )
+        key = None
+        if (prog_reason and lift_cache_dir is not None and exe is not None and exe.is_file()
+                and looks_like_program_dir(boot_dir)):
+            key = lift_cache.lift_inputs_key(repo, exe, game_dir, BROWSER_LIFT_OPTIONS)
+            if not force:
+                if lift_cache.read_stamp(boot_dir) == key and manifest.is_file():
+                    prog_reason = None  # the program there is this exact lift (only mtimes moved)
+                    plan.drop("recomp")
+                elif (lift_cache_dir / key / "program-manifest.json").is_file():
+                    prog_reason = None
+                    plan.drop("recomp")
+                    plan.add(
+                        "program",
+                        f"lift cache hit {key[:12]} (no recomp build or lift)",
+                        ["lift-cache", "restore", str(lift_cache_dir / key), str(boot_dir)],
+                        run=lambda: lift_cache.lift_cache_restore(lift_cache_dir, key, boot_dir, BOOT_DIR_KEEP),
+                    )
         if prog_reason:
-            if exe is None:
-                raise RunnerError(
-                    "program-manifest.json is missing or forced to rebuild, so --exe or PLAYGTA6_EXE "
-                    "is required (or pass --smoke / --trust-build)"
-                )
             prog_cmd = [
                 str(recomp),
                 "build-program",
                 str(exe),
                 "--out",
                 str(boot_dir),
-                "--target",
-                "wasm64",
-                "--memory-model",
-                "window-runs",
-                "--indirect-dispatch",
-                "shard",
+                *BROWSER_LIFT_OPTIONS,
                 "--jobs",
                 str(jobs),
             ]
             if game_dir is not None:
                 prog_cmd += ["--dll-dir", str(game_dir)]
-            plan.add("program", prog_reason, prog_cmd)
+            hooks: dict[str, Callable[[], None]] = {}
+            if key is not None:
+                hooks = {
+                    "before": lambda: lift_cache.clear_program(boot_dir, BOOT_DIR_KEEP),
+                    "after": lambda: lift_cache.lift_cache_store(
+                        lift_cache_dir, key, boot_dir, lift_cache_keep, BOOT_DIR_KEEP
+                    ),
+                }
+            plan.add("program", prog_reason, prog_cmd, **hooks)
 
     # Stage 2: Release PIC libplaygta6_core.a
     runtime_newest = newest_mtime(repo / "runtime")
@@ -3827,6 +3888,8 @@ def _run(
             jobs=args.jobs,
             force=args.rebuild,
             smoke=args.smoke,
+            lift_cache_dir=None if args.dry_run else lift_cache.lift_cache_dir(None, env),
+            lift_cache_keep=lift_cache.lift_cache_keep(env),
         )
 
     shader_plan = plan_shader_staging(shader_pack, shader_stage_dir) if shader_pack is not None else []
@@ -3935,8 +3998,19 @@ def _run(
     for step in plan.steps:
         sanitized_step_cmd = " ".join(sanitize_cmd(step["cmd"], repo))
         print(f"[build] {step['stage']}: {sanitized_step_cmd}", file=sys.stderr, flush=True)
-        if runner(step["cmd"], repo, None, None) != 0:
-            raise RunnerError(f"{step['stage']} failed")
+        hooks = plan.hooks.get(step["stage"], {})
+        try:
+            if "run" in hooks:
+                hooks["run"]()
+            else:
+                if "before" in hooks:
+                    hooks["before"]()
+                if runner(step["cmd"], repo, None, None) != 0:
+                    raise RunnerError(f"{step['stage']} failed")
+                if "after" in hooks:
+                    hooks["after"]()
+        except OSError as exc:
+            raise RunnerError(f"{step['stage']} failed: {exc}") from exc
 
     staged_shaders: list[dict[str, Any]] = []
     if shader_pack is not None:

@@ -4,6 +4,7 @@ import io
 import json
 import os
 import re
+import shutil
 import socket
 import struct
 import sys
@@ -157,6 +158,7 @@ class RepoFixture:
         self.game_dir.mkdir(parents=True)
         self.chrome = root / "external" / ("chrome.exe" if sys.platform == "win32" else "chrome")
         self.base = 1_000_000.0
+        self.lift_cache = root / "liftcache"
 
         touch(self.repo / "Cargo.toml", self.base, '[workspace]\nmembers = ["recomp"]\n')
         touch(self.repo / "Cargo.lock", self.base, "# lock\n")
@@ -217,7 +219,7 @@ class RepoFixture:
                 runner=runner or default_runner,
                 session_runner=session_runner or default_session,
                 chrome_discoverer=chrome_discoverer or default_chrome,
-                env={} if env is None else env,
+                env={rbb.lift_cache.LIFT_CACHE_ENV: str(self.lift_cache)} if env is None else env,
                 repo_root=self.repo,
             )
         return code, out.getvalue(), err.getvalue(), cmd_calls, session_calls
@@ -446,6 +448,96 @@ class DryRunAndStalenessTests(unittest.TestCase):
             self.assertEqual(sessions[0]["shaders_dir"], staged_dir)
             for fname in ("game.wgsl.pack", "game.wgsl.pack.reflect.json", "reflection-manifest.json"):
                 self.assertTrue((staged_dir / fname).is_file(), fname)
+
+
+class LiftCacheTests(unittest.TestCase):
+    INPUTS = ({"recomp/src/main.rs": "a", "Cargo.lock": "b"}, "exe", {"bink.dll": "c"}, {"runtime/os/x.h": "d"})
+
+    def test_lift_options_are_part_of_the_key(self):
+        import run_native_boot as rnb  # noqa: PLC0415
+
+        native = rbb.lift_cache.lift_key(*self.INPUTS, rnb.NATIVE_LIFT_OPTIONS)
+        browser = rbb.lift_cache.lift_key(*self.INPUTS, rbb.BROWSER_LIFT_OPTIONS)
+        self.assertNotEqual(native, browser)
+        self.assertEqual(browser, rbb.lift_cache.lift_key(*self.INPUTS, list(rbb.BROWSER_LIFT_OPTIONS)))
+        # Any single option change is another entry.
+        opts = list(rbb.BROWSER_LIFT_OPTIONS)
+        variants = {tuple(opts[:i] + [opts[i] + "x"] + opts[i + 1:]) for i in range(len(opts))}
+        keys = {rbb.lift_cache.lift_key(*self.INPUTS, v) for v in variants}
+        self.assertEqual(len(keys), len(variants))
+        self.assertNotIn(browser, keys)
+        # The native runner uses the same shared helper.
+        self.assertIs(rnb.lift_key, rbb.lift_cache.lift_key)
+
+    def test_inputs_key_without_game_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            k1 = rbb.lift_cache.lift_inputs_key(fx.repo, fx.exe, None, rbb.BROWSER_LIFT_OPTIONS)
+            (fx.game_dir / "a.dll").write_text("dll")
+            k2 = rbb.lift_cache.lift_inputs_key(fx.repo, fx.exe, fx.game_dir, rbb.BROWSER_LIFT_OPTIONS)
+            self.assertNotEqual(k1, k2)
+
+    def test_miss_stores_and_a_hit_skips_recomp_and_lift(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            touch(fx.repo / "recomp" / "src" / "main.rs", fx.base + 100)  # recomp + program stale
+
+            def lifting_runner(cmd, cwd, log, timeout):
+                if "build-program" in cmd:
+                    out = Path(cmd[cmd.index("--out") + 1])
+                    (out / "shards").mkdir(parents=True, exist_ok=True)
+                    (out / "shards" / "shard-00000.ll").write_text("ir")
+                    (out / "program-manifest.json").write_text("{}")
+                return 0
+
+            code, _, err, _, _ = fx.run_cli("--exe", str(fx.exe), "--game-dir", str(fx.game_dir), "--name", "r1",
+                                            runner=lifting_runner)
+            self.assertEqual(code, 0, err)
+            entries = list(fx.lift_cache.iterdir())
+            self.assertEqual(len(entries), 1)
+            self.assertTrue((entries[0] / "shards" / "shard-00000.ll").is_file())
+            # A native entry for the same inputs is a different key.
+            import run_native_boot as rnb  # noqa: PLC0415
+            native_key = rbb.lift_cache.lift_inputs_key(fx.repo, fx.exe, fx.game_dir, rnb.NATIVE_LIFT_OPTIONS)
+            self.assertNotEqual(native_key, entries[0].name)
+
+            # The boot dir is lost (fresh checkout): the next build restores it from the cache.
+            shutil.rmtree(fx.boot_dir)
+            fx.boot_dir.mkdir()
+            (fx.boot_dir / rbb.BOOT_OPTIONS_NAME).write_text("{}")
+            calls: list[list[str]] = []
+
+            def recording_runner(cmd, cwd, log, timeout):
+                calls.append(list(cmd))
+                return 0
+
+            code, _, err, _, _ = fx.run_cli("--exe", str(fx.exe), "--game-dir", str(fx.game_dir), "--name", "r2",
+                                            runner=recording_runner)
+            self.assertEqual(code, 0, err)
+            self.assertIn("lift cache hit", err)
+            self.assertFalse(any("build-program" in c or "cargo" in c for c in calls), calls)
+            self.assertEqual((fx.boot_dir / "shards" / "shard-00000.ll").read_text(), "ir")
+            self.assertTrue((fx.boot_dir / rbb.BOOT_OPTIONS_NAME).is_file())
+
+            # --rebuild lifts again.
+            calls.clear()
+            code, _, err, _, _ = fx.run_cli("--exe", str(fx.exe), "--game-dir", str(fx.game_dir), "--name", "r3",
+                                            "--rebuild", runner=lambda *a: (calls.append(list(a[0])), lifting_runner(*a))[1])
+            self.assertEqual(code, 0, err)
+            self.assertTrue(any("build-program" in c for c in calls))
+
+    def test_foreign_boot_dir_is_never_cleared(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            fx.manifest.unlink()
+            touch(fx.boot_dir / "unrelated.txt", fx.base)
+            plan, _ = rbb.make_build_plan(
+                repo=fx.repo, build_dir=fx.build, boot_dir=fx.boot_dir, out_dir=fx.out_dir,
+                exe=fx.exe, game_dir=fx.game_dir, runtime_lib_override=None, jobs=2, force=False, smoke=False,
+                lift_cache_dir=fx.lift_cache,
+            )
+            self.assertTrue(plan.has("program"))
+            self.assertNotIn("program", plan.hooks)
 
 
 class ChromeDiscoveryTests(unittest.TestCase):
