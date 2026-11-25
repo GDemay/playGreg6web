@@ -13,9 +13,31 @@
   const DEFAULT_MAX_BYTES = 16 * 1024 * 1024;
   const DEFAULT_MAX_RECORDED_BYTES = DEFAULT_MAX_BYTES;
   const DEFAULT_SKIP_WRITE_TEXTURE_ABOVE_BYTES = 0;
+  const DEFAULT_SPIKE_BUDGET_MS = 33.333;
+  const DEFAULT_SPIKE_MAX_SNAPSHOTS = 4;
   const MAX_SKIPPED_UPLOAD_METADATA_ENTRIES = 256;
   const FRAME_CAPTURE_SCHEMA = 'playgta6-frame-capture';
   const FRAME_CAPTURE_SCHEMA_VERSION = 1;
+
+  // Frozen zero-allocation return singletons for inactive bypass / no-op paths.
+  const EMPTY_CHUNK_RESULT = Object.freeze({
+    recordedBytes: 0,
+    packetsParsed: 0,
+    completedFrames: 0,
+    droppedFrames: 0,
+    skippedLargeUploadPackets: 0,
+    skippedLargeUploadBytes: 0,
+  });
+
+  const EMPTY_END_FRAME_RESULT = Object.freeze({
+    spiked: false,
+    captured: false,
+    dropped: false,
+    evictedFrames: 0,
+    frameDurationMs: 0,
+    byteLength: 0,
+    packetCount: 0,
+  });
 
   const OPCODES = Object.freeze({
     NOP: 0,
@@ -273,6 +295,8 @@
     static DEFAULT_MAX_BYTES = DEFAULT_MAX_BYTES;
     static DEFAULT_MAX_RECORDED_BYTES = DEFAULT_MAX_RECORDED_BYTES;
     static DEFAULT_SKIP_WRITE_TEXTURE_ABOVE_BYTES = DEFAULT_SKIP_WRITE_TEXTURE_ABOVE_BYTES;
+    static DEFAULT_SPIKE_BUDGET_MS = DEFAULT_SPIKE_BUDGET_MS;
+    static DEFAULT_SPIKE_MAX_SNAPSHOTS = DEFAULT_SPIKE_MAX_SNAPSHOTS;
     static OPCODES = OPCODES;
     static OPCODE_NAMES = OPCODE_NAMES;
 
@@ -297,7 +321,11 @@
       if (!Number.isInteger(startFrame) || startFrame < 0) {
         throw new RangeError(`startFrame must be a non-negative integer, got ${startFrame}`);
       }
+      if (opts.now !== undefined && typeof opts.now !== 'function') {
+        throw new TypeError('GpuFrameRecorder option now must be a function');
+      }
 
+      this._now = opts.now || defaultNowMs;
       this._maxFrames = maxFrames;
       this._maxBytes = maxBytes;
       this._startFrame = startFrame;
@@ -329,6 +357,31 @@
       this._pendingBytes = 0;
       this._pendingNeededBytes = PACKET_HEADER_BYTES;
       this._skipBytesRemaining = 0;
+
+      // W325: zero-overhead inactive bypass & 30 FPS frame-spike auto-snapshot trigger.
+      this._spikeTriggerEnabled = false;
+      this._spikeBudgetMs = DEFAULT_SPIKE_BUDGET_MS;
+      this._spikeMaxSnapshots = DEFAULT_SPIKE_MAX_SNAPSHOTS;
+      this._spikeFrameActive = false;
+      this._spikeFrameStartMs = 0;
+      this._spikeStaging = null;
+      this._spikePendingChunks = [];
+      this._spikePendingBytes = 0;
+      this._spikePendingNeededBytes = PACKET_HEADER_BYTES;
+      this._spikeSkipBytesRemaining = 0;
+      this._spikeSnapshotsCaptured = 0;
+      this._lastSpikeFrameMs = 0;
+      this._bypassedPackets = 0;
+    }
+
+    _resetSpikeStaging() {
+      this._spikeFrameActive = false;
+      this._spikeFrameStartMs = 0;
+      this._spikeStaging = null;
+      this._spikePendingChunks = [];
+      this._spikePendingBytes = 0;
+      this._spikePendingNeededBytes = PACKET_HEADER_BYTES;
+      this._spikeSkipBytesRemaining = 0;
     }
 
     _resetPartialState() {
@@ -337,6 +390,7 @@
       this._pendingBytes = 0;
       this._pendingNeededBytes = PACKET_HEADER_BYTES;
       this._skipBytesRemaining = 0;
+      this._resetSpikeStaging();
     }
 
     _shouldSkipLargeWriteTexture(opcode, payloadBytes) {
@@ -437,12 +491,230 @@
         this._resetPartialState();
       }
 
+      this._spikeTriggerEnabled = false;
       this._recording = true;
       return this;
     }
 
+    /**
+     * Enables the 30 FPS frame-spike auto-snapshot trigger. When active, frames
+     * delimited by `beginFrame()` / `endFrame(frameDurationMs)` are staged in a
+     * bounded buffer and retained strictly when `frameDurationMs > budgetMs`,
+     * never exceeding `maxSnapshots` or the recorder's `maxRecordedBytes` ring cap.
+     *
+     * @param {{
+     *   budgetMs?: number,
+     *   maxSnapshots?: number,
+     *   maxBytes?: number,
+     *   maxRecordedBytes?: number
+     * }} [options]
+     */
+    enableSpikeTrigger(options = {}) {
+      const opts = options || {};
+      const budgetMs =
+        opts.budgetMs !== undefined ? opts.budgetMs : DEFAULT_SPIKE_BUDGET_MS;
+      const maxSnapshots =
+        opts.maxSnapshots !== undefined ? opts.maxSnapshots : DEFAULT_SPIKE_MAX_SNAPSHOTS;
+      const maxBytes = resolveMaxBytesOption(opts, this._maxBytes);
+
+      if (typeof budgetMs !== 'number' || !Number.isFinite(budgetMs) || budgetMs <= 0) {
+        throw new RangeError(`budgetMs must be a positive finite number, got ${budgetMs}`);
+      }
+      if (!Number.isInteger(maxSnapshots) || maxSnapshots < 1) {
+        throw new RangeError(`maxSnapshots must be a positive integer, got ${maxSnapshots}`);
+      }
+
+      this._spikeBudgetMs = budgetMs;
+      this._spikeMaxSnapshots = maxSnapshots;
+      this._maxBytes = maxBytes;
+      this._spikeTriggerEnabled = true;
+      this._resetSpikeStaging();
+
+      while (
+        this._retainedFrameCount() > this._spikeMaxSnapshots ||
+        this._totalBytes > this._maxBytes
+      ) {
+        if (!this._evictOldestFrame()) {
+          break;
+        }
+      }
+
+      return this;
+    }
+
+    disableSpikeTrigger() {
+      this._spikeTriggerEnabled = false;
+      this._resetSpikeStaging();
+      return this;
+    }
+
+    isSpikeTriggerEnabled() {
+      return this._spikeTriggerEnabled;
+    }
+
+    /**
+     * Opens a staged frame window for the 30 FPS frame-spike trigger.
+     * Zero-allocation no-op when the spike trigger is disabled.
+     */
+    beginFrame() {
+      if (!this._spikeTriggerEnabled) {
+        return this;
+      }
+      this._spikeFrameActive = true;
+      this._spikeFrameStartMs = this._now();
+      this._spikeStaging = {
+        oversized: false,
+        chunks: [],
+        byteLength: 0,
+        packetCount: 0,
+        opcodeCounts: {},
+        skippedLargeUploadPackets: 0,
+        skippedLargeUploadBytes: 0,
+        skippedLargeUploads: null,
+      };
+      this._spikePendingChunks = [];
+      this._spikePendingBytes = 0;
+      this._spikePendingNeededBytes = PACKET_HEADER_BYTES;
+      this._spikeSkipBytesRemaining = 0;
+      return this;
+    }
+
+    /**
+     * Closes a staged frame window opened by `beginFrame()`. Retains the staged
+     * command snapshot strictly if `frameDurationMs > budgetMs` (within both
+     * `maxSnapshots` and `maxRecordedBytes` ring bounds); otherwise discards it.
+     *
+     * @param {number} [frameDurationMs]
+     */
+    endFrame(frameDurationMs) {
+      if (!this._spikeTriggerEnabled || !this._spikeFrameActive) {
+        return EMPTY_END_FRAME_RESULT;
+      }
+
+      let durationMs;
+      if (frameDurationMs === undefined) {
+        const rawElapsed = this._now() - this._spikeFrameStartMs;
+        durationMs = Number.isFinite(rawElapsed) && rawElapsed >= 0 ? rawElapsed : 0;
+      } else {
+        if (
+          typeof frameDurationMs !== 'number' ||
+          !Number.isFinite(frameDurationMs) ||
+          frameDurationMs < 0
+        ) {
+          throw new RangeError(
+            `frameDurationMs must be a non-negative finite number, got ${frameDurationMs}`
+          );
+        }
+        durationMs = frameDurationMs;
+      }
+
+      const staged = this._spikeStaging;
+      this._resetSpikeStaging();
+
+      const spiked = durationMs > this._spikeBudgetMs;
+      if (!spiked || !staged || staged.packetCount === 0) {
+        return {
+          spiked,
+          captured: false,
+          dropped: false,
+          evictedFrames: 0,
+          frameDurationMs: durationMs,
+          byteLength: 0,
+          packetCount: 0,
+        };
+      }
+
+      this._observedFrames += 1;
+
+      if (staged.oversized || staged.byteLength > this._maxBytes) {
+        this._nextFrameSeq += 1;
+        this._capturedFrames += 1;
+        this._droppedFrames += 1;
+        this._droppedRingPackets += staged.packetCount;
+        this._lastSpikeFrameMs = durationMs;
+        return {
+          spiked: true,
+          captured: false,
+          dropped: true,
+          evictedFrames: 0,
+          frameDurationMs: durationMs,
+          byteLength: staged.byteLength,
+          packetCount: staged.packetCount,
+        };
+      }
+
+      const frameBytes = concatChunks(staged.chunks, staged.byteLength);
+      const frame = {
+        sequence: this._nextFrameSeq++,
+        data: frameBytes,
+        byteLength: frameBytes.byteLength,
+        packetCount: staged.packetCount,
+        opcodeCounts: staged.opcodeCounts,
+        skippedLargeUploadPackets: staged.skippedLargeUploadPackets,
+        skippedLargeUploadBytes: staged.skippedLargeUploadBytes,
+        frameDurationMs: durationMs,
+        spikeSnapshot: true,
+      };
+      this._capturedFrames += 1;
+
+      let evictedNow = 0;
+      while (
+        this._retainedFrameCount() >= this._spikeMaxSnapshots ||
+        this._totalBytes + frame.byteLength > this._maxBytes
+      ) {
+        if (!this._evictOldestFrame()) {
+          break;
+        }
+        evictedNow += 1;
+      }
+
+      this._frames.push(frame);
+      this._totalBytes += frame.byteLength;
+      this._totalPackets += frame.packetCount;
+      if (this._totalBytes > this._peakRecordedBytes) {
+        this._peakRecordedBytes = this._totalBytes;
+      }
+
+      if (staged.skippedLargeUploadPackets > 0) {
+        this._skippedLargeUploadPackets += staged.skippedLargeUploadPackets;
+        this._skippedLargeUploadBytes += staged.skippedLargeUploadBytes;
+        if (staged.skippedLargeUploads) {
+          for (
+            let i = 0;
+            i < staged.skippedLargeUploads.length &&
+            this._skippedLargeUploads.length < MAX_SKIPPED_UPLOAD_METADATA_ENTRIES;
+            i++
+          ) {
+            const entry = staged.skippedLargeUploads[i];
+            entry.frameSequence = frame.sequence;
+            this._skippedLargeUploads.push(entry);
+          }
+        }
+      }
+
+      const keys = Object.keys(frame.opcodeCounts);
+      for (let i = 0; i < keys.length; i++) {
+        const key = keys[i];
+        this._opcodeCounts[key] = (this._opcodeCounts[key] || 0) + frame.opcodeCounts[key];
+      }
+
+      this._spikeSnapshotsCaptured += 1;
+      this._lastSpikeFrameMs = durationMs;
+
+      return {
+        spiked: true,
+        captured: true,
+        dropped: false,
+        evictedFrames: evictedNow,
+        frameDurationMs: durationMs,
+        byteLength: frame.byteLength,
+        packetCount: frame.packetCount,
+      };
+    }
+
     stop() {
       this._recording = false;
+      this._spikeTriggerEnabled = false;
       this._resetPartialState();
       return this;
     }
@@ -466,14 +738,18 @@
       this._skippedLargeUploadBytes = 0;
       this._skippedLargeUploads = [];
       this._nextFrameSeq = 0;
+      this._spikeSnapshotsCaptured = 0;
+      this._lastSpikeFrameMs = 0;
+      this._bypassedPackets = 0;
       this._resetPartialState();
       return this;
     }
 
     /**
      * Resets cumulative recorder telemetry counters (evictions, drops, skipped
-     * large uploads) and re-baselines `peakRecordedBytes` to current live
-     * `recordedBytes` without discarding retained frames.
+     * large uploads, spike trigger & bypass telemetry) and re-baselines
+     * `peakRecordedBytes` to current live `recordedBytes` without discarding
+     * retained frames.
      *
      * @returns {object} Fresh `getStats()` snapshot after reset.
      */
@@ -487,6 +763,9 @@
       this._skippedLargeUploadPackets = 0;
       this._skippedLargeUploadBytes = 0;
       this._skippedLargeUploads = [];
+      this._spikeSnapshotsCaptured = 0;
+      this._lastSpikeFrameMs = 0;
+      this._bypassedPackets = 0;
       return this.getStats();
     }
 
@@ -655,9 +934,185 @@
       return { completed: 0, dropped: 0 };
     }
 
+    _recordSpikeChunk(bytes) {
+      let src = toUint8Array(bytes);
+      const srcLen = src.byteLength;
+      if (srcLen === 0) {
+        return EMPTY_CHUNK_RESULT;
+      }
+
+      const staging = this._spikeStaging;
+      if (!staging) {
+        this._bypassedPackets += 1;
+        return EMPTY_CHUNK_RESULT;
+      }
+
+      if (this._spikeSkipBytesRemaining > 0) {
+        if (src.byteLength <= this._spikeSkipBytesRemaining) {
+          this._spikeSkipBytesRemaining -= src.byteLength;
+          return {
+            recordedBytes: srcLen,
+            packetsParsed: 0,
+            completedFrames: 0,
+            droppedFrames: 0,
+            skippedLargeUploadPackets: 0,
+            skippedLargeUploadBytes: 0,
+          };
+        }
+        src = src.subarray(this._spikeSkipBytesRemaining);
+        this._spikeSkipBytesRemaining = 0;
+      }
+
+      let buf;
+      if (this._spikePendingBytes > 0) {
+        const combinedLen = this._spikePendingBytes + src.byteLength;
+        if (combinedLen < this._spikePendingNeededBytes) {
+          this._spikePendingChunks.push(copyBytes(src));
+          this._spikePendingBytes = combinedLen;
+          return {
+            recordedBytes: srcLen,
+            packetsParsed: 0,
+            completedFrames: 0,
+            droppedFrames: 0,
+            skippedLargeUploadPackets: 0,
+            skippedLargeUploadBytes: 0,
+          };
+        }
+
+        buf = new Uint8Array(combinedLen);
+        let writeOffset = 0;
+        for (let i = 0; i < this._spikePendingChunks.length; i++) {
+          buf.set(this._spikePendingChunks[i], writeOffset);
+          writeOffset += this._spikePendingChunks[i].byteLength;
+        }
+        buf.set(src, writeOffset);
+        this._spikePendingChunks = [];
+        this._spikePendingBytes = 0;
+        this._spikePendingNeededBytes = PACKET_HEADER_BYTES;
+      } else {
+        buf = src;
+      }
+
+      const len = buf.byteLength;
+      const view = new DataView(buf.buffer, buf.byteOffset, len);
+      let offset = 0;
+      let packetsParsed = 0;
+      let chunkSkippedPackets = 0;
+      let chunkSkippedBytes = 0;
+
+      while (offset + PACKET_HEADER_BYTES <= len) {
+        const opcode = view.getUint16(offset, true);
+        const payloadBytes = view.getUint32(offset + 4, true);
+        const packetLen = PACKET_HEADER_BYTES + payloadBytes;
+
+        if (this._shouldSkipLargeWriteTexture(opcode, payloadBytes)) {
+          const minHeaderLen = PACKET_HEADER_BYTES + WRITE_TEXTURE_HEADER_BYTES;
+          if (offset + minHeaderLen > len) {
+            this._spikePendingNeededBytes = minHeaderLen;
+            break;
+          }
+
+          staging.skippedLargeUploadPackets += 1;
+          staging.skippedLargeUploadBytes += packetLen;
+          if (!staging.skippedLargeUploads) {
+            staging.skippedLargeUploads = [];
+          }
+          if (staging.skippedLargeUploads.length < MAX_SKIPPED_UPLOAD_METADATA_ENTRIES) {
+            staging.skippedLargeUploads.push(
+              parseWriteTextureMetadata(
+                view,
+                offset + PACKET_HEADER_BYTES,
+                payloadBytes,
+                packetLen,
+                this._nextFrameSeq
+              )
+            );
+          }
+          chunkSkippedPackets += 1;
+          chunkSkippedBytes += packetLen;
+          packetsParsed += 1;
+
+          if (offset + packetLen > len) {
+            this._spikeSkipBytesRemaining = packetLen - (len - offset);
+            offset = len;
+            break;
+          }
+          offset += packetLen;
+          continue;
+        }
+
+        if (!staging.oversized && staging.byteLength + packetLen > this._maxBytes) {
+          // Immediately release staged chunks so an oversized spike frame can never
+          // exceed maxRecordedBytes (16 MiB ring cap) in renderer RAM.
+          staging.oversized = true;
+          staging.chunks = null;
+        }
+
+        if (staging.oversized) {
+          staging.byteLength += packetLen;
+          staging.packetCount += 1;
+          packetsParsed += 1;
+          if (offset + packetLen > len) {
+            this._spikeSkipBytesRemaining = packetLen - (len - offset);
+            offset = len;
+            break;
+          }
+          offset += packetLen;
+          continue;
+        }
+
+        if (offset + packetLen > len) {
+          this._spikePendingNeededBytes = packetLen;
+          break;
+        }
+
+        const packetCopy = copyBytes(buf.subarray(offset, offset + packetLen));
+        const opName = getOpcodeName(opcode);
+        staging.chunks.push(packetCopy);
+        staging.byteLength += packetCopy.byteLength;
+        staging.packetCount += 1;
+        staging.opcodeCounts[opName] = (staging.opcodeCounts[opName] || 0) + 1;
+        packetsParsed += 1;
+        offset += packetLen;
+      }
+
+      if (offset < len) {
+        const remainder = copyBytes(buf.subarray(offset, len));
+        this._spikePendingChunks = [remainder];
+        this._spikePendingBytes = remainder.byteLength;
+        if (remainder.byteLength >= PACKET_HEADER_BYTES) {
+          const remView = new DataView(
+            remainder.buffer,
+            remainder.byteOffset,
+            remainder.byteLength
+          );
+          const remOpcode = remView.getUint16(0, true);
+          const remPayloadBytes = remView.getUint32(4, true);
+          if (this._shouldSkipLargeWriteTexture(remOpcode, remPayloadBytes)) {
+            this._spikePendingNeededBytes = PACKET_HEADER_BYTES + WRITE_TEXTURE_HEADER_BYTES;
+          } else {
+            this._spikePendingNeededBytes = PACKET_HEADER_BYTES + remPayloadBytes;
+          }
+        } else {
+          this._spikePendingNeededBytes = PACKET_HEADER_BYTES;
+        }
+      }
+
+      return {
+        recordedBytes: srcLen,
+        packetsParsed,
+        completedFrames: 0,
+        droppedFrames: 0,
+        skippedLargeUploadPackets: chunkSkippedPackets,
+        skippedLargeUploadBytes: chunkSkippedBytes,
+      };
+    }
+
     /**
      * Records a chunk of raw binary GPU command packets.
      * Supports arbitrary splits across packet headers, payloads, and frame boundaries.
+     * When inactive (neither recording nor inside a spike-trigger frame), returns a
+     * frozen singleton immediately with zero allocations.
      *
      * @param {Uint8Array|ArrayBufferView|ArrayBuffer|SharedArrayBuffer} bytes
      * @returns {{
@@ -670,28 +1125,21 @@
      * }}
      */
     recordChunk(bytes) {
-      if (!this._recording) {
-        return {
-          recordedBytes: 0,
-          packetsParsed: 0,
-          completedFrames: 0,
-          droppedFrames: 0,
-          skippedLargeUploadPackets: 0,
-          skippedLargeUploadBytes: 0,
-        };
+      if (!this._recording && (!this._spikeTriggerEnabled || !this._spikeFrameActive)) {
+        if (bytes && bytes.byteLength > 0) {
+          this._bypassedPackets += 1;
+        }
+        return EMPTY_CHUNK_RESULT;
+      }
+
+      if (this._spikeTriggerEnabled && this._spikeFrameActive) {
+        return this._recordSpikeChunk(bytes);
       }
 
       let src = toUint8Array(bytes);
       const srcLen = src.byteLength;
       if (srcLen === 0) {
-        return {
-          recordedBytes: 0,
-          packetsParsed: 0,
-          completedFrames: 0,
-          droppedFrames: 0,
-          skippedLargeUploadPackets: 0,
-          skippedLargeUploadBytes: 0,
-        };
+        return EMPTY_CHUNK_RESULT;
       }
 
       if (this._skipBytesRemaining > 0) {
@@ -996,6 +1444,12 @@
         maxFrames: this._maxFrames,
         maxBytes: this._maxBytes,
         maxRecordedBytes: this._maxBytes,
+        spikeTriggerEnabled: this._spikeTriggerEnabled,
+        spikeBudgetMs: this._spikeBudgetMs,
+        spikeMaxSnapshots: this._spikeMaxSnapshots,
+        spikeSnapshotsCaptured: this._spikeSnapshotsCaptured,
+        lastSpikeFrameMs: this._lastSpikeFrameMs,
+        bypassedPackets: this._bypassedPackets,
       };
     }
 
@@ -1009,7 +1463,7 @@
       const frames = new Array(available);
       for (let i = 0; i < available; i++) {
         const frame = this._frames[this._frameHead + i];
-        frames[i] = {
+        const entry = {
           index: i,
           sequence: frame.sequence,
           byteLength: frame.byteLength,
@@ -1018,6 +1472,11 @@
           skippedLargeUploadPackets: frame.skippedLargeUploadPackets,
           skippedLargeUploadBytes: frame.skippedLargeUploadBytes,
         };
+        if (frame.spikeSnapshot) {
+          entry.spikeSnapshot = true;
+          entry.frameDurationMs = frame.frameDurationMs;
+        }
+        frames[i] = entry;
       }
 
       const stats = this.getStats();
@@ -1051,8 +1510,17 @@
       let attached = true;
 
       function interceptedExecuteCommandBuffer(input) {
-        if (attached && recorder.isRecording() && isBinaryInput(input)) {
-          recorder.recordChunk(input);
+        if (attached) {
+          if (
+            recorder._recording ||
+            (recorder._spikeTriggerEnabled && recorder._spikeFrameActive)
+          ) {
+            if (isBinaryInput(input)) {
+              recorder.recordChunk(input);
+            }
+          } else if (input && input.byteLength > 0 && isBinaryInput(input)) {
+            recorder._bypassedPackets += 1;
+          }
         }
         return original.apply(processor, arguments);
       }
@@ -1805,6 +2273,8 @@
     DEFAULT_MAX_BYTES,
     DEFAULT_MAX_RECORDED_BYTES,
     DEFAULT_SKIP_WRITE_TEXTURE_ABOVE_BYTES,
+    DEFAULT_SPIKE_BUDGET_MS,
+    DEFAULT_SPIKE_MAX_SNAPSHOTS,
     OPCODES,
     OPCODE_NAMES,
     getOpcodeName,

@@ -25,6 +25,8 @@ const {
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_RECORDED_BYTES,
   DEFAULT_SKIP_WRITE_TEXTURE_ABOVE_BYTES,
+  DEFAULT_SPIKE_BUDGET_MS,
+  DEFAULT_SPIKE_MAX_SNAPSHOTS,
   OPCODES,
   OPCODE_NAMES,
   getOpcodeName,
@@ -2120,4 +2122,447 @@ test('W277: oversized streaming or unclosed frames in ring mode never exceed max
   assert.equal(stats.evictedFrames, 0);
   assert.equal(stats.droppedFrames, 1);
   assert.deepEqual(rec.exportTraceBytes(), concatUint8Arrays([fBefore, fAfter]));
+});
+
+test('W325: zero-overhead inactive bypass returns frozen singleton with zero allocations and tracks bypassedPackets', () => {
+  assert.equal(DEFAULT_SPIKE_BUDGET_MS, 33.333);
+  assert.equal(DEFAULT_SPIKE_MAX_SNAPSHOTS, 4);
+  assert.equal(GpuFrameRecorder.DEFAULT_SPIKE_BUDGET_MS, 33.333);
+  assert.equal(GpuFrameRecorder.DEFAULT_SPIKE_MAX_SNAPSHOTS, 4);
+
+  const rec = new GpuFrameRecorder();
+  const initial = rec.getStats();
+  assert.equal(initial.recording, false);
+  assert.equal(initial.spikeTriggerEnabled, false);
+  assert.equal(initial.spikeBudgetMs, 33.333);
+  assert.equal(initial.spikeMaxSnapshots, 4);
+  assert.equal(initial.spikeSnapshotsCaptured, 0);
+  assert.equal(initial.lastSpikeFrameMs, 0);
+  assert.equal(initial.bypassedPackets, 0);
+
+  const frame = buildSimpleFrame(0.25, 3);
+  const res1 = rec.recordChunk(frame);
+  const res2 = rec.recordChunk(frame);
+  const res3 = rec.recordChunk(new Uint8Array(0)); // empty chunk does not inflate bypassedPackets
+
+  // Strict identity & freeze prove immediate early return with zero object allocations.
+  assert.equal(Object.is(res1, res2), true);
+  assert.equal(Object.is(res1, res3), true);
+  assert.equal(Object.isFrozen(res1), true);
+  assert.deepEqual(res1, {
+    recordedBytes: 0,
+    packetsParsed: 0,
+    completedFrames: 0,
+    droppedFrames: 0,
+    skippedLargeUploadPackets: 0,
+    skippedLargeUploadBytes: 0,
+  });
+
+  // beginFrame() / endFrame() while disabled are zero-allocation no-ops.
+  assert.equal(rec.beginFrame(), rec);
+  const end1 = rec.endFrame(55.0);
+  const end2 = rec.endFrame(80.0);
+  assert.equal(Object.is(end1, end2), true);
+  assert.equal(Object.isFrozen(end1), true);
+  assert.equal(end1.spiked, false);
+  assert.equal(end1.captured, false);
+
+  const statsAfterDirect = rec.getStats();
+  assert.equal(statsAfterDirect.bypassedPackets, 2);
+  assert.equal(statsAfterDirect.frameCount, 0);
+  assert.equal(statsAfterDirect.recordedBytes, 0);
+  assert.equal(statsAfterDirect.recordedPackets, 0);
+  assert.equal(statsAfterDirect.spikeSnapshotsCaptured, 0);
+  assert.equal(statsAfterDirect.lastSpikeFrameMs, 0);
+
+  // Interceptor bypasses cleanly without invoking recording when inactive.
+  const { device, ctx, calls } = createMockWebGpu();
+  const processor = new WgpuCommandProcessor(device, ctx);
+  const handle = rec.createInterceptor(processor);
+  for (let i = 0; i < 5; i += 1) {
+    processor.executeCommandBuffer(frame);
+  }
+  handle.detach();
+
+  assert.equal(calls.filter((c) => c.op === 'submit').length, 5);
+  assert.equal(rec.getStats().bypassedPackets, 7);
+  assert.equal(rec.getStats().frameCount, 0);
+  assert.equal(rec.exportTraceBytes().byteLength, 0);
+
+  // stop() returns a spike-triggered recorder to zero-overhead bypass mode.
+  rec.enableSpikeTrigger({ budgetMs: 33.333, maxSnapshots: 4 });
+  assert.equal(rec.isSpikeTriggerEnabled(), true);
+  rec.stop();
+  assert.equal(rec.isSpikeTriggerEnabled(), false);
+  const postStop = rec.recordChunk(frame);
+  assert.equal(Object.is(postStop, res1), true);
+  assert.equal(rec.getStats().bypassedPackets, 8);
+});
+
+test('W325: 30 FPS spike trigger retains >33.333ms snapshots, discards <=33.333ms frames, and bounds maxSnapshots', (t) => {
+  const rec = new GpuFrameRecorder();
+  assert.equal(rec.enableSpikeTrigger({ budgetMs: 33.333, maxSnapshots: 4 }), rec);
+  assert.equal(rec.isSpikeTriggerEnabled(), true);
+  assert.equal(rec.isRecording(), false);
+
+  // Option validation leaves state untouched.
+  assert.throws(() => rec.enableSpikeTrigger({ budgetMs: 0 }), RangeError);
+  assert.throws(() => rec.enableSpikeTrigger({ budgetMs: -16.6 }), RangeError);
+  assert.throws(() => rec.enableSpikeTrigger({ budgetMs: Number.NaN }), RangeError);
+  assert.throws(() => rec.enableSpikeTrigger({ maxSnapshots: 0 }), RangeError);
+  assert.throws(() => rec.enableSpikeTrigger({ maxSnapshots: 2.5 }), RangeError);
+  assert.throws(() => rec.enableSpikeTrigger({ maxRecordedBytes: 0 }), RangeError);
+  assert.equal(rec.getStats().spikeBudgetMs, 33.333);
+  assert.equal(rec.getStats().spikeMaxSnapshots, 4);
+
+  const normalFast = buildSimpleFrame(0.1, 3);
+  const normalBorderline = buildSimpleFrame(0.2, 6);
+  const spikeFrames = [];
+  const spikeDurations = [33.334, 41.2, 52.8, 38.0, 64.5, 48.1];
+
+  for (let i = 0; i < spikeDurations.length; i += 1) {
+    spikeFrames.push(buildSimpleFrame(0.3 + i * 0.1, 9 + i * 3));
+  }
+
+  // 1) Out-of-frame packets before beginFrame() are bypassed with zero allocations.
+  const outRes = rec.recordChunk(normalFast);
+  assert.equal(Object.isFrozen(outRes), true);
+  assert.equal(rec.getStats().bypassedPackets, 1);
+
+  // 2) Normal <33.333ms and exact 33.333ms frames are completely discarded.
+  rec.beginFrame();
+  rec.recordChunk(normalFast);
+  const fastEnd = rec.endFrame(16.667);
+  assert.equal(fastEnd.spiked, false);
+  assert.equal(fastEnd.captured, false);
+  assert.equal(fastEnd.byteLength, 0);
+
+  rec.beginFrame();
+  rec.recordChunk(normalBorderline);
+  const exactEnd = rec.endFrame(33.333);
+  assert.equal(exactEnd.spiked, false);
+  assert.equal(exactEnd.captured, false);
+
+  let stats = rec.getStats();
+  assert.equal(stats.frameCount, 0);
+  assert.equal(stats.recordedBytes, 0);
+  assert.equal(stats.spikeSnapshotsCaptured, 0);
+  assert.equal(stats.lastSpikeFrameMs, 0);
+  assert.equal(rec.exportTraceBytes().byteLength, 0);
+
+  // 3) Invalid endFrame duration throws without discarding active frame.
+  rec.beginFrame();
+  // Feed first spike in 1-byte chunks to verify streaming reassembly inside spike staging.
+  for (let i = 0; i < spikeFrames[0].byteLength; i += 1) {
+    rec.recordChunk(spikeFrames[0].subarray(i, i + 1));
+  }
+  assert.throws(() => rec.endFrame(-1), RangeError);
+  assert.throws(() => rec.endFrame(Number.POSITIVE_INFINITY), RangeError);
+  assert.throws(() => rec.endFrame('slow'), RangeError);
+
+  const firstSpikeRes = rec.endFrame(spikeDurations[0]);
+  assert.equal(firstSpikeRes.spiked, true);
+  assert.equal(firstSpikeRes.captured, true);
+  assert.equal(firstSpikeRes.dropped, false);
+  assert.equal(firstSpikeRes.evictedFrames, 0);
+  assert.equal(firstSpikeRes.frameDurationMs, spikeDurations[0]);
+  assert.equal(firstSpikeRes.byteLength, spikeFrames[0].byteLength);
+  assert.equal(firstSpikeRes.packetCount, 4);
+
+  // Interleave normal frames with remaining 5 spikes -> total 6 spikes into maxSnapshots=4.
+  for (let i = 1; i < spikeFrames.length; i += 1) {
+    rec.beginFrame();
+    rec.recordChunk(normalFast);
+    rec.endFrame(20.0 + i);
+
+    rec.beginFrame();
+    rec.recordChunk(spikeFrames[i]);
+    const res = rec.endFrame(spikeDurations[i]);
+    assert.equal(res.spiked, true);
+    assert.equal(res.captured, true);
+    assert.equal(res.evictedFrames, i >= 4 ? 1 : 0);
+  }
+
+  stats = rec.getStats();
+  assert.equal(stats.frameCount, 4);
+  assert.equal(stats.spikeSnapshotsCaptured, 6);
+  assert.equal(stats.lastSpikeFrameMs, spikeDurations[spikeDurations.length - 1]);
+  assert.equal(stats.evictedFrames, 2);
+  assert.equal(stats.bypassedPackets, 1);
+  assert.equal(stats.recordedBytes, spikeFrames.slice(2).reduce((s, f) => s + f.byteLength, 0));
+  assert.deepEqual(JSON.parse(JSON.stringify(stats)), stats);
+
+  // Retained trace bytes must strictly match the newest 4 spike frames.
+  const expectedTrace = concatUint8Arrays(spikeFrames.slice(2));
+  const exported = rec.exportTraceBytes();
+  assert.deepEqual(exported, expectedTrace);
+
+  // Metadata marks spike snapshots with their durations and round-trips cleanly as JSON.
+  const meta = rec.exportMetadata();
+  assert.deepEqual(JSON.parse(JSON.stringify(meta)), meta);
+  assert.equal(meta.frames.length, 4);
+  for (let i = 0; i < 4; i += 1) {
+    assert.equal(meta.frames[i].spikeSnapshot, true);
+    assert.equal(meta.frames[i].frameDurationMs, spikeDurations[i + 2]);
+  }
+
+  // 4) Auto-timing when endFrame() is called without explicit frameDurationMs.
+  let fakeClock = 1000;
+  const timedRec = new GpuFrameRecorder({ now: () => fakeClock });
+  timedRec.enableSpikeTrigger({ budgetMs: 33.333, maxSnapshots: 4 });
+
+  timedRec.beginFrame();
+  timedRec.recordChunk(normalFast);
+  fakeClock += 16.0;
+  assert.equal(timedRec.endFrame().captured, false);
+
+  timedRec.beginFrame();
+  timedRec.recordChunk(spikeFrames[0]);
+  fakeClock += 47.5;
+  const autoSpike = timedRec.endFrame();
+  assert.equal(autoSpike.spiked, true);
+  assert.equal(autoSpike.captured, true);
+  assert.equal(autoSpike.frameDurationMs, 47.5);
+  assert.equal(timedRec.getStats().spikeSnapshotsCaptured, 1);
+  assert.equal(timedRec.getStats().lastSpikeFrameMs, 47.5);
+
+  // 5) Interceptor integration with spike trigger & disableSpikeTrigger().
+  const { device, ctx } = createMockWebGpu();
+  const processor = new WgpuCommandProcessor(device, ctx);
+  const intRec = new GpuFrameRecorder();
+  const handle = intRec.createInterceptor(processor);
+  intRec.enableSpikeTrigger({ budgetMs: 33.333, maxSnapshots: 2 });
+
+  // Normal frame via processor -> discarded
+  intRec.beginFrame();
+  processor.executeCommandBuffer(normalFast);
+  intRec.endFrame(18.0);
+  assert.equal(intRec.getStats().frameCount, 0);
+
+  // Spike frame via processor -> captured
+  intRec.beginFrame();
+  processor.executeCommandBuffer(spikeFrames[0]);
+  intRec.endFrame(44.0);
+  assert.equal(intRec.getStats().frameCount, 1);
+  assert.equal(intRec.getStats().spikeSnapshotsCaptured, 1);
+  assert.deepEqual(intRec.exportTraceBytes(), spikeFrames[0]);
+
+  // Outside beginFrame..endFrame -> bypassed
+  processor.executeCommandBuffer(normalFast);
+  assert.equal(intRec.getStats().bypassedPackets, 1);
+  assert.equal(intRec.disableSpikeTrigger(), intRec);
+  assert.equal(intRec.isSpikeTriggerEnabled(), false);
+  handle.detach();
+
+  // 6) Exported spike trace disassembles cleanly with tools/gpu_trace.py --strict.
+  const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
+  const probe = spawnSync(pythonCmd, ['--version'], { encoding: 'utf-8' });
+  if (probe.error || probe.status !== 0) {
+    t.skip('python interpreter unavailable for gpu_trace.py cross-check');
+    return;
+  }
+  const traceScript = path.join(REPO_ROOT, 'tools', 'gpu_trace.py');
+  const proc = spawnSync(pythonCmd, [traceScript, '-', '--json', '--strict'], {
+    input: Buffer.from(exported),
+    maxBuffer: 4 * 1024 * 1024,
+  });
+  assert.equal(proc.status, 0, `gpu_trace.py failed: ${proc.stderr.toString('utf-8')}`);
+  const parsed = JSON.parse(proc.stdout.toString('utf-8'));
+  assert.equal(parsed.ok, true);
+  assert.deepEqual(parsed.diagnostics, []);
+  assert.equal(parsed.frame_count, 4);
+  assert.equal(parsed.consumed_bytes, exported.byteLength);
+});
+
+test('W325: spike trigger enforces W277 16 MiB ring cap and drops oversized spike frames cleanly', () => {
+  const SIXTEEN_MIB = 16 * 1024 * 1024;
+  const FIVE_MIB_PAYLOAD = 5 * 1024 * 1024;
+
+  // 1) Default 16 MiB ring cap with four 5 MiB spike frames (20 MiB > 16 MiB cap).
+  const rec16 = new GpuFrameRecorder();
+  assert.equal(rec16.getStats().maxRecordedBytes, SIXTEEN_MIB);
+  rec16.enableSpikeTrigger({ budgetMs: 33.333, maxSnapshots: 4 });
+
+  const fiveMibBuf = new Uint8Array(FIVE_MIB_PAYLOAD);
+  const buildFiveMibFrame = (tag) => {
+    fiveMibBuf[0] = tag;
+    return new BinaryPacketBuilder()
+      .beginFrame()
+      .writeBuffer(tag, 0, fiveMibBuf)
+      .present()
+      .finish();
+  };
+
+  for (let i = 1; i <= 4; i += 1) {
+    const f = buildFiveMibFrame(i);
+    rec16.beginFrame();
+    rec16.recordChunk(f);
+    const res = rec16.endFrame(35.0 + i);
+    assert.equal(res.spiked, true);
+    assert.equal(res.captured, true);
+    const s = rec16.getStats();
+    assert.ok(s.recordedBytes <= SIXTEEN_MIB, `recordedBytes ${s.recordedBytes} exceeded 16 MiB`);
+    assert.ok(
+      s.peakRecordedBytes <= SIXTEEN_MIB,
+      `peakRecordedBytes ${s.peakRecordedBytes} exceeded 16 MiB`
+    );
+  }
+
+  const stats16 = rec16.getStats();
+  // At most 3 x ~5 MiB (~15 MiB) fit inside the 16 MiB cap; frame 1 must be evicted.
+  assert.equal(stats16.frameCount, 3);
+  assert.equal(stats16.evictedFrames, 1);
+  assert.equal(stats16.spikeSnapshotsCaptured, 4);
+  assert.equal(stats16.lastSpikeFrameMs, 39.0);
+  assert.ok(stats16.recordedBytes <= SIXTEEN_MIB);
+  assert.ok(stats16.peakRecordedBytes <= SIXTEEN_MIB);
+
+  // 2) Single >16 MiB spike frame is dropped without evicting valid snapshots or exceeding 16 MiB.
+  const hugeHeader = new Uint8Array(8 + 8 + 16);
+  const hugeView = new DataView(hugeHeader.buffer);
+  hugeView.setUint16(0, OPCODES.BEGIN_FRAME, true);
+  hugeView.setUint16(2, 0, true);
+  hugeView.setUint32(4, 0, true);
+  // WriteBuffer header claiming 17 MiB payload (streamed in header-only chunk)
+  hugeView.setUint16(8, OPCODES.WRITE_BUFFER, true);
+  hugeView.setUint16(10, 0, true);
+  hugeView.setUint32(12, 17 * 1024 * 1024, true);
+
+  rec16.beginFrame();
+  rec16.recordChunk(hugeHeader);
+  const oversizedRes = rec16.endFrame(72.5);
+  assert.equal(oversizedRes.spiked, true);
+  assert.equal(oversizedRes.captured, false);
+  assert.equal(oversizedRes.dropped, true);
+
+  const afterOversized = rec16.getStats();
+  assert.equal(afterOversized.frameCount, 3);
+  assert.equal(afterOversized.spikeSnapshotsCaptured, 4);
+  assert.equal(afterOversized.lastSpikeFrameMs, 72.5);
+  assert.equal(afterOversized.droppedFrames, 2); // 1 eviction + 1 oversized drop
+  assert.ok(afterOversized.recordedBytes <= SIXTEEN_MIB);
+  assert.ok(afterOversized.peakRecordedBytes <= SIXTEEN_MIB);
+
+  // 3) Tight custom byte cap (128B) with 64B & 96B spike frames enforces exact eviction.
+  const tightRec = new GpuFrameRecorder({ maxRecordedBytes: 128 });
+  tightRec.enableSpikeTrigger({ budgetMs: 33.333, maxSnapshots: 4 });
+  const f64a = buildSimpleFrame(0.1, 3); // 64B
+  const f64b = buildSimpleFrame(0.2, 6); // 64B
+  const f96 = new BinaryPacketBuilder()
+    .beginFrame()
+    .writeBuffer(1, 0, new Uint8Array(56))
+    .present()
+    .finish(); // 96B
+
+  tightRec.beginFrame();
+  tightRec.recordChunk(f64a);
+  tightRec.endFrame(40.0);
+
+  tightRec.beginFrame();
+  tightRec.recordChunk(f64b);
+  tightRec.endFrame(42.0);
+
+  assert.equal(tightRec.getStats().frameCount, 2);
+  assert.equal(tightRec.getStats().recordedBytes, 128);
+
+  // Adding 96B spike evicts both 64B frames to stay within 128B cap.
+  tightRec.beginFrame();
+  tightRec.recordChunk(f96);
+  const evictRes = tightRec.endFrame(51.5);
+  assert.equal(evictRes.captured, true);
+  assert.equal(evictRes.evictedFrames, 2);
+
+  const tightStats = tightRec.getStats();
+  assert.equal(tightStats.frameCount, 1);
+  assert.equal(tightStats.recordedBytes, 96);
+  assert.equal(tightStats.peakRecordedBytes, 128);
+  assert.equal(tightStats.evictedFrames, 2);
+  assert.equal(tightStats.spikeSnapshotsCaptured, 3);
+  assert.equal(tightStats.lastSpikeFrameMs, 51.5);
+  assert.deepEqual(tightRec.exportTraceBytes(), f96);
+});
+
+test('W325: resetStats() and clear() cleanly reset spike & bypass telemetry', () => {
+  const rec = new GpuFrameRecorder({ maxRecordedBytes: 256 });
+  const f0 = buildSimpleFrame(0.1, 3); // 64B
+  const f1 = buildSimpleFrame(0.2, 6); // 64B
+  const f2 = buildSimpleFrame(0.3, 9); // 64B
+
+  // Accumulate bypassed packets while disabled.
+  rec.recordChunk(f0);
+  rec.recordChunk(f1);
+  assert.equal(rec.getStats().bypassedPackets, 2);
+
+  // Enable spike trigger with maxSnapshots=2 and capture 3 spikes (evicting 1).
+  rec.enableSpikeTrigger({ budgetMs: 33.333, maxSnapshots: 2 });
+  for (const [frame, dur] of [
+    [f0, 40.0],
+    [f1, 45.0],
+    [f2, 55.25],
+  ]) {
+    rec.beginFrame();
+    rec.recordChunk(frame);
+    rec.endFrame(dur);
+  }
+
+  // Out-of-frame bypass increments bypassedPackets further.
+  rec.recordChunk(f0);
+
+  const beforeReset = rec.getStats();
+  assert.equal(beforeReset.frameCount, 2);
+  assert.equal(beforeReset.recordedBytes, 128);
+  assert.equal(beforeReset.evictedFrames, 1);
+  assert.equal(beforeReset.spikeSnapshotsCaptured, 3);
+  assert.equal(beforeReset.lastSpikeFrameMs, 55.25);
+  assert.equal(beforeReset.bypassedPackets, 3);
+  assert.equal(beforeReset.spikeTriggerEnabled, true);
+
+  // resetStats() clears spikeSnapshotsCaptured, lastSpikeFrameMs, bypassedPackets, and
+  // eviction/drop counters WITHOUT discarding retained snapshots or disabling spike trigger.
+  const afterReset = rec.resetStats();
+  assert.equal(afterReset.frameCount, 2);
+  assert.equal(afterReset.recordedBytes, 128);
+  assert.equal(afterReset.peakRecordedBytes, 128);
+  assert.equal(afterReset.evictedFrames, 0);
+  assert.equal(afterReset.droppedFrames, 0);
+  assert.equal(afterReset.droppedRingPackets, 0);
+  assert.equal(afterReset.spikeSnapshotsCaptured, 0);
+  assert.equal(afterReset.lastSpikeFrameMs, 0);
+  assert.equal(afterReset.bypassedPackets, 0);
+  assert.equal(afterReset.spikeTriggerEnabled, true);
+  assert.equal(afterReset.spikeBudgetMs, 33.333);
+  assert.equal(afterReset.spikeMaxSnapshots, 2);
+  assert.deepEqual(rec.exportTraceBytes(), concatUint8Arrays([f1, f2]));
+
+  // Capture one more spike and bypass one chunk, then verify clear() resets everything
+  // including retained snapshots while keeping spikeTriggerEnabled active.
+  rec.beginFrame();
+  rec.recordChunk(f0);
+  rec.endFrame(60.0);
+  rec.recordChunk(f0);
+  assert.equal(rec.getStats().spikeSnapshotsCaptured, 1);
+  assert.equal(rec.getStats().lastSpikeFrameMs, 60.0);
+  assert.equal(rec.getStats().bypassedPackets, 1);
+
+  rec.clear();
+  const afterClear = rec.getStats();
+  assert.equal(afterClear.frameCount, 0);
+  assert.equal(afterClear.recordedBytes, 0);
+  assert.equal(afterClear.peakRecordedBytes, 0);
+  assert.equal(afterClear.spikeSnapshotsCaptured, 0);
+  assert.equal(afterClear.lastSpikeFrameMs, 0);
+  assert.equal(afterClear.bypassedPackets, 0);
+  assert.equal(afterClear.evictedFrames, 0);
+  assert.equal(afterClear.droppedFrames, 0);
+  assert.equal(afterClear.spikeTriggerEnabled, true);
+  assert.equal(rec.exportTraceBytes().byteLength, 0);
+
+  // Spike trigger still works cleanly after clear().
+  rec.beginFrame();
+  rec.recordChunk(f2);
+  rec.endFrame(36.5);
+  assert.equal(rec.getStats().frameCount, 1);
+  assert.equal(rec.getStats().spikeSnapshotsCaptured, 1);
+  assert.equal(rec.getStats().lastSpikeFrameMs, 36.5);
+  assert.deepEqual(rec.exportTraceBytes(), f2);
 });
