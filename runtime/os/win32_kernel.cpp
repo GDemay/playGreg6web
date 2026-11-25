@@ -1370,9 +1370,8 @@ struct SrwShard {
     std::unordered_map<uintptr_t, std::unique_ptr<playgta6::os::SrwLock>> locks;
 };
 
-playgta6::os::SrwLock& srw_lock_for(const SrwLock* srw_lock) {
+playgta6::os::SrwLock& srw_lock_for_slow(uintptr_t key) {
     static SrwShard shards[64];
-    const uintptr_t key = reinterpret_cast<uintptr_t>(srw_lock);
     SrwShard& shard = shards[(key >> 3) % 64];
     std::lock_guard<std::mutex> guard(shard.mutex);
     std::unique_ptr<playgta6::os::SrwLock>& entry = shard.locks[key];
@@ -1380,6 +1379,25 @@ playgta6::os::SrwLock& srw_lock_for(const SrwLock* srw_lock) {
         entry = std::make_unique<playgta6::os::SrwLock>();
     }
     return *entry;
+}
+
+// Uncontended fast path: entries are never removed, so a per-thread direct-mapped cache of
+// address -> host lock stays valid forever and skips the shard mutex + hash lookup per call.
+struct SrwCacheSlot {
+    uintptr_t key = 0;
+    playgta6::os::SrwLock* lock = nullptr;
+};
+constexpr size_t kSrwCacheSlots = 64;
+
+playgta6::os::SrwLock& srw_lock_for(const SrwLock* srw_lock) {
+    thread_local SrwCacheSlot cache[kSrwCacheSlots];
+    const uintptr_t key = reinterpret_cast<uintptr_t>(srw_lock);
+    SrwCacheSlot& slot = cache[(key >> 3) % kSrwCacheSlots];
+    if (slot.key != key) {
+        slot.lock = &srw_lock_for_slow(key);
+        slot.key = key;
+    }
+    return *slot.lock;
 }
 
 }  // namespace
@@ -1449,20 +1467,53 @@ CriticalSectionShard& critical_section_shard(const void* address) {
     return shards[(key >> 4) % kCriticalSectionShards];
 }
 
+// Bumped whenever a section's host lock is replaced (re-Initialize) or erased (Delete), which
+// invalidates every thread's cached lookup below.
+std::atomic<uint64_t> g_critical_section_generation{1};
+
 // The section's lock; created when missing and `create` (a zero-initialized section entered
 // without an Initialize call behaves like an initialized one).
-std::shared_ptr<std::recursive_mutex> critical_section_lock(const CriticalSection* cs, bool create) {
+std::recursive_mutex* critical_section_lock_slow(const CriticalSection* cs, bool create) {
     CriticalSectionShard& shard = critical_section_shard(cs);
     std::lock_guard<std::mutex> guard(shard.mutex);
     auto it = shard.locks.find(cs);
     if (it != shard.locks.end()) {
-        return it->second;
+        return it->second.get();
     }
     if (!create) {
         return nullptr;
     }
     auto lock = std::make_shared<std::recursive_mutex>();
-    shard.locks.emplace(cs, lock);
+    std::recursive_mutex* raw = lock.get();
+    shard.locks.emplace(cs, std::move(lock));
+    return raw;
+}
+
+// Uncontended fast path: a per-thread direct-mapped cache of section -> host lock, valid while
+// the global generation is unchanged. Skips the shard mutex, the hash lookup and two atomic
+// shared_ptr refcount updates on every Enter/Leave. (Deleting a section another thread is still
+// using is undefined in Win32 too, so a raw pointer is as safe as the old temporary reference.)
+struct CriticalSectionCacheSlot {
+    const void* key = nullptr;
+    uint64_t generation = 0;
+    std::recursive_mutex* lock = nullptr;
+};
+constexpr size_t kCriticalSectionCacheSlots = 64;
+
+std::recursive_mutex* critical_section_lock(const CriticalSection* cs, bool create) {
+    thread_local CriticalSectionCacheSlot cache[kCriticalSectionCacheSlots];
+    const uint64_t generation = g_critical_section_generation.load(std::memory_order_acquire);
+    CriticalSectionCacheSlot& slot =
+        cache[(reinterpret_cast<uintptr_t>(cs) >> 4) % kCriticalSectionCacheSlots];
+    if (slot.key == cs && slot.generation == generation) {
+        return slot.lock;
+    }
+    std::recursive_mutex* lock = critical_section_lock_slow(cs, create);
+    if (lock != nullptr) {
+        slot.key = cs;
+        slot.generation = generation;
+        slot.lock = lock;
+    }
     return lock;
 }
 
@@ -1484,7 +1535,11 @@ void InitializeCriticalSectionWithSpinCount(CriticalSection* critical_section, u
     *critical_section = CriticalSection{~uint64_t{0}, -1, 0, 0, 0, spin_count};
     CriticalSectionShard& shard = critical_section_shard(critical_section);
     std::lock_guard<std::mutex> guard(shard.mutex);
-    shard.locks[critical_section] = std::make_shared<std::recursive_mutex>();
+    auto& entry = shard.locks[critical_section];
+    if (entry) {
+        g_critical_section_generation.fetch_add(1, std::memory_order_acq_rel);
+    }
+    entry = std::make_shared<std::recursive_mutex>();
 }
 
 void InitializeCriticalSection(CriticalSection* critical_section) {
@@ -1497,7 +1552,9 @@ void DeleteCriticalSection(CriticalSection* critical_section) {
     }
     CriticalSectionShard& shard = critical_section_shard(critical_section);
     std::lock_guard<std::mutex> guard(shard.mutex);
-    shard.locks.erase(critical_section);
+    if (shard.locks.erase(critical_section) != 0) {
+        g_critical_section_generation.fetch_add(1, std::memory_order_acq_rel);
+    }
 }
 
 void EnterCriticalSection(CriticalSection* critical_section) {
@@ -1524,7 +1581,8 @@ bool TryEnterCriticalSection(CriticalSection* critical_section) {
 }
 
 void LeaveCriticalSection(CriticalSection* critical_section) {
-    const auto lock = critical_section != nullptr ? critical_section_lock(critical_section, false) : nullptr;
+    std::recursive_mutex* const lock =
+        critical_section != nullptr ? critical_section_lock(critical_section, false) : nullptr;
     if (lock == nullptr) {
         SetLastError(ERROR_INVALID_HANDLE);
         return;
