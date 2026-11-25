@@ -1292,3 +1292,344 @@ test('W140: terminate() and destroy() clear all pending watchdog timers with zer
   assert.equal(activeTimers, 0);
   assert.equal(realTimers.size, 0);
 });
+
+// ---- W218: numeric priority scheduling, warm reuse & queue-depth telemetry --
+
+test('W218: numeric priority orders higher priority first with strict FIFO tie-breaking', async () => {
+  const { pool, workers } = setup({ maxWorkers: 1 });
+  const blocker = pool.submit('t', 'blocker');
+
+  const submissions = [
+    { label: 'p-15-a', opts: { priority: -15 } },
+    { label: 'low-a', opts: { priority: 'low' } },
+    { label: 'default-a', opts: {} },
+    { label: 'p5-a', opts: { priority: 5 } },
+    { label: 'p0-b', opts: { priority: 0 } },
+    { label: 'p50-a', opts: { priority: 50 } },
+    { label: 'high-a', opts: { priority: 'high' } },
+    { label: 'p5-b', opts: { priority: 5 } },
+    { label: 'p10-b', opts: { priority: 10 } },
+    { label: 'p2.5', opts: { priority: 2.5 } },
+    { label: 'norm-c', opts: { priority: 'normal' } },
+    { label: 'p50-b', opts: { priority: 50 } },
+    { label: 'p-15-b', opts: { priority: -15 } },
+  ];
+
+  const promises = submissions.map((s) => pool.submit('t', s.label, s.opts));
+  assert.equal(pool.getStats().queuedTasks, submissions.length);
+  assert.equal(pool.getStats().peakQueuedTasks, submissions.length);
+
+  workers[0].reply({ id: workers[0].last().id, ok: true, result: 'done' });
+  await blocker;
+
+  const started = [];
+  for (let i = 0; i < submissions.length; i++) {
+    const job = workers[0].last();
+    started.push(job.payload);
+    workers[0].reply({ id: job.id, ok: true, result: job.payload });
+    await flush();
+  }
+  await Promise.all(promises);
+
+  assert.deepEqual(started, [
+    'p50-a',
+    'p50-b',
+    'high-a',
+    'p10-b',
+    'p5-a',
+    'p5-b',
+    'p2.5',
+    'default-a',
+    'p0-b',
+    'norm-c',
+    'low-a',
+    'p-15-a',
+    'p-15-b',
+  ]);
+  await pool.terminate();
+});
+
+test('W218: rejects non-finite priorities and invalid per-task timeoutMs without throwing synchronously', async () => {
+  const { pool } = setup();
+  await assert.rejects(pool.submit('t', 1, { priority: NaN }), RangeError);
+  await assert.rejects(pool.submit('t', 1, { priority: Infinity }), RangeError);
+  await assert.rejects(pool.submit('t', 1, { priority: -Infinity }), RangeError);
+  await assert.rejects(pool.submit('t', 1, { priority: {} }), RangeError);
+  await assert.rejects(pool.submit('t', 1, { timeoutMs: -5 }), RangeError);
+  await assert.rejects(pool.submit('t', 1, { timeoutMs: NaN }), RangeError);
+  assert.equal(pool.getStats().submitted, 0);
+  assert.equal(pool.getStats().queuedTasks, 0);
+  await pool.terminate();
+});
+
+test('W218: cancelling queued tasks across heap positions preserves priority and FIFO ordering', async () => {
+  const { pool, workers } = setup({ maxWorkers: 1 });
+  const blocker = pool.submit('t', 'blocker');
+
+  const acRoot = new AbortController();
+  const acMid = new AbortController();
+  const acLeaf = new AbortController();
+
+  const p1 = pool.submit('t', 'p10-first', { priority: 10, signal: acRoot.signal });
+  const p2 = pool.submit('t', 'p10-second', { priority: 10 });
+  const p3 = pool.submit('t', 'p5-first', { priority: 5 });
+  const p4 = pool.submit('t', 'p5-second', { priority: 5, signal: acMid.signal });
+  const p5 = pool.submit('t', 'p5-third', { priority: 5 });
+  const p6 = pool.submit('t', 'p1-first', { priority: 1 });
+  const p7 = pool.submit('t', 'p1-second', { priority: 1, signal: acLeaf.signal });
+  const p8 = pool.submit('t', 'p20-top', { priority: 20 });
+
+  assert.equal(pool.getStats().queuedTasks, 8);
+  assert.equal(pool.getStats().peakQueuedTasks, 8);
+
+  acRoot.abort('drop-root-ish');
+  acMid.abort('drop-mid');
+  acLeaf.abort('drop-leaf');
+
+  await assert.rejects(p1, JobAbortedError);
+  await assert.rejects(p4, JobAbortedError);
+  await assert.rejects(p7, JobAbortedError);
+  assert.equal(pool.getStats().queuedTasks, 5);
+  assert.equal(pool.getStats().cancelled, 3);
+
+  workers[0].reply({ id: workers[0].last().id, ok: true, result: 'done' });
+  await blocker;
+
+  const started = [];
+  for (let i = 0; i < 5; i++) {
+    const job = workers[0].last();
+    started.push(job.payload);
+    workers[0].reply({ id: job.id, ok: true, result: job.payload });
+    await flush();
+  }
+  await Promise.all([p2, p3, p5, p6, p8]);
+
+  assert.deepEqual(started, ['p20-top', 'p10-second', 'p5-first', 'p5-third', 'p1-first']);
+  assert.equal(pool.getStats().peakQueuedTasks, 8);
+  assert.equal(pool.getStats().queuedTasks, 0);
+  await pool.terminate();
+});
+
+test('W218: warm worker reuse prefers most recently active idle worker and supports warmUp()', async () => {
+  const { pool, workers, clock } = setup({ maxWorkers: 3, minWorkers: 1, idleTimeoutMs: 100 });
+
+  assert.throws(() => pool.warmUp(-1), RangeError);
+  assert.throws(() => pool.warmUp(1.5), RangeError);
+
+  assert.equal(pool.warmUp(2), 2);
+  assert.equal(workers.length, 2);
+  assert.equal(pool.getStats().activeWorkers, 0);
+  assert.equal(pool.getStats().idleWorkers, 2);
+
+  // Dispatch 3 concurrent jobs: 2 use pre-warmed workers, 1 spawns lazily up to maxWorkers.
+  const j1 = pool.submit('t', 'j1');
+  const j2 = pool.submit('t', 'j2');
+  const j3 = pool.submit('t', 'j3');
+  assert.equal(workers.length, 3);
+  assert.equal(pool.getStats().activeWorkers, 3);
+  assert.equal(pool.getStats().idleWorkers, 0);
+
+  // Finish workers 0, 1, 2 at t=10, t=20, t=30 so worker 2 is most recently warm.
+  clock.advance(10);
+  workers[0].reply({ id: workers[0].last().id, ok: true, result: 1 });
+  clock.advance(10);
+  workers[1].reply({ id: workers[1].last().id, ok: true, result: 2 });
+  clock.advance(10);
+  workers[2].reply({ id: workers[2].last().id, ok: true, result: 3 });
+  await Promise.all([j1, j2, j3]);
+  assert.equal(pool.getStats().idleWorkers, 3);
+  assert.equal(pool.getStats().warmReuses, 0);
+
+  // At t=80, submit a single job: MRU warm worker (workers[2]) is reused, no new worker spawned.
+  clock.advance(50);
+  const j4 = pool.submit('t', 'j4');
+  assert.equal(workers.length, 3);
+  assert.equal(workers[2].last().payload, 'j4');
+  assert.equal(pool.getStats().activeWorkers, 1);
+  assert.equal(pool.getStats().idleWorkers, 2);
+  assert.equal(pool.getStats().warmReuses, 1);
+
+  // Advance 50ms (t=130): older idle workers[0] (t=110) and workers[1] (t=120) shrink away,
+  // while busy warm worker[2] stays alive.
+  clock.advance(50);
+  assert.equal(workers[0].terminated, true);
+  assert.equal(workers[1].terminated, true);
+  assert.equal(workers[2].terminated, false);
+  assert.equal(pool.getStats().workers, 1);
+
+  workers[2].reply({ id: workers[2].last().id, ok: true, result: 4 });
+  assert.equal(await j4, 4);
+  assert.equal(pool.getStats().idleWorkers, 1);
+  assert.equal(pool.getStats().activeWorkers, 0);
+
+  await pool.terminate();
+  assert.equal(clock.pending, 0);
+});
+
+test('W218: error, crash, and timeout recovery preserves full pool capacity and priority order', async () => {
+  const { pool, workers, clock } = setup({
+    maxWorkers: 2,
+    retries: 0,
+    taskTimeoutMs: 50,
+    cancelGraceMs: 20,
+    breaker: false,
+  });
+
+  // Fill both workers and queue 4 prioritized tasks.
+  const runA = pool.submit('t', 'runA');
+  const runB = pool.submit('t', 'runB');
+  const qLow = pool.submit('t', 'qLow', { priority: 1 });
+  const qUrgent = pool.submit('t', 'qUrgent', { priority: 100 });
+  const qMid = pool.submit('t', 'qMid', { priority: 20 });
+  const qHigh = pool.submit('t', 'qHigh', { priority: 50 });
+
+  assert.equal(pool.getStats().activeWorkers, 2);
+  assert.equal(pool.getStats().idleWorkers, 0);
+  assert.equal(pool.getStats().queuedTasks, 4);
+  assert.equal(pool.getStats().peakQueuedTasks, 4);
+
+  // 1) Worker 0 returns a job-level error -> stays alive, reuses warm slot for qUrgent (prio 100).
+  clock.advance(10);
+  workers[0].reply({ id: workers[0].last().id, ok: false, error: { name: 'Error', message: 'bad-task' } });
+  await assert.rejects(runA, /bad-task/);
+  assert.equal(workers.length, 2);
+  assert.equal(workers[0].last().payload, 'qUrgent');
+  assert.equal(pool.getStats().activeWorkers, 2);
+  assert.equal(pool.getStats().warmReuses, 1);
+
+  // 2) Worker 1 crashes -> replaced cleanly without losing capacity; picks up qHigh (prio 50).
+  clock.advance(10);
+  workers[1].emit('error', { message: 'segfault' });
+  await assert.rejects(runB, WorkerCrashError);
+  assert.equal(workers[1].terminated, true);
+  assert.equal(workers.length, 3);
+  assert.equal(workers[2].last().payload, 'qHigh');
+  assert.equal(pool.getStats().activeWorkers, 2);
+  assert.equal(pool.getStats().respawnedWorkers, 1);
+
+  // 3) qUrgent (started at t=10) times out at t=60, ignores cancel, hard-kills at t=80.
+  //    qHigh (started at t=20) completes at t=60 (run time = 40ms) -> worker[2] picks up qMid (prio 20).
+  clock.advance(40);
+  await assert.rejects(qUrgent, JobTimeoutError);
+  workers[2].reply({ id: workers[2].last().id, ok: true, result: 'HIGH' });
+  assert.equal(await qHigh, 'HIGH');
+  assert.equal(workers[2].last().payload, 'qMid');
+
+  // Hard-kill grace expires for workers[0] at t=80 -> worker[3] spawns and picks up qLow (prio 1).
+  clock.advance(20);
+  assert.equal(workers[0].terminated, true);
+  assert.equal(workers.length, 4);
+  assert.equal(workers[3].last().payload, 'qLow');
+  assert.equal(pool.getStats().activeWorkers, 2);
+
+  // Complete remaining two jobs at t=100 on full 2-worker capacity (qMid ran 40ms, qLow ran 20ms).
+  clock.advance(20);
+  workers[2].reply({ id: workers[2].last().id, ok: true, result: 'MID' });
+  workers[3].reply({ id: workers[3].last().id, ok: true, result: 'LOW' });
+  assert.deepEqual(await Promise.all([qMid, qLow]), ['MID', 'LOW']);
+
+  const stats = pool.getStats();
+  assert.deepEqual(stats, pool.stats());
+  assert.equal(stats.workers, 2);
+  assert.equal(stats.activeWorkers, 0);
+  assert.equal(stats.idleWorkers, 2);
+  assert.equal(stats.queuedTasks, 0);
+  assert.equal(stats.peakQueuedTasks, 4);
+  assert.equal(stats.completedTasks, 3);
+  assert.equal(stats.failedTasks, 3);
+  assert.equal(stats.timedOutTasks, 1);
+  assert.equal(stats.crashed, 1);
+  assert.equal(stats.respawnedWorkers, 2);
+  assert.ok(stats.avgTaskMs > 0);
+  assert.equal(stats.avgTaskMs, stats.avgRunMs);
+
+  await pool.terminate();
+  assert.equal(clock.pending, 0);
+});
+
+test('W218: cancel postMessage failure hard-kills broken worker immediately without wedging slot', async () => {
+  const { pool, workers, clock } = setup({ maxWorkers: 1, cancelGraceMs: 5000 });
+  const ac = new AbortController();
+  const p1 = pool.submit('t', 'first', { signal: ac.signal });
+  const p2 = pool.submit('t', 'second');
+
+  // Simulate worker throwing when asked to cancel.
+  workers[0].postMessage = () => {
+    throw new Error('channel closed');
+  };
+  ac.abort();
+  await assert.rejects(p1, JobAbortedError);
+
+  assert.equal(workers[0].terminated, true);
+  assert.equal(workers.length, 2);
+  assert.equal(workers[1].last().payload, 'second');
+  workers[1].reply({ id: workers[1].last().id, ok: true, result: 'recovered' });
+  assert.equal(await p2, 'recovered');
+  assert.equal(clock.pending, 0);
+
+  await pool.terminate();
+});
+
+test('W218: telemetry reports exact activeWorkers, idleWorkers, queuedTasks, peakQueuedTasks, completedTasks, failedTasks, avgTaskMs', async () => {
+  const { pool, workers, clock } = setup({ maxWorkers: 2 });
+
+  // Initial empty state.
+  let s = pool.getStats();
+  assert.equal(s.activeWorkers, 0);
+  assert.equal(s.idleWorkers, 0);
+  assert.equal(s.queuedTasks, 0);
+  assert.equal(s.peakQueuedTasks, 0);
+  assert.equal(s.completedTasks, 0);
+  assert.equal(s.failedTasks, 0);
+  assert.equal(s.avgTaskMs, 0);
+
+  // Submit 4 tasks: 2 active, 2 queued.
+  const t1 = pool.submit('t', 1, { priority: 1 });
+  const t2 = pool.submit('t', 2, { priority: 2 });
+  const t3 = pool.submit('t', 3, { priority: 10 });
+  const t4 = pool.submit('t', 4, { priority: 5 });
+
+  s = pool.getStats();
+  assert.equal(s.activeWorkers, 2);
+  assert.equal(s.idleWorkers, 0);
+  assert.equal(s.queuedTasks, 2);
+  assert.equal(s.peakQueuedTasks, 2);
+
+  // t1 completes at t=20 (20ms), t3 (prio 10) dispatches onto worker 0.
+  clock.advance(20);
+  workers[0].reply({ id: 1, ok: true, result: 'r1' });
+  assert.equal(await t1, 'r1');
+  assert.equal(workers[0].last().id, 3);
+
+  // t2 fails at t=40 (40ms), t4 (prio 5) dispatches onto worker 1.
+  clock.advance(20);
+  workers[1].reply({ id: 2, ok: false, error: { name: 'Error', message: 'boom' } });
+  await assert.rejects(t2, /boom/);
+  assert.equal(workers[1].last().id, 4);
+
+  // t3 finishes at t=60 (run 40ms), t4 finishes at t=100 (run 60ms).
+  clock.advance(20);
+  workers[0].reply({ id: 3, ok: true, result: 'r3' });
+  assert.equal(await t3, 'r3');
+  s = pool.getStats();
+  assert.equal(s.activeWorkers, 1);
+  assert.equal(s.idleWorkers, 1);
+  assert.equal(s.queuedTasks, 0);
+
+  clock.advance(40);
+  workers[1].reply({ id: 4, ok: true, result: 'r4' });
+  assert.equal(await t4, 'r4');
+
+  // Run durations: 20 + 40 + 40 + 60 = 160ms across 4 tasks => avgTaskMs === 40.
+  s = pool.getStats();
+  assert.equal(s.activeWorkers, 0);
+  assert.equal(s.idleWorkers, 2);
+  assert.equal(s.queuedTasks, 0);
+  assert.equal(s.peakQueuedTasks, 2);
+  assert.equal(s.completedTasks, 3);
+  assert.equal(s.failedTasks, 1);
+  assert.equal(s.avgTaskMs, 40);
+  assert.equal(s.warmReuses, 2);
+
+  await pool.terminate();
+});
