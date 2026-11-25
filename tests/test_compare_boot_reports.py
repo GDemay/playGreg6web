@@ -695,5 +695,366 @@ class GpuAdapterAndVisibleFrameTests(unittest.TestCase):
         self.assertEqual(result["gpu_delta"]["black_loading_ms"], {"a": 4000, "b": 4000, "delta": 0, "pct": 0.0})
 
 
+class TelemetryDeltaTests(unittest.TestCase):
+    tol = cbr.Tolerances()
+
+    def test_full_chrome_boot_telemetry_diff_json_text_and_markdown(self):
+        ra = make_browser_report()
+        rb = make_browser_report()
+        ra.update({
+            "first_visible_frame_s": 50.4,
+            "black_loading_s": 42.0,
+            "js_heap_used_mb": 1220.0,
+            "js_heap_total_mb": 1500.0,
+            "audio_ring_attached": False,
+            "audio_frames_drained": 0,
+        })
+        rb.update({
+            "first_visible_frame_s": 12.2,
+            "black_loading_s": 4.0,
+            "js_heap_used_mb": 270.0,
+            "js_heap_total_mb": 512.0,
+            "audio_ring_attached": True,
+            "audio_frames_drained": 48000,
+        })
+
+        c = cbr.compare(ra, rb, self.tol)
+        self.assertEqual(c.failures(), [])
+        result = cbr.to_result(c)
+        self.assertEqual(result["verdict"], "pass")
+        self.assertIn("telemetry_delta", result)
+        td = result["telemetry_delta"]
+
+        self.assertEqual(
+            td["first_visible_frame_s"],
+            {
+                "a": 50.4,
+                "b": 12.2,
+                "delta": -38.2,
+                "pct": -75.79,
+                "formatted_delta": "-38.2s",
+                "better": "lower",
+                "status": "improved",
+            },
+        )
+        self.assertEqual(
+            td["black_loading_s"],
+            {
+                "a": 42.0,
+                "b": 4.0,
+                "delta": -38.0,
+                "pct": -90.48,
+                "formatted_delta": "-38.0s",
+                "better": "lower",
+                "status": "improved",
+            },
+        )
+        self.assertEqual(
+            td["js_heap_used_mb"],
+            {
+                "a": 1220.0,
+                "b": 270.0,
+                "delta": -950.0,
+                "pct": -77.87,
+                "formatted_delta": "-950.0 MB",
+                "better": "lower",
+                "status": "improved",
+            },
+        )
+        self.assertEqual(
+            td["js_heap_total_mb"],
+            {
+                "a": 1500.0,
+                "b": 512.0,
+                "delta": -988.0,
+                "pct": -65.87,
+                "formatted_delta": "-988.0 MB",
+                "better": "lower",
+                "status": "improved",
+            },
+        )
+        self.assertEqual(
+            td["audio_ring_attached"],
+            {
+                "a": False,
+                "b": True,
+                "delta": "false -> true",
+                "changed": True,
+                "transition": "false -> true",
+                "better": "true",
+                "status": "improved",
+            },
+        )
+        self.assertEqual(
+            td["audio_frames_drained"],
+            {
+                "a": 0,
+                "b": 48000,
+                "delta": 48000,
+                "pct": None,
+                "formatted_delta": "+48000",
+                "better": "higher",
+                "status": "improved",
+            },
+        )
+
+        text = cbr.format_text(c)
+        self.assertIn("[telemetry_delta]", text)
+        self.assertIn("first_visible_frame_s: 50.4s -> 12.2s (-38.2s, -75.8%, improved)", text)
+        self.assertIn("black_loading_s: 42.0s -> 4.0s (-38.0s, -90.5%, improved)", text)
+        self.assertIn("js_heap_used_mb: 1220.0 MB -> 270.0 MB (-950.0 MB, -77.9%, improved)", text)
+        self.assertIn("js_heap_total_mb: 1500.0 MB -> 512.0 MB (-988.0 MB, -65.9%, improved)", text)
+        self.assertIn("audio_ring_attached: false -> true (improved)", text)
+        self.assertIn("audio_frames_drained: 0 -> 48000 (+48000, improved)", text)
+
+        md = cbr.format_markdown(c)
+        self.assertIn("## Boot Report Comparison — PASS", md)
+        self.assertIn("### Telemetry Delta", md)
+        self.assertIn("| `first_visible_frame_s` | 50.4s | 12.2s | -38.2s | -75.8% | improved |", md)
+        self.assertIn("| `js_heap_used_mb` | 1220.0 MB | 270.0 MB | -950.0 MB | -77.9% | improved |", md)
+        self.assertIn("| `audio_ring_attached` | false | true | false -> true | — | improved |", md)
+        self.assertIn("| `audio_frames_drained` | 0 | 48000 | +48000 | — | improved |", md)
+
+    def test_regressions_and_unchanged_directionality(self):
+        ra = make_browser_report()
+        rb = make_browser_report()
+        ra.update({
+            "first_visible_frame_s": 12.2,
+            "black_loading_s": 4.0,
+            "js_heap_used_mb": 270.0,
+            "js_heap_total_mb": 512.0,
+            "audio_ring_attached": True,
+            "audio_frames_drained": 48000,
+        })
+        rb.update({
+            "first_visible_frame_s": 50.4,
+            "black_loading_s": 4.0,
+            "js_heap_used_mb": 1220.0,
+            "js_heap_total_mb": 512.0,
+            "audio_ring_attached": False,
+            "audio_frames_drained": 12000,
+        })
+
+        td = cbr.compute_telemetry_delta(ra, rb)
+        self.assertEqual(td["first_visible_frame_s"]["status"], "regressed")
+        self.assertEqual(td["first_visible_frame_s"]["formatted_delta"], "+38.2s")
+        self.assertEqual(td["black_loading_s"]["status"], "unchanged")
+        self.assertEqual(td["black_loading_s"]["formatted_delta"], "0.0s")
+        self.assertEqual(td["js_heap_used_mb"]["status"], "regressed")
+        self.assertEqual(td["js_heap_used_mb"]["formatted_delta"], "+950.0 MB")
+        self.assertEqual(td["js_heap_total_mb"]["status"], "unchanged")
+        self.assertEqual(td["audio_ring_attached"]["status"], "regressed")
+        self.assertEqual(td["audio_ring_attached"]["transition"], "true -> false")
+        self.assertEqual(td["audio_frames_drained"]["status"], "regressed")
+        self.assertEqual(td["audio_frames_drained"]["formatted_delta"], "-36000")
+        self.assertEqual(td["audio_frames_drained"]["pct"], -75.0)
+
+        # Unchanged boolean transitions (both true and both false)
+        rc = copy.deepcopy(ra)
+        td_same = cbr.compute_telemetry_delta(ra, rc)
+        self.assertEqual(td_same["audio_ring_attached"]["status"], "unchanged")
+        self.assertFalse(td_same["audio_ring_attached"]["changed"])
+        self.assertEqual(td_same["audio_ring_attached"]["transition"], "true -> true")
+        self.assertEqual(td_same["audio_frames_drained"]["status"], "unchanged")
+        self.assertEqual(td_same["audio_frames_drained"]["formatted_delta"], "0")
+
+    def test_nested_telemetry_memory_audio_and_unit_conversions(self):
+        ra = make_browser_report(first_present_ms=10000.0)
+        ra["milestones"].append({"milestone": "FIRST_VISIBLE_FRAME", "elapsed_ms": 50250.0})
+        # black_loading_s derived as (50.25 - 10.0) = 40.25s
+        ra["memory"] = {
+            "cpu_window": {"alias_slots": 8, "alias_conflicts": 0},
+            "js_heap_used_mb": 1024.0,
+            "totalJSHeapSize": 1536 * 1024 * 1024,
+        }
+        ra["audio"] = {"ring_attached": False, "frames_drained": 0}
+
+        rb = make_browser_report(first_present_ms=10000.0)
+        rb["telemetry"] = {
+            "first_visible_frame_s": 12.0,
+            "black_loading_s": 2.0,
+            "memory": {
+                "usedJSHeapSize": 256 * 1024 * 1024,
+                "js_heap_total_mb": 512.0,
+            },
+            "audio": {
+                "ring": {"attached": True, "frames_drained": 96000.0},
+            },
+        }
+
+        td = cbr.compute_telemetry_delta(ra, rb)
+        self.assertEqual(td["first_visible_frame_s"]["a"], 50.25)
+        self.assertEqual(td["first_visible_frame_s"]["b"], 12.0)
+        self.assertEqual(td["first_visible_frame_s"]["formatted_delta"], "-38.25s")
+        self.assertEqual(td["black_loading_s"]["a"], 40.25)
+        self.assertEqual(td["black_loading_s"]["b"], 2.0)
+        self.assertEqual(td["black_loading_s"]["formatted_delta"], "-38.25s")
+        self.assertEqual(td["js_heap_used_mb"]["a"], 1024.0)
+        self.assertEqual(td["js_heap_used_mb"]["b"], 256.0)
+        self.assertEqual(td["js_heap_used_mb"]["formatted_delta"], "-768.0 MB")
+        self.assertEqual(td["js_heap_total_mb"]["a"], 1536.0)
+        self.assertEqual(td["js_heap_total_mb"]["b"], 512.0)
+        self.assertEqual(td["js_heap_total_mb"]["formatted_delta"], "-1024.0 MB")
+        self.assertEqual(td["audio_ring_attached"]["transition"], "false -> true")
+        self.assertEqual(td["audio_frames_drained"]["a"], 0)
+        self.assertEqual(td["audio_frames_drained"]["b"], 96000)
+        self.assertEqual(td["audio_frames_drained"]["formatted_delta"], "+96000")
+
+    def test_graceful_degradation_for_older_and_partial_reports(self):
+        # Older native reports (even with XMem memory.cpu_window) omit telemetry_delta completely
+        old_a = make_report_v2()
+        old_b = make_report_v2()
+        old_a["memory"] = {"cpu_window": {"alias_slots": 10, "alias_conflicts": 0}}
+        old_b["memory"] = {"cpu_window": {"alias_slots": 10, "alias_conflicts": 0}}
+        c_old = cbr.compare(old_a, old_b, self.tol)
+        self.assertEqual(c_old.telemetry_delta, {})
+        self.assertNotIn("telemetry_delta", cbr.to_result(c_old))
+        self.assertNotIn("[telemetry_delta]", cbr.format_text(c_old))
+        self.assertNotIn("### Telemetry Delta", cbr.format_markdown(c_old))
+
+        # Older baseline (no T61 fields) vs newer candidate (has T61 fields)
+        base = make_browser_report()
+        cand = make_browser_report()
+        cand["telemetry"] = {
+            "js_heap_used_mb": 270.0,
+            "audio_ring_attached": True,
+            "audio_frames_drained": 48000,
+        }
+        c_added = cbr.compare(base, cand, self.tol)
+        td = cbr.to_result(c_added)["telemetry_delta"]
+        self.assertEqual(
+            td["js_heap_used_mb"],
+            {
+                "a": None,
+                "b": 270.0,
+                "delta": None,
+                "pct": None,
+                "formatted_delta": None,
+                "better": "lower",
+                "status": "added",
+            },
+        )
+        self.assertEqual(
+            td["audio_ring_attached"],
+            {
+                "a": None,
+                "b": True,
+                "delta": None,
+                "changed": None,
+                "transition": None,
+                "better": "true",
+                "status": "added",
+            },
+        )
+        self.assertEqual(td["audio_frames_drained"]["status"], "added")
+        self.assertIsNone(td["audio_frames_drained"]["delta"])
+        self.assertNotIn("first_visible_frame_s", td)
+        self.assertNotIn("black_loading_s", td)
+        self.assertNotIn("js_heap_total_mb", td)
+
+        text_added = cbr.format_text(c_added)
+        self.assertIn("js_heap_used_mb: <missing> -> 270.0 MB (n/a, added)", text_added)
+        self.assertIn("audio_ring_attached: <missing> -> true (n/a, added)", text_added)
+        self.assertIn("audio_frames_drained: <missing> -> 48000 (n/a, added)", text_added)
+
+        md_added = cbr.format_markdown(c_added)
+        self.assertIn("| `js_heap_used_mb` | — | 270.0 MB | — | — | added |", md_added)
+        self.assertIn("| `audio_ring_attached` | — | true | — | — | added |", md_added)
+
+        # Reverse direction: present in baseline, missing in candidate -> removed
+        td_removed = cbr.compute_telemetry_delta(cand, base)
+        self.assertEqual(td_removed["js_heap_used_mb"]["status"], "removed")
+        self.assertEqual(td_removed["js_heap_used_mb"]["a"], 270.0)
+        self.assertIsNone(td_removed["js_heap_used_mb"]["b"])
+        self.assertEqual(td_removed["audio_ring_attached"]["status"], "removed")
+        self.assertEqual(td_removed["audio_ring_attached"]["a"], True)
+        self.assertIsNone(td_removed["audio_ring_attached"]["b"])
+
+    def test_falsy_zero_and_false_are_preserved_without_fallthrough(self):
+        ra = make_browser_report(first_present_ms=1000.0)
+        ra["first_visible_frame_s"] = 0.0
+        ra["first_visible_frame_ms"] = 99999.0
+        ra["black_loading_s"] = 0.0
+        ra["black_loading_ms"] = 88888.0
+        ra["js_heap_used_mb"] = 0.0
+        ra["memory"] = {"js_heap_used_mb": 777.0, "js_heap_total_mb": 666.0}
+        ra["js_heap_total_mb"] = 0.0
+        ra["audio_ring_attached"] = False
+        ra["audio"] = {"attached": True, "frames_drained": 555}
+        ra["audio_frames_drained"] = 0
+
+        extracted = cbr.extract_telemetry_metrics(ra)
+        self.assertEqual(extracted["first_visible_frame_s"], 0.0)
+        self.assertEqual(extracted["black_loading_s"], 0.0)
+        self.assertEqual(extracted["js_heap_used_mb"], 0.0)
+        self.assertEqual(extracted["js_heap_total_mb"], 0.0)
+        self.assertIs(extracted["audio_ring_attached"], False)
+        self.assertEqual(extracted["audio_frames_drained"], 0)
+
+    def test_sanitization_rejects_invalid_types_negatives_non_finite_and_paths(self):
+        ra = make_report()
+        rb = make_report()
+        ra["telemetry"] = {
+            "first_visible_frame_s": True,
+            "black_loading_s": -5.0,
+            "js_heap_used_mb": float("nan"),
+            "js_heap_total_mb": float("inf"),
+            "audio_ring_attached": "true",
+            "audio_frames_drained": r"C:\Users\secret\audio.wav",
+        }
+        rb["telemetry"] = {
+            "first_visible_frame_s": "/home/alice/frame.png",
+            "black_loading_s": False,
+            "js_heap_used_mb": -1.0,
+            "js_heap_total_mb": "512",
+            "audio_ring_attached": 1,
+            "audio_frames_drained": -10,
+        }
+        c = cbr.compare(ra, rb, self.tol)
+        self.assertEqual(c.telemetry_delta, {})
+        result = cbr.to_result(c)
+        self.assertNotIn("telemetry_delta", result)
+        serialized = json.dumps(result)
+        self.assertNotIn("secret", serialized)
+        self.assertNotIn("alice", serialized)
+
+    def test_cli_markdown_flag_and_mutually_exclusive_guard(self):
+        ra = make_browser_report()
+        rb = make_browser_report()
+        ra["telemetry"] = {
+            "first_visible_frame_s": 50.4,
+            "js_heap_used_mb": 1220.0,
+            "audio_ring_attached": False,
+            "audio_frames_drained": 0,
+        }
+        rb["telemetry"] = {
+            "first_visible_frame_s": 12.2,
+            "js_heap_used_mb": 270.0,
+            "audio_ring_attached": True,
+            "audio_frames_drained": 48000,
+        }
+        with tempfile.TemporaryDirectory() as d:
+            pa, pb = Path(d, "a.json"), Path(d, "b.json")
+            pa.write_text(json.dumps(ra), encoding="utf-8")
+            pb.write_text(json.dumps(rb), encoding="utf-8")
+
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = cbr.main([str(pa), str(pb), "--markdown"])
+            self.assertEqual(code, 0, err.getvalue())
+            md = out.getvalue()
+            self.assertIn("### Telemetry Delta", md)
+            self.assertIn("-38.2s", md)
+            self.assertIn("-950.0 MB", md)
+            self.assertIn("+48000", md)
+
+            # --json and --markdown together -> exit code 2
+            out2, err2 = io.StringIO(), io.StringIO()
+            with redirect_stdout(out2), redirect_stderr(err2):
+                code2 = cbr.main([str(pa), str(pb), "--json", "--markdown"])
+            self.assertEqual(code2, 2)
+            self.assertIn("mutually exclusive", err2.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
