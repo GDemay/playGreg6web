@@ -7,6 +7,8 @@
   'use strict';
 
   const WEBGPU_BYTES_PER_ROW_ALIGNMENT = 256;
+  const DEFAULT_MAX_SCRATCH_BYTES = 16 * 1024 * 1024; // 16 MiB upper cap for persistent scratch pool
+  const A8_UNORM_EXPANDED_WEBGPU_FORMAT = 'rgba8unorm';
   const TEXTURE_COMPRESSION_BC_FEATURE = 'texture-compression-bc';
   const TEXTURE_COMPRESSION_BC_SLICED_3D_FEATURE = 'texture-compression-bc-sliced-3d';
   const TEXTURE_FORMATS_TIER1_FEATURE = 'texture-formats-tier1';
@@ -96,6 +98,73 @@
 
   const BC_FORMAT_PATTERN = /^bc[1-7]/;
   const COMPRESSED_FORMAT_PATTERN = /^(bc[1-7]|etc2-|eac-|astc-)/;
+
+  // Canonical WebGPU GPUTextureFormat block geometry (blockWidth, blockHeight, bytesPerBlock).
+  const WEBGPU_FORMAT_INFO = Object.freeze({
+    r8unorm: Object.freeze({ webgpuFormat: 'r8unorm', blockWidth: 1, blockHeight: 1, bytesPerBlock: 1, isCompressed: false, isDepth: false, isSrgb: false }),
+    r8snorm: Object.freeze({ webgpuFormat: 'r8snorm', blockWidth: 1, blockHeight: 1, bytesPerBlock: 1, isCompressed: false, isDepth: false, isSrgb: false }),
+    r8uint: Object.freeze({ webgpuFormat: 'r8uint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 1, isCompressed: false, isDepth: false, isSrgb: false }),
+    r8sint: Object.freeze({ webgpuFormat: 'r8sint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 1, isCompressed: false, isDepth: false, isSrgb: false }),
+    r16unorm: Object.freeze({ webgpuFormat: 'r16unorm', blockWidth: 1, blockHeight: 1, bytesPerBlock: 2, isCompressed: false, isDepth: false, isSrgb: false }),
+    r16snorm: Object.freeze({ webgpuFormat: 'r16snorm', blockWidth: 1, blockHeight: 1, bytesPerBlock: 2, isCompressed: false, isDepth: false, isSrgb: false }),
+    r16uint: Object.freeze({ webgpuFormat: 'r16uint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 2, isCompressed: false, isDepth: false, isSrgb: false }),
+    r16sint: Object.freeze({ webgpuFormat: 'r16sint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 2, isCompressed: false, isDepth: false, isSrgb: false }),
+    r16float: Object.freeze({ webgpuFormat: 'r16float', blockWidth: 1, blockHeight: 1, bytesPerBlock: 2, isCompressed: false, isDepth: false, isSrgb: false }),
+    rg8unorm: Object.freeze({ webgpuFormat: 'rg8unorm', blockWidth: 1, blockHeight: 1, bytesPerBlock: 2, isCompressed: false, isDepth: false, isSrgb: false }),
+    rg8snorm: Object.freeze({ webgpuFormat: 'rg8snorm', blockWidth: 1, blockHeight: 1, bytesPerBlock: 2, isCompressed: false, isDepth: false, isSrgb: false }),
+    rg8uint: Object.freeze({ webgpuFormat: 'rg8uint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 2, isCompressed: false, isDepth: false, isSrgb: false }),
+    rg8sint: Object.freeze({ webgpuFormat: 'rg8sint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 2, isCompressed: false, isDepth: false, isSrgb: false }),
+    r32uint: Object.freeze({ webgpuFormat: 'r32uint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
+    r32sint: Object.freeze({ webgpuFormat: 'r32sint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
+    r32float: Object.freeze({ webgpuFormat: 'r32float', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
+    rg16unorm: Object.freeze({ webgpuFormat: 'rg16unorm', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
+    rg16snorm: Object.freeze({ webgpuFormat: 'rg16snorm', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
+    rg16uint: Object.freeze({ webgpuFormat: 'rg16uint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
+    rg16sint: Object.freeze({ webgpuFormat: 'rg16sint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
+    rg16float: Object.freeze({ webgpuFormat: 'rg16float', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
+    rgba8unorm: Object.freeze({ webgpuFormat: 'rgba8unorm', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
+    'rgba8unorm-srgb': Object.freeze({ webgpuFormat: 'rgba8unorm-srgb', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: true }),
+    rgba8snorm: Object.freeze({ webgpuFormat: 'rgba8snorm', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
+    rgba8uint: Object.freeze({ webgpuFormat: 'rgba8uint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
+    rgba8sint: Object.freeze({ webgpuFormat: 'rgba8sint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
+    bgra8unorm: Object.freeze({ webgpuFormat: 'bgra8unorm', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
+    'bgra8unorm-srgb': Object.freeze({ webgpuFormat: 'bgra8unorm-srgb', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: true }),
+    rgb9e5ufloat: Object.freeze({ webgpuFormat: 'rgb9e5ufloat', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
+    rgb10a2uint: Object.freeze({ webgpuFormat: 'rgb10a2uint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
+    rgb10a2unorm: Object.freeze({ webgpuFormat: 'rgb10a2unorm', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
+    rg11b10ufloat: Object.freeze({ webgpuFormat: 'rg11b10ufloat', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: false, isSrgb: false }),
+    rg32uint: Object.freeze({ webgpuFormat: 'rg32uint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 8, isCompressed: false, isDepth: false, isSrgb: false }),
+    rg32sint: Object.freeze({ webgpuFormat: 'rg32sint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 8, isCompressed: false, isDepth: false, isSrgb: false }),
+    rg32float: Object.freeze({ webgpuFormat: 'rg32float', blockWidth: 1, blockHeight: 1, bytesPerBlock: 8, isCompressed: false, isDepth: false, isSrgb: false }),
+    rgba16unorm: Object.freeze({ webgpuFormat: 'rgba16unorm', blockWidth: 1, blockHeight: 1, bytesPerBlock: 8, isCompressed: false, isDepth: false, isSrgb: false }),
+    rgba16snorm: Object.freeze({ webgpuFormat: 'rgba16snorm', blockWidth: 1, blockHeight: 1, bytesPerBlock: 8, isCompressed: false, isDepth: false, isSrgb: false }),
+    rgba16uint: Object.freeze({ webgpuFormat: 'rgba16uint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 8, isCompressed: false, isDepth: false, isSrgb: false }),
+    rgba16sint: Object.freeze({ webgpuFormat: 'rgba16sint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 8, isCompressed: false, isDepth: false, isSrgb: false }),
+    rgba16float: Object.freeze({ webgpuFormat: 'rgba16float', blockWidth: 1, blockHeight: 1, bytesPerBlock: 8, isCompressed: false, isDepth: false, isSrgb: false }),
+    rgba32uint: Object.freeze({ webgpuFormat: 'rgba32uint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 16, isCompressed: false, isDepth: false, isSrgb: false }),
+    rgba32sint: Object.freeze({ webgpuFormat: 'rgba32sint', blockWidth: 1, blockHeight: 1, bytesPerBlock: 16, isCompressed: false, isDepth: false, isSrgb: false }),
+    rgba32float: Object.freeze({ webgpuFormat: 'rgba32float', blockWidth: 1, blockHeight: 1, bytesPerBlock: 16, isCompressed: false, isDepth: false, isSrgb: false }),
+    stencil8: Object.freeze({ webgpuFormat: 'stencil8', blockWidth: 1, blockHeight: 1, bytesPerBlock: 1, isCompressed: false, isDepth: true, isSrgb: false }),
+    depth16unorm: Object.freeze({ webgpuFormat: 'depth16unorm', blockWidth: 1, blockHeight: 1, bytesPerBlock: 2, isCompressed: false, isDepth: true, isSrgb: false }),
+    depth24plus: Object.freeze({ webgpuFormat: 'depth24plus', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: true, isSrgb: false }),
+    'depth24plus-stencil8': Object.freeze({ webgpuFormat: 'depth24plus-stencil8', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: true, isSrgb: false }),
+    depth32float: Object.freeze({ webgpuFormat: 'depth32float', blockWidth: 1, blockHeight: 1, bytesPerBlock: 4, isCompressed: false, isDepth: true, isSrgb: false }),
+    'depth32float-stencil8': Object.freeze({ webgpuFormat: 'depth32float-stencil8', blockWidth: 1, blockHeight: 1, bytesPerBlock: 8, isCompressed: false, isDepth: true, isSrgb: false }),
+    'bc1-rgba-unorm': Object.freeze({ webgpuFormat: 'bc1-rgba-unorm', blockWidth: 4, blockHeight: 4, bytesPerBlock: 8, isCompressed: true, isDepth: false, isSrgb: false }),
+    'bc1-rgba-unorm-srgb': Object.freeze({ webgpuFormat: 'bc1-rgba-unorm-srgb', blockWidth: 4, blockHeight: 4, bytesPerBlock: 8, isCompressed: true, isDepth: false, isSrgb: true }),
+    'bc2-rgba-unorm': Object.freeze({ webgpuFormat: 'bc2-rgba-unorm', blockWidth: 4, blockHeight: 4, bytesPerBlock: 16, isCompressed: true, isDepth: false, isSrgb: false }),
+    'bc2-rgba-unorm-srgb': Object.freeze({ webgpuFormat: 'bc2-rgba-unorm-srgb', blockWidth: 4, blockHeight: 4, bytesPerBlock: 16, isCompressed: true, isDepth: false, isSrgb: true }),
+    'bc3-rgba-unorm': Object.freeze({ webgpuFormat: 'bc3-rgba-unorm', blockWidth: 4, blockHeight: 4, bytesPerBlock: 16, isCompressed: true, isDepth: false, isSrgb: false }),
+    'bc3-rgba-unorm-srgb': Object.freeze({ webgpuFormat: 'bc3-rgba-unorm-srgb', blockWidth: 4, blockHeight: 4, bytesPerBlock: 16, isCompressed: true, isDepth: false, isSrgb: true }),
+    'bc4-r-unorm': Object.freeze({ webgpuFormat: 'bc4-r-unorm', blockWidth: 4, blockHeight: 4, bytesPerBlock: 8, isCompressed: true, isDepth: false, isSrgb: false }),
+    'bc4-r-snorm': Object.freeze({ webgpuFormat: 'bc4-r-snorm', blockWidth: 4, blockHeight: 4, bytesPerBlock: 8, isCompressed: true, isDepth: false, isSrgb: false }),
+    'bc5-rg-unorm': Object.freeze({ webgpuFormat: 'bc5-rg-unorm', blockWidth: 4, blockHeight: 4, bytesPerBlock: 16, isCompressed: true, isDepth: false, isSrgb: false }),
+    'bc5-rg-snorm': Object.freeze({ webgpuFormat: 'bc5-rg-snorm', blockWidth: 4, blockHeight: 4, bytesPerBlock: 16, isCompressed: true, isDepth: false, isSrgb: false }),
+    'bc6h-rgb-ufloat': Object.freeze({ webgpuFormat: 'bc6h-rgb-ufloat', blockWidth: 4, blockHeight: 4, bytesPerBlock: 16, isCompressed: true, isDepth: false, isSrgb: false }),
+    'bc6h-rgb-float': Object.freeze({ webgpuFormat: 'bc6h-rgb-float', blockWidth: 4, blockHeight: 4, bytesPerBlock: 16, isCompressed: true, isDepth: false, isSrgb: false }),
+    'bc7-rgba-unorm': Object.freeze({ webgpuFormat: 'bc7-rgba-unorm', blockWidth: 4, blockHeight: 4, bytesPerBlock: 16, isCompressed: true, isDepth: false, isSrgb: false }),
+    'bc7-rgba-unorm-srgb': Object.freeze({ webgpuFormat: 'bc7-rgba-unorm-srgb', blockWidth: 4, blockHeight: 4, bytesPerBlock: 16, isCompressed: true, isDepth: false, isSrgb: true }),
+  });
 
   /**
    * Standard DirectX / Xbox Series DXGI_FORMAT numeric enum values (dxgiformat.h).
@@ -389,6 +458,16 @@
     return false;
   }
 
+  function isSharedBuffer(buf) {
+    if (!buf || typeof buf !== 'object') {
+      return false;
+    }
+    if (typeof SharedArrayBuffer !== 'undefined' && buf instanceof SharedArrayBuffer) {
+      return true;
+    }
+    return Object.prototype.toString.call(buf) === '[object SharedArrayBuffer]';
+  }
+
   function toUint8Array(input, label) {
     if (input instanceof Uint8Array) {
       return input;
@@ -396,15 +475,347 @@
     if (ArrayBuffer.isView(input)) {
       return new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
     }
-    if (input instanceof ArrayBuffer) {
+    if (input instanceof ArrayBuffer || isSharedBuffer(input)) {
       return new Uint8Array(input);
     }
-    if (typeof SharedArrayBuffer !== 'undefined' && input instanceof SharedArrayBuffer) {
+    if (
+      input &&
+      typeof input === 'object' &&
+      typeof input.byteLength === 'number' &&
+      Object.prototype.toString.call(input) === '[object ArrayBuffer]'
+    ) {
       return new Uint8Array(input);
     }
     throw new TypeError(
       `${label} expects a Uint8Array, ArrayBufferView, ArrayBuffer, or SharedArrayBuffer`
     );
+  }
+
+  function resolveFormatBlockInfo(formatOrInfo) {
+    if (formatOrInfo && typeof formatOrInfo === 'object') {
+      return formatOrInfo;
+    }
+    if (typeof formatOrInfo === 'string') {
+      const lowered = formatOrInfo.trim().toLowerCase();
+      if (Object.prototype.hasOwnProperty.call(WEBGPU_FORMAT_INFO, lowered)) {
+        return WEBGPU_FORMAT_INFO[lowered];
+      }
+      return FORMAT_TABLE[resolveDxgiFormatCode(formatOrInfo)];
+    }
+    if (typeof formatOrInfo === 'number') {
+      return FORMAT_TABLE[resolveDxgiFormatCode(formatOrInfo)];
+    }
+    throw new TypeError('formatInfo must be a format descriptor object, WebGPU format name, or DXGI_FORMAT');
+  }
+
+  /**
+   * Look up WebGPU block geometry (`blockWidth`, `blockHeight`, `bytesPerBlock`,
+   * `isCompressed`, `isDepth`, `isSrgb`) by WebGPU format string, DXGI_FORMAT code/name,
+   * or format descriptor object. Returns `null` for unknown/invalid values.
+   *
+   * @param {string | number | object} formatOrInfo
+   */
+  function getWebGpuFormatInfo(formatOrInfo) {
+    if (typeof formatOrInfo === 'string') {
+      const lowered = formatOrInfo.trim().toLowerCase();
+      if (Object.prototype.hasOwnProperty.call(WEBGPU_FORMAT_INFO, lowered)) {
+        return WEBGPU_FORMAT_INFO[lowered];
+      }
+      try {
+        return FORMAT_TABLE[resolveDxgiFormatCode(formatOrInfo)];
+      } catch {
+        return null;
+      }
+    }
+    if (typeof formatOrInfo === 'number') {
+      return Number.isInteger(formatOrInfo) &&
+        Object.prototype.hasOwnProperty.call(FORMAT_TABLE, formatOrInfo)
+        ? FORMAT_TABLE[formatOrInfo]
+        : null;
+    }
+    if (
+      formatOrInfo &&
+      typeof formatOrInfo === 'object' &&
+      Number.isInteger(formatOrInfo.blockWidth) &&
+      formatOrInfo.blockWidth >= 1 &&
+      Number.isInteger(formatOrInfo.blockHeight) &&
+      formatOrInfo.blockHeight >= 1 &&
+      Number.isInteger(formatOrInfo.bytesPerBlock) &&
+      formatOrInfo.bytesPerBlock >= 1
+    ) {
+      return formatOrInfo;
+    }
+    return null;
+  }
+
+  /**
+   * Bounded reusable non-shared `Uint8Array` scratch buffer pool for row-pitch
+   * repacking and `A8_UNORM -> rgba8unorm` expansion.
+   *
+   * - Enforces an upper cap (`maxBytes`, default 16 MiB) so oversized one-off
+   *   uploads allocate a standalone buffer and never pin giant RAM.
+   * - Supports `copy: true` (or `snapshot(view)`) for callers that retain slices
+   *   across frames so subsequent scratch acquisitions cannot alias stored data.
+   */
+  class TextureScratchPool {
+    constructor(options = {}) {
+      const opts = options && typeof options === 'object' ? options : {};
+      const rawMaxBytes =
+        opts.maxBytes !== undefined ? opts.maxBytes : opts.maxScratchBytes;
+      this.maxBytes =
+        Number.isInteger(rawMaxBytes) && rawMaxBytes >= 0
+          ? rawMaxBytes
+          : DEFAULT_MAX_SCRATCH_BYTES;
+      const rawMaxSlots = opts.maxSlots;
+      this.maxSlots =
+        Number.isInteger(rawMaxSlots) && rawMaxSlots >= 1 ? rawMaxSlots : 1;
+      this._slots = new Array(this.maxSlots).fill(null);
+      this._allocations = 0;
+      this._reuses = 0;
+      this._oversizedFallbacks = 0;
+    }
+
+    get currentBuffer() {
+      return this._slots[0] || null;
+    }
+
+    get retainedBytes() {
+      let total = 0;
+      for (let i = 0; i < this._slots.length; i += 1) {
+        if (this._slots[i]) {
+          total += this._slots[i].byteLength;
+        }
+      }
+      return total;
+    }
+
+    /**
+     * Acquire a non-shared `Uint8Array` of length `requiredBytes`.
+     *
+     * @param {number} requiredBytes
+     * @param {{ slot?: number, copy?: boolean }} [options]
+     * @returns {{
+     *   buffer: Uint8Array,
+     *   view: Uint8Array,
+     *   reused: boolean,
+     *   pooled: boolean,
+     *   oversized: boolean,
+     *   copied: boolean,
+     * }}
+     */
+    acquire(requiredBytes, options = {}) {
+      assertNonNegativeInteger(requiredBytes, 'requiredBytes');
+      const opts = options && typeof options === 'object' ? options : {};
+      if (requiredBytes === 0) {
+        const empty = new Uint8Array(0);
+        return {
+          buffer: empty,
+          view: empty,
+          reused: false,
+          pooled: false,
+          oversized: false,
+          copied: Boolean(opts.copy),
+        };
+      }
+      if (opts.copy === true) {
+        const standalone = new Uint8Array(requiredBytes);
+        return {
+          buffer: standalone,
+          view: standalone,
+          reused: false,
+          pooled: false,
+          oversized: false,
+          copied: true,
+        };
+      }
+
+      const slotIndex =
+        Number.isInteger(opts.slot) && opts.slot >= 0 && opts.slot < this.maxSlots
+          ? opts.slot
+          : 0;
+      const existing = this._slots[slotIndex];
+      if (existing && existing.byteLength >= requiredBytes) {
+        this._reuses += 1;
+        return {
+          buffer: existing,
+          view: existing.subarray(0, requiredBytes),
+          reused: true,
+          pooled: true,
+          oversized: false,
+          copied: false,
+        };
+      }
+
+      const otherSlotsBytes = this.retainedBytes - (existing ? existing.byteLength : 0);
+      if (requiredBytes > this.maxBytes || otherSlotsBytes + requiredBytes > this.maxBytes) {
+        this._oversizedFallbacks += 1;
+        const standalone = new Uint8Array(requiredBytes);
+        return {
+          buffer: standalone,
+          view: standalone,
+          reused: false,
+          pooled: false,
+          oversized: true,
+          copied: false,
+        };
+      }
+
+      const allocated = new Uint8Array(requiredBytes);
+      this._slots[slotIndex] = allocated;
+      this._allocations += 1;
+      return {
+        buffer: allocated,
+        view: allocated,
+        reused: false,
+        pooled: true,
+        oversized: false,
+        copied: false,
+      };
+    }
+
+    /**
+     * Create an independent owned copy of a scratch slice so it cannot be aliased
+     * by subsequent pool acquisitions.
+     *
+     * @param {Uint8Array | ArrayBufferView} slice
+     * @returns {Uint8Array}
+     */
+    snapshot(slice) {
+      const src = toUint8Array(slice, 'TextureScratchPool.snapshot');
+      const copy = new Uint8Array(src.byteLength);
+      copy.set(src, 0);
+      return copy;
+    }
+
+    getStats() {
+      let activeSlots = 0;
+      let retainedBytes = 0;
+      for (let i = 0; i < this._slots.length; i += 1) {
+        if (this._slots[i]) {
+          activeSlots += 1;
+          retainedBytes += this._slots[i].byteLength;
+        }
+      }
+      return {
+        allocations: this._allocations,
+        reuses: this._reuses,
+        oversizedFallbacks: this._oversizedFallbacks,
+        retainedBytes,
+        maxBytes: this.maxBytes,
+        maxSlots: this.maxSlots,
+        activeSlots,
+      };
+    }
+
+    reset() {
+      this._slots.fill(null);
+      this._allocations = 0;
+      this._reuses = 0;
+      this._oversizedFallbacks = 0;
+    }
+
+    destroy() {
+      this.reset();
+    }
+  }
+
+  function resolveScratchDestination(requiredBytes, scratchOrOptions) {
+    if (requiredBytes === 0) {
+      return {
+        view: new Uint8Array(0),
+        usingScratch: false,
+        reusedScratch: false,
+        pooledScratch: false,
+        oversized: false,
+      };
+    }
+    if (!scratchOrOptions) {
+      return {
+        view: new Uint8Array(requiredBytes),
+        usingScratch: false,
+        reusedScratch: false,
+        pooledScratch: false,
+        oversized: false,
+      };
+    }
+
+    // Raw Uint8Array scratch buffer
+    if (scratchOrOptions instanceof Uint8Array) {
+      if (!isSharedBuffer(scratchOrOptions.buffer) && scratchOrOptions.byteLength >= requiredBytes) {
+        return {
+          view: scratchOrOptions.subarray(0, requiredBytes),
+          usingScratch: true,
+          reusedScratch: true,
+          pooledScratch: false,
+          oversized: false,
+        };
+      }
+      return {
+        view: new Uint8Array(requiredBytes),
+        usingScratch: false,
+        reusedScratch: false,
+        pooledScratch: false,
+        oversized: false,
+      };
+    }
+
+    // TextureScratchPool instance
+    if (typeof scratchOrOptions === 'object' && typeof scratchOrOptions.acquire === 'function') {
+      const acquired = scratchOrOptions.acquire(requiredBytes);
+      return {
+        view: acquired.view,
+        usingScratch: acquired.pooled,
+        reusedScratch: acquired.reused,
+        pooledScratch: acquired.pooled,
+        oversized: acquired.oversized,
+      };
+    }
+
+    // Options object: { scratchBuffer, scratchPool, slot, copyResult }
+    if (typeof scratchOrOptions === 'object') {
+      if (scratchOrOptions.copyResult === true || scratchOrOptions.copy === true) {
+        return {
+          view: new Uint8Array(requiredBytes),
+          usingScratch: false,
+          reusedScratch: false,
+          pooledScratch: false,
+          oversized: false,
+        };
+      }
+      if (
+        scratchOrOptions.scratchPool &&
+        typeof scratchOrOptions.scratchPool.acquire === 'function'
+      ) {
+        const acquired = scratchOrOptions.scratchPool.acquire(requiredBytes, {
+          slot: scratchOrOptions.slot,
+        });
+        return {
+          view: acquired.view,
+          usingScratch: acquired.pooled,
+          reusedScratch: acquired.reused,
+          pooledScratch: acquired.pooled,
+          oversized: acquired.oversized,
+        };
+      }
+      const buf = scratchOrOptions.scratchBuffer;
+      if (buf instanceof Uint8Array && !isSharedBuffer(buf.buffer) && buf.byteLength >= requiredBytes) {
+        return {
+          view: buf.subarray(0, requiredBytes),
+          usingScratch: true,
+          reusedScratch: true,
+          pooledScratch: false,
+          oversized: false,
+        };
+      }
+    }
+
+    return {
+      view: new Uint8Array(requiredBytes),
+      usingScratch: false,
+      reusedScratch: false,
+      pooledScratch: false,
+      oversized: false,
+    };
   }
 
   function assertPositiveInteger(value, name) {
@@ -846,13 +1257,7 @@
     depthOrLayers = 1,
     alignBytesPerRow = WEBGPU_BYTES_PER_ROW_ALIGNMENT
   ) {
-    let info = formatInfo;
-    if (typeof formatInfo === 'number' || typeof formatInfo === 'string') {
-      info = FORMAT_TABLE[resolveDxgiFormatCode(formatInfo)];
-    }
-    if (!info || typeof info !== 'object') {
-      throw new TypeError('formatInfo must be a format descriptor object or DXGI_FORMAT');
-    }
+    const info = resolveFormatBlockInfo(formatInfo);
 
     assertPositiveInteger(info.blockWidth, 'formatInfo.blockWidth');
     assertPositiveInteger(info.blockHeight, 'formatInfo.blockHeight');
@@ -883,20 +1288,112 @@
   }
 
   /**
+   * Align a WebGPU texture copy extent `(width, height, depthOrLayers)` up to
+   * the format's block size (`4x4` for BC1..BC7) so small tail mips (`1x1`,
+   * `2x2`, `3x3`) and non-multiple-of-4 sub-mips satisfy WebGPU validation.
+   *
+   * @param {object | number | string} formatInfo
+   * @param {number} width
+   * @param {number} height
+   * @param {number} [depthOrLayers=1]
+   */
+  function alignCopyExtentForFormat(formatInfo, width, height, depthOrLayers = 1) {
+    const info = resolveFormatBlockInfo(formatInfo);
+    assertPositiveInteger(info.blockWidth, 'formatInfo.blockWidth');
+    assertPositiveInteger(info.blockHeight, 'formatInfo.blockHeight');
+    assertPositiveInteger(width, 'width');
+    assertPositiveInteger(height, 'height');
+    assertPositiveInteger(depthOrLayers, 'depthOrLayers');
+
+    const blocksX = Math.ceil(width / info.blockWidth);
+    const blocksY = Math.ceil(height / info.blockHeight);
+    const alignedWidth = blocksX * info.blockWidth;
+    const alignedHeight = blocksY * info.blockHeight;
+
+    return {
+      width: alignedWidth,
+      height: alignedHeight,
+      depthOrLayers,
+      blocksX,
+      blocksY,
+      blockWidth: info.blockWidth,
+      blockHeight: info.blockHeight,
+      wasClamped: alignedWidth !== width || alignedHeight !== height,
+    };
+  }
+
+  /**
+   * Compute full WebGPU upload layout for a mip level, including block-clamped
+   * copy extents (`copyWidth`, `copyHeight`) for BC1..BC7 tail mips (`1x1`,
+   * `2x2`, `3x3` -> `4x4`), tight vs 256-byte aligned row strides, and
+   * multi-row/multi-layer padding requirements.
+   *
+   * @param {object | number | string} formatInfo
+   * @param {number} width
+   * @param {number} height
+   * @param {number} [depthOrLayers=1]
+   * @param {number} [alignBytesPerRow=256]
+   */
+  function calcMipUploadLayout(
+    formatInfo,
+    width,
+    height,
+    depthOrLayers = 1,
+    alignBytesPerRow = WEBGPU_BYTES_PER_ROW_ALIGNMENT
+  ) {
+    const info = resolveFormatBlockInfo(formatInfo);
+    const base = calcMipLayout(info, width, height, depthOrLayers, alignBytesPerRow);
+    const copyWidth = base.blocksX * info.blockWidth;
+    const copyHeight = base.blocksY * info.blockHeight;
+    const isCompressed = Boolean(info.isCompressed || info.blockWidth > 1 || info.blockHeight > 1);
+    const tightTotalBytes = base.unalignedBytesPerRow * base.rowsPerImage * depthOrLayers;
+
+    return {
+      width: base.width,
+      height: base.height,
+      copyWidth,
+      copyHeight,
+      depthOrLayers: base.depthOrLayers,
+      blocksX: base.blocksX,
+      blocksY: base.blocksY,
+      blockWidth: info.blockWidth,
+      blockHeight: info.blockHeight,
+      bytesPerBlock: info.bytesPerBlock,
+      isCompressed,
+      isTailMip: isCompressed && (width < info.blockWidth || height < info.blockHeight),
+      wasBlockClamped: copyWidth !== width || copyHeight !== height,
+      unalignedBytesPerRow: base.unalignedBytesPerRow,
+      bytesPerRow: base.bytesPerRow,
+      rowsPerImage: base.rowsPerImage,
+      tightTotalBytes,
+      totalBytes: base.totalBytes,
+      needsRowPadding: base.bytesPerRow !== base.unalignedBytesPerRow,
+    };
+  }
+
+  /**
    * Pad (or tightly copy) texture rows so every row starts on an `alignedBytesPerRow`
    * boundary (256 bytes for WebGPU `copyBufferToTexture` / staging uploads).
+   *
+   * By default (when `scratchOrOptions` is omitted), returns a freshly allocated,
+   * non-shared `Uint8Array` so callers retaining slices are never aliased.
+   * Pass a non-shared `Uint8Array`, a `TextureScratchPool`, or
+   * `{ scratchBuffer, scratchPool, copyResult }` to opt into bounded zero-churn
+   * scratch reuse with strict trailing-padding zeroing.
    *
    * @param {Uint8Array | ArrayBufferView | ArrayBuffer | SharedArrayBuffer} srcBytes
    * @param {number} unalignedBytesPerRow
    * @param {number} alignedBytesPerRow
    * @param {number} rowCount
+   * @param {Uint8Array | TextureScratchPool | { scratchBuffer?: Uint8Array, scratchPool?: TextureScratchPool, slot?: number, copyResult?: boolean } | null} [scratchOrOptions=null]
    * @returns {Uint8Array}
    */
   function padTextureRowsForWriteTexture(
     srcBytes,
     unalignedBytesPerRow,
     alignedBytesPerRow,
-    rowCount
+    rowCount,
+    scratchOrOptions = null
   ) {
     const src = toUint8Array(srcBytes, 'padTextureRowsForWriteTexture');
     assertNonNegativeInteger(unalignedBytesPerRow, 'unalignedBytesPerRow');
@@ -917,16 +1414,151 @@
     }
 
     const dstBytes = alignedBytesPerRow * rowCount;
+    const dest = resolveScratchDestination(dstBytes, scratchOrOptions);
+    const dst = dest.view;
+
     if (alignedBytesPerRow === unalignedBytesPerRow) {
-      return src.slice(0, dstBytes);
+      dst.set(src.subarray(0, dstBytes), 0);
+      return dst;
     }
 
-    const dst = new Uint8Array(dstBytes);
     for (let row = 0; row < rowCount; row += 1) {
       const srcOffset = row * unalignedBytesPerRow;
-      dst.set(src.subarray(srcOffset, srcOffset + unalignedBytesPerRow), row * alignedBytesPerRow);
+      const dstOffset = row * alignedBytesPerRow;
+      dst.set(src.subarray(srcOffset, srcOffset + unalignedBytesPerRow), dstOffset);
+      if (dest.usingScratch) {
+        dst.fill(0, dstOffset + unalignedBytesPerRow, dstOffset + alignedBytesPerRow);
+      }
     }
     return dst;
+  }
+
+  /**
+   * Expand `DXGI_FORMAT_A8_UNORM` (1 Bpp alpha-only font/mask atlas) into
+   * `#973` `rgba8unorm` texels `(0, 0, 0, a)` with optional 256-byte row-pitch
+   * alignment and bounded reusable scratch buffer support.
+   *
+   * Returns a metadata + `data` object (default `alignBytesPerRow = 256`).
+   * By default (when no `scratchBuffer`/`scratchPool` is provided, or when
+   * `copyResult: true`), returns an independent non-shared `Uint8Array`.
+   *
+   * @param {Uint8Array | ArrayBufferView | ArrayBuffer | SharedArrayBuffer} srcBytes
+   * @param {number} width
+   * @param {number} height
+   * @param {{
+   *   depthOrLayers?: number,
+   *   srcBytesPerRow?: number,
+   *   srcRowsPerImage?: number,
+   *   alignBytesPerRow?: number,
+   *   scratchBuffer?: Uint8Array | null,
+   *   scratchPool?: TextureScratchPool | null,
+   *   slot?: number,
+   *   copyResult?: boolean,
+   * }} [options]
+   */
+  function expandA8ToRgba8Layout(srcBytes, width, height, options = {}) {
+    const src = toUint8Array(srcBytes, 'expandA8ToRgba8Layout');
+    assertPositiveInteger(width, 'width');
+    assertPositiveInteger(height, 'height');
+
+    const opts = options && typeof options === 'object' ? options : {};
+    const depthOrLayers = opts.depthOrLayers !== undefined ? opts.depthOrLayers : 1;
+    const srcBytesPerRow = opts.srcBytesPerRow !== undefined ? opts.srcBytesPerRow : width;
+    const srcRowsPerImage = opts.srcRowsPerImage !== undefined ? opts.srcRowsPerImage : height;
+    const alignBytesPerRow =
+      opts.alignBytesPerRow !== undefined
+        ? opts.alignBytesPerRow
+        : WEBGPU_BYTES_PER_ROW_ALIGNMENT;
+
+    assertPositiveInteger(depthOrLayers, 'depthOrLayers');
+    assertPositiveInteger(srcBytesPerRow, 'srcBytesPerRow');
+    assertPositiveInteger(srcRowsPerImage, 'srcRowsPerImage');
+    assertPositiveInteger(alignBytesPerRow, 'alignBytesPerRow');
+
+    if (srcBytesPerRow < width) {
+      throw new RangeError(`srcBytesPerRow (${srcBytesPerRow}) must be >= width (${width})`);
+    }
+    if (srcRowsPerImage < height) {
+      throw new RangeError(`srcRowsPerImage (${srcRowsPerImage}) must be >= height (${height})`);
+    }
+
+    const srcSliceBytes = srcBytesPerRow * srcRowsPerImage;
+    const minRequiredSrcBytes =
+      (depthOrLayers - 1) * srcSliceBytes + (height - 1) * srcBytesPerRow + width;
+    if (src.byteLength < minRequiredSrcBytes) {
+      throw new RangeError(
+        `A8_UNORM input too small (${src.byteLength} bytes; need at least ${minRequiredSrcBytes} bytes for ${width}x${height}x${depthOrLayers})`
+      );
+    }
+
+    const unalignedBytesPerRow = width * 4;
+    const bytesPerRow = Math.ceil(unalignedBytesPerRow / alignBytesPerRow) * alignBytesPerRow;
+    const rowsPerImage = height;
+    const totalBytes = bytesPerRow * rowsPerImage * depthOrLayers;
+    const dest = resolveScratchDestination(totalBytes, opts);
+    const dst = dest.view;
+    const hasTrailingPad = bytesPerRow > unalignedBytesPerRow;
+
+    for (let z = 0; z < depthOrLayers; z += 1) {
+      const srcSliceBase = z * srcSliceBytes;
+      const dstSliceBase = z * rowsPerImage * bytesPerRow;
+      for (let y = 0; y < height; y += 1) {
+        const srcRow = srcSliceBase + y * srcBytesPerRow;
+        const dstRow = dstSliceBase + y * bytesPerRow;
+        for (let x = 0; x < width; x += 1) {
+          const outOff = dstRow + (x << 2);
+          dst[outOff] = 0;
+          dst[outOff + 1] = 0;
+          dst[outOff + 2] = 0;
+          dst[outOff + 3] = src[srcRow + x];
+        }
+        if (dest.usingScratch && hasTrailingPad) {
+          dst.fill(0, dstRow + unalignedBytesPerRow, dstRow + bytesPerRow);
+        }
+      }
+    }
+
+    return {
+      data: dst,
+      width,
+      height,
+      depthOrLayers,
+      unalignedBytesPerRow,
+      bytesPerRow,
+      rowsPerImage,
+      totalBytes,
+      copiedFromSab: isSharedBuffer(src.buffer),
+      reusedScratch: dest.reusedScratch,
+      pooledScratch: dest.pooledScratch,
+      oversized: dest.oversized,
+    };
+  }
+
+  /**
+   * Expand `DXGI_FORMAT_A8_UNORM` alpha texels into `#973` `rgba8unorm`
+   * `(0, 0, 0, a)` bytes, returning a `Uint8Array`.
+   * Defaults to tightly-packed rows (`alignBytesPerRow = 1`); pass
+   * `{ alignBytesPerRow: 256 }` (or `alignTo256: true`) for 256-byte row padding,
+   * and `{ scratchBuffer }` or `{ scratchPool }` for opt-in scratch reuse.
+   *
+   * @param {Uint8Array | ArrayBufferView | ArrayBuffer | SharedArrayBuffer} srcBytes
+   * @param {number} width
+   * @param {number} height
+   * @param {object} [options]
+   * @returns {Uint8Array}
+   */
+  function expandA8ToRgba8(srcBytes, width, height, options = {}) {
+    const opts = options && typeof options === 'object' ? options : {};
+    const alignBytesPerRow =
+      opts.alignBytesPerRow !== undefined
+        ? opts.alignBytesPerRow
+        : opts.alignTo256
+          ? WEBGPU_BYTES_PER_ROW_ALIGNMENT
+          : 1;
+    return expandA8ToRgba8Layout(srcBytes, width, height, {
+      ...opts,
+      alignBytesPerRow,
+    }).data;
   }
 
   function decodeRgb565(c, outPalette, baseOffset) {
@@ -1233,20 +1865,29 @@
   const exportsObj = Object.freeze({
     DXGI_FORMAT,
     DXGI_FORMAT_NAMES,
+    WEBGPU_FORMAT_INFO,
     WEBGPU_BYTES_PER_ROW_ALIGNMENT,
+    DEFAULT_MAX_SCRATCH_BYTES,
+    A8_UNORM_EXPANDED_WEBGPU_FORMAT,
     TEXTURE_COMPRESSION_BC_FEATURE,
     TEXTURE_COMPRESSION_BC_SLICED_3D_FEATURE,
     TEXTURE_FORMATS_TIER1_FEATURE,
     CHROMIUM_UNORM16_FEATURE,
     DEPTH32FLOAT_STENCIL8_FEATURE,
     BGRA8UNORM_STORAGE_FEATURE,
+    TextureScratchPool,
+    getWebGpuFormatInfo,
     mapDxgiFormatToWebGpu,
     getSrgbSiblingFormat,
     classifyTextureFormatSupport,
     resolveStorageCompatibleFormat,
     calcMipSize,
     calcMipLayout,
+    alignCopyExtentForFormat,
+    calcMipUploadLayout,
     padTextureRowsForWriteTexture,
+    expandA8ToRgba8,
+    expandA8ToRgba8Layout,
     decodeBc1ToRgba8,
     decodeBc3ToRgba8,
     decodeBc4ToR8,
