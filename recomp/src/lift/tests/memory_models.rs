@@ -135,9 +135,10 @@ fn table_entries_are_ordinary_loads_and_the_base_stays_invariant() {
 
 #[test]
 fn contiguous_runs_store_marks_its_last_slot_only_when_it_crosses() {
-    // `mov [rcx], rax` under window-runs: one unconditional mark of the store's slot; the mark of
-    // the last byte's slot sits in its own block behind `icmp ne` (taken only by a store that
-    // leaves its slot), not on the hot path.
+    // `mov [rcx], rax` under window-runs: one hot dirty check for the store's slot (with its
+    // atomic release store behind `icmp eq i8 ..., 0`); the dirty check for the last byte's slot
+    // sits in its own block behind `icmp ne` (taken only by a store that leaves its slot), not on
+    // the hot path.
     use iced_x86::code_asm::*;
     let f = super::asm_function(0x1000, |a| {
         a.mov(qword_ptr(rcx), rax)?;
@@ -146,19 +147,26 @@ fn contiguous_runs_store_marks_its_last_slot_only_when_it_crosses() {
     let ir = lift_module_with([&f], window(WindowCheck::Branch, true, true))
         .expect("lifts")
         .ir;
-    // Labels of the blocks holding a mark.
+    // Labels of the blocks holding a dirty check and a release store.
     let mut label = "";
-    let mut marked = Vec::new();
+    let mut checked = Vec::new();
+    let mut stored = Vec::new();
     for line in ir.lines() {
         if let Some(l) = line.strip_suffix(':') {
             label = l;
-        } else if line.contains("store atomic i8 1, ptr ") {
-            marked.push(label);
+        } else if line.contains("load atomic i8, ptr ") && line.contains(" monotonic, align 1") {
+            checked.push(label);
+        } else if line.contains("store atomic i8 1, ptr ") && line.contains(" release, align 1") {
+            stored.push(label);
         }
     }
-    assert_eq!(marked.len(), 2, "{ir}");
-    assert_ne!(marked[0], marked[1], "both marks on the hot path:\n{ir}");
-    let cold = marked[1];
+    assert_eq!(checked.len(), 2, "{ir}");
+    assert_eq!(stored.len(), 2, "{ir}");
+    assert_ne!(
+        checked[0], checked[1],
+        "both dirty checks on the hot path:\n{ir}"
+    );
+    let cold = checked[1];
     assert!(cold.starts_with("gm"), "{ir}");
     // The cold mark block is entered only by an `icmp ne` of the two slot indices.
     let branch = ir
@@ -175,6 +183,59 @@ fn contiguous_runs_store_marks_its_last_slot_only_when_it_crosses() {
             .any(|l| l.trim_start().starts_with(&format!("{cond} = icmp ne i64"))),
         "{ir}"
     );
+    // Both atomic release stores sit in cold `gms*` blocks entered by `icmp eq i8 ..., 0`.
+    for set_block in stored {
+        assert!(set_block.starts_with("gms"), "{ir}");
+        let set_br = ir
+            .lines()
+            .find(|l| l.contains(&format!("label %{set_block},")))
+            .expect("branch to mark-set block");
+        assert!(
+            set_br.contains("!prof !{!\"branch_weights\", i32 1, i32 2000}"),
+            "{ir}"
+        );
+        let set_cond = set_br
+            .split_whitespace()
+            .nth(2)
+            .expect("condition")
+            .trim_end_matches(',');
+        assert!(
+            ir.lines()
+                .any(|l| l.trim_start().starts_with(&format!("{set_cond} = icmp eq i8"))
+                    && l.ends_with(", 0")),
+            "{ir}"
+        );
+    }
+}
+
+#[test]
+fn window_dirty_marks_guard_atomic_release_store_with_monotonic_check() {
+    // R57: every window model guards `store atomic i8 1 ... release` behind a `load atomic i8 ...
+    // monotonic` + `icmp eq i8 ..., 0` cold branch so already-dirty slots avoid `LOCK XCHG`.
+    use iced_x86::code_asm::*;
+    let f = super::asm_function(0x1000, |a| {
+        a.mov(qword_ptr(rcx), rax)?;
+        a.lock().xadd(qword_ptr(rdx), rax)?;
+        a.ret()
+    });
+    for name in ["window", "window-outline", "window-runs"] {
+        let model = MemoryModel::from_name(name).expect("model");
+        let ir = lift_module_with([&f], model).expect("lifts").ir;
+        let loads = ir.matches("load atomic i8, ptr ").count();
+        let stores = ir.matches("store atomic i8 1, ptr ").count();
+        assert!(stores > 0, "{name}: expected dirty marks:\n{ir}");
+        assert_eq!(
+            loads, stores,
+            "{name}: every dirty release store must have a matching monotonic load guard:\n{ir}"
+        );
+    }
+    let select_ir = lift_module_with([&f], window(WindowCheck::Select, false, false))
+        .expect("lifts")
+        .ir;
+    let loads = select_ir.matches("load atomic i8, ptr ").count();
+    let stores = select_ir.matches("store atomic i8 1, ptr ").count();
+    assert!(stores > 0, "window-select:\n{select_ir}");
+    assert_eq!(loads, stores, "window-select:\n{select_ir}");
 }
 
 /// FNV-1a 64 of a byte string (stable fingerprint of emitted IR).
