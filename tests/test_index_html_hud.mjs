@@ -19,6 +19,7 @@ import { HudController, BOOT_MODE, DEFAULT_TOGGLE_KEY } from '../web/ui/hud_cont
 
 const require = createRequire(import.meta.url);
 const { GpuBootPanelController } = require('../web/ui/gpu_boot_panel.js');
+const { DEFAULT_FADE_OUT_MS } = require('../web/ui/splash_overlay.js');
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
@@ -776,4 +777,127 @@ test('W145 integration: F3 toggle, ?hud=0 clean capture, scripted-input badge, a
   controller.destroy();
   gpuBootPanel.destroy();
   assert.equal(keyTarget.listenerCount('keydown'), 0);
+});
+
+test('W330 web/ui/overlay.css aligns .pg6-splash--fading transition with W311 fadeOutMs and preserves Astryx splash tokens', () => {
+  assert.equal(DEFAULT_FADE_OUT_MS, 220);
+
+  // :root splash fade duration tokens match W311 DEFAULT_FADE_OUT_MS (220ms).
+  assert.match(
+    overlayCss,
+    new RegExp(`--pg6-splash-fade-out:\\s*${DEFAULT_FADE_OUT_MS}ms;`),
+    'overlay.css must define --pg6-splash-fade-out matching W311 DEFAULT_FADE_OUT_MS'
+  );
+  assert.match(
+    overlayCss,
+    new RegExp(`--pg6-splash-fade:\\s*${DEFAULT_FADE_OUT_MS}ms;`),
+    'overlay.css must align default --pg6-splash-fade with W311 DEFAULT_FADE_OUT_MS'
+  );
+  assert.match(overlayCss, /--pg6-splash-ease:\s*cubic-bezier\(/);
+
+  // Smooth opacity transition on splash root and .pg6-splash--fading (standalone and #splash-overlay-root).
+  assert.match(
+    overlayCss,
+    /\.pg6-splash,\s*\r?\n#splash-overlay-root\s+\.pg6-splash\s*\{[\s\S]*?opacity:\s*1;[\s\S]*?transition:\s*opacity\s+var\(--pg6-splash-fade,\s*220ms\)\s+var\(--pg6-splash-ease[\s\S]*?will-change:\s*opacity;/
+  );
+  assert.match(
+    overlayCss,
+    /\.pg6-splash\.pg6-splash--fading,\s*\r?\n#splash-overlay-root\s+\.pg6-splash\.pg6-splash--fading\s*\{[\s\S]*?opacity:\s*0;[\s\S]*?pointer-events:\s*none;[\s\S]*?transition:\s*opacity\s+var\(--pg6-splash-fade,\s*220ms\)/
+  );
+  assert.match(
+    overlayCss,
+    /\.pg6-splash\.pg6-splash--fading\s+\.pg6-splash__panel,\s*\r?\n#splash-overlay-root\s+\.pg6-splash\.pg6-splash--fading\s+\.pg6-splash__panel\s*\{[\s\S]*?opacity:\s*0;[\s\S]*?pointer-events:\s*none;/
+  );
+});
+
+test('W330 web/ui/overlay.css disables splash & HUD transitions under prefers-reduced-motion and [data-reduced-motion="true"]', () => {
+  const reducedMotionMatch = /@media\s*\(\s*prefers-reduced-motion\s*:\s*reduce\s*\)\s*\{([\s\S]*)\}\s*$/.exec(
+    overlayCss
+  );
+  assert.ok(
+    reducedMotionMatch,
+    'overlay.css must end with a @media (prefers-reduced-motion: reduce) cascade override block'
+  );
+  const reducedMotionBody = reducedMotionMatch[1];
+
+  // Zero out motion custom properties.
+  assert.match(reducedMotionBody, /--duration-fast:\s*0ms;/);
+  assert.match(reducedMotionBody, /--pg6-splash-fade:\s*0ms;/);
+  assert.match(reducedMotionBody, /--pg6-splash-fade-out:\s*0ms;/);
+
+  // Cover HUD, splash fading state, panel, progress bars, and spinners.
+  for (const selector of [
+    '#hud',
+    '.pg6-splash',
+    '.pg6-splash.pg6-splash--fading',
+    '#splash-overlay-root .pg6-splash',
+    '#splash-overlay-root .pg6-splash.pg6-splash--fading',
+    '.pg6-splash__panel',
+    '#splash-overlay-root .pg6-splash__panel',
+    '.pg6-splash__bar-fill',
+    '.pg6-splash__stream-fill',
+    '.astryx-button',
+    '.astryx-progress-bar-fill',
+    '.astryx-chevron',
+  ]) {
+    assert.ok(
+      reducedMotionBody.includes(selector),
+      `prefers-reduced-motion block must cover "${selector}"`
+    );
+  }
+  assert.match(reducedMotionBody, /transition:\s*none\s*!important;/);
+  assert.match(reducedMotionBody, /transition-duration:\s*0ms\s*!important;/);
+  assert.match(reducedMotionBody, /transition-delay:\s*0ms\s*!important;/);
+  assert.match(reducedMotionBody, /transform:\s*none\s*!important;/);
+  assert.match(
+    reducedMotionBody,
+    /\.pg6-splash__spinner-ring[\s\S]*\.pg6-splash__greg[\s\S]*animation:\s*none\s*!important;/
+  );
+
+  // Programmatic [data-reduced-motion="true"] attribute also disables fade transitions & spinner rotation.
+  assert.match(
+    overlayCss,
+    /\.pg6-splash\[data-reduced-motion="true"\][\s\S]*--pg6-splash-fade:\s*0ms;[\s\S]*transition:\s*none\s*!important;/
+  );
+  assert.match(
+    overlayCss,
+    /\.pg6-splash\[data-reduced-motion="true"\]\s+\.pg6-splash__spinner-ring[\s\S]*animation:\s*none\s*!important;/
+  );
+});
+
+test('W330 web/ui/overlay.css adds clean 1080p/4K/narrow responsive sizing while preserving compact Astryx #hud invariants', () => {
+  // Base 1080p Astryx compact top-left #hud card invariants remain intact.
+  assert.match(
+    overlayCss,
+    /#hud\s*\{[\s\S]*?position:\s*fixed;[\s\S]*?top:\s*12px;[\s\S]*?left:\s*12px;[\s\S]*?width:\s*min\(320px,\s*calc\(100vw - 24px\)\);[\s\S]*?max-width:\s*320px;[\s\S]*?border:\s*none;[\s\S]*?border-radius:\s*var\(--radius-container\);[\s\S]*?contain:\s*layout style paint;/
+  );
+  assert.match(overlayCss, /#hud\[data-hud-visible="false"\]\s*\{[\s\S]*?display:\s*none\s*!important;/);
+  assert.match(overlayCss, /#hud\.collapsed\s*\{[\s\S]*?border-radius:\s*var\(--radius-full\);/);
+  assert.doesNotMatch(overlayCss, /#6db3ff/i, 'overlay.css must never reintroduce legacy neon blue #6db3ff');
+
+  // 4K viewport breakpoint scales gently without bloating the compact top-left #hud card.
+  const fourKMatch = /@media\s*\(\s*min-width\s*:\s*2560px\s*\)\s*\{([\s\S]*?)\r?\n\}/.exec(overlayCss);
+  assert.ok(fourKMatch, 'overlay.css must define a @media (min-width: 2560px) responsive block for 4K viewports');
+  const fourKBody = fourKMatch[1];
+  const fourKMaxWidth = /#hud\s*\{[\s\S]*?max-width:\s*(\d+)px;/.exec(fourKBody);
+  assert.ok(fourKMaxWidth, '4K breakpoint must cap #hud max-width cleanly');
+  assert.ok(
+    Number(fourKMaxWidth[1]) >= 320 && Number(fourKMaxWidth[1]) <= 360,
+    `4K #hud max-width (${fourKMaxWidth[1]}px) must stay compact (320px..360px)`
+  );
+  assert.match(fourKBody, /#splash-overlay-root\s+\.pg6-splash__panel\s*\{[\s\S]*?max-width:\s*368px;/);
+
+  // Narrow viewport breakpoints tighten margins & stack primary actions without overflow.
+  const narrowMatch = /@media\s*\(\s*max-width\s*:\s*640px\s*\)\s*\{([\s\S]*?)\r?\n\}/.exec(overlayCss);
+  assert.ok(narrowMatch, 'overlay.css must define a @media (max-width: 640px) responsive block for narrow viewports');
+  assert.match(narrowMatch[1], /#hud\s*\{[\s\S]*?top:\s*8px;[\s\S]*?left:\s*8px;[\s\S]*?calc\(100vw - 16px\)/);
+  assert.match(narrowMatch[1], /#splash-overlay-root\s+\.pg6-splash__panel\s*\{[\s\S]*?calc\(100vw - 16px\)/);
+
+  const tinyMatch = /@media\s*\(\s*max-width\s*:\s*380px\s*\)\s*\{([\s\S]*?)\r?\n\}/.exec(overlayCss);
+  assert.ok(tinyMatch, 'overlay.css must define a @media (max-width: 380px) responsive block for ultra-narrow viewports');
+  assert.match(tinyMatch[1], /\.hud-primary-actions[\s\S]*?grid-template-columns:\s*1fr;/);
+
+  const shortMatch = /@media\s*\(\s*max-height\s*:\s*600px\s*\)\s*\{([\s\S]*?)\r?\n\}/.exec(overlayCss);
+  assert.ok(shortMatch, 'overlay.css must define a @media (max-height: 600px) responsive block for short viewports');
+  assert.match(shortMatch[1], /#hud-body\s*\{[\s\S]*?max-height:\s*calc\(100vh - 56px\);/);
 });
