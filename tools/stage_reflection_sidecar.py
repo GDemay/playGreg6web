@@ -22,7 +22,7 @@ sidecar only when its reflection carries the join keys the runtime needs:
     components, component_type, fetch_format?}).
 Stages without them are skipped and counted, so the runtime keeps its conventions for them.
 
-    python tools/stage_reflection_sidecar.py <json>... --out <pack>.reflect.json [--merge-existing <reflect.json>] [--diff-baseline <reflect.json>] [--fail-on-regressions] [--report-missing-sources <report.json>] [--json]
+    python tools/stage_reflection_sidecar.py <json>... --out <pack>.reflect.json [--merge-existing <reflect.json>] [--diff-baseline <reflect.json>] [--fail-on-regressions] [--report-missing-sources <report.json>] [--verify-pack <wgsl.pack>] [--json]
 
 The sidecar is derived from the title's shaders: write it under work/, never into the repository.
 """
@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import struct
 import sys
 from pathlib import Path
 from typing import Any
@@ -43,8 +44,23 @@ REPORT_VERSION = 1
 DEFAULT_MAX_SAMPLE_HASHES = 5
 STAGES = ("vertex", "fragment", "compute")
 
+# WGPK v1 binary container constants (matching shaders/src/pack.rs byte-for-byte)
+WGPK_MAGIC = b"WGPK"
+WGPK_VERSION = 1
+WGPK_HEADER_STRUCT = struct.Struct("<4sIII")
+WGPK_HEADER_BYTES = WGPK_HEADER_STRUCT.size  # 16 bytes
+WGPK_ENTRY_STRUCT = struct.Struct("<QB3sII")
+WGPK_ENTRY_BYTES = WGPK_ENTRY_STRUCT.size  # 20 bytes
+WGPK_U32_MAX = 0xFFFFFFFF
+WGPK_STAGE_NAMES: dict[int, str] = {
+    1: "vertex",
+    2: "fragment",
+    3: "compute",
+}
+
 _SAFE_LABEL_RE = re.compile(r"^[A-Za-z0-9_.$<>\[\]-]{1,64}$")
 _SAFE_HASH_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 
 KIND_MAP = {
     "uniform": "uniform",
@@ -210,6 +226,230 @@ def _sanitize_hash(value: Any) -> str:
     if text and _SAFE_HASH_RE.match(text):
         return text
     return "<redacted>"
+
+
+def _sanitize_path_label(path: Path | str | None) -> str:
+    """Return a strictly sanitized basename-only label (no host paths or usernames)."""
+    if path is None:
+        return "<unknown>"
+    raw = str(path).strip()
+    if not raw:
+        return "<unknown>"
+    stripped = raw.rstrip("/\\")
+    if not stripped:
+        return "<unknown>"
+    parts = re.split(r"[/\\]+", stripped)
+    base = parts[-1]
+    if not base or base in (".", "..") or (len(base) == 2 and base[1] == ":"):
+        return "<unknown>"
+    return _sanitize_label(base, fallback="<redacted>")
+
+
+def _normalize_hash_key(key: str) -> str:
+    """Canonicalize valid 64-bit hex shader hashes to 0x + 16 lowercase hex digits."""
+    trimmed = key.strip()
+    raw_hex = trimmed[2:] if trimmed.lower().startswith("0x") else trimmed
+    if raw_hex and len(raw_hex) <= 16 and _HEX_RE.fullmatch(raw_hex):
+        return f"0x{int(raw_hex, 16):016x}"
+    return key
+
+
+def _validate_wgpk_header(header: bytes | bytearray | memoryview, total_len: int) -> tuple[int, int]:
+    """Validate a 16-byte WGPK v1 header against total_len; returns (entry_count, data_start)."""
+    if total_len < WGPK_HEADER_BYTES or len(header) < WGPK_HEADER_BYTES:
+        raise ValueError(
+            f"WGPK pack truncated: {total_len} bytes (minimum header size: {WGPK_HEADER_BYTES})"
+        )
+    if total_len > WGPK_U32_MAX:
+        raise ValueError(f"WGPK pack size {total_len} exceeds u32 max ({WGPK_U32_MAX})")
+    magic, version, entry_count, _flags = WGPK_HEADER_STRUCT.unpack_from(header, 0)
+    if magic != WGPK_MAGIC:
+        magic_hex = " ".join(f"0x{b:02x}" for b in magic)
+        raise ValueError(f"invalid WGPK pack magic [{magic_hex}] (expected 'WGPK')")
+    if version != WGPK_VERSION:
+        raise ValueError(f"unsupported WGPK pack version {version} (expected {WGPK_VERSION})")
+    table_bytes = entry_count * WGPK_ENTRY_BYTES
+    data_start = WGPK_HEADER_BYTES + table_bytes
+    if data_start > WGPK_U32_MAX:
+        raise ValueError(f"WGPK entry table size overflows u32 for {entry_count} entries")
+    if total_len < data_start:
+        raise ValueError(
+            f"WGPK pack truncated: {total_len} bytes "
+            f"(header + {entry_count} entries require {data_start} bytes)"
+        )
+    return entry_count, data_start
+
+
+def _parse_wgpk_toc_entries(
+    toc_bytes: bytes | bytearray | memoryview,
+    *,
+    entry_count: int,
+    data_start: int,
+    total_len: int,
+) -> list[dict[str, Any]]:
+    """Decode and bounds-check all WGPK v1 TOC records."""
+    entries: list[dict[str, Any]] = []
+    seen_hashes: dict[int, int] = {}
+    spans: list[tuple[int, int, int]] = []
+
+    for idx in range(entry_count):
+        base = idx * WGPK_ENTRY_BYTES
+        hash_int, stage_code, _reserved, offset, length = WGPK_ENTRY_STRUCT.unpack_from(toc_bytes, base)
+        stage = WGPK_STAGE_NAMES.get(stage_code)
+        if stage is None:
+            raise ValueError(f"invalid WGPK shader stage code {stage_code} at entry {idx} (expected 1..3)")
+        end = offset + length
+        if end > WGPK_U32_MAX:
+            raise ValueError(f"WGPK entry {idx} payload [{offset}..+{length}] overflows u32")
+        if offset < data_start:
+            raise ValueError(
+                f"WGPK entry {idx} payload offset {offset} overlaps header/TOC (data_start={data_start})"
+            )
+        if end > total_len:
+            raise ValueError(
+                f"WGPK entry {idx} payload [{offset}..+{length}] exceeds pack bounds ({total_len} bytes)"
+            )
+        if hash_int in seen_hashes:
+            raise ValueError(
+                f"WGPK pack contains duplicate shader hash 0x{hash_int:016x} "
+                f"at entries {seen_hashes[hash_int]} and {idx}"
+            )
+        seen_hashes[hash_int] = idx
+        if length > 0:
+            spans.append((offset, end, idx))
+        entries.append({
+            "hash": f"0x{hash_int:016x}",
+            "stage": stage,
+            "offset": offset,
+            "length": length,
+        })
+
+    if len(spans) > 1:
+        spans.sort(key=lambda item: (item[0], item[1]))
+        for prev, curr in zip(spans, spans[1:]):
+            if curr[0] < prev[1]:
+                raise ValueError(
+                    f"WGPK entry {prev[2]} payload [{prev[0]}..{prev[1]}) "
+                    f"overlaps entry {curr[2]} payload [{curr[0]}..{curr[1]})"
+                )
+
+    return entries
+
+
+def parse_wgpk_toc_bytes(data: bytes | bytearray | memoryview) -> list[dict[str, Any]]:
+    """Parse and bounds-check a WGPK v1 header and TOC from an in-memory buffer."""
+    view = memoryview(data)
+    total_len = len(view)
+    entry_count, data_start = _validate_wgpk_header(view, total_len)
+    return _parse_wgpk_toc_entries(
+        view[WGPK_HEADER_BYTES:data_start],
+        entry_count=entry_count,
+        data_start=data_start,
+        total_len=total_len,
+    )
+
+
+def load_wgpk_toc(path: Path) -> list[dict[str, Any]]:
+    """Read and validate a WGPK v1 header and TOC from disk without loading WGSL payloads."""
+    label = _sanitize_path_label(path)
+    if not path.exists():
+        raise ValueError(f"WGPK pack {label} does not exist")
+    if path.is_dir():
+        raise ValueError(f"WGPK pack {label} is a directory")
+    try:
+        with path.open("rb") as f:
+            f.seek(0, 2)
+            total_len = f.tell()
+            if total_len < WGPK_HEADER_BYTES:
+                raise ValueError(
+                    f"WGPK pack truncated: {total_len} bytes (minimum header size: {WGPK_HEADER_BYTES})"
+                )
+            f.seek(0)
+            header = f.read(WGPK_HEADER_BYTES)
+            entry_count, data_start = _validate_wgpk_header(header, total_len)
+            table_bytes = data_start - WGPK_HEADER_BYTES
+            toc_bytes = f.read(table_bytes)
+            if len(toc_bytes) < table_bytes:
+                raise ValueError(
+                    f"WGPK pack truncated while reading TOC: got {len(toc_bytes)} of {table_bytes} bytes"
+                )
+    except OSError as exc:
+        reason = exc.strerror or type(exc).__name__
+        raise ValueError(f"failed to read WGPK pack {label}: {reason}") from None
+    return _parse_wgpk_toc_entries(
+        toc_bytes,
+        entry_count=entry_count,
+        data_start=data_start,
+        total_len=total_len,
+    )
+
+
+def verify_sidecar_against_pack(
+    pack_entries: list[dict[str, Any]],
+    stages: dict[str, Any],
+    *,
+    pack_label: str | Path = "<pack>",
+    max_samples: int = DEFAULT_MAX_SAMPLE_HASHES,
+) -> dict[str, Any]:
+    """Cross-check reflection sidecar stage hashes against a parsed WGPK v1 TOC."""
+    safe_pack_label = _sanitize_path_label(pack_label)
+    pack_by_hash: dict[str, str] = {}
+    pack_by_stage: dict[str, int] = {stage: 0 for stage in STAGES}
+    for entry in pack_entries:
+        h = entry["hash"]
+        stage = entry["stage"]
+        pack_by_hash[h] = stage
+        if stage in pack_by_stage:
+            pack_by_stage[stage] += 1
+
+    reflection_by_hash: dict[str, str | None] = {}
+    for raw_key, stage_obj in stages.items():
+        norm_key = _normalize_hash_key(raw_key)
+        stage_val = stage_obj.get("stage") if isinstance(stage_obj, dict) else None
+        reflection_by_hash[norm_key] = stage_val if isinstance(stage_val, str) else None
+
+    pack_keys = set(pack_by_hash.keys())
+    reflection_keys = set(reflection_by_hash.keys())
+
+    matched_keys = sorted(pack_keys & reflection_keys)
+    missing_keys = sorted(pack_keys - reflection_keys)
+    extra_keys = sorted(reflection_keys - pack_keys)
+
+    missing_by_stage: dict[str, int] = {stage: 0 for stage in STAGES}
+    for key in missing_keys:
+        stage = pack_by_hash[key]
+        if stage in missing_by_stage:
+            missing_by_stage[stage] += 1
+
+    stage_mismatches = sum(
+        1
+        for key in matched_keys
+        if reflection_by_hash.get(key) is not None and reflection_by_hash[key] != pack_by_hash[key]
+    )
+
+    pack_entry_count = len(pack_entries)
+    reflection_stage_count = len(stages)
+    matched_count = len(matched_keys)
+    coverage_pct = round((matched_count * 100.0) / pack_entry_count, 2) if pack_entry_count > 0 else 0.0
+
+    return {
+        "pack_label": safe_pack_label,
+        "pack_entry_count": pack_entry_count,
+        "reflection_stage_count": reflection_stage_count,
+        "matched_hashes": matched_count,
+        "missing_reflection_hashes": {
+            "count": len(missing_keys),
+            "samples": _sample_hashes(missing_keys, max_samples=max_samples),
+        },
+        "extra_reflection_hashes": {
+            "count": len(extra_keys),
+            "samples": _sample_hashes(extra_keys, max_samples=max_samples),
+        },
+        "coverage_pct": coverage_pct,
+        "pack_by_stage": pack_by_stage,
+        "missing_by_stage": missing_by_stage,
+        "stage_mismatches": stage_mismatches,
+    }
 
 
 def _load_sidecar(path: Path, *, label: str, allow_missing: bool) -> dict[str, Any]:
@@ -486,7 +726,7 @@ def build_missing_sources_report(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("inputs", nargs="+", type=Path)
+    parser.add_argument("inputs", nargs="*", type=Path)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument(
         "--merge-existing",
@@ -511,8 +751,21 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="write a sanitized JSON report summarizing skipped 'binding without source' stages",
     )
+    parser.add_argument(
+        "--verify-pack",
+        type=Path,
+        default=None,
+        help="cross-check reflection sidecar hashes against a WGPK v1 .wgsl.pack header/TOC",
+    )
     parser.add_argument("--json", action="store_true", help="print the counts as JSON")
     args = parser.parse_args(argv)
+
+    if not args.inputs and args.verify_pack is None:
+        parser.error("the following arguments are required: inputs")
+
+    if not args.inputs and (args.merge_existing is not None or args.report_missing_sources is not None):
+        print("error: --merge-existing and --report-missing-sources require input JSON files", file=sys.stderr)
+        return 1
 
     if args.fail_on_regressions and args.diff_baseline is None:
         print("error: --fail-on-regressions requires --diff-baseline", file=sys.stderr)
@@ -534,21 +787,48 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: failed to load --diff-baseline: {exc}", file=sys.stderr)
             return 1
 
-    docs = []
-    for path in args.inputs:
-        with path.open(encoding="utf-8-sig") as f:
-            docs.append(json.load(f))
+    pack_entries: list[dict[str, Any]] | None = None
+    if args.verify_pack is not None:
+        try:
+            pack_entries = load_wgpk_toc(args.verify_pack)
+        except ValueError as exc:
+            print(f"error: failed to load --verify-pack: {exc}", file=sys.stderr)
+            return 1
 
-    sidecar, skipped = build(docs, existing_stages=existing_stages if args.merge_existing is not None else None)
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(json.dumps(sidecar, indent=1) + "\n", encoding="utf-8")
+    if args.inputs:
+        docs = []
+        for path in args.inputs:
+            with path.open(encoding="utf-8-sig") as f:
+                docs.append(json.load(f))
 
-    if args.report_missing_sources is not None:
-        report = build_missing_sources_report(docs)
-        args.report_missing_sources.parent.mkdir(parents=True, exist_ok=True)
-        args.report_missing_sources.write_text(json.dumps(report, indent=1) + "\n", encoding="utf-8")
+        sidecar, skipped = build(docs, existing_stages=existing_stages if args.merge_existing is not None else None)
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(json.dumps(sidecar, indent=1) + "\n", encoding="utf-8")
 
-    counts: dict[str, Any] = {"stages_written": len(sidecar["stages"]), "skipped": skipped}
+        if args.report_missing_sources is not None:
+            report = build_missing_sources_report(docs)
+            args.report_missing_sources.parent.mkdir(parents=True, exist_ok=True)
+            args.report_missing_sources.write_text(json.dumps(report, indent=1) + "\n", encoding="utf-8")
+
+        stages_written = len(sidecar["stages"])
+    else:
+        try:
+            loaded_stages = _load_sidecar(args.out, label="sidecar", allow_missing=False)
+        except OSError as exc:
+            reason = exc.strerror or type(exc).__name__
+            print(
+                f"error: failed to load --out sidecar {_sanitize_path_label(args.out)}: {reason}",
+                file=sys.stderr,
+            )
+            return 1
+        except ValueError as exc:
+            print(f"error: failed to load --out sidecar: {exc}", file=sys.stderr)
+            return 1
+        sidecar = {"schema": SCHEMA, "version": VERSION, "stages": loaded_stages}
+        skipped = {}
+        stages_written = 0
+
+    counts: dict[str, Any] = {"stages_written": stages_written, "skipped": skipped}
     if args.merge_existing is not None:
         counts["merged_existing"] = len(existing_stages)
     counts.update(summarize_stages(sidecar["stages"]))
@@ -557,6 +837,15 @@ def main(argv: list[str] | None = None) -> int:
     if baseline_stages is not None:
         diff = diff_sidecars(baseline_stages, sidecar["stages"])
         counts["diff"] = diff
+
+    pack_verification: dict[str, Any] | None = None
+    if pack_entries is not None and args.verify_pack is not None:
+        pack_verification = verify_sidecar_against_pack(
+            pack_entries,
+            sidecar["stages"],
+            pack_label=args.verify_pack,
+        )
+        counts["pack_verification"] = pack_verification
 
     if args.json:
         print(json.dumps(counts))
@@ -573,6 +862,14 @@ def main(argv: list[str] | None = None) -> int:
                 f"; diff: +{diff['added_count']}/-{diff['removed_count']}"
                 f"/~{diff['changed_count']}/={diff['unchanged_count']}"
                 f" (net {diff['net_delta']:+d})"
+            )
+        if pack_verification is not None:
+            line += (
+                f"; pack verify ({pack_verification['pack_label']}): "
+                f"{pack_verification['matched_hashes']}/{pack_verification['pack_entry_count']} matched "
+                f"({pack_verification['coverage_pct']:.2f}%), "
+                f"{pack_verification['missing_reflection_hashes']['count']} missing, "
+                f"{pack_verification['extra_reflection_hashes']['count']} extra"
             )
         print(line)
 
