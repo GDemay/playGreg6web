@@ -93,6 +93,14 @@ const EXCEPTION_EXECUTE_HANDLER: u32 = 1;
 /// Upper bound for any table count (scope records, states, try blocks, handlers, IP map entries,
 /// separated segments). Real functions stay far below; garbage counts are rejected.
 const MAX_TABLE_ENTRIES: u32 = 1 << 16;
+/// Byte size of the `C_SCOPE_TABLE` record count prefix (`u32 Count`).
+const SCOPE_TABLE_HEADER_LEN: u32 = 4;
+/// Byte size of one `C_SCOPE_TABLE_ENTRY` (`BeginAddress`, `EndAddress`, `HandlerAddress`,
+/// `JumpTarget`).
+const SCOPE_RECORD_LEN: usize = 16;
+/// Cap initial `Vec::with_capacity` pre-allocations so malformed/truncated tables with large
+/// counts cannot trigger large upfront allocations before entries are verified.
+const INITIAL_TABLE_CAPACITY: usize = 256;
 /// Instructions decoded per handler when identifying it.
 const HANDLER_SCAN_LIMIT: usize = 96;
 
@@ -535,36 +543,85 @@ struct Reader<'p, 'f> {
     file: &'f [u8],
 }
 
+/// Convert a 32-bit RVA to a 64-bit VA with checked addition.
+fn rva_to_va(base: u64, rva: u32) -> Option<u64> {
+    base.checked_add(u64::from(rva))
+}
+
+/// Decode a little-endian `u32` at `offset` within `bytes`, returning `None` if out of bounds.
+fn le_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let end = offset.checked_add(4)?;
+    let b = bytes.get(offset..end)?;
+    Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// Compute a safe initial `Vec` capacity bounded by both remaining bytes and [`INITIAL_TABLE_CAPACITY`].
+fn bounded_capacity(n: usize, remaining_bytes: usize, min_entry_bytes: usize) -> usize {
+    let max_fit = if min_entry_bytes == 0 {
+        0
+    } else {
+        remaining_bytes / min_entry_bytes
+    };
+    n.min(max_fit).min(INITIAL_TABLE_CAPACITY)
+}
+
 impl<'f> Reader<'_, 'f> {
-    /// Bytes from `rva` to the end of its section's file data.
+    /// Bytes from `rva` to the end of its section's mapped file data (clamped to `SizeOfImage`).
     fn tail(&self, rva: u32) -> Option<&'f [u8]> {
+        if rva >= self.pe.optional.size_of_image {
+            return None;
+        }
         let offset = self.pe.rva_to_file_offset(rva)?;
+        let section_extent = |s: &crate::pe::SectionHeader| {
+            if s.virtual_size == 0 {
+                s.raw_size
+            } else {
+                s.virtual_size.min(s.raw_size)
+            }
+        };
         let section = self.pe.sections.iter().find(|s| {
+            let extent = section_extent(s);
             rva.checked_sub(s.virtual_address)
-                .is_some_and(|delta| delta < s.raw_size)
+                .is_some_and(|delta| delta < extent)
         });
-        let end = match section {
+        let (end_offset, max_rva_len) = match section {
             Some(s) => {
-                let extent = if s.virtual_size == 0 {
-                    s.raw_size
-                } else {
-                    s.virtual_size.min(s.raw_size)
-                };
-                (s.raw_offset as usize).checked_add(extent as usize)?
+                let extent = section_extent(s);
+                let raw_end = usize::try_from(s.raw_offset)
+                    .ok()?
+                    .checked_add(usize::try_from(extent).ok()?)?;
+                let delta = rva.checked_sub(s.virtual_address)?;
+                let section_rem = extent.checked_sub(delta)?;
+                (raw_end, section_rem)
             }
             // Headers.
-            None => self.pe.optional.size_of_headers as usize,
+            None => {
+                let hdr_end = usize::try_from(self.pe.optional.size_of_headers).ok()?;
+                let hdr_rem = self.pe.optional.size_of_headers.checked_sub(rva)?;
+                (hdr_end, hdr_rem)
+            }
         };
-        self.file.get(offset..end.min(self.file.len()))
+        let image_rem = self.pe.optional.size_of_image.checked_sub(rva)?;
+        let rva_bound = usize::try_from(max_rva_len.min(image_rem)).ok()?;
+        let file_end = end_offset.min(self.file.len());
+        let clamped_end = offset
+            .checked_add(rva_bound)
+            .map_or(file_end, |e| e.min(file_end));
+        self.file.get(offset..clamped_end)
     }
 
     fn read(&self, rva: u32, len: usize) -> Option<&'f [u8]> {
+        let len_u32 = u32::try_from(len).ok()?;
+        let end_rva = rva.checked_add(len_u32)?;
+        if end_rva > self.pe.optional.size_of_image {
+            return None;
+        }
         self.tail(rva)?.get(..len)
     }
 
     fn u32(&self, rva: u32) -> Option<u32> {
-        self.read(rva, 4)
-            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        let b = self.read(rva, 4)?;
+        le_u32(b, 0)
     }
 }
 
@@ -575,23 +632,28 @@ struct Stream<'f> {
 }
 
 impl Stream<'_> {
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.pos)
+    }
+
     fn u8(&mut self) -> Option<u8> {
         let b = *self.bytes.get(self.pos)?;
-        self.pos += 1;
+        self.pos = self.pos.checked_add(1)?;
         Some(b)
     }
 
     /// Raw little-endian `i32` (`ReadInt`).
     fn int(&mut self) -> Option<u32> {
-        let b = self.bytes.get(self.pos..self.pos.checked_add(4)?)?;
-        self.pos += 4;
-        Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        let end = self.pos.checked_add(4)?;
+        let b = self.bytes.get(self.pos..end)?;
+        self.pos = end;
+        le_u32(b, 0)
     }
 
     /// Compressed unsigned integer (`ReadUnsigned`).
     fn unsigned(&mut self) -> Option<u32> {
         let (value, len) = decode_compressed(self.bytes.get(self.pos..)?)?;
-        self.pos += len;
+        self.pos = self.pos.checked_add(len)?;
         Some(value)
     }
 }
@@ -663,7 +725,9 @@ impl Diags<'_> {
 
 /// Validates a table count read from the data.
 fn count(value: u32) -> Option<usize> {
-    (value <= MAX_TABLE_ENTRIES).then_some(value as usize)
+    (value <= MAX_TABLE_ENTRIES)
+        .then(|| usize::try_from(value).ok())
+        .flatten()
 }
 
 impl EhMetadata {
@@ -674,52 +738,63 @@ impl EhMetadata {
         let reader = Reader { pe, file };
         let base = pe.optional.image_base;
         let slots = import_slots(pe);
+        let setjmp_slots: BTreeSet<u32> = slots
+            .iter()
+            .filter(|(_, name)| SETJMP_IMPORTS.contains(&name.as_str()))
+            .filter_map(|(va, _)| va.checked_sub(base).and_then(|d| u32::try_from(d).ok()))
+            .collect();
         let mut out = Self {
-            setjmp_slots: slots
-                .iter()
-                .filter(|(_, name)| SETJMP_IMPORTS.contains(&name.as_str()))
-                .map(|(va, _)| (va - base) as u32)
-                .collect(),
+            setjmp_slots: setjmp_slots.into_iter().collect(),
             ..Self::default()
         };
 
         // The module that implements the handlers itself (`vcruntime140*.dll`) exports them
         // under their import names and calls them directly instead of through the IAT.
-        let exported: BTreeMap<u64, HandlerKind> = pe
-            .exports
-            .iter()
-            .flat_map(|t| t.symbols.iter())
-            .filter(|e| e.forwarder.is_none())
-            .filter_map(|e| {
-                let name = e.name.as_deref()?;
-                let kind = HANDLER_IMPORTS.iter().find(|(n, _)| *n == name)?.1;
-                Some((base + u64::from(e.rva), kind))
-            })
-            .collect();
+        let mut exported: BTreeMap<u64, HandlerKind> = BTreeMap::new();
+        for e in pe.exports.iter().flat_map(|t| t.symbols.iter()) {
+            if e.forwarder.is_some() {
+                continue;
+            }
+            let Some(name) = e.name.as_deref() else {
+                continue;
+            };
+            let Some(kind) = HandlerKind::from_import(name) else {
+                continue;
+            };
+            let Some(va) = rva_to_va(base, e.rva) else {
+                continue;
+            };
+            exported
+                .entry(va)
+                .and_modify(|existing| *existing = (*existing).min(kind))
+                .or_insert(kind);
+        }
 
-        // Identify every handler routine once.
-        let handler_rvas = dir.handler_rvas();
-        let scans: Vec<(u32, HandlerScan)> = handler_rvas
-            .iter()
-            .map(|&rva| {
-                let mut scan = scan_handler(&image, &slots, base + u64::from(rva));
+        // Identify every handler routine once in canonical ascending RVA order.
+        let handler_rvas: BTreeSet<u32> = dir.handler_rvas().into_iter().collect();
+        let scans: BTreeMap<u32, HandlerScan> = handler_rvas
+            .into_iter()
+            .map(|rva| {
+                let mut scan = rva_to_va(base, rva)
+                    .map(|va| scan_handler(&image, &slots, va))
+                    .unwrap_or_default();
                 // A direct call to an exported handler counts like a call through its import.
-                scan.kinds
-                    .extend(scan.direct_calls.iter().filter_map(|c| exported.get(c)));
-                scan.kinds.sort_unstable();
-                scan.kinds.dedup();
+                let mut kinds: BTreeSet<HandlerKind> = scan.kinds.into_iter().collect();
+                kinds.extend(scan.direct_calls.iter().filter_map(|c| exported.get(c)));
+                scan.kinds = kinds.into_iter().collect();
                 scan.direct_calls.retain(|c| !exported.contains_key(c));
                 (rva, scan)
             })
             .collect();
         // Cookie-check helpers called first by recognised wrappers identify `__GSHandlerCheck`.
         let gs_helpers: BTreeSet<u64> = scans
-            .iter()
-            .filter(|(_, scan)| scan.thunk.is_none() && scan.kinds.len() == 1)
-            .filter_map(|(_, scan)| scan.direct_calls.first().copied())
+            .values()
+            .filter(|scan| scan.thunk.is_none() && scan.kinds.len() == 1)
+            .filter_map(|scan| scan.direct_calls.first().copied())
             .collect();
-        for (rva, scan) in &scans {
-            let handler = if let Some(&kind) = exported.get(&(base + u64::from(*rva))) {
+        for (&rva, scan) in &scans {
+            let handler = if let Some(&kind) = rva_to_va(base, rva).and_then(|va| exported.get(&va))
+            {
                 Ok(Handler {
                     kind,
                     wrapper: false,
@@ -749,22 +824,36 @@ impl EhMetadata {
             };
             match handler {
                 Ok(handler) => {
-                    out.handlers.insert(*rva, handler);
+                    out.handlers.insert(rva, handler);
                 }
                 Err(kind) => out.diagnostics.push(EhDiagnostic {
-                    rva: *rva,
-                    address: *rva,
+                    rva,
+                    address: rva,
                     kind,
                 }),
             }
         }
 
+        // Process `.pdata` records in canonical ascending RVA order (deduplicating identical
+        // `(begin, end, unwind)` keys) so outputs are invariant to input order or duplicates.
+        let mut ordered_entries: BTreeMap<(u32, u32, u32), &crate::pdata::PdataEntry> =
+            BTreeMap::new();
         for entry in &dir.entries {
+            ordered_entries
+                .entry((
+                    entry.function.begin,
+                    entry.function.end,
+                    entry.function.unwind,
+                ))
+                .or_insert(entry);
+        }
+        let mut unrecognised = BTreeSet::new();
+        for entry in ordered_entries.into_values() {
             let Some(eh) = entry.unwind.as_ref().and_then(|u| u.handler) else {
                 continue;
             };
             let Some(&handler) = out.handlers.get(&eh.rva) else {
-                out.unrecognised.push(entry.function.begin);
+                unrecognised.insert(entry.function.begin);
                 continue;
             };
             let mut diags = Diags {
@@ -797,6 +886,7 @@ impl EhMetadata {
                 data,
             });
         }
+        out.unrecognised = unrecognised.into_iter().collect();
         out
     }
 
@@ -805,6 +895,14 @@ impl EhMetadata {
         self.functions
             .iter()
             .flat_map(EhFunction::funclets)
+            .collect()
+    }
+
+    /// Distinct resume targets of all functions, `(rva, kind)`.
+    pub fn resume_targets(&self) -> BTreeSet<(u32, ResumeKind)> {
+        self.functions
+            .iter()
+            .flat_map(EhFunction::resume_targets)
             .collect()
     }
 
@@ -829,9 +927,8 @@ impl EhMetadata {
         }
         stats.funclets = self.funclets().len();
         stats.resume_targets = self
-            .functions
-            .iter()
-            .flat_map(EhFunction::resume_targets)
+            .resume_targets()
+            .into_iter()
             .map(|(rva, _)| rva)
             .collect::<BTreeSet<_>>()
             .len();
@@ -845,36 +942,44 @@ impl EhMetadata {
     /// Install `.pdata` first ([`ExceptionDirectory::seed`]).
     pub fn seed(&self, image: &mut CodeImage<'_>) {
         let base = image.base();
-        let va = |rva: u32| base.saturating_add(u64::from(rva));
-        let funclets: Vec<u64> = self
-            .funclets()
+        let mut entries: BTreeSet<u64> = std::mem::take(&mut image.entry_points)
             .into_iter()
-            .map(|(rva, _)| va(rva))
-            .filter(|&va| image.region_of(va) == Region::Code)
             .collect();
-        let mut entries = std::mem::take(&mut image.entry_points);
-        entries.extend(funclets);
-        entries.sort_unstable();
-        entries.dedup();
-        image.entry_points = entries;
+        entries.extend(
+            self.funclets()
+                .into_iter()
+                .filter_map(|(rva, _)| rva_to_va(base, rva))
+                .filter(|&va| image.region_of(va) == Region::Code),
+        );
+        image.entry_points = entries.into_iter().collect();
 
         let mut targets = BTreeSet::new();
         for function in &self.functions {
             for (rva, _) in function.resume_targets() {
-                let target = va(rva);
+                let Some(target) = rva_to_va(base, rva) else {
+                    continue;
+                };
                 if image.region_of(target) != Region::Code {
                     continue;
                 }
-                let owner = image
+                let Some(owner) = image
                     .function_table
                     .function_at(target)
-                    .unwrap_or_else(|| va(function.begin));
+                    .or_else(|| rva_to_va(base, function.begin))
+                else {
+                    continue;
+                };
                 targets.insert((owner, target));
             }
         }
+        let setjmp_slots: BTreeSet<u64> = self
+            .setjmp_slots
+            .iter()
+            .filter_map(|&rva| rva_to_va(base, rva))
+            .collect();
         image.eh = EhSeeds {
             resume_targets: targets.into_iter().collect(),
-            setjmp_slots: self.setjmp_slots.iter().map(|&rva| va(rva)).collect(),
+            setjmp_slots: setjmp_slots.into_iter().collect(),
             stats: self.stats(),
         };
     }
@@ -894,8 +999,17 @@ fn import_slots(pe: &Pe64) -> BTreeMap<u64, String> {
             continue;
         }
         for (i, symbol) in symbols.iter().enumerate() {
+            let Some(slot_rva) = u32::try_from(i)
+                .ok()
+                .and_then(|idx| idx.checked_mul(8))
+                .and_then(|off| iat.checked_add(off))
+            else {
+                break;
+            };
+            let Some(slot) = rva_to_va(base, slot_rva) else {
+                break;
+            };
             if let ImportedSymbol::ByName { name, .. } = symbol {
-                let slot = base + u64::from(iat) + 8 * i as u64;
                 slots.insert(slot, name.clone());
             }
         }
@@ -981,7 +1095,11 @@ fn scan_handler(image: &CodeImage<'_>, slots: &BTreeMap<u64, String>, va: u64) -
                             None if ins.flow_control() == FlowControl::Call => {
                                 calls.insert(target);
                             }
-                            None => work.push(target),
+                            None => {
+                                if !seen.contains(&target) && work.len() < HANDLER_SCAN_LIMIT {
+                                    work.push(target);
+                                }
+                            }
                         }
                     }
                     if ins.flow_control() == FlowControl::UnconditionalBranch {
@@ -996,7 +1114,10 @@ fn scan_handler(image: &CodeImage<'_>, slots: &BTreeMap<u64, String>, va: u64) -
                     break;
                 }
                 FlowControl::ConditionalBranch => {
-                    if let Some(target) = direct {
+                    if let Some(target) = direct
+                        && !seen.contains(&target)
+                        && work.len() < HANDLER_SCAN_LIMIT
+                    {
                         work.push(target);
                     }
                 }
@@ -1012,14 +1133,13 @@ fn scan_handler(image: &CodeImage<'_>, slots: &BTreeMap<u64, String>, va: u64) -
 
 /// Records `rva` as code-or-diagnostic.
 fn check_code(image: &CodeImage<'_>, rva: u32, diags: &mut Diags<'_>) {
-    let va = image.base().saturating_add(u64::from(rva));
-    if image.region_of(va) != Region::Code {
+    if !is_code(image, rva) {
         diags.push(rva, EhDiagnosticKind::NotCode);
     }
 }
 
 fn is_code(image: &CodeImage<'_>, rva: u32) -> bool {
-    image.region_of(image.base().saturating_add(u64::from(rva))) == Region::Code
+    rva_to_va(image.base(), rva).is_some_and(|va| image.region_of(va) == Region::Code)
 }
 
 /// `__C_specific_handler` scope table at `rva`.
@@ -1037,30 +1157,48 @@ fn parse_scope_table(
         diags.push(rva, EhDiagnosticKind::TooLarge);
         return LanguageData::None;
     };
-    let Some(bytes) = rva.checked_add(4).and_then(|at| reader.read(at, n * 16)) else {
+    if n == 0 {
+        return LanguageData::ScopeTable(Vec::new());
+    }
+    let Some(byte_len) = n.checked_mul(SCOPE_RECORD_LEN) else {
+        diags.push(rva, EhDiagnosticKind::TooLarge);
+        return LanguageData::None;
+    };
+    let Some(records_rva) = rva.checked_add(SCOPE_TABLE_HEADER_LEN) else {
         diags.push(rva, EhDiagnosticKind::Truncated);
         return LanguageData::None;
     };
-    let field = |i: usize, f: usize| {
-        let at = i * 16 + f * 4;
-        u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+    let Some(bytes) = reader.read(records_rva, byte_len) else {
+        diags.push(rva, EhDiagnosticKind::Truncated);
+        return LanguageData::None;
     };
-    let mut records = Vec::with_capacity(n);
-    for i in 0..n {
-        let (begin, end, handler, jump_target) =
-            (field(i, 0), field(i, 1), field(i, 2), field(i, 3));
+    let size_of_image = reader.pe.optional.size_of_image;
+    let mut records = Vec::with_capacity(n.min(INITIAL_TABLE_CAPACITY));
+    for chunk in bytes.chunks_exact(SCOPE_RECORD_LEN) {
+        let (Some(begin), Some(end), Some(raw_handler), Some(jump_target)) = (
+            le_u32(chunk, 0),
+            le_u32(chunk, 4),
+            le_u32(chunk, 8),
+            le_u32(chunk, 12),
+        ) else {
+            diags.push(rva, EhDiagnosticKind::Truncated);
+            return LanguageData::None;
+        };
+        if begin > end || end > size_of_image {
+            diags.push(begin, EhDiagnosticKind::NotCode);
+        }
         let handler = if jump_target == 0 {
-            check_code(image, handler, diags);
-            ScopeHandler::Finally(handler)
+            check_code(image, raw_handler, diags);
+            ScopeHandler::Finally(raw_handler)
         } else {
             check_code(image, jump_target, diags);
-            if is_code(image, handler) {
-                ScopeHandler::Filter(handler)
+            if is_code(image, raw_handler) {
+                ScopeHandler::Filter(raw_handler)
             } else {
-                if handler != EXCEPTION_EXECUTE_HANDLER {
-                    diags.push(handler, EhDiagnosticKind::NotCode);
+                if raw_handler != EXCEPTION_EXECUTE_HANDLER {
+                    diags.push(raw_handler, EhDiagnosticKind::NotCode);
                 }
-                ScopeHandler::Constant(handler)
+                ScopeHandler::Constant(raw_handler)
             }
         };
         records.push(ScopeRecord {
@@ -1081,6 +1219,10 @@ fn read_records(
     size: usize,
     diags: &mut Diags<'_>,
 ) -> Option<Vec<Vec<u32>>> {
+    if size == 0 || !size.is_multiple_of(4) {
+        diags.push(rva, EhDiagnosticKind::Truncated);
+        return None;
+    }
     let Some(n) = count(raw_count) else {
         diags.push(rva, EhDiagnosticKind::TooLarge);
         return None;
@@ -1088,23 +1230,23 @@ fn read_records(
     if n == 0 {
         return Some(Vec::new());
     }
-    let Some(bytes) = reader.read(rva, n * size) else {
+    let Some(byte_len) = n.checked_mul(size) else {
+        diags.push(rva, EhDiagnosticKind::TooLarge);
+        return None;
+    };
+    let Some(bytes) = reader.read(rva, byte_len) else {
         diags.push(rva, EhDiagnosticKind::Truncated);
         return None;
     };
-    Some(
-        bytes
-            .chunks_exact(size)
-            .map(|chunk| {
-                (0..size / 4)
-                    .map(|i| {
-                        let b = &chunk[4 * i..4 * i + 4];
-                        u32::from_le_bytes([b[0], b[1], b[2], b[3]])
-                    })
-                    .collect()
-            })
-            .collect(),
-    )
+    let mut out = Vec::with_capacity(n.min(INITIAL_TABLE_CAPACITY));
+    for chunk in bytes.chunks_exact(size) {
+        let mut fields = Vec::with_capacity(size / 4);
+        for word in chunk.chunks_exact(4) {
+            fields.push(le_u32(word, 0)?);
+        }
+        out.push(fields);
+    }
+    Some(out)
 }
 
 /// `__CxxFrameHandler3`: the data is the RVA of a `FuncInfo`.
@@ -1127,18 +1269,35 @@ fn parse_fh3(
         diags.push(rva, EhDiagnosticKind::UnknownMagic);
         return LanguageData::None;
     }
-    let fields = 8 + (magic - FH3_MAGIC_MIN) as usize;
-    let Some(header) = reader.read(rva, fields * 4) else {
+    let Some(fields) = magic
+        .checked_sub(FH3_MAGIC_MIN)
+        .and_then(|d| usize::try_from(d).ok())
+        .and_then(|d| 8usize.checked_add(d))
+    else {
         diags.push(rva, EhDiagnosticKind::Truncated);
         return LanguageData::None;
     };
-    let f = |i: usize| {
-        u32::from_le_bytes([
-            header[4 * i],
-            header[4 * i + 1],
-            header[4 * i + 2],
-            header[4 * i + 3],
-        ])
+    let Some(header_len) = fields.checked_mul(4) else {
+        diags.push(rva, EhDiagnosticKind::Truncated);
+        return LanguageData::None;
+    };
+    let Some(header) = reader.read(rva, header_len) else {
+        diags.push(rva, EhDiagnosticKind::Truncated);
+        return LanguageData::None;
+    };
+    let f = |i: usize| i.checked_mul(4).and_then(|off| le_u32(header, off));
+    let (
+        Some(max_state),
+        Some(unwind_rva),
+        Some(n_try),
+        Some(try_rva),
+        Some(n_ip),
+        Some(ip_rva),
+        Some(unwind_help),
+    ) = (f(1), f(2), f(3), f(4), f(5), f(6), f(7))
+    else {
+        diags.push(rva, EhDiagnosticKind::Truncated);
+        return LanguageData::None;
     };
     let mut info = FuncInfo3 {
         rva,
@@ -1147,12 +1306,10 @@ fn parse_fh3(
         unwind_map: Vec::new(),
         try_blocks: Vec::new(),
         ip_to_state: Vec::new(),
-        unwind_help: f(7) as i32,
-        es_type_list: if fields > 8 { f(8) } else { 0 },
-        eh_flags: if fields > 9 { f(9) } else { 0 },
+        unwind_help: unwind_help as i32,
+        es_type_list: if fields > 8 { f(8).unwrap_or(0) } else { 0 },
+        eh_flags: if fields > 9 { f(9).unwrap_or(0) } else { 0 },
     };
-    let (max_state, unwind_rva, n_try, try_rva, n_ip, ip_rva) =
-        (f(1), f(2), f(3), f(4), f(5), f(6));
 
     if let Some(records) = read_records(reader, unwind_rva, max_state, 8, diags) {
         info.unwind_map = records
@@ -1325,7 +1482,7 @@ fn parse_unwind_map4(
         return Vec::new();
     };
     // (entry start offset, next offset, entry)
-    let mut raw = Vec::with_capacity(n);
+    let mut raw = Vec::with_capacity(bounded_capacity(n, s.remaining(), 1));
     for _ in 0..n {
         let start = s.pos;
         let parsed = (|| {
@@ -1345,8 +1502,9 @@ fn parse_unwind_map4(
                 UnwindKind4::Funclet => action = s.int()?,
                 UnwindKind4::None => {}
             }
+            let next_offset = usize::try_from(next_and_type >> 2).ok()?;
             Some((
-                next_and_type >> 2,
+                next_offset,
                 UnwindEntry4 {
                     kind,
                     next_state: -1,
@@ -1362,7 +1520,7 @@ fn parse_unwind_map4(
         if entry.kind != UnwindKind4::None {
             check_code(image, entry.action, diags);
         }
-        raw.push((start, next_offset as usize, entry));
+        raw.push((start, next_offset, entry));
     }
     // `nextOffset` counts bytes back from the start of the entry to the start of the entry of
     // the next state; landing on the start of the map (the entry count) ends the chain
@@ -1372,7 +1530,10 @@ fn parse_unwind_map4(
         .map(|(start, next_offset, mut entry)| {
             let link = match start.checked_sub(next_offset) {
                 Some(0) => Some(-1),
-                Some(at) if next_offset != 0 => starts.binary_search(&at).ok().map(|s| s as i32),
+                Some(at) if next_offset != 0 => starts
+                    .binary_search(&at)
+                    .ok()
+                    .and_then(|s| i32::try_from(s).ok()),
                 _ => None,
             };
             match link {
@@ -1402,7 +1563,7 @@ fn parse_try_map4(
         diags.push(rva, EhDiagnosticKind::TooLarge);
         return Vec::new();
     };
-    let mut blocks = Vec::with_capacity(n);
+    let mut blocks = Vec::with_capacity(bounded_capacity(n, s.remaining(), 7));
     for _ in 0..n {
         let parsed = (|| {
             Some(TryBlock4 {
@@ -1441,7 +1602,7 @@ fn parse_handlers4(
         diags.push(rva, EhDiagnosticKind::TooLarge);
         return Vec::new();
     };
-    let mut handlers = Vec::with_capacity(n);
+    let mut handlers = Vec::with_capacity(bounded_capacity(n, s.remaining(), 5));
     for _ in 0..n {
         let mut reserved = false;
         let parsed = (|| {
@@ -1509,15 +1670,27 @@ fn parse_ip_map4(
         diags.push(rva, EhDiagnosticKind::TooLarge);
         return Vec::new();
     };
-    let mut out = Vec::with_capacity(n);
+    let mut out = Vec::with_capacity(bounded_capacity(n, s.remaining(), 2));
     let mut ip = function;
     for _ in 0..n {
-        let (Some(delta), Some(state)) = (s.unsigned(), s.unsigned()) else {
+        let (Some(delta), Some(raw_state)) = (s.unsigned(), s.unsigned()) else {
             diags.push(rva, EhDiagnosticKind::Truncated);
             return out;
         };
-        ip = ip.wrapping_add(delta);
-        out.push((ip, state.wrapping_sub(1) as i32));
+        let Some(next_ip) = ip.checked_add(delta) else {
+            diags.push(rva, EhDiagnosticKind::Truncated);
+            return out;
+        };
+        let state = if raw_state == 0 {
+            -1
+        } else if let Ok(s) = i32::try_from(raw_state - 1) {
+            s
+        } else {
+            diags.push(rva, EhDiagnosticKind::TooLarge);
+            return out;
+        };
+        ip = next_ip;
+        out.push((ip, state));
     }
     out
 }
@@ -2488,5 +2661,346 @@ mod tests {
         assert_eq!(image.eh.setjmp_slots, [va(fx.setjmp_slot)]);
         assert_eq!(image.eh.stats, eh.stats());
         assert_eq!(image.eh.stats.resume_targets, 5);
+    }
+
+    // ----- R52 hardening: bounds, checked RVA math, OOM prevention & determinism ---------------
+
+    #[test]
+    fn scope_table_huge_and_truncated_counts_never_oom_or_panic() {
+        // Huge counts that exceed MAX_TABLE_ENTRIES or would overflow `n * 16` in u32.
+        for huge in [u32::MAX, 0x1000_0000, MAX_TABLE_ENTRIES + 1] {
+            let mut fx = fixture();
+            put(&mut fx.file, UNWIND_SEH + 12, &le(huge));
+            let eh = parse(&fx.file);
+            assert_eq!(
+                single_diag(&eh, F_SEH),
+                [(UNWIND_SEH + 12, EhDiagnosticKind::TooLarge)],
+                "count={huge:#x}"
+            );
+            assert_eq!(function(&eh, F_SEH).data, LanguageData::None);
+        }
+
+        // Count right at MAX_TABLE_ENTRIES (65536): allowed by cap, but truncated in `.rdata`;
+        // must fail bounds check without OOM pre-allocation.
+        let mut fx = fixture();
+        put(&mut fx.file, UNWIND_SEH + 12, &le(MAX_TABLE_ENTRIES));
+        let eh = parse(&fx.file);
+        assert_eq!(
+            single_diag(&eh, F_SEH),
+            [(UNWIND_SEH + 12, EhDiagnosticKind::Truncated)]
+        );
+        assert_eq!(function(&eh, F_SEH).data, LanguageData::None);
+
+        // Truncated scope table near the end of `.rdata` (0x2800): claims 2 records (32 bytes)
+        // when only 20 bytes remain after the count field.
+        let mut fx = fixture();
+        let pe = Pe64::parse(&fx.file).unwrap();
+        let mut dir = ExceptionDirectory::from_pe(&pe, &fx.file);
+        put(&mut fx.file, 0x27e8, &le(2));
+        for entry in &mut dir.entries {
+            if entry.function.begin == F_SEH {
+                entry.unwind.as_mut().unwrap().handler.as_mut().unwrap().data_rva = 0x27e8;
+            }
+        }
+        let eh = EhMetadata::from_pe(&pe, &fx.file, &dir);
+        assert_eq!(
+            single_diag(&eh, F_SEH),
+            [(0x27e8, EhDiagnosticKind::Truncated)]
+        );
+        assert_eq!(function(&eh, F_SEH).data, LanguageData::None);
+
+        // Empty (0-record) scope table sitting right at the last 4 bytes of `.rdata` (`0x27fc`)
+        // must succeed without reading past section end.
+        let mut fx = fixture();
+        put(&mut fx.file, 0x27fc, &le(0));
+        let pe = Pe64::parse(&fx.file).unwrap();
+        let mut dir = ExceptionDirectory::from_pe(&pe, &fx.file);
+        for entry in &mut dir.entries {
+            if entry.function.begin == F_SEH {
+                entry.unwind.as_mut().unwrap().handler.as_mut().unwrap().data_rva = 0x27fc;
+            }
+        }
+        let eh = EhMetadata::from_pe(&pe, &fx.file, &dir);
+        assert!(single_diag(&eh, F_SEH).is_empty());
+        assert_eq!(function(&eh, F_SEH).data, LanguageData::ScopeTable(vec![]));
+    }
+
+    #[test]
+    fn scope_table_overflowing_and_out_of_bounds_rvas_are_diagnosed() {
+        // 1) `data_rva` near `u32::MAX` so `rva.checked_add(4)` overflows.
+        let fx = fixture();
+        let pe = Pe64::parse(&fx.file).unwrap();
+        let mut dir = ExceptionDirectory::from_pe(&pe, &fx.file);
+        for entry in &mut dir.entries {
+            if entry.function.begin == F_SEH {
+                entry.unwind.as_mut().unwrap().handler.as_mut().unwrap().data_rva = u32::MAX - 2;
+            }
+        }
+        let eh = EhMetadata::from_pe(&pe, &fx.file, &dir);
+        assert_eq!(
+            single_diag(&eh, F_SEH),
+            [(u32::MAX - 2, EhDiagnosticKind::Truncated)]
+        );
+        assert_eq!(function(&eh, F_SEH).data, LanguageData::None);
+
+        // 2) Inverted scope range (`begin > end`), out-of-image `end`, and `u32::MAX` handler /
+        //    jump_target RVAs.
+        let mut fx = fixture();
+        let bad_scopes: Vec<u8> = [
+            le(2),
+            // Inverted range + overflowing jump target + overflowing filter.
+            le(F_SEH + 0x10),
+            le(F_SEH + 0x04),
+            le(u32::MAX),
+            le(u32::MAX),
+            // Out-of-image end + overflowing finally handler.
+            le(F_SEH + 0x02),
+            le(u32::MAX),
+            le(u32::MAX),
+            le(0),
+        ]
+        .concat();
+        put(
+            &mut fx.file,
+            UNWIND_SEH,
+            &unwind_bytes(
+                UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER,
+                &trailer(THUNK_SEH, &bad_scopes),
+            ),
+        );
+        let pe = Pe64::parse(&fx.file).unwrap();
+        let dir = ExceptionDirectory::from_pe(&pe, &fx.file);
+        let eh = EhMetadata::from_pe(&pe, &fx.file, &dir);
+        let diags = single_diag(&eh, F_SEH);
+        assert!(diags.contains(&(F_SEH + 0x10, EhDiagnosticKind::NotCode)));
+        assert!(diags.contains(&(F_SEH + 0x02, EhDiagnosticKind::NotCode)));
+        assert!(diags.contains(&(u32::MAX, EhDiagnosticKind::NotCode)));
+        // Non-code targets must never be seeded into discovery.
+        let mut image = CodeImage::from_pe(&pe, &fx.file);
+        dir.seed(&mut image);
+        eh.seed(&mut image);
+        assert!(
+            !image
+                .eh
+                .resume_targets
+                .iter()
+                .any(|&(owner, _)| owner == BASE + u64::from(F_SEH))
+        );
+
+        // 3) Extreme `image_base` near `u64::MAX` where `base + rva` overflows `u64`:
+        //    must not panic or clamp to `u64::MAX`.
+        let fx = fixture();
+        let mut pe = Pe64::parse(&fx.file).unwrap();
+        let dir = ExceptionDirectory::from_pe(&pe, &fx.file);
+        pe.optional.image_base = u64::MAX - 0x100;
+        let eh = EhMetadata::from_pe(&pe, &fx.file, &dir);
+        let mut image = CodeImage::from_pe(&pe, &fx.file);
+        eh.seed(&mut image);
+        assert!(image.eh.resume_targets.is_empty());
+        assert!(image.eh.setjmp_slots.is_empty());
+    }
+
+    #[test]
+    fn scope_table_duplicates_and_permutations_yield_canonical_outputs() {
+        let build = |records: &[[u32; 4]]| {
+            let mut fx = fixture();
+            let mut raw = Vec::new();
+            raw.extend_from_slice(&le(records.len() as u32));
+            for rec in records {
+                for &word in rec {
+                    raw.extend_from_slice(&le(word));
+                }
+            }
+            // Place the custom scope table at a roomy `.rdata` slot (`0x2780`) so 6 records fit.
+            put(&mut fx.file, 0x2780, &raw);
+            let pe = Pe64::parse(&fx.file).unwrap();
+            let mut dir = ExceptionDirectory::from_pe(&pe, &fx.file);
+            for entry in &mut dir.entries {
+                if entry.function.begin == F_SEH {
+                    entry.unwind.as_mut().unwrap().handler.as_mut().unwrap().data_rva = 0x2780;
+                }
+            }
+            let eh = EhMetadata::from_pe(&pe, &fx.file, &dir);
+            let mut image = CodeImage::from_pe(&pe, &fx.file);
+            dir.seed(&mut image);
+            eh.seed(&mut image);
+            (eh, image.entry_points, image.eh)
+        };
+
+        let r0 = [F_SEH + 2, F_SEH + 8, SEH_FILTER, F_SEH + 0x10];
+        let r1 = [F_SEH + 2, F_SEH + 8, EXCEPTION_EXECUTE_HANDLER, F_SEH + 0x14];
+        let r2 = [F_SEH + 8, F_SEH + 0xc, SEH_FINALLY, 0];
+
+        let (eh_orig, ep_orig, seeds_orig) = build(&[r0, r1, r2]);
+        let (eh_perm, ep_perm, seeds_perm) = build(&[r2, r1, r0]);
+        let (eh_dups, ep_dups, seeds_dups) = build(&[r2, r0, r2, r1, r0, r1]);
+
+        let expected_funclets = vec![
+            (SEH_FILTER, FuncletKind::Filter),
+            (SEH_FINALLY, FuncletKind::Finally),
+        ];
+        let expected_resumes = vec![
+            (F_SEH + 0x10, ResumeKind::ExceptBody),
+            (F_SEH + 0x14, ResumeKind::ExceptBody),
+        ];
+
+        for eh in [&eh_orig, &eh_perm, &eh_dups] {
+            let f = function(eh, F_SEH);
+            assert_eq!(f.funclets(), expected_funclets);
+            assert_eq!(f.resume_targets(), expected_resumes);
+            assert_eq!(eh.funclets(), eh_orig.funclets());
+            assert_eq!(eh.resume_targets(), eh_orig.resume_targets());
+            assert_eq!(eh.stats(), eh_orig.stats());
+        }
+        assert_eq!(ep_orig, ep_perm);
+        assert_eq!(ep_orig, ep_dups);
+        assert_eq!(seeds_orig, seeds_perm);
+        assert_eq!(seeds_orig, seeds_dups);
+    }
+
+    #[test]
+    fn permuted_and_duplicate_pdata_entries_yield_identical_eh_metadata() {
+        let fx = fixture();
+        let pe = Pe64::parse(&fx.file).unwrap();
+        let dir = ExceptionDirectory::from_pe(&pe, &fx.file);
+        let eh_canon = EhMetadata::from_pe(&pe, &fx.file, &dir);
+
+        // Reverse entry order.
+        let mut dir_rev = dir.clone();
+        dir_rev.entries.reverse();
+        let eh_rev = EhMetadata::from_pe(&pe, &fx.file, &dir_rev);
+
+        // Rotate and duplicate every entry.
+        let mut dir_dup = dir.clone();
+        dir_dup.entries.rotate_left(3);
+        let cloned = dir_dup.entries.clone();
+        dir_dup.entries.extend(cloned);
+        let eh_dup = EhMetadata::from_pe(&pe, &fx.file, &dir_dup);
+
+        assert_eq!(eh_canon, eh_rev);
+        assert_eq!(eh_canon, eh_dup);
+        assert!(
+            eh_canon
+                .functions
+                .windows(2)
+                .all(|w| w[0].begin < w[1].begin)
+        );
+        assert!(
+            eh_canon
+                .unrecognised
+                .windows(2)
+                .all(|w| w[0] < w[1])
+        );
+    }
+
+    #[test]
+    fn fh4_overflowing_ip_delta_and_huge_truncated_tables_never_oom_or_panic() {
+        // 1) IP-to-state delta that overflows `u32` (`function + u32::MAX`).
+        let mut fx = fixture();
+        put(&mut fx.file, FH4_IP, &[c(1), c(u32::MAX), c(1)].concat());
+        let eh = parse(&fx.file);
+        assert_eq!(
+            single_diag(&eh, F_FH4),
+            [(FH4_IP, EhDiagnosticKind::Truncated)]
+        );
+        let LanguageData::Cxx4(info) = &function(&eh, F_FH4).data else {
+            panic!("FH4 data");
+        };
+        assert!(info.ip_to_state.is_empty());
+
+        // 2) IP-to-state raw state exceeding `i32::MAX + 1`.
+        let mut fx = fixture();
+        put(&mut fx.file, FH4_IP, &[c(1), c(0), c(u32::MAX)].concat());
+        let eh = parse(&fx.file);
+        assert_eq!(
+            single_diag(&eh, F_FH4),
+            [(FH4_IP, EhDiagnosticKind::TooLarge)]
+        );
+
+        // 3) Function-relative continuation offset overflowing `u32`.
+        let mut fx = fixture();
+        let bad_handler = [
+            c(1),
+            vec![1 << FH4_HANDLER_CONT_SHIFT],
+            le(F_CATCH).to_vec(),
+            c(u32::MAX),
+        ]
+        .concat();
+        put(&mut fx.file, FH4_HANDLERS, &bad_handler);
+        let eh = parse(&fx.file);
+        assert_eq!(
+            single_diag(&eh, F_FH4),
+            [(FH4_HANDLERS, EhDiagnosticKind::Truncated)]
+        );
+
+        // 4) Unwind map / try map / handler array / IP map each claiming MAX_TABLE_ENTRIES right
+        //    near the end of `.rdata` (only a few bytes left) must truncate cleanly without OOM.
+        let mut fx = fixture();
+        let near_end = 0x27f8;
+        put(&mut fx.file, near_end, &c(MAX_TABLE_ENTRIES));
+        put(&mut fx.file, FH4_INFO + 1, &le(near_end));
+        put(&mut fx.file, FH4_INFO + 5, &le(near_end));
+        put(&mut fx.file, FH4_INFO + 9, &le(near_end));
+        let eh = parse(&fx.file);
+        let diags = single_diag(&eh, F_FH4);
+        assert_eq!(
+            diags,
+            [
+                (near_end, EhDiagnosticKind::Truncated),
+                (near_end, EhDiagnosticKind::Truncated),
+                (near_end, EhDiagnosticKind::Truncated),
+            ]
+        );
+    }
+
+    #[test]
+    fn fh3_overflowing_record_tables_and_truncated_bounds() {
+        // 1) `max_state = MAX_TABLE_ENTRIES` at `0x27f8` (truncated, must not OOM) and
+        //    `unwind_rva` near `u32::MAX` (RVA + byte_len overflows `u32`).
+        let mut fx = fixture();
+        put(&mut fx.file, FH3_INFO + 4, &le(MAX_TABLE_ENTRIES));
+        put(&mut fx.file, FH3_INFO + 8, &le(0x27f8));
+        put(&mut fx.file, FH3_INFO + 12, &le(2));
+        put(&mut fx.file, FH3_INFO + 16, &le(u32::MAX - 4));
+        // Zero-count IP map with bogus RVA must still succeed with empty `ip_to_state`.
+        put(&mut fx.file, FH3_INFO + 20, &le(0));
+        put(&mut fx.file, FH3_INFO + 24, &le(u32::MAX));
+        let eh = parse(&fx.file);
+        assert_eq!(
+            single_diag(&eh, F_FH3),
+            [
+                (0x27f8, EhDiagnosticKind::Truncated),
+                (u32::MAX - 4, EhDiagnosticKind::Truncated),
+            ]
+        );
+        let LanguageData::Cxx3(info) = &function(&eh, F_FH3).data else {
+            panic!("FH3 data");
+        };
+        assert!(info.unwind_map.is_empty());
+        assert!(info.try_blocks.is_empty());
+        assert!(info.ip_to_state.is_empty());
+    }
+
+    #[test]
+    fn reader_clamps_to_section_virtual_size() {
+        let fx = fixture();
+        let pe = Pe64::parse(&fx.file).unwrap();
+        let dir = ExceptionDirectory::from_pe(&pe, &fx.file);
+        // Shrink `.rdata`'s VirtualSize so the SEH scope table (at `UNWIND_SEH + 12 = 0x25cc`,
+        // spanning 52 bytes to `0x2600`) crosses the virtual section boundary even though the
+        // backing raw bytes still exist in the file buffer.
+        let mut pe_shrunk = pe;
+        let rdata = pe_shrunk
+            .sections
+            .iter_mut()
+            .find(|s| s.virtual_address == 0x2000)
+            .expect(".rdata section");
+        rdata.virtual_size = 0x5e0; // ends at RVA 0x25e0, mid-way through the 3 scope records
+        let eh = EhMetadata::from_pe(&pe_shrunk, &fx.file, &dir);
+        assert_eq!(
+            single_diag(&eh, F_SEH),
+            [(UNWIND_SEH + 12, EhDiagnosticKind::Truncated)]
+        );
+        assert_eq!(function(&eh, F_SEH).data, LanguageData::None);
     }
 }
