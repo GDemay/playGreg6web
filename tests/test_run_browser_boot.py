@@ -10,7 +10,9 @@ import sys
 import tempfile
 import threading
 import unittest
+import zlib
 from contextlib import redirect_stderr, redirect_stdout
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -1349,6 +1351,447 @@ class BootFlagsAndOptionsTests(unittest.TestCase):
             self.assertEqual(rep_none["summary"]["realPackDrawCount"], 3)
             self.assertEqual(rep_none["summary"]["fallbackDrawCount"], 0)
             self.assertEqual(rep_none["summary"]["validationErrorCount"], 0)
+
+
+def _make_synthetic_rgb_png(
+    width: int,
+    height: int,
+    pixel_fn,
+) -> bytes:
+    """Build a valid 8-bit RGB PNG using only Python stdlib (no Pillow required)."""
+    def _chunk(chunk_type: bytes, data: bytes) -> bytes:
+        crc = zlib.crc32(chunk_type + data) & 0xFFFFFFFF
+        return struct.pack("!I", len(data)) + chunk_type + data + struct.pack("!I", crc)
+
+    raw_rows = bytearray()
+    for y in range(height):
+        raw_rows.append(0)  # filter type 0 (None)
+        for x in range(width):
+            r, g, b = pixel_fn(x, y)
+            raw_rows.extend((r & 0xFF, g & 0xFF, b & 0xFF))
+
+    ihdr = struct.pack("!IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _chunk(b"IHDR", ihdr)
+        + _chunk(b"IDAT", zlib.compress(bytes(raw_rows)))
+        + _chunk(b"IEND", b"")
+    )
+
+
+class _FakePilImage:
+    """Pure-Python PIL.Image stand-in that inspects synthetic PNG payloads without Pillow."""
+
+    def __init__(self, width: int, height: int, pixels: list[tuple[int, int, int]]) -> None:
+        self.size = (width, height)
+        self._pixels = pixels
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def convert(self, mode: str):
+        assert mode == "RGB"
+        return self
+
+    def crop(self, box: tuple[int, int, int, int]):
+        left, top, right, bottom = box
+        w, _h = self.size
+        cropped: list[tuple[int, int, int]] = []
+        for y in range(top, bottom):
+            row_start = y * w
+            for x in range(left, right):
+                cropped.append(self._pixels[row_start + x])
+        return _FakePilImage(right - left, bottom - top, cropped)
+
+    def getextrema(self):
+        if not self._pixels:
+            return ((0, 0), (0, 0), (0, 0))
+        rs = [p[0] for p in self._pixels]
+        gs = [p[1] for p in self._pixels]
+        bs = [p[2] for p in self._pixels]
+        return ((min(rs), max(rs)), (min(gs), max(gs)), (min(bs), max(bs)))
+
+
+class _FakePilModule:
+    """Minimal PIL.Image module replacement decoding uncompressed/zlib 8-bit RGB PNGs."""
+
+    @staticmethod
+    def open(buf: io.BytesIO) -> _FakePilImage:
+        data = buf.read()
+        if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise OSError("not a PNG")
+        pos = 8
+        width = height = 0
+        idat = bytearray()
+        while pos + 8 <= len(data):
+            length, chunk_type = struct.unpack("!I4s", data[pos : pos + 8])
+            pos += 8
+            payload = data[pos : pos + length]
+            pos += length + 4  # skip CRC
+            if chunk_type == b"IHDR":
+                width, height = struct.unpack("!II", payload[:8])
+            elif chunk_type == b"IDAT":
+                idat.extend(payload)
+            elif chunk_type == b"IEND":
+                break
+        raw = zlib.decompress(bytes(idat))
+        stride = 1 + width * 3
+        pixels: list[tuple[int, int, int]] = []
+        for y in range(height):
+            row = raw[y * stride + 1 : (y + 1) * stride]
+            for x in range(width):
+                off = x * 3
+                pixels.append((row[off], row[off + 1], row[off + 2]))
+        return _FakePilImage(width, height, pixels)
+
+
+class CaptureFramesDumpPipelinesAndPresetsTests(unittest.TestCase):
+    def test_t43_flag_defaults_and_validation(self):
+        parser = rbb.build_arg_parser()
+        args = parser.parse_args([])
+        self.assertIsNone(args.capture_frames)
+        self.assertEqual(args.capture_interval_sec, 2.0)
+        self.assertFalse(args.dump_pipelines)
+
+        # Bare --capture-frames preserves legacy boolean behavior; with DIR captures path
+        bare = parser.parse_args(["--capture-frames"])
+        self.assertIs(bare.capture_frames, True)
+        with_dir = parser.parse_args(["--capture-frames", "work/frames", "--capture-interval-sec", "0.5", "--dump-pipelines"])
+        self.assertEqual(with_dir.capture_frames, "work/frames")
+        self.assertEqual(with_dir.capture_interval_sec, 0.5)
+        self.assertTrue(with_dir.dump_pipelines)
+
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            for bad_args in (
+                ("--capture-interval-sec", "0"),
+                ("--capture-interval-sec", "-2.5"),
+                ("--capture-interval-sec", "nan"),
+                ("--capture-interval-sec", "inf"),
+                ("--capture-interval-sec", "-inf"),
+                ("--capture-frames", ""),
+                ("--capture-frames", "   "),
+            ):
+                code, _, _, _, _ = fx.run_cli("--smoke", "--dry-run", *bad_args)
+                self.assertEqual(code, 2, f"expected exit 2 for {bad_args}")
+
+            # Tracked repository directories are refused for --capture-frames (same guard as boot-options)
+            for tracked_dir in (fx.repo / "web", fx.repo / "tools", fx.repo):
+                code, _, err_text, _, _ = fx.run_cli(
+                    "--smoke",
+                    "--dry-run",
+                    "--capture-frames",
+                    str(tracked_dir),
+                )
+                self.assertEqual(code, 2, f"expected tracked dir refusal for {tracked_dir}")
+                self.assertIn("tracked repository directory", err_text)
+
+            # Passing a regular file path as --capture-frames fails cleanly
+            file_path = fx.repo / "work" / "not-a-dir.txt"
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_text("hi", encoding="utf-8")
+            code, _, err_text, _, _ = fx.run_cli(
+                "--smoke",
+                "--dry-run",
+                "--capture-frames",
+                str(file_path),
+            )
+            self.assertEqual(code, 2)
+            self.assertIn("not a directory", err_text)
+
+    def test_input_script_accepts_new_presets(self):
+        for preset in ("start-screen", "menu-flow", "calibration-skip", "intro-watch"):
+            self.assertEqual(rbb.sanitize_input_script_preset(preset), preset)
+            self.assertEqual(rbb.sanitize_input_script_preset(f"  {preset.upper()}  "), preset)
+            self.assertEqual(
+                rbb.build_target_url("127.0.0.1", 8080, input_script=preset),
+                f"http://127.0.0.1:8080/?inputScript={preset}",
+            )
+
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            for preset in ("menu-flow", "calibration-skip", "intro-watch"):
+                code, out, err, _, _ = fx.run_cli(
+                    "--smoke",
+                    "--dry-run",
+                    "--name",
+                    f"dry-{preset}",
+                    "--input-script",
+                    preset,
+                )
+                self.assertEqual(code, 0, err)
+                payload = json.loads(out)
+                self.assertEqual(payload["input_script"], preset)
+                self.assertEqual(payload["inputScript"], preset)
+                self.assertIn(f"inputScript={preset}", payload["url"])
+
+    def test_dump_pipelines_dry_run_live_staging_and_validation(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            # Dry-run records dumpPipelines: true without writing boot-options.json
+            code, out, err, _, _ = fx.run_cli(
+                "--trust-build",
+                "--dry-run",
+                "--name",
+                "dump-dry",
+                "--dump-pipelines",
+                "--report-to-log",
+            )
+            self.assertEqual(code, 0, err)
+            dry = json.loads(out)
+            self.assertTrue(dry["dumpPipelines"])
+            self.assertTrue(dry["dump_pipelines"])
+            self.assertEqual(
+                dry["boot_options"],
+                {"dump_pipelines_dir": "/pg6_dump", "report_to_log": True},
+            )
+            self.assertFalse(dry["boot_options_staging"]["staged"])
+            self.assertEqual(dry["boot_options_staging"]["action"], "plan_write")
+            self.assertFalse((fx.boot_dir / "boot-options.json").exists())
+
+            # Tracked boot-dir is refused when --dump-pipelines is set
+            code, _, err_text, _, _ = fx.run_cli(
+                "--trust-build",
+                "--dry-run",
+                "--boot-dir",
+                str(fx.repo / "web"),
+                "--dump-pipelines",
+            )
+            self.assertEqual(code, 2)
+            self.assertIn("tracked repository directory", err_text)
+
+            # Live real-game run stages dump_pipelines_dir into boot-options.json and records dumpPipelines
+            code, _, err, _, sessions = fx.run_cli(
+                "--trust-build",
+                "--name",
+                "dump-live",
+                "--dump-pipelines",
+            )
+            self.assertEqual(code, 0, err)
+            staged_path = fx.boot_dir / "boot-options.json"
+            self.assertTrue(staged_path.is_file())
+            self.assertEqual(
+                json.loads(staged_path.read_text(encoding="utf-8")),
+                {"dump_pipelines_dir": "/pg6_dump"},
+            )
+            self.assertEqual(sessions[0]["boot_options"], {"dump_pipelines_dir": "/pg6_dump"})
+
+            run_dir = fx.build / "runs" / "dump-live"
+            cmd_meta = json.loads((run_dir / "command.json").read_text(encoding="utf-8"))
+            report = json.loads((run_dir / "boot-report.json").read_text(encoding="utf-8"))
+            telemetry = json.loads((run_dir / "telemetry.json").read_text(encoding="utf-8"))
+            self.assertTrue(cmd_meta["dumpPipelines"])
+            self.assertTrue(cmd_meta["dump_pipelines"])
+            self.assertEqual(cmd_meta["boot_options"], {"dump_pipelines_dir": "/pg6_dump"})
+            self.assertEqual(report["boot_options"], {"dump_pipelines_dir": "/pg6_dump"})
+            self.assertEqual(telemetry["boot_options"], {"dump_pipelines_dir": "/pg6_dump"})
+
+            # Reject invalid dump_pipelines_dir values passed via --boot-options
+            for bad_json in (
+                '{"dump_pipelines_dir": ""}',
+                '{"dump_pipelines_dir": 123}',
+                '{"dump_pipelines_dir": "../escape"}',
+                '{"dump_pipelines_dir": "C:\\\\dump"}',
+            ):
+                code, _, _, _, _ = fx.run_cli("--smoke", "--dry-run", "--boot-options", bad_json)
+                self.assertEqual(code, 2, f"expected exit 2 for {bad_json}")
+
+    def test_check_canvas_non_black_pure_python_mock_and_optional_pillow(self):
+        all_black = _make_synthetic_rgb_png(420, 4, lambda x, y: (0, 0, 0))
+        sidebar_only = _make_synthetic_rgb_png(420, 4, lambda x, y: (255, 255, 255) if x < 410 else (0, 0, 0))
+        canvas_lit = _make_synthetic_rgb_png(420, 4, lambda x, y: (0, 200, 50) if x == 410 and y == 1 else (0, 0, 0))
+        too_narrow = _make_synthetic_rgb_png(410, 4, lambda x, y: (255, 255, 255))
+
+        # Pure-Python mock PIL module (always runs regardless of whether Pillow is installed)
+        self.assertFalse(rbb.check_canvas_non_black(all_black, pil_image_mod=_FakePilModule, _auto_import_pil=False))
+        self.assertFalse(rbb.check_canvas_non_black(sidebar_only, pil_image_mod=_FakePilModule, _auto_import_pil=False))
+        self.assertTrue(rbb.check_canvas_non_black(canvas_lit, pil_image_mod=_FakePilModule, _auto_import_pil=False))
+        self.assertFalse(rbb.check_canvas_non_black(too_narrow, pil_image_mod=_FakePilModule, _auto_import_pil=False))
+        self.assertIsNone(rbb.check_canvas_non_black(b"not-a-png", pil_image_mod=_FakePilModule, _auto_import_pil=False))
+
+        # Graceful skip when Pillow is unavailable
+        self.assertIsNone(rbb.check_canvas_non_black(canvas_lit, pil_image_mod=None, _auto_import_pil=False))
+        with mock.patch.object(rbb, "_import_pil_image", return_value=None):
+            self.assertIsNone(rbb.check_canvas_non_black(canvas_lit))
+
+        # If real Pillow is installed on this machine, verify real PIL produces identical results
+        real_pil = rbb._import_pil_image()
+        if real_pil is not None:
+            self.assertFalse(rbb.check_canvas_non_black(all_black, pil_image_mod=real_pil, _auto_import_pil=False))
+            self.assertFalse(rbb.check_canvas_non_black(sidebar_only, pil_image_mod=real_pil, _auto_import_pil=False))
+            self.assertTrue(rbb.check_canvas_non_black(canvas_lit, pil_image_mod=real_pil, _auto_import_pil=False))
+            self.assertFalse(rbb.check_canvas_non_black(too_narrow, pil_image_mod=real_pil, _auto_import_pil=False))
+            self.assertIsNone(rbb.check_canvas_non_black(b"\xff\xd8\xff\xd9", pil_image_mod=real_pil, _auto_import_pil=False))
+
+    def test_capture_frames_dir_png_session_with_and_without_pillow(self):
+        sidebar_only_png = _make_synthetic_rgb_png(420, 4, lambda x, y: (255, 255, 255) if x < 410 else (0, 0, 0))
+        canvas_lit_png = _make_synthetic_rgb_png(420, 4, lambda x, y: (32, 64, 128) if x >= 410 else (0, 0, 0))
+        frame_sequence = [sidebar_only_png, canvas_lit_png, canvas_lit_png]
+
+        class FakeProc:
+            returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = 0
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                self.returncode = -9
+
+        def run_mock_png_session(fx: RepoFixture, run_name: str, capture_dir: Path, pil_return: Any):
+            run_dir = fx.build / "runs" / run_name
+            run_dir.mkdir(parents=True)
+            shot_params: list[dict[str, Any]] = []
+            shot_idx = {"n": 0}
+            fake_clock = {"t": 1000.0}
+
+            class FakeCdp:
+                def __init__(self, ws_url: str) -> None:
+                    self.ws_url = ws_url
+
+                def connect(self):
+                    return None
+
+                def close(self):
+                    return None
+
+                def send(self, method: str, params=None, timeout=None):
+                    if method == "Runtime.evaluate":
+                        return {"result": {"value": make_sample_probe(presents=2, real_draws=5, fallback_draws=0)}}
+                    if method == "Page.captureScreenshot":
+                        shot_params.append(dict(params or {}))
+                        payload = frame_sequence[min(shot_idx["n"], len(frame_sequence) - 1)]
+                        shot_idx["n"] += 1
+                        return {"data": base64.b64encode(payload).decode("ascii")}
+                    return {}
+
+                def drain_events(self, timeout: float = 0.0):
+                    fake_clock["t"] += 0.1
+                    return []
+
+            with (
+                mock.patch.object(rbb, "_import_pil_image", return_value=pil_return),
+                mock.patch.object(rbb.time, "monotonic", side_effect=lambda: fake_clock["t"]),
+            ):
+                res = rbb.run_browser_session(
+                    repo=fx.repo,
+                    run_dir=run_dir,
+                    chrome_path=fx.chrome,
+                    port=0,
+                    boot_dir=None,
+                    game_dir=None,
+                    shaders_dir=None,
+                    duration_s=0.29,
+                    headless=True,
+                    smoke=True,
+                    send_input=False,
+                    capture_frames=True,
+                    capture_frames_dir=capture_dir,
+                    capture_interval_sec=0.1,
+                    frame_interval_s=1.0,
+                    encode_mp4=False,
+                    input_script="menu-flow",
+                    popen_fn=lambda cmd, **kw: FakeProc(),
+                    cdp_factory=FakeCdp,
+                    wait_server_fn=lambda *a, **k: {"status_code": 200, "coop": "same-origin", "coep": "require-corp"},
+                    wait_cdp_fn=lambda *a, **k: "ws://127.0.0.1:9222/devtools/page/1",
+                )
+            return res, shot_params
+
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+
+            # 1. With PIL available (via pure-Python _FakePilModule): captures PNGs and counts non-black x>=410 frames
+            cap_dir_pil = fx.repo / "work" / "frames-with-pil"
+            res_pil, params_pil = run_mock_png_session(fx, "cap-pil", cap_dir_pil, _FakePilModule)
+            self.assertTrue(res_pil.ok)
+            self.assertEqual(len(res_pil.captured_frames), 3)
+            self.assertTrue(all(p == {"format": "png"} for p in params_pil))
+            for fname in res_pil.captured_frames:
+                self.assertTrue(fname.endswith(".png"))
+                self.assertTrue((cap_dir_pil / fname).is_file())
+            # First frame is sidebar-only (black at x>=410), remaining 2 frames are canvas-lit
+            self.assertEqual(res_pil.non_black_canvas_frames, 2)
+            self.assertEqual(res_pil.capture_frames_dir, "work/frames-with-pil")
+
+            # Verify CLI wiring writes capturedFrames / nonBlackCanvasFrames across report, telemetry, command, digest
+            code, out, err, _, _ = fx.run_cli(
+                "--smoke",
+                "--name",
+                "cli-cap-pil",
+                "--input-script",
+                "menu-flow",
+                "--capture-frames",
+                str(cap_dir_pil),
+                "--capture-interval-sec",
+                "0.5",
+                "--dump-pipelines",
+                session_runner=lambda **kw: res_pil,
+            )
+            self.assertEqual(code, 0, err)
+            run_dir = fx.build / "runs" / "cli-cap-pil"
+            report = json.loads((run_dir / "boot-report.json").read_text(encoding="utf-8"))
+            telemetry = json.loads((run_dir / "telemetry.json").read_text(encoding="utf-8"))
+            cmd_meta = json.loads((run_dir / "command.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(report["summary"]["capturedFrames"], len(res_pil.captured_frames))
+            self.assertEqual(report["summary"]["nonBlackCanvasFrames"], len(res_pil.captured_frames) - 1)
+            self.assertEqual(report["summary"]["inputScript"], "menu-flow")
+            self.assertEqual(telemetry["summary"]["capturedFrames"], len(res_pil.captured_frames))
+            self.assertEqual(telemetry["summary"]["nonBlackCanvasFrames"], len(res_pil.captured_frames) - 1)
+            self.assertEqual(telemetry["capturedFrames"], len(res_pil.captured_frames))
+            self.assertEqual(telemetry["nonBlackCanvasFrames"], len(res_pil.captured_frames) - 1)
+            self.assertEqual(telemetry["capture_frames_dir"], "work/frames-with-pil")
+            self.assertEqual(cmd_meta["capturedFrames"], len(res_pil.captured_frames))
+            self.assertEqual(cmd_meta["nonBlackCanvasFrames"], len(res_pil.captured_frames) - 1)
+            self.assertEqual(cmd_meta["capture_frames_dir"], "work/frames-with-pil")
+            self.assertEqual(cmd_meta["capture_interval_sec"], 0.5)
+            self.assertTrue(cmd_meta["dumpPipelines"])
+            self.assertIn(f"captured_frames: {len(res_pil.captured_frames)} (non_black_canvas={len(res_pil.captured_frames) - 1})", out)
+            # Zero host path leaks
+            for fname in ("boot-report.json", "telemetry.json", "command.json", "digest.txt"):
+                self.assertNotIn(str(Path(d)), (run_dir / fname).read_text(encoding="utf-8"))
+
+            # 2. Without Pillow installed: still captures PNGs, gracefully sets nonBlackCanvasFrames to None
+            cap_dir_nopil = fx.repo / "work" / "frames-no-pil"
+            res_nopil, _ = run_mock_png_session(fx, "cap-nopil", cap_dir_nopil, None)
+            self.assertTrue(res_nopil.ok)
+            self.assertGreaterEqual(len(res_nopil.captured_frames), 1)
+            self.assertIsNone(res_nopil.non_black_canvas_frames)
+            self.assertTrue(any("Pillow" in w for w in res_nopil.warnings))
+
+            rep_nopil = rbb.build_boot_report(res_nopil, smoke=True, preset="smoke")
+            tel_nopil = rbb.build_telemetry_payload(res_nopil, smoke=True, preset="smoke", headless=True)
+            self.assertEqual(rep_nopil["summary"]["capturedFrames"], len(res_nopil.captured_frames))
+            self.assertIsNone(rep_nopil["summary"]["nonBlackCanvasFrames"])
+            self.assertEqual(tel_nopil["summary"]["capturedFrames"], len(res_nopil.captured_frames))
+            self.assertIsNone(tel_nopil["summary"]["nonBlackCanvasFrames"])
+            self.assertIn("non_black_canvas=skipped", rbb.digest(rep_nopil, 0))
+
+            # 3. encode_frames_to_mp4 also handles PNG frames
+            ffmpeg_cmds: list[list[str]] = []
+
+            def fake_ffmpeg(cmd, cwd, log, timeout):
+                ffmpeg_cmds.append(list(cmd))
+                Path(cmd[-1]).write_bytes(b"ftypmp42")
+                return 0
+
+            ok_mp4, warn_mp4 = rbb.encode_frames_to_mp4(
+                cap_dir_pil,
+                fx.repo / "work" / "out.mp4",
+                runner=fake_ffmpeg,
+                which_fn=lambda n: "ffmpeg" if n == "ffmpeg" else None,
+            )
+            self.assertTrue(ok_mp4, warn_mp4)
+            self.assertTrue(any("frame_%04d.png" in tok for tok in ffmpeg_cmds[0]))
 
 
 if __name__ == "__main__":
