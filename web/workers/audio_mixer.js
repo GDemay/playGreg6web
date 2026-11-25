@@ -47,6 +47,23 @@
     return value;
   }
 
+  function sanitizeFiniteNonNeg(value) {
+    return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
+  }
+
+  function sanitizeCount(value) {
+    return typeof value === 'number' && Number.isFinite(value) && value > 0
+      ? Math.floor(value)
+      : 0;
+  }
+
+  function sanitizeUnitLevel(value) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+      return 0;
+    }
+    return value > 1.0 ? 1.0 : value;
+  }
+
   function toUint8Array(input) {
     if (input instanceof Uint8Array) {
       return input;
@@ -1056,10 +1073,16 @@
       }
 
       const masterGain =
-        options.masterGain !== undefined ? options.masterGain : 1.0;
+        options.masterGain !== undefined
+          ? options.masterGain
+          : options.volume !== undefined
+            ? options.volume
+            : 1.0;
       if (typeof masterGain !== 'number' || !Number.isFinite(masterGain) || masterGain < 0) {
         throw new RangeError(`masterGain must be a non-negative finite number, got ${masterGain}`);
       }
+
+      const muted = Boolean(options.muted);
 
       const softClip =
         options.softClip !== undefined ? Boolean(options.softClip) : true;
@@ -1102,21 +1125,34 @@
             ? resolveRampFrames(options.rampFrames, sampleRate, 0)
             : 0;
 
+      const volumeRampFrames =
+        options.volumeRampFrames !== undefined
+          ? resolveRampFrames(options.volumeRampFrames, sampleRate, DEFAULT_GAIN_RAMP_FRAMES)
+          : options.muteRampFrames !== undefined
+            ? resolveRampFrames(options.muteRampFrames, sampleRate, DEFAULT_GAIN_RAMP_FRAMES)
+            : defaultGainRampFrames > 0
+              ? defaultGainRampFrames
+              : DEFAULT_GAIN_RAMP_FRAMES;
+
       const underrunRampFrames =
         options.underrunRampFrames !== undefined
           ? resolveRampFrames(options.underrunRampFrames, sampleRate, DEFAULT_UNDERRUN_RAMP_FRAMES)
           : DEFAULT_UNDERRUN_RAMP_FRAMES;
 
       const reuseOutputBuffer = Boolean(options.reuseOutputBuffer);
+      const initialEffectiveGain = muted ? 0.0 : masterGain;
 
       this.sampleRate = sampleRate;
       this.channels = DEFAULT_CHANNELS;
       this.maxVoices = maxVoices;
-      this._masterGain = masterGain;
-      this._masterGainTarget = masterGain;
+      this._muted = muted;
+      this._masterGainUnmuted = masterGain;
+      this._masterGain = initialEffectiveGain;
+      this._masterGainTarget = initialEffectiveGain;
       this._masterGainRampRemaining = 0;
       this._masterGainRampStep = 0.0;
       this._defaultGainRampFrames = defaultGainRampFrames;
+      this._volumeRampFrames = volumeRampFrames;
       this._underrunRampFrames = underrunRampFrames;
       this._reuseOutputBuffer = reuseOutputBuffer;
       this._softClip = softClip;
@@ -1127,10 +1163,12 @@
       this._finishedIds = [];
       this._nextVoiceId = 1;
 
-      // Pre-allocated Float32Array accumulation & scratch output buffers so hot
-      // mix passes perform zero per-quantum heap allocations in steady state.
+      // Pre-allocated Float32Array stereo bus accumulation & scratch output buffers
+      // so hot mix passes perform zero per-quantum heap allocations in steady state.
       const initialSamples = initialBufferFrames * DEFAULT_CHANNELS;
       this._mixScratch = new Float32Array(initialSamples);
+      this._busLeftScratch = this._mixScratch.subarray(0, initialBufferFrames);
+      this._busRightScratch = this._mixScratch.subarray(initialBufferFrames, initialSamples);
       this._outputScratch = new Float32Array(initialSamples);
       this._outputScratchView = this._outputScratch;
       this._outputScratchViewLen = initialSamples;
@@ -1140,11 +1178,18 @@
       this._emptyFloat32 = new Float32Array(0);
       this._scratchReallocations = 0;
 
+      // Per-quantum scalar scratch accumulators (zero heap objects per quantum).
+      this._quantumSanitized = 0;
+      this._quantumDownmixed = 0;
+      this._quantumResampled = 0;
+
       this._renderedFrames = 0;
       this._quantaMixed = 0;
+      this._zeroAllocMixQuanta = 0;
       this._downmixedFrames = 0;
       this._resampledFrames = 0;
       this._ringUnderrunCount = 0;
+      this._lastObservedRingUnderruns = 0;
       this._manualUnderrunQuanta = 0;
       this._underrunFadeOuts = 0;
       this._recoveryFadeIns = 0;
@@ -1154,10 +1199,18 @@
       this._pumpRecoveryFadeTotal = 0;
       this._lastOutL = 0.0;
       this._lastOutR = 0.0;
+      this._peakLeft = 0.0;
+      this._peakRight = 0.0;
       this._peakOutputLevel = 0.0;
+      this._rmsLeftSumSq = 0.0;
+      this._rmsRightSumSq = 0.0;
+      this._rmsFrames = 0;
+      this._clippedLeft = 0;
+      this._clippedRight = 0;
       this._clippedSamples = 0;
       this._softClippedSamples = 0;
       this._sanitizedNonFiniteSamples = 0;
+      this._gainRampsStarted = 0;
       this._activeVoicePeak = 0;
     }
 
@@ -1172,7 +1225,10 @@
       while (nextSamples < sampleCount) {
         nextSamples *= 2;
       }
+      const nextFrames = nextSamples >>> 1;
       this._mixScratch = new Float32Array(nextSamples);
+      this._busLeftScratch = this._mixScratch.subarray(0, nextFrames);
+      this._busRightScratch = this._mixScratch.subarray(nextFrames, nextSamples);
       this._outputScratch = new Float32Array(nextSamples);
       this._outputScratchView = this._outputScratch;
       this._outputScratchViewLen = nextSamples;
@@ -1249,6 +1305,31 @@
       return this._masterGain;
     }
 
+    get volume() {
+      return this._masterGainUnmuted;
+    }
+
+    get muted() {
+      return this._muted;
+    }
+
+    get effectiveGain() {
+      return this._masterGain;
+    }
+
+    _scheduleMasterGainRamp(target, frames) {
+      this._masterGainTarget = target;
+      if (frames <= 0 || this._masterGain === target) {
+        this._masterGain = target;
+        this._masterGainRampRemaining = 0;
+        this._masterGainRampStep = 0.0;
+      } else {
+        this._masterGainRampRemaining = frames;
+        this._masterGainRampStep = (target - this._masterGain) / frames;
+        this._gainRampsStarted += 1;
+      }
+    }
+
     setMasterGain(gain, rampFrames) {
       if (typeof gain !== 'number' || !Number.isFinite(gain)) {
         return this._masterGainTarget;
@@ -1259,16 +1340,79 @@
         this.sampleRate,
         this._defaultGainRampFrames
       );
-      this._masterGainTarget = target;
-      if (frames <= 0 || this._masterGain === target) {
-        this._masterGain = target;
-        this._masterGainRampRemaining = 0;
-        this._masterGainRampStep = 0.0;
-      } else {
-        this._masterGainRampRemaining = frames;
-        this._masterGainRampStep = (target - this._masterGain) / frames;
-      }
+      this._masterGainUnmuted = target;
+      const effectiveTarget = this._muted ? 0.0 : target;
+      this._scheduleMasterGainRamp(effectiveTarget, frames);
       return this._masterGainTarget;
+    }
+
+    /**
+     * Smoothly ramps the master bus gain to `targetGain` over `rampFrames`
+     * (defaults to `volumeRampFrames` / `DEFAULT_GAIN_RAMP_FRAMES`).
+     *
+     * @param {number} targetGain
+     * @param {number|object} [rampFrames]
+     * @returns {number}
+     */
+    rampMasterGain(targetGain, rampFrames) {
+      const resolved = resolveRampFrames(
+        rampFrames,
+        this.sampleRate,
+        this._volumeRampFrames
+      );
+      return this.setMasterGain(targetGain, resolved);
+    }
+
+    /**
+     * Sets the logical master volume with smooth linear per-sample gain ramping
+     * by default (`volumeRampFrames`, 64 frames @ 48 kHz) to prevent zipper noise
+     * and clicks. Pass `rampFrames = 0` to snap immediately.
+     *
+     * @param {number} volume Non-negative finite volume multiplier.
+     * @param {number|object} [rampFrames]
+     * @returns {number} Updated logical master volume.
+     */
+    setVolume(volume, rampFrames) {
+      if (typeof volume !== 'number' || !Number.isFinite(volume)) {
+        return this._masterGainUnmuted;
+      }
+      const target = volume < 0 ? 0.0 : volume;
+      const frames = resolveRampFrames(
+        rampFrames,
+        this.sampleRate,
+        this._volumeRampFrames
+      );
+      this._masterGainUnmuted = target;
+      if (!this._muted) {
+        this._scheduleMasterGainRamp(target, frames);
+      }
+      return this._masterGainUnmuted;
+    }
+
+    /**
+     * Mutes or unmutes the master bus using a smooth linear per-sample gain ramp
+     * by default (`volumeRampFrames`, 64 frames @ 48 kHz) so toggling mute never
+     * clicks or pops. Pass `rampFrames = 0` to snap immediately.
+     *
+     * @param {boolean} muted
+     * @param {number|object} [rampFrames]
+     * @returns {boolean} Updated mute state.
+     */
+    setMuted(muted, rampFrames) {
+      const nextMuted = Boolean(muted);
+      const frames = resolveRampFrames(
+        rampFrames,
+        this.sampleRate,
+        this._volumeRampFrames
+      );
+      this._muted = nextMuted;
+      const effectiveTarget = nextMuted ? 0.0 : this._masterGainUnmuted;
+      this._scheduleMasterGainRamp(effectiveTarget, frames);
+      return this._muted;
+    }
+
+    setMute(muted, rampFrames) {
+      return this.setMuted(muted, rampFrames);
     }
 
     /**
@@ -1387,8 +1531,14 @@
       }
 
       const loop = Boolean(config.loop);
+      const voiceMuted = Boolean(config.muted);
       const frameCount = Math.floor(samples.length / channels);
       const voiceId = this._nextVoiceId++;
+
+      const effectiveStartGain = voiceMuted ? 0.0 : startGain;
+      const effectiveTargetGain = voiceMuted ? 0.0 : gain;
+      const effectiveRampRemaining = voiceMuted ? 0 : initRampRemaining;
+      const effectiveRampStep = voiceMuted ? 0.0 : initRampStep;
 
       const voice = {
         id: voiceId,
@@ -1400,10 +1550,12 @@
         surroundGain,
         lfeGain,
         gain,
-        currentGain: startGain,
-        targetGain: gain,
-        gainRampRemaining: initRampRemaining,
-        gainRampStep: initRampStep,
+        unmutedGain: gain,
+        muted: voiceMuted,
+        currentGain: effectiveStartGain,
+        targetGain: effectiveTargetGain,
+        gainRampRemaining: effectiveRampRemaining,
+        gainRampStep: effectiveRampStep,
         gainRampFrames: voiceGainRampFrames,
         pan,
         panL: Math.SQRT1_2,
@@ -1459,6 +1611,10 @@
       const frames = resolveRampFrames(rampFrames, this.sampleRate, defaultRamp);
 
       voice.gain = target;
+      voice.unmutedGain = target;
+      if (voice.muted) {
+        return true;
+      }
       voice.targetGain = target;
       if (frames <= 0 || voice.currentGain === target) {
         voice.currentGain = target;
@@ -1467,6 +1623,42 @@
       } else {
         voice.gainRampRemaining = frames;
         voice.gainRampStep = (target - voice.currentGain) / frames;
+        this._gainRampsStarted += 1;
+      }
+      return true;
+    }
+
+    /**
+     * Smoothly mutes or unmutes a voice via linear per-sample gain ramping
+     * (defaults to the voice's ramp length, mixer volumeRampFrames, or
+     * `DEFAULT_GAIN_RAMP_FRAMES`). Pass `rampFrames = 0` to snap immediately.
+     *
+     * @param {number} voiceId
+     * @param {boolean} muted
+     * @param {number|object} [rampFrames]
+     * @returns {boolean}
+     */
+    setVoiceMuted(voiceId, muted, rampFrames) {
+      const voice = this._voices.get(voiceId);
+      if (!voice) return false;
+      const nextMuted = Boolean(muted);
+      const fallback =
+        voice.gainRampFrames !== null && voice.gainRampFrames > 0
+          ? voice.gainRampFrames
+          : this._volumeRampFrames;
+      const frames = resolveRampFrames(rampFrames, this.sampleRate, fallback);
+
+      voice.muted = nextMuted;
+      const target = nextMuted ? 0.0 : voice.unmutedGain;
+      voice.targetGain = target;
+      if (frames <= 0 || voice.currentGain === target) {
+        voice.currentGain = target;
+        voice.gainRampRemaining = 0;
+        voice.gainRampStep = 0.0;
+      } else {
+        voice.gainRampRemaining = frames;
+        voice.gainRampStep = (target - voice.currentGain) / frames;
+        this._gainRampsStarted += 1;
       }
       return true;
     }
@@ -1711,23 +1903,54 @@
     }
 
     /**
-     * Zero-allocation core stereo mix pass. Accumulates all active voices into
-     * the pre-allocated Float32Array `_mixScratch`, applies per-voice and
-     * master gain ramping, non-finite sample sanitization, and smooth
-     * soft-clip / clamp protection, and writes interleaved stereo Float32
-     * samples into `output[0 .. frameCount * 2 - 1]`.
+     * Applies an in-place zero-alloc half-cosine recovery fade-in chunk
+     * spanning frames `[startPos .. startPos + rampCount - 1]` of `total`
+     * onto planar stereo output buffers `(leftOut, rightOut)`.
      *
      * @private
      */
-    _mixIntoBuffer(output, frameCount) {
-      if (frameCount === 0) {
+    _applyCosineFadeInChunkPlanar(leftOut, rightOut, frameCount, startPos, total) {
+      const remaining = total - startPos;
+      const rampCount = frameCount < remaining ? frameCount : remaining;
+      if (rampCount <= 0) {
         return 0;
       }
+      const lastIdx = total - 1;
+      const invDenom = lastIdx > 0 ? Math.PI / lastIdx : 0.0;
+      for (let f = 0; f < rampCount; f++) {
+        const idx = startPos + f;
+        const gain =
+          total === 1
+            ? 1.0
+            : idx === 0
+              ? 0.0
+              : idx >= lastIdx
+                ? 1.0
+                : 0.5 * (1.0 - Math.cos(idx * invDenom));
+        if (gain === 0.0) {
+          leftOut[f] = 0.0;
+          rightOut[f] = 0.0;
+        } else if (gain !== 1.0) {
+          leftOut[f] *= gain;
+          rightOut[f] *= gain;
+        }
+      }
+      return rampCount;
+    }
 
-      const sampleCount = frameCount * 2;
-      this._ensureScratchCapacity(sampleCount);
-      const mix = this._mixScratch;
-      mix.fill(0.0, 0, sampleCount);
+    /**
+     * Zero-allocation stereo bus voice accumulation pass. Clears and accumulates
+     * all active voices into the pre-allocated `_busLeftScratch` and
+     * `_busRightScratch` Float32Array buffers, reaps finished one-shot voices in
+     * place, and records per-quantum scalar counters on `this`.
+     *
+     * @private
+     */
+    _accumulateVoicesToBus(frameCount) {
+      const busL = this._busLeftScratch;
+      const busR = this._busRightScratch;
+      busL.fill(0.0, 0, frameCount);
+      busR.fill(0.0, 0, frameCount);
 
       const finishedIds = this._finishedIds;
       finishedIds.length = 0;
@@ -1792,13 +2015,12 @@
               const fEnd = f + chunk;
               for (; f < fEnd; f++, idx++) {
                 let sample = src[idx];
-                if (!Number.isFinite(sample)) {
+                if (sample - sample !== 0) {
                   sample = 0.0;
                   sanitized += 1;
                 }
-                const outIdx = f * 2;
-                mix[outIdx] += sample * gL;
-                mix[outIdx + 1] += sample * gR;
+                busL[f] += sample * gL;
+                busR[f] += sample * gR;
               }
               voiceRendered += chunk;
             }
@@ -1840,15 +2062,14 @@
                 sample = s0 + (s1 - s0) * frac;
               }
 
-              if (!Number.isFinite(sample)) {
+              if (sample - sample !== 0) {
                 sample = 0.0;
                 sanitized += 1;
               }
 
               const scaled = sample * curGain;
-              const outIdx = f * 2;
-              mix[outIdx] += scaled * panL;
-              mix[outIdx + 1] += scaled * panR;
+              busL[f] += scaled * panL;
+              busR[f] += scaled * panR;
 
               voiceRendered += 1;
               pos += step;
@@ -1897,17 +2118,16 @@
                   const base0 = idx * 2;
                   let rawL = src[base0];
                   let rawR = src[base0 + 1];
-                  if (!Number.isFinite(rawL)) {
+                  if (rawL - rawL !== 0) {
                     rawL = 0.0;
                     sanitized += 1;
                   }
-                  if (!Number.isFinite(rawR)) {
+                  if (rawR - rawR !== 0) {
                     rawR = 0.0;
                     sanitized += 1;
                   }
-                  const outIdx = f * 2;
-                  mix[outIdx] += rawL * curGain;
-                  mix[outIdx + 1] += rawR * curGain;
+                  busL[f] += rawL * curGain;
+                  busR[f] += rawR * curGain;
                 }
                 voiceRendered += chunk;
               }
@@ -1934,17 +2154,16 @@
                   const base0 = idx * 2;
                   let rawL = src[base0];
                   let rawR = src[base0 + 1];
-                  if (!Number.isFinite(rawL)) {
+                  if (rawL - rawL !== 0) {
                     rawL = 0.0;
                     sanitized += 1;
                   }
-                  if (!Number.isFinite(rawR)) {
+                  if (rawR - rawR !== 0) {
                     rawR = 0.0;
                     sanitized += 1;
                   }
-                  const outIdx = f * 2;
-                  mix[outIdx] += rawL * gLL + rawR * gLR;
-                  mix[outIdx + 1] += rawL * gRL + rawR * gRR;
+                  busL[f] += rawL * gLL + rawR * gLR;
+                  busR[f] += rawL * gRL + rawR * gRR;
                 }
                 voiceRendered += chunk;
               }
@@ -1990,11 +2209,11 @@
                 rawR = src[base0 + 1] + (src[base1 + 1] - src[base0 + 1]) * frac;
               }
 
-              if (!Number.isFinite(rawL)) {
+              if (rawL - rawL !== 0) {
                 rawL = 0.0;
                 sanitized += 1;
               }
-              if (!Number.isFinite(rawR)) {
+              if (rawR - rawR !== 0) {
                 rawR = 0.0;
                 sanitized += 1;
               }
@@ -2002,9 +2221,8 @@
               const sL = rawL * curGain;
               const sR = rawR * curGain;
 
-              const outIdx = f * 2;
-              mix[outIdx] += sL * ll + sR * lr;
-              mix[outIdx + 1] += sL * rl + sR * rr;
+              busL[f] += sL * ll + sR * lr;
+              busR[f] += sL * rl + sR * rr;
 
               voiceRendered += 1;
               pos += step;
@@ -2079,12 +2297,12 @@
               let bl = frac === 0 ? src[base0 + 4] : src[base0 + 4] + (src[base1 + 4] - src[base0 + 4]) * frac;
               let br = frac === 0 ? src[base0 + 5] : src[base0 + 5] + (src[base1 + 5] - src[base0 + 5]) * frac;
 
-              if (!Number.isFinite(fl)) { fl = 0.0; sanitized += 1; }
-              if (!Number.isFinite(fr)) { fr = 0.0; sanitized += 1; }
-              if (!Number.isFinite(fc)) { fc = 0.0; sanitized += 1; }
-              if (!Number.isFinite(lfe)) { lfe = 0.0; sanitized += 1; }
-              if (!Number.isFinite(bl)) { bl = 0.0; sanitized += 1; }
-              if (!Number.isFinite(br)) { br = 0.0; sanitized += 1; }
+              if (fl - fl !== 0) { fl = 0.0; sanitized += 1; }
+              if (fr - fr !== 0) { fr = 0.0; sanitized += 1; }
+              if (fc - fc !== 0) { fc = 0.0; sanitized += 1; }
+              if (lfe - lfe !== 0) { lfe = 0.0; sanitized += 1; }
+              if (bl - bl !== 0) { bl = 0.0; sanitized += 1; }
+              if (br - br !== 0) { br = 0.0; sanitized += 1; }
 
               rawL = fl + fc * centerGain + bl * surroundGain + lfe * lfeGain;
               rawR = fr + fc * centerGain + br * surroundGain + lfe * lfeGain;
@@ -2099,14 +2317,14 @@
               let sl = frac === 0 ? src[base0 + 6] : src[base0 + 6] + (src[base1 + 6] - src[base0 + 6]) * frac;
               let sr = frac === 0 ? src[base0 + 7] : src[base0 + 7] + (src[base1 + 7] - src[base0 + 7]) * frac;
 
-              if (!Number.isFinite(fl)) { fl = 0.0; sanitized += 1; }
-              if (!Number.isFinite(fr)) { fr = 0.0; sanitized += 1; }
-              if (!Number.isFinite(fc)) { fc = 0.0; sanitized += 1; }
-              if (!Number.isFinite(lfe)) { lfe = 0.0; sanitized += 1; }
-              if (!Number.isFinite(bl)) { bl = 0.0; sanitized += 1; }
-              if (!Number.isFinite(br)) { br = 0.0; sanitized += 1; }
-              if (!Number.isFinite(sl)) { sl = 0.0; sanitized += 1; }
-              if (!Number.isFinite(sr)) { sr = 0.0; sanitized += 1; }
+              if (fl - fl !== 0) { fl = 0.0; sanitized += 1; }
+              if (fr - fr !== 0) { fr = 0.0; sanitized += 1; }
+              if (fc - fc !== 0) { fc = 0.0; sanitized += 1; }
+              if (lfe - lfe !== 0) { lfe = 0.0; sanitized += 1; }
+              if (bl - bl !== 0) { bl = 0.0; sanitized += 1; }
+              if (br - br !== 0) { br = 0.0; sanitized += 1; }
+              if (sl - sl !== 0) { sl = 0.0; sanitized += 1; }
+              if (sr - sr !== 0) { sr = 0.0; sanitized += 1; }
 
               rawL = fl + fc * centerGain + (bl + sl) * surroundGain + lfe * lfeGain;
               rawR = fr + fc * centerGain + (br + sr) * surroundGain + lfe * lfeGain;
@@ -2117,24 +2335,23 @@
               let bl = frac === 0 ? src[base0 + 2] : src[base0 + 2] + (src[base1 + 2] - src[base0 + 2]) * frac;
               let br = frac === 0 ? src[base0 + 3] : src[base0 + 3] + (src[base1 + 3] - src[base0 + 3]) * frac;
 
-              if (!Number.isFinite(fl)) { fl = 0.0; sanitized += 1; }
-              if (!Number.isFinite(fr)) { fr = 0.0; sanitized += 1; }
-              if (!Number.isFinite(bl)) { bl = 0.0; sanitized += 1; }
-              if (!Number.isFinite(br)) { br = 0.0; sanitized += 1; }
+              if (fl - fl !== 0) { fl = 0.0; sanitized += 1; }
+              if (fr - fr !== 0) { fr = 0.0; sanitized += 1; }
+              if (bl - bl !== 0) { bl = 0.0; sanitized += 1; }
+              if (br - br !== 0) { br = 0.0; sanitized += 1; }
 
               rawL = fl + bl * surroundGain;
               rawR = fr + br * surroundGain;
             }
 
-            if (!Number.isFinite(rawL)) { rawL = 0.0; sanitized += 1; }
-            if (!Number.isFinite(rawR)) { rawR = 0.0; sanitized += 1; }
+            if (rawL - rawL !== 0) { rawL = 0.0; sanitized += 1; }
+            if (rawR - rawR !== 0) { rawR = 0.0; sanitized += 1; }
 
             const sL = rawL * curGain;
             const sR = rawR * curGain;
 
-            const outIdx = f * 2;
-            mix[outIdx] += sL * ll + sR * lr;
-            mix[outIdx + 1] += sL * rl + sR * rr;
+            busL[f] += sL * ll + sR * lr;
+            busR[f] += sL * rl + sR * rr;
 
             downmixed += 1;
             voiceRendered += 1;
@@ -2176,162 +2393,252 @@
         finishedIds.length = 0;
       }
 
-      // Apply master gain (with optional per-frame ramp), non-finite sanitizer,
-      // inlined smooth soft-clip/hard-clip limiter, and update metering stats.
+      this._quantumSanitized = sanitized;
+      this._quantumDownmixed = downmixed;
+      this._quantumResampled = resampled;
+    }
+
+    /**
+     * Zero-allocation core stereo mix pass supporting both interleaved stereo
+     * output (`interleavedOut`) and planar stereo output (`leftOut`, `rightOut`).
+     * Reuses pre-allocated `_busLeftScratch` and `_busRightScratch` Float32Array
+     * buffers, applies per-voice and master gain/mute ramping, non-finite
+     * sanitization, smooth soft-clip/hard-clip limiting, W272 half-cosine
+     * recovery fade-in, and updates sanitized per-bus peak/RMS/clip telemetry.
+     *
+     * @private
+     */
+    _mixIntoCore(interleavedOut, leftOut, rightOut, frameCount, reallocsBefore) {
+      if (frameCount === 0) {
+        return 0;
+      }
+
+      const baselineReallocs =
+        reallocsBefore !== undefined ? reallocsBefore : this._scratchReallocations;
+      const sampleCount = frameCount * 2;
+      this._ensureScratchCapacity(sampleCount);
+      const zeroAllocQuantum = this._scratchReallocations === baselineReallocs;
+
+      this._accumulateVoicesToBus(frameCount);
+
+      const busL = this._busLeftScratch;
+      const busR = this._busRightScratch;
       const softClip = this._softClip;
       const knee = this._limiterKnee;
+      const negKnee = -knee;
       const headroom = 1.0 - knee;
-      let peak = this._peakOutputLevel;
-      let clipped = 0;
+      const hasRecoveryFade = this._recoveryFadeRemaining > 0;
+      const isPlanar = leftOut !== null;
 
-      if (this._masterGainRampRemaining > 0) {
-        let mg = this._masterGain;
-        const mgTarget = this._masterGainTarget;
-        let mgRem = this._masterGainRampRemaining;
-        const mgStep = this._masterGainRampStep;
+      let peakL = this._peakLeft;
+      let peakR = this._peakRight;
+      let sumSqL = 0.0;
+      let sumSqR = 0.0;
+      let clippedL = 0;
+      let clippedR = 0;
+      let sanitized = this._quantumSanitized;
 
-        for (let f = 0; f < frameCount; f++) {
-          if (mgRem > 0) {
-            if (mgRem === 1) {
-              mg = mgTarget;
-              mgRem = 0;
-            } else {
-              mg += mgStep;
-              mgRem -= 1;
-            }
-          }
+      let mg = this._masterGain;
+      const mgTarget = this._masterGainTarget;
+      let mgRem = this._masterGainRampRemaining;
+      const mgStep = this._masterGainRampStep;
+      const rampingMaster = mgRem > 0;
 
-          const base = f * 2;
-          for (let c = 0; c < 2; c++) {
-            const i = base + c;
-            let raw = mix[i] * mg;
-            if (!Number.isFinite(raw)) {
-              raw = 0.0;
-              sanitized += 1;
-            }
-
-            let limited;
-            if (softClip) {
-              if (raw > knee) {
-                clipped += 1;
-                const compressed = knee + headroom * Math.tanh((raw - knee) / headroom);
-                limited = compressed > 1.0 ? 1.0 : compressed;
-              } else if (raw < -knee) {
-                clipped += 1;
-                const compressed = knee + headroom * Math.tanh((-raw - knee) / headroom);
-                limited = compressed > 1.0 ? -1.0 : -compressed;
-              } else {
-                limited = raw;
-              }
-            } else {
-              if (raw > 1.0) {
-                clipped += 1;
-                limited = 1.0;
-              } else if (raw < -1.0) {
-                clipped += 1;
-                limited = -1.0;
-              } else {
-                limited = raw;
-              }
-            }
-
-            const absVal = limited < 0 ? -limited : limited;
-            if (absVal > peak) {
-              peak = absVal;
-            }
-            output[i] = limited;
+      for (let f = 0; f < frameCount; f++) {
+        if (rampingMaster && mgRem > 0) {
+          if (mgRem === 1) {
+            mg = mgTarget;
+            mgRem = 0;
+          } else {
+            mg += mgStep;
+            mgRem -= 1;
           }
         }
 
+        let rawL = busL[f] * mg;
+        if (rawL - rawL !== 0) {
+          rawL = 0.0;
+          sanitized += 1;
+        } else if (mg === 0.0) {
+          rawL = 0.0;
+        }
+
+        let rawR = busR[f] * mg;
+        if (rawR - rawR !== 0) {
+          rawR = 0.0;
+          sanitized += 1;
+        } else if (mg === 0.0) {
+          rawR = 0.0;
+        }
+
+        let outL;
+        let outR;
+        if (softClip) {
+          if (rawL > knee) {
+            clippedL += 1;
+            const compressed = knee + headroom * Math.tanh((rawL - knee) / headroom);
+            outL = compressed > 1.0 ? 1.0 : compressed;
+          } else if (rawL < negKnee) {
+            clippedL += 1;
+            const compressed = knee + headroom * Math.tanh((-rawL - knee) / headroom);
+            outL = compressed > 1.0 ? -1.0 : -compressed;
+          } else {
+            outL = rawL;
+          }
+
+          if (rawR > knee) {
+            clippedR += 1;
+            const compressed = knee + headroom * Math.tanh((rawR - knee) / headroom);
+            outR = compressed > 1.0 ? 1.0 : compressed;
+          } else if (rawR < negKnee) {
+            clippedR += 1;
+            const compressed = knee + headroom * Math.tanh((-rawR - knee) / headroom);
+            outR = compressed > 1.0 ? -1.0 : -compressed;
+          } else {
+            outR = rawR;
+          }
+        } else {
+          if (rawL > 1.0) {
+            clippedL += 1;
+            outL = 1.0;
+          } else if (rawL < -1.0) {
+            clippedL += 1;
+            outL = -1.0;
+          } else {
+            outL = rawL;
+          }
+
+          if (rawR > 1.0) {
+            clippedR += 1;
+            outR = 1.0;
+          } else if (rawR < -1.0) {
+            clippedR += 1;
+            outR = -1.0;
+          } else {
+            outR = rawR;
+          }
+        }
+
+        if (isPlanar) {
+          leftOut[f] = outL;
+          rightOut[f] = outR;
+        } else {
+          const outIdx = f * 2;
+          interleavedOut[outIdx] = outL;
+          interleavedOut[outIdx + 1] = outR;
+        }
+
+        if (!hasRecoveryFade) {
+          const absL = outL < 0 ? -outL : outL;
+          const absR = outR < 0 ? -outR : outR;
+          if (absL > peakL) peakL = absL;
+          if (absR > peakR) peakR = absR;
+          sumSqL += outL * outL;
+          sumSqR += outR * outR;
+        }
+      }
+
+      if (rampingMaster) {
         this._masterGain = mg;
         this._masterGainRampRemaining = mgRem;
         if (mgRem === 0) {
           this._masterGainRampStep = 0.0;
         }
-      } else {
-        const masterGain = this._masterGain;
-        if (softClip) {
-          for (let i = 0; i < sampleCount; i++) {
-            let raw = mix[i] * masterGain;
-            if (!Number.isFinite(raw)) {
-              raw = 0.0;
-              sanitized += 1;
-            }
-
-            let limited;
-            if (raw > knee) {
-              clipped += 1;
-              const compressed = knee + headroom * Math.tanh((raw - knee) / headroom);
-              limited = compressed > 1.0 ? 1.0 : compressed;
-            } else if (raw < -knee) {
-              clipped += 1;
-              const compressed = knee + headroom * Math.tanh((-raw - knee) / headroom);
-              limited = compressed > 1.0 ? -1.0 : -compressed;
-            } else {
-              limited = raw;
-            }
-
-            const absVal = limited < 0 ? -limited : limited;
-            if (absVal > peak) {
-              peak = absVal;
-            }
-            output[i] = limited;
-          }
-        } else {
-          for (let i = 0; i < sampleCount; i++) {
-            let raw = mix[i] * masterGain;
-            if (!Number.isFinite(raw)) {
-              raw = 0.0;
-              sanitized += 1;
-            }
-
-            let limited;
-            if (raw > 1.0) {
-              clipped += 1;
-              limited = 1.0;
-            } else if (raw < -1.0) {
-              clipped += 1;
-              limited = -1.0;
-            } else {
-              limited = raw;
-            }
-
-            const absVal = limited < 0 ? -limited : limited;
-            if (absVal > peak) {
-              peak = absVal;
-            }
-            output[i] = limited;
-          }
-        }
       }
 
-      if (this._recoveryFadeRemaining > 0) {
+      if (hasRecoveryFade) {
         const total = this._recoveryFadeTotal;
         const startPos = total - this._recoveryFadeRemaining;
-        const applied = this._applyCosineFadeInChunk(output, frameCount, startPos, total);
+        const applied = isPlanar
+          ? this._applyCosineFadeInChunkPlanar(leftOut, rightOut, frameCount, startPos, total)
+          : this._applyCosineFadeInChunk(interleavedOut, frameCount, startPos, total);
         this._recoveryFadeRemaining -= applied;
         if (this._recoveryFadeRemaining <= 0) {
           this._recoveryFadeRemaining = 0;
           this._recoveryFadeTotal = 0;
         }
+        for (let f = 0; f < frameCount; f++) {
+          const sL = isPlanar ? leftOut[f] : interleavedOut[f * 2];
+          const sR = isPlanar ? rightOut[f] : interleavedOut[f * 2 + 1];
+          const absL = sL < 0 ? -sL : sL;
+          const absR = sR < 0 ? -sR : sR;
+          if (absL > peakL) peakL = absL;
+          if (absR > peakR) peakR = absR;
+          sumSqL += sL * sL;
+          sumSqR += sR * sR;
+        }
       }
 
-      const lastBase = (frameCount - 1) * 2;
-      this._lastOutL = output[lastBase];
-      this._lastOutR = output[lastBase + 1];
+      if (isPlanar) {
+        this._lastOutL = leftOut[frameCount - 1];
+        this._lastOutR = rightOut[frameCount - 1];
+      } else {
+        const lastBase = (frameCount - 1) * 2;
+        this._lastOutL = interleavedOut[lastBase];
+        this._lastOutR = interleavedOut[lastBase + 1];
+      }
 
-      this._peakOutputLevel = peak;
+      const clipped = clippedL + clippedR;
+      this._peakLeft = peakL;
+      this._peakRight = peakR;
+      this._peakOutputLevel = peakL > peakR ? peakL : peakR;
+      this._rmsLeftSumSq += sumSqL;
+      this._rmsRightSumSq += sumSqR;
+      this._rmsFrames += frameCount;
+      this._clippedLeft += clippedL;
+      this._clippedRight += clippedR;
       this._clippedSamples += clipped;
       if (softClip) {
         this._softClippedSamples += clipped;
       }
       this._sanitizedNonFiniteSamples += sanitized;
-      this._downmixedFrames += downmixed;
-      this._resampledFrames += resampled;
+      this._downmixedFrames += this._quantumDownmixed;
+      this._resampledFrames += this._quantumResampled;
       this._renderedFrames += frameCount;
       this._quantaMixed += 1;
+      if (zeroAllocQuantum) {
+        this._zeroAllocMixQuanta += 1;
+      }
 
       return frameCount;
+    }
+
+    /**
+     * Zero-allocation core stereo mix pass into an interleaved stereo Float32Array.
+     *
+     * @private
+     */
+    _mixIntoBuffer(output, frameCount, reallocsBefore) {
+      return this._mixIntoCore(output, null, null, frameCount, reallocsBefore);
+    }
+
+    /**
+     * Zero-allocation stereo mix pass directly into caller-supplied planar
+     * left/right Float32Array buffers (`leftBuffer.length >= frameCount`,
+     * `rightBuffer.length >= frameCount`), ideal for Web Audio AudioWorklet
+     * stereo outputs.
+     *
+     * @param {Float32Array} leftBuffer Destination left channel buffer.
+     * @param {Float32Array} rightBuffer Destination right channel buffer.
+     * @param {number} [frameCount] Number of stereo frames to mix.
+     * @returns {number} Number of frames mixed.
+     */
+    mixIntoPlanar(leftBuffer, rightBuffer, frameCount) {
+      if (!(leftBuffer instanceof Float32Array) || !(rightBuffer instanceof Float32Array)) {
+        throw new TypeError('leftBuffer and rightBuffer must be Float32Array instances');
+      }
+      const maxFrames =
+        leftBuffer.length < rightBuffer.length ? leftBuffer.length : rightBuffer.length;
+      const frames = frameCount !== undefined ? frameCount : maxFrames;
+      if (!Number.isInteger(frames) || frames < 0) {
+        throw new RangeError(`frameCount must be a non-negative integer, got ${frames}`);
+      }
+      if (leftBuffer.length < frames || rightBuffer.length < frames) {
+        throw new RangeError(
+          `Planar output buffers (${leftBuffer.length}, ${rightBuffer.length}) are smaller than required ${frames} frames`
+        );
+      }
+      return this._mixIntoCore(null, leftBuffer, rightBuffer, frames, this._scratchReallocations);
     }
 
     /**
@@ -2408,9 +2715,10 @@
       }
 
       if (this._reuseOutputBuffer) {
+        const reallocsBefore = this._scratchReallocations;
         const outView = this._getScratchOutputView(sampleCount);
         if (frameCount > 0) {
-          this._mixIntoBuffer(outView, frameCount);
+          this._mixIntoBuffer(outView, frameCount, reallocsBefore);
         }
         return outView;
       }
@@ -2419,7 +2727,7 @@
       if (frameCount === 0) {
         return output;
       }
-      this._mixIntoBuffer(output, frameCount);
+      this._mixIntoBuffer(output, frameCount, this._scratchReallocations);
       return output;
     }
 
@@ -2454,10 +2762,11 @@
               : null;
       let detectedRingUnderrun = false;
       if (ringUnderruns !== null) {
-        if (ringUnderruns > this._ringUnderrunCount) {
+        if (ringUnderruns > this._lastObservedRingUnderruns) {
+          this._ringUnderrunCount += ringUnderruns - this._lastObservedRingUnderruns;
           detectedRingUnderrun = true;
         }
-        this._ringUnderrunCount = ringUnderruns;
+        this._lastObservedRingUnderruns = ringUnderruns;
       }
 
       const hasPushSamples = typeof audioRingBuffer.pushSamples === 'function';
@@ -2509,8 +2818,10 @@
         throw new RangeError(`Unsupported audioRingBuffer channel count: ${ringChannels}`);
       }
 
+      const reallocsBefore = this._scratchReallocations;
       const outView = this._getScratchOutputView(framesToRender * 2);
-      this._mixIntoBuffer(outView, framesToRender);
+      const monoView = ringChannels === 1 ? this._getMonoScratchView(framesToRender) : null;
+      this._mixIntoBuffer(outView, framesToRender, reallocsBefore);
 
       if (this._pumpRecoveryFadeRemaining > 0) {
         const total = this._pumpRecoveryFadeTotal;
@@ -2532,7 +2843,6 @@
           : audioRingBuffer.write(outView);
       }
 
-      const monoView = this._getMonoScratchView(framesToRender);
       for (let f = 0; f < framesToRender; f++) {
         const base = f * 2;
         monoView[f] = (outView[base] + outView[base + 1]) * 0.5;
@@ -2540,6 +2850,38 @@
       return hasPushSamples
         ? audioRingBuffer.pushSamples(monoView)
         : audioRingBuffer.write(monoView);
+    }
+
+    /**
+     * Clears all mixer telemetry and per-bus metering accumulators (`peakLeft`,
+     * `peakRight`, `rmsLeft`, `rmsRight`, `clippedSamples`, `zeroAllocMixQuanta`,
+     * underrun/fade counters, etc.) without disturbing active voices, gain/mute
+     * state, or pre-allocated scratch buffers.
+     */
+    resetStats() {
+      this._renderedFrames = 0;
+      this._quantaMixed = 0;
+      this._zeroAllocMixQuanta = 0;
+      this._downmixedFrames = 0;
+      this._resampledFrames = 0;
+      this._ringUnderrunCount = 0;
+      this._manualUnderrunQuanta = 0;
+      this._underrunFadeOuts = 0;
+      this._recoveryFadeIns = 0;
+      this._peakLeft = 0.0;
+      this._peakRight = 0.0;
+      this._peakOutputLevel = 0.0;
+      this._rmsLeftSumSq = 0.0;
+      this._rmsRightSumSq = 0.0;
+      this._rmsFrames = 0;
+      this._clippedLeft = 0;
+      this._clippedRight = 0;
+      this._clippedSamples = 0;
+      this._softClippedSamples = 0;
+      this._sanitizedNonFiniteSamples = 0;
+      this._scratchReallocations = 0;
+      this._gainRampsStarted = 0;
+      this._activeVoicePeak = this._countActiveVoices();
     }
 
     /**
@@ -2566,33 +2908,23 @@
       if (this._monoScratch.length > 0) {
         this._monoScratch.fill(0.0);
       }
-      this._masterGain = this._masterGainTarget;
+      const effectiveTarget = this._muted ? 0.0 : this._masterGainUnmuted;
+      this._masterGain = effectiveTarget;
+      this._masterGainTarget = effectiveTarget;
       this._masterGainRampRemaining = 0;
       this._masterGainRampStep = 0.0;
-      this._renderedFrames = 0;
-      this._quantaMixed = 0;
-      this._downmixedFrames = 0;
-      this._resampledFrames = 0;
-      this._ringUnderrunCount = 0;
-      this._manualUnderrunQuanta = 0;
-      this._underrunFadeOuts = 0;
-      this._recoveryFadeIns = 0;
+      this._lastObservedRingUnderruns = 0;
       this._recoveryFadeRemaining = 0;
       this._recoveryFadeTotal = 0;
       this._pumpRecoveryFadeRemaining = 0;
       this._pumpRecoveryFadeTotal = 0;
       this._lastOutL = 0.0;
       this._lastOutR = 0.0;
-      this._peakOutputLevel = 0.0;
-      this._clippedSamples = 0;
-      this._softClippedSamples = 0;
-      this._sanitizedNonFiniteSamples = 0;
-      this._scratchReallocations = 0;
-      this._activeVoicePeak = clearVoices ? 0 : this._countActiveVoices();
+      this.resetStats();
     }
 
     /**
-     * Returns mixer diagnostics and voice metering stats.
+     * Returns sanitized mixer diagnostics and per-bus peak/RMS/clip telemetry.
      */
     getStats() {
       let activeVoices = 0;
@@ -2611,7 +2943,27 @@
         }
       }
 
-      const totalUnderruns = this._ringUnderrunCount + this._manualUnderrunQuanta;
+      const totalUnderruns = sanitizeCount(this._ringUnderrunCount + this._manualUnderrunQuanta);
+      const peakLeft = sanitizeUnitLevel(this._peakLeft);
+      const peakRight = sanitizeUnitLevel(this._peakRight);
+      const peakLevel = peakLeft > peakRight ? peakLeft : peakRight;
+      const rmsFrames = sanitizeCount(this._rmsFrames);
+      const rmsLeft =
+        rmsFrames > 0
+          ? sanitizeUnitLevel(Math.sqrt(sanitizeFiniteNonNeg(this._rmsLeftSumSq) / rmsFrames))
+          : 0;
+      const rmsRight =
+        rmsFrames > 0
+          ? sanitizeUnitLevel(Math.sqrt(sanitizeFiniteNonNeg(this._rmsRightSumSq) / rmsFrames))
+          : 0;
+      const clippedLeft = sanitizeCount(this._clippedLeft);
+      const clippedRight = sanitizeCount(this._clippedRight);
+      const clippedSamples = sanitizeCount(this._clippedSamples);
+      const softClippedSamples = sanitizeCount(this._softClippedSamples);
+      const sanitizedNonFiniteSamples = sanitizeCount(this._sanitizedNonFiniteSamples);
+      const renderedFrames = sanitizeCount(this._renderedFrames);
+      const activeVoicePeak = sanitizeCount(this._activeVoicePeak);
+      const effectiveGain = sanitizeFiniteNonNeg(this._masterGain);
 
       return {
         activeVoices,
@@ -2621,31 +2973,45 @@
         maxVoices: this.maxVoices,
         sampleRate: this.sampleRate,
         channels: this.channels,
-        masterGain: this._masterGain,
+        masterGain: effectiveGain,
+        masterGainTarget: sanitizeFiniteNonNeg(this._masterGainTarget),
+        volume: sanitizeFiniteNonNeg(this._masterGainUnmuted),
+        muted: Boolean(this._muted),
+        effectiveGain,
+        gainRampActive: this._masterGainRampRemaining > 0,
+        gainRampsStarted: sanitizeCount(this._gainRampsStarted),
         softClip: this._softClip,
         limiterKnee: this._limiterKnee,
         gainRampFrames: this._defaultGainRampFrames,
+        volumeRampFrames: this._volumeRampFrames,
         underrunRampFrames: this._underrunRampFrames,
-        framesMixed: this._renderedFrames,
-        renderedFrames: this._renderedFrames,
-        quantaMixed: this._quantaMixed,
-        downmixedFrames: this._downmixedFrames,
-        resampledFrames: this._resampledFrames,
+        framesMixed: renderedFrames,
+        renderedFrames,
+        quantaMixed: sanitizeCount(this._quantaMixed),
+        zeroAllocMixQuanta: sanitizeCount(this._zeroAllocMixQuanta),
+        downmixedFrames: sanitizeCount(this._downmixedFrames),
+        resampledFrames: sanitizeCount(this._resampledFrames),
         underrunQuanta: totalUnderruns,
         underrunCount: totalUnderruns,
-        underrunFadeOuts: this._underrunFadeOuts,
-        recoveryFadeIns: this._recoveryFadeIns,
-        peakLevel: this._peakOutputLevel,
-        peakOutputLevel: this._peakOutputLevel,
-        clippedSamples: this._clippedSamples,
-        softClippedSamples: this._softClippedSamples,
-        sanitizedNonFiniteSamples: this._sanitizedNonFiniteSamples,
-        nanSanitizedSamples: this._sanitizedNonFiniteSamples,
-        nonFiniteSanitized: this._sanitizedNonFiniteSamples,
-        peakVoices: this._activeVoicePeak,
-        activeVoicePeak: this._activeVoicePeak,
+        underrunFadeOuts: sanitizeCount(this._underrunFadeOuts),
+        recoveryFadeIns: sanitizeCount(this._recoveryFadeIns),
+        peakLeft,
+        peakRight,
+        rmsLeft,
+        rmsRight,
+        peakLevel,
+        peakOutputLevel: peakLevel,
+        clippedLeft,
+        clippedRight,
+        clippedSamples,
+        softClippedSamples,
+        sanitizedNonFiniteSamples,
+        nanSanitizedSamples: sanitizedNonFiniteSamples,
+        nonFiniteSanitized: sanitizedNonFiniteSamples,
+        peakVoices: activeVoicePeak,
+        activeVoicePeak,
         scratchCapacityFrames: this._mixScratch.length >>> 1,
-        scratchReallocations: this._scratchReallocations,
+        scratchReallocations: sanitizeCount(this._scratchReallocations),
       };
     }
   }
