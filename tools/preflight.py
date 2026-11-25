@@ -13,25 +13,41 @@ Security & privacy invariant:
 from __future__ import annotations
 
 import argparse
+import ctypes
 import http.client
 import importlib.util
 import json
 import math
 import os
 import platform
+import plistlib
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import threading
 from functools import partial
 from http.server import ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 DEFAULT_REPO_ROOT = Path(__file__).resolve().parent.parent
 WASM_MAGIC = b"\x00asm"
+WGPK_MAGIC = b"WGPK"
+WGPK_VERSION = 1
+WGPK_HEADER_STRUCT = struct.Struct("<4sIII")
+WGPK_HEADER_BYTES = WGPK_HEADER_STRUCT.size
+WGPK_ENTRY_STRUCT = struct.Struct("<QB3sII")
+WGPK_ENTRY_BYTES = WGPK_ENTRY_STRUCT.size
+WGPK_STAGE_MAP: Mapping[int, str] = {
+    1: "vertex",
+    2: "fragment",
+    3: "compute",
+}
+SPLASH_PACK_NAME = "splash.wgsl.pack"
 DEFAULT_MIN_FREE_GB = 5.0
+DEFAULT_MIN_FREE_RAM_GB = 4.0
 BYTES_PER_GIB = 1024**3
 REFLECT_SIDECAR_SCHEMA = "playgta6-stage-reflection"
 REFLECT_STAGE_ALIASES: Mapping[str, str] = {
@@ -40,6 +56,14 @@ REFLECT_STAGE_ALIASES: Mapping[str, str] = {
     "pixel": "fragment",
     "compute": "compute",
 }
+
+BROWSER_SPECS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("chrome", ("google-chrome", "google-chrome-stable", "chrome")),
+    ("edge", ("microsoft-edge", "microsoft-edge-stable", "msedge")),
+    ("chromium", ("chromium", "chromium-browser")),
+)
+_SEMVER_VERSION_RE = re.compile(r"\b(\d+\.\d+(?:\.\d+){1,2})\b")
+_QUAD_VERSION_DIR_RE = re.compile(r"^\d+\.\d+\.\d+\.\d+$")
 
 TOOLCHAIN_SPECS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("python", ("python", "python3")),
@@ -381,6 +405,568 @@ def check_disk_space(
         "freeGb": min_free_gb_val,
         "workspace": workspace_info,
         "work": work_info,
+    }
+
+
+def _probe_system_memory_bytes() -> tuple[int, int] | None:
+    """Return `(total_bytes, available_bytes)` using stdlib-only OS probes."""
+    if sys.platform == "win32":
+        class _MemoryStatusEx(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = _MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(_MemoryStatusEx)
+        try:
+            ok = ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
+        except (AttributeError, OSError):
+            return None
+        if not ok or status.ullTotalPhys <= 0:
+            return None
+        return int(status.ullTotalPhys), int(status.ullAvailPhys)
+
+    proc_meminfo = Path("/proc/meminfo")
+    if proc_meminfo.is_file():
+        try:
+            values_kib: dict[str, int] = {}
+            for line in proc_meminfo.read_text(encoding="utf-8").splitlines():
+                if ":" not in line:
+                    continue
+                key, rest = line.split(":", 1)
+                parts = rest.strip().split()
+                if parts and parts[0].isdigit():
+                    values_kib[key.strip()] = int(parts[0])
+            total_kib = values_kib.get("MemTotal")
+            if total_kib is None or total_kib <= 0:
+                return None
+            avail_kib = values_kib.get("MemAvailable")
+            if avail_kib is None:
+                avail_kib = (
+                    values_kib.get("MemFree", 0)
+                    + values_kib.get("Buffers", 0)
+                    + values_kib.get("Cached", 0)
+                )
+            return total_kib * 1024, max(0, avail_kib) * 1024
+        except (OSError, UnicodeDecodeError, ValueError):
+            return None
+
+    if sys.platform == "darwin":
+        try:
+            total_proc = subprocess.run(
+                ["sysctl", "-n", "hw.memsize"],
+                capture_output=True,
+                text=True,
+                stdin=subprocess.DEVNULL,
+                timeout=3,
+                check=False,
+            )
+            vm_proc = subprocess.run(
+                ["vm_stat"],
+                capture_output=True,
+                text=True,
+                stdin=subprocess.DEVNULL,
+                timeout=3,
+                check=False,
+            )
+            if total_proc.returncode != 0 or vm_proc.returncode != 0:
+                return None
+            total_bytes = int(total_proc.stdout.strip())
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            pages: dict[str, int] = {}
+            for line in vm_proc.stdout.splitlines():
+                m = re.match(r"^([^:]+):\s+(\d+)\.$", line.strip())
+                if m:
+                    pages[m.group(1).strip().lower()] = int(m.group(2))
+            avail_pages = (
+                pages.get("pages free", 0)
+                + pages.get("pages inactive", 0)
+                + pages.get("pages speculative", 0)
+            )
+            return total_bytes, max(0, avail_pages * int(page_size))
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
+
+    return None
+
+
+def check_memory_headroom(
+    *,
+    min_free_ram_gb: float = DEFAULT_MIN_FREE_RAM_GB,
+    memory_info_fn: Callable[[], tuple[int, int] | None] | None = None,
+) -> dict[str, Any]:
+    """Check available system RAM against a safe browser-boot headroom threshold."""
+    if not math.isfinite(min_free_ram_gb) or min_free_ram_gb < 0:
+        raise ValueError("min_free_ram_gb must be a finite non-negative number")
+
+    probe_fn = _probe_system_memory_bytes if memory_info_fn is None else memory_info_fn
+    threshold_rounded = round(float(min_free_ram_gb), 2)
+    try:
+        mem = probe_fn()
+    except Exception:
+        mem = None
+
+    if (
+        not isinstance(mem, tuple)
+        or len(mem) != 2
+        or not isinstance(mem[0], int)
+        or isinstance(mem[0], bool)
+        or not isinstance(mem[1], int)
+        or isinstance(mem[1], bool)
+        or mem[0] <= 0
+        or mem[1] < 0
+    ):
+        return {
+            "checked": False,
+            "totalBytes": None,
+            "availableBytes": None,
+            "totalGb": None,
+            "availableGb": None,
+            "minFreeRamGb": threshold_rounded,
+            "lowMemory": False,
+            "ok": False,
+            "warning": False,
+            "error": "memory info unavailable",
+        }
+
+    total_bytes, available_bytes = mem
+    total_gb = total_bytes / BYTES_PER_GIB
+    available_gb = available_bytes / BYTES_PER_GIB
+    low_memory = available_gb < min_free_ram_gb
+    return {
+        "checked": True,
+        "totalBytes": total_bytes,
+        "availableBytes": available_bytes,
+        "totalGb": round(total_gb, 2),
+        "availableGb": round(available_gb, 2),
+        "minFreeRamGb": threshold_rounded,
+        "lowMemory": low_memory,
+        "ok": not low_memory,
+        "warning": low_memory,
+        "error": None,
+    }
+
+
+def _sanitize_browser_version(raw: str | None) -> str | None:
+    """Extract a sanitized browser version string that never leaks host paths or usernames."""
+    cleaned = sanitize_version(raw)
+    if not cleaned:
+        return None
+    match = _SEMVER_VERSION_RE.search(cleaned)
+    if match:
+        return match.group(1)
+    stripped = re.sub(r"\(\s*<path>\s*\)", "", cleaned)
+    stripped = stripped.replace("<path>", "").replace("<user>", "")
+    stripped = " ".join(stripped.split()).strip(" -:,()")
+    return stripped or None
+
+
+def _default_browser_candidate_paths(family: str) -> list[Path]:
+    paths: list[Path] = []
+    if sys.platform == "win32":
+        roots = [
+            os.environ.get("PROGRAMFILES", ""),
+            os.environ.get("PROGRAMFILES(X86)", ""),
+            os.environ.get("LOCALAPPDATA", ""),
+        ]
+        rel_map: Mapping[str, tuple[str, ...]] = {
+            "chrome": (r"Google\Chrome\Application\chrome.exe",),
+            "edge": (r"Microsoft\Edge\Application\msedge.exe",),
+            "chromium": (r"Chromium\Application\chrome.exe",),
+        }
+        for root_str in roots:
+            if not root_str:
+                continue
+            base = Path(root_str)
+            for rel in rel_map.get(family, ()):
+                paths.append(base / rel)
+    elif sys.platform == "darwin":
+        mac_map: Mapping[str, tuple[str, ...]] = {
+            "chrome": ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",),
+            "edge": ("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",),
+            "chromium": ("/Applications/Chromium.app/Contents/MacOS/Chromium",),
+        }
+        for raw_path in mac_map.get(family, ()):
+            paths.append(Path(raw_path))
+    return paths
+
+
+def _probe_windows_browser_version(family: str, resolved_bin: str) -> str | None:
+    """Read Chrome/Edge/Chromium version on Windows without spawning a GUI process."""
+    try:
+        parent = Path(resolved_bin).parent
+        if parent.is_dir():
+            versions: list[tuple[tuple[int, ...], str]] = []
+            for entry in parent.iterdir():
+                if entry.is_dir() and _QUAD_VERSION_DIR_RE.match(entry.name):
+                    versions.append((tuple(int(part) for part in entry.name.split(".")), entry.name))
+            if versions:
+                versions.sort(key=lambda item: item[0], reverse=True)
+                return _sanitize_browser_version(versions[0][1])
+    except OSError:
+        pass
+
+    try:
+        import winreg  # type: ignore[import-not-found]
+    except ImportError:
+        return None
+
+    reg_paths: Mapping[str, tuple[str, ...]] = {
+        "chrome": (
+            r"Software\Google\Chrome\BLBeacon",
+            r"Software\WOW6432Node\Google\Chrome\BLBeacon",
+        ),
+        "edge": (
+            r"Software\Microsoft\Edge\BLBeacon",
+            r"Software\WOW6432Node\Microsoft\Edge\BLBeacon",
+        ),
+        "chromium": (r"Software\Chromium\BLBeacon",),
+    }
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        for subkey in reg_paths.get(family, ()):
+            try:
+                with winreg.OpenKey(hive, subkey) as key:
+                    val, _ = winreg.QueryValueEx(key, "version")
+                    if isinstance(val, str):
+                        sanitized = _sanitize_browser_version(val)
+                        if sanitized:
+                            return sanitized
+            except OSError:
+                continue
+    return None
+
+
+def _probe_browser_version(family: str, resolved_bin: str) -> str | None:
+    if sys.platform == "win32":
+        return _probe_windows_browser_version(family, resolved_bin)
+
+    if sys.platform == "darwin":
+        try:
+            plist_path = Path(resolved_bin).parent.parent / "Info.plist"
+            if plist_path.is_file():
+                with plist_path.open("rb") as fh:
+                    info = plistlib.load(fh)
+                if isinstance(info, dict):
+                    raw_ver = info.get("CFBundleShortVersionString") or info.get("CFBundleVersion")
+                    if isinstance(raw_ver, str):
+                        sanitized = _sanitize_browser_version(raw_ver)
+                        if sanitized:
+                            return sanitized
+        except (OSError, plistlib.InvalidFileException, ValueError):
+            pass
+
+    return _sanitize_browser_version(_probe_binary_version(resolved_bin))
+
+
+def check_browser(
+    *,
+    which_fn: Callable[[str], str | None] = shutil.which,
+    version_fn: Callable[[str], str | None] | None = None,
+    candidate_paths_fn: Callable[[str], Sequence[Path]] | None = None,
+) -> dict[str, Any]:
+    """Detect local Chrome/Edge/Chromium availability without ever leaking host paths."""
+    use_default_paths = candidate_paths_fn is None and which_fn is shutil.which
+    browsers: dict[str, dict[str, Any]] = {}
+    primary_family: str | None = None
+    primary_version: str | None = None
+
+    for family, bin_names in BROWSER_SPECS:
+        resolved: str | None = None
+        for bin_name in bin_names:
+            found = which_fn(bin_name)
+            if found:
+                resolved = found
+                break
+
+        if resolved is None:
+            candidates: Sequence[Path] = ()
+            if candidate_paths_fn is not None:
+                candidates = candidate_paths_fn(family)
+            elif use_default_paths:
+                candidates = _default_browser_candidate_paths(family)
+            for candidate in candidates:
+                try:
+                    if candidate.is_file():
+                        resolved = str(candidate)
+                        break
+                except OSError:
+                    continue
+
+        if resolved is None:
+            browsers[family] = {"available": False, "version": None}
+            continue
+
+        if version_fn is not None:
+            raw_ver = version_fn(resolved)
+            version = _sanitize_browser_version(raw_ver)
+        else:
+            version = _probe_browser_version(family, resolved)
+
+        browsers[family] = {"available": True, "version": version}
+        if primary_family is None:
+            primary_family = family
+            primary_version = version
+
+    available = primary_family is not None
+    warnings: list[str] = []
+    if not available:
+        warnings.append("no Chrome/Edge/Chromium browser detected for WebGPU/Wasm64 boot")
+
+    return {
+        "available": available,
+        "family": primary_family,
+        "version": primary_version,
+        "browsers": browsers,
+        "warning": not available,
+        "warnings": warnings,
+    }
+
+
+def inspect_wgpk_header(path: Path) -> dict[str, Any]:
+    """Validate a WGPK v1 binary pack header and entry table (strictly sanitized)."""
+    stage_counts: dict[str, int] = {"vertex": 0, "fragment": 0, "compute": 0}
+    result: dict[str, Any] = {
+        "present": False,
+        "sizeBytes": 0,
+        "headerValid": False,
+        "version": None,
+        "entryCount": None,
+        "flags": None,
+        "stageCounts": stage_counts,
+        "errors": [],
+    }
+    if not path.is_file():
+        return result
+
+    result["present"] = True
+    errors: list[str] = []
+
+    def _add_error(msg: str) -> None:
+        if msg not in errors:
+            errors.append(msg)
+
+    try:
+        size_bytes = path.stat().st_size
+    except OSError:
+        result["errors"] = ["unreadable file"]
+        return result
+
+    result["sizeBytes"] = size_bytes
+    if size_bytes < WGPK_HEADER_BYTES:
+        result["errors"] = ["pack truncated (shorter than 16-byte WGPK header)"]
+        return result
+
+    try:
+        with path.open("rb") as fh:
+            header_bytes = fh.read(WGPK_HEADER_BYTES)
+            if len(header_bytes) < WGPK_HEADER_BYTES:
+                result["errors"] = ["pack truncated (shorter than 16-byte WGPK header)"]
+                return result
+            magic, version, entry_count, flags = WGPK_HEADER_STRUCT.unpack(header_bytes)
+            if magic != WGPK_MAGIC:
+                result["errors"] = ["invalid WGPK magic"]
+                return result
+
+            result["version"] = int(version)
+            result["entryCount"] = int(entry_count)
+            result["flags"] = int(flags)
+
+            if version != WGPK_VERSION:
+                result["errors"] = [f"unsupported WGPK version {version}"]
+                return result
+
+            table_bytes_len = entry_count * WGPK_ENTRY_BYTES
+            min_required = WGPK_HEADER_BYTES + table_bytes_len
+            if size_bytes < min_required:
+                result["errors"] = ["pack truncated (entry table exceeds file size)"]
+                return result
+
+            if entry_count > 0:
+                table_bytes = fh.read(table_bytes_len)
+                if len(table_bytes) < table_bytes_len:
+                    result["errors"] = ["pack truncated (entry table exceeds file size)"]
+                    return result
+
+                for _hash_u64, stage_u8, _reserved, offset_u32, length_u32 in WGPK_ENTRY_STRUCT.iter_unpack(
+                    table_bytes
+                ):
+                    stage_name = WGPK_STAGE_MAP.get(stage_u8)
+                    if stage_name is None:
+                        _add_error("invalid WGPK entry stage")
+                    else:
+                        stage_counts[stage_name] += 1
+                    end_offset = offset_u32 + length_u32
+                    if end_offset > size_bytes or (length_u32 > 0 and offset_u32 < min_required):
+                        _add_error("WGPK entry payload out of bounds")
+    except OSError:
+        result["errors"] = ["unreadable file"]
+        return result
+
+    result["errors"] = errors
+    result["headerValid"] = len(errors) == 0
+    return result
+
+
+def check_splash_wgpk_sync(
+    repo_root: Path,
+    *,
+    data_dir: Path | None = None,
+    work_dir: Path | None = None,
+    shaders_dir: Path | str | None = None,
+) -> dict[str, Any]:
+    """Validate `splash.wgsl.pack` WGPK v1 header and `.reflect.json` sidecar sync."""
+    resolved_data = data_dir if data_dir is not None else (repo_root / "local-data")
+    resolved_work = work_dir if work_dir is not None else (repo_root / "work")
+    web_root = repo_root / "web"
+
+    shaders_dir_provided = shaders_dir is not None
+    shaders_dir_exists = False
+    pack_path: Path | None = None
+    warnings: list[str] = []
+
+    def _add_warning(msg: str) -> None:
+        if msg not in warnings:
+            warnings.append(msg)
+
+    if shaders_dir is not None:
+        raw_dir = Path(shaders_dir).expanduser()
+        target_dir = raw_dir if (raw_dir.is_absolute() or raw_dir.exists()) else (repo_root / raw_dir)
+        shaders_dir_exists = target_dir.is_dir()
+        if not shaders_dir_exists:
+            _add_warning("shaders directory not found")
+        else:
+            candidate = target_dir / SPLASH_PACK_NAME
+            if candidate.is_file():
+                pack_path = candidate
+    else:
+        search_dirs = (
+            resolved_data / "shaders",
+            resolved_data,
+            web_root / "shaders",
+            web_root / "dist",
+            resolved_work,
+        )
+        for directory in search_dirs:
+            if directory.is_dir():
+                shaders_dir_exists = True
+                candidate = directory / SPLASH_PACK_NAME
+                if candidate.is_file():
+                    pack_path = candidate
+                    break
+
+    if pack_path is None:
+        _add_warning(f"{SPLASH_PACK_NAME} not found")
+        return {
+            "shadersDirProvided": shaders_dir_provided,
+            "shadersDirExists": shaders_dir_exists,
+            "present": False,
+            "sizeBytes": 0,
+            "headerValid": False,
+            "version": None,
+            "entryCount": None,
+            "flags": None,
+            "stageCounts": {"vertex": 0, "fragment": 0, "compute": 0},
+            "sidecarPresent": False,
+            "sidecarValid": False,
+            "sidecarStageCount": None,
+            "sidecarStale": False,
+            "mtimeDeltaSeconds": None,
+            "countMatch": None,
+            "inSync": False,
+            "ok": False,
+            "warning": True,
+            "warnings": warnings,
+            "errors": [],
+        }
+
+    pack_info = inspect_wgpk_header(pack_path)
+    errors = list(pack_info["errors"])
+    header_valid = bool(pack_info["headerValid"])
+    entry_count = pack_info["entryCount"]
+
+    if not header_valid:
+        _add_warning(f"{SPLASH_PACK_NAME} header validation failed")
+    elif entry_count == 0:
+        _add_warning(f"{SPLASH_PACK_NAME} has 0 shader entries")
+
+    sidecar_path = _find_adjacent_sidecar(pack_path)
+    sidecar_present = sidecar_path is not None
+    sidecar_valid = False
+    sidecar_stage_count: int | None = None
+    sidecar_stale = False
+    mtime_delta_seconds: float | None = None
+    count_match: bool | None = None
+
+    if not sidecar_present:
+        _add_warning(f"{SPLASH_PACK_NAME}.reflect.json sidecar is missing")
+    else:
+        assert sidecar_path is not None
+        sidecar_info = _inspect_reflect_sidecar(sidecar_path)
+        sidecar_valid = bool(sidecar_info["valid"])
+        sidecar_stage_count = int(sidecar_info["stageCount"])
+        if not sidecar_valid:
+            _add_warning(f"{SPLASH_PACK_NAME}.reflect.json sidecar is invalid")
+            for err in sidecar_info["errors"]:
+                if err not in errors:
+                    errors.append(err)
+
+        try:
+            pack_mtime = pack_path.stat().st_mtime
+            sidecar_mtime = sidecar_path.stat().st_mtime
+            delta = sidecar_mtime - pack_mtime
+            mtime_delta_seconds = round(delta, 3)
+            if (pack_mtime - sidecar_mtime) > 1e-3:
+                sidecar_stale = True
+                _add_warning(f"{SPLASH_PACK_NAME}.reflect.json sidecar is stale (older than {SPLASH_PACK_NAME})")
+        except OSError:
+            pass
+
+        if header_valid and sidecar_valid and isinstance(entry_count, int):
+            count_match = entry_count == sidecar_stage_count
+            if not count_match:
+                _add_warning(
+                    f"sidecar stage count ({sidecar_stage_count}) does not match "
+                    f"{SPLASH_PACK_NAME} entry count ({entry_count})"
+                )
+
+    in_sync = bool(
+        header_valid
+        and sidecar_present
+        and sidecar_valid
+        and not sidecar_stale
+        and count_match is True
+    )
+    ok = bool(header_valid and isinstance(entry_count, int) and entry_count > 0 and in_sync)
+
+    return {
+        "shadersDirProvided": shaders_dir_provided,
+        "shadersDirExists": shaders_dir_exists,
+        "present": True,
+        "sizeBytes": int(pack_info["sizeBytes"]),
+        "headerValid": header_valid,
+        "version": pack_info["version"],
+        "entryCount": entry_count,
+        "flags": pack_info["flags"],
+        "stageCounts": pack_info["stageCounts"],
+        "sidecarPresent": sidecar_present,
+        "sidecarValid": sidecar_valid,
+        "sidecarStageCount": sidecar_stage_count,
+        "sidecarStale": sidecar_stale,
+        "mtimeDeltaSeconds": mtime_delta_seconds,
+        "countMatch": count_match,
+        "inSync": in_sync,
+        "ok": ok,
+        "warning": len(warnings) > 0,
+        "warnings": warnings,
+        "errors": errors,
     }
 
 
@@ -1116,6 +1702,12 @@ def run_preflight(
     skip_server_check: bool = False,
     min_free_gb: float = DEFAULT_MIN_FREE_GB,
     disk_usage_fn: Callable[[Path], Any] | None = None,
+    shaders_dir: Path | str | None = None,
+    min_free_ram_gb: float = DEFAULT_MIN_FREE_RAM_GB,
+    memory_info_fn: Callable[[], tuple[int, int] | None] | None = None,
+    browser_which_fn: Callable[[str], str | None] | None = None,
+    browser_version_fn: Callable[[str], str | None] | None = None,
+    browser_candidate_paths_fn: Callable[[str], Sequence[Path]] | None = None,
 ) -> dict[str, Any]:
     """Run all preflight checks against `repo_root` and return a sanitized JSON-safe dict."""
     root = Path(repo_root).resolve()
@@ -1131,7 +1723,59 @@ def run_preflight(
         min_free_gb=min_free_gb,
         disk_usage_fn=disk_usage_fn,
     )
+    memory = check_memory_headroom(
+        min_free_ram_gb=min_free_ram_gb,
+        memory_info_fn=memory_info_fn,
+    )
+    eff_browser_which = which_fn if browser_which_fn is None else browser_which_fn
+    eff_browser_version = version_fn if browser_version_fn is None else browser_version_fn
+    browser = check_browser(
+        which_fn=eff_browser_which,
+        version_fn=eff_browser_version,
+        candidate_paths_fn=browser_candidate_paths_fn,
+    )
     artifacts = check_artifacts(root, data_dir=data_dir)
+    splash_pack = check_splash_wgpk_sync(
+        root,
+        data_dir=data_dir,
+        work_dir=work_dir,
+        shaders_dir=shaders_dir,
+    )
+
+    fast_boot_warnings: list[str] = []
+    for msg in splash_pack["warnings"]:
+        if msg not in fast_boot_warnings:
+            fast_boot_warnings.append(msg)
+    for msg in browser["warnings"]:
+        if msg not in fast_boot_warnings:
+            fast_boot_warnings.append(msg)
+    if disk_space["lowSpace"]:
+        fast_boot_warnings.append(
+            f"free disk space ({disk_space['freeGb']:.2f} GB) is below "
+            f"{disk_space['minFreeGb']:.2f} GB browser-boot threshold"
+        )
+    if memory["lowMemory"]:
+        fast_boot_warnings.append(
+            f"available RAM ({memory['availableGb']:.2f} GB) is below "
+            f"{memory['minFreeRamGb']:.2f} GB browser-boot threshold"
+        )
+
+    fast_boot: dict[str, Any] = {
+        "ready": bool(
+            splash_pack["ok"]
+            and browser["available"]
+            and disk_space["ok"]
+            and memory["ok"]
+        ),
+        "splashPackOk": bool(splash_pack["ok"]),
+        "sidecarInSync": bool(splash_pack["inSync"]),
+        "browserAvailable": bool(browser["available"]),
+        "browserFamily": browser["family"],
+        "diskHeadroomOk": bool(disk_space["ok"]),
+        "ramHeadroomOk": bool(memory["ok"]),
+        "warnings": fast_boot_warnings,
+    }
+
     if skip_server_check:
         server: dict[str, Any] = {
             "checked": False,
@@ -1157,7 +1801,11 @@ def run_preflight(
         "toolchains": toolchains,
         "localEnv": local_env,
         "diskSpace": disk_space,
+        "memory": memory,
+        "browser": browser,
         "artifacts": artifacts,
+        "splashPack": splash_pack,
+        "fastBoot": fast_boot,
         "server": server,
         "milestones": milestones,
         "nextCommands": next_commands,
@@ -1229,6 +1877,39 @@ def format_report_text(report: Mapping[str, Any]) -> str:
                     f"(>= {threshold:.2f} GB)"
                 )
 
+    memory = report.get("memory")
+    if isinstance(memory, Mapping):
+        ram_threshold = memory.get("minFreeRamGb", DEFAULT_MIN_FREE_RAM_GB)
+        lines.append("")
+        lines.append(f"Memory Headroom (warning threshold: {ram_threshold:.2f} GB):")
+        if not memory.get("checked"):
+            lines.append(
+                f"  [WARN] {'system RAM':<16} {memory.get('error') or 'memory info unavailable'}"
+            )
+        elif memory.get("lowMemory"):
+            lines.append(
+                f"  [WARN] {'system RAM':<16} {memory.get('availableGb', 0.0):.2f} GB available / "
+                f"{memory.get('totalGb', 0.0):.2f} GB total (below {ram_threshold:.2f} GB warning threshold)"
+            )
+        else:
+            lines.append(
+                f"  {_warn_tag(True)} {'system RAM':<16} {memory.get('availableGb', 0.0):.2f} GB available / "
+                f"{memory.get('totalGb', 0.0):.2f} GB total (>= {ram_threshold:.2f} GB)"
+            )
+
+    browser = report.get("browser")
+    if isinstance(browser, Mapping):
+        lines.append("")
+        lines.append("Browser Availability (WebGPU / Wasm64):")
+        if browser.get("available"):
+            family = browser.get("family") or "chromium"
+            ver = browser.get("version") or "detected"
+            lines.append(f"  {_warn_tag(True)} {family:<16} {ver}")
+        else:
+            lines.append(
+                f"  [WARN] {'browser':<16} no Chrome/Edge/Chromium browser detected"
+            )
+
     lines.append("")
     lines.append("Build & Runtime Artifacts:")
     art = report["artifacts"]
@@ -1295,6 +1976,20 @@ def format_report_text(report: Mapping[str, Any]) -> str:
                 f"{sidecars['count']} found ({sidecars['invalidCount']} invalid, "
                 f"invalid_inline_samplers={sidecars['invalidInlineSamplerCount']}: {err_summary})"
             )
+
+    splash = report.get("splashPack")
+    if isinstance(splash, Mapping):
+        if splash.get("ok"):
+            sc = splash.get("stageCounts", {})
+            lines.append(
+                f"  {_warn_tag(True)} {SPLASH_PACK_NAME:<25} "
+                f"WGPK v{splash.get('version')} (entries={splash.get('entryCount')}: "
+                f"vs={sc.get('vertex', 0)}, fs={sc.get('fragment', 0)}, cs={sc.get('compute', 0)}; "
+                f"sidecar in sync)"
+            )
+        else:
+            warn_summary = "; ".join(splash.get("warnings") or splash.get("errors") or ["not ready"])
+            lines.append(f"  {_warn_tag(False)} {SPLASH_PACK_NAME:<25} {warn_summary}")
 
     lines.append("")
     lines.append("Server COOP/COEP Self-Check:")
@@ -1363,6 +2058,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
             f"a low-space warning (default: {DEFAULT_MIN_FREE_GB:g})."
         ),
     )
+    parser.add_argument(
+        "--min-free-ram-gb",
+        type=float,
+        default=DEFAULT_MIN_FREE_RAM_GB,
+        help=(
+            f"Minimum available system RAM in GB before emitting a low-memory "
+            f"browser-boot warning (default: {DEFAULT_MIN_FREE_RAM_GB:g})."
+        ),
+    )
+    parser.add_argument(
+        "--shaders-dir",
+        type=Path,
+        default=None,
+        help=(
+            f"Optional shaders directory to inspect for {SPLASH_PACK_NAME} WGPK v1 "
+            f"header sanity and .reflect.json sidecar sync."
+        ),
+    )
     return parser
 
 
@@ -1371,11 +2084,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not math.isfinite(args.min_free_gb) or args.min_free_gb < 0:
         parser.error("--min-free-gb must be a finite non-negative number")
+    if not math.isfinite(args.min_free_ram_gb) or args.min_free_ram_gb < 0:
+        parser.error("--min-free-ram-gb must be a finite non-negative number")
 
     report = run_preflight(
         repo_root=args.repo_root,
         skip_server_check=args.skip_server,
         min_free_gb=args.min_free_gb,
+        shaders_dir=args.shaders_dir,
+        min_free_ram_gb=args.min_free_ram_gb,
     )
 
     if args.json:
