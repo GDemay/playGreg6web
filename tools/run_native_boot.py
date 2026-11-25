@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """One-command native boot runner: rebuild what is stale, run `playgta6_boot`, keep the run.
 
-    python tools/run_native_boot.py [--preset smoke|start-screen|menu-flow|menu-flow-2|menu-flow-3|long] [--name NAME]
+    python tools/run_native_boot.py [--preset smoke|start-screen|menu-flow|menu-flow-2|menu-flow-3|menu-flow-4|long]
+        [--name NAME]
         [--exe PATH] [--game-dir DIR] [options] [-- extra playgta6_boot options]
 
 What it does, in order:
@@ -28,12 +29,20 @@ What it does, in order:
 2. Run `playgta6_boot --program-dir <program> --name <exe name> --game-dir <game-dir>` with a
    preset or explicit options. Presets: `smoke` (60 s limit, 90 s watchdog), `start-screen`
    (120 s limit; an input script pressing A for 100 ms once a second from 5 s on), `menu-flow`
-   (240 s limit; A every 2.5 s from 20 s, then D-pad Down, Down, A through LEGAL NOTICES), `menu-flow-2` (360 s limit; the same, then
-   every 14 s Up x6 + Down, Down, A: leaves the list screen), `menu-flow-3` (420 s limit; the same until 200 s, then scrolls
-   TERMS OF SERVICE with RDown + Down and presses A), `long`
-   (600 s limit, 630 s watchdog). `--max-ms`, `--watchdog-ms`, `--input-script FILE`,
+   (240 s limit; A every 2.5 s from 20 s, then Up x6 + Down, Down, A every 14 s through LEGAL
+   NOTICES to the list screen, then A every 3 s), `menu-flow-2` (360 s limit; the same, then the
+   Up x6 + Down, Down, A cycle on), `menu-flow-3` (420 s limit; the same to the list screen, then
+   scrolls it with RDown + Down and presses A), `menu-flow-4` (420 s limit;
+   Up + A on the list screen, which leads to the 34 draws/frame screen, then the menu cycle), `long`
+   (600 s limit, 630 s watchdog). The menu-flow presets are screen-synchronised: they repeat the
+   menu cycle until the list screen after LEGAL NOTICES holds (draws/frame 33 or 50, read live from
+   the present counters; `wait` / `repeat` steps in runtime/guest/input_script.h), so a slower run
+   (a payload capture, a busy machine) does not desync them. `--max-ms`, `--watchdog-ms`, `--input-script FILE`,
    `--shader-pack FILE`, `--gpu-capture-frames N` (captures into the run directory),
-   `--gpu-capture-payloads`, `--gpu-capture-thin-uploads N`, `--dump-pipelines DIR` and everything after `--` are passed through.
+   `--gpu-capture-payloads`, `--gpu-capture-thin-uploads N`, `--gpu-capture-start-ms N` (frames start
+   late; objects and the newest writes are kept), `--gpu-capture-start-at-script` (frames start at
+   the script's `capture` step: the presets' list screen), `--dump-pipelines DIR` and everything
+   after `--` are passed through.
 3. The run lands in `<runs-dir>/<name>/`: `boot-report.json`, `summary.txt` (the harness text
    summary), `boot.log` (stdout and stderr), `capture.pg6trace` (+ `.json`, with a GPU capture),
    `input-script.txt` (with an input script), `import-trace.txt` (`--import-trace`),
@@ -82,6 +91,7 @@ PRESETS: dict[str, dict] = {
     "menu-flow": {"max_ms": 240_000, "watchdog_ms": 270_000, "input": "menu-flow"},
     "menu-flow-2": {"max_ms": 360_000, "watchdog_ms": 390_000, "input": "menu-flow-2"},
     "menu-flow-3": {"max_ms": 420_000, "watchdog_ms": 450_000, "input": "menu-flow-3"},
+    "menu-flow-4": {"max_ms": 420_000, "watchdog_ms": 450_000, "input": "menu-flow-4"},
     "long": {"max_ms": 600_000, "watchdog_ms": 630_000, "input": None},
 }
 INPUT_START_MS = 5_000
@@ -423,59 +433,98 @@ def make_plan(repo: Path, build_dir: Path, exe: Path | None, game_dir: Path | No
 # ---------------------------------------------------------------------------
 
 
+# Screens of the menu flow by draws per frame (the live present counters, #663): start screen ~21,
+# loading 4, UI TEXT SIZE 20, FINISH SETUP? 30, 23, LEGAL NOTICES 37 (44 with the cursor moved),
+# then the list screen reached through LEGAL NOTICES' "Next >": 50 with the cursor up, 33 after Down.
+LIST_SCREEN = "draws_per_frame==33|50"
+
+
+def _menu_cycle(t: int = 0) -> list[tuple[int, str, int]]:
+    """Up x6 (cursor reset), Down, Down, A: LEGAL NOTICES' "Next >" (and each earlier screen's A)."""
+    return ([(t + i * 400, "DUp", 100) for i in range(6)]
+            + [(t + 3_000, "DDown", 150), (t + 4_500, "DDown", 150), (t + 6_500, "A", INPUT_HOLD_MS)])
+
+
+def _lines(events: Sequence[tuple[int, str, int]], limit: int | None = None) -> list[str]:
+    return [f"{t} {b} {h}" for t, b, h in events if limit is None or t < limit]
+
+
+def _to_list_screen() -> list[str]:
+    """A every 2.5 s from 20 s (intro, start screen), then the menu cycle every 14 s until the list
+    screen after LEGAL NOTICES is up and steady (screen-synchronised: a slow run just takes more
+    rounds; no press goes out once the list screen is on), then the capture step (only acts with
+    --gpu-capture-start-at-script). Later press times count from the moment the list screen held."""
+    lines = _lines([(t, "A", INPUT_HOLD_MS) for t in range(20_000, 60_000, 2_500)])
+    lines.append(f"repeat every 14s until {LIST_SCREEN} for 1500ms")
+    lines += ["  " + line for line in _lines(_menu_cycle())]
+    lines += ["end", "capture"]
+    return lines
+
+
 def menu_flow_script_text(duration_ms: int) -> str:
-    """The menu-flow preset: past the intro movie (about 20 s) A every 2.5 s through the start
-    screen, loading and UI TEXT SIZE; then D-pad Down, Down, A (the "Next >" entry of LEGAL
-    NOTICES) every 12 s, which lands whatever the exact arrival time; then A every 3 s."""
-    lines = ["# menu-flow (tools/run_native_boot.py): A every 2.5 s from 20 s; Down, Down, A every 12 s",
-             "# from 64 s (LEGAL NOTICES -> Next >); then A every 3 s"]
-    events = [(t, "A", INPUT_HOLD_MS) for t in range(20_000, 60_000, 2_500)]
-    for t in range(64_000, 124_000, 12_000):
-        events += [(t, "DDown", 150), (t + 2_000, "DDown", 150), (t + 4_500, "A", INPUT_HOLD_MS)]
-    events += [(t, "A", INPUT_HOLD_MS) for t in range(130_000, duration_ms, 3_000)]
-    lines += [f"{t} {b} {h}" for t, b, h in events if t < duration_ms]
+    """The menu-flow preset: to the list screen after LEGAL NOTICES (_to_list_screen), then A every 3 s."""
+    lines = ["# menu-flow (tools/run_native_boot.py): A every 2.5 s from 20 s; Up x6, Down, Down, A every 14 s",
+             "# until the list screen after LEGAL NOTICES (" + LIST_SCREEN + "); then A every 3 s"]
+    lines += _to_list_screen()
+    lines += _lines([(t, "A", INPUT_HOLD_MS) for t in range(3_000, duration_ms, 3_000)])
     return "\n".join(lines) + "\n"
 
 
 def menu_flow_2_script_text(duration_ms: int) -> str:
-    """The menu-flow-2 preset: A every 2.5 s from 20 s (intro, start screen, loading, UI TEXT SIZE),
-    then every 14 s from 64 s a cursor reset (D-pad Up x6) + Down, Down, A. Measured (#663): the
-    list screen (4 draws/frame) is left by exactly that Down x2 + A, to the 20 draws/frame screen;
-    a second Down x2 + A cycle leads on to the 30 draws/frame screen (Down x0/x1 + A and RDown + A
-    did nothing). Later cycles keep the cursor deterministic whatever the arrival time."""
-    lines = ["# menu-flow-2 (tools/run_native_boot.py): A every 2.5 s from 20 s; every 14 s from 64 s:",
-             "# Up x6 (cursor reset), Down, Down, A (the list screen's third entry)"]
-    events = [(t, "A", INPUT_HOLD_MS) for t in range(20_000, 60_000, 2_500)]
-    for t in range(64_000, duration_ms - 8_000, 14_000):
-        events += [(t + i * 400, "DUp", 100) for i in range(6)]
-        events += [(t + 3_000, "DDown", 150), (t + 4_500, "DDown", 150), (t + 6_500, "A", INPUT_HOLD_MS)]
-    lines += [f"{t} {b} {h}" for t, b, h in events if t < duration_ms]
+    """The menu-flow-2 preset: to the list screen (_to_list_screen), then the menu cycle every 14 s
+    (Up x6 + Down, Down, A: the list screen's third entry; later cycles keep the cursor
+    deterministic). Measured (#663): only that cycle left the list screens; Down x0/x1 + A and
+    RDown + A did nothing."""
+    lines = ["# menu-flow-2 (tools/run_native_boot.py): to the list screen after LEGAL NOTICES", "# ("
+             + LIST_SCREEN + "), then every 14 s: Up x6 (cursor reset), Down, Down, A"]
+    lines += _to_list_screen()
+    events: list[tuple[int, str, int]] = []
+    for t in range(2_000, duration_ms, 14_000):
+        events += _menu_cycle(t)
+    lines += _lines(events, duration_ms)
     return "\n".join(lines) + "\n"
 
 
 def menu_flow_3_script_text(duration_ms: int) -> str:
-    """The menu-flow-3 preset: the menu-flow-2 cycles until 200 s (the TERMS OF SERVICE screen, ~37
-    draws/frame, prompts SCROLL (right stick) / SELECT (A) / BACK (B), is on screen from ~210 s), then
-    scroll it to the end (RDown held 1.2 s + D-pad Down every 2 s until 300 s), then A every 4 s.
-    Measured (#663): the menu-flow-2 cycle's A at 350.5 s (after ~40 D-pad Downs) left the screen and
-    the guest then faulted in the unimplemented XGameSave slot 16."""
-    base = menu_flow_2_script_text(duration_ms).splitlines()
-    lines = ["# menu-flow-3 (tools/run_native_boot.py): menu-flow-2 until 200 s; then RDown + Down every 2 s",
-             "# (scroll TERMS OF SERVICE to its end) until 300 s; then A every 4 s"]
-    for line in base:
-        if line.startswith("#"):
-            continue
-        if int(line.split()[0]) < 200_000:
-            lines.append(line)
-    events = []
-    for t in range(200_000, 300_000, 2_000):
+    """The menu-flow-3 preset: to the list screen (_to_list_screen), then scroll it (RDown held 1.2 s
+    + D-pad Down every 2 s for 100 s), then A every 4 s. Measured (#663): the list screen (50/33
+    draws/frame) is the screen that stayed up to the 420 s limit; A only ever reached it in its
+    Down (33) state."""
+    lines = ["# menu-flow-3 (tools/run_native_boot.py): to the list screen after LEGAL NOTICES (" + LIST_SCREEN + ");",
+             "# then RDown + Down every 2 s for 100 s; then A every 4 s"]
+    lines += _to_list_screen()
+    events: list[tuple[int, str, int]] = []
+    for t in range(0, 100_000, 2_000):
         events += [(t, "RDown", 1_200), (t + 1_500, "DDown", 150)]
-    events += [(t, "A", INPUT_HOLD_MS) for t in range(302_000, duration_ms, 4_000)]
-    lines += [f"{t} {b} {h}" for t, b, h in events if t < duration_ms]
+    events += [(t, "A", INPUT_HOLD_MS) for t in range(102_000, duration_ms, 4_000)]
+    lines += _lines(events, duration_ms)
+    return "\n".join(lines) + "\n"
+
+
+# The screen behind the list screen's Up + A (#663: 34 draws/frame after a ~3 s transition).
+NEXT_SCREEN = "draws_per_frame==34"
+
+
+def menu_flow_4_script_text(duration_ms: int) -> str:
+    """The menu-flow-4 preset: to the list screen (_to_list_screen), D-pad Up (the cursor's top
+    state, 50 draws/frame) and A, then wait for the next screen (34 draws/frame, steady 2 s), then
+    the menu cycle every 14 s (untested on that screen). Measured (#663, native, menu-flow-3 with
+    waits): A in the list screen's Down state (33) only blipped; Up + A animated for ~3 s into a
+    34 draws/frame screen that stayed up through 250 s of RDown + Down and A every 4 s."""
+    lines = ["# menu-flow-4 (tools/run_native_boot.py): to the list screen after LEGAL NOTICES (" + LIST_SCREEN + ");",
+             "# Up, A; wait for " + NEXT_SCREEN + "; then every 14 s: Up x6, Down, Down, A"]
+    lines += _to_list_screen()
+    lines += ["1000 DUp 150", "3000 A 100", f"wait {NEXT_SCREEN} for 2s timeout 30s"]
+    events: list[tuple[int, str, int]] = []
+    for t in range(2_000, duration_ms, 14_000):
+        events += _menu_cycle(t)
+    lines += _lines(events, duration_ms)
     return "\n".join(lines) + "\n"
 
 
 def input_script_text(duration_ms: int, kind: str = "start-screen") -> str:
+    if kind == "menu-flow-4":
+        return menu_flow_4_script_text(duration_ms)
     if kind == "menu-flow-3":
         return menu_flow_3_script_text(duration_ms)
     if kind == "menu-flow-2":
@@ -571,18 +620,52 @@ THUMB_MIN_SEGMENT_MS = 1000.0
 
 
 def thumbnail_frames(segs: Sequence[dict], min_ms: float = THUMB_MIN_SEGMENT_MS,
-                     total_presents: int | None = None) -> list[tuple[int, int, int, float]]:
-    """(segment number, middle present index, draws/frame, start seconds) of every segment spanning
-    more than `min_ms` (first to last sampled present)."""
+                     total_presents: int | None = None, first_present: int = 0) -> list[tuple[int, int, int, float]]:
+    """(segment number, trace frame, draws/frame, start seconds) of every segment spanning more than
+    `min_ms` (first to last sampled present), at its middle present. A late-started capture's frame
+    i is present `first_present` + i (the sidecar's first_present); `total_presents` bounds the
+    run's present index."""
     out = []
     for n, s in enumerate(segs):
         if float(s["end_time"]) - float(s["start_time"]) <= min_ms:
             continue
-        frame = int(s["first_present"]) + (int(s["presents"]) - 1) // 2
-        if total_presents is not None and frame >= total_presents:
+        lo = max(int(s["first_present"]), first_present)
+        hi = int(s["first_present"]) + int(s["presents"]) - 1
+        if lo > hi:
             continue
-        out.append((n, frame, int(s["draws_per_frame"]), float(s["start_time"]) / 1000.0))
+        present = lo + (hi - lo) // 2
+        if total_presents is not None and present >= total_presents:
+            continue
+        out.append((n, present - first_present, int(s["draws_per_frame"]), float(s["start_time"]) / 1000.0))
     return out
+
+
+def capture_first_present(run_dir: Path) -> int:
+    """The sidecar's first_present (0 for a capture from boot or an older sidecar)."""
+    try:
+        side = json.loads((run_dir / "capture.pg6trace.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return 0
+    return int(side.get("first_present") or 0) if isinstance(side, dict) else 0
+
+
+INPUT_LOG = re.compile(r"^\[input\] (\d+) ms: (.*)$", re.M)
+
+
+def logged_input_times(log_text: str) -> list[float]:
+    """Press times (ms) the harness logged ("[input] <ms> ms: press ..."): the real times of a
+    screen-synchronised script, whose own times are relative to its waits."""
+    return [float(m.group(1)) for m in INPUT_LOG.finditer(log_text) if m.group(2).startswith("press ")]
+
+
+def input_wait_line(log_text: str) -> str | None:
+    """One digest line on the script's wait / repeat steps, or None without any."""
+    ends = [(int(m.group(1)), m.group(2)) for m in INPUT_LOG.finditer(log_text)
+            if m.group(2).endswith(")") and (" met (" in m.group(2) or " timed out (" in m.group(2))]
+    if not ends:
+        return None
+    parts = [f"{what.split(' (presents')[0]} @ {ms / 1000:.1f} s" for ms, what in ends]
+    return "input waits: " + "; ".join(parts)
 
 
 def thumbnail_name(seg: int, start_s: float, draws: int) -> str:
@@ -608,7 +691,8 @@ def make_thumbnails(args, run_dir: Path, report: dict, env: Mapping[str, str],
     pack = args.replay_pack
     if not chrome or not pack:
         return ["thumbnails: no Chrome found (pass --chrome or set $PLAYGTA6_CHROME) and pass --replay-pack (the wgsl pack)"]
-    picks = thumbnail_frames(report.get("screen_timeline") or [], total_presents=len(report.get("presents") or []) or None)
+    picks = thumbnail_frames(report.get("screen_timeline") or [], total_presents=len(report.get("presents") or []) or None,
+                             first_present=capture_first_present(run_dir))
     if not picks:
         return ["thumbnails: no screen segment longer than 1 s within the captured frames"]
     thumbs = run_dir / "thumbs"
@@ -681,6 +765,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--gpu-capture-payloads", action="store_true", help="keep payloads in the capture")
     p.add_argument("--gpu-capture-thin-uploads", type=int, metavar="N",
                    help="with payloads: keep only every Nth write of a texture/buffer > 4 MiB")
+    p.add_argument("--gpu-capture-start-ms", type=int, metavar="N",
+                   help="start the captured frames N ms after boot (objects and the newest writes are kept)")
+    p.add_argument("--gpu-capture-start-at-script", action="store_true",
+                   help="start the captured frames at the input script's `capture` step (the menu-flow presets: the list screen)")
     p.add_argument("--thumbnails", action="store_true",
                    help="after a payload GPU capture, replay it in Chrome and save one image per screen segment")
     p.add_argument("--chrome", help="Chrome executable for --thumbnails (default $PLAYGTA6_CHROME, then auto-detected)")
@@ -762,6 +850,10 @@ def _run(args, extra: list[str], runner: Runner, env: Mapping[str, str], repo: P
             cmd += ["--gpu-capture-payloads"]
             if args.gpu_capture_thin_uploads:
                 cmd += ["--gpu-capture-thin-uploads", str(args.gpu_capture_thin_uploads)]
+        if args.gpu_capture_start_ms:
+            cmd += ["--gpu-capture-start-ms", str(args.gpu_capture_start_ms)]
+        if args.gpu_capture_start_at_script:
+            cmd += ["--gpu-capture-start-at-script"]
     if args.import_trace:
         cmd += ["--import-trace", str(run_dir / "import-trace.txt")]
     if args.dump_pipelines:
@@ -812,14 +904,22 @@ def _run(args, extra: list[str], runner: Runner, env: Mapping[str, str], repo: P
         print(f"error: the harness (exit {code}) wrote no report; see {run_dir / 'boot.log'}", file=sys.stderr)
         return 3
     presents = timeline_presents(report)
+    log_text = ""
+    try:
+        log_text = (run_dir / "boot.log").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        pass
     if presents and "screen_timeline" not in report:
-        times: list[float] = []
+        times: list[float] = logged_input_times(log_text)
         ipath = Path(args.input_script) if args.input_script else script_path
-        if ipath.is_file():
+        if not times and ipath.is_file():
             times = screen_timeline.parse_input_times(ipath.read_text(encoding="utf-8"))
         report["screen_timeline"] = screen_timeline.build_timeline(presents, times)
         (run_dir / "boot-report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     text = digest(report, code)
+    waits = input_wait_line(log_text)
+    if waits:
+        text += NL + waits
     (run_dir / "digest.txt").write_text(text + "\n", encoding="utf-8")
     print(text)
     hint = shader_pack_hint(report, args.shader_pack)

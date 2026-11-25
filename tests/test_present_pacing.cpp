@@ -97,7 +97,9 @@ void test_immediate_and_off() {
 
 void test_present_samples_ring() {
     playgta6::gpu::PresentSampleRing r(3);
+    CHECK(r.last().index == 0 && r.last().draws == 0);
     r.record(10, 5, 2);
+    CHECK(r.last().draws == 5 && r.last().wall_ms == 10);
     r.record(20, 12, 2);
     auto v = r.snapshot();
     CHECK(v.size() == 2 && v[0].draws == 5 && v[0].resources == 2);
@@ -109,6 +111,9 @@ void test_present_samples_ring() {
     CHECK(r.total() == 5 && r.size() == 3 && v.size() == 3);
     CHECK(v[0].index == 2 && v[1].index == 3 && v[2].index == 4);
     CHECK(v[1].draws == 8 && v[2].draws == 0);
+    CHECK(r.last().index == 4 && r.last().wall_ms == 50);  // the newest, also after wrapping
+    r.record(60, 23, 4);
+    CHECK(r.last().index == 5 && r.last().draws == 3);
     r.clear();
     CHECK(r.total() == 0 && r.snapshot().empty());
 }

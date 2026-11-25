@@ -350,54 +350,99 @@ class RunTests(unittest.TestCase):
         self.assertEqual(rnb.timeline_presents({"presents": cap, "present_samples": samples}), cap)
         self.assertEqual(rnb.timeline_presents({}), [])
 
+    @staticmethod
+    def _sections(script: str):
+        """(timed presses before the repeat, repeat header, repeat body, steps after `end`)."""
+        lines = [line.strip() for line in script.splitlines() if line.strip() and not line.startswith("#")]
+        r = next(i for i, line in enumerate(lines) if line.startswith("repeat "))
+        e = lines.index("end")
+        return ([line.split() for line in lines[:r]], lines[r], [line.split() for line in lines[r + 1:e]],
+                lines[e + 1:])
+
+    def _check_to_list_screen(self, script: str):
+        before, header, body, after = self._sections(script)
+        self.assertEqual(before[0], ["20000", "A", "100"])
+        self.assertEqual(before[-1], ["57500", "A", "100"])
+        self.assertEqual(header, "repeat every 14s until draws_per_frame==33|50 for 1500ms")
+        self.assertEqual([e[1] for e in body], ["DUp"] * 6 + ["DDown", "DDown", "A"])
+        self.assertEqual(body[-1], ["6500", "A", "100"])
+        self.assertEqual(after[0], "capture")
+        return [line.split() for line in after[1:]]
+
     def test_menu_flow_preset(self):
         self.assertEqual(rnb.PRESETS["menu-flow"]["max_ms"], 240_000)
-        script = rnb.input_script_text(240_000, "menu-flow").splitlines()
-        events = [line.split() for line in script if not line.startswith("#")]
-        self.assertEqual(events[0], ["20000", "A", "100"])
-        # Down, Down, A for LEGAL NOTICES' "Next >", every 12 s from 64 s.
-        i = events.index(["64000", "DDown", "150"])
-        self.assertEqual(events[i + 1], ["66000", "DDown", "150"])
-        self.assertEqual(events[i + 2], ["68500", "A", "100"])
-        times = [int(e[0]) for e in events]
-        self.assertEqual(times, sorted(times))
-        self.assertLess(times[-1], 240_000)
+        tail = self._check_to_list_screen(rnb.input_script_text(240_000, "menu-flow"))
+        self.assertEqual(tail[0], ["3000", "A", "100"])
+        self.assertEqual({e[1] for e in tail}, {"A"})
         with tempfile.TemporaryDirectory() as d:
             fx = Fixture(Path(d))
             code, _, _, _ = fx.run("--preset", "menu-flow", "--name", "mf")
             self.assertEqual(code, 0)
-            written = (fx.build / "runs" / "mf" / "input-script.txt").read_text().splitlines()
-            self.assertIn("68500 A 100", written)
+            written = (fx.build / "runs" / "mf" / "input-script.txt").read_text()
+            self.assertIn("repeat every 14s until draws_per_frame==33|50 for 1500ms", written)
             args = json.loads((fx.build / "runs" / "mf" / "boot-report.json").read_text())["args"]
             self.assertEqual(args[args.index("--max-ms") + 1], "240000")
 
     def test_menu_flow_2_preset(self):
         self.assertEqual(rnb.PRESETS["menu-flow-2"]["max_ms"], 360_000)
-        script = rnb.input_script_text(360_000, "menu-flow-2").splitlines()
-        events = [line.split() for line in script if not line.startswith("#")]
-        self.assertEqual(events[0], ["20000", "A", "100"])
-        times = [int(e[0]) for e in events]
+        tail = self._check_to_list_screen(rnb.input_script_text(360_000, "menu-flow-2"))
+        # After the list screen: every 14 s Up x6 reset, then Down, Down, A.
+        self.assertEqual([e[1] for e in tail[:9]], ["DUp"] * 6 + ["DDown", "DDown", "A"])
+        self.assertEqual(tail[0], ["2000", "DUp", "100"])
+        self.assertEqual(tail[8], ["8500", "A", "100"])
+        self.assertIn(["16000", "DUp", "100"], tail)
+        times = [int(e[0]) for e in tail]
         self.assertEqual(times, sorted(times))
         self.assertLess(times[-1], 360_000)
-        # Each cycle: Up x6 reset, then Down, Down, A (the list screen's third entry).
-        i = events.index(["64000", "DUp", "100"])
-        self.assertEqual([e[1] for e in events[i:i + 9]], ["DUp"] * 6 + ["DDown", "DDown", "A"])
-        self.assertEqual(events[i + 8], ["70500", "A", "100"])
-        self.assertIn(["78000", "DUp", "100"], events)
-        self.assertEqual({e[1] for e in events}, {"A", "DUp", "DDown"})
 
     def test_menu_flow_3_preset(self):
         self.assertEqual(rnb.PRESETS["menu-flow-3"]["max_ms"], 420_000)
-        script = rnb.input_script_text(420_000, "menu-flow-3").splitlines()
-        events = [line.split() for line in script if not line.startswith("#")]
-        times = [int(e[0]) for e in events]
+        tail = self._check_to_list_screen(rnb.input_script_text(420_000, "menu-flow-3"))
+        self.assertEqual(tail[:2], [["0", "RDown", "1200"], ["1500", "DDown", "150"]])
+        self.assertIn(["102000", "A", "100"], tail)
+        self.assertEqual({e[1] for e in tail}, {"A", "DDown", "RDown"})
+        self.assertFalse([e for e in tail if e[1] == "A" and int(e[0]) < 102_000])
+        times = [int(e[0]) for e in tail]
         self.assertEqual(times, sorted(times))
         self.assertLess(times[-1], 420_000)
-        self.assertIn(["64000", "DUp", "100"], events)
-        self.assertIn(["200000", "RDown", "1200"], events)
-        self.assertIn(["302000", "A", "100"], events)
-        self.assertEqual({e[1] for e in events}, {"A", "DUp", "DDown", "RDown"})
-        self.assertFalse([e for e in events if e[1] == "DUp" and 200_000 <= int(e[0]) < 302_000])
+
+    def test_menu_flow_4_preset(self):
+        self.assertEqual(rnb.PRESETS["menu-flow-4"]["max_ms"], 420_000)
+        script = rnb.input_script_text(420_000, "menu-flow-4")
+        before, header, body, after = self._sections(script)
+        self.assertEqual(header, "repeat every 14s until draws_per_frame==33|50 for 1500ms")
+        self.assertEqual(after[:4], ["capture", "1000 DUp 150", "3000 A 100",
+                                     "wait draws_per_frame==34 for 2s timeout 30s"])
+        tail = [line.split() for line in after[4:]]
+        self.assertEqual([e[1] for e in tail[:9]], ["DUp"] * 6 + ["DDown", "DDown", "A"])
+        self.assertLess(int(tail[-1][0]), 420_000)
+
+    def test_logged_input_times_and_wait_line(self):
+        log = ("[harness] input script x: 12 event(s)\n"
+               "[input] 20000 ms: press 0x1 100\n"
+               "[input] 141600 ms: repeat (7 round(s)) draws_per_frame==33|50 met (presents 1900, draws_per_frame 50)\n"
+               "[input] 141600 ms: capture\n"
+               "[input] 141600 ms: press 0x100 1200\n"
+               "[input] 170000 ms: wait draws_per_frame!=33|50 timed out (presents 2300, draws_per_frame 33)\n")
+        self.assertEqual(rnb.logged_input_times(log), [20000.0, 141600.0])
+        self.assertEqual(rnb.input_wait_line(log),
+                         "input waits: repeat (7 round(s)) draws_per_frame==33|50 met @ 141.6 s; "
+                         "wait draws_per_frame!=33|50 timed out @ 170.0 s")
+        self.assertIsNone(rnb.input_wait_line("[input] 5 ms: press 0x1 100\n"))
+
+    def test_capture_start_flags_pass_through(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = Fixture(Path(d))
+            fx.run("--name", "late", "--gpu-capture-frames", "500", "--gpu-capture-payloads",
+                   "--gpu-capture-start-ms", "120000")
+            args = json.loads((fx.build / "runs" / "late" / "boot-report.json").read_text())["args"]
+            self.assertEqual(args[args.index("--gpu-capture-start-ms") + 1], "120000")
+            self.assertNotIn("--gpu-capture-start-at-script", args)
+            fx.run("--preset", "menu-flow-3", "--name", "late2", "--gpu-capture-frames", "500",
+                   "--gpu-capture-start-at-script")
+            args = json.loads((fx.build / "runs" / "late2" / "boot-report.json").read_text())["args"]
+            self.assertIn("--gpu-capture-start-at-script", args)
+            self.assertNotIn("--gpu-capture-start-ms", args)
 
     def test_presets(self):
         self.assertEqual(rnb.PRESETS["long"]["max_ms"], 600_000)
@@ -487,6 +532,17 @@ class ThumbnailTests(unittest.TestCase):
 
     def test_selection_skips_uncaptured_frames(self):
         self.assertEqual(rnb.thumbnail_frames(self.SEGS, total_presents=9), [])
+
+    def test_selection_with_late_capture(self):
+        # Frame i of a capture started at present 7 is present 7 + i: the middle of the captured
+        # part of segment 1 (presents 7..14) is present 10, trace frame 3.
+        self.assertEqual(rnb.thumbnail_frames(self.SEGS, first_present=7), [(1, 3, 120, 2.0)])
+        self.assertEqual(rnb.thumbnail_frames(self.SEGS, first_present=15), [])
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d)
+            self.assertEqual(rnb.capture_first_present(run), 0)
+            (run / "capture.pg6trace.json").write_text('{"first_present": 7}')
+            self.assertEqual(rnb.capture_first_present(run), 7)
 
     def test_name(self):
         self.assertEqual(rnb.thumbnail_name(1, 2.0, 120), "seg01_2s_120d.png")
