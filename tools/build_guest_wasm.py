@@ -153,7 +153,9 @@ SPLIT_INCOMING_MODULE_JS_API = (
 BROWSER_BOOT_EXPORTED_RUNTIME_METHODS = (
     "wasmMemory,FS,HEAPU8,addRunDependency,removeRunDependency"
 )
-BROWSER_BOOT_EXPORTED_FUNCTIONS = "_main,_playgta6_get_input_state_ptr"
+BROWSER_BOOT_EXPORTED_FUNCTIONS = (
+    "_main,_playgta6_get_input_state_ptr,_playgta6_audio_ring"
+)
 BROWSER_BOOT_EXPORT_LINK_FLAGS: tuple[str, ...] = (
     f"-sINCOMING_MODULE_JS_API={BROWSER_BOOT_INCOMING_MODULE_JS_API}",
     f"-sEXPORTED_RUNTIME_METHODS={BROWSER_BOOT_EXPORTED_RUNTIME_METHODS}",
