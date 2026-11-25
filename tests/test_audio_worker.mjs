@@ -13,11 +13,15 @@ const audioMod = require('../web/workers/audio_worker.js');
 const {
   AudioRingBuffer,
   AudioMixerWorker,
+  PcmScratchPool,
   OUTPUT_STATES,
+  OVERFLOW_POLICIES,
   DEFAULT_MAX_PCM_BYTES,
   DEFAULT_DECLICK_FRAMES,
   ITU_BS775_CENTER_GAIN,
   ITU_BS775_SURROUND_GAIN,
+  deinterleavePcm,
+  interleavePcm,
   extractSafePcmSamples,
   clonePcmForTransfer,
   sanitizeTransferList,
@@ -1353,5 +1357,365 @@ test('W170 sanitized audio-stats telemetry exposes downmixedFrames, clippedSampl
   assert.equal(dirty.stats.underrunCount, 3);
   assert.equal(dirty.stats.activeVoicePeak, 12);
   assert.equal(JSON.stringify(dirty).includes('bink2.bk2'), false);
+  worker.destroy();
+});
+
+// ---------------------------------------------------------------------------
+// W222: Zero-Alloc PCM Ring Forwarding, Overflow Drop Guards, Underrun Recovery & Telemetry
+// ---------------------------------------------------------------------------
+
+test('W222 interleaved<->planar conversion reuses scratch buffers with zero steady-state TypedArray allocations', () => {
+  assert.equal(typeof PcmScratchPool, 'function');
+  assert.equal(typeof deinterleavePcm, 'function');
+  assert.equal(typeof interleavePcm, 'function');
+
+  // 1. Standalone deinterleavePcm / interleavePcm round-trip + NaN sanitization across 1ch, 2ch, 6ch.
+  const stereoIn = new Float32Array([0.25, -0.25, 0.5, Number.NaN, -0.75, Infinity, 1.0, -1.0]);
+  const planar2 = deinterleavePcm(stereoIn, 2, 4);
+  assert.equal(planar2.length, 2);
+  assert.deepEqual(Array.from(planar2[0]), [0.25, 0.5, -0.75, 1.0]);
+  assert.deepEqual(Array.from(planar2[1]), [-0.25, 0.0, 0.0, -1.0]);
+
+  const reinterleaved = interleavePcm(planar2, 4);
+  assert.deepEqual(Array.from(reinterleaved), [0.25, -0.25, 0.5, 0.0, -0.75, 0.0, 1.0, -1.0]);
+
+  // 6-channel (5.1) deinterleave/interleave exactness.
+  const pcm6 = new Float32Array(3 * 6);
+  for (let i = 0; i < pcm6.length; i++) pcm6[i] = (i + 1) * 0.05;
+  const planar6 = deinterleavePcm(pcm6, 6, 3);
+  assert.equal(planar6.length, 6);
+  for (let f = 0; f < 3; f++) {
+    for (let c = 0; c < 6; c++) {
+      assert.equal(planar6[c][f], pcm6[f * 6 + c]);
+    }
+  }
+  assert.deepEqual(Array.from(interleavePcm(planar6, 3)), Array.from(pcm6));
+
+  // 2. PcmScratchPool steady-state reuse: exact same Float32Array & Array instances, zero new allocations.
+  const pool = new PcmScratchPool();
+  const blockA = makeStereoFrames(0, 128);
+  const blockB = makeStereoFrames(128, 128);
+
+  const firstPlanar = pool.deinterleave(blockA, 2, 128);
+  const allocsAfterFirst = pool.allocations;
+  assert.equal(allocsAfterFirst, 2);
+  assert.equal(pool.reuses, 0);
+
+  for (let i = 0; i < 40; i++) {
+    const nextPlanar = pool.deinterleave(i % 2 === 0 ? blockB : blockA, 2, 128);
+    assert.equal(nextPlanar, firstPlanar);
+    assert.equal(nextPlanar[0], firstPlanar[0]);
+    assert.equal(nextPlanar[1], firstPlanar[1]);
+  }
+  assert.equal(pool.allocations, allocsAfterFirst, 'Steady-state deinterleave must perform zero allocations');
+  assert.equal(pool.reuses, 40);
+
+  // Smaller frame count reuses the exact same underlying ArrayBuffer with zero new allocations.
+  const smallerPlanar = pool.deinterleave(makeStereoFrames(0, 64), 2, 64);
+  assert.equal(smallerPlanar[0].length, 64);
+  assert.equal(smallerPlanar[0].buffer, firstPlanar[0].buffer);
+  assert.equal(smallerPlanar[1].buffer, firstPlanar[1].buffer);
+  assert.equal(pool.allocations, allocsAfterFirst);
+
+  // 3. AudioMixerWorker end-to-end steady-state SAB pushPcm + downmix + resample + pullPlanar zero-alloc check.
+  const worker = new AudioMixerWorker(null, {
+    outputState: 'active',
+    autoDrain: false,
+    declickFrames: 0,
+  });
+  worker.handleMessage({
+    init: true,
+    sampleRate: 48000,
+    channels: 2,
+    capacityFrames: 1024,
+    outputState: 'active',
+  });
+
+  const sab = new SharedArrayBuffer(128 * 2 * Float32Array.BYTES_PER_ELEMENT);
+  const sabView = new Float32Array(sab);
+  sabView.set(makeStereoFrames(0, 128));
+
+  // Warmup packet #1 (allocates 'extract', 'pull', and 2 planar buffers).
+  worker.handleMessage({ pushPcm: true, samples: sabView });
+  const pull1 = worker.pullPlanar(128);
+  assert.equal(pull1.framesRead, 128);
+  const firstL = pull1.channels[0];
+  const firstR = pull1.channels[1];
+  assert.equal(firstL[0], sabView[0]);
+  assert.equal(firstR[0], sabView[1]);
+  const allocsAfterWarmup = worker.getScratchStats().allocations;
+  assert.ok(allocsAfterWarmup > 0);
+
+  // Steady-state packets #2..#31: ZERO additional scratch allocations!
+  for (let round = 1; round <= 30; round++) {
+    sabView.set(makeStereoFrames(round * 128, 128));
+    worker.handleMessage({ pushPcm: true, samples: sabView });
+    const pulled = worker.pullPlanar(128);
+    assert.equal(pulled.framesRead, 128);
+    assert.equal(pulled.channels[0], firstL);
+    assert.equal(pulled.channels[1], firstR);
+    assert.equal(pulled.channels[0][0], sabView[0]);
+    assert.equal(pulled.channels[1][0], sabView[1]);
+  }
+
+  const steadyStats = worker.getStats();
+  assert.equal(steadyStats.scratchAllocations, allocsAfterWarmup);
+  assert.ok(steadyStats.scratchReuses >= 30 * 3, `Expected >= 90 scratch reuses, got ${steadyStats.scratchReuses}`);
+  assert.equal(steadyStats.packetsReceived, 31);
+  assert.equal(steadyStats.framesDecoded, 31 * 128);
+  assert.equal(steadyStats.droppedPackets, 0);
+  assert.equal(steadyStats.bufferFillPct, 0);
+
+  // Planar pushPcm input + steady-state reuse.
+  const chL = new Float32Array(64);
+  const chR = new Float32Array(64);
+  for (let f = 0; f < 64; f++) {
+    chL[f] = (f + 1) * 0.01;
+    chR[f] = -(f + 1) * 0.01;
+  }
+  worker.handleMessage({ pushPcm: true, planar: true, samples: [chL, chR] });
+  const allocsAfterPlanarWarmup = worker.getScratchStats().allocations;
+  for (let round = 0; round < 10; round++) {
+    worker.handleMessage({ pushPcm: true, planar: true, channelData: [chL, chR] });
+    const p = worker.pullPlanar(64);
+    assert.equal(p.framesRead, 64);
+    assert.ok(Math.abs(p.channels[0][0] - chL[0]) < 1e-6);
+    assert.ok(Math.abs(p.channels[1][63] - chR[63]) < 1e-6);
+  }
+  assert.equal(worker.getScratchStats().allocations, allocsAfterPlanarWarmup);
+  worker.destroy();
+});
+
+test('W222 bounded ring-overflow drop guards (drop-tail, drop-newest, drop-oldest, maxFillRatio) protect unread audio and track droppedPackets', () => {
+  assert.deepEqual(OVERFLOW_POLICIES, {
+    DROP_TAIL: 'drop-tail',
+    DROP_NEWEST: 'drop-newest',
+    DROP_OLDEST: 'drop-oldest',
+  });
+
+  // 1. drop-newest: atomic packet drop preserves all existing buffered frames intact.
+  const repliesNewest = [];
+  const wNewest = new AudioMixerWorker((m) => repliesNewest.push(m), {
+    outputState: 'active',
+    autoDrain: false,
+    declickFrames: 0,
+    overflowPolicy: OVERFLOW_POLICIES.DROP_NEWEST,
+  });
+  wNewest.handleMessage({
+    init: true,
+    sampleRate: 48000,
+    channels: 2,
+    capacityFrames: 16,
+    outputState: 'active',
+  });
+
+  const p1 = makeStereoFrames(0, 12);
+  wNewest.handleMessage({ pushPcm: true, id: 1, samples: p1 });
+  assert.equal(repliesNewest[repliesNewest.length - 1].pushedFrames, 12);
+  assert.equal(repliesNewest[repliesNewest.length - 1].droppedFrames, 0);
+  assert.equal(wNewest.getStats().bufferFillPct, 75);
+
+  // Only 4 frames free; pushing 8 under 'drop-newest' atomically drops all 8 frames.
+  const p2 = makeStereoFrames(100, 8);
+  wNewest.handleMessage({ pushPcm: true, id: 2, samples: p2 });
+  assert.equal(repliesNewest[repliesNewest.length - 1].pushedFrames, 0);
+  assert.equal(repliesNewest[repliesNewest.length - 1].droppedFrames, 8);
+  assert.equal(repliesNewest[repliesNewest.length - 1].availableFrames, 12);
+
+  let sNewest = wNewest.getStats();
+  assert.equal(sNewest.packetsReceived, 2);
+  assert.equal(sNewest.framesDecoded, 20);
+  assert.equal(sNewest.droppedPackets, 1);
+  assert.equal(sNewest.droppedFrames, 8);
+  assert.equal(sNewest.overflows, 1);
+  assert.equal(sNewest.bufferFillPct, 75);
+
+  // Buffered 12 frames remain strictly p1.
+  const outNewest = new Float32Array(12 * 2);
+  assert.equal(wNewest.pullSamples(outNewest), 12);
+  assert.deepEqual(Array.from(outNewest), Array.from(p1));
+  wNewest.destroy();
+
+  // 2. drop-oldest: evicts oldest unread frames to keep freshest low-latency audio bounded.
+  const repliesOldest = [];
+  const wOldest = new AudioMixerWorker((m) => repliesOldest.push(m), {
+    outputState: 'active',
+    autoDrain: false,
+    declickFrames: 0,
+    overflowPolicy: OVERFLOW_POLICIES.DROP_OLDEST,
+  });
+  wOldest.handleMessage({
+    init: true,
+    sampleRate: 48000,
+    channels: 2,
+    capacityFrames: 10,
+    outputState: 'active',
+  });
+
+  const o1 = makeStereoFrames(0, 8); // frames 0..7
+  const o2 = makeStereoFrames(8, 6); // frames 8..13 -> evicts oldest 4 (0..3), keeps 4..13
+  wOldest.handleMessage({ pushPcm: true, id: 1, samples: o1 });
+  wOldest.handleMessage({ pushPcm: true, id: 2, samples: o2 });
+  assert.equal(repliesOldest[repliesOldest.length - 1].pushedFrames, 6);
+  assert.equal(repliesOldest[repliesOldest.length - 1].droppedFrames, 4);
+  assert.equal(repliesOldest[repliesOldest.length - 1].availableFrames, 10);
+
+  const outOldest = new Float32Array(10 * 2);
+  assert.equal(wOldest.pullSamples(outOldest), 10);
+  assert.deepEqual(Array.from(outOldest), Array.from(makeStereoFrames(4, 10)));
+
+  // Single oversized packet > capacity (14 frames into 10-frame ring) trims to newest 10 frames.
+  const huge = makeStereoFrames(50, 14);
+  wOldest.handleMessage({ pushPcm: true, id: 3, samples: huge });
+  assert.equal(repliesOldest[repliesOldest.length - 1].pushedFrames, 10);
+  assert.equal(repliesOldest[repliesOldest.length - 1].droppedFrames, 4);
+  const outHuge = new Float32Array(10 * 2);
+  assert.equal(wOldest.pullSamples(outHuge), 10);
+  assert.deepEqual(Array.from(outHuge), Array.from(makeStereoFrames(54, 10)));
+
+  const sOldest = wOldest.getStats();
+  assert.equal(sOldest.packetsReceived, 3);
+  assert.equal(sOldest.framesDecoded, 28);
+  assert.equal(sOldest.droppedPackets, 2);
+  assert.equal(sOldest.droppedFrames, 8);
+  assert.equal(sOldest.overflows, 2);
+  wOldest.destroy();
+
+  // 3. maxFillRatio watermark caps latency at 50% of ring capacity.
+  const repliesCap = [];
+  const wCap = new AudioMixerWorker((m) => repliesCap.push(m), {
+    outputState: 'active',
+    autoDrain: false,
+    declickFrames: 0,
+    maxFillRatio: 0.5,
+  });
+  wCap.handleMessage({
+    init: true,
+    sampleRate: 48000,
+    channels: 2,
+    capacityFrames: 64,
+    outputState: 'active',
+  });
+  wCap.handleMessage({ pushPcm: true, id: 1, samples: makeStereoFrames(0, 48) });
+  assert.equal(repliesCap[repliesCap.length - 1].pushedFrames, 32);
+  assert.equal(repliesCap[repliesCap.length - 1].droppedFrames, 16);
+  assert.equal(wCap.getStats().bufferFillPct, 50);
+  assert.equal(wCap.getStats().droppedPackets, 1);
+  wCap.destroy();
+});
+
+test('W222 underrun recovery watermark holds silence until re-primed and telemetry snapshot exposes all W222 fields cleanly', () => {
+  const replies = [];
+  const worker = new AudioMixerWorker((m) => replies.push(m), {
+    outputState: 'active',
+    autoDrain: false,
+    declickFrames: 8,
+    underrunRecoveryFrames: 32,
+  });
+
+  worker.handleMessage({
+    init: true,
+    sampleRate: 48000,
+    channels: 2,
+    capacityFrames: 128,
+    outputState: 'active',
+  });
+
+  // 1. Trigger initial underrun on empty ring.
+  const out0 = new Float32Array(16 * 2);
+  out0.fill(5.0);
+  assert.equal(worker.pullSamples(out0), 0);
+  assert.ok(out0.every((v) => v === 0));
+  assert.equal(worker.getStats().underruns, 1);
+  assert.equal(worker.getStats().underrunRecoveries, 0);
+
+  // 2. Trickle 16 frames (< 32 recovery watermark): pull holds silence without consuming trickle.
+  worker.handleMessage({ pushPcm: true, samples: makeConstantStereoFrames(16, 0.5) });
+  assert.equal(worker.ring.availableFrames(), 16);
+  assert.equal(worker.getStats().bufferFillPct, 12.5);
+
+  const holdOut = new Float32Array(16 * 2);
+  holdOut.fill(3.0);
+  assert.equal(worker.pullSamples(holdOut), 0);
+  assert.ok(holdOut.every((v) => v === 0));
+  assert.equal(worker.ring.availableFrames(), 16, 'Recovery hold must preserve trickled frames');
+  assert.equal(worker.getStats().underruns, 2);
+  assert.equal(worker.getStats().underrunRecoveries, 0);
+
+  // 3. Push 16 more frames (total 32 == watermark): pull exits recovery cleanly with fade-in!
+  worker.handleMessage({ pushPcm: true, samples: makeConstantStereoFrames(16, 0.5) });
+  assert.equal(worker.getStats().bufferFillPct, 25);
+
+  const recPlanar = worker.pullPlanar(32);
+  assert.equal(recPlanar.framesRead, 32);
+  assert.equal(recPlanar.channels[0][0], 0); // smooth fade-in starts at 0
+  assert.equal(recPlanar.channels[0][8], 0.5); // full level after 8-frame declick ramp
+  assert.equal(recPlanar.channels[1][31], 0.5);
+
+  // 4. Request stats via message protocol and verify all W222 lightweight telemetry fields.
+  worker.handleMessage({ stats: true, id: 'w222-stats' });
+  const snap = replies[replies.length - 1];
+  assert.equal(snap.type, 'audio-stats');
+  assert.equal(snap.id, 'w222-stats');
+  assert.equal(snap.stats.packetsReceived, 2);
+  assert.equal(snap.stats.framesDecoded, 32);
+  assert.equal(snap.stats.droppedPackets, 0);
+  assert.equal(snap.stats.underruns, 2);
+  assert.equal(snap.stats.underrunRecoveries, 1);
+  assert.equal(snap.stats.bufferFillPct, 0);
+  assert.ok(snap.stats.scratchAllocations >= 1);
+
+  // 5. pullPlanar message protocol works cleanly.
+  worker.handleMessage({ pushPcm: true, samples: makeStereoFrames(0, 64) });
+  worker.handleMessage({ pullPlanar: true, frameCount: 32, id: 'w222-pull' });
+  const pullReply = replies[replies.length - 1];
+  assert.equal(pullReply.id, 'w222-pull');
+  assert.equal(pullReply.framesRead, 32);
+  assert.equal(pullReply.availableFrames, 32);
+  assert.equal(pullReply.bufferFillPct, 25);
+
+  // 6. Corrupt out-of-range SAB cursors are normalized defensively without crashing.
+  const corruptRing = AudioRingBuffer.create(16, 2);
+  const ctrl = new Int32Array(corruptRing.sab, 0, 8);
+  Atomics.store(ctrl, 0, 999); // invalid write cursor >> 2 * capacity
+  Atomics.store(ctrl, 1, -17); // invalid negative read cursor
+  assert.doesNotThrow(() => {
+    assert.ok(corruptRing.availableFrames() >= 0 && corruptRing.availableFrames() <= 16);
+    corruptRing.pushSamples(makeStereoFrames(0, 4));
+    corruptRing.pullSamples(new Float32Array(4 * 2));
+  });
+
+  // 7. Dirty telemetry sanitization clamps bufferFillPct and sanitizes W222 counters.
+  const dirty = buildAudioTelemetrySnapshot(
+    {
+      packetsReceived: -5,
+      framesDecoded: Infinity,
+      droppedPackets: Number.NaN,
+      underruns: 4,
+      underrunRecoveries: 2.9,
+      bufferFillPct: 999,
+      overflowPolicy: 'evil-policy',
+      maxFillRatio: -2,
+    },
+    { timestamp: 4321 }
+  );
+  assert.equal(dirty.stats.packetsReceived, 0);
+  assert.equal(dirty.stats.framesDecoded, 0);
+  assert.equal(dirty.stats.droppedPackets, 0);
+  assert.equal(dirty.stats.underruns, 4);
+  assert.equal(dirty.stats.underrunRecoveries, 2);
+  assert.equal(dirty.stats.bufferFillPct, 100);
+  assert.equal(dirty.stats.overflowPolicy, 'drop-tail');
+  assert.equal(dirty.stats.maxFillRatio, 1.0);
+
+  // 8. reset() clears all W222 counters cleanly.
+  worker.reset();
+  const afterReset = worker.getStats();
+  assert.equal(afterReset.packetsReceived, 0);
+  assert.equal(afterReset.framesDecoded, 0);
+  assert.equal(afterReset.droppedPackets, 0);
+  assert.equal(afterReset.underruns, 0);
+  assert.equal(afterReset.underrunRecoveries, 0);
+  assert.equal(afterReset.bufferFillPct, 0);
   worker.destroy();
 });
