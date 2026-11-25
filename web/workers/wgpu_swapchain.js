@@ -21,6 +21,13 @@
   const VALID_CANVAS_FORMATS = Object.freeze(['bgra8unorm', 'rgba8unorm', 'rgba16float']);
   const VALID_CANVAS_FORMAT_SET = new Set(VALID_CANVAS_FORMATS);
 
+  const COMPATIBLE_VIEW_FORMATS = Object.freeze({
+    bgra8unorm: Object.freeze(['bgra8unorm-srgb']),
+    rgba8unorm: Object.freeze(['rgba8unorm-srgb']),
+    'bgra8unorm-srgb': Object.freeze(['bgra8unorm']),
+    'rgba8unorm-srgb': Object.freeze(['rgba8unorm']),
+  });
+
   const DEFAULT_CLEAR_COLOR = Object.freeze({ r: 0.05, g: 0.07, b: 0.11, a: 1.0 });
   const DEFAULT_FORMAT = 'bgra8unorm';
   const DEFAULT_ALPHA_MODE = 'opaque';
@@ -83,6 +90,44 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
     return typeof format === 'string' && VALID_CANVAS_FORMAT_SET.has(format);
   }
 
+  function getCompatibleViewFormats(format) {
+    if (typeof format !== 'string' || format.length === 0) {
+      return [];
+    }
+    const siblings = COMPATIBLE_VIEW_FORMATS[format];
+    return siblings ? siblings.slice() : [];
+  }
+
+  function normalizeViewFormats(viewFormats) {
+    if (viewFormats === null || viewFormats === undefined) {
+      return null;
+    }
+    if (!Array.isArray(viewFormats)) {
+      throw new TypeError('viewFormats must be an array of non-empty format strings when provided');
+    }
+    const clean = [];
+    for (let i = 0; i < viewFormats.length; i += 1) {
+      const vf = viewFormats[i];
+      if (typeof vf !== 'string' || vf.length === 0) {
+        throw new TypeError('viewFormats entries must be non-empty strings');
+      }
+      if (!clean.includes(vf)) {
+        clean.push(vf);
+      }
+    }
+    return clean;
+  }
+
+  function normalizeFrameIntervalUs(value) {
+    if (value === null || value === undefined) {
+      return null;
+    }
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+      throw new RangeError(`frameIntervalUs must be a non-negative finite number, got ${value}`);
+    }
+    return value;
+  }
+
   function resolvePreferredCanvasFormat() {
     if (
       typeof navigator !== 'undefined' &&
@@ -137,7 +182,11 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       if (devicePixelRatio === Infinity) {
         return cssSize > 0 ? maxDimension : 1;
       }
-      if (typeof devicePixelRatio === 'number' && !Number.isNaN(devicePixelRatio)) {
+      if (
+        typeof devicePixelRatio === 'number' &&
+        !Number.isNaN(devicePixelRatio) &&
+        devicePixelRatio > 0
+      ) {
         dpr = devicePixelRatio;
       }
     }
@@ -306,12 +355,15 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
         context,
         format,
         streamFormat,
+        viewFormats,
         depthFormat = DEFAULT_DEPTH_FORMAT,
         alphaMode = DEFAULT_ALPHA_MODE,
         maxDimension = DEFAULT_MAX_DIMENSION,
         enableDepth = true,
-        now = defaultNow,
+        now,
+        nowFn,
         frameWindowSize = DEFAULT_FRAME_WINDOW,
+        frameIntervalUs,
         onValidationError = null,
         maxErrorHistory = DEFAULT_MAX_ERROR_HISTORY,
       } = options;
@@ -335,12 +387,18 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       if (!Number.isInteger(maxDimension) || maxDimension < 1) {
         throw new RangeError(`maxDimension must be a positive integer, got ${maxDimension}`);
       }
-      if (typeof now !== 'function') {
-        throw new TypeError('now must be a function returning a timestamp in milliseconds');
+      const resolvedNow =
+        nowFn !== undefined ? nowFn : now !== undefined ? now : defaultNow;
+      if (typeof resolvedNow !== 'function') {
+        throw new TypeError('now/nowFn must be a function returning a timestamp in milliseconds');
       }
       if (!Number.isInteger(frameWindowSize) || frameWindowSize < 1) {
         throw new RangeError(`frameWindowSize must be a positive integer, got ${frameWindowSize}`);
       }
+      const resolvedViewFormats =
+        viewFormats !== undefined ? normalizeViewFormats(viewFormats) : null;
+      const resolvedFrameIntervalUs =
+        frameIntervalUs !== undefined ? normalizeFrameIntervalUs(frameIntervalUs) : null;
       if (
         onValidationError !== null &&
         onValidationError !== undefined &&
@@ -386,12 +444,18 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       this._format = resolvedCanvasFormat;
       this._streamFormat = resolvedStreamFormat;
       this._usesBlitFallback = initialUsesBlitFallback;
+      this._explicitViewFormats = resolvedViewFormats;
+      this._viewFormats = resolvedViewFormats;
+      this._activeViewFormats = [];
+      this._viewFormatsFallbackCount = 0;
+      this._appliedConfig = null;
       this._depthFormat = depthFormat;
       this._alphaMode = alphaMode;
       this._maxDimension = maxDimension;
       this._enableDepth = Boolean(enableDepth);
-      this._now = now;
+      this._now = resolvedNow;
       this._frameWindowSize = frameWindowSize;
+      this._frameIntervalUs = resolvedFrameIntervalUs;
       this._onValidationError = typeof onValidationError === 'function' ? onValidationError : null;
       this._maxErrorHistory = maxErrorHistory;
 
@@ -430,7 +494,10 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
 
       this._totalFrames = 0;
       this._resizeCount = 0;
+      this._reconfigureCount = 0;
+      this._skippedRedundantReconfigures = 0;
       this._lastFrameTimestamp = null;
+      this._lastPresentIntervalMs = 0;
       this._frameDeltas = [];
 
       this._hookDeviceLost(this._device);
@@ -455,6 +522,14 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
 
     get streamFormat() {
       return this._streamFormat;
+    }
+
+    get viewFormats() {
+      return this._activeViewFormats.slice();
+    }
+
+    get frameIntervalUs() {
+      return this._frameIntervalUs;
     }
 
     get usesBlitFallback() {
@@ -873,19 +948,74 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       return record;
     }
 
+    _resolveEffectiveViewFormats(format = this._format, explicitViewFormats = this._explicitViewFormats) {
+      if (explicitViewFormats !== null && explicitViewFormats !== undefined) {
+        return explicitViewFormats.length > 0 ? explicitViewFormats.slice() : null;
+      }
+      const compatible = getCompatibleViewFormats(format);
+      return compatible.length > 0 ? compatible : null;
+    }
+
+    _isSameAppliedConfig(width, height, format, alphaMode, viewFormatsKey) {
+      const prev = this._appliedConfig;
+      return Boolean(
+        this._configured &&
+        prev &&
+        prev.device === this._device &&
+        prev.format === format &&
+        prev.alphaMode === alphaMode &&
+        prev.width === width &&
+        prev.height === height &&
+        prev.viewFormatsKey === viewFormatsKey
+      );
+    }
+
     _applyContextConfiguration() {
-      this._canvas.width = this._width;
-      this._canvas.height = this._height;
+      if (this._canvas.width !== this._width) {
+        this._canvas.width = this._width;
+      }
+      if (this._canvas.height !== this._height) {
+        this._canvas.height = this._height;
+      }
+      const effectiveViewFormats = this._resolveEffectiveViewFormats();
       const cfg = {
         device: this._device,
         format: this._format,
         alphaMode: this._alphaMode,
       };
-      if (Array.isArray(this._viewFormats) && this._viewFormats.length > 0) {
-        cfg.viewFormats = this._viewFormats;
+      let appliedViewFormats = [];
+      if (effectiveViewFormats && effectiveViewFormats.length > 0) {
+        cfg.viewFormats = effectiveViewFormats.slice();
+        appliedViewFormats = effectiveViewFormats.slice();
       }
-      this._context.configure(cfg);
+      try {
+        this._context.configure(cfg);
+      } catch (err) {
+        if (cfg.viewFormats) {
+          // Graceful retry without viewFormats if a mock or WebGPU device rejects them.
+          const fallbackCfg = {
+            device: this._device,
+            format: this._format,
+            alphaMode: this._alphaMode,
+          };
+          this._context.configure(fallbackCfg);
+          appliedViewFormats = [];
+          this._viewFormatsFallbackCount += 1;
+        } else {
+          throw err;
+        }
+      }
       this._configured = true;
+      this._activeViewFormats = appliedViewFormats;
+      this._appliedConfig = {
+        device: this._device,
+        format: this._format,
+        alphaMode: this._alphaMode,
+        width: this._width,
+        height: this._height,
+        viewFormatsKey: effectiveViewFormats ? effectiveViewFormats.join(',') : '',
+      };
+      this._reconfigureCount += 1;
       this._ensureDepthTexture();
       if (this._usesBlitFallback) {
         this._ensureIntermediateTexture();
@@ -916,11 +1046,13 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       if (isValidCanvasFormat(streamFormat)) {
         const hadBlit = this._usesBlitFallback;
         const canvasChanged = this._format !== streamFormat;
-        const viewFormatsChanged =
-          Array.isArray(this._viewFormats) && this._viewFormats.length > 0;
+        const prevEffectiveKey = (this._resolveEffectiveViewFormats() || []).join(',');
+        const nextEffectiveKey = (this._resolveEffectiveViewFormats(streamFormat, null) || []).join(',');
+        const viewFormatsChanged = prevEffectiveKey !== nextEffectiveKey;
         const streamChanged = this._streamFormat !== streamFormat;
 
         if (!hadBlit && !canvasChanged && !viewFormatsChanged && !streamChanged && this._configured) {
+          this._skippedRedundantReconfigures += 1;
           return false;
         }
 
@@ -931,6 +1063,7 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
 
         this._streamFormat = streamFormat;
         this._format = streamFormat;
+        this._explicitViewFormats = null;
         this._viewFormats = null;
 
         if (this._configured && this._device && this._context && (canvasChanged || viewFormatsChanged)) {
@@ -945,8 +1078,9 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
         ? this._format
         : this._preferredCanvasFormat;
       const canvasChanged = this._format !== nextCanvasFormat;
-      const viewFormatsChanged =
-        Array.isArray(this._viewFormats) && this._viewFormats.length > 0;
+      const prevEffectiveKey = (this._resolveEffectiveViewFormats() || []).join(',');
+      const nextEffectiveKey = (this._resolveEffectiveViewFormats(nextCanvasFormat, null) || []).join(',');
+      const viewFormatsChanged = prevEffectiveKey !== nextEffectiveKey;
       const streamChanged = this._streamFormat !== streamFormat;
       const needsIntermediateNow =
         this._configured &&
@@ -966,10 +1100,14 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
         !viewFormatsChanged &&
         !needsIntermediateNow
       ) {
+        if (this._configured) {
+          this._skippedRedundantReconfigures += 1;
+        }
         return false;
       }
 
       this._format = nextCanvasFormat;
+      this._explicitViewFormats = null;
       this._viewFormats = null;
       this._streamFormat = streamFormat;
       this._usesBlitFallback = true;
@@ -1005,15 +1143,20 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       if (typeof format !== 'string' || format.length === 0) {
         return false;
       }
-      const nextViewFormats =
-        Array.isArray(viewFormats) && viewFormats.length > 0 ? viewFormats.slice() : null;
-      if (!isValidCanvasFormat(format) && !nextViewFormats) {
+      const nextExplicitViewFormats =
+        viewFormats !== null && viewFormats !== undefined
+          ? normalizeViewFormats(viewFormats)
+          : null;
+      if (!isValidCanvasFormat(format) && (!nextExplicitViewFormats || nextExplicitViewFormats.length === 0)) {
         return this.configureForStreamFormat(format);
       }
-      const prevViewKey = Array.isArray(this._viewFormats) ? this._viewFormats.join(',') : '';
-      const nextViewKey = nextViewFormats ? nextViewFormats.join(',') : '';
+      const prevViewKey = (this._resolveEffectiveViewFormats() || []).join(',');
+      const nextViewKey = (
+        this._resolveEffectiveViewFormats(format, nextExplicitViewFormats) || []
+      ).join(',');
       const hadBlit = this._usesBlitFallback;
       if (!hadBlit && this._format === format && prevViewKey === nextViewKey && this._configured) {
+        this._skippedRedundantReconfigures += 1;
         return false;
       }
       if (hadBlit) {
@@ -1023,7 +1166,8 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       const canvasChanged = this._format !== format;
       this._format = format;
       this._streamFormat = format;
-      this._viewFormats = nextViewFormats;
+      this._explicitViewFormats = nextExplicitViewFormats;
+      this._viewFormats = nextExplicitViewFormats;
       if (canvasChanged) {
         this._blitPipeline = null;
         this._blitPipelineMeta = null;
@@ -1043,9 +1187,12 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
      *   height: number,
      *   devicePixelRatio?: number,
      *   format?: string,
+     *   streamFormat?: string,
+     *   viewFormats?: string[] | null,
      *   depthFormat?: string,
      *   alphaMode?: string,
      *   enableDepth?: boolean,
+     *   frameIntervalUs?: number | null,
      * }} config
      */
     configure(config = {}) {
@@ -1059,15 +1206,49 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
         throw new TypeError('configure requires a configuration object');
       }
 
+      // Validate all incoming options before mutating swapchain state.
       if (config.format !== undefined) {
         if (typeof config.format !== 'string' || config.format.length === 0) {
           throw new TypeError('format must be a non-empty string');
         }
+      }
+      if (config.streamFormat !== undefined) {
+        if (typeof config.streamFormat !== 'string' || config.streamFormat.length === 0) {
+          throw new TypeError('streamFormat must be a non-empty string');
+        }
+      }
+      if (config.depthFormat !== undefined) {
+        validateDepthFormat(config.depthFormat);
+      }
+      if (config.alphaMode !== undefined) {
+        validateAlphaMode(config.alphaMode);
+      }
+      const nextExplicitViewFormats =
+        config.viewFormats !== undefined ? normalizeViewFormats(config.viewFormats) : undefined;
+      const nextFrameIntervalUs =
+        config.frameIntervalUs !== undefined
+          ? normalizeFrameIntervalUs(config.frameIntervalUs)
+          : undefined;
+
+      const wasConfigured = this._configured;
+      const prevWidth = this._width;
+      const prevHeight = this._height;
+      const prevFormat = this._format;
+      const prevStreamFormat = this._streamFormat;
+      const prevUsesBlit = this._usesBlitFallback;
+      const prevDepthFormat = this._depthFormat;
+      const prevEnableDepth = this._enableDepth;
+
+      if (config.format !== undefined) {
         if (isValidCanvasFormat(config.format)) {
           if (this._format !== config.format) {
             this._blitPipeline = null;
             this._blitPipelineMeta = null;
             this._invalidateBlitBindGroup();
+            if (nextExplicitViewFormats === undefined) {
+              this._explicitViewFormats = null;
+              this._viewFormats = null;
+            }
           }
           if (this._usesBlitFallback) {
             this._usesBlitFallback = false;
@@ -1084,14 +1265,15 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
         }
       }
       if (config.streamFormat !== undefined) {
-        if (typeof config.streamFormat !== 'string' || config.streamFormat.length === 0) {
-          throw new TypeError('streamFormat must be a non-empty string');
-        }
         if (isValidCanvasFormat(config.streamFormat)) {
           if (this._format !== config.streamFormat) {
             this._blitPipeline = null;
             this._blitPipelineMeta = null;
             this._invalidateBlitBindGroup();
+            if (nextExplicitViewFormats === undefined) {
+              this._explicitViewFormats = null;
+              this._viewFormats = null;
+            }
           }
           if (this._usesBlitFallback) {
             this._usesBlitFallback = false;
@@ -1107,36 +1289,78 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
           this._usesBlitFallback = true;
         }
       }
+      if (nextExplicitViewFormats !== undefined) {
+        this._explicitViewFormats = nextExplicitViewFormats;
+        this._viewFormats = nextExplicitViewFormats;
+      }
       if (config.depthFormat !== undefined) {
-        validateDepthFormat(config.depthFormat);
         this._depthFormat = config.depthFormat;
       }
       if (config.alphaMode !== undefined) {
-        validateAlphaMode(config.alphaMode);
         this._alphaMode = config.alphaMode;
       }
       if (config.enableDepth !== undefined) {
         this._enableDepth = Boolean(config.enableDepth);
       }
+      if (nextFrameIntervalUs !== undefined) {
+        this._frameIntervalUs = nextFrameIntervalUs;
+      }
 
       const dpr = config.devicePixelRatio !== undefined ? config.devicePixelRatio : 1;
       const maxDim = this._effectiveMaxDimension();
-      const nextWidth = clampDimension(config.width, dpr, maxDim);
-      const nextHeight = clampDimension(config.height, dpr, maxDim);
+      const nextWidth =
+        config.width === undefined && wasConfigured && prevWidth > 0
+          ? prevWidth
+          : clampDimension(config.width, dpr, maxDim);
+      const nextHeight =
+        config.height === undefined && wasConfigured && prevHeight > 0
+          ? prevHeight
+          : clampDimension(config.height, dpr, maxDim);
 
-      const wasConfigured = this._configured;
       const dimensionsChanged =
-        wasConfigured && (nextWidth !== this._width || nextHeight !== this._height);
+        wasConfigured && (nextWidth !== prevWidth || nextHeight !== prevHeight);
 
       this._width = nextWidth;
       this._height = nextHeight;
       this._devicePixelRatio =
         typeof dpr === 'number' && Number.isFinite(dpr) && dpr > 0 ? dpr : 1;
 
-      this._applyContextConfiguration();
+      const nextEffectiveVfKey = (this._resolveEffectiveViewFormats() || []).join(',');
+      const sameCanvasConfig = this._isSameAppliedConfig(
+        nextWidth,
+        nextHeight,
+        this._format,
+        this._alphaMode,
+        nextEffectiveVfKey
+      );
+      const depthChanged =
+        wasConfigured &&
+        (this._depthFormat !== prevDepthFormat || this._enableDepth !== prevEnableDepth);
+      const streamChanged =
+        wasConfigured &&
+        (this._streamFormat !== prevStreamFormat ||
+          this._usesBlitFallback !== prevUsesBlit ||
+          this._format !== prevFormat);
 
-      if (dimensionsChanged) {
-        this._resizeCount += 1;
+      if (sameCanvasConfig) {
+        if (depthChanged) {
+          this._ensureDepthTexture();
+        }
+        if (streamChanged) {
+          if (this._usesBlitFallback) {
+            this._ensureIntermediateTexture();
+          } else {
+            this._destroyBlitResources();
+          }
+        }
+        if (!depthChanged && !streamChanged) {
+          this._skippedRedundantReconfigures += 1;
+        }
+      } else {
+        this._applyContextConfiguration();
+        if (dimensionsChanged) {
+          this._resizeCount += 1;
+        }
       }
 
       return {
@@ -1149,13 +1373,14 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
     }
 
     /**
-     * Dynamically resize the swapchain. No-ops (returning false) when clamped pixel dimensions
-     * match the currently configured dimensions.
+     * Dynamically resize the swapchain. Safely rejects invalid/zero/negative dimensions and
+     * no-ops (returning false) when clamped pixel dimensions match the currently configured
+     * dimensions.
      *
      * @param {number} cssWidth
      * @param {number} cssHeight
      * @param {number} [devicePixelRatio=1]
-     * @returns {boolean} True if swapchain was reconfigured, false on no-op.
+     * @returns {boolean} True if swapchain was reconfigured, false on no-op or invalid input.
      */
     resize(cssWidth, cssHeight, devicePixelRatio = 1) {
       if (this._destroyed) {
@@ -1165,18 +1390,36 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
         throw new Error('Cannot resize WgpuSwapchain while GPUDevice is lost; call recover() first');
       }
 
+      if (
+        typeof cssWidth !== 'number' ||
+        typeof cssHeight !== 'number' ||
+        Number.isNaN(cssWidth) ||
+        Number.isNaN(cssHeight) ||
+        cssWidth <= 0 ||
+        cssHeight <= 0
+      ) {
+        return false;
+      }
+
+      const effectiveDpr =
+        typeof devicePixelRatio === 'number' &&
+        !Number.isNaN(devicePixelRatio) &&
+        devicePixelRatio > 0
+          ? devicePixelRatio
+          : 1;
       const maxDim = this._effectiveMaxDimension();
-      const nextWidth = clampDimension(cssWidth, devicePixelRatio, maxDim);
-      const nextHeight = clampDimension(cssHeight, devicePixelRatio, maxDim);
+      const nextWidth = clampDimension(cssWidth, effectiveDpr, maxDim);
+      const nextHeight = clampDimension(cssHeight, effectiveDpr, maxDim);
 
       if (this._configured && nextWidth === this._width && nextHeight === this._height) {
+        this._skippedRedundantReconfigures += 1;
         return false;
       }
 
       this.configure({
         width: cssWidth,
         height: cssHeight,
-        devicePixelRatio,
+        devicePixelRatio: effectiveDpr,
       });
       return true;
     }
@@ -1369,20 +1612,61 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
     }
 
     /**
+     * Set or clear the declared frame interval target in microseconds (e.g. 16667 for 60Hz,
+     * 33333 for 30Hz PresentX cadence).
+     *
+     * @param {number | null | undefined} frameIntervalUs
+     */
+    setFrameIntervalUs(frameIntervalUs) {
+      this._frameIntervalUs = normalizeFrameIntervalUs(frameIntervalUs);
+    }
+
+    /**
      * Record a presented frame timestamp into the rolling frame-pacing window.
      *
-     * @param {number} [timestampMs] Optional explicit timestamp override; defaults to `now()`.
+     * @param {number | { timestampMs?: number, frameIntervalUs?: number | null }} [timestampOrOptions]
+     *   Optional explicit timestamp override in milliseconds (defaults to `nowFn()`/`now()`) or
+     *   metadata object `{ timestampMs?, frameIntervalUs? }`.
+     * @param {number | { frameIntervalUs?: number | null }} [meta]
+     *   Optional present cadence metadata (`{ frameIntervalUs }` or numeric `frameIntervalUs`).
      */
-    recordFramePresented(timestampMs) {
+    recordFramePresented(timestampOrOptions, meta) {
+      let explicitTimestampMs;
+      let providedFrameIntervalUs;
+
+      if (timestampOrOptions && typeof timestampOrOptions === 'object') {
+        explicitTimestampMs = timestampOrOptions.timestampMs;
+        if ('frameIntervalUs' in timestampOrOptions) {
+          providedFrameIntervalUs = timestampOrOptions.frameIntervalUs;
+        }
+      } else {
+        explicitTimestampMs = timestampOrOptions;
+      }
+
+      if (meta !== undefined) {
+        if (meta && typeof meta === 'object') {
+          if ('frameIntervalUs' in meta) {
+            providedFrameIntervalUs = meta.frameIntervalUs;
+          }
+        } else if (typeof meta === 'number' || meta === null) {
+          providedFrameIntervalUs = meta;
+        }
+      }
+
+      if (providedFrameIntervalUs !== undefined) {
+        this._frameIntervalUs = normalizeFrameIntervalUs(providedFrameIntervalUs);
+      }
+
       const nowMs =
-        typeof timestampMs === 'number' && Number.isFinite(timestampMs)
-          ? timestampMs
+        typeof explicitTimestampMs === 'number' && Number.isFinite(explicitTimestampMs)
+          ? explicitTimestampMs
           : this._now();
 
       this._totalFrames += 1;
 
       if (this._lastFrameTimestamp !== null) {
         const deltaMs = Math.max(0, nowMs - this._lastFrameTimestamp);
+        this._lastPresentIntervalMs = deltaMs;
         this._frameDeltas.push(deltaMs);
         if (this._frameDeltas.length > this._frameWindowSize) {
           this._frameDeltas.shift();
@@ -1415,18 +1699,26 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
 
       const fps = avgFrameTimeMs > 0 ? 1000 / avgFrameTimeMs : 0;
 
-      return {
+      const telemetry = {
         fps,
         avgFrameTimeMs,
         maxFrameTimeMs,
         totalFrames: this._totalFrames,
         resizeCount: this._resizeCount,
+        reconfigureCount: this._reconfigureCount,
+        skippedRedundantReconfigures: this._skippedRedundantReconfigures,
+        lastPresentIntervalMs: this._lastPresentIntervalMs,
+        avgPresentIntervalMs: avgFrameTimeMs,
         width: this._width,
         height: this._height,
         format: this._format,
         depthFormat: this._enableDepth ? this._depthFormat : null,
         isDeviceLost: this._isDeviceLost,
       };
+      if (this._frameIntervalUs !== null) {
+        telemetry.frameIntervalUs = this._frameIntervalUs;
+      }
+      return telemetry;
     }
 
     /**
@@ -1442,6 +1734,8 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
         usesBlitFallback: this._usesBlitFallback,
         streamFormat: this._streamFormat,
         canvasFormat: this._format,
+        viewFormats: this._activeViewFormats.slice(),
+        viewFormatsFallbackCount: this._viewFormatsFallbackCount,
         blitCount: this._blitCount,
       };
     }
@@ -1508,6 +1802,10 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
           throw new TypeError('newFormat must be a non-empty string when provided');
         }
         if (isValidCanvasFormat(newFormat)) {
+          if (this._format !== newFormat) {
+            this._explicitViewFormats = null;
+            this._viewFormats = null;
+          }
           this._format = newFormat;
           this._preferredCanvasFormat = newFormat;
           if (!this._usesBlitFallback) {
@@ -1532,6 +1830,7 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       this._lastDeviceLostInfo = null;
       this._hookedDevice = null;
       this._lastFrameTimestamp = null;
+      this._appliedConfig = null;
 
       this._hookDeviceLost(newDevice);
       this._hookUncapturedError(newDevice);
@@ -1577,6 +1876,10 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       this._context = null;
       this._canvas = null;
       this._hookedDevice = null;
+      this._appliedConfig = null;
+      this._activeViewFormats = [];
+      this._explicitViewFormats = null;
+      this._viewFormats = null;
       this._configured = false;
     }
   }
@@ -1585,6 +1888,7 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
     DEFAULT_DEPTH_FORMAT,
     SUPPORTED_DEPTH_FORMATS,
     VALID_CANVAS_FORMATS,
+    COMPATIBLE_VIEW_FORMATS,
     DEFAULT_CLEAR_COLOR,
     DEFAULT_ALPHA_MODE,
     DEFAULT_MAX_DIMENSION,
@@ -1597,6 +1901,7 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
     INTERMEDIATE_TEXTURE_USAGE,
     BLIT_FULLSCREEN_WGSL,
     isValidCanvasFormat,
+    getCompatibleViewFormats,
     WgpuSwapchain,
   };
 
