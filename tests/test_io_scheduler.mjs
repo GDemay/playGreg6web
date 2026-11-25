@@ -14,7 +14,15 @@ const repoRoot = path.resolve(__dirname, '..');
 const schedulerMod = require('../web/workers/io_scheduler.js');
 const rangeCacheMod = require('../web/workers/range_cache.js');
 
-const { IO_PRIORITY, IoPriorityScheduler, isRetryableError } = schedulerMod;
+const {
+  IO_PRIORITY,
+  IoPriorityScheduler,
+  classifyIoPriority,
+  isBinkVideoPath,
+  isShaderPackPath,
+  isUiFontRpfPath,
+  isRetryableError,
+} = schedulerMod;
 const { RangeCache } = rangeCacheMod;
 
 function deferred() {
@@ -1285,4 +1293,450 @@ test('reset() and clear() cleanly reset telemetry counters and cancel queued tas
   assert.equal(scheduler.getStats().completed, 1);
   assert.equal(scheduler.getStats().maxQueueWaitMs, 0);
   assert.equal(scheduler.getStats().avgQueueWaitMsByPriority.NORMAL, 0);
+});
+
+// ---------------------------------------------------------------------------
+// W188: Automatic path-based priority classification, Bink2/shader/UI reads,
+//       telemetry (priorityCounts, binkVideoReads, shaderPackReads, promotions),
+//       and anti-starvation aging under media/shader bursts.
+// ---------------------------------------------------------------------------
+
+test('classifyIoPriority is exported in CommonJS and Worker globalThis', () => {
+  assert.equal(typeof classifyIoPriority, 'function');
+  assert.equal(typeof isBinkVideoPath, 'function');
+  assert.equal(typeof isShaderPackPath, 'function');
+  assert.equal(typeof isUiFontRpfPath, 'function');
+
+  const src = fs.readFileSync(path.join(repoRoot, 'web/workers/io_scheduler.js'), 'utf8');
+  const sandbox = {};
+  sandbox.globalThis = sandbox;
+  sandbox.self = sandbox;
+  vm.runInNewContext(src, sandbox);
+
+  assert.equal(typeof sandbox.PlayGta6IoScheduler.classifyIoPriority, 'function');
+  assert.equal(
+    sandbox.PlayGta6IoScheduler.classifyIoPriority('shaders/main.wgsl.pack'),
+    IO_PRIORITY.CRITICAL
+  );
+  assert.equal(
+    sandbox.PlayGta6IoScheduler.classifyIoPriority('movies/intro.bk2'),
+    IO_PRIORITY.HIGH
+  );
+});
+
+test('classifyIoPriority maps shader packs, boot metadata, Bink2, UI/font RPF, general RPF/TTPF, and prefetch paths', () => {
+  // CRITICAL: shader packs, reflection JSON, boot-options.json, guest .pgim images
+  assert.equal(classifyIoPriority('shaders/frame1.wgsl.pack'), IO_PRIORITY.CRITICAL);
+  assert.equal(classifyIoPriority('SHADERS/MAIN.WGSL.PACK?v=2#frag'), IO_PRIORITY.CRITICAL);
+  assert.equal(classifyIoPriority('shaders/frame1.reflect.json'), IO_PRIORITY.CRITICAL);
+  assert.equal(classifyIoPriority('shaders/main.wgsl.pack.reflect.json'), IO_PRIORITY.CRITICAL);
+  assert.equal(classifyIoPriority('boot-options.json'), IO_PRIORITY.CRITICAL);
+  assert.equal(classifyIoPriority('config/boot-options.json'), IO_PRIORITY.CRITICAL);
+  assert.equal(classifyIoPriority('guest\\game_main.pgim'), IO_PRIORITY.CRITICAL);
+
+  // HIGH: Bink2 video streams (.bk2 / .bik) and UI/font .rpf / .ttpf / font assets
+  assert.equal(classifyIoPriority('movies/intro_logo.bk2'), IO_PRIORITY.HIGH);
+  assert.equal(classifyIoPriority('movies/INTRO.BIK?range=1'), IO_PRIORITY.HIGH);
+  assert.equal(classifyIoPriority('x64/data/ui/fonts.rpf'), IO_PRIORITY.HIGH);
+  assert.equal(classifyIoPriority('common/ui.rpf'), IO_PRIORITY.HIGH);
+  assert.equal(classifyIoPriority('x64/data/scaleform_generic.rpf'), IO_PRIORITY.HIGH);
+  assert.equal(classifyIoPriority('x64/data/hud_icons.ttpf'), IO_PRIORITY.HIGH);
+  assert.equal(classifyIoPriority('x64/data/frontend_menu.rpf'), IO_PRIORITY.HIGH);
+  assert.equal(classifyIoPriority('x64/data/splash_screen.rpf'), IO_PRIORITY.HIGH);
+  assert.equal(classifyIoPriority('rpf://x64/data/ui/fonts.rpf/font_lib.gfx'), IO_PRIORITY.HIGH);
+  assert.equal(classifyIoPriority('fonts/ui_sans.ttf'), IO_PRIORITY.HIGH);
+
+  // NORMAL: general on-demand .rpf / .ttpf reads (including false-positive substring guards)
+  assert.equal(classifyIoPriority('x64/levels/world.rpf'), IO_PRIORITY.NORMAL);
+  assert.equal(classifyIoPriority('x64/textures/terrain.ttpf'), IO_PRIORITY.NORMAL);
+  assert.equal(classifyIoPriority('x64/build_assets.rpf'), IO_PRIORITY.NORMAL);
+  assert.equal(classifyIoPriority('x64/liquid_sim.rpf'), IO_PRIORITY.NORMAL);
+  assert.equal(classifyIoPriority('x64/fruit_props.rpf'), IO_PRIORITY.NORMAL);
+  assert.equal(classifyIoPriority('misc/data.bin'), IO_PRIORITY.NORMAL);
+  assert.equal(classifyIoPriority(''), IO_PRIORITY.NORMAL);
+  assert.equal(classifyIoPriority(null), IO_PRIORITY.NORMAL);
+  assert.equal(classifyIoPriority(undefined), IO_PRIORITY.NORMAL);
+
+  // PREFETCH (Low): background speculative prefetch paths
+  assert.equal(classifyIoPriority('prefetch/world_lod.rpf'), IO_PRIORITY.PREFETCH);
+  assert.equal(classifyIoPriority('x64/speculative/chunk_01.rpf'), IO_PRIORITY.PREFETCH);
+  assert.equal(classifyIoPriority('chunk_02.rpf.prefetch'), IO_PRIORITY.PREFETCH);
+
+  // Helper predicates
+  assert.equal(isBinkVideoPath('movies/intro.bk2'), true);
+  assert.equal(isBinkVideoPath('movies/logo.BIK'), true);
+  assert.equal(isBinkVideoPath('movies/intro.mp4'), false);
+  assert.equal(isShaderPackPath('shaders/main.wgsl.pack'), true);
+  assert.equal(isShaderPackPath('shaders/main.wgsl.pack.reflect.json'), false);
+  assert.equal(isUiFontRpfPath('x64/data/ui/fonts.rpf'), true);
+  assert.equal(isUiFontRpfPath('x64/levels/world.rpf'), false);
+});
+
+test('classifyIoPriority explicit caller priority always overrides auto-classification', () => {
+  // Demote CRITICAL/HIGH assets explicitly to PREFETCH or NORMAL.
+  assert.equal(
+    classifyIoPriority('shaders/main.wgsl.pack', IO_PRIORITY.PREFETCH),
+    IO_PRIORITY.PREFETCH
+  );
+  assert.equal(
+    classifyIoPriority('boot-options.json', IO_PRIORITY.NORMAL),
+    IO_PRIORITY.NORMAL
+  );
+  assert.equal(
+    classifyIoPriority('movies/intro.bk2', IO_PRIORITY.PREFETCH),
+    IO_PRIORITY.PREFETCH
+  );
+  assert.equal(
+    classifyIoPriority('x64/data/ui/fonts.rpf', IO_PRIORITY.NORMAL),
+    IO_PRIORITY.NORMAL
+  );
+
+  // Promote NORMAL/PREFETCH assets explicitly to CRITICAL or HIGH.
+  assert.equal(
+    classifyIoPriority('x64/levels/world.rpf', IO_PRIORITY.CRITICAL),
+    IO_PRIORITY.CRITICAL
+  );
+  assert.equal(
+    classifyIoPriority('prefetch/world_lod.rpf', IO_PRIORITY.HIGH),
+    IO_PRIORITY.HIGH
+  );
+  assert.equal(
+    classifyIoPriority('movies/intro.bk2', IO_PRIORITY.CRITICAL),
+    IO_PRIORITY.CRITICAL
+  );
+
+  // Undefined/null explicit priority falls back to auto-classification.
+  assert.equal(classifyIoPriority('movies/intro.bk2', undefined), IO_PRIORITY.HIGH);
+  assert.equal(classifyIoPriority('shaders/main.wgsl.pack', null), IO_PRIORITY.CRITICAL);
+});
+
+test('auto-classified shader packs, boot metadata, Bink2 video, and UI/font RPF preempt general RPF and prefetch traffic', async () => {
+  const dispatchOrder = [];
+  const blockerGate = deferred();
+
+  const rangeCache = {
+    read(filePath, offset, length) {
+      dispatchOrder.push(filePath);
+      if (filePath === 'blocker.bin') {
+        return blockerGate.promise;
+      }
+      return Promise.resolve(makeBytes(filePath.charCodeAt(0), length));
+    },
+  };
+
+  const scheduler = new IoPriorityScheduler({
+    rangeCache,
+    maxConcurrency: 1,
+    sleep: async () => {},
+  });
+
+  // Occupy single slot so all subsequent reads queue up.
+  const pBlocker = scheduler.scheduleRead('blocker.bin', 0, 16, {
+    priority: IO_PRIORITY.PREFETCH,
+  });
+
+  // Queue background prefetch, normal RPF/TTPF, Bink2 video, UI/font RPF, and critical shader/boot assets
+  // WITHOUT explicit priorities (relying on auto-classification, plus schedulePrefetchList/prefetch flag).
+  const pPrefetchList = scheduler.schedulePrefetchList([
+    { path: 'x64/levels/bg_chunk_1.rpf', offset: 0, length: 16 },
+    { path: 'x64/levels/bg_chunk_2.rpf', offset: 16, length: 16 },
+  ]);
+  const pPrefetchPath = scheduler.scheduleRead('prefetch/world_lod.rpf', 0, 16);
+  const pPrefetchFlag = scheduler.scheduleRead('x64/levels/spec_world.rpf', 0, 16, {
+    prefetch: true,
+  });
+  const pNormalRpf = scheduler.scheduleRead('x64/levels/world.rpf', 0, 16);
+  const pNormalTtpf = scheduler.scheduleRead('x64/textures/terrain.ttpf', 0, 16);
+  const pBink2 = scheduler.scheduleRead('movies/intro.bk2', 0, 64);
+  const pBink1 = scheduler.scheduleRead('movies/logo.bik', 0, 64);
+  const pUiFont = scheduler.scheduleRead('x64/data/ui/fonts.rpf', 0, 32);
+  const pShaderPack = scheduler.scheduleRead('shaders/frame1.wgsl.pack', 0, 128);
+  const pReflect = scheduler.scheduleRead('shaders/frame1.reflect.json', 0, 32);
+  const pBootOpts = scheduler.scheduleRead('boot-options.json', 0, 32);
+  const pPgim = scheduler.scheduleRead('guest/main.pgim', 0, 64);
+
+  blockerGate.resolve(makeBytes(1, 16));
+
+  await Promise.all([
+    pBlocker,
+    pPrefetchList,
+    pPrefetchPath,
+    pPrefetchFlag,
+    pNormalRpf,
+    pNormalTtpf,
+    pBink2,
+    pBink1,
+    pUiFont,
+    pShaderPack,
+    pReflect,
+    pBootOpts,
+    pPgim,
+  ]);
+
+  assert.deepEqual(dispatchOrder, [
+    'blocker.bin',
+    // CRITICAL (FIFO):
+    'shaders/frame1.wgsl.pack',
+    'shaders/frame1.reflect.json',
+    'boot-options.json',
+    'guest/main.pgim',
+    // HIGH (FIFO):
+    'movies/intro.bk2',
+    'movies/logo.bik',
+    'x64/data/ui/fonts.rpf',
+    // NORMAL (FIFO):
+    'x64/levels/world.rpf',
+    'x64/textures/terrain.ttpf',
+    // PREFETCH (FIFO):
+    'x64/levels/bg_chunk_1.rpf',
+    'x64/levels/bg_chunk_2.rpf',
+    'prefetch/world_lod.rpf',
+    'x64/levels/spec_world.rpf',
+  ]);
+
+  const stats = scheduler.getStats();
+  assert.deepEqual(stats.priorityCounts, {
+    CRITICAL: 4,
+    HIGH: 3,
+    NORMAL: 2,
+    PREFETCH: 5,
+  });
+  assert.equal(stats.binkVideoReads, 2);
+  assert.equal(stats.shaderPackReads, 1);
+  assert.equal(stats.uiFontReads, 1);
+  assert.equal(stats.promotions, 0);
+  assert.equal(stats.agedPromotions, 0);
+  assert.equal(stats.byPriority.CRITICAL.scheduled, 4);
+  assert.equal(stats.byPriority.HIGH.scheduled, 3);
+  assert.equal(stats.byPriority.NORMAL.scheduled, 2);
+  assert.equal(stats.byPriority.PREFETCH.scheduled, 5);
+});
+
+test('explicit caller priority overrides auto-classification in scheduleRead and schedulePrefetchList', async () => {
+  const dispatchOrder = [];
+  const blockerGate = deferred();
+
+  const rangeCache = {
+    read(filePath, offset, length) {
+      dispatchOrder.push(filePath);
+      if (filePath === 'blocker.bin') {
+        return blockerGate.promise;
+      }
+      return Promise.resolve(makeBytes(3, length));
+    },
+  };
+
+  const scheduler = new IoPriorityScheduler({
+    rangeCache,
+    maxConcurrency: 1,
+    sleep: async () => {},
+  });
+
+  const pBlocker = scheduler.scheduleRead('blocker.bin', 0, 8, {
+    priority: IO_PRIORITY.NORMAL,
+  });
+
+  // Explicitly schedule a .wgsl.pack and .bk2 as PREFETCH via schedulePrefetchList.
+  const pPrefetchMedia = scheduler.schedulePrefetchList([
+    { path: 'shaders/background.wgsl.pack', offset: 0, length: 16 },
+    { path: 'movies/attract.bk2', offset: 0, length: 16 },
+  ]);
+
+  // Explicitly demote a .bk2 to NORMAL and promote a general .rpf to CRITICAL.
+  const pDemotedBink = scheduler.scheduleRead('movies/low_prio.bk2', 0, 16, {
+    priority: IO_PRIORITY.NORMAL,
+  });
+  const pAutoUi = scheduler.scheduleRead('x64/data/ui/hud.rpf', 0, 16);
+  const pPromotedRpf = scheduler.scheduleRead('x64/levels/world.rpf', 0, 16, {
+    priority: IO_PRIORITY.CRITICAL,
+  });
+
+  // cancelPrefetch() must cancel the prefetched .wgsl.pack and .bk2 cleanly.
+  assert.equal(scheduler.cancelPrefetch(), 2);
+
+  blockerGate.resolve(makeBytes(1, 8));
+  const [prefetchSummary] = await Promise.all([
+    pPrefetchMedia,
+    pBlocker,
+    pDemotedBink,
+    pAutoUi,
+    pPromotedRpf,
+  ]);
+
+  assert.equal(prefetchSummary.cancelled, 2);
+  assert.deepEqual(dispatchOrder, [
+    'blocker.bin',
+    'x64/levels/world.rpf', // explicit CRITICAL
+    'x64/data/ui/hud.rpf', // auto HIGH
+    'movies/low_prio.bk2', // explicit NORMAL
+  ]);
+
+  const stats = scheduler.getStats();
+  assert.deepEqual(stats.priorityCounts, {
+    CRITICAL: 1,
+    HIGH: 1,
+    NORMAL: 2,
+    PREFETCH: 2,
+  });
+  assert.equal(stats.binkVideoReads, 2);
+  assert.equal(stats.shaderPackReads, 1);
+  assert.equal(stats.uiFontReads, 1);
+});
+
+test('anti-starvation aging drains low-priority prefetch reads during continuous Bink2 and shader-pack bursts', async () => {
+  let fakeNow = 0;
+  const dispatchOrder = [];
+  const gates = new Map();
+
+  const rangeCache = {
+    read(filePath, offset, length) {
+      dispatchOrder.push(filePath);
+      const gate = gates.get(filePath);
+      if (gate) {
+        return gate.promise;
+      }
+      return Promise.resolve(makeBytes(5, length));
+    },
+  };
+
+  const blockerGate = deferred();
+  const prefetchGate = deferred();
+  const binkGate = deferred();
+  gates.set('shaders/init.wgsl.pack', blockerGate);
+  gates.set('prefetch/bg_lod.rpf', prefetchGate);
+  gates.set('movies/stream_01.bk2', binkGate);
+
+  const scheduler = new IoPriorityScheduler({
+    rangeCache,
+    maxConcurrency: 1,
+    agingThresholdMs: 100,
+    nowFn: () => fakeNow,
+    sleep: async () => {},
+  });
+
+  // t = 0: shader pack occupies the slot; background prefetch queues up.
+  const pInitPack = scheduler.scheduleRead('shaders/init.wgsl.pack', 0, 64);
+  const pBgPrefetch = scheduler.scheduleRead('prefetch/bg_lod.rpf', 0, 64);
+
+  // t = 60: Bink2 stream and another shader pack arrive; prefetch wait is 60ms (< 100ms).
+  fakeNow = 60;
+  const pShaderBurst = scheduler.scheduleRead('shaders/frame2.wgsl.pack', 0, 64);
+  const pBinkStream = scheduler.scheduleRead('movies/stream_01.bk2', 0, 64);
+
+  // t = 110: initial shader pack completes -> prefetch waited 110ms (>= 100ms),
+  // so anti-starvation promotes it ahead of the newer CRITICAL shader pack and HIGH Bink2 read!
+  fakeNow = 110;
+  blockerGate.resolve(makeBytes(1, 64));
+  await pInitPack;
+  await Promise.resolve();
+
+  assert.deepEqual(dispatchOrder, ['shaders/init.wgsl.pack', 'prefetch/bg_lod.rpf']);
+  const midStats = scheduler.getStats();
+  assert.equal(midStats.promotions, 1);
+  assert.equal(midStats.agedPromotions, 1);
+  assert.equal(midStats.byPriority.PREFETCH.promotions, 1);
+
+  // t = 120: prefetch finishes -> shader pack (CRITICAL, wait 60ms) runs before Bink2 (HIGH, wait 60ms).
+  fakeNow = 120;
+  prefetchGate.resolve(makeBytes(2, 64));
+  await pBgPrefetch;
+  await pShaderBurst;
+  await Promise.resolve();
+
+  binkGate.resolve(makeBytes(3, 64));
+  await pBinkStream;
+
+  assert.deepEqual(dispatchOrder, [
+    'shaders/init.wgsl.pack',
+    'prefetch/bg_lod.rpf',
+    'shaders/frame2.wgsl.pack',
+    'movies/stream_01.bk2',
+  ]);
+
+  const finalStats = scheduler.getStats();
+  assert.equal(finalStats.promotions, 1);
+  assert.equal(finalStats.agedPromotions, 1);
+  assert.equal(finalStats.shaderPackReads, 2);
+  assert.equal(finalStats.binkVideoReads, 1);
+  assert.deepEqual(finalStats.priorityCounts, {
+    CRITICAL: 2,
+    HIGH: 1,
+    NORMAL: 0,
+    PREFETCH: 1,
+  });
+});
+
+test('telemetry counters isolate snapshot mutations, exclude pre-aborted/invalid reads, and reset cleanly', async () => {
+  const rangeCache = {
+    read(filePath, offset, length) {
+      return Promise.resolve(makeBytes(9, length));
+    },
+  };
+
+  const scheduler = new IoPriorityScheduler({
+    rangeCache,
+    maxConcurrency: 2,
+    sleep: async () => {},
+  });
+
+  // Pre-aborted and invalid reads must not increment priorityCounts / media counters.
+  const preAborted = new AbortController();
+  preAborted.abort();
+  await assert.rejects(
+    scheduler.scheduleRead('movies/aborted.bk2', 0, 16, { signal: preAborted.signal }),
+    { name: 'AbortError' }
+  );
+  await assert.rejects(scheduler.scheduleRead('shaders/bad.wgsl.pack', -1, 16), RangeError);
+
+  assert.deepEqual(scheduler.getStats().priorityCounts, {
+    CRITICAL: 0,
+    HIGH: 0,
+    NORMAL: 0,
+    PREFETCH: 0,
+  });
+  assert.equal(scheduler.getStats().binkVideoReads, 0);
+  assert.equal(scheduler.getStats().shaderPackReads, 0);
+
+  // Schedule valid reads and verify snapshot isolation.
+  await Promise.all([
+    scheduler.scheduleRead('shaders/main.wgsl.pack', 0, 32),
+    scheduler.scheduleRead('movies/cutscene.bk2', 0, 32),
+    scheduler.scheduleRead('x64/data/ui/fonts.rpf', 0, 32),
+  ]);
+
+  const snap = scheduler.getStats();
+  assert.deepEqual(snap.priorityCounts, {
+    CRITICAL: 1,
+    HIGH: 2,
+    NORMAL: 0,
+    PREFETCH: 0,
+  });
+  assert.equal(snap.shaderPackReads, 1);
+  assert.equal(snap.binkVideoReads, 1);
+  assert.equal(snap.uiFontReads, 1);
+
+  snap.priorityCounts.CRITICAL = 999;
+  snap.binkVideoReads = 999;
+  snap.shaderPackReads = 999;
+  snap.promotions = 999;
+
+  const fresh = scheduler.getStats();
+  assert.equal(fresh.priorityCounts.CRITICAL, 1);
+  assert.equal(fresh.binkVideoReads, 1);
+  assert.equal(fresh.shaderPackReads, 1);
+  assert.equal(fresh.promotions, 0);
+
+  // reset() zeroes all new telemetry counters.
+  scheduler.reset();
+  const afterReset = scheduler.getStats();
+  assert.deepEqual(afterReset.priorityCounts, {
+    CRITICAL: 0,
+    HIGH: 0,
+    NORMAL: 0,
+    PREFETCH: 0,
+  });
+  assert.equal(afterReset.binkVideoReads, 0);
+  assert.equal(afterReset.shaderPackReads, 0);
+  assert.equal(afterReset.uiFontReads, 0);
+  assert.equal(afterReset.promotions, 0);
 });
