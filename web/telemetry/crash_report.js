@@ -938,6 +938,10 @@ function extractErrorFields(errorOrMessage) {
   };
 }
 
+function makeErrorCoalesceKey(category, message) {
+  return `${category}\u0000${message}`;
+}
+
 class BoundedRing {
   constructor(capacity) {
     this._capacity = capacity;
@@ -964,13 +968,19 @@ class BoundedRing {
   }
 
   push(item) {
+    this.pushWithEvicted(item);
+    return item;
+  }
+
+  pushWithEvicted(item) {
+    const evicted = this._count === this._capacity ? this._items[this._writeIdx] : undefined;
     this._items[this._writeIdx] = item;
     this._writeIdx = (this._writeIdx + 1) % this._capacity;
     if (this._count < this._capacity) {
       this._count += 1;
     }
     this._totalRecorded += 1;
-    return item;
+    return evicted;
   }
 
   toArray() {
@@ -1002,6 +1012,7 @@ export class CrashReporter {
    * @param {number} [options.maxErrors=32]
    * @param {string} [options.appVersion='0.1.0']
    * @param {() => number} [options.now]
+   * @param {boolean} [options.coalesceDuplicates=true]
    * @param {object} [options.navigatorObj]
    * @param {object} [options.globalObj]
    */
@@ -1015,6 +1026,7 @@ export class CrashReporter {
       maxErrors = DEFAULT_MAX_ERRORS,
       appVersion = DEFAULT_APP_VERSION,
       now = () => Date.now(),
+      coalesceDuplicates = true,
       navigatorObj = typeof navigator !== 'undefined' ? navigator : undefined,
       globalObj = typeof globalThis !== 'undefined' ? globalThis : undefined,
     } = options;
@@ -1028,16 +1040,24 @@ export class CrashReporter {
     if (typeof now !== 'function') {
       throw new TypeError('now must be a function returning epoch milliseconds');
     }
+    if (typeof coalesceDuplicates !== 'boolean') {
+      throw new TypeError('coalesceDuplicates must be a boolean');
+    }
 
     this._maxLogs = maxLogs;
     this._maxErrors = maxErrors;
     this._appVersion = sanitizeString(appVersion || DEFAULT_APP_VERSION);
     this._now = now;
+    this._coalesceDuplicates = coalesceDuplicates;
     this._navigatorObj = navigatorObj;
     this._globalObj = globalObj;
 
     this._logs = new BoundedRing(maxLogs);
     this._errors = new BoundedRing(maxErrors);
+    this._errorIndex = new Map();
+    this._recordedErrorCount = 0;
+    this._coalescedErrorCount = 0;
+    this._categoryCounts = Object.create(null);
     this._errorClassifications = new WeakMap();
     this._bootSnapshot = null;
     this._gpuTelemetry = null;
@@ -1067,8 +1087,43 @@ export class CrashReporter {
     return this._errors.length;
   }
 
+  get recordedErrorCount() {
+    return this._recordedErrorCount;
+  }
+
+  get coalescedCount() {
+    return this._coalescedErrorCount;
+  }
+
+  get categoryCounts() {
+    return { ...this._categoryCounts };
+  }
+
   get isGlobalHandlersAttached() {
     return this._attachedTarget !== null;
+  }
+
+  /**
+   * Returns additive, sanitized error recording and coalescing statistics.
+   *
+   * @returns {{
+   *   recordedCount: number,
+   *   bufferedCount: number,
+   *   coalescedCount: number,
+   *   droppedCount: number,
+   *   maxErrors: number,
+   *   categoryCounts: Record<string, number>
+   * }}
+   */
+  getErrorStats() {
+    return {
+      recordedCount: this._recordedErrorCount,
+      bufferedCount: this._errors.length,
+      coalescedCount: this._coalescedErrorCount,
+      droppedCount: this._errors.droppedCount,
+      maxErrors: this._maxErrors,
+      categoryCounts: { ...this._categoryCounts },
+    };
   }
 
   /**
@@ -1077,6 +1132,10 @@ export class CrashReporter {
   clear() {
     this._logs.clear();
     this._errors.clear();
+    this._errorIndex.clear();
+    this._recordedErrorCount = 0;
+    this._coalescedErrorCount = 0;
+    this._categoryCounts = Object.create(null);
     this._bootSnapshot = null;
     this._gpuTelemetry = null;
   }
@@ -1148,6 +1207,9 @@ export class CrashReporter {
 
   /**
    * Records and classifies a runtime error into the bounded error ring buffer.
+   * When duplicate coalescing is enabled (default), repeated identical
+   * `(category, message)` errors increment `occurrences` and update `lastSeenAtMs`
+   * on the existing buffered entry instead of evicting earlier root-cause errors.
    *
    * @param {string|null|undefined} category
    * @param {unknown} errorOrMessage
@@ -1156,8 +1218,23 @@ export class CrashReporter {
    */
   recordError(category, errorOrMessage, context) {
     const ts = this._now();
+    const safeTs = Number.isFinite(ts) ? ts : 0;
     const resolvedCategory = classifyError(errorOrMessage, category);
     const fields = extractErrorFields(errorOrMessage);
+
+    this._recordedErrorCount += 1;
+    this._categoryCounts[resolvedCategory] = (this._categoryCounts[resolvedCategory] || 0) + 1;
+
+    const coalesceKey = makeErrorCoalesceKey(resolvedCategory, fields.message);
+    if (this._coalesceDuplicates) {
+      const existing = this._errorIndex.get(coalesceKey);
+      if (existing) {
+        existing.occurrences += 1;
+        existing.lastSeenAtMs = Math.max(existing.lastSeenAtMs, safeTs);
+        this._coalescedErrorCount += 1;
+        return { ...existing };
+      }
+    }
 
     let sanitizedContext = context !== undefined ? sanitizeValue(context) : null;
     if (
@@ -1178,7 +1255,10 @@ export class CrashReporter {
 
     const entry = {
       timestamp: formatIsoTimestamp(ts),
-      timestampMs: Number.isFinite(ts) ? ts : 0,
+      timestampMs: safeTs,
+      firstSeenAtMs: safeTs,
+      lastSeenAtMs: safeTs,
+      occurrences: 1,
       category: resolvedCategory,
       name: fields.name,
       message: fields.message,
@@ -1187,8 +1267,17 @@ export class CrashReporter {
     };
 
     this._errorClassifications.set(entry, classifyBootError(errorOrMessage));
-    this._errors.push(entry);
-    return entry;
+    const evicted = this._errors.pushWithEvicted(entry);
+    if (evicted !== undefined) {
+      const evictedKey = makeErrorCoalesceKey(evicted.category, evicted.message);
+      if (this._errorIndex.get(evictedKey) === evicted) {
+        this._errorIndex.delete(evictedKey);
+      }
+    }
+    if (this._coalesceDuplicates) {
+      this._errorIndex.set(coalesceKey, entry);
+    }
+    return { ...entry };
   }
 
   /**
@@ -1202,7 +1291,7 @@ export class CrashReporter {
    * Returns a shallow copy of buffered sanitized error entries (oldest to newest).
    */
   getErrors() {
-    return this._errors.toArray();
+    return this._errors.toArray().map((entry) => ({ ...entry }));
   }
 
   /**
@@ -1355,16 +1444,20 @@ export class CrashReporter {
     for (let i = 0; i < recentErrors.length; i += 1) {
       const errEntry = recentErrors[i];
       const classified = this._errorClassifications.get(errEntry) || classifyBootError(errEntry);
+      const occurrences = errEntry.occurrences || 1;
       classifiedErrors.push({
         timestamp: errEntry.timestamp,
         timestampMs: errEntry.timestampMs,
+        firstSeenAtMs: errEntry.firstSeenAtMs,
+        lastSeenAtMs: errEntry.lastSeenAtMs,
+        occurrences,
         errorCategory: errEntry.category,
         code: classified.code,
         category: classified.category,
         hint: classified.hint,
         message: classified.message,
       });
-      errorCodeCounts[classified.code] = (errorCodeCounts[classified.code] || 0) + 1;
+      errorCodeCounts[classified.code] = (errorCodeCounts[classified.code] || 0) + occurrences;
     }
 
     const rawBootOverride = bootSnapshot !== undefined ? bootSnapshot : bootSummary;
@@ -1379,6 +1472,7 @@ export class CrashReporter {
       appVersion: this._appVersion,
       capabilities: this.collectCapabilities(),
       errors: recentErrors,
+      errorStats: this.getErrorStats(),
       recentLogs: this._logs.toArray(),
       perf: resolvedPerf,
       storage: storageSummary !== undefined ? storageSummary : null,
