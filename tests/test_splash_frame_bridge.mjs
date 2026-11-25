@@ -1637,3 +1637,370 @@ test('W189: 4K (3840x2160 Y + 1920x1080 Cr/Cb) Bink2Scarlett yvu preserves plane
   assert.equal(alignedBridge.getStats().presenterStats.scratchAllocations, 0);
   alignedBridge.destroy();
 });
+
+function createMockImageBitmap(width, height, options = {}) {
+  const bmp = {
+    width,
+    height,
+    closeCalls: 0,
+    closed: false,
+    close() {
+      this.closeCalls += 1;
+      if (options.throwOnClose) {
+        throw new Error(typeof options.throwOnClose === 'string' ? options.throwOnClose : 'ImageBitmap already closed');
+      }
+      this.closed = true;
+    },
+  };
+  if (options.withData) {
+    bmp.data = makeRgbaFrame(width, height, options.fill !== undefined ? options.fill : 0x66);
+  }
+  return bmp;
+}
+
+test('W279: pushExternalImage + renderFrame explicitly closes owned ImageBitmaps once, preserves extracted-copy caller ownership, and tracks framesBridged/bitmapsClosed', () => {
+  const device = createMockWebGpuDevice();
+  const bridge = new SplashFrameBridge({ device, targetFps: 1000 });
+
+  // 1) ImageBitmap with RGBA data (extracted RGBA owns copy; caller retains bitmap unless closeOnRelease: true).
+  const bmpWithData = createMockImageBitmap(8, 8, { withData: true, fill: 0x33 });
+  bridge.pushExternalImage(bmpWithData, { timestampMs: 0 });
+  assert.equal(bmpWithData.closeCalls, 0);
+  assert.equal(bridge.getStats().retainedBitmaps, 1);
+
+  const r0 = bridge.renderFrame(device, { kind: 'GPUTextureView' }, 128, 128, 0);
+  assert.equal(r0.presented, true);
+  assert.equal(r0.framesBridged, 1);
+  assert.equal(r0.bitmapsClosed, 0);
+  assert.equal(bmpWithData.closeCalls, 0);
+  assert.equal(bridge.getStats().retainedBitmaps, 0);
+
+  const firstScratchTex = device.createdTextures.find((t) =>
+    t.label && t.label.startsWith('playgta6-splash-external-')
+  );
+  assert.ok(firstScratchTex);
+  assert.equal(firstScratchTex.destroyed, false);
+
+  // 2) Copy-only ImageBitmap (real browser ImageBitmap with no .data; must close exactly once after renderFrame).
+  const bmpCopyOnly = createMockImageBitmap(4, 4, { withData: false });
+  bridge.pushExternalImage(bmpCopyOnly, { timestampMs: 10 });
+  assert.equal(bridge.getStats().retainedBitmaps, 1);
+
+  const r1 = bridge.renderFrame(device, { kind: 'GPUTextureView' }, 128, 128, 10);
+  assert.equal(r1.presented, true);
+  assert.equal(r1.framesBridged, 2);
+  assert.equal(r1.bitmapsClosed, 1);
+  assert.equal(bmpCopyOnly.closeCalls, 1);
+  assert.equal(bmpCopyOnly.closed, true);
+  // Prior scratch texture was destroyed when replaced by the newer external frame.
+  assert.equal(firstScratchTex.destroyed, true);
+
+  // 3) ImageBitmap with data + explicit closeOnRelease: true closes after renderFrame.
+  const bmpOwned = createMockImageBitmap(4, 4, { withData: true, fill: 0x55 });
+  bridge.pushExternalImage(bmpOwned, { timestampMs: 20, closeOnRelease: true });
+  const r2 = bridge.renderFrame(device, { kind: 'GPUTextureView' }, 128, 128, 20);
+  assert.equal(r2.presented, true);
+  assert.equal(r2.framesBridged, 3);
+  assert.equal(r2.bitmapsClosed, 2);
+  assert.equal(bmpOwned.closeCalls, 1);
+  assert.equal(bmpOwned.closed, true);
+
+  const stats = bridge.getStats();
+  assert.equal(stats.framesBridged, 3);
+  assert.equal(stats.framesPresented, 3);
+  assert.equal(stats.bitmapsClosed, 2);
+  assert.equal(stats.retainedBitmaps, 0);
+  assert.equal(stats.droppedStaleFrames, 0);
+
+  bridge.dispose();
+});
+
+test('W279: replacing older frames via queue overflow or stale timestamps closes ImageBitmaps, nulls buffers, and increments droppedStaleFrames', () => {
+  const device = createMockWebGpuDevice();
+  const bridge = new SplashFrameBridge({ device, maxQueueDepth: 2, targetFps: 1000 });
+
+  const bmp0 = createMockImageBitmap(4, 4, { withData: true, fill: 0x10 });
+  const bmp1 = createMockImageBitmap(4, 4, { withData: false });
+  const bmp2 = createMockImageBitmap(4, 4, { withData: false });
+
+  bridge.pushExternalImage(bmp0, { frameIndex: 0, timestampMs: 0 });
+  const entry0 = bridge._queue[0];
+  bridge.pushExternalImage(bmp1, { frameIndex: 1, timestampMs: 10 });
+  const entry1 = bridge._queue[1];
+
+  // Overflow: evicts frame 0 immediately, closing bmp0 and nulling entry0 references.
+  const enq2 = bridge.pushExternalImage(bmp2, { frameIndex: 2, timestampMs: 20 });
+  assert.equal(enq2.droppedStaleFrames, 1);
+  assert.equal(bmp0.closeCalls, 1);
+  assert.equal(entry0.image, null);
+  assert.equal(entry0.externalSource, null);
+  assert.equal(entry0.planes, null);
+  assert.equal(bmp1.closeCalls, 0);
+  assert.equal(bmp2.closeCalls, 0);
+  assert.equal(bridge.getStats().droppedStaleFrames, 1);
+  assert.equal(bridge.getStats().bitmapsClosed, 1);
+  assert.equal(bridge.getStats().retainedBitmaps, 2);
+
+  // Stale due-frame skip: at nowMs=25, frame 1 is skipped as stale and frame 2 is presented.
+  const res = bridge.renderFrame(device, { kind: 'GPUTextureView' }, 64, 64, 25);
+  assert.equal(res.presented, true);
+  assert.equal(res.frameIndex, 2);
+  assert.equal(bmp1.closeCalls, 1);
+  assert.equal(bmp2.closeCalls, 1);
+  assert.equal(entry1.image, null);
+  assert.equal(entry1.externalSource, null);
+  assert.equal(entry1.planes, null);
+
+  const stats = bridge.getStats();
+  assert.equal(stats.framesBridged, 1);
+  assert.equal(stats.droppedFrames, 2);
+  assert.equal(stats.droppedStaleFrames, 2);
+  assert.equal(stats.bitmapsClosed, 3);
+  assert.equal(stats.retainedBitmaps, 0);
+
+  bridge.dispose();
+});
+
+test('W279: releaseSplashResources() releases queued bitmaps, pixel buffers, and scratch textures idempotently without double-close', () => {
+  const device = createMockWebGpuDevice();
+  const bridge = new SplashFrameBridge({ device, maxQueueDepth: 4, targetFps: 1000 });
+
+  // Present one copy-only external frame so a scratch texture is allocated and bitmap is closed.
+  const presentedBmp = createMockImageBitmap(4, 4, { withData: false });
+  bridge.pushExternalImage(presentedBmp, { timestampMs: 0 });
+  bridge.renderFrame(device, { kind: 'GPUTextureView' }, 64, 64, 0);
+  assert.equal(presentedBmp.closeCalls, 1);
+
+  const scratchTex = device.createdTextures.find(
+    (t) => t.label && t.label.startsWith('playgta6-splash-external-')
+  );
+  assert.ok(scratchTex);
+  assert.equal(scratchTex.destroyed, false);
+
+  // Queue an ImageBitmap and a raw YUV frame without rendering them.
+  const queuedBmp = createMockImageBitmap(8, 8, { withData: true });
+  bridge.pushExternalImage(queuedBmp, { timestampMs: 10 });
+  bridge.pushRawFrame({
+    width: 8,
+    height: 4,
+    format: PIXEL_FORMAT.YUV420P,
+    planes: makeYuv420Planes(8, 4),
+    timestampMs: 20,
+  });
+  const queuedExtEntry = bridge._queue[0];
+  const queuedYuvEntry = bridge._queue[1];
+
+  const rel1 = bridge.releaseSplashResources();
+  assert.equal(rel1.released, true);
+  assert.equal(rel1.framesReleased, 2);
+  assert.equal(rel1.bitmapsClosed, 1);
+  assert.equal(rel1.buffersReleased, 4); // 1 rgba + 3 y/u/v planes
+  assert.equal(rel1.texturesDestroyed, 1);
+  assert.equal(rel1.releaseCount, 1);
+  assert.equal(rel1.queueDepth, 0);
+
+  assert.equal(queuedBmp.closeCalls, 1);
+  assert.equal(scratchTex.destroyed, true);
+  assert.equal(scratchTex.destroyCalls, 1);
+  assert.equal(queuedExtEntry.image, null);
+  assert.equal(queuedExtEntry.externalSource, null);
+  assert.equal(queuedExtEntry.planes, null);
+  assert.equal(queuedYuvEntry.planes, null);
+  assert.equal(bridge.getStats().retainedBitmaps, 0);
+  assert.equal(bridge.getStats().releaseCount, 1);
+  assert.equal(bridge.getStats().bitmapsClosed, 2);
+
+  // Repeated releaseSplashResources() is idempotent: no double-close, no throw, releaseCount unchanged.
+  const rel2 = bridge.releaseSplashResources();
+  assert.equal(rel2.released, false);
+  assert.equal(rel2.framesReleased, 0);
+  assert.equal(rel2.bitmapsClosed, 0);
+  assert.equal(rel2.texturesDestroyed, 0);
+  assert.equal(rel2.releaseCount, 1);
+  assert.equal(queuedBmp.closeCalls, 1);
+  assert.equal(presentedBmp.closeCalls, 1);
+  assert.equal(scratchTex.destroyCalls, 1);
+
+  // Pushing a new frame re-arms releaseSplashResources() for a second release cycle.
+  const secondBmp = createMockImageBitmap(4, 4, { withData: false });
+  bridge.pushExternalImage(secondBmp, { timestampMs: 30 });
+  const rel3 = bridge.releaseSplashResources();
+  assert.equal(rel3.released, true);
+  assert.equal(rel3.framesReleased, 1);
+  assert.equal(rel3.bitmapsClosed, 1);
+  assert.equal(rel3.releaseCount, 2);
+  assert.equal(secondBmp.closeCalls, 1);
+  assert.equal(bridge.getStats().releaseCount, 2);
+  assert.equal(bridge.getStats().bitmapsClosed, 3);
+
+  bridge.dispose();
+  // Calling releaseSplashResources() after dispose() never throws or double-closes.
+  assert.doesNotThrow(() => bridge.releaseSplashResources());
+  assert.equal(secondBmp.closeCalls, 1);
+});
+
+test('W279: notifyGuestFirstPresent handoff closes queued bitmaps, destroys scratch textures, and closes late post-handoff bitmaps', () => {
+  const device = createMockWebGpuDevice();
+  const bridge = new SplashFrameBridge({ device, maxQueueDepth: 4, targetFps: 1000 });
+
+  const firstBmp = createMockImageBitmap(8, 8, { withData: false });
+  bridge.pushExternalImage(firstBmp, { timestampMs: 0 });
+  bridge.renderFrame(device, { kind: 'GPUTextureView' }, 128, 72, 0);
+  assert.equal(firstBmp.closeCalls, 1);
+
+  const scratchTex = device.createdTextures.find(
+    (t) => t.label && t.label.startsWith('playgta6-splash-external-')
+  );
+  assert.ok(scratchTex);
+  assert.equal(scratchTex.destroyed, false);
+
+  const pendingBmp = createMockImageBitmap(8, 8, { withData: false });
+  bridge.pushExternalImage(pendingBmp, { timestampMs: 10 });
+  const pendingEntry = bridge._queue[0];
+
+  const handoff = bridge.notifyGuestFirstPresent();
+  assert.equal(handoff.guestFirstPresent, true);
+  assert.equal(handoff.splashSuppressed, true);
+  assert.equal(handoff.drainedFrames, 1);
+  assert.equal(handoff.bitmapsClosed, 2);
+  assert.equal(handoff.releaseCount, 1);
+  assert.equal(pendingBmp.closeCalls, 1);
+  assert.equal(pendingEntry.image, null);
+  assert.equal(pendingEntry.externalSource, null);
+  assert.equal(scratchTex.destroyed, true);
+  assert.equal(bridge.getStats().retainedBitmaps, 0);
+
+  // Late post-handoff ImageBitmap is ignored AND closed immediately to prevent leaks.
+  const lateBmp = createMockImageBitmap(4, 4, { withData: true });
+  const lateRes = bridge.pushExternalImage(lateBmp, { timestampMs: 20 });
+  assert.equal(lateRes.ignored, true);
+  assert.equal(lateRes.reason, 'suppressed');
+  assert.equal(lateBmp.closeCalls, 1);
+  assert.equal(bridge.getStats().bitmapsClosed, 3);
+  assert.equal(bridge.getStats().retainedBitmaps, 0);
+
+  // Idempotent second handoff & dispose never double-close.
+  const handoff2 = bridge.notifyGuestFirstPresent();
+  assert.equal(handoff2.drainedFrames, 0);
+  assert.equal(handoff2.releaseCount, 1);
+  bridge.dispose();
+  bridge.dispose();
+  assert.equal(firstBmp.closeCalls, 1);
+  assert.equal(pendingBmp.closeCalls, 1);
+  assert.equal(lateBmp.closeCalls, 1);
+});
+
+test('W279: dispose() is idempotent, catches already-closed bitmap errors safely, avoids double-close, and cleans up on renderFrame error', () => {
+  const device = createMockWebGpuDevice();
+  const bridge = new SplashFrameBridge({ device, maxQueueDepth: 6, targetFps: 1000 });
+
+  const throwingBmp = createMockImageBitmap(4, 4, { withData: true, throwOnClose: 'already closed' });
+  const sharedBmp = createMockImageBitmap(4, 4, { withData: false });
+  const plainExternal = { width: 4, height: 4, data: makeRgbaFrame(4, 4) };
+  const validBmp = createMockImageBitmap(4, 4, { withData: true });
+
+  bridge.pushExternalImage(throwingBmp, { timestampMs: 0 });
+  bridge.pushExternalImage(sharedBmp, { timestampMs: 10 });
+  bridge.pushExternalImage(sharedBmp, { timestampMs: 20 });
+  bridge.pushExternalImage(plainExternal, { timestampMs: 30 });
+  bridge.pushExternalImage(validBmp, { timestampMs: 40 });
+
+  assert.doesNotThrow(() => bridge.dispose());
+  assert.doesNotThrow(() => bridge.dispose());
+  assert.doesNotThrow(() => bridge.destroy());
+  assert.doesNotThrow(() => bridge.releaseSplashResources());
+
+  assert.equal(bridge.isDestroyed, true);
+  assert.equal(throwingBmp.closeCalls, 1);
+  assert.equal(sharedBmp.closeCalls, 1); // deduplicated via WeakSet
+  assert.equal(validBmp.closeCalls, 1);
+  const stats = bridge.getStats();
+  assert.equal(stats.bitmapsClosed, 2); // sharedBmp + validBmp (throwingBmp failed close safely)
+  assert.equal(stats.releaseCount, 1);
+  assert.equal(stats.retainedBitmaps, 0);
+  assert.equal(stats.queueDepth, 0);
+
+  // Error during renderFrame upload still releases dequeued owned ImageBitmap via finally.
+  const failingPresenter = {
+    uploadRgbaFrame() {
+      throw new Error('simulated GPU upload failure');
+    },
+    presentFrame() {
+      return { presented: true };
+    },
+  };
+  const errBridge = new SplashFrameBridge({ presenter: failingPresenter, maxQueueDepth: 2 });
+  const errBmp = createMockImageBitmap(4, 4, { withData: false });
+  errBridge.pushExternalImage(errBmp, { timestampMs: 0 });
+  assert.throws(
+    () => errBridge.renderFrame(device, { kind: 'GPUTextureView' }, 64, 64, 0),
+    /simulated GPU upload failure/
+  );
+  assert.equal(errBmp.closeCalls, 1);
+  assert.equal(errBridge.getStats().bitmapsClosed, 1);
+  assert.equal(errBridge.getStats().framesBridged, 0);
+  assert.equal(errBridge.getStats().retainedBitmaps, 0);
+  errBridge.dispose();
+});
+
+test('W279: resetStats() cleanly resets lifecycle counters without dropping queue and getStats()/getState() sanitize corrupted counters', () => {
+  const device = createMockWebGpuDevice();
+  const bridge = new SplashFrameBridge({ device, maxQueueDepth: 2, targetFps: 1000 });
+
+  const bmp0 = createMockImageBitmap(4, 4, { withData: false });
+  const bmp1 = createMockImageBitmap(4, 4, { withData: true });
+  const bmp2 = createMockImageBitmap(4, 4, { withData: true });
+
+  bridge.pushExternalImage(bmp0, { frameIndex: 0, timestampMs: 0 });
+  bridge.renderFrame(device, { kind: 'GPUTextureView' }, 64, 64, 0);
+  bridge.releaseSplashResources();
+
+  bridge.pushExternalImage(bmp1, { frameIndex: 1, timestampMs: 10 });
+  bridge.pushExternalImage(bmp2, { frameIndex: 2, timestampMs: 20 });
+  // Push one more to force overflow drop while leaving 2 frames queued.
+  bridge.pushDiagnosticFrame(4, 4, 3, { timestampMs: 30 });
+
+  let stats = bridge.getStats();
+  assert.equal(stats.framesBridged, 1);
+  assert.equal(stats.bitmapsClosed, 2); // bmp0 (rendered) + bmp1 (evicted)
+  assert.equal(stats.releaseCount, 1);
+  assert.equal(stats.droppedStaleFrames, 1);
+  assert.equal(stats.queueDepth, 2);
+
+  // resetStats() zeroes all counters while keeping queued frames and presenter intact.
+  const afterReset = bridge.resetStats();
+  assert.equal(afterReset.framesBridged, 0);
+  assert.equal(afterReset.framesPresented, 0);
+  assert.equal(afterReset.bitmapsClosed, 0);
+  assert.equal(afterReset.releaseCount, 0);
+  assert.equal(afterReset.droppedStaleFrames, 0);
+  assert.equal(afterReset.droppedFrames, 0);
+  assert.equal(afterReset.queueDepth, 2);
+  assert.equal(afterReset.retainedBitmaps, 1); // bmp2 still queued
+  assert.equal(afterReset.firstPresentSent, true); // session handoff flag preserved
+  assert.ok(bridge.presenter);
+
+  // Corrupted internal counters / source tokens are defensively sanitized.
+  bridge._framesBridged = -42;
+  bridge._bitmapsClosed = Number.NaN;
+  bridge._releaseCount = 'C:\\Users\\secret\\splash.raw';
+  bridge._droppedStaleFrames = Infinity;
+  bridge._lastSource = '/etc/passwd';
+
+  stats = bridge.getStats();
+  const state = bridge.getState();
+  assert.equal(stats.framesBridged, 0);
+  assert.equal(stats.bitmapsClosed, 0);
+  assert.equal(stats.releaseCount, 0);
+  assert.equal(stats.droppedStaleFrames, 0);
+  assert.equal(stats.lastSource, null);
+  assert.equal(state.framesBridged, 0);
+  assert.equal(state.bitmapsClosed, 0);
+  assert.equal(state.releaseCount, 0);
+  assert.equal(state.droppedStaleFrames, 0);
+  assert.equal(state.lastSource, null);
+
+  bridge.dispose();
+  assert.equal(bmp2.closeCalls, 1);
+  assert.throws(() => bridge.resetStats(), /destroyed/i);
+});
