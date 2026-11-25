@@ -10,7 +10,9 @@ const DEFAULT_MAX_BYTES = 64 * 1024 * 1024; // 64 MiB
 const DEFAULT_PREFETCH_CONCURRENCY = 4;
 const DEFAULT_COALESCE_MAX_GAP_BYTES = 64 * 1024; // 64 KiB
 const DEFAULT_COALESCE_MAX_MERGED_BYTES = 2 * 1024 * 1024; // 2 MiB
-const DEFAULT_MAX_READ_AHEAD_BYTES = 2 * 1024 * 1024; // 2 MiB
+const DEFAULT_MAX_READ_AHEAD_BYTES = 2 * 1024 * 1024; // 2 MiB (legacy W181 constant)
+const DEFAULT_MIN_READAHEAD_BYTES = 256 * 1024; // 256 KiB (W312 adaptive floor)
+const DEFAULT_MAX_READAHEAD_BYTES = 4 * 1024 * 1024; // 4 MiB (W312 adaptive ceiling)
 const DEFAULT_SEQUENTIAL_STREAK_THRESHOLD = 2;
 const DEFAULT_MAX_PENDING_OPFS_WRITES = 64;
 const DEFAULT_MAX_OPFS_WRITE_CONCURRENCY = 4;
@@ -329,10 +331,29 @@ function detectSequentialRead(prevState, offset, length, options = {}) {
     Number.isInteger(options.chunkSize) && options.chunkSize > 0
       ? options.chunkSize
       : DEFAULT_CHUNK_SIZE;
+  const rawMaxReadAhead =
+    options.maxReadaheadBytes !== undefined
+      ? options.maxReadaheadBytes
+      : options.maxReadAheadBytes;
   const maxReadAheadBytes =
-    Number.isFinite(options.maxReadAheadBytes) && options.maxReadAheadBytes >= 0
-      ? Math.floor(options.maxReadAheadBytes)
+    Number.isFinite(rawMaxReadAhead) && rawMaxReadAhead >= 0
+      ? Math.floor(rawMaxReadAhead)
       : DEFAULT_MAX_READ_AHEAD_BYTES;
+  const rawMinReadAhead =
+    options.minReadaheadBytes !== undefined
+      ? options.minReadaheadBytes
+      : options.minReadAheadBytes !== undefined
+        ? options.minReadAheadBytes
+        : options.initialReadAheadBytes;
+  const minReadaheadBytes =
+    maxReadAheadBytes > 0
+      ? Math.min(
+          maxReadAheadBytes,
+          Number.isFinite(rawMinReadAhead) && rawMinReadAhead > 0
+            ? Math.floor(rawMinReadAhead)
+            : Math.max(chunkSize, length),
+        )
+      : 0;
   const maxGapBytes =
     Number.isFinite(options.maxGapBytes) && options.maxGapBytes >= 0
       ? Math.floor(options.maxGapBytes)
@@ -349,6 +370,10 @@ function detectSequentialRead(prevState, offset, length, options = {}) {
     Number.isFinite(options.growthFactor) && options.growthFactor >= 1
       ? options.growthFactor
       : 2;
+  const shrinkFactor =
+    Number.isFinite(options.shrinkFactor) && options.shrinkFactor > 0 && options.shrinkFactor < 1
+      ? options.shrinkFactor
+      : 0.5;
 
   const end = offset + length;
   let isSequential = false;
@@ -357,6 +382,7 @@ function detectSequentialRead(prevState, offset, length, options = {}) {
   let stride = length;
   let streak = 0;
   let readAheadBytes = 0;
+  let adaptiveWindowBytes = minReadaheadBytes;
 
   if (
     prevState &&
@@ -366,6 +392,20 @@ function detectSequentialRead(prevState, offset, length, options = {}) {
     const prevOffset = prevState.lastOffset;
     const prevEnd = prevState.lastEnd;
     const prevStreak = Number.isInteger(prevState.streak) && prevState.streak >= 0 ? prevState.streak : 0;
+    const prevAdaptiveWindow =
+      maxReadAheadBytes > 0
+        ? Math.min(
+            maxReadAheadBytes,
+            Math.max(
+              minReadaheadBytes,
+              Number.isFinite(prevState.adaptiveWindowBytes) && prevState.adaptiveWindowBytes > 0
+                ? Math.floor(prevState.adaptiveWindowBytes)
+                : Number.isFinite(prevState.readAheadBytes) && prevState.readAheadBytes > 0
+                  ? Math.floor(prevState.readAheadBytes)
+                  : minReadaheadBytes,
+            ),
+          )
+        : 0;
 
     if (offset === prevEnd) {
       isSequential = true;
@@ -395,24 +435,30 @@ function detectSequentialRead(prevState, offset, length, options = {}) {
       streak = 0;
     }
 
-    if (isSequential && streak >= streakThreshold && maxReadAheadBytes > 0) {
-      const baseWindow = Math.min(
-        maxReadAheadBytes,
-        Number.isFinite(options.initialReadAheadBytes) && options.initialReadAheadBytes > 0
-          ? Math.floor(options.initialReadAheadBytes)
-          : Math.max(chunkSize, length),
-      );
+    if (isRandomSeek) {
+      adaptiveWindowBytes =
+        maxReadAheadBytes > 0
+          ? Math.max(minReadaheadBytes, Math.floor(prevAdaptiveWindow * shrinkFactor))
+          : 0;
+    } else if (isSequential && streak >= streakThreshold && maxReadAheadBytes > 0) {
       const prevWindow =
         Number.isFinite(prevState.readAheadBytes) && prevState.readAheadBytes > 0
           ? prevState.readAheadBytes
           : 0;
       if (prevWindow > 0) {
-        readAheadBytes = Math.min(maxReadAheadBytes, Math.floor(prevWindow * growthFactor));
+        readAheadBytes = Math.min(
+          maxReadAheadBytes,
+          Math.max(minReadaheadBytes, Math.floor(prevWindow * growthFactor)),
+        );
       } else {
+        const baseWindow = Math.min(maxReadAheadBytes, Math.max(minReadaheadBytes, prevAdaptiveWindow));
         const stepsAboveThreshold = streak - streakThreshold;
         const scaled = Math.floor(baseWindow * Math.pow(growthFactor, stepsAboveThreshold));
         readAheadBytes = Math.min(maxReadAheadBytes, Math.max(baseWindow, scaled));
       }
+      adaptiveWindowBytes = readAheadBytes;
+    } else {
+      adaptiveWindowBytes = prevAdaptiveWindow;
     }
   }
 
@@ -423,6 +469,7 @@ function detectSequentialRead(prevState, offset, length, options = {}) {
     gapBytes,
     stride,
     readAheadBytes,
+    adaptiveWindowBytes,
     nextState: {
       lastOffset: offset,
       lastLength: length,
@@ -430,6 +477,7 @@ function detectSequentialRead(prevState, offset, length, options = {}) {
       stride,
       streak,
       readAheadBytes,
+      adaptiveWindowBytes,
     },
   };
 }
@@ -480,6 +528,7 @@ class RangeCache {
         ? options.maxOpfsWriteConcurrency
         : DEFAULT_MAX_OPFS_WRITE_CONCURRENCY;
 
+    this._explicitCoalesceMaxMergedBytes = options.coalesceMaxMergedBytes !== undefined;
     this.coalesceMaxGapBytes =
       Number.isFinite(options.coalesceMaxGapBytes) && options.coalesceMaxGapBytes >= 0
         ? Math.floor(options.coalesceMaxGapBytes)
@@ -488,10 +537,25 @@ class RangeCache {
       Number.isFinite(options.coalesceMaxMergedBytes) && options.coalesceMaxMergedBytes > 0
         ? Math.floor(options.coalesceMaxMergedBytes)
         : DEFAULT_COALESCE_MAX_MERGED_BYTES;
-    this.maxReadAheadBytes =
-      Number.isFinite(options.maxReadAheadBytes) && options.maxReadAheadBytes >= 0
-        ? Math.floor(options.maxReadAheadBytes)
-        : DEFAULT_MAX_READ_AHEAD_BYTES;
+    const rawMaxReadahead =
+      options.maxReadaheadBytes !== undefined
+        ? options.maxReadaheadBytes
+        : options.maxReadAheadBytes;
+    this.maxReadaheadBytes =
+      Number.isFinite(rawMaxReadahead) && rawMaxReadahead >= 0
+        ? Math.floor(rawMaxReadahead)
+        : DEFAULT_MAX_READAHEAD_BYTES;
+    this.maxReadAheadBytes = this.maxReadaheadBytes;
+    const rawMinReadahead =
+      options.minReadaheadBytes !== undefined
+        ? options.minReadaheadBytes
+        : options.minReadAheadBytes;
+    const requestedMinReadahead =
+      Number.isFinite(rawMinReadahead) && rawMinReadahead > 0
+        ? Math.floor(rawMinReadahead)
+        : DEFAULT_MIN_READAHEAD_BYTES;
+    this.minReadaheadBytes =
+      this.maxReadaheadBytes > 0 ? Math.min(requestedMinReadahead, this.maxReadaheadBytes) : 0;
     this.sequentialStreakThreshold =
       Number.isInteger(options.sequentialStreakThreshold) && options.sequentialStreakThreshold >= 1
         ? options.sequentialStreakThreshold
@@ -523,11 +587,16 @@ class RangeCache {
           ? options.readAhead
           : null;
     if (explicitReadAhead !== null) {
-      this.enableReadAhead = explicitReadAhead && this.maxReadAheadBytes > 0;
-    } else if (options.maxReadAheadBytes !== undefined) {
-      this.enableReadAhead = this.maxReadAheadBytes > 0;
+      this.enableReadAhead = explicitReadAhead && this.maxReadaheadBytes > 0;
+    } else if (
+      options.maxReadaheadBytes !== undefined ||
+      options.maxReadAheadBytes !== undefined ||
+      options.minReadaheadBytes !== undefined ||
+      options.minReadAheadBytes !== undefined
+    ) {
+      this.enableReadAhead = this.maxReadaheadBytes > 0;
     } else {
-      this.enableReadAhead = autoOptimize && this.maxReadAheadBytes > 0;
+      this.enableReadAhead = autoOptimize && this.maxReadaheadBytes > 0;
     }
 
     this._memCache = new Map();
@@ -545,11 +614,27 @@ class RangeCache {
     this._fileSizes = new Map();
     this._seqTrackers = new Map();
     this._prefetchedKeys = new Set();
+    this._readaheadKeys = new Map();
     this._inFlightPrefetchKeys = new Set();
+    this._inFlightReadaheadKeys = new Set();
     this._activePrefetches = new Set();
     this._activeReadAheadBatches = 0;
     this._bytesCached = 0;
-    this._stats = {
+    this._stats = this._createEmptyStats();
+
+    if (options.fileFingerprints instanceof Map) {
+      for (const [p, fp] of options.fileFingerprints.entries()) {
+        this.setFileFingerprint(p, fp);
+      }
+    } else if (options.fileFingerprints && typeof options.fileFingerprints === 'object') {
+      for (const [p, fp] of Object.entries(options.fileFingerprints)) {
+        this.setFileFingerprint(p, fp);
+      }
+    }
+  }
+
+  _createEmptyStats() {
+    return {
       hits: 0,
       misses: 0,
       opfsHits: 0,
@@ -566,15 +651,62 @@ class RangeCache {
       prefetchHits: 0,
       prefetchBytes: 0,
       bytesSavedByCoalescing: 0,
+      adaptiveReadaheadWindowBytes: 0,
+      sequentialStreakPeak: 0,
+      readaheadHits: 0,
+      readaheadWastedBytes: 0,
+      zeroAllocCopyHits: 0,
     };
+  }
 
-    if (options.fileFingerprints instanceof Map) {
-      for (const [p, fp] of options.fileFingerprints.entries()) {
-        this.setFileFingerprint(p, fp);
+  _normalizePathOrUrl(urlOrPath) {
+    if (typeof urlOrPath !== 'string' || urlOrPath.length === 0) {
+      throw new Error('RangeCache path must be a non-empty string');
+    }
+    let candidate = urlOrPath;
+    if (candidate.startsWith(this.dataBase)) {
+      candidate = candidate.slice(this.dataBase.length);
+    } else if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(candidate)) {
+      candidate = candidate.replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/]*/, '');
+      candidate = candidate.replace(/[?#].*$/, '');
+      const basePath = this.dataBase.replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/]*/, '');
+      if (basePath && candidate.startsWith(basePath)) {
+        candidate = candidate.slice(basePath.length);
       }
-    } else if (options.fileFingerprints && typeof options.fileFingerprints === 'object') {
-      for (const [p, fp] of Object.entries(options.fileFingerprints)) {
-        this.setFileFingerprint(p, fp);
+    }
+    return normalizeRelPath(candidate);
+  }
+
+  _recordReadaheadWastedKey(key) {
+    const wastedBytes = this._readaheadKeys.get(key);
+    if (wastedBytes !== undefined) {
+      this._readaheadKeys.delete(key);
+      if (wastedBytes > 0) {
+        this._stats.readaheadWastedBytes += wastedBytes;
+      }
+    }
+  }
+
+  _accountAbandonedReadaheadOnSeek(relPath, keepFirstChunk, keepLastChunk) {
+    if (this._readaheadKeys.size === 0) {
+      return;
+    }
+    const prefix = `${relPath}::`;
+    for (const [key, byteLength] of Array.from(this._readaheadKeys.entries())) {
+      if (!key.startsWith(prefix)) {
+        continue;
+      }
+      const chunkIndex = Number(key.slice(prefix.length));
+      if (
+        Number.isInteger(chunkIndex) &&
+        chunkIndex >= keepFirstChunk &&
+        chunkIndex <= keepLastChunk
+      ) {
+        continue;
+      }
+      this._readaheadKeys.delete(key);
+      if (byteLength > 0) {
+        this._stats.readaheadWastedBytes += byteLength;
       }
     }
   }
@@ -646,6 +778,7 @@ class RangeCache {
         this._memCache.delete(key);
         this._memChunkFingerprints.delete(key);
         this._prefetchedKeys.delete(key);
+        this._recordReadaheadWastedKey(key);
         this._opfsWriteQueue.delete(key);
         if (bytes && Number.isFinite(bytes.byteLength)) {
           this._bytesCached = Math.max(0, this._bytesCached - bytes.byteLength);
@@ -801,6 +934,7 @@ class RangeCache {
       this._memCache.delete(oldestKey);
       this._memChunkFingerprints.delete(oldestKey);
       this._prefetchedKeys.delete(oldestKey);
+      this._recordReadaheadWastedKey(oldestKey);
       if (oldestBytes && Number.isFinite(oldestBytes.byteLength)) {
         this._bytesCached = Math.max(0, this._bytesCached - oldestBytes.byteLength);
       }
@@ -971,6 +1105,7 @@ class RangeCache {
     }
     this._memChunkFingerprints.delete(key);
     this._prefetchedKeys.delete(key);
+    this._recordReadaheadWastedKey(key);
     this._opfsWriteQueue.delete(key);
     const fp = this._resolveEffectiveFingerprint(relPath, fileFingerprint);
     if (this.opfsCache && typeof this.opfsCache.delete === 'function') {
@@ -1514,19 +1649,25 @@ class RangeCache {
   }
 
   _consumePrefetchHit(key) {
-    if (this._prefetchedKeys.delete(key)) {
+    const wasPrefetch = this._prefetchedKeys.delete(key);
+    if (wasPrefetch) {
       this._stats.prefetchHits += 1;
-      return true;
     }
-    return false;
+    if (this._readaheadKeys.delete(key)) {
+      this._stats.readaheadHits += 1;
+    }
+    return wasPrefetch;
   }
 
   _updateSequentialTracker(relPath, offset, length) {
     const prevState = this._seqTrackers.get(relPath) || null;
+    const effectiveMaxReadahead = this.enableReadAhead ? this.maxReadaheadBytes : 0;
+    const effectiveMinReadahead = this.enableReadAhead ? this.minReadaheadBytes : 0;
     const detection = detectSequentialRead(prevState, offset, length, {
       chunkSize: this.chunkSize,
       maxGapBytes: this.sequentialMaxGapBytes,
-      maxReadAheadBytes: this.maxReadAheadBytes,
+      minReadaheadBytes: effectiveMinReadahead,
+      maxReadaheadBytes: effectiveMaxReadahead,
       streakThreshold: this.sequentialStreakThreshold,
     });
 
@@ -1542,6 +1683,17 @@ class RangeCache {
 
     if (detection.isSequential) {
       this._stats.sequentialHits += 1;
+      if (detection.streak > this._stats.sequentialStreakPeak) {
+        this._stats.sequentialStreakPeak = detection.streak;
+      }
+    } else if (detection.isRandomSeek && length > 0) {
+      const firstChunk = Math.floor(offset / this.chunkSize);
+      const lastChunk = Math.floor((offset + length - 1) / this.chunkSize);
+      this._accountAbandonedReadaheadOnSeek(relPath, firstChunk, lastChunk);
+    }
+
+    if (this.enableReadAhead) {
+      this._stats.adaptiveReadaheadWindowBytes = detection.adaptiveWindowBytes;
     }
 
     return detection;
@@ -1550,7 +1702,7 @@ class RangeCache {
   getSequentialState(relPath) {
     let cleanPath;
     try {
-      cleanPath = normalizeRelPath(relPath);
+      cleanPath = this._normalizePathOrUrl(relPath);
     } catch {
       return null;
     }
@@ -1560,6 +1712,7 @@ class RangeCache {
 
   async _getChunk(relPath, chunkIndex, requiredEndInChunk = 0, options = {}) {
     const isPrefetch = Boolean(options.isPrefetch);
+    const isReadahead = Boolean(options.isReadahead);
     const countMiss = options.countMiss !== false;
     const fp = this._resolveEffectiveFingerprint(relPath, options.fileFingerprint);
     const key = this._chunkKey(relPath, chunkIndex);
@@ -1572,6 +1725,7 @@ class RangeCache {
         this._memCache.delete(key);
         this._memChunkFingerprints.delete(key);
         this._prefetchedKeys.delete(key);
+        this._recordReadaheadWastedKey(key);
         if (Number.isFinite(memHit.byteLength)) {
           this._bytesCached = Math.max(0, this._bytesCached - memHit.byteLength);
         }
@@ -1596,6 +1750,7 @@ class RangeCache {
     const existingFlight = this._inFlight.get(key);
     if (existingFlight) {
       const joinedPrefetch = !isPrefetch && this._inFlightPrefetchKeys.delete(key);
+      const joinedReadahead = !isPrefetch && this._inFlightReadaheadKeys.delete(key);
       const inflightBytes = await existingFlight;
       if (inflightBytes instanceof Uint8Array && inflightBytes.byteLength === 0) {
         return inflightBytes;
@@ -1612,6 +1767,10 @@ class RangeCache {
           this._prefetchedKeys.delete(key);
           this._stats.prefetchHits += 1;
         }
+        if (joinedReadahead) {
+          this._readaheadKeys.delete(key);
+          this._stats.readaheadHits += 1;
+        }
         return inflightBytes;
       }
       if (verdict === 'corrupt') {
@@ -1624,6 +1783,9 @@ class RangeCache {
 
     if (isPrefetch) {
       this._inFlightPrefetchKeys.add(key);
+      if (isReadahead) {
+        this._inFlightReadaheadKeys.add(key);
+      }
     }
 
     const loadPromise = (async () => {
@@ -1652,6 +1814,9 @@ class RangeCache {
             this._putMemory(key, opfsResult.bytes, fp);
             if (isPrefetch && this._inFlightPrefetchKeys.has(key) && this._memCache.has(key)) {
               this._prefetchedKeys.add(key);
+              if (isReadahead && this._inFlightReadaheadKeys.has(key)) {
+                this._readaheadKeys.set(key, opfsResult.bytes.byteLength);
+              }
             }
             return opfsResult.bytes;
           }
@@ -1684,6 +1849,9 @@ class RangeCache {
           this._stats.prefetchBytes += netBytes.byteLength;
           if (this._inFlightPrefetchKeys.has(key) && this._memCache.has(key)) {
             this._prefetchedKeys.add(key);
+            if (isReadahead && this._inFlightReadaheadKeys.has(key)) {
+              this._readaheadKeys.set(key, netBytes.byteLength);
+            }
           }
         }
         if (this.backgroundOpfsWrites) {
@@ -1700,6 +1868,7 @@ class RangeCache {
       return await loadPromise;
     } finally {
       this._inFlightPrefetchKeys.delete(key);
+      this._inFlightReadaheadKeys.delete(key);
       if (this._inFlight.get(key) === loadPromise) {
         this._inFlight.delete(key);
       }
@@ -1708,6 +1877,7 @@ class RangeCache {
 
   async _getChunksCoalesced(relPath, chunkSpecs, options = {}) {
     const isPrefetch = Boolean(options.isPrefetch);
+    const isReadahead = Boolean(options.isReadahead);
     const countMiss = options.countMiss !== false;
     const countCoalesce = options.countCoalesce !== false;
     const fp = this._resolveEffectiveFingerprint(relPath, options.fileFingerprint);
@@ -1737,6 +1907,7 @@ class RangeCache {
           this._memCache.delete(key);
           this._memChunkFingerprints.delete(key);
           this._prefetchedKeys.delete(key);
+          this._recordReadaheadWastedKey(key);
           if (Number.isFinite(memHit.byteLength)) {
             this._bytesCached = Math.max(0, this._bytesCached - memHit.byteLength);
           }
@@ -1774,6 +1945,7 @@ class RangeCache {
           suspectByteLength,
           existingFlight,
           joinedPrefetch: !isPrefetch && this._inFlightPrefetchKeys.delete(key),
+          joinedReadahead: !isPrefetch && this._inFlightReadaheadKeys.delete(key),
         });
         continue;
       }
@@ -1785,6 +1957,7 @@ class RangeCache {
         suspectByteLength,
         existingFlight: null,
         joinedPrefetch: false,
+        joinedReadahead: false,
       });
     }
 
@@ -1809,6 +1982,10 @@ class RangeCache {
             if (item.joinedPrefetch) {
               this._prefetchedKeys.delete(item.key);
               this._stats.prefetchHits += 1;
+            }
+            if (item.joinedReadahead) {
+              this._readaheadKeys.delete(item.key);
+              this._stats.readaheadHits += 1;
             }
             results[item.pos] = inflightBytes;
             return;
@@ -1853,6 +2030,9 @@ class RangeCache {
               this._putMemory(item.key, opfsResult.bytes, fp);
               if (isPrefetch && this._memCache.has(item.key)) {
                 this._prefetchedKeys.add(item.key);
+                if (isReadahead) {
+                  this._readaheadKeys.set(item.key, opfsResult.bytes.byteLength);
+                }
               }
               results[item.pos] = opfsResult.bytes;
               return;
@@ -1910,11 +2090,18 @@ class RangeCache {
       const lateFlight = this._inFlight.get(item.key);
       if (lateFlight) {
         const joinedPrefetch = !isPrefetch && this._inFlightPrefetchKeys.delete(item.key);
+        const joinedReadahead = !isPrefetch && this._inFlightReadaheadKeys.delete(item.key);
         lateJoins.push(
           lateFlight.then((bytes) => {
-            if (joinedPrefetch && bytes instanceof Uint8Array && bytes.byteLength > 0) {
-              this._prefetchedKeys.delete(item.key);
-              this._stats.prefetchHits += 1;
+            if (bytes instanceof Uint8Array && bytes.byteLength > 0) {
+              if (joinedPrefetch) {
+                this._prefetchedKeys.delete(item.key);
+                this._stats.prefetchHits += 1;
+              }
+              if (joinedReadahead) {
+                this._readaheadKeys.delete(item.key);
+                this._stats.readaheadHits += 1;
+              }
             }
             results[item.pos] = bytes;
           }),
@@ -1960,6 +2147,9 @@ class RangeCache {
           this._stats.prefetchBytes += bytes.byteLength;
           if (this._inFlightPrefetchKeys.has(item.key) && this._memCache.has(item.key)) {
             this._prefetchedKeys.add(item.key);
+            if (isReadahead && this._inFlightReadaheadKeys.has(item.key)) {
+              this._readaheadKeys.set(item.key, bytes.byteLength);
+            }
           }
         }
         if (this.backgroundOpfsWrites) {
@@ -1981,6 +2171,9 @@ class RangeCache {
         this._inFlight.set(item.key, promise);
         if (isPrefetch) {
           this._inFlightPrefetchKeys.add(item.key);
+          if (isReadahead) {
+            this._inFlightReadaheadKeys.add(item.key);
+          }
         }
         return { item, promise, resolve, reject };
       });
@@ -2044,6 +2237,7 @@ class RangeCache {
           for (let k = 0; k < deferreds.length; k += 1) {
             const d = deferreds[k];
             this._inFlightPrefetchKeys.delete(d.item.key);
+            this._inFlightReadaheadKeys.delete(d.item.key);
             if (this._inFlight.get(d.item.key) === d.promise) {
               this._inFlight.delete(d.item.key);
             }
@@ -2065,14 +2259,15 @@ class RangeCache {
       !detection ||
       detection.readAheadBytes <= 0 ||
       this.maxBytes < this.chunkSize * 2 ||
-      this._activeReadAheadBatches >= this.maxPrefetchConcurrency
+      this._activeReadAheadBatches >= this.maxPrefetchConcurrency ||
+      (typeof this.fetchImpl !== 'function' && !this.opfsDir && !this.opfsCache)
     ) {
       return;
     }
 
     const safeBudget = Math.min(
       detection.readAheadBytes,
-      this.maxReadAheadBytes,
+      this.maxReadaheadBytes,
       Math.max(0, this.maxBytes - this.chunkSize),
     );
     if (safeBudget < this.chunkSize) {
@@ -2129,19 +2324,25 @@ class RangeCache {
       return;
     }
 
+    const readAheadMaxMergedBytes = this._explicitCoalesceMaxMergedBytes
+      ? this.coalesceMaxMergedBytes
+      : Math.max(this.coalesceMaxMergedBytes, Math.min(safeBudget, this.maxReadaheadBytes));
+
     this._activeReadAheadBatches += 1;
     const prefetchPromise = (async () => {
       try {
         if (this.coalesceAdjacent || missingSpecs.length > 1) {
           await this._getChunksCoalesced(relPath, missingSpecs, {
             isPrefetch: true,
+            isReadahead: true,
             countMiss: false,
             countCoalesce: true,
-            maxMergedBytes: this.coalesceMaxMergedBytes,
+            maxMergedBytes: readAheadMaxMergedBytes,
           });
         } else {
           await this._getChunk(relPath, missingSpecs[0].chunkIndex, 0, {
             isPrefetch: true,
+            isReadahead: true,
             countMiss: false,
           });
         }
@@ -2163,6 +2364,131 @@ class RangeCache {
       const pending = Array.from(this._activePrefetches);
       await Promise.allSettled(pending);
     }
+  }
+
+  /**
+   * Zero-alloc synchronous L1 cache-hit fast path: copies cached bytes for [offset, offset + length)
+   * directly into caller-provided `targetBytes` without intermediate buffer/array allocations.
+   * Returns exact bytes written (>= 0) on full L1 memory hit, or -1 on cache miss (leaving
+   * `targetBytes` unmodified so the caller can fall back to async `read()`).
+   */
+  readCachedRangeInto(url, offset, length, targetBytes, options = {}) {
+    const cleanPath = this._normalizePathOrUrl(url);
+    if (!Number.isInteger(offset) || offset < 0) {
+      throw new Error(`Invalid read offset: ${offset}`);
+    }
+    if (!Number.isInteger(length) || length < 0) {
+      throw new Error(`Invalid read length: ${length}`);
+    }
+    if (!(targetBytes instanceof Uint8Array)) {
+      throw new TypeError('readCachedRangeInto requires a Uint8Array targetBytes');
+    }
+
+    const readOpts = options && typeof options === 'object' ? options : {};
+    const targetOffset =
+      Number.isInteger(readOpts.targetOffset) && readOpts.targetOffset >= 0
+        ? readOpts.targetOffset
+        : 0;
+    if (targetOffset > targetBytes.byteLength) {
+      throw new RangeError(
+        `targetOffset (${targetOffset}) exceeds targetBytes length (${targetBytes.byteLength})`,
+      );
+    }
+
+    if (length === 0) {
+      return 0;
+    }
+
+    let effectiveLength = length;
+    if (this._fileSizes.has(cleanPath)) {
+      const knownTotal = this._fileSizes.get(cleanPath);
+      if (offset >= knownTotal) {
+        return 0;
+      }
+      effectiveLength = Math.min(length, knownTotal - offset);
+    }
+
+    const fp = this._resolveEffectiveFingerprint(cleanPath, readOpts.fileFingerprint);
+    const firstChunk = Math.floor(offset / this.chunkSize);
+    const lastChunk = Math.floor((offset + effectiveLength - 1) / this.chunkSize);
+
+    // Pass 1: verify all required chunks are present & valid in L1 RAM before touching targetBytes.
+    let totalBytes = 0;
+    let actualLastChunk = firstChunk;
+    let reachedEof = false;
+
+    for (let idx = firstChunk; idx <= lastChunk; idx += 1) {
+      const key = this._chunkKey(cleanPath, idx);
+      const chunk = this._memCache.get(key);
+      if (!chunk) {
+        return -1;
+      }
+      if (fp !== null) {
+        const memFp = this._memChunkFingerprints.get(key) || null;
+        if (memFp !== fp) {
+          return -1;
+        }
+      }
+      const chunkStart = idx * this.chunkSize;
+      const requiredEndInChunk = Math.min(this.chunkSize, offset + effectiveLength - chunkStart);
+      if (this._validateCachedChunk(key, cleanPath, idx, chunk, requiredEndInChunk) !== 'valid') {
+        return -1;
+      }
+      const sliceStart = offset > chunkStart ? offset - chunkStart : 0;
+      const maxEnd = offset + effectiveLength - chunkStart;
+      const sliceEnd = chunk.byteLength < maxEnd ? chunk.byteLength : maxEnd;
+      if (sliceEnd > sliceStart) {
+        totalBytes += sliceEnd - sliceStart;
+      }
+      actualLastChunk = idx;
+      if (chunk.byteLength < this.chunkSize) {
+        reachedEof = true;
+        break;
+      }
+    }
+
+    if (targetBytes.byteLength - targetOffset < totalBytes) {
+      throw new RangeError(
+        `targetBytes capacity (${targetBytes.byteLength - targetOffset}) is smaller than required bytes (${totalBytes})`,
+      );
+    }
+
+    // Pass 2: touch LRU, consume prefetch/readahead hits, and copy directly into targetBytes.
+    let cursor = targetOffset;
+    for (let idx = firstChunk; idx <= actualLastChunk; idx += 1) {
+      const key = this._chunkKey(cleanPath, idx);
+      const chunk = this._touchMemory(key);
+      this._stats.hits += 1;
+      this._consumePrefetchHit(key);
+
+      const chunkStart = idx * this.chunkSize;
+      const sliceStart = offset > chunkStart ? offset - chunkStart : 0;
+      const maxEnd = offset + effectiveLength - chunkStart;
+      const sliceEnd = chunk.byteLength < maxEnd ? chunk.byteLength : maxEnd;
+      const copyLen = sliceEnd - sliceStart;
+      if (copyLen > 0) {
+        if (sliceStart === 0 && sliceEnd === chunk.byteLength) {
+          targetBytes.set(chunk, cursor);
+        } else if (copyLen <= 64) {
+          for (let j = 0; j < copyLen; j += 1) {
+            targetBytes[cursor + j] = chunk[sliceStart + j];
+          }
+        } else {
+          targetBytes.set(chunk.subarray(sliceStart, sliceEnd), cursor);
+        }
+        cursor += copyLen;
+      }
+    }
+
+    if (totalBytes > 0) {
+      this._stats.zeroAllocCopyHits += 1;
+      const seqDetection = this._updateSequentialTracker(cleanPath, offset, totalBytes);
+      if (!reachedEof && seqDetection.readAheadBytes > 0) {
+        this._scheduleReadAhead(cleanPath, actualLastChunk, seqDetection);
+      }
+    }
+
+    return totalBytes;
   }
 
   async read(relPath, offset, length, options = {}) {
@@ -2606,7 +2932,13 @@ class RangeCache {
     this._memChunkFingerprints.clear();
     this._seqTrackers.clear();
     this._prefetchedKeys.clear();
+    this._readaheadKeys.clear();
     this._bytesCached = 0;
+    this._stats.adaptiveReadaheadWindowBytes = 0;
+  }
+
+  resetStats() {
+    this._stats = this._createEmptyStats();
   }
 
   getStats() {
@@ -2631,6 +2963,11 @@ class RangeCache {
       prefetchHits: this._stats.prefetchHits,
       prefetchBytes: this._stats.prefetchBytes,
       bytesSavedByCoalescing: this._stats.bytesSavedByCoalescing,
+      adaptiveReadaheadWindowBytes: this._stats.adaptiveReadaheadWindowBytes,
+      sequentialStreakPeak: this._stats.sequentialStreakPeak,
+      readaheadHits: this._stats.readaheadHits,
+      readaheadWastedBytes: this._stats.readaheadWastedBytes,
+      zeroAllocCopyHits: this._stats.zeroAllocCopyHits,
       bytesCached: this._bytesCached,
       entries: this._memCache.size,
     };
@@ -2645,6 +2982,8 @@ const exportedApi = {
   DEFAULT_COALESCE_MAX_GAP_BYTES,
   DEFAULT_COALESCE_MAX_MERGED_BYTES,
   DEFAULT_MAX_READ_AHEAD_BYTES,
+  DEFAULT_MIN_READAHEAD_BYTES,
+  DEFAULT_MAX_READAHEAD_BYTES,
   DEFAULT_SEQUENTIAL_STREAK_THRESHOLD,
   DEFAULT_MAX_PENDING_OPFS_WRITES,
   DEFAULT_MAX_OPFS_WRITE_CONCURRENCY,
