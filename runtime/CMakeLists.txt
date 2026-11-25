@@ -76,6 +76,8 @@ add_library(playgta6_core STATIC
     guest/shard_dispatch.cpp
     os/xbox_scarlett_guest_input.cpp
     os/acp_hal_guest.cpp
+    os/mmdevice_guest.cpp
+    os/audio_downmix.cpp
 )
 target_include_directories(playgta6_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -293,6 +295,10 @@ else()
     add_executable(test_guest_callback_unwind ../tests/test_guest_callback_unwind.cpp)
     target_link_libraries(test_guest_callback_unwind PRIVATE playgta6_core)
     add_test(NAME playgta6_guest_callback_unwind_tests COMMAND test_guest_callback_unwind)
+
+    add_executable(test_audio_downmix ../tests/test_audio_downmix.cpp)
+    target_link_libraries(test_audio_downmix PRIVATE playgta6_core)
+    add_test(NAME playgta6_audio_downmix_tests COMMAND test_audio_downmix)
 
     add_executable(test_xbox_scarlett_guest ../tests/test_xbox_scarlett_guest.cpp)
     target_link_libraries(test_xbox_scarlett_guest PRIVATE playgta6_core)
