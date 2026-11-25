@@ -36,7 +36,13 @@ const INPUT_STATE_BYTES = 40;
 const INPUT_STATE_WORDS = 10;
 const DEFAULT_INPUT_BRIDGE_POLL_MS = 16;
 const INPUT_SNAPSHOT_MAX_RETRIES = 64;
+const DEFAULT_MEMFS_PIPELINE_DUMP_DIR = '/pg6_dump';
+const DEFAULT_MEMFS_PIPELINE_DUMP_ENDPOINT = '/__pg6_dump/';
+const DEFAULT_MEMFS_PIPELINE_DUMP_INTERVAL_MS = 3000;
+const DEFAULT_MEMFS_PIPELINE_DUMP_MAX_CONCURRENT_UPLOADS = 4;
+const MAX_MEMFS_DUMP_WALK_DEPTH = 16;
 const utf8Decoder = new TextDecoder('utf-8', { fatal: false });
+const utf8Encoder = new TextEncoder();
 
 // Emscripten 7.0.1 `-pthread` spawns `new Worker(pthreadMainJs, { name: "em-pthread-" + id })`
 // (or legacy `{ name: "em-pthread" }`), which our coordinator Worker Proxy redirects to `loader.js`.
@@ -2976,6 +2982,685 @@ function startInputSabBridge(options = {}) {
   };
 }
 
+function parseDumpPipelinesFromSearch(rawSearch) {
+  if (typeof rawSearch !== 'string' || rawSearch.length === 0) {
+    return false;
+  }
+  const withoutHash = rawSearch.split('#', 1)[0];
+  const query = withoutHash.startsWith('?') ? withoutHash.slice(1) : withoutHash;
+  if (!query) {
+    return false;
+  }
+  try {
+    if (typeof URLSearchParams === 'function') {
+      const params = new URLSearchParams(query);
+      const val = params.get('dumpPipelines');
+      if (val === null) {
+        return false;
+      }
+      const norm = val.trim().toLowerCase();
+      return norm === '1' || norm === 'true';
+    }
+  } catch {
+    // Fall through to simple query parser.
+  }
+  const pairs = query.split('&');
+  for (let i = 0; i < pairs.length; i += 1) {
+    const pair = pairs[i];
+    if (!pair) continue;
+    const eq = pair.indexOf('=');
+    const rawKey = eq >= 0 ? pair.slice(0, eq) : pair;
+    let key;
+    try {
+      key = decodeURIComponent(rawKey);
+    } catch {
+      key = rawKey;
+    }
+    if (key !== 'dumpPipelines') continue;
+    const rawVal = eq >= 0 ? pair.slice(eq + 1) : '';
+    let val;
+    try {
+      val = decodeURIComponent(rawVal);
+    } catch {
+      val = rawVal;
+    }
+    const norm = val.trim().toLowerCase();
+    return norm === '1' || norm === 'true';
+  }
+  return false;
+}
+
+function extractSearchFromHref(rawHref) {
+  if (typeof rawHref !== 'string' || rawHref.length === 0) {
+    return '';
+  }
+  try {
+    if (typeof URL === 'function' && isAbsoluteUrl(rawHref)) {
+      return new URL(rawHref).search || '';
+    }
+  } catch {
+    // Fall through to string extraction.
+  }
+  const qIdx = rawHref.indexOf('?');
+  if (qIdx < 0) {
+    return '';
+  }
+  const hashIdx = rawHref.indexOf('#', qIdx);
+  return hashIdx >= 0 ? rawHref.slice(qIdx, hashIdx) : rawHref.slice(qIdx);
+}
+
+function resolveDumpPipelinesEnabled(options = {}) {
+  if (options && options.dumpPipelines === true) {
+    return true;
+  }
+  if (options && options.dumpPipelines === false) {
+    return false;
+  }
+  if (options && typeof options.locationSearch === 'string') {
+    return parseDumpPipelinesFromSearch(options.locationSearch);
+  }
+  if (options && typeof options.locationHref === 'string') {
+    return parseDumpPipelinesFromSearch(extractSearchFromHref(options.locationHref));
+  }
+  try {
+    const loc =
+      typeof self !== 'undefined' && self && self.location
+        ? self.location
+        : typeof globalThis !== 'undefined' && globalThis && globalThis.location
+          ? globalThis.location
+          : null;
+    if (!loc || typeof loc !== 'object') {
+      return false;
+    }
+    if (typeof loc.search === 'string' && loc.search.length > 0) {
+      return parseDumpPipelinesFromSearch(loc.search);
+    }
+    if (typeof loc.href === 'string' && loc.href.length > 0) {
+      return parseDumpPipelinesFromSearch(extractSearchFromHref(loc.href));
+    }
+  } catch {
+    // Safe fallback in restricted/headless environments without location.
+  }
+  return false;
+}
+
+function hasControlChar(str) {
+  for (let i = 0; i < str.length; i += 1) {
+    const code = str.charCodeAt(i);
+    if (code < 32 || code === 127) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function normalizeMemfsDumpDir(rawDir) {
+  if (typeof rawDir !== 'string') {
+    return DEFAULT_MEMFS_PIPELINE_DUMP_DIR;
+  }
+  const trimmed = rawDir.trim();
+  if (!trimmed || trimmed.includes('\0') || trimmed.includes('\\') || hasControlChar(trimmed)) {
+    return DEFAULT_MEMFS_PIPELINE_DUMP_DIR;
+  }
+  const stripped = trimmed.replace(/^\/+/, '').replace(/\/+$/, '');
+  if (!stripped) {
+    return DEFAULT_MEMFS_PIPELINE_DUMP_DIR;
+  }
+  const segments = stripped.split('/');
+  for (let i = 0; i < segments.length; i += 1) {
+    const seg = segments[i];
+    if (!seg || seg === '.' || seg === '..' || seg.includes(':')) {
+      return DEFAULT_MEMFS_PIPELINE_DUMP_DIR;
+    }
+  }
+  return `/${segments.join('/')}`;
+}
+
+function normalizeDumpEndpoint(rawEndpoint) {
+  if (typeof rawEndpoint !== 'string') {
+    return DEFAULT_MEMFS_PIPELINE_DUMP_ENDPOINT;
+  }
+  const trimmed = rawEndpoint.trim();
+  if (!trimmed || trimmed.includes('\0') || trimmed.includes('\\') || hasControlChar(trimmed)) {
+    return DEFAULT_MEMFS_PIPELINE_DUMP_ENDPOINT;
+  }
+  const withoutQuery = trimmed.split(/[?#]/, 1)[0];
+  if (isAbsoluteUrl(trimmed)) {
+    if (!/^https?:/i.test(trimmed)) {
+      return DEFAULT_MEMFS_PIPELINE_DUMP_ENDPOINT;
+    }
+    try {
+      if (typeof URL === 'function') {
+        const parsed = new URL(trimmed);
+        if (parsed.pathname.split('/').includes('..')) {
+          return DEFAULT_MEMFS_PIPELINE_DUMP_ENDPOINT;
+        }
+      }
+    } catch {
+      return DEFAULT_MEMFS_PIPELINE_DUMP_ENDPOINT;
+    }
+    return ensureTrailingSlash(withoutQuery);
+  }
+  if (withoutQuery.split('/').includes('..')) {
+    return DEFAULT_MEMFS_PIPELINE_DUMP_ENDPOINT;
+  }
+  return ensureTrailingSlash(withoutQuery);
+}
+
+function sanitizeDumpRelPath(relPath) {
+  if (typeof relPath !== 'string' || relPath.length === 0) {
+    return null;
+  }
+  if (
+    relPath.includes('\0') ||
+    relPath.includes('\\') ||
+    relPath.includes(':') ||
+    relPath.startsWith('/') ||
+    hasControlChar(relPath)
+  ) {
+    return null;
+  }
+  const segments = relPath.split('/');
+  if (segments.length === 0) {
+    return null;
+  }
+  for (let i = 0; i < segments.length; i += 1) {
+    const seg = segments[i];
+    if (!seg || seg === '.' || seg === '..') {
+      return null;
+    }
+  }
+  return segments.join('/');
+}
+
+function isFsExistsError(err) {
+  if (!err) return false;
+  if (err.code === 'EEXIST' || err.errno === 20) {
+    return true;
+  }
+  const msg = typeof err.message === 'string' ? err.message : String(err);
+  return /EEXIST|File exists/i.test(msg);
+}
+
+function isFsNotFoundError(err) {
+  if (!err) return false;
+  if (err.code === 'ENOENT' || err.errno === 44 || err.errno === 2) {
+    return true;
+  }
+  const msg = typeof err.message === 'string' ? err.message : String(err);
+  return /ENOENT|No such file/i.test(msg);
+}
+
+function toUint8ArrayCopy(raw) {
+  if (raw instanceof Uint8Array) {
+    const copy = new Uint8Array(raw.byteLength);
+    copy.set(raw);
+    return copy;
+  }
+  if (ArrayBuffer.isView(raw)) {
+    const copy = new Uint8Array(raw.byteLength);
+    copy.set(new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength));
+    return copy;
+  }
+  if (raw instanceof ArrayBuffer) {
+    return new Uint8Array(raw.slice(0));
+  }
+  if (typeof raw === 'string') {
+    return utf8Encoder.encode(raw);
+  }
+  throw new TypeError('Unsupported FS.readFile return type');
+}
+
+function compareDumpCandidates(a, b) {
+  const aIsManifest = a.relpath === 'manifest.json';
+  const bIsManifest = b.relpath === 'manifest.json';
+  if (aIsManifest !== bIsManifest) {
+    return aIsManifest ? 1 : -1;
+  }
+  if (a.relpath < b.relpath) return -1;
+  if (a.relpath > b.relpath) return 1;
+  return 0;
+}
+
+/**
+ * Opt-in Emscripten `Module.FS` `/pg6_dump` -> `POST /__pg6_dump/<relpath>` pipeline-dump syncer.
+ *
+ * - Disabled by default (zero overhead: no FS access, no timer, no fetch) unless
+ *   `options.dumpPipelines === true` or URL search param `dumpPipelines=1|true` is present.
+ * - Ensures `dumpDir` exists during `preRun` via `FS.mkdirTree` / `FS.mkdir` (ignoring `EEXIST`).
+ * - Incrementally uploads new files and re-uploads updated files whose byte size changed
+ *   (e.g. `manifest.json`), with bounded concurrency (`maxConcurrentUploads`).
+ * - Never throws on HTTP 403/500 or network errors; increments `uploadErrors` and retries next flush.
+ * - Exposes sanitized `getStats()` with zero host paths or raw shader bytes.
+ */
+function createMemfsPipelineDumpSyncer(options = {}) {
+  const enabled = resolveDumpPipelinesEnabled(options);
+  const dumpDir = normalizeMemfsDumpDir(options.dumpDir);
+  const dumpEndpoint = normalizeDumpEndpoint(options.dumpEndpoint);
+  const intervalMs =
+    typeof options.intervalMs === 'number' &&
+    Number.isFinite(options.intervalMs) &&
+    options.intervalMs > 0
+      ? Math.max(10, Math.floor(options.intervalMs))
+      : DEFAULT_MEMFS_PIPELINE_DUMP_INTERVAL_MS;
+  const maxConcurrentUploads =
+    typeof options.maxConcurrentUploads === 'number' &&
+    Number.isFinite(options.maxConcurrentUploads) &&
+    options.maxConcurrentUploads >= 1
+      ? Math.floor(options.maxConcurrentUploads)
+      : DEFAULT_MEMFS_PIPELINE_DUMP_MAX_CONCURRENT_UPLOADS;
+
+  const fetchFn =
+    typeof options.fetchFn === 'function'
+      ? options.fetchFn
+      : typeof globalThis !== 'undefined' && typeof globalThis.fetch === 'function'
+        ? (url, init) => globalThis.fetch(url, init)
+        : typeof fetch === 'function'
+          ? (url, init) => fetch(url, init)
+          : null;
+  const setIntervalFn =
+    options.setIntervalFn !== undefined
+      ? options.setIntervalFn
+      : typeof setInterval === 'function'
+        ? (fn, ms) => setInterval(fn, ms)
+        : null;
+  const clearIntervalFn =
+    options.clearIntervalFn !== undefined
+      ? options.clearIntervalFn
+      : typeof clearInterval === 'function'
+        ? (id) => clearInterval(id)
+        : null;
+  const nowFn = typeof options.nowFn === 'function' ? options.nowFn : () => Date.now();
+
+  let explicitFs = options.fs || options.FS || null;
+  const getFsFn = typeof options.getFS === 'function' ? options.getFS : null;
+  let attachedModule = options.module && typeof options.module === 'object' ? options.module : null;
+  const getModuleFn = typeof options.getModule === 'function' ? options.getModule : null;
+
+  const uploadedSizes = new Map();
+  let filesUploaded = 0;
+  let bytesUploaded = 0;
+  let uploadErrors = 0;
+  let lastFlushAtMs = null;
+  let pendingCount = 0;
+
+  let timerId = null;
+  let activeFlush = null;
+  let queuedFlush = null;
+
+  function resolveFs(fsOverride) {
+    if (fsOverride && typeof fsOverride === 'object') {
+      return fsOverride;
+    }
+    if (explicitFs && typeof explicitFs === 'object') {
+      return explicitFs;
+    }
+    if (getFsFn) {
+      try {
+        const res = getFsFn();
+        if (res && typeof res === 'object') {
+          return res;
+        }
+      } catch {
+        // Ignore getter errors.
+      }
+    }
+    if (attachedModule && attachedModule.FS && typeof attachedModule.FS === 'object') {
+      return attachedModule.FS;
+    }
+    if (getModuleFn) {
+      try {
+        const mod = getModuleFn();
+        if (mod && mod.FS && typeof mod.FS === 'object') {
+          return mod.FS;
+        }
+      } catch {
+        // Ignore getter errors.
+      }
+    }
+    return null;
+  }
+
+  function getStats() {
+    return {
+      enabled,
+      filesUploaded,
+      bytesUploaded,
+      uploadErrors,
+      lastFlushAtMs,
+      pendingCount,
+    };
+  }
+
+  function setFS(fsObj) {
+    explicitFs = fsObj && typeof fsObj === 'object' ? fsObj : null;
+  }
+
+  function attachModule(mod) {
+    if (mod && typeof mod === 'object') {
+      attachedModule = mod;
+    }
+  }
+
+  function ensureDumpDir(fsOverride) {
+    if (!enabled) {
+      return false;
+    }
+    const fsObj = resolveFs(fsOverride);
+    if (!fsObj) {
+      return false;
+    }
+    try {
+      if (typeof fsObj.mkdirTree === 'function') {
+        fsObj.mkdirTree(dumpDir);
+        return true;
+      }
+      if (typeof fsObj.mkdir === 'function') {
+        const parts = dumpDir.split('/').filter(Boolean);
+        let cur = '';
+        for (let i = 0; i < parts.length; i += 1) {
+          cur += `/${parts[i]}`;
+          try {
+            fsObj.mkdir(cur);
+          } catch (err) {
+            if (!isFsExistsError(err)) {
+              throw err;
+            }
+          }
+        }
+        return true;
+      }
+    } catch (err) {
+      if (isFsExistsError(err)) {
+        return true;
+      }
+      // Directory creation failure must never crash runtime boot.
+    }
+    return false;
+  }
+
+  function isDirMode(fsObj, mode) {
+    if (typeof fsObj.isDir === 'function') {
+      return Boolean(fsObj.isDir(mode));
+    }
+    return typeof mode === 'number' && (mode & 0o170000) === 0o040000;
+  }
+
+  function isFileMode(fsObj, mode) {
+    if (typeof fsObj.isFile === 'function') {
+      return Boolean(fsObj.isFile(mode));
+    }
+    return typeof mode === 'number' && (mode & 0o170000) === 0o100000;
+  }
+
+  function collectDumpFiles(fsObj) {
+    if (
+      !fsObj ||
+      typeof fsObj.readdir !== 'function' ||
+      typeof fsObj.stat !== 'function' ||
+      typeof fsObj.readFile !== 'function'
+    ) {
+      return [];
+    }
+
+    const found = [];
+    const visitedDirs = new Set();
+
+    function walk(dirFullPath, relPrefix, depth) {
+      if (depth > MAX_MEMFS_DUMP_WALK_DEPTH) {
+        return;
+      }
+      if (visitedDirs.has(dirFullPath)) {
+        return;
+      }
+      visitedDirs.add(dirFullPath);
+
+      let entries;
+      try {
+        entries = fsObj.readdir(dirFullPath);
+      } catch (err) {
+        if (isFsNotFoundError(err)) {
+          return;
+        }
+        return;
+      }
+      if (!Array.isArray(entries)) {
+        return;
+      }
+
+      for (let i = 0; i < entries.length; i += 1) {
+        const name = entries[i];
+        if (typeof name !== 'string' || name === '.' || name === '..' || name.length === 0) {
+          continue;
+        }
+        if (
+          name.includes('/') ||
+          name.includes('\\') ||
+          name.includes('\0') ||
+          name.includes(':') ||
+          hasControlChar(name)
+        ) {
+          continue;
+        }
+        const candidateRel = relPrefix ? `${relPrefix}/${name}` : name;
+        const cleanRel = sanitizeDumpRelPath(candidateRel);
+        if (!cleanRel) {
+          continue;
+        }
+        const fullPath = `${dirFullPath}/${name}`;
+        let st;
+        try {
+          st = fsObj.stat(fullPath);
+        } catch {
+          continue;
+        }
+        if (!st || typeof st !== 'object') {
+          continue;
+        }
+        if (isDirMode(fsObj, st.mode)) {
+          walk(fullPath, cleanRel, depth + 1);
+        } else if (isFileMode(fsObj, st.mode)) {
+          const sizeBytes =
+            typeof st.size === 'number' && Number.isFinite(st.size) && st.size >= 0
+              ? Math.floor(st.size)
+              : null;
+          found.push({
+            relpath: cleanRel,
+            fullPath,
+            sizeBytes,
+          });
+        }
+      }
+    }
+
+    walk(dumpDir, '', 0);
+    found.sort(compareDumpCandidates);
+    return found;
+  }
+
+  async function runFlushPass() {
+    if (!enabled) {
+      return getStats();
+    }
+    const fsObj = resolveFs();
+    if (!fsObj || !fetchFn) {
+      lastFlushAtMs = nowFn();
+      pendingCount = 0;
+      return getStats();
+    }
+
+    const allFiles = collectDumpFiles(fsObj);
+    const toUpload = [];
+    for (let i = 0; i < allFiles.length; i += 1) {
+      const item = allFiles[i];
+      const prevSize = uploadedSizes.get(item.relpath);
+      if (prevSize !== undefined && item.sizeBytes !== null && prevSize === item.sizeBytes) {
+        continue;
+      }
+      toUpload.push(item);
+    }
+
+    if (toUpload.length === 0) {
+      pendingCount = 0;
+      lastFlushAtMs = nowFn();
+      return getStats();
+    }
+
+    let remainingOrInFlight = toUpload.length;
+    let failedInPass = 0;
+    pendingCount = remainingOrInFlight;
+    let cursor = 0;
+
+    async function uploadOne(item) {
+      let bytes;
+      try {
+        const raw = fsObj.readFile(item.fullPath);
+        bytes = toUint8ArrayCopy(raw);
+      } catch {
+        uploadErrors += 1;
+        failedInPass += 1;
+        remainingOrInFlight = Math.max(0, remainingOrInFlight - 1);
+        pendingCount = remainingOrInFlight + failedInPass;
+        return;
+      }
+
+      const actualSize = bytes.byteLength;
+      if (item.sizeBytes === null && uploadedSizes.get(item.relpath) === actualSize) {
+        remainingOrInFlight = Math.max(0, remainingOrInFlight - 1);
+        pendingCount = remainingOrInFlight + failedInPass;
+        return;
+      }
+
+      const encodedRel = item.relpath
+        .split('/')
+        .map((seg) => encodeURIComponent(seg))
+        .join('/');
+      const url = `${dumpEndpoint}${encodedRel}`;
+
+      try {
+        const resp = await fetchFn(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/octet-stream' },
+          body: bytes,
+        });
+        const ok = Boolean(
+          resp &&
+            resp.ok !== false &&
+            (typeof resp.status !== 'number' || (resp.status >= 200 && resp.status < 300)),
+        );
+        if (!ok) {
+          uploadErrors += 1;
+          failedInPass += 1;
+        } else {
+          uploadedSizes.set(item.relpath, actualSize);
+          filesUploaded += 1;
+          bytesUploaded += actualSize;
+        }
+      } catch {
+        uploadErrors += 1;
+        failedInPass += 1;
+      } finally {
+        remainingOrInFlight = Math.max(0, remainingOrInFlight - 1);
+        pendingCount = remainingOrInFlight + failedInPass;
+      }
+    }
+
+    const workerCount = Math.min(maxConcurrentUploads, toUpload.length);
+    const workers = [];
+    for (let w = 0; w < workerCount; w += 1) {
+      workers.push(
+        (async () => {
+          while (cursor < toUpload.length) {
+            const idx = cursor;
+            cursor += 1;
+            await uploadOne(toUpload[idx]);
+          }
+        })(),
+      );
+    }
+
+    await Promise.all(workers);
+    lastFlushAtMs = nowFn();
+    return getStats();
+  }
+
+  function startFlushPass() {
+    const p = runFlushPass().finally(() => {
+      if (activeFlush === p) {
+        activeFlush = null;
+      }
+    });
+    activeFlush = p;
+    return p;
+  }
+
+  function flush() {
+    if (!enabled) {
+      return Promise.resolve(getStats());
+    }
+    if (!activeFlush) {
+      return startFlushPass();
+    }
+    if (!queuedFlush) {
+      queuedFlush = activeFlush.then(() => {
+        queuedFlush = null;
+        return startFlushPass();
+      });
+    }
+    return queuedFlush;
+  }
+
+  function clearTimer() {
+    if (timerId !== null && typeof clearIntervalFn === 'function') {
+      try {
+        clearIntervalFn(timerId);
+      } catch {
+        // Ignore timer cleanup errors.
+      }
+      timerId = null;
+    }
+  }
+
+  function start(modOrFs) {
+    if (!enabled) {
+      return false;
+    }
+    if (modOrFs && typeof modOrFs === 'object') {
+      if (modOrFs.FS && typeof modOrFs.FS === 'object') {
+        attachModule(modOrFs);
+      } else if (typeof modOrFs.readdir === 'function' || typeof modOrFs.mkdir === 'function') {
+        setFS(modOrFs);
+      }
+    }
+    ensureDumpDir();
+    if (timerId === null && typeof setIntervalFn === 'function') {
+      timerId = setIntervalFn(() => {
+        flush().catch(() => {});
+      }, intervalMs);
+    }
+    return true;
+  }
+
+  function stop() {
+    clearTimer();
+    if (!enabled) {
+      return Promise.resolve(getStats());
+    }
+    return flush();
+  }
+
+  return {
+    enabled,
+    start,
+    stop,
+    flush,
+    ensureDumpDir,
+    attachModule,
+    setFS,
+    getStats,
+  };
+}
+
 /**
  * Build the Emscripten `createRuntimeModule(...)` configuration object with:
  * - `mainScriptUrlOrBlob` pinned to `dist/runtime.js` (never `loader.js`),
@@ -3091,8 +3776,73 @@ function buildRuntimeModuleConfig(options = {}) {
     wasmMetrics: manifestSummary ? manifestSummary.wasmMetrics : null,
   });
 
+  const pipelineDumpSyncer =
+    options.pipelineDumpSyncer && typeof options.pipelineDumpSyncer === 'object'
+      ? options.pipelineDumpSyncer
+      : createMemfsPipelineDumpSyncer({
+          dumpPipelines: options.dumpPipelines,
+          dumpDir: options.dumpDir,
+          dumpEndpoint: options.dumpEndpoint,
+          intervalMs:
+            options.dumpIntervalMs !== undefined ? options.dumpIntervalMs : options.intervalMs,
+          maxConcurrentUploads:
+            options.dumpMaxConcurrentUploads !== undefined
+              ? options.dumpMaxConcurrentUploads
+              : options.maxConcurrentUploads,
+          fetchFn:
+            typeof options.dumpFetchFn === 'function'
+              ? options.dumpFetchFn
+              : typeof options.fetchFn === 'function'
+                ? options.fetchFn
+                : undefined,
+          locationHref: options.locationHref,
+          locationSearch: options.locationSearch,
+          setIntervalFn: options.dumpSetIntervalFn,
+          clearIntervalFn: options.dumpClearIntervalFn,
+          nowFn: options.dumpNowFn,
+          getModule: () => boundModule,
+        });
+
+  let pipelineDumpSyncerStarted = false;
+  const attachPipelineDumpSyncer = (mod) => {
+    if (!pipelineDumpSyncer || !pipelineDumpSyncer.enabled || pipelineDumpSyncerStarted) {
+      return;
+    }
+    const targetMod = mod && typeof mod === 'object' ? mod : boundModule;
+    if (!targetMod || !targetMod.FS) {
+      return;
+    }
+    pipelineDumpSyncerStarted = true;
+    try {
+      pipelineDumpSyncer.start(targetMod);
+    } catch {
+      // Pipeline dump sync setup must never block or crash boot.
+    }
+  };
+
+  const stopPipelineDumpSyncer = () => {
+    if (!pipelineDumpSyncer || !pipelineDumpSyncer.enabled) {
+      return Promise.resolve(pipelineDumpSyncer ? pipelineDumpSyncer.getStats() : null);
+    }
+    try {
+      return pipelineDumpSyncer.stop();
+    } catch {
+      return Promise.resolve(pipelineDumpSyncer.getStats());
+    }
+  };
+
   const preRun = Array.isArray(options.preRun)
-    ? options.preRun
+    ? pipelineDumpSyncer && pipelineDumpSyncer.enabled
+      ? [
+          (mod) => {
+            if (mod && !boundModule) {
+              boundModule = mod;
+            }
+            attachPipelineDumpSyncer(mod);
+          },
+          ...options.preRun,
+        ]
+      : options.preRun
     : [
         (mod) => {
           boundModule = mod || null;
@@ -3106,6 +3856,7 @@ function buildRuntimeModuleConfig(options = {}) {
           ) {
             activeHostImports.setMemory(mod.wasmMemory || mod.HEAPU8.buffer);
           }
+          attachPipelineDumpSyncer(mod);
           if (!activeUserdataStore || !mod || !mod.FS) return;
           const useRunDep =
             typeof mod.addRunDependency === 'function' &&
@@ -3197,6 +3948,7 @@ function buildRuntimeModuleConfig(options = {}) {
     if (mod && !boundModule) {
       boundModule = mod;
     }
+    attachPipelineDumpSyncer(mod);
     attachInputBridge(mod);
     if (userOnRuntimeInitialized) {
       return userOnRuntimeInitialized.apply(this, arguments);
@@ -3206,6 +3958,10 @@ function buildRuntimeModuleConfig(options = {}) {
 
   const onExit = function onPlayGta6RuntimeExit() {
     stopInputBridge();
+    const drainPromise = stopPipelineDumpSyncer();
+    if (drainPromise && typeof drainPromise.catch === 'function') {
+      drainPromise.catch(() => {});
+    }
     if (userOnExit) {
       return userOnExit.apply(this, arguments);
     }
@@ -3227,6 +3983,10 @@ function buildRuntimeModuleConfig(options = {}) {
     attachInputBridge,
     stopInputBridge,
     getInputBridge: () => activeInputBridge,
+    pipelineDumpSyncer,
+    getPipelineDumpSyncer: () => pipelineDumpSyncer,
+    flushPipelineDumps: () => pipelineDumpSyncer.flush(),
+    stopPipelineDumpSyncer,
     hostCallbacks: options.hostCallbacks || {
       log: logFn,
       wgpuSubmit,
@@ -3917,6 +4677,12 @@ let configuredDynamicLibraries = null;
 let configuredGuestManifest = null;
 let configuredGuestManifestUrl = null;
 let configuredMaxConcurrentPthreadLoads = null;
+let configuredDumpPipelines = undefined;
+let configuredDumpDir = undefined;
+let configuredDumpEndpoint = undefined;
+let configuredDumpIntervalMs = undefined;
+let configuredDumpMaxConcurrentUploads = undefined;
+let activeCoordinatorPipelineDumpSyncer = null;
 let activeGuestManifestSummary = null;
 let activeSideModuleProgressGetter = null;
 
@@ -4044,7 +4810,33 @@ async function tryBootWasmRuntime() {
       if (configuredDynamicLibraries) {
         runtimeOptions.dynamicLibraries = configuredDynamicLibraries;
       }
+      if (configuredDumpPipelines !== undefined) {
+        runtimeOptions.dumpPipelines = configuredDumpPipelines;
+      }
+      if (configuredDumpDir !== undefined) {
+        runtimeOptions.dumpDir = configuredDumpDir;
+      }
+      if (configuredDumpEndpoint !== undefined) {
+        runtimeOptions.dumpEndpoint = configuredDumpEndpoint;
+      }
+      if (configuredDumpIntervalMs !== undefined) {
+        runtimeOptions.dumpIntervalMs = configuredDumpIntervalMs;
+      }
+      if (configuredDumpMaxConcurrentUploads !== undefined) {
+        runtimeOptions.dumpMaxConcurrentUploads = configuredDumpMaxConcurrentUploads;
+      }
+      if (activeCoordinatorPipelineDumpSyncer) {
+        try {
+          activeCoordinatorPipelineDumpSyncer.stop().catch(() => {});
+        } catch {
+          // Ignore teardown errors from a previous runtime boot.
+        }
+        activeCoordinatorPipelineDumpSyncer = null;
+      }
       const moduleConfig = createRuntimeModuleOptions(runtimeOptions);
+      if (typeof moduleConfig.getPipelineDumpSyncer === 'function') {
+        activeCoordinatorPipelineDumpSyncer = moduleConfig.getPipelineDumpSyncer();
+      }
       if (typeof moduleConfig.getSideModuleProgress === 'function') {
         activeSideModuleProgressGetter = moduleConfig.getSideModuleProgress;
       }
@@ -4227,7 +5019,24 @@ if (typeof self !== 'undefined') {
       }
       activeCoordinatorInputBridge = null;
     }
+    if (activeCoordinatorPipelineDumpSyncer) {
+      try {
+        activeCoordinatorPipelineDumpSyncer.stop().catch(() => {});
+      } catch {
+        // Ignore pipeline dump syncer teardown errors when re-initializing workers.
+      }
+      activeCoordinatorPipelineDumpSyncer = null;
+    }
     inputSab = msg.inputSab || null;
+    configuredDumpPipelines =
+      typeof msg.dumpPipelines === 'boolean' ? msg.dumpPipelines : undefined;
+    configuredDumpDir = typeof msg.dumpDir === 'string' ? msg.dumpDir : undefined;
+    configuredDumpEndpoint =
+      typeof msg.dumpEndpoint === 'string' ? msg.dumpEndpoint : undefined;
+    configuredDumpIntervalMs =
+      typeof msg.dumpIntervalMs === 'number' ? msg.dumpIntervalMs : undefined;
+    configuredDumpMaxConcurrentUploads =
+      typeof msg.dumpMaxConcurrentUploads === 'number' ? msg.dumpMaxConcurrentUploads : undefined;
     configuredSideModuleUrls = Array.isArray(msg.sideModuleUrls) ? msg.sideModuleUrls : null;
     configuredDynamicLibraries = Array.isArray(msg.dynamicLibraries)
       ? msg.dynamicLibraries
@@ -4316,6 +5125,10 @@ const exportedApi = {
   INPUT_STATE_BYTES,
   INPUT_STATE_WORDS,
   DEFAULT_INPUT_BRIDGE_POLL_MS,
+  DEFAULT_MEMFS_PIPELINE_DUMP_DIR,
+  DEFAULT_MEMFS_PIPELINE_DUMP_ENDPOINT,
+  DEFAULT_MEMFS_PIPELINE_DUMP_INTERVAL_MS,
+  DEFAULT_MEMFS_PIPELINE_DUMP_MAX_CONCURRENT_UPLOADS,
   BOOT_INIT_FORWARD_KEYS,
   isEmscriptenPthreadWorkerName,
   isEmscriptenPthreadWorker,
@@ -4336,6 +5149,9 @@ const exportedApi = {
   sanitizeRenderStateStats,
   createHostImports,
   startInputSabBridge,
+  resolveDumpPipelinesEnabled,
+  sanitizeDumpRelPath,
+  createMemfsPipelineDumpSyncer,
   resolveRuntimeScriptUrl,
   resolveSideModuleUrl,
   sanitizeSideModuleUrls,
