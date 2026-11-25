@@ -15,6 +15,7 @@ const {
   AudioMixerWorker,
   OUTPUT_STATES,
   DEFAULT_MAX_PCM_BYTES,
+  DEFAULT_DECLICK_FRAMES,
   extractSafePcmSamples,
   clonePcmForTransfer,
   sanitizeTransferList,
@@ -780,4 +781,331 @@ test('W84 audio_worker.js runs cleanly in a classic Dedicated Worker context wit
 
   workerSelf.onmessage({ data: { stop: true, id: 5 } });
   assert.equal(posted[posted.length - 1].stopped, true);
+});
+
+// ---------------------------------------------------------------------------
+// W116: Underrun De-Click Fade-Out / Fade-In & Fill-Level Telemetry
+// ---------------------------------------------------------------------------
+
+function makeConstantStereoFrames(frameCount, value) {
+  const out = new Float32Array(frameCount * 2);
+  out.fill(value);
+  return out;
+}
+
+test('W116 steady-state playback with full ring produces 100% bit-exact samples and zero fade counters', () => {
+  const worker = new AudioMixerWorker(null, {
+    outputState: 'active',
+    autoDrain: false,
+    declickFrames: DEFAULT_DECLICK_FRAMES,
+  });
+  worker.handleMessage({
+    init: true,
+    sampleRate: 48000,
+    channels: 2,
+    capacityFrames: 512,
+    outputState: 'active',
+  });
+
+  // Push and pull multiple steady-state blocks with non-trivial varying values.
+  for (let round = 0; round < 4; round++) {
+    const input = makeStereoFrames(round * 128, 128);
+    worker.handleMessage({ pushPcm: true, samples: input });
+    const output = new Float32Array(128 * 2);
+    const pulled = worker.pullSamples(output);
+    assert.equal(pulled, 128);
+    assert.deepEqual(Array.from(output), Array.from(input));
+  }
+
+  const stats = worker.getStats();
+  assert.equal(stats.underrunCount, 0);
+  assert.equal(stats.underruns, 0);
+  assert.equal(stats.fadeOutCount, 0);
+  assert.equal(stats.fadeInCount, 0);
+  assert.equal(stats.declickFrames, DEFAULT_DECLICK_FRAMES);
+  worker.destroy();
+});
+
+test('W116 underrun on constant +0.8 waveform fades smoothly to 0.0 and recovery fades smoothly back to +0.8', () => {
+  const fadeFrames = 32;
+  const amp = Math.fround(0.8);
+  const maxAllowedStep = amp / fadeFrames + 1e-5;
+
+  const worker = new AudioMixerWorker(null, {
+    outputState: 'active',
+    autoDrain: false,
+    declickFrames: fadeFrames,
+  });
+  worker.handleMessage({
+    init: true,
+    sampleRate: 48000,
+    channels: 2,
+    capacityFrames: 512,
+    outputState: 'active',
+  });
+
+  // 1. Steady-state pull: bit-exact +0.8 across all 128 stereo frames.
+  worker.handleMessage({ pushPcm: true, samples: makeConstantStereoFrames(128, amp) });
+  const steadyOut = new Float32Array(128 * 2);
+  assert.equal(worker.pullSamples(steadyOut), 128);
+  for (let i = 0; i < steadyOut.length; i++) {
+    assert.equal(steadyOut[i], amp);
+  }
+
+  // 2. Partial underrun: only 64 frames available when 128 requested.
+  worker.handleMessage({ pushPcm: true, samples: makeConstantStereoFrames(64, amp) });
+  const partialUnderrunOut = new Float32Array(128 * 2);
+  partialUnderrunOut.fill(99.0);
+  assert.equal(worker.pullSamples(partialUnderrunOut), 64);
+
+  // Leading frames remain at +0.8, tail ramps monotonically to 0.0 with bounded step.
+  assert.equal(partialUnderrunOut[0], amp);
+  assert.equal(partialUnderrunOut[(128 - 1) * 2], 0);
+  assert.equal(partialUnderrunOut[(128 - 1) * 2 + 1], 0);
+  let maxStepOut = 0;
+  for (let f = 1; f < 128; f++) {
+    for (let c = 0; c < 2; c++) {
+      const prev = partialUnderrunOut[(f - 1) * 2 + c];
+      const curr = partialUnderrunOut[f * 2 + c];
+      assert.ok(curr <= prev + 1e-6, `Expected monotonic fade-out at frame ${f} ch ${c}: ${prev} -> ${curr}`);
+      const step = Math.abs(curr - prev);
+      if (step > maxStepOut) maxStepOut = step;
+    }
+  }
+  assert.ok(
+    maxStepOut <= maxAllowedStep,
+    `Expected fade-out max adjacent step <= ${maxAllowedStep}, got ${maxStepOut}`
+  );
+  assert.ok(maxStepOut > 0, 'Expected non-zero smooth ramp steps during fade-out');
+
+  let stats = worker.getStats();
+  assert.equal(stats.underrunCount, 1);
+  assert.equal(stats.underruns, 1);
+  assert.equal(stats.fadeOutCount, 1);
+  assert.equal(stats.fadeInCount, 0);
+
+  // 3. Consecutive empty pull stays silent and does NOT double-count fadeOutCount.
+  const silentOut = new Float32Array(128 * 2);
+  silentOut.fill(42.0);
+  assert.equal(worker.pullSamples(silentOut), 0);
+  for (let i = 0; i < silentOut.length; i++) {
+    assert.equal(silentOut[i], 0);
+  }
+  stats = worker.getStats();
+  assert.equal(stats.underrunCount, 2);
+  assert.equal(stats.fadeOutCount, 1);
+  assert.equal(stats.fadeInCount, 0);
+
+  // 4. Recovery after underrun: push 128 frames of +0.8 and verify smooth fade-in 0.0 -> +0.8.
+  worker.handleMessage({ pushPcm: true, samples: makeConstantStereoFrames(128, amp) });
+  const recoveryOut = new Float32Array(128 * 2);
+  assert.equal(worker.pullSamples(recoveryOut), 128);
+
+  assert.equal(recoveryOut[0], 0);
+  assert.equal(recoveryOut[1], 0);
+  assert.equal(recoveryOut[fadeFrames * 2], amp);
+  assert.equal(recoveryOut[(128 - 1) * 2], amp);
+
+  let maxStepIn = 0;
+  for (let f = 1; f < 128; f++) {
+    for (let c = 0; c < 2; c++) {
+      const prev = recoveryOut[(f - 1) * 2 + c];
+      const curr = recoveryOut[f * 2 + c];
+      assert.ok(curr >= prev - 1e-6, `Expected monotonic fade-in at frame ${f} ch ${c}: ${prev} -> ${curr}`);
+      const step = Math.abs(curr - prev);
+      if (step > maxStepIn) maxStepIn = step;
+    }
+  }
+  assert.ok(
+    maxStepIn <= maxAllowedStep,
+    `Expected fade-in max adjacent step <= ${maxAllowedStep}, got ${maxStepIn}`
+  );
+  assert.ok(maxStepIn > 0, 'Expected non-zero smooth ramp steps during fade-in');
+
+  stats = worker.getStats();
+  assert.equal(stats.underrunCount, 2);
+  assert.equal(stats.fadeOutCount, 1);
+  assert.equal(stats.fadeInCount, 1);
+
+  // 5. Subsequent full steady-state pull returns to 100% bit-exact +0.8.
+  worker.handleMessage({ pushPcm: true, samples: makeConstantStereoFrames(128, amp) });
+  const postRecoveryOut = new Float32Array(128 * 2);
+  assert.equal(worker.pullSamples(postRecoveryOut), 128);
+  for (let i = 0; i < postRecoveryOut.length; i++) {
+    assert.equal(postRecoveryOut[i], amp);
+  }
+  assert.equal(worker.getStats().fadeInCount, 1);
+  worker.destroy();
+});
+
+test('W116 empty-ring underrun after steady-state and tight-tail underrun both ramp smoothly without abrupt steps', () => {
+  const fadeFrames = 64;
+  const amp = Math.fround(0.8);
+  const maxAllowedStep = amp / fadeFrames + 1e-5;
+
+  const ring = AudioRingBuffer.create(512, 2, { declickFrames: fadeFrames });
+
+  // A. Steady-state pull followed immediately by a completely empty ring pull (0 available).
+  assert.equal(ring.pushSamples(makeConstantStereoFrames(128, amp)), 128);
+  const steady = new Float32Array(128 * 2);
+  assert.equal(ring.pullSamples(steady), 128);
+  assert.equal(steady[steady.length - 1], amp);
+
+  const emptyUnderrun = new Float32Array(128 * 2);
+  assert.equal(ring.pullSamples(emptyUnderrun), 0);
+
+  // First sample steps smoothly from previous pull's +0.8 (NOT straight to 0.0).
+  const boundaryStep = Math.abs(emptyUnderrun[0] - amp);
+  assert.ok(boundaryStep <= maxAllowedStep, `Boundary step ${boundaryStep} exceeded ${maxAllowedStep}`);
+  assert.ok(emptyUnderrun[0] > 0.7, `Expected smooth fade start near 0.8, got ${emptyUnderrun[0]}`);
+  assert.equal(emptyUnderrun[(fadeFrames - 1) * 2], 0);
+  assert.equal(emptyUnderrun[(128 - 1) * 2], 0);
+  for (let f = 1; f < 128; f++) {
+    const step = Math.abs(emptyUnderrun[f * 2] - emptyUnderrun[(f - 1) * 2]);
+    assert.ok(step <= maxAllowedStep, `Empty underrun step ${step} at frame ${f} exceeded ${maxAllowedStep}`);
+  }
+  assert.equal(ring.underrunCount, 1);
+  assert.equal(ring.fadeOutCount, 1);
+
+  // B. Multi-chunk recovery (32 frames per pull < 64 declickFrames) ramps continuously across pulls.
+  assert.equal(ring.pushSamples(makeConstantStereoFrames(96, amp)), 96);
+  const rec1 = new Float32Array(32 * 2);
+  const rec2 = new Float32Array(32 * 2);
+  const rec3 = new Float32Array(32 * 2);
+  assert.equal(ring.pullSamples(rec1), 32);
+  assert.equal(ring.pullSamples(rec2), 32);
+  assert.equal(ring.pullSamples(rec3), 32);
+  assert.equal(ring.fadeInCount, 1);
+  assert.equal(rec1[0], 0);
+  assert.ok(Math.abs(rec2[0] - rec1[(32 - 1) * 2]) <= maxAllowedStep);
+  assert.ok(Math.abs(rec3[0] - rec2[(32 - 1) * 2]) <= maxAllowedStep);
+  assert.equal(rec3[0], amp);
+  assert.equal(rec3[rec3.length - 1], amp);
+
+  // C. Tight missing tail: 120 available / 128 requested (missing = 8 < fadeFrames = 64).
+  assert.equal(ring.pushSamples(makeConstantStereoFrames(120, amp)), 120);
+  const tightTail = new Float32Array(128 * 2);
+  assert.equal(ring.pullSamples(tightTail), 120);
+  assert.equal(tightTail[0], amp);
+  assert.equal(tightTail[120 * 2], 0);
+  assert.equal(tightTail[(128 - 1) * 2], 0);
+  for (let f = 1; f < 128; f++) {
+    const step = Math.abs(tightTail[f * 2] - tightTail[(f - 1) * 2]);
+    assert.ok(step <= maxAllowedStep, `Tight tail step ${step} at frame ${f} exceeded ${maxAllowedStep}`);
+  }
+  assert.equal(ring.underrunCount, 2);
+  assert.equal(ring.fadeOutCount, 2);
+});
+
+test('W116 fill-level telemetry tracks peakFillFrames, minFillFrames, avgFillRatio accurately and resets cleanly', () => {
+  const replies = [];
+  const worker = new AudioMixerWorker((msg) => replies.push(msg), {
+    outputState: 'active',
+    autoDrain: false,
+    declickFrames: 16,
+  });
+
+  worker.handleMessage({
+    init: true,
+    sampleRate: 48000,
+    channels: 2,
+    capacityFrames: 100,
+    outputState: 'active',
+  });
+
+  // Initially all fill & underrun telemetry fields are zero.
+  let s = worker.getStats();
+  assert.equal(s.peakFillFrames, 0);
+  assert.equal(s.minFillFrames, 0);
+  assert.equal(s.avgFillRatio, 0);
+  assert.equal(s.underrunCount, 0);
+  assert.equal(s.fadeOutCount, 0);
+  assert.equal(s.fadeInCount, 0);
+
+  // Trajectory on 100-frame ring:
+  // Push 80 -> fill = 80
+  // Pull 60 -> fill = 20
+  // Push 40 -> fill = 60
+  // Pull 20 -> fill = 40
+  // Observations = [80, 20, 60, 40] -> peak = 80, min = 20, avg = 50 / 100 = 0.5.
+  worker.handleMessage({ pushPcm: true, samples: makeConstantStereoFrames(80, 0.5) });
+  assert.equal(worker.pullSamples(new Float32Array(60 * 2)), 60);
+  worker.handleMessage({ pushPcm: true, samples: makeConstantStereoFrames(40, 0.5) });
+  assert.equal(worker.pullSamples(new Float32Array(20 * 2)), 20);
+
+  s = worker.getStats();
+  assert.equal(s.peakFillFrames, 80);
+  assert.equal(s.minFillFrames, 20);
+  assert.ok(Math.abs(s.avgFillRatio - 0.5) < 1e-9, `Expected avgFillRatio 0.5, got ${s.avgFillRatio}`);
+
+  // Sanitized audio-stats message round-trip exposes all additive W116 fields.
+  worker.handleMessage({ stats: true, id: 'w116-telemetry' });
+  const snap = replies[replies.length - 1];
+  assert.equal(snap.type, 'audio-stats');
+  assert.equal(snap.id, 'w116-telemetry');
+  assert.equal(snap.stats.peakFillFrames, 80);
+  assert.equal(snap.stats.minFillFrames, 20);
+  assert.ok(Math.abs(snap.stats.avgFillRatio - 0.5) < 1e-9);
+  assert.equal(snap.stats.underrunCount, 0);
+  assert.equal(snap.stats.fadeOutCount, 0);
+  assert.equal(snap.stats.fadeInCount, 0);
+
+  // Trigger an underrun + recovery so all counters are non-zero before reset checks.
+  assert.equal(worker.pullSamples(new Float32Array(60 * 2)), 40);
+  worker.handleMessage({ pushPcm: true, samples: makeConstantStereoFrames(32, 0.5) });
+  assert.equal(worker.pullSamples(new Float32Array(32 * 2)), 32);
+
+  s = worker.getStats();
+  assert.equal(s.underrunCount, 1);
+  assert.equal(s.fadeOutCount, 1);
+  assert.equal(s.fadeInCount, 1);
+  assert.equal(s.minFillFrames, 0);
+
+  // 1. Clean reset via reset() / { reset: true } message.
+  worker.handleMessage({ reset: true, id: 'w116-reset' });
+  assert.equal(replies[replies.length - 1].reset, true);
+  s = worker.getStats();
+  assert.equal(s.underrunCount, 0);
+  assert.equal(s.fadeOutCount, 0);
+  assert.equal(s.fadeInCount, 0);
+  assert.equal(s.peakFillFrames, 0);
+  assert.equal(s.minFillFrames, 0);
+  assert.equal(s.avgFillRatio, 0);
+
+  // 2. Clean reset via stop().
+  worker.handleMessage({ pushPcm: true, samples: makeConstantStereoFrames(50, 0.5) });
+  assert.equal(worker.pullSamples(new Float32Array(80 * 2)), 50);
+  assert.equal(worker.getStats().fadeOutCount, 1);
+  worker.stop();
+  s = worker.getStats();
+  assert.equal(s.underrunCount, 0);
+  assert.equal(s.fadeOutCount, 0);
+  assert.equal(s.fadeInCount, 0);
+  assert.equal(s.peakFillFrames, 0);
+  assert.equal(s.minFillFrames, 0);
+  assert.equal(s.avgFillRatio, 0);
+
+  // 3. Clean reset via stream reconfigure (re-init with new capacity/declickFrames).
+  worker.handleMessage({ pushPcm: true, samples: makeConstantStereoFrames(40, 0.5) });
+  assert.equal(worker.pullSamples(new Float32Array(64 * 2)), 40);
+  assert.equal(worker.getStats().underrunCount, 1);
+
+  worker.handleMessage({
+    init: true,
+    sampleRate: 48000,
+    channels: 2,
+    capacityFrames: 256,
+    declickFrames: 64,
+    outputState: 'active',
+  });
+  s = worker.getStats();
+  assert.equal(s.capacityFrames, 256);
+  assert.equal(s.declickFrames, 64);
+  assert.equal(s.underrunCount, 0);
+  assert.equal(s.fadeOutCount, 0);
+  assert.equal(s.fadeInCount, 0);
+  assert.equal(s.peakFillFrames, 0);
+  assert.equal(s.minFillFrames, 0);
+  assert.equal(s.avgFillRatio, 0);
+  worker.destroy();
 });
