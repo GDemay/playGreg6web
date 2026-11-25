@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Safe local browser real-boot artifact staging CLI (Track 5 / W51, W66, W119).
+"""Safe local browser real-boot artifact staging CLI (Track 5 / W51, W66, W119, T46).
 
 Stages allowlisted local recompilation boot artifacts (`program-manifest.json`,
 `build-manifest.json`, nested `*.pgim`) from `--program-dir` into `--boot-dir`
 (served at `/boot/` by `server/serve_local.py`), validates + atomically stages
 `runtime.wasm`, `runtime.js`, and any sibling top-level `*.wasm` Emscripten
 side modules from `--wasm-dir` into `--web-dist`, atomically stages `.wgsl.pack`
-shader bundles plus adjacent/overridden `<pack>.reflect.json` sidecars into
-`--shaders-dir`, and optionally writes a schema-validated `boot-options.json`
+shader bundles plus adjacent/overridden/merged `<pack>.reflect.json` sidecars
+into `--shaders-dir`, and optionally writes a schema-validated `boot-options.json`
 into `--boot-dir`.
 
 Safety & privacy invariants:
@@ -35,8 +35,9 @@ Usage:
         [--wasm-dir work/wasm_guest_dist] [--boot-dir work/recomp_build]
         [--web-dist web/dist] [--shader-pack work/splash.wgsl.pack]
         [--shaders-dir local-data/shaders] [--reflect-sidecar <path>]
-        [--verify-window-marks] [--boot-options-json <json-or-file>]
-        [--dry-run] [--json]
+        [--merge-reflect <extra_reflect.json> ...] [--verify-window-marks]
+        [--dump-pipelines] [--input-script <preset>]
+        [--boot-options-json <json-or-file>] [--dry-run] [--json]
 """
 
 from __future__ import annotations
@@ -64,8 +65,20 @@ RUNTIME_WASM_NAME = "runtime.wasm"
 RUNTIME_JS_NAME = "runtime.js"
 DEFAULT_SHADER_PACK_NAME = "splash.wgsl.pack"
 REFLECT_SIDECAR_SUFFIX = ".reflect.json"
+REFLECT_SIDECAR_SCHEMA = "playgta6-stage-reflection"
+REFLECT_SIDECAR_VERSION = 1
+REFLECT_SIDECAR_STAGES: frozenset[str] = frozenset({"vertex", "fragment", "compute"})
 BOOT_OPTIONS_NAME = "boot-options.json"
+DEFAULT_DUMP_PIPELINES_DIR = "/pg6_dump"
 WGPK_MAGIC = b"WGPK"
+
+ALLOWED_INPUT_SCRIPT_PRESETS: dict[str, str] = {
+    "start-screen": "start-screen",
+    "menu-flow": "menu-flow",
+    "calibration-skip": "calibration-skip",
+    "intro-watch": "intro-watch",
+}
+_SAFE_INPUT_SCRIPT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 _SAFE_SIDE_MODULE_NAME_RE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._-]*\.wasm$", re.IGNORECASE
@@ -88,8 +101,14 @@ BOOT_OPTIONS_BOOL_KEYS: frozenset[str] = frozenset(
         "verify_window_marks",
     }
 )
+BOOT_OPTIONS_STR_KEYS: frozenset[str] = frozenset(
+    {
+        "dump_pipelines_dir",
+        "input_script",
+    }
+)
 BOOT_OPTIONS_ALLOWED_KEYS: frozenset[str] = (
-    BOOT_OPTIONS_UINT_KEYS | BOOT_OPTIONS_BOOL_KEYS
+    BOOT_OPTIONS_UINT_KEYS | BOOT_OPTIONS_BOOL_KEYS | BOOT_OPTIONS_STR_KEYS
 )
 _UINT64_MAX = (1 << 64) - 1
 
@@ -650,6 +669,30 @@ def atomic_write_bytes(payload: bytes, dst: Path) -> None:
         raise
 
 
+def _atomic_stage_mixed(
+    file_pairs: Sequence[tuple[Path, Path]],
+    byte_pairs: Sequence[tuple[bytes, Path]],
+) -> None:
+    """Prepare all file/bytes temp outputs first, then atomically replace each destination."""
+    staged: list[tuple[Path, Path]] = []
+    replaced: set[Path] = set()
+    try:
+        for src, dst in file_pairs:
+            tmp_path = _write_temp_copy(src, dst.parent, dst.name)
+            staged.append((tmp_path, dst))
+        for payload, dst in byte_pairs:
+            tmp_path = _write_temp_bytes(payload, dst.parent, dst.name)
+            staged.append((tmp_path, dst))
+        for tmp_path, dst in staged:
+            os.replace(tmp_path, dst)
+            replaced.add(tmp_path)
+    except Exception:
+        for tmp_path, _ in staged:
+            if tmp_path not in replaced:
+                tmp_path.unlink(missing_ok=True)
+        raise
+
+
 # ---------------------------------------------------------------------------
 # Wasm64 validation via tools/check_wasm_exports.py
 # ---------------------------------------------------------------------------
@@ -1136,18 +1179,171 @@ def validate_reflect_sidecar(sidecar_path: Path) -> tuple[bool, dict[str, Any], 
     return True, summary, []
 
 
+def load_and_validate_reflect_sidecar_v1(
+    sidecar_path: Path,
+) -> tuple[bool, dict[str, Any] | None, list[str]]:
+    """Load and strictly validate a `playgta6-stage-reflection` v1 sidecar JSON file."""
+    label = basename_label(sidecar_path)
+    try:
+        raw_text = sidecar_path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError) as exc:
+        return (
+            False,
+            None,
+            [sanitize_text(f"failed to read reflection sidecar {label}: {exc}")],
+        )
+
+    try:
+        parsed = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        return (
+            False,
+            None,
+            [
+                sanitize_text(
+                    f"invalid JSON in reflection sidecar {label} "
+                    f"(line {exc.lineno}, col {exc.colno}): {exc.msg}"
+                )
+            ],
+        )
+
+    if not isinstance(parsed, dict):
+        return (
+            False,
+            None,
+            [f"invalid reflection sidecar {label}: top-level JSON value must be an object"],
+        )
+
+    errors: list[str] = []
+    schema_val = parsed.get("schema")
+    if schema_val != REFLECT_SIDECAR_SCHEMA:
+        errors.append(
+            f"invalid reflection sidecar {label}: 'schema' must be {REFLECT_SIDECAR_SCHEMA!r}"
+        )
+
+    version_val = parsed.get("version")
+    if type(version_val) is not int or version_val != REFLECT_SIDECAR_VERSION:
+        errors.append(
+            f"invalid reflection sidecar {label}: 'version' must be {REFLECT_SIDECAR_VERSION}"
+        )
+
+    stages_val = parsed.get("stages")
+    validated_stages: dict[str, Any] = {}
+    if not isinstance(stages_val, dict):
+        errors.append(
+            f"invalid reflection sidecar {label}: missing or non-object 'stages' map"
+        )
+    else:
+        for stage_key, stage_entry in stages_val.items():
+            if not isinstance(stage_key, str) or not stage_key.strip():
+                errors.append(
+                    f"invalid reflection sidecar {label}: every stage key must be a non-empty string"
+                )
+                break
+            if not isinstance(stage_entry, dict):
+                errors.append(
+                    f"invalid reflection sidecar {label}: stage {sanitize_text(stage_key)!r} must be a JSON object"
+                )
+                break
+            stage_kind = stage_entry.get("stage")
+            if not isinstance(stage_kind, str) or stage_kind not in REFLECT_SIDECAR_STAGES:
+                errors.append(
+                    f"invalid reflection sidecar {label}: stage {sanitize_text(stage_key)!r} has invalid 'stage' value"
+                )
+                break
+            if not isinstance(stage_entry.get("bindings"), list):
+                errors.append(
+                    f"invalid reflection sidecar {label}: stage {sanitize_text(stage_key)!r} must have a 'bindings' list"
+                )
+                break
+            validated_stages[stage_key] = stage_entry
+
+    if errors:
+        return False, None, sanitize_value(errors)
+
+    doc = {
+        "schema": REFLECT_SIDECAR_SCHEMA,
+        "version": REFLECT_SIDECAR_VERSION,
+        "stages": validated_stages,
+    }
+    return True, doc, []
+
+
+def merge_reflect_sidecar_stages(
+    *,
+    existing_stages: Mapping[str, Any] | None = None,
+    source_stages: Mapping[str, Any] | None = None,
+    extra_stage_maps: Sequence[Mapping[str, Any]] = (),
+) -> tuple[dict[str, Any], dict[str, int]]:
+    """Merge v1 stage-reflection maps deterministically without losing existing stages."""
+    merged: dict[str, Any] = {}
+    existing_count = 0
+    if existing_stages:
+        for k, v in existing_stages.items():
+            merged[k] = v
+        existing_count = len(existing_stages)
+
+    source_count = 0
+    if source_stages:
+        for k, v in source_stages.items():
+            merged[k] = v
+        source_count = len(source_stages)
+
+    base_keys = set(merged.keys())
+    added_keys: set[str] = set()
+    updated_keys: set[str] = set()
+    for extra in extra_stage_maps:
+        for k, v in extra.items():
+            if k in base_keys:
+                updated_keys.add(k)
+            else:
+                added_keys.add(k)
+            merged[k] = v
+
+    ordered_stages = {k: merged[k] for k in sorted(merged)}
+    doc = {
+        "schema": REFLECT_SIDECAR_SCHEMA,
+        "version": REFLECT_SIDECAR_VERSION,
+        "stages": ordered_stages,
+    }
+    stats = {
+        "existing_stages": existing_count,
+        "source_stages": source_count,
+        "added_stages": len(added_keys),
+        "updated_stages": len(updated_keys),
+        "preserved_stages": len(base_keys - updated_keys),
+        "total_stages": len(ordered_stages),
+    }
+    return doc, stats
+
+
+def _normalize_merge_reflect_paths(
+    merge_reflect: Path | str | Sequence[Path | str] | None,
+    resolved_repo: Path,
+) -> list[Path]:
+    if merge_reflect is None:
+        return []
+    if isinstance(merge_reflect, (str, Path)):
+        raw_items: Sequence[Path | str] = (merge_reflect,)
+    else:
+        raw_items = merge_reflect
+    return [_resolve_against_repo(item, resolved_repo) for item in raw_items]
+
+
 def stage_shader_pack(
     *,
     shader_pack: Path | str | None,
     shaders_dir: Path | str = DEFAULT_SHADERS_DIR_REL,
     shader_pack_name: str = DEFAULT_SHADER_PACK_NAME,
     reflect_sidecar: Path | str | None = None,
+    merge_reflect: Path | str | Sequence[Path | str] | None = None,
     repo_root: Path | str = DEFAULT_REPO_ROOT,
     dry_run: bool = False,
 ) -> tuple[dict[str, Any], list[str], list[str]]:
-    """Atomically stage a `.wgsl.pack` bundle and its adjacent or overridden `.reflect.json` sidecar."""
+    """Atomically stage a `.wgsl.pack` bundle and its adjacent, overridden, or merged `.reflect.json` sidecar."""
     resolved_repo = Path(repo_root).resolve()
     shaders_dir_path = _resolve_against_repo(shaders_dir, resolved_repo)
+    merge_paths_raw = _normalize_merge_reflect_paths(merge_reflect, resolved_repo)
     shaders_section = _empty_shaders_section()
     errors: list[str] = []
     warnings: list[str] = []
@@ -1160,7 +1356,7 @@ def stage_shader_pack(
         errors.append(shaders_safety_err or "refused unsafe --shaders-dir")
         return sanitize_value(shaders_section), sanitize_value(errors), sanitize_value(warnings)
 
-    if shader_pack is None:
+    if shader_pack is None and not merge_paths_raw:
         if reflect_sidecar is not None:
             shaders_section["status"] = "error"
             errors.append("--reflect-sidecar requires --shader-pack")
@@ -1173,50 +1369,73 @@ def stage_shader_pack(
         )
         return sanitize_value(shaders_section), sanitize_value(errors), sanitize_value(warnings)
 
-    src_pack_raw = _resolve_against_repo(shader_pack, resolved_repo)
-    if not src_pack_raw.name.lower().endswith(".wgsl.pack"):
-        shaders_section["status"] = "refused"
-        errors.append(
-            f"shader-pack must end with .wgsl.pack: {basename_label(src_pack_raw)}"
-        )
-        return sanitize_value(shaders_section), sanitize_value(errors), sanitize_value(warnings)
+    src_pack: Path | None = None
+    src_pack_raw: Path | None = None
+    if shader_pack is not None:
+        src_pack_raw = _resolve_against_repo(shader_pack, resolved_repo)
+        if not src_pack_raw.name.lower().endswith(".wgsl.pack"):
+            shaders_section["status"] = "refused"
+            errors.append(
+                f"shader-pack must end with .wgsl.pack: {basename_label(src_pack_raw)}"
+            )
+            return (
+                sanitize_value(shaders_section),
+                sanitize_value(errors),
+                sanitize_value(warnings),
+            )
 
-    try:
-        src_pack = src_pack_raw.resolve(strict=True)
-    except OSError:
-        shaders_section["status"] = "error"
-        errors.append(
-            f"shader-pack does not exist: {repo_relative_label(src_pack_raw, resolved_repo)}"
-        )
-        return sanitize_value(shaders_section), sanitize_value(errors), sanitize_value(warnings)
+        try:
+            src_pack = src_pack_raw.resolve(strict=True)
+        except OSError:
+            shaders_section["status"] = "error"
+            errors.append(
+                f"shader-pack does not exist: {repo_relative_label(src_pack_raw, resolved_repo)}"
+            )
+            return (
+                sanitize_value(shaders_section),
+                sanitize_value(errors),
+                sanitize_value(warnings),
+            )
 
-    if not src_pack.is_file():
-        shaders_section["status"] = "error"
-        errors.append(
-            f"shader-pack is not a regular file: {repo_relative_label(src_pack_raw, resolved_repo)}"
-        )
-        return sanitize_value(shaders_section), sanitize_value(errors), sanitize_value(warnings)
+        if not src_pack.is_file():
+            shaders_section["status"] = "error"
+            errors.append(
+                f"shader-pack is not a regular file: {repo_relative_label(src_pack_raw, resolved_repo)}"
+            )
+            return (
+                sanitize_value(shaders_section),
+                sanitize_value(errors),
+                sanitize_value(warnings),
+            )
 
-    try:
-        pack_size = int(src_pack.stat().st_size)
-        with src_pack.open("rb") as fh:
-            pack_magic = fh.read(len(WGPK_MAGIC))
-    except OSError as exc:
-        shaders_section["status"] = "error"
-        errors.append(
-            f"failed to read shader-pack {basename_label(src_pack_raw)}: {sanitize_text(str(exc))}"
-        )
-        return sanitize_value(shaders_section), sanitize_value(errors), sanitize_value(warnings)
+        try:
+            pack_size = int(src_pack.stat().st_size)
+            with src_pack.open("rb") as fh:
+                pack_magic = fh.read(len(WGPK_MAGIC))
+        except OSError as exc:
+            shaders_section["status"] = "error"
+            errors.append(
+                f"failed to read shader-pack {basename_label(src_pack_raw)}: {sanitize_text(str(exc))}"
+            )
+            return (
+                sanitize_value(shaders_section),
+                sanitize_value(errors),
+                sanitize_value(warnings),
+            )
 
-    if pack_size == 0:
-        shaders_section["status"] = "refused"
-        errors.append(f"refusing empty shader-pack: {basename_label(src_pack_raw)}")
-        return sanitize_value(shaders_section), sanitize_value(errors), sanitize_value(warnings)
+        if pack_size == 0:
+            shaders_section["status"] = "refused"
+            errors.append(f"refusing empty shader-pack: {basename_label(src_pack_raw)}")
+            return (
+                sanitize_value(shaders_section),
+                sanitize_value(errors),
+                sanitize_value(warnings),
+            )
 
-    if pack_magic != WGPK_MAGIC:
-        warnings.append(
-            f"shader-pack {basename_label(src_pack_raw)} does not start with WGPK magic"
-        )
+        if pack_magic != WGPK_MAGIC:
+            warnings.append(
+                f"shader-pack {basename_label(src_pack_raw)} does not start with WGPK magic"
+            )
 
     # Locate optional adjacent `<src_pack>.reflect.json` or explicit `--reflect-sidecar` override.
     sidecar_source: str | None = None
@@ -1250,7 +1469,7 @@ def stage_shader_pack(
                 sanitize_value(warnings),
             )
         sidecar_resolved = sidecar_candidate
-    else:
+    elif src_pack_raw is not None:
         adjacent_raw = Path(str(src_pack_raw) + REFLECT_SIDECAR_SUFFIX)
         if adjacent_raw.exists() or adjacent_raw.is_symlink():
             sidecar_source = "adjacent"
@@ -1280,6 +1499,239 @@ def stage_shader_pack(
                 )
             sidecar_resolved = adjacent_resolved
 
+    resolved_shaders = shaders_dir_path.resolve()
+    dst_pack = shaders_dir_path / shader_pack_name
+    dst_sidecar = Path(str(dst_pack) + REFLECT_SIDECAR_SUFFIX)
+    sidecar_dest_name = dst_sidecar.name
+
+    # Validate destination containment before doing any staging work.
+    dest_checks: list[tuple[str, Path]] = []
+    if src_pack is not None:
+        dest_checks.append((shader_pack_name, dst_pack))
+    if sidecar_resolved is not None or merge_paths_raw:
+        dest_checks.append((sidecar_dest_name, dst_sidecar))
+    for dest_name, dst_file in dest_checks:
+        if dst_file.parent.resolve() != resolved_shaders or dst_file.name != dest_name:
+            shaders_section["status"] = "refused"
+            errors.append(
+                f"refused shader artifact escaping shaders-dir: {sanitize_text(dest_name)}"
+            )
+            return (
+                sanitize_value(shaders_section),
+                sanitize_value(errors),
+                sanitize_value(warnings),
+            )
+
+    # Incremental `--merge-reflect` path: validate existing staged sidecar,
+    # optional source sidecar, and every extra v1 sidecar BEFORE touching disk.
+    if merge_paths_raw:
+        extra_stage_maps: list[Mapping[str, Any]] = []
+        merged_labels: list[str] = []
+        for merge_raw in merge_paths_raw:
+            try:
+                merge_resolved = merge_raw.resolve(strict=True)
+            except OSError:
+                shaders_section["status"] = "error"
+                errors.append(
+                    f"merge-reflect sidecar does not exist: "
+                    f"{repo_relative_label(merge_raw, resolved_repo)}"
+                )
+                return (
+                    sanitize_value(shaders_section),
+                    sanitize_value(errors),
+                    sanitize_value(warnings),
+                )
+            if not merge_resolved.is_file():
+                shaders_section["status"] = "error"
+                errors.append(
+                    f"merge-reflect sidecar is not a regular file: "
+                    f"{repo_relative_label(merge_raw, resolved_repo)}"
+                )
+                return (
+                    sanitize_value(shaders_section),
+                    sanitize_value(errors),
+                    sanitize_value(warnings),
+                )
+            extra_ok, extra_doc, extra_errors = load_and_validate_reflect_sidecar_v1(
+                merge_resolved
+            )
+            if not extra_ok or extra_doc is None:
+                shaders_section["status"] = "refused"
+                errors.extend(extra_errors)
+                return (
+                    sanitize_value(shaders_section),
+                    sanitize_value(errors),
+                    sanitize_value(warnings),
+                )
+            extra_stage_maps.append(extra_doc["stages"])
+            merged_labels.append(
+                repo_relative_label(merge_raw, resolved_repo) or basename_label(merge_raw)
+            )
+
+        source_stages: Mapping[str, Any] | None = None
+        if sidecar_resolved is not None:
+            src_sc_ok, src_sc_doc, src_sc_errors = load_and_validate_reflect_sidecar_v1(
+                sidecar_resolved
+            )
+            if not src_sc_ok or src_sc_doc is None:
+                shaders_section["status"] = "refused"
+                errors.extend(src_sc_errors)
+                return (
+                    sanitize_value(shaders_section),
+                    sanitize_value(errors),
+                    sanitize_value(warnings),
+                )
+            source_stages = src_sc_doc["stages"]
+
+        existing_stages: Mapping[str, Any] | None = None
+        if dst_sidecar.exists() or dst_sidecar.is_symlink():
+            dst_sc_safe, dst_sc_resolved = _check_file_within_root(
+                dst_sidecar, shaders_dir_path
+            )
+            if not dst_sc_safe or dst_sc_resolved is None:
+                shaders_section["status"] = "refused"
+                errors.append(
+                    f"existing staged reflection sidecar is unreadable, not a regular file, "
+                    f"or escapes shaders-dir: {sanitize_text(sidecar_dest_name)}"
+                )
+                return (
+                    sanitize_value(shaders_section),
+                    sanitize_value(errors),
+                    sanitize_value(warnings),
+                )
+            exist_ok, exist_doc, exist_errors = load_and_validate_reflect_sidecar_v1(
+                dst_sc_resolved
+            )
+            if not exist_ok or exist_doc is None:
+                shaders_section["status"] = "refused"
+                errors.extend(exist_errors)
+                return (
+                    sanitize_value(shaders_section),
+                    sanitize_value(errors),
+                    sanitize_value(warnings),
+                )
+            existing_stages = exist_doc["stages"]
+
+        merged_doc, merge_stats = merge_reflect_sidecar_stages(
+            existing_stages=existing_stages,
+            source_stages=source_stages,
+            extra_stage_maps=extra_stage_maps,
+        )
+        merged_payload = (json.dumps(merged_doc, indent=2, sort_keys=True) + "\n").encode(
+            "utf-8"
+        )
+
+        pack_plan: FileStagePlan | None = None
+        if src_pack is not None:
+            try:
+                pack_plan = plan_file_stage(src_pack, dst_pack)
+            except (OSError, StageBrowserBootError) as exc:
+                shaders_section["status"] = "error"
+                errors.append(
+                    f"failed to inspect shader artifact {sanitize_text(shader_pack_name)}: "
+                    f"{sanitize_text(str(exc))}"
+                )
+                return (
+                    sanitize_value(shaders_section),
+                    sanitize_value(errors),
+                    sanitize_value(warnings),
+                )
+
+        try:
+            sidecar_plan = plan_bytes_stage(merged_payload, dst_sidecar)
+        except (OSError, StageBrowserBootError) as exc:
+            shaders_section["status"] = "error"
+            errors.append(
+                f"failed to inspect shader artifact {sanitize_text(sidecar_dest_name)}: "
+                f"{sanitize_text(str(exc))}"
+            )
+            return (
+                sanitize_value(shaders_section),
+                sanitize_value(errors),
+                sanitize_value(warnings),
+            )
+
+        file_pairs: list[tuple[Path, Path]] = []
+        byte_pairs: list[tuple[bytes, Path]] = []
+        if src_pack is not None and pack_plan is not None and pack_plan.needs_copy:
+            file_pairs.append((src_pack, dst_pack))
+        if sidecar_plan.needs_copy:
+            byte_pairs.append((merged_payload, dst_sidecar))
+
+        if (file_pairs or byte_pairs) and not dry_run:
+            try:
+                _atomic_stage_mixed(file_pairs, byte_pairs)
+            except OSError as exc:
+                shaders_section["status"] = "error"
+                errors.append(
+                    f"failed to atomically stage shader artifacts: {sanitize_text(str(exc))}"
+                )
+                return (
+                    sanitize_value(shaders_section),
+                    sanitize_value(errors),
+                    sanitize_value(warnings),
+                )
+
+        copied = 0
+        planned = 0
+        unchanged = 0
+        if pack_plan is not None:
+            if not pack_plan.needs_copy:
+                unchanged += 1
+                pack_action = "unchanged"
+            elif dry_run:
+                planned += 1
+                pack_action = "plan_copy"
+            else:
+                copied += 1
+                pack_action = "copied"
+            shaders_section["pack"] = {
+                "name": sanitize_text(shader_pack_name),
+                "action": pack_action,
+                "reason": pack_plan.reason,
+                "size_bytes": pack_plan.size_bytes,
+                "sha256": pack_plan.sha256,
+            }
+
+        if not sidecar_plan.needs_copy:
+            unchanged += 1
+            sidecar_action = "unchanged"
+        elif dry_run:
+            planned += 1
+            sidecar_action = "plan_copy"
+        else:
+            copied += 1
+            sidecar_action = "copied"
+
+        sidecar_entry: dict[str, Any] = {
+            "name": sanitize_text(sidecar_dest_name),
+            "action": sidecar_action,
+            "reason": sidecar_plan.reason,
+            "size_bytes": sidecar_plan.size_bytes,
+            "sha256": sidecar_plan.sha256,
+            "source": "merged",
+            "stage_count": merge_stats["total_stages"],
+            "merged": True,
+            "merged_files": merged_labels,
+            "merge_stats": merge_stats,
+        }
+        shaders_section["sidecar"] = sidecar_entry
+        if sidecar_action in ("copied", "unchanged"):
+            shaders_section["sidecar_staged"] = True
+            shaders_section["sidecar_bytes"] = sidecar_plan.size_bytes
+
+        shaders_section["copied_count"] = copied
+        shaders_section["planned_count"] = planned
+        shaders_section["unchanged_count"] = unchanged
+        if dry_run:
+            shaders_section["status"] = "planned" if planned > 0 else "unchanged"
+        elif copied > 0:
+            shaders_section["status"] = "staged"
+        else:
+            shaders_section["status"] = "unchanged"
+
+        return sanitize_value(shaders_section), sanitize_value(errors), sanitize_value(warnings)
+
     # Validate sidecar JSON BEFORE staging either the pack or the sidecar so
     # invalid sidecars never clobber existing staged files.
     if sidecar_resolved is not None:
@@ -1293,28 +1745,12 @@ def stage_shader_pack(
                 sanitize_value(warnings),
             )
 
-    resolved_shaders = shaders_dir_path.resolve()
-    dst_pack = shaders_dir_path / shader_pack_name
-    dst_sidecar = Path(str(dst_pack) + REFLECT_SIDECAR_SUFFIX)
-    sidecar_dest_name = dst_sidecar.name
-
+    assert src_pack is not None
     candidates: list[tuple[str, str, Path, Path]] = [
         ("pack", shader_pack_name, src_pack, dst_pack),
     ]
     if sidecar_resolved is not None:
         candidates.append(("sidecar", sidecar_dest_name, sidecar_resolved, dst_sidecar))
-
-    for _, dest_name, _, dst_file in candidates:
-        if dst_file.parent.resolve() != resolved_shaders or dst_file.name != dest_name:
-            shaders_section["status"] = "refused"
-            errors.append(
-                f"refused shader artifact escaping shaders-dir: {sanitize_text(dest_name)}"
-            )
-            return (
-                sanitize_value(shaders_section),
-                sanitize_value(errors),
-                sanitize_value(warnings),
-            )
 
     plans: list[tuple[str, str, Path, Path, FileStagePlan]] = []
     for kind, dest_name, src_file, dst_file in candidates:
@@ -1397,8 +1833,72 @@ def stage_shader_pack(
 
 
 # ---------------------------------------------------------------------------
-# Validated boot-options.json staging (W119 / O36 / O37)
+# Validated boot-options.json & input-script preset staging (W119 / O36 / O37 / T46)
 # ---------------------------------------------------------------------------
+
+
+def sanitize_input_script_preset(raw: Any) -> str | None:
+    """Sanitize and canonicalize an input-script preset against the allowlist.
+
+    Matches `ALLOWED_INPUT_SCRIPT_PRESETS` in `tools/run_browser_boot.py` and
+    `web/input/input_bridge.js` (`start-screen`, `menu-flow`, `calibration-skip`,
+    `intro-watch`).
+    """
+    if not isinstance(raw, str):
+        return None
+    trimmed = raw.strip()
+    if (
+        not trimmed
+        or len(trimmed) > 64
+        or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in trimmed)
+    ):
+        return None
+    lower = trimmed.lower()
+    if not _SAFE_INPUT_SCRIPT_RE.match(lower):
+        return None
+    return ALLOWED_INPUT_SCRIPT_PRESETS.get(lower)
+
+
+def validate_input_script_preset(raw: Any) -> tuple[bool, str | None, str | None]:
+    """Validate an input-script preset; returns `(ok, canonical_or_none, error_or_none)`."""
+    if raw is None:
+        return True, None, None
+    allowed = ", ".join(ALLOWED_INPUT_SCRIPT_PRESETS.values())
+    if not isinstance(raw, str):
+        return False, None, f"invalid input_script: must be a string (allowed: {allowed})"
+    cleaned = sanitize_input_script_preset(raw)
+    if cleaned is None:
+        return (
+            False,
+            None,
+            sanitize_text(f"invalid input_script {raw!r} (allowed: {allowed})"),
+        )
+    return True, cleaned, None
+
+
+def _validate_dump_pipelines_dir(value: Any) -> tuple[bool, str | None, str | None]:
+    """Validate `dump_pipelines_dir` as a safe virtual MEMFS path (e.g. `/pg6_dump`)."""
+    if not isinstance(value, str):
+        return (
+            False,
+            None,
+            "invalid boot-options.json: 'dump_pipelines_dir' must be a non-empty string",
+        )
+    cleaned = value.strip()
+    if (
+        not cleaned
+        or len(cleaned) > 256
+        or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in cleaned)
+        or "\\" in cleaned
+        or re.match(r"^[A-Za-z]:", cleaned)
+        or ".." in cleaned.split("/")
+    ):
+        return (
+            False,
+            None,
+            "invalid boot-options.json: 'dump_pipelines_dir' must be a safe non-empty virtual path (e.g. '/pg6_dump')",
+        )
+    return True, cleaned, None
 
 
 def _empty_boot_options_section() -> dict[str, Any]:
@@ -1418,10 +1918,17 @@ def parse_and_validate_boot_options(
     *,
     boot_options: Mapping[str, Any] | str | Path | None = None,
     verify_window_marks: bool = False,
+    dump_pipelines: bool = False,
+    input_script: str | None = None,
     repo_root: Path | str = DEFAULT_REPO_ROOT,
 ) -> tuple[bool, dict[str, Any] | None, list[str]]:
     """Parse and schema-validate `boot-options.json` input and CLI flags."""
-    if boot_options is None and not verify_window_marks:
+    if (
+        boot_options is None
+        and not verify_window_marks
+        and not dump_pipelines
+        and input_script is None
+    ):
         return True, None, []
 
     resolved_repo = Path(repo_root).resolve()
@@ -1553,12 +2060,39 @@ def parse_and_validate_boot_options(
                 )
                 continue
             validated[key] = value
+        elif key == "dump_pipelines_dir":
+            dir_ok, cleaned_dir, dir_err = _validate_dump_pipelines_dir(value)
+            if not dir_ok or cleaned_dir is None:
+                errors.append(
+                    dir_err
+                    or "invalid boot-options.json: 'dump_pipelines_dir' must be a safe non-empty virtual path"
+                )
+                continue
+            validated[key] = cleaned_dir
+        elif key == "input_script":
+            preset_ok, cleaned_preset, preset_err = validate_input_script_preset(value)
+            if not preset_ok or cleaned_preset is None:
+                errors.append(
+                    f"invalid boot-options.json: {preset_err or 'invalid input_script'}"
+                )
+                continue
+            validated[key] = cleaned_preset
+
+    if input_script is not None:
+        cli_preset_ok, cli_preset, cli_preset_err = validate_input_script_preset(input_script)
+        if not cli_preset_ok or cli_preset is None:
+            errors.append(cli_preset_err or "invalid --input-script preset")
+        else:
+            validated["input_script"] = cli_preset
 
     if errors:
         return False, None, sanitize_value(errors)
 
     if verify_window_marks:
         validated["verify_window_marks"] = True
+
+    if dump_pipelines:
+        validated["dump_pipelines_dir"] = DEFAULT_DUMP_PIPELINES_DIR
 
     ordered = {key: validated[key] for key in sorted(validated)}
     return True, ordered, []
@@ -1569,6 +2103,8 @@ def stage_boot_options(
     boot_dir: Path | str = DEFAULT_BOOT_DIR_REL,
     boot_options: Mapping[str, Any] | str | Path | None = None,
     verify_window_marks: bool = False,
+    dump_pipelines: bool = False,
+    input_script: str | None = None,
     repo_root: Path | str = DEFAULT_REPO_ROOT,
     dry_run: bool = False,
 ) -> tuple[dict[str, Any], list[str], list[str]]:
@@ -1588,6 +2124,8 @@ def stage_boot_options(
     ok_val, validated, val_errors = parse_and_validate_boot_options(
         boot_options=boot_options,
         verify_window_marks=verify_window_marks,
+        dump_pipelines=dump_pipelines,
+        input_script=input_script,
         repo_root=resolved_repo,
     )
     if not ok_val:
@@ -1663,7 +2201,10 @@ def stage_browser_boot(
     shaders_dir: Path | str = DEFAULT_SHADERS_DIR_REL,
     shader_pack_name: str = DEFAULT_SHADER_PACK_NAME,
     reflect_sidecar: Path | str | None = None,
+    merge_reflect: Path | str | Sequence[Path | str] | None = None,
     verify_window_marks: bool = False,
+    dump_pipelines: bool = False,
+    input_script: str | None = None,
     boot_options: Mapping[str, Any] | str | Path | None = None,
     repo_root: Path | str = DEFAULT_REPO_ROOT,
     dry_run: bool = False,
@@ -1687,6 +2228,7 @@ def stage_browser_boot(
         if reflect_sidecar is not None
         else None
     )
+    merge_reflect_paths = _normalize_merge_reflect_paths(merge_reflect, resolved_repo)
 
     errors: list[str] = []
     warnings: list[str] = []
@@ -1714,7 +2256,12 @@ def stage_browser_boot(
     shaders_section: dict[str, Any] = _empty_shaders_section()
     boot_options_section: dict[str, Any] = _empty_boot_options_section()
 
-    wants_boot_options = bool(verify_window_marks or boot_options is not None)
+    wants_boot_options = bool(
+        verify_window_marks
+        or dump_pipelines
+        or input_script is not None
+        or boot_options is not None
+    )
 
     if not boot_safe:
         boot_section["status"] = "refused"
@@ -1743,6 +2290,9 @@ def stage_browser_boot(
                     "shader_pack": repo_relative_label(shader_pack_path, resolved_repo),
                     "shaders_dir": repo_relative_label(shaders_dir_path, resolved_repo),
                     "reflect_sidecar": repo_relative_label(reflect_sidecar_path, resolved_repo),
+                    "merge_reflect": [
+                        repo_relative_label(p, resolved_repo) for p in merge_reflect_paths
+                    ],
                 },
                 "safety": {
                     "boot_dir_safe": boot_safe,
@@ -1879,13 +2429,18 @@ def stage_browser_boot(
         errors.extend(wasm_errors)
         warnings.extend(wasm_warnings)
 
-    # ---- Stage 3: Shader pack + adjacent/overridden .reflect.json sidecar ----
-    if shader_pack_path is not None or reflect_sidecar_path is not None:
+    # ---- Stage 3: Shader pack + adjacent/overridden/merged .reflect.json sidecar ----
+    if (
+        shader_pack_path is not None
+        or reflect_sidecar_path is not None
+        or merge_reflect_paths
+    ):
         shaders_section, shader_errors, shader_warnings = stage_shader_pack(
             shader_pack=shader_pack_path,
             shaders_dir=shaders_dir_path,
             shader_pack_name=shader_pack_name,
             reflect_sidecar=reflect_sidecar_path,
+            merge_reflect=merge_reflect_paths,
             repo_root=resolved_repo,
             dry_run=dry_run,
         )
@@ -1901,6 +2456,8 @@ def stage_browser_boot(
                 boot_dir=boot_path,
                 boot_options=boot_options,
                 verify_window_marks=verify_window_marks,
+                dump_pipelines=dump_pipelines,
+                input_script=input_script,
                 repo_root=resolved_repo,
                 dry_run=dry_run,
             )
@@ -1921,6 +2478,9 @@ def stage_browser_boot(
                 "shader_pack": repo_relative_label(shader_pack_path, resolved_repo),
                 "shaders_dir": repo_relative_label(shaders_dir_path, resolved_repo),
                 "reflect_sidecar": repo_relative_label(reflect_sidecar_path, resolved_repo),
+                "merge_reflect": [
+                    repo_relative_label(p, resolved_repo) for p in merge_reflect_paths
+                ],
             },
             "safety": {
                 "boot_dir_safe": boot_safe,
@@ -2035,11 +2595,19 @@ def format_report_text(report: Mapping[str, Any]) -> str:
         )
     sidecar_item = shaders.get("sidecar")
     if isinstance(sidecar_item, Mapping):
+        merge_suffix = ""
+        merge_stats = sidecar_item.get("merge_stats")
+        if isinstance(merge_stats, Mapping):
+            merge_suffix = (
+                f", merged=+{merge_stats.get('added_stages', 0)}"
+                f"/~{merge_stats.get('updated_stages', 0)}"
+                f"/={merge_stats.get('preserved_stages', 0)}"
+            )
         lines.append(
             f"    [{str(sidecar_item.get('action', '')).upper()}] "
             f"{sidecar_item.get('name')} ({sidecar_item.get('size_bytes')} bytes, "
             f"{sidecar_item.get('reason')}, stages={sidecar_item.get('stage_count', 0)}, "
-            f"source={sidecar_item.get('source')})"
+            f"source={sidecar_item.get('source')}{merge_suffix})"
         )
 
     boot_opts_status = str(boot_options.get("status", "skipped")).upper()
@@ -2052,10 +2620,22 @@ def format_report_text(report: Mapping[str, Any]) -> str:
         f"(boot_options_staged={'true' if boot_opts_staged else 'false'})"
     )
     if boot_options.get("action"):
+        opts_detail_parts: list[str] = [
+            f"{boot_options.get('size_bytes', 0)} bytes",
+            str(boot_options.get("reason")),
+        ]
+        opts_map = boot_options.get("options")
+        if isinstance(opts_map, Mapping):
+            if opts_map.get("dump_pipelines_dir"):
+                opts_detail_parts.append(
+                    f"dump_pipelines_dir={opts_map.get('dump_pipelines_dir')}"
+                )
+            if opts_map.get("input_script"):
+                opts_detail_parts.append(f"input_script={opts_map.get('input_script')}")
         lines.append(
             f"    [{str(boot_options.get('action', '')).upper()}] "
             f"{boot_options.get('filename', BOOT_OPTIONS_NAME)} "
-            f"({boot_options.get('size_bytes', 0)} bytes, {boot_options.get('reason')})"
+            f"({', '.join(opts_detail_parts)})"
         )
 
     warnings = report.get("warnings") or []
@@ -2149,11 +2729,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--merge-reflect",
+        action="append",
+        type=Path,
+        default=None,
+        metavar="EXTRA_REFLECT_JSON",
+        help=(
+            "Merge additional playgta6-stage-reflection v1 sidecar stages into the "
+            "staged <pack>.reflect.json without losing existing stages (may be passed "
+            "multiple times)."
+        ),
+    )
+    parser.add_argument(
         "--verify-window-marks",
         action="store_true",
         help=(
             "Stage validated boot-options.json into --boot-dir with "
             "verify_window_marks=true."
+        ),
+    )
+    parser.add_argument(
+        "--dump-pipelines",
+        action="store_true",
+        help=(
+            f'Stage validated boot-options.json into --boot-dir with '
+            f'dump_pipelines_dir="{DEFAULT_DUMP_PIPELINES_DIR}".'
+        ),
+    )
+    parser.add_argument(
+        "--input-script",
+        type=str,
+        default=None,
+        help=(
+            "Optional validated input-script preset to record in boot-options.json "
+            f"(allowed: {', '.join(ALLOWED_INPUT_SCRIPT_PRESETS.values())})."
         ),
     )
     parser.add_argument(
@@ -2198,7 +2807,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         has_other_target = bool(
             args.shader_pack is not None
             or args.reflect_sidecar is not None
+            or bool(args.merge_reflect)
             or args.verify_window_marks
+            or args.dump_pipelines
+            or args.input_script is not None
             or args.boot_options_json is not None
         )
         if not has_other_target or default_program.is_dir():
@@ -2213,7 +2825,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         shaders_dir=args.shaders_dir,
         shader_pack_name=args.shader_pack_name,
         reflect_sidecar=args.reflect_sidecar,
+        merge_reflect=args.merge_reflect,
         verify_window_marks=args.verify_window_marks,
+        dump_pipelines=args.dump_pipelines,
+        input_script=args.input_script,
         boot_options=args.boot_options_json,
         repo_root=args.repo_root,
         dry_run=args.dry_run,

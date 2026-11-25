@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit and CLI tests for tools/stage_browser_boot.py (Track 5 / W51, W66, W119)."""
+"""Unit and CLI tests for tools/stage_browser_boot.py (Track 5 / W51, W66, W119, T46)."""
 
 from __future__ import annotations
 
@@ -1704,6 +1704,658 @@ class TestBootOptionsStaging(unittest.TestCase):
             # Verify zero host paths or usernames in both JSON and text outputs.
             for output in (buf_json.getvalue(), text_out):
                 self.assertNotIn("W119SecretHost_", output)
+                self.assertNotIn(str(base), output)
+                self.assertNotIn(str(base).replace("\\", "/"), output)
+                self.assertNotRegex(output, r"[A-Za-z]:[\\/]")
+                self.assertNotIn("/Users/", output)
+                self.assertNotIn("/home/", output)
+                self.assertNotIn("/tmp/", output)
+                for username in sbb._current_usernames():
+                    self.assertNotRegex(
+                        output,
+                        re.compile(
+                            rf"(?<![A-Za-z0-9_]){re.escape(username)}(?![A-Za-z0-9_])",
+                            re.IGNORECASE,
+                        ),
+                    )
+
+
+class TestDumpPipelinesAndInputScriptPresets(unittest.TestCase):
+    def test_input_script_helpers_recognize_all_four_presets_and_reject_invalid(self) -> None:
+        self.assertEqual(
+            set(sbb.ALLOWED_INPUT_SCRIPT_PRESETS.values()),
+            {"start-screen", "menu-flow", "calibration-skip", "intro-watch"},
+        )
+        for preset in ("start-screen", "menu-flow", "calibration-skip", "intro-watch"):
+            self.assertEqual(sbb.sanitize_input_script_preset(preset), preset)
+            self.assertEqual(sbb.sanitize_input_script_preset(f"  {preset.upper()}  "), preset)
+            ok, canonical, err = sbb.validate_input_script_preset(preset)
+            self.assertTrue(ok)
+            self.assertEqual(canonical, preset)
+            self.assertIsNone(err)
+
+        ok_none, val_none, err_none = sbb.validate_input_script_preset(None)
+        self.assertTrue(ok_none)
+        self.assertIsNone(val_none)
+        self.assertIsNone(err_none)
+
+        for bad in (
+            "",
+            "   ",
+            "unknown-preset",
+            "../menu-flow",
+            "menu-flow;rm -rf /",
+            "intro-watch\x00",
+            "a" * 65,
+            123,
+            True,
+        ):
+            self.assertIsNone(sbb.sanitize_input_script_preset(bad))
+            ok_bad, val_bad, err_bad = sbb.validate_input_script_preset(bad)
+            self.assertFalse(ok_bad, f"expected rejection for {bad!r}")
+            self.assertIsNone(val_bad)
+            self.assertIsNotNone(err_bad)
+
+    def test_dump_pipelines_stages_boot_options_refuses_tracked_dirs_and_respects_dry_run(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_repo_skeleton(Path(tmp))
+            boot_dir = repo / "work" / "recomp_build"
+
+            # Dry-run plans dump_pipelines_dir="/pg6_dump" without creating files or directories.
+            dry = sbb.stage_browser_boot(
+                boot_dir=boot_dir,
+                dump_pipelines=True,
+                repo_root=repo,
+                dry_run=True,
+            )
+            self.assertTrue(dry["ok"])
+            self.assertTrue(dry["dry_run"])
+            self.assertFalse(dry["boot_options_staged"])
+            self.assertEqual(dry["boot_options"]["status"], "planned")
+            self.assertEqual(dry["boot_options"]["action"], "plan_copy")
+            self.assertEqual(
+                dry["boot_options"]["options"],
+                {"dump_pipelines_dir": "/pg6_dump"},
+            )
+            self.assertFalse(boot_dir.exists())
+
+            # Real stage writes boot-options.json with dump_pipelines_dir="/pg6_dump".
+            staged = sbb.stage_browser_boot(
+                boot_dir=boot_dir,
+                dump_pipelines=True,
+                repo_root=repo,
+            )
+            self.assertTrue(staged["ok"])
+            self.assertTrue(staged["boot_options_staged"])
+            self.assertEqual(staged["boot_options"]["status"], "staged")
+            self.assertEqual(
+                json.loads((boot_dir / "boot-options.json").read_text(encoding="utf-8")),
+                {"dump_pipelines_dir": "/pg6_dump"},
+            )
+
+            # Second identical run is incremental unchanged no-op.
+            second = sbb.stage_browser_boot(
+                boot_dir=boot_dir,
+                dump_pipelines=True,
+                repo_root=repo,
+            )
+            self.assertTrue(second["ok"])
+            self.assertTrue(second["boot_options_staged"])
+            self.assertEqual(second["boot_options"]["status"], "unchanged")
+            self.assertEqual(second["boot_options"]["action"], "unchanged")
+
+            # Refuses tracked repo directories without writing boot-options.json.
+            for bad_rel in ("web", "tools", "runtime", "web/dist", "."):
+                bad_boot = repo / bad_rel
+                refused = sbb.stage_browser_boot(
+                    boot_dir=bad_boot,
+                    dump_pipelines=True,
+                    repo_root=repo,
+                )
+                self.assertFalse(refused["ok"], f"expected refusal for {bad_rel}")
+                self.assertFalse(refused["safety"]["boot_dir_safe"])
+                self.assertFalse(refused["boot_options_staged"])
+                self.assertEqual(refused["boot_options"]["status"], "refused")
+                self.assertFalse((bad_boot / "boot-options.json").exists())
+
+    def test_boot_options_validates_dump_pipelines_dir_and_input_script_presets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_repo_skeleton(Path(tmp))
+            boot_dir = repo / "work" / "recomp_build"
+
+            # Valid presets accepted both in inline boot_options JSON and via input_script arg.
+            for preset in ("start-screen", "menu-flow", "calibration-skip", "intro-watch"):
+                report = sbb.stage_browser_boot(
+                    boot_dir=boot_dir,
+                    boot_options=json.dumps(
+                        {
+                            "max_wall_ms": 60000,
+                            "dump_pipelines_dir": "/custom_dump",
+                            "input_script": preset,
+                        }
+                    ),
+                    repo_root=repo,
+                )
+                self.assertTrue(report["ok"], f"expected preset {preset} to pass")
+                written = json.loads((boot_dir / "boot-options.json").read_text(encoding="utf-8"))
+                self.assertEqual(written["input_script"], preset)
+                self.assertEqual(written["dump_pipelines_dir"], "/custom_dump")
+
+            # CLI flags override inline options cleanly.
+            combined = sbb.stage_browser_boot(
+                boot_dir=boot_dir,
+                boot_options='{"max_wall_ms": 120000, "report_to_log": true}',
+                dump_pipelines=True,
+                input_script="  MENU-FLOW ",
+                verify_window_marks=True,
+                repo_root=repo,
+            )
+            self.assertTrue(combined["ok"])
+            self.assertEqual(
+                json.loads((boot_dir / "boot-options.json").read_text(encoding="utf-8")),
+                {
+                    "dump_pipelines_dir": "/pg6_dump",
+                    "input_script": "menu-flow",
+                    "max_wall_ms": 120000,
+                    "report_to_log": True,
+                    "verify_window_marks": True,
+                },
+            )
+
+            existing_text = (boot_dir / "boot-options.json").read_text(encoding="utf-8")
+
+            # Invalid dump_pipelines_dir or input_script values fail cleanly without clobbering.
+            bad_payloads = [
+                '{"dump_pipelines_dir": ""}',
+                '{"dump_pipelines_dir": 42}',
+                '{"dump_pipelines_dir": "C:\\\\Users\\\\alice\\\\dump"}',
+                '{"dump_pipelines_dir": "../escape"}',
+                '{"dump_pipelines_dir": "/pg6_dump/../etc"}',
+                '{"dump_pipelines_dir": "/pg6_dump\\\\sub"}',
+                '{"input_script": "not-a-preset"}',
+                '{"input_script": ""}',
+                '{"input_script": 123}',
+            ]
+            for bad_json in bad_payloads:
+                with self.subTest(bad_json=bad_json):
+                    bad = sbb.stage_browser_boot(
+                        boot_dir=boot_dir,
+                        boot_options=bad_json,
+                        repo_root=repo,
+                    )
+                    self.assertFalse(bad["ok"])
+                    self.assertEqual(bad["boot_options"]["status"], "refused")
+                    self.assertEqual(
+                        (boot_dir / "boot-options.json").read_text(encoding="utf-8"),
+                        existing_text,
+                    )
+
+            bad_cli_preset = sbb.stage_browser_boot(
+                boot_dir=boot_dir,
+                input_script="bogus-preset",
+                repo_root=repo,
+            )
+            self.assertFalse(bad_cli_preset["ok"])
+            self.assertEqual(bad_cli_preset["boot_options"]["status"], "refused")
+            self.assertEqual(
+                (boot_dir / "boot-options.json").read_text(encoding="utf-8"),
+                existing_text,
+            )
+
+
+class TestMergeReflectSidecarStaging(unittest.TestCase):
+    @staticmethod
+    def _make_stage(kind: str = "fragment", user_sgpr: int = 8) -> dict[str, object]:
+        return {
+            "stage": kind,
+            "bindings": [
+                {
+                    "group": 0,
+                    "binding": 0,
+                    "kind": "uniform",
+                    "source": {"user_sgpr": user_sgpr, "table_byte_offset": 0},
+                }
+            ],
+        }
+
+    def _make_v1_sidecar(self, stages: dict[str, object]) -> dict[str, object]:
+        return {
+            "schema": "playgta6-stage-reflection",
+            "version": 1,
+            "stages": stages,
+        }
+
+    def test_merge_reflect_preserves_existing_stages_adds_new_and_updates_colliding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_repo_skeleton(Path(tmp))
+            shaders_dir = repo / "local-data" / "shaders"
+            shaders_dir.mkdir(parents=True)
+
+            dst_sidecar = shaders_dir / "splash.wgsl.pack.reflect.json"
+            existing_doc = self._make_v1_sidecar(
+                {
+                    "0x0000000000000001": self._make_stage("vertex", user_sgpr=2),
+                    "0x0000000000000002": self._make_stage("fragment", user_sgpr=4),
+                }
+            )
+            dst_sidecar.write_text(json.dumps(existing_doc, indent=2) + "\n", encoding="utf-8")
+
+            extra_path = repo / "work" / "menu_extra.reflect.json"
+            extra_doc = self._make_v1_sidecar(
+                {
+                    "0x0000000000000002": self._make_stage("fragment", user_sgpr=10),
+                    "0x0000000000000003": self._make_stage("compute", user_sgpr=12),
+                }
+            )
+            extra_path.write_text(json.dumps(extra_doc, indent=2) + "\n", encoding="utf-8")
+
+            # Dry-run plans merge without modifying staged sidecar on disk.
+            before_bytes = dst_sidecar.read_bytes()
+            dry = sbb.stage_browser_boot(
+                shaders_dir=shaders_dir,
+                merge_reflect=extra_path,
+                repo_root=repo,
+                dry_run=True,
+            )
+            self.assertTrue(dry["ok"])
+            self.assertEqual(dry["shaders"]["status"], "planned")
+            self.assertEqual(dry["shaders"]["sidecar"]["action"], "plan_copy")
+            self.assertEqual(dry["shaders"]["sidecar"]["source"], "merged")
+            self.assertEqual(dry["shaders"]["sidecar"]["stage_count"], 3)
+            self.assertEqual(
+                dry["shaders"]["sidecar"]["merge_stats"],
+                {
+                    "existing_stages": 2,
+                    "source_stages": 0,
+                    "added_stages": 1,
+                    "updated_stages": 1,
+                    "preserved_stages": 1,
+                    "total_stages": 3,
+                },
+            )
+            self.assertFalse(dry["sidecar_staged"])
+            self.assertEqual(dst_sidecar.read_bytes(), before_bytes)
+
+            # Real merge preserves 0x01, updates 0x02, adds 0x03.
+            merged = sbb.stage_browser_boot(
+                shaders_dir=shaders_dir,
+                merge_reflect=extra_path,
+                repo_root=repo,
+            )
+            self.assertTrue(merged["ok"])
+            self.assertTrue(merged["sidecar_staged"])
+            self.assertEqual(merged["shaders"]["status"], "staged")
+            self.assertEqual(merged["shaders"]["sidecar"]["action"], "copied")
+            self.assertEqual(merged["shaders"]["sidecar"]["stage_count"], 3)
+
+            written = json.loads(dst_sidecar.read_text(encoding="utf-8"))
+            self.assertEqual(written["schema"], "playgta6-stage-reflection")
+            self.assertEqual(written["version"], 1)
+            self.assertEqual(
+                sorted(written["stages"].keys()),
+                ["0x0000000000000001", "0x0000000000000002", "0x0000000000000003"],
+            )
+            self.assertEqual(
+                written["stages"]["0x0000000000000001"]["bindings"][0]["source"]["user_sgpr"], 2
+            )
+            self.assertEqual(
+                written["stages"]["0x0000000000000002"]["bindings"][0]["source"]["user_sgpr"], 10
+            )
+            self.assertEqual(written["stages"]["0x0000000000000003"]["stage"], "compute")
+
+            # Repeating the same merge is an idempotent unchanged no-op.
+            repeat = sbb.stage_browser_boot(
+                shaders_dir=shaders_dir,
+                merge_reflect=extra_path,
+                repo_root=repo,
+            )
+            self.assertTrue(repeat["ok"])
+            self.assertTrue(repeat["sidecar_staged"])
+            self.assertEqual(repeat["shaders"]["status"], "unchanged")
+            self.assertEqual(repeat["shaders"]["copied_count"], 0)
+            self.assertEqual(repeat["shaders"]["unchanged_count"], 1)
+
+    def test_merge_reflect_combines_existing_pack_sidecar_and_multiple_extras(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_repo_skeleton(Path(tmp))
+            shaders_dir = repo / "local-data" / "shaders"
+            shaders_dir.mkdir(parents=True)
+
+            # Pre-existing staged sidecar has 0x01 (must not be lost).
+            (shaders_dir / "splash.wgsl.pack.reflect.json").write_text(
+                json.dumps(
+                    self._make_v1_sidecar({"0x0000000000000001": self._make_stage("vertex", 1)})
+                ),
+                encoding="utf-8",
+            )
+
+            # Pack + adjacent sidecar brings 0x02.
+            src_pack = repo / "work" / "built.wgsl.pack"
+            src_pack.write_bytes(_build_synthetic_wgpk(seed=33))
+            Path(str(src_pack) + ".reflect.json").write_text(
+                json.dumps(
+                    self._make_v1_sidecar({"0x0000000000000002": self._make_stage("fragment", 2)})
+                ),
+                encoding="utf-8",
+            )
+
+            # Two extra reflect files bring 0x03 and 0x04 (with extra2 updating 0x03).
+            extra1 = repo / "work" / "extra1.reflect.json"
+            extra2 = repo / "work" / "extra2.reflect.json"
+            extra1.write_text(
+                json.dumps(
+                    self._make_v1_sidecar({"0x0000000000000003": self._make_stage("compute", 3)})
+                ),
+                encoding="utf-8",
+            )
+            extra2.write_text(
+                json.dumps(
+                    self._make_v1_sidecar(
+                        {
+                            "0x0000000000000003": self._make_stage("compute", 9),
+                            "0x0000000000000004": self._make_stage("vertex", 4),
+                        }
+                    )
+                ),
+                encoding="utf-8",
+            )
+
+            report = sbb.stage_browser_boot(
+                shader_pack=src_pack,
+                shaders_dir=shaders_dir,
+                merge_reflect=[extra1, extra2],
+                repo_root=repo,
+            )
+            self.assertTrue(report["ok"])
+            self.assertEqual(report["shaders"]["status"], "staged")
+            self.assertEqual(report["shaders"]["copied_count"], 2)
+            self.assertTrue(report["sidecar_staged"])
+
+            written = json.loads(
+                (shaders_dir / "splash.wgsl.pack.reflect.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                sorted(written["stages"].keys()),
+                [
+                    "0x0000000000000001",
+                    "0x0000000000000002",
+                    "0x0000000000000003",
+                    "0x0000000000000004",
+                ],
+            )
+            self.assertEqual(
+                written["stages"]["0x0000000000000003"]["bindings"][0]["source"]["user_sgpr"], 9
+            )
+
+    def test_merge_reflect_rejects_invalid_v1_sidecars_and_tracked_dirs_without_clobbering(
+        self,
+    ) -> None:
+        bad_cases = [
+            ("malformed_json", "{not-json"),
+            ("non_object", "[1, 2]"),
+            ("wrong_schema", json.dumps({"schema": "other", "version": 1, "stages": {}})),
+            ("missing_schema", json.dumps({"version": 1, "stages": {}})),
+            (
+                "wrong_version",
+                json.dumps({"schema": "playgta6-stage-reflection", "version": 2, "stages": {}}),
+            ),
+            (
+                "bool_version",
+                json.dumps({"schema": "playgta6-stage-reflection", "version": True, "stages": {}}),
+            ),
+            (
+                "bad_stage_kind",
+                json.dumps(
+                    {
+                        "schema": "playgta6-stage-reflection",
+                        "version": 1,
+                        "stages": {"0x01": {"stage": "geometry", "bindings": []}},
+                    }
+                ),
+            ),
+            (
+                "missing_bindings_list",
+                json.dumps(
+                    {
+                        "schema": "playgta6-stage-reflection",
+                        "version": 1,
+                        "stages": {"0x01": {"stage": "vertex"}},
+                    }
+                ),
+            ),
+        ]
+        for label, bad_text in bad_cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as tmp:
+                repo = _make_repo_skeleton(Path(tmp))
+                shaders_dir = repo / "local-data" / "shaders"
+                shaders_dir.mkdir(parents=True)
+
+                existing_text = json.dumps(_sample_reflect_sidecar(stage_count=1), indent=2) + "\n"
+                dst_sidecar = shaders_dir / "splash.wgsl.pack.reflect.json"
+                dst_sidecar.write_text(existing_text, encoding="utf-8")
+
+                bad_extra = repo / "work" / "bad_extra.reflect.json"
+                bad_extra.write_text(bad_text, encoding="utf-8")
+
+                report = sbb.stage_browser_boot(
+                    shaders_dir=shaders_dir,
+                    merge_reflect=bad_extra,
+                    repo_root=repo,
+                )
+                self.assertFalse(report["ok"])
+                self.assertEqual(report["shaders"]["status"], "refused")
+                self.assertEqual(dst_sidecar.read_text(encoding="utf-8"), existing_text)
+
+        # Missing merge file & tracked shaders dir are refused cleanly.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_repo_skeleton(Path(tmp))
+            missing = sbb.stage_browser_boot(
+                shaders_dir=repo / "local-data" / "shaders",
+                merge_reflect=repo / "work" / "does_not_exist.reflect.json",
+                repo_root=repo,
+            )
+            self.assertFalse(missing["ok"])
+            self.assertEqual(missing["shaders"]["status"], "error")
+
+            valid_extra = repo / "work" / "valid_extra.reflect.json"
+            valid_extra.write_text(
+                json.dumps(_sample_reflect_sidecar(stage_count=1)), encoding="utf-8"
+            )
+            tracked = sbb.stage_browser_boot(
+                shaders_dir=repo / "web",
+                merge_reflect=valid_extra,
+                repo_root=repo,
+            )
+            self.assertFalse(tracked["ok"])
+            self.assertFalse(tracked["safety"]["shaders_dir_safe"])
+            self.assertEqual(tracked["shaders"]["status"], "refused")
+            self.assertFalse((repo / "web" / "splash.wgsl.pack.reflect.json").exists())
+
+    def test_merge_reflect_creates_fresh_sidecar_and_refuses_corrupt_existing_or_replace_error(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_repo_skeleton(Path(tmp))
+            shaders_dir = repo / "local-data" / "shaders"
+            extra_path = repo / "work" / "fresh_extra.reflect.json"
+            extra_path.write_text(
+                json.dumps(
+                    self._make_v1_sidecar({"0x000000000000000a": self._make_stage("compute", 5)})
+                ),
+                encoding="utf-8",
+            )
+
+            # 1. Merge-only with no pre-existing staged sidecar creates valid v1 sidecar.
+            fresh = sbb.stage_browser_boot(
+                shaders_dir=shaders_dir,
+                merge_reflect=extra_path,
+                repo_root=repo,
+            )
+            self.assertTrue(fresh["ok"])
+            self.assertTrue(fresh["sidecar_staged"])
+            self.assertEqual(fresh["shaders"]["status"], "staged")
+            dst_sidecar = shaders_dir / "splash.wgsl.pack.reflect.json"
+            written = json.loads(dst_sidecar.read_text(encoding="utf-8"))
+            self.assertEqual(written["schema"], "playgta6-stage-reflection")
+            self.assertEqual(written["version"], 1)
+            self.assertEqual(list(written["stages"].keys()), ["0x000000000000000a"])
+
+            # 2. Atomic replace failure during merge cleans up temp files and preserves existing.
+            existing_bytes = dst_sidecar.read_bytes()
+            extra2 = repo / "work" / "second_extra.reflect.json"
+            extra2.write_text(
+                json.dumps(
+                    self._make_v1_sidecar({"0x000000000000000b": self._make_stage("vertex", 6)})
+                ),
+                encoding="utf-8",
+            )
+            orig_replace = os.replace
+
+            def fail_on_shaders(src: Path | str, dst: Path | str) -> None:
+                if Path(dst).parent.resolve() == shaders_dir.resolve():
+                    raise OSError("simulated merge replace failure")
+                orig_replace(src, dst)
+
+            with mock.patch("stage_browser_boot.os.replace", side_effect=fail_on_shaders):
+                failed = sbb.stage_browser_boot(
+                    shaders_dir=shaders_dir,
+                    merge_reflect=extra2,
+                    repo_root=repo,
+                )
+            self.assertFalse(failed["ok"])
+            self.assertEqual(failed["shaders"]["status"], "error")
+            self.assertEqual(dst_sidecar.read_bytes(), existing_bytes)
+            self.assertEqual(
+                sorted(p.name for p in shaders_dir.iterdir()),
+                ["splash.wgsl.pack.reflect.json"],
+            )
+
+            # 3. Corrupt existing staged sidecar is refused without clobbering.
+            dst_sidecar.write_text("{corrupt-existing", encoding="utf-8")
+            corrupt_res = sbb.stage_browser_boot(
+                shaders_dir=shaders_dir,
+                merge_reflect=extra2,
+                repo_root=repo,
+            )
+            self.assertFalse(corrupt_res["ok"])
+            self.assertEqual(corrupt_res["shaders"]["status"], "refused")
+            self.assertEqual(dst_sidecar.read_text(encoding="utf-8"), "{corrupt-existing")
+
+            # 4. Invalid CLI --input-script returns exit code 1 without writing boot-options.json.
+            bad_boot = repo / "work" / "bad_preset_boot"
+            buf_err = io.StringIO()
+            with redirect_stdout(buf_err):
+                rc_bad = sbb.main(
+                    [
+                        "--repo-root",
+                        str(repo),
+                        "--boot-dir",
+                        str(bad_boot),
+                        "--input-script",
+                        "invalid-preset",
+                        "--json",
+                    ]
+                )
+            self.assertEqual(rc_bad, 1)
+            bad_payload = json.loads(buf_err.getvalue())
+            self.assertFalse(bad_payload["ok"])
+            self.assertEqual(bad_payload["boot_options"]["status"], "refused")
+            self.assertFalse(bad_boot.exists())
+
+    def test_cli_one_command_dump_pipelines_merge_reflect_and_menu_flow_sanitized(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="T46SecretHost_") as tmp:
+            base = Path(tmp)
+            repo = _make_repo_skeleton(base)
+            program_dir = repo / "work" / "recomp_program"
+            _populate_program_dir(program_dir)
+
+            src_pack = base / "external_splash.wgsl.pack"
+            src_pack.write_bytes(_build_synthetic_wgpk(seed=19))
+            Path(str(src_pack) + ".reflect.json").write_text(
+                json.dumps(
+                    self._make_v1_sidecar({"0x0000000000000001": self._make_stage("vertex", 2)})
+                ),
+                encoding="utf-8",
+            )
+            extra_reflect = base / "menu_dump.reflect.json"
+            extra_reflect.write_text(
+                json.dumps(
+                    self._make_v1_sidecar({"0x0000000000000002": self._make_stage("fragment", 6)})
+                ),
+                encoding="utf-8",
+            )
+
+            ext_boot = base / "ext_boot_t46"
+            ext_shaders = base / "ext_shaders_t46"
+
+            # One reproducible CLI command stages boot + pack + merged sidecar + dump-pipelines + menu-flow.
+            buf_json = io.StringIO()
+            with redirect_stdout(buf_json):
+                rc_json = sbb.main(
+                    [
+                        "--repo-root",
+                        str(repo),
+                        "--program-dir",
+                        str(program_dir),
+                        "--boot-dir",
+                        str(ext_boot),
+                        "--shader-pack",
+                        str(src_pack),
+                        "--shaders-dir",
+                        str(ext_shaders),
+                        "--merge-reflect",
+                        str(extra_reflect),
+                        "--dump-pipelines",
+                        "--input-script",
+                        "menu-flow",
+                        "--json",
+                    ]
+                )
+            self.assertEqual(rc_json, 0)
+            payload = json.loads(buf_json.getvalue())
+            self.assertTrue(payload["ok"])
+            self.assertTrue(payload["sidecar_staged"])
+            self.assertTrue(payload["boot_options_staged"])
+            self.assertEqual(payload["shaders"]["sidecar"]["source"], "merged")
+            self.assertEqual(payload["shaders"]["sidecar"]["stage_count"], 2)
+            self.assertEqual(
+                payload["boot_options"]["options"],
+                {"dump_pipelines_dir": "/pg6_dump", "input_script": "menu-flow"},
+            )
+            self.assertEqual(
+                json.loads((ext_boot / "boot-options.json").read_text(encoding="utf-8")),
+                {"dump_pipelines_dir": "/pg6_dump", "input_script": "menu-flow"},
+            )
+
+            # Text CLI run with intro-watch preset.
+            buf_text = io.StringIO()
+            with redirect_stdout(buf_text):
+                rc_text = sbb.main(
+                    [
+                        "--repo-root",
+                        str(repo),
+                        "--boot-dir",
+                        str(ext_boot),
+                        "--shaders-dir",
+                        str(ext_shaders),
+                        "--merge-reflect",
+                        str(extra_reflect),
+                        "--dump-pipelines",
+                        "--input-script",
+                        "intro-watch",
+                    ]
+                )
+            self.assertEqual(rc_text, 0)
+            text_out = buf_text.getvalue()
+            self.assertIn("source=merged", text_out)
+            self.assertIn("dump_pipelines_dir=/pg6_dump", text_out)
+            self.assertIn("input_script=intro-watch", text_out)
+
+            # Zero host paths or usernames in both JSON and text output.
+            for output in (buf_json.getvalue(), text_out):
+                self.assertNotIn("T46SecretHost_", output)
                 self.assertNotIn(str(base), output)
                 self.assertNotIn(str(base).replace("\\", "/"), output)
                 self.assertNotRegex(output, r"[A-Za-z]:[\\/]")
