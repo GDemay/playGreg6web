@@ -11,7 +11,7 @@ import {
   SESSION_STATE,
 } from './runtime/session_controller.js';
 import { SmokeDemoRunner } from './demo/run_smoke_demo.js';
-import { InputBridge } from './input/input_bridge.js';
+import { INPUT_SCRIPT_PRESETS, InputBridge } from './input/input_bridge.js';
 import { InputProfileManager } from './input/input_profiles.js';
 import { AudioEngine } from './audio/audio_engine.js';
 import { BrowserStorageManager } from './storage/storage_manager.js';
@@ -25,6 +25,34 @@ export const DEFAULT_VIEWPORT_WIDTH = 640;
 export const DEFAULT_VIEWPORT_HEIGHT = 360;
 export const DEFAULT_CANVAS_FORMAT = 'bgra8unorm';
 export const DEFAULT_MAX_VALIDATION_ERRORS = 32;
+export const DEFAULT_STREAM_SHADERS_THRESHOLD_MB = 64;
+export const DEFAULT_STREAM_SHADERS_THRESHOLD_BYTES =
+  DEFAULT_STREAM_SHADERS_THRESHOLD_MB * 1024 * 1024;
+export const MAX_STREAM_THRESHOLD_MB = 4096;
+export const MAX_STREAM_THRESHOLD_BYTES = MAX_STREAM_THRESHOLD_MB * 1024 * 1024;
+export const MIN_STREAM_THRESHOLD_BYTES = 1;
+
+const BYTES_PER_MIB = 1024 * 1024;
+const SAFE_INPUT_SCRIPT_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+const POSITIVE_DECIMAL_RE = /^(?:\d+(?:\.\d+)?|\.\d+)$/;
+
+const ALLOWED_INPUT_SCRIPT_PRESETS = (() => {
+  const map = new Map();
+  if (INPUT_SCRIPT_PRESETS && typeof INPUT_SCRIPT_PRESETS === 'object') {
+    const keys = Object.keys(INPUT_SCRIPT_PRESETS);
+    for (let i = 0; i < keys.length; i += 1) {
+      const key = keys[i];
+      const lower = key.toLowerCase();
+      if (SAFE_INPUT_SCRIPT_RE.test(lower)) {
+        map.set(lower, key);
+      }
+    }
+  }
+  if (!map.has('start-screen')) {
+    map.set('start-screen', 'start-screen');
+  }
+  return map;
+})();
 
 const MAX_VALIDATION_ERROR_MESSAGE_LENGTH = 512;
 const MAX_VALIDATION_ERROR_CODE_LENGTH = 64;
@@ -232,6 +260,263 @@ export function resolveDefaultGameBase(options = {}, windowObj = null) {
     return `${origin}/game/`;
   }
   return '/game/';
+}
+
+export function sanitizeInputScriptPreset(raw) {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 64 || /[\x00-\x1F\x7F]/.test(trimmed)) {
+    return null;
+  }
+  const lower = trimmed.toLowerCase();
+  if (!SAFE_INPUT_SCRIPT_RE.test(lower)) {
+    return null;
+  }
+  return ALLOWED_INPUT_SCRIPT_PRESETS.get(lower) ?? null;
+}
+
+function parseStreamThresholdMb(raw) {
+  let parsed = null;
+  if (typeof raw === 'number') {
+    parsed = raw;
+  } else if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!trimmed || trimmed.length > 32 || !POSITIVE_DECIMAL_RE.test(trimmed)) {
+      return null;
+    }
+    parsed = Number(trimmed);
+  } else {
+    return null;
+  }
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return null;
+  }
+  const mb = Math.min(parsed, MAX_STREAM_THRESHOLD_MB);
+  const bytes = Math.max(
+    MIN_STREAM_THRESHOLD_BYTES,
+    Math.min(MAX_STREAM_THRESHOLD_BYTES, Math.floor(mb * BYTES_PER_MIB))
+  );
+  return { mb, bytes };
+}
+
+function parsePositiveStreamBytes(raw) {
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) {
+    return null;
+  }
+  return Math.max(
+    MIN_STREAM_THRESHOLD_BYTES,
+    Math.min(MAX_STREAM_THRESHOLD_BYTES, Math.floor(raw))
+  );
+}
+
+function parseBooleanQueryFlag(raw) {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on') {
+    return true;
+  }
+  if (normalized === '0' || normalized === 'false' || normalized === 'no' || normalized === 'off') {
+    return false;
+  }
+  return null;
+}
+
+function getQueryParamInsensitive(params, name) {
+  if (params.has(name)) {
+    return params.get(name);
+  }
+  const targetLower = name.toLowerCase();
+  for (const [key, value] of params.entries()) {
+    if (key.toLowerCase() === targetLower) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function toUrlSearchParams(search) {
+  if (search === null || search === undefined || search === '') {
+    return null;
+  }
+  if (typeof URLSearchParams === 'function' && search instanceof URLSearchParams) {
+    return search;
+  }
+  let raw = null;
+  if (typeof search === 'string') {
+    raw = search;
+  } else if (typeof search === 'object') {
+    if (typeof search.search === 'string') {
+      raw = search.search;
+    } else if (typeof search.href === 'string') {
+      raw = search.href;
+    }
+  }
+  if (typeof raw !== 'string' || raw.length === 0) {
+    return null;
+  }
+  const withoutHash = raw.split('#', 1)[0];
+  if (!withoutHash) {
+    return null;
+  }
+  let query = '';
+  if (ABSOLUTE_URL_RE.test(withoutHash)) {
+    const qIdx = withoutHash.indexOf('?');
+    query = qIdx >= 0 ? withoutHash.slice(qIdx + 1) : '';
+  } else if (withoutHash.startsWith('?')) {
+    query = withoutHash.slice(1);
+  } else if (withoutHash.includes('?')) {
+    query = withoutHash.slice(withoutHash.indexOf('?') + 1);
+  } else {
+    query = withoutHash;
+  }
+  if (!query) {
+    return null;
+  }
+  try {
+    return new URLSearchParams(query);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Pure URL query-parameter parser and sanitizer for bootstrap options:
+ * - `?inputScript=<preset>` (case-insensitive, strictly allowlisted to known preset IDs)
+ * - `?streamShaders=1|true` (enables ranged shader streaming with default 64 MiB threshold)
+ * - `?streamThresholdMb=<N>` (finite positive number clamped to safe bounds, converted to bytes)
+ *
+ * @param {string|URLSearchParams|URL|Location|object|null|undefined} search
+ * @returns {Readonly<{
+ *   inputScript: string | null,
+ *   streamShaders: boolean,
+ *   streamThresholdMb: number | null,
+ *   streamThresholdBytes: number | null,
+ * }>}
+ */
+export function parseBootUrlOptions(search) {
+  const params = toUrlSearchParams(search);
+  if (!params) {
+    return Object.freeze({
+      inputScript: null,
+      streamShaders: false,
+      streamThresholdMb: null,
+      streamThresholdBytes: null,
+    });
+  }
+
+  const inputScript = sanitizeInputScriptPreset(getQueryParamInsensitive(params, 'inputScript'));
+  const streamFlag = parseBooleanQueryFlag(getQueryParamInsensitive(params, 'streamShaders'));
+  const parsedThreshold = parseStreamThresholdMb(
+    getQueryParamInsensitive(params, 'streamThresholdMb')
+  );
+
+  let streamShaders = false;
+  let streamThresholdMb = null;
+  let streamThresholdBytes = null;
+
+  if (streamFlag === false) {
+    streamShaders = false;
+  } else if (parsedThreshold !== null) {
+    streamShaders = true;
+    streamThresholdMb = parsedThreshold.mb;
+    streamThresholdBytes = parsedThreshold.bytes;
+  } else if (streamFlag === true) {
+    streamShaders = true;
+    streamThresholdMb = DEFAULT_STREAM_SHADERS_THRESHOLD_MB;
+    streamThresholdBytes = DEFAULT_STREAM_SHADERS_THRESHOLD_BYTES;
+  }
+
+  return Object.freeze({
+    inputScript,
+    streamShaders,
+    streamThresholdMb,
+    streamThresholdBytes,
+  });
+}
+
+function resolveInputScriptOverride(source, fallback) {
+  if (!source || typeof source !== 'object') {
+    return fallback;
+  }
+  if (
+    !Object.prototype.hasOwnProperty.call(source, 'inputScript') ||
+    source.inputScript === undefined
+  ) {
+    return fallback;
+  }
+  if (source.inputScript === null || source.inputScript === false || source.inputScript === '') {
+    return null;
+  }
+  return sanitizeInputScriptPreset(source.inputScript);
+}
+
+function resolveStreamConfigOverride(source, base) {
+  if (!source || typeof source !== 'object') {
+    return base;
+  }
+  const hasStreamFlag =
+    Object.prototype.hasOwnProperty.call(source, 'streamShaders') &&
+    source.streamShaders !== undefined;
+  const hasThresholdBytes =
+    Object.prototype.hasOwnProperty.call(source, 'streamThresholdBytes') &&
+    source.streamThresholdBytes !== undefined;
+  const hasThresholdMb =
+    Object.prototype.hasOwnProperty.call(source, 'streamThresholdMb') &&
+    source.streamThresholdMb !== undefined;
+
+  if (!hasStreamFlag && !hasThresholdBytes && !hasThresholdMb) {
+    return base;
+  }
+
+  if (hasStreamFlag && source.streamShaders === false) {
+    return Object.freeze({
+      streamShaders: false,
+      streamThresholdMb: null,
+      streamThresholdBytes: null,
+    });
+  }
+
+  let bytes = null;
+  let mb = null;
+  if (hasThresholdBytes) {
+    const parsedBytes = parsePositiveStreamBytes(source.streamThresholdBytes);
+    if (parsedBytes !== null) {
+      bytes = parsedBytes;
+      mb = parsedBytes / BYTES_PER_MIB;
+    }
+  }
+  if (bytes === null && hasThresholdMb) {
+    const parsedMb = parseStreamThresholdMb(source.streamThresholdMb);
+    if (parsedMb !== null) {
+      bytes = parsedMb.bytes;
+      mb = parsedMb.mb;
+    }
+  }
+
+  if (bytes !== null) {
+    return Object.freeze({
+      streamShaders: true,
+      streamThresholdMb: mb,
+      streamThresholdBytes: bytes,
+    });
+  }
+
+  if (hasStreamFlag && source.streamShaders === true) {
+    if (base && base.streamShaders && isPositiveFinite(base.streamThresholdBytes)) {
+      return base;
+    }
+    return Object.freeze({
+      streamShaders: true,
+      streamThresholdMb: DEFAULT_STREAM_SHADERS_THRESHOLD_MB,
+      streamThresholdBytes: DEFAULT_STREAM_SHADERS_THRESHOLD_BYTES,
+    });
+  }
+
+  return base;
 }
 
 function pickBootUrl(...candidates) {
@@ -713,6 +998,7 @@ export class PlayGta6AppHandle {
     this.gpuBootPanel = components.gpuBootPanel || null;
     this.pgimPreloader = components.pgimPreloader || null;
     this.bootOrchestrator = components.bootOrchestrator || null;
+    this.bootUrlOptions = components.bootUrlOptions || null;
 
     this._getSmokeRunner = components.getSmokeRunner;
     this._getWasmWorker = components.getWasmWorker;
@@ -884,6 +1170,28 @@ export function bootstrapPlayGta6App(options = {}) {
   let latestDiscoveredBootAssets = { ...initialBootAssets };
   let lastNotifiedSideModuleKey = null;
   let session = null;
+
+  const rawUrlSearch =
+    options.urlSearch !== undefined
+      ? options.urlSearch
+      : windowObj && windowObj.location
+        ? typeof windowObj.location.search === 'string'
+          ? windowObj.location.search
+          : typeof windowObj.location.href === 'string'
+            ? windowObj.location.href
+            : ''
+        : '';
+  const parsedUrlOptions = parseBootUrlOptions(rawUrlSearch);
+  const baseInputScript = resolveInputScriptOverride(options, parsedUrlOptions.inputScript);
+  const baseStreamConfig = resolveStreamConfigOverride(options, parsedUrlOptions);
+  const resolvedBootUrlOptions = Object.freeze({
+    inputScript: baseInputScript,
+    streamShaders: baseStreamConfig.streamShaders,
+    streamThresholdMb: baseStreamConfig.streamThresholdMb,
+    streamThresholdBytes: baseStreamConfig.streamThresholdBytes,
+  });
+  let activeStreamConfig = baseStreamConfig;
+  let activeInputScript = null;
 
   const gpuTelemetry = {
     realPackDrawCount: 0,
@@ -1129,6 +1437,14 @@ export function bootstrapPlayGta6App(options = {}) {
       fields.sideModuleCount = Math.max(0, Math.floor(merged.sideModuleCount));
     } else if (Array.isArray(fields.sideModuleUrls)) {
       fields.sideModuleCount = fields.sideModuleUrls.length;
+    }
+    if (
+      activeStreamConfig &&
+      activeStreamConfig.streamShaders === true &&
+      isPositiveFinite(activeStreamConfig.streamThresholdBytes)
+    ) {
+      fields.streamShaders = true;
+      fields.streamThresholdBytes = activeStreamConfig.streamThresholdBytes;
     }
     return fields;
   }
@@ -3292,6 +3608,59 @@ export function bootstrapPlayGta6App(options = {}) {
     }
   }
 
+  function stopActiveInputScript() {
+    const hasRunningScript =
+      activeInputScript !== null ||
+      (inputBridge &&
+        typeof inputBridge.getScriptState === 'function' &&
+        Boolean(inputBridge.getScriptState()?.active));
+    activeInputScript = null;
+    if (!hasRunningScript || !inputBridge || typeof inputBridge.stopScript !== 'function') {
+      return;
+    }
+    try {
+      inputBridge.stopScript();
+    } catch (err) {
+      crashReporter.recordError('runtime', err, {
+        source: 'inputBridge',
+        phase: 'stopScript',
+      });
+    }
+  }
+
+  function startActiveInputScript(preset) {
+    if (destroyed || !preset) {
+      return false;
+    }
+    if (!inputBridge || typeof inputBridge.startScript !== 'function') {
+      return false;
+    }
+    try {
+      if (options.inputScriptOptions && typeof options.inputScriptOptions === 'object') {
+        inputBridge.startScript(preset, options.inputScriptOptions);
+      } else {
+        inputBridge.startScript(preset);
+      }
+      activeInputScript = preset;
+      if (hud && typeof hud.appendLog === 'function') {
+        try {
+          hud.appendLog(`Input script active: ${preset}`, 'info');
+        } catch {
+          // Ignore HUD errors.
+        }
+      }
+      return true;
+    } catch (err) {
+      activeInputScript = null;
+      crashReporter.recordError('runtime', err, {
+        source: 'inputBridge',
+        phase: 'startScript',
+        preset,
+      });
+      return false;
+    }
+  }
+
   async function start(startOpts) {
     if (destroyed) {
       return {
@@ -3302,6 +3671,9 @@ export function bootstrapPlayGta6App(options = {}) {
         error: new Error('PlayGta6AppHandle has been destroyed'),
       };
     }
+    stopActiveInputScript();
+    activeStreamConfig = resolveStreamConfigOverride(startOpts, baseStreamConfig);
+    const desiredInputScript = resolveInputScriptOverride(startOpts, baseInputScript);
     lastNotifiedSideModuleKey = null;
     startOverrideShaderPackUrl =
       startOpts && typeof startOpts === 'object'
@@ -3312,6 +3684,7 @@ export function bootstrapPlayGta6App(options = {}) {
             startOpts.wgslPack
           )
         : null;
+    let result;
     if (bootOrchestrator && typeof bootOrchestrator.start === 'function') {
       pendingStartOpts = startOpts;
       lastBootSessionResult = null;
@@ -3325,26 +3698,33 @@ export function bootstrapPlayGta6App(options = {}) {
         if (lastBootSessionResult.serverStatus) {
           recordDiscoveredBootAssets(lastBootSessionResult.serverStatus);
         }
-        return lastBootSessionResult;
+        result = lastBootSessionResult;
+      } else {
+        const fallbackResult = await session.start(startOpts);
+        if (fallbackResult && fallbackResult.serverStatus) {
+          recordDiscoveredBootAssets(fallbackResult.serverStatus);
+        }
+        result = fallbackResult;
       }
-      const fallbackResult = await session.start(startOpts);
-      if (fallbackResult && fallbackResult.serverStatus) {
-        recordDiscoveredBootAssets(fallbackResult.serverStatus);
+    } else {
+      latestDiscoveredBootAssets = { ...initialBootAssets };
+      loaderTelemetry.preferredShaderPackUrl = sanitizeTelemetryUrl(
+        pickBootUrl(options.preferredShaderPackUrl, options.shaderPackUrl)
+      );
+      const sessionResult = await session.start(startOpts);
+      if (sessionResult && sessionResult.serverStatus) {
+        recordDiscoveredBootAssets(sessionResult.serverStatus);
       }
-      return fallbackResult;
+      result = sessionResult;
     }
-    latestDiscoveredBootAssets = { ...initialBootAssets };
-    loaderTelemetry.preferredShaderPackUrl = sanitizeTelemetryUrl(
-      pickBootUrl(options.preferredShaderPackUrl, options.shaderPackUrl)
-    );
-    const sessionResult = await session.start(startOpts);
-    if (sessionResult && sessionResult.serverStatus) {
-      recordDiscoveredBootAssets(sessionResult.serverStatus);
+    if (!destroyed && result && result.ok && desiredInputScript) {
+      startActiveInputScript(desiredInputScript);
     }
-    return sessionResult;
+    return result;
   }
 
   async function stop() {
+    stopActiveInputScript();
     if (destroyed) {
       return {
         ok: true,
@@ -3425,6 +3805,8 @@ export function bootstrapPlayGta6App(options = {}) {
         resizeListenerAttached = false;
         windowObj.removeEventListener('resize', onWindowResize);
       }
+
+      stopActiveInputScript();
 
       try {
         await session.stop();
@@ -3529,6 +3911,7 @@ export function bootstrapPlayGta6App(options = {}) {
     gpuBootPanel,
     pgimPreloader,
     bootOrchestrator,
+    bootUrlOptions: resolvedBootUrlOptions,
     getSmokeRunner: () => activeSmokeRunner,
     getWasmWorker: () => activeWasmWorker,
     getDiagnosticsSnapshot,
