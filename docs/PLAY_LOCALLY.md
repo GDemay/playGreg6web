@@ -10,15 +10,25 @@ Build and watch the game in a headed Chrome on your own machine. Game files stay
 
 ## Quick start
 ```powershell
-.\tools\play_local.ps1 -Exe <path-to-game.exe> -GameDir <package-dir> -ShaderPack <path-to-pack> -Port 8141 -BuildDir work/browser-boot -InputScript calibration-skip
+.\tools\play_local.ps1 -Exe <path-to-game.exe> -GameDir <package-dir> -Port 8141 -BuildDir work/browser-boot
 ```
 This calls `tools/run_browser_boot.py --preset long --headed`: it rebuilds stale stages (recomp lift, PIC runtime lib,
 guest Wasm, shader pack, staging), starts the local COOP/COEP server and launches Chrome with its own profile.
 Useful switches: `-NoBuild` (fail on stale), `-TrustBuild` (reuse artifacts), `-DryRun` (print plan),
 `-Chrome <path>`, `-DurationS`. Input presets: start-screen, menu-flow, calibration-skip, intro-watch,
-legal-notices, chrome-menu-flow. Defaults come from `PLAYGTA6_EXE`, `GTA6_GAME_DIR`, `CHROME_PATH`.
+legal-notices, chrome-menu-flow. Defaults come from the env vars `PLAYGTA6_EXE`, `GTA6_GAME_DIR`, `CHROME_PATH` and `PLAYGTA6_SHADER_PACK`.
+`-InputScript` defaults to `calibration-skip` (`-InputScript none` turns it off). `-ShaderPack` defaults to
+`$env:PLAYGTA6_SHADER_PACK`, else `work/splash.wgsl.pack`; if none exists the script prints the build command and stops.
+Each run gets a unique name (`play-local-YYYYMMDD-HHMMSS`, override with `-Name`), so reruns never collide.
 
-`-ShaderPack` is required to see anything: without a pack the panel shows "Shader Packs: 0 packs" and every draw is dropped.
+## Troubleshooting: stuck on loading artwork
+- Without a shader pack nothing renders: check that the page's debug panel shows **Shader Packs** = 1 and that
+  **Pack Hits** climbs. If not, build one (`cargo run --release -p playgta6-shaders -- pack-rdna2 <input-dir> --out
+  work/splash.wgsl.pack`) and pass `-ShaderPack` or set `PLAYGTA6_SHADER_PACK`.
+- The title waits on its first (calibration) screen and the keyboard may not get past it. Keep the default
+  `-InputScript calibration-skip` (do not pass `-InputScript none`).
+
+A shader pack is required to see anything: without a pack the panel shows "Shader Packs: 0 packs" and every draw is dropped.
 Build one with `playgta6-shaders pack-rdna2 --max-wgsl-bytes 262144` plus `tools/stage_reflection_sidecar.py` (see the build recipe below); the `.reflect.json` sidecar is staged next to the pack.
 "Manifest/Bootset: Missing" in the readiness panel is fine for local play and can be ignored.
 
