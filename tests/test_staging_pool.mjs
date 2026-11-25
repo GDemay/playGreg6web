@@ -10,9 +10,13 @@ const stagingMod = require('../web/workers/staging_pool.js');
 const {
   alignUp,
   alignBufferSize,
+  selectLargeSlabBucket,
   isSharedBuffer,
   sanitizeWriteBufferPayload,
   GpuStagingPool,
+  DEFAULT_LARGE_SLAB_THRESHOLD,
+  DEFAULT_MAX_LARGE_SLABS,
+  DEFAULT_LARGE_SLAB_BUCKETS,
   BUFFER_USAGE,
   MAP_MODE,
   STAGING_MODE,
@@ -1524,5 +1528,560 @@ test('W126: active and in-flight chunks are never reclaimed prematurely in write
   mappedPool.destroy();
   assert.equal(mappedMock.createdBuffers[0].destroyCount, 1);
   assert.equal(mappedMock.createdBuffers[1].destroyCount, 1);
+});
+
+// ---------------------------------------------------------------------------
+// W176: 4K Bink2 YUV large-slab persistent bucket reuse (2–16 MiB) &
+// upload bandwidth / reuse telemetry.
+// ---------------------------------------------------------------------------
+
+/**
+ * Lightweight mock WebGPU device for multi-frame 4K (12.5 MiB/frame) tests.
+ * Validates buffer bounds & 4-byte alignment without duplicating full multi-MiB
+ * snapshots on every frame.
+ */
+function createLightweight4kMockDevice(options = {}) {
+  let nextBufferId = 1;
+  const createdBuffers = [];
+  const queueWrites = [];
+  const deferredFences = [];
+  const allocateBacking = Boolean(options.allocateBacking);
+
+  const queue = {
+    writeBuffer(buffer, bufferOffset, data) {
+      const byteLength = ArrayBuffer.isView(data) ? data.byteLength : data.byteLength;
+      assert.equal(bufferOffset % 4, 0);
+      assert.equal(byteLength % 4, 0);
+      assert.ok(bufferOffset + byteLength <= buffer.size, 'writeBuffer must stay in bounds');
+      if (buffer._data) {
+        const bytes =
+          data instanceof Uint8Array
+            ? data
+            : ArrayBuffer.isView(data)
+              ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+              : new Uint8Array(data);
+        buffer._data.set(bytes, bufferOffset);
+      }
+      queueWrites.push({ buffer, bufferOffset, byteLength });
+    },
+  };
+
+  if (options.enableWorkDoneFence) {
+    queue.onSubmittedWorkDone = () => {
+      let resolve;
+      const promise = new Promise((res) => {
+        resolve = res;
+      });
+      deferredFences.push({ promise, resolve });
+      return promise;
+    };
+  }
+
+  const device = {
+    queue,
+    createBuffer(descriptor) {
+      const id = nextBufferId++;
+      const needsBacking = allocateBacking || Boolean(descriptor.mappedAtCreation);
+      const backing = needsBacking ? new ArrayBuffer(descriptor.size) : null;
+      const dataView = backing ? new Uint8Array(backing) : null;
+      const buffer = {
+        id,
+        label: descriptor.label || `buf-${id}`,
+        size: descriptor.size,
+        usage: descriptor.usage,
+        mappedAtCreation: Boolean(descriptor.mappedAtCreation),
+        _data: dataView,
+        _mapped: Boolean(descriptor.mappedAtCreation),
+        unmapCount: 0,
+        mapAsyncCount: 0,
+        destroyCount: 0,
+        getMappedRange() {
+          if (!this._mapped) {
+            throw new Error(`Buffer ${this.id} is not mapped`);
+          }
+          return backing;
+        },
+        unmap() {
+          if (!this._mapped) {
+            throw new Error(`Buffer ${this.id} is already unmapped`);
+          }
+          this._mapped = false;
+          this.unmapCount += 1;
+        },
+        async mapAsync(mode) {
+          assert.equal(mode, MAP_MODE.WRITE);
+          this.mapAsyncCount += 1;
+          this._mapped = true;
+        },
+        destroy() {
+          this._mapped = false;
+          this.destroyCount += 1;
+        },
+      };
+      createdBuffers.push(buffer);
+      return buffer;
+    },
+  };
+
+  return { device, createdBuffers, queueWrites, deferredFences };
+}
+
+function createLightweightEncoder() {
+  const bufferCopies = [];
+  const textureCopies = [];
+  return {
+    bufferCopies,
+    textureCopies,
+    copyBufferToBuffer(srcBuffer, srcOffset, dstBuffer, dstOffset, size) {
+      assert.ok(srcOffset + size <= srcBuffer.size);
+      bufferCopies.push({ srcBuffer, srcOffset, dstBuffer, dstOffset, size });
+    },
+    copyBufferToTexture(source, destination, copySize) {
+      const totalBytes = source.bytesPerRow * source.rowsPerImage * copySize.depthOrArrayLayers;
+      assert.ok(source.offset + totalBytes <= source.buffer.size);
+      assert.equal(source.bytesPerRow % 256, 0);
+      textureCopies.push({
+        source: { ...source },
+        destination: { ...destination, origin: { ...destination.origin } },
+        copySize: { ...copySize },
+        totalBytes,
+      });
+    },
+  };
+}
+
+test('W176: selectLargeSlabBucket and constructor option validation for large-slab buckets', () => {
+  const MiB = 1024 * 1024;
+  assert.equal(DEFAULT_LARGE_SLAB_THRESHOLD, 2 * MiB);
+  assert.equal(DEFAULT_MAX_LARGE_SLABS, 12);
+  assert.deepEqual(
+    Array.from(DEFAULT_LARGE_SLAB_BUCKETS),
+    [2 * MiB, 3 * MiB, 4 * MiB, 6 * MiB, 8 * MiB, 12 * MiB, 16 * MiB]
+  );
+
+  // 4K Bink2 YUV plane sizes map cleanly onto 2–16 MiB buckets.
+  assert.equal(selectLargeSlabBucket(2 * MiB), 2 * MiB);
+  assert.equal(selectLargeSlabBucket(2048 * 1080), 3 * MiB); // 4K Cr/Cb 256B-aligned (2.11 MiB)
+  assert.equal(selectLargeSlabBucket(3840 * 1080), 4 * MiB); // 4K NV12 UV (3.96 MiB)
+  assert.equal(selectLargeSlabBucket(5 * MiB), 6 * MiB);
+  assert.equal(selectLargeSlabBucket(3840 * 2160), 8 * MiB); // 4K Y plane (7.91 MiB)
+  assert.equal(selectLargeSlabBucket(Math.ceil(8.3 * MiB)), 12 * MiB); // 8.3 MiB slab
+  assert.equal(selectLargeSlabBucket(15 * MiB), 16 * MiB);
+  assert.equal(selectLargeSlabBucket(20 * MiB + 1), 20 * MiB + 4); // >16 MiB falls back to 4B-aligned exact
+
+  assert.throws(() => selectLargeSlabBucket(0), RangeError);
+  assert.throws(() => selectLargeSlabBucket(-4), RangeError);
+
+  const { device } = createLightweight4kMockDevice();
+  assert.throws(() => new GpuStagingPool({ device, maxLargeSlabs: -1 }), RangeError);
+  assert.throws(() => new GpuStagingPool({ device, maxLargeSlabs: 1.5 }), RangeError);
+  assert.throws(() => new GpuStagingPool({ device, largeSlabMinBytes: 0 }), RangeError);
+  assert.throws(() => new GpuStagingPool({ device, largeSlabBuckets: 'bad' }), TypeError);
+  assert.throws(() => new GpuStagingPool({ device, largeSlabBuckets: [0] }), RangeError);
+  assert.throws(() => new GpuStagingPool({ device, now: 'not-a-fn' }), TypeError);
+});
+
+test('W176: 30 FPS 4K Bink2 YUV plane uploads reuse persistent large slabs with zero steady-state GPUBuffer churn', () => {
+  const MiB = 1024 * 1024;
+  let fakeTimeMs = 0;
+  const { device, createdBuffers } = createLightweight4kMockDevice();
+  const pool = new GpuStagingPool({
+    device,
+    // Default chunkSize = 4 MiB, maxPoolBytes = 64 MiB, framesInFlight = 3, maxLargeSlabs = 12
+    now: () => fakeTimeMs,
+  });
+
+  const encoder = createLightweightEncoder();
+  const dstY = { id: 'bink-y-4k' };
+  const dstCb = { id: 'bink-cb-4k' };
+  const dstCr = { id: 'bink-cr-4k' };
+  const dstUniform = { id: 'frame-meta' };
+
+  // 4K YUV420 planes:
+  //  - Y:  3840x2160 R8 (bytesPerRow = 3840, 256B-aligned -> 8,294,400 B -> 8 MiB bucket)
+  //  - Cb: 1920x1080 R8 (bytesPerRow = 2048 pre-aligned -> 2,211,840 B -> 3 MiB bucket)
+  //  - Cr: 1920x1080 R8 (bytesPerRow = 2048 pre-aligned -> 2,211,840 B -> 3 MiB bucket)
+  const yBytes = new Uint8Array(3840 * 2160);
+  const cbBytes = new Uint8Array(2048 * 1080);
+  const crBytes = new Uint8Array(2048 * 1080);
+  const metaBytes = new Uint8Array(256);
+  const frameVideoBytes = yBytes.byteLength + cbBytes.byteLength + crBytes.byteLength;
+  const frameTotalBytes = frameVideoBytes + metaBytes.byteLength;
+
+  const totalFrames = 30;
+  const frameMs = 1000 / 30;
+
+  for (let frame = 0; frame < totalFrames; frame += 1) {
+    fakeTimeMs = frame * frameMs;
+    pool.beginFrame(frame);
+
+    // Small uniform upload before video planes -> uses standard 4 MiB chunk.
+    const metaUpload = pool.stageBufferUpload(encoder, dstUniform, 0, metaBytes);
+
+    // 4K Y, Cb, Cr texture uploads -> persistent large-slab buckets (8 MiB + 2x 3 MiB).
+    const yUpload = pool.stageTextureUpload(encoder, dstY, yBytes, {
+      width: 3840,
+      height: 2160,
+      bytesPerRow: 3840,
+    });
+    const cbUpload = pool.stageTextureUpload(encoder, dstCb, cbBytes, {
+      width: 1920,
+      height: 1080,
+      bytesPerRow: 2048,
+    });
+    const crUpload = pool.stageTextureUpload(encoder, dstCr, crBytes, {
+      width: 1920,
+      height: 1080,
+      bytesPerRow: 2048,
+    });
+
+    // Small upload after video planes still packs into the preserved standard _currentChunk!
+    const metaTail = pool.stageBufferUpload(encoder, dstUniform, 256, metaBytes);
+    assert.equal(metaTail.buffer, metaUpload.buffer);
+    assert.equal(metaTail.offset, 256);
+
+    assert.equal(yUpload.buffer.size, 8 * MiB);
+    assert.equal(cbUpload.buffer.size, 3 * MiB);
+    assert.equal(crUpload.buffer.size, 3 * MiB);
+
+    fakeTimeMs = (frame + 1) * frameMs;
+    const endStats = pool.endFrame();
+    assert.equal(endStats.bytesUploaded, frameTotalBytes + metaBytes.byteLength);
+
+    if (frame === 2) {
+      // After 3 warmup frames (framesInFlight = 3):
+      // 3 frames * (1 standard 4 MiB chunk + 1x 8 MiB Y + 2x 3 MiB chroma) = 12 buffers total, 54 MiB <= 64 MiB.
+      assert.equal(createdBuffers.length, 12);
+      assert.equal(pool.getStats().largeSlabMisses, 9);
+      assert.equal(pool.getStats().largeSlabHits, 0);
+    }
+  }
+
+  // Frames 3..29 (27 steady-state frames) must create ZERO new GPUBuffers!
+  assert.equal(createdBuffers.length, 12, 'steady-state 30 FPS 4K video must not churn GPUBuffers');
+
+  const stats = pool.getStats();
+  // 30 frames * 3 video planes = 90 large-slab uploads: 9 warmup misses + 81 bucket hits!
+  assert.equal(stats.largeSlabMisses, 9);
+  assert.equal(stats.largeSlabHits, 81);
+  assert.equal(stats.largeSlabReuseRate, 81 / 90);
+  assert.equal(stats.largeSlabEvictions, 0);
+  assert.equal(stats.oversizeAllocations, 30); // Y plane (7.91 MiB > 4 MiB chunkSize) x 30 frames
+
+  // 30 frames * 5 allocations/frame = 150 total allocations:
+  // 12 fresh GPUBuffers created, 138 allocations served from existing/reused buffers!
+  assert.equal(stats.allocationCount, 150);
+  assert.equal(stats.freshAllocations, 12);
+  assert.equal(stats.reusedAllocations, 138);
+  assert.equal(stats.freshAllocations + stats.reusedAllocations, stats.allocationCount);
+  assert.equal(stats.reuseRate, 138 / 150);
+
+  // Pool footprint: 3 frames * (4 MiB std + 8 MiB Y + 3 MiB Cb + 3 MiB Cr) = 54 MiB <= 64 MiB!
+  const expectedPeakPoolBytes = 3 * (4 + 8 + 3 + 3) * MiB;
+  assert.equal(stats.allocatedBytes, expectedPeakPoolBytes);
+  assert.equal(stats.peakAllocationBytes, expectedPeakPoolBytes);
+  assert.equal(stats.peakAllocatedBytes, expectedPeakPoolBytes);
+  assert.equal(stats.peakSingleAllocationBytes, 3840 * 2160);
+  assert.equal(stats.largeSlabBytes, 3 * (8 + 3 + 3) * MiB);
+
+  // Upload bandwidth telemetry across 1.0 second (30 frames @ 30 FPS).
+  const expectedPerFrameUpload = frameTotalBytes + metaBytes.byteLength;
+  assert.equal(stats.totalBytesUploaded, expectedPerFrameUpload * totalFrames);
+  assert.equal(stats.bytesUploaded, stats.totalBytesUploaded);
+  assert.equal(stats.framesCompleted, totalFrames);
+  assert.equal(stats.lastFrameBytesUploaded, expectedPerFrameUpload);
+  assert.equal(stats.peakFrameBytesUploaded, expectedPerFrameUpload);
+  assert.equal(stats.avgBytesPerFrame, expectedPerFrameUpload);
+  assert.ok(Math.abs(stats.uploadBytesPerSec - stats.totalBytesUploaded) < 1);
+  assert.ok(stats.uploadMiBPerSec > 360 && stats.uploadMiBPerSec < 370);
+
+  // Clean teardown destroys all 12 buffers once and zeroes live large-slab bytes.
+  pool.destroy();
+  for (const buf of createdBuffers) {
+    assert.equal(buf.destroyCount, 1);
+  }
+  const destroyed = pool.getStats();
+  assert.equal(destroyed.allocatedBytes, 0);
+  assert.equal(destroyed.largeSlabBytes, 0);
+  assert.equal(destroyed.idleLargeSlabs, 0);
+  assert.equal(destroyed.peakAllocationBytes, expectedPeakPoolBytes);
+  assert.equal(destroyed.totalBytesUploaded, expectedPerFrameUpload * totalFrames);
+});
+
+test('W176: 4K video large slabs (8.3 MiB Y + 2x 2.1 MiB chroma) reuse cleanly in mapped mode with GPU work fence', async () => {
+  const MiB = 1024 * 1024;
+  const { device, createdBuffers, queueWrites, deferredFences } = createLightweight4kMockDevice({
+    enableWorkDoneFence: true,
+    allocateBacking: true,
+  });
+
+  const pool = new GpuStagingPool({
+    device,
+    chunkSize: 4 * MiB,
+    maxPoolBytes: 64 * MiB,
+    framesInFlight: 3,
+    mode: STAGING_MODE.MAPPED,
+  });
+
+  const encoder = createLightweightEncoder();
+  const dstY = { id: 'mapped-y' };
+  const dstU = { id: 'mapped-u' };
+  const dstV = { id: 'mapped-v' };
+
+  // 8.3 MiB (~8,703,232 B, 256B-aligned row width 4096 x 2124 = 8,699,904 B -> 12 MiB bucket)
+  // + 2x 2.1 MiB (2048 x 1080 = 2,211,840 B -> 3 MiB bucket).
+  const ySrc = new Uint8Array(4096 * 2124);
+  const uSrc = new Uint8Array(2048 * 1080);
+  const vSrc = new Uint8Array(2048 * 1080);
+  ySrc[0] = 0x41;
+  ySrc[ySrc.length - 1] = 0x42;
+  uSrc[0] = 0x51;
+  vSrc[0] = 0x61;
+
+  pool.beginFrame(0);
+  const y0 = pool.stageTextureUpload(encoder, dstY, ySrc, { width: 4096, height: 2124, bytesPerRow: 4096 });
+  const u0 = pool.stageTextureUpload(encoder, dstU, uSrc, { width: 1920, height: 1080, bytesPerRow: 2048 });
+  const v0 = pool.stageTextureUpload(encoder, dstV, vSrc, { width: 1920, height: 1080, bytesPerRow: 2048 });
+
+  assert.equal(queueWrites.length, 0, 'mapped mode must never call queue.writeBuffer');
+  assert.equal(createdBuffers.length, 3);
+  assert.equal(y0.buffer.size, 12 * MiB);
+  assert.equal(u0.buffer.size, 3 * MiB);
+  assert.equal(v0.buffer.size, 3 * MiB);
+  assert.equal(y0.buffer._data[0], 0x41);
+  assert.equal(y0.buffer._data[ySrc.length - 1], 0x42);
+  assert.equal(u0.buffer._data[0], 0x51);
+  assert.equal(v0.buffer._data[0], 0x61);
+  assert.equal(pool.getStats().activeLargeSlabs, 3);
+
+  pool.endFrame();
+  assert.equal(pool.getStats().activeLargeSlabs, 0);
+  assert.equal(pool.getStats().inFlightLargeSlabs, 3);
+  for (const buf of createdBuffers) {
+    assert.equal(buf.unmapCount, 1);
+    assert.equal(buf._mapped, false);
+  }
+
+  // Resolve Frame 0 GPU fence early -> triggers mapAsync on all 3 slabs.
+  deferredFences[0].resolve();
+  await deferredFences[0].promise;
+  await pool.waitForPendingMaps();
+
+  // Frame 1 immediately reuses all 3 mapped large slabs with ZERO new GPUBuffers!
+  pool.beginFrame(1);
+  assert.equal(pool.getStats().idleLargeSlabs, 3);
+  assert.deepEqual(pool.getStats().largeSlabBucketCounts, {
+    [12 * MiB]: 1,
+    [3 * MiB]: 2,
+  });
+
+  ySrc[0] = 0x77;
+  const y1 = pool.stageTextureUpload(encoder, dstY, ySrc, { width: 4096, height: 2124, bytesPerRow: 4096 });
+  const u1 = pool.stageTextureUpload(encoder, dstU, uSrc, { width: 1920, height: 1080, bytesPerRow: 2048 });
+  const v1 = pool.stageTextureUpload(encoder, dstV, vSrc, { width: 1920, height: 1080, bytesPerRow: 2048 });
+
+  assert.equal(createdBuffers.length, 3, 'mapped mode must reuse remapped large slabs');
+  assert.equal(y1.buffer, y0.buffer);
+  assert.equal(y1.buffer._data[0], 0x77);
+  assert.ok([u0.buffer, v0.buffer].includes(u1.buffer));
+  assert.ok([u0.buffer, v0.buffer].includes(v1.buffer));
+  assert.notEqual(u1.buffer, v1.buffer);
+
+  const stats = pool.getStats();
+  assert.equal(stats.largeSlabMisses, 3);
+  assert.equal(stats.largeSlabHits, 3);
+  assert.equal(stats.freshAllocations, 3);
+  assert.equal(stats.reusedAllocations, 3);
+
+  pool.endFrame();
+  pool.destroy();
+  for (const buf of createdBuffers) {
+    assert.equal(buf.destroyCount, 1);
+  }
+});
+
+test('W176: maxLargeSlabs bounded idle cap and maxPoolBytes eviction prevent unbounded large-slab growth', () => {
+  const MiB = 1024 * 1024;
+  const { device, createdBuffers } = createLightweight4kMockDevice();
+
+  // 1. Bounded idle cap: maxLargeSlabs = 2 with 4 slabs allocated in Frame 0.
+  const pool = new GpuStagingPool({
+    device,
+    chunkSize: 4 * MiB,
+    maxPoolBytes: 64 * MiB,
+    framesInFlight: 2,
+    maxLargeSlabs: 2,
+  });
+
+  pool.beginFrame(0);
+  const s1 = pool.allocate(2 * MiB, 256); // 2 MiB bucket
+  const s2 = pool.allocate(3 * MiB, 256); // 3 MiB bucket
+  const s3 = pool.allocate(8 * MiB, 256); // 8 MiB bucket
+  const s4 = pool.allocate(16 * MiB, 256); // 16 MiB bucket
+  assert.equal(s1.isLargeSlab, true);
+  assert.equal(s1.slabBucketSize, 2 * MiB);
+  assert.equal(s4.slabBucketSize, 16 * MiB);
+  assert.equal(pool.getStats().activeLargeSlabs, 4);
+  assert.equal(pool.getStats().largeSlabBytes, (2 + 3 + 8 + 16) * MiB);
+  pool.endFrame();
+
+  // Frame 2 recycles all 4 slabs -> cap = 2 must immediately evict the 2 largest (16 MiB & 8 MiB)!
+  const begin2 = pool.beginFrame(2);
+  assert.equal(begin2.reclaimedChunks, 2);
+  assert.equal(begin2.reclaimedBytes, (16 + 8) * MiB);
+  assert.equal(createdBuffers[3].destroyCount, 1, 'largest idle slab (16 MiB) evicted first on tie');
+  assert.equal(createdBuffers[2].destroyCount, 1, 'second largest idle slab (8 MiB) evicted next');
+  assert.equal(createdBuffers[0].destroyCount, 0);
+  assert.equal(createdBuffers[1].destroyCount, 0);
+
+  const capStats = pool.getStats();
+  assert.equal(capStats.idleLargeSlabs, 2);
+  assert.equal(capStats.largeSlabEvictions, 2);
+  assert.equal(capStats.largeSlabBytes, (2 + 3) * MiB);
+  assert.equal(capStats.allocatedBytes, (2 + 3) * MiB);
+  assert.equal(capStats.peakAllocationBytes, (2 + 3 + 8 + 16) * MiB);
+  pool.endFrame();
+  pool.destroy();
+
+  // 2. maxLargeSlabs = 0 retains zero idle large slabs upon recycle.
+  const zeroCapMock = createLightweight4kMockDevice();
+  const zeroCapPool = new GpuStagingPool({
+    device: zeroCapMock.device,
+    chunkSize: 4 * MiB,
+    maxPoolBytes: 32 * MiB,
+    framesInFlight: 1,
+    maxLargeSlabs: 0,
+  });
+  zeroCapPool.beginFrame(0);
+  zeroCapPool.allocate(8 * MiB, 256);
+  zeroCapPool.endFrame();
+  zeroCapPool.beginFrame(1);
+  assert.equal(zeroCapPool.getStats().idleLargeSlabs, 0);
+  assert.equal(zeroCapPool.getStats().largeSlabEvictions, 1);
+  assert.equal(zeroCapMock.createdBuffers[0].destroyCount, 1);
+  zeroCapPool.destroy();
+
+  // 3. Budget eviction frees idle large slabs to stay under maxPoolBytes, and failed
+  //    allocations throw RangeError without inflating telemetry.
+  const tightMock = createLightweight4kMockDevice();
+  const tightPool = new GpuStagingPool({
+    device: tightMock.device,
+    chunkSize: 4 * MiB,
+    maxPoolBytes: 18 * MiB,
+    framesInFlight: 1,
+    maxLargeSlabs: 8,
+  });
+
+  tightPool.beginFrame(0);
+  tightPool.allocate(1024, 4); // 4 MiB standard chunk
+  tightPool.allocate(8 * MiB, 256); // 8 MiB large slab (total 12 MiB)
+  tightPool.endFrame();
+
+  // Frame 1: both buffers idle. Allocating a 12 MiB slab needs 12 + 12 = 24 > 18 MiB ->
+  // must evict the idle 8 MiB large slab FIRST (keeping the 4 MiB standard chunk warm: 4 + 12 = 16 <= 18 MiB)!
+  tightPool.beginFrame(1);
+  const slab12 = tightPool.allocate(10 * MiB, 256);
+  assert.equal(slab12.buffer.size, 12 * MiB);
+  assert.equal(tightMock.createdBuffers[1].destroyCount, 1, 'idle large slab evicted before standard chunk');
+  assert.equal(tightMock.createdBuffers[0].destroyCount, 0, 'warm standard chunk preserved');
+  assert.equal(tightPool.getStats().allocatedBytes, 16 * MiB);
+  assert.equal(tightPool.getStats().largeSlabEvictions, 1);
+
+  // Over-budget 8 MiB request while 12 MiB slab is active (only 4 MiB standard idle -> 12 + 8 = 20 > 18 MiB) throws.
+  const beforeFail = tightPool.getStats();
+  assert.throws(() => tightPool.allocate(8 * MiB, 256), RangeError);
+  const afterFail = tightPool.getStats();
+  assert.equal(afterFail.largeSlabMisses, beforeFail.largeSlabMisses);
+  assert.equal(afterFail.freshAllocations, beforeFail.freshAllocations);
+  assert.equal(afterFail.peakAllocationBytes, beforeFail.peakAllocationBytes);
+  tightPool.destroy();
+
+  // 4. Tight maxPoolBytes clamping: 8.3 MiB request inside a 10 MiB pool clamps bucket to exact aligned size
+  //    instead of spuriously failing on 12 MiB bucket rounding, and reuses that clamped bucket on next frame!
+  const clampMock = createLightweight4kMockDevice();
+  const clampPool = new GpuStagingPool({
+    device: clampMock.device,
+    chunkSize: 4 * MiB,
+    maxPoolBytes: 10 * MiB,
+    framesInFlight: 1,
+  });
+  const reqBytes = Math.ceil(8.3 * MiB / 4) * 4;
+  clampPool.beginFrame(0);
+  const c0 = clampPool.allocate(reqBytes, 256);
+  assert.equal(c0.buffer.size, reqBytes);
+  assert.equal(c0.slabBucketSize, reqBytes);
+  clampPool.endFrame();
+
+  clampPool.beginFrame(1);
+  const c1 = clampPool.allocate(reqBytes, 256);
+  assert.equal(c1.buffer, c0.buffer);
+  assert.equal(clampMock.createdBuffers.length, 1);
+  assert.equal(clampPool.getStats().largeSlabHits, 1);
+  clampPool.destroy();
+});
+
+test('W176: bucket isolation, explicit release, >16 MiB fallback, and idleEvictFrames post-cutscene reclamation', () => {
+  const MiB = 1024 * 1024;
+  const { device, createdBuffers } = createLightweight4kMockDevice();
+  const pool = new GpuStagingPool({
+    device,
+    chunkSize: 4 * MiB,
+    maxPoolBytes: 64 * MiB,
+    framesInFlight: 2,
+    minWarmChunks: 1,
+    idleEvictFrames: 5,
+  });
+
+  // Frame 0: allocate a standard chunk + 8 MiB Y slab, then explicitly release the Y slab.
+  pool.beginFrame(0);
+  pool.allocate(1024, 4); // chunk 0: 4 MiB standard
+  const ySlice = pool.allocate(3840 * 2160, 256); // chunk 1: 8 MiB large slab
+  assert.equal(pool.release(ySlice), true);
+  assert.equal(pool.release(ySlice), false); // double-release guarded
+  assert.equal(pool.getStats().inFlightLargeSlabs, 1);
+  pool.endFrame();
+
+  // Frame 2: 8 MiB Y slab is idle. Requesting a 2.1 MiB chroma slab must NOT steal the 8 MiB Y bucket!
+  pool.beginFrame(2);
+  const cbSlice = pool.allocate(2048 * 1080, 256); // chunk 2: fresh 3 MiB bucket
+  assert.equal(cbSlice.buffer.size, 3 * MiB);
+  assert.notEqual(cbSlice.buffer, ySlice.buffer);
+
+  // Immediately requesting Y plane hits the preserved 8 MiB bucket!
+  const yReuse = pool.allocate(3840 * 2160, 256);
+  assert.equal(yReuse.buffer, ySlice.buffer);
+  assert.equal(pool.getStats().largeSlabHits, 1);
+
+  // >16 MiB slab (e.g., 20 MiB) allocates exact aligned size and reuses on future frames.
+  const mega = pool.allocate(20 * MiB, 256);
+  assert.equal(mega.buffer.size, 20 * MiB);
+  assert.equal(mega.isLargeSlab, true);
+  pool.endFrame();
+
+  // Frame 4: reuse the 20 MiB slab.
+  pool.beginFrame(4);
+  const megaReuse = pool.allocate(20 * MiB, 256);
+  assert.equal(megaReuse.buffer, mega.buffer);
+  assert.equal(pool.getStats().largeSlabHits, 2);
+  pool.endFrame();
+
+  // Cutscene stops! Advance to frame 10 (>= idleEvictFrames = 5 past last usage at frames 0, 2, 4):
+  // all idle large slabs (20 MiB, 8 MiB, 3 MiB) are reclaimed while 1 warm standard chunk stays alive!
+  const begin10 = pool.beginFrame(10);
+  assert.equal(begin10.reclaimedChunks, 3);
+  assert.equal(begin10.reclaimedBytes, (20 + 8 + 3) * MiB);
+  assert.equal(createdBuffers[0].destroyCount, 0, 'minWarmChunks standard chunk remains warm');
+  assert.equal(createdBuffers[1].destroyCount, 1, 'stale 8 MiB slab reclaimed');
+  assert.equal(createdBuffers[2].destroyCount, 1, 'stale 3 MiB slab reclaimed');
+  assert.equal(createdBuffers[3].destroyCount, 1, 'stale 20 MiB slab reclaimed');
+
+  const afterCutscene = pool.getStats();
+  assert.equal(afterCutscene.idleLargeSlabs, 0);
+  assert.equal(afterCutscene.largeSlabBytes, 0);
+  assert.equal(afterCutscene.largeSlabEvictions, 3);
+  assert.equal(afterCutscene.allocatedBytes, 4 * MiB);
+  assert.equal(afterCutscene.recycledChunks, 1);
+
+  pool.destroy();
 });
 

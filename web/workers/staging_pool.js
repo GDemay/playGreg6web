@@ -11,6 +11,17 @@
   const DEFAULT_FRAMES_IN_FLIGHT = 3;
   const DEFAULT_MIN_WARM_CHUNKS = 1;
   const DEFAULT_IDLE_EVICT_FRAMES = 0;
+  const DEFAULT_LARGE_SLAB_THRESHOLD = 2 * 1024 * 1024; // 2 MiB
+  const DEFAULT_MAX_LARGE_SLABS = 12;
+  const DEFAULT_LARGE_SLAB_BUCKETS = Object.freeze([
+    2 * 1024 * 1024, // 2 MiB
+    3 * 1024 * 1024, // 3 MiB (fits 4K 1920x1080 256B-aligned chroma = 2.11 MiB)
+    4 * 1024 * 1024, // 4 MiB (fits 4K NV12 UV = 3.96 MiB)
+    6 * 1024 * 1024, // 6 MiB
+    8 * 1024 * 1024, // 8 MiB (fits 4K 3840x2160 Y plane = 7.91 MiB)
+    12 * 1024 * 1024, // 12 MiB (fits 8.3–12 MiB video / texture slabs)
+    16 * 1024 * 1024, // 16 MiB
+  ]);
   const WEBGPU_BUFFER_COPY_ALIGNMENT = 4;
   const WEBGPU_BYTES_PER_ROW_ALIGNMENT = 256;
 
@@ -84,6 +95,54 @@
       return WEBGPU_BUFFER_COPY_ALIGNMENT;
     }
     return alignUp(size, WEBGPU_BUFFER_COPY_ALIGNMENT);
+  }
+
+  function normalizeLargeSlabBuckets(buckets) {
+    if (!Array.isArray(buckets)) {
+      throw new TypeError('largeSlabBuckets must be an array of positive integers');
+    }
+    const seen = new Set();
+    const normalized = [];
+    for (let i = 0; i < buckets.length; i += 1) {
+      assertPositiveInteger(buckets[i], `largeSlabBuckets[${i}]`);
+      const aligned = alignBufferSize(buckets[i]);
+      if (!seen.has(aligned)) {
+        seen.add(aligned);
+        normalized.push(aligned);
+      }
+    }
+    normalized.sort((a, b) => a - b);
+    return Object.freeze(normalized);
+  }
+
+  /**
+   * Select the canonical large-slab bucket byte size for a requested allocation.
+   * Returns the smallest bucket `>= alignBufferSize(byteSize)`, or `alignBufferSize(byteSize)`
+   * if the request exceeds the largest configured bucket.
+   *
+   * @param {number} byteSize
+   * @param {readonly number[]} [buckets=DEFAULT_LARGE_SLAB_BUCKETS]
+   * @returns {number}
+   */
+  function selectLargeSlabBucket(byteSize, buckets = DEFAULT_LARGE_SLAB_BUCKETS) {
+    assertPositiveInteger(byteSize, 'byteSize');
+    const aligned = alignBufferSize(byteSize);
+    for (let i = 0; i < buckets.length; i += 1) {
+      if (buckets[i] >= aligned) {
+        return buckets[i];
+      }
+    }
+    return aligned;
+  }
+
+  function defaultNowMs() {
+    if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
+      return performance.now();
+    }
+    if (typeof Date !== 'undefined' && typeof Date.now === 'function') {
+      return Date.now();
+    }
+    return 0;
   }
 
   function lcmWithBufferAlignment(alignment) {
@@ -213,6 +272,10 @@
         mode = STAGING_MODE.WRITE_BUFFER,
         minWarmChunks = DEFAULT_MIN_WARM_CHUNKS,
         idleEvictFrames = DEFAULT_IDLE_EVICT_FRAMES,
+        maxLargeSlabs = DEFAULT_MAX_LARGE_SLABS,
+        largeSlabMinBytes,
+        largeSlabBuckets,
+        now,
       } = options;
 
       if (!device || typeof device.createBuffer !== 'function') {
@@ -222,11 +285,31 @@
       assertPositiveInteger(framesInFlight, 'framesInFlight');
       assertNonNegativeInteger(minWarmChunks, 'minWarmChunks');
       assertNonNegativeInteger(idleEvictFrames, 'idleEvictFrames');
+      assertNonNegativeInteger(maxLargeSlabs, 'maxLargeSlabs');
 
       if (mode !== STAGING_MODE.WRITE_BUFFER && mode !== STAGING_MODE.MAPPED) {
         throw new RangeError(
           `Unsupported staging mode: ${JSON.stringify(mode)} (expected 'writeBuffer' or 'mapped')`
         );
+      }
+
+      if (now !== undefined && typeof now !== 'function') {
+        throw new TypeError('now must be a function returning a timestamp in milliseconds');
+      }
+
+      const resolvedLargeSlabBuckets =
+        largeSlabBuckets !== undefined
+          ? normalizeLargeSlabBuckets(largeSlabBuckets)
+          : DEFAULT_LARGE_SLAB_BUCKETS;
+
+      let resolvedLargeSlabMinBytes;
+      if (largeSlabMinBytes !== undefined) {
+        assertPositiveInteger(largeSlabMinBytes, 'largeSlabMinBytes');
+        resolvedLargeSlabMinBytes = largeSlabMinBytes;
+      } else if (largeSlabBuckets !== undefined && resolvedLargeSlabBuckets.length > 0) {
+        resolvedLargeSlabMinBytes = resolvedLargeSlabBuckets[0];
+      } else {
+        resolvedLargeSlabMinBytes = DEFAULT_LARGE_SLAB_THRESHOLD;
       }
 
       let resolvedChunkSize;
@@ -252,6 +335,10 @@
       this.mode = mode;
       this.minWarmChunks = minWarmChunks;
       this.idleEvictFrames = idleEvictFrames;
+      this.maxLargeSlabs = maxLargeSlabs;
+      this.largeSlabMinBytes = resolvedLargeSlabMinBytes;
+      this.largeSlabBuckets = resolvedLargeSlabBuckets;
+      this._now = now || defaultNowMs;
 
       this._destroyed = false;
       this._currentFrame = -1;
@@ -263,6 +350,8 @@
       this._chunkByBuffer = new Map();
       this._activeChunks = [];
       this._recycledChunks = [];
+      this._largeSlabBuckets = new Map();
+      this._idleLargeSlabCount = 0;
       this._inFlightChunks = [];
       this._currentChunk = null;
       this._pendingMapPromises = new Set();
@@ -271,6 +360,8 @@
       this._totalChunksAllocated = 0;
       this._allocatedBytes = 0;
       this._peakAllocatedBytes = 0;
+      this._peakSingleAllocationBytes = 0;
+      this._largeSlabBytes = 0;
       this._reclaimedChunks = 0;
       this._reclaimedBytes = 0;
       this._oversizeAllocations = 0;
@@ -278,11 +369,21 @@
       this._allocationCount = 0;
       this._bufferReuseHits = 0;
       this._bufferReuseMisses = 0;
+      this._largeSlabHits = 0;
+      this._largeSlabMisses = 0;
+      this._largeSlabEvictions = 0;
+      this._reusedAllocations = 0;
+      this._freshAllocations = 0;
       this._alignPadCount = initialAlignPads;
       this._sabCopyCount = 0;
       this._doubleReleaseIgnored = 0;
 
-      // Per-frame telemetry (reset on beginFrame / endFrame).
+      // Upload throughput & per-frame telemetry.
+      this._framesCompleted = 0;
+      this._lastFrameBytesUploaded = 0;
+      this._peakFrameBytesUploaded = 0;
+      this._firstActivityTimeMs = null;
+      this._lastActivityTimeMs = null;
       this._frameAllocations = 0;
       this._frameBytesAllocated = 0;
       this._frameBytesUploaded = 0;
@@ -304,21 +405,118 @@
       }
     }
 
-    _createChunk(byteSize, oversized) {
+    _recordActivityTime() {
+      const t = this._now();
+      if (typeof t === 'number' && Number.isFinite(t)) {
+        if (this._firstActivityTimeMs === null) {
+          this._firstActivityTimeMs = t;
+        }
+        if (this._lastActivityTimeMs === null || t >= this._lastActivityTimeMs) {
+          this._lastActivityTimeMs = t;
+        }
+      }
+    }
+
+    _getRecycledCount() {
+      return this._recycledChunks.length + this._idleLargeSlabCount;
+    }
+
+    _resolveLargeSlabBucket(alignedSize) {
+      if (this.largeSlabBuckets.length === 0 || alignedSize < this.largeSlabMinBytes) {
+        return 0;
+      }
+      let bucketSize = selectLargeSlabBucket(alignedSize, this.largeSlabBuckets);
+      if (bucketSize > this.maxPoolBytes && alignedSize <= this.maxPoolBytes) {
+        bucketSize = alignedSize;
+      }
+      return bucketSize;
+    }
+
+    _putIntoRecycled(chunk) {
+      chunk.cursor = 0;
+      chunk.retiredAtFrame = -1;
+      chunk.gpuDone = false;
+      chunk.readyToRecycle = false;
+      chunk.state = 'recycled';
+      if (chunk.isLargeSlab) {
+        let bucket = this._largeSlabBuckets.get(chunk.slabBucketSize);
+        if (!bucket) {
+          bucket = [];
+          this._largeSlabBuckets.set(chunk.slabBucketSize, bucket);
+        }
+        bucket.push(chunk);
+        this._idleLargeSlabCount += 1;
+      } else {
+        this._recycledChunks.push(chunk);
+      }
+    }
+
+    _enforceLargeSlabCap() {
+      if (this._idleLargeSlabCount <= this.maxLargeSlabs) {
+        return { reclaimedChunks: 0, reclaimedBytes: 0 };
+      }
+
+      const idleSlabs = [];
+      for (const bucket of this._largeSlabBuckets.values()) {
+        for (let i = 0; i < bucket.length; i += 1) {
+          const slab = bucket[i];
+          if (slab && !slab.destroyed && slab.state === 'recycled') {
+            idleSlabs.push(slab);
+          }
+        }
+      }
+
+      // Evict oldest-used idle large slabs first (largest first on tie) to keep
+      // hot video/texture buckets warm within the bounded maxLargeSlabs cap.
+      idleSlabs.sort((a, b) => {
+        if (a.lastUsedFrame !== b.lastUsedFrame) {
+          return a.lastUsedFrame - b.lastUsedFrame;
+        }
+        if (a.size !== b.size) {
+          return b.size - a.size;
+        }
+        return a.id - b.id;
+      });
+
+      let reclaimedChunks = 0;
+      let reclaimedBytes = 0;
+      for (let i = 0; i < idleSlabs.length && this._idleLargeSlabCount > this.maxLargeSlabs; i += 1) {
+        const slab = idleSlabs[i];
+        if (slab.destroyed || slab.state !== 'recycled') {
+          continue;
+        }
+        const byteSize = slab.size;
+        this._destroyChunk(slab);
+        reclaimedChunks += 1;
+        reclaimedBytes += byteSize;
+        this._largeSlabEvictions += 1;
+      }
+
+      if (reclaimedChunks > 0) {
+        this._reclaimedChunks += reclaimedChunks;
+        this._reclaimedBytes += reclaimedBytes;
+      }
+
+      return { reclaimedChunks, reclaimedBytes };
+    }
+
+    _createChunk(byteSize, oversized, slabBucketSize = 0) {
       const allocSize = alignBufferSize(byteSize);
       this._ensureBudget(allocSize, byteSize);
 
       const id = this._nextChunkId++;
+      const isLargeSlab = slabBucketSize > 0;
       const isMappedMode = this.mode === STAGING_MODE.MAPPED;
+      const label = isLargeSlab ? `playgta6-staging-slab-${id}` : `playgta6-staging-${id}`;
       const descriptor = isMappedMode
         ? {
-            label: `playgta6-staging-${id}`,
+            label,
             size: allocSize,
             usage: BUFFER_USAGE.MAP_WRITE | BUFFER_USAGE.COPY_SRC,
             mappedAtCreation: true,
           }
         : {
-            label: `playgta6-staging-${id}`,
+            label,
             size: allocSize,
             usage: BUFFER_USAGE.COPY_SRC | BUFFER_USAGE.COPY_DST,
           };
@@ -345,6 +543,8 @@
         size: allocSize,
         cursor: 0,
         oversized,
+        isLargeSlab,
+        slabBucketSize,
         state: 'active',
         lastUsedFrame: this._currentFrame < 0 ? 0 : this._currentFrame,
         retiredAtFrame: -1,
@@ -360,6 +560,9 @@
       this._chunkByBuffer.set(buffer, chunk);
       this._totalChunksAllocated += 1;
       this._allocatedBytes += allocSize;
+      if (isLargeSlab) {
+        this._largeSlabBytes += allocSize;
+      }
       if (this._allocatedBytes > this._peakAllocatedBytes) {
         this._peakAllocatedBytes = this._allocatedBytes;
       }
@@ -391,6 +594,20 @@
       if (recycledIdx !== -1) {
         this._recycledChunks.splice(recycledIdx, 1);
       }
+      if (chunk.isLargeSlab) {
+        const bucket = this._largeSlabBuckets.get(chunk.slabBucketSize);
+        if (bucket) {
+          const bucketIdx = bucket.indexOf(chunk);
+          if (bucketIdx !== -1) {
+            bucket.splice(bucketIdx, 1);
+            this._idleLargeSlabCount = Math.max(0, this._idleLargeSlabCount - 1);
+            if (bucket.length === 0) {
+              this._largeSlabBuckets.delete(chunk.slabBucketSize);
+            }
+          }
+        }
+        this._largeSlabBytes = Math.max(0, this._largeSlabBytes - chunk.size);
+      }
       const inFlightIdx = this._inFlightChunks.indexOf(chunk);
       if (inFlightIdx !== -1) {
         this._inFlightChunks.splice(inFlightIdx, 1);
@@ -401,9 +618,9 @@
       }
     }
 
-    _pickEvictionIndex() {
-      // Prefer evicting idle oversized burst chunks (largest first) to keep
-      // steady-state standard chunks warm in the recycled pool.
+    _pickBudgetEvictionCandidate() {
+      // 1. Prefer evicting idle non-bucketed oversized burst chunks (largest first)
+      //    so steady-state standard chunks stay warm.
       let oversizedIdx = -1;
       let oversizedMax = -1;
       for (let i = 0; i < this._recycledChunks.length; i += 1) {
@@ -413,10 +630,39 @@
           oversizedMax = candidate.size;
         }
       }
-      return oversizedIdx !== -1 ? oversizedIdx : 0;
+      if (oversizedIdx !== -1) {
+        return this._recycledChunks[oversizedIdx];
+      }
+
+      // 2. Next evict idle large slabs (oldest used first, then largest first).
+      let bestSlab = null;
+      for (const bucket of this._largeSlabBuckets.values()) {
+        for (let i = 0; i < bucket.length; i += 1) {
+          const slab = bucket[i];
+          if (!slab || slab.destroyed || slab.state !== 'recycled') {
+            continue;
+          }
+          if (
+            !bestSlab ||
+            slab.lastUsedFrame < bestSlab.lastUsedFrame ||
+            (slab.lastUsedFrame === bestSlab.lastUsedFrame && slab.size > bestSlab.size) ||
+            (slab.lastUsedFrame === bestSlab.lastUsedFrame &&
+              slab.size === bestSlab.size &&
+              slab.id < bestSlab.id)
+          ) {
+            bestSlab = slab;
+          }
+        }
+      }
+      if (bestSlab) {
+        return bestSlab;
+      }
+
+      // 3. Finally evict the oldest idle standard chunk.
+      return this._recycledChunks.length > 0 ? this._recycledChunks[0] : null;
     }
 
-    _reclaimCompletedInFlight() {
+    _reclaimCompletedInFlight(enforceCap = true) {
       if (this._destroyed || this._inFlightChunks.length === 0) {
         return 0;
       }
@@ -432,23 +678,13 @@
             chunk.readyToRecycle = true;
             this._beginRemap(chunk);
             if (chunk.isMapped) {
-              chunk.cursor = 0;
-              chunk.retiredAtFrame = -1;
-              chunk.gpuDone = false;
-              chunk.readyToRecycle = false;
-              chunk.state = 'recycled';
-              this._recycledChunks.push(chunk);
+              this._putIntoRecycled(chunk);
               reclaimed += 1;
             } else {
               stillInFlight.push(chunk);
             }
           } else {
-            chunk.cursor = 0;
-            chunk.retiredAtFrame = -1;
-            chunk.gpuDone = false;
-            chunk.readyToRecycle = false;
-            chunk.state = 'recycled';
-            this._recycledChunks.push(chunk);
+            this._putIntoRecycled(chunk);
             reclaimed += 1;
           }
         } else {
@@ -456,6 +692,9 @@
         }
       }
       this._inFlightChunks = stillInFlight;
+      if (enforceCap && reclaimed > 0) {
+        this._enforceLargeSlabCap();
+      }
       return reclaimed;
     }
 
@@ -467,7 +706,7 @@
      */
     recycleCompleted() {
       this._assertNotDestroyed();
-      const recycled = this._reclaimCompletedInFlight();
+      const recycled = this._reclaimCompletedInFlight(true);
       if (this.idleEvictFrames > 0) {
         this.reclaimIdleChunks(this.idleEvictFrames);
       }
@@ -479,8 +718,8 @@
      * whose `currentFrame - chunk.lastUsedFrame >= maxIdleFrames`, while keeping
      * at least `minWarmChunks` warm chunks in the recycled pool.
      *
-     * Prefers evicting oversized burst chunks (largest first) and oldest chunks
-     * first so steady-state standard chunks stay warm.
+     * Prefers evicting oversized burst chunks / large slabs (largest first) and
+     * oldest chunks first so steady-state standard chunks stay warm.
      *
      * @param {number} [maxIdleFrames]
      * @returns {{ reclaimedChunks: number, reclaimedBytes: number }}
@@ -499,7 +738,7 @@
         threshold = maxIdleFrames;
       }
 
-      if (this._recycledChunks.length <= this.minWarmChunks) {
+      if (this._getRecycledCount() <= this.minWarmChunks) {
         return { reclaimedChunks: 0, reclaimedBytes: 0 };
       }
 
@@ -516,16 +755,31 @@
           candidates.push(chunk);
         }
       }
+      for (const bucket of this._largeSlabBuckets.values()) {
+        for (let i = 0; i < bucket.length; i += 1) {
+          const chunk = bucket[i];
+          if (
+            chunk &&
+            !chunk.destroyed &&
+            chunk.state === 'recycled' &&
+            currentFrame - chunk.lastUsedFrame >= threshold
+          ) {
+            candidates.push(chunk);
+          }
+        }
+      }
 
       if (candidates.length === 0) {
         return { reclaimedChunks: 0, reclaimedBytes: 0 };
       }
 
       candidates.sort((a, b) => {
-        if (a.oversized !== b.oversized) {
-          return a.oversized ? -1 : 1;
+        const aLarge = a.oversized || a.isLargeSlab;
+        const bLarge = b.oversized || b.isLargeSlab;
+        if (aLarge !== bLarge) {
+          return aLarge ? -1 : 1;
         }
-        if (a.oversized && a.size !== b.size) {
+        if (aLarge && a.size !== b.size) {
           return b.size - a.size;
         }
         if (a.lastUsedFrame !== b.lastUsedFrame) {
@@ -537,7 +791,7 @@
       let reclaimedChunks = 0;
       let reclaimedBytes = 0;
       for (let i = 0; i < candidates.length; i += 1) {
-        if (this._recycledChunks.length <= this.minWarmChunks) {
+        if (this._getRecycledCount() <= this.minWarmChunks) {
           break;
         }
         const chunk = candidates[i];
@@ -545,7 +799,11 @@
           continue;
         }
         const byteSize = chunk.size;
+        const wasLargeSlab = chunk.isLargeSlab;
         this._destroyChunk(chunk);
+        if (wasLargeSlab) {
+          this._largeSlabEvictions += 1;
+        }
         reclaimedChunks += 1;
         reclaimedBytes += byteSize;
       }
@@ -564,22 +822,30 @@
       }
 
       // First reclaim any GPU-completed in-flight chunks so burst eviction can reuse/free them.
-      this._reclaimCompletedInFlight();
+      this._reclaimCompletedInFlight(false);
 
-      // Check whether evicting idle recycled chunks can make room for this allocation.
+      // Check whether evicting idle recycled chunks / idle large slabs can make room.
       let reclaimable = 0;
       for (let i = 0; i < this._recycledChunks.length; i += 1) {
         reclaimable += this._recycledChunks[i].size;
       }
+      for (const bucket of this._largeSlabBuckets.values()) {
+        for (let i = 0; i < bucket.length; i += 1) {
+          reclaimable += bucket[i].size;
+        }
+      }
 
       if (this._allocatedBytes - reclaimable + allocSize <= this.maxPoolBytes) {
-        while (
-          this._recycledChunks.length > 0 &&
-          this._allocatedBytes + allocSize > this.maxPoolBytes
-        ) {
-          const evictIdx = this._pickEvictionIndex();
-          const [evicted] = this._recycledChunks.splice(evictIdx, 1);
+        while (this._allocatedBytes + allocSize > this.maxPoolBytes) {
+          const evicted = this._pickBudgetEvictionCandidate();
+          if (!evicted) {
+            break;
+          }
+          const wasLargeSlab = evicted.isLargeSlab;
           this._destroyChunk(evicted);
+          if (wasLargeSlab) {
+            this._largeSlabEvictions += 1;
+          }
         }
         return;
       }
@@ -589,6 +855,52 @@
           `(requested ${requestedSize} bytes; allocated=${this._allocatedBytes}, ` +
           `maxPoolBytes=${this.maxPoolBytes})`
       );
+    }
+
+    _takeLargeSlab(bucketSize) {
+      const bucket = this._largeSlabBuckets.get(bucketSize);
+      if (!bucket || bucket.length === 0) {
+        return null;
+      }
+      while (bucket.length > 0) {
+        const slab = bucket.pop();
+        this._idleLargeSlabCount = Math.max(0, this._idleLargeSlabCount - 1);
+        if (bucket.length === 0) {
+          this._largeSlabBuckets.delete(bucketSize);
+        }
+        if (slab && !slab.destroyed && slab.state === 'recycled') {
+          slab.cursor = 0;
+          slab.lastUsedFrame = this._currentFrame < 0 ? 0 : this._currentFrame;
+          slab.retiredAtFrame = -1;
+          slab.gpuDone = false;
+          slab.readyToRecycle = false;
+          slab.state = 'active';
+          return slab;
+        }
+      }
+      return null;
+    }
+
+    _acquireLargeSlab(bucketSize, oversized) {
+      let recycled = this._takeLargeSlab(bucketSize);
+
+      if (!recycled && this._reclaimCompletedInFlight(false) > 0) {
+        recycled = this._takeLargeSlab(bucketSize);
+        this._enforceLargeSlabCap();
+      }
+
+      if (recycled) {
+        this._bufferReuseHits += 1;
+        this._largeSlabHits += 1;
+        this._activeChunks.push(recycled);
+        return { chunk: recycled, fresh: false };
+      }
+
+      const created = this._createChunk(bucketSize, oversized, bucketSize);
+      this._bufferReuseMisses += 1;
+      this._largeSlabMisses += 1;
+      this._activeChunks.push(created);
+      return { chunk: created, fresh: true };
     }
 
     _takeRecycledChunk(minSize, oversized) {
@@ -652,20 +964,21 @@
 
       // During Frame-1 or mid-frame bursts, reclaim GPU-finished chunks on demand
       // before allocating fresh GPUBuffers.
-      if (!recycled && this._reclaimCompletedInFlight() > 0) {
+      if (!recycled && this._reclaimCompletedInFlight(false) > 0) {
         recycled = this._takeRecycledChunk(minRequired, oversized);
+        this._enforceLargeSlabCap();
       }
 
       if (recycled) {
         this._bufferReuseHits += 1;
         this._activeChunks.push(recycled);
-        return recycled;
+        return { chunk: recycled, fresh: false };
       }
 
-      const created = this._createChunk(targetSize, oversized);
+      const created = this._createChunk(targetSize, oversized, 0);
       this._bufferReuseMisses += 1;
       this._activeChunks.push(created);
-      return created;
+      return { chunk: created, fresh: true };
     }
 
     _moveInFlightToRecycled(chunk) {
@@ -677,12 +990,10 @@
         return false;
       }
       this._inFlightChunks.splice(idx, 1);
-      chunk.cursor = 0;
-      chunk.retiredAtFrame = -1;
-      chunk.gpuDone = false;
-      chunk.readyToRecycle = false;
-      chunk.state = 'recycled';
-      this._recycledChunks.push(chunk);
+      this._putIntoRecycled(chunk);
+      if (chunk.isLargeSlab) {
+        this._enforceLargeSlabCap();
+      }
       return true;
     }
 
@@ -787,6 +1098,7 @@
       this._currentFrame = nextFrame;
       this._inFrame = true;
       this._frameStartedAtLeastOnce = true;
+      this._recordActivityTime();
       this._frameAllocations = 0;
       this._frameBytesAllocated = 0;
       this._frameBytesUploaded = 0;
@@ -805,23 +1117,13 @@
             chunk.readyToRecycle = true;
             this._beginRemap(chunk);
             if (chunk.isMapped) {
-              chunk.cursor = 0;
-              chunk.retiredAtFrame = -1;
-              chunk.gpuDone = false;
-              chunk.readyToRecycle = false;
-              chunk.state = 'recycled';
-              this._recycledChunks.push(chunk);
+              this._putIntoRecycled(chunk);
               recycledCount += 1;
             } else {
               stillInFlight.push(chunk);
             }
           } else {
-            chunk.cursor = 0;
-            chunk.retiredAtFrame = -1;
-            chunk.gpuDone = false;
-            chunk.readyToRecycle = false;
-            chunk.state = 'recycled';
-            this._recycledChunks.push(chunk);
+            this._putIntoRecycled(chunk);
             recycledCount += 1;
           }
         } else {
@@ -831,6 +1133,7 @@
 
       this._inFlightChunks = stillInFlight;
 
+      const capReclaim = this._enforceLargeSlabCap();
       let idleReclaim = { reclaimedChunks: 0, reclaimedBytes: 0 };
       if (this.idleEvictFrames > 0) {
         idleReclaim = this.reclaimIdleChunks(this.idleEvictFrames);
@@ -839,10 +1142,10 @@
       return {
         frameIndex: this._currentFrame,
         recycledCount,
-        recycledChunks: this._recycledChunks.length,
+        recycledChunks: this._getRecycledCount(),
         inFlightChunks: this._inFlightChunks.length,
-        reclaimedChunks: idleReclaim.reclaimedChunks,
-        reclaimedBytes: idleReclaim.reclaimedBytes,
+        reclaimedChunks: capReclaim.reclaimedChunks + idleReclaim.reclaimedChunks,
+        reclaimedBytes: capReclaim.reclaimedBytes + idleReclaim.reclaimedBytes,
       };
     }
 
@@ -964,12 +1267,21 @@
         retiredChunks.push(chunk);
       }
 
-      if (wasNotInFrame && retiredChunks.length === 0) {
+      const isDuplicateEnd = wasNotInFrame && retiredChunks.length === 0;
+      if (isDuplicateEnd) {
         this._doubleReleaseIgnored += 1;
+      } else {
+        this._framesCompleted += 1;
+        this._lastFrameBytesUploaded = this._frameBytesUploaded;
+        if (this._frameBytesUploaded > this._peakFrameBytesUploaded) {
+          this._peakFrameBytesUploaded = this._frameBytesUploaded;
+        }
+        this._recordActivityTime();
       }
 
       this._attachWorkDoneFence(retiredChunks);
 
+      const capReclaim = this._enforceLargeSlabCap();
       let idleReclaim = { reclaimedChunks: 0, reclaimedBytes: 0 };
       if (this.idleEvictFrames > 0) {
         idleReclaim = this.reclaimIdleChunks(this.idleEvictFrames);
@@ -982,9 +1294,9 @@
         bytesAllocated: this._frameBytesAllocated,
         bytesUploaded: this._frameBytesUploaded,
         inFlightChunks: this._inFlightChunks.length,
-        recycledChunks: this._recycledChunks.length,
-        reclaimedChunks: idleReclaim.reclaimedChunks,
-        reclaimedBytes: idleReclaim.reclaimedBytes,
+        recycledChunks: this._getRecycledCount(),
+        reclaimedChunks: capReclaim.reclaimedChunks + idleReclaim.reclaimedChunks,
+        reclaimedBytes: capReclaim.reclaimedBytes + idleReclaim.reclaimedBytes,
       };
 
       this._inFrame = false;
@@ -997,8 +1309,8 @@
 
     /**
      * Sub-allocate an aligned staging slice from the current active chunk, rolling
-     * over to a recycled or newly allocated chunk (or a dedicated oversized chunk
-     * when `byteSize > chunkSize`) within `maxPoolBytes`.
+     * over to a recycled or newly allocated chunk (or a persistent large-slab bucket /
+     * dedicated oversized chunk) within `maxPoolBytes`.
      *
      * Enforces WebGPU 4-byte minimum alignment for buffer reservation and offsets
      * while preserving `slice.size === byteSize` for backwards compatibility.
@@ -1017,12 +1329,25 @@
       const effectiveAlignment = lcmWithBufferAlignment(alignment);
 
       const isOversized = alignedSize > this.chunkSize;
+      const slabBucketSize = this._resolveLargeSlabBucket(alignedSize);
+      const isLargeSlab = slabBucketSize > 0;
       let chunk;
       let offset;
+      let isFreshBuffer = false;
 
-      if (isOversized) {
+      if (isLargeSlab) {
+        // Persistent large-slab bucket (e.g., 2–16 MiB 4K Bink2 YUV planes);
+        // preserves _currentChunk for smaller sub-allocations.
+        const acquired = this._acquireLargeSlab(slabBucketSize, isOversized);
+        chunk = acquired.chunk;
+        isFreshBuffer = acquired.fresh;
+        offset = 0;
+        chunk.cursor = alignedSize;
+      } else if (isOversized) {
         // Dedicated oversized chunk; preserve _currentChunk for smaller allocations.
-        chunk = this._acquireChunk(alignedSize, true);
+        const acquired = this._acquireChunk(alignedSize, true);
+        chunk = acquired.chunk;
+        isFreshBuffer = acquired.fresh;
         offset = 0;
         chunk.cursor = alignedSize;
       } else {
@@ -1032,11 +1357,14 @@
             chunk = this._currentChunk;
             offset = candidateOffset;
             chunk.cursor = offset + alignedSize;
+            isFreshBuffer = false;
           }
         }
 
         if (!chunk) {
-          chunk = this._acquireChunk(alignedSize, false);
+          const acquired = this._acquireChunk(alignedSize, false);
+          chunk = acquired.chunk;
+          isFreshBuffer = acquired.fresh;
           offset = 0;
           chunk.cursor = alignedSize;
           this._currentChunk = chunk;
@@ -1053,6 +1381,16 @@
         this._alignPadCount += 1;
       }
 
+      if (isFreshBuffer) {
+        this._freshAllocations += 1;
+      } else {
+        this._reusedAllocations += 1;
+      }
+
+      if (byteSize > this._peakSingleAllocationBytes) {
+        this._peakSingleAllocationBytes = byteSize;
+      }
+
       this._allocationCount += 1;
       this._frameAllocations += 1;
       this._frameBytesAllocated += byteSize;
@@ -1063,6 +1401,10 @@
         size: byteSize,
         alignedSize,
       };
+      if (isLargeSlab) {
+        slice.isLargeSlab = true;
+        slice.slabBucketSize = chunk.slabBucketSize;
+      }
       if (chunk.isMapped && chunk.mappedView) {
         slice.view = chunk.mappedView.subarray(offset, offset + byteSize);
         if (alignedSize > byteSize) {
@@ -1140,6 +1482,7 @@
 
       this._bytesUploaded += copySize;
       this._frameBytesUploaded += copySize;
+      this._recordActivityTime();
 
       return {
         buffer: slice.buffer,
@@ -1276,6 +1619,7 @@
 
       this._bytesUploaded += stagedBytes;
       this._frameBytesUploaded += stagedBytes;
+      this._recordActivityTime();
 
       return {
         buffer: slice.buffer,
@@ -1305,11 +1649,38 @@
     }
 
     /**
-     * Return pool-wide allocation, reuse, and upload statistics.
+     * Return pool-wide allocation, large-slab reuse, and upload bandwidth statistics.
      */
     getStats() {
       const activeCount = this._activeChunks.length;
-      const recycledCount = this._recycledChunks.length;
+      const recycledCount = this._getRecycledCount();
+      let activeLargeSlabs = 0;
+      for (let i = 0; i < this._activeChunks.length; i += 1) {
+        if (this._activeChunks[i].isLargeSlab) {
+          activeLargeSlabs += 1;
+        }
+      }
+      let inFlightLargeSlabs = 0;
+      for (let i = 0; i < this._inFlightChunks.length; i += 1) {
+        if (this._inFlightChunks[i].isLargeSlab) {
+          inFlightLargeSlabs += 1;
+        }
+      }
+      const largeSlabBucketCounts = {};
+      for (const [bucketSize, bucket] of this._largeSlabBuckets.entries()) {
+        if (bucket.length > 0) {
+          largeSlabBucketCounts[bucketSize] = bucket.length;
+        }
+      }
+
+      const largeSlabTotal = this._largeSlabHits + this._largeSlabMisses;
+      const elapsedMs =
+        this._firstActivityTimeMs !== null && this._lastActivityTimeMs !== null
+          ? Math.max(0, this._lastActivityTimeMs - this._firstActivityTimeMs)
+          : 0;
+      const uploadBytesPerSec =
+        elapsedMs > 0 && this._bytesUploaded > 0 ? (this._bytesUploaded * 1000) / elapsedMs : 0;
+
       return {
         totalChunksAllocated: this._totalChunksAllocated,
         activeChunks: activeCount,
@@ -1320,13 +1691,36 @@
         allocatedBytes: this._allocatedBytes,
         peakAllocatedBytes: this._peakAllocatedBytes,
         peakBytesAllocated: this._peakAllocatedBytes,
+        peakAllocationBytes: this._peakAllocatedBytes,
+        peakSingleAllocationBytes: this._peakSingleAllocationBytes,
         reclaimedChunks: this._reclaimedChunks,
         reclaimedBytes: this._reclaimedBytes,
         oversizeAllocations: this._oversizeAllocations,
         bytesUploaded: this._bytesUploaded,
+        totalBytesUploaded: this._bytesUploaded,
         allocationCount: this._allocationCount,
         bufferReuseHits: this._bufferReuseHits,
         bufferReuseMisses: this._bufferReuseMisses,
+        reusedAllocations: this._reusedAllocations,
+        freshAllocations: this._freshAllocations,
+        reuseRate: this._allocationCount > 0 ? this._reusedAllocations / this._allocationCount : 0,
+        largeSlabHits: this._largeSlabHits,
+        largeSlabMisses: this._largeSlabMisses,
+        largeSlabEvictions: this._largeSlabEvictions,
+        largeSlabReuseRate: largeSlabTotal > 0 ? this._largeSlabHits / largeSlabTotal : 0,
+        activeLargeSlabs,
+        inFlightLargeSlabs,
+        idleLargeSlabs: this._idleLargeSlabCount,
+        largeSlabBytes: this._largeSlabBytes,
+        maxLargeSlabs: this.maxLargeSlabs,
+        largeSlabBucketCounts,
+        framesCompleted: this._framesCompleted,
+        lastFrameBytesUploaded: this._lastFrameBytesUploaded,
+        peakFrameBytesUploaded: this._peakFrameBytesUploaded,
+        avgBytesPerFrame:
+          this._framesCompleted > 0 ? this._bytesUploaded / this._framesCompleted : 0,
+        uploadBytesPerSec,
+        uploadMiBPerSec: uploadBytesPerSec / (1024 * 1024),
         alignPadCount: this._alignPadCount,
         sabCopyCount: this._sabCopyCount,
         doubleReleaseIgnored: this._doubleReleaseIgnored,
@@ -1350,6 +1744,9 @@
 
       this._allChunks.clear();
       this._chunkByBuffer.clear();
+      this._largeSlabBuckets.clear();
+      this._idleLargeSlabCount = 0;
+      this._largeSlabBytes = 0;
       this._pendingMapPromises.clear();
       this._activeChunks = [];
       this._recycledChunks = [];
@@ -1366,6 +1763,9 @@
     DEFAULT_FRAMES_IN_FLIGHT,
     DEFAULT_MIN_WARM_CHUNKS,
     DEFAULT_IDLE_EVICT_FRAMES,
+    DEFAULT_LARGE_SLAB_THRESHOLD,
+    DEFAULT_MAX_LARGE_SLABS,
+    DEFAULT_LARGE_SLAB_BUCKETS,
     WEBGPU_BUFFER_COPY_ALIGNMENT,
     WEBGPU_BYTES_PER_ROW_ALIGNMENT,
     BUFFER_USAGE,
@@ -1373,6 +1773,7 @@
     STAGING_MODE,
     alignUp,
     alignBufferSize,
+    selectLargeSlabBucket,
     isSharedBuffer,
     sanitizeWriteBufferPayload,
     GpuStagingPool,
