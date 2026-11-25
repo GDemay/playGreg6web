@@ -43,6 +43,16 @@
   const ROOT_CLASS = 'pg6-splash';
   const REDUCED_MOTION_QUERY = '(prefers-reduced-motion: reduce)';
   const SCRIPTED_INPUT_PRESET_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/i;
+  const DISMISS_REASON_RE = /^[a-z0-9][a-z0-9_.:-]{0,63}$/i;
+  const HUD_HIDDEN_VALUES = new Set(['0', 'false', 'off', 'no', 'none', 'hidden']);
+  const DISMISS_REASONS = Object.freeze({
+    FIRST_PRESENT: 'first_present',
+    IMMEDIATE: 'immediate',
+    HUD_HIDDEN: 'hud_hidden',
+    INSTANT_HIDE: 'instant_hide',
+    REDUCED_MOTION: 'reduced_motion',
+    MANUAL: 'manual',
+  });
 
   const FALLBACK_SVG =
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360" role="img" aria-label="playgta6web">' +
@@ -142,6 +152,130 @@
       return null;
     }
     return trimmed;
+  }
+
+  /**
+   * Strictly validate a dismissal reason tag for telemetry.
+   * Rejects paths, URLs, control characters, whitespace, and oversized strings.
+   *
+   * @param {unknown} raw
+   * @returns {string|null}
+   */
+  function sanitizeDismissReason(raw) {
+    if (typeof raw !== 'string') {
+      return null;
+    }
+    const trimmed = raw.trim();
+    if (!trimmed || /[\x00-\x1F\x7F]/.test(trimmed)) {
+      return null;
+    }
+    if (!DISMISS_REASON_RE.test(trimmed)) {
+      return null;
+    }
+    return trimmed;
+  }
+
+  /**
+   * Detect whether a URL query string / URLSearchParams / Location disables the HUD
+   * (e.g. `?hud=0`, `?hud=false`, `?hud=off`, `?hud=no`). Never throws.
+   *
+   * @param {unknown} search
+   * @returns {boolean}
+   */
+  function isHudHiddenQuery(search) {
+    if (search === null || search === undefined || search === '') {
+      return false;
+    }
+    try {
+      let params = null;
+      if (typeof URLSearchParams === 'function' && search instanceof URLSearchParams) {
+        params = search;
+      } else {
+        let raw = null;
+        if (typeof search === 'string') {
+          raw = search;
+        } else if (typeof search === 'object' && typeof search.search === 'string') {
+          raw = search.search;
+        }
+        if (typeof raw !== 'string' || raw.length === 0) {
+          return false;
+        }
+        const hashIdx = raw.indexOf('#');
+        const withoutHash = hashIdx >= 0 ? raw.slice(0, hashIdx) : raw;
+        const qIdx = withoutHash.indexOf('?');
+        const query = qIdx >= 0 ? withoutHash.slice(qIdx + 1) : withoutHash;
+        if (!query) {
+          return false;
+        }
+        if (typeof URLSearchParams === 'function') {
+          params = new URLSearchParams(query);
+        } else {
+          let lastHudValue = null;
+          for (const part of query.split('&')) {
+            if (!part) continue;
+            const eqIdx = part.indexOf('=');
+            const rawKey = eqIdx >= 0 ? part.slice(0, eqIdx) : part;
+            const rawVal = eqIdx >= 0 ? part.slice(eqIdx + 1) : '';
+            const key = decodeURIComponent(rawKey).trim().toLowerCase();
+            if (key === 'hud') {
+              lastHudValue = decodeURIComponent(rawVal).trim().toLowerCase();
+            }
+          }
+          return lastHudValue !== null && HUD_HIDDEN_VALUES.has(lastHudValue);
+        }
+      }
+
+      if (!params) {
+        return false;
+      }
+      let lastHudValue = null;
+      for (const [key, value] of params.entries()) {
+        if (String(key).trim().toLowerCase() === 'hud') {
+          lastHudValue = String(value).trim().toLowerCase();
+        }
+      }
+      return lastHudValue !== null && HUD_HIDDEN_VALUES.has(lastHudValue);
+    } catch {
+      return false;
+    }
+  }
+
+  function resolveSearchSource(opts, doc) {
+    if (opts.locationSearch !== undefined && opts.locationSearch !== null) {
+      return opts.locationSearch;
+    }
+    if (opts.search !== undefined && opts.search !== null) {
+      return opts.search;
+    }
+    try {
+      if (opts.windowObj && opts.windowObj.location && typeof opts.windowObj.location.search === 'string') {
+        return opts.windowObj.location.search;
+      }
+    } catch {
+      // ignore
+    }
+    try {
+      if (doc && doc.defaultView && doc.defaultView.location && typeof doc.defaultView.location.search === 'string') {
+        return doc.defaultView.location.search;
+      }
+    } catch {
+      // ignore
+    }
+    try {
+      if (doc && doc.location && typeof doc.location.search === 'string') {
+        return doc.location.search;
+      }
+    } catch {
+      // ignore
+    }
+    try {
+      if (typeof window !== 'undefined' && window && window.location && typeof window.location.search === 'string') {
+        return window.location.search;
+      }
+    } catch {
+      // ignore
+    }
+    return null;
   }
 
   function clampPct(value) {
@@ -297,6 +431,7 @@
     /**
      * @param {object} [options]
      * @param {Document|object} [options.documentObj]
+     * @param {Window|object|null} [options.windowObj]
      * @param {Element|object|null} [options.parent]
      * @param {Element|object|null} [options.root]
      * @param {string|null} [options.splashImageUrl]
@@ -307,6 +442,9 @@
      * @param {(() => number)} [options.nowFn]
      * @param {boolean} [options.reducedMotion]
      * @param {((query: string) => { matches?: boolean } | null)} [options.matchMedia]
+     * @param {boolean} [options.instantHide]
+     * @param {string|URLSearchParams|object|null} [options.locationSearch]
+     * @param {string|URLSearchParams|object|null} [options.search]
      * @param {string|null} [options.scriptedInput]
      * @param {boolean} [options.autoMount=true]
      * @param {boolean} [options.visible=true]
@@ -352,8 +490,23 @@
       ) {
         throw new TypeError('matchMedia must be a function');
       }
+      if (
+        opts.instantHide !== undefined &&
+        opts.instantHide !== null &&
+        typeof opts.instantHide !== 'boolean'
+      ) {
+        throw new TypeError('instantHide must be a boolean');
+      }
+      if (
+        opts.windowObj !== undefined &&
+        opts.windowObj !== null &&
+        typeof opts.windowObj !== 'object'
+      ) {
+        throw new TypeError('windowObj must be an object or null');
+      }
 
       this._document = doc;
+      this._window = opts.windowObj && typeof opts.windowObj === 'object' ? opts.windowObj : null;
       this._parent =
         opts.parent ||
         opts.mountEl ||
@@ -388,14 +541,24 @@
         typeof opts.reducedMotion === 'boolean' ? opts.reducedMotion : null;
       this._matchMedia = typeof opts.matchMedia === 'function' ? opts.matchMedia : null;
 
+      const searchSource = resolveSearchSource(opts, doc);
+      this._hudHidden = isHudHiddenQuery(searchSource);
+      this._instantHide =
+        typeof opts.instantHide === 'boolean' ? opts.instantHide : this._hudHidden;
+
+      const autoHiddenByHud =
+        this._hudHidden && opts.visible === undefined && opts.instantHide !== false;
+
       this._destroyed = false;
-      this._visible = opts.visible !== false;
-      this._dismissed = false;
+      this._visible = autoHiddenByHud ? false : opts.visible !== false;
+      this._dismissed = autoHiddenByHud;
       this._fading = false;
       this._fadeTimer = null;
-      this._dismissedAtMs = null;
-      this._dismissCount = 0;
-      this._fadeDurationMs = null;
+      this._pendingDismissReason = null;
+      this._dismissedAtMs = autoHiddenByHud ? this._safeNow() : null;
+      this._dismissCount = autoHiddenByHud ? 1 : 0;
+      this._fadeDurationMs = autoHiddenByHud ? 0 : null;
+      this._dismissReason = autoHiddenByHud ? DISMISS_REASONS.HUD_HIDDEN : null;
       this._scriptedInputPreset = sanitizeScriptedInputPreset(opts.scriptedInput);
       this._imageFailed = false;
       this._usingFallback = this._splashImageUrl === null;
@@ -442,7 +605,9 @@
         return this._reducedMotionOverride;
       }
       let mediaFn = this._matchMedia;
-      if (!mediaFn && this._document && this._document.defaultView && typeof this._document.defaultView.matchMedia === 'function') {
+      if (!mediaFn && this._window && typeof this._window.matchMedia === 'function') {
+        mediaFn = this._window.matchMedia.bind(this._window);
+      } else if (!mediaFn && this._document && this._document.defaultView && typeof this._document.defaultView.matchMedia === 'function') {
         mediaFn = this._document.defaultView.matchMedia.bind(this._document.defaultView);
       } else if (!mediaFn && typeof window !== 'undefined' && window && typeof window.matchMedia === 'function') {
         mediaFn = window.matchMedia.bind(window);
@@ -468,7 +633,7 @@
         'aria-atomic': 'true',
         'aria-busy': 'true',
       });
-      const initialFadeMs = this._isReducedMotion() ? 0 : this._fadeMs;
+      const initialFadeMs = this._isReducedMotion() || this._instantHide ? 0 : this._fadeMs;
       root.style.setProperty('--pg6-splash-fade', `${initialFadeMs}ms`);
 
       const media = createEl(doc, 'div', `${ROOT_CLASS}__media`);
@@ -616,6 +781,18 @@
       this._usingFallback = !useImage;
     }
 
+    _removeFadingClass(el) {
+      if (!el) return;
+      if (el.classList && typeof el.classList.remove === 'function') {
+        el.classList.remove('pg6-splash--fading');
+      } else if (typeof el.className === 'string') {
+        el.className = el.className
+          .split(/\s+/)
+          .filter((c) => c && c !== 'pg6-splash--fading')
+          .join(' ');
+      }
+    }
+
     _applyVisibility(visible) {
       const root = this._root;
       if (!root) return;
@@ -623,17 +800,11 @@
         if (visible) {
           root.hidden = false;
           if (root.style) root.style.display = '';
-          if (root.classList && typeof root.classList.remove === 'function') {
-            root.classList.remove('pg6-splash--fading');
-          } else if (typeof root.className === 'string') {
-            root.className = root.className
-              .split(/\s+/)
-              .filter((c) => c && c !== 'pg6-splash--fading')
-              .join(' ');
-          }
+          this._removeFadingClass(root);
         } else {
           root.hidden = true;
           if (root.style) root.style.display = 'none';
+          this._removeFadingClass(root);
         }
       } catch {
         // Visibility updates must never throw.
@@ -824,7 +995,7 @@
       return this.getState();
     }
 
-    _completeDismiss(effectiveFadeMs, startedAtMs) {
+    _completeDismiss(effectiveFadeMs, startedAtMs, reason) {
       const completedAtMs = this._safeNow();
       let fadeDurationMs = 0;
       if (effectiveFadeMs > 0) {
@@ -834,15 +1005,23 @@
       this._dismissedAtMs = completedAtMs;
       this._dismissCount += 1;
       this._fadeDurationMs = fadeDurationMs;
+      this._dismissReason =
+        sanitizeDismissReason(reason) ||
+        this._pendingDismissReason ||
+        DISMISS_REASONS.MANUAL;
+      this._pendingDismissReason = null;
       this._fading = false;
       this._applyVisibility(false);
       this._fireDismiss();
     }
 
     /**
-     * Signal that the first WebGPU / Bink frame has been presented and start the dismiss fade.
+     * Signal that the first WebGPU / Bink frame has been presented and dismiss the overlay.
+     * Supports immediate dismissal via `{ immediate: true }`, `{ instant: true }`,
+     * `{ instantHide: true }`, `{ fadeMs: 0 }`, constructor `instantHide: true`,
+     * `?hud=0`, or `prefers-reduced-motion`.
      *
-     * @param {{ fadeMs?: number, reducedMotion?: boolean }} [options]
+     * @param {{ fadeMs?: number, reducedMotion?: boolean, immediate?: boolean, instant?: boolean, instantHide?: boolean, reason?: string }} [options]
      * @returns {object}
      */
     onFirstPresent(options) {
@@ -855,46 +1034,126 @@
       this._progressPct = 100;
       this._statusText = this._stageLabel;
       this._syncChrome();
-      return this.dismiss(options);
+
+      const opts = options && typeof options === 'object' ? { ...options } : {};
+      if (opts.reason === undefined) {
+        opts.reason = DISMISS_REASONS.FIRST_PRESENT;
+      }
+      return this.dismiss(opts);
+    }
+
+    /**
+     * Immediately dismiss the overlay with zero transition delay (no CSS fade timer).
+     * Cancels any in-flight fade animation and hides synchronously so automated video
+     * captures and `FIRST_PRESENT` Bink2 frames are never occluded. Idempotent once dismissed.
+     *
+     * @param {string|{ reason?: string }} [options]
+     * @returns {object}
+     */
+    dismissImmediate(options) {
+      if (this._destroyed) {
+        return this.getState();
+      }
+      let opts;
+      if (typeof options === 'string') {
+        opts = { reason: options };
+      } else if (options && typeof options === 'object') {
+        opts = { ...options };
+      } else {
+        opts = {};
+      }
+      if (opts.reason === undefined) {
+        opts.reason = DISMISS_REASONS.IMMEDIATE;
+      }
+      opts.immediate = true;
+      opts.fadeMs = 0;
+      return this.dismiss(opts);
     }
 
     /**
      * Smoothly cross-fade the overlay out, then hide it. Idempotent.
-     * Honors `prefers-reduced-motion` (or `reducedMotion: true`) by skipping
-     * transition delay and hiding immediately.
+     * Honors `immediate` / `instant` / `instantHide`, `?hud=0`, and
+     * `prefers-reduced-motion` (or `reducedMotion: true`) by skipping transition
+     * delay and hiding synchronously. Calling with immediate mode while a fade
+     * is in flight cancels the pending timer and completes dismissal immediately.
      *
-     * @param {{ fadeMs?: number, reducedMotion?: boolean }} [options]
+     * @param {{ fadeMs?: number, reducedMotion?: boolean, immediate?: boolean, instant?: boolean, instantHide?: boolean, reason?: string }} [options]
      * @returns {object}
      */
     dismiss(options = {}) {
       if (this._destroyed) {
         return this.getState();
       }
+
+      const opts = options && typeof options === 'object' ? options : {};
+      const explicitImmediate =
+        typeof opts.immediate === 'boolean'
+          ? opts.immediate
+          : typeof opts.instant === 'boolean'
+            ? opts.instant
+            : typeof opts.instantHide === 'boolean'
+              ? opts.instantHide
+              : null;
+      const requestedFadeMs =
+        typeof opts.fadeMs === 'number' && Number.isFinite(opts.fadeMs)
+          ? Math.max(0, opts.fadeMs)
+          : this._fadeMs;
+      const reducedMotion =
+        typeof opts.reducedMotion === 'boolean'
+          ? opts.reducedMotion
+          : this._isReducedMotion();
+      const useInstant = explicitImmediate !== null ? explicitImmediate : this._instantHide;
+      const effectiveFadeMs = useInstant || reducedMotion ? 0 : requestedFadeMs;
+
+      const explicitReason = sanitizeDismissReason(opts.reason);
+      const defaultReason =
+        explicitImmediate === true
+          ? DISMISS_REASONS.IMMEDIATE
+          : this._hudHidden && useInstant
+            ? DISMISS_REASONS.HUD_HIDDEN
+            : useInstant
+              ? DISMISS_REASONS.INSTANT_HIDE
+              : reducedMotion
+                ? DISMISS_REASONS.REDUCED_MOTION
+                : DISMISS_REASONS.MANUAL;
+      const resolvedReason = explicitReason || defaultReason;
+
       if (this._dismissed) {
+        if (this._fading && (explicitImmediate === true || effectiveFadeMs === 0)) {
+          const upgradedReason =
+            explicitReason ||
+            (explicitImmediate === true
+              ? DISMISS_REASONS.IMMEDIATE
+              : this._pendingDismissReason || resolvedReason);
+          this._clearFadeTimer();
+          if (this._root) {
+            try {
+              this._root.style && this._root.style.setProperty('--pg6-splash-fade', '0ms');
+              this._root.setAttribute('aria-busy', 'false');
+            } catch {
+              // ignore
+            }
+          }
+          this._completeDismiss(0, this._safeNow(), upgradedReason);
+        }
         return this.getState();
       }
 
-      const requestedFadeMs =
-        options && typeof options === 'object' && typeof options.fadeMs === 'number' && Number.isFinite(options.fadeMs)
-          ? Math.max(0, options.fadeMs)
-          : this._fadeMs;
-      const reducedMotion =
-        options && typeof options === 'object' && typeof options.reducedMotion === 'boolean'
-          ? options.reducedMotion
-          : this._isReducedMotion();
-      const effectiveFadeMs = reducedMotion ? 0 : requestedFadeMs;
       const startedAtMs = this._safeNow();
 
       this._dismissed = true;
+      this._pendingDismissReason = resolvedReason;
       this._clearFadeTimer();
 
       if (this._root) {
         try {
           this._root.style && this._root.style.setProperty('--pg6-splash-fade', `${effectiveFadeMs}ms`);
-          if (this._root.classList && typeof this._root.classList.add === 'function') {
-            this._root.classList.add('pg6-splash--fading');
-          } else if (typeof this._root.className === 'string') {
-            this._root.className = `${this._root.className} pg6-splash--fading`.trim();
+          if (effectiveFadeMs > 0) {
+            if (this._root.classList && typeof this._root.classList.add === 'function') {
+              this._root.classList.add('pg6-splash--fading');
+            } else if (typeof this._root.className === 'string') {
+              this._root.className = `${this._root.className} pg6-splash--fading`.trim();
+            }
           }
           this._root.setAttribute('aria-busy', 'false');
         } catch {
@@ -903,7 +1162,7 @@
       }
 
       if (effectiveFadeMs <= 0) {
-        this._completeDismiss(0, startedAtMs);
+        this._completeDismiss(0, startedAtMs, resolvedReason);
         return this.getState();
       }
 
@@ -913,35 +1172,73 @@
         if (this._destroyed) {
           return;
         }
-        this._completeDismiss(effectiveFadeMs, startedAtMs);
+        this._completeDismiss(effectiveFadeMs, startedAtMs, resolvedReason);
       }, effectiveFadeMs);
 
       return this.getState();
     }
 
-    /** Show the overlay (clears a prior hide; does not undo a completed dismiss fade class). */
-    show() {
+    /**
+     * Show the overlay (clears a prior hide/dismiss; idempotent when already visible
+     * and active). Pass `{ reset: true }` to reset boot stage/progress on restart.
+     *
+     * @param {{ reset?: boolean }} [options]
+     * @returns {object}
+     */
+    show(options) {
       if (this._destroyed) return this.getState();
+      const reset = Boolean(options && typeof options === 'object' && options.reset === true);
+      if (this._visible && !this._dismissed && !this._fading && !reset) {
+        return this.getState();
+      }
       this._clearFadeTimer();
       this._dismissed = false;
       this._fading = false;
+      this._pendingDismissReason = null;
+      if (reset) {
+        this._stage = STAGE_NOT_STARTED;
+        this._stageLabel = BOOT_STAGE_LABELS.NOT_STARTED;
+        this._statusText = this._stageLabel;
+        this._progressPct = 0;
+        this._streamPct = null;
+        this._elapsedMs = 0;
+        this._badgeText = '';
+        this._readyForSplash = false;
+      }
+      if (this._root && this._root.style && typeof this._root.style.setProperty === 'function') {
+        try {
+          const fadeMs = this._isReducedMotion() || this._instantHide ? 0 : this._fadeMs;
+          this._root.style.setProperty('--pg6-splash-fade', `${fadeMs}ms`);
+        } catch {
+          // ignore
+        }
+      }
       this._applyVisibility(true);
       this._syncChrome();
       return this.getState();
     }
 
-    /** Immediately hide the overlay without firing onDismiss. */
+    /** Immediately hide the overlay without firing onDismiss. Idempotent when already hidden. */
     hide() {
       if (this._destroyed) return this.getState();
+      if (!this._visible && !this._fading) {
+        return this.getState();
+      }
+      const wasFading = this._fading;
       this._clearFadeTimer();
       this._fading = false;
+      this._pendingDismissReason = null;
+      if (wasFading) {
+        this._dismissed = false;
+      }
       this._applyVisibility(false);
       return this.getState();
     }
 
     /**
      * Return a sanitized, JSON-safe telemetry snapshot of overlay visibility,
-     * dismissal timing/counts, reduced-motion state, and scripted-input preset.
+     * dismissal timing/counts/reason, reduced-motion/instant-hide state, and
+     * scripted-input preset.
      *
      * @returns {object}
      */
@@ -965,7 +1262,10 @@
           this._fadeDurationMs >= 0
             ? this._fadeDurationMs
             : null,
+        dismissReason: sanitizeDismissReason(this._dismissReason),
         fadeMs: this._fadeMs,
+        instantHide: Boolean(this._instantHide),
+        hudHidden: Boolean(this._hudHidden),
         reducedMotion: this._isReducedMotion(),
         stage: this._stage,
         progressPct: Math.round(clampPct(this._progressPct)),
@@ -995,9 +1295,12 @@
         usingFallback: this._usingFallback,
         imageFailed: this._imageFailed,
         fadeMs: this._fadeMs,
+        instantHide: this._instantHide,
+        hudHidden: this._hudHidden,
         dismissedAtMs: this._dismissedAtMs,
         dismissCount: this._dismissCount,
         fadeDurationMs: this._fadeDurationMs,
+        dismissReason: this._dismissReason,
         reducedMotion: this._isReducedMotion(),
         scriptedInputPreset: this._scriptedInputPreset,
         root: this._root,
@@ -1011,6 +1314,7 @@
       }
       this._destroyed = true;
       this._clearFadeTimer();
+      this._pendingDismissReason = null;
 
       const img = this._els && this._els.img;
       if (img && this._onImageError) {
@@ -1043,8 +1347,11 @@
   const exportedApi = {
     BOOT_STAGE_ORDER,
     BOOT_STAGE_LABELS,
+    DISMISS_REASONS,
     computeBootProgress,
     sanitizeScriptedInputPreset,
+    sanitizeDismissReason,
+    isHudHiddenQuery,
     SplashOverlayController,
     DEFAULT_FADE_MS,
     REDUCED_MOTION_QUERY,
