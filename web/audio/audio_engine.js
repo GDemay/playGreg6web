@@ -27,6 +27,12 @@ export const RING_HEADER_BYTES = RING_HEADER_INT32_COUNT * Int32Array.BYTES_PER_
 
 export const DEFAULT_MAX_RESUME_RETRIES = 5;
 export const MAX_ERROR_MESSAGE_LENGTH = 256;
+export const DEFAULT_GESTURE_EVENTS = Object.freeze([
+  'pointerdown',
+  'keydown',
+  'touchstart',
+  'click',
+]);
 
 const KNOWN_OUTPUT_STATES = new Set([
   'idle',
@@ -38,6 +44,83 @@ const KNOWN_OUTPUT_STATES = new Set([
   'unsupported',
   'error',
 ]);
+
+function isSharedArrayBufferValue(buf) {
+  return typeof SharedArrayBuffer !== 'undefined' && buf instanceof SharedArrayBuffer;
+}
+
+function isDetachedArrayBuffer(buf) {
+  if (!(buf instanceof ArrayBuffer)) {
+    return false;
+  }
+  if (buf.detached === true) {
+    return true;
+  }
+  try {
+    void buf.byteLength;
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+function extractInterleavedFloat32(samples) {
+  if (samples === null || samples === undefined) {
+    return null;
+  }
+  if (samples instanceof Float32Array) {
+    try {
+      const buf = samples.buffer;
+      if (!buf || (!isSharedArrayBufferValue(buf) && isDetachedArrayBuffer(buf))) {
+        return null;
+      }
+      return samples;
+    } catch {
+      return null;
+    }
+  }
+  if (isSharedArrayBufferValue(samples)) {
+    const count = Math.floor(samples.byteLength / Float32Array.BYTES_PER_ELEMENT);
+    return new Float32Array(samples, 0, count);
+  }
+  if (samples instanceof ArrayBuffer) {
+    if (isDetachedArrayBuffer(samples)) {
+      return null;
+    }
+    const count = Math.floor(samples.byteLength / Float32Array.BYTES_PER_ELEMENT);
+    return new Float32Array(samples, 0, count);
+  }
+  if (ArrayBuffer.isView(samples)) {
+    try {
+      const buf = samples.buffer;
+      if (!buf || (!isSharedArrayBufferValue(buf) && isDetachedArrayBuffer(buf))) {
+        return null;
+      }
+      const byteLen = samples.byteLength;
+      const count = Math.floor(byteLen / Float32Array.BYTES_PER_ELEMENT);
+      if (count <= 0) {
+        return new Float32Array(0);
+      }
+      if (samples.byteOffset % Float32Array.BYTES_PER_ELEMENT === 0) {
+        return new Float32Array(buf, samples.byteOffset, count);
+      }
+      const bytes = new Uint8Array(buf, samples.byteOffset, count * Float32Array.BYTES_PER_ELEMENT);
+      const aligned = new Uint8Array(bytes.byteLength);
+      aligned.set(bytes);
+      return new Float32Array(aligned.buffer);
+    } catch {
+      return null;
+    }
+  }
+  if (Array.isArray(samples)) {
+    const out = new Float32Array(samples.length);
+    for (let i = 0; i < samples.length; i++) {
+      out[i] = Number(samples[i]);
+    }
+    return out;
+  }
+  return null;
+}
 
 const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f]+/g;
 const FILE_URL_RE = /file:\/\/[^\s'")]+/gi;
@@ -272,6 +355,10 @@ export class AudioEngine {
       Number.isInteger(opts.capacityFrames) && opts.capacityFrames > 0
         ? opts.capacityFrames
         : DEFAULT_CAPACITY_FRAMES;
+    this._requestedMaxQueuedFrames =
+      Number.isInteger(opts.maxQueuedFrames) && opts.maxQueuedFrames > 0
+        ? opts.maxQueuedFrames
+        : null;
 
     this._workletUrl =
       typeof opts.workletUrl === 'string' && opts.workletUrl.length > 0
@@ -287,6 +374,8 @@ export class AudioEngine {
       opts.maxResumeRetries,
       DEFAULT_MAX_RESUME_RETRIES
     );
+    this._autoResumeOnGesture = Boolean(opts.autoResumeOnGesture);
+    this._gestureTarget = opts.gestureTarget;
 
     this._AudioContextCtor =
       opts.AudioContextCtor !== undefined
@@ -309,8 +398,16 @@ export class AudioEngine {
 
     this._sab = null;
     this._ctrl = null;
+    this._samples = null;
+    this._fallbackCtrl = null;
+    this._fallbackSamples = null;
     this._capacityFrames = this._requestedCapacityFrames;
+    this._maxQueuedFrames =
+      this._requestedMaxQueuedFrames !== null
+        ? Math.min(this._requestedMaxQueuedFrames, this._requestedCapacityFrames)
+        : this._requestedCapacityFrames;
     this._channels = this._requestedChannels;
+    this._modulus = this._requestedCapacityFrames * 2;
 
     this._context = null;
     this._node = null;
@@ -330,6 +427,10 @@ export class AudioEngine {
     this._lastTrackedState = 'idle';
     this._gainClamps = 0;
     this._invalidGainInputs = 0;
+    this._submittedFrames = 0;
+    this._submittedBatches = 0;
+    this._consumedFrames = 0;
+    this._sanitizedSamples = 0;
 
     const initialSab = opts.sab || (opts.ringBuffer && opts.ringBuffer.sab) || null;
     if (initialSab) {
@@ -338,6 +439,8 @@ export class AudioEngine {
       this.attachSab(
         createAudioRingSab(this._requestedCapacityFrames, this._requestedChannels)
       );
+    } else {
+      this._initFallbackRing(this._requestedCapacityFrames, this._requestedChannels);
     }
   }
 
@@ -369,6 +472,103 @@ export class AudioEngine {
     return this._error;
   }
 
+  _readContextState(ctx = this._context) {
+    if (!ctx) {
+      return null;
+    }
+    try {
+      const raw = ctx.state;
+      return typeof raw === 'string' && raw.length > 0 ? raw : null;
+    } catch {
+      return null;
+    }
+  }
+
+  _initFallbackRing(capacityFrames, channels) {
+    const cap =
+      Number.isInteger(capacityFrames) && capacityFrames > 0
+        ? capacityFrames
+        : DEFAULT_CAPACITY_FRAMES;
+    const ch = Number.isInteger(channels) && channels > 0 ? channels : DEFAULT_CHANNELS;
+    const ctrl = new Int32Array(RING_HEADER_INT32_COUNT);
+    ctrl[HDR_WRITE_CURSOR] = 0;
+    ctrl[HDR_READ_CURSOR] = 0;
+    ctrl[HDR_CAPACITY_FRAMES] = cap;
+    ctrl[HDR_CHANNELS] = ch;
+    ctrl[HDR_UNDERRUNS] = 0;
+    ctrl[HDR_UNDERRUN_FRAMES] = 0;
+    ctrl[HDR_OVERFLOWS] = 0;
+    ctrl[HDR_DROPPED_FRAMES] = 0;
+    this._fallbackCtrl = ctrl;
+    this._fallbackSamples = new Float32Array(cap * ch);
+    this._capacityFrames = cap;
+    this._channels = ch;
+    this._modulus = cap * 2;
+    this._maxQueuedFrames =
+      this._requestedMaxQueuedFrames !== null
+        ? Math.min(this._requestedMaxQueuedFrames, cap)
+        : cap;
+  }
+
+  _activeCtrl() {
+    return this._ctrl || this._fallbackCtrl;
+  }
+
+  _activeSamples() {
+    return this._samples || this._fallbackSamples;
+  }
+
+  _loadHdr(index) {
+    if (this._ctrl) {
+      return Atomics.load(this._ctrl, index);
+    }
+    if (this._fallbackCtrl) {
+      return this._fallbackCtrl[index];
+    }
+    return 0;
+  }
+
+  _storeHdr(index, value) {
+    if (this._ctrl) {
+      Atomics.store(this._ctrl, index, value);
+    } else if (this._fallbackCtrl) {
+      this._fallbackCtrl[index] = value;
+    }
+  }
+
+  _addHdr(index, delta) {
+    if (this._ctrl) {
+      return Atomics.add(this._ctrl, index, delta);
+    }
+    if (this._fallbackCtrl) {
+      const prev = this._fallbackCtrl[index];
+      this._fallbackCtrl[index] = prev + delta;
+      return prev;
+    }
+    return 0;
+  }
+
+  _computeBufferedFrames() {
+    const ctrl = this._activeCtrl();
+    const cap = this._capacityFrames;
+    if (!ctrl || cap <= 0) {
+      return 0;
+    }
+    const write = this._loadHdr(HDR_WRITE_CURSOR);
+    const read = this._loadHdr(HDR_READ_CURSOR);
+    let used = write - read;
+    if (used < 0) {
+      used += cap * 2;
+    }
+    if (!Number.isFinite(used) || used < 0) {
+      return 0;
+    }
+    if (used > cap) {
+      return cap;
+    }
+    return Math.floor(used);
+  }
+
   get state() {
     if (this._destroyed) {
       return 'closed';
@@ -376,12 +576,9 @@ export class AudioEngine {
     if (this._status === 'unsupported' || this._status === 'error') {
       return this._status;
     }
-    if (
-      this._context &&
-      typeof this._context.state === 'string' &&
-      this._context.state.length > 0
-    ) {
-      return this._context.state;
+    const ctxState = this._readContextState();
+    if (ctxState !== null) {
+      return ctxState;
     }
     return this._status;
   }
@@ -390,14 +587,20 @@ export class AudioEngine {
     return sanitizeOutputState(this.state);
   }
 
+  get contextState() {
+    return sanitizeOutputState(this.state);
+  }
+
   get sampleRate() {
-    if (
-      this._context &&
-      typeof this._context.sampleRate === 'number' &&
-      Number.isFinite(this._context.sampleRate) &&
-      this._context.sampleRate > 0
-    ) {
-      return this._context.sampleRate;
+    if (this._context) {
+      try {
+        const rate = this._context.sampleRate;
+        if (typeof rate === 'number' && Number.isFinite(rate) && rate > 0) {
+          return rate;
+        }
+      } catch {
+        // Ignore hostile getter.
+      }
     }
     return this._requestedSampleRate;
   }
@@ -449,11 +652,23 @@ export class AudioEngine {
 
     this._sab = sab;
     this._ctrl = ctrl;
+    this._samples = new Float32Array(sab, RING_HEADER_BYTES, cap * ch);
+    this._fallbackCtrl = null;
+    this._fallbackSamples = null;
     this._capacityFrames = cap;
     this._channels = ch;
+    this._modulus = cap * 2;
+    this._maxQueuedFrames =
+      this._requestedMaxQueuedFrames !== null
+        ? Math.min(this._requestedMaxQueuedFrames, cap)
+        : cap;
 
     if (this._node && this._node.port && typeof this._node.port.postMessage === 'function') {
-      this._node.port.postMessage({ type: 'attach', sab });
+      try {
+        this._node.port.postMessage({ type: 'attach', sab });
+      } catch {
+        // Ignore postMessage errors on closed/detached port.
+      }
     }
 
     return sab;
@@ -697,21 +912,35 @@ export class AudioEngine {
 
     this._context = ctx;
     this._node = node;
-    this._status = ctx.state || 'running';
+    this._status = this._readContextState(ctx) || 'running';
 
     this._boundContextStateChange = () => {
       if (!this._destroyed && this._context) {
-        this._status = this._context.state || this._status;
+        const liveState = this._readContextState(this._context);
+        if (liveState !== null) {
+          this._status = liveState;
+        }
         this._emitStateChange();
       }
     };
-    if (typeof ctx.addEventListener === 'function') {
-      ctx.addEventListener('statechange', this._boundContextStateChange);
-    } else if ('onstatechange' in ctx) {
-      ctx.onstatechange = this._boundContextStateChange;
+    try {
+      if (typeof ctx.addEventListener === 'function') {
+        ctx.addEventListener('statechange', this._boundContextStateChange);
+      } else if ('onstatechange' in ctx) {
+        ctx.onstatechange = this._boundContextStateChange;
+      }
+    } catch {
+      // Ignore event registration failures in restricted/headless contexts.
     }
 
     this._emitStateChange();
+
+    if (
+      this._autoResumeOnGesture &&
+      (this.outputState === 'suspended' || this.outputState === 'interrupted')
+    ) {
+      this.resumeOnUserGesture(this._gestureTarget);
+    }
 
     return {
       ok: true,
@@ -735,8 +964,12 @@ export class AudioEngine {
     if (this._destroyed || !this._context) {
       return Promise.resolve(false);
     }
-    if (this._context.state === 'running') {
+    const currentState = this._readContextState();
+    if (currentState === 'running') {
       return Promise.resolve(true);
+    }
+    if (currentState === 'closed') {
+      return Promise.resolve(false);
     }
     if (this._resumePromise) {
       return this._resumePromise;
@@ -762,8 +995,12 @@ export class AudioEngine {
       if (this._destroyed || !this._context) {
         return false;
       }
-      if (this._context.state === 'running') {
+      const preState = this._readContextState();
+      if (preState === 'running') {
         return true;
+      }
+      if (preState === 'closed') {
+        return false;
       }
 
       this._resumeAttempts += 1;
@@ -791,11 +1028,12 @@ export class AudioEngine {
           return false;
         }
 
-        const nextState = sanitizeOutputState(this._context.state || 'running');
+        const postRawState = this._readContextState();
+        const nextState = sanitizeOutputState(postRawState || 'running');
         this._status = nextState;
         this._emitStateChange();
 
-        if (this._context.state === 'running') {
+        if (postRawState === 'running') {
           this._resumeSuccesses += 1;
           this._lastResumeError = null;
           this._error = null;
@@ -832,24 +1070,82 @@ export class AudioEngine {
   }
 
   /**
-   * Attaches `pointerdown` and `keydown` listeners to `target` to unlock a
-   * suspended AudioContext on user gesture. Cleans up both listeners once
-   * running (or when `destroy()` is called). If a gesture resume attempt fails,
-   * listeners automatically re-arm up to `options.maxRetries` times.
+   * Safely suspends a running AudioContext without throwing in headless,
+   * unsupported, or closed states.
    *
-   * @param {EventTarget} [target] Defaults to `window` when available.
+   * @returns {Promise<boolean>} True if context is suspended after call.
+   */
+  async suspend() {
+    if (this._destroyed || !this._context) {
+      return false;
+    }
+    const currentState = this._readContextState();
+    if (currentState === 'suspended') {
+      return true;
+    }
+    if (currentState === 'closed' || typeof this._context.suspend !== 'function') {
+      return false;
+    }
+    try {
+      await this._context.suspend();
+      if (this._destroyed || !this._context) {
+        return false;
+      }
+      const nextState = sanitizeOutputState(this._readContextState() || 'suspended');
+      this._status = nextState;
+      this._emitStateChange();
+      return nextState === 'suspended';
+    } catch (err) {
+      this._error =
+        err instanceof Error
+          ? err
+          : new Error(sanitizeResumeError(err) || 'AudioContext suspend failed');
+      if (this._onError) {
+        try {
+          this._onError(this._error);
+        } catch {
+          // Ignore.
+        }
+      }
+      return false;
+    }
+  }
+
+  /**
+   * Attaches user-gesture listeners (`pointerdown`, `keydown`, `touchstart`, `click`
+   * by default) to `target` to unlock a suspended AudioContext on user gesture.
+   * Safe in headless/autoplay-restricted browsers: never throws when `window` or
+   * `target` is absent or when `resume()` fails. Cleans up all listeners once
+   * running (or when `destroy()`/`close()` is called). If a gesture resume attempt
+   * fails, listeners automatically re-arm up to `options.maxRetries` times.
+   *
+   * @param {EventTarget} [target] Defaults to `window` / `document` / `globalThis` when available.
    * @param {object} [options]
    * @param {number} [options.maxRetries] Maximum gesture retry re-arms after an initial failure.
+   * @param {string[]} [options.events] Custom gesture event names.
    * @returns {() => void} Manual cleanup function.
    */
   resumeOnUserGesture(target, options = {}) {
-    const resolvedTarget =
-      target ||
-      (typeof window !== 'undefined'
-        ? window
-        : typeof globalThis !== 'undefined' && typeof globalThis.addEventListener === 'function'
-          ? globalThis
-          : null);
+    let resolvedTarget = target || null;
+    if (!resolvedTarget) {
+      try {
+        if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+          resolvedTarget = window;
+        } else if (
+          typeof document !== 'undefined' &&
+          typeof document.addEventListener === 'function'
+        ) {
+          resolvedTarget = document;
+        } else if (
+          typeof globalThis !== 'undefined' &&
+          typeof globalThis.addEventListener === 'function'
+        ) {
+          resolvedTarget = globalThis;
+        }
+      } catch {
+        resolvedTarget = null;
+      }
+    }
 
     if (
       this._destroyed ||
@@ -860,7 +1156,8 @@ export class AudioEngine {
       return () => {};
     }
 
-    if (this._context && this._context.state === 'running') {
+    const currentCtxState = this._readContextState();
+    if (this._context && (currentCtxState === 'running' || currentCtxState === 'closed')) {
       return () => {};
     }
 
@@ -874,7 +1171,18 @@ export class AudioEngine {
     let retriesRemaining = sanitizeFiniteNonNegInt(opts.maxRetries, this._maxResumeRetries);
     let disposed = false;
     let activeCleanup = null;
-    const events = ['pointerdown', 'keydown'];
+    const rawEvents =
+      Array.isArray(opts.events) && opts.events.length > 0 ? opts.events : DEFAULT_GESTURE_EVENTS;
+    const events = [];
+    for (let i = 0; i < rawEvents.length; i++) {
+      const evt = rawEvents[i];
+      if (typeof evt === 'string' && evt.length > 0 && !events.includes(evt)) {
+        events.push(evt);
+      }
+    }
+    if (events.length === 0) {
+      return () => {};
+    }
 
     const removeListeners = () => {
       if (activeCleanup) {
@@ -902,31 +1210,68 @@ export class AudioEngine {
 
       const onGesture = () => {
         removeListeners();
-        Promise.resolve(this.resume()).then((resumed) => {
-          if (
-            !resumed &&
-            !disposed &&
-            !this._destroyed &&
-            this._context &&
-            this._context.state !== 'running' &&
-            retriesRemaining > 0
-          ) {
-            retriesRemaining -= 1;
+        if (disposed || this._destroyed || this._status === 'unsupported') {
+          cleanup();
+          return;
+        }
+        if (!this._context) {
+          if (this._status === 'idle' || this._status === 'initializing') {
             arm();
-          } else if (resumed || this._destroyed || retriesRemaining <= 0) {
+          } else {
             cleanup();
           }
-        });
+          return;
+        }
+        let resumePromise;
+        try {
+          resumePromise = Promise.resolve(this.resume());
+        } catch {
+          resumePromise = Promise.resolve(false);
+        }
+        resumePromise
+          .catch(() => false)
+          .then((resumed) => {
+            const postState = this._readContextState();
+            if (
+              !resumed &&
+              !disposed &&
+              !this._destroyed &&
+              this._context &&
+              postState !== 'running' &&
+              postState !== 'closed' &&
+              retriesRemaining > 0
+            ) {
+              retriesRemaining -= 1;
+              arm();
+            } else if (
+              resumed ||
+              this._destroyed ||
+              postState === 'closed' ||
+              retriesRemaining <= 0
+            ) {
+              cleanup();
+            }
+          });
       };
 
+      const registered = [];
       for (const evt of events) {
-        resolvedTarget.addEventListener(evt, onGesture, { once: true, passive: true });
+        try {
+          resolvedTarget.addEventListener(evt, onGesture, { once: true, passive: true });
+          registered.push(evt);
+        } catch {
+          // Ignore unsupported/blocked event listener registrations in restricted hosts.
+        }
       }
 
       activeCleanup = () => {
         if (typeof resolvedTarget.removeEventListener === 'function') {
-          for (const evt of events) {
-            resolvedTarget.removeEventListener(evt, onGesture);
+          for (const evt of registered) {
+            try {
+              resolvedTarget.removeEventListener(evt, onGesture);
+            } catch {
+              // Ignore listener teardown failures.
+            }
           }
         }
       };
@@ -958,7 +1303,11 @@ export class AudioEngine {
 
     this._volume = clamped;
     if (this._node && this._node.port && typeof this._node.port.postMessage === 'function') {
-      this._node.port.postMessage({ type: 'setGain', gain: this._volume });
+      try {
+        this._node.port.postMessage({ type: 'setGain', gain: this._volume });
+      } catch {
+        // Ignore postMessage errors on closed/detached port.
+      }
     }
     return this._volume;
   }
@@ -981,9 +1330,450 @@ export class AudioEngine {
   setMuted(muted) {
     this._muted = Boolean(muted);
     if (this._node && this._node.port && typeof this._node.port.postMessage === 'function') {
-      this._node.port.postMessage({ type: 'setMuted', muted: this._muted });
+      try {
+        this._node.port.postMessage({ type: 'setMuted', muted: this._muted });
+      } catch {
+        // Ignore postMessage errors on closed/detached port.
+      }
     }
     return this._muted;
+  }
+
+  /**
+   * Convenience helper to mute audio output.
+   * @returns {boolean} Always `true`.
+   */
+  mute() {
+    return this.setMuted(true);
+  }
+
+  /**
+   * Convenience helper to unmute audio output.
+   * @returns {boolean} Always `false`.
+   */
+  unmute() {
+    return this.setMuted(false);
+  }
+
+  /**
+   * Toggles mute state and returns the updated muted flag.
+   * @returns {boolean}
+   */
+  toggleMute() {
+    return this.setMuted(!this._muted);
+  }
+
+  /**
+   * Returns the number of currently queued PCM frames in the bounded ring buffer.
+   * @returns {number}
+   */
+  availableFrames() {
+    return this._computeBufferedFrames();
+  }
+
+  /**
+   * Returns the number of free frame slots remaining in the bounded ring buffer.
+   * @returns {number}
+   */
+  freeFrames() {
+    const limit = Math.min(this._maxQueuedFrames, this._capacityFrames);
+    if (limit <= 0) {
+      return 0;
+    }
+    return Math.max(0, limit - this._computeBufferedFrames());
+  }
+
+  /**
+   * Submits interleaved Float32 PCM frames into the bounded audio ring buffer
+   * with strict overflow/overrun guards and non-finite sample sanitization.
+   * Never throws on invalid inputs or closed engines.
+   *
+   * @param {Float32Array|ArrayBuffer|SharedArrayBuffer|ArrayBufferView|number[]} samples
+   * @param {object} [options]
+   * @param {number} [options.frameCount] Optional frame count cap within `samples`.
+   * @param {'drop-newest'|'drop-oldest'} [options.overflowPolicy='drop-newest']
+   * @returns {{ ok: boolean, acceptedFrames: number, submittedFrames: number, droppedFrames: number, overrun: boolean, bufferedFrames: number, capacityFrames: number, freeFrames: number, reason?: string }}
+   */
+  submitPcm(samples, options = {}) {
+    const cap = this._capacityFrames;
+    const channels = this._channels;
+    const limit = Math.min(this._maxQueuedFrames, cap);
+
+    if (this._destroyed) {
+      return {
+        ok: false,
+        acceptedFrames: 0,
+        submittedFrames: 0,
+        droppedFrames: 0,
+        overrun: false,
+        bufferedFrames: this._computeBufferedFrames(),
+        capacityFrames: cap,
+        freeFrames: this.freeFrames(),
+        reason: 'closed',
+      };
+    }
+
+    const ctrl = this._activeCtrl();
+    const ringSamples = this._activeSamples();
+    if (!ctrl || !ringSamples || cap <= 0 || channels <= 0) {
+      return {
+        ok: false,
+        acceptedFrames: 0,
+        submittedFrames: 0,
+        droppedFrames: 0,
+        overrun: false,
+        bufferedFrames: 0,
+        capacityFrames: cap,
+        freeFrames: 0,
+        reason: 'uninitialized',
+      };
+    }
+
+    const pcm = extractInterleavedFloat32(samples);
+    if (!pcm) {
+      return {
+        ok: false,
+        acceptedFrames: 0,
+        submittedFrames: 0,
+        droppedFrames: 0,
+        overrun: false,
+        bufferedFrames: this._computeBufferedFrames(),
+        capacityFrames: cap,
+        freeFrames: this.freeFrames(),
+        reason: 'invalid-input',
+      };
+    }
+
+    const opts = options && typeof options === 'object' ? options : {};
+    const availableInputFrames = Math.floor(pcm.length / channels);
+    const requestedFrameCount =
+      Number.isInteger(opts.frameCount) && opts.frameCount >= 0
+        ? Math.min(opts.frameCount, availableInputFrames)
+        : availableInputFrames;
+
+    if (requestedFrameCount <= 0) {
+      const buffered = this._computeBufferedFrames();
+      return {
+        ok: true,
+        acceptedFrames: 0,
+        submittedFrames: 0,
+        droppedFrames: 0,
+        overrun: false,
+        bufferedFrames: buffered,
+        capacityFrames: cap,
+        freeFrames: Math.max(0, limit - buffered),
+      };
+    }
+
+    const modulus = cap * 2;
+    const write = this._loadHdr(HDR_WRITE_CURSOR);
+    let read = this._loadHdr(HDR_READ_CURSOR);
+    let used = write - read;
+    if (used < 0) {
+      used += modulus;
+    }
+    if (!Number.isFinite(used) || used < 0) {
+      used = 0;
+    } else if (used > cap) {
+      used = cap;
+    }
+
+    const policy = opts.overflowPolicy === 'drop-oldest' ? 'drop-oldest' : 'drop-newest';
+    let free = Math.max(0, limit - used);
+    let srcFrameOffset = 0;
+    let framesToWrite = requestedFrameCount;
+    let dropped = 0;
+
+    if (policy === 'drop-oldest' && requestedFrameCount > free) {
+      const overflow = requestedFrameCount - free;
+      const discardQueued = Math.min(used, overflow);
+      if (discardQueued > 0) {
+        read = (read + discardQueued) % modulus;
+        this._storeHdr(HDR_READ_CURSOR, read);
+        used -= discardQueued;
+        free = Math.max(0, limit - used);
+      }
+      const skipIncoming = Math.max(0, requestedFrameCount - free);
+      srcFrameOffset = skipIncoming;
+      framesToWrite = requestedFrameCount - skipIncoming;
+      dropped = discardQueued + skipIncoming;
+    } else {
+      framesToWrite = requestedFrameCount <= free ? requestedFrameCount : free;
+      dropped = requestedFrameCount - framesToWrite;
+    }
+
+    if (framesToWrite > 0) {
+      const writeSlot = write >= cap ? write - cap : write;
+      const firstFrames = Math.min(framesToWrite, cap - writeSlot);
+      const secondFrames = framesToWrite - firstFrames;
+      const srcBase = srcFrameOffset * channels;
+      const firstSampleCount = firstFrames * channels;
+      const dstFirstBase = writeSlot * channels;
+
+      let sanitized = 0;
+      for (let i = 0; i < firstSampleCount; i++) {
+        let s = pcm[srcBase + i];
+        if (!Number.isFinite(s)) {
+          s = 0.0;
+          sanitized += 1;
+        }
+        ringSamples[dstFirstBase + i] = s;
+      }
+
+      if (secondFrames > 0) {
+        const secondSampleCount = secondFrames * channels;
+        const srcSecondBase = srcBase + firstSampleCount;
+        for (let i = 0; i < secondSampleCount; i++) {
+          let s = pcm[srcSecondBase + i];
+          if (!Number.isFinite(s)) {
+            s = 0.0;
+            sanitized += 1;
+          }
+          ringSamples[i] = s;
+        }
+      }
+
+      if (sanitized > 0) {
+        this._sanitizedSamples += sanitized;
+      }
+
+      let nextWrite = write + framesToWrite;
+      if (nextWrite >= modulus) {
+        nextWrite -= modulus;
+      }
+      this._storeHdr(HDR_WRITE_CURSOR, nextWrite);
+      this._submittedFrames += framesToWrite;
+      this._submittedBatches += 1;
+    }
+
+    if (dropped > 0) {
+      this._addHdr(HDR_OVERFLOWS, 1);
+      this._addHdr(HDR_DROPPED_FRAMES, dropped);
+    }
+
+    const nextBuffered = Math.min(cap, used + framesToWrite);
+    return {
+      ok: true,
+      acceptedFrames: framesToWrite,
+      submittedFrames: framesToWrite,
+      droppedFrames: dropped,
+      overrun: dropped > 0,
+      bufferedFrames: nextBuffered,
+      capacityFrames: cap,
+      freeFrames: Math.max(0, limit - nextBuffered),
+    };
+  }
+
+  /**
+   * Pulls interleaved PCM frames from the bounded ring buffer with underrun
+   * zero-fill guard and atomic underrun telemetry accounting.
+   *
+   * Accepts either a destination `Float32Array` (filled in place, zero-padded on
+   * underrun) or a non-negative integer frame count (drains without allocating).
+   *
+   * @param {Float32Array|number} outputOrFrames
+   * @param {object} [options]
+   * @param {boolean} [options.applyGain=true]
+   * @returns {{ ok: boolean, framesRead: number, requestedFrames: number, underrun: boolean, underrunFrames: number, bufferedFrames: number }}
+   */
+  pullPcm(outputOrFrames, options = {}) {
+    const cap = this._capacityFrames;
+    const channels = this._channels;
+    const ctrl = this._activeCtrl();
+    const ringSamples = this._activeSamples();
+
+    let output = null;
+    let requestedFrames = 0;
+
+    if (outputOrFrames instanceof Float32Array) {
+      if (
+        !outputOrFrames.buffer ||
+        (!isSharedArrayBufferValue(outputOrFrames.buffer) &&
+          isDetachedArrayBuffer(outputOrFrames.buffer))
+      ) {
+        return {
+          ok: false,
+          framesRead: 0,
+          requestedFrames: 0,
+          underrun: false,
+          underrunFrames: 0,
+          bufferedFrames: this._computeBufferedFrames(),
+        };
+      }
+      output = outputOrFrames;
+      requestedFrames = channels > 0 ? Math.floor(output.length / channels) : 0;
+    } else if (typeof outputOrFrames === 'number' && Number.isFinite(outputOrFrames)) {
+      requestedFrames = Math.max(0, Math.floor(outputOrFrames));
+    } else {
+      return {
+        ok: false,
+        framesRead: 0,
+        requestedFrames: 0,
+        underrun: false,
+        underrunFrames: 0,
+        bufferedFrames: this._computeBufferedFrames(),
+      };
+    }
+
+    if (!ctrl || !ringSamples || cap <= 0 || channels <= 0 || requestedFrames <= 0) {
+      if (output && requestedFrames > 0) {
+        output.fill(0, 0, requestedFrames * channels);
+      }
+      return {
+        ok: Boolean(ctrl && ringSamples && cap > 0 && channels > 0),
+        framesRead: 0,
+        requestedFrames,
+        underrun: false,
+        underrunFrames: 0,
+        bufferedFrames: this._computeBufferedFrames(),
+      };
+    }
+
+    const opts = options && typeof options === 'object' ? options : {};
+    const applyGain = opts.applyGain !== false;
+    const effectiveGain = applyGain ? (this._muted ? 0.0 : clampVolume(this._volume, 1.0)) : 1.0;
+
+    const modulus = cap * 2;
+    const read = this._loadHdr(HDR_READ_CURSOR);
+    const write = this._loadHdr(HDR_WRITE_CURSOR);
+    let used = write - read;
+    if (used < 0) {
+      used += modulus;
+    }
+    if (!Number.isFinite(used) || used < 0) {
+      used = 0;
+    } else if (used > cap) {
+      used = cap;
+    }
+
+    const framesToRead = requestedFrames <= used ? requestedFrames : used;
+    const missingFrames = requestedFrames - framesToRead;
+
+    if (framesToRead > 0) {
+      if (output) {
+        const readSlot = read >= cap ? read - cap : read;
+        const firstFrames = Math.min(framesToRead, cap - readSlot);
+        const secondFrames = framesToRead - firstFrames;
+        const firstSampleCount = firstFrames * channels;
+        const srcFirstBase = readSlot * channels;
+
+        if (effectiveGain === 0.0) {
+          output.fill(0, 0, framesToRead * channels);
+        } else {
+          let sanitized = 0;
+          for (let i = 0; i < firstSampleCount; i++) {
+            let s = ringSamples[srcFirstBase + i];
+            if (!Number.isFinite(s)) {
+              s = 0.0;
+              sanitized += 1;
+            }
+            output[i] = effectiveGain === 1.0 ? s : s * effectiveGain;
+          }
+          if (secondFrames > 0) {
+            const secondSampleCount = secondFrames * channels;
+            for (let i = 0; i < secondSampleCount; i++) {
+              let s = ringSamples[i];
+              if (!Number.isFinite(s)) {
+                s = 0.0;
+                sanitized += 1;
+              }
+              output[firstSampleCount + i] = effectiveGain === 1.0 ? s : s * effectiveGain;
+            }
+          }
+          if (sanitized > 0) {
+            this._sanitizedSamples += sanitized;
+          }
+        }
+      }
+
+      let nextRead = read + framesToRead;
+      if (nextRead >= modulus) {
+        nextRead -= modulus;
+      }
+      this._storeHdr(HDR_READ_CURSOR, nextRead);
+      this._consumedFrames += framesToRead;
+    }
+
+    if (missingFrames > 0) {
+      if (output) {
+        output.fill(0, framesToRead * channels, requestedFrames * channels);
+      }
+      this._addHdr(HDR_UNDERRUNS, 1);
+      this._addHdr(HDR_UNDERRUN_FRAMES, missingFrames);
+    }
+
+    return {
+      ok: true,
+      framesRead: framesToRead,
+      requestedFrames,
+      underrun: missingFrames > 0,
+      underrunFrames: missingFrames,
+      bufferedFrames: Math.max(0, used - framesToRead),
+    };
+  }
+
+  /**
+   * Alias for `pullPcm(outputOrFrames, options)`.
+   */
+  consumePcm(outputOrFrames, options = {}) {
+    return this.pullPcm(outputOrFrames, options);
+  }
+
+  /**
+   * Resets queued PCM frames, ring cursors, and underrun/overrun/submit telemetry
+   * counters cleanly without closing the AudioContext.
+   *
+   * @param {object} [options]
+   * @param {boolean} [options.preserveStats=false] Keep telemetry counters while only flushing the ring.
+   * @param {boolean} [options.resetGain=false] Reset volume to 1.0 and muted to false.
+   * @param {boolean} [options.clearGestureListeners=false] Remove armed user-gesture unlock listeners.
+   * @returns {ReturnType<AudioEngine['getAudioStats']>}
+   */
+  reset(options = {}) {
+    const opts = options && typeof options === 'object' ? options : {};
+
+    const ctrl = this._activeCtrl();
+    if (ctrl) {
+      this._storeHdr(HDR_WRITE_CURSOR, 0);
+      this._storeHdr(HDR_READ_CURSOR, 0);
+      if (!opts.preserveStats) {
+        this._storeHdr(HDR_UNDERRUNS, 0);
+        this._storeHdr(HDR_UNDERRUN_FRAMES, 0);
+        this._storeHdr(HDR_OVERFLOWS, 0);
+        this._storeHdr(HDR_DROPPED_FRAMES, 0);
+      }
+    }
+
+    const samples = this._activeSamples();
+    if (samples) {
+      samples.fill(0);
+    }
+
+    if (!opts.preserveStats) {
+      this._submittedFrames = 0;
+      this._submittedBatches = 0;
+      this._consumedFrames = 0;
+      this._sanitizedSamples = 0;
+      this._resumeAttempts = 0;
+      this._resumeSuccesses = 0;
+      this._resumeFailures = 0;
+      this._lastResumeError = null;
+      this._error = null;
+      this._gainClamps = 0;
+      this._invalidGainInputs = 0;
+    }
+
+    if (opts.resetGain) {
+      this.setVolume(1.0);
+      this.setMuted(false);
+    }
+
+    if (opts.clearGestureListeners && this._gestureCleanup) {
+      this._gestureCleanup();
+      this._gestureCleanup = null;
+    }
+
+    return this.getAudioStats();
   }
 
   /**
@@ -997,20 +1787,21 @@ export class AudioEngine {
     let overflows = 0;
     let droppedFrames = 0;
 
-    if (this._ctrl && this._capacityFrames > 0) {
-      const write = Atomics.load(this._ctrl, HDR_WRITE_CURSOR);
-      const read = Atomics.load(this._ctrl, HDR_READ_CURSOR);
-      let used = write - read;
-      if (used < 0) {
-        used += this._capacityFrames * 2;
-      }
-      bufferedFrames = sanitizeFiniteNonNegInt(used, 0);
-      underruns = sanitizeFiniteNonNegInt(Atomics.load(this._ctrl, HDR_UNDERRUNS), 0);
-      underrunFrames = sanitizeFiniteNonNegInt(Atomics.load(this._ctrl, HDR_UNDERRUN_FRAMES), 0);
-      overflows = sanitizeFiniteNonNegInt(Atomics.load(this._ctrl, HDR_OVERFLOWS), 0);
-      droppedFrames = sanitizeFiniteNonNegInt(Atomics.load(this._ctrl, HDR_DROPPED_FRAMES), 0);
+    const ctrl = this._activeCtrl();
+    if (ctrl && this._capacityFrames > 0) {
+      bufferedFrames = this._computeBufferedFrames();
+      underruns = sanitizeFiniteNonNegInt(this._loadHdr(HDR_UNDERRUNS), 0);
+      underrunFrames = sanitizeFiniteNonNegInt(this._loadHdr(HDR_UNDERRUN_FRAMES), 0);
+      overflows = sanitizeFiniteNonNegInt(this._loadHdr(HDR_OVERFLOWS), 0);
+      droppedFrames = sanitizeFiniteNonNegInt(this._loadHdr(HDR_DROPPED_FRAMES), 0);
     }
 
+    const capacityFrames = sanitizeFiniteNonNegInt(
+      this._capacityFrames,
+      this._requestedCapacityFrames
+    );
+    const limit = Math.min(this._maxQueuedFrames, capacityFrames);
+    const freeFrames = Math.max(0, limit - bufferedFrames);
     const outputState = sanitizeOutputState(this.state);
     const gain = clampVolume(this._volume, 1.0);
     const muted = Boolean(this._muted);
@@ -1020,12 +1811,18 @@ export class AudioEngine {
       sampleRate: sanitizePositiveFiniteNumber(this.sampleRate, this._requestedSampleRate),
       state: this.state,
       outputState,
+      contextState: outputState,
       channels: sanitizeFiniteNonNegInt(this._channels, this._requestedChannels),
-      capacityFrames: sanitizeFiniteNonNegInt(this._capacityFrames, this._requestedCapacityFrames),
+      capacityFrames,
       bufferedFrames,
+      freeFrames,
+      submittedFrames: sanitizeFiniteNonNegInt(this._submittedFrames, 0),
+      consumedFrames: sanitizeFiniteNonNegInt(this._consumedFrames, 0),
+      sanitizedSamples: sanitizeFiniteNonNegInt(this._sanitizedSamples, 0),
       underruns,
       underrunFrames,
       overflows,
+      overruns: overflows,
       droppedFrames,
       volume: gain,
       gain,
@@ -1050,14 +1847,20 @@ export class AudioEngine {
     const telemetry = this.getTelemetry();
     return {
       outputState: telemetry.outputState,
+      contextState: telemetry.contextState,
       state: telemetry.outputState,
       sampleRate: telemetry.sampleRate,
       channels: telemetry.channels,
       capacityFrames: telemetry.capacityFrames,
       bufferedFrames: telemetry.bufferedFrames,
+      freeFrames: telemetry.freeFrames,
+      submittedFrames: telemetry.submittedFrames,
+      consumedFrames: telemetry.consumedFrames,
+      sanitizedSamples: telemetry.sanitizedSamples,
       underruns: telemetry.underruns,
       underrunFrames: telemetry.underrunFrames,
       overflows: telemetry.overflows,
+      overruns: telemetry.overruns,
       droppedFrames: telemetry.droppedFrames,
       gain: telemetry.gain,
       volume: telemetry.volume,
@@ -1075,6 +1878,45 @@ export class AudioEngine {
   }
 
   /**
+   * Returns a compact, sanitized PCM & AudioContext telemetry snapshot for
+   * runtime dashboards and diagnostics:
+   * `{ submittedFrames, droppedFrames, underruns, overruns, contextState, sampleRate, muted, ... }`.
+   */
+  getAudioStats() {
+    const telemetry = this.getTelemetry();
+    return {
+      submittedFrames: telemetry.submittedFrames,
+      droppedFrames: telemetry.droppedFrames,
+      underruns: telemetry.underruns,
+      underrunFrames: telemetry.underrunFrames,
+      overruns: telemetry.overruns,
+      contextState: telemetry.contextState,
+      sampleRate: telemetry.sampleRate,
+      muted: telemetry.muted,
+      volume: telemetry.volume,
+      effectiveGain: telemetry.effectiveGain,
+      channels: telemetry.channels,
+      capacityFrames: telemetry.capacityFrames,
+      bufferedFrames: telemetry.bufferedFrames,
+      freeFrames: telemetry.freeFrames,
+      consumedFrames: telemetry.consumedFrames,
+      sanitizedSamples: telemetry.sanitizedSamples,
+      resumeAttempts: telemetry.resumeAttempts,
+      resumeSuccesses: telemetry.resumeSuccesses,
+      resumeFailures: telemetry.resumeFailures,
+      lastResumeError: telemetry.lastResumeError,
+    };
+  }
+
+  /**
+   * Alias for `destroy()`: idempotently stops the worklet, removes gesture
+   * listeners, disconnects nodes, and closes the AudioContext.
+   */
+  async close() {
+    return this.destroy();
+  }
+
+  /**
    * Stops the AudioWorkletProcessor, removes any pending user-gesture unlock
    * listeners, disconnects the node, and closes the AudioContext.
    */
@@ -1085,9 +1927,14 @@ export class AudioEngine {
 
     this._destroyed = true;
     this._status = 'closed';
+    this._resumePromise = null;
 
     if (this._gestureCleanup) {
-      this._gestureCleanup();
+      try {
+        this._gestureCleanup();
+      } catch {
+        // Ignore teardown errors on gesture cleanup.
+      }
       this._gestureCleanup = null;
     }
 
@@ -1120,10 +1967,14 @@ export class AudioEngine {
     this._context = null;
     if (ctx) {
       if (this._boundContextStateChange) {
-        if (typeof ctx.removeEventListener === 'function') {
-          ctx.removeEventListener('statechange', this._boundContextStateChange);
-        } else if (ctx.onstatechange === this._boundContextStateChange) {
-          ctx.onstatechange = null;
+        try {
+          if (typeof ctx.removeEventListener === 'function') {
+            ctx.removeEventListener('statechange', this._boundContextStateChange);
+          } else if (ctx.onstatechange === this._boundContextStateChange) {
+            ctx.onstatechange = null;
+          }
+        } catch {
+          // Ignore teardown errors on context listener removal.
         }
         this._boundContextStateChange = null;
       }

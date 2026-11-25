@@ -10,6 +10,7 @@ import {
   AudioEngine,
   PROCESSOR_NAME,
   DEFAULT_MAX_RESUME_RETRIES,
+  DEFAULT_GESTURE_EVENTS,
   MAX_ERROR_MESSAGE_LENGTH,
   clampVolume,
   clampGain,
@@ -1220,4 +1221,395 @@ test('AudioEngine counts AudioContext stateTransitions accurately and returns sa
   // Idempotent destroy does not increment stateTransitions again.
   await engine.destroy();
   assert.equal(engine.getStats().stateTransitions, 5);
+});
+
+test('W214: suspended-context autoplay guard and headless gesture resume never throw', async () => {
+  // 1. Headless environment (no window / null target) and sync-throwing resume() never throw.
+  let throwSync = true;
+  class AutoplayBlockedContext {
+    constructor(opts = {}) {
+      this.sampleRate = opts.sampleRate ?? 48000;
+      this.state = 'suspended';
+      this.destination = { kind: 'mock-destination' };
+      this.resumeCalls = 0;
+      this.suspendCalls = 0;
+      this.closeCalls = 0;
+      this.audioWorklet = { addModule: async () => {} };
+    }
+    resume() {
+      this.resumeCalls += 1;
+      if (throwSync) {
+        throw new Error('NotAllowedError: play() failed because the user did not interact');
+      }
+      this.state = 'running';
+      return Promise.resolve();
+    }
+    suspend() {
+      this.suspendCalls += 1;
+      this.state = 'suspended';
+      return Promise.resolve();
+    }
+    close() {
+      this.closeCalls += 1;
+      this.state = 'closed';
+      return Promise.resolve();
+    }
+  }
+
+  const { MockAudioWorkletNode } = createMockWebAudioEnv();
+  const engine = new AudioEngine({
+    sampleRate: 44100,
+    AudioContextCtor: AutoplayBlockedContext,
+    AudioWorkletNodeCtor: MockAudioWorkletNode,
+  });
+
+  // Calling resumeOnUserGesture without a browser window or with a hostile target never throws.
+  const noopCleanup = engine.resumeOnUserGesture(null);
+  assert.equal(typeof noopCleanup, 'function');
+  noopCleanup();
+
+  const hostileTarget = {
+    addEventListener() {
+      throw new Error('restricted host');
+    },
+    removeEventListener() {
+      throw new Error('restricted host');
+    },
+  };
+  const hostileCleanup = engine.resumeOnUserGesture(hostileTarget);
+  assert.equal(typeof hostileCleanup, 'function');
+  hostileCleanup();
+
+  // Arm gesture before start(); firing gesture before start() safely re-arms without throwing.
+  const target = createMockEventTarget();
+  engine.resumeOnUserGesture(target);
+  for (const evt of DEFAULT_GESTURE_EVENTS) {
+    assert.equal(target.listenerCount(evt), 1);
+  }
+  target.dispatch('click');
+  assert.equal(target.listenerCount('pointerdown'), 1);
+
+  const startRes = await engine.start();
+  assert.equal(startRes.ok, true);
+  assert.equal(engine.contextState, 'suspended');
+  assert.equal(engine.getAudioStats().contextState, 'suspended');
+  assert.equal(engine.getAudioStats().sampleRate, 44100);
+
+  // Sync-throwing resume() is caught cleanly and listeners re-arm for next gesture.
+  target.dispatch('touchstart');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(engine.context.resumeCalls, 1);
+  assert.equal(engine.getAudioStats().contextState, 'suspended');
+  assert.equal(engine.getAudioStats().resumeFailures, 1);
+  assert.match(engine.getAudioStats().lastResumeError, /NotAllowedError/);
+  assert.equal(target.listenerCount('click'), 1);
+
+  // Next gesture succeeds -> context becomes running and all gesture listeners are removed.
+  throwSync = false;
+  target.dispatch('click');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(engine.context.resumeCalls, 2);
+  assert.equal(engine.contextState, 'running');
+  assert.equal(engine.getAudioStats().contextState, 'running');
+  assert.equal(engine.getAudioStats().resumeSuccesses, 1);
+  assert.equal(engine.getAudioStats().lastResumeError, null);
+  for (const evt of DEFAULT_GESTURE_EVENTS) {
+    assert.equal(target.listenerCount(evt), 0);
+  }
+
+  // suspend() safely transitions running -> suspended; externally closed context does not throw on resume().
+  assert.equal(await engine.suspend(), true);
+  assert.equal(engine.getAudioStats().contextState, 'suspended');
+
+  engine.context.state = 'closed';
+  const callsBeforeClosedResume = engine.context.resumeCalls;
+  assert.equal(await engine.resume(), false);
+  assert.equal(engine.context.resumeCalls, callsBeforeClosedResume);
+
+  await engine.close();
+
+  // 2. autoResumeOnGesture option arms listeners automatically on suspended start().
+  const autoEnv = createMockWebAudioEnv({ initialState: 'suspended' });
+  const autoTarget = createMockEventTarget();
+  const autoEngine = new AudioEngine({
+    AudioContextCtor: autoEnv.MockAudioContext,
+    AudioWorkletNodeCtor: autoEnv.MockAudioWorkletNode,
+    autoResumeOnGesture: true,
+    gestureTarget: autoTarget,
+  });
+  await autoEngine.start();
+  assert.equal(autoTarget.listenerCount('pointerdown'), 1);
+  assert.equal(autoTarget.listenerCount('touchstart'), 1);
+
+  autoTarget.dispatch('touchstart');
+  await Promise.resolve();
+  assert.equal(autoEngine.getAudioStats().contextState, 'running');
+  assert.equal(autoTarget.listenerCount('pointerdown'), 0);
+  assert.equal(autoTarget.listenerCount('touchstart'), 0);
+  await autoEngine.close();
+});
+
+test('W214: bounded PCM submitPcm/pullPcm tracks submittedFrames, droppedFrames, underruns, and overruns in getAudioStats()', async () => {
+  const { MockAudioContext, MockAudioWorkletNode, events } = createMockWebAudioEnv({
+    initialState: 'running',
+    attachRealProcessor: true,
+  });
+
+  const engine = new AudioEngine({
+    sampleRate: 48000,
+    channels: 2,
+    capacityFrames: 256,
+    AudioContextCtor: MockAudioContext,
+    AudioWorkletNodeCtor: MockAudioWorkletNode,
+  });
+  await engine.start();
+
+  // Invalid inputs never throw and never corrupt counters.
+  assert.equal(engine.submitPcm(null).ok, false);
+  assert.equal(engine.submitPcm(undefined).ok, false);
+  assert.equal(engine.submitPcm('bad').ok, false);
+  assert.equal(engine.pullPcm('bad').ok, false);
+
+  // Submit 200 valid frames (fits cleanly in 256-frame ring).
+  const chunk1 = makeStereoInterleaved(0, 200);
+  const r1 = engine.submitPcm(chunk1);
+  assert.equal(r1.ok, true);
+  assert.equal(r1.acceptedFrames, 200);
+  assert.equal(r1.droppedFrames, 0);
+  assert.equal(r1.overrun, false);
+  assert.equal(r1.bufferedFrames, 200);
+  assert.equal(r1.freeFrames, 56);
+
+  // Submit 100 more frames into 56 free slots -> 56 accepted, 44 dropped, 1 overrun.
+  const chunk2 = makeStereoInterleaved(200, 100);
+  const r2 = engine.submitPcm(chunk2);
+  assert.equal(r2.ok, true);
+  assert.equal(r2.acceptedFrames, 56);
+  assert.equal(r2.droppedFrames, 44);
+  assert.equal(r2.overrun, true);
+  assert.equal(r2.bufferedFrames, 256);
+  assert.equal(r2.freeFrames, 0);
+
+  let stats = engine.getAudioStats();
+  assert.equal(stats.submittedFrames, 256);
+  assert.equal(stats.droppedFrames, 44);
+  assert.equal(stats.overruns, 1);
+  assert.equal(stats.underruns, 0);
+  assert.equal(stats.contextState, 'running');
+  assert.equal(stats.sampleRate, 48000);
+  assert.equal(stats.muted, false);
+  assert.equal(stats.bufferedFrames, 256);
+
+  // Drive the attached real AudioWorkletProcessor: 2 full 128-frame quanta consume exact samples,
+  // 3rd quantum triggers an underrun.
+  const proc = events.nodes[0]._processor;
+  const outQ = makePlanarOutput(2, 128, 99.0);
+  assert.equal(proc.process([], outQ), true);
+  assert.equal(outQ[0][0][0], chunk1[0]);
+  assert.equal(outQ[0][1][0], chunk1[1]);
+  assert.equal(proc.process([], outQ), true);
+  assert.equal(outQ[0][0][127], chunk2[55 * 2]);
+  assert.equal(outQ[0][1][127], chunk2[55 * 2 + 1]);
+  assert.equal(proc.process([], outQ), true); // full underrun (128 frames)
+  assert.ok(outQ[0][0].every((v) => v === 0));
+
+  stats = engine.getAudioStats();
+  assert.equal(stats.underruns, 1);
+  assert.equal(stats.underrunFrames, 128);
+  assert.equal(stats.bufferedFrames, 0);
+
+  // Submit PCM containing NaN / ±Infinity -> sanitized to 0.0; partial pullPcm zero-fills shortfall and records underrun.
+  const dirty = new Float32Array([0.5, Number.NaN, Number.POSITIVE_INFINITY, -0.25, 0.75, Number.NEGATIVE_INFINITY]);
+  const rDirty = engine.submitPcm(dirty);
+  assert.equal(rDirty.acceptedFrames, 3);
+  assert.equal(engine.getAudioStats().sanitizedSamples, 3);
+
+  const pulled = new Float32Array(10 * 2);
+  pulled.fill(42.0);
+  const pullRes = engine.pullPcm(pulled);
+  assert.equal(pullRes.ok, true);
+  assert.equal(pullRes.framesRead, 3);
+  assert.equal(pullRes.underrun, true);
+  assert.equal(pullRes.underrunFrames, 7);
+  assert.equal(pulled[0], 0.5);
+  assert.equal(pulled[1], 0.0);
+  assert.equal(pulled[2], 0.0);
+  assert.equal(pulled[3], -0.25);
+  assert.equal(pulled[4], 0.75);
+  assert.equal(pulled[5], 0.0);
+  for (let i = 6; i < pulled.length; i++) {
+    assert.equal(pulled[i], 0.0, `underrun tail sample ${i} must be zero-filled`);
+  }
+
+  stats = engine.getAudioStats();
+  assert.equal(stats.submittedFrames, 259);
+  assert.equal(stats.underruns, 2);
+  assert.equal(stats.underrunFrames, 128 + 7);
+  assert.equal(stats.overruns, 1);
+  assert.equal(stats.droppedFrames, 44);
+
+  // Defensive snapshot: mutating returned object never mutates engine internals.
+  stats.submittedFrames = -999;
+  stats.overruns = 999;
+  stats.muted = true;
+  const freshStats = engine.getAudioStats();
+  assert.equal(freshStats.submittedFrames, 259);
+  assert.equal(freshStats.overruns, 1);
+  assert.equal(freshStats.muted, false);
+
+  // drop-oldest overflow policy keeps newest samples and counts overrun + droppedFrames.
+  const newestChunk = makeStereoInterleaved(1000, 300);
+  const dropOldRes = engine.submitPcm(newestChunk, { overflowPolicy: 'drop-oldest' });
+  assert.equal(dropOldRes.ok, true);
+  assert.equal(dropOldRes.acceptedFrames, 256);
+  assert.equal(dropOldRes.droppedFrames, 44);
+  assert.equal(dropOldRes.overrun, true);
+  assert.equal(engine.getAudioStats().overruns, 2);
+  assert.equal(engine.getAudioStats().droppedFrames, 88);
+
+  const checkNewest = new Float32Array(4 * 2);
+  engine.pullPcm(checkNewest);
+  assert.equal(checkNewest[0], newestChunk[44 * 2]);
+  assert.equal(checkNewest[1], newestChunk[44 * 2 + 1]);
+
+  await engine.close();
+});
+
+test('W214: mute/unmute controls silence output, update worklet, and reflect in getAudioStats()', async () => {
+  const { MockAudioContext, MockAudioWorkletNode, events } = createMockWebAudioEnv({
+    initialState: 'running',
+  });
+
+  const engine = new AudioEngine({
+    capacityFrames: 128,
+    channels: 2,
+    volume: 0.5,
+    muted: false,
+    AudioContextCtor: MockAudioContext,
+    AudioWorkletNodeCtor: MockAudioWorkletNode,
+  });
+  await engine.start();
+
+  assert.equal(engine.getAudioStats().muted, false);
+  assert.equal(engine.getAudioStats().effectiveGain, 0.5);
+
+  // Mute via mute() helper: silences pulled PCM while still consuming frames.
+  assert.equal(engine.mute(), true);
+  assert.equal(engine.muted, true);
+  assert.equal(engine.getAudioStats().muted, true);
+  assert.equal(engine.getAudioStats().effectiveGain, 0.0);
+
+  const ones = new Float32Array(16 * 2).fill(1.0);
+  engine.submitPcm(ones);
+  const mutedOut = new Float32Array(16 * 2).fill(7.0);
+  const mutedPull = engine.pullPcm(mutedOut);
+  assert.equal(mutedPull.framesRead, 16);
+  assert.equal(mutedPull.underrun, false);
+  assert.ok(mutedOut.every((v) => v === 0.0));
+  assert.equal(engine.availableFrames(), 0);
+
+  // Unmute via unmute() helper: restores volume scaling on pulled PCM.
+  assert.equal(engine.unmute(), false);
+  assert.equal(engine.muted, false);
+  assert.equal(engine.getAudioStats().muted, false);
+  assert.equal(engine.getAudioStats().effectiveGain, 0.5);
+
+  engine.submitPcm(ones);
+  const unmutedOut = new Float32Array(16 * 2);
+  engine.pullPcm(unmutedOut);
+  assert.ok(unmutedOut.every((v) => v === 0.5));
+
+  // toggleMute() flips state cleanly and posts expected messages to worklet.
+  assert.equal(engine.toggleMute(), true);
+  assert.equal(engine.toggleMute(), false);
+  assert.deepEqual(events.nodes[0].postedMessages, [
+    { type: 'setMuted', muted: true },
+    { type: 'setMuted', muted: false },
+    { type: 'setMuted', muted: true },
+    { type: 'setMuted', muted: false },
+  ]);
+
+  await engine.close();
+});
+
+test('W214: reset() and close() clean up ring state, telemetry counters, gesture listeners, and reject post-close submissions', async () => {
+  const { MockAudioContext, MockAudioWorkletNode, events } = createMockWebAudioEnv({
+    initialState: 'suspended',
+  });
+
+  const engine = new AudioEngine({
+    capacityFrames: 64,
+    channels: 2,
+    volume: 0.4,
+    AudioContextCtor: MockAudioContext,
+    AudioWorkletNodeCtor: MockAudioWorkletNode,
+  });
+  await engine.start();
+
+  const target = createMockEventTarget();
+  engine.resumeOnUserGesture(target);
+  assert.equal(target.listenerCount('pointerdown'), 1);
+
+  // Populate ring, force 1 overrun and 1 underrun.
+  engine.submitPcm(makeStereoInterleaved(0, 80)); // 64 written, 16 dropped, 1 overrun
+  engine.consumePcm(70); // 64 read, 6 underrunFrames, 1 underrun
+  engine.submitPcm(makeStereoInterleaved(0, 20)); // leave 20 frames queued
+
+  let stats = engine.getAudioStats();
+  assert.equal(stats.submittedFrames, 84);
+  assert.equal(stats.droppedFrames, 16);
+  assert.equal(stats.overruns, 1);
+  assert.equal(stats.underruns, 1);
+  assert.equal(stats.bufferedFrames, 20);
+
+  // reset({ preserveStats: true }) flushes queued frames while retaining counters.
+  const flushedStats = engine.reset({ preserveStats: true });
+  assert.equal(flushedStats.bufferedFrames, 0);
+  assert.equal(flushedStats.freeFrames, 64);
+  assert.equal(flushedStats.submittedFrames, 84);
+  assert.equal(flushedStats.overruns, 1);
+  assert.equal(flushedStats.underruns, 1);
+
+  // Full reset() clears cursors and counters while keeping AudioContext open and usable.
+  engine.submitPcm(makeStereoInterleaved(0, 12));
+  const resetStats = engine.reset({ resetGain: true, clearGestureListeners: true });
+  assert.equal(resetStats.submittedFrames, 0);
+  assert.equal(resetStats.droppedFrames, 0);
+  assert.equal(resetStats.underruns, 0);
+  assert.equal(resetStats.overruns, 0);
+  assert.equal(resetStats.bufferedFrames, 0);
+  assert.equal(resetStats.volume, 1.0);
+  assert.equal(resetStats.muted, false);
+  assert.equal(resetStats.contextState, 'suspended');
+  assert.equal(target.listenerCount('pointerdown'), 0);
+
+  // Engine still accepts new PCM after reset().
+  const postResetSubmit = engine.submitPcm(makeStereoInterleaved(0, 16));
+  assert.equal(postResetSubmit.ok, true);
+  assert.equal(postResetSubmit.acceptedFrames, 16);
+  assert.equal(engine.getAudioStats().submittedFrames, 16);
+
+  // Re-arm gesture listeners, then close() -> cleans up listeners, node, context, and is idempotent.
+  engine.resumeOnUserGesture(target);
+  assert.equal(target.listenerCount('pointerdown'), 1);
+
+  await engine.close();
+  assert.equal(engine.contextState, 'closed');
+  assert.equal(engine.getAudioStats().contextState, 'closed');
+  assert.equal(target.listenerCount('pointerdown'), 0);
+  assert.equal(target.listenerCount('keydown'), 0);
+  assert.equal(events.nodes[0].disconnected, true);
+  assert.equal(events.nodes[0].portClosed, true);
+  assert.equal(events.contexts[0].closeCalls, 1);
+
+  // Post-close submitPcm is safely rejected without throwing or mutating submittedFrames/overruns.
+  const postCloseSubmit = engine.submitPcm(makeStereoInterleaved(0, 128));
+  assert.equal(postCloseSubmit.ok, false);
+  assert.equal(postCloseSubmit.reason, 'closed');
+  assert.equal(engine.getAudioStats().submittedFrames, 16);
+  assert.equal(engine.getAudioStats().overruns, 0);
+
+  // Second close() is an idempotent no-op.
+  await engine.close();
+  assert.equal(events.contexts[0].closeCalls, 1);
 });
