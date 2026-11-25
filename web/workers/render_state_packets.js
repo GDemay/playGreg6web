@@ -605,53 +605,77 @@ function getMaxComputeWorkgroupsPerDimension(deviceOrLimits) {
 
 // Validates and clamps compute dispatch workgroup counts against WebGPU limits.
 // Zero or invalid dimensions are skipped; oversized dimensions are clamped to maxComputeWorkgroupsPerDimension.
-function validateComputeDispatch(x, y, z, deviceOrLimits) {
+function validateComputeDispatch(x, y, z, deviceOrLimits, out = null) {
   const maxDim = getMaxComputeWorkgroupsPerDimension(deviceOrLimits);
   const fx = typeof x === 'number' && Number.isFinite(x) ? Math.floor(x) : 0;
   const fy = typeof y === 'number' && Number.isFinite(y) ? Math.floor(y) : 0;
   const fz = typeof z === 'number' && Number.isFinite(z) ? Math.floor(z) : 0;
-  if (fx <= 0 || fy <= 0 || fz <= 0) {
-    return {
-      skip: true,
-      clamped: false,
-      x: 0,
-      y: 0,
-      z: 0,
-      maxWorkgroupsPerDimension: maxDim,
-      reason: 'zero-dimension',
-    };
-  }
-  if (fx > maxDim || fy > maxDim || fz > maxDim) {
-    return {
-      skip: false,
-      clamped: true,
-      x: Math.min(fx, maxDim),
-      y: Math.min(fy, maxDim),
-      z: Math.min(fz, maxDim),
-      maxWorkgroupsPerDimension: maxDim,
-      reason: 'exceeds-limit',
-    };
-  }
-  return {
+  const dst = out || {
     skip: false,
     clamped: false,
-    x: fx,
-    y: fy,
-    z: fz,
+    x: 0,
+    y: 0,
+    z: 0,
     maxWorkgroupsPerDimension: maxDim,
     reason: null,
   };
+  dst.maxWorkgroupsPerDimension = maxDim;
+  if (fx <= 0 || fy <= 0 || fz <= 0) {
+    dst.skip = true;
+    dst.clamped = false;
+    dst.x = 0;
+    dst.y = 0;
+    dst.z = 0;
+    dst.reason = 'zero-dimension';
+    return dst;
+  }
+  if (fx > maxDim || fy > maxDim || fz > maxDim) {
+    dst.skip = false;
+    dst.clamped = true;
+    dst.x = Math.min(fx, maxDim);
+    dst.y = Math.min(fy, maxDim);
+    dst.z = Math.min(fz, maxDim);
+    dst.reason = 'exceeds-limit';
+    return dst;
+  }
+  dst.skip = false;
+  dst.clamped = false;
+  dst.x = fx;
+  dst.y = fy;
+  dst.z = fz;
+  dst.reason = null;
+  return dst;
 }
 
 // Decodes an ABI v2 CreateTexture2 payload (opcode 35, 40-byte GpuCreateTexture2Payload).
-function decodeCreateTexture2(view, offset = 0, payloadBytes) {
-  const available = payloadBytes !== undefined ? payloadBytes : view.byteLength - offset;
+// Supports an optional pre-allocated `out` scratch target (as 4th arg, or 3rd arg when payloadBytes is omitted).
+function decodeCreateTexture2(view, offset = 0, payloadBytes, out = null) {
+  let targetOut = out;
+  let explicitPayloadBytes = payloadBytes;
+  if (typeof payloadBytes === 'object' && payloadBytes !== null && out === null) {
+    targetOut = payloadBytes;
+    explicitPayloadBytes = undefined;
+  }
+  const writeError = (id, message) => {
+    if (targetOut) {
+      targetOut.id = id;
+      targetOut.error = message;
+      if ('descriptor' in targetOut) delete targetOut.descriptor;
+      return targetOut;
+    }
+    return { id, error: message };
+  };
+  if (!view) {
+    return writeError(0, `CreateTexture2: payload 0 < ${CREATE_TEXTURE2_BYTES} bytes`);
+  }
+  const available =
+    explicitPayloadBytes !== undefined ? explicitPayloadBytes : view.byteLength - offset;
   if (
     offset < 0 ||
     available < CREATE_TEXTURE2_BYTES ||
     offset + CREATE_TEXTURE2_BYTES > view.byteLength
   ) {
-    return { id: 0, error: `CreateTexture2: payload ${available} < ${CREATE_TEXTURE2_BYTES} bytes` };
+    return writeError(0, `CreateTexture2: payload ${available} < ${CREATE_TEXTURE2_BYTES} bytes`);
   }
   const id = view.getUint32(offset, true);
   const rawWidth = view.getUint32(offset + 4, true);
@@ -666,24 +690,57 @@ function decodeCreateTexture2(view, offset = 0, payloadBytes) {
 
   const format = nameOf(TEXTURE_FORMAT_NAMES, formatCode);
   if (formatCode === 0 || !format || format === 'undefined') {
-    return { id, error: `CreateTexture2 ${id}: invalid texture format code ${formatCode}` };
+    return writeError(id, `CreateTexture2 ${id}: invalid texture format code ${formatCode}`);
   }
   const dimension = nameOf(TEXTURE_DIMENSION_NAMES, dimensionCode);
   if (!dimension) {
-    return { id, error: `CreateTexture2 ${id}: invalid dimension ${dimensionCode}` };
+    return writeError(id, `CreateTexture2 ${id}: invalid dimension ${dimensionCode}`);
   }
   if (viewFormatCount > MAX_TEXTURE_VIEW_FORMATS) {
-    return {
+    return writeError(
       id,
-      error: `CreateTexture2 ${id}: view_format_count ${viewFormatCount} > ${MAX_TEXTURE_VIEW_FORMATS}`,
-    };
+      `CreateTexture2 ${id}: view_format_count ${viewFormatCount} > ${MAX_TEXTURE_VIEW_FORMATS}`
+    );
   }
-  const viewFormats = [];
+
+  let pool = targetOut ? targetOut._pool : null;
+  if (targetOut && !pool) {
+    const sizeObj =
+      targetOut.descriptor && targetOut.descriptor.size && typeof targetOut.descriptor.size === 'object'
+        ? targetOut.descriptor.size
+        : { width: 1, height: 1, depthOrArrayLayers: 1 };
+    const descObj =
+      targetOut.descriptor && typeof targetOut.descriptor === 'object'
+        ? targetOut.descriptor
+        : {
+            size: sizeObj,
+            mipLevelCount: 1,
+            sampleCount: 1,
+            dimension: '2d',
+            format: 'rgba8unorm',
+            usage: 0,
+          };
+    descObj.size = sizeObj;
+    pool = {
+      descriptor: descObj,
+      size: sizeObj,
+      viewFormats: Array.isArray(descObj.viewFormats) ? descObj.viewFormats : [],
+    };
+    Object.defineProperty(targetOut, '_pool', {
+      value: pool,
+      enumerable: false,
+      configurable: false,
+    });
+  }
+
+  const viewFormats = pool ? pool.viewFormats : [];
+  viewFormats.length = 0;
   for (let i = 0; i < viewFormatCount; i += 1) {
     const code = view.getUint8(offset + 32 + i);
     const vf = nameOf(TEXTURE_FORMAT_NAMES, code);
     if (code === 0 || !vf || vf === 'undefined') {
-      return { id, error: `CreateTexture2 ${id}: invalid view format code ${code}` };
+      viewFormats.length = 0;
+      return writeError(id, `CreateTexture2 ${id}: invalid view format code ${code}`);
     }
     viewFormats.push(vf);
   }
@@ -699,6 +756,29 @@ function decodeCreateTexture2(view, offset = 0, payloadBytes) {
   const geometryAllowsMsaa =
     dimension === '2d' && mipLevelCount <= 1 && depthOrArrayLayers === 1;
   const sampleCount = rawSampleCount >= 4 && geometryAllowsMsaa ? 4 : 1;
+
+  if (targetOut) {
+    const size = pool.size;
+    size.width = width;
+    size.height = height;
+    size.depthOrArrayLayers = depthOrArrayLayers;
+    const descriptor = pool.descriptor;
+    descriptor.size = size;
+    descriptor.mipLevelCount = mipLevelCount;
+    descriptor.sampleCount = sampleCount;
+    descriptor.dimension = dimension;
+    descriptor.format = format;
+    descriptor.usage = usage;
+    if (viewFormats.length > 0) {
+      descriptor.viewFormats = viewFormats;
+    } else if ('viewFormats' in descriptor) {
+      delete descriptor.viewFormats;
+    }
+    targetOut.id = id;
+    targetOut.descriptor = descriptor;
+    if ('error' in targetOut) delete targetOut.error;
+    return targetOut;
+  }
 
   const descriptor = {
     size: { width, height, depthOrArrayLayers },
@@ -1281,22 +1361,32 @@ function finiteOr(value, fallback) {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }
 
-function validTargetSize(width, height) {
-  if (
+function isValidTargetDims(width, height) {
+  return (
     typeof width === 'number' &&
     typeof height === 'number' &&
     Number.isFinite(width) &&
     Number.isFinite(height) &&
     width > 0 &&
     height > 0
-  ) {
+  );
+}
+
+function validTargetSize(width, height, out = null) {
+  if (isValidTargetDims(width, height)) {
+    if (out) {
+      out.width = width;
+      out.height = height;
+      return out;
+    }
     return { width, height };
   }
   return null;
 }
 
 // Clamps a guest viewport to the active render target bounds and WebGPU [0, 1] depth range.
-function clampViewportToTarget(viewport, targetSize) {
+// When `out` is provided, writes directly into `out` with zero heap allocations (safe when `out === viewport`).
+function clampViewportToTarget(viewport, targetSize, out = null) {
   const rawX = finiteOr(viewport && viewport.x, 0);
   const rawY = finiteOr(viewport && viewport.y, 0);
   const rawW = finiteOr(viewport && viewport.width, 0);
@@ -1312,12 +1402,21 @@ function clampViewportToTarget(viewport, targetSize) {
   minDepth = minDepth || 0;
   maxDepth = maxDepth || 0;
 
-  const target = targetSize ? validTargetSize(targetSize.width, targetSize.height) : null;
-  if (!target) {
+  const hasTarget = Boolean(targetSize && isValidTargetDims(targetSize.width, targetSize.height));
+  if (!hasTarget) {
     const safeX = Number.isFinite(Math.fround(rawX)) ? Math.max(0, rawX) || 0 : 0;
     const safeY = Number.isFinite(Math.fround(rawY)) ? Math.max(0, rawY) || 0 : 0;
     const safeW = Number.isFinite(Math.fround(rawW)) ? Math.max(0, rawW) || 0 : 0;
     const safeH = Number.isFinite(Math.fround(rawH)) ? Math.max(0, rawH) || 0 : 0;
+    if (out) {
+      out.x = safeX;
+      out.y = safeY;
+      out.width = safeW;
+      out.height = safeH;
+      out.minDepth = minDepth;
+      out.maxDepth = maxDepth;
+      return out;
+    }
     return {
       x: safeX,
       y: safeY,
@@ -1328,8 +1427,8 @@ function clampViewportToTarget(viewport, targetSize) {
     };
   }
 
-  const targetWidth = target.width;
-  const targetHeight = target.height;
+  const targetWidth = targetSize.width;
+  const targetHeight = targetSize.height;
   if (
     rawX >= 0 &&
     rawY >= 0 &&
@@ -1340,11 +1439,24 @@ function clampViewportToTarget(viewport, targetSize) {
     Math.fround(rawX) + Math.fround(rawW) <= targetWidth &&
     Math.fround(rawY) + Math.fround(rawH) <= targetHeight
   ) {
+    const x = rawX || 0;
+    const y = rawY || 0;
+    const width = rawW || 0;
+    const height = rawH || 0;
+    if (out) {
+      out.x = x;
+      out.y = y;
+      out.width = width;
+      out.height = height;
+      out.minDepth = minDepth;
+      out.maxDepth = maxDepth;
+      return out;
+    }
     return {
-      x: rawX || 0,
-      y: rawY || 0,
-      width: rawW || 0,
-      height: rawH || 0,
+      x,
+      y,
+      width,
+      height,
       minDepth,
       maxDepth,
     };
@@ -1365,6 +1477,15 @@ function clampViewportToTarget(viewport, targetSize) {
   }
   if (y + height > targetHeight || Math.fround(y) + Math.fround(height) > targetHeight) {
     height = Math.max(0, Math.floor(targetHeight - Math.fround(y))) || 0;
+  }
+  if (out) {
+    out.x = x;
+    out.y = y;
+    out.width = width;
+    out.height = height;
+    out.minDepth = minDepth;
+    out.maxDepth = maxDepth;
+    return out;
   }
   return { x, y, width, height, minDepth, maxDepth };
 }
@@ -1390,24 +1511,46 @@ function isViewportClamped(raw, clamped) {
 const MAX_SCISSOR_UINT32 = 0xffffffff;
 
 // Clamps a guest integer scissor rect to [0..targetWidth] x [0..targetHeight].
-function clampScissorToTarget(scissor, targetSize) {
+// When `out` is provided, writes directly into `out` with zero heap allocations (safe when `out === scissor`).
+function clampScissorToTarget(scissor, targetSize, out = null) {
   const rawX = Math.min(MAX_SCISSOR_UINT32, Math.max(0, Math.floor(finiteOr(scissor && scissor.x, 0)))) || 0;
   const rawY = Math.min(MAX_SCISSOR_UINT32, Math.max(0, Math.floor(finiteOr(scissor && scissor.y, 0)))) || 0;
   const rawW = Math.min(MAX_SCISSOR_UINT32, Math.max(0, Math.floor(finiteOr(scissor && scissor.width, 0)))) || 0;
   const rawH = Math.min(MAX_SCISSOR_UINT32, Math.max(0, Math.floor(finiteOr(scissor && scissor.height, 0)))) || 0;
 
-  const target = targetSize ? validTargetSize(targetSize.width, targetSize.height) : null;
-  if (!target) {
+  const hasTarget = Boolean(targetSize && isValidTargetDims(targetSize.width, targetSize.height));
+  if (!hasTarget) {
+    if (out) {
+      out.x = rawX;
+      out.y = rawY;
+      out.width = rawW;
+      out.height = rawH;
+      return out;
+    }
     return { x: rawX, y: rawY, width: rawW, height: rawH };
   }
 
-  const targetWidth = Math.floor(target.width);
-  const targetHeight = Math.floor(target.height);
+  const targetWidth = Math.floor(targetSize.width);
+  const targetHeight = Math.floor(targetSize.height);
   if (targetWidth <= 0 || targetHeight <= 0) {
+    if (out) {
+      out.x = rawX;
+      out.y = rawY;
+      out.width = rawW;
+      out.height = rawH;
+      return out;
+    }
     return { x: rawX, y: rawY, width: rawW, height: rawH };
   }
 
   if (rawX + rawW <= targetWidth && rawY + rawH <= targetHeight) {
+    if (out) {
+      out.x = rawX;
+      out.y = rawY;
+      out.width = rawW;
+      out.height = rawH;
+      return out;
+    }
     return { x: rawX, y: rawY, width: rawW, height: rawH };
   }
 
@@ -1415,6 +1558,13 @@ function clampScissorToTarget(scissor, targetSize) {
   const y = Math.min(rawY, targetHeight) || 0;
   const width = Math.min(rawW, targetWidth - x) || 0;
   const height = Math.min(rawH, targetHeight - y) || 0;
+  if (out) {
+    out.x = x;
+    out.y = y;
+    out.width = width;
+    out.height = height;
+    return out;
+  }
   return { x, y, width, height };
 }
 
@@ -1601,10 +1751,356 @@ function sanitizeRenderPassAttachments(descriptor, attachmentSizes = null) {
   return { descriptor: outDescriptor, referenceSize, sanitizedCount, warnings };
 }
 
-// ---- Decoders (pure; also used by the tests) ----
+// ---- Decoders (pure; also used by the tests; W302 zero-alloc scratch reuse) ----
 
-function decodeTextureViewDesc(view, offset) {
-  const desc = {};
+const VIEWPORT_PACKET_BYTES = 24;
+const SCISSOR_PACKET_BYTES = 16;
+const BLEND_CONSTANTS_PACKET_BYTES = 16;
+const STENCIL_REF_PACKET_BYTES = 4;
+const PRIMITIVE_TOPOLOGY_PACKET_BYTES = 5;
+const SAMPLER2_PACKET_BYTES = 24;
+const TEXTURE_VIEW_DESC_BYTES = 16;
+const BIND_GROUP_LAYOUT_ENTRY_BYTES = 24;
+const BEGIN_RENDER_PASS_BYTES = 368;
+
+// Pre-allocated 4-byte DataView so f32FromBits performs zero heap allocations.
+const _f32ScratchView = new DataView(new ArrayBuffer(4));
+
+function f32FromBits(bits) {
+  _f32ScratchView.setUint32(0, bits, true);
+  return _f32ScratchView.getFloat32(0, true);
+}
+
+function attachNonEnumerablePool(obj, pool) {
+  Object.defineProperty(obj, '_pool', {
+    value: pool,
+    enumerable: false,
+    configurable: false,
+  });
+  return pool;
+}
+
+// W302: factory returning pre-allocated reusable scratch structs & typed buffers for all
+// hot render-state packet decoders so callers (e.g. wgpu_worker.js) can decode thousands of
+// per-frame state packets with zero per-packet object allocations.
+function createRenderStateScratch() {
+  const bindGroupLayoutEntry = { binding: 0, visibility: 0 };
+  attachNonEnumerablePool(bindGroupLayoutEntry, {
+    buffer: { type: 'uniform', hasDynamicOffset: false, minBindingSize: 0 },
+    sampler: { type: 'filtering' },
+    texture: { sampleType: 'float', viewDimension: '2d', multisampled: false },
+    storageTexture: { access: 'write-only', format: 'rgba8unorm', viewDimension: '2d' },
+  });
+
+  const createTexture2 = {
+    id: 0,
+    descriptor: {
+      size: { width: 1, height: 1, depthOrArrayLayers: 1 },
+      mipLevelCount: 1,
+      sampleCount: 1,
+      dimension: '2d',
+      format: 'rgba8unorm',
+      usage: 0,
+    },
+  };
+  attachNonEnumerablePool(createTexture2, {
+    descriptor: createTexture2.descriptor,
+    size: createTexture2.descriptor.size,
+    viewFormats: [],
+  });
+
+  const beginRenderPassColors = new Array(8);
+  for (let i = 0; i < 8; i += 1) {
+    beginRenderPassColors[i] = {
+      textureId: 0,
+      loadOp: 'undefined',
+      storeOp: 'undefined',
+      view: {},
+      clearValue: { r: 0, g: 0, b: 0, a: 0 },
+    };
+  }
+  const beginRenderPass = { colors: [], depthStencil: null };
+  attachNonEnumerablePool(beginRenderPass, {
+    colors: beginRenderPassColors,
+    depthStencil: {
+      textureId: 0,
+      depthLoadOp: 0,
+      depthStoreOp: 0,
+      stencilLoadOp: 0,
+      stencilStoreOp: 0,
+      view: {},
+      depthClearValue: 1,
+      stencilClearValue: 0,
+      depthReadOnly: false,
+      stencilReadOnly: false,
+    },
+  });
+
+  const pipelineTargets = new Array(8);
+  const pipelineBlends = new Array(8);
+  const pipelineBuffers = new Array(8);
+  for (let i = 0; i < 8; i += 1) {
+    pipelineTargets[i] = { format: 'rgba8unorm', writeMask: 0x0f };
+    pipelineBlends[i] = {
+      color: { operation: 'add', srcFactor: 'one', dstFactor: 'zero' },
+      alpha: { operation: 'add', srcFactor: 'one', dstFactor: 'zero' },
+    };
+    pipelineBuffers[i] = { arrayStride: 0, stepMode: 'vertex', attributes: [] };
+  }
+  const pipelineAttrs = new Array(16);
+  for (let i = 0; i < 16; i += 1) {
+    pipelineAttrs[i] = { format: 'float32', offset: 0, shaderLocation: 0 };
+  }
+  const renderPipelineKey = {
+    primitive: { topology: 'triangle-list', frontFace: 'ccw', cullMode: 'none' },
+    multisample: { count: 1, mask: 0xffffffff, alphaToCoverageEnabled: false },
+    depthStencil: undefined,
+    targets: [],
+    buffers: [],
+    colorTargetCount: 0,
+  };
+  attachNonEnumerablePool(renderPipelineKey, {
+    targets: pipelineTargets,
+    blends: pipelineBlends,
+    depthStencil: {
+      format: 'depth24plus',
+      depthWriteEnabled: false,
+      stencilFront: { compare: 'always', failOp: 'keep', depthFailOp: 'keep', passOp: 'keep' },
+      stencilBack: { compare: 'always', failOp: 'keep', depthFailOp: 'keep', passOp: 'keep' },
+      stencilReadMask: 0,
+      stencilWriteMask: 0,
+      depthBias: 0,
+      depthBiasSlopeScale: 0,
+      depthBiasClamp: 0,
+    },
+    buffers: pipelineBuffers,
+    attributes: pipelineAttrs,
+  });
+
+  return {
+    viewport: { x: 0, y: 0, width: 0, height: 0, minDepth: 0, maxDepth: 1 },
+    viewportClamped: { x: 0, y: 0, width: 0, height: 0, minDepth: 0, maxDepth: 1 },
+    scissor: { x: 0, y: 0, width: 0, height: 0 },
+    scissorClamped: { x: 0, y: 0, width: 0, height: 0 },
+    blendConstants: { r: 0, g: 0, b: 0, a: 0 },
+    stencilRef: { reference: 0 },
+    primitiveTopology: { topology: 'triangle-list', frontFace: 'ccw', cullMode: 'none' },
+    blendComponent: { operation: 'add', srcFactor: 'one', dstFactor: 'zero' },
+    stencilFace: { compare: 'always', failOp: 'keep', depthFailOp: 'keep', passOp: 'keep' },
+    textureViewDesc: {},
+    bindGroupLayoutEntry,
+    setBindGroup2: { groupIndex: 0, bindGroupId: 0, dynamicOffsetCount: 0, dynamicOffsets: [] },
+    sampler2: {
+      id: 0,
+      descriptor: {
+        addressModeU: 'clamp-to-edge',
+        addressModeV: 'clamp-to-edge',
+        addressModeW: 'clamp-to-edge',
+        magFilter: 'nearest',
+        minFilter: 'nearest',
+        mipmapFilter: 'nearest',
+        lodMinClamp: 0,
+        lodMaxClamp: 32,
+        maxAnisotropy: 1,
+      },
+    },
+    createTexture2,
+    beginRenderPass,
+    renderPipelineKey,
+    computeDispatch: {
+      skip: false,
+      clamped: false,
+      x: 0,
+      y: 0,
+      z: 0,
+      maxWorkgroupsPerDimension: DEFAULT_MAX_COMPUTE_WORKGROUPS_PER_DIMENSION,
+      reason: null,
+    },
+    targetSize: { width: 0, height: 0 },
+    viewportF32: new Float32Array(6),
+    scissorU32: new Uint32Array(4),
+    blendConstantsF32: new Float32Array(4),
+    dynamicOffsetsU32: new Uint32Array(16),
+  };
+}
+
+// Decodes a 24-byte SET_VIEWPORT (opcode 28) payload.
+// Optionally writes into pre-allocated `out` and clamps to `targetSize` in-place.
+function decodeViewportPacket(view, offset = 0, out = null, targetSize = null) {
+  if (!view || offset < 0 || offset + VIEWPORT_PACKET_BYTES > view.byteLength) {
+    return null;
+  }
+  const dst = out || { x: 0, y: 0, width: 0, height: 0, minDepth: 0, maxDepth: 1 };
+  dst.x = view.getFloat32(offset, true);
+  dst.y = view.getFloat32(offset + 4, true);
+  dst.width = view.getFloat32(offset + 8, true);
+  dst.height = view.getFloat32(offset + 12, true);
+  dst.minDepth = view.getFloat32(offset + 16, true);
+  dst.maxDepth = view.getFloat32(offset + 20, true);
+  if (targetSize) {
+    return clampViewportToTarget(dst, targetSize, dst);
+  }
+  return dst;
+}
+
+// Decodes a 16-byte SET_SCISSOR_RECT (opcode 29) payload.
+// Optionally writes into pre-allocated `out` and clamps to `targetSize` in-place.
+function decodeScissorPacket(view, offset = 0, out = null, targetSize = null) {
+  if (!view || offset < 0 || offset + SCISSOR_PACKET_BYTES > view.byteLength) {
+    return null;
+  }
+  const dst = out || { x: 0, y: 0, width: 0, height: 0 };
+  dst.x = view.getUint32(offset, true);
+  dst.y = view.getUint32(offset + 4, true);
+  dst.width = view.getUint32(offset + 8, true);
+  dst.height = view.getUint32(offset + 12, true);
+  if (targetSize) {
+    return clampScissorToTarget(dst, targetSize, dst);
+  }
+  return dst;
+}
+
+// Decodes a 16-byte SET_BLEND_CONSTANT (opcode 30) payload with W266 NaN/Infinity/-0 sanitization.
+function decodeBlendConstantsPacket(view, offset = 0, out = null) {
+  if (!view || offset < 0 || offset + BLEND_CONSTANTS_PACKET_BYTES > view.byteLength) {
+    return null;
+  }
+  const dst = out || { r: 0, g: 0, b: 0, a: 0 };
+  dst.r = finiteOr(view.getFloat32(offset, true), 0) || 0;
+  dst.g = finiteOr(view.getFloat32(offset + 4, true), 0) || 0;
+  dst.b = finiteOr(view.getFloat32(offset + 8, true), 0) || 0;
+  dst.a = finiteOr(view.getFloat32(offset + 12, true), 0) || 0;
+  return dst;
+}
+
+// Decodes a 4-byte SET_STENCIL_REFERENCE (opcode 31) payload.
+function decodeStencilRefPacket(view, offset = 0, out = null) {
+  if (!view || offset < 0 || offset + STENCIL_REF_PACKET_BYTES > view.byteLength) {
+    return null;
+  }
+  const dst = out || { reference: 0 };
+  dst.reference = view.getUint32(offset, true);
+  return dst;
+}
+
+// Decodes the 5-byte primitive state block (topology, stripIndexFormat, frontFace, cullMode, unclippedDepth).
+function decodePrimitiveTopologyPacket(view, offset = 0, out = null) {
+  if (!view || offset < 0 || offset + PRIMITIVE_TOPOLOGY_PACKET_BYTES > view.byteLength) {
+    return null;
+  }
+  const topology = nameOf(PRIMITIVE_TOPOLOGY_NAMES, view.getUint8(offset)) || 'triangle-list';
+  const stripIndexFormat = view.getUint8(offset + 1);
+  const frontFace = nameOf(FRONT_FACE_NAMES, view.getUint8(offset + 2)) || 'ccw';
+  const cullMode = nameOf(CULL_MODE_NAMES, view.getUint8(offset + 3)) || 'none';
+  const unclippedDepth = view.getUint8(offset + 4) !== 0;
+  const dst = out || { topology, frontFace, cullMode };
+  dst.topology = topology;
+  dst.frontFace = frontFace;
+  dst.cullMode = cullMode;
+  if (stripIndexFormat !== 0 && (topology === 'triangle-strip' || topology === 'line-strip')) {
+    const idxFormat = nameOf(INDEX_FORMAT_NAMES, stripIndexFormat);
+    if (idxFormat && idxFormat !== 'undefined') {
+      dst.stripIndexFormat = idxFormat;
+    } else if ('stripIndexFormat' in dst) {
+      delete dst.stripIndexFormat;
+    }
+  } else if ('stripIndexFormat' in dst) {
+    delete dst.stripIndexFormat;
+  }
+  if (unclippedDepth) {
+    dst.unclippedDepth = true;
+  } else if ('unclippedDepth' in dst) {
+    delete dst.unclippedDepth;
+  }
+  return dst;
+}
+
+// Decodes a SET_BIND_GROUP2 (opcode 33) payload (16-byte header + dynamicOffsetCount * 4 bytes).
+// Supports optional `out` (as 4th arg, or 3rd arg when payloadBytes is omitted).
+function decodeSetBindGroup2Packet(view, offset = 0, payloadBytes, out = null) {
+  let targetOut = out;
+  let explicitPayloadBytes = payloadBytes;
+  if (typeof payloadBytes === 'object' && payloadBytes !== null && out === null) {
+    targetOut = payloadBytes;
+    explicitPayloadBytes = undefined;
+  }
+  if (!view || offset < 0) return null;
+  const available =
+    explicitPayloadBytes !== undefined ? explicitPayloadBytes : view.byteLength - offset;
+  if (available < 16 || offset + 16 > view.byteLength) return null;
+  const groupIndex = view.getUint32(offset, true);
+  const bindGroupId = view.getUint32(offset + 4, true);
+  const count = view.getUint32(offset + 8, true);
+  const required = 16 + count * 4;
+  if (required > available || offset + required > view.byteLength) return null;
+  const dst = targetOut || {
+    groupIndex: 0,
+    bindGroupId: 0,
+    dynamicOffsetCount: 0,
+    dynamicOffsets: [],
+  };
+  dst.groupIndex = groupIndex;
+  dst.bindGroupId = bindGroupId;
+  dst.dynamicOffsetCount = count;
+  if (!Array.isArray(dst.dynamicOffsets)) {
+    dst.dynamicOffsets = [];
+  }
+  const offsets = dst.dynamicOffsets;
+  offsets.length = count;
+  for (let i = 0; i < count; i += 1) {
+    offsets[i] = view.getUint32(offset + 16 + i * 4, true);
+  }
+  return dst;
+}
+
+// Decodes a 24-byte CREATE_SAMPLER2 (opcode 34) payload.
+function decodeSampler2Packet(view, offset = 0, out = null) {
+  if (!view || offset < 0 || offset + SAMPLER2_PACKET_BYTES > view.byteLength) {
+    return null;
+  }
+  const id = view.getUint32(offset, true);
+  const dst = out || {
+    id: 0,
+    descriptor: {
+      addressModeU: 'clamp-to-edge',
+      addressModeV: 'clamp-to-edge',
+      addressModeW: 'clamp-to-edge',
+      magFilter: 'nearest',
+      minFilter: 'nearest',
+      mipmapFilter: 'nearest',
+      lodMinClamp: 0,
+      lodMaxClamp: 32,
+      maxAnisotropy: 1,
+    },
+  };
+  if (!dst.descriptor || typeof dst.descriptor !== 'object') {
+    dst.descriptor = {};
+  }
+  const desc = dst.descriptor;
+  desc.addressModeU = nameOf(ADDRESS_MODE_NAMES, view.getUint8(offset + 4)) || 'clamp-to-edge';
+  desc.addressModeV = nameOf(ADDRESS_MODE_NAMES, view.getUint8(offset + 5)) || 'clamp-to-edge';
+  desc.addressModeW = nameOf(ADDRESS_MODE_NAMES, view.getUint8(offset + 6)) || 'clamp-to-edge';
+  desc.magFilter = nameOf(FILTER_MODE_NAMES, view.getUint8(offset + 7)) || 'nearest';
+  desc.minFilter = nameOf(FILTER_MODE_NAMES, view.getUint8(offset + 8)) || 'nearest';
+  desc.mipmapFilter = nameOf(FILTER_MODE_NAMES, view.getUint8(offset + 9)) || 'nearest';
+  desc.lodMinClamp = view.getFloat32(offset + 16, true);
+  desc.lodMaxClamp = view.getFloat32(offset + 20, true);
+  desc.maxAnisotropy = Math.max(1, view.getUint16(offset + 12, true));
+  const compare = view.getUint8(offset + 10);
+  if (compare !== 0) {
+    desc.compare = nameOf(COMPARE_FUNCTION_NAMES, compare);
+  } else if ('compare' in desc) {
+    delete desc.compare;
+  }
+  dst.id = id;
+  return dst;
+}
+
+function decodeTextureViewDesc(view, offset = 0, out = null) {
+  if (!view || offset < 0 || offset + TEXTURE_VIEW_DESC_BYTES > view.byteLength) {
+    return null;
+  }
+  const desc = out || {};
   const format = view.getUint8(offset);
   const dimension = view.getUint8(offset + 1);
   const aspect = view.getUint8(offset + 2);
@@ -1613,114 +2109,261 @@ function decodeTextureViewDesc(view, offset) {
   const baseArrayLayer = view.getUint32(offset + 8, true);
   const arrayLayerCount = view.getUint32(offset + 12, true);
   if (format !== 0) desc.format = nameOf(TEXTURE_FORMAT_NAMES, format);
+  else if (out && 'format' in desc) delete desc.format;
   if (dimension !== 0) desc.dimension = nameOf(VIEW_DIMENSION_NAMES, dimension);
+  else if (out && 'dimension' in desc) delete desc.dimension;
   if (aspect !== 0) desc.aspect = nameOf(TEXTURE_ASPECT_NAMES, aspect);
+  else if (out && 'aspect' in desc) delete desc.aspect;
   if (baseMipLevel !== 0) desc.baseMipLevel = baseMipLevel;
+  else if (out && 'baseMipLevel' in desc) delete desc.baseMipLevel;
   if (mipLevelCount !== 0) desc.mipLevelCount = mipLevelCount;
+  else if (out && 'mipLevelCount' in desc) delete desc.mipLevelCount;
   if (baseArrayLayer !== 0) desc.baseArrayLayer = baseArrayLayer;
+  else if (out && 'baseArrayLayer' in desc) delete desc.baseArrayLayer;
   if (arrayLayerCount !== 0) desc.arrayLayerCount = arrayLayerCount;
+  else if (out && 'arrayLayerCount' in desc) delete desc.arrayLayerCount;
   return desc;
 }
 
-function decodeBindGroupLayoutEntry(view, offset) {
-  const entry = {
-    binding: view.getUint32(offset, true),
-    visibility: view.getUint32(offset + 4, true) & GPU_SHADER_STAGE_ALL_MASK,
-  };
+function decodeBindGroupLayoutEntry(view, offset = 0, out = null) {
+  if (!view || offset < 0 || offset + BIND_GROUP_LAYOUT_ENTRY_BYTES > view.byteLength) {
+    return null;
+  }
+  const binding = view.getUint32(offset, true);
+  let visibility = view.getUint32(offset + 4, true) & GPU_SHADER_STAGE_ALL_MASK;
   const type = view.getUint8(offset + 8);
   const subtype = view.getUint8(offset + 9);
   const dimension = view.getUint8(offset + 10);
   const flags = view.getUint8(offset + 11);
   const storageFormat = view.getUint8(offset + 12);
   const viewDimension = dimension !== 0 ? nameOf(VIEW_DIMENSION_NAMES, dimension) : '2d';
+
+  let bufferType;
+  let samplerType;
+  let sampleType;
+  let access;
+  let format;
   if (type === BINDING_LAYOUT_TYPE.BUFFER) {
-    const bufferType = nameOf(BUFFER_BINDING_TYPE_NAMES, subtype);
+    bufferType = nameOf(BUFFER_BINDING_TYPE_NAMES, subtype);
     if (!bufferType) return null;
     // WebGPU forbids read-write 'storage' buffers in the vertex stage (e.g., root-signature layouts
     // that tag all entries Vertex|Fragment). Strip the illegal VERTEX visibility bit cleanly.
-    if (bufferType === 'storage' && (entry.visibility & GPU_SHADER_STAGE_VERTEX) !== 0) {
-      entry.visibility &= ~GPU_SHADER_STAGE_VERTEX;
+    if (bufferType === 'storage' && (visibility & GPU_SHADER_STAGE_VERTEX) !== 0) {
+      visibility &= ~GPU_SHADER_STAGE_VERTEX;
     }
-    entry.buffer = {
-      type: bufferType,
-      hasDynamicOffset: (flags & 0x1) !== 0,
-      minBindingSize: Number(view.getBigUint64(offset + 16, true)),
-    };
   } else if (type === BINDING_LAYOUT_TYPE.SAMPLER) {
-    const samplerType = nameOf(SAMPLER_BINDING_TYPE_NAMES, subtype);
+    samplerType = nameOf(SAMPLER_BINDING_TYPE_NAMES, subtype);
     if (!samplerType) return null;
-    entry.sampler = { type: samplerType };
   } else if (type === BINDING_LAYOUT_TYPE.TEXTURE) {
-    const sampleType = nameOf(TEXTURE_SAMPLE_TYPE_NAMES, subtype);
+    sampleType = nameOf(TEXTURE_SAMPLE_TYPE_NAMES, subtype);
     if (!sampleType || !viewDimension || viewDimension === 'undefined') return null;
-    entry.texture = {
-      sampleType,
-      viewDimension,
-      multisampled: (flags & 0x2) !== 0,
-    };
   } else if (type === BINDING_LAYOUT_TYPE.STORAGE_TEXTURE) {
-    const access = nameOf(STORAGE_TEXTURE_ACCESS_NAMES, subtype);
-    const format = storageFormat !== 0 ? nameOf(TEXTURE_FORMAT_NAMES, storageFormat) : undefined;
+    access = nameOf(STORAGE_TEXTURE_ACCESS_NAMES, subtype);
+    format = storageFormat !== 0 ? nameOf(TEXTURE_FORMAT_NAMES, storageFormat) : undefined;
     if (!access || !format || format === 'undefined' || !viewDimension || viewDimension === 'undefined') {
       return null;
     }
-    if ((access === 'write-only' || access === 'read-write') && (entry.visibility & GPU_SHADER_STAGE_VERTEX) !== 0) {
-      entry.visibility &= ~GPU_SHADER_STAGE_VERTEX;
+    if ((access === 'write-only' || access === 'read-write') && (visibility & GPU_SHADER_STAGE_VERTEX) !== 0) {
+      visibility &= ~GPU_SHADER_STAGE_VERTEX;
     }
-    entry.storageTexture = {
-      access,
-      format,
-      viewDimension,
-    };
   } else {
     return null;
+  }
+
+  let pool = null;
+  let entry;
+  if (out) {
+    entry = out;
+    pool = out._pool || attachNonEnumerablePool(out, {
+      buffer: { type: 'uniform', hasDynamicOffset: false, minBindingSize: 0 },
+      sampler: { type: 'filtering' },
+      texture: { sampleType: 'float', viewDimension: '2d', multisampled: false },
+      storageTexture: { access: 'write-only', format: 'rgba8unorm', viewDimension: '2d' },
+    });
+    if ('buffer' in entry) delete entry.buffer;
+    if ('sampler' in entry) delete entry.sampler;
+    if ('texture' in entry) delete entry.texture;
+    if ('storageTexture' in entry) delete entry.storageTexture;
+    entry.binding = binding;
+    entry.visibility = visibility;
+  } else {
+    entry = { binding, visibility };
+  }
+
+  if (type === BINDING_LAYOUT_TYPE.BUFFER) {
+    const minBindingSize = Number(view.getBigUint64(offset + 16, true));
+    if (pool) {
+      const b = pool.buffer;
+      b.type = bufferType;
+      b.hasDynamicOffset = (flags & 0x1) !== 0;
+      b.minBindingSize = minBindingSize;
+      entry.buffer = b;
+    } else {
+      entry.buffer = {
+        type: bufferType,
+        hasDynamicOffset: (flags & 0x1) !== 0,
+        minBindingSize,
+      };
+    }
+  } else if (type === BINDING_LAYOUT_TYPE.SAMPLER) {
+    if (pool) {
+      pool.sampler.type = samplerType;
+      entry.sampler = pool.sampler;
+    } else {
+      entry.sampler = { type: samplerType };
+    }
+  } else if (type === BINDING_LAYOUT_TYPE.TEXTURE) {
+    if (pool) {
+      const t = pool.texture;
+      t.sampleType = sampleType;
+      t.viewDimension = viewDimension;
+      t.multisampled = (flags & 0x2) !== 0;
+      entry.texture = t;
+    } else {
+      entry.texture = {
+        sampleType,
+        viewDimension,
+        multisampled: (flags & 0x2) !== 0,
+      };
+    }
+  } else {
+    if (pool) {
+      const st = pool.storageTexture;
+      st.access = access;
+      st.format = format;
+      st.viewDimension = viewDimension;
+      entry.storageTexture = st;
+    } else {
+      entry.storageTexture = {
+        access,
+        format,
+        viewDimension,
+      };
+    }
   }
   return entry;
 }
 
-function decodeBlendComponent(view, offset) {
-  return {
-    operation: nameOf(BLEND_OPERATION_NAMES, view.getUint8(offset)) || 'add',
-    srcFactor: nameOf(BLEND_FACTOR_NAMES, view.getUint8(offset + 1)) || 'one',
-    dstFactor: nameOf(BLEND_FACTOR_NAMES, view.getUint8(offset + 2)) || 'zero',
-  };
+function decodeBlendComponent(view, offset = 0, out = null) {
+  if (!view || offset < 0 || offset + 3 > view.byteLength) {
+    return null;
+  }
+  const operation = nameOf(BLEND_OPERATION_NAMES, view.getUint8(offset)) || 'add';
+  const srcFactor = nameOf(BLEND_FACTOR_NAMES, view.getUint8(offset + 1)) || 'one';
+  const dstFactor = nameOf(BLEND_FACTOR_NAMES, view.getUint8(offset + 2)) || 'zero';
+  if (out) {
+    out.operation = operation;
+    out.srcFactor = srcFactor;
+    out.dstFactor = dstFactor;
+    return out;
+  }
+  return { operation, srcFactor, dstFactor };
 }
 
-function decodeStencilFace(view, offset) {
+function decodeStencilFace(view, offset = 0, out = null) {
+  if (!view || offset < 0 || offset + 4 > view.byteLength) {
+    return null;
+  }
   const compareCode = view.getUint8(offset);
-  const compare = compareCode !== 0 ? nameOf(COMPARE_FUNCTION_NAMES, compareCode) : undefined;
-  return {
-    compare: compare && compare !== 'undefined' ? compare : 'always',
-    failOp: nameOf(STENCIL_OPERATION_NAMES, view.getUint8(offset + 1)) || 'keep',
-    depthFailOp: nameOf(STENCIL_OPERATION_NAMES, view.getUint8(offset + 2)) || 'keep',
-    passOp: nameOf(STENCIL_OPERATION_NAMES, view.getUint8(offset + 3)) || 'keep',
-  };
-}
-
-function f32FromBits(bits) {
-  const scratch = new DataView(new ArrayBuffer(4));
-  scratch.setUint32(0, bits, true);
-  return scratch.getFloat32(0, true);
+  const compareRaw = compareCode !== 0 ? nameOf(COMPARE_FUNCTION_NAMES, compareCode) : undefined;
+  const compare = compareRaw && compareRaw !== 'undefined' ? compareRaw : 'always';
+  const failOp = nameOf(STENCIL_OPERATION_NAMES, view.getUint8(offset + 1)) || 'keep';
+  const depthFailOp = nameOf(STENCIL_OPERATION_NAMES, view.getUint8(offset + 2)) || 'keep';
+  const passOp = nameOf(STENCIL_OPERATION_NAMES, view.getUint8(offset + 3)) || 'keep';
+  if (out) {
+    out.compare = compare;
+    out.failOp = failOp;
+    out.depthFailOp = depthFailOp;
+    out.passOp = passOp;
+    return out;
+  }
+  return { compare, failOp, depthFailOp, passOp };
 }
 
 // Decodes a GpuRenderPipelineKey at `base` into the GPURenderPipelineDescriptor parts it determines.
 // Returns { primitive, multisample, depthStencil?, targets, buffers, colorTargetCount }.
-function decodeRenderPipelineKey(view, base) {
+// When `out` is provided, reuses pooled sub-objects and resets all dirty fields for zero-alloc decoding.
+function decodeRenderPipelineKey(view, base = 0, out = null) {
+  if (!view || base < 0 || base + KEY_SIZE > view.byteLength) {
+    return null;
+  }
+  let pool = out ? out._pool : null;
+  if (out && !pool) {
+    const pTargets = new Array(8);
+    const pBlends = new Array(8);
+    const pBuffers = new Array(8);
+    for (let i = 0; i < 8; i += 1) {
+      pTargets[i] = { format: 'rgba8unorm', writeMask: 0x0f };
+      pBlends[i] = {
+        color: { operation: 'add', srcFactor: 'one', dstFactor: 'zero' },
+        alpha: { operation: 'add', srcFactor: 'one', dstFactor: 'zero' },
+      };
+      pBuffers[i] = { arrayStride: 0, stepMode: 'vertex', attributes: [] };
+    }
+    const pAttrs = new Array(16);
+    for (let i = 0; i < 16; i += 1) {
+      pAttrs[i] = { format: 'float32', offset: 0, shaderLocation: 0 };
+    }
+    pool = attachNonEnumerablePool(out, {
+      targets: pTargets,
+      blends: pBlends,
+      depthStencil: {
+        format: 'depth24plus',
+        depthWriteEnabled: false,
+        stencilFront: { compare: 'always', failOp: 'keep', depthFailOp: 'keep', passOp: 'keep' },
+        stencilBack: { compare: 'always', failOp: 'keep', depthFailOp: 'keep', passOp: 'keep' },
+        stencilReadMask: 0,
+        stencilWriteMask: 0,
+        depthBias: 0,
+        depthBiasSlopeScale: 0,
+        depthBiasClamp: 0,
+      },
+      buffers: pBuffers,
+      attributes: pAttrs,
+    });
+  }
+
   const colorTargetCount = Math.min(view.getUint32(base + 20, true), 8);
-  const targets = [];
-  for (let i = 0; i < colorTargetCount; i++) {
+  let targets;
+  if (out) {
+    targets = Array.isArray(out.targets) ? out.targets : [];
+    targets.length = colorTargetCount;
+  } else {
+    targets = new Array(colorTargetCount);
+  }
+  for (let i = 0; i < colorTargetCount; i += 1) {
     const o = base + 24 + 12 * i;
     const format = view.getUint8(o);
     if (format === 0) {
-      targets.push(null);
+      targets[i] = null;
       continue;
     }
     const targetFormat = nameOf(TEXTURE_FORMAT_NAMES, format);
-    const target = { format: targetFormat, writeMask: view.getUint8(o + 2) & 0x0f };
-    if (view.getUint8(o + 1) !== 0) {
-      target.blend = { color: decodeBlendComponent(view, o + 4), alpha: decodeBlendComponent(view, o + 8) };
+    const writeMask = view.getUint8(o + 2) & 0x0f;
+    const blendEnable = view.getUint8(o + 1) !== 0;
+    if (pool) {
+      const target = pool.targets[i];
+      target.format = targetFormat;
+      target.writeMask = writeMask;
+      if (blendEnable) {
+        const blend = pool.blends[i];
+        decodeBlendComponent(view, o + 4, blend.color);
+        decodeBlendComponent(view, o + 8, blend.alpha);
+        target.blend = blend;
+      } else if ('blend' in target) {
+        delete target.blend;
+      }
+      targets[i] = target;
+    } else {
+      const target = { format: targetFormat, writeMask };
+      if (blendEnable) {
+        target.blend = {
+          color: decodeBlendComponent(view, o + 4),
+          alpha: decodeBlendComponent(view, o + 8),
+        };
+      }
+      targets[i] = target;
     }
-    targets.push(target);
   }
 
   const ds = base + 120;
@@ -1732,121 +2375,333 @@ function decodeRenderPipelineKey(view, base) {
     const rawDepthCompare = view.getUint8(ds + 2);
     const mappedCompare = rawDepthCompare !== 0 ? nameOf(COMPARE_FUNCTION_NAMES, rawDepthCompare) : undefined;
     const validCompare = mappedCompare && mappedCompare !== 'undefined' ? mappedCompare : undefined;
-    depthStencil = {
-      format: dsFormatName,
-      depthWriteEnabled: hasDepth ? Boolean(view.getUint8(ds + 1) !== 0) : false,
-      stencilFront: decodeStencilFace(view, ds + 4),
-      stencilBack: decodeStencilFace(view, ds + 8),
-      stencilReadMask: view.getUint32(ds + 12, true),
-      stencilWriteMask: view.getUint32(ds + 16, true),
-      depthBias: view.getInt32(ds + 20, true),
-      depthBiasSlopeScale: finiteOr(f32FromBits(view.getUint32(ds + 24, true)), 0),
-      depthBiasClamp: finiteOr(f32FromBits(view.getUint32(ds + 28, true)), 0),
-    };
-    if (hasDepth) {
-      // Depth-containing formats (e.g. depth24plus-stencil8, depth32float) must always carry a
-      // valid GPUCompareFunction; default to 'always' when depth test is disabled (code 0).
-      depthStencil.depthCompare = validCompare || 'always';
-    } else if (validCompare === 'always') {
-      depthStencil.depthCompare = 'always';
+    if (pool) {
+      depthStencil = pool.depthStencil;
+      depthStencil.format = dsFormatName;
+      depthStencil.depthWriteEnabled = hasDepth ? Boolean(view.getUint8(ds + 1) !== 0) : false;
+      decodeStencilFace(view, ds + 4, depthStencil.stencilFront);
+      decodeStencilFace(view, ds + 8, depthStencil.stencilBack);
+      depthStencil.stencilReadMask = view.getUint32(ds + 12, true);
+      depthStencil.stencilWriteMask = view.getUint32(ds + 16, true);
+      depthStencil.depthBias = view.getInt32(ds + 20, true);
+      depthStencil.depthBiasSlopeScale = finiteOr(f32FromBits(view.getUint32(ds + 24, true)), 0);
+      depthStencil.depthBiasClamp = finiteOr(f32FromBits(view.getUint32(ds + 28, true)), 0);
+      if (hasDepth) {
+        depthStencil.depthCompare = validCompare || 'always';
+      } else if (validCompare === 'always') {
+        depthStencil.depthCompare = 'always';
+      } else if ('depthCompare' in depthStencil) {
+        delete depthStencil.depthCompare;
+      }
+    } else {
+      depthStencil = {
+        format: dsFormatName,
+        depthWriteEnabled: hasDepth ? Boolean(view.getUint8(ds + 1) !== 0) : false,
+        stencilFront: decodeStencilFace(view, ds + 4),
+        stencilBack: decodeStencilFace(view, ds + 8),
+        stencilReadMask: view.getUint32(ds + 12, true),
+        stencilWriteMask: view.getUint32(ds + 16, true),
+        depthBias: view.getInt32(ds + 20, true),
+        depthBiasSlopeScale: finiteOr(f32FromBits(view.getUint32(ds + 24, true)), 0),
+        depthBiasClamp: finiteOr(f32FromBits(view.getUint32(ds + 28, true)), 0),
+      };
+      if (hasDepth) {
+        // Depth-containing formats (e.g. depth24plus-stencil8, depth32float) must always carry a
+        // valid GPUCompareFunction; default to 'always' when depth test is disabled (code 0).
+        depthStencil.depthCompare = validCompare || 'always';
+      } else if (validCompare === 'always') {
+        depthStencil.depthCompare = 'always';
+      }
     }
   }
 
-  const pr = base + 152;
-  const topology = nameOf(PRIMITIVE_TOPOLOGY_NAMES, view.getUint8(pr)) || 'triangle-list';
-  const primitive = {
-    topology,
-    frontFace: nameOf(FRONT_FACE_NAMES, view.getUint8(pr + 2)) || 'ccw',
-    cullMode: nameOf(CULL_MODE_NAMES, view.getUint8(pr + 3)) || 'none',
-  };
-  const stripIndexFormat = view.getUint8(pr + 1);
-  if (stripIndexFormat !== 0 && (topology === 'triangle-strip' || topology === 'line-strip')) {
-    const idxFormat = nameOf(INDEX_FORMAT_NAMES, stripIndexFormat);
-    if (idxFormat && idxFormat !== 'undefined') {
-      primitive.stripIndexFormat = idxFormat;
-    }
-  }
-  if (view.getUint8(pr + 4) !== 0) primitive.unclippedDepth = true;
+  const primitiveOut = out && out.primitive && typeof out.primitive === 'object' ? out.primitive : null;
+  const primitive = decodePrimitiveTopologyPacket(view, base + 152, primitiveOut);
 
   const ms = base + 160;
-  const multisample = {
-    count: view.getUint32(ms, true) || 1,
-    mask: view.getUint32(ms + 4, true),
-    alphaToCoverageEnabled: view.getUint8(ms + 8) !== 0,
-  };
+  let multisample;
+  if (out && out.multisample && typeof out.multisample === 'object') {
+    multisample = out.multisample;
+    multisample.count = view.getUint32(ms, true) || 1;
+    multisample.mask = view.getUint32(ms + 4, true);
+    multisample.alphaToCoverageEnabled = view.getUint8(ms + 8) !== 0;
+  } else {
+    multisample = {
+      count: view.getUint32(ms, true) || 1,
+      mask: view.getUint32(ms + 4, true),
+      alphaToCoverageEnabled: view.getUint8(ms + 8) !== 0,
+    };
+  }
 
   const bufferCount = Math.min(view.getUint32(base + 172, true), 8);
   const attributeCount = Math.min(view.getUint32(base + 176, true), 16);
-  const attributes = [];
-  for (let i = 0; i < attributeCount; i++) {
-    const o = base + 244 + 8 * i;
-    attributes.push({
-      bufferIndex: view.getUint8(o + 6),
-      attribute: {
-        format: nameOf(VERTEX_FORMAT_NAMES, view.getUint8(o + 4)),
-        offset: view.getUint32(o, true),
-        shaderLocation: view.getUint8(o + 5),
-      },
-    });
+  let buffers;
+  if (out) {
+    buffers = Array.isArray(out.buffers) ? out.buffers : [];
+    buffers.length = bufferCount;
+  } else {
+    buffers = new Array(bufferCount);
   }
-  const buffers = [];
-  for (let i = 0; i < bufferCount; i++) {
+  for (let i = 0; i < bufferCount; i += 1) {
     const o = base + 180 + 8 * i;
     const stepMode = view.getUint8(o + 4);
     if (stepMode === 0) {
-      buffers.push(null);
+      buffers[i] = null;
       continue;
     }
-    buffers.push({
-      arrayStride: view.getUint32(o, true),
-      stepMode: nameOf(VERTEX_STEP_MODE_NAMES, stepMode),
-      attributes: attributes.filter((a) => a.bufferIndex === i).map((a) => a.attribute),
-    });
+    if (pool) {
+      const slot = pool.buffers[i];
+      slot.arrayStride = view.getUint32(o, true);
+      slot.stepMode = nameOf(VERTEX_STEP_MODE_NAMES, stepMode);
+      slot.attributes.length = 0;
+      buffers[i] = slot;
+    } else {
+      buffers[i] = {
+        arrayStride: view.getUint32(o, true),
+        stepMode: nameOf(VERTEX_STEP_MODE_NAMES, stepMode),
+        attributes: [],
+      };
+    }
+  }
+  for (let i = 0; i < attributeCount; i += 1) {
+    const o = base + 244 + 8 * i;
+    const bufferIndex = view.getUint8(o + 6);
+    if (bufferIndex >= bufferCount) continue;
+    const slot = buffers[bufferIndex];
+    if (!slot) continue;
+    if (pool) {
+      const attr = pool.attributes[i];
+      attr.format = nameOf(VERTEX_FORMAT_NAMES, view.getUint8(o + 4));
+      attr.offset = view.getUint32(o, true);
+      attr.shaderLocation = view.getUint8(o + 5);
+      slot.attributes.push(attr);
+    } else {
+      slot.attributes.push({
+        format: nameOf(VERTEX_FORMAT_NAMES, view.getUint8(o + 4)),
+        offset: view.getUint32(o, true),
+        shaderLocation: view.getUint8(o + 5),
+      });
+    }
+  }
+
+  if (out) {
+    out.primitive = primitive;
+    out.multisample = multisample;
+    out.depthStencil = depthStencil;
+    out.targets = targets;
+    out.buffers = buffers;
+    out.colorTargetCount = colorTargetCount;
+    return out;
   }
   return { primitive, multisample, depthStencil, targets, buffers, colorTargetCount };
 }
 
-function decodeBeginRenderPass(view, offset) {
+function decodeBeginRenderPass(view, offset = 0, out = null) {
+  if (!view || offset < 0 || offset + BEGIN_RENDER_PASS_BYTES > view.byteLength) {
+    return null;
+  }
+  let pool = out ? out._pool : null;
+  if (out && !pool) {
+    const pColors = new Array(8);
+    for (let i = 0; i < 8; i += 1) {
+      pColors[i] = {
+        textureId: 0,
+        loadOp: 'undefined',
+        storeOp: 'undefined',
+        view: {},
+        clearValue: { r: 0, g: 0, b: 0, a: 0 },
+      };
+    }
+    pool = attachNonEnumerablePool(out, {
+      colors: pColors,
+      depthStencil: {
+        textureId: 0,
+        depthLoadOp: 0,
+        depthStoreOp: 0,
+        stencilLoadOp: 0,
+        stencilStoreOp: 0,
+        view: {},
+        depthClearValue: 1,
+        stencilClearValue: 0,
+        depthReadOnly: false,
+        stencilReadOnly: false,
+      },
+    });
+  }
+
   const colorCount = Math.min(view.getUint32(offset, true), 8);
-  const colors = [];
-  for (let i = 0; i < colorCount; i++) {
+  let colors;
+  if (out) {
+    colors = Array.isArray(out.colors) ? out.colors : [];
+    colors.length = colorCount;
+  } else {
+    colors = new Array(colorCount);
+  }
+  for (let i = 0; i < colorCount; i += 1) {
     const o = offset + 8 + 40 * i;
     const textureId = view.getUint32(o, true);
     if (textureId === 0) {
-      colors.push(null);
+      colors[i] = null;
       continue;
     }
-    colors.push({
-      textureId,
-      loadOp: nameOf(LOAD_OP_NAMES, view.getUint8(o + 4)),
-      storeOp: nameOf(STORE_OP_NAMES, view.getUint8(o + 5)),
-      view: decodeTextureViewDesc(view, o + 8),
-      clearValue: {
-        r: view.getFloat32(o + 24, true),
-        g: view.getFloat32(o + 28, true),
-        b: view.getFloat32(o + 32, true),
-        a: view.getFloat32(o + 36, true),
-      },
-    });
+    if (pool) {
+      const slot = pool.colors[i];
+      slot.textureId = textureId;
+      slot.loadOp = nameOf(LOAD_OP_NAMES, view.getUint8(o + 4));
+      slot.storeOp = nameOf(STORE_OP_NAMES, view.getUint8(o + 5));
+      decodeTextureViewDesc(view, o + 8, slot.view);
+      slot.clearValue.r = view.getFloat32(o + 24, true);
+      slot.clearValue.g = view.getFloat32(o + 28, true);
+      slot.clearValue.b = view.getFloat32(o + 32, true);
+      slot.clearValue.a = view.getFloat32(o + 36, true);
+      colors[i] = slot;
+    } else {
+      colors[i] = {
+        textureId,
+        loadOp: nameOf(LOAD_OP_NAMES, view.getUint8(o + 4)),
+        storeOp: nameOf(STORE_OP_NAMES, view.getUint8(o + 5)),
+        view: decodeTextureViewDesc(view, o + 8),
+        clearValue: {
+          r: view.getFloat32(o + 24, true),
+          g: view.getFloat32(o + 28, true),
+          b: view.getFloat32(o + 32, true),
+          a: view.getFloat32(o + 36, true),
+        },
+      };
+    }
   }
   const d = offset + 328;
   let depthStencil = null;
   const dsTexture = view.getUint32(d, true);
   if (dsTexture !== 0) {
-    depthStencil = {
-      textureId: dsTexture,
-      depthLoadOp: view.getUint8(d + 4),
-      depthStoreOp: view.getUint8(d + 5),
-      stencilLoadOp: view.getUint8(d + 6),
-      stencilStoreOp: view.getUint8(d + 7),
-      view: decodeTextureViewDesc(view, d + 8),
-      depthClearValue: view.getFloat32(d + 24, true),
-      stencilClearValue: view.getUint32(d + 28, true),
-      depthReadOnly: view.getUint8(d + 32) !== 0,
-      stencilReadOnly: view.getUint8(d + 33) !== 0,
-    };
+    if (pool) {
+      depthStencil = pool.depthStencil;
+      depthStencil.textureId = dsTexture;
+      depthStencil.depthLoadOp = view.getUint8(d + 4);
+      depthStencil.depthStoreOp = view.getUint8(d + 5);
+      depthStencil.stencilLoadOp = view.getUint8(d + 6);
+      depthStencil.stencilStoreOp = view.getUint8(d + 7);
+      decodeTextureViewDesc(view, d + 8, depthStencil.view);
+      depthStencil.depthClearValue = view.getFloat32(d + 24, true);
+      depthStencil.stencilClearValue = view.getUint32(d + 28, true);
+      depthStencil.depthReadOnly = view.getUint8(d + 32) !== 0;
+      depthStencil.stencilReadOnly = view.getUint8(d + 33) !== 0;
+    } else {
+      depthStencil = {
+        textureId: dsTexture,
+        depthLoadOp: view.getUint8(d + 4),
+        depthStoreOp: view.getUint8(d + 5),
+        stencilLoadOp: view.getUint8(d + 6),
+        stencilStoreOp: view.getUint8(d + 7),
+        view: decodeTextureViewDesc(view, d + 8),
+        depthClearValue: view.getFloat32(d + 24, true),
+        stencilClearValue: view.getUint32(d + 28, true),
+        depthReadOnly: view.getUint8(d + 32) !== 0,
+        stencilReadOnly: view.getUint8(d + 33) !== 0,
+      };
+    }
+  }
+  if (out) {
+    out.colors = colors;
+    out.depthStencil = depthStencil;
+    return out;
   }
   return { colors, depthStencil };
+}
+
+// W302: lightweight monomorphic pass-command objects for hot dynamic render-state packets,
+// eliminating per-packet closures and temporary scratch objects during decode & replay.
+class SetViewportCommand {
+  constructor(handler, x, y, width, height, minDepth, maxDepth) {
+    this.type = 'renderState';
+    this._handler = handler;
+    this.x = x;
+    this.y = y;
+    this.width = width;
+    this.height = height;
+    this.minDepth = minDepth;
+    this.maxDepth = maxDepth;
+  }
+  run(ctl) {
+    if (ctl.passKind !== 'render') return;
+    const h = this._handler;
+    const targetSize = h._getActivePassTargetSize(ctl, h._scratch.targetSize);
+    const raw = h._scratch.viewport;
+    raw.x = this.x;
+    raw.y = this.y;
+    raw.width = this.width;
+    raw.height = this.height;
+    raw.minDepth = this.minDepth;
+    raw.maxDepth = this.maxDepth;
+    const vp = clampViewportToTarget(raw, targetSize, h._scratch.viewportClamped);
+    if (isViewportClamped(raw, vp)) {
+      h.telemetry.clampedViewports += 1;
+      const targetTag = targetSize ? `${targetSize.width}x${targetSize.height}` : 'unbounded';
+      h._recordTelemetryWarningOnce(
+        `clamp-viewport:${targetTag}`,
+        `clamped viewport (${raw.x},${raw.y},${raw.width}x${raw.height},d=${raw.minDepth}..${raw.maxDepth}) to (${vp.x},${vp.y},${vp.width}x${vp.height},d=${vp.minDepth}..${vp.maxDepth}) for target ${targetTag}`
+      );
+    }
+    ctl.pass.setViewport(vp.x, vp.y, vp.width, vp.height, vp.minDepth, vp.maxDepth);
+  }
+}
+
+class SetScissorRectCommand {
+  constructor(handler, x, y, width, height) {
+    this.type = 'renderState';
+    this._handler = handler;
+    this.x = x;
+    this.y = y;
+    this.width = width;
+    this.height = height;
+  }
+  run(ctl) {
+    if (ctl.passKind !== 'render') return;
+    const h = this._handler;
+    const targetSize = h._getActivePassTargetSize(ctl, h._scratch.targetSize);
+    const raw = h._scratch.scissor;
+    raw.x = this.x;
+    raw.y = this.y;
+    raw.width = this.width;
+    raw.height = this.height;
+    const sc = clampScissorToTarget(raw, targetSize, h._scratch.scissorClamped);
+    if (isScissorClamped(raw, sc)) {
+      h.telemetry.clampedScissors += 1;
+      const targetTag = targetSize ? `${targetSize.width}x${targetSize.height}` : 'unbounded';
+      h._recordTelemetryWarningOnce(
+        `clamp-scissor:${targetTag}`,
+        `clamped scissor (${raw.x},${raw.y},${raw.width}x${raw.height}) to (${sc.x},${sc.y},${sc.width}x${sc.height}) for target ${targetTag}`
+      );
+    }
+    ctl.pass.setScissorRect(sc.x, sc.y, sc.width, sc.height);
+  }
+}
+
+class SetBlendConstantCommand {
+  constructor(r, g, b, a) {
+    this.type = 'renderState';
+    this.r = r;
+    this.g = g;
+    this.b = b;
+    this.a = a;
+  }
+  run(ctl) {
+    if (ctl.passKind === 'render') {
+      ctl.pass.setBlendConstant({ r: this.r, g: this.g, b: this.b, a: this.a });
+    }
+  }
+}
+
+class SetStencilReferenceCommand {
+  constructor(reference) {
+    this.type = 'renderState';
+    this.reference = reference;
+  }
+  run(ctl) {
+    if (ctl.passKind === 'render') {
+      ctl.pass.setStencilReference(this.reference);
+    }
+  }
 }
 
 // ---- Packet handler ----
@@ -1946,6 +2801,19 @@ class RenderStatePackets {
     this._activePass = null;
     this._activePassTargetSize = null;
     this._lastPassReferenceSize = null;
+    // W302: pre-allocated scratch bag and reusable END_RENDER_PASS command for zero-alloc hot paths.
+    this._scratch = createRenderStateScratch();
+    this._endRenderPassCmd = {
+      type: 'renderState',
+      _rsPassOp: 'endRenderPass',
+      _wgpuMeta: { kind: 'endRenderPass' },
+      run: (ctl) => {
+        if (ctl.passKind === 'render') ctl.endPass();
+        this._activePass = null;
+        this._activePassTargetSize = null;
+        this._lastPassReferenceSize = null;
+      },
+    };
   }
 
   getStats() {
@@ -2052,80 +2920,39 @@ class RenderStatePackets {
       case V2_OPCODES.BEGIN_RENDER_PASS:
         return this._count(payloadBytes >= 368 && this._beginRenderPass(view, offset));
       case V2_OPCODES.END_RENDER_PASS: {
-        const endCmd = {
-          type: 'renderState',
-          _rsPassOp: 'endRenderPass',
-          _wgpuMeta: { kind: 'endRenderPass' },
-          run: (ctl) => {
-            if (ctl.passKind === 'render') ctl.endPass();
-            this._activePass = null;
-            this._activePassTargetSize = null;
-            this._lastPassReferenceSize = null;
-          },
-        };
-        this.processor._passCommands.push(endCmd);
+        this.processor._passCommands.push(this._endRenderPassCmd);
         return this._count(true);
       }
       case V2_OPCODES.SET_VIEWPORT: {
-        if (payloadBytes < 24) return this._count(false);
-        const rawViewport = {
-          x: view.getFloat32(offset, true),
-          y: view.getFloat32(offset + 4, true),
-          width: view.getFloat32(offset + 8, true),
-          height: view.getFloat32(offset + 12, true),
-          minDepth: view.getFloat32(offset + 16, true),
-          maxDepth: view.getFloat32(offset + 20, true),
-        };
-        this._queue((ctl) => {
-          if (ctl.passKind !== 'render') return;
-          const targetSize = this._getActivePassTargetSize(ctl);
-          const vp = clampViewportToTarget(rawViewport, targetSize);
-          if (isViewportClamped(rawViewport, vp)) {
-            this.telemetry.clampedViewports += 1;
-            const targetTag = targetSize ? `${targetSize.width}x${targetSize.height}` : 'unbounded';
-            this._recordTelemetryWarningOnce(
-              `clamp-viewport:${targetTag}`,
-              `clamped viewport (${rawViewport.x},${rawViewport.y},${rawViewport.width}x${rawViewport.height},d=${rawViewport.minDepth}..${rawViewport.maxDepth}) to (${vp.x},${vp.y},${vp.width}x${vp.height},d=${vp.minDepth}..${vp.maxDepth}) for target ${targetTag}`
-            );
-          }
-          ctl.pass.setViewport(vp.x, vp.y, vp.width, vp.height, vp.minDepth, vp.maxDepth);
-        });
+        if (payloadBytes < VIEWPORT_PACKET_BYTES) return this._count(false);
+        const vp = decodeViewportPacket(view, offset, this._scratch.viewport);
+        if (!vp) return this._count(false);
+        this.processor._passCommands.push(
+          new SetViewportCommand(this, vp.x, vp.y, vp.width, vp.height, vp.minDepth, vp.maxDepth)
+        );
         return this._count(true);
       }
       case V2_OPCODES.SET_SCISSOR_RECT: {
-        if (payloadBytes < 16) return this._count(false);
-        const rawScissor = {
-          x: view.getUint32(offset, true),
-          y: view.getUint32(offset + 4, true),
-          width: view.getUint32(offset + 8, true),
-          height: view.getUint32(offset + 12, true),
-        };
-        this._queue((ctl) => {
-          if (ctl.passKind !== 'render') return;
-          const targetSize = this._getActivePassTargetSize(ctl);
-          const sc = clampScissorToTarget(rawScissor, targetSize);
-          if (isScissorClamped(rawScissor, sc)) {
-            this.telemetry.clampedScissors += 1;
-            const targetTag = targetSize ? `${targetSize.width}x${targetSize.height}` : 'unbounded';
-            this._recordTelemetryWarningOnce(
-              `clamp-scissor:${targetTag}`,
-              `clamped scissor (${rawScissor.x},${rawScissor.y},${rawScissor.width}x${rawScissor.height}) to (${sc.x},${sc.y},${sc.width}x${sc.height}) for target ${targetTag}`
-            );
-          }
-          ctl.pass.setScissorRect(sc.x, sc.y, sc.width, sc.height);
-        });
+        if (payloadBytes < SCISSOR_PACKET_BYTES) return this._count(false);
+        const sc = decodeScissorPacket(view, offset, this._scratch.scissor);
+        if (!sc) return this._count(false);
+        this.processor._passCommands.push(
+          new SetScissorRectCommand(this, sc.x, sc.y, sc.width, sc.height)
+        );
         return this._count(true);
       }
       case V2_OPCODES.SET_BLEND_CONSTANT: {
-        if (payloadBytes < 16) return this._count(false);
-        const c = [0, 4, 8, 12].map((o) => finiteOr(view.getFloat32(offset + o, true), 0) || 0);
-        this._queueRender((pass) => pass.setBlendConstant({ r: c[0], g: c[1], b: c[2], a: c[3] }));
+        if (payloadBytes < BLEND_CONSTANTS_PACKET_BYTES) return this._count(false);
+        const bc = decodeBlendConstantsPacket(view, offset, this._scratch.blendConstants);
+        if (!bc) return this._count(false);
+        this.processor._passCommands.push(new SetBlendConstantCommand(bc.r, bc.g, bc.b, bc.a));
         return this._count(true);
       }
       case V2_OPCODES.SET_STENCIL_REFERENCE: {
-        if (payloadBytes < 4) return this._count(false);
-        const reference = view.getUint32(offset, true);
-        this._queueRender((pass) => pass.setStencilReference(reference));
+        if (payloadBytes < STENCIL_REF_PACKET_BYTES) return this._count(false);
+        const sr = decodeStencilRefPacket(view, offset, this._scratch.stencilRef);
+        if (!sr) return this._count(false);
+        this.processor._passCommands.push(new SetStencilReferenceCommand(sr.reference));
         return this._count(true);
       }
       case V2_OPCODES.CREATE_BIND_GROUP2:
@@ -3861,7 +4688,7 @@ class RenderStatePackets {
         const rawX = cmd.workgroupX;
         const rawY = cmd.workgroupY;
         const rawZ = cmd.workgroupZ;
-        const check = validateComputeDispatch(rawX, rawY, rawZ, this.device);
+        const check = validateComputeDispatch(rawX, rawY, rawZ, this.device, this._scratch.computeDispatch);
         if (check.skip) {
           this.telemetry.skippedComputeDispatchCount += 1;
           this._recordTelemetryWarningOnce(
@@ -3915,7 +4742,7 @@ class RenderStatePackets {
   // ---- Textures and views ----
 
   _createTexture2(view, offset, payloadBytes) {
-    const decoded = decodeCreateTexture2(view, offset, payloadBytes);
+    const decoded = decodeCreateTexture2(view, offset, payloadBytes, this._scratch.createTexture2);
     if (decoded.error) {
       this._packetError = decoded.error;
       return false;
@@ -4111,21 +4938,21 @@ class RenderStatePackets {
     };
   }
 
-  _resolveSwapchainSize(ctl) {
+  _resolveSwapchainSize(ctl, out = null) {
     if (ctl) {
       if (ctl.swapchainTexture) {
-        const fromTex = validTargetSize(ctl.swapchainTexture.width, ctl.swapchainTexture.height);
+        const fromTex = validTargetSize(ctl.swapchainTexture.width, ctl.swapchainTexture.height, out);
         if (fromTex) return fromTex;
       }
       const fromCtl =
-        validTargetSize(ctl.swapchainWidth, ctl.swapchainHeight) ||
-        validTargetSize(ctl.canvasWidth, ctl.canvasHeight);
+        validTargetSize(ctl.swapchainWidth, ctl.swapchainHeight, out) ||
+        validTargetSize(ctl.canvasWidth, ctl.canvasHeight, out);
       if (fromCtl) return fromCtl;
       if (typeof ctl.getCanvasTexture === 'function') {
         try {
           const tex = ctl.getCanvasTexture();
           if (tex) {
-            const fromGetter = validTargetSize(tex.width, tex.height);
+            const fromGetter = validTargetSize(tex.width, tex.height, out);
             if (fromGetter) return fromGetter;
           }
         } catch (_) {
@@ -4134,32 +4961,32 @@ class RenderStatePackets {
       }
       if (ctl.swapchainView) {
         const fromView =
-          validTargetSize(ctl.swapchainView.width, ctl.swapchainView.height) ||
+          validTargetSize(ctl.swapchainView.width, ctl.swapchainView.height, out) ||
           (ctl.swapchainView.texture &&
-            validTargetSize(ctl.swapchainView.texture.width, ctl.swapchainView.texture.height));
+            validTargetSize(ctl.swapchainView.texture.width, ctl.swapchainView.texture.height, out));
         if (fromView) return fromView;
       }
     }
     const proc = this.processor;
     if (proc) {
       if (proc._swapchain && !proc._swapchain.isDestroyed) {
-        const fromSwapchain = validTargetSize(proc._swapchain.width, proc._swapchain.height);
+        const fromSwapchain = validTargetSize(proc._swapchain.width, proc._swapchain.height, out);
         if (fromSwapchain) return fromSwapchain;
       }
       if (proc.canvas) {
-        const fromProcCanvas = validTargetSize(proc.canvas.width, proc.canvas.height);
+        const fromProcCanvas = validTargetSize(proc.canvas.width, proc.canvas.height, out);
         if (fromProcCanvas) return fromProcCanvas;
       }
       if (proc.ctx) {
         if (proc.ctx.canvas) {
-          const fromCtxCanvas = validTargetSize(proc.ctx.canvas.width, proc.ctx.canvas.height);
+          const fromCtxCanvas = validTargetSize(proc.ctx.canvas.width, proc.ctx.canvas.height, out);
           if (fromCtxCanvas) return fromCtxCanvas;
         }
         if (typeof proc.ctx.getCurrentTexture === 'function') {
           try {
             const current = proc.ctx.getCurrentTexture();
             if (current) {
-              const fromCurrent = validTargetSize(current.width, current.height);
+              const fromCurrent = validTargetSize(current.width, current.height, out);
               if (fromCurrent) return fromCurrent;
             }
           } catch (_) {
@@ -4171,13 +4998,13 @@ class RenderStatePackets {
     return null;
   }
 
-  _getActivePassTargetSize(ctl) {
+  _getActivePassTargetSize(ctl, out = null) {
     if (this._activePass !== null && ctl.pass === this._activePass) {
       return this._activePassTargetSize;
     }
     this._activePass = null;
     this._activePassTargetSize = null;
-    return this._resolveSwapchainSize(ctl);
+    return this._resolveSwapchainSize(ctl, out);
   }
 
   // The exact GPURenderPassDescriptor for a decoded BeginRenderPass (views resolved via `ctl`).
@@ -4947,20 +5774,10 @@ class RenderStatePackets {
   }
 
   _createSampler(view, offset) {
-    const id = view.getUint32(offset, true);
-    const desc = {
-      addressModeU: nameOf(ADDRESS_MODE_NAMES, view.getUint8(offset + 4)) || 'clamp-to-edge',
-      addressModeV: nameOf(ADDRESS_MODE_NAMES, view.getUint8(offset + 5)) || 'clamp-to-edge',
-      addressModeW: nameOf(ADDRESS_MODE_NAMES, view.getUint8(offset + 6)) || 'clamp-to-edge',
-      magFilter: nameOf(FILTER_MODE_NAMES, view.getUint8(offset + 7)) || 'nearest',
-      minFilter: nameOf(FILTER_MODE_NAMES, view.getUint8(offset + 8)) || 'nearest',
-      mipmapFilter: nameOf(FILTER_MODE_NAMES, view.getUint8(offset + 9)) || 'nearest',
-      lodMinClamp: view.getFloat32(offset + 16, true),
-      lodMaxClamp: view.getFloat32(offset + 20, true),
-      maxAnisotropy: Math.max(1, view.getUint16(offset + 12, true)),
-    };
-    const compare = view.getUint8(offset + 10);
-    if (compare !== 0) desc.compare = nameOf(COMPARE_FUNCTION_NAMES, compare);
+    const decoded = decodeSampler2Packet(view, offset);
+    if (!decoded) return false;
+    const id = decoded.id;
+    const desc = decoded.descriptor;
     let sampler;
     try {
       sampler = this.device.createSampler(desc);
@@ -5019,6 +5836,16 @@ function installRenderStatePackets(processor, options = {}) {
 const exportedApi = {
   RenderStatePackets,
   installRenderStatePackets,
+  createRenderStateScratch,
+  decodeViewportPacket,
+  decodeScissorPacket,
+  decodeBlendConstantsPacket,
+  decodeStencilRefPacket,
+  decodePrimitiveTopologyPacket,
+  decodeBlendComponent,
+  decodeStencilFace,
+  decodeSetBindGroup2Packet,
+  decodeSampler2Packet,
   clampViewportToTarget,
   clampScissorToTarget,
   decodeRenderPipelineKey,

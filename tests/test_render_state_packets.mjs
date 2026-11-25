@@ -1527,6 +1527,16 @@ test('W81 G31 render_state_packets.js has zero ES module syntax and reloads clea
   assert.equal(typeof ctx.PlayGta6RenderState.isBlendableTextureFormat, 'function');
   assert.equal(typeof ctx.PlayGta6RenderState.sanitizeColorTargetBlendState, 'function');
   assert.equal(typeof ctx.PlayGta6RenderState.sanitizeRenderPassAttachments, 'function');
+  assert.equal(typeof ctx.PlayGta6RenderState.createRenderStateScratch, 'function');
+  assert.equal(typeof ctx.PlayGta6RenderState.decodeViewportPacket, 'function');
+  assert.equal(typeof ctx.PlayGta6RenderState.decodeScissorPacket, 'function');
+  assert.equal(typeof ctx.PlayGta6RenderState.decodeBlendConstantsPacket, 'function');
+  assert.equal(typeof ctx.PlayGta6RenderState.decodeStencilRefPacket, 'function');
+  assert.equal(typeof ctx.PlayGta6RenderState.decodePrimitiveTopologyPacket, 'function');
+  assert.equal(typeof ctx.PlayGta6RenderState.decodeBlendComponent, 'function');
+  assert.equal(typeof ctx.PlayGta6RenderState.decodeStencilFace, 'function');
+  assert.equal(typeof ctx.PlayGta6RenderState.decodeSetBindGroup2Packet, 'function');
+  assert.equal(typeof ctx.PlayGta6RenderState.decodeSampler2Packet, 'function');
 
   // Verify zero leaked top-level lexical declarations
   assert.doesNotThrow(() => {
@@ -5151,4 +5161,565 @@ test('W266 (#1128): sanitizeRenderPassAttachments guards mismatched color/depth/
   assert.ok(warnings.some((w) => w.includes('dropped depthStencilAttachment (3840x2160)')));
   assert.ok(warnings.some((w) => w.includes('dropped colorAttachments[1] (512x256)')));
   assert.ok(warnings.some((w) => w.includes('clamped depthClearValue')));
+});
+
+// ---------------------------------------------------------------------------------------------
+// W302 (#1218): Zero-alloc render-state packet decoding & createRenderStateScratch()
+// ---------------------------------------------------------------------------------------------
+
+test('W302 (#1218): createRenderStateScratch returns independent pre-allocated structs without leaking internal pools', () => {
+  const s1 = rs.createRenderStateScratch();
+  const s2 = rs.createRenderStateScratch();
+
+  assert.notEqual(s1, s2);
+  assert.notEqual(s1.viewport, s2.viewport);
+  assert.notEqual(s1.viewportClamped, s2.viewportClamped);
+  assert.notEqual(s1.scissor, s2.scissor);
+  assert.notEqual(s1.scissorClamped, s2.scissorClamped);
+  assert.notEqual(s1.blendConstants, s2.blendConstants);
+  assert.notEqual(s1.stencilRef, s2.stencilRef);
+  assert.notEqual(s1.primitiveTopology, s2.primitiveTopology);
+  assert.notEqual(s1.textureViewDesc, s2.textureViewDesc);
+  assert.notEqual(s1.bindGroupLayoutEntry, s2.bindGroupLayoutEntry);
+  assert.notEqual(s1.setBindGroup2, s2.setBindGroup2);
+  assert.notEqual(s1.sampler2, s2.sampler2);
+  assert.notEqual(s1.createTexture2, s2.createTexture2);
+  assert.notEqual(s1.beginRenderPass, s2.beginRenderPass);
+  assert.notEqual(s1.renderPipelineKey, s2.renderPipelineKey);
+  assert.notEqual(s1.computeDispatch, s2.computeDispatch);
+  assert.notEqual(s1.targetSize, s2.targetSize);
+
+  assert.ok(s1.viewportF32 instanceof Float32Array && s1.viewportF32.length === 6);
+  assert.ok(s1.scissorU32 instanceof Uint32Array && s1.scissorU32.length === 4);
+  assert.ok(s1.blendConstantsF32 instanceof Float32Array && s1.blendConstantsF32.length === 4);
+  assert.ok(s1.dynamicOffsetsU32 instanceof Uint32Array && s1.dynamicOffsetsU32.length === 16);
+
+  // Internal _pool properties must stay non-enumerable so deepEqual / WebGPU descriptors never see them.
+  assert.equal(Object.keys(s1.bindGroupLayoutEntry).includes('_pool'), false);
+  assert.equal(Object.keys(s1.createTexture2).includes('_pool'), false);
+  assert.equal(Object.keys(s1.beginRenderPass).includes('_pool'), false);
+  assert.equal(Object.keys(s1.renderPipelineKey).includes('_pool'), false);
+});
+
+test('W302 (#1218): hot viewport, scissor, blend constant, stencil ref & clamping decoders achieve zero-alloc out parity and NaN sanitization', () => {
+  const scratch = rs.createRenderStateScratch();
+  const target = { width: 1280, height: 720 };
+
+  // 1. Viewport packet (raw + clamped + NaN/Infinity/negative/reversed depth + bounds check)
+  const vpBuf = new ArrayBuffer(32);
+  const vpView = new DataView(vpBuf);
+  const writeVp = (off, x, y, w, h, minD, maxD) => {
+    vpView.setFloat32(off, x, true);
+    vpView.setFloat32(off + 4, y, true);
+    vpView.setFloat32(off + 8, w, true);
+    vpView.setFloat32(off + 12, h, true);
+    vpView.setFloat32(off + 16, minD, true);
+    vpView.setFloat32(off + 20, maxD, true);
+  };
+
+  writeVp(4, 12.5, 24.5, 640, 360, 0.1, 0.9);
+  const vpFresh1 = rs.decodeViewportPacket(vpView, 4);
+  const vpReuse1 = rs.decodeViewportPacket(vpView, 4, scratch.viewport);
+  assert.equal(vpReuse1, scratch.viewport);
+  assert.deepEqual(vpReuse1, vpFresh1);
+
+  // Overwrite dirty scratch with NaN/Infinity/oversized packet and clamp directly into reused target
+  writeVp(4, Number.NaN, -16, 3840, Number.POSITIVE_INFINITY, 0.9, 0.1);
+  const vpClampedFresh = rs.decodeViewportPacket(vpView, 4, null, target);
+  const vpClampedReuse = rs.decodeViewportPacket(vpView, 4, scratch.viewport, target);
+  assert.equal(vpClampedReuse, scratch.viewport);
+  assert.deepEqual(vpClampedReuse, vpClampedFresh);
+  assert.deepEqual(vpClampedReuse, {
+    x: 0,
+    y: 0,
+    width: 1280,
+    height: 0,
+    minDepth: Math.fround(0.1),
+    maxDepth: Math.fround(0.9),
+  });
+
+  // clampViewportToTarget into reused dirty out AND in-place (out === viewport)
+  scratch.viewportClamped.x = 9999;
+  scratch.viewportClamped.y = 8888;
+  scratch.viewportClamped.width = 7777;
+  scratch.viewportClamped.height = 6666;
+  scratch.viewportClamped.minDepth = 0.75;
+  scratch.viewportClamped.maxDepth = 0.85;
+  const rawDirtyVp = {
+    x: Number.NEGATIVE_INFINITY,
+    y: Number.NaN,
+    width: 1e308,
+    height: -10,
+    minDepth: 2,
+    maxDepth: -1,
+  };
+  const cvpFresh = clampViewportToTarget(rawDirtyVp, null);
+  const cvpReuse = clampViewportToTarget(rawDirtyVp, null, scratch.viewportClamped);
+  assert.equal(cvpReuse, scratch.viewportClamped);
+  assert.deepEqual(cvpReuse, cvpFresh);
+  assert.deepEqual(cvpReuse, { x: 0, y: 0, width: 0, height: 0, minDepth: 0, maxDepth: 1 });
+
+  const inPlaceVp = { x: 100, y: 200, width: 2000, height: 1000, minDepth: 0.8, maxDepth: 0.2 };
+  const inPlaceRes = clampViewportToTarget(inPlaceVp, target, inPlaceVp);
+  assert.equal(inPlaceRes, inPlaceVp);
+  assert.deepEqual(inPlaceVp, { x: 100, y: 200, width: 1180, height: 520, minDepth: 0.2, maxDepth: 0.8 });
+
+  // Bounds check must return null without mutating scratch
+  const snapVp = { ...scratch.viewport };
+  assert.equal(rs.decodeViewportPacket(vpView, 16, scratch.viewport), null);
+  assert.equal(rs.decodeViewportPacket(vpView, -4, scratch.viewport), null);
+  assert.equal(rs.decodeViewportPacket(null, 0, scratch.viewport), null);
+  assert.deepEqual(scratch.viewport, snapVp);
+
+  // 2. Scissor packet (raw + clamped + in-place + bounds check)
+  const scBuf = new ArrayBuffer(20);
+  const scView = new DataView(scBuf);
+  const writeSc = (off, x, y, w, h) => {
+    scView.setUint32(off, x, true);
+    scView.setUint32(off + 4, y, true);
+    scView.setUint32(off + 8, w, true);
+    scView.setUint32(off + 12, h, true);
+  };
+  writeSc(4, 16, 32, 3840, 2160);
+  const scFreshRaw = rs.decodeScissorPacket(scView, 4);
+  const scReuseRaw = rs.decodeScissorPacket(scView, 4, scratch.scissor);
+  assert.equal(scReuseRaw, scratch.scissor);
+  assert.deepEqual(scReuseRaw, scFreshRaw);
+
+  const scFreshClamped = rs.decodeScissorPacket(scView, 4, null, target);
+  const scReuseClamped = rs.decodeScissorPacket(scView, 4, scratch.scissor, target);
+  assert.equal(scReuseClamped, scratch.scissor);
+  assert.deepEqual(scReuseClamped, scFreshClamped);
+  assert.deepEqual(scReuseClamped, { x: 16, y: 32, width: 1264, height: 688 });
+
+  // Dirty target reset + NaN/negative sanitization via clampScissorToTarget(..., out)
+  scratch.scissorClamped.x = 555;
+  scratch.scissorClamped.y = 666;
+  scratch.scissorClamped.width = 777;
+  scratch.scissorClamped.height = 888;
+  const cscFresh = clampScissorToTarget({ x: Number.NaN, y: -5, width: 1e20, height: Number.POSITIVE_INFINITY }, target);
+  const cscReuse = clampScissorToTarget(
+    { x: Number.NaN, y: -5, width: 1e20, height: Number.POSITIVE_INFINITY },
+    target,
+    scratch.scissorClamped
+  );
+  assert.equal(cscReuse, scratch.scissorClamped);
+  assert.deepEqual(cscReuse, cscFresh);
+  assert.deepEqual(cscReuse, { x: 0, y: 0, width: 1280, height: 0 });
+
+  const inPlaceSc = { x: 1200, y: 700, width: 500, height: 500 };
+  assert.equal(clampScissorToTarget(inPlaceSc, target, inPlaceSc), inPlaceSc);
+  assert.deepEqual(inPlaceSc, { x: 1200, y: 700, width: 80, height: 20 });
+
+  assert.equal(rs.decodeScissorPacket(scView, 8, scratch.scissor), null);
+
+  // 3. Blend constants packet (dirty overwrite + NaN/Infinity/-0 sanitization)
+  const bcBuf = new ArrayBuffer(20);
+  const bcView = new DataView(bcBuf);
+  bcView.setFloat32(4, 0.25, true);
+  bcView.setFloat32(8, 0.5, true);
+  bcView.setFloat32(12, 0.75, true);
+  bcView.setFloat32(16, 1.0, true);
+  const bcFresh1 = rs.decodeBlendConstantsPacket(bcView, 4);
+  const bcReuse1 = rs.decodeBlendConstantsPacket(bcView, 4, scratch.blendConstants);
+  assert.equal(bcReuse1, scratch.blendConstants);
+  assert.deepEqual(bcReuse1, bcFresh1);
+
+  bcView.setFloat32(4, Number.NaN, true);
+  bcView.setFloat32(8, Number.POSITIVE_INFINITY, true);
+  bcView.setFloat32(12, Number.NEGATIVE_INFINITY, true);
+  bcView.setFloat32(16, -0, true);
+  const bcFresh2 = rs.decodeBlendConstantsPacket(bcView, 4);
+  const bcReuse2 = rs.decodeBlendConstantsPacket(bcView, 4, scratch.blendConstants);
+  assert.equal(bcReuse2, scratch.blendConstants);
+  assert.deepEqual(bcReuse2, bcFresh2);
+  assert.deepEqual(bcReuse2, { r: 0, g: 0, b: 0, a: 0 });
+  assert.equal(Object.is(bcReuse2.a, 0), true, '-0 must sanitize to +0');
+  assert.equal(rs.decodeBlendConstantsPacket(bcView, 8, scratch.blendConstants), null);
+
+  // 4. Stencil reference packet
+  const srBuf = new ArrayBuffer(8);
+  const srView = new DataView(srBuf);
+  srView.setUint32(4, 0xdeadbeef, true);
+  const srFresh1 = rs.decodeStencilRefPacket(srView, 4);
+  const srReuse1 = rs.decodeStencilRefPacket(srView, 4, scratch.stencilRef);
+  assert.equal(srReuse1, scratch.stencilRef);
+  assert.deepEqual(srReuse1, srFresh1);
+  assert.equal(srReuse1.reference, 0xdeadbeef);
+
+  srView.setUint32(4, 0, true);
+  assert.equal(rs.decodeStencilRefPacket(srView, 4, scratch.stencilRef), scratch.stencilRef);
+  assert.equal(scratch.stencilRef.reference, 0);
+  assert.equal(rs.decodeStencilRefPacket(srView, 6, scratch.stencilRef), null);
+
+  // 5. validateComputeDispatch zero-alloc out parity
+  const cdFresh1 = rs.validateComputeDispatch(0, 4, 1, { limits: { maxComputeWorkgroupsPerDimension: 65535 } });
+  const cdReuse1 = rs.validateComputeDispatch(
+    0,
+    4,
+    1,
+    { limits: { maxComputeWorkgroupsPerDimension: 65535 } },
+    scratch.computeDispatch
+  );
+  assert.equal(cdReuse1, scratch.computeDispatch);
+  assert.deepEqual(cdReuse1, cdFresh1);
+
+  const cdFresh2 = rs.validateComputeDispatch(100000, 8, 2, { limits: { maxComputeWorkgroupsPerDimension: 65535 } });
+  const cdReuse2 = rs.validateComputeDispatch(
+    100000,
+    8,
+    2,
+    { limits: { maxComputeWorkgroupsPerDimension: 65535 } },
+    scratch.computeDispatch
+  );
+  assert.equal(cdReuse2, scratch.computeDispatch);
+  assert.deepEqual(cdReuse2, cdFresh2);
+
+  const cdFresh3 = rs.validateComputeDispatch(8, 4, 1, { limits: { maxComputeWorkgroupsPerDimension: 65535 } });
+  const cdReuse3 = rs.validateComputeDispatch(
+    8,
+    4,
+    1,
+    { limits: { maxComputeWorkgroupsPerDimension: 65535 } },
+    scratch.computeDispatch
+  );
+  assert.equal(cdReuse3, scratch.computeDispatch);
+  assert.deepEqual(cdReuse3, cdFresh3);
+});
+
+test('W302 (#1218): dirty-field reset across consecutive decodes for primitive topology, texture view, BGL entry, SetBindGroup2, Sampler2, CreateTexture2, BeginRenderPass & RenderPipelineKey', () => {
+  const scratch = rs.createRenderStateScratch();
+
+  // 1. Primitive topology: stripIndexFormat + unclippedDepth must be deleted when absent on next decode
+  const prBytes = new Uint8Array(8);
+  const prView = new DataView(prBytes.buffer);
+  prBytes.set([1, 1, 1, 2, 1], 0); // triangle-strip, uint16, cw, back, unclippedDepth=true
+  const prFresh1 = rs.decodePrimitiveTopologyPacket(prView, 0);
+  const prReuse1 = rs.decodePrimitiveTopologyPacket(prView, 0, scratch.primitiveTopology);
+  assert.equal(prReuse1, scratch.primitiveTopology);
+  assert.deepEqual(prReuse1, prFresh1);
+  assert.equal(prReuse1.stripIndexFormat, 'uint16');
+  assert.equal(prReuse1.unclippedDepth, true);
+
+  prBytes.set([0, 2, 0, 0, 0], 0); // triangle-list (stripIndexFormat ignored), ccw, none, unclipped=false
+  const prFresh2 = rs.decodePrimitiveTopologyPacket(prView, 0);
+  const prReuse2 = rs.decodePrimitiveTopologyPacket(prView, 0, scratch.primitiveTopology);
+  assert.equal(prReuse2, scratch.primitiveTopology);
+  assert.deepEqual(prReuse2, prFresh2);
+  assert.equal('stripIndexFormat' in prReuse2, false);
+  assert.equal('unclippedDepth' in prReuse2, false);
+  assert.equal(rs.decodePrimitiveTopologyPacket(prView, 5, scratch.primitiveTopology), null);
+
+  // 2. TextureViewDesc: all 7 optional keys must reset cleanly to {}
+  const vdFull = viewDesc({ format: 22, dimension: 3, aspect: 1, baseMip: 2, mipCount: 4, baseLayer: 1, layerCount: 6 });
+  const vdEmpty = viewDesc({});
+  const tvFresh1 = rs.decodeTextureViewDesc(new DataView(vdFull.buffer), 0);
+  const tvReuse1 = rs.decodeTextureViewDesc(new DataView(vdFull.buffer), 0, scratch.textureViewDesc);
+  assert.equal(tvReuse1, scratch.textureViewDesc);
+  assert.deepEqual(tvReuse1, tvFresh1);
+
+  const tvFresh2 = rs.decodeTextureViewDesc(new DataView(vdEmpty.buffer), 0);
+  const tvReuse2 = rs.decodeTextureViewDesc(new DataView(vdEmpty.buffer), 0, scratch.textureViewDesc);
+  assert.equal(tvReuse2, scratch.textureViewDesc);
+  assert.deepEqual(tvReuse2, tvFresh2);
+  assert.deepEqual(tvReuse2, {});
+
+  // 3. BindGroupLayoutEntry: alternating buffer -> sampler -> texture -> storageTexture -> buffer
+  const makeBglEntry = (e) => {
+    const b = new Uint8Array(24);
+    const v = new DataView(b.buffer);
+    v.setUint32(0, e.binding, true);
+    v.setUint32(4, e.visibility, true);
+    v.setUint8(8, e.type);
+    v.setUint8(9, e.subtype || 0);
+    v.setUint8(10, e.dimension || 0);
+    v.setUint8(11, e.flags || 0);
+    v.setUint8(12, e.storageFormat || 0);
+    v.setBigUint64(16, BigInt(e.minBindingSize || 0), true);
+    return new DataView(b.buffer);
+  };
+  const bglCases = [
+    { binding: 0, visibility: 3, type: 0, subtype: 1, flags: 1, minBindingSize: 256 }, // storage buffer (strips vertex bit)
+    { binding: 1, visibility: 2, type: 1, subtype: 2 }, // comparison sampler
+    { binding: 2, visibility: 2, type: 2, subtype: 2, dimension: 4, flags: 2 }, // multisampled depth cube
+    { binding: 3, visibility: 5, type: 3, subtype: 0, dimension: 3, storageFormat: 16 }, // storage texture (strips vertex bit)
+    { binding: 4, visibility: 3, type: 0, subtype: 0, flags: 0, minBindingSize: 64 }, // uniform buffer
+  ];
+  let firstBufRef = null;
+  for (const spec of bglCases) {
+    const dv = makeBglEntry(spec);
+    const fresh = rs.decodeBindGroupLayoutEntry(dv, 0);
+    const reused = rs.decodeBindGroupLayoutEntry(dv, 0, scratch.bindGroupLayoutEntry);
+    assert.equal(reused, scratch.bindGroupLayoutEntry);
+    assert.deepEqual(reused, fresh);
+    if (reused.buffer) {
+      if (!firstBufRef) firstBufRef = reused.buffer;
+      else assert.equal(reused.buffer, firstBufRef, 'pooled buffer sub-object must be reused');
+    }
+  }
+  // Plain user {} object also works and cleans dirty keys
+  const plainBglOut = {};
+  assert.deepEqual(rs.decodeBindGroupLayoutEntry(makeBglEntry(bglCases[0]), 0, plainBglOut), rs.decodeBindGroupLayoutEntry(makeBglEntry(bglCases[0]), 0));
+  assert.deepEqual(rs.decodeBindGroupLayoutEntry(makeBglEntry(bglCases[1]), 0, plainBglOut), rs.decodeBindGroupLayoutEntry(makeBglEntry(bglCases[1]), 0));
+  assert.equal('buffer' in plainBglOut, false);
+
+  // 4. SetBindGroup2: dynamicOffsets array shrinks cleanly without reallocating
+  const sbg1 = setBindGroup2Packet(0, 42, [256, 512, 768]).subarray(8);
+  const sbg2 = setBindGroup2Packet(2, 99, [1024]).subarray(8);
+  const sbg3 = setBindGroup2Packet(1, 7, []).subarray(8);
+  const offsetsArrRef = scratch.setBindGroup2.dynamicOffsets;
+
+  const sbgFresh1 = rs.decodeSetBindGroup2Packet(new DataView(sbg1.buffer, sbg1.byteOffset, sbg1.byteLength), 0);
+  const sbgReuse1 = rs.decodeSetBindGroup2Packet(new DataView(sbg1.buffer, sbg1.byteOffset, sbg1.byteLength), 0, scratch.setBindGroup2);
+  assert.equal(sbgReuse1, scratch.setBindGroup2);
+  assert.equal(sbgReuse1.dynamicOffsets, offsetsArrRef);
+  assert.deepEqual(sbgReuse1, sbgFresh1);
+
+  const sbgFresh2 = rs.decodeSetBindGroup2Packet(new DataView(sbg2.buffer, sbg2.byteOffset, sbg2.byteLength), 0, sbg2.byteLength);
+  const sbgReuse2 = rs.decodeSetBindGroup2Packet(new DataView(sbg2.buffer, sbg2.byteOffset, sbg2.byteLength), 0, sbg2.byteLength, scratch.setBindGroup2);
+  assert.equal(sbgReuse2.dynamicOffsets, offsetsArrRef);
+  assert.deepEqual(sbgReuse2, sbgFresh2);
+
+  const sbgFresh3 = rs.decodeSetBindGroup2Packet(new DataView(sbg3.buffer, sbg3.byteOffset, sbg3.byteLength), 0);
+  const sbgReuse3 = rs.decodeSetBindGroup2Packet(new DataView(sbg3.buffer, sbg3.byteOffset, sbg3.byteLength), 0, scratch.setBindGroup2);
+  assert.equal(sbgReuse3.dynamicOffsets, offsetsArrRef);
+  assert.deepEqual(sbgReuse3, sbgFresh3);
+  assert.deepEqual(sbgReuse3.dynamicOffsets, []);
+
+  // 5. Sampler2: optional `compare` deleted when switching from comparison to non-comparison sampler
+  const smpBytes = new Uint8Array(24);
+  const smpView = new DataView(smpBytes.buffer);
+  smpView.setUint32(0, 10, true);
+  smpBytes.set([1, 2, 0, 1, 1, 1, 2], 4); // repeat, mirror, clamp, linear, compare='less'
+  smpView.setUint16(12, 8, true);
+  smpView.setFloat32(16, 0.5, true);
+  smpView.setFloat32(20, 12.0, true);
+  const smpDescRef = scratch.sampler2.descriptor;
+  const smpFresh1 = rs.decodeSampler2Packet(smpView, 0);
+  const smpReuse1 = rs.decodeSampler2Packet(smpView, 0, scratch.sampler2);
+  assert.equal(smpReuse1, scratch.sampler2);
+  assert.equal(smpReuse1.descriptor, smpDescRef);
+  assert.deepEqual(smpReuse1, smpFresh1);
+  assert.equal(smpReuse1.descriptor.compare, 'less');
+
+  smpView.setUint32(0, 11, true);
+  smpBytes[10] = 0; // no compare
+  const smpFresh2 = rs.decodeSampler2Packet(smpView, 0);
+  const smpReuse2 = rs.decodeSampler2Packet(smpView, 0, scratch.sampler2);
+  assert.equal(smpReuse2.descriptor, smpDescRef);
+  assert.deepEqual(smpReuse2, smpFresh2);
+  assert.equal('compare' in smpReuse2.descriptor, false);
+
+  // 6. CreateTexture2: error -> success with viewFormats -> success without viewFormats -> error
+  const ctDescRef = scratch.createTexture2.descriptor;
+  const ctSizeRef = scratch.createTexture2.descriptor.size;
+  const badCt = new Uint8Array(40);
+  const ctFreshErr = rs.decodeCreateTexture2(new DataView(badCt.buffer), 0, 40);
+  const ctReuseErr = rs.decodeCreateTexture2(new DataView(badCt.buffer), 0, 40, scratch.createTexture2);
+  assert.equal(ctReuseErr, scratch.createTexture2);
+  assert.deepEqual(ctReuseErr, ctFreshErr);
+  assert.equal('descriptor' in ctReuseErr, false);
+
+  const okWithVf = createTexture2Packet({
+    id: 77,
+    width: 256,
+    height: 128,
+    format: formatCodeOf('rgba8unorm'),
+    usage: 0x14,
+    viewFormats: [formatCodeOf('rgba8unorm-srgb')],
+  }).subarray(8);
+  const ctFreshOk1 = rs.decodeCreateTexture2(new DataView(okWithVf.buffer, okWithVf.byteOffset, okWithVf.byteLength), 0);
+  const ctReuseOk1 = rs.decodeCreateTexture2(new DataView(okWithVf.buffer, okWithVf.byteOffset, okWithVf.byteLength), 0, scratch.createTexture2);
+  assert.equal(ctReuseOk1.descriptor, ctDescRef);
+  assert.equal(ctReuseOk1.descriptor.size, ctSizeRef);
+  assert.deepEqual(ctReuseOk1, ctFreshOk1);
+  assert.equal('error' in ctReuseOk1, false);
+
+  const okNoVf = createTexture2Packet({
+    id: 78,
+    width: 64,
+    height: 64,
+    format: formatCodeOf('bgra8unorm'),
+    usage: 0x04,
+  }).subarray(8);
+  const ctFreshOk2 = rs.decodeCreateTexture2(new DataView(okNoVf.buffer, okNoVf.byteOffset, okNoVf.byteLength), 0, 40);
+  const ctReuseOk2 = rs.decodeCreateTexture2(new DataView(okNoVf.buffer, okNoVf.byteOffset, okNoVf.byteLength), 0, 40, scratch.createTexture2);
+  assert.equal(ctReuseOk2.descriptor, ctDescRef);
+  assert.deepEqual(ctReuseOk2, ctFreshOk2);
+  assert.equal('viewFormats' in ctReuseOk2.descriptor, false);
+
+  // 7. BeginRenderPass: 2 colors + depthStencil -> 1 color (empty view) + null depthStencil
+  const rp1 = beginRenderPassPacket({
+    colors: [
+      { textureId: 10, loadOp: 2, storeOp: 1, view: viewDesc({ format: 22, dimension: 2, baseMip: 1, mipCount: 1 }), clearValue: [0.1, 0.2, 0.3, 1] },
+      { textureId: 11, loadOp: 1, storeOp: 2 },
+    ],
+    depthStencil: { textureId: 20, view: viewDesc({ aspect: 1 }), depthClearValue: 0.5 },
+  }).subarray(8);
+  const rp2 = beginRenderPassPacket({
+    colors: [{ textureId: 12, loadOp: 1, storeOp: 1 }],
+  }).subarray(8);
+  const rpFresh1 = rs.decodeBeginRenderPass(new DataView(rp1.buffer, rp1.byteOffset, rp1.byteLength), 0);
+  const rpReuse1 = rs.decodeBeginRenderPass(new DataView(rp1.buffer, rp1.byteOffset, rp1.byteLength), 0, scratch.beginRenderPass);
+  assert.equal(rpReuse1, scratch.beginRenderPass);
+  assert.deepEqual(rpReuse1, rpFresh1);
+  const color0Ref = rpReuse1.colors[0];
+
+  const rpFresh2 = rs.decodeBeginRenderPass(new DataView(rp2.buffer, rp2.byteOffset, rp2.byteLength), 0);
+  const rpReuse2 = rs.decodeBeginRenderPass(new DataView(rp2.buffer, rp2.byteOffset, rp2.byteLength), 0, scratch.beginRenderPass);
+  assert.equal(rpReuse2, scratch.beginRenderPass);
+  assert.equal(rpReuse2.colors[0], color0Ref, 'color attachment slot object must be reused');
+  assert.deepEqual(rpReuse2, rpFresh2);
+  assert.equal(rpReuse2.depthStencil, null);
+  assert.deepEqual(rpReuse2.colors[0].view, {});
+
+  // 8. RenderPipelineKey: full complex key -> minimal key -> full key (reusing target/buffer/attr/primitive/multisample pools)
+  const keyFull = new Uint8Array(376);
+  const kfv = new DataView(keyFull.buffer);
+  kfv.setUint32(20, 2, true);
+  keyFull.set([40, 1, 0x7, 0, 0, 11, 12, 0, 4, 1, 0, 0], 24);
+  keyFull.set([16, 0, 0xf, 0], 36);
+  keyFull.set([47, 1, 7, 0, 5, 1, 2, 3, 8, 0, 0, 0], 120);
+  kfv.setUint32(132, 0xff, true);
+  kfv.setUint32(136, 0x0f, true);
+  kfv.setInt32(140, -2, true);
+  kfv.setFloat32(144, 1.5, true);
+  kfv.setFloat32(148, 0.25, true);
+  keyFull.set([1, 1, 0, 1, 1], 152);
+  kfv.setUint32(160, 4, true);
+  kfv.setUint32(164, 0xf, true);
+  keyFull[168] = 1;
+  kfv.setUint32(172, 2, true);
+  kfv.setUint32(176, 2, true);
+  kfv.setUint32(180, 16, true);
+  keyFull.set([1, 1], 184);
+  kfv.setUint32(188, 8, true);
+  keyFull.set([2, 1], 192);
+  kfv.setUint32(244, 0, true);
+  keyFull.set([29, 0, 0], 248);
+  kfv.setUint32(252, 0, true);
+  keyFull.set([28, 1, 1], 256);
+
+  const keyMinimal = new Uint8Array(376);
+  const kmv = new DataView(keyMinimal.buffer);
+  kmv.setUint32(20, 1, true);
+  keyMinimal.set([22, 0, 0xf, 0], 24); // rgba8unorm, no blend
+  kmv.setUint32(160, 1, true);
+  kmv.setUint32(164, 0xffffffff, true);
+
+  const rpkFreshFull = decodeRenderPipelineKey(new DataView(keyFull.buffer), 0);
+  const rpkReuseFull = decodeRenderPipelineKey(new DataView(keyFull.buffer), 0, scratch.renderPipelineKey);
+  assert.equal(rpkReuseFull, scratch.renderPipelineKey);
+  assert.deepEqual(rpkReuseFull, rpkFreshFull);
+  const primRef = rpkReuseFull.primitive;
+  const msRef = rpkReuseFull.multisample;
+  const target0Ref = rpkReuseFull.targets[0];
+
+  const rpkFreshMin = decodeRenderPipelineKey(new DataView(keyMinimal.buffer), 0);
+  const rpkReuseMin = decodeRenderPipelineKey(new DataView(keyMinimal.buffer), 0, scratch.renderPipelineKey);
+  assert.equal(rpkReuseMin, scratch.renderPipelineKey);
+  assert.equal(rpkReuseMin.primitive, primRef);
+  assert.equal(rpkReuseMin.multisample, msRef);
+  assert.equal(rpkReuseMin.targets[0], target0Ref);
+  assert.deepEqual(rpkReuseMin, rpkFreshMin);
+  assert.equal(rpkReuseMin.depthStencil, undefined);
+  assert.equal('blend' in rpkReuseMin.targets[0], false);
+  assert.equal('stripIndexFormat' in rpkReuseMin.primitive, false);
+  assert.equal('unclippedDepth' in rpkReuseMin.primitive, false);
+  assert.deepEqual(rpkReuseMin.buffers, []);
+
+  // Re-decode full key again to verify pooled sub-objects repopulate cleanly
+  const rpkReuseFull2 = decodeRenderPipelineKey(new DataView(keyFull.buffer), 0, scratch.renderPipelineKey);
+  assert.deepEqual(rpkReuseFull2, rpkFreshFull);
+});
+
+test('W302 (#1218): 30 FPS draw-heavy multi-frame render-state stream replays thousands of state changes cleanly with W266 telemetry preserved', () => {
+  const scratch = rs.createRenderStateScratch();
+  const target = { width: 1280, height: 720 };
+
+  // Tight zero-alloc hot loop parity check across 1,000 alternating viewport/scissor/blend/stencil decodes
+  const buf = new ArrayBuffer(64);
+  const dv = new DataView(buf);
+  const vpRef = scratch.viewport;
+  const scRef = scratch.scissor;
+  const bcRef = scratch.blendConstants;
+  const srRef = scratch.stencilRef;
+  for (let i = 0; i < 1000; i += 1) {
+    dv.setFloat32(0, i % 2 === 0 ? i : Number.NaN, true);
+    dv.setFloat32(4, (i * 3) % 400, true);
+    dv.setFloat32(8, 640 + (i % 2000), true);
+    dv.setFloat32(12, 360 + (i % 1000), true);
+    dv.setFloat32(16, 0, true);
+    dv.setFloat32(20, 1, true);
+    const vpOut = rs.decodeViewportPacket(dv, 0, scratch.viewport, target);
+    assert.equal(vpOut, vpRef);
+    assert.ok(vpOut.x >= 0 && vpOut.x + vpOut.width <= target.width);
+    assert.ok(vpOut.y >= 0 && vpOut.y + vpOut.height <= target.height);
+
+    dv.setUint32(24, i * 2, true);
+    dv.setUint32(28, i, true);
+    dv.setUint32(32, 1600, true);
+    dv.setUint32(36, 900, true);
+    const scOut = rs.decodeScissorPacket(dv, 24, scratch.scissor, target);
+    assert.equal(scOut, scRef);
+    assert.ok(scOut.x + scOut.width <= target.width && scOut.y + scOut.height <= target.height);
+
+    dv.setFloat32(40, (i % 5) * 0.25, true);
+    dv.setFloat32(44, i % 7 === 0 ? Number.NaN : 0.5, true);
+    dv.setFloat32(48, 0.75, true);
+    dv.setFloat32(52, 1.0, true);
+    const bcOut = rs.decodeBlendConstantsPacket(dv, 40, scratch.blendConstants);
+    assert.equal(bcOut, bcRef);
+    assert.equal(Number.isFinite(bcOut.g), true);
+
+    dv.setUint32(56, i & 0xff, true);
+    const srOut = rs.decodeStencilRefPacket(dv, 56, scratch.stencilRef);
+    assert.equal(srOut, srRef);
+    assert.equal(srOut.reference, i & 0xff);
+  }
+
+  // End-to-end processor stream across 2 frames with multiple viewports, scissors, blend constants, stencil refs
+  const gpu = createMockWebGpu();
+  gpu.ctx.canvas = { width: 1280, height: 720 };
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { format: 'bgra8unorm' });
+  const handler = installRenderStatePackets(processor);
+
+  const blendA = new Uint8Array(16);
+  new DataView(blendA.buffer).setFloat32(0, 0.25, true);
+  new DataView(blendA.buffer).setFloat32(12, 1.0, true);
+  const blendB = new Uint8Array(16);
+  new DataView(blendB.buffer).setFloat32(4, 0.75, true);
+  new DataView(blendB.buffer).setFloat32(8, Number.NaN, true);
+
+  for (let frame = 0; frame < 2; frame += 1) {
+    const stream = concat(
+      new Stream().packet(OPCODES.BEGIN_FRAME).bytes(),
+      beginRenderPassPacket({ colors: [{ textureId: SWAPCHAIN_TEXTURE_ID }] }),
+      setViewportPacket(0, 0, 1280, 720, 0, 1),
+      setViewportPacket(0, 0, 3840, 2160, 0, 1),
+      setScissorPacket(0, 0, 1280, 720),
+      setScissorPacket(0, 0, 3840, 2160),
+      header(V2_OPCODES.SET_BLEND_CONSTANT, blendA),
+      header(V2_OPCODES.SET_BLEND_CONSTANT, blendB),
+      new Stream().u32s(V2_OPCODES.SET_STENCIL_REFERENCE, [frame === 0 ? 1 : 255]).bytes(),
+      header(V2_OPCODES.END_RENDER_PASS, new Uint8Array(0)),
+      new Stream().packet(OPCODES.PRESENT).bytes()
+    );
+    const res = processor.executeCommandBuffer(stream);
+    assert.equal(res.presents, 1);
+  }
+
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  assert.equal(handler.getStats().clampedViewports, 2);
+  assert.equal(handler.getStats().clampedScissors, 2);
+
+  const blendCalls = gpu.passCalls.filter((c) => c.op === 'setBlendConstant').map((c) => c.args[0]);
+  assert.deepEqual(blendCalls, [
+    { r: 0.25, g: 0, b: 0, a: 1 },
+    { r: 0, g: 0.75, b: 0, a: 0 },
+    { r: 0.25, g: 0, b: 0, a: 1 },
+    { r: 0, g: 0.75, b: 0, a: 0 },
+  ]);
+  const stencilCalls = gpu.passCalls.filter((c) => c.op === 'setStencilReference').map((c) => c.args[0]);
+  assert.deepEqual(stencilCalls, [1, 255]);
 });
