@@ -215,13 +215,22 @@ test('exports expected PGIM whole-file and slab cache defaults and path predicat
   assert.equal(isWholeFileBufferedPath('boot/main/image/GUEST.PGIM'), true);
   assert.equal(isWholeFileBufferedPath('program-manifest.json'), true);
   assert.equal(isWholeFileBufferedPath('boot/program-manifest.json'), true);
+  assert.equal(isWholeFileBufferedPath('boot/boot-options.json'), true);
+  assert.equal(isWholeFileBufferedPath('boot-options.json'), true);
+  assert.equal(isWholeFileBufferedPath('shaders/splash.wgsl.pack.reflect.json'), true);
+  assert.equal(isWholeFileBufferedPath('shaders/SPLASH.WGSL.PACK.REFLECT.JSON'), true);
+  assert.equal(isWholeFileBufferedPath('shaders/splash.wgsl.pack'), false);
   assert.equal(isWholeFileBufferedPath('appdata0.rpf'), false);
   assert.equal(isWholeFileBufferedPath('audio.ttpf'), false);
   assert.equal(isWholeFileBufferedPath('data-manifest.json'), false);
 
-  // Immutable paths include .ttpf in addition to .rpf, .pgim, .dll, MicrosoftGame.Config
+  // Immutable paths include .ttpf, .pack (.wgsl.pack), and .reflect.json in addition to
+  // .rpf, .pgim, .dll, and MicrosoftGame.Config
   assert.equal(isImmutableHttpfsPath('x64/audio/dialogue.ttpf'), true);
   assert.equal(isImmutableHttpfsPath('x64/audio/SFX.TTPF'), true);
+  assert.equal(isImmutableHttpfsPath('shaders/splash.wgsl.pack'), true);
+  assert.equal(isImmutableHttpfsPath('shaders/SPLASH.WGSL.PACK'), true);
+  assert.equal(isImmutableHttpfsPath('shaders/splash.wgsl.pack.reflect.json'), true);
   assert.equal(isImmutableHttpfsPath('appdata0.rpf'), true);
   assert.equal(isImmutableHttpfsPath('xgameruntime.dll'), true);
   assert.equal(isImmutableHttpfsPath('main/image/guest.pgim'), true);
@@ -861,5 +870,235 @@ test('real HTTP server + cross-thread Atomics.wait boot loads PGIM in 1 fetch an
   } finally {
     await controller.detachMailbox();
     await server.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 6. W125: .wgsl.pack slab caching & .reflect.json / boot-options.json whole-file buffering
+// ---------------------------------------------------------------------------
+
+test('W125: multi-chunk 64 KiB reads of .wgsl.pack coalesce into ImmutableHttpfsCache slabs without whole-file buffering', async () => {
+  const slabSize = 256 * 1024; // 256 KiB slabs (4 x 64 KiB reads per slab)
+  const packSize = 600 * 1024; // 10 x 64 KiB reads -> 3 slabs: [0..256K), [256K..512K), [512K..600K)
+  const packBytes = makePatternBytes(packSize, 137);
+
+  const mock = createMockRangeFetch(new Map([['/shaders/splash.wgsl.pack', packBytes]]));
+  const controller = new IoWorkerController({
+    fetchImpl: mock.fetchImpl,
+    slabSize,
+    slabMaxBytes: 4 * 1024 * 1024,
+    opfsDir: null,
+  });
+
+  const sab = createHttpfsMailboxBuffer(64 * 1024);
+  const client = new HttpfsMailboxClient(sab);
+
+  try {
+    await controller.init({
+      dataBase: '/data/',
+      bootBase: '/boot/',
+      gameBase: '/game/',
+      shadersBase: '/shaders/',
+    });
+    await controller.attachMailbox(sab);
+
+    const reqsBefore = mock.requests.length;
+    const h = await client.openAsync('shaders/splash.wgsl.pack');
+    assert.ok(h >= 1, `Expected valid .wgsl.pack handle, got ${h}`);
+    assert.equal(controller.getHandleInfo(h).size, packSize);
+    assert.equal(controller.getHandleInfo(h).wholeFileBuffered, false);
+    assert.equal(controller.getStats().wholeFileCache.activeEntries, 0);
+
+    const out = new Uint8Array(packSize);
+    const chunkBuf = new Uint8Array(65536);
+    let offset = 0;
+    let readCalls = 0;
+    while (offset < packSize) {
+      const got = await client.readAsync(h, BigInt(offset), chunkBuf, 65536);
+      assert.ok(got > 0, `Expected positive bytes at offset ${offset}, got ${got}`);
+      out.set(chunkBuf.subarray(0, got), offset);
+      offset += got;
+      readCalls += 1;
+    }
+
+    assert.equal(readCalls, 10);
+    assert.deepEqual(out, packBytes);
+
+    // 1 OPEN chunk-0 probe + 3 aligned slab fetches = 4 HTTP fetches (NOT 10!)
+    assert.equal(
+      mock.requests.length - reqsBefore,
+      4,
+      `Expected 4 HTTP fetches for .wgsl.pack, got ${mock.requests.length - reqsBefore}`,
+    );
+
+    // Cross-slab re-read hits cached slabs with 0 additional HTTP fetches.
+    const reqsBeforeCross = mock.requests.length;
+    const crossBuf = new Uint8Array(65536);
+    const crossOff = slabSize - 32768;
+    const crossGot = await client.readAsync(h, BigInt(crossOff), crossBuf, 65536);
+    assert.equal(crossGot, 65536);
+    assert.deepEqual(crossBuf, packBytes.subarray(crossOff, crossOff + 65536));
+    assert.equal(mock.requests.length, reqsBeforeCross);
+
+    const stats = controller.getStats();
+    assert.equal(stats.slabCacheMisses, 3);
+    assert.ok(stats.slabCacheHits >= 7, `Expected >= 7 slab hits, got ${stats.slabCacheHits}`);
+    assert.equal(stats.immutableCache.slabEntries, 3);
+    assert.equal(stats.immutableCache.slabBytesCached, packSize);
+    assert.equal(stats.wholeFileCache.wholeFileFetches, 0);
+    assert.ok(stats.syncFastPathHits >= 7);
+
+    assert.equal(await client.closeAsync(h), true);
+  } finally {
+    await controller.detachMailbox();
+  }
+});
+
+test('W125: .reflect.json and boot-options.json load in 1 HTTP fetch, release on CLOSE, and fall back to slabs when oversized', async () => {
+  // Synthetic .reflect.json spanning 5 x 64 KiB reads (300 KiB)
+  const padEntry = 'x'.repeat(1024);
+  const entries = [];
+  while (entries.length * 1060 < 300 * 1024) {
+    entries.push({ hash: `0x${entries.length.toString(16).padStart(8, '0')}`, pad: padEntry });
+  }
+  const reflectBytes = utf8Encoder.encode(JSON.stringify({ version: 1, shaders: entries }));
+  assert.ok(reflectBytes.byteLength > 4 * 65536, 'Synthetic .reflect.json must exceed 4 x 64 KiB chunks');
+
+  const bootOptionsBytes = utf8Encoder.encode(
+    JSON.stringify({ streamShaders: true, shaderPack: 'shaders/splash.wgsl.pack' }),
+  );
+
+  const mock = createMockRangeFetch(
+    new Map([
+      ['/shaders/splash.wgsl.pack.reflect.json', reflectBytes],
+      ['/boot/boot-options.json', bootOptionsBytes],
+    ]),
+  );
+
+  const controller = new IoWorkerController({
+    fetchImpl: mock.fetchImpl,
+    opfsDir: null,
+  });
+
+  const sab = createHttpfsMailboxBuffer(64 * 1024);
+  const client = new HttpfsMailboxClient(sab);
+
+  try {
+    await controller.init({
+      dataBase: '/data/',
+      bootBase: '/boot/',
+      gameBase: '/game/',
+      shadersBase: '/shaders/',
+    });
+    await controller.attachMailbox(sab);
+
+    // 1. Multi-chunk 64 KiB reads of .reflect.json complete in 1 HTTP fetch and release on CLOSE.
+    const reqsBeforeReflect = mock.requests.length;
+    const hRef = await client.openAsync('shaders/splash.wgsl.pack.reflect.json');
+    assert.ok(hRef >= 1, `Expected valid .reflect.json handle, got ${hRef}`);
+    assert.equal(controller.getHandleInfo(hRef).size, reflectBytes.byteLength);
+    assert.equal(controller.getHandleInfo(hRef).wholeFileBuffered, true);
+    assert.equal(mock.requests.length - reqsBeforeReflect, 1);
+
+    let statsOpen = controller.getStats();
+    assert.equal(statsOpen.wholeFileCache.activeEntries, 1);
+    assert.equal(statsOpen.wholeFileCache.activeBytes, reflectBytes.byteLength);
+    assert.equal(statsOpen.wholeFileCache.wholeFileFetches, 1);
+    assert.equal(statsOpen.pgimFullFetches, 0);
+
+    const assembled = new Uint8Array(reflectBytes.byteLength);
+    const chunkBuf = new Uint8Array(65536);
+    let offset = 0;
+    let readCalls = 0;
+    while (offset < reflectBytes.byteLength) {
+      const got = await client.readAsync(hRef, BigInt(offset), chunkBuf, 65536);
+      assert.ok(got > 0);
+      assembled.set(chunkBuf.subarray(0, got), offset);
+      offset += got;
+      readCalls += 1;
+    }
+
+    assert.ok(readCalls >= 5, `Expected >= 5 64 KiB reads, got ${readCalls}`);
+    assert.deepEqual(assembled, reflectBytes);
+    assert.equal(await client.readAsync(hRef, BigInt(reflectBytes.byteLength), chunkBuf, 64), 0);
+    assert.equal(
+      mock.requests.length - reqsBeforeReflect,
+      1,
+      `Expected strictly 1 HTTP fetch for .reflect.json, got ${mock.requests.length - reqsBeforeReflect}`,
+    );
+
+    assert.equal(await client.closeAsync(hRef), true);
+    const statsAfterReflectClose = controller.getStats();
+    assert.equal(statsAfterReflectClose.wholeFileCache.activeEntries, 0);
+    assert.equal(statsAfterReflectClose.wholeFileCache.activeBytes, 0);
+    assert.equal(statsAfterReflectClose.wholeFileCache.releases, 1);
+
+    // 2. boot/boot-options.json loads in 1 HTTP fetch and releases on CLOSE.
+    const reqsBeforeOpts = mock.requests.length;
+    const hOpts = await client.openAsync('boot/boot-options.json');
+    assert.ok(hOpts >= 1, `Expected valid boot-options.json handle, got ${hOpts}`);
+    assert.equal(controller.getHandleInfo(hOpts).wholeFileBuffered, true);
+    assert.equal(mock.requests.length - reqsBeforeOpts, 1);
+
+    const optsBuf = new Uint8Array(bootOptionsBytes.byteLength);
+    assert.equal(await client.readAsync(hOpts, 0n, optsBuf, bootOptionsBytes.byteLength), bootOptionsBytes.byteLength);
+    assert.deepEqual(optsBuf, bootOptionsBytes);
+    assert.equal(mock.requests.length - reqsBeforeOpts, 1);
+
+    assert.equal(await client.closeAsync(hOpts), true);
+    const statsAfterOptsClose = controller.getStats();
+    assert.equal(statsAfterOptsClose.wholeFileCache.activeEntries, 0);
+    assert.equal(statsAfterOptsClose.wholeFileCache.activeBytes, 0);
+    assert.equal(statsAfterOptsClose.wholeFileCache.releases, 2);
+  } finally {
+    await controller.detachMailbox();
+  }
+
+  // 3. Oversized .reflect.json exceeding wholeFileMaxBytes falls back cleanly to slab LRU cache.
+  const hugeReflectBytes = makePatternBytes(512 * 1024, 149);
+  const hugeMock = createMockRangeFetch(
+    new Map([['/shaders/huge.wgsl.pack.reflect.json', hugeReflectBytes]]),
+  );
+  const hugeController = new IoWorkerController({
+    fetchImpl: hugeMock.fetchImpl,
+    wholeFileMaxBytes: 128 * 1024,
+    slabSize: 256 * 1024,
+    slabMaxBytes: 512 * 1024,
+    opfsDir: null,
+  });
+  const hugeSab = createHttpfsMailboxBuffer(64 * 1024);
+  const hugeClient = new HttpfsMailboxClient(hugeSab);
+
+  try {
+    await hugeController.init({
+      dataBase: '/data/',
+      bootBase: '/boot/',
+      gameBase: '/game/',
+      shadersBase: '/shaders/',
+    });
+    await hugeController.attachMailbox(hugeSab);
+
+    const reqsStart = hugeMock.requests.length;
+    const hHuge = await hugeClient.openAsync('shaders/huge.wgsl.pack.reflect.json');
+    assert.ok(hHuge >= 1);
+    assert.equal(hugeController.getHandleInfo(hHuge).wholeFileBuffered, false);
+    assert.equal(hugeController.getStats().wholeFileCache.fallbacks, 1);
+
+    const out = new Uint8Array(hugeReflectBytes.byteLength);
+    const stepBuf = new Uint8Array(65536);
+    for (let i = 0; i < 8; i += 1) {
+      const got = await hugeClient.readAsync(hHuge, BigInt(i * 65536), stepBuf, 65536);
+      assert.equal(got, 65536);
+      out.set(stepBuf, i * 65536);
+    }
+    assert.deepEqual(out, hugeReflectBytes);
+
+    // 1 initial oversized probe on OPEN + 2 x 256 KiB slab fetches = 3 HTTP fetches (NOT 8!)
+    assert.equal(hugeMock.requests.length - reqsStart, 3);
+    assert.equal(hugeController.getStats().slabCacheMisses, 2);
+    assert.equal(hugeController.getStats().slabCacheHits, 6);
+    assert.equal(await hugeClient.closeAsync(hHuge), true);
+  } finally {
+    await hugeController.detachMailbox();
   }
 });

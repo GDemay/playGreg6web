@@ -108,7 +108,7 @@
 
   const MOUNT_CACHE_PREFIX = '__pg6_mount__/';
   const GAME_PACKAGE_EXT_RE = /\.(?:rpf|ttpf|dll|png|xvd|xvc|bin|pri)$/i;
-  const IMMUTABLE_HTTPFS_EXT_RE = /\.(?:rpf|pgim|dll|ttpf)$/i;
+  const IMMUTABLE_HTTPFS_EXT_RE = /\.(?:rpf|pgim|dll|ttpf|pack|reflect\.json)$/i;
 
   const DEFAULT_IMMUTABLE_CHUNK_SIZE = 64 * 1024; // 64 KiB aligned chunks
   const DEFAULT_IMMUTABLE_MAX_BYTES = 64 * 1024 * 1024; // 64 MiB RAM cap
@@ -125,7 +125,13 @@
       return false;
     }
     const lower = cleanPath.toLowerCase();
-    return basenameOfPath(lower) === 'program-manifest.json' || lower.endsWith('.pgim');
+    const base = basenameOfPath(lower);
+    return (
+      base === 'program-manifest.json' ||
+      base === 'boot-options.json' ||
+      lower.endsWith('.pgim') ||
+      lower.endsWith('.reflect.json')
+    );
   }
 
   function isImmutableHttpfsPath(cleanPath) {
@@ -677,7 +683,7 @@
   /**
    * Bounded in-memory chunked LRU + sequential read-ahead slab LRU + file-length metadata
    * + short negative cache for immutable HTTPFS files (`*.rpf`, `*.pgim`, `*.dll`, `*.ttpf`,
-   * `MicrosoftGame.Config`). Eliminates redundant HTTP 206 round-trips across guest worker
+   * `*.pack`, `*.reflect.json`, `MicrosoftGame.Config`). Eliminates redundant HTTP 206 round-trips across guest worker
    * threads while keeping RAM strictly bounded and returning 100% exact byte slices.
    */
   class ImmutableHttpfsCache {
