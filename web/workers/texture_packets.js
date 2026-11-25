@@ -2,7 +2,8 @@
 // - ABI v2 CreateTexture2 (opcode 35, 40-byte payload, docs/gpu_commands.md "CreateTexture2")
 //   with safe mipLevels and sampleCount clamping alongside ABI v1 CreateTexture (opcode 12),
 //   automatically attaching compatible sRGB/linear sibling `viewFormats` (`rgba8unorm`,
-//   `bgra8unorm`, `bc1..bc7`).
+//   `bgra8unorm`, `bc1..bc7`) and promoting `1d` LUT textures to WebGPU `2d` (`width x 1 x 1`)
+//   when `promote1DTo2D` is enabled (default `true`, W341 / #1460) for `texture_2d` compatibility.
 // - Zero-copy direct `queue.writeTexture` fast path when source row pitch is already 256-byte
 //   aligned (e.g., 4K Bink2 `3840x2160` `r8unorm` Y plane).
 // - WebGPU 256-byte bytesPerRow alignment & row-pitch repacking helpers (`alignBytesPerRow256`,
@@ -20,8 +21,9 @@
 //   `uploadCount`, `uploadsCount`, `uploadBytes`, `uploadBytesTotal`, `reusedDescriptorCount`,
 //   `clampedSubRegionCount`, `zeroCopyUploads`, `scratchRepackUploads`,
 //   `directZeroCopyUploads`, `repackedUploads`, `scratchBufferReuses`, `r8unormUploads`,
-//   `bytesUploaded`, `srgbSiblingViewFormatsAdded`) exposed via `getStats()`, `getUploadStats()`,
-//   the `uploadStats` getter, and cleanly reset via `resetStats()` / `reset()` / `destroy()`.
+//   `bytesUploaded`, `srgbSiblingViewFormatsAdded`, `promoted1DTo2DCount`) exposed via
+//   `getStats()`, `getUploadStats()`, the `uploadStats` getter, and cleanly reset via
+//   `resetStats()` / `reset()` / `destroy()`.
 //
 // Install with installTexturePackets(processor) after the v2 handler (render_state_packets.js):
 // it chains in front of processor.extension and forwards every other opcode to it.
@@ -1606,14 +1608,23 @@
     constructor(processor, next, options = {}) {
       this.processor = processor;
       this.next = next || null;
+      const opts = options && typeof options === 'object' ? options : {};
+      // W341 (#1460): Promote 1D textures (width x 1) to WebGPU 2D (width x 1 x 1) by
+      // default so shaders with texture_2d bindings never fail 1D/2D view validation.
+      if (opts.promote1DTo2D !== undefined) {
+        this.promote1DTo2D = opts.promote1DTo2D !== false;
+      } else if (opts.promote1DTexturesTo2D !== undefined) {
+        this.promote1DTo2D = opts.promote1DTexturesTo2D !== false;
+      } else {
+        this.promote1DTo2D = true;
+      }
       this._bc3dFallbackTextures = new Set();
       this._bc3dFallbackTextureObjs = new WeakSet();
       this._textureFormats = new Map();
       this._textureObjFormats = new WeakMap();
       this._textureMeta = new Map();
       this._textureObjMeta = new WeakMap();
-      const rawMaxScratch =
-        options && typeof options === 'object' ? options.maxScratchBytes : undefined;
+      const rawMaxScratch = opts.maxScratchBytes;
       this._maxScratchBytes =
         Number.isInteger(rawMaxScratch) && rawMaxScratch >= 0
           ? rawMaxScratch
@@ -1709,6 +1720,7 @@
         r8unormUploads: 0,
         bytesUploaded: 0,
         srgbSiblingViewFormatsAdded: 0,
+        promoted1DTo2DCount: 0,
       };
     }
 
@@ -1852,6 +1864,7 @@
         r8unormUploads: toNonNegativeInt(this.stats.r8unormUploads),
         bytesUploaded: toNonNegativeInt(this.stats.bytesUploaded),
         srgbSiblingViewFormatsAdded: toNonNegativeInt(this.stats.srgbSiblingViewFormatsAdded),
+        promoted1DTo2DCount: toNonNegativeInt(this.stats.promoted1DTo2DCount),
       };
     }
 
@@ -3044,7 +3057,7 @@
       const originY = view.getUint32(payloadOffset + 12, true);
       const originZ = view.getUint32(payloadOffset + 16, true);
       const width = view.getUint32(payloadOffset + 20, true);
-      const height = view.getUint32(payloadOffset + 24, true);
+      const rawHeight = view.getUint32(payloadOffset + 24, true);
       const depthOrArrayLayers = Math.max(1, view.getUint32(payloadOffset + 28, true));
       const bytesPerRow = view.getUint32(payloadOffset + 32, true);
       const rowsPerImage = view.getUint32(payloadOffset + 36, true);
@@ -3062,6 +3075,12 @@
         this.stats.bc3dFallbackUploadsSkipped += 1;
         return;
       }
+
+      const texMeta = this._getTextureMeta(texture, textureId);
+      const is1DOrPromoted = Boolean(
+        texMeta && (texMeta.dimension === '1d' || texMeta.requestedDimension === '1d')
+      );
+      const height = rawHeight === 0 && is1DOrPromoted && width > 0 ? 1 : rawHeight;
 
       const rawData = new Uint8Array(
         view.buffer,
@@ -3295,6 +3314,11 @@
       let effectiveDescriptor = descriptor;
       let bc3dFallback = false;
       let srgbSiblingAdded = false;
+      let promoted1DTo2D = false;
+      const requestedDimension =
+        descriptor && typeof descriptor.dimension === 'string' && descriptor.dimension
+          ? descriptor.dimension
+          : '2d';
       if (
         descriptor &&
         descriptor.dimension === '3d' &&
@@ -3345,6 +3369,28 @@
         }
       }
 
+      if (this.promote1DTo2D && effectiveDescriptor && effectiveDescriptor.dimension === '1d') {
+        // W341 (#1460): Promote 1D LUT textures to WebGPU 2D (width x 1 x 1) so default
+        // and explicit 2D texture views match shader texture_2d bindings cleanly.
+        const rawSize = effectiveDescriptor.size;
+        const rawWidth = Array.isArray(rawSize)
+          ? rawSize[0]
+          : rawSize && typeof rawSize === 'object'
+            ? rawSize.width
+            : 1;
+        const width = Math.max(1, Math.floor(Number(rawWidth) || 1));
+        effectiveDescriptor = {
+          ...effectiveDescriptor,
+          dimension: '2d',
+          size: { width, height: 1, depthOrArrayLayers: 1 },
+          mipLevelCount: 1,
+        };
+        if (effectiveDescriptor.sampleCount !== undefined) {
+          effectiveDescriptor.sampleCount = 1;
+        }
+        promoted1DTo2D = true;
+      }
+
       let texture;
       try {
         texture = p.device.createTexture(effectiveDescriptor);
@@ -3370,6 +3416,8 @@
           ),
           mipLevelCount: Math.max(1, Math.floor(Number(effectiveDescriptor.mipLevelCount) || 1)),
           dimension: effectiveDescriptor.dimension || '2d',
+          requestedDimension,
+          promoted1DTo2D,
           format: effectiveDescriptor.format || null,
         };
         this._textureMeta.set(id, meta);
@@ -3380,31 +3428,41 @@
       if (srgbSiblingAdded) {
         this.stats.srgbSiblingViewFormatsAdded += 1;
       }
+      if (promoted1DTo2D) {
+        this.stats.promoted1DTo2DCount += 1;
+      }
       if (bc3dFallback) {
         this._bc3dFallbackTextures.add(id);
         if (texture && typeof texture === 'object') {
           this._bc3dFallbackTextureObjs.add(texture);
         }
         this.stats.bc3dFallbacks += 1;
-        // Propagate fallback metadata to chained RenderStatePackets so CreateBindGroup2 /
-        // BeginRenderPass views never pass a bc* view format against the rgba8unorm texture.
-        if (this.next && this.next.textureMeta && typeof this.next.textureMeta.set === 'function') {
-          this.next.textureMeta.set(id, {
-            id,
-            requestedFormat: descriptor.format,
-            format: effectiveDescriptor.format,
-            bcFallback: true,
-            formatFallback: true,
-            usage: effectiveDescriptor.usage,
-            dimension: effectiveDescriptor.dimension,
-            sampleCount: effectiveDescriptor.sampleCount || 1,
-            width: effectiveDescriptor.size ? effectiveDescriptor.size.width : 1,
-            height: effectiveDescriptor.size ? effectiveDescriptor.size.height : 1,
-            depthOrArrayLayers: effectiveDescriptor.size
-              ? effectiveDescriptor.size.depthOrArrayLayers
-              : 1,
-          });
-        }
+      }
+      if (
+        (bc3dFallback || promoted1DTo2D) &&
+        this.next &&
+        this.next.textureMeta &&
+        typeof this.next.textureMeta.set === 'function'
+      ) {
+        // Propagate fallback / 1D->2D promotion metadata to chained RenderStatePackets so
+        // CreateBindGroup2 / BeginRenderPass views see the effective format and dimension.
+        this.next.textureMeta.set(id, {
+          id,
+          requestedFormat: descriptor.format,
+          format: effectiveDescriptor.format,
+          requestedDimension,
+          dimension: effectiveDescriptor.dimension,
+          promoted1DTo2D,
+          bcFallback: bc3dFallback,
+          formatFallback: bc3dFallback,
+          usage: effectiveDescriptor.usage,
+          sampleCount: effectiveDescriptor.sampleCount || 1,
+          width: effectiveDescriptor.size ? effectiveDescriptor.size.width : 1,
+          height: effectiveDescriptor.size ? effectiveDescriptor.size.height : 1,
+          depthOrArrayLayers: effectiveDescriptor.size
+            ? effectiveDescriptor.size.depthOrArrayLayers
+            : 1,
+        });
       }
       let textureView = null;
       if (texture && typeof texture.createView === 'function') {
