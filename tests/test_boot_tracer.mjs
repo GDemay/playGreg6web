@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 
 import BootTracerDefault, {
   BOOT_MILESTONES,
+  OPTIONAL_BOOT_MILESTONES,
+  MAX_GPU_ADAPTER_LENGTH,
   TRAP_KIND,
   DEFAULT_MAX_TRAPS,
   DEFAULT_SLOW_THRESHOLD_MS,
@@ -15,6 +17,7 @@ import BootTracerDefault, {
   extractGuestVa,
   extractImportRef,
   normalizeGuestVa,
+  sanitizeGpuAdapter,
 } from '../web/telemetry/boot_tracer.js';
 import { CrashReporter } from '../web/telemetry/crash_report.js';
 
@@ -921,4 +924,249 @@ test('reset clears milestone deltas, slowMilestones, and Chrome traceEvents whil
       { name: 'phase:CRT_INITTERM', ts: 12000, dur: 30000 },
     ]
   );
+});
+
+test('W236: optional FIRST_VISIBLE_FRAME preserves BOOT_MILESTONES and computes blackLoadingMs', () => {
+  assert.deepEqual(OPTIONAL_BOOT_MILESTONES, ['FIRST_VISIBLE_FRAME']);
+  assert.ok(Object.isFrozen(OPTIONAL_BOOT_MILESTONES));
+  assert.equal(MAX_GPU_ADAPTER_LENGTH, 96);
+  assert.equal(BOOT_MILESTONES.includes('FIRST_VISIBLE_FRAME'), false);
+
+  const clock = createClock(1000);
+  const hud = createHud();
+  const tracer = new BootTracer({ now: clock.now, hud });
+
+  const initial = tracer.getSummary();
+  assert.equal(initial.firstPresentMs, null);
+  assert.equal(initial.firstVisibleFrameMs, null);
+  assert.equal(initial.blackLoadingMs, null);
+  assert.equal(initial.gpuAdapter, null);
+
+  clock.advance(45000);
+  tracer.markMilestone('FIRST_PRESENT');
+  const afterPresent = tracer.getSummary();
+  assert.equal(afterPresent.firstPresentMs, 45000);
+  assert.equal(afterPresent.firstVisibleFrameMs, null);
+  assert.equal(afterPresent.blackLoadingMs, null);
+  assert.equal(afterPresent.milestones.length, BOOT_MILESTONES.length);
+
+  clock.advance(150000);
+  const visible = tracer.recordFirstVisibleFrame({ frameIndex: 900, nonBlackRatio: 0.42 });
+  assert.equal(visible.milestone, 'FIRST_VISIBLE_FRAME');
+  assert.equal(visible.firstReach, true);
+  assert.equal(visible.index, BOOT_MILESTONES.length);
+  assert.equal(visible.elapsedMs, 195000);
+  assert.equal(visible.firstVisibleFrameMs, 195000);
+  assert.equal(visible.blackLoadingMs, 150000);
+  assert.deepEqual(visible.detail, { frameIndex: 900, nonBlackRatio: 0.42 });
+
+  // Repeat call preserves first-reach timestamp and blackLoadingMs while incrementing count.
+  clock.advance(5000);
+  const repeat = tracer.recordFirstVisibleFrame({ frameIndex: 950 });
+  assert.equal(repeat.firstReach, false);
+  assert.equal(repeat.count, 2);
+  assert.equal(repeat.elapsedMs, 195000);
+  assert.equal(repeat.lastElapsedMs, 200000);
+  assert.equal(repeat.firstVisibleFrameMs, 195000);
+  assert.equal(repeat.blackLoadingMs, 150000);
+  assert.deepEqual(repeat.detail, { frameIndex: 900, nonBlackRatio: 0.42 });
+
+  const summary = tracer.getSummary();
+  assert.equal(summary.stage, 'FIRST_VISIBLE_FRAME');
+  assert.equal(summary.progressPct, 100);
+  assert.equal(summary.readyForSplash, true);
+  assert.equal(summary.firstPresentMs, 45000);
+  assert.equal(summary.firstVisibleFrameMs, 195000);
+  assert.equal(summary.blackLoadingMs, 150000);
+  assert.equal(summary.milestonesReached, 2);
+  assert.equal(summary.milestones.at(-1).milestone, 'FIRST_VISIBLE_FRAME');
+  assert.equal(summary.milestones.at(-1).reached, true);
+  assert.equal(summary.milestones.at(-1).elapsedMs, 195000);
+
+  assert.deepEqual(hud.calls, [
+    { text: 'Boot 100%: FIRST_PRESENT', level: 'ok' },
+    { text: 'Boot 100%: FIRST_VISIBLE_FRAME', level: 'ok' },
+  ]);
+
+  const deltas = tracer.getMilestoneDeltas();
+  assert.deepEqual(
+    deltas.map((d) => ({ name: d.name, atMs: d.atMs, deltaMs: d.deltaMs })),
+    [
+      { name: 'FIRST_PRESENT', atMs: 45000, deltaMs: 45000 },
+      { name: 'FIRST_VISIBLE_FRAME', atMs: 195000, deltaMs: 150000 },
+    ]
+  );
+
+  const trace = tracer.toChromeTraceEvents();
+  assert.equal(trace.metadata.firstPresentMs, 45000);
+  assert.equal(trace.metadata.firstVisibleFrameMs, 195000);
+  assert.equal(trace.metadata.blackLoadingMs, 150000);
+  assert.ok(trace.traceEvents.some((e) => e.ph === 'X' && e.name === 'phase:FIRST_VISIBLE_FRAME' && e.dur === 150000000));
+  assert.ok(trace.traceEvents.some((e) => e.ph === 'i' && e.name === 'FIRST_VISIBLE_FRAME' && e.ts === 195000000));
+});
+
+test('W236: FIRST_VISIBLE_FRAME works via markMilestone, ingestLogLine, explicit elapsedMs, and clamps negative blackLoadingMs', () => {
+  const clock = createClock(0);
+  const tracer = new BootTracer({ now: clock.now });
+
+  // FIRST_VISIBLE_FRAME without FIRST_PRESENT => blackLoadingMs is null.
+  clock.advance(250);
+  const viaMark = tracer.markMilestone('first_visible_frame', { path: 'C:\\Users\\alice\\frame.png' });
+  assert.equal(viaMark.milestone, 'FIRST_VISIBLE_FRAME');
+  assert.equal(viaMark.elapsedMs, 250);
+  assert.equal(tracer.getSummary().firstVisibleFrameMs, 250);
+  assert.equal(tracer.getSummary().blackLoadingMs, null);
+  assert.equal(JSON.stringify(viaMark.detail).includes('alice'), false);
+
+  // If FIRST_PRESENT happens later (500ms > 250ms), blackLoadingMs clamps to 0.
+  clock.advance(250);
+  tracer.markMilestone('FIRST_PRESENT');
+  assert.equal(tracer.getSummary().firstPresentMs, 500);
+  assert.equal(tracer.getSummary().firstVisibleFrameMs, 250);
+  assert.equal(tracer.getSummary().blackLoadingMs, 0);
+
+  // Explicit elapsedMs & detail sanitization via recordFirstVisibleFrame.
+  const tracer2 = new BootTracer({ now: createClock(0).now });
+  tracer2.markMilestone('FIRST_PRESENT');
+  const explicit = tracer2.recordFirstVisibleFrame({
+    elapsedMs: 1234.5,
+    detail: { note: 'Start Screen', secret: 'top-secret', path: '/home/bob/shot.png' },
+  });
+  assert.equal(explicit.firstVisibleFrameMs, 1234.5);
+  assert.equal(explicit.blackLoadingMs, 1234.5);
+  assert.equal(explicit.detail.secret, '[REDACTED]');
+  assert.equal(JSON.stringify(explicit.detail).includes('bob'), false);
+
+  // Validation errors on recordFirstVisibleFrame.
+  assert.throws(() => tracer2.recordFirstVisibleFrame(null), TypeError);
+  assert.throws(() => tracer2.recordFirstVisibleFrame([]), TypeError);
+  assert.throws(() => tracer2.recordFirstVisibleFrame('bad'), TypeError);
+  assert.throws(() => tracer2.recordFirstVisibleFrame({ elapsedMs: -1 }), RangeError);
+  assert.throws(() => tracer2.recordFirstVisibleFrame({ elapsedMs: Number.NaN }), RangeError);
+  assert.throws(() => tracer2.recordFirstVisibleFrame({ elapsedMs: Number.POSITIVE_INFINITY }), RangeError);
+  assert.throws(() => tracer2.recordFirstVisibleFrame({ elapsedMs: '100' }), RangeError);
+
+  // Log ingestion heuristics and explicit tokens.
+  const logClock = createClock(0);
+  const logTracer = new BootTracer({ now: logClock.now });
+  logClock.advance(100);
+  logTracer.ingestLogLine('[wasm] first present submitted to swapchain');
+  logClock.advance(400);
+  const visLog = logTracer.ingestLogLine('[wasm] first visible frame rendered');
+  assert.equal(visLog?.type, 'milestone');
+  assert.deepEqual(
+    visLog.milestones.map((m) => m.milestone),
+    ['FIRST_VISIBLE_FRAME']
+  );
+  assert.equal(logTracer.getSummary().blackLoadingMs, 400);
+
+  const nonBlack = parseLogLine('[boot] first non-black frame detected');
+  assert.deepEqual(nonBlack?.milestones, ['FIRST_VISIBLE_FRAME']);
+  const explicitToken = parseLogLine('[boot] milestone=FIRST_VISIBLE_FRAME');
+  assert.deepEqual(explicitToken?.milestones, ['FIRST_VISIBLE_FRAME']);
+  assert.equal(parseLogLine('[boot] FIRST_VISIBLE_FRAME failed'), null);
+});
+
+test('W236: recordGpuAdapter sanitizes vendor / architecture labels, strips control chars/host paths, and enforces 96-char max', () => {
+  const clock = createClock(1000);
+  const reporter = new CrashReporter({ now: clock.now });
+  const tracer = new BootTracer({ now: clock.now, crashReporter: reporter });
+
+  assert.equal(tracer.recordGpuAdapter('NVIDIA / Ampere'), 'nvidia / ampere');
+  assert.equal(tracer.gpuAdapter, 'nvidia / ampere');
+  assert.equal(tracer.getSummary().gpuAdapter, 'nvidia / ampere');
+  assert.equal(JSON.parse(tracer.toJson()).gpuAdapter, 'nvidia / ampere');
+  assert.equal(tracer.toChromeTraceEvents().metadata.gpuAdapter, 'nvidia / ampere');
+  assert.ok(reporter.getLogs().some((l) => l.message === 'gpu adapter: nvidia / ampere'));
+
+  // Whitespace, slash spacing, and object inputs.
+  assert.equal(tracer.recordGpuAdapter('  AMD/RDNA 3  '), 'amd / rdna 3');
+  assert.equal(tracer.recordGpuAdapter({ vendor: 'Apple', architecture: 'Metal-3' }), 'apple / metal-3');
+  assert.equal(tracer.recordGpuAdapter({ vendor: 'Intel', architecture: '' }), 'intel');
+  assert.equal(tracer.recordGpuAdapter({}), null);
+
+  // Control characters and ANSI escape sequences are stripped.
+  const ctrl = tracer.recordGpuAdapter('\x1b[31mNVIDIA\x1b[0m\x00\x07\r\n / \tAmpere\x7f\u0085');
+  assert.equal(ctrl, 'nvidia / ampere');
+  assert.equal(/[\u0000-\u001f\u007f-\u009f]/.test(ctrl), false);
+
+  // Host paths (Windows drive, UNC, POSIX, lowercase POSIX, file://) are stripped without leaking usernames.
+  const winPath = tracer.recordGpuAdapter('NVIDIA C:\\Users\\alice\\drivers\\nv.dll / Ampere');
+  assert.equal(winPath, 'nvidia / ampere');
+  assert.equal(winPath.includes('alice'), false);
+
+  const winSpaces = tracer.recordGpuAdapter('NVIDIA C:\\Program Files\\NVIDIA\\nv.dll / Ada');
+  assert.equal(winSpaces.includes('Program'), false);
+  assert.equal(winSpaces.includes('\\'), false);
+  assert.equal(winSpaces, 'nvidia / ada');
+
+  const posixPath = tracer.recordGpuAdapter('AMD / RDNA 2 (/home/bob/mesa/libvulkan.so)');
+  assert.equal(posixPath, 'amd / rdna 2');
+  assert.equal(posixPath.includes('bob'), false);
+
+  const lowerPosixPath = tracer.recordGpuAdapter('Intel / Xe /users/carol/lib.so /dev/dri/renderD128');
+  assert.equal(lowerPosixPath, 'intel / xe');
+  assert.equal(lowerPosixPath.includes('carol'), false);
+
+  // Pure paths, empty strings, null, undefined, and non-strings yield null.
+  assert.equal(sanitizeGpuAdapter('C:\\Users\\alice\\gpu.dll'), null);
+  assert.equal(sanitizeGpuAdapter('\\\\fileserver\\share\\driver'), null);
+  assert.equal(sanitizeGpuAdapter('file:///Users/dave/gpu.bin'), null);
+  assert.equal(sanitizeGpuAdapter(''), null);
+  assert.equal(sanitizeGpuAdapter('   /   '), null);
+  assert.equal(sanitizeGpuAdapter(null), null);
+  assert.equal(sanitizeGpuAdapter(undefined), null);
+  assert.equal(sanitizeGpuAdapter(42), null);
+
+  // Max length 96 chars enforced.
+  const longInput = `NVIDIA / ${'ArchX'.repeat(40)}`;
+  const truncated = tracer.recordGpuAdapter(longInput);
+  assert.equal(truncated.length, MAX_GPU_ADAPTER_LENGTH);
+  assert.equal(truncated, truncated.toLowerCase());
+  assert.ok(truncated.startsWith('nvidia / archx'));
+});
+
+test('W236: reset clears FIRST_VISIBLE_FRAME, blackLoadingMs, and gpuAdapter cleanly', () => {
+  const clock = createClock(0);
+  const tracer = new BootTracer({ now: clock.now });
+
+  tracer.recordGpuAdapter('NVIDIA / Ada Lovelace');
+  clock.advance(45000);
+  tracer.markMilestone('FIRST_PRESENT');
+  clock.advance(150000);
+  tracer.recordFirstVisibleFrame({ frameIndex: 120 });
+
+  assert.equal(tracer.gpuAdapter, 'nvidia / ada lovelace');
+  assert.equal(tracer.getSummary().firstPresentMs, 45000);
+  assert.equal(tracer.getSummary().firstVisibleFrameMs, 195000);
+  assert.equal(tracer.getSummary().blackLoadingMs, 150000);
+  assert.equal(tracer.getSummary().milestones.length, BOOT_MILESTONES.length + 1);
+
+  tracer.reset();
+  const afterReset = tracer.getSummary();
+  assert.equal(tracer.gpuAdapter, null);
+  assert.equal(afterReset.gpuAdapter, null);
+  assert.equal(afterReset.firstPresentMs, null);
+  assert.equal(afterReset.firstVisibleFrameMs, null);
+  assert.equal(afterReset.blackLoadingMs, null);
+  assert.equal(afterReset.milestones.length, BOOT_MILESTONES.length);
+  assert.equal(afterReset.stage, STAGE_NOT_STARTED);
+  assert.equal(afterReset.progressPct, 0);
+
+  const traceAfterReset = tracer.toChromeTraceEvents();
+  assert.equal(traceAfterReset.metadata.gpuAdapter, null);
+  assert.equal(traceAfterReset.metadata.firstPresentMs, null);
+  assert.equal(traceAfterReset.metadata.firstVisibleFrameMs, null);
+  assert.equal(traceAfterReset.metadata.blackLoadingMs, null);
+
+  // Can re-record cleanly after reset anchored to the new boot clock.
+  tracer.recordGpuAdapter('AMD / RDNA 3');
+  clock.advance(1000);
+  tracer.markMilestone('FIRST_PRESENT');
+  clock.advance(2500);
+  const again = tracer.recordFirstVisibleFrame();
+  assert.equal(again.firstReach, true);
+  assert.equal(again.firstVisibleFrameMs, 3500);
+  assert.equal(again.blackLoadingMs, 2500);
+  assert.equal(tracer.getSummary().gpuAdapter, 'amd / rdna 3');
 });
