@@ -14,7 +14,9 @@ import bootstrapDefault, {
   bootstrapPlayGta6App,
   detectWasm64,
   extractBootAssetUrls,
+  extractGpuAdapterFromLogLine,
   parseBootUrlOptions,
+  parseSplashHoldQuery,
   resolveDefaultGameBase,
   sanitizeInputScriptPreset,
   sanitizeSideModuleUrls,
@@ -3230,5 +3232,679 @@ test('W184 ?inputScript=menu-flow, calibration-skip, and intro-watch auto-start 
     assert.ok(!JSON.stringify(hostileApp.bootUrlOptions).includes('alice'));
   } finally {
     await hostileApp.destroy();
+  }
+});
+
+test('W253 parseSplashHoldQuery and extractGpuAdapterFromLogLine parse and sanitize inputs safely', () => {
+  for (const q of [
+    '?splashHold=1',
+    '?splashHold=true',
+    '?SPLASHHOLD=YES',
+    '?splashhold=on',
+    'https://playgta6.local/?foo=1&splashHold=1#boot',
+    new URLSearchParams('splashHold=1'),
+    { search: '?splashHold=true' },
+    '?splashHold=0&splashHold=1',
+  ]) {
+    assert.equal(parseSplashHoldQuery(q), true, `Expected true for ${String(q)}`);
+  }
+
+  for (const q of [
+    '?splashHold=0',
+    '?splashHold=false',
+    '?SPLASHHOLD=OFF',
+    '?splashhold=no',
+    'https://playgta6.local/?splashHold=0#boot',
+    new URLSearchParams('splashHold=0'),
+    { search: '?splashHold=false' },
+    '?splashHold=1&splashHold=0',
+  ]) {
+    assert.equal(parseSplashHoldQuery(q), false, `Expected false for ${String(q)}`);
+  }
+
+  for (const q of [undefined, null, '', '?', '?foo=bar', '?splashHold=maybe', '?splashHold=C:\\Users\\alice']) {
+    assert.equal(parseSplashHoldQuery(q), null, `Expected null for ${String(q)}`);
+  }
+
+  assert.equal(
+    extractGpuAdapterFromLogLine('[wgpu_worker] WebGPU adapter: NVIDIA / Turing'),
+    'nvidia / turing'
+  );
+  assert.equal(
+    extractGpuAdapterFromLogLine(
+      '[wgpu_worker] WebGPU adapter: Intel / Gen-12LP (C:\\Users\\alice\\igd10iumd64.dll)'
+    ),
+    'intel / gen-12lp'
+  );
+  assert.equal(
+    extractGpuAdapterFromLogLine(
+      'WebGPU adapter: <script>alert(1)</script> AMD / RDNA2 https://evil.example/path'
+    ),
+    'amd / rdna2'
+  );
+  assert.equal(extractGpuAdapterFromLogLine('[wgpu_worker] no WebGPU adapter available'), null);
+  assert.equal(extractGpuAdapterFromLogLine(null), null);
+});
+
+test('W253 smooth splash hold through FIRST_PRESENT -> black loading progress -> FIRST_VISIBLE_FRAME cross-fade', async () => {
+  const { createRequire } = await import('node:module');
+  const require = createRequire(import.meta.url);
+  const { SplashOverlayController, DISMISS_REASONS } = require('../web/ui/splash_overlay.js');
+  const { BootOrchestrator } = require('../web/runtime/boot_orchestrator.js');
+
+  function makeMockNode(tag = 'div') {
+    const attrs = new Map();
+    const styles = new Map();
+    const listeners = new Map();
+    const node = {
+      tagName: String(tag).toUpperCase(),
+      className: '',
+      hidden: false,
+      textContent: '',
+      innerHTML: '',
+      parentNode: null,
+      children: [],
+      style: {
+        setProperty(k, v) {
+          styles.set(k, String(v));
+        },
+        getPropertyValue(k) {
+          return styles.get(k) || '';
+        },
+      },
+      classList: {
+        add(c) {
+          const set = new Set(String(node.className || '').split(/\s+/).filter(Boolean));
+          set.add(c);
+          node.className = [...set].join(' ');
+        },
+        remove(c) {
+          const set = new Set(String(node.className || '').split(/\s+/).filter(Boolean));
+          set.delete(c);
+          node.className = [...set].join(' ');
+        },
+        contains(c) {
+          return String(node.className || '').split(/\s+/).includes(c);
+        },
+      },
+      setAttribute(k, v) {
+        attrs.set(k, String(v));
+      },
+      getAttribute(k) {
+        return attrs.has(k) ? attrs.get(k) : null;
+      },
+      removeAttribute(k) {
+        attrs.delete(k);
+      },
+      appendChild(child) {
+        child.parentNode = node;
+        node.children.push(child);
+        return child;
+      },
+      removeChild(child) {
+        const idx = node.children.indexOf(child);
+        if (idx >= 0) node.children.splice(idx, 1);
+        child.parentNode = null;
+        return child;
+      },
+      addEventListener(type, fn) {
+        if (!listeners.has(type)) listeners.set(type, new Set());
+        listeners.get(type).add(fn);
+      },
+      removeEventListener(type, fn) {
+        listeners.get(type)?.delete(fn);
+      },
+      querySelector() {
+        return null;
+      },
+    };
+    return node;
+  }
+
+  const clock = createClock(1000);
+  const raf = createFakeRaf(clock);
+  const timers = createFakeTimers();
+  const webgpu = createMockWebGpuEnv();
+  const hud = createMockHud();
+
+  let nextTimeoutId = 1;
+  const pendingTimeouts = new Map();
+  const fakeSetTimeout = (fn, ms) => {
+    const id = nextTimeoutId++;
+    pendingTimeouts.set(id, { fn, ms });
+    return id;
+  };
+  const fakeClearTimeout = (id) => {
+    pendingTimeouts.delete(id);
+  };
+  const flushFadeTimeouts = (expectedMs) => {
+    for (const [id, entry] of [...pendingTimeouts.entries()]) {
+      if (expectedMs === undefined || entry.ms === expectedMs) {
+        pendingTimeouts.delete(id);
+        entry.fn();
+      }
+    }
+  };
+
+  const splashContainer = makeMockNode('div');
+  const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+    clock,
+    raf,
+    timers,
+    gpu: webgpu.gpu,
+  });
+  windowObj.location = { origin: 'https://playgta6.local', search: '?splashHold=1' };
+  documentObj.head = makeMockNode('head');
+  documentObj.createElement = (tag) => makeMockNode(tag);
+  documentObj.querySelector = () => null;
+
+  const mockWorker = createFakeEventTarget({
+    postMessage() {},
+    terminate() {},
+  });
+
+  const hudGpuUpdates = [];
+  const hudController = {
+    updateGpuStats(stats) {
+      hudGpuUpdates.push(stats);
+    },
+  };
+
+  const app = bootstrapPlayGta6App({
+    windowObj,
+    documentObj,
+    navigatorObj,
+    fetchImpl: createMockFetch({
+      ok: true,
+      coopCoep: true,
+      hasWasmBinary: true,
+      pgimUrl: '/boot/guest.pgim',
+      splashImage: '/game/xbs_splash.png',
+    }),
+    canvas: webgpu.canvas,
+    hud,
+    hudController,
+    splashContainer,
+    SplashOverlayCtor: SplashOverlayController,
+    BootOrchestratorCtor: BootOrchestrator,
+    pgimPreloader: {
+      async preloadBootBundle() {
+        return { pgim: new Uint8Array(4), shaderPackBytes: null, reflectionManifest: null, bytesLoaded: 4 };
+      },
+    },
+    splashOverlayOptions: {
+      visibleFrameFadeMs: 450,
+      setTimeout: fakeSetTimeout,
+      clearTimeout: fakeClearTimeout,
+      nowFn: clock.now,
+    },
+    now: clock.now,
+    raf: raf.raf,
+    cancelRaf: raf.cancelRaf,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+    createWasmWorker() {
+      return mockWorker;
+    },
+  });
+
+  try {
+    assert.equal(app.bootUrlOptions.splashHold, true);
+    assert.equal(app.bootUrlOptions.holdUntilVisible, true);
+    assert.equal(app.splashOverlay.getState().holdUntilVisible, true);
+    assert.equal(app.splashOverlay.getState().visible, true);
+
+    const started = await app.start();
+    assert.equal(started.ok, true);
+    assert.equal(started.mode, SESSION_MODE.WASM);
+    assert.equal(app.splashOverlay.getState().splashImageUrl, '/game/xbs_splash.png');
+
+    // 1. FIRST_PRESENT arrives during black archive-loading phase -> splash MUST stay visible & held!
+    clock.advance(500);
+    mockWorker.dispatch('message', {
+      data: {
+        type: 'splash-frame-presented',
+        ok: true,
+        frameIndex: 0,
+        framesPresented: 1,
+        firstPresent: true,
+      },
+    });
+
+    let splashState = app.splashOverlay.getState();
+    assert.equal(splashState.visible, true);
+    assert.equal(splashState.dismissed, false);
+    assert.equal(splashState.holdingForVisibleFrame, true);
+    assert.equal(splashState.heldForVisibleFrame, true);
+    assert.equal(app.bootTracer.getSummary().readyForSplash, true);
+    assert.equal(app.bootTracer.getSummary().firstPresentMs, 500);
+    assert.equal(app.bootTracer.getSummary().firstVisibleFrameMs, null);
+    assert.equal(app.getBootTelemetry().loadingAssets, true);
+    assert.equal(app.getDiagnosticsSnapshot().loadingAssets, true);
+
+    // 2. Black loading frames update setLoadingAssetsProgress({ presents, realPackDraws }) without dismissing.
+    clock.advance(1000);
+    mockWorker.dispatch('message', {
+      data: {
+        type: 'gpu-stats',
+        presentCount: 14,
+        realPackDrawCount: 0,
+        fallbackDrawCount: 0,
+      },
+    });
+    splashState = app.splashOverlay.getState();
+    assert.equal(splashState.visible, true);
+    assert.equal(splashState.dismissed, false);
+    assert.equal(splashState.holdingForVisibleFrame, true);
+    assert.equal(splashState.blackPresentsWhileHeld, 14);
+    assert.match(splashState.statusText, /Loading game assets\.\.\. \(14 frames\)/);
+
+    // Explicit hasVisibleContent: false keeps holding even if realPackDrawCount > 0.
+    clock.advance(500);
+    mockWorker.dispatch('message', {
+      data: {
+        type: 'gpu-stats',
+        presentCount: 20,
+        realPackDrawCount: 3,
+        hasVisibleContent: false,
+      },
+    });
+    splashState = app.splashOverlay.getState();
+    assert.equal(splashState.holdingForVisibleFrame, true);
+    assert.equal(splashState.dismissed, false);
+    assert.equal(splashState.blackPresentsWhileHeld, 20);
+    assert.equal(splashState.loadingRealPackDraws, 3);
+    assert.match(splashState.statusText, /3 draws, 20 frames/);
+
+    // 3. First real visible frame arrives -> BootTracer records FIRST_VISIBLE_FRAME & splash smoothly cross-fades!
+    clock.advance(2000);
+    mockWorker.dispatch('message', {
+      data: {
+        type: 'gpu-stats',
+        presentCount: 25,
+        realPackDrawCount: 18,
+        hasVisibleContent: true,
+      },
+    });
+
+    const tracerSummary = app.bootTracer.getSummary();
+    assert.equal(tracerSummary.stage, 'FIRST_VISIBLE_FRAME');
+    assert.equal(tracerSummary.firstPresentMs, 500);
+    assert.equal(tracerSummary.firstVisibleFrameMs, 4000);
+    assert.equal(tracerSummary.blackLoadingMs, 3500);
+
+    splashState = app.splashOverlay.getState();
+    assert.equal(splashState.holdingForVisibleFrame, false);
+    assert.equal(splashState.heldForVisibleFrame, true);
+    assert.equal(splashState.dismissed, true);
+    assert.equal(splashState.fading, true);
+
+    // Complete the 450 ms smooth cross-fade.
+    clock.advance(450);
+    flushFadeTimeouts(450);
+    splashState = app.splashOverlay.getState();
+    assert.equal(splashState.visible, false);
+    assert.equal(splashState.fading, false);
+    assert.equal(splashState.dismissReason, DISMISS_REASONS.FIRST_VISIBLE_FRAME);
+
+    const telem = app.getBootTelemetry();
+    assert.equal(telem.hasVisibleContent, true);
+    assert.equal(telem.loadingAssets, false);
+    assert.equal(telem.firstVisibleFrameMs, 4000);
+    assert.equal(telem.blackLoadingMs, 3500);
+    assert.equal(telem.gpu.firstVisibleFrameMs, 4000);
+    assert.equal(telem.gpu.blackLoadingMs, 3500);
+
+    const lastHudGpu = hudGpuUpdates[hudGpuUpdates.length - 1];
+    assert.equal(lastHudGpu.hasVisibleContent, true);
+    assert.equal(lastHudGpu.loadingAssets, false);
+    assert.equal(lastHudGpu.firstVisibleFrameMs, 4000);
+    assert.equal(lastHudGpu.blackLoadingMs, 3500);
+
+    // Subsequent notifyFirstVisibleFrame calls are idempotent.
+    const dup = app.notifyFirstVisibleFrame({ source: 'duplicate' });
+    assert.equal(dup.ok, true);
+    assert.equal(dup.alreadyVisible, true);
+  } finally {
+    await app.destroy();
+  }
+});
+
+test('W253 ?splashHold=0 opt-out and explicit holdUntilVisible overrides work cleanly', async () => {
+  const { createRequire } = await import('node:module');
+  const require = createRequire(import.meta.url);
+  const { SplashOverlayController, DISMISS_REASONS } = require('../web/ui/splash_overlay.js');
+  const { BootOrchestrator } = require('../web/runtime/boot_orchestrator.js');
+
+  function makeMockNode(tag = 'div') {
+    const attrs = new Map();
+    const styles = new Map();
+    const node = {
+      tagName: String(tag).toUpperCase(),
+      className: '',
+      hidden: false,
+      textContent: '',
+      innerHTML: '',
+      parentNode: null,
+      children: [],
+      style: {
+        setProperty(k, v) {
+          styles.set(k, String(v));
+        },
+        getPropertyValue(k) {
+          return styles.get(k) || '';
+        },
+      },
+      classList: {
+        add(c) {
+          const set = new Set(String(node.className || '').split(/\s+/).filter(Boolean));
+          set.add(c);
+          node.className = [...set].join(' ');
+        },
+        remove(c) {
+          const set = new Set(String(node.className || '').split(/\s+/).filter(Boolean));
+          set.delete(c);
+          node.className = [...set].join(' ');
+        },
+        contains(c) {
+          return String(node.className || '').split(/\s+/).includes(c);
+        },
+      },
+      setAttribute(k, v) {
+        attrs.set(k, String(v));
+      },
+      getAttribute(k) {
+        return attrs.has(k) ? attrs.get(k) : null;
+      },
+      removeAttribute(k) {
+        attrs.delete(k);
+      },
+      appendChild(child) {
+        child.parentNode = node;
+        node.children.push(child);
+        return child;
+      },
+      removeChild(child) {
+        const idx = node.children.indexOf(child);
+        if (idx >= 0) node.children.splice(idx, 1);
+        child.parentNode = null;
+        return child;
+      },
+      addEventListener() {},
+      removeEventListener() {},
+      querySelector() {
+        return null;
+      },
+    };
+    return node;
+  }
+
+  async function bootWithHoldConfig({ search, holdUntilVisible }) {
+    const clock = createClock(5000);
+    const raf = createFakeRaf(clock);
+    const timers = createFakeTimers();
+    const webgpu = createMockWebGpuEnv();
+    const hud = createMockHud();
+    const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+      clock,
+      raf,
+      timers,
+      gpu: webgpu.gpu,
+    });
+    windowObj.location = { origin: 'https://playgta6.local', search };
+    documentObj.head = makeMockNode('head');
+    documentObj.createElement = (tag) => makeMockNode(tag);
+    documentObj.querySelector = () => null;
+
+    const mockWorker = createFakeEventTarget({
+      postMessage() {},
+      terminate() {},
+    });
+
+    const app = bootstrapPlayGta6App({
+      windowObj,
+      documentObj,
+      navigatorObj,
+      fetchImpl: createMockFetch({
+        ok: true,
+        coopCoep: true,
+        hasWasmBinary: true,
+        pgimUrl: '/boot/guest.pgim',
+      }),
+      canvas: webgpu.canvas,
+      hud,
+      splashContainer: makeMockNode('div'),
+      SplashOverlayCtor: SplashOverlayController,
+      BootOrchestratorCtor: BootOrchestrator,
+      pgimPreloader: {
+        async preloadBootBundle() {
+          return { pgim: new Uint8Array(4), shaderPackBytes: null, reflectionManifest: null, bytesLoaded: 4 };
+        },
+      },
+      splashOverlayOptions: { fadeMs: 0, visibleFrameFadeMs: 0, nowFn: clock.now },
+      ...(holdUntilVisible !== undefined ? { holdUntilVisible } : {}),
+      now: clock.now,
+      setInterval: timers.setInterval,
+      clearInterval: timers.clearInterval,
+      createWasmWorker() {
+        return mockWorker;
+      },
+    });
+
+    await app.start();
+    clock.advance(250);
+    mockWorker.dispatch('message', {
+      data: {
+        type: 'first-present',
+        framesPresented: 1,
+      },
+    });
+    return { app, mockWorker, clock };
+  }
+
+  // 1. ?splashHold=0 opts out -> immediate dismiss on FIRST_PRESENT.
+  const optOut = await bootWithHoldConfig({ search: '?splashHold=0' });
+  try {
+    assert.equal(optOut.app.bootUrlOptions.splashHold, false);
+    assert.equal(optOut.app.bootUrlOptions.holdUntilVisible, false);
+    const st = optOut.app.splashOverlay.getState();
+    assert.equal(st.holdingForVisibleFrame, false);
+    assert.equal(st.heldForVisibleFrame, false);
+    assert.equal(st.dismissed, true);
+    assert.equal(st.visible, false);
+    assert.equal(st.dismissReason, DISMISS_REASONS.FIRST_PRESENT);
+
+    // Explicit first-visible-frame worker message still records BootTracer timing cleanly.
+    optOut.clock.advance(600);
+    optOut.mockWorker.dispatch('message', {
+      data: { type: 'first-visible-frame', framesPresented: 5 },
+    });
+    assert.equal(optOut.app.bootTracer.getSummary().firstVisibleFrameMs, 850);
+    assert.equal(optOut.app.bootTracer.getSummary().blackLoadingMs, 600);
+  } finally {
+    await optOut.app.destroy();
+  }
+
+  // 2. Explicit holdUntilVisible: false overrides ?splashHold=1.
+  const forcedOff = await bootWithHoldConfig({ search: '?splashHold=1', holdUntilVisible: false });
+  try {
+    assert.equal(forcedOff.app.bootUrlOptions.holdUntilVisible, false);
+    assert.equal(forcedOff.app.splashOverlay.getState().dismissed, true);
+    assert.equal(forcedOff.app.splashOverlay.getState().holdingForVisibleFrame, false);
+  } finally {
+    await forcedOff.app.destroy();
+  }
+
+  // 3. Explicit holdUntilVisible: true overrides ?splashHold=0 and holds until realPackDrawCount > 0.
+  const forcedOn = await bootWithHoldConfig({ search: '?splashHold=0', holdUntilVisible: true });
+  try {
+    assert.equal(forcedOn.app.bootUrlOptions.holdUntilVisible, true);
+    assert.equal(forcedOn.app.splashOverlay.getState().holdingForVisibleFrame, true);
+    assert.equal(forcedOn.app.splashOverlay.getState().visible, true);
+
+    forcedOn.clock.advance(750);
+    forcedOn.mockWorker.dispatch('message', {
+      data: { type: 'gpu-stats', presentCount: 9, realPackDrawCount: 6 },
+    });
+    assert.equal(forcedOn.app.splashOverlay.getState().dismissed, true);
+    assert.equal(forcedOn.app.splashOverlay.getState().visible, false);
+    assert.equal(forcedOn.app.splashOverlay.getState().dismissReason, DISMISS_REASONS.FIRST_VISIBLE_FRAME);
+    assert.equal(forcedOn.app.bootTracer.getSummary().blackLoadingMs, 750);
+  } finally {
+    await forcedOn.app.destroy();
+  }
+});
+
+test('W253 forwards sanitized WebGPU adapter labels from logs, telemetry, and smoke adapter to BootTracer and HudController', async () => {
+  const { HudController } = await import('../web/ui/hud_controller.js');
+
+  const clock = createClock(20000);
+  const raf = createFakeRaf(clock);
+  const timers = createFakeTimers();
+  const webgpu = createMockWebGpuEnv();
+  const hud = createMockHud();
+
+  const broadcastInstances = [];
+  class MockBroadcastChannel {
+    constructor(name) {
+      this.name = name;
+      this.onmessage = null;
+      broadcastInstances.push(this);
+    }
+    close() {}
+  }
+
+  const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+    clock,
+    raf,
+    timers,
+    gpu: webgpu.gpu,
+  });
+  windowObj.BroadcastChannel = MockBroadcastChannel;
+
+  const mockWorker = createFakeEventTarget({
+    postMessage() {},
+    terminate() {},
+  });
+
+  const adapterSpyCalls = [];
+  const hudController = new HudController({
+    hud,
+    now: clock.now,
+  });
+  const origSetGpuAdapter = hudController.setGpuAdapter.bind(hudController);
+  hudController.setGpuAdapter = (label, opts) => {
+    adapterSpyCalls.push(label);
+    return origSetGpuAdapter(label, opts);
+  };
+
+  const app = bootstrapPlayGta6App({
+    windowObj,
+    documentObj,
+    navigatorObj,
+    fetchImpl: createMockFetch({ ok: true, coopCoep: true, hasWasmBinary: true }),
+    canvas: webgpu.canvas,
+    hud,
+    hudController,
+    now: clock.now,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+    createWasmWorker() {
+      return mockWorker;
+    },
+  });
+
+  try {
+    await app.start();
+    assert.equal(broadcastInstances.length, 1);
+
+    // 1. Adapter reported via [wgpu_worker] log line over BroadcastChannel with host path noise.
+    broadcastInstances[0].onmessage({
+      data: {
+        label: '[wgpu_worker] WebGPU adapter: NVIDIA / Turing (C:\\Users\\alice\\nvwgf2umx.dll)',
+      },
+    });
+
+    assert.equal(app.bootTracer.gpuAdapter, 'nvidia / turing');
+    assert.equal(app.bootTracer.getSummary().gpuAdapter, 'nvidia / turing');
+    assert.equal(hudController.getGpuAdapter(), 'nvidia / turing');
+    assert.deepEqual(adapterSpyCalls, ['nvidia / turing']);
+    assert.equal(app.getBootTelemetry().gpuAdapter, 'nvidia / turing');
+    assert.equal(app.getBootTelemetry().gpu.gpuAdapter, 'nvidia / turing');
+    assert.equal(app.getDiagnosticsSnapshot().gpuAdapter, 'nvidia / turing');
+    assert.ok(!JSON.stringify(app.getBootTelemetry()).includes('alice'));
+    assert.ok(!JSON.stringify(app.bootTracer.getSummary()).includes('alice'));
+
+    // Duplicate identical adapter line does not spam setGpuAdapter.
+    broadcastInstances[0].onmessage({
+      data: {
+        label: '[wgpu_worker] WebGPU adapter: nvidia / turing',
+      },
+    });
+    assert.equal(adapterSpyCalls.length, 1);
+
+    // 2. Adapter updated via worker gpu-stats object payload `{ vendor, architecture }`.
+    mockWorker.dispatch('message', {
+      data: {
+        type: 'gpu-stats',
+        presentCount: 2,
+        realPackDrawCount: 0,
+        adapterInfo: { vendor: 'Intel', architecture: 'Gen-12LP' },
+      },
+    });
+    assert.equal(app.bootTracer.gpuAdapter, 'intel / gen-12lp');
+    assert.equal(hudController.getGpuAdapter(), 'intel / gen-12lp');
+    assert.deepEqual(adapterSpyCalls, ['nvidia / turing', 'intel / gen-12lp']);
+
+    // 3. Explicit [boot] FIRST_VISIBLE_FRAME log line records FIRST_VISIBLE_FRAME even without gpu-stats draws.
+    clock.advance(1200);
+    broadcastInstances[0].onmessage({
+      data: { label: '[boot] FIRST_VISIBLE_FRAME rendered' },
+    });
+    assert.equal(app.bootTracer.getSummary().stage, 'FIRST_VISIBLE_FRAME');
+    assert.equal(app.getBootTelemetry().hasVisibleContent, true);
+  } finally {
+    hudController.destroy();
+    await app.destroy();
+  }
+
+  // 4. Smoke demo adapter.info is also forwarded cleanly.
+  const smokeClock = createClock(30000);
+  const smokeRaf = createFakeRaf(smokeClock);
+  const smokeTimers = createFakeTimers();
+  const smokeWebgpu = createMockWebGpuEnv();
+  smokeWebgpu.adapter.info = { vendor: 'Apple', architecture: 'Metal-3' };
+  const smokeHost = createMockBrowserHost({
+    clock: smokeClock,
+    raf: smokeRaf,
+    timers: smokeTimers,
+    gpu: smokeWebgpu.gpu,
+  });
+  const smokeAdapterCalls = [];
+  const smokeApp = bootstrapPlayGta6App({
+    windowObj: smokeHost.windowObj,
+    documentObj: smokeHost.documentObj,
+    navigatorObj: smokeHost.navigatorObj,
+    fetchImpl: createMockFetch({ ok: true, hasWasmBinary: false }),
+    canvas: smokeWebgpu.canvas,
+    hud: createMockHud(),
+    hudController: {
+      setGpuAdapter(label) {
+        smokeAdapterCalls.push(label);
+      },
+    },
+    now: smokeClock.now,
+    raf: smokeRaf.raf,
+    cancelRaf: smokeRaf.cancelRaf,
+    setInterval: smokeTimers.setInterval,
+    clearInterval: smokeTimers.clearInterval,
+  });
+  try {
+    const res = await smokeApp.start();
+    assert.equal(res.ok, true);
+    assert.equal(smokeApp.bootTracer.gpuAdapter, 'apple / metal-3');
+    assert.deepEqual(smokeAdapterCalls, ['apple / metal-3']);
+  } finally {
+    await smokeApp.destroy();
   }
 });
