@@ -17,6 +17,7 @@
 
   const BUFFER_ALIGNMENT_BYTES = 4;
   const UNIFORM_BUFFER_MIN_BYTES = 16;
+  const DEFAULT_MAX_WRITE_CHUNK_BYTES = 4 * 1024 * 1024; // 4 MiB cap per queue.writeBuffer (W352)
   const DEFAULT_FAST_SLOT_CAPACITY = 1024;
   const DEFAULT_MAX_BIND_GROUPS = 4096;
   const DEFAULT_FAST_BIND_GROUP_BUCKETS = 512;
@@ -1043,16 +1044,35 @@
       this.resourceRegistry = options.resourceRegistry || options.registry || null;
       this._onWarning = typeof options.onWarning === 'function' ? options.onWarning : null;
 
-      // Mid-frame deferred destruction state (W340 / #1459).
+      // Mid-frame deferred destruction state (W340 / #1459) & W352 destroy/chunk telemetry.
       // Defaults to false so synchronous destroys outside a frame stay 100% backwards compatible.
       this._deferDestroys = Boolean(options.deferDestroys);
       this._inFrame = false;
       this._suppressDeferDestroys = false;
       /** @type {Array<object>} */
       this._deferredDestroys = [];
-      /** @type {Set<Array<object>>} */
+      /** @type {Array<string>} */
+      this._deferredDestroyKinds = [];
+      /** @type {Set<{ items: Array<object>, kinds: Array<string> }>} */
       this._inFlightDeferredBatches = new Set();
       this._deferredDestroyCount = 0;
+      this._destroyedObjects = typeof WeakSet === 'function' ? new WeakSet() : null;
+      this._destroyedBuffers = 0;
+      this._destroyedTextures = 0;
+
+      // W352: Bounded chunk size for queue.writeBuffer to prevent Dawn upload ring spikes.
+      const rawMaxWriteChunk =
+        options.maxWriteChunkBytes !== undefined
+          ? options.maxWriteChunkBytes
+          : DEFAULT_MAX_WRITE_CHUNK_BYTES;
+      if (!Number.isInteger(rawMaxWriteChunk) || rawMaxWriteChunk < BUFFER_ALIGNMENT_BYTES) {
+        throw new RangeError(
+          `ResourceTable maxWriteChunkBytes must be an integer >= ${BUFFER_ALIGNMENT_BYTES}, got ${rawMaxWriteChunk}`
+        );
+      }
+      this._maxWriteChunkBytes = Math.ceil(rawMaxWriteChunk / BUFFER_ALIGNMENT_BYTES) * BUFFER_ALIGNMENT_BYTES;
+      this._writeScratch = null;
+      this._chunkedWrites = 0;
 
       // Optional 1D -> 2D (width x 1) promotion and view dimension guard telemetry (W340 / #1459).
       this._promote1DTo2D = Boolean(options.promote1DTo2D);
@@ -1589,9 +1609,28 @@
       return buffer;
     }
 
+    _acquireWriteScratch(requiredBytes) {
+      if (requiredBytes <= 0) {
+        return null;
+      }
+      if (this._writeScratch && this._writeScratch.byteLength >= requiredBytes) {
+        return this._writeScratch;
+      }
+      if (requiredBytes > this._maxWriteChunkBytes) {
+        return null;
+      }
+      const allocBytes = this._writeScratch
+        ? Math.min(this._maxWriteChunkBytes, Math.max(requiredBytes, this._writeScratch.byteLength * 2))
+        : requiredBytes;
+      this._writeScratch = new Uint8Array(allocBytes);
+      return this._writeScratch;
+    }
+
     /**
      * Upload bytes to a tracked buffer (or direct GPUBuffer), automatically
-     * padding non-4-byte-aligned payloads into a zero-padded 4-byte-aligned copy.
+     * padding non-4-byte-aligned payloads into a zero-padded 4-byte-aligned copy
+     * and chunking large uploads (> `maxWriteChunkBytes`, default 4 MiB) so Dawn's
+     * internal upload ring never spikes to multi-GB.
      *
      * @param {number | object} idOrBuffer
      * @param {number} bufferOffset
@@ -1617,21 +1656,101 @@
       }
 
       const dstOffset = Math.max(0, Math.floor(Number(bufferOffset) || 0));
-      const upload = padBufferUploadData(data, dataOffset, size);
-      if (upload.alignedByteLength === 0) {
+
+      let byteView;
+      if (data instanceof Uint8Array) {
+        const start = dataOffset !== undefined ? Math.max(0, Math.floor(dataOffset)) : 0;
+        const maxLen = Math.max(0, data.byteLength - start);
+        const len = size !== undefined ? Math.min(maxLen, Math.max(0, Math.floor(size))) : maxLen;
+        byteView = data.subarray(start, start + len);
+      } else if (ArrayBuffer.isView(data)) {
+        const elemSize = data.BYTES_PER_ELEMENT || 1;
+        const startBytes =
+          dataOffset !== undefined ? Math.max(0, Math.floor(dataOffset) * elemSize) : 0;
+        const maxBytes = Math.max(0, data.byteLength - startBytes);
+        const lenBytes =
+          size !== undefined
+            ? Math.min(maxBytes, Math.max(0, Math.floor(size) * elemSize))
+            : maxBytes;
+        byteView = new Uint8Array(data.buffer, data.byteOffset + startBytes, lenBytes);
+      } else if (
+        data instanceof ArrayBuffer ||
+        (typeof SharedArrayBuffer !== 'undefined' && data instanceof SharedArrayBuffer)
+      ) {
+        const startBytes = dataOffset !== undefined ? Math.max(0, Math.floor(dataOffset)) : 0;
+        const maxBytes = Math.max(0, data.byteLength - startBytes);
+        const lenBytes =
+          size !== undefined ? Math.min(maxBytes, Math.max(0, Math.floor(size))) : maxBytes;
+        byteView = new Uint8Array(data, startBytes, lenBytes);
+      } else {
+        throw new TypeError('writeBuffer data must be an ArrayBufferView or ArrayBuffer');
+      }
+
+      const originalByteLength = byteView.byteLength;
+      if (originalByteLength === 0) {
         return true;
       }
 
-      if (upload.padded) {
+      const remainder = originalByteLength % BUFFER_ALIGNMENT_BYTES;
+      const padded = remainder !== 0;
+      const alignedByteLength = padded
+        ? originalByteLength + (BUFFER_ALIGNMENT_BYTES - remainder)
+        : originalByteLength;
+      const isShared =
+        typeof SharedArrayBuffer !== 'undefined' && byteView.buffer instanceof SharedArrayBuffer;
+
+      if (padded) {
         this._bufferAlignPadCount += 1;
         this._warn(
           'buffer_write_pad',
           resourceId,
-          `padded writeBuffer ${upload.originalByteLength} -> ${upload.alignedByteLength} bytes`
+          `padded writeBuffer ${originalByteLength} -> ${alignedByteLength} bytes`
         );
       }
 
-      this.device.queue.writeBuffer(buffer, dstOffset, upload.bytes);
+      const chunkMax = this._maxWriteChunkBytes;
+      if (alignedByteLength <= chunkMax) {
+        if (!padded && !isShared) {
+          this.device.queue.writeBuffer(buffer, dstOffset, byteView);
+        } else {
+          const scratch = this._acquireWriteScratch(alignedByteLength);
+          const dst = scratch
+            ? scratch.byteLength === alignedByteLength
+              ? scratch
+              : scratch.subarray(0, alignedByteLength)
+            : new Uint8Array(alignedByteLength);
+          dst.set(byteView, 0);
+          if (padded) {
+            dst.fill(0, originalByteLength, alignedByteLength);
+          }
+          this.device.queue.writeBuffer(buffer, dstOffset, dst);
+        }
+      } else {
+        for (let off = 0; off < originalByteLength; off += chunkMax) {
+          const rawLen = Math.min(chunkMax, originalByteLength - off);
+          const chunkRem = rawLen % BUFFER_ALIGNMENT_BYTES;
+          const chunkAlignedLen =
+            chunkRem === 0 ? rawLen : rawLen + (BUFFER_ALIGNMENT_BYTES - chunkRem);
+          const srcSlice = byteView.subarray(off, off + rawLen);
+          if (!isShared && chunkRem === 0) {
+            this.device.queue.writeBuffer(buffer, dstOffset + off, srcSlice);
+          } else {
+            const scratch = this._acquireWriteScratch(chunkAlignedLen);
+            const dst = scratch
+              ? scratch.byteLength === chunkAlignedLen
+                ? scratch
+                : scratch.subarray(0, chunkAlignedLen)
+              : new Uint8Array(chunkAlignedLen);
+            dst.set(srcSlice, 0);
+            if (chunkRem !== 0) {
+              dst.fill(0, rawLen, chunkAlignedLen);
+            }
+            this.device.queue.writeBuffer(buffer, dstOffset + off, dst);
+          }
+        }
+        this._chunkedWrites += 1;
+      }
+
       this._bufferWrites += 1;
       return true;
     }
@@ -1649,48 +1768,67 @@
       return true;
     }
 
-    _destroyBatchNow(batch) {
-      if (!batch || batch.length === 0) {
-        return 0;
-      }
-      const items = batch.splice(0, batch.length);
-      let destroyed = 0;
-      for (let i = 0; i < items.length; i += 1) {
-        const res = items[i];
-        if (res && typeof res.destroy === 'function') {
-          try {
-            res.destroy();
-          } catch (_err) {
-            // Ignore errors from already-destroyed or lost WebGPU resources.
-          }
-          destroyed += 1;
-        }
-      }
-      return destroyed;
-    }
-
-    _destroyOrDefer(resource) {
+    _destroySingleResourceNow(resource, kind) {
       if (!resource || typeof resource.destroy !== 'function') {
         return false;
       }
-      if (!this._suppressDeferDestroys && (this._inFrame || this._deferDestroys)) {
-        this._deferredDestroys.push(resource);
-        this._deferredDestroyCount += 1;
+      if (this._destroyedObjects !== null && this._destroyedObjects.has(resource)) {
         return false;
+      }
+      if (this._destroyedObjects !== null) {
+        this._destroyedObjects.add(resource);
       }
       try {
         resource.destroy();
       } catch (_err) {
         // Ignore errors from already-destroyed or lost WebGPU resources.
       }
+      if (kind === 'buffer') {
+        this._destroyedBuffers += 1;
+      } else if (kind === 'texture') {
+        this._destroyedTextures += 1;
+      }
       return true;
+    }
+
+    _destroyBatchNow(batch) {
+      if (!batch || !batch.items || batch.items.length === 0) {
+        return 0;
+      }
+      const items = batch.items.splice(0, batch.items.length);
+      const kinds = batch.kinds ? batch.kinds.splice(0, batch.kinds.length) : null;
+      let destroyed = 0;
+      for (let i = 0; i < items.length; i += 1) {
+        const res = items[i];
+        const kind = kinds ? kinds[i] : '';
+        if (this._destroySingleResourceNow(res, kind)) {
+          destroyed += 1;
+        }
+      }
+      return destroyed;
+    }
+
+    _destroyOrDefer(resource, kind = '') {
+      if (!resource || typeof resource.destroy !== 'function') {
+        return false;
+      }
+      if (this._destroyedObjects !== null && this._destroyedObjects.has(resource)) {
+        return false;
+      }
+      if (!this._suppressDeferDestroys && (this._inFrame || this._deferDestroys)) {
+        this._deferredDestroys.push(resource);
+        this._deferredDestroyKinds.push(kind);
+        this._deferredDestroyCount += 1;
+        return false;
+      }
+      return this._destroySingleResourceNow(resource, kind);
     }
 
     _getPendingDeferredDestroyCount() {
       let pending = this._deferredDestroys.length;
       if (this._inFlightDeferredBatches.size > 0) {
         for (const batch of this._inFlightDeferredBatches) {
-          pending += batch.length;
+          pending += batch.items.length;
         }
       }
       return pending;
@@ -1714,8 +1852,12 @@
       if (this._deferredDestroys.length === 0) {
         return 0;
       }
-      const batch = this._deferredDestroys;
+      const batch = {
+        items: this._deferredDestroys,
+        kinds: this._deferredDestroyKinds,
+      };
       this._deferredDestroys = [];
+      this._deferredDestroyKinds = [];
 
       if (queue && typeof queue.onSubmittedWorkDone === 'function') {
         let workPromise;
@@ -1746,8 +1888,12 @@
     flushDeferredDestroys() {
       let destroyed = 0;
       if (this._deferredDestroys.length > 0) {
-        const batch = this._deferredDestroys;
+        const batch = {
+          items: this._deferredDestroys,
+          kinds: this._deferredDestroyKinds,
+        };
         this._deferredDestroys = [];
+        this._deferredDestroyKinds = [];
         destroyed += this._destroyBatchNow(batch);
       }
       if (this._inFlightDeferredBatches.size > 0) {
@@ -1898,13 +2044,28 @@
         }
         throw err;
       }
+
+      let textureView = null;
+      if (texture && typeof texture.createView === 'function') {
+        try {
+          textureView = texture.createView();
+        } catch (err) {
+          // Ensure newly allocated GPUTexture is not leaked if createView() throws.
+          this._destroySingleResourceNow(texture, 'texture');
+          if (existed) {
+            this._totalDeletes += 1;
+            this._resourceVersions.texture.delete(id);
+            this._invalidateSlotsForResource('texture', id, 0);
+          }
+          throw err;
+        }
+      }
+
       this.textures.set(id, texture);
       const texGen = this._advanceResourceGeneration('texture', id, true);
       this._trackObjectOrigin(texture, 'texture', id, texGen);
 
-      let textureView = null;
-      if (texture && typeof texture.createView === 'function') {
-        textureView = texture.createView();
+      if (textureView) {
         this.textureViews.set(id, textureView);
         this._linkTextureViewParent(id, id);
         const viewGen = this._advanceResourceGeneration('textureView', id, true);
@@ -2432,10 +2593,10 @@
       if (this.resourceRegistry && typeof this.resourceRegistry.retire === 'function') {
         const retired = this.resourceRegistry.retire('buffer', id);
         if (!retired && typeof existing.destroy === 'function') {
-          this._destroyOrDefer(existing);
+          this._destroyOrDefer(existing, 'buffer');
         }
       } else if (typeof existing.destroy === 'function') {
-        this._destroyOrDefer(existing);
+        this._destroyOrDefer(existing, 'buffer');
       }
       this.buffers.delete(id);
       this._bufferMeta.delete(id);
@@ -2469,10 +2630,10 @@
         const retiredTex = this.resourceRegistry.retire('texture', id);
         this.resourceRegistry.retire('textureView', id);
         if (!retiredTex && typeof existing.destroy === 'function') {
-          this._destroyOrDefer(existing);
+          this._destroyOrDefer(existing, 'texture');
         }
       } else if (typeof existing.destroy === 'function') {
-        this._destroyOrDefer(existing);
+        this._destroyOrDefer(existing, 'texture');
       }
       const childViews = this._textureChildViews.get(id);
       const childViewIds = childViews ? Array.from(childViews) : [];
@@ -4970,6 +5131,7 @@
           this.destroy(id);
         }
         this.flushDeferredDestroys();
+        this._writeScratch = null;
       } finally {
         this._suppressDeferDestroys = prevSuppressDefer;
       }
@@ -5025,6 +5187,10 @@
         samplersActive: this.samplers.size,
         shaderModulesActive: this.shaderModules.size,
         destroyCount: this._destroyCount,
+        destroyedBuffers: this._destroyedBuffers,
+        destroyedTextures: this._destroyedTextures,
+        chunkedWrites: this._chunkedWrites,
+        maxWriteChunkBytes: this._maxWriteChunkBytes,
         deferredDestroyCount: this._deferredDestroyCount,
         pendingDeferredDestroyCount: this._getPendingDeferredDestroyCount(),
         viewDimensionGuardCount: this._viewDimensionGuardCount,
@@ -5067,6 +5233,9 @@
       this._shaderModulesCreated = 0;
       this._bufferWrites = 0;
       this._destroyCount = 0;
+      this._destroyedBuffers = 0;
+      this._destroyedTextures = 0;
+      this._chunkedWrites = 0;
       this._deferredDestroyCount = 0;
       this._viewDimensionGuardCount = 0;
       this._promoted1DTo2DCount = 0;
@@ -5106,6 +5275,7 @@
     TEXTURE_COMPRESSION_BC_FEATURE,
     BUFFER_ALIGNMENT_BYTES,
     UNIFORM_BUFFER_MIN_BYTES,
+    DEFAULT_MAX_WRITE_CHUNK_BYTES,
     DEFAULT_FAST_SLOT_CAPACITY,
     DEFAULT_MAX_BIND_GROUPS,
     DEFAULT_FAST_BIND_GROUP_BUCKETS,
@@ -5146,6 +5316,7 @@
       TEXTURE_COMPRESSION_BC_FEATURE,
       BUFFER_ALIGNMENT_BYTES,
       UNIFORM_BUFFER_MIN_BYTES,
+      DEFAULT_MAX_WRITE_CHUNK_BYTES,
       DEFAULT_FAST_SLOT_CAPACITY,
       DEFAULT_MAX_BIND_GROUPS,
       DEFAULT_FAST_BIND_GROUP_BUCKETS,
