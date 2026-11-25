@@ -25,10 +25,20 @@ const {
 } = ioWorkerMod;
 
 const {
+  HTTPFS_DIRECTSTORAGE_CHUNK_BYTES,
+  HTTPFS_READAHEAD_BASE_BYTES,
+  HTTPFS_READAHEAD_MID_BYTES,
+  HTTPFS_READAHEAD_MAX_BYTES,
+  HTTPFS_DEFAULT_PIPELINE_SLOTS,
   HttpfsStatus,
+  isVideoReadAheadPath,
+  computeReadAheadWindowSize,
   createHttpfsMailboxBuffer,
+  createHttpfsMailboxPool,
   HttpfsMailboxHost,
   HttpfsMailboxClient,
+  HttpfsMailboxPoolHost,
+  HttpfsMailboxPoolClient,
 } = mailboxMod;
 
 const utf8Encoder = new TextEncoder();
@@ -1100,5 +1110,334 @@ test('W125: .reflect.json and boot-options.json load in 1 HTTP fetch, release on
     assert.equal(await hugeClient.closeAsync(hHuge), true);
   } finally {
     await hugeController.detachMailbox();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 7. W182: Adaptive read-ahead window sizing, multi-slot mailbox pipelining & telemetry
+// ---------------------------------------------------------------------------
+
+test('W182: computeReadAheadWindowSize ramps 256 KiB -> 1 MiB -> 2 MiB for 64 KiB DirectStorage and .bk2 reads capped by maxReadAheadBytes', () => {
+  assert.equal(HTTPFS_DIRECTSTORAGE_CHUNK_BYTES, 64 * 1024);
+  assert.equal(HTTPFS_READAHEAD_BASE_BYTES, 256 * 1024);
+  assert.equal(HTTPFS_READAHEAD_MID_BYTES, 1024 * 1024);
+  assert.equal(HTTPFS_READAHEAD_MAX_BYTES, 2 * 1024 * 1024);
+  assert.equal(HTTPFS_DEFAULT_PIPELINE_SLOTS, 4);
+
+  assert.equal(isVideoReadAheadPath('movies/intro_4k.bk2'), true);
+  assert.equal(isVideoReadAheadPath('MOVIES/SPLASH.BIK'), true);
+  assert.equal(isVideoReadAheadPath('update/world.rpf'), false);
+
+  // Non-sequential, invalid, or zero-cap inputs return 0.
+  assert.equal(computeReadAheadWindowSize(65536, 0), 0);
+  assert.equal(computeReadAheadWindowSize(65536, -3), 0);
+  assert.equal(computeReadAheadWindowSize(0, 4), 0);
+  assert.equal(computeReadAheadWindowSize(-65536, 4), 0);
+  assert.equal(computeReadAheadWindowSize(NaN, 4), 0);
+  assert.equal(computeReadAheadWindowSize(65536, 8, { maxReadAheadBytes: 0 }), 0);
+
+  // General 64 KiB DirectStorage ramp: 256 KiB (seq 1..3) -> 1 MiB (seq 4..7) -> 2 MiB (seq >= 8).
+  assert.equal(computeReadAheadWindowSize(65536, 1), 256 * 1024);
+  assert.equal(computeReadAheadWindowSize(65536, 2), 256 * 1024);
+  assert.equal(computeReadAheadWindowSize(65536, 3), 256 * 1024);
+  assert.equal(computeReadAheadWindowSize(65536, 4), 1024 * 1024);
+  assert.equal(computeReadAheadWindowSize(65536, 7), 1024 * 1024);
+  assert.equal(computeReadAheadWindowSize(65536, 8), 2 * 1024 * 1024);
+  assert.equal(computeReadAheadWindowSize(65536n, 20), 2 * 1024 * 1024);
+
+  // 4K Bink2 (.bk2) ramp: 256 KiB (seq 1) -> 1 MiB (seq 2..3) -> 2 MiB (seq >= 4).
+  assert.equal(computeReadAheadWindowSize(65536, 0, { path: 'movies/intro.bk2' }), 0);
+  assert.equal(computeReadAheadWindowSize(65536, 1, { path: 'movies/intro.bk2' }), 256 * 1024);
+  assert.equal(computeReadAheadWindowSize(65536, 2, { path: 'movies/intro.bk2' }), 1024 * 1024);
+  assert.equal(computeReadAheadWindowSize(65536, 3, { path: 'movies/intro.bk2' }), 1024 * 1024);
+  assert.equal(computeReadAheadWindowSize(65536, 4, { path: 'movies/intro.bk2' }), 2 * 1024 * 1024);
+  assert.equal(computeReadAheadWindowSize(65536, 2, { isVideoStream: true }), 1024 * 1024);
+  assert.equal(computeReadAheadWindowSize(65536, 4, { isVideoStream: true }), 2 * 1024 * 1024);
+
+  // Strict maxReadAheadBytes capping.
+  assert.equal(
+    computeReadAheadWindowSize(65536, 12, { maxReadAheadBytes: 512 * 1024 }),
+    512 * 1024,
+  );
+  assert.equal(
+    computeReadAheadWindowSize(65536, 1, { maxReadAheadBytes: 128 * 1024 }),
+    128 * 1024,
+  );
+  assert.equal(
+    computeReadAheadWindowSize(65536, 4, { path: 'movies/intro.bk2', maxReadAheadBytes: 1024 * 1024 }),
+    1024 * 1024,
+  );
+});
+
+test('W182: HttpfsMailboxHost adaptive read-ahead ramps 256 KiB -> 1 MiB -> 2 MiB, tracks per-handle burst/wait telemetry, and handles random seeks and short reads', async () => {
+  const fileSize = 4 * 1024 * 1024; // 4 MiB = 64 x 64 KiB DirectStorage chunks
+  const fileBytes = makePatternBytes(fileSize, 193);
+  const backendReads = [];
+  let fakeNowMs = 100;
+
+  const sab = createHttpfsMailboxBuffer(64 * 1024);
+  const host = new HttpfsMailboxHost(sab, {
+    readAhead: true,
+    maxReadAheadBytes: 2 * 1024 * 1024,
+    now: () => fakeNowMs,
+    open: (relPath) => (relPath === 'update/streaming_world.rpf' ? 11 : -2),
+    read: async (handle, offset, reqLen) => {
+      if (handle !== 11) return null;
+      backendReads.push({ offset, reqLen });
+      fakeNowMs += 5; // Deterministic 5ms async backend read latency
+      return fileBytes.subarray(offset, Math.min(fileSize, offset + reqLen));
+    },
+    close: (handle) => handle === 11,
+  });
+  const client = new HttpfsMailboxClient(sab);
+  host.start();
+
+  try {
+    const h = await client.openAsync('update/streaming_world.rpf');
+    assert.equal(h, 11);
+
+    // Stream all 4 MiB in sequential 64 KiB chunks.
+    const assembled = new Uint8Array(fileSize);
+    const chunkBuf = new Uint8Array(64 * 1024);
+    for (let i = 0; i < 64; i += 1) {
+      const got = await client.readAsync(h, BigInt(i * 65536), chunkBuf, 65536);
+      assert.equal(got, 65536);
+      assembled.set(chunkBuf, i * 65536);
+    }
+    assert.deepEqual(assembled, fileBytes);
+
+    // Expected adaptive fetch ramp:
+    //   Read 0  (seq 0):  64 KiB
+    //   Read 1  (seq 1): 256 KiB  -> serves reads 1..4 (3 read-ahead hits)
+    //   Read 5  (seq 5):   1 MiB  -> serves reads 5..20 (15 read-ahead hits)
+    //   Read 21 (seq 21):  2 MiB  -> serves reads 21..52 (31 read-ahead hits)
+    //   Read 53 (seq 53):  2 MiB  -> returns remaining 704 KiB, serves reads 53..63 (10 read-ahead hits)
+    assert.deepEqual(
+      backendReads.map((r) => r.reqLen),
+      [64 * 1024, 256 * 1024, 1024 * 1024, 2 * 1024 * 1024, 2 * 1024 * 1024],
+    );
+
+    const handleTel = host.getHandleTelemetry(h);
+    assert.ok(handleTel);
+    assert.equal(handleTel.handle, 11);
+    assert.equal(handleTel.reads, 64);
+    assert.equal(handleTel.burstReads, 63);
+    assert.equal(handleTel.maxSequentialCount, 63);
+    assert.equal(handleTel.peakPendingSlots, 1);
+    assert.equal(handleTel.readAheadFetches, 4);
+    assert.equal(handleTel.readAheadHits, 59);
+    assert.equal(handleTel.readAheadBytesServed, 59 * 65536);
+    assert.equal(handleTel.currentWindowBytes, 2 * 1024 * 1024);
+    assert.ok(handleTel.avgWaitMs > 0, `Expected positive avgWaitMs, got ${handleTel.avgWaitMs}`);
+    assert.equal(handleTel.totalWaitMs, 5 * 5); // 5 async backend reads x 5ms each
+    assert.equal(handleTel.maxWaitMs, 5);
+    assert.equal(handleTel.isVideoStream, false);
+
+    // Random seek resets sequentialCount and fetches only exact requested length on miss.
+    const seekCountBefore = backendReads.length;
+    const seekBuf = new Uint8Array(4096);
+    assert.equal(await client.readAsync(h, 12345n, seekBuf, 4096), 4096);
+    assert.deepEqual(seekBuf, fileBytes.subarray(12345, 12345 + 4096));
+    assert.equal(backendReads.length, seekCountBefore + 1);
+    assert.equal(backendReads[backendReads.length - 1].reqLen, 4096);
+    assert.equal(host.getHandleTelemetry(h).sequentialCount, 0);
+    assert.equal(host.getHandleTelemetry(h).currentWindowBytes, 0);
+
+    // Close frees read-ahead buffer while keeping sanitized telemetry with zero paths.
+    assert.equal(await client.closeAsync(h), true);
+    const stats = host.getStats();
+    assert.equal(stats.burstReads, 63);
+    assert.equal(stats.peakPendingSlots, 1);
+    assert.equal(stats.readAheadBytesServed, 59 * 65536);
+    assert.ok(stats.avgWaitMs > 0);
+    assert.equal(stats.handles['11'].closed, true);
+
+    const statsJson = JSON.stringify(stats);
+    assert.equal(statsJson.includes('streaming_world.rpf'), false);
+    assert.equal(statsJson.includes('update/'), false);
+  } finally {
+    await host.stop();
+  }
+
+  // Short-read safety: backend that caps every single read to 64 KiB must never trigger false EOF.
+  const shortSize = 200 * 1024; // 3 full 64 KiB + 8 KiB tail
+  const shortBytes = makePatternBytes(shortSize, 211);
+  const shortSab = createHttpfsMailboxBuffer(64 * 1024);
+  const shortHost = new HttpfsMailboxHost(shortSab, {
+    readAhead: true,
+    open: () => 2,
+    read: (_h, offset, reqLen) => {
+      const capped = Math.min(reqLen, 64 * 1024);
+      return shortBytes.subarray(offset, Math.min(shortSize, offset + capped));
+    },
+    close: () => true,
+  });
+  const shortClient = new HttpfsMailboxClient(shortSab);
+  shortHost.start();
+  try {
+    const h2 = await shortClient.openAsync('capped.rpf');
+    const out = new Uint8Array(shortSize);
+    const step = new Uint8Array(64 * 1024);
+    let off = 0;
+    while (off < shortSize) {
+      const n = await shortClient.readAsync(h2, BigInt(off), step, 65536);
+      assert.ok(n > 0);
+      out.set(step.subarray(0, n), off);
+      off += n;
+    }
+    assert.deepEqual(out, shortBytes);
+    assert.equal(await shortClient.readAsync(h2, BigInt(shortSize), step, 65536), 0);
+    assert.equal(await shortClient.closeAsync(h2), true);
+  } finally {
+    await shortHost.stop();
+  }
+});
+
+test('W182: multi-slot HttpfsMailboxPoolHost/Client pipelines concurrent 64 KiB DirectStorage and 4K Bink2 .bk2 bursts with coalescing and telemetry', async () => {
+  assert.throws(() => createHttpfsMailboxPool(0), RangeError);
+  assert.throws(() => createHttpfsMailboxPool(99), RangeError);
+
+  const rpfSize = 2 * 1024 * 1024; // 2 MiB DirectStorage asset (32 x 64 KiB)
+  const bk2Size = 3 * 1024 * 1024; // 3 MiB 4K Bink2 video stream (48 x 64 KiB)
+  const rpfBytes = makePatternBytes(rpfSize, 43);
+  const bk2Bytes = makePatternBytes(bk2Size, 97);
+
+  const backendCalls = [];
+  const slots = createHttpfsMailboxPool(4, 64 * 1024);
+  assert.equal(slots.length, 4);
+
+  const poolHost = new HttpfsMailboxPoolHost(slots, {
+    maxReadAheadBytes: 2 * 1024 * 1024,
+    open: (relPath) => {
+      if (relPath === 'update/ds_stream.rpf') return 1;
+      if (relPath === 'movies/intro_4k.bk2') return 2;
+      return -2;
+    },
+    read: async (handle, offset, reqLen) => {
+      backendCalls.push({ handle, offset, reqLen });
+      // Small async delay so pipelined sibling slots overlap in flight and coalesce cleanly.
+      await new Promise((r) => setTimeout(r, 8));
+      const src = handle === 1 ? rpfBytes : handle === 2 ? bk2Bytes : null;
+      if (!src) return null;
+      return src.subarray(offset, Math.min(src.byteLength, offset + reqLen));
+    },
+    close: (handle) => handle === 1 || handle === 2,
+  });
+
+  const poolClient = new HttpfsMailboxPoolClient(slots);
+  poolHost.start();
+
+  try {
+    const [hRpf, hBk2] = await Promise.all([
+      poolClient.openAsync('update/ds_stream.rpf'),
+      poolClient.openAsync('movies/intro_4k.bk2'),
+    ]);
+    assert.equal(hRpf, 1);
+    assert.equal(hBk2, 2);
+
+    // 1. Pipeline 4 concurrent 64 KiB .bk2 reads in one batch -> saturates all 4 slots and coalesces!
+    const bk2Batch1 = await poolClient.readBatchAsync([
+      { handle: hBk2, offset: 0n, len: 65536 },
+      { handle: hBk2, offset: 65536n, len: 65536 },
+      { handle: hBk2, offset: 131072n, len: 65536 },
+      { handle: hBk2, offset: 196608n, len: 65536 },
+    ]);
+    for (let i = 0; i < 4; i += 1) {
+      assert.equal(bk2Batch1[i].bytesRead, 65536);
+      assert.deepEqual(bk2Batch1[i].dst, bk2Bytes.subarray(i * 65536, (i + 1) * 65536));
+    }
+
+    // Stream remaining .bk2 chunks in 4-slot pipelined bursts + interleaved DirectStorage .rpf bursts.
+    const bk2Out = new Uint8Array(bk2Size);
+    for (let i = 0; i < 4; i += 1) {
+      bk2Out.set(bk2Batch1[i].dst, i * 65536);
+    }
+    for (let chunk = 4; chunk < 48; chunk += 4) {
+      const batch = await poolClient.readBatchAsync(
+        [0, 1, 2, 3].map((k) => ({
+          handle: hBk2,
+          offset: BigInt((chunk + k) * 65536),
+          len: 65536,
+        })),
+      );
+      for (let k = 0; k < 4; k += 1) {
+        assert.equal(batch[k].bytesRead, 65536);
+        bk2Out.set(batch[k].dst, (chunk + k) * 65536);
+      }
+    }
+    assert.deepEqual(bk2Out, bk2Bytes);
+
+    // Stream all 32 x 64 KiB DirectStorage .rpf chunks in 4-slot pipelined batches.
+    const rpfOut = new Uint8Array(rpfSize);
+    for (let chunk = 0; chunk < 32; chunk += 4) {
+      const batch = await poolClient.readBatchAsync(
+        [0, 1, 2, 3].map((k) => ({
+          handle: hRpf,
+          offset: BigInt((chunk + k) * 65536),
+          len: 65536,
+        })),
+      );
+      for (let k = 0; k < 4; k += 1) {
+        assert.equal(batch[k].bytesRead, 65536);
+        rpfOut.set(batch[k].dst, (chunk + k) * 65536);
+      }
+    }
+    assert.deepEqual(rpfOut, rpfBytes);
+
+    const bk2Tel = poolHost.getHandleTelemetry(hBk2);
+    const rpfTel = poolHost.getHandleTelemetry(hRpf);
+    assert.ok(bk2Tel && rpfTel);
+
+    // .bk2 stream: detected as video stream, ramped cleanly to 2 MiB window, coalesced pipelined slots!
+    assert.equal(bk2Tel.isVideoStream, true);
+    assert.equal(bk2Tel.reads, 48);
+    assert.equal(bk2Tel.burstReads, 47);
+    assert.equal(bk2Tel.peakPendingSlots, 4);
+    assert.ok(bk2Tel.coalescedSlotReads >= 2, `Expected >= 2 coalesced .bk2 slot reads, got ${bk2Tel.coalescedSlotReads}`);
+    assert.ok(bk2Tel.readAheadBytesServed >= 40 * 65536, `Expected >= 40 chunks served from read-ahead, got ${bk2Tel.readAheadBytesServed}`);
+    assert.equal(bk2Tel.currentWindowBytes, 2 * 1024 * 1024);
+    assert.ok(bk2Tel.avgWaitMs >= 0);
+
+    // .rpf DirectStorage stream: independent telemetry & read-ahead acceleration.
+    assert.equal(rpfTel.isVideoStream, false);
+    assert.equal(rpfTel.reads, 32);
+    assert.equal(rpfTel.burstReads, 31);
+    assert.equal(rpfTel.peakPendingSlots, 4);
+    assert.ok(rpfTel.readAheadBytesServed >= 25 * 65536);
+    assert.equal(rpfTel.currentWindowBytes, 2 * 1024 * 1024);
+
+    // Total backend calls across 80 x 64 KiB reads must be dramatically reduced by adaptive read-ahead + coalescing!
+    const bk2BackendCalls = backendCalls.filter((c) => c.handle === hBk2);
+    const rpfBackendCalls = backendCalls.filter((c) => c.handle === hRpf);
+    assert.ok(bk2BackendCalls.length <= 5, `Expected <= 5 backend calls for 48 .bk2 reads, got ${bk2BackendCalls.length}`);
+    assert.ok(rpfBackendCalls.length <= 5, `Expected <= 5 backend calls for 32 .rpf reads, got ${rpfBackendCalls.length}`);
+
+    // Verify .bk2 ramped all the way up to 2 MiB on the backend!
+    assert.ok(
+      bk2BackendCalls.some((c) => c.reqLen === 2 * 1024 * 1024),
+      `Expected .bk2 stream to ramp to 2 MiB fetch window, saw: ${bk2BackendCalls.map((c) => c.reqLen)}`,
+    );
+
+    const hostStats = poolHost.getStats();
+    const clientStats = poolClient.getStats();
+    assert.equal(hostStats.slotCount, 4);
+    assert.equal(hostStats.peakPendingSlots, 4);
+    assert.equal(hostStats.burstReads, 78);
+    assert.equal(hostStats.activePendingSlots, 0);
+    assert.equal(hostStats.perSlot.length, 4);
+    assert.ok(hostStats.perSlot.every((s) => s.requests > 0), 'All 4 pipeline slots should serve requests');
+    assert.equal(clientStats.slotCount, 4);
+    assert.equal(clientStats.peakPendingSlots, 4);
+    assert.equal(clientStats.availableSlots, 4);
+
+    assert.equal(await poolClient.closeAsync(hRpf), true);
+    assert.equal(await poolClient.closeAsync(hBk2), true);
+
+    // Confirm zero file paths/URLs leak into sanitized telemetry JSON.
+    const serialized = JSON.stringify({ hostStats: poolHost.getStats(), clientStats: poolClient.getStats() });
+    assert.equal(serialized.includes('intro_4k.bk2'), false);
+    assert.equal(serialized.includes('ds_stream.rpf'), false);
+  } finally {
+    await poolHost.stop();
   }
 });
