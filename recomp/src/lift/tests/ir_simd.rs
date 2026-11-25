@@ -30,7 +30,7 @@ fn used_xmm_registers_get_slots_synced_like_gprs() {
         !ir.contains("%xmm1 = alloca"),
         "only used registers get a slot"
     );
-    let state_slot = |idx: u32| format!("ptr %state, i64 0, i32 5, i64 {idx}\n");
+    let state_slot = |idx: u32| format!("ptr %state.xmm{idx}, align 8");
     // entry + after the call + before the call + before the return
     assert_eq!(ir.matches(&state_slot(0)).count(), 4, "{ir}");
     assert_eq!(ir.matches(&state_slot(5)).count(), 4, "{ir}");
@@ -42,7 +42,7 @@ fn used_xmm_registers_get_slots_synced_like_gprs() {
             > before.rfind("load <2 x i64>, ptr %xmm0").unwrap()
     );
     assert!(
-        after.contains("load <2 x i64>, ptr %t"),
+        after.contains("load <2 x i64>, ptr %state.xmm"),
         "reloaded after the call: {after}"
     );
 
@@ -75,11 +75,8 @@ fn ymm_upper_halves_get_slots_only_where_avx_touches_them() {
         );
         // entry load + exit store of state field 6 (`ymm_hi`)
         assert_eq!(
-            ir.matches(&format!(
-                "ptr %state, i64 0, i32 6, i64 {idx}
-"
-            ))
-            .count(),
+            ir.matches(&format!("ptr %state.ymmh{idx}, align 8"))
+                .count(),
             2,
             "{ir}"
         );
