@@ -1,13 +1,19 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-use crate::rpf9::{RPF7_MAGIC, RPF8_MAGIC, RPF9_MAGIC, json_escape};
+use crate::rpf9::{
+    RPF7_MAGIC, RPF7_MAGIC_LE, RPF8_MAGIC, RPF8_MAGIC_LE, RPF9_MAGIC, RPF9_MAGIC_LE, json_escape,
+};
 
 const ABI_VERSION: u32 = 1;
+
+/// Maximum directory recursion depth during a scan to prevent stack overflow
+/// on pathologically deep trees or OS-level directory loops.
+pub const MAX_SCAN_DEPTH: usize = 64;
 
 /// Number of header bytes probed per file.
 ///
@@ -99,12 +105,17 @@ impl IncompleteReason {
 
     pub fn detail(&self) -> String {
         match self {
-            IncompleteReason::TempSuffix(suffix) => format!("temporary download suffix {suffix}"),
+            IncompleteReason::TempSuffix(suffix) => format!(
+                "temporary download suffix {}",
+                sanitize_diagnostic_text(suffix)
+            ),
             IncompleteReason::EmptyFile => "zero-byte file".to_string(),
             IncompleteReason::SparseOrZeroHeader => {
                 "unallocated/zero-filled header bytes".to_string()
             }
-            IncompleteReason::Unreadable(kind) => format!("file unreadable ({kind})"),
+            IncompleteReason::Unreadable(kind) => {
+                format!("file unreadable ({})", sanitize_diagnostic_text(kind))
+            }
         }
     }
 }
@@ -409,11 +420,204 @@ fn sanitized_io_kind(err: &io::Error) -> String {
     match err.kind() {
         io::ErrorKind::NotFound => "not_found".to_string(),
         io::ErrorKind::PermissionDenied => "permission_denied".to_string(),
+        io::ErrorKind::InvalidInput => "invalid_input".to_string(),
+        io::ErrorKind::InvalidData => "invalid_data".to_string(),
+        io::ErrorKind::TimedOut => "timed_out".to_string(),
         io::ErrorKind::WouldBlock => "would_block".to_string(),
         io::ErrorKind::Interrupted => "interrupted".to_string(),
         io::ErrorKind::UnexpectedEof => "unexpected_eof".to_string(),
         _ => "io_error".to_string(),
     }
+}
+
+fn strip_control_chars(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// Extracts a sanitized basename label from a path string, stripping all host directory
+/// prefixes (Unix roots, Windows drive letters, UNC paths, extended-length prefixes)
+/// and ASCII control characters.
+pub fn sanitize_basename_str(raw: &str) -> String {
+    let cleaned = strip_control_chars(raw);
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return "<root>".to_string();
+    }
+
+    let mut last_valid: Option<&str> = None;
+    for seg in trimmed.split(['/', '\\']) {
+        let seg = seg.trim();
+        if seg.is_empty() || seg == "." || seg == ".." || seg == "?" {
+            continue;
+        }
+        let b = seg.as_bytes();
+        if b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+            continue;
+        }
+        last_valid = Some(seg);
+    }
+
+    match last_valid {
+        Some(seg) => {
+            let b = seg.as_bytes();
+            let without_drive = if b.len() > 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+                &seg[2..]
+            } else {
+                seg
+            };
+            if without_drive.is_empty() || without_drive == "." || without_drive == ".." {
+                "<root>".to_string()
+            } else {
+                without_drive.to_string()
+            }
+        }
+        None => "<root>".to_string(),
+    }
+}
+
+/// Extracts a sanitized basename label from `path` (never leaking parent host directories).
+pub fn sanitize_basename(path: &Path) -> String {
+    sanitize_basename_str(&path.to_string_lossy())
+}
+
+/// Normalizes and sanitizes a relative path label for serialized outputs.
+///
+/// - Converts backslashes to forward slashes and strips ASCII control characters.
+/// - Collapses host-absolute paths (leading `/` or `\`, Windows drive prefixes `X:`) or paths
+///   containing parent traversal (`..`) down to only their sanitized basename so host directory
+///   structures never leak into JSON or human reports.
+pub fn sanitize_relative_label(raw: &str) -> String {
+    let cleaned = strip_control_chars(raw);
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return "<root>".to_string();
+    }
+
+    let bytes = trimmed.as_bytes();
+    let has_drive_prefix = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    let is_absolute = trimmed.starts_with('/') || trimmed.starts_with('\\') || has_drive_prefix;
+
+    let mut segments: Vec<&str> = Vec::new();
+    let mut has_parent_dir = false;
+    for seg in trimmed.split(['/', '\\']) {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            has_parent_dir = true;
+            continue;
+        }
+        segments.push(seg);
+    }
+
+    if is_absolute || has_parent_dir {
+        return sanitize_basename_str(trimmed);
+    }
+
+    if segments.is_empty() {
+        "<root>".to_string()
+    } else {
+        segments.join("/")
+    }
+}
+
+fn looks_like_host_path(token: &str) -> bool {
+    let trimmed = token.trim_matches(|c: char| {
+        matches!(c, '"' | '\'' | '(' | ')' | '[' | ']' | ',' | ';')
+    });
+    if trimmed.is_empty() {
+        return false;
+    }
+    let bytes = trimmed.as_bytes();
+    let has_drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    if has_drive || trimmed.starts_with('/') || trimmed.starts_with('\\') || trimmed.contains('\\')
+    {
+        return true;
+    }
+    trimmed.split('/').any(|seg| seg == "..")
+}
+
+fn sanitize_single_word(word: &str) -> String {
+    if let Some((lhs, rhs)) = word.split_once('=')
+        && looks_like_host_path(rhs)
+    {
+        let rhs_clean = rhs.trim_end_matches(':');
+        return format!("{lhs}={}", sanitize_basename_str(rhs_clean));
+    }
+    if looks_like_host_path(word) {
+        let stripped = word.trim_matches(|c: char| {
+            matches!(c, '"' | '\'' | '(' | ')' | '[' | ']' | ',' | ';')
+        });
+        let stripped = if stripped.len() > 2 {
+            stripped.trim_end_matches(':')
+        } else {
+            stripped
+        };
+        return sanitize_basename_str(stripped);
+    }
+    word.to_string()
+}
+
+/// Sanitizes diagnostic text so embedded host-absolute paths and control characters
+/// never leak into serialized reports or error summaries.
+pub fn sanitize_diagnostic_text(raw: &str) -> String {
+    let normalized: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_control() {
+                if matches!(c, '\n' | '\r' | '\t') {
+                    ' '
+                } else {
+                    '\0'
+                }
+            } else {
+                c
+            }
+        })
+        .filter(|&c| c != '\0')
+        .collect();
+
+    let words: Vec<String> = normalized
+        .split_whitespace()
+        .map(sanitize_single_word)
+        .collect();
+
+    if words.is_empty() {
+        "unknown".to_string()
+    } else {
+        words.join(" ")
+    }
+}
+
+/// Formats an `io::Error` for diagnostics using only the sanitized basename of `target`
+/// and a fixed error-kind code (never exposing host directory paths or raw OS strings).
+pub fn format_sanitized_io_error(context: &str, target: &Path, err: &io::Error) -> String {
+    let safe_context = sanitize_diagnostic_text(context);
+    let label = sanitize_basename(target);
+    let kind = sanitized_io_kind(err);
+    format!("{safe_context} ({label}): {kind}")
+}
+
+/// Checked `u64` byte-size accumulation across an iterator of sizes.
+/// Returns `None` if the sum would overflow `u64::MAX`.
+pub fn checked_sum_bytes<I>(sizes: I) -> Option<u64>
+where
+    I: IntoIterator<Item = u64>,
+{
+    sizes
+        .into_iter()
+        .try_fold(0u64, |acc, size| acc.checked_add(size))
+}
+
+/// Saturating `u64` byte-size accumulation across an iterator of sizes.
+/// Never wraps or panics on overflow; clamps to `u64::MAX`.
+pub fn saturating_sum_bytes<I>(sizes: I) -> u64
+where
+    I: IntoIterator<Item = u64>,
+{
+    sizes
+        .into_iter()
+        .fold(0u64, |acc, size| acc.saturating_add(size))
 }
 
 /// Probes a single file read-only to determine whether it is incomplete or completed
@@ -485,19 +689,19 @@ pub fn probe_file(path: &Path, size: u64) -> FileProbe {
     // 2. Magic-based classification for completed files.
     if prefix.len() >= 4 {
         let magic4 = [prefix[0], prefix[1], prefix[2], prefix[3]];
-        if magic4 == RPF9_MAGIC {
+        if magic4 == RPF9_MAGIC || magic4 == RPF9_MAGIC_LE {
             return FileProbe::Complete {
                 category: FileCategory::RpfArchive,
                 format_tag: Some("RPF9".to_string()),
             };
         }
-        if magic4 == RPF8_MAGIC {
+        if magic4 == RPF8_MAGIC || magic4 == RPF8_MAGIC_LE {
             return FileProbe::Complete {
                 category: FileCategory::RpfArchive,
                 format_tag: Some("RPF8".to_string()),
             };
         }
-        if magic4 == RPF7_MAGIC {
+        if magic4 == RPF7_MAGIC || magic4 == RPF7_MAGIC_LE {
             return FileProbe::Complete {
                 category: FileCategory::RpfArchive,
                 format_tag: Some("RPF7".to_string()),
@@ -585,65 +789,138 @@ pub fn is_file_complete(path: &Path, size: u64) -> bool {
 
 fn normalize_rel_path(root: &Path, path: &Path) -> Option<String> {
     let rel = path.strip_prefix(root).ok()?;
-    Some(rel.to_string_lossy().replace('\\', "/"))
+    let mut parts: Vec<String> = Vec::new();
+    for component in rel.components() {
+        match component {
+            Component::Normal(seg) => {
+                let cleaned = strip_control_chars(&seg.to_string_lossy());
+                if !cleaned.is_empty() {
+                    parts.push(cleaned);
+                }
+            }
+            Component::CurDir => {}
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir => {
+                return None;
+            }
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
+}
+
+fn canonical_dir_key(dir: &Path) -> PathBuf {
+    fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
 }
 
 fn scan_dir_recursive(
     root: &Path,
     dir: &Path,
-    completed: &mut Vec<ScannedFile>,
-    incomplete: &mut Vec<IncompleteFile>,
+    depth: usize,
+    visited_dirs: &mut BTreeSet<PathBuf>,
+    completed: &mut BTreeMap<String, ScannedFile>,
+    incomplete: &mut BTreeMap<String, IncompleteFile>,
     skipped_dirs: &mut usize,
 ) {
     let entries = match fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(_) => {
-            *skipped_dirs += 1;
+            *skipped_dirs = skipped_dirs.saturating_add(1);
             return;
         }
     };
 
+    // Collect immediate directory children in deterministic lexicographical order
+    // before inspecting metadata or recursing.
+    let mut sorted_entries: BTreeMap<String, PathBuf> = BTreeMap::new();
     for entry_res in entries {
         let Ok(entry) = entry_res else {
             continue;
         };
         let path = entry.path();
-        let meta = match entry.metadata() {
+        let Some(rel_path) = normalize_rel_path(root, &path) else {
+            continue;
+        };
+        sorted_entries.insert(rel_path, path);
+    }
+
+    for (rel_path, path) in sorted_entries {
+        let sym_meta = match fs::symlink_metadata(&path) {
             Ok(m) => m,
             Err(err) => {
-                if let Some(rel_path) = normalize_rel_path(root, &path) {
-                    incomplete.push(IncompleteFile {
+                incomplete.insert(
+                    rel_path.clone(),
+                    IncompleteFile {
                         rel_path,
                         size: 0,
                         reason: IncompleteReason::Unreadable(sanitized_io_kind(&err)),
-                    });
-                }
+                    },
+                );
                 continue;
             }
         };
 
-        if meta.is_dir() {
-            scan_dir_recursive(root, &path, completed, incomplete, skipped_dirs);
-        } else if meta.is_file() {
-            let Some(rel_path) = normalize_rel_path(root, &path) else {
+        // Never follow symlinks: prevents symlink cycles and host-filesystem escapes.
+        if sym_meta.file_type().is_symlink() {
+            let points_to_dir_or_loop = sym_meta.is_dir()
+                || match fs::metadata(&path) {
+                    Ok(target_meta) => target_meta.is_dir(),
+                    Err(_) => true,
+                };
+            if points_to_dir_or_loop {
+                *skipped_dirs = skipped_dirs.saturating_add(1);
+            }
+            continue;
+        }
+
+        if sym_meta.is_dir() {
+            if depth >= MAX_SCAN_DEPTH {
+                *skipped_dirs = skipped_dirs.saturating_add(1);
                 continue;
-            };
-            let size = meta.len();
+            }
+            let dir_key = canonical_dir_key(&path);
+            if !visited_dirs.insert(dir_key) {
+                *skipped_dirs = skipped_dirs.saturating_add(1);
+                continue;
+            }
+            scan_dir_recursive(
+                root,
+                &path,
+                depth.saturating_add(1),
+                visited_dirs,
+                completed,
+                incomplete,
+                skipped_dirs,
+            );
+        } else if sym_meta.is_file() {
+            let size = sym_meta.len();
             match probe_file(&path, size) {
                 FileProbe::Complete {
                     category,
                     format_tag,
-                } => completed.push(ScannedFile {
-                    rel_path,
-                    size,
-                    category,
-                    format_tag,
-                }),
-                FileProbe::Incomplete(reason) => incomplete.push(IncompleteFile {
-                    rel_path,
-                    size,
-                    reason,
-                }),
+                } => {
+                    completed.insert(
+                        rel_path.clone(),
+                        ScannedFile {
+                            rel_path,
+                            size,
+                            category,
+                            format_tag,
+                        },
+                    );
+                }
+                FileProbe::Incomplete(reason) => {
+                    incomplete.insert(
+                        rel_path.clone(),
+                        IncompleteFile {
+                            rel_path,
+                            size,
+                            reason,
+                        },
+                    );
+                }
             }
         }
     }
@@ -779,41 +1056,21 @@ fn build_next_steps(completed: &[ScannedFile], incomplete: &[IncompleteFile]) ->
     steps
 }
 
-/// Scans `root` read-only, classifying completed vs in-progress/sparse/unreadable files.
-pub fn scan_directory(root: &Path) -> io::Result<ScanReport> {
-    let meta = fs::metadata(root)?;
-    if !meta.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "scan target is not a directory",
-        ));
-    }
-
-    let mut completed = Vec::new();
-    let mut incomplete = Vec::new();
-    let mut skipped_dirs = 0usize;
-
-    scan_dir_recursive(
-        root,
-        root,
-        &mut completed,
-        &mut incomplete,
-        &mut skipped_dirs,
-    );
-
-    completed.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
-    incomplete.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
-
+fn build_scan_report(
+    completed: Vec<ScannedFile>,
+    incomplete: Vec<IncompleteFile>,
+    skipped_dirs: usize,
+) -> ScanReport {
     let completed_count = completed.len();
-    let completed_bytes: u64 = completed.iter().map(|f| f.size).sum();
+    let completed_bytes = saturating_sum_bytes(completed.iter().map(|f| f.size));
     let incomplete_count = incomplete.len();
-    let incomplete_bytes: u64 = incomplete.iter().map(|f| f.size).sum();
-    let total_files = completed_count + incomplete_count;
+    let incomplete_bytes = saturating_sum_bytes(incomplete.iter().map(|f| f.size));
+    let total_files = completed_count.saturating_add(incomplete_count);
     let total_bytes = completed_bytes.saturating_add(incomplete_bytes);
 
     let next_steps = build_next_steps(&completed, &incomplete);
 
-    Ok(ScanReport {
+    ScanReport {
         total_files,
         total_bytes,
         completed_count,
@@ -824,7 +1081,50 @@ pub fn scan_directory(root: &Path) -> io::Result<ScanReport> {
         completed,
         incomplete,
         next_steps,
-    })
+    }
+}
+
+/// Scans `root` read-only with deterministic sorted traversal, symlink-loop protection,
+/// saturating `u64` byte accounting, and sanitized diagnostics (never exposing host paths).
+pub fn scan_directory(root: &Path) -> io::Result<ScanReport> {
+    let meta = fs::metadata(root).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format_sanitized_io_error("scan target inaccessible", root, &err),
+        )
+    })?;
+    if !meta.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "scan target ({}) is not a directory",
+                sanitize_basename(root)
+            ),
+        ));
+    }
+
+    let mut visited_dirs: BTreeSet<PathBuf> = BTreeSet::new();
+    visited_dirs.insert(canonical_dir_key(root));
+
+    let mut completed_map: BTreeMap<String, ScannedFile> = BTreeMap::new();
+    let mut incomplete_map: BTreeMap<String, IncompleteFile> = BTreeMap::new();
+    let mut skipped_dirs = 0usize;
+
+    scan_dir_recursive(
+        root,
+        root,
+        0,
+        &mut visited_dirs,
+        &mut completed_map,
+        &mut incomplete_map,
+        &mut skipped_dirs,
+    );
+
+    Ok(build_scan_report(
+        completed_map.into_values().collect(),
+        incomplete_map.into_values().collect(),
+        skipped_dirs,
+    ))
 }
 
 pub fn format_bytes(bytes: u64) -> String {
@@ -844,12 +1144,46 @@ pub fn format_bytes(bytes: u64) -> String {
 }
 
 impl ScanReport {
+    /// Builds a deterministic, sanitized [`ScanReport`] from arbitrary entry lists using
+    /// `BTreeMap` ordering/deduplication and saturating `u64` byte totals.
+    pub fn from_entries(
+        completed: Vec<ScannedFile>,
+        incomplete: Vec<IncompleteFile>,
+        skipped_dirs: usize,
+    ) -> Self {
+        let mut completed_map: BTreeMap<String, ScannedFile> = BTreeMap::new();
+        for mut file in completed {
+            file.rel_path = sanitize_relative_label(&file.rel_path);
+            completed_map.insert(file.rel_path.clone(), file);
+        }
+
+        let mut incomplete_map: BTreeMap<String, IncompleteFile> = BTreeMap::new();
+        for mut file in incomplete {
+            file.rel_path = sanitize_relative_label(&file.rel_path);
+            incomplete_map.insert(file.rel_path.clone(), file);
+        }
+
+        build_scan_report(
+            completed_map.into_values().collect(),
+            incomplete_map.into_values().collect(),
+            skipped_dirs,
+        )
+    }
+
+    /// Computes the exact checked total byte count across completed and incomplete files,
+    /// returning `None` if the sum would overflow `u64::MAX`.
+    pub fn checked_total_bytes(&self) -> Option<u64> {
+        let completed = checked_sum_bytes(self.completed.iter().map(|f| f.size))?;
+        let incomplete = checked_sum_bytes(self.incomplete.iter().map(|f| f.size))?;
+        completed.checked_add(incomplete)
+    }
+
     pub fn category_stats(&self, category: FileCategory) -> (usize, u64) {
         let mut count = 0usize;
         let mut bytes = 0u64;
         for f in &self.completed {
             if f.category == category {
-                count += 1;
+                count = count.saturating_add(1);
                 bytes = bytes.saturating_add(f.size);
             }
         }
@@ -910,13 +1244,14 @@ impl ScanReport {
                 } else {
                     ","
                 };
+                let safe_path = sanitize_relative_label(&file.rel_path);
                 let format_field = match &file.format_tag {
-                    Some(tag) => format!("\"{}\"", json_escape(tag)),
+                    Some(tag) => format!("\"{}\"", json_escape(&sanitize_diagnostic_text(tag))),
                     None => "null".to_string(),
                 };
                 out.push_str(&format!(
                     "    {{\"path\": \"{}\", \"size\": {}, \"category\": \"{}\", \"format\": {}}}{}\n",
-                    json_escape(&file.rel_path),
+                    json_escape(&safe_path),
                     file.size,
                     file.category.json_key(),
                     format_field,
@@ -936,9 +1271,10 @@ impl ScanReport {
                 } else {
                     ","
                 };
+                let safe_path = sanitize_relative_label(&file.rel_path);
                 out.push_str(&format!(
                     "    {{\"path\": \"{}\", \"size\": {}, \"reason\": \"{}\", \"detail\": \"{}\"}}{}\n",
-                    json_escape(&file.rel_path),
+                    json_escape(&safe_path),
                     file.size,
                     file.reason.json_code(),
                     json_escape(&file.reason.detail()),
@@ -966,14 +1302,14 @@ impl ScanReport {
                 ));
                 out.push_str(&format!(
                     "      \"command\": \"{}\",\n",
-                    json_escape(&step.command)
+                    json_escape(&sanitize_diagnostic_text(&step.command))
                 ));
                 out.push_str("      \"ready_files\": [");
                 for (f_idx, rel) in step.ready_files.iter().enumerate() {
                     if f_idx > 0 {
                         out.push_str(", ");
                     }
-                    out.push_str(&format!("\"{}\"", json_escape(rel)));
+                    out.push_str(&format!("\"{}\"", json_escape(&sanitize_relative_label(rel))));
                 }
                 out.push_str("]\n");
                 out.push_str(&format!("    }}{comma}\n"));
@@ -1036,7 +1372,7 @@ impl ScanReport {
             for file in self.incomplete.iter().take(MAX_LISTED) {
                 out.push_str(&format!(
                     "  [incomplete] {} ({}) - {}\n",
-                    file.rel_path,
+                    sanitize_relative_label(&file.rel_path),
                     format_bytes(file.size),
                     file.reason
                 ));
@@ -1053,11 +1389,11 @@ impl ScanReport {
         for (idx, step) in self.next_steps.iter().enumerate() {
             out.push_str(&format!("  {}. {}\n", idx + 1, step.title));
             if !step.ready_files.is_empty() {
-                let shown: Vec<&str> = step
+                let shown: Vec<String> = step
                     .ready_files
                     .iter()
                     .take(5)
-                    .map(String::as_str)
+                    .map(|rel| sanitize_relative_label(rel))
                     .collect();
                 let suffix = if step.ready_files.len() > 5 {
                     format!(" (+{} more)", step.ready_files.len() - 5)
@@ -1066,7 +1402,10 @@ impl ScanReport {
                 };
                 out.push_str(&format!("     Ready: {}{}\n", shown.join(", "), suffix));
             }
-            out.push_str(&format!("     Run  : {}\n", step.command));
+            out.push_str(&format!(
+                "     Run  : {}\n",
+                sanitize_diagnostic_text(&step.command)
+            ));
         }
 
         out
@@ -1460,5 +1799,413 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deterministic_sorted_traversal_and_repeated_scans_match_byte_for_byte() {
+        let dir = unique_temp_dir("deterministic_traversal");
+        let game = dir.join("game");
+        fs::create_dir_all(game.join("z_dir")).unwrap();
+        fs::create_dir_all(game.join("a_dir").join("deep")).unwrap();
+        fs::create_dir_all(game.join("b_dir")).unwrap();
+
+        // Populate files in deliberately unsorted creation order.
+        fs::write(game.join("z_dir").join("b.rpf"), make_synthetic_rpf9()).unwrap();
+        fs::write(game.join("z_dir").join("a.rpf"), make_synthetic_rpf9()).unwrap();
+        fs::write(game.join("m_file.txt"), b"hello").unwrap();
+        fs::write(game.join("a_dir").join("deep").join("c.meta"), b"<meta/>").unwrap();
+
+        // Real Xbox Series little-endian 9FPR magic should classify as RPF9.
+        let mut rpf9_le = vec![0u8; 64];
+        rpf9_le[0..4].copy_from_slice(&RPF9_MAGIC_LE);
+        fs::write(game.join("b_dir").join("real_le.rpf"), &rpf9_le).unwrap();
+
+        // Unsorted incomplete files.
+        fs::write(game.join("z_dir").join("partial.rpf.part"), b"chunk").unwrap();
+        fs::write(game.join("a_dir").join("zero.rpf"), vec![0u8; 64]).unwrap();
+
+        let first = scan_directory(&game).unwrap();
+        let second = scan_directory(&game).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.to_json(), second.to_json());
+        assert_eq!(first.format_human(), second.format_human());
+
+        let completed_paths: Vec<&str> = first
+            .completed
+            .iter()
+            .map(|f| f.rel_path.as_str())
+            .collect();
+        assert_eq!(
+            completed_paths,
+            vec![
+                "a_dir/deep/c.meta",
+                "b_dir/real_le.rpf",
+                "m_file.txt",
+                "z_dir/a.rpf",
+                "z_dir/b.rpf",
+            ]
+        );
+        let le_entry = first
+            .completed
+            .iter()
+            .find(|f| f.rel_path == "b_dir/real_le.rpf")
+            .unwrap();
+        assert_eq!(le_entry.category, FileCategory::RpfArchive);
+        assert_eq!(le_entry.format_tag.as_deref(), Some("RPF9"));
+
+        let incomplete_paths: Vec<&str> = first
+            .incomplete
+            .iter()
+            .map(|f| f.rel_path.as_str())
+            .collect();
+        assert_eq!(
+            incomplete_paths,
+            vec!["a_dir/zero.rpf", "z_dir/partial.rpf.part"]
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn symlink_and_cycle_guard_prevents_infinite_recursion() {
+        let dir = unique_temp_dir("cycle_guard");
+        let game = dir.join("game");
+        let sub = game.join("sub");
+        let nested = sub.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(game.join("root.txt"), b"root").unwrap();
+        fs::write(nested.join("leaf.txt"), b"leaf").unwrap();
+
+        // 1. Pre-seeding `visited_dirs` with `sub`'s canonical key simulates a directory
+        //    alias/cycle deterministically on all platforms (even without symlink privileges).
+        let mut visited = BTreeSet::new();
+        visited.insert(canonical_dir_key(&game));
+        visited.insert(canonical_dir_key(&sub));
+        let mut completed = BTreeMap::new();
+        let mut incomplete = BTreeMap::new();
+        let mut skipped_dirs = 0usize;
+
+        scan_dir_recursive(
+            &game,
+            &game,
+            0,
+            &mut visited,
+            &mut completed,
+            &mut incomplete,
+            &mut skipped_dirs,
+        );
+        assert_eq!(skipped_dirs, 1);
+        assert!(completed.contains_key("root.txt"));
+        assert!(!completed.contains_key("sub/nested/leaf.txt"));
+
+        // 2. Depth cap prevents unbounded recursion at `MAX_SCAN_DEPTH`.
+        let mut visited_depth = BTreeSet::new();
+        visited_depth.insert(canonical_dir_key(&game));
+        let mut completed_depth = BTreeMap::new();
+        let mut incomplete_depth = BTreeMap::new();
+        let mut skipped_depth = 0usize;
+        scan_dir_recursive(
+            &game,
+            &game,
+            MAX_SCAN_DEPTH,
+            &mut visited_depth,
+            &mut completed_depth,
+            &mut incomplete_depth,
+            &mut skipped_depth,
+        );
+        assert_eq!(skipped_depth, 1);
+        assert!(completed_depth.contains_key("root.txt"));
+        assert!(!completed_depth.contains_key("sub/nested/leaf.txt"));
+
+        // 3. When the OS permits creating a real directory symlink loop, verify
+        //    `scan_directory` terminates cleanly, skips the symlink, and never duplicates files.
+        let loop_link = sub.join("loop_to_root");
+        #[cfg(unix)]
+        let symlink_res = std::os::unix::fs::symlink(&game, &loop_link);
+        #[cfg(windows)]
+        let symlink_res = std::os::windows::fs::symlink_dir(&game, &loop_link);
+
+        if symlink_res.is_ok() {
+            let report = scan_directory(&game).unwrap();
+            assert_eq!(report.completed_count, 2);
+            assert_eq!(report.incomplete_count, 0);
+            assert!(report.skipped_dirs >= 1);
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_directory_and_nested_empty_subdirs_produce_clean_report() {
+        let dir = unique_temp_dir("empty_dirs");
+        let empty_root = dir.join("empty_root");
+        fs::create_dir_all(&empty_root).unwrap();
+
+        let report = scan_directory(&empty_root).unwrap();
+        assert_eq!(report.total_files, 0);
+        assert_eq!(report.total_bytes, 0);
+        assert_eq!(report.completed_count, 0);
+        assert_eq!(report.completed_bytes, 0);
+        assert_eq!(report.incomplete_count, 0);
+        assert_eq!(report.incomplete_bytes, 0);
+        assert_eq!(report.skipped_dirs, 0);
+        assert_eq!(report.checked_total_bytes(), Some(0));
+        assert!(
+            report
+                .next_steps
+                .iter()
+                .any(|step| step.id == "wait-for-downloads")
+        );
+
+        let json = report.to_json();
+        assert!(json.contains("\"total_files\": 0"));
+        assert!(json.contains("\"completed\": [],"));
+        assert!(json.contains("\"incomplete\": [],"));
+        assert!(!json.contains(&empty_root.to_string_lossy().to_string()));
+
+        let human = report.format_human();
+        assert!(human.contains("(none yet)"));
+        assert!(!human.contains(&empty_root.to_string_lossy().to_string()));
+
+        // Nested empty subdirectories only.
+        let nested_empty = dir.join("nested_empty");
+        fs::create_dir_all(nested_empty.join("a").join("b")).unwrap();
+        fs::create_dir_all(nested_empty.join("c")).unwrap();
+        let nested_report = scan_directory(&nested_empty).unwrap();
+        assert_eq!(nested_report.total_files, 0);
+        assert_eq!(nested_report.total_bytes, 0);
+        assert_eq!(nested_report.skipped_dirs, 0);
+        assert_eq!(nested_report.checked_total_bytes(), Some(0));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checked_and_saturating_byte_totals_guard_against_u64_overflow() {
+        assert_eq!(checked_sum_bytes([]), Some(0));
+        assert_eq!(checked_sum_bytes([100, 200, 300]), Some(600));
+        assert_eq!(checked_sum_bytes([u64::MAX, 0]), Some(u64::MAX));
+        assert_eq!(checked_sum_bytes([u64::MAX, 1]), None);
+        assert_eq!(checked_sum_bytes([u64::MAX - 10, 20]), None);
+
+        assert_eq!(saturating_sum_bytes([]), 0);
+        assert_eq!(saturating_sum_bytes([u64::MAX - 5, 100]), u64::MAX);
+
+        let report = ScanReport::from_entries(
+            vec![
+                ScannedFile {
+                    rel_path: "x64/huge_a.rpf".to_string(),
+                    size: u64::MAX - 10,
+                    category: FileCategory::RpfArchive,
+                    format_tag: Some("RPF9".to_string()),
+                },
+                ScannedFile {
+                    rel_path: "x64/huge_b.rpf".to_string(),
+                    size: 50,
+                    category: FileCategory::RpfArchive,
+                    format_tag: Some("RPF9".to_string()),
+                },
+            ],
+            vec![IncompleteFile {
+                rel_path: "x64/partial.rpf.part".to_string(),
+                size: 100,
+                reason: IncompleteReason::TempSuffix(".part".to_string()),
+            }],
+            0,
+        );
+
+        assert_eq!(report.completed_count, 2);
+        assert_eq!(report.incomplete_count, 1);
+        assert_eq!(report.total_files, 3);
+        assert_eq!(report.completed_bytes, u64::MAX);
+        assert_eq!(report.incomplete_bytes, 100);
+        assert_eq!(report.total_bytes, u64::MAX);
+        assert_eq!(report.checked_total_bytes(), None);
+        assert_eq!(
+            report.category_stats(FileCategory::RpfArchive),
+            (2, u64::MAX)
+        );
+
+        let json = report.to_json();
+        assert!(json.contains(&format!("\"total_bytes\": {}", u64::MAX)));
+        let human = report.format_human();
+        assert!(human.contains("GiB"));
+    }
+
+    #[test]
+    fn sanitizes_host_paths_in_labels_and_serialized_reports() {
+        assert_eq!(
+            sanitize_basename_str("/Users/alice/secret/Games/GTA6"),
+            "GTA6"
+        );
+        assert_eq!(
+            sanitize_basename_str("/Users/alice/secret/Games/GTA6/"),
+            "GTA6"
+        );
+        assert_eq!(
+            sanitize_basename_str(r"C:\Users\alice\secret\levels.rpf"),
+            "levels.rpf"
+        );
+        assert_eq!(
+            sanitize_basename_str(r"\\server\share\private\audio.awc"),
+            "audio.awc"
+        );
+        assert_eq!(
+            sanitize_basename_str(r"\\?\C:\Users\alice\GTA6.exe"),
+            "GTA6.exe"
+        );
+        assert_eq!(sanitize_basename_str("C:local.rpf"), "local.rpf");
+        assert_eq!(sanitize_basename_str("/"), "<root>");
+        assert_eq!(sanitize_basename_str(r"C:\"), "<root>");
+        assert_eq!(sanitize_basename_str("../.."), "<root>");
+        assert_eq!(sanitize_basename_str(""), "<root>");
+        assert_eq!(
+            sanitize_basename_str("dir/bad\nname\x00.rpf"),
+            "badname.rpf"
+        );
+
+        assert_eq!(
+            sanitize_relative_label("x64\\levels.rpf"),
+            "x64/levels.rpf"
+        );
+        assert_eq!(
+            sanitize_relative_label("./x64//levels.rpf"),
+            "x64/levels.rpf"
+        );
+        assert_eq!(
+            sanitize_relative_label(r"C:\Users\alice\secret\levels.rpf"),
+            "levels.rpf"
+        );
+        assert_eq!(
+            sanitize_relative_label("/home/bob/private/GTA6.exe"),
+            "GTA6.exe"
+        );
+        assert_eq!(
+            sanitize_relative_label("../../Users/alice/secret.bin"),
+            "secret.bin"
+        );
+
+        // Even if manually constructed with host-absolute paths, serialized JSON and human
+        // diagnostics must never leak host directory segments.
+        let dirty_report = ScanReport::from_entries(
+            vec![ScannedFile {
+                rel_path: r"C:\Users\alice\secret\GTA6.exe".to_string(),
+                size: 512,
+                category: FileCategory::PeExecutable,
+                format_tag: Some("PE64/x86-64".to_string()),
+            }],
+            vec![IncompleteFile {
+                rel_path: "/Users/alice/secret/broken.rpf".to_string(),
+                size: 0,
+                reason: IncompleteReason::Unreadable(
+                    r"cannot open C:\Users\alice\secret\broken.rpf".to_string(),
+                ),
+            }],
+            0,
+        );
+
+        let json = dirty_report.to_json();
+        let human = dirty_report.format_human();
+        for forbidden in ["Users", "alice", "secret", r"C:\", "/Users/"] {
+            assert!(
+                !json.contains(forbidden),
+                "JSON leaked host path fragment {forbidden:?}:\n{json}"
+            );
+            assert!(
+                !human.contains(forbidden),
+                "Human report leaked host path fragment {forbidden:?}:\n{human}"
+            );
+        }
+        assert!(json.contains("\"path\": \"GTA6.exe\""));
+        assert!(json.contains("\"path\": \"broken.rpf\""));
+        assert!(json.contains("cannot open broken.rpf"));
+        assert!(json.contains("<GTA6_GAME_DIR>/GTA6.exe"));
+    }
+
+    #[test]
+    fn error_formatting_sanitizes_host_paths_for_missing_and_non_dir_targets() {
+        let dir = unique_temp_dir("error_fmt");
+        let secret_parent = dir.join("secret_host_segment");
+        fs::create_dir_all(&secret_parent).unwrap();
+        let host_prefix = secret_parent.to_string_lossy().to_string();
+
+        // 1. Missing directory target
+        let missing = secret_parent.join("missing_game_dir");
+        let missing_err = scan_directory(&missing).unwrap_err();
+        assert_eq!(missing_err.kind(), io::ErrorKind::NotFound);
+        let missing_msg = missing_err.to_string();
+        assert!(missing_msg.contains("missing_game_dir"));
+        assert!(missing_msg.contains("not_found"));
+        assert!(!missing_msg.contains("secret_host_segment"));
+        assert!(!missing_msg.contains(&host_prefix));
+
+        // 2. Non-directory file target
+        let file_target = secret_parent.join("not_a_dir.rpf");
+        fs::write(&file_target, b"RPF9").unwrap();
+        let file_err = scan_directory(&file_target).unwrap_err();
+        assert_eq!(file_err.kind(), io::ErrorKind::InvalidInput);
+        let file_msg = file_err.to_string();
+        assert!(file_msg.contains("not_a_dir.rpf"));
+        assert!(file_msg.contains("is not a directory"));
+        assert!(!file_msg.contains("secret_host_segment"));
+        assert!(!file_msg.contains(&host_prefix));
+
+        // 3. Direct helper formatting across multiple io::ErrorKind values
+        let cases = [
+            (io::ErrorKind::PermissionDenied, "permission_denied"),
+            (io::ErrorKind::UnexpectedEof, "unexpected_eof"),
+            (io::ErrorKind::InvalidData, "invalid_data"),
+            (io::ErrorKind::Other, "io_error"),
+        ];
+        for (kind, expected_code) in cases {
+            let err = io::Error::new(kind, r"raw host path C:\Users\alice\secret\x.rpf");
+            let formatted = format_sanitized_io_error(
+                "read failed",
+                Path::new(r"C:\Users\alice\secret\archive.rpf"),
+                &err,
+            );
+            assert_eq!(formatted, format!("read failed (archive.rpf): {expected_code}"));
+            assert!(!formatted.contains("alice"));
+            assert!(!formatted.contains("secret"));
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_entries_deduplicates_and_orders_unsorted_inputs_deterministically() {
+        let a = ScannedFile {
+            rel_path: "a/alpha.meta".to_string(),
+            size: 10,
+            category: FileCategory::MetadataOrConfig,
+            format_tag: Some("meta".to_string()),
+        };
+        let b = ScannedFile {
+            rel_path: "b/beta.rpf".to_string(),
+            size: 20,
+            category: FileCategory::RpfArchive,
+            format_tag: Some("RPF9".to_string()),
+        };
+        let z = ScannedFile {
+            rel_path: "z/zeta.exe".to_string(),
+            size: 30,
+            category: FileCategory::PeExecutable,
+            format_tag: Some("PE64/x86-64".to_string()),
+        };
+
+        let report1 = ScanReport::from_entries(vec![z.clone(), a.clone(), b.clone()], vec![], 0);
+        let report2 =
+            ScanReport::from_entries(vec![b.clone(), z.clone(), a.clone(), b.clone()], vec![], 0);
+
+        assert_eq!(report1, report2);
+        assert_eq!(report1.to_json(), report2.to_json());
+        assert_eq!(report1.checked_total_bytes(), Some(60));
+        let paths: Vec<&str> = report1
+            .completed
+            .iter()
+            .map(|f| f.rel_path.as_str())
+            .collect();
+        assert_eq!(paths, vec!["a/alpha.meta", "b/beta.rpf", "z/zeta.exe"]);
     }
 }
