@@ -178,8 +178,11 @@ pub enum WgslBindingSource {
     RootConstants { user_sgpr: u32 },
     /// Root CBV/SRV/UAV descriptor (64-bit GPU VA) starting at `user_sgpr`.
     RootDescriptor { user_sgpr: u32 },
-    /// Inline static sampler S# materialized directly in SGPRs (0-based index in stage order).
+    /// Inline static sampler S# materialized directly in SGPRs (0-based index in stage order;
+    /// fallback when any of the 4 S# descriptor words is not statically known).
     StaticSampler { index: u32 },
+    /// Inline GFX10 S# sampler whose 4 descriptor dwords are statically known constants (#482 / #950).
+    InlineSampler { sdwords: [u32; 4] },
     /// SM 6.6 `SamplerDescriptorHeap[index]` (`SAMPLER_HEAP_DIRECTLY_INDEXED`, 0x800):
     /// 16-byte S# loaded from heap base in `base_user_sgpr` at byte offset derived from `index_user_sgpr`.
     SamplerHeap {
@@ -290,6 +293,13 @@ pub(crate) fn write_wgsl_bindings_json(
                 }
                 WgslBindingSource::StaticSampler { index } => {
                     let _ = write!(out, "{{\"static_sampler\": {index}}}");
+                }
+                WgslBindingSource::InlineSampler { sdwords } => {
+                    let _ = write!(
+                        out,
+                        "{{\"inline_sampler\": {{\"sdwords\": [{}, {}, {}, {}]}}}}",
+                        sdwords[0], sdwords[1], sdwords[2], sdwords[3]
+                    );
                 }
                 WgslBindingSource::SamplerHeap {
                     base_user_sgpr,
@@ -591,6 +601,7 @@ enum ResourceKey {
         user_sgpr: u32,
     },
     StaticSampler(u32),
+    InlineSampler([u32; 4]),
     SamplerHeap {
         base_user_sgpr: u32,
         stride: u32,
@@ -620,6 +631,7 @@ impl ResourceKey {
                 Some(WgslBindingSource::RootDescriptor { user_sgpr })
             }
             Self::StaticSampler(index) => Some(WgslBindingSource::StaticSampler { index }),
+            Self::InlineSampler(sdwords) => Some(WgslBindingSource::InlineSampler { sdwords }),
             Self::SamplerHeap {
                 base_user_sgpr,
                 stride,
@@ -1318,6 +1330,38 @@ fn decode_inline_u32_src(src: u16, literal: Option<u32>) -> Option<i32> {
     }
 }
 
+/// Exact IEEE-754 `f32` bit pattern for GFX10.3 inline float constants (`240..=248`).
+fn decode_inline_float_u32(src: u16) -> Option<u32> {
+    match src {
+        240 => Some(0.5f32.to_bits()),
+        241 => Some((-0.5f32).to_bits()),
+        242 => Some(1.0f32.to_bits()),
+        243 => Some((-1.0f32).to_bits()),
+        244 => Some(2.0f32.to_bits()),
+        245 => Some((-2.0f32).to_bits()),
+        246 => Some(4.0f32.to_bits()),
+        247 => Some((-4.0f32).to_bits()),
+        248 => Some(0x3E22_F983), // 1 / (2 * pi)
+        _ => None,
+    }
+}
+
+/// Exact IEEE-754 `f64` bit pattern for GFX10.3 64-bit inline float constants (`240..=248`).
+fn decode_inline_float_u64(src: u16) -> Option<u64> {
+    match src {
+        240 => Some(0.5f64.to_bits()),
+        241 => Some((-0.5f64).to_bits()),
+        242 => Some(1.0f64.to_bits()),
+        243 => Some((-1.0f64).to_bits()),
+        244 => Some(2.0f64.to_bits()),
+        245 => Some((-2.0f64).to_bits()),
+        246 => Some(4.0f64.to_bits()),
+        247 => Some((-4.0f64).to_bits()),
+        248 => Some(0x3FC4_5F30_6DC9_C883), // 1 / (2 * pi) in IEEE-754 binary64
+        _ => None,
+    }
+}
+
 /// Decode a static wave lane index (`0..=63`) from `v_readlane_b32` / `v_writelane_b32` `src1`.
 /// Returns `None` when `src1` is a dynamic register (SGPR, `m0`, etc.).
 fn decode_const_lane_index(src1: u16, literal: Option<u32>) -> Option<u8> {
@@ -1327,6 +1371,8 @@ fn decode_const_lane_index(src1: u16, literal: Option<u32>) -> Option<u8> {
 fn resolve_const_u32(src: u8, literal: Option<u32>, origins: &[SgprOrigin; 106]) -> Option<u32> {
     if let Some(v) = decode_inline_u32_src(u16::from(src), literal) {
         Some(v as u32)
+    } else if let Some(bits) = decode_inline_float_u32(u16::from(src)) {
+        Some(bits)
     } else if src <= 105
         && let SgprOrigin::ConstImmediate { value: Some(v), .. } = origins[src as usize]
     {
@@ -1390,6 +1436,11 @@ fn resolve_src_origin_u8(
             def_inst_idx: inst_idx,
             value: Some(v as u32),
         }
+    } else if let Some(bits) = decode_inline_float_u32(u16::from(src)) {
+        SgprOrigin::ConstImmediate {
+            def_inst_idx: inst_idx,
+            value: Some(bits),
+        }
     } else if src >= 128 {
         SgprOrigin::ConstImmediate {
             def_inst_idx: inst_idx,
@@ -1432,6 +1483,17 @@ fn resolve_src_pair_origins(
                 value: Some(hi_val),
             },
         )
+    } else if let Some(bits) = decode_inline_float_u64(u16::from(src)) {
+        (
+            SgprOrigin::ConstImmediate {
+                def_inst_idx: inst_idx,
+                value: Some(bits as u32),
+            },
+            SgprOrigin::ConstImmediate {
+                def_inst_idx: inst_idx,
+                value: Some((bits >> 32) as u32),
+            },
+        )
     } else if src >= 128 {
         let c = SgprOrigin::ConstImmediate {
             def_inst_idx: inst_idx,
@@ -1441,6 +1503,23 @@ fn resolve_src_pair_origins(
     } else {
         (SgprOrigin::Unknown, SgprOrigin::Unknown)
     }
+}
+
+/// Extract all 4 statically known GFX10 S# descriptor dwords from `s[samp_sgpr .. samp_sgpr+3]`
+/// when every register in the quad holds `ConstImmediate { value: Some(d), .. }`.
+fn resolve_inline_sampler_sdwords(origins: &[SgprOrigin; 106], samp_sgpr: u8) -> Option<[u32; 4]> {
+    let base = samp_sgpr as usize;
+    if base + 3 >= origins.len() {
+        return None;
+    }
+    let mut sdwords = [0u32; 4];
+    for (i, slot) in sdwords.iter_mut().enumerate() {
+        match origins[base + i] {
+            SgprOrigin::ConstImmediate { value: Some(v), .. } => *slot = v,
+            _ => return None,
+        }
+    }
+    Some(sdwords)
 }
 
 fn is_known_descriptor_or_table(o: SgprOrigin) -> bool {
@@ -2192,6 +2271,62 @@ fn step_origin_state(
                                 _ => (SgprOrigin::Unknown, SgprOrigin::Unknown),
                             }
                         }
+                        0x0C => {
+                            // s_brev_b64
+                            let (src_lo, src_hi) =
+                                resolve_src_pair_origins(*ssrc0, *literal, inst_idx, &state.origins);
+                            match (src_lo, src_hi) {
+                                (
+                                    SgprOrigin::ConstImmediate { value: lo, .. },
+                                    SgprOrigin::ConstImmediate { value: hi, .. },
+                                ) => {
+                                    let rev = lo.zip(hi).map(|(l, h)| {
+                                        ((u64::from(h) << 32) | u64::from(l)).reverse_bits()
+                                    });
+                                    (
+                                        SgprOrigin::ConstImmediate {
+                                            def_inst_idx: inst_idx,
+                                            value: rev.map(|v| v as u32),
+                                        },
+                                        SgprOrigin::ConstImmediate {
+                                            def_inst_idx: inst_idx,
+                                            value: rev.map(|v| (v >> 32) as u32),
+                                        },
+                                    )
+                                }
+                                _ => (SgprOrigin::Unknown, SgprOrigin::Unknown),
+                            }
+                        }
+                        0x1C | 0x1E => {
+                            // s_bitset0_b64 / s_bitset1_b64
+                            let dst_lo = state.origins[*sdst as usize];
+                            let dst_hi = state.origins[(*sdst + 1) as usize];
+                            if let (
+                                SgprOrigin::ConstImmediate { value: lo_v, .. },
+                                SgprOrigin::ConstImmediate { value: hi_v, .. },
+                            ) = (dst_lo, dst_hi)
+                                && is_const_src(*ssrc0, &state.origins)
+                            {
+                                let bit = resolve_const_u32(*ssrc0, *literal, &state.origins);
+                                let val64 = lo_v.zip(hi_v).zip(bit).map(|((l, h), b)| {
+                                    let cur = (u64::from(h) << 32) | u64::from(l);
+                                    let mask = 1u64 << (b & 63);
+                                    if *op == 0x1C { cur & !mask } else { cur | mask }
+                                });
+                                (
+                                    SgprOrigin::ConstImmediate {
+                                        def_inst_idx: inst_idx,
+                                        value: val64.map(|v| v as u32),
+                                    },
+                                    SgprOrigin::ConstImmediate {
+                                        def_inst_idx: inst_idx,
+                                        value: val64.map(|v| (v >> 32) as u32),
+                                    },
+                                )
+                            } else {
+                                (SgprOrigin::Unknown, SgprOrigin::Unknown)
+                            }
+                        }
                         _ => (SgprOrigin::Unknown, SgprOrigin::Unknown),
                     };
                     state.origins[*sdst as usize] = new_lo;
@@ -2586,17 +2721,92 @@ fn step_origin_state(
                             (SgprOrigin::Unknown, SgprOrigin::Unknown)
                         }
                     }
-                    0x13 | 0x17 | 0x19 | 0x1B | 0x1D | 0x21 | 0x23 | 0x29 | 0x2A => {
-                        if matches!(s0_lo, SgprOrigin::ConstImmediate { .. })
-                            && matches!(s0_hi, SgprOrigin::ConstImmediate { .. })
-                            && matches!(s1_lo, SgprOrigin::ConstImmediate { .. })
-                            && (!pair1 || matches!(s1_hi, SgprOrigin::ConstImmediate { .. }))
-                        {
-                            let c = SgprOrigin::ConstImmediate {
+                    0x13 | 0x17 | 0x19 | 0x1B | 0x1D => {
+                        // 64-bit bitwise ops: s_xor_b64, s_orn2_b64, s_nand_b64, s_nor_b64, s_xnor_b64
+                        if *op == 0x13 && *ssrc0 == *ssrc1 && *ssrc0 <= 104 {
+                            let z = SgprOrigin::ConstImmediate {
                                 def_inst_idx: inst_idx,
-                                value: None,
+                                value: Some(0),
                             };
-                            (c, c)
+                            (z, z)
+                        } else if let (
+                            SgprOrigin::ConstImmediate { value: lo0, .. },
+                            SgprOrigin::ConstImmediate { value: hi0, .. },
+                            SgprOrigin::ConstImmediate { value: lo1, .. },
+                            SgprOrigin::ConstImmediate { value: hi1, .. },
+                        ) = (s0_lo, s0_hi, s1_lo, s1_hi)
+                        {
+                            let fold32 = |a: u32, b: u32| match *op {
+                                0x13 => a ^ b,
+                                0x17 => a | !b,
+                                0x19 => !(a & b),
+                                0x1B => !(a | b),
+                                _ => !(a ^ b),
+                            };
+                            (
+                                SgprOrigin::ConstImmediate {
+                                    def_inst_idx: inst_idx,
+                                    value: lo0.zip(lo1).map(|(a, b)| fold32(a, b)),
+                                },
+                                SgprOrigin::ConstImmediate {
+                                    def_inst_idx: inst_idx,
+                                    value: hi0.zip(hi1).map(|(a, b)| fold32(a, b)),
+                                },
+                            )
+                        } else {
+                            (SgprOrigin::Unknown, SgprOrigin::Unknown)
+                        }
+                    }
+                    0x21 | 0x23 | 0x29 | 0x2A => {
+                        // s_lshr_b64, s_ashr_i64, s_bfe_u64, s_bfe_i64
+                        if let (
+                            SgprOrigin::ConstImmediate { value: lo0, .. },
+                            SgprOrigin::ConstImmediate { value: hi0, .. },
+                            SgprOrigin::ConstImmediate { value: s1_v, .. },
+                        ) = (s0_lo, s0_hi, s1_lo)
+                        {
+                            let val64 = lo0.zip(hi0).zip(s1_v).map(|((l, h), s1)| {
+                                let x = (u64::from(h) << 32) | u64::from(l);
+                                match *op {
+                                    0x21 => x.wrapping_shr(s1 & 63),
+                                    0x23 => ((x as i64).wrapping_shr(s1 & 63)) as u64,
+                                    0x29 => {
+                                        let off = s1 & 63;
+                                        let width = (s1 >> 16) & 0x7F;
+                                        if width == 0 {
+                                            0
+                                        } else if width >= 64 {
+                                            x.wrapping_shr(off)
+                                        } else {
+                                            x.wrapping_shr(off) & ((1u64 << width) - 1)
+                                        }
+                                    }
+                                    _ => {
+                                        // 0x2A: s_bfe_i64
+                                        let off = s1 & 63;
+                                        let width = (s1 >> 16) & 0x7F;
+                                        if width == 0 {
+                                            0
+                                        } else if width >= 64 {
+                                            ((x as i64).wrapping_shr(off)) as u64
+                                        } else {
+                                            let sh = 64 - width;
+                                            let ext = x.wrapping_shr(off);
+                                            (((ext.wrapping_shl(sh)) as i64).wrapping_shr(sh)) as u64
+                                        }
+                                    }
+                                }
+                            });
+                            (
+                                SgprOrigin::ConstImmediate {
+                                    def_inst_idx: inst_idx,
+                                    value: val64.map(|v| v as u32),
+                                },
+                                SgprOrigin::ConstImmediate {
+                                    def_inst_idx: inst_idx,
+                                    value: val64.map(|v| (v >> 32) as u32),
+                                },
+                            )
                         } else {
                             (SgprOrigin::Unknown, SgprOrigin::Unknown)
                         }
@@ -2689,15 +2899,35 @@ fn step_origin_state(
                             next_origin = make_scaled_user_sgpr(u0, new_stride);
                         }
                     }
-                    // s_sub_u32 / s_sub_i32: constant fold or table pointer - constant offset.
+                    // s_sub_u32 / s_sub_i32: constant fold, self-sub zero, or table pointer - constant offset.
                     0x01 | 0x03 => {
                         if let (Some(v0), Some(v1)) = (c0, c1) {
                             next_origin = SgprOrigin::ConstImmediate {
                                 def_inst_idx: inst_idx,
                                 value: Some(v0.wrapping_sub(v1)),
                             };
+                        } else if *ssrc0 == *ssrc1 && *ssrc0 <= 105 {
+                            next_origin = SgprOrigin::ConstImmediate {
+                                def_inst_idx: inst_idx,
+                                value: Some(0),
+                            };
                         } else if let Some(imm) = c1 {
                             next_origin = apply_const_offset(src0_origin, (imm as i32).wrapping_neg());
+                        }
+                    }
+                    // s_min_i32 / s_min_u32 / s_max_i32 / s_max_u32
+                    0x06..=0x09 => {
+                        if let (Some(v0), Some(v1)) = (c0, c1) {
+                            let folded = match *op {
+                                0x06 => (v0 as i32).min(v1 as i32) as u32,
+                                0x07 => v0.min(v1),
+                                0x08 => (v0 as i32).max(v1 as i32) as u32,
+                                _ => v0.max(v1),
+                            };
+                            next_origin = SgprOrigin::ConstImmediate {
+                                def_inst_idx: inst_idx,
+                                value: Some(folded),
+                            };
                         }
                     }
                     // s_cselect_b32
@@ -2782,6 +3012,11 @@ fn step_origin_state(
                             next_origin = SgprOrigin::ConstImmediate {
                                 def_inst_idx: inst_idx,
                                 value: Some(folded),
+                            };
+                        } else if *op == 0x12 && *ssrc0 == *ssrc1 && *ssrc0 <= 105 {
+                            next_origin = SgprOrigin::ConstImmediate {
+                                def_inst_idx: inst_idx,
+                                value: Some(0),
                             };
                         } else if is_const_src(*ssrc0, &state.origins)
                             && is_const_src(*ssrc1, &state.origins)
@@ -2897,14 +3132,66 @@ fn step_origin_state(
                             }
                         }
                     }
-                    // Bitfield extract / pack on constants (inline static sampler S#).
-                    0x27 | 0x28 | 0x32..=0x34
+                    // Bitfield extract / pack / absdiff / mul_hi on constants (inline S# sampler).
+                    0x27 | 0x28 | 0x2C | 0x32..=0x36
                         if is_const_src(*ssrc0, &state.origins)
                             && is_const_src(*ssrc1, &state.origins) =>
                     {
+                        let folded = c0.zip(c1).map(|(v0, v1)| match *op {
+                            0x27 => {
+                                // s_bfe_u32: offset = s1[4:0], width = s1[22:16]
+                                let off = v1 & 31;
+                                let width = (v1 >> 16) & 0x7F;
+                                if width == 0 {
+                                    0
+                                } else if width >= 32 {
+                                    v0.wrapping_shr(off)
+                                } else {
+                                    v0.wrapping_shr(off) & ((1u32 << width) - 1)
+                                }
+                            }
+                            0x28 => {
+                                // s_bfe_i32: signed bitfield extract
+                                let off = v1 & 31;
+                                let width = (v1 >> 16) & 0x7F;
+                                if width == 0 {
+                                    0
+                                } else if width >= 32 {
+                                    ((v0 as i32).wrapping_shr(off)) as u32
+                                } else {
+                                    let sh = 32 - width;
+                                    let ext = v0.wrapping_shr(off);
+                                    (((ext.wrapping_shl(sh)) as i32).wrapping_shr(sh)) as u32
+                                }
+                            }
+                            0x2C => {
+                                // s_absdiff_i32
+                                (v0 as i32).wrapping_sub(v1 as i32).wrapping_abs() as u32
+                            }
+                            0x32 => {
+                                // s_pack_ll_b32_b16: (v0[15:0]) | (v1[15:0] << 16)
+                                (v0 & 0x0000_FFFF) | ((v1 & 0x0000_FFFF) << 16)
+                            }
+                            0x33 => {
+                                // s_pack_lh_b32_b16: (v0[15:0]) | (v1[31:16] << 16)
+                                (v0 & 0x0000_FFFF) | (v1 & 0xFFFF_0000)
+                            }
+                            0x34 => {
+                                // s_pack_hh_b32_b16: (v0[31:16]) | (v1[31:16] << 16)
+                                (v0 >> 16) | (v1 & 0xFFFF_0000)
+                            }
+                            0x35 => {
+                                // s_mul_hi_u32
+                                ((u64::from(v0) * u64::from(v1)) >> 32) as u32
+                            }
+                            _ => {
+                                // 0x36: s_mul_hi_i32
+                                ((i64::from(v0 as i32) * i64::from(v1 as i32)) >> 32) as u32
+                            }
+                        });
                         next_origin = SgprOrigin::ConstImmediate {
                             def_inst_idx: inst_idx,
-                            value: None,
+                            value: folded,
                         };
                     }
                     _ => {}
@@ -3280,6 +3567,13 @@ fn step_origin_state(
                                     def_inst_idx: inst_idx,
                                     value: Some(v as u32),
                                 };
+                        } else if let Some(bits) = decode_inline_float_u32(*src0) {
+                            clear_vgpr_origins(state, *vdst);
+                            state.vgpr_uniform_origins[*vdst as usize] =
+                                SgprOrigin::ConstImmediate {
+                                    def_inst_idx: inst_idx,
+                                    value: Some(bits),
+                                };
                         } else {
                             clear_vgpr_origins(state, *vdst);
                         }
@@ -3404,6 +3698,12 @@ fn step_origin_state(
                         def_inst_idx: inst_idx,
                         value: Some(v as u32),
                     };
+                } else if let Some(bits) = decode_inline_float_u32(*src0) {
+                    clear_vgpr_origins(state, *vdst);
+                    state.vgpr_uniform_origins[*vdst as usize] = SgprOrigin::ConstImmediate {
+                        def_inst_idx: inst_idx,
+                        value: Some(bits),
+                    };
                 } else {
                     clear_vgpr_origins(state, *vdst);
                 }
@@ -3443,6 +3743,11 @@ fn step_origin_state(
                         SgprOrigin::ConstImmediate {
                             def_inst_idx: inst_idx,
                             value: Some(v as u32),
+                        }
+                    } else if let Some(bits) = decode_inline_float_u32(*src0) {
+                        SgprOrigin::ConstImmediate {
+                            def_inst_idx: inst_idx,
+                            value: Some(bits),
                         }
                     } else if *src0 >= 128 && *src0 < 256 {
                         SgprOrigin::ConstImmediate {
@@ -3607,17 +3912,25 @@ fn step_origin_state(
                                 }
                                 SgprOrigin::ConstImmediate { def_inst_idx, .. } => {
                                     if !layout.is_get_lod {
-                                        let idx = *col
-                                            .static_sampler_by_def
-                                            .entry(def_inst_idx)
-                                            .or_insert_with(|| {
-                                                let i = col.next_static_sampler_index;
-                                                col.next_static_sampler_index += 1;
-                                                i
-                                            });
-                                        col.out
-                                            .inst_samp_keys
-                                            .insert(inst_idx, ResourceKey::StaticSampler(idx));
+                                        let key = if let Some(sdwords) =
+                                            resolve_inline_sampler_sdwords(
+                                                &state.origins,
+                                                samp_sgpr,
+                                            )
+                                        {
+                                            ResourceKey::InlineSampler(sdwords)
+                                        } else {
+                                            let idx = *col
+                                                .static_sampler_by_def
+                                                .entry(def_inst_idx)
+                                                .or_insert_with(|| {
+                                                    let i = col.next_static_sampler_index;
+                                                    col.next_static_sampler_index += 1;
+                                                    i
+                                                });
+                                            ResourceKey::StaticSampler(idx)
+                                        };
+                                        col.out.inst_samp_keys.insert(inst_idx, key);
                                     }
                                 }
                                 SgprOrigin::RawTableDesc {
@@ -5128,116 +5441,102 @@ fn plan_program(
     let mut vertex_attrs: Vec<VertexInputAttr> = Vec::new();
     let mut legacy_uv_attr_index: Option<usize> = None;
     let vertex_input_mode = if stage == ShaderStage::Vertex {
-        let multi_vgpr_input = read_before_write_vgprs.iter().any(|&v| v >= 1);
-        if has_buffer_fetch || multi_vgpr_input {
-            if vertex_buf_fetches.is_empty() {
-                // Pure multi-VGPR attribute input without MUBUF/MTBUF fetches.
-                vertex_attrs.push(VertexInputAttr {
-                    vb_slot: 0,
-                    byte_offset: None,
-                    location: 0,
-                    name: "position".to_string(),
-                    components: 4,
-                    component_type: "f32",
-                    fetch_format: None,
-                });
+        if has_buffer_fetch && !vertex_buf_fetches.is_empty() {
+            // Map MUBUF/MTBUF vertex fetches deterministically by ascending (vb_slot, byte_offset):
+            //   (0, 0)  -> @location(0) position: vec3 (3-comp) or vec4
+            //   (0, 12) -> @location(1+) color: vec4<f32> (R8G8B8A8_UNORM) or exact integer width
+            //   (0, 16) -> @location(2+) uv: vec2<f32> (R32G32_FLOAT at +16B)
+            //   any other slot/offset -> deterministic sequential @location(N) attr_<offset>
+            let mut next_loc: u32 = 0;
+            for (&(vb_slot, byte_offset), &fetch) in &vertex_buf_fetches {
+                let max_comps = fetch.components;
+                let (location, name, components) = match (vb_slot, byte_offset) {
+                    (0, 0) => {
+                        let loc = next_loc;
+                        next_loc = loc + 1;
+                        let comps = if fetch.component_type != "f32" {
+                            max_comps.clamp(1, 4)
+                        } else if max_comps == 3 {
+                            3
+                        } else {
+                            4
+                        };
+                        (loc, "position".to_string(), comps)
+                    }
+                    (0, 12) => {
+                        let loc = next_loc.max(1);
+                        next_loc = loc + 1;
+                        let comps = if fetch.component_type != "f32" {
+                            max_comps.clamp(1, 4)
+                        } else {
+                            4
+                        };
+                        (loc, "color".to_string(), comps)
+                    }
+                    (0, 16) => {
+                        let loc = next_loc.max(2);
+                        next_loc = loc + 1;
+                        let comps = if fetch.component_type != "f32" {
+                            max_comps.clamp(1, 4)
+                        } else {
+                            2
+                        };
+                        (loc, "uv".to_string(), comps)
+                    }
+                    (0, other) => {
+                        let loc = next_loc;
+                        next_loc = loc + 1;
+                        (loc, format!("attr_{other}"), max_comps.clamp(1, 4))
+                    }
+                    (slot, other) => {
+                        let loc = next_loc;
+                        next_loc = loc + 1;
+                        (loc, format!("vb{slot}_attr_{other}"), max_comps.clamp(1, 4))
+                    }
+                };
+                if location < u32::from(MAX_WEBGPU_LOCATIONS) {
+                    vertex_attrs.push(VertexInputAttr {
+                        vb_slot,
+                        byte_offset: Some(byte_offset),
+                        location,
+                        name,
+                        components,
+                        component_type: fetch.component_type,
+                        fetch_format: fetch.fetch_format,
+                    });
+                }
+            }
+            // Preserve legacy multi-VGPR v4/v5 UV input when the shader reads v4 or v5
+            // before writing and has no explicit offset-16 UV buffer fetch.
+            let reads_legacy_uv =
+                read_before_write_vgprs.contains(&4) || read_before_write_vgprs.contains(&5);
+            if reads_legacy_uv
+                && !vertex_buf_fetches.contains_key(&(0, 16))
+                && next_loc < u32::from(MAX_WEBGPU_LOCATIONS)
+            {
                 legacy_uv_attr_index = Some(vertex_attrs.len());
                 vertex_attrs.push(VertexInputAttr {
                     vb_slot: 0,
                     byte_offset: None,
-                    location: 1,
+                    location: next_loc,
                     name: "uv".to_string(),
                     components: 2,
                     component_type: "f32",
                     fetch_format: None,
                 });
-            } else {
-                // Map MUBUF/MTBUF vertex fetches deterministically by ascending (vb_slot, byte_offset):
-                //   (0, 0)  -> @location(0) position: vec3 (3-comp) or vec4
-                //   (0, 12) -> @location(1+) color: vec4<f32> (R8G8B8A8_UNORM) or exact integer width
-                //   (0, 16) -> @location(2+) uv: vec2<f32> (R32G32_FLOAT at +16B)
-                //   any other slot/offset -> deterministic sequential @location(N) attr_<offset>
-                let mut next_loc: u32 = 0;
-                for (&(vb_slot, byte_offset), &fetch) in &vertex_buf_fetches {
-                    let max_comps = fetch.components;
-                    let (location, name, components) = match (vb_slot, byte_offset) {
-                        (0, 0) => {
-                            let loc = next_loc;
-                            next_loc = loc + 1;
-                            let comps = if fetch.component_type != "f32" {
-                                max_comps.clamp(1, 4)
-                            } else if max_comps == 3 {
-                                3
-                            } else {
-                                4
-                            };
-                            (loc, "position".to_string(), comps)
-                        }
-                        (0, 12) => {
-                            let loc = next_loc.max(1);
-                            next_loc = loc + 1;
-                            let comps = if fetch.component_type != "f32" {
-                                max_comps.clamp(1, 4)
-                            } else {
-                                4
-                            };
-                            (loc, "color".to_string(), comps)
-                        }
-                        (0, 16) => {
-                            let loc = next_loc.max(2);
-                            next_loc = loc + 1;
-                            let comps = if fetch.component_type != "f32" {
-                                max_comps.clamp(1, 4)
-                            } else {
-                                2
-                            };
-                            (loc, "uv".to_string(), comps)
-                        }
-                        (0, other) => {
-                            let loc = next_loc;
-                            next_loc = loc + 1;
-                            (loc, format!("attr_{other}"), max_comps.clamp(1, 4))
-                        }
-                        (slot, other) => {
-                            let loc = next_loc;
-                            next_loc = loc + 1;
-                            (loc, format!("vb{slot}_attr_{other}"), max_comps.clamp(1, 4))
-                        }
-                    };
-                    if location < u32::from(MAX_WEBGPU_LOCATIONS) {
-                        vertex_attrs.push(VertexInputAttr {
-                            vb_slot,
-                            byte_offset: Some(byte_offset),
-                            location,
-                            name,
-                            components,
-                            component_type: fetch.component_type,
-                            fetch_format: fetch.fetch_format,
-                        });
-                    }
-                }
-                // Preserve legacy multi-VGPR v4/v5 UV input when the shader reads v4 or v5
-                // before writing and has no explicit offset-16 UV buffer fetch.
-                let reads_legacy_uv =
-                    read_before_write_vgprs.contains(&4) || read_before_write_vgprs.contains(&5);
-                if reads_legacy_uv
-                    && !vertex_buf_fetches.contains_key(&(0, 16))
-                    && next_loc < u32::from(MAX_WEBGPU_LOCATIONS)
-                {
-                    legacy_uv_attr_index = Some(vertex_attrs.len());
-                    vertex_attrs.push(VertexInputAttr {
-                        vb_slot: 0,
-                        byte_offset: None,
-                        location: next_loc,
-                        name: "uv".to_string(),
-                        components: 2,
-                        component_type: "f32",
-                        fetch_format: None,
-                    });
-                }
             }
-            VertexInputMode::Attributes
+            if vertex_attrs.iter().any(|a| a.byte_offset.is_some()) {
+                VertexInputMode::Attributes
+            } else {
+                vertex_attrs.clear();
+                legacy_uv_attr_index = None;
+                vgprs.insert(0);
+                VertexInputMode::VertexIndex
+            }
         } else {
+            // Buffer-pulling / procedural vertex shaders with zero IA VbDesc vertex fetches
+            // use `@builtin(vertex_index)` only and emit `vertex_input_mode: "vertex_index"`
+            // with no `@location(...)` inputs (S42 / #949).
             vgprs.insert(0);
             VertexInputMode::VertexIndex
         }
@@ -17237,11 +17536,16 @@ mod tests {
             })
         );
         let samp = out.bindings.iter().find(|b| b.kind == "sampler").unwrap();
-        assert_eq!(samp.source, Some(WgslBindingSource::StaticSampler { index: 0 }));
+        assert_eq!(
+            samp.source,
+            Some(WgslBindingSource::InlineSampler {
+                sdwords: [1, 2, 3, 4],
+            })
+        );
         let json = out.to_json();
         assert!(json.contains("\"user_sgpr\": 4, \"table_byte_offset\": 64"));
         assert!(json.contains("\"view_dimension\": \"2d-array\""));
-        assert!(json.contains("\"static_sampler\": 0"));
+        assert!(json.contains("\"inline_sampler\": {\"sdwords\": [1, 2, 3, 4]}"));
         assert_naga_wgsl_valid(&out.wgsl);
     }
 
@@ -17567,8 +17871,13 @@ mod tests {
         let out = translate_as(&words, Rdna2StageOverride::Pixel);
         assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
         let samps: Vec<_> = out.bindings.iter().filter(|b| b.kind == "sampler").collect();
-        assert_eq!(samps.len(), 1, "expected 1 deduplicated static sampler: {:?}", out.bindings);
-        assert_eq!(samps[0].source, Some(WgslBindingSource::StaticSampler { index: 0 }));
+        assert_eq!(samps.len(), 1, "expected 1 deduplicated inline sampler: {:?}", out.bindings);
+        assert_eq!(
+            samps[0].source,
+            Some(WgslBindingSource::InlineSampler {
+                sdwords: [0, 0x00C0_0000, 0x1450_0000, 0],
+            })
+        );
         // All bindings are reflected -> fragment offset +32 applies!
         assert_eq!(samps[0].binding, FRAGMENT_REFLECTED_BINDING_OFFSET + 2);
         assert_naga_wgsl_valid(&out.wgsl);
@@ -18183,18 +18492,36 @@ mod tests {
         );
         assert_naga_wgsl_valid(&out.wgsl);
 
-        // Verify vertex read-before-write tracking: swapping unwritten v2 with v0 marks v2 as read!
+        // Verify vertex read-before-write tracking: swapping unwritten v4 with v0 marks v4 as read!
+        // Without IA MUBUF/MTBUF fetches, vertex_input_mode stays "vertex_index" (S42 / #949),
+        // while with an IA MUBUF fetch, reading unwritten v4 triggers the legacy uv input.
         let mut vs_words = Vec::new();
-        vs_words.push(enc_vop1(0x65, 2, 256 + 0)); // v_swap_b32 v2, v0 (v2 is read before write!)
+        vs_words.push(enc_vop1(0x65, 2, 256 + 0)); // v_swap_b32 v2, v0 (no IA fetch -> vertex_index)
         vs_words.extend_from_slice(&enc_exp(12, 0xF, false, true, false, [0, 1, 2, 3]));
         vs_words.push(enc_sopp(0x01, 0));
         let vs_out = translate_as(&vs_words, Rdna2StageOverride::Vertex);
         assert_eq!(vs_out.unsupported_op_count, 0, "WGSL:\n{}", vs_out.wgsl);
         assert_eq!(
-            vs_out.binding_summary.vertex_input_mode, "attributes",
-            "v_swap_b32 with unwritten vdst>=1 must record read-before-write VGPR"
+            vs_out.binding_summary.vertex_input_mode, "vertex_index",
+            "VS without IA buffer fetches must emit vertex_index mode (S42 / #949)"
         );
+        assert!(vs_out.wgsl.contains("v_2_ = _e"), "WGSL:\n{}", vs_out.wgsl);
         assert_naga_wgsl_valid(&vs_out.wgsl);
+
+        let mut vs_attr_words = Vec::new();
+        vs_attr_words.extend_from_slice(&enc_mubuf(0x03, 0, 0, 0, 1, true)); // buffer_load_format_xyzw
+        vs_attr_words.push(enc_vop1(0x65, 4, 256 + 0)); // v_swap_b32 v4, v0 (v4 read before write!)
+        vs_attr_words.extend_from_slice(&enc_exp(12, 0xF, false, true, false, [0, 1, 2, 3]));
+        vs_attr_words.push(enc_sopp(0x01, 0));
+        let vs_attr_out = translate_as(&vs_attr_words, Rdna2StageOverride::Vertex);
+        assert_eq!(vs_attr_out.unsupported_op_count, 0, "WGSL:\n{}", vs_attr_out.wgsl);
+        assert_eq!(vs_attr_out.binding_summary.vertex_input_mode, "attributes");
+        assert!(
+            vs_attr_out.wgsl.contains("@location(1) uv: vec2<f32>"),
+            "v_swap_b32 with unwritten v4 must record read-before-write VGPR:\n{}",
+            vs_attr_out.wgsl
+        );
+        assert_naga_wgsl_valid(&vs_attr_out.wgsl);
     }
 
     #[test]
@@ -18989,9 +19316,12 @@ mod tests {
                     table_byte_offset: 0x60,
                 })
         }));
-        assert!(samps
-            .iter()
-            .any(|s| s.source == Some(WgslBindingSource::StaticSampler { index: 0 })));
+        assert!(samps.iter().any(|s| {
+            s.source
+                == Some(WgslBindingSource::InlineSampler {
+                    sdwords: [0x105, 0, 0, 0],
+                })
+        }));
         assert_naga_wgsl_valid(&out.wgsl);
     }
 
@@ -19311,6 +19641,221 @@ mod tests {
                 table_byte_offset: 0x40,
             })
         );
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn s42_buffer_pulling_vertex_stage_emits_vertex_index_mode_and_no_bogus_locations() {
+        // Reproduces #949 (1,687 buffer-pulling vertex stages):
+        //   - Loads V# from user-data descriptor table `s8 + 0x20` (`TableDesc`)
+        //   - Synthesizes a root descriptor V# from `s10` (`RootDescriptor`)
+        //   - Pulls vertex data via MUBUF `buffer_load_dwordx4` using `v1` (SV_InstanceID /
+        //     read-before-write VGPR >= 1) and `v0` (SV_VertexID)
+        //   - Zero IA `VbDesc` vertex fetches!
+        // Must emit `vertex_input_mode == "vertex_index"`, empty `vertex_inputs` (omitted in JSON),
+        // `@builtin(vertex_index)` with NO unused `@location(...)` inputs on `vs_main`, and 100%
+        // reflected binding sources.
+        let mut words = Vec::new();
+        words.push(enc_sop1(0x03, 9, 0x80)); // s9 = 0 (zero-extend table ptr s8)
+        words.extend_from_slice(&enc_smem(0x02, 12, 4, 0x7D, 0x20, false, false)); // TableDesc V# @ s8+0x20 -> s[12:15]
+        // Synthesized root descriptor V# in s[16:19] from user SGPR s10
+        words.push(enc_sop1(0x03, 16, 10)); // s16 = s10 (UserTable 10)
+        words.push(enc_sop1(0x03, 17, 0x80)); // s17 = 0
+        words.push(enc_sop1(0x03, 18, 0xFF)); // s18 = 0xFFFFFFFF (num_records)
+        words.push(0xFFFF_FFFF);
+        words.push(enc_sop1(0x03, 19, 0xFF)); // s19 = rsrc_word3
+        words.push(0x3101_4000);
+        // MUBUF buffer_load_dwordx4 (0x0E) offen=1 using vaddr=v1 (reads v1 before write!) from s[12:15]
+        let mubuf1_w0 = (0b111000u32 << 26) | (0x0Eu32 << 18) | (1u32 << 12);
+        let mubuf1_w1 = (0x80u32 << 24) | (3u32 << 16) | (4u32 << 8) | 1u32;
+        words.extend_from_slice(&[mubuf1_w0, mubuf1_w1]);
+        // MUBUF buffer_load_dwordx4 (0x0E) offen=1 using vaddr=v0 from root descriptor s[16:19]
+        let mubuf2_w0 = (0b111000u32 << 26) | (0x0Eu32 << 18) | (1u32 << 12);
+        let mubuf2_w1 = (0x80u32 << 24) | (4u32 << 16) | (8u32 << 8) | 0u32;
+        words.extend_from_slice(&[mubuf2_w0, mubuf2_w1]);
+        words.push(enc_vop2(0x03, 4, 256 + 4, 8)); // v4 += v8
+        words.extend_from_slice(&enc_exp(12, 0xF, false, true, false, [4, 5, 6, 7]));
+        words.push(enc_sopp(0x01, 0));
+
+        let out = translate_as(&words, Rdna2StageOverride::Vertex);
+        assert!(out.naga_validated);
+        assert_eq!(out.stage, ShaderStage::Vertex);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert_eq!(
+            out.binding_summary.vertex_input_mode, "vertex_index",
+            "buffer-pulling VS with zero IA VbDesc fetches must NOT report vertex_input_mode=attributes"
+        );
+        assert!(out.vertex_inputs.is_empty(), "vertex_inputs: {:?}", out.vertex_inputs);
+        assert!(
+            out.wgsl.contains("@builtin(vertex_index)"),
+            "WGSL must declare @builtin(vertex_index):\n{}",
+            out.wgsl
+        );
+        assert!(
+            !out.wgsl.contains("struct VsIn"),
+            "buffer-pulling VS must not declare unused VsIn @location inputs:\n{}",
+            out.wgsl
+        );
+        assert!(
+            !out.wgsl.contains("@location(0) position"),
+            "buffer-pulling VS must not declare synthetic @location(0) position:\n{}",
+            out.wgsl
+        );
+        assert_eq!(out.bindings.len(), 2, "bindings: {:?}", out.bindings);
+        assert!(
+            out.bindings.iter().all(|b| b.source.is_some()),
+            "every binding must have a reflected source: {:?}",
+            out.bindings
+        );
+        let json = out.to_json();
+        assert!(
+            json.contains("\"vertex_input_mode\": \"vertex_index\""),
+            "JSON:\n{json}"
+        );
+        assert!(!json.contains("\"vertex_inputs\""), "JSON:\n{json}");
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn s43_inline_sampler_sdwords_from_salu_const_ops_and_copies() {
+        // Tests Timon's exact #950 inline S# sampler JSON contract:
+        //   {"inline_sampler": {"sdwords": [d0, d1, d2, d3]}}
+        // Constructs TWO real GFX10 S# descriptors using a broad mix of SALU constant ops:
+        //   Sampler A = [0x92, 0x00F0_0000, 0x0850_0000, 0] (clamp-to-edge bilinear, max LOD 15)
+        //     - d0 via s_movk_i32 + s_or_b32
+        //     - d1 via s_bfm_b32
+        //     - d2 via s_movk_i32 + s_pack_ll_b32_b16
+        //     - d3 via self s_xor_b32 s23, s8, s8 -> 0
+        //     - copied via s_mov_b64 into s[28:31] and reused (must deduplicate to 1 binding!)
+        //   Sampler B = [0x3000, 0x00F0_0000, 0x0400_0000, 0] (comparison sampler)
+        //     - d0/d1 seeded via s_bfm_b64 s[32:33], 4, 52 -> [0, 0x00F0_0000]
+        //     - d0 overwritten via sign-extended negative s_movk_i32 (-16) -> s_not_b32 (0xF) ->
+        //       s_lshl_b32 (, 12) (0xF000) -> s_sub_u32 (, 0xC000) -> 0x3000
+        //     - d2 via inline float constant 244 (2.0f32 = 0x4000_0000) -> s_lshr_b32 (, 4) -> 0x0400_0000
+        //     - d3 via s_bfe_u32 + s_add_u32 + s_and_b32 -> 0
+        //   Also verifies s_pack_lh_b32_b16 and s_pack_hh_b32_b16 constant folding in Sampler C.
+        let mut words = Vec::new();
+        words.push(enc_vintrp(0, 2, 0, 0, 0));
+        words.push(enc_vintrp(0, 3, 0, 1, 0));
+        words.push(enc_sop1(0x03, 9, 0x80)); // s9 = 0
+        words.extend_from_slice(&enc_smem(0x03, 40, 4, 0x7D, 0x00, false, false)); // T# @ s8+0 -> s[40:47]
+
+        // Sampler A in s[20:23]: [0x92, 0x00F0_0000, 0x0850_0000, 0]
+        words.push(enc_sopk(0x00, 20, 0x0090)); // s_movk_i32 s20, 0x0090
+        words.push(enc_sop2(0x10, 20, 20, 128 + 2)); // s_or_b32 s20, s20, 2 -> 0x92
+        words.push(enc_sop2(0x24, 21, 128 + 4, 128 + 20)); // s_bfm_b32 s21, 4, 20 -> 0x00F0_0000
+        words.push(enc_sopk(0x00, 26, 0x0850)); // s_movk_i32 s26, 0x0850
+        words.push(enc_sop2(0x32, 22, 128 + 0, 26)); // s_pack_ll_b32_b16 s22, 0, s26 -> 0x0850_0000
+        words.push(enc_sop2(0x12, 23, 8, 8)); // s_xor_b32 s23, s8, s8 -> 0
+
+        // Copy Sampler A into s[28:31] via s_mov_b64
+        words.push(enc_sop1(0x04, 28, 20)); // s_mov_b64 s[28:29], s[20:21]
+        words.push(enc_sop1(0x04, 30, 22)); // s_mov_b64 s[30:31], s[22:23]
+
+        // Sampler B in s[32:35]: [0x3000, 0x00F0_0000, 0x0400_0000, 0]
+        words.push(enc_sop2(0x25, 32, 128 + 4, 128 + 52)); // s_bfm_b64 s[32:33], 4, 52 -> [0, 0x00F0_0000]
+        words.push(enc_sopk(0x00, 32, (-16i16) as u16)); // s_movk_i32 s32, -16 (0xFFFF_FFF0)
+        words.push(enc_sop1(0x07, 32, 32)); // s_not_b32 s32, s32 -> 0xF
+        words.push(enc_sop2(0x1E, 32, 32, 128 + 12)); // s_lshl_b32 s32, s32, 12 -> 0xF000
+        words.push(enc_sop2(0x01, 32, 32, 0xFF)); // s_sub_u32 s32, s32, 0xC000 -> 0x3000
+        words.push(0x0000_C000);
+        words.push(enc_sop1(0x03, 34, 244)); // s_mov_b32 s34, 2.0 (0x4000_0000)
+        words.push(enc_sop2(0x20, 34, 34, 128 + 4)); // s_lshr_b32 s34, s34, 4 -> 0x0400_0000
+        words.push(enc_sop1(0x03, 35, 0xFF)); // s_mov_b32 s35, 0x1234_5678
+        words.push(0x1234_5678);
+        words.push(enc_sop2(0x27, 35, 35, 0xFF)); // s_bfe_u32 s35, s35, off=8/w=4 -> 0x6
+        words.push(0x0004_0008);
+        words.push(enc_sop2(0x00, 35, 35, 128 + 10)); // s_add_u32 s35, s35, 10 -> 0x10
+        words.push(enc_sop2(0x0E, 35, 35, 128 + 0)); // s_and_b32 s35, s35, 0 -> 0
+
+        // Sampler C in s[36:39]: exercises s_pack_lh_b32_b16 and s_pack_hh_b32_b16
+        words.push(enc_sop1(0x03, 36, 0xFF));
+        words.push(0x1111_0092);
+        words.push(enc_sop1(0x03, 37, 0xFF));
+        words.push(0x00F0_2222);
+        words.push(enc_sop2(0x33, 36, 36, 37)); // s_pack_lh_b32_b16 -> 0x00F0_0092
+        words.push(enc_sop2(0x34, 37, 36, 37)); // s_pack_hh_b32_b16 -> 0x00F0_00F0
+        words.push(enc_sop1(0x03, 38, 128 + 0));
+        words.push(enc_sop1(0x03, 39, 128 + 0));
+
+        // Sample with Sampler A (s[20:23]), copied Sampler A (s[28:31]), Sampler B (s[32:35]), Sampler C (s[36:39])
+        words.extend_from_slice(&enc_mimg(0x27, 0xF, 1, 2, 4, 10, 5)); // ssamp=5 -> s[20:23]
+        words.extend_from_slice(&enc_mimg(0x27, 0xF, 1, 2, 8, 10, 7)); // ssamp=7 -> s[28:31] (dup of A!)
+        words.extend_from_slice(&enc_mimg(0x27, 0xF, 1, 2, 12, 10, 8)); // ssamp=8 -> s[32:35]
+        words.extend_from_slice(&enc_mimg(0x27, 0xF, 1, 2, 16, 10, 9)); // ssamp=9 -> s[36:39]
+        words.push(enc_vop2(0x03, 4, 256 + 4, 8));
+        words.push(enc_vop2(0x03, 4, 256 + 4, 12));
+        words.push(enc_vop2(0x03, 4, 256 + 4, 16));
+        words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [4, 5, 6, 7]));
+        words.push(enc_sopp(0x01, 0));
+
+        let out = translate_as(&words, Rdna2StageOverride::Pixel);
+        assert!(out.naga_validated);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+
+        let samps: Vec<_> = out.bindings.iter().filter(|b| b.kind == "sampler").collect();
+        assert_eq!(
+            samps.len(),
+            3,
+            "copied Sampler A quad must deduplicate; expected 3 distinct inline samplers: {:?}",
+            samps
+        );
+        let sources: Vec<WgslBindingSource> = samps
+            .iter()
+            .map(|s| s.source.expect("sampler must have reflected source"))
+            .collect();
+        assert!(sources.contains(&WgslBindingSource::InlineSampler {
+            sdwords: [0x92, 0x00F0_0000, 0x0850_0000, 0],
+        }));
+        assert!(sources.contains(&WgslBindingSource::InlineSampler {
+            sdwords: [0x3000, 0x00F0_0000, 0x0400_0000, 0],
+        }));
+        assert!(sources.contains(&WgslBindingSource::InlineSampler {
+            sdwords: [0x00F0_0092, 0x00F0_00F0, 0, 0],
+        }));
+
+        let json = out.to_json();
+        assert!(
+            json.contains("\"inline_sampler\": {\"sdwords\": [146, 15728640, 139460608, 0]}"),
+            "JSON:\n{json}"
+        );
+        assert!(
+            json.contains("\"inline_sampler\": {\"sdwords\": [12288, 15728640, 67108864, 0]}"),
+            "JSON:\n{json}"
+        );
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn s43_inline_sampler_with_unknown_word_falls_back_to_static_sampler() {
+        // When word 0 is ConstImmediate but another word in s[20:23] is dynamic/ambiguous
+        // (e.g. s_cselect_b32 between two different constants -> value: None), we must NOT
+        // fabricate sdwords — fall back cleanly to StaticSampler { index: 0 }.
+        let mut words = Vec::new();
+        words.push(enc_vintrp(0, 2, 0, 0, 0));
+        words.push(enc_vintrp(0, 3, 0, 1, 0));
+        words.push(enc_sop1(0x03, 9, 0x80)); // s9 = 0
+        words.extend_from_slice(&enc_smem(0x03, 24, 4, 0x7D, 0x00, false, false)); // T# @ s8+0
+        words.push(enc_sop1(0x03, 20, 128 + 1)); // s20 = 1 (known const)
+        words.push(enc_sopc(0x06, 8, 128 + 0)); // s_cmp_eq_u32 s8, 0
+        words.push(enc_sop2(0x0A, 21, 128 + 2, 128 + 3)); // s_cselect_b32 s21, 2, 3 -> value: None!
+        words.push(enc_sop1(0x03, 22, 128 + 0));
+        words.push(enc_sop1(0x03, 23, 128 + 0));
+        words.extend_from_slice(&enc_mimg(0x27, 0xF, 1, 2, 4, 6, 5)); // ssamp=5 -> s[20:23]
+        words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [4, 5, 6, 7]));
+        words.push(enc_sopp(0x01, 0));
+
+        let out = translate_as(&words, Rdna2StageOverride::Pixel);
+        assert!(out.naga_validated);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        let samp = out.bindings.iter().find(|b| b.kind == "sampler").unwrap();
+        assert_eq!(
+            samp.source,
+            Some(WgslBindingSource::StaticSampler { index: 0 })
+        );
+        let json = out.to_json();
+        assert!(json.contains("\"static_sampler\": 0"), "JSON:\n{json}");
+        assert!(!json.contains("\"inline_sampler\""), "JSON:\n{json}");
         assert_naga_wgsl_valid(&out.wgsl);
     }
 }
