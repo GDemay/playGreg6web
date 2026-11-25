@@ -1447,6 +1447,10 @@ enum class Work : size_t {
     GpuObjectsDeferred,
     GpuObjectsCreatedOnUse,
     GpuObjectsNeverCreated,
+    // Lane-indexed heap bindings (VGPR / waterfall bindless, stage_reflection.h, G62 #482) that
+    // failed their pipeline's reflection join because the bridge has no descriptor arrays yet, per
+    // pipeline state created.
+    ReflectionLaneIndexedUnbound,
     Count
 };
 void count_work(Work w, uint64_t n = 1);
