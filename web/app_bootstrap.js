@@ -1331,6 +1331,9 @@ export class PlayGta6AppHandle {
  * @param {object} [options.inputBridgeOptions]
  * @param {object} [options.storageOptions]
  * @param {object} [options.audioOptions]
+ * @param {object|null} [options.audioEngine]
+ * @param {boolean} [options.holdUntilVisible]
+ * @param {boolean} [options.defaultHoldUntilVisible=false]
  * @param {object} [options.smokeDemoOptions]
  * @returns {PlayGta6AppHandle}
  */
@@ -1439,6 +1442,13 @@ export function bootstrapPlayGta6App(options = {}) {
     }
     if (parsedSplashHold !== null) {
       return parsedSplashHold;
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(options, 'defaultHoldUntilVisible') &&
+      options.defaultHoldUntilVisible !== undefined &&
+      options.defaultHoldUntilVisible !== null
+    ) {
+      return resolveBooleanOverride(options.defaultHoldUntilVisible, false);
     }
     return false;
   })();
@@ -1902,22 +1912,42 @@ export function bootstrapPlayGta6App(options = {}) {
       : hasExplicitWindow
         ? (windowObj && windowObj.AudioWorkletNode) || null
         : undefined;
+  const effectiveAudioContextCtor =
+    resolvedAudioContextCtor !== undefined
+      ? resolvedAudioContextCtor
+      : (windowObj && (windowObj.AudioContext || windowObj.webkitAudioContext)) ||
+        (typeof globalThis !== 'undefined' &&
+          (globalThis.AudioContext || globalThis.webkitAudioContext)) ||
+        null;
+  const effectiveAudioWorkletNodeCtor =
+    resolvedAudioWorkletNodeCtor !== undefined
+      ? resolvedAudioWorkletNodeCtor
+      : (windowObj && windowObj.AudioWorkletNode) ||
+        (typeof globalThis !== 'undefined' && globalThis.AudioWorkletNode) ||
+        null;
+  const hasWebAudioSupport =
+    typeof effectiveAudioContextCtor === 'function' &&
+    typeof effectiveAudioWorkletNodeCtor === 'function';
 
-  const audioEngine = new AudioEngine({
-    ...audioOptions,
-    ...(resolvedAudioContextCtor !== undefined
-      ? { AudioContextCtor: resolvedAudioContextCtor }
-      : {}),
-    ...(resolvedAudioWorkletNodeCtor !== undefined
-      ? { AudioWorkletNodeCtor: resolvedAudioWorkletNodeCtor }
-      : {}),
-    onError: (err) => {
-      crashReporter.recordError('runtime', err, { source: 'audioEngine' });
-      if (userAudioOnError) {
-        userAudioOnError(err);
-      }
-    },
-  });
+  const hasExplicitAudioEngine =
+    options.audioEngine !== undefined && options.audioEngine !== null;
+  const audioEngine = hasExplicitAudioEngine
+    ? options.audioEngine
+    : new AudioEngine({
+        ...audioOptions,
+        ...(resolvedAudioContextCtor !== undefined
+          ? { AudioContextCtor: resolvedAudioContextCtor }
+          : {}),
+        ...(resolvedAudioWorkletNodeCtor !== undefined
+          ? { AudioWorkletNodeCtor: resolvedAudioWorkletNodeCtor }
+          : {}),
+        onError: (err) => {
+          crashReporter.recordError('runtime', err, { source: 'audioEngine' });
+          if (userAudioOnError) {
+            userAudioOnError(err);
+          }
+        },
+      });
 
   // 5b. BootTracer (W40), optional SplashOverlay (W42), PgimPreloader (W41) & BootOrchestrator (W44).
   const bootTracerOptions =
@@ -2324,6 +2354,8 @@ export function bootstrapPlayGta6App(options = {}) {
     const explicitVisible = pickFirstDefinedField(sources, [
       'hasVisibleContent',
       'has_visible_content',
+      'firstVisibleFrame',
+      'first_visible_frame',
     ]);
     if (explicitVisible.found && typeof explicitVisible.value === 'boolean') {
       return {
@@ -2399,10 +2431,35 @@ export function bootstrapPlayGta6App(options = {}) {
     const signal = detectVisibleFrameSignal(data);
     if (signal.isVisible) {
       const effectivePresentCount = Math.max(gpuTelemetry.presentCount, resolveFramesPresented());
+      const sources = collectPlainSources([
+        data,
+        data && data.stats,
+        data && data.gpuStats,
+        data && data.frameStats,
+        data && data.swapchainStats,
+        data && data.swapchain,
+      ]);
+      const blackField = pickFirstDefinedField(sources, ['blackLoadingMs', 'black_loading_ms']);
+      const visibleMsField = pickFirstDefinedField(sources, [
+        'firstVisibleFrameMs',
+        'first_visible_frame_ms',
+      ]);
       notifyFirstVisibleFrame({
         source,
         presents: effectivePresentCount,
         realPackDraws: gpuTelemetry.realPackDrawCount,
+        ...(blackField.found &&
+        typeof blackField.value === 'number' &&
+        Number.isFinite(blackField.value) &&
+        blackField.value >= 0
+          ? { blackLoadingMs: blackField.value }
+          : {}),
+        ...(visibleMsField.found &&
+        typeof visibleMsField.value === 'number' &&
+        Number.isFinite(visibleMsField.value) &&
+        visibleMsField.value >= 0
+          ? { firstVisibleFrameMs: visibleMsField.value }
+          : {}),
         _deferObserverForward: deferObserverForward,
       });
       return true;
@@ -2611,6 +2668,15 @@ export function bootstrapPlayGta6App(options = {}) {
             unboundBindGroupCount: gpuStatsPayload.unboundBindGroupCount,
             skippedDrawCount: gpuStatsPayload.skippedDrawCount,
             validationErrorCount: gpuStatsPayload.validationErrorCount,
+            ...(gpuStatsPayload.gpuAdapter !== undefined
+              ? { gpuAdapter: gpuStatsPayload.gpuAdapter }
+              : {}),
+            ...(gpuStatsPayload.firstVisibleFrameMs !== undefined
+              ? { firstVisibleFrameMs: gpuStatsPayload.firstVisibleFrameMs }
+              : {}),
+            ...(gpuStatsPayload.blackLoadingMs !== undefined
+              ? { blackLoadingMs: gpuStatsPayload.blackLoadingMs }
+              : {}),
           });
         } catch {
           // Ignore HUD metrics errors.
@@ -3155,10 +3221,26 @@ export function bootstrapPlayGta6App(options = {}) {
           toSafeNonNegativeInt(realPackField.value, 0)
         );
       }
+      const rawBlackLoadingMs =
+        data.blackLoadingMs !== undefined ? data.blackLoadingMs : data.black_loading_ms;
+      const rawFirstVisibleFrameMs =
+        data.firstVisibleFrameMs !== undefined
+          ? data.firstVisibleFrameMs
+          : data.first_visible_frame_ms;
       notifyFirstVisibleFrame({
         source: sanitizeDiagnosticText(data.source || data.type, 64) || data.type,
         ...(typeof data.elapsedMs === 'number' && Number.isFinite(data.elapsedMs) && data.elapsedMs >= 0
           ? { elapsedMs: data.elapsedMs }
+          : {}),
+        ...(typeof rawFirstVisibleFrameMs === 'number' &&
+        Number.isFinite(rawFirstVisibleFrameMs) &&
+        rawFirstVisibleFrameMs >= 0
+          ? { firstVisibleFrameMs: rawFirstVisibleFrameMs }
+          : {}),
+        ...(typeof rawBlackLoadingMs === 'number' &&
+        Number.isFinite(rawBlackLoadingMs) &&
+        rawBlackLoadingMs >= 0
+          ? { blackLoadingMs: rawBlackLoadingMs }
           : {}),
         ...(typeof data.fadeDurationMs === 'number' && Number.isFinite(data.fadeDurationMs)
           ? { fadeDurationMs: data.fadeDurationMs }
@@ -3168,6 +3250,10 @@ export function bootstrapPlayGta6App(options = {}) {
           : {}),
       });
       return true;
+    }
+    if (data.type === 'ready' || data.type === 'wgpu-ready') {
+      ingestGpuAdapterFromPayload(data);
+      return data.label === undefined && data.error === undefined && data.metrics === undefined;
     }
     if (
       data.type === 'gpu-adapter' ||
@@ -3386,6 +3472,22 @@ export function bootstrapPlayGta6App(options = {}) {
     gpuTelemetry.loadingAssets = false;
 
     const safeMeta = meta && typeof meta === 'object' && !Array.isArray(meta) ? meta : {};
+    if (safeMeta.gpuAdapter !== undefined || safeMeta.adapterInfo !== undefined) {
+      recordGpuAdapter(safeMeta.gpuAdapter ?? safeMeta.adapterInfo);
+    }
+    const providedBlackLoadingMs =
+      typeof safeMeta.blackLoadingMs === 'number' &&
+      Number.isFinite(safeMeta.blackLoadingMs) &&
+      safeMeta.blackLoadingMs >= 0
+        ? safeMeta.blackLoadingMs
+        : null;
+    const providedFirstVisibleFrameMs =
+      typeof safeMeta.firstVisibleFrameMs === 'number' &&
+      Number.isFinite(safeMeta.firstVisibleFrameMs) &&
+      safeMeta.firstVisibleFrameMs >= 0
+        ? safeMeta.firstVisibleFrameMs
+        : null;
+
     if (bootTracer && typeof bootTracer.recordFirstVisibleFrame === 'function') {
       try {
         const tracerOpts = {};
@@ -3395,6 +3497,24 @@ export function bootstrapPlayGta6App(options = {}) {
           safeMeta.elapsedMs >= 0
         ) {
           tracerOpts.elapsedMs = safeMeta.elapsedMs;
+        } else if (providedBlackLoadingMs !== null && typeof bootTracer.getSummary === 'function') {
+          try {
+            const preSummary = bootTracer.getSummary();
+            if (
+              preSummary &&
+              typeof preSummary.firstPresentMs === 'number' &&
+              Number.isFinite(preSummary.firstPresentMs) &&
+              preSummary.firstPresentMs >= 0
+            ) {
+              tracerOpts.elapsedMs = preSummary.firstPresentMs + providedBlackLoadingMs;
+            } else if (providedFirstVisibleFrameMs !== null) {
+              tracerOpts.elapsedMs = providedFirstVisibleFrameMs;
+            }
+          } catch {
+            // Fall through to tracer default clock.
+          }
+        } else if (providedFirstVisibleFrameMs !== null) {
+          tracerOpts.elapsedMs = providedFirstVisibleFrameMs;
         }
         if (typeof safeMeta.source === 'string' && safeMeta.source.trim().length > 0) {
           tracerOpts.source = sanitizeDiagnosticText(safeMeta.source, 64);
@@ -3450,12 +3570,30 @@ export function bootstrapPlayGta6App(options = {}) {
       }
     }
 
+    if (gpuTelemetry.firstVisibleFrameMs === null && providedFirstVisibleFrameMs !== null) {
+      gpuTelemetry.firstVisibleFrameMs = providedFirstVisibleFrameMs;
+    }
+    if (gpuTelemetry.blackLoadingMs === null && providedBlackLoadingMs !== null) {
+      gpuTelemetry.blackLoadingMs = providedBlackLoadingMs;
+    }
+
     if (splashOverlay) {
       try {
+        const splashMeta = { ...safeMeta };
+        delete splashMeta._deferObserverForward;
+        if (gpuTelemetry.firstVisibleFrameMs !== null) {
+          splashMeta.firstVisibleFrameMs = gpuTelemetry.firstVisibleFrameMs;
+        }
+        if (gpuTelemetry.blackLoadingMs !== null) {
+          splashMeta.blackLoadingMs = gpuTelemetry.blackLoadingMs;
+        }
+        if (gpuTelemetry.gpuAdapter !== null) {
+          splashMeta.gpuAdapter = gpuTelemetry.gpuAdapter;
+        }
         if (typeof splashOverlay.notifyFirstVisibleFrame === 'function') {
-          splashOverlay.notifyFirstVisibleFrame(safeMeta);
+          splashOverlay.notifyFirstVisibleFrame(splashMeta);
         } else if (typeof splashOverlay.dismiss === 'function') {
-          splashOverlay.dismiss(safeMeta);
+          splashOverlay.dismiss(splashMeta);
         }
       } catch {
         // Overlay errors must never interrupt rendering.
@@ -3987,6 +4125,9 @@ export function bootstrapPlayGta6App(options = {}) {
       runner.init();
     }
     notifyFirstPresent({ source: 'smoke_demo' });
+    if (isSplashOverlayHolding()) {
+      notifyFirstVisibleFrame({ source: 'smoke_demo' });
+    }
 
     const cleanupDeviceListeners = () => {
       deviceStopped = true;
@@ -4128,6 +4269,114 @@ export function bootstrapPlayGta6App(options = {}) {
   if (options.autoResize !== false && isEventTargetLike(windowObj)) {
     windowObj.addEventListener('resize', onWindowResize);
     resizeListenerAttached = true;
+  }
+
+  // 8b. First-user-gesture Web Audio unlock (W261 / #1028 live stereo audio).
+  const audioGestureTarget =
+    options.audioGestureTarget !== undefined
+      ? options.audioGestureTarget
+      : isEventTargetLike(windowObj)
+        ? windowObj
+        : isEventTargetLike(documentObj)
+          ? documentObj
+          : null;
+  let audioGestureUnlockAttempted = false;
+  let audioGestureCleanup = null;
+
+  function detachAudioGestureUnlock() {
+    if (!audioGestureCleanup) {
+      return;
+    }
+    const cleanup = audioGestureCleanup;
+    audioGestureCleanup = null;
+    try {
+      cleanup();
+    } catch {
+      // Ignore audio gesture listener removal errors.
+    }
+  }
+
+  function invokeAudioGestureUnlock() {
+    if (destroyed || audioGestureUnlockAttempted || !audioEngine || typeof audioEngine !== 'object') {
+      return;
+    }
+    audioGestureUnlockAttempted = true;
+    detachAudioGestureUnlock();
+
+    const triggerUnlock = () => {
+      if (destroyed || !audioEngine || typeof audioEngine !== 'object') {
+        return;
+      }
+      try {
+        let result;
+        if (typeof audioEngine.unlockOnUserGesture === 'function') {
+          result = audioEngine.unlockOnUserGesture();
+        } else if (typeof audioEngine.unlockOnGesture === 'function') {
+          result = audioEngine.unlockOnGesture();
+        } else if (typeof audioEngine.resume === 'function') {
+          result = audioEngine.resume();
+        }
+        if (result && typeof result.catch === 'function') {
+          result.catch(() => {
+            // Audio unlock rejections must never surface as unhandled rejections.
+          });
+        }
+      } catch {
+        // Audio unlock errors must never interrupt input or rendering.
+      }
+    };
+
+    const needsLazyStart =
+      !hasExplicitAudioEngine &&
+      hasWebAudioSupport &&
+      !audioEngine.context &&
+      audioEngine.state === 'idle' &&
+      typeof audioEngine.start === 'function';
+
+    if (needsLazyStart) {
+      try {
+        Promise.resolve(audioEngine.start())
+          .then(() => {
+            triggerUnlock();
+          })
+          .catch(() => {
+            // Ignore lazy WebAudio startup failures during gesture unlock.
+          });
+      } catch {
+        // Ignore synchronous startup errors.
+      }
+      return;
+    }
+
+    triggerUnlock();
+  }
+
+  if (isEventTargetLike(audioGestureTarget) && audioEngine) {
+    const gestureEvents = ['pointerdown', 'keydown'];
+    const registeredEvents = [];
+    for (let i = 0; i < gestureEvents.length; i += 1) {
+      const evt = gestureEvents[i];
+      try {
+        audioGestureTarget.addEventListener(evt, invokeAudioGestureUnlock, {
+          passive: true,
+          once: true,
+        });
+        registeredEvents.push(evt);
+      } catch {
+        // Ignore listener registration errors in restricted hosts.
+      }
+    }
+    if (registeredEvents.length > 0) {
+      audioGestureCleanup = () => {
+        for (let i = 0; i < registeredEvents.length; i += 1) {
+          try {
+            audioGestureTarget.removeEventListener(registeredEvents[i], invokeAudioGestureUnlock);
+          } catch {
+            // Ignore listener removal errors.
+          }
+        }
+      };
+    }
   }
 
   function resolveCurrentBootMode() {
@@ -4653,6 +4902,8 @@ export function bootstrapPlayGta6App(options = {}) {
         windowObj.removeEventListener('resize', onWindowResize);
       }
 
+      detachAudioGestureUnlock();
+
       stopActiveInputScript();
 
       try {
@@ -4697,7 +4948,9 @@ export function bootstrapPlayGta6App(options = {}) {
       }
 
       try {
-        await audioEngine.destroy();
+        if (audioEngine && typeof audioEngine.destroy === 'function') {
+          await audioEngine.destroy();
+        }
       } catch {
         // Ignore teardown errors.
       }
