@@ -40,8 +40,10 @@
   const DEFAULT_MAX_TRACKED_MISSING_HASHES = 2048;
   const DEFAULT_MAX_CATEGORIZED_MISSING_HASHES = 8192;
   const DEFAULT_MAX_RESOLVE_CACHE_ENTRIES = 8192;
+  const DEFAULT_MAX_COMPILE_FAILURE_ENTRIES = 2048;
   const DEFAULT_TOP_MISSING_LIMIT = 16;
   const DEFAULT_MISSING_SUMMARY_TOP_LIMIT = 32;
+  const SAFE_REASON_TOKEN_REGEX = /^[a-z][a-z0-9_]{0,63}$/;
 
   const ENTRY_POINT_REGEXES = Object.freeze({
     vertex: /@vertex\b[\s\S]*?\bfn\s+([A-Za-z_][A-Za-z0-9_]*)/,
@@ -71,6 +73,7 @@
     not_in_pack: MISSING_SHADER_REASONS.NOT_IN_PACK,
     missing: MISSING_SHADER_REASONS.NOT_IN_PACK,
     missing_from_pack: MISSING_SHADER_REASONS.NOT_IN_PACK,
+    missing_pack_entry: MISSING_SHADER_REASONS.NOT_IN_PACK,
     pack_miss: MISSING_SHADER_REASONS.NOT_IN_PACK,
     reflection_failed: MISSING_SHADER_REASONS.REFLECTION_FAILED,
     reflection_error: MISSING_SHADER_REASONS.REFLECTION_FAILED,
@@ -515,6 +518,113 @@
     return MISSING_SHADER_REASONS.OTHER;
   }
 
+  /**
+   * Sanitize a negative compile-failure reason into a short, safe identifier token
+   * (e.g. `'compile_failed'`, `'missing_pack_entry'`, `'tint_validation_failed'`).
+   * Never preserves host paths, raw WGSL snippets, or unbounded error strings.
+   *
+   * @param {string | null | undefined} reason
+   * @returns {string}
+   */
+  function sanitizeCompileFailureReason(reason) {
+    if (typeof reason !== 'string') {
+      return MISSING_SHADER_REASONS.COMPILE_FAILED;
+    }
+    const normalized = reason
+      .trim()
+      .toLowerCase()
+      .replace(/[\s-]+/g, '_');
+    if (normalized.length === 0) {
+      return MISSING_SHADER_REASONS.COMPILE_FAILED;
+    }
+    if (SAFE_REASON_TOKEN_REGEX.test(normalized)) {
+      return normalized;
+    }
+    const mapped = normalizeMissingReason(reason);
+    return mapped === MISSING_SHADER_REASONS.OTHER
+      ? MISSING_SHADER_REASONS.COMPILE_FAILED
+      : mapped;
+  }
+
+  /**
+   * Deterministically select a built-in fallback WGSL profile from shader stage and
+   * binding signature:
+   * - compute stage -> `'default'` (compute no-op)
+   * - explicit `profile` hint -> `normalizeFallbackProfile(profile)`
+   * - vertex-colored UI / CBV+texture splash pass -> `'splash_rect_24b'`
+   * - textured UI quad / 24-byte vertex stride -> `'textured_quad_24b'`
+   * - fullscreen pass with CBV -> `'fullscreen_triangle_cbv'`
+   * - otherwise -> `'default'`
+   *
+   * @param {number | string} stage
+   * @param {object | null | undefined} [bindingSignature]
+   * @returns {'default' | 'fullscreen_triangle_cbv' | 'textured_quad_24b' | 'splash_rect_24b'}
+   */
+  function selectDeterministicFallbackProfile(stage, bindingSignature) {
+    const stageCode = normalizeStageCode(stage);
+    if (stageCode === SHADER_STAGE.COMPUTE) {
+      return 'default';
+    }
+    if (!bindingSignature || typeof bindingSignature !== 'object') {
+      return 'default';
+    }
+    if (
+      typeof bindingSignature.profile === 'string' &&
+      bindingSignature.profile.trim().length > 0
+    ) {
+      return normalizeFallbackProfile(bindingSignature.profile);
+    }
+
+    const hasCbv =
+      bindingSignature.hasCbv === true ||
+      bindingSignature.hasBoundCbv === true ||
+      bindingSignature.hasUniform === true ||
+      (typeof bindingSignature.cbvCount === 'number' && bindingSignature.cbvCount > 0) ||
+      (typeof bindingSignature.uniformCount === 'number' && bindingSignature.uniformCount > 0);
+
+    const hasTexture =
+      bindingSignature.hasTexture === true ||
+      bindingSignature.hasBoundTexture === true ||
+      bindingSignature.hasSampledTexture === true ||
+      bindingSignature.hasSrv === true ||
+      bindingSignature.hasBoundSrv === true ||
+      (typeof bindingSignature.textureCount === 'number' && bindingSignature.textureCount > 0) ||
+      (typeof bindingSignature.srvCount === 'number' && bindingSignature.srvCount > 0);
+
+    const hasSampler =
+      bindingSignature.hasSampler === true ||
+      bindingSignature.hasBoundSampler === true ||
+      (typeof bindingSignature.samplerCount === 'number' && bindingSignature.samplerCount > 0);
+
+    const hasVertexColor =
+      bindingSignature.hasVertexColor === true ||
+      bindingSignature.hasColor === true ||
+      bindingSignature.hasColorAttribute === true ||
+      bindingSignature.vertexColored === true ||
+      (typeof bindingSignature.attributeCount === 'number' && bindingSignature.attributeCount >= 3);
+
+    const hasVertexStride24 =
+      bindingSignature.vertexStride === 24 ||
+      bindingSignature.arrayStride === 24 ||
+      bindingSignature.stride === 24;
+
+    const isFullscreen =
+      bindingSignature.fullscreen === true ||
+      bindingSignature.isFullscreen === true ||
+      bindingSignature.vertexCount === 3;
+
+    if (hasVertexColor || (hasCbv && (hasTexture || hasSampler))) {
+      return 'splash_rect_24b';
+    }
+    if (hasTexture || hasSampler || hasVertexStride24) {
+      return 'textured_quad_24b';
+    }
+    if (hasCbv || isFullscreen) {
+      return 'fullscreen_triangle_cbv';
+    }
+    return 'default';
+  }
+
   function compareLex(a, b) {
     return a < b ? -1 : a > b ? 1 : 0;
   }
@@ -791,6 +901,7 @@
      *   maxTrackedMissing?: number,
      *   maxCategorizedMissingHashes?: number,
      *   maxResolveCacheEntries?: number,
+     *   maxCompileFailureEntries?: number,
      *   initialFrame?: number,
      *   defaultProfile?: string | null,
      *   realShaders?: Iterable<any> | Map<any, any> | Record<string, any> | null,
@@ -863,6 +974,20 @@
       }
       this._maxResolveCacheEntries = maxResolveCache;
 
+      let maxCompileFailures = DEFAULT_MAX_COMPILE_FAILURE_ENTRIES;
+      if (opts.maxCompileFailureEntries !== undefined) {
+        if (
+          !Number.isInteger(opts.maxCompileFailureEntries) ||
+          opts.maxCompileFailureEntries < 0
+        ) {
+          throw new RangeError(
+            `maxCompileFailureEntries must be a non-negative integer, got ${opts.maxCompileFailureEntries}`
+          );
+        }
+        maxCompileFailures = opts.maxCompileFailureEntries;
+      }
+      this._maxCompileFailureEntries = maxCompileFailures;
+
       const initialFrame =
         opts.initialFrame !== undefined && opts.initialFrame !== null
           ? normalizeFrameNumber(opts.initialFrame)
@@ -913,6 +1038,11 @@
       this._blockedOverrides = new Map();
       this._blockedOverrideCount = 0;
       this._blockedOverflowCount = 0;
+
+      // W268: Bounded negative compile-failure LRU cache keyed by canonical normalized hash.
+      this._compileFailures = new Map();
+      this._compileFailureCacheHits = 0;
+      this._compileFailureRecorded = 0;
 
       if (opts.realShaders !== undefined && opts.realShaders !== null) {
         this._registerInitialRealShaders(opts.realShaders);
@@ -1010,6 +1140,229 @@
         stageCache.delete(entry.key3);
       }
       this._resolveCacheEntries.delete(entry);
+    }
+
+    _evictResolveCacheForHash(hashBigInt, hashHex) {
+      for (let s = 1; s <= 3; s += 1) {
+        const stageCache = this._resolveCacheByStage[s];
+        const entry = stageCache.get(hashBigInt) || stageCache.get(hashHex);
+        if (entry !== undefined) {
+          this._evictResolveCacheEntry(entry);
+        }
+      }
+    }
+
+    _recordCompileFailureEntry(hashBigInt, hashHex, stageName, reason, nowMs) {
+      const sanitizedReason = sanitizeCompileFailureReason(reason);
+      this._compileFailureRecorded += 1;
+      if (this._isConfiguredFallbackHash(hashBigInt)) {
+        this._clearResolveCache();
+      } else {
+        this._evictResolveCacheForHash(hashBigInt, hashHex);
+      }
+
+      if (this._maxCompileFailureEntries <= 0) {
+        return null;
+      }
+
+      const existing = this._compileFailures.get(hashHex);
+      if (existing !== undefined) {
+        existing.count += 1;
+        existing.reason = sanitizedReason;
+        if (stageName !== null) {
+          existing.stage = stageName;
+        }
+        existing.lastSeenMs = nowMs;
+        // Refresh LRU position (move to tail of Map).
+        this._compileFailures.delete(hashHex);
+        this._compileFailures.set(hashHex, existing);
+        return existing;
+      }
+
+      if (this._compileFailures.size >= this._maxCompileFailureEntries) {
+        const oldestKey = this._compileFailures.keys().next().value;
+        if (oldestKey !== undefined) {
+          this._compileFailures.delete(oldestKey);
+        }
+      }
+
+      const entry = {
+        hashHex,
+        stage: stageName,
+        reason: sanitizedReason,
+        count: 1,
+        firstSeenMs: nowMs,
+        lastSeenMs: nowMs,
+      };
+      this._compileFailures.set(hashHex, entry);
+      return entry;
+    }
+
+    /**
+     * Record a shader hash into the bounded negative compile-failure LRU cache so
+     * subsequent `hasCompileFailure()` / `resolve()` calls skip retrying broken WGSL
+     * and route straight to a deterministic fallback profile.
+     *
+     * @param {bigint | string | number} hash
+     * @param {number | string | { stage?: number | string | null, reason?: string | null } | null} [stageOrOpts]
+     * @param {string | null} [maybeReason]
+     * @returns {{
+     *   hashHex: string,
+     *   stage: 'vertex' | 'fragment' | 'compute' | null,
+     *   reason: string,
+     *   count: number,
+     *   firstSeenMs: number,
+     *   lastSeenMs: number,
+     *   cached: boolean,
+     * }}
+     */
+    recordCompileFailure(hash, stageOrOpts = null, maybeReason) {
+      const hashBigInt = normalizeShaderHash(hash);
+      const hashHex = formatShaderHash(hashBigInt);
+      let stageArg = stageOrOpts;
+      let reasonArg = maybeReason;
+
+      if (
+        maybeReason === undefined &&
+        stageOrOpts !== null &&
+        typeof stageOrOpts === 'object'
+      ) {
+        stageArg = stageOrOpts.stage !== undefined ? stageOrOpts.stage : null;
+        reasonArg = stageOrOpts.reason;
+      }
+
+      const stageName =
+        stageArg === undefined || stageArg === null ? null : normalizeStage(stageArg);
+      const sanitizedReason = sanitizeCompileFailureReason(reasonArg);
+      const nowMs = this._now();
+      const entry = this._recordCompileFailureEntry(
+        hashBigInt,
+        hashHex,
+        stageName,
+        sanitizedReason,
+        nowMs
+      );
+      if (entry === null) {
+        return {
+          hashHex,
+          stage: stageName,
+          reason: sanitizedReason,
+          count: 1,
+          firstSeenMs: nowMs,
+          lastSeenMs: nowMs,
+          cached: false,
+        };
+      }
+      return {
+        hashHex: entry.hashHex,
+        stage: entry.stage,
+        reason: entry.reason,
+        count: entry.count,
+        firstSeenMs: entry.firstSeenMs,
+        lastSeenMs: entry.lastSeenMs,
+        cached: true,
+      };
+    }
+
+    /**
+     * Return true when `hash` is present in the negative compile-failure cache.
+     * Touches the entry for LRU recency and increments `compileFailureCacheHits` on hits.
+     *
+     * @param {bigint | string | number | null | undefined} hash
+     * @returns {boolean}
+     */
+    hasCompileFailure(hash) {
+      if (hash === null || hash === undefined || hash === '') {
+        return false;
+      }
+      const hashHex = formatShaderHash(normalizeShaderHash(hash));
+      const entry = this._compileFailures.get(hashHex);
+      if (entry === undefined) {
+        return false;
+      }
+      // Refresh LRU recency (move to tail of Map).
+      this._compileFailures.delete(hashHex);
+      this._compileFailures.set(hashHex, entry);
+      this._compileFailureCacheHits += 1;
+      return true;
+    }
+
+    /**
+     * Inspect a sanitized negative compile-failure cache entry for `hash` without mutating
+     * LRU ordering or hit counters. Returns `null` when not cached.
+     *
+     * @param {bigint | string | number | null | undefined} hash
+     * @returns {{
+     *   hashHex: string,
+     *   stage: 'vertex' | 'fragment' | 'compute' | null,
+     *   reason: string,
+     *   count: number,
+     *   firstSeenMs: number,
+     *   lastSeenMs: number,
+     * } | null}
+     */
+    getCompileFailure(hash) {
+      if (hash === null || hash === undefined || hash === '') {
+        return null;
+      }
+      const hashHex = formatShaderHash(normalizeShaderHash(hash));
+      const entry = this._compileFailures.get(hashHex);
+      if (entry === undefined) {
+        return null;
+      }
+      return {
+        hashHex: entry.hashHex,
+        stage: entry.stage,
+        reason: entry.reason,
+        count: entry.count,
+        firstSeenMs: entry.firstSeenMs,
+        lastSeenMs: entry.lastSeenMs,
+      };
+    }
+
+    /**
+     * Remove a single shader hash from the negative compile-failure cache.
+     *
+     * @param {bigint | string | number | null | undefined} hash
+     * @returns {boolean}
+     */
+    clearCompileFailure(hash) {
+      if (hash === null || hash === undefined || hash === '') {
+        return false;
+      }
+      const hashBigInt = normalizeShaderHash(hash);
+      const hashHex = formatShaderHash(hashBigInt);
+      const removed = this._compileFailures.delete(hashHex);
+      if (removed) {
+        this._evictResolveCacheForHash(hashBigInt, hashHex);
+      }
+      return removed;
+    }
+
+    /**
+     * Clear all entries from the negative compile-failure cache.
+     * Returns the number of entries cleared.
+     *
+     * @returns {number}
+     */
+    clearCompileFailures() {
+      const cleared = this._compileFailures.size;
+      if (cleared > 0) {
+        this._compileFailures.clear();
+        this._clearResolveCache();
+      }
+      return cleared;
+    }
+
+    /**
+     * Deterministically select a built-in fallback WGSL profile for `(stage, bindingSignature)`.
+     *
+     * @param {number | string} stage
+     * @param {object | null | undefined} [bindingSignature]
+     * @returns {'default' | 'fullscreen_triangle_cbv' | 'textured_quad_24b' | 'splash_rect_24b'}
+     */
+    selectFallbackProfile(stage, bindingSignature) {
+      return selectDeterministicFallbackProfile(stage, bindingSignature);
     }
 
     _storeResolveCache(
@@ -1604,7 +1957,9 @@
             const profileName =
               opts !== null && opts.profile !== undefined && opts.profile !== null
                 ? normalizeFallbackProfile(opts.profile)
-                : this._defaultProfile;
+                : opts !== null && opts.bindingSignature !== undefined && opts.bindingSignature !== null
+                  ? selectDeterministicFallbackProfile(stageCode, opts.bindingSignature)
+                  : this._defaultProfile;
             if (cached.profile === profileName) {
               const frame =
                 opts !== null && opts.frame !== undefined && opts.frame !== null
@@ -1629,13 +1984,69 @@
       const profileName =
         opts !== null && opts.profile !== undefined && opts.profile !== null
           ? normalizeFallbackProfile(opts.profile)
-          : this._defaultProfile;
+          : opts !== null && opts.bindingSignature !== undefined && opts.bindingSignature !== null
+            ? selectDeterministicFallbackProfile(stageCode, opts.bindingSignature)
+            : this._defaultProfile;
 
       if (!hasSpecialOpts) {
         this._resolveCacheMisses += 1;
       }
 
       this._stats.totalLookups += 1;
+
+      // W268: Negative compile-failure cache — skip retrying known-broken hashes and
+      // route straight to the deterministic fallback shader without spamming Tint errors.
+      const compileFailureEntry =
+        this._compileFailures.size > 0 ? this._compileFailures.get(requestedHex) : undefined;
+      if (compileFailureEntry !== undefined) {
+        this._compileFailures.delete(requestedHex);
+        this._compileFailures.set(requestedHex, compileFailureEntry);
+        this._compileFailureCacheHits += 1;
+
+        const nowMs = this._now();
+        this._trackMissing(requested, requestedHex, stageCode, stageName, nowMs, frame);
+        const failReason =
+          opts !== null && (opts.reason !== undefined || opts.missingReason !== undefined)
+            ? normalizeMissingReason(opts.reason !== undefined ? opts.reason : opts.missingReason)
+            : MISSING_SHADER_REASONS.COMPILE_FAILED;
+        this._recordCategorizedMissingRow(requestedHex, stageName, failReason, nowMs);
+
+        const fallbackHash = resolveFallbackHashForStage(this._fallbackHashes, stageName);
+        if (fallbackHash !== null) {
+          const resolvedHex = formatShaderHash(fallbackHash);
+          if (!this._compileFailures.has(resolvedHex)) {
+            const fallbackHit = lookupPackSource(this._packLoader, fallbackHash, resolvedHex);
+            if (fallbackHit) {
+              this._stats.fallbackHits += 1;
+              return Object.freeze({
+                wgsl: fallbackHit.wgsl,
+                source: 'fallback',
+                requestedHash: requestedHex,
+                resolvedHash: resolvedHex,
+                stage: stageName,
+                entryPoint: fallbackHit.entryPoint || extractEntryPoint(fallbackHit.wgsl, stageName),
+                compileFailureCached: true,
+                compileFailureReason: compileFailureEntry.reason,
+              });
+            }
+          }
+        }
+
+        const profileTemplates = BUILTIN_FALLBACK_PROFILES[profileName] || BUILTIN_FALLBACK_WGSL;
+        const builtin = profileTemplates[stageName] || BUILTIN_FALLBACK_WGSL[stageName];
+        this._stats.builtinHits += 1;
+        return Object.freeze({
+          wgsl: builtin,
+          source: 'builtin',
+          requestedHash: requestedHex,
+          resolvedHash: null,
+          stage: stageName,
+          entryPoint: extractEntryPoint(builtin, stageName),
+          profile: profileName,
+          compileFailureCached: true,
+          compileFailureReason: compileFailureEntry.reason,
+        });
+      }
 
       const exact = lookupPackSource(this._packLoader, requested, requestedHex);
       if (exact) {
@@ -1772,32 +2183,34 @@
       const fallbackHash = resolveFallbackHashForStage(this._fallbackHashes, stageName);
       if (fallbackHash !== null) {
         const resolvedHex = formatShaderHash(fallbackHash);
-        const fallbackHit = lookupPackSource(this._packLoader, fallbackHash, resolvedHex);
-        if (fallbackHit) {
-          this._stats.fallbackHits += 1;
-          const result = Object.freeze({
-            wgsl: fallbackHit.wgsl,
-            source: 'fallback',
-            requestedHash: requestedHex,
-            resolvedHash: resolvedHex,
-            stage: stageName,
-            entryPoint: fallbackHit.entryPoint || extractEntryPoint(fallbackHit.wgsl, stageName),
-          });
-          if (canCacheMiss) {
-            this._storeResolveCache(
-              stageCode,
-              stageName,
-              hash,
-              requested,
-              requestedHex,
-              result,
-              'fallback',
-              null,
-              missingRow,
-              categorizedRow
-            );
+        if (!this._compileFailures.has(resolvedHex)) {
+          const fallbackHit = lookupPackSource(this._packLoader, fallbackHash, resolvedHex);
+          if (fallbackHit) {
+            this._stats.fallbackHits += 1;
+            const result = Object.freeze({
+              wgsl: fallbackHit.wgsl,
+              source: 'fallback',
+              requestedHash: requestedHex,
+              resolvedHash: resolvedHex,
+              stage: stageName,
+              entryPoint: fallbackHit.entryPoint || extractEntryPoint(fallbackHit.wgsl, stageName),
+            });
+            if (canCacheMiss) {
+              this._storeResolveCache(
+                stageCode,
+                stageName,
+                hash,
+                requested,
+                requestedHex,
+                result,
+                'fallback',
+                null,
+                missingRow,
+                categorizedRow
+              );
+            }
+            return result;
           }
-          return result;
         }
       }
 
@@ -1988,14 +2401,25 @@
      * }}
      */
     recordMissingShader(hashHex, stage, reason = MISSING_SHADER_REASONS.OTHER) {
-      const canonicalHash = formatShaderHash(normalizeShaderHash(hashHex));
+      const hashBigInt = normalizeShaderHash(hashHex);
+      const canonicalHash = formatShaderHash(hashBigInt);
       const stageName = normalizeStage(stage);
       const canonicalReason = normalizeMissingReason(reason);
+      const nowMs = this._now();
+      if (canonicalReason === MISSING_SHADER_REASONS.COMPILE_FAILED) {
+        this._recordCompileFailureEntry(
+          hashBigInt,
+          canonicalHash,
+          stageName,
+          canonicalReason,
+          nowMs
+        );
+      }
       return this._recordCategorizedMissing(
         canonicalHash,
         stageName,
         canonicalReason,
-        this._now()
+        nowMs
       );
     }
 
@@ -2234,6 +2658,9 @@
         overflowMissingHashes: this._overflowMissingCount,
         hitRatePct,
         hitRatio,
+        compileFailureEntries: this._compileFailures.size,
+        compileFailureCacheHits: this._compileFailureCacheHits,
+        compileFailureRecorded: this._compileFailureRecorded,
       };
     }
 
@@ -2258,7 +2685,8 @@
     }
 
     /**
-     * Clear missing-shader telemetry, categorized summary, guard counters, and lookup counters.
+     * Clear missing-shader telemetry, categorized summary, guard counters, negative
+     * compile-failure cache, and lookup counters.
      * Preserves configured `packLoader`, `fallbackHashes`, and registered real shaders.
      */
     reset() {
@@ -2274,6 +2702,21 @@
       this._blockedOverrides.clear();
       this._blockedOverrideCount = 0;
       this._blockedOverflowCount = 0;
+
+      if (this._compileFailures.size > 0) {
+        this._compileFailures.clear();
+        this._clearResolveCache();
+      }
+      this._compileFailureCacheHits = 0;
+      this._compileFailureRecorded = 0;
+    }
+
+    /**
+     * Alias for `reset()` that resets lookup counters, missing-shader telemetry,
+     * and compile-failure cache statistics.
+     */
+    resetStats() {
+      this.reset();
     }
   }
 
@@ -2290,13 +2733,16 @@
     DEFAULT_MAX_TRACKED_MISSING_HASHES,
     DEFAULT_MAX_CATEGORIZED_MISSING_HASHES,
     DEFAULT_MAX_RESOLVE_CACHE_ENTRIES,
+    DEFAULT_MAX_COMPILE_FAILURE_ENTRIES,
     DEFAULT_TOP_MISSING_LIMIT,
     DEFAULT_MISSING_SUMMARY_TOP_LIMIT,
     normalizeShaderHash,
     formatShaderHash,
     normalizeStage,
     normalizeMissingReason,
+    sanitizeCompileFailureReason,
     normalizeFallbackProfile,
+    selectDeterministicFallbackProfile,
     getBuiltInFallbackProfiles,
     ShaderFallbackRouter,
   });
