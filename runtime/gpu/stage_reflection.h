@@ -221,6 +221,9 @@ struct JoinStats {
     // Root-descriptor bindings whose user SGPR starts a descriptor table, joined as a table slot
     // (the given table_byte_offset, else the first descriptor; on success).
     uint64_t root_descriptor_tables = 0;
+    // Vertex inputs no input-layout element covers, read as D3D12's (0, 0, 0, 1) defaults from a
+    // shared constant buffer (join_vertex_inputs; on success).
+    uint64_t vertex_inputs_defaulted = 0;
 };
 struct JoinOptions {
     // The consumer binds binding arrays (GpuLayoutFlags::BindingArrays): lane-indexed heap windows
@@ -235,9 +238,9 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
 // element of its slot that covers its byte offset. An element starting at that offset gives its own
 // format (its component class must match the input's: float for unorm/snorm/float formats, uint,
 // sint); an input inside an element needs its fetch format. Elements no input reads are dropped.
-// False (one line per failed location in *report) when an input has no element or the classes
-// differ.
+// An input no element covers is not a failure: D3D12 reads (0, 0, 0, 1), so it becomes a
+// `constant_default` fetch. False (one line per failed location in *report) when the classes differ.
 bool join_vertex_inputs(const StageReflection& vs, const pso::D3D12InputElementDesc* elements, uint32_t count,
-                        std::vector<pso::VertexInputFetch>* out, std::string* report);
+                        std::vector<pso::VertexInputFetch>* out, std::string* report, JoinStats* stats = nullptr);
 
 }  // namespace playgta6::gpu

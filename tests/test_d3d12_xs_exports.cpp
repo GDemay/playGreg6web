@@ -3653,7 +3653,7 @@ void test_stage_reflection_join() {
     const std::vector<uint8_t> pack = wgpk({{vs_good_key, 1}, {vs_bad_key, 1}, {ps_key, 2}});
     CHECK(playgta6::gpu::parse_shader_pack_index(pack.data(), pack.size(), index.get(), &error));
     // The good vertex stage reads 2 floats inside POSITION (R32G32B32_FLOAT at offset 0) at
-    // @location(3); the bad one reads past the element. Neither stage binds anything (the scene's
+    // @location(3); the bad one reads inside it without a fetch_format (an uncovered offset would default). Neither stage binds anything (the scene's
     // root signature is empty).
     const std::string json = "{\"schema\": \"playgta6-stage-reflection\", \"version\": 1, \"stages\": {\"" +
                              playgta6::gpu::pack_key_code(vs_good_key) +
@@ -3662,7 +3662,7 @@ void test_stage_reflection_join() {
                              "\"fetch_format\": \"float32x2\"}]}, \"" +
                              playgta6::gpu::pack_key_code(vs_bad_key) +
                              "\": {\"stage\": \"vertex\", \"vertex_inputs\": [{\"location\": 0, \"vb_slot\": 0, "
-                             "\"byte_offset\": 40, \"components\": 2, \"component_type\": \"f32\"}]}, \"" +
+                             "\"byte_offset\": 4, \"components\": 2, \"component_type\": \"f32\"}]}, \"" +
                              playgta6::gpu::pack_key_code(ps_key) + "\": {\"stage\": \"fragment\", \"bindings\": []}}}";
     auto reflection = std::make_shared<playgta6::gpu::StageReflectionIndex>();
     CHECK(playgta6::gpu::parse_stage_reflection_json(json, reflection.get(), &error));

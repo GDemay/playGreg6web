@@ -321,6 +321,8 @@ private:
     uint32_t intern_sampler(const d3d::SamplerDesc& desc, CommandEncoder& encoder, uint64_t* diagnostics);
     // Root constant ring buffer id; emits its CreateBuffer on first use.
     uint32_t ensure_root_constant_ring(CommandEncoder& encoder);
+    // Shared (0,0,0,1) vertex buffer for attributes no input element feeds (G62); created on first use.
+    uint32_t ensure_default_vertex_buffer(CommandEncoder& encoder);
     // Reserves `bytes` (256-byte aligned start) in the ring and returns the offset.
     uint32_t allocate_root_constants(uint32_t bytes, bool* wrapped);
     // True exactly once per compute pipeline id: the caller emits CreateComputePipeline2.
@@ -375,6 +377,7 @@ private:
     std::unordered_map<std::string, uint32_t> samplers_;
     std::unordered_set<uint32_t> emitted_compute_;
     uint32_t ring_buffer_id_ = 0;
+    uint32_t default_vertex_buffer_id_ = 0;
     uint32_t ring_cursor_ = 0;
     std::map<std::pair<uint32_t, uint8_t>, uint32_t> intermediates_;     // (texture, format) -> texture
     std::map<uint32_t, StorageConversionPipeline> conversion_pipelines_;  // dst format << 8 | dimension

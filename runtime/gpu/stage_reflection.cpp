@@ -1145,7 +1145,7 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
 }
 
 bool join_vertex_inputs(const StageReflection& vs, const pso::D3D12InputElementDesc* elements, uint32_t count,
-                        std::vector<pso::VertexInputFetch>* out, std::string* report) {
+                        std::vector<pso::VertexInputFetch>* out, std::string* report, JoinStats* stats) {
     struct Element {
         uint32_t slot, offset, size;
         pso::WgpuVertexFormat format;
@@ -1169,6 +1169,7 @@ bool join_vertex_inputs(const StageReflection& vs, const pso::D3D12InputElementD
         placed.push_back(Element{e.InputSlot, offset, vf.byte_size, vf.format, e.SemanticName, e.SemanticIndex});
     }
     bool ok = true;
+    uint64_t defaulted = 0;
     std::vector<pso::VertexInputFetch> fetches;
     for (const ReflectedVertexInput& in : vs.vertex_inputs) {
         const std::string key = "@location(" + std::to_string(in.location) + ") <- slot " + std::to_string(in.vb_slot) +
@@ -1181,8 +1182,14 @@ bool join_vertex_inputs(const StageReflection& vs, const pso::D3D12InputElementD
             }
         }
         if (hit == nullptr) {
-            *report += key + ": no input-layout element covers it\n";
-            ok = false;
+            // D3D12 reads (0, 0, 0, 1) for an attribute the layout does not provide.
+            pso::VertexInputFetch d;
+            d.location = in.location;
+            d.constant_default = true;
+            d.offset = in.component_type == ReflectedComponentType::F32 ? 0u : pso::kDefaultVertexIntOffset;
+            d.format = dword_format(in.component_type, std::min(std::max(in.components, 1u), 4u));
+            fetches.push_back(d);
+            ++defaulted;
             continue;
         }
         pso::VertexInputFetch f;
@@ -1245,6 +1252,9 @@ bool join_vertex_inputs(const StageReflection& vs, const pso::D3D12InputElementD
         return false;
     }
     *out = std::move(fetches);
+    if (stats != nullptr) {
+        stats->vertex_inputs_defaulted += defaulted;
+    }
     return true;
 }
 
