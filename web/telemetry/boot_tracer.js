@@ -13,6 +13,7 @@ export const CHROME_TRACE_CATEGORY = 'playgta6.boot';
 export const DEFAULT_TRACE_PID = 1;
 export const DEFAULT_TRACE_TID = 1;
 export const MAX_MESSAGE_LENGTH = 512;
+export const MAX_GPU_ADAPTER_LENGTH = 96;
 export const STAGE_NOT_STARTED = 'NOT_STARTED';
 
 /** Guest boot milestones in the order the real boot path reaches them. */
@@ -28,6 +29,11 @@ export const BOOT_MILESTONES = Object.freeze([
   'FIRST_PRESENT',
 ]);
 
+/** Optional post-present boot milestones that do not affect core BOOT_MILESTONES ordering or progress percentages. */
+export const OPTIONAL_BOOT_MILESTONES = Object.freeze(['FIRST_VISIBLE_FRAME']);
+
+const ALL_MILESTONES = Object.freeze([...BOOT_MILESTONES, ...OPTIONAL_BOOT_MILESTONES]);
+
 /** Trap kinds mirroring the recompiler/runtime fault helpers. */
 export const TRAP_KIND = Object.freeze({
   UNIMPLEMENTED_OPCODE: 'UNIMPLEMENTED_OPCODE',
@@ -39,7 +45,7 @@ export const TRAP_KIND = Object.freeze({
 });
 
 const TRAP_KIND_VALUES = Object.freeze(Object.values(TRAP_KIND));
-const MILESTONE_INDEX = new Map(BOOT_MILESTONES.map((name, idx) => [name, idx]));
+const MILESTONE_INDEX = new Map(ALL_MILESTONES.map((name, idx) => [name, idx]));
 const TRAP_KIND_SET = new Set(TRAP_KIND_VALUES);
 
 // Unresolved imports are logged once before the runtime decides whether to abort,
@@ -47,7 +53,7 @@ const TRAP_KIND_SET = new Set(TRAP_KIND_VALUES);
 const NON_FATAL_BY_DEFAULT = new Set([TRAP_KIND.UNRESOLVED_IMPORT]);
 
 const LOG_TAG_RE = /\[(wasm|boot|trap|unimpl|import)\]\s*(.*)$/i;
-const MILESTONE_TOKEN_RE = new RegExp(`\\b(${BOOT_MILESTONES.join('|')})\\b`, 'gi');
+const MILESTONE_TOKEN_RE = new RegExp(`\\b(${ALL_MILESTONES.join('|')})\\b`, 'gi');
 const TRAP_KIND_TOKEN_RE = new RegExp(`\\b(${TRAP_KIND_VALUES.join('|')})\\b`, 'i');
 const FAILURE_RE = /\b(?:fail(?:ed|s|ure)?|error|unresolved|missing|unimplemented|abort(?:ed)?)\b/i;
 const HEX_RE = /\b0x([0-9a-f]{1,16})\b/gi;
@@ -57,6 +63,13 @@ const IMPORT_REF_RE =
   /\b([A-Za-z0-9_][A-Za-z0-9_.-]*\.(?:dll|exe|sys|lib))!(#\d+|[A-Za-z_?@$][A-Za-z0-9_?@$]*)/i;
 const WASM_TRAP_RE =
   /\b(?:RuntimeError|unreachable|out of bounds|trap(?:ped)?|integer (?:divide by zero|overflow)|indirect call|call stack exhausted|stack overflow)\b/i;
+const ANSI_ESCAPE_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
+const GPU_ADAPTER_WHITESPACE_CTRL_RE = /[\r\n\t]+/g;
+const GPU_ADAPTER_CONTROL_CHAR_RE = /[\u0000-\u001f\u007f-\u009f]/g;
+const GPU_ADAPTER_LOWER_POSIX_PATH_RE =
+  /(^|[\s"'`(\[={<,:;|])(\/(?:users|library|applications|volumes|home|root|tmp|var|etc|opt|usr|mnt|media|private|srv|proc|sys|dev|run|cygdrive)(?:\/[^\s"'`<>)\]},;]+)?)(?=[\s"'`<>)\]},;]|$)/gi;
+const GPU_ADAPTER_BACKSLASH_TOKEN_RE = /[^\s"'`<>|*?)\]},;]*\\[^\s"'`<>|*?)\]},;]*/g;
+const REDACTED_TOKEN_RE = /\[REDACTED(?:_[A-Z0-9_]+)?\]/g;
 
 const MILESTONE_HEURISTICS = Object.freeze([
   [
@@ -77,6 +90,7 @@ const MILESTONE_HEURISTICS = Object.freeze([
   ['D3D12_CREATE_DEVICE', /\bD3D12(?:Xbox)?CreateDevice\b|\bd3d12\s+device\s+(?:created|ready)\b/i],
   ['BINK_OPEN', /\bBinkOpen\w*\b|\bbink\s+(?:open(?:ed)?|stream\s+opened)\b/i],
   ['FIRST_PRESENT', /\bfirst[\s_-]*(?:swapchain[\s_-]*)?(?:present(?:ed)?|frame)\b/i],
+  ['FIRST_VISIBLE_FRAME', /\bfirst[\s_-]*(?:visible|non[\s_-]*black)[\s_-]*frame\b/i],
 ]);
 
 function defaultNow() {
@@ -89,6 +103,61 @@ function defaultNow() {
 function clip(text, max = MAX_MESSAGE_LENGTH) {
   const safe = sanitizeString(text);
   return safe.length > max ? `${safe.slice(0, max - 3)}...` : safe;
+}
+
+/**
+ * Sanitizes a GPU adapter label (or `{ vendor, architecture }` object) into a
+ * lowercase `vendor / architecture` string of at most `MAX_GPU_ADAPTER_LENGTH`
+ * (96) characters with control characters, ANSI escapes, host paths, and
+ * credentials stripped.
+ *
+ * @param {unknown} adapterLabel
+ * @returns {string|null}
+ */
+export function sanitizeGpuAdapter(adapterLabel) {
+  if (adapterLabel === null || adapterLabel === undefined) {
+    return null;
+  }
+
+  let raw = null;
+  if (typeof adapterLabel === 'string') {
+    raw = adapterLabel;
+  } else if (typeof adapterLabel === 'object' && !Array.isArray(adapterLabel)) {
+    const vendor = typeof adapterLabel.vendor === 'string' ? adapterLabel.vendor.trim() : '';
+    const arch = typeof adapterLabel.architecture === 'string' ? adapterLabel.architecture.trim() : '';
+    if (vendor && arch) {
+      raw = `${vendor} / ${arch}`;
+    } else if (vendor || arch) {
+      raw = vendor || arch;
+    }
+  }
+
+  if (typeof raw !== 'string' || raw.length === 0) {
+    return null;
+  }
+
+  let out = raw
+    .replace(ANSI_ESCAPE_RE, ' ')
+    .replace(GPU_ADAPTER_WHITESPACE_CTRL_RE, ' ')
+    .replace(GPU_ADAPTER_CONTROL_CHAR_RE, '');
+
+  out = sanitizeString(out);
+  out = out
+    .replace(GPU_ADAPTER_LOWER_POSIX_PATH_RE, '$1')
+    .replace(GPU_ADAPTER_BACKSLASH_TOKEN_RE, '')
+    .replace(REDACTED_TOKEN_RE, '')
+    .replace(/\(\s*\)/g, '')
+    .replace(/\s+/g, ' ')
+    .replace(/\s*\/\s*/g, ' / ')
+    .replace(/(?:\s*\/\s*){2,}/g, ' / ')
+    .replace(/^[\s/]+|[\s/]+$/g, '')
+    .toLowerCase();
+
+  if (out.length > MAX_GPU_ADAPTER_LENGTH) {
+    out = out.slice(0, MAX_GPU_ADAPTER_LENGTH).replace(/[\s/]+$/, '');
+  }
+
+  return out.length > 0 ? out : null;
 }
 
 /**
@@ -201,7 +270,7 @@ function detectMilestones(text) {
       found.add(name);
     }
   }
-  return BOOT_MILESTONES.filter((name) => found.has(name));
+  return ALL_MILESTONES.filter((name) => found.has(name));
 }
 
 function isUnresolvedImportText(text) {
@@ -400,8 +469,12 @@ export class BootTracer {
     return this._trapCount;
   }
 
+  get gpuAdapter() {
+    return this._gpuAdapter;
+  }
+
   /**
-   * Clears milestones, traps, and the import table and restarts the boot clock.
+   * Clears milestones, traps, GPU adapter label, and the import table and restarts the boot clock.
    * Keeps the attached crash reporter and HUD.
    *
    * @param {number} [startMs]
@@ -414,6 +487,7 @@ export class BootTracer {
     this._milestones = new Map();
     this._milestoneOrder = [];
     this._highestIdx = -1;
+    this._gpuAdapter = null;
     this._traps.clear();
     this._trapCount = 0;
     this._trapSeq = 0;
@@ -431,7 +505,28 @@ export class BootTracer {
   }
 
   _progressPct() {
-    return this._highestIdx < 0 ? 0 : Math.round(((this._highestIdx + 1) / BOOT_MILESTONES.length) * 100);
+    return this._highestIdx < 0
+      ? 0
+      : Math.min(100, Math.round(((this._highestIdx + 1) / BOOT_MILESTONES.length) * 100));
+  }
+
+  _firstPresentMs() {
+    const entry = this._milestones.get('FIRST_PRESENT');
+    return entry ? entry.elapsedMs : null;
+  }
+
+  _firstVisibleFrameMs() {
+    const entry = this._milestones.get('FIRST_VISIBLE_FRAME');
+    return entry ? entry.elapsedMs : null;
+  }
+
+  _blackLoadingMs() {
+    const firstPresentMs = this._firstPresentMs();
+    const firstVisibleFrameMs = this._firstVisibleFrameMs();
+    if (firstPresentMs === null || firstVisibleFrameMs === null) {
+      return null;
+    }
+    return Math.max(0, firstVisibleFrameMs - firstPresentMs);
   }
 
   _notifyHud(text, level) {
@@ -466,14 +561,26 @@ export class BootTracer {
    * Records that a boot milestone was reached. The first-reached timestamp is kept;
    * repeats only bump `count` and `lastElapsedMs`.
    *
-   * @param {string} milestone One of `BOOT_MILESTONES`.
+   * @param {string} milestone One of `BOOT_MILESTONES` or `OPTIONAL_BOOT_MILESTONES`.
    * @param {unknown} [detail] Optional sanitized detail stored on first reach.
    * @returns {{ milestone: string, index: number, elapsedMs: number, lastElapsedMs: number,
    *   count: number, detail: any, firstReach: boolean }}
    */
   markMilestone(milestone, detail) {
+    return this._markMilestone(milestone, detail, undefined);
+  }
+
+  _markMilestone(milestone, detail, explicitElapsedMs) {
     const name = resolveMilestone(milestone);
-    const elapsedMs = this._elapsed();
+    let elapsedMs;
+    if (explicitElapsedMs !== undefined) {
+      elapsedMs = explicitElapsedMs;
+      if (elapsedMs > this._lastElapsedMs) {
+        this._lastElapsedMs = elapsedMs;
+      }
+    } else {
+      elapsedMs = this._elapsed();
+    }
     const index = MILESTONE_INDEX.get(name);
     let entry = this._milestones.get(name);
     const firstReach = entry === undefined;
@@ -481,7 +588,9 @@ export class BootTracer {
     if (firstReach) {
       const safeDetail = detail === undefined ? null : sanitizeValue(detail);
       const deltaFromPrevMs = Math.max(0, elapsedMs - this._lastMilestoneElapsedMs);
-      this._lastMilestoneElapsedMs = elapsedMs;
+      if (elapsedMs > this._lastMilestoneElapsedMs) {
+        this._lastMilestoneElapsedMs = elapsedMs;
+      }
       const slow = this._slowThresholdMs !== null && deltaFromPrevMs > this._slowThresholdMs;
       entry = {
         milestone: name,
@@ -500,12 +609,74 @@ export class BootTracer {
       }
       const pct = this._progressPct();
       this._forward('recordLog', 'info', 'boot_tracer', `milestone ${name} reached at ${elapsedMs.toFixed(1)}ms`);
-      this._notifyHud(`Boot ${pct}%: ${name}`, name === 'FIRST_PRESENT' ? 'ok' : 'info');
+      this._notifyHud(
+        `Boot ${pct}%: ${name}`,
+        name === 'FIRST_PRESENT' || name === 'FIRST_VISIBLE_FRAME' ? 'ok' : 'info'
+      );
     } else {
       entry.count += 1;
       entry.lastElapsedMs = elapsedMs;
     }
     return { ...entry, firstReach };
+  }
+
+  /**
+   * Records the optional `FIRST_VISIBLE_FRAME` milestone (first non-black frame after
+   * `FIRST_PRESENT`), preserving the first-reached `firstVisibleFrameMs` and computing
+   * `blackLoadingMs = max(0, firstVisibleFrameMs - firstPresentMs)` when both exist.
+   *
+   * @param {object} [opts]
+   * @param {number} [opts.elapsedMs] Optional explicit non-negative elapsed time in ms.
+   * @param {unknown} [opts.detail] Optional sanitized detail metadata.
+   * @returns {object} Milestone record enriched with `firstVisibleFrameMs` and `blackLoadingMs`.
+   */
+  recordFirstVisibleFrame(opts = {}) {
+    if (opts !== undefined && (opts === null || typeof opts !== 'object' || Array.isArray(opts))) {
+      throw new TypeError('recordFirstVisibleFrame options must be an object');
+    }
+    let explicitElapsedMs;
+    if (opts.elapsedMs !== undefined && opts.elapsedMs !== null) {
+      if (typeof opts.elapsedMs !== 'number' || !Number.isFinite(opts.elapsedMs) || opts.elapsedMs < 0) {
+        throw new RangeError(`elapsedMs must be a non-negative finite number, got ${opts.elapsedMs}`);
+      }
+      explicitElapsedMs = opts.elapsedMs;
+    }
+
+    const nonTimingKeys = Object.keys(opts).filter((key) => key !== 'elapsedMs');
+    let detail;
+    if (nonTimingKeys.length === 0) {
+      detail = undefined;
+    } else if (nonTimingKeys.length === 1 && nonTimingKeys[0] === 'detail') {
+      detail = opts.detail;
+    } else {
+      detail = {};
+      for (const key of nonTimingKeys) {
+        detail[key] = opts[key];
+      }
+    }
+
+    const entry = this._markMilestone('FIRST_VISIBLE_FRAME', detail, explicitElapsedMs);
+    return {
+      ...entry,
+      firstVisibleFrameMs: this._firstVisibleFrameMs(),
+      blackLoadingMs: this._blackLoadingMs(),
+    };
+  }
+
+  /**
+   * Records a sanitized lowercase `vendor / architecture` GPU adapter label
+   * (max 96 chars, stripped of control characters and host paths).
+   *
+   * @param {string|{ vendor?: string, architecture?: string }|null|undefined} adapterLabel
+   * @returns {string|null} The stored sanitized GPU adapter label, or `null`.
+   */
+  recordGpuAdapter(adapterLabel) {
+    const sanitized = sanitizeGpuAdapter(adapterLabel);
+    this._gpuAdapter = sanitized;
+    if (sanitized !== null) {
+      this._forward('recordLog', 'info', 'boot_tracer', `gpu adapter: ${sanitized}`);
+    }
+    return this._gpuAdapter;
   }
 
   /**
@@ -633,7 +804,7 @@ export class BootTracer {
   }
 
   _stage() {
-    return this._highestIdx < 0 ? STAGE_NOT_STARTED : BOOT_MILESTONES[this._highestIdx];
+    return this._highestIdx < 0 ? STAGE_NOT_STARTED : ALL_MILESTONES[this._highestIdx];
   }
 
   /**
@@ -814,12 +985,20 @@ export class BootTracer {
 
     timedEvents.sort((a, b) => a.ts - b.ts);
 
+    const firstPresentMs = this._firstPresentMs();
+    const firstVisibleFrameMs = this._firstVisibleFrameMs();
+    const blackLoadingMs = this._blackLoadingMs();
+
     const metadata = {
       source: 'playgta6web.boot_tracer',
       stage: this._stage(),
       progressPct: this._progressPct(),
       readyForSplash: this._milestones.has('FIRST_PRESENT'),
       elapsedMs: this._elapsed(),
+      firstPresentMs,
+      firstVisibleFrameMs,
+      blackLoadingMs,
+      gpuAdapter: this._gpuAdapter,
       milestonesReached: this._milestones.size,
       trapCount: this._trapCount,
     };
@@ -865,17 +1044,42 @@ export class BootTracer {
           };
     });
 
+    for (const name of OPTIONAL_BOOT_MILESTONES) {
+      const entry = this._milestones.get(name);
+      if (entry) {
+        milestones.push({
+          milestone: name,
+          index: entry.index,
+          reached: true,
+          elapsedMs: entry.elapsedMs,
+          lastElapsedMs: entry.lastElapsedMs,
+          deltaFromPrevMs: entry.deltaFromPrevMs,
+          slow: entry.slow,
+          count: entry.count,
+          detail: entry.detail,
+        });
+      }
+    }
+
     const slowMilestones = this.getMilestoneDeltas().filter((delta) => delta.slow);
 
     const unresolvedImports = Array.from(this._imports.values(), (entry) => ({ ...entry })).sort(
       (a, b) => b.count - a.count || a.firstElapsedMs - b.firstElapsedMs || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)
     );
 
+    const firstPresentMs = this._firstPresentMs();
+    const firstVisibleFrameMs = this._firstVisibleFrameMs();
+    const blackLoadingMs = this._blackLoadingMs();
+
     return sanitizeValue({
       stage: this._stage(),
       progressPct: this._progressPct(),
       readyForSplash: this._milestones.has('FIRST_PRESENT'),
       elapsedMs: this._elapsed(),
+      firstPresentMs,
+      firstVisibleFrameMs,
+      blackLoadingMs,
+      gpuAdapter: this._gpuAdapter,
       milestonesReached: this._milestones.size,
       milestones,
       slowThresholdMs: this._slowThresholdMs,
