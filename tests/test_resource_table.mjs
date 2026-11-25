@@ -26,6 +26,7 @@ const {
   UNIFORM_BUFFER_MIN_BYTES,
   DEFAULT_FAST_SLOT_CAPACITY,
   DEFAULT_MAX_BIND_GROUPS,
+  DEFAULT_FAST_BIND_GROUP_BUCKETS,
   isBcFormat,
   deviceSupportsBc,
   computeMaxMipLevels,
@@ -36,6 +37,7 @@ const {
   padBufferUploadData,
   decodeCreateTexture2,
   sanitizeTextureDescriptor,
+  computeBindGroupHashFast,
   ResourceTable,
 } = rt;
 
@@ -1800,6 +1802,409 @@ test('ResourceTable scene transition stress (Start Screen -> 4K Bink2 -> Main Me
   assert.equal(finalStats.staleBindGroupEvictions, 2);
   assert.ok(finalStats.bindGroupHitRate >= 0 && finalStats.bindGroupHitRate <= 1);
   for (const [k, v] of Object.entries(finalStats)) {
+    assert.equal(typeof v, 'number', `stat ${k} must be numeric`);
+    assert.ok(Number.isFinite(v), `stat ${k} must be finite`);
+  }
+});
+
+test('computeBindGroupHashFast produces deterministic 64-bit dual-u32 hashes sensitive to layout, slots, handles, generations, and ranges (W320)', async () => {
+  const esmMod = await import('../web/workers/resource_table.js');
+  assert.equal(typeof computeBindGroupHashFast, 'function');
+  assert.equal(esmMod.computeBindGroupHashFast, computeBindGroupHashFast);
+  assert.equal(globalThis.PlayGta6ResourceTable.computeBindGroupHashFast, computeBindGroupHashFast);
+  assert.equal(DEFAULT_FAST_BIND_GROUP_BUCKETS, 512);
+  assert.equal(esmMod.DEFAULT_FAST_BIND_GROUP_BUCKETS, 512);
+
+  const pairA = new Uint32Array(2);
+  const pairB = new Uint32Array(2);
+  const slots = new Uint32Array([0, 1, 2]);
+  const handles = new Uint32Array([10, 20, 30]);
+  const gens = new Uint32Array([1, 2, 3]);
+  const kinds = new Uint8Array([1, 2, 4]);
+  const offsets = new Float64Array([0, 0, 0]);
+  const sizes = new Float64Array([256, -1, -1]);
+
+  const h1 = computeBindGroupHashFast(1, 3, slots, handles, gens, pairA, kinds, offsets, sizes);
+  const h2 = computeBindGroupHashFast(
+    1,
+    3,
+    [0, 1, 2],
+    [10, 20, 30],
+    [1, 2, 3],
+    pairB,
+    [1, 2, 4],
+    [0, 0, 0],
+    [256, -1, -1]
+  );
+
+  assert.equal(typeof h1, 'number');
+  assert.equal(Number.isSafeInteger(h1), true);
+  assert.ok(h1 >= 0);
+  assert.equal(h1, h2);
+  assert.equal(pairA[0], pairB[0]);
+  assert.equal(pairA[1], pairB[1]);
+
+  // Changing any single component (layoutId, entryCount, slot, handle, generation, kind, offset, size) alters hash.
+  const variants = [
+    computeBindGroupHashFast(2, 3, slots, handles, gens, null, kinds, offsets, sizes),
+    computeBindGroupHashFast(1, 2, slots, handles, gens, null, kinds, offsets, sizes),
+    computeBindGroupHashFast(1, 3, new Uint32Array([0, 1, 3]), handles, gens, null, kinds, offsets, sizes),
+    computeBindGroupHashFast(1, 3, slots, new Uint32Array([10, 21, 30]), gens, null, kinds, offsets, sizes),
+    computeBindGroupHashFast(1, 3, slots, handles, new Uint32Array([1, 2, 4]), null, kinds, offsets, sizes),
+    computeBindGroupHashFast(1, 3, slots, handles, gens, null, new Uint8Array([1, 3, 4]), offsets, sizes),
+    computeBindGroupHashFast(1, 3, slots, handles, gens, null, kinds, new Float64Array([64, 0, 0]), sizes),
+    computeBindGroupHashFast(1, 3, slots, handles, gens, null, kinds, offsets, new Float64Array([512, -1, -1])),
+    computeBindGroupHashFast('layout-str', 3, slots, handles, gens),
+    computeBindGroupHashFast(1, 0, slots, handles, gens),
+  ];
+  for (let i = 0; i < variants.length; i += 1) {
+    assert.equal(Number.isSafeInteger(variants[i]), true);
+    assert.notEqual(variants[i], h1, `variant ${i} must differ from baseline hash`);
+  }
+});
+
+test('ResourceTable zero-alloc repeated bind-group probes bypass string key building on steady-state hits (W320)', () => {
+  const { device, calls } = createMockDevice();
+  const table = new ResourceTable(device);
+  const layoutA = { kind: 'GPUBindGroupLayout', id: 'draw-a' };
+  const layoutB = { kind: 'GPUBindGroupLayout', id: 'draw-b' };
+
+  const buf1 = table.createBuffer(1, { size: 512, usage: GPU_BUFFER_USAGE.UNIFORM });
+  table.createTexture(2, { size: { width: 128, height: 128 }, format: 'rgba8unorm' });
+  const view2 = table.getTextureView(2);
+  table.createSampler(3, { magFilter: 'linear' });
+
+  table.setSlot(0, { kind: 'buffer', handle: 1, offset: 0, size: 64 });
+  table.setSlot(1, { kind: 'texture', handle: 2 });
+
+  // Instrument slow-path methods to verify ZERO invocations on steady-state hits!
+  let resolveSlowCalls = 0;
+  let layoutKeyStringCalls = 0;
+  const origResolve = table._resolveBindGroupEntries.bind(table);
+  const origGetLayoutId = table._getLayoutId.bind(table);
+  table._resolveBindGroupEntries = (...args) => {
+    resolveSlowCalls += 1;
+    return origResolve(...args);
+  };
+  table._getLayoutId = (...args) => {
+    layoutKeyStringCalls += 1;
+    return origGetLayoutId(...args);
+  };
+
+  // Warm cache: handle-based, different buffer offset, different layout, direct GPU entries, and slot-backed.
+  const entriesA = [
+    { binding: 0, kind: 'buffer', handle: 1, offset: 0, size: 64 },
+    { binding: 1, kind: 'texture', handle: 2 },
+    { binding: 2, kind: 'sampler', handle: 3 },
+  ];
+  const entriesAOffset = [
+    { binding: 0, kind: 'buffer', handle: 1, offset: 256, size: 64 },
+    { binding: 1, kind: 'texture', handle: 2 },
+    { binding: 2, kind: 'sampler', handle: 3 },
+  ];
+  const entriesDirect = [
+    { binding: 0, resource: { buffer: buf1, offset: 0, size: 64 } },
+    { binding: 1, resource: view2 },
+  ];
+  const entriesDirectUnsorted = [
+    { binding: 1, resource: view2 },
+    { binding: 0, resource: { buffer: buf1, offset: 0, size: 64 } },
+  ];
+
+  const bgA = table.getOrCreateBindGroup(layoutA, entriesA);
+  const bgAOffset = table.getOrCreateBindGroup(layoutA, entriesAOffset);
+  const bgB = table.getOrCreateBindGroup(layoutB, entriesA);
+  const bgDirect = table.getOrCreateBindGroup(layoutA, entriesDirect);
+  const bgSlots = table.getOrCreateBindGroup({ layout: layoutA, slots: [0, 1] });
+
+  assert.ok(bgA && bgAOffset && bgB && bgDirect && bgSlots);
+  assert.notStrictEqual(bgA, bgAOffset);
+  assert.notStrictEqual(bgA, bgB);
+  assert.notStrictEqual(bgA, bgDirect);
+  assert.equal(calls.createBindGroup.length, 5);
+  assert.equal(resolveSlowCalls, 5);
+  assert.equal(layoutKeyStringCalls, 5);
+
+  // Steady-state 30 FPS draw loop: 200 probes across all 5 bind groups (including out-of-order entries).
+  for (let i = 0; i < 40; i += 1) {
+    assert.strictEqual(table.getOrCreateBindGroup(layoutA, entriesA), bgA);
+    assert.strictEqual(table.getOrCreateBindGroup(layoutA, entriesAOffset), bgAOffset);
+    assert.strictEqual(table.getOrCreateBindGroup(layoutB, entriesA), bgB);
+    assert.strictEqual(table.getOrCreateBindGroup(layoutA, entriesDirectUnsorted), bgDirect);
+    assert.strictEqual(table.getOrCreateBindGroup({ layout: layoutA, slots: [0, 1] }), bgSlots);
+  }
+
+  // Slow path & string key builders were NEVER called during the 200 steady-state probes!
+  assert.equal(calls.createBindGroup.length, 5);
+  assert.equal(resolveSlowCalls, 5);
+  assert.equal(layoutKeyStringCalls, 5);
+
+  const stats = table.getStats();
+  assert.equal(stats.zeroAllocKeyProbes, 205);
+  assert.equal(stats.zeroAllocKeyHits, 200);
+  assert.equal(stats.hashCollisions, 0);
+  assert.equal(stats.bindGroupHits, 200);
+  assert.equal(stats.bindGroupMisses, 5);
+  assert.ok(Math.abs(stats.bindGroupHitRate - 200 / 205) < 1e-12);
+});
+
+test('ResourceTable zero-alloc fast-cache invalidates on generation bumps, destroys, and slot mutations (W320)', () => {
+  const { device, calls } = createMockDevice();
+  const table = new ResourceTable(device);
+  const layout = { kind: 'GPUBindGroupLayout', id: 'gen-inval-bgl' };
+
+  table.createBuffer(1, { size: 128, usage: GPU_BUFFER_USAGE.UNIFORM });
+  const tex1 = table.createTexture(2, { size: { width: 64, height: 64 }, format: 'rgba8unorm' });
+  table.createSampler(3, { magFilter: 'linear' });
+
+  const entries = [
+    { binding: 0, kind: 'buffer', handle: 1, offset: 0, size: 64 },
+    { binding: 1, kind: 'texture', handle: 2 },
+    { binding: 2, kind: 'sampler', handle: 3 },
+  ];
+
+  const bg1 = table.getOrCreateBindGroup(layout, entries);
+  assert.strictEqual(table.getOrCreateBindGroup(layout, entries), bg1);
+  assert.equal(table.getStats().zeroAllocKeyHits, 1);
+  assert.equal(calls.createBindGroup.length, 1);
+
+  // Overwriting buffer 1 bumps generation and proactively evicts fast-cache + LRU entry.
+  table.createBuffer(1, { size: 256, usage: GPU_BUFFER_USAGE.UNIFORM });
+  assert.equal(table.getStats().staleBindGroupEvictions, 1);
+  assert.equal(table.getStats().cachedBindGroups, 0);
+
+  const bg2 = table.getOrCreateBindGroup(layout, entries);
+  assert.ok(bg2);
+  assert.notStrictEqual(bg2, bg1);
+  assert.strictEqual(table.getOrCreateBindGroup(layout, entries), bg2);
+  assert.equal(calls.createBindGroup.length, 2);
+  assert.equal(table.getStats().zeroAllocKeyHits, 2);
+
+  // Overwriting default textureView bumps textureView generation and evicts fast-cache entry.
+  table.createTextureView(2, { baseMipLevel: 0, mipLevelCount: 1 });
+  assert.equal(table.getStats().staleBindGroupEvictions, 2);
+  const bg3 = table.getOrCreateBindGroup(layout, entries);
+  assert.ok(bg3);
+  assert.notStrictEqual(bg3, bg2);
+  assert.strictEqual(table.getOrCreateBindGroup(layout, entries), bg3);
+  assert.equal(calls.createBindGroup.length, 3);
+
+  // External texture destroy() (bypassing destroyTexture) is caught safely and evicts stale entry.
+  tex1.destroy();
+  const staleBeforeExt = table.getStats().staleBindGroupEvictions;
+  assert.equal(table.getOrCreateBindGroup(layout, entries), null);
+  assert.equal(table.getStats().staleBindGroupEvictions, staleBeforeExt + 1);
+  assert.equal(table.getStats().cachedBindGroups, 0);
+  assert.equal(calls.createBindGroup.length, 3);
+
+  // Slot-backed fast-cache invalidates cleanly when setSlot() changes offset.
+  table.createTexture(2, { size: { width: 64, height: 64 }, format: 'rgba8unorm' });
+  table.setSlot(0, { kind: 'buffer', handle: 1, offset: 0, size: 64 });
+  table.setSlot(1, { kind: 'texture', handle: 2 });
+  const bgSlot1 = table.getOrCreateBindGroup({ layout, slots: [0, 1] });
+  assert.strictEqual(table.getOrCreateBindGroup({ layout, slots: [0, 1] }), bgSlot1);
+
+  table.setSlot(0, { kind: 'buffer', handle: 1, offset: 64, size: 64 });
+  const bgSlot2 = table.getOrCreateBindGroup({ layout, slots: [0, 1] });
+  assert.ok(bgSlot2);
+  assert.notStrictEqual(bgSlot2, bgSlot1);
+  assert.strictEqual(table.getOrCreateBindGroup({ layout, slots: [0, 1] }), bgSlot2);
+});
+
+test('ResourceTable forced 64-bit hash-collision verification guarantees ZERO wrong bind groups (W320)', () => {
+  const { device, calls } = createMockDevice();
+  // Force EVERY bind group to produce the exact same 64-bit (lo, hi) hash!
+  const table = new ResourceTable(device, {
+    maxBindGroups: 32,
+    fastBindGroupBuckets: 8,
+    bindGroupHashFn: (_layoutId, _count, _slots, _handles, _gens, outPair) => {
+      if (outPair) {
+        outPair[0] = 0xdeadbeef;
+        outPair[1] = 0xcafebabe;
+      }
+      return 0xdeadbeef;
+    },
+  });
+
+  const layoutA = { kind: 'GPUBindGroupLayout', id: 'col-a' };
+  const layoutB = { kind: 'GPUBindGroupLayout', id: 'col-b' };
+
+  // Phase A: 6 distinct bind groups all sharing the exact same 64-bit hash inside the 8-slot window.
+  for (let i = 1; i <= 12; i += 1) {
+    table.createBuffer(i, { size: 256, usage: GPU_BUFFER_USAGE.UNIFORM });
+  }
+
+  const created = [];
+  for (let i = 1; i <= 4; i += 1) {
+    const bg = table.getOrCreateBindGroup(layoutA, [
+      { binding: 0, kind: 'buffer', handle: i, offset: 0, size: 64 },
+    ]);
+    assert.ok(bg);
+    created.push(bg);
+  }
+  // Distinct offset on buffer 1 and distinct layout on buffer 1 must also never alias!
+  const bgBuf1Offset = table.getOrCreateBindGroup(layoutA, [
+    { binding: 0, kind: 'buffer', handle: 1, offset: 64, size: 64 },
+  ]);
+  const bgBuf1LayoutB = table.getOrCreateBindGroup(layoutB, [
+    { binding: 0, kind: 'buffer', handle: 1, offset: 0, size: 64 },
+  ]);
+  assert.equal(calls.createBindGroup.length, 6);
+
+  // Re-probing all 6 colliding bind groups hits directly in the fast-cache with exact collision verification!
+  for (let i = 1; i <= 4; i += 1) {
+    assert.strictEqual(
+      table.getOrCreateBindGroup(layoutA, [
+        { binding: 0, kind: 'buffer', handle: i, offset: 0, size: 64 },
+      ]),
+      created[i - 1]
+    );
+  }
+  assert.strictEqual(
+    table.getOrCreateBindGroup(layoutA, [
+      { binding: 0, kind: 'buffer', handle: 1, offset: 64, size: 64 },
+    ]),
+    bgBuf1Offset
+  );
+  assert.strictEqual(
+    table.getOrCreateBindGroup(layoutB, [
+      { binding: 0, kind: 'buffer', handle: 1, offset: 0, size: 64 },
+    ]),
+    bgBuf1LayoutB
+  );
+  assert.equal(table.getStats().zeroAllocKeyHits, 6);
+  assert.ok(table.getStats().hashCollisions > 0);
+  assert.equal(calls.createBindGroup.length, 6);
+
+  // Phase B: Add 8 more colliding bind groups (total 14 > 8-slot window!) to test overflow
+  // fallback to _bindGroupCache with zero duplicate creates and zero cross-contamination.
+  for (let i = 5; i <= 12; i += 1) {
+    const bg = table.getOrCreateBindGroup(layoutA, [
+      { binding: 0, kind: 'buffer', handle: i, offset: 0, size: 64 },
+    ]);
+    assert.ok(bg);
+    created.push(bg);
+  }
+  assert.equal(calls.createBindGroup.length, 14);
+  assert.equal(new Set([...created, bgBuf1Offset, bgBuf1LayoutB]).size, 14);
+
+  // Re-probing all 14 distinct bind groups must return the exact matching object every time
+  // with ZERO extra device.createBindGroup calls!
+  for (let pass = 0; pass < 3; pass += 1) {
+    for (let i = 1; i <= 12; i += 1) {
+      const hit = table.getOrCreateBindGroup(layoutA, [
+        { binding: 0, kind: 'buffer', handle: i, offset: 0, size: 64 },
+      ]);
+      assert.strictEqual(hit, created[i - 1], `buffer ${i} must never collide with another bind group`);
+    }
+    assert.strictEqual(
+      table.getOrCreateBindGroup(layoutA, [
+        { binding: 0, kind: 'buffer', handle: 1, offset: 64, size: 64 },
+      ]),
+      bgBuf1Offset
+    );
+    assert.strictEqual(
+      table.getOrCreateBindGroup(layoutB, [
+        { binding: 0, kind: 'buffer', handle: 1, offset: 0, size: 64 },
+      ]),
+      bgBuf1LayoutB
+    );
+  }
+
+  assert.equal(calls.createBindGroup.length, 14);
+  const stats = table.getStats();
+  assert.ok(stats.hashCollisions > 0, 'forced hash collisions must be recorded in telemetry');
+  assert.ok(stats.zeroAllocKeyProbes >= 62);
+  assert.ok(stats.zeroAllocKeyHits >= 6);
+  assert.equal(stats.bindGroupHits, 48);
+  assert.equal(stats.bindGroupMisses, 14);
+  assert.equal(stats.cachedBindGroups, 14);
+});
+
+test('ResourceTable zero-alloc fast-cache preserves bounded LRU recency, clear(), and resetStats() (W320)', () => {
+  const { device, calls } = createMockDevice();
+  assert.throws(() => new ResourceTable(device, { fastBindGroupBuckets: -1 }), RangeError);
+  assert.throws(() => new ResourceTable(device, { fastBindGroupBuckets: 2.5 }), RangeError);
+
+  const table = new ResourceTable(device, { maxBindGroups: 3, fastBindGroupBuckets: 16 });
+  const layout = { kind: 'GPUBindGroupLayout', id: 'lru-fast-bgl' };
+
+  for (let i = 1; i <= 4; i += 1) {
+    table.createBuffer(i, { size: 64, usage: GPU_BUFFER_USAGE.UNIFORM });
+  }
+
+  const e1 = [{ binding: 0, kind: 'buffer', handle: 1 }];
+  const e2 = [{ binding: 0, kind: 'buffer', handle: 2 }];
+  const e3 = [{ binding: 0, kind: 'buffer', handle: 3 }];
+  const e4 = [{ binding: 0, kind: 'buffer', handle: 4 }];
+
+  const bg1 = table.getOrCreateBindGroup(layout, e1);
+  const bg2 = table.getOrCreateBindGroup(layout, e2);
+  const bg3 = table.getOrCreateBindGroup(layout, e3);
+  assert.equal(calls.createBindGroup.length, 3);
+
+  // Zero-alloc hit on e1 refreshes its LRU recency so order becomes [e2 (oldest), e3, e1 (newest)].
+  assert.strictEqual(table.getOrCreateBindGroup(layout, e1), bg1);
+  assert.equal(table.getStats().zeroAllocKeyHits, 1);
+
+  // Inserting e4 evicts e2 (LRU oldest) from BOTH _bindGroupCache and fast-cache!
+  const bg4 = table.getOrCreateBindGroup(layout, e4);
+  assert.ok(bg4);
+  assert.equal(table.getStats().lruBindGroupEvictions, 1);
+  assert.equal(table.getStats().cachedBindGroups, 3);
+
+  // e1, e3, e4 still hit via zero-alloc fast-cache without creating new bind groups.
+  assert.strictEqual(table.getOrCreateBindGroup(layout, e1), bg1);
+  assert.strictEqual(table.getOrCreateBindGroup(layout, e3), bg3);
+  assert.strictEqual(table.getOrCreateBindGroup(layout, e4), bg4);
+  assert.equal(calls.createBindGroup.length, 4);
+  assert.equal(table.getStats().zeroAllocKeyHits, 4);
+
+  // Re-probing evicted e2 misses and creates a brand-new GPUBindGroup (evicting e1, now oldest).
+  const bg2Recreated = table.getOrCreateBindGroup(layout, e2);
+  assert.ok(bg2Recreated);
+  assert.notStrictEqual(bg2Recreated, bg2);
+  assert.equal(calls.createBindGroup.length, 5);
+  assert.equal(table.getStats().lruBindGroupEvictions, 2);
+
+  // resetStats() clears zeroAllocKeyProbes, zeroAllocKeyHits, and hashCollisions while keeping cached entries live.
+  table.resetStats();
+  let stats = table.getStats();
+  assert.equal(stats.zeroAllocKeyProbes, 0);
+  assert.equal(stats.zeroAllocKeyHits, 0);
+  assert.equal(stats.hashCollisions, 0);
+  assert.equal(stats.bindGroupHits, 0);
+  assert.equal(stats.bindGroupMisses, 0);
+  assert.equal(stats.cachedBindGroups, 3);
+
+  // Live cached entry e4 immediately hits via zero-alloc fast-cache after resetStats().
+  assert.strictEqual(table.getOrCreateBindGroup(layout, e4), bg4);
+  stats = table.getStats();
+  assert.equal(stats.zeroAllocKeyProbes, 1);
+  assert.equal(stats.zeroAllocKeyHits, 1);
+  assert.equal(stats.hashCollisions, 0);
+  assert.equal(stats.bindGroupHits, 1);
+  assert.equal(stats.bindGroupHitRate, 1);
+
+  // clear({ resetStats: true }) clears fast-cache slots and resets all counters cleanly.
+  table.clear({ resetStats: true });
+  stats = table.getStats();
+  assert.equal(stats.cachedBindGroups, 0);
+  assert.equal(stats.zeroAllocKeyProbes, 0);
+  assert.equal(stats.zeroAllocKeyHits, 0);
+  assert.equal(stats.hashCollisions, 0);
+
+  // fastBindGroupBuckets: 0 disables fast-cache cleanly while preserving W267 caching.
+  const noFastTable = new ResourceTable(device, { fastBindGroupBuckets: 0 });
+  noFastTable.createBuffer(1, { size: 64, usage: GPU_BUFFER_USAGE.UNIFORM });
+  const nf1 = noFastTable.getOrCreateBindGroup(layout, e1);
+  const nf2 = noFastTable.getOrCreateBindGroup(layout, e1);
+  assert.strictEqual(nf1, nf2);
+  assert.equal(noFastTable.getStats().zeroAllocKeyProbes, 0);
+  assert.equal(noFastTable.getStats().zeroAllocKeyHits, 0);
+  assert.equal(noFastTable.getStats().bindGroupHits, 1);
+
+  for (const [k, v] of Object.entries(stats)) {
     assert.equal(typeof v, 'number', `stat ${k} must be numeric`);
     assert.ok(Number.isFinite(v), `stat ${k} must be finite`);
   }
