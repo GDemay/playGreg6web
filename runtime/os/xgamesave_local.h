@@ -30,13 +30,19 @@ inline constexpr uint64_t kDefaultQuotaBytes = 256ull * 1024 * 1024;
 inline constexpr size_t kMaxContainerNameChars = 255;
 inline constexpr size_t kMaxBlobNameChars = 128;
 inline constexpr uint64_t kMaxBlobBytes = 16ull * 1024 * 1024;
+inline constexpr size_t kMaxDisplayNameChars = 255;
 
 // Host directory that holds all saves (default "pg6-saves", relative to the working directory).
 void set_save_dir(const std::string& dir);
 std::string save_dir();
 
+// Name checks of the store (non-empty, printable, short enough for a path component).
+bool valid_container_name(const std::string& name);
+bool valid_blob_name(const std::string& name);
+
 struct ContainerInfo {
     std::string name;
+    std::string display_name;  // as last given to an update ("" when none was given)
     uint32_t blob_count = 0;
     uint64_t total_size = 0;
     uint64_t last_modified = 0;  // FILETIME ticks (UTC)
@@ -63,6 +69,8 @@ public:
     HResult read_blob(const std::string& container, const std::string& blob, std::vector<uint8_t>* out) const;
     HResult submit_update(const std::string& container, const std::vector<BlobWrite>& writes,
                           const std::vector<std::string>& deletes);
+    // Display name shown for an existing container (kept next to its blobs).
+    HResult set_display_name(const std::string& container, const std::string& display_name);
 
 private:
     std::string root_;
