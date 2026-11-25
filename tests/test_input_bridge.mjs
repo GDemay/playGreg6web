@@ -17,6 +17,8 @@ import {
   applyDeadzone,
   applyAxialDeadzone,
   applyTriggerDeadzone,
+  INPUT_SCRIPT_PRESETS,
+  ScriptedInputPlayer,
   InputBridge,
 } from '../web/input/input_bridge.js';
 
@@ -1007,4 +1009,468 @@ test('zero-alloc deadzone and snapshot reuse + steady-state gamepad polling avoi
   assert.equal(snap2.seq, seq1);
 
   bridge.destroy();
+});
+
+function createFakeClockAndTimers(initialNow = 0) {
+  let now = initialNow;
+  let nextId = 1;
+  const timeouts = new Map();
+  const intervals = new Map();
+
+  function setTimeoutFn(cb, delay = 0) {
+    const id = nextId++;
+    timeouts.set(id, { id, cb, due: now + Math.max(0, delay) });
+    return id;
+  }
+
+  function clearTimeoutFn(id) {
+    timeouts.delete(id);
+  }
+
+  function setIntervalFn(cb, period = 16) {
+    const id = nextId++;
+    const step = Math.max(1, period);
+    intervals.set(id, { id, cb, period: step, due: now + step });
+    return id;
+  }
+
+  function clearIntervalFn(id) {
+    intervals.delete(id);
+  }
+
+  function advanceTo(targetMs) {
+    assert.ok(targetMs >= now, `Cannot move fake clock backwards (${now} -> ${targetMs})`);
+    while (true) {
+      let nextDue = Infinity;
+      let kind = null;
+      let entry = null;
+
+      for (const item of timeouts.values()) {
+        if (item.due <= targetMs && item.due < nextDue) {
+          nextDue = item.due;
+          kind = 'timeout';
+          entry = item;
+        }
+      }
+      for (const item of intervals.values()) {
+        if (item.due <= targetMs && item.due < nextDue) {
+          nextDue = item.due;
+          kind = 'interval';
+          entry = item;
+        }
+      }
+
+      if (!entry) break;
+      now = nextDue;
+      if (kind === 'timeout') {
+        timeouts.delete(entry.id);
+        entry.cb();
+      } else {
+        entry.due += entry.period;
+        entry.cb();
+      }
+    }
+    now = targetMs;
+  }
+
+  return {
+    nowFn: () => now,
+    setTimeoutFn,
+    clearTimeoutFn,
+    setIntervalFn,
+    clearIntervalFn,
+    advanceTo,
+    advanceBy(deltaMs) {
+      advanceTo(now + deltaMs);
+    },
+    pendingTimeouts: () => timeouts.size,
+    pendingIntervals: () => intervals.size,
+  };
+}
+
+test('INPUT_SCRIPT_PRESETS["start-screen"] matches tools/run_native_boot.py and exact sampleAt() boundaries', () => {
+  const preset = INPUT_SCRIPT_PRESETS['start-screen'];
+  assert.ok(preset);
+  assert.equal(preset.button, INPUT_BUTTONS.A);
+  assert.equal(preset.startMs, 5000);
+  assert.equal(preset.holdMs, 100);
+  assert.equal(preset.periodMs, 1000);
+
+  // Verify parity with tools/run_native_boot.py constants.
+  const nativeBootPy = fs.readFileSync(
+    path.join(REPO_ROOT, 'tools/run_native_boot.py'),
+    'utf8'
+  );
+  assert.match(nativeBootPy, /INPUT_START_MS\s*=\s*5_000/);
+  assert.match(nativeBootPy, /INPUT_PERIOD_MS\s*=\s*1_000/);
+  assert.match(nativeBootPy, /INPUT_HOLD_MS\s*=\s*100/);
+
+  const player = new ScriptedInputPlayer('start-screen');
+  assert.equal(player.preset, 'start-screen');
+
+  // Exact boundary table:
+  // t = 0..4999 -> 0
+  // t = 5000..5099 -> BUTTON_A
+  // t = 5100..5999 -> 0
+  // t = 6000..6099 -> BUTTON_A
+  // t = 6100..6999 -> 0
+  const cases = [
+    [-10, 0, 0, 0],
+    [0, 0, 0, 0],
+    [1, 0, 0, 0],
+    [4999, 0, 0, 0],
+    [4999.9, 0, 0, 0],
+    [5000, INPUT_BUTTONS.A, 1, 1],
+    [5050, INPUT_BUTTONS.A, 1, 1],
+    [5099, INPUT_BUTTONS.A, 1, 1],
+    [5099.9, INPUT_BUTTONS.A, 1, 1],
+    [5100, 0, 0, 1],
+    [5500, 0, 0, 1],
+    [5999, 0, 0, 1],
+    [5999.9, 0, 0, 1],
+    [6000, INPUT_BUTTONS.A, 1, 2],
+    [6050, INPUT_BUTTONS.A, 1, 2],
+    [6099, INPUT_BUTTONS.A, 1, 2],
+    [6100, 0, 0, 2],
+    [120000, INPUT_BUTTONS.A, 1, 116],
+    [120100, 0, 0, 116],
+  ];
+
+  for (const [t, expectedMask, expectedActiveCount, expectedPressCount] of cases) {
+    assert.deepEqual(
+      player.sampleAt(t),
+      { buttonsMask: expectedMask, activeEventCount: expectedActiveCount },
+      `sampleAt(${t})`
+    );
+    assert.equal(player.pressCountAt(t), expectedPressCount, `pressCountAt(${t})`);
+  }
+
+  // Optional maxPresses and endMs caps on 'start-screen'.
+  const cappedByCount = new ScriptedInputPlayer('start-screen', { maxPresses: 2 });
+  assert.equal(cappedByCount.sampleAt(5000).buttonsMask, INPUT_BUTTONS.A);
+  assert.equal(cappedByCount.sampleAt(6000).buttonsMask, INPUT_BUTTONS.A);
+  assert.equal(cappedByCount.sampleAt(6100).buttonsMask, 0);
+  assert.equal(cappedByCount.sampleAt(7000).buttonsMask, 0);
+  assert.equal(cappedByCount.pressCountAt(9000), 2);
+  assert.equal(cappedByCount.nextTransitionMs(6100), null);
+
+  const cappedByEnd = new ScriptedInputPlayer('start-screen', { endMs: 6050 });
+  assert.equal(cappedByEnd.sampleAt(5000).buttonsMask, INPUT_BUTTONS.A);
+  assert.equal(cappedByEnd.sampleAt(6049).buttonsMask, INPUT_BUTTONS.A);
+  assert.equal(cappedByEnd.sampleAt(6050).buttonsMask, 0);
+  assert.equal(cappedByEnd.sampleAt(7000).buttonsMask, 0);
+  assert.equal(cappedByEnd.nextTransitionMs(6000), 6050);
+  assert.equal(cappedByEnd.nextTransitionMs(6050), null);
+});
+
+test('ScriptedInputPlayer supports custom multi-event schedules, simultaneous buttons, sticks, maxPresses, and validates inputs', () => {
+  // Unsorted multi-event schedule with simultaneous overlapping presses, string button names,
+  // bitmasks, and analog sticks.
+  const events = [
+    { atMs: 250, holdMs: 100, button: ['B', 'MENU'] },
+    { atMs: 100, holdMs: 200, buttonsMask: INPUT_BUTTONS.A | INPUT_BUTTONS.RB, sticks: { lx: 0.75, ly: -0.5 } },
+    { atMs: 400, holdMs: 50, button: 'BUTTON_X' },
+  ];
+  const player = new ScriptedInputPlayer(events);
+  assert.equal(player.preset, null);
+
+  assert.deepEqual(player.sampleAt(0), { buttonsMask: 0, activeEventCount: 0 });
+  assert.deepEqual(player.sampleAt(99), { buttonsMask: 0, activeEventCount: 0 });
+
+  assert.deepEqual(player.sampleAt(100), {
+    buttonsMask: INPUT_BUTTONS.A | INPUT_BUTTONS.RB,
+    activeEventCount: 1,
+    sticks: { lx: 0.75, ly: -0.5, rx: 0, ry: 0 },
+  });
+
+  // Overlap window [250, 300): both events active simultaneously -> OR'd buttons, activeEventCount = 2.
+  assert.deepEqual(player.sampleAt(250), {
+    buttonsMask: INPUT_BUTTONS.A | INPUT_BUTTONS.RB | INPUT_BUTTONS.B | INPUT_BUTTONS.MENU,
+    activeEventCount: 2,
+    sticks: { lx: 0.75, ly: -0.5, rx: 0, ry: 0 },
+  });
+  assert.deepEqual(player.sampleAt(299), {
+    buttonsMask: INPUT_BUTTONS.A | INPUT_BUTTONS.RB | INPUT_BUTTONS.B | INPUT_BUTTONS.MENU,
+    activeEventCount: 2,
+    sticks: { lx: 0.75, ly: -0.5, rx: 0, ry: 0 },
+  });
+
+  // [300, 350): first event released, second event still held.
+  assert.deepEqual(player.sampleAt(300), {
+    buttonsMask: INPUT_BUTTONS.B | INPUT_BUTTONS.MENU,
+    activeEventCount: 1,
+  });
+  assert.deepEqual(player.sampleAt(350), { buttonsMask: 0, activeEventCount: 0 });
+
+  // [400, 450): third event active.
+  assert.deepEqual(player.sampleAt(400), { buttonsMask: INPUT_BUTTONS.X, activeEventCount: 1 });
+  assert.deepEqual(player.sampleAt(450), { buttonsMask: 0, activeEventCount: 0 });
+  assert.equal(player.pressCountAt(500), 3);
+
+  // maxPresses caps explicit event schedules after sorting by atMs.
+  const capped = new ScriptedInputPlayer({ events, maxPresses: 2 });
+  assert.equal(capped.sampleAt(100).buttonsMask, INPUT_BUTTONS.A | INPUT_BUTTONS.RB);
+  assert.equal(capped.sampleAt(300).buttonsMask, INPUT_BUTTONS.B | INPUT_BUTTONS.MENU);
+  assert.equal(capped.sampleAt(400).buttonsMask, 0);
+  assert.equal(capped.pressCountAt(500), 2);
+
+  // Repeating rule with overlapping holdMs > periodMs and maxPresses.
+  const overlappingRepeat = new ScriptedInputPlayer({
+    button: 'Y',
+    startMs: 100,
+    holdMs: 250,
+    periodMs: 100,
+    maxPresses: 3,
+  });
+  assert.deepEqual(overlappingRepeat.sampleAt(100), { buttonsMask: INPUT_BUTTONS.Y, activeEventCount: 1 });
+  assert.deepEqual(overlappingRepeat.sampleAt(200), { buttonsMask: INPUT_BUTTONS.Y, activeEventCount: 2 });
+  assert.deepEqual(overlappingRepeat.sampleAt(300), { buttonsMask: INPUT_BUTTONS.Y, activeEventCount: 3 });
+  assert.deepEqual(overlappingRepeat.sampleAt(350), { buttonsMask: INPUT_BUTTONS.Y, activeEventCount: 2 });
+  assert.deepEqual(overlappingRepeat.sampleAt(549), { buttonsMask: INPUT_BUTTONS.Y, activeEventCount: 1 });
+  assert.deepEqual(overlappingRepeat.sampleAt(550), { buttonsMask: 0, activeEventCount: 0 });
+
+  // Validation errors.
+  assert.throws(() => new ScriptedInputPlayer('does-not-exist'), RangeError);
+  assert.throws(() => new ScriptedInputPlayer({ button: 'INVALID', startMs: 0, holdMs: 50, periodMs: 100 }), RangeError);
+  assert.throws(() => new ScriptedInputPlayer({ button: INPUT_BUTTONS.A, startMs: -1, holdMs: 50, periodMs: 100 }), RangeError);
+  assert.throws(() => new ScriptedInputPlayer({ button: INPUT_BUTTONS.A, startMs: 0, holdMs: 0, periodMs: 100 }), RangeError);
+  assert.throws(() => new ScriptedInputPlayer({ button: INPUT_BUTTONS.A, startMs: 0, holdMs: 50, periodMs: 0 }), RangeError);
+  assert.throws(() => new ScriptedInputPlayer(null), TypeError);
+});
+
+test('InputBridge scripted playback writes to 40-byte SAB and merges cleanly with live keyboard/gamepad inputs', () => {
+  const env = createMockEnv();
+  const clock = createFakeClockAndTimers(1000);
+  const bridge = new InputBridge(env.canvas, {
+    windowObj: env.win,
+    documentObj: env.doc,
+    navigatorObj: env.nav,
+  });
+
+  // Before starting any script.
+  assert.deepEqual(bridge.getScriptState(), {
+    active: false,
+    preset: null,
+    elapsedMs: 0,
+    pressCount: 0,
+    currentMask: 0,
+  });
+
+  const player = bridge.startScript('start-screen', {
+    nowFn: clock.nowFn,
+    setTimeoutFn: clock.setTimeoutFn,
+    clearTimeoutFn: clock.clearTimeoutFn,
+  });
+  assert.ok(player instanceof ScriptedInputPlayer);
+  assert.equal(clock.pendingTimeouts(), 1);
+
+  // t = 0..4999: no scripted button yet, seq untouched.
+  assert.equal(bridge.getSnapshot().buttons, 0);
+  assert.equal(bridge.getSnapshot().seq, 0);
+  assert.deepEqual(bridge.getScriptState(), {
+    active: true,
+    preset: 'start-screen',
+    elapsedMs: 0,
+    pressCount: 0,
+    currentMask: 0,
+  });
+
+  clock.advanceBy(4999);
+  assert.equal(bridge.getSnapshot().buttons, 0);
+  assert.equal(bridge.getSnapshot().seq, 0);
+
+  // t = 5000: first scripted A press fires into 40-byte SAB with valid even seqlock.
+  clock.advanceBy(1);
+  let snap = bridge.getSnapshot();
+  assert.equal(snap.buttons, INPUT_BUTTONS.A);
+  assert.equal(snap.seq, 2);
+  const dv = new DataView(bridge.sab);
+  assert.equal(dv.getUint32(INPUT_OFFSETS.BUTTONS, true), INPUT_BUTTONS.A);
+  assert.deepEqual(bridge.getScriptState(), {
+    active: true,
+    preset: 'start-screen',
+    elapsedMs: 5000,
+    pressCount: 1,
+    currentMask: INPUT_BUTTONS.A,
+  });
+
+  // Concurrent live keyboard (KeyW -> MOVE_FORWARD) + gamepad (B) merge via OR without clobbering.
+  env.win.dispatch('keydown', { code: 'KeyW' });
+  env.setGamepads([makeStandardGamepad({ buttons: { 1: 1 } })]); // B
+  bridge.pollGamepads();
+  snap = bridge.getSnapshot();
+  assert.equal(snap.buttons, INPUT_BUTTONS.A | INPUT_BUTTONS.MOVE_FORWARD | INPUT_BUTTONS.B);
+  approxEqual(snap.ly, 1.0);
+
+  // t = 5100: scripted A releases, live keyboard + gamepad buttons remain intact!
+  clock.advanceBy(100);
+  snap = bridge.getSnapshot();
+  assert.equal(snap.buttons, INPUT_BUTTONS.MOVE_FORWARD | INPUT_BUTTONS.B);
+  approxEqual(snap.ly, 1.0);
+  assert.deepEqual(bridge.getScriptState(), {
+    active: true,
+    preset: 'start-screen',
+    elapsedMs: 5100,
+    pressCount: 1,
+    currentMask: 0,
+  });
+
+  // Live Enter (also maps to INPUT_BUTTONS.A) stays held even when scripted A releases at t = 6100.
+  env.win.dispatch('keydown', { code: 'Enter' });
+  clock.advanceBy(900); // t = 6000 (scripted A pressed)
+  assert.equal(bridge.getScriptState().pressCount, 2);
+  assert.equal(bridge.getScriptState().currentMask, INPUT_BUTTONS.A);
+  assert.equal(
+    bridge.getSnapshot().buttons,
+    INPUT_BUTTONS.A | INPUT_BUTTONS.MOVE_FORWARD | INPUT_BUTTONS.B
+  );
+
+  clock.advanceBy(100); // t = 6100 (scripted A released, Enter still held)
+  assert.equal(bridge.getScriptState().currentMask, 0);
+  assert.equal(
+    bridge.getSnapshot().buttons,
+    INPUT_BUTTONS.A | INPUT_BUTTONS.MOVE_FORWARD | INPUT_BUTTONS.B
+  );
+
+  // Release live Enter and gamepad; keep KeyW held.
+  env.win.dispatch('keyup', { code: 'Enter' });
+  env.setGamepads([null]);
+  bridge.pollGamepads();
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.MOVE_FORWARD);
+
+  // Advance to t = 7050 (mid-press of 3rd scripted A) and call stopScript():
+  // clears scripted A immediately from SAB, cancels timer, preserves live KeyW!
+  clock.advanceBy(950); // t = 7050
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.MOVE_FORWARD | INPUT_BUTTONS.A);
+  assert.equal(bridge.getScriptState().pressCount, 3);
+
+  bridge.stopScript();
+  assert.equal(clock.pendingTimeouts(), 0);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.MOVE_FORWARD);
+  assert.deepEqual(bridge.getScriptState(), {
+    active: false,
+    preset: 'start-screen',
+    elapsedMs: 7050,
+    pressCount: 3,
+    currentMask: 0,
+  });
+
+  // Advancing clock further must NOT re-trigger stopped script.
+  clock.advanceBy(5000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.MOVE_FORWARD);
+
+  bridge.destroy();
+});
+
+test('InputBridge scripted playback supports interval mode, scripted sticks, auto-completion, blur resilience, and destroy()/detach() cleanup', () => {
+  const env = createMockEnv();
+  const clock = createFakeClockAndTimers(0);
+  const bridge = new InputBridge(env.canvas, {
+    windowObj: env.win,
+    documentObj: env.doc,
+    navigatorObj: env.nav,
+  });
+
+  // 1. Interval-driven playback with finite maxPresses auto-stops & cleans up interval.
+  let completedState = null;
+  bridge.startScript(
+    {
+      button: INPUT_BUTTONS.A,
+      startMs: 100,
+      holdMs: 50,
+      periodMs: 200,
+      maxPresses: 2,
+      sticks: { lx: 0.5, ly: -0.25 },
+    },
+    {
+      nowFn: clock.nowFn,
+      setIntervalFn: clock.setIntervalFn,
+      clearIntervalFn: clock.clearIntervalFn,
+      tickMs: 25,
+      onComplete: (state) => {
+        completedState = state;
+      },
+    }
+  );
+  assert.equal(clock.pendingIntervals(), 1);
+
+  clock.advanceTo(100);
+  let snap = bridge.getSnapshot();
+  assert.equal(snap.buttons, INPUT_BUTTONS.A);
+  approxEqual(snap.lx, 0.5);
+  approxEqual(snap.ly, -0.25);
+
+  // Live WASD overrides scripted sticks while held, then yields back to scripted sticks on release.
+  env.win.dispatch('keydown', { code: 'KeyA' }); // keyLx = -1
+  snap = bridge.getSnapshot();
+  approxEqual(snap.lx, -1.0);
+  approxEqual(snap.ly, -0.25);
+
+  // Window blur clears stuck human keyboard key without stopping active scripted playback.
+  env.win.dispatch('blur');
+  snap = bridge.getSnapshot();
+  assert.equal(snap.buttons, INPUT_BUTTONS.A);
+  approxEqual(snap.lx, 0.5);
+  approxEqual(snap.ly, -0.25);
+
+  // Release after press 1 (t = 150), fire press 2 (t = 300), finish at t = 350 -> auto-stops.
+  clock.advanceTo(150);
+  snap = bridge.getSnapshot();
+  assert.equal(snap.buttons, 0);
+  approxEqual(snap.lx, 0);
+  approxEqual(snap.ly, 0);
+
+  clock.advanceTo(300);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+
+  clock.advanceTo(350);
+  assert.equal(bridge.getSnapshot().buttons, 0);
+  assert.equal(clock.pendingIntervals(), 0);
+  assert.equal(bridge.getScriptState().active, false);
+  assert.equal(bridge.getScriptState().pressCount, 2);
+  assert.ok(completedState !== null && completedState.active === false && completedState.pressCount === 2);
+
+  // 2. destroy() while a script is actively holding a button cancels timers and zeros SAB.
+  bridge.startScript(
+    [{ atMs: 0, holdMs: 500, button: INPUT_BUTTONS.MENU }],
+    {
+      nowFn: clock.nowFn,
+      setTimeoutFn: clock.setTimeoutFn,
+      clearTimeoutFn: clock.clearTimeoutFn,
+    }
+  );
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.MENU);
+  assert.equal(clock.pendingTimeouts(), 1);
+
+  bridge.destroy();
+  assert.equal(clock.pendingTimeouts(), 0);
+  assert.equal(bridge.getScriptState().active, false);
+  assert.equal(bridge.getScriptState().currentMask, 0);
+  assert.equal(bridge.getSnapshot().buttons, 0);
+
+  // Starting a script after destroy() is safely ignored.
+  assert.equal(bridge.startScript('start-screen'), null);
+  assert.equal(clock.pendingTimeouts(), 0);
+
+  // 3. detach() alias also stops active scripts and cleans up timers in headless mode without SAB/timers.
+  const headlessClock = createFakeClockAndTimers(0);
+  const headlessBridge = new InputBridge({
+    windowObj: null,
+    documentObj: null,
+    navigatorObj: null,
+    sharedArrayBufferCtor: null,
+    atomicsObj: null,
+  });
+  headlessBridge.startScript('start-screen', {
+    nowFn: headlessClock.nowFn,
+    setTimeoutFn: headlessClock.setTimeoutFn,
+    clearTimeoutFn: headlessClock.clearTimeoutFn,
+  });
+  headlessClock.advanceTo(5000);
+  assert.equal(headlessBridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  headlessBridge.detach();
+  assert.equal(headlessClock.pendingTimeouts(), 0);
+  assert.equal(headlessBridge.disposed, true);
+  assert.equal(headlessBridge.getScriptState().active, false);
+  assert.equal(headlessBridge.getSnapshot().buttons, 0);
 });
