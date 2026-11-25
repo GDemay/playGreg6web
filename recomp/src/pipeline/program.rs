@@ -77,11 +77,12 @@
 //! (`required_guest_unavailable`, e.g. `vcruntime140.dll` not supplied) leaves the import on the
 //! bridge.
 //!
-//! DLL roles: `bink2scarlett.dll xcurl.dll libhttpclient.gdk.dll xboxbvhbuilder.dll
-//! amd_fidelityfx_loader_xbox.dll amd_fidelityfx_upscaler_xbox.dll` are host-only by default: the
-//! runtime replaces them on purpose (offline networking, video and GPU paths, O14), so they are
-//! never built and their imports go to the bridge. Every other supplied DLL can be a guest
-//! module.
+//! DLL roles: `xcurl.dll libhttpclient.gdk.dll xboxbvhbuilder.dll amd_fidelityfx_loader_xbox.dll
+//! amd_fidelityfx_upscaler_xbox.dll` are host-only by default: the runtime replaces them on
+//! purpose (offline networking and GPU paths, O14), so they are never built and their imports go
+//! to the bridge. Every other supplied DLL can be a guest module; `bink2scarlett.dll` (video,
+//! decoded on the CPU) is built when supplied and its shims (`pg6_mw_bink_*`) serve only a
+//! program without it.
 //!
 //! Overrides take precedence over the table, in the order given: `--bind <dll>!<symbol>=<action>`,
 //! `--guest-dll <dll>` (guest role, built even when unreferenced), `--host-dll <dll>` (host-only),
