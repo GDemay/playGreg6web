@@ -17,7 +17,9 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
+const INDEX_HTML_PATH = path.join(REPO_ROOT, 'web', 'index.html');
 const OVERLAY_CSS_PATH = path.join(REPO_ROOT, 'web', 'ui', 'overlay.css');
+const indexHtml = fs.readFileSync(INDEX_HTML_PATH, 'utf8');
 const overlayCss = fs.readFileSync(OVERLAY_CSS_PATH, 'utf8');
 
 /**
@@ -418,4 +420,115 @@ test('W226 preserves 100% of existing Astryx overlay selectors, tokens, and resp
 
   const hudScrollBody = findRuleBody(parsedCss.rules, '#hud-body');
   assert.match(hudScrollBody, /max-height:\s*calc\(100vh - 72px\)/);
+});
+
+test('W232 web/index.html defines a clean inline SVG data-URI favicon in <head> to prevent /favicon.ico 404s', () => {
+  const headMatch = /<head>([\s\S]*?)<\/head>/i.exec(indexHtml);
+  assert.ok(headMatch, 'web/index.html must contain a <head> block');
+  const headHtml = headMatch[1];
+
+  const iconMatch = /<link\b([^>]*\brel="icon"[^>]*)\/?>/i.exec(headHtml);
+  assert.ok(iconMatch, 'web/index.html <head> must contain a <link rel="icon"> tag');
+  const attrs = iconMatch[1];
+
+  assert.match(attrs, /\btype="image\/svg\+xml"/i, 'Favicon link must declare type="image/svg+xml"');
+  const hrefMatch = /\bhref="(data:image\/svg\+xml,[^"]+)"/i.exec(attrs);
+  assert.ok(hrefMatch, 'Favicon link must use an inline data:image/svg+xml,... URI');
+
+  const dataUri = hrefMatch[1];
+  const encodedSvg = dataUri.slice('data:image/svg+xml,'.length);
+
+  // Must be compact and safely percent-encoded (no raw #, <, >, or whitespace).
+  assert.ok(encodedSvg.length > 0 && encodedSvg.length < 512, 'Inline SVG favicon payload must remain compact');
+  assert.doesNotMatch(encodedSvg, /[#<>\s]/, 'Inline SVG data-URI must percent-encode #, <, >, and spaces');
+
+  const decodedSvg = decodeURIComponent(encodedSvg);
+  assert.match(decodedSvg, /^<svg\b[^>]*xmlns=['"]http:\/\/www\.w3\.org\/2000\/svg['"][^>]*>/);
+  assert.match(decodedSvg, /\bviewBox=['"]0 0 32 32['"]/);
+  assert.match(decodedSvg, /<\/svg>$/);
+  assert.match(decodedSvg, /<(?:rect|path|polygon|circle)\b/, 'Favicon must use minimal geometric SVG primitives');
+  assert.doesNotMatch(decodedSvg, /<script\b|on[a-z]+\s*=|https?:\/\/(?!www\.w3\.org\/2000\/svg)|\bid=/i);
+});
+
+test('W232 web/ui/overlay.css provides smooth fade-out helpers and frosted high-contrast splash backdrop classes', () => {
+  const rootBody = findRuleBody(parsedCss.rules, ':root');
+  for (const token of [
+    '--pg6-splash-fade',
+    '--pg6-splash-ease',
+    '--pg6-splash-backdrop',
+    '--pg6-splash-backdrop-strong',
+    '--pg6-splash-pill-border',
+  ]) {
+    assert.match(
+      rootBody,
+      new RegExp(`${token}\\s*:`),
+      `W232 custom property "${token}" must be defined in :root`
+    );
+  }
+
+  // Smooth fade-out transition helpers.
+  const fadeTransitionBody = findRuleBody(parsedCss.rules, '.pg6-fade-transition');
+  assert.match(fadeTransitionBody, /\bopacity\s*:\s*1\s*;/);
+  assert.match(fadeTransitionBody, /\btransition\s*:[\s\S]*opacity\s+var\(--pg6-splash-fade/);
+
+  const fadeOutBody = findRuleBody(parsedCss.rules, '.pg6-fade-out');
+  assert.match(fadeOutBody, /\bopacity\s*:\s*0\s*;/);
+  assert.match(fadeOutBody, /\bpointer-events\s*:\s*none\s*;/);
+  assert.match(fadeOutBody, /\btransition\s*:[\s\S]*opacity\s+var\(--pg6-splash-fade/);
+
+  const splashRootFadeBody = findRuleBody(parsedCss.rules, '#splash-overlay-root .pg6-splash');
+  assert.match(splashRootFadeBody, /\btransition\s*:\s*opacity\s+var\(--pg6-splash-fade/);
+
+  const splashRootFadingBody = findRuleBody(
+    parsedCss.rules,
+    '#splash-overlay-root .pg6-splash.pg6-splash--fading'
+  );
+  assert.match(splashRootFadingBody, /\bopacity\s*:\s*0\s*;/);
+  assert.match(splashRootFadingBody, /\bpointer-events\s*:\s*none\s*;/);
+
+  // Frosted high-contrast backdrop classes for splash status pill & panel/spinner/Greg overlay.
+  const frostedBody = findRuleBody(parsedCss.rules, '.pg6-splash-frosted');
+  assert.match(frostedBody, /\bbackground\s*:\s*var\(--pg6-splash-backdrop\)\s*;/);
+  assert.match(frostedBody, /\bbackdrop-filter\s*:\s*blur\(/);
+  assert.match(frostedBody, /-webkit-backdrop-filter\s*:\s*blur\(/);
+
+  const statusPillBody = findRuleBody(parsedCss.rules, '.pg6-splash-status-pill');
+  assert.match(statusPillBody, /\bborder-radius\s*:\s*var\(--radius-full\)\s*;/);
+  assert.match(statusPillBody, /\bbackground\s*:\s*var\(--pg6-splash-backdrop-strong\)\s*;/);
+  assert.match(statusPillBody, /\bcolor\s*:\s*var\(--color-text-strong\)\s*;/);
+  assert.match(statusPillBody, /\bbackdrop-filter\s*:\s*blur\(/);
+  assert.match(statusPillBody, /-webkit-backdrop-filter\s*:\s*blur\(/);
+
+  const splashPanelBody = findRuleBody(parsedCss.rules, '#splash-overlay-root .pg6-splash__panel');
+  assert.match(splashPanelBody, /\bbackground\s*:\s*var\(--pg6-splash-backdrop\)\s*;/);
+  assert.match(splashPanelBody, /\bbackdrop-filter\s*:\s*blur\(/);
+  assert.match(splashPanelBody, /\bcontain\s*:\s*layout\s+style\s+paint\s*;/);
+
+  const splashStageBody = findRuleBody(parsedCss.rules, '#splash-overlay-root .pg6-splash__stage');
+  assert.match(splashStageBody, /\bcolor\s*:\s*var\(--color-text-strong\)\s*;/);
+
+  const splashSpinnerBody = findRuleBody(parsedCss.rules, '#splash-overlay-root .pg6-splash__spinner');
+  assert.match(splashSpinnerBody, /\btransition\s*:/);
+
+  const splashGregBody = findRuleBody(parsedCss.rules, '#splash-overlay-root .pg6-splash__greg');
+  assert.match(splashGregBody, /\bbox-shadow\s*:/);
+
+  // Reduced-motion block must also disable transitions on the new W232 helpers.
+  const reducedMotionBlock = parsedCss.mediaBlocks.find((block) =>
+    /@media\s*\(\s*prefers-reduced-motion\s*:\s*reduce\s*\)/i.test(block.prelude)
+  );
+  assert.ok(reducedMotionBlock, 'Expected prefers-reduced-motion block');
+  for (const selector of [
+    '.pg6-fade-transition',
+    '.pg6-fade-out',
+    '#splash-overlay-root .pg6-splash',
+    '#splash-overlay-root .pg6-splash__spinner',
+  ]) {
+    const body = findRuleBody(reducedMotionBlock.rules, selector);
+    assert.match(
+      body,
+      /\btransition\s*:\s*none\s*!important\s*;/,
+      `prefers-reduced-motion must disable transitions on "${selector}"`
+    );
+  }
 });
