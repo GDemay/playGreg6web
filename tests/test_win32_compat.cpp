@@ -1,3 +1,4 @@
+#include <chrono>
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -1366,6 +1367,16 @@ static void test_stall_compensation() {
     CHECK(b >= a);                              // monotonic
     CHECK(b - a < 1'000'000'000LL);             // stall not visible to guest
     CHECK(GetTickCount64() < 1000u + static_cast<uint64_t>(b / 1'000'000LL));
+    ResetHostStallForTesting();
+    {
+        HostStallScope fast;
+    }
+    CHECK(TotalHostStallNs() == 0);
+    {
+        HostStallScope slow;
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    }
+    CHECK(TotalHostStallNs() >= kHostStallThresholdNs);
     ResetHostStallForTesting();
 }
 
