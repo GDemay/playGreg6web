@@ -25,6 +25,7 @@ const {
   sanitizeDismissReason,
   isHudHiddenQuery,
   isGregQuery,
+  resolveDefaultGregMode,
   isSplashHoldQuery,
   SplashOverlayController,
   DEFAULT_FADE_MS,
@@ -372,7 +373,10 @@ test('constructor validates options and mounts accessible root', () => {
   const state = controller.getState();
   assert.equal(state.visible, true);
   assert.equal(state.destroyed, false);
-  assert.equal(state.usingFallback, true);
+  assert.equal(state.gregMode, true);
+  assert.equal(state.gregBackdropActive, true);
+  assert.equal(state.activeSplashImageUrl, './assets/greg.png');
+  assert.equal(state.usingFallback, false);
   assert.ok(state.root);
   assert.equal(state.root.parentNode, documentObj.body);
   assert.equal(state.root.getAttribute('role'), 'status');
@@ -381,16 +385,21 @@ test('constructor validates options and mounts accessible root', () => {
   controller.destroy();
 });
 
-test('binds splashImageUrl to img src when provided', () => {
+test('binds splashImageUrl to img src when provided and Greg mode is disabled', () => {
   const { controller } = createController({
     splashImageUrl: '/game/xbs_splash.png',
+    gregMode: false,
   });
   const state = controller.getState();
   assert.equal(state.splashImageUrl, '/game/xbs_splash.png');
+  assert.equal(state.activeSplashImageUrl, '/game/xbs_splash.png');
+  assert.equal(state.gregBackdropActive, false);
   assert.equal(state.usingFallback, false);
   const img = state.root.querySelector('.pg6-splash__img');
   assert.ok(img);
   assert.equal(img.getAttribute('src'), '/game/xbs_splash.png');
+  assert.equal(img.style.objectFit, 'cover');
+  assert.equal(img.classList.contains('pg6-splash__img--greg'), false);
   assert.equal(img.hidden, false);
   const fallback = state.root.querySelector('.pg6-splash__fallback');
   assert.equal(fallback.hidden, true);
@@ -400,6 +409,7 @@ test('binds splashImageUrl to img src when provided', () => {
 test('image onerror falls back to built-in CSS/SVG without throwing', () => {
   const { controller } = createController({
     splashImageUrl: '/game/missing-splash.png',
+    gregMode: false,
   });
   const img = controller.getState().root.querySelector('.pg6-splash__img');
   assert.equal(controller.getState().usingFallback, false);
@@ -416,10 +426,11 @@ test('image onerror falls back to built-in CSS/SVG without throwing', () => {
   controller.destroy();
 });
 
-test('null splashImageUrl uses fallback immediately', () => {
-  const { controller } = createController({ splashImageUrl: null });
+test('null splashImageUrl uses fallback immediately when Greg mode is disabled', () => {
+  const { controller } = createController({ splashImageUrl: null, gregMode: false });
   const state = controller.getState();
   assert.equal(state.usingFallback, true);
+  assert.equal(state.gregBackdropActive, false);
   const img = state.root.querySelector('.pg6-splash__img');
   assert.equal(img.hidden, true);
   const fallback = state.root.querySelector('.pg6-splash__fallback');
@@ -2734,4 +2745,239 @@ test('spinning Greg splash spinner renders assets/greg.png by default, degrades 
     minCtrl.dismiss({ fadeMs: 0 });
     minCtrl.destroy();
   });
+});
+
+test('default Greg splash backdrop replaces /game/xbs_splash.png while keeping Spinning Greg and centered dark styling', () => {
+  assert.equal(typeof resolveDefaultGregMode, 'function');
+  assert.equal(resolveDefaultGregMode(''), true);
+  assert.equal(resolveDefaultGregMode(null), true);
+  assert.equal(resolveDefaultGregMode('?greg=1'), true);
+  assert.equal(resolveDefaultGregMode('?greg=0'), false);
+  assert.equal(resolveDefaultGregMode('?greg=false'), false);
+  assert.equal(resolveDefaultGregMode('?greg=off'), false);
+  assert.equal(resolveDefaultGregMode('?greg=no'), false);
+
+  const doc = new MockDocument();
+  const { controller } = createController({
+    documentObj: doc,
+    splashImageUrl: '/game/xbs_splash.png',
+  });
+
+  const root = controller.getState().root;
+  const media = root.querySelector('.pg6-splash__media');
+  const img = root.querySelector('.pg6-splash__img');
+  const fallback = root.querySelector('.pg6-splash__fallback');
+  const spinner = root.querySelector('.pg6-splash__spinner');
+  const gregSpinner = root.querySelector('.pg6-splash__greg');
+
+  // 1) Initial mount uses Greg backdrop and keeps Spinning Greg in the bottom Astryx card.
+  const initial = controller.getState();
+  assert.equal(initial.gregMode, true);
+  assert.equal(initial.gregBackdropActive, true);
+  assert.equal(initial.splashImageUrl, '/game/xbs_splash.png');
+  assert.equal(initial.activeSplashImageUrl, './assets/greg.png');
+  assert.equal(initial.usingFallback, false);
+  assert.equal(controller.getStats().gregBackdropActive, true);
+  assert.equal(root.getAttribute('data-greg-backdrop'), 'true');
+  assert.equal(media.classList.contains('pg6-splash__media--greg'), true);
+  assert.equal(media.getAttribute('data-greg-backdrop'), 'true');
+  assert.equal(img.getAttribute('src'), './assets/greg.png');
+  assert.equal(img.getAttribute('alt'), 'Greg');
+  assert.equal(img.getAttribute('data-greg-backdrop'), 'true');
+  assert.equal(img.classList.contains('pg6-splash__img--greg'), true);
+  assert.equal(img.style.objectFit, 'contain');
+  assert.equal(img.hidden, false);
+  assert.equal(fallback.hidden, true);
+  assert.equal(spinner.classList.contains('pg6-splash__spinner--greg'), true);
+  assert.equal(gregSpinner.hidden, false);
+  assert.equal(gregSpinner.getAttribute('src'), './assets/greg.png');
+
+  // 2) Calling setSplashImageUrl() / setSplashImage() later stores original URL but keeps Greg backdrop active.
+  const afterSet = controller.setSplashImageUrl('/game/Assets/xbs_splash.png');
+  assert.equal(afterSet.splashImageUrl, '/game/Assets/xbs_splash.png');
+  assert.equal(afterSet.activeSplashImageUrl, './assets/greg.png');
+  assert.equal(afterSet.gregBackdropActive, true);
+  assert.equal(img.getAttribute('src'), './assets/greg.png');
+  assert.equal(img.style.objectFit, 'contain');
+  assert.equal(img.classList.contains('pg6-splash__img--greg'), true);
+
+  // 3) Verify SHARED_CSS and web/ui/overlay.css style the centered Greg backdrop on a dark #0b0c10 vignette.
+  const styleEl = doc.head.children.find((el) => el.getAttribute('data-pg6-splash-style') === '1');
+  assert.ok(styleEl);
+  assert.match(styleEl.textContent, /\.pg6-splash\[data-greg-backdrop="true"\]\{background:#0b0c10;\}/);
+  assert.match(styleEl.textContent, /\.pg6-splash__media--greg\{[^}]*radial-gradient\([^}]*#0b0c10/);
+  assert.match(
+    styleEl.textContent,
+    /\.pg6-splash__img\.pg6-splash__img--greg\{[^}]*width:min\(340px,46vmin\)[^}]*max-width:70vw;max-height:55vh;object-fit:contain;/
+  );
+
+  const overlayCss = fs.readFileSync(path.join(REPO_ROOT, 'web', 'ui', 'overlay.css'), 'utf8');
+  assert.match(overlayCss, /#splash-overlay-root\s+\.pg6-splash\[data-greg-backdrop="true"\][\s\S]*#0b0c10/);
+  assert.match(overlayCss, /#splash-overlay-root\s+\.pg6-splash__media--greg[\s\S]*radial-gradient/);
+  assert.match(
+    overlayCss,
+    /#splash-overlay-root\s+\.pg6-splash__img\.pg6-splash__img--greg[\s\S]*width:\s*min\(340px,\s*46vmin\)[\s\S]*max-width:\s*70vw;[\s\S]*max-height:\s*55vh;[\s\S]*object-fit:\s*contain;/
+  );
+
+  controller.destroy();
+});
+
+test('opting out via ?greg=0 or gregMode: false renders original /game/xbs_splash.png with object-fit: cover', () => {
+  // 1) Opt-out via ?greg=0 query string.
+  const viaQuery = createController({
+    locationSearch: '?greg=0',
+    splashImageUrl: null,
+  });
+  const qRoot = viaQuery.controller.getState().root;
+  const qImg = qRoot.querySelector('.pg6-splash__img');
+  const qMedia = qRoot.querySelector('.pg6-splash__media');
+  const qFallback = qRoot.querySelector('.pg6-splash__fallback');
+
+  assert.equal(viaQuery.controller.getState().gregMode, false);
+  assert.equal(viaQuery.controller.getState().gregBackdropActive, false);
+  assert.equal(viaQuery.controller.getState().usingFallback, true);
+  assert.equal(qImg.hidden, true);
+  assert.equal(qFallback.hidden, false);
+
+  viaQuery.controller.setSplashImageUrl('/game/xbs_splash.png');
+  assert.equal(viaQuery.controller.getState().splashImageUrl, '/game/xbs_splash.png');
+  assert.equal(viaQuery.controller.getState().activeSplashImageUrl, '/game/xbs_splash.png');
+  assert.equal(viaQuery.controller.getState().gregBackdropActive, false);
+  assert.equal(viaQuery.controller.getState().usingFallback, false);
+  assert.equal(qRoot.getAttribute('data-greg-backdrop'), 'false');
+  assert.equal(qMedia.classList.contains('pg6-splash__media--greg'), false);
+  assert.equal(qImg.getAttribute('src'), '/game/xbs_splash.png');
+  assert.equal(qImg.getAttribute('alt'), 'Local splash');
+  assert.equal(qImg.classList.contains('pg6-splash__img--greg'), false);
+  assert.equal(qImg.style.objectFit, 'cover');
+  assert.equal(qImg.hidden, false);
+  assert.equal(qFallback.hidden, true);
+  viaQuery.controller.destroy();
+
+  // 2) Opt-out via constructor gregMode: false.
+  const viaOpt = createController({
+    gregMode: false,
+    splashImageUrl: '/game/xbs_splash.png',
+  });
+  const oRoot = viaOpt.controller.getState().root;
+  const oImg = oRoot.querySelector('.pg6-splash__img');
+  assert.equal(viaOpt.controller.getState().gregBackdropActive, false);
+  assert.equal(oImg.getAttribute('src'), '/game/xbs_splash.png');
+  assert.equal(oImg.style.objectFit, 'cover');
+  assert.equal(oImg.classList.contains('pg6-splash__img--greg'), false);
+  viaOpt.controller.destroy();
+});
+
+test('toggling Greg mode switches cleanly between Greg backdrop and original splash URL or SVG fallback', () => {
+  const { controller, documentObj } = createController({ splashImageUrl: null });
+  const root = controller.getState().root;
+  const media = root.querySelector('.pg6-splash__media');
+  const img = root.querySelector('.pg6-splash__img');
+  const fallback = root.querySelector('.pg6-splash__fallback');
+  const spinner = root.querySelector('.pg6-splash__spinner');
+
+  // Late discovery of /game/xbs_splash.png while Greg mode is ON.
+  controller.setSplashImageUrl('/game/xbs_splash.png');
+  assert.equal(img.getAttribute('src'), './assets/greg.png');
+  assert.equal(img.style.objectFit, 'contain');
+  assert.equal(controller.getState().gregBackdropActive, true);
+
+  // 3x click toggles Greg OFF -> immediately restores /game/xbs_splash.png with cover fit.
+  spinner.dispatch('click');
+  spinner.dispatch('click');
+  spinner.dispatch('click');
+  assert.equal(controller.getState().gregMode, false);
+  assert.equal(controller.getState().gregBackdropActive, false);
+  assert.equal(controller.getState().activeSplashImageUrl, '/game/xbs_splash.png');
+  assert.equal(img.getAttribute('src'), '/game/xbs_splash.png');
+  assert.equal(img.style.objectFit, 'cover');
+  assert.equal(img.classList.contains('pg6-splash__img--greg'), false);
+  assert.equal(media.classList.contains('pg6-splash__media--greg'), false);
+  assert.equal(root.getAttribute('data-greg-backdrop'), 'false');
+  assert.equal(img.hidden, false);
+  assert.equal(fallback.hidden, true);
+
+  // Typing "greg" toggles Greg back ON -> restores centered Greg backdrop.
+  for (const ch of 'greg') {
+    documentObj.dispatch('keydown', { key: ch });
+  }
+  assert.equal(controller.getState().gregMode, true);
+  assert.equal(controller.getState().gregBackdropActive, true);
+  assert.equal(controller.getState().activeSplashImageUrl, './assets/greg.png');
+  assert.equal(img.getAttribute('src'), './assets/greg.png');
+  assert.equal(img.style.objectFit, 'contain');
+  assert.equal(img.classList.contains('pg6-splash__img--greg'), true);
+  assert.equal(media.classList.contains('pg6-splash__media--greg'), true);
+  assert.equal(root.getAttribute('data-greg-backdrop'), 'true');
+
+  // Clearing original splashImageUrl and toggling Greg OFF falls back cleanly to built-in SVG.
+  controller.setSplashImageUrl(null);
+  assert.equal(img.getAttribute('src'), './assets/greg.png');
+  controller.setGregMode(false);
+  assert.equal(controller.getState().gregBackdropActive, false);
+  assert.equal(controller.getState().usingFallback, true);
+  assert.equal(controller.getState().activeSplashImageUrl, null);
+  assert.equal(img.hidden, true);
+  assert.equal(fallback.hidden, false);
+
+  // Toggling back ON brings Greg backdrop back.
+  controller.toggleGregMode();
+  assert.equal(controller.getState().gregBackdropActive, true);
+  assert.equal(controller.getState().usingFallback, false);
+  assert.equal(img.hidden, false);
+  assert.equal(img.getAttribute('src'), './assets/greg.png');
+  assert.equal(fallback.hidden, true);
+  controller.destroy();
+});
+
+test('Greg backdrop degrades gracefully when ./assets/greg.png fails to load', () => {
+  // 1) With a stored original splashImageUrl, Greg load error falls back to /game/xbs_splash.png,
+  //    and a second error falls back to built-in CSS/SVG.
+  const withOriginal = createController({ splashImageUrl: '/game/xbs_splash.png' });
+  const wRoot = withOriginal.controller.getState().root;
+  const wImg = wRoot.querySelector('.pg6-splash__img');
+  const wMedia = wRoot.querySelector('.pg6-splash__media');
+  const wFallback = wRoot.querySelector('.pg6-splash__fallback');
+
+  assert.equal(wImg.getAttribute('src'), './assets/greg.png');
+  assert.doesNotThrow(() => wImg.dispatch('error'));
+
+  let state = withOriginal.controller.getState();
+  assert.equal(state.gregBackdropFailed, true);
+  assert.equal(state.gregBackdropActive, false);
+  assert.equal(state.imageFailed, false);
+  assert.equal(state.usingFallback, false);
+  assert.equal(state.activeSplashImageUrl, '/game/xbs_splash.png');
+  assert.equal(wImg.getAttribute('src'), '/game/xbs_splash.png');
+  assert.equal(wImg.style.objectFit, 'cover');
+  assert.equal(wImg.classList.contains('pg6-splash__img--greg'), false);
+  assert.equal(wMedia.classList.contains('pg6-splash__media--greg'), false);
+  assert.equal(wImg.hidden, false);
+  assert.equal(wFallback.hidden, true);
+
+  // If the fallback /game/xbs_splash.png also fails, degrade cleanly to built-in SVG.
+  assert.doesNotThrow(() => wImg.dispatch('error'));
+  state = withOriginal.controller.getState();
+  assert.equal(state.imageFailed, true);
+  assert.equal(state.usingFallback, true);
+  assert.equal(state.activeSplashImageUrl, null);
+  assert.equal(wImg.hidden, true);
+  assert.equal(wFallback.hidden, false);
+  withOriginal.controller.destroy();
+
+  // 2) Without a stored original splashImageUrl, Greg load error falls back immediately to SVG.
+  const withoutOriginal = createController({ splashImageUrl: null });
+  const nRoot = withoutOriginal.controller.getState().root;
+  const nImg = nRoot.querySelector('.pg6-splash__img');
+  const nFallback = nRoot.querySelector('.pg6-splash__fallback');
+
+  assert.equal(nImg.getAttribute('src'), './assets/greg.png');
+  assert.doesNotThrow(() => nImg.dispatch('error'));
+  const nState = withoutOriginal.controller.getState();
+  assert.equal(nState.gregBackdropFailed, true);
+  assert.equal(nState.gregBackdropActive, false);
+  assert.equal(nState.usingFallback, true);
+  assert.equal(nImg.hidden, true);
+  assert.equal(nFallback.hidden, false);
+  withoutOriginal.controller.destroy();
 });
