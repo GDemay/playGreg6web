@@ -9,12 +9,17 @@ import { BootTracer } from '../web/telemetry/boot_tracer.js';
 
 const {
   DEFAULT_MAX_ROWS,
+  DEFAULT_MAX_TOP_MISSING_SHADERS,
   EXPORT_FORMAT,
   EXPORT_SCHEMA_VERSION,
   BOOT_STAGE_ORDER,
   STAGE_NAMES,
   ALLOWED_SWAPCHAIN_FORMATS,
   sanitizeSwapchainFormat,
+  formatOnePercentLowFps,
+  formatP99FrameMs,
+  normalizeTopMissingShaders,
+  formatTopMissingShaders,
   formatMissingShaderRow,
   buildMissingShaderExport,
   GpuBootPanelController,
@@ -69,6 +74,8 @@ class MockElement {
     };
     this._hidden = false;
     this._textContent = '';
+    this.textContentWrites = 0;
+    this.childMutations = 0;
     this.className = '';
     this.classList = new MockClassList(this);
     this._listeners = new Map();
@@ -88,6 +95,7 @@ class MockElement {
   }
 
   set textContent(value) {
+    this.textContentWrites += 1;
     this._textContent = String(value ?? '');
   }
 
@@ -113,6 +121,7 @@ class MockElement {
     }
     child.parentNode = this;
     this.children.push(child);
+    this.childMutations += 1;
     return child;
   }
 
@@ -121,6 +130,7 @@ class MockElement {
     if (idx >= 0) {
       this.children.splice(idx, 1);
       child.parentNode = null;
+      this.childMutations += 1;
     }
     return child;
   }
@@ -1044,6 +1054,338 @@ test('W114 malicious or overly long swapchainFormat strings and invalid counters
     JSON.stringify(directExport),
     /private|bob|game\.xvc|secretDump|Games|Secret|file\.rpf/i
   );
+
+  controller.destroy();
+});
+
+test('W212 exports perf telemetry formatters and defaults cleanly when fields are omitted', () => {
+  assert.equal(DEFAULT_MAX_TOP_MISSING_SHADERS, 8);
+  assert.equal(typeof formatOnePercentLowFps, 'function');
+  assert.equal(typeof formatP99FrameMs, 'function');
+  assert.equal(typeof normalizeTopMissingShaders, 'function');
+  assert.equal(typeof formatTopMissingShaders, 'function');
+  assert.equal(globalThis.PlayGta6GpuBootPanel.formatOnePercentLowFps, formatOnePercentLowFps);
+  assert.equal(globalThis.PlayGta6GpuBootPanel.formatP99FrameMs, formatP99FrameMs);
+  assert.equal(globalThis.PlayGta6GpuBootPanel.formatTopMissingShaders, formatTopMissingShaders);
+
+  // Pure formatter edge cases
+  assert.equal(formatOnePercentLowFps(58.44), '58.4 fps');
+  assert.equal(formatOnePercentLowFps(0), '0.0 fps');
+  assert.equal(formatOnePercentLowFps('59.95'), '60.0 fps');
+  assert.equal(formatOnePercentLowFps(null), '—');
+  assert.equal(formatOnePercentLowFps(undefined), '—');
+  assert.equal(formatOnePercentLowFps(-1), '—');
+  assert.equal(formatOnePercentLowFps(Number.NaN), '—');
+  assert.equal(formatOnePercentLowFps(Infinity), '—');
+  assert.equal(formatOnePercentLowFps(true), '—');
+  assert.equal(formatOnePercentLowFps('C:\\Users\\alice\\60'), '—');
+
+  assert.equal(formatP99FrameMs(16.666), '16.67 ms');
+  assert.equal(formatP99FrameMs(0), '0.00 ms');
+  assert.equal(formatP99FrameMs('8.333'), '8.33 ms');
+  assert.equal(formatP99FrameMs(null), '—');
+  assert.equal(formatP99FrameMs(-0.5), '—');
+  assert.equal(formatP99FrameMs(Infinity), '—');
+  assert.equal(formatP99FrameMs(false), '—');
+  assert.equal(formatP99FrameMs('/home/alice/frame.bin'), '—');
+
+  assert.equal(formatTopMissingShaders([]), '—');
+  assert.equal(formatTopMissingShaders(null), '—');
+
+  // Invalid maxTopMissingShaders option throws RangeError
+  assert.throws(
+    () => new GpuBootPanelController({ documentObj: new MockDocument(), maxTopMissingShaders: 0 }),
+    RangeError
+  );
+  assert.throws(
+    () => new GpuBootPanelController({ documentObj: new MockDocument(), maxTopMissingShaders: -2 }),
+    RangeError
+  );
+  assert.throws(
+    () => new GpuBootPanelController({ documentObj: new MockDocument(), maxTopMissingShaders: 1.5 }),
+    RangeError
+  );
+
+  // Initial panel state & DOM defaults
+  const { controller } = createPanel();
+  const state = controller.getState();
+  const root = state.root;
+
+  assert.deepEqual(state.perfStats, {
+    onePercentLowFps: null,
+    p99FrameMs: null,
+    zeroCopyUploads: 0,
+    totalElidedStateCalls: 0,
+    bindGroupCacheHits: 0,
+    topMissingShaders: [],
+    topMissingShaderOverflow: 0,
+  });
+
+  const perfSection = root.querySelector('.pg6-gpu-panel__perf');
+  assert.equal(perfSection.getAttribute('role'), 'group');
+  assert.equal(perfSection.getAttribute('aria-label'), 'Performance & GPU Telemetry');
+  assert.equal(root.querySelector('.pg6-gpu-panel__one-percent-low-fps').textContent, '—');
+  assert.equal(root.querySelector('.pg6-gpu-panel__p99-frame-ms').textContent, '—');
+  assert.equal(root.querySelector('.pg6-gpu-panel__zero-copy-uploads').textContent, '0');
+  assert.equal(root.querySelector('.pg6-gpu-panel__elided-state-calls').textContent, '0');
+  assert.equal(root.querySelector('.pg6-gpu-panel__bind-group-cache-hits').textContent, '0');
+  assert.equal(root.querySelector('.pg6-gpu-panel__top-missing-count').textContent, '0');
+  assert.equal(root.querySelector('.pg6-gpu-panel__top-missing-shaders').textContent, '—');
+
+  const exported = JSON.parse(controller.exportMissingShadersJson());
+  assert.deepEqual(exported.perf, {
+    onePercentLowFps: null,
+    p99FrameMs: null,
+    zeroCopyUploads: 0,
+    totalElidedStateCalls: 0,
+    bindGroupCacheHits: 0,
+    topMissingShaders: [],
+  });
+
+  controller.destroy();
+});
+
+test('W212 update() formats 1%-low FPS, P99 frame time, 4K Bink2 zero-copy, state elision, BG cache hits, and capped top missing shaders', () => {
+  const { controller } = createPanel({ maxTopMissingShaders: 3 });
+  const root = controller.getState().root;
+
+  // Top-level W212 telemetry fields
+  controller.update({
+    onePercentLowFps: 57.36,
+    p99FrameMs: 17.456,
+    zeroCopyUploads: 128,
+    totalElidedStateCalls: 4096,
+    bindGroupCacheHits: 2048,
+    topMissingShaders: [
+      { hash: '0x20', stage: 'fragment', hits: 9 },
+      { hash: 0x10n, stage: 'vs', hitCount: 15 },
+      { hash: '0x10', stage: 'vertex', count: 5 }, // merges with 0x10 vertex -> 20
+      { hashHex: '0x30', stage: 'compute', count: 12 },
+      { hash: '0x40', stage: 'fragment', hits: 4 },
+      { hash: '0x50', stage: 'vertex', hits: 2 },
+    ],
+  });
+
+  const state = controller.getState();
+  assert.equal(state.perfStats.onePercentLowFps, 57.36);
+  assert.equal(state.perfStats.p99FrameMs, 17.456);
+  assert.equal(state.perfStats.zeroCopyUploads, 128);
+  assert.equal(state.perfStats.totalElidedStateCalls, 4096);
+  assert.equal(state.perfStats.bindGroupCacheHits, 2048);
+  assert.equal(state.perfStats.topMissingShaders.length, 3);
+  assert.equal(state.perfStats.topMissingShaderOverflow, 2);
+  assert.deepEqual(
+    state.perfStats.topMissingShaders.map((r) => [r.hash, r.stage, r.hits]),
+    [
+      ['0x0000000000000010', 'vertex', 20],
+      ['0x0000000000000030', 'compute', 12],
+      ['0x0000000000000020', 'fragment', 9],
+    ]
+  );
+
+  assert.equal(root.querySelector('.pg6-gpu-panel__one-percent-low-fps').textContent, '57.4 fps');
+  assert.equal(root.querySelector('.pg6-gpu-panel__p99-frame-ms').textContent, '17.46 ms');
+  assert.equal(root.querySelector('.pg6-gpu-panel__zero-copy-uploads').textContent, '128');
+  assert.equal(root.querySelector('.pg6-gpu-panel__elided-state-calls').textContent, '4096');
+  assert.equal(root.querySelector('.pg6-gpu-panel__bind-group-cache-hits').textContent, '2048');
+  assert.equal(root.querySelector('.pg6-gpu-panel__top-missing-count').textContent, '3');
+  assert.equal(
+    root.querySelector('.pg6-gpu-panel__top-missing-shaders').textContent,
+    '0x0000000000000010 (20), 0x0000000000000030 (12), 0x0000000000000020 (9) (+2 more)'
+  );
+
+  // Partial update via nested worker/monitor sub-objects preserves untouched fields
+  controller.update({
+    frameStats: { framesPresented: 60, p99FrameTimeMs: 16.25 },
+    binkStats: { directZeroCopyUploads: 256 },
+    drawStats: {
+      redundantPipelineSkips: 100,
+      redundantBindGroupSkips: 200,
+      redundantVertexBufferSkips: 50,
+      redundantIndexBufferSkips: 25,
+      bindGroupCacheHits: 3333,
+    },
+  });
+
+  const s2 = controller.getState();
+  assert.equal(s2.perfStats.onePercentLowFps, 57.36); // preserved
+  assert.equal(s2.perfStats.p99FrameMs, 16.25); // updated from frameStats.p99FrameTimeMs
+  assert.equal(s2.perfStats.zeroCopyUploads, 256); // updated from binkStats.directZeroCopyUploads
+  assert.equal(s2.perfStats.totalElidedStateCalls, 375); // summed from redundant*Skips
+  assert.equal(s2.perfStats.bindGroupCacheHits, 3333); // updated from drawStats
+  assert.equal(s2.perfStats.topMissingShaders.length, 3); // preserved
+
+  assert.equal(root.querySelector('.pg6-gpu-panel__p99-frame-ms').textContent, '16.25 ms');
+  assert.equal(root.querySelector('.pg6-gpu-panel__zero-copy-uploads').textContent, '256');
+  assert.equal(root.querySelector('.pg6-gpu-panel__elided-state-calls').textContent, '375');
+  assert.equal(root.querySelector('.pg6-gpu-panel__bind-group-cache-hits').textContent, '3333');
+
+  // Bare hash array preserves deduplicated order and formats cleanly without fake counts
+  controller.update({
+    topMissingShaders: ['0xbeef', '0x000000000000beef', '0xdead'],
+  });
+  assert.equal(
+    root.querySelector('.pg6-gpu-panel__top-missing-shaders').textContent,
+    '0x000000000000beef, 0x000000000000dead'
+  );
+  assert.equal(root.querySelector('.pg6-gpu-panel__top-missing-count').textContent, '2');
+
+  // Explicit perfStats: null resets all perf telemetry fields cleanly
+  controller.update({ perfStats: null });
+  assert.equal(controller.getState().perfStats.onePercentLowFps, null);
+  assert.equal(controller.getState().perfStats.zeroCopyUploads, 0);
+  assert.equal(controller.getState().perfStats.topMissingShaders.length, 0);
+  assert.equal(root.querySelector('.pg6-gpu-panel__one-percent-low-fps').textContent, '—');
+  assert.equal(root.querySelector('.pg6-gpu-panel__top-missing-shaders').textContent, '—');
+
+  controller.destroy();
+});
+
+test('W212 sanitizes hostile perf fields and strips host paths and raw bytes from topMissingShaders and export', () => {
+  const { controller } = createPanel();
+  const root = controller.getState().root;
+
+  controller.update({
+    onePercentLowFps: 'C:\\Users\\alice\\GTA6\\fps.txt',
+    p99FrameMs: '/home/alice/secret/p99.bin',
+    zeroCopyUploads: -12,
+    totalElidedStateCalls: 'file:///C:/Users/alice/elided',
+    bindGroupCacheHits: Number.NaN,
+    topMissingShaders: [
+      'C:\\Users\\alice\\shaders\\sky.dxil',
+      '/home/alice/game/main.rpf',
+      'file:///C:/secret/shader.wgsl',
+      new Uint8Array([0xde, 0xad, 0xbe, 0xef]),
+      {
+        hash: '0xcafebabe',
+        stage: 'C:\\Users\\alice\\bad_stage',
+        hits: 7,
+        sourcePath: 'D:\\Games\\GTA6\\shader_dump.bin',
+        bytecode: new Uint8Array([1, 2, 3, 4]),
+      },
+      {
+        hash: '/var/private/not-a-hash',
+        stage: 'fragment',
+        hits: 99,
+      },
+      {
+        get hash() {
+          throw new Error('hostile getter');
+        },
+      },
+    ],
+  });
+
+  const state = controller.getState();
+  assert.equal(state.perfStats.onePercentLowFps, null);
+  assert.equal(state.perfStats.p99FrameMs, null);
+  assert.equal(state.perfStats.zeroCopyUploads, 0);
+  assert.equal(state.perfStats.totalElidedStateCalls, 0);
+  assert.equal(state.perfStats.bindGroupCacheHits, 0);
+  assert.deepEqual(state.perfStats.topMissingShaders, [
+    { hash: '0x00000000cafebabe', stage: 'unknown', hits: 7 },
+  ]);
+
+  assert.equal(root.querySelector('.pg6-gpu-panel__one-percent-low-fps').textContent, '—');
+  assert.equal(root.querySelector('.pg6-gpu-panel__p99-frame-ms').textContent, '—');
+  assert.equal(root.querySelector('.pg6-gpu-panel__zero-copy-uploads').textContent, '0');
+  assert.equal(root.querySelector('.pg6-gpu-panel__elided-state-calls').textContent, '0');
+  assert.equal(root.querySelector('.pg6-gpu-panel__bind-group-cache-hits').textContent, '0');
+  assert.equal(
+    root.querySelector('.pg6-gpu-panel__top-missing-shaders').textContent,
+    '0x00000000cafebabe (7)'
+  );
+
+  const exportedJson = controller.exportMissingShadersJson();
+  assert.doesNotMatch(
+    exportedJson,
+    /Users|alice|home|secret|file:\/\/|sourcePath|bytecode|shader_dump|private/i
+  );
+  const parsed = JSON.parse(exportedJson);
+  assert.deepEqual(parsed.perf.topMissingShaders, [
+    { hash: '0x00000000cafebabe', stage: 'unknown', hits: 7 },
+  ]);
+
+  // Direct formatTopMissingShaders also rejects hostile paths
+  assert.equal(
+    formatTopMissingShaders(['C:\\Users\\alice\\a.bin', '/etc/passwd', '0x1234']),
+    '0x0000000000001234'
+  );
+
+  controller.destroy();
+});
+
+test('W212 dirty-checked DOM updates skip redundant textContent writes and table rebuilds on unchanged telemetry', () => {
+  const { controller } = createPanel();
+  const root = controller.getState().root;
+
+  const snapshot = {
+    bootSummary: { stage: 'FIRST_PRESENT', milestonesReached: 9, progressPct: 100, readyForSplash: true },
+    frameStats: { framesPresented: 120, droppedFrames: 1 },
+    fallbackStats: { packHits: 90, fallbackHits: 8, builtinHits: 2 },
+    onePercentLowFps: 59.1,
+    p99FrameMs: 16.92,
+    zeroCopyUploads: 44,
+    totalElidedStateCalls: 812,
+    bindGroupCacheHits: 512,
+    topMissingShaders: [{ hash: '0xabc', stage: 'fragment', hits: 6 }],
+    missingShaders: [{ hash: '0xabc', stage: 'fragment', hits: 6 }],
+  };
+
+  controller.update(snapshot);
+
+  const fpsEl = root.querySelector('.pg6-gpu-panel__one-percent-low-fps');
+  const p99El = root.querySelector('.pg6-gpu-panel__p99-frame-ms');
+  const zeroCopyEl = root.querySelector('.pg6-gpu-panel__zero-copy-uploads');
+  const elidedEl = root.querySelector('.pg6-gpu-panel__elided-state-calls');
+  const bgHitsEl = root.querySelector('.pg6-gpu-panel__bind-group-cache-hits');
+  const topMissingEl = root.querySelector('.pg6-gpu-panel__top-missing-shaders');
+  const framesEl = root.querySelector('.pg6-gpu-panel__frames-presented');
+  const tbodyEl = root.querySelector('.pg6-gpu-panel__table-body');
+
+  const before = {
+    fps: fpsEl.textContentWrites,
+    p99: p99El.textContentWrites,
+    zeroCopy: zeroCopyEl.textContentWrites,
+    elided: elidedEl.textContentWrites,
+    bgHits: bgHitsEl.textContentWrites,
+    topMissing: topMissingEl.textContentWrites,
+    frames: framesEl.textContentWrites,
+    tbodyMutations: tbodyEl.childMutations,
+  };
+
+  // Repeated identical updates must produce zero DOM writes / table mutations.
+  controller.update(snapshot);
+  controller.update({ ...snapshot, topMissingShaders: [{ hash: 0xabcn, stage: 'ps', count: 6 }] });
+  controller.update(snapshot);
+
+  assert.equal(fpsEl.textContentWrites, before.fps);
+  assert.equal(p99El.textContentWrites, before.p99);
+  assert.equal(zeroCopyEl.textContentWrites, before.zeroCopy);
+  assert.equal(elidedEl.textContentWrites, before.elided);
+  assert.equal(bgHitsEl.textContentWrites, before.bgHits);
+  assert.equal(topMissingEl.textContentWrites, before.topMissing);
+  assert.equal(framesEl.textContentWrites, before.frames);
+  assert.equal(tbodyEl.childMutations, before.tbodyMutations);
+
+  // Updating a single perf counter must touch ONLY that counter's DOM element.
+  controller.update({ zeroCopyUploads: 45 });
+  assert.equal(zeroCopyEl.textContent, '45');
+  assert.equal(zeroCopyEl.textContentWrites, before.zeroCopy + 1);
+  assert.equal(fpsEl.textContentWrites, before.fps);
+  assert.equal(p99El.textContentWrites, before.p99);
+  assert.equal(elidedEl.textContentWrites, before.elided);
+  assert.equal(bgHitsEl.textContentWrites, before.bgHits);
+  assert.equal(topMissingEl.textContentWrites, before.topMissing);
+  assert.equal(framesEl.textContentWrites, before.frames);
+  assert.equal(tbodyEl.childMutations, before.tbodyMutations);
+
+  // Changing formatted 1%-low FPS updates only fpsEl.
+  controller.update({ onePercentLowFps: 58.2 });
+  assert.equal(fpsEl.textContent, '58.2 fps');
+  assert.equal(fpsEl.textContentWrites, before.fps + 1);
+  assert.equal(zeroCopyEl.textContentWrites, before.zeroCopy + 1);
+  assert.equal(p99El.textContentWrites, before.p99);
 
   controller.destroy();
 });
