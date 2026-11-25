@@ -16,6 +16,8 @@ const {
   BUILTIN_FALLBACK_PROFILES,
   DEFAULT_ENTRY_POINTS,
   DEFAULT_MAX_TRACKED_MISSING,
+  DEFAULT_MAX_TRACKED_MISSING_HASHES,
+  DEFAULT_TOP_MISSING_LIMIT,
   normalizeShaderHash,
   formatShaderHash,
   normalizeStage,
@@ -370,7 +372,9 @@ test('getStats reports hitRatePct from pack hits and reset clears telemetry', ()
   assert.equal(stats.builtinHits, 1);
   assert.equal(stats.uniqueMissing, 2);
   assert.equal(stats.overflowMissingCount, 0);
+  assert.equal(stats.overflowMissingHashes, 0);
   assert.equal(stats.hitRatePct, 50);
+  assert.equal(stats.hitRatio, 0.5);
 
   router.reset();
   stats = router.getStats();
@@ -381,7 +385,9 @@ test('getStats reports hitRatePct from pack hits and reset clears telemetry', ()
     builtinHits: 0,
     uniqueMissing: 0,
     overflowMissingCount: 0,
+    overflowMissingHashes: 0,
     hitRatePct: 0,
+    hitRatio: 0,
   });
   assert.deepEqual(router.getMissingReport(), []);
 
@@ -778,4 +784,204 @@ test('G47 normalizeFallbackProfile and resolve() support splash_rect_24b and ali
   assert.equal(csSplash.profile, 'splash_rect_24b');
   assert.equal(csSplash.entryPoint, 'cs_main');
   assert.equal(csSplash.wgsl, BUILTIN_FALLBACK_WGSL.compute);
+});
+
+// ---------------------------------------------------------------------------
+// W133 Bounded missing-hash tracking, top-N ranking, and hitRatio telemetry
+// ---------------------------------------------------------------------------
+
+test('W133 getTopMissingShaders ranks descending by count with deterministic hashHex tie-breaking and sanitized output', () => {
+  assert.equal(DEFAULT_TOP_MISSING_LIMIT, 16);
+
+  const router = new ShaderFallbackRouter({ now: () => 133 });
+  assert.deepEqual(router.getTopMissingShaders(), []);
+  assert.deepEqual(router.getTopMissingShaders(0), []);
+
+  // Insert in non-sorted order with deliberate count ties across hashes & stages.
+  const hHigh = '0x0000000000000099';
+  const hTieC = '0x00000000000000cc';
+  const hTieA = '0x00000000000000aa';
+  const hTieB = '0x00000000000000bb';
+
+  for (let i = 0; i < 2; i += 1) router.resolve(hTieC, 'fragment');
+  for (let i = 0; i < 5; i += 1) router.resolve(hHigh, 'vertex');
+  for (let i = 0; i < 2; i += 1) router.resolve(hTieA, 'vertex');
+  for (let i = 0; i < 2; i += 1) router.resolve(hTieB, 'compute');
+  // Same hash as hTieA, different stage, same count -> stage ascending breaks secondary tie.
+  for (let i = 0; i < 2; i += 1) router.resolve(hTieA, 'fragment');
+
+  // Add 15 more single-hit entries so total unique missing = 20 (> default limit 16).
+  for (let i = 1; i <= 15; i += 1) {
+    router.resolve(BigInt(0x1000 + i), 'fragment');
+  }
+
+  // Default limit returns 16 sanitized records.
+  const topDefault = router.getTopMissingShaders();
+  assert.equal(topDefault.length, 16);
+
+  // Verify descending count order and deterministic hashHex (then stage) ascending tie-breaking.
+  assert.deepEqual(topDefault.slice(0, 5), [
+    { hashHex: hHigh, stage: 'vertex', count: 5 },
+    { hashHex: hTieA, stage: 'fragment', count: 2 },
+    { hashHex: hTieA, stage: 'vertex', count: 2 },
+    { hashHex: hTieB, stage: 'compute', count: 2 },
+    { hashHex: hTieC, stage: 'fragment', count: 2 },
+  ]);
+
+  // Explicit limit subsets cleanly and limit=0 returns empty array.
+  assert.deepEqual(router.getTopMissingShaders(3), topDefault.slice(0, 3));
+  assert.deepEqual(router.getTopMissingShaders(0), []);
+  assert.equal(router.getTopMissingShaders(null).length, 16);
+  assert.equal(router.getTopMissingShaders(100).length, 20);
+
+  // Every record is strictly sanitized: only { hashHex, stage, count }, no paths or WGSL text.
+  for (const row of topDefault) {
+    assert.deepEqual(Object.keys(row).sort(), ['count', 'hashHex', 'stage']);
+    assert.match(row.hashHex, /^0x[0-9a-f]{16}$/);
+    assert.ok(['vertex', 'fragment', 'compute'].includes(row.stage));
+    assert.equal(Number.isInteger(row.count) && row.count > 0, true);
+  }
+  const serialized = JSON.stringify(topDefault);
+  assert.equal(serialized.includes('@vertex'), false);
+  assert.equal(serialized.includes('@fragment'), false);
+  assert.equal(serialized.includes('fn '), false);
+
+  // Mutating returned objects must not alter router state.
+  topDefault[0].count = 999999;
+  assert.equal(router.getTopMissingShaders(1)[0].count, 5);
+
+  // Invalid limit throws RangeError.
+  assert.throws(() => router.getTopMissingShaders(-1), RangeError);
+  assert.throws(() => router.getTopMissingShaders(2.5), RangeError);
+  assert.throws(() => router.getTopMissingShaders(Number.NaN), RangeError);
+  assert.throws(() => router.getTopMissingShaders('4'), RangeError);
+});
+
+test('W133 maxTrackedMissingHashes defaults to 2048, caps map, tracks overflowMissingHashes, and keeps counting tracked hashes', () => {
+  assert.equal(DEFAULT_MAX_TRACKED_MISSING_HASHES, 2048);
+
+  // Default constructor cap is 2048.
+  const defaultRouter = new ShaderFallbackRouter({ now: () => 1 });
+  for (let i = 0; i < 2048; i += 1) {
+    defaultRouter.resolve(BigInt(i + 1), 'vertex');
+  }
+  assert.equal(defaultRouter.getStats().uniqueMissing, 2048);
+  assert.equal(defaultRouter.getStats().overflowMissingHashes, 0);
+
+  // 2049th unseen hash overflows without growing the tracked map.
+  defaultRouter.resolve(BigInt(2049), 'vertex');
+  assert.equal(defaultRouter.getStats().uniqueMissing, 2048);
+  assert.equal(defaultRouter.getStats().overflowMissingHashes, 1);
+  assert.equal(defaultRouter.getStats().overflowMissingCount, 1);
+
+  // Already-tracked hash still increments count without incrementing overflow.
+  defaultRouter.resolve(BigInt(1), 'vertex');
+  assert.equal(defaultRouter.getStats().uniqueMissing, 2048);
+  assert.equal(defaultRouter.getStats().overflowMissingHashes, 1);
+  assert.deepEqual(defaultRouter.getTopMissingShaders(1), [
+    { hashHex: '0x0000000000000001', stage: 'vertex', count: 2 },
+  ]);
+
+  // Custom small cap via maxTrackedMissingHashes.
+  const capped = new ShaderFallbackRouter({
+    maxTrackedMissingHashes: 3,
+    now: () => 77,
+  });
+  capped.resolve('0x0000000000000010', 'vertex');
+  capped.resolve('0x0000000000000020', 'fragment');
+  capped.resolve('0x0000000000000030', 'compute');
+
+  // Unseen hashes beyond cap increment overflowMissingHashes and are not added.
+  capped.resolve('0x0000000000000040', 'vertex');
+  capped.resolve('0x0000000000000050', 'fragment');
+  capped.resolve('0x0000000000000040', 'vertex');
+
+  // Already-tracked hashes keep incrementing even while full.
+  capped.resolve('0x0000000000000020', 'fragment');
+  capped.resolve('0x0000000000000020', 'fragment');
+  capped.resolve('0x0000000000000030', 'compute');
+
+  const stats = capped.getStats();
+  assert.equal(stats.uniqueMissing, 3);
+  assert.equal(stats.overflowMissingHashes, 3);
+  assert.equal(stats.overflowMissingCount, 3);
+  assert.deepEqual(capped.getTopMissingShaders(), [
+    { hashHex: '0x0000000000000020', stage: 'fragment', count: 3 },
+    { hashHex: '0x0000000000000030', stage: 'compute', count: 2 },
+    { hashHex: '0x0000000000000010', stage: 'vertex', count: 1 },
+  ]);
+
+  // Zero cap tracks nothing and counts every miss as overflow.
+  const zeroCap = new ShaderFallbackRouter({ maxTrackedMissingHashes: 0 });
+  zeroCap.resolve('0x0000000000000001', 'vertex');
+  zeroCap.resolve('0x0000000000000001', 'vertex');
+  assert.equal(zeroCap.getStats().uniqueMissing, 0);
+  assert.equal(zeroCap.getStats().overflowMissingHashes, 2);
+  assert.deepEqual(zeroCap.getTopMissingShaders(), []);
+
+  // Option validation rejects invalid maxTrackedMissingHashes values.
+  assert.throws(
+    () => new ShaderFallbackRouter({ maxTrackedMissingHashes: -1 }),
+    /maxTrackedMissingHashes/
+  );
+  assert.throws(
+    () => new ShaderFallbackRouter({ maxTrackedMissingHashes: 3.14 }),
+    /maxTrackedMissingHashes/
+  );
+  assert.throws(
+    () => new ShaderFallbackRouter({ maxTrackedMissingHashes: '10' }),
+    /maxTrackedMissingHashes/
+  );
+
+  // reset() clears tracked hashes and overflow counters.
+  capped.reset();
+  assert.equal(capped.getStats().uniqueMissing, 0);
+  assert.equal(capped.getStats().overflowMissingHashes, 0);
+  assert.deepEqual(capped.getTopMissingShaders(), []);
+});
+
+test('W133 getStats exposes accurate hitRatio in [0, 1] across empty, miss, mixed, and hit workloads', () => {
+  const hitHash = '0xaaaaaaaaaaaaaaaa';
+  const router = new ShaderFallbackRouter({
+    packLoader: createGetSourcePackLoader({
+      [hitHash]: PACK_VS_WGSL,
+      [S9_FALLBACK_HASHES.vertex]: S9_FALLBACK_WGSL.vertex,
+    }),
+    fallbackHashes: { vertex: S9_FALLBACK_HASHES.vertex },
+  });
+
+  // Empty router: 0 / 0 => hitRatio === 0.
+  assert.equal(router.getStats().hitRatio, 0);
+
+  // All misses (fallback + builtin): 0 / 2 => hitRatio === 0.
+  router.resolve('0x5555555555555555', 'vertex');
+  router.resolve('0x6666666666666666', 'fragment');
+  let stats = router.getStats();
+  assert.equal(stats.totalLookups, 2);
+  assert.equal(stats.packHits, 0);
+  assert.equal(stats.hitRatio, 0);
+  assert.ok(stats.hitRatio >= 0 && stats.hitRatio <= 1);
+
+  // Mixed: 1 pack hit + 2 misses => 1/3.
+  router.resolve(hitHash, 'vertex');
+  stats = router.getStats();
+  assert.equal(stats.totalLookups, 3);
+  assert.equal(stats.packHits, 1);
+  assert.ok(Math.abs(stats.hitRatio - 1 / 3) < 1e-12);
+  assert.ok(stats.hitRatio >= 0 && stats.hitRatio <= 1);
+
+  // Mixed: 2 pack hits + 2 misses => 0.5.
+  router.resolve(hitHash, 'vertex');
+  stats = router.getStats();
+  assert.equal(stats.hitRatio, 0.5);
+  assert.equal(stats.hitRatePct, 50);
+
+  // Reset restores 0; all pack hits => hitRatio === 1.
+  router.reset();
+  assert.equal(router.getStats().hitRatio, 0);
+  router.resolve(hitHash, 'vertex');
+  router.resolve(hitHash, 'vertex');
+  stats = router.getStats();
+  assert.equal(stats.hitRatio, 1);
+  assert.equal(stats.hitRatePct, 100);
 });
