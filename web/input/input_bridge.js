@@ -241,6 +241,648 @@ function readGamepadTrigger(button) {
   return button.pressed ? 1 : 0;
 }
 
+// Named deterministic scripted-input presets.
+// 'start-screen' matches tools/run_native_boot.py (A held 100 ms every 1000 ms starting at 5000 ms).
+export const INPUT_SCRIPT_PRESETS = Object.freeze({
+  'start-screen': Object.freeze({
+    name: 'start-screen',
+    button: INPUT_BUTTONS.A,
+    startMs: 5000,
+    holdMs: 100,
+    periodMs: 1000,
+  }),
+});
+
+const SCRIPT_BUTTON_ALIASES = Object.freeze({
+  START: INPUT_BUTTONS.MENU,
+  BACK: INPUT_BUTTONS.VIEW,
+  SELECT: INPUT_BUTTONS.VIEW,
+});
+
+function resolveSingleScriptButton(value) {
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      throw new RangeError(`Scripted input button mask must be a finite number, got ${value}`);
+    }
+    return value >>> 0;
+  }
+  if (typeof value === 'string') {
+    const key = value.trim().toUpperCase().replace(/^BUTTON_/, '');
+    if (Object.prototype.hasOwnProperty.call(INPUT_BUTTONS, key)) {
+      return INPUT_BUTTONS[key];
+    }
+    if (Object.prototype.hasOwnProperty.call(SCRIPT_BUTTON_ALIASES, key)) {
+      return SCRIPT_BUTTON_ALIASES[key];
+    }
+    throw new RangeError(`Unknown scripted input button: ${value}`);
+  }
+  if (Array.isArray(value)) {
+    let mask = 0;
+    for (let i = 0; i < value.length; i++) {
+      mask = (mask | resolveSingleScriptButton(value[i])) >>> 0;
+    }
+    return mask;
+  }
+  throw new TypeError(`Invalid scripted input button specifier: ${typeof value}`);
+}
+
+function resolveScriptButtonMask(button, buttonsMask) {
+  let mask = 0;
+  if (buttonsMask !== undefined && buttonsMask !== null) {
+    if (typeof buttonsMask !== 'number' || !Number.isFinite(buttonsMask)) {
+      throw new RangeError(`buttonsMask must be a finite number, got ${buttonsMask}`);
+    }
+    mask = (mask | (buttonsMask >>> 0)) >>> 0;
+  }
+  if (button !== undefined && button !== null) {
+    mask = (mask | resolveSingleScriptButton(button)) >>> 0;
+  }
+  return mask >>> 0;
+}
+
+function normalizeScriptSticks(sticks) {
+  if (sticks === undefined || sticks === null) return null;
+  if (typeof sticks !== 'object') {
+    throw new TypeError('Scripted input sticks must be an object');
+  }
+  const rawLx = sticks.lx !== undefined ? sticks.lx : sticks.leftX;
+  const rawLy = sticks.ly !== undefined ? sticks.ly : sticks.leftY;
+  const rawRx = sticks.rx !== undefined ? sticks.rx : sticks.rightX;
+  const rawRy = sticks.ry !== undefined ? sticks.ry : sticks.rightY;
+
+  const lx = rawLx !== undefined && rawLx !== null ? clamp(rawLx, -1, 1) : null;
+  const ly = rawLy !== undefined && rawLy !== null ? clamp(rawLy, -1, 1) : null;
+  const rx = rawRx !== undefined && rawRx !== null ? clamp(rawRx, -1, 1) : null;
+  const ry = rawRy !== undefined && rawRy !== null ? clamp(rawRy, -1, 1) : null;
+
+  if (lx === null && ly === null && rx === null && ry === null) return null;
+  return Object.freeze({ lx, ly, rx, ry });
+}
+
+function scriptSticksEqual(a, b) {
+  if (a === b) return true;
+  const alx = a ? a.lx : 0;
+  const aly = a ? a.ly : 0;
+  const arx = a ? a.rx : 0;
+  const ary = a ? a.ry : 0;
+  const blx = b ? b.lx : 0;
+  const bly = b ? b.ly : 0;
+  const brx = b ? b.rx : 0;
+  const bry = b ? b.ry : 0;
+  return alx === blx && aly === bly && arx === brx && ary === bry;
+}
+
+function defaultNowMs() {
+  if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
+    return performance.now();
+  }
+  return Date.now();
+}
+
+function validateNonNegativeFinite(value, name) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    throw new RangeError(`${name} must be a finite number >= 0, got ${value}`);
+  }
+  return value;
+}
+
+function validatePositiveFinite(value, name) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+    throw new RangeError(`${name} must be a finite number > 0, got ${value}`);
+  }
+  return value;
+}
+
+function validateOptionalEndMs(value) {
+  if (value === undefined || value === null) return null;
+  return validateNonNegativeFinite(value, 'endMs');
+}
+
+function validateOptionalMaxPresses(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    throw new RangeError(`maxPresses must be an integer >= 0, got ${value}`);
+  }
+  return value;
+}
+
+/**
+ * Deterministic scripted input scheduler supporting named presets (e.g. 'start-screen'),
+ * repeating press schedules, and explicit sorted event arrays.
+ *
+ * Provides pure time evaluation via `sampleAt(elapsedMs)` plus a timer-driven
+ * `start()` / `stop()` loop with injectable clock & timer hooks for deterministic testing.
+ */
+export class ScriptedInputPlayer {
+  constructor(presetOrSpec, options = {}) {
+    const opts = options || {};
+
+    let spec = presetOrSpec;
+    let presetName = typeof opts.preset === 'string' ? opts.preset : null;
+
+    if (typeof spec === 'string') {
+      if (!Object.prototype.hasOwnProperty.call(INPUT_SCRIPT_PRESETS, spec)) {
+        throw new RangeError(`Unknown input script preset: ${spec}`);
+      }
+      presetName = spec;
+      spec = INPUT_SCRIPT_PRESETS[spec];
+    } else if (
+      spec &&
+      typeof spec === 'object' &&
+      !Array.isArray(spec) &&
+      typeof spec.preset === 'string' &&
+      !Array.isArray(spec.events) &&
+      spec.holdMs === undefined &&
+      spec.periodMs === undefined
+    ) {
+      if (!Object.prototype.hasOwnProperty.call(INPUT_SCRIPT_PRESETS, spec.preset)) {
+        throw new RangeError(`Unknown input script preset: ${spec.preset}`);
+      }
+      presetName = spec.preset;
+      spec = {
+        ...INPUT_SCRIPT_PRESETS[spec.preset],
+        ...(spec.endMs !== undefined ? { endMs: spec.endMs } : null),
+        ...(spec.maxPresses !== undefined ? { maxPresses: spec.maxPresses } : null),
+      };
+    }
+
+    if (Array.isArray(spec) || (spec && typeof spec === 'object' && Array.isArray(spec.events))) {
+      const rawEvents = Array.isArray(spec) ? spec : spec.events;
+      const specObj = Array.isArray(spec) ? null : spec;
+      const endMs = validateOptionalEndMs(
+        opts.endMs !== undefined ? opts.endMs : specObj?.endMs
+      );
+      const maxPresses = validateOptionalMaxPresses(
+        opts.maxPresses !== undefined ? opts.maxPresses : specObj?.maxPresses
+      );
+
+      if (!presetName && specObj) {
+        if (typeof specObj.preset === 'string') presetName = specObj.preset;
+        else if (typeof specObj.name === 'string') presetName = specObj.name;
+      }
+
+      const indexed = rawEvents.map((ev, index) => {
+        if (!ev || typeof ev !== 'object') {
+          throw new TypeError(`Scripted input event at index ${index} must be an object`);
+        }
+        const atMs = validateNonNegativeFinite(
+          ev.atMs !== undefined ? ev.atMs : ev.startMs,
+          `events[${index}].atMs`
+        );
+        const holdMs = validatePositiveFinite(ev.holdMs, `events[${index}].holdMs`);
+        const buttonsMask = resolveScriptButtonMask(ev.button, ev.buttonsMask);
+        const sticks = normalizeScriptSticks(ev.sticks);
+        return { index, atMs, holdMs, buttonsMask, sticks };
+      });
+
+      indexed.sort((a, b) => (a.atMs !== b.atMs ? a.atMs - b.atMs : a.index - b.index));
+
+      const capped = maxPresses !== null ? indexed.slice(0, maxPresses) : indexed;
+      const normalized = [];
+      for (let i = 0; i < capped.length; i++) {
+        const ev = capped[i];
+        if (endMs !== null && ev.atMs >= endMs) continue;
+        const evEnd = endMs !== null ? Math.min(ev.atMs + ev.holdMs, endMs) : ev.atMs + ev.holdMs;
+        if (evEnd <= ev.atMs) continue;
+        normalized.push(
+          Object.freeze({
+            atMs: ev.atMs,
+            holdMs: evEnd - ev.atMs,
+            endMs: evEnd,
+            buttonsMask: ev.buttonsMask,
+            sticks: ev.sticks,
+          })
+        );
+      }
+
+      this._mode = 'events';
+      this._rule = null;
+      this._events = Object.freeze(normalized);
+      this._endMs = endMs;
+      this._maxPresses = maxPresses;
+    } else if (spec && typeof spec === 'object') {
+      const startMs = validateNonNegativeFinite(spec.startMs ?? 0, 'startMs');
+      const holdMs = validatePositiveFinite(spec.holdMs, 'holdMs');
+      const periodMs = validatePositiveFinite(spec.periodMs, 'periodMs');
+      const endMs = validateOptionalEndMs(opts.endMs !== undefined ? opts.endMs : spec.endMs);
+      const maxPresses = validateOptionalMaxPresses(
+        opts.maxPresses !== undefined ? opts.maxPresses : spec.maxPresses
+      );
+      const buttonsMask = resolveScriptButtonMask(spec.button, spec.buttonsMask);
+      const sticks = normalizeScriptSticks(spec.sticks);
+
+      if (!presetName) {
+        if (typeof spec.preset === 'string') presetName = spec.preset;
+        else if (typeof spec.name === 'string') presetName = spec.name;
+      }
+
+      this._mode = 'repeating';
+      this._rule = Object.freeze({
+        startMs,
+        holdMs,
+        periodMs,
+        endMs,
+        maxPresses,
+        buttonsMask,
+        sticks,
+      });
+      this._events = EMPTY_ARRAY;
+      this._endMs = endMs;
+      this._maxPresses = maxPresses;
+    } else {
+      throw new TypeError(
+        'Input script spec must be a preset name, repeating schedule object, or event array'
+      );
+    }
+
+    this.preset = presetName;
+
+    this._nowFn = typeof opts.nowFn === 'function' ? opts.nowFn : defaultNowMs;
+    this._setTimeoutFn =
+      opts.setTimeoutFn !== undefined
+        ? opts.setTimeoutFn
+        : typeof globalThis !== 'undefined' && typeof globalThis.setTimeout === 'function'
+          ? globalThis.setTimeout.bind(globalThis)
+          : null;
+    this._clearTimeoutFn =
+      opts.clearTimeoutFn !== undefined
+        ? opts.clearTimeoutFn
+        : typeof globalThis !== 'undefined' && typeof globalThis.clearTimeout === 'function'
+          ? globalThis.clearTimeout.bind(globalThis)
+          : null;
+    this._setIntervalFn =
+      opts.setIntervalFn !== undefined
+        ? opts.setIntervalFn
+        : typeof globalThis !== 'undefined' && typeof globalThis.setInterval === 'function'
+          ? globalThis.setInterval.bind(globalThis)
+          : null;
+    this._clearIntervalFn =
+      opts.clearIntervalFn !== undefined
+        ? opts.clearIntervalFn
+        : typeof globalThis !== 'undefined' && typeof globalThis.clearInterval === 'function'
+          ? globalThis.clearInterval.bind(globalThis)
+          : null;
+
+    const explicitInterval =
+      opts.setIntervalFn !== undefined && opts.setTimeoutFn === undefined;
+    const hasTickMs = typeof opts.tickMs === 'number' && Number.isFinite(opts.tickMs) && opts.tickMs > 0;
+    this._useInterval = Boolean(hasTickMs || explicitInterval);
+    this._tickMs = hasTickMs ? opts.tickMs : 16;
+
+    this._onSample = typeof opts.onSample === 'function' ? opts.onSample : null;
+    this._onComplete = typeof opts.onComplete === 'function' ? opts.onComplete : null;
+    this._bridgeSink =
+      typeof opts._bridgeSink === 'function'
+        ? opts._bridgeSink
+        : opts.bridge && typeof opts.bridge._applyScriptSample === 'function'
+          ? (sample) => opts.bridge._applyScriptSample(sample)
+          : null;
+
+    this._active = false;
+    this._startedAt = 0;
+    this._stoppedElapsedMs = 0;
+    this._pressCount = 0;
+    this._currentMask = 0;
+    this._currentSticks = null;
+    this._timerId = null;
+    this._intervalId = null;
+    this._runToken = 0;
+  }
+
+  _setBridgeSink(sinkFn) {
+    this._bridgeSink = typeof sinkFn === 'function' ? sinkFn : null;
+  }
+
+  /**
+   * Pure deterministic evaluation at `elapsedMs` (ms since playback start).
+   * Returns `{ buttonsMask, activeEventCount }` (plus `sticks` when an active event sets sticks).
+   */
+  sampleAt(elapsedMs) {
+    if (!Number.isFinite(elapsedMs) || elapsedMs < 0) {
+      return { buttonsMask: 0, activeEventCount: 0 };
+    }
+
+    if (this._mode === 'repeating') {
+      const { startMs, holdMs, periodMs, endMs, maxPresses, buttonsMask, sticks } = this._rule;
+      if (maxPresses === 0 || elapsedMs < startMs) {
+        return { buttonsMask: 0, activeEventCount: 0 };
+      }
+      if (endMs !== null && (endMs <= startMs || elapsedMs >= endMs)) {
+        return { buttonsMask: 0, activeEventCount: 0 };
+      }
+
+      let maxK = Math.floor((elapsedMs - startMs) / periodMs);
+      if (maxPresses !== null) {
+        maxK = Math.min(maxK, maxPresses - 1);
+      }
+      if (endMs !== null) {
+        maxK = Math.min(maxK, Math.ceil((endMs - startMs) / periodMs) - 1);
+      }
+      if (maxK < 0) {
+        return { buttonsMask: 0, activeEventCount: 0 };
+      }
+
+      const latestEnd = startMs + maxK * periodMs + holdMs;
+      if (elapsedMs >= latestEnd) {
+        return { buttonsMask: 0, activeEventCount: 0 };
+      }
+
+      let activeEventCount = 1;
+      if (holdMs > periodMs) {
+        let lowK = Math.max(0, Math.floor((elapsedMs - startMs - holdMs) / periodMs) + 1);
+        while (lowK <= maxK && startMs + lowK * periodMs + holdMs <= elapsedMs) {
+          lowK += 1;
+        }
+        while (lowK > 0 && startMs + (lowK - 1) * periodMs + holdMs > elapsedMs) {
+          lowK -= 1;
+        }
+        activeEventCount = Math.max(1, maxK - lowK + 1);
+      }
+
+      if (sticks) {
+        return {
+          buttonsMask,
+          activeEventCount,
+          sticks: {
+            lx: sticks.lx ?? 0,
+            ly: sticks.ly ?? 0,
+            rx: sticks.rx ?? 0,
+            ry: sticks.ry ?? 0,
+          },
+        };
+      }
+      return { buttonsMask, activeEventCount };
+    }
+
+    let buttonsMask = 0;
+    let activeEventCount = 0;
+    let hasSticks = false;
+    let lx = 0;
+    let ly = 0;
+    let rx = 0;
+    let ry = 0;
+
+    for (let i = 0; i < this._events.length; i++) {
+      const ev = this._events[i];
+      if (ev.atMs > elapsedMs) break;
+      if (elapsedMs < ev.endMs) {
+        buttonsMask = (buttonsMask | ev.buttonsMask) >>> 0;
+        activeEventCount += 1;
+        if (ev.sticks) {
+          hasSticks = true;
+          if (ev.sticks.lx !== null) lx = ev.sticks.lx;
+          if (ev.sticks.ly !== null) ly = ev.sticks.ly;
+          if (ev.sticks.rx !== null) rx = ev.sticks.rx;
+          if (ev.sticks.ry !== null) ry = ev.sticks.ry;
+        }
+      }
+    }
+
+    if (hasSticks) {
+      return {
+        buttonsMask,
+        activeEventCount,
+        sticks: { lx, ly, rx, ry },
+      };
+    }
+    return { buttonsMask, activeEventCount };
+  }
+
+  /**
+   * Pure count of scheduled presses that have started at or before `elapsedMs`.
+   */
+  pressCountAt(elapsedMs) {
+    if (!Number.isFinite(elapsedMs) || elapsedMs < 0) return 0;
+
+    if (this._mode === 'repeating') {
+      const { startMs, periodMs, endMs, maxPresses } = this._rule;
+      if (maxPresses === 0 || elapsedMs < startMs) return 0;
+      if (endMs !== null && endMs <= startMs) return 0;
+
+      let maxK = Math.floor((elapsedMs - startMs) / periodMs);
+      if (maxPresses !== null) {
+        maxK = Math.min(maxK, maxPresses - 1);
+      }
+      if (endMs !== null) {
+        maxK = Math.min(maxK, Math.ceil((endMs - startMs) / periodMs) - 1);
+      }
+      return maxK >= 0 ? maxK + 1 : 0;
+    }
+
+    let count = 0;
+    for (let i = 0; i < this._events.length; i++) {
+      if (this._events[i].atMs <= elapsedMs) {
+        count += 1;
+      } else {
+        break;
+      }
+    }
+    return count;
+  }
+
+  /**
+   * Pure next transition timestamp strictly greater than `elapsedMs`, or `null` if none remain.
+   */
+  nextTransitionMs(elapsedMs) {
+    const t = Number.isFinite(elapsedMs) && elapsedMs >= 0 ? elapsedMs : 0;
+
+    if (this._mode === 'repeating') {
+      const { startMs, holdMs, periodMs, endMs, maxPresses } = this._rule;
+      if (maxPresses === 0) return null;
+      if (endMs !== null && (endMs <= startMs || t >= endMs)) return null;
+      if (t < startMs) return startMs;
+
+      let maxK = Infinity;
+      if (maxPresses !== null) {
+        maxK = Math.min(maxK, maxPresses - 1);
+      }
+      if (endMs !== null) {
+        maxK = Math.min(maxK, Math.ceil((endMs - startMs) / periodMs) - 1);
+      }
+      if (maxK < 0) return null;
+
+      const k = Math.min(Math.floor((t - startMs) / periodMs), maxK);
+      if (holdMs < periodMs) {
+        const rawEnd = startMs + k * periodMs + holdMs;
+        const pressEnd = endMs !== null ? Math.min(rawEnd, endMs) : rawEnd;
+        if (t < pressEnd) return pressEnd;
+        if (k + 1 <= maxK) return startMs + (k + 1) * periodMs;
+        return null;
+      }
+
+      if (!Number.isFinite(maxK)) {
+        return endMs !== null && t < endMs ? endMs : null;
+      }
+      const rawFinalEnd = startMs + maxK * periodMs + holdMs;
+      const finalEnd = endMs !== null ? Math.min(rawFinalEnd, endMs) : rawFinalEnd;
+      return t < finalEnd ? finalEnd : null;
+    }
+
+    let nextMs = Infinity;
+    for (let i = 0; i < this._events.length; i++) {
+      const ev = this._events[i];
+      if (ev.atMs > t && ev.atMs < nextMs) {
+        nextMs = ev.atMs;
+      }
+      if (ev.endMs > t && ev.endMs < nextMs) {
+        nextMs = ev.endMs;
+      }
+    }
+    return Number.isFinite(nextMs) ? nextMs : null;
+  }
+
+  _clearTimers() {
+    if (this._timerId !== null && typeof this._clearTimeoutFn === 'function') {
+      this._clearTimeoutFn(this._timerId);
+    }
+    this._timerId = null;
+
+    if (this._intervalId !== null && typeof this._clearIntervalFn === 'function') {
+      this._clearIntervalFn(this._intervalId);
+    }
+    this._intervalId = null;
+  }
+
+  _emitSample(sample) {
+    if (this._bridgeSink) {
+      this._bridgeSink(sample);
+    }
+    if (this._onSample) {
+      this._onSample(sample, this.getState());
+    }
+  }
+
+  _tick(expectedToken, elapsedOverride) {
+    if (!this._active || expectedToken !== this._runToken) return;
+
+    const elapsedMs =
+      elapsedOverride !== undefined
+        ? Math.max(0, elapsedOverride)
+        : Math.max(0, this._nowFn() - this._startedAt);
+
+    const sample = this.sampleAt(elapsedMs);
+    this._pressCount = Math.max(this._pressCount, this.pressCountAt(elapsedMs));
+
+    const nextMask = sample.buttonsMask >>> 0;
+    const nextSticks = sample.sticks || null;
+    const changed =
+      nextMask !== this._currentMask || !scriptSticksEqual(nextSticks, this._currentSticks);
+
+    if (changed) {
+      this._currentMask = nextMask;
+      this._currentSticks = nextSticks;
+      this._emitSample(sample);
+      if (!this._active || expectedToken !== this._runToken) return;
+    }
+
+    const nextMs = this.nextTransitionMs(elapsedMs);
+    if (nextMs === null && sample.activeEventCount === 0) {
+      this._clearTimers();
+      this._active = false;
+      this._stoppedElapsedMs = elapsedMs;
+      if (this._onComplete) {
+        this._onComplete(this.getState());
+      }
+      return;
+    }
+
+    if (!this._useInterval && nextMs !== null && typeof this._setTimeoutFn === 'function') {
+      if (this._timerId !== null && typeof this._clearTimeoutFn === 'function') {
+        this._clearTimeoutFn(this._timerId);
+        this._timerId = null;
+      }
+      const delay = Math.max(0, Math.ceil(nextMs - elapsedMs));
+      this._timerId = this._setTimeoutFn(() => {
+        this._timerId = null;
+        this._tick(expectedToken);
+      }, delay);
+    }
+  }
+
+  /**
+   * Starts timer-driven playback from `elapsedMs = 0`.
+   */
+  start() {
+    this._clearTimers();
+    this._runToken += 1;
+    const token = this._runToken;
+
+    this._startedAt = this._nowFn();
+    this._stoppedElapsedMs = 0;
+    this._pressCount = 0;
+    this._active = true;
+
+    this._tick(token, 0);
+
+    if (
+      this._active &&
+      token === this._runToken &&
+      this._useInterval &&
+      typeof this._setIntervalFn === 'function'
+    ) {
+      this._intervalId = this._setIntervalFn(() => {
+        this._tick(token);
+      }, this._tickMs);
+    }
+
+    return this;
+  }
+
+  /**
+   * Manually advances playback to `elapsedMs` (or `nowFn() - startedAt` when omitted).
+   */
+  step(elapsedMs) {
+    if (!this._active) return this.sampleAt(elapsedMs ?? this._stoppedElapsedMs);
+    this._tick(this._runToken, elapsedMs);
+    return {
+      buttonsMask: this._currentMask,
+      activeEventCount: this.sampleAt(
+        elapsedMs !== undefined ? elapsedMs : Math.max(0, this._nowFn() - this._startedAt)
+      ).activeEventCount,
+      ...(this._currentSticks ? { sticks: { ...this._currentSticks } } : null),
+    };
+  }
+
+  _stopWithoutSink() {
+    this._runToken += 1;
+    this._clearTimers();
+    if (this._active) {
+      this._stoppedElapsedMs = Math.max(0, this._nowFn() - this._startedAt);
+      this._active = false;
+    }
+    this._currentMask = 0;
+    this._currentSticks = null;
+  }
+
+  /**
+   * Stops playback, cancels timers, and clears any held scripted buttons immediately.
+   */
+  stop() {
+    const hadHeldState = this._currentMask !== 0 || this._currentSticks !== null;
+    this._stopWithoutSink();
+    if (hadHeldState) {
+      this._emitSample({ buttonsMask: 0, activeEventCount: 0 });
+    }
+    return this;
+  }
+
+  getState() {
+    const elapsedMs = this._active
+      ? Math.max(0, this._nowFn() - this._startedAt)
+      : this._stoppedElapsedMs;
+    const pressCount = this._active
+      ? Math.max(this._pressCount, this.pressCountAt(elapsedMs))
+      : this._pressCount;
+    return {
+      active: this._active,
+      preset: this.preset,
+      elapsedMs,
+      pressCount,
+      currentMask: this._currentMask,
+    };
+  }
+}
+
 export class InputBridge {
   constructor(canvasOrOptions = null, options = {}) {
     let canvas = canvasOrOptions;
@@ -373,6 +1015,13 @@ export class InputBridge {
     this._gpRy = 0;
     this._gpLt = 0;
     this._gpRt = 0;
+
+    this._scriptPlayer = null;
+    this._scriptButtons = 0;
+    this._scriptLx = 0;
+    this._scriptLy = 0;
+    this._scriptRx = 0;
+    this._scriptRy = 0;
 
     // Pre-allocated scratch objects for zero-allocation 60/120Hz gamepad polling.
     this._leftStickScratch = { x: 0, y: 0 };
@@ -790,13 +1439,22 @@ export class InputBridge {
   }
 
   _commitMergedState(force = false) {
-    const mergedButtons = (this._keyButtons | this._mouseButtonBits | this._gpButtons) >>> 0;
+    const mergedButtons =
+      (this._keyButtons | this._mouseButtonBits | this._gpButtons | this._scriptButtons) >>> 0;
 
-    // Gamepad axes override zero keyboard axes; keyboard WASD takes priority when active.
-    const lx = clamp(this._keyLx !== 0 ? this._keyLx : this._gpLx, -1, 1);
-    const ly = clamp(this._keyLy !== 0 ? this._keyLy : this._gpLy, -1, 1);
-    const rx = clamp(this._gpRx, -1, 1);
-    const ry = clamp(this._gpRy, -1, 1);
+    // Priority: keyboard WASD -> gamepad sticks -> scripted sticks.
+    const lx = clamp(
+      this._keyLx !== 0 ? this._keyLx : this._gpLx !== 0 ? this._gpLx : this._scriptLx,
+      -1,
+      1
+    );
+    const ly = clamp(
+      this._keyLy !== 0 ? this._keyLy : this._gpLy !== 0 ? this._gpLy : this._scriptLy,
+      -1,
+      1
+    );
+    const rx = clamp(this._gpRx !== 0 ? this._gpRx : this._scriptRx, -1, 1);
+    const ry = clamp(this._gpRy !== 0 ? this._gpRy : this._scriptRy, -1, 1);
 
     const lt = clamp(Math.max(this._mouseLt, this._gpLt), 0, 1);
     const rt = clamp(Math.max(this._mouseRt, this._gpRt), 0, 1);
@@ -881,6 +1539,89 @@ export class InputBridge {
     this._rafId = null;
   }
 
+  _applyScriptSample(sample) {
+    if (this.disposed) return false;
+    const nextButtons =
+      sample && typeof sample.buttonsMask === 'number' ? sample.buttonsMask >>> 0 : 0;
+    const sticks = sample && sample.sticks ? sample.sticks : null;
+    this._scriptButtons = nextButtons;
+    this._scriptLx = sticks && Number.isFinite(sticks.lx) ? clamp(sticks.lx, -1, 1) : 0;
+    this._scriptLy = sticks && Number.isFinite(sticks.ly) ? clamp(sticks.ly, -1, 1) : 0;
+    this._scriptRx = sticks && Number.isFinite(sticks.rx) ? clamp(sticks.rx, -1, 1) : 0;
+    this._scriptRy = sticks && Number.isFinite(sticks.ry) ? clamp(sticks.ry, -1, 1) : 0;
+    return this._commitMergedState(false);
+  }
+
+  /**
+   * Starts deterministic scripted input playback (preset name, repeating schedule,
+   * explicit event array, or ScriptedInputPlayer instance). Merges scripted buttons
+   * alongside live keyboard/mouse/gamepad input without clobbering live state on release.
+   */
+  startScript(presetOrSpec, options = {}) {
+    if (this.disposed) return null;
+    this.stopScript();
+
+    let player;
+    if (presetOrSpec instanceof ScriptedInputPlayer) {
+      player = presetOrSpec;
+      player._setBridgeSink((sample) => {
+        this._applyScriptSample(sample);
+      });
+    } else {
+      player = new ScriptedInputPlayer(presetOrSpec, {
+        ...(options || {}),
+        _bridgeSink: (sample) => {
+          this._applyScriptSample(sample);
+        },
+      });
+    }
+
+    this._scriptPlayer = player;
+    player.start();
+    return player;
+  }
+
+  /**
+   * Stops any active scripted input playback, cleans up timers, and clears
+   * scripted button bits immediately from the SharedArrayBuffer while preserving live inputs.
+   */
+  stopScript() {
+    if (this._scriptPlayer) {
+      this._scriptPlayer.stop();
+    }
+    const hadScriptState =
+      this._scriptButtons !== 0 ||
+      this._scriptLx !== 0 ||
+      this._scriptLy !== 0 ||
+      this._scriptRx !== 0 ||
+      this._scriptRy !== 0;
+    this._scriptButtons = 0;
+    this._scriptLx = 0;
+    this._scriptLy = 0;
+    this._scriptRx = 0;
+    this._scriptRy = 0;
+    if (hadScriptState && !this.disposed) {
+      this._commitMergedState(false);
+    }
+  }
+
+  /**
+   * Returns current scripted playback status:
+   * `{ active, preset, elapsedMs, pressCount, currentMask }`.
+   */
+  getScriptState() {
+    if (!this._scriptPlayer) {
+      return {
+        active: false,
+        preset: null,
+        elapsedMs: 0,
+        pressCount: 0,
+        currentMask: 0,
+      };
+    }
+    return this._scriptPlayer.getState();
+  }
+
   consumeWheelDelta() {
     const delta = this._wheelDelta;
     this._wheelDelta = 0;
@@ -888,6 +1629,15 @@ export class InputBridge {
   }
 
   reset() {
+    if (this._scriptPlayer) {
+      this._scriptPlayer._stopWithoutSink();
+    }
+    this._scriptButtons = 0;
+    this._scriptLx = 0;
+    this._scriptLy = 0;
+    this._scriptRx = 0;
+    this._scriptRy = 0;
+
     this._pressedKeys.clear();
     this._recomputeKeyboardState();
     this._clearMouseButtons();
@@ -973,6 +1723,7 @@ export class InputBridge {
 
   destroy() {
     if (this.disposed) return;
+    this.stopScript();
     this.stop();
     for (const { target, event, handler, options } of this._listeners) {
       if (target && typeof target.removeEventListener === 'function') {
@@ -985,6 +1736,10 @@ export class InputBridge {
   }
 
   dispose() {
+    this.destroy();
+  }
+
+  detach() {
     this.destroy();
   }
 }
