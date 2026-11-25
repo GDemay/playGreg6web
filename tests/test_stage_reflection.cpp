@@ -204,8 +204,8 @@ void test_vertex_join() {
         CHECK(fetches[2].location == 2 && fetches[2].offset == 6 && fetches[2].format == pso::WgpuVertexFormat::Unorm8x2);
     }
 
-    // Failures: an offset no element covers, a read inside an element without fetch format, and a
-    // component class mismatch. Each is reported with its key.
+    // Failures: a read inside an element without fetch format and a component class mismatch. Each is
+    // reported with its key. (Offsets no element covers are defaulted, see test_vertex_default_inputs.)
     StageReflection bad;
     bad.vertex_inputs = {{0, 0, 40, 2, ReflectedComponentType::F32, pso::WgpuVertexFormat::Undefined},
                          {1, 0, 5, 1, ReflectedComponentType::F32, pso::WgpuVertexFormat::Undefined},
@@ -213,11 +213,10 @@ void test_vertex_join() {
                          {3, 1, 0, 4, ReflectedComponentType::F32, pso::WgpuVertexFormat::Undefined}};
     report.clear();
     CHECK(!join_vertex_inputs(bad, layout.data(), 3, &fetches, &report));
-    CHECK(report.find("@location(0) <- slot 0 + 40: no input-layout element") != std::string::npos);
     CHECK(report.find("@location(1) <- slot 0 + 5: reads inside element COLOR1") != std::string::npos);
     CHECK(report.find("@location(2) <- slot 0 + 0: the stage expects u32, the attribute gives f32") !=
           std::string::npos);
-    CHECK(report.find("@location(3) <- slot 1 + 0: no input-layout element") != std::string::npos);
+    CHECK(report.find("@location(3)") == std::string::npos);
 
     // The pipeline key takes the fetches: locations, offsets and formats from the stage; COLOR1 dropped.
     pso::D3D12GraphicsPsoDesc desc{};
@@ -245,6 +244,40 @@ void test_vertex_join() {
     }
     CHECK(saw_position && saw_inside);
     CHECK((t.diagnostics & (pso::PipelineDiag::VertexLayoutInvalid | pso::PipelineDiag::MissingVertexInput)) == 0);
+}
+
+// An input no layout element covers reads D3D12's (0, 0, 0, 1): a constant-default fetch placed at a
+// spare instance slot with stride 0, counted in JoinStats.
+void test_vertex_default_inputs() {
+    const std::vector<pso::D3D12InputElementDesc> layout = ui_input_layout();
+    StageReflection vs;
+    vs.vertex_inputs = {{0, 0, 8, 2, ReflectedComponentType::F32, pso::WgpuVertexFormat::Undefined},
+                        {1, 3, 0, 4, ReflectedComponentType::F32, pso::WgpuVertexFormat::Undefined},
+                        {2, 3, 4, 4, ReflectedComponentType::U32, pso::WgpuVertexFormat::Undefined}};
+    std::vector<pso::VertexInputFetch> fetches;
+    std::string report;
+    JoinStats stats;
+    CHECK(join_vertex_inputs(vs, layout.data(), 3, &fetches, &report, &stats));
+    CHECK(report.empty() && fetches.size() == 3 && stats.vertex_inputs_defaulted == 2);
+    CHECK(fetches[1].constant_default && fetches[1].format == pso::WgpuVertexFormat::Float32x4 && fetches[1].offset == 0);
+    CHECK(fetches[2].constant_default && fetches[2].format == pso::WgpuVertexFormat::Uint32x4 &&
+          fetches[2].offset == pso::kDefaultVertexIntOffset);
+
+    pso::D3D12GraphicsPsoDesc desc{};
+    desc.vs = 1;
+    desc.ps = 2;
+    desc.pInputElementDescs = layout.data();
+    desc.NumInputElements = 3;
+    desc.NumRenderTargets = 1;
+    desc.RTVFormats[0] = pso::DxgiFormat::R8G8B8A8_UNORM;
+    desc.vs_input_fetches = fetches.data();
+    desc.vs_input_fetch_count = static_cast<uint32_t>(fetches.size());
+    const pso::GraphicsPsoTranslation t = pso::translate_graphics_pso(desc, pso::PipelineKeyOptions{});
+    CHECK(t.default_vertex_slot_mask == 2u);  // slot 0 carries POSITION, slot 1 is the first spare
+    CHECK(t.base.vertex_buffer_count == 2 && t.base.vertex_buffers[1].array_stride == 0 &&
+          t.base.vertex_buffers[1].step_mode == pso::WgpuVertexStepMode::Instance &&
+          t.base.vertex_buffers[1].attribute_count == 2);
+    CHECK((t.diagnostics & (pso::PipelineDiag::VertexLayoutInvalid | pso::PipelineDiag::VertexSlotOutOfRange)) == 0);
 }
 
 // #691: menu glyph quads (COLOR unorm8x4 @0, TEXCOORD float2 @4, POSITION float2 @12, stride 20)
@@ -933,6 +966,7 @@ int main() {
     test_contained_sgpr_and_bitcast_vertex();
     test_vertex_join();
     test_vertex_join_wide_fetch();
+    test_vertex_default_inputs();
     test_layout_join();
     test_plan_direct_slot();
     test_heap_sources();

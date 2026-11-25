@@ -1502,6 +1502,7 @@ enum class Work : size_t {
     // Reflected root-descriptor bindings whose user SGPR starts a descriptor table, joined as a
     // table slot (stage_reflection.h, G62 #482), per pipeline state created.
     ReflectionRootDescriptorTables,
+    ReflectionVertexInputsDefaulted,
     Count
 };
 void count_work(Work w, uint64_t n = 1);

@@ -3358,13 +3358,13 @@ bool Device::resolve_with_pack(GraphicsPsoSource& src, uint64_t* vs_key, uint64_
         }
         std::vector<pso::VertexInputFetch> fetches;
         if (ok) {
+            JoinStats join_stats;
             ok = join_vertex_inputs(*vs_refl, src.input.data(), static_cast<uint32_t>(src.input.size()), &fetches,
-                                    &report);
+                                    &report, &join_stats);
             std::vector<ReflectedStageRef> stages{{GpuShaderStageBits::Vertex, vs_refl}};
             if (ps_refl != nullptr) {
                 stages.push_back({GpuShaderStageBits::Fragment, ps_refl});
             }
-            JoinStats join_stats;
             ok = join_pipeline_layout(src.root_signature->signature().desc(), /*compute=*/false, stages,
                                       &reflected_layout, &report, &join_stats,
                                       JoinOptions{options_.bridge.binding_arrays}) && ok;
@@ -3372,6 +3372,7 @@ bool Device::resolve_with_pack(GraphicsPsoSource& src, uint64_t* vs_key, uint64_
             if (ok) {
                 count_work(Work::ReflectionTableSlotsOutsideRs, join_stats.table_slots_outside_rs);
                 count_work(Work::ReflectionRootDescriptorTables, join_stats.root_descriptor_tables);
+                count_work(Work::ReflectionVertexInputsDefaulted, join_stats.vertex_inputs_defaulted);
             }
         }
         if (!ok) {
