@@ -6,6 +6,87 @@
 export const MANIFEST_ABI_VERSION = 1;
 export const DEFAULT_SAMPLE_COUNT = 5;
 export const DEFAULT_RANGE_PROBE_BYTES = 1;
+export const DEFAULT_MAX_CONCURRENCY = 4;
+export const MIN_MAX_CONCURRENCY = 1;
+export const MAX_MAX_CONCURRENCY = 16;
+
+const INTERNAL_SKIP_STATS = Symbol('manifestVerifierSkipModuleStats');
+
+const moduleStats = {
+  filesVerified: 0,
+  bytesHashed: 0,
+  mismatchCount: 0,
+  abortedCount: 0,
+  peakConcurrentHashes: 0,
+  activeHashes: 0,
+};
+
+function normalizeMaxConcurrency(raw, fallback = DEFAULT_MAX_CONCURRENCY) {
+  if (raw === undefined || raw === null || typeof raw === 'boolean' || raw === '') {
+    return fallback;
+  }
+  const num = Number(raw);
+  if (Number.isNaN(num)) {
+    return fallback;
+  }
+  if (num === Infinity) {
+    return MAX_MAX_CONCURRENCY;
+  }
+  if (num === -Infinity) {
+    return MIN_MAX_CONCURRENCY;
+  }
+  const floored = Math.floor(num);
+  return Math.max(MIN_MAX_CONCURRENCY, Math.min(MAX_MAX_CONCURRENCY, floored));
+}
+
+function enterModuleHash() {
+  moduleStats.activeHashes += 1;
+  if (moduleStats.activeHashes > moduleStats.peakConcurrentHashes) {
+    moduleStats.peakConcurrentHashes = moduleStats.activeHashes;
+  }
+}
+
+function leaveModuleHash() {
+  if (moduleStats.activeHashes > 0) {
+    moduleStats.activeHashes -= 1;
+  }
+}
+
+/**
+ * Returns a sanitized snapshot of cumulative manifest & stream verification telemetry.
+ * Contains only numeric counters (never host filesystem paths, URLs, or raw file bytes).
+ *
+ * @returns {{
+ *   filesVerified: number,
+ *   bytesHashed: number,
+ *   mismatchCount: number,
+ *   abortedCount: number,
+ *   peakConcurrentHashes: number,
+ *   activeHashes: number,
+ * }}
+ */
+export function getStats() {
+  return {
+    filesVerified: moduleStats.filesVerified,
+    bytesHashed: moduleStats.bytesHashed,
+    mismatchCount: moduleStats.mismatchCount,
+    abortedCount: moduleStats.abortedCount,
+    peakConcurrentHashes: moduleStats.peakConcurrentHashes,
+    activeHashes: moduleStats.activeHashes,
+  };
+}
+
+/**
+ * Resets cumulative manifest & stream verification telemetry counters.
+ * Preserves any currently active hash count so in-flight workers cannot underflow counters.
+ */
+export function resetStats() {
+  moduleStats.filesVerified = 0;
+  moduleStats.bytesHashed = 0;
+  moduleStats.mismatchCount = 0;
+  moduleStats.abortedCount = 0;
+  moduleStats.peakConcurrentHashes = moduleStats.activeHashes;
+}
 
 export const MISMATCH_CATEGORIES = Object.freeze({
   MISSING: 'missing',
@@ -630,16 +711,16 @@ async function raceWithAbort(promise, signal) {
 }
 
 async function computeSha256Hex(bytes) {
-  const subtle = globalThis.crypto?.subtle;
-  if (!subtle || typeof subtle.digest !== 'function') {
-    throw new Error('SHA-256 verification requires Web Crypto crypto.subtle.digest or a custom hashFn');
-  }
   const view =
     bytes instanceof Uint8Array
       ? bytes
       : bytes instanceof ArrayBuffer
         ? new Uint8Array(bytes)
         : new Uint8Array(0);
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle || typeof subtle.digest !== 'function') {
+    return computeDigest(view, STREAM_HASH_ALGORITHMS.SHA256);
+  }
   const digest = await subtle.digest('SHA-256', view);
   const out = new Uint8Array(digest);
   let hex = '';
@@ -2057,24 +2138,97 @@ export function computeStreamingReadiness(manifest, bootset = null, options = {}
   };
 }
 
-async function consumeResponseBuffer(res) {
-  if (!res) return { byteLength: null, bytes: null };
-  if (typeof res.arrayBuffer === 'function') {
-    const buf = await res.arrayBuffer();
-    if (!buf) {
-      return { byteLength: 0, bytes: new Uint8Array(0) };
-    }
-    const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
-    return { byteLength: bytes.byteLength, bytes };
-  }
-  if (res.body && typeof res.body.cancel === 'function') {
+async function cancelResponseBodyQuietly(res) {
+  if (res?.body && typeof res.body.cancel === 'function') {
     try {
       await res.body.cancel();
     } catch {
       // Ignore stream cancellation errors.
     }
   }
-  return { byteLength: null, bytes: null };
+}
+
+async function consumeResponseStream(res, options = {}) {
+  if (!res) {
+    return { byteLength: null, bytes: null, streamed: false };
+  }
+  const { signal = null, needBytes = true } = options;
+
+  if (res.body && typeof res.body.getReader === 'function') {
+    const reader = res.body.getReader();
+    const chunks = needBytes ? [] : null;
+    let totalBytes = 0;
+    let shouldCancel = false;
+    try {
+      while (true) {
+        if (signal?.aborted) {
+          shouldCancel = true;
+          throw createAbortError(signal);
+        }
+        let step;
+        try {
+          step = await raceWithAbort(reader.read(), signal);
+        } catch (err) {
+          if (signal?.aborted || isAbortError(err)) {
+            shouldCancel = true;
+          }
+          throw err;
+        }
+        if (!step || step.done) {
+          break;
+        }
+        if (step.value !== undefined && step.value !== null) {
+          const view = toUint8View(step.value);
+          totalBytes += view.byteLength;
+          if (chunks !== null && view.byteLength > 0) {
+            chunks.push(view);
+          }
+        }
+      }
+    } finally {
+      if (shouldCancel) {
+        try {
+          await reader.cancel();
+        } catch {
+          // Ignore stream cancel errors.
+        }
+      }
+      try {
+        reader.releaseLock();
+      } catch {
+        // Ignore lock release errors.
+      }
+    }
+
+    if (!needBytes) {
+      return { byteLength: totalBytes, bytes: null, streamed: true };
+    }
+    if (chunks.length === 0) {
+      return { byteLength: 0, bytes: new Uint8Array(0), streamed: true };
+    }
+    if (chunks.length === 1) {
+      return { byteLength: totalBytes, bytes: chunks[0], streamed: true };
+    }
+    const merged = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      merged.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return { byteLength: totalBytes, bytes: merged, streamed: true };
+  }
+
+  if (typeof res.arrayBuffer === 'function') {
+    const buf = await raceWithAbort(res.arrayBuffer(), signal);
+    if (!buf) {
+      return { byteLength: 0, bytes: needBytes ? new Uint8Array(0) : null, streamed: false };
+    }
+    const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+    return { byteLength: bytes.byteLength, bytes: needBytes ? bytes : null, streamed: false };
+  }
+
+  await cancelResponseBodyQuietly(res);
+  return { byteLength: null, bytes: null, streamed: false };
 }
 
 function hasCoopCoepHeaders(headers) {
@@ -2090,13 +2244,14 @@ function hasCoopCoepHeaders(headers) {
 
 /**
  * Probes up to `sampleCount` complete manifest files against a live HTTP endpoint using
- * `HEAD` and `GET Range: bytes=0-<end>` requests. Verifies `206 Partial Content`,
- * `Accept-Ranges: bytes`, `Content-Range` total length matching the manifest size,
- * response byte count, `ETag` presence/consistency, and optional SHA-256 content hashes.
+ * `HEAD` and `GET Range: bytes=0-<end>` requests with bounded concurrency (`maxConcurrency`,
+ * default `4`, clamped `[1, 16]`). Verifies `206 Partial Content`, `Accept-Ranges: bytes`,
+ * `Content-Range` total length matching the manifest size, response byte count, `ETag`
+ * presence/consistency, and optional streaming SHA-256 content hashes.
  *
- * Supports optional `AbortSignal` cancellation (`signal`) and injectable clock (`nowFn`),
- * returning sanitized additive throughput/timing telemetry and structured mismatch categories
- * without leaking host paths or raw file bytes.
+ * Supports optional `AbortSignal` cancellation (`signal`) propagated across all active workers
+ * and injectable clock (`nowFn`), returning sanitized additive throughput/timing telemetry and
+ * structured mismatch categories without leaking host paths or raw file bytes.
  *
  * @param {object} options
  * @param {typeof fetch} [options.fetchImpl] Injectable fetch implementation (defaults to globalThis.fetch).
@@ -2104,6 +2259,7 @@ function hasCoopCoepHeaders(headers) {
  * @param {unknown} options.manifest Raw manifest object, JSON string, or validateDataManifest() result.
  * @param {number} [options.sampleCount=5] Maximum number of complete files to probe.
  * @param {number} [options.probeBytes=1] Number of prefix bytes to request in the Range probe (1 -> bytes=0-0).
+ * @param {number} [options.maxConcurrency=4] Maximum concurrent verification workers, clamped to `[1, 16]`.
  * @param {boolean} [options.checkCoopCoep=false] When true, fail probes missing COOP/COEP headers.
  * @param {boolean} [options.verifyHashes=false] When true, verify SHA-256 digests for entries declaring `sha256`.
  * @param {((bytes: Uint8Array) => Promise<string> | string) | null} [options.hashFn=null] Optional SHA-256 hex digest provider.
@@ -2118,20 +2274,28 @@ function hasCoopCoepHeaders(headers) {
  *   errors: string[],
  *   results: Array<object>,
  *   aborted: boolean,
+ *   abortedCount: number,
  *   elapsedMs: number,
  *   bytesVerified: number,
+ *   bytesHashed: number,
  *   filesVerified: number,
+ *   peakConcurrentHashes: number,
+ *   maxConcurrency: number,
  *   mismatchCount: number,
  *   mismatchesByCategory: { missing: number, size_mismatch: number, hash_mismatch: number },
  *   mismatches: Array<{ path: string, category: 'missing' | 'size_mismatch' | 'hash_mismatch', detail: string }>,
  *   telemetry: {
  *     elapsedMs: number,
  *     bytesVerified: number,
+ *     bytesHashed: number,
  *     filesVerified: number,
  *     bytesPerSecond: number,
  *     mismatchCount: number,
  *     mismatchesByCategory: { missing: number, size_mismatch: number, hash_mismatch: number },
  *     aborted: boolean,
+ *     abortedCount: number,
+ *     peakConcurrentHashes: number,
+ *     maxConcurrency: number,
  *   },
  * }>}
  */
@@ -2142,6 +2306,7 @@ export async function verifyLiveEndpoints(options = {}) {
     manifest,
     sampleCount = DEFAULT_SAMPLE_COUNT,
     probeBytes = DEFAULT_RANGE_PROBE_BYTES,
+    maxConcurrency = DEFAULT_MAX_CONCURRENCY,
     checkCoopCoep = false,
     verifyHashes = false,
     hashFn = null,
@@ -2153,6 +2318,7 @@ export async function verifyLiveEndpoints(options = {}) {
     throw new TypeError('verifyLiveEndpoints requires a fetchImpl function');
   }
 
+  const concurrency = normalizeMaxConcurrency(maxConcurrency, DEFAULT_MAX_CONCURRENCY);
   const now = resolveNowFn(nowFn);
   const startTime = now();
 
@@ -2165,16 +2331,42 @@ export async function verifyLiveEndpoints(options = {}) {
   let bytesVerified = 0;
   let filesVerified = 0;
   let aborted = false;
+  let runBytesHashed = 0;
+  let runAbortedCount = 0;
+  let runActiveHashes = 0;
+  let runPeakConcurrentHashes = 0;
+
+  const enterRunHash = () => {
+    runActiveHashes += 1;
+    if (runActiveHashes > runPeakConcurrentHashes) {
+      runPeakConcurrentHashes = runActiveHashes;
+    }
+    enterModuleHash();
+  };
+
+  const leaveRunHash = () => {
+    if (runActiveHashes > 0) {
+      runActiveHashes -= 1;
+    }
+    leaveModuleHash();
+  };
 
   const finalize = (manifestOk, topErrors) => {
     const elapsedMs = computeElapsedMs(startTime, now());
-    const telemetry = buildTelemetry({
+    const baseTelemetry = buildTelemetry({
       elapsedMs,
       bytesVerified,
       filesVerified,
       mismatchesByCategory,
       aborted,
     });
+    const telemetry = {
+      ...baseTelemetry,
+      bytesHashed: runBytesHashed,
+      abortedCount: runAbortedCount,
+      peakConcurrentHashes: runPeakConcurrentHashes,
+      maxConcurrency: concurrency,
+    };
     return {
       ok: !aborted && manifestOk && failed === 0,
       probed: results.length,
@@ -2184,9 +2376,13 @@ export async function verifyLiveEndpoints(options = {}) {
       errors: topErrors,
       results,
       aborted: telemetry.aborted,
+      abortedCount: runAbortedCount,
       elapsedMs: telemetry.elapsedMs,
       bytesVerified: telemetry.bytesVerified,
+      bytesHashed: runBytesHashed,
       filesVerified: telemetry.filesVerified,
+      peakConcurrentHashes: runPeakConcurrentHashes,
+      maxConcurrency: concurrency,
       mismatchCount: telemetry.mismatchCount,
       mismatchesByCategory: { ...telemetry.mismatchesByCategory },
       mismatches,
@@ -2196,6 +2392,8 @@ export async function verifyLiveEndpoints(options = {}) {
 
   if (signal?.aborted) {
     aborted = true;
+    runAbortedCount = 1;
+    moduleStats.abortedCount += 1;
     return finalize(false, []);
   }
 
@@ -2211,6 +2409,8 @@ export async function verifyLiveEndpoints(options = {}) {
 
   if (signal?.aborted || manifestResult.aborted) {
     aborted = true;
+    runAbortedCount = 1;
+    moduleStats.abortedCount += 1;
     return finalize(manifestResult.ok, topErrors);
   }
 
@@ -2235,12 +2435,7 @@ export async function verifyLiveEndpoints(options = {}) {
 
   const selected = completeEntries.slice(0, maxSamples);
 
-  for (const entry of selected) {
-    if (signal?.aborted) {
-      aborted = true;
-      break;
-    }
-
+  const verifySingleEntry = async (entry) => {
     const fileStart = now();
     const safePath = validateManifestPath(entry.path).ok ? entry.path : '<invalid-path>';
     const url = `${base}${encodeRelPathForUrl(entry.path)}`;
@@ -2282,7 +2477,9 @@ export async function verifyLiveEndpoints(options = {}) {
     let headCoopCoep = false;
     let rangeCoopCoep = false;
     let fileBytesVerified = 0;
+    let fileBytesHashed = 0;
     let rangeBytes = null;
+    let rangeStreamedHash = null;
     let rangeEndByte = -1;
     let entryAborted = false;
 
@@ -2291,6 +2488,7 @@ export async function verifyLiveEndpoints(options = {}) {
       const headInit = signal ? { method: 'HEAD', signal } : { method: 'HEAD' };
       const headRes = await raceWithAbort(fetchImpl(url, headInit), signal);
       if (signal?.aborted) {
+        await cancelResponseBodyQuietly(headRes);
         entryAborted = true;
       } else {
         headInfo.status = headRes ? headRes.status : null;
@@ -2301,13 +2499,7 @@ export async function verifyLiveEndpoints(options = {}) {
           headLenRaw !== null && /^\d+$/.test(headLenRaw.trim()) ? Number(headLenRaw.trim()) : null;
         headCoopCoep = hasCoopCoepHeaders(headRes?.headers);
 
-        if (headRes?.body && typeof headRes.body.cancel === 'function') {
-          try {
-            await headRes.body.cancel();
-          } catch {
-            // Ignore body cancel errors on HEAD.
-          }
-        }
+        await cancelResponseBodyQuietly(headRes);
 
         if (headInfo.status !== 200) {
           const msg = `HEAD ${safePath} returned HTTP ${headInfo.status} (expected 200)`;
@@ -2348,8 +2540,7 @@ export async function verifyLiveEndpoints(options = {}) {
     }
 
     if (entryAborted || signal?.aborted) {
-      aborted = true;
-      break;
+      return { aborted: true, bytesHashed: fileBytesHashed };
     }
 
     // 2. Range GET probe (only when file has at least 1 byte; 0-byte files cannot satisfy bytes=0-0)
@@ -2359,6 +2550,11 @@ export async function verifyLiveEndpoints(options = {}) {
       const rangeHeader = `bytes=0-${endByte}`;
       rangeInfo.requested = rangeHeader;
       rangeEndByte = endByte;
+      const canReuseRangeForHash =
+        verifyHashes &&
+        entry.sha256 !== null &&
+        !fileCategories.has(MISMATCH_CATEGORIES.MISSING) &&
+        endByte === entry.size - 1;
 
       try {
         const rangeInit = signal
@@ -2366,6 +2562,7 @@ export async function verifyLiveEndpoints(options = {}) {
           : { method: 'GET', headers: { Range: rangeHeader } };
         const rangeRes = await raceWithAbort(fetchImpl(url, rangeInit), signal);
         if (signal?.aborted) {
+          await cancelResponseBodyQuietly(rangeRes);
           entryAborted = true;
         } else {
           rangeInfo.status = rangeRes ? rangeRes.status : null;
@@ -2379,82 +2576,114 @@ export async function verifyLiveEndpoints(options = {}) {
               : null;
           rangeCoopCoep = hasCoopCoepHeaders(rangeRes?.headers);
 
-          const consumed = await raceWithAbort(consumeResponseBuffer(rangeRes), signal);
-          if (signal?.aborted) {
-            entryAborted = true;
-          } else {
-            rangeInfo.receivedBytes = consumed.byteLength;
-            rangeBytes = consumed.bytes;
-
-            if (rangeInfo.status !== 206) {
-              const msg = `GET ${safePath} (${rangeHeader}) returned HTTP ${rangeInfo.status} (expected 206 Partial Content)`;
-              fileErrors.push(msg);
-              if (rangeInfo.status === 404 || rangeInfo.status === 410) {
-                recordFileMismatch(MISMATCH_CATEGORIES.MISSING, msg);
-              } else if (rangeInfo.status === 416) {
-                recordFileMismatch(MISMATCH_CATEGORIES.SIZE_MISMATCH, msg);
-              }
+          if (rangeInfo.status !== 206) {
+            await cancelResponseBodyQuietly(rangeRes);
+            const msg = `GET ${safePath} (${rangeHeader}) returned HTTP ${rangeInfo.status} (expected 206 Partial Content)`;
+            fileErrors.push(msg);
+            if (rangeInfo.status === 404 || rangeInfo.status === 410) {
+              recordFileMismatch(MISMATCH_CATEGORIES.MISSING, msg);
+            } else if (rangeInfo.status === 416) {
+              recordFileMismatch(MISMATCH_CATEGORIES.SIZE_MISMATCH, msg);
+            }
+          } else if (
+            canReuseRangeForHash &&
+            typeof hashFn !== 'function' &&
+            rangeRes?.body &&
+            typeof rangeRes.body.getReader === 'function'
+          ) {
+            enterRunHash();
+            try {
+              rangeStreamedHash = await verifyStream(rangeRes.body, {
+                algorithm: STREAM_HASH_ALGORITHMS.SHA256,
+                expectedDigest: entry.sha256,
+                expectedSize: entry.size,
+                path: safePath,
+                signal,
+                nowFn,
+                [INTERNAL_SKIP_STATS]: true,
+              });
+            } finally {
+              leaveRunHash();
+            }
+            fileBytesHashed += rangeStreamedHash.checkedBytes;
+            if (rangeStreamedHash.aborted || signal?.aborted) {
+              entryAborted = true;
             } else {
-              if (rangeInfo.receivedBytes !== null && rangeInfo.receivedBytes > 0) {
-                fileBytesVerified += rangeInfo.receivedBytes;
-              }
-              if (!rangeInfo.acceptRanges || !/\bbytes\b/i.test(rangeInfo.acceptRanges)) {
+              rangeInfo.receivedBytes = rangeStreamedHash.checkedBytes;
+            }
+          } else {
+            const consumed = await consumeResponseStream(rangeRes, {
+              signal,
+              needBytes: canReuseRangeForHash,
+            });
+            if (signal?.aborted) {
+              entryAborted = true;
+            } else {
+              rangeInfo.receivedBytes = consumed.byteLength;
+              rangeBytes = consumed.bytes;
+            }
+          }
+
+          if (!entryAborted && !signal?.aborted && rangeInfo.status === 206) {
+            if (rangeInfo.receivedBytes !== null && rangeInfo.receivedBytes > 0) {
+              fileBytesVerified += rangeInfo.receivedBytes;
+            }
+            if (!rangeInfo.acceptRanges || !/\bbytes\b/i.test(rangeInfo.acceptRanges)) {
+              fileErrors.push(
+                `GET ${safePath} (${rangeHeader}) missing Accept-Ranges: bytes (got ${JSON.stringify(rangeInfo.acceptRanges)})`,
+              );
+            }
+
+            const parsedCr = parseContentRange(rangeInfo.contentRange);
+            rangeInfo.parsedContentRange = parsedCr;
+            if (!parsedCr) {
+              fileErrors.push(
+                `GET ${safePath} (${rangeHeader}) returned missing or invalid Content-Range: ${JSON.stringify(rangeInfo.contentRange)}`,
+              );
+            } else {
+              if (parsedCr.start !== 0 || parsedCr.end !== endByte) {
                 fileErrors.push(
-                  `GET ${safePath} (${rangeHeader}) missing Accept-Ranges: bytes (got ${JSON.stringify(rangeInfo.acceptRanges)})`,
+                  `GET ${safePath} (${rangeHeader}) Content-Range span ${parsedCr.start}-${parsedCr.end} does not match requested 0-${endByte}`,
                 );
               }
-
-              const parsedCr = parseContentRange(rangeInfo.contentRange);
-              rangeInfo.parsedContentRange = parsedCr;
-              if (!parsedCr) {
-                fileErrors.push(
-                  `GET ${safePath} (${rangeHeader}) returned missing or invalid Content-Range: ${JSON.stringify(rangeInfo.contentRange)}`,
-                );
-              } else {
-                if (parsedCr.start !== 0 || parsedCr.end !== endByte) {
-                  fileErrors.push(
-                    `GET ${safePath} (${rangeHeader}) Content-Range span ${parsedCr.start}-${parsedCr.end} does not match requested 0-${endByte}`,
-                  );
-                }
-                if (parsedCr.total !== entry.size) {
-                  const msg = `GET ${safePath} (${rangeHeader}) Content-Range total (${parsedCr.total}) does not match manifest size (${entry.size})`;
-                  fileErrors.push(msg);
-                  recordFileMismatch(MISMATCH_CATEGORIES.SIZE_MISMATCH, msg);
-                }
-              }
-
-              if (rangeInfo.contentLength !== null && rangeInfo.contentLength !== expectedLength) {
-                const msg = `GET ${safePath} (${rangeHeader}) Content-Length (${rangeInfo.contentLength}) does not match expected ${expectedLength}`;
+              if (parsedCr.total !== entry.size) {
+                const msg = `GET ${safePath} (${rangeHeader}) Content-Range total (${parsedCr.total}) does not match manifest size (${entry.size})`;
                 fileErrors.push(msg);
                 recordFileMismatch(MISMATCH_CATEGORIES.SIZE_MISMATCH, msg);
               }
+            }
 
-              if (rangeInfo.receivedBytes !== null && rangeInfo.receivedBytes !== expectedLength) {
-                const msg = `GET ${safePath} (${rangeHeader}) returned ${rangeInfo.receivedBytes} bytes (expected ${expectedLength})`;
+            if (rangeInfo.contentLength !== null && rangeInfo.contentLength !== expectedLength) {
+              const msg = `GET ${safePath} (${rangeHeader}) Content-Length (${rangeInfo.contentLength}) does not match expected ${expectedLength}`;
+              fileErrors.push(msg);
+              recordFileMismatch(MISMATCH_CATEGORIES.SIZE_MISMATCH, msg);
+            }
+
+            if (rangeInfo.receivedBytes !== null && rangeInfo.receivedBytes !== expectedLength) {
+              const msg = `GET ${safePath} (${rangeHeader}) returned ${rangeInfo.receivedBytes} bytes (expected ${expectedLength})`;
+              fileErrors.push(msg);
+              recordFileMismatch(MISMATCH_CATEGORIES.SIZE_MISMATCH, msg);
+            }
+
+            if (!rangeInfo.etag || rangeInfo.etag.trim().length === 0) {
+              fileErrors.push(`GET ${safePath} (${rangeHeader}) missing ETag header`);
+            } else {
+              if (headInfo.etag && rangeInfo.etag.trim() !== headInfo.etag.trim()) {
+                const msg = `GET ${safePath} ETag (${sanitizeDiagnosticText(rangeInfo.etag.trim(), 96)}) differs from HEAD ETag (${sanitizeDiagnosticText(headInfo.etag.trim(), 96)})`;
                 fileErrors.push(msg);
-                recordFileMismatch(MISMATCH_CATEGORIES.SIZE_MISMATCH, msg);
+                recordFileMismatch(MISMATCH_CATEGORIES.HASH_MISMATCH, msg);
               }
+              if (entry.etag && rangeInfo.etag.trim() !== entry.etag) {
+                const msg = `GET ${safePath} ETag (${sanitizeDiagnosticText(rangeInfo.etag.trim(), 96)}) does not match manifest ETag (${sanitizeDiagnosticText(entry.etag, 96)})`;
+                fileErrors.push(msg);
+                recordFileMismatch(MISMATCH_CATEGORIES.HASH_MISMATCH, msg);
+              }
+            }
 
-              if (!rangeInfo.etag || rangeInfo.etag.trim().length === 0) {
-                fileErrors.push(`GET ${safePath} (${rangeHeader}) missing ETag header`);
-              } else {
-                if (headInfo.etag && rangeInfo.etag.trim() !== headInfo.etag.trim()) {
-                  const msg = `GET ${safePath} ETag (${sanitizeDiagnosticText(rangeInfo.etag.trim(), 96)}) differs from HEAD ETag (${sanitizeDiagnosticText(headInfo.etag.trim(), 96)})`;
-                  fileErrors.push(msg);
-                  recordFileMismatch(MISMATCH_CATEGORIES.HASH_MISMATCH, msg);
-                }
-                if (entry.etag && rangeInfo.etag.trim() !== entry.etag) {
-                  const msg = `GET ${safePath} ETag (${sanitizeDiagnosticText(rangeInfo.etag.trim(), 96)}) does not match manifest ETag (${sanitizeDiagnosticText(entry.etag, 96)})`;
-                  fileErrors.push(msg);
-                  recordFileMismatch(MISMATCH_CATEGORIES.HASH_MISMATCH, msg);
-                }
-              }
-
-              if (checkCoopCoep && !rangeCoopCoep) {
-                fileErrors.push(
-                  `GET ${safePath} (${rangeHeader}) missing required COOP/COEP headers`,
-                );
-              }
+            if (checkCoopCoep && !rangeCoopCoep) {
+              fileErrors.push(
+                `GET ${safePath} (${rangeHeader}) missing required COOP/COEP headers`,
+              );
             }
           }
         }
@@ -2469,8 +2698,8 @@ export async function verifyLiveEndpoints(options = {}) {
     }
 
     if (entryAborted || signal?.aborted) {
-      aborted = true;
-      break;
+      rangeBytes = null;
+      return { aborted: true, bytesHashed: fileBytesHashed };
     }
 
     // 3. Optional SHA-256 content hash verification (streams response body in O(1) RAM when
@@ -2482,9 +2711,24 @@ export async function verifyLiveEndpoints(options = {}) {
     ) {
       const hashStart = now();
       let bytesToHash = null;
-      let streamedResult = null;
+      let streamedResult = rangeStreamedHash;
       try {
-        if (entry.size === 0) {
+        if (streamedResult !== null) {
+          fileBytesVerified = Math.max(fileBytesVerified, streamedResult.checkedBytes);
+          const verified = Boolean(streamedResult.digestVerified);
+          hashInfo = {
+            expected: entry.sha256,
+            actual: streamedResult.digest,
+            verified,
+            checkedBytes: streamedResult.checkedBytes,
+            elapsedMs: streamedResult.elapsedMs,
+          };
+          if (!verified) {
+            const msg = `SHA-256 ${safePath} digest (${streamedResult.digest || 'invalid'}) does not match manifest sha256 (${entry.sha256})`;
+            fileErrors.push(msg);
+            recordFileMismatch(MISMATCH_CATEGORIES.HASH_MISMATCH, msg);
+          }
+        } else if (entry.size === 0) {
           bytesToHash = new Uint8Array(0);
         } else if (
           rangeInfo.status === 206 &&
@@ -2497,28 +2741,17 @@ export async function verifyLiveEndpoints(options = {}) {
           const fullInit = signal ? { method: 'GET', signal } : { method: 'GET' };
           const fullRes = await raceWithAbort(fetchImpl(url, fullInit), signal);
           if (signal?.aborted) {
+            await cancelResponseBodyQuietly(fullRes);
             entryAborted = true;
           } else {
             const fullStatus = fullRes ? fullRes.status : null;
             if (fullStatus === 404 || fullStatus === 410) {
-              if (fullRes?.body && typeof fullRes.body.cancel === 'function') {
-                try {
-                  await fullRes.body.cancel();
-                } catch {
-                  // Ignore body cancel errors.
-                }
-              }
+              await cancelResponseBodyQuietly(fullRes);
               const msg = `GET ${safePath} (sha256) returned HTTP ${fullStatus} (expected 200)`;
               fileErrors.push(msg);
               recordFileMismatch(MISMATCH_CATEGORIES.MISSING, msg);
             } else if (fullStatus !== 200) {
-              if (fullRes?.body && typeof fullRes.body.cancel === 'function') {
-                try {
-                  await fullRes.body.cancel();
-                } catch {
-                  // Ignore body cancel errors.
-                }
-              }
+              await cancelResponseBodyQuietly(fullRes);
               fileErrors.push(
                 `GET ${safePath} (sha256) returned HTTP ${fullStatus} (expected 200)`,
               );
@@ -2527,14 +2760,21 @@ export async function verifyLiveEndpoints(options = {}) {
               fullRes?.body &&
               typeof fullRes.body.getReader === 'function'
             ) {
-              streamedResult = await verifyStream(fullRes.body, {
-                algorithm: STREAM_HASH_ALGORITHMS.SHA256,
-                expectedDigest: entry.sha256,
-                expectedSize: entry.size,
-                path: safePath,
-                signal,
-                nowFn,
-              });
+              enterRunHash();
+              try {
+                streamedResult = await verifyStream(fullRes.body, {
+                  algorithm: STREAM_HASH_ALGORITHMS.SHA256,
+                  expectedDigest: entry.sha256,
+                  expectedSize: entry.size,
+                  path: safePath,
+                  signal,
+                  nowFn,
+                  [INTERNAL_SKIP_STATS]: true,
+                });
+              } finally {
+                leaveRunHash();
+              }
+              fileBytesHashed += streamedResult.checkedBytes;
               if (streamedResult.aborted || signal?.aborted) {
                 entryAborted = true;
               } else {
@@ -2559,7 +2799,10 @@ export async function verifyLiveEndpoints(options = {}) {
                 }
               }
             } else {
-              const fullConsumed = await raceWithAbort(consumeResponseBuffer(fullRes), signal);
+              const fullConsumed = await consumeResponseStream(fullRes, {
+                signal,
+                needBytes: true,
+              });
               if (signal?.aborted) {
                 entryAborted = true;
               } else if (fullConsumed.bytes !== null) {
@@ -2576,15 +2819,22 @@ export async function verifyLiveEndpoints(options = {}) {
         }
 
         if (!entryAborted && !signal?.aborted && streamedResult === null && bytesToHash !== null) {
-          const rawDigest = await raceWithAbort(
-            Promise.resolve(
-              typeof hashFn === 'function' ? hashFn(bytesToHash) : computeSha256Hex(bytesToHash),
-            ),
-            signal,
-          );
+          let rawDigest;
+          enterRunHash();
+          try {
+            rawDigest = await raceWithAbort(
+              Promise.resolve(
+                typeof hashFn === 'function' ? hashFn(bytesToHash) : computeSha256Hex(bytesToHash),
+              ),
+              signal,
+            );
+          } finally {
+            leaveRunHash();
+          }
           if (signal?.aborted) {
             entryAborted = true;
           } else {
+            fileBytesHashed += bytesToHash.byteLength;
             const actualHex =
               typeof rawDigest === 'string' && SHA256_HEX_RE.test(rawDigest.trim())
                 ? rawDigest.trim().toLowerCase()
@@ -2611,6 +2861,8 @@ export async function verifyLiveEndpoints(options = {}) {
           const safeErr = sanitizeDiagnosticText(err instanceof Error ? err.message : String(err));
           fileErrors.push(`SHA-256 ${safePath} verification failed: ${safeErr}`);
         }
+      } finally {
+        bytesToHash = null;
       }
     }
 
@@ -2618,41 +2870,99 @@ export async function verifyLiveEndpoints(options = {}) {
     rangeBytes = null;
 
     if (entryAborted || signal?.aborted) {
-      aborted = true;
-      break;
-    }
-
-    for (const m of fileMismatches) {
-      mismatchesByCategory[m.category] += 1;
-      mismatches.push(m);
+      return { aborted: true, bytesHashed: fileBytesHashed };
     }
 
     const fileElapsedMs = computeElapsedMs(fileStart, now());
-    filesVerified += 1;
-    bytesVerified += fileBytesVerified;
-
     const fileOk = fileErrors.length === 0;
-    if (fileOk) {
+
+    return {
+      aborted: false,
+      bytesVerified: fileBytesVerified,
+      bytesHashed: fileBytesHashed,
+      mismatches: fileMismatches,
+      result: {
+        path: entry.path,
+        url,
+        expectedSize: entry.size,
+        ok: fileOk,
+        errors: fileErrors,
+        head: headInfo,
+        range: rangeInfo,
+        hash: hashInfo,
+        etag: rangeInfo.etag || headInfo.etag || null,
+        coopCoep: entry.size > 0 ? headCoopCoep && rangeCoopCoep : headCoopCoep,
+        elapsedMs: fileElapsedMs,
+        bytesVerified: fileBytesVerified,
+        mismatchCategories: Array.from(fileCategories),
+      },
+    };
+  };
+
+  const orderedOutcomes = new Array(selected.length).fill(null);
+  let nextIndex = 0;
+  const workerCount = Math.min(concurrency, selected.length);
+
+  const runWorker = async () => {
+    while (true) {
+      if (signal?.aborted) {
+        aborted = true;
+        return;
+      }
+      const idx = nextIndex;
+      if (idx >= selected.length) {
+        return;
+      }
+      nextIndex += 1;
+
+      const outcome = await verifySingleEntry(selected[idx]);
+      if (outcome.aborted) {
+        aborted = true;
+        runAbortedCount += 1;
+        moduleStats.abortedCount += 1;
+        if (outcome.bytesHashed > 0) {
+          runBytesHashed += outcome.bytesHashed;
+          moduleStats.bytesHashed += outcome.bytesHashed;
+        }
+        return;
+      }
+
+      orderedOutcomes[idx] = outcome;
+      runBytesHashed += outcome.bytesHashed;
+      moduleStats.filesVerified += 1;
+      moduleStats.bytesHashed += outcome.bytesHashed;
+      moduleStats.mismatchCount += outcome.mismatches.length;
+    }
+  };
+
+  if (workerCount > 0) {
+    const workers = [];
+    for (let w = 0; w < workerCount; w += 1) {
+      workers.push(runWorker());
+    }
+    await Promise.all(workers);
+  }
+
+  if (aborted && runAbortedCount === 0) {
+    runAbortedCount = 1;
+    moduleStats.abortedCount += 1;
+  }
+
+  for (let i = 0; i < orderedOutcomes.length; i += 1) {
+    const outcome = orderedOutcomes[i];
+    if (!outcome) continue;
+    for (const m of outcome.mismatches) {
+      mismatchesByCategory[m.category] += 1;
+      mismatches.push(m);
+    }
+    filesVerified += 1;
+    bytesVerified += outcome.bytesVerified;
+    if (outcome.result.ok) {
       passed += 1;
     } else {
       failed += 1;
     }
-
-    results.push({
-      path: entry.path,
-      url,
-      expectedSize: entry.size,
-      ok: fileOk,
-      errors: fileErrors,
-      head: headInfo,
-      range: rangeInfo,
-      hash: hashInfo,
-      etag: rangeInfo.etag || headInfo.etag || null,
-      coopCoep: entry.size > 0 ? headCoopCoep && rangeCoopCoep : headCoopCoep,
-      elapsedMs: fileElapsedMs,
-      bytesVerified: fileBytesVerified,
-      mismatchCategories: Array.from(fileCategories),
-    });
+    results.push(outcome.result);
   }
 
   return finalize(manifestResult.ok, topErrors);
@@ -2801,6 +3111,7 @@ function resolveAlgorithmAndExpectations(options) {
  * @param {((updateResult: object) => void) | null} [options.onChunk=null] Optional per-update progress callback.
  */
 export function createIncrementalVerifier(options = {}) {
+  const skipModuleStats = Boolean(isPlainObject(options) && options[INTERNAL_SKIP_STATS]);
   const config = resolveAlgorithmAndExpectations(options);
   const now = resolveNowFn(config.nowFn);
 
@@ -3114,6 +3425,11 @@ export function createIncrementalVerifier(options = {}) {
           verifiedBlocks,
         },
       };
+      if (!skipModuleStats) {
+        moduleStats.bytesHashed += checkedBytes;
+        moduleStats.mismatchCount += telemetry.mismatchCount;
+        moduleStats.abortedCount += 1;
+      }
       return cachedResult;
     }
 
@@ -3241,6 +3557,11 @@ export function createIncrementalVerifier(options = {}) {
         verifiedBlocks,
       },
     };
+    if (!skipModuleStats) {
+      moduleStats.filesVerified += 1;
+      moduleStats.bytesHashed += checkedBytes;
+      moduleStats.mismatchCount += telemetry.mismatchCount;
+    }
     return cachedResult;
   };
 
@@ -3288,113 +3609,151 @@ export function createIncrementalVerifier(options = {}) {
  * @returns {Promise<ReturnType<ReturnType<typeof createIncrementalVerifier>['finalize']>>}
  */
 export async function verifyStream(source, options = {}) {
-  const verifier = createIncrementalVerifier(options);
   const opts = isPlainObject(options) ? options : {};
+  const skipModuleStats = Boolean(opts[INTERNAL_SKIP_STATS]);
+  const verifier = createIncrementalVerifier({
+    ...opts,
+    [INTERNAL_SKIP_STATS]: true,
+  });
   const signal = opts.signal ?? null;
   const failFast = Boolean(opts.failFast);
 
   if (signal?.aborted) {
-    return verifier.finalize();
+    const result = verifier.finalize();
+    if (!skipModuleStats) {
+      moduleStats.abortedCount += 1;
+    }
+    return result;
   }
 
-  if (
+  const isBufferSource =
     source instanceof Uint8Array ||
     source instanceof ArrayBuffer ||
     (typeof SharedArrayBuffer !== 'undefined' && source instanceof SharedArrayBuffer) ||
-    ArrayBuffer.isView(source)
-  ) {
-    verifier.update(source);
-    return verifier.finalize();
+    ArrayBuffer.isView(source);
+  const isReaderSource = Boolean(source && typeof source.getReader === 'function');
+  const isAsyncIterable = Boolean(source && typeof source[Symbol.asyncIterator] === 'function');
+  const isSyncIterable = Boolean(source && typeof source[Symbol.iterator] === 'function');
+
+  if (!isBufferSource && !isReaderSource && !isAsyncIterable && !isSyncIterable) {
+    throw new TypeError(
+      'verifyStream source must be a ReadableStream, AsyncIterable, Iterable of chunks, or byte buffer',
+    );
   }
 
-  if (source && typeof source.getReader === 'function') {
-    const reader = source.getReader();
-    let shouldCancel = false;
-    try {
-      while (true) {
-        if (signal?.aborted) {
-          shouldCancel = true;
-          break;
-        }
-        let step;
-        try {
-          step = await raceWithAbort(reader.read(), signal);
-        } catch (err) {
-          if (signal?.aborted || isAbortError(err)) {
-            shouldCancel = true;
-            break;
-          }
-          throw err;
-        }
-        if (!step || step.done) {
-          break;
-        }
-        if (step.value !== undefined && step.value !== null) {
-          const updateRes = verifier.update(step.value);
-          if (updateRes.aborted || (failFast && !updateRes.ok)) {
-            shouldCancel = true;
-            break;
-          }
-        }
-      }
-    } finally {
-      if (shouldCancel) {
-        try {
-          await reader.cancel();
-        } catch {
-          // Ignore stream cancel errors.
-        }
-      }
-      try {
-        reader.releaseLock();
-      } catch {
-        // Ignore lock release errors.
-      }
+  const recordStreamStats = (result) => {
+    if (skipModuleStats) return;
+    moduleStats.bytesHashed += result.checkedBytes;
+    moduleStats.mismatchCount += result.mismatchCount;
+    if (result.aborted) {
+      moduleStats.abortedCount += 1;
+    } else {
+      moduleStats.filesVerified += 1;
     }
-    return verifier.finalize();
-  }
+  };
 
-  if (source && typeof source[Symbol.asyncIterator] === 'function') {
-    const iterator = source[Symbol.asyncIterator]();
-    let shouldClose = false;
-    try {
-      while (true) {
-        if (signal?.aborted) {
-          shouldClose = true;
-          break;
+  if (!skipModuleStats) {
+    enterModuleHash();
+  }
+  try {
+    if (isBufferSource) {
+      verifier.update(source);
+      const result = verifier.finalize();
+      recordStreamStats(result);
+      return result;
+    }
+
+    if (isReaderSource) {
+      const reader = source.getReader();
+      let shouldCancel = false;
+      try {
+        while (true) {
+          if (signal?.aborted) {
+            shouldCancel = true;
+            break;
+          }
+          let step;
+          try {
+            step = await raceWithAbort(reader.read(), signal);
+          } catch (err) {
+            if (signal?.aborted || isAbortError(err)) {
+              shouldCancel = true;
+              break;
+            }
+            throw err;
+          }
+          if (!step || step.done) {
+            break;
+          }
+          if (step.value !== undefined && step.value !== null) {
+            const updateRes = verifier.update(step.value);
+            if (updateRes.aborted || (failFast && !updateRes.ok)) {
+              shouldCancel = true;
+              break;
+            }
+          }
         }
-        let step;
+      } finally {
+        if (shouldCancel) {
+          try {
+            await reader.cancel();
+          } catch {
+            // Ignore stream cancel errors.
+          }
+        }
         try {
-          step = await raceWithAbort(iterator.next(), signal);
-        } catch (err) {
-          if (signal?.aborted || isAbortError(err)) {
+          reader.releaseLock();
+        } catch {
+          // Ignore lock release errors.
+        }
+      }
+      const result = verifier.finalize();
+      recordStreamStats(result);
+      return result;
+    }
+
+    if (isAsyncIterable) {
+      const iterator = source[Symbol.asyncIterator]();
+      let shouldClose = false;
+      try {
+        while (true) {
+          if (signal?.aborted) {
             shouldClose = true;
             break;
           }
-          throw err;
+          let step;
+          try {
+            step = await raceWithAbort(iterator.next(), signal);
+          } catch (err) {
+            if (signal?.aborted || isAbortError(err)) {
+              shouldClose = true;
+              break;
+            }
+            throw err;
+          }
+          if (!step || step.done) {
+            break;
+          }
+          const updateRes = verifier.update(step.value);
+          if (updateRes.aborted || (failFast && !updateRes.ok)) {
+            shouldClose = true;
+            break;
+          }
         }
-        if (!step || step.done) {
-          break;
-        }
-        const updateRes = verifier.update(step.value);
-        if (updateRes.aborted || (failFast && !updateRes.ok)) {
-          shouldClose = true;
-          break;
+      } finally {
+        if (shouldClose && typeof iterator.return === 'function') {
+          try {
+            await iterator.return();
+          } catch {
+            // Ignore iterator close errors.
+          }
         }
       }
-    } finally {
-      if (shouldClose && typeof iterator.return === 'function') {
-        try {
-          await iterator.return();
-        } catch {
-          // Ignore iterator close errors.
-        }
-      }
+      const result = verifier.finalize();
+      recordStreamStats(result);
+      return result;
     }
-    return verifier.finalize();
-  }
 
-  if (source && typeof source[Symbol.iterator] === 'function') {
     for (const chunk of source) {
       if (signal?.aborted) {
         break;
@@ -3404,10 +3763,12 @@ export async function verifyStream(source, options = {}) {
         break;
       }
     }
-    return verifier.finalize();
+    const result = verifier.finalize();
+    recordStreamStats(result);
+    return result;
+  } finally {
+    if (!skipModuleStats) {
+      leaveModuleHash();
+    }
   }
-
-  throw new TypeError(
-    'verifyStream source must be a ReadableStream, AsyncIterable, Iterable of chunks, or byte buffer',
-  );
 }
