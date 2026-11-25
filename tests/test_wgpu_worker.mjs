@@ -3696,3 +3696,302 @@ test('W342: outside an active frame, _destroyTextureIfPresent and _destroyBuffer
 
   processor.destroy();
 });
+
+// ============================================================================
+// W346: Skip redundant _scanCommandBufferFallbackProfiles double-walk &
+//       enableResourceReplay: false zero-overhead fast path + init wiring
+// ============================================================================
+
+test('W346: steady-state and pack-backed command buffers skip _scanCommandBufferFallbackProfiles completely', () => {
+  const { device, ctx } = createMockWebGpu();
+  const vsWgsl = '@vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> { return vec4<f32>(0.0, 0.0, 0.0, 1.0); }';
+  const fsWgsl = '@fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(0.2, 0.4, 0.8, 1.0); }';
+  const vsHash = 0x3460000000000001n;
+  const fsHash = 0x3460000000000002n;
+  const packBuf = buildWgslPackBuffer([
+    { hash: vsHash, stage: WGPK_SHADER_STAGE.VERTEX, wgsl: vsWgsl },
+    { hash: fsHash, stage: WGPK_SHADER_STAGE.FRAGMENT, wgsl: fsWgsl },
+  ]);
+
+  const processor = new WgpuCommandProcessor(device, ctx, {
+    wgslPackBuffer: packBuf,
+  });
+
+  let scanCalls = 0;
+  const origScan = processor._scanCommandBufferFallbackProfiles.bind(processor);
+  processor._scanCommandBufferFallbackProfiles = (view) => {
+    scanCalls += 1;
+    return origScan(view);
+  };
+
+  // Frame 1: CreateShaderModule hashes hit splash.wgsl.pack -> ZERO fallback profile scans!
+  const packSetupAndDraw = new BinaryCommandBuilder()
+    .beginFrame()
+    .createBuffer(1, BUFFER_USAGE.UNIFORM | BUFFER_USAGE.COPY_DST, 256)
+    .createShaderModule(2, SHADER_STAGE.VERTEX, formatHashHex(vsHash))
+    .createShaderModule(3, SHADER_STAGE.FRAGMENT, formatHashHex(fsHash))
+    .createRenderPipeline(4, 2, 3, 0)
+    .setPipeline(4)
+    .draw(3, 1, 0, 0)
+    .present()
+    .finish();
+
+  const r1 = processor.executeCommandBuffer(packSetupAndDraw);
+  assert.deepEqual(r1, { frameCount: 1, presents: 1 });
+  assert.equal(processor.shaderModules.get(2).source, 'pack');
+  assert.equal(processor.shaderModules.get(3).source, 'pack');
+  assert.equal(scanCalls, 0);
+  assert.equal(processor.getStats().fallbackProfileScanCount, 0);
+
+  // Frame 2: Inline WGSL CreateShaderModule -> ZERO fallback profile scans!
+  const inlineShaderDraw = new BinaryCommandBuilder()
+    .beginFrame()
+    .createShaderModule(12, SHADER_STAGE.VERTEX, vsWgsl)
+    .createShaderModule(13, SHADER_STAGE.FRAGMENT, fsWgsl)
+    .createRenderPipeline(14, 12, 13, 0)
+    .setPipeline(14)
+    .draw(3, 1, 0, 0)
+    .present()
+    .finish();
+
+  const r2 = processor.executeCommandBuffer(inlineShaderDraw);
+  assert.deepEqual(r2, { frameCount: 2, presents: 1 });
+  assert.equal(scanCalls, 0);
+  assert.equal(processor.getStats().fallbackProfileScanCount, 0);
+
+  // Frames 3..12: Steady-state draw-only command buffers -> ZERO fallback profile scans!
+  const drawOnly = new BinaryCommandBuilder()
+    .beginFrame()
+    .setPipeline(4)
+    .draw(3, 1, 0, 0)
+    .present()
+    .finish();
+
+  for (let i = 0; i < 10; i += 1) {
+    processor.executeCommandBuffer(drawOnly);
+  }
+  assert.equal(processor.frameCount, 12);
+  assert.equal(scanCalls, 0);
+  assert.equal(processor.getStats().fallbackProfileScanCount, 0);
+
+  processor.destroy();
+});
+
+test('W346: missing-shader CreateShaderModule lazily scans command buffer ONCE and still selects exact fallback profile', () => {
+  const { device, ctx } = createMockWebGpu();
+  const processor = new WgpuCommandProcessor(device, ctx);
+
+  let scanCalls = 0;
+  const origScan = processor._scanCommandBufferFallbackProfiles.bind(processor);
+  processor._scanCommandBufferFallbackProfiles = (view) => {
+    scanCalls += 1;
+    return origScan(view);
+  };
+
+  // Batch with TWO missing shaders (VS + FS) + CBV + Draw(3, 1):
+  // must lazily scan the command buffer at most ONCE and route both to fullscreen_triangle_cbv.
+  const missingBatch = new BinaryCommandBuilder()
+    .beginFrame()
+    .createBuffer(1, BUFFER_USAGE.UNIFORM | BUFFER_USAGE.COPY_DST, 256)
+    .createShaderModule(2, SHADER_STAGE.VERTEX, '0xdead000000000346')
+    .createShaderModule(3, SHADER_STAGE.FRAGMENT, '0xdead000000000347')
+    .createRenderPipeline(4, 2, 3, 0)
+    .createBindGroup(5, 4, 0, [
+      { binding: 0, resourceType: BIND_RESOURCE_TYPE.BUFFER, resourceId: 1, offset: 0, size: 256 },
+    ])
+    .setPipeline(4)
+    .setBindGroup(0, 5)
+    .draw(3, 1, 0, 0)
+    .present()
+    .finish();
+
+  const res = processor.executeCommandBuffer(missingBatch);
+  assert.deepEqual(res, { frameCount: 1, presents: 1 });
+  assert.equal(scanCalls, 1, 'should lazily scan command buffer exactly once for both missing shaders');
+  assert.equal(processor.getStats().fallbackProfileScanCount, 1);
+  assert.equal(processor.shaderModules.get(2).fallbackProfile, 'fullscreen_triangle_cbv');
+  assert.equal(processor.shaderModules.get(3).fallbackProfile, 'fullscreen_triangle_cbv');
+
+  // Subsequent steady-state frames using that pipeline must NOT re-scan.
+  const drawFrame = new BinaryCommandBuilder()
+    .beginFrame()
+    .setPipeline(4)
+    .setBindGroup(0, 5)
+    .draw(3, 1, 0, 0)
+    .present()
+    .finish();
+
+  processor.executeCommandBuffer(drawFrame);
+  processor.executeCommandBuffer(drawFrame);
+  assert.equal(scanCalls, 1);
+  assert.equal(processor.getStats().fallbackProfileScanCount, 1);
+
+  processor.destroy();
+});
+
+test('W346: enableResourceReplay: false bypasses _recordReplayPacket and _recordShadowBufferWrite with zero allocations, while default stays true', () => {
+  const { device: devDefault, ctx: ctxDefault } = createMockWebGpu();
+  const procDefault = new WgpuCommandProcessor(devDefault, ctxDefault);
+
+  const payloadBytes = new Uint8Array(64).fill(0xab);
+  const stream = new BinaryCommandBuilder()
+    .beginFrame()
+    .createBuffer(1, BUFFER_USAGE.UNIFORM | BUFFER_USAGE.COPY_DST, 64)
+    .writeBuffer(1, 0, payloadBytes)
+    .createTexture(2, 16, 16, 1, 1, TEXTURE_FORMAT.RGBA8_UNORM, TEXTURE_USAGE.TEXTURE_BINDING)
+    .present()
+    .finish();
+
+  // Default behavior: resource replay remains enabled for device-loss recovery compatibility.
+  assert.equal(procDefault.resourceReplayEnabled, true);
+  procDefault.executeCommandBuffer(stream);
+  const defaultReplayStats = procDefault.getResourceReplayStats();
+  assert.equal(defaultReplayStats.enabled, true);
+  assert.equal(defaultReplayStats.recordedResourceCount, 2);
+  assert.ok(defaultReplayStats.recordedResourceBytes > 0);
+  assert.equal(defaultReplayStats.shadowBufferCount, 1);
+  assert.equal(defaultReplayStats.shadowBufferBytes, 64);
+  assert.equal(procDefault.getStats().resourceReplayEnabled, true);
+
+  // Runtime disable with { clear: true } drops previously recorded entries & stops recording.
+  procDefault.setEnableResourceReplay(false, { clear: true });
+  assert.equal(procDefault.resourceReplayEnabled, false);
+  const clearedStats = procDefault.getResourceReplayStats();
+  assert.equal(clearedStats.enabled, false);
+  assert.equal(clearedStats.recordedResourceCount, 0);
+  assert.equal(clearedStats.recordedResourceBytes, 0);
+  assert.equal(clearedStats.shadowBufferCount, 0);
+  assert.equal(clearedStats.shadowBufferBytes, 0);
+  procDefault.destroy();
+
+  // Fast-path: enableResourceReplay: false completely skips _recordReplayPacket & _recordShadowBufferWrite.
+  const { device, ctx } = createMockWebGpu();
+  const procFast = new WgpuCommandProcessor(device, ctx, { enableResourceReplay: false });
+  assert.equal(procFast.resourceReplayEnabled, false);
+
+  let recordPacketCalls = 0;
+  let recordShadowCalls = 0;
+  let recordFromCalls = 0;
+  procFast._recordReplayPacket = () => {
+    recordPacketCalls += 1;
+  };
+  procFast._recordShadowBufferWrite = () => {
+    recordShadowCalls += 1;
+  };
+  procFast._recordReplayPacketsFrom = () => {
+    recordFromCalls += 1;
+  };
+
+  procFast.executeCommandBuffer(stream);
+  assert.equal(recordPacketCalls, 0, 'executeCommandBuffer must bypass _recordReplayPacket');
+  assert.equal(recordShadowCalls, 0, 'executeCommandBuffer must bypass _recordShadowBufferWrite');
+  assert.equal(recordFromCalls, 0, 'executeCommandBuffer must bypass _recordReplayPacketsFrom');
+
+  // Even while recovering, enableResourceReplay: false must not scan/copy packets.
+  procFast.beginDeviceRecovery();
+  procFast.executeCommandBuffer(stream);
+  procFast.endDeviceRecovery(true);
+  assert.equal(recordFromCalls, 0);
+
+  const fastStats = procFast.getResourceReplayStats();
+  assert.equal(fastStats.enabled, false);
+  assert.equal(fastStats.recordedResourceCount, 0);
+  assert.equal(fastStats.recordedResourceBytes, 0);
+  assert.equal(fastStats.shadowBufferCount, 0);
+  assert.equal(fastStats.shadowBufferBytes, 0);
+  assert.equal(procFast.getStats().resourceReplayEnabled, false);
+
+  procFast.destroy();
+});
+
+test('W346: createWgpuWorkerHandler forwards init.enableResourceReplay: false and options.enableResourceReplay: false', async () => {
+  const makeMockEnv = () => {
+    const { device, ctx } = createMockWebGpu();
+    device.features = new Set();
+    const { canvas } = createMockOffscreenCanvas(ctx);
+    const mockGpu = {
+      async requestAdapter() {
+        return {
+          info: { vendor: 'mock', architecture: 'rdna2' },
+          features: new Set(),
+          limits: {},
+          async requestDevice() {
+            return device;
+          },
+        };
+      },
+      getPreferredCanvasFormat() {
+        return 'bgra8unorm';
+      },
+    };
+    return { device, ctx, canvas, mockGpu };
+  };
+
+  const payloadBytes = new Uint8Array(64).fill(0x55);
+  const stream = new BinaryCommandBuilder()
+    .beginFrame()
+    .createBuffer(1, BUFFER_USAGE.UNIFORM | BUFFER_USAGE.COPY_DST, 64)
+    .writeBuffer(1, 0, payloadBytes)
+    .present()
+    .finish();
+
+  // 1. init message sets enableResourceReplay: false.
+  {
+    const { canvas, mockGpu } = makeMockEnv();
+    const posted = [];
+    const handler = createWgpuWorkerHandler({
+      postMessage: (m) => posted.push(m),
+      enableSwapchain: false,
+    });
+    await withMockNavigatorGpu(mockGpu, async () => {
+      await handler.handleMessage({
+        init: true,
+        canvas,
+        width: 640,
+        height: 360,
+        enableResourceReplay: false,
+      });
+    });
+
+    assert.ok(handler.processor, 'processor initialized');
+    assert.equal(handler.processor.resourceReplayEnabled, false);
+    await handler.handleMessage({ cmdBuffer: stream });
+    const replayStats = handler.processor.getResourceReplayStats();
+    assert.equal(replayStats.enabled, false);
+    assert.equal(replayStats.recordedResourceCount, 0);
+    assert.equal(replayStats.shadowBufferCount, 0);
+    assert.equal(replayStats.shadowBufferBytes, 0);
+    handler.processor.destroy();
+  }
+
+  // 2. handler options sets enableResourceReplay: false (and subsequent init can toggle it back on).
+  {
+    const { canvas, mockGpu } = makeMockEnv();
+    const posted = [];
+    const handler = createWgpuWorkerHandler({
+      postMessage: (m) => posted.push(m),
+      enableSwapchain: false,
+      enableResourceReplay: false,
+    });
+    await withMockNavigatorGpu(mockGpu, async () => {
+      await handler.handleMessage({
+        init: true,
+        canvas,
+        width: 640,
+        height: 360,
+      });
+    });
+
+    assert.equal(handler.processor.resourceReplayEnabled, false);
+    await handler.handleMessage({ cmdBuffer: stream });
+    assert.equal(handler.processor.getResourceReplayStats().recordedResourceCount, 0);
+
+    // Re-enabling via follow-up init message works cleanly.
+    await handler.handleMessage({ init: true, enableResourceReplay: true });
+    assert.equal(handler.processor.resourceReplayEnabled, true);
+    await handler.handleMessage({ cmdBuffer: stream });
+    assert.equal(handler.processor.getResourceReplayStats().recordedResourceCount, 1);
+    assert.equal(handler.processor.getResourceReplayStats().shadowBufferCount, 1);
+    handler.processor.destroy();
+  }
+});
