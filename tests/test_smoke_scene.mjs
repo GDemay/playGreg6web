@@ -18,6 +18,9 @@ import {
   UNIFORM_BYTE_SIZE,
   STORAGE_BYTE_SIZE,
   VERTEX_STRIDE_BYTES,
+  DEFAULT_TARGET_FPS,
+  DEFAULT_FRAME_BUDGET_MS,
+  DEFAULT_NON_BLACK_THRESHOLD,
   SMOKE_VERTEX_WGSL,
   SMOKE_FRAGMENT_WGSL,
   SMOKE_COMPUTE_WGSL,
@@ -26,6 +29,9 @@ import {
   generateProceduralTexture,
   normalizeInputState,
   submitToRing,
+  evaluateFramePacing,
+  hasNonBlackRgbaPixels,
+  summarizeDrawBatch,
 } from '../web/demo/smoke_scene.js';
 
 const require = createRequire(import.meta.url);
@@ -621,4 +627,219 @@ test('generateProceduralTexture and normalizeInputState validate edge cases', ()
 
   assert.equal(Object.keys(DEFAULT_RESOURCE_IDS).length, 13);
   assert.equal(STORAGE_BYTE_SIZE, 48);
+  assert.equal(DEFAULT_TARGET_FPS, 30);
+  assert.equal(DEFAULT_FRAME_BUDGET_MS, 33.333);
+  assert.equal(DEFAULT_NON_BLACK_THRESHOLD, 4);
+});
+
+test('evaluateFramePacing computes deterministic 30 FPS pacing metrics and guards invalid inputs', () => {
+  const input = [16, 20, 24, 28, 32, 16, 20, 24, 28, 32];
+  const snapshot = input.slice();
+  const steady = evaluateFramePacing(input);
+
+  // Input array must not be mutated
+  assert.deepEqual(input, snapshot);
+  assert.equal(steady.sampleCount, 10);
+  assert.equal(steady.droppedSamples, 0);
+  assert.equal(steady.budgetMs, DEFAULT_FRAME_BUDGET_MS);
+  assert.ok(Math.abs(steady.targetFps - 1000 / 33.333) < 1e-9);
+  assert.equal(steady.avgMs, 24);
+  assert.equal(steady.minMs, 16);
+  assert.equal(steady.maxMs, 32);
+  assert.equal(steady.p50Ms, 24);
+  assert.equal(steady.p95Ms, 32);
+  assert.equal(steady.p99Ms, 32);
+  assert.ok(Math.abs(steady.avgFps - 1000 / 24) < 1e-9);
+  assert.ok(Math.abs(steady.jitterMs - 48 / 9) < 1e-9);
+  assert.equal(steady.overBudgetCount, 0);
+  assert.equal(steady.overBudgetRatio, 0);
+  assert.equal(steady.withinBudgetRatio, 1);
+  assert.equal(steady.withinBudget, true);
+  assert.equal(steady.meetsTarget, true);
+
+  // 19 frames at 20ms + 1 spike at 50ms => p95 stays within 33.333ms while withinBudget is false
+  const withSingleSpike = Array(19).fill(20).concat([50]);
+  const spikeMetrics = evaluateFramePacing(withSingleSpike);
+  assert.equal(spikeMetrics.sampleCount, 20);
+  assert.equal(spikeMetrics.overBudgetCount, 1);
+  assert.equal(spikeMetrics.overBudgetRatio, 0.05);
+  assert.equal(spikeMetrics.withinBudgetRatio, 0.95);
+  assert.equal(spikeMetrics.p95Ms, 20);
+  assert.equal(spikeMetrics.p99Ms, 50);
+  assert.equal(spikeMetrics.withinBudget, false);
+  assert.equal(spikeMetrics.meetsTarget, true);
+
+  // Sustained slow frames miss the 30 FPS target
+  const slow = evaluateFramePacing([38, 40, 42, 44, 46]);
+  assert.equal(slow.overBudgetCount, 5);
+  assert.equal(slow.withinBudget, false);
+  assert.equal(slow.meetsTarget, false);
+
+  // Custom 60 FPS budget + TypedArray + invalid sample filtering
+  const mixed = evaluateFramePacing(new Float32Array([16, -2, Number.NaN, 17, Infinity, 16]), 16.667);
+  assert.equal(mixed.sampleCount, 3);
+  assert.equal(mixed.droppedSamples, 3);
+  assert.equal(mixed.overBudgetCount, 1);
+  assert.equal(mixed.withinBudget, false);
+
+  // Generator iterable support
+  function* gen() {
+    yield 33;
+    yield 33;
+  }
+  const fromIter = evaluateFramePacing(gen());
+  assert.equal(fromIter.sampleCount, 2);
+  assert.equal(fromIter.jitterMs, 0);
+  assert.equal(fromIter.withinBudget, true);
+
+  // Empty / null / undefined guards
+  for (const emptyInput of [null, undefined, [], [NaN, -5]]) {
+    const res = evaluateFramePacing(emptyInput);
+    assert.equal(res.sampleCount, 0);
+    assert.equal(res.avgMs, 0);
+    assert.equal(res.avgFps, 0);
+    assert.equal(res.withinBudget, false);
+    assert.equal(res.meetsTarget, false);
+  }
+
+  // Invalid budgetMs throws RangeError
+  assert.throws(() => evaluateFramePacing([16], 0), RangeError);
+  assert.throws(() => evaluateFramePacing([16], -10), RangeError);
+  assert.throws(() => evaluateFramePacing([16], Number.NaN), RangeError);
+});
+
+test('hasNonBlackRgbaPixels validates all-black, alpha-only, single bright pixel, and empty/null guards', () => {
+  // Empty / null / malformed guards
+  assert.equal(hasNonBlackRgbaPixels(null), false);
+  assert.equal(hasNonBlackRgbaPixels(undefined), false);
+  assert.equal(hasNonBlackRgbaPixels([]), false);
+  assert.equal(hasNonBlackRgbaPixels(new Uint8Array(0)), false);
+  assert.equal(hasNonBlackRgbaPixels(new Uint8Array(3)), false);
+  assert.equal(hasNonBlackRgbaPixels({}), false);
+
+  // All-black buffer
+  assert.equal(hasNonBlackRgbaPixels(new Uint8Array(64)), false);
+
+  // Alpha-only buffer (R=G=B=0, A=255) must remain false
+  const alphaOnly = new Uint8Array(16);
+  for (let i = 3; i < alphaOnly.length; i += 4) {
+    alphaOnly[i] = 255;
+  }
+  assert.equal(hasNonBlackRgbaPixels(alphaOnly), false);
+  assert.equal(hasNonBlackRgbaPixels(alphaOnly, 0), false);
+
+  // Threshold boundary checks
+  assert.equal(hasNonBlackRgbaPixels(new Uint8Array([4, 4, 4, 255]), 4), false);
+  assert.equal(hasNonBlackRgbaPixels(new Uint8Array([5, 0, 0, 255]), 4), true);
+  assert.equal(hasNonBlackRgbaPixels(new Uint8Array([1, 0, 0, 255]), 0), true);
+
+  // Single bright pixel in R, G, or B among alpha-only black pixels
+  for (const channel of [0, 1, 2]) {
+    const buf = new Uint8Array(32);
+    for (let i = 3; i < buf.length; i += 4) {
+      buf[i] = 255;
+    }
+    buf[4 * 5 + channel] = 200;
+    assert.equal(hasNonBlackRgbaPixels(buf), true, `Bright channel ${channel} should pass`);
+  }
+
+  // Supports Uint8ClampedArray, ArrayBuffer, SharedArrayBuffer, and plain arrays
+  assert.equal(hasNonBlackRgbaPixels(new Uint8ClampedArray([0, 0, 0, 255, 0, 0, 128, 255])), true);
+  const ab = new Uint8Array([0, 0, 0, 255, 10, 0, 0, 255]).buffer;
+  assert.equal(hasNonBlackRgbaPixels(ab), true);
+  const sab = new SharedArrayBuffer(8);
+  new Uint8Array(sab).set([0, 0, 0, 255, 0, 20, 0, 255]);
+  assert.equal(hasNonBlackRgbaPixels(sab), true);
+  assert.equal(hasNonBlackRgbaPixels([0, 0, 0, 255, 0, 0, 255, 255]), true);
+
+  // Trailing incomplete pixel bytes (< 4 bytes remainder) are ignored safely
+  assert.equal(hasNonBlackRgbaPixels(new Uint8Array([0, 0, 0, 255, 255, 255])), false);
+
+  // Procedural smoke texture is guaranteed non-black
+  assert.equal(hasNonBlackRgbaPixels(generateProceduralTexture(16, 16)), true);
+});
+
+test('summarizeDrawBatch and SmokeSceneController batch metadata preserve default rendering behavior', () => {
+  const controller = new SmokeSceneController({ textureSize: 16, aspect: 16 / 9 });
+  assert.equal(controller.getLastBatchSummary(), null);
+
+  // Default buildFrameCommandBuffer stays unchanged (12 packets, 1 drawIndexed, 6 indices)
+  const defaultFrame = controller.buildFrameCommandBuffer(0, 0.25, null);
+  const defaultSummary = summarizeDrawBatch(defaultFrame);
+  assert.equal(defaultSummary.byteLength, defaultFrame.byteLength);
+  assert.equal(defaultSummary.packetCount, 12);
+  assert.equal(defaultSummary.truncated, false);
+  assert.equal(defaultSummary.beginFrameCount, 1);
+  assert.equal(defaultSummary.presentCount, 1);
+  assert.equal(defaultSummary.clearColorCount, 1);
+  assert.equal(defaultSummary.computeDispatchCount, 1);
+  assert.equal(defaultSummary.drawCallCount, 1);
+  assert.equal(defaultSummary.drawCount, 0);
+  assert.equal(defaultSummary.drawIndexedCount, 1);
+  assert.equal(defaultSummary.totalIndices, 6);
+  assert.equal(defaultSummary.totalInstances, 1);
+  assert.equal(defaultSummary.hasRenderWork, true);
+  assert.equal(defaultSummary.opcodeCounts.DRAW_INDEXED, 1);
+  assert.equal(defaultSummary.opcodeCounts.PRESENT, 1);
+
+  const lastDefault = controller.getLastBatchSummary();
+  assert.equal(lastDefault.frameIndex, 0);
+  assert.equal(lastDefault.packetCount, 12);
+  assert.equal(lastDefault.drawBatchCount, 1);
+  assert.equal(lastDefault.instanceCount, 1);
+  assert.equal(lastDefault.totalIndices, 6);
+  // Returned summary is a defensive copy
+  lastDefault.drawBatchCount = 999;
+  assert.equal(controller.getLastBatchSummary().drawBatchCount, 1);
+
+  // Optional multi-draw batching updates summary accurately and runs cleanly in WgpuCommandProcessor
+  const batchedFrame = controller.buildFrameCommandBuffer(1, 0.5, null, {
+    drawBatchCount: 4,
+    instanceCount: 3,
+  });
+  const batchedSummary = summarizeDrawBatch(batchedFrame);
+  assert.equal(batchedSummary.packetCount, 15);
+  assert.equal(batchedSummary.drawCallCount, 4);
+  assert.equal(batchedSummary.drawIndexedCount, 4);
+  assert.equal(batchedSummary.totalIndices, 4 * 6 * 3);
+  assert.equal(batchedSummary.totalInstances, 12);
+  assert.equal(batchedSummary.hasRenderWork, true);
+
+  const lastBatched = controller.getLastBatchSummary();
+  assert.equal(lastBatched.drawBatchCount, 4);
+  assert.equal(lastBatched.instanceCount, 3);
+  assert.equal(lastBatched.totalIndices, 72);
+  assert.equal(lastBatched.totalInstances, 12);
+
+  // Invalid batch options throw RangeError
+  assert.throws(() => controller.buildFrameCommandBuffer(2, 0.75, null, { drawBatchCount: 0 }), RangeError);
+  assert.throws(() => controller.buildFrameCommandBuffer(2, 0.75, null, { instanceCount: 1.5 }), RangeError);
+
+  // Mixed DRAW + DRAW_INDEXED stream and empty/truncated guards
+  const mixedBuilder = new SmokeCommandBuilder()
+    .beginFrame()
+    .draw(3, 2, 0, 0)
+    .drawIndexed(6, 4, 0, 0, 0)
+    .present();
+  const mixedSummary = summarizeDrawBatch(mixedBuilder.finish());
+  assert.equal(mixedSummary.drawCallCount, 2);
+  assert.equal(mixedSummary.drawCount, 1);
+  assert.equal(mixedSummary.drawIndexedCount, 1);
+  assert.equal(mixedSummary.totalVertices, 6);
+  assert.equal(mixedSummary.totalIndices, 24);
+  assert.equal(mixedSummary.totalInstances, 6);
+  assert.equal(mixedSummary.hasRenderWork, true);
+
+  const emptySummary = summarizeDrawBatch(null);
+  assert.equal(emptySummary.packetCount, 0);
+  assert.equal(emptySummary.truncated, false);
+  assert.equal(emptySummary.hasRenderWork, false);
+
+  const truncatedHeader = summarizeDrawBatch(new Uint8Array([1, 0, 0, 0]));
+  assert.equal(truncatedHeader.truncated, true);
+  assert.equal(truncatedHeader.packetCount, 0);
+
+  const truncatedPayload = summarizeDrawBatch(defaultFrame.subarray(0, defaultFrame.byteLength - 4));
+  assert.equal(truncatedPayload.truncated, true);
+  assert.ok(truncatedPayload.packetCount < defaultSummary.packetCount);
 });
