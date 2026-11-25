@@ -75,6 +75,9 @@
 //   {973a344e-...}/{2549f142-...} XGame: s3 XGameGetXboxTitleId(1) h (s4 XLaunchNewGame stub).
 //   {0dd112ac-...}/{b09d803c-...} XStore: s3 CreateContext h, s4 CloseContextHandle h; the
 //     other 40 used slots stay stubs (O8 offline policy: nothing about licences is invented).
+//   {0dd112ac-...}/{2d42fea5-...} XStore extension: s71 AcquireLicenseForDurablesAsync, s72
+//     AcquireLicenseForDurablesResult (O37: truthful synchronous E_NOTIMPL, claiming zero
+//     ownership/entitlement; all other slots stay trapping stubs).
 //   {37e56907-...}/{bf2346b2-...} XNetworking: s15 GetConnectivityHint h, s16/s17
 //     Register/UnregisterConnectivityHintChanged h.
 //   {af406016-...}/{0b9d556e-...} XPackage: s3 GetCurrentProcessPackageIdentifier(2) h (local
@@ -99,8 +102,8 @@
 //     s19 4, s20 5, s21 4 with a 32-bit third, s22 4, s23 3, s24 1, s25 4, s28 2, s29 1) were
 //     never reached and stay logging stubs until a boot calls them.
 //   Stub-only (every slot logs and traps, so the first boot reports what it needs):
-//     XStore extension {0dd112ac-...}/{2d42fea5-...}, XGameEventWrite
-//     {bbfbdcc7-...}, {1b339674-...} (XDisplay?), and unmapped {a4f1aee2-...}, {dfcd4649-...}.
+//     XGameEventWrite {bbfbdcc7-...}, {1b339674-...} (XDisplay?), and unmapped
+//     {a4f1aee2-...}, {dfcd4649-...}.
 //   {b884675d-...}: s3 is called through a wrapper that takes one pointer, passes a zeroed 0x90-byte
 //     local as the hidden return slot and copies 0x90 bytes from the returned pointer: a
 //     no-argument function returning a 144-byte struct by value, i.e. XSystemGetAnalyticsInfo()
@@ -910,6 +913,46 @@ public:
     }
 };
 
+// {0dd112ac-...}/{2d42fea5-...}: XStore extension (O37: offline-truthful synchronous failure on
+// durable license acquisition; claims zero ownership/entitlement and never invents a license).
+class StoreExtApi : public com::ComObject {
+public:
+    static constexpr const char* kComClassName = "xgameruntime XStore extension";
+
+    // s71: XStoreAcquireLicenseForDurablesAsync(XStoreContextHandle, const char* storeId,
+    // XAsyncBlock*): synchronous E_NOTIMPL offline failure (never allocates a license handle or
+    // queues fake async completion).
+    int32_t AcquireLicenseForDurablesAsync(uint64_t context, GuestPtr<const char> store_id,
+                                           GuestPtr<Pg6XAsyncBlock> async_block) {
+        if (!check_handle(stores(), context, "XStoreContextHandle") || store_id.is_null() ||
+            async_block.is_null()) {
+            return E_INVALIDARG_HR;
+        }
+        if (!acquire_logged_.exchange(true)) {
+            os::log("xgameruntime: XStoreAcquireLicenseForDurablesAsync: offline mode (no store/entitlement); "
+                    "returning E_NOTIMPL");
+        }
+        return com::E_NOTIMPL_HR;
+    }
+
+    // s72: XStoreAcquireLicenseForDurablesResult(XAsyncBlock*, XStoreLicenseHandle*): clears the
+    // out handle if non-null and returns E_NOTIMPL.
+    int32_t AcquireLicenseForDurablesResult(GuestPtr<Pg6XAsyncBlock> /*async_block*/, OutPtr license_handle) {
+        if (!license_handle.is_null()) {
+            license_handle.write(0);
+        }
+        if (!result_logged_.exchange(true)) {
+            os::log("xgameruntime: XStoreAcquireLicenseForDurablesResult: offline mode (no store/entitlement); "
+                    "returning E_NOTIMPL");
+        }
+        return com::E_NOTIMPL_HR;
+    }
+
+private:
+    std::atomic<bool> acquire_logged_{false};
+    std::atomic<bool> result_logged_{false};
+};
+
 void ignore_connectivity_change(void* /*context*/, const Pg6XNetworkingConnectivityHint* /*hint*/) {}
 
 // {37e56907-...}/{bf2346b2-...}: XNetworking.
@@ -1542,8 +1585,13 @@ constexpr auto kGameSaveTable = slot_table<12>({
 });
 constexpr auto kIGameSave = com::declare_interface<GameSaveApi>("xgameruntime.XGameSave", kGameSaveIid,
                                                                kGameSaveTable.slots, {.slot_count = 40});
-constexpr auto kIStoreExt = com::declare_interface<StubApi>("xgameruntime.XStoreExt", kStoreExtIid, {},
-                                                            {.slot_count = 96});
+using SX = M<StoreExtApi>;
+constexpr auto kStoreExtTable = slot_table<70>({
+    {71, SX::method<&StoreExtApi::AcquireLicenseForDurablesAsync>("XStoreAcquireLicenseForDurablesAsync")},
+    {72, SX::method<&StoreExtApi::AcquireLicenseForDurablesResult>("XStoreAcquireLicenseForDurablesResult")},
+});
+constexpr auto kIStoreExt = com::declare_interface<StoreExtApi>("xgameruntime.XStoreExt", kStoreExtIid,
+                                                                kStoreExtTable.slots, {.slot_count = 96});
 using PL = M<PersistentLocalStorageApi>;
 constexpr auto kPlsTable = slot_table<2>({
     {4, PL::method<&PersistentLocalStorageApi::GetPath>("XPersistentLocalStorageGetPath")},
@@ -1604,7 +1652,7 @@ const ApiEntry kApis[] = {
     {kNetworkingProvider, kNetworkingIid, &kINetworking.info, [] { return make<NetworkingApi>(kINetworking); }},
     {kPackageProvider, kPackageIid, &kIPackage.info, [] { return make<PackageApi>(kIPackage); }},
     {kGameSaveProvider, kGameSaveIid, &kIGameSave.info, [] { return make<GameSaveApi>(kIGameSave); }},
-    {kStoreProvider, kStoreExtIid, &kIStoreExt.info, [] { return make<StubApi>(kIStoreExt); }},
+    {kStoreProvider, kStoreExtIid, &kIStoreExt.info, [] { return make<StoreExtApi>(kIStoreExt); }},
     {kPlsProvider, kPlsIid, &kIPersistentLocalStorage.info,
      [] { return make<PersistentLocalStorageApi>(kIPersistentLocalStorage); }},
     {kSpeechProvider, kSpeechIid, &kISpeech.info, [] { return make<SpeechApi>(kISpeech); }},
