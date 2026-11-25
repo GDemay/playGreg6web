@@ -20,6 +20,15 @@
 //     float32 mono, 480 frames per pass; the stream's event is set every 10 ms while started.
 // Audio data is consumed at real-time rate and discarded natively; set_audio_render_sink()
 // receives every pass's PCM (the browser path can forward it to web audio).
+// ISpatialAudioObject::SetVolume scales that object's samples from the next EndUpdatingAudioObjects.
+//
+// PG6_AUDIO_TRACE=1 logs, every 500 spatial passes (5 s), how many object buffers the title filled
+// with non-zero samples and its XApu / XDsp command counts. On the start-screen boot the title
+// renders two static objects (FrontLeft/FrontRight) per pass and fills them with zeros except
+// for ~0.7 s around the first XApu voice: the silence is upstream of this endpoint. The title's
+// stream decoders (0x144E64B10) only produce PCM after an XApu type-3 result reporting the bytes
+// of float output the APU wrote to the voice's output slot (result +0x34 -> voice +0x334), and
+// the XApu model (acp_hal_guest.cpp) neither decodes nor sends such results.
 
 #include "os/audio_downmix.h"
 
@@ -28,6 +37,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -303,6 +313,72 @@ Engine& engine() {
 std::atomic<uint64_t> g_endpoint_activations{0};
 std::atomic<uint64_t> g_spatial_passes{0};
 std::atomic<uint64_t> g_render_frames{0};
+std::atomic<uint64_t> g_spatial_object_buffers{0};   // object buffers read at EndUpdatingAudioObjects
+std::atomic<uint64_t> g_spatial_nonzero_buffers{0};  // ... of them holding a non-zero sample
+std::atomic<uint64_t> g_render_nonzero_frames{0};
+std::atomic<uint64_t> g_render_silent_releases{0};   // ReleaseBuffer with AUDCLNT_BUFFERFLAGS_SILENT
+
+bool any_nonzero(const float* p, size_t n, float* peak) {
+    bool nz = false;
+    for (size_t i = 0; i < n; ++i) {
+        const float a = p[i] < 0 ? -p[i] : p[i];
+        if (a > 0.0f) {
+            nz = true;
+            if (peak != nullptr && a > *peak) {
+                *peak = a;
+            }
+        }
+    }
+    return nz;
+}
+
+// PG6_AUDIO_TRACE=1: one diagnostic line per 500 spatial passes (5 s) with what the title wrote.
+void trace_window(uint32_t objects_this_pass, float pass_peak) {
+    static const bool on = [] {
+        const char* e = std::getenv("PG6_AUDIO_TRACE");
+        return e != nullptr && e[0] == '1';
+    }();
+    if (!on) {
+        return;
+    }
+    static std::mutex m;
+    static uint64_t passes = 0, objects = 0, nz_last = 0, rf_last = 0, rnz_last = 0, xapu_last = 0, xdsp_last = 0;
+    static float peak = 0.0f;
+    std::lock_guard<std::mutex> lock(m);
+    ++passes;
+    objects += objects_this_pass;
+    peak = std::max(peak, pass_peak);
+    if (passes % 500 != 0) {
+        return;
+    }
+    const uint64_t nz = g_spatial_nonzero_buffers.load(), rf = g_render_frames.load(),
+                   rnz = g_render_nonzero_frames.load(), xa = xapu_stats().commands, xd = xdsp_stats().commands;
+    char line[320];
+    std::snprintf(line, sizeof(line),
+                  "audio-trace: passes %llu: objects/pass %.2f, non-zero object buffers %llu, peak %.5f; render "
+                  "frames %llu (non-zero %llu, silent releases %llu); xapu commands +%llu, xdsp commands +%llu",
+                  static_cast<unsigned long long>(passes), static_cast<double>(objects) / 500.0,
+                  static_cast<unsigned long long>(nz - nz_last), static_cast<double>(peak),
+                  static_cast<unsigned long long>(rf - rf_last), static_cast<unsigned long long>(rnz - rnz_last),
+                  static_cast<unsigned long long>(g_render_silent_releases.load()),
+                  static_cast<unsigned long long>(xa - xapu_last), static_cast<unsigned long long>(xd - xdsp_last));
+    com::detail::diagnostic(line);
+    objects = 0;
+    peak = 0.0f;
+    nz_last = nz;
+    rf_last = rf;
+    rnz_last = rnz;
+    xapu_last = xa;
+    xdsp_last = xd;
+}
+
+void forward_samples(uint32_t object_type, const float* pcm, uint32_t frames, uint32_t channels) {
+    Sink& s = sink();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (s.fn != nullptr && frames != 0) {
+        s.fn(s.user, object_type, pcm, frames, channels, kSampleRate);
+    }
+}
 
 void forward_pcm(uint32_t object_type, uint64_t buffer, uint32_t frames, uint32_t channels) {
     Sink& s = sink();
@@ -562,11 +638,17 @@ public:
             written_ += frames;
             buffer = (flags & 0x2u) != 0 ? 0 : buffer_;  // AUDCLNT_BUFFERFLAGS_SILENT
         }
+        if ((flags & 0x2u) != 0) {
+            g_render_silent_releases.fetch_add(1);
+        }
         g_render_frames.fetch_add(frames);
         forward_pcm(0, buffer, frames, 2);
         if (buffer != 0 && frames != 0) {
             std::vector<float> stereo(static_cast<size_t>(frames) * 2);
             if (com::read_guest(buffer, stereo.data(), stereo.size() * sizeof(float))) {
+                if (any_nonzero(stereo.data(), stereo.size(), nullptr)) {
+                    g_render_nonzero_frames.fetch_add(frames);
+                }
                 audio_downmix::push_render_stereo(stereo.data(), frames);
             }
         }
@@ -652,18 +734,25 @@ public:
         return type.write(type_) ? kOk : com::E_POINTER_HR;
     }
     HResult SetPosition(float /*x*/, float /*y*/, float /*z*/) { return kOk; }  // 7 (dynamic objects only)
-    HResult SetVolume(float volume) {                                       // 8
-        return volume >= 0.0f && volume <= 1.0f ? kOk : com::E_INVALIDARG_HR;
+    // 8: an amplitude multiplier on the object's audio, applied from the pass that ends next.
+    HResult SetVolume(float volume) {
+        if (!(volume >= 0.0f && volume <= 1.0f)) {
+            return com::E_INVALIDARG_HR;
+        }
+        volume_ = volume;
+        return kOk;
     }
 
     uint32_t type() const { return type_; }
     bool active() const { return active_; }
+    float volume() const { return volume_; }
     void detach() { stream_ = nullptr; }
 
 private:
     SpatialStreamObj* stream_;  // the stream owns its objects (cleared before it goes away)
     uint32_t type_;
     std::atomic<bool> active_{true};
+    std::atomic<float> volume_{1.0f};
 };
 
 class SpatialStreamObj : public com::ComObject {
@@ -716,7 +805,12 @@ public:
         return kOk;
     }
     HResult EndUpdatingAudioObjects() {  // 9
-        std::vector<std::pair<uint32_t, uint64_t>> written;
+        struct Written {
+            uint32_t type;
+            uint64_t buffer;
+            float volume;
+        };
+        std::vector<Written> written;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (!updating_) {
@@ -725,7 +819,7 @@ public:
             updating_ = false;
             for (auto& o : objects_) {
                 if (o.handed_out && o.object->active()) {
-                    written.emplace_back(o.object->type(), o.buffer);
+                    written.push_back({o.object->type(), o.buffer, o.object->volume()});
                 }
                 o.handed_out = false;
             }
@@ -733,10 +827,20 @@ public:
         g_spatial_passes.fetch_add(1);
         std::vector<uint32_t> types;
         std::vector<std::vector<float>> pcm;
-        for (const auto& [type, buffer] : written) {
-            forward_pcm(type, buffer, kPeriodFrames, 1);
+        float pass_peak = 0.0f;
+        for (const auto& [type, buffer, volume] : written) {
             std::vector<float> mono(kPeriodFrames);
             if (buffer != 0 && com::read_guest(buffer, mono.data(), mono.size() * sizeof(float))) {
+                if (volume != 1.0f) {
+                    for (float& v : mono) {
+                        v *= volume;
+                    }
+                }
+                forward_samples(type, mono.data(), kPeriodFrames, 1);
+                g_spatial_object_buffers.fetch_add(1);
+                if (any_nonzero(mono.data(), mono.size(), &pass_peak)) {
+                    g_spatial_nonzero_buffers.fetch_add(1);
+                }
                 types.push_back(type);
                 pcm.push_back(std::move(mono));
             }
@@ -747,6 +851,7 @@ public:
         }
         audio_downmix::push_spatial_pass(types.data(), ptrs.data(), static_cast<uint32_t>(types.size()),
                                          kPeriodFrames);
+        trace_window(static_cast<uint32_t>(types.size()), pass_peak);
         return kOk;
     }
     HResult ActivateSpatialAudioObject(uint32_t type, OutPtr out);  // 10
@@ -1274,6 +1379,10 @@ AudioEndpointStats audio_endpoint_stats() {
     s.activations = g_endpoint_activations.load();
     s.spatial_passes = g_spatial_passes.load();
     s.render_frames = g_render_frames.load();
+    s.spatial_object_buffers = g_spatial_object_buffers.load();
+    s.spatial_nonzero_buffers = g_spatial_nonzero_buffers.load();
+    s.render_nonzero_frames = g_render_nonzero_frames.load();
+    s.render_silent_releases = g_render_silent_releases.load();
     return s;
 }
 
@@ -1287,6 +1396,10 @@ void reset_audio_endpoint() {
     g_endpoint_activations = 0;
     g_spatial_passes = 0;
     g_render_frames = 0;
+    g_spatial_object_buffers = 0;
+    g_spatial_nonzero_buffers = 0;
+    g_render_nonzero_frames = 0;
+    g_render_silent_releases = 0;
 }
 
 }  // namespace playgta6::os::scarlett::guest_api

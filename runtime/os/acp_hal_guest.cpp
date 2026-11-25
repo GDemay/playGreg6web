@@ -242,7 +242,10 @@ HResult xdsp_submit_command(uint64_t handle, uint64_t command) {
 //   XApuDisconnect(handle) at shutdown
 // The title's result handler (0x144EAA840) acknowledges its own commands: a result of type 1
 // moves a voice from state 1 to 4, type 5 from state 2 (set when command 5 is sent) to 4, type
-// 2 frees the voice (command 2 sets state 3); type 3 is a notification of its own.
+// 2 frees the voice (command 2 sets state 3); type 3 is a notification of its own: for a voice in
+// state 4 it stores the result's u32 at +0x34 (bytes of float32 output written to the voice's
+// output slot) and moves it to state 5, after which the stream decoder (0x144E64B10) converts
+// that many bytes to int16 PCM. Without these results the title's decoded streams stay silent.
 // Model: no processing hardware, but every command of types 1, 2 and 5 is acknowledged with a
 // result {type, voice index} (the rest zero) in submission order, so voices move through their
 // states and are freed; other command types are accepted without a result (counted, the first

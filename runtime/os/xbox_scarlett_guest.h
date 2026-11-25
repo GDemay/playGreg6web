@@ -461,6 +461,11 @@ struct AudioEndpointStats {
     uint64_t activations = 0;     // IMMDevice::Activate calls that returned a client
     uint64_t spatial_passes = 0;  // completed Begin/EndUpdatingAudioObjects passes
     uint64_t render_frames = 0;   // frames released through IAudioRenderClient
+    // What the title actually wrote (tells "the title renders silence" from "we lose its audio"):
+    uint64_t spatial_object_buffers = 0;   // static-object buffers read at EndUpdatingAudioObjects
+    uint64_t spatial_nonzero_buffers = 0;  // ... of them holding a non-zero sample
+    uint64_t render_nonzero_frames = 0;    // released render frames of buffers with a non-zero sample
+    uint64_t render_silent_releases = 0;   // ReleaseBuffer calls with AUDCLNT_BUFFERFLAGS_SILENT
 };
 AudioEndpointStats audio_endpoint_stats();
 
