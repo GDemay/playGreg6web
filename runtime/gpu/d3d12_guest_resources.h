@@ -171,7 +171,8 @@ public:
     uint32_t subresource_count() const;
     bool has_gpu_texture() const { return gpu_texture_; }
     // Shadow comparison (CPU-visible buffers): appends WriteBuffer packets for changed pages.
-    void flush_shadow(CommandEncoder& encoder);
+    // `marks`: the flush's pass over the translated window's write marks (null: a pass of its own).
+    void flush_shadow(CommandEncoder& encoder, os::guest_window::MarkPass* marks = nullptr);
     // Marks the texture as the presented back buffer (Device::set_back_buffer).
     void mark_back_buffer();
     bool is_back_buffer() const { return back_buffer_; }

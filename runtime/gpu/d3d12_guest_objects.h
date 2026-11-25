@@ -83,6 +83,7 @@
 #include "gpu/stage_reflection.h"
 #include "gpu/state_bridge.h"
 #include "guest/com_bridge.h"
+#include "os/guest_window.h"
 
 namespace playgta6::gpu::d3d12_guest {
 
@@ -1033,6 +1034,10 @@ private:
     uint64_t next_fake_va_ = kFakeGpuVaBase;
     std::mutex tracked_mutex_;
     std::vector<Resource*> tracked_;
+    // O36: one pass over the translated window's write marks per flush_cpu_buffers, shared by the
+    // tracked buffers and the relocated ranges (under flush_mutex_).
+    std::mutex flush_mutex_;
+    os::guest_window::MarkPass mark_pass_;
     mutable std::mutex tracked_textures_mutex_;
     std::unordered_map<uint32_t, TrackedTexture> tracked_textures_;
     std::unordered_set<uint32_t> copy_destinations_;  // under tracked_textures_mutex_
