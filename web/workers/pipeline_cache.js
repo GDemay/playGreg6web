@@ -101,6 +101,92 @@
     'triangle-strip',
   ]);
 
+  const VALID_BLEND_OPERATIONS = new Set([
+    'add',
+    'subtract',
+    'reverse-subtract',
+    'min',
+    'max',
+  ]);
+
+  const VALID_BLEND_FACTORS = new Set([
+    'zero',
+    'one',
+    'src',
+    'one-minus-src',
+    'src-alpha',
+    'one-minus-src-alpha',
+    'dst',
+    'one-minus-dst',
+    'dst-alpha',
+    'one-minus-dst-alpha',
+    'src-alpha-saturated',
+    'constant',
+    'one-minus-constant',
+    'src1',
+    'one-minus-src1',
+    'src1-alpha',
+    'one-minus-src1-alpha',
+  ]);
+
+  // Canonical W167 fallback sampler descriptors for stages declaring sampler bindings
+  // without an explicit static sampler in the root signature.
+  const DEFAULT_SAMPLER_DESCRIPTORS = Object.freeze({
+    filtering: Object.freeze({
+      label: 'fallback-sampler:filtering',
+      addressModeU: 'clamp-to-edge',
+      addressModeV: 'clamp-to-edge',
+      addressModeW: 'clamp-to-edge',
+      magFilter: 'linear',
+      minFilter: 'linear',
+      mipmapFilter: 'linear',
+    }),
+    'non-filtering': Object.freeze({
+      label: 'fallback-sampler:non-filtering',
+      addressModeU: 'clamp-to-edge',
+      addressModeV: 'clamp-to-edge',
+      addressModeW: 'clamp-to-edge',
+      magFilter: 'nearest',
+      minFilter: 'nearest',
+      mipmapFilter: 'nearest',
+    }),
+    comparison: Object.freeze({
+      label: 'fallback-sampler:comparison',
+      addressModeU: 'clamp-to-edge',
+      addressModeV: 'clamp-to-edge',
+      addressModeW: 'clamp-to-edge',
+      magFilter: 'linear',
+      minFilter: 'linear',
+      mipmapFilter: 'nearest',
+      compare: 'less-equal',
+    }),
+  });
+
+  const DEFAULT_SAMPLER_KIND_ALIASES = Object.freeze({
+    filtering: 'filtering',
+    linear: 'filtering',
+    'linear-clamp': 'filtering',
+    linear_clamp: 'filtering',
+    bilinear: 'filtering',
+    trilinear: 'filtering',
+    default: 'filtering',
+    'non-filtering': 'non-filtering',
+    non_filtering: 'non-filtering',
+    nonfiltering: 'non-filtering',
+    point: 'non-filtering',
+    nearest: 'non-filtering',
+    'nearest-clamp': 'non-filtering',
+    nearest_clamp: 'non-filtering',
+    'point-clamp': 'non-filtering',
+    point_clamp: 'non-filtering',
+    comparison: 'comparison',
+    compare: 'comparison',
+    shadow: 'comparison',
+    'less-equal': 'comparison',
+    less_equal: 'comparison',
+    pcf: 'comparison',
+  });
+
   // Canonical G34 fallback profile aliases matching web/workers/shader_fallback_router.js.
   const FALLBACK_PROFILE_ALIASES = Object.freeze({
     default: 'default',
@@ -235,6 +321,7 @@
     if (typeof GPUShaderModule !== 'undefined' && val instanceof GPUShaderModule) return true;
     if (typeof GPUBindGroupLayout !== 'undefined' && val instanceof GPUBindGroupLayout) return true;
     if (typeof GPUPipelineLayout !== 'undefined' && val instanceof GPUPipelineLayout) return true;
+    if (typeof GPUSampler !== 'undefined' && val instanceof GPUSampler) return true;
     const tag = Object.prototype.toString.call(val);
     return tag.startsWith('[object GPU');
   }
@@ -488,7 +575,9 @@
 
     if (raw.sampler && typeof raw.sampler === 'object') {
       const s = {};
-      if (raw.sampler.type !== undefined) s.type = raw.sampler.type;
+      if (raw.sampler.type !== undefined) {
+        s.type = normalizeDefaultSamplerKind(raw.sampler.type);
+      }
       entry.sampler = s;
     }
 
@@ -541,6 +630,246 @@
   function alignDown(value, align) {
     if (align <= 1) return value;
     return value - (value % align);
+  }
+
+  /**
+   * Normalize a fallback sampler kind or alias to a canonical WebGPU `GPUSamplerBindingType`
+   * (`'filtering'`, `'non-filtering'`, or `'comparison'`). Unknown or omitted values safely
+   * resolve to `'filtering'` (linear clamp-to-edge).
+   *
+   * @param {string | null | undefined} kind
+   * @returns {'filtering' | 'non-filtering' | 'comparison'}
+   */
+  function normalizeDefaultSamplerKind(kind) {
+    if (typeof kind !== 'string') {
+      return 'filtering';
+    }
+    const key = kind.trim().toLowerCase();
+    if (key.length === 0) {
+      return 'filtering';
+    }
+    if (Object.prototype.hasOwnProperty.call(DEFAULT_SAMPLER_KIND_ALIASES, key)) {
+      return DEFAULT_SAMPLER_KIND_ALIASES[key];
+    }
+    return 'filtering';
+  }
+
+  /**
+   * Build a fresh mutable `GPUSamplerDescriptor` for a canonical default fallback sampler kind:
+   * - `'filtering'`: linear min/mag/mipmap, clamp-to-edge
+   * - `'non-filtering'`: nearest min/mag/mipmap, clamp-to-edge
+   * - `'comparison'`: linear min/mag, nearest mipmap, clamp-to-edge, compare `'less-equal'`
+   *
+   * @param {string | null | undefined} kind
+   * @returns {GPUSamplerDescriptor}
+   */
+  function buildDefaultSamplerDescriptor(kind) {
+    const canonical = normalizeDefaultSamplerKind(kind);
+    return { ...DEFAULT_SAMPLER_DESCRIPTORS[canonical] };
+  }
+
+  /**
+   * Return true when a WebGPU color texture format uses sRGB transfer encoding
+   * (e.g., `'rgba8unorm-srgb'`, `'bgra8unorm-srgb'`).
+   *
+   * @param {unknown} format
+   * @returns {boolean}
+   */
+  function isSrgbColorFormat(format) {
+    return typeof format === 'string' && format.trim().toLowerCase().endsWith('-srgb');
+  }
+
+  function descriptorHasBlendState(descriptor) {
+    if (!descriptor || typeof descriptor !== 'object') {
+      return false;
+    }
+    const targets = descriptor.fragment && descriptor.fragment.targets;
+    if (!Array.isArray(targets)) {
+      return false;
+    }
+    for (let i = 0; i < targets.length; i += 1) {
+      const target = targets[i];
+      if (target && typeof target === 'object' && target.blend && typeof target.blend === 'object') {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function descriptorHasSrgbTarget(descriptor) {
+    if (!descriptor || typeof descriptor !== 'object') {
+      return false;
+    }
+    const targets = descriptor.fragment && descriptor.fragment.targets;
+    if (!Array.isArray(targets)) {
+      return false;
+    }
+    for (let i = 0; i < targets.length; i += 1) {
+      const target = targets[i];
+      if (target && typeof target === 'object' && isSrgbColorFormat(target.format)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function normalizeBlendComponentInternal(rawComp, addReason) {
+    if (!rawComp || typeof rawComp !== 'object' || Array.isArray(rawComp)) {
+      addReason('normalized-blend-component');
+      return {
+        component: { operation: 'add', srcFactor: 'one', dstFactor: 'zero' },
+        changed: true,
+      };
+    }
+
+    let changed = false;
+    let operation = rawComp.operation;
+    if (typeof operation !== 'string' || !VALID_BLEND_OPERATIONS.has(operation)) {
+      operation = 'add';
+      changed = true;
+      addReason('normalized-blend-component');
+    }
+
+    let srcFactor = rawComp.srcFactor;
+    if (typeof srcFactor !== 'string' || !VALID_BLEND_FACTORS.has(srcFactor)) {
+      srcFactor = 'one';
+      changed = true;
+      addReason('normalized-blend-component');
+    }
+
+    let dstFactor = rawComp.dstFactor;
+    if (typeof dstFactor !== 'string' || !VALID_BLEND_FACTORS.has(dstFactor)) {
+      dstFactor = operation === 'min' || operation === 'max' ? 'one' : 'zero';
+      changed = true;
+      addReason('normalized-blend-component');
+    }
+
+    if (!changed) {
+      return { component: rawComp, changed: false };
+    }
+
+    return {
+      component: { operation, srcFactor, dstFactor },
+      changed: true,
+    };
+  }
+
+  function normalizeColorTargetsInternal(targets, defaultColorFormat) {
+    const reasons = [];
+    const addReason = (r) => {
+      if (!reasons.includes(r)) {
+        reasons.push(r);
+      }
+    };
+
+    if (!Array.isArray(targets) || targets.length === 0) {
+      addReason('default-color-target');
+      return {
+        targets: [{ format: defaultColorFormat }],
+        changed: true,
+        reasons,
+      };
+    }
+
+    let changed = false;
+    const normalizedTargets = new Array(targets.length);
+
+    for (let i = 0; i < targets.length; i += 1) {
+      const rawTarget = targets[i];
+      if (rawTarget === null) {
+        normalizedTargets[i] = null;
+        continue;
+      }
+      if (rawTarget === undefined) {
+        normalizedTargets[i] = null;
+        changed = true;
+        addReason('normalized-color-target');
+        continue;
+      }
+      if (typeof rawTarget !== 'object' || Array.isArray(rawTarget)) {
+        normalizedTargets[i] = { format: defaultColorFormat };
+        changed = true;
+        addReason('normalized-color-target');
+        continue;
+      }
+
+      let targetChanged = false;
+      let nextFormat = rawTarget.format;
+      if (typeof nextFormat !== 'string' || nextFormat.trim().length === 0) {
+        nextFormat = defaultColorFormat;
+        targetChanged = true;
+        addReason('default-color-target-format');
+      } else {
+        const lowerFmt = nextFormat.trim().toLowerCase();
+        if (lowerFmt !== nextFormat) {
+          nextFormat = lowerFmt;
+          targetChanged = true;
+          addReason('normalized-color-target-format');
+        }
+      }
+
+      let nextBlend = rawTarget.blend;
+      let stripBlend = false;
+      if (rawTarget.blend === null) {
+        stripBlend = true;
+        targetChanged = true;
+        addReason('null-blend-cleared');
+      } else if (rawTarget.blend !== undefined) {
+        if (typeof rawTarget.blend !== 'object' || Array.isArray(rawTarget.blend)) {
+          stripBlend = true;
+          targetChanged = true;
+          addReason('invalid-blend-cleared');
+        } else {
+          const colorRes = normalizeBlendComponentInternal(rawTarget.blend.color, addReason);
+          const alphaRes = normalizeBlendComponentInternal(rawTarget.blend.alpha, addReason);
+          if (colorRes.changed || alphaRes.changed) {
+            nextBlend = {
+              color: colorRes.component,
+              alpha: alphaRes.component,
+            };
+            targetChanged = true;
+          }
+        }
+      }
+
+      let nextWriteMask = rawTarget.writeMask;
+      if (rawTarget.writeMask !== undefined) {
+        if (
+          typeof rawTarget.writeMask !== 'number' ||
+          !Number.isInteger(rawTarget.writeMask) ||
+          rawTarget.writeMask < 0 ||
+          rawTarget.writeMask > 0xf
+        ) {
+          nextWriteMask =
+            typeof rawTarget.writeMask === 'number' && Number.isFinite(rawTarget.writeMask)
+              ? Math.trunc(rawTarget.writeMask) & 0xf
+              : 0xf;
+          targetChanged = true;
+          addReason('clamped-write-mask');
+        }
+      }
+
+      if (!targetChanged) {
+        normalizedTargets[i] = rawTarget;
+      } else {
+        changed = true;
+        const copy = { ...rawTarget, format: nextFormat };
+        if (stripBlend) {
+          delete copy.blend;
+        } else if (nextBlend !== undefined) {
+          copy.blend = nextBlend;
+        }
+        if (nextWriteMask !== undefined) {
+          copy.writeMask = nextWriteMask;
+        }
+        normalizedTargets[i] = copy;
+      }
+    }
+
+    if (!changed) {
+      return { targets, changed: false, reasons };
+    }
+    return { targets: normalizedTargets, changed: true, reasons };
   }
 
   /**
@@ -1273,11 +1602,14 @@
       }
 
       let nextTargets = descriptor.fragment.targets;
-      if (!Array.isArray(nextTargets) || nextTargets.length === 0) {
-        nextTargets = [{ format: defaultColorFormat }];
+      const targetsResult = normalizeColorTargetsInternal(nextTargets, defaultColorFormat);
+      if (targetsResult.changed) {
+        nextTargets = targetsResult.targets;
         fragChanged = true;
         otherNormalized = true;
-        addReason('default-color-target');
+        for (let i = 0; i < targetsResult.reasons.length; i += 1) {
+          addReason(targetsResult.reasons[i]);
+        }
       }
 
       if (fragChanged) {
@@ -1289,7 +1621,7 @@
       }
     }
 
-    // 4. Primitive topology normalization
+    // 4. Primitive topology & depthStencil null normalization
     let nextPrimitive = descriptor.primitive;
     if (
       descriptor.primitive &&
@@ -1303,6 +1635,13 @@
       };
       otherNormalized = true;
       addReason('clamped-primitive-topology');
+    }
+
+    let stripDepthStencil = false;
+    if (descriptor.depthStencil === null) {
+      stripDepthStencil = true;
+      otherNormalized = true;
+      addReason('null-depth-stencil-cleared');
     }
 
     const normalized = layoutNormalized || vertexLayoutNormalized || otherNormalized;
@@ -1321,6 +1660,9 @@
     if (hasHelperMeta) {
       delete nextDescriptor.fallbackProfile;
       delete nextDescriptor.vertexStride;
+    }
+    if (stripDepthStencil) {
+      delete nextDescriptor.depthStencil;
     }
     nextDescriptor.layout = nextLayout;
     if (nextVertex !== undefined) {
@@ -1593,6 +1935,7 @@
       this._computePipelines = new Map();
       this._bindGroupLayouts = new Map();
       this._fallbackPipelineLayouts = new Map();
+      this._defaultSamplers = new Map();
       this._inFlightRender = new Map();
       this._inFlightCompute = new Map();
       this._quarantinedKeys = new Map();
@@ -1608,6 +1951,8 @@
         computeMisses: 0,
         layoutHits: 0,
         layoutMisses: 0,
+        samplerHits: 0,
+        samplerMisses: 0,
         inFlightDedupes: 0,
         evictions: 0,
         compileCount: 0,
@@ -1619,6 +1964,10 @@
         layoutNormalizedCount: 0,
         fallbackRecoveryCount: 0,
         pipelineErrorCount: 0,
+        fallbackSamplersCreated: 0,
+        fallbackSamplerBindingsSynthesized: 0,
+        blendPipelineVariants: 0,
+        srgbPipelineVariants: 0,
       };
     }
 
@@ -1703,6 +2052,142 @@
       if (norm.layoutNormalized) {
         this._stats.layoutNormalizedCount += 1;
       }
+    }
+
+    _recordRenderVariantStats(descriptor) {
+      if (descriptorHasBlendState(descriptor)) {
+        this._stats.blendPipelineVariants += 1;
+      }
+      if (descriptorHasSrgbTarget(descriptor)) {
+        this._stats.srgbPipelineVariants += 1;
+      }
+    }
+
+    /**
+     * Return a cached default fallback `GPUSampler` for the requested WebGPU sampler binding kind
+     * (`'filtering'` linear clamp-to-edge, `'non-filtering'` nearest clamp-to-edge, or
+     * `'comparison'` less-equal). Created lazily via `device.createSampler` and invalidated on
+     * `clear()`, `reset()`, `onDeviceLost()`, and `setDevice()`.
+     *
+     * @param {'filtering' | 'non-filtering' | 'comparison' | string | null | undefined} [kind='filtering']
+     * @returns {GPUSampler}
+     */
+    getOrCreateDefaultSampler(kind = 'filtering') {
+      const canonical = normalizeDefaultSamplerKind(kind);
+      const cached = this._defaultSamplers.get(canonical);
+      if (cached !== undefined) {
+        this._stats.samplerHits += 1;
+        return cached;
+      }
+      if (typeof this._device.createSampler !== 'function') {
+        throw new TypeError('device must provide a createSampler(descriptor) method');
+      }
+
+      this._stats.samplerMisses += 1;
+      const descriptor = buildDefaultSamplerDescriptor(canonical);
+      const key = `fallback-sampler:${canonical}`;
+      let sampler;
+      try {
+        sampler = this._device.createSampler(descriptor);
+      } catch (err) {
+        this._recordPipelineError('sampler', err, { key });
+        throw err;
+      }
+
+      if (!sampler || (typeof sampler !== 'object' && typeof sampler !== 'function')) {
+        const emptyErr = new Error('createSampler returned empty sampler');
+        this._recordPipelineError('sampler', emptyErr, { key });
+        throw emptyErr;
+      }
+
+      registeredObjectIds.set(sampler, key);
+      this._defaultSamplers.set(canonical, sampler);
+      this._stats.fallbackSamplersCreated += 1;
+      return sampler;
+    }
+
+    /**
+     * Synthesize safe fallback `GPUSampler` bind-group entries for any sampler slot declared in
+     * a bind-group layout or S6/S34 reflection group that does not already have an explicit static
+     * or dynamic sampler bound in `existingEntries`. Does not mutate caller inputs.
+     *
+     * @param {Array<object> | { entries?: Array<object>, bindings?: Array<object> }} reflectionGroupOrEntries
+     * @param {Iterable<{ binding: number, resource: unknown }>} [existingEntries=[]]
+     * @returns {{
+     *   entries: Array<{ binding: number, resource: unknown }>,
+     *   synthesized: Array<{ binding: number, kind: 'filtering' | 'non-filtering' | 'comparison', resource: GPUSampler }>,
+     *   synthesizedCount: number,
+     * }}
+     */
+    synthesizeFallbackSamplerEntries(reflectionGroupOrEntries, existingEntries = []) {
+      let layoutEntries;
+      if (Array.isArray(reflectionGroupOrEntries)) {
+        layoutEntries = reflectionGroupOrEntries;
+      } else if (reflectionGroupOrEntries && typeof reflectionGroupOrEntries === 'object') {
+        if (Array.isArray(reflectionGroupOrEntries.entries)) {
+          layoutEntries = reflectionGroupOrEntries.entries;
+        } else if (Array.isArray(reflectionGroupOrEntries.bindings)) {
+          layoutEntries = reflectionGroupOrEntries.bindings;
+        } else {
+          throw new TypeError(
+            'reflectionGroupOrEntries must be an array or an object with an "entries" or "bindings" array'
+          );
+        }
+      } else {
+        throw new TypeError('reflectionGroupOrEntries must be an array or object');
+      }
+
+      const byBinding = new Map();
+      const boundSet = new Set();
+      if (existingEntries !== null && existingEntries !== undefined) {
+        for (const item of existingEntries) {
+          if (!item || typeof item !== 'object') {
+            continue;
+          }
+          if (!Number.isInteger(item.binding) || item.binding < 0) {
+            continue;
+          }
+          if (item.resource !== undefined && item.resource !== null) {
+            byBinding.set(item.binding, { ...item });
+            boundSet.add(item.binding);
+          }
+        }
+      }
+
+      const synthesized = [];
+      for (let i = 0; i < layoutEntries.length; i += 1) {
+        const entry = layoutEntries[i];
+        if (
+          !entry ||
+          typeof entry !== 'object' ||
+          !entry.sampler ||
+          typeof entry.sampler !== 'object' ||
+          !Number.isInteger(entry.binding) ||
+          entry.binding < 0
+        ) {
+          continue;
+        }
+        if (boundSet.has(entry.binding)) {
+          continue;
+        }
+        const samplerKind = normalizeDefaultSamplerKind(entry.sampler.type);
+        const sampler = this.getOrCreateDefaultSampler(samplerKind);
+        byBinding.set(entry.binding, { binding: entry.binding, resource: sampler });
+        boundSet.add(entry.binding);
+        synthesized.push({
+          binding: entry.binding,
+          kind: samplerKind,
+          resource: sampler,
+        });
+        this._stats.fallbackSamplerBindingsSynthesized += 1;
+      }
+
+      const entries = Array.from(byBinding.values()).sort((a, b) => a.binding - b.binding);
+      return {
+        entries,
+        synthesized,
+        synthesizedCount: synthesized.length,
+      };
     }
 
     /**
@@ -2303,6 +2788,7 @@
 
       const compileMs = Math.max(0, this._now() - t0);
       this._recordCompileTiming(compileMs);
+      this._recordRenderVariantStats(effectiveDescriptor);
 
       this._setLru(this._renderPipelines, key, pipeline, compileMs, this._maxRenderPipelines);
       return pipeline;
@@ -2441,6 +2927,7 @@
           }
           const compileMs = Math.max(0, this._now() - t0);
           this._recordCompileTiming(compileMs);
+          this._recordRenderVariantStats(effectiveDescriptor);
           this._setLru(this._renderPipelines, key, pipeline, compileMs, this._maxRenderPipelines);
           return Promise.resolve(pipeline);
         } catch (err) {
@@ -2476,6 +2963,7 @@
         const compileMs = Math.max(0, this._now() - t0);
         this._recordCompileTiming(compileMs);
         if (generation === this._generation) {
+          this._recordRenderVariantStats(effectiveDescriptor);
           this._setLru(this._renderPipelines, key, pipeline, compileMs, this._maxRenderPipelines);
         }
         return pipeline;
@@ -2915,6 +3403,7 @@
       this._computePipelines.clear();
       this._bindGroupLayouts.clear();
       this._fallbackPipelineLayouts.clear();
+      this._defaultSamplers.clear();
       this._inFlightRender.clear();
       this._inFlightCompute.clear();
       this._quarantinedKeys.clear();
@@ -2926,6 +3415,8 @@
         this._stats.computeMisses = 0;
         this._stats.layoutHits = 0;
         this._stats.layoutMisses = 0;
+        this._stats.samplerHits = 0;
+        this._stats.samplerMisses = 0;
         this._stats.inFlightDedupes = 0;
         this._stats.evictions = 0;
         this._stats.compileCount = 0;
@@ -2937,6 +3428,10 @@
         this._stats.layoutNormalizedCount = 0;
         this._stats.fallbackRecoveryCount = 0;
         this._stats.pipelineErrorCount = 0;
+        this._stats.fallbackSamplersCreated = 0;
+        this._stats.fallbackSamplerBindingsSynthesized = 0;
+        this._stats.blendPipelineVariants = 0;
+        this._stats.srgbPipelineVariants = 0;
         this._pipelineErrors.length = 0;
         this._pipelineErrorSeq = 0;
       }
@@ -2985,18 +3480,36 @@
      * normalization, error tracking, and compile-time telemetry.
      */
     getStats() {
+      const renderHits = this._stats.renderHits;
+      const renderMisses = this._stats.renderMisses;
+      const computeHits = this._stats.computeHits;
+      const computeMisses = this._stats.computeMisses;
+      const layoutHits = this._stats.layoutHits;
+      const layoutMisses = this._stats.layoutMisses;
+      const samplerHits = this._stats.samplerHits;
+      const samplerMisses = this._stats.samplerMisses;
+      const totalHits = renderHits + computeHits + layoutHits + samplerHits;
+      const totalMisses = renderMisses + computeMisses + layoutMisses + samplerMisses;
+      const hitRate = (hits, misses) => {
+        const total = hits + misses;
+        return total > 0 ? hits / total : 0;
+      };
+
       return {
-        renderHits: this._stats.renderHits,
-        renderMisses: this._stats.renderMisses,
-        computeHits: this._stats.computeHits,
-        computeMisses: this._stats.computeMisses,
-        layoutHits: this._stats.layoutHits,
-        layoutMisses: this._stats.layoutMisses,
+        renderHits,
+        renderMisses,
+        computeHits,
+        computeMisses,
+        layoutHits,
+        layoutMisses,
+        samplerHits,
+        samplerMisses,
         inFlightDedupes: this._stats.inFlightDedupes,
         evictions: this._stats.evictions,
         renderCount: this._renderPipelines.size,
         computeCount: this._computePipelines.size,
         layoutCount: this._bindGroupLayouts.size,
+        fallbackSamplerCount: this._defaultSamplers.size,
         compileCount: this._stats.compileCount,
         totalCompileMs: this._stats.totalCompileMs,
         maxCompileMs: this._stats.maxCompileMs,
@@ -3009,6 +3522,37 @@
         pipelineErrorCount: this._stats.pipelineErrorCount,
         pipelineErrorHistorySize: this._pipelineErrors.length,
         maxErrorHistory: this._maxErrorHistory,
+        fallbackSamplersCreated: this._stats.fallbackSamplersCreated,
+        fallbackSamplerBindingsSynthesized: this._stats.fallbackSamplerBindingsSynthesized,
+        blendPipelineVariants: this._stats.blendPipelineVariants,
+        srgbPipelineVariants: this._stats.srgbPipelineVariants,
+        cacheBreakdown: {
+          render: {
+            hits: renderHits,
+            misses: renderMisses,
+            hitRate: hitRate(renderHits, renderMisses),
+          },
+          compute: {
+            hits: computeHits,
+            misses: computeMisses,
+            hitRate: hitRate(computeHits, computeMisses),
+          },
+          layout: {
+            hits: layoutHits,
+            misses: layoutMisses,
+            hitRate: hitRate(layoutHits, layoutMisses),
+          },
+          sampler: {
+            hits: samplerHits,
+            misses: samplerMisses,
+            hitRate: hitRate(samplerHits, samplerMisses),
+          },
+          total: {
+            hits: totalHits,
+            misses: totalMisses,
+            hitRate: hitRate(totalHits, totalMisses),
+          },
+        },
       };
     }
   }
@@ -3030,10 +3574,14 @@
     VERTEX_FORMAT_BYTE_SIZES,
     FRAME1_VERTEX_LAYOUT_24B,
     FALLBACK_BIND_GROUP_ENTRIES,
+    DEFAULT_SAMPLER_DESCRIPTORS,
     hashDescriptorKey,
     registerShaderModuleId,
     normalizeVisibility,
     normalizeFallbackProfile,
+    normalizeDefaultSamplerKind,
+    buildDefaultSamplerDescriptor,
+    isSrgbColorFormat,
     getVertexFormatByteSize,
     buildVertexBufferLayoutForStride,
     normalizeVertexBufferLayouts,

@@ -15,10 +15,14 @@ const {
   FRAME1_VERTEX_STRIDE_24B,
   FRAME1_CBV_MIN_BINDING_SIZE,
   FRAME1_VERTEX_LAYOUT_24B,
+  DEFAULT_SAMPLER_DESCRIPTORS,
   SHADER_STAGE_BITS,
   hashDescriptorKey,
   registerShaderModuleId,
   normalizeFallbackProfile,
+  normalizeDefaultSamplerKind,
+  buildDefaultSamplerDescriptor,
+  isSrgbColorFormat,
   getVertexFormatByteSize,
   buildVertexBufferLayoutForStride,
   normalizeVertexBufferLayouts,
@@ -42,6 +46,7 @@ function createDeferred() {
 function createMockGpuDevice({
   withAsync = true,
   withPipelineLayout = true,
+  withSampler = true,
   limits = undefined,
   advanceClockOnCompile = null,
   renderSyncImpl = null,
@@ -50,6 +55,7 @@ function createMockGpuDevice({
   computeAsyncImpl = null,
   bglImpl = null,
   pipelineLayoutImpl = null,
+  samplerImpl = null,
 } = {}) {
   let nextId = 1;
   const calls = {
@@ -59,6 +65,7 @@ function createMockGpuDevice({
     createComputePipelineAsync: [],
     createBindGroupLayout: [],
     createPipelineLayout: [],
+    createSampler: [],
     createShaderModule: [],
   };
 
@@ -123,6 +130,20 @@ function createMockGpuDevice({
       const layout = { kind: 'GPUPipelineLayout', id, desc };
       calls.createPipelineLayout.push({ id, desc, layout });
       return layout;
+    };
+  }
+
+  if (withSampler) {
+    device.createSampler = (desc = {}) => {
+      const id = nextId++;
+      if (samplerImpl) {
+        const sampler = samplerImpl(desc, id);
+        calls.createSampler.push({ id, desc, sampler });
+        return sampler;
+      }
+      const sampler = { kind: 'GPUSampler', id, desc };
+      calls.createSampler.push({ id, desc, sampler });
+      return sampler;
     };
   }
 
@@ -329,11 +350,14 @@ test('sync render, compute, and bindGroupLayout cache hits, misses, and telemetr
     computeMisses: 1,
     layoutHits: 1,
     layoutMisses: 1,
+    samplerHits: 0,
+    samplerMisses: 0,
     inFlightDedupes: 0,
     evictions: 0,
     renderCount: 2,
     computeCount: 1,
     layoutCount: 1,
+    fallbackSamplerCount: 0,
     compileCount: 4,
     totalCompileMs: 1.5 + 4.0 + 2.5 + 4.0,
     maxCompileMs: 4.0,
@@ -346,6 +370,17 @@ test('sync render, compute, and bindGroupLayout cache hits, misses, and telemetr
     pipelineErrorCount: 0,
     pipelineErrorHistorySize: 0,
     maxErrorHistory: DEFAULT_MAX_ERROR_HISTORY,
+    fallbackSamplersCreated: 0,
+    fallbackSamplerBindingsSynthesized: 0,
+    blendPipelineVariants: 0,
+    srgbPipelineVariants: 0,
+    cacheBreakdown: {
+      render: { hits: 2, misses: 2, hitRate: 0.5 },
+      compute: { hits: 1, misses: 1, hitRate: 0.5 },
+      layout: { hits: 1, misses: 1, hitRate: 0.5 },
+      sampler: { hits: 0, misses: 0, hitRate: 0 },
+      total: { hits: 4, misses: 4, hitRate: 0.5 },
+    },
   });
 });
 
@@ -773,11 +808,14 @@ test('evictOlderThan and clear manage lifecycle and isolate stale in-flight comp
     computeMisses: 0,
     layoutHits: 0,
     layoutMisses: 0,
+    samplerHits: 0,
+    samplerMisses: 0,
     inFlightDedupes: 0,
     evictions: 0,
     renderCount: 0,
     computeCount: 0,
     layoutCount: 0,
+    fallbackSamplerCount: 0,
     compileCount: 0,
     totalCompileMs: 0,
     maxCompileMs: 0,
@@ -790,6 +828,17 @@ test('evictOlderThan and clear manage lifecycle and isolate stale in-flight comp
     pipelineErrorCount: 0,
     pipelineErrorHistorySize: 0,
     maxErrorHistory: DEFAULT_MAX_ERROR_HISTORY,
+    fallbackSamplersCreated: 0,
+    fallbackSamplerBindingsSynthesized: 0,
+    blendPipelineVariants: 0,
+    srgbPipelineVariants: 0,
+    cacheBreakdown: {
+      render: { hits: 0, misses: 0, hitRate: 0 },
+      compute: { hits: 0, misses: 0, hitRate: 0 },
+      layout: { hits: 0, misses: 0, hitRate: 0 },
+      sampler: { hits: 0, misses: 0, hitRate: 0 },
+      total: { hits: 0, misses: 0, hitRate: 0 },
+    },
   });
 });
 
@@ -1869,4 +1918,571 @@ test('W118 compile-latency telemetry tracks compileCount, totalCompileMs, and ma
     () => new WebGpuPipelineCache({ device, nowFn: 'not-a-fn' }),
     /nowFn must be a function/
   );
+});
+
+// --- W167: Static-Sampler Fallback Synthesis & Menu Blend/sRGB Cache Hardening Tests ---
+
+test('W167 normalizeDefaultSamplerKind, buildDefaultSamplerDescriptor, and IIFE isolation', () => {
+  assert.equal(normalizeDefaultSamplerKind('filtering'), 'filtering');
+  assert.equal(normalizeDefaultSamplerKind('linear'), 'filtering');
+  assert.equal(normalizeDefaultSamplerKind('linear-clamp'), 'filtering');
+  assert.equal(normalizeDefaultSamplerKind('default'), 'filtering');
+  assert.equal(normalizeDefaultSamplerKind('non-filtering'), 'non-filtering');
+  assert.equal(normalizeDefaultSamplerKind('non_filtering'), 'non-filtering');
+  assert.equal(normalizeDefaultSamplerKind('point'), 'non-filtering');
+  assert.equal(normalizeDefaultSamplerKind('nearest-clamp'), 'non-filtering');
+  assert.equal(normalizeDefaultSamplerKind('comparison'), 'comparison');
+  assert.equal(normalizeDefaultSamplerKind('compare'), 'comparison');
+  assert.equal(normalizeDefaultSamplerKind('less-equal'), 'comparison');
+  assert.equal(normalizeDefaultSamplerKind('shadow'), 'comparison');
+  assert.equal(normalizeDefaultSamplerKind('unknown-kind'), 'filtering');
+  assert.equal(normalizeDefaultSamplerKind(null), 'filtering');
+  assert.equal(normalizeDefaultSamplerKind(undefined), 'filtering');
+
+  const filteringDesc = buildDefaultSamplerDescriptor('filtering');
+  assert.deepEqual(filteringDesc, {
+    label: 'fallback-sampler:filtering',
+    addressModeU: 'clamp-to-edge',
+    addressModeV: 'clamp-to-edge',
+    addressModeW: 'clamp-to-edge',
+    magFilter: 'linear',
+    minFilter: 'linear',
+    mipmapFilter: 'linear',
+  });
+
+  const nonFilteringDesc = buildDefaultSamplerDescriptor('non-filtering');
+  assert.deepEqual(nonFilteringDesc, {
+    label: 'fallback-sampler:non-filtering',
+    addressModeU: 'clamp-to-edge',
+    addressModeV: 'clamp-to-edge',
+    addressModeW: 'clamp-to-edge',
+    magFilter: 'nearest',
+    minFilter: 'nearest',
+    mipmapFilter: 'nearest',
+  });
+
+  const comparisonDesc = buildDefaultSamplerDescriptor('comparison');
+  assert.deepEqual(comparisonDesc, {
+    label: 'fallback-sampler:comparison',
+    addressModeU: 'clamp-to-edge',
+    addressModeV: 'clamp-to-edge',
+    addressModeW: 'clamp-to-edge',
+    magFilter: 'linear',
+    minFilter: 'linear',
+    mipmapFilter: 'nearest',
+    compare: 'less-equal',
+  });
+
+  // Mutating returned descriptor does not affect frozen DEFAULT_SAMPLER_DESCRIPTORS
+  filteringDesc.magFilter = 'nearest';
+  assert.equal(DEFAULT_SAMPLER_DESCRIPTORS.filtering.magFilter, 'linear');
+  assert.equal(buildDefaultSamplerDescriptor('filtering').magFilter, 'linear');
+
+  // sRGB format detection helper
+  assert.equal(isSrgbColorFormat('rgba8unorm-srgb'), true);
+  assert.equal(isSrgbColorFormat('bgra8unorm-srgb'), true);
+  assert.equal(isSrgbColorFormat('RGBA8UNORM-SRGB'), true);
+  assert.equal(isSrgbColorFormat('rgba8unorm'), false);
+  assert.equal(isSrgbColorFormat('bgra8unorm'), false);
+  assert.equal(isSrgbColorFormat(null), false);
+
+  // Classic worker IIFE isolation verifies W167 helpers do not leak globals
+  const scriptPath = path.resolve(
+    path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')),
+    '../web/workers/pipeline_cache.js'
+  );
+  const source = fs.readFileSync(scriptPath, 'utf8');
+  const sandbox = { TextEncoder, performance, Date };
+  sandbox.globalThis = sandbox;
+  sandbox.self = sandbox;
+  vm.createContext(sandbox);
+  vm.runInContext(source, sandbox);
+  assert.equal(typeof sandbox.PlayGta6PipelineCache.normalizeDefaultSamplerKind, 'function');
+  assert.equal(typeof sandbox.PlayGta6PipelineCache.buildDefaultSamplerDescriptor, 'function');
+  assert.equal(typeof sandbox.PlayGta6PipelineCache.isSrgbColorFormat, 'function');
+  assert.equal(sandbox.DEFAULT_SAMPLER_DESCRIPTORS, undefined);
+  assert.equal(sandbox.normalizeDefaultSamplerKind, undefined);
+});
+
+test('W167 getOrCreateDefaultSampler caches per kind, invalidates on device reset, and handles errors', () => {
+  const device1 = createMockGpuDevice();
+  const cache = new WebGpuPipelineCache({ device: device1 });
+
+  const sLinear1 = cache.getOrCreateDefaultSampler('filtering');
+  const sLinear2 = cache.getOrCreateDefaultSampler('linear-clamp');
+  const sLinear3 = cache.getOrCreateDefaultSampler();
+  assert.equal(sLinear1, sLinear2);
+  assert.equal(sLinear1, sLinear3);
+  assert.equal(sLinear1.desc.magFilter, 'linear');
+  assert.equal(sLinear1.desc.minFilter, 'linear');
+  assert.equal(sLinear1.desc.addressModeU, 'clamp-to-edge');
+
+  const sPoint1 = cache.getOrCreateDefaultSampler('non-filtering');
+  const sPoint2 = cache.getOrCreateDefaultSampler('point');
+  assert.equal(sPoint1, sPoint2);
+  assert.notEqual(sPoint1, sLinear1);
+  assert.equal(sPoint1.desc.magFilter, 'nearest');
+  assert.equal(sPoint1.desc.minFilter, 'nearest');
+
+  const sCmp1 = cache.getOrCreateDefaultSampler('comparison');
+  const sCmp2 = cache.getOrCreateDefaultSampler('less-equal');
+  assert.equal(sCmp1, sCmp2);
+  assert.notEqual(sCmp1, sLinear1);
+  assert.equal(sCmp1.desc.compare, 'less-equal');
+
+  assert.equal(device1.calls.createSampler.length, 3);
+
+  // Deterministic hashing via registeredObjectIds
+  assert.equal(
+    hashDescriptorKey({ sampler: sLinear1 }),
+    hashDescriptorKey({ sampler: sLinear2 })
+  );
+  assert.notEqual(
+    hashDescriptorKey({ sampler: sLinear1 }),
+    hashDescriptorKey({ sampler: sPoint1 })
+  );
+  assert.notEqual(
+    hashDescriptorKey({ sampler: sLinear1 }),
+    hashDescriptorKey({ sampler: sCmp1 })
+  );
+
+  const stats = cache.getStats();
+  assert.equal(stats.fallbackSamplersCreated, 3);
+  assert.equal(stats.fallbackSamplerCount, 3);
+  assert.equal(stats.samplerMisses, 3);
+  assert.equal(stats.samplerHits, 4);
+  assert.equal(stats.cacheBreakdown.sampler.hits, 4);
+  assert.equal(stats.cacheBreakdown.sampler.misses, 3);
+
+  // Device swap clears cached samplers and creates fresh ones on new device
+  const device2 = createMockGpuDevice();
+  assert.equal(cache.setDevice(device2), true);
+  assert.equal(cache.getStats().fallbackSamplerCount, 0);
+  const sLinearNew = cache.getOrCreateDefaultSampler('filtering');
+  assert.notEqual(sLinearNew, sLinear1);
+  assert.equal(device2.calls.createSampler.length, 1);
+  assert.equal(cache.getStats().fallbackSamplersCreated, 4);
+
+  // Missing createSampler throws TypeError cleanly
+  const noSamplerCache = new WebGpuPipelineCache({
+    device: createMockGpuDevice({ withSampler: false }),
+  });
+  assert.throws(
+    () => noSamplerCache.getOrCreateDefaultSampler('filtering'),
+    /device must provide a createSampler/
+  );
+
+  // Failing / empty createSampler records sanitized pipeline error
+  const failSamplerCache = new WebGpuPipelineCache({
+    device: createMockGpuDevice({
+      samplerImpl: (desc) => {
+        if (desc.compare) {
+          return null;
+        }
+        const err = new Error('Sampler failed at C:\\Users\\dev\\menu.wgsl');
+        err.name = 'GPUValidationError';
+        throw err;
+      },
+    }),
+  });
+  assert.throws(() => failSamplerCache.getOrCreateDefaultSampler('filtering'), /Sampler failed/);
+  assert.throws(() => failSamplerCache.getOrCreateDefaultSampler('comparison'), /empty sampler/);
+  assert.equal(failSamplerCache.getStats().fallbackSamplersCreated, 0);
+  assert.equal(failSamplerCache.getStats().pipelineErrorCount, 2);
+  const errs = failSamplerCache.getPipelineErrors();
+  assert.equal(errs[0].kind, 'sampler');
+  assert.equal(errs[0].errorType, 'validation');
+  assert.doesNotMatch(errs[0].message, /Users\\dev/);
+  assert.match(errs[0].message, /<path>/);
+});
+
+test('W167 synthesizeFallbackSamplerEntries fills missing sampler slots without mutating caller entries', () => {
+  const device = createMockGpuDevice();
+  const cache = new WebGpuPipelineCache({ device });
+
+  // Reflection group with a texture + 3 sampler slots (linear filtering, nearest non-filtering, comparison)
+  const reflectionGroup = {
+    group: 0,
+    entries: [
+      {
+        binding: 0,
+        visibility: 'fragment',
+        texture: { sampleType: 'float', viewDimension: '2d', multisampled: false },
+      },
+      {
+        binding: 1,
+        visibility: 'fragment',
+        sampler: {}, // omitted type -> defaults to 'filtering'
+      },
+      {
+        binding: 2,
+        visibility: 'fragment',
+        sampler: { type: 'non-filtering' },
+      },
+      {
+        binding: 3,
+        visibility: 'fragment',
+        sampler: { type: 'comparison' },
+      },
+      {
+        binding: 4,
+        visibility: 'fragment',
+        sampler: { type: 'filtering' },
+      },
+    ],
+  };
+
+  const mockTexView = { kind: 'GPUTextureView', id: 100 };
+  const explicitStaticSampler = { kind: 'GPUSampler', id: 200, customStatic: true };
+  const existingEntries = [
+    { binding: 0, resource: mockTexView },
+    { binding: 1, resource: null }, // null placeholder -> treated as missing & synthesized
+    { binding: 4, resource: explicitStaticSampler }, // explicit static sampler -> preserved
+  ];
+  const existingSnapshot = JSON.stringify(existingEntries);
+
+  const result = cache.synthesizeFallbackSamplerEntries(reflectionGroup, existingEntries);
+
+  // Caller's array must not be mutated
+  assert.equal(JSON.stringify(existingEntries), existingSnapshot);
+
+  assert.equal(result.synthesizedCount, 3);
+  assert.equal(result.entries.length, 5);
+  assert.deepEqual(
+    result.entries.map((e) => e.binding),
+    [0, 1, 2, 3, 4]
+  );
+  assert.equal(result.entries[0].resource, mockTexView);
+  assert.equal(result.entries[1].resource.desc.magFilter, 'linear');
+  assert.equal(result.entries[2].resource.desc.magFilter, 'nearest');
+  assert.equal(result.entries[3].resource.desc.compare, 'less-equal');
+  assert.equal(result.entries[4].resource, explicitStaticSampler);
+
+  assert.deepEqual(
+    result.synthesized.map((s) => ({ binding: s.binding, kind: s.kind })),
+    [
+      { binding: 1, kind: 'filtering' },
+      { binding: 2, kind: 'non-filtering' },
+      { binding: 3, kind: 'comparison' },
+    ]
+  );
+
+  // Second synthesis reuses cached fallback samplers without creating new device samplers
+  const result2 = cache.synthesizeFallbackSamplerEntries(reflectionGroup.entries, [
+    { binding: 0, resource: mockTexView },
+  ]);
+  assert.equal(result2.synthesizedCount, 4);
+  assert.equal(result2.entries[1].resource, result.entries[1].resource);
+  assert.equal(result2.entries[4].resource, result.entries[1].resource);
+  assert.equal(device.calls.createSampler.length, 3);
+
+  const stats = cache.getStats();
+  assert.equal(stats.fallbackSamplersCreated, 3);
+  assert.equal(stats.fallbackSamplerBindingsSynthesized, 7);
+  assert.equal(stats.samplerMisses, 3);
+  assert.equal(stats.samplerHits, 4);
+
+  // Reflection layout creation normalizes sampler type aliases cleanly
+  const bglA = cache.createBindGroupLayoutFromReflection([
+    { binding: 0, visibility: 'fragment', sampler: { type: 'linear' } },
+    { binding: 1, visibility: 'fragment', sampler: { type: 'point' } },
+    { binding: 2, visibility: 'fragment', sampler: { type: 'compare' } },
+  ]);
+  const bglB = cache.createBindGroupLayoutFromReflection([
+    { binding: 0, visibility: 'fragment', sampler: { type: 'filtering' } },
+    { binding: 1, visibility: 'fragment', sampler: { type: 'non-filtering' } },
+    { binding: 2, visibility: 'fragment', sampler: { type: 'comparison' } },
+  ]);
+  assert.equal(bglA, bglB);
+  assert.equal(device.calls.createBindGroupLayout.length, 1);
+});
+
+test('W167 menu sRGB/linear color formats, alpha-blend states, writeMask, depthStencil, and vertex layouts never collide', async () => {
+  const device = createMockGpuDevice();
+  const cache = new WebGpuPipelineCache({ device });
+
+  const vs = device.createShaderModule({ label: 'wgpk:vertex:0x000000000000a001', code: 'vs' });
+  const fs = device.createShaderModule({ label: 'wgpk:fragment:0x000000000000a002', code: 'fs' });
+
+  const alphaBlend = {
+    color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+    alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+  };
+  const premultipliedBlend = {
+    color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+    alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+  };
+  const additiveBlend = {
+    color: { srcFactor: 'src-alpha', dstFactor: 'one', operation: 'add' },
+    alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
+  };
+  const subtractBlend = {
+    color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'subtract' },
+    alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+  };
+
+  const vbl24 = [
+    {
+      arrayStride: 24,
+      stepMode: 'vertex',
+      attributes: [
+        { shaderLocation: 0, offset: 0, format: 'float32x4' },
+        { shaderLocation: 1, offset: 16, format: 'float32x2' },
+      ],
+    },
+  ];
+  const vbl32UiGlyph = [
+    {
+      arrayStride: 32,
+      stepMode: 'vertex',
+      attributes: [
+        { shaderLocation: 0, offset: 0, format: 'float32x4' },
+        { shaderLocation: 1, offset: 16, format: 'float32x2' },
+        { shaderLocation: 2, offset: 24, format: 'unorm8x4' },
+      ],
+    },
+  ];
+  const vbl24Instanced = [
+    {
+      arrayStride: 24,
+      stepMode: 'instance',
+      attributes: [
+        { shaderLocation: 0, offset: 0, format: 'float32x4' },
+        { shaderLocation: 1, offset: 16, format: 'float32x2' },
+      ],
+    },
+  ];
+
+  const makeDesc = ({ targets, depthStencil, buffers = vbl24 }) => ({
+    layout: 'auto',
+    vertex: { module: vs, entryPoint: 'vs_main', buffers },
+    fragment: { module: fs, entryPoint: 'fs_main', targets },
+    ...(depthStencil !== undefined ? { depthStencil } : {}),
+  });
+
+  const variantDescriptors = [
+    // 1. Opaque intro video quads across linear/sRGB/BGRA formats
+    makeDesc({ targets: [{ format: 'rgba8unorm' }] }),
+    makeDesc({ targets: [{ format: 'rgba8unorm-srgb' }] }),
+    makeDesc({ targets: [{ format: 'bgra8unorm' }] }),
+    makeDesc({ targets: [{ format: 'bgra8unorm-srgb' }] }),
+
+    // 2. Alpha-blended UI text/glyphs vs premultiplied vs additive vs subtract (same bgra8unorm format)
+    makeDesc({ targets: [{ format: 'bgra8unorm', blend: alphaBlend }] }),
+    makeDesc({ targets: [{ format: 'bgra8unorm', blend: premultipliedBlend }] }),
+    makeDesc({ targets: [{ format: 'bgra8unorm', blend: additiveBlend }] }),
+    makeDesc({ targets: [{ format: 'bgra8unorm', blend: subtractBlend }] }),
+
+    // 3. sRGB + alpha blend UI target
+    makeDesc({ targets: [{ format: 'rgba8unorm-srgb', blend: alphaBlend }] }),
+
+    // 4. writeMask variants (depth-only 0x0, RGB-only 0x7, alpha-only 0x8, RGBA 0xf)
+    makeDesc({ targets: [{ format: 'bgra8unorm', writeMask: 0x0 }] }),
+    makeDesc({ targets: [{ format: 'bgra8unorm', writeMask: 0x7 }] }),
+    makeDesc({ targets: [{ format: 'bgra8unorm', writeMask: 0x8 }] }),
+    makeDesc({ targets: [{ format: 'bgra8unorm', writeMask: 0xf }] }),
+
+    // 5. depthStencil variants (depth write on/off, compare op, format, stencil)
+    makeDesc({
+      targets: [{ format: 'bgra8unorm' }],
+      depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
+    }),
+    makeDesc({
+      targets: [{ format: 'bgra8unorm' }],
+      depthStencil: { format: 'depth24plus', depthWriteEnabled: false, depthCompare: 'less' },
+    }),
+    makeDesc({
+      targets: [{ format: 'bgra8unorm' }],
+      depthStencil: { format: 'depth24plus', depthWriteEnabled: false, depthCompare: 'always' },
+    }),
+    makeDesc({
+      targets: [{ format: 'bgra8unorm' }],
+      depthStencil: {
+        format: 'depth24plus-stencil8',
+        depthWriteEnabled: false,
+        depthCompare: 'less-equal',
+        stencilFront: { compare: 'equal', passOp: 'keep' },
+      },
+    }),
+
+    // 6. Vertex buffer layout variants (fullscreen [], 32B UI glyph, instanced 24B)
+    makeDesc({ targets: [{ format: 'bgra8unorm' }], buffers: [] }),
+    makeDesc({ targets: [{ format: 'bgra8unorm' }], buffers: vbl32UiGlyph }),
+    makeDesc({ targets: [{ format: 'bgra8unorm' }], buffers: vbl24Instanced }),
+
+    // 7. MRT order and sparse null target sensitivity
+    makeDesc({ targets: [{ format: 'rgba8unorm' }, { format: 'rgba8unorm-srgb' }] }),
+    makeDesc({ targets: [{ format: 'rgba8unorm-srgb' }, { format: 'rgba8unorm' }] }),
+    makeDesc({ targets: [null, { format: 'rgba8unorm' }] }),
+  ];
+
+  const seenKeys = new Set();
+  const seenPipelines = new Set();
+
+  for (let i = 0; i < variantDescriptors.length; i += 1) {
+    const desc = variantDescriptors[i];
+    const key = hashDescriptorKey(desc);
+    assert.equal(seenKeys.has(key), false, `variant index ${i} collided on cache key ${key}`);
+    seenKeys.add(key);
+
+    const pipeline =
+      i % 2 === 0
+        ? cache.getOrCreateRenderPipeline(desc)
+        : await cache.getOrCreateRenderPipelineAsync(desc);
+    assert.equal(seenPipelines.has(pipeline), false, `variant index ${i} returned colliding pipeline`);
+    seenPipelines.add(pipeline);
+  }
+
+  assert.equal(seenPipelines.size, variantDescriptors.length);
+
+  // Re-querying every variant hits the cache with zero new compiles
+  for (let i = 0; i < variantDescriptors.length; i += 1) {
+    const hit = cache.getOrCreateRenderPipeline(variantDescriptors[i]);
+    assert.equal(seenPipelines.has(hit), true);
+  }
+
+  const stats = cache.getStats();
+  assert.equal(stats.renderCount, variantDescriptors.length);
+  assert.equal(stats.renderMisses, variantDescriptors.length);
+  assert.equal(stats.renderHits, variantDescriptors.length);
+  // 5 blended variants: alphaBlend, premultipliedBlend, additiveBlend, subtractBlend, sRGB+alphaBlend
+  assert.equal(stats.blendPipelineVariants, 5);
+  // 5 sRGB variants: rgba8unorm-srgb, bgra8unorm-srgb, rgba8unorm-srgb+alphaBlend, and 2 MRT pairs
+  assert.equal(stats.srgbPipelineVariants, 5);
+  assert.equal(stats.cacheBreakdown.render.hits, variantDescriptors.length);
+  assert.equal(stats.cacheBreakdown.render.misses, variantDescriptors.length);
+  assert.equal(stats.cacheBreakdown.render.hitRate, 0.5);
+});
+
+test('W167 color target blend/sRGB/writeMask/depthStencil normalization deduplicates safely without mutating caller descriptors', () => {
+  const device = createMockGpuDevice();
+  const cache = new WebGpuPipelineCache({ device, defaultColorFormat: 'bgra8unorm' });
+  const vs = device.createShaderModule({ label: 'wgpk:vertex:0x000000000000b001', code: 'vs' });
+  const fs = device.createShaderModule({ label: 'wgpk:fragment:0x000000000000b002', code: 'fs' });
+
+  // 1. blend: null and depthStencil: null normalize to omitted and share key with clean opaque descriptor
+  const cleanOpaque = {
+    layout: 'auto',
+    vertex: { module: vs, entryPoint: 'vs_main' },
+    fragment: { module: fs, entryPoint: 'fs_main', targets: [{ format: 'rgba8unorm-srgb' }] },
+  };
+  const nullableOpaque = {
+    layout: 'auto',
+    vertex: { module: vs, entryPoint: 'vs_main' },
+    fragment: {
+      module: fs,
+      entryPoint: 'fs_main',
+      targets: [{ format: '  RGBA8UNORM-SRGB ', blend: null }],
+    },
+    depthStencil: null,
+  };
+
+  const pClean = cache.getOrCreateRenderPipeline(cleanOpaque);
+  const pFromNullable = cache.getOrCreateRenderPipeline(nullableOpaque);
+  assert.equal(pFromNullable, pClean);
+  assert.equal(device.calls.createRenderPipeline.length, 1);
+  // Caller descriptor untouched
+  assert.equal(nullableOpaque.depthStencil, null);
+  assert.equal(nullableOpaque.fragment.targets[0].blend, null);
+  assert.equal(nullableOpaque.fragment.targets[0].format, '  RGBA8UNORM-SRGB ');
+
+  // 2. Partial blend component (missing operation: 'add') normalizes and deduplicates with explicit blend
+  const explicitBlendDesc = {
+    layout: 'auto',
+    vertex: { module: vs, entryPoint: 'vs_main' },
+    fragment: {
+      module: fs,
+      entryPoint: 'fs_main',
+      targets: [
+        {
+          format: 'bgra8unorm',
+          blend: {
+            color: { operation: 'add', srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' },
+            alpha: { operation: 'add', srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
+          },
+        },
+      ],
+    },
+  };
+  const partialBlendDesc = {
+    layout: 'auto',
+    vertex: { module: vs, entryPoint: 'vs_main' },
+    fragment: {
+      module: fs,
+      entryPoint: 'fs_main',
+      targets: [
+        {
+          format: 'bgra8unorm',
+          blend: {
+            color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' },
+            alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
+          },
+        },
+      ],
+    },
+  };
+  const pBlend1 = cache.getOrCreateRenderPipeline(explicitBlendDesc);
+  const pBlend2 = cache.getOrCreateRenderPipeline(partialBlendDesc);
+  assert.equal(pBlend2, pBlend1);
+  assert.equal(device.calls.createRenderPipeline.length, 2);
+
+  // 3. Out-of-range writeMask, missing target format, and min/max blend defaults normalize safely
+  const norm = normalizeRenderPipelineDescriptor(
+    {
+      layout: 'auto',
+      vertex: { module: vs, entryPoint: 'vs_main' },
+      fragment: {
+        module: fs,
+        entryPoint: 'fs_main',
+        targets: [
+          {
+            writeMask: 0x37, // clamps to 0x7
+            blend: {
+              color: { operation: 'min' }, // defaults srcFactor='one', dstFactor='one'
+            }, // missing alpha -> synthesized default
+          },
+        ],
+      },
+    },
+    { defaultColorFormat: 'rgba8unorm' }
+  );
+  assert.equal(norm.normalized, true);
+  assert.equal(norm.descriptor.fragment.targets[0].format, 'rgba8unorm');
+  assert.equal(norm.descriptor.fragment.targets[0].writeMask, 0x7);
+  assert.deepEqual(norm.descriptor.fragment.targets[0].blend, {
+    color: { operation: 'min', srcFactor: 'one', dstFactor: 'one' },
+    alpha: { operation: 'add', srcFactor: 'one', dstFactor: 'zero' },
+  });
+  assert.ok(norm.reasons.includes('default-color-target-format'));
+  assert.ok(norm.reasons.includes('clamped-write-mask'));
+  assert.ok(norm.reasons.includes('normalized-blend-component'));
+
+  // 4. Failed compilations do not inflate blendPipelineVariants or srgbPipelineVariants
+  const failCache = new WebGpuPipelineCache({
+    device: createMockGpuDevice({
+      renderSyncImpl: () => {
+        throw new Error('compile failed');
+      },
+    }),
+  });
+  assert.throws(
+    () =>
+      failCache.getOrCreateRenderPipeline({
+        layout: 'auto',
+        vertex: { module: vs, entryPoint: 'vs_fail' },
+        fragment: {
+          module: fs,
+          entryPoint: 'fs_fail',
+          targets: [
+            {
+              format: 'rgba8unorm-srgb',
+              blend: explicitBlendDesc.fragment.targets[0].blend,
+            },
+          ],
+        },
+      }),
+    /compile failed/
+  );
+  assert.equal(failCache.getStats().blendPipelineVariants, 0);
+  assert.equal(failCache.getStats().srgbPipelineVariants, 0);
 });
