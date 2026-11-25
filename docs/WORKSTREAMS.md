@@ -70,6 +70,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Iterate the native boot until the first draws with bound resources, compute dispatches and texture uploads reach the recorded command stream and runs end only on the watchdog.
 - [ ] **R40 — Real-Binary Boot, Phase 5: Past the Start Screen — Steady State, Scripted Input, Next Blockers** — `IN PROGRESS` (#663, @Timon-ok) *(continues R32)*
   - Characterise what the title does after the start screen, drive its flow with scripted input, fix the next runtime blockers and measure frame time.
+  - Landed: default audio render endpoint (MMDevice/WASAPI) with stereo downmix, PCM ring and `--audio-dump`; XMem map/unmap work outside the lock; menu-flow preset through LEGAL NOTICES and right-stick/trigger input scripting; boot report screen timeline, GPU work counters and XMem alias diffs; XG/D3D12 tiling and layout fixes; CI guard against PRs that revert merged changes.
 - [x] **R41 — Boot Report Comparison Tool: Diff Two Native Boot Runs (`tools/compare_boot_reports.py`)** — `DONE` (PR #672, closes #670)
   - Structured diff of two boot reports (milestones, imports, address space, stop, counters, captures) with a pass/fail verdict and noise tolerances.
 - [x] **R42 — Boot Report: Milestone Import Indices, Per-Present Samples and Per-Thread Import Counts in the JSON** — `DONE` (PR #679, closes #673) *(R41 follow-up)*
@@ -156,8 +157,10 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Run and loop every runtime suite under ASan+UBSan and TSan, fix findings by cause with regression tests, and close the thread-pool submission leak left by O32.
 - [x] **O36 — Browser Boot Parity: Run the Real Program's wasm64 Boot Locally in Chrome and Close the Gap to the Native Boot** — `DONE` (closes #687) *(coordinated with the browser pipeline's owner)*
   - Run the browser boot end to end locally, compare it with a native run of the same commit, and fix wasm-only runtime gaps; web and build-tool items go to their owner first.
+  - Landed: one XMem backing for every mapping of a physical page, no zeroing of freshly committed slots (browser RAM), HTTPFS direct bridge reads with cached game-file sizes, lazy buffer shadows, dirty-slot-only flushes and 60 Hz present pacing.
 - [x] **O37 — Write Tracking for the Translated CPU Window in the Browser: Per-Slot Dirty Bits From Lifted Stores and Copy Helpers** — `DONE` (closes #716) *(O36 follow-up)*
   - Lifted window stores and runtime copy helpers set per-slot dirty bits so the GPU shadow flush compares only written slots in the browser.
+  - Landed with O36: window write marks, atomics target feature, translated-window placement of physical-page reservations, and flushing CPU-visible buffers from the write marks.
 
 ---
 
@@ -238,12 +241,15 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Create textures for views that name only a GPU address and a description, upload the data streamed into the GPU-window pages behind them, and convert the console tiled layouts to linear texels using the GPU family's public addressing rules.
 - [ ] **G62 — Bind Translated Stages by Reflection: Vertex-Input and Resource-Binding Contract Between the Shader Pack and the D3D12 Guest Layer (runtime side)** — `IN PROGRESS` (#651, @Timon-ok) *(contract discussed on #482; repo tests synthetic)*
   - Build vertex layouts and bind-group layouts for pack-resolved pipelines from each stage's reflection joined to the D3D12 input layout and root signature, instead of numbering conventions.
+  - Landed: table slots the root signature does not declare are joined (console stages read tables as memory), A8_UNORM held as rgba8unorm with the value in alpha (glyph atlas), sRGB/linear viewFormats siblings and `--watch-gpu-va`.
 - [x] **G64 — Upload Every Mip and Array Slice of Console-Layout Textures, Including Linear Multi-Mip Chains (`runtime/gpu`)** — `DONE` (PR #676, closes #665) *(G49 follow-up)*
   - Upload all mips and slices through the dirty-tracked path with GFX10 placement; model linear multi-mip chains from measured footprints.
 - [x] **G65 — One Linear Layout Rule for Allocation Size, XG Layout and Upload (`runtime/gpu`, XG)** — `DONE` (PR #689, closes #678) *(G64 follow-up)*
   - Settle the linear multi-mip rule with a boot probe and make allocation info, XG GetResourceLayout and uploads agree.
 - [ ] **G66 — Where Streamed Texture Data Lands: DirectStorage Destinations, Decompression and the Textures the Steady-State Passes Sample** — `IN PROGRESS` (#691, @Timon-ok)
   - Trace DirectStorage requests to their destinations and the textures the steady-state draws bind; fix runtime gaps, report formats that need a decoder.
+  - Landed: inline S# samplers bound from stage reflection, table-slot joins counted, compute stages writing through a declared SRV slot, every PresentX plane composed into the canvas, queue fence values published a frame late and PRESENT waits completing on present.
+  - Capture tooling: `replay_capture.py` with thinned uploads and an end-to-end test, lazy GPU object creation.
 
 ---
 
