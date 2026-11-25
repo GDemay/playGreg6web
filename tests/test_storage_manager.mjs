@@ -8,6 +8,9 @@ import {
   CACHE_INDEX_VERSION,
   DEFAULT_CACHE_INDEX_FILENAME,
   DEFAULT_CRITICAL_THRESHOLD_RATIO,
+  DEFAULT_FAST_BOOT_MEDIUM_THRESHOLD_RATIO,
+  DEFAULT_FAST_BOOT_OPFS_BUDGET_BYTES,
+  DEFAULT_FAST_BOOT_SLAB_MAX_BYTES,
   DEFAULT_OPFS_CACHE_DIR,
   DEFAULT_QUOTA_BUDGET_RATIO,
   DEFAULT_USERDATA_DB_NAME,
@@ -15,6 +18,8 @@ import {
   DEFAULT_WARM_BOOT_MIN_HEADROOM_RATIO,
   DEFAULT_WARM_BOOT_MIN_RPF_CHUNKS,
   DEFAULT_WARN_THRESHOLD_RATIO,
+  FAST_BOOT_PRESSURE_LEVELS,
+  MIN_FAST_BOOT_SLAB_MAX_BYTES,
   QUOTA_PRESSURE_LEVELS,
   SNAPSHOT_FORMAT,
   SNAPSHOT_VERSION,
@@ -28,6 +33,7 @@ import {
   validateCacheKey,
   validateUserdataPath,
 } from '../web/storage/storage_manager.js';
+import { OpfsChunkCache } from '../web/storage/opfs_cache.js';
 
 const require = createRequire(import.meta.url);
 const userdataMod = require('../web/workers/userdata.js');
@@ -925,6 +931,7 @@ test('eviction telemetry tracks evictedEntries, evictedBytes, cleanupCount, and 
     evictedBytes: 0,
     evictedFormatted: '0 B',
     cleanupCount: 0,
+    quotaEvictionRuns: 0,
     lastCleanupAtMs: null,
     warnThresholdRatio: 0.75,
     criticalThresholdRatio: 0.9,
@@ -2054,4 +2061,376 @@ test('getWarmBootReadiness accepts optional cacheStats/cacheSummary/quota overri
   assert.equal(malformedQuota.rpfChunksCached, 0);
   assert.equal(malformedQuota.warmBootReady, false);
   assert.equal(malformedQuota.recommendation, WARM_BOOT_RECOMMENDATIONS.WARM_CACHE_EMPTY);
+});
+
+// --- W291 Fast-Boot Plan & Quota-Pressure Eviction tests ---
+
+test('getFastBootPlan recommends 192 MiB slab cap and healthy OPFS budget when warm cache and headroom are healthy', async () => {
+  assert.equal(DEFAULT_FAST_BOOT_SLAB_MAX_BYTES, 192 * 1024 * 1024);
+  assert.equal(MIN_FAST_BOOT_SLAB_MAX_BYTES, 32 * 1024 * 1024);
+  assert.equal(DEFAULT_FAST_BOOT_OPFS_BUDGET_BYTES, 512 * 1024 * 1024);
+  assert.equal(DEFAULT_FAST_BOOT_MEDIUM_THRESHOLD_RATIO, 0.5);
+  assert.equal(Object.isFrozen(FAST_BOOT_PRESSURE_LEVELS), true);
+  assert.deepEqual(FAST_BOOT_PRESSURE_LEVELS, {
+    LOW: 'low',
+    MEDIUM: 'medium',
+    HIGH: 'high',
+    CRITICAL: 'critical',
+  });
+
+  const MiB = 1024 * 1024;
+  const opfsRoot = createMockOpfsDirHandle('', {
+    'C:\\Users\\secret\\fast-boot-cache': createMockOpfsDirHandle(
+      'C:\\Users\\secret\\fast-boot-cache',
+      {
+        'shaders/main.wgsl.pack': makePatternBytes(8192, 1),
+        [rangeCacheMod.opfsChunkFileName('x64a.rpf', 0, 262144)]: makePatternBytes(4096, 2),
+      }
+    ),
+  });
+
+  const manager = new BrowserStorageManager({
+    storageObj: createMockStorageObj({
+      usage: 256 * MiB,
+      quota: 2048 * MiB,
+      persisted: true,
+      opfsRoot,
+    }),
+    opfsDirName: 'C:\\Users\\secret\\fast-boot-cache',
+    dbName: 'secret-fastboot-db',
+    indexedDBFactory: null,
+  });
+
+  const planA = await manager.getFastBootPlan();
+  const planB = await manager.getFastBootPlan();
+
+  // Strictly deterministic and sanitized output shape.
+  assert.deepEqual(planA, planB);
+  assert.deepEqual(Object.keys(planA).sort(), [
+    'pressureLevel',
+    'quotaHeadroomBytes',
+    'recommendedOpfsBudgetBytes',
+    'recommendedSlabMaxBytes',
+    'shouldEvictColdChunks',
+    'warmCacheReady',
+  ]);
+  assert.deepEqual(planA, {
+    warmCacheReady: true,
+    recommendedSlabMaxBytes: 192 * MiB,
+    recommendedOpfsBudgetBytes: 512 * MiB,
+    quotaHeadroomBytes: 1792 * MiB,
+    pressureLevel: 'low',
+    shouldEvictColdChunks: false,
+  });
+
+  const serialized = JSON.stringify(planA);
+  assert.equal(serialized.includes('secret'), false);
+  assert.equal(serialized.includes('x64a.rpf'), false);
+  assert.equal(serialized.includes('wgsl.pack'), false);
+});
+
+test('getFastBootPlan scales slab and OPFS budgets down gracefully across storage and memory pressure tiers (#1077)', async () => {
+  const MiB = 1024 * 1024;
+  const opfsRoot = createMockOpfsDirHandle('', {
+    [DEFAULT_OPFS_CACHE_DIR]: createMockOpfsDirHandle(DEFAULT_OPFS_CACHE_DIR, {
+      'shaders/frame1.wgsl.pack': makePatternBytes(4096, 3),
+      [rangeCacheMod.opfsChunkFileName('x64b.rpf', 0, 262144)]: makePatternBytes(2048, 4),
+    }),
+  });
+
+  let usage = 200 * MiB;
+  const quota = 2048 * MiB;
+  const manager = new BrowserStorageManager({
+    storageObj: {
+      async estimate() {
+        return { usage, quota };
+      },
+      async persisted() {
+        return true;
+      },
+      async getDirectory() {
+        return opfsRoot;
+      },
+    },
+    indexedDBFactory: null,
+  });
+
+  // 1. Low pressure (~9.8% used)
+  const low = await manager.getFastBootPlan();
+  assert.equal(low.pressureLevel, 'low');
+  assert.equal(low.warmCacheReady, true);
+  assert.equal(low.recommendedSlabMaxBytes, 192 * MiB);
+  assert.equal(low.shouldEvictColdChunks, false);
+
+  // 2. Medium pressure (~55% used)
+  usage = 1126 * MiB;
+  const medium = await manager.getFastBootPlan();
+  assert.equal(medium.pressureLevel, 'medium');
+  assert.equal(medium.warmCacheReady, true);
+  assert.equal(medium.recommendedSlabMaxBytes, 128 * MiB);
+  assert.ok(medium.recommendedSlabMaxBytes < low.recommendedSlabMaxBytes);
+  assert.ok(medium.recommendedOpfsBudgetBytes < low.recommendedOpfsBudgetBytes);
+  assert.equal(medium.shouldEvictColdChunks, false);
+
+  // 3. High pressure (~80% used)
+  usage = 1638 * MiB;
+  const high = await manager.getFastBootPlan();
+  assert.equal(high.pressureLevel, 'high');
+  assert.equal(high.warmCacheReady, true);
+  assert.equal(high.recommendedSlabMaxBytes, 96 * MiB);
+  assert.ok(high.recommendedSlabMaxBytes < medium.recommendedSlabMaxBytes);
+  assert.ok(high.recommendedOpfsBudgetBytes < medium.recommendedOpfsBudgetBytes);
+  assert.equal(high.shouldEvictColdChunks, true);
+
+  // 4. Critical pressure (~95% used -> headroom < 10%)
+  usage = 1946 * MiB;
+  const critical = await manager.getFastBootPlan();
+  assert.equal(critical.pressureLevel, 'critical');
+  assert.equal(critical.warmCacheReady, false);
+  assert.equal(critical.recommendedSlabMaxBytes, 48 * MiB);
+  assert.ok(critical.recommendedSlabMaxBytes >= MIN_FAST_BOOT_SLAB_MAX_BYTES);
+  assert.ok(critical.recommendedSlabMaxBytes < high.recommendedSlabMaxBytes);
+  assert.ok(critical.recommendedOpfsBudgetBytes < high.recommendedOpfsBudgetBytes);
+  assert.equal(critical.shouldEvictColdChunks, true);
+
+  // 5. Over-quota clamps headroom and OPFS budget to 0
+  usage = 2500 * MiB;
+  const overQuota = await manager.getFastBootPlan();
+  assert.equal(overQuota.pressureLevel, 'critical');
+  assert.equal(overQuota.quotaHeadroomBytes, 0);
+  assert.equal(overQuota.recommendedOpfsBudgetBytes, 0);
+  assert.equal(overQuota.shouldEvictColdChunks, true);
+
+  // 6. Memory pressure (#1077) scales down slab cap even when storage headroom is healthy
+  usage = 200 * MiB;
+  const highMem = await manager.getFastBootPlan({
+    jsHeapUsedBytes: 800 * MiB,
+    jsHeapLimitBytes: 1000 * MiB,
+  });
+  assert.equal(highMem.pressureLevel, 'high');
+  assert.equal(highMem.recommendedSlabMaxBytes, 96 * MiB);
+  assert.equal(highMem.shouldEvictColdChunks, true);
+
+  const criticalMem = await manager.getFastBootPlan({ deviceMemoryGb: 2 });
+  assert.equal(criticalMem.pressureLevel, 'critical');
+  assert.equal(criticalMem.recommendedSlabMaxBytes, 48 * MiB);
+  assert.equal(criticalMem.shouldEvictColdChunks, true);
+
+  const explicitMem = await manager.getFastBootPlan({ memoryPressure: 'medium' });
+  assert.equal(explicitMem.pressureLevel, 'medium');
+  assert.equal(explicitMem.recommendedSlabMaxBytes, 128 * MiB);
+
+  // 7. Cache occupancy exceeding recommended OPFS budget triggers shouldEvictColdChunks even at medium pressure
+  const overBudgetPlan = await manager.getFastBootPlan({
+    quota: { usage: 1126 * MiB, quota: 2048 * MiB, persisted: true },
+    cacheSummary: {
+      supported: true,
+      cachedEntries: 10,
+      cachedBytes: 400 * MiB,
+      shaderPackCached: true,
+      rpfChunksCached: 9,
+    },
+  });
+  assert.equal(overBudgetPlan.pressureLevel, 'medium');
+  assert.equal(overBudgetPlan.shouldEvictColdChunks, true);
+
+  // 8. Unsupported OPFS & unavailable quota degrade conservatively and safely
+  const unsupportedMgr = new BrowserStorageManager({
+    storageObj: null,
+    opfsRoot: null,
+    indexedDBFactory: null,
+  });
+  const unsupportedPlan = await unsupportedMgr.getFastBootPlan(null);
+  assert.deepEqual(unsupportedPlan, {
+    warmCacheReady: false,
+    recommendedSlabMaxBytes: 128 * MiB,
+    recommendedOpfsBudgetBytes: 0,
+    quotaHeadroomBytes: 0,
+    pressureLevel: 'medium',
+    shouldEvictColdChunks: false,
+  });
+});
+
+test('runQuotaPressureEviction delegates safely to attached OPFS cache (evictToTarget / prune / evictOldest), updates quotaEvictionRuns, and never touches /userdata', async () => {
+  const mockIdb = createMockIndexedDB();
+  const saveBytes = makePatternBytes(256, 42);
+  const store = new userdataMod.UserdataStore({ indexedDB: mockIdb });
+  await store.saveFile('/userdata/saves/slot1.sav', saveBytes, 1700000001000);
+  store.close();
+
+  let clockMs = 200000;
+  const manager = new BrowserStorageManager({
+    storageObj: null,
+    opfsRoot: null,
+    indexedDBFactory: mockIdb,
+    nowFn: () => clockMs,
+  });
+
+  // 1. evictToTarget takes precedence over prune and evictOldest
+  const calls = [];
+  manager.attachOpfsCache({
+    async evictToTarget(target) {
+      calls.push(['evictToTarget', target]);
+      return { evictedBytes: 8192, evictedEntries: 3, ok: true };
+    },
+    async prune(target) {
+      calls.push(['prune', target]);
+      return { evictedBytes: 1, evictedEntries: 1 };
+    },
+    async evictOldest(target) {
+      calls.push(['evictOldest', target]);
+      return { evictedBytes: 1, evictedEntries: 1 };
+    },
+  });
+
+  const res1 = await manager.runQuotaPressureEviction(16384);
+  assert.deepEqual(res1, { evictedBytes: 8192, evictedEntries: 3, ok: true });
+  assert.deepEqual(calls, [['evictToTarget', 16384]]);
+  assert.equal(manager.getStats().quotaEvictionRuns, 1);
+  assert.equal(manager.getCacheStats().quotaEvictionRuns, 1);
+  assert.equal(manager.getStats().evictedBytes, 8192);
+  assert.equal(manager.getStats().evictedEntries, 3);
+
+  // 2. Falls back to prune() when evictToTarget() is absent
+  clockMs += 1000;
+  manager.attachOpfsCache({
+    async prune(target) {
+      calls.push(['prune', target]);
+      return { freedBytes: 4096, removedCount: 2 };
+    },
+    async evictOldest(target) {
+      calls.push(['evictOldest', target]);
+      return { evictedBytes: 1, evictedEntries: 1 };
+    },
+  });
+
+  const res2 = await manager.runQuotaPressureEviction(4096);
+  assert.deepEqual(res2, { evictedBytes: 4096, evictedEntries: 2, ok: true });
+  assert.deepEqual(calls[1], ['prune', 4096]);
+  assert.equal(manager.getStats().quotaEvictionRuns, 2);
+  assert.equal(manager.getStats().evictedBytes, 12288);
+  assert.equal(manager.getStats().evictedEntries, 5);
+
+  // 3. Falls back to evictOldest() when evictToTarget() and prune() are absent
+  clockMs += 1000;
+  manager.attachOpfsCache({
+    async evictOldest(target) {
+      calls.push(['evictOldest', target]);
+      return { evictedBytes: 2048, evictedEntries: 1 };
+    },
+  });
+
+  const res3 = await manager.runQuotaPressureEviction(2048);
+  assert.deepEqual(res3, { evictedBytes: 2048, evictedEntries: 1, ok: true });
+  assert.deepEqual(calls[2], ['evictOldest', 2048]);
+  assert.equal(manager.getStats().quotaEvictionRuns, 3);
+
+  // 4. Throwing attached cache fails safely without throwing or touching /userdata
+  manager.attachOpfsCache({
+    async evictToTarget() {
+      throw new Error('OPFS lock fault');
+    },
+  });
+  const resErr = await manager.runQuotaPressureEviction(1024);
+  assert.deepEqual(resErr, { evictedBytes: 0, evictedEntries: 0, ok: false });
+  assert.equal(manager.getStats().quotaEvictionRuns, 4);
+
+  // 5. Zero / negative / NaN targetFreeBytes safely no-op and still increment quotaEvictionRuns
+  const resZero = await manager.runQuotaPressureEviction(0);
+  const resNeg = await manager.runQuotaPressureEviction(-500);
+  const resNaN = await manager.runQuotaPressureEviction(Number.NaN);
+  assert.deepEqual(resZero, { evictedBytes: 0, evictedEntries: 0, ok: true });
+  assert.deepEqual(resNeg, { evictedBytes: 0, evictedEntries: 0, ok: true });
+  assert.deepEqual(resNaN, { evictedBytes: 0, evictedEntries: 0, ok: true });
+  assert.equal(manager.getStats().quotaEvictionRuns, 7);
+
+  // 6. Verify /userdata player saves are 100% untouched
+  const userdataAfter = await manager.listUserdataFiles();
+  assert.equal(userdataAfter.fileCount, 1);
+  assert.equal(userdataAfter.files[0].path, '/userdata/saves/slot1.sav');
+  assert.equal(userdataAfter.files[0].byteLength, saveBytes.byteLength);
+
+  // 7. resetStats clears quotaEvictionRuns cleanly
+  const reset = manager.resetStats();
+  assert.equal(reset.quotaEvictionRuns, 0);
+  assert.equal(manager.getCacheStats().quotaEvictionRuns, 0);
+});
+
+test('runQuotaPressureEviction integrates with real OpfsChunkCache and built-in OPFS LRU while preserving pinned boot assets and /userdata', async () => {
+  let clockMs = 300000;
+  const opfsRoot = createMockOpfsDirHandle('');
+  const mockIdb = createMockIndexedDB();
+  const saveBytes = makePatternBytes(128, 99);
+  const store = new userdataMod.UserdataStore({ indexedDB: mockIdb });
+  await store.saveFile('/userdata/profile.sav', saveBytes, 1700000010000);
+  store.close();
+
+  // Part A: Attached real OpfsChunkCache (evictToBudget path)
+  const chunkCache = new OpfsChunkCache({
+    opfsRoot,
+    maxBytes: null,
+    nowFn: () => (clockMs += 100),
+  });
+  await chunkCache.put('boot/gta6.pgim', makePatternBytes(2048, 1), { pinned: true });
+  await chunkCache.put('c_262144_0_cold1.bin', makePatternBytes(1024, 2));
+  await chunkCache.put('c_262144_1_cold2.bin', makePatternBytes(1024, 3));
+  await chunkCache.put('c_262144_2_warm.bin', makePatternBytes(1024, 4));
+
+  const mgrWithChunkCache = new BrowserStorageManager({
+    storageObj: null,
+    opfsRoot,
+    opfsCache: chunkCache,
+    indexedDBFactory: mockIdb,
+    nowFn: () => clockMs,
+  });
+
+  const evAttached = await mgrWithChunkCache.runQuotaPressureEviction(1500);
+  assert.equal(evAttached.ok, true);
+  assert.equal(evAttached.evictedEntries, 2);
+  assert.equal(evAttached.evictedBytes, 2048);
+  assert.equal(mgrWithChunkCache.getStats().quotaEvictionRuns, 1);
+  // Pinned boot .pgim and newest chunk remain in OpfsChunkCache.
+  assert.ok(await chunkCache.get('boot/gta6.pgim'));
+  assert.ok(await chunkCache.get('c_262144_2_warm.bin'));
+  assert.equal(await chunkCache.get('c_262144_0_cold1.bin'), null);
+  assert.equal(await chunkCache.get('c_262144_1_cold2.bin'), null);
+
+  // Part B: Built-in OPFS fallback when no external opfsCache is attached
+  const builtinRoot = createMockOpfsDirHandle('');
+  const builtinMgr = new BrowserStorageManager({
+    storageObj: null,
+    opfsRoot: builtinRoot,
+    indexedDBFactory: mockIdb,
+    nowFn: () => (clockMs += 100),
+  });
+  await builtinMgr.putCacheEntry('shaders/active.wgsl.pack', makePatternBytes(2048, 5), {
+    pinned: true,
+  });
+  await builtinMgr.putCacheEntry('c_262144_0_old.bin', makePatternBytes(1024, 6));
+  await builtinMgr.putCacheEntry('c_262144_1_new.bin', makePatternBytes(1024, 7));
+
+  const evBuiltin = await builtinMgr.runQuotaPressureEviction(1024);
+  assert.deepEqual(evBuiltin, { evictedBytes: 1024, evictedEntries: 1, ok: true });
+  assert.equal(builtinMgr.getStats().quotaEvictionRuns, 1);
+  assert.equal(builtinMgr.getStats().evictedEntries, 1);
+  assert.equal(builtinMgr.getStats().evictedBytes, 1024);
+  assert.ok(builtinMgr.getCacheEntryMeta('shaders/active.wgsl.pack'));
+  assert.equal(builtinMgr.getCacheEntryMeta('c_262144_0_old.bin'), null);
+  assert.ok(builtinMgr.getCacheEntryMeta('c_262144_1_new.bin'));
+
+  // Part C: Unsupported OPFS with no attached cache returns ok: false safely
+  const unsupportedMgr = new BrowserStorageManager({
+    storageObj: null,
+    opfsRoot: null,
+    indexedDBFactory: mockIdb,
+  });
+  const evUnsupported = await unsupportedMgr.runQuotaPressureEviction(1024);
+  assert.deepEqual(evUnsupported, { evictedBytes: 0, evictedEntries: 0, ok: false });
+  assert.equal(unsupportedMgr.getStats().quotaEvictionRuns, 1);
+
+  // IndexedDB /userdata save still intact after all eviction runs
+  const saves = await builtinMgr.listUserdataFiles();
+  assert.equal(saves.fileCount, 1);
+  assert.equal(saves.files[0].path, '/userdata/profile.sav');
+  assert.equal(saves.files[0].byteLength, saveBytes.byteLength);
 });
