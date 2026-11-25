@@ -2039,7 +2039,7 @@ class TestBrowserBootFlags(unittest.TestCase):
         "-sEXPORTED_RUNTIME_METHODS=wasmMemory,FS,HEAPU8,addRunDependency,removeRunDependency"
     )
     EXPECTED_EXPORTED_FUNCTIONS = (
-        "-sEXPORTED_FUNCTIONS=_main,_playgta6_get_input_state_ptr"
+        "-sEXPORTED_FUNCTIONS=_main,_playgta6_get_input_state_ptr,_playgta6_audio_ring"
     )
 
     def _repo(self, tmp: Path) -> Path:
@@ -2349,6 +2349,39 @@ class TestBrowserBootFlags(unittest.TestCase):
             )
             self.assertEqual(code_txt, 0, err_txt)
             self.assertIn("Browser boot exports: yes", out_txt)
+
+    def test_browser_boot_exports_includes_audio_ring_symbol(self) -> None:
+        exported = bgw.BROWSER_BOOT_EXPORTED_FUNCTIONS.split(",")
+        self.assertEqual(
+            exported,
+            ["_main", "_playgta6_get_input_state_ptr", "_playgta6_audio_ring"],
+        )
+
+        # Disabled by default: neither -sEXPORTED_FUNCTIONS nor _playgta6_audio_ring is emitted.
+        default_flags = bgw.resolve_link_flags()
+        self.assertFalse(any("_playgta6_audio_ring" in f for f in default_flags))
+        default_split_flags = bgw.resolve_link_flags(main_module=True)
+        self.assertFalse(any("_playgta6_audio_ring" in f for f in default_split_flags))
+
+        # Enabled: both monolithic and split-module builds export _playgta6_audio_ring alongside
+        # _main and _playgta6_get_input_state_ptr.
+        for main_module in (False, True):
+            flags = bgw.resolve_link_flags(browser_boot_exports=True, main_module=main_module)
+            exported_flags = [f for f in flags if f.startswith("-sEXPORTED_FUNCTIONS=")]
+            self.assertEqual(exported_flags, [self.EXPECTED_EXPORTED_FUNCTIONS])
+            symbols = exported_flags[0].split("=", 1)[1].split(",")
+            self.assertIn("_main", symbols)
+            self.assertIn("_playgta6_get_input_state_ptr", symbols)
+            self.assertIn("_playgta6_audio_ring", symbols)
+
+            link_argv = bgw.build_link_argv(
+                "em++",
+                [Path("a.o")],
+                output_js=Path("web/dist/runtime.js"),
+                browser_boot_exports=True,
+                main_module=main_module,
+            )
+            self.assertIn(self.EXPECTED_EXPORTED_FUNCTIONS, link_argv)
 
     def test_invalid_browser_boot_flag_values_rejected(self) -> None:
         bad_sizes = ("", "   ", "0", "0MB", "-64MB", "64 MB", "abc", "64MB;rm", "8.5MB", "64MB/x")
