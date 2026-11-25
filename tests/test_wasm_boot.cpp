@@ -1607,6 +1607,29 @@ void test_wasm_input_state_and_game_input_wiring() {
             CHECK(reading->GetSequenceNumber(scarlett::kGameInputKindGamepad) >= 2u);
             reading->Release();
         }
+        // The bridge's extended bits 16..21 (stick clicks, D-pad) reach the gamepad buttons.
+        write_vals.buttons = input_btn::kDPadDown | input_btn::kDPadLeft | input_btn::kRightStickPress;
+        playgta6::os::GameInputReader::write_seqlock(*cpp_ptr, write_vals);
+        reading = nullptr;
+        CHECK(gi->GetCurrentReading(scarlett::kGameInputKindGamepad, nullptr, &reading) == 0);
+        if (reading != nullptr) {
+            Pg6GameInputGamepadState gp{};
+            CHECK(reading->GetGamepadState(&gp));
+            namespace gb = scarlett::gamepad_button;
+            CHECK(gp.buttons == (gb::kDPadDown | gb::kDPadLeft | gb::kRightThumbstick));
+            reading->Release();
+        }
+        write_vals.buttons = input_btn::kDPadUp | input_btn::kDPadRight | input_btn::kLeftStickPress;
+        playgta6::os::GameInputReader::write_seqlock(*cpp_ptr, write_vals);
+        reading = nullptr;
+        CHECK(gi->GetCurrentReading(scarlett::kGameInputKindGamepad, nullptr, &reading) == 0);
+        if (reading != nullptr) {
+            Pg6GameInputGamepadState gp{};
+            CHECK(reading->GetGamepadState(&gp));
+            namespace gb = scarlett::gamepad_button;
+            CHECK(gp.buttons == (gb::kDPadUp | gb::kDPadRight | gb::kLeftThumbstick));
+            reading->Release();
+        }
         gi->Release();
     }
 

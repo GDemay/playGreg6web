@@ -6,7 +6,7 @@
 
 namespace playgta6::os {
 
-// Button bit definitions matching web/input/input_bridge.js (bits 0..5) and Xbox GameInput extensions.
+// Button bit definitions matching web/input/input_bridge.js (bits 0..5, 8..21).
 namespace input_button {
 inline constexpr uint32_t kMoveForward = 1u << 0;   // KeyW
 inline constexpr uint32_t kMoveBackward = 1u << 1;  // KeyS
@@ -22,6 +22,13 @@ inline constexpr uint32_t kLeftBumper = 1u << 12;
 inline constexpr uint32_t kRightBumper = 1u << 13;
 inline constexpr uint32_t kMenu = 1u << 14;
 inline constexpr uint32_t kView = 1u << 15;
+// Extended gamepad bits 16..21 (web/input/input_bridge.js INPUT_BUTTONS).
+inline constexpr uint32_t kLeftStickPress = 1u << 16;   // L3
+inline constexpr uint32_t kRightStickPress = 1u << 17;  // R3
+inline constexpr uint32_t kDPadUp = 1u << 18;
+inline constexpr uint32_t kDPadDown = 1u << 19;
+inline constexpr uint32_t kDPadLeft = 1u << 20;
+inline constexpr uint32_t kDPadRight = 1u << 21;
 }  // namespace input_button
 
 enum class SeqlockMode : uint8_t {

@@ -32,6 +32,9 @@ bool button_bit(const std::string& name, uint32_t& bit) {
         // Left stick pushed fully (the bridge's W/A/S/D bits, which the GameInput layer turns
         // into the left thumbstick): menu navigation.
         {"Up", b::kMoveForward},   {"Down", b::kMoveBackward}, {"Left", b::kMoveLeft}, {"Right", b::kMoveRight},
+        // D-pad and stick clicks (gamepad buttons only).
+        {"DUp", b::kDPadUp},       {"DDown", b::kDPadDown},    {"DLeft", b::kDPadLeft}, {"DRight", b::kDPadRight},
+        {"LS", b::kLeftStickPress}, {"RS", b::kRightStickPress},
     };
     for (const Name& n : kNames) {
         if (name == n.text) {
