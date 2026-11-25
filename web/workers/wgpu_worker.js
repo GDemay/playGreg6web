@@ -2555,6 +2555,9 @@ class WgpuCommandProcessor {
     this._specializedFallbackPipelines = new Map();
     this._specializedFallbackBindGroups = new Map();
     this._pendingCommandStreamShaderProfiles = null;
+    this._pendingCommandStreamView = null;
+    this._pendingCommandStreamScanned = true;
+    this._fallbackProfileScanCount = 0;
     this._fallbackProfileCounts = {
       [FALLBACK_PROFILE.DEFAULT]: 0,
       [FALLBACK_PROFILE.FULLSCREEN_TRIANGLE_CBV]: 0,
@@ -3224,10 +3227,26 @@ class WgpuCommandProcessor {
     }
   }
 
+  /**
+   * W346: Lazily scan the active command buffer for fallback shader profile hints only when
+   * a `CreateShaderModule` packet actually misses the WGSL pack and needs fallback routing.
+   */
+  _ensureCommandStreamFallbackProfiles() {
+    if (!this._pendingCommandStreamScanned) {
+      this._pendingCommandStreamScanned = true;
+      const view = this._pendingCommandStreamView;
+      if (view) {
+        this._pendingCommandStreamShaderProfiles = this._scanCommandBufferFallbackProfiles(view);
+      }
+    }
+    return this._pendingCommandStreamShaderProfiles;
+  }
+
   _scanCommandBufferFallbackProfiles(view) {
     if (!this.shaderFallbackRouter || typeof this.shaderFallbackRouter.resolve !== 'function') {
       return null;
     }
+    this._fallbackProfileScanCount += 1;
 
     const localPipelines = new Map();
     const localBindGroups = new Map();
@@ -5700,6 +5719,31 @@ class WgpuCommandProcessor {
   }
 
   /**
+   * W346: toggle live-resource replay recording at runtime (or via worker `init`).
+   * Passing `{ clear: true }` while disabling also releases previously recorded packets
+   * and shadow buffers immediately.
+   *
+   * @param {boolean} enabled
+   * @param {{ clear?: boolean } | null} [opts]
+   * @returns {boolean}
+   */
+  setEnableResourceReplay(enabled, opts = null) {
+    this._resourceReplayEnabled = enabled !== false;
+    if (!this._resourceReplayEnabled && opts && opts.clear === true) {
+      this._replayLog.clear();
+      this._replayBindGroupKeys.clear();
+      this._replayLogBytes = 0;
+      this._shadowBuffers.clear();
+      this._shadowBufferBytes = 0;
+    }
+    return this._resourceReplayEnabled;
+  }
+
+  get resourceReplayEnabled() {
+    return this._resourceReplayEnabled;
+  }
+
+  /**
    * W104: record one packet into the live-resource replay log. Creation packets are copied
    * (latest creation of an id wins), DestroyResource forgets every record of the id, and
    * WriteBuffer updates the bounded shadow copy of the buffer contents. Never records while
@@ -5808,7 +5852,7 @@ class WgpuCommandProcessor {
   }
 
   _recordShadowBufferWrite(view, payloadOffset, payloadBytes) {
-    if (payloadBytes < 16) {
+    if (!this._resourceReplayEnabled || this._replayingResources || payloadBytes < 16) {
       return;
     }
     const id = view.getUint32(payloadOffset, true);
@@ -5906,10 +5950,14 @@ class WgpuCommandProcessor {
 
     const ordered = this._collectOrderedReplayEntries();
     const prevPendingHints = this._pendingCommandStreamShaderProfiles;
+    const prevPendingView = this._pendingCommandStreamView;
+    const prevPendingScanned = this._pendingCommandStreamScanned;
     const prevPassCommands = this._passCommands;
     this._replayingResources = true;
     try {
       this._pendingCommandStreamShaderProfiles = null;
+      this._pendingCommandStreamView = null;
+      this._pendingCommandStreamScanned = true;
       this._passCommands = [];
       let shadowWritesDone = false;
       for (let i = 0; i < ordered.length; i += 1) {
@@ -5930,6 +5978,8 @@ class WgpuCommandProcessor {
     } finally {
       this._passCommands = prevPassCommands;
       this._pendingCommandStreamShaderProfiles = prevPendingHints;
+      this._pendingCommandStreamView = prevPendingView;
+      this._pendingCommandStreamScanned = prevPendingScanned;
       this._replayingResources = false;
     }
 
@@ -5971,10 +6021,14 @@ class WgpuCommandProcessor {
     );
 
     const prevPendingHints = this._pendingCommandStreamShaderProfiles;
+    const prevPendingView = this._pendingCommandStreamView;
+    const prevPendingScanned = this._pendingCommandStreamScanned;
     const prevPassCommands = this._passCommands;
     this._replayingResources = true;
     try {
       this._pendingCommandStreamShaderProfiles = null;
+      this._pendingCommandStreamView = null;
+      this._pendingCommandStreamScanned = true;
       this._passCommands = [];
       let shadowWritesDone = false;
       for (let i = 0; i < ordered.length; i += 1) {
@@ -6002,6 +6056,8 @@ class WgpuCommandProcessor {
     } finally {
       this._passCommands = prevPassCommands;
       this._pendingCommandStreamShaderProfiles = prevPendingHints;
+      this._pendingCommandStreamView = prevPendingView;
+      this._pendingCommandStreamScanned = prevPendingScanned;
       this._replayingResources = false;
     }
 
@@ -6064,6 +6120,7 @@ class WgpuCommandProcessor {
    */
   getResourceReplayStats() {
     return {
+      enabled: this._resourceReplayEnabled,
       recordedResourceCount: this._replayLog.size,
       recordedResourceBytes: this._replayLogBytes,
       replayLogOverflowCount: this._replayLogOverflowCount,
@@ -6135,6 +6192,8 @@ class WgpuCommandProcessor {
     this._specializedFallbackPipelines.clear();
     this._specializedFallbackBindGroups.clear();
     this._pendingCommandStreamShaderProfiles = null;
+    this._pendingCommandStreamView = null;
+    this._pendingCommandStreamScanned = true;
     this._explicitFallbackDrawContext = null;
     this.computePipelines.clear();
     this._pipelineBindGroupLayouts.clear();
@@ -7533,13 +7592,22 @@ class WgpuCommandProcessor {
         typeof this.shaderFallbackRouter.resolve === 'function'
       ) {
         let hintProfile = this._defaultFallbackProfile;
-        if (
-          this._pendingCommandStreamShaderProfiles &&
-          this._pendingCommandStreamShaderProfiles.has(id)
-        ) {
-          hintProfile = this._pendingCommandStreamShaderProfiles.get(id);
-        } else if (this._explicitFallbackDrawContext) {
-          hintProfile = selectFallbackShaderProfile(this._explicitFallbackDrawContext);
+        // W346: Skip lookahead fallback-profile command-buffer scan when the requested hash
+        // is already present in the router's WGSL pack (100% of live pack-backed shaders).
+        const routerPackLoader = this.shaderFallbackRouter._packLoader;
+        const knownCompileFailure =
+          typeof this.shaderFallbackRouter.hasCompileFailure === 'function' &&
+          this.shaderFallbackRouter.hasCompileFailure(lookupHashHex);
+        const isPackHit =
+          !knownCompileFailure &&
+          Boolean(routerPackLoader && lookupFromPackCache(routerPackLoader, lookupHashHex));
+        if (!isPackHit) {
+          const pendingHints = this._ensureCommandStreamFallbackProfiles();
+          if (pendingHints && pendingHints.has(id)) {
+            hintProfile = pendingHints.get(id);
+          } else if (this._explicitFallbackDrawContext) {
+            hintProfile = selectFallbackShaderProfile(this._explicitFallbackDrawContext);
+          }
         }
         const resolved = callFallbackRouterResolve(
           this.shaderFallbackRouter,
@@ -10046,8 +10114,9 @@ class WgpuCommandProcessor {
     if (this._deviceRecovering) {
       // W100: drop submissions for the lost device while recovery is in flight.
       this._droppedWhileRecoveringCount += 1;
-      // W104: resources the guest creates meanwhile are still recorded for replay.
-      if (view) {
+      // W104 / W346: resources the guest creates meanwhile are still recorded for replay
+      // only when resource replay is enabled.
+      if (view && this._resourceReplayEnabled && !this._replayingResources) {
         this._recordReplayPacketsFrom(view, 0);
       }
       return { frameCount: this.frameCount, presents: 0 };
@@ -10057,7 +10126,13 @@ class WgpuCommandProcessor {
     let presents = 0;
 
     const prevPendingHints = this._pendingCommandStreamShaderProfiles;
-    this._pendingCommandStreamShaderProfiles = this._scanCommandBufferFallbackProfiles(view);
+    const prevPendingView = this._pendingCommandStreamView;
+    const prevPendingScanned = this._pendingCommandStreamScanned;
+    // W346: Defer fallback profile lookahead scanning until a CreateShaderModule packet
+    // actually misses the WGSL pack; steady-state & pack-backed submissions walk once.
+    this._pendingCommandStreamShaderProfiles = null;
+    this._pendingCommandStreamView = view;
+    this._pendingCommandStreamScanned = false;
     try {
     while (offset + 8 <= view.byteLength) {
       const opcode = view.getUint16(offset, true);
@@ -10074,19 +10149,25 @@ class WgpuCommandProcessor {
       this._packetCount += 1;
       this._bytesProcessed += 8 + payloadBytes;
 
-      this._recordReplayPacket(opcode, view, payloadOffset, payloadBytes);
+      if (this._resourceReplayEnabled && !this._replayingResources) {
+        this._recordReplayPacket(opcode, view, payloadOffset, payloadBytes);
+      }
       presents += this._dispatchPacket(opcode, view, payloadOffset, payloadBytes);
 
       offset = payloadOffset + payloadBytes;
       if (this._deviceRecovering) {
         // W100: device loss detected mid-buffer; skip the remaining packets cleanly.
-        // W104: still record the skipped resource packets so recovery can replay them.
-        this._recordReplayPacketsFrom(view, offset);
+        // W104 / W346: still record the skipped resource packets when replay is enabled.
+        if (this._resourceReplayEnabled && !this._replayingResources) {
+          this._recordReplayPacketsFrom(view, offset);
+        }
         break;
       }
     }
     } finally {
       this._pendingCommandStreamShaderProfiles = prevPendingHints;
+      this._pendingCommandStreamView = prevPendingView;
+      this._pendingCommandStreamScanned = prevPendingScanned;
     }
 
     return { frameCount: this.frameCount, presents };
@@ -10595,6 +10676,8 @@ class WgpuCommandProcessor {
       deferredGpuDestroysInFlight: this._inFlightDeferredDestroys.size,
       deferredGpuDestroysCompleted: this._deferredDestroyCount,
       promoted1DTo2DCount: this._promoted1DTo2DCount,
+      fallbackProfileScanCount: this._fallbackProfileScanCount,
+      resourceReplayEnabled: this._resourceReplayEnabled,
     };
   }
 
@@ -10684,6 +10767,8 @@ class WgpuCommandProcessor {
     this._specializedFallbackPipelines.clear();
     this._specializedFallbackBindGroups.clear();
     this._pendingCommandStreamShaderProfiles = null;
+    this._pendingCommandStreamView = null;
+    this._pendingCommandStreamScanned = true;
     this._explicitFallbackDrawContext = null;
     this.computePipelines.clear();
     this._pipelineBindGroupLayouts.clear();
@@ -13094,6 +13179,10 @@ function createWgpuWorkerHandler(options = {}) {
       enableRtPool: initPayload.enableRtPool ?? options.enableRtPool,
       enableShaderFallback:
         initPayload.enableShaderFallback ?? options.enableShaderFallback,
+      enableResourceReplay:
+        initPayload.enableResourceReplay !== undefined
+          ? initPayload.enableResourceReplay
+          : options.enableResourceReplay,
       enableSplashBridge:
         initPayload.enableSplashBridge ?? options.enableSplashBridge,
       fallbackShaderHashes:
@@ -13173,6 +13262,13 @@ function createWgpuWorkerHandler(options = {}) {
           firstVisibleFrameNotified = false;
           bindProcessorValidationErrors(processor);
         }
+        if (
+          processor &&
+          payload.enableResourceReplay !== undefined &&
+          typeof processor.setEnableResourceReplay === 'function'
+        ) {
+          processor.setEnableResourceReplay(payload.enableResourceReplay !== false);
+        }
         if (payload.ringSab || payload.ring) {
           attachRingFromMessage(payload);
         } else if (attachedRing && processor) {
@@ -13182,6 +13278,12 @@ function createWgpuWorkerHandler(options = {}) {
           await preloadBootShaderAssets(processor, payload);
         }
       } else if (payload.init && processor) {
+        if (
+          payload.enableResourceReplay !== undefined &&
+          typeof processor.setEnableResourceReplay === 'function'
+        ) {
+          processor.setEnableResourceReplay(payload.enableResourceReplay !== false);
+        }
         await preloadBootShaderAssets(processor, payload);
       } else if (payload.resize && canvas) {
         const nextW = Math.max(1, payload.width | 0);
