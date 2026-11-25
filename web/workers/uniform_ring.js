@@ -214,6 +214,116 @@
   }
 
   /**
+   * Insert `[start, end)` into a sorted, disjoint array of `{ start, end, writeCount }`
+   * dirty byte ranges, coalescing adjacent/overlapping intervals (and intervals separated
+   * by at most `maxGapBytes`).
+   *
+   * O(1) zero-allocation fast path for sequential appends (the dominant per-frame draw path).
+   *
+   * @param {Array<{ start: number, end: number, writeCount: number }>} ranges
+   * @param {number} start
+   * @param {number} end
+   * @param {number} [writeCount=1]
+   * @param {number} [maxGapBytes=0]
+   */
+  function insertDirtyRange(ranges, start, end, writeCount = 1, maxGapBytes = 0) {
+    if (end <= start) {
+      return;
+    }
+
+    const len = ranges.length;
+    if (len === 0) {
+      ranges.push({ start, end, writeCount });
+      return;
+    }
+
+    // O(1) fast path: sequential append or overlap with the last range.
+    const last = ranges[len - 1];
+    if (start >= last.start) {
+      if (start <= last.end + maxGapBytes) {
+        if (end > last.end) {
+          last.end = end;
+        }
+        last.writeCount += writeCount;
+        return;
+      }
+      ranges.push({ start, end, writeCount });
+      return;
+    }
+
+    // General sorted insertion + coalescing for wrap-around or out-of-order staged writes.
+    let insertIdx = 0;
+    while (insertIdx < len && ranges[insertIdx].end + maxGapBytes < start) {
+      insertIdx += 1;
+    }
+
+    let mergedStart = start;
+    let mergedEnd = end;
+    let mergedWrites = writeCount;
+    let mergeEndIdx = insertIdx;
+
+    while (mergeEndIdx < len && ranges[mergeEndIdx].start <= mergedEnd + maxGapBytes) {
+      const existing = ranges[mergeEndIdx];
+      if (existing.start < mergedStart) {
+        mergedStart = existing.start;
+      }
+      if (existing.end > mergedEnd) {
+        mergedEnd = existing.end;
+      }
+      mergedWrites += existing.writeCount;
+      mergeEndIdx += 1;
+    }
+
+    const merged = {
+      start: mergedStart,
+      end: mergedEnd,
+      writeCount: mergedWrites,
+    };
+
+    if (mergeEndIdx === insertIdx) {
+      ranges.splice(insertIdx, 0, merged);
+    } else {
+      ranges.splice(insertIdx, mergeEndIdx - insertIdx, merged);
+    }
+  }
+
+  /**
+   * Pure helper: sort and coalesce an array of `{ start, end, writeCount? }` byte ranges,
+   * merging adjacent/overlapping intervals (and optionally bridging gaps <= `maxGapBytes`).
+   *
+   * @param {Array<{ start: number, end: number, writeCount?: number }>} inputRanges
+   * @param {number} [maxGapBytes=0]
+   * @returns {Array<{ start: number, end: number, byteLength: number, writeCount: number }>}
+   */
+  function coalesceDirtyRanges(inputRanges, maxGapBytes = 0) {
+    if (!Array.isArray(inputRanges)) {
+      throw new TypeError('coalesceDirtyRanges expects an array of { start, end } ranges');
+    }
+    assertNonNegativeInteger(maxGapBytes, 'maxGapBytes');
+    const merged = [];
+    for (let i = 0; i < inputRanges.length; i += 1) {
+      const r = inputRanges[i];
+      if (!r || typeof r !== 'object') {
+        throw new TypeError(`Dirty range at index ${i} must be an object`);
+      }
+      assertNonNegativeInteger(r.start, 'range.start');
+      assertNonNegativeInteger(r.end, 'range.end');
+      if (r.end < r.start) {
+        throw new RangeError(`Dirty range end (${r.end}) must be >= start (${r.start})`);
+      }
+      const writes = r.writeCount === undefined ? 1 : r.writeCount;
+      assertPositiveInteger(writes, 'range.writeCount');
+      insertDirtyRange(merged, r.start, r.end, writes, maxGapBytes);
+    }
+    return merged.map((r) => ({
+      start: r.start,
+      end: r.end,
+      byteLength: r.end - r.start,
+      writeCount: r.writeCount,
+    }));
+  }
+
+  /**
    * Multi-buffered WebGPU dynamic uniform buffer ring for per-draw D3D12 root constants / CBVs.
    *
    * Accumulates per-draw uniform payloads into an aligned CPU shadow buffer and uploads the
@@ -244,7 +354,13 @@
         maxRingBytes,
         multiSlice,
         preserveBuffersOnGrow,
+        allowWrap = false,
+        wrapOnOverflow = false,
+        immediateFlush = false,
+        maxCoalesceGapBytes = 0,
       } = options;
+
+      assertNonNegativeInteger(maxCoalesceGapBytes, 'maxCoalesceGapBytes');
 
       if (!device || typeof device.createBuffer !== 'function') {
         throw new TypeError('DynamicUniformRing requires a WebGPU device with createBuffer()');
@@ -399,21 +515,29 @@
       this.allowSpill = resolvedAllowSpill;
       this.maxRingBytes = resolvedMaxRingBytes;
       this.multiSlice = resolvedMultiSlice;
+      this.allowWrap = Boolean(allowWrap || wrapOnOverflow);
+      this.immediateFlush = Boolean(immediateFlush);
+      this.maxCoalesceGapBytes = maxCoalesceGapBytes;
 
       this._capacity = resolvedByteSize;
       this._shadow = new Uint8Array(resolvedByteSize);
+      this._dirtyRanges = [];
       this._slots = [];
       this._destroyed = false;
 
       this._frameIndex = -1;
       this._slotIndex = 0;
       this._cursor = 0;
+      this._writtenHighWater = 0;
+      this._framePrimaryBytes = 0;
       this._flushedCursor = 0;
       this._flushedDrawCount = 0;
+      this._hasFlushedActiveSlot = false;
       this._primaryFrameDrawCount = 0;
       this._frameSliceBytes = 0;
       this._activeSliceIndex = 0;
       this._frameOverflowBytes = 0;
+      this._batchDepth = 0;
       this._dirty = false;
 
       // Telemetry counters.
@@ -427,6 +551,9 @@
       this._totalBytesUploaded = 0;
       this._alignedBytesWasted = 0;
       this._flushCount = 0;
+      this._writeBufferCalls = 0;
+      this._coalescedWrites = 0;
+      this._stagedWritesFlushed = 0;
       this._growCount = 0;
       this._overflowAllocCount = 0;
       this._spillAllocations = 0;
@@ -470,7 +597,19 @@
     }
 
     get usedBytes() {
-      return this._frameSliceBytes + this._cursor + this._frameOverflowBytes;
+      return this._frameSliceBytes + this._framePrimaryBytes + this._frameOverflowBytes;
+    }
+
+    get cursor() {
+      return this._cursor;
+    }
+
+    get batchDepth() {
+      return this._batchDepth;
+    }
+
+    get isBatchActive() {
+      return this._batchDepth > 0;
     }
 
     get slotIndex() {
@@ -599,8 +738,9 @@
       }
 
       const nextShadow = new Uint8Array(nextCapacity);
-      if (this._cursor > 0) {
-        nextShadow.set(this._shadow.subarray(0, this._cursor), 0);
+      const copyLen = Math.max(this._cursor, this._writtenHighWater);
+      if (copyLen > 0) {
+        nextShadow.set(this._shadow.subarray(0, copyLen), 0);
       }
       this._shadow = nextShadow;
       this._capacity = nextCapacity;
@@ -610,13 +750,24 @@
       // If draws were already flushed into the active slot's previous buffer in this frame,
       // retain the old buffer until the slot rotates back in a later frame.
       const activeSlot = this._slots[this._slotIndex];
-      const deferOldDestroy = this._flushedCursor > 0;
+      const deferOldDestroy = this._flushedCursor > 0 || this._hasFlushedActiveSlot;
       this._resizeSlot(activeSlot, nextCapacity, deferOldDestroy);
 
       // The active slot now has a fresh GPUBuffer, so any prior partial flush in this frame
       // must be re-uploaded from offset 0 on the next flush().
+      this._dirtyRanges = [];
+      if (copyLen > 0) {
+        insertDirtyRange(
+          this._dirtyRanges,
+          0,
+          copyLen,
+          Math.max(1, this._primaryFrameDrawCount),
+          this.maxCoalesceGapBytes
+        );
+      }
       this._flushedCursor = 0;
       this._flushedDrawCount = 0;
+      this._hasFlushedActiveSlot = false;
       this._growCount += 1;
       this._overflowAllocCount += 1;
     }
@@ -660,7 +811,7 @@
     }
 
     _recordFramePeak() {
-      const totalUsed = this._frameSliceBytes + this._cursor + this._frameOverflowBytes;
+      const totalUsed = this._frameSliceBytes + this._framePrimaryBytes + this._frameOverflowBytes;
       if (totalUsed > this._peakUsedBytes) {
         this._peakUsedBytes = totalUsed;
       }
@@ -726,11 +877,12 @@
         nextSliceSize = maxAlignedRemaining;
       }
 
-      const sliceDirty = this._cursor > this._flushedCursor;
+      const sliceDirty = this._dirtyRanges.length > 0;
       slot.retiredSlices.push({
         buffer: slot.buffer,
         byteSize: slot.byteSize,
         shadow: sliceDirty ? this._shadow : null,
+        dirtyRanges: sliceDirty ? this._dirtyRanges : [],
         cursor: this._cursor,
         flushedCursor: this._flushedCursor,
         drawCount: this._primaryFrameDrawCount,
@@ -738,7 +890,7 @@
         dirty: sliceDirty,
       });
 
-      this._frameSliceBytes += this._cursor;
+      this._frameSliceBytes += this._framePrimaryBytes;
       this._activeSliceIndex += 1;
 
       const nextBuffer = this._createGpuUniformBuffer(
@@ -750,10 +902,14 @@
       slot.generation += 1;
 
       this._shadow = new Uint8Array(nextSliceSize);
+      this._dirtyRanges = [];
       this._cursor = 0;
+      this._writtenHighWater = 0;
+      this._framePrimaryBytes = 0;
       this._flushedCursor = 0;
       this._flushedDrawCount = 0;
       this._primaryFrameDrawCount = 0;
+      this._hasFlushedActiveSlot = false;
 
       // Raise steady-state per-slot capacity target so subsequent frames fit in a single buffer.
       const totalFrameCapacity = this._getSlotPrimaryAndRetiredBytes(slot);
@@ -808,6 +964,7 @@
           buffer,
           byteSize: chunkByteSize,
           shadow: new Uint8Array(chunkByteSize),
+          dirtyRanges: [],
           cursor: 0,
           flushedCursor: 0,
           drawCount: 0,
@@ -876,6 +1033,29 @@
       return bytes;
     }
 
+    _countPendingDirtyRanges() {
+      let count = this._dirtyRanges ? this._dirtyRanges.length : 0;
+      const slot =
+        !this._destroyed && this._slots.length > 0
+          ? this._slots[this._slotIndex]
+          : null;
+      if (slot) {
+        for (let i = 0; i < slot.retiredSlices.length; i += 1) {
+          const slice = slot.retiredSlices[i];
+          if (slice.dirty && slice.dirtyRanges) {
+            count += slice.dirtyRanges.length;
+          }
+        }
+        for (let i = 0; i < slot.overflowChunks.length; i += 1) {
+          const chunk = slot.overflowChunks[i];
+          if (chunk.dirty && chunk.dirtyRanges) {
+            count += chunk.dirtyRanges.length;
+          }
+        }
+      }
+      return count;
+    }
+
     /**
      * Pad a uniform slice byte length to a 4-byte multiple and at least
      * `this.minUniformBindingSize` (default 16B).
@@ -911,13 +1091,18 @@
       this._frameIndex = nextFrame;
       this._slotIndex = nextFrame % this.framesInFlight;
       this._cursor = 0;
+      this._writtenHighWater = 0;
+      this._framePrimaryBytes = 0;
       this._flushedCursor = 0;
       this._flushedDrawCount = 0;
+      this._hasFlushedActiveSlot = false;
       this._primaryFrameDrawCount = 0;
       this._frameSliceBytes = 0;
       this._activeSliceIndex = 0;
       this._frameOverflowBytes = 0;
       this._frameDrawCount = 0;
+      this._batchDepth = 0;
+      this._dirtyRanges = [];
       this._dirty = false;
 
       const slot = this._slots[this._slotIndex];
@@ -947,6 +1132,97 @@
     }
 
     /**
+     * Begin a coalesced write batch. Multiple `pushConstants()`, `pushCbv()`, or
+     * `writeStaged()` calls inside a batch accumulate in the CPU shadow staging slab and
+     * merge adjacent/overlapping dirty ranges so `endBatch()`, `flush()`, or `flushDirty()`
+     * emits the minimum number of `device.queue.writeBuffer()` calls.
+     *
+     * Supports nesting: nested `beginBatch()` / `endBatch()` pairs defer auto-flushing
+     * until the outermost batch completes.
+     *
+     * @returns {{ batchDepth: number, frameIndex: number, slotIndex: number, cursor: number }}
+     */
+    beginBatch() {
+      this._assertNotDestroyed();
+      if (this._frameIndex < 0) {
+        this._frameIndex = 0;
+        this._slots[this._slotIndex].used = true;
+      }
+      this._batchDepth += 1;
+      return {
+        batchDepth: this._batchDepth,
+        frameIndex: this._frameIndex,
+        slotIndex: this._slotIndex,
+        cursor: this._cursor,
+      };
+    }
+
+    /**
+     * End the current write batch. When the outermost batch completes (`batchDepth` returns
+     * to 0), flushes all coalesced dirty ranges in the CPU shadow staging slab unless
+     * `{ autoFlush: false }` is passed.
+     *
+     * @param {{ autoFlush?: boolean }} [options]
+     * @returns {{ uploadedBytes: number, bytesUploaded: number, drawCount: number, stagedWrites: number, writeBufferCalls: number, coalescedWrites: number, dirtyRangesFlushed: number, batchDepth: number }}
+     */
+    endBatch(options = {}) {
+      this._assertNotDestroyed();
+      if (this._batchDepth === 0) {
+        return {
+          uploadedBytes: 0,
+          bytesUploaded: 0,
+          drawCount: 0,
+          stagedWrites: 0,
+          writeBufferCalls: 0,
+          coalescedWrites: 0,
+          dirtyRangesFlushed: 0,
+          batchDepth: 0,
+        };
+      }
+      this._batchDepth -= 1;
+      const shouldFlush = !(options && options.autoFlush === false);
+      if (this._batchDepth === 0 && shouldFlush) {
+        const res = this._flushDirtyInternal();
+        return {
+          uploadedBytes: res.uploadedBytes,
+          bytesUploaded: res.bytesUploaded,
+          drawCount: res.drawCount,
+          stagedWrites: res.stagedWrites,
+          writeBufferCalls: res.writeBufferCalls,
+          coalescedWrites: res.coalescedWrites,
+          dirtyRangesFlushed: res.dirtyRangesFlushed,
+          batchDepth: 0,
+        };
+      }
+      return {
+        uploadedBytes: 0,
+        bytesUploaded: 0,
+        drawCount: 0,
+        stagedWrites: 0,
+        writeBufferCalls: 0,
+        coalescedWrites: 0,
+        dirtyRangesFlushed: 0,
+        batchDepth: this._batchDepth,
+      };
+    }
+
+    /**
+     * Return a defensive snapshot of currently pending coalesced dirty byte ranges in the
+     * active slot's CPU shadow staging slab.
+     *
+     * @returns {Array<{ start: number, end: number, byteLength: number, writeCount: number }>}
+     */
+    getDirtyRanges() {
+      this._assertNotDestroyed();
+      return this._dirtyRanges.map((r) => ({
+        start: r.start,
+        end: r.end,
+        byteLength: r.end - r.start,
+        writeCount: r.writeCount,
+      }));
+    }
+
+    /**
      * Append a per-draw constant payload into the CPU shadow ring aligned to `alignment`
      * (at least `device.limits.minUniformBufferOffsetAlignment`, default 256B).
      * Auto-grows capacity (doubling up to `maxByteSize`) when needed, and optionally
@@ -961,6 +1237,11 @@
 
       const allowEmpty =
         (pushOptions && pushOptions.allowEmpty === true) || this.allowEmptyPayloads;
+      const allowWrap =
+        (pushOptions && pushOptions.wrap === true) || this.allowWrap;
+      const deferImmediateFlush = Boolean(
+        pushOptions && pushOptions._deferImmediateFlush === true
+      );
 
       let src;
       if ((data === null || data === undefined) && allowEmpty) {
@@ -1018,6 +1299,7 @@
       let targetBuffer;
       let dynamicOffset;
       let isOverflow = false;
+      let wrapped = false;
       let allocationSliceIndex = this._activeSliceIndex;
       let wastedBytes = 0;
 
@@ -1027,17 +1309,64 @@
         if (alignedSize > size) {
           this._shadow.fill(0, primaryDynamicOffset + size, primaryEndOffset);
         }
+        insertDirtyRange(
+          this._dirtyRanges,
+          primaryDynamicOffset,
+          primaryEndOffset,
+          1,
+          this.maxCoalesceGapBytes
+        );
         this._cursor = primaryEndOffset;
+        if (primaryEndOffset > this._writtenHighWater) {
+          this._writtenHighWater = primaryEndOffset;
+        }
+        this._framePrimaryBytes += alignedSize;
         this._primaryFrameDrawCount += 1;
         targetBuffer = slot.buffer;
         dynamicOffset = primaryDynamicOffset;
+      } else if (allowWrap && alignedSize <= slot.byteSize) {
+        // Wrap cursor cleanly to offset 0 while preserving 256-byte alignment and
+        // retaining any unflushed tail dirty range for coalesced multi-range flush.
+        wastedBytes = (slot.byteSize - this._cursor) + (alignedSize - size);
+        this._shadow.set(uploadBytes, 0);
+        if (alignedSize > size) {
+          this._shadow.fill(0, size, alignedSize);
+        }
+        insertDirtyRange(
+          this._dirtyRanges,
+          0,
+          alignedSize,
+          1,
+          this.maxCoalesceGapBytes
+        );
+        this._cursor = alignedSize;
+        if (alignedSize > this._writtenHighWater) {
+          this._writtenHighWater = alignedSize;
+        }
+        this._framePrimaryBytes += alignedSize;
+        this._primaryFrameDrawCount += 1;
+        this._wrapCount += 1;
+        targetBuffer = slot.buffer;
+        dynamicOffset = 0;
+        wrapped = true;
       } else if (this.multiSlice && this._growMultiSlice(slot, alignedSize)) {
         wastedBytes = alignedSize - size;
         this._shadow.set(uploadBytes, 0);
         if (alignedSize > size) {
           this._shadow.fill(0, size, alignedSize);
         }
+        insertDirtyRange(
+          this._dirtyRanges,
+          0,
+          alignedSize,
+          1,
+          this.maxCoalesceGapBytes
+        );
         this._cursor = alignedSize;
+        if (alignedSize > this._writtenHighWater) {
+          this._writtenHighWater = alignedSize;
+        }
+        this._framePrimaryBytes += alignedSize;
         this._primaryFrameDrawCount += 1;
         targetBuffer = slot.buffer;
         dynamicOffset = 0;
@@ -1049,10 +1378,45 @@
         if (alignedSize > size) {
           this._shadow.fill(0, primaryDynamicOffset + size, primaryEndOffset);
         }
+        insertDirtyRange(
+          this._dirtyRanges,
+          primaryDynamicOffset,
+          primaryEndOffset,
+          1,
+          this.maxCoalesceGapBytes
+        );
         this._cursor = primaryEndOffset;
+        if (primaryEndOffset > this._writtenHighWater) {
+          this._writtenHighWater = primaryEndOffset;
+        }
+        this._framePrimaryBytes += alignedSize;
         this._primaryFrameDrawCount += 1;
         targetBuffer = slot.buffer;
         dynamicOffset = primaryDynamicOffset;
+      } else if (allowWrap && !this.multiSlice && alignedSize <= this.maxByteSize) {
+        wastedBytes = alignedSize - size;
+        this._grow(alignedSize);
+        this._shadow.set(uploadBytes, 0);
+        if (alignedSize > size) {
+          this._shadow.fill(0, size, alignedSize);
+        }
+        insertDirtyRange(
+          this._dirtyRanges,
+          0,
+          alignedSize,
+          1,
+          this.maxCoalesceGapBytes
+        );
+        this._cursor = alignedSize;
+        if (alignedSize > this._writtenHighWater) {
+          this._writtenHighWater = alignedSize;
+        }
+        this._framePrimaryBytes += alignedSize;
+        this._primaryFrameDrawCount += 1;
+        this._wrapCount += 1;
+        targetBuffer = slot.buffer;
+        dynamicOffset = 0;
+        wrapped = true;
       } else if (this.allowSpill || this.allowOverflow) {
         const overflowAlloc = this._allocateOverflowSlice(slot, alignedSize);
         const chunk = overflowAlloc.chunk;
@@ -1065,6 +1429,13 @@
         if (alignedSize > size) {
           chunk.shadow.fill(0, dynamicOffset + size, chunkEndOffset);
         }
+        insertDirtyRange(
+          chunk.dirtyRanges,
+          dynamicOffset,
+          chunkEndOffset,
+          1,
+          this.maxCoalesceGapBytes
+        );
         chunk.cursor = chunkEndOffset;
         chunk.drawCount += 1;
         chunk.dirty = true;
@@ -1098,6 +1469,10 @@
       this._alignedBytesWasted += wastedBytes;
       this._recordFramePeak();
 
+      if (this.immediateFlush && this._batchDepth === 0 && !deferImmediateFlush) {
+        this._flushDirtyInternal();
+      }
+
       return {
         buffer: targetBuffer,
         offset: dynamicOffset,
@@ -1107,7 +1482,164 @@
         alignedSize,
         overflow: isOverflow,
         isSpill: isOverflow,
+        wrapped,
         sliceIndex: allocationSliceIndex,
+      };
+    }
+
+    /**
+     * Stage uniform constant bytes into the CPU shadow slab and record their dirty byte
+     * range for coalesced upload on `flush()` / `flushDirty()` / `endBatch()`.
+     *
+     * Supports two call forms:
+     * 1. `writeStaged(data, options?)` — allocates the next `alignment`-aligned (default 256B)
+     *    slice in the ring (wrapping to offset 0 when `allowWrap` or `options.wrap` is true).
+     * 2. `writeStaged(offset, data, options?)` — writes directly at an explicit
+     *    `alignment`-aligned (or 4B-aligned when `options.allowSubAlignment` is true) byte
+     *    offset in the active slot's CPU shadow slab.
+     *
+     * Unlike `pushConstants()` under `immediateFlush: true`, `writeStaged()` never auto-flushes
+     * before `flushDirty()` / `flush()` / `endBatch()`.
+     *
+     * @param {number | ArrayBufferView | ArrayBuffer | SharedArrayBuffer | null | undefined} offsetOrData
+     * @param {ArrayBufferView | ArrayBuffer | SharedArrayBuffer | object | null | undefined} [dataOrOptions]
+     * @param {{ allowEmpty?: boolean, wrap?: boolean, allowSubAlignment?: boolean }} [maybeOptions]
+     */
+    writeStaged(offsetOrData, dataOrOptions, maybeOptions) {
+      this._assertNotDestroyed();
+
+      if (typeof offsetOrData !== 'number') {
+        const pushOpts =
+          dataOrOptions && typeof dataOrOptions === 'object'
+            ? Object.assign({}, dataOrOptions, { _deferImmediateFlush: true })
+            : { _deferImmediateFlush: true };
+        const alloc = this.pushConstants(offsetOrData, pushOpts);
+        alloc.staged = true;
+        return alloc;
+      }
+
+      const offset = offsetOrData;
+      const data = dataOrOptions;
+      const options = maybeOptions && typeof maybeOptions === 'object' ? maybeOptions : {};
+      assertNonNegativeInteger(offset, 'offset');
+
+      const allowSubAlignment = options.allowSubAlignment === true;
+      const requiredOffsetAlign = allowSubAlignment
+        ? WEBGPU_BUFFER_COPY_ALIGNMENT
+        : this.alignment;
+      if (offset % requiredOffsetAlign !== 0) {
+        throw new RangeError(
+          `writeStaged offset (${offset}) must be aligned to ${requiredOffsetAlign} bytes`
+        );
+      }
+
+      const allowEmpty =
+        options.allowEmpty === true || this.allowEmptyPayloads;
+
+      let src;
+      if ((data === null || data === undefined) && allowEmpty) {
+        src = new Uint8Array(0);
+      } else {
+        src = toUint8Array(data, 'writeStaged');
+      }
+
+      const size = src.byteLength;
+      if (size === 0 && !allowEmpty) {
+        throw new RangeError('writeStaged data must not be empty (got 0 bytes)');
+      }
+      if (size > this.maxBindingSize) {
+        throw new RangeError(
+          `writeStaged size (${size} bytes) exceeds maxBindingSize (${this.maxBindingSize} bytes)`
+        );
+      }
+
+      const paddedSize = Math.max(
+        this.minUniformBindingSize,
+        alignUp(size, WEBGPU_BUFFER_COPY_ALIGNMENT)
+      );
+      if (paddedSize > this.maxBindingSize) {
+        throw new RangeError(
+          `writeStaged padded size (${paddedSize} bytes) exceeds maxBindingSize (${this.maxBindingSize} bytes)`
+        );
+      }
+
+      const alignedSize = alignUp(paddedSize, this.alignment);
+      const writeSpan = allowSubAlignment ? paddedSize : alignedSize;
+
+      if (this._frameIndex < 0) {
+        this._frameIndex = 0;
+        this._slots[this._slotIndex].used = true;
+      }
+
+      const slot = this._slots[this._slotIndex];
+      const endOffset = offset + writeSpan;
+      if (endOffset > slot.byteSize) {
+        throw new RangeError(
+          `writeStaged range [${offset}, ${endOffset}) exceeds active slot capacity (${slot.byteSize} bytes)`
+        );
+      }
+
+      const fromSab = size > 0 && isSharedArrayBuffer(src.buffer);
+      const isUnalignedInput =
+        size > 0 &&
+        (src.byteOffset % WEBGPU_BUFFER_COPY_ALIGNMENT !== 0 ||
+          size % WEBGPU_BUFFER_COPY_ALIGNMENT !== 0);
+
+      let uploadBytes = src;
+      if (fromSab) {
+        const snapshot = new Uint8Array(size);
+        snapshot.set(src, 0);
+        uploadBytes = snapshot;
+      }
+
+      this._shadow.set(uploadBytes, offset);
+      if (writeSpan > size) {
+        this._shadow.fill(0, offset + size, endOffset);
+      }
+
+      insertDirtyRange(
+        this._dirtyRanges,
+        offset,
+        endOffset,
+        1,
+        this.maxCoalesceGapBytes
+      );
+
+      if (endOffset > this._cursor) {
+        this._cursor = endOffset;
+      }
+      if (endOffset > this._writtenHighWater) {
+        this._writtenHighWater = endOffset;
+      }
+      this._framePrimaryBytes += writeSpan;
+      this._primaryFrameDrawCount += 1;
+
+      if (fromSab) {
+        this._sabCopyCount += 1;
+      }
+      if (isUnalignedInput) {
+        this._unalignedCopyCount += 1;
+      }
+
+      this._dirty = true;
+      this._frameDrawCount += 1;
+      this._totalDrawCount += 1;
+      this._totalBytesPushed += size;
+      this._alignedBytesWasted += writeSpan - size;
+      this._recordFramePeak();
+
+      return {
+        buffer: slot.buffer,
+        offset,
+        dynamicOffset: offset,
+        size,
+        paddedSize,
+        alignedSize,
+        overflow: false,
+        isSpill: false,
+        wrapped: false,
+        staged: true,
+        sliceIndex: this._activeSliceIndex,
       };
     }
 
@@ -1123,37 +1655,38 @@
       return this.pushConstants(data, { allowEmpty: true });
     }
 
-    /**
-     * Upload the dirty CPU shadow prefix for the current frame (plus any dirty per-frame
-     * overflow buffers) to GPU memory using regular `ArrayBuffer`-backed, 4-byte-aligned
-     * `device.queue.writeBuffer(...)` calls.
-     *
-     * @returns {{ uploadedBytes: number, drawCount: number }}
-     */
-    flush() {
+    _flushDirtyInternal() {
       this._assertNotDestroyed();
 
       const slot = this._slots[this._slotIndex];
       let hasRetiredSlicesDirty = false;
       for (let i = 0; i < slot.retiredSlices.length; i += 1) {
         const slice = slot.retiredSlices[i];
-        if (slice.dirty && slice.cursor > slice.flushedCursor) {
+        if (slice.dirty && slice.dirtyRanges && slice.dirtyRanges.length > 0) {
           hasRetiredSlicesDirty = true;
           break;
         }
       }
-      const hasPrimaryDirty = this._cursor > this._flushedCursor;
+      const hasPrimaryDirty = this._dirtyRanges.length > 0;
       let hasOverflowDirty = false;
       for (let i = 0; i < slot.overflowChunks.length; i += 1) {
         const chunk = slot.overflowChunks[i];
-        if (chunk.dirty && chunk.cursor > chunk.flushedCursor) {
+        if (chunk.dirty && chunk.dirtyRanges && chunk.dirtyRanges.length > 0) {
           hasOverflowDirty = true;
           break;
         }
       }
 
       if (!this._dirty || (!hasRetiredSlicesDirty && !hasPrimaryDirty && !hasOverflowDirty)) {
-        return { uploadedBytes: 0, drawCount: 0 };
+        return {
+          uploadedBytes: 0,
+          bytesUploaded: 0,
+          drawCount: 0,
+          stagedWrites: 0,
+          writeBufferCalls: 0,
+          coalescedWrites: 0,
+          dirtyRangesFlushed: 0,
+        };
       }
 
       if (!this.device.queue || typeof this.device.queue.writeBuffer !== 'function') {
@@ -1163,67 +1696,122 @@
       }
 
       let uploadedBytes = 0;
-      let drawCount = 0;
+      let stagedWrites = 0;
+      let writeBufferCalls = 0;
+      let coalescedWrites = 0;
 
       for (let i = 0; i < slot.retiredSlices.length; i += 1) {
         const slice = slot.retiredSlices[i];
-        if (!slice.dirty || slice.cursor <= slice.flushedCursor) {
+        if (!slice.dirty || !slice.dirtyRanges || slice.dirtyRanges.length === 0) {
           continue;
         }
-        const startOffset = slice.flushedCursor;
-        const sliceBytes = slice.cursor - startOffset;
-        const sliceDraws = slice.drawCount - slice.flushedDrawCount;
-        const sliceView = slice.shadow.subarray(startOffset, slice.cursor);
+        for (let rIdx = 0; rIdx < slice.dirtyRanges.length; rIdx += 1) {
+          const range = slice.dirtyRanges[rIdx];
+          const rangeBytes = range.end - range.start;
+          const sliceView = slice.shadow.subarray(range.start, range.end);
 
-        this._safeWriteBuffer(slice.buffer, startOffset, sliceView);
+          this._safeWriteBuffer(slice.buffer, range.start, sliceView);
 
+          writeBufferCalls += 1;
+          stagedWrites += range.writeCount;
+          coalescedWrites += Math.max(0, range.writeCount - 1);
+          uploadedBytes += rangeBytes;
+        }
+        slice.dirtyRanges.length = 0;
         slice.flushedCursor = slice.cursor;
         slice.flushedDrawCount = slice.drawCount;
         slice.dirty = false;
         slice.shadow = null;
-        uploadedBytes += sliceBytes;
-        drawCount += sliceDraws;
       }
 
       if (hasPrimaryDirty) {
-        const startOffset = this._flushedCursor;
-        const primaryBytes = this._cursor - startOffset;
-        const primaryDrawTotal = this._primaryFrameDrawCount;
-        const primaryDraws = primaryDrawTotal - this._flushedDrawCount;
-        const shadowSlice = this._shadow.subarray(startOffset, this._cursor);
+        for (let rIdx = 0; rIdx < this._dirtyRanges.length; rIdx += 1) {
+          const range = this._dirtyRanges[rIdx];
+          const rangeBytes = range.end - range.start;
+          const shadowSlice = this._shadow.subarray(range.start, range.end);
 
-        this._safeWriteBuffer(slot.buffer, startOffset, shadowSlice);
+          this._safeWriteBuffer(slot.buffer, range.start, shadowSlice);
 
+          writeBufferCalls += 1;
+          stagedWrites += range.writeCount;
+          coalescedWrites += Math.max(0, range.writeCount - 1);
+          uploadedBytes += rangeBytes;
+        }
+        this._dirtyRanges.length = 0;
         this._flushedCursor = this._cursor;
-        this._flushedDrawCount = primaryDrawTotal;
-        uploadedBytes += primaryBytes;
-        drawCount += primaryDraws;
+        this._flushedDrawCount = this._primaryFrameDrawCount;
+        this._hasFlushedActiveSlot = true;
       }
 
       for (let i = 0; i < slot.overflowChunks.length; i += 1) {
         const chunk = slot.overflowChunks[i];
-        if (!chunk.dirty || chunk.cursor <= chunk.flushedCursor) {
+        if (!chunk.dirty || !chunk.dirtyRanges || chunk.dirtyRanges.length === 0) {
           continue;
         }
-        const startOffset = chunk.flushedCursor;
-        const chunkBytes = chunk.cursor - startOffset;
-        const chunkDraws = chunk.drawCount - chunk.flushedDrawCount;
-        const chunkSlice = chunk.shadow.subarray(startOffset, chunk.cursor);
+        for (let rIdx = 0; rIdx < chunk.dirtyRanges.length; rIdx += 1) {
+          const range = chunk.dirtyRanges[rIdx];
+          const rangeBytes = range.end - range.start;
+          const chunkSlice = chunk.shadow.subarray(range.start, range.end);
 
-        this._safeWriteBuffer(chunk.buffer, startOffset, chunkSlice);
+          this._safeWriteBuffer(chunk.buffer, range.start, chunkSlice);
 
+          writeBufferCalls += 1;
+          stagedWrites += range.writeCount;
+          coalescedWrites += Math.max(0, range.writeCount - 1);
+          uploadedBytes += rangeBytes;
+        }
+        chunk.dirtyRanges.length = 0;
         chunk.flushedCursor = chunk.cursor;
         chunk.flushedDrawCount = chunk.drawCount;
         chunk.dirty = false;
-        uploadedBytes += chunkBytes;
-        drawCount += chunkDraws;
       }
 
       this._dirty = false;
       this._flushCount += 1;
       this._totalBytesUploaded += uploadedBytes;
+      this._writeBufferCalls += writeBufferCalls;
+      this._coalescedWrites += coalescedWrites;
+      this._stagedWritesFlushed += stagedWrites;
 
-      return { uploadedBytes, drawCount };
+      return {
+        uploadedBytes,
+        bytesUploaded: uploadedBytes,
+        drawCount: stagedWrites,
+        stagedWrites,
+        writeBufferCalls,
+        coalescedWrites,
+        dirtyRangesFlushed: writeBufferCalls,
+      };
+    }
+
+    /**
+     * Upload all coalesced dirty ranges in the CPU shadow staging slab (plus any dirty
+     * retired slices or per-frame overflow buffers) to GPU memory using the minimum number
+     * of regular `ArrayBuffer`-backed, 4-byte-aligned `device.queue.writeBuffer(...)` calls,
+     * returning full coalescing telemetry for this flush.
+     *
+     * @returns {{ uploadedBytes: number, bytesUploaded: number, drawCount: number, stagedWrites: number, writeBufferCalls: number, coalescedWrites: number, dirtyRangesFlushed: number }}
+     */
+    flushDirty() {
+      return this._flushDirtyInternal();
+    }
+
+    /**
+     * Upload all coalesced dirty CPU shadow ranges for the current frame (plus any dirty
+     * retired slices or per-frame overflow buffers) to GPU memory using regular
+     * `ArrayBuffer`-backed, 4-byte-aligned `device.queue.writeBuffer(...)` calls.
+     *
+     * Preserves the legacy `{ uploadedBytes, drawCount }` return contract for existing
+     * callers; call `flushDirty()` or `getStats()` for full coalescing stats.
+     *
+     * @returns {{ uploadedBytes: number, drawCount: number }}
+     */
+    flush() {
+      const res = this._flushDirtyInternal();
+      return {
+        uploadedBytes: res.uploadedBytes,
+        drawCount: res.drawCount,
+      };
     }
 
     /**
@@ -1271,7 +1859,7 @@
       if (activeSlot && activeSlot.overflowChunks) {
         for (let i = 0; i < activeSlot.overflowChunks.length; i += 1) {
           const chunk = activeSlot.overflowChunks[i];
-          if (chunk.dirty && chunk.cursor > chunk.flushedCursor) {
+          if (chunk.dirty && chunk.dirtyRanges && chunk.dirtyRanges.length > 0) {
             activeHasDirtySpill = true;
             break;
           }
@@ -1281,14 +1869,14 @@
       if (activeSlot && activeSlot.retiredSlices) {
         for (let i = 0; i < activeSlot.retiredSlices.length; i += 1) {
           const slice = activeSlot.retiredSlices[i];
-          if (slice.dirty && slice.cursor > slice.flushedCursor) {
+          if (slice.dirty && slice.dirtyRanges && slice.dirtyRanges.length > 0) {
             activeHasDirtyRetiredSlice = true;
             break;
           }
         }
       }
       if (
-        this._cursor <= this._flushedCursor &&
+        this._dirtyRanges.length === 0 &&
         !activeHasDirtySpill &&
         !activeHasDirtyRetiredSlice
       ) {
@@ -1310,7 +1898,7 @@
       this._assertNotDestroyed();
       this._recordFramePeak();
 
-      const frameBytes = this._frameSliceBytes + this._cursor + this._frameOverflowBytes;
+      const frameBytes = this._frameSliceBytes + this._framePrimaryBytes + this._frameOverflowBytes;
       const shouldReclaim =
         !(options && (options.deferReclaim === true || options.reclaimSpillPages === false));
 
@@ -1347,13 +1935,18 @@
       }
 
       this._cursor = 0;
+      this._writtenHighWater = 0;
+      this._framePrimaryBytes = 0;
       this._flushedCursor = 0;
       this._flushedDrawCount = 0;
+      this._hasFlushedActiveSlot = false;
       this._primaryFrameDrawCount = 0;
       this._frameSliceBytes = 0;
       this._activeSliceIndex = 0;
       this._frameOverflowBytes = 0;
       this._frameDrawCount = 0;
+      this._batchDepth = 0;
+      this._dirtyRanges = [];
       this._dirty = false;
 
       return { reclaimedPages, reclaimedBytes };
@@ -1514,7 +2107,10 @@
         allowOverflow: this.allowOverflow,
         allowSpill: this.allowSpill,
         multiSlice: this.multiSlice,
-        usedBytes: this._frameSliceBytes + this._cursor + this._frameOverflowBytes,
+        allowWrap: this.allowWrap,
+        immediateFlush: this.immediateFlush,
+        maxCoalesceGapBytes: this.maxCoalesceGapBytes,
+        usedBytes: this._frameSliceBytes + this._framePrimaryBytes + this._frameOverflowBytes,
         peakUsedBytes: this._peakUsedBytes,
         peakFrameBytes: this._peakFrameBytes,
         peakUtilizationRatio: this._capacity > 0 ? this._peakFrameBytes / this._capacity : 0,
@@ -1525,8 +2121,15 @@
         totalAllocations: this._totalDrawCount,
         totalBytesPushed: this._totalBytesPushed,
         totalBytesUploaded: this._totalBytesUploaded,
+        bytesUploaded: this._totalBytesUploaded,
         alignedBytesWasted: this._alignedBytesWasted,
         flushCount: this._flushCount,
+        writeBufferCalls: this._writeBufferCalls,
+        coalescedWrites: this._coalescedWrites,
+        stagedWritesFlushed: this._stagedWritesFlushed,
+        dirtyRangeCount: this._destroyed ? 0 : this._countPendingDirtyRanges(),
+        batchDepth: this._batchDepth,
+        batchActive: this._batchDepth > 0,
         growCount: this._growCount,
         growthCount: this._growCount,
         overflowAllocCount: this._overflowAllocCount,
@@ -1561,15 +2164,20 @@
 
       this._slots = [];
       this._shadow = null;
+      this._dirtyRanges = [];
       this._allocatedGpuBytes = 0;
       this._cursor = 0;
+      this._writtenHighWater = 0;
+      this._framePrimaryBytes = 0;
       this._flushedCursor = 0;
       this._flushedDrawCount = 0;
+      this._hasFlushedActiveSlot = false;
       this._primaryFrameDrawCount = 0;
       this._frameSliceBytes = 0;
       this._activeSliceIndex = 0;
       this._frameOverflowBytes = 0;
       this._frameDrawCount = 0;
+      this._batchDepth = 0;
       this._dirty = false;
     }
   }
@@ -1587,6 +2195,7 @@
     alignUp,
     alignUniformSliceSize,
     copyForWriteBuffer,
+    coalesceDirtyRanges,
     DynamicUniformRing,
   });
 
