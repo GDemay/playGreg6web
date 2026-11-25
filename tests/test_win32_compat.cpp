@@ -915,6 +915,40 @@ void test_debug_and_lifecycle() {
     pg6_win32_unregister_app_constrained_change_notification(0x1);
     CHECK(app_notification_registration_count() == base + 1);
 
+    // PLM order: suspend runs constrained (TRUE) before app-state (quiesced TRUE); resume runs
+    // app-state (FALSE) before constrained (FALSE). Unregister with the wrong kind is a no-op.
+    {
+        uint64_t s1 = 0, c1 = 0, s2 = 0;
+        CHECK(pg6_win32_register_app_state_change_notification(0x5100, 11, &s1) == ERROR_SUCCESS);
+        CHECK(pg6_win32_register_app_constrained_change_notification(0x5200, 12, &c1) == ERROR_SUCCESS);
+        CHECK(pg6_win32_register_app_state_change_notification(0x5300, 13, &s2) == ERROR_SUCCESS);
+        pg6_win32_unregister_app_constrained_change_notification(s1);  // wrong kind: kept
+        CHECK(app_notification_registration_count(AppNotificationKind::State) >= 2);
+        std::vector<AppNotification> calls;
+        const auto record = [](const AppNotification& n, void* user) {
+            if (n.routine >= 0x5100 && n.routine <= 0x5300) {
+                static_cast<std::vector<AppNotification>*>(user)->push_back(n);
+            }
+        };
+        dispatch_app_suspend(record, &calls);
+        CHECK(calls.size() == 3);
+        CHECK(calls[0].routine == 0x5200 && calls[0].kind == AppNotificationKind::Constrained && calls[0].flag == 1 &&
+              calls[0].context == 12);
+        CHECK(calls[1].routine == 0x5100 && calls[1].flag == 1 && calls[1].context == 11);
+        CHECK(calls[2].routine == 0x5300 && calls[2].flag == 1);
+        calls.clear();
+        dispatch_app_resume(record, &calls);
+        CHECK(calls.size() == 3);
+        CHECK(calls[0].routine == 0x5100 && calls[0].kind == AppNotificationKind::State && calls[0].flag == 0);
+        CHECK(calls[1].routine == 0x5300 && calls[1].flag == 0);
+        CHECK(calls[2].routine == 0x5200 && calls[2].flag == 0);
+        CHECK(dispatch_app_suspend(nullptr, nullptr) == 0);
+        pg6_win32_unregister_app_state_change_notification(s1);
+        pg6_win32_unregister_app_state_change_notification(s2);
+        pg6_win32_unregister_app_constrained_change_notification(c1);
+        CHECK(app_notification_registration_count() == base + 1);
+    }
+
     // WER, named pipes.
     CHECK(pg6_win32_wer_register_file(u"C:\\x.log", 2, 0) == 0);
     CHECK(pg6_win32_wer_register_file(nullptr, 2, 0) == E_INVALIDARG);

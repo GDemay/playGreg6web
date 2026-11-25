@@ -20,6 +20,7 @@
 #include "guest/guest_callbacks.h"
 #include "guest/guest_runtime.h"
 #include "os/os_shim.h"
+#include "os/win32_compat.h"
 #include "os/win32_kernel.h"
 #include "os/win32_loader.h"
 #include "os/xasync_provider.h"
@@ -74,7 +75,8 @@
 //   {e349bd1a-...}/{1861cf2e-...} XSystem: s3 GetConsoleId(3) h, s4 GetXboxLiveSandboxId(3) h
 //     (the configured console sandbox; none: E_NOTIMPL), s5 GetAppSpecificDeviceId stub. XSystemGetDeviceType /
 //     GetAnalyticsInfo are never called.
-//   {973a344e-...}/{2549f142-...} XGame: s3 XGameGetXboxTitleId(1) h (s4 XLaunchNewGame stub).
+//   {973a344e-...}/{2549f142-...} XGame: s3 XGameGetXboxTitleId(1) h, s4 XLaunchNewGame(3) h (self: relaunch
+//     via kRelaunchSelfExitCode; another title: E_NOTIMPL).
 //   {0dd112ac-...}/{b09d803c-...} XStore: s3 CreateContext h, s4 CloseContextHandle h; the
 //     other 40 used slots stay stubs (O8 offline policy: nothing about licences is invented).
 //   {0dd112ac-...}/{2d42fea5-...} XStore extension: s71 AcquireLicenseForDurablesAsync, s72
@@ -892,6 +894,27 @@ public:
             return E_INVALIDARG_HR;
         }
         title_id.write(g_title_id.load(std::memory_order_relaxed));
+        return S_OK_HR;
+    }
+
+    // XLaunchNewGame(exePath, args, defaultUser). The running title relaunching itself is a restart,
+    // not a store or licence call: the guest stops with kRelaunchSelfExitCode through the
+    // TerminateProcess path and the harness / browser boot start it again with the same arguments.
+    // Like the real call it does not return on success (only without an exit handler, i.e. tests).
+    // Launching another title stays E_NOTIMPL.
+    int32_t LaunchNewGame(const char* exe_path, const char* args, uint64_t /*default_user*/) {
+        if (exe_path == nullptr || exe_path[0] == '\0') {
+            return E_INVALIDARG_HR;
+        }
+        const char* command_line = pg6_win32_get_command_line_a();
+        if (!is_self_launch_target(exe_path, command_line != nullptr ? command_line : "")) {
+            os::log(std::string("xgameruntime: XLaunchNewGame(\"") + exe_path +
+                    "\"): another title; returning E_NOTIMPL");
+            return com::E_NOTIMPL_HR;
+        }
+        os::log(std::string("xgameruntime: XLaunchNewGame(\"") + exe_path + "\", args \"" +
+                (args != nullptr ? args : "") + "\"): relaunch of the running title requested");
+        pg6_win32_terminate_process(win32::kCurrentProcessPseudoHandle, win32::kRelaunchSelfExitCode);
         return S_OK_HR;
     }
 };
@@ -2084,7 +2107,7 @@ constexpr auto kISystem =
 using GA = M<GameApi>;
 constexpr com::MethodDesc kGameMethods[] = {
     GA::method<&GameApi::GetXboxTitleId>("XGameGetXboxTitleId"),
-    GA::stub("XLaunchNewGame"),
+    GA::method<&GameApi::LaunchNewGame>("XLaunchNewGame"),
 };
 constexpr auto kIGame =
     com::declare_interface<GameApi>("xgameruntime.XGame", kGameIid, kGameMethods, {.slot_count = 16});
@@ -2412,6 +2435,47 @@ std::vector<ApiRequest> api_requests() {
         out.push_back(ApiRequest{key.first, key.second, value.first, value.second});
     }
     return out;
+}
+
+namespace {
+std::string_view exe_basename(std::string_view path) {
+    while (!path.empty() && (path.back() == ' ' || path.back() == '\t')) {
+        path.remove_suffix(1);
+    }
+    const size_t slash = path.find_last_of("\\/");
+    return slash == std::string_view::npos ? path : path.substr(slash + 1);
+}
+
+bool iequals_ascii(std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.size(); ++i) {
+        const auto lower = [](char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c + 32) : c; };
+        if (lower(a[i]) != lower(b[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+}  // namespace
+
+bool is_self_launch_target(std::string_view exe_path, std::string_view command_line) {
+    size_t start = command_line.find_first_not_of(" \t");
+    if (start == std::string_view::npos) {
+        return false;
+    }
+    std::string_view first;
+    if (command_line[start] == '"') {
+        const size_t end = command_line.find('"', start + 1);
+        first = command_line.substr(start + 1, end == std::string_view::npos ? std::string_view::npos : end - start - 1);
+    } else {
+        const size_t end = command_line.find_first_of(" \t", start);
+        first = command_line.substr(start, end == std::string_view::npos ? std::string_view::npos : end - start);
+    }
+    const std::string_view self = exe_basename(first);
+    const std::string_view target = exe_basename(exe_path);
+    return !self.empty() && iequals_ascii(self, target);
 }
 
 void set_xbox_title_id(uint32_t title_id) {

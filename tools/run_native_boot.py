@@ -632,6 +632,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
+# kRelaunchSelfExitCode (runtime/os/win32_compat.h, ASCII "RELN"): the title called XLaunchNewGame on
+# itself. The guest stopped; the harness starts it again with the same command line.
+RELAUNCH_SELF_EXIT_CODE = 0x52454C4E
+MAX_RELAUNCHES = 3
+
+
+def is_relaunch_request(report: dict | None) -> bool:
+    return bool(report) and report.get("exit_code") == RELAUNCH_SELF_EXIT_CODE
+
+
+def run_with_relaunch(cmd: list[str], repo: Path, run_dir: Path, runner: Runner,
+                      timeout: float) -> tuple[int, dict | None, int]:
+    """Runs the harness; when the title relaunched itself, archives that launch's report and log as
+    boot-report.launchN.json / boot.launchN.log and runs it again (at most MAX_RELAUNCHES times)."""
+    relaunches = 0
+    while True:
+        code = runner(cmd, repo, run_dir / "boot.log", timeout)
+        report = load_report(run_dir / "boot-report.json")
+        if not is_relaunch_request(report) or relaunches >= MAX_RELAUNCHES:
+            return code, report, relaunches
+        relaunches += 1
+        for name, archived in (("boot-report.json", f"boot-report.launch{relaunches}.json"),
+                               ("boot.log", f"boot.launch{relaunches}.log"),
+                               ("summary.txt", f"summary.launch{relaunches}.txt")):
+            if (run_dir / name).is_file():
+                (run_dir / name).replace(run_dir / archived)
+        print(f"[run] the title relaunched itself (XLaunchNewGame); relaunch {relaunches} of at most "
+              f"{MAX_RELAUNCHES} with the same arguments", file=sys.stderr, flush=True)
+
+
 def main(argv: Sequence[str] | None = None, runner: Runner = run_command,
          env: Mapping[str, str] | None = None, repo_root: Path = REPO_ROOT) -> int:
     env = os.environ if env is None else env
@@ -744,10 +774,10 @@ def _run(args, extra: list[str], runner: Runner, env: Mapping[str, str], repo: P
     if preset["input"] and not args.input_script:
         script_path.write_text(input_script_text(max_ms, preset["input"]), encoding="utf-8")
     print(f"[run] {run_dir}", file=sys.stderr, flush=True)
-    code = runner(cmd, repo, run_dir / "boot.log", watchdog_ms / 1000 + 60)
-    report = load_report(run_dir / "boot-report.json")
+    code, report, relaunches = run_with_relaunch(cmd, repo, run_dir, runner, watchdog_ms / 1000 + 60)
     (run_dir / "command.json").write_text(json.dumps({
-        "preset": args.preset, "command": cmd, "plan": plan.steps, "harness_exit": code}, indent=2), encoding="utf-8")
+        "preset": args.preset, "command": cmd, "plan": plan.steps, "harness_exit": code,
+        "relaunches": relaunches}, indent=2), encoding="utf-8")
     if report is None:
         print(f"error: the harness (exit {code}) wrote no report; see {run_dir / 'boot.log'}", file=sys.stderr)
         return 3

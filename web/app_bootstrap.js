@@ -25,6 +25,48 @@ import {
 import { CrashReporter, sanitizeString } from './telemetry/crash_report.js';
 import { BootTracer, FAST_BOOT_MILESTONES, sanitizeGpuAdapter } from './telemetry/boot_tracer.js';
 
+export const GUEST_RELAUNCH_MESSAGE_TYPE = 'guest-relaunch';
+export const MAX_GUEST_RELAUNCHES = 3;
+const GUEST_RELAUNCH_COUNT_KEY = 'pg6.guestRelaunchCount';
+
+/** Clears the self-relaunch counter (called once a boot presents its first frame). */
+export function resetGuestRelaunchCount(windowObj) {
+  try {
+    if (windowObj && windowObj.sessionStorage) {
+      windowObj.sessionStorage.removeItem(GUEST_RELAUNCH_COUNT_KEY);
+    }
+  } catch {
+    // Ignore storage failures.
+  }
+}
+
+/**
+ * Counts a guest self-relaunch in sessionStorage and says whether another one is allowed
+ * (at most MAX_GUEST_RELAUNCHES per tab session, so a relaunch loop cannot spin forever).
+ * Without storage the relaunch is allowed.
+ */
+export function shouldRelaunchGuest(windowObj, max = MAX_GUEST_RELAUNCHES) {
+  let storage = null;
+  try {
+    storage = windowObj && windowObj.sessionStorage ? windowObj.sessionStorage : null;
+  } catch {
+    storage = null;
+  }
+  if (!storage) {
+    return true;
+  }
+  try {
+    const count = Number.parseInt(storage.getItem(GUEST_RELAUNCH_COUNT_KEY) || '0', 10) || 0;
+    if (count >= max) {
+      return false;
+    }
+    storage.setItem(GUEST_RELAUNCH_COUNT_KEY, String(count + 1));
+  } catch {
+    // Storage failures never block the relaunch.
+  }
+  return true;
+}
+
 export const DEFAULT_LOADER_URL = new URL('./loader.js', import.meta.url).href;
 export const DEFAULT_SHADER_PACK_URL = '/shaders/fallback.wgsl.pack';
 export const DEFAULT_DUMP_ENDPOINT = '/__pg6_dump/';
@@ -4797,6 +4839,20 @@ export function bootstrapPlayGta6App(options = {}) {
     if (!data || typeof data !== 'object') {
       return false;
     }
+    if (data.type === GUEST_RELAUNCH_MESSAGE_TYPE) {
+      // XLaunchNewGame of the running title: reload the page, i.e. boot again with the same URL.
+      if (shouldRelaunchGuest(windowObj)) {
+        feedBootLog('The title relaunched itself (XLaunchNewGame); restarting the boot.');
+        try {
+          windowObj.location.reload();
+        } catch {
+          // A page without a reloadable location keeps the stopped boot.
+        }
+      } else {
+        feedBootLog('ERROR: the title kept relaunching itself; not restarting again.');
+      }
+      return true;
+    }
     if (data.type === 'gpu-telemetry') {
       return handleGpuTelemetryMessage(data);
     }
@@ -5269,6 +5325,8 @@ export function bootstrapPlayGta6App(options = {}) {
     if (firstPresentNotified) {
       return { ok: true, alreadyPresented: true };
     }
+    // The boot made it to a frame: a later self-relaunch starts a fresh relaunch budget.
+    resetGuestRelaunchCount(windowObj);
     firstPresentNotified = true;
     notifyAudioRingGuestMilestone('first_present');
     if (bootOrchestrator && typeof bootOrchestrator.notifyFirstPresent === 'function') {

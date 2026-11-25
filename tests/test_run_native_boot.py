@@ -261,6 +261,50 @@ class StalenessTests(unittest.TestCase):
             self.assertIn("program failed", err)
 
 
+class RelaunchTests(unittest.TestCase):
+    def fake_runner(self, run_dir: Path, exit_codes: list[int]):
+        calls = []
+
+        def runner(cmd, cwd, log, timeout):
+            calls.append(list(cmd))
+            code = exit_codes[min(len(calls) - 1, len(exit_codes) - 1)]
+            (run_dir / "boot-report.json").write_text(json.dumps({"status": "exited", "exit_code": code}))
+            log.write_text(f"launch {len(calls)}")
+            return 0
+
+        return runner, calls
+
+    def test_self_relaunch_reruns_with_the_same_command(self):
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = Path(d)
+            runner, calls = self.fake_runner(run_dir, [rnb.RELAUNCH_SELF_EXIT_CODE, 0])
+            with redirect_stderr(io.StringIO()) as err:
+                code, report, relaunches = rnb.run_with_relaunch(["h", "--x"], run_dir, run_dir, runner, 5)
+            self.assertEqual((code, report["exit_code"], relaunches), (0, 0, 1))
+            self.assertEqual(calls, [["h", "--x"], ["h", "--x"]])
+            self.assertEqual(json.loads((run_dir / "boot-report.launch1.json").read_text())["exit_code"],
+                             rnb.RELAUNCH_SELF_EXIT_CODE)
+            self.assertEqual((run_dir / "boot.launch1.log").read_text(), "launch 1")
+            self.assertEqual((run_dir / "boot.log").read_text(), "launch 2")
+            self.assertIn("relaunched itself", err.getvalue())
+
+    def test_relaunches_are_capped_and_other_exits_do_not_relaunch(self):
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = Path(d)
+            runner, calls = self.fake_runner(run_dir, [rnb.RELAUNCH_SELF_EXIT_CODE])
+            with redirect_stderr(io.StringIO()):
+                _, report, relaunches = rnb.run_with_relaunch(["h"], run_dir, run_dir, runner, 5)
+            self.assertEqual(relaunches, rnb.MAX_RELAUNCHES)
+            self.assertEqual(len(calls), rnb.MAX_RELAUNCHES + 1)
+            self.assertTrue(rnb.is_relaunch_request(report))
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = Path(d)
+            runner, calls = self.fake_runner(run_dir, [3])
+            _, _, relaunches = rnb.run_with_relaunch(["h"], run_dir, run_dir, runner, 5)
+            self.assertEqual((relaunches, len(calls)), (0, 1))
+        self.assertFalse(rnb.is_relaunch_request(None))
+
+
 class RunTests(unittest.TestCase):
     def test_paths_required_and_from_env(self):
         out, err = io.StringIO(), io.StringIO()
