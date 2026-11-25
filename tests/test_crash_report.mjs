@@ -13,6 +13,7 @@ import CrashReporterDefault, {
   sanitizeValue,
   classifyError,
   classifyBootError,
+  formatGitHubIssueMarkdown,
 } from '../web/telemetry/crash_report.js';
 import { PerfMonitor } from '../web/telemetry/perf_monitor.js';
 
@@ -1146,4 +1147,518 @@ test('W152 separates distinct categories with same message, handles eviction + r
   assert.equal(rawReporter.recordedErrorCount, 2);
   assert.equal(rawReporter.coalescedCount, 0);
   assert.deepEqual(rawReporter.categoryCounts, { runtime: 2 });
+});
+
+test('W220 aggressively redacts extended host paths, query/token secrets, and raw binary payloads while preserving VAs, offsets, and hashes', () => {
+  // Extended Windows device/UNC paths, MSYS/WSL paths, and unclosed quoted POSIX paths
+  const extWin = sanitizeString('Open failed on \\\\?\\C:\\Users\\alice\\GTA6\\game.exe and \\\\.\\D:\\vault\\dump.bin');
+  assert.ok(!extWin.includes('alice'));
+  assert.ok(!extWin.includes('GTA6'));
+  assert.ok(!extWin.includes('vault'));
+  assert.equal(extWin, 'Open failed on [REDACTED_PATH] and [REDACTED_PATH]');
+
+  const msysAndPosix = sanitizeString(
+    'Failed in /c/Users/alice/GTA6/mod.wasm and "/home/bob/secret.rpf and /cygdrive/d/Games/x.bin'
+  );
+  for (const leaked of ['alice', 'bob', 'GTA6', 'secret.rpf', 'Games']) {
+    assert.ok(!msysAndPosix.includes(leaked), `Leaked "${leaked}" in: ${msysAndPosix}`);
+  }
+
+  // Query secrets, JSON key/value secrets, AWS/GitHub/JWT bare tokens
+  const jwt = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c';
+  const secretsText = sanitizeString(
+    `GET https://cdn.local/chunk.bin?X-Amz-Signature=deadbeef&token=tok123 ` +
+      `body={"api_key":"sk_live_9999999999999999","session_token":"sess_abc"} ` +
+      `bare=${jwt} pat=ghp_1234567890abcdef1234567890abcdef aws=AKIAIOSFODNN7EXAMPLE`
+  );
+  for (const leaked of [
+    'deadbeef',
+    'tok123',
+    'sk_live_9999999999999999',
+    'sess_abc',
+    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9',
+    'SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c',
+    'ghp_1234567890abcdef1234567890abcdef',
+    'AKIAIOSFODNN7EXAMPLE',
+  ]) {
+    assert.ok(!secretsText.includes(leaked), `Leaked secret "${leaked}" in: ${secretsText}`);
+  }
+
+  // Raw binary payloads: data URI base64, multi-byte spaced hex dump, >64-char hex blob, raw Wasm NUL string
+  const dataUri = sanitizeString('Image payload data:application/octet-stream;base64,AGFzbQEAAAABBAFgAA== leaked');
+  assert.ok(!dataUri.includes('AGFzbQEAAAABBAFgAA=='));
+  assert.ok(dataUri.includes('[REDACTED_BUFFER]'));
+
+  const hexDump = sanitizeString(
+    'Packet dump: de ad be ef 00 11 22 33 44 55 66 77 88 99 aa bb cc dd ee ff end'
+  );
+  assert.ok(!hexDump.includes('de ad be ef'));
+  assert.equal(hexDump, 'Packet dump: [REDACTED_BUFFER] end');
+
+  const longHexBlob = sanitizeString(`Blob: 0x${'ab'.repeat(40)} done`);
+  assert.ok(!longHexBlob.includes('abababababab'));
+  assert.equal(longHexBlob, 'Blob: [REDACTED_BUFFER] done');
+
+  const rawWasmBytesStr = sanitizeString('\x00asm\x01\x00\x00\x00\x01\x05\x01\x60\x00\x00');
+  assert.equal(rawWasmBytesStr, '[REDACTED_BUFFER]');
+
+  // Exact preservation of trap VAs, instruction offsets, 64-bit & SHA-256 shader hashes, and app routes
+  const sha256Hex = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+  const preserved = sanitizeString(
+    `Trap at guestVa=0x140001234 instructionOffset=+0x2c shader=0x123456789abcdef0 sha256=${sha256Hex} route=/game/boot.pgim`
+  );
+  assert.equal(
+    preserved,
+    `Trap at guestVa=0x140001234 instructionOffset=+0x2c shader=0x123456789abcdef0 sha256=${sha256Hex} route=/game/boot.pgim`
+  );
+
+  // Idempotency on complex mixed strings
+  const mixed = sanitizeString(
+    `\\\\?\\C:\\Users\\alice\\x.exe /home/bob/y?token=sec ${jwt} data:image/png;base64,iVBORw0KGgoAAAANSUhEUg== guestVa=0x140001234 +0x2c`
+  );
+  assert.equal(sanitizeString(mixed), mixed);
+  assert.ok(mixed.includes('0x140001234'));
+  assert.ok(mixed.includes('+0x2c'));
+
+  // sanitizeValue summarizes serialized Node Buffers and Blobs without dumping bytes or paths
+  const serializedBuf = { type: 'Buffer', data: [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00] };
+  const sanitizedObj = sanitizeValue({
+    serializedBuf,
+    rawUint8: new Uint8Array([1, 2, 3, 4, 5]),
+    session_token: 'super-secret-session',
+    private_key: '-----BEGIN KEY-----',
+    guestVa: '0x140009990',
+    instructionOffset: '+0x18',
+  });
+  assert.deepEqual(sanitizedObj.serializedBuf, { type: 'Buffer', byteLength: 6 });
+  assert.deepEqual(sanitizedObj.rawUint8, { type: 'Uint8Array', byteLength: 5 });
+  assert.equal(sanitizedObj.session_token, '[REDACTED]');
+  assert.equal(sanitizedObj.private_key, '[REDACTED]');
+  assert.equal(sanitizedObj.guestVa, '0x140009990');
+  assert.equal(sanitizedObj.instructionOffset, '+0x18');
+  if (typeof Blob === 'function') {
+    const blobSanitized = sanitizeValue({ payload: new Blob(['secret-game-bytes']) });
+    assert.deepEqual(blobSanitized.payload, { type: 'Blob', byteLength: 17 });
+  }
+});
+
+test('W220 preserves trap VAs, instruction offsets, GPU validation/draw/skip counts, 1%-low FPS, Bink2 telemetry, and missing shader hashes in bundles', () => {
+  const clock = createDeterministicClock(1700005000000);
+  const perf = new PerfMonitor({ windowSize: 10, now: clock.now });
+  perf.recordFrameTimeMs(16.0);
+  perf.recordFrameTimeMs(16.5);
+  perf.recordFrameTimeMs(17.0);
+  perf.recordFrameTimeMs(25.0); // p99 = 25.0ms -> 1%-low FPS = 40
+  const rawPerfSnap = perf.getSnapshot();
+  assert.equal(rawPerfSnap.frames.onePercentLowFps, 40);
+  const legacyPerfSnap = {
+    ...rawPerfSnap,
+    frames: { ...rawPerfSnap.frames },
+  };
+  delete legacyPerfSnap.frames.onePercentLowFps;
+  delete legacyPerfSnap.frames.fps1PctLow;
+  assert.equal('onePercentLowFps' in legacyPerfSnap.frames, false);
+
+  const reporter = new CrashReporter({
+    appVersion: '0.4.0-w220',
+    now: clock.now,
+    globalObj: { crossOriginIsolated: true, SharedArrayBuffer },
+    navigatorObj: {
+      gpu: {},
+      storage: { getDirectory: () => Promise.resolve({}) },
+      hardwareConcurrency: 16,
+    },
+  });
+
+  reporter.setBootSnapshot({
+    stage: 'BINK_OPEN',
+    mode: 'real-wasm',
+    progressPct: 88.9,
+    readyForSplash: false,
+    trapCount: 3,
+    uniqueTrapCount: 2,
+    lastTrap: {
+      seq: 3,
+      kind: 'UNIMPLEMENTED_OPCODE',
+      guestVa: 0x140045678n,
+      instructionOffset: '+0x2c',
+      rva: '0x45678',
+      functionVa: '0x14004564c',
+      mnemonic: 'vpgatherdd',
+      opcode: '0x62f27d48',
+      stage: 'BINK_OPEN',
+      count: 2,
+      message: 'Unimplemented AVX-512 op while loading C:\\Users\\alice\\GTA6\\bink.bk2?token=secret',
+      rawBytes: new Uint8Array([0x62, 0xf2, 0x7d, 0x48]),
+      localFile: '/home/bob/dump.bin',
+    },
+    recentTraps: [
+      {
+        seq: 1,
+        kind: 'INDIRECT_CALL_MISS',
+        guestVa: '0x140012000',
+        insnOffset: 0x14,
+        stage: 'ENTRY_CALL',
+        count: 1,
+        message: 'Indirect call target unresolved at /Users/charlie/game.exe',
+      },
+    ],
+    unresolvedImports: [
+      {
+        name: 'Bink2Scarlett.dll!BinkOpen',
+        dll: 'Bink2Scarlett.dll',
+        symbol: 'BinkOpen',
+        guestVa: '0x140020100',
+        instructionOffset: '+0x8',
+        count: 1,
+      },
+    ],
+  });
+
+  reporter.setGpuTelemetry({
+    backend: 'webgpu',
+    adapter: 'NVIDIA RTX /home/bob/driver',
+    deviceLost: false,
+    framesPresented: 120,
+    presentCount: 120,
+    drawCalls: 450,
+    realPackDrawCount: 410,
+    fallbackDrawCount: 32,
+    skippedDrawCount: 8,
+    unboundBindGroupCount: 3,
+    computeDispatches: 14,
+    validationErrorCount: 2,
+    lastValidationErrorCode: 'BIND_GROUP_MISMATCH',
+    lastValidationErrorMessage: 'Bind group 1 mismatch from C:\\Users\\alice\\shader.wgsl?api_key=k999',
+    shaderFallback: {
+      packHits: 92,
+      fallbackHits: 6,
+      builtinHits: 2,
+      totalLookups: 100,
+      uniqueMissing: 3,
+      hitRatePct: 92.0,
+    },
+    missingShaderSummary: {
+      top: [
+        { hash: 0x00000000deadbeefn, stage: 'vertex', hits: 5, firstSeenFrame: 4, wgsl: 'secret-wgsl' },
+        { hash: '0x123456789abcdef0', stage: 'fragment', hits: 19, firstSeenFrame: 1, rawSpirv: new Uint8Array(8) },
+        { hash: '0xfedcba9876543210', stage: 'compute', hits: 11, firstSeenFrame: 2, sourcePath: '/home/bob/cs.hlsl' },
+      ],
+    },
+    rawCommandBuffer: new ArrayBuffer(256),
+  });
+
+  // Duck-typed BinkVideoPresenter / SplashFrameBridge stats provider with raw planes & paths that MUST be dropped
+  const mockBinkPresenter = {
+    getStats() {
+      return {
+        pixelFormat: 'yuv420p',
+        colorSpace: 'bt709',
+        colorRange: 'limited',
+        chromaOrder: 'yvu',
+        loadOp: 'clear',
+        frameWidth: 3840,
+        frameHeight: 2160,
+        targetFps: 30,
+        uploadedFrames: 48,
+        presentedFrames: 46,
+        droppedFrames: 2,
+        skippedFrames: 1,
+        hasFrame: true,
+        paused: false,
+        skipped: false,
+        // Disallowed raw buffers & host paths that MUST be stripped
+        yPlane: new Uint8Array(64),
+        rgba: new Uint8Array(128),
+        videoPath: 'C:\\Users\\alice\\GTA6\\movies\\intro.bk2',
+        streamUrl: 'http://localhost:8080/video?token=binksecret',
+      };
+    },
+  };
+
+  const storedBink = reporter.setBinkTelemetry(mockBinkPresenter);
+  assert.equal(storedBink.pixelFormat, 'yuv420p');
+  assert.equal(storedBink.chromaOrder, 'yvu');
+  assert.equal(storedBink.frameWidth, 3840);
+  assert.equal(storedBink.frameHeight, 2160);
+  assert.equal(storedBink.presentedFrames, 46);
+  assert.equal(storedBink.droppedFrames, 2);
+  assert.equal(storedBink.skippedFrames, 1);
+  assert.equal('yPlane' in storedBink, false);
+  assert.equal('rgba' in storedBink, false);
+  assert.equal('videoPath' in storedBink, false);
+  assert.equal('streamUrl' in storedBink, false);
+
+  const report = reporter.buildReport({ perfSnapshot: rawPerfSnap });
+  // Exported bundle preserves 1%-low FPS (1000 / 25.0 = 40) from PerfMonitor
+  assert.equal(report.perf.frames.onePercentLowFps, 40);
+
+  // Legacy perfSnapshot without onePercentLowFps derives it without mutating caller input
+  const derivedReport = reporter.buildReport({ perfSnapshot: legacyPerfSnap });
+  assert.equal('onePercentLowFps' in legacyPerfSnap.frames, false);
+  assert.equal(derivedReport.perf.frames.onePercentLowFps, 40);
+
+  // Exact trap VA and instruction offset preserved
+  assert.equal(report.bootDiagnostics.bootSnapshot.lastTrap.guestVa, '0x140045678');
+  assert.equal(report.bootDiagnostics.bootSnapshot.lastTrap.instructionOffset, '+0x2c');
+  assert.equal(report.bootDiagnostics.bootSnapshot.lastTrap.rva, '0x45678');
+  assert.equal(report.bootDiagnostics.bootSnapshot.lastTrap.functionVa, '0x14004564c');
+  assert.equal(report.bootDiagnostics.bootSnapshot.lastTrap.mnemonic, 'vpgatherdd');
+  assert.equal(report.bootDiagnostics.bootSnapshot.recentTraps[0].guestVa, '0x140012000');
+  assert.equal(report.bootDiagnostics.bootSnapshot.recentTraps[0].insnOffset, 20);
+  assert.equal('rawBytes' in report.bootDiagnostics.bootSnapshot.lastTrap, false);
+  assert.equal('localFile' in report.bootDiagnostics.bootSnapshot.lastTrap, false);
+
+  // Exact GPU validation/draw/skip counts and shader hashes preserved
+  const gpu = report.bootDiagnostics.gpuTelemetry;
+  assert.equal(gpu.drawCalls, 450);
+  assert.equal(gpu.realPackDrawCount, 410);
+  assert.equal(gpu.fallbackDrawCount, 32);
+  assert.equal(gpu.skippedDrawCount, 8);
+  assert.equal(gpu.unboundBindGroupCount, 3);
+  assert.equal(gpu.validationErrorCount, 2);
+  assert.equal(gpu.lastValidationErrorCode, 'BIND_GROUP_MISMATCH');
+  assert.ok(!gpu.lastValidationErrorMessage.includes('alice'));
+  assert.ok(!gpu.lastValidationErrorMessage.includes('k999'));
+  assert.equal(gpu.missingShaders.length, 3);
+  assert.equal(gpu.missingShaders[0].hash, '0x00000000deadbeef');
+  assert.equal(gpu.missingShaders[1].hash, '0x123456789abcdef0');
+  assert.equal(gpu.missingShaders[2].hash, '0xfedcba9876543210');
+  assert.equal('rawCommandBuffer' in gpu, false);
+
+  // Bink2 telemetry attached in bootDiagnostics
+  assert.equal(report.bootDiagnostics.binkTelemetry.pixelFormat, 'yuv420p');
+  assert.equal(report.bootDiagnostics.binkTelemetry.presentedFrames, 46);
+
+  // JSON export leaks zero paths, secrets, or shader sources
+  const json = reporter.toJson({ perfSnapshot: perf });
+  for (const forbidden of ['alice', 'bob', 'charlie', 'secret', 'k999', 'binksecret', 'secret-wgsl', 'intro.bk2']) {
+    assert.ok(!json.includes(forbidden), `JSON bundle leaked "${forbidden}"`);
+  }
+
+  // clear() resets binkTelemetry too
+  reporter.clear();
+  assert.equal(reporter.getBinkTelemetry(), null);
+});
+
+test('W220 formatGitHubIssueMarkdown produces compact, strictly sanitized Markdown with exact VAs, offsets, GPU/Bink2 counts, 1%-low FPS, and top missing shader hashes', () => {
+  const clock = createDeterministicClock(1700006000000);
+  const reporter = new CrashReporter({
+    appVersion: '0.4.0-w220',
+    now: clock.now,
+    globalObj: { crossOriginIsolated: true, SharedArrayBuffer },
+    navigatorObj: { gpu: {}, storage: { getDirectory: () => Promise.resolve({}) }, hardwareConcurrency: 8 },
+  });
+
+  reporter.recordError(
+    'wasm_trap',
+    new WebAssembly.RuntimeError('Trap at 0x140045678 loading C:\\Users\\alice\\GTA6\\game.exe?token=errtok'),
+    { guestVa: '0x140045678', instructionOffset: '+0x2c', rawDump: new Uint8Array([0xde, 0xad]) }
+  );
+
+  reporter.setBootSnapshot({
+    stage: 'D3D12_CREATE_DEVICE',
+    mode: 'real-wasm',
+    progressPct: 77.8,
+    readyForSplash: false,
+    trapCount: 2,
+    uniqueTrapCount: 2,
+    lastTrap: {
+      seq: 2,
+      kind: 'UNIMPLEMENTED_OPCODE',
+      guestVa: '0x140045678',
+      instructionOffset: '+0x2c',
+      mnemonic: 'vpgatherdd',
+      stage: 'D3D12_CREATE_DEVICE',
+      count: 2,
+      message: 'Unimplemented op in /home/bob/game.wasm Bearer secret123',
+    },
+    unresolvedImports: [
+      {
+        name: 'kernel32.dll!CreateFileW',
+        dll: 'kernel32.dll',
+        symbol: 'CreateFileW',
+        guestVa: '0x140001234',
+        instructionOffset: '+0x10',
+        count: 3,
+      },
+    ],
+  });
+
+  reporter.setGpuTelemetry({
+    backend: 'webgpu',
+    adapter: 'NVIDIA Blackwell /Users/charlie/driver',
+    framesPresented: 60,
+    drawCalls: 320,
+    realPackDrawCount: 280,
+    fallbackDrawCount: 30,
+    skippedDrawCount: 10,
+    unboundBindGroupCount: 4,
+    computeDispatches: 9,
+    validationErrorCount: 3,
+    lastValidationErrorCode: 'PIPELINE_LAYOUT_MISMATCH',
+    lastValidationErrorMessage: 'Layout mismatch at C:\\Users\\alice\\ps.wgsl?sig=s1',
+    fallbackStats: {
+      packHits: 90,
+      fallbackHits: 10,
+      builtinHits: 0,
+      totalLookups: 100,
+      uniqueMissing: 3,
+      hitRatePct: 90,
+    },
+    missingShaders: [
+      { hash: '0x00000000000000aa', stage: 'vertex', hits: 2, firstSeenFrame: 5 },
+      { hash: '0x123456789abcdef0', stage: 'fragment', hits: 17, firstSeenFrame: 1 },
+      { hash: '0xabcdef0123456789', stage: 'compute', hits: 9, firstSeenFrame: 2 },
+    ],
+  });
+
+  reporter.setBinkTelemetry({
+    pixelFormat: 'yuv420p',
+    chromaOrder: 'yvu',
+    colorSpace: 'bt709',
+    colorRange: 'limited',
+    frameWidth: 1920,
+    frameHeight: 1080,
+    presentedFrames: 30,
+    droppedFrames: 1,
+    skippedFrames: 0,
+    uploadedFrames: 31,
+    targetFps: 30,
+  });
+
+  const md = reporter.toGitHubIssueMarkdown({
+    perfSnapshot: {
+      frames: {
+        fps: 58.42,
+        avgFrameTimeMs: 17.12,
+        p95FrameTimeMs: 21.4,
+        p99FrameTimeMs: 24.24,
+        onePercentLowFps: 41.25,
+        totalFrames: 300,
+        jankFrames: 2,
+      },
+    },
+  });
+
+  // Verify structure and exact diagnostic tokens preserved
+  assert.ok(md.startsWith('### PlayGTA6Web Sanitized Diagnostic Summary'));
+  assert.ok(md.includes('`0.4.0-w220`'));
+  assert.ok(md.includes('1%-low FPS=`41.25`'));
+  assert.ok(md.includes('FPS=`58.42`'));
+  assert.ok(md.includes('draws=320'));
+  assert.ok(md.includes('realPackDraws=280'));
+  assert.ok(md.includes('fallbackDraws=30'));
+  assert.ok(md.includes('skippedDraws=10'));
+  assert.ok(md.includes('unboundBindGroups=4'));
+  assert.ok(md.includes('validationErrors=3'));
+  assert.ok(md.includes('`PIPELINE_LAYOUT_MISMATCH`'));
+  assert.ok(md.includes('`yuv420p`'));
+  assert.ok(md.includes('res=1920x1080'));
+  assert.ok(md.includes('chroma=`yvu`'));
+  assert.ok(md.includes('presented=30'));
+  assert.ok(md.includes('dropped=1'));
+  assert.ok(md.includes('`0x140045678`'));
+  assert.ok(md.includes('`+0x2c`'));
+  assert.ok(md.includes('`kernel32.dll!CreateFileW`'));
+  assert.ok(md.includes('`0x140001234`'));
+  assert.ok(md.includes('`0x123456789abcdef0`'));
+  assert.ok(md.includes('`0xabcdef0123456789`'));
+
+  // Missing shaders table must be sorted by hits descending (17 before 9 before 2)
+  const idxTop = md.indexOf('0x123456789abcdef0');
+  const idxMid = md.indexOf('0xabcdef0123456789');
+  const idxLow = md.indexOf('0x00000000000000aa');
+  assert.ok(idxTop > 0 && idxMid > idxTop && idxLow > idxMid);
+
+  // Zero leaked host paths, usernames, or tokens
+  for (const forbidden of ['alice', 'bob', 'charlie', 'errtok', 'secret123', 'sig=s1', 'GTA6\\game.exe', 'game.exe']) {
+    assert.ok(!md.includes(forbidden), `Markdown leaked "${forbidden}"`);
+  }
+
+  // Defense-in-depth: passing a RAW UNSANITIZED object directly to formatGitHubIssueMarkdown()
+  const rawDirtyReport = {
+    appVersion: '0.4.0 C:\\Users\\alice\\repo',
+    schemaVersion: 1,
+    bootDiagnostics: {
+      bootSnapshot: {
+        stage: 'ENTRY_CALL',
+        trapCount: 1,
+        lastTrap: {
+          kind: 'GUEST_TRAP',
+          guestVa: '0x140099990',
+          instructionOffset: '+0x44',
+          message: 'Fault | in /home/bob/secret.rpf?token=rawtok data:application/octet-stream;base64,QUJDREVGR0hJSktMTU5PUA==',
+          rawMemory: new Uint8Array([0xca, 0xfe, 0xba, 0xbe]),
+        },
+        hostPath: 'C:\\Users\\alice\\GTA6',
+      },
+      gpuTelemetry: {
+        backend: 'webgpu',
+        validationErrors: 4,
+        drawCalls: 100,
+        skippedDrawCount: 7,
+        missingShaders: [
+          { hash: '0x9988776655443322', stage: 'fragment', hits: 12, wgsl: '@fragment fn leak() {}' },
+        ],
+        bink: {
+          pixelFormat: 'nv12',
+          frameWidth: 1280,
+          frameHeight: 720,
+          presentedFrames: 15,
+          droppedFrames: 0,
+          yPlane: new Uint8Array(32),
+          videoPath: '/Users/charlie/Movies/intro.bk2',
+        },
+        secretBuf: { type: 'Buffer', data: [1, 2, 3, 4] },
+      },
+    },
+    perf: { frames: { fps: 60, p99FrameTimeMs: 20 } },
+    errors: [
+      {
+        category: 'wasm_trap',
+        message: 'Crash in C:\\Users\\alice\\bin.wasm | Bearer my-raw-bearer',
+        context: { guestVa: '0x140099990', instructionOffset: '+0x44', payload: new Uint8Array(16) },
+      },
+    ],
+    extra: {
+      password: 'do-not-render-extra-password',
+      localPath: 'C:\\Users\\alice\\never-shown',
+    },
+  };
+
+  const dirtyMd = formatGitHubIssueMarkdown(rawDirtyReport);
+  assert.ok(dirtyMd.includes('`0x140099990`'));
+  assert.ok(dirtyMd.includes('`+0x44`'));
+  assert.ok(dirtyMd.includes('1%-low FPS=`50`'));
+  assert.ok(dirtyMd.includes('validationErrors=4'));
+  assert.ok(dirtyMd.includes('skippedDraws=7'));
+  assert.ok(dirtyMd.includes('`0x9988776655443322`'));
+  assert.ok(dirtyMd.includes('`nv12`'));
+  assert.ok(dirtyMd.includes('\\|')); // Pipe in message escaped so Markdown table stays valid
+  for (const forbidden of [
+    'alice',
+    'bob',
+    'charlie',
+    'rawtok',
+    'QUJDREVGR0hJSktMTU5PUA==',
+    '@fragment',
+    'intro.bk2',
+    'my-raw-bearer',
+    'do-not-render-extra-password',
+    'never-shown',
+  ]) {
+    assert.ok(!dirtyMd.includes(forbidden), `formatGitHubIssueMarkdown leaked "${forbidden}"`);
+  }
+
+  // Graceful handling of null/empty inputs and CrashReporter instance passed directly
+  assert.ok(formatGitHubIssueMarkdown(null).startsWith('### PlayGTA6Web Sanitized Diagnostic Summary'));
+  assert.ok(formatGitHubIssueMarkdown({}).startsWith('### PlayGTA6Web Sanitized Diagnostic Summary'));
+  const fromInstance = formatGitHubIssueMarkdown(reporter, {
+    title: '### Custom Heading',
+    maxMissingShaders: 1,
+  });
+  assert.ok(fromInstance.startsWith('### Custom Heading'));
+  assert.ok(fromInstance.includes('0x123456789abcdef0'));
+  assert.ok(!fromInstance.includes('0xabcdef0123456789'));
 });
