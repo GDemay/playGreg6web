@@ -6507,5 +6507,339 @@ class TestSideModule2CrossExports(unittest.TestCase):
             self.assertEqual(len(good_runner.link_calls), 1)
 
 
+class TestRuntimeHeaderCacheKeys(unittest.TestCase):
+    """W110 (#738): `runtime/` and generated header fingerprints in C/C++ cache keys only."""
+
+    def _repo_with_runtime(self, root: Path) -> Path:
+        repo = root / "repo"
+        _fake_emsdk(repo)
+        _touch_lib(repo / "runtime" / "build-wasm64" / "libplaygta6_core.a")
+        _write(repo / "runtime" / "guest" / "boot.h", "#pragma once\nstruct BootCfg { int a; };\n")
+        _write(repo / "runtime" / "os" / "win32_kernel.h", "#pragma once\nint pg6_open();\n")
+        _write(repo / "runtime" / "os" / "inline_helpers.inl", "static inline int ok() { return 1; }\n")
+        _write(repo / "runtime" / "gpu" / "state.hpp", "#pragma once\nstruct GpuState { int v; };\n")
+        _write(repo / "runtime" / "main.cpp", '#include "guest/boot.h"\nint main() { return 0; }\n')
+        _write(repo / "runtime" / "wasm_boot.cpp", '#include "guest/boot.h"\nvoid boot() {}\n')
+        return repo
+
+    def test_compute_runtime_headers_fingerprint_determinism_extensions_and_exclusions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo_with_runtime(root)
+
+            fp1 = bgw.compute_runtime_headers_fingerprint(repo)
+            fp2 = bgw.compute_runtime_headers_fingerprint(repo)
+            self.assertEqual(len(fp1), 64)
+            self.assertEqual(fp1, fp2)
+
+            # Non-header files and excluded dirs (build*, target, hidden) must not affect digest.
+            _write(repo / "runtime" / "os" / "win32_kernel.cpp", "int pg6_open() { return 0; }\n")
+            _write(repo / "runtime" / "build" / "generated.h", "#pragma once\n#define X 1\n")
+            _write(repo / "runtime" / "build-wasm64" / "config.hpp", "#pragma once\n#define Y 2\n")
+            _write(repo / "runtime" / "target" / "debug.h", "#pragma once\n")
+            _write(repo / "runtime" / ".hidden" / "secret.h", "#pragma once\n")
+            (repo / "runtime" / "guest" / "dir_named.h").mkdir(parents=True, exist_ok=True)
+            self.assertEqual(bgw.compute_runtime_headers_fingerprint(repo), fp1)
+
+            # Modifying a .h file changes the fingerprint.
+            _write(
+                repo / "runtime" / "guest" / "boot.h",
+                "#pragma once\nstruct BootCfg { int a; int b; };\n",
+            )
+            fp_h = bgw.compute_runtime_headers_fingerprint(repo)
+            self.assertNotEqual(fp_h, fp1)
+
+            # Modifying a .hpp file changes the fingerprint.
+            _write(
+                repo / "runtime" / "gpu" / "state.hpp",
+                "#pragma once\nstruct GpuState { int v; int w; };\n",
+            )
+            fp_hpp = bgw.compute_runtime_headers_fingerprint(repo)
+            self.assertNotEqual(fp_hpp, fp_h)
+
+            # Modifying a .inl file changes the fingerprint.
+            _write(
+                repo / "runtime" / "os" / "inline_helpers.inl",
+                "static inline int ok() { return 2; }\n",
+            )
+            fp_inl = bgw.compute_runtime_headers_fingerprint(repo)
+            self.assertNotEqual(fp_inl, fp_hpp)
+
+            # Explicit header_roots list is supported and deterministic.
+            extra_dir = root / "extra_headers"
+            _write(extra_dir / "custom.h", "#pragma once\n#define Z 1\n")
+            fp_multi_1 = bgw.compute_runtime_headers_fingerprint(
+                header_roots=[repo / "runtime", extra_dir]
+            )
+            fp_multi_2 = bgw.compute_runtime_headers_fingerprint(
+                header_roots=[repo / "runtime", extra_dir]
+            )
+            self.assertEqual(fp_multi_1, fp_multi_2)
+            self.assertNotEqual(fp_multi_1, fp_inl)
+            _write(extra_dir / "custom.h", "#pragma once\n#define Z 2\n")
+            fp_multi_3 = bgw.compute_runtime_headers_fingerprint(
+                header_roots=[repo / "runtime", extra_dir]
+            )
+            self.assertNotEqual(fp_multi_3, fp_multi_1)
+
+    def test_cache_key_for_runtime_headers_affects_c_cpp_never_ll(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo_with_runtime(root)
+            cpp_flags = bgw.compile_flags_for(opt="O2", kind="cpp")
+            c_flags = bgw.compile_flags_for(opt="O2", kind="c")
+            ll_flags = bgw.compile_flags_for(opt="O2", kind="ll")
+
+            cpp_bytes = b'#include "guest/boot.h"\nvoid thunk() {}\n'
+            c_bytes = b'#include "os/win32_kernel.h"\nint helper(void) { return 0; }\n'
+            ll_bytes = b"; ModuleID = 'shard-00000'\ndefine void @sub_1() { ret void }\n"
+
+            fp_before = bgw.compute_runtime_headers_fingerprint(repo)
+            cpp_before = bgw.cache_key_for(
+                cpp_bytes, cpp_flags, kind="cpp", runtime_headers_fingerprint=fp_before
+            )
+            c_before = bgw.cache_key_for(
+                c_bytes, c_flags, kind="c", runtime_headers_fingerprint=fp_before
+            )
+            ll_before = bgw.cache_key_for(
+                ll_bytes, ll_flags, kind="ll", runtime_headers_fingerprint=fp_before
+            )
+            # Unchanged header -> identical deterministic keys.
+            fp_same = bgw.compute_runtime_headers_fingerprint(repo)
+            self.assertEqual(
+                cpp_before,
+                bgw.cache_key_for(cpp_bytes, cpp_flags, kind="cpp", runtime_headers_fingerprint=fp_same),
+            )
+            # .ll key must match bare cache_key_for without runtime_headers_fingerprint.
+            self.assertEqual(
+                ll_before,
+                bgw.cache_key_for(ll_bytes, ll_flags, kind="ll"),
+            )
+
+            # Mutate a runtime/ header -> .cpp and .c keys change, .ll stays IDENTICAL.
+            _write(
+                repo / "runtime" / "guest" / "boot.h",
+                "#pragma once\nstruct BootCfg { int a; long long expanded; };\n",
+            )
+            fp_after = bgw.compute_runtime_headers_fingerprint(repo)
+            self.assertNotEqual(fp_before, fp_after)
+
+            cpp_after = bgw.cache_key_for(
+                cpp_bytes, cpp_flags, kind="cpp", runtime_headers_fingerprint=fp_after
+            )
+            c_after = bgw.cache_key_for(
+                c_bytes, c_flags, kind="c", runtime_headers_fingerprint=fp_after
+            )
+            ll_after = bgw.cache_key_for(
+                ll_bytes, ll_flags, kind="ll", runtime_headers_fingerprint=fp_after
+            )
+            self.assertNotEqual(cpp_before, cpp_after)
+            self.assertNotEqual(c_before, c_after)
+            self.assertEqual(ll_before, ll_after)
+
+    def test_run_build_runtime_header_change_invalidates_cpp_c_and_boot_keeps_ll_hit(self) -> None:
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo_with_runtime(root)
+            src = _program_layout(root)
+            # Add .c, .cc, and .cxx units to verify all C/C++ extensions invalidate.
+            _write(src / "extra" / "helper.c", "int h_c(void) { return 1; }\n")
+            _write(src / "extra" / "helper.cc", "int h_cc() { return 2; }\n")
+            _write(src / "extra" / "helper.cxx", "int h_cxx() { return 3; }\n")
+            manifest_path = src / "program-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["files"].extend(
+                [
+                    {"path": "extra/helper.c"},
+                    {"path": "extra/helper.cc"},
+                    {"path": "extra/helper.cxx"},
+                ]
+            )
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            cache = root / "cache"
+            lib = repo / "runtime" / "build-wasm64" / "libplaygta6_core.a"
+
+            # Step 1: Warm the cache and assert runtime header fingerprint is computed ONCE.
+            runner1 = RecordingRunner()
+            with mock.patch.object(
+                bgw,
+                "compute_runtime_headers_fingerprint",
+                wraps=bgw.compute_runtime_headers_fingerprint,
+            ) as spy_fp:
+                first = bgw.run_build(
+                    source_dir=src,
+                    repo_root=repo,
+                    cache_dir=cache,
+                    out_dir=root / "dist1",
+                    jobs=2,
+                    runtime_lib=lib,
+                    link_guest_boot=True,
+                    run_command=runner1,
+                    which_fn=lambda _n: None,
+                )
+            self.assertTrue(first.ok, first.errors)
+            self.assertEqual(spy_fp.call_count, 1)
+            self.assertEqual(first.cache_hits, 0)
+            self.assertEqual(first.cache_misses, len(first.sources))
+            first_keys = {u.unit.unit_id: u.cache_key for u in first.sources}
+            ll_ids = {u.unit.unit_id for u in first.sources if u.unit.kind == "ll"}
+            c_cpp_ids = {u.unit.unit_id for u in first.sources if u.unit.kind in {"c", "cpp"}}
+            self.assertGreaterEqual(len(ll_ids), 7)
+            self.assertIn("runtime/wasm_boot.cpp", c_cpp_ids)
+            self.assertIn("runtime/main.cpp", c_cpp_ids)
+            self.assertIn("extra/helper.c", c_cpp_ids)
+            self.assertIn("extra/helper.cc", c_cpp_ids)
+            self.assertIn("extra/helper.cxx", c_cpp_ids)
+
+            # Step 2: Unchanged rebuild -> 100% cache hits.
+            runner2 = RecordingRunner()
+            second = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist2",
+                jobs=2,
+                runtime_lib=lib,
+                link_guest_boot=True,
+                run_command=runner2,
+                which_fn=lambda _n: None,
+            )
+            self.assertTrue(second.ok, second.errors)
+            self.assertEqual(second.cache_hits, len(second.sources))
+            self.assertEqual(second.cache_misses, 0)
+            self.assertEqual(runner2.compile_calls, [])
+
+            # Step 3: Change runtime/guest/boot.h -> ALL C/C++ units recompile, ALL .ll stay 100% hit!
+            _write(
+                repo / "runtime" / "guest" / "boot.h",
+                "#pragma once\nstruct BootCfg { int a; uint64_t new_field; };\n",
+            )
+            runner3 = RecordingRunner()
+            third = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist3",
+                jobs=2,
+                runtime_lib=lib,
+                link_guest_boot=True,
+                run_command=runner3,
+                which_fn=lambda _n: None,
+            )
+            self.assertTrue(third.ok, third.errors)
+            self.assertEqual(third.cache_misses, len(c_cpp_ids))
+            self.assertEqual(third.cache_hits, len(ll_ids))
+            self.assertEqual(len(runner3.compile_calls), len(c_cpp_ids))
+            for item in third.sources:
+                if item.unit.kind == "ll":
+                    self.assertEqual(item.status, "hit", item.unit.unit_id)
+                    self.assertEqual(item.cache_key, first_keys[item.unit.unit_id])
+                else:
+                    self.assertEqual(item.status, "compiled", item.unit.unit_id)
+                    self.assertNotEqual(item.cache_key, first_keys[item.unit.unit_id])
+
+            # Step 4: Modify excluded dirs under runtime/ (build*, target, .hidden) -> ZERO misses.
+            _write(repo / "runtime" / "build-wasm64" / "temp.h", "#pragma once\n// v2\n")
+            _write(repo / "runtime" / "target" / "temp.h", "#pragma once\n// v2\n")
+            _write(repo / "runtime" / ".cache" / "temp.h", "#pragma once\n// v2\n")
+            runner4 = RecordingRunner()
+            fourth = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist4",
+                jobs=2,
+                runtime_lib=lib,
+                link_guest_boot=True,
+                run_command=runner4,
+                which_fn=lambda _n: None,
+            )
+            self.assertTrue(fourth.ok, fourth.errors)
+            self.assertEqual(fourth.cache_misses, 0)
+            self.assertEqual(fourth.cache_hits, len(fourth.sources))
+            self.assertEqual(runner4.compile_calls, [])
+
+    def test_run_build_generated_program_headers_invalidate_cpp_not_ll(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo_with_runtime(root)
+            src = _program_layout(root)
+            prog_h = _write(src / "pg6_program.h", "#pragma once\n#define PG6_PROG_VER 1\n")
+            exp_h = _write(
+                src / "exports" / "pg6_export_thunks.h",
+                "#pragma once\nvoid pg6_export_thunks();\n",
+            )
+            _write(
+                src / "pg6_program.cpp",
+                '#include "pg6_program.h"\n#include "exports/pg6_export_thunks.h"\n'
+                "extern const int pg6_program_modules;\n",
+            )
+            cache = root / "cache"
+            lib = repo / "runtime" / "build-wasm64" / "libplaygta6_core.a"
+
+            first = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist1",
+                jobs=2,
+                runtime_lib=lib,
+                run_command=RecordingRunner(),
+                which_fn=lambda _n: None,
+            )
+            self.assertTrue(first.ok, first.errors)
+            first_keys = {u.unit.unit_id: u.cache_key for u in first.sources}
+            ll_ids = {u.unit.unit_id for u in first.sources if u.unit.kind == "ll"}
+            cpp_ids = {u.unit.unit_id for u in first.sources if u.unit.kind in {"c", "cpp"}}
+
+            # Mutate top-level generated pg6_program.h -> all C/C++ units recompile, .ll 100% hit.
+            _write(prog_h, "#pragma once\n#define PG6_PROG_VER 2\n")
+            second = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist2",
+                jobs=2,
+                runtime_lib=lib,
+                run_command=RecordingRunner(),
+                which_fn=lambda _n: None,
+            )
+            self.assertTrue(second.ok, second.errors)
+            self.assertEqual(second.cache_misses, len(cpp_ids))
+            self.assertEqual(second.cache_hits, len(ll_ids))
+            for item in second.sources:
+                if item.unit.kind == "ll":
+                    self.assertEqual(item.cache_key, first_keys[item.unit.unit_id])
+                else:
+                    self.assertNotEqual(item.cache_key, first_keys[item.unit.unit_id])
+
+            # Mutate exports/pg6_export_thunks.h -> both exports/pg6_export_thunks.cpp and
+            # pg6_program.cpp (which #includes it) recompile; .ll shards stay 100% hit.
+            _write(exp_h, "#pragma once\nvoid pg6_export_thunks(); // v2\n")
+            third = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist3",
+                jobs=2,
+                runtime_lib=lib,
+                run_command=RecordingRunner(),
+                which_fn=lambda _n: None,
+            )
+            self.assertTrue(third.ok, third.errors)
+            compiled_ids = {u.unit.unit_id for u in third.sources if u.status == "compiled"}
+            self.assertEqual(
+                compiled_ids,
+                {"exports/pg6_export_thunks.cpp", "pg6_program.cpp"},
+            )
+            for item in third.sources:
+                if item.unit.kind == "ll":
+                    self.assertEqual(item.status, "hit", item.unit.unit_id)
+                    self.assertEqual(item.cache_key, first_keys[item.unit.unit_id])
+
+
 if __name__ == "__main__":
     unittest.main()
