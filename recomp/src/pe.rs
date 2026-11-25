@@ -222,6 +222,56 @@ pub struct SectionHeader {
 }
 
 impl SectionHeader {
+    /// Effective virtual span in memory: `raw_size` when `virtual_size == 0`, else `virtual_size`.
+    pub const fn virtual_extent(&self) -> u32 {
+        if self.virtual_size == 0 {
+            self.raw_size
+        } else {
+            self.virtual_size
+        }
+    }
+
+    /// Number of file-backed bytes visible in the section's virtual address range.
+    pub const fn mapped_raw_size(&self) -> u32 {
+        let virt = self.virtual_extent();
+        if virt < self.raw_size {
+            virt
+        } else {
+            self.raw_size
+        }
+    }
+
+    /// True when the section occupies zero virtual bytes.
+    pub const fn is_empty(&self) -> bool {
+        self.virtual_extent() == 0
+    }
+
+    /// True when the section has virtual extent but zero file-backed raw bytes (pure BSS).
+    pub const fn is_bss(&self) -> bool {
+        self.virtual_extent() > 0 && self.raw_size == 0
+    }
+
+    /// Checked exclusive virtual end RVA (`virtual_address + virtual_extent`), or `None` on `u32` overflow.
+    pub const fn checked_virtual_end(&self) -> Option<u32> {
+        self.virtual_address.checked_add(self.virtual_extent())
+    }
+
+    /// Checked exclusive raw file end offset (`raw_offset + raw_size`), or `None` on `u32` overflow.
+    pub const fn checked_raw_end(&self) -> Option<u32> {
+        self.raw_offset.checked_add(self.raw_size)
+    }
+
+    /// Checked virtual address range `[start, end)` relative to `image_base`, or `None` on `u64` overflow.
+    pub const fn checked_va_range(&self, image_base: u64) -> Option<(u64, u64)> {
+        let Some(start) = image_base.checked_add(self.virtual_address as u64) else {
+            return None;
+        };
+        let Some(end) = start.checked_add(self.virtual_extent() as u64) else {
+            return None;
+        };
+        Some((start, end))
+    }
+
     pub fn permissions_str(&self) -> String {
         let r = if self.characteristics & IMAGE_SCN_MEM_READ != 0 {
             'r'
@@ -329,7 +379,12 @@ impl Pe64 {
         }
 
         let e_lfanew = read_u32(data, 0x3C, "DOS e_lfanew")?;
-        let pe_offset = e_lfanew as usize;
+        let pe_offset = usize::try_from(e_lfanew).map_err(|_| PeError::IntegerOverflow {
+            context: "DOS e_lfanew",
+        })?;
+        let coff_offset_u32 = e_lfanew.checked_add(4).ok_or(PeError::IntegerOverflow {
+            context: "PE signature offset",
+        })?;
         let sig_bytes = read_slice(data, pe_offset, 4, "PE signature")?;
         let sig = [sig_bytes[0], sig_bytes[1], sig_bytes[2], sig_bytes[3]];
         if sig != PE_SIGNATURE {
@@ -343,6 +398,11 @@ impl Pe64 {
             })?;
         let coff = parse_coff_header(data, coff_offset)?;
 
+        let opt_offset_u32 = coff_offset_u32
+            .checked_add(COFF_HEADER_LEN as u32)
+            .ok_or(PeError::IntegerOverflow {
+                context: "optional header offset",
+            })?;
         let opt_offset = coff_offset
             .checked_add(COFF_HEADER_LEN)
             .ok_or(PeError::IntegerOverflow {
@@ -350,12 +410,23 @@ impl Pe64 {
             })?;
         let optional = parse_optional_header(data, opt_offset, coff.size_of_optional_header)?;
 
-        let sections_offset = opt_offset
-            .checked_add(coff.size_of_optional_header as usize)
+        let sections_offset_u32 = opt_offset_u32
+            .checked_add(u32::from(coff.size_of_optional_header))
             .ok_or(PeError::IntegerOverflow {
                 context: "section table offset",
             })?;
-        let sections = parse_sections(data, sections_offset, &coff)?;
+        let sections_offset = opt_offset
+            .checked_add(usize::from(coff.size_of_optional_header))
+            .ok_or(PeError::IntegerOverflow {
+                context: "section table offset",
+            })?;
+        let sections = parse_sections(
+            data,
+            sections_offset,
+            sections_offset_u32,
+            &coff,
+            optional.image_base,
+        )?;
 
         let imports = if let Some(dir) = optional.data_directory(DIR_IMPORT) {
             parse_imports(data, &sections, optional.size_of_headers, dir)?
@@ -415,6 +486,87 @@ impl Pe64 {
             rva,
         )
     }
+
+    /// Maps a contiguous RVA byte range `[rva, rva + len)` to a file byte offset, ensuring
+    /// zero integer wraparound and that the entire range fits within one mapped section (or header)
+    /// and within `self.file_size`.
+    pub fn rva_range_to_file_offset(&self, rva: u32, len: usize) -> Option<usize> {
+        let len_u32 = u32::try_from(len).ok()?;
+        rva.checked_add(len_u32)?;
+        let (offset, avail) = rva_to_file_span_raw(
+            &self.sections,
+            self.optional.size_of_headers,
+            self.file_size,
+            rva,
+        )?;
+        if len <= avail {
+            Some(offset)
+        } else {
+            None
+        }
+    }
+
+    /// Converts an RVA to a 64-bit virtual address using checked `u64` addition.
+    pub const fn rva_to_va(&self, rva: u32) -> Option<u64> {
+        self.optional.image_base.checked_add(rva as u64)
+    }
+
+    /// Converts a 64-bit virtual address to a 32-bit RVA using checked subtraction and narrowing.
+    pub fn va_to_rva(&self, va: u64) -> Option<u32> {
+        va.checked_sub(self.optional.image_base)
+            .and_then(|delta| u32::try_from(delta).ok())
+    }
+
+    /// Returns sections in canonical deterministic order by `(virtual_address, raw_offset, name)`.
+    pub fn sections_by_rva(&self) -> Vec<&SectionHeader> {
+        let mut out: Vec<&SectionHeader> = self.sections.iter().collect();
+        out.sort_by(|a, b| {
+            (a.virtual_address, a.raw_offset, a.name.as_str()).cmp(&(
+                b.virtual_address,
+                b.raw_offset,
+                b.name.as_str(),
+            ))
+        });
+        out
+    }
+
+    /// Returns standard import modules in canonical deterministic order by case-folded DLL name,
+    /// exact DLL name, and IAT RVA.
+    pub fn imports_sorted(&self) -> Vec<&ImportModule> {
+        let mut out: Vec<&ImportModule> = self.imports.iter().collect();
+        out.sort_by(|a, b| {
+            (
+                a.dll_name.to_ascii_lowercase(),
+                a.dll_name.as_str(),
+                a.iat_rva,
+            )
+                .cmp(&(
+                    b.dll_name.to_ascii_lowercase(),
+                    b.dll_name.as_str(),
+                    b.iat_rva,
+                ))
+        });
+        out
+    }
+
+    /// Returns delay-load import modules in canonical deterministic order by case-folded DLL name,
+    /// exact DLL name, and IAT RVA.
+    pub fn delay_imports_sorted(&self) -> Vec<&DelayImportModule> {
+        let mut out: Vec<&DelayImportModule> = self.delay_imports.iter().collect();
+        out.sort_by(|a, b| {
+            (
+                a.dll_name.to_ascii_lowercase(),
+                a.dll_name.as_str(),
+                a.iat_rva,
+            )
+                .cmp(&(
+                    b.dll_name.to_ascii_lowercase(),
+                    b.dll_name.as_str(),
+                    b.iat_rva,
+                ))
+        });
+        out
+    }
 }
 
 fn rva_to_file_offset_raw(
@@ -423,29 +575,87 @@ fn rva_to_file_offset_raw(
     file_size: usize,
     rva: u32,
 ) -> Option<usize> {
+    rva_to_file_span_raw(sections, size_of_headers, file_size, rva).map(|(offset, _avail)| offset)
+}
+
+/// Maps `rva` to `(file_offset, contiguous_available_bytes)` within the owning section's
+/// initialized raw data (or the PE headers), strictly clamped to `file_size`.
+fn rva_to_file_span_raw(
+    sections: &[SectionHeader],
+    size_of_headers: u32,
+    file_size: usize,
+    rva: u32,
+) -> Option<(usize, usize)> {
     for section in sections {
-        let virt_extent = if section.virtual_size == 0 {
-            section.raw_size
-        } else {
-            section.virtual_size
+        let virt_extent = section.virtual_extent();
+        if virt_extent == 0 {
+            continue;
+        }
+        // Guard against overflowing section definitions (even on manually constructed `Pe64`).
+        if section.checked_virtual_end().is_none() || section.checked_raw_end().is_none() {
+            continue;
+        }
+        let Some(delta) = rva.checked_sub(section.virtual_address) else {
+            continue;
         };
-        if let Some(delta) = rva.checked_sub(section.virtual_address)
-            && delta < virt_extent
-            && delta < section.raw_size
-        {
-            let offset = (section.raw_offset as usize).checked_add(delta as usize)?;
-            if offset < file_size {
-                return Some(offset);
-            }
+        if delta >= virt_extent {
+            continue;
+        }
+        // RVA falls inside this section's virtual range: first matching section owns it
+        // deterministically, and uninitialized BSS / out-of-bounds raw regions never fall
+        // through to header bytes or later sections.
+        let mapped_raw = section.mapped_raw_size();
+        if delta >= mapped_raw {
             return None;
+        }
+        let raw_offset = usize::try_from(section.raw_offset).ok()?;
+        let delta_usize = usize::try_from(delta).ok()?;
+        let file_offset = raw_offset.checked_add(delta_usize)?;
+        if file_offset >= file_size {
+            return None;
+        }
+        let section_remaining = usize::try_from(mapped_raw - delta).ok()?;
+        let file_remaining = file_size - file_offset;
+        return Some((file_offset, section_remaining.min(file_remaining)));
+    }
+
+    if rva < size_of_headers {
+        let rva_usize = usize::try_from(rva).ok()?;
+        if rva_usize < file_size {
+            let hdr_end = usize::try_from(size_of_headers)
+                .unwrap_or(file_size)
+                .min(file_size);
+            let avail = hdr_end.checked_sub(rva_usize)?;
+            if avail > 0 {
+                return Some((rva_usize, avail));
+            }
         }
     }
 
-    if rva < size_of_headers && (rva as usize) < file_size {
-        return Some(rva as usize);
-    }
-
     None
+}
+
+fn read_rva_slice<'a>(
+    data: &'a [u8],
+    sections: &[SectionHeader],
+    size_of_headers: u32,
+    rva: u32,
+    len: usize,
+    context: &'static str,
+) -> Result<&'a [u8], PeError> {
+    let len_u32 = u32::try_from(len).map_err(|_| PeError::IntegerOverflow { context })?;
+    rva.checked_add(len_u32)
+        .ok_or(PeError::IntegerOverflow { context })?;
+    let (offset, avail) = rva_to_file_span_raw(sections, size_of_headers, data.len(), rva)
+        .ok_or(PeError::UnmappedRva { context, rva })?;
+    if len > avail {
+        return Err(PeError::Truncated {
+            context,
+            needed: len,
+            available: avail,
+        });
+    }
+    read_slice(data, offset, len, context)
 }
 
 fn parse_coff_header(data: &[u8], offset: usize) -> Result<CoffHeader, PeError> {
@@ -466,7 +676,7 @@ fn parse_optional_header(
     offset: usize,
     size_of_optional_header: u16,
 ) -> Result<OptionalHeader64, PeError> {
-    let opt_size = size_of_optional_header as usize;
+    let opt_size = usize::from(size_of_optional_header);
     if opt_size < 2 {
         return Err(PeError::Truncated {
             context: "optional header magic",
@@ -489,16 +699,36 @@ fn parse_optional_header(
         });
     }
 
+    let entry_point_rva = le_u32(&opt[16..20]);
+    let image_base = le_u64(&opt[24..32]);
+    let size_of_image = le_u32(&opt[56..60]);
+    image_base
+        .checked_add(u64::from(size_of_image))
+        .ok_or(PeError::IntegerOverflow {
+            context: "optional header image_base + size_of_image",
+        })?;
+    image_base
+        .checked_add(u64::from(entry_point_rva))
+        .ok_or(PeError::IntegerOverflow {
+            context: "optional header entry point VA",
+        })?;
+
     let number_of_rva_and_sizes = le_u32(&opt[108..112]);
-    let max_dirs_in_header = (opt_size - OPT_HEADER_MIN_LEN) / 8;
-    let dir_count = (number_of_rva_and_sizes as usize).min(max_dirs_in_header);
+    let dir_bytes = opt_size
+        .checked_sub(OPT_HEADER_MIN_LEN)
+        .ok_or(PeError::IntegerOverflow {
+            context: "optional header data directories size",
+        })?;
+    let max_dirs_in_header = dir_bytes / 8;
+    let dir_count = usize::try_from(number_of_rva_and_sizes)
+        .unwrap_or(usize::MAX)
+        .min(max_dirs_in_header);
 
     let mut data_directories = Vec::with_capacity(dir_count);
-    for i in 0..dir_count {
-        let base = OPT_HEADER_MIN_LEN + i * 8;
+    for chunk in opt[OPT_HEADER_MIN_LEN..].chunks_exact(8).take(dir_count) {
         data_directories.push(DataDirectory {
-            virtual_address: le_u32(&opt[base..base + 4]),
-            size: le_u32(&opt[base + 4..base + 8]),
+            virtual_address: le_u32(&chunk[0..4]),
+            size: le_u32(&chunk[4..8]),
         });
     }
 
@@ -509,12 +739,12 @@ fn parse_optional_header(
         size_of_code: le_u32(&opt[4..8]),
         size_of_initialized_data: le_u32(&opt[8..12]),
         size_of_uninitialized_data: le_u32(&opt[12..16]),
-        entry_point_rva: le_u32(&opt[16..20]),
+        entry_point_rva,
         base_of_code: le_u32(&opt[20..24]),
-        image_base: le_u64(&opt[24..32]),
+        image_base,
         section_alignment: le_u32(&opt[32..36]),
         file_alignment: le_u32(&opt[36..40]),
-        size_of_image: le_u32(&opt[56..60]),
+        size_of_image,
         size_of_headers: le_u32(&opt[60..64]),
         checksum: le_u32(&opt[64..68]),
         subsystem: le_u16(&opt[68..70]),
@@ -527,19 +757,29 @@ fn parse_optional_header(
 fn parse_sections(
     data: &[u8],
     offset: usize,
+    offset_u32: u32,
     coff: &CoffHeader,
+    image_base: u64,
 ) -> Result<Vec<SectionHeader>, PeError> {
-    let count = coff.number_of_sections as usize;
+    let count = usize::from(coff.number_of_sections);
     let table_bytes_len = count
         .checked_mul(SECTION_HEADER_LEN)
         .ok_or(PeError::IntegerOverflow {
             context: "section table size",
         })?;
+    let table_bytes_len_u32 =
+        u32::try_from(table_bytes_len).map_err(|_| PeError::IntegerOverflow {
+            context: "section table size",
+        })?;
+    offset_u32
+        .checked_add(table_bytes_len_u32)
+        .ok_or(PeError::IntegerOverflow {
+            context: "section table end offset",
+        })?;
     let table_bytes = read_slice(data, offset, table_bytes_len, "section table")?;
 
     let mut sections = Vec::with_capacity(count);
-    for i in 0..count {
-        let entry = &table_bytes[i * SECTION_HEADER_LEN..(i + 1) * SECTION_HEADER_LEN];
+    for entry in table_bytes.chunks_exact(SECTION_HEADER_LEN) {
         let raw_name = &entry[0..8];
         let trimmed_len = raw_name
             .iter()
@@ -555,14 +795,32 @@ fn parse_sections(
             name = resolved;
         }
 
-        sections.push(SectionHeader {
+        let section = SectionHeader {
             name,
             virtual_size: le_u32(&entry[8..12]),
             virtual_address: le_u32(&entry[12..16]),
             raw_size: le_u32(&entry[16..20]),
             raw_offset: le_u32(&entry[20..24]),
             characteristics: le_u32(&entry[36..40]),
-        });
+        };
+
+        if section.checked_virtual_end().is_none() {
+            return Err(PeError::IntegerOverflow {
+                context: "section virtual range",
+            });
+        }
+        if section.checked_raw_end().is_none() {
+            return Err(PeError::IntegerOverflow {
+                context: "section raw range",
+            });
+        }
+        if section.checked_va_range(image_base).is_none() {
+            return Err(PeError::IntegerOverflow {
+                context: "section virtual address range",
+            });
+        }
+
+        sections.push(section);
     }
 
     Ok(sections)
@@ -572,13 +830,21 @@ fn resolve_coff_string(data: &[u8], coff: &CoffHeader, string_offset: usize) -> 
     if coff.pointer_to_symbol_table == 0 || coff.number_of_symbols == 0 || string_offset < 4 {
         return None;
     }
-    let sym_table_bytes = (coff.number_of_symbols as usize).checked_mul(18)?;
-    let str_table_start = (coff.pointer_to_symbol_table as usize).checked_add(sym_table_bytes)?;
-    let start = str_table_start.checked_add(string_offset)?;
-    if start >= data.len() {
+    let num_symbols = usize::try_from(coff.number_of_symbols).ok()?;
+    let ptr_symtab = usize::try_from(coff.pointer_to_symbol_table).ok()?;
+    let sym_table_bytes = num_symbols.checked_mul(18)?;
+    let str_table_start = ptr_symtab.checked_add(sym_table_bytes)?;
+    let table_len = usize::try_from(read_u32(data, str_table_start, "COFF string table size").ok()?).ok()?;
+    if table_len < 4 || string_offset >= table_len {
         return None;
     }
-    let tail = &data[start..data.len().min(start + MAX_CSTR_LEN)];
+    let table_end = str_table_start.checked_add(table_len)?.min(data.len());
+    let start = str_table_start.checked_add(string_offset)?;
+    if start >= table_end {
+        return None;
+    }
+    let end = table_end.min(start.saturating_add(MAX_CSTR_LEN));
+    let tail = &data[start..end];
     let nul = tail.iter().position(|&b| b == 0)?;
     Some(String::from_utf8_lossy(&tail[..nul]).into_owned())
 }
@@ -589,11 +855,18 @@ fn parse_imports(
     size_of_headers: u32,
     dir: DataDirectory,
 ) -> Result<Vec<ImportModule>, PeError> {
-    let base_offset = rva_to_file_offset_raw(sections, size_of_headers, data.len(), dir.virtual_address)
-        .ok_or(PeError::UnmappedRva {
-            context: "import directory",
-            rva: dir.virtual_address,
+    dir.virtual_address
+        .checked_add(dir.size)
+        .ok_or(PeError::IntegerOverflow {
+            context: "import directory range",
         })?;
+    let (base_offset, avail) =
+        rva_to_file_span_raw(sections, size_of_headers, data.len(), dir.virtual_address).ok_or(
+            PeError::UnmappedRva {
+                context: "import directory",
+                rva: dir.virtual_address,
+            },
+        )?;
 
     let mut modules = Vec::new();
     let mut index = 0usize;
@@ -606,8 +879,25 @@ fn parse_imports(
             });
         }
 
+        let rel = index
+            .checked_mul(IMPORT_DESCRIPTOR_LEN)
+            .ok_or(PeError::IntegerOverflow {
+                context: "import descriptor offset",
+            })?;
+        let rel_end = rel
+            .checked_add(IMPORT_DESCRIPTOR_LEN)
+            .ok_or(PeError::IntegerOverflow {
+                context: "import descriptor offset",
+            })?;
+        if rel_end > avail {
+            return Err(PeError::Truncated {
+                context: "import descriptor",
+                needed: IMPORT_DESCRIPTOR_LEN,
+                available: avail.saturating_sub(rel),
+            });
+        }
         let desc_off = base_offset
-            .checked_add(index * IMPORT_DESCRIPTOR_LEN)
+            .checked_add(rel)
             .ok_or(PeError::IntegerOverflow {
                 context: "import descriptor offset",
             })?;
@@ -669,11 +959,18 @@ fn parse_delay_imports(
     image_base: u64,
     dir: DataDirectory,
 ) -> Result<Vec<DelayImportModule>, PeError> {
-    let base_offset = rva_to_file_offset_raw(sections, size_of_headers, data.len(), dir.virtual_address)
-        .ok_or(PeError::UnmappedRva {
-            context: "delay-load import directory",
-            rva: dir.virtual_address,
+    dir.virtual_address
+        .checked_add(dir.size)
+        .ok_or(PeError::IntegerOverflow {
+            context: "delay-load import directory range",
         })?;
+    let (base_offset, avail) =
+        rva_to_file_span_raw(sections, size_of_headers, data.len(), dir.virtual_address).ok_or(
+            PeError::UnmappedRva {
+                context: "delay-load import directory",
+                rva: dir.virtual_address,
+            },
+        )?;
 
     let mut modules = Vec::new();
     let mut index = 0usize;
@@ -686,8 +983,25 @@ fn parse_delay_imports(
             });
         }
 
+        let rel = index
+            .checked_mul(DELAY_IMPORT_DESCRIPTOR_LEN)
+            .ok_or(PeError::IntegerOverflow {
+                context: "delay-load descriptor offset",
+            })?;
+        let rel_end = rel
+            .checked_add(DELAY_IMPORT_DESCRIPTOR_LEN)
+            .ok_or(PeError::IntegerOverflow {
+                context: "delay-load descriptor offset",
+            })?;
+        if rel_end > avail {
+            return Err(PeError::Truncated {
+                context: "delay-load import descriptor",
+                needed: DELAY_IMPORT_DESCRIPTOR_LEN,
+                available: avail.saturating_sub(rel),
+            });
+        }
         let desc_off = base_offset
-            .checked_add(index * DELAY_IMPORT_DESCRIPTOR_LEN)
+            .checked_add(rel)
             .ok_or(PeError::IntegerOverflow {
                 context: "delay-load descriptor offset",
             })?;
@@ -801,19 +1115,34 @@ fn parse_thunk_table_rva(
     thunk_rva: u32,
     context: &'static str,
 ) -> Result<Vec<ImportedSymbol>, PeError> {
-    let base_offset = rva_to_file_offset_raw(sections, size_of_headers, data.len(), thunk_rva)
-        .ok_or(PeError::UnmappedRva {
-            context,
-            rva: thunk_rva,
-        })?;
+    let (base_offset, avail) =
+        rva_to_file_span_raw(sections, size_of_headers, data.len(), thunk_rva).ok_or(
+            PeError::UnmappedRva {
+                context,
+                rva: thunk_rva,
+            },
+        )?;
 
     let mut symbols = Vec::new();
     for i in 0..=MAX_THUNKS_PER_MODULE {
         if i == MAX_THUNKS_PER_MODULE {
             return Err(PeError::TableTooLarge { context, count: i });
         }
+        let rel = i
+            .checked_mul(8)
+            .ok_or(PeError::IntegerOverflow { context })?;
+        let rel_end = rel
+            .checked_add(8)
+            .ok_or(PeError::IntegerOverflow { context })?;
+        if rel_end > avail {
+            return Err(PeError::Truncated {
+                context,
+                needed: 8,
+                available: avail.saturating_sub(rel),
+            });
+        }
         let off = base_offset
-            .checked_add(i * 8)
+            .checked_add(rel)
             .ok_or(PeError::IntegerOverflow { context })?;
         let thunk = read_u64(data, off, context)?;
         if thunk == 0 {
@@ -826,7 +1155,7 @@ fn parse_thunk_table_rva(
         } else {
             let hint_name_rva = u32::try_from(thunk).map_err(|_| PeError::InvalidOffset {
                 context,
-                offset: thunk as usize,
+                offset: usize::try_from(thunk).unwrap_or(usize::MAX),
             })?;
             symbols.push(read_hint_name(
                 data,
@@ -848,19 +1177,34 @@ fn parse_thunk_table_va(
     thunk_rva: u32,
     context: &'static str,
 ) -> Result<Vec<ImportedSymbol>, PeError> {
-    let base_offset = rva_to_file_offset_raw(sections, size_of_headers, data.len(), thunk_rva)
-        .ok_or(PeError::UnmappedRva {
-            context,
-            rva: thunk_rva,
-        })?;
+    let (base_offset, avail) =
+        rva_to_file_span_raw(sections, size_of_headers, data.len(), thunk_rva).ok_or(
+            PeError::UnmappedRva {
+                context,
+                rva: thunk_rva,
+            },
+        )?;
 
     let mut symbols = Vec::new();
     for i in 0..=MAX_THUNKS_PER_MODULE {
         if i == MAX_THUNKS_PER_MODULE {
             return Err(PeError::TableTooLarge { context, count: i });
         }
+        let rel = i
+            .checked_mul(8)
+            .ok_or(PeError::IntegerOverflow { context })?;
+        let rel_end = rel
+            .checked_add(8)
+            .ok_or(PeError::IntegerOverflow { context })?;
+        if rel_end > avail {
+            return Err(PeError::Truncated {
+                context,
+                needed: 8,
+                available: avail.saturating_sub(rel),
+            });
+        }
         let off = base_offset
-            .checked_add(i * 8)
+            .checked_add(rel)
             .ok_or(PeError::IntegerOverflow { context })?;
         let thunk = read_u64(data, off, context)?;
         if thunk == 0 {
@@ -891,12 +1235,8 @@ fn read_hint_name(
     hint_name_rva: u32,
     context: &'static str,
 ) -> Result<ImportedSymbol, PeError> {
-    let off = rva_to_file_offset_raw(sections, size_of_headers, data.len(), hint_name_rva)
-        .ok_or(PeError::UnmappedRva {
-            context,
-            rva: hint_name_rva,
-        })?;
-    let hint = read_u16(data, off, "import hint")?;
+    let hint_bytes = read_rva_slice(data, sections, size_of_headers, hint_name_rva, 2, context)?;
+    let hint = le_u16(hint_bytes);
     let name_rva = hint_name_rva
         .checked_add(2)
         .ok_or(PeError::IntegerOverflow {
@@ -912,17 +1252,33 @@ fn parse_exports(
     size_of_headers: u32,
     dir: DataDirectory,
 ) -> Result<ExportTable, PeError> {
-    let dir_off = rva_to_file_offset_raw(sections, size_of_headers, data.len(), dir.virtual_address)
-        .ok_or(PeError::UnmappedRva {
-            context: "export directory",
-            rva: dir.virtual_address,
+    let dir_end = dir
+        .virtual_address
+        .checked_add(dir.size)
+        .ok_or(PeError::IntegerOverflow {
+            context: "export directory range",
         })?;
-    let hdr = read_slice(data, dir_off, EXPORT_DIRECTORY_LEN, "export directory")?;
+    let hdr = read_rva_slice(
+        data,
+        sections,
+        size_of_headers,
+        dir.virtual_address,
+        EXPORT_DIRECTORY_LEN,
+        "export directory",
+    )?;
 
     let name_rva = le_u32(&hdr[12..16]);
     let ordinal_base = le_u32(&hdr[16..20]);
-    let num_functions = le_u32(&hdr[20..24]) as usize;
-    let num_names = le_u32(&hdr[24..28]) as usize;
+    let num_functions =
+        usize::try_from(le_u32(&hdr[20..24])).map_err(|_| PeError::TableTooLarge {
+            context: "export address table",
+            count: usize::MAX,
+        })?;
+    let num_names =
+        usize::try_from(le_u32(&hdr[24..28])).map_err(|_| PeError::TableTooLarge {
+            context: "export name table",
+            count: usize::MAX,
+        })?;
     let addr_functions_rva = le_u32(&hdr[28..32]);
     let addr_names_rva = le_u32(&hdr[32..36]);
     let addr_ordinals_rva = le_u32(&hdr[36..40]);
@@ -960,58 +1316,49 @@ fn parse_exports(
         });
     }
 
-    let eat_off = rva_to_file_offset_raw(sections, size_of_headers, data.len(), addr_functions_rva)
-        .ok_or(PeError::UnmappedRva {
-            context: "export address table",
-            rva: addr_functions_rva,
+    let eat_len = num_functions
+        .checked_mul(4)
+        .ok_or(PeError::IntegerOverflow {
+            context: "export address table size",
         })?;
-    let eat_bytes = read_slice(
+    let eat_bytes = read_rva_slice(
         data,
-        eat_off,
-        num_functions
-            .checked_mul(4)
-            .ok_or(PeError::IntegerOverflow {
-                context: "export address table size",
-            })?,
+        sections,
+        size_of_headers,
+        addr_functions_rva,
+        eat_len,
         "export address table",
     )?;
 
     let mut names_by_index: Vec<Vec<String>> = vec![Vec::new(); num_functions];
     if num_names > 0 {
-        let names_off =
-            rva_to_file_offset_raw(sections, size_of_headers, data.len(), addr_names_rva).ok_or(
-                PeError::UnmappedRva {
-                    context: "export name pointer table",
-                    rva: addr_names_rva,
-                },
-            )?;
-        let ords_off =
-            rva_to_file_offset_raw(sections, size_of_headers, data.len(), addr_ordinals_rva)
-                .ok_or(PeError::UnmappedRva {
-                    context: "export ordinal table",
-                    rva: addr_ordinals_rva,
-                })?;
+        let name_ptrs_len = num_names.checked_mul(4).ok_or(PeError::IntegerOverflow {
+            context: "export name pointer table size",
+        })?;
+        let ord_bytes_len = num_names.checked_mul(2).ok_or(PeError::IntegerOverflow {
+            context: "export ordinal table size",
+        })?;
 
-        let name_ptrs = read_slice(
+        let name_ptrs = read_rva_slice(
             data,
-            names_off,
-            num_names.checked_mul(4).ok_or(PeError::IntegerOverflow {
-                context: "export name pointer table size",
-            })?,
+            sections,
+            size_of_headers,
+            addr_names_rva,
+            name_ptrs_len,
             "export name pointer table",
         )?;
-        let ord_bytes = read_slice(
+        let ord_bytes = read_rva_slice(
             data,
-            ords_off,
-            num_names.checked_mul(2).ok_or(PeError::IntegerOverflow {
-                context: "export ordinal table size",
-            })?,
+            sections,
+            size_of_headers,
+            addr_ordinals_rva,
+            ord_bytes_len,
             "export ordinal table",
         )?;
 
-        for i in 0..num_names {
-            let sym_name_rva = le_u32(&name_ptrs[i * 4..(i + 1) * 4]);
-            let eat_idx = le_u16(&ord_bytes[i * 2..(i + 1) * 2]) as usize;
+        for (name_chunk, ord_chunk) in name_ptrs.chunks_exact(4).zip(ord_bytes.chunks_exact(2)) {
+            let sym_name_rva = le_u32(name_chunk);
+            let eat_idx = usize::from(le_u16(ord_chunk));
             if eat_idx >= num_functions {
                 return Err(PeError::InvalidOffset {
                     context: "export ordinal index out of range",
@@ -1029,14 +1376,20 @@ fn parse_exports(
         }
     }
 
-    let dir_end = dir.virtual_address.saturating_add(dir.size);
     let mut symbols = Vec::new();
-    for eat_idx in 0..num_functions {
-        let func_rva = le_u32(&eat_bytes[eat_idx * 4..(eat_idx + 1) * 4]);
+    for (eat_idx, func_chunk) in eat_bytes.chunks_exact(4).enumerate() {
+        let func_rva = le_u32(func_chunk);
         if func_rva == 0 {
             continue;
         }
-        let ordinal = ordinal_base.saturating_add(eat_idx as u32);
+        let eat_idx_u32 = u32::try_from(eat_idx).map_err(|_| PeError::IntegerOverflow {
+            context: "export ordinal",
+        })?;
+        let ordinal = ordinal_base
+            .checked_add(eat_idx_u32)
+            .ok_or(PeError::IntegerOverflow {
+                context: "export ordinal",
+            })?;
         let forwarder = if func_rva >= dir.virtual_address && func_rva < dir_end {
             Some(read_c_string_rva(
                 data,
@@ -1057,6 +1410,7 @@ fn parse_exports(
                 forwarder,
             });
         } else {
+            names_by_index[eat_idx].sort();
             for sym_name in &names_by_index[eat_idx] {
                 symbols.push(ExportSymbol {
                     name: Some(sym_name.clone()),
@@ -1082,12 +1436,19 @@ fn parse_tls(
     image_base: u64,
     dir: DataDirectory,
 ) -> Result<TlsDirectory, PeError> {
-    let dir_off = rva_to_file_offset_raw(sections, size_of_headers, data.len(), dir.virtual_address)
-        .ok_or(PeError::UnmappedRva {
-            context: "TLS directory",
-            rva: dir.virtual_address,
+    dir.virtual_address
+        .checked_add(dir.size)
+        .ok_or(PeError::IntegerOverflow {
+            context: "TLS directory range",
         })?;
-    let bytes = read_slice(data, dir_off, TLS_DIRECTORY64_LEN, "TLS directory")?;
+    let bytes = read_rva_slice(
+        data,
+        sections,
+        size_of_headers,
+        dir.virtual_address,
+        TLS_DIRECTORY64_LEN,
+        "TLS directory",
+    )?;
 
     let start_address_of_raw_data = le_u64(&bytes[0..8]);
     let end_address_of_raw_data = le_u64(&bytes[8..16]);
@@ -1099,8 +1460,8 @@ fn parse_tls(
     let mut callbacks = Vec::new();
     if address_of_callbacks != 0 {
         let cb_array_rva = va_to_rva(address_of_callbacks, image_base, "TLS callbacks array")?;
-        let cb_array_off =
-            rva_to_file_offset_raw(sections, size_of_headers, data.len(), cb_array_rva).ok_or(
+        let (cb_array_off, avail) =
+            rva_to_file_span_raw(sections, size_of_headers, data.len(), cb_array_rva).ok_or(
                 PeError::UnmappedRva {
                     context: "TLS callbacks array",
                     rva: cb_array_rva,
@@ -1114,8 +1475,21 @@ fn parse_tls(
                     count: i,
                 });
             }
+            let rel = i.checked_mul(8).ok_or(PeError::IntegerOverflow {
+                context: "TLS callback offset",
+            })?;
+            let rel_end = rel.checked_add(8).ok_or(PeError::IntegerOverflow {
+                context: "TLS callback offset",
+            })?;
+            if rel_end > avail {
+                return Err(PeError::Truncated {
+                    context: "TLS callback entry",
+                    needed: 8,
+                    available: avail.saturating_sub(rel),
+                });
+            }
             let off = cb_array_off
-                .checked_add(i * 8)
+                .checked_add(rel)
                 .ok_or(PeError::IntegerOverflow {
                     context: "TLS callback offset",
                 })?;
@@ -1149,11 +1523,10 @@ fn read_c_string_rva(
     rva: u32,
     context: &'static str,
 ) -> Result<String, PeError> {
-    let offset = rva_to_file_offset_raw(sections, size_of_headers, data.len(), rva).ok_or(
-        PeError::UnmappedRva { context, rva },
-    )?;
-    let max_end = data.len().min(offset.saturating_add(MAX_CSTR_LEN));
-    let slice = &data[offset..max_end];
+    let (offset, avail) = rva_to_file_span_raw(sections, size_of_headers, data.len(), rva)
+        .ok_or(PeError::UnmappedRva { context, rva })?;
+    let scan_len = avail.min(MAX_CSTR_LEN);
+    let slice = read_slice(data, offset, scan_len, context)?;
     let nul_pos = slice
         .iter()
         .position(|&b| b == 0)
@@ -1176,10 +1549,6 @@ fn read_slice<'a>(
         });
     }
     Ok(&data[offset..end])
-}
-
-fn read_u16(data: &[u8], offset: usize, context: &'static str) -> Result<u16, PeError> {
-    Ok(le_u16(read_slice(data, offset, 2, context)?))
 }
 
 fn read_u32(data: &[u8], offset: usize, context: &'static str) -> Result<u32, PeError> {
@@ -1789,5 +2158,514 @@ mod tests {
             Pe64::parse(&raw),
             Err(PeError::InvalidVirtualAddress { .. })
         ));
+    }
+
+    /// Minimal PE64 builder with configurable headers and sections for edge-case unit tests.
+    fn build_minimal_pe64(
+        image_base: u64,
+        size_of_image: u32,
+        size_of_headers: u32,
+        sections: &[(&[u8], u32, u32, u32, u32, u32)],
+        file_len: usize,
+    ) -> Vec<u8> {
+        let e_lfanew: usize = 0x40;
+        let coff_off = e_lfanew + 4;
+        let opt_off = coff_off + COFF_HEADER_LEN;
+        let size_of_opt: u16 = 240; // 112 + 16 * 8
+        let sec_off = opt_off + usize::from(size_of_opt);
+        let min_len = sec_off + sections.len() * SECTION_HEADER_LEN;
+        let mut buf = vec![0u8; file_len.max(min_len)];
+
+        buf[0..2].copy_from_slice(&DOS_MAGIC);
+        buf[0x3C..0x40].copy_from_slice(&(e_lfanew as u32).to_le_bytes());
+        buf[e_lfanew..e_lfanew + 4].copy_from_slice(&PE_SIGNATURE);
+
+        // COFF header
+        buf[coff_off..coff_off + 2].copy_from_slice(&0x8664u16.to_le_bytes());
+        buf[coff_off + 2..coff_off + 4].copy_from_slice(&(sections.len() as u16).to_le_bytes());
+        buf[coff_off + 16..coff_off + 18].copy_from_slice(&size_of_opt.to_le_bytes());
+        buf[coff_off + 18..coff_off + 20].copy_from_slice(&0x0022u16.to_le_bytes());
+
+        // PE32+ Optional header
+        buf[opt_off..opt_off + 2].copy_from_slice(&PE32_PLUS_MAGIC.to_le_bytes());
+        buf[opt_off + 24..opt_off + 32].copy_from_slice(&image_base.to_le_bytes());
+        buf[opt_off + 32..opt_off + 36].copy_from_slice(&0x1000u32.to_le_bytes());
+        buf[opt_off + 36..opt_off + 40].copy_from_slice(&0x200u32.to_le_bytes());
+        buf[opt_off + 56..opt_off + 60].copy_from_slice(&size_of_image.to_le_bytes());
+        buf[opt_off + 60..opt_off + 64].copy_from_slice(&size_of_headers.to_le_bytes());
+        buf[opt_off + 108..opt_off + 112].copy_from_slice(&16u32.to_le_bytes());
+
+        for (i, &(name, vsize, va, rsize, roff, chars)) in sections.iter().enumerate() {
+            let off = sec_off + i * SECTION_HEADER_LEN;
+            let n = name.len().min(8);
+            buf[off..off + n].copy_from_slice(&name[..n]);
+            buf[off + 8..off + 12].copy_from_slice(&vsize.to_le_bytes());
+            buf[off + 12..off + 16].copy_from_slice(&va.to_le_bytes());
+            buf[off + 16..off + 20].copy_from_slice(&rsize.to_le_bytes());
+            buf[off + 20..off + 24].copy_from_slice(&roff.to_le_bytes());
+            buf[off + 36..off + 40].copy_from_slice(&chars.to_le_bytes());
+        }
+
+        buf
+    }
+
+    #[test]
+    fn rejects_truncated_dos_pe_coff_optional_and_section_headers() {
+        let base = build_synthetic_pe64(false);
+        // 1 byte short of DOS header
+        assert!(matches!(
+            Pe64::parse(&base[..DOS_HEADER_MIN_LEN - 1]),
+            Err(PeError::Truncated {
+                context: "DOS header",
+                ..
+            })
+        ));
+        // Truncated inside PE signature (e_lfanew = 0x80)
+        assert!(matches!(
+            Pe64::parse(&base[..0x83]),
+            Err(PeError::Truncated {
+                context: "PE signature",
+                ..
+            })
+        ));
+        // Truncated inside COFF header (0x84..0x98)
+        assert!(matches!(
+            Pe64::parse(&base[..0x97]),
+            Err(PeError::Truncated {
+                context: "COFF header",
+                ..
+            })
+        ));
+        // Truncated inside optional header (0x98..0x188)
+        assert!(matches!(
+            Pe64::parse(&base[..0x187]),
+            Err(PeError::Truncated {
+                context: "optional header",
+                ..
+            })
+        ));
+        // Truncated inside section table (0x188..0x1D8)
+        assert!(matches!(
+            Pe64::parse(&base[..0x1D7]),
+            Err(PeError::Truncated {
+                context: "section table",
+                ..
+            })
+        ));
+
+        // size_of_optional_header < 2
+        let mut small_opt = base.clone();
+        small_opt[0x84 + 16..0x84 + 18].copy_from_slice(&1u16.to_le_bytes());
+        assert!(matches!(
+            Pe64::parse(&small_opt),
+            Err(PeError::Truncated {
+                context: "optional header magic",
+                ..
+            })
+        ));
+
+        // size_of_optional_header >= 2 with PE32+ magic but < OPT_HEADER_MIN_LEN
+        let mut short_opt = base.clone();
+        short_opt[0x84 + 16..0x84 + 18].copy_from_slice(&111u16.to_le_bytes());
+        assert!(matches!(
+            Pe64::parse(&short_opt),
+            Err(PeError::Truncated {
+                context: "PE32+ optional header",
+                ..
+            })
+        ));
+
+        // Huge number_of_sections on small buffer must fail Truncated without OOM
+        let mut huge_secs = base;
+        huge_secs[0x84 + 2..0x84 + 4].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(matches!(
+            Pe64::parse(&huge_secs),
+            Err(PeError::Truncated {
+                context: "section table",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_u32_and_u64_header_and_section_overflow_boundaries() {
+        // e_lfanew overflowing u32 when adding 4-byte PE signature
+        for &bad_lfanew in &[u32::MAX, u32::MAX - 2, u32::MAX - 3] {
+            let mut raw = build_synthetic_pe64(false);
+            raw[0x3C..0x40].copy_from_slice(&bad_lfanew.to_le_bytes());
+            assert!(matches!(
+                Pe64::parse(&raw),
+                Err(PeError::IntegerOverflow {
+                    context: "PE signature offset",
+                })
+            ));
+        }
+
+        // image_base + size_of_image overflowing u64
+        let bad_img = build_minimal_pe64(u64::MAX - 0x100, 0x3000, 0x200, &[], 0x400);
+        assert!(matches!(
+            Pe64::parse(&bad_img),
+            Err(PeError::IntegerOverflow {
+                context: "optional header image_base + size_of_image",
+            })
+        ));
+
+        // Section virtual_address + virtual_size overflowing u32
+        let bad_sec_va = build_minimal_pe64(
+            0x1_4000_0000,
+            0x3000,
+            0x200,
+            &[(b".ovfva", 0x2000, 0xFFFF_F000, 0x200, 0x200, IMAGE_SCN_MEM_READ)],
+            0x400,
+        );
+        assert!(matches!(
+            Pe64::parse(&bad_sec_va),
+            Err(PeError::IntegerOverflow {
+                context: "section virtual range",
+            })
+        ));
+
+        // Section raw_offset + raw_size overflowing u32
+        let bad_sec_raw = build_minimal_pe64(
+            0x1_4000_0000,
+            0x3000,
+            0x200,
+            &[(b".ovfraw", 0x200, 0x1000, 0x2000, 0xFFFF_F000, IMAGE_SCN_MEM_READ)],
+            0x400,
+        );
+        assert!(matches!(
+            Pe64::parse(&bad_sec_raw),
+            Err(PeError::IntegerOverflow {
+                context: "section raw range",
+            })
+        ));
+
+        // Section image_base + virtual_address + virtual_extent overflowing u64 (with size_of_image = 0)
+        let bad_sec_u64 = build_minimal_pe64(
+            u64::MAX - 0x1000,
+            0,
+            0x200,
+            &[(b".hi64", 0x200, 0x1000, 0x200, 0x200, IMAGE_SCN_MEM_READ)],
+            0x400,
+        );
+        assert!(matches!(
+            Pe64::parse(&bad_sec_u64),
+            Err(PeError::IntegerOverflow {
+                context: "section virtual address range",
+            })
+        ));
+
+        // Export directory virtual_address + size overflowing u32
+        let mut bad_exp_dir = build_synthetic_pe64(false);
+        let exp_dir_entry = 0x98 + OPT_HEADER_MIN_LEN + DIR_EXPORT * 8;
+        bad_exp_dir[exp_dir_entry..exp_dir_entry + 4]
+            .copy_from_slice(&0xFFFF_F000u32.to_le_bytes());
+        bad_exp_dir[exp_dir_entry + 4..exp_dir_entry + 8]
+            .copy_from_slice(&0x2000u32.to_le_bytes());
+        assert!(matches!(
+            Pe64::parse(&bad_exp_dir),
+            Err(PeError::IntegerOverflow {
+                context: "export directory range",
+            })
+        ));
+
+        // Export ordinal_base + eat_idx overflowing u32
+        let mut bad_exp_ord = build_synthetic_pe64(false);
+        let exp_ord_base_off = 0x400 + 0x280 + 16;
+        bad_exp_ord[exp_ord_base_off..exp_ord_base_off + 4]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            Pe64::parse(&bad_exp_ord),
+            Err(PeError::IntegerOverflow {
+                context: "export ordinal",
+            })
+        ));
+
+        // Huge number_of_rva_and_sizes is clamped safely to the optional header length
+        let mut huge_dirs = build_synthetic_pe64(false);
+        huge_dirs[0x98 + 108..0x98 + 112].copy_from_slice(&u32::MAX.to_le_bytes());
+        let pe = Pe64::parse(&huge_dirs).expect("clamped data directories should still parse");
+        assert_eq!(pe.optional.data_directories.len(), 16);
+    }
+
+    #[test]
+    fn handles_zero_size_bss_and_out_of_bounds_sections_safely() {
+        // Note: size_of_headers is intentionally larger than .bss VA (0x1000) to confirm
+        // BSS RVAs do NOT fall through to header bytes.
+        let raw = build_minimal_pe64(
+            0x1_4000_0000,
+            0x8000,
+            0x1800,
+            &[
+                (b".empty", 0, 0x0800, 0, 0, IMAGE_SCN_MEM_READ),
+                (b".bss", 0x1000, 0x1000, 0, 0, IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE),
+                (b".rawonly", 0, 0x2000, 0x200, 0x200, IMAGE_SCN_MEM_READ),
+                (b".partial", 0x1000, 0x3000, 0x100, 0x400, IMAGE_SCN_MEM_READ),
+                (b".oob", 0x200, 0x4000, 0x200, 0x9000, IMAGE_SCN_MEM_READ),
+            ],
+            0x600,
+        );
+        let pe = Pe64::parse(&raw).expect("synthetic edge-case sections should parse");
+
+        assert!(pe.sections[0].is_empty());
+        assert!(!pe.sections[0].is_bss());
+        assert_eq!(pe.sections[0].mapped_raw_size(), 0);
+
+        assert!(!pe.sections[1].is_empty());
+        assert!(pe.sections[1].is_bss());
+        assert_eq!(pe.sections[1].virtual_extent(), 0x1000);
+        assert_eq!(pe.sections[1].mapped_raw_size(), 0);
+        // .bss must not map to file bytes and must NOT fall through to size_of_headers (0x1800)
+        assert_eq!(pe.rva_to_file_offset(0x1000), None);
+        assert_eq!(pe.rva_to_file_offset(0x1500), None);
+
+        // .rawonly has virtual_size == 0 -> virtual_extent falls back to raw_size (0x200)
+        assert_eq!(pe.sections[2].virtual_extent(), 0x200);
+        assert_eq!(pe.rva_to_file_offset(0x2000), Some(0x200));
+        assert_eq!(pe.rva_to_file_offset(0x21FF), Some(0x3FF));
+        assert_eq!(pe.rva_to_file_offset(0x2200), None);
+
+        // .partial has 0x100 initialized bytes then 0xF00 BSS tail
+        assert_eq!(pe.sections[3].mapped_raw_size(), 0x100);
+        assert_eq!(pe.rva_to_file_offset(0x3000), Some(0x400));
+        assert_eq!(pe.rva_to_file_offset(0x30FF), Some(0x4FF));
+        assert_eq!(pe.rva_to_file_offset(0x3100), None);
+        assert_eq!(pe.rva_range_to_file_offset(0x3000, 0x100), Some(0x400));
+        assert_eq!(pe.rva_range_to_file_offset(0x3000, 0x101), None);
+
+        // .oob has raw_offset beyond file_size (0x600)
+        assert_eq!(pe.rva_to_file_offset(0x4000), None);
+        assert_eq!(pe.rva_range_to_file_offset(0x4000, 4), None);
+
+        // Header RVA outside all sections maps cleanly within file_size
+        assert_eq!(pe.rva_to_file_offset(0), Some(0));
+        assert_eq!(pe.rva_to_file_offset(0x3F), Some(0x3F));
+        assert_eq!(pe.rva_to_file_offset(0x600), None); // beyond file_size even though < size_of_headers
+    }
+
+    #[test]
+    fn rva_translation_and_range_edge_cases() {
+        // Overlapping sections: first section in table order owns the overlapping RVA range.
+        let raw = build_minimal_pe64(
+            0xFFFF_FFFF_0000_0000,
+            0x4000,
+            0x200,
+            &[
+                (b".first", 0x1000, 0x1000, 0x100, 0x200, IMAGE_SCN_MEM_READ),
+                (b".second", 0x1000, 0x1000, 0x200, 0x400, IMAGE_SCN_MEM_READ),
+            ],
+            0x600,
+        );
+        let mut pe = Pe64::parse(&raw).expect("overlapping sections parse without panic");
+
+        // RVA 0x1010 maps via .first (raw_offset 0x200), not .second (0x400)
+        assert_eq!(pe.rva_to_file_offset(0x1010), Some(0x210));
+        // RVA 0x1150 is in .first's BSS tail (0x100..0x1000) -> None (no fallthrough to .second)
+        assert_eq!(pe.rva_to_file_offset(0x1150), None);
+
+        // RVA range overflow & boundary checks
+        assert_eq!(pe.rva_to_file_offset(u32::MAX), None);
+        assert_eq!(pe.rva_range_to_file_offset(u32::MAX, 1), None);
+        assert_eq!(pe.rva_range_to_file_offset(0xFFFF_FFF0, 0x20), None);
+        assert_eq!(pe.rva_range_to_file_offset(0x10F8, 8), Some(0x2F8));
+        assert_eq!(pe.rva_range_to_file_offset(0x10F8, 9), None);
+
+        // Checked rva_to_va / va_to_rva
+        assert_eq!(pe.rva_to_va(0x1000), Some(0xFFFF_FFFF_0000_1000));
+        assert_eq!(pe.va_to_rva(0xFFFF_FFFF_0000_1000), Some(0x1000));
+        assert_eq!(pe.va_to_rva(0xFFFF_FFFE_FFFF_FFFF), None); // below image_base
+
+        // Manually injected overflowing section in Pe64 struct still cannot panic or wrap
+        pe.sections.push(SectionHeader {
+            name: ".bad".to_string(),
+            virtual_size: 0x2000,
+            virtual_address: 0xFFFF_F000,
+            raw_size: 0x2000,
+            raw_offset: 0x200,
+            characteristics: IMAGE_SCN_MEM_READ,
+        });
+        assert_eq!(pe.rva_to_file_offset(0xFFFF_F100), None);
+        assert_eq!(pe.rva_range_to_file_offset(0xFFFF_F100, 4), None);
+    }
+
+    #[test]
+    fn prevents_cross_section_table_and_cstring_bleed() {
+        // Truncate .rdata's virtual_size right in the middle of the import directory (which
+        // starts at .rdata+0x000 and needs 60 bytes for 2 descriptors + terminator). The file
+        // itself is still full length, so without section-bounded reads this would silently
+        // bleed past .rdata's virtual_size.
+        let mut raw = build_synthetic_pe64(false);
+        let rdata_vsize_off = 0x188 + SECTION_HEADER_LEN + 8;
+        raw[rdata_vsize_off..rdata_vsize_off + 4].copy_from_slice(&24u32.to_le_bytes());
+        assert!(matches!(
+            Pe64::parse(&raw),
+            Err(PeError::UnmappedRva { .. } | PeError::Truncated { .. })
+        ));
+
+        // Truncate .rdata virtual_size right before the NUL terminator of "KERNEL32.dll"
+        // (at .rdata+0x080, length 12, NUL at 0x08C -> set virtual_size to 0x08C).
+        let mut raw_cstr = build_synthetic_pe64(false);
+        raw_cstr[rdata_vsize_off..rdata_vsize_off + 4].copy_from_slice(&0x08Cu32.to_le_bytes());
+        assert!(matches!(
+            Pe64::parse(&raw_cstr),
+            Err(PeError::UnterminatedString {
+                context: "import DLL name",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn coff_long_section_name_bounds_and_overflow_safety() {
+        // Valid COFF long section name "/4"
+        let mut raw = build_minimal_pe64(
+            0x1_4000_0000,
+            0x3000,
+            0x200,
+            &[(b"/4", 0x100, 0x1000, 0x100, 0x200, IMAGE_SCN_MEM_READ)],
+            0x400,
+        );
+        let coff_off = 0x44;
+        let symtab_off: u32 = 0x300;
+        let num_syms: u32 = 1;
+        let strtab_off = (symtab_off as usize) + (num_syms as usize) * 18;
+        raw[coff_off + 8..coff_off + 12].copy_from_slice(&symtab_off.to_le_bytes());
+        raw[coff_off + 12..coff_off + 16].copy_from_slice(&num_syms.to_le_bytes());
+        let long_name = b".long_debug_section\0";
+        let strtab_len = (4 + long_name.len()) as u32;
+        raw[strtab_off..strtab_off + 4].copy_from_slice(&strtab_len.to_le_bytes());
+        raw[strtab_off + 4..strtab_off + 4 + long_name.len()].copy_from_slice(long_name);
+
+        let pe = Pe64::parse(&raw).expect("valid COFF long section name should resolve");
+        assert_eq!(pe.sections[0].name, ".long_debug_section");
+
+        // Overflowing symbol table pointer/count must never panic, falling back to raw "/4"
+        let mut overflow_sym = raw.clone();
+        overflow_sym[coff_off + 8..coff_off + 12].copy_from_slice(&u32::MAX.to_le_bytes());
+        overflow_sym[coff_off + 12..coff_off + 16].copy_from_slice(&u32::MAX.to_le_bytes());
+        let pe_ovf = Pe64::parse(&overflow_sym).expect("overflowing COFF symtab falls back cleanly");
+        assert_eq!(pe_ovf.sections[0].name, "/4");
+
+        // String offset past COFF string table length falls back cleanly
+        let mut oob_str = raw;
+        let sec_name_off = 0x40 + 4 + COFF_HEADER_LEN + 240;
+        oob_str[sec_name_off..sec_name_off + 8].copy_from_slice(b"/99999\0\0");
+        let pe_oob = Pe64::parse(&oob_str).expect("OOB COFF string offset falls back cleanly");
+        assert_eq!(pe_oob.sections[0].name, "/99999");
+    }
+
+    #[test]
+    fn deterministic_parsing_and_canonical_listings() {
+        // Repeated parsing yields identical output
+        let raw = build_synthetic_pe64(false);
+        let first = Pe64::parse(&raw).expect("first parse succeeds");
+        for _ in 0..8 {
+            assert_eq!(Pe64::parse(&raw).expect("repeat parse succeeds"), first);
+        }
+
+        // Canonical sorted import listing
+        let sorted_imports: Vec<&str> = first
+            .imports_sorted()
+            .into_iter()
+            .map(|m| m.dll_name.as_str())
+            .collect();
+        assert_eq!(sorted_imports, vec!["KERNEL32.dll", "xgameruntime.dll"]);
+        let sorted_delay: Vec<&str> = first
+            .delay_imports_sorted()
+            .into_iter()
+            .map(|m| m.dll_name.as_str())
+            .collect();
+        assert_eq!(sorted_delay, vec!["d3d12_xs.dll"]);
+
+        // Out-of-order sections in input still produce identical sections_by_rva() order
+        let fwd = build_minimal_pe64(
+            0x1_4000_0000,
+            0x4000,
+            0x200,
+            &[
+                (b".text", 0x100, 0x1000, 0x200, 0x200, IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE),
+                (b".rdata", 0x100, 0x2000, 0x200, 0x400, IMAGE_SCN_MEM_READ),
+                (b".data", 0x100, 0x3000, 0x200, 0x600, IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE),
+            ],
+            0x800,
+        );
+        let rev = build_minimal_pe64(
+            0x1_4000_0000,
+            0x4000,
+            0x200,
+            &[
+                (b".data", 0x100, 0x3000, 0x200, 0x600, IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE),
+                (b".text", 0x100, 0x1000, 0x200, 0x200, IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE),
+                (b".rdata", 0x100, 0x2000, 0x200, 0x400, IMAGE_SCN_MEM_READ),
+            ],
+            0x800,
+        );
+        let pe_fwd = Pe64::parse(&fwd).expect("fwd parses");
+        let pe_rev = Pe64::parse(&rev).expect("rev parses");
+        let names_fwd: Vec<&str> = pe_fwd
+            .sections_by_rva()
+            .into_iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        let names_rev: Vec<&str> = pe_rev
+            .sections_by_rva()
+            .into_iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(names_fwd, vec![".text", ".rdata", ".data"]);
+        assert_eq!(names_fwd, names_rev);
+
+        // Unsorted export alias names pointing to the same EAT index are sorted deterministically
+        let mut aliased = build_synthetic_pe64(false);
+        // Point both export name pointers (at .rdata+0x2C0) to EAT index 0 in reverse lexical order
+        let rdata_off = 0x400;
+        // Name 0 = "ForwardedLog" (0x2320), Name 1 = "GameMain" (0x2300) -> both ordinal index 0
+        aliased[rdata_off + 0x2C0..rdata_off + 0x2C4].copy_from_slice(&0x2320u32.to_le_bytes());
+        aliased[rdata_off + 0x2C4..rdata_off + 0x2C8].copy_from_slice(&0x2300u32.to_le_bytes());
+        aliased[rdata_off + 0x2D0..rdata_off + 0x2D2].copy_from_slice(&0u16.to_le_bytes());
+        aliased[rdata_off + 0x2D2..rdata_off + 0x2D4].copy_from_slice(&0u16.to_le_bytes());
+        let pe_alias = Pe64::parse(&aliased).expect("aliased exports should parse");
+        let exports = pe_alias.exports.expect("exports present");
+        let ord10_names: Vec<&str> = exports
+            .symbols
+            .iter()
+            .filter(|s| s.ordinal == 10)
+            .filter_map(|s| s.name.as_deref())
+            .collect();
+        assert_eq!(ord10_names, vec!["ForwardedLog", "GameMain"]);
+    }
+
+    #[test]
+    fn never_panics_on_arbitrary_and_mutated_bytes() {
+        let mut state = 0x517C_C1B7_2722_0A95u64;
+        let mut next_byte = || -> u8 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 56) as u8
+        };
+
+        // Arbitrary byte streams of lengths 0..=256
+        for len in 0..=256 {
+            let bytes: Vec<u8> = (0..len).map(|_| next_byte()).collect();
+            let _ = Pe64::parse(&bytes);
+        }
+
+        // Targeted 0xFF and single-byte mutations across synthetic PE64s (both RVA and VA delay)
+        for delay_va in [false, true] {
+            let base = build_synthetic_pe64(delay_va);
+            for stride in (0..base.len()).step_by(17) {
+                let mut mutated = base.clone();
+                let end = (stride + 8).min(mutated.len());
+                for b in &mut mutated[stride..end] {
+                    *b = 0xFF;
+                }
+                if let Ok(pe) = Pe64::parse(&mutated) {
+                    let _ = pe.rva_to_file_offset(0);
+                    let _ = pe.rva_to_file_offset(u32::MAX);
+                    let _ = pe.rva_range_to_file_offset(u32::MAX, 8);
+                }
+            }
+        }
     }
 }
