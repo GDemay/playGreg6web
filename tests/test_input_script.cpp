@@ -43,6 +43,13 @@ void test_parse() {
         CHECK(ev[2].time_ms == 3000 && ev[2].buttons == (button::kMenu | button::kGamepadB) && ev[2].hold_ms == 250);
     }
     CHECK(parse_input_script("", ev, error) && ev.empty());
+    // Stick directions for menu navigation.
+    CHECK(parse_input_script("10 Down\n20 Up+A\n30 Left\n40 Right\n", ev, error) && ev.size() == 4);
+    if (ev.size() == 4) {
+        CHECK(ev[0].buttons == button::kMoveBackward);
+        CHECK(ev[1].buttons == (button::kMoveForward | button::kGamepadA));
+        CHECK(ev[2].buttons == button::kMoveLeft && ev[3].buttons == button::kMoveRight);
+    }
 
     // Malformed lines are refused with their line number.
     CHECK(!parse_input_script("1000 A\nsoon A\n", ev, error) && error.rfind("line 2:", 0) == 0);
