@@ -6,7 +6,8 @@
         [--runs-dir DIR] [--port PORT] [--duration-s N] [--headless | --headed]
         [--chrome PATH] [--trust-build] [--rebuild] [--no-build] [--dry-run]
         [--capture-frames [DIR]] [--capture-interval-sec SEC] [--mp4] [--mp4-fps FPS]
-        [--mp4-skip-black] [--hide-hud] [--baseline NAME|DIR]
+        [--mp4-skip-black] [--hide-hud] [--hold-until-visible auto|on|off]
+        [--baseline NAME|DIR]
         [--input-script PRESET] [--stream-shaders] [--stream-threshold-mb MB]
         [--boot-options JSON|FILE] [--report-to-log] [--max-wall-ms MS] [--dump-pipelines]
         [--quiet-server]
@@ -72,6 +73,7 @@ import re
 import select
 import shutil
 import socket
+import statistics
 import struct
 import subprocess
 import sys
@@ -119,6 +121,12 @@ CANVAS_MIN_X = 410
 DEFAULT_POLL_INTERVAL_S = 0.5
 SERVER_READY_TIMEOUT_S = 15.0
 CDP_READY_TIMEOUT_S = 15.0
+CDP_PROBE_TIMEOUT_S = 15.0
+HOLD_UNTIL_VISIBLE_CHOICES: tuple[str, ...] = ("auto", "on", "off")
+DEFAULT_FPS_WINDOW_MS = 5000.0
+DEFAULT_FPS_RAMP_FRACTION = 0.2
+DEFAULT_FPS_MAX_RAMP_MS = 30000.0
+TARGET_FPS_THRESHOLD = 30.0
 
 COPY_CHUNK_BYTES = 256 * 1024
 
@@ -893,6 +901,20 @@ def format_stream_threshold_mb(value: float) -> str:
     return text
 
 
+def validate_hold_until_visible(raw: str | None) -> str | None:
+    """Validate `--hold-until-visible` (`auto`, `on`, `off`, or `None`)."""
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise RunnerError("--hold-until-visible must be one of: auto, on, off")
+    cleaned = raw.strip().lower()
+    if cleaned not in HOLD_UNTIL_VISIBLE_CHOICES:
+        raise RunnerError(
+            f"invalid --hold-until-visible {sanitize_text(raw)!r} (allowed: auto, on, off)"
+        )
+    return cleaned
+
+
 def build_target_url(
     host: str,
     port: int | str,
@@ -902,6 +924,7 @@ def build_target_url(
     stream_shaders: bool = False,
     stream_threshold_mb: float | None = None,
     hide_hud: bool = False,
+    hold_until_visible: str | None = None,
 ) -> str:
     """Construct the local browser boot URL with sanitized query parameters."""
     params: list[tuple[str, str]] = []
@@ -917,6 +940,11 @@ def build_target_url(
         params.append(("streamThresholdMb", format_stream_threshold_mb(clean_threshold)))
     if hide_hud:
         params.append(("hud", "0"))
+    clean_hold = validate_hold_until_visible(hold_until_visible)
+    if clean_hold == "on":
+        params.append(("holdUntilVisible", "1"))
+    elif clean_hold == "off":
+        params.append(("holdUntilVisible", "0"))
     base = f"http://{host}:{port}/"
     if not params:
         return base
@@ -1813,6 +1841,7 @@ class BrowserSessionResult:
     mp4_fps: float | None = None
     mp4_skip_black: bool = False
     hide_hud: bool = False
+    hold_until_visible: str | None = None
     warnings: list[str] = field(default_factory=list)
     target_url: str = ""
     input_script: str | None = None
@@ -1827,6 +1856,10 @@ class BrowserSessionResult:
     audio_ring_attached: bool | None = None
     audio_frames_drained: int | None = None
     present_fps_avg: float | None = None
+    fps_steady_avg: float | None = None
+    fps_p50_window: float | None = None
+    fps_max_window: float | None = None
+    windows_ge_30fps_pct: float | None = None
 
 
 def _format_console_event(params: Mapping[str, Any], elapsed_s: float) -> tuple[str, bool]:
@@ -2362,23 +2395,27 @@ def _extract_audio_ring_summary(
     probe_map = probe if isinstance(probe, Mapping) else (
         session.final_probe if isinstance(session.final_probe, Mapping) else {}
     )
-    boot_state = probe_map.get("bootState") if isinstance(probe_map.get("bootState"), Mapping) else {}
+    raw_boot = probe_map.get("bootState")
+    if not isinstance(raw_boot, Mapping):
+        raw_boot = probe_map.get("boot_state")
+    boot_state = raw_boot if isinstance(raw_boot, Mapping) else {}
     diag = probe_map.get("diagnostics") if isinstance(probe_map.get("diagnostics"), Mapping) else {}
 
     audio_sources: list[Mapping[str, Any]] = []
     for candidate in (
-        probe_map.get("audioStats"),
-        probe_map.get("audio"),
-        boot_state.get("audio"),
-        diag.get("audio"),
         boot_state,
         diag,
+        boot_state.get("audio"),
+        diag.get("audio"),
+        probe_map.get("audioStats"),
+        probe_map.get("audio"),
     ):
         if isinstance(candidate, Mapping):
             audio_sources.append(candidate)
 
-    for src in audio_sources:
-        if attached is None:
+    if attached is None:
+        attached_vals: list[bool] = []
+        for src in audio_sources:
             for key in (
                 "audio_ring_attached",
                 "audioRingAttached",
@@ -2389,30 +2426,29 @@ def _extract_audio_ring_summary(
             ):
                 val = _sanitize_optional_bool(src.get(key))
                 if val is not None:
-                    attached = val
+                    attached_vals.append(val)
                     break
-        if frames_drained is None:
+        if attached_vals:
+            attached = any(attached_vals)
+
+    if frames_drained is None:
+        drained_vals: list[int] = []
+        for src in audio_sources:
             for key in (
                 "audio_frames_drained",
                 "audioFramesDrained",
                 "guestFramesDrained",
                 "guest_frames_drained",
                 "guestDrainedFrames",
+                "framesDrained",
+                "frames_drained",
             ):
                 val = _sanitize_optional_non_negative_int(src.get(key))
                 if val is not None:
-                    frames_drained = val
+                    drained_vals.append(val)
                     break
-
-    if frames_drained is None:
-        for src in audio_sources:
-            for key in ("framesDrained", "frames_drained"):
-                val = _sanitize_optional_non_negative_int(src.get(key))
-                if val is not None:
-                    frames_drained = val
-                    break
-            if frames_drained is not None:
-                break
+        if drained_vals:
+            frames_drained = max(drained_vals)
 
     if attached is None or frames_drained is None:
         log_att, log_drained = extract_audio_ring_summary_from_console_lines(session.console_lines)
@@ -2490,11 +2526,207 @@ def _extract_present_fps_avg(
     )
 
 
+def compute_rolling_fps_stats(
+    presents: Sequence[Mapping[str, Any]] | None,
+    *,
+    present_count: int | None = None,
+    window_ms: float = DEFAULT_FPS_WINDOW_MS,
+    ramp_fraction: float = DEFAULT_FPS_RAMP_FRACTION,
+    max_ramp_ms: float = DEFAULT_FPS_MAX_RAMP_MS,
+) -> dict[str, float | None]:
+    """Compute rolling-window and steady-state FPS stats from `presents` samples.
+
+    Returns a dict with:
+      - `fps_steady_avg`: average presents/sec excluding the initial ramp
+        (`min(max_ramp_ms, total_span_ms * ramp_fraction)` from the first sample).
+      - `fps_p50_window`: median rolling-window FPS.
+      - `fps_max_window`: maximum rolling-window FPS.
+      - `windows_ge_30fps_pct`: percentage (0.0..100.0) of rolling windows at >= 30.0 FPS.
+    """
+    empty: dict[str, float | None] = {
+        "fps_steady_avg": None,
+        "fps_p50_window": None,
+        "fps_max_window": None,
+        "windows_ge_30fps_pct": None,
+    }
+    if not presents or not math.isfinite(window_ms) or window_ms <= 0.0:
+        return empty
+
+    raw_samples: list[tuple[float, int | None]] = []
+    for sample in presents:
+        if not isinstance(sample, Mapping):
+            continue
+        wall_ms = _sanitize_non_negative_float(sample.get("wall_ms"))
+        if wall_ms is None:
+            continue
+        explicit_count = _sanitize_optional_non_negative_int(
+            sample.get("present_count") if "present_count" in sample else sample.get("presents")
+        )
+        raw_samples.append((wall_ms, explicit_count))
+
+    if len(raw_samples) < 2:
+        return empty
+
+    has_explicit_counts = all(c is not None for _, c in raw_samples)
+    if has_explicit_counts:
+        points: list[tuple[float, int]] = [(w, int(c)) for w, c in raw_samples if c is not None]
+    else:
+        clean_total = _sanitize_optional_non_negative_int(present_count)
+        if clean_total is not None and clean_total > len(raw_samples):
+            return empty
+        points = [(w, idx + 1) for idx, (w, _) in enumerate(raw_samples)]
+
+    deduped: list[tuple[float, int]] = []
+    for w, c in points:
+        if deduped and w < deduped[-1][0]:
+            continue
+        if deduped and w == deduped[-1][0]:
+            deduped[-1] = (w, max(deduped[-1][1], c))
+        else:
+            if deduped and c < deduped[-1][1]:
+                c = deduped[-1][1]
+            deduped.append((w, c))
+
+    if len(deduped) < 2:
+        return empty
+
+    t_first, c_first = deduped[0]
+    t_last, c_last = deduped[-1]
+    total_span_ms = t_last - t_first
+    if not math.isfinite(total_span_ms) or total_span_ms <= 0.0 or c_last <= c_first:
+        return empty
+
+    clamped_frac = max(0.0, min(0.5, float(ramp_fraction)))
+    ramp_ms = min(max(0.0, float(max_ramp_ms)), total_span_ms * clamped_frac)
+    ramp_cutoff_ms = t_first + ramp_ms
+    steady_points = [pt for pt in deduped if pt[0] >= ramp_cutoff_ms]
+    if len(steady_points) < 2:
+        steady_points = deduped[1:] if len(deduped) >= 3 else deduped
+    steady_dt = steady_points[-1][0] - steady_points[0][0]
+    steady_dc = steady_points[-1][1] - steady_points[0][1]
+    fps_steady_avg = (
+        _sanitize_non_negative_float(float(steady_dc) * 1000.0 / steady_dt, digits=2)
+        if steady_dt > 0.0 and steady_dc >= 0
+        else None
+    )
+
+    window_fps: list[float] = []
+    i = 0
+    n = len(deduped)
+    while i < n - 1:
+        t_start, c_start = deduped[i]
+        j = i + 1
+        while j < n - 1 and (deduped[j][0] - t_start) < window_ms:
+            j += 1
+        dt = deduped[j][0] - t_start
+        dc = deduped[j][1] - c_start
+        if dt > 0.0 and dc >= 0:
+            if dt >= window_ms or not window_fps or dt >= (window_ms * 0.5):
+                window_fps.append(float(dc) * 1000.0 / dt)
+        i = j
+
+    if not window_fps:
+        return empty
+
+    fps_p50_window = _sanitize_non_negative_float(statistics.median(window_fps), digits=2)
+    fps_max_window = _sanitize_non_negative_float(max(window_fps), digits=2)
+    ge_30_count = sum(1 for val in window_fps if val >= (TARGET_FPS_THRESHOLD - 1e-9))
+    windows_ge_30fps_pct = _sanitize_non_negative_float(
+        (float(ge_30_count) * 100.0) / float(len(window_fps)),
+        digits=1,
+    )
+    return {
+        "fps_steady_avg": fps_steady_avg,
+        "fps_p50_window": fps_p50_window,
+        "fps_max_window": fps_max_window,
+        "windows_ge_30fps_pct": windows_ge_30fps_pct,
+    }
+
+
+def _extract_rolling_fps_stats(
+    session: BrowserSessionResult,
+    probe: Mapping[str, Any] | None = None,
+) -> dict[str, float | None]:
+    """Resolve rolling FPS breakdown from session overrides or recorded present samples."""
+    probe_map = probe if isinstance(probe, Mapping) else (
+        session.final_probe if isinstance(session.final_probe, Mapping) else {}
+    )
+    present_count = max(len(session.presents), _extract_present_count(probe_map))
+    computed = compute_rolling_fps_stats(session.presents, present_count=present_count)
+    return {
+        "fps_steady_avg": (
+            _sanitize_non_negative_float(session.fps_steady_avg, digits=2)
+            if session.fps_steady_avg is not None
+            else computed["fps_steady_avg"]
+        ),
+        "fps_p50_window": (
+            _sanitize_non_negative_float(session.fps_p50_window, digits=2)
+            if session.fps_p50_window is not None
+            else computed["fps_p50_window"]
+        ),
+        "fps_max_window": (
+            _sanitize_non_negative_float(session.fps_max_window, digits=2)
+            if session.fps_max_window is not None
+            else computed["fps_max_window"]
+        ),
+        "windows_ge_30fps_pct": (
+            _sanitize_non_negative_float(session.windows_ge_30fps_pct, digits=1)
+            if session.windows_ge_30fps_pct is not None
+            else computed["windows_ge_30fps_pct"]
+        ),
+    }
+
+
+def _extract_swapchain_probe_stats(probe: Mapping[str, Any] | None) -> dict[str, int | float | None]:
+    """Extract swapchain non-black probe telemetry when present in `boot_state.gpu`."""
+    out: dict[str, int | float | None] = {
+        "swapchainProbeCount": None,
+        "lastSampledMaxLuma": None,
+        "suppressedBlackFrames": None,
+    }
+    if not isinstance(probe, Mapping):
+        return out
+    raw_boot = probe.get("bootState")
+    if not isinstance(raw_boot, Mapping):
+        raw_boot = probe.get("boot_state")
+    boot_state = raw_boot if isinstance(raw_boot, Mapping) else {}
+    gpu = boot_state.get("gpu") if isinstance(boot_state.get("gpu"), Mapping) else {}
+    diag = probe.get("diagnostics") if isinstance(probe.get("diagnostics"), Mapping) else {}
+
+    for src in (gpu, boot_state, diag):
+        if out["swapchainProbeCount"] is None:
+            for key in ("swapchainProbeCount", "swapchain_probe_count"):
+                val = _sanitize_optional_non_negative_int(src.get(key))
+                if val is not None:
+                    out["swapchainProbeCount"] = val
+                    break
+        if out["lastSampledMaxLuma"] is None:
+            for key in ("lastSampledMaxLuma", "last_sampled_max_luma"):
+                raw_val = src.get(key)
+                int_val = _sanitize_optional_non_negative_int(raw_val)
+                if int_val is not None:
+                    out["lastSampledMaxLuma"] = int_val
+                    break
+                float_val = _sanitize_non_negative_float(raw_val, digits=2)
+                if float_val is not None:
+                    out["lastSampledMaxLuma"] = float_val
+                    break
+        if out["suppressedBlackFrames"] is None:
+            for key in ("suppressedBlackFrames", "suppressed_black_frames"):
+                val = _sanitize_optional_non_negative_int(src.get(key))
+                if val is not None:
+                    out["suppressedBlackFrames"] = val
+                    break
+    return out
+
+
 def _sample_present_record(probe: Mapping[str, Any], index: int, wall_ms: float) -> dict[str, Any]:
     counts = _extract_gpu_counts(probe)
+    present_count = _extract_present_count(probe)
     return {
         "index": index,
         "wall_ms": round(wall_ms, 2),
+        "present_count": present_count,
         "dispatches": 0,
         "import_calls": 0,
         "counters": {
@@ -2772,6 +3004,7 @@ def run_browser_session(
     mp4_fps: float | None = None,
     mp4_skip_black: bool = False,
     hide_hud: bool = False,
+    hold_until_visible: str | None = None,
     capture_frames_dir: Path | None = None,
     capture_interval_sec: float | None = None,
     input_script: str | None = None,
@@ -2793,6 +3026,7 @@ def run_browser_session(
     clean_input_script = validate_input_script_preset(input_script)
     clean_threshold_mb = validate_stream_threshold_mb(stream_threshold_mb)
     clean_mp4_fps = validate_mp4_fps(mp4_fps)
+    clean_hold_until_visible = validate_hold_until_visible(hold_until_visible)
     effective_hide_hud = bool(hide_hud)
     effective_mp4_skip_black = bool(mp4_skip_black)
     effective_canvas_min_x = 0 if effective_hide_hud else CANVAS_MIN_X
@@ -2804,6 +3038,7 @@ def run_browser_session(
         stream_shaders=stream_shaders,
         stream_threshold_mb=clean_threshold_mb,
         hide_hud=effective_hide_hud,
+        hold_until_visible=clean_hold_until_visible,
     )
 
     if capture_frames_dir is not None:
@@ -2882,6 +3117,7 @@ def run_browser_session(
         capture_frames_enabled=want_frames,
         capture_frames_dir=repo_relative_label(frames_dir, repo) if want_frames else None,
         hide_hud=effective_hide_hud,
+        hold_until_visible=clean_hold_until_visible,
         mp4_fps=clean_mp4_fps,
         mp4_skip_black=effective_mp4_skip_black,
     )
@@ -2928,7 +3164,7 @@ def run_browser_session(
             cdp.send("Log.enable")
             cdp.send("Page.enable")
             cdp.send("Page.navigate", {"url": target_url})
-        except CdpError as exc:
+        except (CdpError, TimeoutError, OSError) as exc:
             result.ok = False
             result.crashed = True
             result.status = "error"
@@ -2971,7 +3207,7 @@ def run_browser_session(
                         )
                         if non_black is True:
                             result.non_black_canvas_frames = (result.non_black_canvas_frames or 0) + 1
-            except (CdpError, ValueError, OSError):
+            except (CdpError, TimeoutError, ValueError, OSError):
                 pass
 
         def process_events(events: Sequence[dict[str, Any]]) -> None:
@@ -3009,11 +3245,11 @@ def run_browser_session(
                 resp = cdp.send(
                     "Runtime.evaluate",
                     {"expression": TELEMETRY_PROBE_JS, "returnByValue": True},
-                    timeout=5.0,
+                    timeout=CDP_PROBE_TIMEOUT_S,
                 )
                 val = (resp.get("result") or {}).get("value")
                 return val if isinstance(val, dict) else {}
-            except CdpError:
+            except (CdpError, TimeoutError, OSError):
                 return {}
 
         while time.monotonic() < end_time and not result.crashed:
@@ -3041,7 +3277,7 @@ def run_browser_session(
                                     {"expression": FORCE_SMOKE_JS, "awaitPromise": True, "returnByValue": True},
                                     timeout=5.0,
                                 )
-                            except CdpError:
+                            except (CdpError, TimeoutError, OSError):
                                 pass
                         smoke_triggered = True
                     present_count = _extract_present_count(probe)
@@ -3073,7 +3309,7 @@ def run_browser_session(
                         timeout=3.0,
                     )
                     result.scripted_inputs_sent += 1
-                except CdpError:
+                except (CdpError, TimeoutError, OSError):
                     pass
                 next_input = now + INPUT_PERIOD_S
 
@@ -3112,6 +3348,11 @@ def run_browser_session(
         result.js_heap_used_mb, result.js_heap_total_mb = _extract_js_heap_mb(result)
         result.audio_ring_attached, result.audio_frames_drained = _extract_audio_ring_summary(result)
         result.present_fps_avg = _extract_present_fps_avg(result)
+        rolling_fps = _extract_rolling_fps_stats(result)
+        result.fps_steady_avg = rolling_fps["fps_steady_avg"]
+        result.fps_p50_window = rolling_fps["fps_p50_window"]
+        result.fps_max_window = rolling_fps["fps_max_window"]
+        result.windows_ge_30fps_pct = rolling_fps["windows_ge_30fps_pct"]
         if result.crashed:
             result.ok = False
             result.exit_code = 1
@@ -3198,6 +3439,8 @@ def build_boot_report(
     effective_js_heap_used_mb, effective_js_heap_total_mb = _extract_js_heap_mb(session, probe)
     effective_audio_ring_attached, effective_audio_frames_drained = _extract_audio_ring_summary(session, probe)
     effective_present_fps_avg = _extract_present_fps_avg(session, probe)
+    effective_rolling_fps = _extract_rolling_fps_stats(session, probe)
+    effective_swapchain_probe = _extract_swapchain_probe_stats(probe)
 
     milestones: list[dict[str, Any]] = []
     raw_milestones = tracer.get("milestones")
@@ -3284,6 +3527,12 @@ def build_boot_report(
         summary["audio_frames_drained"] = effective_audio_frames_drained
     if effective_present_fps_avg is not None:
         summary["present_fps_avg"] = effective_present_fps_avg
+    for fps_key in ("fps_steady_avg", "fps_p50_window", "fps_max_window", "windows_ge_30fps_pct"):
+        if effective_rolling_fps[fps_key] is not None:
+            summary[fps_key] = effective_rolling_fps[fps_key]
+    for probe_key in ("swapchainProbeCount", "lastSampledMaxLuma", "suppressedBlackFrames"):
+        if effective_swapchain_probe[probe_key] is not None:
+            summary[probe_key] = effective_swapchain_probe[probe_key]
 
     report: dict[str, Any] = {
         "schema": REPORT_SCHEMA,
@@ -3301,6 +3550,10 @@ def build_boot_report(
         "audio_ring_attached": effective_audio_ring_attached,
         "audio_frames_drained": effective_audio_frames_drained,
         "present_fps_avg": effective_present_fps_avg,
+        "fps_steady_avg": effective_rolling_fps["fps_steady_avg"],
+        "fps_p50_window": effective_rolling_fps["fps_p50_window"],
+        "fps_max_window": effective_rolling_fps["fps_max_window"],
+        "windows_ge_30fps_pct": effective_rolling_fps["windows_ge_30fps_pct"],
         "status": status,
         "phase": phase,
         "exit_code": session.exit_code,
@@ -3348,6 +3601,7 @@ def build_telemetry_payload(
     stream_threshold_mb: float | None = None,
     boot_options: Mapping[str, Any] | None = None,
     hide_hud: bool = False,
+    hold_until_visible: str | None = None,
     mp4_fps: float | None = None,
     mp4_skip_black: bool = False,
 ) -> dict[str, Any]:
@@ -3370,7 +3624,14 @@ def build_telemetry_payload(
     effective_js_heap_used_mb, effective_js_heap_total_mb = _extract_js_heap_mb(session, probe)
     effective_audio_ring_attached, effective_audio_frames_drained = _extract_audio_ring_summary(session, probe)
     effective_present_fps_avg = _extract_present_fps_avg(session, probe)
+    effective_rolling_fps = _extract_rolling_fps_stats(session, probe)
+    effective_swapchain_probe = _extract_swapchain_probe_stats(probe)
     effective_hide_hud = bool(hide_hud or session.hide_hud)
+    effective_hold_until_visible = (
+        validate_hold_until_visible(hold_until_visible)
+        if hold_until_visible is not None
+        else session.hold_until_visible
+    )
     effective_mp4_fps = mp4_fps if mp4_fps is not None else session.mp4_fps
     effective_mp4_skip_black = bool(mp4_skip_black or session.mp4_skip_black)
     summary: dict[str, Any] = {
@@ -3404,50 +3665,63 @@ def build_telemetry_payload(
         summary["audio_frames_drained"] = effective_audio_frames_drained
     if effective_present_fps_avg is not None:
         summary["present_fps_avg"] = effective_present_fps_avg
-    return sanitize_value(
-        {
-            "schema": "playgta6-browser-telemetry",
-            "schema_version": 1,
-            "preset": preset,
-            "smoke": smoke,
-            "headless": headless,
-            "hide_hud": effective_hide_hud,
-            "inputScript": effective_input_script,
-            "gpu_adapter": effective_gpu_adapter,
-            "first_visible_frame_s": effective_first_visible_frame_s,
-            "black_loading_s": effective_black_loading_s,
-            "js_heap_used_mb": effective_js_heap_used_mb,
-            "js_heap_total_mb": effective_js_heap_total_mb,
-            "audio_ring_attached": effective_audio_ring_attached,
-            "audio_frames_drained": effective_audio_frames_drained,
-            "present_fps_avg": effective_present_fps_avg,
-            "stream_shaders": effective_stream_shaders,
-            "stream_threshold_mb": effective_stream_threshold_mb,
-            "boot_options": dict(effective_boot_options) if effective_boot_options is not None else None,
-            "elapsed_ms": round(float(session.elapsed_ms), 2),
-            "status": session.status,
-            "crashed": session.crashed,
-            "server": session.server_ready,
-            "capabilities": probe.get("capabilities") or {},
-            "boot_state": probe.get("bootState"),
-            "diagnostics": probe.get("diagnostics"),
-            "boot_tracer": probe.get("tracerSummary"),
-            "hud": probe.get("hud"),
-            "summary": summary,
-            "presents_sampled": len(session.presents),
-            "first_present_ms": session.first_present_ms,
-            "scripted_inputs_sent": session.scripted_inputs_sent,
-            "captured_frames": list(session.captured_frames),
-            "capturedFrames": len(session.captured_frames),
-            "nonBlackCanvasFrames": session.non_black_canvas_frames,
-            "capture_frames_dir": session.capture_frames_dir,
-            "mp4": session.mp4_path,
-            "mp4_fps": effective_mp4_fps,
-            "mp4_skip_black": effective_mp4_skip_black,
-            "page_error_count": len(session.page_errors),
-            "warnings": list(session.warnings),
-        }
-    )
+    for fps_key in ("fps_steady_avg", "fps_p50_window", "fps_max_window", "windows_ge_30fps_pct"):
+        if effective_rolling_fps[fps_key] is not None:
+            summary[fps_key] = effective_rolling_fps[fps_key]
+    for probe_key in ("swapchainProbeCount", "lastSampledMaxLuma", "suppressedBlackFrames"):
+        if effective_swapchain_probe[probe_key] is not None:
+            summary[probe_key] = effective_swapchain_probe[probe_key]
+    telemetry_payload: dict[str, Any] = {
+        "schema": "playgta6-browser-telemetry",
+        "schema_version": 1,
+        "preset": preset,
+        "smoke": smoke,
+        "headless": headless,
+        "hide_hud": effective_hide_hud,
+        "hold_until_visible": effective_hold_until_visible,
+        "inputScript": effective_input_script,
+        "gpu_adapter": effective_gpu_adapter,
+        "first_visible_frame_s": effective_first_visible_frame_s,
+        "black_loading_s": effective_black_loading_s,
+        "js_heap_used_mb": effective_js_heap_used_mb,
+        "js_heap_total_mb": effective_js_heap_total_mb,
+        "audio_ring_attached": effective_audio_ring_attached,
+        "audio_frames_drained": effective_audio_frames_drained,
+        "present_fps_avg": effective_present_fps_avg,
+        "fps_steady_avg": effective_rolling_fps["fps_steady_avg"],
+        "fps_p50_window": effective_rolling_fps["fps_p50_window"],
+        "fps_max_window": effective_rolling_fps["fps_max_window"],
+        "windows_ge_30fps_pct": effective_rolling_fps["windows_ge_30fps_pct"],
+        "stream_shaders": effective_stream_shaders,
+        "stream_threshold_mb": effective_stream_threshold_mb,
+        "boot_options": dict(effective_boot_options) if effective_boot_options is not None else None,
+        "elapsed_ms": round(float(session.elapsed_ms), 2),
+        "status": session.status,
+        "crashed": session.crashed,
+        "server": session.server_ready,
+        "capabilities": probe.get("capabilities") or {},
+        "boot_state": probe.get("bootState"),
+        "diagnostics": probe.get("diagnostics"),
+        "boot_tracer": probe.get("tracerSummary"),
+        "hud": probe.get("hud"),
+        "summary": summary,
+        "presents_sampled": len(session.presents),
+        "first_present_ms": session.first_present_ms,
+        "scripted_inputs_sent": session.scripted_inputs_sent,
+        "captured_frames": list(session.captured_frames),
+        "capturedFrames": len(session.captured_frames),
+        "nonBlackCanvasFrames": session.non_black_canvas_frames,
+        "capture_frames_dir": session.capture_frames_dir,
+        "mp4": session.mp4_path,
+        "mp4_fps": effective_mp4_fps,
+        "mp4_skip_black": effective_mp4_skip_black,
+        "page_error_count": len(session.page_errors),
+        "warnings": list(session.warnings),
+    }
+    for probe_key in ("swapchainProbeCount", "lastSampledMaxLuma", "suppressedBlackFrames"):
+        if effective_swapchain_probe[probe_key] is not None:
+            telemetry_payload[probe_key] = effective_swapchain_probe[probe_key]
+    return sanitize_value(telemetry_payload)
 
 
 def load_report(path: Path) -> dict[str, Any] | None:
@@ -3501,9 +3775,53 @@ def digest(report: dict[str, Any], exit_code: int, max_counters: int = 12) -> st
         present_fps_avg = _sanitize_non_negative_float(summary.get("present_fps_avg"), digits=2)
     if present_fps_avg is not None:
         lines.append(f"present_fps_avg: {present_fps_avg:.2f}")
+    fps_steady_avg = _sanitize_non_negative_float(report.get("fps_steady_avg"), digits=2)
+    if fps_steady_avg is None:
+        fps_steady_avg = _sanitize_non_negative_float(summary.get("fps_steady_avg"), digits=2)
+    fps_p50_window = _sanitize_non_negative_float(report.get("fps_p50_window"), digits=2)
+    if fps_p50_window is None:
+        fps_p50_window = _sanitize_non_negative_float(summary.get("fps_p50_window"), digits=2)
+    fps_max_window = _sanitize_non_negative_float(report.get("fps_max_window"), digits=2)
+    if fps_max_window is None:
+        fps_max_window = _sanitize_non_negative_float(summary.get("fps_max_window"), digits=2)
+    windows_ge_30fps_pct = _sanitize_non_negative_float(report.get("windows_ge_30fps_pct"), digits=1)
+    if windows_ge_30fps_pct is None:
+        windows_ge_30fps_pct = _sanitize_non_negative_float(summary.get("windows_ge_30fps_pct"), digits=1)
+    fps_window_parts: list[str] = []
+    if fps_steady_avg is not None:
+        fps_window_parts.append(f"fps_steady_avg={fps_steady_avg:.2f}")
+    if fps_p50_window is not None:
+        fps_window_parts.append(f"fps_p50_window={fps_p50_window:.2f}")
+    if fps_max_window is not None:
+        fps_window_parts.append(f"fps_max_window={fps_max_window:.2f}")
+    if windows_ge_30fps_pct is not None:
+        fps_window_parts.append(f"windows_ge_30fps_pct={windows_ge_30fps_pct:.1f}%")
+    if fps_window_parts:
+        lines.append(f"fps_windows: {', '.join(fps_window_parts)}")
     gpu_adapter = sanitize_gpu_adapter(report.get("gpu_adapter") or summary.get("gpu_adapter"))
     if gpu_adapter:
         lines.append(f"gpu_adapter: {gpu_adapter}")
+    swapchain_probe_count = _sanitize_optional_non_negative_int(report.get("swapchainProbeCount"))
+    if swapchain_probe_count is None:
+        swapchain_probe_count = _sanitize_optional_non_negative_int(summary.get("swapchainProbeCount"))
+    raw_max_luma = report.get("lastSampledMaxLuma")
+    if raw_max_luma is None:
+        raw_max_luma = summary.get("lastSampledMaxLuma")
+    last_sampled_max_luma: int | float | None = _sanitize_optional_non_negative_int(raw_max_luma)
+    if last_sampled_max_luma is None:
+        last_sampled_max_luma = _sanitize_non_negative_float(raw_max_luma, digits=2)
+    suppressed_black_frames = _sanitize_optional_non_negative_int(report.get("suppressedBlackFrames"))
+    if suppressed_black_frames is None:
+        suppressed_black_frames = _sanitize_optional_non_negative_int(summary.get("suppressedBlackFrames"))
+    probe_parts: list[str] = []
+    if swapchain_probe_count is not None:
+        probe_parts.append(f"swapchainProbeCount={swapchain_probe_count}")
+    if last_sampled_max_luma is not None:
+        probe_parts.append(f"lastSampledMaxLuma={last_sampled_max_luma}")
+    if suppressed_black_frames is not None:
+        probe_parts.append(f"suppressedBlackFrames={suppressed_black_frames}")
+    if probe_parts:
+        lines.append(f"swapchain_probe: {', '.join(probe_parts)}")
     first_visible_frame_s = _sanitize_non_negative_float(
         report.get("first_visible_frame_s"), digits=3
     )
@@ -3698,6 +4016,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="append hud=0 to the target URL for clean fullscreen captures without the HUD card",
     )
+    p.add_argument(
+        "--hold-until-visible",
+        choices=HOLD_UNTIL_VISIBLE_CHOICES,
+        default=None,
+        help=(
+            "override splash hold-until-visible gating via URL query parameter "
+            "(on: holdUntilVisible=1, off: holdUntilVisible=0, auto/omitted: page default)"
+        ),
+    )
     p.add_argument("--baseline", help="earlier run (name in runs-dir or directory path) to compare against")
     p.add_argument("--ignore", action="append", default=[], metavar="PATTERN", help="compare_boot_reports --ignore")
     p.add_argument("--time-tolerance", type=float, metavar="REL", help="compare_boot_reports --time-tolerance")
@@ -3819,6 +4146,7 @@ def _run(
     mp4_fps = validate_mp4_fps(args.mp4_fps)
     mp4_skip_black = bool(args.mp4_skip_black)
     hide_hud = bool(args.hide_hud)
+    hold_until_visible = validate_hold_until_visible(args.hold_until_visible)
     quiet_server = bool(args.quiet_server)
     if args.jobs < 1:
         raise RunnerError("--jobs must be >= 1")
@@ -3946,6 +4274,7 @@ def _run(
             stream_shaders=stream_shaders,
             stream_threshold_mb=stream_threshold_mb,
             hide_hud=hide_hud,
+            hold_until_visible=hold_until_visible,
         )
         dry_payload = sanitize_value(
             {
@@ -3956,6 +4285,7 @@ def _run(
                 "duration_s": duration_s,
                 "headless": args.headless,
                 "hide_hud": hide_hud,
+                "hold_until_visible": hold_until_visible,
                 "send_input": send_input,
                 "input_script": input_script,
                 "inputScript": input_script,
@@ -4056,6 +4386,7 @@ def _run(
         mp4_fps=mp4_fps,
         mp4_skip_black=mp4_skip_black,
         hide_hud=hide_hud,
+        hold_until_visible=hold_until_visible,
         input_script=input_script,
         stream_shaders=stream_shaders,
         stream_threshold_mb=stream_threshold_mb,
@@ -4085,6 +4416,7 @@ def _run(
         stream_threshold_mb=stream_threshold_mb,
         boot_options=resolved_boot_options,
         hide_hud=hide_hud,
+        hold_until_visible=hold_until_visible,
         mp4_fps=mp4_fps,
         mp4_skip_black=mp4_skip_black,
     )
@@ -4098,6 +4430,7 @@ def _run(
             "duration_s": duration_s,
             "headless": bool(args.headless),
             "hide_hud": hide_hud,
+            "hold_until_visible": hold_until_visible,
             "send_input": send_input,
             "input_script": input_script,
             "inputScript": input_script,
