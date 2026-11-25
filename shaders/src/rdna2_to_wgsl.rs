@@ -530,9 +530,75 @@ struct CbvSlotPlan {
     highest_vec4_offset: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ResourceKey {
+    Table {
+        user_sgpr: u32,
+        table_byte_offset: u32,
+    },
+    StaticSampler(u32),
+    RawSlot(u8),
+}
+
+impl ResourceKey {
+    fn to_source(self) -> Option<WgslBindingSource> {
+        match self {
+            Self::Table {
+                user_sgpr,
+                table_byte_offset,
+            } => Some(WgslBindingSource::Table {
+                user_sgpr,
+                table_byte_offset,
+            }),
+            Self::StaticSampler(index) => Some(WgslBindingSource::StaticSampler { index }),
+            Self::RawSlot(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TexDim {
+    D2,
+    D2Array,
+    D3,
+}
+
+impl TexDim {
+    fn from_mimg_dim(dim: u8) -> Self {
+        match dim {
+            5 => Self::D2Array,
+            2 => Self::D3,
+            _ => Self::D2,
+        }
+    }
+
+    fn view_dimension_name(self) -> &'static str {
+        match self {
+            Self::D2 => "2d",
+            Self::D2Array => "2d-array",
+            Self::D3 => "3d",
+        }
+    }
+
+    fn extra_coord_vgprs(self) -> u8 {
+        match self {
+            Self::D2 => 0,
+            Self::D2Array | Self::D3 => 1,
+        }
+    }
+
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::D2, o) => o,
+            (s, Self::D2) => s,
+            (s, _) => s,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StorageBufSlotPlan {
-    srsrc: u8,
+    key: ResourceKey,
     writable: bool,
 }
 
@@ -549,20 +615,20 @@ struct ProgramPlan {
     vsharp_fetch_insts: BTreeSet<usize>,
     indirect_smem_cbv_keys: BTreeMap<usize, CbvKey>,
     cbv_sources: BTreeMap<CbvKey, WgslBindingSource>,
-    tex_sources: BTreeMap<u8, WgslBindingSource>,
-    samp_sources: BTreeMap<u8, WgslBindingSource>,
-    storage_buf_sources: BTreeMap<u8, WgslBindingSource>,
-    storage_tex_sources: BTreeMap<u8, WgslBindingSource>,
-    tex_arrayed: BTreeSet<u8>,
-    storage_tex_arrayed: BTreeSet<u8>,
+    inst_tex_keys: BTreeMap<usize, ResourceKey>,
+    inst_samp_keys: BTreeMap<usize, ResourceKey>,
+    inst_storage_buf_keys: BTreeMap<usize, ResourceKey>,
+    inst_storage_tex_keys: BTreeMap<usize, ResourceKey>,
+    tex_dims: BTreeMap<ResourceKey, TexDim>,
+    storage_tex_dims: BTreeMap<ResourceKey, TexDim>,
     vertex_storage_buf_insts: BTreeSet<usize>,
     vertex_fetch_vb_slots: BTreeMap<usize, u32>,
     cbv_slots: Vec<CbvSlotPlan>,
     cbv_vec4_count: u32,
-    tex_slots: Vec<u8>,
-    samp_slots: Vec<u8>,
+    tex_slots: Vec<ResourceKey>,
+    samp_slots: Vec<ResourceKey>,
     storage_buf_slots: Vec<StorageBufSlotPlan>,
-    storage_tex_slots: Vec<u8>,
+    storage_tex_slots: Vec<ResourceKey>,
     uses_lds: bool,
     frag_attrs: Vec<u8>,
     vs_params: Vec<u8>,
@@ -974,7 +1040,7 @@ enum SgprOrigin {
         vb_slot: u32,
     },
     /// Materialized from immediate/literal constants (used to detect inline static sampler S#).
-    ConstImmediate,
+    ConstImmediate { def_inst_idx: usize },
 }
 
 #[derive(Debug, Clone)]
@@ -985,6 +1051,7 @@ struct VSharpCandidate {
     table_sbase: u8,
     user_sgpr: Option<u32>,
     table_offset: i32,
+    is_dynamic_desc: bool,
     buffer_load_users: Vec<(usize, i32)>,
     tainted_by_scalar_read: bool,
     /// Vertex-shader `idxen` MUBUF/MTBUF attribute fetches using this V# as `srsrc`.
@@ -999,10 +1066,10 @@ struct DescriptorAnalysis {
     indirect_smem_cbv_keys: BTreeMap<usize, CbvKey>,
     cbv_sources: BTreeMap<CbvKey, WgslBindingSource>,
     direct_smem_user_sgpr: BTreeMap<usize, u32>,
-    tex_sources: BTreeMap<u8, WgslBindingSource>,
-    samp_sources: BTreeMap<u8, WgslBindingSource>,
-    storage_buf_sources: BTreeMap<u8, WgslBindingSource>,
-    storage_tex_sources: BTreeMap<u8, WgslBindingSource>,
+    inst_tex_keys: BTreeMap<usize, ResourceKey>,
+    inst_samp_keys: BTreeMap<usize, ResourceKey>,
+    inst_storage_buf_keys: BTreeMap<usize, ResourceKey>,
+    inst_storage_tex_keys: BTreeMap<usize, ResourceKey>,
     vertex_storage_buf_insts: BTreeSet<usize>,
     vertex_fetch_vb_slots: BTreeMap<usize, u32>,
 }
@@ -1067,6 +1134,7 @@ fn analyze_vsharp_indirections(
     let mut finished: Vec<VSharpCandidate> = Vec::new();
     let mut origins = [SgprOrigin::Unknown; 106];
     let mut next_static_sampler_index: u32 = 0;
+    let mut static_sampler_by_def: BTreeMap<usize, u32> = BTreeMap::new();
 
     // Seed console ABI initial SGPR origins:
     //   Graphics: user data starts at s8; vertex hardware VB table ptr is in s[0:1].
@@ -1118,13 +1186,15 @@ fn analyze_vsharp_indirections(
                         } else if decode_inline_u32_src(u16::from(*ssrc0), *literal).is_some()
                             || *ssrc0 == 0xFF
                         {
-                            SgprOrigin::ConstImmediate
+                            SgprOrigin::ConstImmediate {
+                                def_inst_idx: inst_idx,
+                            }
                         } else {
                             SgprOrigin::Unknown
                         };
                         origins[*sdst as usize] = src_origin;
                         origins[(*sdst + 1) as usize] = match src_origin {
-                            SgprOrigin::ConstImmediate => SgprOrigin::ConstImmediate,
+                            SgprOrigin::ConstImmediate { .. } => src_origin,
                             _ => SgprOrigin::Unknown,
                         };
                     } else if *sdst == 105 {
@@ -1150,9 +1220,13 @@ fn analyze_vsharp_indirections(
                             {
                                 // Zero-extending a 32-bit console table pointer in s[2k:2k+1]:
                                 // preserve the low SGPR's UserTable/VbTablePtr origin.
-                                origins[*sdst as usize] = SgprOrigin::ConstImmediate;
+                                origins[*sdst as usize] = SgprOrigin::ConstImmediate {
+                                    def_inst_idx: inst_idx,
+                                };
                             } else if *ssrc0 >= 128 {
-                                origins[*sdst as usize] = SgprOrigin::ConstImmediate;
+                                origins[*sdst as usize] = SgprOrigin::ConstImmediate {
+                                    def_inst_idx: inst_idx,
+                                };
                             } else {
                                 origins[*sdst as usize] = SgprOrigin::Unknown;
                             }
@@ -1170,7 +1244,9 @@ fn analyze_vsharp_indirections(
                     retire_overwritten_vsharps(&mut live, &mut finished, *sdst, 1);
                     origins[*sdst as usize] = if *op == 0x00 {
                         // s_movk_i32
-                        SgprOrigin::ConstImmediate
+                        SgprOrigin::ConstImmediate {
+                            def_inst_idx: inst_idx,
+                        }
                     } else {
                         SgprOrigin::Unknown
                     };
@@ -1192,7 +1268,20 @@ fn analyze_vsharp_indirections(
                 if pair1 && *ssrc1 <= 104 {
                     taint_vsharp_if_sgpr_read(&mut live, u16::from(*ssrc1 + 1));
                 }
-                if pair0 && *sdst <= 104 {
+                if *op == 0x25 && *sdst <= 104 {
+                    // s_bfm_b64 writes a 64-bit SGPR pair from two 32-bit operands (frequently
+                    // used to materialize inline static sampler S# descriptors).
+                    retire_overwritten_vsharps(&mut live, &mut finished, *sdst, 2);
+                    let imm_origin = if *ssrc0 >= 128 && *ssrc1 >= 128 {
+                        SgprOrigin::ConstImmediate {
+                            def_inst_idx: inst_idx,
+                        }
+                    } else {
+                        SgprOrigin::Unknown
+                    };
+                    origins[*sdst as usize] = imm_origin;
+                    origins[(*sdst + 1) as usize] = imm_origin;
+                } else if pair0 && *sdst <= 104 {
                     retire_overwritten_vsharps(&mut live, &mut finished, *sdst, 2);
                     origins[*sdst as usize] = SgprOrigin::Unknown;
                     origins[(*sdst + 1) as usize] = SgprOrigin::Unknown;
@@ -1224,16 +1313,20 @@ fn analyze_vsharp_indirections(
                                 byte_offset: byte_offset.saturating_add(imm),
                             };
                         }
-                    } else if *op == 0x29 {
+                    } else if *op == 0x24 {
                         // s_bfm_b32 with immediate operands (common in inline static sampler S#).
                         if *ssrc0 >= 128 && *ssrc1 >= 128 {
-                            next_origin = SgprOrigin::ConstImmediate;
+                            next_origin = SgprOrigin::ConstImmediate {
+                                def_inst_idx: inst_idx,
+                            };
                         }
                     } else if matches!(*op, 0x0E | 0x10)
                         && *ssrc0 >= 128
                         && *ssrc1 >= 128
                     {
-                        next_origin = SgprOrigin::ConstImmediate;
+                        next_origin = SgprOrigin::ConstImmediate {
+                            def_inst_idx: inst_idx,
+                        };
                     }
                     origins[*sdst as usize] = next_origin;
                 }
@@ -1302,50 +1395,56 @@ fn analyze_vsharp_indirections(
                         }
                     }
                 }
-                // Track 4-, 8-, and 16-dword descriptor loads (`s_load_dwordx4/x8/x16`).
+                // Track 4-, 8-, and 16-dword descriptor loads (`s_load_dwordx4/x8/x16`), including
+                // dynamic SM 6.6 heap fetches (`SamplerDescriptorHeap` / `ResourceDescriptorHeap`)
+                // so pure descriptor loads never emit spurious 256-byte uniform buffers.
                 if matches!(*op, 0x02 | 0x03 | 0x04)
-                    && !is_dynamic
                     && (*sdata % 2 == 0)
                     && let Some(count) = smem_load_dword_count(*op)
                     && sdata.saturating_add(count) <= 106
                 {
-                    let inline_off = if (128..=192).contains(soffset) {
-                        i32::from(*soffset - 128)
+                    let (user_sgpr, eff_table_off) = if !is_dynamic {
+                        let inline_off = if (128..=192).contains(soffset) {
+                            i32::from(*soffset - 128)
+                        } else {
+                            0
+                        };
+                        let raw_off = offset.saturating_add(inline_off);
+                        let (user_sgpr, eff_table_off, is_vb_table) = match base_origin {
+                            SgprOrigin::VbTablePtr => (None, raw_off, true),
+                            SgprOrigin::UserTable {
+                                user_sgpr,
+                                byte_offset,
+                            } => (Some(user_sgpr), byte_offset.saturating_add(raw_off), false),
+                            _ => (None, raw_off, false),
+                        };
+                        if is_vb_table {
+                            for k in 0..count {
+                                let reg = sdata.saturating_add(k);
+                                let vb_slot = (eff_table_off.saturating_add(i32::from(k) * 4))
+                                    .max(0) as u32
+                                    / 16;
+                                origins[reg as usize] = SgprOrigin::VbDesc {
+                                    def_inst_idx: inst_idx,
+                                    vb_slot,
+                                };
+                            }
+                        } else if let Some(u) = user_sgpr {
+                            for k in 0..count {
+                                let reg = sdata.saturating_add(k);
+                                let byte_off =
+                                    (eff_table_off.saturating_add(i32::from(k) * 4)).max(0) as u32;
+                                origins[reg as usize] = SgprOrigin::TableDesc {
+                                    def_inst_idx: inst_idx,
+                                    user_sgpr: u,
+                                    table_byte_offset: byte_off,
+                                };
+                            }
+                        }
+                        (user_sgpr, eff_table_off)
                     } else {
-                        0
+                        (None, 0)
                     };
-                    let raw_off = offset.saturating_add(inline_off);
-                    let (user_sgpr, eff_table_off, is_vb_table) = match base_origin {
-                        SgprOrigin::VbTablePtr => (None, raw_off, true),
-                        SgprOrigin::UserTable {
-                            user_sgpr,
-                            byte_offset,
-                        } => (Some(user_sgpr), byte_offset.saturating_add(raw_off), false),
-                        _ => (None, raw_off, false),
-                    };
-                    if is_vb_table {
-                        for k in 0..count {
-                            let reg = sdata.saturating_add(k);
-                            let vb_slot = (eff_table_off.saturating_add(i32::from(k) * 4)).max(0)
-                                as u32
-                                / 16;
-                            origins[reg as usize] = SgprOrigin::VbDesc {
-                                def_inst_idx: inst_idx,
-                                vb_slot,
-                            };
-                        }
-                    } else if let Some(u) = user_sgpr {
-                        for k in 0..count {
-                            let reg = sdata.saturating_add(k);
-                            let byte_off =
-                                (eff_table_off.saturating_add(i32::from(k) * 4)).max(0) as u32;
-                            origins[reg as usize] = SgprOrigin::TableDesc {
-                                def_inst_idx: inst_idx,
-                                user_sgpr: u,
-                                table_byte_offset: byte_off,
-                            };
-                        }
-                    }
                     live.push(VSharpCandidate {
                         def_inst_idx: inst_idx,
                         dst_sgpr: *sdata,
@@ -1353,6 +1452,7 @@ fn analyze_vsharp_indirections(
                         table_sbase: *sbase,
                         user_sgpr,
                         table_offset: eff_table_off,
+                        is_dynamic_desc: is_dynamic,
                         buffer_load_users: Vec::new(),
                         tainted_by_scalar_read: false,
                         vertex_fetch_users: 0,
@@ -1439,10 +1539,10 @@ fn analyze_vsharp_indirections(
             } => {
                 if let Some(layout) = mimg_addr_layout(*op) {
                     let rsrc_sgpr = srsrc.saturating_mul(4);
-                    // Mark any live s_load_dwordx4/x8/x16 from a user-data descriptor table
+                    // Mark any live s_load_dwordx4/x8/x16 from a descriptor table or dynamic heap
                     // providing T# as a descriptor fetch (so it never allocates a bogus CBV).
                     for cand in live.iter_mut() {
-                        if cand.user_sgpr.is_some()
+                        if (cand.user_sgpr.is_some() || cand.is_dynamic_desc)
                             && rsrc_sgpr >= cand.dst_sgpr
                             && rsrc_sgpr < cand.dst_sgpr.saturating_add(cand.dword_count)
                         {
@@ -1457,20 +1557,20 @@ fn analyze_vsharp_indirections(
                         } = origins[rsrc_sgpr as usize]
                     {
                         out.vsharp_fetch_insts.insert(def_inst_idx);
-                        let src = WgslBindingSource::Table {
+                        let key = ResourceKey::Table {
                             user_sgpr,
                             table_byte_offset,
                         };
                         if layout.is_store {
-                            out.storage_tex_sources.entry(*srsrc).or_insert(src);
+                            out.inst_storage_tex_keys.insert(inst_idx, key);
                         } else {
-                            out.tex_sources.entry(*srsrc).or_insert(src);
+                            out.inst_tex_keys.insert(inst_idx, key);
                         }
                     }
                     if !layout.is_load && !layout.is_store {
                         let samp_sgpr = ssamp.saturating_mul(4);
                         for cand in live.iter_mut() {
-                            if cand.user_sgpr.is_some()
+                            if (cand.user_sgpr.is_some() || cand.is_dynamic_desc)
                                 && samp_sgpr >= cand.dst_sgpr
                                 && samp_sgpr < cand.dst_sgpr.saturating_add(cand.dword_count)
                             {
@@ -1485,19 +1585,24 @@ fn analyze_vsharp_indirections(
                                     table_byte_offset,
                                 } => {
                                     out.vsharp_fetch_insts.insert(def_inst_idx);
-                                    out.samp_sources.entry(*ssamp).or_insert(
-                                        WgslBindingSource::Table {
+                                    out.inst_samp_keys.insert(
+                                        inst_idx,
+                                        ResourceKey::Table {
                                             user_sgpr,
                                             table_byte_offset,
                                         },
                                     );
                                 }
-                                SgprOrigin::ConstImmediate => {
-                                    out.samp_sources.entry(*ssamp).or_insert_with(|| {
-                                        let idx = next_static_sampler_index;
-                                        next_static_sampler_index += 1;
-                                        WgslBindingSource::StaticSampler { index: idx }
-                                    });
+                                SgprOrigin::ConstImmediate { def_inst_idx } => {
+                                    let idx = *static_sampler_by_def
+                                        .entry(def_inst_idx)
+                                        .or_insert_with(|| {
+                                            let i = next_static_sampler_index;
+                                            next_static_sampler_index += 1;
+                                            i
+                                        });
+                                    out.inst_samp_keys
+                                        .insert(inst_idx, ResourceKey::StaticSampler(idx));
                                 }
                                 _ => {}
                             }
@@ -1534,8 +1639,9 @@ fn analyze_vsharp_indirections(
                         table_byte_offset,
                     } => {
                         out.vsharp_fetch_insts.insert(def_inst_idx);
-                        out.storage_buf_sources.entry(*srsrc).or_insert(
-                            WgslBindingSource::Table {
+                        out.inst_storage_buf_keys.insert(
+                            inst_idx,
+                            ResourceKey::Table {
                                 user_sgpr,
                                 table_byte_offset,
                             },
@@ -1582,8 +1688,9 @@ fn analyze_vsharp_indirections(
                         table_byte_offset,
                     } => {
                         out.vsharp_fetch_insts.insert(def_inst_idx);
-                        out.storage_buf_sources.entry(*srsrc).or_insert(
-                            WgslBindingSource::Table {
+                        out.inst_storage_buf_keys.insert(
+                            inst_idx,
+                            ResourceKey::Table {
                                 user_sgpr,
                                 table_byte_offset,
                             },
@@ -1618,7 +1725,7 @@ fn analyze_vsharp_indirections(
     finished.extend(live);
 
     for cand in finished {
-        if !cand.tainted_by_scalar_read && !cand.buffer_load_users.is_empty() {
+        if !cand.tainted_by_scalar_read && !cand.is_dynamic_desc && !cand.buffer_load_users.is_empty() {
             out.vsharp_fetch_insts.insert(cand.def_inst_idx);
             for (user_idx, delta_bytes) in cand.buffer_load_users {
                 let eff_off = cand.table_offset.saturating_add(delta_bytes);
@@ -1635,9 +1742,12 @@ fn analyze_vsharp_indirections(
                 }
             }
         } else if !cand.tainted_by_scalar_read
-            && (cand.used_as_descriptor || cand.vertex_fetch_users > 0)
+            && (cand.used_as_descriptor
+                || cand.vertex_fetch_users > 0
+                || (cand.is_dynamic_desc && !cand.buffer_load_users.is_empty()))
         {
-            // Pure descriptor fetch (T#/S#/VB V#/storage V#): never allocate a spurious CBV!
+            // Pure descriptor fetch (static or dynamic heap T#/S#/VB V#/storage V#):
+            // never allocate a spurious CBV!
             out.vsharp_fetch_insts.insert(cand.def_inst_idx);
         }
     }
@@ -1770,12 +1880,10 @@ fn plan_program(
     let vertex_fetch_vb_slots = desc_analysis.vertex_fetch_vb_slots;
 
     let mut cbv_usage: BTreeMap<CbvKey, CbvUsage> = BTreeMap::new();
-    let mut tex_rsrc_set: BTreeSet<u8> = BTreeSet::new();
-    let mut tex_arrayed: BTreeSet<u8> = BTreeSet::new();
-    let mut samp_rsrc_set: BTreeSet<u8> = BTreeSet::new();
-    let mut storage_buf_usage: BTreeMap<u8, bool> = BTreeMap::new();
-    let mut storage_tex_rsrc_set: BTreeSet<u8> = BTreeSet::new();
-    let mut storage_tex_arrayed: BTreeSet<u8> = BTreeSet::new();
+    let mut tex_dims: BTreeMap<ResourceKey, TexDim> = BTreeMap::new();
+    let mut samp_rsrc_set: BTreeSet<ResourceKey> = BTreeSet::new();
+    let mut storage_buf_usage: BTreeMap<ResourceKey, bool> = BTreeMap::new();
+    let mut storage_tex_dims: BTreeMap<ResourceKey, TexDim> = BTreeMap::new();
     let mut uses_lds = false;
     let mut has_buffer_fetch = false;
     let mut vertex_buf_fetches: BTreeMap<(u32, u16), VertexFetchPlan> = BTreeMap::new();
@@ -1984,7 +2092,7 @@ fn plan_program(
                     // `exec_lo` / `exec` destination (e.g. `s_or_b32 exec_lo, exec_lo, s0`).
                     needs_exec = true;
                 }
-                if pair0 && *sdst <= 104 {
+                if (pair0 || *op == 0x25) && *sdst <= 104 {
                     // 64-bit SGPR pair destination
                     sgprs.insert(*sdst);
                     sgprs.insert(*sdst + 1);
@@ -2320,14 +2428,19 @@ fn plan_program(
                 ..
             } => {
                 if let Some(layout) = mimg_addr_layout(*op) {
-                    let is_array = *dim == 5;
-                    let addr_vgprs = layout.total_vgprs.saturating_add(u8::from(is_array));
+                    let tex_dim = TexDim::from_mimg_dim(*dim);
+                    let addr_vgprs = layout.total_vgprs.saturating_add(tex_dim.extra_coord_vgprs());
                     if layout.is_store {
                         if stage != ShaderStage::Vertex {
-                            storage_tex_rsrc_set.insert(*srsrc);
-                            if is_array {
-                                storage_tex_arrayed.insert(*srsrc);
-                            }
+                            let key = desc_analysis
+                                .inst_storage_tex_keys
+                                .get(&inst_idx)
+                                .copied()
+                                .unwrap_or(ResourceKey::RawSlot(*srsrc));
+                            storage_tex_dims
+                                .entry(key)
+                                .and_modify(|d| *d = d.merge(tex_dim))
+                                .or_insert(tex_dim);
                             for a in 0..addr_vgprs {
                                 let reg = vaddr.saturating_add(a);
                                 vgprs.insert(reg);
@@ -2346,12 +2459,22 @@ fn plan_program(
                             }
                         }
                     } else {
-                        tex_rsrc_set.insert(*srsrc);
-                        if is_array {
-                            tex_arrayed.insert(*srsrc);
-                        }
+                        let key = desc_analysis
+                            .inst_tex_keys
+                            .get(&inst_idx)
+                            .copied()
+                            .unwrap_or(ResourceKey::RawSlot(*srsrc));
+                        tex_dims
+                            .entry(key)
+                            .and_modify(|d| *d = d.merge(tex_dim))
+                            .or_insert(tex_dim);
                         if !layout.is_load {
-                            samp_rsrc_set.insert(*ssamp);
+                            let skey = desc_analysis
+                                .inst_samp_keys
+                                .get(&inst_idx)
+                                .copied()
+                                .unwrap_or(ResourceKey::RawSlot(*ssamp));
+                            samp_rsrc_set.insert(skey);
                         }
                         for a in 0..addr_vgprs {
                             let reg = vaddr.saturating_add(a);
@@ -2401,8 +2524,13 @@ fn plan_program(
                     }
                 } else if let Some(buf_op) = mubuf_storage_op(*op) {
                     let writable = buf_op.is_store() && stage != ShaderStage::Vertex;
+                    let key = desc_analysis
+                        .inst_storage_buf_keys
+                        .get(&inst_idx)
+                        .copied()
+                        .unwrap_or(ResourceKey::RawSlot(*srsrc));
                     storage_buf_usage
-                        .entry(*srsrc)
+                        .entry(key)
                         .and_modify(|w| *w |= writable)
                         .or_insert(writable);
                     if *offen || *idxen {
@@ -2441,7 +2569,12 @@ fn plan_program(
                         }
                     }
                 } else if mubuf_is_atomic(*op) && stage != ShaderStage::Vertex {
-                    storage_buf_usage.insert(*srsrc, true);
+                    let key = desc_analysis
+                        .inst_storage_buf_keys
+                        .get(&inst_idx)
+                        .copied()
+                        .unwrap_or(ResourceKey::RawSlot(*srsrc));
+                    storage_buf_usage.insert(key, true);
                 }
             }
             Rdna2Detail::Mtbuf {
@@ -2485,8 +2618,13 @@ fn plan_program(
                     }
                 } else if let Some(buf_op) = mtbuf_storage_op(*op) {
                     let writable = buf_op.is_store() && stage != ShaderStage::Vertex;
+                    let key = desc_analysis
+                        .inst_storage_buf_keys
+                        .get(&inst_idx)
+                        .copied()
+                        .unwrap_or(ResourceKey::RawSlot(*srsrc));
                     storage_buf_usage
-                        .entry(*srsrc)
+                        .entry(key)
                         .and_modify(|w| *w |= writable)
                         .or_insert(writable);
                     if *offen || *idxen {
@@ -2799,13 +2937,13 @@ fn plan_program(
             }
         })
         .collect();
-    let tex_slots: Vec<u8> = tex_rsrc_set.into_iter().collect();
-    let samp_slots: Vec<u8> = samp_rsrc_set.into_iter().collect();
+    let tex_slots: Vec<ResourceKey> = tex_dims.keys().copied().collect();
+    let samp_slots: Vec<ResourceKey> = samp_rsrc_set.into_iter().collect();
     let storage_buf_slots: Vec<StorageBufSlotPlan> = storage_buf_usage
         .into_iter()
-        .map(|(srsrc, writable)| StorageBufSlotPlan { srsrc, writable })
+        .map(|(key, writable)| StorageBufSlotPlan { key, writable })
         .collect();
-    let storage_tex_slots: Vec<u8> = storage_tex_rsrc_set.into_iter().collect();
+    let storage_tex_slots: Vec<ResourceKey> = storage_tex_dims.keys().copied().collect();
 
     let cbv_vec4_count = cbv_slots
         .iter()
@@ -2826,12 +2964,12 @@ fn plan_program(
         vsharp_fetch_insts,
         indirect_smem_cbv_keys,
         cbv_sources: desc_analysis.cbv_sources,
-        tex_sources: desc_analysis.tex_sources,
-        samp_sources: desc_analysis.samp_sources,
-        storage_buf_sources: desc_analysis.storage_buf_sources,
-        storage_tex_sources: desc_analysis.storage_tex_sources,
-        tex_arrayed,
-        storage_tex_arrayed,
+        inst_tex_keys: desc_analysis.inst_tex_keys,
+        inst_samp_keys: desc_analysis.inst_samp_keys,
+        inst_storage_buf_keys: desc_analysis.inst_storage_buf_keys,
+        inst_storage_tex_keys: desc_analysis.inst_storage_tex_keys,
+        tex_dims,
+        storage_tex_dims,
         vertex_storage_buf_insts,
         vertex_fetch_vb_slots,
         cbv_slots,
@@ -2863,6 +3001,8 @@ struct CommonTypes {
     i32_ty: Handle<Type>,
     vec2_f32_ty: Handle<Type>,
     vec2_i32_ty: Handle<Type>,
+    vec3_f32_ty: Handle<Type>,
+    vec3_i32_ty: Handle<Type>,
     vec4_f32_ty: Handle<Type>,
 }
 
@@ -2879,13 +3019,17 @@ struct IrEmitter {
     types: CommonTypes,
     vsharp_fetch_insts: BTreeSet<usize>,
     indirect_smem_cbv_keys: BTreeMap<usize, CbvKey>,
+    inst_tex_keys: BTreeMap<usize, ResourceKey>,
+    inst_samp_keys: BTreeMap<usize, ResourceKey>,
+    inst_storage_buf_keys: BTreeMap<usize, ResourceKey>,
+    inst_storage_tex_keys: BTreeMap<usize, ResourceKey>,
     vertex_storage_buf_insts: BTreeSet<usize>,
     vertex_fetch_vb_slots: BTreeMap<usize, u32>,
     cb_globals: BTreeMap<CbvKey, (Handle<GlobalVariable>, u32)>,
-    tex_globals: BTreeMap<u8, (Handle<GlobalVariable>, bool)>,
-    samp_globals: BTreeMap<u8, Handle<GlobalVariable>>,
-    storage_buf_globals: BTreeMap<u8, (Handle<GlobalVariable>, bool)>,
-    storage_tex_globals: BTreeMap<u8, (Handle<GlobalVariable>, bool)>,
+    tex_globals: BTreeMap<ResourceKey, (Handle<GlobalVariable>, TexDim)>,
+    samp_globals: BTreeMap<ResourceKey, Handle<GlobalVariable>>,
+    storage_buf_globals: BTreeMap<ResourceKey, (Handle<GlobalVariable>, bool)>,
+    storage_tex_globals: BTreeMap<ResourceKey, (Handle<GlobalVariable>, TexDim)>,
     lds_global: Option<Handle<GlobalVariable>>,
     emitted_bindings: Vec<WgslBindingInfo>,
     stage: ShaderStage,
@@ -2978,6 +3122,14 @@ impl IrEmitter {
                 scalar: Scalar::F32,
             },
         );
+        let vec3_i32_ty = insert_type(
+            &mut module,
+            None,
+            TypeInner::Vector {
+                size: VectorSize::Tri,
+                scalar: Scalar::I32,
+            },
+        );
         let vec3_u32_ty = insert_type(
             &mut module,
             None,
@@ -3009,6 +3161,8 @@ impl IrEmitter {
             i32_ty,
             vec2_f32_ty,
             vec2_i32_ty,
+            vec3_f32_ty,
+            vec3_i32_ty,
             vec4_f32_ty,
         };
 
@@ -3018,10 +3172,13 @@ impl IrEmitter {
         //   samp0 -> @group(0) @binding(2)
         //   Additional cb1../tex1../samp1.. -> @group(0) @binding(3+)
         let mut cb_globals: BTreeMap<CbvKey, (Handle<GlobalVariable>, u32)> = BTreeMap::new();
-        let mut tex_globals: BTreeMap<u8, (Handle<GlobalVariable>, bool)> = BTreeMap::new();
-        let mut samp_globals: BTreeMap<u8, Handle<GlobalVariable>> = BTreeMap::new();
-        let mut storage_buf_globals: BTreeMap<u8, (Handle<GlobalVariable>, bool)> = BTreeMap::new();
-        let mut storage_tex_globals: BTreeMap<u8, (Handle<GlobalVariable>, bool)> = BTreeMap::new();
+        let mut tex_globals: BTreeMap<ResourceKey, (Handle<GlobalVariable>, TexDim)> =
+            BTreeMap::new();
+        let mut samp_globals: BTreeMap<ResourceKey, Handle<GlobalVariable>> = BTreeMap::new();
+        let mut storage_buf_globals: BTreeMap<ResourceKey, (Handle<GlobalVariable>, bool)> =
+            BTreeMap::new();
+        let mut storage_tex_globals: BTreeMap<ResourceKey, (Handle<GlobalVariable>, TexDim)> =
+            BTreeMap::new();
         let mut emitted_bindings: Vec<WgslBindingInfo> = Vec::new();
         let has_any_binding = !plan.cbv_slots.is_empty()
             || !plan.tex_slots.is_empty()
@@ -3033,22 +3190,16 @@ impl IrEmitter {
                 .cbv_slots
                 .iter()
                 .all(|s| plan.cbv_sources.contains_key(&s.key))
-            && plan
-                .tex_slots
-                .iter()
-                .all(|s| plan.tex_sources.contains_key(s))
-            && plan
-                .samp_slots
-                .iter()
-                .all(|s| plan.samp_sources.contains_key(s))
+            && plan.tex_slots.iter().all(|s| s.to_source().is_some())
+            && plan.samp_slots.iter().all(|s| s.to_source().is_some())
             && plan
                 .storage_buf_slots
                 .iter()
-                .all(|s| plan.storage_buf_sources.contains_key(&s.srsrc))
+                .all(|s| s.key.to_source().is_some())
             && plan
                 .storage_tex_slots
                 .iter()
-                .all(|s| plan.storage_tex_sources.contains_key(s));
+                .all(|s| s.to_source().is_some());
         let binding_base: u32 =
             if plan.stage == ShaderStage::Fragment && all_bindings_reflected {
                 FRAGMENT_REFLECTED_BINDING_OFFSET
@@ -3138,15 +3289,16 @@ impl IrEmitter {
         if !plan.tex_slots.is_empty() {
             let mut tex_2d_ty: Option<Handle<Type>> = None;
             let mut tex_2d_array_ty: Option<Handle<Type>> = None;
+            let mut tex_3d_ty: Option<Handle<Type>> = None;
             let samp_ty = insert_type(
                 &mut module,
                 None,
                 TypeInner::Sampler { comparison: false },
             );
-            for (idx, &srsrc) in plan.tex_slots.iter().enumerate() {
-                let is_array = plan.tex_arrayed.contains(&srsrc);
-                let tex_ty = if is_array {
-                    *tex_2d_array_ty.get_or_insert_with(|| {
+            for (idx, &key) in plan.tex_slots.iter().enumerate() {
+                let tex_dim = plan.tex_dims.get(&key).copied().unwrap_or(TexDim::D2);
+                let tex_ty = match tex_dim {
+                    TexDim::D2Array => *tex_2d_array_ty.get_or_insert_with(|| {
                         insert_type(
                             &mut module,
                             None,
@@ -3159,9 +3311,22 @@ impl IrEmitter {
                                 },
                             },
                         )
-                    })
-                } else {
-                    *tex_2d_ty.get_or_insert_with(|| {
+                    }),
+                    TexDim::D3 => *tex_3d_ty.get_or_insert_with(|| {
+                        insert_type(
+                            &mut module,
+                            None,
+                            TypeInner::Image {
+                                dim: ImageDimension::D3,
+                                arrayed: false,
+                                class: ImageClass::Sampled {
+                                    kind: ScalarKind::Float,
+                                    multi: false,
+                                },
+                            },
+                        )
+                    }),
+                    TexDim::D2 => *tex_2d_ty.get_or_insert_with(|| {
                         insert_type(
                             &mut module,
                             None,
@@ -3174,7 +3339,7 @@ impl IrEmitter {
                                 },
                             },
                         )
-                    })
+                    }),
                 };
                 let binding_num = binding_base
                     + if idx == 0 {
@@ -3199,20 +3364,20 @@ impl IrEmitter {
                     },
                     Span::UNDEFINED,
                 );
-                tex_globals.insert(srsrc, (g, is_array));
+                tex_globals.insert(key, (g, tex_dim));
                 emitted_bindings.push(WgslBindingInfo {
                     group: 0,
                     binding: binding_num,
                     kind: "texture_2d",
                     name,
-                    view_dimension: Some(if is_array { "2d-array" } else { "2d" }),
+                    view_dimension: Some(tex_dim.view_dimension_name()),
                     storage_format: None,
                     min_binding_size_bytes: None,
                     highest_vec4_offset: None,
-                    source: plan.tex_sources.get(&srsrc).copied(),
+                    source: key.to_source(),
                 });
             }
-            for (idx, &ssamp) in plan.samp_slots.iter().enumerate() {
+            for (idx, &key) in plan.samp_slots.iter().enumerate() {
                 let binding_num = binding_base
                     + if idx == 0 {
                         2
@@ -3236,7 +3401,7 @@ impl IrEmitter {
                     },
                     Span::UNDEFINED,
                 );
-                samp_globals.insert(ssamp, g);
+                samp_globals.insert(key, g);
                 emitted_bindings.push(WgslBindingInfo {
                     group: 0,
                     binding: binding_num,
@@ -3246,7 +3411,7 @@ impl IrEmitter {
                     storage_format: None,
                     min_binding_size_bytes: None,
                     highest_vec4_offset: None,
-                    source: plan.samp_sources.get(&ssamp).copied(),
+                    source: key.to_source(),
                 });
             }
         }
@@ -3293,7 +3458,7 @@ impl IrEmitter {
                     },
                     Span::UNDEFINED,
                 );
-                storage_buf_globals.insert(slot.srsrc, (g, slot.writable));
+                storage_buf_globals.insert(slot.key, (g, slot.writable));
                 emitted_bindings.push(WgslBindingInfo {
                     group: 0,
                     binding: binding_num,
@@ -3303,7 +3468,7 @@ impl IrEmitter {
                     storage_format: None,
                     min_binding_size_bytes: None,
                     highest_vec4_offset: None,
-                    source: plan.storage_buf_sources.get(&slot.srsrc).copied(),
+                    source: slot.key.to_source(),
                 });
             }
         }
@@ -3311,10 +3476,11 @@ impl IrEmitter {
         if !plan.storage_tex_slots.is_empty() {
             let mut storage_tex_2d_ty: Option<Handle<Type>> = None;
             let mut storage_tex_2d_array_ty: Option<Handle<Type>> = None;
-            for (idx, &srsrc) in plan.storage_tex_slots.iter().enumerate() {
-                let is_array = plan.storage_tex_arrayed.contains(&srsrc);
-                let storage_tex_ty = if is_array {
-                    *storage_tex_2d_array_ty.get_or_insert_with(|| {
+            let mut storage_tex_3d_ty: Option<Handle<Type>> = None;
+            for (idx, &key) in plan.storage_tex_slots.iter().enumerate() {
+                let tex_dim = plan.storage_tex_dims.get(&key).copied().unwrap_or(TexDim::D2);
+                let storage_tex_ty = match tex_dim {
+                    TexDim::D2Array => *storage_tex_2d_array_ty.get_or_insert_with(|| {
                         insert_type(
                             &mut module,
                             None,
@@ -3327,9 +3493,22 @@ impl IrEmitter {
                                 },
                             },
                         )
-                    })
-                } else {
-                    *storage_tex_2d_ty.get_or_insert_with(|| {
+                    }),
+                    TexDim::D3 => *storage_tex_3d_ty.get_or_insert_with(|| {
+                        insert_type(
+                            &mut module,
+                            None,
+                            TypeInner::Image {
+                                dim: ImageDimension::D3,
+                                arrayed: false,
+                                class: ImageClass::Storage {
+                                    format: StorageFormat::Rgba8Unorm,
+                                    access: StorageAccess::STORE,
+                                },
+                            },
+                        )
+                    }),
+                    TexDim::D2 => *storage_tex_2d_ty.get_or_insert_with(|| {
                         insert_type(
                             &mut module,
                             None,
@@ -3342,7 +3521,7 @@ impl IrEmitter {
                                 },
                             },
                         )
-                    })
+                    }),
                 };
                 let binding_num = binding_base + next_extra_binding;
                 next_extra_binding += 1;
@@ -3361,17 +3540,17 @@ impl IrEmitter {
                     },
                     Span::UNDEFINED,
                 );
-                storage_tex_globals.insert(srsrc, (g, is_array));
+                storage_tex_globals.insert(key, (g, tex_dim));
                 emitted_bindings.push(WgslBindingInfo {
                     group: 0,
                     binding: binding_num,
                     kind: "storage-texture",
                     name,
-                    view_dimension: Some(if is_array { "2d-array" } else { "2d" }),
+                    view_dimension: Some(tex_dim.view_dimension_name()),
                     storage_format: Some(WGPU_STORAGE_FORMAT_RGBA8_UNORM),
                     min_binding_size_bytes: None,
                     highest_vec4_offset: None,
-                    source: plan.storage_tex_sources.get(&srsrc).copied(),
+                    source: key.to_source(),
                 });
             }
         }
@@ -3771,6 +3950,10 @@ impl IrEmitter {
             types,
             vsharp_fetch_insts: plan.vsharp_fetch_insts.clone(),
             indirect_smem_cbv_keys: plan.indirect_smem_cbv_keys.clone(),
+            inst_tex_keys: plan.inst_tex_keys.clone(),
+            inst_samp_keys: plan.inst_samp_keys.clone(),
+            inst_storage_buf_keys: plan.inst_storage_buf_keys.clone(),
+            inst_storage_tex_keys: plan.inst_storage_tex_keys.clone(),
             vertex_storage_buf_insts: plan.vertex_storage_buf_insts.clone(),
             vertex_fetch_vb_slots: plan.vertex_fetch_vb_slots.clone(),
             cb_globals,
@@ -5898,7 +6081,7 @@ impl IrEmitter {
                 srsrc,
                 ssamp,
                 ..
-            } => self.translate_mimg(*op, *dmask, *dim, *vaddr, *vdata, *srsrc, *ssamp),
+            } => self.translate_mimg(inst_idx, *op, *dmask, *dim, *vaddr, *vdata, *srsrc, *ssamp),
             Rdna2Detail::Mubuf {
                 op,
                 offset,
@@ -6522,6 +6705,67 @@ impl IrEmitter {
                     right: offset,
                 });
                 self.store_sgpr_u32(sdst, res);
+                true
+            }
+            // s_bfm_b64: ((1u64 << (s0 & 63)) - 1u64) << (s1 & 63) -> s[sdst:sdst+1]
+            0x25 => {
+                if let (Some(w_i), Some(o_i)) = (
+                    decode_inline_u32_src(s0_u(), literal),
+                    decode_inline_u32_src(s1_u(), literal),
+                ) {
+                    let w = (w_i as u32) & 63;
+                    let o = (o_i as u32) & 63;
+                    let base: u64 = if w == 0 {
+                        0
+                    } else if w >= 64 {
+                        u64::MAX
+                    } else {
+                        (1u64 << w) - 1
+                    };
+                    let val = base.wrapping_shl(o);
+                    let lo = self.lit_u32(val as u32);
+                    let hi = self.lit_u32((val >> 32) as u32);
+                    self.store_sgpr_u32(sdst, lo);
+                    if sdst <= 104 {
+                        self.store_sgpr_u32(sdst + 1, hi);
+                    }
+                } else {
+                    // Dynamic width/offset: compute 32-bit low half and zero-extended high half.
+                    let l = self.read_src_u32(s0_u(), literal);
+                    let r = self.read_src_u32(s1_u(), literal);
+                    let mask31 = self.lit_u32(31);
+                    let width = self.emit_expr(Expression::Binary {
+                        op: BinaryOperator::And,
+                        left: l,
+                        right: mask31,
+                    });
+                    let offset = self.emit_expr(Expression::Binary {
+                        op: BinaryOperator::And,
+                        left: r,
+                        right: mask31,
+                    });
+                    let one = self.lit_u32(1);
+                    let sh_w = self.emit_expr(Expression::Binary {
+                        op: BinaryOperator::ShiftLeft,
+                        left: one,
+                        right: width,
+                    });
+                    let base_mask = self.emit_expr(Expression::Binary {
+                        op: BinaryOperator::Subtract,
+                        left: sh_w,
+                        right: one,
+                    });
+                    let lo = self.emit_expr(Expression::Binary {
+                        op: BinaryOperator::ShiftLeft,
+                        left: base_mask,
+                        right: offset,
+                    });
+                    let zero = self.lit_u32(0);
+                    self.store_sgpr_u32(sdst, lo);
+                    if sdst <= 104 {
+                        self.store_sgpr_u32(sdst + 1, zero);
+                    }
+                }
                 true
             }
             // s_mul_i32
@@ -8748,11 +8992,12 @@ impl IrEmitter {
         true
     }
 
-    // -- MIMG (2D / 2D-Array Texture sampling, loading & storing) --
+    // -- MIMG (2D / 2D-Array / 3D Texture sampling, loading & storing) --
 
     #[allow(clippy::too_many_arguments)]
     fn translate_mimg(
         &mut self,
+        inst_idx: usize,
         op: u8,
         dmask: u8,
         dim: u8,
@@ -8764,15 +9009,20 @@ impl IrEmitter {
         let Some(layout) = mimg_addr_layout(op) else {
             return false;
         };
-        let inst_is_array = dim == 5;
+        let inst_dim = TexDim::from_mimg_dim(dim);
 
         if layout.is_store {
             if self.stage == ShaderStage::Vertex {
                 return false;
             }
-            let Some(&(uav_tex_global, tex_is_array)) = self
+            let key = self
+                .inst_storage_tex_keys
+                .get(&inst_idx)
+                .copied()
+                .unwrap_or(ResourceKey::RawSlot(srsrc));
+            let Some(&(uav_tex_global, tex_dim)) = self
                 .storage_tex_globals
-                .get(&srsrc)
+                .get(&key)
                 .or_else(|| self.storage_tex_globals.values().next())
             else {
                 return false;
@@ -8782,19 +9032,44 @@ impl IrEmitter {
             let uy = self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off + 1));
             let ix = self.bitcast_f32_to_i32(ux);
             let iy = self.bitcast_f32_to_i32(uy);
-            let coord = self.emit_expr(Expression::Compose {
-                ty: self.types.vec2_i32_ty,
-                components: vec![ix, iy],
-            });
-            let array_index = if tex_is_array {
-                if inst_is_array {
-                    let s = self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off + 2));
-                    Some(self.bitcast_f32_to_i32(s))
-                } else {
-                    Some(self.lit_i32(0))
+            let (coord, array_index) = match tex_dim {
+                TexDim::D3 => {
+                    let iz = if inst_dim == TexDim::D3 {
+                        let uz = self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off + 2));
+                        self.bitcast_f32_to_i32(uz)
+                    } else {
+                        self.lit_i32(0)
+                    };
+                    (
+                        self.emit_expr(Expression::Compose {
+                            ty: self.types.vec3_i32_ty,
+                            components: vec![ix, iy, iz],
+                        }),
+                        None,
+                    )
                 }
-            } else {
-                None
+                TexDim::D2Array => {
+                    let arr = if inst_dim == TexDim::D2Array {
+                        let s = self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off + 2));
+                        self.bitcast_f32_to_i32(s)
+                    } else {
+                        self.lit_i32(0)
+                    };
+                    (
+                        self.emit_expr(Expression::Compose {
+                            ty: self.types.vec2_i32_ty,
+                            components: vec![ix, iy],
+                        }),
+                        Some(arr),
+                    )
+                }
+                TexDim::D2 => (
+                    self.emit_expr(Expression::Compose {
+                        ty: self.types.vec2_i32_ty,
+                        components: vec![ix, iy],
+                    }),
+                    None,
+                ),
             };
 
             let eff_mask = if dmask == 0 { 0xF } else { dmask };
@@ -8824,15 +9099,20 @@ impl IrEmitter {
             return true;
         }
 
-        let Some(&(tex_global, tex_is_array)) = self
+        let key = self
+            .inst_tex_keys
+            .get(&inst_idx)
+            .copied()
+            .unwrap_or(ResourceKey::RawSlot(srsrc));
+        let Some(&(tex_global, tex_dim)) = self
             .tex_globals
-            .get(&srsrc)
+            .get(&key)
             .or_else(|| self.tex_globals.values().next())
         else {
             return false;
         };
         let image = self.raw_expr(Expression::GlobalVariable(tex_global));
-        let lod_shift = u8::from(inst_is_array);
+        let lod_shift = inst_dim.extra_coord_vgprs();
 
         let sampled = if layout.is_load {
             // image_load / image_load_mip
@@ -8840,19 +9120,44 @@ impl IrEmitter {
             let uy = self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off + 1));
             let ix = self.bitcast_f32_to_i32(ux);
             let iy = self.bitcast_f32_to_i32(uy);
-            let coord = self.emit_expr(Expression::Compose {
-                ty: self.types.vec2_i32_ty,
-                components: vec![ix, iy],
-            });
-            let array_index = if tex_is_array {
-                if inst_is_array {
-                    let s = self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off + 2));
-                    Some(self.bitcast_f32_to_i32(s))
-                } else {
-                    Some(self.lit_i32(0))
+            let (coord, array_index) = match tex_dim {
+                TexDim::D3 => {
+                    let iz = if inst_dim == TexDim::D3 {
+                        let uz = self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off + 2));
+                        self.bitcast_f32_to_i32(uz)
+                    } else {
+                        self.lit_i32(0)
+                    };
+                    (
+                        self.emit_expr(Expression::Compose {
+                            ty: self.types.vec3_i32_ty,
+                            components: vec![ix, iy, iz],
+                        }),
+                        None,
+                    )
                 }
-            } else {
-                None
+                TexDim::D2Array => {
+                    let arr = if inst_dim == TexDim::D2Array {
+                        let s = self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off + 2));
+                        self.bitcast_f32_to_i32(s)
+                    } else {
+                        self.lit_i32(0)
+                    };
+                    (
+                        self.emit_expr(Expression::Compose {
+                            ty: self.types.vec2_i32_ty,
+                            components: vec![ix, iy],
+                        }),
+                        Some(arr),
+                    )
+                }
+                TexDim::D2 => (
+                    self.emit_expr(Expression::Compose {
+                        ty: self.types.vec2_i32_ty,
+                        components: vec![ix, iy],
+                    }),
+                    None,
+                ),
             };
             let level = if let Some(lod_off) = layout.lod_off {
                 let ml = self.load_vgpr_f32(vaddr.saturating_add(lod_off.saturating_add(lod_shift)));
@@ -8868,10 +9173,15 @@ impl IrEmitter {
                 level,
             })
         } else {
-            // image_sample* (sampled 2D or 2D-array texture)
+            // image_sample* (sampled 2D, 2D-array, or 3D texture)
+            let skey = self
+                .inst_samp_keys
+                .get(&inst_idx)
+                .copied()
+                .unwrap_or(ResourceKey::RawSlot(ssamp));
             let Some(&samp_global) = self
                 .samp_globals
-                .get(&ssamp)
+                .get(&skey)
                 .or_else(|| self.samp_globals.values().next())
             else {
                 return false;
@@ -8879,23 +9189,47 @@ impl IrEmitter {
             let sampler = self.raw_expr(Expression::GlobalVariable(samp_global));
             let u = self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off));
             let v = self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off + 1));
-            let coord = self.emit_expr(Expression::Compose {
-                ty: self.types.vec2_f32_ty,
-                components: vec![u, v],
-            });
-            let array_index = if tex_is_array {
-                if inst_is_array {
-                    let s = self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off + 2));
-                    Some(self.emit_expr(Expression::As {
-                        expr: s,
-                        kind: ScalarKind::Sint,
-                        convert: Some(4),
-                    }))
-                } else {
-                    Some(self.lit_i32(0))
+            let (coord, array_index) = match tex_dim {
+                TexDim::D3 => {
+                    let w = if inst_dim == TexDim::D3 {
+                        self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off + 2))
+                    } else {
+                        self.lit_f32(0.0)
+                    };
+                    (
+                        self.emit_expr(Expression::Compose {
+                            ty: self.types.vec3_f32_ty,
+                            components: vec![u, v, w],
+                        }),
+                        None,
+                    )
                 }
-            } else {
-                None
+                TexDim::D2Array => {
+                    let arr = if inst_dim == TexDim::D2Array {
+                        let s = self.load_vgpr_f32(vaddr.saturating_add(layout.uv_off + 2));
+                        self.emit_expr(Expression::As {
+                            expr: s,
+                            kind: ScalarKind::Sint,
+                            convert: Some(4),
+                        })
+                    } else {
+                        self.lit_i32(0)
+                    };
+                    (
+                        self.emit_expr(Expression::Compose {
+                            ty: self.types.vec2_f32_ty,
+                            components: vec![u, v],
+                        }),
+                        Some(arr),
+                    )
+                }
+                TexDim::D2 => (
+                    self.emit_expr(Expression::Compose {
+                        ty: self.types.vec2_f32_ty,
+                        components: vec![u, v],
+                    }),
+                    None,
+                ),
             };
 
             // WGSL only permits implicit-derivative `textureSample` / `textureSampleBias`
@@ -8908,19 +9242,46 @@ impl IrEmitter {
                     self.load_vgpr_f32(vaddr.saturating_add(lod_off.saturating_add(lod_shift)));
                 SampleLevel::Exact(lod)
             } else if let Some(grad_off) = layout.grad_off {
-                let dudx = self.load_vgpr_f32(vaddr.saturating_add(grad_off));
-                let dvdx = self.load_vgpr_f32(vaddr.saturating_add(grad_off + 1));
-                let dudy = self.load_vgpr_f32(vaddr.saturating_add(grad_off + 2));
-                let dvdy = self.load_vgpr_f32(vaddr.saturating_add(grad_off + 3));
-                let x = self.emit_expr(Expression::Compose {
-                    ty: self.types.vec2_f32_ty,
-                    components: vec![dudx, dvdx],
-                });
-                let y = self.emit_expr(Expression::Compose {
-                    ty: self.types.vec2_f32_ty,
-                    components: vec![dudy, dvdy],
-                });
-                SampleLevel::Gradient { x, y }
+                if tex_dim == TexDim::D3 {
+                    let dudx = self.load_vgpr_f32(vaddr.saturating_add(grad_off));
+                    let dvdx = self.load_vgpr_f32(vaddr.saturating_add(grad_off + 1));
+                    let dwdx = if inst_dim == TexDim::D3 {
+                        self.load_vgpr_f32(vaddr.saturating_add(grad_off + 2))
+                    } else {
+                        self.lit_f32(0.0)
+                    };
+                    let dy_base = if inst_dim == TexDim::D3 { 3 } else { 2 };
+                    let dudy = self.load_vgpr_f32(vaddr.saturating_add(grad_off + dy_base));
+                    let dvdy = self.load_vgpr_f32(vaddr.saturating_add(grad_off + dy_base + 1));
+                    let dwdy = if inst_dim == TexDim::D3 {
+                        self.load_vgpr_f32(vaddr.saturating_add(grad_off + dy_base + 2))
+                    } else {
+                        self.lit_f32(0.0)
+                    };
+                    let x = self.emit_expr(Expression::Compose {
+                        ty: self.types.vec3_f32_ty,
+                        components: vec![dudx, dvdx, dwdx],
+                    });
+                    let y = self.emit_expr(Expression::Compose {
+                        ty: self.types.vec3_f32_ty,
+                        components: vec![dudy, dvdy, dwdy],
+                    });
+                    SampleLevel::Gradient { x, y }
+                } else {
+                    let dudx = self.load_vgpr_f32(vaddr.saturating_add(grad_off));
+                    let dvdx = self.load_vgpr_f32(vaddr.saturating_add(grad_off + 1));
+                    let dudy = self.load_vgpr_f32(vaddr.saturating_add(grad_off + 2));
+                    let dvdy = self.load_vgpr_f32(vaddr.saturating_add(grad_off + 3));
+                    let x = self.emit_expr(Expression::Compose {
+                        ty: self.types.vec2_f32_ty,
+                        components: vec![dudx, dvdx],
+                    });
+                    let y = self.emit_expr(Expression::Compose {
+                        ty: self.types.vec2_f32_ty,
+                        components: vec![dudy, dvdy],
+                    });
+                    SampleLevel::Gradient { x, y }
+                }
             } else if let Some(bias_off) = layout.bias_off {
                 // Implicit-derivative sampling requires uniform control flow in WGSL.
                 if self.stage == ShaderStage::Fragment && !self.in_nonuniform_cf() {
@@ -9020,6 +9381,7 @@ impl IrEmitter {
             );
         }
         self.translate_storage_buf_op(
+            inst_idx,
             is_mtbuf,
             op,
             byte_offset,
@@ -9035,6 +9397,7 @@ impl IrEmitter {
     #[allow(clippy::too_many_arguments)]
     fn translate_storage_buf_op(
         &mut self,
+        inst_idx: usize,
         is_mtbuf: bool,
         op: u8,
         byte_offset: u16,
@@ -9052,9 +9415,14 @@ impl IrEmitter {
         }) else {
             return false;
         };
+        let key = self
+            .inst_storage_buf_keys
+            .get(&inst_idx)
+            .copied()
+            .unwrap_or(ResourceKey::RawSlot(srsrc));
         let Some(&(buf_global, writable)) = self
             .storage_buf_globals
-            .get(&srsrc)
+            .get(&key)
             .or_else(|| self.storage_buf_globals.values().next())
         else {
             return false;
@@ -13978,6 +14346,155 @@ mod tests {
         assert!(json.contains("\"component_type\": \"u32\""), "JSON:\n{json}");
         assert!(json.contains("\"fetch_format\": \"uint8\""), "JSON:\n{json}");
         assert!(json.contains("\"fetch_format\": \"unorm8x2\""), "JSON:\n{json}");
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn s33_dynamic_heap_sampler_load_emits_no_bogus_cbv() {
+        // Reproduces RS #3 SM 6.6 SamplerDescriptorHeap pixel shader:
+        //   s_mov_b32 s10, s11
+        //   s_mov_b32 s11, 0
+        //   s_lshl_b32 s9, s9, 4
+        //   s_load_dwordx4 s[16:19], s[10:11], s9   ; dynamic sampler descriptor load
+        //   s_mov_b32 s9, 0
+        //   s_load_dwordx8 s[24:31], s[8:9], 0x0    ; static table T# @ s8 + 0
+        //   image_sample v0, v2, s[24:31], s[16:19] dmask:0xf dim:1
+        let mut words = Vec::new();
+        words.push(enc_sop1(0x03, 10, 11)); // s10 = s11
+        words.push(enc_sop1(0x03, 11, 0x80)); // s11 = 0
+        words.push(enc_sop2(0x0E, 9, 9, 128 + 4)); // s_lshl_b32 s9, s9, 4
+        words.extend_from_slice(&enc_smem(0x02, 16, 5, 9, 0x0, false, false)); // dynamic s_load_dwordx4
+        words.push(enc_sop1(0x03, 9, 0x80)); // s9 = 0
+        words.extend_from_slice(&enc_smem(0x03, 24, 4, 0x7D, 0x0, false, false)); // T# @ s8 + 0
+        words.extend_from_slice(&enc_mimg(0x20, 0xF, 1, 2, 0, 6, 4)); // image_sample srsrc=6, ssamp=4
+        words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [0, 1, 2, 3]));
+        words.push(enc_sopp(0x01, 0));
+
+        let out = translate_as(&words, Rdna2StageOverride::Pixel);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert!(
+            out.bindings.iter().all(|b| b.kind != "uniform"),
+            "dynamic sampler descriptor load must NOT emit bogus cb0: {:?}",
+            out.bindings
+        );
+        assert_eq!(out.bindings.len(), 2, "bindings: {:?}", out.bindings);
+        assert_eq!(out.bindings[0].kind, "texture_2d");
+        assert_eq!(
+            out.bindings[0].source,
+            Some(WgslBindingSource::Table {
+                user_sgpr: 8,
+                table_byte_offset: 0,
+            })
+        );
+        assert_eq!(out.bindings[1].kind, "sampler");
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn s33_resource_key_deduplicates_multi_sgpr_loads_and_separates_reused_sgprs() {
+        // Compute shader:
+        //   - Loads T# from s5 + 32 into BOTH s[32:39] and s[40:47] and image_load's both -> 1 tex0!
+        //   - Loads V# from s5 + 64 into s[16:19] -> buffer_store, then reloads s[16:19] from
+        //     s5 + 96 -> buffer_store -> 2 distinct uav_buf0 (s5+64) and uav_buf1 (s5+96)!
+        let mut words = Vec::new();
+        words.push(enc_sop1(0x03, 8, 5)); // s8 = s5
+        words.push(enc_sop1(0x03, 9, 0x80)); // s9 = 0
+        words.extend_from_slice(&enc_smem(0x03, 32, 4, 0x7D, 0x20, false, false)); // T# s5+32 -> s[32:39]
+        words.extend_from_slice(&enc_mimg(0x00, 0xF, 1, 0, 4, 8, 0)); // image_load srsrc=8
+        words.extend_from_slice(&enc_smem(0x03, 40, 4, 0x7D, 0x20, false, false)); // SAME T# s5+32 -> s[40:47]
+        words.extend_from_slice(&enc_mimg(0x00, 0xF, 1, 0, 8, 10, 0)); // image_load srsrc=10
+        // V# s5+64 -> s[16:19], buffer_store_dwordx4 (MUBUF op 0x1E) offen=1 srsrc=4
+        words.extend_from_slice(&enc_smem(0x02, 16, 4, 0x7D, 0x40, false, false));
+        let st_w0 = (0b111000u32 << 26) | (0x1Eu32 << 18) | (1u32 << 12);
+        let st_w1 = (0x80u32 << 24) | (4u32 << 16) | (4u32 << 8);
+        words.extend_from_slice(&[st_w0, st_w1]);
+        // Reload SAME s[16:19] from s5+96 -> buffer_store_dwordx4
+        words.extend_from_slice(&enc_smem(0x02, 16, 4, 0x7D, 0x60, false, false));
+        let st2_w1 = (0x80u32 << 24) | (4u32 << 16) | (8u32 << 8);
+        words.extend_from_slice(&[st_w0, st2_w1]);
+        words.push(enc_sopp(0x01, 0));
+
+        let out = translate_as(&words, Rdna2StageOverride::Compute);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        let texs: Vec<_> = out.bindings.iter().filter(|b| b.kind == "texture_2d").collect();
+        assert_eq!(texs.len(), 1, "duplicate T# loads must collapse to 1 binding: {:?}", out.bindings);
+        assert_eq!(
+            texs[0].source,
+            Some(WgslBindingSource::Table {
+                user_sgpr: 5,
+                table_byte_offset: 32,
+            })
+        );
+        let uavs: Vec<_> = out.bindings.iter().filter(|b| b.kind == "storage").collect();
+        assert_eq!(uavs.len(), 2, "reused SGPR with 2 V# offsets must emit 2 UAVs: {:?}", out.bindings);
+        assert_eq!(
+            uavs[0].source,
+            Some(WgslBindingSource::Table {
+                user_sgpr: 5,
+                table_byte_offset: 64,
+            })
+        );
+        assert_eq!(
+            uavs[1].source,
+            Some(WgslBindingSource::Table {
+                user_sgpr: 5,
+                table_byte_offset: 96,
+            })
+        );
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn s33_s_bfm_b64_inline_static_sampler_emits_single_static_sampler_source() {
+        // Reproduces RS #5 PS inline static sampler built with s_bfm_b64 + s_mov_b64,
+        // reused across two image_sample calls.
+        let mut words = Vec::new();
+        words.push(enc_sop1(0x03, 9, 0x80)); // s9 = 0
+        words.extend_from_slice(&enc_smem(0x03, 24, 4, 0x7D, 0x0, false, false)); // T# @ s8 + 0
+        words.push(enc_sop2(0x25, 20, 128 + 2, 128 + 54)); // s_bfm_b64 s[20:21], 2, 54
+        words.push(enc_sop1(0x04, 22, 0xFF)); // s_mov_b64 s[22:23], 0x14500000
+        words.push(0x1450_0000);
+        words.extend_from_slice(&enc_mimg(0x20, 0xF, 1, 0, 4, 6, 5)); // image_sample #1
+        words.extend_from_slice(&enc_mimg(0x20, 0xF, 1, 0, 8, 6, 5)); // image_sample #2 (same sampler)
+        words.push(enc_vop2(0x03, 4, 256 + 4, 8));
+        words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [4, 5, 6, 7]));
+        words.push(enc_sopp(0x01, 0));
+
+        let out = translate_as(&words, Rdna2StageOverride::Pixel);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        let samps: Vec<_> = out.bindings.iter().filter(|b| b.kind == "sampler").collect();
+        assert_eq!(samps.len(), 1, "expected 1 deduplicated static sampler: {:?}", out.bindings);
+        assert_eq!(samps[0].source, Some(WgslBindingSource::StaticSampler { index: 0 }));
+        // All bindings are reflected -> fragment offset +32 applies!
+        assert_eq!(samps[0].binding, FRAGMENT_REFLECTED_BINDING_OFFSET + 2);
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn s33_mimg_dim2_emits_3d_sampled_and_storage_textures() {
+        let mut words = Vec::new();
+        words.push(enc_sop1(0x03, 8, 5)); // s8 = s5
+        words.push(enc_sop1(0x03, 9, 0x80)); // s9 = 0
+        words.extend_from_slice(&enc_smem(0x03, 16, 4, 0x7D, 0x0, false, false)); // 3D SRV @ s5+0
+        words.extend_from_slice(&enc_smem(0x03, 24, 4, 0x7D, 0x20, false, false)); // 3D UAV @ s5+32
+        words.extend_from_slice(&enc_mimg(0x00, 0xF, 2, 0, 4, 4, 0)); // image_load dim:2 (3d)
+        words.extend_from_slice(&enc_mimg(0x08, 0xF, 2, 0, 4, 6, 0)); // image_store dim:2 (3d)
+        words.push(enc_sopp(0x01, 0));
+
+        let out = translate_as(&words, Rdna2StageOverride::Compute);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("texture_3d<f32>"), "WGSL:\n{}", out.wgsl);
+        assert!(
+            out.wgsl.contains("texture_storage_3d<rgba8unorm,write>")
+                || out.wgsl.contains("texture_storage_3d<rgba8unorm, write>"),
+            "WGSL:\n{}",
+            out.wgsl
+        );
+        let tex = out.bindings.iter().find(|b| b.kind == "texture_2d").unwrap();
+        let uav = out.bindings.iter().find(|b| b.kind == "storage-texture").unwrap();
+        assert_eq!(tex.view_dimension, Some("3d"));
+        assert_eq!(uav.view_dimension, Some("3d"));
+        assert_eq!(uav.storage_format, Some(WGPU_STORAGE_FORMAT_RGBA8_UNORM));
         assert_naga_wgsl_valid(&out.wgsl);
     }
 }
