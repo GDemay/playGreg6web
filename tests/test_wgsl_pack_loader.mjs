@@ -8,6 +8,9 @@ import {
   WGPK_ENTRY_BYTES,
   DEFAULT_INITIAL_RANGE_BYTES,
   DEFAULT_MAX_CACHED_WGSL_BYTES,
+  DEFAULT_MAX_CONCURRENT_RANGE_FETCHES,
+  DEFAULT_MAX_RANGE_FETCH_RETRIES,
+  DEFAULT_RANGE_RETRY_DELAY_MS,
   SHADER_STAGE,
   STAGE_NAMES,
   fnv1a64,
@@ -1249,6 +1252,7 @@ test('W109 getWgslAsync fetches exact byte ranges, caches hits, deduplicates con
   const pack = await loadIndexFromUrl('/packs/on-demand.wgsl.pack', {
     fetch: mock.fetch,
     initialRangeBytes: tableEnd,
+    maxRangeFetchRetries: 0,
   });
   assert.equal(mock.requests.length, 1);
 
@@ -2070,6 +2074,7 @@ test('W160 concurrent getWgslAsync coalesces burst HTTP 206 Range fetches and cl
   const pack = await loadIndexFromUrl('/packs/coalesce.wgsl.pack', {
     fetch: mock.fetch,
     initialRangeBytes: indexBytes.byteLength,
+    maxRangeFetchRetries: 0,
   });
   assert.equal(pack.getStats().inFlightCount, 0);
   assert.equal(pack.getStats().rangeFetchCount, 1);
@@ -2272,4 +2277,467 @@ test('W160 ranged cache telemetry (inFlightCoalesced, rangeFetchCount, rangeByte
   assert.equal(snapshot.stats.rangeBytesFetched, indexBytes.byteLength + 300);
   assert.equal(snapshot.stats.inFlightCoalesced, 2);
   assert.equal(snapshot.stats.lruEvictions, 1);
+});
+
+// ---------------------------------------------------------------------------
+// W162: Bounded HTTP 206 Range concurrency semaphore & transient retry (#864)
+// ---------------------------------------------------------------------------
+
+test('W162 bounded FIFO semaphore caps concurrent HTTP 206 Range fetches, preserves order, coalesces duplicates before acquiring slots, and supports unlimited (0)', async () => {
+  assert.equal(DEFAULT_MAX_CONCURRENT_RANGE_FETCHES, 8);
+  assert.equal(DEFAULT_MAX_RANGE_FETCH_RETRIES, 2);
+  assert.equal(DEFAULT_RANGE_RETRY_DELAY_MS, 25);
+
+  const count = 20;
+  const entries = [];
+  for (let i = 0; i < count; i += 1) {
+    entries.push({
+      hash: fnv1a64(`w162-sem-shader-${i}`),
+      stage: SHADER_STAGE.COMPUTE,
+      wgsl: `@compute @workgroup_size(${i + 1}) fn sem_${i}() {}`,
+    });
+  }
+  const packBuf = buildWgslPackBuffer(entries);
+  const tableEnd = WGPK_HEADER_BYTES + count * WGPK_ENTRY_BYTES;
+
+  // 1. Validate option bounds up front
+  const validateMock = createRangeMockFetch({ '/packs/sem.wgsl.pack': packBuf });
+  await assert.rejects(
+    () => loadIndexFromUrl('/packs/sem.wgsl.pack', { fetch: validateMock.fetch, maxConcurrentRangeFetches: -1 }),
+    RangeError
+  );
+  await assert.rejects(
+    () => loadIndexFromUrl('/packs/sem.wgsl.pack', { fetch: validateMock.fetch, maxRangeFetchRetries: -1 }),
+    RangeError
+  );
+  await assert.rejects(
+    () => loadIndexFromUrl('/packs/sem.wgsl.pack', { fetch: validateMock.fetch, rangeRetryDelayMs: -5 }),
+    RangeError
+  );
+  await assert.rejects(
+    () => loadIndexFromUrl('/packs/sem.wgsl.pack', { fetch: validateMock.fetch, sleepFn: 'not-a-fn' }),
+    TypeError
+  );
+
+  // 2. Cap = 4 with 20 distinct hashes + duplicate burst -> never exceeds 4 active fetches, strict FIFO order
+  let liveConcurrent = 0;
+  let observedPeak = 0;
+  const startedOrder = [];
+  const pendingReleases = [];
+
+  const capMock = createRangeMockFetch(
+    { '/packs/sem.wgsl.pack': packBuf },
+    {
+      beforeResponse: async ({ range }) => {
+        if (!range || range.startsWith('bytes=0-')) {
+          return null;
+        }
+        liveConcurrent += 1;
+        if (liveConcurrent > observedPeak) {
+          observedPeak = liveConcurrent;
+        }
+        startedOrder.push(range);
+        await new Promise((resolve) => {
+          pendingReleases.push(() => {
+            liveConcurrent -= 1;
+            resolve();
+          });
+        });
+        return null;
+      },
+    }
+  );
+
+  const pack = await loadIndexFromUrl('/packs/sem.wgsl.pack', {
+    fetch: capMock.fetch,
+    initialRangeBytes: tableEnd,
+    maxConcurrentRangeFetches: 4,
+  });
+  assert.equal(pack.getStats().maxConcurrentRangeFetches, 4);
+  assert.equal(pack.getStats().activeRangeFetches, 0);
+  assert.equal(pack.getStats().peakConcurrentRangeFetches, 0);
+
+  const expectedRangeByIdx = entries.map((e) => {
+    const meta = pack.entries.get(e.hash);
+    return `bytes=${meta.offset}-${meta.offset + meta.length - 1}`;
+  });
+
+  // Launch 20 distinct fetches plus 3 duplicate calls for entry 0 and 2 duplicate calls for entry 10
+  // (entry 10 is queued in the FIFO wait queue, so duplicates must coalesce without taking extra slots!).
+  const promises = entries.map((e) => pack.getWgslAsync(e.hash));
+  const dupPromises = [
+    pack.getWgslAsync(formatHashHex(entries[0].hash)),
+    pack.getWgslAsync(entries[0].hash),
+    pack.getWgslAsync(entries[0].hash),
+    pack.getWgslAsync(formatHashHex(entries[10].hash)),
+    pack.getWgslAsync(entries[10].hash),
+  ];
+
+  // Exactly 4 should be active immediately; 16 distinct queued; 5 duplicates coalesced.
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(liveConcurrent, 4);
+  assert.equal(observedPeak, 4);
+  assert.equal(pendingReleases.length, 4);
+  assert.equal(pack.getStats().activeRangeFetches, 4);
+  assert.equal(pack.getStats().peakConcurrentRangeFetches, 4);
+  assert.equal(pack.getStats().inFlightCount, 20);
+  assert.equal(pack.getStats().inFlightCoalesced, 5);
+
+  // Release requests one by one in FIFO order and verify concurrency never exceeds 4.
+  while (startedOrder.length < count || pendingReleases.length > 0) {
+    assert.ok(liveConcurrent <= 4, `active fetches exceeded cap 4: ${liveConcurrent}`);
+    assert.ok(pack.getStats().activeRangeFetches <= 4);
+    const release = pendingReleases.shift();
+    if (release) {
+      release();
+    }
+    await new Promise((r) => setTimeout(r, 2));
+  }
+
+  const results = await Promise.all(promises);
+  const dupResults = await Promise.all(dupPromises);
+  for (let i = 0; i < count; i += 1) {
+    assert.equal(results[i], entries[i].wgsl);
+  }
+  assert.equal(dupResults[0], entries[0].wgsl);
+  assert.equal(dupResults[3], entries[10].wgsl);
+
+  assert.equal(observedPeak, 4, 'peak concurrent range fetches must be capped at 4');
+  assert.deepEqual(startedOrder, expectedRangeByIdx, 'queued range fetches must dispatch in strict FIFO order');
+  assert.equal(capMock.requests.length, 1 + count, 'each distinct hash must issue exactly 1 Range request');
+
+  const finalStats = pack.getStats();
+  assert.equal(finalStats.activeRangeFetches, 0);
+  assert.equal(finalStats.peakConcurrentRangeFetches, 4);
+  assert.equal(finalStats.rangeFetchRetries, 0);
+  assert.equal(finalStats.inFlightCount, 0);
+  assert.equal(finalStats.inFlightCoalesced, 5);
+
+  // 3. maxConcurrentRangeFetches: 0 (unlimited) dispatches all concurrent distinct hashes at once
+  let unlimitedLive = 0;
+  let unlimitedPeak = 0;
+  const unlimitedReleases = [];
+  const unlimitedMock = createRangeMockFetch(
+    { '/packs/unlimited.wgsl.pack': packBuf },
+    {
+      beforeResponse: async ({ range }) => {
+        if (!range || range.startsWith('bytes=0-')) {
+          return null;
+        }
+        unlimitedLive += 1;
+        if (unlimitedLive > unlimitedPeak) {
+          unlimitedPeak = unlimitedLive;
+        }
+        await new Promise((resolve) => {
+          unlimitedReleases.push(() => {
+            unlimitedLive -= 1;
+            resolve();
+          });
+        });
+        return null;
+      },
+    }
+  );
+  const unlimitedPack = await loadIndexFromUrl('/packs/unlimited.wgsl.pack', {
+    fetch: unlimitedMock.fetch,
+    initialRangeBytes: tableEnd,
+    maxConcurrentRangeFetches: 0,
+  });
+  const unlimitedPromises = entries.slice(0, 12).map((e) => unlimitedPack.getWgslAsync(e.hash));
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(unlimitedPeak, 12);
+  assert.equal(unlimitedPack.getStats().activeRangeFetches, 12);
+  assert.equal(unlimitedPack.getStats().peakConcurrentRangeFetches, 12);
+  while (unlimitedReleases.length > 0) {
+    unlimitedReleases.shift()();
+  }
+  await Promise.all(unlimitedPromises);
+  assert.equal(unlimitedPack.getStats().activeRangeFetches, 0);
+  assert.equal(unlimitedPack.getStats().peakConcurrentRangeFetches, 12);
+});
+
+test('W162 transient TypeError: Failed to fetch, HTTP 5xx, and HTTP 429 retry with bounded backoff and recover cleanly', async () => {
+  const hNet = fnv1a64('w162-retry-net');
+  const h503 = fnv1a64('w162-retry-503');
+  const h429 = fnv1a64('w162-retry-429');
+  const hExhaust = fnv1a64('w162-retry-exhaust');
+
+  const packBuf = buildWgslPackBuffer([
+    { hash: hNet, stage: SHADER_STAGE.VERTEX, wgsl: SAMPLE_VS_WGSL },
+    { hash: h503, stage: SHADER_STAGE.FRAGMENT, wgsl: SAMPLE_FS_WGSL },
+    { hash: h429, stage: SHADER_STAGE.COMPUTE, wgsl: SAMPLE_CS_WGSL },
+    { hash: hExhaust, stage: SHADER_STAGE.COMPUTE, wgsl: '@compute @workgroup_size(2) fn ex() {}' },
+  ]);
+  const tableEnd = WGPK_HEADER_BYTES + 4 * WGPK_ENTRY_BYTES;
+
+  const sleepCalls = [];
+  const sleepFn = async (ms) => {
+    sleepCalls.push(ms);
+  };
+
+  let indexFailuresRemaining = 1;
+  const failuresByStart = new Map();
+  let packRef = null;
+
+  const mock = createRangeMockFetch(
+    { '/packs/retry.wgsl.pack': packBuf },
+    {
+      beforeResponse: async ({ range }) => {
+        if (range && range.startsWith('bytes=0-')) {
+          if (indexFailuresRemaining > 0) {
+            indexFailuresRemaining -= 1;
+            throw new TypeError('Failed to fetch');
+          }
+          return null;
+        }
+        const match = /^bytes=(\d+)-/.exec(range || '');
+        if (!match) return null;
+        const start = Number(match[1]);
+        const spec = failuresByStart.get(start);
+        if (!spec || spec.remaining <= 0) {
+          return null;
+        }
+        spec.remaining -= 1;
+        if (spec.kind === 'typeerror') {
+          throw new TypeError('Failed to fetch');
+        }
+        return {
+          ok: false,
+          status: spec.status,
+          statusText: spec.statusText,
+          headers: new Headers(),
+          async arrayBuffer() {
+            return new ArrayBuffer(0);
+          },
+        };
+      },
+    }
+  );
+
+  // Initial index load recovers from 1 transient TypeError: Failed to fetch!
+  packRef = await loadIndexFromUrl('/packs/retry.wgsl.pack', {
+    fetch: mock.fetch,
+    initialRangeBytes: tableEnd,
+    sleepFn,
+  });
+  assert.equal(packRef.getStats().rangeFetchRetries, 1);
+  assert.equal(packRef.getStats().rangeFetchCount, 2); // 1 failed + 1 succeeded
+  assert.deepEqual(sleepCalls, [25]);
+
+  const offNet = packRef.entries.get(hNet).offset;
+  const off503 = packRef.entries.get(h503).offset;
+  const off429 = packRef.entries.get(h429).offset;
+  const offExhaust = packRef.entries.get(hExhaust).offset;
+
+  // 1. TypeError: Failed to fetch fails twice, succeeds on 3rd attempt (default maxRangeFetchRetries = 2)
+  failuresByStart.set(offNet, { kind: 'typeerror', remaining: 2 });
+  sleepCalls.length = 0;
+  const wgslNet = await packRef.getWgslAsync(hNet);
+  assert.equal(wgslNet, SAMPLE_VS_WGSL);
+  assert.deepEqual(sleepCalls, [25, 50]);
+  assert.equal(packRef.getStats().rangeFetchRetries, 3);
+  assert.equal(packRef.getStats().activeRangeFetches, 0);
+
+  // 2. HTTP 503 fails once, recovers on retry #1
+  failuresByStart.set(off503, { kind: 'http', status: 503, statusText: 'Service Unavailable', remaining: 1 });
+  sleepCalls.length = 0;
+  const wgsl503 = await packRef.getWgslAsync(h503);
+  assert.equal(wgsl503, SAMPLE_FS_WGSL);
+  assert.deepEqual(sleepCalls, [25]);
+  assert.equal(packRef.getStats().rangeFetchRetries, 4);
+
+  // 3. HTTP 429 Too Many Requests fails once, recovers on retry #1
+  failuresByStart.set(off429, { kind: 'http', status: 429, statusText: 'Too Many Requests', remaining: 1 });
+  sleepCalls.length = 0;
+  const wgsl429 = await packRef.getWgslAsync(h429);
+  assert.equal(wgsl429, SAMPLE_CS_WGSL);
+  assert.deepEqual(sleepCalls, [25]);
+  assert.equal(packRef.getStats().rangeFetchRetries, 5);
+
+  // 4. Exhausted retries (3 consecutive TypeError: Failed to fetch with maxRangeFetchRetries = 2)
+  failuresByStart.set(offExhaust, { kind: 'typeerror', remaining: 5 });
+  sleepCalls.length = 0;
+  await assert.rejects(() => packRef.getWgslAsync(hExhaust), /Failed to fetch/);
+  assert.deepEqual(sleepCalls, [25, 50]);
+  assert.equal(packRef.getStats().rangeFetchRetries, 7);
+  assert.equal(packRef.getStats().activeRangeFetches, 0);
+  assert.equal(packRef.getStats().inFlightCount, 0);
+});
+
+test('W162 non-retryable HTTP 404, 416, 400, and AbortError fail fast immediately without wasting retries', async () => {
+  const h404 = fnv1a64('w162-failfast-404');
+  const h416 = fnv1a64('w162-failfast-416');
+  const h400 = fnv1a64('w162-failfast-400');
+  const hAbort = fnv1a64('w162-failfast-abort');
+
+  const packBuf = buildWgslPackBuffer([
+    { hash: h404, stage: SHADER_STAGE.VERTEX, wgsl: SAMPLE_VS_WGSL },
+    { hash: h416, stage: SHADER_STAGE.FRAGMENT, wgsl: SAMPLE_FS_WGSL },
+    { hash: h400, stage: SHADER_STAGE.COMPUTE, wgsl: SAMPLE_CS_WGSL },
+    { hash: hAbort, stage: SHADER_STAGE.COMPUTE, wgsl: '@compute @workgroup_size(4) fn ab() {}' },
+  ]);
+  const tableEnd = WGPK_HEADER_BYTES + 4 * WGPK_ENTRY_BYTES;
+
+  const sleepCalls = [];
+  const sleepFn = async (ms) => {
+    sleepCalls.push(ms);
+  };
+
+  let attemptCounts = new Map();
+  let modeByStart = new Map();
+
+  const mock = createRangeMockFetch(
+    { '/packs/failfast.wgsl.pack': packBuf },
+    {
+      beforeResponse: async ({ range }) => {
+        if (!range || range.startsWith('bytes=0-')) {
+          return null;
+        }
+        const start = Number(/^bytes=(\d+)-/.exec(range)[1]);
+        attemptCounts.set(start, (attemptCounts.get(start) || 0) + 1);
+        const mode = modeByStart.get(start);
+        if (mode === 'abort') {
+          const err = new Error('The operation was aborted');
+          err.name = 'AbortError';
+          throw err;
+        }
+        if (typeof mode === 'number') {
+          return {
+            ok: false,
+            status: mode,
+            statusText: `Status ${mode}`,
+            headers: new Headers(),
+            async arrayBuffer() {
+              return new ArrayBuffer(0);
+            },
+          };
+        }
+        return null;
+      },
+    }
+  );
+
+  const pack = await loadIndexFromUrl('/packs/failfast.wgsl.pack', {
+    fetch: mock.fetch,
+    initialRangeBytes: tableEnd,
+    maxRangeFetchRetries: 3,
+    rangeRetryDelayMs: 50,
+    sleepFn,
+  });
+
+  const off404 = pack.entries.get(h404).offset;
+  const off416 = pack.entries.get(h416).offset;
+  const off400 = pack.entries.get(h400).offset;
+  const offAbort = pack.entries.get(hAbort).offset;
+
+  modeByStart.set(off404, 404);
+  modeByStart.set(off416, 416);
+  modeByStart.set(off400, 400);
+  modeByStart.set(offAbort, 'abort');
+
+  await assert.rejects(() => pack.getWgslAsync(h404), /HTTP 404/);
+  await assert.rejects(() => pack.getWgslAsync(h416), /HTTP 416/);
+  await assert.rejects(() => pack.getWgslAsync(h400), /HTTP 400/);
+  await assert.rejects(() => pack.getWgslAsync(hAbort), (err) => err.name === 'AbortError');
+
+  assert.equal(attemptCounts.get(off404), 1, '404 must not retry');
+  assert.equal(attemptCounts.get(off416), 1, '416 must not retry');
+  assert.equal(attemptCounts.get(off400), 1, '400 must not retry');
+  assert.equal(attemptCounts.get(offAbort), 1, 'AbortError must not retry');
+  assert.equal(sleepCalls.length, 0, 'sleepFn must never be called for non-retryable errors');
+
+  const stats = pack.getStats();
+  assert.equal(stats.rangeFetchRetries, 0);
+  assert.equal(stats.activeRangeFetches, 0);
+  assert.equal(stats.inFlightCount, 0);
+});
+
+test('W162 WgslPackCache forwards concurrency/retry options and aggregates rangeFetchRetries, peakConcurrentRangeFetches, and activeRangeFetches', async () => {
+  const entries = [];
+  for (let i = 0; i < 6; i += 1) {
+    entries.push({
+      hash: fnv1a64(`w162-cache-shader-${i}`),
+      stage: SHADER_STAGE.COMPUTE,
+      wgsl: `@compute @workgroup_size(${i + 1}) fn c_${i}() {}`,
+    });
+  }
+  const packBuf = buildWgslPackBuffer(entries);
+  const tableEnd = WGPK_HEADER_BYTES + entries.length * WGPK_ENTRY_BYTES;
+
+  const sleepCalls = [];
+  const sleepFn = async (ms) => {
+    sleepCalls.push(ms);
+  };
+
+  let failFirstPayload = true;
+  const releases = [];
+
+  const mock = createRangeMockFetch(
+    { '/packs/cache-w162.wgsl.pack': packBuf },
+    {
+      beforeResponse: async ({ range }) => {
+        if (!range || range.startsWith('bytes=0-')) {
+          return null;
+        }
+        if (failFirstPayload) {
+          failFirstPayload = false;
+          throw new TypeError('Failed to fetch');
+        }
+        await new Promise((resolve) => {
+          releases.push(resolve);
+        });
+        return null;
+      },
+    }
+  );
+
+  const cache = new WgslPackCache({
+    fetch: mock.fetch,
+    initialRangeBytes: tableEnd,
+    maxConcurrentRangeFetches: 3,
+    maxRangeFetchRetries: 2,
+    rangeRetryDelayMs: 10,
+    sleepFn,
+  });
+
+  const pack = await cache.loadIndexFromUrl('/packs/cache-w162.wgsl.pack');
+  assert.equal(pack.getStats().maxConcurrentRangeFetches, 3);
+  assert.equal(pack.getStats().maxRangeFetchRetries, 2);
+
+  const promises = entries.map((e) => cache.getWgslAsync(e.hash));
+  await new Promise((r) => setTimeout(r, 10));
+
+  // While gated, activeRangeFetches and peakConcurrentRangeFetches must be visible on both pack and cache
+  const midCacheStats = cache.getStats();
+  assert.equal(midCacheStats.activeRangeFetches, 3);
+  assert.equal(midCacheStats.peakConcurrentRangeFetches, 3);
+  assert.equal(midCacheStats.rangeFetchRetries, 1);
+
+  while (releases.length > 0 || cache.getStats().activeRangeFetches > 0) {
+    const rel = releases.shift();
+    if (rel) rel();
+    await new Promise((r) => setTimeout(r, 2));
+  }
+
+  const results = await Promise.all(promises);
+  for (let i = 0; i < entries.length; i += 1) {
+    assert.equal(results[i], entries[i].wgsl);
+  }
+
+  assert.deepEqual(sleepCalls, [10]);
+
+  const packStats = pack.stats();
+  const cacheStats = cache.getStats();
+  for (const s of [packStats, cacheStats]) {
+    assert.equal(s.rangeFetchRetries, 1);
+    assert.equal(s.peakConcurrentRangeFetches, 3);
+    assert.equal(s.activeRangeFetches, 0);
+    assert.equal(s.inFlightCount, 0);
+  }
+
+  const snapshot = cache.inspect();
+  assert.doesNotThrow(() => JSON.stringify(snapshot));
+  assert.equal(snapshot.stats.rangeFetchRetries, 1);
+  assert.equal(snapshot.stats.peakConcurrentRangeFetches, 3);
+  assert.equal(snapshot.stats.activeRangeFetches, 0);
 });
