@@ -10,6 +10,8 @@
 
 (function (root) {
   const DEFAULT_MAX_ROWS = 32;
+  const DEFAULT_MAX_TOP_MISSING_SHADERS = 8;
+  const MAX_TOP_MISSING_SHADERS_CAP = 32;
   const EXPORT_FORMAT = 'playgta6-missing-shaders-v1';
   const EXPORT_SCHEMA_VERSION = 1;
   const STAGE_NOT_STARTED = 'NOT_STARTED';
@@ -145,11 +147,17 @@
     '__metric{padding:0.3rem 0.45rem;border-radius:0.35rem;background:rgba(255,255,255,0.04);}' +
     '.' +
     ROOT_CLASS +
+    '__metric--wide{grid-column:1 / -1;}' +
+    '.' +
+    ROOT_CLASS +
     '__metric-label{display:block;font-size:0.68rem;color:#8fa3bc;}' +
     '.' +
     ROOT_CLASS +
     '__metric-value{display:block;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;' +
     'font-size:0.78rem;font-weight:600;color:#e8eef7;}' +
+    '.' +
+    ROOT_CLASS +
+    '__top-missing-shaders{font-size:0.72rem;word-break:break-all;}' +
     '.' +
     ROOT_CLASS +
     '__progress-bar{height:0.35rem;border-radius:999px;background:rgba(255,255,255,0.12);overflow:hidden;}' +
@@ -570,6 +578,355 @@
     return usesBlitFallback ? `Active (${count})` : `Direct (${count})`;
   }
 
+  function sanitizeNonNegativeNumber(value) {
+    if (typeof value === 'number') {
+      return Number.isFinite(value) && value >= 0 ? value : null;
+    }
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (trimmed.length === 0 || trimmed.length > 32) return null;
+      if (!/^\d+(?:\.\d+)?$/.test(trimmed)) return null;
+      const n = Number(trimmed);
+      return Number.isFinite(n) && n >= 0 ? n : null;
+    }
+    return null;
+  }
+
+  function sanitizeNonNegativeInt(value, fallback = 0) {
+    const n = sanitizeNonNegativeNumber(value);
+    return n === null ? fallback : Math.floor(n);
+  }
+
+  function formatOnePercentLowFps(value) {
+    const n = sanitizeNonNegativeNumber(value);
+    return n === null ? PLACEHOLDER_DASH : `${n.toFixed(1)} fps`;
+  }
+
+  function formatP99FrameMs(value) {
+    const n = sanitizeNonNegativeNumber(value);
+    return n === null ? PLACEHOLDER_DASH : `${n.toFixed(2)} ms`;
+  }
+
+  function createDefaultPerfStats() {
+    return {
+      onePercentLowFps: null,
+      p99FrameMs: null,
+      zeroCopyUploads: 0,
+      totalElidedStateCalls: 0,
+      bindGroupCacheHits: 0,
+      topMissingShaders: [],
+      topMissingShaderOverflow: 0,
+    };
+  }
+
+  /**
+   * Normalize, deduplicate, sanitize, and cap a `topMissingShaders` list so only
+   * canonical 64-bit hex shader hashes (plus optional stage/hit counts) are retained
+   * and zero host paths or raw bytes can ever leak into UI or exports.
+   *
+   * @param {unknown} rawList
+   * @param {number} [maxItems=8]
+   * @returns {{ items: Array<{ hash: string, stage: string|null, hits: number|null }>, overflowCount: number }}
+   */
+  function normalizeTopMissingShaders(rawList, maxItems = DEFAULT_MAX_TOP_MISSING_SHADERS) {
+    const cap =
+      Number.isInteger(maxItems) && maxItems >= 1
+        ? Math.min(maxItems, MAX_TOP_MISSING_SHADERS_CAP)
+        : DEFAULT_MAX_TOP_MISSING_SHADERS;
+
+    if (!rawList || typeof rawList === 'string') {
+      return { items: [], overflowCount: 0 };
+    }
+
+    let rawItems;
+    if (Array.isArray(rawList)) {
+      rawItems = rawList;
+    } else if (typeof rawList[Symbol.iterator] === 'function') {
+      try {
+        rawItems = Array.from(rawList);
+      } catch {
+        return { items: [], overflowCount: 0 };
+      }
+    } else {
+      return { items: [], overflowCount: 0 };
+    }
+
+    const merged = new Map();
+    let hasNumericHits = false;
+
+    for (let i = 0; i < rawItems.length; i += 1) {
+      const entry = rawItems[i];
+      let hash = null;
+      let stage = null;
+      let hits = null;
+
+      if (typeof entry === 'string' || typeof entry === 'number' || typeof entry === 'bigint') {
+        hash = normalizeHashHex(entry);
+      } else if (entry && typeof entry === 'object' && !ArrayBuffer.isView(entry)) {
+        const rawHash =
+          safeRead(entry, 'hash') !== undefined
+            ? safeRead(entry, 'hash')
+            : safeRead(entry, 'shaderHash') !== undefined
+              ? safeRead(entry, 'shaderHash')
+              : safeRead(entry, 'hashHex');
+        hash = normalizeHashHex(rawHash);
+        if (hash !== null) {
+          const rawStage = safeRead(entry, 'stage');
+          if (rawStage !== undefined && rawStage !== null) {
+            stage = normalizeStageName(rawStage);
+          }
+          const rawHits =
+            safeRead(entry, 'hits') !== undefined
+              ? safeRead(entry, 'hits')
+              : safeRead(entry, 'hitCount') !== undefined
+                ? safeRead(entry, 'hitCount')
+                : safeRead(entry, 'drawCount') !== undefined
+                  ? safeRead(entry, 'drawCount')
+                  : safeRead(entry, 'count');
+          if (rawHits !== undefined && rawHits !== null) {
+            const parsedHits = sanitizeNonNegativeNumber(rawHits);
+            if (parsedHits !== null) {
+              hits = Math.floor(parsedHits);
+            }
+          }
+        }
+      }
+
+      if (hash === null) continue;
+      if (hits !== null) {
+        hasNumericHits = true;
+      }
+
+      const key = `${hash}|${stage || ''}`;
+      const existing = merged.get(key);
+      if (!existing) {
+        merged.set(key, { hash, stage, hits });
+      } else if (hits !== null) {
+        existing.hits = existing.hits === null ? hits : existing.hits + hits;
+      }
+    }
+
+    const rows = Array.from(merged.values());
+    if (hasNumericHits) {
+      rows.sort(
+        (a, b) =>
+          (b.hits === null ? -1 : b.hits) - (a.hits === null ? -1 : a.hits) ||
+          a.hash.localeCompare(b.hash) ||
+          String(a.stage || '').localeCompare(String(b.stage || ''))
+      );
+    }
+
+    const items = rows.slice(0, cap);
+    const overflowCount = Math.max(0, rows.length - items.length);
+    return { items, overflowCount };
+  }
+
+  /**
+   * Format a sanitized list of top missing shader hashes for compact UI rendering.
+   *
+   * @param {Array<{ hash?: string, hits?: number|null }|string>|null|undefined} items
+   * @param {number} [overflowCount=0]
+   * @param {number} [maxItems=8]
+   * @returns {string}
+   */
+  function formatTopMissingShaders(
+    items,
+    overflowCount = 0,
+    maxItems = DEFAULT_MAX_TOP_MISSING_SHADERS
+  ) {
+    if (!Array.isArray(items) || items.length === 0) {
+      return PLACEHOLDER_DASH;
+    }
+
+    const cap =
+      Number.isInteger(maxItems) && maxItems >= 1
+        ? Math.min(maxItems, MAX_TOP_MISSING_SHADERS_CAP)
+        : DEFAULT_MAX_TOP_MISSING_SHADERS;
+    const parts = [];
+    let validCount = 0;
+
+    for (let i = 0; i < items.length; i += 1) {
+      const entry = items[i];
+      let hash = null;
+      let hits = null;
+      if (typeof entry === 'string' || typeof entry === 'number' || typeof entry === 'bigint') {
+        hash = normalizeHashHex(entry);
+      } else if (entry && typeof entry === 'object' && !ArrayBuffer.isView(entry)) {
+        const rawHash =
+          safeRead(entry, 'hash') !== undefined
+            ? safeRead(entry, 'hash')
+            : safeRead(entry, 'shaderHash') !== undefined
+              ? safeRead(entry, 'shaderHash')
+              : safeRead(entry, 'hashHex');
+        hash = normalizeHashHex(rawHash);
+        const rawHits =
+          safeRead(entry, 'hits') !== undefined
+            ? safeRead(entry, 'hits')
+            : safeRead(entry, 'hitCount') !== undefined
+              ? safeRead(entry, 'hitCount')
+              : safeRead(entry, 'drawCount') !== undefined
+                ? safeRead(entry, 'drawCount')
+                : safeRead(entry, 'count');
+        const parsedHits = sanitizeNonNegativeNumber(rawHits);
+        if (parsedHits !== null) {
+          hits = Math.floor(parsedHits);
+        }
+      }
+      if (hash === null) continue;
+      validCount += 1;
+      if (parts.length < cap) {
+        parts.push(hits !== null ? `${hash} (${hits})` : hash);
+      }
+    }
+
+    if (parts.length === 0) {
+      return PLACEHOLDER_DASH;
+    }
+
+    const extraOverflow = sanitizeNonNegativeInt(overflowCount, 0);
+    const localOverflow = Math.max(0, validCount - parts.length);
+    const totalOverflow = extraOverflow + localOverflow;
+    const joined = parts.join(', ');
+    return totalOverflow > 0 ? `${joined} (+${totalOverflow} more)` : joined;
+  }
+
+  function extractPerfStats(source, base, maxTopMissingShaders = DEFAULT_MAX_TOP_MISSING_SHADERS) {
+    let next = base
+      ? {
+          ...base,
+          topMissingShaders: Array.isArray(base.topMissingShaders)
+            ? base.topMissingShaders.map((row) => ({ ...row }))
+            : [],
+        }
+      : createDefaultPerfStats();
+    if (!source || typeof source !== 'object') {
+      return next;
+    }
+
+    const rawPerf =
+      safeRead(source, 'perfStats') !== undefined
+        ? safeRead(source, 'perfStats')
+        : safeRead(source, 'perf');
+    if (rawPerf === null) {
+      next = createDefaultPerfStats();
+    }
+    const perfObj = rawPerf && typeof rawPerf === 'object' ? rawPerf : null;
+
+    const rawFrames =
+      safeRead(source, 'frameStats') !== undefined
+        ? safeRead(source, 'frameStats')
+        : safeRead(source, 'frames');
+    const framesObj = rawFrames && typeof rawFrames === 'object' ? rawFrames : null;
+
+    const rawBink =
+      safeRead(source, 'binkStats') !== undefined
+        ? safeRead(source, 'binkStats')
+        : safeRead(source, 'bink') !== undefined
+          ? safeRead(source, 'bink')
+          : safeRead(source, 'videoStats');
+    const binkObj = rawBink && typeof rawBink === 'object' ? rawBink : null;
+
+    const rawTexture = safeRead(source, 'textureStats');
+    const textureObj = rawTexture && typeof rawTexture === 'object' ? rawTexture : null;
+
+    const rawDraw =
+      safeRead(source, 'drawStats') !== undefined
+        ? safeRead(source, 'drawStats')
+        : safeRead(source, 'drawExecutorStats');
+    const drawObj = rawDraw && typeof rawDraw === 'object' ? rawDraw : null;
+
+    const rawRenderState = safeRead(source, 'renderStateStats');
+    const renderStateObj =
+      rawRenderState && typeof rawRenderState === 'object' ? rawRenderState : null;
+
+    const rawFallback = safeRead(source, 'fallbackStats');
+    const fallbackObj = rawFallback && typeof rawFallback === 'object' ? rawFallback : null;
+
+    const rawMissingSummary = safeRead(source, 'missingShaderSummary');
+    const missingSummaryObj =
+      rawMissingSummary && typeof rawMissingSummary === 'object' ? rawMissingSummary : null;
+
+    const onePctLow = pickFirstDefined(
+      [source, perfObj, framesObj],
+      ['onePercentLowFps', 'fps1PercentLow', 'low1PctFps']
+    );
+    if (onePctLow.found) {
+      next.onePercentLowFps = sanitizeNonNegativeNumber(onePctLow.value);
+    }
+
+    const p99 = pickFirstDefined([source, perfObj, framesObj], ['p99FrameMs', 'p99FrameTimeMs']);
+    if (p99.found) {
+      next.p99FrameMs = sanitizeNonNegativeNumber(p99.value);
+    }
+
+    const zeroCopy = pickFirstDefined(
+      [source, perfObj, binkObj, textureObj, framesObj],
+      ['zeroCopyUploads', 'directZeroCopyUploads', 'binkZeroCopyUploads']
+    );
+    if (zeroCopy.found) {
+      next.zeroCopyUploads = sanitizeNonNegativeInt(zeroCopy.value, 0);
+    }
+
+    const elided = pickFirstDefined(
+      [source, perfObj, drawObj, renderStateObj, framesObj],
+      ['totalElidedStateCalls', 'elidedStateCalls']
+    );
+    if (elided.found) {
+      next.totalElidedStateCalls = sanitizeNonNegativeInt(elided.value, 0);
+    } else {
+      const skipSources = [source, perfObj, drawObj, renderStateObj];
+      for (let i = 0; i < skipSources.length; i += 1) {
+        const src = skipSources[i];
+        if (!src || typeof src !== 'object') continue;
+        const pSkips = safeRead(src, 'redundantPipelineSkips');
+        const bgSkips = safeRead(src, 'redundantBindGroupSkips');
+        const vbSkips = safeRead(src, 'redundantVertexBufferSkips');
+        const ibSkips = safeRead(src, 'redundantIndexBufferSkips');
+        if (
+          pSkips !== undefined ||
+          bgSkips !== undefined ||
+          vbSkips !== undefined ||
+          ibSkips !== undefined
+        ) {
+          next.totalElidedStateCalls =
+            sanitizeNonNegativeInt(pSkips, 0) +
+            sanitizeNonNegativeInt(bgSkips, 0) +
+            sanitizeNonNegativeInt(vbSkips, 0) +
+            sanitizeNonNegativeInt(ibSkips, 0);
+          break;
+        }
+      }
+    }
+
+    let bgCacheHits = pickFirstDefined(
+      [source, perfObj, drawObj, renderStateObj, framesObj],
+      ['bindGroupCacheHits']
+    );
+    if (!bgCacheHits.found && renderStateObj) {
+      bgCacheHits = pickFirstDefined([renderStateObj], ['presentxBindGroupCacheHits']);
+    }
+    if (bgCacheHits.found) {
+      next.bindGroupCacheHits = sanitizeNonNegativeInt(bgCacheHits.value, 0);
+    }
+
+    const topMissing = pickFirstDefined(
+      [source, perfObj, fallbackObj, missingSummaryObj],
+      ['topMissingShaders']
+    );
+    if (topMissing.found) {
+      if (topMissing.value === null) {
+        next.topMissingShaders = [];
+        next.topMissingShaderOverflow = 0;
+      } else {
+        const normalized = normalizeTopMissingShaders(topMissing.value, maxTopMissingShaders);
+        next.topMissingShaders = normalized.items;
+        next.topMissingShaderOverflow = normalized.overflowCount;
+      }
+    }
+
+    return next;
+  }
+
   /**
    * Normalize and sanitize a single missing-shader entry into a canonical row
    * (`hash` hex, `stage`, `hits`, optional numeric timestamps, and display `text`).
@@ -719,6 +1076,10 @@
     const fallbackStats = normalizeFallbackStats(safeRead(source, 'fallbackStats'));
     const compatStats = extractCompatStats(source, null);
     const ioStats = extractIoStats(source, null);
+    const rawMaxTop = safeRead(source, 'maxTopMissingShaders');
+    const maxTop =
+      Number.isInteger(rawMaxTop) && rawMaxTop >= 1 ? rawMaxTop : DEFAULT_MAX_TOP_MISSING_SHADERS;
+    const perfStats = extractPerfStats(source, null, maxTop);
 
     let exportedAtValue = safeRead(source, 'exportedAt');
     if (exportedAtValue === undefined) {
@@ -781,6 +1142,19 @@
         slabCacheHits: ioStats.slabCacheHits,
         slabCacheMisses: ioStats.slabCacheMisses,
         syncFastPathHits: ioStats.syncFastPathHits,
+      },
+      perf: {
+        onePercentLowFps: perfStats.onePercentLowFps,
+        p99FrameMs: perfStats.p99FrameMs,
+        zeroCopyUploads: perfStats.zeroCopyUploads,
+        totalElidedStateCalls: perfStats.totalElidedStateCalls,
+        bindGroupCacheHits: perfStats.bindGroupCacheHits,
+        topMissingShaders: perfStats.topMissingShaders.map((row) => {
+          const item = { hash: row.hash };
+          if (row.stage !== null) item.stage = row.stage;
+          if (row.hits !== null) item.hits = row.hits;
+          return item;
+        }),
       },
       missingShaderCount: missingShaders.length,
       missingShaders,
@@ -889,6 +1263,16 @@
         throw new RangeError(`maxRows must be a positive integer, got ${maxRows}`);
       }
 
+      const maxTopMissingShaders =
+        opts.maxTopMissingShaders !== undefined
+          ? opts.maxTopMissingShaders
+          : DEFAULT_MAX_TOP_MISSING_SHADERS;
+      if (!Number.isInteger(maxTopMissingShaders) || maxTopMissingShaders < 1) {
+        throw new RangeError(
+          `maxTopMissingShaders must be a positive integer, got ${maxTopMissingShaders}`
+        );
+      }
+
       if (
         opts.onExportMissingShaders !== undefined &&
         opts.onExportMissingShaders !== null &&
@@ -909,6 +1293,7 @@
         (doc.body && typeof doc.body.appendChild === 'function' ? doc.body : null) ||
         (typeof doc.documentElement !== 'undefined' ? doc.documentElement : null);
       this._maxRows = maxRows;
+      this._maxTopMissingShaders = Math.min(maxTopMissingShaders, MAX_TOP_MISSING_SHADERS_CAP);
       this._onExportMissingShaders =
         typeof opts.onExportMissingShaders === 'function' ? opts.onExportMissingShaders : null;
       this._ariaLabel =
@@ -928,7 +1313,9 @@
       this._fallbackStats = normalizeFallbackStats(null);
       this._compatStats = createDefaultCompatStats();
       this._ioStats = createDefaultIoStats();
+      this._perfStats = createDefaultPerfStats();
       this._missingShaders = [];
+      this._renderedCache = Object.create(null);
 
       this._styleEl = ensureSharedStyle(doc);
       this._root = opts.root && typeof opts.root === 'object' ? opts.root : this._buildDom();
@@ -1203,6 +1590,75 @@
       ioGrid.appendChild(syncFastHitsMetric.card);
       ioSection.appendChild(ioGrid);
 
+      // --- Performance, Bink2 zero-copy, state-elision & top missing shaders section (W212) ---
+      const perfSection = createEl(
+        doc,
+        'div',
+        `${ROOT_CLASS}__section ${ROOT_CLASS}__perf`,
+        {
+          role: 'group',
+          'aria-label': 'Performance & GPU Telemetry',
+        }
+      );
+      perfSection.appendChild(
+        createEl(doc, 'div', `${ROOT_CLASS}__section-title`, {
+          text: 'Performance & GPU Telemetry',
+        })
+      );
+      const perfGrid = createEl(doc, 'div', `${ROOT_CLASS}__grid`);
+      const onePercentLowFpsMetric = this._buildMetricCard(
+        doc,
+        '1% Low FPS',
+        `${ROOT_CLASS}__one-percent-low-fps`,
+        PLACEHOLDER_DASH
+      );
+      const p99FrameMsMetric = this._buildMetricCard(
+        doc,
+        'P99 Frame',
+        `${ROOT_CLASS}__p99-frame-ms`,
+        PLACEHOLDER_DASH
+      );
+      const zeroCopyUploadsMetric = this._buildMetricCard(
+        doc,
+        '4K Zero-Copy',
+        `${ROOT_CLASS}__zero-copy-uploads`,
+        '0'
+      );
+      const elidedStateCallsMetric = this._buildMetricCard(
+        doc,
+        'State Elided',
+        `${ROOT_CLASS}__elided-state-calls`,
+        '0'
+      );
+      const bindGroupCacheHitsMetric = this._buildMetricCard(
+        doc,
+        'BG Cache Hits',
+        `${ROOT_CLASS}__bind-group-cache-hits`,
+        '0'
+      );
+      const topMissingCountMetric = this._buildMetricCard(
+        doc,
+        'Top Missing',
+        `${ROOT_CLASS}__top-missing-count`,
+        '0'
+      );
+      const topMissingShadersMetric = this._buildMetricCard(
+        doc,
+        'Top Missing Shader Hashes',
+        `${ROOT_CLASS}__top-missing-shaders`,
+        PLACEHOLDER_DASH
+      );
+      topMissingShadersMetric.card.className = `${ROOT_CLASS}__metric ${ROOT_CLASS}__metric--wide`;
+
+      perfGrid.appendChild(onePercentLowFpsMetric.card);
+      perfGrid.appendChild(p99FrameMsMetric.card);
+      perfGrid.appendChild(zeroCopyUploadsMetric.card);
+      perfGrid.appendChild(elidedStateCallsMetric.card);
+      perfGrid.appendChild(bindGroupCacheHitsMetric.card);
+      perfGrid.appendChild(topMissingCountMetric.card);
+      perfGrid.appendChild(topMissingShadersMetric.card);
+      perfSection.appendChild(perfGrid);
+
       // --- Missing-shader table section ---
       const missingSection = createEl(doc, 'div', `${ROOT_CLASS}__section ${ROOT_CLASS}__missing`);
       const missingHeader = createEl(
@@ -1237,6 +1693,7 @@
       body.appendChild(countersSection);
       body.appendChild(compatSection);
       body.appendChild(ioSection);
+      body.appendChild(perfSection);
       body.appendChild(missingSection);
 
       rootEl.appendChild(header);
@@ -1271,6 +1728,13 @@
         slabCacheHits: slabHitsMetric.val,
         slabCacheMisses: slabMissesMetric.val,
         syncFastPathHits: syncFastHitsMetric.val,
+        onePercentLowFps: onePercentLowFpsMetric.val,
+        p99FrameMs: p99FrameMsMetric.val,
+        zeroCopyUploads: zeroCopyUploadsMetric.val,
+        totalElidedStateCalls: elidedStateCallsMetric.val,
+        bindGroupCacheHits: bindGroupCacheHitsMetric.val,
+        topMissingCount: topMissingCountMetric.val,
+        topMissingShaders: topMissingShadersMetric.val,
         missingHeader,
         table,
         tbody,
@@ -1317,6 +1781,13 @@
           slabCacheHits: q(`.${ROOT_CLASS}__slab-hits`),
           slabCacheMisses: q(`.${ROOT_CLASS}__slab-misses`),
           syncFastPathHits: q(`.${ROOT_CLASS}__sync-fast-hits`),
+          onePercentLowFps: q(`.${ROOT_CLASS}__one-percent-low-fps`),
+          p99FrameMs: q(`.${ROOT_CLASS}__p99-frame-ms`),
+          zeroCopyUploads: q(`.${ROOT_CLASS}__zero-copy-uploads`),
+          totalElidedStateCalls: q(`.${ROOT_CLASS}__elided-state-calls`),
+          bindGroupCacheHits: q(`.${ROOT_CLASS}__bind-group-cache-hits`),
+          topMissingCount: q(`.${ROOT_CLASS}__top-missing-count`),
+          topMissingShaders: q(`.${ROOT_CLASS}__top-missing-shaders`),
           missingHeader: q(`.${ROOT_CLASS}__missing-header`),
           table: q(`.${ROOT_CLASS}__table`),
           tbody: q(`.${ROOT_CLASS}__table-body`),
@@ -1399,6 +1870,39 @@
       }
     }
 
+    _setTextIfChanged(cacheKey, el, nextText) {
+      if (!el) return false;
+      const str = String(nextText);
+      if (this._renderedCache[cacheKey] === str) {
+        return false;
+      }
+      el.textContent = str;
+      this._renderedCache[cacheKey] = str;
+      return true;
+    }
+
+    _setAttrIfChanged(cacheKey, el, attrName, nextValue) {
+      if (!el || typeof el.setAttribute !== 'function') return false;
+      const str = String(nextValue);
+      if (this._renderedCache[cacheKey] === str) {
+        return false;
+      }
+      el.setAttribute(attrName, str);
+      this._renderedCache[cacheKey] = str;
+      return true;
+    }
+
+    _setStylePropIfChanged(cacheKey, el, prop, nextValue) {
+      if (!el || !el.style) return false;
+      const str = String(nextValue);
+      if (this._renderedCache[cacheKey] === str) {
+        return false;
+      }
+      el.style[prop] = str;
+      this._renderedCache[cacheKey] = str;
+      return true;
+    }
+
     _render() {
       const els = this._els;
       if (!els) return;
@@ -1408,126 +1912,159 @@
       const fb = this._fallbackStats;
       const compat = this._compatStats;
       const io = this._ioStats;
+      const perf = this._perfStats;
 
       try {
-        if (els.summaryBadge) {
-          els.summaryBadge.textContent = `${boot.stage} · ${boot.progressPct}%`;
-        }
-        if (els.bootStage) {
-          els.bootStage.textContent = boot.stage;
-        }
-        if (els.bootMilestones) {
-          els.bootMilestones.textContent = `${boot.milestonesReached}/${boot.totalMilestones}`;
-        }
-        if (els.bootProgress) {
-          els.bootProgress.textContent = `${boot.progressPct}%`;
-        }
-        if (els.bootReady) {
-          els.bootReady.textContent = boot.readyForSplash ? 'Ready' : 'Pending';
-        }
-        if (els.progressFill && els.progressFill.style) {
-          els.progressFill.style.width = `${boot.progressPct}%`;
-        }
-        if (els.progressBar && typeof els.progressBar.setAttribute === 'function') {
-          els.progressBar.setAttribute('aria-valuenow', String(boot.progressPct));
-        }
+        this._setTextIfChanged('summaryBadge', els.summaryBadge, `${boot.stage} · ${boot.progressPct}%`);
+        this._setTextIfChanged('bootStage', els.bootStage, boot.stage);
+        this._setTextIfChanged(
+          'bootMilestones',
+          els.bootMilestones,
+          `${boot.milestonesReached}/${boot.totalMilestones}`
+        );
+        this._setTextIfChanged('bootProgress', els.bootProgress, `${boot.progressPct}%`);
+        this._setTextIfChanged('bootReady', els.bootReady, boot.readyForSplash ? 'Ready' : 'Pending');
+        this._setStylePropIfChanged('progressFill.width', els.progressFill, 'width', `${boot.progressPct}%`);
+        this._setAttrIfChanged(
+          'progressBar.aria-valuenow',
+          els.progressBar,
+          'aria-valuenow',
+          boot.progressPct
+        );
 
-        if (els.framesPresented) {
-          els.framesPresented.textContent = String(frames.framesPresented);
-        }
-        if (els.droppedFrames) {
-          els.droppedFrames.textContent = String(frames.droppedFrames);
-        }
-        if (els.packHits) {
-          els.packHits.textContent = String(fb.packHits);
-        }
-        if (els.fallbackHits) {
-          els.fallbackHits.textContent = String(fb.fallbackHits);
-        }
-        if (els.builtinHits) {
-          els.builtinHits.textContent = String(fb.builtinHits);
-        }
-        if (els.hitRate) {
-          els.hitRate.textContent = formatHitRatePct(fb.hitRatePct);
-        }
+        this._setTextIfChanged('framesPresented', els.framesPresented, frames.framesPresented);
+        this._setTextIfChanged('droppedFrames', els.droppedFrames, frames.droppedFrames);
+        this._setTextIfChanged('packHits', els.packHits, fb.packHits);
+        this._setTextIfChanged('fallbackHits', els.fallbackHits, fb.fallbackHits);
+        this._setTextIfChanged('builtinHits', els.builtinHits, fb.builtinHits);
+        this._setTextIfChanged('hitRate', els.hitRate, formatHitRatePct(fb.hitRatePct));
 
-        if (els.bindGroupKindMismatches) {
-          els.bindGroupKindMismatches.textContent = String(compat.bindGroupKindMismatches);
-        }
-        if (els.autoLayoutFallbacks) {
-          els.autoLayoutFallbacks.textContent = String(compat.autoLayoutFallbacks);
-        }
-        if (els.bc3dFallbacks) {
-          els.bc3dFallbacks.textContent = String(compat.bc3dFallbacks);
-        }
-        if (els.bc3dFallbackUploadsSkipped) {
-          els.bc3dFallbackUploadsSkipped.textContent = String(compat.bc3dFallbackUploadsSkipped);
-        }
-        if (els.swapchainFormat) {
-          els.swapchainFormat.textContent = compat.swapchainFormat || PLACEHOLDER_DASH;
-        }
+        this._setTextIfChanged(
+          'bindGroupKindMismatches',
+          els.bindGroupKindMismatches,
+          compat.bindGroupKindMismatches
+        );
+        this._setTextIfChanged(
+          'autoLayoutFallbacks',
+          els.autoLayoutFallbacks,
+          compat.autoLayoutFallbacks
+        );
+        this._setTextIfChanged('bc3dFallbacks', els.bc3dFallbacks, compat.bc3dFallbacks);
+        this._setTextIfChanged(
+          'bc3dFallbackUploadsSkipped',
+          els.bc3dFallbackUploadsSkipped,
+          compat.bc3dFallbackUploadsSkipped
+        );
+        this._setTextIfChanged(
+          'swapchainFormat',
+          els.swapchainFormat,
+          compat.swapchainFormat || PLACEHOLDER_DASH
+        );
         if (els.blitFallback) {
-          els.blitFallback.textContent = formatBlitFallbackText(
-            compat.usesBlitFallback,
+          this._setTextIfChanged(
+            'blitFallback',
+            els.blitFallback,
+            formatBlitFallbackText(compat.usesBlitFallback, compat.blitCount)
+          );
+          this._setAttrIfChanged(
+            'blitFallback.data-uses-blit',
+            els.blitFallback,
+            'data-uses-blit',
+            compat.usesBlitFallback
+          );
+          this._setAttrIfChanged(
+            'blitFallback.data-blit-count',
+            els.blitFallback,
+            'data-blit-count',
             compat.blitCount
           );
-          if (typeof els.blitFallback.setAttribute === 'function') {
-            els.blitFallback.setAttribute('data-uses-blit', String(compat.usesBlitFallback));
-            els.blitFallback.setAttribute('data-blit-count', String(compat.blitCount));
-          }
         }
 
-        if (els.pgimFullFetches) {
-          els.pgimFullFetches.textContent = String(io.pgimFullFetches);
-        }
-        if (els.slabCacheHits) {
-          els.slabCacheHits.textContent = String(io.slabCacheHits);
-        }
-        if (els.slabCacheMisses) {
-          els.slabCacheMisses.textContent = String(io.slabCacheMisses);
-        }
-        if (els.syncFastPathHits) {
-          els.syncFastPathHits.textContent = String(io.syncFastPathHits);
-        }
+        this._setTextIfChanged('pgimFullFetches', els.pgimFullFetches, io.pgimFullFetches);
+        this._setTextIfChanged('slabCacheHits', els.slabCacheHits, io.slabCacheHits);
+        this._setTextIfChanged('slabCacheMisses', els.slabCacheMisses, io.slabCacheMisses);
+        this._setTextIfChanged('syncFastPathHits', els.syncFastPathHits, io.syncFastPathHits);
+
+        // W212: Performance, 4K Bink2 zero-copy, state elision, and top missing shader hashes.
+        this._setTextIfChanged(
+          'onePercentLowFps',
+          els.onePercentLowFps,
+          formatOnePercentLowFps(perf.onePercentLowFps)
+        );
+        this._setTextIfChanged(
+          'p99FrameMs',
+          els.p99FrameMs,
+          formatP99FrameMs(perf.p99FrameMs)
+        );
+        this._setTextIfChanged('zeroCopyUploads', els.zeroCopyUploads, perf.zeroCopyUploads);
+        this._setTextIfChanged(
+          'totalElidedStateCalls',
+          els.totalElidedStateCalls,
+          perf.totalElidedStateCalls
+        );
+        this._setTextIfChanged(
+          'bindGroupCacheHits',
+          els.bindGroupCacheHits,
+          perf.bindGroupCacheHits
+        );
+        this._setTextIfChanged(
+          'topMissingCount',
+          els.topMissingCount,
+          perf.topMissingShaders.length
+        );
+        this._setTextIfChanged(
+          'topMissingShaders',
+          els.topMissingShaders,
+          formatTopMissingShaders(
+            perf.topMissingShaders,
+            perf.topMissingShaderOverflow,
+            this._maxTopMissingShaders
+          )
+        );
 
         const totalMissing = this._missingShaders.length;
         const visibleRows = this._missingShaders.slice(0, this._maxRows);
         const overflowCount = Math.max(0, totalMissing - visibleRows.length);
 
-        if (els.missingHeader) {
-          els.missingHeader.textContent = `Missing Shaders (${totalMissing})`;
-        }
+        this._setTextIfChanged('missingHeader', els.missingHeader, `Missing Shaders (${totalMissing})`);
 
         if (els.tbody) {
-          clearElementChildren(els.tbody);
-          const doc = this._document;
-          if (visibleRows.length === 0) {
-            const emptyRow = createEl(doc, 'tr', `${ROOT_CLASS}__empty-row`);
-            const emptyCell = createEl(doc, 'td', `${ROOT_CLASS}__empty-cell`, {
-              colspan: '3',
-              text: 'No missing shaders recorded',
-            });
-            emptyRow.appendChild(emptyCell);
-            els.tbody.appendChild(emptyRow);
-          } else {
-            for (let i = 0; i < visibleRows.length; i += 1) {
-              const row = visibleRows[i];
-              const tr = createEl(doc, 'tr', `${ROOT_CLASS}__shader-row`);
-              tr.appendChild(
-                createEl(doc, 'td', `${ROOT_CLASS}__cell-hash`, { text: row.hash })
-              );
-              tr.appendChild(
-                createEl(doc, 'td', `${ROOT_CLASS}__cell-stage`, { text: row.stage })
-              );
-              tr.appendChild(
-                createEl(doc, 'td', `${ROOT_CLASS}__cell-hits`, { text: String(row.hits) })
-              );
-              els.tbody.appendChild(tr);
+          const tableFingerprint =
+            visibleRows.length === 0
+              ? '__EMPTY__'
+              : visibleRows.map((row) => `${row.hash}|${row.stage}|${row.hits}`).join('\n');
+          if (this._renderedCache.tbodyFingerprint !== tableFingerprint) {
+            clearElementChildren(els.tbody);
+            const doc = this._document;
+            if (visibleRows.length === 0) {
+              const emptyRow = createEl(doc, 'tr', `${ROOT_CLASS}__empty-row`);
+              const emptyCell = createEl(doc, 'td', `${ROOT_CLASS}__empty-cell`, {
+                colspan: '3',
+                text: 'No missing shaders recorded',
+              });
+              emptyRow.appendChild(emptyCell);
+              els.tbody.appendChild(emptyRow);
+            } else {
+              for (let i = 0; i < visibleRows.length; i += 1) {
+                const row = visibleRows[i];
+                const tr = createEl(doc, 'tr', `${ROOT_CLASS}__shader-row`);
+                tr.appendChild(
+                  createEl(doc, 'td', `${ROOT_CLASS}__cell-hash`, { text: row.hash })
+                );
+                tr.appendChild(
+                  createEl(doc, 'td', `${ROOT_CLASS}__cell-stage`, { text: row.stage })
+                );
+                tr.appendChild(
+                  createEl(doc, 'td', `${ROOT_CLASS}__cell-hits`, { text: String(row.hits) })
+                );
+                els.tbody.appendChild(tr);
+              }
             }
+            this._renderedCache.tbodyFingerprint = tableFingerprint;
           }
         }
 
-        if (els.overflowEl) {
+        if (els.overflowEl && this._renderedCache.overflowCount !== overflowCount) {
           if (overflowCount > 0) {
             els.overflowEl.hidden = false;
             if (els.overflowEl.style) els.overflowEl.style.display = '';
@@ -1537,6 +2074,7 @@
             if (els.overflowEl.style) els.overflowEl.style.display = 'none';
             els.overflowEl.textContent = '';
           }
+          this._renderedCache.overflowCount = overflowCount;
         }
       } catch {
         // Render errors on partial/failing DOM mocks must never escape.
@@ -1600,6 +2138,7 @@
 
       this._compatStats = extractCompatStats(snapshot, this._compatStats);
       this._ioStats = extractIoStats(snapshot, this._ioStats);
+      this._perfStats = extractPerfStats(snapshot, this._perfStats, this._maxTopMissingShaders);
 
       this._render();
       return this.getState();
@@ -1619,6 +2158,8 @@
         frameStats: this._frameStats,
         compatStats: this._compatStats,
         ioStats: this._ioStats,
+        perfStats: this._perfStats,
+        maxTopMissingShaders: this._maxTopMissingShaders,
         now: this._now,
       });
       const jsonText = JSON.stringify(payload, null, 2);
@@ -1686,6 +2227,15 @@
         fallbackStats: { ...this._fallbackStats },
         compatStats: { ...this._compatStats },
         ioStats: { ...this._ioStats },
+        perfStats: {
+          onePercentLowFps: this._perfStats.onePercentLowFps,
+          p99FrameMs: this._perfStats.p99FrameMs,
+          zeroCopyUploads: this._perfStats.zeroCopyUploads,
+          totalElidedStateCalls: this._perfStats.totalElidedStateCalls,
+          bindGroupCacheHits: this._perfStats.bindGroupCacheHits,
+          topMissingShaders: this._perfStats.topMissingShaders.map((row) => ({ ...row })),
+          topMissingShaderOverflow: this._perfStats.topMissingShaderOverflow,
+        },
         hitRateText: formatHitRatePct(this._fallbackStats.hitRatePct),
         missingShaders: this._missingShaders.map((row) => ({ ...row })),
         visibleMissingShaders,
@@ -1742,6 +2292,7 @@
       this._visible = false;
       this._els = null;
       this._root = null;
+      this._renderedCache = Object.create(null);
       this._onExportMissingShaders = null;
       this._onToggleClick = null;
       this._onExportClick = null;
@@ -1750,12 +2301,17 @@
 
   const exportedApi = Object.freeze({
     DEFAULT_MAX_ROWS,
+    DEFAULT_MAX_TOP_MISSING_SHADERS,
     EXPORT_FORMAT,
     EXPORT_SCHEMA_VERSION,
     BOOT_STAGE_ORDER,
     STAGE_NAMES,
     ALLOWED_SWAPCHAIN_FORMATS,
     sanitizeSwapchainFormat,
+    formatOnePercentLowFps,
+    formatP99FrameMs,
+    normalizeTopMissingShaders,
+    formatTopMissingShaders,
     formatMissingShaderRow,
     buildMissingShaderExport,
     GpuBootPanelController,
