@@ -19,18 +19,24 @@ const {
   OVERFLOW_POLICIES,
   DEFAULT_MAX_PCM_BYTES,
   DEFAULT_DECLICK_FRAMES,
+  DEFAULT_TARGET_LATENCY_MS,
+  MIN_TARGET_LATENCY_MS,
+  MAX_TARGET_LATENCY_MS,
   GUEST_PCM_RING_DEFAULT_SAMPLE_RATE,
   GUEST_PCM_RING_CHANNELS,
   GUEST_PCM_RING_DEFAULT_CAPACITY_SAMPLES,
   GUEST_PCM_RING_DEFAULT_QUANTUM_FRAMES,
   ITU_BS775_CENTER_GAIN,
   ITU_BS775_SURROUND_GAIN,
+  clampTargetLatencyMs,
   deinterleavePcm,
   interleavePcm,
   extractSafePcmSamples,
   clonePcmForTransfer,
   sanitizeTransferList,
   softClipSample,
+  applyFadeRamp,
+  sanitizeAndSoftLimitBuffer,
   downmixToStereo,
   resampleLinear,
   buildAudioTelemetrySnapshot,
@@ -2232,4 +2238,408 @@ test('W235 guest PCM ring resampling (44.1 kHz -> 48 kHz), validation, telemetry
 
   worker.destroy();
   assert.equal(worker.getStats().guestRingAttached, false);
+});
+
+// ---------------------------------------------------------------------------
+// W299: W272 Fade Metrics, targetLatencyMs Jitter Control & Zero-Alloc #1028 Ring Drain
+// ---------------------------------------------------------------------------
+
+test('W299 targetLatencyMs clamping [10, 120] ms, control messages, drain cadence & watermark refill tuning', () => {
+  assert.equal(DEFAULT_TARGET_LATENCY_MS, 30);
+  assert.equal(MIN_TARGET_LATENCY_MS, 10);
+  assert.equal(MAX_TARGET_LATENCY_MS, 120);
+  assert.equal(clampTargetLatencyMs(undefined), 30);
+  assert.equal(clampTargetLatencyMs(Number.NaN), 30);
+  assert.equal(clampTargetLatencyMs(Number.POSITIVE_INFINITY), 30);
+  assert.equal(clampTargetLatencyMs('60'), 30);
+  assert.equal(clampTargetLatencyMs(2), 10);
+  assert.equal(clampTargetLatencyMs(10), 10);
+  assert.equal(clampTargetLatencyMs(45), 45);
+  assert.equal(clampTargetLatencyMs(120), 120);
+  assert.equal(clampTargetLatencyMs(500), 120);
+
+  const replies = [];
+  const scheduledTimers = [];
+  let clearedCount = 0;
+  const worker = new AudioMixerWorker((m) => replies.push(m), {
+    outputState: 'headless-drain',
+    autoDrain: true,
+    setIntervalFn: (fn, ms) => {
+      const handle = { fn, ms };
+      scheduledTimers.push(handle);
+      return handle;
+    },
+    clearIntervalFn: () => {
+      clearedCount += 1;
+    },
+  });
+
+  // Default targetLatencyMs is 30 ms.
+  assert.equal(worker.targetLatencyMs, 30);
+  assert.equal(worker.getStats().targetLatencyMs, 30);
+
+  worker.handleMessage({
+    init: true,
+    sampleRate: 48000,
+    channels: 2,
+    capacityFrames: 4096,
+    outputState: 'headless-drain',
+  });
+  assert.equal(scheduledTimers.length, 1);
+
+  // 1. `set-target-latency` message clamps low (< 10 ms -> 10 ms) & retunes timer cadence (5 ms).
+  worker.handleMessage({ type: 'set-target-latency', targetLatencyMs: 3, id: 'lat-low' });
+  const lowAck = replies[replies.length - 1];
+  assert.equal(lowAck.id, 'lat-low');
+  assert.equal(lowAck.type, 'target-latency');
+  assert.equal(lowAck.targetLatencyMs, 10);
+  assert.equal(lowAck.targetLatencyFrames, 480);
+  assert.equal(lowAck.drainWatermarkFrames, 480);
+  assert.equal(lowAck.drainIntervalMs, 5);
+  assert.equal(worker.targetLatencyMs, 10);
+  assert.equal(worker.drainIntervalMs, 5);
+  assert.equal(clearedCount, 1);
+  assert.equal(scheduledTimers[scheduledTimers.length - 1].ms, 5);
+
+  // 2. W293 `setTargetLatencyMs` control message clamps high (> 120 ms -> 120 ms) & caps watermark to ring capacity.
+  worker.handleMessage({
+    type: 'setTargetLatencyMs',
+    setTargetLatencyMs: true,
+    targetLatencyMs: 250,
+    id: 'lat-high',
+  });
+  const highAck = replies[replies.length - 1];
+  assert.equal(highAck.id, 'lat-high');
+  assert.equal(highAck.targetLatencyMs, 120);
+  assert.equal(highAck.targetLatencyFrames, 5760);
+  assert.equal(highAck.drainWatermarkFrames, 4096); // capped to ring capacityFrames
+  assert.equal(highAck.drainIntervalMs, 60);
+
+  // 3. Invalid/non-finite targetLatencyMs preserves current setting safely without throwing.
+  worker.handleMessage({ type: 'set-target-latency', targetLatencyMs: Number.NaN, id: 'lat-nan' });
+  assert.equal(replies[replies.length - 1].targetLatencyMs, 120);
+  worker.handleMessage({ type: 'set-target-latency', targetLatencyMs: 'invalid', id: 'lat-str' });
+  assert.equal(replies[replies.length - 1].targetLatencyMs, 120);
+
+  // 4. Watermark-tuned refill cadence in active mode stops pumping once buffered >= targetLatencyFrames.
+  worker.setOutputState('active');
+  worker.handleMessage({ type: 'set-target-latency', targetLatencyMs: 20, id: 'lat-20' }); // 960 frames @ 48 kHz
+  assert.equal(worker.targetLatencyFrames, 960);
+  assert.equal(worker.drainWatermarkFrames, 960);
+
+  const mock = createMockGuestPcmRing({ capacitySamples: 4096, baseOffset: 64 });
+  worker.attachGuestPcmRing(mock.descriptor);
+  assert.equal(mock.producerPush(makeConstantStereoFrames(1500, 0.25)), 3000);
+
+  // First implicit drain fills exactly up to the 960-frame watermark (not all 1500 frames).
+  const refill1 = worker.drainGuestPcmRing();
+  assert.equal(refill1.framesDrained, 960);
+  assert.equal(refill1.pushedFrames, 960);
+  assert.equal(worker.ring.availableFrames(), 960);
+
+  // Second implicit drain sees ring already at watermark -> pumps 0 frames (no over-buffering).
+  const refill2 = worker.drainGuestPcmRing();
+  assert.equal(refill2.framesDrained, 0);
+  assert.equal(refill2.pushedFrames, 0);
+  assert.equal(worker.ring.availableFrames(), 960);
+
+  // Pull 320 frames -> deficit is 320 frames -> next implicit drain refills exactly 320 frames.
+  assert.equal(worker.pullSamples(new Float32Array(320 * 2)), 320);
+  const refill3 = worker.drainGuestPcmRing();
+  assert.equal(refill3.framesDrained, 320);
+  assert.equal(refill3.pushedFrames, 320);
+  assert.equal(worker.ring.availableFrames(), 960);
+
+  worker.destroy();
+});
+
+test('W299 zero-alloc reusable scratch drain across wrap-around stereo #1028 rings (Wasm64 & Wasm32) with variable sizes', () => {
+  const worker = new AudioMixerWorker(null, {
+    outputState: 'active',
+    autoDrain: false,
+    declickFrames: 0,
+  });
+  worker.handleMessage({
+    init: true,
+    sampleRate: 48000,
+    channels: 2,
+    capacityFrames: 256,
+    outputState: 'active',
+  });
+
+  // 32-sample (16-frame) stereo #1028 ring using Wasm64 BigInt byte offsets.
+  const mock64 = createMockGuestPcmRing({ capacitySamples: 32, baseOffset: 64 });
+  worker.attachGuestPcmRing({
+    sab: mock64.sab,
+    base: BigInt(mock64.descriptor.base),
+    capacity: 32,
+    channels: 2,
+    sample_rate: 48000,
+    read_index_ptr: BigInt(mock64.descriptor.read_index_ptr),
+    write_index_ptr: BigInt(mock64.descriptor.write_index_ptr),
+    quantumFrames: 16,
+  });
+
+  // Start near uint32 2^32 cursor wrap boundary to stress both slot wrap and uint32 wrap.
+  Atomics.store(mock64.readCtrl, 0, 0xfffffff8);
+  Atomics.store(mock64.writeCtrl, 0, 0xfffffff8);
+
+  const allocsAfterAttach = worker.getScratchStats().allocations;
+  const pullScratch = new Float32Array(16 * 2);
+
+  // Spy on Float32Array.prototype.subarray to prove variable-size drains do not allocate even subarray views.
+  const origSubarray = Float32Array.prototype.subarray;
+  let subarrayCalls = 0;
+  Float32Array.prototype.subarray = function (...args) {
+    subarrayCalls += 1;
+    return origSubarray.apply(this, args);
+  };
+
+  try {
+    const variableSizes = [5, 11, 3, 13, 7, 9, 4, 12, 6, 10, 8, 15, 2, 14, 16, 1];
+    let seq = 0;
+    for (let round = 0; round < variableSizes.length; round++) {
+      const frames = variableSizes[round];
+      const input = new Float32Array(frames * 2);
+      for (let f = 0; f < frames; f++) {
+        const val = ((seq + f) % 17) * 0.04;
+        input[f * 2] = Math.fround(val);
+        input[f * 2 + 1] = Math.fround(-val);
+      }
+      seq += frames;
+      assert.equal(mock64.producerPush(input), frames * 2);
+
+      const drainRes = worker.drainGuestPcmRing(frames);
+      assert.equal(drainRes.framesDrained, frames);
+      assert.equal(drainRes.pushedFrames, frames);
+      assert.equal(drainRes.zeroAlloc, true);
+
+      const outView = origSubarray.call(pullScratch, 0, frames * 2);
+      assert.equal(worker.pullSamples(outView), frames);
+      for (let i = 0; i < frames * 2; i++) {
+        assert.equal(outView[i], input[i]);
+      }
+    }
+  } finally {
+    Float32Array.prototype.subarray = origSubarray;
+  }
+
+  assert.equal(subarrayCalls, 0, 'Variable-size stereo #1028 ring drains must allocate zero Float32Array subarray views');
+  assert.equal(worker.getScratchStats().allocations, allocsAfterAttach);
+  assert.equal(worker.getStats().zeroAllocDrains, 16);
+
+  // Verify Wasm32 numeric offsets attach & drain cleanly too.
+  const mock32 = createMockGuestPcmRing({ capacitySamples: 16, baseOffset: 32 });
+  worker.attachGuestPcmRing({
+    ...mock32.descriptor,
+    quantumFrames: 8,
+  });
+  const batch32 = makeConstantStereoFrames(6, 0.3);
+  assert.equal(mock32.producerPush(batch32), 12);
+  const res32 = worker.drainGuestPcmRing(6);
+  assert.equal(res32.framesDrained, 6);
+  assert.equal(res32.zeroAlloc, true);
+  assert.equal(worker.getStats().zeroAllocDrains, 17);
+
+  worker.destroy();
+});
+
+test('W299 NaN/Inf sanitization, soft-clipping [-1, 1], and W272 half-cosine underrun/recovery fade ramps', () => {
+  // 1. Standalone W272 helpers: applyFadeRamp & sanitizeAndSoftLimitBuffer.
+  assert.equal(typeof applyFadeRamp, 'function');
+  assert.equal(typeof sanitizeAndSoftLimitBuffer, 'function');
+
+  const rampBuf = makeConstantStereoFrames(16, 0.8);
+  applyFadeRamp(rampBuf, 2, 16, 1.0, 0.0);
+  assert.ok(Math.abs(rampBuf[0] - 0.8) < 1e-6);
+  assert.equal(rampBuf[15 * 2], 0.0);
+  assert.equal(rampBuf[15 * 2 + 1], 0.0);
+  for (let f = 1; f < 16; f++) {
+    assert.ok(rampBuf[f * 2] <= rampBuf[(f - 1) * 2] + 1e-6);
+  }
+
+  const sanitizeTarget = new Float32Array([0.5, -0.5, Number.NaN, Number.POSITIVE_INFINITY, 2.0, -3.5]);
+  const reuseStats = { softClippedSamples: 0, nonFiniteSanitized: 0 };
+  sanitizeAndSoftLimitBuffer(sanitizeTarget, sanitizeTarget.length, 0.95, reuseStats);
+  assert.equal(sanitizeTarget[0], 0.5);
+  assert.equal(sanitizeTarget[1], -0.5);
+  assert.equal(sanitizeTarget[2], 0.0);
+  assert.equal(sanitizeTarget[3], 0.0);
+  assert.ok(sanitizeTarget[4] > 0.95 && sanitizeTarget[4] <= 1.0);
+  assert.ok(sanitizeTarget[5] < -0.95 && sanitizeTarget[5] >= -1.0);
+  assert.equal(reuseStats.nonFiniteSanitized, 2);
+  assert.equal(reuseStats.softClippedSamples, 2);
+
+  // 2. #1028 stereo ring drain with NaN/±Inf sanitization, soft-clipping, and half-cosine underrun/recovery fades.
+  const worker = new AudioMixerWorker(null, {
+    outputState: 'active',
+    autoDrain: false,
+    declickFrames: 16,
+    fadeCurve: 'cosine',
+  });
+  worker.handleMessage({
+    init: true,
+    sampleRate: 48000,
+    channels: 2,
+    capacityFrames: 256,
+    outputState: 'active',
+  });
+
+  const mock = createMockGuestPcmRing({ capacitySamples: 128, baseOffset: 64 });
+  worker.attachGuestPcmRing({
+    ...mock.descriptor,
+    quantumFrames: 32,
+    softClip: true,
+    limiterKnee: 0.95,
+  });
+
+  // Push 32 frames: first 2 frames carry NaN/±Inf and hot peaks, rest steady +0.8.
+  const steadyAndDirty = makeConstantStereoFrames(32, 0.8);
+  steadyAndDirty[0] = Number.NaN;
+  steadyAndDirty[1] = Number.POSITIVE_INFINITY;
+  steadyAndDirty[2] = Number.NEGATIVE_INFINITY;
+  steadyAndDirty[3] = 2.5;
+  steadyAndDirty[4] = -3.0;
+  assert.equal(mock.producerPush(steadyAndDirty), 64);
+
+  const out1 = new Float32Array(32 * 2);
+  const d1 = worker.drainGuestPcmRing(out1);
+  assert.equal(d1.framesDrained, 32);
+  assert.equal(d1.underrun, false);
+  assert.equal(d1.sanitizedNonFiniteSamples, 3);
+  assert.equal(d1.softClippedSamples, 2);
+  assert.equal(out1[0], 0.0);
+  assert.equal(out1[1], 0.0);
+  assert.equal(out1[2], 0.0);
+  assert.ok(out1[3] > 0.95 && out1[3] <= 1.0);
+  assert.ok(out1[4] < -0.95 && out1[4] >= -1.0);
+  assert.equal(out1[31 * 2], Math.fround(0.8));
+
+  // Trigger guest underrun (empty ring after active audio) -> smooth half-cosine fade-out from +0.8 to 0.0!
+  const outUnderrun = new Float32Array(32 * 2);
+  outUnderrun.fill(99.0);
+  const d2 = worker.drainGuestPcmRing(outUnderrun);
+  assert.equal(d2.framesDrained, 0);
+  assert.equal(d2.underrun, true);
+  assert.ok(outUnderrun[0] > 0.7 && outUnderrun[0] < 0.8, `Expected cosine fade-out start near 0.8, got ${outUnderrun[0]}`);
+  assert.equal(outUnderrun[15 * 2], 0.0);
+  assert.equal(outUnderrun[31 * 2], 0.0);
+  for (let f = 1; f < 32; f++) {
+    assert.ok(outUnderrun[f * 2] <= outUnderrun[(f - 1) * 2] + 1e-6);
+  }
+
+  // Consecutive empty drain stays silent and does NOT double-count underrunFadeCount.
+  const outSilent = new Float32Array(32 * 2);
+  outSilent.fill(5.0);
+  worker.drainGuestPcmRing(outSilent);
+  assert.ok(outSilent.every((v) => v === 0.0));
+  assert.equal(worker.getStats().underrunFadeCount, 1);
+  assert.equal(worker.getStats().recoveryFadeCount, 0);
+
+  // Recovery drain with steady +0.8 -> smooth half-cosine fade-in from 0.0 to +0.8!
+  assert.equal(mock.producerPush(makeConstantStereoFrames(32, 0.8)), 64);
+  const outRecovery = new Float32Array(32 * 2);
+  const d3 = worker.drainGuestPcmRing(outRecovery);
+  assert.equal(d3.framesDrained, 32);
+  assert.equal(d3.underrun, false);
+  assert.equal(outRecovery[0], 0.0);
+  assert.equal(outRecovery[16 * 2], Math.fround(0.8));
+  assert.equal(outRecovery[31 * 2], Math.fround(0.8));
+  for (let f = 1; f < 32; f++) {
+    assert.ok(outRecovery[f * 2] >= outRecovery[(f - 1) * 2] - 1e-6);
+  }
+
+  // Verify AudioRingBuffer half-cosine fade curve & additive stats too.
+  worker.handleMessage({ pushPcm: true, samples: makeConstantStereoFrames(16, 0.6) });
+  const ringUnderrunOut = new Float32Array(32 * 2);
+  assert.equal(worker.pullSamples(ringUnderrunOut), 16);
+  assert.equal(ringUnderrunOut[31 * 2], 0.0);
+  worker.handleMessage({ pushPcm: true, samples: makeConstantStereoFrames(32, 0.6) });
+  const ringRecoveryOut = new Float32Array(32 * 2);
+  assert.equal(worker.pullSamples(ringRecoveryOut), 32);
+  assert.equal(ringRecoveryOut[0], 0.0);
+  assert.equal(ringRecoveryOut[16 * 2], Math.fround(0.6));
+
+  const stats = worker.getStats();
+  assert.equal(stats.fadeCurve, 'cosine');
+  assert.equal(stats.underrunFadeCount, 2); // 1 guest ring + 1 output ring
+  assert.equal(stats.recoveryFadeCount, 2); // 1 guest ring + 1 output ring
+  assert.equal(stats.sanitizedNonFiniteSamples, 3);
+  assert.equal(stats.softClippedSamples, 2);
+  assert.equal(stats.zeroAllocDrains, 4);
+
+  worker.destroy();
+});
+
+test('W299 sanitized audio-stats telemetry surfaces all new fields, sanitizes dirty inputs, and resets cleanly', () => {
+  const replies = [];
+  const worker = new AudioMixerWorker((m) => replies.push(m), {
+    outputState: 'active',
+    autoDrain: false,
+    declickFrames: 8,
+    fadeCurve: 'cosine',
+    targetLatencyMs: 42,
+  });
+
+  worker.handleMessage({
+    init: true,
+    sampleRate: 48000,
+    channels: 2,
+    capacityFrames: 128,
+    outputState: 'active',
+  });
+
+  const mock = createMockGuestPcmRing({ capacitySamples: 64, baseOffset: 64 });
+  worker.attachGuestPcmRing({ ...mock.descriptor, quantumFrames: 16 });
+  assert.equal(mock.producerPush(new Float32Array([Number.NaN, 2.2, 0.5, -0.5, 0.5, -0.5, 0.5, -0.5])), 8);
+
+  // Trigger partial underrun + fade-out + sanitization + soft-clip, then recovery + fade-in.
+  const buf = new Float32Array(16 * 2);
+  worker.drainGuestPcmRing(buf);
+  assert.equal(mock.producerPush(makeConstantStereoFrames(16, 0.5)), 32);
+  worker.drainGuestPcmRing(buf);
+
+  worker.handleMessage({ type: 'request-audio-stats', id: 'w299-telemetry' });
+  const reply = replies[replies.length - 1];
+  assert.equal(reply.type, 'audio-stats');
+  assert.equal(reply.id, 'w299-telemetry');
+  assert.equal(reply.stats.targetLatencyMs, 42);
+  assert.equal(reply.stats.zeroAllocDrains, 2);
+  assert.equal(reply.stats.underrunFadeCount, 1);
+  assert.equal(reply.stats.recoveryFadeCount, 1);
+  assert.equal(reply.stats.sanitizedNonFiniteSamples, 1);
+  assert.equal(reply.stats.softClippedSamples, 1);
+
+  // Dirty snapshot sanitization clamps targetLatencyMs to [10, 120] and strips host paths / negatives / NaN.
+  const dirty = buildAudioTelemetrySnapshot(
+    {
+      targetLatencyMs: 9999,
+      zeroAllocDrains: -10,
+      underrunFadeCount: Number.NaN,
+      recoveryFadeCount: 3.9,
+      sanitizedNonFiniteSamples: -4,
+      softClippedSamples: Number.POSITIVE_INFINITY,
+      hostPath: 'C:\\secret\\game.rpf',
+    },
+    { timestamp: 7777 }
+  );
+  assert.equal(dirty.stats.targetLatencyMs, 120);
+  assert.equal(dirty.stats.zeroAllocDrains, 0);
+  assert.equal(dirty.stats.underrunFadeCount, 0);
+  assert.equal(dirty.stats.recoveryFadeCount, 3);
+  assert.equal(dirty.stats.sanitizedNonFiniteSamples, 0);
+  assert.equal(dirty.stats.softClippedSamples, 0);
+  assert.equal(JSON.stringify(dirty).includes('game.rpf'), false);
+
+  // reset() zeroes counters while preserving configured targetLatencyMs.
+  worker.reset();
+  const afterReset = worker.getStats();
+  assert.equal(afterReset.targetLatencyMs, 42);
+  assert.equal(afterReset.zeroAllocDrains, 0);
+  assert.equal(afterReset.underrunFadeCount, 0);
+  assert.equal(afterReset.recoveryFadeCount, 0);
+  assert.equal(afterReset.sanitizedNonFiniteSamples, 0);
+  assert.equal(afterReset.softClippedSamples, 0);
+
+  worker.destroy();
 });
