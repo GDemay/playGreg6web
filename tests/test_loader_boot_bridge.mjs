@@ -21,6 +21,10 @@ const {
   INPUT_STATE_BYTES,
   INPUT_STATE_WORDS,
   DEFAULT_INPUT_BRIDGE_POLL_MS,
+  DEFAULT_MEMFS_PIPELINE_DUMP_DIR,
+  DEFAULT_MEMFS_PIPELINE_DUMP_ENDPOINT,
+  DEFAULT_MEMFS_PIPELINE_DUMP_INTERVAL_MS,
+  DEFAULT_MEMFS_PIPELINE_DUMP_MAX_CONCURRENT_UPLOADS,
   BOOT_INIT_FORWARD_KEYS,
   isEmscriptenPthreadWorkerName,
   isEmscriptenPthreadWorker,
@@ -36,6 +40,9 @@ const {
   getLoaderStatus,
   createHostImports,
   startInputSabBridge,
+  resolveDumpPipelinesEnabled,
+  sanitizeDumpRelPath,
+  createMemfsPipelineDumpSyncer,
   resolveRuntimeScriptUrl,
   resolveSideModuleUrl,
   sanitizeSideModuleUrls,
@@ -2728,4 +2735,610 @@ test('O36/#796 buildRuntimeModuleConfig wires onRuntimeInitialized and onExit to
   assert.equal(userExitCalled, 1);
   assert.equal(cfg.getInputBridge(), null);
   assert.equal(bridge.getStats().stopped, true);
+});
+
+function createFakeMemfs({ withMkdirTree = true } = {}) {
+  const S_IFDIR = 0o040000;
+  const S_IFREG = 0o100000;
+  const dirs = new Set(['/']);
+  const files = new Map();
+  const extraDirEntries = new Map();
+  const counts = {
+    mkdir: 0,
+    mkdirTree: 0,
+    readdir: 0,
+    stat: 0,
+    readFile: 0,
+  };
+
+  function normPath(p) {
+    const clean = String(p || '').replace(/\/+/g, '/');
+    return clean.length > 1 && clean.endsWith('/') ? clean.slice(0, -1) : clean || '/';
+  }
+
+  function parentOf(p) {
+    const idx = p.lastIndexOf('/');
+    return idx <= 0 ? '/' : p.slice(0, idx);
+  }
+
+  function makeErrnoError(code, errno, msg) {
+    const err = new Error(msg);
+    err.code = code;
+    err.errno = errno;
+    return err;
+  }
+
+  const fakeFs = {
+    isDir(mode) {
+      return (mode & 0o170000) === S_IFDIR;
+    },
+    isFile(mode) {
+      return (mode & 0o170000) === S_IFREG;
+    },
+    mkdir(p) {
+      counts.mkdir += 1;
+      const target = normPath(p);
+      if (dirs.has(target) || files.has(target)) {
+        throw makeErrnoError('EEXIST', 20, `File exists: ${target}`);
+      }
+      const parent = parentOf(target);
+      if (!dirs.has(parent)) {
+        throw makeErrnoError('ENOENT', 44, `No such parent: ${parent}`);
+      }
+      dirs.add(target);
+    },
+    readdir(p) {
+      counts.readdir += 1;
+      const dir = normPath(p);
+      if (!dirs.has(dir)) {
+        throw makeErrnoError('ENOENT', 44, `No such directory: ${dir}`);
+      }
+      const prefix = dir === '/' ? '/' : `${dir}/`;
+      const names = new Set(['.', '..']);
+      for (const d of dirs) {
+        if (d === dir || !d.startsWith(prefix)) continue;
+        const rest = d.slice(prefix.length);
+        if (rest && !rest.includes('/')) {
+          names.add(rest);
+        }
+      }
+      for (const f of files.keys()) {
+        if (!f.startsWith(prefix)) continue;
+        const rest = f.slice(prefix.length);
+        if (rest && !rest.includes('/')) {
+          names.add(rest);
+        }
+      }
+      const injected = extraDirEntries.get(dir);
+      if (injected) {
+        for (const bad of injected) {
+          names.add(bad);
+        }
+      }
+      return Array.from(names);
+    },
+    stat(p) {
+      counts.stat += 1;
+      const target = normPath(p);
+      if (dirs.has(target)) {
+        return { mode: S_IFDIR | 0o755, size: 0 };
+      }
+      if (files.has(target)) {
+        return { mode: S_IFREG | 0o644, size: files.get(target).byteLength };
+      }
+      throw makeErrnoError('ENOENT', 44, `No such entry: ${target}`);
+    },
+    readFile(p) {
+      counts.readFile += 1;
+      const target = normPath(p);
+      if (!files.has(target)) {
+        throw makeErrnoError('ENOENT', 44, `No such file: ${target}`);
+      }
+      return files.get(target).slice();
+    },
+  };
+
+  if (withMkdirTree) {
+    fakeFs.mkdirTree = (p) => {
+      counts.mkdirTree += 1;
+      const target = normPath(p);
+      const parts = target.split('/').filter(Boolean);
+      let cur = '';
+      for (const part of parts) {
+        cur += `/${part}`;
+        dirs.add(cur);
+      }
+    };
+  }
+
+  function writeFile(p, data) {
+    const target = normPath(p);
+    const parts = target.split('/').filter(Boolean);
+    let cur = '';
+    for (let i = 0; i < parts.length - 1; i += 1) {
+      cur += `/${parts[i]}`;
+      dirs.add(cur);
+    }
+    const bytes =
+      data instanceof Uint8Array
+        ? data.slice()
+        : typeof data === 'string'
+          ? new TextEncoder().encode(data)
+          : new Uint8Array(data);
+    files.set(target, bytes);
+  }
+
+  function injectUnsafeEntry(dirPath, rawName) {
+    const dir = normPath(dirPath);
+    dirs.add(dir);
+    if (!extraDirEntries.has(dir)) {
+      extraDirEntries.set(dir, []);
+    }
+    extraDirEntries.get(dir).push(rawName);
+  }
+
+  return {
+    fs: fakeFs,
+    dirs,
+    files,
+    counts,
+    writeFile,
+    injectUnsafeEntry,
+  };
+}
+
+test('W180/#918 createMemfsPipelineDumpSyncer is disabled by default with zero overhead and supports opt-in URL/option flags', async () => {
+  assert.equal(DEFAULT_MEMFS_PIPELINE_DUMP_DIR, '/pg6_dump');
+  assert.equal(DEFAULT_MEMFS_PIPELINE_DUMP_ENDPOINT, '/__pg6_dump/');
+  assert.equal(DEFAULT_MEMFS_PIPELINE_DUMP_INTERVAL_MS, 3000);
+  assert.equal(DEFAULT_MEMFS_PIPELINE_DUMP_MAX_CONCURRENT_UPLOADS, 4);
+
+  // URL / option opt-in resolution (headless-safe when location is absent).
+  assert.equal(resolveDumpPipelinesEnabled(), false);
+  assert.equal(resolveDumpPipelinesEnabled({}), false);
+  assert.equal(resolveDumpPipelinesEnabled({ dumpPipelines: true }), true);
+  assert.equal(
+    resolveDumpPipelinesEnabled({ dumpPipelines: false, locationSearch: '?dumpPipelines=1' }),
+    false,
+  );
+  assert.equal(resolveDumpPipelinesEnabled({ locationSearch: '?dumpPipelines=1' }), true);
+  assert.equal(resolveDumpPipelinesEnabled({ locationSearch: '?foo=bar&dumpPipelines=true' }), true);
+  assert.equal(resolveDumpPipelinesEnabled({ locationSearch: '?dumpPipelines=TRUE' }), true);
+  assert.equal(resolveDumpPipelinesEnabled({ locationSearch: '?dumpPipelines=0' }), false);
+  assert.equal(resolveDumpPipelinesEnabled({ locationSearch: '?dumpPipelines=false' }), false);
+  assert.equal(
+    resolveDumpPipelinesEnabled({ locationHref: 'http://127.0.0.1:8080/loader.js?dumpPipelines=1' }),
+    true,
+  );
+  assert.equal(
+    resolveDumpPipelinesEnabled({ locationHref: 'http://127.0.0.1:8080/loader.js?other=1' }),
+    false,
+  );
+
+  // Path sanitization checks.
+  assert.equal(sanitizeDumpRelPath('native/0001.bin'), 'native/0001.bin');
+  assert.equal(sanitizeDumpRelPath('manifest.json'), 'manifest.json');
+  assert.equal(sanitizeDumpRelPath('../escape.bin'), null);
+  assert.equal(sanitizeDumpRelPath('native/../escape.bin'), null);
+  assert.equal(sanitizeDumpRelPath('native\\0001.bin'), null);
+  assert.equal(sanitizeDumpRelPath('native/bad\0.bin'), null);
+  assert.equal(sanitizeDumpRelPath('/abs/path.bin'), null);
+  assert.equal(sanitizeDumpRelPath('C:drive.bin'), null);
+
+  // Disabled syncer must perform zero FS, timer, or fetch work.
+  const memfs = createFakeMemfs();
+  memfs.writeFile('/pg6_dump/native/a.bin', new Uint8Array([1, 2, 3, 4]));
+  let fetchCalls = 0;
+  let timerCalls = 0;
+  const syncer = createMemfsPipelineDumpSyncer({
+    fs: memfs.fs,
+    fetchFn: async () => {
+      fetchCalls += 1;
+      return { ok: true, status: 200 };
+    },
+    setIntervalFn: () => {
+      timerCalls += 1;
+      return 1;
+    },
+  });
+
+  assert.equal(syncer.enabled, false);
+  assert.equal(syncer.ensureDumpDir(), false);
+  assert.equal(syncer.start(), false);
+  const flushStats = await syncer.flush();
+  const stopStats = await syncer.stop();
+
+  assert.deepEqual(flushStats, {
+    enabled: false,
+    filesUploaded: 0,
+    bytesUploaded: 0,
+    uploadErrors: 0,
+    lastFlushAtMs: null,
+    pendingCount: 0,
+  });
+  assert.deepEqual(stopStats, flushStats);
+  assert.equal(fetchCalls, 0);
+  assert.equal(timerCalls, 0);
+  assert.equal(memfs.counts.mkdir, 0);
+  assert.equal(memfs.counts.mkdirTree, 0);
+  assert.equal(memfs.counts.readdir, 0);
+  assert.equal(memfs.counts.readFile, 0);
+
+  // buildRuntimeModuleConfig keeps dump sync disabled by default.
+  const cfg = buildRuntimeModuleConfig({
+    locationHref: 'http://127.0.0.1:8080/loader.js',
+    dumpFetchFn: async () => {
+      fetchCalls += 1;
+      return { ok: true, status: 200 };
+    },
+    dumpSetIntervalFn: () => {
+      timerCalls += 1;
+      return 99;
+    },
+  });
+  cfg.preRun[0]({ FS: memfs.fs });
+  cfg.onExit(0);
+  assert.equal(cfg.getPipelineDumpSyncer().enabled, false);
+  assert.equal(fetchCalls, 0);
+  assert.equal(timerCalls, 0);
+  assert.equal(memfs.counts.mkdirTree, 0);
+});
+
+test('W180/#918 preRun creates /pg6_dump via mkdirTree or mkdir fallback ignoring EEXIST and activates via URL query', () => {
+  // 1. FS.mkdirTree path enabled via URL query parameter.
+  const memfsTree = createFakeMemfs({ withMkdirTree: true });
+  let scheduledMs = null;
+  let clearedId = null;
+  const cfgUrl = buildRuntimeModuleConfig({
+    locationHref: 'http://127.0.0.1:8080/loader.js?dumpPipelines=1',
+    dumpIntervalMs: 2500,
+    dumpFetchFn: async () => ({ ok: true, status: 200 }),
+    dumpSetIntervalFn: (_fn, ms) => {
+      scheduledMs = ms;
+      return 'timer-tree';
+    },
+    dumpClearIntervalFn: (id) => {
+      clearedId = id;
+    },
+  });
+
+  assert.equal(memfsTree.dirs.has('/pg6_dump'), false);
+  cfgUrl.preRun[0]({ FS: memfsTree.fs });
+  assert.equal(memfsTree.dirs.has('/pg6_dump'), true);
+  assert.equal(memfsTree.counts.mkdirTree, 1);
+  assert.equal(scheduledMs, 2500);
+
+  // Calling ensureDumpDir again when directory exists does not throw.
+  assert.equal(cfgUrl.getPipelineDumpSyncer().ensureDumpDir(), true);
+  cfgUrl.onExit(0);
+  assert.equal(clearedId, 'timer-tree');
+
+  // 2. FS.mkdir fallback (no mkdirTree) with nested dumpDir and pre-existing EEXIST parent.
+  const memfsFlat = createFakeMemfs({ withMkdirTree: false });
+  memfsFlat.dirs.add('/work');
+  const syncer = createMemfsPipelineDumpSyncer({
+    dumpPipelines: true,
+    dumpDir: '/work/pg6_dump',
+    fs: memfsFlat.fs,
+    fetchFn: async () => ({ ok: true, status: 200 }),
+    setIntervalFn: () => null,
+  });
+
+  assert.equal(syncer.ensureDumpDir(), true);
+  assert.equal(memfsFlat.dirs.has('/work/pg6_dump'), true);
+  // Second call encounters EEXIST on both /work and /work/pg6_dump and ignores it cleanly.
+  assert.equal(syncer.ensureDumpDir(), true);
+});
+
+test('W180/#918 recursively uploads native/*.bin, dxil/*.dxbc, manifest.json with deduplication, size-change re-upload, and traversal blocking', async () => {
+  const memfs = createFakeMemfs();
+  const binBytes = new Uint8Array([0x01, 0x02, 0x03, 0x04, 0x05, 0x06]);
+  const metaBytes = new TextEncoder().encode('{"stage":"ps"}');
+  const dxbcBytes = new Uint8Array([0x44, 0x58, 0x42, 0x43, 0x10, 0x20, 0x30, 0x40]);
+  const manifestV1 = new TextEncoder().encode('{"count":1}');
+
+  memfs.writeFile('/pg6_dump/native/pso_0001.bin', binBytes);
+  memfs.writeFile('/pg6_dump/native/pso_0001.meta', metaBytes);
+  memfs.writeFile('/pg6_dump/dxil/shader_0002.dxbc', dxbcBytes);
+  memfs.writeFile('/pg6_dump/manifest.json', manifestV1);
+
+  // Inject hostile entries that must be rejected cleanly.
+  memfs.injectUnsafeEntry('/pg6_dump', '../escape.bin');
+  memfs.injectUnsafeEntry('/pg6_dump/native', 'bad\\name.bin');
+  memfs.injectUnsafeEntry('/pg6_dump/dxil', 'nul\0byte.dxbc');
+  memfs.injectUnsafeEntry('/pg6_dump', 'C:secret.bin');
+
+  const uploads = [];
+  let fakeNow = 1700000001000;
+  const syncer = createMemfsPipelineDumpSyncer({
+    dumpPipelines: true,
+    fs: memfs.fs,
+    nowFn: () => fakeNow,
+    fetchFn: async (url, init) => {
+      uploads.push({
+        url,
+        method: init.method,
+        contentType: init.headers['Content-Type'],
+        body: new Uint8Array(init.body),
+      });
+      return { ok: true, status: 200 };
+    },
+  });
+
+  const stats1 = await syncer.flush();
+  assert.equal(uploads.length, 4);
+  assert.deepEqual(
+    uploads.map((u) => u.url),
+    [
+      '/__pg6_dump/dxil/shader_0002.dxbc',
+      '/__pg6_dump/native/pso_0001.bin',
+      '/__pg6_dump/native/pso_0001.meta',
+      '/__pg6_dump/manifest.json',
+    ],
+  );
+  for (const u of uploads) {
+    assert.equal(u.method, 'POST');
+    assert.equal(u.contentType, 'application/octet-stream');
+    assert.ok(u.body instanceof Uint8Array);
+  }
+  assert.deepEqual(uploads[0].body, dxbcBytes);
+  assert.deepEqual(uploads[1].body, binBytes);
+  assert.deepEqual(uploads[2].body, metaBytes);
+  assert.deepEqual(uploads[3].body, manifestV1);
+
+  const expectedBytes1 =
+    dxbcBytes.byteLength + binBytes.byteLength + metaBytes.byteLength + manifestV1.byteLength;
+  assert.deepEqual(stats1, {
+    enabled: true,
+    filesUploaded: 4,
+    bytesUploaded: expectedBytes1,
+    uploadErrors: 0,
+    lastFlushAtMs: 1700000001000,
+    pendingCount: 0,
+  });
+  // Verify getStats() returns only sanitized fields (zero host paths or raw shader bytes).
+  assert.deepEqual(Object.keys(stats1).sort(), [
+    'bytesUploaded',
+    'enabled',
+    'filesUploaded',
+    'lastFlushAtMs',
+    'pendingCount',
+    'uploadErrors',
+  ]);
+  stats1.filesUploaded = 999;
+  assert.equal(syncer.getStats().filesUploaded, 4);
+
+  // Second flush with no file changes must skip all 4 files (zero POSTs, zero extra readFile).
+  const readCountBefore = memfs.counts.readFile;
+  fakeNow = 1700000004000;
+  const stats2 = await syncer.flush();
+  assert.equal(uploads.length, 4);
+  assert.equal(memfs.counts.readFile, readCountBefore);
+  assert.equal(stats2.filesUploaded, 4);
+  assert.equal(stats2.lastFlushAtMs, 1700000004000);
+
+  // Write a newly discovered Bink2 shader and grow manifest.json: only those 2 files upload!
+  const dxbc2Bytes = new Uint8Array([0x44, 0x58, 0x42, 0x43, 0x99, 0xaa]);
+  const manifestV2 = new TextEncoder().encode('{"count":2,"entries":["pso_0001","bink2_0003"]}');
+  memfs.writeFile('/pg6_dump/dxil/bink2_0003.dxbc', dxbc2Bytes);
+  memfs.writeFile('/pg6_dump/manifest.json', manifestV2);
+
+  fakeNow = 1700000007000;
+  const stats3 = await syncer.flush();
+  assert.equal(uploads.length, 6);
+  assert.deepEqual(
+    uploads.slice(4).map((u) => u.url),
+    ['/__pg6_dump/dxil/bink2_0003.dxbc', '/__pg6_dump/manifest.json'],
+  );
+  assert.deepEqual(uploads[4].body, dxbc2Bytes);
+  assert.deepEqual(uploads[5].body, manifestV2);
+  assert.deepEqual(stats3, {
+    enabled: true,
+    filesUploaded: 6,
+    bytesUploaded: expectedBytes1 + dxbc2Bytes.byteLength + manifestV2.byteLength,
+    uploadErrors: 0,
+    lastFlushAtMs: 1700000007000,
+    pendingCount: 0,
+  });
+});
+
+test('W180/#918 enforces maxConcurrentUploads bounded concurrency cap and tracks pendingCount', async () => {
+  const memfs = createFakeMemfs();
+  for (let i = 0; i < 9; i += 1) {
+    memfs.writeFile(`/pg6_dump/native/s${i}.bin`, new Uint8Array([i, i + 1, i + 2]));
+  }
+
+  let inFlight = 0;
+  let peakInFlight = 0;
+  const resolvers = [];
+
+  const syncer = createMemfsPipelineDumpSyncer({
+    dumpPipelines: true,
+    maxConcurrentUploads: 3,
+    fs: memfs.fs,
+    fetchFn: (url) =>
+      new Promise((resolve) => {
+        inFlight += 1;
+        if (inFlight > peakInFlight) {
+          peakInFlight = inFlight;
+        }
+        resolvers.push({
+          url,
+          finish() {
+            inFlight -= 1;
+            resolve({ ok: true, status: 200 });
+          },
+        });
+      }),
+  });
+
+  const flushPromise = syncer.flush();
+  // Immediately after starting flush, exactly 3 uploads are in flight and all 9 are pending.
+  assert.equal(inFlight, 3);
+  assert.equal(peakInFlight, 3);
+  assert.equal(syncer.getStats().pendingCount, 9);
+
+  while (resolvers.length > 0) {
+    const batch = resolvers.splice(0, resolvers.length);
+    for (const item of batch) {
+      item.finish();
+    }
+    await new Promise((r) => setImmediate(r));
+    assert.ok(inFlight <= 3, `Expected inFlight <= 3, got ${inFlight}`);
+  }
+
+  const finalStats = await flushPromise;
+  assert.equal(peakInFlight, 3);
+  assert.equal(inFlight, 0);
+  assert.equal(finalStats.filesUploaded, 9);
+  assert.equal(finalStats.bytesUploaded, 27);
+  assert.equal(finalStats.uploadErrors, 0);
+  assert.equal(finalStats.pendingCount, 0);
+});
+
+test('W180/#918 handles HTTP 403/500 and network rejections without crashing, increments uploadErrors, and retries next flush', async () => {
+  const memfs = createFakeMemfs();
+  memfs.writeFile('/pg6_dump/native/a.bin', new Uint8Array([1, 2]));
+  memfs.writeFile('/pg6_dump/dxil/b.dxbc', new Uint8Array([3, 4, 5]));
+  memfs.writeFile('/pg6_dump/manifest.json', '{"v":1}');
+  memfs.writeFile('/pg6_dump/native/ok.bin', new Uint8Array([9]));
+
+  let failMode = true;
+  const attempts = [];
+  const syncer = createMemfsPipelineDumpSyncer({
+    dumpPipelines: true,
+    fs: memfs.fs,
+    fetchFn: async (url) => {
+      attempts.push(url);
+      if (!failMode) {
+        return { ok: true, status: 200 };
+      }
+      if (url.endsWith('/native/a.bin')) {
+        return { ok: false, status: 403 };
+      }
+      if (url.endsWith('/dxil/b.dxbc')) {
+        return { ok: false, status: 500 };
+      }
+      if (url.endsWith('/manifest.json')) {
+        throw new Error('simulated network disconnect');
+      }
+      return { ok: true, status: 200 };
+    },
+  });
+
+  const stats1 = await syncer.flush();
+  assert.equal(stats1.filesUploaded, 1);
+  assert.equal(stats1.bytesUploaded, 1);
+  assert.equal(stats1.uploadErrors, 3);
+  assert.equal(stats1.pendingCount, 3);
+
+  // Recover server and retry: only the 3 failed files are retried (native/ok.bin is NOT re-posted).
+  failMode = false;
+  attempts.length = 0;
+  const stats2 = await syncer.flush();
+  assert.deepEqual(attempts.sort(), [
+    '/__pg6_dump/dxil/b.dxbc',
+    '/__pg6_dump/manifest.json',
+    '/__pg6_dump/native/a.bin',
+  ]);
+  assert.equal(stats2.filesUploaded, 4);
+  assert.equal(stats2.bytesUploaded, 1 + 2 + 3 + 7);
+  assert.equal(stats2.uploadErrors, 3);
+  assert.equal(stats2.pendingCount, 0);
+});
+
+test('W180/#918 buildRuntimeModuleConfig hooks preRun timer + onExit final flush drain and coalesces in-flight stop()', async () => {
+  const memfs = createFakeMemfs();
+  const postedUrls = [];
+  let intervalCb = null;
+  let clearedToken = null;
+  let userExitCode = null;
+  const fakeTimer = { id: 180 };
+
+  const cfg = buildRuntimeModuleConfig({
+    locationHref: 'http://127.0.0.1:8080/loader.js',
+    dumpPipelines: true,
+    dumpIntervalMs: 3000,
+    dumpFetchFn: async (url) => {
+      postedUrls.push(url);
+      return { ok: true, status: 200 };
+    },
+    dumpSetIntervalFn: (fn, ms) => {
+      assert.equal(ms, 3000);
+      intervalCb = fn;
+      return fakeTimer;
+    },
+    dumpClearIntervalFn: (token) => {
+      clearedToken = token;
+    },
+    onExit(code) {
+      userExitCode = code;
+    },
+  });
+
+  const mockModule = { FS: memfs.fs };
+  cfg.preRun[0](mockModule);
+  assert.equal(memfs.dirs.has('/pg6_dump'), true);
+  assert.equal(typeof intervalCb, 'function');
+
+  // Periodic timer flush picks up first shader dump.
+  memfs.writeFile('/pg6_dump/native/boot0.bin', new Uint8Array([0xaa, 0xbb]));
+  intervalCb();
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(postedUrls, ['/__pg6_dump/native/boot0.bin']);
+
+  // New post-XGameSave / Bink2 shaders written right before exit must be drained by onExit().
+  memfs.writeFile('/pg6_dump/dxil/bink2_intro.dxbc', new Uint8Array([0xde, 0xad, 0xbe, 0xef]));
+  memfs.writeFile('/pg6_dump/manifest.json', '{"shaders":2}');
+
+  cfg.onExit(0);
+  assert.equal(clearedToken, fakeTimer);
+  assert.equal(userExitCode, 0);
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(postedUrls, [
+    '/__pg6_dump/native/boot0.bin',
+    '/__pg6_dump/dxil/bink2_intro.dxbc',
+    '/__pg6_dump/manifest.json',
+  ]);
+  const stats = cfg.getPipelineDumpSyncer().getStats();
+  assert.equal(stats.filesUploaded, 3);
+  assert.equal(stats.uploadErrors, 0);
+  assert.equal(stats.pendingCount, 0);
+
+  // Coalesced stop() while an earlier flush() is still in flight runs a follow-up drain.
+  const memfs2 = createFakeMemfs();
+  memfs2.writeFile('/pg6_dump/native/first.bin', new Uint8Array([1, 2]));
+  const uploaded2 = [];
+  let releaseFirst = null;
+  const syncer2 = createMemfsPipelineDumpSyncer({
+    dumpPipelines: true,
+    fs: memfs2.fs,
+    setIntervalFn: () => 55,
+    clearIntervalFn: () => {},
+    fetchFn: (url) =>
+      new Promise((resolve) => {
+        uploaded2.push(url);
+        if (url.endsWith('/first.bin')) {
+          releaseFirst = () => resolve({ ok: true, status: 200 });
+        } else {
+          resolve({ ok: true, status: 200 });
+        }
+      }),
+  });
+  syncer2.start();
+  const inFlightFlush = syncer2.flush();
+  assert.equal(typeof releaseFirst, 'function');
+
+  // Write a second file while first.bin upload is still in flight, then call stop().
+  memfs2.writeFile('/pg6_dump/native/late_exit.bin', new Uint8Array([3, 4, 5]));
+  const stopDrain = syncer2.stop();
+  releaseFirst();
+  await Promise.all([inFlightFlush, stopDrain]);
+
+  assert.deepEqual(uploaded2, [
+    '/__pg6_dump/native/first.bin',
+    '/__pg6_dump/native/late_exit.bin',
+  ]);
+  assert.equal(syncer2.getStats().filesUploaded, 2);
+  assert.equal(syncer2.getStats().pendingCount, 0);
 });
