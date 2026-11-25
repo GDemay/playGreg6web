@@ -67,10 +67,14 @@ Xbox Live (XSAPI, `XblContextCreateHandle` etc.) answers with the offline HRESUL
 | XSystem 4 | XSystemGetXboxLiveSandboxId | Configured sandbox, else `E_NOTIMPL` | #235 |
 | XSystem 5 | XSystemGetAppSpecificDeviceId | **Trapping stub** (device identity / attestation-adjacent; owner decision) | #235 |
 | XGame 3 | XGameGetXboxTitleId | Implemented | #235 |
-| XGame 4 | XLaunchNewGame | **Trapping stub** (owner decision) | #235 |
 | XPackage 3/4 | GetCurrentProcessPackageIdentifier / IsPackagedProcess | Implemented: deterministic local id (32 zero digits), packaged | #235 |
 | XPackage 5/6/7/9 | Installation monitor and progress | Implemented: always complete and launchable | #235 |
 | XPackage 39 | XPackageEnumeratePackages | Content kind: none; game-package kind: `E_NOTIMPL` | #235 |
+
+XGame 4 XLaunchNewGame is no longer listed: relaunching the running title is a process restart, not a store,
+licence or entitlement call. When the target is the title itself the guest stops with `kRelaunchSelfExitCode`
+(`runtime/os/win32_compat.h`) and `tools/run_native_boot.py` / the browser boot relaunch it with the same
+arguments; launching any other title returns `E_NOTIMPL`.
 
 There is no package-licence or entitlement answer anywhere: no slot returns a licence handle or "owned".
 
@@ -83,13 +87,12 @@ There is no package-licence or entitlement answer anywhere: no slot returns a li
   both answered locally.
 - **No store or licence call later in the boot.** A native menu-flow run to 240 s states "No store/licence call".
   I found no comment on #663 reporting a store/licence call at about 73 s; if one exists elsewhere, add it here.
-- Token/signature, GetAppSpecificDeviceId and XLaunchNewGame: no comment on #663 reports the boot reaching them.
+- Token/signature and GetAppSpecificDeviceId: no comment on #663 reports the boot reaching them.
   Their stubs would trap on first call, so a stop at them would be visible as an unimplemented-import fault.
 
 ## 6. Owner decisions pending
 
 1. Whether XUserGetTokenAndSignatureResult (slot 25) should match the offline HRESULT of slots 23/24 rather than trap.
 2. What XSystemGetAppSpecificDeviceId should return, if anything.
-3. Whether XLaunchNewGame stays a trap.
-4. Which HRESULT slot 71/72 should settle on long term (see section 2).
-5. Any policy for XStore slots 20/21/22/65/68 if the boot reaches them.
+3. Which HRESULT slot 71/72 should settle on long term (see section 2).
+4. Any policy for XStore slots 20/21/22/65/68 if the boot reaches them.
