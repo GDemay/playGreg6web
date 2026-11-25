@@ -835,6 +835,42 @@ const MENU_NAVIGATION_KB_BINDINGS = {
   KeyM: INPUT_BUTTONS.MENU,
 };
 
+// Ready-to-play Menu preset: layers WASD -> D-Pad over MENU_NAVIGATION_KB_BINDINGS
+// so both Arrow keys and WASD navigate Main Menu / Calibration / Pause screens
+// without driving left-stick gameplay movement bits.
+const MENU_KB_BINDINGS = {
+  ...MENU_NAVIGATION_KB_BINDINGS,
+  KeyW: INPUT_BUTTONS.DPAD_UP,
+  KeyS: INPUT_BUTTONS.DPAD_DOWN,
+  KeyA: INPUT_BUTTONS.DPAD_LEFT,
+  KeyD: INPUT_BUTTONS.DPAD_RIGHT,
+};
+
+// Ready-to-play On-Foot preset: layers GTA pause (KeyP) & camera cycle (KeyV)
+// cleanly over DEFAULT_KEY_BINDINGS without altering any default binding.
+const ON_FOOT_KB_BINDINGS = {
+  ...DEFAULT_KEY_BINDINGS,
+  KeyP: INPUT_BUTTONS.MENU,
+  KeyV: INPUT_BUTTONS.VIEW,
+};
+
+// Ready-to-play Driving preset: layers vehicle-specific controls (handbrake Space->RB,
+// horn KeyE->LS, headlights KeyH->DPAD_RIGHT, duck KeyX->A, cinematic camera KeyR->B,
+// camera cycle KeyV->VIEW, pause KeyP/Escape->MENU) over DEFAULT_KEY_BINDINGS.
+const DRIVING_KB_BINDINGS = {
+  ...DEFAULT_KEY_BINDINGS,
+  Space: INPUT_BUTTONS.RB,
+  KeyE: INPUT_BUTTONS.LS,
+  KeyH: INPUT_BUTTONS.DPAD_RIGHT,
+  KeyX: INPUT_BUTTONS.A,
+  KeyR: INPUT_BUTTONS.B,
+  KeyV: INPUT_BUTTONS.VIEW,
+  KeyP: INPUT_BUTTONS.MENU,
+  Escape: INPUT_BUTTONS.MENU,
+};
+
+export const GAMEPLAY_PROFILE_PRESETS = Object.freeze(['menu', 'on_foot', 'driving']);
+
 export const BUILTIN_PROFILES = Object.freeze({
   default: deepFreezeProfile({
     id: 'default',
@@ -906,7 +942,129 @@ export const BUILTIN_PROFILES = Object.freeze({
     swapSticks: false,
     swapTriggersAndBumpers: false,
   }),
+  menu: deepFreezeProfile({
+    id: 'menu',
+    name: 'Menu (Ready-to-Play)',
+    keyBindings: { ...MENU_KB_BINDINGS },
+    mouseSensitivityX: 1.0,
+    mouseSensitivityY: 1.0,
+    invertLookY: false,
+    leftStickDeadzone: 0.22,
+    rightStickDeadzone: 0.22,
+    triggerDeadzone: 0.12,
+    stickCurve: RESPONSE_CURVES.CUBIC,
+    swapSticks: false,
+    swapTriggersAndBumpers: false,
+  }),
+  on_foot: deepFreezeProfile({
+    id: 'on_foot',
+    name: 'On Foot (GTA VI)',
+    keyBindings: { ...ON_FOOT_KB_BINDINGS },
+    mouseSensitivityX: 1.25,
+    mouseSensitivityY: 1.25,
+    invertLookY: false,
+    leftStickDeadzone: 0.14,
+    rightStickDeadzone: 0.12,
+    triggerDeadzone: 0.04,
+    stickCurve: RESPONSE_CURVES.EXPO,
+    swapSticks: false,
+    swapTriggersAndBumpers: false,
+  }),
+  driving: deepFreezeProfile({
+    id: 'driving',
+    name: 'Driving (GTA VI)',
+    keyBindings: { ...DRIVING_KB_BINDINGS },
+    mouseSensitivityX: 0.9,
+    mouseSensitivityY: 0.9,
+    invertLookY: false,
+    leftStickDeadzone: 0.12,
+    rightStickDeadzone: 0.16,
+    triggerDeadzone: 0.03,
+    stickCurve: RESPONSE_CURVES.CUBIC,
+    swapSticks: false,
+    swapTriggersAndBumpers: false,
+  }),
 });
+
+function populateKeyLookupMap(targetMap, keyBindings) {
+  targetMap.clear();
+  if (!keyBindings) return;
+  const keys = Object.keys(keyBindings);
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i];
+    const mask = keyBindings[key] >>> 0;
+    if (mask !== 0) {
+      targetMap.set(key, mask);
+    }
+  }
+}
+
+// Pre-built O(1) key-lookup tables for all built-in presets so switching between
+// presets and resolving keys in hot input loops perform zero heap allocations.
+const BUILTIN_KEY_LOOKUP_TABLES = new Map();
+for (const [profileId, preset] of Object.entries(BUILTIN_PROFILES)) {
+  const table = new Map();
+  populateKeyLookupMap(table, preset.keyBindings);
+  BUILTIN_KEY_LOOKUP_TABLES.set(profileId, table);
+}
+
+let _moduleActiveProfileId = 'default';
+let _moduleActiveProfile = BUILTIN_PROFILES.default;
+let _moduleActiveKeyLookup = BUILTIN_KEY_LOOKUP_TABLES.get('default');
+const _moduleCustomKeyLookup = new Map();
+
+/**
+ * Sets the module-level active input profile used by `resolveKeyBindingFast(keyCode)`.
+ * Accepts any built-in profile name (e.g. 'menu', 'on_foot', 'driving', 'default')
+ * or a validated profile object. Switching between built-in profiles is O(1) and
+ * performs zero heap allocations.
+ */
+export function setActiveProfile(nameOrProfile) {
+  if (typeof nameOrProfile === 'string') {
+    if (!Object.prototype.hasOwnProperty.call(BUILTIN_PROFILES, nameOrProfile)) {
+      throw new RangeError(`Unknown input profile: ${nameOrProfile}`);
+    }
+    _moduleActiveProfileId = nameOrProfile;
+    _moduleActiveProfile = BUILTIN_PROFILES[nameOrProfile];
+    _moduleActiveKeyLookup = BUILTIN_KEY_LOOKUP_TABLES.get(nameOrProfile);
+    return _moduleActiveProfile;
+  }
+
+  if (isPlainObject(nameOrProfile)) {
+    const validated = validateAndNormalizeProfile(nameOrProfile, 'profile', { strict: true });
+    populateKeyLookupMap(_moduleCustomKeyLookup, validated.keyBindings);
+    _moduleActiveProfileId = validated.id;
+    _moduleActiveProfile = deepFreezeProfile(validated);
+    _moduleActiveKeyLookup = _moduleCustomKeyLookup;
+    return _moduleActiveProfile;
+  }
+
+  throw new TypeError('setActiveProfile expects a built-in profile name or profile object');
+}
+
+/**
+ * Returns the active module-level profile ID (O(1), zero-alloc).
+ */
+export function getActiveProfileId() {
+  return _moduleActiveProfileId;
+}
+
+/**
+ * Returns the active module-level frozen profile object.
+ */
+export function getActiveProfile() {
+  return _moduleActiveProfile;
+}
+
+/**
+ * Zero-allocation O(1) key-to-INPUT_BUTTONS bitmask lookup against the active profile.
+ * Returns 0 for unbound keys, prototype property names, or non-string inputs.
+ */
+export function resolveKeyBindingFast(keyCode) {
+  if (typeof keyCode !== 'string') return 0;
+  const mask = _moduleActiveKeyLookup.get(keyCode);
+  return mask === undefined ? 0 : mask;
+}
 
 /**
  * Transforms raw stick axes according to a profile:
@@ -961,8 +1119,10 @@ export class InputProfileManager {
         : DEFAULT_STORAGE_KEY;
 
     this._profiles = new Map();
+    this._activeKeyLookup = new Map();
     this._seedBuiltins();
     this._activeProfileId = 'default';
+    this._syncActiveKeyLookup();
 
     if (opts.autoLoad === true) {
       this.load({
@@ -977,6 +1137,11 @@ export class InputProfileManager {
     for (const preset of Object.values(BUILTIN_PROFILES)) {
       this._profiles.set(preset.id, cloneProfile(preset));
     }
+  }
+
+  _syncActiveKeyLookup() {
+    const active = this._profiles.get(this._activeProfileId);
+    populateKeyLookupMap(this._activeKeyLookup, active ? active.keyBindings : null);
   }
 
   _requireProfile(profileId) {
@@ -995,6 +1160,10 @@ export class InputProfileManager {
     return profile ? cloneProfile(profile) : null;
   }
 
+  getActiveProfileId() {
+    return this._activeProfileId;
+  }
+
   getActiveProfile() {
     return cloneProfile(this._profiles.get(this._activeProfileId));
   }
@@ -1002,7 +1171,18 @@ export class InputProfileManager {
   setActiveProfile(profileId) {
     const profile = this._requireProfile(profileId);
     this._activeProfileId = profile.id;
+    this._syncActiveKeyLookup();
     return cloneProfile(profile);
+  }
+
+  /**
+   * Zero-allocation O(1) key-to-INPUT_BUTTONS bitmask lookup against this manager's
+   * active profile. Returns 0 for unbound keys, prototype keys, or non-string inputs.
+   */
+  resolveKeyBindingFast(keyCode) {
+    if (typeof keyCode !== 'string') return 0;
+    const mask = this._activeKeyLookup.get(keyCode);
+    return mask === undefined ? 0 : mask;
   }
 
   createProfile(rawProfile) {
@@ -1039,6 +1219,9 @@ export class InputProfileManager {
       strict: true,
     });
     this._profiles.set(existing.id, validated);
+    if (existing.id === this._activeProfileId) {
+      this._syncActiveKeyLookup();
+    }
     return cloneProfile(validated);
   }
 
@@ -1050,6 +1233,7 @@ export class InputProfileManager {
     this._profiles.delete(profileId);
     if (this._activeProfileId === profileId) {
       this._activeProfileId = 'default';
+      this._syncActiveKeyLookup();
     }
     return true;
   }
@@ -1061,6 +1245,9 @@ export class InputProfileManager {
     ) {
       const restored = cloneProfile(BUILTIN_PROFILES[profileId]);
       this._profiles.set(profileId, restored);
+      if (profileId === this._activeProfileId) {
+        this._syncActiveKeyLookup();
+      }
       return cloneProfile(restored);
     }
 
@@ -1073,11 +1260,15 @@ export class InputProfileManager {
           name: existing.name,
         };
         this._profiles.set(profileId, restoredCustom);
+        if (profileId === this._activeProfileId) {
+          this._syncActiveKeyLookup();
+        }
         return cloneProfile(restoredCustom);
       }
       const restoredDefault = cloneProfile(BUILTIN_PROFILES.default);
       this._profiles.set('default', restoredDefault);
       this._activeProfileId = 'default';
+      this._syncActiveKeyLookup();
       return cloneProfile(restoredDefault);
     }
 
@@ -1092,6 +1283,7 @@ export class InputProfileManager {
   resetToDefaults({ persist = false } = {}) {
     this._seedBuiltins();
     this._activeProfileId = 'default';
+    this._syncActiveKeyLookup();
     if (persist) {
       try {
         this.save();
@@ -1164,6 +1356,9 @@ export class InputProfileManager {
     }
 
     bindings[keyCode] = mask;
+    if (profile.id === this._activeProfileId) {
+      this._syncActiveKeyLookup();
+    }
     return { changed: true, conflictKey };
   }
 
@@ -1174,6 +1369,9 @@ export class InputProfileManager {
       return false;
     }
     delete profile.keyBindings[keyCode];
+    if (profile.id === this._activeProfileId) {
+      this._syncActiveKeyLookup();
+    }
     return true;
   }
 
@@ -1259,6 +1457,9 @@ export class InputProfileManager {
     if (activate) {
       this._activeProfileId = normalized.id;
     }
+    if (activate || normalized.id === this._activeProfileId) {
+      this._syncActiveKeyLookup();
+    }
     return cloneProfile(normalized);
   }
 
@@ -1325,6 +1526,7 @@ export class InputProfileManager {
     // Commit atomically only after full validation passes.
     this._profiles = nextMap;
     this._activeProfileId = nextActiveId;
+    this._syncActiveKeyLookup();
     return this.listProfiles();
   }
 

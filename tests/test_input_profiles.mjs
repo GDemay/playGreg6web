@@ -14,6 +14,7 @@ import {
   PROFILE_ALLOWED_FIELDS,
   PROFILE_SCHEMA_VERSION,
   DEFAULT_STORAGE_KEY,
+  GAMEPLAY_PROFILE_PRESETS,
   applyResponseCurve,
   applyRadialDeadzone,
   transformStickAxes,
@@ -23,6 +24,10 @@ import {
   importProfileJson,
   detectBindingConflicts,
   BUILTIN_PROFILES,
+  setActiveProfile,
+  getActiveProfile,
+  getActiveProfileId,
+  resolveKeyBindingFast,
   InputProfileManager,
 } from '../web/input/input_profiles.js';
 
@@ -151,11 +156,13 @@ test('applyResponseCurve handles linear, cubic, expo, negative symmetry, clampin
   assert.throws(() => applyResponseCurve(0.5, 'invalid-curve'), RangeError);
 });
 
-test('BUILTIN_PROFILES defines default, southpaw, fps, lefty-kb, and menu-navigation with frozen immutability', () => {
+test('BUILTIN_PROFILES defines default, southpaw, fps, lefty-kb, menu-navigation, menu, on_foot, and driving with frozen immutability', () => {
   assert.deepEqual(
     Object.keys(BUILTIN_PROFILES).sort(),
-    ['default', 'fps', 'lefty-kb', 'menu-navigation', 'southpaw']
+    ['default', 'driving', 'fps', 'lefty-kb', 'menu', 'menu-navigation', 'on_foot', 'southpaw']
   );
+  assert.equal(Object.isFrozen(GAMEPLAY_PROFILE_PRESETS), true);
+  assert.deepEqual(GAMEPLAY_PROFILE_PRESETS, ['menu', 'on_foot', 'driving']);
 
   // Default matches InputBridge DEFAULT_KEY_BINDINGS and deadzones 100%
   const def = BUILTIN_PROFILES.default;
@@ -1220,4 +1227,435 @@ test('custom profile override validation accepts safe overrides and strictly rej
   assert.equal(({}).polluted, undefined);
   assert.equal(Object.prototype.polluted, undefined);
   assert.equal(manager.exportJson(), snapshotBefore);
+});
+
+test('W329 menu, on_foot, and driving presets layer cleanly over INPUT_BUTTONS and DEFAULT_KEY_BINDINGS and integrate with InputBridge', () => {
+  const manager = new InputProfileManager({ storage: null });
+
+  // 1. menu preset: Arrow + WASD -> DPAD (no MOVE_* bits), confirm/back, drift-resistant deadzones, cubic curve
+  const menu = BUILTIN_PROFILES.menu;
+  assert.equal(menu.id, 'menu');
+  assert.equal(Object.isFrozen(menu), true);
+  assert.equal(Object.isFrozen(menu.keyBindings), true);
+  assert.equal(menu.keyBindings.Enter, INPUT_BUTTONS.A);
+  assert.equal(menu.keyBindings.NumpadEnter, INPUT_BUTTONS.A);
+  assert.equal(menu.keyBindings.Space, INPUT_BUTTONS.A);
+  assert.equal(menu.keyBindings.Escape, INPUT_BUTTONS.B);
+  assert.equal(menu.keyBindings.Backspace, INPUT_BUTTONS.B);
+  assert.equal(menu.keyBindings.ArrowUp, INPUT_BUTTONS.DPAD_UP);
+  assert.equal(menu.keyBindings.ArrowDown, INPUT_BUTTONS.DPAD_DOWN);
+  assert.equal(menu.keyBindings.ArrowLeft, INPUT_BUTTONS.DPAD_LEFT);
+  assert.equal(menu.keyBindings.ArrowRight, INPUT_BUTTONS.DPAD_RIGHT);
+  assert.equal(menu.keyBindings.KeyW, INPUT_BUTTONS.DPAD_UP);
+  assert.equal(menu.keyBindings.KeyS, INPUT_BUTTONS.DPAD_DOWN);
+  assert.equal(menu.keyBindings.KeyA, INPUT_BUTTONS.DPAD_LEFT);
+  assert.equal(menu.keyBindings.KeyD, INPUT_BUTTONS.DPAD_RIGHT);
+  assert.equal(menu.keyBindings.KeyQ, INPUT_BUTTONS.LB);
+  assert.equal(menu.keyBindings.KeyE, INPUT_BUTTONS.RB);
+  assert.equal(menu.keyBindings.Tab, INPUT_BUTTONS.VIEW);
+  assert.equal(menu.keyBindings.KeyM, INPUT_BUTTONS.MENU);
+  assert.ok(menu.leftStickDeadzone >= 0.2);
+  assert.ok(menu.rightStickDeadzone >= 0.2);
+  assert.ok(menu.triggerDeadzone >= 0.1);
+  assert.equal(menu.stickCurve, RESPONSE_CURVES.CUBIC);
+  // Ensure no gameplay MOVE_* bits exist in menu preset
+  const moveBits =
+    INPUT_BUTTONS.MOVE_FORWARD |
+    INPUT_BUTTONS.MOVE_BACKWARD |
+    INPUT_BUTTONS.MOVE_LEFT |
+    INPUT_BUTTONS.MOVE_RIGHT;
+  for (const mask of Object.values(menu.keyBindings)) {
+    assert.equal(mask & moveBits, 0, 'menu preset must not emit gameplay movement bits');
+  }
+
+  // 2. on_foot preset: preserves 100% of DEFAULT_KEY_BINDINGS + KeyP (MENU) + KeyV (VIEW)
+  const onFoot = BUILTIN_PROFILES.on_foot;
+  assert.equal(onFoot.id, 'on_foot');
+  assert.equal(Object.isFrozen(onFoot), true);
+  assert.equal(Object.isFrozen(onFoot.keyBindings), true);
+  for (const [keyCode, expectedMask] of Object.entries(DEFAULT_KEY_BINDINGS)) {
+    assert.equal(
+      onFoot.keyBindings[keyCode],
+      expectedMask,
+      `on_foot must preserve DEFAULT_KEY_BINDINGS.${keyCode}`
+    );
+  }
+  assert.equal(onFoot.keyBindings.KeyP, INPUT_BUTTONS.MENU);
+  assert.equal(onFoot.keyBindings.KeyV, INPUT_BUTTONS.VIEW);
+  assert.equal(onFoot.stickCurve, RESPONSE_CURVES.EXPO);
+  assert.ok(onFoot.mouseSensitivityX > 1.0 && onFoot.mouseSensitivityY > 1.0);
+  assert.ok(onFoot.rightStickDeadzone < BUILTIN_PROFILES.default.rightStickDeadzone);
+
+  // 3. driving preset: vehicle-tuned bindings & cubic steering curve
+  const driving = BUILTIN_PROFILES.driving;
+  assert.equal(driving.id, 'driving');
+  assert.equal(Object.isFrozen(driving), true);
+  assert.equal(Object.isFrozen(driving.keyBindings), true);
+  assert.equal(driving.keyBindings.KeyW, INPUT_BUTTONS.MOVE_FORWARD);
+  assert.equal(driving.keyBindings.KeyS, INPUT_BUTTONS.MOVE_BACKWARD);
+  assert.equal(driving.keyBindings.KeyA, INPUT_BUTTONS.MOVE_LEFT);
+  assert.equal(driving.keyBindings.KeyD, INPUT_BUTTONS.MOVE_RIGHT);
+  assert.equal(driving.keyBindings.Space, INPUT_BUTTONS.RB);       // Handbrake
+  assert.equal(driving.keyBindings.KeyE, INPUT_BUTTONS.LS);        // Horn
+  assert.equal(driving.keyBindings.KeyF, INPUT_BUTTONS.Y);         // Enter/Exit vehicle
+  assert.equal(driving.keyBindings.KeyQ, INPUT_BUTTONS.LB);        // Drive-by weapon
+  assert.equal(driving.keyBindings.KeyC, INPUT_BUTTONS.RS);        // Look behind
+  assert.equal(driving.keyBindings.KeyH, INPUT_BUTTONS.DPAD_RIGHT); // Headlights
+  assert.equal(driving.keyBindings.KeyX, INPUT_BUTTONS.A);         // Duck
+  assert.equal(driving.keyBindings.KeyR, INPUT_BUTTONS.B);         // Cinematic camera
+  assert.equal(driving.keyBindings.KeyV, INPUT_BUTTONS.VIEW);      // Camera cycle
+  assert.equal(driving.keyBindings.KeyP, INPUT_BUTTONS.MENU);      // Pause
+  assert.equal(driving.keyBindings.Escape, INPUT_BUTTONS.MENU);    // Pause
+  assert.equal(driving.stickCurve, RESPONSE_CURVES.CUBIC);
+  assert.ok(driving.leftStickDeadzone < BUILTIN_PROFILES.default.leftStickDeadzone);
+  assert.ok(driving.triggerDeadzone < BUILTIN_PROFILES.default.triggerDeadzone);
+
+  // Strict JSON round-trip & deletion protection for all 3 gameplay presets
+  for (const presetId of GAMEPLAY_PROFILE_PRESETS) {
+    assert.throws(() => manager.deleteProfile(presetId), RangeError);
+    const exported = manager.exportProfileJson(presetId);
+    const reimported = importProfileJson(exported);
+    assert.deepEqual(reimported, manager.getProfile(presetId));
+  }
+
+  // Real InputBridge integration for menu, on_foot, and driving
+  const bridgeCases = [
+    [
+      'menu',
+      [
+        ['KeyW', INPUT_BUTTONS.DPAD_UP],
+        ['ArrowDown', INPUT_BUTTONS.DPAD_DOWN],
+        ['Enter', INPUT_BUTTONS.A],
+        ['Escape', INPUT_BUTTONS.B],
+        ['KeyR', 0], // gameplay-only key zeroed out in menu
+      ],
+    ],
+    [
+      'on_foot',
+      [
+        ['KeyW', INPUT_BUTTONS.MOVE_FORWARD],
+        ['Space', INPUT_BUTTONS.JUMP | INPUT_BUTTONS.A],
+        ['KeyR', INPUT_BUTTONS.X],
+        ['KeyP', INPUT_BUTTONS.MENU],
+        ['KeyV', INPUT_BUTTONS.VIEW],
+      ],
+    ],
+    [
+      'driving',
+      [
+        ['KeyW', INPUT_BUTTONS.MOVE_FORWARD],
+        ['Space', INPUT_BUTTONS.RB],
+        ['KeyE', INPUT_BUTTONS.LS],
+        ['KeyH', INPUT_BUTTONS.DPAD_RIGHT],
+        ['KeyX', INPUT_BUTTONS.A],
+        ['KeyR', INPUT_BUTTONS.B],
+        ['Escape', INPUT_BUTTONS.MENU],
+      ],
+    ],
+  ];
+
+  for (const [presetId, checks] of bridgeCases) {
+    const env = createMockBridgeEnv();
+    const bridge = new InputBridge(
+      env.canvas,
+      manager.toInputBridgeOptions(presetId, {
+        windowObj: env.win,
+        documentObj: env.doc,
+        navigatorObj: env.nav,
+      })
+    );
+    for (const [code, expectedMask] of checks) {
+      env.win.dispatch('keydown', { code });
+      assert.equal(
+        bridge.getSnapshot().buttons,
+        expectedMask,
+        `${presetId}: keydown ${code} expected 0x${expectedMask.toString(16)}`
+      );
+      env.win.dispatch('keyup', { code });
+      assert.equal(bridge.getSnapshot().buttons, 0, `${presetId}: keyup ${code} must clear`);
+    }
+    bridge.destroy();
+  }
+});
+
+test('W329 setActiveProfile and zero-alloc O(1) resolveKeyBindingFast work at module level and on InputProfileManager', () => {
+  try {
+    // Module-level defaults to 'default'
+    setActiveProfile('default');
+    assert.equal(getActiveProfileId(), 'default');
+    assert.equal(getActiveProfile(), BUILTIN_PROFILES.default);
+    assert.equal(resolveKeyBindingFast('KeyW'), INPUT_BUTTONS.MOVE_FORWARD);
+    assert.equal(resolveKeyBindingFast('Space'), INPUT_BUTTONS.JUMP | INPUT_BUTTONS.A);
+    assert.equal(resolveKeyBindingFast('KeyP'), 0);
+
+    // Switch through menu -> on_foot -> driving and verify immediate O(1) resolution
+    assert.equal(setActiveProfile('menu'), BUILTIN_PROFILES.menu);
+    assert.equal(getActiveProfileId(), 'menu');
+    assert.equal(resolveKeyBindingFast('KeyW'), INPUT_BUTTONS.DPAD_UP);
+    assert.equal(resolveKeyBindingFast('Space'), INPUT_BUTTONS.A);
+    assert.equal(resolveKeyBindingFast('KeyE'), INPUT_BUTTONS.RB);
+    assert.equal(resolveKeyBindingFast('ShiftLeft'), 0);
+
+    assert.equal(setActiveProfile('on_foot'), BUILTIN_PROFILES.on_foot);
+    assert.equal(getActiveProfileId(), 'on_foot');
+    assert.equal(resolveKeyBindingFast('KeyW'), INPUT_BUTTONS.MOVE_FORWARD);
+    assert.equal(resolveKeyBindingFast('Space'), INPUT_BUTTONS.JUMP | INPUT_BUTTONS.A);
+    assert.equal(resolveKeyBindingFast('KeyE'), INPUT_BUTTONS.RB);
+    assert.equal(resolveKeyBindingFast('KeyP'), INPUT_BUTTONS.MENU);
+    assert.equal(resolveKeyBindingFast('KeyV'), INPUT_BUTTONS.VIEW);
+
+    assert.equal(setActiveProfile('driving'), BUILTIN_PROFILES.driving);
+    assert.equal(getActiveProfileId(), 'driving');
+    assert.equal(resolveKeyBindingFast('KeyW'), INPUT_BUTTONS.MOVE_FORWARD);
+    assert.equal(resolveKeyBindingFast('Space'), INPUT_BUTTONS.RB);
+    assert.equal(resolveKeyBindingFast('KeyE'), INPUT_BUTTONS.LS);
+    assert.equal(resolveKeyBindingFast('KeyH'), INPUT_BUTTONS.DPAD_RIGHT);
+    assert.equal(resolveKeyBindingFast('KeyX'), INPUT_BUTTONS.A);
+    assert.equal(resolveKeyBindingFast('KeyR'), INPUT_BUTTONS.B);
+
+    // Custom profile object supported & frozen; external mutation cannot corrupt lookup table
+    const customDriving = applyProfileOverrides('driving', {
+      id: 'driving-custom',
+      name: 'Driving Custom',
+      keyBindings: { KeyG: INPUT_BUTTONS.GUIDE },
+    });
+    const activeCustom = setActiveProfile(customDriving);
+    assert.equal(Object.isFrozen(activeCustom), true);
+    assert.equal(getActiveProfileId(), 'driving-custom');
+    assert.equal(resolveKeyBindingFast('KeyG'), INPUT_BUTTONS.GUIDE);
+    customDriving.keyBindings.KeyG = 0;
+    assert.equal(resolveKeyBindingFast('KeyG'), INPUT_BUTTONS.GUIDE);
+
+    // Invalid profile names / non-objects throw without mutating active state
+    assert.throws(() => setActiveProfile('does-not-exist'), RangeError);
+    assert.throws(() => setActiveProfile('__proto__'), RangeError);
+    assert.throws(() => setActiveProfile(null), TypeError);
+    assert.throws(() => setActiveProfile(123), TypeError);
+    assert.throws(() => setActiveProfile([]), TypeError);
+    assert.equal(getActiveProfileId(), 'driving-custom');
+    assert.equal(resolveKeyBindingFast('KeyG'), INPUT_BUTTONS.GUIDE);
+
+    // Prototype keys, unbound keys, and non-string inputs safely return 0
+    for (const unsafeKey of [
+      '__proto__',
+      'constructor',
+      'prototype',
+      'toString',
+      'valueOf',
+      'hasOwnProperty',
+      '',
+      'KeyZ',
+      null,
+      undefined,
+      0,
+      42,
+      {},
+      [],
+    ]) {
+      assert.equal(resolveKeyBindingFast(unsafeKey), 0);
+    }
+
+    // Verify 100% parity with every key of every built-in preset & hot-loop stability
+    const sampleKeys = [
+      'KeyW',
+      'KeyA',
+      'KeyS',
+      'KeyD',
+      'Space',
+      'KeyE',
+      'KeyR',
+      'KeyF',
+      'KeyH',
+      'KeyX',
+      'KeyP',
+      'KeyV',
+      'Escape',
+      'ArrowUp',
+      'KeyZ',
+    ];
+    for (const [id, preset] of Object.entries(BUILTIN_PROFILES)) {
+      setActiveProfile(id);
+      for (const code of Object.keys(preset.keyBindings)) {
+        assert.equal(resolveKeyBindingFast(code), preset.keyBindings[code]);
+      }
+      let expectedSum = 0;
+      for (const code of sampleKeys) {
+        expectedSum += preset.keyBindings[code] || 0;
+      }
+      let hotSum = 0;
+      const iterations = 5000;
+      for (let i = 0; i < iterations; i++) {
+        for (let k = 0; k < sampleKeys.length; k++) {
+          hotSum += resolveKeyBindingFast(sampleKeys[k]);
+        }
+      }
+      assert.equal(hotSum, expectedSum * iterations);
+    }
+  } finally {
+    setActiveProfile('default');
+  }
+
+  // InputProfileManager instance-level resolveKeyBindingFast tracks every lifecycle mutation
+  const manager = new InputProfileManager({ storage: null });
+  assert.equal(manager.getActiveProfileId(), 'default');
+  assert.equal(manager.resolveKeyBindingFast('Space'), INPUT_BUTTONS.JUMP | INPUT_BUTTONS.A);
+  assert.equal(manager.resolveKeyBindingFast('__proto__'), 0);
+  assert.equal(manager.resolveKeyBindingFast(null), 0);
+
+  // Switch active profile -> lookup updates immediately
+  manager.setActiveProfile('driving');
+  assert.equal(manager.getActiveProfileId(), 'driving');
+  assert.equal(manager.resolveKeyBindingFast('Space'), INPUT_BUTTONS.RB);
+  assert.equal(manager.resolveKeyBindingFast('KeyE'), INPUT_BUTTONS.LS);
+
+  // rebindKey on active profile updates fast lookup immediately
+  manager.rebindKey('driving', 'KeyU', 'GUIDE', { allowOverwrite: false });
+  assert.equal(manager.resolveKeyBindingFast('KeyU'), INPUT_BUTTONS.GUIDE);
+
+  // Failed conflict rebind leaves fast lookup untouched
+  assert.throws(
+    () => manager.rebindKey('driving', 'KeyT', 'GUIDE', { allowOverwrite: false }),
+    /already bound to "KeyU"/
+  );
+  assert.equal(manager.resolveKeyBindingFast('KeyU'), INPUT_BUTTONS.GUIDE);
+  assert.equal(manager.resolveKeyBindingFast('KeyT'), 0);
+
+  // Overwrite rebind moves binding in fast lookup cleanly
+  const moved = manager.rebindKey('driving', 'KeyT', 'GUIDE', { allowOverwrite: true });
+  assert.deepEqual(moved, { changed: true, conflictKey: 'KeyU' });
+  assert.equal(manager.resolveKeyBindingFast('KeyU'), 0);
+  assert.equal(manager.resolveKeyBindingFast('KeyT'), INPUT_BUTTONS.GUIDE);
+
+  // unbindKey removes entry from fast lookup
+  assert.equal(manager.unbindKey('driving', 'KeyT'), true);
+  assert.equal(manager.resolveKeyBindingFast('KeyT'), 0);
+
+  // updateProfile on active profile updates fast lookup
+  manager.updateProfile('driving', { keyBindings: { KeyW: INPUT_BUTTONS.MOVE_FORWARD, KeyG: INPUT_BUTTONS.RB } });
+  assert.equal(manager.resolveKeyBindingFast('KeyG'), INPUT_BUTTONS.RB);
+  assert.equal(manager.resolveKeyBindingFast('Space'), 0);
+
+  // resetProfile restores built-in driving bindings in fast lookup
+  manager.resetProfile('driving');
+  assert.equal(manager.resolveKeyBindingFast('Space'), INPUT_BUTTONS.RB);
+  assert.equal(manager.resolveKeyBindingFast('KeyG'), 0);
+
+  // Custom active profile delete falls back to default and updates fast lookup
+  manager.createProfile({
+    ...BUILTIN_PROFILES.menu,
+    id: 'temp-menu',
+    name: 'Temp Menu',
+  });
+  manager.setActiveProfile('temp-menu');
+  assert.equal(manager.resolveKeyBindingFast('KeyW'), INPUT_BUTTONS.DPAD_UP);
+  manager.deleteProfile('temp-menu');
+  assert.equal(manager.getActiveProfileId(), 'default');
+  assert.equal(manager.resolveKeyBindingFast('KeyW'), INPUT_BUTTONS.MOVE_FORWARD);
+
+  // importProfileJson with activate: true and overwriting active profile sync fast lookup
+  const onFootJson = manager.exportProfileJson('on_foot');
+  manager.importProfileJson(onFootJson, { allowOverwrite: true, activate: true });
+  assert.equal(manager.getActiveProfileId(), 'on_foot');
+  assert.equal(manager.resolveKeyBindingFast('KeyP'), INPUT_BUTTONS.MENU);
+
+  // resetToDefaults restores default fast lookup
+  manager.resetToDefaults();
+  assert.equal(manager.getActiveProfileId(), 'default');
+  assert.equal(manager.resolveKeyBindingFast('KeyP'), 0);
+});
+
+test('W329 key conflict safety for menu, on_foot, and driving presets', () => {
+  const manager = new InputProfileManager({ storage: null });
+
+  // menu preset has zero multi-action keys (every key maps to a single unambiguous action)
+  const menuAll = manager.detectBindingConflicts('menu', { includeMultiActionKeys: true });
+  assert.deepEqual(
+    menuAll.filter((c) => c.type === 'multi-action-key'),
+    []
+  );
+
+  // driving preset separates handbrake (Space -> RB), horn (KeyE -> LS), and pause (Escape -> MENU) cleanly
+  assert.equal(BUILTIN_PROFILES.driving.keyBindings.Space, INPUT_BUTTONS.RB);
+  assert.equal(BUILTIN_PROFILES.driving.keyBindings.KeyE, INPUT_BUTTONS.LS);
+  assert.equal(BUILTIN_PROFILES.driving.keyBindings.Escape, INPUT_BUTTONS.MENU);
+  const drivingDups = manager.detectBindingConflicts('driving');
+  // RB (handbrake) must have zero duplicate key conflicts in driving
+  assert.equal(
+    drivingDups.some((c) => c.action === 'RB'),
+    false,
+    'driving handbrake (RB) should be uniquely bound to Space'
+  );
+
+  // Clean 1-to-1 derived override from on_foot passes importProfileJson({ rejectConflicts: true })
+  const conflictFreeOnFoot = applyProfileOverrides(
+    'on_foot',
+    {
+      id: 'on_foot_strict',
+      name: 'On Foot Strict',
+      keyBindings: {
+        KeyW: INPUT_BUTTONS.MOVE_FORWARD,
+        KeyS: INPUT_BUTTONS.MOVE_BACKWARD,
+        KeyA: INPUT_BUTTONS.MOVE_LEFT,
+        KeyD: INPUT_BUTTONS.MOVE_RIGHT,
+        Space: INPUT_BUTTONS.JUMP,
+        ShiftLeft: INPUT_BUTTONS.SPRINT,
+        KeyR: INPUT_BUTTONS.X,
+        KeyF: INPUT_BUTTONS.Y,
+        KeyP: INPUT_BUTTONS.MENU,
+      },
+    },
+    { mergeKeyBindings: false }
+  );
+  assert.deepEqual(detectBindingConflicts(conflictFreeOnFoot, { includeMultiActionKeys: true }), []);
+  const roundTripped = importProfileJson(exportProfileJson(conflictFreeOnFoot), {
+    rejectConflicts: true,
+  });
+  assert.deepEqual(roundTripped, conflictFreeOnFoot);
+});
+
+test('W271 applyRadialDeadzone regression: zero-alloc out-object reuse and InputBridge applyDeadzone parity', () => {
+  const out = { x: 99, y: 99 };
+
+  // Inside deadzone reuses `out` in-place and sets +0
+  const inside = applyRadialDeadzone(0.08, -0.09, 0.15, 0.98, out);
+  assert.equal(inside, out);
+  assert.ok(Object.is(out.x, 0));
+  assert.ok(Object.is(out.y, 0));
+
+  // Non-finite inputs reuse `out` in-place and zero safely
+  const nanOut = applyRadialDeadzone(Number.NaN, 0.5, 0.15, 0.98, out);
+  assert.equal(nanOut, out);
+  assert.equal(out.x, 0);
+  assert.equal(out.y, 0);
+
+  // Exact numerical parity with InputBridge applyDeadzone across cardinal, diagonal, and clamped inputs
+  const samples = [
+    [0, 0],
+    [0.14, 0],
+    [0.5, 0],
+    [0, -0.75],
+    [0.5, 0.5],
+    [-0.6, 0.3],
+    [0.98, 0],
+    [1.0, 1.0],
+    [2.5, -1.2],
+  ];
+  for (const [sx, sy] of samples) {
+    const expected = applyDeadzone(sx, sy, 0.15, 0.98);
+    const actual = applyRadialDeadzone(sx, sy, 0.15, 0.98, out);
+    assert.equal(actual, out, 'must reuse pre-allocated out object');
+    approxEqual(actual.x, expected.x);
+    approxEqual(actual.y, expected.y);
+    assert.ok(Math.hypot(actual.x, actual.y) <= 1 + 1e-12);
+  }
+
+  // Curve signature with `{ out }` option also reuses `out` in-place
+  const curved = applyRadialDeadzone(0.565, 0, 0.15, RESPONSE_CURVES.EXPO, {
+    out,
+    outerDeadzone: 0.98,
+    exponent: 2.0,
+  });
+  assert.equal(curved, out);
+  approxEqual(out.x, 0.25, 1e-5);
+  assert.equal(out.y, 0);
 });
