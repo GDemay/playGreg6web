@@ -49,6 +49,7 @@ const {
   buildRuntimeModuleConfig,
   createRuntimeModuleOptions,
   encodeTestFramePacket,
+  toTransferableArrayBuffer,
 } = require('../web/loader.js');
 
 function packet(opcode, payloadBytes = 0, flags = 0) {
@@ -278,7 +279,9 @@ test('collectBootBridgeInitFields and worker payloads omit optional URLs when ab
     canvas: 'offscreen',
     width: 1280,
     height: 720,
+    enableResourceReplay: false,
   });
+  assert.equal('enableResourceReplay' in payloads.ioInit, false);
   assert.equal('shaderPackUrl' in payloads.ioInit, false);
   assert.equal('bootBase' in payloads.gpuInit, false);
   assert.equal('gameBase' in payloads.ioInit, false);
@@ -3343,4 +3346,138 @@ test('W180/#918 buildRuntimeModuleConfig hooks preRun timer + onExit final flush
   ]);
   assert.equal(syncer2.getStats().filesUploaded, 2);
   assert.equal(syncer2.getStats().pendingCount, 0);
+});
+
+test('W345 createWorkerBootInitPayloads disables enableResourceReplay by default and honors explicit overrides', () => {
+  const defaultPayloads = createWorkerBootInitPayloads({
+    canvas: 'c',
+    width: 1920,
+    height: 1080,
+    dataBase: '/data/',
+  });
+  assert.equal(defaultPayloads.gpuInit.enableResourceReplay, false);
+  assert.equal('enableResourceReplay' in defaultPayloads.ioInit, false);
+
+  const optedIn = createWorkerBootInitPayloads({
+    canvas: 'c',
+    width: 1920,
+    height: 1080,
+    dataBase: '/data/',
+    enableResourceReplay: true,
+  });
+  assert.equal(optedIn.gpuInit.enableResourceReplay, true);
+  assert.equal('enableResourceReplay' in optedIn.ioInit, false);
+
+  const optedOut = createWorkerBootInitPayloads({
+    canvas: 'c',
+    width: 1920,
+    height: 1080,
+    dataBase: '/data/',
+    enableResourceReplay: false,
+  });
+  assert.equal(optedOut.gpuInit.enableResourceReplay, false);
+
+  // Non-boolean values fall back safely to false.
+  const nonBoolean = createWorkerBootInitPayloads({
+    canvas: 'c',
+    width: 1920,
+    height: 1080,
+    dataBase: '/data/',
+    enableResourceReplay: 'yes',
+  });
+  assert.equal(nonBoolean.gpuInit.enableResourceReplay, false);
+});
+
+test('W345 toTransferableArrayBuffer avoids copying standalone non-shared buffers and safely copies subviews/SABs', () => {
+  // 1. Standalone ArrayBuffer -> returned directly (same reference, zero copy).
+  const standaloneAb = new ArrayBuffer(16);
+  new Uint8Array(standaloneAb).set([1, 2, 3, 4]);
+  assert.equal(toTransferableArrayBuffer(standaloneAb), standaloneAb);
+
+  // 2. Full-span Uint8Array / DataView / Int32Array -> backing ArrayBuffer returned directly.
+  const fullU8 = new Uint8Array([10, 20, 30, 40]);
+  assert.equal(toTransferableArrayBuffer(fullU8), fullU8.buffer);
+  const fullDv = new DataView(fullU8.buffer);
+  assert.equal(toTransferableArrayBuffer(fullDv), fullU8.buffer);
+  const fullI32 = new Int32Array(fullU8.buffer);
+  assert.equal(toTransferableArrayBuffer(fullI32), fullU8.buffer);
+
+  // 3. Empty standalone Uint8Array -> backing ArrayBuffer returned directly.
+  const emptyU8 = new Uint8Array(0);
+  assert.equal(toTransferableArrayBuffer(emptyU8), emptyU8.buffer);
+
+  // 4. Subview of larger ArrayBuffer -> copied into an exact-length standalone ArrayBuffer.
+  const big = new Uint8Array([0, 1, 2, 3, 4, 5, 6, 7]);
+  const sub = big.subarray(2, 6);
+  const subBuf = toTransferableArrayBuffer(sub);
+  assert.ok(subBuf instanceof ArrayBuffer);
+  assert.notEqual(subBuf, big.buffer);
+  assert.deepEqual(new Uint8Array(subBuf), new Uint8Array([2, 3, 4, 5]));
+
+  // 5. SharedArrayBuffer and SharedArrayBuffer-backed view -> copied into a non-shared ArrayBuffer.
+  const sab = new SharedArrayBuffer(8);
+  new Uint8Array(sab).set([9, 8, 7, 6, 5, 4, 3, 2]);
+  const sabCopy = toTransferableArrayBuffer(sab);
+  assert.ok(sabCopy instanceof ArrayBuffer);
+  assert.equal(sabCopy instanceof SharedArrayBuffer, false);
+  assert.deepEqual(new Uint8Array(sabCopy), new Uint8Array([9, 8, 7, 6, 5, 4, 3, 2]));
+
+  const sabView = new Uint8Array(sab, 0, 8);
+  const sabViewCopy = toTransferableArrayBuffer(sabView);
+  assert.ok(sabViewCopy instanceof ArrayBuffer);
+  assert.equal(sabViewCopy instanceof SharedArrayBuffer, false);
+  assert.deepEqual(new Uint8Array(sabViewCopy), new Uint8Array([9, 8, 7, 6, 5, 4, 3, 2]));
+
+  // 6. Nullish / invalid inputs return null.
+  assert.equal(toTransferableArrayBuffer(null), null);
+  assert.equal(toTransferableArrayBuffer(undefined), null);
+  assert.equal(toTransferableArrayBuffer({}), null);
+});
+
+test('W345 coordinator wgpuSubmit transfers standalone ArrayBuffer with zero extra copy and copies subviews/SAB views', () => {
+  const posted = [];
+  const mockGpuWorker = {
+    postMessage(msg, transfer) {
+      posted.push({ msg, transfer });
+    },
+  };
+
+  const cfg = buildRuntimeModuleConfig({
+    gpuWorker: mockGpuWorker,
+    reportFn: () => {},
+  });
+
+  // Standalone Uint8Array (same shape produced by copyMemoryBytes) -> zero copy, exact buffer identity!
+  const standalone = new Uint8Array([1, 0, 0, 0, 0, 0, 0, 0]);
+  let sliceCalls = 0;
+  standalone.slice = () => {
+    sliceCalls += 1;
+    throw new Error('W345 regression: redundant bytes.slice() called on standalone Uint8Array');
+  };
+  cfg.hostCallbacks.wgpuSubmit(standalone);
+  assert.equal(sliceCalls, 0);
+  assert.equal(posted.length, 1);
+  assert.equal(posted[0].msg.cmdBuffer, standalone.buffer);
+  assert.deepEqual(posted[0].transfer, [standalone.buffer]);
+
+  // Subview -> safely copied into a standalone exact-length ArrayBuffer.
+  const backing = new Uint8Array([99, 98, 7, 0, 0, 0, 0, 0, 0, 0, 97]);
+  const subview = backing.subarray(2, 10);
+  cfg.hostCallbacks.wgpuSubmit(subview);
+  assert.equal(posted.length, 2);
+  assert.notEqual(posted[1].msg.cmdBuffer, backing.buffer);
+  assert.equal(posted[1].msg.cmdBuffer.byteLength, 8);
+  assert.deepEqual(new Uint8Array(posted[1].msg.cmdBuffer), subview);
+  assert.deepEqual(posted[1].transfer, [posted[1].msg.cmdBuffer]);
+
+  // SharedArrayBuffer-backed view -> safely copied into a transferable ArrayBuffer.
+  const sab = new SharedArrayBuffer(8);
+  const sabView = new Uint8Array(sab);
+  sabView.set([7, 0, 0, 0, 0, 0, 0, 0]);
+  cfg.hostCallbacks.wgpuSubmit(sabView);
+  assert.equal(posted.length, 3);
+  assert.ok(posted[2].msg.cmdBuffer instanceof ArrayBuffer);
+  assert.equal(posted[2].msg.cmdBuffer instanceof SharedArrayBuffer, false);
+  assert.deepEqual(new Uint8Array(posted[2].msg.cmdBuffer), new Uint8Array([7, 0, 0, 0, 0, 0, 0, 0]));
+  assert.deepEqual(posted[2].transfer, [posted[2].msg.cmdBuffer]);
 });

@@ -283,11 +283,69 @@ function copyMemoryBytes(buf, ptr, len) {
   return copy;
 }
 
+function isSharedArrayBuffer(value) {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  if (typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer) {
+    return true;
+  }
+  return Object.prototype.toString.call(value) === '[object SharedArrayBuffer]';
+}
+
+function isTransferableArrayBuffer(value) {
+  if (!value || typeof value !== 'object' || isSharedArrayBuffer(value)) {
+    return false;
+  }
+  return (
+    value instanceof ArrayBuffer ||
+    Object.prototype.toString.call(value) === '[object ArrayBuffer]'
+  );
+}
+
+/**
+ * Return a standalone transferable `ArrayBuffer` for a GPU command batch.
+ *
+ * When `bytes` is already a standalone non-shared `ArrayBuffer` or a view covering
+ * the full length of a non-shared `ArrayBuffer` (such as the fresh `Uint8Array`
+ * returned by `copyMemoryBytes()`), its backing buffer is returned directly with
+ * zero extra allocation or memcpy. Subviews and `SharedArrayBuffer`-backed views
+ * fall back to copying into a fresh `ArrayBuffer`.
+ */
+function toTransferableArrayBuffer(bytes) {
+  if (!bytes) {
+    return null;
+  }
+  if (isTransferableArrayBuffer(bytes)) {
+    return bytes;
+  }
+  if (ArrayBuffer.isView(bytes)) {
+    const buf = bytes.buffer;
+    if (
+      isTransferableArrayBuffer(buf) &&
+      bytes.byteOffset === 0 &&
+      bytes.byteLength === buf.byteLength
+    ) {
+      return buf;
+    }
+    const copy = new Uint8Array(bytes.byteLength);
+    if (bytes.byteLength > 0) {
+      copy.set(new Uint8Array(buf, bytes.byteOffset, bytes.byteLength));
+    }
+    return copy.buffer;
+  }
+  if (isSharedArrayBuffer(bytes)) {
+    const copy = new Uint8Array(bytes.byteLength);
+    if (bytes.byteLength > 0) {
+      copy.set(new Uint8Array(bytes));
+    }
+    return copy.buffer;
+  }
+  return null;
+}
+
 function asDataView(bytes) {
-  if (
-    bytes instanceof ArrayBuffer ||
-    (typeof SharedArrayBuffer !== 'undefined' && bytes instanceof SharedArrayBuffer)
-  ) {
+  if (isTransferableArrayBuffer(bytes) || isSharedArrayBuffer(bytes)) {
     return new DataView(bytes);
   }
   if (ArrayBuffer.isView(bytes)) {
@@ -995,10 +1053,23 @@ function collectBootBridgeInitFields(src) {
 
 function createWorkerBootInitPayloads(msg = {}) {
   const bootFields = collectBootBridgeInitFields(msg);
+  // W345: disable per-batch resource replay shadow-copying in live Wasm64 browser
+  // sessions unless explicitly opted in, while keeping standalone WgpuCommandProcessor
+  // unit tests backward-compatible.
+  const enableResourceReplay =
+    msg && typeof msg === 'object' && typeof msg.enableResourceReplay === 'boolean'
+      ? msg.enableResourceReplay
+      : false;
   return {
     ioInit: Object.assign({ init: true, dataBase: msg.dataBase }, bootFields),
     gpuInit: Object.assign(
-      { init: true, canvas: msg.canvas, width: msg.width, height: msg.height },
+      {
+        init: true,
+        canvas: msg.canvas,
+        width: msg.width,
+        height: msg.height,
+        enableResourceReplay,
+      },
       bootFields,
     ),
   };
@@ -1794,9 +1865,11 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
     log: (msg) => pthreadReport(`[wasm] ${msg}`),
     report: () => {},
     wgpuSubmit: (bytes) => {
+      const cmdBuffer = toTransferableArrayBuffer(bytes);
+      if (!cmdBuffer) {
+        return;
+      }
       if (txPort && !txPortClosed) {
-        const copy = bytes.slice();
-        const cmdBuffer = copy.buffer;
         try {
           txPort.postMessage(
             { type: PTHREAD_TX_MSG_WGPU_SUBMIT, cmdBuffer },
@@ -1810,10 +1883,9 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
       if (typeof BroadcastChannelCtor !== 'function') {
         return;
       }
-      const copy = bytes.slice();
       postBroadcastOnce(BroadcastChannelCtor, PTHREAD_WGPU_CHANNEL_NAME, {
         type: PTHREAD_TX_MSG_WGPU_SUBMIT,
-        cmdBuffer: copy.buffer,
+        cmdBuffer,
       });
     },
     getHttpfsClient: () => pthreadHttpfsClient,
@@ -4882,8 +4954,9 @@ function buildRuntimeModuleConfig(options = {}) {
       ? options.wgpuSubmit
       : (bytes) => {
           if (!activeGpuWorker) return;
-          const copy = bytes.slice().buffer;
-          activeGpuWorker.postMessage({ cmdBuffer: copy }, [copy]);
+          const cmdBuffer = toTransferableArrayBuffer(bytes);
+          if (!cmdBuffer) return;
+          activeGpuWorker.postMessage({ cmdBuffer }, [cmdBuffer]);
         };
 
   const userLogFn =
@@ -6234,31 +6307,43 @@ let activeCoordinatorPipelineDumpSyncer = null;
 let activeGuestManifestSummary = null;
 let activeSideModuleProgressGetter = null;
 
+// W345: Keep pthread GPU submits flowing through the coordinator's multiplexed `txPort`
+// so `FIRST_PRESENT` detection (`GPU_OPCODE_PRESENT = 7`), audio-ring milestone delivery,
+// and `pthreadActiveTxPorts` telemetry stay intact, while transferring the received
+// `ArrayBuffer` straight through to `gpuWorker` with zero extra copy.
 function handlePthreadWgpuSubmit(data, options = {}) {
   const raw =
     data &&
     typeof data === 'object' &&
-    !(data instanceof ArrayBuffer) &&
+    !isTransferableArrayBuffer(data) &&
+    !isSharedArrayBuffer(data) &&
     !ArrayBuffer.isView(data)
       ? data.cmdBuffer || data.bytes || null
       : data;
-  const view = asDataView(raw);
-  if (!view || view.byteLength === 0) {
+  let transferBuf = null;
+  if (options.ownedArrayBuffer !== false && isTransferableArrayBuffer(raw)) {
+    if (raw.byteLength === 0) {
+      return false;
+    }
+    transferBuf = raw;
+  } else {
+    const view = asDataView(raw);
+    if (!view || view.byteLength === 0) {
+      return false;
+    }
+    if (options.ownedArrayBuffer !== false) {
+      transferBuf = toTransferableArrayBuffer(raw);
+    } else {
+      const copyBytes = new Uint8Array(view.byteLength);
+      copyBytes.set(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
+      transferBuf = copyBytes.buffer;
+    }
+  }
+  if (!transferBuf || transferBuf.byteLength === 0) {
     return false;
   }
-  let transferBuf;
-  let inspectBytes;
-  if (options.ownedArrayBuffer && raw instanceof ArrayBuffer) {
-    transferBuf = raw;
-    inspectBytes = new Uint8Array(raw);
-  } else {
-    const copyBytes = new Uint8Array(view.byteLength);
-    copyBytes.set(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
-    transferBuf = copyBytes.buffer;
-    inspectBytes = copyBytes;
-  }
   if (!coordinatorFirstPresentEmitted) {
-    const info = inspectGpuPacketBatchForPresent(inspectBytes);
+    const info = inspectGpuPacketBatchForPresent(transferBuf);
     if (info.hasPresent) {
       coordinatorFirstPresentEmitted = true;
       if (
@@ -6884,6 +6969,7 @@ const exportedApi = {
   createRuntimeModuleOptions,
   encodeTestFramePacket,
   postBroadcastOnce,
+  toTransferableArrayBuffer,
   ptrToNumber,
 };
 
