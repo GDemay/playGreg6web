@@ -60,6 +60,14 @@ const HTTPFS_MAX_PIPELINE_SLOTS = 16;               // Bounded upper cap for mul
 const MAX_RETAINED_CLOSED_TELEMETRY = 64;           // Bounded closed-handle telemetry history
 const VIDEO_READAHEAD_EXT_RE = /\.(?:bk2|bik)$/i;
 
+const HTTPFS_DEFAULT_CACHE_MAX_BYTES = 32 * 1024 * 1024; // 32 MiB default bounded LRU chunk cache
+const HTTPFS_DEFAULT_CACHE_CHUNK_SIZE = 256 * 1024;      // 256 KiB default HTTP Range cache chunk
+const HTTPFS_DEFAULT_READAHEAD_CHUNKS = 2;               // 2 chunks sequential read-ahead prefetch
+const HTTPFS_MAX_READAHEAD_CHUNKS = 8;                   // Upper bound for read-ahead chunk count
+const HTTPFS_MAX_TRACKED_URLS = 1024;                    // Bounded metadata maps per worker
+const IMMUTABLE_GAME_RPF_RE = /^\/game\/.+\.rpf$/i;
+const IMMUTABLE_SHADERS_RE = /^\/shaders\/.+$/i;
+
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder('utf-8', { fatal: false });
 
@@ -256,8 +264,914 @@ function snapshotHandleTelemetry(rec) {
   };
 }
 
+function extractUrlPathname(url) {
+  if (typeof url !== 'string' || url.length === 0) {
+    return '';
+  }
+  const trimmed = url.trim();
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed)) {
+    try {
+      return new URL(trimmed).pathname;
+    } catch {
+      return '';
+    }
+  }
+  const withoutQuery = trimmed.split(/[?#]/, 1)[0];
+  if (!withoutQuery) {
+    return '';
+  }
+  return withoutQuery.startsWith('/') ? withoutQuery : `/${withoutQuery}`;
+}
+
+/**
+ * Returns true if the URL points to an immutable `/game/*.rpf` archive or
+ * `/shaders/*` shader asset eligible for bounded LRU chunk caching and
+ * sequential read-ahead prefetching.
+ */
+function isCacheableImmutableUrl(url) {
+  const pathname = extractUrlPathname(url);
+  if (!pathname) {
+    return false;
+  }
+  return IMMUTABLE_GAME_RPF_RE.test(pathname) || IMMUTABLE_SHADERS_RE.test(pathname);
+}
+
+function normalizeUrlBasePrefix(base, fallback) {
+  const raw = typeof base === 'string' && base.length > 0 ? base : fallback;
+  if (!raw) {
+    return '/';
+  }
+  return raw.endsWith('/') ? raw : `${raw}/`;
+}
+
+function joinOriginAndPath(baseUrl, pathStr) {
+  if (typeof baseUrl !== 'string' || baseUrl.length === 0) {
+    return pathStr;
+  }
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(pathStr)) {
+    return pathStr;
+  }
+  const origin = baseUrl.replace(/\/+$/, '');
+  const rel = pathStr.startsWith('/') ? pathStr : `/${pathStr}`;
+  return `${origin}${rel}`;
+}
+
+function resolveHttpfsUrl(cleanPath, options = {}) {
+  const opts = options && typeof options === 'object' ? options : {};
+  if (typeof opts.urlResolver === 'function') {
+    return opts.urlResolver(cleanPath);
+  }
+  const baseUrl = typeof opts.baseUrl === 'string' ? opts.baseUrl : '';
+  const gameBase = joinOriginAndPath(baseUrl, normalizeUrlBasePrefix(opts.gameBase, '/game/'));
+  const shadersBase = joinOriginAndPath(
+    baseUrl,
+    normalizeUrlBasePrefix(opts.shadersBase, '/shaders/'),
+  );
+  const dataBase = joinOriginAndPath(baseUrl, normalizeUrlBasePrefix(opts.dataBase, '/'));
+
+  const lower = cleanPath.toLowerCase();
+  if (lower.startsWith('game/')) {
+    return `${gameBase}${cleanPath.slice(5)}`;
+  }
+  if (lower.startsWith('shaders/')) {
+    return `${shadersBase}${cleanPath.slice(8)}`;
+  }
+  if (lower.endsWith('.rpf')) {
+    return `${gameBase}${cleanPath}`;
+  }
+  return `${dataBase}${cleanPath}`;
+}
+
+function getHeaderCaseInsensitive(headers, name) {
+  if (!headers) {
+    return null;
+  }
+  const lower = name.toLowerCase();
+  if (typeof headers.get === 'function') {
+    const direct = headers.get(name);
+    if (direct !== undefined && direct !== null) {
+      return String(direct);
+    }
+    const lowerVal = headers.get(lower);
+    if (lowerVal !== undefined && lowerVal !== null) {
+      return String(lowerVal);
+    }
+    if (typeof headers.entries === 'function') {
+      for (const [k, v] of headers.entries()) {
+        if (String(k).toLowerCase() === lower && v !== undefined && v !== null) {
+          return String(v);
+        }
+      }
+    }
+    return null;
+  }
+  if (typeof headers === 'object') {
+    const keys = Object.keys(headers);
+    for (let i = 0; i < keys.length; i += 1) {
+      const k = keys[i];
+      if (k.toLowerCase() === lower && headers[k] !== undefined && headers[k] !== null) {
+        return String(headers[k]);
+      }
+    }
+  }
+  return null;
+}
+
+function parseContentRangeHeader(header) {
+  if (typeof header !== 'string') {
+    return null;
+  }
+  const match = /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i.exec(header.trim());
+  if (!match) {
+    return null;
+  }
+  const start = Number(match[1]);
+  const end = Number(match[2]);
+  const total = match[3] === '*' ? null : Number(match[3]);
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || end < start) {
+    return null;
+  }
+  if (total !== null && (!Number.isSafeInteger(total) || total < 0)) {
+    return null;
+  }
+  return { start, end, total };
+}
+
+function parseUnsatisfiedRangeTotal(header) {
+  if (typeof header !== 'string') {
+    return null;
+  }
+  const match = /^bytes\s+\*\/(\d+)$/i.exec(header.trim());
+  if (!match) {
+    return null;
+  }
+  const total = Number(match[1]);
+  return Number.isSafeInteger(total) && total >= 0 ? total : null;
+}
+
+function setBoundedMapEntry(map, key, value, maxEntries) {
+  if (map.has(key)) {
+    map.delete(key);
+  } else if (map.size >= maxEntries) {
+    const oldest = map.keys().next().value;
+    if (oldest !== undefined) {
+      map.delete(oldest);
+    }
+  }
+  map.set(key, value);
+}
+
+function makeHttpfsChunkKey(url, chunkIndex) {
+  return `${url}\0${chunkIndex}`;
+}
+
+function createEmptyCacheStats() {
+  return {
+    cacheHits: 0,
+    cacheMisses: 0,
+    cacheBytes: 0,
+    cacheEvictions: 0,
+    prefetchIssued: 0,
+    prefetchHits: 0,
+    coalescedReads: 0,
+    bytesServedFromCache: 0,
+    bytesFetchedFromNetwork: 0,
+  };
+}
+
+/**
+ * Bounded in-worker LRU chunk cache + sequential read-ahead prefetcher for
+ * immutable `/game/*.rpf` and `/shaders/*` HTTP Range reads.
+ *
+ * - Safe opt-out when `cacheMaxBytes === 0` (direct uncached HTTP Range reads).
+ * - Coalesces duplicate in-flight fetches for the same `(url, chunkIndex)`.
+ * - Clamps cleanly at range boundaries and EOF (`206`, `200`, and `416`).
+ * - Exposes sanitized telemetry via `getStats()` with zero paths or URLs.
+ */
+class HttpfsLruChunkCache {
+  constructor(options = {}) {
+    const opts = options && typeof options === 'object' ? options : {};
+
+    const fetchFn =
+      typeof opts.fetchImpl === 'function'
+        ? opts.fetchImpl
+        : typeof opts.fetch === 'function'
+          ? opts.fetch
+          : typeof fetch === 'function'
+            ? fetch.bind(globalThis)
+            : null;
+    this._fetchImpl = fetchFn;
+
+    if (opts.cacheMaxBytes === undefined || opts.cacheMaxBytes === null) {
+      this._cacheMaxBytes = HTTPFS_DEFAULT_CACHE_MAX_BYTES;
+    } else {
+      const parsedMax = Math.floor(Number(opts.cacheMaxBytes));
+      this._cacheMaxBytes = Number.isFinite(parsedMax) && parsedMax > 0 ? parsedMax : 0;
+    }
+
+    if (opts.chunkSize === undefined || opts.chunkSize === null) {
+      this._chunkSize = HTTPFS_DEFAULT_CACHE_CHUNK_SIZE;
+    } else {
+      const parsedChunk = Math.floor(Number(opts.chunkSize));
+      if (!Number.isFinite(parsedChunk) || parsedChunk <= 0) {
+        throw new RangeError(`HttpfsLruChunkCache chunkSize must be a positive integer: ${opts.chunkSize}`);
+      }
+      this._chunkSize = parsedChunk;
+    }
+
+    if (opts.readAheadChunks === undefined || opts.readAheadChunks === null) {
+      this._readAheadChunks = HTTPFS_DEFAULT_READAHEAD_CHUNKS;
+    } else {
+      const parsedRa = Math.floor(Number(opts.readAheadChunks));
+      this._readAheadChunks =
+        Number.isFinite(parsedRa) && parsedRa > 0
+          ? Math.min(parsedRa, HTTPFS_MAX_READAHEAD_CHUNKS)
+          : 0;
+    }
+
+    this._sequentialThreshold = positiveIntOr(opts.sequentialThreshold, 1);
+    this._isCacheableFn =
+      typeof opts.isCacheableUrl === 'function' ? opts.isCacheableUrl : isCacheableImmutableUrl;
+
+    this._cache = new Map();
+    this._cacheBytes = 0;
+    this._inFlight = new Map();
+    this._pendingPrefetches = new Set();
+    this._fileSizes = new Map();
+    this._seqState = new Map();
+
+    this._stats = {
+      cacheHits: 0,
+      cacheMisses: 0,
+      cacheEvictions: 0,
+      prefetchIssued: 0,
+      prefetchHits: 0,
+      coalescedReads: 0,
+      bytesServedFromCache: 0,
+      bytesFetchedFromNetwork: 0,
+    };
+  }
+
+  get cacheMaxBytes() {
+    return this._cacheMaxBytes;
+  }
+
+  get chunkSize() {
+    return this._chunkSize;
+  }
+
+  get readAheadChunks() {
+    return this._readAheadChunks;
+  }
+
+  get cacheBytes() {
+    return this._cacheBytes;
+  }
+
+  isCacheableUrl(url) {
+    return Boolean(this._isCacheableFn(url));
+  }
+
+  getKnownSize(url) {
+    return this._fileSizes.has(url) ? this._fileSizes.get(url) : null;
+  }
+
+  getStats() {
+    return {
+      enabled: this._cacheMaxBytes > 0,
+      cacheMaxBytes: this._cacheMaxBytes,
+      chunkSize: this._chunkSize,
+      readAheadChunks: this._readAheadChunks,
+      cacheEntries: this._cache.size,
+      inFlightRequests: this._inFlight.size,
+      cacheHits: this._stats.cacheHits,
+      cacheMisses: this._stats.cacheMisses,
+      cacheBytes: this._cacheBytes,
+      cacheEvictions: this._stats.cacheEvictions,
+      prefetchIssued: this._stats.prefetchIssued,
+      prefetchHits: this._stats.prefetchHits,
+      coalescedReads: this._stats.coalescedReads,
+      bytesServedFromCache: this._stats.bytesServedFromCache,
+      bytesFetchedFromNetwork: this._stats.bytesFetchedFromNetwork,
+    };
+  }
+
+  clear(options = {}) {
+    this._cache.clear();
+    this._cacheBytes = 0;
+    this._seqState.clear();
+    if (options && options.clearFileSizes) {
+      this._fileSizes.clear();
+    }
+    if (options && options.resetStats) {
+      this._stats.cacheHits = 0;
+      this._stats.cacheMisses = 0;
+      this._stats.cacheEvictions = 0;
+      this._stats.prefetchIssued = 0;
+      this._stats.prefetchHits = 0;
+      this._stats.coalescedReads = 0;
+      this._stats.bytesServedFromCache = 0;
+      this._stats.bytesFetchedFromNetwork = 0;
+    }
+  }
+
+  async flushPrefetches() {
+    while (this._pendingPrefetches.size > 0) {
+      const batch = Array.from(this._pendingPrefetches);
+      await Promise.allSettled(batch);
+    }
+  }
+
+  _requireFetch() {
+    const fn = this._fetchImpl || (typeof fetch === 'function' ? fetch.bind(globalThis) : null);
+    if (typeof fn !== 'function') {
+      throw new Error('HttpfsLruChunkCache requires a fetch implementation');
+    }
+    return fn;
+  }
+
+  _recordKnownSize(url, totalSize) {
+    if (Number.isSafeInteger(totalSize) && totalSize >= 0) {
+      setBoundedMapEntry(this._fileSizes, url, totalSize, HTTPFS_MAX_TRACKED_URLS);
+    }
+  }
+
+  _touchEntry(key, entry) {
+    this._cache.delete(key);
+    this._cache.set(key, entry);
+  }
+
+  _insertEntry(key, url, chunkIndex, bytes, isPrefetch, consumedPrefetch) {
+    if (this._cacheMaxBytes <= 0 || !(bytes instanceof Uint8Array) || bytes.byteLength === 0) {
+      return;
+    }
+    if (bytes.byteLength > this._cacheMaxBytes) {
+      return;
+    }
+
+    const existing = this._cache.get(key);
+    if (existing) {
+      this._cacheBytes -= existing.byteLength;
+      this._cache.delete(key);
+    }
+
+    while (this._cacheBytes + bytes.byteLength > this._cacheMaxBytes && this._cache.size > 0) {
+      const oldestKey = this._cache.keys().next().value;
+      const oldest = this._cache.get(oldestKey);
+      this._cache.delete(oldestKey);
+      if (oldest) {
+        this._cacheBytes -= oldest.byteLength;
+      }
+      this._stats.cacheEvictions += 1;
+    }
+
+    const stored = new Uint8Array(bytes.byteLength);
+    stored.set(bytes);
+    this._cache.set(key, {
+      key,
+      url,
+      chunkIndex,
+      bytes: stored,
+      byteLength: stored.byteLength,
+      prefetched: Boolean(isPrefetch),
+      consumedPrefetch: Boolean(consumedPrefetch),
+    });
+    this._cacheBytes += stored.byteLength;
+  }
+
+  async _fetchRawRange(url, start, end) {
+    const fetchFn = this._requireFetch();
+    const res = await fetchFn(url, {
+      method: 'GET',
+      headers: {
+        Range: `bytes=${start}-${end}`,
+      },
+    });
+
+    if (res.status === 416) {
+      const cr = getHeaderCaseInsensitive(res.headers, 'Content-Range');
+      const total = parseUnsatisfiedRangeTotal(cr);
+      if (total !== null) {
+        this._recordKnownSize(url, total);
+      }
+      return { bytes: new Uint8Array(0), eof: true, status: 416 };
+    }
+
+    if (res.status === 206) {
+      const cr = parseContentRangeHeader(getHeaderCaseInsensitive(res.headers, 'Content-Range'));
+      if (cr && cr.total !== null) {
+        this._recordKnownSize(url, cr.total);
+      }
+      const rawBuf = await res.arrayBuffer();
+      const body = new Uint8Array(rawBuf);
+      this._stats.bytesFetchedFromNetwork += body.byteLength;
+
+      const knownTotal = this.getKnownSize(url);
+      const reachedKnownEof = knownTotal !== null && start + body.byteLength >= knownTotal;
+      const unknownTotalShort =
+        knownTotal === null && body.byteLength < end - start + 1;
+      return {
+        bytes: body,
+        eof: reachedKnownEof || unknownTotalShort,
+        status: 206,
+      };
+    }
+
+    if (res.status === 200) {
+      const rawBuf = await res.arrayBuffer();
+      const full = new Uint8Array(rawBuf);
+      this._stats.bytesFetchedFromNetwork += full.byteLength;
+      this._recordKnownSize(url, full.byteLength);
+      if (start >= full.byteLength) {
+        return { bytes: new Uint8Array(0), eof: true, status: 200 };
+      }
+      const sliceEnd = Math.min(end + 1, full.byteLength);
+      return {
+        bytes: full.slice(start, sliceEnd),
+        eof: true,
+        status: 200,
+      };
+    }
+
+    const err = new Error(`HTTPFS range request failed (HTTP ${res.status})`);
+    err.status = res.status;
+    throw err;
+  }
+
+  async _fetchExactRange(url, start, length) {
+    if (length <= 0) {
+      return new Uint8Array(0);
+    }
+    const knownTotal = this.getKnownSize(url);
+    if (knownTotal !== null && start >= knownTotal) {
+      return new Uint8Array(0);
+    }
+    const targetLen =
+      knownTotal !== null ? Math.min(length, knownTotal - start) : length;
+    if (targetLen <= 0) {
+      return new Uint8Array(0);
+    }
+
+    const parts = [];
+    let collected = 0;
+    while (collected < targetLen) {
+      const curStart = start + collected;
+      const curKnown = this.getKnownSize(url);
+      if (curKnown !== null && curStart >= curKnown) {
+        break;
+      }
+      const remaining =
+        curKnown !== null
+          ? Math.min(targetLen - collected, curKnown - curStart)
+          : targetLen - collected;
+      if (remaining <= 0) {
+        break;
+      }
+      const curEnd = curStart + remaining - 1;
+      const resp = await this._fetchRawRange(url, curStart, curEnd);
+      if (resp.bytes.byteLength > 0) {
+        const take =
+          resp.bytes.byteLength > remaining
+            ? resp.bytes.subarray(0, remaining)
+            : resp.bytes;
+        parts.push(take);
+        collected += take.byteLength;
+      }
+      if (resp.eof || resp.bytes.byteLength === 0) {
+        break;
+      }
+    }
+
+    if (parts.length === 0) {
+      return new Uint8Array(0);
+    }
+    if (parts.length === 1) {
+      return parts[0];
+    }
+    const merged = new Uint8Array(collected);
+    let cursor = 0;
+    for (let i = 0; i < parts.length; i += 1) {
+      merged.set(parts[i], cursor);
+      cursor += parts[i].byteLength;
+    }
+    return merged;
+  }
+
+  async _fetchChunkNetwork(url, chunkIndex) {
+    const chunkStart = chunkIndex * this._chunkSize;
+    const chunkBytes = await this._fetchExactRange(url, chunkStart, this._chunkSize);
+    if (chunkBytes.byteLength < this._chunkSize && !this._fileSizes.has(url)) {
+      this._recordKnownSize(url, chunkStart + chunkBytes.byteLength);
+    }
+    return chunkBytes;
+  }
+
+  _startChunkFetch(url, chunkIndex, isPrefetch) {
+    const key = makeHttpfsChunkKey(url, chunkIndex);
+    const inFlightEntry = {
+      promise: null,
+      isPrefetch: Boolean(isPrefetch),
+      prefetchHitCounted: false,
+    };
+
+    const promise = this._fetchChunkNetwork(url, chunkIndex).then(
+      (chunkBytes) => {
+        if (this._inFlight.get(key) === inFlightEntry) {
+          this._inFlight.delete(key);
+        }
+        if (chunkBytes.byteLength > 0 && this._cacheMaxBytes > 0) {
+          this._insertEntry(
+            key,
+            url,
+            chunkIndex,
+            chunkBytes,
+            inFlightEntry.isPrefetch,
+            inFlightEntry.prefetchHitCounted,
+          );
+        }
+        return chunkBytes;
+      },
+      (err) => {
+        if (this._inFlight.get(key) === inFlightEntry) {
+          this._inFlight.delete(key);
+        }
+        throw err;
+      },
+    );
+
+    inFlightEntry.promise = promise;
+    this._inFlight.set(key, inFlightEntry);
+
+    if (isPrefetch) {
+      this._stats.prefetchIssued += 1;
+      const tracked = promise.catch(() => {});
+      this._pendingPrefetches.add(tracked);
+      tracked.finally(() => {
+        this._pendingPrefetches.delete(tracked);
+      });
+    } else {
+      this._stats.cacheMisses += 1;
+    }
+
+    return promise;
+  }
+
+  _updateSequentialState(url, offset, length) {
+    const startChunk = Math.floor(offset / this._chunkSize);
+    const endChunk = Math.floor((offset + length - 1) / this._chunkSize);
+    const prev = this._seqState.get(url) || null;
+
+    let isSequential = false;
+    if (prev !== null) {
+      if (offset === prev.lastEndOffset) {
+        isSequential = true;
+      } else if (startChunk === prev.lastChunkIndex + 1 && offset > prev.lastOffset) {
+        isSequential = true;
+      }
+    }
+
+    const sequentialCount = isSequential ? prev.sequentialCount + 1 : 0;
+    const nextState = {
+      lastOffset: offset,
+      lastLength: length,
+      lastEndOffset: offset + length,
+      lastChunkIndex: endChunk,
+      sequentialCount,
+    };
+    setBoundedMapEntry(this._seqState, url, nextState, HTTPFS_MAX_TRACKED_URLS);
+    return { isSequential, sequentialCount, endChunk };
+  }
+
+  _schedulePrefetches(url, endChunk, sequentialCount) {
+    if (
+      this._cacheMaxBytes <= 0 ||
+      this._readAheadChunks <= 0 ||
+      sequentialCount < this._sequentialThreshold
+    ) {
+      return;
+    }
+    const maxBudgetChunks = Math.floor(this._cacheMaxBytes / this._chunkSize);
+    if (maxBudgetChunks < 2) {
+      return;
+    }
+    const prefetchCount = Math.min(this._readAheadChunks, maxBudgetChunks - 1);
+    const knownTotal = this.getKnownSize(url);
+
+    for (let i = 1; i <= prefetchCount; i += 1) {
+      const targetChunk = endChunk + i;
+      const targetStart = targetChunk * this._chunkSize;
+      if (knownTotal !== null && targetStart >= knownTotal) {
+        break;
+      }
+      const key = makeHttpfsChunkKey(url, targetChunk);
+      if (this._cache.has(key) || this._inFlight.has(key)) {
+        continue;
+      }
+      this._startChunkFetch(url, targetChunk, true);
+    }
+  }
+
+  async probe(url) {
+    if (typeof url !== 'string' || url.length === 0) {
+      throw new Error('HTTPFS probe requires a non-empty URL');
+    }
+    if (this._fileSizes.has(url)) {
+      return { size: this._fileSizes.get(url) };
+    }
+    const key0 = makeHttpfsChunkKey(url, 0);
+    if (this._cache.has(key0)) {
+      return { size: this.getKnownSize(url) };
+    }
+    await this._fetchRawRange(url, 0, 0);
+    return { size: this.getKnownSize(url) };
+  }
+
+  tryReadSync(url, offset, length) {
+    const off = toSafeNonNegNumber(offset, 'offset');
+    const len = toSafeNonNegNumber(length, 'length');
+    if (len === 0) {
+      return new Uint8Array(0);
+    }
+    if (this._cacheMaxBytes <= 0 || !this.isCacheableUrl(url)) {
+      return null;
+    }
+
+    const knownTotal = this.getKnownSize(url);
+    if (knownTotal !== null && off >= knownTotal) {
+      return new Uint8Array(0);
+    }
+
+    const effectiveEnd = knownTotal !== null ? Math.min(off + len, knownTotal) : off + len;
+    const effectiveLen = effectiveEnd - off;
+    if (effectiveLen <= 0) {
+      return new Uint8Array(0);
+    }
+
+    const firstChunk = Math.floor(off / this._chunkSize);
+    const lastChunk = Math.floor((effectiveEnd - 1) / this._chunkSize);
+
+    const entries = [];
+    for (let idx = firstChunk; idx <= lastChunk; idx += 1) {
+      const key = makeHttpfsChunkKey(url, idx);
+      const entry = this._cache.get(key);
+      if (!entry) {
+        return null;
+      }
+      entries.push(entry);
+    }
+
+    const out = new Uint8Array(effectiveLen);
+    let cursor = 0;
+    for (let i = 0; i < entries.length; i += 1) {
+      const entry = entries[i];
+      this._touchEntry(entry.key, entry);
+      this._stats.cacheHits += 1;
+      if (entry.prefetched && !entry.consumedPrefetch) {
+        entry.consumedPrefetch = true;
+        this._stats.prefetchHits += 1;
+      }
+
+      const chunkStart = entry.chunkIndex * this._chunkSize;
+      const sliceStart = Math.max(0, off - chunkStart);
+      const remaining = effectiveLen - cursor;
+      const available = Math.max(0, entry.byteLength - sliceStart);
+      const copyLen = Math.min(remaining, available);
+      if (copyLen > 0) {
+        out.set(entry.bytes.subarray(sliceStart, sliceStart + copyLen), cursor);
+        cursor += copyLen;
+        this._stats.bytesServedFromCache += copyLen;
+      }
+      if (entry.byteLength < this._chunkSize) {
+        break;
+      }
+    }
+
+    const result = cursor === out.byteLength ? out : out.slice(0, cursor);
+    if (result.byteLength > 0) {
+      const seq = this._updateSequentialState(url, off, result.byteLength);
+      if (seq.isSequential) {
+        this._schedulePrefetches(url, seq.endChunk, seq.sequentialCount);
+      }
+    }
+    return result;
+  }
+
+  async read(url, offset, length, options = {}) {
+    const off = toSafeNonNegNumber(offset, 'offset');
+    const len = toSafeNonNegNumber(length, 'length');
+    if (len === 0) {
+      return new Uint8Array(0);
+    }
+
+    const trackSequential = !(options && options.trackSequential === false);
+    const knownTotalBefore = this.getKnownSize(url);
+    if (knownTotalBefore !== null && off >= knownTotalBefore) {
+      return new Uint8Array(0);
+    }
+
+    // Opt-out (cacheMaxBytes === 0) or non-immutable URL: direct HTTP Range read without caching.
+    if (this._cacheMaxBytes <= 0 || !this.isCacheableUrl(url)) {
+      this._stats.cacheMisses += 1;
+      return this._fetchExactRange(url, off, len);
+    }
+
+    const effectiveEndBefore =
+      knownTotalBefore !== null ? Math.min(off + len, knownTotalBefore) : off + len;
+    const effectiveLenBefore = effectiveEndBefore - off;
+    if (effectiveLenBefore <= 0) {
+      return new Uint8Array(0);
+    }
+
+    const firstChunk = Math.floor(off / this._chunkSize);
+    let lastChunk = Math.floor((effectiveEndBefore - 1) / this._chunkSize);
+
+    const resolveChunk = (chunkIdx) => {
+      const key = makeHttpfsChunkKey(url, chunkIdx);
+      const cached = this._cache.get(key);
+      if (cached) {
+        this._touchEntry(key, cached);
+        this._stats.cacheHits += 1;
+        if (cached.prefetched && !cached.consumedPrefetch) {
+          cached.consumedPrefetch = true;
+          this._stats.prefetchHits += 1;
+        }
+        return { fromCache: true, bytes: cached.bytes, promise: null };
+      }
+
+      const existingInFlight = this._inFlight.get(key);
+      if (existingInFlight) {
+        this._stats.coalescedReads += 1;
+        if (existingInFlight.isPrefetch && !existingInFlight.prefetchHitCounted) {
+          existingInFlight.prefetchHitCounted = true;
+          this._stats.prefetchHits += 1;
+        }
+        return { fromCache: false, bytes: null, promise: existingInFlight.promise };
+      }
+
+      const promise = this._startChunkFetch(url, chunkIdx, false);
+      return { fromCache: false, bytes: null, promise };
+    };
+
+    let seqInfo = null;
+    let prefetchScheduledEarly = false;
+    if (trackSequential) {
+      seqInfo = this._updateSequentialState(url, off, effectiveLenBefore);
+      if (seqInfo.isSequential && knownTotalBefore !== null) {
+        this._schedulePrefetches(url, seqInfo.endChunk, seqInfo.sequentialCount);
+        prefetchScheduledEarly = true;
+      }
+    }
+
+    const chunkResults = new Map();
+
+    // If total file size is unknown and the read spans multiple chunks, fetch the first chunk
+    // first so we learn Content-Range total / EOF and avoid issuing wasted past-EOF requests.
+    if (knownTotalBefore === null && firstChunk < lastChunk) {
+      const firstHandle = resolveChunk(firstChunk);
+      const firstBytes = firstHandle.fromCache ? firstHandle.bytes : await firstHandle.promise;
+      chunkResults.set(firstChunk, { bytes: firstBytes, fromCache: firstHandle.fromCache });
+
+      if (firstBytes.byteLength < this._chunkSize) {
+        lastChunk = firstChunk;
+      } else {
+        const knownAfterFirst = this.getKnownSize(url);
+        if (knownAfterFirst !== null) {
+          const clampedEnd = Math.min(off + len, knownAfterFirst);
+          lastChunk =
+            clampedEnd <= off ? firstChunk : Math.floor((clampedEnd - 1) / this._chunkSize);
+        }
+      }
+
+      if (lastChunk > firstChunk) {
+        const restPromises = [];
+        for (let idx = firstChunk + 1; idx <= lastChunk; idx += 1) {
+          const h = resolveChunk(idx);
+          if (h.fromCache) {
+            chunkResults.set(idx, { bytes: h.bytes, fromCache: true });
+          } else {
+            restPromises.push(
+              h.promise.then((bytes) => {
+                chunkResults.set(idx, { bytes, fromCache: false });
+              }),
+            );
+          }
+        }
+        if (restPromises.length > 0) {
+          await Promise.all(restPromises);
+        }
+      }
+    } else {
+      const pending = [];
+      for (let idx = firstChunk; idx <= lastChunk; idx += 1) {
+        const h = resolveChunk(idx);
+        if (h.fromCache) {
+          chunkResults.set(idx, { bytes: h.bytes, fromCache: true });
+        } else {
+          pending.push(
+            h.promise.then((bytes) => {
+              chunkResults.set(idx, { bytes, fromCache: false });
+            }),
+          );
+        }
+      }
+      if (pending.length > 0) {
+        await Promise.all(pending);
+      }
+    }
+
+    const out = new Uint8Array(effectiveLenBefore);
+    let cursor = 0;
+    for (let idx = firstChunk; idx <= lastChunk; idx += 1) {
+      const item = chunkResults.get(idx);
+      if (!item || !item.bytes || item.bytes.byteLength === 0) {
+        break;
+      }
+      const chunkStart = idx * this._chunkSize;
+      const sliceStart = Math.max(0, off - chunkStart);
+      const remaining = effectiveLenBefore - cursor;
+      const available = Math.max(0, item.bytes.byteLength - sliceStart);
+      const copyLen = Math.min(remaining, available);
+      if (copyLen > 0) {
+        out.set(item.bytes.subarray(sliceStart, sliceStart + copyLen), cursor);
+        cursor += copyLen;
+        if (item.fromCache) {
+          this._stats.bytesServedFromCache += copyLen;
+        }
+      }
+      if (item.bytes.byteLength < this._chunkSize) {
+        break;
+      }
+    }
+
+    const result = cursor === out.byteLength ? out : out.slice(0, cursor);
+
+    if (trackSequential && seqInfo) {
+      // Adjust recorded end offset on clamped EOF reads so subsequent reads stay accurate.
+      if (result.byteLength < effectiveLenBefore) {
+        const state = this._seqState.get(url);
+        if (state && state.lastOffset === off) {
+          state.lastLength = result.byteLength;
+          state.lastEndOffset = off + result.byteLength;
+          state.lastChunkIndex =
+            result.byteLength > 0
+              ? Math.floor((off + result.byteLength - 1) / this._chunkSize)
+              : firstChunk;
+        }
+      }
+      if (seqInfo.isSequential && !prefetchScheduledEarly && result.byteLength > 0) {
+        const finalEndChunk = Math.floor((off + result.byteLength - 1) / this._chunkSize);
+        this._schedulePrefetches(url, finalEndChunk, seqInfo.sequentialCount);
+      }
+    }
+
+    return result;
+  }
+}
+
+function hasHttpRangeCacheOptions(opts) {
+  return Boolean(
+    opts &&
+      (typeof opts.fetchImpl === 'function' ||
+        typeof opts.fetch === 'function' ||
+        opts.chunkCache !== undefined ||
+        opts.baseUrl !== undefined ||
+        opts.gameBase !== undefined ||
+        opts.shadersBase !== undefined ||
+        opts.dataBase !== undefined ||
+        typeof opts.urlResolver === 'function' ||
+        opts.cacheMaxBytes !== undefined ||
+        opts.chunkSize !== undefined ||
+        opts.readAheadChunks !== undefined ||
+        opts.enableHttpRange === true),
+  );
+}
+
 function createSharedMailboxHostState(options = {}, defaultReadAheadEnabled = false, slotCount = 1) {
   const opts = options && typeof options === 'object' ? options : {};
+  const backend = opts.backend || null;
+  const hasExternalBackend = Boolean(
+    opts.rangeCache ||
+      typeof opts.getRangeCache === 'function' ||
+      typeof opts.open === 'function' ||
+      typeof opts.read === 'function' ||
+      (backend && (typeof backend.open === 'function' || typeof backend.read === 'function')),
+  );
+
+  let chunkCache = null;
+  if (opts.chunkCache && typeof opts.chunkCache.read === 'function') {
+    chunkCache = opts.chunkCache;
+  } else if (!hasExternalBackend && hasHttpRangeCacheOptions(opts)) {
+    chunkCache = new HttpfsLruChunkCache({
+      fetchImpl: opts.fetchImpl,
+      fetch: opts.fetch,
+      cacheMaxBytes: opts.cacheMaxBytes,
+      chunkSize: opts.chunkSize,
+      readAheadChunks: opts.readAheadChunks,
+      sequentialThreshold: opts.sequentialThreshold,
+      isCacheableUrl: opts.isCacheableUrl,
+    });
+  }
+
   return {
     slotCount: Math.max(1, Math.floor(Number(slotCount) || 1)),
     handles: new Map(),
@@ -266,6 +1180,14 @@ function createSharedMailboxHostState(options = {}, defaultReadAheadEnabled = fa
     closedOrder: [],
     now: typeof opts.now === 'function' ? opts.now : defaultNowMs,
     readAhead: normalizeReadAheadConfig(opts, defaultReadAheadEnabled),
+    chunkCache,
+    urlConfig: {
+      baseUrl: opts.baseUrl,
+      gameBase: opts.gameBase,
+      shadersBase: opts.shadersBase,
+      dataBase: opts.dataBase,
+      urlResolver: opts.urlResolver,
+    },
     stats: {
       requests: 0,
       syncFastPathHits: 0,
@@ -517,6 +1439,18 @@ class HttpfsMailboxHost {
     return this._stats.syncFastPathHits;
   }
 
+  get chunkCache() {
+    return this._shared.chunkCache || null;
+  }
+
+  flushPrefetches() {
+    const cc = this._shared.chunkCache;
+    if (cc && typeof cc.flushPrefetches === 'function') {
+      return cc.flushPrefetches();
+    }
+    return Promise.resolve();
+  }
+
   _getOrCreateHandleRecord(handle, isVideoStream = false) {
     let rec = this._shared.handleRecords.get(handle);
     if (!rec) {
@@ -569,6 +1503,9 @@ class HttpfsMailboxHost {
     for (const [handle, rec] of this._shared.handleRecords.entries()) {
       handles[String(handle)] = snapshotHandleTelemetry(rec);
     }
+    const cc = this._shared.chunkCache;
+    const cacheStats =
+      cc && typeof cc.getStats === 'function' ? cc.getStats() : createEmptyCacheStats();
     return {
       requests: this._stats.requests,
       syncFastPathHits: this._stats.syncFastPathHits,
@@ -586,6 +1523,15 @@ class HttpfsMailboxHost {
       readAheadHits: this._stats.readAheadHits,
       readAheadFetches: this._stats.readAheadFetches,
       coalescedSlotReads: this._stats.coalescedSlotReads,
+      cacheHits: cacheStats.cacheHits,
+      cacheMisses: cacheStats.cacheMisses,
+      cacheBytes: cacheStats.cacheBytes,
+      cacheEvictions: cacheStats.cacheEvictions,
+      prefetchIssued: cacheStats.prefetchIssued,
+      prefetchHits: cacheStats.prefetchHits,
+      coalescedReads: cacheStats.coalescedReads,
+      bytesServedFromCache: cacheStats.bytesServedFromCache,
+      bytesFetchedFromNetwork: cacheStats.bytesFetchedFromNetwork,
       handles,
     };
   }
@@ -725,8 +1671,37 @@ class HttpfsMailboxHost {
     }
 
     const cache = this._resolveRangeCache();
-    if (!cache || typeof cache.read !== 'function') {
+    const chunkCache = !cache ? this._shared.chunkCache : null;
+    if ((!cache || typeof cache.read !== 'function') && !chunkCache) {
       this.completeResponse(-19n, HttpfsStatus.Error);
+      return;
+    }
+
+    if (chunkCache) {
+      const url = resolveHttpfsUrl(cleanPath, this._shared.urlConfig);
+      if (inManifest === null && this._probeOnOpen) {
+        const probe = chunkCache.probe(url);
+        if (isThenable(probe)) {
+          return probe.then(
+            () => {
+              const handle = this._shared.nextHandle;
+              this._shared.nextHandle += 1;
+              this._handles.set(handle, { path: cleanPath, url });
+              this._initHandleRecordOnOpen(handle, cleanPath);
+              this.completeResponse(BigInt(handle), HttpfsStatus.ResponseReady);
+            },
+            () => {
+              this.completeResponse(-2n, HttpfsStatus.Error);
+            },
+          );
+        }
+      }
+
+      const handle = this._shared.nextHandle;
+      this._shared.nextHandle += 1;
+      this._handles.set(handle, { path: cleanPath, url });
+      this._initHandleRecordOnOpen(handle, cleanPath);
+      this.completeResponse(BigInt(handle), HttpfsStatus.ResponseReady);
       return;
     }
 
@@ -765,7 +1740,9 @@ class HttpfsMailboxHost {
     const reqLen = lengthBig > BigInt(cap) ? cap : Number(lengthBig);
 
     let entryPath = null;
+    let entryUrl = null;
     let cache = null;
+    let chunkCache = null;
     if (!this._customRead) {
       const entry = this._handles.get(handle);
       if (!entry) {
@@ -773,12 +1750,14 @@ class HttpfsMailboxHost {
         return;
       }
       entryPath = entry.path;
+      entryUrl = entry.url || null;
       if (reqLen === 0) {
         this.completeResponse(0n, HttpfsStatus.ResponseReady);
         return;
       }
       cache = this._resolveRangeCache();
-      if (!cache || typeof cache.read !== 'function') {
+      chunkCache = !cache ? this._shared.chunkCache : null;
+      if ((!cache || typeof cache.read !== 'function') && !chunkCache) {
         this.completeResponse(-19n, HttpfsStatus.Error);
         return;
       }
@@ -869,6 +1848,19 @@ class HttpfsMailboxHost {
       }
       this.completeResponse(BigInt(toCopy), HttpfsStatus.ResponseReady);
     };
+
+    // Bounded in-worker LRU chunk cache + sequential read-ahead mode (no external RangeCache/custom read).
+    if (chunkCache) {
+      const url = entryUrl || resolveHttpfsUrl(entryPath, this._shared.urlConfig);
+      const syncBytes = chunkCache.tryReadSync(url, offset, reqLen);
+      if (syncBytes !== null) {
+        finishWithTelemetry(syncBytes, reqLen, false);
+        return;
+      }
+      return chunkCache.read(url, offset, reqLen).then((resolved) => {
+        finishWithTelemetry(resolved, reqLen, false);
+      });
+    }
 
     // Preserve exact legacy direct pass-through when host-side read-ahead buffering is disabled.
     if (!raCfg.enabled) {
@@ -1512,6 +2504,14 @@ class HttpfsMailboxPoolHost {
     return this._slots.some((slot) => slot.isRunning);
   }
 
+  get chunkCache() {
+    return this._shared.chunkCache || null;
+  }
+
+  flushPrefetches() {
+    return this._slots[0].flushPrefetches();
+  }
+
   getHandleTelemetry(handle) {
     return this._slots[0].getHandleTelemetry(handle);
   }
@@ -1687,12 +2687,19 @@ const exportedApi = {
   HTTPFS_READAHEAD_MAX_BYTES,
   HTTPFS_DEFAULT_PIPELINE_SLOTS,
   HTTPFS_MAX_PIPELINE_SLOTS,
+  HTTPFS_DEFAULT_CACHE_MAX_BYTES,
+  HTTPFS_DEFAULT_CACHE_CHUNK_SIZE,
+  HTTPFS_DEFAULT_READAHEAD_CHUNKS,
+  HTTPFS_MAX_READAHEAD_CHUNKS,
   HttpfsStatus,
   HttpfsOp,
   HttpfsOffsets,
   normalizeRelPath,
   isVideoReadAheadPath,
+  isCacheableImmutableUrl,
+  resolveHttpfsUrl,
   computeReadAheadWindowSize,
+  HttpfsLruChunkCache,
   initHttpfsMailbox,
   createHttpfsMailboxBuffer,
   createHttpfsMailboxPool,
