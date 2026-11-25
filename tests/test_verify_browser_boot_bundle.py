@@ -653,5 +653,388 @@ class TestStrictSanitizationAndCli(unittest.TestCase):
             self.assertIsNone(re.search(r"[A-Za-z]:[\\/]", buf.getvalue()))
 
 
+class TestReflectSidecarInlineSamplerValidation(unittest.TestCase):
+    def test_valid_inline_sampler_sidecar_passes_strict_and_counts_stages_and_bindings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            web_dist = base / "dist"
+            shaders_dir = base / "shaders"
+            _write_valid_web_dist(web_dist)
+            _write_valid_shaders_dir(shaders_dir)
+
+            sidecar = {
+                "schema": "playgta6-stage-reflection",
+                "version": 1,
+                "stages": {
+                    "0x00000000000000d4": {
+                        "stage": "fragment",
+                        "bindings": [
+                            {
+                                "group": 0,
+                                "binding": 0,
+                                "kind": "uniform",
+                                "source": {"user_sgpr": 8, "table_byte_offset": 0},
+                            },
+                            {
+                                "group": 0,
+                                "binding": 34,
+                                "kind": "sampler",
+                                "source": {
+                                    "inline_sampler": {
+                                        "sdwords": [0x92, 0x00F00000, 0x08500000, 0],
+                                    }
+                                },
+                            },
+                            {
+                                "group": 0,
+                                "binding": 35,
+                                "kind": "sampler",
+                                "source": {
+                                    "inline_sampler": {
+                                        "sdwords": [0, 1, 2, 0xFFFFFFFF],
+                                    }
+                                },
+                            },
+                        ],
+                    },
+                    "0x00000000000000e5": {
+                        "stage": "compute",
+                        "bindings": [
+                            {
+                                "group": 0,
+                                "binding": 2,
+                                "kind": "sampler",
+                                "source": {
+                                    "inline_sampler": {
+                                        "sdwords": [12288, 15728640, 67108864, 0],
+                                    }
+                                },
+                            },
+                        ],
+                    },
+                    "0x00000000000000f6": {
+                        "stage": "vertex",
+                        "bindings": [
+                            {
+                                "group": 0,
+                                "binding": 0,
+                                "kind": "sampler",
+                                "source": {"static_sampler": 0},
+                            },
+                        ],
+                    },
+                },
+            }
+            (shaders_dir / "fallback.wgsl.pack.reflect.json").write_text(
+                json.dumps(sidecar), encoding="utf-8"
+            )
+
+            report = vbb.verify_browser_boot_bundle(
+                web_dist=web_dist,
+                shaders_dir=shaders_dir,
+                strict=True,
+            )
+
+            self.assertTrue(report["ok"])
+            self.assertEqual(report["errors"], [])
+            self.assertEqual(report["warnings"], [])
+            shaders = report["shaders"]
+            self.assertEqual(shaders["reflect_sidecar_count"], 1)
+            self.assertEqual(shaders["valid_reflect_sidecar_count"], 1)
+            self.assertEqual(shaders["reflect_stage_count"], 3)
+            self.assertEqual(shaders["inline_sampler_stages"], 2)
+            self.assertEqual(shaders["inline_sampler_bindings"], 3)
+            self.assertEqual(shaders["malformed_inline_samplers"], 0)
+            self.assertEqual(len(shaders["reflect_sidecars"]), 1)
+            self.assertTrue(shaders["reflect_sidecars"][0]["ok"])
+
+            text = vbb.format_report_text(report)
+            self.assertIn("inline_sampler_stages=2", text)
+            self.assertIn("inline_sampler_bindings=3", text)
+            self.assertIn("malformed_inline_samplers=0", text)
+
+    def test_malformed_inline_sampler_sdwords_fails_strict_validation(self) -> None:
+        bad_sources = [
+            {"inline_sampler": {"sdwords": [1, 2, 3]}},  # too short
+            {"inline_sampler": {"sdwords": [1, 2, 3, 4, 5]}},  # too long
+            {"inline_sampler": {"sdwords": [1, 2, 3, -1]}},  # negative
+            {"inline_sampler": {"sdwords": [1, 2, 3, 0x100000000]}},  # > uint32 max
+            {"inline_sampler": {"sdwords": [1, 2, 3, "4"]}},  # string
+            {"inline_sampler": {"sdwords": [1, 2, 3, True]}},  # bool
+            {"inline_sampler": {"sdwords": [1, 2, 3, 4.5]}},  # float
+            {"inline_sampler": {}},  # missing sdwords
+            {"inline_sampler": [1, 2, 3, 4]},  # non-object inline_sampler
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            web_dist = base / "dist"
+            shaders_dir = base / "shaders"
+            _write_valid_web_dist(web_dist)
+            _write_valid_shaders_dir(shaders_dir)
+
+            bindings: list[dict[str, object]] = [
+                {
+                    "group": 0,
+                    "binding": 0,
+                    "kind": "sampler",
+                    "source": {"inline_sampler": {"sdwords": [146, 15728640, 139460608, 0]}},
+                }
+            ]
+            for idx, src in enumerate(bad_sources, start=1):
+                bindings.append(
+                    {"group": 0, "binding": idx, "kind": "sampler", "source": src}
+                )
+
+            sidecar = {
+                "schema": "playgta6-stage-reflection",
+                "version": 1,
+                "stages": {
+                    "0x000000000000bad1": {
+                        "stage": "fragment",
+                        "bindings": bindings,
+                    }
+                },
+            }
+            (shaders_dir / "fallback.wgsl.pack.reflect.json").write_text(
+                json.dumps(sidecar), encoding="utf-8"
+            )
+
+            non_strict = vbb.verify_browser_boot_bundle(
+                web_dist=web_dist, shaders_dir=shaders_dir, strict=False
+            )
+            self.assertTrue(non_strict["ok"])
+            self.assertEqual(non_strict["shaders"]["inline_sampler_stages"], 1)
+            self.assertEqual(non_strict["shaders"]["inline_sampler_bindings"], 1)
+            self.assertEqual(
+                non_strict["shaders"]["malformed_inline_samplers"], len(bad_sources)
+            )
+            self.assertEqual(non_strict["shaders"]["valid_reflect_sidecar_count"], 0)
+            self.assertFalse(non_strict["shaders"]["reflect_sidecars"][0]["ok"])
+            self.assertEqual(len(non_strict["warnings"]), len(bad_sources))
+
+            strict_report = vbb.verify_browser_boot_bundle(
+                web_dist=web_dist, shaders_dir=shaders_dir, strict=True
+            )
+            self.assertFalse(strict_report["ok"])
+            self.assertEqual(
+                strict_report["shaders"]["malformed_inline_samplers"], len(bad_sources)
+            )
+
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = vbb.main(
+                    [
+                        "--web-dist",
+                        str(web_dist),
+                        "--shaders-dir",
+                        str(shaders_dir),
+                        "--json",
+                        "--strict",
+                    ]
+                )
+            self.assertEqual(rc, 1)
+            cli_payload = json.loads(buf.getvalue())
+            self.assertFalse(cli_payload["ok"])
+            self.assertEqual(
+                cli_payload["shaders"]["malformed_inline_samplers"], len(bad_sources)
+            )
+
+    def test_malformed_reflect_sidecar_json_and_escaping_symlink_fail_strict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            web_dist = base / "dist"
+            shaders_dir = base / "shaders"
+            _write_valid_web_dist(web_dist)
+            _write_valid_shaders_dir(shaders_dir)
+            (shaders_dir / "broken.wgsl.pack.reflect.json").write_text(
+                "{not valid json", encoding="utf-8"
+            )
+
+            strict_report = vbb.verify_browser_boot_bundle(
+                web_dist=web_dist, shaders_dir=shaders_dir, strict=True
+            )
+            self.assertFalse(strict_report["ok"])
+            self.assertEqual(strict_report["shaders"]["reflect_sidecar_count"], 1)
+            self.assertEqual(strict_report["shaders"]["valid_reflect_sidecar_count"], 0)
+            self.assertTrue(any("invalid JSON" in w for w in strict_report["warnings"]))
+
+
+class TestGuestManifestAndBink2Readiness(unittest.TestCase):
+    def test_guest_manifest_reports_bink2scarlett_present_both_spellings(self) -> None:
+        for modules_list in (
+            ["vcruntime140", "bink2scarlett"],
+            ["VCRUNTIME140.dll", "Bink2Scarlett.dll"],
+        ):
+            with self.subTest(modules_list=modules_list):
+                with tempfile.TemporaryDirectory() as tmp:
+                    web_dist = Path(tmp) / "dist"
+                    _write_valid_web_dist(web_dist)
+                    (web_dist / "guest_manifest.json").write_text(
+                        json.dumps(
+                            {
+                                "schemaVersion": 1,
+                                "runtimeJs": "runtime.js",
+                                "runtimeWasm": "runtime.wasm",
+                                "indirectDispatch": "shard",
+                                "guest_dll_modules": modules_list,
+                                "sideModules": [],
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+
+                    report = vbb.verify_browser_boot_bundle(web_dist=web_dist, strict=True)
+                    self.assertTrue(report["ok"])
+                    self.assertEqual(report["errors"], [])
+                    self.assertEqual(report["warnings"], [])
+                    gm = report["wasm"]["guest_manifest"]
+                    self.assertTrue(gm["present"])
+                    self.assertTrue(gm["ok"])
+                    self.assertEqual(gm["guest_modules"], modules_list)
+                    self.assertTrue(gm["bink2scarlett_present"])
+                    self.assertTrue(report["wasm"]["bink2scarlett_present"])
+
+                    text = vbb.format_report_text(report)
+                    self.assertIn("guest_manifest.json: OK", text)
+                    self.assertIn("bink2scarlett=YES", text)
+
+    def test_guest_manifest_without_bink2scarlett_reports_false_and_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            web_dist = Path(tmp) / "dist"
+            _write_valid_web_dist(web_dist)
+            (web_dist / "guest_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "guest_dll_modules": ["vcruntime140", "msvcp140"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report = vbb.verify_browser_boot_bundle(web_dist=web_dist, strict=True)
+            self.assertTrue(report["ok"])
+            gm = report["wasm"]["guest_manifest"]
+            self.assertTrue(gm["present"])
+            self.assertTrue(gm["ok"])
+            self.assertEqual(gm["guest_modules"], ["vcruntime140", "msvcp140"])
+            self.assertFalse(gm["bink2scarlett_present"])
+            self.assertFalse(report["wasm"]["bink2scarlett_present"])
+
+            text = vbb.format_report_text(report)
+            self.assertIn("bink2scarlett=NO", text)
+
+    def test_program_manifest_reports_bink2scarlett_in_boot_section(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            web_dist = base / "dist"
+            boot_dir = base / "boot"
+            _write_valid_web_dist(web_dist)
+            boot_dir.mkdir(parents=True)
+            (boot_dir / "program-manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "playgta6-recomp-program",
+                        "schema_version": 1,
+                        "modules": [
+                            {"module": "main", "role": "exe"},
+                            {
+                                "module": "Bink2Scarlett.dll",
+                                "pgimPath": "bink2scarlett/image/guest.pgim",
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (boot_dir / "main" / "image").mkdir(parents=True)
+            (boot_dir / "main" / "image" / "guest.pgim").write_bytes(_make_pgim_v1_header_bytes())
+            (boot_dir / "bink2scarlett" / "image").mkdir(parents=True)
+            (boot_dir / "bink2scarlett" / "image" / "guest.pgim").write_bytes(
+                _make_pgim_v1_header_bytes()
+            )
+
+            report = vbb.verify_browser_boot_bundle(
+                web_dist=web_dist, boot_dir=boot_dir, strict=True
+            )
+            self.assertTrue(report["ok"])
+            self.assertTrue(report["boot"]["bink2scarlett_present"])
+            self.assertEqual(report["boot"]["guest_modules"], ["main", "Bink2Scarlett.dll"])
+
+    def test_malformed_guest_manifest_warns_and_fails_strict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            web_dist = Path(tmp) / "dist"
+            _write_valid_web_dist(web_dist)
+            (web_dist / "guest_manifest.json").write_text(
+                json.dumps({"guest_dll_modules": "not-a-list"}),
+                encoding="utf-8",
+            )
+
+            non_strict = vbb.verify_browser_boot_bundle(web_dist=web_dist, strict=False)
+            self.assertTrue(non_strict["ok"])
+            self.assertFalse(non_strict["wasm"]["guest_manifest"]["ok"])
+            self.assertTrue(any("guest_dll_modules" in w for w in non_strict["warnings"]))
+
+            strict_report = vbb.verify_browser_boot_bundle(web_dist=web_dist, strict=True)
+            self.assertFalse(strict_report["ok"])
+
+    def test_sanitization_strips_host_paths_in_guest_manifest_and_sidecar(self) -> None:
+        with mock.patch.dict(os.environ, {"USERNAME": "SecretPlayer99", "USER": "SecretPlayer99"}):
+            with tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                web_dist = base / "dist"
+                shaders_dir = base / "shaders"
+                _write_valid_web_dist(web_dist)
+                _write_valid_shaders_dir(shaders_dir)
+
+                (web_dist / "guest_manifest.json").write_text(
+                    json.dumps(
+                        {
+                            "guest_dll_modules": [
+                                r"C:\Users\SecretPlayer99\Games\Bink2Scarlett.dll"
+                            ]
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                (shaders_dir / "fallback.wgsl.pack.reflect.json").write_text(
+                    json.dumps(
+                        {
+                            "schema": "playgta6-stage-reflection",
+                            "version": 1,
+                            "stages": {
+                                r"C:\Users\SecretPlayer99\dumps\stage0": {
+                                    "stage": "fragment",
+                                    "bindings": [
+                                        {
+                                            "group": 0,
+                                            "binding": 0,
+                                            "kind": "sampler",
+                                            "source": {"inline_sampler": {"sdwords": [1, 2, 3]}},
+                                        }
+                                    ],
+                                }
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                report = vbb.verify_browser_boot_bundle(
+                    web_dist=web_dist, shaders_dir=shaders_dir, strict=False
+                )
+                json_text = json.dumps(report)
+                human_text = vbb.format_report_text(report)
+
+                self.assertTrue(report["wasm"]["bink2scarlett_present"])
+                self.assertEqual(
+                    report["wasm"]["guest_manifest"]["guest_modules"], ["Bink2Scarlett.dll"]
+                )
+                self.assertEqual(report["shaders"]["malformed_inline_samplers"], 1)
+                for output in (json_text, human_text):
+                    self.assertNotIn("SecretPlayer99", output)
+                    self.assertIsNone(re.search(r"[A-Za-z]:[\\/]", output), output)
+
+
 if __name__ == "__main__":
     unittest.main()
