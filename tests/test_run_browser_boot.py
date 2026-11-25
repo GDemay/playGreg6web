@@ -1076,6 +1076,21 @@ class BootFlagsAndOptionsTests(unittest.TestCase):
             # Dry-run must never write boot-options.json to boot_dir
             self.assertFalse((fx.boot_dir / "boot-options.json").exists())
 
+    def test_runtime_switch_boot_options_are_accepted(self):
+        # #1336 runtime switches (runtime/guest/boot.cpp) must pass --boot-options validation.
+        switches = {
+            "present_pacing": False,
+            "fence_publish_lag": False,
+            "defer_gpu_objects": False,
+            "xmem_shared_pages": False,
+            "present_frame_waits": False,
+            "audio_endpoint": False,
+        }
+        opts = rbb.parse_and_validate_boot_options(boot_options=dict(switches))
+        self.assertEqual(opts, switches)
+        with self.assertRaises(rbb.RunnerError):
+            rbb.parse_and_validate_boot_options(boot_options={"fence_publish_lag": "no"})
+
     def test_boot_options_file_validation_errors_and_tracked_dir_guard(self):
         with tempfile.TemporaryDirectory() as d:
             fx = RepoFixture(Path(d))
