@@ -1417,3 +1417,442 @@ test('W127: peakFrameBytes and peakUtilizationRatio track accurately across quie
   assert.equal(afterDestroy.spillAllocations, 2);
   assert.equal(afterDestroy.spillPagesCreated, 1);
 });
+
+test('W177: supports maxCapacityBytes, minUniformBufferOffsetAlignment, and strict power-of-two alignment validation', () => {
+  const { device: dev64 } = createMockGpuDevice({
+    limits: { minUniformBufferOffsetAlignment: 64, maxUniformBufferBindingSize: 65536 },
+  });
+
+  // Configurable power-of-two alignments >= device limit (64, 128, 256, 512, 1024).
+  for (const align of [64, 128, 256, 512, 1024]) {
+    const ring = new DynamicUniformRing({
+      device: dev64,
+      capacityBytes: align * 2,
+      maxCapacityBytes: align * 8,
+      minUniformBufferOffsetAlignment: align,
+      framesInFlight: 2,
+    });
+    assert.equal(ring.alignment, align);
+    assert.equal(ring.maxByteSize, align * 8);
+    assert.equal(ring.maxCapacityBytes, align * 8);
+    assert.equal(ring.currentCapacityBytes, align * 2);
+
+    const initStats = ring.getStats();
+    assert.equal(initStats.currentCapacityBytes, align * 2);
+    assert.equal(initStats.maxCapacityBytes, align * 8);
+    assert.equal(initStats.growthCount, 0);
+    assert.equal(initStats.wrapCount, 0);
+    assert.equal(initStats.totalAllocations, 0);
+    assert.equal(initStats.alignedBytesWasted, 0);
+
+    ring.beginFrame();
+    const a0 = ring.pushConstants(new Uint8Array(16).fill(1));
+    const a1 = ring.pushConstants(new Uint8Array(16).fill(2));
+    assert.equal(a0.dynamicOffset, 0);
+    assert.equal(a1.dynamicOffset, align);
+    assert.equal(a0.dynamicOffset % align, 0);
+    assert.equal(a1.dynamicOffset % align, 0);
+    assert.equal(ring.getStats().alignedBytesWasted, (align - 16) * 2);
+    ring.destroy();
+  }
+
+  // Non-power-of-two or invalid alignment values reject cleanly.
+  const { device: dev256 } = createMockGpuDevice();
+  for (const badAlign of [0, -256, 2, 3, 48, 192, 300, 256.5, NaN, Infinity, '256']) {
+    assert.throws(
+      () => new DynamicUniformRing({ device: dev256, minUniformBufferOffsetAlignment: badAlign }),
+      RangeError
+    );
+  }
+
+  // Invalid maxCapacityBytes values reject cleanly.
+  assert.throws(
+    () => new DynamicUniformRing({ device: dev256, maxCapacityBytes: 128 }),
+    RangeError
+  );
+  assert.throws(
+    () => new DynamicUniformRing({ device: dev256, capacityBytes: 2048, maxCapacityBytes: 1024 }),
+    RangeError
+  );
+  assert.throws(
+    () => new DynamicUniformRing({ device: dev256, maxCapacityBytes: 0 }),
+    RangeError
+  );
+});
+
+test('W177: handles burst 35,000+ uniform allocations in a single GTA VI menu frame with dynamic growth and additive telemetry', () => {
+  const { device, createdBuffers, queueWrites } = createMockGpuDevice();
+  const DRAW_COUNT = 35000;
+  const ring = new DynamicUniformRing({
+    device,
+    capacityBytes: 64 * 1024, // 64 KiB initial (256 draws)
+    maxCapacityBytes: 16 * 1024 * 1024, // 16 MiB cap (65,536 draws)
+    framesInFlight: 3,
+  });
+
+  ring.beginFrame();
+
+  // Synthetic GTA VI menu/UI glyph payloads of varying sizes (16B, 48B, 64B, 128B, 256B).
+  const payloadSizes = [16, 48, 64, 128, 256];
+  const reusablePayloads = payloadSizes.map((sz) => new Uint32Array(sz / 4));
+  let expectedBytesPushed = 0;
+
+  for (let i = 0; i < DRAW_COUNT; i += 1) {
+    const bucket = i % payloadSizes.length;
+    const payload = reusablePayloads[bucket];
+    payload[0] = i + 1;
+    payload[1] = 0x67746136; // 'gta6'
+    payload[2] = payloadSizes[bucket];
+    payload[3] = (i * 2654435761) >>> 0;
+
+    const alloc = ring.pushConstants(payload);
+    assert.equal(alloc.dynamicOffset, i * 256);
+    assert.equal(alloc.dynamicOffset % 256, 0);
+    assert.equal(alloc.alignedSize, 256);
+    assert.equal(alloc.overflow, false);
+    expectedBytesPushed += payloadSizes[bucket];
+  }
+
+  const expectedFrameBytes = DRAW_COUNT * 256; // 8,960,000 bytes
+  const flush0 = ring.flush();
+  assert.deepEqual(flush0, { uploadedBytes: expectedFrameBytes, drawCount: DRAW_COUNT });
+  assert.equal(queueWrites.length, 1, 'all 35,000 draws must upload in ONE writeBuffer call');
+
+  // Spot-check data integrity across first, growth-boundary, middle, and final draws.
+  const gpuBytes = ring.currentBuffer._data;
+  const gpuU32 = new Uint32Array(gpuBytes.buffer);
+  const checkIndices = [0, 1, 255, 256, 512, 4095, 4096, 16383, 16384, 32767, 32768, DRAW_COUNT - 1];
+  for (const idx of checkIndices) {
+    const baseU32 = (idx * 256) / 4;
+    const sz = payloadSizes[idx % payloadSizes.length];
+    assert.equal(gpuU32[baseU32], idx + 1);
+    assert.equal(gpuU32[baseU32 + 1], 0x67746136);
+    assert.equal(gpuU32[baseU32 + 2], sz);
+    assert.equal(gpuU32[baseU32 + 3], (idx * 2654435761) >>> 0);
+    // Verify trailing alignment padding is zero-filled.
+    for (let p = sz; p < 256; p += 1) {
+      assert.equal(gpuBytes[idx * 256 + p], 0, `draw ${idx} padding byte ${p} must be zero`);
+    }
+  }
+
+  // Verify additive W177 telemetry on Frame 0:
+  // 64K -> 128K -> 256K -> 512K -> 1M -> 2M -> 4M -> 8M -> 16M = 8 doublings.
+  const statsF0 = ring.getStats();
+  assert.equal(statsF0.growthCount, 8);
+  assert.equal(statsF0.growCount, 8);
+  assert.equal(statsF0.wrapCount, 0);
+  assert.equal(statsF0.peakFrameBytes, expectedFrameBytes);
+  assert.equal(statsF0.totalAllocations, DRAW_COUNT);
+  assert.equal(statsF0.totalDrawCount, DRAW_COUNT);
+  assert.equal(statsF0.totalBytesPushed, expectedBytesPushed);
+  assert.equal(statsF0.alignedBytesWasted, expectedFrameBytes - expectedBytesPushed);
+  assert.equal(statsF0.currentCapacityBytes, 16 * 1024 * 1024);
+  assert.equal(statsF0.maxCapacityBytes, 16 * 1024 * 1024);
+
+  // Run 4 more frames across 3 slots in flight:
+  // - Frames 1 & 2 resize slots 1 & 2 lazily with ZERO additional mid-frame growths.
+  // - Frame 3 wraps back to slot 0 (wrapCount = 1), Frame 4 wraps to slot 1 (wrapCount = 2).
+  const quietPayload = new Uint32Array([0xdeadbeef, 1, 2, 3]);
+  for (let frame = 1; frame <= 4; frame += 1) {
+    const info = ring.beginFrame();
+    assert.equal(info.byteSize, 16 * 1024 * 1024);
+    ring.pushConstants(quietPayload);
+    assert.deepEqual(ring.flush(), { uploadedBytes: 256, drawCount: 1 });
+  }
+
+  const statsF4 = ring.getStats();
+  assert.equal(statsF4.growthCount, 8, 'steady-state frames must incur zero additional growths');
+  assert.equal(statsF4.wrapCount, 2, 'frames 3 and 4 wrap across 3 in-flight slots');
+  assert.equal(statsF4.peakFrameBytes, expectedFrameBytes, 'peakFrameBytes retains burst high-water mark');
+  assert.equal(statsF4.totalAllocations, DRAW_COUNT + 4);
+  assert.equal(
+    statsF4.alignedBytesWasted,
+    expectedFrameBytes - expectedBytesPushed + 4 * (256 - 16)
+  );
+  assert.equal(statsF4.currentCapacityBytes, 16 * 1024 * 1024);
+
+  ring.destroy();
+  for (const buf of createdBuffers) {
+    assert.equal(buf.destroyCount, 1, `buffer ${buf.id} must be destroyed exactly once`);
+  }
+});
+
+test('W177: multiSlice dynamic growth preserves all earlier allocations across a 12,000-draw single-pass burst without mid-frame drops', () => {
+  const { device, createdBuffers, queueWrites } = createMockGpuDevice();
+  const BURST_DRAWS = 12000;
+  const ring = new DynamicUniformRing({
+    device,
+    capacityBytes: 4096, // 16 draws in initial slice
+    maxCapacityBytes: 8 * 1024 * 1024, // 8 MiB max total per-frame capacity
+    framesInFlight: 3,
+    multiSlice: true,
+  });
+
+  assert.equal(ring.multiSlice, true);
+  ring.beginFrame(); // Frame 0 -> slot 0
+
+  // Record every allocation handle BEFORE flush() (modeling a single WebGPU render pass
+  // that binds alloc.buffer + [alloc.dynamicOffset] as draws are encoded).
+  const allocs = new Array(BURST_DRAWS);
+  const scratch = new Uint32Array(16); // 64B payload -> 256B aligned (192B padding wasted per draw)
+
+  for (let i = 0; i < BURST_DRAWS; i += 1) {
+    scratch[0] = i;
+    scratch[1] = 0x55aa0000 | (i & 0xffff);
+    scratch[2] = i ^ 0x13579bdf;
+    scratch[15] = i * 7 + 3;
+    const alloc = ring.pushConstants(scratch);
+    assert.equal(alloc.dynamicOffset % 256, 0, `draw ${i} offset must be 256B-aligned`);
+    assert.equal(alloc.size, 64);
+    assert.equal(alloc.alignedSize, 256);
+    assert.equal(alloc.overflow, false);
+    assert.ok(
+      alloc.dynamicOffset + alloc.alignedSize <= alloc.buffer.size,
+      `draw ${i} must fit within its slice GPUBuffer`
+    );
+    allocs[i] = alloc;
+  }
+
+  // Before flush(): ZERO earlier slice buffers may have been destroyed!
+  const distinctFrame0Buffers = new Set(allocs.map((a) => a.buffer));
+  assert.ok(distinctFrame0Buffers.size > 1, 'burst must span multiple grown slices');
+  for (const buf of distinctFrame0Buffers) {
+    assert.equal(
+      buf.destroyCount,
+      0,
+      `earlier slice buffer ${buf.label} must remain alive in the same submitted pass`
+    );
+  }
+
+  // Verify bind group entry helper works on allocations from both slice 0 and later slices.
+  const bgFirst = ring.createBindGroupEntryForAllocation(0, allocs[0]);
+  const bgLast = ring.createBindGroupEntryForAllocation(0, allocs[BURST_DRAWS - 1]);
+  assert.equal(bgFirst.resource.buffer, allocs[0].buffer);
+  assert.equal(bgLast.resource.buffer, allocs[BURST_DRAWS - 1].buffer);
+  assert.notEqual(bgFirst.resource.buffer, bgLast.resource.buffer);
+
+  // Flush uploads all dirty retired slices + active slice cleanly.
+  const expectedBytes = BURST_DRAWS * 256; // 3,072,000 bytes
+  const flush0 = ring.flush();
+  assert.deepEqual(flush0, { uploadedBytes: expectedBytes, drawCount: BURST_DRAWS });
+  assert.equal(queueWrites.length, distinctFrame0Buffers.size);
+
+  // Verify EVERY SINGLE ONE of the 12,000 allocations has its exact bytes intact in its own alloc.buffer!
+  for (let i = 0; i < BURST_DRAWS; i += 1) {
+    const a = allocs[i];
+    assert.equal(a.buffer.destroyCount, 0);
+    const u32 = new Uint32Array(a.buffer._data.buffer, a.dynamicOffset, 16);
+    assert.equal(u32[0], i, `corrupted word 0 at draw ${i}`);
+    assert.equal(u32[1], (0x55aa0000 | (i & 0xffff)) >>> 0, `corrupted word 1 at draw ${i}`);
+    assert.equal(u32[2], (i ^ 0x13579bdf) >>> 0, `corrupted word 2 at draw ${i}`);
+    assert.equal(u32[15], (i * 7 + 3) >>> 0, `corrupted word 15 at draw ${i}`);
+  }
+
+  const statsF0 = ring.getStats();
+  assert.equal(statsF0.multiSlice, true);
+  assert.equal(statsF0.growthCount, distinctFrame0Buffers.size - 1);
+  assert.equal(statsF0.liveRetiredSlices, distinctFrame0Buffers.size - 1);
+  assert.equal(statsF0.totalAllocations, BURST_DRAWS);
+  assert.equal(statsF0.peakFrameBytes, expectedBytes);
+  assert.equal(statsF0.usedBytes, expectedBytes);
+  assert.equal(statsF0.alignedBytesWasted, BURST_DRAWS * (256 - 64));
+  assert.equal(statsF0.wrapCount, 0);
+  assert.ok(statsF0.currentCapacityBytes >= expectedBytes);
+  assert.ok(statsF0.currentCapacityBytes <= 8 * 1024 * 1024);
+
+  const growthsAfterF0 = statsF0.growthCount;
+  const writesAfterF0 = queueWrites.length;
+
+  // Frame 1 (slot 1): Frame 0's slices MUST remain alive while Frame 0 is in flight,
+  // and slot 1 resizes to steady-state currentCapacityBytes so another 12,000-draw burst
+  // completes in ONE single buffer with ZERO growths and ONE writeBuffer call!
+  const frame1Info = ring.beginFrame();
+  assert.equal(frame1Info.slotIndex, 1);
+  assert.equal(frame1Info.byteSize, statsF0.currentCapacityBytes);
+  for (const buf of distinctFrame0Buffers) {
+    assert.equal(buf.destroyCount, 0, 'Frame 0 slices must stay alive during Frame 1');
+  }
+
+  for (let i = 0; i < BURST_DRAWS; i += 1) {
+    scratch[0] = 100000 + i;
+    const a = ring.pushConstants(scratch);
+    assert.equal(a.buffer, frame1Info.buffer);
+    assert.equal(a.sliceIndex, 0);
+    assert.equal(a.dynamicOffset, i * 256);
+  }
+  assert.deepEqual(ring.flush(), { uploadedBytes: expectedBytes, drawCount: BURST_DRAWS });
+  assert.equal(queueWrites.length, writesAfterF0 + 1, 'steady-state burst must use 1 writeBuffer call');
+  assert.equal(ring.getStats().growthCount, growthsAfterF0, 'steady-state burst must incur 0 growths');
+
+  // Frame 2 (slot 2): Frame 0's slices MUST STILL remain alive (3 frames in flight).
+  ring.beginFrame();
+  for (const buf of distinctFrame0Buffers) {
+    assert.equal(buf.destroyCount, 0, 'Frame 0 slices must stay alive during Frame 2');
+  }
+  ring.pushConstants(scratch);
+  ring.flush();
+
+  // Frame 3 (wraps back to slot 0): Frame 0 completed, so ALL Frame 0 retired slices + old active slice
+  // are cleanly retired/destroyed and slot 0 is promoted to the single steady-state buffer!
+  const frame3Info = ring.beginFrame();
+  assert.equal(frame3Info.slotIndex, 0);
+  assert.equal(frame3Info.byteSize, statsF0.currentCapacityBytes);
+  for (const buf of distinctFrame0Buffers) {
+    assert.equal(buf.destroyCount, 1, `Frame 0 slice ${buf.label} must be destroyed on slot wrap`);
+  }
+
+  const statsF3 = ring.getStats();
+  assert.equal(statsF3.wrapCount, 1);
+  assert.equal(statsF3.liveRetiredSlices, 0);
+  assert.equal(statsF3.overflowBufferCount, 0);
+  assert.equal(statsF3.allocatedGpuBytes, statsF0.currentCapacityBytes * 3);
+
+  ring.destroy();
+  for (const buf of createdBuffers) {
+    assert.equal(buf.destroyCount, 1, `buffer ${buf.id} must be destroyed exactly once`);
+  }
+});
+
+test('W177: multiSlice enforces maxCapacityBytes cap, incremental mid-frame flush, oversized first draw, and reset()/endFrame() cleanup', () => {
+  const { device, createdBuffers, queueWrites } = createMockGpuDevice();
+  const ring = new DynamicUniformRing({
+    device,
+    capacityBytes: 512, // 2 draws
+    maxCapacityBytes: 2048, // 8 draws total across slices: 512 + 1024 + 512 = 2048
+    framesInFlight: 2,
+    preserveBuffersOnGrow: true, // alias for multiSlice: true
+  });
+
+  assert.equal(ring.multiSlice, true);
+  ring.beginFrame();
+
+  // Incremental flush mid-slice, then fill rest of slice 0, then grow into slice 1.
+  const d0 = ring.pushConstants(new Uint32Array([10, 11, 12, 13])); // S0[0..256)
+  assert.deepEqual(ring.flush(), { uploadedBytes: 256, drawCount: 1 });
+  assert.equal(queueWrites.length, 1);
+
+  const d1 = ring.pushConstants(new Uint32Array([20, 21, 22, 23])); // S0[256..512)
+  assert.equal(d1.buffer, d0.buffer);
+  assert.equal(d1.dynamicOffset, 256);
+
+  // Draw 2 grows to Slice 1 (1024B). Slice 0 stays alive and retains dirty tail [256..512).
+  const d2 = ring.pushConstants(new Uint32Array([30, 31, 32, 33])); // S1[0..256)
+  assert.notEqual(d2.buffer, d0.buffer);
+  assert.equal(d2.buffer.size, 1024);
+  assert.equal(d2.dynamicOffset, 0);
+  assert.equal(d2.sliceIndex, 1);
+  assert.equal(d0.buffer.destroyCount, 0);
+
+  // Flush uploads ONLY the unflushed tail [256..512) of Slice 0 + [0..256) of Slice 1!
+  assert.deepEqual(ring.flush(), { uploadedBytes: 512, drawCount: 2 });
+  assert.equal(queueWrites.length, 3);
+  assert.equal(queueWrites[1].buffer, d0.buffer);
+  assert.equal(queueWrites[1].bufferOffset, 256);
+  assert.equal(queueWrites[1].byteLength, 256);
+  assert.equal(queueWrites[2].buffer, d2.buffer);
+  assert.equal(queueWrites[2].bufferOffset, 0);
+  assert.equal(queueWrites[2].byteLength, 256);
+
+  // Fill remaining 3 slots of Slice 1 (d3..d5) and Slice 2 (capped to remaining 512B: d6..d7).
+  const d3 = ring.pushConstants(new Uint32Array([40, 41, 42, 43]));
+  const d4 = ring.pushConstants(new Uint32Array([50, 51, 52, 53]));
+  const d5 = ring.pushConstants(new Uint32Array([60, 61, 62, 63]));
+  const d6 = ring.pushConstants(new Uint32Array([70, 71, 72, 73])); // Slice 2 (512B)
+  const d7 = ring.pushConstants(new Uint32Array([80, 81, 82, 83]));
+  assert.equal(d6.buffer.size, 512, 'final slice must cap cleanly within maxCapacityBytes');
+  assert.equal(d6.sliceIndex, 2);
+  assert.equal(d7.buffer, d6.buffer);
+  assert.equal(ring.usedBytes, 2048);
+
+  // Exceeding maxCapacityBytes throws RangeError without mutating state or leaking buffers.
+  const beforeCapErr = ring.getStats();
+  const bufCountBefore = createdBuffers.length;
+  assert.throws(
+    () => ring.pushConstants(new Uint32Array([90, 91, 92, 93])),
+    (err) => err instanceof RangeError && /capacity exceeded|maxByteSize/i.test(err.message)
+  );
+  assert.equal(createdBuffers.length, bufCountBefore);
+  assert.equal(ring.usedBytes, beforeCapErr.usedBytes);
+  assert.equal(ring.getStats().totalAllocations, beforeCapErr.totalAllocations);
+  assert.equal(ring.getStats().growthCount, beforeCapErr.growthCount);
+
+  assert.deepEqual(ring.flush(), { uploadedBytes: 1280, drawCount: 5 });
+
+  // Verify every draw d0..d7 arrived intact in its own buffer.
+  const allDraws = [d0, d1, d2, d3, d4, d5, d6, d7];
+  for (let i = 0; i < allDraws.length; i += 1) {
+    const u32 = new Uint32Array(allDraws[i].buffer._data.buffer, allDraws[i].dynamicOffset, 4);
+    assert.deepEqual(Array.from(u32), [(i + 1) * 10, (i + 1) * 10 + 1, (i + 1) * 10 + 2, (i + 1) * 10 + 3]);
+  }
+
+  // endFrame() reports exact frameBytes across all slices and preserves retired slices until wrap/reset.
+  const endRes = ring.endFrame();
+  assert.equal(endRes.frameBytes, 2048);
+  assert.equal(ring.getStats().liveRetiredSlices, 2);
+
+  // reset() cleanly destroys all retired slices while preserving lifetime telemetry.
+  ring.reset();
+  assert.equal(ring.usedBytes, 0);
+  assert.equal(ring.getStats().liveRetiredSlices, 0);
+  assert.equal(d0.buffer.destroyCount, 1);
+  assert.equal(d2.buffer.destroyCount, 1);
+  assert.equal(ring.getStats().growthCount, 2);
+  assert.equal(ring.getStats().totalAllocations, 8);
+  assert.equal(ring.getStats().peakFrameBytes, 2048);
+
+  ring.destroy();
+  for (const buf of createdBuffers) {
+    assert.equal(buf.destroyCount, 1, `buffer ${buf.id} must be destroyed exactly once`);
+  }
+
+  // Oversized first draw on empty slice (cursor === 0) resizes in place without creating an empty retired slice.
+  const { device: dev2, createdBuffers: bufs2 } = createMockGpuDevice();
+  const ring2 = new DynamicUniformRing({
+    device: dev2,
+    capacityBytes: 512,
+    maxCapacityBytes: 4096,
+    framesInFlight: 2,
+    multiSlice: true,
+  });
+  ring2.beginFrame();
+  const bigFirst = ring2.pushConstants(new Uint8Array(1024).fill(0xcd));
+  assert.equal(bigFirst.dynamicOffset, 0);
+  assert.equal(bigFirst.buffer.size, 1024);
+  assert.equal(ring2.getStats().liveRetiredSlices, 0, 'empty initial slice must not linger as retired slice');
+  assert.equal(ring2.getStats().growthCount, 1);
+  assert.equal(ring2.getStats().alignedBytesWasted, 0);
+  ring2.destroy();
+  for (const buf of bufs2) {
+    assert.equal(buf.destroyCount, 1);
+  }
+});
+
+test('W177: alignedBytesWasted accurately tracks alignment padding across empty, tiny, unaligned, exact, and spill allocations', () => {
+  const { device } = createMockGpuDevice({
+    limits: { minUniformBufferOffsetAlignment: 256, maxUniformBufferBindingSize: 65536 },
+  });
+  const ring = new DynamicUniformRing({
+    device,
+    capacityBytes: 1024,
+    maxCapacityBytes: 1024,
+    allowSpill: true,
+    maxRingBytes: 4096,
+    framesInFlight: 2,
+  });
+
+  ring.beginFrame();
+  ring.pushCbv(new Uint8Array(0)); // size 0, aligned 256 -> wasted 256
+  ring.pushConstants(new Uint8Array(5)); // size 5, aligned 256 -> wasted 251
+  ring.pushConstants(new Uint8Array(256)); // size 256, aligned 256 -> wasted 0
+  ring.pushConstants(new Uint8Array(300)); // size 300, aligned 512 -> spills to page 0! wasted 212
+  ring.flush();
+
+  const stats = ring.getStats();
+  assert.equal(stats.totalAllocations, 4);
+  assert.equal(stats.totalBytesPushed, 0 + 5 + 256 + 300);
+  assert.equal(stats.alignedBytesWasted, 256 + 251 + 0 + 212);
+  assert.equal(stats.totalBytesPushed + stats.alignedBytesWasted, 256 + 256 + 256 + 512);
+  assert.equal(stats.peakFrameBytes, 256 + 256 + 256 + 512);
+
+  ring.destroy();
+});
