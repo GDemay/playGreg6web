@@ -10,7 +10,9 @@ What it does, in order:
    with `cargo build --release -p playgta6-recomp` when missing or older than the sources of the
    workspace crates; the program (`<build-dir>/program`, `playgta6-recomp build-program <exe>
    --out ... --dll-dir <game-dir> --target native`) when its `program-manifest.json` is missing
-   or older than the recompiler or the exe; the harness (`python tools/build_native_boot.py
+   or older than the recompiler, the exe or the runtime files it binds imports from
+   (`runtime/os/*.h|*.cpp`, `runtime/gpu/d3d12_xs.h`, `d3d12_xs_exports.*`,
+   `runtime/guest/guest_callbacks.h`); the harness (`python tools/build_native_boot.py
    <build-dir>/program --cache-dir <build-dir>/obj-cache --keep-going --delete-ir --debug-info`;
    the PDB lets `--profile` name runtime functions) when the binary is missing or older than the
    program manifest, any `runtime/` source or `tools/build_native_boot.py`. Only stale stages run, in dependency order (a rebuilt stage makes
@@ -130,6 +132,17 @@ def workspace_dirs(repo: Path) -> list[Path]:
     return [repo / m for m in members if "*" not in m] or [repo / "recomp"]
 
 
+def shim_inputs(repo: Path) -> list[Path]:
+    """The runtime files `build-program` scans to bind imports (recomp `checkout_shim_headers`):
+    `runtime/os/*.h` and `*.cpp` (export tables, `pg6_gthunk_*` registrations),
+    `runtime/gpu/d3d12_xs.h`, `runtime/gpu/d3d12_xs_exports.*`, `runtime/guest/guest_callbacks.h`."""
+    runtime = repo / "runtime"
+    files = sorted((runtime / "os").glob("*.h")) + sorted((runtime / "os").glob("*.cpp"))
+    files += [runtime / "gpu" / "d3d12_xs.h", runtime / "guest" / "guest_callbacks.h"]
+    files += sorted((runtime / "gpu").glob("d3d12_xs_exports.*"))
+    return files
+
+
 class Plan:
     def __init__(self) -> None:
         self.steps: list[dict] = []
@@ -168,7 +181,11 @@ def make_plan(repo: Path, build_dir: Path, exe: Path | None, game_dir: Path | No
 
     manifest = program / "program-manifest.json"
     exe_time = mtime(exe) if exe else 0.0
-    reason = stale("program", manifest, [("the recompiler", mtime(recomp) or 0.0), ("the exe", exe_time or 0.0)])
+    # The import bindings come from the runtime's shim headers and export tables: a new guest
+    # thunk (e.g. combase!CoCreateInstance) is only bound once the program is generated again.
+    shim_time = max([mtime(p) or 0.0 for p in shim_inputs(repo)] + [0.0])
+    reason = stale("program", manifest, [("the recompiler", mtime(recomp) or 0.0), ("the exe", exe_time or 0.0),
+                                         ("the runtime shim headers or export tables", shim_time)])
     if reason is None and plan.has("recomp"):
         reason = "the recompiler is rebuilt"
     if reason:
