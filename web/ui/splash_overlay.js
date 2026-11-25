@@ -23,21 +23,61 @@
     'FIRST_PRESENT',
   ]);
 
+  /** High-level monotonic splash boot phases (W311). */
+  const BOOT_PHASE_ORDER = Object.freeze([
+    'PGIM_LOAD',
+    'WASM_INIT',
+    'D3D12_INIT',
+    'ASSET_STREAMING',
+    'FIRST_VISIBLE_FRAME',
+  ]);
+
+  /** Monotonic progress bands for each canonical boot phase (W311). */
+  const BOOT_PHASE_RANGES = Object.freeze({
+    PGIM_LOAD: Object.freeze({ min: 0, max: 20, defaultPct: 11 }),
+    WASM_INIT: Object.freeze({ min: 20, max: 67, defaultPct: 35 }),
+    D3D12_INIT: Object.freeze({ min: 67, max: 85, defaultPct: 78 }),
+    ASSET_STREAMING: Object.freeze({ min: 85, max: 99, defaultPct: 90 }),
+    FIRST_VISIBLE_FRAME: Object.freeze({ min: 100, max: 100, defaultPct: 100 }),
+  });
+
+  /** Mapping from BootTracer milestones & W311 phases to canonical monotonic phases. */
+  const STAGE_TO_PHASE = Object.freeze({
+    PGIM_LOAD: 'PGIM_LOAD',
+    WASM_INIT: 'WASM_INIT',
+    TLS_INIT: 'WASM_INIT',
+    CRT_INITTERM: 'WASM_INIT',
+    ENTRY_CALL: 'WASM_INIT',
+    XMEM_INIT: 'WASM_INIT',
+    GDK_INIT: 'WASM_INIT',
+    D3D12_INIT: 'D3D12_INIT',
+    D3D12_CREATE_DEVICE: 'D3D12_INIT',
+    ASSET_STREAMING: 'ASSET_STREAMING',
+    BINK_OPEN: 'ASSET_STREAMING',
+    FIRST_VISIBLE_FRAME: 'FIRST_VISIBLE_FRAME',
+    FIRST_PRESENT: 'FIRST_VISIBLE_FRAME',
+  });
+
   /** Human-readable labels for each boot stage. */
   const BOOT_STAGE_LABELS = Object.freeze({
     NOT_STARTED: 'Waiting to start',
     PGIM_LOAD: 'Loading guest image',
+    WASM_INIT: 'Initializing Wasm64 runtime',
     TLS_INIT: 'Initializing TLS',
     CRT_INITTERM: 'Running CRT startup',
     ENTRY_CALL: 'Calling guest entry',
     XMEM_INIT: 'Initializing XMem',
     GDK_INIT: 'Initializing GDK runtime',
+    D3D12_INIT: 'Initializing D3D12',
     D3D12_CREATE_DEVICE: 'Creating D3D12 device',
     BINK_OPEN: 'Opening Bink stream',
+    ASSET_STREAMING: 'Loading game assets...',
     FIRST_PRESENT: 'First frame presented',
+    FIRST_VISIBLE_FRAME: 'First frame presented',
   });
 
   const DEFAULT_FADE_MS = 400;
+  const DEFAULT_FADE_OUT_MS = 220;
   const DEFAULT_VISIBLE_FRAME_FADE_MS = 450;
   const DEFAULT_HOLD_FALLBACK_TIMEOUT_MS = 240000;
   const DEFAULT_LOADING_ASSETS_MESSAGE = 'Loading game assets...';
@@ -428,6 +468,64 @@
     return BOOT_STAGE_ORDER.indexOf(upper);
   }
 
+  /**
+   * Map a BootTracer milestone or W311 phase name to one of the 5 canonical
+   * monotonic phases (`PGIM_LOAD`, `WASM_INIT`, `D3D12_INIT`, `ASSET_STREAMING`,
+   * `FIRST_VISIBLE_FRAME`), or `null` if unknown/not started.
+   *
+   * @param {unknown} stage
+   * @param {{ holdingForVisibleFrame?: boolean }} [options]
+   * @returns {string|null}
+   */
+  function resolveBootPhase(stage, options) {
+    if (typeof stage !== 'string' || stage.length === 0) return null;
+    const upper = stage.trim().toUpperCase();
+    if (upper === STAGE_NOT_STARTED) return null;
+    if (upper === 'FIRST_PRESENT' && options && options.holdingForVisibleFrame === true) {
+      return 'ASSET_STREAMING';
+    }
+    return STAGE_TO_PHASE[upper] || null;
+  }
+
+  function phaseIndex(phase) {
+    if (typeof phase !== 'string' || phase.length === 0) return -1;
+    return BOOT_PHASE_ORDER.indexOf(phase.trim().toUpperCase());
+  }
+
+  /**
+   * Clamp a candidate progress percentage within a canonical phase's `[min, max]`
+   * band while enforcing strict monotonicity (`>= currentPct`) so parallel
+   * preload events can never jump the progress bar backwards or prematurely hit
+   * 100% before dismissal / first visible frame.
+   *
+   * @param {string|null|undefined} stageOrPhase
+   * @param {number} candidatePct
+   * @param {number} [currentPct=0]
+   * @param {{ holdingForVisibleFrame?: boolean }} [options]
+   * @returns {number}
+   */
+  function clampMonotonicPhaseProgress(stageOrPhase, candidatePct, currentPct = 0, options) {
+    const holding = Boolean(options && options.holdingForVisibleFrame === true);
+    const prev = Math.round(clampPct(currentPct));
+    const raw = Math.round(clampPct(candidatePct));
+    const phase = resolveBootPhase(stageOrPhase, { holdingForVisibleFrame: holding });
+    const range = phase ? BOOT_PHASE_RANGES[phase] : null;
+    let bounded = raw;
+    if (range) {
+      const maxPct = holding ? Math.min(range.max, 99) : range.max;
+      bounded = Math.max(range.min, Math.min(maxPct, raw));
+    }
+    const monotonic = Math.max(prev, bounded);
+    return holding ? Math.min(99, monotonic) : monotonic;
+  }
+
+  function sanitizeNonNegativeMs(value) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+      return 0;
+    }
+    return Math.round(value);
+  }
+
   function labelForStage(stage) {
     if (typeof stage !== 'string' || stage.length === 0) {
       return BOOT_STAGE_LABELS.NOT_STARTED;
@@ -439,7 +537,8 @@
   /**
    * Compute a 0..100 boot progress percentage from a BootTracer-style snapshot.
    * Prefers an explicit `progressPct`, otherwise derives it from `stage` /
-   * `milestonesReached` against `BOOT_STAGE_ORDER`.
+   * `phaseProgress` / `milestonesReached` against `BOOT_STAGE_ORDER` and
+   * `BOOT_PHASE_RANGES`.
    *
    * @param {object|null|undefined} snapshot
    * @returns {number}
@@ -451,9 +550,25 @@
     if (snapshot.progressPct !== undefined && snapshot.progressPct !== null) {
       return Math.round(clampPct(snapshot.progressPct));
     }
+    const phase = resolveBootPhase(snapshot.stage);
+    const phaseRange = phase ? BOOT_PHASE_RANGES[phase] : null;
+    if (
+      phaseRange &&
+      snapshot.phaseProgress !== undefined &&
+      snapshot.phaseProgress !== null
+    ) {
+      const ratioRaw = Number(snapshot.phaseProgress);
+      if (Number.isFinite(ratioRaw)) {
+        const ratio = Math.max(0, Math.min(1, ratioRaw));
+        return Math.round(phaseRange.min + (phaseRange.max - phaseRange.min) * ratio);
+      }
+    }
     const idx = stageIndex(snapshot.stage);
     if (idx >= 0) {
       return Math.round(((idx + 1) / BOOT_STAGE_ORDER.length) * 100);
+    }
+    if (phaseRange) {
+      return phaseRange.defaultPct;
     }
     const reached = Number(snapshot.milestonesReached);
     if (Number.isFinite(reached) && reached > 0) {
@@ -691,6 +806,15 @@
       ) {
         throw new TypeError('visibleFrameFadeMs must be a non-negative finite number');
       }
+      if (
+        opts.fadeOutMs !== undefined &&
+        opts.fadeOutMs !== null &&
+        (typeof opts.fadeOutMs !== 'number' ||
+          !Number.isFinite(opts.fadeOutMs) ||
+          opts.fadeOutMs < 0)
+      ) {
+        throw new TypeError('fadeOutMs must be a non-negative finite number');
+      }
 
       this._document = doc;
       this._window = opts.windowObj && typeof opts.windowObj === 'object' ? opts.windowObj : null;
@@ -711,13 +835,21 @@
         typeof opts.gregClickThreshold === 'number'
           ? opts.gregClickThreshold
           : DEFAULT_GREG_CLICK_THRESHOLD;
-      this._fadeMs =
-        typeof opts.fadeMs === 'number' && Number.isFinite(opts.fadeMs) && opts.fadeMs >= 0
-          ? opts.fadeMs
+      const hasExplicitFadeOutMs = typeof opts.fadeOutMs === 'number';
+      const hasExplicitFadeMs =
+        typeof opts.fadeMs === 'number' && Number.isFinite(opts.fadeMs) && opts.fadeMs >= 0;
+      const hasExplicitVisibleFrameFadeMs = typeof opts.visibleFrameFadeMs === 'number';
+
+      this._fadeOutMs = hasExplicitFadeOutMs ? opts.fadeOutMs : DEFAULT_FADE_OUT_MS;
+      this._fadeMs = hasExplicitFadeMs
+        ? opts.fadeMs
+        : hasExplicitFadeOutMs
+          ? this._fadeOutMs
           : DEFAULT_FADE_MS;
-      this._visibleFrameFadeMs =
-        typeof opts.visibleFrameFadeMs === 'number'
-          ? opts.visibleFrameFadeMs
+      this._visibleFrameFadeMs = hasExplicitVisibleFrameFadeMs
+        ? opts.visibleFrameFadeMs
+        : hasExplicitFadeOutMs
+          ? this._fadeOutMs
           : DEFAULT_VISIBLE_FRAME_FADE_MS;
       this._holdFallbackTimeoutMs =
         typeof opts.holdFallbackTimeoutMs === 'number'
@@ -762,11 +894,13 @@
 
       const autoHiddenByHud =
         this._hudHidden && opts.visible === undefined && opts.instantHide !== false;
+      const createdAtMs = this._safeNow();
 
       this._destroyed = false;
       this._visible = autoHiddenByHud ? false : opts.visible !== false;
       this._dismissed = autoHiddenByHud;
       this._fading = false;
+      this._fadeOutCompleted = Boolean(autoHiddenByHud);
       this._fadeTimer = null;
       this._holdFallbackTimer = null;
       this._holdingForVisibleFrame = false;
@@ -778,7 +912,9 @@
       this._loadingRealPackDraws = 0;
       this._holdFallbackTimedOut = false;
       this._pendingDismissReason = null;
-      this._dismissedAtMs = autoHiddenByHud ? this._safeNow() : null;
+      this._splashStartedAtMs = createdAtMs;
+      this._totalSplashMs = autoHiddenByHud ? 0 : null;
+      this._dismissedAtMs = autoHiddenByHud ? createdAtMs : null;
       this._dismissCount = autoHiddenByHud ? 1 : 0;
       this._fadeDurationMs = autoHiddenByHud ? 0 : null;
       this._dismissReason = autoHiddenByHud ? DISMISS_REASONS.HUD_HIDDEN : null;
@@ -788,6 +924,11 @@
       this._progressPct = 0;
       this._streamPct = null;
       this._stage = STAGE_NOT_STARTED;
+      this._phase = STAGE_NOT_STARTED;
+      this._highestPhaseIndex = -1;
+      this._activePhase = null;
+      this._activePhaseStartedAtMs = null;
+      this._stageDurationsMs = Object.create(null);
       this._stageLabel = BOOT_STAGE_LABELS.NOT_STARTED;
       this._statusText = this._stageLabel;
       this._elapsedMs = 0;
@@ -1141,17 +1282,90 @@
       try {
         if (visible) {
           root.hidden = false;
-          if (root.style) root.style.display = '';
+          if (root.style) {
+            root.style.display = '';
+            root.style.opacity = '';
+          }
           this._removeFadingClass(root);
         } else {
           root.hidden = true;
-          if (root.style) root.style.display = 'none';
+          if (root.style) {
+            root.style.display = 'none';
+            root.style.opacity = '';
+          }
           this._removeFadingClass(root);
         }
       } catch {
         // Visibility updates must never throw.
       }
       this._visible = Boolean(visible);
+    }
+
+    _enterPhase(phase) {
+      const idx = phaseIndex(phase);
+      if (idx < 0) {
+        return false;
+      }
+      if (idx < this._highestPhaseIndex) {
+        return false;
+      }
+      const canonical = BOOT_PHASE_ORDER[idx];
+      const now = this._safeNow();
+      if (this._activePhase !== canonical) {
+        this._finalizeActivePhase(now);
+        this._highestPhaseIndex = idx;
+        this._phase = canonical;
+        this._activePhase = canonical;
+        this._activePhaseStartedAtMs = now;
+        if (this._stageDurationsMs[canonical] === undefined) {
+          this._stageDurationsMs[canonical] = 0;
+        }
+      } else {
+        this._highestPhaseIndex = idx;
+        this._phase = canonical;
+        if (this._activePhaseStartedAtMs === null) {
+          this._activePhaseStartedAtMs = now;
+        }
+      }
+      return true;
+    }
+
+    _finalizeActivePhase(nowMs) {
+      if (this._activePhase === null || this._activePhaseStartedAtMs === null) {
+        return;
+      }
+      const now = typeof nowMs === 'number' && Number.isFinite(nowMs) && nowMs >= 0 ? nowMs : this._safeNow();
+      const delta = sanitizeNonNegativeMs(now - this._activePhaseStartedAtMs);
+      const prev = sanitizeNonNegativeMs(this._stageDurationsMs[this._activePhase]);
+      this._stageDurationsMs[this._activePhase] = sanitizeNonNegativeMs(prev + delta);
+      this._activePhaseStartedAtMs = null;
+    }
+
+    _getSanitizedStageDurationsMs() {
+      const out = {};
+      const now = this._safeNow();
+      for (const phase of BOOT_PHASE_ORDER) {
+        const isRecorded = Object.prototype.hasOwnProperty.call(this._stageDurationsMs, phase);
+        const isActive = this._activePhase === phase && this._activePhaseStartedAtMs !== null;
+        if (!isRecorded && !isActive) {
+          continue;
+        }
+        const stored = sanitizeNonNegativeMs(this._stageDurationsMs[phase]);
+        const live = isActive ? sanitizeNonNegativeMs(now - this._activePhaseStartedAtMs) : 0;
+        out[phase] = sanitizeNonNegativeMs(stored + live);
+      }
+      return out;
+    }
+
+    _getSanitizedTotalSplashMs() {
+      if (
+        typeof this._totalSplashMs === 'number' &&
+        Number.isFinite(this._totalSplashMs) &&
+        this._totalSplashMs >= 0
+      ) {
+        return sanitizeNonNegativeMs(this._totalSplashMs);
+      }
+      return sanitizeNonNegativeMs(this._safeNow() - this._splashStartedAtMs);
     }
 
     _syncSpinner() {
@@ -1412,27 +1626,59 @@
       const snap = snapshot && typeof snapshot === 'object' ? snapshot : {};
       this._lastSnapshot = snap;
 
-      this._stage =
+      const incomingStage =
         typeof snap.stage === 'string' && snap.stage.length > 0
           ? snap.stage.trim().toUpperCase()
           : STAGE_NOT_STARTED;
-      this._stageLabel = labelForStage(this._stage);
-      const nextProgress = computeBootProgress(snap);
-      this._progressPct = this._holdingForVisibleFrame
-        ? Math.min(99, Math.max(this._progressPct, nextProgress))
-        : nextProgress;
-      this._elapsedMs =
+      const incomingPhase = resolveBootPhase(incomingStage, {
+        holdingForVisibleFrame: this._holdingForVisibleFrame,
+      });
+      const incomingPhaseIdx = incomingPhase ? phaseIndex(incomingPhase) : -1;
+      const isStaleEarlierPhase =
+        incomingPhaseIdx >= 0 && incomingPhaseIdx < this._highestPhaseIndex;
+
+      if (!isStaleEarlierPhase) {
+        this._stage = incomingStage;
+        this._stageLabel = labelForStage(this._stage);
+        if (incomingPhase) {
+          this._enterPhase(incomingPhase);
+        }
+      }
+
+      const rawProgress = computeBootProgress(snap);
+      const clampPhase =
+        incomingPhase || (this._phase !== STAGE_NOT_STARTED ? this._phase : null);
+      this._progressPct = clampMonotonicPhaseProgress(
+        clampPhase,
+        rawProgress,
+        this._progressPct,
+        { holdingForVisibleFrame: this._holdingForVisibleFrame }
+      );
+
+      const incomingElapsed =
         typeof snap.elapsedMs === 'number' && Number.isFinite(snap.elapsedMs) ? snap.elapsedMs : 0;
-      this._readyForSplash = Boolean(snap.readyForSplash) || this._stage === 'FIRST_PRESENT';
+      if (!isStaleEarlierPhase) {
+        this._elapsedMs = incomingElapsed;
+      } else if (incomingElapsed > this._elapsedMs) {
+        this._elapsedMs = incomingElapsed;
+      }
+
+      this._readyForSplash =
+        this._readyForSplash ||
+        Boolean(snap.readyForSplash) ||
+        incomingStage === 'FIRST_PRESENT' ||
+        incomingStage === 'FIRST_VISIBLE_FRAME';
       this._streamPct = streamingPct(snap.streamingProgress);
 
       const traps = snap.traps !== undefined ? snap.traps : snap.recentTraps;
       this._badgeText = formatTrapBadge(traps, snap.unresolvedImports);
 
-      if (typeof snap.statusText === 'string' && snap.statusText.trim().length > 0) {
-        this._statusText = snap.statusText.trim();
-      } else if (!this._holdingForVisibleFrame) {
-        this._statusText = this._stageLabel;
+      if (!isStaleEarlierPhase) {
+        if (typeof snap.statusText === 'string' && snap.statusText.trim().length > 0) {
+          this._statusText = snap.statusText.trim();
+        } else if (!this._holdingForVisibleFrame) {
+          this._statusText = this._stageLabel;
+        }
       }
 
       this._syncChrome();
@@ -1522,6 +1768,9 @@
         const measured = completedAtMs - startedAtMs;
         fadeDurationMs = Number.isFinite(measured) && measured > 0 ? measured : effectiveFadeMs;
       }
+      this._finalizeActivePhase(completedAtMs);
+      this._totalSplashMs = sanitizeNonNegativeMs(completedAtMs - this._splashStartedAtMs);
+      this._fadeOutCompleted = true;
       this._dismissedAtMs = completedAtMs;
       this._dismissCount += 1;
       this._fadeDurationMs = fadeDurationMs;
@@ -1550,6 +1799,7 @@
       }
 
       const info = progress && typeof progress === 'object' ? progress : {};
+      this._enterPhase('ASSET_STREAMING');
       if (
         typeof info.presents === 'number' &&
         Number.isFinite(info.presents) &&
@@ -1584,14 +1834,20 @@
         this._ensureHoldFallbackTimer();
       }
 
+      let candidatePct;
       if (typeof info.progressPct === 'number' && Number.isFinite(info.progressPct)) {
-        this._progressPct = clampPct(info.progressPct);
+        candidatePct = clampPct(info.progressPct);
       } else {
         const presentFactor = Math.min(this._loadingPresents, 300) / 300;
         const drawFactor = Math.min(this._loadingRealPackDraws, 60) / 60;
-        const computed = 90 + Math.round((drawFactor * 0.7 + presentFactor * 0.3) * 9);
-        this._progressPct = Math.min(99, Math.max(this._progressPct, computed));
+        candidatePct = 90 + Math.round((drawFactor * 0.7 + presentFactor * 0.3) * 9);
       }
+      this._progressPct = clampMonotonicPhaseProgress(
+        'ASSET_STREAMING',
+        candidatePct,
+        this._progressPct,
+        { holdingForVisibleFrame: true }
+      );
 
       const cleanMsg =
         typeof info.message === 'string'
@@ -1615,11 +1871,10 @@
 
     /**
      * Signal that the first non-black visible frame has rendered and smoothly fade
-     * out the splash overlay (default 450 ms CSS opacity fade). Records
-     * `heldForVisibleFrame`, `firstVisibleFrameMs`, and `blackPresentsWhileHeld`
-     * telemetry. Idempotent once dismissed.
+     * out the splash overlay. Records `heldForVisibleFrame`, `firstVisibleFrameMs`,
+     * `blackPresentsWhileHeld`, and sanitized phase timing telemetry. Idempotent once dismissed.
      *
-     * @param {{ fadeDurationMs?: number, fadeMs?: number, reducedMotion?: boolean, immediate?: boolean, instant?: boolean, instantHide?: boolean, reason?: string }} [options]
+     * @param {{ fadeOutMs?: number, fadeDurationMs?: number, fadeMs?: number, reducedMotion?: boolean, immediate?: boolean, instant?: boolean, instantHide?: boolean, reason?: string }} [options]
      * @returns {object} Current controller state.
      */
     notifyFirstVisibleFrame(options) {
@@ -1637,6 +1892,9 @@
       this._readyForSplash = true;
       this._stage = 'FIRST_PRESENT';
       this._stageLabel = labelForStage(this._stage);
+      if (!this._dismissed) {
+        this._enterPhase('FIRST_VISIBLE_FRAME');
+      }
       this._progressPct = 100;
       if (!this._dismissed) {
         this._statusText = this._stageLabel;
@@ -1645,12 +1903,15 @@
 
       const opts = options && typeof options === 'object' ? { ...options } : {};
       let resolvedFadeMs = this._visibleFrameFadeMs;
-      if (typeof opts.fadeDurationMs === 'number' && Number.isFinite(opts.fadeDurationMs)) {
+      if (typeof opts.fadeOutMs === 'number' && Number.isFinite(opts.fadeOutMs)) {
+        resolvedFadeMs = Math.max(0, opts.fadeOutMs);
+      } else if (typeof opts.fadeDurationMs === 'number' && Number.isFinite(opts.fadeDurationMs)) {
         resolvedFadeMs = Math.max(0, opts.fadeDurationMs);
       } else if (typeof opts.fadeMs === 'number' && Number.isFinite(opts.fadeMs)) {
         resolvedFadeMs = Math.max(0, opts.fadeMs);
       }
       opts.fadeMs = resolvedFadeMs;
+      delete opts.fadeOutMs;
       if (opts.reason === undefined) {
         opts.reason = DISMISS_REASONS.FIRST_VISIBLE_FRAME;
       }
@@ -1662,10 +1923,10 @@
      * Signal that the first WebGPU / Bink frame has been presented and dismiss the overlay
      * (or enter the smooth loading-assets hold phase when `holdUntilVisible` is enabled).
      * Supports immediate dismissal via `{ immediate: true }`, `{ instant: true }`,
-     * `{ instantHide: true }`, `{ fadeMs: 0 }`, constructor `instantHide: true`,
+     * `{ instantHide: true }`, `{ fadeOutMs: 0 }`, `{ fadeMs: 0 }`, constructor `instantHide: true`,
      * `?hud=0`, or `prefers-reduced-motion`.
      *
-     * @param {{ fadeMs?: number, reducedMotion?: boolean, immediate?: boolean, instant?: boolean, instantHide?: boolean, reason?: string, message?: string }} [options]
+     * @param {{ fadeOutMs?: number, fadeMs?: number, reducedMotion?: boolean, immediate?: boolean, instant?: boolean, instantHide?: boolean, reason?: string, message?: string }} [options]
      * @returns {object}
      */
     onFirstPresent(options) {
@@ -1679,12 +1940,18 @@
         this._stageLabel = labelForStage(this._stage);
         this._holdingForVisibleFrame = true;
         this._heldForVisibleFrame = true;
+        this._enterPhase('ASSET_STREAMING');
         if (this._holdStartedAtMs === null) {
           this._holdStartedAtMs = this._safeNow();
         }
         this._blackPresentsWhileHeld += 1;
         this._loadingPresents = Math.max(this._loadingPresents, this._blackPresentsWhileHeld);
-        this._progressPct = Math.min(99, Math.max(this._progressPct, 90));
+        this._progressPct = clampMonotonicPhaseProgress(
+          'ASSET_STREAMING',
+          Math.max(this._progressPct, 90),
+          this._progressPct,
+          { holdingForVisibleFrame: true }
+        );
         const customMessage =
           typeof opts.message === 'string'
             ? opts.message.replace(/[\x00-\x1F\x7F]+/g, ' ').trim()
@@ -1706,6 +1973,9 @@
       this._readyForSplash = true;
       this._stage = 'FIRST_PRESENT';
       this._stageLabel = labelForStage(this._stage);
+      if (!this._dismissed) {
+        this._enterPhase('FIRST_VISIBLE_FRAME');
+      }
       this._progressPct = 100;
       this._statusText = this._stageLabel;
       this._syncChrome();
@@ -1770,9 +2040,11 @@
               ? opts.instantHide
               : null;
       const requestedFadeMs =
-        typeof opts.fadeMs === 'number' && Number.isFinite(opts.fadeMs)
-          ? Math.max(0, opts.fadeMs)
-          : this._fadeMs;
+        typeof opts.fadeOutMs === 'number' && Number.isFinite(opts.fadeOutMs)
+          ? Math.max(0, opts.fadeOutMs)
+          : typeof opts.fadeMs === 'number' && Number.isFinite(opts.fadeMs)
+            ? Math.max(0, opts.fadeMs)
+            : this._fadeMs;
       const reducedMotion =
         typeof opts.reducedMotion === 'boolean'
           ? opts.reducedMotion
@@ -1818,10 +2090,17 @@
 
       this._dismissed = true;
       this._holdingForVisibleFrame = false;
+      this._fadeOutCompleted = false;
       this._pendingDismissReason = resolvedReason;
       this._clearFadeTimer();
       this._clearHoldFallbackTimer();
-      this._syncSpinner();
+      this._enterPhase('FIRST_VISIBLE_FRAME');
+      if (this._progressPct < 100) {
+        this._progressPct = 100;
+        this._syncChrome();
+      } else {
+        this._syncSpinner();
+      }
 
       if (this._root) {
         try {
@@ -1835,6 +2114,9 @@
               this._root.classList.add('pg6-splash--fading');
             } else if (typeof this._root.className === 'string') {
               this._root.className = `${this._root.className} pg6-splash--fading`.trim();
+            }
+            if (this._root.style) {
+              this._root.style.opacity = '0';
             }
           }
           this._root.setAttribute('aria-busy', 'false');
@@ -1877,10 +2159,18 @@
       this._clearHoldFallbackTimer();
       this._dismissed = false;
       this._fading = false;
+      this._fadeOutCompleted = false;
       this._holdingForVisibleFrame = false;
       this._pendingDismissReason = null;
       if (reset) {
         this._stage = STAGE_NOT_STARTED;
+        this._phase = STAGE_NOT_STARTED;
+        this._highestPhaseIndex = -1;
+        this._activePhase = null;
+        this._activePhaseStartedAtMs = null;
+        this._stageDurationsMs = Object.create(null);
+        this._splashStartedAtMs = this._safeNow();
+        this._totalSplashMs = null;
         this._stageLabel = BOOT_STAGE_LABELS.NOT_STARTED;
         this._statusText = this._stageLabel;
         this._progressPct = 0;
@@ -1909,9 +2199,30 @@
       return this.getState();
     }
 
-    /** Immediately hide the overlay without firing onDismiss. Idempotent when already hidden. */
-    hide() {
+    /**
+     * Hide the overlay without firing `onDismiss`. Immediate by default (and when
+     * `fadeOutMs: 0`), or smoothly fades out when passed `{ fadeOutMs > 0 }`.
+     * Always cancels any in-flight fade/fallback timers (zero leaked timers) and is
+     * idempotent when already hidden.
+     *
+     * @param {{ fadeOutMs?: number, fadeMs?: number, reducedMotion?: boolean }} [options]
+     * @returns {object}
+     */
+    hide(options) {
       if (this._destroyed) return this.getState();
+      const opts = options && typeof options === 'object' ? options : null;
+      const requestedFadeMs =
+        opts && typeof opts.fadeOutMs === 'number' && Number.isFinite(opts.fadeOutMs)
+          ? Math.max(0, opts.fadeOutMs)
+          : opts && typeof opts.fadeMs === 'number' && Number.isFinite(opts.fadeMs)
+            ? Math.max(0, opts.fadeMs)
+            : 0;
+      const reducedMotion =
+        opts && typeof opts.reducedMotion === 'boolean'
+          ? opts.reducedMotion
+          : this._isReducedMotion();
+      const effectiveFadeMs = this._instantHide || reducedMotion ? 0 : requestedFadeMs;
+
       if (!this._visible && !this._fading) {
         return this.getState();
       }
@@ -1924,14 +2235,45 @@
       if (wasFading) {
         this._dismissed = false;
       }
+
+      if (effectiveFadeMs > 0 && !wasFading) {
+        this._fadeOutCompleted = false;
+        if (this._root) {
+          try {
+            this._root.style && this._root.style.setProperty('--pg6-splash-fade', `${effectiveFadeMs}ms`);
+            if (this._root.classList && typeof this._root.classList.add === 'function') {
+              this._root.classList.add('pg6-splash--fading');
+            } else if (typeof this._root.className === 'string') {
+              this._root.className = `${this._root.className} pg6-splash--fading`.trim();
+            }
+            if (this._root.style) {
+              this._root.style.opacity = '0';
+            }
+          } catch {
+            // ignore
+          }
+        }
+        this._fading = true;
+        this._fadeTimer = this._setTimeout(() => {
+          this._fadeTimer = null;
+          if (this._destroyed) {
+            return;
+          }
+          this._fading = false;
+          this._fadeOutCompleted = true;
+          this._applyVisibility(false);
+        }, effectiveFadeMs);
+        return this.getState();
+      }
+
       this._applyVisibility(false);
       return this.getState();
     }
 
     /**
      * Return a sanitized, JSON-safe telemetry snapshot of overlay visibility,
-     * dismissal timing/counts/reason, reduced-motion/instant-hide state, and
-     * scripted-input preset.
+     * dismissal timing/counts/reason, phase timing durations, reduced-motion/instant-hide
+     * state, and scripted-input preset.
      *
      * @returns {object}
      */
@@ -1940,6 +2282,7 @@
         visible: Boolean(this._visible),
         dismissed: Boolean(this._dismissed),
         fading: Boolean(this._fading),
+        fadeOutCompleted: Boolean(this._fadeOutCompleted),
         destroyed: Boolean(this._destroyed),
         dismissedAtMs:
           typeof this._dismissedAtMs === 'number' && Number.isFinite(this._dismissedAtMs) && this._dismissedAtMs >= 0
@@ -1957,11 +2300,15 @@
             : null,
         dismissReason: sanitizeDismissReason(this._dismissReason),
         fadeMs: this._fadeMs,
+        fadeOutMs: this._fadeOutMs,
         instantHide: Boolean(this._instantHide),
         hudHidden: Boolean(this._hudHidden),
         reducedMotion: this._isReducedMotion(),
         stage: this._stage,
+        phase: this._phase,
         progressPct: Math.round(clampPct(this._progressPct)),
+        stageDurationsMs: this._getSanitizedStageDurationsMs(),
+        totalSplashMs: this._getSanitizedTotalSplashMs(),
         readyForSplash: Boolean(this._readyForSplash),
         scriptedInputPreset: this._scriptedInputPreset,
         gregMode: Boolean(this._gregMode),
@@ -1998,21 +2345,26 @@
         visible: this._visible,
         dismissed: this._dismissed,
         fading: this._fading,
+        fadeOutCompleted: Boolean(this._fadeOutCompleted),
         destroyed: this._destroyed,
         progressPct: Math.round(clampPct(this._progressPct)),
         streamPct: this._streamPct === null || this._streamPct === undefined
           ? null
           : Math.round(clampPct(this._streamPct)),
         stage: this._stage,
+        phase: this._phase,
         stageLabel: this._stageLabel,
         statusText: this._statusText,
         elapsedMs: this._elapsedMs,
+        stageDurationsMs: this._getSanitizedStageDurationsMs(),
+        totalSplashMs: this._getSanitizedTotalSplashMs(),
         badgeText: this._badgeText,
         readyForSplash: this._readyForSplash,
         splashImageUrl: this._splashImageUrl,
         usingFallback: this._usingFallback,
         imageFailed: this._imageFailed,
         fadeMs: this._fadeMs,
+        fadeOutMs: this._fadeOutMs,
         instantHide: this._instantHide,
         hudHidden: this._hudHidden,
         dismissedAtMs: this._dismissedAtMs,
@@ -2035,10 +2387,15 @@
       };
     }
 
-    /** Tear down DOM listeners / nodes. Idempotent. */
+    /** Tear down DOM listeners / nodes and cancel all pending timers. Idempotent. */
     destroy() {
       if (this._destroyed) {
         return;
+      }
+      const destroyedAtMs = this._safeNow();
+      this._finalizeActivePhase(destroyedAtMs);
+      if (this._totalSplashMs === null) {
+        this._totalSplashMs = sanitizeNonNegativeMs(destroyedAtMs - this._splashStartedAtMs);
       }
       this._destroyed = true;
       this._clearFadeTimer();
@@ -2103,8 +2460,12 @@
   const exportedApi = {
     BOOT_STAGE_ORDER,
     BOOT_STAGE_LABELS,
+    BOOT_PHASE_ORDER,
+    BOOT_PHASE_RANGES,
     DISMISS_REASONS,
     computeBootProgress,
+    resolveBootPhase,
+    clampMonotonicPhaseProgress,
     sanitizeScriptedInputPreset,
     sanitizeDismissReason,
     isHudHiddenQuery,
@@ -2112,6 +2473,7 @@
     isSplashHoldQuery,
     SplashOverlayController,
     DEFAULT_FADE_MS,
+    DEFAULT_FADE_OUT_MS,
     DEFAULT_VISIBLE_FRAME_FADE_MS,
     DEFAULT_HOLD_FALLBACK_TIMEOUT_MS,
     DEFAULT_LOADING_ASSETS_MESSAGE,
