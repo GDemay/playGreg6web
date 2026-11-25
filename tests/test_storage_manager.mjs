@@ -4,8 +4,12 @@ import { createRequire } from 'node:module';
 
 import {
   BrowserStorageManager,
+  CACHE_ENTRY_KINDS,
+  CACHE_INDEX_VERSION,
+  DEFAULT_CACHE_INDEX_FILENAME,
   DEFAULT_CRITICAL_THRESHOLD_RATIO,
   DEFAULT_OPFS_CACHE_DIR,
+  DEFAULT_QUOTA_BUDGET_RATIO,
   DEFAULT_USERDATA_DB_NAME,
   DEFAULT_USERDATA_STORE_NAME,
   DEFAULT_WARN_THRESHOLD_RATIO,
@@ -17,6 +21,8 @@ import {
   decodeBase64,
   encodeBase64,
   formatBytes,
+  inferCacheEntryKind,
+  validateCacheKey,
   validateUserdataPath,
 } from '../web/storage/storage_manager.js';
 
@@ -1116,4 +1122,587 @@ test('getSummary and getUsageSnapshot expose quota pressure, eviction telemetry,
   assert.equal(serialized.includes('custom-secret-store'), false);
   assert.equal('entries' in snapshot.opfsCache, false);
   assert.equal('files' in snapshot.userdata, false);
+});
+
+// --- W211 OPFS Quota-Aware LRU Eviction & Integrity-Keyed Shader/PGIM Cache tests ---
+
+test('validateCacheKey and inferCacheEntryKind enforce safe keys and classify pgim/shader-pack/chunk entries', () => {
+  assert.equal(DEFAULT_CACHE_INDEX_FILENAME, '.playgta6-cache-index.json');
+  assert.equal(CACHE_INDEX_VERSION, 1);
+  assert.equal(DEFAULT_QUOTA_BUDGET_RATIO, 0.6);
+  assert.equal(Object.isFrozen(CACHE_ENTRY_KINDS), true);
+
+  assert.equal(validateCacheKey('boot.pgim'), 'boot.pgim');
+  assert.equal(validateCacheKey('shaders/frame1.wgsl.pack'), 'shaders/frame1.wgsl.pack');
+  assert.equal(validateCacheKey('c_262144_0_78363461.bin'), 'c_262144_0_78363461.bin');
+
+  for (const badKey of [
+    '',
+    '/boot.pgim',
+    'shaders/',
+    '../escape.pgim',
+    'shaders/../boot.pgim',
+    'shaders/./pack.wgsl.pack',
+    'shaders//pack.wgsl.pack',
+    'shaders\\pack.wgsl.pack',
+    'boot\0.pgim',
+    DEFAULT_CACHE_INDEX_FILENAME,
+  ]) {
+    assert.throws(() => validateCacheKey(badKey), `validateCacheKey should reject "${badKey}"`);
+  }
+
+  assert.equal(inferCacheEntryKind('boot/gta6.pgim'), CACHE_ENTRY_KINDS.PGIM);
+  assert.equal(inferCacheEntryKind('BOOT.PGIM'), CACHE_ENTRY_KINDS.PGIM);
+  assert.equal(inferCacheEntryKind('shaders/main.wgsl.pack'), CACHE_ENTRY_KINDS.SHADER_PACK);
+  assert.equal(inferCacheEntryKind('custom/pass.spv'), CACHE_ENTRY_KINDS.SHADER_PACK);
+  assert.equal(inferCacheEntryKind('c_262144_12_abcdef.bin'), CACHE_ENTRY_KINDS.RANGE_CHUNK);
+  assert.equal(inferCacheEntryKind('misc/data.bin'), CACHE_ENTRY_KINDS.GENERIC);
+});
+
+test('integrity-keyed shader/PGIM cache validates ETag, versionKey, and byte size with automatic invalidation', async () => {
+  let clockMs = 1700002000000;
+  const opfsRoot = createMockOpfsDirHandle('');
+  const manager = new BrowserStorageManager({
+    storageObj: createMockStorageObj({ usage: 0, quota: 10 * 1024 * 1024, opfsRoot }),
+    indexedDBFactory: null,
+    nowFn: () => clockMs,
+  });
+
+  const pgimBytes = makePatternBytes(4096, 10);
+  const shaderBytes = makePatternBytes(2048, 20);
+
+  const putPgim = await manager.putCacheEntry('boot/gta6.pgim', pgimBytes, {
+    etag: '"etag-pgim-v1"',
+    versionKey: 'pgim-sha256-aaa',
+    pinned: true,
+  });
+  assert.equal(putPgim.supported, true);
+  assert.equal(putPgim.stored, true);
+  assert.equal(putPgim.replaced, false);
+  assert.equal(putPgim.versionChanged, false);
+  assert.deepEqual(putPgim.meta, {
+    key: 'boot/gta6.pgim',
+    sizeBytes: 4096,
+    lastAccessedMs: 1700002000000,
+    createdAtMs: 1700002000000,
+    etag: '"etag-pgim-v1"',
+    versionKey: 'pgim-sha256-aaa',
+    pinned: true,
+    kind: 'pgim',
+  });
+
+  clockMs += 1000;
+  await manager.putCacheEntry('shaders/main.wgsl.pack', shaderBytes, {
+    etag: '"etag-shader-v1"',
+    versionKey: 'shader-pack-v1',
+    pinned: false,
+  });
+
+  // Internal index file must NOT leak into inspectOpfsCache().
+  const inspected = await manager.inspectOpfsCache();
+  assert.equal(inspected.entryCount, 2);
+  assert.equal(inspected.totalBytes, 6144);
+  assert.deepEqual(
+    inspected.entries.map((e) => e.name),
+    ['boot/gta6.pgim', 'shaders/main.wgsl.pack']
+  );
+
+  // Matching ETag & versionKey -> hit and updates lastAccessedMs.
+  clockMs += 5000;
+  const hitPgim = await manager.getCacheEntry('boot/gta6.pgim', {
+    etag: '"etag-pgim-v1"',
+    versionKey: 'pgim-sha256-aaa',
+    expectedSizeBytes: 4096,
+  });
+  assert.equal(hitPgim.hit, true);
+  assert.equal(hitPgim.invalidated, false);
+  assert.deepEqual(hitPgim.data, pgimBytes);
+  assert.equal(hitPgim.meta.lastAccessedMs, 1700002006000);
+
+  // ETag mismatch invalidates & removes shader pack from OPFS.
+  clockMs += 1000;
+  const etagMiss = await manager.getCacheEntry('shaders/main.wgsl.pack', {
+    etag: '"etag-shader-v2"',
+  });
+  assert.equal(etagMiss.hit, false);
+  assert.equal(etagMiss.invalidated, true);
+  assert.equal(etagMiss.reason, 'etag-mismatch');
+  assert.equal(etagMiss.data, null);
+  assert.equal(manager.getCacheEntryMeta('shaders/main.wgsl.pack'), null);
+  assert.equal((await manager.inspectOpfsCache()).entryCount, 1);
+
+  // Re-store shader pack under v2, then test versionKey mismatch invalidation.
+  await manager.putCacheEntry('shaders/main.wgsl.pack', shaderBytes, {
+    etag: '"etag-shader-v2"',
+    versionKey: 'shader-pack-v2',
+  });
+  const versionMiss = await manager.getCacheEntry('shaders/main.wgsl.pack', {
+    versionKey: 'shader-pack-v3',
+  });
+  assert.equal(versionMiss.hit, false);
+  assert.equal(versionMiss.invalidated, true);
+  assert.equal(versionMiss.reason, 'version-mismatch');
+  assert.equal(manager.getCacheEntryMeta('shaders/main.wgsl.pack'), null);
+
+  // Size integrity mismatch also invalidates and removes entry.
+  await manager.putCacheEntry('shaders/corrupt.wgsl.pack', makePatternBytes(512, 33), {
+    versionKey: 'v1',
+  });
+  const sizeMiss = await manager.getCacheEntry('shaders/corrupt.wgsl.pack', {
+    versionKey: 'v1',
+    expectedSizeBytes: 1024,
+  });
+  assert.equal(sizeMiss.hit, false);
+  assert.equal(sizeMiss.invalidated, true);
+  assert.equal(sizeMiss.reason, 'size-mismatch');
+
+  // Replacing an existing entry with a new versionKey counts as versionChanged + invalidation.
+  const replaced = await manager.putCacheEntry('boot/gta6.pgim', makePatternBytes(4096, 99), {
+    etag: '"etag-pgim-v2"',
+    versionKey: 'pgim-sha256-bbb',
+    pinned: true,
+  });
+  assert.equal(replaced.replaced, true);
+  assert.equal(replaced.versionChanged, true);
+
+  const stats = manager.getCacheStats();
+  assert.equal(stats.hits, 1);
+  assert.equal(stats.misses, 3);
+  assert.equal(stats.invalidations, 4); // etag-mismatch + version-mismatch + size-mismatch + versionChanged replace
+  assert.equal(stats.entryCount, 1);
+  assert.equal(stats.totalBytes, 4096);
+});
+
+test('invalidateStaleCacheEntries bulk-purges mismatched shader packs and persists metadata across reload', async () => {
+  let clockMs = 100000;
+  const opfsRoot = createMockOpfsDirHandle('');
+
+  const writer = new BrowserStorageManager({
+    storageObj: null,
+    opfsRoot,
+    indexedDBFactory: null,
+    nowFn: () => clockMs,
+  });
+
+  await writer.putCacheEntry('boot/active.pgim', makePatternBytes(2048, 1), {
+    versionKey: 'pgim-v2',
+    etag: '"pgim-2"',
+    pinned: true,
+  });
+  clockMs += 100;
+  await writer.putCacheEntry('shaders/old_a.wgsl.pack', makePatternBytes(1024, 2), {
+    versionKey: 'shaders-v1',
+    etag: '"s1"',
+  });
+  clockMs += 100;
+  await writer.putCacheEntry('shaders/old_b.wgsl.pack', makePatternBytes(1024, 3), {
+    versionKey: 'shaders-v1',
+    etag: '"s1"',
+    pinned: true,
+  });
+  clockMs += 100;
+  await writer.putCacheEntry('shaders/fresh.wgsl.pack', makePatternBytes(1536, 4), {
+    versionKey: 'shaders-v2',
+    etag: '"s2"',
+  });
+
+  // Simulate browser reload with a brand-new manager sharing the same OPFS root.
+  const reloaded = new BrowserStorageManager({
+    storageObj: null,
+    opfsRoot,
+    indexedDBFactory: null,
+    nowFn: () => clockMs + 500,
+  });
+
+  const synced = await reloaded.syncCacheIndex();
+  assert.equal(synced.supported, true);
+  assert.equal(synced.entryCount, 4);
+  assert.equal(synced.totalBytes, 5632);
+  assert.equal(synced.discoveredCount, 0);
+  assert.equal(reloaded.getCacheEntryMeta('boot/active.pgim').pinned, true);
+  assert.equal(reloaded.getCacheEntryMeta('boot/active.pgim').versionKey, 'pgim-v2');
+
+  // Bulk invalidate stale shader packs while skipping pinned entries first.
+  const bulk1 = await reloaded.invalidateStaleCacheEntries({
+    kind: CACHE_ENTRY_KINDS.SHADER_PACK,
+    expectedVersionKey: 'shaders-v2',
+    includePinned: false,
+  });
+  assert.equal(bulk1.invalidatedCount, 1);
+  assert.deepEqual(bulk1.invalidatedKeys, ['shaders/old_a.wgsl.pack']);
+  assert.equal(bulk1.freedBytes, 1024);
+  assert.equal(bulk1.skippedPinnedCount, 1);
+
+  // Per-key manifest map invalidation with includePinned: true (default) clears stale pinned pack too.
+  const bulk2 = await reloaded.invalidateStaleCacheEntries({
+    entries: {
+      'boot/active.pgim': { versionKey: 'pgim-v2', etag: '"pgim-2"' },
+      'shaders/old_b.wgsl.pack': { versionKey: 'shaders-v2' },
+    },
+  });
+  assert.equal(bulk2.invalidatedCount, 1);
+  assert.deepEqual(bulk2.invalidatedKeys, ['shaders/old_b.wgsl.pack']);
+  assert.equal(bulk2.freedBytes, 1024);
+
+  // Active PGIM and fresh shader pack remain intact.
+  assert.deepEqual(
+    reloaded.listCacheEntries().map((e) => e.key),
+    ['boot/active.pgim', 'shaders/fresh.wgsl.pack']
+  );
+});
+
+test('evictToBudget enforces deterministic LRU eviction order including touch promotion and timestamp ties', async () => {
+  let clockMs = 1000;
+  const opfsRoot = createMockOpfsDirHandle('');
+  const manager = new BrowserStorageManager({
+    storageObj: null,
+    opfsRoot,
+    indexedDBFactory: null,
+    nowFn: () => clockMs,
+  });
+
+  // Store 4 entries of 1000 bytes each with advancing timestamps.
+  await manager.putCacheEntry('chunk_1.bin', makePatternBytes(1000, 1));
+  clockMs = 2000;
+  await manager.putCacheEntry('chunk_2.bin', makePatternBytes(1000, 2));
+  clockMs = 3000;
+  await manager.putCacheEntry('chunk_3.bin', makePatternBytes(1000, 3));
+  clockMs = 4000;
+  await manager.putCacheEntry('chunk_4.bin', makePatternBytes(1000, 4));
+
+  // Access chunk_1 via getCacheEntry (promotes to MRU at t=5000) and touch chunk_2 at t=6000.
+  clockMs = 5000;
+  const hit1 = await manager.getCacheEntry('chunk_1.bin');
+  assert.equal(hit1.hit, true);
+  assert.equal(hit1.meta.lastAccessedMs, 5000);
+
+  clockMs = 6000;
+  const touched2 = await manager.touchCacheEntry('chunk_2.bin');
+  assert.equal(touched2.lastAccessedMs, 6000);
+
+  // Expected LRU order (oldest -> newest): chunk_3 (3000), chunk_4 (4000), chunk_1 (5000), chunk_2 (6000).
+  assert.deepEqual(
+    manager.listCacheEntries({ sortBy: 'lru' }).map((e) => e.key),
+    ['chunk_3.bin', 'chunk_4.bin', 'chunk_1.bin', 'chunk_2.bin']
+  );
+
+  // Evict down to 2000 bytes -> must evict chunk_3 then chunk_4 deterministically.
+  const ev = await manager.evictToBudget(2000);
+  assert.deepEqual(ev, {
+    supported: true,
+    budgetBytes: 2000,
+    beforeBytes: 4000,
+    afterBytes: 2000,
+    evictedEntries: 2,
+    evictedBytes: 2000,
+    evictedKeys: ['chunk_3.bin', 'chunk_4.bin'],
+    skippedPinnedCount: 0,
+    skippedPinnedBytes: 0,
+    budgetMet: true,
+  });
+
+  // Frozen clock tie-breaking: write 3 entries at the exact same timestamp (t=7000).
+  clockMs = 7000;
+  await manager.putCacheEntry('tie_z.bin', makePatternBytes(500, 10));
+  await manager.putCacheEntry('tie_a.bin', makePatternBytes(500, 11));
+  await manager.putCacheEntry('tie_m.bin', makePatternBytes(500, 12));
+
+  // Total is now 2000 + 1500 = 3500. Evict down to 500 -> chunk_1, chunk_2, tie_z, tie_a evicted in exact accessOrder!
+  const evTies = await manager.evictToBudget(500);
+  assert.deepEqual(evTies.evictedKeys, ['chunk_1.bin', 'chunk_2.bin', 'tie_z.bin', 'tie_a.bin']);
+  assert.equal(evTies.afterBytes, 500);
+  assert.equal(evTies.budgetMet, true);
+  assert.deepEqual(
+    manager.listCacheEntries().map((e) => e.key),
+    ['tie_m.bin']
+  );
+
+  // Invalid maxBytes rejects cleanly with RangeError.
+  await assert.rejects(() => manager.evictToBudget(-1), RangeError);
+  await assert.rejects(() => manager.evictToBudget(Number.NaN), RangeError);
+  await assert.rejects(() => manager.evictToBudget(Number.POSITIVE_INFINITY), RangeError);
+});
+
+test('evictToBudget protects pinned boot .pgim and active shader pack even at budget=0 and allows eviction after unpin', async () => {
+  let clockMs = 10000;
+  const opfsRoot = createMockOpfsDirHandle('');
+  const manager = new BrowserStorageManager({
+    storageObj: null,
+    opfsRoot,
+    indexedDBFactory: null,
+    nowFn: () => clockMs,
+  });
+
+  // Oldest entries are pinned boot PGIM and active shader pack.
+  await manager.putCacheEntry('boot/gta6_boot.pgim', makePatternBytes(3000, 1), {
+    versionKey: 'pgim-boot-v1',
+    pinned: true,
+  });
+  clockMs += 100;
+  await manager.putCacheEntry('shaders/active.wgsl.pack', makePatternBytes(2000, 2), {
+    versionKey: 'shader-active-v1',
+    pinned: false,
+  });
+  // Pin shader pack after creation via pinCacheEntry().
+  const pinRes = await manager.pinCacheEntry('shaders/active.wgsl.pack');
+  assert.equal(pinRes.found, true);
+  assert.equal(pinRes.pinned, true);
+
+  // Newer unpinned streaming chunks.
+  clockMs += 100;
+  await manager.putCacheEntry('chunks/area_a.bin', makePatternBytes(1500, 3));
+  clockMs += 100;
+  await manager.putCacheEntry('chunks/area_b.bin', makePatternBytes(1500, 4));
+
+  // Total = 8000 (5000 pinned + 3000 unpinned). Request budget=6000 -> evicts both chunks? Only area_a (8000 - 1500 = 6500 > 6000) then area_b (5000 <= 6000).
+  const ev1 = await manager.evictToBudget(6000);
+  assert.deepEqual(ev1.evictedKeys, ['chunks/area_a.bin', 'chunks/area_b.bin']);
+  assert.equal(ev1.skippedPinnedCount, 2);
+  assert.equal(ev1.skippedPinnedBytes, 5000);
+  assert.equal(ev1.afterBytes, 5000);
+  assert.equal(ev1.budgetMet, true);
+
+  // Even at maxBytes=0, pinned entries MUST survive and budgetMet reports false.
+  const evZero = await manager.evictToBudget(0);
+  assert.equal(evZero.evictedEntries, 0);
+  assert.equal(evZero.evictedBytes, 0);
+  assert.equal(evZero.skippedPinnedCount, 2);
+  assert.equal(evZero.skippedPinnedBytes, 5000);
+  assert.equal(evZero.afterBytes, 5000);
+  assert.equal(evZero.budgetMet, false);
+
+  // deleteCacheEntry with respectPinned: true also skips pinned entries.
+  const blockedDelete = await manager.deleteCacheEntry('boot/gta6_boot.pgim', {
+    respectPinned: true,
+  });
+  assert.equal(blockedDelete.removed, false);
+  assert.equal(blockedDelete.skippedPinned, true);
+
+  // Unpin shader pack and evict to 3000 -> shader pack is now evicted, boot .pgim stays!
+  const unpinRes = await manager.unpinCacheEntry('shaders/active.wgsl.pack');
+  assert.equal(unpinRes.found, true);
+  assert.equal(unpinRes.pinned, false);
+
+  const evAfterUnpin = await manager.evictToBudget(3000);
+  assert.deepEqual(evAfterUnpin.evictedKeys, ['shaders/active.wgsl.pack']);
+  assert.equal(evAfterUnpin.evictedEntries, 1);
+  assert.equal(evAfterUnpin.evictedBytes, 2000);
+  assert.equal(evAfterUnpin.afterBytes, 3000);
+  assert.equal(evAfterUnpin.budgetMet, true);
+  assert.deepEqual(
+    manager.listCacheEntries().map((e) => e.key),
+    ['boot/gta6_boot.pgim']
+  );
+});
+
+test('quota budget enforcement, maxCacheBytes auto-eviction, QuotaExceededError recovery, and getCacheStats telemetry', async () => {
+  let clockMs = 50000;
+  let dynamicUsage = 0;
+  const totalQuota = 10000;
+
+  const opfsRoot = createMockOpfsDirHandle('');
+  const storageObj = {
+    async estimate() {
+      return { usage: dynamicUsage, quota: totalQuota };
+    },
+    async persisted() {
+      return true;
+    },
+    async getDirectory() {
+      return opfsRoot;
+    },
+  };
+
+  // Configure maxCacheBytes = 4000 so putCacheEntry auto-evicts older unpinned items.
+  const manager = new BrowserStorageManager({
+    storageObj,
+    indexedDBFactory: null,
+    maxCacheBytes: 4000,
+    nowFn: () => clockMs,
+  });
+
+  await manager.putCacheEntry('boot.pgim', makePatternBytes(1500, 1), {
+    versionKey: 'v1',
+    pinned: true,
+  });
+  clockMs += 100;
+  await manager.putCacheEntry('old_chunk.bin', makePatternBytes(1500, 2));
+  clockMs += 100;
+  await manager.putCacheEntry('mid_chunk.bin', makePatternBytes(1000, 3));
+  // Total = 4000 (within maxCacheBytes).
+  assert.equal(manager.getCacheStats().entryCount, 3);
+  assert.equal(manager.getCacheStats().totalBytes, 4000);
+
+  // Writing a 1200-byte entry pushes total to 5200 -> auto-evicts old_chunk.bin (1500B), leaving 3700B <= 4000B.
+  clockMs += 100;
+  dynamicUsage = 8500; // 85% quota usage -> 'warn'
+  const autoRes = await manager.putCacheEntry('new_chunk.bin', makePatternBytes(1200, 4));
+  assert.equal(autoRes.stored, true);
+  assert.equal(autoRes.evictedEntries, 1);
+  assert.equal(autoRes.evictedBytes, 1500);
+  assert.equal(manager.getCacheEntryMeta('old_chunk.bin'), null);
+  assert.ok(manager.getCacheEntryMeta('boot.pgim'));
+  assert.ok(manager.getCacheEntryMeta('new_chunk.bin'));
+
+  const midStats = manager.getCacheStats();
+  assert.equal(midStats.entryCount, 3);
+  assert.equal(midStats.totalBytes, 3700);
+  assert.equal(midStats.pinnedCount, 1);
+  assert.equal(midStats.pinnedBytes, 1500);
+  assert.equal(midStats.evictedEntries, 1);
+  assert.equal(midStats.evictedBytes, 1500);
+  assert.equal(midStats.quotaUsagePct, 85);
+  assert.equal(midStats.budgetUsagePct, 92.5);
+  assert.equal(midStats.quotaPressure, 'warn');
+
+  // Mutating returned getCacheStats() object must not corrupt internal counters.
+  midStats.evictedEntries = 9999;
+  assert.equal(manager.getCacheStats().evictedEntries, 1);
+  assert.equal(JSON.stringify(manager.getCacheStats()).includes('boot.pgim'), false);
+
+  // Quota-aware enforceQuotaBudget(): non-cache usage = 8500 - 3700 = 4800.
+  // Target 70% of 10000 = 7000 -> allowed cache budget = 7000 - 4800 = 2200 -> evicts mid_chunk (1000) + new_chunk (1200)?
+  // 3700 - 1000 = 2700 > 2200 -> also evicts new_chunk -> 1500 <= 2200 (boot.pgim pinned survives!).
+  dynamicUsage = 8500;
+  const enforced = await manager.enforceQuotaBudget({
+    targetUsageRatio: 0.7,
+    onlyUnderPressure: true,
+  });
+  assert.equal(enforced.supported, true);
+  assert.equal(enforced.pressure, 'warn');
+  assert.equal(enforced.targetBudgetBytes, 2200);
+  assert.deepEqual(enforced.evictedKeys, ['mid_chunk.bin', 'new_chunk.bin']);
+  assert.equal(enforced.afterBytes, 1500);
+  assert.equal(enforced.budgetMet, true);
+
+  // When pressure is 'ok' and onlyUnderPressure: true, enforceQuotaBudget skips eviction.
+  dynamicUsage = 3000; // 30% -> 'ok'
+  const skipped = await manager.enforceQuotaBudget({
+    targetUsageRatio: 0.1,
+    onlyUnderPressure: true,
+  });
+  assert.equal(skipped.pressure, 'ok');
+  assert.equal(skipped.evictedEntries, 0);
+
+  // Verify overall telemetry in getStats() also captured all 3 LRU evictions.
+  assert.equal(manager.getStats().evictedEntries, 3);
+  assert.equal(manager.getStats().evictedBytes, 3700);
+  assert.equal(manager.getCacheStats().evictedEntries, 3);
+  assert.equal(manager.getCacheStats().evictedBytes, 3700);
+  assert.equal(manager.getCacheStats().quotaUsagePct, 30);
+
+  // Fallback quotaUsagePct uses maxCacheBytes when no browser quota is available.
+  const noQuotaMgr = new BrowserStorageManager({
+    storageObj: null,
+    opfsRoot: createMockOpfsDirHandle(''),
+    indexedDBFactory: null,
+    maxCacheBytes: 2000,
+    nowFn: () => clockMs,
+  });
+  await noQuotaMgr.putCacheEntry('sample.bin', makePatternBytes(500, 7));
+  assert.equal(noQuotaMgr.getCacheStats().quotaUsagePct, 25);
+  assert.equal(noQuotaMgr.getCacheStats().budgetUsagePct, 25);
+
+  // QuotaExceededError recovery during putCacheEntry evicts unpinned entries and retries once.
+  const flakyCacheDir = createMockOpfsDirHandle(DEFAULT_OPFS_CACHE_DIR);
+  let failOnceOnKey = 'incoming.pgim';
+  const origGetFileHandle = flakyCacheDir.getFileHandle.bind(flakyCacheDir);
+  flakyCacheDir.getFileHandle = async (fileName, opts) => {
+    const fh = await origGetFileHandle(fileName, opts);
+    if (fileName === failOnceOnKey) {
+      const origCreateWritable = fh.createWritable.bind(fh);
+      fh.createWritable = async () => {
+        const w = await origCreateWritable();
+        const origWrite = w.write.bind(w);
+        w.write = async (chunk) => {
+          if (failOnceOnKey === fileName) {
+            failOnceOnKey = null;
+            const err = new Error('QuotaExceededError: OPFS full');
+            err.name = 'QuotaExceededError';
+            throw err;
+          }
+          return origWrite(chunk);
+        };
+        return w;
+      };
+    }
+    return fh;
+  };
+  const flakyRoot = createMockOpfsDirHandle('', {
+    [DEFAULT_OPFS_CACHE_DIR]: flakyCacheDir,
+  });
+  const recoveryMgr = new BrowserStorageManager({
+    storageObj: null,
+    opfsRoot: flakyRoot,
+    indexedDBFactory: null,
+    nowFn: () => (clockMs += 10),
+  });
+  await recoveryMgr.putCacheEntry('evictable.bin', makePatternBytes(1024, 1));
+  await recoveryMgr.putCacheEntry('pinned.pgim', makePatternBytes(1024, 2), { pinned: true });
+  const recovered = await recoveryMgr.putCacheEntry('incoming.pgim', makePatternBytes(512, 3), {
+    versionKey: 'inc-v1',
+  });
+  assert.equal(recovered.stored, true);
+  assert.equal(recovered.quotaRecovered, true);
+  assert.equal(recovered.evictedEntries, 1);
+  assert.equal(recoveryMgr.getCacheEntryMeta('evictable.bin'), null);
+  assert.ok(recoveryMgr.getCacheEntryMeta('pinned.pgim'));
+  assert.ok(recoveryMgr.getCacheEntryMeta('incoming.pgim'));
+});
+
+test('cache management discovers pre-existing OPFS chunks, supports registerCacheEntry, and degrades cleanly without OPFS', async () => {
+  const chunkName = rangeCacheMod.opfsChunkFileName('x64b.rpf', 0, 262144);
+  const opfsRoot = createMockOpfsDirHandle('', {
+    [DEFAULT_OPFS_CACHE_DIR]: createMockOpfsDirHandle(DEFAULT_OPFS_CACHE_DIR, {
+      [chunkName]: makePatternBytes(2048, 5),
+      'legacy.bin': makePatternBytes(1024, 6),
+    }),
+  });
+
+  const manager = new BrowserStorageManager({
+    storageObj: null,
+    opfsRoot,
+    indexedDBFactory: null,
+    nowFn: () => 90000,
+  });
+
+  // Register metadata on an existing RangeCache file and pin it.
+  const reg = await manager.registerCacheEntry(chunkName, {
+    etag: '"chunk-e1"',
+    versionKey: 'rpf-v1',
+    pinned: true,
+  });
+  assert.equal(reg.supported, true);
+  assert.equal(reg.found, true);
+  assert.equal(reg.meta.sizeBytes, 2048);
+  assert.equal(reg.meta.kind, CACHE_ENTRY_KINDS.RANGE_CHUNK);
+  assert.equal(reg.meta.pinned, true);
+
+  // Evict down to 2048 -> removes untracked legacy.bin while keeping pinned chunk.
+  const ev = await manager.evictToBudget(2048);
+  assert.deepEqual(ev.evictedKeys, ['legacy.bin']);
+  assert.equal(ev.afterBytes, 2048);
+  assert.equal(ev.skippedPinnedCount, 1);
+
+  // clearOpfsCache clears metadata too and updates cache stats cleanly.
+  const cleared = await manager.clearOpfsCache();
+  assert.deepEqual(cleared, { supported: true, removedCount: 1, freedBytes: 2048 });
+  assert.equal(manager.getCacheStats().entryCount, 0);
+  assert.equal(manager.getCacheStats().totalBytes, 0);
+  assert.equal(manager.getCacheStats().evictedEntries, 2);
+  assert.equal(manager.getCacheStats().evictedBytes, 3072);
+
+  // Unsupported OPFS degrades cleanly across all new cache APIs.
+  const unsupportedMgr = new BrowserStorageManager({
+    storageObj: null,
+    opfsRoot: null,
+    indexedDBFactory: null,
+  });
+  assert.equal((await unsupportedMgr.syncCacheIndex()).supported, false);
+  assert.equal((await unsupportedMgr.putCacheEntry('a.pgim', new Uint8Array([1]))).supported, false);
+  assert.equal((await unsupportedMgr.getCacheEntry('a.pgim')).supported, false);
+  assert.equal((await unsupportedMgr.evictToBudget(1024)).supported, false);
+  assert.equal((await unsupportedMgr.enforceQuotaBudget()).supported, false);
+  assert.equal(unsupportedMgr.getCacheStats().entryCount, 0);
+  assert.equal(unsupportedMgr.getCacheStats().quotaUsagePct, 0);
 });

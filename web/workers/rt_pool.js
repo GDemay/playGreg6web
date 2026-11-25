@@ -8,8 +8,19 @@
 (function (root) {
   const DEFAULT_MAX_POOL_BYTES = 512 * 1024 * 1024; // 512 MiB (accommodates simultaneous 4K scene plane 1 + 1080p UI plane 0)
   const DEFAULT_IDLE_FRAME_TTL = 8;
+  const DEFAULT_OVERSIZED_TARGET_BYTES = 24 * 1024 * 1024; // 24 MiB (separates 4K targets >= 31.6 MiB from 1080p targets <= 15.8 MiB)
   const DEFAULT_MAX_TEXTURE_DIMENSION_2D = 8192;
   const DEFAULT_MAX_TEXTURE_ARRAY_LAYERS = 256;
+
+  const VALID_VIEW_DIMENSIONS = Object.freeze([
+    '1d',
+    '2d',
+    '2d-array',
+    'cube',
+    'cube-array',
+    '3d',
+  ]);
+  const VALID_VIEW_ASPECTS = Object.freeze(['all', 'stencil-only', 'depth-only']);
 
   // WebGPU GPUTextureUsage bitmask values with headless/Node fallbacks.
   const TEXTURE_USAGE = Object.freeze({
@@ -693,6 +704,128 @@
   }
 
   /**
+   * Build a canonical deterministic cache key and WebGPU `GPUTextureViewDescriptor`
+   * for a texture view request. Default/empty descriptors collapse to `{ isDefault: true }`
+   * so callers reuse the cached default `GPUTextureView` with zero extra `createView()` calls.
+   *
+   * @param {object | null | undefined} viewDesc
+   * @param {string} [baseFormat]
+   * @returns {{ isDefault: boolean, key: string, descriptor: object | null }}
+   */
+  function makeTextureViewKey(viewDesc, baseFormat) {
+    if (viewDesc === undefined || viewDesc === null) {
+      return { isDefault: true, key: 'default', descriptor: null };
+    }
+    if (typeof viewDesc !== 'object' || Array.isArray(viewDesc)) {
+      throw new TypeError('viewDesc must be an object when provided');
+    }
+
+    const canonicalBase =
+      typeof baseFormat === 'string' && baseFormat.trim().length > 0
+        ? _normalizeFormatWithMeta(baseFormat).format
+        : null;
+
+    let format = null;
+    if (viewDesc.format !== undefined && viewDesc.format !== null) {
+      const normalizedFormat = _normalizeFormatWithMeta(viewDesc.format).format;
+      if (canonicalBase === null || normalizedFormat !== canonicalBase) {
+        format = normalizedFormat;
+      }
+    }
+
+    let dimension = null;
+    if (viewDesc.dimension !== undefined && viewDesc.dimension !== null) {
+      dimension = String(viewDesc.dimension).trim().toLowerCase();
+      if (!VALID_VIEW_DIMENSIONS.includes(dimension)) {
+        throw new RangeError(
+          `Unsupported texture view dimension "${viewDesc.dimension}"; expected one of: ${VALID_VIEW_DIMENSIONS.join(', ')}`
+        );
+      }
+    }
+
+    let aspect = 'all';
+    if (viewDesc.aspect !== undefined && viewDesc.aspect !== null) {
+      aspect = String(viewDesc.aspect).trim().toLowerCase();
+      if (!VALID_VIEW_ASPECTS.includes(aspect)) {
+        throw new RangeError(
+          `Unsupported texture view aspect "${viewDesc.aspect}"; expected one of: ${VALID_VIEW_ASPECTS.join(', ')}`
+        );
+      }
+    }
+
+    const baseMipLevel = viewDesc.baseMipLevel === undefined ? 0 : viewDesc.baseMipLevel;
+    assertNonNegativeInteger(baseMipLevel, 'baseMipLevel');
+
+    let mipLevelCount;
+    if (viewDesc.mipLevelCount !== undefined) {
+      assertPositiveInteger(viewDesc.mipLevelCount, 'mipLevelCount');
+      mipLevelCount = viewDesc.mipLevelCount;
+    }
+
+    const baseArrayLayer = viewDesc.baseArrayLayer === undefined ? 0 : viewDesc.baseArrayLayer;
+    assertNonNegativeInteger(baseArrayLayer, 'baseArrayLayer');
+
+    let arrayLayerCount;
+    if (viewDesc.arrayLayerCount !== undefined) {
+      assertPositiveInteger(viewDesc.arrayLayerCount, 'arrayLayerCount');
+      arrayLayerCount = viewDesc.arrayLayerCount;
+    }
+
+    const usage = viewDesc.usage === undefined ? 0 : viewDesc.usage;
+    assertNonNegativeInteger(usage, 'usage');
+
+    const isDefault =
+      format === null &&
+      dimension === null &&
+      aspect === 'all' &&
+      baseMipLevel === 0 &&
+      mipLevelCount === undefined &&
+      baseArrayLayer === 0 &&
+      arrayLayerCount === undefined &&
+      usage === 0;
+
+    if (isDefault) {
+      return { isDefault: true, key: 'default', descriptor: null };
+    }
+
+    const descriptor = {};
+    if (format !== null) {
+      descriptor.format = format;
+    }
+    if (dimension !== null) {
+      descriptor.dimension = dimension;
+    }
+    if (aspect !== 'all') {
+      descriptor.aspect = aspect;
+    }
+    if (baseMipLevel !== 0) {
+      descriptor.baseMipLevel = baseMipLevel;
+    }
+    if (mipLevelCount !== undefined) {
+      descriptor.mipLevelCount = mipLevelCount;
+    }
+    if (baseArrayLayer !== 0) {
+      descriptor.baseArrayLayer = baseArrayLayer;
+    }
+    if (arrayLayerCount !== undefined) {
+      descriptor.arrayLayerCount = arrayLayerCount;
+    }
+    if (usage !== 0) {
+      descriptor.usage = usage;
+    }
+    if (typeof viewDesc.label === 'string' && viewDesc.label.length > 0) {
+      descriptor.label = viewDesc.label;
+    }
+
+    const key =
+      `f=${format || ''}|d=${dimension || ''}|a=${aspect}|` +
+      `bm=${baseMipLevel}|mc=${mipLevelCount === undefined ? '' : mipLevelCount}|` +
+      `bl=${baseArrayLayer}|lc=${arrayLayerCount === undefined ? '' : arrayLayerCount}|u=${usage}`;
+
+    return { isDefault: false, key, descriptor };
+  }
+
+  /**
    * Estimate VRAM footprint in bytes for a WebGPU render target descriptor,
    * accounting for format texel size, full mip chain, array layers / 3D depth,
    * and MSAA `sampleCount`.
@@ -749,13 +882,30 @@
 
       const {
         device,
-        maxPoolBytes = DEFAULT_MAX_POOL_BYTES,
-        idleFrameTtl = DEFAULT_IDLE_FRAME_TTL,
+        maxPoolBytes: rawMaxPoolBytes,
+        maxVramBytes,
+        idleFrameTtl: rawIdleFrameTtl,
+        maxIdleFrames,
+        oversizedTargetBytes = DEFAULT_OVERSIZED_TARGET_BYTES,
+        oversizedIdleFrameTtl = null,
         strictBudget = true,
         autoReleaseLeaked = true,
         onLeak = null,
         warn = null,
       } = options;
+
+      const maxPoolBytes =
+        rawMaxPoolBytes !== undefined
+          ? rawMaxPoolBytes
+          : maxVramBytes !== undefined
+            ? maxVramBytes
+            : DEFAULT_MAX_POOL_BYTES;
+      const idleFrameTtl =
+        rawIdleFrameTtl !== undefined
+          ? rawIdleFrameTtl
+          : maxIdleFrames !== undefined
+            ? maxIdleFrames
+            : DEFAULT_IDLE_FRAME_TTL;
 
       if (!device || typeof device.createTexture !== 'function') {
         throw new TypeError('RenderTargetPool requires a WebGPU device with createTexture()');
@@ -768,6 +918,18 @@
       }
       assertNonNegativeInteger(idleFrameTtl, 'idleFrameTtl');
 
+      if (
+        oversizedTargetBytes !== Infinity &&
+        (!Number.isInteger(oversizedTargetBytes) || oversizedTargetBytes < 1)
+      ) {
+        throw new RangeError(
+          `oversizedTargetBytes must be a positive integer or Infinity, got ${oversizedTargetBytes}`
+        );
+      }
+      if (oversizedIdleFrameTtl !== null && oversizedIdleFrameTtl !== undefined) {
+        assertNonNegativeInteger(oversizedIdleFrameTtl, 'oversizedIdleFrameTtl');
+      }
+
       if (onLeak !== null && typeof onLeak !== 'function') {
         throw new TypeError('onLeak must be a function when provided');
       }
@@ -778,6 +940,9 @@
       this._device = device;
       this._maxPoolBytes = maxPoolBytes;
       this._idleFrameTtl = idleFrameTtl;
+      this._oversizedTargetBytes = oversizedTargetBytes;
+      this._oversizedIdleFrameTtl =
+        oversizedIdleFrameTtl === undefined ? null : oversizedIdleFrameTtl;
       this._strictBudget = Boolean(strictBudget);
       this._autoReleaseLeaked = Boolean(autoReleaseLeaked);
       this._onLeak = onLeak;
@@ -807,6 +972,9 @@
       // Telemetry counters
       this._hits = 0;
       this._misses = 0;
+      this._viewsCached = 0;
+      this._viewCacheHits = 0;
+      this._viewCacheMisses = 0;
       this._activeBytes = 0;
       this._idleBytes = 0;
       this._peakBytes = 0;
@@ -829,6 +997,14 @@
 
     get idleFrameTtl() {
       return this._idleFrameTtl;
+    }
+
+    get oversizedTargetBytes() {
+      return this._oversizedTargetBytes;
+    }
+
+    get oversizedIdleFrameTtl() {
+      return this._oversizedIdleFrameTtl;
     }
 
     get currentFrame() {
@@ -909,11 +1085,85 @@
       record.leaseToken = 0;
       this._allEntries.delete(record.id);
 
+      const removedViews =
+        (record.view !== null ? 1 : 0) + (record.viewCache ? record.viewCache.size : 0);
+      if (removedViews > 0) {
+        this._viewsCached = Math.max(0, this._viewsCached - removedViews);
+      }
+
       const tex = record.texture;
       record.texture = null;
       record.view = null;
+      if (record.viewCache) {
+        record.viewCache.clear();
+      }
       this._destroyTextureSafely(tex);
       return true;
+    }
+
+    _getOrCreateRecordView(record, viewDesc) {
+      if (!this._isRecordTextureAlive(record)) {
+        return null;
+      }
+      const normalized = makeTextureViewKey(viewDesc, record.desc.format);
+      if (normalized.isDefault) {
+        if (record.view !== null) {
+          this._viewCacheHits += 1;
+        }
+        return record.view;
+      }
+      if (!record.viewCache) {
+        record.viewCache = new Map();
+      }
+      if (record.viewCache.has(normalized.key)) {
+        this._viewCacheHits += 1;
+        return record.viewCache.get(normalized.key);
+      }
+      if (typeof record.texture.createView !== 'function') {
+        return null;
+      }
+      const subView = record.texture.createView(normalized.descriptor);
+      if (subView === null || subView === undefined) {
+        return null;
+      }
+      record.viewCache.set(normalized.key, subView);
+      this._viewsCached += 1;
+      this._viewCacheMisses += 1;
+      return subView;
+    }
+
+    _resolveEntryId(entryOrId, methodName) {
+      if (entryOrId === null || entryOrId === undefined) {
+        throw new TypeError(`${methodName}() requires an acquired entry object or numeric id`);
+      }
+
+      if (typeof entryOrId === 'number') {
+        if (!Number.isInteger(entryOrId) || entryOrId < 1) {
+          throw new TypeError(`${methodName}() id must be a positive integer, got ${entryOrId}`);
+        }
+        return { id: entryOrId, expectedLeaseToken: null };
+      }
+      if (typeof entryOrId === 'object') {
+        const tokenInfo = this._handleTokens.get(entryOrId);
+        if (tokenInfo) {
+          return { id: tokenInfo.id, expectedLeaseToken: tokenInfo.leaseToken };
+        }
+        if (Number.isInteger(entryOrId.id) && entryOrId.id >= 1) {
+          return { id: entryOrId.id, expectedLeaseToken: null };
+        }
+        throw new TypeError(`${methodName}() entry object must have a valid positive integer id`);
+      }
+      throw new TypeError(`${methodName}() requires an acquired entry object or numeric id`);
+    }
+
+    _effectiveIdleTtlForRecord(record) {
+      if (
+        this._oversizedIdleFrameTtl !== null &&
+        record.byteSize >= this._oversizedTargetBytes
+      ) {
+        return Math.min(this._idleFrameTtl, this._oversizedIdleFrameTtl);
+      }
+      return this._idleFrameTtl;
     }
 
     _evictIdleRecord(record, reason = null) {
@@ -968,6 +1218,101 @@
       return this._evictIdleToBudget(this._maxPoolBytes, 0);
     }
 
+    /**
+     * Reconfigure the pool's idle-frame expiration threshold (`idleFrameTtl`) at runtime
+     * and immediately evict any idle targets already past the new TTL.
+     * Never destroys currently checked-out/active targets.
+     *
+     * @param {number} idleFrameTtl Non-negative integer frame threshold.
+     * @returns {{ evictedCount: number, evictedBytes: number }}
+     */
+    setIdleFrameTtl(idleFrameTtl) {
+      this._assertNotDestroyed();
+      assertNonNegativeInteger(idleFrameTtl, 'idleFrameTtl');
+      this._idleFrameTtl = idleFrameTtl;
+
+      let evictedCount = 0;
+      let evictedBytes = 0;
+      const idleRecords = Array.from(this._idleLru.values());
+      for (let i = 0; i < idleRecords.length; i += 1) {
+        const record = idleRecords[i];
+        const effectiveTtl = this._effectiveIdleTtlForRecord(record);
+        if (this._currentFrame - record.lastUsedFrame > effectiveTtl) {
+          const bytes = record.byteSize;
+          if (this._evictIdleRecord(record, 'idle')) {
+            evictedCount += 1;
+            evictedBytes += bytes;
+          }
+        }
+      }
+      return { evictedCount, evictedBytes };
+    }
+
+    /**
+     * Configure faster idle-frame eviction for oversized transient render targets
+     * (e.g., unused 4K intro/scene targets during intro -> Start Screen -> menu transitions)
+     * and immediately evict any idle oversized targets already past the new TTL.
+     *
+     * @param {{ oversizedTargetBytes?: number, oversizedIdleFrameTtl?: number | null }} [options]
+     * @returns {{ evictedCount: number, evictedBytes: number }}
+     */
+    setOversizedEvictionPolicy(options = {}) {
+      this._assertNotDestroyed();
+      if (!options || typeof options !== 'object') {
+        throw new TypeError('setOversizedEvictionPolicy() expects an options object');
+      }
+      if (options.oversizedTargetBytes !== undefined) {
+        if (
+          options.oversizedTargetBytes !== Infinity &&
+          (!Number.isInteger(options.oversizedTargetBytes) || options.oversizedTargetBytes < 1)
+        ) {
+          throw new RangeError(
+            `oversizedTargetBytes must be a positive integer or Infinity, got ${options.oversizedTargetBytes}`
+          );
+        }
+        this._oversizedTargetBytes = options.oversizedTargetBytes;
+      }
+      if (options.oversizedIdleFrameTtl !== undefined) {
+        if (options.oversizedIdleFrameTtl !== null) {
+          assertNonNegativeInteger(options.oversizedIdleFrameTtl, 'oversizedIdleFrameTtl');
+        }
+        this._oversizedIdleFrameTtl = options.oversizedIdleFrameTtl;
+      }
+
+      let evictedCount = 0;
+      let evictedBytes = 0;
+      const idleRecords = Array.from(this._idleLru.values());
+      for (let i = 0; i < idleRecords.length; i += 1) {
+        const record = idleRecords[i];
+        const effectiveTtl = this._effectiveIdleTtlForRecord(record);
+        if (this._currentFrame - record.lastUsedFrame > effectiveTtl) {
+          const bytes = record.byteSize;
+          if (this._evictIdleRecord(record, 'idle')) {
+            evictedCount += 1;
+            evictedBytes += bytes;
+          }
+        }
+      }
+      return { evictedCount, evictedBytes };
+    }
+
+    /**
+     * LRU-evict idle targets until total pooled VRAM is at most `targetBytes`
+     * without changing `maxPoolBytes` or destroying active targets.
+     *
+     * @param {number} [targetBytes=this._maxPoolBytes] Non-negative integer or Infinity.
+     * @returns {{ evictedCount: number, evictedBytes: number }}
+     */
+    trimToBudget(targetBytes = this._maxPoolBytes) {
+      this._assertNotDestroyed();
+      if (targetBytes !== Infinity && (!Number.isInteger(targetBytes) || targetBytes < 0)) {
+        throw new RangeError(
+          `targetBytes must be a non-negative integer or Infinity, got ${targetBytes}`
+        );
+      }
+      return this._evictIdleToBudget(targetBytes, 0);
+    }
+
     _retireActiveRecord(record) {
       record.active = false;
       record.leaseToken = 0;
@@ -1009,6 +1354,9 @@
         texture: textureRef,
         get view() {
           return pool._isRecordTextureAlive(record) ? record.view : null;
+        },
+        getView(viewDesc) {
+          return pool._getOrCreateRecordView(record, viewDesc);
         },
         get destroyed() {
           return !pool._isRecordTextureAlive(record);
@@ -1084,6 +1432,9 @@
           this._idleBytes = Math.max(0, this._idleBytes - record.byteSize);
           this._activeBytes += record.byteSize;
           this._hits += 1;
+          if (record.view !== null) {
+            this._viewCacheHits += 1;
+          }
 
           if (sanitized.dimensionClamped) {
             this._dimensionClampCount += 1;
@@ -1153,6 +1504,7 @@
         texture,
         view,
         hasView: view !== null,
+        viewCache: new Map(),
         byteSize,
         active: true,
         destroyed: false,
@@ -1165,6 +1517,10 @@
       this._activeEntries.set(id, record);
       this._activeBytes += byteSize;
       this._misses += 1;
+      if (view !== null) {
+        this._viewsCached += 1;
+        this._viewCacheMisses += 1;
+      }
 
       if (sanitized.dimensionClamped) {
         this._dimensionClampCount += 1;
@@ -1185,6 +1541,30 @@
     }
 
     /**
+     * Retrieve a cached `GPUTextureView` for a pooled render target.
+     * Omitting `viewDesc` (or passing an empty/default descriptor) returns the cached
+     * default view with 0 `createView()` calls; custom descriptors (e.g. sRGB format,
+     * depth-only/stencil-only aspect, or mip/layer slices) are cached per target and
+     * invalidated cleanly upon eviction or destruction.
+     *
+     * @param {object | number} entryOrId
+     * @param {object | null} [viewDesc]
+     * @returns {GPUTextureView | null}
+     */
+    getView(entryOrId, viewDesc) {
+      this._assertNotDestroyed();
+      const { id, expectedLeaseToken } = this._resolveEntryId(entryOrId, 'getView');
+      const record = this._allEntries.get(id);
+      if (!record || !this._isRecordTextureAlive(record)) {
+        return null;
+      }
+      if (expectedLeaseToken !== null && record.active && record.leaseToken !== expectedLeaseToken) {
+        return null;
+      }
+      return this._getOrCreateRecordView(record, viewDesc);
+    }
+
+    /**
      * Mark an acquired render target available for immediate aliasing within the same frame
      * (or subsequent frames). If the target was invalidated during a resize while in flight
      * (or externally destroyed), it is retired and destroyed cleanly instead of re-entering
@@ -1196,31 +1576,7 @@
     release(entryOrId) {
       this._assertNotDestroyed();
 
-      if (entryOrId === null || entryOrId === undefined) {
-        throw new TypeError('release() requires an acquired entry object or numeric id');
-      }
-
-      let id;
-      let expectedLeaseToken = null;
-
-      if (typeof entryOrId === 'number') {
-        if (!Number.isInteger(entryOrId) || entryOrId < 1) {
-          throw new TypeError(`release() id must be a positive integer, got ${entryOrId}`);
-        }
-        id = entryOrId;
-      } else if (typeof entryOrId === 'object') {
-        const tokenInfo = this._handleTokens.get(entryOrId);
-        if (tokenInfo) {
-          id = tokenInfo.id;
-          expectedLeaseToken = tokenInfo.leaseToken;
-        } else if (Number.isInteger(entryOrId.id) && entryOrId.id >= 1) {
-          id = entryOrId.id;
-        } else {
-          throw new TypeError('release() entry object must have a valid positive integer id');
-        }
-      } else {
-        throw new TypeError('release() requires an acquired entry object or numeric id');
-      }
+      const { id, expectedLeaseToken } = this._resolveEntryId(entryOrId, 'release');
 
       const record = this._allEntries.get(id);
       if (!record || !record.active) {
@@ -1317,11 +1673,13 @@
         }
       }
 
-      // Evict idle textures unused for more than idleFrameTtl frames or no longer reusable.
+      // Evict idle textures unused for more than their effective idleFrameTtl (or oversizedIdleFrameTtl)
+      // or no longer reusable.
       const idleRecords = Array.from(this._idleLru.values());
       for (let i = 0; i < idleRecords.length; i += 1) {
         const record = idleRecords[i];
-        const expired = this._currentFrame - record.lastUsedFrame > this._idleFrameTtl;
+        const effectiveTtl = this._effectiveIdleTtlForRecord(record);
+        const expired = this._currentFrame - record.lastUsedFrame > effectiveTtl;
         if (expired || !this._isRecordReusable(record)) {
           if (this._evictIdleRecord(record, expired ? 'idle' : null)) {
             evictedCount += 1;
@@ -1348,25 +1706,42 @@
 
     /**
      * Explicitly destroy and remove non-acquired (idle) pooled render targets whose
-     * idle age satisfies `currentFrame - entry.lastUsedFrame >= maxIdleFrames`.
+     * idle age satisfies `currentFrame - entry.lastUsedFrame >= maxIdleFrames`
+     * (and optionally whose `byteSize >= options.minBytes`).
      * Never evicts currently acquired/in-use targets.
      *
      * @param {number} [maxIdleFrames=this._idleFrameTtl] Non-negative integer frame threshold.
+     * @param {{ minBytes?: number } | null} [options]
      * @returns {{ evictedCount: number, evictedBytes: number }}
      */
-    evictIdle(maxIdleFrames = this._idleFrameTtl) {
+    evictIdle(maxIdleFrames = this._idleFrameTtl, options = null) {
       this._assertNotDestroyed();
       assertNonNegativeInteger(maxIdleFrames, 'maxIdleFrames');
+
+      let minBytes = 0;
+      if (options !== null && options !== undefined) {
+        if (typeof options !== 'object') {
+          throw new TypeError('evictIdle() options must be an object when provided');
+        }
+        if (options.minBytes !== undefined) {
+          assertNonNegativeInteger(options.minBytes, 'minBytes');
+          minBytes = options.minBytes;
+        }
+      }
 
       let evictedCount = 0;
       let evictedBytes = 0;
       const idleRecords = Array.from(this._idleLru.values());
       for (let i = 0; i < idleRecords.length; i += 1) {
         const record = idleRecords[i];
-        if (this._currentFrame - record.lastUsedFrame >= maxIdleFrames) {
+        if (
+          this._currentFrame - record.lastUsedFrame >= maxIdleFrames &&
+          record.byteSize >= minBytes
+        ) {
+          const bytes = record.byteSize;
           if (this._evictIdleRecord(record, 'idle')) {
             evictedCount += 1;
-            evictedBytes += record.byteSize;
+            evictedBytes += bytes;
           }
         }
       }
@@ -1430,6 +1805,9 @@
         misses: this._misses,
         poolHits: this._hits,
         poolMisses: this._misses,
+        viewsCached: this._viewsCached,
+        viewCacheHits: this._viewCacheHits,
+        viewCacheMisses: this._viewCacheMisses,
         hitRate,
         reuseRatio: hitRate,
         activeCount: this._activeEntries.size,
@@ -1440,10 +1818,15 @@
         idleBytes: this._idleBytes,
         totalBytes,
         estimatedBytes: totalBytes,
+        estimatedVramBytes: totalBytes,
         peakBytes: this._peakBytes,
         peakPooledBytes: this._peakBytes,
         peakEstimatedBytes: this._peakBytes,
+        peakVramBytes: this._peakBytes,
         maxPoolBytes: this._maxPoolBytes,
+        idleFrameTtl: this._idleFrameTtl,
+        oversizedTargetBytes: this._oversizedTargetBytes,
+        oversizedIdleFrameTtl: this._oversizedIdleFrameTtl,
         evictions: this._evictions,
         budgetEvictions: this._budgetEvictions,
         idleEvictions: this._idleEvictions,
@@ -1478,6 +1861,7 @@
       this._idleLru.clear();
       this._activeBytes = 0;
       this._idleBytes = 0;
+      this._viewsCached = 0;
       this._device = null;
     }
   }
@@ -1485,6 +1869,7 @@
   const exportsObj = Object.freeze({
     DEFAULT_MAX_POOL_BYTES,
     DEFAULT_IDLE_FRAME_TTL,
+    DEFAULT_OVERSIZED_TARGET_BYTES,
     DEFAULT_MAX_TEXTURE_DIMENSION_2D,
     TEXTURE_USAGE,
     DEFAULT_TEXTURE_USAGE,
@@ -1498,6 +1883,7 @@
     sanitizeRenderTargetDesc,
     normalizeRenderTargetDesc,
     makeRenderTargetKey,
+    makeTextureViewKey,
     estimateRenderTargetBytes,
     RenderTargetPool,
   });

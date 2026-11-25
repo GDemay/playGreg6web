@@ -46,6 +46,22 @@ const GPU_TELEMETRY_FIELD_KEYS = Object.freeze([
   'skipped_draw_count',
   'validationErrorCount',
   'validation_error_count',
+  'onePercentLowFps',
+  'one_percent_low_fps',
+  'fps1PercentLow',
+  'low1PercentFps',
+  'p99FrameMs',
+  'p99_frame_ms',
+  'p99FrameTimeMs',
+  'p99_frame_time_ms',
+  'zeroCopyUploads',
+  'zero_copy_uploads',
+  'binkZeroCopyUploads',
+  'bink_zero_copy_uploads',
+  'zeroCopyFramesForwarded',
+  'zero_copy_frames_forwarded',
+  'zeroCopyFrames',
+  'binkZeroCopyFrames',
 ]);
 
 const AUDIO_TELEMETRY_FIELD_KEYS = Object.freeze([
@@ -81,6 +97,7 @@ const PTHREAD_TELEMETRY_FIELD_KEYS = Object.freeze([
 export const DEFAULT_MAX_VALIDATION_ERRORS = 32;
 export const MAX_VALIDATION_ERROR_MESSAGE_LENGTH = 256;
 export const DEFAULT_TOGGLE_KEY = 'F3';
+export const DEFAULT_MIN_RENDER_INTERVAL_MS = 0;
 const SCRIPTED_INPUT_PRESET_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/i;
 const MAX_SIDE_MODULE_NAMES = 64;
 const SIDE_MODULE_LAYOUT_RE =
@@ -165,6 +182,10 @@ const SUPPORTED_DISPLAY_ELEMENTS = Object.freeze([
   'framesEl',
   'fpsEl',
   'pillFpsEl',
+  'onePercentLowFpsEl',
+  'p99FrameMsEl',
+  'zeroCopyUploadsEl',
+  'binkZeroCopyEl',
   'bootStageEl',
   'bootProgressBarEl',
   'bootProgressFillEl',
@@ -511,6 +532,100 @@ export function formatFpsDisplay(fps) {
   return value >= 10 ? Math.round(value).toString() : value.toFixed(1);
 }
 
+/**
+ * Formats a 1%-low FPS telemetry value for HUD display (e.g. `'1% low: 54 fps'`,
+ * `'1% low: 8.5 fps'`). Returns `''` when absent or invalid.
+ *
+ * @param {unknown} fps
+ * @returns {string}
+ */
+export function formatOnePercentLowFps(fps) {
+  const value = toNonNegativeFiniteNumber(fps, null);
+  if (value === null) {
+    return '';
+  }
+  return `1% low: ${formatFpsDisplay(value)} fps`;
+}
+
+/**
+ * Formats a p99 frame time in milliseconds for HUD display (e.g. `'p99: 18.4 ms'`).
+ * Returns `''` when absent or invalid.
+ *
+ * @param {unknown} frameMs
+ * @returns {string}
+ */
+export function formatP99FrameMs(frameMs) {
+  const value = toNonNegativeFiniteNumber(frameMs, null);
+  if (value === null) {
+    return '';
+  }
+  return `p99: ${value.toFixed(1)} ms`;
+}
+
+/**
+ * Formats a Bink2 zero-copy texture upload counter for HUD display
+ * (e.g. `'Bink2 zero-copy: 120'`). Returns `''` when absent or invalid.
+ *
+ * @param {unknown} uploads
+ * @returns {string}
+ */
+export function formatZeroCopyUploads(uploads) {
+  const value = toNonNegativeInt(uploads, null);
+  if (value === null) {
+    return '';
+  }
+  return `Bink2 zero-copy: ${value}`;
+}
+
+/**
+ * Formats a combined single-line summary of optional frame-pacing & Bink2
+ * zero-copy telemetry (`onePercentLowFps`, `p99FrameMs`, `zeroCopyUploads`),
+ * cleanly omitting any unset or invalid metrics.
+ *
+ * @param {object|null|undefined} metrics
+ * @returns {string}
+ */
+export function formatPerfMetricsSummary(metrics) {
+  if (!isPlainObject(metrics)) {
+    return '';
+  }
+  const source = isPlainObject(safeGet(metrics, 'gpu')) ? safeGet(metrics, 'gpu') : metrics;
+  const parts = [];
+  const lowText = formatOnePercentLowFps(
+    pickFirstDefined(source, [
+      'onePercentLowFps',
+      'one_percent_low_fps',
+      'fps1PercentLow',
+      'low1PercentFps',
+    ])
+  );
+  if (lowText) {
+    parts.push(lowText);
+  }
+  const p99Text = formatP99FrameMs(
+    pickFirstDefined(source, ['p99FrameMs', 'p99_frame_ms', 'p99FrameTimeMs', 'p99_frame_time_ms'])
+  );
+  if (p99Text) {
+    parts.push(p99Text);
+  }
+  const zeroCopyText = formatZeroCopyUploads(
+    pickFirstDefined(source, [
+      'zeroCopyUploads',
+      'zero_copy_uploads',
+      'binkZeroCopyUploads',
+      'bink_zero_copy_uploads',
+      'zeroCopyFramesForwarded',
+      'zero_copy_frames_forwarded',
+      'zeroCopyFrames',
+      'binkZeroCopyFrames',
+    ])
+  );
+  if (zeroCopyText) {
+    parts.push(zeroCopyText);
+  }
+  return parts.join(' · ');
+}
+
 function formatElapsedSeconds(ms) {
   const clamped = typeof ms === 'number' && Number.isFinite(ms) && ms > 0 ? ms : 0;
   return `${(clamped / 1000).toFixed(1)}s`;
@@ -702,6 +817,9 @@ function createInitialGpuTelemetry() {
     unboundBindGroupCount: 0,
     skippedDrawCount: 0,
     validationErrorCount: 0,
+    onePercentLowFps: null,
+    p99FrameMs: null,
+    zeroCopyUploads: null,
     updatedAtMs: null,
   };
 }
@@ -809,66 +927,181 @@ export function parseSideModuleProgressLabel(raw) {
   return null;
 }
 
-function safeSetText(el, text) {
-  if (!el || typeof el !== 'object') return;
+/**
+ * Dirty-checked DOM text write helper. Skips writing `el.textContent` when the
+ * element already holds the exact target string, preventing unnecessary browser
+ * style/layout invalidation churn. Optionally updates `{ domWrites, domWritesElided }`.
+ *
+ * @param {object|null|undefined} el
+ * @param {unknown} text
+ * @param {{ domWrites: number, domWritesElided: number }|null} [stats=null]
+ * @returns {boolean} `true` if a DOM write occurred, `false` if elided or unavailable.
+ */
+export function setTextIfChanged(el, text, stats = null) {
+  if (!el || typeof el !== 'object') return false;
+  const next = String(text ?? '');
+  let hasCurrent = false;
+  let current;
   try {
-    el.textContent = String(text ?? '');
+    current = el.textContent;
+    hasCurrent = typeof current === 'string';
+  } catch {
+    hasCurrent = false;
+  }
+  if (hasCurrent && current === next) {
+    if (stats) stats.domWritesElided += 1;
+    return false;
+  }
+  try {
+    el.textContent = next;
+    if (stats) stats.domWrites += 1;
+    return true;
   } catch {
     // Ignore read-only mock properties.
+    return false;
   }
 }
 
-function safeSetTitle(el, title) {
-  if (!el || typeof el !== 'object') return;
+function safeSetText(el, text, stats = null) {
+  return setTextIfChanged(el, text, stats);
+}
+
+function safeSetTitle(el, title, stats = null) {
+  if (!el || typeof el !== 'object') return false;
+  const next = String(title ?? '');
+  let hasCurrent = false;
+  let current;
   try {
-    el.title = String(title ?? '');
+    current = el.title;
+    hasCurrent = typeof current === 'string';
+  } catch {
+    hasCurrent = false;
+  }
+  if (hasCurrent && current === next) {
+    if (stats) stats.domWritesElided += 1;
+    return false;
+  }
+  try {
+    el.title = next;
+    if (stats) stats.domWrites += 1;
+    return true;
   } catch {
     // Ignore read-only mock properties.
+    return false;
   }
 }
 
-function safeSetHidden(el, hidden) {
-  if (!el || typeof el !== 'object') return;
+function safeSetHidden(el, hidden, stats = null) {
+  if (!el || typeof el !== 'object') return false;
+  const next = Boolean(hidden);
+  let hasCurrent = false;
+  let current;
   try {
-    el.hidden = Boolean(hidden);
+    current = el.hidden;
+    hasCurrent = typeof current === 'boolean';
+  } catch {
+    hasCurrent = false;
+  }
+  if (hasCurrent && current === next) {
+    if (stats) stats.domWritesElided += 1;
+    return false;
+  }
+  try {
+    el.hidden = next;
+    if (stats) stats.domWrites += 1;
+    return true;
   } catch {
     // Ignore read-only mock properties.
+    return false;
   }
 }
 
-function safeSetDataset(el, key, value) {
-  if (!el || typeof el !== 'object') return;
+function hasDatasetKey(el, key) {
+  if (!el || typeof el !== 'object') return false;
+  try {
+    return Boolean(
+      el.dataset &&
+        typeof el.dataset === 'object' &&
+        Object.prototype.hasOwnProperty.call(el.dataset, key) &&
+        el.dataset[key] !== undefined
+    );
+  } catch {
+    return false;
+  }
+}
+
+function safeSetDataset(el, key, value, stats = null) {
+  if (!el || typeof el !== 'object') return false;
   try {
     if (el.dataset && typeof el.dataset === 'object') {
       if (value === '' || value === null || value === undefined) {
+        if (
+          !Object.prototype.hasOwnProperty.call(el.dataset, key) ||
+          el.dataset[key] === undefined
+        ) {
+          if (stats) stats.domWritesElided += 1;
+          return false;
+        }
         delete el.dataset[key];
-      } else {
-        el.dataset[key] = String(value);
+        if (stats) stats.domWrites += 1;
+        return true;
       }
+      const next = String(value);
+      if (el.dataset[key] === next) {
+        if (stats) stats.domWritesElided += 1;
+        return false;
+      }
+      el.dataset[key] = next;
+      if (stats) stats.domWrites += 1;
+      return true;
     }
   } catch {
     // Ignore DOM dataset update errors on lightweight mocks.
   }
+  return false;
 }
 
-function safeSetAttribute(el, name, value) {
-  if (!el || typeof el !== 'object' || typeof el.setAttribute !== 'function') return;
+function safeSetAttribute(el, name, value, stats = null) {
+  if (!el || typeof el !== 'object' || typeof el.setAttribute !== 'function') return false;
+  const next = String(value);
+  if (typeof el.getAttribute === 'function') {
+    try {
+      const current = el.getAttribute(name);
+      if (current === next) {
+        if (stats) stats.domWritesElided += 1;
+        return false;
+      }
+    } catch {
+      // Ignore getAttribute errors and attempt write below.
+    }
+  }
   try {
-    el.setAttribute(name, String(value));
+    el.setAttribute(name, next);
+    if (stats) stats.domWrites += 1;
+    return true;
   } catch {
     // Ignore DOM attribute update errors on lightweight mocks.
+    return false;
   }
 }
 
-function safeSetStyleWidth(el, width) {
-  if (!el || typeof el !== 'object') return;
+function safeSetStyleWidth(el, width, stats = null) {
+  if (!el || typeof el !== 'object') return false;
+  const next = String(width);
   try {
     if (el.style && typeof el.style === 'object') {
-      el.style.width = String(width);
+      if (el.style.width === next) {
+        if (stats) stats.domWritesElided += 1;
+        return false;
+      }
+      el.style.width = next;
+      if (stats) stats.domWrites += 1;
+      return true;
     }
   } catch {
     // Ignore DOM style update errors on lightweight mocks.
   }
+  return false;
 }
 
 /**
@@ -977,6 +1210,7 @@ export class HudController {
       toggleKey = undefined,
       maxValidationErrors = DEFAULT_MAX_VALIDATION_ERRORS,
       maxValidationMessageLength = MAX_VALIDATION_ERROR_MESSAGE_LENGTH,
+      minRenderIntervalMs = DEFAULT_MIN_RENDER_INTERVAL_MS,
     } = options;
 
     if (downloadBlob !== undefined && downloadBlob !== null && typeof downloadBlob !== 'function') {
@@ -1098,6 +1332,22 @@ export class HudController {
     this._hasAudioTelemetry = false;
     this._hasPthreadTelemetry = false;
 
+    const resolvedMinRenderIntervalMs =
+      typeof minRenderIntervalMs === 'number' &&
+      Number.isFinite(minRenderIntervalMs) &&
+      minRenderIntervalMs > 0
+        ? minRenderIntervalMs
+        : 0;
+    this._minRenderIntervalMs = resolvedMinRenderIntervalMs;
+    this._lastRenderTimestampMs = null;
+    this._renderDirty = false;
+    this._renderCount = 0;
+    this._throttledRenders = 0;
+    this._domWriteStats = {
+      domWrites: 0,
+      domWritesElided: 0,
+    };
+
     const initialDisplayEls = isPlainObject(displayElements)
       ? displayElements
       : isPlainObject(elements)
@@ -1125,6 +1375,18 @@ export class HudController {
 
   get isExportingMissingShaders() {
     return this._exportingMissingShaders;
+  }
+
+  get domWrites() {
+    return this._domWriteStats.domWrites;
+  }
+
+  get domWritesElided() {
+    return this._domWriteStats.domWritesElided;
+  }
+
+  get minRenderIntervalMs() {
+    return this._minRenderIntervalMs;
   }
 
   // --- Internal Helpers ---
@@ -1489,19 +1751,12 @@ export class HudController {
   }
 
   _syncBoundControlState() {
+    const domStats = this._domWriteStats;
     const recordBtn = this._boundElements.recordTraceBtn;
     if (recordBtn) {
       const recording = this._isRecording();
-      try {
-        if (recordBtn.dataset && typeof recordBtn.dataset === 'object') {
-          recordBtn.dataset.recording = recording ? 'true' : 'false';
-        }
-        if (typeof recordBtn.setAttribute === 'function') {
-          recordBtn.setAttribute('aria-pressed', recording ? 'true' : 'false');
-        }
-      } catch {
-        // Ignore DOM attribute update errors on lightweight mocks.
-      }
+      safeSetDataset(recordBtn, 'recording', recording ? 'true' : 'false', domStats);
+      safeSetAttribute(recordBtn, 'aria-pressed', recording ? 'true' : 'false', domStats);
     }
 
     const profileSelect = this._boundElements.profileSelect;
@@ -1509,7 +1764,12 @@ export class HudController {
       const activeId = this._getActiveProfileId();
       if (activeId !== null) {
         try {
-          profileSelect.value = activeId;
+          if (profileSelect.value !== activeId) {
+            profileSelect.value = activeId;
+            domStats.domWrites += 1;
+          } else {
+            domStats.domWritesElided += 1;
+          }
         } catch {
           // Ignore read-only mock properties.
         }
@@ -2042,16 +2302,17 @@ export class HudController {
    * }|null|undefined} payload
    * @returns {object|null}
    */
-  updateGpuBootTelemetry(payload) {
+  updateGpuBootTelemetry(payload, options = {}) {
     if (this._destroyed || this._inOwnUpdateGpuBootTelemetry) {
       return null;
     }
 
+    const opts = isPlainObject(options) ? options : {};
     const prevReentry = this._inOwnUpdateGpuBootTelemetry;
     this._inOwnUpdateGpuBootTelemetry = true;
     try {
       if (payload && typeof payload === 'object') {
-        this._ingestBootTelemetryPayload(payload);
+        this._ingestBootTelemetryPayload(payload, opts);
       }
 
       const panel = this._getGpuBootPanel();
@@ -2076,7 +2337,8 @@ export class HudController {
     }
   }
 
-  _ingestBootTelemetryPayload(payload) {
+  _ingestBootTelemetryPayload(payload, opts = {}) {
+    const force = Boolean(opts && opts.force === true);
     let changed = false;
     let liveMetricsDirty = false;
     let bootStageChanged = false;
@@ -2162,7 +2424,7 @@ export class HudController {
         sideModules: payload.sideModules ?? (summary ? summary.sideModules : undefined),
         loadedModules: payload.loadedSideModuleNames ?? (summary ? summary.loadedModules : undefined),
       };
-      this.setSideModuleProgress(progressInput, { updateHudStatus: false });
+      this.setSideModuleProgress(progressInput, { updateHudStatus: false, force });
       changed = false; // setSideModuleProgress already rendered.
     } else if (
       summary &&
@@ -2181,10 +2443,11 @@ export class HudController {
     if (Array.isArray(payload.validationErrors)) {
       this.setValidationErrors(payload.validationErrors, {
         totalCount: payload.validationErrorCount,
+        force,
       });
       changed = false;
     } else if (payload.validationError !== undefined && payload.validationError !== null) {
-      this.recordValidationError(payload.validationError);
+      this.recordValidationError(payload.validationError, { force });
       changed = false;
     }
 
@@ -2194,7 +2457,7 @@ export class HudController {
     }
 
     if (changed) {
-      this._renderBootDiagnostics({ updateHudStatus: false });
+      this._renderBootDiagnostics({ updateHudStatus: false, force });
     }
     if (liveMetricsDirty || bootStageChanged) {
       this._syncLiveHudReadouts({
@@ -2579,6 +2842,38 @@ export class HudController {
             this._validationErrorCount = ve;
             telemetryChanged = true;
           }
+          const appLowFps = toNonNegativeFiniteNumber(
+            pickFirstDefined(appGpu, ['onePercentLowFps', 'one_percent_low_fps']),
+            null
+          );
+          if (appLowFps !== null && appLowFps !== this._gpuTelemetry.onePercentLowFps) {
+            this._gpuTelemetry.onePercentLowFps = appLowFps;
+            this._hasGpuTelemetry = true;
+            telemetryChanged = true;
+          }
+          const appP99 = toNonNegativeFiniteNumber(
+            pickFirstDefined(appGpu, ['p99FrameMs', 'p99_frame_ms']),
+            null
+          );
+          if (appP99 !== null && appP99 !== this._gpuTelemetry.p99FrameMs) {
+            this._gpuTelemetry.p99FrameMs = appP99;
+            this._hasGpuTelemetry = true;
+            telemetryChanged = true;
+          }
+          const appZeroCopy = toNonNegativeInt(
+            pickFirstDefined(appGpu, [
+              'zeroCopyUploads',
+              'zero_copy_uploads',
+              'binkZeroCopyUploads',
+              'zeroCopyFramesForwarded',
+            ]),
+            null
+          );
+          if (appZeroCopy !== null && appZeroCopy !== this._gpuTelemetry.zeroCopyUploads) {
+            this._gpuTelemetry.zeroCopyUploads = appZeroCopy;
+            this._hasGpuTelemetry = true;
+            telemetryChanged = true;
+          }
         }
       }
     }
@@ -2672,10 +2967,11 @@ export class HudController {
     }
   }
 
-  _interceptExternalHudMetrics(metrics) {
+  _interceptExternalHudMetrics(metrics, opts = {}) {
     if (!isPlainObject(metrics)) {
       return metrics;
     }
+    const force = Boolean(opts && opts.force === true);
     let diagChanged = false;
 
     const appSync = this._syncFromAppSources();
@@ -2742,7 +3038,7 @@ export class HudController {
     }
 
     if (diagChanged) {
-      this._renderBootDiagnostics({ updateHudStatus: false });
+      this._renderBootDiagnostics({ updateHudStatus: false, force });
     }
 
     const patched = { ...metrics };
@@ -2874,6 +3170,50 @@ export class HudController {
       if (sanitizedValErrs > this._validationErrorCount) {
         this._validationErrorCount = sanitizedValErrs;
       }
+      touched = true;
+    }
+
+    const rawOnePercentLow = pickTelemetryField(primary, secondary, [
+      'onePercentLowFps',
+      'one_percent_low_fps',
+      'fps1PercentLow',
+      'low1PercentFps',
+    ]);
+    if (rawOnePercentLow !== undefined) {
+      this._gpuTelemetry.onePercentLowFps = toNonNegativeFiniteNumber(rawOnePercentLow, null);
+      touched = true;
+    }
+
+    const rawDirectP99 = pickTelemetryField(primary, secondary, ['p99FrameMs', 'p99_frame_ms']);
+    if (rawDirectP99 !== undefined) {
+      this._gpuTelemetry.p99FrameMs = toNonNegativeFiniteNumber(rawDirectP99, null);
+      touched = true;
+    } else {
+      const rawPerfP99 = pickTelemetryField(primary, secondary, [
+        'p99FrameTimeMs',
+        'p99_frame_time_ms',
+      ]);
+      if (rawPerfP99 !== undefined) {
+        const parsedPerfP99 = toNonNegativeFiniteNumber(rawPerfP99, null);
+        if (parsedPerfP99 !== null && parsedPerfP99 > 0) {
+          this._gpuTelemetry.p99FrameMs = parsedPerfP99;
+          touched = true;
+        }
+      }
+    }
+
+    const rawZeroCopy = pickTelemetryField(primary, secondary, [
+      'zeroCopyUploads',
+      'zero_copy_uploads',
+      'binkZeroCopyUploads',
+      'bink_zero_copy_uploads',
+      'zeroCopyFramesForwarded',
+      'zero_copy_frames_forwarded',
+      'zeroCopyFrames',
+      'binkZeroCopyFrames',
+    ]);
+    if (rawZeroCopy !== undefined) {
+      this._gpuTelemetry.zeroCopyUploads = toNonNegativeInt(rawZeroCopy, null);
       touched = true;
     }
 
@@ -3042,7 +3382,7 @@ export class HudController {
       null;
 
     if (gpuNested) {
-      if (this._applyGpuTelemetry(gpuNested)) {
+      if (this._applyGpuTelemetry(gpuNested, payload)) {
         changed = true;
       }
     } else if (
@@ -3075,6 +3415,71 @@ export class HudController {
           });
           changed = true;
         }
+      }
+    }
+
+    const framesNested =
+      (isPlainObject(safeGet(payload, 'frames')) && safeGet(payload, 'frames')) ||
+      (isPlainObject(safeGet(payload, 'frameStats')) && safeGet(payload, 'frameStats')) ||
+      (isPlainObject(safeGet(payload, 'perf')) && safeGet(payload, 'perf')) ||
+      null;
+    if (framesNested) {
+      const nestedLow = pickFirstDefined(framesNested, [
+        'onePercentLowFps',
+        'one_percent_low_fps',
+        'fps1PercentLow',
+        'low1PercentFps',
+      ]);
+      if (nestedLow !== undefined) {
+        this._gpuTelemetry.onePercentLowFps = toNonNegativeFiniteNumber(nestedLow, null);
+        this._hasGpuTelemetry = true;
+        this._gpuTelemetry.updatedAtMs = this._safeNowMs();
+        changed = true;
+      }
+      const nestedDirectP99 = pickFirstDefined(framesNested, ['p99FrameMs', 'p99_frame_ms']);
+      if (nestedDirectP99 !== undefined) {
+        this._gpuTelemetry.p99FrameMs = toNonNegativeFiniteNumber(nestedDirectP99, null);
+        this._hasGpuTelemetry = true;
+        this._gpuTelemetry.updatedAtMs = this._safeNowMs();
+        changed = true;
+      } else {
+        const nestedPerfP99 = pickFirstDefined(framesNested, [
+          'p99FrameTimeMs',
+          'p99_frame_time_ms',
+        ]);
+        if (nestedPerfP99 !== undefined) {
+          const parsed = toNonNegativeFiniteNumber(nestedPerfP99, null);
+          if (parsed !== null && parsed > 0) {
+            this._gpuTelemetry.p99FrameMs = parsed;
+            this._hasGpuTelemetry = true;
+            this._gpuTelemetry.updatedAtMs = this._safeNowMs();
+            changed = true;
+          }
+        }
+      }
+    }
+
+    const binkNested =
+      (isPlainObject(safeGet(payload, 'bink')) && safeGet(payload, 'bink')) ||
+      (isPlainObject(safeGet(payload, 'binkStats')) && safeGet(payload, 'binkStats')) ||
+      (isPlainObject(safeGet(payload, 'binkPresenter')) && safeGet(payload, 'binkPresenter')) ||
+      null;
+    if (binkNested) {
+      const nestedZeroCopy = pickFirstDefined(binkNested, [
+        'zeroCopyUploads',
+        'zero_copy_uploads',
+        'binkZeroCopyUploads',
+        'bink_zero_copy_uploads',
+        'zeroCopyFramesForwarded',
+        'zero_copy_frames_forwarded',
+        'zeroCopyFrames',
+        'binkZeroCopyFrames',
+      ]);
+      if (nestedZeroCopy !== undefined) {
+        this._gpuTelemetry.zeroCopyUploads = toNonNegativeInt(nestedZeroCopy, null);
+        this._hasGpuTelemetry = true;
+        this._gpuTelemetry.updatedAtMs = this._safeNowMs();
+        changed = true;
       }
     }
 
@@ -3142,6 +3547,7 @@ export class HudController {
     if (gpuChanged || appSync.bootStageChanged || appSync.telemetryChanged) {
       this._renderBootDiagnostics({
         updateHudStatus: opts.updateHudStatus === true,
+        force: opts.force === true,
       });
       this._syncLiveHudReadouts({
         includeFrames: true,
@@ -3156,7 +3562,7 @@ export class HudController {
    * updating live Frames, rolling FPS, and advancing the boot milestone to `FIRST_PRESENT`.
    *
    * @param {object|null|undefined} event
-   * @param {{ updateHudStatus?: boolean }} [options]
+   * @param {{ updateHudStatus?: boolean, force?: boolean }} [options]
    */
   onSplashFramePresented(event, options = {}) {
     if (this._destroyed) {
@@ -3188,6 +3594,16 @@ export class HudController {
       safeGet(event, 'timestampMs') ?? safeGet(event, 'timestamp'),
       null
     );
+    const rawZeroCopy = pickFirstDefined(event, [
+      'zeroCopyUploads',
+      'zero_copy_uploads',
+      'binkZeroCopyUploads',
+      'zeroCopyFramesForwarded',
+      'zero_copy_frames_forwarded',
+    ]);
+    if (rawZeroCopy !== undefined) {
+      this._gpuTelemetry.zeroCopyUploads = toNonNegativeInt(rawZeroCopy, null);
+    }
 
     this._recordLiveFrames(nextFrames, {
       fps: explicitFps,
@@ -3208,6 +3624,7 @@ export class HudController {
     this._syncFromAppSources();
     this._renderBootDiagnostics({
       updateHudStatus: opts.updateHudStatus === true,
+      force: opts.force === true,
     });
     this._syncLiveHudReadouts({
       includeFrames: true,
@@ -3272,9 +3689,9 @@ export class HudController {
       return this.getTelemetry();
     }
     const opts = isPlainObject(options) ? options : {};
-    const patched = this._interceptExternalHudMetrics(metrics);
+    const patched = this._interceptExternalHudMetrics(metrics, opts);
     if (opts.updateHudStatus === true) {
-      this._renderBootDiagnostics({ updateHudStatus: true });
+      this._renderBootDiagnostics({ updateHudStatus: true, force: opts.force === true });
     }
     this._pushHudMetrics(patched);
     return this.getTelemetry();
@@ -3285,7 +3702,7 @@ export class HudController {
    * `outputState` (`'active' | 'suspended' | 'headless-drain'`) and sanitized counters.
    *
    * @param {object|null|undefined} stats
-   * @param {{ updateHudStatus?: boolean }} [options]
+   * @param {{ updateHudStatus?: boolean, force?: boolean }} [options]
    */
   updateAudioStats(stats, options = {}) {
     if (this._destroyed) {
@@ -3295,6 +3712,7 @@ export class HudController {
     if (this._applyAudioTelemetry(stats)) {
       this._renderBootDiagnostics({
         updateHudStatus: opts.updateHudStatus === true,
+        force: opts.force === true,
       });
     }
     return this.getTelemetry().audio;
@@ -3305,7 +3723,7 @@ export class HudController {
    * thread counts, load queue depth, and normalized indirect dispatch mode.
    *
    * @param {object|null|undefined} stats
-   * @param {{ updateHudStatus?: boolean }} [options]
+   * @param {{ updateHudStatus?: boolean, force?: boolean }} [options]
    */
   updatePthreadStats(stats, options = {}) {
     if (this._destroyed) {
@@ -3315,6 +3733,7 @@ export class HudController {
     if (this._applyPthreadTelemetry(stats)) {
       this._renderBootDiagnostics({
         updateHudStatus: opts.updateHudStatus === true,
+        force: opts.force === true,
       });
     }
     return this.getTelemetry().pthread;
@@ -3325,7 +3744,7 @@ export class HudController {
    * `audio-stats`, `pthread-stats`, or a combined `{ gpu, audio, pthread }` object).
    *
    * @param {object|null|undefined} payload
-   * @param {{ updateHudStatus?: boolean }} [options]
+   * @param {{ updateHudStatus?: boolean, force?: boolean }} [options]
    */
   updateTelemetry(payload, options = {}) {
     if (this._destroyed) {
@@ -3357,10 +3776,16 @@ export class HudController {
     if (structuredChanged || bootStageChanged || appSync.bootStageChanged || appSync.telemetryChanged) {
       this._renderBootDiagnostics({
         updateHudStatus: opts.updateHudStatus === true,
+        force: opts.force === true,
       });
       this._syncLiveHudReadouts({
         includeFrames: this._liveFramesPresented > 0,
         updateHudStatus: opts.updateHudStatus,
+      });
+    } else if (opts.force === true) {
+      this._renderBootDiagnostics({
+        updateHudStatus: opts.updateHudStatus === true,
+        force: true,
       });
     }
     return this.getTelemetry();
@@ -3369,7 +3794,7 @@ export class HudController {
   /**
    * Resets tracked GPU, Audio, and Pthread telemetry back to clean initial defaults.
    *
-   * @param {{ updateHudStatus?: boolean }} [options]
+   * @param {{ updateHudStatus?: boolean, force?: boolean }} [options]
    */
   resetTelemetry(options = {}) {
     if (this._destroyed) {
@@ -3388,6 +3813,7 @@ export class HudController {
     this._lastConciseHudStatus = null;
     this._renderBootDiagnostics({
       updateHudStatus: opts.updateHudStatus === true,
+      force: opts.force !== false,
     });
     return this.getTelemetry();
   }
@@ -3446,6 +3872,11 @@ export class HudController {
           : base;
     }
 
+    const onePercentLowFpsText = formatOnePercentLowFps(g.onePercentLowFps);
+    const p99FrameMsText = formatP99FrameMs(g.p99FrameMs);
+    const zeroCopyUploadsText = formatZeroCopyUploads(g.zeroCopyUploads);
+    const perfSummaryText = formatPerfMetricsSummary(g);
+
     return {
       gpu: {
         realPackDrawCount: g.realPackDrawCount,
@@ -3453,6 +3884,13 @@ export class HudController {
         presentCount: effectivePresentCount,
         framesPresented: effectivePresentCount,
         fps: this._liveFps,
+        onePercentLowFps: g.onePercentLowFps,
+        p99FrameMs: g.p99FrameMs,
+        zeroCopyUploads: g.zeroCopyUploads,
+        onePercentLowFpsText,
+        p99FrameMsText,
+        zeroCopyUploadsText,
+        perfSummaryText,
         unboundBindGroupCount: g.unboundBindGroupCount,
         skippedDrawCount: g.skippedDrawCount,
         validationErrorCount: g.validationErrorCount,
@@ -3589,6 +4027,7 @@ export class HudController {
 
     return this._renderBootDiagnostics({
       updateHudStatus: opts.updateHudStatus !== false,
+      force: opts.force === true,
     });
   }
 
@@ -3734,6 +4173,7 @@ export class HudController {
     this._applySideModuleProgress(progress);
     this._renderBootDiagnostics({
       updateHudStatus: opts.updateHudStatus === true,
+      force: opts.force === true,
     });
     return this.getSideModuleProgress();
   }
@@ -3790,6 +4230,7 @@ export class HudController {
 
     this._renderBootDiagnostics({
       updateHudStatus: opts.updateHudStatus === true,
+      force: opts.force === true,
     });
     return this.getSideModuleProgress();
   }
@@ -3930,6 +4371,7 @@ export class HudController {
     this._runtimeInitialized = false;
     this._renderBootDiagnostics({
       updateHudStatus: opts.updateHudStatus === true,
+      force: opts.force === true,
     });
     return this.getSideModuleProgress();
   }
@@ -4058,7 +4500,7 @@ export class HudController {
       this._hudLog(`[WebGPU ${normalized.type}] ${normalized.message}`, 'error');
     }
 
-    this._renderBootDiagnostics({ updateHudStatus: false });
+    this._renderBootDiagnostics({ updateHudStatus: false, force: opts.force === true });
     return { ...normalized };
   }
 
@@ -4116,21 +4558,22 @@ export class HudController {
         : sanitizedAll.length;
     this._validationErrorSeq = Math.max(this._validationErrorSeq, maxSeq, this._validationErrorCount);
 
-    this._renderBootDiagnostics({ updateHudStatus: false });
+    this._renderBootDiagnostics({ updateHudStatus: false, force: opts.force === true });
     return this.getValidationSummary();
   }
 
   /**
    * Clears all recorded live WebGPU validation errors and resets the counter to zero.
    */
-  clearValidationErrors() {
+  clearValidationErrors(options = {}) {
     if (this._destroyed) {
       return this.getValidationSummary();
     }
+    const opts = isPlainObject(options) ? options : {};
     this._validationErrors = [];
     this._validationErrorCount = 0;
     this._gpuTelemetry.validationErrorCount = 0;
-    this._renderBootDiagnostics({ updateHudStatus: false });
+    this._renderBootDiagnostics({ updateHudStatus: false, force: opts.force === true });
     return this.getValidationSummary();
   }
 
@@ -4184,6 +4627,9 @@ export class HudController {
     if (telemetry.gpu.statusText) {
       parts.push(telemetry.gpu.statusText);
     }
+    if (telemetry.gpu.perfSummaryText) {
+      parts.push(telemetry.gpu.perfSummaryText);
+    }
     if (telemetry.pthread.statusText) {
       parts.push(telemetry.pthread.statusText);
     }
@@ -4218,6 +4664,10 @@ export class HudController {
       readyForSplash: this._bootReadyForSplash,
       framesPresented: Math.max(telemetry.gpu.presentCount, this._liveFramesPresented),
       fps: this._liveFps,
+      onePercentLowFps: telemetry.gpu.onePercentLowFps,
+      p99FrameMs: telemetry.gpu.p99FrameMs,
+      zeroCopyUploads: telemetry.gpu.zeroCopyUploads,
+      perfSummaryText: telemetry.gpu.perfSummaryText,
       sideModules,
       validation,
       telemetry,
@@ -4252,7 +4702,11 @@ export class HudController {
       }
     }
 
-    this._renderBootDiagnostics({ updateHudStatus: false });
+    this._renderBootDiagnostics({
+      updateHudStatus: false,
+      force: true,
+      recordRenderTimestamp: false,
+    });
 
     let active = true;
     return () => {
@@ -4270,38 +4724,129 @@ export class HudController {
   }
 
   /**
+   * Configures the minimum interval (in ms) between non-forced DOM renders.
+   * Pass `0` to disable throttling (default).
+   *
+   * @param {number} intervalMs
+   * @returns {number} Effective `minRenderIntervalMs`.
+   */
+  setMinRenderIntervalMs(intervalMs) {
+    this._minRenderIntervalMs =
+      typeof intervalMs === 'number' && Number.isFinite(intervalMs) && intervalMs > 0
+        ? intervalMs
+        : 0;
+    return this._minRenderIntervalMs;
+  }
+
+  /**
+   * Returns dirty-check DOM write counters and render throttle telemetry.
+   */
+  getRenderStats() {
+    return {
+      domWrites: this._domWriteStats.domWrites,
+      domWritesElided: this._domWriteStats.domWritesElided,
+      renderCount: this._renderCount,
+      throttledRenders: this._throttledRenders,
+      minRenderIntervalMs: this._minRenderIntervalMs,
+      lastRenderTimestampMs: this._lastRenderTimestampMs,
+      dirty: this._renderDirty,
+    };
+  }
+
+  /**
+   * Resets dirty-check DOM write and throttle counters back to zero.
+   */
+  resetRenderStats() {
+    this._domWriteStats.domWrites = 0;
+    this._domWriteStats.domWritesElided = 0;
+    this._renderCount = 0;
+    this._throttledRenders = 0;
+    return this.getRenderStats();
+  }
+
+  /**
+   * Flushes any throttled/dirty DOM render immediately (or unconditionally when
+   * `options.force === true`).
+   *
+   * @param {{ updateHudStatus?: boolean, force?: boolean }} [options]
+   */
+  flushRender(options = {}) {
+    if (this._destroyed) {
+      return this.getBootStatus();
+    }
+    const opts = isPlainObject(options) ? options : {};
+    if (!this._renderDirty && opts.force !== true) {
+      return this.getBootStatus();
+    }
+    return this._renderBootDiagnostics({
+      updateHudStatus: opts.updateHudStatus === true,
+      force: true,
+    });
+  }
+
+  /**
    * Re-renders all bound boot mode, split-module, and validation-error display elements.
    *
-   * @param {{ updateHudStatus?: boolean }} [options]
+   * @param {{ updateHudStatus?: boolean, force?: boolean }} [options]
    */
   renderBootStatus(options = {}) {
+    if (this._destroyed) {
+      return this.getBootStatus();
+    }
     const opts = isPlainObject(options) ? options : {};
     return this._renderBootDiagnostics({
       updateHudStatus: opts.updateHudStatus === true,
+      force: opts.force === true,
     });
   }
 
   _renderBootDiagnostics(options = {}) {
+    const opts = isPlainObject(options) ? options : {};
+    const force = opts.force === true;
+    const recordRenderTimestamp = opts.recordRenderTimestamp !== false;
+    const nowMs = this._safeNowMs();
+
+    if (
+      !force &&
+      this._minRenderIntervalMs > 0 &&
+      this._lastRenderTimestampMs !== null
+    ) {
+      const elapsedMs = nowMs - this._lastRenderTimestampMs;
+      if (elapsedMs >= 0 && elapsedMs < this._minRenderIntervalMs) {
+        this._renderDirty = true;
+        this._throttledRenders += 1;
+        return this.getBootStatus();
+      }
+    }
+
     const status = this.getBootStatus();
+    if (recordRenderTimestamp) {
+      this._lastRenderTimestampMs = nowMs;
+    }
+    this._renderDirty = false;
+    this._renderCount += 1;
+
     const els = this._displayElements;
+    const domStats = this._domWriteStats;
 
     if (els.bootModeBadge) {
-      safeSetText(els.bootModeBadge, status.badgeText);
-      safeSetDataset(els.bootModeBadge, 'bootMode', status.bootMode);
-      safeSetDataset(els.bootModeBadge, 'state', status.badgeState);
-      safeSetTitle(els.bootModeBadge, status.statusText);
-      safeSetAttribute(els.bootModeBadge, 'aria-label', `Boot mode: ${status.badgeText}`);
+      safeSetText(els.bootModeBadge, status.badgeText, domStats);
+      safeSetDataset(els.bootModeBadge, 'bootMode', status.bootMode, domStats);
+      safeSetDataset(els.bootModeBadge, 'state', status.badgeState, domStats);
+      safeSetTitle(els.bootModeBadge, status.statusText, domStats);
+      safeSetAttribute(els.bootModeBadge, 'aria-label', `Boot mode: ${status.badgeText}`, domStats);
     }
 
     if (els.bootStatusEl) {
-      safeSetText(els.bootStatusEl, status.statusText);
-      safeSetDataset(els.bootStatusEl, 'bootMode', status.bootMode);
+      safeSetText(els.bootStatusEl, status.statusText, domStats);
+      safeSetDataset(els.bootStatusEl, 'bootMode', status.bootMode, domStats);
       safeSetDataset(
         els.bootStatusEl,
         'state',
-        status.statusLevel === 'error' ? 'err' : status.statusLevel
+        status.statusLevel === 'error' ? 'err' : status.statusLevel,
+        domStats
       );
-      safeSetTitle(els.bootStatusEl, status.statusText);
+      safeSetTitle(els.bootStatusEl, status.statusText, domStats);
     }
 
     if (els.sideModuleStatusEl) {
@@ -4313,100 +4858,166 @@ export class HudController {
           : sm.statusText
         : 'No split modules';
       const smState = !sm.active ? '' : sm.complete ? 'ok' : 'info';
-      safeSetText(els.sideModuleStatusEl, smText);
-      safeSetDataset(els.sideModuleStatusEl, 'loaded', String(sm.loadedCount));
-      safeSetDataset(els.sideModuleStatusEl, 'total', String(sm.sideModuleCount));
-      safeSetDataset(els.sideModuleStatusEl, 'state', smState);
-      safeSetTitle(els.sideModuleStatusEl, smText);
+      safeSetText(els.sideModuleStatusEl, smText, domStats);
+      safeSetDataset(els.sideModuleStatusEl, 'loaded', String(sm.loadedCount), domStats);
+      safeSetDataset(els.sideModuleStatusEl, 'total', String(sm.sideModuleCount), domStats);
+      safeSetDataset(els.sideModuleStatusEl, 'state', smState, domStats);
+      safeSetTitle(els.sideModuleStatusEl, smText, domStats);
     }
 
     const validation = status.validation;
     if (els.validationCountEl) {
-      safeSetText(els.validationCountEl, String(validation.count));
-      safeSetDataset(els.validationCountEl, 'count', String(validation.count));
-      safeSetDataset(els.validationCountEl, 'state', validation.hasErrors ? 'err' : 'ok');
+      safeSetText(els.validationCountEl, String(validation.count), domStats);
+      safeSetDataset(els.validationCountEl, 'count', String(validation.count), domStats);
+      safeSetDataset(els.validationCountEl, 'state', validation.hasErrors ? 'err' : 'ok', domStats);
     }
 
     if (els.validationLatestEl) {
       const latestText =
         validation.hasErrors && validation.latestMessage ? validation.latestMessage : 'None';
-      safeSetText(els.validationLatestEl, latestText);
-      safeSetDataset(els.validationLatestEl, 'state', validation.hasErrors ? 'err' : '');
-      safeSetTitle(els.validationLatestEl, latestText);
+      safeSetText(els.validationLatestEl, latestText, domStats);
+      safeSetDataset(els.validationLatestEl, 'state', validation.hasErrors ? 'err' : '', domStats);
+      safeSetTitle(els.validationLatestEl, latestText, domStats);
     }
 
     if (els.validationBannerEl) {
-      safeSetHidden(els.validationBannerEl, !validation.hasErrors);
-      safeSetDataset(els.validationBannerEl, 'count', String(validation.count));
-      safeSetDataset(els.validationBannerEl, 'hasErrors', validation.hasErrors ? 'true' : 'false');
-      safeSetDataset(els.validationBannerEl, 'state', validation.hasErrors ? 'err' : 'ok');
+      safeSetHidden(els.validationBannerEl, !validation.hasErrors, domStats);
+      safeSetDataset(els.validationBannerEl, 'count', String(validation.count), domStats);
+      safeSetDataset(
+        els.validationBannerEl,
+        'hasErrors',
+        validation.hasErrors ? 'true' : 'false',
+        domStats
+      );
+      safeSetDataset(els.validationBannerEl, 'state', validation.hasErrors ? 'err' : 'ok', domStats);
       const hasChildren =
         (Array.isArray(els.validationBannerEl.children) &&
           els.validationBannerEl.children.length > 0) ||
         (typeof els.validationBannerEl.childElementCount === 'number' &&
           els.validationBannerEl.childElementCount > 0);
       if (!hasChildren) {
-        safeSetText(els.validationBannerEl, validation.statusText);
+        safeSetText(els.validationBannerEl, validation.statusText, domStats);
       }
     }
 
     const liveFrames = status.framesPresented;
     const liveFps = status.fps;
     const formattedFps = formatFpsDisplay(liveFps);
-    const gpuStatus = status.telemetry && status.telemetry.gpu ? status.telemetry.gpu.statusText : '';
+    const gpuTelemetry = status.telemetry && status.telemetry.gpu ? status.telemetry.gpu : null;
+    const gpuStatus = gpuTelemetry ? gpuTelemetry.statusText : '';
+    const onePercentLowText = gpuTelemetry ? gpuTelemetry.onePercentLowFpsText : '';
+    const p99FrameMsText = gpuTelemetry ? gpuTelemetry.p99FrameMsText : '';
+    const zeroCopyUploadsText = gpuTelemetry ? gpuTelemetry.zeroCopyUploadsText : '';
+    const perfSummaryText = gpuTelemetry ? gpuTelemetry.perfSummaryText : '';
 
     if (els.framesEl) {
-      safeSetText(els.framesEl, String(liveFrames));
-      safeSetDataset(els.framesEl, 'frames', String(liveFrames));
+      safeSetText(els.framesEl, String(liveFrames), domStats);
+      safeSetDataset(els.framesEl, 'frames', String(liveFrames), domStats);
       safeSetTitle(
         els.framesEl,
-        gpuStatus || `${liveFrames} frame${liveFrames === 1 ? '' : 's'} presented`
+        gpuStatus || perfSummaryText || `${liveFrames} frame${liveFrames === 1 ? '' : 's'} presented`,
+        domStats
       );
     }
 
     if (els.fpsEl) {
-      safeSetText(els.fpsEl, formattedFps);
-      safeSetDataset(els.fpsEl, 'fps', String(liveFps));
-      safeSetDataset(els.fpsEl, 'state', liveFps >= 30 ? 'ok' : 'info');
+      safeSetText(els.fpsEl, formattedFps, domStats);
+      safeSetDataset(els.fpsEl, 'fps', String(liveFps), domStats);
+      safeSetDataset(els.fpsEl, 'state', liveFps >= 30 ? 'ok' : 'info', domStats);
+      if (status.onePercentLowFps !== null) {
+        safeSetDataset(els.fpsEl, 'onePercentLowFps', String(status.onePercentLowFps), domStats);
+      } else if (hasDatasetKey(els.fpsEl, 'onePercentLowFps')) {
+        safeSetDataset(els.fpsEl, 'onePercentLowFps', '', domStats);
+      }
+      if (status.p99FrameMs !== null) {
+        safeSetDataset(els.fpsEl, 'p99FrameMs', String(status.p99FrameMs), domStats);
+      } else if (hasDatasetKey(els.fpsEl, 'p99FrameMs')) {
+        safeSetDataset(els.fpsEl, 'p99FrameMs', '', domStats);
+      }
+      if (perfSummaryText) {
+        safeSetTitle(els.fpsEl, perfSummaryText, domStats);
+      } else if (typeof els.fpsEl.title === 'string' && els.fpsEl.title.length > 0) {
+        safeSetTitle(els.fpsEl, '', domStats);
+      }
     }
 
     if (els.pillFpsEl) {
-      safeSetText(els.pillFpsEl, `${formattedFps} fps`);
+      safeSetText(els.pillFpsEl, `${formattedFps} fps`, domStats);
+    }
+
+    if (els.onePercentLowFpsEl) {
+      safeSetText(els.onePercentLowFpsEl, onePercentLowText || '--', domStats);
+      safeSetDataset(
+        els.onePercentLowFpsEl,
+        'onePercentLowFps',
+        status.onePercentLowFps !== null ? String(status.onePercentLowFps) : '',
+        domStats
+      );
+      safeSetTitle(els.onePercentLowFpsEl, onePercentLowText, domStats);
+    }
+
+    if (els.p99FrameMsEl) {
+      safeSetText(els.p99FrameMsEl, p99FrameMsText || '--', domStats);
+      safeSetDataset(
+        els.p99FrameMsEl,
+        'p99FrameMs',
+        status.p99FrameMs !== null ? String(status.p99FrameMs) : '',
+        domStats
+      );
+      safeSetTitle(els.p99FrameMsEl, p99FrameMsText, domStats);
+    }
+
+    const zeroCopyEl = els.zeroCopyUploadsEl || els.binkZeroCopyEl || null;
+    if (zeroCopyEl) {
+      safeSetText(zeroCopyEl, zeroCopyUploadsText || '--', domStats);
+      safeSetDataset(
+        zeroCopyEl,
+        'zeroCopyUploads',
+        status.zeroCopyUploads !== null ? String(status.zeroCopyUploads) : '',
+        domStats
+      );
+      safeSetTitle(zeroCopyEl, zeroCopyUploadsText, domStats);
     }
 
     if (els.bootStageEl) {
-      safeSetText(els.bootStageEl, status.bootStage);
-      safeSetDataset(els.bootStageEl, 'stage', status.bootStage);
+      safeSetText(els.bootStageEl, status.bootStage, domStats);
+      safeSetDataset(els.bootStageEl, 'stage', status.bootStage, domStats);
       safeSetDataset(
         els.bootStageEl,
         'state',
-        status.readyForSplash || status.progressPct >= 100 ? 'ok' : ''
+        status.readyForSplash || status.progressPct >= 100 ? 'ok' : '',
+        domStats
       );
     }
 
     if (els.bootProgressBarEl) {
-      safeSetAttribute(els.bootProgressBarEl, 'aria-valuenow', String(Math.round(status.progressPct)));
+      safeSetAttribute(
+        els.bootProgressBarEl,
+        'aria-valuenow',
+        String(Math.round(status.progressPct)),
+        domStats
+      );
     }
 
     if (els.bootProgressFillEl) {
-      safeSetStyleWidth(els.bootProgressFillEl, `${status.progressPct.toFixed(1)}%`);
+      safeSetStyleWidth(els.bootProgressFillEl, `${status.progressPct.toFixed(1)}%`, domStats);
       safeSetDataset(
         els.bootProgressFillEl,
         'state',
-        status.readyForSplash || status.progressPct >= 100 ? 'ok' : ''
+        status.readyForSplash || status.progressPct >= 100 ? 'ok' : '',
+        domStats
       );
     }
 
     if (els.bootElapsedEl && this._bootElapsedMs !== null) {
-      safeSetText(els.bootElapsedEl, formatElapsedSeconds(this._bootElapsedMs));
+      safeSetText(els.bootElapsedEl, formatElapsedSeconds(this._bootElapsedMs), domStats);
     }
 
     this._renderVisibility();
     this._renderScriptedInputBadge();
 
     if (
-      options &&
-      options.updateHudStatus === true &&
+      opts.updateHudStatus === true &&
       this._hud &&
       typeof this._hud.setStatus === 'function'
     ) {
@@ -4439,10 +5050,11 @@ export class HudController {
     if (!rootEl) {
       return;
     }
+    const domStats = this._domWriteStats;
     const hidden = !this._visible;
-    safeSetHidden(rootEl, hidden);
-    safeSetAttribute(rootEl, 'aria-hidden', hidden ? 'true' : 'false');
-    safeSetDataset(rootEl, 'hudVisible', this._visible ? 'true' : 'false');
+    safeSetHidden(rootEl, hidden, domStats);
+    safeSetAttribute(rootEl, 'aria-hidden', hidden ? 'true' : 'false', domStats);
+    safeSetDataset(rootEl, 'hudVisible', this._visible ? 'true' : 'false', domStats);
   }
 
   _renderScriptedInputBadge() {
@@ -4450,24 +5062,25 @@ export class HudController {
     if (!badgeEl) {
       return;
     }
+    const domStats = this._domWriteStats;
     const preset = this._scriptedInputPreset;
     if (preset) {
       const label = `Scripted input: ${preset}`;
-      safeSetHidden(badgeEl, false);
-      safeSetAttribute(badgeEl, 'aria-hidden', 'false');
-      safeSetText(badgeEl, label);
-      safeSetDataset(badgeEl, 'preset', preset);
-      safeSetDataset(badgeEl, 'active', 'true');
-      safeSetDataset(badgeEl, 'state', 'info');
-      safeSetTitle(badgeEl, label);
+      safeSetHidden(badgeEl, false, domStats);
+      safeSetAttribute(badgeEl, 'aria-hidden', 'false', domStats);
+      safeSetText(badgeEl, label, domStats);
+      safeSetDataset(badgeEl, 'preset', preset, domStats);
+      safeSetDataset(badgeEl, 'active', 'true', domStats);
+      safeSetDataset(badgeEl, 'state', 'info', domStats);
+      safeSetTitle(badgeEl, label, domStats);
     } else {
-      safeSetHidden(badgeEl, true);
-      safeSetAttribute(badgeEl, 'aria-hidden', 'true');
-      safeSetText(badgeEl, '');
-      safeSetDataset(badgeEl, 'preset', '');
-      safeSetDataset(badgeEl, 'active', 'false');
-      safeSetDataset(badgeEl, 'state', '');
-      safeSetTitle(badgeEl, '');
+      safeSetHidden(badgeEl, true, domStats);
+      safeSetAttribute(badgeEl, 'aria-hidden', 'true', domStats);
+      safeSetText(badgeEl, '', domStats);
+      safeSetDataset(badgeEl, 'preset', '', domStats);
+      safeSetDataset(badgeEl, 'active', 'false', domStats);
+      safeSetDataset(badgeEl, 'state', '', domStats);
+      safeSetTitle(badgeEl, '', domStats);
     }
   }
 
@@ -4666,6 +5279,7 @@ export class HudController {
     this._scriptedInputPreset = sanitizeScriptedInputPreset(presetOrNull);
     this._renderBootDiagnostics({
       updateHudStatus: opts.updateHudStatus !== false,
+      force: opts.force === true,
     });
     return this._scriptedInputPreset;
   }
@@ -4875,7 +5489,7 @@ export class HudController {
       this._lastExternalHudStatus = null;
       this._lastConciseHudStatus = null;
 
-      this._renderBootDiagnostics({ updateHudStatus: false });
+      this._renderBootDiagnostics({ updateHudStatus: false, force: true });
       this._pushHudMetrics({
         framesPresented: 0,
         totalFrames: 0,
@@ -4894,7 +5508,7 @@ export class HudController {
 
       if (sessionResult && sessionResult.ok === false) {
         this._explicitBootMode = null;
-        this._renderBootDiagnostics({ updateHudStatus: false });
+        this._renderBootDiagnostics({ updateHudStatus: false, force: true });
         const error = toErrorMessage(
           sessionResult.error ||
             (Array.isArray(sessionResult.reasons) ? sessionResult.reasons[0] : null),
@@ -4909,7 +5523,7 @@ export class HudController {
       }
 
       this._explicitBootMode = null;
-      this._renderBootDiagnostics({ updateHudStatus: false });
+      this._renderBootDiagnostics({ updateHudStatus: false, force: true });
       this._pushHudMetrics({
         framesPresented: this._liveFramesPresented,
         totalFrames: this._liveFramesPresented,
@@ -5032,7 +5646,11 @@ export class HudController {
 
     this._syncBoundControlState();
     if (hasDisplayOverride) {
-      this._renderBootDiagnostics({ updateHudStatus: false });
+      this._renderBootDiagnostics({
+        updateHudStatus: false,
+        force: true,
+        recordRenderTimestamp: false,
+      });
     }
 
     let active = true;
@@ -5070,6 +5688,7 @@ export class HudController {
     this.unbindDisplayElements();
     this._hudRootEl = null;
     this._scriptedInputBadgeEl = null;
+    this._renderDirty = false;
     this._destroyed = true;
   }
 
@@ -5093,13 +5712,18 @@ export class HudController {
 
   /**
    * Returns a complete defensive HUD snapshot including control state, visibility,
-   * scripted-input status, boot diagnostics, and honest GPU/Audio/Pthread telemetry.
+   * scripted-input status, boot diagnostics, render stats, and honest GPU/Audio/Pthread telemetry.
    */
   getSnapshot() {
     return {
       ...this.getState(),
       visible: this._visible,
       scriptedInputPreset: this._scriptedInputPreset,
+      domWrites: this._domWriteStats.domWrites,
+      domWritesElided: this._domWriteStats.domWritesElided,
+      minRenderIntervalMs: this._minRenderIntervalMs,
+      throttledRenders: this._throttledRenders,
+      renderStats: this.getRenderStats(),
       bootStatus: this.getBootStatus(),
       telemetry: this.getTelemetry(),
     };

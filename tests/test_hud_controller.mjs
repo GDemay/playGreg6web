@@ -12,6 +12,7 @@ import {
   DEFAULT_MAX_VALIDATION_ERRORS,
   MAX_VALIDATION_ERROR_MESSAGE_LENGTH,
   DEFAULT_TOGGLE_KEY,
+  DEFAULT_MIN_RENDER_INTERVAL_MS,
   normalizeBootMode,
   normalizeAudioOutputState,
   normalizeIndirectDispatchMode,
@@ -19,6 +20,11 @@ import {
   sanitizeScriptedInputPreset,
   parseSideModuleProgressLabel,
   formatFpsDisplay,
+  formatOnePercentLowFps,
+  formatP99FrameMs,
+  formatZeroCopyUploads,
+  formatPerfMetricsSummary,
+  setTextIfChanged,
 } from '../web/ui/hud_controller.js';
 import { bootstrapPlayGta6App } from '../web/app_bootstrap.js';
 import {
@@ -3151,4 +3157,458 @@ test('W143: setScriptedInputStatus displays valid presets, clears on null, and r
   assert.equal(controller.setScriptedInputStatus(null), 'start-screen');
   assert.equal(controller.setScriptedInputStatus('other-preset'), 'start-screen');
   assert.equal(controller.getScriptedInputStatus(), 'start-screen');
+});
+
+// --- W210: Dirty-Checked Throttled DOM Updates & 1%-Low / Bink2 Metric Formatting ---
+
+function createSpyDisplayElement(initial = {}) {
+  let _textContent = initial.textContent !== undefined ? initial.textContent : '';
+  let _title = initial.title !== undefined ? initial.title : '';
+  let _hidden = initial.hidden !== undefined ? initial.hidden : false;
+  const attributes = new Map();
+  const counts = {
+    textWrites: 0,
+    titleWrites: 0,
+    hiddenWrites: 0,
+    attrWrites: 0,
+  };
+
+  return {
+    counts,
+    dataset: { ...(initial.dataset || {}) },
+    style: { ...(initial.style || {}) },
+    get textContent() {
+      return _textContent;
+    },
+    set textContent(v) {
+      counts.textWrites += 1;
+      _textContent = v;
+    },
+    get title() {
+      return _title;
+    },
+    set title(v) {
+      counts.titleWrites += 1;
+      _title = v;
+    },
+    get hidden() {
+      return _hidden;
+    },
+    set hidden(v) {
+      counts.hiddenWrites += 1;
+      _hidden = v;
+    },
+    setAttribute(name, value) {
+      counts.attrWrites += 1;
+      attributes.set(name, String(value));
+    },
+    getAttribute(name) {
+      return attributes.has(name) ? attributes.get(name) : null;
+    },
+  };
+}
+
+test('W210: setTextIfChanged elides unchanged DOM writes, tracks domWrites/domWritesElided, and resists read-only/throwing mocks', () => {
+  const spy = createSpyDisplayElement({ textContent: '' });
+  const stats = { domWrites: 0, domWritesElided: 0 };
+
+  // Writing '' when already '' is elided immediately.
+  assert.equal(setTextIfChanged(spy, '', stats), false);
+  assert.equal(spy.counts.textWrites, 0);
+  assert.equal(stats.domWrites, 0);
+  assert.equal(stats.domWritesElided, 1);
+
+  // First distinct write sets textContent and increments domWrites.
+  assert.equal(setTextIfChanged(spy, '60', stats), true);
+  assert.equal(spy.textContent, '60');
+  assert.equal(spy.counts.textWrites, 1);
+  assert.equal(stats.domWrites, 1);
+  assert.equal(stats.domWritesElided, 1);
+
+  // Repeated identical writes never invoke the setter.
+  assert.equal(setTextIfChanged(spy, '60', stats), false);
+  assert.equal(setTextIfChanged(spy, 60, stats), false);
+  assert.equal(spy.counts.textWrites, 1);
+  assert.equal(stats.domWrites, 1);
+  assert.equal(stats.domWritesElided, 3);
+
+  // Changing value writes once.
+  assert.equal(setTextIfChanged(spy, '59', stats), true);
+  assert.equal(spy.textContent, '59');
+  assert.equal(spy.counts.textWrites, 2);
+  assert.equal(stats.domWrites, 2);
+
+  // Null/frozen/throwing elements fail safely without throwing or incrementing domWrites.
+  assert.equal(setTextIfChanged(null, 'x', stats), false);
+  assert.equal(setTextIfChanged(Object.freeze({}), 'x', stats), false);
+  const throwing = {
+    get textContent() {
+      throw new Error('getter boom');
+    },
+    set textContent(_v) {
+      throw new Error('setter boom');
+    },
+  };
+  assert.equal(setTextIfChanged(throwing, 'x', stats), false);
+  assert.equal(stats.domWrites, 2);
+
+  // Integrated HudController dirty-check verification across FPS, Frames, Status, and Badge.
+  const framesEl = createSpyDisplayElement();
+  const fpsEl = createSpyDisplayElement();
+  const pillFpsEl = createSpyDisplayElement();
+  const bootStatusEl = createSpyDisplayElement();
+  const bootModeBadge = createSpyDisplayElement();
+
+  const controller = new HudController({
+    bootMode: 'real-wasm64',
+    displayElements: {
+      framesEl,
+      fpsEl,
+      pillFpsEl,
+      bootStatusEl,
+      bootModeBadge,
+    },
+  });
+
+  controller.resetRenderStats();
+  const baseTextWrites = {
+    frames: framesEl.counts.textWrites,
+    fps: fpsEl.counts.textWrites,
+    pillFps: pillFpsEl.counts.textWrites,
+    status: bootStatusEl.counts.textWrites,
+    badge: bootModeBadge.counts.textWrites,
+  };
+
+  // First telemetry update writes changed elements (frames, fps, pillFps, bootStatus) while eliding unchanged badge text.
+  controller.updateTelemetry({
+    gpu: { realPackDrawCount: 48, fallbackDrawCount: 2, presentCount: 31, fps: 60 },
+  });
+  assert.equal(framesEl.textContent, '31');
+  assert.equal(fpsEl.textContent, '60');
+  assert.equal(pillFpsEl.textContent, '60 fps');
+  assert.equal(framesEl.counts.textWrites, baseTextWrites.frames + 1);
+  assert.equal(fpsEl.counts.textWrites, baseTextWrites.fps + 1);
+  assert.equal(pillFpsEl.counts.textWrites, baseTextWrites.pillFps + 1);
+  assert.equal(bootStatusEl.counts.textWrites, baseTextWrites.status + 1);
+  assert.equal(bootModeBadge.counts.textWrites, baseTextWrites.badge); // Still 'Real Wasm64' -> elided!
+
+  const writesAfterFirst = controller.domWrites;
+  const elidedAfterFirst = controller.domWritesElided;
+  assert.ok(writesAfterFirst > 0);
+  assert.ok(elidedAfterFirst > 0);
+
+  // Pushing identical telemetry 5 times must perform ZERO additional DOM writes and increment domWritesElided.
+  for (let i = 0; i < 5; i += 1) {
+    controller.updateTelemetry({
+      gpu: { realPackDrawCount: 48, fallbackDrawCount: 2, presentCount: 31, fps: 60 },
+    });
+  }
+  assert.equal(controller.domWrites, writesAfterFirst);
+  assert.ok(controller.domWritesElided > elidedAfterFirst);
+  assert.equal(framesEl.counts.textWrites, baseTextWrites.frames + 1);
+  assert.equal(fpsEl.counts.textWrites, baseTextWrites.fps + 1);
+  assert.equal(pillFpsEl.counts.textWrites, baseTextWrites.pillFps + 1);
+  assert.equal(bootStatusEl.counts.textWrites, baseTextWrites.status + 1);
+  assert.equal(bootModeBadge.counts.textWrites, baseTextWrites.badge);
+
+  // Changing ONLY presentCount (FPS remains 60) writes framesEl + status but elides fpsEl & pillFpsEl.
+  controller.updateTelemetry({
+    gpu: { realPackDrawCount: 48, fallbackDrawCount: 2, presentCount: 32, fps: 60 },
+  });
+  assert.equal(framesEl.textContent, '32');
+  assert.equal(framesEl.counts.textWrites, baseTextWrites.frames + 2);
+  assert.equal(fpsEl.counts.textWrites, baseTextWrites.fps + 1);
+  assert.equal(pillFpsEl.counts.textWrites, baseTextWrites.pillFps + 1);
+
+  // Verify domWrites & domWritesElided exposure across getters, getSnapshot(), and getRenderStats().
+  const snap = controller.getSnapshot();
+  const renderStats = controller.getRenderStats();
+  assert.equal(snap.domWrites, controller.domWrites);
+  assert.equal(snap.domWritesElided, controller.domWritesElided);
+  assert.equal(snap.renderStats.domWrites, controller.domWrites);
+  assert.equal(snap.renderStats.domWritesElided, controller.domWritesElided);
+  assert.equal(renderStats.domWrites, controller.domWrites);
+  assert.equal(renderStats.domWritesElided, controller.domWritesElided);
+
+  controller.destroy();
+});
+
+test('W210: minRenderIntervalMs throttles rapid DOM updates while preserving force/flushRender overrides and synchronous default', () => {
+  assert.equal(DEFAULT_MIN_RENDER_INTERVAL_MS, 0);
+
+  let nowMs = 1000;
+  const framesEl = createSpyDisplayElement();
+  const fpsEl = createSpyDisplayElement();
+  const hudRootEl = createSpyDisplayElement();
+
+  // 1. Default minRenderIntervalMs === 0 updates synchronously on every call without advancing clock.
+  const syncController = new HudController({
+    now: () => nowMs,
+    displayElements: { framesEl: createSpyDisplayElement() },
+  });
+  assert.equal(syncController.minRenderIntervalMs, 0);
+  syncController.updateTelemetry({ gpu: { presentCount: 1, fps: 60 } });
+  syncController.updateTelemetry({ gpu: { presentCount: 2, fps: 60 } });
+  assert.equal(syncController.getRenderStats().throttledRenders, 0);
+  syncController.destroy();
+
+  // 2. Throttled controller with minRenderIntervalMs: 100.
+  const controller = new HudController({
+    bootMode: 'real-wasm64',
+    now: () => nowMs,
+    minRenderIntervalMs: 100,
+    displayElements: { framesEl, fpsEl, hudRootEl },
+  });
+  assert.equal(controller.minRenderIntervalMs, 100);
+  assert.equal(controller.getSnapshot().minRenderIntervalMs, 100);
+
+  // First live telemetry update at t=1000 renders immediately.
+  controller.updateTelemetry({ gpu: { presentCount: 10, fps: 60 } });
+  assert.equal(framesEl.textContent, '10');
+  assert.equal(fpsEl.textContent, '60');
+  assert.equal(controller.getRenderStats().throttledRenders, 0);
+  assert.equal(controller.getRenderStats().dirty, false);
+
+  const writesAtT1000 = controller.domWrites;
+
+  // Rapid updates inside the 100ms window update internal telemetry immediately but throttle DOM writes.
+  nowMs = 1020;
+  controller.updateTelemetry({ gpu: { presentCount: 11, fps: 58 } });
+  nowMs = 1050;
+  controller.updateTelemetry({ gpu: { presentCount: 12, fps: 57 } });
+  nowMs = 1099;
+  controller.updateTelemetry({ gpu: { presentCount: 13, fps: 55 } });
+
+  assert.equal(controller.getTelemetry().gpu.presentCount, 13);
+  assert.equal(controller.getTelemetry().gpu.fps, 55);
+  assert.equal(framesEl.textContent, '10'); // DOM not yet updated!
+  assert.equal(fpsEl.textContent, '60');
+  assert.equal(controller.domWrites, writesAtT1000);
+  assert.equal(controller.getRenderStats().throttledRenders, 3);
+  assert.equal(controller.getRenderStats().dirty, true);
+
+  // Forced update bypasses throttle immediately at t=1099.
+  controller.updateTelemetry({ gpu: { presentCount: 14, fps: 54 } }, { force: true });
+  assert.equal(framesEl.textContent, '14');
+  assert.equal(fpsEl.textContent, '54');
+  assert.equal(controller.getRenderStats().dirty, false);
+
+  // Next update 40ms later (t=1139 < 1199) is throttled, then flushRender() flushes immediately.
+  nowMs = 1139;
+  controller.updateTelemetry({ gpu: { presentCount: 15, fps: 52 } });
+  assert.equal(framesEl.textContent, '14');
+  assert.equal(controller.getRenderStats().dirty, true);
+
+  controller.flushRender();
+  assert.equal(framesEl.textContent, '15');
+  assert.equal(fpsEl.textContent, '52');
+  assert.equal(controller.getRenderStats().dirty, false);
+
+  // Calling flushRender() again when clean is a no-op (does not increment renderCount).
+  const rendersBeforeCleanFlush = controller.getRenderStats().renderCount;
+  controller.flushRender();
+  assert.equal(controller.getRenderStats().renderCount, rendersBeforeCleanFlush);
+
+  // Advancing clock >= minRenderIntervalMs (t=1240, 101ms since 1139) renders automatically without force.
+  nowMs = 1240;
+  controller.updateTelemetry({ gpu: { presentCount: 20, fps: 60 } });
+  assert.equal(framesEl.textContent, '20');
+  assert.equal(fpsEl.textContent, '60');
+
+  // renderBootStatus({ force: true }) forces DOM render inside throttle window.
+  nowMs = 1250;
+  controller.updateTelemetry({ gpu: { presentCount: 21, fps: 59 } });
+  assert.equal(framesEl.textContent, '20');
+  controller.renderBootStatus({ force: true });
+  assert.equal(framesEl.textContent, '21');
+  assert.equal(fpsEl.textContent, '59');
+
+  // Visibility toggle (F3) is NEVER delayed by telemetry throttling.
+  nowMs = 1255;
+  assert.equal(controller.setVisible(false), false);
+  assert.equal(hudRootEl.hidden, true);
+  assert.equal(controller.toggleVisible(), true);
+  assert.equal(hudRootEl.hidden, false);
+
+  // Clock jumping backwards never deadlocks rendering.
+  nowMs = 500;
+  controller.updateTelemetry({ gpu: { presentCount: 25, fps: 60 } });
+  assert.equal(framesEl.textContent, '25');
+
+  // setMinRenderIntervalMs(0) disables throttling dynamically; invalid values clamp to 0.
+  assert.equal(controller.setMinRenderIntervalMs(-50), 0);
+  assert.equal(controller.setMinRenderIntervalMs(Number.NaN), 0);
+  controller.updateTelemetry({ gpu: { presentCount: 26, fps: 60 } });
+  assert.equal(framesEl.textContent, '26');
+
+  controller.destroy();
+});
+
+test('W210: formats onePercentLowFps, p99FrameMs, and zeroCopyUploads across telemetry APIs, display elements, and hostile inputs', () => {
+  // 1. Direct formatter unit checks.
+  assert.equal(formatOnePercentLowFps(58.6), '1% low: 59 fps');
+  assert.equal(formatOnePercentLowFps(8.44), '1% low: 8.4 fps');
+  assert.equal(formatOnePercentLowFps(0), '1% low: 0.0 fps');
+  assert.equal(formatOnePercentLowFps(null), '');
+  assert.equal(formatOnePercentLowFps(undefined), '');
+  assert.equal(formatOnePercentLowFps(Number.NaN), '');
+  assert.equal(formatOnePercentLowFps(-10), '');
+  assert.equal(formatOnePercentLowFps(Number.POSITIVE_INFINITY), '');
+
+  assert.equal(formatP99FrameMs(16.666), 'p99: 16.7 ms');
+  assert.equal(formatP99FrameMs(8), 'p99: 8.0 ms');
+  assert.equal(formatP99FrameMs(0), 'p99: 0.0 ms');
+  assert.equal(formatP99FrameMs(null), '');
+  assert.equal(formatP99FrameMs(undefined), '');
+  assert.equal(formatP99FrameMs(Number.NaN), '');
+  assert.equal(formatP99FrameMs(-1.5), '');
+
+  assert.equal(formatZeroCopyUploads(120), 'Bink2 zero-copy: 120');
+  assert.equal(formatZeroCopyUploads(0), 'Bink2 zero-copy: 0');
+  assert.equal(formatZeroCopyUploads(42.9), 'Bink2 zero-copy: 42');
+  assert.equal(formatZeroCopyUploads(15n), 'Bink2 zero-copy: 15');
+  assert.equal(formatZeroCopyUploads(null), '');
+  assert.equal(formatZeroCopyUploads(undefined), '');
+  assert.equal(formatZeroCopyUploads(-3), '');
+  assert.equal(formatZeroCopyUploads(Number.NaN), '');
+
+  assert.equal(
+    formatPerfMetricsSummary({
+      onePercentLowFps: 58.6,
+      p99FrameMs: 16.666,
+      zeroCopyUploads: 120,
+    }),
+    '1% low: 59 fps · p99: 16.7 ms · Bink2 zero-copy: 120'
+  );
+  assert.equal(formatPerfMetricsSummary({ onePercentLowFps: 45 }), '1% low: 45 fps');
+  assert.equal(formatPerfMetricsSummary({ zeroCopyUploads: 12 }), 'Bink2 zero-copy: 12');
+  assert.equal(formatPerfMetricsSummary({}), '');
+  assert.equal(formatPerfMetricsSummary(null), '');
+
+  // 2. Integrated HudController rendering & telemetry snapshots.
+  const fpsEl = createSpyDisplayElement();
+  const bootStatusEl = createSpyDisplayElement();
+  const onePercentLowFpsEl = createSpyDisplayElement();
+  const p99FrameMsEl = createSpyDisplayElement();
+  const zeroCopyUploadsEl = createSpyDisplayElement();
+
+  const controller = new HudController({
+    bootMode: 'real-wasm64',
+    displayElements: {
+      fpsEl,
+      bootStatusEl,
+      onePercentLowFpsEl,
+      p99FrameMsEl,
+      zeroCopyUploadsEl,
+    },
+  });
+
+  // Unsupplied metrics remain null and do not clutter boot status text.
+  const initialGpu = controller.getTelemetry().gpu;
+  assert.equal(initialGpu.onePercentLowFps, null);
+  assert.equal(initialGpu.p99FrameMs, null);
+  assert.equal(initialGpu.zeroCopyUploads, null);
+  assert.equal(initialGpu.perfSummaryText, '');
+  assert.equal(bootStatusEl.textContent, 'Real Wasm64 Guest');
+  assert.equal(onePercentLowFpsEl.textContent, '--');
+  assert.equal(p99FrameMsEl.textContent, '--');
+  assert.equal(zeroCopyUploadsEl.textContent, '--');
+
+  // Supply all three via updateTelemetry.
+  controller.updateTelemetry({
+    gpu: {
+      realPackDrawCount: 20,
+      presentCount: 60,
+      fps: 60,
+      onePercentLowFps: 54.2,
+      p99FrameMs: 18.44,
+      zeroCopyUploads: 45,
+    },
+  });
+
+  const gpu = controller.getTelemetry().gpu;
+  assert.equal(gpu.onePercentLowFps, 54.2);
+  assert.equal(gpu.p99FrameMs, 18.44);
+  assert.equal(gpu.zeroCopyUploads, 45);
+  assert.equal(gpu.onePercentLowFpsText, '1% low: 54 fps');
+  assert.equal(gpu.p99FrameMsText, 'p99: 18.4 ms');
+  assert.equal(gpu.zeroCopyUploadsText, 'Bink2 zero-copy: 45');
+  assert.equal(gpu.perfSummaryText, '1% low: 54 fps · p99: 18.4 ms · Bink2 zero-copy: 45');
+
+  const bootStatus = controller.getBootStatus();
+  assert.equal(bootStatus.onePercentLowFps, 54.2);
+  assert.equal(bootStatus.p99FrameMs, 18.44);
+  assert.equal(bootStatus.zeroCopyUploads, 45);
+  assert.equal(
+    bootStatusEl.textContent,
+    'Real Wasm64 Guest — Draws: 20 real (60 presents) — 1% low: 54 fps · p99: 18.4 ms · Bink2 zero-copy: 45'
+  );
+  assert.equal(onePercentLowFpsEl.textContent, '1% low: 54 fps');
+  assert.equal(onePercentLowFpsEl.dataset.onePercentLowFps, '54.2');
+  assert.equal(p99FrameMsEl.textContent, 'p99: 18.4 ms');
+  assert.equal(p99FrameMsEl.dataset.p99FrameMs, '18.44');
+  assert.equal(zeroCopyUploadsEl.textContent, 'Bink2 zero-copy: 45');
+  assert.equal(zeroCopyUploadsEl.dataset.zeroCopyUploads, '45');
+  assert.equal(fpsEl.title, '1% low: 54 fps · p99: 18.4 ms · Bink2 zero-copy: 45');
+  assert.equal(fpsEl.dataset.onePercentLowFps, '54.2');
+  assert.equal(fpsEl.dataset.p99FrameMs, '18.44');
+
+  // Nested frames + bink payload and splash-frame-presented zeroCopyUploads updates.
+  controller.updateTelemetry({
+    frames: { onePercentLowFps: 48.1, p99FrameMs: 21.3 },
+    bink: { zeroCopyUploads: 99 },
+  });
+  assert.equal(onePercentLowFpsEl.textContent, '1% low: 48 fps');
+  assert.equal(p99FrameMsEl.textContent, 'p99: 21.3 ms');
+  assert.equal(zeroCopyUploadsEl.textContent, 'Bink2 zero-copy: 99');
+
+  controller.onSplashFramePresented({
+    ok: true,
+    framesPresented: 65,
+    zeroCopyUploads: 105,
+  });
+  assert.equal(controller.getTelemetry().gpu.zeroCopyUploads, 105);
+  assert.equal(zeroCopyUploadsEl.textContent, 'Bink2 zero-copy: 105');
+
+  // PerfMonitor zero-tick (p99FrameTimeMs: 0) MUST NOT clobber real p99FrameMs, while positive p99FrameTimeMs updates it.
+  controller.updateMetrics({ fps: 0, totalFrames: 0, p99FrameTimeMs: 0 });
+  assert.equal(controller.getTelemetry().gpu.p99FrameMs, 21.3);
+  controller.updateMetrics({ fps: 60, totalFrames: 70, p99FrameTimeMs: 19.5 });
+  assert.equal(controller.getTelemetry().gpu.p99FrameMs, 19.5);
+  assert.equal(p99FrameMsEl.textContent, 'p99: 19.5 ms');
+
+  // Hostile / invalid inputs sanitize safely to null without throwing or leaking NaN/negatives.
+  assert.doesNotThrow(() => {
+    controller.updateTelemetry({
+      gpu: {
+        onePercentLowFps: -5,
+        p99FrameMs: Number.NaN,
+        zeroCopyUploads: -99,
+      },
+    });
+  });
+  const sanitized = controller.getTelemetry().gpu;
+  assert.equal(sanitized.onePercentLowFps, null);
+  assert.equal(sanitized.p99FrameMs, null);
+  assert.equal(sanitized.zeroCopyUploads, null);
+  assert.equal(sanitized.perfSummaryText, '');
+  assert.equal(onePercentLowFpsEl.textContent, '--');
+  assert.equal(p99FrameMsEl.textContent, '--');
+  assert.equal(zeroCopyUploadsEl.textContent, '--');
+  assert.equal(fpsEl.dataset.onePercentLowFps, undefined);
+  assert.equal(fpsEl.dataset.p99FrameMs, undefined);
+
+  // resetTelemetry clears all new metrics cleanly.
+  controller.updateTelemetry({
+    gpu: { onePercentLowFps: 50, p99FrameMs: 20, zeroCopyUploads: 10 },
+  });
+  controller.resetTelemetry();
+  assert.equal(controller.getTelemetry().gpu.onePercentLowFps, null);
+  assert.equal(controller.getTelemetry().gpu.p99FrameMs, null);
+  assert.equal(controller.getTelemetry().gpu.zeroCopyUploads, null);
+  assert.equal(onePercentLowFpsEl.textContent, '--');
+  assert.equal(p99FrameMsEl.textContent, '--');
+  assert.equal(zeroCopyUploadsEl.textContent, '--');
+
+  controller.destroy();
 });

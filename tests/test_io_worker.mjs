@@ -16,6 +16,7 @@ const ioWorkerMod = require('../web/workers/io_worker.js');
 const mailboxMod = require('../web/workers/httpfs_mailbox.js');
 
 const {
+  IO_PRIORITY,
   DEFAULT_IMMUTABLE_CHUNK_SIZE,
   DEFAULT_IMMUTABLE_MAX_BYTES,
   DEFAULT_DUMP_ENDPOINT,
@@ -26,9 +27,15 @@ const {
   MAX_SLAB_SIZE,
   MAX_SLAB_CACHE_BYTES,
   VIDEO_STREAM_SLAB_PRESET,
+  DEFAULT_BATCH_COALESCE_MAX_GAP_BYTES,
+  DEFAULT_BATCH_COALESCE_MAX_BYTES,
   ImmutableHttpfsCache,
   IoWorkerController,
+  coalesceBatchReadRequests,
+  collectTransferableBuffers,
   createSlabCacheTuningProfile,
+  emptyStats,
+  emptyStreamingStats,
   isDumpVirtualPath,
   isImmutableHttpfsPath,
   isVideoStreamPath,
@@ -1925,4 +1932,513 @@ test('W173: classic Web Worker self.onmessage forwards dump writes, slab tuning,
     mock.dumpedFiles.get('/__pg6_dump/worker_pso.dxil'),
     new Uint8Array([1, 2, 3, 4, 5]),
   );
+});
+
+// ---------------------------------------------------------------------------
+// 9. W219: Batched multi-range read dispatch, zero-copy slicing & streaming telemetry
+// ---------------------------------------------------------------------------
+
+test('W219: coalesceBatchReadRequests merges adjacent/aliased ranges, promotes priority, and isolates invalid/zero entries', () => {
+  assert.equal(DEFAULT_BATCH_COALESCE_MAX_GAP_BYTES, 64 * 1024);
+  assert.equal(DEFAULT_BATCH_COALESCE_MAX_BYTES, 2 * 1024 * 1024);
+
+  const plan = coalesceBatchReadRequests(
+    [
+      { id: 'r0', path: 'G:\\audio.rpf', offset: 128, length: 64, priority: IO_PRIORITY.NORMAL },
+      { id: 'r1', path: '/game/audio.rpf', offset: 0, length: 64, priority: IO_PRIORITY.PREFETCH },
+      { id: 'r2', path: 'audio.rpf', offset: 64, length: 64, priority: IO_PRIORITY.CRITICAL },
+      { id: 'r3', path: 'audio.rpf', offset: 5000, length: 32 }, // beyond maxGapBytes=128 -> separate group
+      { id: 'r4', path: 'notes.txt', offset: 10, length: 20 }, // different asset
+      { id: 'r5', path: 'notes.txt', offset: 40, length: 0 }, // zero-length valid read
+      { id: 'r6', path: '../escape.bin', offset: 0, length: 16 }, // traversal -> invalid
+      { id: 'r7', path: 'notes.txt', offset: -5, length: 16 }, // negative offset -> invalid
+      { id: 'r8', path: 'notes.txt', offset: 0, length: -1 }, // negative length -> invalid
+    ],
+    {
+      dataBase: '/data/',
+      bootBase: '/boot/',
+      gameBase: '/game/',
+      maxGapBytes: 128,
+      maxCoalescedBytes: 1024,
+    },
+  );
+
+  assert.equal(plan.zeroItems.length, 1);
+  assert.equal(plan.zeroItems[0].id, 'r5');
+  assert.equal(plan.invalidItems.length, 3);
+  assert.deepEqual(
+    plan.invalidItems.map((x) => [x.id, x.errno]),
+    [
+      ['r6', -22],
+      ['r7', -22],
+      ['r8', -22],
+    ],
+  );
+
+  // Groups: 1 coalesced group [0..192) on /game/audio.rpf, 1 disjoint [5000..5032) on /game/audio.rpf, 1 on /data/notes.txt
+  assert.equal(plan.groups.length, 3);
+  const mergedGroup = plan.groups.find((g) => g.route.url === '/game/audio.rpf' && g.offset === 0);
+  assert.ok(mergedGroup);
+  assert.equal(mergedGroup.coalesced, true);
+  assert.equal(mergedGroup.offset, 0);
+  assert.equal(mergedGroup.length, 192);
+  assert.equal(mergedGroup.gapBytes, 0);
+  assert.equal(mergedGroup.priority, IO_PRIORITY.CRITICAL);
+  assert.deepEqual(
+    mergedGroup.items.map((it) => it.id),
+    ['r1', 'r2', 'r0'],
+  );
+
+  const farGroup = plan.groups.find((g) => g.route.url === '/game/audio.rpf' && g.offset === 5000);
+  assert.ok(farGroup);
+  assert.equal(farGroup.coalesced, false);
+  assert.equal(farGroup.length, 32);
+
+  // collectTransferableBuffers deduplicates shared ArrayBuffers and skips empty/SAB/failed entries
+  const shared = new Uint8Array(64);
+  const sab = new SharedArrayBuffer(16);
+  const transfer = collectTransferableBuffers([
+    { ok: true, bytes: shared.subarray(0, 32) },
+    { ok: true, bytes: shared.subarray(32, 64) },
+    { ok: true, bytes: new Uint8Array(0) },
+    { ok: true, bytes: new Uint8Array(sab) },
+    { ok: false, bytes: null },
+  ]);
+  assert.equal(transfer.length, 1);
+  assert.equal(transfer[0], shared.buffer);
+});
+
+test('W219: readBatch coalesces adjacent ranges into a single HTTP 206 fetch, slices with zero extra copies, and isolates overlapping callers', async () => {
+  const assetA = makePatternBytes(512, 0x21);
+  const assetB = makePatternBytes(256, 0x42);
+
+  const mock = createMockRangeFetch(
+    new Map([
+      ['/game/world.rpf', assetA],
+      ['/data/config.dat', assetB],
+    ]),
+  );
+
+  const controller = new IoWorkerController({
+    fetchImpl: mock.fetchImpl,
+    chunkSize: 64,
+    maxBytes: 8192,
+    opfsDir: null,
+  });
+  await controller.init({ dataBase: '/data/', bootBase: '/boot/', gameBase: '/game/' });
+  const reqsBefore = mock.requests.length;
+
+  // Batch with out-of-order adjacent ranges, small gap (16B), overlap, EOF clamp, past-EOF, zero-length, and second asset
+  const batch = await controller.readBatch(
+    [
+      { id: 'tail', path: 'G:\\world.rpf', offset: 120, length: 60 }, // [120..180) (gap 20B from [0..100))
+      { id: 'head', path: '/game/world.rpf', offset: 0, length: 64 }, // [0..64)
+      { id: 'mid', path: 'world.rpf', offset: 64, length: 36 }, // [64..100) adjacent to head
+      { id: 'overlap', path: 'world.rpf', offset: 32, length: 48 }, // [32..80) overlaps head & mid -> isolated copy
+      { id: 'eof_clamp', path: 'config.dat', offset: 220, length: 100 }, // clamps to [220..256) (36B)
+      { id: 'past_eof', path: 'config.dat', offset: 260, length: 32 }, // coalesces with eof_clamp (gap 4B) -> 0B
+      { id: 'empty', path: 'config.dat', offset: 10, length: 0 }, // zero-length -> 0B
+    ],
+    { maxGapBytes: 64, maxCoalescedBytes: 1024 },
+  );
+
+  assert.equal(batch.ok, true);
+  assert.equal(batch.requested, 7);
+  assert.equal(batch.succeeded, 7);
+  assert.equal(batch.failed, 0);
+  assert.equal(batch.fetches, 2); // 1 coalesced span for world.rpf + 1 coalesced span for config.bin
+  assert.equal(batch.coalescedFetches, 2);
+  assert.equal(batch.bytesTransferred, 60 + 64 + 36 + 48 + 36 + 0 + 0);
+
+  // Verify ONLY 2 HTTP 206 Range requests went over the wire (NOT 6 individual requests!)
+  const rangeReqs = mock.requests.slice(reqsBefore).filter((r) => r.rangeHeader);
+  assert.equal(rangeReqs.length, 2, `Expected 2 coalesced HTTP 206 fetches, got ${rangeReqs.length}`);
+
+  // Verify exact byte slicing fidelity in original caller order
+  const byId = new Map(batch.results.map((r) => [r.id, r]));
+  assert.equal(batch.results[0].id, 'tail');
+  assert.equal(batch.results[1].id, 'head');
+  assert.equal(batch.results[2].id, 'mid');
+  assert.equal(batch.results[3].id, 'overlap');
+  assert.equal(batch.results[4].id, 'eof_clamp');
+  assert.equal(batch.results[5].id, 'past_eof');
+  assert.equal(batch.results[6].id, 'empty');
+
+  assert.deepEqual(byId.get('head').bytes, assetA.subarray(0, 64));
+  assert.deepEqual(byId.get('mid').bytes, assetA.subarray(64, 100));
+  assert.deepEqual(byId.get('tail').bytes, assetA.subarray(120, 180));
+  assert.deepEqual(byId.get('overlap').bytes, assetA.subarray(32, 80));
+  assert.deepEqual(byId.get('eof_clamp').bytes, assetB.subarray(220, 256));
+  assert.equal(byId.get('past_eof').bytes.byteLength, 0);
+  assert.equal(byId.get('empty').bytes.byteLength, 0);
+
+  // Non-overlapping slices from the same coalesced span share ONE underlying ArrayBuffer (zero extra copies!)
+  assert.equal(byId.get('head').bytes.buffer, byId.get('mid').bytes.buffer);
+  assert.equal(byId.get('head').bytes.buffer, byId.get('tail').bytes.buffer);
+  assert.equal(byId.get('head').bytes.byteOffset, 0);
+  assert.equal(byId.get('mid').bytes.byteOffset, 64);
+  assert.equal(byId.get('tail').bytes.byteOffset, 120);
+
+  // Overlapping slice gets its own isolated ArrayBuffer so caller mutation never corrupts sibling slices
+  assert.notEqual(byId.get('overlap').bytes.buffer, byId.get('head').bytes.buffer);
+  byId.get('overlap').bytes.fill(0xff);
+  assert.deepEqual(byId.get('head').bytes, assetA.subarray(0, 64));
+  assert.deepEqual(byId.get('mid').bytes, assetA.subarray(64, 100));
+
+  // transferList is deduplicated: 1 shared buffer for world.rpf non-overlapping + 1 isolated overlap + 1 config.bin
+  assert.equal(batch.transferList.length, 3);
+  assert.equal(new Set(batch.transferList).size, 3);
+
+  // Repeat identical batch -> 100% cache hits with ZERO additional network fetches!
+  const reqsAfterFirst = mock.requests.length;
+  const cachedBatch = await controller.readBatch(
+    [
+      { id: 'c0', path: 'G:\\world.rpf', offset: 0, length: 64 },
+      { id: 'c1', path: 'G:\\world.rpf', offset: 64, length: 64 },
+    ],
+    { isolateBuffers: true },
+  );
+  assert.equal(cachedBatch.ok, true);
+  assert.equal(mock.requests.length, reqsAfterFirst, 'Warm batch read must make zero network fetches');
+  assert.deepEqual(cachedBatch.results[0].bytes, assetA.subarray(0, 64));
+  assert.deepEqual(cachedBatch.results[1].bytes, assetA.subarray(64, 128));
+  // isolateBuffers: true gives each caller its own ArrayBuffer
+  assert.notEqual(cachedBatch.results[0].bytes.buffer, cachedBatch.results[1].bytes.buffer);
+  assert.equal(cachedBatch.transferList.length, 2);
+
+  const stats = controller.getStats();
+  assert.equal(stats.batchedRequests, 2);
+  assert.equal(stats.coalescedFetches, 3);
+  assert.equal(stats.readsCompleted, 9);
+  assert.ok(stats.cacheHits > 0, `Expected positive cacheHits, got ${stats.cacheHits}`);
+  assert.equal(stats.errorCount, 0);
+});
+
+test('W219: readBatch error propagation isolates per-item failures by default and rejects on failFast or invalid input', async () => {
+  const validBytes = makePatternBytes(128, 0x77);
+  const mock = createMockRangeFetch(new Map([['/data/good.bin', validBytes]]), {
+    statusOverrides: new Map([['/data/forbidden.bin', 403]]),
+  });
+
+  const controller = new IoWorkerController({
+    fetchImpl: mock.fetchImpl,
+    chunkSize: 64,
+    maxBytes: 4096,
+    maxRetries: 0,
+    opfsDir: null,
+  });
+  await controller.init({ dataBase: '/data/' });
+
+  // Partial-error batch: 1 valid + 2 coalesced 404s + 1 HTTP 403 + 1 traversal + 1 bad offset
+  const mixed = await controller.readBatch([
+    { id: 'ok', path: 'good.bin', offset: 16, length: 32 },
+    { id: 'miss1', path: 'missing.bin', offset: 0, length: 16 },
+    { id: 'miss2', path: 'missing.bin', offset: 16, length: 16 },
+    { id: 'deny', path: 'forbidden.bin', offset: 0, length: 16 },
+    { id: 'trav', path: '../secret.bin', offset: 0, length: 16 },
+    { id: 'neg', path: 'good.bin', offset: -1, length: 16 },
+  ]);
+
+  assert.equal(mixed.ok, false);
+  assert.equal(mixed.requested, 6);
+  assert.equal(mixed.succeeded, 1);
+  assert.equal(mixed.failed, 5);
+
+  assert.equal(mixed.results[0].ok, true);
+  assert.deepEqual(mixed.results[0].bytes, validBytes.subarray(16, 48));
+
+  assert.equal(mixed.results[1].ok, false);
+  assert.equal(mixed.results[1].errno, -2);
+  assert.equal(mixed.results[1].bytes, null);
+
+  assert.equal(mixed.results[2].ok, false);
+  assert.equal(mixed.results[2].errno, -2);
+
+  assert.equal(mixed.results[3].ok, false);
+  assert.equal(mixed.results[3].errno, -13);
+
+  assert.equal(mixed.results[4].ok, false);
+  assert.equal(mixed.results[4].errno, -22);
+
+  assert.equal(mixed.results[5].ok, false);
+  assert.equal(mixed.results[5].errno, -22);
+
+  // Only the valid item's buffer is in transferList
+  assert.equal(mixed.transferList.length, 1);
+  assert.equal(mixed.transferList[0], mixed.results[0].bytes.buffer);
+  assert.equal(controller.getStats().errorCount, 5);
+  assert.equal(controller.getStats().readsCompleted, 1);
+
+  // failFast: true rejects immediately on HTTP 404 or validation error
+  await assert.rejects(
+    () =>
+      controller.readBatch([{ path: 'missing.bin', offset: 0, length: 16 }], {
+        failFast: true,
+      }),
+    /404/,
+  );
+  assert.equal(controller.getStats().errorCount, 6);
+
+  await assert.rejects(
+    () =>
+      controller.readBatch([{ path: '../escape.bin', offset: 0, length: 16 }], {
+        failFast: true,
+      }),
+    (err) => err && err.errno === -22,
+  );
+  assert.equal(controller.getStats().errorCount, 7);
+
+  // Non-array requests rejects with EINVAL (-22)
+  await assert.rejects(
+    () => controller.readBatch('not-an-array'),
+    (err) => err && err.errno === -22,
+  );
+  assert.equal(controller.getStats().errorCount, 8);
+
+  // Aborted signal propagates AbortError cleanly
+  const ac = new AbortController();
+  ac.abort('cancelled by caller');
+  const aborted = await controller.readBatch(
+    [{ id: 'ab', path: 'good.bin', offset: 0, length: 16 }],
+    { signal: ac.signal },
+  );
+  assert.equal(aborted.ok, false);
+  assert.equal(aborted.failed, 1);
+  assert.equal(controller.getStats().errorCount, 9);
+});
+
+test('W219: streaming telemetry tracks exact readsCompleted, bytesTransferred, batchedRequests, coalescedFetches, cacheHits, errorCount, and avgReadMs', async () => {
+  // Check baseline zeroed emptyStats() / emptyStreamingStats()
+  const baseEmpty = emptyStats();
+  const baseStreaming = emptyStreamingStats();
+  for (const key of [
+    'readsCompleted',
+    'bytesTransferred',
+    'batchedRequests',
+    'coalescedFetches',
+    'cacheHits',
+    'errorCount',
+    'avgReadMs',
+  ]) {
+    assert.equal(baseEmpty[key], 0, `emptyStats().${key} must default to 0`);
+    assert.equal(baseEmpty.streaming[key], 0, `emptyStats().streaming.${key} must default to 0`);
+    assert.equal(baseStreaming[key], 0, `emptyStreamingStats().${key} must default to 0`);
+  }
+
+  let clockMs = 1000;
+  const asset = makePatternBytes(256, 0x99);
+  const rawMock = createMockRangeFetch(new Map([['/data/stream.bin', asset]]));
+  const timedFetch = async (url, init) => {
+    const res = await rawMock.fetchImpl(url, init);
+    if (init && init.headers && init.headers.Range) {
+      clockMs += 12; // deterministic 12ms per network range fetch
+    }
+    return res;
+  };
+
+  const controller = new IoWorkerController({
+    fetchImpl: timedFetch,
+    chunkSize: 64,
+    maxBytes: 4096,
+    maxRetries: 0,
+    now: () => clockMs,
+    opfsDir: null,
+  });
+  await controller.init({ dataBase: '/data/' });
+
+  // 1. Single cold read: 40B taking 12ms -> readsCompleted=1, bytesTransferred=40, avgReadMs=12
+  const single = await controller.read('stream.bin', 0, 40);
+  assert.deepEqual(single, asset.subarray(0, 40));
+  let st = controller.getStats();
+  assert.equal(st.readsCompleted, 1);
+  assert.equal(st.bytesTransferred, 40);
+  assert.equal(st.batchedRequests, 0);
+  assert.equal(st.coalescedFetches, 0);
+  assert.equal(st.cacheHits, 0);
+  assert.equal(st.errorCount, 0);
+  assert.equal(st.avgReadMs, 12);
+  assert.equal(st.streaming.avgReadMs, 12);
+
+  // 2. Coalesced cold batch of 2 adjacent ranges in chunks 1 & 2 (12ms total for both)
+  const b1 = await controller.readBatch([
+    { path: 'stream.bin', offset: 64, length: 64 },
+    { path: 'stream.bin', offset: 128, length: 64 },
+  ]);
+  assert.equal(b1.ok, true);
+  assert.equal(b1.coalescedFetches, 1);
+  st = controller.getStats();
+  assert.equal(st.readsCompleted, 3); // 1 + 2
+  assert.equal(st.bytesTransferred, 40 + 64 + 64);
+  assert.equal(st.batchedRequests, 1);
+  assert.equal(st.coalescedFetches, 1);
+  assert.equal(st.avgReadMs, 12); // (12 + 12 + 12) / 3 = 12
+
+  // 3. Warm single read (0ms cache hit) -> avgReadMs = 36 / 4 = 9, cacheHits >= 1
+  const warm = await controller.read('stream.bin', 0, 32);
+  assert.deepEqual(warm, asset.subarray(0, 32));
+  st = controller.getStats();
+  assert.equal(st.readsCompleted, 4);
+  assert.equal(st.bytesTransferred, 40 + 64 + 64 + 32);
+  assert.equal(st.cacheHits, 1);
+  assert.equal(st.avgReadMs, 9);
+
+  // 4. Failed single read increments errorCount once (does not distort readsCompleted/avgReadMs)
+  await assert.rejects(() => controller.read('missing.bin', 0, 16), /404/);
+  st = controller.getStats();
+  assert.equal(st.errorCount, 1);
+  assert.equal(st.readsCompleted, 4);
+  assert.equal(st.avgReadMs, 9);
+
+  // 5. Sanitized telemetry contains zero paths or URLs
+  const json = JSON.stringify(st.streaming);
+  assert.equal(json.includes('stream.bin'), false);
+  assert.equal(json.includes('/data/'), false);
+
+  // 6. Re-init resets all streaming counters cleanly
+  await controller.init({ dataBase: '/data/' });
+  st = controller.getStats();
+  assert.equal(st.readsCompleted, 0);
+  assert.equal(st.bytesTransferred, 0);
+  assert.equal(st.batchedRequests, 0);
+  assert.equal(st.coalescedFetches, 0);
+  assert.equal(st.cacheHits, 0);
+  assert.equal(st.errorCount, 0);
+  assert.equal(st.avgReadMs, 0);
+});
+
+test('W219: classic Web Worker self.onmessage handles readBatch with zero-copy transferable ArrayBuffers and streaming stats', async () => {
+  const dataA = makePatternBytes(256, 0x3a);
+  const mock = createMockRangeFetch(new Map([['/game/textures.rpf', dataA]]));
+  const posted = [];
+  const workerSelf = {
+    onmessage: null,
+    postMessage(msg, transfer) {
+      // Simulate real browser structuredClone with transfer list to guarantee zero DataCloneError!
+      const cloned =
+        Array.isArray(transfer) && transfer.length > 0
+          ? structuredClone(msg, { transfer })
+          : structuredClone(msg);
+      posted.push({
+        msg: cloned,
+        transferCount: Array.isArray(transfer) ? transfer.length : 0,
+      });
+    },
+  };
+
+  class MockSyncXHR {
+    open(_method, url) {
+      this._url = url;
+    }
+    send() {
+      const resolved = path.resolve(repoRoot, 'web/workers', this._url);
+      this.status = 200;
+      this.responseText = fs.readFileSync(resolved, 'utf8');
+    }
+  }
+
+  // Deliberately omit `performance` to verify Date.now() fallback in minimal Worker scopes.
+  const sandbox = {
+    self: workerSelf,
+    globalThis: null,
+    fetch: mock.fetchImpl,
+    XMLHttpRequest: MockSyncXHR,
+    navigator: {},
+    Uint8Array,
+    Int32Array,
+    Uint32Array,
+    DataView,
+    ArrayBuffer,
+    SharedArrayBuffer,
+    Atomics,
+    BigInt,
+    TextEncoder,
+    TextDecoder,
+    AbortController,
+    Map,
+    Set,
+    WeakSet,
+    Promise,
+    Error,
+    Number,
+    Math,
+    Object,
+    Array,
+    Date,
+    setTimeout,
+    clearTimeout,
+    importScripts(scriptPath) {
+      const resolved = path.resolve(repoRoot, 'web/workers', scriptPath);
+      vm.runInContext(fs.readFileSync(resolved, 'utf8'), context, { filename: resolved });
+    },
+  };
+  sandbox.globalThis = sandbox;
+  const context = vm.createContext(sandbox);
+
+  const ioWorkerPath = path.join(repoRoot, 'web/workers/io_worker.js');
+  vm.runInContext(fs.readFileSync(ioWorkerPath, 'utf8'), context, { filename: ioWorkerPath });
+
+  assert.equal(typeof sandbox.PlayGta6IoWorker.coalesceBatchReadRequests, 'function');
+  assert.equal(typeof sandbox.PlayGta6IoWorker.collectTransferableBuffers, 'function');
+  assert.equal(typeof sandbox.PlayGta6IoWorker.emptyStreamingStats, 'function');
+
+  await workerSelf.onmessage({
+    data: { init: true, dataBase: '/data/', gameBase: '/game/', chunkSize: 64, maxBytes: 4096 },
+  });
+  assert.equal(posted[0].msg.ready, true);
+
+  const reqsBefore = mock.requests.length;
+  await workerSelf.onmessage({
+    data: {
+      readBatch: true,
+      id: 42,
+      requests: [
+        { id: 'a', path: 'G:\\textures.rpf', offset: 0, length: 64 },
+        { id: 'b', path: '/game/textures.rpf', offset: 64, length: 64 },
+        { id: 'c', path: 'textures.rpf', offset: 128, length: 32 },
+      ],
+    },
+  });
+
+  const batchReply = posted.find((p) => p.msg.id === 42);
+  assert.ok(batchReply);
+  assert.equal(batchReply.msg.ok, true);
+  assert.equal(batchReply.msg.requested, 3);
+  assert.equal(batchReply.msg.succeeded, 3);
+  assert.equal(batchReply.msg.failed, 0);
+  assert.equal(batchReply.msg.fetches, 1);
+  assert.equal(batchReply.msg.coalescedFetches, 1);
+  // All 3 non-overlapping slices shared 1 transferred ArrayBuffer (zero extra copies, no duplicate transfer!)
+  assert.equal(batchReply.transferCount, 1);
+  assert.equal(
+    mock.requests.slice(reqsBefore).filter((r) => r.rangeHeader).length,
+    1,
+    'Worker readBatch must coalesce all 3 adjacent ranges into 1 HTTP 206 fetch',
+  );
+  assert.deepEqual(batchReply.msg.results[0].bytes, dataA.subarray(0, 64));
+  assert.deepEqual(batchReply.msg.results[1].bytes, dataA.subarray(64, 128));
+  assert.deepEqual(batchReply.msg.results[2].bytes, dataA.subarray(128, 160));
+
+  // Verify error message on readBatch with invalid payload does not double-count errorCount
+  await workerSelf.onmessage({
+    data: { readBatch: true, id: 43, requests: 'bad' },
+  });
+  const errReply = posted.find((p) => p.msg.id === 43);
+  assert.ok(errReply && errReply.msg.error);
+  assert.equal(errReply.msg.errno, -22);
+
+  await workerSelf.onmessage({ data: { stats: true, id: 44 } });
+  const statsReply = posted.find((p) => p.msg.id === 44);
+  assert.ok(statsReply && statsReply.msg.stats);
+  const s = statsReply.msg.stats;
+  assert.equal(s.readsCompleted, 3);
+  assert.equal(s.bytesTransferred, 160);
+  assert.equal(s.batchedRequests, 1);
+  assert.equal(s.coalescedFetches, 1);
+  assert.equal(s.errorCount, 1);
+  assert.equal(typeof s.avgReadMs, 'number');
+  assert.ok(Number.isFinite(s.avgReadMs) && s.avgReadMs >= 0);
+  assert.equal(s.streaming.readsCompleted, 3);
+  assert.equal(s.streaming.bytesTransferred, 160);
+  assert.equal(s.streaming.coalescedFetches, 1);
+  assert.equal(s.streaming.errorCount, 1);
 });

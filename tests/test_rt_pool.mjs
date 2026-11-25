@@ -11,6 +11,7 @@ const rtPoolMod = require('../web/workers/rt_pool.js');
 const {
   DEFAULT_MAX_POOL_BYTES,
   DEFAULT_IDLE_FRAME_TTL,
+  DEFAULT_OVERSIZED_TARGET_BYTES,
   DEFAULT_MAX_TEXTURE_DIMENSION_2D,
   TEXTURE_USAGE,
   DEFAULT_TEXTURE_USAGE,
@@ -24,6 +25,7 @@ const {
   sanitizeRenderTargetDesc,
   normalizeRenderTargetDesc,
   makeRenderTargetKey,
+  makeTextureViewKey,
   estimateRenderTargetBytes,
   RenderTargetPool,
 } = rtPoolMod;
@@ -1873,4 +1875,375 @@ test('W175 memory-budget LRU eviction guards evict only idle targets and never d
     pool.release(activeHdr);
     pool.destroy();
   }
+});
+
+// ---------------------------------------------------------------------------
+// W200: GPUTextureView Caching, 4K Transient Target Reuse, Oversized Screen-
+//       Transition Eviction & Lightweight Telemetry
+// ---------------------------------------------------------------------------
+
+test('W200 caches default and parameterized GPUTextureViews for 4K and 1080p reuse with 0 createTexture/createView calls on hits', () => {
+  assert.equal(typeof makeTextureViewKey, 'function');
+  assert.equal(DEFAULT_OVERSIZED_TARGET_BYTES, 24 * 1024 * 1024);
+
+  // Default / redundant descriptors collapse to default view key.
+  assert.equal(makeTextureViewKey(undefined, 'rgba8unorm').isDefault, true);
+  assert.equal(makeTextureViewKey(null, 'rgba8unorm').isDefault, true);
+  assert.equal(makeTextureViewKey({}, 'rgba8unorm').isDefault, true);
+  assert.equal(makeTextureViewKey({ format: 'rgba8unorm' }, 'rgba8unorm').isDefault, true);
+  assert.equal(
+    makeTextureViewKey({ format: 'DXGI_FORMAT_R8G8B8A8_UNORM', aspect: 'all', baseMipLevel: 0 }, 'rgba8unorm')
+      .isDefault,
+    true
+  );
+
+  // Non-default view descriptors produce canonical deterministic keys independent of label.
+  const srgbKey1 = makeTextureViewKey({ format: 'rgba8unorm-srgb', label: 'pass-a' }, 'rgba8unorm');
+  const srgbKey2 = makeTextureViewKey(
+    { format: 'DXGI_FORMAT_R8G8B8A8_UNORM_SRGB', label: 'pass-b' },
+    'rgba8unorm'
+  );
+  assert.equal(srgbKey1.isDefault, false);
+  assert.equal(srgbKey1.key, srgbKey2.key);
+  assert.equal(srgbKey1.descriptor.format, 'rgba8unorm-srgb');
+
+  // Validation errors for malformed view descriptors.
+  assert.throws(() => makeTextureViewKey('bad', 'rgba8unorm'), TypeError);
+  assert.throws(() => makeTextureViewKey([], 'rgba8unorm'), TypeError);
+  assert.throws(() => makeTextureViewKey({ dimension: '4d' }, 'rgba8unorm'), RangeError);
+  assert.throws(() => makeTextureViewKey({ aspect: 'color-only' }, 'rgba8unorm'), RangeError);
+  assert.throws(() => makeTextureViewKey({ baseMipLevel: -1 }, 'rgba8unorm'), RangeError);
+  assert.throws(() => makeTextureViewKey({ mipLevelCount: 0 }, 'rgba8unorm'), RangeError);
+
+  const { device, createdTextures } = createMockGpuDevice();
+  const pool = new RenderTargetPool({ device });
+
+  // Fresh pool telemetry starts at 0.
+  let stats = pool.getStats();
+  assert.equal(stats.poolHits, 0);
+  assert.equal(stats.poolMisses, 0);
+  assert.equal(stats.viewsCached, 0);
+  assert.equal(stats.viewCacheHits, 0);
+  assert.equal(stats.viewCacheMisses, 0);
+  assert.equal(stats.evictions, 0);
+  assert.equal(stats.activeTargets, 0);
+  assert.equal(stats.idleTargets, 0);
+  assert.equal(stats.estimatedVramBytes, 0);
+
+  const desc4kColor = {
+    width: 3840,
+    height: 2160,
+    format: 'rgba8unorm',
+    viewFormats: ['rgba8unorm-srgb'],
+  };
+  const desc4kDepth = {
+    width: 3840,
+    height: 2160,
+    format: 'depth32float-stencil8',
+  };
+  const desc1080Ui = {
+    width: 1920,
+    height: 1080,
+    format: 'rgba8unorm-srgb',
+  };
+
+  // Frame 0: initial misses create 3 textures and 3 default cached views.
+  const rt4k = pool.acquire(desc4kColor, '4k-scene-color');
+  const rt4kDepth = pool.acquire(desc4kDepth, '4k-scene-depth');
+  const rt1080 = pool.acquire(desc1080Ui, '1080p-ui');
+
+  assert.equal(createdTextures.length, 3);
+  assert.equal(rt4k.texture.viewCreateCount, 1);
+  assert.equal(rt4kDepth.texture.viewCreateCount, 1);
+  assert.equal(rt1080.texture.viewCreateCount, 1);
+
+  // Requesting default views via handle.getView / pool.getView performs 0 createView calls.
+  assert.equal(rt4k.getView(), rt4k.view);
+  assert.equal(rt4k.getView({}), rt4k.view);
+  assert.equal(rt4k.getView({ format: 'rgba8unorm' }), rt4k.view);
+  assert.equal(pool.getView(rt4k), rt4k.view);
+  assert.equal(pool.getView(rt4k.id), rt4k.view);
+  assert.equal(rt4k.texture.viewCreateCount, 1);
+
+  // Requesting alternate sRGB view on 4K color and depth-only / stencil-only views on 4K depth
+  // creates each view once and caches them by normalized descriptor.
+  const srgbView1 = rt4k.getView({ format: 'rgba8unorm-srgb' });
+  const srgbView2 = pool.getView(rt4k, { format: 'DXGI_FORMAT_R8G8B8A8_UNORM_SRGB' });
+  assert.ok(srgbView1 !== null);
+  assert.notEqual(srgbView1, rt4k.view);
+  assert.equal(srgbView2, srgbView1);
+  assert.equal(rt4k.texture.viewCreateCount, 2);
+
+  const depthOnlyView1 = rt4kDepth.getView({ aspect: 'depth-only' });
+  const stencilOnlyView1 = rt4kDepth.getView({ aspect: 'stencil-only' });
+  assert.ok(depthOnlyView1 !== null);
+  assert.ok(stencilOnlyView1 !== null);
+  assert.notEqual(depthOnlyView1, stencilOnlyView1);
+  assert.equal(rt4kDepth.getView({ aspect: 'depth-only' }), depthOnlyView1);
+  assert.equal(rt4kDepth.texture.viewCreateCount, 3);
+
+  const expectedVramBytes =
+    3840 * 2160 * 4 + 3840 * 2160 * 8 + 1920 * 1080 * 4;
+  stats = pool.getStats();
+  assert.equal(stats.poolMisses, 3);
+  assert.equal(stats.poolHits, 0);
+  // 3 default views + 1 sRGB view + 1 depth-only + 1 stencil-only = 6 cached views
+  assert.equal(stats.viewsCached, 6);
+  assert.equal(stats.activeTargets, 3);
+  assert.equal(stats.idleTargets, 0);
+  assert.equal(stats.estimatedVramBytes, expectedVramBytes);
+
+  pool.release(rt4k);
+  pool.release(rt4kDepth);
+  pool.release(rt1080);
+  pool.endFrame();
+
+  // Frames 1..5: acquiring/reusing 4K and 1080p targets and their cached views performs
+  // ZERO createTexture and ZERO createView calls!
+  const texCountBeforeHits = createdTextures.length;
+  const viewCountsBeforeHits = createdTextures.map((t) => t.viewCreateCount);
+
+  for (let frame = 1; frame <= 5; frame += 1) {
+    const c = pool.acquire(desc4kColor, `4k-color-f${frame}`);
+    const d = pool.acquire(desc4kDepth, `4k-depth-f${frame}`);
+    const u = pool.acquire(desc1080Ui, `1080p-ui-f${frame}`);
+
+    assert.equal(c.reused, true);
+    assert.equal(d.reused, true);
+    assert.equal(u.reused, true);
+    assert.equal(c.texture, rt4k.texture);
+    assert.equal(d.texture, rt4kDepth.texture);
+    assert.equal(u.texture, rt1080.texture);
+    assert.equal(c.view, rt4k.view);
+    assert.equal(d.view, rt4kDepth.view);
+    assert.equal(u.view, rt1080.view);
+    assert.equal(c.getView({ format: 'rgba8unorm-srgb' }), srgbView1);
+    assert.equal(d.getView({ aspect: 'depth-only' }), depthOnlyView1);
+    assert.equal(d.getView({ aspect: 'stencil-only' }), stencilOnlyView1);
+
+    // Stale handle rt4k must not steal or create views via pool.getView while c owns the lease.
+    assert.equal(pool.getView(rt4k, { format: 'rgba8unorm-srgb' }), null);
+
+    pool.release(c);
+    pool.release(d);
+    pool.release(u);
+    pool.endFrame();
+  }
+
+  assert.equal(createdTextures.length, texCountBeforeHits, '0 createTexture calls on pool hits');
+  assert.deepEqual(
+    createdTextures.map((t) => t.viewCreateCount),
+    viewCountsBeforeHits,
+    '0 createView calls on pool hits'
+  );
+
+  stats = pool.getStats();
+  assert.equal(stats.poolHits, 15);
+  assert.equal(stats.poolMisses, 3);
+  assert.equal(stats.viewsCached, 6);
+  assert.equal(stats.activeTargets, 0);
+  assert.equal(stats.idleTargets, 3);
+  assert.equal(stats.estimatedVramBytes, expectedVramBytes);
+  assert.equal(stats.evictions, 0);
+
+  // Evicting via invalidateAll() invalidates all cached views cleanly.
+  assert.equal(pool.invalidateAll(), 3);
+  assert.equal(rt4k.view, null);
+  assert.equal(rt4k.getView(), null);
+  assert.equal(rt4k.getView({ format: 'rgba8unorm-srgb' }), null);
+  assert.equal(pool.getView(rt4k), null);
+  assert.equal(rt4kDepth.view, null);
+  assert.equal(rt4kDepth.getView({ aspect: 'depth-only' }), null);
+  assert.equal(rt1080.view, null);
+
+  stats = pool.getStats();
+  assert.equal(stats.viewsCached, 0);
+  assert.equal(stats.evictions, 3);
+  assert.equal(stats.idleTargets, 0);
+  assert.equal(stats.estimatedVramBytes, 0);
+
+  // Re-acquiring after eviction allocates fresh texture + fresh cached view.
+  const rt4kFresh = pool.acquire(desc4kColor, '4k-after-evict');
+  assert.equal(rt4kFresh.reused, false);
+  assert.notEqual(rt4kFresh.texture, rt4k.texture);
+  assert.notEqual(rt4kFresh.view, rt4k.view);
+  assert.equal(pool.getStats().viewsCached, 1);
+
+  pool.destroy();
+  assert.equal(rt4kFresh.view, null);
+  assert.equal(rt4kFresh.getView(), null);
+  assert.equal(pool.getStats().viewsCached, 0);
+  assert.equal(pool.getStats().estimatedVramBytes, 0);
+  assert.throws(() => pool.getView(rt4kFresh), /destroyed/i);
+});
+
+test('W200 configurable memory budget and oversized idle-frame eviction prevent VRAM leaks across intro -> Start Screen -> menus', () => {
+  const bytes4kHdr = 3840 * 2160 * 8; // 66,355,200 B (~63.3 MiB)
+  const bytes4kRgba8 = 3840 * 2160 * 4; // 33,177,600 B (~31.6 MiB)
+  const bytes1080Rgba8 = 1920 * 1080 * 4; // 8,294,400 B (~7.9 MiB)
+  const bytes1080Depth = 1920 * 1080 * 4; // 8,294,400 B (~7.9 MiB)
+
+  const { device, createdTextures } = createMockGpuDevice();
+  // Configure via maxVramBytes / maxIdleFrames aliases + oversizedIdleFrameTtl for 4K targets.
+  const pool = new RenderTargetPool({
+    device,
+    maxVramBytes: 256 * 1024 * 1024,
+    maxIdleFrames: 8,
+    oversizedTargetBytes: DEFAULT_OVERSIZED_TARGET_BYTES, // 24 MiB
+    oversizedIdleFrameTtl: 2,
+  });
+
+  assert.equal(pool.maxPoolBytes, 256 * 1024 * 1024);
+  assert.equal(pool.idleFrameTtl, 8);
+  assert.equal(pool.oversizedTargetBytes, DEFAULT_OVERSIZED_TARGET_BYTES);
+  assert.equal(pool.oversizedIdleFrameTtl, 2);
+
+  const intro4kHdrDesc = { width: 3840, height: 2160, format: 'rgba16float' };
+  const intro4kColorDesc = { width: 3840, height: 2160, format: 'rgba8unorm' };
+  const start1080ColorDesc = { width: 1920, height: 1080, format: 'rgba8unorm-srgb' };
+  const start1080DepthDesc = { width: 1920, height: 1080, format: 'depth32float' };
+
+  // Phase 1 (Intro): 2 frames using 4K HDR + 4K color targets (reused with 0 churn).
+  let introHdr = pool.acquire(intro4kHdrDesc, 'intro-4k-hdr');
+  let introColor = pool.acquire(intro4kColorDesc, 'intro-4k-color');
+  pool.release(introHdr);
+  pool.release(introColor);
+  pool.endFrame(); // frame 1
+
+  introHdr = pool.acquire(intro4kHdrDesc, 'intro-4k-hdr-f1');
+  introColor = pool.acquire(intro4kColorDesc, 'intro-4k-color-f1');
+  assert.equal(introHdr.reused, true);
+  assert.equal(introColor.reused, true);
+  assert.equal(createdTextures.length, 2);
+  pool.release(introHdr); // lastUsedFrame = 1
+  pool.release(introColor); // lastUsedFrame = 1
+  pool.endFrame(); // frame 2
+
+  // Phase 2 (Start Screen): switches to 1080p UI + depth; 4K intro targets are now unused.
+  for (let i = 0; i < 2; i += 1) {
+    const uiColor = pool.acquire(start1080ColorDesc, 'start-1080p-color');
+    const uiDepth = pool.acquire(start1080DepthDesc, 'start-1080p-depth');
+    assert.equal(uiColor.reused, i > 0);
+    assert.equal(uiDepth.reused, i > 0);
+    pool.release(uiColor);
+    pool.release(uiDepth);
+    const res = pool.endFrame();
+    if (i === 0) {
+      // frame 3: 4K idle age = 3 - 1 = 2 <= oversizedIdleFrameTtl (2) -> still warm.
+      assert.equal(res.evictedCount, 0);
+    } else {
+      // frame 4: 4K idle age = 4 - 1 = 3 > oversizedIdleFrameTtl (2) -> BOTH 4K targets evicted!
+      assert.equal(res.evictedCount, 2);
+    }
+  }
+
+  // Oversized 4K targets destroyed & views invalidated; 1080p Start Screen targets stay warm!
+  assert.equal(createdTextures[0].destroyed, true);
+  assert.equal(createdTextures[1].destroyed, true);
+  assert.equal(introHdr.view, null);
+  assert.equal(introColor.view, null);
+  assert.equal(createdTextures[2].destroyed, false);
+  assert.equal(createdTextures[3].destroyed, false);
+
+  let stats = pool.getStats();
+  assert.equal(stats.evictions, 2);
+  assert.equal(stats.idleEvictions, 2);
+  assert.equal(stats.idleTargets, 2);
+  assert.equal(stats.activeTargets, 0);
+  assert.equal(stats.viewsCached, 2);
+  assert.equal(stats.estimatedVramBytes, bytes1080Rgba8 + bytes1080Depth);
+  assert.equal(
+    stats.peakVramBytes,
+    bytes4kHdr + bytes4kRgba8 + bytes1080Rgba8 + bytes1080Depth
+  );
+
+  // Phase 3 (Menus): trimToBudget reclaims idle targets without mutating maxPoolBytes
+  // and without touching active targets.
+  const activeMenuRt = pool.acquire(start1080ColorDesc, 'menu-active-color');
+  assert.equal(activeMenuRt.reused, true);
+  // Active is 1080p color (8.29 MB), idle is 1080p depth (8.29 MB).
+  // trimToBudget(bytes1080Rgba8) evicts the idle 1080p depth while keeping activeMenuRt alive.
+  const trimRes = pool.trimToBudget(bytes1080Rgba8);
+  assert.deepEqual(trimRes, { evictedCount: 1, evictedBytes: bytes1080Depth });
+  assert.equal(createdTextures[3].destroyed, true);
+  assert.equal(createdTextures[2].destroyed, false);
+  assert.equal(pool.maxPoolBytes, 256 * 1024 * 1024, 'trimToBudget must not alter maxPoolBytes');
+
+  stats = pool.getStats();
+  assert.equal(stats.activeTargets, 1);
+  assert.equal(stats.idleTargets, 0);
+  assert.equal(stats.viewsCached, 1);
+  assert.equal(stats.estimatedVramBytes, bytes1080Rgba8);
+  assert.equal(stats.evictions, 3);
+  assert.equal(stats.budgetEvictions, 1);
+
+  // Release activeMenuRt and verify runtime setIdleFrameTtl + setOversizedEvictionPolicy + evictIdle minBytes.
+  pool.release(activeMenuRt);
+  const bigTemp = pool.acquire(intro4kColorDesc, 'menu-photo-mode-4k');
+  pool.release(bigTemp); // lastUsedFrame = 4
+
+  // evictIdle with minBytes only evicts idle targets >= 24 MiB (bigTemp), sparing 1080p activeMenuRt.
+  const bigOnlyRes = pool.evictIdle(0, { minBytes: DEFAULT_OVERSIZED_TARGET_BYTES });
+  assert.deepEqual(bigOnlyRes, { evictedCount: 1, evictedBytes: bytes4kRgba8 });
+  assert.equal(bigTemp.destroyed, true);
+  assert.equal(bigTemp.view, null);
+  assert.equal(createdTextures[2].destroyed, false);
+  assert.equal(pool.getStats().idleTargets, 1);
+  assert.equal(pool.getStats().viewsCached, 1);
+
+  // Advance 2 frames, then tighten idleFrameTtl via setIdleFrameTtl(1) -> immediately evicts aged 1080p target.
+  pool.endFrame(); // frame 5
+  pool.endFrame(); // frame 6 (age = 6 - 4 = 2 > 1)
+  const ttlRes = pool.setIdleFrameTtl(1);
+  assert.deepEqual(ttlRes, { evictedCount: 1, evictedBytes: bytes1080Rgba8 });
+  assert.equal(pool.idleFrameTtl, 1);
+  assert.equal(pool.getStats().idleTargets, 0);
+  assert.equal(pool.getStats().viewsCached, 0);
+  assert.equal(pool.getStats().estimatedVramBytes, 0);
+
+  // Runtime setOversizedEvictionPolicy updates and validates cleanly.
+  assert.deepEqual(
+    pool.setOversizedEvictionPolicy({ oversizedTargetBytes: 16 * 1024 * 1024, oversizedIdleFrameTtl: 1 }),
+    { evictedCount: 0, evictedBytes: 0 }
+  );
+  assert.equal(pool.oversizedTargetBytes, 16 * 1024 * 1024);
+  assert.equal(pool.oversizedIdleFrameTtl, 1);
+
+  assert.throws(() => pool.setIdleFrameTtl(-1), RangeError);
+  assert.throws(() => pool.trimToBudget(-1), RangeError);
+  assert.throws(() => pool.evictIdle(0, { minBytes: -1 }), RangeError);
+  assert.throws(() => pool.setOversizedEvictionPolicy(null), TypeError);
+  assert.throws(() => pool.setOversizedEvictionPolicy({ oversizedTargetBytes: 0 }), RangeError);
+  assert.throws(() => pool.setOversizedEvictionPolicy({ oversizedIdleFrameTtl: -1 }), RangeError);
+
+  pool.destroy();
+  assert.throws(() => pool.setIdleFrameTtl(2), /destroyed/i);
+  assert.throws(() => pool.trimToBudget(0), /destroyed/i);
+  assert.throws(() => pool.setOversizedEvictionPolicy({ oversizedIdleFrameTtl: 0 }), /destroyed/i);
+});
+
+test('W200 classic-worker importScripts compatibility keeps new helpers isolated inside IIFE', () => {
+  const rtPoolPath = fileURLToPath(new URL('../web/workers/rt_pool.js', import.meta.url));
+  const source = readFileSync(rtPoolPath, 'utf8');
+
+  const sandbox = { console };
+  const ctx = vm.createContext(sandbox);
+  ctx.self = ctx;
+
+  assert.doesNotThrow(() => {
+    vm.runInContext(source, ctx, { filename: rtPoolPath });
+    vm.runInContext(source, ctx, { filename: rtPoolPath });
+    vm.runInContext(
+      `
+      const DEFAULT_OVERSIZED_TARGET_BYTES = 1;
+      const VALID_VIEW_DIMENSIONS = [];
+      const VALID_VIEW_ASPECTS = [];
+      function makeTextureViewKey() {}
+      `,
+      ctx
+    );
+  });
+
+  assert.equal(ctx.PlayGta6RenderTargetPool.DEFAULT_OVERSIZED_TARGET_BYTES, 24 * 1024 * 1024);
+  assert.equal(typeof ctx.PlayGta6RenderTargetPool.makeTextureViewKey, 'function');
 });

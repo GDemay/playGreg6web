@@ -16,7 +16,9 @@ const {
   PlayGta6AudioWorkletProcessor,
   PROCESSOR_NAME,
   DEFAULT_DECLICK_FRAMES,
+  DEFAULT_FADE_IN_FRAMES,
   MAX_DECLICK_FRAMES,
+  DEFAULT_SAMPLE_CLAMP_LIMIT,
   HDR_WRITE_CURSOR,
   HDR_READ_CURSOR,
   HDR_CAPACITY_FRAMES,
@@ -428,12 +430,16 @@ test('W154 de-click fade-out spans seamlessly across quantum boundary when missi
   assert.equal(processor.framesProcessed, 112);
   assert.equal(processor.underrunFrames, 16 + 128);
 
-  // Recovery: push 128 frames -> exact playback, then next underrun triggers fadeOutCount === 2.
+  // Recovery: push 128 frames -> smooth linear fade-in back to (0.5, -0.5),
+  // then next underrun triggers fadeOutCount === 2.
   assert.equal(ring.pushSamples(makeConstantStereo(128, 0.5, -0.5)), 128);
   const q3 = makePlanarOutput(2, 128);
   assert.equal(processor.process([], q3), true);
-  assert.equal(q3[0][0][0], 0.5);
+  assert.equal(q3[0][0][0], 0.0);
+  assert.equal(q3[0][1][0], 0.0);
+  assert.equal(q3[0][0][fadeFrames], 0.5);
   assert.equal(q3[0][1][127], -0.5);
+  assert.equal(processor.fadeInCount, 1);
 
   const q4 = makePlanarOutput(2, 128);
   assert.equal(processor.process([], q4), true);
@@ -602,4 +608,515 @@ test('W154 lock-free stress run maintains finite output and exact frame/sanitize
   } finally {
     Atomics.wait = origWait;
   }
+});
+
+// ---------------------------------------------------------------------------
+// W227: Zero-Alloc Render Quantum Hardening, Recovery Fade-In & Sample Clamping
+// ---------------------------------------------------------------------------
+
+test('W227 exports DEFAULT_FADE_IN_FRAMES, DEFAULT_SAMPLE_CLAMP_LIMIT, and control messages for fade-in & clamping', () => {
+  assert.equal(DEFAULT_FADE_IN_FRAMES, DEFAULT_DECLICK_FRAMES);
+  assert.equal(DEFAULT_SAMPLE_CLAMP_LIMIT, 1.0);
+  assert.equal(globalThis.PlayGta6AudioWorklet.DEFAULT_FADE_IN_FRAMES, DEFAULT_FADE_IN_FRAMES);
+  assert.equal(
+    globalThis.PlayGta6AudioWorklet.DEFAULT_SAMPLE_CLAMP_LIMIT,
+    DEFAULT_SAMPLE_CLAMP_LIMIT
+  );
+
+  const ring = AudioRingBuffer.create(256, 2);
+  const processor = new PlayGta6AudioWorkletProcessor({
+    processorOptions: { sab: ring.sab },
+  });
+  const replies = attachMessageRecorder(processor);
+
+  // Defaults preserve full backward compatibility.
+  assert.equal(processor.declickFrames, 0);
+  assert.equal(processor.fadeInFrames, 0);
+  assert.equal(processor.fadeInCount, 0);
+  assert.equal(processor.inUnderrun, false);
+  assert.equal(processor.clampSamples, false);
+  assert.equal(processor.clampLimit, 0);
+  assert.equal(processor.clampedSamples, 0);
+
+  // Enabling declickFrames automatically configures matching fadeInFrames unless overridden.
+  processor.setDeclickFrames(32);
+  assert.equal(processor.fadeInFrames, 32);
+
+  // Explicit fade-in override via control message.
+  processor.port.onmessage({
+    data: { type: 'setFadeInFrames', fadeInFrames: 16, id: 'fi-1' },
+  });
+  assert.deepEqual(replies[replies.length - 1], {
+    type: 'fadeInFrames',
+    fadeInFrames: 16,
+    id: 'fi-1',
+  });
+  assert.equal(processor.fadeInFrames, 16);
+  assert.equal(processor.declickFrames, 32);
+
+  // Reset override back to tracking declickFrames.
+  assert.equal(processor.setFadeInFrames(null), 32);
+  assert.equal(processor.fadeInFrames, 32);
+
+  // Enable and customize sample clamping via control message.
+  processor.port.onmessage({
+    data: { type: 'setClampSamples', clampSamples: true, id: 'cl-1' },
+  });
+  assert.deepEqual(replies[replies.length - 1], {
+    type: 'clampSamples',
+    clampSamples: true,
+    clampLimit: 1.0,
+    id: 'cl-1',
+  });
+  assert.equal(processor.clampSamples, true);
+  assert.equal(processor.clampLimit, 1.0);
+
+  processor.port.onmessage({
+    data: { type: 'setSampleClamp', clampLimit: 0.85, id: 'cl-2' },
+  });
+  assert.deepEqual(replies[replies.length - 1], {
+    type: 'clampSamples',
+    clampSamples: true,
+    clampLimit: 0.85,
+    id: 'cl-2',
+  });
+  assert.equal(processor.clampLimit, 0.85);
+
+  // Disable sample clamping cleanly.
+  assert.equal(processor.setClampSamples(false), 0);
+  assert.equal(processor.clampSamples, false);
+
+  const stats = processor.getStats();
+  assert.equal(stats.fadeInFrames, 32);
+  assert.equal(stats.fadeInCount, 0);
+  assert.equal(stats.inUnderrun, false);
+  assert.equal(stats.clampSamples, false);
+  assert.equal(stats.clampLimit, 0);
+  assert.equal(stats.clampedSamples, 0);
+});
+
+test('W227 underrun fade-out and recovery fade-in produce strictly click-free bounded ramps and exact steady-state drain', () => {
+  const fadeFrames = 32;
+  const ampL = Math.fround(0.8);
+  const ampR = Math.fround(-0.6);
+  const maxStepL = Math.abs(ampL) / fadeFrames + 1e-5;
+  const maxStepR = Math.abs(ampR) / fadeFrames + 1e-5;
+
+  const ring = AudioRingBuffer.create(512, 2);
+  const processor = new PlayGta6AudioWorkletProcessor({
+    processorOptions: {
+      sab: ring.sab,
+      declickFrames: fadeFrames,
+    },
+  });
+
+  // 1. Steady-state drain: 2 full quanta -> 100% bit-exact, zero underruns/fades.
+  assert.equal(ring.pushSamples(makeConstantStereo(256, ampL, ampR)), 256);
+  for (let q = 0; q < 2; q++) {
+    const out = makePlanarOutput(2, 128, 99.0);
+    assert.equal(processor.process([], out), true);
+    for (let f = 0; f < 128; f++) {
+      assert.equal(out[0][0][f], ampL);
+      assert.equal(out[0][1][f], ampR);
+    }
+  }
+  assert.equal(ring.availableFrames(), 0);
+  assert.equal(processor.underruns, 0);
+  assert.equal(processor.fadeOutCount, 0);
+  assert.equal(processor.fadeInCount, 0);
+  assert.equal(processor.inUnderrun, false);
+
+  // 2. Partial underrun (64 frames available): smooth linear fade-out to 0.0.
+  assert.equal(ring.pushSamples(makeConstantStereo(64, ampL, ampR)), 64);
+  const qUnderrun = makePlanarOutput(2, 128, -5.0);
+  assert.equal(processor.process([], qUnderrun), true);
+  assert.equal(qUnderrun[0][0][63], ampL);
+  assert.equal(qUnderrun[0][0][64 + fadeFrames - 1], 0.0);
+  assert.equal(qUnderrun[0][1][64 + fadeFrames - 1], 0.0);
+  for (let f = 64; f < 128; f++) {
+    assert.ok(Math.abs(qUnderrun[0][0][f] - qUnderrun[0][0][f - 1]) <= maxStepL);
+    assert.ok(Math.abs(qUnderrun[0][1][f] - qUnderrun[0][1][f - 1]) <= maxStepR);
+  }
+  assert.equal(processor.inUnderrun, true);
+  assert.equal(processor.fadeOutCount, 1);
+  assert.equal(processor.fadeInCount, 0);
+  assert.equal(ring.underruns, 1);
+  assert.equal(ring.underrunFrames, 64);
+
+  // 3. Recovery: push 128 frames -> smooth monotonic fade-in 0.0 -> (ampL, ampR).
+  assert.equal(ring.pushSamples(makeConstantStereo(128, ampL, ampR)), 128);
+  const qRecover = makePlanarOutput(2, 128, 7.0);
+  assert.equal(processor.process([], qRecover), true);
+
+  assert.equal(qRecover[0][0][0], 0.0);
+  assert.equal(qRecover[0][1][0], 0.0);
+  for (let f = 1; f <= fadeFrames; f++) {
+    const stepL = Math.abs(qRecover[0][0][f] - qRecover[0][0][f - 1]);
+    const stepR = Math.abs(qRecover[0][1][f] - qRecover[0][1][f - 1]);
+    assert.ok(stepL <= maxStepL, `Recovery L step at frame ${f} (${stepL}) exceeded ${maxStepL}`);
+    assert.ok(stepR <= maxStepR, `Recovery R step at frame ${f} (${stepR}) exceeded ${maxStepR}`);
+    assert.ok(qRecover[0][0][f] >= qRecover[0][0][f - 1] - 1e-6);
+    assert.ok(qRecover[0][1][f] <= qRecover[0][1][f - 1] + 1e-6);
+  }
+  for (let f = fadeFrames; f < 128; f++) {
+    assert.equal(qRecover[0][0][f], ampL);
+    assert.equal(qRecover[0][1][f], ampR);
+  }
+  assert.equal(processor.inUnderrun, false);
+  assert.equal(processor.fadeInCount, 1);
+
+  // 4. Post-recovery steady-state quantum is 100% bit-exact without re-triggering fade-in.
+  assert.equal(ring.pushSamples(makeConstantStereo(128, ampL, ampR)), 128);
+  const qSteady = makePlanarOutput(2, 128);
+  assert.equal(processor.process([], qSteady), true);
+  for (let f = 0; f < 128; f++) {
+    assert.equal(qSteady[0][0][f], ampL);
+    assert.equal(qSteady[0][1][f], ampR);
+  }
+  assert.equal(processor.fadeInCount, 1);
+  assert.equal(processor.underruns, 1);
+});
+
+test('W227 mid-fade-out recovery crossfades seamlessly without jumping to zero and handles re-underrun mid-fade-in', () => {
+  const fadeFrames = 32;
+  const amp = Math.fround(0.8);
+  const maxStep = amp / fadeFrames + 1e-5;
+
+  const ring = AudioRingBuffer.create(256, 2);
+  const processor = new PlayGta6AudioWorkletProcessor({
+    processorOptions: {
+      sab: ring.sab,
+      declickFrames: fadeFrames,
+    },
+  });
+
+  // Quantum 1: 112 frames -> 16 missing (< 32 fadeFrames) -> ends mid-fade-out at 0.4.
+  assert.equal(ring.pushSamples(makeConstantStereo(112, amp, -amp)), 112);
+  const q1 = makePlanarOutput(2, 128);
+  assert.equal(processor.process([], q1), true);
+  assert.ok(Math.abs(q1[0][0][127] - 0.4) < 1e-5);
+  assert.equal(processor.inUnderrun, true);
+  assert.equal(processor.fadeOutCount, 1);
+
+  // Quantum 2: Only 8 fresh frames arrive mid-fade-out, immediately followed by another underrun!
+  // Must crossfade smoothly from Q1[127] (0.4) toward +0.8 for 8 frames, then fade out smoothly to 0.0.
+  assert.equal(ring.pushSamples(makeConstantStereo(8, amp, -amp)), 8);
+  const q2 = makePlanarOutput(2, 128, 3.0);
+  assert.equal(processor.process([], q2), true);
+
+  // Boundary between Q1[127] and Q2[0] has zero jump (starts at exact 0.4, NOT 0.0).
+  assert.ok(
+    Math.abs(q2[0][0][0] - q1[0][0][127]) <= maxStep,
+    `Mid-fade-out recovery jumped from ${q1[0][0][127]} to ${q2[0][0][0]}`
+  );
+  assert.ok(q2[0][0][0] > 0.39 && q2[0][0][0] < 0.41);
+
+  // Every adjacent sample across the entire quantum (crossfade-in + immediate re-fade-out) is bounded.
+  for (let f = 1; f < 128; f++) {
+    const stepL = Math.abs(q2[0][0][f] - q2[0][0][f - 1]);
+    const stepR = Math.abs(q2[0][1][f] - q2[0][1][f - 1]);
+    assert.ok(stepL <= maxStep, `L discontinuity at frame ${f}: step ${stepL} > ${maxStep}`);
+    assert.ok(stepR <= maxStep, `R discontinuity at frame ${f}: step ${stepR} > ${maxStep}`);
+  }
+  // Fade-out completes cleanly to exact 0.0.
+  assert.equal(q2[0][0][8 + fadeFrames - 1], 0.0);
+  assert.equal(q2[0][0][127], 0.0);
+  assert.equal(processor.fadeInCount, 1);
+  assert.equal(processor.fadeOutCount, 2);
+  assert.equal(processor.inUnderrun, true);
+
+  // Multi-quantum recovery fade-in when fadeInFrames (192) > 128-frame quantum.
+  processor.setFadeInFrames(192);
+  assert.equal(ring.pushSamples(makeConstantStereo(256, amp, -amp)), 256);
+
+  const q3 = makePlanarOutput(2, 128);
+  const q4 = makePlanarOutput(2, 128);
+  assert.equal(processor.process([], q3), true);
+  assert.equal(processor.process([], q4), true);
+
+  const maxStep192 = amp / 192 + 1e-5;
+  assert.equal(q3[0][0][0], 0.0);
+  assert.ok(Math.abs(q4[0][0][0] - q3[0][0][127]) <= maxStep192);
+  assert.ok(q3[0][0][127] > 0.5 && q3[0][0][127] < 0.55);
+  assert.equal(q4[0][0][64], amp);
+  assert.equal(q4[0][1][127], -amp);
+  assert.equal(processor.fadeInCount, 2);
+});
+
+test('W227 clamps finite out-of-range samples and sanitizes NaN/+-Infinity safely across all gain & channel paths', () => {
+  const ring = AudioRingBuffer.create(192, 2);
+  const processor = new PlayGta6AudioWorkletProcessor({
+    processorOptions: {
+      sab: ring.sab,
+      gain: 1.0,
+      smoothingFrames: 16,
+      clampSamples: true,
+    },
+  });
+
+  // 1. Unity gain + wrap-around: mix of NaN, +-Inf, out-of-range finite (+3.5, -2.5), and in-range samples.
+  const q1 = makeConstantStereo(128, 0.5, -0.5);
+  q1[0] = NaN;
+  q1[1] = 3.5; // > +1.0 -> +1.0
+  q1[2] = -2.5; // < -1.0 -> -1.0
+  q1[3] = Infinity;
+  q1[254] = -Infinity;
+  q1[255] = 1e20; // > +1.0 -> +1.0
+  assert.equal(pushRawSabFrames(ring.sab, q1), 128);
+
+  const out1 = makePlanarOutput(2, 128);
+  assert.equal(processor.process([], out1), true);
+  assert.equal(out1[0][0][0], 0.0);
+  assert.equal(out1[0][1][0], 1.0);
+  assert.equal(out1[0][0][1], -1.0);
+  assert.equal(out1[0][1][1], 0.0);
+  assert.equal(out1[0][0][127], 0.0);
+  assert.equal(out1[0][1][127], 1.0);
+  assert.equal(out1[0][0][10], 0.5);
+  assert.equal(out1[0][1][10], -0.5);
+  assert.equal(processor.sanitizedSamples, 3);
+  assert.equal(processor.clampedSamples, 3);
+
+  // 2. Wrap-around quantum at scalar gain 0.5 with custom clampLimit 0.8.
+  processor.setClampSamples(0.8);
+  processor.port.onmessage({ data: { type: 'setGain', gain: 0.5, immediate: true } });
+  const q2 = makeConstantStereo(128, 0.4, -0.4);
+  q2[10 * 2] = 2.0; // clamped to 0.8 -> * 0.5 = 0.4
+  q2[80 * 2 + 1] = -9.0; // wrapped segment, clamped to -0.8 -> * 0.5 = -0.4
+  q2[81 * 2] = NaN;
+  assert.equal(pushRawSabFrames(ring.sab, q2), 128);
+
+  const out2 = makePlanarOutput(2, 128);
+  assert.equal(processor.process([], out2), true);
+  assert.equal(out2[0][0][10], Math.fround(0.4));
+  assert.equal(out2[0][1][80], Math.fround(-0.4));
+  assert.equal(out2[0][0][81], 0.0);
+  assert.equal(processor.sanitizedSamples, 4);
+  assert.equal(processor.clampedSamples, 5);
+
+  // 3. Ramping gain path + muted steady-state path both clamp/count accurately.
+  processor.setClampSamples(1.0);
+  processor.port.onmessage({ data: { type: 'setMuted', muted: true } });
+  const q3 = makeConstantStereo(128, 0.25, -0.25);
+  q3[0] = 5.0; // clamped to 1.0 during ramp
+  q3[20 * 2 + 1] = -5.0; // clamped during post-ramp gain===0
+  assert.equal(pushRawSabFrames(ring.sab, q3), 128);
+  const out3 = makePlanarOutput(2, 128);
+  assert.equal(processor.process([], out3), true);
+  assert.ok(out3[0][0].every((v) => Number.isFinite(v) && Math.abs(v) <= 1.0));
+  assert.ok(out3[0][1].every((v) => Number.isFinite(v) && Math.abs(v) <= 1.0));
+  assert.equal(processor.clampedSamples, 7);
+
+  // Muted steady-state fast path still tracks out-of-range & non-finite samples.
+  const q4 = makeConstantStereo(128, 0.2, -0.2);
+  q4[0] = 4.0;
+  q4[1] = -Infinity;
+  assert.equal(pushRawSabFrames(ring.sab, q4), 128);
+  const out4 = makePlanarOutput(2, 128, 9.0);
+  assert.equal(processor.process([], out4), true);
+  assert.ok(out4[0][0].every((v) => v === 0.0));
+  assert.ok(out4[0][1].every((v) => v === 0.0));
+  assert.equal(processor.sanitizedSamples, 5);
+  assert.equal(processor.clampedSamples, 8);
+
+  // 4. Mono-to-stereo & 4-channel clamping.
+  const ringMono = AudioRingBuffer.create(128, 1);
+  const procMono = new PlayGta6AudioWorkletProcessor({
+    processorOptions: { sab: ringMono.sab, clampSamples: true },
+  });
+  const mono = new Float32Array(128);
+  mono.fill(0.25);
+  mono[3] = 2.5;
+  mono[4] = -3.0;
+  assert.equal(pushRawSabFrames(ringMono.sab, mono), 128);
+  const outMono = makePlanarOutput(2, 128);
+  assert.equal(procMono.process([], outMono), true);
+  assert.equal(outMono[0][0][3], 1.0);
+  assert.equal(outMono[0][1][3], 1.0);
+  assert.equal(outMono[0][0][4], -1.0);
+  assert.equal(outMono[0][1][4], -1.0);
+  assert.equal(procMono.clampedSamples, 2);
+
+  const ring4 = AudioRingBuffer.create(128, 4);
+  const proc4 = new PlayGta6AudioWorkletProcessor({
+    processorOptions: { sab: ring4.sab, sampleClampLimit: 1.0 },
+  });
+  const pcm4 = new Float32Array(128 * 4);
+  pcm4.fill(0.1);
+  pcm4[2 * 4 + 3] = -4.2;
+  pcm4[5 * 4 + 1] = 8.8;
+  assert.equal(pushRawSabFrames(ring4.sab, pcm4), 128);
+  const out4ch = makePlanarOutput(4, 128);
+  assert.equal(proc4.process([], out4ch), true);
+  assert.equal(out4ch[0][3][2], -1.0);
+  assert.equal(out4ch[0][1][5], 1.0);
+  assert.equal(proc4.clampedSamples, 2);
+});
+
+test('W227 process() performs strictly zero heap allocations across 256 quanta of steady-state, underrun, recovery, and clamping', () => {
+  const src = fs.readFileSync(
+    path.resolve(__dirname, '../web/workers/audio_worklet_processor.js'),
+    'utf8'
+  );
+
+  let allocationCount = 0;
+  let trackingAllocations = false;
+  let waitCalls = 0;
+
+  function trackCtor(RealCtor) {
+    return new Proxy(RealCtor, {
+      construct(target, args, newTarget) {
+        if (trackingAllocations) allocationCount++;
+        return Reflect.construct(target, args, newTarget);
+      },
+      apply(target, thisArg, args) {
+        if (trackingAllocations) allocationCount++;
+        return Reflect.apply(target, thisArg, args);
+      },
+    });
+  }
+
+  const trackedAtomics = {
+    load: Atomics.load,
+    store: Atomics.store,
+    add: Atomics.add,
+    wait() {
+      waitCalls++;
+      throw new Error('Atomics.wait must never be called on AudioWorklet thread');
+    },
+  };
+
+  let RegisteredProcessor = null;
+  class MockBase {
+    constructor() {
+      this.port = { onmessage: null, postMessage() {} };
+    }
+  }
+
+  const sandbox = {
+    AudioWorkletProcessor: MockBase,
+    registerProcessor(_name, ctor) {
+      RegisteredProcessor = ctor;
+    },
+    Array: trackCtor(Array),
+    Float32Array: trackCtor(Float32Array),
+    Int32Array: trackCtor(Int32Array),
+    Uint8Array: trackCtor(Uint8Array),
+    ArrayBuffer: trackCtor(ArrayBuffer),
+    SharedArrayBuffer: trackCtor(SharedArrayBuffer),
+    Object: Object.assign(trackCtor(Object), {
+      assign(...args) {
+        if (trackingAllocations) allocationCount++;
+        return Object.assign(...args);
+      },
+      create(...args) {
+        if (trackingAllocations) allocationCount++;
+        return Object.create(...args);
+      },
+    }),
+    Atomics: trackedAtomics,
+    Number,
+    Math,
+    Boolean,
+    String,
+    Error,
+    TypeError,
+    RangeError,
+  };
+  sandbox.globalThis = sandbox;
+  sandbox.self = sandbox;
+
+  vm.runInNewContext(src, sandbox, { filename: 'audio_worklet_processor.js' });
+  assert.equal(typeof RegisteredProcessor, 'function');
+
+  const ring = AudioRingBuffer.create(192, 2);
+  const processor = new RegisteredProcessor({
+    processorOptions: {
+      sab: ring.sab,
+      declickFrames: 32,
+      smoothingFrames: 16,
+      clampSamples: true,
+    },
+  });
+
+  // Pre-allocate reusable producer & output buffers outside process().
+  const out = makePlanarOutput(2, 128);
+  const fullChunk = makeConstantStereo(128, 0.5, -0.5);
+  fullChunk[4] = NaN;
+  fullChunk[5] = 2.5;
+  const partialChunk = makeConstantStereo(96, 0.6, -0.6);
+  partialChunk[10] = -Infinity;
+  partialChunk[11] = -3.0;
+
+  let expectedFrames = 0;
+  let expectedUnderruns = 0;
+  let expectedUnderrunFrames = 0;
+
+  for (let q = 0; q < 256; q++) {
+    if (q % 8 === 3) {
+      pushRawSabFrames(ring.sab, partialChunk);
+      expectedFrames += 96;
+      expectedUnderruns += 1;
+      expectedUnderrunFrames += 32;
+    } else if (q % 8 === 4) {
+      // Full empty underrun.
+      expectedUnderruns += 1;
+      expectedUnderrunFrames += 128;
+    } else {
+      pushRawSabFrames(ring.sab, fullChunk);
+      expectedFrames += 128;
+    }
+
+    trackingAllocations = true;
+    const keepAlive = processor.process([], out);
+    trackingAllocations = false;
+
+    assert.equal(keepAlive, true);
+    for (let f = 0; f < 128; f++) {
+      const l = out[0][0][f];
+      const r = out[0][1][f];
+      assert.ok(Number.isFinite(l) && Math.abs(l) <= 1.0);
+      assert.ok(Number.isFinite(r) && Math.abs(r) <= 1.0);
+    }
+  }
+
+  assert.equal(allocationCount, 0, `Expected 0 allocations in process(), got ${allocationCount}`);
+  assert.equal(waitCalls, 0);
+  assert.equal(processor.framesProcessed, expectedFrames);
+  assert.equal(processor.underruns, expectedUnderruns);
+  assert.equal(processor.underrunFrames, expectedUnderrunFrames);
+  assert.equal(ring.underruns, expectedUnderruns);
+  assert.equal(ring.underrunFrames, expectedUnderrunFrames);
+  assert.equal(ring.availableFrames(), 0);
+  assert.ok(processor.fadeOutCount > 0);
+  assert.ok(processor.fadeInCount > 0);
+  assert.ok(processor.sanitizedSamples > 0);
+  assert.ok(processor.clampedSamples > 0);
+});
+
+test('W227 defends against corrupted SAB cursors and degenerate output arrays without throwing', () => {
+  const ring = AudioRingBuffer.create(128, 2);
+  const ctrl = new Int32Array(ring.sab, 0, RING_HEADER_INT32_COUNT);
+  const processor = new PlayGta6AudioWorkletProcessor({
+    processorOptions: { sab: ring.sab, declickFrames: 16, clampSamples: true },
+  });
+
+  // Corrupt read/write cursors with negative and out-of-range values.
+  Atomics.store(ctrl, HDR_READ_CURSOR, -17);
+  Atomics.store(ctrl, HDR_WRITE_CURSOR, 99999);
+
+  const out = makePlanarOutput(2, 128, 5.0);
+  assert.doesNotThrow(() => {
+    assert.equal(processor.process([], out), true);
+  });
+  assert.ok(out[0][0].every((v) => Number.isFinite(v) && Math.abs(v) <= 1.0));
+  assert.ok(out[0][1].every((v) => Number.isFinite(v) && Math.abs(v) <= 1.0));
+  assert.ok(processor.getStats().bufferedFrames >= 0);
+  assert.ok(processor.getStats().bufferedFrames <= 128);
+
+  // Degenerate outputs never throw.
+  assert.equal(processor.process([], []), true);
+  assert.equal(processor.process([], [[]]), true);
+  assert.equal(processor.process([], [[null]]), true);
+  assert.equal(processor.process([], [[new Float32Array(0)]]), true);
 });

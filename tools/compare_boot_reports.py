@@ -40,8 +40,10 @@ Tolerances: a value pair matches when |a - b| <= max(floor, rel * max(|a|, |b|))
 Everything else must match exactly. `--ignore PATTERN` (repeatable, fnmatch on the field path,
 e.g. `milestones.*.elapsed_ms` or `address_space.*`) drops known-different fields.
 
-Output is text by default and `--json` for automation. Exit code: 0 pass, 1 differences,
-2 usage error (missing or malformed input).
+Output is text by default and `--json` for automation. When GPU/draw/frame-pacing metrics are
+present in both reports, an additive, strictly-sanitized `gpu_delta` summary is included without
+altering pass/fail verdicts or exit codes. Exit code: 0 pass, 1 differences, 2 usage error
+(missing or malformed input).
 
     python tools/compare_boot_reports.py a.json b.json
     python tools/compare_boot_reports.py a.json b.json --capture a.pg6trace b.pg6trace --json
@@ -52,6 +54,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import json
+import math
 import statistics
 import sys
 from collections import Counter
@@ -85,6 +88,7 @@ class Comparison:
     tol: Tolerances
     ignore: list[str]
     entries: list[dict[str, Any]] = field(default_factory=list)
+    gpu_delta: dict[str, dict[str, int | float | None]] = field(default_factory=dict)
 
     def _ignored(self, path: str) -> bool:
         return any(fnmatch.fnmatchcase(path, p) for p in self.ignore)
@@ -367,6 +371,227 @@ def compare_captures(c: Comparison, ca: Capture, cb: Capture) -> None:
             c.exact(f"capture.frame[{i}].opcode.{op}", ha.get(op), hb.get(op))
 
 
+GPU_DELTA_METRICS: tuple[str, ...] = (
+    "real_pack_draws",
+    "fallback_draws",
+    "skipped_draws",
+    "gpu_validation_errors",
+    "non_black_canvas_frames",
+    "first_present_ms",
+    "presents",
+    "present_fps",
+    "frame_time_ms",
+    "frame_time_median_ms",
+)
+
+_GPU_DELTA_UNITS: dict[str, str] = {
+    "first_present_ms": " ms",
+    "present_fps": " fps",
+    "frame_time_ms": " ms",
+    "frame_time_median_ms": " ms",
+}
+
+
+def _finite_number(value: Any) -> int | float | None:
+    """Return finite numeric values only (rejects bool, non-numeric, NaN, Inf)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def _first_number(*candidates: Any) -> int | float | None:
+    for candidate in candidates:
+        num = _finite_number(candidate)
+        if num is not None:
+            return num
+    return None
+
+
+def extract_gpu_metrics(
+    report: dict[str, Any],
+    presents: list[dict[str, Any]] | None = None,
+) -> dict[str, int | float]:
+    """Extract strictly-sanitized numeric GPU/draw/frame-pacing metrics from one report."""
+    counters = report.get("counters") if isinstance(report.get("counters"), dict) else {}
+    summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
+    sample_list = presents if isinstance(presents, list) else (
+        report.get("presents") if isinstance(report.get("presents"), list) else []
+    )
+    last_present_counters: dict[str, Any] = {}
+    for sample in reversed(sample_list):
+        if isinstance(sample, dict) and isinstance(sample.get("counters"), dict):
+            last_present_counters = sample["counters"]
+            break
+
+    metrics: dict[str, int | float] = {}
+
+    def set_if_present(name: str, value: int | float | None) -> None:
+        if value is not None:
+            metrics[name] = value
+
+    set_if_present(
+        "real_pack_draws",
+        _first_number(
+            counters.get("real_pack_draws"),
+            summary.get("realPackDrawCount"),
+            summary.get("real_pack_draws"),
+            last_present_counters.get("draws_real_pack"),
+        ),
+    )
+    set_if_present(
+        "fallback_draws",
+        _first_number(
+            counters.get("fallback_draws"),
+            summary.get("fallbackDrawCount"),
+            summary.get("fallback_draws"),
+            last_present_counters.get("draws_fallback"),
+        ),
+    )
+    set_if_present(
+        "skipped_draws",
+        _first_number(
+            counters.get("skipped_draws"),
+            summary.get("skippedDrawCount"),
+            summary.get("skipped_draws"),
+            last_present_counters.get("draws_skipped"),
+        ),
+    )
+    set_if_present(
+        "gpu_validation_errors",
+        _first_number(
+            counters.get("gpu_validation_errors"),
+            summary.get("validationErrorCount"),
+            summary.get("gpu_validation_errors"),
+            last_present_counters.get("gpu_validation_errors"),
+        ),
+    )
+    set_if_present(
+        "non_black_canvas_frames",
+        _first_number(
+            summary.get("nonBlackCanvasFrames"),
+            summary.get("non_black_canvas_frames"),
+            counters.get("non_black_canvas_frames"),
+            report.get("nonBlackCanvasFrames"),
+            report.get("non_black_canvas_frames"),
+        ),
+    )
+
+    first_present_elapsed: Any = None
+    fp = report.get("first_present")
+    if isinstance(fp, dict):
+        first_present_elapsed = fp.get("elapsed_ms")
+    milestone_first_present: Any = None
+    for m in report.get("milestones") or []:
+        if isinstance(m, dict) and m.get("milestone") == "FIRST_PRESENT":
+            milestone_first_present = m.get("elapsed_ms")
+            break
+    set_if_present(
+        "first_present_ms",
+        _first_number(first_present_elapsed, milestone_first_present, report.get("first_present_ms")),
+    )
+
+    total_presents = _first_number(counters.get("presents"))
+    if total_presents is None and sample_list:
+        total_presents = len(sample_list)
+    set_if_present("presents", total_presents)
+
+    walls: list[float] = []
+    for sample in sample_list:
+        if isinstance(sample, dict):
+            w = _finite_number(sample.get("wall_ms"))
+            if w is not None:
+                walls.append(float(w))
+
+    present_fps: float | None = None
+    frame_time_ms: float | None = None
+    frame_time_median_ms: float | None = None
+
+    if len(walls) >= 2 and walls[-1] > walls[0]:
+        span_ms = walls[-1] - walls[0]
+        sample_count = len(walls)
+        is_subsampled = total_presents is not None and float(total_presents) > float(sample_count)
+        intervals = (float(total_presents) - 1.0) if is_subsampled else float(sample_count - 1)
+        if intervals > 0.0:
+            present_fps = round(intervals * 1000.0 / span_ms, 2)
+            frame_time_ms = round(span_ms / intervals, 2)
+        if not is_subsampled:
+            dts = [walls[i] - walls[i - 1] for i in range(1, sample_count) if walls[i] >= walls[i - 1]]
+            if dts:
+                frame_time_median_ms = round(statistics.median(dts), 2)
+    elif (
+        total_presents is not None
+        and float(total_presents) >= 2.0
+        and "first_present_ms" in metrics
+    ):
+        elapsed_ms = _finite_number(report.get("elapsed_ms"))
+        if elapsed_ms is not None and float(elapsed_ms) > float(metrics["first_present_ms"]):
+            span_ms = float(elapsed_ms) - float(metrics["first_present_ms"])
+            intervals = float(total_presents) - 1.0
+            present_fps = round(intervals * 1000.0 / span_ms, 2)
+            frame_time_ms = round(span_ms / intervals, 2)
+
+    set_if_present(
+        "present_fps",
+        _first_number(
+            present_fps,
+            counters.get("present_fps"),
+            summary.get("presentFps"),
+            summary.get("present_fps"),
+        ),
+    )
+    set_if_present(
+        "frame_time_ms",
+        _first_number(
+            frame_time_ms,
+            counters.get("frame_time_ms"),
+            summary.get("frameTimeMs"),
+            summary.get("frame_time_ms"),
+        ),
+    )
+    set_if_present(
+        "frame_time_median_ms",
+        _first_number(
+            frame_time_median_ms,
+            counters.get("frame_time_median_ms"),
+            summary.get("frameTimeMedianMs"),
+            summary.get("frame_time_median_ms"),
+        ),
+    )
+    return metrics
+
+
+def compute_gpu_delta(
+    ra: dict[str, Any],
+    rb: dict[str, Any],
+    pa: list[dict[str, Any]] | None = None,
+    pb: list[dict[str, Any]] | None = None,
+) -> dict[str, dict[str, int | float | None]]:
+    """Build a compact, strictly-sanitized delta map for GPU/draw/frame-pacing fields in both reports."""
+    ma = extract_gpu_metrics(ra, pa)
+    mb = extract_gpu_metrics(rb, pb)
+    out: dict[str, dict[str, int | float | None]] = {}
+    for key in GPU_DELTA_METRICS:
+        if key not in ma or key not in mb:
+            continue
+        va, vb = ma[key], mb[key]
+        if isinstance(va, int) and isinstance(vb, int):
+            delta: int | float = vb - va
+        else:
+            va = round(float(va), 2)
+            vb = round(float(vb), 2)
+            delta = round(vb - va, 2)
+        if va != 0:
+            pct: float | None = round(((vb - va) / va) * 100.0, 2)
+        elif vb == 0:
+            pct = 0.0
+        else:
+            pct = None
+        out[key] = {"a": va, "b": vb, "delta": delta, "pct": pct}
+    return out
+
+
 def compare(
     ra: dict[str, Any],
     rb: dict[str, Any],
@@ -391,6 +616,7 @@ def compare(
         compare_presents(c, pa, pb)
     if captures:
         compare_captures(c, *captures)
+    c.gpu_delta = compute_gpu_delta(ra, rb, pa, pb)
     return c
 
 
@@ -401,7 +627,7 @@ def compare(
 
 def to_result(c: Comparison) -> dict[str, Any]:
     bad = c.failures()
-    return {
+    result: dict[str, Any] = {
         "verdict": "fail" if bad else "pass",
         "checked": len(c.entries),
         "differences": len(bad),
@@ -413,6 +639,22 @@ def to_result(c: Comparison) -> dict[str, Any]:
         "ignore": c.ignore,
         "entries": bad,
     }
+    if c.gpu_delta:
+        result["gpu_delta"] = c.gpu_delta
+    return result
+
+
+def _format_gpu_delta_line(metric: str, item: dict[str, int | float | None]) -> str:
+    unit = _GPU_DELTA_UNITS.get(metric, "")
+    a, b, delta, pct = item["a"], item["b"], item["delta"], item["pct"]
+    if delta == 0:
+        change = f"0{unit}"
+    else:
+        sign = "+" if (delta is not None and delta > 0) else ""
+        change = f"{sign}{delta}{unit}"
+        if pct is not None:
+            change += f", {pct:+.1f}%"
+    return f"  {metric}: {a} -> {b} ({change})"
 
 
 def format_text(c: Comparison, verbose: bool = False) -> str:
@@ -428,6 +670,10 @@ def format_text(c: Comparison, verbose: bool = False) -> str:
             lines.append(f"  ok   {e['field']}: {e['a']!r} ({e['mode']})")
         else:
             lines.append(f"  DIFF {e['field']}: {e['a']!r} != {e['b']!r} ({e['mode']})")
+    if c.gpu_delta:
+        lines.append("[gpu_delta]")
+        for metric, item in c.gpu_delta.items():
+            lines.append(_format_gpu_delta_line(metric, item))
     lines.append(
         f"verdict: {result['verdict'].upper()} ({result['differences']} difference(s) in {result['checked']} checks)"
     )

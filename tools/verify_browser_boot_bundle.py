@@ -14,16 +14,23 @@ and Chrome/Edge:
      naturally sorted, skipping escaping symlinks), verifies each has valid
      `\\0asm` magic (version 1) and `size <= 1,073,741,824` bytes (`v8_limit_ok`),
      and reports individual and total Wasm byte sizes.
+   - When `guest_manifest.json` is present inside `--web-dist`, reports lifted
+     guest DLL/module entries and whether `bink2scarlett` / `Bink2Scarlett.dll`
+     is present.
 
 2. **PGIM / Program Manifest (`--boot-dir`, optional):**
    - Checks `program-manifest.json` (or `boot-manifest.json` fallback), rejects
      path traversal and escaping symlinks, and verifies every referenced `.pgim`
      file exists inside `--boot-dir` and starts with valid `PGIM` magic.
 
-3. **Shader Pack (`--shaders-dir`, optional):**
+3. **Shader Pack & Stage-Reflection Sidecar (`--shaders-dir`, optional):**
    - Discovers `*.wgsl.pack` bundles (skipping escaping symlinks), validates
      `WGPK` magic, version 1, entry table bounds, and parses `entry_count` safely
      matching `shaders/src/pack.rs`.
+   - When `*.reflect.json` stage-reflection sidecars are present, validates
+     `#950` `inline_sampler` entries (`sdwords` must be 4 uint32 integers) and
+     reports `inline_sampler_stages`, `inline_sampler_bindings`, and
+     `malformed_inline_samplers` (failing `--strict` on any malformed entry).
 
 Security & privacy invariants:
 - Pure Python 3.12 standard library only (zero external dependencies).
@@ -66,6 +73,15 @@ V8_MAX_WASM_MODULE_BYTES = 1024 * 1024 * 1024  # 1,073,741,824 bytes
 
 RUNTIME_WASM_NAME = "runtime.wasm"
 RUNTIME_JS_NAME = "runtime.js"
+GUEST_MANIFEST_NAME = "guest_manifest.json"
+GUEST_MANIFEST_MODULE_KEYS: tuple[str, ...] = (
+    "guest_dll_modules",
+    "guestDllModules",
+    "guest_modules",
+    "guestModules",
+    "modules",
+)
+BINK2_MODULE_KEY = "bink2scarlett"
 WASM_MAGIC = b"\x00asm"
 WASM_VERSION = 1
 WASM_HEADER_BYTES = 8
@@ -85,6 +101,10 @@ WGPK_HEADER_BYTES = WGPK_HEADER_STRUCT.size  # 16 bytes
 WGPK_ENTRY_STRUCT = struct.Struct("<QB3sII")
 WGPK_ENTRY_BYTES = WGPK_ENTRY_STRUCT.size  # 20 bytes
 WGPK_VALID_STAGES: frozenset[int] = frozenset({1, 2, 3})
+
+REFLECT_SIDECAR_SUFFIX = ".reflect.json"
+REFLECT_SIDECAR_SCHEMA = "playgta6-stage-reflection"
+REFLECT_SIDECAR_VERSION = 1
 
 _SAFE_SIDE_MODULE_NAME_RE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._-]*\.wasm$", re.IGNORECASE
@@ -453,6 +473,121 @@ def inspect_side_module_wasm(
     }
 
 
+def _is_bink2scarlett_module(name: str) -> bool:
+    """Return True if `name` refers to `bink2scarlett` or `Bink2Scarlett.dll` (case-insensitive)."""
+    cleaned = name.strip().lower()
+    if cleaned.endswith(".dll"):
+        cleaned = cleaned[:-4]
+    return cleaned == BINK2_MODULE_KEY
+
+
+def _sanitize_guest_module_label(raw: str) -> str:
+    """Sanitize a guest module name without leaking host path segments."""
+    cleaned = raw.strip()
+    if not cleaned:
+        return ""
+    if "/" in cleaned or "\\" in cleaned or _WINDOWS_DRIVE_PREFIX_RE.match(cleaned):
+        label = basename_label(cleaned)
+        return "" if label == "<unknown>" else label
+    return sanitize_text(cleaned)
+
+
+def _empty_guest_manifest_info() -> dict[str, Any]:
+    return {
+        "present": False,
+        "ok": True,
+        "guest_modules": [],
+        "bink2scarlett_present": False,
+        "warnings": [],
+    }
+
+
+def inspect_guest_manifest(web_dist: Path) -> tuple[dict[str, Any], list[str]]:
+    """Inspect optional `guest_manifest.json` inside `--web-dist` for lifted guest modules."""
+    info = _empty_guest_manifest_info()
+    warnings: list[str] = []
+
+    status, resolved = _check_file_within_root(web_dist / GUEST_MANIFEST_NAME, web_dist)
+    if status == "missing":
+        return info, warnings
+    if status == "escaping_symlink":
+        msg = f"{GUEST_MANIFEST_NAME} is an escaping or broken symlink outside web-dist"
+        info["ok"] = False
+        info["warnings"].append(msg)
+        warnings.append(msg)
+        return info, warnings
+    if status != "ok" or resolved is None:
+        msg = f"{GUEST_MANIFEST_NAME} in web-dist is not a regular file"
+        info["ok"] = False
+        info["warnings"].append(msg)
+        warnings.append(msg)
+        return info, warnings
+
+    info["present"] = True
+    try:
+        doc = json.loads(resolved.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        msg = f"failed to parse {GUEST_MANIFEST_NAME}: {sanitize_text(type(exc).__name__)}"
+        info["ok"] = False
+        info["warnings"].append(msg)
+        warnings.append(msg)
+        return info, warnings
+
+    if not isinstance(doc, Mapping):
+        msg = f"{GUEST_MANIFEST_NAME} root must be a JSON object"
+        info["ok"] = False
+        info["warnings"].append(msg)
+        warnings.append(msg)
+        return info, warnings
+
+    selected_key: str | None = None
+    raw_modules: Any = None
+    for key in GUEST_MANIFEST_MODULE_KEYS:
+        if key in doc and doc[key] is not None:
+            selected_key = key
+            raw_modules = doc[key]
+            break
+
+    guest_modules: list[str] = []
+    seen_lower: set[str] = set()
+    if selected_key is not None:
+        if not isinstance(raw_modules, list):
+            msg = f"{GUEST_MANIFEST_NAME} '{selected_key}' must be a list"
+            info["ok"] = False
+            info["warnings"].append(msg)
+            warnings.append(msg)
+        else:
+            for idx, item in enumerate(raw_modules):
+                raw_name: Any = None
+                if isinstance(item, str):
+                    raw_name = item
+                elif isinstance(item, Mapping):
+                    for field_key in ("module", "name", "id"):
+                        if item.get(field_key) is not None:
+                            raw_name = item[field_key]
+                            break
+                if not isinstance(raw_name, str) or not raw_name.strip():
+                    msg = (
+                        f"{GUEST_MANIFEST_NAME} '{selected_key}[{idx}]' must be a "
+                        f"non-empty module string or object"
+                    )
+                    info["ok"] = False
+                    info["warnings"].append(msg)
+                    warnings.append(msg)
+                    continue
+                cleaned = _sanitize_guest_module_label(raw_name)
+                if not cleaned:
+                    continue
+                lowered = cleaned.lower()
+                if lowered not in seen_lower:
+                    seen_lower.add(lowered)
+                    guest_modules.append(cleaned)
+
+    info["guest_modules"] = guest_modules
+    info["bink2scarlett_present"] = any(_is_bink2scarlett_module(m) for m in guest_modules)
+    return info, warnings
+
+
 def verify_web_dist(
     web_dist: Path,
     *,
@@ -499,6 +634,8 @@ def verify_web_dist(
         "side_modules_total_bytes": 0,
         "total_wasm_bytes": 0,
         "all_v8_limits_ok": False,
+        "guest_manifest": _empty_guest_manifest_info(),
+        "bink2scarlett_present": False,
     }
 
     if not web_dist.is_dir():
@@ -674,6 +811,13 @@ def verify_web_dist(
         and runtime_wasm_info["v8_limit_ok"]
         and all(item["v8_limit_ok"] for item in side_entries)
     )
+
+    # ---- Optional guest_manifest.json (lifted guest modules & Bink2Scarlett readiness) ----
+    guest_manifest_info, gm_warnings = inspect_guest_manifest(web_dist)
+    section["guest_manifest"] = guest_manifest_info
+    section["bink2scarlett_present"] = bool(guest_manifest_info["bink2scarlett_present"])
+    warnings.extend(gm_warnings)
+
     section["status"] = "pass" if len(errors) == 0 else "fail"
 
     return section, errors, warnings
@@ -1032,6 +1176,8 @@ def verify_boot_dir(boot_dir: Path) -> tuple[dict[str, Any], list[str], list[str
         "valid_pgim_count": 0,
         "total_pgim_bytes": 0,
         "pgims": [],
+        "guest_modules": [],
+        "bink2scarlett_present": False,
     }
 
     if not boot_dir.is_dir():
@@ -1100,10 +1246,22 @@ def verify_boot_dir(boot_dir: Path) -> tuple[dict[str, Any], list[str], list[str
         else:
             errors.extend(info["errors"])
 
+    boot_modules: list[str] = []
+    seen_boot_modules: set[str] = set()
+    for info in pgim_entries:
+        mod_name = info.get("module")
+        if isinstance(mod_name, str) and mod_name.strip():
+            cleaned_mod = sanitize_text(mod_name.strip())
+            if cleaned_mod.lower() not in seen_boot_modules:
+                seen_boot_modules.add(cleaned_mod.lower())
+                boot_modules.append(cleaned_mod)
+
     section["pgims"] = pgim_entries
     section["pgim_count"] = len(pgim_entries)
     section["valid_pgim_count"] = valid_count
     section["total_pgim_bytes"] = total_bytes
+    section["guest_modules"] = boot_modules
+    section["bink2scarlett_present"] = any(_is_bink2scarlett_module(m) for m in boot_modules)
     if not pgim_entries and not errors:
         errors.append(f"{manifest_name} references zero .pgim files")
 
@@ -1232,8 +1390,192 @@ def inspect_wgsl_pack_file(pack_name: str, pack_path: Path) -> tuple[dict[str, A
     )
 
 
+def _is_valid_uint32(value: Any) -> bool:
+    """Return True only for non-bool integers within `[0, 0xFFFFFFFF]`."""
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 0xFFFFFFFF
+
+
+def validate_inline_sampler_source(source: Any) -> bool | None:
+    """Validate a `#950` `inline_sampler` reflection binding source.
+
+    Returns:
+    - `None` when `source` does not declare `"inline_sampler"`.
+    - `True` when `source["inline_sampler"]["sdwords"]` is a 4-element list of uint32s.
+    - `False` when `"inline_sampler"` is present but malformed.
+    """
+    if not isinstance(source, Mapping) or "inline_sampler" not in source:
+        return None
+    sampler = source["inline_sampler"]
+    if not isinstance(sampler, Mapping):
+        return False
+    words = sampler.get("sdwords")
+    return (
+        isinstance(words, list)
+        and len(words) == 4
+        and all(_is_valid_uint32(w) for w in words)
+    )
+
+
+def inspect_reflect_sidecar_file(
+    sidecar_name: str,
+    sidecar_path: Path,
+) -> tuple[dict[str, Any], list[str]]:
+    """Inspect a `<pack>.reflect.json` stage-reflection sidecar for `#950` inline samplers."""
+    safe_name = sanitize_text(sidecar_name)
+    warnings: list[str] = []
+    size_bytes = 0
+    schema_str: str | None = None
+    version_int: int | None = None
+    stage_count = 0
+    inline_sampler_stages = 0
+    inline_sampler_bindings = 0
+    malformed_inline_samplers = 0
+
+    try:
+        size_bytes = get_file_size(sidecar_path)
+    except OSError as exc:
+        warnings.append(_sanitize_os_error(sidecar_name, exc))
+        return (
+            {
+                "name": safe_name,
+                "size_bytes": 0,
+                "schema": None,
+                "version": None,
+                "stage_count": 0,
+                "inline_sampler_stages": 0,
+                "inline_sampler_bindings": 0,
+                "malformed_inline_samplers": 0,
+                "ok": False,
+                "warnings": warnings,
+            },
+            warnings,
+        )
+
+    try:
+        raw_text = sidecar_path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError) as exc:
+        warnings.append(f"{safe_name}: failed to read ({sanitize_text(type(exc).__name__)})")
+        return (
+            {
+                "name": safe_name,
+                "size_bytes": size_bytes,
+                "schema": None,
+                "version": None,
+                "stage_count": 0,
+                "inline_sampler_stages": 0,
+                "inline_sampler_bindings": 0,
+                "malformed_inline_samplers": 0,
+                "ok": False,
+                "warnings": warnings,
+            },
+            warnings,
+        )
+
+    try:
+        doc = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        warnings.append(f"{safe_name}: invalid JSON ({sanitize_text(type(exc).__name__)})")
+        return (
+            {
+                "name": safe_name,
+                "size_bytes": size_bytes,
+                "schema": None,
+                "version": None,
+                "stage_count": 0,
+                "inline_sampler_stages": 0,
+                "inline_sampler_bindings": 0,
+                "malformed_inline_samplers": 0,
+                "ok": False,
+                "warnings": warnings,
+            },
+            warnings,
+        )
+
+    if not isinstance(doc, Mapping):
+        warnings.append(f"{safe_name}: top-level JSON value must be an object")
+        return (
+            {
+                "name": safe_name,
+                "size_bytes": size_bytes,
+                "schema": None,
+                "version": None,
+                "stage_count": 0,
+                "inline_sampler_stages": 0,
+                "inline_sampler_bindings": 0,
+                "malformed_inline_samplers": 0,
+                "ok": False,
+                "warnings": warnings,
+            },
+            warnings,
+        )
+
+    raw_schema = doc.get("schema")
+    if raw_schema is not None:
+        if isinstance(raw_schema, str) and raw_schema.strip():
+            schema_str = sanitize_text(raw_schema.strip())
+        else:
+            warnings.append(f"{safe_name}: 'schema' must be a non-empty string")
+
+    raw_version = doc.get("version")
+    if raw_version is not None:
+        if isinstance(raw_version, int) and not isinstance(raw_version, bool) and raw_version >= 1:
+            version_int = int(raw_version)
+        else:
+            warnings.append(f"{safe_name}: 'version' must be a positive integer")
+
+    stages = doc.get("stages")
+    if not isinstance(stages, Mapping):
+        warnings.append(f"{safe_name}: missing or invalid 'stages' object")
+    else:
+        stage_count = len(stages)
+        for stage_key, stage_entry in stages.items():
+            safe_stage_key = sanitize_text(str(stage_key))
+            if not isinstance(stage_entry, Mapping):
+                warnings.append(f"{safe_name}: stage '{safe_stage_key}' must be a JSON object")
+                continue
+            bindings = stage_entry.get("bindings")
+            if bindings is None:
+                continue
+            if not isinstance(bindings, list):
+                warnings.append(f"{safe_name}: stage '{safe_stage_key}' 'bindings' must be a list")
+                continue
+
+            stage_has_inline_sampler = False
+            for b_idx, binding in enumerate(bindings):
+                if not isinstance(binding, Mapping):
+                    continue
+                inline_status = validate_inline_sampler_source(binding.get("source"))
+                if inline_status is True:
+                    inline_sampler_bindings += 1
+                    stage_has_inline_sampler = True
+                elif inline_status is False:
+                    malformed_inline_samplers += 1
+                    warnings.append(
+                        f"{safe_name}: stage '{safe_stage_key}' binding[{b_idx}] has "
+                        f"malformed inline_sampler (sdwords must be 4 uint32 integers)"
+                    )
+            if stage_has_inline_sampler:
+                inline_sampler_stages += 1
+
+    return (
+        {
+            "name": safe_name,
+            "size_bytes": size_bytes,
+            "schema": schema_str,
+            "version": version_int,
+            "stage_count": stage_count,
+            "inline_sampler_stages": inline_sampler_stages,
+            "inline_sampler_bindings": inline_sampler_bindings,
+            "malformed_inline_samplers": malformed_inline_samplers,
+            "ok": len(warnings) == 0,
+            "warnings": warnings,
+        },
+        warnings,
+    )
+
+
 def verify_shaders_dir(shaders_dir: Path) -> tuple[dict[str, Any], list[str], list[str]]:
-    """Verify `*.wgsl.pack` (`WGPK`) shader bundles inside `--shaders-dir`."""
+    """Verify `*.wgsl.pack` (`WGPK`) shader bundles and optional `*.reflect.json` sidecars."""
     errors: list[str] = []
     warnings: list[str] = []
 
@@ -1246,6 +1588,13 @@ def verify_shaders_dir(shaders_dir: Path) -> tuple[dict[str, Any], list[str], li
         "total_pack_bytes": 0,
         "total_shader_entries": 0,
         "packs": [],
+        "reflect_sidecar_count": 0,
+        "valid_reflect_sidecar_count": 0,
+        "reflect_stage_count": 0,
+        "inline_sampler_stages": 0,
+        "inline_sampler_bindings": 0,
+        "malformed_inline_samplers": 0,
+        "reflect_sidecars": [],
     }
 
     if not shaders_dir.is_dir():
@@ -1254,24 +1603,34 @@ def verify_shaders_dir(shaders_dir: Path) -> tuple[dict[str, Any], list[str], li
 
     resolved_root = shaders_dir.resolve()
     candidates: list[tuple[str, Path]] = []
-    skipped_symlinks = 0
+    sidecar_candidates: list[tuple[str, Path]] = []
+    skipped_pack_symlinks = 0
+    skipped_sidecar_symlinks = 0
 
     for entry in shaders_dir.iterdir():
         name = entry.name
-        if not name.lower().endswith(".wgsl.pack"):
+        lowered = name.lower()
+        is_pack = lowered.endswith(".wgsl.pack")
+        is_sidecar = lowered.endswith(REFLECT_SIDECAR_SUFFIX)
+        if not is_pack and not is_sidecar:
             continue
         if entry.is_symlink():
             try:
                 resolved = entry.resolve(strict=True)
             except OSError:
-                skipped_symlinks += 1
+                if is_pack:
+                    skipped_pack_symlinks += 1
+                else:
+                    skipped_sidecar_symlinks += 1
                 continue
             if not resolved.is_relative_to(resolved_root):
-                skipped_symlinks += 1
+                if is_pack:
+                    skipped_pack_symlinks += 1
+                else:
+                    skipped_sidecar_symlinks += 1
                 continue
             if not resolved.is_file():
                 continue
-            candidates.append((name, resolved))
         else:
             if not entry.is_file():
                 continue
@@ -1280,16 +1639,53 @@ def verify_shaders_dir(shaders_dir: Path) -> tuple[dict[str, Any], list[str], li
             except OSError:
                 continue
             if not resolved.is_relative_to(resolved_root):
-                skipped_symlinks += 1
+                if is_pack:
+                    skipped_pack_symlinks += 1
+                else:
+                    skipped_sidecar_symlinks += 1
                 continue
+
+        if is_pack:
             candidates.append((name, resolved))
+        else:
+            sidecar_candidates.append((name, resolved))
 
     candidates.sort(key=lambda item: (_natural_sort_key(item[0]), item[0]))
-    section["skipped_escaping_symlinks"] = skipped_symlinks
-    if skipped_symlinks > 0:
+    sidecar_candidates.sort(key=lambda item: (_natural_sort_key(item[0]), item[0]))
+    section["skipped_escaping_symlinks"] = skipped_pack_symlinks + skipped_sidecar_symlinks
+    if skipped_pack_symlinks > 0:
         warnings.append(
-            f"skipped {skipped_symlinks} escaping/broken *.wgsl.pack symlink(s) in shaders-dir"
+            f"skipped {skipped_pack_symlinks} escaping/broken *.wgsl.pack symlink(s) in shaders-dir"
         )
+    if skipped_sidecar_symlinks > 0:
+        warnings.append(
+            f"skipped {skipped_sidecar_symlinks} escaping/broken *.reflect.json symlink(s) in shaders-dir"
+        )
+
+    sidecars: list[dict[str, Any]] = []
+    valid_sidecars = 0
+    reflect_stages = 0
+    inline_sampler_stages = 0
+    inline_sampler_bindings = 0
+    malformed_inline_samplers = 0
+    for sidecar_name, sidecar_path in sidecar_candidates:
+        sc_info, sc_warnings = inspect_reflect_sidecar_file(sidecar_name, sidecar_path)
+        sidecars.append(sc_info)
+        warnings.extend(sc_warnings)
+        reflect_stages += int(sc_info["stage_count"])
+        inline_sampler_stages += int(sc_info["inline_sampler_stages"])
+        inline_sampler_bindings += int(sc_info["inline_sampler_bindings"])
+        malformed_inline_samplers += int(sc_info["malformed_inline_samplers"])
+        if sc_info["ok"]:
+            valid_sidecars += 1
+
+    section["reflect_sidecars"] = sidecars
+    section["reflect_sidecar_count"] = len(sidecars)
+    section["valid_reflect_sidecar_count"] = valid_sidecars
+    section["reflect_stage_count"] = reflect_stages
+    section["inline_sampler_stages"] = inline_sampler_stages
+    section["inline_sampler_bindings"] = inline_sampler_bindings
+    section["malformed_inline_samplers"] = malformed_inline_samplers
 
     if not candidates:
         errors.append("no .wgsl.pack shader bundles found in shaders-dir")
@@ -1334,6 +1730,8 @@ def _empty_boot_section() -> dict[str, Any]:
         "valid_pgim_count": 0,
         "total_pgim_bytes": 0,
         "pgims": [],
+        "guest_modules": [],
+        "bink2scarlett_present": False,
     }
 
 
@@ -1347,6 +1745,13 @@ def _empty_shaders_section() -> dict[str, Any]:
         "total_pack_bytes": 0,
         "total_shader_entries": 0,
         "packs": [],
+        "reflect_sidecar_count": 0,
+        "valid_reflect_sidecar_count": 0,
+        "reflect_stage_count": 0,
+        "inline_sampler_stages": 0,
+        "inline_sampler_bindings": 0,
+        "malformed_inline_samplers": 0,
+        "reflect_sidecars": [],
     }
 
 
@@ -1458,6 +1863,15 @@ def format_report_text(report: Mapping[str, Any]) -> str:
             f"v8_limit={'OK' if mod.get('v8_limit_ok') else 'FAIL'})"
         )
 
+    guest_manifest = wasm.get("guest_manifest") or {}
+    if guest_manifest.get("present"):
+        gm_mods = guest_manifest.get("guest_modules") or []
+        lines.append(
+            f"    guest_manifest.json: {'OK' if guest_manifest.get('ok') else 'WARN'} "
+            f"(guest_modules={len(gm_mods)}, "
+            f"bink2scarlett={'YES' if guest_manifest.get('bink2scarlett_present') else 'NO'})"
+        )
+
     if boot.get("checked"):
         lines.append(
             f"  Boot [{str(boot.get('status', 'fail')).upper()}]: {paths.get('boot_dir')} "
@@ -1487,6 +1901,16 @@ def format_report_text(report: Mapping[str, Any]) -> str:
                 f"({pack.get('size_bytes', 0)} bytes, "
                 f"magic={'WGPK' if pack.get('magic_ok') else 'BAD'}, "
                 f"entries={pack.get('entry_count')})"
+            )
+        if int(shaders.get("reflect_sidecar_count", 0)) > 0:
+            lines.append(
+                f"    reflect sidecars: "
+                f"{shaders.get('valid_reflect_sidecar_count', 0)}/"
+                f"{shaders.get('reflect_sidecar_count', 0)} "
+                f"(stages={shaders.get('reflect_stage_count', 0)}, "
+                f"inline_sampler_stages={shaders.get('inline_sampler_stages', 0)}, "
+                f"inline_sampler_bindings={shaders.get('inline_sampler_bindings', 0)}, "
+                f"malformed_inline_samplers={shaders.get('malformed_inline_samplers', 0)})"
             )
     else:
         lines.append("  Shaders [SKIPPED]: --shaders-dir not specified")

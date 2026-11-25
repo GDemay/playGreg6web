@@ -698,13 +698,18 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                         }
                         const bool read_only_kind = b.kind != ReflectedBindingKind::Storage &&
                                                     b.kind != ReflectedBindingKind::StorageTexture;
-                        if (!table_slot_register(p, b.table_byte_offset / kTableSlotBytes, &cls, &reg, &space) ||
-                            (read_only_kind && !kind_accepts(b.kind, cls))) {
-                            // A slot the root signature does not declare, or declares as another class
-                            // for a read-only binding: console stages read their tables as memory, past
-                            // and regardless of the declared ranges. Join the slot itself, with the class
-                            // the stage reads. (A writable binding over a declared SRV / CBV stays a
-                            // failure: binding it would make the whole submission invalid.)
+                        const bool declared =
+                            table_slot_register(p, b.table_byte_offset / kTableSlotBytes, &cls, &reg, &space);
+                        if (!declared || (read_only_kind && !kind_accepts(b.kind, cls)) ||
+                            (!read_only_kind && cls == d3d::DescriptorRangeType::Srv)) {
+                            // A slot the root signature does not declare, or declares as another class:
+                            // console stages read their tables as memory, past and regardless of the
+                            // declared ranges. Join the slot itself, with the class the stage reads.
+                            // That includes a writable binding over a declared SRV: the stage stores
+                            // through the descriptor (image_store / buffer_store), so the slot holds a
+                            // UAV-capable view on the console; it is bound as a storage view (a texture
+                            // created without storage usage binds null, see the state bridge). A
+                            // writable binding over a declared CBV stays a failure.
                             const bool sampler_kind = b.kind == ReflectedBindingKind::Sampler ||
                                                       b.kind == ReflectedBindingKind::ComparisonSampler;
                             bool sampler_table = false;
@@ -807,7 +812,10 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                         continue;
                     }
                     lb.entry.type = static_cast<uint8_t>(GpuBindingLayoutType::StorageTexture);
-                    lb.entry.binding_type = static_cast<uint8_t>(GpuStorageTextureAccess::ReadWrite);
+                    // The translator declares storage textures write-only (texture_storage_*<fmt, write>);
+                    // the layout must match, and read-write access is not even allowed for formats
+                    // such as rgba8unorm (WebGPU rejects the layout, the pipeline and the frame).
+                    lb.entry.binding_type = static_cast<uint8_t>(GpuStorageTextureAccess::WriteOnly);
                     lb.entry.view_dimension = static_cast<uint8_t>(b.view_dimension);
                     lb.entry.storage_format = b.storage_format;
                     break;

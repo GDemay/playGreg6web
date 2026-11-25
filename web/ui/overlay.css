@@ -131,6 +131,10 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 
+[hidden] {
+  display: none !important;
+}
+
 #viewport {
   position: fixed;
   inset: 0;
@@ -163,9 +167,14 @@ body {
   line-height: 1.4;
   overflow: hidden;
   user-select: none;
+  contain: layout style paint;
   transition:
     border-radius var(--duration-fast) var(--ease-standard),
     box-shadow var(--duration-fast) var(--ease-standard);
+}
+
+#hud[data-hud-visible="false"] {
+  display: none !important;
 }
 
 /* Collapsed single-line Astryx status pill (`playgta6web · Real Wasm64 · 0 fps`) */
@@ -441,6 +450,7 @@ body {
   padding: 4px 14px 12px;
   max-height: calc(100vh - 72px);
   overflow-y: auto;
+  contain: layout style paint;
 }
 
 #hud-body::-webkit-scrollbar,
@@ -602,6 +612,7 @@ body {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 6px;
+  contain: layout style paint;
 }
 
 .hud-metric-cell {
@@ -670,6 +681,7 @@ body {
 
 .astryx-collapsible {
   width: 100%;
+  contain: layout style;
 }
 
 .astryx-collapsible-trigger {
@@ -743,6 +755,7 @@ body {
   display: flex;
   flex-direction: column;
   gap: 12px;
+  contain: layout style paint;
 }
 
 #hud-log-disclosure:not([open]) #hud-clear-log {
@@ -769,6 +782,7 @@ body {
   font-size: 10.5px;
   line-height: 1.45;
   user-select: text;
+  contain: layout style paint;
 }
 
 .log-entry {
@@ -929,6 +943,7 @@ body {
   border-radius: var(--radius-element);
   background: var(--color-background-muted);
   overflow: hidden;
+  contain: layout style paint;
 }
 
 #gpu-boot-panel-root:empty {
@@ -1016,4 +1031,33 @@ body {
 
 #gpu-boot-panel-root .pg6-gpu-panel__progress-fill {
   background: var(--color-accent);
+}
+
+/* ============================================================================
+ * Reduced Motion & Instant HUD / Splash Hiding (W226)
+ * ========================================================================== */
+
+@media (prefers-reduced-motion: reduce) {
+  :root,
+  [data-astryx-theme="astryx"] {
+    --duration-fast: 0ms;
+    --pg6-splash-fade: 0ms;
+  }
+
+  #hud,
+  #splash-overlay-root,
+  .pg6-splash,
+  .pg6-splash__bar-fill,
+  .pg6-splash__stream-fill,
+  .astryx-button,
+  .astryx-progress-bar-fill,
+  .astryx-collapsible-trigger,
+  .astryx-chevron,
+  #gpu-boot-panel-root .pg6-gpu-panel__progress-fill {
+    transition: none !important;
+    transition-duration: 0ms !important;
+    transition-delay: 0ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
 }

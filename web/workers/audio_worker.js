@@ -38,6 +38,16 @@
     HEADLESS_DRAIN: 'headless-drain',
   });
 
+  // W222: Bounded ring-overflow drop policies and underrun recovery defaults.
+  const OVERFLOW_POLICIES = Object.freeze({
+    DROP_TAIL: 'drop-tail',
+    DROP_NEWEST: 'drop-newest',
+    DROP_OLDEST: 'drop-oldest',
+  });
+  const DEFAULT_OVERFLOW_POLICY = OVERFLOW_POLICIES.DROP_TAIL;
+  const DEFAULT_MAX_FILL_RATIO = 1.0;
+  const DEFAULT_UNDERRUN_RECOVERY_FRAMES = 0;
+
   // Atomic Int32 header layout at byte offset 0..32 of the SharedArrayBuffer.
   const HDR_WRITE_CURSOR = 0;
   const HDR_READ_CURSOR = 1;
@@ -164,6 +174,43 @@
     return OUTPUT_STATES.HEADLESS_DRAIN;
   }
 
+  function normalizeOverflowPolicy(value, fallback = DEFAULT_OVERFLOW_POLICY) {
+    if (typeof value !== 'string') {
+      return fallback;
+    }
+    const normalized = value.trim().toLowerCase();
+    if (
+      normalized === OVERFLOW_POLICIES.DROP_TAIL ||
+      normalized === 'tail' ||
+      normalized === 'partial'
+    ) {
+      return OVERFLOW_POLICIES.DROP_TAIL;
+    }
+    if (
+      normalized === OVERFLOW_POLICIES.DROP_NEWEST ||
+      normalized === 'newest' ||
+      normalized === 'drop-packet'
+    ) {
+      return OVERFLOW_POLICIES.DROP_NEWEST;
+    }
+    if (
+      normalized === OVERFLOW_POLICIES.DROP_OLDEST ||
+      normalized === 'oldest' ||
+      normalized === 'evict-oldest'
+    ) {
+      return OVERFLOW_POLICIES.DROP_OLDEST;
+    }
+    return fallback;
+  }
+
+  function sanitizeFillRatio(value, fallback = DEFAULT_MAX_FILL_RATIO) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+      return fallback;
+    }
+    if (value > 1.0) return 1.0;
+    return value;
+  }
+
   function sanitizeErrorMessage(err) {
     const raw = err && typeof err.message === 'string' ? err.message : String(err || 'Unknown audio worker error');
     // Strip control characters and clamp length to prevent noisy/leaky error strings.
@@ -207,15 +254,457 @@
   }
 
   /**
+   * De-interleaves interleaved PCM samples (`[L0, R0, L1, R1, ...]`) into
+   * planar per-channel Float32Arrays (`[[L0, L1, ...], [R0, R1, ...]]`).
+   * Writes into caller-provided `planarTargets` with zero TypedArray allocation
+   * when supplied. Non-finite samples are sanitized to 0.0.
+   *
+   * @param {Float32Array} interleaved
+   * @param {number} channels Channel count in [1, MAX_CHANNELS].
+   * @param {number} [frameCount] Frames to convert (defaults to floor(interleaved.length / channels)).
+   * @param {Float32Array[]} [planarTargets] Optional pre-allocated planar channel buffers.
+   * @returns {Float32Array[]}
+   */
+  function deinterleavePcm(interleaved, channels, frameCount, planarTargets) {
+    if (!Number.isInteger(channels) || channels < 1 || channels > MAX_CHANNELS) {
+      throw new RangeError(
+        `deinterleavePcm channels must be an integer in [1, ${MAX_CHANNELS}], got ${channels}`
+      );
+    }
+    if (!ArrayBuffer.isView(interleaved) && !Array.isArray(interleaved)) {
+      throw new TypeError('deinterleavePcm interleaved source must be a TypedArray or Array');
+    }
+    const maxFrames = Math.floor(interleaved.length / channels);
+    const frames =
+      frameCount !== undefined
+        ? Math.min(sanitizeNonNegInt(frameCount, 0), maxFrames)
+        : maxFrames;
+
+    let targets;
+    if (Array.isArray(planarTargets) && planarTargets.length >= channels) {
+      for (let c = 0; c < channels; c++) {
+        if (!(planarTargets[c] instanceof Float32Array) || planarTargets[c].length < frames) {
+          throw new RangeError(
+            `deinterleavePcm planar target channel ${c} must be a Float32Array of length >= ${frames}`
+          );
+        }
+      }
+      targets = planarTargets;
+    } else {
+      targets = new Array(channels);
+      for (let c = 0; c < channels; c++) {
+        targets[c] = new Float32Array(frames);
+      }
+    }
+
+    if (frames <= 0) {
+      return targets;
+    }
+
+    if (channels === 2) {
+      const ch0 = targets[0];
+      const ch1 = targets[1];
+      for (let f = 0; f < frames; f++) {
+        const idx = f * 2;
+        const l = interleaved[idx];
+        const r = interleaved[idx + 1];
+        ch0[f] = Number.isFinite(l) ? l : 0.0;
+        ch1[f] = Number.isFinite(r) ? r : 0.0;
+      }
+    } else if (channels === 1) {
+      const ch0 = targets[0];
+      for (let f = 0; f < frames; f++) {
+        const v = interleaved[f];
+        ch0[f] = Number.isFinite(v) ? v : 0.0;
+      }
+    } else {
+      for (let f = 0; f < frames; f++) {
+        const base = f * channels;
+        for (let c = 0; c < channels; c++) {
+          const v = interleaved[base + c];
+          targets[c][f] = Number.isFinite(v) ? v : 0.0;
+        }
+      }
+    }
+
+    return targets;
+  }
+
+  /**
+   * Interleaves planar per-channel Float32Arrays into a single interleaved
+   * Float32Array. Writes into caller-provided `interleavedTarget` with zero
+   * TypedArray allocation when supplied. Non-finite samples are sanitized to 0.0.
+   *
+   * @param {Float32Array[]} planarChannels
+   * @param {number} [frameCount]
+   * @param {Float32Array} [interleavedTarget]
+   * @returns {Float32Array}
+   */
+  function interleavePcm(planarChannels, frameCount, interleavedTarget) {
+    if (!Array.isArray(planarChannels) || planarChannels.length < 1 || planarChannels.length > MAX_CHANNELS) {
+      throw new RangeError(
+        `interleavePcm planarChannels must be an array of 1..${MAX_CHANNELS} channel buffers`
+      );
+    }
+    const channels = planarChannels.length;
+    let minLen = Infinity;
+    for (let c = 0; c < channels; c++) {
+      const ch = planarChannels[c];
+      if (!(ch instanceof Float32Array)) {
+        throw new TypeError(`interleavePcm channel ${c} must be a Float32Array`);
+      }
+      if (!isSharedArrayBuffer(ch.buffer) && isDetachedArrayBuffer(ch.buffer)) {
+        throw new TypeError(`interleavePcm channel ${c} buffer is detached`);
+      }
+      if (ch.length < minLen) {
+        minLen = ch.length;
+      }
+    }
+
+    const frames =
+      frameCount !== undefined
+        ? Math.min(sanitizeNonNegInt(frameCount, 0), minLen)
+        : minLen;
+    const totalSamples = frames * channels;
+
+    let out;
+    if (interleavedTarget instanceof Float32Array && interleavedTarget.length >= totalSamples) {
+      out = interleavedTarget;
+    } else {
+      out = new Float32Array(totalSamples);
+    }
+
+    if (frames <= 0) {
+      return out;
+    }
+
+    if (channels === 2) {
+      const ch0 = planarChannels[0];
+      const ch1 = planarChannels[1];
+      for (let f = 0; f < frames; f++) {
+        const idx = f * 2;
+        const l = ch0[f];
+        const r = ch1[f];
+        out[idx] = Number.isFinite(l) ? l : 0.0;
+        out[idx + 1] = Number.isFinite(r) ? r : 0.0;
+      }
+    } else if (channels === 1) {
+      const ch0 = planarChannels[0];
+      for (let f = 0; f < frames; f++) {
+        const v = ch0[f];
+        out[f] = Number.isFinite(v) ? v : 0.0;
+      }
+    } else {
+      for (let f = 0; f < frames; f++) {
+        const base = f * channels;
+        for (let c = 0; c < channels; c++) {
+          const v = planarChannels[c][f];
+          out[base + c] = Number.isFinite(v) ? v : 0.0;
+        }
+      }
+    }
+
+    return out;
+  }
+
+  /**
+   * Reusable PCM scratch buffer pool supporting named interleaved slots and
+   * per-channel planar scratch buffers so steady-state packet forwarding,
+   * downmixing, resampling, and interleaved<->planar conversion perform zero
+   * per-packet TypedArray allocations.
+   */
+  class PcmScratchPool {
+    constructor(options = {}) {
+      const opts = options && typeof options === 'object' ? options : {};
+      this._maxSamples = sanitizePositiveInt(
+        opts.maxSamples,
+        Math.floor(DEFAULT_MAX_PCM_BYTES / Float32Array.BYTES_PER_ELEMENT),
+        1,
+        16 * 1024 * 1024
+      );
+      this._slots = Object.create(null);
+      this._slotCount = 0;
+
+      this._planarBacking = [];
+      this._planarViews = [];
+      this._planarChannels = 0;
+      this._planarCapacityFrames = 0;
+      this._planarViewFrames = 0;
+
+      this._lastRawSab = null;
+      this._lastRawSabSamples = 0;
+      this._lastRawSabView = null;
+
+      this._allocations = 0;
+      this._reuses = 0;
+    }
+
+    get allocations() {
+      return this._allocations;
+    }
+
+    get reuses() {
+      return this._reuses;
+    }
+
+    get planarChannels() {
+      return this._planarChannels;
+    }
+
+    get planarCapacityFrames() {
+      return this._planarCapacityFrames;
+    }
+
+    _getOrCreateSlot(slotName, sampleCount, needBytes) {
+      const count = sanitizeNonNegInt(sampleCount, 0);
+      if (count > this._maxSamples) {
+        throw new RangeError(
+          `PCM scratch request (${count} samples) exceeds maxSamples (${this._maxSamples})`
+        );
+      }
+
+      let slot = this._slots[slotName];
+      if (!slot) {
+        const cap = count > 0 ? count : 1;
+        const backing = new Float32Array(cap);
+        const byteBacking = needBytes ? new Uint8Array(backing.buffer) : null;
+        slot = {
+          backing,
+          capacity: cap,
+          view: count === cap ? backing : backing.subarray(0, count),
+          viewLen: count,
+          byteBacking,
+          byteView: needBytes
+            ? count === cap
+              ? byteBacking
+              : byteBacking.subarray(0, count * Float32Array.BYTES_PER_ELEMENT)
+            : null,
+          byteViewLen: needBytes ? count * Float32Array.BYTES_PER_ELEMENT : -1,
+          pair: { floats: null, bytes: null },
+        };
+        slot.pair.floats = slot.view;
+        slot.pair.bytes = slot.byteView;
+        this._slots[slotName] = slot;
+        this._slotCount += 1;
+        this._allocations += 1;
+        return slot;
+      }
+
+      if (count > slot.capacity) {
+        const backing = new Float32Array(count);
+        slot.backing = backing;
+        slot.capacity = count;
+        slot.view = backing;
+        slot.viewLen = count;
+        if (needBytes || slot.byteBacking !== null) {
+          slot.byteBacking = new Uint8Array(backing.buffer);
+          slot.byteView = slot.byteBacking;
+          slot.byteViewLen = count * Float32Array.BYTES_PER_ELEMENT;
+        }
+        slot.pair.floats = slot.view;
+        slot.pair.bytes = slot.byteView;
+        this._allocations += 1;
+        return slot;
+      }
+
+      if (slot.viewLen !== count) {
+        slot.view = count === slot.capacity ? slot.backing : slot.backing.subarray(0, count);
+        slot.viewLen = count;
+        slot.pair.floats = slot.view;
+      }
+
+      if (needBytes) {
+        const byteLen = count * Float32Array.BYTES_PER_ELEMENT;
+        if (!slot.byteBacking) {
+          slot.byteBacking = new Uint8Array(slot.backing.buffer);
+          slot.byteViewLen = -1;
+        }
+        if (slot.byteViewLen !== byteLen) {
+          slot.byteView =
+            byteLen === slot.byteBacking.byteLength
+              ? slot.byteBacking
+              : slot.byteBacking.subarray(0, byteLen);
+          slot.byteViewLen = byteLen;
+          slot.pair.bytes = slot.byteView;
+        }
+      }
+
+      this._reuses += 1;
+      return slot;
+    }
+
+    acquireFloat32(slotName, sampleCount) {
+      return this._getOrCreateSlot(slotName, sampleCount, false).view;
+    }
+
+    acquireFloat32WithBytes(slotName, sampleCount) {
+      return this._getOrCreateSlot(slotName, sampleCount, true).pair;
+    }
+
+    acquireRawSabView(sab, sampleCount) {
+      if (this._lastRawSab === sab && this._lastRawSabSamples === sampleCount && this._lastRawSabView) {
+        return this._lastRawSabView;
+      }
+      const view = new Float32Array(sab, 0, sampleCount);
+      this._lastRawSab = sab;
+      this._lastRawSabSamples = sampleCount;
+      this._lastRawSabView = view;
+      return view;
+    }
+
+    /**
+     * Returns a reusable array of `channels` Float32Arrays each of exact length
+     * `frameCount`. Steady-state calls with the same `(channels, frameCount)`
+     * return the exact same Array and Float32Array instances with zero allocations.
+     *
+     * @param {number} channels
+     * @param {number} frameCount
+     * @returns {Float32Array[]}
+     */
+    acquirePlanar(channels, frameCount) {
+      if (!Number.isInteger(channels) || channels < 1 || channels > MAX_CHANNELS) {
+        throw new RangeError(
+          `acquirePlanar channels must be an integer in [1, ${MAX_CHANNELS}], got ${channels}`
+        );
+      }
+      const frames = sanitizeNonNegInt(frameCount, 0);
+      if (frames * channels > this._maxSamples) {
+        throw new RangeError(
+          `Planar PCM scratch request (${frames}x${channels} samples) exceeds maxSamples (${this._maxSamples})`
+        );
+      }
+
+      const needMoreChannels = channels > this._planarBacking.length;
+      const needMoreFrames = frames > this._planarCapacityFrames;
+
+      if (needMoreChannels || needMoreFrames) {
+        const nextCap = needMoreFrames ? Math.max(frames, 1) : Math.max(this._planarCapacityFrames, 1);
+        const targetChannelCount = Math.max(channels, this._planarBacking.length);
+        if (needMoreFrames) {
+          this._planarBacking = new Array(targetChannelCount);
+          for (let c = 0; c < targetChannelCount; c++) {
+            this._planarBacking[c] = new Float32Array(nextCap);
+          }
+          this._allocations += targetChannelCount;
+        } else {
+          for (let c = this._planarBacking.length; c < targetChannelCount; c++) {
+            this._planarBacking.push(new Float32Array(nextCap));
+            this._allocations += 1;
+          }
+        }
+        this._planarCapacityFrames = nextCap;
+        this._planarViews = new Array(channels);
+        for (let c = 0; c < channels; c++) {
+          this._planarViews[c] =
+            frames === nextCap ? this._planarBacking[c] : this._planarBacking[c].subarray(0, frames);
+        }
+        this._planarChannels = channels;
+        this._planarViewFrames = frames;
+        return this._planarViews;
+      }
+
+      if (channels !== this._planarChannels || frames !== this._planarViewFrames) {
+        if (this._planarViews.length !== channels) {
+          this._planarViews = new Array(channels);
+        }
+        for (let c = 0; c < channels; c++) {
+          this._planarViews[c] =
+            frames === this._planarCapacityFrames
+              ? this._planarBacking[c]
+              : this._planarBacking[c].subarray(0, frames);
+        }
+        this._planarChannels = channels;
+        this._planarViewFrames = frames;
+      }
+
+      this._reuses += 1;
+      return this._planarViews;
+    }
+
+    deinterleave(interleaved, channels, frameCount) {
+      if (!Number.isInteger(channels) || channels < 1 || channels > MAX_CHANNELS) {
+        throw new RangeError(
+          `deinterleave channels must be an integer in [1, ${MAX_CHANNELS}], got ${channels}`
+        );
+      }
+      if (!ArrayBuffer.isView(interleaved) && !Array.isArray(interleaved)) {
+        throw new TypeError('deinterleave source must be a TypedArray or Array');
+      }
+      const maxFrames = Math.floor(interleaved.length / channels);
+      const frames =
+        frameCount !== undefined
+          ? Math.min(sanitizeNonNegInt(frameCount, 0), maxFrames)
+          : maxFrames;
+      const targets = this.acquirePlanar(channels, frames);
+      return deinterleavePcm(interleaved, channels, frames, targets);
+    }
+
+    interleave(planarChannels, frameCount) {
+      if (!Array.isArray(planarChannels) || planarChannels.length < 1 || planarChannels.length > MAX_CHANNELS) {
+        throw new RangeError(
+          `interleave planarChannels must be an array of 1..${MAX_CHANNELS} channel buffers`
+        );
+      }
+      const channels = planarChannels.length;
+      let minLen = Infinity;
+      for (let c = 0; c < channels; c++) {
+        const ch = planarChannels[c];
+        if (!(ch instanceof Float32Array)) {
+          throw new TypeError(`interleave channel ${c} must be a Float32Array`);
+        }
+        if (ch.length < minLen) {
+          minLen = ch.length;
+        }
+      }
+      const frames =
+        frameCount !== undefined
+          ? Math.min(sanitizeNonNegInt(frameCount, 0), minLen)
+          : minLen;
+      const target = this.acquireFloat32('interleave', frames * channels);
+      return interleavePcm(planarChannels, frames, target);
+    }
+
+    resetStats() {
+      this._allocations = 0;
+      this._reuses = 0;
+    }
+
+    clear() {
+      this._slots = Object.create(null);
+      this._slotCount = 0;
+      this._planarBacking = [];
+      this._planarViews = [];
+      this._planarChannels = 0;
+      this._planarCapacityFrames = 0;
+      this._planarViewFrames = 0;
+      this._lastRawSab = null;
+      this._lastRawSabSamples = 0;
+      this._lastRawSabView = null;
+      this._allocations = 0;
+      this._reuses = 0;
+    }
+
+    getStats() {
+      return {
+        allocations: this._allocations,
+        reuses: this._reuses,
+        planarChannels: this._planarChannels,
+        planarCapacityFrames: this._planarCapacityFrames,
+        slotCount: this._slotCount,
+      };
+    }
+  }
+
+  /**
    * Validates and extracts PCM Float32 samples safely from any supported payload.
    * - Rejects null, malformed types, detached ArrayBuffers, and oversized payloads.
    * - Copies SharedArrayBuffer-backed views (and unaligned TypedArray views) into
-   *   a fresh standalone ArrayBuffer-backed Float32Array to prevent concurrent
-   *   mutation races and DataCloneError on transfer.
+   *   a fresh or reusable scratch ArrayBuffer-backed Float32Array to prevent
+   *   concurrent mutation races and DataCloneError on transfer.
    * - Sanitizes non-finite float samples (NaN / +-Infinity) to 0.0.
    *
    * @param {any} samples
-   * @param {{ maxPcmBytes?: number }} [options]
+   * @param {{ maxPcmBytes?: number, scratch?: PcmScratchPool }} [options]
    * @returns {{ ok: true, pcm: Float32Array, copiedFromSab: boolean, sanitizedSamples: number } | { ok: false, error: string }}
    */
   function extractSafePcmSamples(samples, options = {}) {
@@ -226,6 +715,12 @@
       64 * 1024 * 1024
     );
     const maxSamples = Math.floor(maxPcmBytes / Float32Array.BYTES_PER_ELEMENT);
+    const scratch =
+      options &&
+      options.scratch &&
+      typeof options.scratch.acquireFloat32 === 'function'
+        ? options.scratch
+        : null;
 
     if (samples === null || samples === undefined) {
       return { ok: false, error: 'PCM samples missing or null' };
@@ -241,8 +736,13 @@
         };
       }
       const sampleCount = Math.floor(byteLen / Float32Array.BYTES_PER_ELEMENT);
-      const view = new Float32Array(samples, 0, sampleCount);
-      const copy = new Float32Array(sampleCount);
+      const view =
+        scratch && typeof scratch.acquireRawSabView === 'function'
+          ? scratch.acquireRawSabView(samples, sampleCount)
+          : new Float32Array(samples, 0, sampleCount);
+      const copy = scratch
+        ? scratch.acquireFloat32('extract', sampleCount)
+        : new Float32Array(sampleCount);
       let sanitizedSamples = 0;
       for (let i = 0; i < sampleCount; i++) {
         const v = view[i];
@@ -275,7 +775,10 @@
       for (let i = 0; i < sampleCount; i++) {
         if (!Number.isFinite(view[i])) {
           if (!copy) {
-            copy = new Float32Array(view);
+            copy = scratch
+              ? scratch.acquireFloat32('extract', sampleCount)
+              : new Float32Array(sampleCount);
+            copy.set(view);
           }
           copy[i] = 0.0;
           sanitizedSamples += 1;
@@ -316,20 +819,41 @@
       const sampleCount = alignedByteLength / Float32Array.BYTES_PER_ELEMENT;
 
       if (fromSab || byteOffset % Float32Array.BYTES_PER_ELEMENT !== 0) {
-        // Always copy SAB-backed or unaligned views into a fresh, aligned ArrayBuffer.
+        // Always copy SAB-backed or unaligned views into a standalone or reusable scratch ArrayBuffer.
         let copy;
+        let sanitizedSamples = 0;
         if (samples instanceof Float32Array) {
-          copy = new Float32Array(sampleCount);
+          copy = scratch
+            ? scratch.acquireFloat32('extract', sampleCount)
+            : new Float32Array(sampleCount);
           for (let i = 0; i < sampleCount; i++) {
-            copy[i] = samples[i];
+            const v = samples[i];
+            if (Number.isFinite(v)) {
+              copy[i] = v;
+            } else {
+              copy[i] = 0.0;
+              sanitizedSamples += 1;
+            }
           }
+          return { ok: true, pcm: copy, copiedFromSab: fromSab, sanitizedSamples };
+        }
+
+        if (scratch && typeof scratch.acquireFloat32WithBytes === 'function') {
+          const pair = scratch.acquireFloat32WithBytes('extract', sampleCount);
+          if (samples instanceof Uint8Array) {
+            for (let i = 0; i < alignedByteLength; i++) {
+              pair.bytes[i] = samples[i];
+            }
+          } else {
+            pair.bytes.set(new Uint8Array(backing, byteOffset, alignedByteLength));
+          }
+          copy = pair.floats;
         } else {
           const byteCopy = new Uint8Array(alignedByteLength);
           byteCopy.set(new Uint8Array(backing, byteOffset, alignedByteLength));
           copy = new Float32Array(byteCopy.buffer);
         }
 
-        let sanitizedSamples = 0;
         for (let i = 0; i < sampleCount; i++) {
           if (!Number.isFinite(copy[i])) {
             copy[i] = 0.0;
@@ -348,7 +872,10 @@
       for (let i = 0; i < view.length; i++) {
         if (!Number.isFinite(view[i])) {
           if (!copy) {
-            copy = new Float32Array(view);
+            copy = scratch
+              ? scratch.acquireFloat32('extract', view.length)
+              : new Float32Array(view.length);
+            copy.set(view);
           }
           copy[i] = 0.0;
           sanitizedSamples += 1;
@@ -365,7 +892,9 @@
           error: `PCM array (${samples.length} samples) exceeds max allowed (${maxSamples} samples)`,
         };
       }
-      const out = new Float32Array(samples.length);
+      const out = scratch
+        ? scratch.acquireFloat32('extract', samples.length)
+        : new Float32Array(samples.length);
       let sanitizedSamples = 0;
       for (let i = 0; i < samples.length; i++) {
         const v = samples[i];
@@ -535,7 +1064,18 @@
     }
 
     const frameCount = Math.floor(src.length / channels);
-    const out = new Float32Array(frameCount * 2);
+    const outSampleCount = frameCount * 2;
+    let out;
+    if (opts.output instanceof Float32Array && opts.output.length >= outSampleCount) {
+      out =
+        opts.output.length === outSampleCount
+          ? opts.output
+          : opts.output.subarray(0, outSampleCount);
+    } else if (opts.scratch && typeof opts.scratch.acquireFloat32 === 'function') {
+      out = opts.scratch.acquireFloat32('downmix', outSampleCount);
+    } else {
+      out = new Float32Array(outSampleCount);
+    }
     let clipped = 0;
     let peak = 0.0;
 
@@ -755,7 +1295,17 @@
         );
       }
       const totalSamples = srcFrames * channels;
-      const out = new Float32Array(totalSamples);
+      let out;
+      if (opts.output instanceof Float32Array && opts.output.length >= totalSamples) {
+        out =
+          opts.output.length === totalSamples
+            ? opts.output
+            : opts.output.subarray(0, totalSamples);
+      } else if (opts.scratch && typeof opts.scratch.acquireFloat32 === 'function') {
+        out = opts.scratch.acquireFloat32('resample', totalSamples);
+      } else {
+        out = new Float32Array(totalSamples);
+      }
       for (let i = 0; i < totalSamples; i++) {
         let v = src[i];
         if (!Number.isFinite(v)) {
@@ -794,7 +1344,18 @@
       );
     }
 
-    const out = new Float32Array(outFrames * channels);
+    const outSampleCount = outFrames * channels;
+    let out;
+    if (opts.output instanceof Float32Array && opts.output.length >= outSampleCount) {
+      out =
+        opts.output.length === outSampleCount
+          ? opts.output
+          : opts.output.subarray(0, outSampleCount);
+    } else if (opts.scratch && typeof opts.scratch.acquireFloat32 === 'function') {
+      out = opts.scratch.acquireFloat32('resample', outSampleCount);
+    } else {
+      out = new Float32Array(outSampleCount);
+    }
     const lastFrame = srcFrames - 1;
 
     for (let f = 0; f < outFrames; f++) {
@@ -953,6 +1514,25 @@
       s.activeVoicePeak !== undefined ? s.activeVoicePeak : s.activeVoices,
       0
     );
+    const packetsReceived = sanitizeNonNegInt(s.packetsReceived, 0);
+    const framesDecoded = sanitizeNonNegInt(
+      s.framesDecoded !== undefined ? s.framesDecoded : totalPushedFrames,
+      0
+    );
+    const droppedPackets = sanitizeNonNegInt(s.droppedPackets, 0);
+    const underrunRecoveries = sanitizeNonNegInt(s.underrunRecoveries, 0);
+    const rawBufferFillPct =
+      typeof s.bufferFillPct === 'number' && Number.isFinite(s.bufferFillPct)
+        ? s.bufferFillPct
+        : capacityFrames > 0
+          ? (availableFrames / capacityFrames) * 100
+          : 0.0;
+    const bufferFillPct =
+      rawBufferFillPct < 0 ? 0.0 : rawBufferFillPct > 100 ? 100.0 : rawBufferFillPct;
+    const scratchAllocations = sanitizeNonNegInt(s.scratchAllocations, 0);
+    const scratchReuses = sanitizeNonNegInt(s.scratchReuses, 0);
+    const overflowPolicy = normalizeOverflowPolicy(s.overflowPolicy, DEFAULT_OVERFLOW_POLICY);
+    const maxFillRatio = sanitizeFillRatio(s.maxFillRatio, DEFAULT_MAX_FILL_RATIO);
     const outputState = normalizeOutputState(s.outputState, OUTPUT_STATES.HEADLESS_DRAIN);
 
     return {
@@ -966,13 +1546,18 @@
         capacityFrames,
         availableFrames,
         freeFrames,
+        bufferFillPct,
         volume,
         muted,
         effectiveGain,
         framesDrained,
+        packetsReceived,
+        framesDecoded,
+        droppedPackets,
         underruns,
         underrunCount,
         underrunFrames,
+        underrunRecoveries,
         fadeOutCount,
         fadeInCount,
         peakFillFrames,
@@ -980,6 +1565,8 @@
         avgFillRatio,
         overruns,
         overflows,
+        overflowPolicy,
+        maxFillRatio,
         droppedFrames,
         totalPushedFrames,
         totalPulledFrames,
@@ -992,6 +1579,8 @@
         resampledFrames,
         clippedSamples,
         activeVoicePeak,
+        scratchAllocations,
+        scratchReuses,
       },
     };
   }
@@ -1108,6 +1697,15 @@
       this._volume = clampVolume(options.volume !== undefined ? options.volume : 1.0);
       this._muted = Boolean(options.muted);
       this._declickFrames = sanitizeDeclickFrames(options.declickFrames, 0);
+      this._overflowPolicy = normalizeOverflowPolicy(
+        options.overflowPolicy,
+        DEFAULT_OVERFLOW_POLICY
+      );
+      this._maxFillRatio = sanitizeFillRatio(options.maxFillRatio, DEFAULT_MAX_FILL_RATIO);
+      this._underrunRecoveryFrames = sanitizeNonNegInt(
+        options.underrunRecoveryFrames,
+        DEFAULT_UNDERRUN_RECOVERY_FRAMES
+      );
       this._lastOutputFrame = new Float32Array(this._channels);
       this._hasActiveAudio = false;
       this._inUnderrun = false;
@@ -1115,11 +1713,23 @@
       this._fadeInTotal = 0;
       this._fadeOutCount = 0;
       this._fadeInCount = 0;
+      this._underrunRecoveries = 0;
+      this._consecutiveUnderruns = 0;
+      this._maxConsecutiveUnderruns = 0;
       this._peakFillFrames = 0;
       this._minFillFrames = Infinity;
       this._fillFramesSum = 0;
       this._fillSamples = 0;
       this._lastObservedFill = null;
+      this._packetsReceived = 0;
+      this._framesDecoded = 0;
+      this._droppedPackets = 0;
+      this._lastPushDroppedFrames = 0;
+      this._lastPushOverflowed = false;
+      this._pushScratch = null;
+      this._pullScratch = null;
+      this._pullScratchView = null;
+      this._pullScratchViewLen = 0;
     }
 
     get sab() {
@@ -1146,6 +1756,18 @@
       return this._declickFrames;
     }
 
+    get overflowPolicy() {
+      return this._overflowPolicy;
+    }
+
+    get maxFillRatio() {
+      return this._maxFillRatio;
+    }
+
+    get underrunRecoveryFrames() {
+      return this._underrunRecoveryFrames;
+    }
+
     get underruns() {
       return Atomics.load(this._ctrl, HDR_UNDERRUNS);
     }
@@ -1156,6 +1778,18 @@
 
     get underrunFrames() {
       return Atomics.load(this._ctrl, HDR_UNDERRUN_FRAMES);
+    }
+
+    get underrunRecoveries() {
+      return this._underrunRecoveries;
+    }
+
+    get consecutiveUnderruns() {
+      return this._consecutiveUnderruns;
+    }
+
+    get maxConsecutiveUnderruns() {
+      return this._maxConsecutiveUnderruns;
     }
 
     get fadeOutCount() {
@@ -1184,6 +1818,16 @@
       return ratio;
     }
 
+    get bufferFillPct() {
+      if (this._capacityFrames <= 0) {
+        return 0.0;
+      }
+      const pct = (this.availableFrames() / this._capacityFrames) * 100;
+      if (pct < 0) return 0.0;
+      if (pct > 100) return 100.0;
+      return pct;
+    }
+
     get overflows() {
       return Atomics.load(this._ctrl, HDR_OVERFLOWS);
     }
@@ -1194,6 +1838,18 @@
 
     get droppedFrames() {
       return Atomics.load(this._ctrl, HDR_DROPPED_FRAMES);
+    }
+
+    get packetsReceived() {
+      return this._packetsReceived;
+    }
+
+    get framesDecoded() {
+      return this._framesDecoded;
+    }
+
+    get droppedPackets() {
+      return this._droppedPackets;
     }
 
     setVolume(volume) {
@@ -1209,6 +1865,43 @@
     setDeclickFrames(frames) {
       this._declickFrames = sanitizeDeclickFrames(frames, this._declickFrames);
       return this._declickFrames;
+    }
+
+    setOverflowPolicy(policy) {
+      this._overflowPolicy = normalizeOverflowPolicy(policy, this._overflowPolicy);
+      return this._overflowPolicy;
+    }
+
+    setMaxFillRatio(ratio) {
+      this._maxFillRatio = sanitizeFillRatio(ratio, this._maxFillRatio);
+      return this._maxFillRatio;
+    }
+
+    setUnderrunRecoveryFrames(frames) {
+      this._underrunRecoveryFrames = sanitizeNonNegInt(frames, this._underrunRecoveryFrames);
+      return this._underrunRecoveryFrames;
+    }
+
+    _normalizeCursor(cursor) {
+      const mod = this._modulus;
+      if (cursor >= 0 && cursor < mod) {
+        return cursor;
+      }
+      const norm = cursor % mod;
+      return norm < 0 ? norm + mod : norm;
+    }
+
+    _effectiveMaxFillFrames(override) {
+      const cap = this._capacityFrames;
+      if (typeof override === 'number' && Number.isFinite(override) && override > 0) {
+        const n = Math.floor(override);
+        return n < cap ? n : cap;
+      }
+      if (this._maxFillRatio >= 1.0) {
+        return cap;
+      }
+      const scaled = Math.floor(cap * this._maxFillRatio);
+      return scaled < 1 ? 1 : scaled > cap ? cap : scaled;
     }
 
     _recordFillSample(fillFrames) {
@@ -1242,8 +1935,8 @@
     }
 
     availableFrames() {
-      const write = Atomics.load(this._ctrl, HDR_WRITE_CURSOR);
-      const read = Atomics.load(this._ctrl, HDR_READ_CURSOR);
+      const write = this._normalizeCursor(Atomics.load(this._ctrl, HDR_WRITE_CURSOR));
+      const read = this._normalizeCursor(Atomics.load(this._ctrl, HDR_READ_CURSOR));
       let used = write - read;
       if (used < 0) {
         used += this._modulus;
@@ -1259,47 +1952,151 @@
 
     /**
      * Pushes interleaved PCM float samples into the ring buffer.
-     * Applies overflow backpressure: writes as many complete frames as fit,
-     * never overwrites unread audio, and increments overflow counters on drop.
+     * Applies bounded overflow drop guards (`drop-tail`, `drop-newest`, or
+     * `drop-oldest`) respecting `maxFillFrames` / `maxFillRatio`, performs zero
+     * per-packet TypedArray allocation on steady-state Float32Array inputs, and
+     * updates atomic overflow counters on drop.
      *
      * @param {Float32Array|ArrayBuffer|SharedArrayBuffer|number[]} samples Interleaved PCM samples.
+     * @param {number|{ frameCount?: number, overflowPolicy?: string, maxFillFrames?: number }} [optionsOrFrameCount]
      * @returns {number} Number of complete frames written.
      */
-    pushSamples(samples) {
-      const pcm = toFloat32Array(samples);
+    pushSamples(samples, optionsOrFrameCount) {
+      let pcm;
+      if (samples instanceof Float32Array && !isSharedArrayBuffer(samples.buffer)) {
+        if (isDetachedArrayBuffer(samples.buffer)) {
+          throw new TypeError('PCM TypedArray backing ArrayBuffer is detached');
+        }
+        pcm = samples;
+      } else {
+        if (!this._pushScratch) {
+          this._pushScratch = new PcmScratchPool({ maxSamples: 16 * 1024 * 1024 });
+        }
+        const extracted = extractSafePcmSamples(samples, {
+          maxPcmBytes: 64 * 1024 * 1024,
+          scratch: this._pushScratch,
+        });
+        if (!extracted.ok) {
+          throw new TypeError(extracted.error);
+        }
+        pcm = extracted.pcm;
+      }
+
       const channels = this._channels;
-      const inputFrames = Math.floor(pcm.length / channels);
+      const maxAvailFrames = Math.floor(pcm.length / channels);
+      let frameCountOpt;
+      let policyOpt = this._overflowPolicy;
+      let maxFillOpt;
+
+      if (typeof optionsOrFrameCount === 'number') {
+        frameCountOpt = optionsOrFrameCount;
+      } else if (optionsOrFrameCount && typeof optionsOrFrameCount === 'object') {
+        if (optionsOrFrameCount.frameCount !== undefined) {
+          frameCountOpt = optionsOrFrameCount.frameCount;
+        }
+        if (optionsOrFrameCount.overflowPolicy !== undefined) {
+          policyOpt = normalizeOverflowPolicy(
+            optionsOrFrameCount.overflowPolicy,
+            this._overflowPolicy
+          );
+        }
+        if (optionsOrFrameCount.maxFillFrames !== undefined) {
+          maxFillOpt = optionsOrFrameCount.maxFillFrames;
+        }
+      }
+
+      const inputFrames =
+        frameCountOpt !== undefined
+          ? Math.min(sanitizeNonNegInt(frameCountOpt, 0), maxAvailFrames)
+          : maxAvailFrames;
+
+      this._lastPushDroppedFrames = 0;
+      this._lastPushOverflowed = false;
+      this._packetsReceived += 1;
+      this._framesDecoded += inputFrames;
+
       if (inputFrames <= 0) {
         return 0;
       }
 
       const cap = this._capacityFrames;
-      const write = Atomics.load(this._ctrl, HDR_WRITE_CURSOR);
-      const read = Atomics.load(this._ctrl, HDR_READ_CURSOR);
+      const maxFillFrames = this._effectiveMaxFillFrames(maxFillOpt);
+      const write = this._normalizeCursor(Atomics.load(this._ctrl, HDR_WRITE_CURSOR));
+      let read = this._normalizeCursor(Atomics.load(this._ctrl, HDR_READ_CURSOR));
       let used = write - read;
       if (used < 0) {
         used += this._modulus;
       }
+      if (used > cap) {
+        used = cap;
+      }
 
-      const free = Math.max(0, cap - used);
-      const framesToWrite = inputFrames <= free ? inputFrames : free;
+      const effectiveFree = maxFillFrames > used ? maxFillFrames - used : 0;
+      let framesToWrite = 0;
+      let srcFrameOffset = 0;
+      let droppedFrames = 0;
+      let overflowed = false;
+
+      if (inputFrames <= effectiveFree) {
+        framesToWrite = inputFrames;
+      } else if (policyOpt === OVERFLOW_POLICIES.DROP_NEWEST) {
+        framesToWrite = 0;
+        droppedFrames = inputFrames;
+        overflowed = true;
+      } else if (policyOpt === OVERFLOW_POLICIES.DROP_OLDEST) {
+        overflowed = true;
+        let toEvict = 0;
+        let trimmedInput = 0;
+        if (inputFrames >= maxFillFrames) {
+          toEvict = used;
+          trimmedInput = inputFrames - maxFillFrames;
+          srcFrameOffset = trimmedInput;
+          framesToWrite = maxFillFrames;
+        } else {
+          toEvict = used + inputFrames - maxFillFrames;
+          if (toEvict > used) {
+            toEvict = used;
+          }
+          framesToWrite = inputFrames;
+        }
+        if (toEvict > 0) {
+          let nextRead = read + toEvict;
+          if (nextRead >= this._modulus) {
+            nextRead -= this._modulus;
+          }
+          Atomics.store(this._ctrl, HDR_READ_CURSOR, nextRead);
+          read = nextRead;
+          used -= toEvict;
+        }
+        droppedFrames = toEvict + trimmedInput;
+      } else {
+        // Default: 'drop-tail' — write as many frames as fit without clobbering unread audio.
+        framesToWrite = effectiveFree;
+        droppedFrames = inputFrames - framesToWrite;
+        overflowed = droppedFrames > 0;
+      }
 
       if (framesToWrite > 0) {
         const writeSlot = write >= cap ? write - cap : write;
         const firstFrames = Math.min(framesToWrite, cap - writeSlot);
         const secondFrames = framesToWrite - firstFrames;
-
         const firstSampleCount = firstFrames * channels;
-        this._samples.set(
-          pcm.subarray(0, firstSampleCount),
-          writeSlot * channels
-        );
+        const secondSampleCount = secondFrames * channels;
+        const srcBase = srcFrameOffset * channels;
+        const dstBase = writeSlot * channels;
+        const ringSamples = this._samples;
 
-        if (secondFrames > 0) {
-          this._samples.set(
-            pcm.subarray(firstSampleCount, framesToWrite * channels),
-            0
-          );
+        for (let i = 0; i < firstSampleCount; i++) {
+          const v = pcm[srcBase + i];
+          ringSamples[dstBase + i] = Number.isFinite(v) ? v : 0.0;
+        }
+
+        if (secondSampleCount > 0) {
+          const srcSecondBase = srcBase + firstSampleCount;
+          for (let i = 0; i < secondSampleCount; i++) {
+            const v = pcm[srcSecondBase + i];
+            ringSamples[i] = Number.isFinite(v) ? v : 0.0;
+          }
         }
 
         let nextWrite = write + framesToWrite;
@@ -1311,9 +2108,12 @@
 
       this._recordFillSample(used + framesToWrite);
 
-      if (framesToWrite < inputFrames) {
+      if (overflowed || droppedFrames > 0) {
         Atomics.add(this._ctrl, HDR_OVERFLOWS, 1);
-        Atomics.add(this._ctrl, HDR_DROPPED_FRAMES, inputFrames - framesToWrite);
+        Atomics.add(this._ctrl, HDR_DROPPED_FRAMES, droppedFrames);
+        this._droppedPackets += 1;
+        this._lastPushDroppedFrames = droppedFrames;
+        this._lastPushOverflowed = true;
       }
 
       return framesToWrite;
@@ -1324,8 +2124,9 @@
      * Applies master volume / mute gain. On underrun, applies a smooth linear
      * de-click fade-out when `declickFrames > 0` (or zero-fills when disabled)
      * and increments atomic underrun counters. On recovery after underrun,
-     * applies a matching linear fade-in. Steady-state pulls with no underrun
-     * remain bit-exact unchanged.
+     * optionally waits for `underrunRecoveryFrames` to accumulate before
+     * resuming with a matching linear fade-in. Steady-state pulls with no
+     * underrun remain bit-exact unchanged with zero TypedArray allocations.
      *
      * @param {Float32Array} output Destination buffer (length = frames * channels).
      * @param {number} [gainOverride] Optional explicit gain override in [0, 1].
@@ -1346,14 +2147,32 @@
       }
 
       const cap = this._capacityFrames;
-      const read = Atomics.load(this._ctrl, HDR_READ_CURSOR);
-      const write = Atomics.load(this._ctrl, HDR_WRITE_CURSOR);
+      const read = this._normalizeCursor(Atomics.load(this._ctrl, HDR_READ_CURSOR));
+      const write = this._normalizeCursor(Atomics.load(this._ctrl, HDR_WRITE_CURSOR));
       let used = write - read;
       if (used < 0) {
         used += this._modulus;
       }
       if (used > cap) {
         used = cap;
+      }
+
+      // Optional underrun re-priming watermark: hold silence until enough frames
+      // have accumulated to resume cleanly without immediate re-underrun buzz.
+      if (this._inUnderrun && this._underrunRecoveryFrames > 0) {
+        const recoveryTarget =
+          this._underrunRecoveryFrames < cap ? this._underrunRecoveryFrames : cap;
+        if (used < recoveryTarget) {
+          output.fill(0, 0, requestedFrames * channels);
+          this._recordFillTransition(used, used);
+          this._consecutiveUnderruns += 1;
+          if (this._consecutiveUnderruns > this._maxConsecutiveUnderruns) {
+            this._maxConsecutiveUnderruns = this._consecutiveUnderruns;
+          }
+          Atomics.add(this._ctrl, HDR_UNDERRUNS, 1);
+          Atomics.add(this._ctrl, HDR_UNDERRUN_FRAMES, requestedFrames);
+          return 0;
+        }
       }
 
       const framesToRead = requestedFrames <= used ? requestedFrames : used;
@@ -1366,24 +2185,24 @@
         const secondFrames = framesToRead - firstFrames;
         const firstSamples = firstFrames * channels;
         const secondSamples = secondFrames * channels;
+        const ringSamples = this._samples;
+        const srcBase = readSlot * channels;
 
         if (gain === 0.0) {
           output.fill(0, 0, framesToRead * channels);
         } else if (gain === 1.0) {
-          output.set(
-            this._samples.subarray(readSlot * channels, readSlot * channels + firstSamples),
-            0
-          );
-          if (secondSamples > 0) {
-            output.set(this._samples.subarray(0, secondSamples), firstSamples);
-          }
-        } else {
-          const srcBase = readSlot * channels;
           for (let i = 0; i < firstSamples; i++) {
-            output[i] = this._samples[srcBase + i] * gain;
+            output[i] = ringSamples[srcBase + i];
           }
           for (let i = 0; i < secondSamples; i++) {
-            output[firstSamples + i] = this._samples[i] * gain;
+            output[firstSamples + i] = ringSamples[i];
+          }
+        } else {
+          for (let i = 0; i < firstSamples; i++) {
+            output[i] = ringSamples[srcBase + i] * gain;
+          }
+          for (let i = 0; i < secondSamples; i++) {
+            output[firstSamples + i] = ringSamples[i] * gain;
           }
         }
 
@@ -1399,15 +2218,19 @@
 
       const declickFrames = this._declickFrames;
 
-      // Apply smooth linear fade-in when valid audio resumes after an underrun.
-      if (framesToRead > 0 && declickFrames > 0) {
+      // Track recovery from underrun and apply smooth linear fade-in when enabled.
+      if (framesToRead > 0) {
         if (this._inUnderrun) {
           this._inUnderrun = false;
-          this._fadeInPos = 0;
-          this._fadeInTotal = declickFrames;
-          this._fadeInCount += 1;
+          this._consecutiveUnderruns = 0;
+          this._underrunRecoveries += 1;
+          if (declickFrames > 0) {
+            this._fadeInPos = 0;
+            this._fadeInTotal = declickFrames;
+            this._fadeInCount += 1;
+          }
         }
-        if (this._fadeInTotal > 0 && this._fadeInPos < this._fadeInTotal) {
+        if (declickFrames > 0 && this._fadeInTotal > 0 && this._fadeInPos < this._fadeInTotal) {
           const remaining = this._fadeInTotal - this._fadeInPos;
           const rampCount = framesToRead < remaining ? framesToRead : remaining;
           const total = this._fadeInTotal;
@@ -1484,16 +2307,20 @@
           } else {
             output.fill(0, framesToRead * channels, requestedFrames * channels);
           }
-
-          this._inUnderrun = true;
         } else {
           output.fill(0, framesToRead * channels, requestedFrames * channels);
         }
 
+        this._inUnderrun = true;
+        this._consecutiveUnderruns += 1;
+        if (this._consecutiveUnderruns > this._maxConsecutiveUnderruns) {
+          this._maxConsecutiveUnderruns = this._consecutiveUnderruns;
+        }
         Atomics.add(this._ctrl, HDR_UNDERRUNS, 1);
         Atomics.add(this._ctrl, HDR_UNDERRUN_FRAMES, missingFrames);
       } else {
         // Steady-state full pull: record trailing frame without mutating output.
+        this._consecutiveUnderruns = 0;
         const lastBase = (requestedFrames - 1) * channels;
         for (let c = 0; c < channels; c++) {
           this._lastOutputFrame[c] = output[lastBase + c];
@@ -1502,6 +2329,59 @@
       }
 
       return framesToRead;
+    }
+
+    /**
+     * Pulls interleaved ring audio through an internal reusable scratch buffer
+     * and de-interleaves directly into caller-provided planar channel buffers
+     * (`Float32Array[]`) with zero per-call TypedArray allocations in steady state.
+     *
+     * @param {Float32Array[]} planarOutputs One Float32Array per channel.
+     * @param {number} [frameCount]
+     * @param {number} [gainOverride]
+     * @returns {number} Number of real frames pulled before any underrun fill.
+     */
+    pullPlanarSamples(planarOutputs, frameCount, gainOverride) {
+      const channels = this._channels;
+      if (!Array.isArray(planarOutputs) || planarOutputs.length < channels) {
+        throw new TypeError(
+          `pullPlanarSamples requires an array of at least ${channels} Float32Array channel buffers`
+        );
+      }
+      let minLen = Infinity;
+      for (let c = 0; c < channels; c++) {
+        const ch = planarOutputs[c];
+        if (!(ch instanceof Float32Array)) {
+          throw new TypeError(`pullPlanarSamples channel ${c} must be a Float32Array`);
+        }
+        if (ch.length < minLen) {
+          minLen = ch.length;
+        }
+      }
+      const requestedFrames =
+        frameCount !== undefined
+          ? Math.min(sanitizeNonNegInt(frameCount, 0), minLen)
+          : minLen;
+      if (requestedFrames <= 0) {
+        return 0;
+      }
+
+      const neededSamples = requestedFrames * channels;
+      if (!this._pullScratch || this._pullScratch.length < neededSamples) {
+        this._pullScratch = new Float32Array(neededSamples);
+        this._pullScratchView = this._pullScratch;
+        this._pullScratchViewLen = neededSamples;
+      } else if (this._pullScratchViewLen !== neededSamples) {
+        this._pullScratchView =
+          neededSamples === this._pullScratch.length
+            ? this._pullScratch
+            : this._pullScratch.subarray(0, neededSamples);
+        this._pullScratchViewLen = neededSamples;
+      }
+
+      const framesRead = this.pullSamples(this._pullScratchView, gainOverride);
+      deinterleavePcm(this._pullScratchView, channels, requestedFrames, planarOutputs);
+      return framesRead;
     }
 
     /**
@@ -1518,8 +2398,8 @@
         return 0;
       }
 
-      const read = Atomics.load(this._ctrl, HDR_READ_CURSOR);
-      const write = Atomics.load(this._ctrl, HDR_WRITE_CURSOR);
+      const read = this._normalizeCursor(Atomics.load(this._ctrl, HDR_READ_CURSOR));
+      const write = this._normalizeCursor(Atomics.load(this._ctrl, HDR_WRITE_CURSOR));
       let used = write - read;
       if (used < 0) {
         used += this._modulus;
@@ -1566,28 +2446,51 @@
       this._fadeInTotal = 0;
       this._fadeOutCount = 0;
       this._fadeInCount = 0;
+      this._underrunRecoveries = 0;
+      this._consecutiveUnderruns = 0;
+      this._maxConsecutiveUnderruns = 0;
       this._peakFillFrames = 0;
       this._minFillFrames = Infinity;
       this._fillFramesSum = 0;
       this._fillSamples = 0;
       this._lastObservedFill = null;
+      this._packetsReceived = 0;
+      this._framesDecoded = 0;
+      this._droppedPackets = 0;
+      this._lastPushDroppedFrames = 0;
+      this._lastPushOverflowed = false;
     }
 
     getStats() {
       const overflows = this.overflows;
       const underruns = this.underruns;
+      const availableFrames = this.availableFrames();
+      const bufferFillPct =
+        this._capacityFrames > 0
+          ? Math.min(100, Math.max(0, (availableFrames / this._capacityFrames) * 100))
+          : 0.0;
       return {
         capacityFrames: this._capacityFrames,
         channels: this._channels,
-        availableFrames: this.availableFrames(),
-        freeFrames: this.freeFrames(),
+        availableFrames,
+        freeFrames: this._capacityFrames - availableFrames,
+        bufferFillPct,
         volume: this._volume,
         muted: this._muted,
         effectiveGain: this.effectiveGain(),
         declickFrames: this._declickFrames,
+        overflowPolicy: this._overflowPolicy,
+        maxFillRatio: this._maxFillRatio,
+        underrunRecoveryFrames: this._underrunRecoveryFrames,
+        packetsReceived: this._packetsReceived,
+        framesDecoded: this._framesDecoded,
+        droppedPackets: this._droppedPackets,
         underruns,
         underrunCount: underruns,
         underrunFrames: this.underrunFrames,
+        underrunRecoveries: this._underrunRecoveries,
+        consecutiveUnderruns: this._consecutiveUnderruns,
+        maxConsecutiveUnderruns: this._maxConsecutiveUnderruns,
         fadeOutCount: this._fadeOutCount,
         fadeInCount: this._fadeInCount,
         peakFillFrames: this.peakFillFrames,
@@ -1671,6 +2574,41 @@
           ? rawKnee
           : DEFAULT_SOFT_CLIP_KNEE;
 
+      this._overflowPolicy = normalizeOverflowPolicy(
+        opts.overflowPolicy,
+        DEFAULT_OVERFLOW_POLICY
+      );
+      this._maxFillRatio = sanitizeFillRatio(opts.maxFillRatio, DEFAULT_MAX_FILL_RATIO);
+      this._underrunRecoveryFrames = sanitizeNonNegInt(
+        opts.underrunRecoveryFrames,
+        DEFAULT_UNDERRUN_RECOVERY_FRAMES
+      );
+
+      this._scratchPool = new PcmScratchPool({
+        maxSamples: Math.max(1, Math.floor(this._maxPcmBytes / Float32Array.BYTES_PER_ELEMENT)),
+      });
+      this._dmStats = {
+        downmixedFrames: 0,
+        clippedSamples: 0,
+        nanSanitizedSamples: 0,
+        peakLevel: 0.0,
+      };
+      this._rsStats = {
+        resampledFrames: 0,
+        nanSanitizedSamples: 0,
+        clippedSamples: 0,
+      };
+      this._pushOpts = {
+        frameCount: 0,
+        overflowPolicy: this._overflowPolicy,
+        maxFillFrames: undefined,
+      };
+      this._pullPlanarResult = {
+        framesRead: 0,
+        channels: [],
+        frameCount: 0,
+      };
+
       this.initialized = false;
       this.sampleRate = DEFAULT_SAMPLE_RATE;
       this.channels = DEFAULT_CHANNELS;
@@ -1680,6 +2618,9 @@
       this.totalPushedFrames = 0;
       this.totalPulledFrames = 0;
       this.framesDrained = 0;
+      this._packetsReceived = 0;
+      this._framesDecoded = 0;
+      this._droppedPackets = 0;
       this._drainTicks = 0;
       this._overruns = 0;
       this._rejectedPackets = 0;
@@ -1693,6 +2634,13 @@
       this._lastResampleSrcRate = null;
       this._drainTimer = null;
       this._lastDrainMs = null;
+
+      if (typeof opts.initialScratchFrames === 'number' && opts.initialScratchFrames > 0) {
+        const initFrames = sanitizeNonNegInt(opts.initialScratchFrames, 0);
+        if (initFrames > 0) {
+          this._scratchPool.acquirePlanar(this.channels, initFrames);
+        }
+      }
     }
 
     _safePostMessage(payload, transfer) {
@@ -1861,6 +2809,120 @@
       return this._declickFrames;
     }
 
+    get overflowPolicy() {
+      return this._overflowPolicy;
+    }
+
+    setOverflowPolicy(policy) {
+      this._overflowPolicy = normalizeOverflowPolicy(policy, this._overflowPolicy);
+      if (this.ring) {
+        this.ring.setOverflowPolicy(this._overflowPolicy);
+      }
+      return this._overflowPolicy;
+    }
+
+    get maxFillRatio() {
+      return this._maxFillRatio;
+    }
+
+    setMaxFillRatio(ratio) {
+      this._maxFillRatio = sanitizeFillRatio(ratio, this._maxFillRatio);
+      if (this.ring) {
+        this.ring.setMaxFillRatio(this._maxFillRatio);
+      }
+      return this._maxFillRatio;
+    }
+
+    get underrunRecoveryFrames() {
+      return this._underrunRecoveryFrames;
+    }
+
+    setUnderrunRecoveryFrames(frames) {
+      this._underrunRecoveryFrames = sanitizeNonNegInt(frames, this._underrunRecoveryFrames);
+      if (this.ring) {
+        this.ring.setUnderrunRecoveryFrames(this._underrunRecoveryFrames);
+      }
+      return this._underrunRecoveryFrames;
+    }
+
+    _effectiveMaxFillFrames() {
+      if (!this.ring) {
+        return undefined;
+      }
+      if (this._maxFillRatio >= 1.0) {
+        return this.ring.capacityFrames;
+      }
+      const scaled = Math.floor(this.ring.capacityFrames * this._maxFillRatio);
+      return scaled < 1 ? 1 : scaled > this.ring.capacityFrames ? this.ring.capacityFrames : scaled;
+    }
+
+    /**
+     * Converts interleaved PCM into the worker's reusable planar scratch buffers
+     * (`Float32Array[]`) with zero per-packet TypedArray allocation in steady state.
+     *
+     * @param {Float32Array|number[]} samples
+     * @param {number} [channels]
+     * @param {number} [frameCount]
+     * @returns {Float32Array[]}
+     */
+    interleavedToPlanar(samples, channels = this.channels, frameCount) {
+      return this._scratchPool.deinterleave(samples, channels, frameCount);
+    }
+
+    /**
+     * Converts planar channel buffers into the worker's reusable interleaved
+     * scratch buffer (`Float32Array`) with zero per-packet TypedArray allocation
+     * in steady state.
+     *
+     * @param {Float32Array[]} planarChannels
+     * @param {number} [frameCount]
+     * @returns {Float32Array}
+     */
+    planarToInterleaved(planarChannels, frameCount) {
+      return this._scratchPool.interleave(planarChannels, frameCount);
+    }
+
+    /**
+     * Pulls `frameCount` frames from the ring into reusable planar scratch buffers
+     * (`Float32Array[]`) with zero per-call TypedArray allocation in steady state.
+     *
+     * @param {number} frameCount
+     * @param {number} [gainOverride]
+     * @returns {{ framesRead: number, channels: Float32Array[], frameCount: number }}
+     */
+    pullPlanar(frameCount, gainOverride) {
+      const frames = sanitizeNonNegInt(frameCount, 0);
+      const channels = this.channels;
+      const planar = this._scratchPool.acquirePlanar(channels, frames);
+      if (frames <= 0) {
+        this._pullPlanarResult.framesRead = 0;
+        this._pullPlanarResult.channels = planar;
+        this._pullPlanarResult.frameCount = 0;
+        return this._pullPlanarResult;
+      }
+      if (!this.ring) {
+        for (let c = 0; c < channels; c++) {
+          planar[c].fill(0);
+        }
+        this._pullPlanarResult.framesRead = 0;
+        this._pullPlanarResult.channels = planar;
+        this._pullPlanarResult.frameCount = frames;
+        return this._pullPlanarResult;
+      }
+      const scratchInterleaved = this._scratchPool.acquireFloat32('pull', frames * channels);
+      const framesRead = this.ring.pullSamples(scratchInterleaved, gainOverride);
+      this.totalPulledFrames += framesRead;
+      deinterleavePcm(scratchInterleaved, channels, frames, planar);
+      this._pullPlanarResult.framesRead = framesRead;
+      this._pullPlanarResult.channels = planar;
+      this._pullPlanarResult.frameCount = frames;
+      return this._pullPlanarResult;
+    }
+
+    getScratchStats() {
+      return this._scratchPool.getStats();
+    }
+
     recordActiveVoices(count) {
       const sanitized = sanitizeNonNegInt(count, -1);
       if (sanitized > this._activeVoicePeak) {
@@ -1873,6 +2935,9 @@
       this.totalPushedFrames = 0;
       this.totalPulledFrames = 0;
       this.framesDrained = 0;
+      this._packetsReceived = 0;
+      this._framesDecoded = 0;
+      this._droppedPackets = 0;
       this._drainTicks = 0;
       this._overruns = 0;
       this._rejectedPackets = 0;
@@ -1885,6 +2950,7 @@
       this._resamplerState = { phase: 0.0 };
       this._lastResampleSrcRate = null;
       this._lastDrainMs = null;
+      this._scratchPool.resetStats();
     }
 
     reset() {
@@ -1931,13 +2997,18 @@
             channels: this.channels,
             availableFrames: 0,
             freeFrames: 0,
+            bufferFillPct: 0.0,
             volume: this.volume,
             muted: this.muted,
             effectiveGain: this.effectiveGain(),
             declickFrames: this._declickFrames,
+            overflowPolicy: this._overflowPolicy,
+            maxFillRatio: this._maxFillRatio,
+            underrunRecoveryFrames: this._underrunRecoveryFrames,
             underruns: 0,
             underrunCount: 0,
             underrunFrames: 0,
+            underrunRecoveries: 0,
             fadeOutCount: 0,
             fadeInCount: 0,
             peakFillFrames: 0,
@@ -1958,14 +3029,22 @@
         capacityFrames: ringStats.capacityFrames,
         availableFrames: ringStats.availableFrames,
         freeFrames: ringStats.freeFrames,
+        bufferFillPct: ringStats.bufferFillPct,
         volume: this.volume,
         muted: this.muted,
         effectiveGain: this.effectiveGain(),
         declickFrames: this._declickFrames,
+        overflowPolicy: this._overflowPolicy,
+        maxFillRatio: this._maxFillRatio,
+        underrunRecoveryFrames: this._underrunRecoveryFrames,
         framesDrained: this.framesDrained,
+        packetsReceived: this._packetsReceived,
+        framesDecoded: this._framesDecoded,
+        droppedPackets: this._droppedPackets,
         underruns: ringStats.underruns,
         underrunCount: ringStats.underrunCount,
         underrunFrames: ringStats.underrunFrames,
+        underrunRecoveries: ringStats.underrunRecoveries,
         fadeOutCount: ringStats.fadeOutCount,
         fadeInCount: ringStats.fadeInCount,
         peakFillFrames: ringStats.peakFillFrames,
@@ -1985,6 +3064,8 @@
         resampledFrames: this._resampledFrames,
         clippedSamples: this._clippedSamples,
         activeVoicePeak: this._activeVoicePeak,
+        scratchAllocations: this._scratchPool.allocations,
+        scratchReuses: this._scratchPool.reuses,
       };
     }
 
@@ -2058,6 +3139,21 @@
               this._declickFrames
             );
           }
+          if (msg.overflowPolicy !== undefined) {
+            this._overflowPolicy = normalizeOverflowPolicy(
+              msg.overflowPolicy,
+              this._overflowPolicy
+            );
+          }
+          if (msg.maxFillRatio !== undefined) {
+            this._maxFillRatio = sanitizeFillRatio(msg.maxFillRatio, this._maxFillRatio);
+          }
+          if (msg.underrunRecoveryFrames !== undefined) {
+            this._underrunRecoveryFrames = sanitizeNonNegInt(
+              msg.underrunRecoveryFrames,
+              this._underrunRecoveryFrames
+            );
+          }
           if (msg.softClip !== undefined) {
             this._softClip = Boolean(msg.softClip);
           }
@@ -2108,6 +3204,9 @@
               volume: this.volume,
               muted: this.muted,
               declickFrames: this._declickFrames,
+              overflowPolicy: this._overflowPolicy,
+              maxFillRatio: this._maxFillRatio,
+              underrunRecoveryFrames: this._underrunRecoveryFrames,
             });
             if (reconfiguringSameSab) {
               nextRing.reset();
@@ -2121,6 +3220,9 @@
             );
             nextRing = AudioRingBuffer.create(cap, nextChannels, {
               declickFrames: this._declickFrames,
+              overflowPolicy: this._overflowPolicy,
+              maxFillRatio: this._maxFillRatio,
+              underrunRecoveryFrames: this._underrunRecoveryFrames,
             });
             nextRing.setVolume(this.volume);
             nextRing.setMuted(this.muted);
@@ -2156,9 +3258,100 @@
             return;
           }
 
-          const extracted = extractSafePcmSamples(msg.samples, {
-            maxPcmBytes: this._maxPcmBytes,
-          });
+          let extracted;
+          let inferredChannels = this.channels;
+          const isPlanarPayload =
+            msg.planar === true || Array.isArray(msg.channelData);
+          if (isPlanarPayload) {
+            const planarArr = Array.isArray(msg.channelData) ? msg.channelData : msg.samples;
+            if (
+              !Array.isArray(planarArr) ||
+              planarArr.length < 1 ||
+              planarArr.length > MAX_CHANNELS
+            ) {
+              this._rejectedPackets += 1;
+              if (safeId !== undefined) {
+                this._safePostMessage({
+                  id: safeId,
+                  error: 'Planar PCM payload must be an array of 1..8 Float32Array channel buffers',
+                });
+              }
+              return;
+            }
+            let minFrames = Infinity;
+            let copiedFromSab = false;
+            for (let c = 0; c < planarArr.length; c++) {
+              const ch = planarArr[c];
+              if (!(ch instanceof Float32Array)) {
+                this._rejectedPackets += 1;
+                if (safeId !== undefined) {
+                  this._safePostMessage({
+                    id: safeId,
+                    error: `Planar PCM channel ${c} must be a Float32Array`,
+                  });
+                }
+                return;
+              }
+              if (isSharedArrayBuffer(ch.buffer)) {
+                copiedFromSab = true;
+              } else if (isDetachedArrayBuffer(ch.buffer)) {
+                this._rejectedPackets += 1;
+                if (safeId !== undefined) {
+                  this._safePostMessage({
+                    id: safeId,
+                    error: `Planar PCM channel ${c} backing ArrayBuffer is detached`,
+                  });
+                }
+                return;
+              }
+              if (ch.length < minFrames) {
+                minFrames = ch.length;
+              }
+            }
+            const totalBytes =
+              minFrames * planarArr.length * Float32Array.BYTES_PER_ELEMENT;
+            if (totalBytes > this._maxPcmBytes) {
+              this._rejectedPackets += 1;
+              if (safeId !== undefined) {
+                this._safePostMessage({
+                  id: safeId,
+                  error: `PCM payload (${totalBytes} bytes) exceeds max allowed (${this._maxPcmBytes} bytes)`,
+                });
+              }
+              return;
+            }
+            let sanitizedSamples = 0;
+            const interleaved = this._scratchPool.acquireFloat32(
+              'interleave',
+              minFrames * planarArr.length
+            );
+            const chCount = planarArr.length;
+            for (let f = 0; f < minFrames; f++) {
+              const base = f * chCount;
+              for (let c = 0; c < chCount; c++) {
+                const v = planarArr[c][f];
+                if (Number.isFinite(v)) {
+                  interleaved[base + c] = v;
+                } else {
+                  interleaved[base + c] = 0.0;
+                  sanitizedSamples += 1;
+                }
+              }
+            }
+            inferredChannels = chCount;
+            extracted = {
+              ok: true,
+              pcm: interleaved,
+              copiedFromSab,
+              sanitizedSamples,
+            };
+          } else {
+            extracted = extractSafePcmSamples(msg.samples, {
+              maxPcmBytes: this._maxPcmBytes,
+              scratch: this._scratchPool,
+            });
+          }
+
           if (!extracted.ok) {
             this._rejectedPackets += 1;
             if (safeId !== undefined) {
@@ -2170,7 +3363,7 @@
             return;
           }
 
-          const srcChannels = msg.channels !== undefined ? msg.channels : this.channels;
+          const srcChannels = msg.channels !== undefined ? msg.channels : inferredChannels;
           if (!Number.isInteger(srcChannels) || srcChannels < 1 || srcChannels > MAX_CHANNELS) {
             this._rejectedPackets += 1;
             if (safeId !== undefined) {
@@ -2223,6 +3416,8 @@
             return;
           }
 
+          this._packetsReceived += 1;
+
           if (extracted.copiedFromSab) {
             this._sabCopiedPackets += 1;
           }
@@ -2234,12 +3429,11 @@
 
           // Step 1: ITU-R BS.775 multi-channel (5.1 / 7.1 / 4ch) or mono -> stereo downmix/adapt.
           if (srcChannels !== this.channels) {
-            const dmStats = {
-              downmixedFrames: 0,
-              clippedSamples: 0,
-              nanSanitizedSamples: 0,
-              peakLevel: 0.0,
-            };
+            const dmStats = this._dmStats;
+            dmStats.downmixedFrames = 0;
+            dmStats.clippedSamples = 0;
+            dmStats.nanSanitizedSamples = 0;
+            dmStats.peakLevel = 0.0;
             const dmSoftClip = msg.softClip !== undefined ? Boolean(msg.softClip) : true;
             const dmKnee =
               msg.limiterKnee !== undefined
@@ -2253,6 +3447,7 @@
               lfeGain: msg.lfeGain,
               softClip: dmSoftClip,
               limiterKnee: dmKnee,
+              scratch: this._scratchPool,
               stats: dmStats,
             });
             this._downmixedFrames += dmStats.downmixedFrames;
@@ -2265,7 +3460,7 @@
                 : msg.softClipKnee !== undefined
                   ? msg.softClipKnee
                   : this._limiterKnee;
-            const limited = new Float32Array(pcm.length);
+            const limited = this._scratchPool.acquireFloat32('limit', pcm.length);
             let clipped = 0;
             for (let i = 0; i < pcm.length; i++) {
               const v = pcm[i];
@@ -2288,14 +3483,14 @@
               1,
               Math.floor(this._maxPcmBytes / (this.channels * Float32Array.BYTES_PER_ELEMENT))
             );
-            const rsStats = {
-              resampledFrames: 0,
-              nanSanitizedSamples: 0,
-              clippedSamples: 0,
-            };
+            const rsStats = this._rsStats;
+            rsStats.resampledFrames = 0;
+            rsStats.nanSanitizedSamples = 0;
+            rsStats.clippedSamples = 0;
             pcm = resampleLinear(pcm, this.channels, srcSampleRate, this.sampleRate, {
               state: this._resamplerState,
               maxOutputFrames,
+              scratch: this._scratchPool,
               stats: rsStats,
             });
             this._resampledFrames += rsStats.resampledFrames;
@@ -2307,6 +3502,11 @@
           }
 
           const inputFrames = Math.floor(pcm.length / this.channels);
+          this._framesDecoded += inputFrames;
+
+          if (msg.convertToPlanar === true && inputFrames > 0) {
+            this._scratchPool.deinterleave(pcm, this.channels, inputFrames);
+          }
 
           if (
             typeof msg.activeVoices === 'number' &&
@@ -2337,9 +3537,22 @@
             }
           }
 
-          const pushedFrames = inputFrames > 0 ? this.ring.pushSamples(pcm) : 0;
-          const droppedFrames = inputFrames - pushedFrames;
+          const pktPolicy =
+            msg.overflowPolicy !== undefined
+              ? normalizeOverflowPolicy(msg.overflowPolicy, this._overflowPolicy)
+              : this._overflowPolicy;
+          this._pushOpts.frameCount = inputFrames;
+          this._pushOpts.overflowPolicy = pktPolicy;
+          this._pushOpts.maxFillFrames = this._effectiveMaxFillFrames();
+
+          const pushedFrames =
+            inputFrames > 0 ? this.ring.pushSamples(pcm, this._pushOpts) : 0;
+          const droppedFrames = inputFrames > 0 ? this.ring._lastPushDroppedFrames : 0;
+          const overflowed = inputFrames > 0 ? this.ring._lastPushOverflowed : false;
           this.totalPushedFrames += pushedFrames;
+          if (overflowed || droppedFrames > 0) {
+            this._droppedPackets += 1;
+          }
 
           if (safeId !== undefined) {
             this._safePostMessage({
@@ -2347,6 +3560,32 @@
               pushedFrames,
               droppedFrames,
               availableFrames: this.ring.availableFrames(),
+            });
+          }
+          return;
+        }
+
+        if (msg.pullPlanar) {
+          if (!this.ring) {
+            this._rejectedPackets += 1;
+            if (safeId !== undefined) {
+              this._safePostMessage({
+                id: safeId,
+                error: 'AudioMixerWorker not initialized',
+              });
+            }
+            return;
+          }
+          const reqFrames = sanitizeNonNegInt(msg.frameCount, 128);
+          const pulled = this.pullPlanar(reqFrames, msg.gainOverride);
+          if (safeId !== undefined) {
+            this._safePostMessage({
+              id: safeId,
+              framesRead: pulled.framesRead,
+              frameCount: pulled.frameCount,
+              channels: this.channels,
+              availableFrames: this.ring.availableFrames(),
+              bufferFillPct: this.ring.bufferFillPct,
             });
           }
           return;
@@ -2477,7 +3716,9 @@
   const exportsObj = {
     AudioRingBuffer,
     AudioMixerWorker,
+    PcmScratchPool,
     OUTPUT_STATES,
+    OVERFLOW_POLICIES,
     DEFAULT_SAMPLE_RATE,
     DEFAULT_CHANNELS,
     DEFAULT_CAPACITY_FRAMES,
@@ -2488,6 +3729,9 @@
     DEFAULT_DECLICK_FRAMES,
     MAX_DECLICK_FRAMES,
     DEFAULT_SOFT_CLIP_KNEE,
+    DEFAULT_OVERFLOW_POLICY,
+    DEFAULT_MAX_FILL_RATIO,
+    DEFAULT_UNDERRUN_RECOVERY_FRAMES,
     ITU_BS775_CENTER_GAIN,
     ITU_BS775_SURROUND_GAIN,
     ITU_BS775_LFE_GAIN,
@@ -2495,6 +3739,8 @@
     DEFAULT_MAX_RESAMPLE_FRAMES,
     SUPPORTED_DOWNMIX_CHANNELS,
     RING_HEADER_BYTES,
+    deinterleavePcm,
+    interleavePcm,
     extractSafePcmSamples,
     clonePcmForTransfer,
     sanitizeTransferList,

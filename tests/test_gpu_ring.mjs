@@ -1083,3 +1083,239 @@ test('W187 10,000-packet burst streams losslessly across bounded wrapping ring w
   assert.ok(prodStats.backpressureWaits > 0, 'bounded 4KB burst must exercise backpressureWaits');
   assert.equal(prodStats.peakOccupancyBytes, consStats.peakOccupancyBytes);
 });
+
+test('W198 drainBatch(maxPackets, callback) performs zero-extra-atomics batching across wrap-around with partial caps and early stop', () => {
+  const producer = GpuRingBuffer.create(128);
+  const consumer = GpuRingBuffer.attach(producer.sab);
+
+  // Argument validation for (maxPackets, callback) order.
+  assert.throws(() => consumer.drainBatch(4), TypeError);
+  assert.throws(() => consumer.drainBatch(0, () => {}), RangeError);
+  assert.throws(() => consumer.drainBatch(-3, () => {}), RangeError);
+  assert.throws(() => consumer.drainBatch(2.5, () => {}), RangeError);
+  assert.throws(() => consumer.drainBatch(NaN, () => {}), RangeError);
+  assert.throws(() => consumer.drainBatch(Infinity, () => {}), RangeError);
+  assert.throws(() => consumer.drainBatch('4', () => {}), RangeError);
+
+  // Advance ring offset to 108 so the batch wraps across the 128-byte boundary
+  // (packet 1 header splits [124..128) + [0..4), and later packets continue contiguously).
+  assert.equal(producer.writeBytes(new Uint8Array(108)), true);
+  assert.equal(consumer.drainTo(() => {}), 108);
+  assert.equal(consumer.readPos & 127, 108);
+
+  const expected = [];
+  for (let i = 0; i < 7; i++) {
+    const payload = Uint8Array.from({ length: 8 }, (_, b) => ((i * 29 + b * 7 + 3) & 0xff));
+    const pkt = encodeRawPacket(20 + i, (i + 1) * 0x11, payload); // 16B each; 7 * 16 = 112B <= 128B
+    assert.equal(producer.writeBytes(pkt), true);
+    expected.push({ opcode: 20 + i, flags: (i + 1) * 0x11, payload, raw: pkt });
+  }
+
+  // Instrument Atomics.load / Atomics.store / Atomics.notify to assert zero extra atomics.
+  const origLoad = Atomics.load;
+  const origStore = Atomics.store;
+  const origNotify = Atomics.notify;
+  let writePosLoads = 0;
+  let readPosLoads = 0;
+  let readPosStores = 0;
+  let readPosNotifies = 0;
+
+  Atomics.load = (ta, idx) => {
+    if (idx === HEADER_INDEX.WRITE_POS) writePosLoads += 1;
+    if (idx === HEADER_INDEX.READ_POS) readPosLoads += 1;
+    return origLoad(ta, idx);
+  };
+  Atomics.store = (ta, idx, val) => {
+    if (idx === HEADER_INDEX.READ_POS) readPosStores += 1;
+    return origStore(ta, idx, val);
+  };
+  Atomics.notify = (ta, idx, count) => {
+    if (idx === HEADER_INDEX.READ_POS) readPosNotifies += 1;
+    return origNotify(ta, idx, count);
+  };
+
+  const collected = [];
+  try {
+    // Partial cap: drain first 3 packets (spans wrap boundary) with (maxPackets, callback).
+    const r1 = consumer.drainBatch(3, (pkt, idx) => {
+      assert.equal(idx, collected.length);
+      // Zero extra atomics during packet iteration!
+      assert.equal(writePosLoads, 1);
+      assert.equal(readPosLoads, 1);
+      assert.equal(readPosStores, 0);
+      collected.push({
+        opcode: pkt.opcode,
+        flags: pkt.flags,
+        payload: pkt.payload.slice(),
+        bytes: pkt.bytes.slice(),
+        wrapped: pkt.wrapped,
+      });
+    });
+
+    assert.equal(r1.packets, 3);
+    assert.equal(r1.bytes, 48);
+    assert.equal(r1.remainingBytes, 64);
+    assert.equal(r1.wrapped, true);
+    assert.equal(writePosLoads, 1, 'must read WRITE_POS exactly once per drainBatch');
+    assert.equal(readPosLoads, 1, 'must read READ_POS exactly once per drainBatch');
+    assert.equal(readPosStores, 1, 'must write READ_POS exactly once at batch end');
+    assert.equal(readPosNotifies, 1);
+
+    // Cooperative early stop: ask for up to 4 packets, return false on index 1 -> commits 2 packets.
+    const r2 = consumer.drainBatch(4, (pkt, idx) => {
+      collected.push({
+        opcode: pkt.opcode,
+        flags: pkt.flags,
+        payload: pkt.payload.slice(),
+        bytes: pkt.bytes.slice(),
+        wrapped: pkt.wrapped,
+      });
+      if (idx === 1) {
+        return false;
+      }
+    });
+
+    assert.equal(r2.packets, 2);
+    assert.equal(r2.bytes, 32);
+    assert.equal(r2.remainingBytes, 32);
+    assert.equal(writePosLoads, 2);
+    assert.equal(readPosLoads, 2);
+    assert.equal(readPosStores, 2);
+    assert.equal(readPosNotifies, 2);
+
+    // Default maxPackets via (undefined, callback) drains remaining 2 packets.
+    const r3 = consumer.drainBatch(undefined, (pkt) => {
+      collected.push({
+        opcode: pkt.opcode,
+        flags: pkt.flags,
+        payload: pkt.payload.slice(),
+        bytes: pkt.bytes.slice(),
+        wrapped: pkt.wrapped,
+      });
+    });
+
+    assert.equal(r3.packets, 2);
+    assert.equal(r3.bytes, 32);
+    assert.equal(r3.remainingBytes, 0);
+    assert.equal(writePosLoads, 3);
+    assert.equal(readPosLoads, 3);
+    assert.equal(readPosStores, 3);
+    assert.equal(readPosNotifies, 3);
+  } finally {
+    Atomics.load = origLoad;
+    Atomics.store = origStore;
+    Atomics.notify = origNotify;
+  }
+
+  // Exact byte-for-byte preservation across all 7 packets.
+  assert.equal(collected.length, 7);
+  for (let i = 0; i < 7; i++) {
+    assert.equal(collected[i].opcode, expected[i].opcode);
+    assert.equal(collected[i].flags, expected[i].flags);
+    assert.deepEqual(collected[i].payload, expected[i].payload);
+    assert.deepEqual(collected[i].bytes, expected[i].raw);
+  }
+  assert.equal(collected[0].wrapped, false);
+  assert.equal(collected[1].wrapped, true);
+  assert.equal(collected[2].wrapped, false);
+  assert.equal(consumer.availableBytes(), 0);
+});
+
+test('W198 high-watermark utilization, peakUtilizationPct, resetTelemetry(), and untouched 64B SAB header', () => {
+  const ring = GpuRingBuffer.create(64);
+  const rawHeader = new DataView(ring.sab);
+
+  // Initial telemetry state.
+  assert.equal(ring.highWatermarkBytes, 0);
+  assert.equal(ring.peakUtilizationPct, 0);
+  assert.equal(ring.batchesDrained, 0);
+  assert.equal(ring.packetsDrained, 0);
+  assert.equal(ring.backpressureWaits, 0);
+  const initStats = ring.getStats();
+  assert.equal(initStats.highWatermarkBytes, 0);
+  assert.equal(initStats.peakUtilizationPct, 0);
+  assert.equal(initStats.utilizationPct, 0);
+
+  // Write 16B (25%), then 32B more -> 48B (75%).
+  const pkt16 = encodeRawPacket(OPCODES.DRAW, 1, new Uint8Array(8));
+  assert.equal(ring.writeBytes(pkt16), true);
+  assert.equal(ring.highWatermarkBytes, 16);
+  assert.equal(ring.peakUtilizationPct, 25);
+  assert.equal(ring.getStats().utilizationPct, 25);
+
+  assert.equal(ring.writeBytes(pkt16), true);
+  assert.equal(ring.writeBytes(pkt16), true);
+  assert.equal(ring.highWatermarkBytes, 48);
+  assert.equal(ring.peakUtilizationPct, 75);
+  assert.equal(ring.getStats().utilizationPct, 75);
+
+  // Backpressure when 32B doesn't fit in 16B free.
+  assert.equal(ring.writeBytes(new Uint8Array(32)), false);
+  assert.equal(ring.backpressureWaits, 1);
+
+  // Fill remaining 16B -> 64B (100% peak).
+  assert.equal(ring.writeBytes(pkt16), true);
+  assert.equal(ring.highWatermarkBytes, 64);
+  assert.equal(ring.peakUtilizationPct, 100);
+  assert.equal(ring.getStats().utilizationPct, 100);
+
+  // Drain 2 of 4 packets using drainBatch(2, cb): current utilization drops to 50%,
+  // while highWatermarkBytes & peakUtilizationPct remain at 64B / 100%.
+  const b1 = ring.drainBatch(2, () => {});
+  assert.equal(b1.packets, 2);
+  assert.equal(ring.highWatermarkBytes, 64);
+  assert.equal(ring.peakUtilizationPct, 100);
+  assert.equal(ring.batchesDrained, 1);
+  assert.equal(ring.packetsDrained, 2);
+  const midStats = ring.getStats();
+  assert.equal(midStats.highWatermarkBytes, 64);
+  assert.equal(midStats.peakOccupancyBytes, 64);
+  assert.equal(midStats.peakUtilizationPct, 100);
+  assert.equal(midStats.utilizationPct, 50);
+  assert.equal(midStats.batchesDrained, 1);
+  assert.equal(midStats.packetsDrained, 2);
+  assert.equal(midStats.backpressureWaits, 1);
+
+  // resetTelemetry() clears local telemetry counters without discarding queued SAB packets!
+  const writePosBefore = ring.writePos;
+  const readPosBefore = ring.readPos;
+  ring.resetTelemetry();
+  assert.equal(ring.highWatermarkBytes, 0);
+  assert.equal(ring.peakUtilizationPct, 0);
+  assert.equal(ring.batchesDrained, 0);
+  assert.equal(ring.packetsDrained, 0);
+  assert.equal(ring.backpressureWaits, 0);
+  assert.equal(ring.writePos, writePosBefore);
+  assert.equal(ring.readPos, readPosBefore);
+
+  // Draining remaining 2 queued packets still succeeds and records fresh watermark = 32B (50%).
+  const b2 = ring.drainBatch(16, () => {});
+  assert.equal(b2.packets, 2);
+  assert.equal(ring.highWatermarkBytes, 32);
+  assert.equal(ring.peakUtilizationPct, 50);
+  assert.equal(ring.batchesDrained, 1);
+  assert.equal(ring.packetsDrained, 2);
+  assert.equal(ring.getStats().utilizationPct, 0);
+
+  // Self-healing if internal _peakOccupancyBytes is corrupted to NaN or oversized.
+  ring._peakOccupancyBytes = NaN;
+  assert.equal(ring.highWatermarkBytes, 0);
+  assert.equal(ring.peakUtilizationPct, 0);
+  assert.equal(ring.writeBytes(pkt16), true);
+  assert.equal(ring.highWatermarkBytes, 16);
+  assert.equal(ring.peakUtilizationPct, 25);
+
+  ring._peakOccupancyBytes = 99999;
+  assert.equal(ring.highWatermarkBytes, 64);
+  assert.equal(ring.peakUtilizationPct, 100);
+  assert.equal(ring.getStats().peakUtilizationPct, 100);
+
+  // Verify the 64-byte SAB header ABI layout is untouched (reserved words 8..15 stay 0).
+  assert.equal(rawHeader.getUint32(0, true), GPU_RING_MAGIC);
+  assert.equal(rawHeader.getUint32(4, true), GPU_RING_VERSION);
+  assert.equal(rawHeader.getUint32(8, true), 64);
+  assert.equal(rawHeader.getUint32(12, true), 0);
+  for (let off = 32; off < 64; off += 4) {
+    assert.equal(rawHeader.getUint32(off, true), 0, `SAB header reserved word at byte ${off} must remain 0`);
+  }
+});

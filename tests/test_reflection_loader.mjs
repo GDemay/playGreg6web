@@ -8,7 +8,10 @@ const pipelineCacheMod = require('../web/workers/pipeline_cache.js');
 
 const {
   LAYOUT_MANIFEST_SCHEMA_VERSION,
+  STAGE_REFLECTION_SCHEMA,
+  STAGE_REFLECTION_VERSION,
   MAX_HEAP_INDEX_SHIFT,
+  INLINE_SAMPLER_SDWORD_COUNT,
   GRAPHICS_USER_DATA_BASE,
   COMPUTE_USER_DATA_BASE,
   TABLE_SLOT_BYTES,
@@ -28,6 +31,7 @@ const {
   computePipelineLayoutHash,
   parseBindingSource,
   parseReflectionManifest,
+  parseStageReflectionSidecar,
   buildBindGroupLayoutDescriptors,
   buildVertexBufferLayouts,
   diagnoseStageBindings,
@@ -1198,11 +1202,15 @@ test('parseReflectionManifest and ReflectionRegistry preserve S34 heap sources a
   assert.equal(parsed.resourceHeapBindings, 2);
   assert.deepEqual(parsed.summary, {
     shaderCount: 2,
+    stageCount: 2,
     bindGroupLayoutCount: 2,
     pipelineLayoutCount: 2,
     pipelineCount: 0,
     samplerHeapBindings: 1,
     resourceHeapBindings: 2,
+    inlineSamplerStages: 0,
+    inlineSamplerBindings: 0,
+    vertexIndexStages: 0,
   });
 
   const fs = parsed.shadersByHash.get(0xa001n);
@@ -2190,4 +2198,661 @@ test('ReflectionRegistry.diagnoseStageBindings and synthesizeMissingStaticSample
   assert.equal(fallback.comparisonCount, 1);
   assert.equal(fallback.slots[0].samplerType, 'comparison');
   assert.equal(fallback.slots[0].fallbackDescriptor.compare, 'less-equal');
+});
+
+// ---------------------------------------------------------------------------
+// W215: #950 / S43 inline_sampler sdwords validation, stage-reflection sidecar
+// parsing, O(1) normalized-hash lookup, and reflection summary telemetry
+// ---------------------------------------------------------------------------
+
+test('W215 exports inline_sampler and stage-reflection constants and helpers cleanly', () => {
+  assert.equal(STAGE_REFLECTION_SCHEMA, 'playgta6-stage-reflection');
+  assert.equal(STAGE_REFLECTION_VERSION, 1);
+  assert.equal(INLINE_SAMPLER_SDWORD_COUNT, 4);
+  assert.equal(typeof parseStageReflectionSidecar, 'function');
+});
+
+test('W215 parseBindingSource validates, normalizes, and defensively clones #950 inline_sampler sdwords', () => {
+  const inputWords = [146, 15728640, 139460608, 0];
+  const parsedLinear = parseBindingSource({ inline_sampler: { sdwords: inputWords } });
+  assert.deepEqual(parsedLinear, {
+    kind: 'inline_sampler',
+    sdwords: [146, 15728640, 139460608, 0],
+  });
+  // Mutating caller array must not affect parsed result
+  inputWords[0] = 999;
+  assert.equal(parsedLinear.sdwords[0], 146);
+
+  // Boundary u32 values: 0 and 0xFFFFFFFF (4294967295)
+  assert.deepEqual(
+    parseBindingSource({ inline_sampler: { sdwords: [0, 0, 0, 0] } }),
+    { kind: 'inline_sampler', sdwords: [0, 0, 0, 0] }
+  );
+  assert.deepEqual(
+    parseBindingSource({ inline_sampler: { sdwords: [0xffffffff, 12288, 67108864, 0xffffffff] } }),
+    { kind: 'inline_sampler', sdwords: [4294967295, 12288, 67108864, 4294967295] }
+  );
+});
+
+test('W215 rejects malformed inline_sampler sdwords in parseBindingSource, parseReflectionManifest, and parseStageReflectionSidecar', () => {
+  const invalidSources = [
+    // Non-object inline_sampler payload
+    [{ inline_sampler: null }, /inline_sampler must be an object/],
+    [{ inline_sampler: [1, 2, 3, 4] }, /inline_sampler must be an object/],
+    [{ inline_sampler: 'sdwords' }, /inline_sampler must be an object/],
+    [{ inline_sampler: 42 }, /inline_sampler must be an object/],
+    // Missing or wrong-length sdwords array
+    [{ inline_sampler: {} }, /inline_sampler\.sdwords must be an array of 4/],
+    [{ inline_sampler: { sdwords: null } }, /inline_sampler\.sdwords must be an array of 4/],
+    [{ inline_sampler: { sdwords: '1234' } }, /inline_sampler\.sdwords must be an array of 4/],
+    [{ inline_sampler: { sdwords: [] } }, /inline_sampler\.sdwords must be an array of 4/],
+    [{ inline_sampler: { sdwords: [1, 2, 3] } }, /inline_sampler\.sdwords must be an array of 4/],
+    [{ inline_sampler: { sdwords: [1, 2, 3, 4, 5] } }, /inline_sampler\.sdwords must be an array of 4/],
+    // Out-of-range or non-u32 element values
+    [{ inline_sampler: { sdwords: [1, 2, 3, -1] } }, /inline_sampler\.sdwords\[3\]/],
+    [{ inline_sampler: { sdwords: [-1, 0, 0, 0] } }, /inline_sampler\.sdwords\[0\]/],
+    [{ inline_sampler: { sdwords: [1, 2, 3, 0x100000000] } }, /inline_sampler\.sdwords\[3\]/],
+    [{ inline_sampler: { sdwords: [1, 2, 1.5, 4] } }, /inline_sampler\.sdwords\[2\]/],
+    [{ inline_sampler: { sdwords: [1, NaN, 3, 4] } }, /inline_sampler\.sdwords\[1\]/],
+    [{ inline_sampler: { sdwords: [1, 2, Infinity, 4] } }, /inline_sampler\.sdwords\[2\]/],
+    [{ inline_sampler: { sdwords: [1, 2, 3, '4'] } }, /inline_sampler\.sdwords\[3\]/],
+    [{ inline_sampler: { sdwords: [1, 2, 3, true] } }, /inline_sampler\.sdwords\[3\]/],
+    [{ inline_sampler: { sdwords: [false, 2, 3, 4] } }, /inline_sampler\.sdwords\[0\]/],
+    [{ inline_sampler: { sdwords: [1, null, 3, 4] } }, /inline_sampler\.sdwords\[1\]/],
+    [{ inline_sampler: { sdwords: [1, 2, undefined, 4] } }, /inline_sampler\.sdwords\[2\]/],
+    // Ambiguous combined source keys
+    [
+      { inline_sampler: { sdwords: [1, 2, 3, 4] }, static_sampler: 0 },
+      /inline_sampler source cannot be combined/,
+    ],
+    [
+      { inline_sampler: { sdwords: [1, 2, 3, 4] }, user_sgpr: 8, table_byte_offset: 0 },
+      /inline_sampler source cannot be combined/,
+    ],
+    [
+      {
+        inline_sampler: { sdwords: [1, 2, 3, 4] },
+        sampler_heap: { base_user_sgpr: 11, stride: 16, index: { user_sgpr: 9, shift: 4 } },
+      },
+      /cannot be combined with other binding source fields/,
+    ],
+    [
+      {
+        inline_sampler: { sdwords: [1, 2, 3, 4] },
+        resource_heap: { base_user_sgpr: 4, stride: 32, index: { user_sgpr: 5, shift: 5 } },
+      },
+      /cannot be combined with other binding source fields/,
+    ],
+  ];
+
+  for (const [badSource, pattern] of invalidSources) {
+    assert.throws(
+      () => parseBindingSource(badSource, 'test.source'),
+      (err) => err instanceof ManifestValidationError && pattern.test(err.message),
+      `Expected parseBindingSource(${JSON.stringify(badSource)}) to fail with ${pattern}`
+    );
+
+    assert.throws(
+      () =>
+        parseReflectionManifest({
+          schema_version: 1,
+          bind_group_layouts: {},
+          pipeline_layouts: {},
+          shaders: {
+            '0x000000000000d001': {
+              stage: 'fragment',
+              entry_point: 'fs_bad_inline',
+              bindings: [
+                { group: 0, binding: 0, name: 'smp', resource: 'sampler', source: badSource },
+              ],
+            },
+          },
+        }),
+      (err) => err instanceof ManifestValidationError && pattern.test(err.message),
+      `Expected parseReflectionManifest(${JSON.stringify(badSource)}) to fail with ${pattern}`
+    );
+
+    assert.throws(
+      () =>
+        parseStageReflectionSidecar({
+          schema: 'playgta6-stage-reflection',
+          version: 1,
+          stages: {
+            '0x000000000000d001': {
+              stage: 'fragment',
+              bindings: [{ group: 0, binding: 0, kind: 'sampler', source: badSource }],
+            },
+          },
+        }),
+      (err) => err instanceof ManifestValidationError && pattern.test(err.message),
+      `Expected parseStageReflectionSidecar(${JSON.stringify(badSource)}) to fail with ${pattern}`
+    );
+  }
+});
+
+test('W215 parseStageReflectionSidecar parses splash.wgsl.pack.reflect.json format with inline_sampler, O(1) normalized lookups, and telemetry', () => {
+  const sidecarFixture = {
+    schema: 'playgta6-stage-reflection',
+    version: 1,
+    stages: {
+      // Fragment stage with 2 inline_sampler bindings + all other binding source kinds
+      '0x0000000011223344': {
+        stage: 'fragment',
+        bindings: [
+          {
+            group: 0,
+            binding: 0,
+            kind: 'uniform',
+            min_binding_size_bytes: 64,
+            source: { user_sgpr: 8, table_byte_offset: 0 },
+          },
+          {
+            group: 0,
+            binding: 1,
+            kind: 'texture',
+            view_dimension: '2d',
+            sample_type: 'float',
+            source: { user_sgpr: 8, table_byte_offset: 32 },
+          },
+          {
+            group: 0,
+            binding: 2,
+            kind: 'sampler',
+            source: { inline_sampler: { sdwords: [146, 15728640, 139460608, 0] } },
+          },
+          {
+            group: 0,
+            binding: 3,
+            kind: 'comparison_sampler',
+            source: { inline_sampler: { sdwords: [12288, 15728640, 67108864, 0] } },
+          },
+          {
+            group: 0,
+            binding: 4,
+            kind: 'uniform',
+            min_binding_size_bytes: 16,
+            source: { user_sgpr: 9, root_constants: true },
+          },
+          {
+            group: 0,
+            binding: 5,
+            kind: 'uniform',
+            min_binding_size_bytes: 32,
+            source: { user_sgpr: 11, root_descriptor: true },
+          },
+          {
+            group: 0,
+            binding: 6,
+            kind: 'sampler',
+            source: { static_sampler: 0 },
+          },
+          {
+            group: 1,
+            binding: 0,
+            kind: 'sampler',
+            source: { sampler_heap: { base_user_sgpr: 2, stride: 16, index: { user_sgpr: 9, shift: 4 } } },
+          },
+          {
+            group: 1,
+            binding: 1,
+            kind: 'read_only_storage',
+            min_binding_size_bytes: 16,
+            source: { resource_heap: { base_user_sgpr: 0, stride: 32, index: { user_sgpr: 10, shift: 5 } } },
+          },
+        ],
+      },
+      // Vertex stage keyed by bare 16-hex-char key, buffer-pulling (no vertex_inputs -> vertex_index)
+      abcdef0123456789: {
+        stage: 'vertex',
+        bindings: [
+          {
+            group: 0,
+            binding: 0,
+            kind: 'read_only_storage',
+            min_binding_size_bytes: 16,
+            source: { user_sgpr: 8, table_byte_offset: 0 },
+          },
+        ],
+      },
+      // Vertex stage with explicit vertex_input_mode: "vertex_index"
+      '0x00000000000055aa': {
+        stage: 'vertex',
+        vertex_input_mode: 'vertex_index',
+        bindings: [],
+      },
+      // Vertex stage fetching IA attributes (NOT a vertex_index stage)
+      FEDCBA9876543210: {
+        stage: 'vertex',
+        bindings: [],
+        vertex_inputs: [
+          {
+            location: 0,
+            vb_slot: 0,
+            byte_offset: 0,
+            components: 3,
+            component_type: 'f32',
+            fetch_format: 'float32x3',
+          },
+        ],
+      },
+      // Compute stage with 1 inline_sampler binding
+      '0x0000000099887766': {
+        stage: 'compute',
+        bindings: [
+          {
+            group: 0,
+            binding: 0,
+            kind: 'sampler',
+            source: { inline_sampler: { sdwords: [0, 1, 2, 0xffffffff] } },
+          },
+        ],
+      },
+    },
+  };
+
+  const parsed = parseStageReflectionSidecar(JSON.stringify(sidecarFixture));
+  assert.equal(parsed.schema, 'playgta6-stage-reflection');
+  assert.equal(parsed.version, 1);
+  assert.equal(parsed.stageCount, 5);
+  assert.equal(parsed.inlineSamplerStages, 2);
+  assert.equal(parsed.inlineSamplerBindings, 3);
+  assert.equal(parsed.vertexIndexStages, 2);
+  assert.equal(parsed.samplerHeapBindings, 1);
+  assert.equal(parsed.resourceHeapBindings, 1);
+
+  assert.deepEqual(parsed.summary, {
+    stageCount: 5,
+    inlineSamplerStages: 2,
+    inlineSamplerBindings: 3,
+    vertexIndexStages: 2,
+    samplerHeapBindings: 1,
+    resourceHeapBindings: 1,
+  });
+
+  // Initial lookup stats
+  assert.deepEqual(parsed.getStats(), {
+    stageCount: 5,
+    inlineSamplerStages: 2,
+    inlineSamplerBindings: 3,
+    vertexIndexStages: 2,
+    samplerHeapBindings: 1,
+    resourceHeapBindings: 1,
+    lookupHits: 0,
+    lookupMisses: 0,
+  });
+
+  // O(1) normalized-hash lookup across '0x...', uppercase '0X...', bare 16-hex, short hex, BigInt, safe int
+  const fsCanonical = parsed.getStage('0x0000000011223344');
+  assert.ok(fsCanonical);
+  assert.equal(fsCanonical.stage, 'fragment');
+  assert.equal(fsCanonical.inlineSamplerBindings, 2);
+  assert.equal(fsCanonical.hasInlineSampler, true);
+  assert.equal(fsCanonical.isVertexIndexStage, false);
+  assert.deepEqual(fsCanonical.bindings[2].source, {
+    kind: 'inline_sampler',
+    sdwords: [146, 15728640, 139460608, 0],
+  });
+  assert.deepEqual(fsCanonical.bindings[3].source, {
+    kind: 'inline_sampler',
+    sdwords: [12288, 15728640, 67108864, 0],
+  });
+
+  assert.equal(parsed.getStage('0000000011223344'), fsCanonical);
+  assert.equal(parsed.getStage('0X0000000011223344'), fsCanonical);
+  assert.equal(parsed.getStage('0x11223344'), fsCanonical);
+  assert.equal(parsed.getStage('11223344'), fsCanonical);
+  assert.equal(parsed.getStage('  0x0000000011223344  '), fsCanonical);
+  assert.equal(parsed.getStage(0x11223344n), fsCanonical);
+  assert.equal(parsed.getStage(0x11223344), fsCanonical);
+
+  // Bare 16-hex-char stage lookup via both bare and 0x forms
+  const vsPulling = parsed.getStage('abcdef0123456789');
+  assert.ok(vsPulling);
+  assert.equal(vsPulling.stage, 'vertex');
+  assert.equal(vsPulling.vertexInputMode, 'vertex_index');
+  assert.equal(vsPulling.isVertexIndexStage, true);
+  assert.equal(parsed.getStage('0xabcdef0123456789'), vsPulling);
+  assert.equal(parsed.getStage('ABCDEF0123456789'), vsPulling);
+  assert.equal(parsed.getStage(0xabcdef0123456789n), vsPulling);
+
+  // Uppercase bare 16-hex-char attribute-fetching VS
+  const vsAttr = parsed.getStage('0xfedcba9876543210');
+  assert.ok(vsAttr);
+  assert.equal(vsAttr.vertexInputMode, 'attributes');
+  assert.equal(vsAttr.isVertexIndexStage, false);
+  assert.equal(vsAttr.vertexInputs.length, 1);
+  assert.equal(vsAttr.vertexInputs[0].format, 'float32x3');
+
+  // Misses across unknown and malformed keys (must never throw)
+  assert.equal(parsed.getStage('0x00000000deadbeef'), undefined);
+  assert.equal(parsed.getStage('deadbeefdeadbeef'), undefined);
+  assert.equal(parsed.getStage('0x1234567890abcdef0'), undefined); // 17 hex chars
+  assert.equal(parsed.getStage('not_hex_at_all!!'), undefined);
+  assert.equal(parsed.getStage(''), undefined);
+  assert.equal(parsed.getStage(-1), undefined);
+  assert.equal(parsed.getStage(-1n), undefined);
+  assert.equal(parsed.getStage(null), undefined);
+
+  const statsAfter = parsed.getStats();
+  assert.equal(statsAfter.lookupHits, 13);
+  assert.equal(statsAfter.lookupMisses, 8);
+
+  // hasStage does not perturb hit/miss counters
+  assert.equal(parsed.hasStage('abcdef0123456789'), true);
+  assert.equal(parsed.hasStage('0x0000000000000001'), false);
+  assert.equal(parsed.getStats().lookupHits, 13);
+  assert.equal(parsed.getStats().lookupMisses, 8);
+
+  // Synthesized BindGroupLayout descriptors work directly on sidecar stages
+  const bgls = buildBindGroupLayoutDescriptors([fsCanonical]);
+  assert.equal(bgls.length, 2);
+  assert.equal(bgls[0].entries.length, 7);
+  assert.deepEqual(bgls[0].entries[2].sampler, { type: 'filtering' });
+  assert.deepEqual(bgls[0].entries[3].sampler, { type: 'comparison' });
+  assert.equal(bgls[1].entries.length, 2);
+});
+
+test('W215 ReflectionRegistry supports stage-reflection sidecar loading, auto-dispatch, overwrite accounting, and telemetry', async () => {
+  const sidecarA = {
+    schema: 'playgta6-stage-reflection',
+    version: 1,
+    stages: {
+      '0x000000000000e001': {
+        stage: 'fragment',
+        bindings: [
+          {
+            group: 0,
+            binding: 0,
+            kind: 'sampler',
+            source: { inline_sampler: { sdwords: [146, 15728640, 139460608, 0] } },
+          },
+          {
+            group: 0,
+            binding: 1,
+            kind: 'comparison_sampler',
+            source: { inline_sampler: { sdwords: [12288, 15728640, 67108864, 0] } },
+          },
+        ],
+      },
+      '000000000000e002': {
+        stage: 'vertex',
+        bindings: [],
+      },
+    },
+  };
+
+  const registry = new ReflectionRegistry();
+
+  // Auto-dispatch via loadManifest(JSON string)
+  const loaded = registry.loadManifest(JSON.stringify(sidecarA));
+  assert.equal(loaded.schema, 'playgta6-stage-reflection');
+
+  let stats = registry.getStats();
+  assert.equal(stats.manifestsLoaded, 1);
+  assert.equal(stats.sidecarsLoaded, 1);
+  assert.equal(stats.stageCount, 2);
+  assert.equal(stats.shaderCount, 2);
+  assert.equal(stats.inlineSamplerStages, 1);
+  assert.equal(stats.inlineSamplerBindings, 2);
+  assert.equal(stats.vertexIndexStages, 1);
+  assert.equal(stats.lookupHits, 0);
+  assert.equal(stats.lookupMisses, 0);
+
+  // Lookup via both getStageReflection and getShaderReflection with 0x & bare 16-hex keys
+  const fs = registry.getStageReflection('000000000000e001');
+  assert.ok(fs);
+  assert.equal(registry.getShaderReflection('0x000000000000E001'), fs);
+  const vs = registry.getStageReflection('0x000000000000e002');
+  assert.ok(vs);
+  assert.equal(registry.getStageReflection('000000000000e002'), vs);
+  assert.equal(registry.getStageReflection('000000000000ffff'), undefined);
+
+  stats = registry.getStats();
+  assert.equal(stats.lookupHits, 4);
+  assert.equal(stats.lookupMisses, 1);
+
+  // Overwrite e001 (remove inline samplers) and e002 (switch to attributes) via loadStageReflectionUrl
+  const sidecarB = {
+    schema: 'playgta6-stage-reflection',
+    version: 1,
+    stages: {
+      '0x000000000000e001': {
+        stage: 'fragment',
+        bindings: [{ group: 0, binding: 0, kind: 'sampler', source: { static_sampler: 0 } }],
+      },
+      '0x000000000000e002': {
+        stage: 'vertex',
+        bindings: [],
+        vertex_inputs: [{ location: 0, vb_slot: 0, byte_offset: 0, fetch_format: 'float32x3' }],
+      },
+      '0x000000000000e003': {
+        stage: 'fragment',
+        bindings: [
+          {
+            group: 0,
+            binding: 0,
+            kind: 'sampler',
+            source: { inline_sampler: { sdwords: [1, 2, 3, 4] } },
+          },
+        ],
+      },
+    },
+  };
+
+  await registry.loadStageReflectionUrl('https://local.test/splash.wgsl.pack.reflect.json', async () => ({
+    ok: true,
+    status: 200,
+    statusText: 'OK',
+    text: async () => JSON.stringify(sidecarB),
+  }));
+
+  stats = registry.getStats();
+  assert.equal(stats.sidecarsLoaded, 2);
+  assert.equal(stats.stageCount, 3);
+  assert.equal(stats.inlineSamplerStages, 1);
+  assert.equal(stats.inlineSamplerBindings, 1);
+  assert.equal(stats.vertexIndexStages, 0);
+
+  // clear() resets live stage/inline/vertexIndex counters while preserving lookupHits/Misses
+  registry.clear();
+  stats = registry.getStats();
+  assert.equal(stats.stageCount, 0);
+  assert.equal(stats.inlineSamplerStages, 0);
+  assert.equal(stats.inlineSamplerBindings, 0);
+  assert.equal(stats.vertexIndexStages, 0);
+  assert.equal(stats.lookupHits, 4);
+  assert.equal(stats.lookupMisses, 1);
+
+  // clear({ resetStats: true }) resets cumulative counters too
+  registry.clear({ resetStats: true });
+  stats = registry.getStats();
+  assert.equal(stats.manifestsLoaded, 0);
+  assert.equal(stats.sidecarsLoaded, 0);
+  assert.equal(stats.lookupHits, 0);
+  assert.equal(stats.lookupMisses, 0);
+});
+
+test('W215 diagnoseStageBindings and synthesizeMissingStaticSamplers handle inline_sampler bindings cleanly', () => {
+  // Root signature with zero parameters and zero static samplers:
+  // inline_sampler bindings are self-contained and must resolve with ok=true!
+  const emptyRs = { parameters: [], static_samplers: [] };
+
+  const validStage = {
+    stage: 'fragment',
+    bindings: [
+      {
+        group: 0,
+        binding: 0,
+        name: 'inline_lin',
+        kind: 'sampler',
+        source: { inline_sampler: { sdwords: [146, 15728640, 139460608, 0] } },
+      },
+      {
+        group: 0,
+        binding: 1,
+        name: 'inline_cmp',
+        kind: 'comparison_sampler',
+        source: { inline_sampler: { sdwords: [12288, 15728640, 67108864, 0] } },
+      },
+    ],
+  };
+
+  const diag = diagnoseStageBindings(validStage, emptyRs);
+  assert.equal(diag.ok, true);
+  assert.equal(diag.diagnostics.length, 0);
+  assert.equal(diag.resolvedBindings.length, 2);
+  assert.equal(diag.resolvedBindings[0].registerClass, 'sampler');
+  assert.equal(diag.resolvedBindings[0].inlineSampler, true);
+  assert.deepEqual(diag.resolvedBindings[0].inlineSamplerSdwords, [146, 15728640, 139460608, 0]);
+  assert.equal(diag.resolvedBindings[1].inlineSampler, true);
+  assert.deepEqual(diag.resolvedBindings[1].inlineSamplerSdwords, [12288, 15728640, 67108864, 0]);
+
+  // Inline samplers never need fallback static sampler synthesis
+  const fallbacks = synthesizeMissingStaticSamplers(validStage, emptyRs);
+  assert.equal(fallbacks.needed, false);
+  assert.equal(fallbacks.count, 0);
+
+  // Non-sampler binding with inline_sampler must fail with DESCRIPTOR_TYPE_MISMATCH
+  const badInlineStage = {
+    stage: 'fragment',
+    bindings: [
+      {
+        group: 0,
+        binding: 0,
+        name: 'bad_tex',
+        kind: 'texture',
+        source: { inline_sampler: { sdwords: [0x92, 0x00f00000, 0x08500000, 0] } },
+      },
+    ],
+  };
+  const badDiag = diagnoseStageBindings(badInlineStage, emptyRs);
+  assert.equal(badDiag.ok, false);
+  assert.equal(badDiag.diagnostics.length, 1);
+  assert.equal(badDiag.diagnostics[0].code, DIAGNOSTIC_CODES.DESCRIPTOR_TYPE_MISMATCH);
+  assert.match(badDiag.diagnostics[0].message, /inline sampler 00000092 00f00000 08500000 00000000/);
+  assert.match(badDiag.diagnostics[0].message, /a texture binding cannot take an inline sampler/);
+});
+
+test('W215 parseStageReflectionSidecar rejects bad schema, version, duplicate hashes, missing sources, and duplicate bindings', () => {
+  assert.throws(
+    () => parseStageReflectionSidecar('{ bad json'),
+    (err) => err instanceof ManifestValidationError && /malformed JSON/.test(err.message)
+  );
+  assert.throws(
+    () => parseStageReflectionSidecar({ schema: 'wrong', version: 1, stages: {} }),
+    (err) => err instanceof ManifestValidationError && /unsupported stage reflection schema/.test(err.message)
+  );
+  assert.throws(
+    () => parseStageReflectionSidecar({ schema: 'playgta6-stage-reflection', version: 2, stages: {} }),
+    (err) => err instanceof ManifestValidationError && /unsupported stage reflection version/.test(err.message)
+  );
+  // Duplicate hash across 0x and bare 16-hex keys
+  assert.throws(
+    () =>
+      parseStageReflectionSidecar({
+        schema: 'playgta6-stage-reflection',
+        version: 1,
+        stages: {
+          '0x0000000000001234': { stage: 'fragment', bindings: [] },
+          '0000000000001234': { stage: 'fragment', bindings: [] },
+        },
+      }),
+    (err) => err instanceof ManifestValidationError && /duplicate stage hash/.test(err.message)
+  );
+  // Missing binding source in sidecar
+  assert.throws(
+    () =>
+      parseStageReflectionSidecar({
+        schema: 'playgta6-stage-reflection',
+        version: 1,
+        stages: {
+          '0x0000000000001234': {
+            stage: 'fragment',
+            bindings: [{ group: 0, binding: 0, kind: 'sampler' }],
+          },
+        },
+      }),
+    (err) => err instanceof ManifestValidationError && /binding source is required/.test(err.message)
+  );
+  // Duplicate (group, binding) within one stage
+  assert.throws(
+    () =>
+      parseStageReflectionSidecar({
+        schema: 'playgta6-stage-reflection',
+        version: 1,
+        stages: {
+          '0x0000000000001234': {
+            stage: 'fragment',
+            bindings: [
+              { group: 0, binding: 0, kind: 'sampler', source: { static_sampler: 0 } },
+              { group: 0, binding: 0, kind: 'sampler', source: { inline_sampler: { sdwords: [1, 2, 3, 4] } } },
+            ],
+          },
+        },
+      }),
+    (err) => err instanceof ManifestValidationError && /duplicate binding/.test(err.message)
+  );
+});
+
+test('W215 S6 parseReflectionManifest tracks inline_sampler and vertex_index telemetry and supports bare 16-hex lookups', () => {
+  const bglFs = {
+    entries: [
+      { binding: 0, visibility: SHADER_STAGE_BITS.FRAGMENT, sampler: { type: 'filtering' } },
+    ],
+  };
+  const bglFsId = computeBindGroupLayoutHash(bglFs);
+  const plFsId = computePipelineLayoutHash([bglFsId]);
+
+  const manifest = {
+    schema_version: 1,
+    bind_group_layouts: { [bglFsId]: bglFs },
+    pipeline_layouts: { [plFsId]: { bindGroupLayouts: [bglFsId] } },
+    shaders: {
+      '0x000000000000f001': {
+        stage: 'fragment',
+        entry_point: 'fs_inline_s6',
+        pipeline_layout: plFsId,
+        bind_group_layouts: [bglFsId],
+        bindings: [
+          {
+            group: 0,
+            binding: 0,
+            name: 'smp_inline',
+            resource: 'sampler',
+            in_layout: true,
+            source: { inline_sampler: { sdwords: [146, 15728640, 139460608, 0] } },
+          },
+        ],
+      },
+      '000000000000f002': {
+        stage: 'vertex',
+        entry_point: 'vs_fullscreen_tri',
+        bind_group_layouts: [],
+        bindings: [],
+        vertex_inputs: [],
+      },
+    },
+  };
+
+  const registry = new ReflectionRegistry();
+  const parsed = registry.loadManifest(manifest);
+  assert.equal(parsed.stageCount, 2);
+  assert.equal(parsed.inlineSamplerStages, 1);
+  assert.equal(parsed.inlineSamplerBindings, 1);
+  assert.equal(parsed.vertexIndexStages, 1);
+
+  assert.equal(registry.getShaderReflection('000000000000f001'), parsed.shadersByHash.get(0xf001n));
+  assert.equal(registry.getShaderReflection('0x000000000000f002'), parsed.shadersByHash.get(0xf002n));
+  assert.deepEqual(parsed.shadersByHash.get(0xf001n).bindings[0].source, {
+    kind: 'inline_sampler',
+    sdwords: [146, 15728640, 139460608, 0],
+  });
+
+  const stats = registry.getStats();
+  assert.equal(stats.stageCount, 2);
+  assert.equal(stats.inlineSamplerStages, 1);
+  assert.equal(stats.inlineSamplerBindings, 1);
+  assert.equal(stats.vertexIndexStages, 1);
+  assert.equal(stats.lookupHits, 2);
+  assert.equal(stats.lookupMisses, 0);
 });

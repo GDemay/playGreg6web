@@ -8,7 +8,10 @@ const {
   BLIT_FULLSCREEN_WGSL,
   COMPATIBLE_VIEW_FORMATS,
   DEFAULT_DEPTH_FORMAT,
+  DEFAULT_DROPPED_FRAME_THRESHOLD_MS,
   DEFAULT_MAX_ERROR_HISTORY,
+  DEFAULT_USAGE,
+  DROPPED_FRAME_CADENCE_MULTIPLIER,
   INTERMEDIATE_TEXTURE_USAGE,
   MAX_VALIDATION_ERROR_MESSAGE_LENGTH,
   SUPPORTED_DEPTH_FORMATS,
@@ -336,6 +339,11 @@ test('rolling FPS and frame-time telemetry uses injectable clock and evicts old 
     avgFrameTimeMs: 0,
     maxFrameTimeMs: 0,
     totalFrames: 0,
+    presentCount: 0,
+    droppedFrameCount: 0,
+    lastFrameMs: 0,
+    avgFrameMs: 0,
+    maxFrameMs: 0,
     resizeCount: 0,
     reconfigureCount: 1,
     skippedRedundantReconfigures: 0,
@@ -1816,4 +1824,374 @@ test('W169 present-cadence telemetry tracks lastPresentIntervalMs, avgPresentInt
     () => new WgpuSwapchain({ canvas, device, context, viewFormats: 'bgra8unorm-srgb' }),
     TypeError
   );
+});
+
+// ---------------------------------------------------------------------------
+// W197: Swapchain configuration elision across (width, height, format, usage,
+// alphaMode, device) & zero-allocation frame-pacing telemetry
+// ---------------------------------------------------------------------------
+
+test('W197 elides redundant context.configure calls when (width, height, format, usage, alphaMode, device) are unchanged and reconfigures on any tuple change', () => {
+  assert.equal(DEFAULT_USAGE, TEXTURE_USAGE_RENDER_ATTACHMENT);
+  assert.ok(Math.abs(DEFAULT_DROPPED_FRAME_THRESHOLD_MS - 1000 / 30) < 1e-9);
+  assert.equal(DROPPED_FRAME_CADENCE_MULTIPLIER, 1.5);
+
+  const { context, device } = createMockWebGpuEnv();
+  let widthWrites = 0;
+  let heightWrites = 0;
+  let backingWidth = 0;
+  let backingHeight = 0;
+  const canvas = {
+    get width() {
+      return backingWidth;
+    },
+    set width(v) {
+      widthWrites += 1;
+      backingWidth = v;
+    },
+    get height() {
+      return backingHeight;
+    },
+    set height(v) {
+      heightWrites += 1;
+      backingHeight = v;
+    },
+    getContext(kind) {
+      return kind === 'webgpu' ? context : null;
+    },
+  };
+
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'bgra8unorm',
+    alphaMode: 'opaque',
+  });
+
+  // Initial configure: default usage is TEXTURE_USAGE_RENDER_ATTACHMENT and omitted from cfg when unspecified.
+  swapchain.configure({ width: 1280, height: 720, devicePixelRatio: 1 });
+  assert.equal(context.configurations.length, 1);
+  assert.equal('usage' in context.configurations[0], false);
+  assert.equal(swapchain.usage, TEXTURE_USAGE_RENDER_ATTACHMENT);
+  assert.equal(swapchain.reconfigureCount, 1);
+  assert.equal(device.createdTextures.length, 1);
+  assert.equal(widthWrites, 1);
+  assert.equal(heightWrites, 1);
+
+  // Repeated configure with identical tuple — including explicit default usage, device, alphaMode,
+  // format, and DPR-equivalent pixel size — must be completely elided.
+  swapchain.configure({ width: 1280, height: 720, devicePixelRatio: 1 });
+  swapchain.configure({
+    width: 640,
+    height: 360,
+    devicePixelRatio: 2,
+    format: 'bgra8unorm',
+    usage: TEXTURE_USAGE_RENDER_ATTACHMENT,
+    alphaMode: 'opaque',
+    device,
+  });
+  assert.equal(swapchain.resize(1280, 720, 1), false);
+  assert.equal(swapchain.setDevice(device), false);
+
+  assert.equal(context.configurations.length, 1);
+  assert.equal(swapchain.reconfigureCount, 1);
+  assert.equal(swapchain.getTelemetry().skippedRedundantReconfigures, 4);
+  assert.equal(device.createdTextures.length, 1);
+  assert.equal(widthWrites, 1);
+  assert.equal(heightWrites, 1);
+
+  // 1. Changing ONLY usage triggers reconfigure with explicit usage; repeating elides.
+  const copyAndRenderUsage = TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC;
+  swapchain.configure({ usage: copyAndRenderUsage });
+  assert.equal(context.configurations.length, 2);
+  assert.equal(context.configurations[1].usage, copyAndRenderUsage);
+  assert.equal(swapchain.usage, copyAndRenderUsage);
+  assert.equal(swapchain.getStats().usage, copyAndRenderUsage);
+  assert.equal(swapchain.reconfigureCount, 2);
+  assert.equal(device.createdTextures.length, 1); // depth texture preserved
+  assert.equal(widthWrites, 1);
+  assert.equal(heightWrites, 1);
+
+  swapchain.configure({ width: 1280, height: 720, usage: copyAndRenderUsage });
+  assert.equal(context.configurations.length, 2);
+  assert.equal(swapchain.reconfigureCount, 2);
+  assert.equal(swapchain.getTelemetry().skippedRedundantReconfigures, 5);
+
+  // Switching usage back to RENDER_ATTACHMENT triggers reconfigure; repeating elides.
+  swapchain.configure({ usage: TEXTURE_USAGE_RENDER_ATTACHMENT });
+  assert.equal(context.configurations.length, 3);
+  assert.equal(context.configurations[2].usage, TEXTURE_USAGE_RENDER_ATTACHMENT);
+  assert.equal(swapchain.reconfigureCount, 3);
+  swapchain.configure({ usage: TEXTURE_USAGE_RENDER_ATTACHMENT });
+  assert.equal(context.configurations.length, 3);
+
+  // 2. Changing ONLY alphaMode triggers reconfigure; repeating elides.
+  swapchain.configure({ alphaMode: 'premultiplied' });
+  assert.equal(context.configurations.length, 4);
+  assert.equal(context.configurations[3].alphaMode, 'premultiplied');
+  assert.equal(swapchain.reconfigureCount, 4);
+  swapchain.configure({ alphaMode: 'premultiplied' });
+  assert.equal(context.configurations.length, 4);
+
+  // 3. Changing ONLY format triggers reconfigure; repeating elides.
+  swapchain.configure({ format: 'rgba8unorm' });
+  assert.equal(context.configurations.length, 5);
+  assert.equal(context.configurations[4].format, 'rgba8unorm');
+  assert.equal(swapchain.reconfigureCount, 5);
+  swapchain.configure({ format: 'rgba8unorm' });
+  assert.equal(context.configurations.length, 5);
+
+  // 4. Leaving blit fallback via setFormat() when canvas format/viewFormats didn't change elides context.configure.
+  assert.equal(swapchain.configureForStreamFormat('rgb10a2unorm'), true);
+  assert.equal(context.configurations.length, 5);
+  assert.equal(swapchain.setFormat('rgba8unorm'), true);
+  assert.equal(swapchain.usesBlitFallback, false);
+  assert.equal(context.configurations.length, 5);
+  assert.equal(swapchain.reconfigureCount, 5);
+
+  // 5. Validation guards for invalid usage / device / droppedFrameThresholdMs.
+  assert.throws(() => new WgpuSwapchain({ canvas, device, context, usage: 0 }), RangeError);
+  assert.throws(() => new WgpuSwapchain({ canvas, device, context, usage: -4 }), RangeError);
+  assert.throws(() => new WgpuSwapchain({ canvas, device, context, usage: 1.5 }), RangeError);
+  assert.throws(() => swapchain.configure({ usage: 0 }), RangeError);
+  assert.throws(() => swapchain.configure({ device: null }), TypeError);
+  assert.throws(() => swapchain.setDevice(null), TypeError);
+  assert.throws(
+    () => new WgpuSwapchain({ canvas, device, context, droppedFrameThresholdMs: -1 }),
+    RangeError
+  );
+  assert.throws(() => swapchain.configure({ droppedFrameThresholdMs: NaN }), RangeError);
+  assert.throws(() => swapchain.recordFrameDropped(-1), RangeError);
+  assert.throws(() => swapchain.recordFrameDropped(1.5), RangeError);
+});
+
+test('W197 cleanly reconfigures on resize and live/lost device replacement via configure({ device }) and setDevice()', async () => {
+  const { canvas, context, device, events, makeDevice } = createMockWebGpuEnv({
+    limits: { maxTextureDimension2D: 4096 },
+  });
+  attachMockEventTarget(device);
+  attachMockBlitCapabilities(device, events);
+
+  const customUsage = TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC;
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'bgra8unorm',
+    usage: customUsage,
+    enableDepth: true,
+  });
+
+  swapchain.configure({ width: 3840, height: 2160 });
+  assert.equal(context.configurations.length, 1);
+  assert.equal(context.configurations[0].device, device);
+  assert.equal(context.configurations[0].usage, customUsage);
+  assert.equal(device.createdTextures.length, 1);
+  assert.equal(device.listenerCount('uncapturederror'), 1);
+
+  const oldDepthTex = device.createdTextures[0];
+
+  // Replace device via configure({ device: device2 }) with smaller maxTextureDimension2D (2048).
+  const device2 = attachMockEventTarget(
+    attachMockBlitCapabilities(makeDevice('device-2', { maxTextureDimension2D: 2048 }), events)
+  );
+  const res2 = swapchain.configure({ device: device2 });
+  assert.equal(res2.width, 2048);
+  assert.equal(res2.height, 2048);
+  assert.equal(swapchain.device, device2);
+  assert.equal(oldDepthTex.destroyed, true);
+  assert.equal(device.listenerCount('uncapturederror'), 0);
+  assert.equal(device2.listenerCount('uncapturederror'), 1);
+  assert.equal(context.configurations.length, 2);
+  assert.equal(context.configurations[1].device, device2);
+  assert.equal(context.configurations[1].usage, customUsage);
+  assert.equal(device2.createdTextures.length, 1);
+  assert.equal(swapchain.reconfigureCount, 2);
+  assert.equal(swapchain.getTelemetry().resizeCount, 1);
+
+  // Subsequent configure with device2 and unchanged size is elided.
+  swapchain.configure({ device: device2, width: 2048, height: 2048, usage: customUsage });
+  assert.equal(context.configurations.length, 2);
+  assert.equal(swapchain.reconfigureCount, 2);
+
+  // Resize on device2 reconfigures cleanly and destroys previous depth texture.
+  const depthOnDevice2 = device2.createdTextures[0];
+  assert.equal(swapchain.resize(1280, 720, 1), true);
+  assert.equal(depthOnDevice2.destroyed, true);
+  assert.equal(context.configurations.length, 3);
+  assert.equal(swapchain.reconfigureCount, 3);
+  assert.equal(swapchain.getTelemetry().resizeCount, 2);
+
+  // Trigger device loss on device2, then replace directly via setDevice(device3).
+  device2.triggerLost({ reason: 'unknown', message: 'simulated crash' });
+  await device2.lost;
+  await Promise.resolve();
+  assert.equal(swapchain.isDeviceLost, true);
+
+  // Configuring with the SAME lost device still rejects.
+  assert.throws(() => swapchain.configure({ device: device2, width: 1280, height: 720 }), /lost/i);
+
+  const device3 = attachMockEventTarget(makeDevice('device-3', { maxTextureDimension2D: 4096 }));
+  assert.equal(swapchain.setDevice(device3), true);
+  assert.equal(swapchain.isDeviceLost, false);
+  assert.equal(swapchain.device, device3);
+  assert.equal(device2.listenerCount('uncapturederror'), 0);
+  assert.equal(device3.listenerCount('uncapturederror'), 1);
+  assert.equal(context.configurations.length, 4);
+  assert.equal(context.configurations[3].device, device3);
+  assert.equal(context.configurations[3].usage, customUsage);
+  assert.equal(swapchain.reconfigureCount, 4);
+
+  // Repeating setDevice(device3) on live already-configured device is elided.
+  assert.equal(swapchain.setDevice(device3), false);
+  assert.equal(context.configurations.length, 4);
+  assert.equal(swapchain.reconfigureCount, 4);
+
+  // Replacing a lost device via configure({ device: device4 }) also recovers cleanly.
+  device3.triggerLost({ reason: 'destroyed', message: 'lost again' });
+  await device3.lost;
+  await Promise.resolve();
+  assert.equal(swapchain.isDeviceLost, true);
+
+  const device4 = attachMockEventTarget(makeDevice('device-4', { maxTextureDimension2D: 4096 }));
+  swapchain.configure({ device: device4, width: 1920, height: 1080 });
+  assert.equal(swapchain.isDeviceLost, false);
+  assert.equal(swapchain.device, device4);
+  assert.equal(swapchain.width, 1920);
+  assert.equal(swapchain.height, 1080);
+  assert.equal(context.configurations.length, 5);
+  assert.equal(context.configurations[4].device, device4);
+  assert.equal(swapchain.reconfigureCount, 5);
+});
+
+test('W197 tracks zero-allocation frame-pacing telemetry (presentCount, reconfigureCount, droppedFrameCount, lastFrameMs, avgFrameMs, maxFrameMs)', () => {
+  const { canvas, context, device } = createMockWebGpuEnv();
+  let clockMs = 1000;
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'bgra8unorm',
+    nowFn: () => clockMs,
+    frameWindowSize: 4,
+    frameIntervalUs: 16667, // 60Hz -> 1.5x drop threshold = 25.0005ms
+  });
+
+  // Ring buffer is pre-allocated as a fixed-size Float64Array.
+  assert.ok(swapchain._frameDeltaRing instanceof Float64Array);
+  assert.equal(swapchain._frameDeltaRing.length, 4);
+
+  swapchain.configure({ width: 1280, height: 720 });
+
+  // Initial pacing stats before presenting any frame.
+  const pacingOut = {};
+  const initPacing = swapchain.getFramePacingStats(pacingOut);
+  assert.strictEqual(initPacing, pacingOut);
+  assert.deepEqual(initPacing, {
+    presentCount: 0,
+    reconfigureCount: 1,
+    droppedFrameCount: 0,
+    lastFrameMs: 0,
+    avgFrameMs: 0,
+    maxFrameMs: 0,
+  });
+
+  // Frame 1 (baseline) + Frame 2 (+16ms) + Frame 3 (+40ms drop!) + Frame 4 (+20ms) + Frame 5 (+16ms).
+  const t1 = swapchain.recordFramePresented();
+  clockMs += 16;
+  const t2 = swapchain.recordFramePresented();
+  clockMs += 40; // > 25.0005ms -> droppedFrameCount += 1
+  const t3 = swapchain.recordFramePresented();
+  clockMs += 20;
+  const t4 = swapchain.recordFramePresented();
+  clockMs += 16;
+  const t5 = swapchain.recordFramePresented();
+
+  // Zero per-frame allocation check: recordFramePresented reuses the exact same telemetry object & Float64Array ring.
+  assert.strictEqual(t1, t2);
+  assert.strictEqual(t2, t3);
+  assert.strictEqual(t3, t4);
+  assert.strictEqual(t4, t5);
+
+  // Rolling window of 4 deltas: [16, 40, 20, 16] -> avg = 23, max = 40, last = 16, dropped = 1.
+  assert.equal(t5.presentCount, 5);
+  assert.equal(t5.totalFrames, 5);
+  assert.equal(t5.reconfigureCount, 1);
+  assert.equal(t5.droppedFrameCount, 1);
+  assert.equal(t5.lastFrameMs, 16);
+  assert.equal(t5.avgFrameMs, 23);
+  assert.equal(t5.maxFrameMs, 40);
+
+  // Direct scalar getters match telemetry & getStats() & getFramePacingStats().
+  assert.equal(swapchain.presentCount, 5);
+  assert.equal(swapchain.reconfigureCount, 1);
+  assert.equal(swapchain.droppedFrameCount, 1);
+  assert.equal(swapchain.lastFrameMs, 16);
+  assert.equal(swapchain.avgFrameMs, 23);
+  assert.equal(swapchain.maxFrameMs, 40);
+
+  const reusableTelemetry = {};
+  const filled = swapchain.getTelemetry(reusableTelemetry);
+  assert.strictEqual(filled, reusableTelemetry);
+  assert.equal(filled.presentCount, 5);
+  assert.equal(filled.droppedFrameCount, 1);
+  assert.equal(filled.lastFrameMs, 16);
+  assert.equal(filled.avgFrameMs, 23);
+  assert.equal(filled.maxFrameMs, 40);
+
+  // No-arg getTelemetry() returns fresh independent snapshots.
+  const snapA = swapchain.getTelemetry();
+  const snapB = swapchain.getTelemetry();
+  assert.notStrictEqual(snapA, snapB);
+  assert.deepEqual(snapA, snapB);
+
+  const stats = swapchain.getStats();
+  assert.equal(stats.presentCount, 5);
+  assert.equal(stats.reconfigureCount, 1);
+  assert.equal(stats.droppedFrameCount, 1);
+  assert.equal(stats.lastFrameMs, 16);
+  assert.equal(stats.avgFrameMs, 23);
+  assert.equal(stats.maxFrameMs, 40);
+
+  // Explicit dropped frame API + explicit { dropped: true } metadata.
+  assert.equal(swapchain.recordFrameDropped(), 2);
+  assert.equal(swapchain.recordFrameDropped(2), 4);
+  clockMs += 16;
+  swapchain.recordFramePresented({ timestampMs: clockMs, dropped: true });
+  assert.equal(swapchain.droppedFrameCount, 5);
+  assert.equal(swapchain.presentCount, 6);
+
+  // High-frequency steady-state loop: 1000 frames at 16ms evicts the 40ms spike and never reallocates the ring.
+  const ringRef = swapchain._frameDeltaRing;
+  for (let i = 0; i < 1000; i += 1) {
+    clockMs += 16;
+    const live = swapchain.recordFramePresented(clockMs);
+    assert.strictEqual(live, t1);
+  }
+  assert.strictEqual(swapchain._frameDeltaRing, ringRef);
+  assert.equal(swapchain._frameDeltaRing.length, 4);
+
+  swapchain.getFramePacingStats(pacingOut);
+  assert.deepEqual(pacingOut, {
+    presentCount: 1006,
+    reconfigureCount: 1,
+    droppedFrameCount: 5,
+    lastFrameMs: 16,
+    avgFrameMs: 16,
+    maxFrameMs: 16,
+  });
+
+  // Explicit droppedFrameThresholdMs override (including 0 to disable automatic drop detection).
+  swapchain.configure({ droppedFrameThresholdMs: 10 });
+  clockMs += 12; // > 10ms -> dropped
+  swapchain.recordFramePresented(clockMs);
+  assert.equal(swapchain.droppedFrameCount, 6);
+
+  swapchain.configure({ droppedFrameThresholdMs: 0 });
+  clockMs += 200; // auto-detection disabled -> not counted
+  swapchain.recordFramePresented(clockMs);
+  assert.equal(swapchain.droppedFrameCount, 6);
+  assert.equal(swapchain.lastFrameMs, 200);
+  assert.equal(swapchain.maxFrameMs, 200);
 });

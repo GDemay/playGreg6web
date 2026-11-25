@@ -241,6 +241,14 @@ function readGamepadTrigger(button) {
   return button.pressed ? 1 : 0;
 }
 
+function buildPeriodicButtonEvents(startMs, endMs, periodMs, holdMs, button) {
+  const events = [];
+  for (let atMs = startMs; atMs <= endMs; atMs += periodMs) {
+    events.push(Object.freeze({ atMs, holdMs, button }));
+  }
+  return Object.freeze(events);
+}
+
 // Named deterministic scripted-input presets.
 // - 'start-screen': matches tools/run_native_boot.py (A held 100 ms every 1000 ms starting at 5000 ms).
 // - 'menu-flow': periodic A presses on Start Screen, clean pauses across CONTINUE / UI TEXT SIZE,
@@ -251,6 +259,13 @@ function readGamepadTrigger(button) {
 //   without double-tapping or backing out (B).
 // - 'intro-watch': waits 18 s (past the 15 s+ 4K Bink2 intro video) before issuing spaced A presses
 //   so automated captures record the full intro video before entering menus.
+// - 'legal-notices': mirrors PR #948's native boot sequence (A every 2500 ms from 20000 ms to
+//   62000 ms through Start Screen / loading / UI TEXT SIZE, then looping DPAD_DOWN, DPAD_DOWN, A
+//   every 12000 ms from 64000 ms to select "Next >" on LEGAL NOTICES with interspersed A every
+//   3000 ms; never presses B or DPAD_UP).
+// - 'chrome-menu-flow': Chrome-timed equivalent for real Wasm64 browser boot (waits through the
+//   4K Bink2 intro & shader init with spaced A every 2500 ms from 165000 ms through 215000 ms,
+//   then loops DPAD_DOWN, DPAD_DOWN, A, A, A every 12000 ms from 218000 ms; never presses B or DPAD_UP).
 export const INPUT_SCRIPT_PRESETS = Object.freeze({
   'start-screen': Object.freeze({
     name: 'start-screen',
@@ -298,6 +313,45 @@ export const INPUT_SCRIPT_PRESETS = Object.freeze({
     startMs: 18000,
     holdMs: 100,
     periodMs: 2500,
+  }),
+  'legal-notices': Object.freeze({
+    name: 'legal-notices',
+    // Phase 1: After the intro video, press A every 2500 ms from 20000 ms to 62000 ms
+    // through Start Screen -> loading -> NAVIGATION EXPERIENCE -> UI TEXT SIZE -> pool/swan.
+    events: buildPeriodicButtonEvents(20000, 62000, 2500, 100, INPUT_BUTTONS.A),
+    // Phase 2: Loop DPAD_DOWN, DPAD_DOWN, A every 12000 ms from 64000 ms to highlight and
+    // confirm "Next >" on LEGAL NOTICES, with interspersed A every 3000 ms (never B or DPAD_UP).
+    loop: Object.freeze({
+      startMs: 64000,
+      periodMs: 12000,
+      events: Object.freeze([
+        Object.freeze({ offsetMs: 0, holdMs: 100, button: INPUT_BUTTONS.DPAD_DOWN }),
+        Object.freeze({ offsetMs: 500, holdMs: 100, button: INPUT_BUTTONS.DPAD_DOWN }),
+        Object.freeze({ offsetMs: 1000, holdMs: 100, button: INPUT_BUTTONS.A }),
+        Object.freeze({ offsetMs: 4000, holdMs: 100, button: INPUT_BUTTONS.A }),
+        Object.freeze({ offsetMs: 7000, holdMs: 100, button: INPUT_BUTTONS.A }),
+        Object.freeze({ offsetMs: 10000, holdMs: 100, button: INPUT_BUTTONS.A }),
+      ]),
+    }),
+  }),
+  'chrome-menu-flow': Object.freeze({
+    name: 'chrome-menu-flow',
+    // Phase 1: Wait through real Wasm64 browser 4K Bink2 intro & shader init, then press A
+    // every 2500 ms from 165000 ms through 215000 ms.
+    events: buildPeriodicButtonEvents(165000, 215000, 2500, 100, INPUT_BUTTONS.A),
+    // Phase 2: Loop DPAD_DOWN, DPAD_DOWN, A, A, A every 12000 ms from 218000 ms to advance
+    // LEGAL NOTICES ("Next >") and subsequent list screens (never B or DPAD_UP).
+    loop: Object.freeze({
+      startMs: 218000,
+      periodMs: 12000,
+      events: Object.freeze([
+        Object.freeze({ offsetMs: 0, holdMs: 100, button: INPUT_BUTTONS.DPAD_DOWN }),
+        Object.freeze({ offsetMs: 500, holdMs: 100, button: INPUT_BUTTONS.DPAD_DOWN }),
+        Object.freeze({ offsetMs: 1200, holdMs: 100, button: INPUT_BUTTONS.A }),
+        Object.freeze({ offsetMs: 4500, holdMs: 100, button: INPUT_BUTTONS.A }),
+        Object.freeze({ offsetMs: 8000, holdMs: 100, button: INPUT_BUTTONS.A }),
+      ]),
+    }),
   }),
 });
 

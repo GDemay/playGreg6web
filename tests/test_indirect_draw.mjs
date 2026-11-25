@@ -24,7 +24,10 @@ const {
   decodeDrawIndexedIndirect,
   decodeDispatchIndirect,
   encodeBatch,
+  isValidIndirectRange,
+  checkIndirectRange,
   validateIndirectRange,
+  computeIndirectBatchStepPlan,
   validateIndirectBatch,
   validateDispatchCounts,
   planDispatches,
@@ -35,6 +38,10 @@ const {
   encodeIndirectDispatch,
   encodeMultiDraw,
   encodeMultiDispatchIndirect,
+  executeIndirect,
+  executeIndirectDraw,
+  executeIndirectDrawIndexed,
+  executeIndirectDispatch,
   getStats,
   resetStats,
   IndirectArgsBuffer,
@@ -820,7 +827,12 @@ test('telemetry tracks drawIndirect, drawIndexedIndirect, dispatchWorkgroupsIndi
   assert.equal(snapshot.indirectDrawsEncoded, 4);
   assert.equal(snapshot.indirectIndexedDrawsEncoded, 5);
   assert.equal(snapshot.indirectDispatchesEncoded, 4);
+  assert.equal(snapshot.indirectDraws, 4);
+  assert.equal(snapshot.indirectIndexedDraws, 5);
+  assert.equal(snapshot.indirectDispatches, 4);
   assert.equal(snapshot.boundsRejectedCount, 1);
+  assert.equal(snapshot.clampedOrSkippedInvalid, 1);
+  assert.equal(snapshot.maxMultiDrawCount, 4);
   assert.equal(snapshot.zeroBatchSkips, 1);
 
   // Returned snapshot is sanitized (finite non-negative integers only) and detached
@@ -829,7 +841,9 @@ test('telemetry tracks drawIndirect, drawIndexedIndirect, dispatchWorkgroupsIndi
     assert.ok(Number.isInteger(val) && val >= 0, `stat ${key} must be a non-negative integer`);
   }
   snapshot.indirectDrawsEncoded = 999999;
+  snapshot.indirectDraws = 999999;
   assert.equal(getStats().indirectDrawsEncoded, 4);
+  assert.equal(getStats().indirectDraws, 4);
 
   // resetStats zeroes module counters
   resetStats();
@@ -841,6 +855,11 @@ test('telemetry tracks drawIndirect, drawIndexedIndirect, dispatchWorkgroupsIndi
     zeroBatchSkips: 0,
     batchLimitRejectedCount: 0,
     batchClampedCount: 0,
+    indirectDraws: 0,
+    indirectIndexedDraws: 0,
+    indirectDispatches: 0,
+    clampedOrSkippedInvalid: 0,
+    maxMultiDrawCount: 0,
   });
 
   // IndirectArgsBuffer instance telemetry + maxIndirectBatchCount + resetStats
@@ -859,11 +878,16 @@ test('telemetry tracks drawIndirect, drawIndexedIndirect, dispatchWorkgroupsIndi
 
   const bufStats = args.getStats();
   assert.equal(bufStats.indirectIndexedDrawsEncoded, 2);
+  assert.equal(bufStats.indirectIndexedDraws, 2);
   assert.equal(bufStats.indirectDrawsEncoded, 0);
+  assert.equal(bufStats.indirectDraws, 0);
   assert.equal(bufStats.indirectDispatchesEncoded, 0);
+  assert.equal(bufStats.indirectDispatches, 0);
   assert.equal(bufStats.boundsRejectedCount, 1);
   assert.equal(bufStats.batchLimitRejectedCount, 1);
   assert.equal(bufStats.batchClampedCount, 1);
+  assert.equal(bufStats.clampedOrSkippedInvalid, 2);
+  assert.equal(bufStats.maxMultiDrawCount, 2);
   assert.equal(bufStats.zeroBatchSkips, 1);
   assert.equal(bufStats.liveSlots, 3);
   assert.equal(bufStats.maxIndirectBatchCount, 2);
@@ -871,9 +895,389 @@ test('telemetry tracks drawIndirect, drawIndexedIndirect, dispatchWorkgroupsIndi
   args.resetStats();
   const clearedBufStats = args.getStats();
   assert.equal(clearedBufStats.indirectIndexedDrawsEncoded, 0);
+  assert.equal(clearedBufStats.indirectIndexedDraws, 0);
   assert.equal(clearedBufStats.boundsRejectedCount, 0);
   assert.equal(clearedBufStats.zeroBatchSkips, 0);
   assert.equal(clearedBufStats.batchLimitRejectedCount, 0);
   assert.equal(clearedBufStats.batchClampedCount, 0);
+  assert.equal(clearedBufStats.clampedOrSkippedInvalid, 0);
+  assert.equal(clearedBufStats.maxMultiDrawCount, 0);
   assert.equal(clearedBufStats.liveSlots, 3, 'resetStats preserves live slot metadata');
+});
+
+test('W205: fast-path isValidIndirectRange & checkIndirectRange validate alignment, bounds, usage, and liveness without mutating stats', () => {
+  resetStats();
+  const buf64 = indirectBuf(64);
+  const destroyedBuf = { usage: BUFFER_USAGE.INDIRECT, size: 64, destroyed: true };
+  const noIndirectBuf = { usage: BUFFER_USAGE.STORAGE, size: 64 };
+
+  // Aligned & exact-fit offsets pass for all three record sizes (16 / 20 / 12)
+  assert.equal(isValidIndirectRange(buf64, 0, 16), true);
+  assert.equal(isValidIndirectRange(buf64, 48, 16), true);
+  assert.equal(isValidIndirectRange(buf64, 44, 20), true);
+  assert.equal(isValidIndirectRange(buf64, 52, 12), true);
+  // > 2 GiB safe-integer 4-byte-aligned offset passes
+  assert.equal(isValidIndirectRange({ usage: BUFFER_USAGE.INDIRECT, size: 0x100000100 }, 0x100000004, 16), true);
+
+  // Misaligned offsets fail (both Smi and > 2 GiB)
+  for (const badOffset of [1, 2, 3, 6, 18, 0x100000002]) {
+    const buf = { usage: BUFFER_USAGE.INDIRECT, size: 0x100000100 };
+    assert.equal(isValidIndirectRange(buf, badOffset, 16), false);
+    const res = checkIndirectRange(buf, badOffset, 16);
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'MISALIGNED_OFFSET');
+  }
+
+  // Out-of-bounds offsets fail (1 byte short & explicit bufferSize cap)
+  assert.equal(checkIndirectRange(buf64, 52, 16).code, 'OUT_OF_BOUNDS');
+  assert.equal(checkIndirectRange(buf64, 48, 20).code, 'OUT_OF_BOUNDS');
+  assert.equal(checkIndirectRange(buf64, 56, 12).code, 'OUT_OF_BOUNDS');
+  assert.equal(checkIndirectRange(buf64, 0, 16, { bufferSize: 12 }).code, 'OUT_OF_BOUNDS');
+  assert.equal(checkIndirectRange(buf64, 0, 16, { bufferSize: -4 }).code, 'OUT_OF_BOUNDS');
+
+  // Non-integer / negative / NaN offsets fail cleanly
+  for (const invalidOffset of [-4, 1.5, NaN, Infinity, '0', null]) {
+    assert.equal(checkIndirectRange(buf64, invalidOffset, 16).code, 'INVALID_OFFSET');
+  }
+
+  // Missing INDIRECT usage and destroyed buffer fail cleanly
+  assert.equal(checkIndirectRange(noIndirectBuf, 0, 16).code, 'NOT_INDIRECT');
+  assert.equal(checkIndirectRange(null, 0, 16).code, 'NOT_INDIRECT');
+  assert.equal(checkIndirectRange(destroyedBuf, 0, 16).code, 'DESTROYED_BUFFER');
+  assert.throws(
+    () => validateIndirectRange(destroyedBuf, 0, 16),
+    (e) => e instanceof IndirectDrawError && e.code === 'DESTROYED_BUFFER'
+  );
+
+  // Only the throwing validateIndirectRange call mutated stats; pure checks did not
+  assert.equal(getStats().boundsRejectedCount, 1);
+  assert.equal(getStats().clampedOrSkippedInvalid, 1);
+});
+
+test('W205: encodeIndirect* with skipInvalid skips misaligned/OOB/destroyed calls without emitting GPU commands', () => {
+  resetStats();
+  const pass = createMockPass();
+  const buf32 = indirectBuf(32);
+  const destroyedBuf = { usage: BUFFER_USAGE.INDIRECT, size: 64, destroyed: true };
+
+  // Misaligned offsets skipped cleanly
+  const r1 = encodeIndirectDraw(pass, buf32, 2, { skipInvalid: true });
+  assert.equal(r1.executed, false);
+  assert.equal(r1.skipped, true);
+  assert.equal(r1.reason, 'MISALIGNED_OFFSET');
+
+  const r2 = encodeIndirectDrawIndexed(pass, buf32, 6, { skipInvalid: true });
+  assert.equal(r2.skipped, true);
+  assert.equal(r2.reason, 'MISALIGNED_OFFSET');
+
+  const r3 = encodeIndirectDispatch(pass, buf32, 1, { skipInvalid: true });
+  assert.equal(r3.skipped, true);
+  assert.equal(r3.reason, 'MISALIGNED_OFFSET');
+
+  // Out-of-bounds skipped cleanly
+  const r4 = encodeIndirectDraw(pass, buf32, 20, { skipInvalid: true });
+  assert.equal(r4.skipped, true);
+  assert.equal(r4.reason, 'OUT_OF_BOUNDS');
+
+  const r5 = encodeIndirectDrawIndexed(pass, buf32, 16, { skipInvalid: true });
+  assert.equal(r5.skipped, true);
+  assert.equal(r5.reason, 'OUT_OF_BOUNDS');
+
+  const r6 = encodeIndirectDispatch(pass, buf32, 24, { skipInvalid: true });
+  assert.equal(r6.skipped, true);
+  assert.equal(r6.reason, 'OUT_OF_BOUNDS');
+
+  // Destroyed buffer & missing pass method skipped cleanly
+  const r7 = encodeIndirectDraw(pass, destroyedBuf, 0, { skipInvalid: true });
+  assert.equal(r7.skipped, true);
+  assert.equal(r7.reason, 'DESTROYED_BUFFER');
+
+  const r8 = encodeIndirectDispatch({}, buf32, 0, { skipInvalid: true });
+  assert.equal(r8.skipped, true);
+  assert.equal(r8.reason, 'MISSING_PASS_METHOD');
+
+  assert.equal(pass.calls.length, 0, 'zero WebGPU pass calls emitted for invalid inputs');
+  assert.equal(getStats().clampedOrSkippedInvalid, 8);
+  assert.equal(getStats().boundsRejectedCount, 8);
+
+  // Valid calls still execute normally with skipInvalid: true
+  encodeIndirectDraw(pass, buf32, 16, { skipInvalid: true });
+  encodeIndirectDrawIndexed(pass, buf32, 12, { skipInvalid: true });
+  encodeIndirectDispatch(pass, buf32, 20, { skipInvalid: true });
+  assert.deepEqual(pass.calls, [
+    ['drawIndirect', 16],
+    ['drawIndexedIndirect', 12],
+    ['dispatchWorkgroupsIndirect', 20],
+  ]);
+  const s = getStats();
+  assert.equal(s.indirectDraws, 1);
+  assert.equal(s.indirectIndexedDraws, 1);
+  assert.equal(s.indirectDispatches, 1);
+  assert.equal(s.clampedOrSkippedInvalid, 8);
+});
+
+test('W205: executeIndirect* steps ExecuteIndirect (count > 1) offsets with packed and custom strides', () => {
+  resetStats();
+  const pass = createMockPass(true);
+
+  // Non-indexed multi-draw with custom D3D12 command signature stride (32B) and argOffset 12
+  // Even with useNative: true, custom stride (> 16B) must step via drawIndirect (never native packed multiDraw)
+  const rDraw = executeIndirectDraw(pass, indirectBuf(256), 12, {
+    count: 4,
+    stride: 32,
+    useNative: true,
+  });
+  assert.deepEqual(rDraw, {
+    ok: true,
+    executed: 4,
+    calls: 4,
+    requestedCount: 4,
+    clamped: false,
+    skipped: 0,
+    reason: null,
+    native: false,
+    firstOffset: 12,
+    stride: 32,
+  });
+  assert.deepEqual(pass.calls, [
+    ['drawIndirect', 12],
+    ['drawIndirect', 44],
+    ['drawIndirect', 76],
+    ['drawIndirect', 108],
+  ]);
+
+  // Indexed multi-draw with packed stride (20B) + firstSlot + maxCommandCount alias + native multiDraw
+  pass.calls.length = 0;
+  const rIndexed = executeIndirectDrawIndexed(pass, indirectBuf(256), 20, {
+    maxCommandCount: 5,
+    firstSlot: 1,
+    useNative: true,
+  });
+  assert.deepEqual(rIndexed, {
+    ok: true,
+    executed: 5,
+    calls: 1,
+    requestedCount: 5,
+    clamped: false,
+    skipped: 0,
+    reason: null,
+    native: true,
+    firstOffset: 40,
+    stride: 20,
+  });
+  assert.deepEqual(pass.calls, [['multiDrawIndexedIndirect', 40, 5]]);
+
+  // Multi-dispatch stepping with 16-byte stride (12B payload + 4B padding)
+  pass.calls.length = 0;
+  const rDisp = executeIndirectDispatch(pass, indirectBuf(128), 8, {
+    count: 3,
+    stride: 16,
+  });
+  assert.deepEqual(rDisp, {
+    ok: true,
+    executed: 3,
+    calls: 3,
+    requestedCount: 3,
+    clamped: false,
+    skipped: 0,
+    reason: null,
+    native: false,
+    firstOffset: 8,
+    stride: 16,
+  });
+  assert.deepEqual(pass.calls, [
+    ['dispatchWorkgroupsIndirect', 8],
+    ['dispatchWorkgroupsIndirect', 24],
+    ['dispatchWorkgroupsIndirect', 40],
+  ]);
+
+  // Single-command fast path (count omitted -> 1)
+  pass.calls.length = 0;
+  const rSingle = executeIndirectDraw(pass, indirectBuf(64), 16);
+  assert.equal(rSingle.ok, true);
+  assert.equal(rSingle.executed, 1);
+  assert.deepEqual(pass.calls, [['drawIndirect', 16]]);
+
+  const s = getStats();
+  assert.equal(s.indirectDraws, 5);
+  assert.equal(s.indirectIndexedDraws, 5);
+  assert.equal(s.indirectDispatches, 3);
+  assert.equal(s.clampedOrSkippedInvalid, 0);
+  assert.equal(s.maxMultiDrawCount, 5);
+});
+
+test('W205: executeIndirect* and computeIndirectBatchStepPlan guard misaligned/OOB offsets and clamp overflowing counts', () => {
+  resetStats();
+  const pass = createMockPass();
+
+  // Buffer of 84 bytes with stride 32 and 20B indexed records fits exactly 3 records:
+  // [0..20], [32..52], [64..84] -> requesting count=7 clamps to 3
+  const plan = computeIndirectBatchStepPlan(indirectBuf(84), {
+    kind: INDIRECT_KIND.DRAW_INDEXED,
+    count: 7,
+    stride: 32,
+  });
+  assert.deepEqual(plan, {
+    valid: true,
+    reason: 'CLAMPED_TO_BUFFER',
+    requestedCount: 7,
+    effectiveCount: 3,
+    clamped: true,
+    clampedReason: 'CLAMPED_TO_BUFFER',
+    recordSize: 20,
+    stride: 32,
+    firstOffset: 0,
+    lastOffset: 64,
+    requiredBytes: 84,
+    bufferSize: 84,
+  });
+
+  const clamped = executeIndirectDrawIndexed(pass, indirectBuf(84), 0, {
+    count: 7,
+    stride: 32,
+  });
+  assert.equal(clamped.ok, true);
+  assert.equal(clamped.executed, 3);
+  assert.equal(clamped.clamped, true);
+  assert.equal(clamped.skipped, 4);
+  assert.equal(clamped.reason, 'CLAMPED_TO_BUFFER');
+  assert.deepEqual(pass.calls, [
+    ['drawIndexedIndirect', 0],
+    ['drawIndexedIndirect', 32],
+    ['drawIndexedIndirect', 64],
+  ]);
+
+  // Buffer of 83 bytes (1 byte too small for slot 2) clamps to 2
+  pass.calls.length = 0;
+  const clamped2 = executeIndirectDrawIndexed(pass, indirectBuf(83), 0, {
+    count: 7,
+    stride: 32,
+  });
+  assert.equal(clamped2.executed, 2);
+  assert.deepEqual(pass.calls, [
+    ['drawIndexedIndirect', 0],
+    ['drawIndexedIndirect', 32],
+  ]);
+
+  // With clampToBuffer: false, overflowing count is rejected atomically (0 calls)
+  pass.calls.length = 0;
+  const rejectedOob = executeIndirectDrawIndexed(pass, indirectBuf(83), 0, {
+    count: 3,
+    stride: 32,
+    clampToBuffer: false,
+  });
+  assert.equal(rejectedOob.ok, false);
+  assert.equal(rejectedOob.executed, 0);
+  assert.equal(rejectedOob.reason, 'OUT_OF_BOUNDS');
+  assert.equal(pass.calls.length, 0);
+
+  // Even slot 0 OOB -> skipped cleanly even when clampToBuffer is true
+  const slot0Oob = executeIndirectDraw(pass, indirectBuf(12), 0, { count: 4 });
+  assert.equal(slot0Oob.ok, false);
+  assert.equal(slot0Oob.executed, 0);
+  assert.equal(slot0Oob.reason, 'OUT_OF_BOUNDS');
+  assert.equal(pass.calls.length, 0);
+
+  // Misaligned argOffset / bad stride / destroyed buffer / batch limit rejected without pass calls
+  const mis = executeIndirectDraw(pass, indirectBuf(256), 2, { count: 3 });
+  assert.equal(mis.ok, false);
+  assert.equal(mis.reason, 'MISALIGNED_OFFSET');
+
+  const badStride = executeIndirectDraw(pass, indirectBuf(256), 0, { count: 3, stride: 18 });
+  assert.equal(badStride.ok, false);
+  assert.equal(badStride.reason, 'INVALID_STRIDE');
+
+  const dest = executeIndirectDispatch(pass, { usage: BUFFER_USAGE.INDIRECT, size: 128, destroyed: true }, 0, { count: 2 });
+  assert.equal(dest.ok, false);
+  assert.equal(dest.reason, 'DESTROYED_BUFFER');
+
+  const batchRej = executeIndirectDraw(pass, indirectBuf(1024), 0, {
+    count: 10,
+    maxIndirectBatchCount: 4,
+    clampBatch: false,
+  });
+  assert.equal(batchRej.ok, false);
+  assert.equal(batchRej.reason, 'BATCH_LIMIT_EXCEEDED');
+  assert.equal(pass.calls.length, 0);
+
+  // Strict mode throws on invalid args
+  assert.throws(
+    () => executeIndirect(pass, INDIRECT_KIND.DRAW, indirectBuf(64), 2, { count: 2, strict: true }),
+    (e) => e instanceof IndirectDrawError && e.code === 'MISALIGNED_OFFSET'
+  );
+  assert.throws(
+    () => executeIndirect(pass, INDIRECT_KIND.DRAW, indirectBuf(64), 0, { count: 1, strict: true, bufferSize: 8 }),
+    (e) => e instanceof IndirectDrawError && e.code === 'OUT_OF_BOUNDS'
+  );
+
+  // Verify stats: 2 clamped batches + 8 skipped/rejected invalid calls = 10
+  const s = getStats();
+  assert.equal(s.indirectIndexedDraws, 5);
+  assert.equal(s.batchClampedCount, 2);
+  assert.equal(s.clampedOrSkippedInvalid, 10);
+  assert.equal(s.maxMultiDrawCount, 3);
+});
+
+test('W205: encodeMultiDraw / encodeMultiDispatchIndirect clampToBuffer & skipInvalid + IndirectArgsBuffer.executeDraws', () => {
+  resetStats();
+  const pass = createMockPass(true);
+
+  // encodeMultiDraw with clampToBuffer clamps 6 requested 16B draws in a 52B buffer to 3 (0, 16, 32; 48+16>52)
+  const md = encodeMultiDraw(pass, indirectBuf(52), {
+    count: 6,
+    clampToBuffer: true,
+    useNative: true,
+  });
+  assert.deepEqual(md, { calls: 1, draws: 3, skipped: 3, native: true });
+  assert.deepEqual(pass.calls, [['multiDrawIndirect', 0, 3]]);
+
+  // encodeMultiDraw with skipInvalid skips misaligned offset without throwing
+  pass.calls.length = 0;
+  const mdSkip = encodeMultiDraw(pass, indirectBuf(128), {
+    count: 3,
+    baseOffset: 2,
+    skipInvalid: true,
+  });
+  assert.deepEqual(mdSkip, { calls: 0, draws: 0, skipped: 3, native: false });
+  assert.equal(pass.calls.length, 0);
+
+  // encodeMultiDispatchIndirect with clampToBuffer clamps 5 dispatches (12B) in 40B buffer to 3
+  const mdisp = encodeMultiDispatchIndirect(pass, indirectBuf(40), {
+    count: 5,
+    clampToBuffer: true,
+  });
+  assert.deepEqual(mdisp, { calls: 3, dispatches: 3, skipped: 2, clamped: true });
+  assert.deepEqual(pass.calls, [
+    ['dispatchWorkgroupsIndirect', 0],
+    ['dispatchWorkgroupsIndirect', 12],
+    ['dispatchWorkgroupsIndirect', 24],
+  ]);
+
+  // IndirectArgsBuffer.executeDraws tracks per-instance W205 telemetry
+  pass.calls.length = 0;
+  const { device } = createMockDevice();
+  const args = new IndirectArgsBuffer({ device, capacity: 4 });
+  args.allocate(rec(10));
+  args.allocate(rec(20));
+  args.allocate(rec(30));
+  const execRes = args.executeDraws(pass, { count: 6 }); // buffer capacity is 4 slots (80B) -> clamps to 4
+  assert.equal(execRes.ok, true);
+  assert.equal(execRes.executed, 4);
+  assert.equal(execRes.clamped, true);
+  assert.equal(execRes.reason, 'CLAMPED_TO_BUFFER');
+  assert.equal(pass.calls.length, 4);
+
+  const bufStats = args.getStats();
+  assert.equal(bufStats.indirectIndexedDraws, 4);
+  assert.equal(bufStats.clampedOrSkippedInvalid, 1);
+  assert.equal(bufStats.maxMultiDrawCount, 4);
+
+  // Classic Worker global export exposes all new W205 helpers
+  assert.equal(globalThis.PlayGta6IndirectDraw.executeIndirect, executeIndirect);
+  assert.equal(globalThis.PlayGta6IndirectDraw.executeIndirectDraw, executeIndirectDraw);
+  assert.equal(globalThis.PlayGta6IndirectDraw.executeIndirectDrawIndexed, executeIndirectDrawIndexed);
+  assert.equal(globalThis.PlayGta6IndirectDraw.executeIndirectDispatch, executeIndirectDispatch);
+  assert.equal(globalThis.PlayGta6IndirectDraw.isValidIndirectRange, isValidIndirectRange);
+  assert.equal(globalThis.PlayGta6IndirectDraw.checkIndirectRange, checkIndirectRange);
+  assert.equal(globalThis.PlayGta6IndirectDraw.computeIndirectBatchStepPlan, computeIndirectBatchStepPlan);
 });
