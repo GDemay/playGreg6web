@@ -74,6 +74,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Since #1246: audio: ISpatialAudioObject::SetVolume, non-zero title buffer count (#1278); native tooling: shared object cache across checkouts, run_native_boot hints and `--thumbnails` (#1254, #1251, #1255); lifter speedups: truncating imul as plain mul, callee-observable flag stores only, IR guards for hot paths (#1252, #1316, #1337); boot report: per-present samples without GPU capture (#1248).
   - Since #1378: XMem write tracking for physical-page views cuts render-thread compare from 46% to <0.5% and raises presents from 7 to 12/s (#1375); XApu decodes Opus stream packets and posts type-3 results (#1378); setvbuf guest buffer handled (#1384).
   - Since #1387: boot report gets an audio section (#1389); menu-flow-3 gets past the TERMS OF SERVICE screen (#1403); XGameSave slot 16 (CreateContainer) on the local provider (#1412).
+  - Since #1415: lifter keeps registers a direct callee never touches out of the state (#1430) and skips flags overwritten before any reader (#1436); audio report counts spatial passes in non_silent_fraction (#1433), XApu codec census and per-type command counters (#1444); XGameSave slot 15 truthful E_NOTIMPL with file-backed container info (#1435); guest sync: uncontended CS/SRW fast paths and spin-before-park (#1441), per-object dispatcher locks and FIFO wait-block handoff (#1455); R51 overflow test fixed after PE parser hardening (#1443); `--host-input` feeds real XInput pad and keyboard into GameInput (#1456); native build compiles the harness with /MP and drops IR of cache hits (#1458); GPU flush hashes relocated ranges in place, copies only on change (#1461).
 - [x] **R41 — Boot Report Comparison Tool: Diff Two Native Boot Runs (`tools/compare_boot_reports.py`)** — `DONE` (PR #672, closes #670)
   - Structured diff of two boot reports (milestones, imports, address space, stop, counters, captures) with a pass/fail verdict and noise tolerances.
 - [x] **R42 — Boot Report: Milestone Import Indices, Per-Present Samples and Per-Thread Import Counts in the JSON** — `DONE` (PR #679, closes #673) *(R41 follow-up)*
@@ -154,6 +155,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Reproduce the intermittent heap-corruption failure deterministically, decide whether the defect is in the runtime or the test, fix by cause and add a reliable regression test.
 - [x] **O33 — Fast Path for Guest Indirect Calls: Measure and Cut the Cost of `__playgta6_indirect_call` (`runtime/guest`)** — `DONE` (PRs #692, #697, closes #666)
   - Measure the lookup's share of frame time on the real boot and add a semantics-preserving per-thread cache for both dispatch modes.
+  - Since #1415: XMem per-page write-tracking locks replace the single global mutex (#1445).
 - [x] **O34 — Local XGameSave Provider Backed by /userdata (`runtime/os`, xgameruntime)** — `DONE` (PR #685, closes #667)
   - Implement provider init, containers and blobs on a configurable host directory mapped to the browser's /userdata; cloud sync reported unavailable.
 - [x] **O35 — Full Sanitizer Sweep of the Runtime Suites (ASan, UBSan, TSan) and Fix What It Finds** — `DONE` (PR #701, closes #669)
@@ -166,6 +168,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Lifted window stores and runtime copy helpers set per-slot dirty bits so the GPU shadow flush compares only written slots in the browser.
   - Landed with O36: window write marks, atomics target feature, translated-window placement of physical-page reservations, and flushing CPU-visible buffers from the write marks.
   - Since #1246: CPU-visible buffer shadow comparison split across helper threads (#1256).
+  - Since #1415: `?opfsL2=0` bypasses the OPFS hot-file cache (#1427); faster wasm64 release build defaults (#1437).
 
 ---
 
@@ -249,6 +252,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Landed: table slots the root signature does not declare are joined (console stages read tables as memory), A8_UNORM held as rgba8unorm with the value in alpha (glyph atlas), sRGB/linear viewFormats siblings and `--watch-gpu-va`.
   - Since #1351: CB-indexed bindless join landed (#1383); contract on #482.
   - Since #1387: lane-indexed heap windows parsed with join-skip counts (#1394); Bridge ABI binding arrays for lane-indexed heap bindings, off by default (#1413).
+  - Since #1415: writable bindings joined over declared CBV table slots as UAVs (#1438).
 - [x] **G64 — Upload Every Mip and Array Slice of Console-Layout Textures, Including Linear Multi-Mip Chains (`runtime/gpu`)** — `DONE` (PR #676, closes #665) *(G49 follow-up)*
   - Upload all mips and slices through the dirty-tracked path with GFX10 placement; model linear multi-mip chains from measured footprints.
 - [x] **G65 — One Linear Layout Rule for Allocation Size, XG Layout and Upload (`runtime/gpu`, XG)** — `DONE` (PR #689, closes #678) *(G64 follow-up)*
@@ -259,6 +263,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Capture tooling: `replay_capture.py` with thinned uploads and an end-to-end test, lazy GPU object creation.
   - Since #1351: 32-bit heap offset wrap fixed (#1352).
   - Since #1387: replay_capture auto-trims traces too large for the browser (#1393).
+  - Since #1415: storage views convert through an intermediate when the declared format differs (#1416), also for fragment-stage storage textures (#1429) and vertex/mixed stages (#1434); band-wise atlas uploads, trim keeps unrewritten texture writes (#1432); widen reflected dword vertex fetches over adjacent elements, glyph fix (#1446); cheaper per-draw bind group tracking, reuse counters in the boot report (#1448).
 
 ---
 
