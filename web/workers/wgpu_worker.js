@@ -3109,6 +3109,20 @@ class WgpuCommandProcessor {
           device: this.device,
           presenter: this.binkPresenter,
         };
+        if (this._binkPresenterOptions) {
+          if (
+            bridgeOpts.chromaOrder === undefined &&
+            this._binkPresenterOptions.chromaOrder !== undefined
+          ) {
+            bridgeOpts.chromaOrder = this._binkPresenterOptions.chromaOrder;
+          }
+          if (
+            bridgeOpts.loadOp === undefined &&
+            this._binkPresenterOptions.loadOp !== undefined
+          ) {
+            bridgeOpts.loadOp = this._binkPresenterOptions.loadOp;
+          }
+        }
         const userOnFirstPresent =
           typeof bridgeOpts.onFirstPresent === 'function' ? bridgeOpts.onFirstPresent : null;
         bridgeOpts.onFirstPresent = (info) => {
@@ -3340,14 +3354,19 @@ class WgpuCommandProcessor {
         const activePresenter =
           presenter ||
           (typeof bridge._ensurePresenter === 'function' ? bridge._ensurePresenter(this.device) : null);
-        if (activePresenter) {
-          if (
-            requestedChromaOrder !== null &&
-            typeof activePresenter.setChromaOrder === 'function'
-          ) {
+        if (requestedChromaOrder !== null) {
+          if (typeof bridge.setChromaOrder === 'function') {
+            bridge.setChromaOrder(requestedChromaOrder);
+          }
+          if (activePresenter && typeof activePresenter.setChromaOrder === 'function') {
             activePresenter.setChromaOrder(requestedChromaOrder);
           }
-          if (requestedLoadOp !== null && typeof activePresenter.setLoadOp === 'function') {
+        }
+        if (requestedLoadOp !== null) {
+          if (typeof bridge.setLoadOp === 'function') {
+            bridge.setLoadOp(requestedLoadOp);
+          }
+          if (activePresenter && typeof activePresenter.setLoadOp === 'function') {
             activePresenter.setLoadOp(requestedLoadOp);
           }
         }
@@ -3359,6 +3378,7 @@ class WgpuCommandProcessor {
           if (framePayload.height !== undefined) extOpts.height = framePayload.height;
           if (framePayload.timestampMs !== undefined) extOpts.timestampMs = framePayload.timestampMs;
           if (framePayload.frameIndex !== undefined) extOpts.frameIndex = framePayload.frameIndex;
+          if (requestedLoadOp !== null) extOpts.loadOp = requestedLoadOp;
           pushed = bridge.pushExternalImage(externalImage, extOpts);
         } else if (isDiagnostic) {
           const diagW =
@@ -3369,9 +3389,11 @@ class WgpuCommandProcessor {
             typeof framePayload.height === 'number' && framePayload.height > 0
               ? Math.floor(framePayload.height)
               : targetHeight;
-          pushed = bridge.pushDiagnosticFrame(diagW, diagH, framePayload.frameIndex, {
+          const diagOpts = {
             timestampMs: framePayload.timestampMs,
-          });
+          };
+          if (requestedLoadOp !== null) diagOpts.loadOp = requestedLoadOp;
+          pushed = bridge.pushDiagnosticFrame(diagW, diagH, framePayload.frameIndex, diagOpts);
         } else {
           const format = normalizeSplashPixelFormat(framePayload.format, framePayload);
           const rawPlanes =
@@ -3415,6 +3437,12 @@ class WgpuCommandProcessor {
               u: rawPlanes.u !== undefined ? rawPlanes.u : framePayload.u,
               v: rawPlanes.v !== undefined ? rawPlanes.v : framePayload.v,
             };
+            if (planes.u === undefined && (rawPlanes.cr !== undefined || framePayload.cr !== undefined)) {
+              planes.cr = rawPlanes.cr !== undefined ? rawPlanes.cr : framePayload.cr;
+            }
+            if (planes.v === undefined && (rawPlanes.cb !== undefined || framePayload.cb !== undefined)) {
+              planes.cb = rawPlanes.cb !== undefined ? rawPlanes.cb : framePayload.cb;
+            }
             if (format === 'yuva420p') {
               planes.a = rawPlanes.a !== undefined ? rawPlanes.a : framePayload.a;
             }
@@ -3432,6 +3460,12 @@ class WgpuCommandProcessor {
           if (requestedColorRange !== undefined) {
             rawFrameDesc.colorRange = requestedColorRange;
           }
+          if (requestedChromaOrder !== null) {
+            rawFrameDesc.chromaOrder = requestedChromaOrder;
+          }
+          if (requestedLoadOp !== null) {
+            rawFrameDesc.loadOp = requestedLoadOp;
+          }
           if (framePayload.yStride !== undefined) {
             rawFrameDesc.yStride = framePayload.yStride;
           }
@@ -3443,6 +3477,9 @@ class WgpuCommandProcessor {
           }
           if (framePayload.strideBytes !== undefined) {
             rawFrameDesc.strideBytes = framePayload.strideBytes;
+          }
+          if (framePayload.zeroCopy !== undefined) {
+            rawFrameDesc.zeroCopy = framePayload.zeroCopy;
           }
           pushed = bridge.pushRawFrame(rawFrameDesc);
         }
