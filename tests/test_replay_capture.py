@@ -430,5 +430,25 @@ class TestSanitizedJsonAndCliExitCodes(unittest.TestCase):
         self.assertIn("frames_within_30fps_budget=1/1", out)
 
 
+class ResolveTrimTests(unittest.TestCase):
+    MB = 1048576
+
+    def test_small_trace_untouched(self):
+        self.assertEqual(replay_capture.resolve_trim(100 * self.MB, 0, 3), (0, 3, False))
+
+    def test_large_trace_auto_trims(self):
+        self.assertEqual(replay_capture.resolve_trim(2000 * self.MB, 0, 3), (100, 12, True))
+        self.assertEqual(replay_capture.resolve_trim(2000 * self.MB, 0, 20), (100, 20, True))
+
+    def test_threshold_boundary_and_override(self):
+        self.assertEqual(replay_capture.resolve_trim(1536 * self.MB, 0, 3)[2], False)
+        self.assertEqual(replay_capture.resolve_trim(1536 * self.MB + 1, 0, 3)[2], True)
+        self.assertEqual(replay_capture.resolve_trim(100 * self.MB, 0, 3, max_trace_mb=50)[2], True)
+
+    def test_disabled_and_explicit(self):
+        self.assertEqual(replay_capture.resolve_trim(5000 * self.MB, 0, 3, max_trace_mb=0), (0, 3, False))
+        self.assertEqual(replay_capture.resolve_trim(5000 * self.MB, 50, 5), (50, 5, False))
+
+
 if __name__ == "__main__":
     unittest.main()
