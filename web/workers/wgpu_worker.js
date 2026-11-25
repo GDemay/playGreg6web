@@ -172,7 +172,7 @@ const WGSL_GROUP0_RE = /@group\(\s*0\s*\)/;
 const SWAPCHAIN_PROBE_DEFAULT_INTERVAL_MS = 250;
 const SWAPCHAIN_PROBE_STRIP_MAX_WIDTH = 64;
 const SWAPCHAIN_PROBE_BYTES_PER_ROW = 256;
-const SWAPCHAIN_PROBE_DEFAULT_LUMA_THRESHOLD = 8;
+const SWAPCHAIN_PROBE_DEFAULT_LUMA_THRESHOLD = 12;
 const SWAPCHAIN_PROBE_STRIPS = Object.freeze([
   Object.freeze({ yFraction: 0.2, xFraction: 0.5 }),
   Object.freeze({ yFraction: 0.5, xFraction: 0.5 }),
@@ -224,7 +224,13 @@ function configureSwapchainWithCopySrc(targetSwapchain, config) {
   const usageSpec = resolveSwapchainCopySrcUsage();
   if (!usageSpec || (config && config.usage !== undefined)) {
     targetSwapchain.configure(config);
-    return { copySrcEnabled: false };
+    const hasCopySrc = Boolean(
+      usageSpec &&
+        config &&
+        typeof config.usage === 'number' &&
+        (config.usage & usageSpec.withCopySrc) === usageSpec.withCopySrc
+    );
+    return { copySrcEnabled: hasCopySrc };
   }
   try {
     targetSwapchain.configure({ ...config, usage: usageSpec.withCopySrc });
@@ -5173,6 +5179,32 @@ class WgpuCommandProcessor {
           const blackLoadingMs = Math.max(0, visibleTs - firstPresentMs);
           this._firstVisibleFrameMs = visibleTs;
           this._blackLoadingMs = blackLoadingMs;
+          // W348: Confirm visible content on the attached swapchain now that GPU readback
+          // verified non-black pixels, keeping swapchain telemetry aligned with the probe.
+          if (this._swapchain && !this._swapchain.isDestroyed) {
+            if (typeof this._swapchain.confirmVisibleFrame === 'function') {
+              try {
+                this._swapchain.confirmVisibleFrame({
+                  timestampMs: visibleTs,
+                  realPackDraws: probeTarget.realPackDrawsThisFrame,
+                });
+              } catch (_) {
+                // Swapchain telemetry must never break frame presentation.
+              }
+            } else if (typeof this._swapchain.markFrameContent === 'function') {
+              try {
+                this._swapchain.markFrameContent({
+                  hasVisibleContent: true,
+                  hasDraws: true,
+                  nonClearDraw: true,
+                  realPackDraws: probeTarget.realPackDrawsThisFrame,
+                  timestampMs: visibleTs,
+                });
+              } catch (_) {
+                // Ignore custom mock swapchain errors.
+              }
+            }
+          }
           this._notifyFirstVisibleFrame({
             type: 'first-visible-frame',
             firstVisibleFrame: true,
@@ -9677,10 +9709,18 @@ class WgpuCommandProcessor {
       return cachedFrameSummary;
     };
 
-    // W338: While waiting for first-visible-frame on a real WebGPU device with COPY_SRC
+    // W338 / W348: While waiting for first-visible-frame on a real WebGPU device with COPY_SRC
     // swapchain readback support, encode 4 small horizontal strip copies before encoder.finish()
     // (throttled to >= 250 ms and strictly non-overlapping; zero work once first-visible-frame fires).
-    let swapchainProbeActive = false;
+    // Once swapchain probe capability is established on this device (`_swapchainProbeSupported === true`),
+    // keep `swapchainProbeActive = true` for EVERY frame (including clear-only frames, throttled frames,
+    // frames while a readback is in flight, and transient resize frames) so nothing can fall through to
+    // the unverified fallback path until real non-black pixels are read back.
+    let swapchainProbeActive = Boolean(
+      !this._firstVisibleFrameNotified &&
+        this._requireNonBlackFrameExplicit !== false &&
+        this._swapchainProbeSupported === true
+    );
     let pendingSwapchainProbe = null;
     if (
       !this._firstVisibleFrameNotified &&
@@ -9694,7 +9734,7 @@ class WgpuCommandProcessor {
         this._realPackDrawCount > 0 ||
         preSummary.realPackDrawsThisFrame > 0 ||
         preSummary.hasNonClearDraw;
-      if (hasDrawCandidate) {
+      if (swapchainProbeActive || hasDrawCandidate) {
         const probeCap = this._resolveSwapchainProbeCapability(encoder, canvasTexture);
         if (probeCap !== null) {
           swapchainProbeActive = true;
@@ -9815,6 +9855,44 @@ class WgpuCommandProcessor {
       const summary = ensureFrameDrawSummary();
       presentIsIdleFrame = summary.drawsThisFrame === 0;
 
+      // W348: While a non-black pixel gate is active (async swapchain luminance probe OR
+      // explicit requireNonBlackFrame), NEVER mark activeSwapchain as having visible content
+      // on an unverified / black frame. Doing so would leak hasVisibleContent=true and
+      // visiblePresentsTotal>0 into swapchain stats & gpu-telemetry and let
+      // swapchainReportedFirstVisible bypass the pixel probe.
+      const pixelGateActive =
+        !this._firstVisibleFrameNotified &&
+        (swapchainProbeActive || this._requireNonBlackFrame);
+
+      let syncGate = null;
+      let syncVisibleConfirmed = false;
+      if (pixelGateActive) {
+        const shouldEvalSyncGate =
+          this._pendingFrameLuminance !== null ||
+          this._nonBlackPixelProbe !== null ||
+          (this._requireNonBlackFrame && summary.hasNonClearDraw);
+        if (shouldEvalSyncGate) {
+          syncGate = this._evaluateCommandBufferNonBlackGate(
+            null,
+            activeSwapchain,
+            curWidth,
+            curHeight,
+            summary
+          );
+          if (syncGate.evaluated) {
+            this._lastSampledMaxLuma = Math.max(
+              0,
+              Math.min(255, Math.floor(syncGate.maxLuma || 0))
+            );
+            syncVisibleConfirmed = syncGate.visible === true;
+          }
+        }
+      }
+
+      const swapchainFrameVisible = pixelGateActive
+        ? syncVisibleConfirmed
+        : summary.hasNonClearDraw;
+
       let swapchainReportedFirstVisible = false;
       let markResult = null;
       if (activeSwapchain && typeof activeSwapchain.markFrameContent === 'function') {
@@ -9824,12 +9902,12 @@ class WgpuCommandProcessor {
         );
         try {
           markResult = activeSwapchain.markFrameContent({
-            hasNonClearDraw: summary.hasNonClearDraw,
-            nonClearDraw: summary.hasNonClearDraw,
-            hasVisibleContent: summary.hasNonClearDraw,
-            hasDraws: summary.hasNonClearDraw,
-            realPackDraws: summary.realPackDrawsThisFrame,
-            fallbackDraws: summary.fallbackDrawsThisFrame,
+            hasNonClearDraw: swapchainFrameVisible,
+            nonClearDraw: swapchainFrameVisible,
+            hasVisibleContent: swapchainFrameVisible,
+            hasDraws: swapchainFrameVisible,
+            realPackDraws: swapchainFrameVisible ? summary.realPackDrawsThisFrame : 0,
+            fallbackDraws: swapchainFrameVisible ? summary.fallbackDrawsThisFrame : 0,
             drawsThisFrame: summary.drawsThisFrame,
             timestampMs: presentTs,
           });
@@ -9843,20 +9921,22 @@ class WgpuCommandProcessor {
             // Swapchain telemetry must never break frame presentation.
           }
         }
-        const nextSwapVisible = Boolean(
-          activeSwapchain.hasFirstVisibleFrame === true ||
-            activeSwapchain.hasVisibleContent === true
-        );
-        if (
-          (!prevSwapVisible && nextSwapVisible) ||
-          (markResult &&
-            typeof markResult === 'object' &&
-            (markResult.firstVisible === true ||
-              markResult.firstVisibleFrame === true ||
-              markResult.isFirstVisibleFrame === true ||
-              markResult.hasFirstVisibleFrame === true))
-        ) {
-          swapchainReportedFirstVisible = true;
+        if (!pixelGateActive) {
+          const nextSwapVisible = Boolean(
+            activeSwapchain.hasFirstVisibleFrame === true ||
+              activeSwapchain.hasVisibleContent === true
+          );
+          if (
+            (!prevSwapVisible && nextSwapVisible) ||
+            (markResult &&
+              typeof markResult === 'object' &&
+              (markResult.firstVisible === true ||
+                markResult.firstVisibleFrame === true ||
+                markResult.isFirstVisibleFrame === true ||
+                markResult.hasFirstVisibleFrame === true))
+          ) {
+            swapchainReportedFirstVisible = true;
+          }
         }
       } else if (activeSwapchain && typeof activeSwapchain.recordFramePresented === 'function') {
         try {
@@ -9866,105 +9946,76 @@ class WgpuCommandProcessor {
         }
       }
 
-      if (swapchainProbeActive && !this._firstVisibleFrameNotified) {
-        let syncEmitted = false;
-        if (this._pendingFrameLuminance !== null || this._nonBlackPixelProbe !== null) {
-          const gate = this._evaluateCommandBufferNonBlackGate(
-            markResult,
-            activeSwapchain,
-            curWidth,
-            curHeight,
-            summary
-          );
-          if (gate.evaluated) {
-            this._lastSampledMaxLuma = Math.max(0, Math.min(255, Math.floor(gate.maxLuma || 0)));
-            if (gate.visible) {
-              const firstPresentMs =
-                this._firstPresentMs !== null ? this._firstPresentMs : presentTs;
-              const blackLoadingMs = Math.max(0, presentTs - firstPresentMs);
-              this._firstVisibleFrameMs = presentTs;
-              this._blackLoadingMs = blackLoadingMs;
-              this._notifyFirstVisibleFrame({
-                type: 'first-visible-frame',
-                firstVisibleFrame: true,
-                firstVisibleFrameMs: presentTs,
-                firstPresentMs,
-                blackLoadingMs,
-                presentCount: this._presentCount,
-                realPackDrawsThisFrame: summary.realPackDrawsThisFrame,
-                fallbackDrawsThisFrame: summary.fallbackDrawsThisFrame,
-                drawsThisFrame: summary.drawsThisFrame,
-                maxLuma: this._lastSampledMaxLuma,
-                suppressedBlackFrames: this._suppressedBlackFrames,
-                gpuAdapter: this._gpuAdapter ? { ...this._gpuAdapter } : null,
-              });
-              syncEmitted = true;
-            } else {
-              this._suppressedBlackFrames += 1;
-            }
-          }
-        }
-        if (!syncEmitted && !this._firstVisibleFrameNotified && pendingSwapchainProbe !== null) {
-          this._startSwapchainProbeReadback(pendingSwapchainProbe);
-        }
-      } else if (
-        (summary.hasNonClearDraw || swapchainReportedFirstVisible) &&
-        !this._firstVisibleFrameNotified
-      ) {
-        let allowVisibleEmit = true;
-        let sampledMaxLuma = null;
-        if (this._requireNonBlackFrame) {
-          const gate = this._evaluateCommandBufferNonBlackGate(
-            markResult,
-            activeSwapchain,
-            curWidth,
-            curHeight,
-            summary
-          );
-          if (gate.evaluated) {
-            this._lastSampledMaxLuma = Math.max(0, Math.min(255, Math.floor(gate.maxLuma || 0)));
-            sampledMaxLuma = this._lastSampledMaxLuma;
-          }
-          if (!gate.visible) {
-            allowVisibleEmit = false;
-            this._suppressedBlackFrames += 1;
-          }
-        }
-        if (allowVisibleEmit) {
-          const firstVisibleFrameMs =
-            activeSwapchain &&
-            typeof activeSwapchain.firstVisibleFrameMs === 'number' &&
-            Number.isFinite(activeSwapchain.firstVisibleFrameMs)
-              ? activeSwapchain.firstVisibleFrameMs
-              : activeSwapchain &&
-                  typeof activeSwapchain.firstVisiblePresentMs === 'number' &&
-                  Number.isFinite(activeSwapchain.firstVisiblePresentMs)
-                ? activeSwapchain.firstVisiblePresentMs
-                : presentTs;
+      if (pixelGateActive && !this._firstVisibleFrameNotified) {
+        if (syncVisibleConfirmed) {
           const firstPresentMs =
-            this._firstPresentMs !== null ? this._firstPresentMs : firstVisibleFrameMs;
-          const blackLoadingMs = Math.max(0, firstVisibleFrameMs - firstPresentMs);
-          this._firstVisibleFrameMs = firstVisibleFrameMs;
+            this._firstPresentMs !== null ? this._firstPresentMs : presentTs;
+          const blackLoadingMs = Math.max(0, presentTs - firstPresentMs);
+          this._firstVisibleFrameMs = presentTs;
           this._blackLoadingMs = blackLoadingMs;
-          const visiblePayload = {
+          this._notifyFirstVisibleFrame({
             type: 'first-visible-frame',
             firstVisibleFrame: true,
-            firstVisibleFrameMs,
+            firstVisibleFrameMs: presentTs,
             firstPresentMs,
             blackLoadingMs,
             presentCount: this._presentCount,
             realPackDrawsThisFrame: summary.realPackDrawsThisFrame,
             fallbackDrawsThisFrame: summary.fallbackDrawsThisFrame,
             drawsThisFrame: summary.drawsThisFrame,
+            maxLuma: this._lastSampledMaxLuma,
+            suppressedBlackFrames: this._suppressedBlackFrames,
             gpuAdapter: this._gpuAdapter ? { ...this._gpuAdapter } : null,
-          };
-          if (this._requireNonBlackFrame) {
-            visiblePayload.maxLuma =
-              sampledMaxLuma !== null ? sampledMaxLuma : this._lastSampledMaxLuma;
-            visiblePayload.suppressedBlackFrames = this._suppressedBlackFrames;
+          });
+        } else {
+          if (syncGate && syncGate.evaluated && !syncGate.visible) {
+            this._suppressedBlackFrames += 1;
+          } else if (
+            !swapchainProbeActive &&
+            this._requireNonBlackFrame &&
+            summary.hasNonClearDraw
+          ) {
+            this._suppressedBlackFrames += 1;
           }
-          this._notifyFirstVisibleFrame(visiblePayload);
+          if (
+            swapchainProbeActive &&
+            !this._firstVisibleFrameNotified &&
+            pendingSwapchainProbe !== null
+          ) {
+            this._startSwapchainProbeReadback(pendingSwapchainProbe);
+          }
         }
+      } else if (
+        (summary.hasNonClearDraw || swapchainReportedFirstVisible) &&
+        !this._firstVisibleFrameNotified
+      ) {
+        const firstVisibleFrameMs =
+          activeSwapchain &&
+          typeof activeSwapchain.firstVisibleFrameMs === 'number' &&
+          Number.isFinite(activeSwapchain.firstVisibleFrameMs)
+            ? activeSwapchain.firstVisibleFrameMs
+            : activeSwapchain &&
+                typeof activeSwapchain.firstVisiblePresentMs === 'number' &&
+                Number.isFinite(activeSwapchain.firstVisiblePresentMs)
+              ? activeSwapchain.firstVisiblePresentMs
+              : presentTs;
+        const firstPresentMs =
+          this._firstPresentMs !== null ? this._firstPresentMs : firstVisibleFrameMs;
+        const blackLoadingMs = Math.max(0, firstVisibleFrameMs - firstPresentMs);
+        this._firstVisibleFrameMs = firstVisibleFrameMs;
+        this._blackLoadingMs = blackLoadingMs;
+        this._notifyFirstVisibleFrame({
+          type: 'first-visible-frame',
+          firstVisibleFrame: true,
+          firstVisibleFrameMs,
+          firstPresentMs,
+          blackLoadingMs,
+          presentCount: this._presentCount,
+          realPackDrawsThisFrame: summary.realPackDrawsThisFrame,
+          fallbackDrawsThisFrame: summary.fallbackDrawsThisFrame,
+          drawsThisFrame: summary.drawsThisFrame,
+          gpuAdapter: this._gpuAdapter ? { ...this._gpuAdapter } : null,
+        });
       }
 
       if (
@@ -10500,6 +10551,20 @@ class WgpuCommandProcessor {
       } catch (_) {
         swapchain = null;
       }
+    }
+    if (
+      swapchain &&
+      typeof swapchain === 'object' &&
+      !this._firstVisibleFrameNotified &&
+      (this._swapchainProbeSupported === true || this._requireNonBlackFrame)
+    ) {
+      swapchain = {
+        ...swapchain,
+        hasVisibleContent: false,
+        firstVisiblePresentIndex: null,
+        firstVisiblePresentMs: null,
+        visiblePresentsTotal: 0,
+      };
     }
     const texturePacketsExt = this._getTexturePacketsExtension();
     let texturePackets = null;
