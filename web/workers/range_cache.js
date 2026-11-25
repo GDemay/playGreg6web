@@ -12,6 +12,8 @@ const DEFAULT_COALESCE_MAX_GAP_BYTES = 64 * 1024; // 64 KiB
 const DEFAULT_COALESCE_MAX_MERGED_BYTES = 2 * 1024 * 1024; // 2 MiB
 const DEFAULT_MAX_READ_AHEAD_BYTES = 2 * 1024 * 1024; // 2 MiB
 const DEFAULT_SEQUENTIAL_STREAK_THRESHOLD = 2;
+const DEFAULT_MAX_PENDING_OPFS_WRITES = 64;
+const DEFAULT_MAX_OPFS_WRITE_CONCURRENCY = 4;
 const ESTIMATED_HTTP_RANGE_OVERHEAD_BYTES = 256;
 const MIN_AUTO_OPTIMIZE_CHUNK_SIZE = 16 * 1024; // 16 KiB
 const MIN_AUTO_OPTIMIZE_CACHE_BYTES = 1024 * 1024; // 1 MiB
@@ -95,10 +97,79 @@ function fnv1a64Hex(str) {
   );
 }
 
-function opfsChunkFileName(relPath, chunkIndex, chunkSize) {
+function buildFileFingerprint(sizeOrMeta, etag = null) {
+  if (sizeOrMeta === null || sizeOrMeta === undefined) {
+    if (typeof etag === 'string' && etag.trim().length > 0) {
+      return `e_${fnv1a64Hex(etag.trim()).slice(0, 16)}`;
+    }
+    return null;
+  }
+  if (typeof sizeOrMeta === 'string') {
+    const trimmed = sizeOrMeta.trim();
+    if (!trimmed) return null;
+    if (/^[0-9a-zA-Z_-]{1,64}$/.test(trimmed)) {
+      return trimmed;
+    }
+    return `h_${fnv1a64Hex(trimmed).slice(0, 16)}`;
+  }
+
+  let size = null;
+  let tag = etag;
+  if (typeof sizeOrMeta === 'object') {
+    if (typeof sizeOrMeta.fileFingerprint === 'string' && sizeOrMeta.fileFingerprint.trim()) {
+      return buildFileFingerprint(sizeOrMeta.fileFingerprint);
+    }
+    if (sizeOrMeta.fileSize !== undefined) {
+      size = sizeOrMeta.fileSize;
+    } else if (sizeOrMeta.size !== undefined) {
+      size = sizeOrMeta.size;
+    }
+    if (tag === null && sizeOrMeta.etag !== undefined) {
+      tag = sizeOrMeta.etag;
+    }
+  } else {
+    size = sizeOrMeta;
+  }
+
+  const validSize = Number.isSafeInteger(size) && size >= 0 ? size : null;
+  const validTag = typeof tag === 'string' && tag.trim().length > 0 ? tag.trim() : null;
+
+  if (validSize !== null && validTag !== null) {
+    return `${validSize}_${fnv1a64Hex(validTag).slice(0, 16)}`;
+  }
+  if (validSize !== null) {
+    return `${validSize}`;
+  }
+  if (validTag !== null) {
+    return `e_${fnv1a64Hex(validTag).slice(0, 16)}`;
+  }
+  return null;
+}
+
+function readResponseHeader(headers, name) {
+  if (!headers) return null;
+  if (typeof headers.get === 'function') {
+    return headers.get(name) || headers.get(name.toLowerCase()) || null;
+  }
+  if (typeof headers === 'object') {
+    return headers[name] || headers[name.toLowerCase()] || null;
+  }
+  return null;
+}
+
+function opfsChunkFilePrefix(relPath, chunkIndex, chunkSize) {
   const encoded = utf8ToHex(relPath);
   const pathToken = encoded.length <= 128 ? encoded : `${encoded.slice(0, 64)}_${fnv1a64Hex(relPath)}`;
-  return `c_${chunkSize}_${chunkIndex}_${pathToken}.bin`;
+  return `c_${chunkSize}_${chunkIndex}_${pathToken}`;
+}
+
+function opfsChunkFileName(relPath, chunkIndex, chunkSize, fileFingerprint = null) {
+  const prefix = opfsChunkFilePrefix(relPath, chunkIndex, chunkSize);
+  const fp = buildFileFingerprint(fileFingerprint);
+  if (fp) {
+    return `${prefix}_fp_${fp}.bin`;
+  }
+  return `${prefix}.bin`;
 }
 
 function parseContentRange(header) {
@@ -398,6 +469,16 @@ class RangeCache {
         : DEFAULT_PREFETCH_CONCURRENCY;
     this.fetchImpl = options.fetchImpl || (typeof fetch === 'function' ? fetch.bind(globalThis) : null);
     this.opfsDir = options.opfsDir || null;
+    this.opfsCache = options.opfsCache || null;
+    this.backgroundOpfsWrites = options.backgroundOpfsWrites !== false;
+    this.maxPendingOpfsWrites =
+      Number.isInteger(options.maxPendingOpfsWrites) && options.maxPendingOpfsWrites > 0
+        ? options.maxPendingOpfsWrites
+        : DEFAULT_MAX_PENDING_OPFS_WRITES;
+    this.maxOpfsWriteConcurrency =
+      Number.isInteger(options.maxOpfsWriteConcurrency) && options.maxOpfsWriteConcurrency > 0
+        ? options.maxOpfsWriteConcurrency
+        : DEFAULT_MAX_OPFS_WRITE_CONCURRENCY;
 
     this.coalesceMaxGapBytes =
       Number.isFinite(options.coalesceMaxGapBytes) && options.coalesceMaxGapBytes >= 0
@@ -450,9 +531,16 @@ class RangeCache {
     }
 
     this._memCache = new Map();
+    this._memChunkFingerprints = new Map();
     this._inFlight = new Map();
     this._opfsEntries = new Map();
     this._keyToOpfsFile = new Map();
+    this._fileFingerprints = new Map();
+    this._observedHttpMeta = new Map();
+    this._opfsWriteQueue = new Map();
+    this._activeOpfsWrites = new Set();
+    this._opfsWriteWaiters = [];
+    this._quotaEvictChain = Promise.resolve();
     this._expectedChunkLengths = new Map();
     this._fileSizes = new Map();
     this._seqTrackers = new Map();
@@ -465,6 +553,10 @@ class RangeCache {
       hits: 0,
       misses: 0,
       opfsHits: 0,
+      opfsMisses: 0,
+      opfsWrites: 0,
+      opfsWriteErrors: 0,
+      opfsStaleInvalidations: 0,
       evictions: 0,
       quotaEvictions: 0,
       quotaRetrySuccesses: 0,
@@ -475,6 +567,16 @@ class RangeCache {
       prefetchBytes: 0,
       bytesSavedByCoalescing: 0,
     };
+
+    if (options.fileFingerprints instanceof Map) {
+      for (const [p, fp] of options.fileFingerprints.entries()) {
+        this.setFileFingerprint(p, fp);
+      }
+    } else if (options.fileFingerprints && typeof options.fileFingerprints === 'object') {
+      for (const [p, fp] of Object.entries(options.fileFingerprints)) {
+        this.setFileFingerprint(p, fp);
+      }
+    }
   }
 
   setOpfsDir(opfsDir) {
@@ -482,8 +584,109 @@ class RangeCache {
     if (nextDir !== this.opfsDir) {
       this._opfsEntries.clear();
       this._keyToOpfsFile.clear();
+      this._opfsWriteQueue.clear();
     }
     this.opfsDir = nextDir;
+  }
+
+  setOpfsCache(opfsCache) {
+    const nextCache = opfsCache || null;
+    if (nextCache !== this.opfsCache) {
+      this._opfsWriteQueue.clear();
+    }
+    this.opfsCache = nextCache;
+  }
+
+  setFileFingerprint(relPath, fingerprintOrMeta) {
+    const cleanPath = normalizeRelPath(relPath);
+    const nextFp = buildFileFingerprint(fingerprintOrMeta);
+    const prevFp = this._fileFingerprints.get(cleanPath) || null;
+    if (nextFp === null) {
+      this._fileFingerprints.delete(cleanPath);
+    } else {
+      this._fileFingerprints.set(cleanPath, nextFp);
+    }
+    if (prevFp !== null && prevFp !== nextFp) {
+      this._evictPathFromMemory(cleanPath);
+    }
+    return nextFp;
+  }
+
+  getFileFingerprint(relPath) {
+    let cleanPath;
+    try {
+      cleanPath = normalizeRelPath(relPath);
+    } catch {
+      return null;
+    }
+    return this._fileFingerprints.get(cleanPath) || null;
+  }
+
+  clearFileFingerprint(relPath) {
+    let cleanPath;
+    try {
+      cleanPath = normalizeRelPath(relPath);
+    } catch {
+      return false;
+    }
+    return this._fileFingerprints.delete(cleanPath);
+  }
+
+  _resolveEffectiveFingerprint(relPath, overrideFingerprint = undefined) {
+    if (overrideFingerprint !== undefined && overrideFingerprint !== null) {
+      return buildFileFingerprint(overrideFingerprint);
+    }
+    return this._fileFingerprints.get(relPath) || null;
+  }
+
+  _evictPathFromMemory(relPath) {
+    const prefix = `${relPath}::`;
+    for (const [key, bytes] of Array.from(this._memCache.entries())) {
+      if (key.startsWith(prefix)) {
+        this._memCache.delete(key);
+        this._memChunkFingerprints.delete(key);
+        this._prefetchedKeys.delete(key);
+        this._opfsWriteQueue.delete(key);
+        if (bytes && Number.isFinite(bytes.byteLength)) {
+          this._bytesCached = Math.max(0, this._bytesCached - bytes.byteLength);
+        }
+      }
+    }
+    for (const key of Array.from(this._expectedChunkLengths.keys())) {
+      if (key.startsWith(prefix)) {
+        this._expectedChunkLengths.delete(key);
+      }
+    }
+    this._fileSizes.delete(relPath);
+  }
+
+  _recordObservedHttpMeta(relPath, totalSize, etag) {
+    const validSize = Number.isSafeInteger(totalSize) && totalSize >= 0 ? totalSize : null;
+    const validTag = typeof etag === 'string' && etag.trim().length > 0 ? etag.trim() : null;
+    if (validSize === null && validTag === null) {
+      return;
+    }
+    const prev = this._observedHttpMeta.get(relPath) || null;
+    if (prev) {
+      const sizeChanged = validSize !== null && prev.totalSize !== null && validSize !== prev.totalSize;
+      const etagChanged = validTag !== null && prev.etag !== null && validTag !== prev.etag;
+      if (sizeChanged || etagChanged) {
+        this._evictPathFromMemory(relPath);
+        if (this._fileFingerprints.has(relPath)) {
+          const updatedFp = buildFileFingerprint(
+            validSize !== null ? validSize : prev.totalSize,
+            validTag !== null ? validTag : prev.etag,
+          );
+          if (updatedFp) {
+            this._fileFingerprints.set(relPath, updatedFp);
+          }
+        }
+      }
+    }
+    this._observedHttpMeta.set(relPath, {
+      totalSize: validSize !== null ? validSize : prev ? prev.totalSize : null,
+      etag: validTag !== null ? validTag : prev ? prev.etag : null,
+    });
   }
 
   _chunkKey(relPath, chunkIndex) {
@@ -577,7 +780,7 @@ class RangeCache {
     return bytes;
   }
 
-  _putMemory(key, bytes) {
+  _putMemory(key, bytes, fileFingerprint = null) {
     if (!(bytes instanceof Uint8Array)) return;
     if (this._memCache.has(key)) {
       const existing = this._memCache.get(key);
@@ -585,6 +788,7 @@ class RangeCache {
         this._bytesCached = Math.max(0, this._bytesCached - existing.byteLength);
       }
       this._memCache.delete(key);
+      this._memChunkFingerprints.delete(key);
     }
 
     if (this.maxBytes <= 0 || bytes.byteLength > this.maxBytes) {
@@ -595,6 +799,7 @@ class RangeCache {
       const oldestKey = this._memCache.keys().next().value;
       const oldestBytes = this._memCache.get(oldestKey);
       this._memCache.delete(oldestKey);
+      this._memChunkFingerprints.delete(oldestKey);
       this._prefetchedKeys.delete(oldestKey);
       if (oldestBytes && Number.isFinite(oldestBytes.byteLength)) {
         this._bytesCached = Math.max(0, this._bytesCached - oldestBytes.byteLength);
@@ -603,6 +808,11 @@ class RangeCache {
     }
 
     this._memCache.set(key, bytes);
+    if (fileFingerprint !== null && fileFingerprint !== undefined) {
+      this._memChunkFingerprints.set(key, fileFingerprint);
+    } else {
+      this._memChunkFingerprints.delete(key);
+    }
     this._bytesCached += bytes.byteLength;
   }
 
@@ -665,7 +875,93 @@ class RangeCache {
     return results;
   }
 
-  async _evictCorruptEntry(key, relPath, chunkIndex, countEviction = true) {
+  async _listOpfsEntryNames() {
+    if (!this.opfsDir) return [];
+    const names = [];
+    try {
+      if (typeof this.opfsDir.keys === 'function') {
+        for await (const name of this.opfsDir.keys()) {
+          if (typeof name === 'string') {
+            names.push(name);
+          }
+        }
+        return names;
+      }
+      if (typeof this.opfsDir.entries === 'function') {
+        for await (const pair of this.opfsDir.entries()) {
+          if (Array.isArray(pair) && typeof pair[0] === 'string') {
+            names.push(pair[0]);
+          }
+        }
+        return names;
+      }
+    } catch {
+      // Ignore directory enumeration failures.
+    }
+    return names;
+  }
+
+  async _invalidateStaleOpfsChunkEntries(relPath, chunkIndex, activeFileName) {
+    if (!this.opfsDir) return 0;
+    const prefix = opfsChunkFilePrefix(relPath, chunkIndex, this.chunkSize);
+    const legacyName = `${prefix}.bin`;
+    const fpPrefix = `${prefix}_fp_`;
+    const isStaleMatch = (name) =>
+      typeof name === 'string' &&
+      name !== activeFileName &&
+      (name === legacyName || (name.startsWith(fpPrefix) && name.endsWith('.bin')));
+
+    const staleNames = new Set();
+    for (const fileName of this._opfsEntries.keys()) {
+      if (isStaleMatch(fileName)) {
+        staleNames.add(fileName);
+      }
+    }
+
+    const dirNames = await this._listOpfsEntryNames();
+    for (let i = 0; i < dirNames.length; i += 1) {
+      if (isStaleMatch(dirNames[i])) {
+        staleNames.add(dirNames[i]);
+      }
+    }
+
+    // Fallback for minimal KV stores lacking keys()/entries(): probe legacy un-fingerprinted key.
+    if (
+      staleNames.size === 0 &&
+      dirNames.length === 0 &&
+      legacyName !== activeFileName &&
+      typeof this.opfsDir.get === 'function'
+    ) {
+      try {
+        const legacyVal = await this.opfsDir.get(legacyName);
+        if (legacyVal !== undefined && legacyVal !== null) {
+          staleNames.add(legacyName);
+        }
+      } catch {
+        // Ignore probe failures.
+      }
+    }
+
+    let invalidated = 0;
+    const key = this._chunkKey(relPath, chunkIndex);
+    for (const staleName of staleNames) {
+      this._opfsEntries.delete(staleName);
+      if (this._keyToOpfsFile.get(key) === staleName) {
+        this._keyToOpfsFile.delete(key);
+      }
+      const deleted = await this._deleteOpfsFile(staleName);
+      if (deleted) {
+        invalidated += 1;
+      }
+    }
+
+    if (invalidated > 0) {
+      this._stats.opfsStaleInvalidations += invalidated;
+    }
+    return invalidated;
+  }
+
+  async _evictCorruptEntry(key, relPath, chunkIndex, countEviction = true, fileFingerprint = null) {
     if (this._memCache.has(key)) {
       const existing = this._memCache.get(key);
       this._memCache.delete(key);
@@ -673,14 +969,34 @@ class RangeCache {
         this._bytesCached = Math.max(0, this._bytesCached - existing.byteLength);
       }
     }
+    this._memChunkFingerprints.delete(key);
     this._prefetchedKeys.delete(key);
-    const fileName = opfsChunkFileName(relPath, chunkIndex, this.chunkSize);
+    this._opfsWriteQueue.delete(key);
+    const fp = this._resolveEffectiveFingerprint(relPath, fileFingerprint);
+    if (this.opfsCache && typeof this.opfsCache.delete === 'function') {
+      try {
+        await this.opfsCache.delete(opfsChunkFileName(relPath, chunkIndex, this.chunkSize));
+      } catch {
+        // Ignore backing store delete errors.
+      }
+    }
+    const fileName = opfsChunkFileName(relPath, chunkIndex, this.chunkSize, fp);
     this._opfsEntries.delete(fileName);
     this._keyToOpfsFile.delete(key);
     await this._deleteOpfsFile(fileName);
     if (countEviction) {
       this._stats.corruptEvictions += 1;
     }
+  }
+
+  async _evictForQuotaSerialized(excludeKey, excludeFileName, targetBytes) {
+    const run = async () => this._evictForQuota(excludeKey, excludeFileName, targetBytes);
+    const next = this._quotaEvictChain.then(run, run);
+    this._quotaEvictChain = next.then(
+      () => {},
+      () => {},
+    );
+    return next;
   }
 
   async _evictForQuota(excludeKey, excludeFileName, targetBytes) {
@@ -740,52 +1056,88 @@ class RangeCache {
     return { freedBytes, evictedEntries };
   }
 
-  async _readOpfsDetailed(relPath, chunkIndex) {
-    if (!this.opfsDir) return { bytes: null, corrupt: false };
-    const fileName = opfsChunkFileName(relPath, chunkIndex, this.chunkSize);
+  async _readOpfsDetailed(relPath, chunkIndex, fileFingerprint = null) {
+    if (!this.opfsDir && !this.opfsCache) {
+      return { bytes: null, corrupt: false, staleInvalidated: false, checkedOpfs: false, fileName: null };
+    }
+    const fp = this._resolveEffectiveFingerprint(relPath, fileFingerprint);
+
+    if (this.opfsCache && typeof this.opfsCache.getEntry === 'function') {
+      const baseKey = opfsChunkFileName(relPath, chunkIndex, this.chunkSize);
+      try {
+        const entry = await this.opfsCache.getEntry(baseKey, fp ? { fileFingerprint: fp } : {});
+        if (!entry || entry.supported === false) {
+          return { bytes: null, corrupt: false, staleInvalidated: false, checkedOpfs: false, fileName: baseKey };
+        }
+        if (entry.hit && entry.data instanceof Uint8Array) {
+          return { bytes: entry.data, corrupt: false, staleInvalidated: false, checkedOpfs: true, fileName: baseKey };
+        }
+        if (entry.invalidated) {
+          this._stats.opfsStaleInvalidations += 1;
+          return { bytes: null, corrupt: false, staleInvalidated: true, checkedOpfs: true, fileName: baseKey };
+        }
+        return { bytes: null, corrupt: false, staleInvalidated: false, checkedOpfs: true, fileName: baseKey };
+      } catch {
+        return { bytes: null, corrupt: true, staleInvalidated: false, checkedOpfs: true, fileName: baseKey };
+      }
+    }
+
+    const fileName = opfsChunkFileName(relPath, chunkIndex, this.chunkSize, fp);
     if (typeof this.opfsDir.getFileHandle === 'function') {
       let handle;
       try {
         handle = await this.opfsDir.getFileHandle(fileName, { create: false });
       } catch (err) {
         if (isNotFoundError(err)) {
-          return { bytes: null, corrupt: false };
+          let staleInvalidated = false;
+          if (fp !== null) {
+            staleInvalidated = (await this._invalidateStaleOpfsChunkEntries(relPath, chunkIndex, fileName)) > 0;
+          }
+          return { bytes: null, corrupt: false, staleInvalidated, checkedOpfs: true, fileName };
         }
-        return { bytes: null, corrupt: true };
+        return { bytes: null, corrupt: true, staleInvalidated: false, checkedOpfs: true, fileName };
       }
       try {
         const file = await handle.getFile();
         const buf = await file.arrayBuffer();
-        return { bytes: new Uint8Array(buf), corrupt: false };
+        return { bytes: new Uint8Array(buf), corrupt: false, staleInvalidated: false, checkedOpfs: true, fileName };
       } catch {
-        return { bytes: null, corrupt: true };
+        return { bytes: null, corrupt: true, staleInvalidated: false, checkedOpfs: true, fileName };
       }
     }
     if (typeof this.opfsDir.get === 'function') {
       try {
         const val = await this.opfsDir.get(fileName);
         if (val === undefined || val === null) {
-          return { bytes: null, corrupt: false };
+          let staleInvalidated = false;
+          if (fp !== null) {
+            staleInvalidated = (await this._invalidateStaleOpfsChunkEntries(relPath, chunkIndex, fileName)) > 0;
+          }
+          return { bytes: null, corrupt: false, staleInvalidated, checkedOpfs: true, fileName };
         }
         if (val instanceof Uint8Array) {
-          return { bytes: val.slice(), corrupt: false };
+          return { bytes: val.slice(), corrupt: false, staleInvalidated: false, checkedOpfs: true, fileName };
         }
         if (val instanceof ArrayBuffer) {
-          return { bytes: new Uint8Array(val.slice(0)), corrupt: false };
+          return { bytes: new Uint8Array(val.slice(0)), corrupt: false, staleInvalidated: false, checkedOpfs: true, fileName };
         }
-        return { bytes: null, corrupt: true };
+        return { bytes: null, corrupt: true, staleInvalidated: false, checkedOpfs: true, fileName };
       } catch (err) {
         if (isNotFoundError(err)) {
-          return { bytes: null, corrupt: false };
+          let staleInvalidated = false;
+          if (fp !== null) {
+            staleInvalidated = (await this._invalidateStaleOpfsChunkEntries(relPath, chunkIndex, fileName)) > 0;
+          }
+          return { bytes: null, corrupt: false, staleInvalidated, checkedOpfs: true, fileName };
         }
-        return { bytes: null, corrupt: true };
+        return { bytes: null, corrupt: true, staleInvalidated: false, checkedOpfs: true, fileName };
       }
     }
-    return { bytes: null, corrupt: false };
+    return { bytes: null, corrupt: false, staleInvalidated: false, checkedOpfs: false, fileName };
   }
 
-  async _readOpfs(relPath, chunkIndex) {
-    const res = await this._readOpfsDetailed(relPath, chunkIndex);
+  async _readOpfs(relPath, chunkIndex, fileFingerprint = null) {
+    const res = await this._readOpfsDetailed(relPath, chunkIndex, fileFingerprint);
     return res.bytes;
   }
 
@@ -829,17 +1181,38 @@ class RangeCache {
     return false;
   }
 
-  async _writeOpfs(relPath, chunkIndex, bytes) {
-    if (!this.opfsDir || !(bytes instanceof Uint8Array) || bytes.byteLength === 0) {
+  async _writeOpfs(relPath, chunkIndex, bytes, fileFingerprint = null) {
+    if ((!this.opfsDir && !this.opfsCache) || !(bytes instanceof Uint8Array) || bytes.byteLength === 0) {
       return false;
     }
     const key = this._chunkKey(relPath, chunkIndex);
-    const fileName = opfsChunkFileName(relPath, chunkIndex, this.chunkSize);
+    const fp = this._resolveEffectiveFingerprint(relPath, fileFingerprint);
+
+    if (this.opfsCache && typeof this.opfsCache.put === 'function') {
+      const baseKey = opfsChunkFileName(relPath, chunkIndex, this.chunkSize);
+      try {
+        const res = await this.opfsCache.put(baseKey, bytes, fp ? { fileFingerprint: fp } : {});
+        if (res && res.stored) {
+          this._stats.opfsWrites += 1;
+          return true;
+        }
+        this._stats.opfsWriteErrors += 1;
+        return false;
+      } catch {
+        this._stats.opfsWriteErrors += 1;
+        return false;
+      }
+    }
+
+    const fileName = opfsChunkFileName(relPath, chunkIndex, this.chunkSize, fp);
 
     try {
       const wrote = await this._writeOpfsOnce(fileName, bytes);
       if (wrote) {
         this._recordOpfsEntry(fileName, key, relPath, chunkIndex, bytes.byteLength);
+        this._stats.opfsWrites += 1;
+      } else {
+        this._stats.opfsWriteErrors += 1;
       }
       return wrote;
     } catch (err) {
@@ -852,19 +1225,23 @@ class RangeCache {
 
       if (!isQuotaExceededError(err)) {
         // Ignore non-quota OPFS write failures and continue memory-only.
+        this._stats.opfsWriteErrors += 1;
         return false;
       }
 
       // QuotaExceededError: evict oldest entries until freeing at least
       // max(entryBytes, ceil(maxBytes * 0.25)) (or all evictable entries), then retry ONCE.
       const targetBytes = Math.max(bytes.byteLength, Math.ceil(this.maxBytes * 0.25));
-      await this._evictForQuota(key, fileName, targetBytes);
+      await this._evictForQuotaSerialized(key, fileName, targetBytes);
 
       try {
         const retryWrote = await this._writeOpfsOnce(fileName, bytes);
         if (retryWrote) {
           this._recordOpfsEntry(fileName, key, relPath, chunkIndex, bytes.byteLength);
           this._stats.quotaRetrySuccesses += 1;
+          this._stats.opfsWrites += 1;
+        } else {
+          this._stats.opfsWriteErrors += 1;
         }
         return retryWrote;
       } catch {
@@ -874,8 +1251,76 @@ class RangeCache {
           this._keyToOpfsFile.delete(key);
         }
         await this._deleteOpfsFile(fileName);
+        this._stats.opfsWriteErrors += 1;
         return false;
       }
+    }
+  }
+
+  _enqueueOpfsWrite(relPath, chunkIndex, bytes, fileFingerprint = null) {
+    if ((!this.opfsDir && !this.opfsCache) || !(bytes instanceof Uint8Array) || bytes.byteLength === 0) {
+      return;
+    }
+    const key = this._chunkKey(relPath, chunkIndex);
+    const fp = this._resolveEffectiveFingerprint(relPath, fileFingerprint);
+    if (this._opfsWriteQueue.has(key)) {
+      this._opfsWriteQueue.delete(key);
+    } else {
+      while (this._opfsWriteQueue.size >= this.maxPendingOpfsWrites) {
+        const oldestKey = this._opfsWriteQueue.keys().next().value;
+        if (oldestKey === undefined) break;
+        this._opfsWriteQueue.delete(oldestKey);
+      }
+    }
+    this._opfsWriteQueue.set(key, { relPath, chunkIndex, bytes, fileFingerprint: fp });
+    this._pumpOpfsWriteQueue();
+  }
+
+  _pumpOpfsWriteQueue() {
+    while (
+      this._activeOpfsWrites.size < this.maxOpfsWriteConcurrency &&
+      this._opfsWriteQueue.size > 0
+    ) {
+      const nextEntry = this._opfsWriteQueue.entries().next().value;
+      if (!nextEntry) break;
+      const [key, task] = nextEntry;
+      this._opfsWriteQueue.delete(key);
+
+      const writePromise = (async () => {
+        try {
+          await this._writeOpfs(task.relPath, task.chunkIndex, task.bytes, task.fileFingerprint);
+        } catch {
+          this._stats.opfsWriteErrors += 1;
+        }
+      })();
+
+      this._activeOpfsWrites.add(writePromise);
+      writePromise.finally(() => {
+        this._activeOpfsWrites.delete(writePromise);
+        this._pumpOpfsWriteQueue();
+        if (this._activeOpfsWrites.size === 0 && this._opfsWriteQueue.size === 0) {
+          const waiters = this._opfsWriteWaiters.splice(0, this._opfsWriteWaiters.length);
+          for (let i = 0; i < waiters.length; i += 1) {
+            waiters[i]();
+          }
+        }
+      });
+    }
+  }
+
+  async flushOpfsWrites() {
+    while (this._activeOpfsWrites.size > 0 || this._opfsWriteQueue.size > 0) {
+      this._pumpOpfsWriteQueue();
+      await new Promise((resolve) => {
+        if (this._activeOpfsWrites.size === 0 && this._opfsWriteQueue.size === 0) {
+          resolve();
+          return;
+        }
+        this._opfsWriteWaiters.push(resolve);
+      });
+    }
+    if (this.opfsCache && typeof this.opfsCache.flushBackgroundWrites === 'function') {
+      await this.opfsCache.flushBackgroundWrites();
     }
   }
 
@@ -908,16 +1353,17 @@ class RangeCache {
     }
 
     const raw = new Uint8Array(await res.arrayBuffer());
+    const etagHeader = readResponseHeader(res.headers, 'ETag');
 
     if (res.status === 206) {
-      const contentRangeHeader =
-        res.headers && typeof res.headers.get === 'function'
-          ? res.headers.get('Content-Range') || res.headers.get('content-range')
-          : null;
+      const contentRangeHeader = readResponseHeader(res.headers, 'Content-Range');
       const parsed = parseContentRange(contentRangeHeader);
       if (parsed) {
         if (Number.isSafeInteger(parsed.total) && parsed.total >= 0) {
+          this._recordObservedHttpMeta(relPath, parsed.total, etagHeader);
           this._recordFileSize(relPath, parsed.total);
+        } else if (etagHeader) {
+          this._recordObservedHttpMeta(relPath, null, etagHeader);
         }
         const expectedLen = parsed.end - parsed.start + 1;
         const relOffset = chunkStart >= parsed.start ? chunkStart - parsed.start : 0;
@@ -928,6 +1374,9 @@ class RangeCache {
         const sliceLen = Math.min(this.chunkSize, available - relOffset);
         return raw.slice(relOffset, relOffset + sliceLen);
       }
+      if (etagHeader) {
+        this._recordObservedHttpMeta(relPath, null, etagHeader);
+      }
       if (raw.byteLength <= this.chunkSize) {
         return raw;
       }
@@ -935,6 +1384,7 @@ class RangeCache {
     }
 
     // 200 OK fallback (server returned full resource instead of 206 Partial Content).
+    this._recordObservedHttpMeta(relPath, raw.byteLength, etagHeader);
     this._recordFileSize(relPath, raw.byteLength);
     if (chunkStart >= raw.byteLength) {
       return new Uint8Array(0);
@@ -990,6 +1440,7 @@ class RangeCache {
     }
 
     const raw = new Uint8Array(await res.arrayBuffer());
+    const etagHeader = readResponseHeader(res.headers, 'ETag');
 
     let actualStart = runStart;
     let actualEnd = raw.byteLength > 0 ? runStart + raw.byteLength - 1 : runStart - 1;
@@ -997,10 +1448,7 @@ class RangeCache {
     let reachedEof = false;
 
     if (res.status === 206) {
-      const contentRangeHeader =
-        res.headers && typeof res.headers.get === 'function'
-          ? res.headers.get('Content-Range') || res.headers.get('content-range')
-          : null;
+      const contentRangeHeader = readResponseHeader(res.headers, 'Content-Range');
       const parsed = parseContentRange(contentRangeHeader);
       if (parsed) {
         actualStart = parsed.start;
@@ -1008,15 +1456,21 @@ class RangeCache {
         const usableLen = Math.min(raw.byteLength, headerSpan);
         actualEnd = usableLen > 0 ? actualStart + usableLen - 1 : actualStart - 1;
         if (Number.isSafeInteger(parsed.total) && parsed.total >= 0) {
+          this._recordObservedHttpMeta(relPath, parsed.total, etagHeader);
           this._recordFileSize(relPath, parsed.total);
           knownTotal = parsed.total;
           if (actualEnd + 1 >= parsed.total) {
             reachedEof = true;
           }
+        } else if (etagHeader) {
+          this._recordObservedHttpMeta(relPath, null, etagHeader);
         }
+      } else if (etagHeader) {
+        this._recordObservedHttpMeta(relPath, null, etagHeader);
       }
     } else {
       // 200 OK fallback (server returned full resource instead of 206 Partial Content).
+      this._recordObservedHttpMeta(relPath, raw.byteLength, etagHeader);
       this._recordFileSize(relPath, raw.byteLength);
       knownTotal = raw.byteLength;
       actualStart = 0;
@@ -1107,24 +1561,35 @@ class RangeCache {
   async _getChunk(relPath, chunkIndex, requiredEndInChunk = 0, options = {}) {
     const isPrefetch = Boolean(options.isPrefetch);
     const countMiss = options.countMiss !== false;
+    const fp = this._resolveEffectiveFingerprint(relPath, options.fileFingerprint);
     const key = this._chunkKey(relPath, chunkIndex);
     let suspectByteLength = null;
 
     const memHit = this._touchMemory(key);
     if (memHit !== null) {
-      const verdict = this._validateCachedChunk(key, relPath, chunkIndex, memHit, requiredEndInChunk);
-      if (verdict === 'valid') {
-        if (!isPrefetch) {
-          this._stats.hits += 1;
-          this._consumePrefetchHit(key);
+      const memFp = this._memChunkFingerprints.get(key) || null;
+      if (fp !== null && memFp !== fp) {
+        this._memCache.delete(key);
+        this._memChunkFingerprints.delete(key);
+        this._prefetchedKeys.delete(key);
+        if (Number.isFinite(memHit.byteLength)) {
+          this._bytesCached = Math.max(0, this._bytesCached - memHit.byteLength);
         }
-        return memHit;
-      }
-      if (verdict === 'corrupt') {
-        await this._evictCorruptEntry(key, relPath, chunkIndex, true);
       } else {
-        suspectByteLength = memHit.byteLength;
-        await this._evictCorruptEntry(key, relPath, chunkIndex, false);
+        const verdict = this._validateCachedChunk(key, relPath, chunkIndex, memHit, requiredEndInChunk);
+        if (verdict === 'valid') {
+          if (!isPrefetch) {
+            this._stats.hits += 1;
+            this._consumePrefetchHit(key);
+          }
+          return memHit;
+        }
+        if (verdict === 'corrupt') {
+          await this._evictCorruptEntry(key, relPath, chunkIndex, true, fp);
+        } else {
+          suspectByteLength = memHit.byteLength;
+          await this._evictCorruptEntry(key, relPath, chunkIndex, false, fp);
+        }
       }
     }
 
@@ -1150,10 +1615,10 @@ class RangeCache {
         return inflightBytes;
       }
       if (verdict === 'corrupt') {
-        await this._evictCorruptEntry(key, relPath, chunkIndex, true);
+        await this._evictCorruptEntry(key, relPath, chunkIndex, true, fp);
       } else {
         suspectByteLength = inflightBytes.byteLength;
-        await this._evictCorruptEntry(key, relPath, chunkIndex, false);
+        await this._evictCorruptEntry(key, relPath, chunkIndex, false, fp);
       }
     }
 
@@ -1163,9 +1628,12 @@ class RangeCache {
 
     const loadPromise = (async () => {
       if (suspectByteLength === null) {
-        const opfsResult = await this._readOpfsDetailed(relPath, chunkIndex);
+        const opfsResult = await this._readOpfsDetailed(relPath, chunkIndex, fp);
         if (opfsResult.corrupt) {
-          await this._evictCorruptEntry(key, relPath, chunkIndex, true);
+          if (!isPrefetch && opfsResult.checkedOpfs) {
+            this._stats.opfsMisses += 1;
+          }
+          await this._evictCorruptEntry(key, relPath, chunkIndex, true, fp);
         } else if (opfsResult.bytes !== null) {
           const verdict = this._validateCachedChunk(
             key,
@@ -1175,24 +1643,29 @@ class RangeCache {
             requiredEndInChunk,
           );
           if (verdict === 'valid') {
-            const fileName = opfsChunkFileName(relPath, chunkIndex, this.chunkSize);
+            const fileName = opfsResult.fileName || opfsChunkFileName(relPath, chunkIndex, this.chunkSize, fp);
             this._recordOpfsEntry(fileName, key, relPath, chunkIndex, opfsResult.bytes.byteLength);
             if (!isPrefetch) {
               this._stats.opfsHits += 1;
               this._stats.hits += 1;
             }
-            this._putMemory(key, opfsResult.bytes);
+            this._putMemory(key, opfsResult.bytes, fp);
             if (isPrefetch && this._inFlightPrefetchKeys.has(key) && this._memCache.has(key)) {
               this._prefetchedKeys.add(key);
             }
             return opfsResult.bytes;
           }
+          if (!isPrefetch && opfsResult.checkedOpfs) {
+            this._stats.opfsMisses += 1;
+          }
           if (verdict === 'corrupt') {
-            await this._evictCorruptEntry(key, relPath, chunkIndex, true);
+            await this._evictCorruptEntry(key, relPath, chunkIndex, true, fp);
           } else {
             suspectByteLength = opfsResult.bytes.byteLength;
-            await this._evictCorruptEntry(key, relPath, chunkIndex, false);
+            await this._evictCorruptEntry(key, relPath, chunkIndex, false, fp);
           }
+        } else if (!isPrefetch && opfsResult.checkedOpfs) {
+          this._stats.opfsMisses += 1;
         }
       }
 
@@ -1204,15 +1677,20 @@ class RangeCache {
         this._stats.corruptEvictions += 1;
       }
       if (netBytes.byteLength > 0) {
+        const effectiveFp = this._resolveEffectiveFingerprint(relPath, options.fileFingerprint);
         this._recordExpectedChunkLength(key, netBytes.byteLength);
-        this._putMemory(key, netBytes);
+        this._putMemory(key, netBytes, effectiveFp);
         if (isPrefetch) {
           this._stats.prefetchBytes += netBytes.byteLength;
           if (this._inFlightPrefetchKeys.has(key) && this._memCache.has(key)) {
             this._prefetchedKeys.add(key);
           }
         }
-        await this._writeOpfs(relPath, chunkIndex, netBytes);
+        if (this.backgroundOpfsWrites) {
+          this._enqueueOpfsWrite(relPath, chunkIndex, netBytes, effectiveFp);
+        } else {
+          await this._writeOpfs(relPath, chunkIndex, netBytes, effectiveFp);
+        }
       }
       return netBytes;
     })();
@@ -1232,6 +1710,7 @@ class RangeCache {
     const isPrefetch = Boolean(options.isPrefetch);
     const countMiss = options.countMiss !== false;
     const countCoalesce = options.countCoalesce !== false;
+    const fp = this._resolveEffectiveFingerprint(relPath, options.fileFingerprint);
     const maxMergedBytes =
       Number.isFinite(options.maxMergedBytes) && options.maxMergedBytes > 0
         ? Math.floor(options.maxMergedBytes)
@@ -1253,26 +1732,36 @@ class RangeCache {
 
       const memHit = this._touchMemory(key);
       if (memHit !== null) {
-        const verdict = this._validateCachedChunk(
-          key,
-          relPath,
-          spec.chunkIndex,
-          memHit,
-          spec.requiredEndInChunk,
-        );
-        if (verdict === 'valid') {
-          if (!isPrefetch) {
-            this._stats.hits += 1;
-            this._consumePrefetchHit(key);
+        const memFp = this._memChunkFingerprints.get(key) || null;
+        if (fp !== null && memFp !== fp) {
+          this._memCache.delete(key);
+          this._memChunkFingerprints.delete(key);
+          this._prefetchedKeys.delete(key);
+          if (Number.isFinite(memHit.byteLength)) {
+            this._bytesCached = Math.max(0, this._bytesCached - memHit.byteLength);
           }
-          results[i] = memHit;
-          continue;
-        }
-        if (verdict === 'corrupt') {
-          await this._evictCorruptEntry(key, relPath, spec.chunkIndex, true);
         } else {
-          suspectByteLength = memHit.byteLength;
-          await this._evictCorruptEntry(key, relPath, spec.chunkIndex, false);
+          const verdict = this._validateCachedChunk(
+            key,
+            relPath,
+            spec.chunkIndex,
+            memHit,
+            spec.requiredEndInChunk,
+          );
+          if (verdict === 'valid') {
+            if (!isPrefetch) {
+              this._stats.hits += 1;
+              this._consumePrefetchHit(key);
+            }
+            results[i] = memHit;
+            continue;
+          }
+          if (verdict === 'corrupt') {
+            await this._evictCorruptEntry(key, relPath, spec.chunkIndex, true, fp);
+          } else {
+            suspectByteLength = memHit.byteLength;
+            await this._evictCorruptEntry(key, relPath, spec.chunkIndex, false, fp);
+          }
         }
       }
 
@@ -1325,17 +1814,20 @@ class RangeCache {
             return;
           }
           if (verdict === 'corrupt') {
-            await this._evictCorruptEntry(item.key, relPath, item.spec.chunkIndex, true);
+            await this._evictCorruptEntry(item.key, relPath, item.spec.chunkIndex, true, fp);
           } else {
             item.suspectByteLength = inflightBytes.byteLength;
-            await this._evictCorruptEntry(item.key, relPath, item.spec.chunkIndex, false);
+            await this._evictCorruptEntry(item.key, relPath, item.spec.chunkIndex, false, fp);
           }
         }
 
-        if (item.suspectByteLength === null && this.opfsDir) {
-          const opfsResult = await this._readOpfsDetailed(relPath, item.spec.chunkIndex);
+        if (item.suspectByteLength === null && (this.opfsDir || this.opfsCache)) {
+          const opfsResult = await this._readOpfsDetailed(relPath, item.spec.chunkIndex, fp);
           if (opfsResult.corrupt) {
-            await this._evictCorruptEntry(item.key, relPath, item.spec.chunkIndex, true);
+            if (!isPrefetch && opfsResult.checkedOpfs) {
+              this._stats.opfsMisses += 1;
+            }
+            await this._evictCorruptEntry(item.key, relPath, item.spec.chunkIndex, true, fp);
           } else if (opfsResult.bytes !== null) {
             const verdict = this._validateCachedChunk(
               item.key,
@@ -1345,7 +1837,8 @@ class RangeCache {
               item.spec.requiredEndInChunk,
             );
             if (verdict === 'valid') {
-              const fileName = opfsChunkFileName(relPath, item.spec.chunkIndex, this.chunkSize);
+              const fileName =
+                opfsResult.fileName || opfsChunkFileName(relPath, item.spec.chunkIndex, this.chunkSize, fp);
               this._recordOpfsEntry(
                 fileName,
                 item.key,
@@ -1357,19 +1850,24 @@ class RangeCache {
                 this._stats.opfsHits += 1;
                 this._stats.hits += 1;
               }
-              this._putMemory(item.key, opfsResult.bytes);
+              this._putMemory(item.key, opfsResult.bytes, fp);
               if (isPrefetch && this._memCache.has(item.key)) {
                 this._prefetchedKeys.add(item.key);
               }
               results[item.pos] = opfsResult.bytes;
               return;
             }
+            if (!isPrefetch && opfsResult.checkedOpfs) {
+              this._stats.opfsMisses += 1;
+            }
             if (verdict === 'corrupt') {
-              await this._evictCorruptEntry(item.key, relPath, item.spec.chunkIndex, true);
+              await this._evictCorruptEntry(item.key, relPath, item.spec.chunkIndex, true, fp);
             } else {
               item.suspectByteLength = opfsResult.bytes.byteLength;
-              await this._evictCorruptEntry(item.key, relPath, item.spec.chunkIndex, false);
+              await this._evictCorruptEntry(item.key, relPath, item.spec.chunkIndex, false, fp);
             }
+          } else if (!isPrefetch && opfsResult.checkedOpfs) {
+            this._stats.opfsMisses += 1;
           }
         }
 
@@ -1390,20 +1888,23 @@ class RangeCache {
       const item = missing[i];
       const memHit = this._touchMemory(item.key);
       if (memHit !== null && item.suspectByteLength === null) {
-        const verdict = this._validateCachedChunk(
-          item.key,
-          relPath,
-          item.spec.chunkIndex,
-          memHit,
-          item.spec.requiredEndInChunk,
-        );
-        if (verdict === 'valid') {
-          if (!isPrefetch) {
-            this._stats.hits += 1;
-            this._consumePrefetchHit(item.key);
+        const memFp = this._memChunkFingerprints.get(item.key) || null;
+        if (fp === null || memFp === fp) {
+          const verdict = this._validateCachedChunk(
+            item.key,
+            relPath,
+            item.spec.chunkIndex,
+            memHit,
+            item.spec.requiredEndInChunk,
+          );
+          if (verdict === 'valid') {
+            if (!isPrefetch) {
+              this._stats.hits += 1;
+              this._consumePrefetchHit(item.key);
+            }
+            results[item.pos] = memHit;
+            continue;
           }
-          results[item.pos] = memHit;
-          continue;
         }
       }
       const lateFlight = this._inFlight.get(item.key);
@@ -1452,15 +1953,20 @@ class RangeCache {
         this._stats.corruptEvictions += 1;
       }
       if (bytes.byteLength > 0) {
+        const effectiveFp = this._resolveEffectiveFingerprint(relPath, options.fileFingerprint);
         this._recordExpectedChunkLength(item.key, bytes.byteLength);
-        this._putMemory(item.key, bytes);
+        this._putMemory(item.key, bytes, effectiveFp);
         if (isPrefetch) {
           this._stats.prefetchBytes += bytes.byteLength;
           if (this._inFlightPrefetchKeys.has(item.key) && this._memCache.has(item.key)) {
             this._prefetchedKeys.add(item.key);
           }
         }
-        await this._writeOpfs(relPath, item.spec.chunkIndex, bytes);
+        if (this.backgroundOpfsWrites) {
+          this._enqueueOpfsWrite(relPath, item.spec.chunkIndex, bytes, effectiveFp);
+        } else {
+          await this._writeOpfs(relPath, item.spec.chunkIndex, bytes, effectiveFp);
+        }
       }
     };
 
@@ -1659,7 +2165,7 @@ class RangeCache {
     }
   }
 
-  async read(relPath, offset, length) {
+  async read(relPath, offset, length, options = {}) {
     const cleanPath = normalizeRelPath(relPath);
     if (!Number.isInteger(offset) || offset < 0) {
       throw new Error(`Invalid read offset: ${offset}`);
@@ -1670,6 +2176,10 @@ class RangeCache {
     if (length === 0) {
       return new Uint8Array(0);
     }
+
+    const readOpts = options && typeof options === 'object' ? options : {};
+    const fileFingerprint =
+      readOpts.fileFingerprint !== undefined ? readOpts.fileFingerprint : undefined;
 
     let effectiveLength = length;
     if (this._fileSizes.has(cleanPath)) {
@@ -1697,13 +2207,16 @@ class RangeCache {
         isPrefetch: false,
         countMiss: true,
         countCoalesce: true,
+        fileFingerprint,
       });
     } else {
       const chunkPromises = [];
       for (let idx = firstChunk; idx <= lastChunk; idx += 1) {
         const chunkStart = idx * this.chunkSize;
         const requiredEndInChunk = Math.min(this.chunkSize, offset + effectiveLength - chunkStart);
-        chunkPromises.push(this._getChunk(cleanPath, idx, requiredEndInChunk));
+        chunkPromises.push(
+          this._getChunk(cleanPath, idx, requiredEndInChunk, { fileFingerprint }),
+        );
       }
       chunks = await Promise.all(chunkPromises);
     }
@@ -1923,7 +2436,13 @@ class RangeCache {
       if (!Number.isInteger(length) || length < 0) {
         throw new Error(`Invalid read length: ${length}`);
       }
-      return { path: cleanPath, offset, length };
+      return {
+        path: cleanPath,
+        offset,
+        length,
+        fileFingerprint:
+          entry.fileFingerprint !== undefined ? entry.fileFingerprint : options.fileFingerprint,
+      };
     });
 
     const nonZero = validated.filter((r) => r.length > 0);
@@ -1957,6 +2476,7 @@ class RangeCache {
             countMiss: true,
             countCoalesce: span.mergedCount <= 1,
             maxMergedBytes,
+            fileFingerprint: options.fileFingerprint,
           });
         }
       };
@@ -1977,7 +2497,9 @@ class RangeCache {
         outputs[i] = new Uint8Array(0);
         continue;
       }
-      outputs[i] = await this.read(req.path, req.offset, req.length);
+      outputs[i] = await this.read(req.path, req.offset, req.length, {
+        fileFingerprint: req.fileFingerprint,
+      });
     }
     return outputs;
   }
@@ -2081,16 +2603,25 @@ class RangeCache {
 
   clear() {
     this._memCache.clear();
+    this._memChunkFingerprints.clear();
     this._seqTrackers.clear();
     this._prefetchedKeys.clear();
     this._bytesCached = 0;
   }
 
   getStats() {
+    const opfsLookups = this._stats.opfsHits + this._stats.opfsMisses;
+    const opfsHitRate =
+      opfsLookups > 0 ? Math.max(0, Math.min(1, this._stats.opfsHits / opfsLookups)) : 0;
     return {
       hits: this._stats.hits,
       misses: this._stats.misses,
       opfsHits: this._stats.opfsHits,
+      opfsMisses: this._stats.opfsMisses,
+      opfsWrites: this._stats.opfsWrites,
+      opfsWriteErrors: this._stats.opfsWriteErrors,
+      opfsStaleInvalidations: this._stats.opfsStaleInvalidations,
+      opfsHitRate,
       evictions: this._stats.evictions,
       quotaEvictions: this._stats.quotaEvictions,
       quotaRetrySuccesses: this._stats.quotaRetrySuccesses,
@@ -2115,7 +2646,10 @@ const exportedApi = {
   DEFAULT_COALESCE_MAX_MERGED_BYTES,
   DEFAULT_MAX_READ_AHEAD_BYTES,
   DEFAULT_SEQUENTIAL_STREAK_THRESHOLD,
+  DEFAULT_MAX_PENDING_OPFS_WRITES,
+  DEFAULT_MAX_OPFS_WRITE_CONCURRENCY,
   normalizeRelPath,
+  buildFileFingerprint,
   opfsChunkFileName,
   parseContentRange,
   openOpfsCacheDir,
