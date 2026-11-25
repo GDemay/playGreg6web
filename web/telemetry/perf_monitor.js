@@ -39,12 +39,12 @@ function percentileFromSorted(sorted, count, fraction) {
     return 0;
   }
   const idx = Math.min(count - 1, Math.max(0, Math.ceil(fraction * count) - 1));
-  return sorted[idx];
+  return sanitizeNonNegativeNumber(sorted[idx], 0);
 }
 
 /**
  * Rolling performance monitor aggregating:
- * - Frame pacing (FPS, avg/min/p95/p99/max frame time, jank frames) via fixed-capacity Float64Array ring
+ * - Frame pacing (FPS, 1% low FPS, avg/min/p50/p95/p99/max frame time, jank frames) via fixed-capacity Float64Array ring
  * - GPU worker batch throughput (packets/sec, draw calls/frame, cumulative packet/draw/compute/byte totals)
  * - HTTP Range / OPFS I/O streaming throughput (MB/s, cache hit ratio, memory & OPFS hit counts)
  * - AudioWorklet ring telemetry (buffered frames, underruns, underrun frames, active voices)
@@ -192,7 +192,8 @@ export class PerfMonitor {
    * @param {number} dtMs
    */
   _pushFrameDelta(dtMs) {
-    this._frameDeltas[this._frameWriteIdx] = dtMs;
+    const safeDtMs = sanitizeNonNegativeNumber(dtMs, 0);
+    this._frameDeltas[this._frameWriteIdx] = safeDtMs;
     this._frameWriteIdx += 1;
     if (this._frameWriteIdx === this._windowSize) {
       this._frameWriteIdx = 0;
@@ -200,7 +201,7 @@ export class PerfMonitor {
     if (this._frameCount < this._windowSize) {
       this._frameCount += 1;
     }
-    if (dtMs > this._jankThresholdMs) {
+    if (safeDtMs > this._jankThresholdMs) {
       this._jankFrames += 1;
     }
   }
@@ -246,7 +247,7 @@ export class PerfMonitor {
     let deltaMs = null;
     if (this._lastFrameTimestamp !== null) {
       const rawDelta = ts - this._lastFrameTimestamp;
-      deltaMs = rawDelta > 0 ? rawDelta : 0;
+      deltaMs = Number.isFinite(rawDelta) && rawDelta > 0 ? rawDelta : 0;
       this._pushFrameDelta(deltaMs);
     }
 
@@ -435,6 +436,7 @@ export class PerfMonitor {
     const count = this._frameCount;
     let avgFrameTimeMs = 0;
     let minFrameTimeMs = 0;
+    let p50FrameTimeMs = 0;
     let p95FrameTimeMs = 0;
     let p99FrameTimeMs = 0;
     let maxFrameTimeMs = 0;
@@ -443,7 +445,7 @@ export class PerfMonitor {
     if (count > 0) {
       let sum = 0;
       for (let i = 0; i < count; i += 1) {
-        const dt = this._frameDeltas[i];
+        const dt = sanitizeNonNegativeNumber(this._frameDeltas[i], 0);
         this._scratchSorted[i] = dt;
         sum += dt;
         if (dt > this._jankThresholdMs) {
@@ -454,14 +456,17 @@ export class PerfMonitor {
       const sorted = this._scratchSorted.subarray(0, count);
       sorted.sort();
 
-      avgFrameTimeMs = sum / count;
-      minFrameTimeMs = sorted[0];
+      avgFrameTimeMs = sanitizeNonNegativeNumber(sum / count, 0);
+      minFrameTimeMs = sanitizeNonNegativeNumber(sorted[0], 0);
+      p50FrameTimeMs = percentileFromSorted(sorted, count, 0.5);
       p95FrameTimeMs = percentileFromSorted(sorted, count, 0.95);
       p99FrameTimeMs = percentileFromSorted(sorted, count, 0.99);
-      maxFrameTimeMs = sorted[count - 1];
+      maxFrameTimeMs = sanitizeNonNegativeNumber(sorted[count - 1], 0);
     }
 
-    const fps = avgFrameTimeMs > 0 ? 1000 / avgFrameTimeMs : 0;
+    const fps = avgFrameTimeMs > 0 ? sanitizeNonNegativeNumber(1000 / avgFrameTimeMs, 0) : 0;
+    const onePercentLowFps =
+      p99FrameTimeMs > 0 ? sanitizeNonNegativeNumber(1000 / p99FrameTimeMs, 0) : 0;
 
     // Rolling GPU packet throughput & draw calls per frame.
     let gpuPacketsSum = 0;
@@ -516,13 +521,23 @@ export class PerfMonitor {
       jankThresholdMs: this._jankThresholdMs,
       frames: {
         fps,
+        onePercentLowFps,
+        fps1PctLow: onePercentLowFps,
         avgFrameTimeMs,
         minFrameTimeMs,
+        p50FrameTimeMs,
         p95FrameTimeMs,
         p99FrameTimeMs,
+        p50FrameMs: p50FrameTimeMs,
+        p95FrameMs: p95FrameTimeMs,
+        p99FrameMs: p99FrameTimeMs,
+        p50Ms: p50FrameTimeMs,
+        p95Ms: p95FrameTimeMs,
+        p99Ms: p99FrameTimeMs,
         maxFrameTimeMs,
         totalFrames: this._totalFrames,
         jankFrames: this._jankFrames,
+        jankFrameCount: this._jankFrames,
         windowJankFrames,
         sampleCount: count,
       },
@@ -554,6 +569,39 @@ export class PerfMonitor {
   }
 
   /**
+   * Returns a flat frame-pacing summary including rolling P50/P95/P99 frame times,
+   * average and 1% low FPS, and jank counters.
+   */
+  getSummary() {
+    const snap = this.getSnapshot();
+    return {
+      timestampMs: snap.timestampMs,
+      windowSize: snap.windowSize,
+      jankThresholdMs: snap.jankThresholdMs,
+      sampleCount: snap.frames.sampleCount,
+      totalFrames: snap.frames.totalFrames,
+      fps: snap.frames.fps,
+      onePercentLowFps: snap.frames.onePercentLowFps,
+      fps1PctLow: snap.frames.fps1PctLow,
+      avgFrameTimeMs: snap.frames.avgFrameTimeMs,
+      minFrameTimeMs: snap.frames.minFrameTimeMs,
+      p50FrameTimeMs: snap.frames.p50FrameTimeMs,
+      p95FrameTimeMs: snap.frames.p95FrameTimeMs,
+      p99FrameTimeMs: snap.frames.p99FrameTimeMs,
+      p50FrameMs: snap.frames.p50FrameMs,
+      p95FrameMs: snap.frames.p95FrameMs,
+      p99FrameMs: snap.frames.p99FrameMs,
+      p50Ms: snap.frames.p50Ms,
+      p95Ms: snap.frames.p95Ms,
+      p99Ms: snap.frames.p99Ms,
+      maxFrameTimeMs: snap.frames.maxFrameTimeMs,
+      jankFrames: snap.frames.jankFrames,
+      jankFrameCount: snap.frames.jankFrameCount,
+      windowJankFrames: snap.frames.windowJankFrames,
+    };
+  }
+
+  /**
    * Returns a flat metrics payload matching the `window.playgta6Hud.updateMetrics(...)`
    * contract in `web/index.html` without clobbering unrelated HUD fields
    * (`pointerLock`, `gamepad`, `status`).
@@ -562,16 +610,27 @@ export class PerfMonitor {
     const snap = this.getSnapshot();
     return {
       fps: snap.frames.fps,
+      onePercentLowFps: snap.frames.onePercentLowFps,
+      fps1PctLow: snap.frames.fps1PctLow,
       gpuPackets: snap.gpu.totalGpuPackets,
       opfsCacheHits: snap.io.opfsCacheHits,
       cacheHits: snap.io.cacheHits,
       avgFrameTimeMs: snap.frames.avgFrameTimeMs,
       minFrameTimeMs: snap.frames.minFrameTimeMs,
+      p50FrameTimeMs: snap.frames.p50FrameTimeMs,
       p95FrameTimeMs: snap.frames.p95FrameTimeMs,
       p99FrameTimeMs: snap.frames.p99FrameTimeMs,
+      p50FrameMs: snap.frames.p50FrameMs,
+      p95FrameMs: snap.frames.p95FrameMs,
+      p99FrameMs: snap.frames.p99FrameMs,
+      p50Ms: snap.frames.p50Ms,
+      p95Ms: snap.frames.p95Ms,
+      p99Ms: snap.frames.p99Ms,
       maxFrameTimeMs: snap.frames.maxFrameTimeMs,
       totalFrames: snap.frames.totalFrames,
       jankFrames: snap.frames.jankFrames,
+      jankFrameCount: snap.frames.jankFrameCount,
+      windowJankFrames: snap.frames.windowJankFrames,
       gpuPacketsPerSec: snap.gpu.gpuPacketsPerSec,
       drawCallsPerFrame: snap.gpu.drawCallsPerFrame,
       cacheHitRate: snap.io.cacheHitRate,
