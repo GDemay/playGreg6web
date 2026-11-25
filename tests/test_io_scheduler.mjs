@@ -820,3 +820,469 @@ test('AbortSignal while in-flight rejects caller immediately and preserves maxCo
   assert.equal(stats.inFlight, 0);
   assert.equal(stats.queued, 0);
 });
+
+test('priority-starvation aging promotes starved low-priority tasks ahead of newer high-priority bursts', async () => {
+  let fakeNow = 0;
+  const dispatchOrder = [];
+  const gates = new Map();
+
+  const rangeCache = {
+    read(filePath, offset, length) {
+      dispatchOrder.push(filePath);
+      const gate = gates.get(filePath);
+      if (gate) {
+        return gate.promise;
+      }
+      return Promise.resolve(makeBytes(filePath.charCodeAt(0), length));
+    },
+  };
+
+  const blockerGate = deferred();
+  const prefetchGate = deferred();
+  const normalGate = deferred();
+  gates.set('blocker.bin', blockerGate);
+  gates.set('prefetch-old.bin', prefetchGate);
+  gates.set('normal-mid.bin', normalGate);
+
+  const scheduler = new IoPriorityScheduler({
+    rangeCache,
+    maxConcurrency: 1,
+    agingThresholdMs: 100,
+    nowFn: () => fakeNow,
+    sleep: async () => {},
+  });
+
+  assert.equal(scheduler.agingThresholdMs, 100);
+
+  // t = 0: occupy slot and enqueue PREFETCH.
+  const pBlocker = scheduler.scheduleRead('blocker.bin', 0, 4, {
+    priority: IO_PRIORITY.CRITICAL,
+  });
+  const pPrefetch = scheduler.scheduleRead('prefetch-old.bin', 0, 4, {
+    priority: IO_PRIORITY.PREFETCH,
+  });
+
+  // t = 20: enqueue NORMAL.
+  fakeNow = 20;
+  const pNormal = scheduler.scheduleRead('normal-mid.bin', 0, 4, {
+    priority: IO_PRIORITY.NORMAL,
+  });
+
+  // t = 110: PREFETCH has waited 110ms (>= 100ms), NORMAL has waited 90ms (< 100ms).
+  // Fresh CRITICAL and HIGH requests arrive in a burst.
+  fakeNow = 110;
+  const pCritical = scheduler.scheduleRead('critical-new.bin', 0, 4, {
+    priority: IO_PRIORITY.CRITICAL,
+  });
+  const pHigh = scheduler.scheduleRead('high-new.bin', 0, 4, {
+    priority: IO_PRIORITY.HIGH,
+  });
+
+  // Release blocker at t = 110 -> starved PREFETCH promotes ahead of CRITICAL and HIGH.
+  blockerGate.resolve(makeBytes(1, 4));
+  await pBlocker;
+  await Promise.resolve();
+
+  assert.deepEqual(dispatchOrder, ['blocker.bin', 'prefetch-old.bin']);
+  assert.equal(scheduler.getStats().agedPromotions, 1);
+  assert.equal(scheduler.getStats().byPriority.PREFETCH.agedPromotions, 1);
+
+  // t = 130: NORMAL has now waited 110ms (>= 100ms), CRITICAL/HIGH only 20ms.
+  fakeNow = 130;
+  prefetchGate.resolve(makeBytes(2, 4));
+  await pPrefetch;
+  await Promise.resolve();
+
+  assert.deepEqual(dispatchOrder, ['blocker.bin', 'prefetch-old.bin', 'normal-mid.bin']);
+  assert.equal(scheduler.getStats().agedPromotions, 2);
+  assert.equal(scheduler.getStats().byPriority.NORMAL.agedPromotions, 1);
+
+  // t = 140: remaining CRITICAL (wait 30ms) and HIGH (wait 30ms) are not starved -> strict priority order.
+  fakeNow = 140;
+  normalGate.resolve(makeBytes(3, 4));
+  await Promise.all([pNormal, pCritical, pHigh]);
+
+  assert.deepEqual(dispatchOrder, [
+    'blocker.bin',
+    'prefetch-old.bin',
+    'normal-mid.bin',
+    'critical-new.bin',
+    'high-new.bin',
+  ]);
+
+  const stats = scheduler.getStats();
+  assert.equal(stats.agedPromotions, 2);
+  assert.equal(stats.byPriority.CRITICAL.agedPromotions, 0);
+  assert.equal(stats.byPriority.HIGH.agedPromotions, 0);
+  assert.equal(stats.byPriority.NORMAL.agedPromotions, 1);
+  assert.equal(stats.byPriority.PREFETCH.agedPromotions, 1);
+  assert.equal(stats.maxQueueWaitMs, 110);
+  assert.equal(stats.avgQueueWaitMsByPriority.CRITICAL, 15); // (0 + 30) / 2
+  assert.equal(stats.avgQueueWaitMsByPriority.HIGH, 30);
+  assert.equal(stats.avgQueueWaitMsByPriority.NORMAL, 110);
+  assert.equal(stats.avgQueueWaitMsByPriority.PREFETCH, 110);
+});
+
+test('aging selects oldest starved task first and preserves priority on equal age or solo queue', async () => {
+  let fakeNow = 0;
+  const dispatchOrder = [];
+  const blockerGate = deferred();
+  const prefetchGate = deferred();
+  const normalGate = deferred();
+
+  const rangeCache = {
+    read(filePath, offset, length) {
+      dispatchOrder.push(filePath);
+      if (filePath === 'blocker.bin') return blockerGate.promise;
+      if (filePath === 'prefetch-oldest.bin') return prefetchGate.promise;
+      if (filePath === 'normal-older.bin') return normalGate.promise;
+      return Promise.resolve(makeBytes(9, length));
+    },
+  };
+
+  const scheduler = new IoPriorityScheduler({
+    rangeCache,
+    maxConcurrency: 1,
+    agingThresholdMs: 100,
+    nowFn: () => fakeNow,
+    sleep: async () => {},
+  });
+
+  // Case 1: Two starved tasks at different enqueue times -> oldest starved runs first.
+  const pBlocker = scheduler.scheduleRead('blocker.bin', 0, 4, {
+    priority: IO_PRIORITY.CRITICAL,
+  });
+
+  fakeNow = 10;
+  const pPrefetchOldest = scheduler.scheduleRead('prefetch-oldest.bin', 0, 4, {
+    priority: IO_PRIORITY.PREFETCH,
+  });
+
+  fakeNow = 30;
+  const pNormalOlder = scheduler.scheduleRead('normal-older.bin', 0, 4, {
+    priority: IO_PRIORITY.NORMAL,
+  });
+
+  fakeNow = 150;
+  const pHighFresh = scheduler.scheduleRead('high-fresh.bin', 0, 4, {
+    priority: IO_PRIORITY.HIGH,
+  });
+
+  blockerGate.resolve(makeBytes(1, 4));
+  await pBlocker;
+  await Promise.resolve();
+  assert.deepEqual(dispatchOrder, ['blocker.bin', 'prefetch-oldest.bin']);
+
+  prefetchGate.resolve(makeBytes(2, 4));
+  await pPrefetchOldest;
+  await Promise.resolve();
+  assert.deepEqual(dispatchOrder, ['blocker.bin', 'prefetch-oldest.bin', 'normal-older.bin']);
+
+  normalGate.resolve(makeBytes(3, 4));
+  await Promise.all([pNormalOlder, pHighFresh]);
+  assert.deepEqual(dispatchOrder, [
+    'blocker.bin',
+    'prefetch-oldest.bin',
+    'normal-older.bin',
+    'high-fresh.bin',
+  ]);
+  assert.equal(scheduler.getStats().agedPromotions, 2);
+
+  // Case 2: Equal-age starved tasks prefer higher priority and do not falsely count promotion.
+  scheduler.reset();
+  dispatchOrder.length = 0;
+  fakeNow = 0;
+  const gate2 = deferred();
+  const rangeCache2 = {
+    read(filePath, offset, length) {
+      dispatchOrder.push(filePath);
+      if (filePath === 'hold2.bin') return gate2.promise;
+      return Promise.resolve(makeBytes(4, length));
+    },
+  };
+  const scheduler2 = new IoPriorityScheduler({
+    rangeCache: rangeCache2,
+    maxConcurrency: 1,
+    agingThresholdMs: 100,
+    nowFn: () => fakeNow,
+    sleep: async () => {},
+  });
+
+  const pHold2 = scheduler2.scheduleRead('hold2.bin', 0, 4, { priority: IO_PRIORITY.NORMAL });
+  const pPrefEq = scheduler2.scheduleRead('pref-eq.bin', 0, 4, { priority: IO_PRIORITY.PREFETCH });
+  const pCritEq = scheduler2.scheduleRead('crit-eq.bin', 0, 4, { priority: IO_PRIORITY.CRITICAL });
+
+  fakeNow = 200;
+  gate2.resolve(makeBytes(1, 4));
+  await Promise.all([pHold2, pPrefEq, pCritEq]);
+
+  // Equal enqueue timestamp -> CRITICAL runs before PREFETCH; then PREFETCH is the only remaining queue item.
+  assert.deepEqual(dispatchOrder, ['hold2.bin', 'crit-eq.bin', 'pref-eq.bin']);
+  assert.equal(scheduler2.getStats().agedPromotions, 0);
+});
+
+test('agingThresholdMs: 0 (and default) preserves strict priority ordering regardless of wait time', async () => {
+  for (const agingOption of [undefined, 0]) {
+    let fakeNow = 0;
+    const dispatchOrder = [];
+    const blockerGate = deferred();
+
+    const rangeCache = {
+      read(filePath, offset, length) {
+        dispatchOrder.push(filePath);
+        if (filePath === 'blocker.bin') {
+          return blockerGate.promise;
+        }
+        return Promise.resolve(makeBytes(5, length));
+      },
+    };
+
+    const opts = {
+      rangeCache,
+      maxConcurrency: 1,
+      nowFn: () => fakeNow,
+      sleep: async () => {},
+    };
+    if (agingOption !== undefined) {
+      opts.agingThresholdMs = agingOption;
+    }
+
+    const scheduler = new IoPriorityScheduler(opts);
+    assert.equal(scheduler.agingThresholdMs, 0);
+
+    const pBlocker = scheduler.scheduleRead('blocker.bin', 0, 4, {
+      priority: IO_PRIORITY.NORMAL,
+    });
+    const pPrefetch = scheduler.scheduleRead('prefetch-waited.bin', 0, 4, {
+      priority: IO_PRIORITY.PREFETCH,
+    });
+    const pNormal = scheduler.scheduleRead('normal-waited.bin', 0, 4, {
+      priority: IO_PRIORITY.NORMAL,
+    });
+
+    // Advance fake clock far ahead before high-priority tasks arrive.
+    fakeNow = 10000;
+    const pHigh = scheduler.scheduleRead('high-new.bin', 0, 4, {
+      priority: IO_PRIORITY.HIGH,
+    });
+    const pCritical = scheduler.scheduleRead('critical-new.bin', 0, 4, {
+      priority: IO_PRIORITY.CRITICAL,
+    });
+
+    blockerGate.resolve(makeBytes(1, 4));
+    await Promise.all([pBlocker, pPrefetch, pNormal, pHigh, pCritical]);
+
+    assert.deepEqual(dispatchOrder, [
+      'blocker.bin',
+      'critical-new.bin',
+      'high-new.bin',
+      'normal-waited.bin',
+      'prefetch-waited.bin',
+    ]);
+
+    const stats = scheduler.getStats();
+    assert.equal(stats.agedPromotions, 0);
+    assert.equal(stats.maxQueueWaitMs, 10000);
+    assert.equal(stats.avgQueueWaitMsByPriority.PREFETCH, 10000);
+    assert.equal(stats.avgQueueWaitMsByPriority.NORMAL, 5000); // (0 + 10000) / 2
+    assert.equal(stats.avgQueueWaitMsByPriority.HIGH, 0);
+    assert.equal(stats.avgQueueWaitMsByPriority.CRITICAL, 0);
+  }
+});
+
+test('queue-wait telemetry computes exact deterministic per-priority averages, max, and ignores aborted queued tasks', async () => {
+  let fakeNow = 0;
+  const gates = new Map();
+
+  const rangeCache = {
+    read(filePath, offset, length) {
+      const gate = gates.get(filePath);
+      if (gate) {
+        return gate.promise;
+      }
+      return Promise.resolve(makeBytes(7, length));
+    },
+  };
+
+  const gBlocker = deferred();
+  const gCrit2 = deferred();
+  const gHigh1 = deferred();
+  const gHigh2 = deferred();
+  gates.set('crit-1.bin', gBlocker);
+  gates.set('crit-2.bin', gCrit2);
+  gates.set('high-1.bin', gHigh1);
+  gates.set('high-2.bin', gHigh2);
+
+  const scheduler = new IoPriorityScheduler({
+    rangeCache,
+    maxConcurrency: 1,
+    agingThresholdMs: 0,
+    nowFn: () => fakeNow,
+    sleep: async () => {},
+  });
+
+  // t = 0: crit-1 dispatches immediately (wait = 0ms).
+  const pCrit1 = scheduler.scheduleRead('crit-1.bin', 0, 4, { priority: IO_PRIORITY.CRITICAL });
+  // t = 0: prefetch-1 queued.
+  const pPrefetch1 = scheduler.scheduleRead('prefetch-1.bin', 0, 4, {
+    priority: IO_PRIORITY.PREFETCH,
+  });
+
+  // t = 10: crit-2 queued.
+  fakeNow = 10;
+  const pCrit2 = scheduler.scheduleRead('crit-2.bin', 0, 4, { priority: IO_PRIORITY.CRITICAL });
+
+  // t = 20: high-1 queued, plus a queued NORMAL read that will be aborted before dispatch.
+  fakeNow = 20;
+  const pHigh1 = scheduler.scheduleRead('high-1.bin', 0, 4, { priority: IO_PRIORITY.HIGH });
+  const abortController = new AbortController();
+  const pAbortedNormal = scheduler.scheduleRead('aborted-normal.bin', 0, 4, {
+    priority: IO_PRIORITY.NORMAL,
+    signal: abortController.signal,
+  });
+
+  // t = 30: high-2 queued.
+  fakeNow = 30;
+  const pHigh2 = scheduler.scheduleRead('high-2.bin', 0, 4, { priority: IO_PRIORITY.HIGH });
+
+  // Abort the queued NORMAL read at t = 45 before it ever dispatches.
+  fakeNow = 45;
+  abortController.abort();
+  await assert.rejects(pAbortedNormal, { name: 'AbortError' });
+
+  // t = 50: crit-1 finishes -> crit-2 dispatches (wait = 50 - 10 = 40ms).
+  fakeNow = 50;
+  gBlocker.resolve(makeBytes(1, 4));
+  await pCrit1;
+  await Promise.resolve();
+
+  // t = 70: crit-2 finishes -> high-1 dispatches (wait = 70 - 20 = 50ms).
+  fakeNow = 70;
+  gCrit2.resolve(makeBytes(2, 4));
+  await pCrit2;
+  await Promise.resolve();
+
+  // t = 100: high-1 finishes -> high-2 dispatches (wait = 100 - 30 = 70ms).
+  fakeNow = 100;
+  gHigh1.resolve(makeBytes(3, 4));
+  await pHigh1;
+  await Promise.resolve();
+
+  // t = 120: high-2 finishes -> prefetch-1 dispatches (wait = 120 - 0 = 120ms).
+  fakeNow = 120;
+  gHigh2.resolve(makeBytes(4, 4));
+  await Promise.all([pHigh2, pPrefetch1]);
+
+  const stats = scheduler.getStats();
+  assert.deepEqual(stats.avgQueueWaitMsByPriority, {
+    CRITICAL: 20, // (0 + 40) / 2
+    HIGH: 60, // (50 + 70) / 2
+    NORMAL: 0, // aborted task was never dispatched
+    PREFETCH: 120, // 120 / 1
+  });
+  assert.equal(stats.maxQueueWaitMs, 120);
+  assert.equal(stats.agedPromotions, 0);
+  assert.equal(stats.byPriority.CRITICAL.maxQueueWaitMs, 40);
+  assert.equal(stats.byPriority.HIGH.maxQueueWaitMs, 70);
+  assert.equal(stats.byPriority.NORMAL.dispatched, 0);
+  assert.equal(stats.byPriority.PREFETCH.maxQueueWaitMs, 120);
+
+  // Snapshot isolation: mutating avgQueueWaitMsByPriority must not affect subsequent getStats().
+  stats.avgQueueWaitMsByPriority.CRITICAL = 9999;
+  assert.equal(scheduler.getStats().avgQueueWaitMsByPriority.CRITICAL, 20);
+});
+
+test('reset() and clear() cleanly reset telemetry counters and cancel queued tasks safely', async () => {
+  let fakeNow = 0;
+  let blockerGate = deferred();
+
+  const rangeCache = {
+    read(filePath, offset, length) {
+      if (filePath.startsWith('blocker')) {
+        return blockerGate.promise;
+      }
+      return Promise.resolve(makeBytes(6, length));
+    },
+  };
+
+  const scheduler = new IoPriorityScheduler({
+    rangeCache,
+    maxConcurrency: 1,
+    agingThresholdMs: 50,
+    nowFn: () => fakeNow,
+    sleep: async () => {},
+  });
+
+  // Accumulate completions, wait latency, and an aged promotion.
+  const pB1 = scheduler.scheduleRead('blocker-1.bin', 0, 4, { priority: IO_PRIORITY.NORMAL });
+  const pPref = scheduler.scheduleRead('pref-1.bin', 0, 4, { priority: IO_PRIORITY.PREFETCH });
+  fakeNow = 80;
+  const pCrit = scheduler.scheduleRead('crit-1.bin', 0, 4, { priority: IO_PRIORITY.CRITICAL });
+
+  blockerGate.resolve(makeBytes(1, 4));
+  await Promise.all([pB1, pPref, pCrit]);
+
+  const beforeReset = scheduler.getStats();
+  assert.equal(beforeReset.completed, 3);
+  assert.equal(beforeReset.agedPromotions, 1);
+  assert.equal(beforeReset.maxQueueWaitMs, 80);
+  assert.equal(beforeReset.avgQueueWaitMsByPriority.PREFETCH, 80);
+
+  // 1. reset() while idle zeroes all counters and telemetry.
+  assert.equal(scheduler.reset(), 0);
+  const afterReset = scheduler.getStats();
+  assert.equal(afterReset.queued, 0);
+  assert.equal(afterReset.inFlight, 0);
+  assert.equal(afterReset.completed, 0);
+  assert.equal(afterReset.failed, 0);
+  assert.equal(afterReset.cancelled, 0);
+  assert.equal(afterReset.retries, 0);
+  assert.equal(afterReset.agedPromotions, 0);
+  assert.equal(afterReset.maxQueueWaitMs, 0);
+  assert.deepEqual(afterReset.avgQueueWaitMsByPriority, {
+    CRITICAL: 0,
+    HIGH: 0,
+    NORMAL: 0,
+    PREFETCH: 0,
+  });
+
+  // 2. clear() with queued tasks rejects queued tasks with AbortError, zeroes telemetry,
+  //    and preserves inFlight tracking until the active read settles.
+  blockerGate = deferred();
+  fakeNow = 100;
+  const pB2 = scheduler.scheduleRead('blocker-2.bin', 0, 4, { priority: IO_PRIORITY.HIGH });
+  const pQueued1 = scheduler.scheduleRead('queued-1.bin', 0, 4, { priority: IO_PRIORITY.NORMAL });
+  const pQueued2 = scheduler.scheduleRead('queued-2.bin', 0, 4, { priority: IO_PRIORITY.PREFETCH });
+
+  const clearedCount = scheduler.clear();
+  assert.equal(clearedCount, 2);
+  await assert.rejects(pQueued1, { name: 'AbortError' });
+  await assert.rejects(pQueued2, { name: 'AbortError' });
+
+  const midClearStats = scheduler.getStats();
+  assert.equal(midClearStats.queued, 0);
+  assert.equal(midClearStats.inFlight, 1);
+  assert.equal(midClearStats.agedPromotions, 0);
+  assert.equal(midClearStats.maxQueueWaitMs, 0);
+  assert.deepEqual(midClearStats.avgQueueWaitMsByPriority, {
+    CRITICAL: 0,
+    HIGH: 0,
+    NORMAL: 0,
+    PREFETCH: 0,
+  });
+
+  blockerGate.resolve(makeBytes(2, 4));
+  await pB2;
+  assert.equal(scheduler.getStats().inFlight, 0);
+
+  // Subsequent reads after clear() work normally and report fresh metrics.
+  scheduler.reset();
+  fakeNow = 200;
+  const freshBytes = await scheduler.scheduleRead('fresh.bin', 0, 4, {
+    priority: IO_PRIORITY.NORMAL,
+  });
+  assert.deepEqual(freshBytes, makeBytes(6, 4));
+  assert.equal(scheduler.getStats().completed, 1);
+  assert.equal(scheduler.getStats().maxQueueWaitMs, 0);
+  assert.equal(scheduler.getStats().avgQueueWaitMsByPriority.NORMAL, 0);
+});
