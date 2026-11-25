@@ -10,6 +10,8 @@
   const DEFAULT_MIN_UNIFORM_BINDING_SIZE = 16;
   const DEFAULT_BYTE_SIZE = 1024 * 1024; // 1 MiB
   const DEFAULT_MAX_BYTE_SIZE = 16 * 1024 * 1024; // 16 MiB
+  const MIN_FRAMES_IN_FLIGHT = 1;
+  const MAX_FRAMES_IN_FLIGHT = 4;
   const DEFAULT_FRAMES_IN_FLIGHT = 3;
   const DEFAULT_MAX_BINDING_SIZE = 65536; // 64 KiB WebGPU default maxUniformBufferBindingSize
   const DEFAULT_SHRINK_AFTER_IDLE_FRAMES = 120;
@@ -238,6 +240,16 @@
         '_deferImmediateFlush' in value ||
         'allowSubAlignment' in value)
     );
+  }
+
+  function validateOutTarget(out, label) {
+    if (out === undefined || out === null) {
+      return null;
+    }
+    if (typeof out !== 'object') {
+      throw new TypeError(`${label} out target must be an object`);
+    }
+    return out;
   }
 
   function acquireDirtyRange(pool, start, end, writeCount) {
@@ -527,6 +539,10 @@
       }
 
       assertPositiveInteger(framesInFlight, 'framesInFlight');
+      const resolvedFramesInFlight = Math.min(
+        MAX_FRAMES_IN_FLIGHT,
+        Math.max(MIN_FRAMES_IN_FLIGHT, framesInFlight)
+      );
       assertPositiveInteger(resolvedMaxBindingSize, 'maxBindingSize');
       assertPositiveInteger(minUniformBindingSize, 'minUniformBindingSize');
 
@@ -650,7 +666,7 @@
       this.deviceMinUniformBufferOffsetAlignment = deviceAlignment;
       this.maxByteSize = resolvedMaxByteSize;
       this.maxCapacityBytes = resolvedMaxByteSize;
-      this.framesInFlight = framesInFlight;
+      this.framesInFlight = resolvedFramesInFlight;
       this.maxBindingSize = resolvedMaxBindingSize;
       this.minUniformBindingSize = resolvedMinUniformBindingSize;
       this.allowEmptyPayloads = Boolean(allowEmptyPayloads);
@@ -670,7 +686,6 @@
       this._shadowU32 = null;
       this._shadowI32 = null;
       this._shadowF32 = null;
-      this._setShadowBuffer(new Uint8Array(resolvedByteSize));
       this._dirtyRanges = [];
       this._dirtyRangePool = [
         { start: 0, end: 0, writeCount: 0 },
@@ -681,6 +696,7 @@
 
       this._frameIndex = -1;
       this._slotIndex = 0;
+      this._frameEnded = false;
       this._cursor = 0;
       this._writtenHighWater = 0;
       this._framePrimaryBytes = 0;
@@ -705,6 +721,8 @@
       this._totalDrawCount = 0;
       this._reusedAllocations = 0;
       this._freshAllocations = 0;
+      this._zeroAllocAllocs = 0;
+      this._partitionRotations = 0;
       this._totalBytesPushed = 0;
       this._totalBytesUploaded = 0;
       this._alignedBytesWasted = 0;
@@ -721,19 +739,33 @@
       this._unalignedCopyCount = 0;
       this._wrapCount = 0;
 
-      for (let i = 0; i < framesInFlight; i += 1) {
+      for (let i = 0; i < resolvedFramesInFlight; i += 1) {
         const buffer = this._createSlotBuffer(i, resolvedByteSize);
-        this._slots.push({
+        const slot = {
           index: i,
+          partitionIndex: i,
           buffer,
           byteSize: resolvedByteSize,
+          shadow: null,
+          shadowU32: null,
+          shadowI32: null,
+          shadowF32: null,
           generation: 1,
           used: false,
+          inFlight: false,
+          lastFrameIndex: -1,
+          endedFrameIndex: -1,
+          completedFrameIndex: -1,
+          lastFrameBytes: 0,
+          fencePromise: null,
           retiredBuffers: [],
           retiredSlices: [],
           overflowChunks: [],
-        });
+        };
+        this._setSlotShadowBuffer(slot, new Uint8Array(resolvedByteSize));
+        this._slots.push(slot);
       }
+      this._bindSlotShadow(this._slots[0]);
     }
 
     get currentBuffer() {
@@ -775,6 +807,10 @@
       return this._slotIndex;
     }
 
+    get partitionIndex() {
+      return this._slotIndex;
+    }
+
     get frameIndex() {
       return this._frameIndex;
     }
@@ -785,7 +821,55 @@
       }
     }
 
+    _setSlotShadowBuffer(slot, buffer) {
+      slot.shadow = buffer;
+      if (buffer && (buffer.byteLength & 3) === 0) {
+        slot.shadowU32 = new Uint32Array(
+          buffer.buffer,
+          buffer.byteOffset,
+          buffer.byteLength >>> 2
+        );
+        slot.shadowI32 = new Int32Array(
+          buffer.buffer,
+          buffer.byteOffset,
+          buffer.byteLength >>> 2
+        );
+        slot.shadowF32 = new Float32Array(
+          buffer.buffer,
+          buffer.byteOffset,
+          buffer.byteLength >>> 2
+        );
+      } else {
+        slot.shadowU32 = null;
+        slot.shadowI32 = null;
+        slot.shadowF32 = null;
+      }
+    }
+
+    _bindSlotShadow(slot) {
+      if (!slot || !slot.shadow) {
+        this._shadow = null;
+        this._shadowU32 = null;
+        this._shadowI32 = null;
+        this._shadowF32 = null;
+        return;
+      }
+      this._shadow = slot.shadow;
+      this._shadowU32 = slot.shadowU32;
+      this._shadowI32 = slot.shadowI32;
+      this._shadowF32 = slot.shadowF32;
+    }
+
     _setShadowBuffer(buffer) {
+      const activeSlot =
+        !this._destroyed && this._slots && this._slots.length > 0
+          ? this._slots[this._slotIndex]
+          : null;
+      if (activeSlot) {
+        this._setSlotShadowBuffer(activeSlot, buffer);
+        this._bindSlotShadow(activeSlot);
+        return;
+      }
       this._shadow = buffer;
       if (buffer && (buffer.byteLength & 3) === 0) {
         this._shadowU32 = new Uint32Array(buffer.buffer, buffer.byteOffset, buffer.byteLength >>> 2);
@@ -795,6 +879,19 @@
         this._shadowU32 = null;
         this._shadowI32 = null;
         this._shadowF32 = null;
+      }
+    }
+
+    _ensureActiveFrame() {
+      if (this._frameIndex < 0) {
+        this._frameIndex = 0;
+        const slot = this._slots[this._slotIndex];
+        slot.used = true;
+        slot.inFlight = true;
+        slot.lastFrameIndex = 0;
+        this._frameEnded = false;
+      } else if (this._frameEnded) {
+        this.beginFrame(this._frameIndex + 1);
       }
     }
 
@@ -1314,6 +1411,16 @@
       return bytes;
     }
 
+    _countInFlightPartitions() {
+      let count = 0;
+      for (let i = 0; i < this._slots.length; i += 1) {
+        if (this._slots[i].inFlight) {
+          count += 1;
+        }
+      }
+      return count;
+    }
+
     _countPendingDirtyRanges() {
       let count = this._dirtyRanges ? this._dirtyRanges.length : 0;
       const slot =
@@ -1349,21 +1456,25 @@
     }
 
     /**
-     * Begin a new frame: rotate to the next frame-in-flight slot, release transient
-     * overflow/retired buffers from that recycled slot, resize the slot's GPUBuffer if
-     * the ring grew on an earlier frame, and reset the write cursor to 0.
+     * Begin a new frame: rotate to the next frame-in-flight partition, release transient
+     * overflow/retired buffers from that recycled partition, resize the partition's GPUBuffer
+     * and CPU shadow slab if the ring grew or shrank on an earlier frame, and reset the write
+     * cursor to 0.
      *
      * @param {number} [frameIndex]
-     * @returns {{ frameIndex: number, slotIndex: number, buffer: GPUBuffer, byteSize: number, generation: number }}
+     * @returns {{ frameIndex: number, slotIndex: number, partitionIndex: number, buffer: GPUBuffer, byteSize: number, generation: number, framesInFlight: number }}
      */
     beginFrame(frameIndex) {
       this._assertNotDestroyed();
 
       this._recordFramePeak();
 
-      if (this._frameIndex >= 0) {
+      const hadPriorFrame = this._frameIndex >= 0;
+      const prevSlotIndex = this._slotIndex;
+      if (hadPriorFrame) {
         const prevFrameBytes =
           this._frameSliceBytes + this._framePrimaryBytes + this._frameOverflowBytes;
+        this._slots[prevSlotIndex].lastFrameBytes = prevFrameBytes;
         this._evaluateAutoShrink(prevFrameBytes);
       }
 
@@ -1377,6 +1488,7 @@
 
       this._frameIndex = nextFrame;
       this._slotIndex = nextFrame % this.framesInFlight;
+      this._frameEnded = false;
       this._cursor = 0;
       this._writtenHighWater = 0;
       this._framePrimaryBytes = 0;
@@ -1392,11 +1504,21 @@
       releaseDirtyRanges(this._dirtyRanges, this._dirtyRangePool);
       this._dirty = false;
 
+      if (hadPriorFrame || this._slotIndex !== prevSlotIndex) {
+        this._partitionRotations += 1;
+      }
+
       const slot = this._slots[this._slotIndex];
       if (slot.used) {
         this._wrapCount += 1;
+        if (slot.endedFrameIndex >= 0) {
+          slot.completedFrameIndex = Math.max(slot.completedFrameIndex, slot.endedFrameIndex);
+        }
       }
       slot.used = true;
+      slot.inFlight = true;
+      slot.lastFrameIndex = nextFrame;
+      slot.fencePromise = null;
 
       // This slot is now safe to recycle: destroy any overflow/retired buffers from its
       // previous frame while leaving all other in-flight slots untouched.
@@ -1407,16 +1529,19 @@
       if (slot.byteSize !== this._capacity) {
         this._resizeSlot(slot, this._capacity, false);
       }
-      if (!this._shadow || this._shadow.byteLength !== slot.byteSize) {
-        this._setShadowBuffer(new Uint8Array(slot.byteSize));
+      if (!slot.shadow || slot.shadow.byteLength !== slot.byteSize) {
+        this._setSlotShadowBuffer(slot, new Uint8Array(slot.byteSize));
       }
+      this._bindSlotShadow(slot);
 
       return {
         frameIndex: this._frameIndex,
         slotIndex: this._slotIndex,
+        partitionIndex: this._slotIndex,
         buffer: slot.buffer,
         byteSize: slot.byteSize,
         generation: slot.generation,
+        framesInFlight: this.framesInFlight,
       };
     }
 
@@ -1433,10 +1558,7 @@
      */
     beginBatch() {
       this._assertNotDestroyed();
-      if (this._frameIndex < 0) {
-        this._frameIndex = 0;
-        this._slots[this._slotIndex].used = true;
-      }
+      this._ensureActiveFrame();
       this._batchDepth += 1;
       return {
         batchDepth: this._batchDepth,
@@ -1534,10 +1656,7 @@
 
       const alignedSize = alignUp(paddedSize, this.alignment);
 
-      if (this._frameIndex < 0) {
-        this._frameIndex = 0;
-        this._slots[this._slotIndex].used = true;
-      }
+      this._ensureActiveFrame();
 
       const slot = this._slots[this._slotIndex];
       const primaryDynamicOffset = alignUp(this._cursor, this.alignment);
@@ -1807,6 +1926,7 @@
       }
 
       if (out) {
+        this._zeroAllocAllocs += 1;
         out.buffer = targetBuffer;
         out.offset = dynamicOffset;
         out.dynamicOffset = dynamicOffset;
@@ -1886,7 +2006,7 @@
           if (outOrOptions._deferImmediateFlush === false) {
             deferImmediateFlush = false;
           }
-          out = outOrOptions.out || null;
+          out = validateOutTarget(outOrOptions.out, 'allocate');
         } else {
           out = outOrOptions;
         }
@@ -1912,6 +2032,19 @@
         true,
         false
       );
+    }
+
+    /**
+     * Zero-allocation hot-path aligned uniform/CBV allocation (`alignment`-aligned, default 256B).
+     * Accepts a reusable `out` scratch object directly (`allocAligned(byteLength, out)`) or via
+     * options (`allocAligned(byteLength, { out, allowEmpty, wrap })`) to eliminate per-draw GC
+     * churn while preserving the exact default return shape when `out` is omitted.
+     *
+     * @param {number} byteLength
+     * @param {object} [outOrOptions]
+     */
+    allocAligned(byteLength, outOrOptions) {
+      return this.allocate(byteLength, outOrOptions);
     }
 
     /**
@@ -2019,7 +2152,9 @@
       const deferImmediateFlush = Boolean(
         pushOptions && pushOptions._deferImmediateFlush === true
       );
-      const out = pushOptions && pushOptions.out ? pushOptions.out : null;
+      const out = pushOptions
+        ? validateOutTarget(pushOptions.out, 'pushConstants')
+        : null;
 
       return this._pushConstantsWithFlags(
         data,
@@ -2055,7 +2190,7 @@
         const opts = dataOrOptions && typeof dataOrOptions === 'object' ? dataOrOptions : null;
         const allowEmpty = (opts && opts.allowEmpty === true) || this.allowEmptyPayloads;
         const allowWrap = (opts && opts.wrap === true) || this.allowWrap;
-        const out = opts && opts.out ? opts.out : null;
+        const out = opts ? validateOutTarget(opts.out, 'writeStaged') : null;
         const alloc = this._pushConstantsWithFlags(
           offsetOrData,
           allowEmpty,
@@ -2084,7 +2219,7 @@
 
       const allowEmpty =
         (options && options.allowEmpty === true) || this.allowEmptyPayloads;
-      const out = options && options.out ? options.out : null;
+      const out = options ? validateOutTarget(options.out, 'writeStaged') : null;
 
       let srcData = data;
       let size = 0;
@@ -2136,10 +2271,7 @@
       const alignedSize = alignUp(paddedSize, this.alignment);
       const writeSpan = allowSubAlignment ? paddedSize : alignedSize;
 
-      if (this._frameIndex < 0) {
-        this._frameIndex = 0;
-        this._slots[this._slotIndex].used = true;
-      }
+      this._ensureActiveFrame();
 
       const slot = this._slots[this._slotIndex];
       const endOffset = offset + writeSpan;
@@ -2196,6 +2328,7 @@
       this._recordFramePeak();
 
       if (out) {
+        this._zeroAllocAllocs += 1;
         out.buffer = slot.buffer;
         out.offset = offset;
         out.dynamicOffset = offset;
@@ -2238,7 +2371,7 @@
       this._assertNotDestroyed();
       const allowWrap =
         (pushOptions && pushOptions.wrap === true) || this.allowWrap;
-      const out = pushOptions && pushOptions.out ? pushOptions.out : null;
+      const out = pushOptions ? validateOutTarget(pushOptions.out, 'pushCbv') : null;
       return this._pushConstantsWithFlags(data, true, allowWrap, false, out);
     }
 
@@ -2474,35 +2607,123 @@
     }
 
     /**
-     * Complete the active frame, updating peak frame utilization telemetry and reclaiming
-     * the active slot's spill pages unless `{ deferReclaim: true }` or
+     * Complete the active (or specified `frameIndex`) frame, updating peak frame utilization
+     * telemetry, recording partition fence tracking so in-flight GPU reads are never clobbered,
+     * and reclaiming that partition's spill pages unless `{ deferReclaim: true }` or
      * `{ reclaimSpillPages: false }` is passed.
      *
-     * @param {{ deferReclaim?: boolean, reclaimSpillPages?: boolean }} [options]
-     * @returns {{ frameIndex: number, slotIndex: number, frameBytes: number, reclaimedPages: number, reclaimedBytes: number }}
+     * Supports:
+     * - `endFrame()`
+     * - `endFrame(options)`
+     * - `endFrame(frameIndex, options?)`
+     *
+     * @param {number | { deferReclaim?: boolean, reclaimSpillPages?: boolean, fence?: Promise<any>, fencePromise?: Promise<any> }} [frameIndexOrOptions]
+     * @param {{ deferReclaim?: boolean, reclaimSpillPages?: boolean, fence?: Promise<any>, fencePromise?: Promise<any> }} [maybeOptions]
+     * @returns {{ frameIndex: number, slotIndex: number, partitionIndex: number, frameBytes: number, reclaimedPages: number, reclaimedBytes: number, inFlight: boolean }}
      */
-    endFrame(options = {}) {
+    endFrame(frameIndexOrOptions, maybeOptions) {
       this._assertNotDestroyed();
       this._recordFramePeak();
 
-      const frameBytes = this._frameSliceBytes + this._framePrimaryBytes + this._frameOverflowBytes;
+      let resolvedFrameIndex;
+      let options;
+      if (typeof frameIndexOrOptions === 'number') {
+        assertNonNegativeInteger(frameIndexOrOptions, 'frameIndex');
+        resolvedFrameIndex = frameIndexOrOptions;
+        if (maybeOptions !== undefined && maybeOptions !== null) {
+          if (typeof maybeOptions !== 'object') {
+            throw new TypeError('endFrame options argument must be an object');
+          }
+          options = maybeOptions;
+        } else {
+          options = {};
+        }
+      } else if (frameIndexOrOptions === undefined || frameIndexOrOptions === null) {
+        resolvedFrameIndex = this._frameIndex;
+        options = {};
+      } else if (typeof frameIndexOrOptions === 'object') {
+        resolvedFrameIndex = this._frameIndex;
+        options = frameIndexOrOptions;
+      } else {
+        throw new TypeError('endFrame expects an optional frameIndex integer or options object');
+      }
+
+      const fence =
+        options.fence !== undefined ? options.fence : options.fencePromise;
+      if (fence !== undefined && fence !== null && typeof fence.then !== 'function') {
+        throw new TypeError('endFrame fence option must be a Promise/thenable, null, or undefined');
+      }
+
+      const targetSlotIndex =
+        resolvedFrameIndex >= 0
+          ? resolvedFrameIndex % this.framesInFlight
+          : this._slotIndex;
+      const slot = this._slots[targetSlotIndex];
+      const isActiveSlot = targetSlotIndex === this._slotIndex;
+      const frameBytes = isActiveSlot
+        ? this._frameSliceBytes + this._framePrimaryBytes + this._frameOverflowBytes
+        : slot.lastFrameBytes;
+      if (isActiveSlot) {
+        slot.lastFrameBytes = frameBytes;
+        if (resolvedFrameIndex === this._frameIndex || this._frameIndex < 0) {
+          this._frameEnded = true;
+        }
+      }
+
+      if (resolvedFrameIndex >= 0) {
+        slot.endedFrameIndex = resolvedFrameIndex;
+        if (slot.lastFrameIndex < 0) {
+          slot.lastFrameIndex = resolvedFrameIndex;
+        }
+        slot.inFlight = true;
+        if (fence) {
+          slot.fencePromise = fence;
+          const trackedFrame = resolvedFrameIndex;
+          fence.then(
+            () => {
+              if (
+                !this._destroyed &&
+                slot.lastFrameIndex === trackedFrame &&
+                slot.endedFrameIndex === trackedFrame
+              ) {
+                slot.completedFrameIndex = Math.max(slot.completedFrameIndex, trackedFrame);
+                slot.inFlight = false;
+                slot.fencePromise = null;
+              }
+            },
+            () => {
+              if (
+                !this._destroyed &&
+                slot.lastFrameIndex === trackedFrame &&
+                slot.endedFrameIndex === trackedFrame
+              ) {
+                slot.inFlight = false;
+                slot.fencePromise = null;
+              }
+            }
+          );
+        }
+      }
+
       const shouldReclaim =
         !(options && (options.deferReclaim === true || options.reclaimSpillPages === false));
 
       let reclaimedPages = 0;
       let reclaimedBytes = 0;
       if (shouldReclaim) {
-        const res = this.reclaimSpillPages(this._slotIndex);
+        const res = this.reclaimSpillPages(targetSlotIndex);
         reclaimedPages = res.reclaimedPages;
         reclaimedBytes = res.reclaimedBytes;
       }
 
       return {
-        frameIndex: this._frameIndex,
-        slotIndex: this._slotIndex,
+        frameIndex: resolvedFrameIndex,
+        slotIndex: targetSlotIndex,
+        partitionIndex: targetSlotIndex,
         frameBytes,
         reclaimedPages,
         reclaimedBytes,
+        inFlight: slot.inFlight,
       };
     }
 
@@ -2518,9 +2739,14 @@
 
       const { reclaimedPages, reclaimedBytes } = this.reclaimSpillPages();
       for (let i = 0; i < this._slots.length; i += 1) {
-        this._releaseSlotTransientBuffers(this._slots[i]);
+        const slot = this._slots[i];
+        this._releaseSlotTransientBuffers(slot);
+        slot.inFlight = false;
+        slot.fencePromise = null;
+        slot.lastFrameBytes = 0;
       }
 
+      this._frameEnded = false;
       this._cursor = 0;
       this._writtenHighWater = 0;
       this._framePrimaryBytes = 0;
@@ -2685,7 +2911,10 @@
       return {
         frameIndex: this._frameIndex,
         slotIndex: this._slotIndex,
+        partitionIndex: this._slotIndex,
         framesInFlight: this.framesInFlight,
+        partitionRotations: this._partitionRotations,
+        inFlightPartitions: this._destroyed ? 0 : this._countInFlightPartitions(),
         alignment: this.alignment,
         minUniformBindingSize: this.minUniformBindingSize,
         byteSize: this._capacity,
@@ -2716,6 +2945,7 @@
         totalAllocations: this._totalDrawCount,
         reusedAllocations: this._reusedAllocations,
         freshAllocations: this._freshAllocations,
+        zeroAllocAllocs: this._zeroAllocAllocs,
         reuseRate: clampUnitRate(this._reusedAllocations, this._totalDrawCount),
         totalBytesPushed: this._totalBytesPushed,
         totalBytesUploaded: this._totalBytesUploaded,
@@ -2762,6 +2992,8 @@
       this._totalDrawCount = 0;
       this._reusedAllocations = 0;
       this._freshAllocations = 0;
+      this._zeroAllocAllocs = 0;
+      this._partitionRotations = 0;
       this._totalBytesPushed = 0;
       this._totalBytesUploaded = 0;
       this._alignedBytesWasted = 0;
@@ -2791,8 +3023,15 @@
       this._destroyed = true;
 
       for (let i = 0; i < this._slots.length; i += 1) {
-        this._releaseSlotTransientBuffers(this._slots[i]);
-        this._destroySlotBuffer(this._slots[i]);
+        const slot = this._slots[i];
+        this._releaseSlotTransientBuffers(slot);
+        this._destroySlotBuffer(slot);
+        slot.shadow = null;
+        slot.shadowU32 = null;
+        slot.shadowI32 = null;
+        slot.shadowF32 = null;
+        slot.inFlight = false;
+        slot.fencePromise = null;
       }
 
       this._slots = [];
@@ -2800,6 +3039,7 @@
       this._dirtyRanges = [];
       this._dirtyRangePool = [];
       this._allocatedGpuBytes = 0;
+      this._frameEnded = false;
       this._cursor = 0;
       this._writtenHighWater = 0;
       this._framePrimaryBytes = 0;
@@ -2823,6 +3063,8 @@
     DEFAULT_MIN_UNIFORM_BINDING_SIZE,
     DEFAULT_BYTE_SIZE,
     DEFAULT_MAX_BYTE_SIZE,
+    MIN_FRAMES_IN_FLIGHT,
+    MAX_FRAMES_IN_FLIGHT,
     DEFAULT_FRAMES_IN_FLIGHT,
     DEFAULT_MAX_BINDING_SIZE,
     DEFAULT_SHRINK_AFTER_IDLE_FRAMES,
