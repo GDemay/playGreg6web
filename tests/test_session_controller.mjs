@@ -2027,3 +2027,493 @@ test('W148 reason sanitization, error recovery, restart(), clearTransitionHistor
   assert.equal(postResetHist[0].durationInPrevMs, 60);
 });
 
+// --- W276: Leak-Free Restart Teardown, Re-entrancy Guard & Device-Loss Recovery Tracking ---
+
+test('W276 option validation and initial getStats() stability counters', () => {
+  assert.throws(() => new RuntimeSessionController({ bootOrchestrator: 'invalid' }), TypeError);
+  assert.throws(() => new RuntimeSessionController({ orchestrator: 123 }), TypeError);
+  assert.throws(() => new RuntimeSessionController({ onDeviceLost: 'nope' }), TypeError);
+  assert.throws(() => new RuntimeSessionController({ onDeviceRecovered: {} }), TypeError);
+
+  const clock = createClock(4000);
+  const controller = new RuntimeSessionController({
+    fetchImpl: null,
+    now: clock.now,
+  });
+
+  assert.throws(() => controller.onDeviceLost('nope'), TypeError);
+  assert.throws(() => controller.onDeviceRecovered(42), TypeError);
+  assert.equal(controller.isDestroyed(), false);
+
+  const stats = controller.getStats();
+  assert.equal(stats.state, SESSION_STATE.IDLE);
+  assert.equal(stats.mode, SESSION_MODE.NONE);
+  assert.equal(stats.bootMode, BOOT_MODE.IDLE);
+  assert.equal(stats.destroyed, false);
+  assert.equal(stats.restartInFlight, false);
+  assert.equal(stats.uptimeMs, 0);
+  assert.equal(stats.restartCount, 0);
+  assert.equal(stats.coalescedRestarts, 0);
+  assert.equal(stats.recoveryCount, 0);
+  assert.equal(stats.deviceLost, false);
+  assert.equal(stats.deviceLossCount, 0);
+  assert.equal(stats.deviceRecoveryCount, 0);
+  assert.equal(stats.lastDeviceLossReason, null);
+  assert.equal(stats.cleanShutdownCount, 0);
+  assert.equal(stats.preloadBufferReleaseCount, 0);
+  assert.equal(stats.attachedWorkerCount, 0);
+  assert.equal(stats.activeListenerCount, 0);
+
+  const snap = controller.getSnapshot();
+  assert.equal(snap.coalescedRestarts, 0);
+  assert.equal(snap.deviceLossCount, 0);
+  assert.equal(snap.deviceRecoveryCount, 0);
+  assert.equal(snap.cleanShutdownCount, 0);
+});
+
+test('W276 concurrent restart() calls coalesce safely without spawning duplicate workers or handles', async () => {
+  const clock = createClock(10_000);
+  const timers = createFakeTimers();
+  const hud = createMockHud();
+  const worker = createMockWorker();
+  const gestureTarget = createMockEventTarget();
+  const perfMonitor = new PerfMonitor({
+    now: clock.now,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+  });
+
+  let releaseStopGate;
+  let releaseLaunchGate;
+  let stopGateArmed = false;
+  let launchGateArmed = false;
+  let wasmLaunchCount = 0;
+  let handleStopCount = 0;
+  let preloadReleaseCount = 0;
+  const activeHandles = new Set();
+
+  const bootOrchestrator = {
+    releasePreloadBuffers() {
+      preloadReleaseCount += 1;
+      return { releasedFields: ['wasmBytes'], releasedBytes: 1024 };
+    },
+  };
+
+  const controller = new RuntimeSessionController({
+    fetchImpl: createMockFetch(readyStatus({ hasWasmBinary: true })),
+    hud,
+    perfMonitor,
+    wgpuWorker: worker,
+    bootOrchestrator,
+    audioGestureTarget: gestureTarget,
+    audioEngine: {
+      resumeOnUserGesture(target) {
+        const fn = () => {};
+        target.addEventListener('pointerdown', fn);
+        return () => target.removeEventListener('pointerdown', fn);
+      },
+    },
+    capabilityProbe: () => fullCapabilities(),
+    now: clock.now,
+    startWasmRuntime: async () => {
+      const id = `wasm-${++wasmLaunchCount}`;
+      if (launchGateArmed) {
+        launchGateArmed = false;
+        await new Promise((resolve) => {
+          releaseLaunchGate = resolve;
+        });
+      }
+      activeHandles.add(id);
+      return {
+        id,
+        async stop() {
+          handleStopCount += 1;
+          if (stopGateArmed) {
+            stopGateArmed = false;
+            await new Promise((resolve) => {
+              releaseStopGate = resolve;
+            });
+          }
+          activeHandles.delete(id);
+        },
+      };
+    },
+  });
+
+  await controller.start();
+  assert.equal(wasmLaunchCount, 1);
+  assert.equal(activeHandles.size, 1);
+
+  // Trigger 4 overlapping concurrent restarts plus a concurrent start() while stop & launch are in flight.
+  stopGateArmed = true;
+  launchGateArmed = true;
+
+  const r1 = controller.restart();
+  const r2 = controller.restart();
+  const r3 = controller.restart();
+  const r4 = controller.restart();
+  const sDuringRestart = controller.start();
+
+  assert.equal(controller.getStats().restartInFlight, true);
+  assert.equal(controller.getStats().restartCount, 1);
+  assert.equal(controller.getStats().coalescedRestarts, 3);
+
+  // Let stop finish, then let the single fresh launch finish.
+  await new Promise((r) => setTimeout(r, 5));
+  releaseStopGate();
+  await new Promise((r) => setTimeout(r, 5));
+  releaseLaunchGate();
+
+  const results = await Promise.all([r1, r2, r3, r4, sDuringRestart]);
+  for (const res of results) {
+    assert.equal(res.ok, true);
+    assert.equal(res.state, SESSION_STATE.RUNNING_WASM);
+  }
+
+  // Only ONE teardown and ONE new launch happened (total 2 launches including initial start).
+  assert.equal(wasmLaunchCount, 2);
+  assert.equal(handleStopCount, 1);
+  assert.equal(preloadReleaseCount, 1);
+  assert.equal(activeHandles.size, 1);
+  assert.ok(activeHandles.has('wasm-2'));
+  assert.equal(timers.activeCount(), 1);
+  assert.equal(worker.listenerCount('message'), 1);
+  assert.equal(gestureTarget.listenerCount('pointerdown'), 1);
+
+  const statsAfter = controller.getStats();
+  assert.equal(statsAfter.restartInFlight, false);
+  assert.equal(statsAfter.restartCount, 1);
+  assert.equal(statsAfter.coalescedRestarts, 3);
+  assert.equal(statsAfter.cleanShutdownCount, 1);
+  assert.equal(statsAfter.preloadBufferReleaseCount, 1);
+
+  // A subsequent non-overlapping restart works cleanly and increments restartCount again.
+  const r5 = await controller.restart();
+  assert.equal(r5.ok, true);
+  assert.equal(wasmLaunchCount, 3);
+  assert.equal(activeHandles.size, 1);
+  assert.ok(activeHandles.has('wasm-3'));
+  assert.equal(controller.getStats().restartCount, 2);
+  assert.equal(controller.getStats().coalescedRestarts, 3);
+  assert.equal(controller.getStats().cleanShutdownCount, 2);
+  assert.equal(preloadReleaseCount, 2);
+
+  // External stop() during an in-flight restart aborts launch cleanly.
+  stopGateArmed = true;
+  const abortedRestart = controller.restart();
+  await new Promise((r) => setTimeout(r, 5));
+  const externalStop = controller.stop();
+  releaseStopGate();
+
+  const [abortedRes, extStopRes] = await Promise.all([abortedRestart, externalStop]);
+  assert.equal(abortedRes.ok, false);
+  assert.equal(abortedRes.aborted, true);
+  assert.equal(extStopRes.ok, true);
+  assert.equal(controller.getState(), SESSION_STATE.STOPPED);
+  assert.equal(wasmLaunchCount, 3);
+  assert.equal(activeHandles.size, 0);
+  assert.equal(timers.activeCount(), 0);
+  assert.equal(worker.listenerCount('message'), 0);
+  assert.equal(gestureTarget.listenerCount('pointerdown'), 0);
+});
+
+test('W276 stop(), restart(), destroy(), and dispose() invoke releasePreloadBuffers/releaseBootBundleBytes and clear all refs', async () => {
+  const clock = createClock(5_000);
+  const timers = createFakeTimers();
+  const hud = createMockHud();
+  const worker = createMockWorker();
+  const gestureTarget = createMockEventTarget();
+  const perfMonitor = new PerfMonitor({
+    now: clock.now,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+  });
+
+  let orchReleaseCalls = 0;
+  let handleReleaseCalls = 0;
+  let handleStopCalls = 0;
+  let inputStopCalls = 0;
+
+  const orchestrator = {
+    releasePreloadBuffers() {
+      orchReleaseCalls += 1;
+      return { releasedFields: ['wasmBytes', 'sideModules'], releasedBytes: 2048 };
+    },
+  };
+
+  const controller = new RuntimeSessionController({
+    fetchImpl: createMockFetch(readyStatus({ hasWasmBinary: true })),
+    hud,
+    perfMonitor,
+    wgpuWorker: worker,
+    orchestrator,
+    audioGestureTarget: gestureTarget,
+    inputBridge: {
+      running: false,
+      start() {
+        this.running = true;
+      },
+      stop() {
+        inputStopCalls += 1;
+        this.running = false;
+      },
+    },
+    audioEngine: {
+      resumeOnUserGesture(target) {
+        const fn = () => {};
+        target.addEventListener('keydown', fn);
+        return () => target.removeEventListener('keydown', fn);
+      },
+    },
+    capabilityProbe: () => fullCapabilities(),
+    now: clock.now,
+    startWasmRuntime: async (ctx) => {
+      assert.equal(ctx.bootOrchestrator, orchestrator);
+      return {
+        stop() {
+          handleStopCalls += 1;
+        },
+        releaseBootBundleBytes() {
+          handleReleaseCalls += 1;
+        },
+      };
+    },
+  });
+
+  const observedStates = [];
+  controller.onStateChange((ev) => observedStates.push(ev.state));
+  controller.onStatusUpdate(() => {});
+  controller.onTelemetry(() => {});
+  controller.onValidationError(() => {});
+  controller.onSplashFrame(() => {});
+  controller.onDeviceLost(() => {});
+  controller.onDeviceRecovered(() => {});
+
+  assert.equal(controller.getStats().activeListenerCount, 7);
+
+  await controller.start();
+  assert.equal(timers.activeCount(), 1);
+  assert.equal(worker.listenerCount('message'), 1);
+  assert.equal(gestureTarget.listenerCount('keydown'), 1);
+
+  // dispose() tears down everything, releases preload buffers on both orchestrator & handle,
+  // notifies state listener of final 'stopped' transition, then clears all listener sets.
+  const d1 = await controller.dispose();
+  assert.equal(d1.ok, true);
+  assert.equal(d1.destroyed, true);
+  assert.equal(d1.alreadyDestroyed, false);
+  assert.equal(controller.isDestroyed(), true);
+  assert.equal(controller.getState(), SESSION_STATE.STOPPED);
+  assert.equal(observedStates[observedStates.length - 1], SESSION_STATE.STOPPED);
+
+  assert.equal(handleStopCalls, 1);
+  assert.equal(orchReleaseCalls, 1);
+  assert.equal(handleReleaseCalls, 1);
+  assert.equal(inputStopCalls, 1);
+  assert.equal(timers.activeCount(), 0);
+  assert.equal(worker.listenerCount('message'), 0);
+  assert.equal(gestureTarget.listenerCount('keydown'), 0);
+
+  const statsAfterDispose = controller.getStats();
+  assert.equal(statsAfterDispose.destroyed, true);
+  assert.equal(statsAfterDispose.cleanShutdownCount, 1);
+  assert.equal(statsAfterDispose.preloadBufferReleaseCount, 1);
+  assert.equal(statsAfterDispose.attachedWorkerCount, 0);
+  assert.equal(statsAfterDispose.activeListenerCount, 0);
+
+  // Idempotent destroy()/dispose() does not double-stop or double-count clean shutdowns.
+  const d2 = await controller.destroy();
+  assert.equal(d2.ok, true);
+  assert.equal(d2.destroyed, true);
+  assert.equal(d2.alreadyDestroyed, true);
+  assert.equal(handleStopCalls, 1);
+  assert.equal(controller.getStats().cleanShutdownCount, 1);
+
+  // start() and restart() after dispose() are rejected cleanly without spawning handles.
+  const startAfter = await controller.start();
+  assert.equal(startAfter.ok, false);
+  assert.equal(startAfter.destroyed, true);
+  const restartAfter = await controller.restart();
+  assert.equal(restartAfter.ok, false);
+  assert.equal(restartAfter.destroyed, true);
+
+  // Fallback to releaseBootBundleBytes() on orchestrator when releasePreloadBuffers() is absent.
+  let bundleReleaseCalls = 0;
+  const c2 = new RuntimeSessionController({
+    fetchImpl: createMockFetch(readyStatus({ hasWasmBinary: false })),
+    bootOrchestrator: {
+      releaseBootBundleBytes() {
+        bundleReleaseCalls += 1;
+      },
+    },
+    capabilityProbe: () => fullCapabilities(),
+    startSmokeDemo: async () => ({ stop() {} }),
+  });
+  await c2.start();
+  await c2.stop();
+  assert.equal(bundleReleaseCalls, 1);
+  assert.equal(c2.getStats().cleanShutdownCount, 1);
+  assert.equal(c2.getStats().preloadBufferReleaseCount, 1);
+  // Idempotent second stop does not double-count cleanShutdownCount.
+  await c2.stop();
+  assert.equal(c2.getStats().cleanShutdownCount, 1);
+});
+
+test('W276 recordDeviceLost / recordDeviceRecovered track sanitized counters, worker messages, and observers', async () => {
+  const clock = createClock(30_000);
+  const hud = createExtendedMockHud();
+  const hudLostEvents = [];
+  const hudRecoveredEvents = [];
+  hud.onDeviceLost = (ev) => hudLostEvents.push(ev);
+  hud.onDeviceRecovered = (ev) => hudRecoveredEvents.push(ev);
+
+  const reported = [];
+  const crashReporter = {
+    captureError(err, ctx) {
+      reported.push({ message: err.message, ctx });
+    },
+  };
+
+  const worker = createMockWorker();
+  const lostEvents = [];
+  const recoveredEvents = [];
+  const telemetryEvents = [];
+  let capturedLaunchCtx = null;
+
+  const controller = new RuntimeSessionController({
+    fetchImpl: createMockFetch(readyStatus({ hasWasmBinary: true })),
+    hud,
+    crashReporter,
+    wgpuWorker: worker,
+    now: clock.now,
+    capabilityProbe: () => fullCapabilities(),
+    onDeviceLost: (ev) => lostEvents.push(ev),
+    onDeviceRecovered: (ev) => recoveredEvents.push(ev),
+    onTelemetry: (ev) => telemetryEvents.push(ev),
+    startWasmRuntime: async (ctx) => {
+      capturedLaunchCtx = ctx;
+      return { stop() {} };
+    },
+  });
+
+  // Throwing observer must not break delivery to other observers.
+  const unsubBadLost = controller.onDeviceLost(() => {
+    throw new Error('deviceLost observer boom');
+  });
+  const unsubBadRec = controller.onDeviceRecovered(() => {
+    throw new Error('deviceRecovered observer boom');
+  });
+
+  await controller.start();
+
+  // 1. Direct recordDeviceLost(reason) sanitizes host paths and hex dumps.
+  const hexDump = 'ff'.repeat(32);
+  const l1 = controller.recordDeviceLost(
+    `GPU driver reset at C:\\Users\\alice\\gpu.dll and /Users/alice/trace.bin dump=${hexDump}\n`
+  );
+  assert.equal(l1.handled, true);
+  assert.equal(l1.type, 'gpu-device-lost');
+  assert.equal(l1.deviceLost, true);
+  assert.equal(l1.deviceLossCount, 1);
+  assert.equal(l1.deviceRecoveryCount, 0);
+  assert.doesNotMatch(l1.reason, /alice|C:\\|\/Users|ffffffff|[\r\n]/);
+  assert.match(l1.reason, /<path>/);
+  assert.match(l1.reason, /<buffer>/);
+
+  // 2. Direct recordDeviceRecovered() clears deviceLost flag and tracks recovery duration.
+  clock.advance(450);
+  const rec1 = controller.recordDeviceRecovered();
+  assert.equal(rec1.handled, true);
+  assert.equal(rec1.type, 'gpu-device-recovered');
+  assert.equal(rec1.deviceLost, false);
+  assert.equal(rec1.deviceLossCount, 1);
+  assert.equal(rec1.deviceRecoveryCount, 1);
+  assert.equal(rec1.recoveryDurationMs, 450);
+
+  // 3. Worker messages (`gpu-device-lost` and `gpu-device-recovered`) flow automatically.
+  clock.advance(100);
+  worker.emitMessage({
+    type: 'gpu-device-lost',
+    reason: 'destroyed',
+    message: 'Adapter lost due to TDR',
+    source: 'wgpu_worker',
+  });
+  clock.advance(250);
+  worker.emitMessage({
+    type: 'gpu-device-recovered',
+    source: 'wgpu_worker',
+  });
+
+  // 4. Launch context callbacks also forward while session is active.
+  clock.advance(50);
+  capturedLaunchCtx.onDeviceLost(new Error('Device lost via launcher callback'));
+  clock.advance(120);
+  capturedLaunchCtx.onDeviceRecovered({ reason: 're-initialized swapchain' });
+
+  const stats = controller.getStats();
+  assert.equal(stats.deviceLost, false);
+  assert.equal(stats.deviceLossCount, 3);
+  assert.equal(stats.deviceRecoveryCount, 3);
+  assert.equal(stats.lastDeviceLossReason, 'Device lost via launcher callback');
+  assert.equal(stats.lastDeviceRecoveredAtMs, clock.now());
+
+  const diag = controller.getDiagnostics();
+  assert.equal(diag.deviceLossCount, 3);
+  assert.equal(diag.deviceRecoveryCount, 3);
+  assert.equal(diag.deviceLost, false);
+
+  assert.equal(lostEvents.length, 3);
+  assert.equal(recoveredEvents.length, 3);
+  assert.equal(hudLostEvents.length, 3);
+  assert.equal(hudRecoveredEvents.length, 3);
+  assert.equal(telemetryEvents.filter((e) => e.type === 'gpu-device-lost').length, 3);
+  assert.equal(telemetryEvents.filter((e) => e.type === 'gpu-device-recovered').length, 3);
+  assert.equal(reported.filter((r) => r.ctx.category === 'webgpu_device_lost').length, 3);
+
+  // 5. After stop(), stale launchContext callbacks are ignored.
+  await controller.stop();
+  const staleRes = capturedLaunchCtx.onDeviceLost('stale loss');
+  assert.equal(staleRes.handled, false);
+  assert.equal(controller.getStats().deviceLossCount, 3);
+
+  // 6. resetTelemetry() clears device-loss, recovery, coalescedRestarts, and cleanShutdownCount.
+  controller.resetTelemetry();
+  const resetStats = controller.getStats();
+  assert.equal(resetStats.deviceLossCount, 0);
+  assert.equal(resetStats.deviceRecoveryCount, 0);
+  assert.equal(resetStats.deviceLost, false);
+  assert.equal(resetStats.lastDeviceLossReason, null);
+  assert.equal(resetStats.cleanShutdownCount, 0);
+  assert.equal(resetStats.coalescedRestarts, 0);
+  assert.equal(resetStats.preloadBufferReleaseCount, 0);
+
+  unsubBadLost();
+  unsubBadRec();
+});
+
+test('W276 cleanShutdownCount does not increment when handle teardown throws', async () => {
+  const reported = [];
+  const controller = new RuntimeSessionController({
+    fetchImpl: createMockFetch(readyStatus({ hasWasmBinary: true })),
+    crashReporter: {
+      captureError(err, ctx) {
+        reported.push({ message: err.message, ctx });
+      },
+    },
+    capabilityProbe: () => fullCapabilities(),
+    startWasmRuntime: async () => ({
+      async stop() {
+        throw new Error('Worker terminate fault');
+      },
+    }),
+  });
+
+  await controller.start();
+  const stopRes = await controller.stop();
+  assert.equal(stopRes.ok, true);
+  assert.equal(stopRes.state, SESSION_STATE.STOPPED);
+  assert.equal(controller.getStats().cleanShutdownCount, 0);
+  assert.ok(reported.some((r) => r.ctx.source === 'runtimeHandle'));
+});
+
+
