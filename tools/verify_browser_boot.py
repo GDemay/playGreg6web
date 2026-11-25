@@ -17,7 +17,8 @@ Security & privacy invariants:
 
 Usage:
     python tools/verify_browser_boot.py [--repo-root <dir>] [--recomp-dir <dir>]
-        [--skip-server] [--json]
+        [--skip-server] [--boot-report <path>] [--min-fps <fps>]
+        [--require-non-black] [--json]
 """
 
 from __future__ import annotations
@@ -69,6 +70,7 @@ GUEST_BOOT_EXPORT_MARKERS: frozenset[str] = frozenset(
 
 _WINDOWS_PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\s\"'<>|,;()\[\]]+")
 _UNC_PATH_RE = re.compile(r"\\\\[^\s\"'<>|,;()\[\]]+")
+_UNC_SLASH_PATH_RE = re.compile(r"(?<!:)//[^\s\"'<>|,;()\[\]]+")
 _POSIX_PATH_RE = re.compile(
     r"/(?:Users|home|tmp|var|opt|root|mnt|private|etc|usr|Library|Volumes)/[^\s\"'<>|,;()\[\]]*"
 )
@@ -106,6 +108,7 @@ def sanitize_text(raw: str | None) -> str:
     text = str(raw).replace("\\", "/")
     sanitized = _WINDOWS_PATH_RE.sub("<path>", text)
     sanitized = _UNC_PATH_RE.sub("<path>", sanitized)
+    sanitized = _UNC_SLASH_PATH_RE.sub("<path>", sanitized)
     sanitized = _POSIX_PATH_RE.sub("<path>", sanitized)
     sanitized = _DRIVE_SLASH_RE.sub("<path>", sanitized)
     for username in _current_usernames():
@@ -1573,6 +1576,497 @@ def check_local_server_gate(
 
 
 # ---------------------------------------------------------------------------
+# Optional boot-report threshold gate (T76: --min-fps & --require-non-black)
+# ---------------------------------------------------------------------------
+
+
+def _finite_non_negative_float(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    fval = float(value)
+    if not math.isfinite(fval) or fval < 0.0:
+        return None
+    return fval
+
+
+def _first_non_negative_float(*values: Any) -> float | None:
+    for value in values:
+        parsed = _finite_non_negative_float(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _non_negative_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float) and math.isfinite(value) and value >= 0.0 and value.is_integer():
+        return int(value)
+    return None
+
+
+def _first_non_negative_int(*values: Any) -> int | None:
+    for value in values:
+        parsed = _non_negative_int(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def extract_boot_report_metrics(doc: Mapping[str, Any]) -> dict[str, Any]:
+    """Extract sanitized FPS and non-black canvas metrics from a boot report dict."""
+    summary = doc.get("summary") if isinstance(doc.get("summary"), Mapping) else {}
+    counters = doc.get("counters") if isinstance(doc.get("counters"), Mapping) else {}
+    first_present_obj = (
+        doc.get("first_present") if isinstance(doc.get("first_present"), Mapping) else {}
+    )
+    milestones = doc.get("milestones") if isinstance(doc.get("milestones"), list) else []
+
+    raw_presents = doc.get("presents")
+    presents_list: list[Mapping[str, Any]] = (
+        [item for item in raw_presents if isinstance(item, Mapping)]
+        if isinstance(raw_presents, list)
+        else []
+    )
+    wall_times: list[float] = []
+    for sample in presents_list:
+        for key in ("wall_ms", "wallMs", "elapsed_ms", "elapsedMs"):
+            val = _finite_non_negative_float(sample.get(key))
+            if val is not None:
+                wall_times.append(val)
+                break
+
+    presents_count = _first_non_negative_int(
+        counters.get("presents"),
+        summary.get("presents"),
+        summary.get("presentCount"),
+        raw_presents if not isinstance(raw_presents, list) else None,
+        len(presents_list) if presents_list else None,
+        doc.get("presents_sampled"),
+    )
+
+    milestone_first_present_ms: float | None = None
+    milestone_first_visible_ms: float | None = None
+    for entry in milestones:
+        if not isinstance(entry, Mapping):
+            continue
+        name = str(entry.get("milestone") or entry.get("name") or "").strip().upper()
+        elapsed = _first_non_negative_float(entry.get("elapsed_ms"), entry.get("elapsedMs"))
+        if elapsed is None:
+            continue
+        if name == "FIRST_PRESENT" and milestone_first_present_ms is None:
+            milestone_first_present_ms = elapsed
+        elif name == "FIRST_VISIBLE_FRAME" and milestone_first_visible_ms is None:
+            milestone_first_visible_ms = elapsed
+
+    first_present_ms = _first_non_negative_float(
+        doc.get("first_present_ms"),
+        doc.get("firstPresentMs"),
+        summary.get("first_present_ms"),
+        summary.get("firstPresentMs"),
+        counters.get("first_present_ms"),
+        first_present_obj.get("elapsed_ms"),
+        first_present_obj.get("elapsedMs"),
+        milestone_first_present_ms,
+        wall_times[0] if wall_times else None,
+    )
+
+    last_present_ms = _first_non_negative_float(
+        doc.get("last_present_ms"),
+        doc.get("lastPresentMs"),
+        summary.get("last_present_ms"),
+        summary.get("lastPresentMs"),
+        counters.get("last_present_ms"),
+        wall_times[-1] if len(wall_times) >= 2 else None,
+    )
+
+    present_span_ms: float | None = None
+    if (
+        first_present_ms is not None
+        and last_present_ms is not None
+        and last_present_ms > first_present_ms
+    ):
+        present_span_ms = round(last_present_ms - first_present_ms, 2)
+
+    direct_fps_avg = _first_non_negative_float(
+        doc.get("present_fps_avg"),
+        doc.get("presentFpsAvg"),
+        summary.get("present_fps_avg"),
+        summary.get("presentFpsAvg"),
+        counters.get("present_fps_avg"),
+    )
+
+    fallback_fps = _first_non_negative_float(
+        doc.get("present_fps"),
+        doc.get("presentFps"),
+        summary.get("present_fps"),
+        summary.get("presentFps"),
+        counters.get("present_fps"),
+    )
+
+    raw_fps: float | None = None
+    fps_source: str | None = None
+
+    if direct_fps_avg is not None:
+        raw_fps = direct_fps_avg
+        fps_source = "present_fps_avg"
+    elif (
+        presents_count is not None
+        and first_present_ms is not None
+        and last_present_ms is not None
+        and last_present_ms > first_present_ms
+    ):
+        raw_fps = (float(presents_count) * 1000.0) / (last_present_ms - first_present_ms)
+        fps_source = "computed_present_span"
+    elif fallback_fps is not None:
+        raw_fps = fallback_fps
+        fps_source = "present_fps"
+    else:
+        elapsed_ms = _finite_non_negative_float(doc.get("elapsed_ms"))
+        if (
+            presents_count is not None
+            and presents_count > 0
+            and first_present_ms is not None
+            and elapsed_ms is not None
+            and elapsed_ms > first_present_ms
+        ):
+            present_span_ms = round(elapsed_ms - first_present_ms, 2)
+            raw_fps = (float(presents_count) * 1000.0) / (elapsed_ms - first_present_ms)
+            fps_source = "computed_elapsed"
+
+    non_black_canvas_frames = _first_non_negative_int(
+        summary.get("nonBlackCanvasFrames"),
+        summary.get("non_black_canvas_frames"),
+        doc.get("nonBlackCanvasFrames"),
+        doc.get("non_black_canvas_frames"),
+        counters.get("nonBlackCanvasFrames"),
+        counters.get("non_black_canvas_frames"),
+    )
+
+    raw_captured = summary.get("capturedFrames")
+    if raw_captured is None:
+        raw_captured = doc.get("capturedFrames")
+    if raw_captured is None:
+        raw_captured_list = doc.get("captured_frames")
+        if isinstance(raw_captured_list, list):
+            raw_captured = len(raw_captured_list)
+    captured_frames = _non_negative_int(raw_captured)
+
+    first_visible_frame_s = _first_non_negative_float(
+        doc.get("first_visible_frame_s"),
+        doc.get("firstVisibleFrameS"),
+        summary.get("first_visible_frame_s"),
+        summary.get("firstVisibleFrameS"),
+    )
+    if first_visible_frame_s is None:
+        fvf_ms = _first_non_negative_float(
+            summary.get("first_visible_frame_ms"),
+            summary.get("firstVisibleFrameMs"),
+            doc.get("first_visible_frame_ms"),
+            doc.get("firstVisibleFrameMs"),
+            milestone_first_visible_ms,
+        )
+        if fvf_ms is not None:
+            first_visible_frame_s = round(fvf_ms / 1000.0, 3)
+
+    has_non_black = bool(
+        (non_black_canvas_frames is not None and non_black_canvas_frames > 0)
+        or (first_visible_frame_s is not None)
+    )
+
+    return {
+        "presents_count": presents_count,
+        "first_present_ms": round(first_present_ms, 2) if first_present_ms is not None else None,
+        "last_present_ms": round(last_present_ms, 2) if last_present_ms is not None else None,
+        "present_span_ms": present_span_ms,
+        "present_fps_avg": round(raw_fps, 2) if raw_fps is not None else None,
+        "present_fps_avg_raw": raw_fps,
+        "present_fps_source": fps_source,
+        "non_black_canvas_frames": non_black_canvas_frames,
+        "captured_frames": captured_frames,
+        "first_visible_frame_s": (
+            round(first_visible_frame_s, 3) if first_visible_frame_s is not None else None
+        ),
+        "has_non_black_frame": has_non_black,
+    }
+
+
+def _discover_boot_report(
+    repo_root: Path,
+    *,
+    work_dir: Path,
+    recomp_dir: Path,
+) -> Path | None:
+    """Find the most recent boot-report.json under standard local run/work folders."""
+    runs_dir = work_dir / "browser-boot" / "runs"
+    if runs_dir.is_dir():
+        candidates: list[tuple[int, str, Path]] = []
+        try:
+            runs_resolved = runs_dir.resolve()
+            for child in runs_dir.iterdir():
+                if child.is_symlink() or not child.is_dir():
+                    continue
+                candidate = child / "boot-report.json"
+                if candidate.is_symlink() or not candidate.is_file():
+                    continue
+                try:
+                    resolved = candidate.resolve(strict=True)
+                    if not resolved.is_relative_to(runs_resolved):
+                        continue
+                    mtime_ns = resolved.stat().st_mtime_ns
+                except OSError:
+                    continue
+                candidates.append((mtime_ns, child.name, candidate))
+        except OSError:
+            candidates = []
+        if candidates:
+            candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            return candidates[0][2]
+
+    for fallback in (recomp_dir / "boot-report.json", work_dir / "boot-report.json"):
+        if fallback.is_file() and not fallback.is_symlink():
+            return fallback
+    return None
+
+
+def check_boot_report_gate(
+    repo_root: Path,
+    *,
+    boot_report: Path | str | None = None,
+    work_dir: Path | None = None,
+    recomp_dir: Path | None = None,
+    min_fps: float | None = None,
+    require_non_black: bool = False,
+) -> GateResult:
+    """Optional boot-report verification gate (`--min-fps` & `--require-non-black`)."""
+    resolved_work = work_dir if work_dir is not None else (repo_root / "work")
+    resolved_recomp = (
+        recomp_dir if recomp_dir is not None else (repo_root / DEFAULT_RECOMP_DIR_REL)
+    )
+
+    if min_fps is not None:
+        if (
+            isinstance(min_fps, bool)
+            or not isinstance(min_fps, (int, float))
+            or not math.isfinite(float(min_fps))
+            or float(min_fps) < 0.0
+        ):
+            return GateResult(
+                name="boot_report",
+                status="fail",
+                summary="invalid --min-fps threshold (must be a finite non-negative number)",
+                details={
+                    "bootReportLabel": None,
+                    "sourceMode": "explicit" if boot_report is not None else "discovered",
+                    "reportPresent": False,
+                    "reportValid": False,
+                    "min_fps": None,
+                    "min_fps_ok": False,
+                    "present_fps_avg": None,
+                    "present_fps_source": None,
+                    "presents": None,
+                    "first_present_ms": None,
+                    "last_present_ms": None,
+                    "present_span_ms": None,
+                    "require_non_black": bool(require_non_black),
+                    "non_black_ok": None,
+                    "nonBlackCanvasFrames": None,
+                    "capturedFrames": None,
+                    "first_visible_frame_s": None,
+                    "failures": ["invalid --min-fps threshold"],
+                },
+                next_action="pass a finite non-negative value to --min-fps (e.g. --min-fps 30)",
+            )
+        min_fps = float(min_fps)
+
+    if boot_report is not None:
+        candidate = Path(boot_report)
+        if not candidate.is_absolute():
+            candidate = repo_root / candidate
+        report_path: Path | None = (
+            (candidate / "boot-report.json") if candidate.is_dir() else candidate
+        )
+        source_mode = "explicit"
+    else:
+        report_path = _discover_boot_report(
+            repo_root,
+            work_dir=resolved_work,
+            recomp_dir=resolved_recomp,
+        )
+        source_mode = "discovered"
+
+    report_label = (
+        repo_relative_label(report_path, repo_root) if report_path is not None else None
+    )
+
+    details: dict[str, Any] = {
+        "bootReportLabel": report_label,
+        "sourceMode": source_mode,
+        "reportPresent": False,
+        "reportValid": False,
+        "min_fps": min_fps,
+        "min_fps_ok": None,
+        "present_fps_avg": None,
+        "present_fps_source": None,
+        "presents": None,
+        "first_present_ms": None,
+        "last_present_ms": None,
+        "present_span_ms": None,
+        "require_non_black": bool(require_non_black),
+        "non_black_ok": None,
+        "nonBlackCanvasFrames": None,
+        "capturedFrames": None,
+        "first_visible_frame_s": None,
+        "failures": [],
+    }
+
+    if report_path is None or not report_path.is_file():
+        missing_note = f" ({report_label})" if report_label else ""
+        failure_msg = f"boot-report.json not found{missing_note}"
+        details["failures"] = [failure_msg]
+        if min_fps is not None:
+            details["min_fps_ok"] = False
+        if require_non_black:
+            details["non_black_ok"] = False
+        return GateResult(
+            name="boot_report",
+            status="fail",
+            summary=failure_msg,
+            details=details,
+            next_action="python tools/run_browser_boot.py --preset start-screen --capture-frames",
+        )
+
+    details["reportPresent"] = True
+    try:
+        raw_text = report_path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError) as exc:
+        failure_msg = f"{report_label}: {type(exc).__name__}"
+        details["failures"] = [failure_msg]
+        if min_fps is not None:
+            details["min_fps_ok"] = False
+        if require_non_black:
+            details["non_black_ok"] = False
+        return GateResult(
+            name="boot_report",
+            status="fail",
+            summary=failure_msg,
+            details=details,
+            next_action="python tools/run_browser_boot.py --preset start-screen --capture-frames",
+        )
+
+    try:
+        doc = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        failure_msg = f"{report_label}: {type(exc).__name__}"
+        details["failures"] = [failure_msg]
+        if min_fps is not None:
+            details["min_fps_ok"] = False
+        if require_non_black:
+            details["non_black_ok"] = False
+        return GateResult(
+            name="boot_report",
+            status="fail",
+            summary=failure_msg,
+            details=details,
+            next_action="python tools/run_browser_boot.py --preset start-screen --capture-frames",
+        )
+
+    if not isinstance(doc, dict):
+        failure_msg = f"{report_label}: expected JSON object"
+        details["failures"] = [failure_msg]
+        if min_fps is not None:
+            details["min_fps_ok"] = False
+        if require_non_black:
+            details["non_black_ok"] = False
+        return GateResult(
+            name="boot_report",
+            status="fail",
+            summary=failure_msg,
+            details=details,
+            next_action="python tools/run_browser_boot.py --preset start-screen --capture-frames",
+        )
+
+    details["reportValid"] = True
+    metrics = extract_boot_report_metrics(doc)
+    details.update(
+        {
+            "present_fps_avg": metrics["present_fps_avg"],
+            "present_fps_source": metrics["present_fps_source"],
+            "presents": metrics["presents_count"],
+            "first_present_ms": metrics["first_present_ms"],
+            "last_present_ms": metrics["last_present_ms"],
+            "present_span_ms": metrics["present_span_ms"],
+            "nonBlackCanvasFrames": metrics["non_black_canvas_frames"],
+            "capturedFrames": metrics["captured_frames"],
+            "first_visible_frame_s": metrics["first_visible_frame_s"],
+        }
+    )
+
+    failures: list[str] = []
+    if min_fps is not None:
+        raw_fps = metrics["present_fps_avg_raw"]
+        if raw_fps is None:
+            details["min_fps_ok"] = False
+            if metrics["presents_count"] == 0:
+                failures.append(f"0 presents recorded (required --min-fps {min_fps:.2f})")
+            else:
+                failures.append(
+                    f"present_fps_avg unavailable (required --min-fps {min_fps:.2f})"
+                )
+        elif raw_fps < min_fps:
+            details["min_fps_ok"] = False
+            failures.append(
+                f"present_fps_avg {metrics['present_fps_avg']:.2f} fps < "
+                f"--min-fps {min_fps:.2f} fps"
+            )
+        else:
+            details["min_fps_ok"] = True
+
+    if require_non_black:
+        has_non_black = bool(metrics["has_non_black_frame"])
+        details["non_black_ok"] = has_non_black
+        if not has_non_black:
+            nb = metrics["non_black_canvas_frames"]
+            nb_desc = (
+                f"nonBlackCanvasFrames={nb}" if nb is not None else "nonBlackCanvasFrames=missing"
+            )
+            failures.append(
+                f"all-black boot capture ({nb_desc}, first_visible_frame_s=null)"
+            )
+
+    details["failures"] = failures
+    if failures:
+        return GateResult(
+            name="boot_report",
+            status="fail",
+            summary="; ".join(failures),
+            details=details,
+            next_action="python tools/run_browser_boot.py --preset start-screen --capture-frames",
+        )
+
+    parts: list[str] = []
+    if metrics["present_fps_avg"] is not None:
+        parts.append(
+            f"fps={metrics['present_fps_avg']:.2f} ({metrics['present_fps_source']})"
+        )
+    else:
+        parts.append("fps=n/a")
+    if metrics["non_black_canvas_frames"] is not None:
+        parts.append(f"nonBlackCanvasFrames={metrics['non_black_canvas_frames']}")
+    if metrics["first_visible_frame_s"] is not None:
+        parts.append(f"first_visible_frame_s={metrics['first_visible_frame_s']}")
+    return GateResult(
+        name="boot_report",
+        status="pass",
+        summary=f"{report_label}: " + ", ".join(parts),
+        details=details,
+        next_action=None,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Aggregation
 # ---------------------------------------------------------------------------
 
@@ -1619,6 +2113,12 @@ def compute_readiness(gates: Mapping[str, GateResult]) -> dict[str, Any]:
             if gate.next_action not in next_steps:
                 next_steps.append(gate.next_action)
 
+    boot_report_gate = gates.get("boot_report")
+    if boot_report_gate is not None:
+        if boot_report_gate.status in ("fail", "warn", "skip") and boot_report_gate.next_action:
+            if boot_report_gate.next_action not in next_steps:
+                next_steps.append(boot_report_gate.next_action)
+
     if splash_ready and not real_boot_ready:
         if wasm_kind == "smoke_shell":
             cmd = "python tools/build_guest_wasm.py work/recomp_build --verify"
@@ -1629,7 +2129,7 @@ def compute_readiness(gates: Mapping[str, GateResult]) -> dict[str, Any]:
             if cmd not in next_steps:
                 next_steps.append(cmd)
 
-    if real_boot_ready:
+    if real_boot_ready and (boot_report_gate is None or boot_report_gate.status == "pass"):
         cmd = "python server/serve_local.py"
         if cmd not in next_steps:
             next_steps.append(cmd)
@@ -1649,8 +2149,11 @@ def run_verification(
     skip_server: bool = False,
     env: Mapping[str, str] | None = None,
     import_coverage_fn: Callable[[Path], Mapping[str, Any]] | None = None,
+    boot_report: Path | str | None = None,
+    min_fps: float | None = None,
+    require_non_black: bool = False,
 ) -> dict[str, Any]:
-    """Run all six browser-boot gates and return a sanitized JSON-safe report."""
+    """Run all six browser-boot gates (plus optional boot-report checks) and return a sanitized JSON-safe report."""
     root = Path(repo_root).resolve()
     resolved_env = _resolve_env_paths(root, env=env)
     data_path: Path = resolved_env["data_path"]
@@ -1678,23 +2181,46 @@ def run_verification(
             skip_server=skip_server,
         ),
     ]
+    boot_report_requested = (
+        boot_report is not None or min_fps is not None or bool(require_non_black)
+    )
+    if boot_report_requested:
+        gates_list.append(
+            check_boot_report_gate(
+                root,
+                boot_report=boot_report,
+                work_dir=work_path,
+                recomp_dir=recomp_path,
+                min_fps=min_fps,
+                require_non_black=bool(require_non_black),
+            )
+        )
+
     gates = {gate.name: gate for gate in gates_list}
     readiness = compute_readiness(gates)
+    gates_payload = {name: gates[name].to_dict() for name in GATE_NAMES}
+    overall_ok = bool(readiness["ready_for_browser_splash"])
 
-    return sanitize_value(
-        {
-            "schemaVersion": SCHEMA_VERSION,
-            "ok": bool(readiness["ready_for_browser_splash"]),
-            "ready_for_browser_splash": readiness["ready_for_browser_splash"],
-            "ready_for_real_guest_boot": readiness["ready_for_real_guest_boot"],
-            "gates": {name: gates[name].to_dict() for name in GATE_NAMES},
-            "next_steps": readiness["next_steps"],
-        }
-    )
+    payload: dict[str, Any] = {
+        "schemaVersion": SCHEMA_VERSION,
+        "ok": overall_ok,
+        "ready_for_browser_splash": readiness["ready_for_browser_splash"],
+        "ready_for_real_guest_boot": readiness["ready_for_real_guest_boot"],
+        "gates": gates_payload,
+        "next_steps": readiness["next_steps"],
+    }
+    if boot_report_requested:
+        br_gate = gates["boot_report"]
+        br_ok = br_gate.status == "pass"
+        gates_payload["boot_report"] = br_gate.to_dict()
+        payload["boot_report_ok"] = br_ok
+        payload["ok"] = bool(overall_ok and br_ok)
+
+    return sanitize_value(payload)
 
 
 def format_report_text(report: Mapping[str, Any]) -> str:
-    """Render a concise terminal checklist for the six gates."""
+    """Render a concise terminal checklist for the verification gates."""
     lines: list[str] = [
         "=== playgta6web Browser Real-Boot Readiness ===",
         "",
@@ -1707,7 +2233,11 @@ def format_report_text(report: Mapping[str, Any]) -> str:
         "skip": "[SKIP]",
     }
     gates = report.get("gates") or {}
-    for name in GATE_NAMES:
+    ordered_names = list(GATE_NAMES)
+    for extra_name in gates.keys():
+        if extra_name not in ordered_names:
+            ordered_names.append(extra_name)
+    for name in ordered_names:
         gate = gates.get(name) or {}
         status = gate.get("status", "fail")
         tag = status_tag.get(status, "[????]")
@@ -1724,6 +2254,11 @@ def format_report_text(report: Mapping[str, Any]) -> str:
         f"  ready_for_real_guest_boot: "
         f"{'YES' if report.get('ready_for_real_guest_boot') else 'NO'}"
     )
+    if "boot_report_ok" in report:
+        lines.append(
+            f"  boot_report_ok           : "
+            f"{'YES' if report.get('boot_report_ok') else 'NO'}"
+        )
 
     next_steps = report.get("next_steps") or []
     if next_steps:
@@ -1733,6 +2268,16 @@ def format_report_text(report: Mapping[str, Any]) -> str:
             lines.append(f"  $ {step}")
 
     return "\n".join(lines)
+
+
+def _parse_min_fps(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid --min-fps value: {raw!r}") from exc
+    if not math.isfinite(value) or value < 0.0:
+        raise argparse.ArgumentTypeError("--min-fps must be a finite non-negative number")
+    return value
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -1761,6 +2306,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Skip the ephemeral local COOP/COEP server self-check.",
     )
     parser.add_argument(
+        "--boot-report",
+        type=Path,
+        default=None,
+        help=(
+            "Optional path to a boot-report.json file (or run directory containing it) "
+            "for --min-fps / --require-non-black checks."
+        ),
+    )
+    parser.add_argument(
+        "--min-fps",
+        type=_parse_min_fps,
+        default=None,
+        metavar="FPS",
+        help=(
+            "Require boot report present_fps_avg (or computed presents / "
+            "(last_present_ms - first_present_ms)) to be >= FPS."
+        ),
+    )
+    parser.add_argument(
+        "--require-non-black",
+        action="store_true",
+        help=(
+            "Require boot report nonBlackCanvasFrames > 0 (or first_visible_frame_s "
+            "is not null) so all-black captures fail immediately."
+        ),
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Emit sanitized machine-readable JSON (never includes host paths or usernames).",
@@ -1776,6 +2348,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         repo_root=args.repo_root,
         recomp_dir=args.recomp_dir,
         skip_server=args.skip_server,
+        boot_report=args.boot_report,
+        min_fps=args.min_fps,
+        require_non_black=args.require_non_black,
     )
 
     if args.json:
@@ -1783,6 +2358,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         print(format_report_text(report))
 
+    if report.get("boot_report_ok") is False:
+        return 1
     if report.get("ready_for_real_guest_boot"):
         return 0
     if report.get("ready_for_browser_splash"):
