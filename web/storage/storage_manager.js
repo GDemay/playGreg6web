@@ -15,6 +15,8 @@ export const SNAPSHOT_VERSION = 1;
 export const DEFAULT_WARN_THRESHOLD_RATIO = 0.75;
 export const DEFAULT_CRITICAL_THRESHOLD_RATIO = 0.9;
 export const DEFAULT_QUOTA_BUDGET_RATIO = 0.6;
+export const DEFAULT_WARM_BOOT_MIN_HEADROOM_RATIO = 0.1;
+export const DEFAULT_WARM_BOOT_MIN_RPF_CHUNKS = 1;
 export const QUOTA_PRESSURE_LEVELS = Object.freeze({
   OK: 'ok',
   WARN: 'warn',
@@ -26,6 +28,15 @@ export const CACHE_ENTRY_KINDS = Object.freeze({
   PGIM: 'pgim',
   RANGE_CHUNK: 'range-chunk',
   GENERIC: 'generic',
+});
+export const WARM_BOOT_RECOMMENDATIONS = Object.freeze({
+  READY: 'ready',
+  OPFS_UNSUPPORTED: 'opfs-unsupported',
+  LOW_QUOTA_HEADROOM: 'low-quota-headroom',
+  REQUEST_PERSISTENCE: 'request-persistence',
+  WARM_CACHE_EMPTY: 'warm-cache-empty',
+  CACHE_SHADER_PACK: 'cache-shader-pack',
+  CACHE_RPF_CHUNKS: 'cache-rpf-chunks',
 });
 
 const BYTE_UNITS = Object.freeze(['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB']);
@@ -2894,6 +2905,279 @@ export class BrowserStorageManager {
         cleanupCount: stats.cleanupCount,
         lastCleanupAtMs: stats.lastCleanupAtMs,
       },
+    };
+  }
+
+  /**
+   * Evaluates sanitized warm-boot storage readiness by combining OPFS support,
+   * persistence status, estimated quota headroom, and cached shader-pack / RPF
+   * chunk coverage. Never exposes host paths, directory/database names, cache
+   * keys, or raw file contents.
+   *
+   * @param {object} [options]
+   * @param {object} [options.quota] Optional pre-fetched quota estimate override.
+   * @param {object} [options.quotaEstimate] Alias for `options.quota`.
+   * @param {object} [options.cacheStats] Optional cache stats/summary override.
+   * @param {object} [options.cacheSummary] Alias for `options.cacheStats`.
+   * @param {object} [options.opfsCache] Optional OPFS cache inspection override.
+   * @param {object} [options.summary] Optional combined summary (`getSummary()` / `getUsageSnapshot()`).
+   * @param {boolean} [options.opfsSupported] Optional explicit OPFS support override.
+   * @param {boolean} [options.persisted] Optional explicit persistence override.
+   * @param {boolean} [options.shaderPackCached] Optional explicit shader-pack coverage override.
+   * @param {number} [options.rpfChunksCached] Optional explicit cached RPF chunk count override.
+   * @param {number} [options.minHeadroomRatio=0.1] Minimum required free quota ratio in [0, 1] when quota is known.
+   * @param {number} [options.minAvailableBytes=0] Minimum required available quota bytes.
+   * @param {number} [options.minRpfChunks=1] Minimum cached RPF chunks required for warm-boot coverage.
+   * @param {boolean} [options.requireShaderPack=true] Whether a cached shader pack is required for warm-boot readiness.
+   * @param {boolean} [options.requirePersistence=false] Whether `persisted === true` is required for `warmBootReady`.
+   */
+  async getWarmBootReadiness(options = {}) {
+    const opts = options && typeof options === 'object' ? options : {};
+    const summaryInput = opts.summary && typeof opts.summary === 'object' ? opts.summary : null;
+
+    const rawQuota =
+      opts.quota && typeof opts.quota === 'object'
+        ? opts.quota
+        : opts.quotaEstimate && typeof opts.quotaEstimate === 'object'
+          ? opts.quotaEstimate
+          : summaryInput && summaryInput.quota && typeof summaryInput.quota === 'object'
+            ? summaryInput.quota
+            : null;
+
+    let quotaSupported = false;
+    let quotaBytes = 0;
+    let usageBytes = 0;
+    let availableBytes = 0;
+    let persisted = false;
+
+    if (rawQuota) {
+      const usageRaw = rawQuota.usageBytes !== undefined ? rawQuota.usageBytes : rawQuota.usage;
+      const quotaRaw = rawQuota.quotaBytes !== undefined ? rawQuota.quotaBytes : rawQuota.quota;
+      const validQuotaNumber =
+        typeof quotaRaw === 'number' && Number.isFinite(quotaRaw) && quotaRaw > 0;
+      quotaSupported =
+        rawQuota.supported === false ? false : rawQuota.supported === true || validQuotaNumber;
+      quotaBytes = quotaSupported && validQuotaNumber ? Math.floor(quotaRaw) : 0;
+      usageBytes = quotaSupported ? sanitizeNonNegativeInt(usageRaw) : 0;
+      availableBytes = quotaSupported && quotaBytes > 0 ? Math.max(0, quotaBytes - usageBytes) : 0;
+      persisted =
+        opts.persisted !== undefined ? Boolean(opts.persisted) : Boolean(rawQuota.persisted);
+    } else {
+      const liveQuota = await this.getQuotaEstimate();
+      quotaSupported = Boolean(liveQuota.supported);
+      quotaBytes = quotaSupported ? sanitizeNonNegativeInt(liveQuota.quotaBytes) : 0;
+      usageBytes = quotaSupported ? sanitizeNonNegativeInt(liveQuota.usageBytes) : 0;
+      availableBytes = quotaSupported && quotaBytes > 0 ? Math.max(0, quotaBytes - usageBytes) : 0;
+      persisted =
+        opts.persisted !== undefined ? Boolean(opts.persisted) : Boolean(liveQuota.persisted);
+    }
+
+    const headroomRatio =
+      quotaSupported && quotaBytes > 0
+        ? clampUnitRatio(availableBytes / quotaBytes, 0)
+        : null;
+
+    const rawCache =
+      opts.cacheSummary && typeof opts.cacheSummary === 'object'
+        ? opts.cacheSummary
+        : opts.cacheStats && typeof opts.cacheStats === 'object'
+          ? opts.cacheStats
+          : opts.opfsCache && typeof opts.opfsCache === 'object'
+            ? opts.opfsCache
+            : summaryInput && summaryInput.opfsCache && typeof summaryInput.opfsCache === 'object'
+              ? summaryInput.opfsCache
+              : null;
+
+    let opfsSupported = false;
+    let cachedEntries = 0;
+    let cachedBytes = 0;
+    let inferredShaderPacks = 0;
+    let inferredRpfChunks = 0;
+    let hasExplicitEntryCount = false;
+
+    if (rawCache) {
+      if (opts.opfsSupported !== undefined) {
+        opfsSupported = Boolean(opts.opfsSupported);
+      } else if (rawCache.opfsSupported !== undefined) {
+        opfsSupported = Boolean(rawCache.opfsSupported);
+      } else if (rawCache.supported !== undefined) {
+        opfsSupported = Boolean(rawCache.supported);
+      } else {
+        opfsSupported = (await this._resolveOpfsRoot()) !== null;
+      }
+
+      if (rawCache.cachedEntries !== undefined) {
+        cachedEntries = sanitizeNonNegativeInt(rawCache.cachedEntries);
+        hasExplicitEntryCount = true;
+      } else if (rawCache.entryCount !== undefined) {
+        cachedEntries = sanitizeNonNegativeInt(rawCache.entryCount);
+        hasExplicitEntryCount = true;
+      } else if (rawCache.entriesCount !== undefined) {
+        cachedEntries = sanitizeNonNegativeInt(rawCache.entriesCount);
+        hasExplicitEntryCount = true;
+      } else if (Array.isArray(rawCache.entries)) {
+        cachedEntries = rawCache.entries.length;
+        hasExplicitEntryCount = true;
+      }
+
+      if (rawCache.cachedBytes !== undefined) {
+        cachedBytes = sanitizeNonNegativeInt(rawCache.cachedBytes);
+      } else if (rawCache.totalBytes !== undefined) {
+        cachedBytes = sanitizeNonNegativeInt(rawCache.totalBytes);
+      } else if (rawCache.bytes !== undefined) {
+        cachedBytes = sanitizeNonNegativeInt(rawCache.bytes);
+      } else if (Array.isArray(rawCache.entries)) {
+        for (const item of rawCache.entries) {
+          if (!item || typeof item !== 'object') continue;
+          cachedBytes += sanitizeNonNegativeInt(
+            item.sizeBytes !== undefined ? item.sizeBytes : item.size
+          );
+        }
+      }
+
+      if (Array.isArray(rawCache.entries)) {
+        for (const item of rawCache.entries) {
+          if (!item || typeof item !== 'object') continue;
+          const key = typeof item.key === 'string' ? item.key : typeof item.name === 'string' ? item.name : '';
+          const tracked = key ? this._cacheEntries.get(key) : null;
+          const kind =
+            typeof item.kind === 'string'
+              ? normalizeCacheKind(item.kind, key)
+              : tracked
+                ? tracked.kind
+                : inferCacheEntryKind(key);
+          if (kind === CACHE_ENTRY_KINDS.SHADER_PACK) {
+            inferredShaderPacks += 1;
+          } else if (kind === CACHE_ENTRY_KINDS.RANGE_CHUNK) {
+            inferredRpfChunks += 1;
+          }
+        }
+      } else if (
+        this._cacheEntries.size > 0 &&
+        cachedEntries === this._cacheEntries.size &&
+        rawCache.shaderPackCached === undefined &&
+        rawCache.shaderPackCount === undefined &&
+        rawCache.shaderPacksCached === undefined &&
+        rawCache.rpfChunksCached === undefined &&
+        rawCache.rangeChunkCount === undefined &&
+        rawCache.chunkCount === undefined
+      ) {
+        for (const entry of this._cacheEntries.values()) {
+          if (entry.kind === CACHE_ENTRY_KINDS.SHADER_PACK) {
+            inferredShaderPacks += 1;
+          } else if (entry.kind === CACHE_ENTRY_KINDS.RANGE_CHUNK) {
+            inferredRpfChunks += 1;
+          }
+        }
+      }
+    } else {
+      const liveOpfsCache = await this.inspectOpfsCache();
+      opfsSupported =
+        opts.opfsSupported !== undefined
+          ? Boolean(opts.opfsSupported)
+          : Boolean(liveOpfsCache.supported);
+      if (liveOpfsCache.supported) {
+        cachedEntries = sanitizeNonNegativeInt(liveOpfsCache.entryCount);
+        cachedBytes = sanitizeNonNegativeInt(liveOpfsCache.totalBytes);
+        hasExplicitEntryCount = true;
+        for (const entry of liveOpfsCache.entries) {
+          const tracked = this._cacheEntries.get(entry.name);
+          const kind = tracked ? tracked.kind : inferCacheEntryKind(entry.name);
+          if (kind === CACHE_ENTRY_KINDS.SHADER_PACK) {
+            inferredShaderPacks += 1;
+          } else if (kind === CACHE_ENTRY_KINDS.RANGE_CHUNK) {
+            inferredRpfChunks += 1;
+          }
+        }
+      }
+    }
+
+    let shaderPackCached = inferredShaderPacks > 0;
+    if (opts.shaderPackCached !== undefined) {
+      shaderPackCached = Boolean(opts.shaderPackCached);
+    } else if (rawCache) {
+      if (rawCache.shaderPackCached !== undefined) {
+        shaderPackCached = Boolean(rawCache.shaderPackCached);
+      } else if (rawCache.shaderPackCount !== undefined) {
+        shaderPackCached = sanitizeNonNegativeInt(rawCache.shaderPackCount) > 0;
+      } else if (rawCache.shaderPacksCached !== undefined) {
+        shaderPackCached = sanitizeNonNegativeInt(rawCache.shaderPacksCached) > 0;
+      }
+    }
+
+    let rpfChunksCached = inferredRpfChunks;
+    if (opts.rpfChunksCached !== undefined) {
+      rpfChunksCached = sanitizeNonNegativeInt(opts.rpfChunksCached);
+    } else if (rawCache) {
+      if (rawCache.rpfChunksCached !== undefined) {
+        rpfChunksCached = sanitizeNonNegativeInt(rawCache.rpfChunksCached);
+      } else if (rawCache.rangeChunkCount !== undefined) {
+        rpfChunksCached = sanitizeNonNegativeInt(rawCache.rangeChunkCount);
+      } else if (rawCache.chunkCount !== undefined) {
+        rpfChunksCached = sanitizeNonNegativeInt(rawCache.chunkCount);
+      }
+    }
+
+    if (!hasExplicitEntryCount && (shaderPackCached || rpfChunksCached > 0)) {
+      cachedEntries = rpfChunksCached + (shaderPackCached ? 1 : 0);
+    }
+
+    const minHeadroomRatio = clampUnitRatio(
+      opts.minHeadroomRatio,
+      DEFAULT_WARM_BOOT_MIN_HEADROOM_RATIO
+    );
+    const minAvailableBytes = sanitizeNonNegativeInt(opts.minAvailableBytes);
+    const minRpfChunks =
+      opts.minRpfChunks !== undefined
+        ? sanitizeNonNegativeInt(opts.minRpfChunks)
+        : DEFAULT_WARM_BOOT_MIN_RPF_CHUNKS;
+    const requireShaderPack = opts.requireShaderPack !== false;
+    const requirePersistence = opts.requirePersistence === true;
+
+    const hasSufficientHeadroom =
+      headroomRatio !== null
+        ? headroomRatio >= minHeadroomRatio && availableBytes >= minAvailableBytes
+        : minAvailableBytes === 0;
+
+    let warmBootReady = false;
+    let recommendation = WARM_BOOT_RECOMMENDATIONS.READY;
+
+    if (!opfsSupported) {
+      warmBootReady = false;
+      recommendation = WARM_BOOT_RECOMMENDATIONS.OPFS_UNSUPPORTED;
+    } else if (!hasSufficientHeadroom) {
+      warmBootReady = false;
+      recommendation = WARM_BOOT_RECOMMENDATIONS.LOW_QUOTA_HEADROOM;
+    } else if (cachedEntries === 0 && !shaderPackCached && rpfChunksCached === 0) {
+      warmBootReady = false;
+      recommendation = WARM_BOOT_RECOMMENDATIONS.WARM_CACHE_EMPTY;
+    } else if (requireShaderPack && !shaderPackCached) {
+      warmBootReady = false;
+      recommendation = WARM_BOOT_RECOMMENDATIONS.CACHE_SHADER_PACK;
+    } else if (rpfChunksCached < minRpfChunks) {
+      warmBootReady = false;
+      recommendation = WARM_BOOT_RECOMMENDATIONS.CACHE_RPF_CHUNKS;
+    } else if (!persisted) {
+      warmBootReady = !requirePersistence;
+      recommendation = WARM_BOOT_RECOMMENDATIONS.REQUEST_PERSISTENCE;
+    } else {
+      warmBootReady = true;
+      recommendation = WARM_BOOT_RECOMMENDATIONS.READY;
+    }
+
+    return {
+      opfsSupported,
+      persisted,
+      quotaBytes,
+      usageBytes,
+      availableBytes,
+      headroomRatio,
+      cachedEntries,
+      cachedBytes,
+      shaderPackCached,
+      rpfChunksCached,
+      warmBootReady,
+      recommendation,
     };
   }
 }
