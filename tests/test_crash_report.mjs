@@ -1250,7 +1250,14 @@ test('W220 preserves trap VAs, instruction offsets, GPU validation/draw/skip cou
   perf.recordFrameTimeMs(17.0);
   perf.recordFrameTimeMs(25.0); // p99 = 25.0ms -> 1%-low FPS = 40
   const rawPerfSnap = perf.getSnapshot();
-  assert.equal('onePercentLowFps' in rawPerfSnap.frames, false);
+  assert.equal(rawPerfSnap.frames.onePercentLowFps, 40);
+  const legacyPerfSnap = {
+    ...rawPerfSnap,
+    frames: { ...rawPerfSnap.frames },
+  };
+  delete legacyPerfSnap.frames.onePercentLowFps;
+  delete legacyPerfSnap.frames.fps1PctLow;
+  assert.equal('onePercentLowFps' in legacyPerfSnap.frames, false);
 
   const reporter = new CrashReporter({
     appVersion: '0.4.0-w220',
@@ -1383,10 +1390,13 @@ test('W220 preserves trap VAs, instruction offsets, GPU validation/draw/skip cou
   assert.equal('streamUrl' in storedBink, false);
 
   const report = reporter.buildReport({ perfSnapshot: rawPerfSnap });
-  // Caller's perfSnapshot object was not mutated
-  assert.equal('onePercentLowFps' in rawPerfSnap.frames, false);
-  // Exported bundle carries derived 1%-low FPS (1000 / 25.0 = 40)
+  // Exported bundle preserves 1%-low FPS (1000 / 25.0 = 40) from PerfMonitor
   assert.equal(report.perf.frames.onePercentLowFps, 40);
+
+  // Legacy perfSnapshot without onePercentLowFps derives it without mutating caller input
+  const derivedReport = reporter.buildReport({ perfSnapshot: legacyPerfSnap });
+  assert.equal('onePercentLowFps' in legacyPerfSnap.frames, false);
+  assert.equal(derivedReport.perf.frames.onePercentLowFps, 40);
 
   // Exact trap VA and instruction offset preserved
   assert.equal(report.bootDiagnostics.bootSnapshot.lastTrap.guestVa, '0x140045678');
