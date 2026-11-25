@@ -13,11 +13,14 @@ import {
   DEFAULT_RANGE_RETRY_DELAY_MS,
   DEFAULT_PREFETCH_MAX_GAP_BYTES,
   DEFAULT_PREFETCH_MAX_SPAN_BYTES,
+  DEFAULT_MAX_COALESCE_GAP_BYTES,
+  DEFAULT_MAX_COALESCE_SPAN_BYTES,
   SHADER_STAGE,
   STAGE_NAMES,
   fnv1a64,
   normalizeHash,
   formatHashHex,
+  coalesceEntryRanges,
   buildWgslPackBuffer,
   parseWgslPack,
   parseWgslPackIndex,
@@ -4287,4 +4290,460 @@ test('W259 guards against infinite reload loops when ETag keeps changing and coa
     'concurrent stale fetches must coalesce onto a single index reload'
   );
   assert.equal(concPack.getStats().inFlightCount, 0);
+});
+
+// ---------------------------------------------------------------------------
+// W317: Coalesce adjacent/nearby WGPK entry Range fetches (#1269)
+// ---------------------------------------------------------------------------
+
+test('W317 coalesceEntryRanges sorts by offset, honors 64 KiB gap / 2 MiB span defaults, splits on caps, and never mutates input', () => {
+  assert.equal(DEFAULT_MAX_COALESCE_GAP_BYTES, 65536);
+  assert.equal(DEFAULT_MAX_COALESCE_SPAN_BYTES, 2 * 1024 * 1024);
+
+  // Empty / null / zero-length inputs
+  assert.deepEqual(coalesceEntryRanges(null), []);
+  assert.deepEqual(coalesceEntryRanges(undefined), []);
+  assert.deepEqual(coalesceEntryRanges([]), []);
+  assert.deepEqual(coalesceEntryRanges([{ offset: 100, length: 0 }]), []);
+
+  // Validation errors
+  assert.throws(() => coalesceEntryRanges('invalid'), TypeError);
+  assert.throws(() => coalesceEntryRanges([null]), TypeError);
+  assert.throws(() => coalesceEntryRanges([{ offset: -1, length: 10 }]), RangeError);
+  assert.throws(() => coalesceEntryRanges([{ offset: 0, length: -5 }]), RangeError);
+  assert.throws(() => coalesceEntryRanges([{ offset: 10, end: 5 }]), RangeError);
+  assert.throws(() => coalesceEntryRanges([{ offset: 10 }]), RangeError);
+  assert.throws(() => coalesceEntryRanges([], { maxCoalesceGapBytes: -1 }), RangeError);
+  assert.throws(() => coalesceEntryRanges([], { maxCoalesceSpanBytes: 0 }), RangeError);
+
+  // Default 64 KiB gap boundary: exact 65536B merges, 65537B splits; input array must not mutate
+  const e0 = { id: 'e0', offset: 1000, length: 200 }; // [1000..1200)
+  const e1 = { id: 'e1', offset: 1200 + 65536, length: 300 }; // exact 64 KiB gap -> merges with e0!
+  const e2 = { id: 'e2', offset: 1200 + 65536 + 300 + 65537, length: 100 }; // 64 KiB + 1B gap -> splits!
+  const eZero = { id: 'zero', offset: 500, length: 0 }; // skipped
+  const unsorted = [e2, eZero, e1, e0];
+  const snapshotBefore = unsorted.slice();
+
+  const defaultSpans = coalesceEntryRanges(unsorted);
+  assert.deepEqual(unsorted, snapshotBefore, 'coalesceEntryRanges must not mutate caller array');
+  assert.equal(defaultSpans.length, 2);
+
+  assert.equal(defaultSpans[0].start, 1000);
+  assert.equal(defaultSpans[0].end, e1.offset + e1.length);
+  assert.equal(defaultSpans[0].rangeEnd, e1.offset + e1.length - 1);
+  assert.equal(defaultSpans[0].spanBytes, 200 + 65536 + 300);
+  assert.equal(defaultSpans[0].payloadBytes, 500);
+  assert.equal(defaultSpans[0].gapBytes, 65536);
+  assert.deepEqual(
+    defaultSpans[0].entries.map((e) => e.id),
+    ['e0', 'e1']
+  );
+
+  assert.equal(defaultSpans[1].start, e2.offset);
+  assert.equal(defaultSpans[1].end, e2.offset + e2.length);
+  assert.equal(defaultSpans[1].spanBytes, 100);
+  assert.equal(defaultSpans[1].payloadBytes, 100);
+  assert.equal(defaultSpans[1].gapBytes, 0);
+  assert.deepEqual(
+    defaultSpans[1].entries.map((e) => e.id),
+    ['e2']
+  );
+
+  // Default 2 MiB span cap splits contiguous chunks cleanly without exceeding 2 MiB
+  const oneMiB = 1024 * 1024;
+  const spanCapEntries = [
+    { id: 'c0', start: 0, end: oneMiB },
+    { id: 'c1', start: oneMiB, end: 2 * oneMiB }, // exactly 2 MiB -> merges with c0!
+    { id: 'c2', start: 2 * oneMiB, end: 2 * oneMiB + 1 }, // 2 MiB + 1B -> splits!
+  ];
+  const cappedSpans = coalesceEntryRanges(spanCapEntries);
+  assert.equal(cappedSpans.length, 2);
+  assert.equal(cappedSpans[0].spanBytes, 2 * oneMiB);
+  assert.equal(cappedSpans[0].entries.length, 2);
+  assert.equal(cappedSpans[1].spanBytes, 1);
+  assert.equal(cappedSpans[1].entries.length, 1);
+
+  // Custom gap + span cap + oversized single entry + >2 GiB u32 offsets
+  const hiBase = 0x90000000;
+  const customSpans = coalesceEntryRanges(
+    [
+      { id: 'a', offset: hiBase, length: 100 },
+      { id: 'b', offset: hiBase + 150, length: 100 }, // gap 50 <= 64, span 250 <= 300 -> merges
+      { id: 'c', offset: hiBase + 250, length: 100 }, // span 350 > 300 -> splits into new span
+      { id: 'oversized', offset: hiBase + 350, length: 500 }, // single entry > 300 -> own exact span
+    ],
+    { maxCoalesceGapBytes: 64, maxCoalesceSpanBytes: 300 }
+  );
+  assert.equal(customSpans.length, 3);
+  assert.deepEqual(
+    customSpans[0].entries.map((e) => e.id),
+    ['a', 'b']
+  );
+  assert.equal(customSpans[0].gapBytes, 50);
+  assert.deepEqual(
+    customSpans[1].entries.map((e) => e.id),
+    ['c']
+  );
+  assert.deepEqual(
+    customSpans[2].entries.map((e) => e.id),
+    ['oversized']
+  );
+  assert.equal(customSpans[2].spanBytes, 500);
+});
+
+test('W317 prefetchHashes coalesces N nearby shaders across a 40 KiB gap into 1 HTTP 206 Range request and reports sanitized telemetry', async () => {
+  const enc = new TextEncoder();
+  const makeWgsl = (tag, targetBytes) => {
+    const prefix = `@compute @workgroup_size(1) fn w317_${tag}() { /* `;
+    const suffix = ' */ }';
+    const padLen = targetBytes - enc.encode(prefix).byteLength - enc.encode(suffix).byteLength;
+    assert.ok(padLen >= 0);
+    return `${prefix}${'w'.repeat(padLen)}${suffix}`;
+  };
+
+  // Build 8 menu/world shaders split by a 40 KiB unrequested gap (<= 64 KiB default!),
+  // plus a far-away isolated cluster separated by an 80 KiB unrequested gap (> 64 KiB default!).
+  const menuShaders = [];
+  for (let i = 0; i < 4; i += 1) {
+    menuShaders.push({
+      hash: fnv1a64(`w317-menu-a-${i}`),
+      stage: SHADER_STAGE.FRAGMENT,
+      wgsl: makeWgsl(`ma_${i}`, 256),
+    });
+  }
+  const gap40k = {
+    hash: fnv1a64('w317-unrequested-40k-gap'),
+    stage: SHADER_STAGE.COMPUTE,
+    wgsl: makeWgsl('gap40k', 40 * 1024),
+  };
+  for (let i = 4; i < 8; i += 1) {
+    menuShaders.push({
+      hash: fnv1a64(`w317-menu-b-${i}`),
+      stage: SHADER_STAGE.VERTEX,
+      wgsl: makeWgsl(`mb_${i}`, 256),
+    });
+  }
+  const gap80k = {
+    hash: fnv1a64('w317-unrequested-80k-gap'),
+    stage: SHADER_STAGE.COMPUTE,
+    wgsl: makeWgsl('gap80k', 80 * 1024),
+  };
+  const worldA = {
+    hash: fnv1a64('w317-world-a'),
+    stage: SHADER_STAGE.FRAGMENT,
+    wgsl: makeWgsl('wa', 300),
+  };
+  const gap120 = {
+    hash: fnv1a64('w317-unrequested-120b-gap'),
+    stage: SHADER_STAGE.COMPUTE,
+    wgsl: makeWgsl('gap120', 120),
+  };
+  const worldB = {
+    hash: fnv1a64('w317-world-b'),
+    stage: SHADER_STAGE.VERTEX,
+    wgsl: makeWgsl('wb', 300),
+  };
+  const gap5k = {
+    hash: fnv1a64('w317-unrequested-5k-gap'),
+    stage: SHADER_STAGE.COMPUTE,
+    wgsl: makeWgsl('gap5k', 5000),
+  };
+  const isolated = {
+    hash: fnv1a64('w317-isolated'),
+    stage: SHADER_STAGE.COMPUTE,
+    wgsl: makeWgsl('iso', 300),
+  };
+
+  const allEntries = [
+    ...menuShaders.slice(0, 4),
+    gap40k,
+    ...menuShaders.slice(4, 8),
+    gap80k,
+    worldA,
+    gap120,
+    worldB,
+    gap5k,
+    isolated,
+  ];
+  const packBuf = buildWgslPackBuffer(allEntries);
+  const tableEnd = WGPK_HEADER_BYTES + allEntries.length * WGPK_ENTRY_BYTES;
+
+  const mock = createRangeMockFetch({ '/packs/w317-menu.wgsl.pack': packBuf });
+  const loader = new WgslPackLoader({
+    fetch: mock.fetch,
+    initialRangeBytes: tableEnd,
+  });
+  const pack = await loader.loadIndexFromUrl('/packs/w317-menu.wgsl.pack');
+
+  assert.equal(pack.getStats().maxCoalesceGapBytes, 65536);
+  assert.equal(pack.getStats().maxCoalesceSpanBytes, 2 * 1024 * 1024);
+
+  // 1. Prefetch all 8 menu shaders (deliberately reversed order) using defaults (64 KiB gap, 2 MiB span):
+  //    MUST issue exactly 1 HTTP 206 Range request spanning all 8 shaders across the 40 KiB gap!
+  const resMenu = await loader.prefetchHashes(menuShaders.map((e) => e.hash).reverse());
+  assert.equal(resMenu.requested, 8);
+  assert.equal(resMenu.prefetched, 8);
+  assert.equal(resMenu.batches, 1);
+  assert.equal(resMenu.bytesFetched, 8 * 256 + 40 * 1024);
+  assert.equal(mock.requests.length, 2, '8 nearby shaders must be fetched in exactly 1 HTTP 206 Range request');
+
+  const firstOff = pack.entries.get(menuShaders[0].hash).offset;
+  const lastEntry = pack.entries.get(menuShaders[7].hash);
+  assert.equal(mock.requests[1].range, `bytes=${firstOff}-${lastEntry.offset + lastEntry.length - 1}`);
+
+  // All 8 sliced payloads match byte-for-byte with 0 additional HTTP traffic
+  for (const s of menuShaders) {
+    assert.equal(await loader.getWgslAsync(s.hash), s.wgsl);
+  }
+  assert.equal(mock.requests.length, 2);
+
+  for (const stats of [pack.getStats(), loader.getStats(), loader.inspect().stats]) {
+    assert.equal(stats.coalescedRangeFetches, 1);
+    assert.equal(stats.coalescedEntriesFetched, 8);
+    assert.equal(stats.httpRequestsSavedByCoalescing, 7);
+    assert.equal(stats.coalescedGapBytes, 40 * 1024);
+    assert.equal(
+      stats.coalescedEntriesFetched - stats.coalescedRangeFetches,
+      stats.httpRequestsSavedByCoalescing
+    );
+  }
+
+  // 2. Prefetch worldA, worldB (120B gap) + isolated (5000B gap) with maxCoalesceGapBytes=256, maxCoalesceSpanBytes=1024:
+  //    - [worldA, worldB] coalesces (1 coalesced fetch, 2 entries, 1 request saved, 120B gap)
+  //    - [isolated] splits into its own single-entry fetch (does NOT increment coalesced* counters!)
+  const reqsBeforeWorld = mock.requests.length;
+  const resWorld = await loader.prefetchHashes([isolated.hash, worldB.hash, worldA.hash], {
+    maxCoalesceGapBytes: 256,
+    maxCoalesceSpanBytes: 1024,
+  });
+  assert.equal(resWorld.prefetched, 3);
+  assert.equal(resWorld.batches, 2);
+  assert.equal(mock.requests.length, reqsBeforeWorld + 2);
+  assert.equal(await loader.getWgslAsync(worldA.hash), worldA.wgsl);
+  assert.equal(await loader.getWgslAsync(worldB.hash), worldB.wgsl);
+  assert.equal(await loader.getWgslAsync(isolated.hash), isolated.wgsl);
+  assert.equal(mock.requests.length, reqsBeforeWorld + 2);
+
+  const finalPackStats = pack.getStats();
+  const finalLoaderStats = loader.getStats();
+  const snapshot = loader.inspect();
+  assert.doesNotThrow(() => JSON.stringify(snapshot));
+
+  for (const stats of [finalPackStats, finalLoaderStats, snapshot.stats]) {
+    assert.equal(stats.coalescedRangeFetches, 2);
+    assert.equal(stats.coalescedEntriesFetched, 10); // 8 + 2 (isolated single-entry excluded)
+    assert.equal(stats.httpRequestsSavedByCoalescing, 8); // 7 + 1
+    assert.equal(stats.coalescedGapBytes, 40 * 1024 + 120);
+    for (const key of [
+      'coalescedRangeFetches',
+      'coalescedEntriesFetched',
+      'httpRequestsSavedByCoalescing',
+      'coalescedGapBytes',
+    ]) {
+      assert.equal(typeof stats[key], 'number');
+      assert.ok(Number.isSafeInteger(stats[key]) && stats[key] >= 0, `${key} must be a sanitized non-negative safe integer`);
+    }
+  }
+});
+
+test('W317 coalesced prefetchHashes preserves W259 ETag/size/416/mid-shader stale-reload protection and bounded 1x reload cap', async () => {
+  const enc = new TextEncoder();
+  const h0 = fnv1a64('w317-stale-0');
+  const h1 = fnv1a64('w317-stale-1');
+  const h2 = fnv1a64('w317-stale-2');
+  const h3 = fnv1a64('w317-stale-3');
+
+  const wgsl0_v1 = '@vertex fn vs0_v1() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }';
+  const wgsl1_v1 = '@fragment fn fs1_v1() -> @location(0) vec4<f32> { return vec4<f32>(1.0, 0.0, 0.0, 1.0); }';
+  const wgsl2_v1 = '@compute @workgroup_size(1) fn cs2_v1() {}';
+  const wgsl3_v1 = '@compute @workgroup_size(2) fn cs3_v1() {}';
+
+  // In V2, shader 0 grows so V1's offset for shader 1 lands directly on a function-body `let ...`!
+  const wgsl0_v1_len = enc.encode(wgsl0_v1).byteLength;
+  const v2Prefix = '@vertex fn vs0_v2() -> @builtin(position) vec4<f32> { ';
+  const padToOld1 = Math.max(0, wgsl0_v1_len - enc.encode(v2Prefix).byteLength);
+  const wgsl0_v2 =
+    `${v2Prefix}${' '.repeat(padToOld1)}` +
+    `let coalesced_spliced = vec4<f32>(0.25, 0.5, 0.75, 1.0); return coalesced_spliced; }`;
+  const wgsl1_v2 = '@fragment fn fs1_v2() -> @location(0) vec4<f32> { return vec4<f32>(0.0, 1.0, 0.5, 1.0); }';
+  const wgsl2_v2 = '@compute @workgroup_size(4) fn cs2_v2() {}';
+  const wgsl3_v2 = '@compute @workgroup_size(8) fn cs3_v2() {}';
+
+  const packV1 = buildWgslPackBuffer([
+    { hash: h0, stage: SHADER_STAGE.VERTEX, wgsl: wgsl0_v1 },
+    { hash: h1, stage: SHADER_STAGE.FRAGMENT, wgsl: wgsl1_v1 },
+    { hash: h2, stage: SHADER_STAGE.COMPUTE, wgsl: wgsl2_v1 },
+    { hash: h3, stage: SHADER_STAGE.COMPUTE, wgsl: wgsl3_v1 },
+  ]);
+  const packV2 = buildWgslPackBuffer([
+    { hash: h0, stage: SHADER_STAGE.VERTEX, wgsl: wgsl0_v2 },
+    { hash: h1, stage: SHADER_STAGE.FRAGMENT, wgsl: wgsl1_v2 },
+    { hash: h2, stage: SHADER_STAGE.COMPUTE, wgsl: wgsl2_v2 },
+    { hash: h3, stage: SHADER_STAGE.COMPUTE, wgsl: wgsl3_v2 },
+  ]);
+  const tableEnd = WGPK_HEADER_BYTES + 4 * WGPK_ENTRY_BYTES;
+
+  // 1. ETag + size mismatch during coalesced prefetchHashes (with concurrent getWgslAsync + WgslPackLoader sync)
+  const etagMock = createMutableRangePackMock({
+    bytes: packV1,
+    etag: '"menu-v1"',
+    lastModified: 'Wed, 25 Nov 2026 18:00:00 GMT',
+  });
+  const loader = new WgslPackLoader({
+    fetch: etagMock.fetch,
+    initialRangeBytes: tableEnd,
+  });
+  const pack = await loader.loadIndexFromUrl('/packs/menu-coalesce.wgsl.pack');
+  const gpu = createMockGpuDevice();
+
+  // Pin & compile h0 from V1 before swap
+  loader.pinHashes([h0]);
+  const oldMod0 = await loader.getOrCreateShaderModuleAsync(gpu.device, h0, 'gta6');
+  assert.equal(oldMod0.code, wgsl0_v1);
+  const reqsBeforeSwap = etagMock.requests.length;
+
+  // Swap pack on disk to V2 with new ETag & shifted offsets!
+  etagMock.state.bytes = new Uint8Array(packV2);
+  etagMock.state.etag = '"menu-v2"';
+  etagMock.state.lastModified = 'Wed, 25 Nov 2026 18:05:00 GMT';
+
+  // Coalesced prefetch of [h1, h2, h3] + concurrent getWgslAsync(h2) deduplicating onto the batch:
+  //   - Stale coalesced fetch detects ETag mismatch -> reloads index ONCE -> re-coalesces V2 [h1, h2, h3] in 1 Range fetch!
+  const pPrefetch = loader.prefetchHashes([h3, h1, h2]);
+  const pConcurrentGet2 = loader.getWgslAsync(h2);
+  const [pfRes, got2] = await Promise.all([pPrefetch, pConcurrentGet2]);
+
+  assert.equal(pfRes.prefetched, 3);
+  assert.equal(pfRes.batches, 1);
+  assert.equal(got2, wgsl2_v2);
+  assert.equal(pack.etag, '"menu-v2"');
+  assert.equal(pack.totalSize, packV2.byteLength);
+  assert.equal(pack.getStats().staleIndexReloads, 1);
+  assert.equal(loader.getStats().staleIndexReloads, 1);
+  // Exactly 3 HTTP calls after swap: 1 stale coalesced + 1 index reload + 1 fresh re-coalesced fetch!
+  assert.equal(etagMock.requests.length, reqsBeforeSwap + 3);
+
+  // Discarded stale fetch was NOT double-counted in coalescing telemetry
+  assert.equal(loader.getStats().coalescedRangeFetches, 1);
+  assert.equal(loader.getStats().coalescedEntriesFetched, 3);
+  assert.equal(loader.getStats().httpRequestsSavedByCoalescing, 2);
+  assert.equal(loader.getStats().coalescedGapBytes, 0);
+
+  // All 3 prefetched shaders are cached with V2 sources (0 extra fetches); pinned h0 recompiles with V2
+  const reqsAfterPrefetch = etagMock.requests.length;
+  assert.equal(await loader.getWgslAsync(h1), wgsl1_v2);
+  assert.equal(await loader.getWgslAsync(h2), wgsl2_v2);
+  assert.equal(await loader.getWgslAsync(h3), wgsl3_v2);
+  assert.equal(etagMock.requests.length, reqsAfterPrefetch);
+  assert.equal(pack.isPinned(h0), true);
+  const newMod0 = await loader.getOrCreateShaderModuleAsync(gpu.device, h0, 'gta6');
+  assert.notEqual(newMod0, oldMod0);
+  assert.equal(newMod0.code, wgsl0_v2);
+  assert.equal(pack.getStats().staleIndexReloads, 1);
+
+  // 2. Same-size pack swap with NO ETag / Last-Modified / Content-Range total -> mid-shader `let` corruption triggers 1x reload!
+  const sameSizePad = enc.encode(wgsl0_v2).byteLength - wgsl0_v1_len;
+  const sameSizeV1 = buildWgslPackBuffer([
+    { hash: h0, stage: SHADER_STAGE.VERTEX, wgsl: wgsl0_v1 },
+    { hash: h1, stage: SHADER_STAGE.FRAGMENT, wgsl: `${wgsl1_v1}${' '.repeat(sameSizePad)}` },
+    { hash: h2, stage: SHADER_STAGE.COMPUTE, wgsl: wgsl2_v1 },
+  ]);
+  const sameSizeV2 = buildWgslPackBuffer([
+    { hash: h0, stage: SHADER_STAGE.VERTEX, wgsl: wgsl0_v2 },
+    { hash: h1, stage: SHADER_STAGE.FRAGMENT, wgsl: wgsl1_v1 },
+    { hash: h2, stage: SHADER_STAGE.COMPUTE, wgsl: wgsl2_v2 },
+  ]);
+  assert.equal(sameSizeV1.byteLength, sameSizeV2.byteLength);
+
+  const corruptMock = createMutableRangePackMock({
+    bytes: sameSizeV1,
+    etag: null,
+    lastModified: null,
+    includeContentRangeTotal: false,
+  });
+  const corruptPack = await loadIndexFromUrl('/packs/w317-midshader.wgsl.pack', {
+    fetch: corruptMock.fetch,
+    initialRangeBytes: WGPK_HEADER_BYTES + 3 * WGPK_ENTRY_BYTES,
+  });
+  corruptMock.state.bytes = new Uint8Array(sameSizeV2);
+  const midRes = await corruptPack.prefetchHashes([h1, h2]);
+  assert.equal(midRes.prefetched, 2);
+  assert.equal(corruptPack.getStats().staleIndexReloads, 1);
+  assert.equal(corruptPack.getStats().coalescedRangeFetches, 1);
+  assert.equal(corruptPack.getStats().httpRequestsSavedByCoalescing, 1);
+  assert.equal(await corruptPack.getWgslAsync(h1), wgsl1_v1);
+  assert.equal(await corruptPack.getWgslAsync(h2), wgsl2_v2);
+
+  // 3. Shrunk pack causing HTTP 416 during coalesced prefetch recovers cleanly via 1x reload
+  const bigPack = buildWgslPackBuffer([
+    { hash: h0, stage: SHADER_STAGE.VERTEX, wgsl: `@vertex fn big() -> @builtin(position) vec4<f32> { /* ${'a'.repeat(500)} */ return vec4<f32>(0.0); }` },
+    { hash: h1, stage: SHADER_STAGE.FRAGMENT, wgsl: wgsl1_v1 },
+    { hash: h2, stage: SHADER_STAGE.COMPUTE, wgsl: wgsl2_v1 },
+  ]);
+  const smallPack = buildWgslPackBuffer([
+    { hash: h0, stage: SHADER_STAGE.VERTEX, wgsl: wgsl0_v1 },
+    { hash: h1, stage: SHADER_STAGE.FRAGMENT, wgsl: wgsl1_v2 },
+    { hash: h2, stage: SHADER_STAGE.COMPUTE, wgsl: wgsl2_v2 },
+  ]);
+  const mock416 = createMutableRangePackMock({ bytes: bigPack, etag: '"big-v1"' });
+  const pack416 = await loadIndexFromUrl('/packs/w317-416.wgsl.pack', {
+    fetch: mock416.fetch,
+    initialRangeBytes: WGPK_HEADER_BYTES + 3 * WGPK_ENTRY_BYTES,
+  });
+  mock416.state.bytes = new Uint8Array(smallPack);
+  mock416.state.etag = '"small-v2"';
+  const res416 = await pack416.prefetchHashes([h1, h2]);
+  assert.equal(res416.prefetched, 2);
+  assert.ok(mock416.requests.some((r) => r.status === 416), 'expected initial 416 before reload');
+  assert.equal(pack416.getStats().staleIndexReloads, 1);
+  assert.equal(await pack416.getWgslAsync(h1), wgsl1_v2);
+  assert.equal(await pack416.getWgslAsync(h2), wgsl2_v2);
+
+  // 4. Flapping ETag on every request -> bounded 1x reload cap (NO infinite loop!), 0 corrupt entries cached
+  let rev = 0;
+  const flapMock = createMutableRangePackMock({
+    bytes: packV1,
+    etag: '"rev-0"',
+    beforeRequest: ({ state }) => {
+      rev += 1;
+      state.etag = `"rev-${rev}"`;
+      return null;
+    },
+  });
+  const flapPack = await loadIndexFromUrl('/packs/w317-flapping.wgsl.pack', {
+    fetch: flapMock.fetch,
+    initialRangeBytes: tableEnd,
+    maxRangeFetchRetries: 0,
+  });
+  await assert.rejects(
+    () => flapPack.prefetchHashes([h0, h1, h2]),
+    /stale pack mismatch.*persisted after index reload/i
+  );
+  // Exactly 4 HTTP requests: initial index ("rev-1") + stale batch ("rev-2") + 1 reload ("rev-3") + 1 retry batch ("rev-4")
+  assert.equal(flapMock.requests.length, 4);
+  assert.equal(flapPack.getStats().staleIndexReloads, 1);
+  assert.equal(flapPack.getStats().inFlightCount, 0);
+  assert.equal(flapPack.getStats().cachedWgslEntries, 0);
+  assert.equal(flapPack.getStats().coalescedRangeFetches, 0);
+  assert.equal(flapPack.getStats().httpRequestsSavedByCoalescing, 0);
+
+  // 5. Multi-batch coalesced prefetch hitting a single pack swap simultaneously coalesces onto 1 index reload!
+  const multiMock = createMutableRangePackMock({ bytes: packV1, etag: '"multi-v1"' });
+  const multiPack = await loadIndexFromUrl('/packs/w317-multi-swap.wgsl.pack', {
+    fetch: multiMock.fetch,
+    initialRangeBytes: tableEnd,
+  });
+  multiMock.state.bytes = new Uint8Array(packV2);
+  multiMock.state.etag = '"multi-v2"';
+  // Use maxCoalesceSpanBytes=170 to force 2 separate batches ([h0, h1] and [h2, h3]) concurrently
+  const multiRes = await multiPack.prefetchHashes([h0, h1, h2, h3], {
+    maxCoalesceGapBytes: 0,
+    maxCoalesceSpanBytes: 170,
+  });
+  assert.equal(multiRes.prefetched, 4);
+  assert.equal(multiPack.getStats().staleIndexReloads, 1, 'concurrent stale batches must share 1 index reload');
+  assert.equal(await multiPack.getWgslAsync(h0), wgsl0_v2);
+  assert.equal(await multiPack.getWgslAsync(h1), wgsl1_v2);
+  assert.equal(await multiPack.getWgslAsync(h2), wgsl2_v2);
+  assert.equal(await multiPack.getWgslAsync(h3), wgsl3_v2);
 });
