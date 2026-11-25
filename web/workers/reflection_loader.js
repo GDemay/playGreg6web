@@ -115,6 +115,51 @@
   const VALID_REGISTER_CLASSES = new Set(['b', 't', 'u', 's']);
   const VALID_STEP_MODES = new Set(['vertex', 'instance']);
 
+  /** Shared frozen empty array reused across compacted stage records to avoid per-stage allocations. */
+  const EMPTY_ARRAY = Object.freeze([]);
+
+  /** Canonical interned string tables for repeated reflection vocabulary tokens. */
+  const CANONICAL_STAGE_TOKENS = Object.freeze({
+    vertex: 'vertex',
+    fragment: 'fragment',
+    pixel: 'fragment',
+    compute: 'compute',
+  });
+  const CANONICAL_VIEW_DIMENSIONS = Object.freeze({
+    '1d': '1d',
+    '2d': '2d',
+    '2d-array': '2d-array',
+    cube: 'cube',
+    'cube-array': 'cube-array',
+    '3d': '3d',
+  });
+  const CANONICAL_SAMPLE_TYPES = Object.freeze({
+    float: 'float',
+    'unfilterable-float': 'unfilterable-float',
+    depth: 'depth',
+    sint: 'sint',
+    uint: 'uint',
+  });
+  const CANONICAL_RESOURCE_KINDS = Object.freeze({
+    buffer: 'buffer',
+    sampler: 'sampler',
+    texture: 'texture',
+    storageTexture: 'storageTexture',
+    externalTexture: 'externalTexture',
+    accelerationStructure: 'accelerationStructure',
+  });
+  const CANONICAL_VERTEX_INPUT_MODES = Object.freeze({
+    vertex_index: 'vertex_index',
+    attributes: 'attributes',
+  });
+  const CANONICAL_ENTRY_POINTS = Object.freeze({
+    vs_main: 'vs_main',
+    fs_main: 'fs_main',
+    cs_main: 'cs_main',
+  });
+
+  const COMPACT_STRING_POOL_LIMIT = 4096;
+
   /** Complete WebGPU GPUVertexFormat byte sizes (covers all S6 io_type outputs + packed formats). */
   const VERTEX_FORMAT_BYTE_SIZES = Object.freeze({
     uint8: 1,
@@ -249,6 +294,141 @@
 
   function hasOwn(obj, key) {
     return Object.prototype.hasOwnProperty.call(obj, key);
+  }
+
+  /**
+   * Detach a string from any large parent string slice (such as a 16.3 MB JSON text buffer)
+   * so V8 can garbage-collect the raw sidecar payload immediately after indexing.
+   *
+   * @param {string} str
+   * @returns {string}
+   */
+  function detachString(str) {
+    if (typeof str !== 'string' || str.length < 13) {
+      return str;
+    }
+    const len = str.length;
+    if (len <= 4096) {
+      const codes = new Array(len);
+      for (let i = 0; i < len; i += 1) {
+        codes[i] = str.charCodeAt(i);
+      }
+      return String.fromCharCode.apply(null, codes);
+    }
+    let out = '';
+    for (let i = 0; i < len; i += 4096) {
+      const end = i + 4096 < len ? i + 4096 : len;
+      const chunk = new Array(end - i);
+      for (let j = i; j < end; j += 1) {
+        chunk[j - i] = str.charCodeAt(j);
+      }
+      out += String.fromCharCode.apply(null, chunk);
+    }
+    return out;
+  }
+
+  /**
+   * Create a parse-local string interner that maps repeated tokens (storage formats, entry points,
+   * vertex formats, binding names, etc.) to a single detached flat string instance and is discarded
+   * once sidecar/manifest indexing completes.
+   *
+   * @param {number} [limit]
+   * @returns {(str: string | null | undefined) => string | null}
+   */
+  function createCompactStringInterner(limit = COMPACT_STRING_POOL_LIMIT) {
+    const pool = new Map();
+    return function internString(value) {
+      if (value === undefined || value === null) {
+        return null;
+      }
+      if (hasOwn(CANONICAL_ENTRY_POINTS, value)) return CANONICAL_ENTRY_POINTS[value];
+      if (hasOwn(CANONICAL_STAGE_TOKENS, value)) return CANONICAL_STAGE_TOKENS[value];
+      if (hasOwn(CANONICAL_VIEW_DIMENSIONS, value)) return CANONICAL_VIEW_DIMENSIONS[value];
+      if (hasOwn(CANONICAL_SAMPLE_TYPES, value)) return CANONICAL_SAMPLE_TYPES[value];
+      if (hasOwn(CANONICAL_RESOURCE_KINDS, value)) return CANONICAL_RESOURCE_KINDS[value];
+      if (hasOwn(CANONICAL_VERTEX_INPUT_MODES, value)) return CANONICAL_VERTEX_INPUT_MODES[value];
+
+      const existing = pool.get(value);
+      if (existing !== undefined) {
+        return existing;
+      }
+      const detached = detachString(value);
+      if (pool.size < limit) {
+        pool.set(detached, detached);
+      }
+      return detached;
+    };
+  }
+
+  /**
+   * Compute lookup hit rate strictly clamped to `[0, 1]` (returns `0` when total lookups is 0).
+   *
+   * @param {number} hits
+   * @param {number} misses
+   * @returns {number}
+   */
+  function computeLookupHitRate(hits, misses) {
+    const safeHits = Number.isFinite(hits) && hits > 0 ? hits : 0;
+    const safeMisses = Number.isFinite(misses) && misses > 0 ? misses : 0;
+    const total = safeHits + safeMisses;
+    if (total <= 0) {
+      return 0;
+    }
+    const rate = safeHits / total;
+    if (rate <= 0) return 0;
+    if (rate >= 1) return 1;
+    return rate;
+  }
+
+  /**
+   * Deduplicate and freeze a normalized binding source object across stages in a parse-local pool,
+   * eliminating thousands of identical `{ kind, ... }` wrapper objects on 9.5K-stage sidecars.
+   *
+   * @param {object} source
+   * @param {Map<string, object>} pool
+   * @returns {object}
+   */
+  function internNormalizedBindingSource(source, pool) {
+    let key;
+    switch (source.kind) {
+      case 'table':
+        key = `t:${source.userSgpr}:${source.tableByteOffset}`;
+        break;
+      case 'root_constants':
+        key = `rc:${source.userSgpr}`;
+        break;
+      case 'root_descriptor':
+        key = `rd:${source.userSgpr}`;
+        break;
+      case 'static_sampler':
+        key = `ss:${source.index}`;
+        break;
+      case 'inline_sampler':
+        key = `is:${source.sdwords[0]}:${source.sdwords[1]}:${source.sdwords[2]}:${source.sdwords[3]}`;
+        break;
+      case 'sampler_heap':
+        key = `sh:${source.baseUserSgpr}:${source.stride}:${source.indexUserSgpr}:${source.indexShift}`;
+        break;
+      case 'resource_heap':
+        key =
+          source.resourceHeap === true
+            ? `rhb:${source.userSgpr === undefined ? '' : source.userSgpr}`
+            : `rh:${source.baseUserSgpr}:${source.stride}:${source.indexUserSgpr}:${source.indexShift}`;
+        break;
+      default:
+        return source;
+    }
+
+    const existing = pool.get(key);
+    if (existing !== undefined) {
+      return existing;
+    }
+    if (source.kind === 'inline_sampler' && Array.isArray(source.sdwords)) {
+      Object.freeze(source.sdwords);
+    }
+    Object.freeze(source);
+    pool.set(key, source);
+    return source;
   }
 
   /**
@@ -790,7 +970,10 @@
 
   function parseHeapBindingSource(kind, rawHeap, path) {
     if (!isPlainObject(rawHeap)) {
-      throw new ManifestValidationError(`${kind} must be an object`, path);
+      throw new ManifestValidationError(
+        kind === 'resource_heap' ? `${kind} must be an object or true` : `${kind} must be an object`,
+        path
+      );
     }
     if (!isNonNegativeInt(rawHeap.base_user_sgpr)) {
       throw new ManifestValidationError(
@@ -865,6 +1048,7 @@
    * `tools/stage_reflection_sidecar.py`:
    * - `{"sampler_heap": {"base_user_sgpr", "stride", "index": {"user_sgpr", "shift"}}}`
    * - `{"resource_heap": {"base_user_sgpr", "stride", "index": {"user_sgpr", "shift"}}}`
+   * - `{"resource_heap": true}` (or `{"user_sgpr", "resource_heap": true}`)
    * - `{"inline_sampler": {"sdwords": [d0, d1, d2, d3]}}`
    * - `{"user_sgpr", "table_byte_offset"}`
    * - `{"user_sgpr", "root_constants": true}`
@@ -899,6 +1083,38 @@
         'binding source cannot define both sampler_heap and resource_heap',
         path
       );
+    }
+
+    if (hasResourceHeap && rawSource.resource_heap === true) {
+      if (
+        hasInlineSampler ||
+        hasStaticSampler ||
+        hasTableByteOffset ||
+        hasRootConstants ||
+        hasRootDescriptor
+      ) {
+        throw new ManifestValidationError(
+          'resource_heap source cannot be combined with other binding source fields',
+          path
+        );
+      }
+      if (hasUserSgpr) {
+        if (!isNonNegativeInt(rawSource.user_sgpr)) {
+          throw new ManifestValidationError(
+            `user_sgpr must be a non-negative uint32 safe integer, got ${JSON.stringify(rawSource.user_sgpr)}`,
+            `${path}.user_sgpr`
+          );
+        }
+        return {
+          kind: 'resource_heap',
+          resourceHeap: true,
+          userSgpr: rawSource.user_sgpr,
+        };
+      }
+      return {
+        kind: 'resource_heap',
+        resourceHeap: true,
+      };
     }
 
     if (hasSamplerHeap || hasResourceHeap) {
@@ -1399,6 +1615,7 @@
     const shadersByBareHex = new Map();
     const shadersByName = new Map();
     let totalSamplerHeapBindings = 0;
+    let totalResourceHeapStages = 0;
     let totalResourceHeapBindings = 0;
     let totalInlineSamplerStages = 0;
     let totalInlineSamplerBindings = 0;
@@ -1545,8 +1762,12 @@
       totalResourceHeapBindings += shaderResourceHeapBindings;
       totalInlineSamplerBindings += shaderInlineSamplerBindings;
       const hasInlineSampler = shaderInlineSamplerBindings > 0;
+      const hasResourceHeap = shaderResourceHeapBindings > 0;
       if (hasInlineSampler) {
         totalInlineSamplerStages += 1;
+      }
+      if (hasResourceHeap) {
+        totalResourceHeapStages += 1;
       }
 
       // Parse vertex_inputs
@@ -1656,6 +1877,7 @@
         resourceHeapBindings: shaderResourceHeapBindings,
         inlineSamplerBindings: shaderInlineSamplerBindings,
         hasInlineSampler,
+        hasResourceHeap,
       };
 
       shaders.set(hashHex, shaderRecord);
@@ -1803,10 +2025,12 @@
     const summary = {
       shaderCount: shaders.size,
       stageCount: shaders.size,
+      stagesIndexed: shaders.size,
       bindGroupLayoutCount: bindGroupLayouts.size,
       pipelineLayoutCount: pipelineLayouts.size,
       pipelineCount: pipelines.size,
       samplerHeapBindings: totalSamplerHeapBindings,
+      resourceHeapStages: totalResourceHeapStages,
       resourceHeapBindings: totalResourceHeapBindings,
       inlineSamplerStages: totalInlineSamplerStages,
       inlineSamplerBindings: totalInlineSamplerBindings,
@@ -1828,7 +2052,9 @@
       shadersByName,
       pipelines,
       stageCount: shaders.size,
+      stagesIndexed: shaders.size,
       samplerHeapBindings: totalSamplerHeapBindings,
+      resourceHeapStages: totalResourceHeapStages,
       resourceHeapBindings: totalResourceHeapBindings,
       inlineSamplerStages: totalInlineSamplerStages,
       inlineSamplerBindings: totalInlineSamplerBindings,
@@ -1839,7 +2065,7 @@
 
   function normalizeSidecarViewDimension(rawDim, isStorage, path) {
     if (rawDim === undefined || rawDim === null) {
-      return '2d';
+      return CANONICAL_VIEW_DIMENSIONS['2d'];
     }
     if (typeof rawDim !== 'string') {
       throw new ManifestValidationError(
@@ -1855,12 +2081,12 @@
         path
       );
     }
-    return normalized;
+    return CANONICAL_VIEW_DIMENSIONS[normalized] || normalized;
   }
 
   function normalizeSidecarSampleType(rawSampleType, path) {
     if (rawSampleType === undefined || rawSampleType === null) {
-      return 'float';
+      return CANONICAL_SAMPLE_TYPES.float;
     }
     if (typeof rawSampleType !== 'string') {
       throw new ManifestValidationError(
@@ -1875,10 +2101,10 @@
         path
       );
     }
-    return normalized;
+    return CANONICAL_SAMPLE_TYPES[normalized] || normalized;
   }
 
-  function parseSidecarVertexInput(raw, path) {
+  function parseSidecarVertexInput(raw, path, internStr = null) {
     if (!isPlainObject(raw)) {
       throw new ManifestValidationError('vertex_input must be an object', path);
     }
@@ -1924,9 +2150,14 @@
     if (raw.format !== undefined && raw.format !== null && typeof raw.format !== 'string') {
       throw new ManifestValidationError('format must be a string or null', `${path}.format`);
     }
-    const fetchFormat = rawFetchFormat !== undefined ? rawFetchFormat : null;
-    const format = raw.format !== undefined && raw.format !== null ? raw.format : fetchFormat;
-    const componentType = rawComponentType !== undefined ? rawComponentType : null;
+    const intern = internStr || ((s) => (s === undefined || s === null ? null : s));
+    const fetchFormat = rawFetchFormat !== undefined && rawFetchFormat !== null ? intern(rawFetchFormat) : null;
+    const format =
+      raw.format !== undefined && raw.format !== null ? intern(raw.format) : fetchFormat;
+    const componentType =
+      rawComponentType !== undefined && rawComponentType !== null ? intern(rawComponentType) : null;
+    const typeStr =
+      typeof raw.type === 'string' ? intern(raw.type) : componentType || 'unknown';
     return {
       location: raw.location,
       vb_slot: rawVbSlot !== undefined ? rawVbSlot : null,
@@ -1938,7 +2169,7 @@
       componentType,
       fetch_format: fetchFormat,
       fetchFormat,
-      type: typeof raw.type === 'string' ? raw.type : componentType || 'unknown',
+      type: typeStr,
       format,
     };
   }
@@ -2019,12 +2250,130 @@
     return null;
   }
 
+  function getOrCreateCompactSidecarLayoutEntry(rec, visibility, layoutEntryPool) {
+    let key;
+    if (rec.kind === 'uniform' || rec.kind === 'storage' || rec.kind === 'read_only_storage') {
+      key = `b:${visibility}:${rec.binding}:${rec.kind}:${rec.minBindingSizeBytes || 0}`;
+    } else if (rec.kind === 'texture') {
+      key = `t:${visibility}:${rec.binding}:${rec.sampleType || 'float'}:${rec.viewDimension || '2d'}:${rec.multisampled ? 1 : 0}`;
+    } else if (rec.kind === 'storage_texture') {
+      if (typeof rec.storageFormat !== 'string' || rec.storageFormat.length === 0) {
+        return null;
+      }
+      key = `st:${visibility}:${rec.binding}:${rec.storageFormat}:${rec.viewDimension || '2d'}`;
+    } else if (rec.kind === 'sampler' || rec.kind === 'comparison_sampler') {
+      key = `s:${visibility}:${rec.binding}:${rec.kind}`;
+    } else {
+      return null;
+    }
+
+    const existing = layoutEntryPool.get(key);
+    if (existing !== undefined) {
+      return existing;
+    }
+    const created = buildSidecarLayoutEntry(rec, visibility);
+    if (!created) {
+      return null;
+    }
+    if (created.buffer) Object.freeze(created.buffer);
+    else if (created.texture) Object.freeze(created.texture);
+    else if (created.storageTexture) Object.freeze(created.storageTexture);
+    else if (created.sampler) Object.freeze(created.sampler);
+    Object.freeze(created);
+    layoutEntryPool.set(key, created);
+    return created;
+  }
+
   function sidecarKindToResource(kind) {
-    if (kind === 'uniform' || kind === 'storage' || kind === 'read_only_storage') return 'buffer';
-    if (kind === 'texture') return 'texture';
-    if (kind === 'storage_texture') return 'storageTexture';
-    if (kind === 'sampler' || kind === 'comparison_sampler') return 'sampler';
-    return 'buffer';
+    if (kind === 'uniform' || kind === 'storage' || kind === 'read_only_storage') {
+      return CANONICAL_RESOURCE_KINDS.buffer;
+    }
+    if (kind === 'texture') return CANONICAL_RESOURCE_KINDS.texture;
+    if (kind === 'storage_texture') return CANONICAL_RESOURCE_KINDS.storageTexture;
+    if (kind === 'sampler' || kind === 'comparison_sampler') {
+      return CANONICAL_RESOURCE_KINDS.sampler;
+    }
+    return CANONICAL_RESOURCE_KINDS.buffer;
+  }
+
+  /**
+   * Construct the public sidecar index API object in an isolated scope so its closures
+   * (`getStage`, `hasStage`, `getStats`, `resetStats`) cannot retain any raw JSON payload
+   * or parse-time interning tables after `parseStageReflectionSidecar` returns.
+   */
+  function createParsedStageSidecar(stages, stagesByHash, stagesByBareHex, totals) {
+    const stageCount = stages.size;
+    const inlineSamplerStages = totals.inlineSamplerStages;
+    const inlineSamplerBindings = totals.inlineSamplerBindings;
+    const resourceHeapStages = totals.resourceHeapStages;
+    const resourceHeapBindings = totals.resourceHeapBindings;
+    const samplerHeapBindings = totals.samplerHeapBindings;
+    const vertexIndexStages = totals.vertexIndexStages;
+
+    const lookupStats = {
+      lookupHits: 0,
+      lookupMisses: 0,
+    };
+
+    const summary = {
+      stageCount,
+      stagesIndexed: stageCount,
+      inlineSamplerStages,
+      inlineSamplerBindings,
+      resourceHeapStages,
+      resourceHeapBindings,
+      samplerHeapBindings,
+      vertexIndexStages,
+    };
+
+    return {
+      schema: STAGE_REFLECTION_SCHEMA,
+      version: STAGE_REFLECTION_VERSION,
+      stages,
+      stagesByHash,
+      stagesByHex: stages,
+      stagesByBareHex,
+      stageCount,
+      stagesIndexed: stageCount,
+      inlineSamplerStages,
+      inlineSamplerBindings,
+      resourceHeapStages,
+      resourceHeapBindings,
+      samplerHeapBindings,
+      vertexIndexStages,
+      summary,
+      getStage(hashKey) {
+        const found = lookupByNormalizedHash(hashKey, stages, stagesByBareHex, stagesByHash, null);
+        if (found !== undefined) {
+          lookupStats.lookupHits += 1;
+        } else {
+          lookupStats.lookupMisses += 1;
+        }
+        return found;
+      },
+      hasStage(hashKey) {
+        return lookupByNormalizedHash(hashKey, stages, stagesByBareHex, stagesByHash, null) !== undefined;
+      },
+      resetStats() {
+        lookupStats.lookupHits = 0;
+        lookupStats.lookupMisses = 0;
+      },
+      getStats() {
+        return {
+          stageCount,
+          stagesIndexed: stageCount,
+          inlineSamplerStages,
+          inlineSamplerBindings,
+          resourceHeapStages,
+          resourceHeapBindings,
+          samplerHeapBindings,
+          vertexIndexStages,
+          lookupHits: lookupStats.lookupHits,
+          lookupMisses: lookupStats.lookupMisses,
+          lookupHitRate: computeLookupHitRate(lookupStats.lookupHits, lookupStats.lookupMisses),
+        };
+      },
+    };
   }
 
   /**
@@ -2032,10 +2381,12 @@
    * (e.g., `splash.wgsl.pack.reflect.json` emitted by `tools/stage_reflection_sidecar.py`
    * and consumed by `runtime/gpu/stage_reflection.cpp`).
    *
-   * Validates all binding sources including `#950` / `S43` `inline_sampler: { sdwords: [d0, d1, d2, d3] }`,
-   * builds O(1) normalized-hash lookup maps (`'0x...'`, bare 16-hex-char, and `BigInt`),
-   * and exposes lightweight telemetry (`stageCount`, `inlineSamplerStages`, `inlineSamplerBindings`,
-   * `vertexIndexStages`, `lookupHits`, `lookupMisses`).
+   * Validates all binding sources including `#950` / `S43` `inline_sampler: { sdwords: [d0, d1, d2, d3] }`
+   * and `#482` `resource_heap` metadata (`{ base_user_sgpr, stride, index }` and `resource_heap: true`),
+   * compacts parsed stage entries with parse-local string/source/layout interning while discarding
+   * unused raw JSON wrappers after indexing, builds O(1) normalized-hash lookup maps (`'0x...'`,
+   * bare 16-hex-char, and `BigInt`), and exposes telemetry (`stagesIndexed`, `inlineSamplerStages`,
+   * `resourceHeapStages`, `lookupHits`, `lookupMisses`, `lookupHitRate`) with `resetStats()`.
    *
    * @param {string | object} jsonOrObject
    * @returns {object}
@@ -2076,13 +2427,29 @@
     const stages = new Map();
     const stagesByHash = new Map();
     const stagesByBareHex = new Map();
+
+    // Parse-local interning pools: deduplicate repeated strings, sources, layout entries,
+    // and bind group layouts across 9,574+ stages, then become immediately GC-eligible.
+    const internStr = createCompactStringInterner();
+    const sourcePool = new Map();
+    const layoutEntryPool = new Map();
+    const bglPool = new Map();
+    const bglIdsPool = new Map();
+
     let totalSamplerHeapBindings = 0;
+    let totalResourceHeapStages = 0;
     let totalResourceHeapBindings = 0;
     let totalInlineSamplerStages = 0;
     let totalInlineSamplerBindings = 0;
     let totalVertexIndexStages = 0;
 
-    for (const [rawHash, rawStage] of Object.entries(raw.stages)) {
+    let rawStages = raw.stages;
+    const seenSlots = new Set();
+    const groupEntriesMap = new Map();
+
+    for (const rawHash in rawStages) {
+      if (!hasOwn(rawStages, rawHash)) continue;
+      const rawStage = rawStages[rawHash];
       const stPath = `stages[${JSON.stringify(rawHash)}]`;
       const { hash, hashHex } = validateHashKey(rawHash, stPath);
       const bareHashHex = hashHex.slice(2);
@@ -2106,17 +2473,18 @@
         throw new ManifestValidationError('bindings must be an array', `${stPath}.bindings`);
       }
 
-      const bindings = [];
-      const seenSlots = new Set();
-      const groupEntriesMap = new Map();
+      seenSlots.clear();
+      groupEntriesMap.clear();
+      const rawBindings = rawStage.bindings;
+      const bindings = rawBindings.length > 0 ? new Array(rawBindings.length) : EMPTY_ARRAY;
       let maxGroupSeen = -1;
       let stageSamplerHeapBindings = 0;
       let stageResourceHeapBindings = 0;
       let stageInlineSamplerBindings = 0;
       let layoutComplete = true;
 
-      for (let i = 0; i < rawStage.bindings.length; i += 1) {
-        const b = rawStage.bindings[i];
+      for (let i = 0; i < rawBindings.length; i += 1) {
+        const b = rawBindings[i];
         const bPath = `${stPath}.bindings[${i}]`;
         if (!isPlainObject(b)) {
           throw new ManifestValidationError('binding record must be an object', bPath);
@@ -2127,7 +2495,10 @@
         if (!isNonNegativeInt(b.binding)) {
           throw new ManifestValidationError(`invalid binding ${JSON.stringify(b.binding)}`, `${bPath}.binding`);
         }
-        const slotKey = `${b.group}:${b.binding}`;
+        const slotKey =
+          b.group < 65536 && b.binding < 65536
+            ? b.group * 65536 + b.binding
+            : `${b.group}:${b.binding}`;
         if (seenSlots.has(slotKey)) {
           throw new ManifestValidationError(
             `duplicate binding at @group(${b.group}) @binding(${b.binding})`,
@@ -2154,7 +2525,10 @@
         if (b.source === undefined || b.source === null) {
           throw new ManifestValidationError('binding source is required in stage reflection sidecar', `${bPath}.source`);
         }
-        const source = parseBindingSource(b.source, `${bPath}.source`);
+        const source = internNormalizedBindingSource(
+          parseBindingSource(b.source, `${bPath}.source`),
+          sourcePool
+        );
 
         let minBindingSizeBytes = null;
         const rawMinSize =
@@ -2184,7 +2558,7 @@
               `${bPath}.storage_format`
             );
           }
-          storageFormat = rawStorageFormat;
+          storageFormat = typeof rawStorageFormat === 'string' ? internStr(rawStorageFormat) : rawStorageFormat;
         }
 
         const rawViewDim = b.view_dimension !== undefined ? b.view_dimension : b.viewDimension;
@@ -2216,18 +2590,19 @@
           stageInlineSamplerBindings += 1;
         }
 
+        const isRootConsts = source.kind === 'root_constants';
         const rec = {
           group: b.group,
           binding: b.binding,
-          name: b.name !== undefined ? b.name : null,
+          name: b.name !== undefined && b.name !== null ? internStr(b.name) : null,
           kind,
           resource: sidecarKindToResource(kind),
           in_layout: true,
           inLayout: true,
           register: null,
           spirv: null,
-          root_constants: source.kind === 'root_constants',
-          rootConstants: source.kind === 'root_constants',
+          root_constants: isRootConsts,
+          rootConstants: isRootConsts,
           binding_array: null,
           bindingArray: null,
           source,
@@ -2243,7 +2618,7 @@
           layoutEntry: null,
         };
 
-        const layoutEntry = buildSidecarLayoutEntry(rec, visibility);
+        const layoutEntry = getOrCreateCompactSidecarLayoutEntry(rec, visibility, layoutEntryPool);
         rec.layoutEntry = layoutEntry;
         if (layoutEntry) {
           if (rec.group > maxGroupSeen) {
@@ -2254,16 +2629,18 @@
             gEntries = [];
             groupEntriesMap.set(rec.group, gEntries);
           }
-          gEntries.push(cloneLayoutEntry(layoutEntry));
+          gEntries.push(layoutEntry);
         } else {
           layoutComplete = false;
         }
 
-        bindings.push(rec);
+        bindings[i] = rec;
       }
 
-      const resolvedGroupLayouts = [];
-      const bindGroupLayoutIds = [];
+      let resolvedGroupLayouts = EMPTY_ARRAY;
+      let bindGroupLayoutIds = EMPTY_ARRAY;
+      let pipelineLayoutId = null;
+
       if (maxGroupSeen >= 0) {
         if (maxGroupSeen >= MAX_REFLECTED_GROUPS) {
           throw new ManifestValidationError(
@@ -2271,33 +2648,78 @@
             `${stPath}.bindings`
           );
         }
-        for (let g = 0; g <= maxGroupSeen; g += 1) {
-          const entries = (groupEntriesMap.get(g) || []).sort((a, b) => a.binding - b.binding);
-          const idHex = computeBindGroupLayoutHash({ entries });
-          const id = normalizeShaderHash(idHex);
-          bindGroupLayoutIds.push(idHex);
-          resolvedGroupLayouts.push({ group: g, id, idHex, entries });
+        const groupCount = maxGroupSeen + 1;
+        resolvedGroupLayouts = new Array(groupCount);
+        const rawIds = new Array(groupCount);
+        for (let g = 0; g < groupCount; g += 1) {
+          const gEntries = groupEntriesMap.get(g);
+          let canonicalEntriesJson;
+          let sortedEntries;
+          if (!gEntries || gEntries.length === 0) {
+            sortedEntries = EMPTY_ARRAY;
+            canonicalEntriesJson = '[]';
+          } else {
+            if (gEntries.length > 1) {
+              gEntries.sort((a, b) => a.binding - b.binding);
+            }
+            sortedEntries = gEntries;
+            canonicalEntriesJson = `[${gEntries.map(serializeLayoutEntryJson).join(',')}]`;
+          }
+
+          const bglKey = `${g}|${canonicalEntriesJson}`;
+          let cachedBgl = bglPool.get(bglKey);
+          if (cachedBgl === undefined) {
+            const id = fnv1a64(`bgl:${canonicalEntriesJson}`);
+            const idHex = formatShaderHash(id);
+            if (sortedEntries !== EMPTY_ARRAY) {
+              Object.freeze(sortedEntries);
+            }
+            cachedBgl = Object.freeze({ group: g, id, idHex, entries: sortedEntries });
+            bglPool.set(bglKey, cachedBgl);
+          }
+          rawIds[g] = cachedBgl.idHex;
+          resolvedGroupLayouts[g] = cachedBgl;
         }
+
+        const idsKey = rawIds.join(',');
+        let cachedPl = bglIdsPool.get(idsKey);
+        if (cachedPl === undefined) {
+          Object.freeze(rawIds);
+          const plId = computePipelineLayoutHash(rawIds);
+          cachedPl = { ids: rawIds, pipelineLayoutId: plId };
+          bglIdsPool.set(idsKey, cachedPl);
+        }
+        bindGroupLayoutIds = cachedPl.ids;
+        pipelineLayoutId = cachedPl.pipelineLayoutId;
       }
 
-      const vertexInputs = [];
       const rawVertexInputs =
         rawStage.vertex_inputs !== undefined ? rawStage.vertex_inputs : rawStage.vertexInputs;
+      let vertexInputs = EMPTY_ARRAY;
       if (rawVertexInputs !== undefined && rawVertexInputs !== null) {
         if (!Array.isArray(rawVertexInputs)) {
           throw new ManifestValidationError('vertex_inputs must be an array', `${stPath}.vertex_inputs`);
         }
-        for (let i = 0; i < rawVertexInputs.length; i += 1) {
-          vertexInputs.push(
-            parseSidecarVertexInput(rawVertexInputs[i], `${stPath}.vertex_inputs[${i}]`)
-          );
+        if (rawVertexInputs.length > 0) {
+          vertexInputs = new Array(rawVertexInputs.length);
+          for (let i = 0; i < rawVertexInputs.length; i += 1) {
+            vertexInputs[i] = parseSidecarVertexInput(
+              rawVertexInputs[i],
+              `${stPath}.vertex_inputs[${i}]`,
+              internStr
+            );
+          }
+          if (vertexInputs.length > 1) {
+            vertexInputs.sort((a, b) => a.location - b.location);
+          }
         }
-        vertexInputs.sort((a, b) => a.location - b.location);
       }
 
-      const vertexInputMode = resolveVertexInputMode(rawStage, stage, vertexInputs, stPath);
+      const resolvedVim = resolveVertexInputMode(rawStage, stage, vertexInputs, stPath);
+      const vertexInputMode = resolvedVim !== null ? internStr(resolvedVim) : null;
       const isVertexIndexStage = stage === 'vertex' && vertexInputMode === 'vertex_index';
       const hasInlineSampler = stageInlineSamplerBindings > 0;
+      const hasResourceHeap = stageResourceHeapBindings > 0;
 
       totalSamplerHeapBindings += stageSamplerHeapBindings;
       totalResourceHeapBindings += stageResourceHeapBindings;
@@ -2305,20 +2727,28 @@
       if (hasInlineSampler) {
         totalInlineSamplerStages += 1;
       }
+      if (hasResourceHeap) {
+        totalResourceHeapStages += 1;
+      }
       if (isVertexIndexStage) {
         totalVertexIndexStages += 1;
       }
 
       const entryPoint =
         typeof rawStage.entry_point === 'string' && rawStage.entry_point.length > 0
-          ? rawStage.entry_point
+          ? internStr(rawStage.entry_point)
           : typeof rawStage.entryPoint === 'string' && rawStage.entryPoint.length > 0
-            ? rawStage.entryPoint
+            ? internStr(rawStage.entryPoint)
             : stage === 'vertex'
-              ? 'vs_main'
+              ? CANONICAL_ENTRY_POINTS.vs_main
               : stage === 'fragment'
-                ? 'fs_main'
-                : 'cs_main';
+                ? CANONICAL_ENTRY_POINTS.fs_main
+                : CANONICAL_ENTRY_POINTS.cs_main;
+
+      const stageName =
+        typeof rawStage.name === 'string' && rawStage.name.length > 0
+          ? internStr(rawStage.name)
+          : null;
 
       const stageRecord = {
         hash,
@@ -2328,13 +2758,11 @@
         visibility,
         entryPoint,
         entry_point: entryPoint,
-        name: typeof rawStage.name === 'string' && rawStage.name.length > 0 ? rawStage.name : null,
-        pipelineLayoutId:
-          bindGroupLayoutIds.length > 0 ? computePipelineLayoutHash(bindGroupLayoutIds) : null,
-        pipeline_layout:
-          bindGroupLayoutIds.length > 0 ? computePipelineLayoutHash(bindGroupLayoutIds) : null,
+        name: stageName,
+        pipelineLayoutId,
+        pipeline_layout: pipelineLayoutId,
         bindGroupLayoutIds,
-        bind_group_layouts: bindGroupLayoutIds.slice(),
+        bind_group_layouts: bindGroupLayoutIds,
         bindGroupLayouts: resolvedGroupLayouts,
         layoutComplete,
         layout_complete: layoutComplete,
@@ -2346,16 +2774,17 @@
         vertexInputMode,
         vertex_input_mode: vertexInputMode,
         isVertexIndexStage,
-        fragmentOutputs: [],
-        fragment_outputs: [],
-        requiresLowering: [],
-        requires_lowering: [],
-        limitViolations: [],
-        limit_violations: [],
+        fragmentOutputs: EMPTY_ARRAY,
+        fragment_outputs: EMPTY_ARRAY,
+        requiresLowering: EMPTY_ARRAY,
+        requires_lowering: EMPTY_ARRAY,
+        limitViolations: EMPTY_ARRAY,
+        limit_violations: EMPTY_ARRAY,
         samplerHeapBindings: stageSamplerHeapBindings,
         resourceHeapBindings: stageResourceHeapBindings,
         inlineSamplerBindings: stageInlineSamplerBindings,
         hasInlineSampler,
+        hasResourceHeap,
       };
 
       stages.set(hashHex, stageRecord);
@@ -2363,59 +2792,24 @@
       stagesByBareHex.set(bareHashHex, stageRecord);
     }
 
-    const lookupStats = {
-      lookupHits: 0,
-      lookupMisses: 0,
-    };
+    // Drop raw payload references and parse-local scratch collections before building the index view.
+    raw = null;
+    rawStages = null;
+    seenSlots.clear();
+    groupEntriesMap.clear();
+    sourcePool.clear();
+    layoutEntryPool.clear();
+    bglPool.clear();
+    bglIdsPool.clear();
 
-    const summary = {
-      stageCount: stages.size,
+    return createParsedStageSidecar(stages, stagesByHash, stagesByBareHex, {
       inlineSamplerStages: totalInlineSamplerStages,
       inlineSamplerBindings: totalInlineSamplerBindings,
-      vertexIndexStages: totalVertexIndexStages,
-      samplerHeapBindings: totalSamplerHeapBindings,
+      resourceHeapStages: totalResourceHeapStages,
       resourceHeapBindings: totalResourceHeapBindings,
-    };
-
-    return {
-      schema: STAGE_REFLECTION_SCHEMA,
-      version: STAGE_REFLECTION_VERSION,
-      stages,
-      stagesByHash,
-      stagesByHex: stages,
-      stagesByBareHex,
-      stageCount: stages.size,
-      inlineSamplerStages: totalInlineSamplerStages,
-      inlineSamplerBindings: totalInlineSamplerBindings,
-      vertexIndexStages: totalVertexIndexStages,
       samplerHeapBindings: totalSamplerHeapBindings,
-      resourceHeapBindings: totalResourceHeapBindings,
-      summary,
-      getStage(hashKey) {
-        const found = lookupByNormalizedHash(hashKey, stages, stagesByBareHex, stagesByHash, null);
-        if (found !== undefined) {
-          lookupStats.lookupHits += 1;
-        } else {
-          lookupStats.lookupMisses += 1;
-        }
-        return found;
-      },
-      hasStage(hashKey) {
-        return lookupByNormalizedHash(hashKey, stages, stagesByBareHex, stagesByHash, null) !== undefined;
-      },
-      getStats() {
-        return {
-          stageCount: stages.size,
-          inlineSamplerStages: totalInlineSamplerStages,
-          inlineSamplerBindings: totalInlineSamplerBindings,
-          vertexIndexStages: totalVertexIndexStages,
-          samplerHeapBindings: totalSamplerHeapBindings,
-          resourceHeapBindings: totalResourceHeapBindings,
-          lookupHits: lookupStats.lookupHits,
-          lookupMisses: lookupStats.lookupMisses,
-        };
-      },
-    };
+      vertexIndexStages: totalVertexIndexStages,
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -3360,7 +3754,18 @@
           rawSource.sdwords.every(isNonNegativeInt)
         );
       case 'sampler_heap':
+        return (
+          isNonNegativeInt(rawSource.baseUserSgpr) &&
+          isNonNegativeInt(rawSource.stride) &&
+          rawSource.stride > 0 &&
+          isNonNegativeInt(rawSource.indexUserSgpr) &&
+          isNonNegativeInt(rawSource.indexShift) &&
+          rawSource.indexShift <= MAX_HEAP_INDEX_SHIFT
+        );
       case 'resource_heap':
+        if (rawSource.resourceHeap === true) {
+          return rawSource.userSgpr === undefined || isNonNegativeInt(rawSource.userSgpr);
+        }
         return (
           isNonNegativeInt(rawSource.baseUserSgpr) &&
           isNonNegativeInt(rawSource.stride) &&
@@ -3468,6 +3873,11 @@
       case 'sampler_heap':
         return `${base} <- sampler heap[s${source.indexUserSgpr} << ${source.indexShift}]`;
       case 'resource_heap':
+        if (source.resourceHeap === true) {
+          return source.userSgpr !== undefined
+            ? `${base} <- resource heap (s${source.userSgpr})`
+            : `${base} <- resource heap`;
+        }
         return `${base} <- resource heap[s${source.indexUserSgpr} << ${source.indexShift}]`;
       default:
         return base;
@@ -4002,27 +4412,6 @@
       let joinFailed = false;
 
       if (source.kind === 'sampler_heap' || source.kind === 'resource_heap') {
-        const covering = findRootParameterCovering(rs.parameters, source.indexUserSgpr);
-        if (!covering || covering.type !== 'constants') {
-          joinFailed = true;
-          emit(
-            group,
-            binding,
-            kind,
-            DIAGNOSTIC_CODES.HEAP_INDEX_NOT_ROOT_CONSTANT,
-            { userSgpr: source.indexUserSgpr, parameterType: 'constants' },
-            covering
-              ? {
-                  userSgpr: source.indexUserSgpr,
-                  parameterIndex: covering.index,
-                  parameterType: covering.type,
-                }
-              : { userSgpr: source.indexUserSgpr, parameterIndex: null, parameterType: null },
-            `${key}: s${source.indexUserSgpr} is not inside a root-constants parameter`,
-            name,
-            source
-          );
-        }
         const samplerKind = kind === 'sampler' || kind === 'comparison_sampler';
         if ((source.kind === 'sampler_heap') !== samplerKind) {
           joinFailed = true;
@@ -4039,24 +4428,68 @@
             source
           );
         }
-        if (!joinFailed) {
-          resolvedParamIndex = covering.index;
-          resolvedClass =
-            kind === 'uniform'
-              ? 'cbv'
-              : samplerKind
-                ? 'sampler'
+
+        if (source.kind === 'resource_heap' && source.resourceHeap === true) {
+          const covering =
+            source.userSgpr !== undefined
+              ? findRootParameterCovering(rs.parameters, source.userSgpr)
+              : null;
+          if (!joinFailed) {
+            resolvedParamIndex = covering ? covering.index : null;
+            resolvedClass =
+              kind === 'uniform'
+                ? 'cbv'
                 : kind === 'storage' || kind === 'storage_texture'
                   ? 'uav'
                   : 'srv';
-          resolvedHeap = {
-            kind: source.kind,
-            parameterIndex: covering.index,
-            dwordOffset: source.indexUserSgpr - covering.startSgpr,
-            baseUserSgpr: source.baseUserSgpr,
-            stride: source.stride,
-            shift: source.indexShift,
-          };
+            resolvedHeap = {
+              kind: 'resource_heap',
+              resourceHeap: true,
+              parameterIndex: resolvedParamIndex,
+              userSgpr: source.userSgpr !== undefined ? source.userSgpr : null,
+            };
+          }
+        } else {
+          const covering = findRootParameterCovering(rs.parameters, source.indexUserSgpr);
+          if (!covering || covering.type !== 'constants') {
+            joinFailed = true;
+            emit(
+              group,
+              binding,
+              kind,
+              DIAGNOSTIC_CODES.HEAP_INDEX_NOT_ROOT_CONSTANT,
+              { userSgpr: source.indexUserSgpr, parameterType: 'constants' },
+              covering
+                ? {
+                    userSgpr: source.indexUserSgpr,
+                    parameterIndex: covering.index,
+                    parameterType: covering.type,
+                  }
+                : { userSgpr: source.indexUserSgpr, parameterIndex: null, parameterType: null },
+              `${key}: s${source.indexUserSgpr} is not inside a root-constants parameter`,
+              name,
+              source
+            );
+          }
+          if (!joinFailed) {
+            resolvedParamIndex = covering.index;
+            resolvedClass =
+              kind === 'uniform'
+                ? 'cbv'
+                : samplerKind
+                  ? 'sampler'
+                  : kind === 'storage' || kind === 'storage_texture'
+                    ? 'uav'
+                    : 'srv';
+            resolvedHeap = {
+              kind: source.kind,
+              parameterIndex: covering.index,
+              dwordOffset: source.indexUserSgpr - covering.startSgpr,
+              baseUserSgpr: source.baseUserSgpr,
+              stride: source.stride,
+              shift: source.indexShift,
+            };
+          }
         }
       } else if (source.kind === 'inline_sampler') {
         const samplerKind = kind === 'sampler' || kind === 'comparison_sampler';
@@ -4420,6 +4853,7 @@
       this._pipelines = new Map();
       this._registerConvention = { source: 'dxc-spirv', shifts: { b: 0, t: 0, u: 0, s: 0 } };
       this._samplerHeapBindings = 0;
+      this._resourceHeapStages = 0;
       this._resourceHeapBindings = 0;
       this._inlineSamplerStages = 0;
       this._inlineSamplerBindings = 0;
@@ -4446,6 +4880,9 @@
         if (previous.hasInlineSampler) {
           this._inlineSamplerStages -= 1;
         }
+        if (previous.hasResourceHeap || (previous.resourceHeapBindings || 0) > 0) {
+          this._resourceHeapStages -= 1;
+        }
         if (previous.isVertexIndexStage) {
           this._vertexIndexStages -= 1;
         }
@@ -4456,6 +4893,9 @@
       this._inlineSamplerBindings += shader.inlineSamplerBindings || 0;
       if (shader.hasInlineSampler) {
         this._inlineSamplerStages += 1;
+      }
+      if (shader.hasResourceHeap || (shader.resourceHeapBindings || 0) > 0) {
+        this._resourceHeapStages += 1;
       }
       if (shader.isVertexIndexStage) {
         this._vertexIndexStages += 1;
@@ -4501,10 +4941,13 @@
         input.schema === STAGE_REFLECTION_SCHEMA &&
         input.schema_version === undefined
       ) {
-        return this.loadStageReflection(input);
+        const result = this.loadStageReflection(input);
+        input = null;
+        return result;
       }
 
       const parsed = parseReflectionManifest(input);
+      input = null;
       this._registerConvention = parsed.registerConvention;
 
       for (const [idHex, bgl] of parsed.bindGroupLayouts.entries()) {
@@ -4856,6 +5299,22 @@
     }
 
     /**
+     * Reset cumulative telemetry counters (`lookupHits`, `lookupMisses`, `manifestsLoaded`,
+     * `sidecarsLoaded`, `layoutsBuilt`, `pipelineLayoutsBuilt`, `vertexLayoutsBuilt`,
+     * `bindingConflicts`) without clearing indexed shaders or stages.
+     */
+    resetStats() {
+      this._stats.manifestsLoaded = 0;
+      this._stats.sidecarsLoaded = 0;
+      this._stats.layoutsBuilt = 0;
+      this._stats.pipelineLayoutsBuilt = 0;
+      this._stats.vertexLayoutsBuilt = 0;
+      this._stats.lookupHits = 0;
+      this._stats.lookupMisses = 0;
+      this._stats.bindingConflicts = 0;
+    }
+
+    /**
      * Clear all loaded manifests and optionally reset telemetry counters.
      *
      * @param {{ resetStats?: boolean }} [options]
@@ -4869,20 +5328,14 @@
       this._pipelineLayouts.clear();
       this._pipelines.clear();
       this._samplerHeapBindings = 0;
+      this._resourceHeapStages = 0;
       this._resourceHeapBindings = 0;
       this._inlineSamplerStages = 0;
       this._inlineSamplerBindings = 0;
       this._vertexIndexStages = 0;
 
       if (options && options.resetStats) {
-        this._stats.manifestsLoaded = 0;
-        this._stats.sidecarsLoaded = 0;
-        this._stats.layoutsBuilt = 0;
-        this._stats.pipelineLayoutsBuilt = 0;
-        this._stats.vertexLayoutsBuilt = 0;
-        this._stats.lookupHits = 0;
-        this._stats.lookupMisses = 0;
-        this._stats.bindingConflicts = 0;
+        this.resetStats();
       }
     }
 
@@ -4890,11 +5343,13 @@
      * Return a telemetry snapshot for the registry.
      */
     getStats() {
+      const stagesIndexed = this._shadersByHash.size;
       return {
         manifestsLoaded: this._stats.manifestsLoaded,
         sidecarsLoaded: this._stats.sidecarsLoaded,
-        shaderCount: this._shadersByHash.size,
-        stageCount: this._shadersByHash.size,
+        shaderCount: stagesIndexed,
+        stageCount: stagesIndexed,
+        stagesIndexed,
         bindGroupLayoutCount: this._bindGroupLayouts.size,
         pipelineLayoutCount: this._pipelineLayouts.size,
         pipelineCount: this._pipelines.size,
@@ -4903,8 +5358,10 @@
         vertexLayoutsBuilt: this._stats.vertexLayoutsBuilt,
         lookupHits: this._stats.lookupHits,
         lookupMisses: this._stats.lookupMisses,
+        lookupHitRate: computeLookupHitRate(this._stats.lookupHits, this._stats.lookupMisses),
         bindingConflicts: this._stats.bindingConflicts,
         samplerHeapBindings: this._samplerHeapBindings,
+        resourceHeapStages: this._resourceHeapStages,
         resourceHeapBindings: this._resourceHeapBindings,
         inlineSamplerStages: this._inlineSamplerStages,
         inlineSamplerBindings: this._inlineSamplerBindings,
