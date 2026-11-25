@@ -26,6 +26,8 @@ const {
   encodeBatch,
   isValidIndirectRange,
   checkIndirectRange,
+  isZeroCountRecord,
+  validateIndirectBufferArgs,
   validateIndirectRange,
   computeIndirectBatchStepPlan,
   validateIndirectBatch,
@@ -860,6 +862,10 @@ test('telemetry tracks drawIndirect, drawIndexedIndirect, dispatchWorkgroupsIndi
     indirectDispatches: 0,
     clampedOrSkippedInvalid: 0,
     maxMultiDrawCount: 0,
+    validatedIndirectDraws: 0,
+    skippedOutOfBoundsDraws: 0,
+    skippedMisalignedDraws: 0,
+    skippedZeroCountDraws: 0,
   });
 
   // IndirectArgsBuffer instance telemetry + maxIndirectBatchCount + resetStats
@@ -1280,4 +1286,251 @@ test('W205: encodeMultiDraw / encodeMultiDispatchIndirect clampToBuffer & skipIn
   assert.equal(globalThis.PlayGta6IndirectDraw.isValidIndirectRange, isValidIndirectRange);
   assert.equal(globalThis.PlayGta6IndirectDraw.checkIndirectRange, checkIndirectRange);
   assert.equal(globalThis.PlayGta6IndirectDraw.computeIndirectBatchStepPlan, computeIndirectBatchStepPlan);
+});
+
+test('W269: validateIndirectBufferArgs enforces 16B/20B/12B strides, alignment, bounds, and zero-count without mutating stats', () => {
+  resetStats();
+  const buf32 = indirectBuf(32);
+
+  // Exact fits for drawIndirect (16B), drawIndexedIndirect (20B), dispatchWorkgroupsIndirect (12B)
+  const vDraw = validateIndirectBufferArgs(INDIRECT_KIND.DRAW, buf32, 16);
+  assert.equal(vDraw.ok, true);
+  assert.equal(vDraw.requiredStrideBytes, 16);
+  assert.equal(vDraw.zeroCount, false);
+
+  const vIndexed = validateIndirectBufferArgs(INDIRECT_KIND.DRAW_INDEXED, buf32, 12);
+  assert.equal(vIndexed.ok, true);
+  assert.equal(vIndexed.requiredStrideBytes, 20);
+
+  const vDisp = validateIndirectBufferArgs(INDIRECT_KIND.DISPATCH, buf32, 20);
+  assert.equal(vDisp.ok, true);
+  assert.equal(vDisp.requiredStrideBytes, 12);
+
+  // Misaligned offsets (offset % 4 !== 0)
+  for (const badOff of [1, 2, 3, 6, 14]) {
+    const res = validateIndirectBufferArgs(INDIRECT_KIND.DRAW, buf32, badOff);
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'MISALIGNED_OFFSET');
+  }
+
+  // Negative & out-of-bounds offsets for each record size
+  assert.equal(validateIndirectBufferArgs(INDIRECT_KIND.DRAW, buf32, -4).code, 'INVALID_OFFSET');
+  assert.equal(validateIndirectBufferArgs(INDIRECT_KIND.DRAW, buf32, 20).code, 'OUT_OF_BOUNDS');
+  assert.equal(validateIndirectBufferArgs(INDIRECT_KIND.DRAW_INDEXED, buf32, 16).code, 'OUT_OF_BOUNDS');
+  assert.equal(validateIndirectBufferArgs(INDIRECT_KIND.DISPATCH, buf32, 24).code, 'OUT_OF_BOUNDS');
+  assert.equal(
+    validateIndirectBufferArgs(INDIRECT_KIND.DRAW, indirectBuf(64), 48, { bufferSize: 60 }).code,
+    'OUT_OF_BOUNDS'
+  );
+
+  // Custom requiredStrideBytes enforcement
+  assert.equal(
+    validateIndirectBufferArgs(INDIRECT_KIND.DRAW, buf32, 0, { requiredStrideBytes: 32 }).ok,
+    true
+  );
+  assert.equal(
+    validateIndirectBufferArgs(INDIRECT_KIND.DRAW, buf32, 4, { requiredStrideBytes: 32 }).code,
+    'OUT_OF_BOUNDS'
+  );
+  assert.equal(
+    validateIndirectBufferArgs(INDIRECT_KIND.DRAW, buf32, 0, { requiredStrideBytes: 18 }).code,
+    'INVALID_STRIDE'
+  );
+
+  // Zero-count detection
+  assert.equal(isZeroCountRecord(INDIRECT_KIND.DRAW, { vertexCount: 0, instanceCount: 1 }), true);
+  assert.equal(isZeroCountRecord(INDIRECT_KIND.DRAW, { vertexCount: 3, instanceCount: 0 }), true);
+  assert.equal(isZeroCountRecord(INDIRECT_KIND.DRAW, { vertexCount: 3, instanceCount: 1 }), false);
+  assert.equal(isZeroCountRecord(INDIRECT_KIND.DRAW_INDEXED, { indexCount: 0, instanceCount: 1 }), true);
+  assert.equal(isZeroCountRecord(INDIRECT_KIND.DRAW_INDEXED, { indexCount: 36, instanceCount: 0 }), true);
+  assert.equal(isZeroCountRecord(INDIRECT_KIND.DISPATCH, { x: 1, y: 0, z: 1 }), true);
+  assert.equal(isZeroCountRecord(INDIRECT_KIND.DISPATCH, { x: 1, y: 1, z: 1 }), false);
+
+  const zCount = validateIndirectBufferArgs(INDIRECT_KIND.DRAW, indirectBuf(0), 0, { count: 0 });
+  assert.equal(zCount.ok, true);
+  assert.equal(zCount.zeroCount, true);
+  assert.equal(zCount.code, 'ZERO_COUNT');
+
+  const zRec = validateIndirectBufferArgs(INDIRECT_KIND.DRAW_INDEXED, buf32, 0, {
+    record: { indexCount: 36, instanceCount: 0 },
+  });
+  assert.equal(zRec.ok, true);
+  assert.equal(zRec.zeroCount, true);
+
+  // Pure validation does not mutate telemetry
+  const stats = getStats();
+  assert.equal(stats.validatedIndirectDraws, 0);
+  assert.equal(stats.skippedOutOfBoundsDraws, 0);
+  assert.equal(stats.skippedMisalignedDraws, 0);
+  assert.equal(stats.skippedZeroCountDraws, 0);
+
+  // UMD global export exposes W269 helpers
+  assert.equal(globalThis.PlayGta6IndirectDraw.isZeroCountRecord, isZeroCountRecord);
+  assert.equal(globalThis.PlayGta6IndirectDraw.validateIndirectBufferArgs, validateIndirectBufferArgs);
+});
+
+test('W269: valid draws, misaligned offsets, and out-of-bounds offsets update telemetry and never emit invalid WebGPU calls', () => {
+  resetStats();
+  const pass = createMockPass();
+  const buf32 = indirectBuf(32);
+
+  // Valid draws (16B draw, 20B indexed draw, 12B dispatch)
+  assert.equal(executeIndirectDraw(pass, buf32, 16).ok, true);
+  assert.equal(executeIndirectDrawIndexed(pass, buf32, 12).ok, true);
+  assert.equal(executeIndirectDispatch(pass, buf32, 20).ok, true);
+  assert.equal(pass.calls.length, 3);
+
+  // Misaligned offsets safely elided without throwing
+  const m1 = executeIndirectDraw(pass, buf32, 2);
+  const m2 = executeIndirectDrawIndexed(pass, buf32, 6);
+  const m3 = executeIndirectDispatch(pass, buf32, 1);
+  const m4 = encodeIndirectDraw(pass, buf32, 3, { skipInvalid: true });
+  assert.equal(m1.ok, false);
+  assert.equal(m1.reason, 'MISALIGNED_OFFSET');
+  assert.equal(m2.reason, 'MISALIGNED_OFFSET');
+  assert.equal(m3.reason, 'MISALIGNED_OFFSET');
+  assert.equal(m4.skipped, true);
+  assert.equal(m4.reason, 'MISALIGNED_OFFSET');
+
+  // Out-of-bounds & negative offsets safely elided without throwing
+  const o1 = executeIndirectDraw(pass, buf32, 20); // 20 + 16 = 36 > 32
+  const o2 = executeIndirectDrawIndexed(pass, buf32, 16); // 16 + 20 = 36 > 32
+  const o3 = executeIndirectDispatch(pass, buf32, 24); // 24 + 12 = 36 > 32
+  const o4 = executeIndirectDraw(pass, buf32, -4); // offset < 0
+  const o5 = encodeIndirectDrawIndexed(pass, indirectBuf(16), 0, { skipInvalid: true }); // 0 + 20 > 16
+  assert.equal(o1.ok, false);
+  assert.equal(o1.reason, 'OUT_OF_BOUNDS');
+  assert.equal(o2.reason, 'OUT_OF_BOUNDS');
+  assert.equal(o3.reason, 'OUT_OF_BOUNDS');
+  assert.equal(o4.reason, 'INVALID_OFFSET');
+  assert.equal(o5.skipped, true);
+  assert.equal(o5.reason, 'OUT_OF_BOUNDS');
+
+  // Clamped multi-draw counts validated draws and OOB-skipped tail draws separately
+  // 48B buffer with 16B drawIndirect fits 3 draws; requesting 5 executes 3 and skips 2 OOB
+  const clamped = executeIndirectDraw(pass, indirectBuf(48), 0, { count: 5 });
+  assert.equal(clamped.ok, true);
+  assert.equal(clamped.executed, 3);
+  assert.equal(clamped.skipped, 2);
+
+  assert.equal(pass.calls.length, 6, 'only the 6 valid draws reached the WebGPU pass encoder');
+
+  const s = getStats();
+  assert.equal(s.validatedIndirectDraws, 6);
+  assert.equal(s.skippedMisalignedDraws, 4);
+  assert.equal(s.skippedOutOfBoundsDraws, 7); // 5 single OOB/negative + 2 clamped OOB tail draws
+  assert.equal(s.skippedZeroCountDraws, 0);
+});
+
+test('W269: zero-count indirect draws and dispatches are safely elided across single, batched, shadowData, and IndirectArgsBuffer paths', () => {
+  resetStats();
+  const pass = createMockPass(true);
+  const buf64 = indirectBuf(64);
+
+  // 1. count === 0 on executeIndirect*, encodeIndirect*, encodeMultiDraw, encodeMultiDispatchIndirect
+  const z1 = executeIndirectDraw(pass, indirectBuf(0), 0, { count: 0 });
+  assert.equal(z1.ok, true);
+  assert.equal(z1.executed, 0);
+
+  const z2 = encodeIndirectDraw(pass, indirectBuf(0), 0, { count: 0 });
+  assert.equal(z2.skipped, true);
+  assert.equal(z2.reason, 'ZERO_COUNT');
+
+  const z3 = encodeIndirectDrawIndexed(pass, indirectBuf(0), 0, { count: 0 });
+  assert.equal(z3.skipped, true);
+  assert.equal(z3.reason, 'ZERO_COUNT');
+
+  const z4 = encodeIndirectDispatch(pass, indirectBuf(0), 0, { count: 0 });
+  assert.equal(z4.skipped, true);
+  assert.equal(z4.reason, 'ZERO_COUNT');
+
+  // 2. Explicit zero-count record / field elision on single draws and dispatches
+  const z5 = executeIndirectDraw(pass, buf64, 0, { record: { vertexCount: 0, instanceCount: 1 } });
+  assert.equal(z5.ok, true);
+  assert.equal(z5.executed, 0);
+  assert.equal(z5.skipped, 1);
+  assert.equal(z5.reason, 'ZERO_COUNT');
+
+  const z6 = executeIndirectDrawIndexed(pass, buf64, 0, { indexCount: 36, instanceCount: 0 });
+  assert.equal(z6.ok, true);
+  assert.equal(z6.executed, 0);
+  assert.equal(z6.reason, 'ZERO_COUNT');
+
+  const z7 = executeIndirectDispatch(pass, buf64, 0, { record: { x: 4, y: 0, z: 1 } });
+  assert.equal(z7.ok, true);
+  assert.equal(z7.executed, 0);
+  assert.equal(z7.reason, 'ZERO_COUNT');
+
+  const z8 = encodeIndirectDraw(pass, buf64, 0, { vertexCount: 3, instanceCount: 0 });
+  assert.equal(z8.skipped, true);
+  assert.equal(z8.reason, 'ZERO_COUNT');
+
+  assert.equal(pass.calls.length, 0, 'zero WebGPU calls emitted for zero-count draws');
+  assert.equal(getStats().skippedZeroCountDraws, 8);
+  assert.equal(getStats().validatedIndirectDraws, 0);
+
+  // 3. CPU shadowData elision in multi-draw (native run coalescing skips zero-count holes)
+  const { bytes: batchBytes } = encodeBatch(INDIRECT_KIND.DRAW_INDEXED, [
+    { indexCount: 36, instanceCount: 1 }, // slot 0: active
+    { indexCount: 0, instanceCount: 1 }, // slot 1: zero indexCount -> elided
+    { indexCount: 24, instanceCount: 2 }, // slot 2: active
+    { indexCount: 12, instanceCount: 0 }, // slot 3: zero instanceCount -> elided
+    { indexCount: 18, instanceCount: 1 }, // slot 4: active
+  ]);
+  const resShadow = executeIndirectDrawIndexed(pass, indirectBuf(batchBytes.byteLength), 0, {
+    count: 5,
+    shadowData: batchBytes,
+    useNative: true,
+  });
+  assert.equal(resShadow.ok, true);
+  assert.equal(resShadow.executed, 3);
+  assert.equal(resShadow.skipped, 2);
+  assert.deepEqual(pass.calls, [
+    ['multiDrawIndexedIndirect', 0, 1],
+    ['multiDrawIndexedIndirect', 40, 1],
+    ['multiDrawIndexedIndirect', 80, 1],
+  ]);
+
+  // 4. IndirectArgsBuffer.executeDraws with elideZeroCount: true elides zeroed/freed slots
+  pass.calls.length = 0;
+  const { device } = createMockDevice();
+  const args = new IndirectArgsBuffer({ device, capacity: 4 });
+  const s0 = args.allocate(rec(12));
+  const s1 = args.allocate({ indexCount: 0, instanceCount: 1 });
+  const s2 = args.allocate(rec(24));
+  args.free(s0); // freed slot is zeroed in shadow
+  assert.equal(s1, 1);
+  assert.equal(s2, 2);
+
+  const bufExec = args.executeDraws(pass, { elideZeroCount: true });
+  assert.equal(bufExec.ok, true);
+  assert.equal(bufExec.executed, 1);
+  assert.equal(bufExec.skipped, 2);
+  assert.deepEqual(pass.calls, [['drawIndexedIndirect', 40]]);
+
+  const bufStats = args.getStats();
+  assert.equal(bufStats.validatedIndirectDraws, 1);
+  assert.equal(bufStats.skippedZeroCountDraws, 2);
+  assert.equal(bufStats.skippedOutOfBoundsDraws, 0);
+  assert.equal(bufStats.skippedMisalignedDraws, 0);
+
+  const modStats = getStats();
+  assert.equal(modStats.validatedIndirectDraws, 4); // 3 from shadowData + 1 from IndirectArgsBuffer
+  assert.equal(modStats.skippedZeroCountDraws, 12); // 8 + 2 + 2
+
+  // 5. resetStats cleanly zeroes all W269 counters on both module and IndirectArgsBuffer
+  args.resetStats();
+  const clearedBuf = args.getStats();
+  assert.equal(clearedBuf.validatedIndirectDraws, 0);
+  assert.equal(clearedBuf.skippedOutOfBoundsDraws, 0);
+  assert.equal(clearedBuf.skippedMisalignedDraws, 0);
+  assert.equal(clearedBuf.skippedZeroCountDraws, 0);
+  assert.equal(clearedBuf.liveSlots, 2, 'resetStats preserves live slot metadata');
+
+  resetStats();
+  const clearedMod = getStats();
+  assert.equal(clearedMod.validatedIndirectDraws, 0);
+  assert.equal(clearedMod.skippedOutOfBoundsDraws, 0);
+  assert.equal(clearedMod.skippedMisalignedDraws, 0);
+  assert.equal(clearedMod.skippedZeroCountDraws, 0);
 });
