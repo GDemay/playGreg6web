@@ -13,6 +13,8 @@ const {
   DEFAULT_FRAMES_IN_FLIGHT,
   DEFAULT_SOFT_BUDGET_BYTES,
   DEFAULT_MAX_CACHED_VIEWS_PER_TEXTURE,
+  FAST_HANDLE_LIMIT,
+  DEFAULT_MAX_STALE_HANDLE_HISTORY,
   CREATE_TEXTURE2_OPCODE,
   CREATE_TEXTURE2_PAYLOAD_BYTES,
   MAX_TEXTURE_VIEW_FORMATS,
@@ -28,6 +30,9 @@ const {
   TEXTURE_COMPRESSION_BC_FEATURE,
   RESOURCE_KIND,
   RESOURCE_KINDS,
+  VRAM_KIND,
+  VRAM_KINDS,
+  resolveVramKind,
   isBcFormat,
   isSrgbFormat,
   getSrgbSiblingFormat,
@@ -2950,4 +2955,533 @@ test('W250 resetStats() resets cumulative telemetry, re-baselines peaks to live 
   assert.equal(cleared.totalBytes, 0);
   assert.equal(cleared.activeCount, 0);
   assert.equal(cleared.cachedViewCount, 0);
+});
+
+// ---------------------------------------------------------------------------
+// W300 Tests (#1207, Refs #1077): O(1) zero-alloc numeric handle fast path,
+// per-kind VRAM accounting (buffer, texture, renderTarget, sampler, other),
+// stale/destroyed resource eviction telemetry, getVramBreakdown(), and resetStats().
+// ---------------------------------------------------------------------------
+
+function assertVramInvariants(reg) {
+  const stats = reg.getStats();
+  const breakdown = reg.getVramBreakdown();
+
+  assert.equal(stats.peakTotalVramBytes, stats.peakBytes);
+  assert.equal(stats.peakTotalVramBytes, stats.peakTotalBytes);
+  assert.equal(breakdown.peakTotalVramBytes, stats.peakTotalVramBytes);
+  assert.equal(breakdown.totalLiveBytes, stats.activeBytes);
+  assert.equal(breakdown.totalPendingRetireBytes, stats.pendingRetireBytes);
+  assert.equal(breakdown.totalBytes, stats.totalBytes);
+  assert.equal(breakdown.evictedCount, stats.evictedCount);
+  assert.equal(breakdown.evictedBytes, stats.evictedBytes);
+
+  let sumLive = 0;
+  let sumPending = 0;
+  let sumTotal = 0;
+  let sumCount = 0;
+
+  for (const vk of VRAM_KINDS) {
+    const sb = stats.vramByKind[vk];
+    const bb = breakdown[vk];
+    assert.ok(sb && bb, `missing vram bucket ${vk}`);
+    assert.deepEqual(bb, sb);
+    assert.deepEqual(breakdown.byKind[vk], sb);
+
+    for (const field of ['count', 'liveBytes', 'pendingRetireBytes', 'totalBytes', 'peakBytes', 'peakLiveBytes']) {
+      assert.equal(typeof sb[field], 'number', `${vk}.${field} must be number`);
+      assert.ok(Number.isFinite(sb[field]) && sb[field] >= 0, `${vk}.${field} must be finite >= 0`);
+    }
+    assert.equal(sb.totalBytes, sb.liveBytes + sb.pendingRetireBytes);
+    assert.ok(sb.peakBytes >= sb.totalBytes, `${vk}.peakBytes >= totalBytes`);
+    assert.ok(sb.peakLiveBytes >= sb.liveBytes, `${vk}.peakLiveBytes >= liveBytes`);
+
+    sumLive += sb.liveBytes;
+    sumPending += sb.pendingRetireBytes;
+    sumTotal += sb.totalBytes;
+    sumCount += sb.count;
+  }
+
+  assert.equal(sumLive, stats.activeBytes);
+  assert.equal(sumPending, stats.pendingRetireBytes);
+  assert.equal(sumTotal, stats.totalBytes);
+  assert.equal(sumCount, stats.activeCount);
+  assert.ok(stats.peakTotalVramBytes >= stats.totalBytes);
+}
+
+test('W300 exports VRAM_KIND/FAST_HANDLE_LIMIT/resolveVramKind and stays classic-worker IIFE isolated', () => {
+  assert.equal(FAST_HANDLE_LIMIT, 65536);
+  assert.equal(DEFAULT_MAX_STALE_HANDLE_HISTORY, 16384);
+  assert.deepEqual([...VRAM_KINDS], ['buffer', 'texture', 'renderTarget', 'sampler', 'other']);
+  assert.ok(Object.isFrozen(VRAM_KIND));
+  assert.ok(Object.isFrozen(VRAM_KINDS));
+  assert.equal(typeof resolveVramKind, 'function');
+
+  // Verify resolveVramKind classification across all 5 buckets
+  assert.equal(resolveVramKind(RESOURCE_KIND.BUFFER, {}, {}), VRAM_KIND.BUFFER);
+  assert.equal(resolveVramKind(RESOURCE_KIND.TEXTURE, {}, {}), VRAM_KIND.TEXTURE);
+  assert.equal(
+    resolveVramKind(RESOURCE_KIND.TEXTURE, {}, { usage: GPU_TEXTURE_USAGE.RENDER_ATTACHMENT }),
+    VRAM_KIND.RENDER_TARGET
+  );
+  assert.equal(
+    resolveVramKind(
+      RESOURCE_KIND.TEXTURE,
+      {},
+      { descriptor: { usage: GPU_TEXTURE_USAGE.TEXTURE_BINDING | GPU_TEXTURE_USAGE.RENDER_ATTACHMENT } }
+    ),
+    VRAM_KIND.RENDER_TARGET
+  );
+  assert.equal(
+    resolveVramKind(RESOURCE_KIND.TEXTURE, { usage: GPU_TEXTURE_USAGE.RENDER_ATTACHMENT }, {}),
+    VRAM_KIND.RENDER_TARGET
+  );
+  assert.equal(
+    resolveVramKind(RESOURCE_KIND.TEXTURE, {}, { isRenderTarget: true }),
+    VRAM_KIND.RENDER_TARGET
+  );
+  assert.equal(resolveVramKind(RESOURCE_KIND.SAMPLER, {}, {}), VRAM_KIND.SAMPLER);
+  assert.equal(resolveVramKind(RESOURCE_KIND.BIND_GROUP, {}, {}), VRAM_KIND.OTHER);
+  assert.equal(resolveVramKind(RESOURCE_KIND.RENDER_PIPELINE, {}, {}), VRAM_KIND.OTHER);
+  assert.equal(resolveVramKind(RESOURCE_KIND.COMPUTE_PIPELINE, {}, {}), VRAM_KIND.OTHER);
+  assert.equal(resolveVramKind(RESOURCE_KIND.SHADER_MODULE, {}, {}), VRAM_KIND.OTHER);
+  assert.equal(resolveVramKind(RESOURCE_KIND.TEXTURE_VIEW, {}, {}), VRAM_KIND.OTHER);
+  assert.equal(
+    resolveVramKind(RESOURCE_KIND.BUFFER, {}, { vramKind: 'renderTarget' }),
+    VRAM_KIND.RENDER_TARGET
+  );
+  assert.equal(
+    resolveVramKind(RESOURCE_KIND.BUFFER, {}, { vramKind: 'unrecognized-kind' }),
+    VRAM_KIND.OTHER
+  );
+
+  // Classic-worker double importScripts isolation check with zero top-level leaks
+  const sandbox = { console, TextEncoder, TextDecoder };
+  const vmCtx = vm.createContext(sandbox);
+  vmCtx.self = vmCtx;
+  vmCtx.importScripts = (...urls) => {
+    for (const rel of urls) {
+      const fullPath = path.resolve(WORKERS_DIR, rel);
+      const source = readFileSync(fullPath, 'utf8');
+      vm.runInContext(source, vmCtx, { filename: fullPath });
+    }
+  };
+  vmCtx.importScripts('./resource_registry.js');
+  vmCtx.importScripts('./resource_registry.js');
+  assert.doesNotThrow(() => {
+    vm.runInContext(
+      `
+      const VRAM_KIND = {};
+      const VRAM_KINDS = [];
+      const FAST_HANDLE_LIMIT = 0;
+      function resolveVramKind() {}
+      `,
+      vmCtx
+    );
+  });
+  assert.equal(vmCtx.PlayGta6ResourceRegistry.FAST_HANDLE_LIMIT, 65536);
+  assert.deepEqual([...vmCtx.PlayGta6ResourceRegistry.VRAM_KINDS], [
+    'buffer',
+    'texture',
+    'renderTarget',
+    'sampler',
+    'other',
+  ]);
+});
+
+test('W300 O(1) zero-alloc numeric handle fast path covers dense slots, overflow handles, typed shortcuts, and invalid inputs', () => {
+  const reg = new GpuResourceRegistry();
+
+  const buf0 = createDestroyableMock('buf-0');
+  const bufEdge = createDestroyableMock('buf-edge');
+  const bufOverflow = createDestroyableMock('buf-overflow');
+  const bufHuge = createDestroyableMock('buf-huge');
+  const tex1 = createDestroyableMock('tex-1');
+  const view1 = createNonDestroyableMock('view-1');
+  const samp1 = createNonDestroyableMock('samp-1');
+  const bg1 = createNonDestroyableMock('bg-1');
+  const rp1 = createNonDestroyableMock('rp-1');
+  const cp1 = createNonDestroyableMock('cp-1');
+
+  const edgeHandle = FAST_HANDLE_LIMIT - 1;
+  const overflowHandle = FAST_HANDLE_LIMIT;
+  const hugeHandle = 1_000_000_007;
+
+  reg.register(RESOURCE_KIND.BUFFER, 0, buf0, { byteSize: 64 });
+  reg.register(RESOURCE_KIND.BUFFER, edgeHandle, bufEdge, { byteSize: 128 });
+  reg.register(RESOURCE_KIND.BUFFER, overflowHandle, bufOverflow, { byteSize: 256 });
+  reg.register(RESOURCE_KIND.BUFFER, hugeHandle, bufHuge, { byteSize: 512 });
+  reg.register(RESOURCE_KIND.TEXTURE, 1, tex1, { byteSize: 1024 });
+  reg.register(RESOURCE_KIND.TEXTURE_VIEW, 1, view1, { byteSize: 0 });
+  reg.register(RESOURCE_KIND.SAMPLER, 2, samp1, { byteSize: 32 });
+  reg.register(RESOURCE_KIND.BIND_GROUP, 3, bg1, { byteSize: 64 });
+  reg.register(RESOURCE_KIND.RENDER_PIPELINE, 4, rp1, { byteSize: 128 });
+  reg.register(RESOURCE_KIND.COMPUTE_PIPELINE, 5, cp1, { byteSize: 128 });
+
+  // Dense fast-slot lookups via getFast & typed shortcuts
+  assert.equal(reg.getFast(RESOURCE_KIND.BUFFER, 0), buf0);
+  assert.equal(reg.getFast(RESOURCE_KIND.BUFFER, edgeHandle), bufEdge);
+  assert.equal(reg.getBufferFast(0), buf0);
+  assert.equal(reg.getBufferFast(edgeHandle), bufEdge);
+  assert.equal(reg.getTextureFast(1), tex1);
+  assert.equal(reg.getTextureViewFast(1), view1);
+  assert.equal(reg.getSamplerFast(2), samp1);
+  assert.equal(reg.getBindGroupFast(3), bg1);
+  assert.equal(reg.getRenderPipelineFast(4), rp1);
+  assert.equal(reg.getComputePipelineFast(5), cp1);
+
+  assert.equal(reg.getStats().fastHandleHits, 10);
+  assert.equal(reg.getStats().fastHandleOverflowHits, 0);
+
+  // Overflow safe-integer handles >= FAST_HANDLE_LIMIT hit Map fallback seamlessly
+  assert.equal(reg.getFast(RESOURCE_KIND.BUFFER, overflowHandle), bufOverflow);
+  assert.equal(reg.getBufferFast(hugeHandle), bufHuge);
+  assert.equal(reg.get(RESOURCE_KIND.BUFFER, overflowHandle), bufOverflow);
+  assert.equal(reg.getStats().fastHandleOverflowHits, 3);
+
+  // has / hasFast across dense, overflow, missing, and invalid inputs
+  assert.equal(reg.hasFast(RESOURCE_KIND.BUFFER, 0), true);
+  assert.equal(reg.hasFast(RESOURCE_KIND.BUFFER, overflowHandle), true);
+  assert.equal(reg.hasFast(RESOURCE_KIND.BUFFER, 999), false);
+  assert.equal(reg.hasFast('bogus', 0), false);
+  assert.equal(reg.hasFast('__proto__', 0), false);
+  assert.equal(reg.hasFast(RESOURCE_KIND.BUFFER, -1), false);
+  assert.equal(reg.hasFast(RESOURCE_KIND.BUFFER, 1.5), false);
+  assert.equal(reg.hasFast(RESOURCE_KIND.BUFFER, NaN), false);
+  assert.equal(reg.hasFast(RESOURCE_KIND.BUFFER, Infinity), false);
+  assert.equal(reg.hasFast(RESOURCE_KIND.BUFFER, '0'), false);
+
+  // getFast & typed shortcuts never throw on invalid inputs
+  assert.equal(reg.getFast('bogus', 0), undefined);
+  assert.equal(reg.getFast('__proto__', 0), undefined);
+  assert.equal(reg.getFast(RESOURCE_KIND.BUFFER, -1), undefined);
+  assert.equal(reg.getFast(RESOURCE_KIND.BUFFER, 1.5), undefined);
+  assert.equal(reg.getFast(RESOURCE_KIND.BUFFER, NaN), undefined);
+  assert.equal(reg.getFast(RESOURCE_KIND.BUFFER, Infinity), undefined);
+  assert.equal(reg.getFast(RESOURCE_KIND.BUFFER, '0'), undefined);
+  assert.equal(reg.getBufferFast(-5), undefined);
+  assert.equal(reg.getBufferFast(NaN), undefined);
+  assert.equal(reg.getBufferFast('1'), undefined);
+  assert.equal(reg.getTextureFast(undefined), undefined);
+
+  // Strict get() and has() still validate prototype-pollution keys and bad handles
+  assert.throws(() => reg.get('__proto__', 0), RangeError);
+  assert.throws(() => reg.has('constructor', 0), RangeError);
+  assert.throws(() => reg.get(RESOURCE_KIND.BUFFER, -1), RangeError);
+  assert.throws(() => reg.get(RESOURCE_KIND.BUFFER, 1.25), RangeError);
+
+  // Hot draw/bind loop stress: 5,000 lookups with exact identity & hit accounting
+  const hitsBefore = reg.getStats().fastHandleHits;
+  for (let i = 0; i < 1000; i += 1) {
+    assert.equal(reg.getBufferFast(0), buf0);
+    assert.equal(reg.getTextureFast(1), tex1);
+    assert.equal(reg.getSamplerFast(2), samp1);
+    assert.equal(reg.getBindGroupFast(3), bg1);
+    assert.equal(reg.getRenderPipelineFast(4), rp1);
+  }
+  assert.equal(reg.getStats().fastHandleHits, hitsBefore + 5000);
+  assert.equal(reg.getStats().staleLookupMisses, 0);
+  assertVramInvariants(reg);
+});
+
+test('W300 per-kind VRAM accounting tracks buffer/texture/renderTarget/sampler/other across create, replace, destroy, collect, and clear', () => {
+  const { device } = createMockWebGpuDevice({
+    features: new Set([TEXTURE_COMPRESSION_BC_FEATURE]),
+  });
+  const reg = new GpuResourceRegistry({ framesInFlight: 2, device });
+
+  assertVramInvariants(reg);
+
+  // 1. Create / register across all 5 VRAM buckets
+  reg.createBuffer(1, { size: 1024, usage: GPU_BUFFER_USAGE.VERTEX });
+  reg.createTexture(2, {
+    width: 64,
+    height: 64,
+    format: 'rgba8unorm',
+    usage: GPU_TEXTURE_USAGE.TEXTURE_BINDING | GPU_TEXTURE_USAGE.COPY_DST,
+  }); // 64*64*4 = 16384 -> texture
+  reg.createTexture2(3, {
+    width: 128,
+    height: 64,
+    format: 'rgba16float',
+    usage: GPU_TEXTURE_USAGE.RENDER_ATTACHMENT | GPU_TEXTURE_USAGE.TEXTURE_BINDING,
+  }); // 128*64*8 = 65536 -> renderTarget
+  const samp = createNonDestroyableMock('aniso');
+  const pso = createNonDestroyableMock('main-pso');
+  reg.register(RESOURCE_KIND.SAMPLER, 4, samp, { byteSize: 256 });
+  reg.register(RESOURCE_KIND.RENDER_PIPELINE, 5, pso, { byteSize: 4096 });
+
+  let bd = reg.getVramBreakdown();
+  assert.equal(bd.buffer.liveBytes, 1024);
+  assert.equal(bd.buffer.count, 1);
+  assert.equal(bd.texture.liveBytes, 16384);
+  assert.equal(bd.texture.count, 1);
+  assert.equal(bd.renderTarget.liveBytes, 65536);
+  assert.equal(bd.renderTarget.count, 1);
+  assert.equal(bd.sampler.liveBytes, 256);
+  assert.equal(bd.sampler.count, 1);
+  // Note: createTexture + createTexture2 also registered 2 default TEXTURE_VIEWs (0 bytes each) -> other count = 3
+  assert.equal(bd.other.liveBytes, 4096);
+  assert.equal(bd.other.count, 3);
+  assert.equal(bd.totalLiveBytes, 1024 + 16384 + 65536 + 256 + 4096);
+  assert.equal(bd.peakTotalVramBytes, 1024 + 16384 + 65536 + 256 + 4096);
+  assertVramInvariants(reg);
+
+  // 2. Same-object in-place replace: resize + reclassify vramKind cleanly
+  const tex2Obj = reg.getTextureFast(2);
+  reg.register(RESOURCE_KIND.TEXTURE, 2, tex2Obj, {
+    byteSize: 32768,
+    isRenderTarget: true,
+  });
+  bd = reg.getVramBreakdown();
+  assert.equal(bd.texture.liveBytes, 0);
+  assert.equal(bd.texture.count, 0);
+  assert.equal(bd.texture.peakBytes, 16384);
+  assert.equal(bd.renderTarget.liveBytes, 65536 + 32768);
+  assert.equal(bd.renderTarget.count, 2);
+  assert.equal(bd.renderTarget.peakBytes, 65536 + 32768);
+  assertVramInvariants(reg);
+
+  // 3. Overwrite replace on buffer handle 1 (retires old 1024-byte buffer -> pending, adds 2048-byte buffer -> live)
+  reg.beginFrame(1);
+  reg.createBuffer(1, { size: 2048, usage: GPU_BUFFER_USAGE.STORAGE });
+  bd = reg.getVramBreakdown();
+  assert.equal(bd.buffer.liveBytes, 2048);
+  assert.equal(bd.buffer.pendingRetireBytes, 1024);
+  assert.equal(bd.buffer.totalBytes, 3072);
+  assert.equal(bd.buffer.peakBytes, 3072);
+  assert.equal(bd.buffer.peakLiveBytes, 2048);
+  assertVramInvariants(reg);
+
+  // Collect after framesInFlight -> old 1024-byte buffer destroyed & accounted in evictedCount/evictedBytes
+  reg.beginFrame(2);
+  reg.beginFrame(3);
+  bd = reg.getVramBreakdown();
+  assert.equal(bd.buffer.liveBytes, 2048);
+  assert.equal(bd.buffer.pendingRetireBytes, 0);
+  assert.equal(bd.buffer.peakBytes, 3072);
+  assert.equal(bd.evictedCount, 1);
+  assert.equal(bd.evictedBytes, 1024);
+  assertVramInvariants(reg);
+
+  // 4. Immediate destroy(kind, handle) reclaims VRAM immediately without waiting for framesInFlight
+  const rt3Obj = reg.getTextureFast(3);
+  assert.equal(reg.destroy(RESOURCE_KIND.TEXTURE, 3), true);
+  assert.equal(reg.destroy(RESOURCE_KIND.TEXTURE, 3), false); // idempotent, no double-decrement
+  assert.equal(rt3Obj.destroyCount, 1);
+  assert.equal(reg.getTextureFast(3), undefined);
+  bd = reg.getVramBreakdown();
+  assert.equal(bd.renderTarget.liveBytes, 32768);
+  assert.equal(bd.renderTarget.count, 1);
+  assert.equal(bd.renderTarget.pendingRetireBytes, 0);
+  assert.equal(bd.renderTarget.peakBytes, 65536 + 32768);
+  assert.equal(bd.evictedCount, 2);
+  assert.equal(bd.evictedBytes, 1024 + 65536);
+  assertVramInvariants(reg);
+
+  // 5. clear() destroys everything remaining (live + pending), zeroes all buckets, preserves peaks
+  const expectedPeak = bd.peakTotalVramBytes;
+  const remainingBytes = bd.totalBytes;
+  const cleared = reg.clear();
+  assert.equal(cleared.freedBytes, remainingBytes);
+  assert.ok(cleared.destroyedCount >= 4);
+
+  bd = reg.getVramBreakdown();
+  assert.equal(bd.totalLiveBytes, 0);
+  assert.equal(bd.totalPendingRetireBytes, 0);
+  assert.equal(bd.totalBytes, 0);
+  assert.equal(bd.peakTotalVramBytes, expectedPeak);
+  for (const vk of VRAM_KINDS) {
+    assert.equal(bd[vk].liveBytes, 0);
+    assert.equal(bd[vk].pendingRetireBytes, 0);
+    assert.equal(bd[vk].totalBytes, 0);
+    assert.equal(bd[vk].count, 0);
+  }
+  assert.equal(bd.evictedBytes, 1024 + 65536 + remainingBytes);
+  assertVramInvariants(reg);
+
+  // Second clear() is a safe idempotent no-op
+  const evictedCountBefore = bd.evictedCount;
+  const evictedBytesBefore = bd.evictedBytes;
+  const cleared2 = reg.clear();
+  assert.equal(cleared2.destroyedCount, 0);
+  assert.equal(cleared2.freedBytes, 0);
+  assert.equal(reg.getStats().evictedCount, evictedCountBefore);
+  assert.equal(reg.getStats().evictedBytes, evictedBytesBefore);
+  assertVramInvariants(reg);
+});
+
+test('W300 stale lookup tracking, external-destroy auto-eviction, evictStale(), and bounded stale history', () => {
+  const reg = new GpuResourceRegistry({ framesInFlight: 2, maxStaleHandleHistory: 3 });
+
+  const b1 = { name: 'b1', destroyed: false, destroy() { this.destroyed = true; } };
+  const b2 = { name: 'b2', destroyed: false, destroy() { this.destroyed = true; } };
+  const b3 = { name: 'b3', destroyed: false, destroy() { this.destroyed = true; } };
+  const t1 = { name: 't1', destroyed: false, destroy() { this.destroyed = true; } };
+
+  // Never-registered handle misses must NOT count as staleLookupMisses
+  assert.equal(reg.get(RESOURCE_KIND.BUFFER, 500), undefined);
+  assert.equal(reg.getFast(RESOURCE_KIND.BUFFER, 501), undefined);
+  assert.equal(reg.getBufferFast(502), undefined);
+  assert.equal(reg.getEntry(RESOURCE_KIND.BUFFER, 503), undefined);
+  assert.equal(reg.getStats().staleLookupMisses, 0);
+
+  reg.register(RESOURCE_KIND.BUFFER, 10, b1, { byteSize: 4096 });
+  reg.register(RESOURCE_KIND.BUFFER, 20, b2, { byteSize: 8192 });
+  reg.register(RESOURCE_KIND.BUFFER, 30, b3, { byteSize: 1024 });
+  reg.register(RESOURCE_KIND.TEXTURE, 40, t1, { byteSize: 16384, isRenderTarget: true });
+
+  // 1. Retiring handle 10 makes lookups count as staleLookupMisses (has/hasFast do NOT count)
+  reg.retire(RESOURCE_KIND.BUFFER, 10);
+  assert.equal(reg.has(RESOURCE_KIND.BUFFER, 10), false);
+  assert.equal(reg.hasFast(RESOURCE_KIND.BUFFER, 10), false);
+  assert.equal(reg.getStats().staleLookupMisses, 0);
+
+  assert.equal(reg.get(RESOURCE_KIND.BUFFER, 10), undefined);
+  assert.equal(reg.getFast(RESOURCE_KIND.BUFFER, 10), undefined);
+  assert.equal(reg.getBufferFast(10), undefined);
+  assert.equal(reg.getEntry(RESOURCE_KIND.BUFFER, 10), undefined);
+  assert.equal(reg.getStats().staleLookupMisses, 4);
+
+  // Re-registering handle 10 clears its stale status
+  const b1Fresh = createDestroyableMock('b1-fresh');
+  reg.register(RESOURCE_KIND.BUFFER, 10, b1Fresh, { byteSize: 2048 });
+  assert.equal(reg.getBufferFast(10), b1Fresh);
+  assert.equal(reg.getStats().staleLookupMisses, 4);
+
+  // 2. External destruction of b2: detected & auto-evicted on lookup once (no double-evict)
+  b2.destroyed = true;
+  assert.equal(reg.hasFast(RESOURCE_KIND.BUFFER, 20), false);
+  assert.equal(reg.getStats().evictedCount, 0); // hasFast is non-mutating
+  assert.equal(reg.getBufferFast(20), undefined);
+  let stats = reg.getStats();
+  assert.equal(stats.staleLookupMisses, 5);
+  assert.equal(stats.evictedCount, 1);
+  assert.equal(stats.evictedBytes, 8192);
+  assert.equal(stats.vramByKind.buffer.liveBytes, 2048 + 1024);
+
+  // Subsequent stale lookup of handle 20 bumps staleLookupMisses without double-evicting
+  assert.equal(reg.getFast(RESOURCE_KIND.BUFFER, 20), undefined);
+  stats = reg.getStats();
+  assert.equal(stats.staleLookupMisses, 6);
+  assert.equal(stats.evictedCount, 1);
+  assert.equal(stats.evictedBytes, 8192);
+
+  // 3. Proactive evictStale() sweeps externally destroyed resources across kinds
+  b3.destroyed = true;
+  t1.destroyed = true;
+  const swept = reg.evictStale();
+  assert.equal(swept.evictedCount, 2);
+  assert.equal(swept.evictedBytes, 1024 + 16384);
+  stats = reg.getStats();
+  assert.equal(stats.evictedCount, 3);
+  assert.equal(stats.evictedBytes, 8192 + 1024 + 16384);
+  assert.equal(stats.vramByKind.renderTarget.liveBytes, 0);
+  assert.equal(stats.vramByKind.buffer.liveBytes, 2048);
+
+  // Second evictStale() is a no-op
+  assert.deepEqual(reg.evictStale(), { evictedCount: 0, evictedBytes: 0 });
+
+  // Looking up proactively evicted handles counts as staleLookupMisses
+  assert.equal(reg.getTextureFast(40), undefined);
+  assert.equal(reg.getStats().staleLookupMisses, 7);
+
+  // 4. Bounded stale-handle history (maxStaleHandleHistory === 3) evicts oldest retired handle
+  // Currently retired buffers: [20, 30]. Retire 10, 100, 101 -> oldest (20, 30) evicted from history.
+  reg.register(RESOURCE_KIND.BUFFER, 100, createDestroyableMock('b100'), { byteSize: 64 });
+  reg.register(RESOURCE_KIND.BUFFER, 101, createDestroyableMock('b101'), { byteSize: 64 });
+  reg.retire(RESOURCE_KIND.BUFFER, 10);
+  reg.retire(RESOURCE_KIND.BUFFER, 100);
+  reg.retire(RESOURCE_KIND.BUFFER, 101);
+  // 20 is now evicted from the 3-entry stale history; 101 is still tracked
+  const missesBefore = reg.getStats().staleLookupMisses;
+  assert.equal(reg.getBufferFast(20), undefined);
+  assert.equal(reg.getStats().staleLookupMisses, missesBefore);
+  assert.equal(reg.getBufferFast(101), undefined);
+  assert.equal(reg.getStats().staleLookupMisses, missesBefore + 1);
+  assertVramInvariants(reg);
+});
+
+test('W300 resetStats() resets eviction/stale/fast-path counters and re-baselines per-kind VRAM peaks', () => {
+  const { device } = createMockWebGpuDevice({
+    features: new Set([TEXTURE_COMPRESSION_BC_FEATURE]),
+  });
+  const reg = new GpuResourceRegistry({ framesInFlight: 2, device });
+
+  reg.createBuffer(1, { size: 4096, usage: GPU_BUFFER_USAGE.VERTEX });
+  reg.createBuffer(2, { size: 8192, usage: GPU_BUFFER_USAGE.INDEX });
+  reg.createTexture2(3, {
+    width: 64,
+    height: 64,
+    format: 'rgba8unorm',
+    usage: GPU_TEXTURE_USAGE.RENDER_ATTACHMENT | GPU_TEXTURE_USAGE.TEXTURE_BINDING,
+  }); // 16384 -> renderTarget
+  reg.createTexture2(4, {
+    width: 32,
+    height: 32,
+    format: 'rgba8unorm',
+    usage: GPU_TEXTURE_USAGE.TEXTURE_BINDING,
+  }); // 4096 -> texture
+  reg.register(RESOURCE_KIND.SAMPLER, 5, createNonDestroyableMock('s5'), { byteSize: 128 });
+  reg.register(RESOURCE_KIND.BIND_GROUP, 6, createNonDestroyableMock('bg6'), { byteSize: 512 });
+
+  // Generate fast hits, overflow hits, evictions, and stale lookup misses
+  const overflowBuf = createDestroyableMock('ovf');
+  reg.register(RESOURCE_KIND.BUFFER, FAST_HANDLE_LIMIT + 7, overflowBuf, { byteSize: 1024 });
+  assert.equal(reg.getBufferFast(1), reg.get(RESOURCE_KIND.BUFFER, 1));
+  assert.equal(reg.getBufferFast(FAST_HANDLE_LIMIT + 7), overflowBuf);
+
+  assert.equal(reg.destroy(RESOURCE_KIND.BUFFER, 2), true);
+  assert.equal(reg.destroy(RESOURCE_KIND.BUFFER, FAST_HANDLE_LIMIT + 7), true);
+  assert.equal(reg.getBufferFast(2), undefined); // stale miss #1
+  assert.equal(reg.getBufferFast(FAST_HANDLE_LIMIT + 7), undefined); // stale miss #2
+
+  const before = reg.getStats();
+  assert.equal(before.evictedCount, 2);
+  assert.equal(before.evictedBytes, 8192 + 1024);
+  assert.equal(before.staleLookupMisses, 2);
+  assert.ok(before.fastHandleHits >= 2);
+  assert.equal(before.fastHandleOverflowHits, 1);
+  assert.equal(before.vramByKind.buffer.liveBytes, 4096);
+  assert.equal(before.vramByKind.buffer.peakBytes, 4096 + 8192 + 1024);
+
+  const after = reg.resetStats();
+  // Cumulative W300 counters reset cleanly to 0
+  assert.equal(after.evictedCount, 0);
+  assert.equal(after.evictedBytes, 0);
+  assert.equal(after.staleLookupMisses, 0);
+  assert.equal(after.fastHandleHits, 0);
+  assert.equal(after.fastHandleOverflowHits, 0);
+
+  // Per-kind VRAM peaks & peakTotalVramBytes re-baseline to current occupancy
+  assert.equal(after.vramByKind.buffer.liveBytes, 4096);
+  assert.equal(after.vramByKind.buffer.peakBytes, 4096);
+  assert.equal(after.vramByKind.buffer.peakLiveBytes, 4096);
+  assert.equal(after.vramByKind.renderTarget.peakBytes, 16384);
+  assert.equal(after.vramByKind.texture.peakBytes, 4096);
+  assert.equal(after.vramByKind.sampler.peakBytes, 128);
+  assert.equal(after.vramByKind.other.peakBytes, 512);
+  assert.equal(after.peakTotalVramBytes, after.totalBytes);
+  assertVramInvariants(reg);
+
+  // Live handles remain reachable on O(1) fast path, and pre-reset retired handle 2 is still stale!
+  assert.ok(reg.getBufferFast(1));
+  assert.equal(reg.getBufferFast(2), undefined);
+  const postReset = reg.getStats();
+  assert.equal(postReset.fastHandleHits, 1);
+  assert.equal(postReset.staleLookupMisses, 1);
+
+  // Clear + resetStats drops all peaks and totals cleanly to 0
+  reg.clear();
+  const empty = reg.resetStats();
+  assert.equal(empty.peakTotalVramBytes, 0);
+  assert.equal(empty.evictedCount, 0);
+  assert.equal(empty.evictedBytes, 0);
+  assert.equal(empty.staleLookupMisses, 0);
+  for (const vk of VRAM_KINDS) {
+    assert.equal(empty.vramByKind[vk].peakBytes, 0);
+    assert.equal(empty.vramByKind[vk].peakLiveBytes, 0);
+    assert.equal(empty.vramByKind[vk].liveBytes, 0);
+  }
+  assertVramInvariants(reg);
 });
