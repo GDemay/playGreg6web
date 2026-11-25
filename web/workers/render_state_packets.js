@@ -1430,6 +1430,7 @@ class RenderStatePackets {
       depthCompareDefaults: 0,
       rootSigGroup0Layouts: 0,
       autoLayoutFallbacks: 0,
+      bindGroupKindMismatches: 0,
       computePipelineCount: 0,
       computeDispatchCount: 0,
       skippedComputeDispatchCount: 0,
@@ -1465,6 +1466,7 @@ class RenderStatePackets {
       depthCompareDefaults: this.telemetry.depthCompareDefaults,
       rootSigGroup0Layouts: this.telemetry.rootSigGroup0Layouts,
       autoLayoutFallbacks: this.telemetry.autoLayoutFallbacks,
+      bindGroupKindMismatches: this.telemetry.bindGroupKindMismatches,
       computePipelineCount: this.telemetry.computePipelineCount,
       computeDispatchCount: this.telemetry.computeDispatchCount,
       skippedComputeDispatchCount: this.telemetry.skippedComputeDispatchCount,
@@ -1482,6 +1484,7 @@ class RenderStatePackets {
       depthCompareDefaults: this.telemetry.depthCompareDefaults,
       rootSigGroup0Layouts: this.telemetry.rootSigGroup0Layouts,
       autoLayoutFallbacks: this.telemetry.autoLayoutFallbacks,
+      bindGroupKindMismatches: this.telemetry.bindGroupKindMismatches,
       computePipelineCount: this.telemetry.computePipelineCount,
       computeDispatchCount: this.telemetry.computeDispatchCount,
       skippedComputeDispatchCount: this.telemetry.skippedComputeDispatchCount,
@@ -3502,6 +3505,7 @@ class RenderStatePackets {
               realResource = { buffer, offset: bufOffset };
               if (effectiveSize > 0) realResource.size = effectiveSize;
               if (kindMismatch) {
+                this.telemetry.bindGroupKindMismatches += 1;
                 this._recordTelemetryWarningOnce(
                   `bg-kind-mismatch:${layoutId}:${binding}:buffer`,
                   `bind group ${id}: binding ${binding} buffer resource mismatches layout entry; substituting dummy resource`
@@ -3578,6 +3582,7 @@ class RenderStatePackets {
           if (resolvedView) {
             realResource = resolvedView;
             if (kindMismatch) {
+              this.telemetry.bindGroupKindMismatches += 1;
               this._recordTelemetryWarningOnce(
                 `bg-kind-mismatch:${layoutId}:${binding}:texture`,
                 `bind group ${id}: binding ${binding} texture resource mismatches layout entry; substituting dummy resource`
@@ -3599,6 +3604,7 @@ class RenderStatePackets {
             samplerComparison = false;
           }
           if (kindMismatch) {
+            this.telemetry.bindGroupKindMismatches += 1;
             this._recordTelemetryWarningOnce(
               `bg-kind-mismatch:${layoutId}:${binding}:sampler`,
               `bind group ${id}: binding ${binding} sampler resource mismatches layout entry; substituting dummy resource`

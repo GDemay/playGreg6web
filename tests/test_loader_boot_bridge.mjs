@@ -2400,6 +2400,7 @@ test('W101 forwardGpuWorkerMessage surfaces sanitized renderStateStats and getLo
     computeDispatchCount: 12,
     computePipelineCount: 4,
     autoLayoutFallbacks: 2,
+    bindGroupKindMismatches: 0,
     dynamicOffsetRemaps: 7,
     remappedBindGroupEvictions: 0,
   });
@@ -2416,6 +2417,7 @@ test('W101 forwardGpuWorkerMessage surfaces sanitized renderStateStats and getLo
     computeDispatchCount: 0,
     computePipelineCount: 0,
     autoLayoutFallbacks: 5,
+    bindGroupKindMismatches: 0,
   });
   const status = getLoaderStatus();
   assert.deepEqual(status.renderStateStats, fromStats.renderStateStats);

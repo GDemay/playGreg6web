@@ -1852,6 +1852,7 @@ test('W99 buildGpuTelemetrySnapshot surfaces render-state compute/auto-layout co
     computeDispatchCount: 0,
     computePipelineCount: 0,
     autoLayoutFallbacks: 0,
+    bindGroupKindMismatches: 0,
   };
 
   // No render-state telemetry attached: counters default to 0, existing keys unchanged.
@@ -1880,11 +1881,13 @@ test('W99 buildGpuTelemetrySnapshot surfaces render-state compute/auto-layout co
   handler.telemetry.computeDispatchCount = 7;
   handler.telemetry.computePipelineCount = 3;
   handler.telemetry.autoLayoutFallbacks = 2;
+  handler.telemetry.bindGroupKindMismatches = 4;
   const live = buildGpuTelemetrySnapshot(processor, { timestamp: 3 });
   assert.deepEqual(live.renderStateStats, {
     computeDispatchCount: 7,
     computePipelineCount: 3,
     autoLayoutFallbacks: 2,
+    bindGroupKindMismatches: 4,
   });
   assert.equal(live.frameStats.computeDispatches, 0);
 
@@ -1897,6 +1900,7 @@ test('W99 buildGpuTelemetrySnapshot surfaces render-state compute/auto-layout co
           computeDispatchCount: 5.9,
           computePipelineCount: -1,
           autoLayoutFallbacks: 'nope',
+          bindGroupKindMismatches: 3.7,
         }),
       },
     },
@@ -1906,6 +1910,7 @@ test('W99 buildGpuTelemetrySnapshot surfaces render-state compute/auto-layout co
     computeDispatchCount: 5,
     computePipelineCount: 0,
     autoLayoutFallbacks: 0,
+    bindGroupKindMismatches: 3,
   });
   const viaPrivate = buildGpuTelemetrySnapshot(
     {
@@ -1918,6 +1923,7 @@ test('W99 buildGpuTelemetrySnapshot surfaces render-state compute/auto-layout co
     computeDispatchCount: 0,
     computePipelineCount: 4,
     autoLayoutFallbacks: 0,
+    bindGroupKindMismatches: 0,
   });
 
   // Throwing telemetry getters never break the snapshot.
