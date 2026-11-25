@@ -349,10 +349,15 @@ test('sync render, compute, and bindGroupLayout cache hits, misses, and telemetr
   assert.deepEqual(stats, {
     hits: 4,
     misses: 4,
+    pipelineHits: 3,
+    pipelineMisses: 3,
     negativeHits: 0,
+    negativeCacheHits: 0,
     negativeCacheSize: 0,
     negativeCacheEvictions: 0,
     hitRate: 0.5,
+    layoutDedupHits: 1,
+    inlineSamplerLayouts: 0,
     avgCompileMs: (1.5 + 4.0 + 2.5 + 4.0) / 4,
     shaderPackGeneration: 0,
     renderHits: 2,
@@ -815,10 +820,15 @@ test('evictOlderThan and clear manage lifecycle and isolate stale in-flight comp
   assert.deepEqual(cache.getStats(), {
     hits: 0,
     misses: 0,
+    pipelineHits: 0,
+    pipelineMisses: 0,
     negativeHits: 0,
+    negativeCacheHits: 0,
     negativeCacheSize: 0,
     negativeCacheEvictions: 0,
     hitRate: 0,
+    layoutDedupHits: 0,
+    inlineSamplerLayouts: 0,
     avgCompileMs: 0,
     shaderPackGeneration: 0,
     renderHits: 0,
@@ -3087,4 +3097,366 @@ test('W195 telemetry exposes hits, misses, negativeHits, evictions, avgCompileMs
   assert.equal(stats.evictions, 0);
   assert.equal(stats.avgCompileMs, 0);
   assert.equal(stats.hitRate, 0);
+});
+
+// --- W246: Pipeline & Bind-Group-Layout Dedup, Inline-Sampler & Compile Telemetry Tests ---
+
+test('W246 tracks pipelineHits, pipelineMisses, clamped hitRate, and resetStats() without evicting warm caches', async () => {
+  let clock = 100;
+  const device = createMockGpuDevice({
+    advanceClockOnCompile: (dt) => {
+      clock += dt;
+    },
+  });
+  const cache = new WebGpuPipelineCache({ device, now: () => clock });
+  const vs = device.createShaderModule({ label: 'wgpk:vertex:0x0000000000070001', code: 'vs' });
+  const cs = device.createShaderModule({ label: 'wgpk:compute:0x0000000000070002', code: 'cs' });
+
+  // Initial zeroed snapshot
+  let stats = cache.getStats();
+  assert.equal(stats.pipelineHits, 0);
+  assert.equal(stats.pipelineMisses, 0);
+  assert.equal(stats.hitRate, 0);
+  assert.equal(stats.negativeCacheHits, 0);
+  assert.equal(stats.layoutDedupHits, 0);
+  assert.equal(stats.inlineSamplerLayouts, 0);
+  assert.equal(stats.avgCompileMs, 0);
+  assert.equal(stats.maxCompileMs, 0);
+
+  const renderDesc = { layout: 'auto', vertex: { module: vs, entryPoint: 'vs_main' } };
+  const computeDesc = { layout: 'auto', compute: { module: cs, entryPoint: 'cs_main' } };
+
+  // 1 sync render miss + 2 hits, 1 async compute miss + 1 hit
+  const rp = cache.getOrCreateRenderPipeline(renderDesc);
+  assert.equal(cache.getOrCreateRenderPipeline(renderDesc), rp);
+  assert.equal(await cache.getOrCreateRenderPipelineAsync(renderDesc), rp);
+
+  const cp = await cache.getOrCreateComputePipelineAsync(computeDesc);
+  assert.equal(cache.getOrCreateComputePipeline(computeDesc), cp);
+
+  // Layout & sampler lookups should NOT inflate pipelineHits/pipelineMisses
+  const bgl = cache.getOrCreateBindGroupLayout({
+    entries: [{ binding: 0, visibility: SHADER_STAGE_BITS.VERTEX, buffer: { type: 'uniform' } }],
+  });
+  assert.equal(
+    cache.getOrCreateBindGroupLayout({
+      entries: [{ buffer: { type: 'uniform' }, visibility: SHADER_STAGE_BITS.VERTEX, binding: 0 }],
+    }),
+    bgl
+  );
+  cache.getOrCreateDefaultSampler('filtering');
+  cache.getOrCreateDefaultSampler('filtering');
+
+  stats = cache.getStats();
+  assert.equal(stats.pipelineHits, 3);
+  assert.equal(stats.pipelineMisses, 2);
+  assert.equal(stats.renderHits, 2);
+  assert.equal(stats.renderMisses, 1);
+  assert.equal(stats.computeHits, 1);
+  assert.equal(stats.computeMisses, 1);
+  assert.equal(stats.layoutDedupHits, 1);
+  assert.equal(stats.inlineSamplerLayouts, 0);
+  assert.equal(stats.hits, 5);
+  assert.equal(stats.misses, 4);
+  assert.equal(stats.hitRate, 5 / 9);
+  assert.ok(stats.hitRate >= 0 && stats.hitRate <= 1);
+  // Compiles: render sync 4.0ms + compute async 3.0ms + bgl 1.5ms = 8.5ms across 3 compiles
+  assert.equal(stats.compileCount, 3);
+  assert.equal(stats.avgCompileMs, 8.5 / 3);
+  assert.equal(stats.maxCompileMs, 4.0);
+
+  // resetStats() clears all telemetry counters while preserving warm cached objects
+  cache.resetStats();
+  stats = cache.getStats();
+  assert.equal(stats.pipelineHits, 0);
+  assert.equal(stats.pipelineMisses, 0);
+  assert.equal(stats.hits, 0);
+  assert.equal(stats.misses, 0);
+  assert.equal(stats.hitRate, 0);
+  assert.equal(stats.negativeCacheHits, 0);
+  assert.equal(stats.negativeHits, 0);
+  assert.equal(stats.layoutDedupHits, 0);
+  assert.equal(stats.layoutHits, 0);
+  assert.equal(stats.inlineSamplerLayouts, 0);
+  assert.equal(stats.avgCompileMs, 0);
+  assert.equal(stats.maxCompileMs, 0);
+  assert.equal(stats.compileCount, 0);
+  assert.equal(stats.totalCompileMs, 0);
+  // Warm caches remain populated
+  assert.equal(stats.renderCount, 1);
+  assert.equal(stats.computeCount, 1);
+  assert.equal(stats.layoutCount, 1);
+  assert.equal(stats.fallbackSamplerCount, 1);
+
+  // Subsequent lookup after resetStats() still hits the warm cache -> hitRate clamps cleanly to 1
+  assert.equal(cache.getOrCreateRenderPipeline(renderDesc), rp);
+  assert.equal(device.calls.createRenderPipeline.length, 1);
+  stats = cache.getStats();
+  assert.equal(stats.pipelineHits, 1);
+  assert.equal(stats.pipelineMisses, 0);
+  assert.equal(stats.hitRate, 1);
+});
+
+test('W246 tracks negativeCacheHits across sync, async, keyHint fast path, resetStats, and shader-pack reload', async () => {
+  let renderAttempts = 0;
+  let computeAttempts = 0;
+  const device = createMockGpuDevice({
+    renderSyncImpl: () => {
+      renderAttempts += 1;
+      throw new Error('broken render pso');
+    },
+    computeAsyncImpl: async () => {
+      computeAttempts += 1;
+      throw new Error('broken compute pso');
+    },
+  });
+  const cache = new WebGpuPipelineCache({ device });
+  const vs = device.createShaderModule({ label: 'wgpk:vertex:0x0000000000071001', code: 'vs' });
+  const cs = device.createShaderModule({ label: 'wgpk:compute:0x0000000000071002', code: 'cs' });
+
+  const badRender = { layout: 'auto', vertex: { module: vs, entryPoint: 'vs_bad' } };
+  const badCompute = { layout: 'auto', compute: { module: cs, entryPoint: 'cs_bad' } };
+  const renderKey = hashDescriptorKey(badRender);
+
+  assert.throws(() => cache.getOrCreateRenderPipeline(badRender), /broken render pso/);
+  await assert.rejects(cache.getOrCreateComputePipelineAsync(badCompute), /broken compute pso/);
+  assert.equal(renderAttempts, 1);
+  assert.equal(computeAttempts, 1);
+
+  // 3 negative-cache fast-path hits: sync descriptor, sync keyHint, async compute
+  assert.equal(cache.getOrCreateRenderPipeline(badRender), null);
+  assert.equal(cache.getOrCreateRenderPipeline(badRender, renderKey), null);
+  assert.equal(await cache.getOrCreateComputePipelineAsync(badCompute), null);
+  assert.equal(renderAttempts, 1);
+  assert.equal(computeAttempts, 1);
+
+  let stats = cache.getStats();
+  assert.equal(stats.pipelineMisses, 2);
+  assert.equal(stats.pipelineHits, 0);
+  assert.equal(stats.negativeCacheHits, 3);
+  assert.equal(stats.negativeHits, 3);
+  assert.equal(stats.quarantineHits, 3);
+  assert.equal(stats.negativeCacheSize, 2);
+  assert.equal(stats.hitRate, 0);
+
+  // resetStats() zeros negativeCacheHits while retaining quarantined keys
+  cache.resetStats();
+  stats = cache.getStats();
+  assert.equal(stats.negativeCacheHits, 0);
+  assert.equal(stats.negativeHits, 0);
+  assert.equal(stats.negativeCacheSize, 2);
+
+  // Subsequent hit increments negativeCacheHits again without invoking device
+  assert.equal(cache.getOrCreateRenderPipeline(badRender, renderKey), null);
+  assert.equal(renderAttempts, 1);
+  assert.equal(cache.getStats().negativeCacheHits, 1);
+
+  // onShaderPackUpdated({ resetStats: true }) clears both negative cache and stats
+  cache.onShaderPackUpdated({ resetStats: true });
+  stats = cache.getStats();
+  assert.equal(stats.negativeCacheHits, 0);
+  assert.equal(stats.negativeCacheSize, 0);
+  assert.equal(stats.shaderPackGeneration, 1);
+});
+
+test('W246 tracks layoutDedupHits and inlineSamplerLayouts across direct BGL, S43 reflection, fallback, and error paths', () => {
+  let failNextBgl = false;
+  const device = createMockGpuDevice({
+    bglImpl: (desc, id) => {
+      if (failNextBgl) {
+        throw new Error('BGL creation failed');
+      }
+      return { kind: 'GPUBindGroupLayout', id, desc };
+    },
+  });
+  const cache = new WebGpuPipelineCache({ device });
+
+  // 1. Buffer-only BGL: does NOT increment inlineSamplerLayouts; duplicate increments layoutDedupHits
+  const bufBgl1 = cache.getOrCreateBindGroupLayout({
+    entries: [{ binding: 0, visibility: SHADER_STAGE_BITS.VERTEX, buffer: { type: 'uniform' } }],
+  });
+  const bufBgl2 = cache.getOrCreateBindGroupLayout({
+    entries: [{ buffer: { type: 'uniform' }, binding: 0, visibility: SHADER_STAGE_BITS.VERTEX }],
+  });
+  assert.equal(bufBgl1, bufBgl2);
+  assert.equal(cache.getStats().inlineSamplerLayouts, 0);
+  assert.equal(cache.getStats().layoutDedupHits, 1);
+
+  // 2. Direct BGL with sampler binding: increments inlineSamplerLayouts once; dedup hit does not double-count
+  const directSamplerBgl1 = cache.getOrCreateBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: SHADER_STAGE_BITS.FRAGMENT, texture: { sampleType: 'float' } },
+      { binding: 1, visibility: SHADER_STAGE_BITS.FRAGMENT, sampler: { type: 'filtering' } },
+    ],
+  });
+  const directSamplerBgl2 = cache.getOrCreateBindGroupLayout({
+    entries: [
+      { texture: { sampleType: 'float' }, visibility: SHADER_STAGE_BITS.FRAGMENT, binding: 0 },
+      { sampler: { type: 'filtering' }, visibility: SHADER_STAGE_BITS.FRAGMENT, binding: 1 },
+    ],
+  });
+  assert.equal(directSamplerBgl1, directSamplerBgl2);
+  assert.equal(cache.getStats().inlineSamplerLayouts, 1);
+  assert.equal(cache.getStats().layoutDedupHits, 2);
+
+  // 3. S43 / #950 reflection group with inline_sampler source metadata:
+  //    strips non-WebGPU metadata, deduplicates reordered/aliased groups, and counts unique layout once
+  const s43GroupA = {
+    group: 0,
+    entries: [
+      {
+        binding: 3,
+        visibility: 'fragment',
+        sampler: { type: 'linear' },
+        source: { kind: 'inline_sampler', sdwords: [0x11111111, 0x22222222, 0x33333333, 0x44444444] },
+      },
+      {
+        binding: 0,
+        visibility: 'fragment',
+        texture: { sample_type: 'float', view_dimension: '2d' },
+      },
+    ],
+  };
+  const s43GroupB = [
+    {
+      binding: 0,
+      visibility: SHADER_STAGE_BITS.FRAGMENT,
+      texture: { sampleType: 'float', viewDimension: '2d' },
+    },
+    {
+      binding: 3,
+      visibility: ['fs'],
+      sampler: { type: 'filtering' },
+      source: { inline_sampler: { sdwords: [0x11111111, 0x22222222, 0x33333333, 0x44444444] } },
+    },
+  ];
+  const reflBgl1 = cache.createBindGroupLayoutFromReflection(s43GroupA);
+  const reflBgl2 = cache.createBindGroupLayoutFromReflection(s43GroupB);
+  assert.equal(reflBgl1, reflBgl2);
+  // Submitted WebGPU descriptor stays clean (no raw `source` metadata leaked into GPUBindGroupLayoutDescriptor)
+  assert.equal('source' in reflBgl1.desc.entries[1], false);
+  assert.equal(cache.getStats().inlineSamplerLayouts, 2);
+  assert.equal(cache.getStats().layoutDedupHits, 3);
+
+  // 4. Reflection group with top-level inlineSamplerBindings flag (even without sampler sub-object)
+  const reflFlagged = cache.createBindGroupLayoutFromReflection({
+    group: 1,
+    inlineSamplerBindings: 1,
+    entries: [{ binding: 2, visibility: 'compute', buffer: { type: 'read-only-storage' } }],
+  });
+  assert.equal(reflFlagged.kind, 'GPUBindGroupLayout');
+  assert.equal(cache.getStats().inlineSamplerLayouts, 3);
+
+  // 5. Fallback bind-group layouts: fullscreen_triangle_cbv (buffer only) vs textured_quad_24b (texture+sampler)
+  cache.getOrCreateFallbackBindGroupLayout('fullscreen_triangle_cbv');
+  assert.equal(cache.getStats().inlineSamplerLayouts, 3);
+  const quadBgl1 = cache.getOrCreateFallbackBindGroupLayout('textured_quad_24b');
+  const quadBgl2 = cache.getOrCreateFallbackBindGroupLayout('textured_quad_24b');
+  assert.equal(quadBgl1, quadBgl2);
+  assert.equal(cache.getStats().inlineSamplerLayouts, 4);
+  assert.equal(cache.getStats().layoutDedupHits, 4);
+
+  // 6. Failed BGL creation does NOT increment inlineSamplerLayouts or layoutDedupHits
+  failNextBgl = true;
+  assert.throws(
+    () =>
+      cache.getOrCreateBindGroupLayout({
+        entries: [{ binding: 7, visibility: SHADER_STAGE_BITS.FRAGMENT, sampler: { type: 'comparison' } }],
+      }),
+    /BGL creation failed/
+  );
+  assert.equal(cache.getStats().inlineSamplerLayouts, 4);
+  assert.equal(cache.getStats().layoutDedupHits, 4);
+
+  // 7. resetStats() resets inlineSamplerLayouts & layoutDedupHits cleanly
+  cache.resetStats();
+  assert.equal(cache.getStats().inlineSamplerLayouts, 0);
+  assert.equal(cache.getStats().layoutDedupHits, 0);
+  assert.equal(cache.getStats().layoutHits, 0);
+  assert.equal(cache.getStats().layoutMisses, 0);
+  assert.equal(cache.getStats().layoutCount, 6);
+});
+
+test('W246 sanitizes avgCompileMs, maxCompileMs, hitRate clamping, JSON serialization, and IIFE isolation', async () => {
+  // Non-monotonic and NaN clock samples must never produce negative or NaN compile timings
+  let clock = 100;
+  let nextEndClock = 90;
+  const device = createMockGpuDevice({
+    renderSyncImpl: (desc, id) => {
+      clock = nextEndClock;
+      return { kind: 'GPURenderPipeline', id, desc };
+    },
+    renderAsyncImpl: async (desc, id) => {
+      clock = nextEndClock;
+      return { kind: 'GPURenderPipeline', id, async: true, desc };
+    },
+  });
+  const cache = new WebGpuPipelineCache({
+    device,
+    now: () => clock,
+  });
+  const vs = device.createShaderModule({ label: 'wgpk:vertex:0x0000000000072001', code: 'vs' });
+
+  // Compile 1: t0=100, t1=90 (non-monotonic backwards clock) -> clamped to 0ms
+  clock = 100;
+  nextEndClock = 90;
+  cache.getOrCreateRenderPipeline({ layout: 'auto', vertex: { module: vs, entryPoint: 'vs_a' } });
+
+  // Compile 2: t0=200, t1=NaN -> clamped to 0ms
+  clock = 200;
+  nextEndClock = NaN;
+  cache.getOrCreateRenderPipeline({ layout: 'auto', vertex: { module: vs, entryPoint: 'vs_b' } });
+
+  // Compile 3: t0=300, t1=315.5 -> 15.5ms
+  clock = 300;
+  nextEndClock = 315.5;
+  await cache.getOrCreateRenderPipelineAsync({ layout: 'auto', vertex: { module: vs, entryPoint: 'vs_c' } });
+
+  // Compile 4: t0=400, t1=404.5 -> 4.5ms
+  clock = 400;
+  nextEndClock = 404.5;
+  cache.getOrCreateRenderPipeline({ layout: 'auto', vertex: { module: vs, entryPoint: 'vs_d' } });
+
+  const stats = cache.getStats();
+  assert.equal(stats.compileCount, 4);
+  assert.equal(stats.totalCompileMs, 20.0);
+  assert.equal(stats.avgCompileMs, 5.0);
+  assert.equal(stats.maxCompileMs, 15.5);
+  assert.ok(Number.isFinite(stats.hitRate) && stats.hitRate >= 0 && stats.hitRate <= 1);
+
+  // Defensive clamping check if internal counters are corrupted
+  cache._stats.renderHits = 100;
+  cache._stats.renderMisses = -50;
+  const clamped = cache.getStats();
+  assert.equal(clamped.hitRate, 1);
+  assert.equal(clamped.cacheBreakdown.render.hitRate, 1);
+
+  // Full stats snapshot is sanitized and cleanly JSON-serializable
+  const roundTripped = JSON.parse(JSON.stringify(stats));
+  assert.deepEqual(roundTripped, stats);
+  assert.equal(typeof roundTripped.pipelineHits, 'number');
+  assert.equal(typeof roundTripped.pipelineMisses, 'number');
+  assert.equal(typeof roundTripped.hitRate, 'number');
+  assert.equal(typeof roundTripped.negativeCacheHits, 'number');
+  assert.equal(typeof roundTripped.layoutDedupHits, 'number');
+  assert.equal(typeof roundTripped.inlineSamplerLayouts, 'number');
+  assert.equal(typeof roundTripped.avgCompileMs, 'number');
+  assert.equal(typeof roundTripped.maxCompileMs, 'number');
+
+  // Classic-Worker sandbox isolation: no W246 internal helpers leaked to global scope
+  const scriptPath = path.resolve(
+    path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')),
+    '../web/workers/pipeline_cache.js'
+  );
+  const source = fs.readFileSync(scriptPath, 'utf8');
+  const sandbox = { performance, Date };
+  sandbox.globalThis = sandbox;
+  sandbox.self = sandbox;
+  vm.createContext(sandbox);
+  vm.runInContext(source, sandbox);
+
+  assert.equal(sandbox.entryHasInlineSampler, undefined);
+  assert.equal(sandbox.descriptorHasInlineSampler, undefined);
+  assert.equal(sandbox.computeClampedHitRate, undefined);
+  assert.equal(typeof sandbox.PlayGta6PipelineCache.WebGpuPipelineCache.prototype.resetStats, 'function');
 });

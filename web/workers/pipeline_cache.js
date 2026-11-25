@@ -1778,6 +1778,81 @@
     return false;
   }
 
+  function entryHasInlineSampler(entry) {
+    if (!entry || typeof entry !== 'object') {
+      return false;
+    }
+    if (entry.sampler && typeof entry.sampler === 'object') {
+      return true;
+    }
+    if (
+      entry.inlineSampler === true ||
+      (entry.inlineSampler && typeof entry.inlineSampler === 'object') ||
+      entry.inline_sampler === true ||
+      (entry.inline_sampler && typeof entry.inline_sampler === 'object') ||
+      (Array.isArray(entry.inlineSamplerSdwords) && entry.inlineSamplerSdwords.length > 0)
+    ) {
+      return true;
+    }
+    if (entry.source && typeof entry.source === 'object') {
+      if (
+        entry.source.kind === 'inline_sampler' ||
+        (entry.source.inline_sampler && typeof entry.source.inline_sampler === 'object') ||
+        (entry.source.inlineSampler && typeof entry.source.inlineSampler === 'object')
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function descriptorHasInlineSampler(descriptor) {
+    if (!descriptor || typeof descriptor !== 'object') {
+      return false;
+    }
+    if (
+      descriptor.inlineSampler === true ||
+      descriptor.inline_sampler === true ||
+      descriptor.hasInlineSampler === true ||
+      descriptor.hasInlineSamplers === true ||
+      (typeof descriptor.inlineSamplerBindings === 'number' &&
+        Number.isFinite(descriptor.inlineSamplerBindings) &&
+        descriptor.inlineSamplerBindings > 0)
+    ) {
+      return true;
+    }
+    const entries = Array.isArray(descriptor)
+      ? descriptor
+      : Array.isArray(descriptor.entries)
+        ? descriptor.entries
+        : Array.isArray(descriptor.bindings)
+          ? descriptor.bindings
+          : null;
+    if (!entries) {
+      return false;
+    }
+    for (let i = 0; i < entries.length; i += 1) {
+      if (entryHasInlineSampler(entries[i])) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function computeClampedHitRate(hits, misses) {
+    const h = typeof hits === 'number' && Number.isFinite(hits) && hits > 0 ? hits : 0;
+    const m = typeof misses === 'number' && Number.isFinite(misses) && misses > 0 ? misses : 0;
+    const total = h + m;
+    if (!(total > 0)) {
+      return 0;
+    }
+    const rate = h / total;
+    if (!Number.isFinite(rate)) {
+      return 0;
+    }
+    return rate < 0 ? 0 : rate > 1 ? 1 : rate;
+  }
+
   function normalizeBlendComponentInternal(rawComp, addReason) {
     if (!rawComp || typeof rawComp !== 'object' || Array.isArray(rawComp)) {
       addReason('normalized-blend-component');
@@ -3034,6 +3109,7 @@
         computeMisses: 0,
         layoutHits: 0,
         layoutMisses: 0,
+        inlineSamplerLayouts: 0,
         samplerHits: 0,
         samplerMisses: 0,
         inFlightDedupes: 0,
@@ -3698,14 +3774,7 @@
       };
     }
 
-    /**
-     * Return a cached `GPUBindGroupLayout` or create and cache it via `device.createBindGroupLayout`.
-     *
-     * @param {GPUBindGroupLayoutDescriptor} descriptor
-     * @param {string | bigint | number | object} [keyHint]
-     * @returns {GPUBindGroupLayout}
-     */
-    getOrCreateBindGroupLayout(descriptor, keyHint) {
+    _getOrCreateBindGroupLayout(descriptor, keyHint, hasInlineSamplerMeta) {
       if (!descriptor || typeof descriptor !== 'object') {
         throw new TypeError('getOrCreateBindGroupLayout requires a descriptor object');
       }
@@ -3731,12 +3800,26 @@
       }
       const compileMs = Math.max(0, this._now() - t0);
       this._recordCompileTiming(compileMs);
+      if (hasInlineSamplerMeta || descriptorHasInlineSampler(descriptor)) {
+        this._stats.inlineSamplerLayouts += 1;
+      }
 
       if (layout && (typeof layout === 'object' || typeof layout === 'function')) {
         registeredObjectIds.set(layout, `bgl:${key}`);
       }
       this._setLru(this._bindGroupLayouts, key, layout, compileMs, this._maxBindGroupLayouts);
       return layout;
+    }
+
+    /**
+     * Return a cached `GPUBindGroupLayout` or create and cache it via `device.createBindGroupLayout`.
+     *
+     * @param {GPUBindGroupLayoutDescriptor} descriptor
+     * @param {string | bigint | number | object} [keyHint]
+     * @returns {GPUBindGroupLayout}
+     */
+    getOrCreateBindGroupLayout(descriptor, keyHint) {
+      return this._getOrCreateBindGroupLayout(descriptor, keyHint, false);
     }
 
     /**
@@ -3751,6 +3834,7 @@
     createBindGroupLayoutFromReflection(reflectionGroup, keyHint) {
       let rawEntries;
       let label;
+      let hasInlineSampler = false;
 
       if (Array.isArray(reflectionGroup)) {
         rawEntries = reflectionGroup;
@@ -3767,6 +3851,17 @@
         if (typeof reflectionGroup.label === 'string' && reflectionGroup.label.length > 0) {
           label = reflectionGroup.label;
         }
+        if (
+          reflectionGroup.inlineSampler === true ||
+          reflectionGroup.inline_sampler === true ||
+          reflectionGroup.hasInlineSampler === true ||
+          reflectionGroup.hasInlineSamplers === true ||
+          (typeof reflectionGroup.inlineSamplerBindings === 'number' &&
+            Number.isFinite(reflectionGroup.inlineSamplerBindings) &&
+            reflectionGroup.inlineSamplerBindings > 0)
+        ) {
+          hasInlineSampler = true;
+        }
       } else {
         throw new TypeError('reflectionGroup must be an array or object');
       }
@@ -3774,7 +3869,11 @@
       const seenBindings = new Set();
       const entries = new Array(rawEntries.length);
       for (let i = 0; i < rawEntries.length; i += 1) {
-        const normalized = normalizeReflectionBinding(rawEntries[i], i);
+        const rawEntry = rawEntries[i];
+        if (!hasInlineSampler && entryHasInlineSampler(rawEntry)) {
+          hasInlineSampler = true;
+        }
+        const normalized = normalizeReflectionBinding(rawEntry, i);
         if (seenBindings.has(normalized.binding)) {
           throw new Error(`Duplicate reflection binding index ${normalized.binding}`);
         }
@@ -3786,7 +3885,7 @@
       entries.sort((a, b) => a.binding - b.binding);
 
       const descriptor = label !== undefined ? { label, entries } : { entries };
-      return this.getOrCreateBindGroupLayout(descriptor, keyHint);
+      return this._getOrCreateBindGroupLayout(descriptor, keyHint, hasInlineSampler);
     }
 
     /**
@@ -4654,6 +4753,7 @@
       this._stats.computeMisses = 0;
       this._stats.layoutHits = 0;
       this._stats.layoutMisses = 0;
+      this._stats.inlineSamplerLayouts = 0;
       this._stats.samplerHits = 0;
       this._stats.samplerMisses = 0;
       this._stats.inFlightDedupes = 0;
@@ -4674,6 +4774,14 @@
       this._stats.srgbPipelineVariants = 0;
       this._pipelineErrors.length = 0;
       this._pipelineErrorSeq = 0;
+    }
+
+    /**
+     * Reset all telemetry counters and error history without evicting cached pipelines,
+     * bind group layouts, fallback samplers, or quarantined keys.
+     */
+    resetStats() {
+      this._resetStatsCounters();
     }
 
     /**
@@ -4750,24 +4858,37 @@
       const layoutMisses = this._stats.layoutMisses;
       const samplerHits = this._stats.samplerHits;
       const samplerMisses = this._stats.samplerMisses;
-      const totalHits = renderHits + computeHits + layoutHits + samplerHits;
-      const totalMisses = renderMisses + computeMisses + layoutMisses + samplerMisses;
+      const pipelineHits = renderHits + computeHits;
+      const pipelineMisses = renderMisses + computeMisses;
+      const totalHits = pipelineHits + layoutHits + samplerHits;
+      const totalMisses = pipelineMisses + layoutMisses + samplerMisses;
       const compileCount = this._stats.compileCount;
-      const totalCompileMs = this._stats.totalCompileMs;
-      const avgCompileMs = compileCount > 0 ? totalCompileMs / compileCount : 0;
-      const computeHitRate = (hits, misses) => {
-        const total = hits + misses;
-        return total > 0 ? hits / total : 0;
-      };
-      const totalHitRate = computeHitRate(totalHits, totalMisses);
+      const totalCompileMs =
+        Number.isFinite(this._stats.totalCompileMs) && this._stats.totalCompileMs > 0
+          ? this._stats.totalCompileMs
+          : 0;
+      const avgCompileMs =
+        compileCount > 0 && Number.isFinite(totalCompileMs / compileCount)
+          ? totalCompileMs / compileCount
+          : 0;
+      const maxCompileMs =
+        Number.isFinite(this._stats.maxCompileMs) && this._stats.maxCompileMs > 0
+          ? this._stats.maxCompileMs
+          : 0;
+      const totalHitRate = computeClampedHitRate(totalHits, totalMisses);
 
       return {
         hits: totalHits,
         misses: totalMisses,
+        pipelineHits,
+        pipelineMisses,
         negativeHits: this._stats.quarantineHits,
+        negativeCacheHits: this._stats.quarantineHits,
         negativeCacheSize: this._quarantinedKeys.size,
         negativeCacheEvictions: this._stats.negativeCacheEvictions,
         hitRate: totalHitRate,
+        layoutDedupHits: layoutHits,
+        inlineSamplerLayouts: this._stats.inlineSamplerLayouts,
         avgCompileMs,
         shaderPackGeneration: this._shaderPackGeneration,
         renderHits,
@@ -4786,7 +4907,7 @@
         fallbackSamplerCount: this._defaultSamplers.size,
         compileCount,
         totalCompileMs,
-        maxCompileMs: this._stats.maxCompileMs,
+        maxCompileMs,
         quarantineHits: this._stats.quarantineHits,
         quarantinedKeys: this._quarantinedKeys.size,
         fallbackNormalizedCount: this._stats.fallbackNormalizedCount,
@@ -4804,22 +4925,22 @@
           render: {
             hits: renderHits,
             misses: renderMisses,
-            hitRate: computeHitRate(renderHits, renderMisses),
+            hitRate: computeClampedHitRate(renderHits, renderMisses),
           },
           compute: {
             hits: computeHits,
             misses: computeMisses,
-            hitRate: computeHitRate(computeHits, computeMisses),
+            hitRate: computeClampedHitRate(computeHits, computeMisses),
           },
           layout: {
             hits: layoutHits,
             misses: layoutMisses,
-            hitRate: computeHitRate(layoutHits, layoutMisses),
+            hitRate: computeClampedHitRate(layoutHits, layoutMisses),
           },
           sampler: {
             hits: samplerHits,
             misses: samplerMisses,
-            hitRate: computeHitRate(samplerHits, samplerMisses),
+            hitRate: computeClampedHitRate(samplerHits, samplerMisses),
           },
           total: {
             hits: totalHits,
