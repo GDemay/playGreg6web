@@ -483,7 +483,7 @@ class ChromeDiscoveryTests(unittest.TestCase):
                 ),
                 Path("/usr/bin/chromium"),
             )
-            win_edge = Path(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe")
+            win_edge = Path(r"C:\Program Files") / "Microsoft" / "Edge" / "Application" / "msedge.exe"
             self.assertEqual(
                 rbb.discover_chrome(
                     None, env={"PROGRAMFILES": r"C:\Program Files"}, which_fn=lambda _: None, platform="win32",
