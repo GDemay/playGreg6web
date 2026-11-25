@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "tools"))
@@ -21,16 +22,22 @@ REQUIRED_REPO_FILES: tuple[str, ...] = (
     repo_health.HTTPFS_HEADER_REL,
     repo_health.HTTPFS_JS_REL,
     repo_health.WORKSTREAMS_MD_REL,
+    repo_health.GITIGNORE_REL,
+    repo_health.CARGO_TOML_REL,
+    "recomp/Cargo.toml",
+    "shaders/Cargo.toml",
+    "tools/Cargo.toml",
 )
 
 
 def _copy_minimal_repo(dest: Path) -> Path:
-    """Copy the ABI-checked files from the real repo into an isolated temp repo."""
+    """Copy the checked files from the real repo into an isolated temp repo."""
     for rel in REQUIRED_REPO_FILES:
         src = REPO_ROOT / rel
         dst = dest / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
+    (dest / repo_health.TESTS_DIR_REL).mkdir(parents=True, exist_ok=True)
     return dest
 
 
@@ -80,6 +87,37 @@ class TestRepoHealthRealRepo(unittest.TestCase):
         self.assertEqual(hyg["oversized_binaries"], [])
         self.assertGreater(hyg["tracked_file_count"], 0)
 
+        gi = checks["gitignore_hygiene"]
+        self.assertTrue(gi["ok"])
+        self.assertEqual(gi["missing_patterns"], [])
+        self.assertEqual(gi["negated_patterns"], [])
+        self.assertEqual(
+            gi["protected_patterns"],
+            list(repo_health.REQUIRED_GITIGNORE_PATTERNS),
+        )
+        self.assertGreaterEqual(gi["rule_count"], len(repo_health.REQUIRED_GITIGNORE_PATTERNS))
+
+        inv = checks["test_inventory"]
+        self.assertTrue(inv["ok"])
+        self.assertGreater(inv["counts"]["mjs"], 0)
+        self.assertGreater(inv["counts"]["py"], 0)
+        self.assertGreater(inv["counts"]["cpp"], 0)
+        self.assertEqual(
+            inv["counts"]["total_test_files"],
+            inv["counts"]["mjs"] + inv["counts"]["py"] + inv["counts"]["cpp"],
+        )
+        self.assertGreaterEqual(inv["counts"]["rust_crates"], 3)
+        self.assertTrue({"recomp", "shaders", "tools"}.issubset(set(inv["rust_crates"])))
+
+        readiness = report["fast_boot_readiness"]
+        self.assertTrue(readiness["ready"])
+        self.assertTrue(readiness["abi_parity_ok"])
+        self.assertTrue(readiness["disk_hygiene_ok"])
+        self.assertTrue(readiness["zero_game_files"])
+        self.assertTrue(readiness["gitignore_protected"])
+        self.assertTrue(readiness["test_inventory_ok"])
+        self.assertEqual(readiness["test_suite_counts"], inv["counts"])
+
         ws = checks["workstreams_summary"]
         self.assertTrue(ws["ok"])
         self.assertEqual(len(ws["tracks"]), 5)
@@ -100,13 +138,44 @@ class TestRepoHealthRealRepo(unittest.TestCase):
         parsed = json.loads(proc.stdout)
         self.assertTrue(parsed["ok"])
         self.assertEqual(parsed["error_count"], 0)
+        self.assertIn("gitignore_hygiene", parsed["checks"])
+        self.assertIn("test_inventory", parsed["checks"])
+        self.assertTrue(parsed["fast_boot_readiness"]["ready"])
 
-        # Ensure zero host filesystem paths leaked into JSON output
+        # Ensure zero host filesystem paths or current usernames leaked into JSON output
         raw_json = proc.stdout
         self.assertNotIn(str(REPO_ROOT), raw_json)
         self.assertNotIn(str(REPO_ROOT).replace("\\", "/"), raw_json)
         self.assertNotIn(str(Path.home()), raw_json)
         self.assertNotIn(str(Path.home()).replace("\\", "/"), raw_json)
+        for username in repo_health._current_usernames():
+            self.assertNotIn(username, raw_json)
+
+    def test_cli_human_and_strict_mode_regressions(self) -> None:
+        human_proc = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "tools" / "repo_health.py")],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(human_proc.returncode, 0, msg=human_proc.stderr or human_proc.stdout)
+        self.assertIn("playgta6web repo health: PASS", human_proc.stdout)
+        self.assertIn("GpuOpcode ABI parity", human_proc.stdout)
+        self.assertIn(".gitignore hygiene", human_proc.stdout)
+        self.assertIn("Test suite inventory", human_proc.stdout)
+        self.assertIn("Fast-boot readiness: READY", human_proc.stdout)
+
+        strict_proc = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "tools" / "repo_health.py"), "--strict", "--json"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(strict_proc.returncode, 0, msg=strict_proc.stderr or strict_proc.stdout)
+        parsed = json.loads(strict_proc.stdout)
+        self.assertTrue(parsed["ok"])
+        self.assertTrue(parsed["strict"])
+        self.assertEqual(parsed["warning_count"], 0)
 
 
 class TestRepoHealthSyntheticDrift(unittest.TestCase):
@@ -210,10 +279,13 @@ class TestRepoHealthSyntheticDrift(unittest.TestCase):
             self.assertIn("update/dlc.rpf", walk_res["forbidden_files"])
             self.assertIn(".env", walk_res["forbidden_files"])
 
-            # Git ls-files detection when tracked in a real git repo
+            # Git ls-files detection when tracked in a real git repo (force-added past .gitignore)
             if shutil.which("git"):
                 subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
-                subprocess.run(["git", "-C", str(repo), "add", "update/dlc.rpf", ".env"], check=True)
+                subprocess.run(
+                    ["git", "-C", str(repo), "add", "-f", "update/dlc.rpf", ".env"],
+                    check=True,
+                )
                 git_res = repo_health.check_tracked_hygiene(repo)
                 self.assertFalse(git_res["ok"])
                 self.assertEqual(git_res["source"], "git")
@@ -321,6 +393,234 @@ class TestRepoHealthSyntheticDrift(unittest.TestCase):
             # Confirm temp host path is never leaked in JSON
             self.assertNotIn(str(repo), proc.stdout)
             self.assertNotIn(str(repo).replace("\\", "/"), proc.stdout)
+
+    def test_gitignore_audit_detects_missing_and_commented_patterns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _copy_minimal_repo(Path(tmp))
+            gi_path = repo / repo_health.GITIGNORE_REL
+            gi_path.write_text(
+                "\n".join(
+                    [
+                        "# local-data/",
+                        "work/",
+                        "*.rpf",
+                        "*.wgsl.pack",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            res = repo_health.check_gitignore_hygiene(repo)
+            self.assertFalse(res["ok"])
+            self.assertEqual(res["missing_patterns"], ["local-data/", ".env", "*.pgim"])
+            self.assertEqual(res["negated_patterns"], [])
+            self.assertEqual(res["protected_patterns"], ["work/", "*.rpf", "*.wgsl.pack"])
+            self.assertEqual(res["rule_count"], 3)
+
+            overall = repo_health.check_repo_health(repo)
+            self.assertFalse(overall["ok"])
+            self.assertFalse(overall["fast_boot_readiness"]["gitignore_protected"])
+            self.assertFalse(overall["fast_boot_readiness"]["disk_hygiene_ok"])
+            self.assertFalse(overall["fast_boot_readiness"]["ready"])
+
+    def test_gitignore_audit_detects_negated_root_anchored_and_missing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _copy_minimal_repo(Path(tmp))
+            gi_path = repo / repo_health.GITIGNORE_REL
+
+            # Equivalent valid forms should pass
+            gi_path.write_text(
+                "\n".join(
+                    [
+                        "/local-data/",
+                        "**/work",
+                        "/.env",
+                        "**/*.rpf",
+                        "*.pgim",
+                        "**/*.wgsl.pack",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            ok_res = repo_health.check_gitignore_hygiene(repo)
+            self.assertTrue(ok_res["ok"], msg=ok_res["errors"])
+
+            # Negating a required pattern or root-anchoring /*.rpf must fail
+            gi_path.write_text(
+                "\n".join(
+                    [
+                        "local-data/",
+                        "work/",
+                        ".env",
+                        "!.env",
+                        "/*.rpf",
+                        "*.pgim",
+                        "*.wgsl.pack",
+                        "!*.wgsl.pack",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            bad_res = repo_health.check_gitignore_hygiene(repo)
+            self.assertFalse(bad_res["ok"])
+            self.assertEqual(bad_res["missing_patterns"], ["*.rpf"])
+            self.assertEqual(bad_res["negated_patterns"], [".env", "*.wgsl.pack"])
+
+            # Missing .gitignore file must fail
+            gi_path.unlink()
+            missing_res = repo_health.check_gitignore_hygiene(repo)
+            self.assertFalse(missing_res["ok"])
+            self.assertEqual(
+                missing_res["missing_patterns"],
+                list(repo_health.REQUIRED_GITIGNORE_PATTERNS),
+            )
+
+    def test_test_inventory_counts_suites_and_rust_crates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _copy_minimal_repo(Path(tmp))
+            tests_dir = repo / repo_health.TESTS_DIR_REL
+            for idx in range(3):
+                (tests_dir / f"test_web_{idx}.mjs").write_text("", encoding="utf-8")
+            for idx in range(2):
+                (tests_dir / f"test_tool_{idx}.py").write_text("", encoding="utf-8")
+            for idx in range(4):
+                (tests_dir / f"test_rt_{idx}.cpp").write_text("", encoding="utf-8")
+            # Non-matching files and directories must not be counted
+            (tests_dir / "helper.mjs").write_text("", encoding="utf-8")
+            (tests_dir / "common.py").write_text("", encoding="utf-8")
+            (tests_dir / "test_dir.mjs").mkdir()
+
+            # Replace Cargo.toml with custom 2-crate workspace
+            (repo / "crate_alpha").mkdir()
+            (repo / "crate_alpha" / "Cargo.toml").write_text(
+                '[package]\nname = "crate_alpha"\nversion = "0.1.0"\n',
+                encoding="utf-8",
+            )
+            (repo / "crate_beta").mkdir()
+            (repo / "crate_beta" / "Cargo.toml").write_text(
+                '[package]\nname = "crate_beta"\nversion = "0.1.0"\n',
+                encoding="utf-8",
+            )
+            (repo / repo_health.CARGO_TOML_REL).write_text(
+                '[workspace]\nmembers = ["crate_beta", "crate_alpha"]\n',
+                encoding="utf-8",
+            )
+
+            inv = repo_health.summarize_test_inventory(repo)
+            self.assertTrue(inv["ok"], msg=inv["errors"])
+            self.assertEqual(inv["warnings"], [])
+            self.assertEqual(
+                inv["counts"],
+                {
+                    "mjs": 3,
+                    "py": 2,
+                    "cpp": 4,
+                    "total_test_files": 9,
+                    "rust_crates": 2,
+                },
+            )
+            self.assertEqual(inv["rust_crates"], ["crate_alpha", "crate_beta"])
+
+    def test_test_inventory_handles_missing_member_invalid_toml_and_warnings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _copy_minimal_repo(Path(tmp))
+
+            # Missing workspace member Cargo.toml -> error
+            (repo / repo_health.CARGO_TOML_REL).write_text(
+                '[workspace]\nmembers = ["recomp", "ghost_crate"]\n',
+                encoding="utf-8",
+            )
+            missing_member = repo_health.summarize_test_inventory(repo)
+            self.assertFalse(missing_member["ok"])
+            self.assertTrue(any("ghost_crate" in err for err in missing_member["errors"]))
+
+            # Malformed Cargo.toml -> error
+            (repo / repo_health.CARGO_TOML_REL).write_text(
+                "[workspace\nbroken = true\n",
+                encoding="utf-8",
+            )
+            bad_toml = repo_health.summarize_test_inventory(repo)
+            self.assertFalse(bad_toml["ok"])
+            self.assertTrue(any("invalid TOML" in err for err in bad_toml["errors"]))
+
+            # Missing tests/ and Cargo.toml -> warnings only (fails --strict)
+            (repo / repo_health.CARGO_TOML_REL).unlink()
+            shutil.rmtree(repo / repo_health.TESTS_DIR_REL)
+            warn_res = repo_health.summarize_test_inventory(repo)
+            self.assertTrue(warn_res["ok"])
+            self.assertEqual(len(warn_res["warnings"]), 2)
+            strict_overall = repo_health.check_repo_health(repo, strict=True)
+            self.assertFalse(strict_overall["ok"])
+            self.assertGreaterEqual(strict_overall["warning_count"], 2)
+
+    def test_json_sanitization_strips_host_paths_and_usernames(self) -> None:
+        fake_user = "zxq_secret_dev_99"
+        custom_root = "/srv/private-workspace-99/playgta6web"
+        dirty_report = {
+            "ok": False,
+            "nested": {
+                "win": f"C:\\Users\\{fake_user}\\playgta6web\\local-data\\game.rpf",
+                "posix": f"/home/{fake_user}/builds/playgta6web/work/out.pgim",
+                "unc": f"\\\\fileserver\\{fake_user}\\share\\x.wgsl.pack",
+                "custom": f"{custom_root}/tools/repo_health.py failed for {fake_user}",
+                "plain_user": f"owned by {fake_user} in CI",
+            },
+            "list_items": [f"see /Users/{fake_user}/Desktop/log.txt", 42, True, None],
+        }
+
+        with mock.patch.dict(os.environ, {"USERNAME": fake_user, "USER": fake_user}):
+            cleaned = repo_health.sanitize_report(dirty_report, repo_root=custom_root)
+
+        serialized = json.dumps(cleaned)
+        self.assertNotIn(fake_user, serialized)
+        self.assertNotIn(custom_root, serialized)
+        self.assertNotIn("C:\\\\Users", serialized)
+        self.assertNotIn("/home/", serialized)
+        self.assertNotIn("/Users/", serialized)
+        self.assertNotIn("fileserver", serialized)
+        self.assertEqual(cleaned["list_items"][1:], [42, True, None])
+
+        # Also verify end-to-end CLI --json scrubs injected host paths & mocked username
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _copy_minimal_repo(Path(tmp))
+            ws_path = repo / repo_health.WORKSTREAMS_MD_REL
+            ws_path.write_text(
+                "\n".join(
+                    [
+                        f"## Track 1: Owned by {fake_user} at {repo}",
+                        f"- [x] **R1 — Leak test** — `IN PROGRESS` ({repo}/secret)",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            env = dict(os.environ)
+            env["USERNAME"] = fake_user
+            env["USER"] = fake_user
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "tools" / "repo_health.py"),
+                    "--repo-root",
+                    str(repo),
+                    "--strict",
+                    "--json",
+                ],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 1)
+            payload = json.loads(proc.stdout)
+            self.assertFalse(payload["ok"])
+            self.assertEqual(payload["warning_count"], 1)
+            self.assertNotIn(fake_user, proc.stdout)
+            self.assertNotIn(str(repo), proc.stdout)
+            self.assertNotIn(str(repo).replace("\\", "/"), proc.stdout)
+            self.assertNotIn(str(Path.home()), proc.stdout)
+            self.assertNotIn(str(Path.home()).replace("\\", "/"), proc.stdout)
 
 
 if __name__ == "__main__":

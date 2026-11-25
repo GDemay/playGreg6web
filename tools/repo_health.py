@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cross-track ABI drift verifier and repository health checker for playgta6web (Track 5 / W27).
+"""Cross-track ABI drift verifier and repository health checker for playgta6web (Track 5 / W27, T77).
 
 Verifies in one fast pure-stdlib pass:
 1. Cross-track `GpuOpcode` ABI parity across `runtime/abi/playgta6_abi.h`,
@@ -11,7 +11,12 @@ Verifies in one fast pure-stdlib pass:
 4. Zero-game-files repository hygiene (no tracked `.rpf`, `.xvd`, `.xvc`, `.ttpf`,
    `.awc`, `.dxbc`, `.spv`, `.wgsl.pack`, `.pgim`, `.exe`, `.dll`, `.env`, or
    oversized binary blobs).
-5. `docs/WORKSTREAMS.md` task status summary (DONE / IN PROGRESS / UNCLAIMED per track).
+5. `.gitignore` protection audit for `local-data/`, `work/`, `.env`, `*.rpf`,
+   `*.pgim`, and `*.wgsl.pack`.
+6. Test suite inventory summary (`tests/test_*.mjs`, `tests/test_*.py`,
+   `tests/test_*.cpp`, and Rust workspace crates).
+7. `docs/WORKSTREAMS.md` task status summary (DONE / IN PROGRESS / UNCLAIMED per track)
+   and fast-boot/30 FPS readiness summary.
 
 Security & privacy invariant:
 - Machine-readable `--json` output NEVER includes raw host filesystem paths or usernames.
@@ -30,6 +35,7 @@ import os
 import re
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -45,6 +51,18 @@ INPUT_BRIDGE_JS_REL = "web/input/input_bridge.js"
 HTTPFS_HEADER_REL = "runtime/os/httpfs_mailbox.h"
 HTTPFS_JS_REL = "web/workers/httpfs_mailbox.js"
 WORKSTREAMS_MD_REL = "docs/WORKSTREAMS.md"
+GITIGNORE_REL = ".gitignore"
+CARGO_TOML_REL = "Cargo.toml"
+TESTS_DIR_REL = "tests"
+
+REQUIRED_GITIGNORE_PATTERNS: tuple[str, ...] = (
+    "local-data/",
+    "work/",
+    ".env",
+    "*.rpf",
+    "*.pgim",
+    "*.wgsl.pack",
+)
 
 EXPECTED_INPUT_STATE_BYTES = 40
 
@@ -123,18 +141,107 @@ def _current_usernames() -> list[str]:
     return names
 
 
-def sanitize_message(text: str) -> str:
-    """Strip any accidental host paths or usernames from diagnostic messages."""
-    sanitized = _WINDOWS_PATH_RE.sub("<path>", text)
-    sanitized = _UNC_PATH_RE.sub("<path>", sanitized)
-    sanitized = _POSIX_PATH_RE.sub("<path>", sanitized)
-    for username in _current_usernames():
-        pattern = re.compile(
+def _sensitive_host_paths(extra_paths: Sequence[Path | str] = ()) -> list[str]:
+    """Collect host-specific filesystem path prefixes that must never leak."""
+    raw_candidates: list[Path] = []
+    try:
+        home = Path.home()
+        raw_candidates.append(home)
+        raw_candidates.append(home.resolve())
+    except (OSError, RuntimeError):
+        pass
+
+    for item in extra_paths:
+        if not item:
+            continue
+        p = Path(item)
+        raw_candidates.append(p)
+        try:
+            raw_candidates.append(p.resolve())
+        except (OSError, RuntimeError):
+            pass
+
+    variants: list[str] = []
+    seen: set[str] = set()
+    for path in raw_candidates:
+        for text in (str(path), str(path).replace("\\", "/")):
+            cleaned = text.rstrip("\\/")
+            if len(cleaned) < 4:
+                continue
+            key = cleaned.lower() if os.name == "nt" else cleaned
+            if key not in seen:
+                seen.add(key)
+                variants.append(cleaned)
+    variants.sort(key=len, reverse=True)
+    return variants
+
+
+def _compile_host_prefix_patterns(extra_paths: Sequence[Path | str] = ()) -> list[re.Pattern[str]]:
+    patterns: list[re.Pattern[str]] = []
+    for host_prefix in _sensitive_host_paths(extra_paths):
+        flags = re.IGNORECASE if (os.name == "nt" or re.match(r"^[A-Za-z]:", host_prefix)) else 0
+        patterns.append(
+            re.compile(
+                rf"{re.escape(host_prefix)}(?:[\\/][^\s\"'<>|,;()\[\]]*)?",
+                flags,
+            )
+        )
+    return patterns
+
+
+def _compile_username_patterns() -> list[re.Pattern[str]]:
+    return [
+        re.compile(
             rf"(?<![A-Za-z0-9_]){re.escape(username)}(?![A-Za-z0-9_])",
             re.IGNORECASE,
         )
-        sanitized = pattern.sub("<user>", sanitized)
+        for username in _current_usernames()
+    ]
+
+
+def _sanitize_text_with_patterns(
+    text: str,
+    prefix_patterns: Sequence[re.Pattern[str]],
+    username_patterns: Sequence[re.Pattern[str]],
+) -> str:
+    sanitized = text
+    for prefix_re in prefix_patterns:
+        sanitized = prefix_re.sub("<path>", sanitized)
+    sanitized = _WINDOWS_PATH_RE.sub("<path>", sanitized)
+    sanitized = _UNC_PATH_RE.sub("<path>", sanitized)
+    sanitized = _POSIX_PATH_RE.sub("<path>", sanitized)
+    for user_re in username_patterns:
+        sanitized = user_re.sub("<user>", sanitized)
     return sanitized
+
+
+def sanitize_message(text: str, *, extra_paths: Sequence[Path | str] = ()) -> str:
+    """Strip any accidental host paths or usernames from diagnostic messages."""
+    return _sanitize_text_with_patterns(
+        text,
+        _compile_host_prefix_patterns(extra_paths),
+        _compile_username_patterns(),
+    )
+
+
+def sanitize_report(value: Any, *, repo_root: Path | str | None = None) -> Any:
+    """Recursively sanitize every string value in a report before JSON serialization."""
+    extra_paths: tuple[Path | str, ...] = (repo_root,) if repo_root is not None else ()
+    prefix_patterns = _compile_host_prefix_patterns(extra_paths)
+    username_patterns = _compile_username_patterns()
+
+    def _walk(node: Any) -> Any:
+        if isinstance(node, str):
+            return _sanitize_text_with_patterns(node, prefix_patterns, username_patterns)
+        if isinstance(node, list):
+            return [_walk(item) for item in node]
+        if isinstance(node, tuple):
+            return [_walk(item) for item in node]
+        if isinstance(node, dict):
+            return {key: _walk(val) for key, val in node.items()}
+        return node
+
+    return _walk(value)
 
 
 def pascal_to_upper_snake(name: str) -> str:
@@ -1107,7 +1214,187 @@ def check_tracked_hygiene(
 
 
 # ---------------------------------------------------------------------------
-# Check 5: Workstreams Summary
+# Check 5: .gitignore Protection Audit (T77)
+# ---------------------------------------------------------------------------
+
+
+def _gitignore_rule_matches_required(rule: str, required: str) -> bool:
+    """Return True if a single non-negated .gitignore rule covers `required`."""
+    cleaned = rule.strip()
+    if not cleaned:
+        return False
+
+    if required.startswith("*."):
+        return cleaned in (required, f"**/{required}")
+
+    normalized = cleaned.lstrip("/")
+    if normalized.startswith("**/"):
+        normalized = normalized[3:]
+
+    if required.endswith("/"):
+        base = required.rstrip("/")
+        return normalized in (base, f"{base}/", f"{base}/*", f"{base}/**")
+
+    return normalized == required
+
+
+def check_gitignore_hygiene(repo_root: Path | str) -> dict[str, Any]:
+    """Verify `.gitignore` protects local game dirs, `.env`, and generated binary packs."""
+    root = Path(repo_root)
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    text, read_err = _read_repo_text(root, GITIGNORE_REL)
+    if read_err is not None or text is None:
+        errors.append(read_err or f"missing {GITIGNORE_REL}")
+        return {
+            "name": "gitignore_hygiene",
+            "ok": False,
+            "source": GITIGNORE_REL,
+            "rule_count": 0,
+            "required_patterns": list(REQUIRED_GITIGNORE_PATTERNS),
+            "protected_patterns": [],
+            "missing_patterns": list(REQUIRED_GITIGNORE_PATTERNS),
+            "negated_patterns": [],
+            "errors": errors,
+            "warnings": warnings,
+        }
+
+    state: dict[str, str] = {pat: "missing" for pat in REQUIRED_GITIGNORE_PATTERNS}
+    rule_count = 0
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        rule_count += 1
+        if line.startswith("!"):
+            neg_rule = line[1:].strip()
+            for pat in REQUIRED_GITIGNORE_PATTERNS:
+                if _gitignore_rule_matches_required(neg_rule, pat):
+                    state[pat] = "negated"
+        else:
+            for pat in REQUIRED_GITIGNORE_PATTERNS:
+                if _gitignore_rule_matches_required(line, pat):
+                    state[pat] = "protected"
+
+    protected_patterns = [p for p in REQUIRED_GITIGNORE_PATTERNS if state[p] == "protected"]
+    missing_patterns = [p for p in REQUIRED_GITIGNORE_PATTERNS if state[p] == "missing"]
+    negated_patterns = [p for p in REQUIRED_GITIGNORE_PATTERNS if state[p] == "negated"]
+
+    for pat in missing_patterns:
+        errors.append(f"{GITIGNORE_REL}: missing required ignore pattern `{pat}`")
+    for pat in negated_patterns:
+        errors.append(f"{GITIGNORE_REL}: required ignore pattern `{pat}` is negated by `!` rule")
+
+    return {
+        "name": "gitignore_hygiene",
+        "ok": not errors,
+        "source": GITIGNORE_REL,
+        "rule_count": rule_count,
+        "required_patterns": list(REQUIRED_GITIGNORE_PATTERNS),
+        "protected_patterns": protected_patterns,
+        "missing_patterns": missing_patterns,
+        "negated_patterns": negated_patterns,
+        "errors": errors,
+        "warnings": warnings,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Check 6: Test Suite Inventory Summary (T77)
+# ---------------------------------------------------------------------------
+
+
+def summarize_test_inventory(repo_root: Path | str) -> dict[str, Any]:
+    """Summarize automated test suite counts (.mjs, .py, .cpp) and Rust workspace crates."""
+    root = Path(repo_root)
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    tests_dir = root / TESTS_DIR_REL
+    if tests_dir.is_dir():
+        mjs_count = sum(1 for p in tests_dir.glob("test_*.mjs") if p.is_file())
+        py_count = sum(1 for p in tests_dir.glob("test_*.py") if p.is_file())
+        cpp_count = sum(1 for p in tests_dir.glob("test_*.cpp") if p.is_file())
+    else:
+        mjs_count = 0
+        py_count = 0
+        cpp_count = 0
+        warnings.append(f"missing `{TESTS_DIR_REL}/` directory")
+
+    rust_crates: list[str] = []
+    cargo_text, cargo_err = _read_repo_text(root, CARGO_TOML_REL)
+    if cargo_err is not None or cargo_text is None:
+        warnings.append(
+            f"missing `{CARGO_TOML_REL}`; Rust workspace crate inventory unavailable"
+        )
+    else:
+        try:
+            cargo_data = tomllib.loads(cargo_text)
+        except tomllib.TOMLDecodeError as exc:
+            errors.append(
+                sanitize_message(f"{CARGO_TOML_REL}: invalid TOML: {exc}", extra_paths=(root,))
+            )
+            cargo_data = None
+
+        if isinstance(cargo_data, dict):
+            workspace = cargo_data.get("workspace")
+            if isinstance(workspace, dict) and isinstance(workspace.get("members"), list):
+                for raw_member in workspace["members"]:
+                    member = str(raw_member).strip().replace("\\", "/").strip("/")
+                    if not member:
+                        continue
+                    if any(ch in member for ch in ("*", "?", "[")):
+                        matched_any = False
+                        for candidate in sorted(root.glob(member)):
+                            if candidate.is_dir() and (candidate / CARGO_TOML_REL).is_file():
+                                rel_member = candidate.relative_to(root).as_posix()
+                                rust_crates.append(rel_member)
+                                matched_any = True
+                        if not matched_any:
+                            errors.append(
+                                f"{CARGO_TOML_REL}: workspace member pattern `{member}` matched no crates"
+                            )
+                    else:
+                        crate_manifest = root / member / CARGO_TOML_REL
+                        if not crate_manifest.is_file():
+                            errors.append(
+                                f"{CARGO_TOML_REL}: workspace member `{member}` missing `{member}/{CARGO_TOML_REL}`"
+                            )
+                        else:
+                            rust_crates.append(member)
+            elif isinstance(cargo_data.get("package"), dict):
+                pkg_name = str(cargo_data["package"].get("name", "")).strip()
+                rust_crates.append(pkg_name or ".")
+            else:
+                warnings.append(
+                    f"{CARGO_TOML_REL}: no `[workspace].members` or `[package]` section found"
+                )
+
+    rust_crates = sorted(set(rust_crates))
+    total_test_files = mjs_count + py_count + cpp_count
+
+    return {
+        "name": "test_inventory",
+        "ok": not errors,
+        "tests_dir": TESTS_DIR_REL,
+        "cargo_manifest": CARGO_TOML_REL,
+        "counts": {
+            "mjs": mjs_count,
+            "py": py_count,
+            "cpp": cpp_count,
+            "total_test_files": total_test_files,
+            "rust_crates": len(rust_crates),
+        },
+        "rust_crates": rust_crates,
+        "errors": errors,
+        "warnings": warnings,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Check 7: Workstreams Summary
 # ---------------------------------------------------------------------------
 
 
@@ -1241,13 +1528,15 @@ def check_repo_health(
     strict: bool = False,
     max_binary_bytes: int = DEFAULT_MAX_BINARY_BYTES,
 ) -> dict[str, Any]:
-    """Run all cross-track ABI parity, repo hygiene, and workstream summary checks."""
+    """Run all cross-track ABI parity, repo hygiene, test inventory, and readiness checks."""
     root = Path(repo_root) if repo_root is not None else DEFAULT_REPO_ROOT
 
     gpu_check = check_gpu_opcode_parity(root)
     input_check = check_input_state_parity(root)
     httpfs_check = check_httpfs_mailbox_parity(root)
     hygiene_check = check_tracked_hygiene(root, max_binary_bytes=max_binary_bytes)
+    gitignore_check = check_gitignore_hygiene(root)
+    test_inventory_check = summarize_test_inventory(root)
     workstreams_check = summarize_workstreams(root)
 
     checks: dict[str, dict[str, Any]] = {
@@ -1255,6 +1544,8 @@ def check_repo_health(
         "input_state_parity": input_check,
         "httpfs_mailbox_parity": httpfs_check,
         "tracked_hygiene": hygiene_check,
+        "gitignore_hygiene": gitignore_check,
+        "test_inventory": test_inventory_check,
         "workstreams_summary": workstreams_check,
     }
 
@@ -1263,13 +1554,26 @@ def check_repo_health(
     all_checks_ok = all(bool(c["ok"]) for c in checks.values())
     overall_ok = all_checks_ok and (warning_count == 0 if strict else True)
 
-    return {
+    abi_parity_ok = bool(gpu_check["ok"] and input_check["ok"] and httpfs_check["ok"])
+    disk_hygiene_ok = bool(hygiene_check["ok"] and gitignore_check["ok"])
+
+    report: dict[str, Any] = {
         "ok": overall_ok,
         "strict": strict,
         "error_count": error_count,
         "warning_count": warning_count,
+        "fast_boot_readiness": {
+            "ready": overall_ok,
+            "abi_parity_ok": abi_parity_ok,
+            "disk_hygiene_ok": disk_hygiene_ok,
+            "zero_game_files": bool(hygiene_check["ok"]),
+            "gitignore_protected": bool(gitignore_check["ok"]),
+            "test_inventory_ok": bool(test_inventory_check["ok"]),
+            "test_suite_counts": dict(test_inventory_check["counts"]),
+        },
         "checks": checks,
     }
+    return sanitize_report(report, repo_root=root)
 
 
 def format_human_report(report: Mapping[str, Any]) -> str:
@@ -1339,7 +1643,36 @@ def format_human_report(report: Mapping[str, Any]) -> str:
     for warn in hyg["warnings"]:
         lines.append(f"       WARN:  {warn}")
 
-    # 5. Workstreams summary
+    # 5. .gitignore hygiene
+    gi = checks.get("gitignore_hygiene")
+    if isinstance(gi, Mapping):
+        tag = "PASS" if gi["ok"] else "FAIL"
+        lines.append(
+            f"[{tag}] .gitignore hygiene: {len(gi['protected_patterns'])}/{len(gi['required_patterns'])} "
+            f"required patterns protected ({gi['rule_count']} rules)"
+        )
+        for err in gi["errors"]:
+            lines.append(f"       ERROR: {err}")
+        for warn in gi["warnings"]:
+            lines.append(f"       WARN:  {warn}")
+
+    # 6. Test suite inventory
+    inv = checks.get("test_inventory")
+    if isinstance(inv, Mapping):
+        tag = "PASS" if inv["ok"] else "FAIL"
+        counts = inv["counts"]
+        crates_label = ", ".join(inv["rust_crates"]) if inv["rust_crates"] else "none"
+        lines.append(
+            f"[{tag}] Test suite inventory: {counts['total_test_files']} test files "
+            f"({counts['mjs']} .mjs, {counts['py']} .py, {counts['cpp']} .cpp), "
+            f"{counts['rust_crates']} Rust crates ({crates_label})"
+        )
+        for err in inv["errors"]:
+            lines.append(f"       ERROR: {err}")
+        for warn in inv["warnings"]:
+            lines.append(f"       WARN:  {warn}")
+
+    # 7. Workstreams summary
     ws = checks["workstreams_summary"]
     tag = "PASS" if ws["ok"] else "FAIL"
     totals = ws["totals"]
@@ -1358,6 +1691,16 @@ def format_human_report(report: Mapping[str, Any]) -> str:
         lines.append(f"       ERROR: {err}")
     for warn in ws["warnings"]:
         lines.append(f"       WARN:  {warn}")
+
+    readiness = report.get("fast_boot_readiness")
+    if isinstance(readiness, Mapping):
+        ready_label = "READY" if readiness.get("ready") else "NOT READY"
+        lines.append(
+            f"Fast-boot readiness: {ready_label} "
+            f"(ABI={'OK' if readiness.get('abi_parity_ok') else 'FAIL'}, "
+            f"hygiene={'OK' if readiness.get('disk_hygiene_ok') else 'FAIL'}, "
+            f"tests={'OK' if readiness.get('test_inventory_ok') else 'FAIL'})"
+        )
 
     lines.append("=" * 64)
     lines.append(
@@ -1406,7 +1749,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     if args.json:
-        print(json.dumps(report, indent=2))
+        sanitized = sanitize_report(report, repo_root=args.repo_root)
+        print(json.dumps(sanitized, indent=2))
     else:
         print(format_human_report(report))
 
