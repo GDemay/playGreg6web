@@ -9,6 +9,12 @@ const pipelineCacheMod = require('../web/workers/pipeline_cache.js');
 const {
   LAYOUT_MANIFEST_SCHEMA_VERSION,
   MAX_HEAP_INDEX_SHIFT,
+  GRAPHICS_USER_DATA_BASE,
+  COMPUTE_USER_DATA_BASE,
+  TABLE_SLOT_BYTES,
+  UNIFORM_MIN_BINDING_SIZE_ALIGNMENT,
+  STORAGE_MIN_BINDING_SIZE_ALIGNMENT,
+  DIAGNOSTIC_CODES,
   SHADER_STAGE_BITS,
   VERTEX_FORMAT_BYTE_SIZES,
   ReflectionError,
@@ -24,6 +30,8 @@ const {
   parseReflectionManifest,
   buildBindGroupLayoutDescriptors,
   buildVertexBufferLayouts,
+  diagnoseStageBindings,
+  synthesizeMissingStaticSamplers,
   ReflectionRegistry,
 } = reflectionMod;
 
@@ -1449,4 +1457,737 @@ test('parseReflectionManifest and parseBindingSource reject malformed S34 heap a
       `Expected parseReflectionManifest with source ${JSON.stringify(badSource)} to match ${expectedPattern}`
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// W171: Root-parameter / table-offset mismatch diagnostics, static-sampler
+// fallback metadata, and min_binding_size_bytes alignment checks
+// ---------------------------------------------------------------------------
+
+test('W171 exports diagnostic constants and helpers cleanly', () => {
+  assert.equal(GRAPHICS_USER_DATA_BASE, 8);
+  assert.equal(COMPUTE_USER_DATA_BASE, 4);
+  assert.equal(TABLE_SLOT_BYTES, 32);
+  assert.equal(UNIFORM_MIN_BINDING_SIZE_ALIGNMENT, 16);
+  assert.equal(STORAGE_MIN_BINDING_SIZE_ALIGNMENT, 4);
+  assert.equal(typeof diagnoseStageBindings, 'function');
+  assert.equal(typeof synthesizeMissingStaticSamplers, 'function');
+  assert.equal(DIAGNOSTIC_CODES.TABLE_DESCRIPTOR_MISSING, 'TABLE_DESCRIPTOR_MISSING');
+  assert.equal(DIAGNOSTIC_CODES.DESCRIPTOR_TYPE_MISMATCH, 'DESCRIPTOR_TYPE_MISMATCH');
+  assert.equal(DIAGNOSTIC_CODES.STATIC_SAMPLER_MISSING, 'STATIC_SAMPLER_MISSING');
+  assert.equal(DIAGNOSTIC_CODES.MIN_BINDING_SIZE_MISALIGNED, 'MIN_BINDING_SIZE_MISALIGNED');
+});
+
+test('diagnoseStageBindings succeeds for valid graphics and compute stages across all 6 binding source kinds', () => {
+  // Graphics root signature (starts at s8):
+  //   param 0 @ s8  (1 sgpr): table [CBV b0 (slot 0), SRV t0..t1 (slots 1..2), UAV u0 at explicit offset 5]
+  //   param 1 @ s9  (2 sgprs): root constants (s9, s10)
+  //   param 2 @ s11 (2 sgprs): root CBV (s11..s12)
+  //   param 3 @ s13 (1 sgpr): table [unbounded SRV t0 space 1]
+  //   static_samplers: [s0 filtering, s1 comparison]
+  const graphicsRs = {
+    parameters: [
+      {
+        type: 'table',
+        ranges: [
+          { type: 'cbv', count: 1, base_register: 0, space: 0 },
+          { type: 'srv', count: 2, base_register: 0, space: 0 },
+          { type: 'uav', count: 1, base_register: 0, space: 0, offset: 5 },
+        ],
+      },
+      { type: 'constants', num_32bit_values: 2, register: 1, space: 0 },
+      { type: 'cbv', register: 2, space: 0 },
+      {
+        type: 'table',
+        ranges: [{ type: 'srv', count: -1, base_register: 0, space: 1 }],
+      },
+    ],
+    static_samplers: [
+      { shader_register: 0, register_space: 0, comparison: false },
+      { shader_register: 1, register_space: 0, comparison: true },
+    ],
+  };
+
+  const fragmentStage = {
+    stage: 'pixel',
+    bindings: [
+      {
+        group: 0,
+        binding: 0,
+        name: 'cb_frame',
+        kind: 'uniform',
+        min_binding_size_bytes: 48,
+        source: { user_sgpr: 8, table_byte_offset: 0 },
+      },
+      {
+        group: 0,
+        binding: 1,
+        name: 'tex_albedo',
+        kind: 'texture',
+        source: { user_sgpr: 8, table_byte_offset: 32 },
+      },
+      {
+        group: 0,
+        binding: 2,
+        name: 'uav_img',
+        kind: 'storage_texture',
+        storage_format: 'rgba8unorm',
+        source: { user_sgpr: 8, table_byte_offset: 5 * 32 },
+      },
+      {
+        group: 0,
+        binding: 3,
+        name: 'push_consts',
+        kind: 'uniform',
+        min_binding_size_bytes: 16,
+        source: { user_sgpr: 9, root_constants: true },
+      },
+      {
+        group: 0,
+        binding: 4,
+        name: 'root_cb',
+        kind: 'uniform',
+        min_binding_size_bytes: 64,
+        source: { user_sgpr: 11, root_descriptor: true },
+      },
+      {
+        group: 0,
+        binding: 5,
+        name: 'unbounded_tex',
+        kind: 'texture',
+        source: { user_sgpr: 13, table_byte_offset: 12 * 32 },
+      },
+      {
+        group: 0,
+        binding: 6,
+        name: 'smp_linear',
+        kind: 'sampler',
+        source: { static_sampler: 0 },
+      },
+      {
+        group: 0,
+        binding: 7,
+        name: 'smp_shadow',
+        kind: 'comparison_sampler',
+        source: { static_sampler: 1 },
+      },
+      {
+        group: 1,
+        binding: 0,
+        name: 'dyn_smp',
+        kind: 'sampler',
+        source: {
+          sampler_heap: { base_user_sgpr: 2, stride: 16, index: { user_sgpr: 9, shift: 4 } },
+        },
+      },
+      {
+        group: 1,
+        binding: 1,
+        name: 'dyn_srv',
+        kind: 'read_only_storage',
+        min_binding_size_bytes: 20,
+        source: {
+          resource_heap: { base_user_sgpr: 0, stride: 32, index: { user_sgpr: 10, shift: 5 } },
+        },
+      },
+    ],
+  };
+
+  const result = diagnoseStageBindings(fragmentStage, graphicsRs);
+  assert.equal(result.ok, true);
+  assert.equal(result.stage, 'fragment');
+  assert.equal(result.compute, false);
+  assert.equal(result.userDataBase, 8);
+  assert.equal(result.bindingCount, 10);
+  assert.equal(result.diagnostics.length, 0);
+  assert.equal(result.resolvedBindings.length, 10);
+  assert.equal(result.summary.mismatchCount, 0);
+  assert.equal(result.summary.resolvedCount, 10);
+
+  // Verify resolved register/space/heap details
+  assert.equal(result.resolvedBindings[1].registerClass, 'srv');
+  assert.equal(result.resolvedBindings[1].shaderRegister, 0);
+  assert.equal(result.resolvedBindings[5].shaderRegister, 12);
+  assert.equal(result.resolvedBindings[5].registerSpace, 1);
+  assert.equal(result.resolvedBindings[8].heap.parameterIndex, 1);
+  assert.equal(result.resolvedBindings[8].heap.dwordOffset, 0);
+  assert.equal(result.resolvedBindings[9].heap.parameterIndex, 1);
+  assert.equal(result.resolvedBindings[9].heap.dwordOffset, 1);
+
+  // Compute root signature (starts at s4):
+  //   param 0 @ s4 (1 sgpr): table [UAV u0 (slot 0)]
+  //   param 1 @ s5 (2 sgprs): root SRV (s5..s6)
+  const computeRs = {
+    parameters: [
+      { type: 'table', ranges: [{ type: 'uav', count: 1, base_register: 0, space: 0 }] },
+      { type: 'srv', register: 3, space: 0 },
+    ],
+    static_samplers: 0,
+  };
+  const computeStage = {
+    stage: 'compute',
+    bindings: [
+      {
+        group: 0,
+        binding: 0,
+        kind: 'storage',
+        min_binding_size_bytes: 4,
+        source: { user_sgpr: 4, table_byte_offset: 0 },
+      },
+      {
+        group: 0,
+        binding: 1,
+        kind: 'read_only_storage',
+        min_binding_size_bytes: 16,
+        source: { user_sgpr: 5, root_descriptor: true },
+      },
+    ],
+  };
+
+  const csRes = diagnoseStageBindings(computeStage, computeRs);
+  assert.equal(csRes.ok, true);
+  assert.equal(csRes.compute, true);
+  assert.equal(csRes.userDataBase, 4);
+  assert.equal(csRes.resolvedBindings.length, 2);
+});
+
+test('diagnoseStageBindings emits structured mismatch diagnostics for root-parameter, table-offset, CBV/SRV type, static-sampler, and heap errors', () => {
+  // Graphics RS (s8 base):
+  //   param 0 @ s8 (1 sgpr): table [CBV b0 (slot 0), SRV t0 (slot 1), gap at slot 2, UAV u0 (slot 3)]
+  //   param 1 @ s9 (2 sgprs): root constants (s9..s10)
+  //   param 2 @ s11 (2 sgprs): root CBV (s11..s12)
+  //   static_samplers: 1 (only index 0 exists)
+  const rs = {
+    parameters: [
+      {
+        type: 'table',
+        ranges: [
+          { type: 'cbv', count: 1, base_register: 0, space: 0 },
+          { type: 'srv', count: 1, base_register: 0, space: 0 },
+          { type: 'uav', count: 1, base_register: 0, space: 0, offset: 3 },
+        ],
+      },
+      { type: 'constants', num_32bit_values: 2, register: 1, space: 0 },
+      { type: 'cbv', register: 2, space: 0 },
+    ],
+    static_samplers: 1,
+  };
+
+  const badStage = {
+    stage: 'fragment',
+    bindings: [
+      // 1. CBV/SRV mismatch: texture binding pointing at CBV slot 0 ("a texture binding cannot take a CBV")
+      {
+        group: 0,
+        binding: 0,
+        name: 'bad_tex_cbv',
+        kind: 'texture',
+        source: { user_sgpr: 8, table_byte_offset: 0 },
+      },
+      // 2. Missing descriptor in table gap (slot 2 -> byte offset 64)
+      {
+        group: 0,
+        binding: 1,
+        name: 'gap_slot',
+        kind: 'texture',
+        source: { user_sgpr: 8, table_byte_offset: 64 },
+      },
+      // 3. Unaligned table_byte_offset (byte offset 48, not multiple of 32)
+      {
+        group: 0,
+        binding: 2,
+        name: 'unaligned_slot',
+        kind: 'texture',
+        source: { user_sgpr: 8, table_byte_offset: 48 },
+      },
+      // 4. Root parameter not found: s10 is INSIDE root constants (s9..s10), does not start a parameter
+      {
+        group: 0,
+        binding: 3,
+        name: 'mid_sgpr',
+        kind: 'uniform',
+        source: { user_sgpr: 10, table_byte_offset: 0 },
+      },
+      // 5. Root parameter type mismatch: table source pointing at root constants (param 1 @ s9)
+      {
+        group: 0,
+        binding: 4,
+        name: 'wrong_param_type',
+        kind: 'uniform',
+        source: { user_sgpr: 9, table_byte_offset: 0 },
+      },
+      // 6. Root constants bound as non-uniform (storage)
+      {
+        group: 0,
+        binding: 5,
+        name: 'rc_as_storage',
+        kind: 'storage',
+        source: { user_sgpr: 9, root_constants: true },
+      },
+      // 7. Root descriptor type mismatch: storage binding cannot take a root CBV
+      {
+        group: 0,
+        binding: 6,
+        name: 'root_cbv_as_storage',
+        kind: 'storage',
+        source: { user_sgpr: 11, root_descriptor: true },
+      },
+      // 8. Missing static_sampler index 2 (only index 0 exists)
+      {
+        group: 0,
+        binding: 7,
+        name: 'missing_static_smp',
+        kind: 'comparison_sampler',
+        source: { static_sampler: 2 },
+      },
+      // 9. Heap index SGPR not inside root constants (s8 is a table, not constants)
+      {
+        group: 1,
+        binding: 0,
+        name: 'bad_heap_idx',
+        kind: 'sampler',
+        source: {
+          sampler_heap: { base_user_sgpr: 2, stride: 16, index: { user_sgpr: 8, shift: 4 } },
+        },
+      },
+      // 10. Heap kind mismatch: texture from sampler_heap
+      {
+        group: 1,
+        binding: 1,
+        name: 'bad_heap_kind',
+        kind: 'texture',
+        source: {
+          sampler_heap: { base_user_sgpr: 2, stride: 16, index: { user_sgpr: 9, shift: 4 } },
+        },
+      },
+      // 11. Storage texture missing storage_format (slot 3 is UAV so join passes, format check fails)
+      {
+        group: 1,
+        binding: 2,
+        name: 'missing_fmt_uav',
+        kind: 'storage_texture',
+        source: { user_sgpr: 8, table_byte_offset: 3 * 32 },
+      },
+      // 12. Missing source entirely
+      {
+        group: 1,
+        binding: 3,
+        name: 'no_src',
+        kind: 'uniform',
+      },
+    ],
+  };
+
+  const report = diagnoseStageBindings(badStage, rs);
+  assert.equal(report.ok, false);
+  assert.equal(report.resolvedBindings.length, 0);
+  assert.equal(report.diagnostics.length, 12);
+
+  // Every diagnostic has the exact required structured shape
+  for (const d of report.diagnostics) {
+    assert.equal(typeof d.group, 'number');
+    assert.equal(typeof d.binding, 'number');
+    assert.equal(typeof d.kind, 'string');
+    assert.equal(typeof d.code, 'string');
+    assert.notEqual(d.expected, undefined);
+    assert.notEqual(d.actual, undefined);
+    assert.equal(typeof d.message, 'string');
+    assert.ok(d.message.length > 0);
+  }
+
+  const bySlot = new Map(report.diagnostics.map((d) => [`${d.group}:${d.binding}`, d]));
+
+  // 1. texture cannot take CBV
+  const d0 = bySlot.get('0:0');
+  assert.equal(d0.code, DIAGNOSTIC_CODES.DESCRIPTOR_TYPE_MISMATCH);
+  assert.equal(d0.kind, 'texture');
+  assert.deepEqual(d0.expected, ['SRV']);
+  assert.equal(d0.actual, 'CBV');
+  assert.match(d0.message, /a texture binding cannot take a CBV/);
+
+  // 2. missing descriptor at table_byte_offset 64
+  const d1 = bySlot.get('0:1');
+  assert.equal(d1.code, DIAGNOSTIC_CODES.TABLE_DESCRIPTOR_MISSING);
+  assert.equal(d1.expected.tableByteOffset, 64);
+  assert.equal(d1.expected.slot, 2);
+  assert.match(d1.message, /has no descriptor at byte offset 64/);
+
+  // 3. unaligned table_byte_offset 48
+  const d2 = bySlot.get('0:2');
+  assert.equal(d2.code, DIAGNOSTIC_CODES.TABLE_OFFSET_UNALIGNED);
+  assert.equal(d2.expected.tableSlotBytes, 32);
+  assert.equal(d2.actual.tableByteOffset, 48);
+  assert.equal(d2.actual.remainder, 16);
+
+  // 4. mid-parameter SGPR reports covering parameter
+  const d3 = bySlot.get('0:3');
+  assert.equal(d3.code, DIAGNOSTIC_CODES.ROOT_PARAMETER_NOT_FOUND);
+  assert.equal(d3.actual.coveringParameterIndex, 1);
+  assert.equal(d3.actual.coveringParameterType, 'constants');
+  assert.match(d3.message, /no root parameter starts at s10/);
+
+  // 5. wrong parameter type
+  const d4 = bySlot.get('0:4');
+  assert.equal(d4.code, DIAGNOSTIC_CODES.ROOT_PARAMETER_TYPE_MISMATCH);
+  assert.equal(d4.expected, 'table');
+  assert.equal(d4.actual, 'constants');
+
+  // 6. root constants only uniform
+  const d5 = bySlot.get('0:5');
+  assert.equal(d5.code, DIAGNOSTIC_CODES.DESCRIPTOR_TYPE_MISMATCH);
+  assert.match(d5.message, /root constants bind as a uniform buffer only/);
+
+  // 7. root CBV cannot bind as storage
+  const d6 = bySlot.get('0:6');
+  assert.equal(d6.code, DIAGNOSTIC_CODES.DESCRIPTOR_TYPE_MISMATCH);
+  assert.match(d6.message, /a storage binding cannot take a CBV/);
+
+  // 8. missing static_sampler index
+  const d7 = bySlot.get('0:7');
+  assert.equal(d7.code, DIAGNOSTIC_CODES.STATIC_SAMPLER_MISSING);
+  assert.equal(d7.actual.staticSamplerIndex, 2);
+  assert.equal(d7.expected.staticSamplerCount, 1);
+  assert.match(d7.message, /no static sampler 2/);
+
+  // 9. heap index not root constant
+  const d8 = bySlot.get('1:0');
+  assert.equal(d8.code, DIAGNOSTIC_CODES.HEAP_INDEX_NOT_ROOT_CONSTANT);
+  assert.match(d8.message, /s8 is not inside a root-constants parameter/);
+
+  // 10. heap kind mismatch
+  const d9 = bySlot.get('1:1');
+  assert.equal(d9.code, DIAGNOSTIC_CODES.HEAP_KIND_MISMATCH);
+  assert.equal(d9.expected, 'resource_heap');
+  assert.equal(d9.actual, 'sampler_heap');
+  assert.match(d9.message, /a texture binding cannot come from the sampler heap/);
+
+  // 11. missing storage texture format
+  const d10 = bySlot.get('1:2');
+  assert.equal(d10.code, DIAGNOSTIC_CODES.MISSING_STORAGE_FORMAT);
+  assert.match(d10.message, /storage texture needs its format/);
+
+  // 12. missing source
+  const d11 = bySlot.get('1:3');
+  assert.equal(d11.code, DIAGNOSTIC_CODES.MISSING_SOURCE);
+});
+
+test('diagnoseStageBindings validates min_binding_size_bytes alignment for uniform, storage, and non-buffer bindings', () => {
+  const rs = {
+    parameters: [
+      {
+        type: 'table',
+        ranges: [
+          { type: 'cbv', count: 2, base_register: 0, space: 0 },
+          { type: 'uav', count: 2, base_register: 0, space: 0 },
+          { type: 'srv', count: 2, base_register: 0, space: 0 },
+        ],
+      },
+    ],
+    static_samplers: 0,
+  };
+
+  const stage = {
+    stage: 'fragment',
+    bindings: [
+      // Valid 16-byte aligned uniform (48 bytes)
+      {
+        group: 0,
+        binding: 0,
+        kind: 'uniform',
+        min_binding_size_bytes: 48,
+        source: { user_sgpr: 8, table_byte_offset: 0 },
+      },
+      // Misaligned uniform (24 bytes -> needs multiple of 16, next aligned 32)
+      {
+        group: 0,
+        binding: 1,
+        kind: 'uniform',
+        min_binding_size_bytes: 24,
+        source: { user_sgpr: 8, table_byte_offset: 32 },
+      },
+      // Valid 4-byte aligned storage (12 bytes)
+      {
+        group: 0,
+        binding: 2,
+        kind: 'storage',
+        min_binding_size_bytes: 12,
+        source: { user_sgpr: 8, table_byte_offset: 64 },
+      },
+      // Misaligned storage (6 bytes -> needs multiple of 4, next aligned 8)
+      {
+        group: 0,
+        binding: 3,
+        kind: 'storage',
+        min_binding_size_bytes: 6,
+        source: { user_sgpr: 8, table_byte_offset: 96 },
+      },
+      // Misaligned read_only_storage (negative -4)
+      {
+        group: 0,
+        binding: 4,
+        kind: 'read_only_storage',
+        min_binding_size_bytes: -4,
+        source: { user_sgpr: 8, table_byte_offset: 128 },
+      },
+      // Unexpected non-zero min_binding_size_bytes on a texture
+      {
+        group: 0,
+        binding: 5,
+        kind: 'texture',
+        min_binding_size_bytes: 16,
+        source: { user_sgpr: 8, table_byte_offset: 160 },
+      },
+    ],
+  };
+
+  const report = diagnoseStageBindings(stage, rs);
+  assert.equal(report.ok, false);
+  assert.equal(report.resolvedBindings.length, 2);
+  assert.equal(report.diagnostics.length, 4);
+
+  const byBinding = new Map(report.diagnostics.map((d) => [d.binding, d]));
+
+  const uniformErr = byBinding.get(1);
+  assert.equal(uniformErr.code, DIAGNOSTIC_CODES.MIN_BINDING_SIZE_MISALIGNED);
+  assert.deepEqual(uniformErr.expected, { alignment: 16, alignedSizeBytes: 32 });
+  assert.deepEqual(uniformErr.actual, { minBindingSizeBytes: 24, remainder: 8 });
+  assert.match(uniformErr.message, /not aligned to 16 bytes/);
+
+  const storageErr = byBinding.get(3);
+  assert.equal(storageErr.code, DIAGNOSTIC_CODES.MIN_BINDING_SIZE_MISALIGNED);
+  assert.deepEqual(storageErr.expected, { alignment: 4, alignedSizeBytes: 8 });
+  assert.deepEqual(storageErr.actual, { minBindingSizeBytes: 6, remainder: 2 });
+
+  const negErr = byBinding.get(4);
+  assert.equal(negErr.code, DIAGNOSTIC_CODES.MIN_BINDING_SIZE_MISALIGNED);
+  assert.equal(negErr.actual.minBindingSizeBytes, -4);
+
+  const texErr = byBinding.get(5);
+  assert.equal(texErr.code, DIAGNOSTIC_CODES.MIN_BINDING_SIZE_UNEXPECTED);
+  assert.equal(texErr.expected, 0);
+  assert.equal(texErr.actual, 16);
+
+  // Custom alignment override (e.g., 256-byte uniform alignment)
+  const strictReport = diagnoseStageBindings(
+    {
+      stage: 'fragment',
+      bindings: [
+        {
+          group: 0,
+          binding: 0,
+          kind: 'uniform',
+          min_binding_size_bytes: 48,
+          source: { user_sgpr: 8, table_byte_offset: 0 },
+        },
+      ],
+    },
+    rs,
+    { uniformMinBindingSizeAlignment: 256 }
+  );
+  assert.equal(strictReport.ok, false);
+  assert.equal(strictReport.diagnostics[0].code, DIAGNOSTIC_CODES.MIN_BINDING_SIZE_MISALIGNED);
+  assert.deepEqual(strictReport.diagnostics[0].expected, { alignment: 256, alignedSizeBytes: 256 });
+});
+
+test('synthesizeMissingStaticSamplers detects filtering & comparison fallback metadata and integrates with diagnoseStageBindings', () => {
+  const rs = {
+    parameters: [
+      {
+        type: 'table',
+        ranges: [{ type: 'srv', count: 1, base_register: 0, space: 0 }],
+      },
+    ],
+    // Only static sampler 0 is defined; indices 1 and 2 are missing
+    static_samplers: [{ shader_register: 0, register_space: 0, comparison: false }],
+  };
+
+  const stage = {
+    stage: 'fragment',
+    bindings: [
+      {
+        group: 0,
+        binding: 0,
+        name: 'albedo',
+        kind: 'texture',
+        source: { user_sgpr: 8, table_byte_offset: 0 },
+      },
+      {
+        group: 0,
+        binding: 1,
+        name: 'present_static',
+        kind: 'sampler',
+        source: { static_sampler: 0 },
+      },
+      {
+        group: 0,
+        binding: 2,
+        name: 'missing_linear',
+        kind: 'sampler',
+        source: { static_sampler: 1 },
+      },
+      {
+        group: 0,
+        binding: 3,
+        name: 'missing_shadow_cmp',
+        kind: 'comparison_sampler',
+        source: { static_sampler: 2 },
+      },
+      {
+        group: 0,
+        binding: 4,
+        name: 'missing_table_smp',
+        kind: 'sampler',
+        source: { user_sgpr: 8, table_byte_offset: 64 },
+      },
+    ],
+  };
+
+  // Default synthesizeMissingStaticSamplers detects only missing static_sampler slots
+  const fallbackMeta = synthesizeMissingStaticSamplers(stage, rs);
+  assert.equal(fallbackMeta.needed, true);
+  assert.equal(fallbackMeta.count, 2);
+  assert.equal(fallbackMeta.filteringCount, 1);
+  assert.equal(fallbackMeta.comparisonCount, 1);
+  assert.equal(fallbackMeta.slots.length, 2);
+
+  const linearSlot = fallbackMeta.bySlot.get('0:2');
+  assert.ok(linearSlot);
+  assert.equal(linearSlot.staticSamplerIndex, 1);
+  assert.equal(linearSlot.samplerType, 'filtering');
+  assert.equal(linearSlot.reason, DIAGNOSTIC_CODES.STATIC_SAMPLER_MISSING);
+  assert.equal(linearSlot.fallbackDescriptor.magFilter, 'linear');
+  assert.equal(linearSlot.fallbackDescriptor.minFilter, 'linear');
+  assert.equal(linearSlot.fallbackDescriptor.compare, undefined);
+  assert.equal(fallbackMeta.byStaticSamplerIndex.get(1), linearSlot);
+
+  const cmpSlot = fallbackMeta.bySlot.get('0:3');
+  assert.ok(cmpSlot);
+  assert.equal(cmpSlot.staticSamplerIndex, 2);
+  assert.equal(cmpSlot.samplerType, 'comparison');
+  assert.equal(cmpSlot.fallbackDescriptor.compare, 'less-equal');
+  assert.equal(fallbackMeta.byStaticSamplerIndex.get(2), cmpSlot);
+
+  // Optional includeMissingTableSamplers also picks up the missing table sampler slot
+  const withTable = synthesizeMissingStaticSamplers(stage, rs, {
+    includeMissingTableSamplers: true,
+  });
+  assert.equal(withTable.count, 3);
+  assert.equal(withTable.bySlot.get('0:4').reason, DIAGNOSTIC_CODES.TABLE_DESCRIPTOR_MISSING);
+  assert.equal(withTable.bySlot.get('0:4').staticSamplerIndex, null);
+
+  // diagnoseStageBindings without fallback fails on missing static samplers
+  const staticOnlyStage = {
+    stage: 'fragment',
+    bindings: stage.bindings.slice(0, 4),
+  };
+  const strictDiag = diagnoseStageBindings(staticOnlyStage, rs);
+  assert.equal(strictDiag.ok, false);
+  assert.equal(strictDiag.diagnostics.length, 2);
+  assert.equal(strictDiag.staticSamplerFallbacks.length, 0);
+
+  // diagnoseStageBindings with synthesizeMissingStaticSamplers: true resolves them cleanly
+  const fallbackDiag = diagnoseStageBindings(staticOnlyStage, rs, {
+    synthesizeMissingStaticSamplers: true,
+  });
+  assert.equal(fallbackDiag.ok, true);
+  assert.equal(fallbackDiag.diagnostics.length, 0);
+  assert.equal(fallbackDiag.staticSamplerFallbacks.length, 2);
+  assert.equal(fallbackDiag.summary.synthesizedStaticSamplers, 2);
+  assert.equal(fallbackDiag.resolvedBindings.length, 4);
+  assert.equal(fallbackDiag.resolvedBindings[2].synthesizedStaticSampler, true);
+  assert.equal(fallbackDiag.resolvedBindings[2].fallbackDescriptor.magFilter, 'linear');
+  assert.equal(fallbackDiag.resolvedBindings[3].synthesizedStaticSampler, true);
+  assert.equal(fallbackDiag.resolvedBindings[3].fallbackDescriptor.compare, 'less-equal');
+
+  // Non-sampler binding with missing static_sampler is NEVER synthesized (still fails type check)
+  const badStaticNonSampler = diagnoseStageBindings(
+    {
+      stage: 'fragment',
+      bindings: [
+        { group: 0, binding: 0, kind: 'texture', source: { static_sampler: 5 } },
+      ],
+    },
+    rs,
+    { synthesizeMissingStaticSamplers: true }
+  );
+  assert.equal(badStaticNonSampler.ok, false);
+  assert.equal(badStaticNonSampler.staticSamplerFallbacks.length, 0);
+  assert.equal(badStaticNonSampler.diagnostics[0].code, DIAGNOSTIC_CODES.DESCRIPTOR_TYPE_MISMATCH);
+});
+
+test('ReflectionRegistry.diagnoseStageBindings and synthesizeMissingStaticSamplers work directly on parsed S6/S34 manifests', () => {
+  const bgl = {
+    entries: [
+      {
+        binding: 0,
+        visibility: SHADER_STAGE_BITS.FRAGMENT,
+        buffer: { type: 'uniform', hasDynamicOffset: false, minBindingSize: 24 }, // misaligned (not multiple of 16)
+      },
+      {
+        binding: 1,
+        visibility: SHADER_STAGE_BITS.FRAGMENT,
+        sampler: { type: 'comparison' },
+      },
+    ],
+  };
+  const bglId = computeBindGroupLayoutHash(bgl);
+  const plId = computePipelineLayoutHash([bglId]);
+
+  const manifest = {
+    schema_version: 1,
+    bind_group_layouts: { [bglId]: bgl },
+    pipeline_layouts: { [plId]: { bindGroupLayouts: [bglId] } },
+    shaders: {
+      '0x000000000000c001': {
+        stage: 'fragment',
+        entry_point: 'fs_menu_intro',
+        pipeline_layout: plId,
+        bind_group_layouts: [bglId],
+        bindings: [
+          {
+            group: 0,
+            binding: 0,
+            name: 'cb_ui',
+            resource: 'buffer',
+            in_layout: true,
+            min_binding_size_bytes: 24,
+            source: { user_sgpr: 8, table_byte_offset: 0 },
+          },
+          {
+            group: 0,
+            binding: 1,
+            name: 'cmp_ui',
+            resource: 'sampler',
+            in_layout: true,
+            source: { static_sampler: 0 },
+          },
+        ],
+      },
+    },
+  };
+
+  const registry = new ReflectionRegistry();
+  const parsed = registry.loadManifest(manifest);
+  assert.equal(parsed.shadersByHash.get(0xc001n).bindings[0].minBindingSizeBytes, 24);
+
+  const rs = {
+    parameters: [
+      { type: 'table', ranges: [{ type: 'cbv', count: 1, base_register: 0, space: 0 }] },
+    ],
+    static_samplers: [],
+  };
+
+  // Diagnose via registry by entry_point name
+  const diag = registry.diagnoseStageBindings('fs_menu_intro', rs);
+  assert.equal(diag.ok, false);
+  assert.equal(diag.diagnostics.length, 2);
+  assert.equal(diag.summary.codes[DIAGNOSTIC_CODES.MIN_BINDING_SIZE_MISALIGNED], 1);
+  assert.equal(diag.summary.codes[DIAGNOSTIC_CODES.STATIC_SAMPLER_MISSING], 1);
+
+  // Synthesize missing static samplers via registry by BigInt shader hash
+  const fallback = registry.synthesizeMissingStaticSamplers(0xc001n, rs);
+  assert.equal(fallback.needed, true);
+  assert.equal(fallback.comparisonCount, 1);
+  assert.equal(fallback.slots[0].samplerType, 'comparison');
+  assert.equal(fallback.slots[0].fallbackDescriptor.compare, 'less-equal');
 });
