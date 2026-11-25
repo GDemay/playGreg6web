@@ -406,6 +406,17 @@ class RunTests(unittest.TestCase):
         self.assertEqual(times, sorted(times))
         self.assertLess(times[-1], 420_000)
 
+    def test_menu_flow_4_preset(self):
+        self.assertEqual(rnb.PRESETS["menu-flow-4"]["max_ms"], 420_000)
+        script = rnb.input_script_text(420_000, "menu-flow-4")
+        before, header, body, after = self._sections(script)
+        self.assertEqual(header, "repeat every 14s until draws_per_frame==33|50 for 1500ms")
+        self.assertEqual(after[:4], ["capture", "1000 DUp 150", "3000 A 100",
+                                     "wait draws_per_frame==34 for 2s timeout 30s"])
+        tail = [line.split() for line in after[4:]]
+        self.assertEqual([e[1] for e in tail[:9]], ["DUp"] * 6 + ["DDown", "DDown", "A"])
+        self.assertLess(int(tail[-1][0]), 420_000)
+
     def test_logged_input_times_and_wait_line(self):
         log = ("[harness] input script x: 12 event(s)\n"
                "[input] 20000 ms: press 0x1 100\n"

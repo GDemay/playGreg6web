@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """One-command native boot runner: rebuild what is stale, run `playgta6_boot`, keep the run.
 
-    python tools/run_native_boot.py [--preset smoke|start-screen|menu-flow|menu-flow-2|menu-flow-3|long] [--name NAME]
+    python tools/run_native_boot.py [--preset smoke|start-screen|menu-flow|menu-flow-2|menu-flow-3|menu-flow-4|long]
+        [--name NAME]
         [--exe PATH] [--game-dir DIR] [options] [-- extra playgta6_boot options]
 
 What it does, in order:
@@ -28,9 +29,11 @@ What it does, in order:
 2. Run `playgta6_boot --program-dir <program> --name <exe name> --game-dir <game-dir>` with a
    preset or explicit options. Presets: `smoke` (60 s limit, 90 s watchdog), `start-screen`
    (120 s limit; an input script pressing A for 100 ms once a second from 5 s on), `menu-flow`
-   (240 s limit; A every 2.5 s from 20 s, then D-pad Down, Down, A through LEGAL NOTICES), `menu-flow-2` (360 s limit; the same, then
-   every 14 s Up x6 + Down, Down, A: leaves the list screen), `menu-flow-3` (420 s limit; the same until 200 s, then scrolls
-   TERMS OF SERVICE with RDown + Down and presses A), `long`
+   (240 s limit; A every 2.5 s from 20 s, then Up x6 + Down, Down, A every 14 s through LEGAL
+   NOTICES to the list screen, then A every 3 s), `menu-flow-2` (360 s limit; the same, then the
+   Up x6 + Down, Down, A cycle on), `menu-flow-3` (420 s limit; the same to the list screen, then
+   scrolls it with RDown + Down and presses A), `menu-flow-4` (420 s limit;
+   Up + A on the list screen, which leads to the 34 draws/frame screen, then the menu cycle), `long`
    (600 s limit, 630 s watchdog). The menu-flow presets are screen-synchronised: they repeat the
    menu cycle until the list screen after LEGAL NOTICES holds (draws/frame 33 or 50, read live from
    the present counters; `wait` / `repeat` steps in runtime/guest/input_script.h), so a slower run
@@ -88,6 +91,7 @@ PRESETS: dict[str, dict] = {
     "menu-flow": {"max_ms": 240_000, "watchdog_ms": 270_000, "input": "menu-flow"},
     "menu-flow-2": {"max_ms": 360_000, "watchdog_ms": 390_000, "input": "menu-flow-2"},
     "menu-flow-3": {"max_ms": 420_000, "watchdog_ms": 450_000, "input": "menu-flow-3"},
+    "menu-flow-4": {"max_ms": 420_000, "watchdog_ms": 450_000, "input": "menu-flow-4"},
     "long": {"max_ms": 600_000, "watchdog_ms": 630_000, "input": None},
 }
 INPUT_START_MS = 5_000
@@ -497,7 +501,30 @@ def menu_flow_3_script_text(duration_ms: int) -> str:
     return "\n".join(lines) + "\n"
 
 
+# The screen behind the list screen's Up + A (#663: 34 draws/frame after a ~3 s transition).
+NEXT_SCREEN = "draws_per_frame==34"
+
+
+def menu_flow_4_script_text(duration_ms: int) -> str:
+    """The menu-flow-4 preset: to the list screen (_to_list_screen), D-pad Up (the cursor's top
+    state, 50 draws/frame) and A, then wait for the next screen (34 draws/frame, steady 2 s), then
+    the menu cycle every 14 s (untested on that screen). Measured (#663, native, menu-flow-3 with
+    waits): A in the list screen's Down state (33) only blipped; Up + A animated for ~3 s into a
+    34 draws/frame screen that stayed up through 250 s of RDown + Down and A every 4 s."""
+    lines = ["# menu-flow-4 (tools/run_native_boot.py): to the list screen after LEGAL NOTICES (" + LIST_SCREEN + ");",
+             "# Up, A; wait for " + NEXT_SCREEN + "; then every 14 s: Up x6, Down, Down, A"]
+    lines += _to_list_screen()
+    lines += ["1000 DUp 150", "3000 A 100", f"wait {NEXT_SCREEN} for 2s timeout 30s"]
+    events: list[tuple[int, str, int]] = []
+    for t in range(2_000, duration_ms, 14_000):
+        events += _menu_cycle(t)
+    lines += _lines(events, duration_ms)
+    return "\n".join(lines) + "\n"
+
+
 def input_script_text(duration_ms: int, kind: str = "start-screen") -> str:
+    if kind == "menu-flow-4":
+        return menu_flow_4_script_text(duration_ms)
     if kind == "menu-flow-3":
         return menu_flow_3_script_text(duration_ms)
     if kind == "menu-flow-2":
