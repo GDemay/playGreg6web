@@ -1090,3 +1090,330 @@ test('G43: preserves G31 classic-worker importScripts IIFE isolation with zero t
   assert.equal(typeof ctx.PlayGta6UniformRing.copyForWriteBuffer, 'function');
   assert.equal(ctx.PlayGta6UniformRing.DEFAULT_MIN_UNIFORM_BINDING_SIZE, 16);
 });
+
+test('W127: allowSpill allocates aligned spill pages on burst frames, flushes primary + spill buffers, and returns valid dynamic offsets', () => {
+  const { device, createdBuffers, queueWrites } = createMockGpuDevice();
+  const ring = new DynamicUniformRing({
+    device,
+    byteSize: 512,
+    framesInFlight: 2,
+    allowSpill: true,
+    maxRingBytes: 1536,
+  });
+
+  assert.equal(ring.capacity, 512);
+  assert.equal(ring.capacityBytes, 512);
+  assert.equal(ring.allowSpill, true);
+  assert.equal(ring.maxRingBytes, 1536);
+  assert.equal(createdBuffers.length, 2);
+
+  ring.beginFrame();
+
+  // Push 5 draws (1280B total):
+  // - Draws 0..1 fill primary slot 0 (512B)
+  // - Draws 2..3 spill into spill page #0 (512B, total live = 1024B)
+  // - Draw 4 spills into spill page #1 (512B, total live = 1536B == maxRingBytes)
+  const allocs = [];
+  for (let i = 0; i < 5; i += 1) {
+    const payload = new Uint32Array([0x2000 + i, 0x3000 + i, 0x4000 + i, 0x5000 + i]);
+    allocs.push(ring.pushConstants(payload));
+  }
+
+  for (let i = 0; i < 2; i += 1) {
+    assert.equal(allocs[i].isSpill, false);
+    assert.equal(allocs[i].overflow, false);
+    assert.equal(allocs[i].buffer, ring.currentBuffer);
+    assert.equal(allocs[i].offset, i * 256);
+    assert.equal(allocs[i].dynamicOffset, i * 256);
+    assert.equal(allocs[i].size, 16);
+    assert.equal(allocs[i].alignedSize, 256);
+  }
+
+  for (let i = 2; i < 4; i += 1) {
+    assert.equal(allocs[i].isSpill, true);
+    assert.equal(allocs[i].overflow, true);
+    assert.notEqual(allocs[i].buffer, ring.currentBuffer);
+    assert.equal(allocs[i].buffer, allocs[2].buffer);
+    assert.equal(allocs[i].buffer.size, 512);
+    assert.equal(allocs[i].offset, (i - 2) * 256);
+    assert.equal(allocs[i].dynamicOffset, (i - 2) * 256);
+    assert.equal(allocs[i].dynamicOffset % 256, 0);
+  }
+
+  assert.equal(allocs[4].isSpill, true);
+  assert.notEqual(allocs[4].buffer, ring.currentBuffer);
+  assert.notEqual(allocs[4].buffer, allocs[2].buffer);
+  assert.equal(allocs[4].buffer.size, 512);
+  assert.equal(allocs[4].offset, 0);
+  assert.equal(allocs[4].dynamicOffset, 0);
+
+  // Flush uploads primary (512B) + spill page #0 (512B) + spill page #1 (256B).
+  const flushed = ring.flush();
+  assert.deepEqual(flushed, { uploadedBytes: 1280, drawCount: 5 });
+  assert.equal(queueWrites.length, 3);
+
+  for (let i = 0; i < 5; i += 1) {
+    const a = allocs[i];
+    const u32 = new Uint32Array(a.buffer._data.buffer, a.dynamicOffset, 4);
+    assert.deepEqual(Array.from(u32), [0x2000 + i, 0x3000 + i, 0x4000 + i, 0x5000 + i]);
+  }
+
+  const stats = ring.getStats();
+  assert.equal(stats.allowSpill, true);
+  assert.equal(stats.maxRingBytes, 1536);
+  assert.equal(stats.spillAllocations, 3);
+  assert.equal(stats.spillPagesCreated, 2);
+  assert.equal(stats.liveSpillPages, 2);
+  assert.equal(stats.liveSpillBytes, 1024);
+  assert.equal(stats.peakFrameBytes, 1280);
+  assert.equal(stats.peakUtilizationRatio, 1280 / 512);
+
+  // Bind group entry helper works transparently on spill allocations.
+  const bgEntry = ring.createBindGroupEntryForAllocation(1, allocs[4]);
+  assert.equal(bgEntry.resource.buffer, allocs[4].buffer);
+  assert.equal(bgEntry.resource.offset, 0);
+  assert.equal(bgEntry.resource.size, 16);
+
+  ring.destroy();
+  for (const buf of createdBuffers) {
+    assert.equal(buf.destroyCount, 1, `buffer ${buf.id} must be destroyed exactly once`);
+  }
+});
+
+test('W127: maxRingBytes strictly bounds spill-page sizing and rejects allocations exceeding budget', () => {
+  const { device, createdBuffers } = createMockGpuDevice();
+
+  // Invalid maxRingBytes configurations throw RangeError.
+  assert.throws(
+    () => new DynamicUniformRing({ device, byteSize: 1024, allowSpill: true, maxRingBytes: 512 }),
+    RangeError
+  );
+  assert.throws(
+    () => new DynamicUniformRing({ device, byteSize: 512, maxByteSize: 2048, maxRingBytes: 1024 }),
+    RangeError
+  );
+  assert.throws(
+    () => new DynamicUniformRing({ device, byteSize: 512, allowSpill: true, maxRingBytes: 0 }),
+    RangeError
+  );
+
+  // maxRingBytes = 1280 with byteSize = 512 allows:
+  // - primary 512B (2 draws)
+  // - spill page #0: 512B (2 draws, live = 1024B)
+  // - spill page #1: capped to remaining 256B (1 draw, live = 1280B)
+  // - 6th draw MUST throw RangeError cleanly without mutating state or leaking buffers!
+  const ring = new DynamicUniformRing({
+    device,
+    byteSize: 512,
+    framesInFlight: 2,
+    maxRingBytes: 1280, // auto-enables allowSpill since maxRingBytes > byteSize
+  });
+
+  assert.equal(ring.allowSpill, true);
+  assert.equal(ring.maxRingBytes, 1280);
+
+  ring.beginFrame();
+  for (let i = 0; i < 4; i += 1) {
+    ring.pushConstants(new Uint32Array([i + 1, 2, 3, 4]));
+  }
+  const cappedAlloc = ring.pushConstants(new Uint32Array([5, 2, 3, 4]));
+  assert.equal(cappedAlloc.isSpill, true);
+  assert.equal(cappedAlloc.buffer.size, 256, 'final spill page must cap cleanly within maxRingBytes');
+  assert.equal(cappedAlloc.dynamicOffset, 0);
+
+  const statsBefore = ring.getStats();
+  const bufferCountBefore = createdBuffers.length;
+
+  assert.throws(
+    () => ring.pushConstants(new Uint32Array([6, 2, 3, 4])),
+    (err) => err instanceof RangeError && /maxRingBytes/i.test(err.message)
+  );
+
+  // Failed allocation must not allocate a buffer or corrupt telemetry/cursors.
+  assert.equal(createdBuffers.length, bufferCountBefore);
+  assert.equal(ring.usedBytes, statsBefore.usedBytes);
+  assert.equal(ring.getStats().spillAllocations, statsBefore.spillAllocations);
+  assert.equal(ring.getStats().spillPagesCreated, statsBefore.spillPagesCreated);
+  assert.equal(ring.getStats().frameDrawCount, statsBefore.frameDrawCount);
+
+  // Explicitly setting allowSpill: false prevents spilling even when maxRingBytes > byteSize.
+  const fixedRing = new DynamicUniformRing({
+    device,
+    byteSize: 512,
+    maxByteSize: 512,
+    allowSpill: false,
+    maxRingBytes: 2048,
+  });
+  assert.equal(fixedRing.allowSpill, false);
+  fixedRing.beginFrame();
+  fixedRing.pushConstants(new Uint32Array([1, 2, 3, 4]));
+  fixedRing.pushConstants(new Uint32Array([5, 6, 7, 8]));
+  assert.throws(() => fixedRing.pushConstants(new Uint32Array([9, 10, 11, 12])), RangeError);
+  fixedRing.destroy();
+
+  ring.destroy();
+});
+
+test('W127: spill pages are cleanly reclaimed on reclaimSpillPages(), endFrame(), reset(), quiet frames, and destroy()', () => {
+  const { device, createdBuffers } = createMockGpuDevice();
+  const ring = new DynamicUniformRing({
+    device,
+    byteSize: 512,
+    framesInFlight: 2,
+    allowSpill: true,
+    maxRingBytes: 2048,
+  });
+
+  // 1. Reclaim via explicit reclaimSpillPages().
+  ring.beginFrame(); // Frame 0 -> slot 0
+  ring.pushConstants(new Uint32Array([1]));
+  ring.pushConstants(new Uint32Array([2]));
+  const spillA = ring.pushConstants(new Uint32Array([3]));
+  assert.equal(spillA.isSpill, true);
+  ring.flush();
+  assert.equal(spillA.buffer.destroyCount, 0);
+  assert.equal(ring.getStats().liveSpillPages, 1);
+
+  const reclaimedA = ring.reclaimSpillPages();
+  assert.deepEqual(reclaimedA, { reclaimedPages: 1, reclaimedBytes: 512 });
+  assert.equal(spillA.buffer.destroyCount, 1);
+  assert.equal(ring.getStats().liveSpillPages, 0);
+  assert.equal(ring.getStats().liveSpillBytes, 0);
+  assert.equal(ring.getStats().allocatedGpuBytes, 1024); // 2 primary slots x 512B
+
+  // Second reclaimSpillPages() is a safe idempotent no-op.
+  assert.deepEqual(ring.reclaimSpillPages(), { reclaimedPages: 0, reclaimedBytes: 0 });
+  assert.equal(spillA.buffer.destroyCount, 1);
+
+  // 2. Reclaim via endFrame().
+  ring.beginFrame(); // Frame 1 -> slot 1
+  ring.pushConstants(new Uint32Array([10]));
+  ring.pushConstants(new Uint32Array([11]));
+  const spillB = ring.pushConstants(new Uint32Array([12]));
+  assert.equal(spillB.isSpill, true);
+  ring.flush();
+  const endRes = ring.endFrame();
+  assert.equal(endRes.frameIndex, 1);
+  assert.equal(endRes.frameBytes, 768);
+  assert.equal(endRes.reclaimedPages, 1);
+  assert.equal(endRes.reclaimedBytes, 512);
+  assert.equal(spillB.buffer.destroyCount, 1);
+  assert.equal(ring.getStats().liveSpillPages, 0);
+
+  // 3. Reclaim via reset() (destroys spill pages across all slots and resets frame cursor).
+  ring.beginFrame(); // Frame 2 -> slot 0
+  ring.pushConstants(new Uint32Array([20]));
+  ring.pushConstants(new Uint32Array([21]));
+  const spillC = ring.pushConstants(new Uint32Array([22]));
+  ring.flush();
+
+  ring.beginFrame(); // Frame 3 -> slot 1 (slot 0 spillC still in flight)
+  assert.equal(spillC.buffer.destroyCount, 0);
+  ring.pushConstants(new Uint32Array([30]));
+  ring.pushConstants(new Uint32Array([31]));
+  const spillD = ring.pushConstants(new Uint32Array([32]));
+  assert.equal(ring.getStats().liveSpillPages, 2);
+
+  const resetRes = ring.reset();
+  assert.deepEqual(resetRes, { reclaimedPages: 2, reclaimedBytes: 1024 });
+  assert.equal(spillC.buffer.destroyCount, 1);
+  assert.equal(spillD.buffer.destroyCount, 1);
+  assert.equal(ring.usedBytes, 0);
+  assert.equal(ring.getStats().liveSpillPages, 0);
+  assert.equal(ring.getStats().allocatedGpuBytes, 1024);
+
+  // 4. Reclaim via destroy() when spill pages are still live.
+  ring.beginFrame(); // Frame 4 -> slot 0
+  ring.pushConstants(new Uint32Array([40]));
+  ring.pushConstants(new Uint32Array([41]));
+  const spillE = ring.pushConstants(new Uint32Array([42]));
+  assert.equal(spillE.buffer.destroyCount, 0);
+
+  ring.destroy();
+  assert.equal(spillE.buffer.destroyCount, 1);
+  assert.equal(ring.getStats().liveSpillPages, 0);
+  assert.equal(ring.getStats().liveSpillBytes, 0);
+
+  // Post-destroy calls throw cleanly.
+  assert.throws(() => ring.reclaimSpillPages(), /destroyed/i);
+  assert.throws(() => ring.endFrame(), /destroyed/i);
+  assert.throws(() => ring.reset(), /destroyed/i);
+
+  // Every buffer ever created was destroyed exactly once (zero double-destroy, zero leaks).
+  for (const buf of createdBuffers) {
+    assert.equal(buf.destroyCount, 1, `buffer ${buf.id} must be destroyed exactly once`);
+  }
+});
+
+test('W127: peakFrameBytes and peakUtilizationRatio track accurately across quiet and burst frames', () => {
+  const { device } = createMockGpuDevice();
+  const ring = new DynamicUniformRing({
+    device,
+    byteSize: 1024,
+    framesInFlight: 2,
+    allowSpill: true,
+    maxRingBytes: 4096,
+  });
+
+  // Initial telemetry before any draws.
+  let stats = ring.getStats();
+  assert.equal(stats.peakFrameBytes, 0);
+  assert.equal(stats.peakUtilizationRatio, 0);
+  assert.equal(stats.spillAllocations, 0);
+  assert.equal(stats.spillPagesCreated, 0);
+
+  // Frame 0: 1 draw (256B / 1024B = 0.25).
+  ring.beginFrame();
+  ring.pushConstants(new Float32Array(4));
+  ring.flush();
+  stats = ring.getStats();
+  assert.equal(stats.peakFrameBytes, 256);
+  assert.equal(stats.peakUtilizationRatio, 0.25);
+
+  // Frame 1: 3 draws (768B / 1024B = 0.75).
+  ring.beginFrame();
+  ring.pushConstants(new Float32Array(4));
+  ring.pushConstants(new Float32Array(4));
+  ring.pushConstants(new Float32Array(4));
+  ring.flush();
+  stats = ring.getStats();
+  assert.equal(stats.peakFrameBytes, 768);
+  assert.equal(stats.peakUtilizationRatio, 0.75);
+
+  // Frame 2: burst frame with 6 draws (1536B / 1024B = 1.5, 2 spill allocations on 1 spill page).
+  ring.beginFrame();
+  for (let i = 0; i < 6; i += 1) {
+    ring.pushConstants(new Float32Array([i, i + 1, i + 2, i + 3]));
+  }
+  ring.flush();
+  stats = ring.getStats();
+  assert.equal(stats.peakFrameBytes, 1536);
+  assert.equal(stats.peakUtilizationRatio, 1.5);
+  assert.equal(stats.spillAllocations, 2);
+  assert.equal(stats.spillPagesCreated, 1);
+
+  // Frame 3: quiet frame (256B) — peakFrameBytes & peakUtilizationRatio must retain high-water mark!
+  ring.beginFrame();
+  ring.pushConstants(new Float32Array(4));
+  ring.flush();
+  stats = ring.getStats();
+  assert.equal(stats.usedBytes, 256);
+  assert.equal(stats.peakFrameBytes, 1536);
+  assert.equal(stats.peakUtilizationRatio, 1.5);
+
+  // Frame 4: wraps back to slot 0, reclaiming Frame 2's spill page while keeping lifetime counters.
+  ring.beginFrame();
+  stats = ring.getStats();
+  assert.equal(stats.liveSpillPages, 0);
+  assert.equal(stats.spillAllocations, 2);
+  assert.equal(stats.spillPagesCreated, 1);
+  assert.equal(stats.peakFrameBytes, 1536);
+  assert.equal(stats.peakUtilizationRatio, 1.5);
+
+  ring.destroy();
+  const afterDestroy = ring.getStats();
+  assert.equal(afterDestroy.peakFrameBytes, 1536);
+  assert.equal(afterDestroy.peakUtilizationRatio, 1.5);
+  assert.equal(afterDestroy.spillAllocations, 2);
+  assert.equal(afterDestroy.spillPagesCreated, 1);
+});
