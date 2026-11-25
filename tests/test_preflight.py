@@ -1,9 +1,11 @@
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from collections import namedtuple
 from pathlib import Path
@@ -14,6 +16,46 @@ sys.path.insert(0, str(REPO_ROOT / "tools"))
 import preflight  # noqa: E402
 
 _FakeDiskUsage = namedtuple("_FakeDiskUsage", ["total", "used", "free"])
+
+
+def _build_wgpk_v1_pack(
+    entries: list[tuple[int, int, bytes]],
+    *,
+    magic: bytes = b"WGPK",
+    version: int = 1,
+    flags: int = 0,
+) -> bytes:
+    header = struct.pack("<4sIII", magic, version, len(entries), flags)
+    payload_offset = len(header) + len(entries) * 20
+    table_chunks: list[bytes] = []
+    payload_chunks: list[bytes] = []
+    cursor = payload_offset
+    for shader_hash, stage_code, wgsl_bytes in entries:
+        table_chunks.append(struct.pack("<QB3sII", shader_hash, stage_code, b"\x00\x00\x00", cursor, len(wgsl_bytes)))
+        payload_chunks.append(wgsl_bytes)
+        cursor += len(wgsl_bytes)
+    return header + b"".join(table_chunks) + b"".join(payload_chunks)
+
+
+def _make_valid_sidecar_doc(stage_specs: list[tuple[str, str]]) -> dict:
+    stages: dict[str, dict] = {}
+    for key, stage in stage_specs:
+        stages[key] = {
+            "stage": stage,
+            "bindings": [
+                {
+                    "group": 0,
+                    "binding": 0,
+                    "kind": "uniform",
+                    "source": {"user_sgpr": 8, "table_byte_offset": 0},
+                }
+            ],
+        }
+    return {
+        "schema": "playgta6-stage-reflection",
+        "version": 1,
+        "stages": stages,
+    }
 
 
 def _make_fake_toolchains(available_map: dict[str, str | None]):
@@ -770,6 +812,429 @@ class TestPreflight(unittest.TestCase):
             ):
                 self.assertNotIn(forbidden, serialized)
                 self.assertNotIn(forbidden, rendered)
+
+    def test_splash_wgpk_valid_and_sidecar_in_sync(self) -> None:
+        gib = preflight.BYTES_PER_GIB
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = self._create_repo_skeleton(base, include_server=True)
+            custom_shaders = base / "SecretCustomShadersDir"
+            custom_shaders.mkdir()
+
+            pack_bytes = _build_wgpk_v1_pack(
+                [
+                    (0x1111, 1, b"@vertex fn vs_main() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }"),
+                    (0x2222, 2, b"@fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }"),
+                ]
+            )
+            pack_path = custom_shaders / "splash.wgsl.pack"
+            sidecar_path = custom_shaders / "splash.wgsl.pack.reflect.json"
+            pack_path.write_bytes(pack_bytes)
+            sidecar_path.write_text(
+                json.dumps(_make_valid_sidecar_doc([("0x1111", "vertex"), ("0x2222", "fragment")])),
+                encoding="utf-8",
+            )
+            now = time.time()
+            os.utime(pack_path, (now - 5, now - 5))
+            os.utime(sidecar_path, (now, now))
+
+            which_fn, version_fn = _make_fake_toolchains(
+                {
+                    "python": "Python 3.12.4",
+                    "chrome": r"Google Chrome 131.0.6778.86 (C:\Users\AliceSecret\chrome.exe)",
+                }
+            )
+            report = preflight.run_preflight(
+                repo,
+                env={},
+                which_fn=which_fn,
+                version_fn=version_fn,
+                skip_server_check=True,
+                shaders_dir=custom_shaders,
+                disk_usage_fn=lambda _p: _FakeDiskUsage(total=200 * gib, used=100 * gib, free=100 * gib),
+                memory_info_fn=lambda: (32 * gib, 16 * gib),
+            )
+
+            sp = report["splashPack"]
+            self.assertTrue(sp["shadersDirProvided"])
+            self.assertTrue(sp["shadersDirExists"])
+            self.assertTrue(sp["present"])
+            self.assertEqual(sp["sizeBytes"], len(pack_bytes))
+            self.assertTrue(sp["headerValid"])
+            self.assertEqual(sp["version"], 1)
+            self.assertEqual(sp["entryCount"], 2)
+            self.assertEqual(sp["stageCounts"], {"vertex": 1, "fragment": 1, "compute": 0})
+            self.assertTrue(sp["sidecarPresent"])
+            self.assertTrue(sp["sidecarValid"])
+            self.assertEqual(sp["sidecarStageCount"], 2)
+            self.assertFalse(sp["sidecarStale"])
+            self.assertGreaterEqual(sp["mtimeDeltaSeconds"], 0.0)
+            self.assertTrue(sp["countMatch"])
+            self.assertTrue(sp["inSync"])
+            self.assertTrue(sp["ok"])
+            self.assertFalse(sp["warning"])
+            self.assertEqual(sp["warnings"], [])
+            self.assertEqual(sp["errors"], [])
+
+            fb = report["fastBoot"]
+            self.assertTrue(fb["ready"])
+            self.assertTrue(fb["splashPackOk"])
+            self.assertTrue(fb["sidecarInSync"])
+            self.assertTrue(fb["browserAvailable"])
+            self.assertEqual(fb["browserFamily"], "chrome")
+            self.assertTrue(fb["diskHeadroomOk"])
+            self.assertTrue(fb["ramHeadroomOk"])
+            self.assertEqual(fb["warnings"], [])
+
+            serialized = json.dumps(report)
+            rendered = preflight.format_report_text(report)
+            self.assertIn("splash.wgsl.pack", rendered)
+            self.assertIn("sidecar in sync", rendered)
+            for forbidden in (str(base), str(custom_shaders), "SecretCustomShadersDir", "AliceSecret"):
+                self.assertNotIn(forbidden, serialized)
+                self.assertNotIn(forbidden, rendered)
+
+    def test_splash_wgpk_missing_stale_mismatch_and_invalid_sidecar_warnings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = self._create_repo_skeleton(base, include_server=False)
+            shaders_dir = base / "shaders"
+            shaders_dir.mkdir()
+
+            pack_bytes = _build_wgpk_v1_pack(
+                [
+                    (0x10, 1, b"@vertex fn vs() {}"),
+                    (0x20, 2, b"@fragment fn fs() {}"),
+                ]
+            )
+            pack_path = shaders_dir / "splash.wgsl.pack"
+            pack_path.write_bytes(pack_bytes)
+
+            # 1) Missing sidecar warning.
+            missing_sidecar = preflight.check_splash_wgpk_sync(repo, shaders_dir=shaders_dir)
+            self.assertTrue(missing_sidecar["present"])
+            self.assertTrue(missing_sidecar["headerValid"])
+            self.assertFalse(missing_sidecar["sidecarPresent"])
+            self.assertFalse(missing_sidecar["inSync"])
+            self.assertFalse(missing_sidecar["ok"])
+            self.assertTrue(missing_sidecar["warning"])
+            self.assertTrue(any("missing" in w for w in missing_sidecar["warnings"]))
+
+            # 2) Stale sidecar warning (older mtime than pack).
+            sidecar_path = shaders_dir / "splash.wgsl.pack.reflect.json"
+            sidecar_path.write_text(
+                json.dumps(_make_valid_sidecar_doc([("0x10", "vertex"), ("0x20", "fragment")])),
+                encoding="utf-8",
+            )
+            now = time.time()
+            os.utime(pack_path, (now, now))
+            os.utime(sidecar_path, (now - 120, now - 120))
+            stale = preflight.check_splash_wgpk_sync(repo, shaders_dir=shaders_dir)
+            self.assertTrue(stale["sidecarPresent"])
+            self.assertTrue(stale["sidecarValid"])
+            self.assertTrue(stale["sidecarStale"])
+            self.assertLess(stale["mtimeDeltaSeconds"], 0.0)
+            self.assertTrue(stale["countMatch"])
+            self.assertFalse(stale["inSync"])
+            self.assertFalse(stale["ok"])
+            self.assertTrue(stale["warning"])
+            self.assertTrue(any("stale" in w for w in stale["warnings"]))
+
+            # 3) Fresh sidecar with mismatched stage count.
+            sidecar_path.write_text(
+                json.dumps(_make_valid_sidecar_doc([("0x10", "vertex")])),
+                encoding="utf-8",
+            )
+            os.utime(sidecar_path, (now + 10, now + 10))
+            mismatch = preflight.check_splash_wgpk_sync(repo, shaders_dir=shaders_dir)
+            self.assertTrue(mismatch["sidecarValid"])
+            self.assertFalse(mismatch["sidecarStale"])
+            self.assertEqual(mismatch["sidecarStageCount"], 1)
+            self.assertEqual(mismatch["entryCount"], 2)
+            self.assertFalse(mismatch["countMatch"])
+            self.assertFalse(mismatch["inSync"])
+            self.assertFalse(mismatch["ok"])
+            self.assertTrue(mismatch["warning"])
+            self.assertTrue(any("stage count" in w for w in mismatch["warnings"]))
+
+            # 4) Invalid sidecar JSON.
+            sidecar_path.write_text("{corrupt", encoding="utf-8")
+            os.utime(sidecar_path, (now + 20, now + 20))
+            invalid_sc = preflight.check_splash_wgpk_sync(repo, shaders_dir=shaders_dir)
+            self.assertTrue(invalid_sc["sidecarPresent"])
+            self.assertFalse(invalid_sc["sidecarValid"])
+            self.assertFalse(invalid_sc["inSync"])
+            self.assertFalse(invalid_sc["ok"])
+            self.assertIn("invalid JSON", invalid_sc["errors"])
+
+    def test_splash_wgpk_missing_pack_and_corrupt_headers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = self._create_repo_skeleton(base, include_server=False)
+
+            # Missing shaders_dir path -> sanitized warning, zero path leakage.
+            missing_dir = base / "DoesNotExist_SecretShaders"
+            res_no_dir = preflight.check_splash_wgpk_sync(repo, shaders_dir=missing_dir)
+            self.assertTrue(res_no_dir["shadersDirProvided"])
+            self.assertFalse(res_no_dir["shadersDirExists"])
+            self.assertFalse(res_no_dir["present"])
+            self.assertFalse(res_no_dir["ok"])
+            self.assertTrue(res_no_dir["warning"])
+            self.assertIn("splash.wgsl.pack not found", res_no_dir["warnings"])
+            self.assertNotIn("DoesNotExist_SecretShaders", json.dumps(res_no_dir))
+
+            # Existing empty shaders_dir -> missing pack warning.
+            shaders_dir = base / "empty_shaders"
+            shaders_dir.mkdir()
+            res_missing = preflight.check_splash_wgpk_sync(repo, shaders_dir=shaders_dir)
+            self.assertTrue(res_missing["shadersDirExists"])
+            self.assertFalse(res_missing["present"])
+            self.assertFalse(res_missing["ok"])
+            self.assertTrue(res_missing["warning"])
+            self.assertIn("splash.wgsl.pack not found", res_missing["warnings"])
+
+            pack_path = shaders_dir / "splash.wgsl.pack"
+
+            # Truncated (< 16 bytes).
+            pack_path.write_bytes(b"WGPK\x01\x00\x00\x00")
+            trunc = preflight.inspect_wgpk_header(pack_path)
+            self.assertFalse(trunc["headerValid"])
+            self.assertTrue(any("truncated" in e for e in trunc["errors"]))
+
+            # Invalid magic.
+            pack_path.write_bytes(struct.pack("<4sIII", b"BAD!", 1, 0, 0))
+            bad_magic = preflight.inspect_wgpk_header(pack_path)
+            self.assertFalse(bad_magic["headerValid"])
+            self.assertIn("invalid WGPK magic", bad_magic["errors"])
+
+            # Unsupported version.
+            pack_path.write_bytes(struct.pack("<4sIII", b"WGPK", 2, 0, 0))
+            bad_ver = preflight.inspect_wgpk_header(pack_path)
+            self.assertFalse(bad_ver["headerValid"])
+            self.assertIn("unsupported WGPK version 2", bad_ver["errors"])
+
+            # Entry table exceeds file size.
+            pack_path.write_bytes(struct.pack("<4sIII", b"WGPK", 1, 100, 0))
+            bad_table = preflight.inspect_wgpk_header(pack_path)
+            self.assertFalse(bad_table["headerValid"])
+            self.assertTrue(any("entry table" in e for e in bad_table["errors"]))
+
+            # Invalid stage code (9).
+            pack_path.write_bytes(_build_wgpk_v1_pack([(0x1, 9, b"fn x() {}")]))
+            bad_stage = preflight.inspect_wgpk_header(pack_path)
+            self.assertFalse(bad_stage["headerValid"])
+            self.assertIn("invalid WGPK entry stage", bad_stage["errors"])
+
+            # Out-of-bounds entry offset/length.
+            oob_header = struct.pack("<4sIII", b"WGPK", 1, 1, 0)
+            oob_entry = struct.pack("<QB3sII", 0x1, 1, b"\x00\x00\x00", 36, 999)
+            pack_path.write_bytes(oob_header + oob_entry)
+            oob = preflight.inspect_wgpk_header(pack_path)
+            self.assertFalse(oob["headerValid"])
+            self.assertIn("WGPK entry payload out of bounds", oob["errors"])
+
+            # Valid 0-entry WGPK header -> headerValid=True, but splash sync warns 0 entries.
+            pack_path.write_bytes(struct.pack("<4sIII", b"WGPK", 1, 0, 0))
+            zero_entries = preflight.check_splash_wgpk_sync(repo, shaders_dir=shaders_dir)
+            self.assertTrue(zero_entries["headerValid"])
+            self.assertEqual(zero_entries["entryCount"], 0)
+            self.assertFalse(zero_entries["ok"])
+            self.assertTrue(any("0 shader entries" in w for w in zero_entries["warnings"]))
+
+    def test_browser_detection_families_and_path_sanitization(self) -> None:
+        # Chrome detected with path/username in raw version string -> sanitized cleanly.
+        w_chrome, v_chrome = _make_fake_toolchains(
+            {"google-chrome": r"Google Chrome 131.0.6778.86 (C:\Users\SecretDev\chrome.exe)"}
+        )
+        res_chrome = preflight.check_browser(which_fn=w_chrome, version_fn=v_chrome)
+        self.assertTrue(res_chrome["available"])
+        self.assertEqual(res_chrome["family"], "chrome")
+        self.assertEqual(res_chrome["version"], "131.0.6778.86")
+        self.assertTrue(res_chrome["browsers"]["chrome"]["available"])
+        self.assertFalse(res_chrome["browsers"]["edge"]["available"])
+        self.assertFalse(res_chrome["warning"])
+        self.assertNotIn("SecretDev", json.dumps(res_chrome))
+        self.assertNotIn("/fake/bin", json.dumps(res_chrome))
+
+        # Edge fallback when Chrome absent.
+        w_edge, v_edge = _make_fake_toolchains(
+            {"msedge": "Microsoft Edge 131.0.2903.63 (/home/secretuser/edge/msedge)"}
+        )
+        res_edge = preflight.check_browser(which_fn=w_edge, version_fn=v_edge)
+        self.assertTrue(res_edge["available"])
+        self.assertEqual(res_edge["family"], "edge")
+        self.assertEqual(res_edge["version"], "131.0.2903.63")
+        self.assertNotIn("secretuser", json.dumps(res_edge))
+
+        # Chromium fallback when Chrome & Edge absent.
+        w_chromium, v_chromium = _make_fake_toolchains(
+            {"chromium": "Chromium 130.0.6723.58"}
+        )
+        res_chromium = preflight.check_browser(which_fn=w_chromium, version_fn=v_chromium)
+        self.assertTrue(res_chromium["available"])
+        self.assertEqual(res_chromium["family"], "chromium")
+        self.assertEqual(res_chromium["version"], "130.0.6723.58")
+
+        # No browser detected -> warning emitted.
+        w_none, v_none = _make_fake_toolchains({})
+        res_none = preflight.check_browser(which_fn=w_none, version_fn=v_none)
+        self.assertFalse(res_none["available"])
+        self.assertIsNone(res_none["family"])
+        self.assertIsNone(res_none["version"])
+        self.assertTrue(res_none["warning"])
+        self.assertEqual(len(res_none["warnings"]), 1)
+
+    def test_memory_headroom_thresholds_and_sanitized_errors(self) -> None:
+        gib = preflight.BYTES_PER_GIB
+
+        # Exact 4.0 GiB boundary -> OK.
+        exact = preflight.check_memory_headroom(
+            min_free_ram_gb=4.0,
+            memory_info_fn=lambda: (16 * gib, 4 * gib),
+        )
+        self.assertTrue(exact["checked"])
+        self.assertTrue(exact["ok"])
+        self.assertFalse(exact["lowMemory"])
+        self.assertFalse(exact["warning"])
+        self.assertEqual(exact["availableGb"], 4.0)
+        self.assertEqual(exact["totalGb"], 16.0)
+
+        # 1 byte below 4.0 GiB -> lowMemory warning (unrounded comparison).
+        below = preflight.check_memory_headroom(
+            min_free_ram_gb=4.0,
+            memory_info_fn=lambda: (16 * gib, 4 * gib - 1),
+        )
+        self.assertTrue(below["checked"])
+        self.assertFalse(below["ok"])
+        self.assertTrue(below["lowMemory"])
+        self.assertTrue(below["warning"])
+
+        # Exception containing host path must never leak.
+        def failing_mem() -> tuple[int, int] | None:
+            raise OSError(r"failed reading C:\Users\TopSecret\meminfo")
+
+        err_mem = preflight.check_memory_headroom(memory_info_fn=failing_mem)
+        self.assertFalse(err_mem["checked"])
+        self.assertFalse(err_mem["ok"])
+        self.assertEqual(err_mem["error"], "memory info unavailable")
+        self.assertNotIn("TopSecret", json.dumps(err_mem))
+
+        # Negative threshold raises ValueError.
+        with self.assertRaises(ValueError):
+            preflight.check_memory_headroom(min_free_ram_gb=-0.5)
+
+    def test_cli_shaders_dir_ram_flag_and_deterministic_sanitized_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = self._create_repo_skeleton(base, include_server=True)
+            dist_dir = repo / "web" / "dist"
+            dist_dir.mkdir(parents=True)
+            (dist_dir / "runtime.js").write_text("export default {};\n", encoding="utf-8")
+            (dist_dir / "runtime.wasm").write_bytes(b"\x00asm\x01\x00\x00\x00")
+
+            secret_shaders = base / "PrivateShadersDir_Secret"
+            secret_shaders.mkdir()
+            pack_path = secret_shaders / "splash.wgsl.pack"
+            sidecar_path = secret_shaders / "splash.wgsl.pack.reflect.json"
+            pack_path.write_bytes(_build_wgpk_v1_pack([(0xabc, 1, b"@vertex fn main() {}")]))
+            sidecar_path.write_text(
+                json.dumps(_make_valid_sidecar_doc([("0xabc", "vertex")])),
+                encoding="utf-8",
+            )
+            now = time.time()
+            os.utime(pack_path, (now - 2, now - 2))
+            os.utime(sidecar_path, (now, now))
+
+            env_clean = {k: v for k, v in os.environ.items() if not k.startswith("GTA6_")}
+            cmd = [
+                sys.executable,
+                str(REPO_ROOT / "tools" / "preflight.py"),
+                "--repo-root",
+                str(repo),
+                "--shaders-dir",
+                str(secret_shaders),
+                "--min-free-gb",
+                "0",
+                "--min-free-ram-gb",
+                "0",
+                "--skip-server",
+                "--json",
+            ]
+            run1 = subprocess.run(cmd, capture_output=True, text=True, env=env_clean, check=False)
+            run2 = subprocess.run(cmd, capture_output=True, text=True, env=env_clean, check=False)
+            self.assertEqual(run1.returncode, 0, msg=run1.stderr)
+            self.assertEqual(run2.returncode, 0, msg=run2.stderr)
+
+            doc1 = json.loads(run1.stdout)
+            doc2 = json.loads(run2.stdout)
+            # Deterministic key order across runs.
+            self.assertEqual(list(doc1.keys()), list(doc2.keys()))
+            self.assertEqual(list(doc1["splashPack"].keys()), list(doc2["splashPack"].keys()))
+            self.assertEqual(list(doc1["browser"].keys()), list(doc2["browser"].keys()))
+            self.assertEqual(list(doc1["memory"].keys()), list(doc2["memory"].keys()))
+            self.assertEqual(list(doc1["fastBoot"].keys()), list(doc2["fastBoot"].keys()))
+
+            self.assertTrue(doc1["splashPack"]["ok"])
+            self.assertTrue(doc1["splashPack"]["inSync"])
+            self.assertEqual(doc1["splashPack"]["entryCount"], 1)
+            self.assertIn("available", doc1["browser"])
+            self.assertIn("family", doc1["browser"])
+            self.assertIn("version", doc1["browser"])
+            self.assertFalse(doc1["memory"]["lowMemory"])
+
+            # Zero host path or username leakage in JSON output.
+            for forbidden in (
+                str(base),
+                str(secret_shaders),
+                "PrivateShadersDir_Secret",
+                os.environ.get("USERNAME", ""),
+                os.environ.get("USER", ""),
+            ):
+                if forbidden and len(forbidden) > 2:
+                    self.assertNotIn(forbidden, run1.stdout)
+
+            # High RAM threshold emits lowMemory warning but --strict still exits 0 when M1 is ready.
+            proc_strict = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "tools" / "preflight.py"),
+                    "--repo-root",
+                    str(repo),
+                    "--shaders-dir",
+                    str(secret_shaders),
+                    "--min-free-ram-gb",
+                    "999999",
+                    "--json",
+                    "--strict",
+                ],
+                capture_output=True,
+                text=True,
+                env=env_clean,
+                check=False,
+            )
+            self.assertEqual(proc_strict.returncode, 0, msg=proc_strict.stderr)
+            strict_doc = json.loads(proc_strict.stdout)
+            self.assertTrue(strict_doc["milestones"]["M1"]["ready"])
+            if strict_doc["memory"]["checked"]:
+                self.assertTrue(strict_doc["memory"]["lowMemory"])
+                self.assertTrue(strict_doc["memory"]["warning"])
+
+            # Negative --min-free-ram-gb is rejected by CLI parser.
+            proc_neg_ram = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "tools" / "preflight.py"),
+                    "--repo-root",
+                    str(repo),
+                    "--min-free-ram-gb",
+                    "-1",
+                ],
+                capture_output=True,
+                text=True,
+                env=env_clean,
+                check=False,
+            )
+            self.assertNotEqual(proc_neg_ram.returncode, 0)
 
 
 if __name__ == "__main__":
