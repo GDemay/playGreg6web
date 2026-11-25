@@ -26,6 +26,14 @@ export const BOOT_MODE = Object.freeze({
   SMOKE: 'smoke',
 });
 
+export const SESSION_PHASE = Object.freeze({
+  BOOT: 'boot',
+  START_SCREEN: 'start_screen',
+  INTRO_VIDEO: 'intro_video',
+  MAIN_MENU: 'main_menu',
+  IN_GAME: 'in_game',
+});
+
 export const DEFAULT_STATUS_URL = '/api/status';
 export const DEFAULT_MAX_VALIDATION_ERRORS = 32;
 export const DEFAULT_MAX_TRANSITION_HISTORY = 64;
@@ -481,6 +489,57 @@ function createEmptyStateDurations() {
   };
 }
 
+const SESSION_PHASE_ALIASES = Object.freeze({
+  boot: SESSION_PHASE.BOOT,
+  booting: SESSION_PHASE.BOOT,
+  startup: SESSION_PHASE.BOOT,
+  start_screen: SESSION_PHASE.START_SCREEN,
+  'start-screen': SESSION_PHASE.START_SCREEN,
+  'start screen': SESSION_PHASE.START_SCREEN,
+  startscreen: SESSION_PHASE.START_SCREEN,
+  title_screen: SESSION_PHASE.START_SCREEN,
+  'title-screen': SESSION_PHASE.START_SCREEN,
+  'title screen': SESSION_PHASE.START_SCREEN,
+  intro_video: SESSION_PHASE.INTRO_VIDEO,
+  'intro-video': SESSION_PHASE.INTRO_VIDEO,
+  'intro video': SESSION_PHASE.INTRO_VIDEO,
+  introvideo: SESSION_PHASE.INTRO_VIDEO,
+  intro: SESSION_PHASE.INTRO_VIDEO,
+  main_menu: SESSION_PHASE.MAIN_MENU,
+  'main-menu': SESSION_PHASE.MAIN_MENU,
+  'main menu': SESSION_PHASE.MAIN_MENU,
+  mainmenu: SESSION_PHASE.MAIN_MENU,
+  menu: SESSION_PHASE.MAIN_MENU,
+  in_game: SESSION_PHASE.IN_GAME,
+  'in-game': SESSION_PHASE.IN_GAME,
+  'in game': SESSION_PHASE.IN_GAME,
+  ingame: SESSION_PHASE.IN_GAME,
+  gameplay: SESSION_PHASE.IN_GAME,
+});
+
+function createEmptyPhaseDurations() {
+  return {
+    [SESSION_PHASE.BOOT]: 0,
+    [SESSION_PHASE.START_SCREEN]: 0,
+    [SESSION_PHASE.INTRO_VIDEO]: 0,
+    [SESSION_PHASE.MAIN_MENU]: 0,
+    [SESSION_PHASE.IN_GAME]: 0,
+  };
+}
+
+function normalizeSessionPhase(raw) {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const normalized = raw.trim().toLowerCase().replace(/\s+/g, ' ');
+  if (!normalized || /[\x00-\x1F\x7F\\\/]/.test(normalized)) {
+    return null;
+  }
+  return Object.prototype.hasOwnProperty.call(SESSION_PHASE_ALIASES, normalized)
+    ? SESSION_PHASE_ALIASES[normalized]
+    : null;
+}
+
 function sanitizeTransitionReason(rawReason) {
   if (typeof rawReason !== 'string') {
     return null;
@@ -519,6 +578,7 @@ export class RuntimeSessionController {
    * @param {EventTarget} [options.audioGestureTarget]
    * @param {Function|null} [options.onDeviceLost=null]
    * @param {Function|null} [options.onDeviceRecovered=null]
+   * @param {Function|null} [options.onMemoryReclaim=null]
    */
   constructor(options = {}) {
     if (options !== undefined && (options === null || typeof options !== 'object')) {
@@ -552,6 +612,7 @@ export class RuntimeSessionController {
       onSplashFrame = null,
       onDeviceLost = null,
       onDeviceRecovered = null,
+      onMemoryReclaim = null,
     } = options;
 
     if (fetchImpl !== null && fetchImpl !== undefined && typeof fetchImpl !== 'function') {
@@ -613,6 +674,9 @@ export class RuntimeSessionController {
     if (onDeviceRecovered !== null && typeof onDeviceRecovered !== 'function') {
       throw new TypeError('onDeviceRecovered must be a function or null');
     }
+    if (onMemoryReclaim !== null && typeof onMemoryReclaim !== 'function') {
+      throw new TypeError('onMemoryReclaim must be a function or null');
+    }
 
     this._fetchImpl = fetchImpl || null;
     this._statusUrl = statusUrl;
@@ -665,6 +729,16 @@ export class RuntimeSessionController {
     this._preloadBufferReleaseCount = 0;
     this._stateDurationsMs = createEmptyStateDurations();
     this._stateEnteredAtMs = this._readNowMs();
+    this._currentPhase = null;
+    this._phaseEnteredAtMs = null;
+    this._phaseDurationsMs = createEmptyPhaseDurations();
+    this._phaseTransitionCount = 0;
+    this._reclaimRuns = 0;
+    this._reclaimFailures = 0;
+    this._lastReclaimReason = null;
+    this._lastReclaimAtMs = null;
+    this._reclaimPromise = null;
+    this._executingReclaimHook = false;
 
     this._validationErrorCount = 0;
     this._validationErrorSeq = 0;
@@ -694,6 +768,8 @@ export class RuntimeSessionController {
     this._splashListeners = new Set();
     this._deviceLostListeners = new Set();
     this._deviceRecoveredListeners = new Set();
+    this._reclaimHooks = new Set();
+    this._sessionReclaimUnregisters = new Set();
 
     if (onStatusUpdate) {
       this._statusListeners.add(onStatusUpdate);
@@ -712,6 +788,9 @@ export class RuntimeSessionController {
     }
     if (onDeviceRecovered) {
       this._deviceRecoveredListeners.add(onDeviceRecovered);
+    }
+    if (onMemoryReclaim) {
+      this._reclaimHooks.add(onMemoryReclaim);
     }
   }
 
@@ -790,12 +869,38 @@ export class RuntimeSessionController {
     this._lastDeviceRecoveredAtMs = null;
     this._cleanShutdownCount = 0;
     this._preloadBufferReleaseCount = 0;
+    const nowMs = this._readNowMs();
     this._stateDurationsMs = createEmptyStateDurations();
-    this._stateEnteredAtMs = this._readNowMs();
+    this._stateEnteredAtMs = nowMs;
+    this._phaseDurationsMs = createEmptyPhaseDurations();
+    this._phaseTransitionCount = 0;
+    if (this._currentPhase !== null) {
+      this._phaseEnteredAtMs = nowMs;
+    } else {
+      this._phaseEnteredAtMs = null;
+    }
+    this._reclaimRuns = 0;
+    this._reclaimFailures = 0;
+    this._lastReclaimReason = null;
+    this._lastReclaimAtMs = null;
   }
 
   isDestroyed() {
     return this._destroyed;
+  }
+
+  getCurrentPhase() {
+    return this._currentPhase;
+  }
+
+  getPhaseDurations(nowMs) {
+    const durations = { ...this._phaseDurationsMs };
+    if (this._currentPhase !== null && this._phaseEnteredAtMs !== null) {
+      const currentNow = this._resolveNowMs(nowMs);
+      const activeElapsedMs = Math.max(0, currentNow - this._phaseEnteredAtMs);
+      durations[this._currentPhase] = (durations[this._currentPhase] || 0) + activeElapsedMs;
+    }
+    return durations;
   }
 
   getStats(nowMs) {
@@ -805,6 +910,9 @@ export class RuntimeSessionController {
       state: this._state,
       mode: this._mode,
       bootMode: this._bootMode,
+      currentPhase: this._currentPhase,
+      phaseDurationsMs: this.getPhaseDurations(resolvedNow),
+      phaseTransitionCount: this._phaseTransitionCount,
       destroyed: this._destroyed,
       restartInFlight: Boolean(this._restartPromise),
       uptimeMs,
@@ -820,6 +928,12 @@ export class RuntimeSessionController {
       lastDeviceRecoveredAtMs: this._lastDeviceRecoveredAtMs,
       cleanShutdownCount: this._cleanShutdownCount,
       preloadBufferReleaseCount: this._preloadBufferReleaseCount,
+      reclaimRuns: this._reclaimRuns,
+      reclaimFailures: this._reclaimFailures,
+      reclaimInFlight: Boolean(this._reclaimPromise),
+      reclaimHookCount: this._reclaimHooks.size,
+      lastReclaimReason: this._lastReclaimReason,
+      lastReclaimAtMs: this._lastReclaimAtMs,
       validationErrorCount: this._validationErrorCount,
       splashFramesPresented: this._splashFramesPresented,
       splashFrameErrorCount: this._splashFrameErrorCount,
@@ -991,6 +1105,43 @@ export class RuntimeSessionController {
     };
   }
 
+  /**
+   * Registers a soft memory-pressure reclaim callback (e.g. RT pool oversized reclaim,
+   * staging slab trim, or OPFS quota eviction) invoked by `requestMemoryReclaim(reason)`
+   * and automatically before full `restart()`.
+   *
+   * @param {(context: { reason: string, state: string, mode: string, bootMode: string, currentPhase: string | null, timestampMs: number }) => (void | Promise<void>)} hook
+   * @returns {() => void} Idempotent unregister function.
+   */
+  registerReclaimHook(hook) {
+    if (typeof hook !== 'function') {
+      throw new TypeError('registerReclaimHook requires a hook function');
+    }
+    if (this._destroyed) {
+      return () => {};
+    }
+    this._reclaimHooks.add(hook);
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      this._reclaimHooks.delete(hook);
+    };
+  }
+
+  /**
+   * Alias for `registerReclaimHook(hook)` matching the `on*` observer convention.
+   *
+   * @param {Function} hook
+   * @returns {() => void} Idempotent unregister function.
+   */
+  onMemoryReclaim(hook) {
+    if (typeof hook !== 'function') {
+      throw new TypeError('onMemoryReclaim requires a hook function');
+    }
+    return this.registerReclaimHook(hook);
+  }
+
   _cloneServerStatus() {
     if (!this._serverStatus) {
       return null;
@@ -1032,6 +1183,9 @@ export class RuntimeSessionController {
       state: this._state,
       mode: this._mode,
       bootMode: this._bootMode,
+      currentPhase: this._currentPhase,
+      phaseDurationsMs: this.getPhaseDurations(resolvedNow),
+      phaseTransitionCount: this._phaseTransitionCount,
       sideModuleCount: this._sideModuleCount,
       sideModuleUrls: [...this._sideModuleUrls],
       validationErrorCount: this._validationErrorCount,
@@ -1064,6 +1218,12 @@ export class RuntimeSessionController {
       lastDeviceLossReason: this._lastDeviceLossReason,
       cleanShutdownCount: this._cleanShutdownCount,
       preloadBufferReleaseCount: this._preloadBufferReleaseCount,
+      reclaimRuns: this._reclaimRuns,
+      reclaimFailures: this._reclaimFailures,
+      reclaimInFlight: Boolean(this._reclaimPromise),
+      reclaimHookCount: this._reclaimHooks.size,
+      lastReclaimReason: this._lastReclaimReason,
+      lastReclaimAtMs: this._lastReclaimAtMs,
       fallbackReason: this._fallbackReason,
       diagnosticReasons: [...this._diagnosticReasons],
       lastError: this._lastError ? this._lastError.message : null,
@@ -1236,6 +1396,8 @@ export class RuntimeSessionController {
       state: this._state,
       mode: this._mode,
       bootMode: this._bootMode,
+      currentPhase: this._currentPhase,
+      phaseDurationsMs: this.getPhaseDurations(nowMs),
       sideModuleCount: this._sideModuleCount,
       sideModuleUrls: [...this._sideModuleUrls],
       serverStatus: this._cloneServerStatus(),
@@ -1255,6 +1417,8 @@ export class RuntimeSessionController {
       deviceLossCount: this._deviceLossCount,
       deviceRecoveryCount: this._deviceRecoveryCount,
       cleanShutdownCount: this._cleanShutdownCount,
+      reclaimRuns: this._reclaimRuns,
+      reclaimFailures: this._reclaimFailures,
       reason,
       timestampMs: nowMs,
     };
@@ -1265,6 +1429,7 @@ export class RuntimeSessionController {
       ...snapshot,
       sideModuleUrls: [...snapshot.sideModuleUrls],
       stateDurations: { ...snapshot.stateDurations },
+      phaseDurationsMs: { ...snapshot.phaseDurationsMs },
       transitionHistory: snapshot.transitionHistory.map((entry) => ({ ...entry })),
     };
   }
@@ -1914,10 +2079,297 @@ export class RuntimeSessionController {
     }
   }
 
+  _resetSessionPhases(enterBoot = false) {
+    this._phaseDurationsMs = createEmptyPhaseDurations();
+    this._phaseTransitionCount = 0;
+    if (enterBoot) {
+      this._currentPhase = SESSION_PHASE.BOOT;
+      this._phaseEnteredAtMs = this._readNowMs();
+      this._phaseTransitionCount = 1;
+    } else {
+      this._currentPhase = null;
+      this._phaseEnteredAtMs = null;
+    }
+  }
+
+  _finalizeCurrentPhase(atMs) {
+    if (this._currentPhase !== null && this._phaseEnteredAtMs !== null) {
+      const resolvedNow = this._resolveNowMs(atMs);
+      const elapsedMs = Math.max(0, resolvedNow - this._phaseEnteredAtMs);
+      this._phaseDurationsMs[this._currentPhase] =
+        (this._phaseDurationsMs[this._currentPhase] || 0) + elapsedMs;
+    }
+    this._currentPhase = null;
+    this._phaseEnteredAtMs = null;
+  }
+
+  /**
+   * Records a sanitized session lifecycle phase transition
+   * (`boot -> start_screen -> intro_video -> main_menu -> in_game`),
+   * accumulating elapsed duration in the previous phase without ever throwing.
+   *
+   * @param {string|{ phase: string, timestampMs?: number }} phase
+   * @param {number} [timestampMs]
+   */
+  recordPhase(phase, timestampMs) {
+    try {
+      let rawPhase = phase;
+      let rawTimestamp = timestampMs;
+      if (phase && typeof phase === 'object') {
+        rawPhase = phase.phase;
+        if (rawTimestamp === undefined) {
+          rawTimestamp = phase.timestampMs;
+        }
+      }
+
+      const normalizedPhase = normalizeSessionPhase(rawPhase);
+      if (!normalizedPhase) {
+        return {
+          ok: false,
+          changed: false,
+          phase: null,
+          previousPhase: this._currentPhase,
+          currentPhase: this._currentPhase,
+          durationInPrevMs: 0,
+          phaseDurationsMs: this.getPhaseDurations(),
+          timestampMs: this._readNowMs(),
+        };
+      }
+
+      const atMs =
+        typeof rawTimestamp === 'number' && Number.isFinite(rawTimestamp)
+          ? rawTimestamp
+          : this._readNowMs();
+
+      const previousPhase = this._currentPhase;
+      if (previousPhase === normalizedPhase) {
+        return {
+          ok: true,
+          changed: false,
+          phase: normalizedPhase,
+          previousPhase,
+          currentPhase: this._currentPhase,
+          durationInPrevMs: 0,
+          phaseDurationsMs: this.getPhaseDurations(atMs),
+          timestampMs: atMs,
+        };
+      }
+
+      let durationInPrevMs = 0;
+      if (previousPhase !== null && this._phaseEnteredAtMs !== null) {
+        durationInPrevMs = Math.max(0, atMs - this._phaseEnteredAtMs);
+        this._phaseDurationsMs[previousPhase] =
+          (this._phaseDurationsMs[previousPhase] || 0) + durationInPrevMs;
+      }
+
+      this._currentPhase = normalizedPhase;
+      this._phaseEnteredAtMs = atMs;
+      this._phaseTransitionCount += 1;
+
+      const phaseDurationsMs = this.getPhaseDurations(atMs);
+      this._emitStatusUpdate(`phase:${normalizedPhase}`);
+
+      return {
+        ok: true,
+        changed: true,
+        phase: normalizedPhase,
+        previousPhase,
+        currentPhase: this._currentPhase,
+        durationInPrevMs,
+        phaseDurationsMs,
+        timestampMs: atMs,
+      };
+    } catch {
+      return {
+        ok: false,
+        changed: false,
+        phase: null,
+        previousPhase: this._currentPhase,
+        currentPhase: this._currentPhase,
+        durationInPrevMs: 0,
+        phaseDurationsMs: this.getPhaseDurations(),
+        timestampMs: this._readNowMs(),
+      };
+    }
+  }
+
+  /**
+   * Invokes registered soft memory-pressure reclaim hooks (e.g. RT pool oversized
+   * reclaim, staging slab trim, OPFS quota eviction) before falling back to a full
+   * session restart. Isolates per-hook errors, guards against overlapping/re-entrant
+   * invocations, and tracks `reclaimRuns` and `reclaimFailures`. Never rejects.
+   *
+   * @param {string|{ reason?: string }} [reason='memory-pressure']
+   */
+  async requestMemoryReclaim(reason = 'memory-pressure') {
+    const rawReason =
+      typeof reason === 'string' && reason.trim().length > 0
+        ? reason
+        : reason &&
+            typeof reason === 'object' &&
+            typeof reason.reason === 'string' &&
+            reason.reason.trim().length > 0
+          ? reason.reason
+          : 'memory-pressure';
+    const sanitizedReason =
+      sanitizeDiagnosticText(rawReason, MAX_TRANSITION_REASON_LENGTH) || 'memory-pressure';
+    const nowMs = this._readNowMs();
+
+    if (this._destroyed) {
+      return {
+        ok: false,
+        destroyed: true,
+        reason: sanitizedReason,
+        hooksInvoked: 0,
+        hooksSucceeded: 0,
+        hooksFailed: 0,
+        errors: [],
+        reclaimRuns: this._reclaimRuns,
+        reclaimFailures: this._reclaimFailures,
+        timestampMs: nowMs,
+      };
+    }
+
+    if (this._executingReclaimHook) {
+      return {
+        ok: false,
+        skipped: true,
+        reentrant: true,
+        reason: sanitizedReason,
+        hooksInvoked: 0,
+        hooksSucceeded: 0,
+        hooksFailed: 0,
+        errors: [],
+        reclaimRuns: this._reclaimRuns,
+        reclaimFailures: this._reclaimFailures,
+        timestampMs: nowMs,
+      };
+    }
+
+    if (this._reclaimPromise) {
+      const firstResult = await this._reclaimPromise;
+      return {
+        ...firstResult,
+        errors: [...firstResult.errors],
+        coalesced: true,
+      };
+    }
+
+    const runReclaim = async () => {
+      const timestampMs = this._readNowMs();
+      this._reclaimRuns += 1;
+      this._lastReclaimReason = sanitizedReason;
+      this._lastReclaimAtMs = timestampMs;
+
+      const hooks = [...this._reclaimHooks];
+      const baseContext = {
+        reason: sanitizedReason,
+        state: this._state,
+        mode: this._mode,
+        bootMode: this._bootMode,
+        currentPhase: this._currentPhase,
+        timestampMs,
+      };
+
+      let hooksInvoked = 0;
+      let hooksSucceeded = 0;
+      let hooksFailed = 0;
+      const errors = [];
+
+      for (let i = 0; i < hooks.length; i += 1) {
+        if (this._destroyed) {
+          break;
+        }
+        const hook = hooks[i];
+        if (!this._reclaimHooks.has(hook)) {
+          continue;
+        }
+        hooksInvoked += 1;
+        try {
+          this._executingReclaimHook = true;
+          let maybePromise;
+          try {
+            maybePromise = hook({ ...baseContext });
+          } finally {
+            this._executingReclaimHook = false;
+          }
+          await maybePromise;
+          hooksSucceeded += 1;
+        } catch (err) {
+          hooksFailed += 1;
+          this._reclaimFailures += 1;
+          const normalized = toError(err, 'Memory reclaim hook failed');
+          const sanitizedMessage =
+            sanitizeDiagnosticText(normalized.message) || 'Memory reclaim hook failed';
+          errors.push(sanitizedMessage);
+          this._hudLog(
+            `Memory reclaim hook warning (${sanitizedReason}): ${sanitizedMessage}`,
+            'warn'
+          );
+          this._reportError(new Error(sanitizedMessage), {
+            phase: 'reclaim',
+            source: 'memoryReclaim',
+            reason: sanitizedReason,
+            hookIndex: i,
+            reclaimRuns: this._reclaimRuns,
+            reclaimFailures: this._reclaimFailures,
+          });
+        }
+      }
+
+      const eventPayload = {
+        type: 'memory-reclaim',
+        ok: hooksFailed === 0,
+        reason: sanitizedReason,
+        hooksInvoked,
+        hooksSucceeded,
+        hooksFailed,
+        errors: [...errors],
+        reclaimRuns: this._reclaimRuns,
+        reclaimFailures: this._reclaimFailures,
+        state: this._state,
+        mode: this._mode,
+        bootMode: this._bootMode,
+        currentPhase: this._currentPhase,
+        timestampMs,
+      };
+
+      for (const listener of [...this._telemetryListeners]) {
+        try {
+          listener({ ...eventPayload, errors: [...errors] });
+        } catch {
+          // Never allow telemetry observers to throw.
+        }
+      }
+
+      this._emitStatusUpdate(`memory-reclaim:${sanitizedReason}`);
+
+      return {
+        ok: hooksFailed === 0,
+        reason: sanitizedReason,
+        hooksInvoked,
+        hooksSucceeded,
+        hooksFailed,
+        errors,
+        reclaimRuns: this._reclaimRuns,
+        reclaimFailures: this._reclaimFailures,
+        timestampMs,
+      };
+    };
+
+    const promise = runReclaim().finally(() => {
+      if (this._reclaimPromise === promise) {
+        this._reclaimPromise = null;
+      }
+    });
+    this._reclaimPromise = promise;
+    return promise;
+  }
+
   /**
    * Dispatches a message (or MessageEvent) from `wgpu_worker.js` / `loader.js`.
    * Handles `gpu-validation-error`, `splash-frame-presented`, device-lost/recovery,
-   * and optional boot lifecycle messages without ever throwing.
+   * `session-phase`, and optional boot lifecycle messages without ever throwing.
    */
   handleWorkerMessage(messageOrEvent) {
     try {
@@ -1956,6 +2408,15 @@ export class RuntimeSessionController {
         msg.type === 'webgpu-device-recovered'
       ) {
         return this.recordDeviceRecovered(msg);
+      }
+
+      if (msg.type === 'session-phase' || msg.type === 'phase-transition') {
+        const res = this.recordPhase(msg.phase, msg.timestampMs);
+        return {
+          handled: res.ok,
+          type: msg.type,
+          ...res,
+        };
       }
 
       if (
@@ -2183,6 +2644,18 @@ export class RuntimeSessionController {
             phase: 'stop',
             source: 'wgpuWorker',
           });
+        }
+      }
+    }
+
+    if (this._sessionReclaimUnregisters.size > 0) {
+      const unregisters = [...this._sessionReclaimUnregisters];
+      this._sessionReclaimUnregisters.clear();
+      for (const unregister of unregisters) {
+        try {
+          unregister();
+        } catch {
+          // Isolate session-scoped reclaim hook unregister errors.
         }
       }
     }
@@ -2442,6 +2915,7 @@ export class RuntimeSessionController {
     this._splashFrameErrorCount = 0;
     this._firstSplashPresented = false;
     this._lastSplashFrame = null;
+    this._resetSessionPhases(true);
 
     if (this._state === SESSION_STATE.ERROR) {
       this._recoveryCount += 1;
@@ -2478,6 +2952,7 @@ export class RuntimeSessionController {
       this._diagnosticReasons = [...diagnosticReasons];
       this._mode = SESSION_MODE.NONE;
       this._bootMode = BOOT_MODE.IDLE;
+      this._finalizeCurrentPhase();
 
       const shortStatus =
         missingCapabilities.includes('crossOriginIsolated') ||
@@ -2572,6 +3047,7 @@ export class RuntimeSessionController {
       this._lastError = error;
       this._diagnosticReasons = [error.message];
       this._bootMode = BOOT_MODE.IDLE;
+      this._finalizeCurrentPhase();
 
       this._hudStatus('No runtime launcher', 'error');
       this._hudLog(error.message, 'error');
@@ -2668,6 +3144,53 @@ export class RuntimeSessionController {
         }
         return this.recordDeviceRecovered(detail);
       },
+      recordPhase: (phase, timestampMs) => {
+        if (token !== this._sessionToken) {
+          return {
+            ok: false,
+            changed: false,
+            phase: null,
+            previousPhase: this._currentPhase,
+            currentPhase: this._currentPhase,
+            durationInPrevMs: 0,
+            phaseDurationsMs: this.getPhaseDurations(),
+            timestampMs: this._readNowMs(),
+          };
+        }
+        return this.recordPhase(phase, timestampMs);
+      },
+      registerReclaimHook: (hook) => {
+        if (typeof hook !== 'function') {
+          throw new TypeError('registerReclaimHook requires a hook function');
+        }
+        if (token !== this._sessionToken || this._destroyed) {
+          return () => {};
+        }
+        const unregister = this.registerReclaimHook(hook);
+        this._sessionReclaimUnregisters.add(unregister);
+        return () => {
+          this._sessionReclaimUnregisters.delete(unregister);
+          unregister();
+        };
+      },
+      requestMemoryReclaim: (reason) => {
+        if (token !== this._sessionToken || this._destroyed) {
+          return Promise.resolve({
+            ok: false,
+            aborted: true,
+            destroyed: this._destroyed,
+            reason: sanitizeTransitionReason(reason) || 'memory-pressure',
+            hooksInvoked: 0,
+            hooksSucceeded: 0,
+            hooksFailed: 0,
+            errors: [],
+            reclaimRuns: this._reclaimRuns,
+            reclaimFailures: this._reclaimFailures,
+            timestampMs: this._readNowMs(),
+          });
+        }
+        return this.requestMemoryReclaim(reason);
+      },
     };
 
     const launcher =
@@ -2695,6 +3218,7 @@ export class RuntimeSessionController {
       this._diagnosticReasons = [normalized.message];
       this._mode = SESSION_MODE.NONE;
       this._bootMode = BOOT_MODE.IDLE;
+      this._finalizeCurrentPhase();
 
       this._hudStatus('Runtime start error', 'error');
       this._hudLog(`Failed to start ${targetMode} runtime: ${normalized.message}`, 'error');
@@ -2776,6 +3300,7 @@ export class RuntimeSessionController {
       this._diagnosticReasons = [normalized.message];
       this._mode = SESSION_MODE.NONE;
       this._bootMode = BOOT_MODE.IDLE;
+      this._finalizeCurrentPhase();
 
       this._hudStatus('Subsystem error', 'error');
       this._hudLog(`Subsystem initialization failed: ${normalized.message}`, 'error');
@@ -2888,6 +3413,7 @@ export class RuntimeSessionController {
       this._bootMode = BOOT_MODE.IDLE;
       this._startedAtMs = null;
       this._fallbackReason = null;
+      this._finalizeCurrentPhase();
 
       if (this._state === SESSION_STATE.STOPPED) {
         return {
@@ -2937,7 +3463,7 @@ export class RuntimeSessionController {
    * Overlapping concurrent calls are coalesced onto the in-flight restart so clicking
    * Restart rapidly never spawns duplicate workers or doubles renderer RAM.
    *
-   * @param {{ preferSmoke?: boolean }} [options]
+   * @param {{ preferSmoke?: boolean, skipReclaim?: boolean }} [options]
    */
   async restart(options = {}) {
     if (this._destroyed) {
@@ -2972,6 +3498,24 @@ export class RuntimeSessionController {
   }
 
   async _restartInternal(options, externalStopBefore) {
+    if (this._reclaimHooks.size > 0 && !(options && options.skipReclaim === true)) {
+      await this.requestMemoryReclaim('restart');
+    }
+
+    if (this._destroyed || this._externalStopToken !== externalStopBefore) {
+      return {
+        ok: false,
+        aborted: true,
+        ...(this._destroyed ? { destroyed: true } : {}),
+        state: this._state,
+        mode: this._mode,
+        bootMode: this._bootMode,
+        sideModuleCount: this._sideModuleCount,
+        sideModuleUrls: [...this._sideModuleUrls],
+        diagnostics: this.getDiagnostics(),
+      };
+    }
+
     await this._stopInternal();
 
     if (this._destroyed || this._externalStopToken !== externalStopBefore) {
@@ -3031,6 +3575,8 @@ export class RuntimeSessionController {
       this._splashListeners.clear();
       this._deviceLostListeners.clear();
       this._deviceRecoveredListeners.clear();
+      this._reclaimHooks.clear();
+      this._sessionReclaimUnregisters.clear();
 
       this._recentValidationErrors.length = 0;
       this._lastSplashFrame = null;
