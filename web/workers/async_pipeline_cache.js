@@ -43,6 +43,22 @@ function normalizeMaxConcurrent(value) {
 }
 
 /**
+ * @param {unknown} value
+ * @returns {number}
+ */
+function normalizeMaxConcurrentCompiles(value) {
+  const n = Number(value);
+  return Number.isInteger(n) && n >= 1 ? n : 0;
+}
+
+function defaultNow() {
+  if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
+    return performance.now();
+  }
+  return Date.now();
+}
+
+/**
  * @param {unknown} err
  * @returns {Error}
  */
@@ -69,15 +85,41 @@ class AsyncPipelineCache {
    * @param {{
    *   device?: GPUDevice | null,
    *   maxConcurrent?: number,
+   *   maxConcurrentCompiles?: number,
+   *   nowFn?: (() => number) | null,
    *   onReady?: ((id: unknown, pipeline: object, meta: object) => void) | null,
    *   onError?: ((id: unknown, err: Error, meta: object) => void) | null,
    *   logger?: { warn?: Function, debug?: Function } | null,
    * }} [options]
    */
-  constructor({ device = null, maxConcurrent = DEFAULT_MAX_CONCURRENT_PIPELINES, onReady = null,
-    onError = null, logger = null } = {}) {
+  constructor({
+    device = null,
+    maxConcurrent,
+    maxConcurrentCompiles,
+    nowFn = null,
+    onReady = null,
+    onError = null,
+    logger = null,
+  } = {}) {
     this.device = device;
-    this.maxConcurrent = normalizeMaxConcurrent(maxConcurrent);
+    const hasMaxConcurrent = maxConcurrent !== undefined;
+    const hasMaxConcurrentCompiles = maxConcurrentCompiles !== undefined;
+    if (hasMaxConcurrentCompiles) {
+      this.maxConcurrentCompiles = normalizeMaxConcurrentCompiles(maxConcurrentCompiles);
+      if (hasMaxConcurrent) {
+        const legacyMax = normalizeMaxConcurrent(maxConcurrent);
+        this.maxConcurrent = this.maxConcurrentCompiles > 0
+          ? Math.min(legacyMax, this.maxConcurrentCompiles)
+          : legacyMax;
+      } else {
+        this.maxConcurrent = this.maxConcurrentCompiles;
+      }
+    } else {
+      this.maxConcurrentCompiles = 0;
+      this.maxConcurrent = normalizeMaxConcurrent(maxConcurrent);
+    }
+    this._concurrencyLimit = this.maxConcurrent > 0 ? this.maxConcurrent : Infinity;
+    this._nowFn = typeof nowFn === 'function' ? nowFn : defaultNow;
     this.onReady = typeof onReady === 'function' ? onReady : null;
     this.onError = typeof onError === 'function' ? onError : null;
     this.logger = logger;
@@ -100,6 +142,10 @@ class AsyncPipelineCache {
       autoLayoutRetries: 0,
       discardedStale: 0,
     };
+    this._peakInFlightCompiles = 0;
+    this._failedAsyncCompiles = 0;
+    this._asyncCompileCount = 0;
+    this._asyncCompileTotalMs = 0;
   }
 
   /**
@@ -207,6 +253,13 @@ class AsyncPipelineCache {
       queued: this._queue.length,
       inFlight: this._inFlight,
       ...this._stats,
+      inFlightCompiles: this._inFlight,
+      peakInFlightCompiles: this._peakInFlightCompiles,
+      queuedCompiles: this._queue.length,
+      failedAsyncCompiles: this._failedAsyncCompiles,
+      avgAsyncCompileMs: this._asyncCompileCount > 0
+        ? this._asyncCompileTotalMs / this._asyncCompileCount
+        : 0,
     };
   }
 
@@ -260,6 +313,7 @@ class AsyncPipelineCache {
       ownerId: id,
       ids: new Set([id]),
       started: false,
+      startedAtMs: 0,
       retried: false,
     };
     entry.job = job;
@@ -315,10 +369,14 @@ class AsyncPipelineCache {
   }
 
   _pump() {
-    while (this._inFlight < this.maxConcurrent && this._queue.length > 0) {
+    while (this._inFlight < this._concurrencyLimit && this._queue.length > 0) {
       const job = this._queue.shift();
       job.started = true;
+      job.startedAtMs = this._now();
       this._inFlight += 1;
+      if (this._inFlight > this._peakInFlightCompiles) {
+        this._peakInFlightCompiles = this._inFlight;
+      }
       this._issue(job, job.descriptor);
     }
   }
@@ -339,39 +397,61 @@ class AsyncPipelineCache {
   }
 
   _onSettled(job, pipeline, error) {
+    if (job.generation !== this.generation) {
+      this._stats.discardedStale += 1;
+      this._log('debug', 'discarded pipeline compile from a previous device generation', {
+        kind: job.kind,
+        generation: job.generation,
+        failed: !!error,
+      });
+      return;
+    }
+
+    if (!error && (pipeline === null || pipeline === undefined)) {
+      error = new Error(`AsyncPipelineCache: ${DEVICE_METHODS[job.kind].async} resolved no pipeline`);
+    }
+
+    if (error && job.fallbackDescriptor && !job.retried) {
+      job.retried = true;
+      this._stats.autoLayoutRetries += 1;
+      this._log('warn', 'pipeline compile rejected; retrying with fallbackDescriptor', {
+        kind: job.kind,
+        message: error.message,
+      });
+      this._issue(job, job.fallbackDescriptor);
+      return; // keeps its concurrency slot
+    }
+
+    let slotReleased = false;
+    const releaseSlot = () => {
+      if (slotReleased) return;
+      slotReleased = true;
+      if (job.generation === this.generation && this._inFlight > 0) {
+        this._inFlight -= 1;
+      }
+    };
+
     try {
-      if (job.generation !== this.generation) {
-        this._stats.discardedStale += 1;
-        this._log('debug', 'discarded pipeline compile from a previous device generation', {
-          kind: job.kind,
-          generation: job.generation,
-          failed: !!error,
-        });
-        return;
+      const elapsedMs = Math.max(0, this._now() - job.startedAtMs);
+      this._asyncCompileCount += 1;
+      this._asyncCompileTotalMs += elapsedMs;
+      if (error) {
+        this._failedAsyncCompiles += 1;
       }
-      if (!error && (pipeline === null || pipeline === undefined)) {
-        error = new Error(`AsyncPipelineCache: ${DEVICE_METHODS[job.kind].async} resolved no pipeline`);
-      }
-      if (error && job.fallbackDescriptor && !job.retried) {
-        job.retried = true;
-        this._stats.autoLayoutRetries += 1;
-        this._log('warn', 'pipeline compile rejected; retrying with fallbackDescriptor', {
-          kind: job.kind,
-          message: error.message,
-        });
-        this._issue(job, job.fallbackDescriptor);
-        return; // keeps its concurrency slot
-      }
-      this._inFlight -= 1;
+      releaseSlot();
       if (job.dedupeKey !== null && this._dedupe.get(job.dedupeKey) === job) {
         if (error) this._dedupe.delete(job.dedupeKey);
         else this._dedupe.set(job.dedupeKey, { kind: job.kind, done: true, pipeline });
       }
       this._completeJob(job, pipeline, error, false);
-      this._pump();
-      this._checkIdle();
     } catch (err) {
       this._log('warn', 'AsyncPipelineCache internal error', { message: toError(err).message });
+    } finally {
+      releaseSlot();
+      if (job.generation === this.generation) {
+        this._pump();
+        this._checkIdle();
+      }
     }
   }
 
@@ -439,6 +519,15 @@ class AsyncPipelineCache {
     const waiters = this._idleWaiters;
     this._idleWaiters = [];
     for (const resolve of waiters) resolve();
+  }
+
+  _now() {
+    try {
+      const value = Number(this._nowFn());
+      return Number.isFinite(value) ? value : 0;
+    } catch {
+      return 0;
+    }
   }
 
   _log(level, message, detail) {
