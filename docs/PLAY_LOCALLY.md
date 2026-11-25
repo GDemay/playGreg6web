@@ -57,3 +57,9 @@ First frame about 30 s after load; the intro follows later. The first build take
 | Q / E | LB / RB |
 | Tab | View |
 | Esc | Menu |
+
+### Native build: `--host-input`
+`playgta6_boot --host-input` feeds the host's first connected XInput pad and the keyboard into GameInput. The harness has
+no window of its own, so the flag is opt-in and keys are read globally. It uses the table above plus I J K L (right
+stick), Shift / Ctrl (L3 / R3) and Z / C (LT / RT). Raw values pass through; the title's adapter applies the deadzones;
+the pad wins per axis when it is deflected more. `--input-script` takes precedence when both are given.
