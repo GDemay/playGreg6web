@@ -3427,3 +3427,496 @@ test('W283: resetStats zeroes subAllocCoalesced, idleSlabShrinks, and stallAvoid
   assert.equal(ctx.DEFAULT_MAX_FRAMES_IN_FLIGHT, undefined);
 });
 
+// ---------------------------------------------------------------------------
+// W319: Zero-alloc slice reuse (`out` scratch target on acquireSlice /
+// acquireUploadSlice / acquire / allocate / stage uploads), scene-transition
+// oversized slab trimming (`trimForSceneTransition`), and sanitized additive
+// telemetry (`zeroAllocAcquires`, `sceneTransitionTrimBytes`, `peakPoolUtilization`).
+// ---------------------------------------------------------------------------
+
+test('W319: out scratch target reuses slice wrapper with zero per-call object churn and preserves exact default shape', () => {
+  const MiB = 1024 * 1024;
+  const { device, createdBuffers } = createLightweight4kMockDevice();
+  const pool = new GpuStagingPool({
+    device,
+    chunkSize: 4 * MiB,
+    maxPoolBytes: 64 * MiB,
+    bucketStrategy: BUCKET_STRATEGY.POW2,
+    maxFramesInFlight: 3,
+  });
+
+  pool.beginFrame(0);
+
+  // Default path (no out) preserves exact legacy shape without extra keys.
+  const defaultStd = pool.acquireSlice(256, 16);
+  assert.deepEqual(Object.keys(defaultStd).sort(), ['alignedSize', 'buffer', 'offset', 'size']);
+  assert.equal(defaultStd.offset, 0);
+  assert.equal(defaultStd.size, 256);
+  assert.equal(defaultStd.alignedSize, 256);
+  assert.equal(pool.getStats().zeroAllocAcquires, 0);
+
+  // Positional acquireSlice(size, align, out) populates and returns the exact same scratch reference.
+  const scratch = {};
+  const r1 = pool.acquireSlice(128, 16, scratch);
+  assert.equal(r1, scratch);
+  assert.equal(scratch.buffer, defaultStd.buffer);
+  assert.equal(scratch.offset, 256);
+  assert.equal(scratch.size, 128);
+  assert.equal(scratch.alignedSize, 128);
+  assert.equal(scratch.isLargeSlab, false);
+  assert.equal(scratch.slabBucketSize, 0);
+  assert.equal(scratch.view, undefined);
+
+  // acquireUploadSlice(size, align, out) and acquire(size, { alignment, out }) / acquire(size, { out }) reuse scratch.
+  const r2 = pool.acquireUploadSlice(64, 256, scratch);
+  assert.equal(r2, scratch);
+  assert.equal(scratch.offset, 512);
+  assert.equal(scratch.size, 64);
+
+  const r3 = pool.acquire(32, { out: scratch });
+  assert.equal(r3, scratch);
+  assert.equal(scratch.offset, 576);
+  assert.equal(scratch.size, 32);
+
+  const r4 = pool.acquire(100, { align: 64, out: scratch });
+  assert.equal(r4, scratch);
+  assert.equal(scratch.offset, 640);
+  assert.equal(scratch.size, 100);
+  assert.equal(scratch.alignedSize, 100);
+
+  const r5 = pool.allocate(5, 4, scratch);
+  assert.equal(r5, scratch);
+  assert.equal(scratch.offset, 740);
+  assert.equal(scratch.size, 5);
+  assert.equal(scratch.alignedSize, 8);
+
+  // Large-slab acquisition sets isLargeSlab/slabBucketSize; subsequent standard acquire clears them cleanly!
+  const ySize = 3840 * 2160; // 8 MiB pow2 large slab
+  const rLarge = pool.acquire(ySize, { alignment: 256, out: scratch });
+  assert.equal(rLarge, scratch);
+  assert.equal(scratch.isLargeSlab, true);
+  assert.equal(scratch.slabBucketSize, 8 * MiB);
+  assert.equal(scratch.offset, 0);
+
+  // Explicit release(scratch) works with reused scratch object.
+  assert.equal(pool.release(scratch), true);
+
+  const rAfterLarge = pool.acquireSlice(64, 16, scratch);
+  assert.equal(rAfterLarge, scratch);
+  assert.equal(scratch.isLargeSlab, false, 'stale isLargeSlab must be cleared on scratch reuse');
+  assert.equal(scratch.slabBucketSize, 0, 'stale slabBucketSize must be cleared on scratch reuse');
+  assert.equal(scratch.view, undefined);
+  assert.equal(scratch.buffer, defaultStd.buffer);
+
+  // Null / undefined out behaves identically to omitted out and does not count as zero-alloc.
+  const freshViaNull = pool.acquireSlice(32, 4, null);
+  assert.notEqual(freshViaNull, scratch);
+  assert.deepEqual(Object.keys(freshViaNull).sort(), ['alignedSize', 'buffer', 'offset', 'size']);
+  const freshViaOpts = pool.acquire(32, { out: null });
+  assert.notEqual(freshViaOpts, scratch);
+
+  assert.equal(pool.getStats().zeroAllocAcquires, 7);
+  assert.equal(createdBuffers.length, 2); // 1x 4 MiB standard + 1x 8 MiB large slab
+  pool.endFrame();
+
+  // Validation errors and OOM must NOT mutate scratch or inflate zeroAllocAcquires.
+  const prevSnapshot = { ...scratch };
+  const prevZeroAlloc = pool.getStats().zeroAllocAcquires;
+  assert.throws(() => pool.acquireSlice(64, 4, 'not-an-object'), TypeError);
+  assert.throws(() => pool.acquireSlice(64, 4, []), TypeError);
+  assert.throws(() => pool.acquire(64, { out: 123 }), TypeError);
+  assert.throws(() => pool.acquire(64, { alignment: 16, align: 32, out: scratch }), RangeError);
+  assert.throws(() => pool.acquire(64, { out: scratch }, {}), RangeError);
+  assert.throws(() => pool.acquireSlice(128 * MiB, 256, scratch), RangeError);
+  assert.deepEqual(scratch, prevSnapshot);
+  assert.equal(pool.getStats().zeroAllocAcquires, prevZeroAlloc);
+
+  pool.destroy();
+});
+
+test('W319: stageBufferUpload & stageTextureUpload support reusable out scratch in both writeBuffer and mapped modes', () => {
+  // 1. writeBuffer mode: 30-frame 3D Main Menu upload loop with zero-alloc out scratch reuse.
+  const { device, createdBuffers } = createMockGpuDevice();
+  const pool = new GpuStagingPool({
+    device,
+    chunkSize: 16 * 1024,
+    maxPoolBytes: 128 * 1024,
+    maxFramesInFlight: 3,
+  });
+
+  const encoder = createMockEncoder();
+  const dstBuf = { id: 'menu-vb' };
+  const dstTex = { id: 'menu-ui-tex' };
+  const bufPayload = new Uint8Array(256).fill(0x3c);
+  const texPayload = new Uint8Array(16 * 4).fill(0x7a);
+
+  const bufOut = {};
+  const texOut = {};
+
+  for (let frame = 0; frame < 10; frame += 1) {
+    pool.beginFrame(frame);
+
+    const bRes = pool.stageBufferUpload(encoder, dstBuf, 0, bufPayload, bufOut);
+    assert.equal(bRes, bufOut);
+    assert.equal(bufOut.size, 256);
+    assert.equal(bufOut.srcByteLength, 256);
+
+    // Empty buffer upload populates out cleanly without inflating zeroAllocAcquires.
+    const emptyOut = { buffer: bufOut.buffer, offset: 99, size: 99, srcByteLength: 99 };
+    const eRes = pool.stageBufferUpload(encoder, dstBuf, 0, new Uint8Array(0), emptyOut);
+    assert.equal(eRes, emptyOut);
+    assert.equal(emptyOut.buffer, null);
+    assert.equal(emptyOut.offset, 0);
+    assert.equal(emptyOut.size, 0);
+    assert.equal(emptyOut.srcByteLength, 0);
+
+    const tRes = pool.stageTextureUpload(
+      encoder,
+      dstTex,
+      texPayload,
+      { width: 4, height: 4, bytesPerRow: 16 },
+      { out: texOut }
+    );
+    assert.equal(tRes, texOut);
+    assert.equal(texOut.bytesPerRow, 256);
+    assert.equal(texOut.size, 256 * 4);
+    assert.equal(texOut.buffer, bufOut.buffer, 'buffer and texture upload coalesce into same frame slab');
+
+    pool.endFrame();
+  }
+
+  assert.equal(createdBuffers.length, 3, '3-deep W283 ring preserved with zero steady-state churn');
+  const wbStats = pool.getStats();
+  assert.equal(wbStats.zeroAllocAcquires, 20, 'exactly 1 zeroAllocAcquire per non-empty upload');
+  assert.equal(wbStats.subAllocCoalesced, 10);
+
+  // Also verify layout.out form and validation on conflicting out.
+  pool.beginFrame(10);
+  const layoutOutRes = pool.stageTextureUpload(encoder, dstTex, texPayload, {
+    width: 4,
+    height: 4,
+    bytesPerRow: 16,
+    out: texOut,
+  });
+  assert.equal(layoutOutRes, texOut);
+  assert.throws(
+    () =>
+      pool.stageTextureUpload(
+        encoder,
+        dstTex,
+        texPayload,
+        { width: 4, height: 4, bytesPerRow: 16, out: texOut },
+        {}
+      ),
+    RangeError
+  );
+  assert.throws(() => pool.stageBufferUpload(encoder, dstBuf, 0, bufPayload, 'bad'), TypeError);
+  pool.endFrame();
+  pool.destroy();
+
+  // 2. mapped mode: scratch exposes live Uint8Array view and zero-pads tail bytes cleanly.
+  const mappedMock = createMockGpuDevice();
+  const mappedPool = new GpuStagingPool({
+    device: mappedMock.device,
+    chunkSize: 4096,
+    maxPoolBytes: 16 * 1024,
+    mode: STAGING_MODE.MAPPED,
+  });
+
+  mappedPool.beginFrame(0);
+  const mappedScratch = {};
+  const m1 = mappedPool.acquireUploadSlice(5, 16, mappedScratch);
+  assert.equal(m1, mappedScratch);
+  assert.ok(mappedScratch.view instanceof Uint8Array);
+  assert.equal(mappedScratch.view.byteLength, 5);
+  assert.equal(mappedScratch.alignedSize, 8);
+  mappedScratch.view.set([10, 20, 30, 40, 50]);
+
+  const m2 = mappedPool.acquireSlice(12, 16, mappedScratch);
+  assert.equal(m2, mappedScratch);
+  assert.equal(mappedScratch.offset, 16);
+  assert.equal(mappedScratch.view.byteLength, 12);
+  assert.equal(mappedPool.getStats().zeroAllocAcquires, 2);
+  mappedPool.endFrame();
+  mappedPool.destroy();
+});
+
+test('W319: trimForSceneTransition destroys idle oversized slabs after 4K Bink2 without touching active, in-flight, or warm standard chunks', async () => {
+  const MiB = 1024 * 1024;
+  const { device, createdBuffers, deferredFences } = createLightweight4kMockDevice({
+    enableWorkDoneFence: true,
+  });
+  const pool = new GpuStagingPool({
+    device,
+    chunkSize: 4 * MiB,
+    maxPoolBytes: 64 * MiB,
+    bucketStrategy: BUCKET_STRATEGY.POW2,
+    maxFramesInFlight: 3,
+    idleShrinkFrames: 120,
+    minWarmChunks: 1,
+  });
+
+  const y4kBytes = 3840 * 2160; // 8 MiB pow2 oversized slab (> 4 MiB default chunkSize)
+  const yHugeBytes = Math.ceil(8.3 * MiB); // 16 MiB pow2 oversized slab (> 4 MiB)
+  const chromaBytes = 2048 * 1080; // 4 MiB pow2 slab (=== chunkSize, NOT oversized)
+
+  // Frame 0: 4K Bink2 intro frame -> 1x 4 MiB std + 1x 4 MiB chroma + 1x 8 MiB Y + 1x 16 MiB slab (32 MiB).
+  pool.beginFrame(0);
+  const std0 = pool.allocate(4096, 256);
+  const chroma0 = pool.allocate(chromaBytes, 256);
+  const y0 = pool.allocate(y4kBytes, 256);
+  const huge0 = pool.allocate(yHugeBytes, 256);
+  pool.endFrame();
+
+  // Frame 1: another 8 MiB Y slab remains IN-FLIGHT (GPU fence NOT resolved yet).
+  pool.beginFrame(1);
+  const yInFlight = pool.allocate(y4kBytes, 256);
+  pool.endFrame();
+
+  // Frame 2: resolve ONLY frame 0's GPU fence so frame 0's slabs are GPU-completed (gpuDone === true),
+  // while frame 1's 8 MiB Y slab stays in-flight and frame 2 allocates an ACTIVE 8 MiB Y slab!
+  deferredFences[0].resolve();
+  await deferredFences[0].promise;
+  await Promise.resolve();
+
+  pool.beginFrame(2); // recycles frame 0 (std0, chroma0, y0, huge0); frame 1 yInFlight still in-flight!
+  const yActive = pool.allocate(y4kBytes, 256); // reuses recycled y0 -> now ACTIVE!
+  // Allocate a second 8 MiB slab on frame 2? No, y0 is now active; huge0 (16 MiB) is idle recycled,
+  // chroma0 (4 MiB) is idle recycled, std0 (4 MiB) is idle recycled, yInFlight (8 MiB) is in-flight.
+  // Total live: std0(4) + chroma0(4) + y0/yActive(8) + huge0(16) + yInFlight(8) = 40 MiB (peak = 40 MiB).
+  assert.equal(pool.getStats().allocatedBytes, 40 * MiB);
+  assert.equal(pool.getStats().peakAllocatedBytes, 40 * MiB);
+  assert.equal(pool.getStats().peakPoolUtilization, 40 / 64);
+
+  // Scene transition trim mid-frame 2: MUST destroy idle huge0 (16 MiB) immediately without
+  // touching active yActive (8 MiB), in-flight yInFlight (8 MiB), warm std0 (4 MiB), or 4 MiB chroma0!
+  const trim1 = pool.trimForSceneTransition();
+  assert.deepEqual(trim1, { reclaimedSlabs: 1, reclaimedBytes: 16 * MiB });
+  assert.equal(huge0.buffer.destroyCount, 1, 'idle oversized 16 MiB slab must be destroyed');
+  assert.equal(yActive.buffer.destroyCount, 0, 'active oversized slab must NEVER be destroyed');
+  assert.equal(yInFlight.buffer.destroyCount, 0, 'in-flight oversized slab must NEVER be destroyed');
+  assert.equal(std0.buffer.destroyCount, 0, 'warm standard 4 MiB chunk must stay alive');
+  assert.equal(chroma0.buffer.destroyCount, 0, '4 MiB (<= default chunkSize) slab must stay alive');
+
+  let stats = pool.getStats();
+  assert.equal(stats.sceneTransitionTrimBytes, 16 * MiB);
+  assert.equal(stats.allocatedBytes, 24 * MiB);
+  assert.equal(stats.peakAllocatedBytes, 40 * MiB, 'peak high-water mark preserved after trim');
+  assert.equal(stats.peakPoolUtilization, 40 / 64);
+  assert.equal(stats.idleSlabShrinks, 0, 'scene transition trim stays distinct from idleSlabShrinks');
+
+  // Now finish frame 2 and resolve both remaining GPU fences (frame 1 & frame 2), then trim with
+  // reclaimCompletedFirst: false (nothing newly recycled -> 0 reclaimed), followed by default
+  // trimForSceneTransition() which reclaims GPU-completed in-flight oversized slabs immediately!
+  pool.endFrame();
+  deferredFences[1].resolve();
+  deferredFences[2].resolve();
+  await Promise.all([deferredFences[1].promise, deferredFences[2].promise]);
+  await Promise.resolve();
+
+  const skipCompleted = pool.trimForSceneTransition({ reclaimCompletedFirst: false });
+  assert.deepEqual(skipCompleted, { reclaimedSlabs: 0, reclaimedBytes: 0 });
+  assert.equal(yActive.buffer.destroyCount, 0);
+  assert.equal(yInFlight.buffer.destroyCount, 0);
+
+  // Default reclaimCompletedFirst: true reclaims both completed 8 MiB Y slabs (16 MiB) right away!
+  const trim2 = pool.trimForSceneTransition();
+  assert.deepEqual(trim2, { reclaimedSlabs: 2, reclaimedBytes: 16 * MiB });
+  assert.equal(yActive.buffer.destroyCount, 1);
+  assert.equal(yInFlight.buffer.destroyCount, 1);
+  assert.equal(std0.buffer.destroyCount, 0);
+  assert.equal(chroma0.buffer.destroyCount, 0);
+
+  stats = pool.getStats();
+  assert.equal(stats.sceneTransitionTrimBytes, 32 * MiB);
+  assert.equal(stats.allocatedBytes, 8 * MiB); // std0 (4 MiB) + chroma0 (4 MiB)
+
+  // Calling trimForSceneTransition({ includeAllLargeSlabs: true }) also trims <= chunkSize large slabs
+  // while STILL keeping standard 4 MiB chunk warm for immediate 30 FPS Main Menu draws!
+  const trim3 = pool.trimForSceneTransition({ includeAllLargeSlabs: true });
+  assert.deepEqual(trim3, { reclaimedSlabs: 1, reclaimedBytes: 4 * MiB });
+  assert.equal(chroma0.buffer.destroyCount, 1);
+  assert.equal(std0.buffer.destroyCount, 0);
+  assert.equal(pool.getStats().sceneTransitionTrimBytes, 36 * MiB);
+  assert.equal(pool.getStats().allocatedBytes, 4 * MiB);
+
+  // Subsequent 3D Main Menu frame reuses warm std0 with ZERO new GPUBuffer allocations!
+  const beforeMenuBuffers = createdBuffers.length;
+  pool.beginFrame(3);
+  const menuScratch = {};
+  pool.acquireSlice(1024, 256, menuScratch);
+  assert.equal(menuScratch.buffer, std0.buffer);
+  assert.equal(createdBuffers.length, beforeMenuBuffers);
+  pool.endFrame();
+
+  // Option validation & non-bucketed oversized chunk + keepOversizedSlabs LRU test.
+  assert.throws(() => pool.trimForSceneTransition('bad'), TypeError);
+  assert.throws(() => pool.trimForSceneTransition([]), TypeError);
+  assert.throws(() => pool.trimForSceneTransition({ maxRetainedSlabBytes: 0 }), RangeError);
+  assert.throws(() => pool.trimForSceneTransition({ includeAllLargeSlabs: 1 }), TypeError);
+  assert.throws(() => pool.trimForSceneTransition({ reclaimCompletedFirst: 'yes' }), TypeError);
+  assert.throws(() => pool.trimForSceneTransition({ keepOversizedSlabs: -1 }), RangeError);
+
+  pool.destroy();
+  assert.throws(() => pool.trimForSceneTransition(), /destroyed/i);
+
+  // Non-bucketed oversized chunks trim cleanly with keepOversizedSlabs retaining the newest slab,
+  // and custom maxRetainedSlabBytes trims slabs above the caller-supplied byte ceiling.
+  const nbMock = createMockGpuDevice();
+  const nbPool = new GpuStagingPool({
+    device: nbMock.device,
+    chunkSize: 512,
+    maxPoolBytes: 8192,
+    maxFramesInFlight: 2,
+    minWarmChunks: 1,
+    largeSlabBuckets: [],
+  });
+  nbPool.beginFrame(0);
+  const olderOv = nbPool.allocate(1024, 4);
+  nbPool.endFrame();
+  nbPool.beginFrame(1);
+  const newerOv = nbPool.allocate(1024, 4);
+  assert.notEqual(newerOv.buffer, olderOv.buffer);
+  nbPool.endFrame();
+  nbPool.beginFrame(3); // both frame 0 and frame 1 oversized chunks are now idle
+
+  const partialTrim = nbPool.trimForSceneTransition({ keepOversizedSlabs: 1 });
+  assert.deepEqual(partialTrim, { reclaimedSlabs: 1, reclaimedBytes: 1024 });
+  assert.equal(olderOv.buffer.destroyCount, 1, 'LRU oldest oversized slab destroyed first');
+  assert.equal(newerOv.buffer.destroyCount, 0, 'newest oversized slab kept by keepOversizedSlabs=1');
+
+  const finalTrim = nbPool.trimForSceneTransition();
+  assert.deepEqual(finalTrim, { reclaimedSlabs: 1, reclaimedBytes: 1024 });
+  assert.equal(newerOv.buffer.destroyCount, 1);
+  assert.equal(nbPool.getStats().allocatedBytes, 0);
+  assert.equal(nbPool.getStats().sceneTransitionTrimBytes, 2048);
+
+  // Custom maxRetainedSlabBytes trims even 512B chunks when ceiling is lowered to 256B.
+  const stdNb = nbPool.allocate(64, 4); // 512B standard chunk
+  nbPool.endFrame();
+  nbPool.beginFrame(5); // stdNb recycled
+  const customCeilingTrim = nbPool.trimForSceneTransition({ maxRetainedSlabBytes: 256 });
+  assert.deepEqual(customCeilingTrim, { reclaimedSlabs: 1, reclaimedBytes: 512 });
+  assert.equal(stdNb.buffer.destroyCount, 1);
+  assert.equal(nbPool.getStats().sceneTransitionTrimBytes, 2048 + 512);
+  nbPool.destroy();
+});
+
+test('W319: peakPoolUtilization clamps to [0, 1], resetStats clears W319 telemetry cleanly, and classic-worker IIFE stays isolated', () => {
+  const MiB = 1024 * 1024;
+  const { device } = createLightweight4kMockDevice();
+  const pool = new GpuStagingPool({
+    device,
+    chunkSize: 4 * MiB,
+    maxPoolBytes: 16 * MiB,
+    bucketStrategy: BUCKET_STRATEGY.POW2,
+    maxFramesInFlight: 1,
+  });
+
+  // Initial state: all W319 metrics are 0 and JSON-serializable.
+  const initStats = pool.getStats();
+  assert.equal(initStats.zeroAllocAcquires, 0);
+  assert.equal(initStats.sceneTransitionTrimBytes, 0);
+  assert.equal(initStats.peakPoolUtilization, 0);
+  const initRoundTrip = JSON.parse(JSON.stringify(initStats));
+  assert.equal(initRoundTrip.zeroAllocAcquires, 0);
+  assert.equal(initRoundTrip.sceneTransitionTrimBytes, 0);
+  assert.equal(initRoundTrip.peakPoolUtilization, 0);
+
+  // Frame 0: allocate 4 MiB standard (25%) + 8 MiB oversized (75% total -> 12 / 16 MiB = 0.75).
+  const scratch = {};
+  pool.beginFrame(0);
+  pool.acquireSlice(1024, 16, scratch);
+  assert.equal(pool.getStats().peakPoolUtilization, 0.25);
+  pool.acquireUploadSlice(3840 * 2160, 256, scratch);
+  assert.equal(pool.getStats().peakPoolUtilization, 0.75);
+  assert.equal(pool.getStats().zeroAllocAcquires, 2);
+  pool.endFrame();
+
+  // Frame 1: trim idle 8 MiB slab -> live drops to 4 MiB (0.25), peak stays 0.75!
+  pool.beginFrame(1);
+  const trimmed = pool.trimForSceneTransition();
+  assert.deepEqual(trimmed, { reclaimedSlabs: 1, reclaimedBytes: 8 * MiB });
+  const preReset = pool.getStats();
+  assert.equal(preReset.allocatedBytes, 4 * MiB);
+  assert.equal(preReset.peakAllocatedBytes, 12 * MiB);
+  assert.equal(preReset.peakPoolUtilization, 0.75);
+  assert.equal(preReset.zeroAllocAcquires, 2);
+  assert.equal(preReset.sceneTransitionTrimBytes, 8 * MiB);
+
+  // Sanitization & clamping guard: corrupt internal values stay clamped to [0, 1] / non-negative ints.
+  pool._peakAllocatedBytes = 64 * MiB; // > maxPoolBytes (16 MiB)
+  assert.equal(pool.getStats().peakPoolUtilization, 1);
+  pool._peakAllocatedBytes = -1024;
+  assert.equal(pool.getStats().peakPoolUtilization, 0);
+  pool._peakAllocatedBytes = Number.NaN;
+  assert.equal(pool.getStats().peakPoolUtilization, 0);
+  pool._peakAllocatedBytes = Number.POSITIVE_INFINITY;
+  assert.equal(pool.getStats().peakPoolUtilization, 0);
+  pool._zeroAllocAcquires = -7;
+  pool._sceneTransitionTrimBytes = Number.NaN;
+  assert.equal(pool.getStats().zeroAllocAcquires, 0);
+  assert.equal(pool.getStats().sceneTransitionTrimBytes, 0);
+
+  // Restore valid counters before resetStats() verification.
+  pool._peakAllocatedBytes = 12 * MiB;
+  pool._zeroAllocAcquires = 2;
+  pool._sceneTransitionTrimBytes = 8 * MiB;
+
+  // resetStats() clears zeroAllocAcquires & sceneTransitionTrimBytes to 0 and re-baselines
+  // peakPoolUtilization to live allocatedBytes / maxPoolBytes (4 MiB / 16 MiB = 0.25).
+  const postReset = pool.resetStats();
+  assert.equal(postReset.zeroAllocAcquires, 0);
+  assert.equal(postReset.sceneTransitionTrimBytes, 0);
+  assert.equal(postReset.allocatedBytes, 4 * MiB);
+  assert.equal(postReset.peakAllocatedBytes, 4 * MiB);
+  assert.equal(postReset.peakPoolUtilization, 0.25);
+
+  // Full saturation hits exact 1.0 peakPoolUtilization.
+  pool.acquire(3840 * 2160, { out: scratch }); // +8 MiB = 12 MiB
+  pool.acquire(2048 * 1080, { out: scratch }); // +4 MiB = 16 MiB (100% of maxPoolBytes)
+  assert.equal(pool.getStats().peakPoolUtilization, 1);
+  assert.equal(pool.getStats().zeroAllocAcquires, 2);
+
+  // After destroy() + resetStats(), peakPoolUtilization clears cleanly to 0.
+  pool.destroy();
+  const destroyedReset = pool.resetStats();
+  assert.equal(destroyedReset.zeroAllocAcquires, 0);
+  assert.equal(destroyedReset.sceneTransitionTrimBytes, 0);
+  assert.equal(destroyedReset.peakPoolUtilization, 0);
+
+  // Classic-worker importScripts IIFE exports W319 methods cleanly without leaking internals.
+  const source = fs.readFileSync(
+    new URL('../web/workers/staging_pool.js', import.meta.url),
+    'utf8'
+  );
+  const sandbox = {
+    Uint8Array,
+    ArrayBuffer,
+    SharedArrayBuffer,
+    DataView,
+    Float32Array,
+    Math,
+    Number,
+    Object,
+    Set,
+    Map,
+    Array,
+    Promise,
+    Error,
+    TypeError,
+    RangeError,
+    JSON,
+    Infinity,
+  };
+  sandbox.self = sandbox;
+  sandbox.globalThis = sandbox;
+  const ctx = vm.createContext(sandbox);
+  vm.runInContext(source, ctx, { filename: 'staging_pool.js' });
+  const proto = ctx.PlayGta6StagingPool.GpuStagingPool.prototype;
+  assert.equal(typeof proto.acquire, 'function');
+  assert.equal(typeof proto.acquireSlice, 'function');
+  assert.equal(typeof proto.acquireUploadSlice, 'function');
+  assert.equal(typeof proto.trimForSceneTransition, 'function');
+});
+
