@@ -398,6 +398,14 @@ struct XMemWindowContiguity {
 };
 XMemWindowContiguity xmem_window_contiguity();
 void xmem_reset_for_testing();
+// Writes `len` bytes into physical pages, page after page (DirectStorage
+// DestinationIsPhysicalPages). `entry_at(i, &e)` yields the i-th page entry: a physical address
+// (frame number << 12, page-aligned) or, failing that, a frame number as XMemAllocatePhysicalPages
+// returns it. Each entry takes min(page size, bytes left). All entries are resolved before any
+// byte is written: false (nothing written) when an entry cannot be read or names no live page.
+bool xmem_write_physical_pages(const std::function<bool(size_t index, uint64_t* entry)>& entry_at,
+                               const uint8_t* data,
+                               size_t len);
 
 // DirectStorage backing hooks (in-memory virtual file table + host read callback + HTTPFS fallback).
 using DStorageHostOpenCallback = std::function<int64_t(std::string_view normalized_path)>;
