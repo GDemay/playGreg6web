@@ -75,6 +75,7 @@
 #include "gpu/d3d12_xs_dump.h"
 #include "gpu/d3d12_xs_xbox.h"
 #include "gpu/descriptor_heap.h"
+#include "gpu/log_rate_limiter.h"
 #include "gpu/pso_cache.h"
 #include "gpu/shader_pack_index.h"
 #include "gpu/stage_reflection.h"
@@ -918,6 +919,7 @@ private:
 
     mutable std::mutex diag_mutex_;
     std::vector<std::string> diags_;
+    LogRateLimiter bad_arg_log_;  // guarded by diag_mutex_
     std::atomic<uint64_t> bad_arguments_{0};
 
     HResult create_resource(const GuestResourceDesc& desc, const GuestHeapProperties& heap, uint32_t heap_flags,
