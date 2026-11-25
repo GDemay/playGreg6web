@@ -209,9 +209,36 @@
         return;
       }
       const clamped = bytes > this._capacityBytes ? this._capacityBytes : Math.floor(bytes);
-      if (clamped > this._peakOccupancyBytes) {
+      const currentPeak = sanitizeNonNegInt(this._peakOccupancyBytes);
+      if (clamped > currentPeak) {
         this._peakOccupancyBytes = clamped;
       }
+    }
+
+    get highWatermarkBytes() {
+      return Math.min(this._capacityBytes, sanitizeNonNegInt(this._peakOccupancyBytes));
+    }
+
+    get peakUtilizationPct() {
+      if (this._capacityBytes <= 0) {
+        return 0;
+      }
+      return Math.min(
+        100,
+        sanitizeNonNegNumber((this.highWatermarkBytes / this._capacityBytes) * 100)
+      );
+    }
+
+    get batchesDrained() {
+      return sanitizeNonNegInt(this._batchesDrained);
+    }
+
+    get packetsDrained() {
+      return sanitizeNonNegInt(this._packetsDrained);
+    }
+
+    get backpressureWaits() {
+      return sanitizeNonNegInt(this._backpressureWaits);
     }
 
     get sab() {
@@ -372,24 +399,42 @@
 
     /**
      * Drains up to `maxPackets` complete framed GpuPacketHeader packets in a single
-     * bounded batch, publishing the updated `read_pos` once atomically at batch end.
+     * bounded batch, reading `write_pos` once via `Atomics.load` and publishing the
+     * updated `read_pos` once via `Atomics.store` at batch end (zero extra atomics
+     * inside the per-packet loop).
+     *
+     * Supports both call signatures for ergonomic and backwards-compatible usage:
+     *   - `drainBatch(handler, maxPackets = 256)`
+     *   - `drainBatch(maxPackets, handler)`
+     *
      * - Non-wrapping packets are passed as zero-copy subarrays directly over the SAB.
      * - Only a packet that physically straddles the ring wrap boundary is linearized
      *   into the reusable internal scratch buffer.
+     * - Returning `false` from `handler` stops the batch cleanly after committing
+     *   the current packet.
      * - If `handler` throws mid-batch, only packets that completed prior to the error
      *   are committed via `read_pos`; the failing packet and all subsequent packets
      *   remain unread in the ring.
      * - Views (`packet.bytes` / `packet.payload`) are only guaranteed valid for the
      *   duration of the `handler` call; copy them if retaining across drains.
      *
-     * @param {(packet: {opcode: number, flags: number, payloadBytes: number, payload: Uint8Array, bytes: Uint8Array, byteLength: number, wrapped: boolean}, index: number) => void} handler
-     * @param {number} [maxPackets=256]
+     * @param {((packet: {opcode: number, flags: number, payloadBytes: number, payload: Uint8Array, bytes: Uint8Array, byteLength: number, wrapped: boolean}, index: number) => (boolean|void)) | number} handlerOrMaxPackets
+     * @param {number | ((packet: {opcode: number, flags: number, payloadBytes: number, payload: Uint8Array, bytes: Uint8Array, byteLength: number, wrapped: boolean}, index: number) => (boolean|void))} [maxPacketsOrHandler]
      * @returns {{packets: number, bytes: number, remainingBytes: number, wrapped: boolean}}
      */
-    drainBatch(handler, maxPackets = DEFAULT_BATCH_MAX_PACKETS) {
-      if (typeof handler !== 'function') {
+    drainBatch(handlerOrMaxPackets, maxPacketsOrHandler) {
+      let handler;
+      let maxPackets;
+      if (typeof handlerOrMaxPackets === 'function') {
+        handler = handlerOrMaxPackets;
+        maxPackets = maxPacketsOrHandler;
+      } else if (typeof maxPacketsOrHandler === 'function') {
+        maxPackets = handlerOrMaxPackets;
+        handler = maxPacketsOrHandler;
+      } else {
         throw new TypeError('GpuRingBuffer.drainBatch requires a handler function');
       }
+
       let limit;
       if (maxPackets === undefined || maxPackets === null) {
         limit = DEFAULT_BATCH_MAX_PACKETS;
@@ -479,7 +524,7 @@
             payload = this._scratch.subarray(GPU_PACKET_HEADER_BYTES, packetLen);
           }
 
-          handler(
+          const shouldContinue = handler(
             {
               opcode,
               flags,
@@ -495,6 +540,9 @@
           cursor += packetLen;
           completedBytes = cursor;
           completedPackets += 1;
+          if (shouldContinue === false) {
+            break;
+          }
         }
       } finally {
         if (completedBytes > 0) {
@@ -522,16 +570,20 @@
       };
     }
 
-    reset() {
-      Atomics.store(this._headerU32, HEADER_INDEX.WRITE_POS, 0);
-      Atomics.store(this._headerU32, HEADER_INDEX.READ_POS, 0);
-      Atomics.store(this._headerU32, HEADER_INDEX.DROPPED_PACKETS, 0);
-      Atomics.store(this._headerU32, HEADER_INDEX.NOTIFY_SEQ, 0);
+    resetTelemetry() {
       this._batchesDrained = 0;
       this._packetsDrained = 0;
       this._maxBatchSize = 0;
       this._backpressureWaits = 0;
       this._peakOccupancyBytes = 0;
+    }
+
+    reset() {
+      Atomics.store(this._headerU32, HEADER_INDEX.WRITE_POS, 0);
+      Atomics.store(this._headerU32, HEADER_INDEX.READ_POS, 0);
+      Atomics.store(this._headerU32, HEADER_INDEX.DROPPED_PACKETS, 0);
+      Atomics.store(this._headerU32, HEADER_INDEX.NOTIFY_SEQ, 0);
+      this.resetTelemetry();
     }
 
     getStats() {
@@ -551,6 +603,22 @@
         this._capacityBytes,
         sanitizeNonNegInt(this._peakOccupancyBytes)
       );
+      const highWatermarkBytes = peakOccupancyBytes;
+      const peakUtilizationPct =
+        this._capacityBytes > 0
+          ? Math.min(
+              100,
+              sanitizeNonNegNumber((highWatermarkBytes / this._capacityBytes) * 100)
+            )
+          : 0;
+      const clampedAvailable = Math.min(this._capacityBytes, availableBytes);
+      const utilizationPct =
+        this._capacityBytes > 0
+          ? Math.min(
+              100,
+              sanitizeNonNegNumber((clampedAvailable / this._capacityBytes) * 100)
+            )
+          : 0;
       return {
         capacityBytes: this._capacityBytes,
         availableBytes,
@@ -565,6 +633,9 @@
         packetsDrained,
         backpressureWaits,
         peakOccupancyBytes,
+        highWatermarkBytes,
+        peakUtilizationPct,
+        utilizationPct,
       };
     }
   }
