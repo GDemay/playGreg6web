@@ -20,13 +20,16 @@ const {
   DEFAULT_MAX_TRACKED_MISSING_HASHES,
   DEFAULT_MAX_CATEGORIZED_MISSING_HASHES,
   DEFAULT_MAX_RESOLVE_CACHE_ENTRIES,
+  DEFAULT_MAX_COMPILE_FAILURE_ENTRIES,
   DEFAULT_TOP_MISSING_LIMIT,
   DEFAULT_MISSING_SUMMARY_TOP_LIMIT,
   normalizeShaderHash,
   formatShaderHash,
   normalizeStage,
   normalizeMissingReason,
+  sanitizeCompileFailureReason,
   normalizeFallbackProfile,
+  selectDeterministicFallbackProfile,
   getBuiltInFallbackProfiles,
   ShaderFallbackRouter,
 } = routerMod;
@@ -393,6 +396,9 @@ test('getStats reports hitRatePct from pack hits and reset clears telemetry', ()
     overflowMissingHashes: 0,
     hitRatePct: 0,
     hitRatio: 0,
+    compileFailureEntries: 0,
+    compileFailureCacheHits: 0,
+    compileFailureRecorded: 0,
   });
   assert.deepEqual(router.getMissingReport(), []);
 
@@ -1940,4 +1946,408 @@ test('W204 classic Worker importScripts isolation exposes W204 APIs with zero gl
   assert.equal(typeof r.setFrame, 'function');
   assert.equal(typeof r.advanceFrame, 'function');
   assert.equal(typeof r.getCurrentFrame, 'function');
+});
+
+// ---------------------------------------------------------------------------
+// W268 Bounded negative compile-failure LRU cache & deterministic fallback routing
+// ---------------------------------------------------------------------------
+
+test('W268 recordMissingShader(compile_failed) populates negative compile-failure cache and ignores non-compile reasons', () => {
+  assert.equal(DEFAULT_MAX_COMPILE_FAILURE_ENTRIES, 2048);
+
+  let clock = 2000;
+  const router = new ShaderFallbackRouter({
+    now: () => {
+      clock += 5;
+      return clock;
+    },
+  });
+
+  const brokenHash = '0x00000000deadb001';
+  const missingHash = '0x00000000deadb002';
+  const reflHash = '0x00000000deadb003';
+  const otherHash = '0x00000000deadb004';
+
+  // Non-compile failure reasons do NOT enter the negative compile-failure cache.
+  router.recordMissingShader(missingHash, 'fragment', 'not_in_pack');
+  router.recordMissingShader(missingHash, 'fragment', 'missing_pack_entry');
+  router.recordMissingShader(reflHash, 'vertex', 'reflection_failed');
+  router.recordMissingShader(otherHash, 'compute', 'other');
+  assert.equal(router.hasCompileFailure(missingHash), false);
+  assert.equal(router.hasCompileFailure(reflHash), false);
+  assert.equal(router.hasCompileFailure(otherHash), false);
+  assert.equal(router.getStats().compileFailureEntries, 0);
+  assert.equal(router.getStats().compileFailureRecorded, 0);
+  assert.equal(router.getStats().compileFailureCacheHits, 0);
+
+  // compile_failed (and aliases) record into the negative compile-failure cache keyed by canonical hash.
+  router.recordMissingShader(brokenHash, 'fragment', 'compile_failed');
+  router.recordMissingShader(0xdeadb001n, SHADER_STAGE.FRAGMENT, 'wgsl_compile_failed');
+  router.recordMissingShader('deadb001', 'fs', 'compilation_failed');
+
+  let stats = router.getStats();
+  assert.equal(stats.compileFailureEntries, 1);
+  assert.equal(stats.compileFailureRecorded, 3);
+  assert.equal(stats.compileFailureCacheHits, 0);
+
+  // Queries across hex, BigInt, bare hex, and safe integer all hit the same canonical entry.
+  assert.equal(router.hasCompileFailure(brokenHash), true);
+  assert.equal(router.hasCompileFailure(0xdeadb001n), true);
+  assert.equal(router.hasCompileFailure('DEADB001'), true);
+  assert.equal(router.hasCompileFailure(0xdeadb001), true);
+  assert.equal(router.hasCompileFailure(null), false);
+  assert.equal(router.hasCompileFailure(undefined), false);
+  assert.equal(router.hasCompileFailure(''), false);
+
+  stats = router.getStats();
+  assert.equal(stats.compileFailureEntries, 1);
+  assert.equal(stats.compileFailureRecorded, 3);
+  assert.equal(stats.compileFailureCacheHits, 4);
+
+  // getCompileFailure returns a mutation-isolated sanitized snapshot without changing hit counters.
+  const entry = router.getCompileFailure(brokenHash);
+  assert.deepEqual(entry, {
+    hashHex: brokenHash,
+    stage: 'fragment',
+    reason: 'compile_failed',
+    count: 3,
+    firstSeenMs: 2025,
+    lastSeenMs: 2035,
+  });
+  entry.reason = 'mutated';
+  assert.equal(router.getCompileFailure(brokenHash).reason, 'compile_failed');
+  assert.equal(router.getStats().compileFailureCacheHits, 4);
+  assert.equal(router.getCompileFailure(null), null);
+  assert.equal(router.getCompileFailure(missingHash), null);
+});
+
+test('W268 sanitizeCompileFailureReason and recordCompileFailure store sanitized reasons only', () => {
+  assert.equal(sanitizeCompileFailureReason('compile_failed'), 'compile_failed');
+  assert.equal(sanitizeCompileFailureReason('missing_pack_entry'), 'missing_pack_entry');
+  assert.equal(sanitizeCompileFailureReason('TINT-VALIDATION-FAILED'), 'tint_validation_failed');
+  assert.equal(sanitizeCompileFailureReason(''), 'compile_failed');
+  assert.equal(sanitizeCompileFailureReason(null), 'compile_failed');
+  assert.equal(sanitizeCompileFailureReason(undefined), 'compile_failed');
+  // Host paths and raw WGSL snippets are stripped down to safe default token.
+  assert.equal(sanitizeCompileFailureReason('C:\\Users\\dev\\game\\shader.wgsl: line 42'), 'compile_failed');
+  assert.equal(sanitizeCompileFailureReason('@fragment fn fs_main() { error }'), 'compile_failed');
+
+  const router = new ShaderFallbackRouter({ now: () => 500 });
+  const rec1 = router.recordCompileFailure('0x000000000000c001', 'fragment', 'missing_pack_entry');
+  assert.equal(rec1.hashHex, '0x000000000000c001');
+  assert.equal(rec1.stage, 'fragment');
+  assert.equal(rec1.reason, 'missing_pack_entry');
+  assert.equal(rec1.cached, true);
+
+  const rec2 = router.recordCompileFailure('0x000000000000c002', {
+    stage: 'vertex',
+    reason: 'C:\\secret\\host\\path\\bad.wgsl',
+  });
+  assert.equal(rec2.reason, 'compile_failed');
+  assert.equal(router.getCompileFailure('0x000000000000c002').reason, 'compile_failed');
+
+  const serialized = JSON.stringify([
+    router.getCompileFailure('0x000000000000c001'),
+    router.getCompileFailure('0x000000000000c002'),
+  ]);
+  assert.equal(serialized.includes('secret'), false);
+  assert.equal(serialized.includes('bad.wgsl'), false);
+});
+
+test('W268 negative compile-failure cache enforces maxCompileFailureEntries with LRU eviction and clear helpers', () => {
+  assert.throws(
+    () => new ShaderFallbackRouter({ maxCompileFailureEntries: -1 }),
+    /maxCompileFailureEntries/
+  );
+  assert.throws(
+    () => new ShaderFallbackRouter({ maxCompileFailureEntries: 2.5 }),
+    /maxCompileFailureEntries/
+  );
+  assert.throws(
+    () => new ShaderFallbackRouter({ maxCompileFailureEntries: '4' }),
+    /maxCompileFailureEntries/
+  );
+
+  // maxCompileFailureEntries: 0 disables caching while still counting recorded failures.
+  const zeroCache = new ShaderFallbackRouter({ maxCompileFailureEntries: 0, now: () => 1 });
+  zeroCache.recordMissingShader('0x0000000000000001', 'vertex', 'compile_failed');
+  assert.equal(zeroCache.hasCompileFailure('0x0000000000000001'), false);
+  assert.equal(zeroCache.getStats().compileFailureEntries, 0);
+  assert.equal(zeroCache.getStats().compileFailureRecorded, 1);
+  assert.equal(zeroCache.getStats().compileFailureCacheHits, 0);
+
+  // Bounded LRU cache of size 2: touching A makes B the LRU victim when C arrives.
+  const router = new ShaderFallbackRouter({ maxCompileFailureEntries: 2, now: () => 10 });
+  const hA = '0x000000000000000a';
+  const hB = '0x000000000000000b';
+  const hC = '0x000000000000000c';
+
+  router.recordMissingShader(hA, 'vertex', 'compile_failed');
+  router.recordMissingShader(hB, 'fragment', 'compile_failed');
+  assert.equal(router.getStats().compileFailureEntries, 2);
+
+  // Querying hA promotes hA to MRU, leaving hB as LRU.
+  assert.equal(router.hasCompileFailure(hA), true);
+  assert.equal(router.getStats().compileFailureCacheHits, 1);
+
+  // Inserting hC evicts hB (LRU), keeping hA and hC.
+  router.recordMissingShader(hC, 'compute', 'compile_failed');
+  assert.equal(router.getStats().compileFailureEntries, 2);
+  assert.equal(router.hasCompileFailure(hB), false);
+  assert.equal(router.hasCompileFailure(hA), true);
+  assert.equal(router.hasCompileFailure(hC), true);
+  assert.equal(router.getStats().compileFailureCacheHits, 3);
+
+  // clearCompileFailure removes a single entry and returns boolean status.
+  assert.equal(router.clearCompileFailure(hA), true);
+  assert.equal(router.clearCompileFailure(hA), false);
+  assert.equal(router.clearCompileFailure(null), false);
+  assert.equal(router.hasCompileFailure(hA), false);
+  assert.equal(router.getStats().compileFailureEntries, 1);
+
+  // clearCompileFailures removes remaining entries while keeping cumulative hit/record counters.
+  assert.equal(router.clearCompileFailures(), 1);
+  assert.equal(router.clearCompileFailures(), 0);
+  assert.equal(router.getStats().compileFailureEntries, 0);
+  assert.equal(router.getStats().compileFailureCacheHits, 3);
+  assert.equal(router.getStats().compileFailureRecorded, 3);
+});
+
+test('W268 resolve skips known compile-failed pack shaders without spamming retries and resumes after clear', () => {
+  const brokenPackHash = '0x00000000bad00001';
+  const healthyPackHash = '0x00000000cafe0002';
+  const brokenWgsl = '@fragment fn fs_broken() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }';
+
+  let packQueries = 0;
+  const backing = createMapPackLoader({
+    [brokenPackHash]: brokenWgsl,
+    [healthyPackHash]: PACK_VS_WGSL,
+  });
+  const router = new ShaderFallbackRouter({
+    packLoader: {
+      getSource(key) {
+        packQueries += 1;
+        return backing.get(key);
+      },
+    },
+    defaultProfile: 'splash_rect_24b',
+    now: () => 300,
+  });
+
+  // Initial resolve returns pack WGSL (and memoizes it in W204 resolve cache).
+  const initial = router.resolve(brokenPackHash, 'fragment');
+  assert.equal(initial.source, 'pack');
+  assert.equal(initial.wgsl, brokenWgsl);
+  assert.equal(router.resolve(healthyPackHash, 'vertex').source, 'pack');
+
+  // Tint rejects brokenPackHash -> recordMissingShader('compile_failed') evicts stale pack cache entry.
+  router.recordMissingShader(brokenPackHash, 'fragment', 'compile_failed');
+  const queriesAfterFailure = packQueries;
+
+  // Next 64 draws must NEVER re-query packLoader or return brokenWgsl; route straight to fallback.
+  const profiles = getBuiltInFallbackProfiles();
+  for (let i = 0; i < 64; i += 1) {
+    const res = router.resolve(brokenPackHash, 'fragment', {
+      bindingSignature: { hasTexture: true, hasSampler: true },
+    });
+    assert.equal(res.source, 'builtin');
+    assert.equal(res.profile, 'textured_quad_24b');
+    assert.equal(res.wgsl, profiles.textured_quad_24b.fragment);
+    assert.equal(res.compileFailureCached, true);
+    assert.equal(res.compileFailureReason, 'compile_failed');
+  }
+  assert.equal(
+    packQueries,
+    queriesAfterFailure,
+    'negative compile-failure cache must skip packLoader lookups on subsequent draws'
+  );
+
+  // Healthy sibling shader stays memoized and unaffected.
+  assert.equal(router.resolve(healthyPackHash, 'vertex').source, 'pack');
+  assert.equal(packQueries, queriesAfterFailure);
+
+  const stats = router.getStats();
+  assert.equal(stats.compileFailureEntries, 1);
+  assert.equal(stats.compileFailureRecorded, 1);
+  assert.equal(stats.compileFailureCacheHits, 64);
+
+  // Clearing the compile failure restores normal pack resolution.
+  assert.equal(router.clearCompileFailure(brokenPackHash), true);
+  const recovered = router.resolve(brokenPackHash, 'fragment');
+  assert.equal(recovered.source, 'pack');
+  assert.equal(recovered.wgsl, brokenWgsl);
+  assert.equal(recovered.compileFailureCached, undefined);
+
+  // If an S9 fallback hash itself fails compilation, resolve degrades safely to built-in WGSL.
+  const s9Router = new ShaderFallbackRouter({
+    packLoader: createS9PackLoader(),
+    fallbackHashes: S9_FALLBACK_HASHES,
+    now: () => 400,
+  });
+  assert.equal(s9Router.resolve('0x1111111122222222', 'fragment').source, 'fallback');
+  s9Router.recordMissingShader(S9_FALLBACK_HASHES.fragment, 'fragment', 'compile_failed');
+  const degraded = s9Router.resolve('0x1111111122222222', 'fragment', {
+    bindingSignature: { hasCbv: true },
+  });
+  assert.equal(degraded.source, 'builtin');
+  assert.equal(degraded.profile, 'fullscreen_triangle_cbv');
+  assert.equal(degraded.wgsl, profiles.fullscreen_triangle_cbv.fragment);
+});
+
+test('W268 deterministic fallback profile routing maps stage + bindingSignature across UI, vertex-colored, fullscreen, and compute', () => {
+  // Compute stage always routes deterministically to compute no-op ('default').
+  assert.equal(selectDeterministicFallbackProfile('compute', null), 'default');
+  assert.equal(
+    selectDeterministicFallbackProfile(SHADER_STAGE.COMPUTE, {
+      hasCbv: true,
+      hasTexture: true,
+      hasVertexColor: true,
+    }),
+    'default'
+  );
+
+  // Vertex-colored UI or CBV+texture pass -> splash_rect_24b.
+  assert.equal(
+    selectDeterministicFallbackProfile('vertex', { hasVertexColor: true }),
+    'splash_rect_24b'
+  );
+  assert.equal(
+    selectDeterministicFallbackProfile('fragment', { hasCbv: true, hasTexture: true }),
+    'splash_rect_24b'
+  );
+  assert.equal(
+    selectDeterministicFallbackProfile('vertex', { attributeCount: 3 }),
+    'splash_rect_24b'
+  );
+
+  // Textured UI / 24-byte vertex stride -> textured_quad_24b.
+  assert.equal(
+    selectDeterministicFallbackProfile('fragment', { hasTexture: true, hasSampler: true }),
+    'textured_quad_24b'
+  );
+  assert.equal(
+    selectDeterministicFallbackProfile('vertex', { vertexStride: 24 }),
+    'textured_quad_24b'
+  );
+
+  // Fullscreen pass with CBV or vertexCount===3 -> fullscreen_triangle_cbv.
+  assert.equal(
+    selectDeterministicFallbackProfile('vertex', { hasCbv: true }),
+    'fullscreen_triangle_cbv'
+  );
+  assert.equal(
+    selectDeterministicFallbackProfile('fragment', { vertexCount: 3 }),
+    'fullscreen_triangle_cbv'
+  );
+
+  // Minimal / empty signature -> default.
+  assert.equal(selectDeterministicFallbackProfile('vertex', {}), 'default');
+  assert.equal(selectDeterministicFallbackProfile('fragment', null), 'default');
+
+  const router = new ShaderFallbackRouter({ now: () => 600 });
+  const profiles = getBuiltInFallbackProfiles();
+
+  assert.equal(router.selectFallbackProfile('fragment', { hasTexture: true }), 'textured_quad_24b');
+
+  const uiSplash = router.resolve('0x000000000000f001', 'fragment', {
+    bindingSignature: { hasVertexColor: true, hasTexture: true, hasCbv: true },
+  });
+  assert.equal(uiSplash.profile, 'splash_rect_24b');
+  assert.equal(uiSplash.wgsl, profiles.splash_rect_24b.fragment);
+
+  const uiTex = router.resolve('0x000000000000f002', 'vertex', {
+    bindingSignature: { textureCount: 1, samplerCount: 1 },
+  });
+  assert.equal(uiTex.profile, 'textured_quad_24b');
+  assert.equal(uiTex.wgsl, profiles.textured_quad_24b.vertex);
+
+  const fullscreen = router.resolve('0x000000000000f003', 'fragment', {
+    bindingSignature: { cbvCount: 1 },
+  });
+  assert.equal(fullscreen.profile, 'fullscreen_triangle_cbv');
+  assert.equal(fullscreen.wgsl, profiles.fullscreen_triangle_cbv.fragment);
+
+  const computeNoop = router.resolve('0x000000000000f004', 'compute', {
+    bindingSignature: { hasCbv: true, hasTexture: true },
+  });
+  assert.equal(computeNoop.profile, 'default');
+  assert.equal(computeNoop.wgsl, BUILTIN_FALLBACK_WGSL.compute);
+
+  // Explicit options.profile takes precedence over bindingSignature.
+  const explicitOverride = router.resolve('0x000000000000f005', 'vertex', {
+    profile: 'fullscreen_cbv',
+    bindingSignature: { hasTexture: true },
+  });
+  assert.equal(explicitOverride.profile, 'fullscreen_triangle_cbv');
+});
+
+test('W268 resetStats clears lookup stats and negative compile-failure cache while preserving packLoader and realShaders', () => {
+  const realHash = '0x000000000000aa99';
+  const badHash = '0x000000000000bb99';
+  const router = new ShaderFallbackRouter({
+    packLoader: createGetSourcePackLoader({ [realHash]: PACK_VS_WGSL }),
+    now: () => 700,
+  });
+  router.registerRealShader(realHash, 'vertex', { wgsl: PACK_VS_WGSL });
+  router.recordMissingShader(badHash, 'fragment', 'compile_failed');
+  assert.equal(router.hasCompileFailure(badHash), true);
+  router.resolve(badHash, 'fragment');
+
+  let stats = router.getStats();
+  assert.equal(stats.compileFailureEntries, 1);
+  assert.equal(stats.compileFailureRecorded, 1);
+  assert.equal(stats.compileFailureCacheHits, 2);
+  assert.equal(stats.totalLookups, 1);
+
+  router.resetStats();
+  stats = router.getStats();
+  assert.deepEqual(stats, {
+    totalLookups: 0,
+    packHits: 0,
+    fallbackHits: 0,
+    builtinHits: 0,
+    uniqueMissing: 0,
+    overflowMissingCount: 0,
+    overflowMissingHashes: 0,
+    hitRatePct: 0,
+    hitRatio: 0,
+    compileFailureEntries: 0,
+    compileFailureCacheHits: 0,
+    compileFailureRecorded: 0,
+  });
+  assert.equal(router.hasCompileFailure(badHash), false);
+  assert.equal(router.hasRealShader(realHash, 'vertex'), true);
+});
+
+test('W268 classic Worker importScripts isolation exposes negative compile-failure APIs with zero global leaks', () => {
+  const source = readFileSync(ROUTER_PATH, 'utf8');
+  const sandbox = { console, performance };
+  const vmCtx = vm.createContext(sandbox);
+  vmCtx.self = vmCtx;
+
+  vm.runInContext(source, vmCtx, { filename: ROUTER_PATH });
+  vm.runInContext(source, vmCtx, { filename: ROUTER_PATH });
+
+  assert.doesNotThrow(() => {
+    vm.runInContext(
+      `
+      const DEFAULT_MAX_COMPILE_FAILURE_ENTRIES = 0;
+      const SAFE_REASON_TOKEN_REGEX = /x/;
+      `,
+      vmCtx
+    );
+  });
+
+  const api = vmCtx.PlayGta6ShaderFallbackRouter;
+  assert.equal(api.DEFAULT_MAX_COMPILE_FAILURE_ENTRIES, 2048);
+  assert.equal(typeof api.sanitizeCompileFailureReason, 'function');
+  assert.equal(typeof api.selectDeterministicFallbackProfile, 'function');
+  const r = new api.ShaderFallbackRouter();
+  assert.equal(typeof r.hasCompileFailure, 'function');
+  assert.equal(typeof r.getCompileFailure, 'function');
+  assert.equal(typeof r.recordCompileFailure, 'function');
+  assert.equal(typeof r.clearCompileFailure, 'function');
+  assert.equal(typeof r.clearCompileFailures, 'function');
+  assert.equal(typeof r.selectFallbackProfile, 'function');
+  assert.equal(typeof r.resetStats, 'function');
 });
