@@ -32,6 +32,7 @@ export const DEFAULT_VIEWPORT_WIDTH = 640;
 export const DEFAULT_VIEWPORT_HEIGHT = 360;
 export const DEFAULT_CANVAS_FORMAT = 'bgra8unorm';
 export const DEFAULT_MAX_VALIDATION_ERRORS = 32;
+export const DEFAULT_SPLASH_FADE_OUT_MS = 220;
 export const DEFAULT_STREAM_SHADERS_THRESHOLD_MB = 64;
 export const DEFAULT_STREAM_SHADERS_THRESHOLD_BYTES =
   DEFAULT_STREAM_SHADERS_THRESHOLD_MB * 1024 * 1024;
@@ -118,12 +119,54 @@ const LOADER_TELEMETRY_MESSAGE_TYPES = new Set([
   'pthread-stats',
   'pthread-status',
   'loader-stats',
+  'loader-status',
   'loader-telemetry',
   'runtime-stats',
   'runtime-telemetry',
   'manifest-stats',
   'shard-dispatch',
   'boot-telemetry',
+]);
+
+const AUDIO_RING_MESSAGE_TYPES = new Set([
+  'audio-ring',
+  'audio-ring-status',
+  'audio-ring-attached',
+  'audio-ring-telemetry',
+  'audio-ring-attempt',
+]);
+
+const SESSION_PHASE_MESSAGE_TYPES = new Set(['session-phase', 'phase-transition']);
+
+const MEMORY_PRESSURE_MESSAGE_TYPES = new Set([
+  'memory-pressure',
+  'soft-memory-pressure',
+  'vram-pressure',
+  'memory-reclaim',
+]);
+
+const AUDIO_RING_ATTACHED_LOG_RE =
+  /\b(?:audio_ring_attached|audioRingAttached|guest_ring_attached|guestRingAttached|pcm_ring_attached|pcmRingAttached)\s*[=:]\s*(true|false|yes|no|1|0)\b/i;
+const AUDIO_RING_RETRIES_LOG_RE = /\bretries\s*[=:]\s*(\d+)\b/i;
+const AUDIO_RING_ATTEMPTS_LOG_RE =
+  /\b(?:audio_ring_attach_attempts|audioRingAttachAttempts|attach_attempts|attachAttempts|attempts)\s*[=:]\s*(\d+)\b/i;
+
+const DEFAULT_AUDIO_RING_RETRY_INTERVAL_MS = 250;
+const DEFAULT_AUDIO_RING_MAX_RETRIES = 120;
+
+const FAST_BOOT_MILESTONE_TO_SESSION_PHASE = Object.freeze({
+  START_SCREEN: 'start_screen',
+  INTRO_VIDEO: 'intro_video',
+  MAIN_MENU: 'main_menu',
+  IN_GAME: 'in_game',
+});
+
+const CANONICAL_SESSION_PHASES = Object.freeze([
+  'boot',
+  'start_screen',
+  'intro_video',
+  'main_menu',
+  'in_game',
 ]);
 
 const PERF_TELEMETRY_MESSAGE_TYPES = new Set([
@@ -1272,6 +1315,24 @@ function createCapabilityProbe({ windowObj, navigatorObj, webgpuAdapterFactory }
   };
 }
 
+function computePhaseProgressRatio(progress) {
+  if (!progress || typeof progress !== 'object') {
+    return null;
+  }
+  if (typeof progress.pct === 'number' && Number.isFinite(progress.pct)) {
+    return Math.min(1, Math.max(0, progress.pct / 100));
+  }
+  if (typeof progress.progressPct === 'number' && Number.isFinite(progress.progressPct)) {
+    return Math.min(1, Math.max(0, progress.progressPct / 100));
+  }
+  const loaded = Number(progress.loadedBytes);
+  const total = Number(progress.totalBytes);
+  if (Number.isFinite(loaded) && Number.isFinite(total) && total > 0) {
+    return Math.min(1, Math.max(0, loaded / total));
+  }
+  return null;
+}
+
 function createSplashOverlayAdapter(splashOverlay) {
   if (!splashOverlay || typeof splashOverlay !== 'object') {
     return null;
@@ -1292,9 +1353,9 @@ function createSplashOverlayAdapter(splashOverlay) {
         splashOverlay.updateBootState(payload.tracer);
       }
     },
-    show() {
+    show(opts) {
       if (typeof splashOverlay.show === 'function') {
-        splashOverlay.show();
+        splashOverlay.show(opts);
       }
     },
     setSplashImage(url) {
@@ -1306,22 +1367,56 @@ function createSplashOverlayAdapter(splashOverlay) {
     },
     update(payload = {}) {
       const base = payload.tracer && typeof payload.tracer === 'object' ? { ...payload.tracer } : {};
+      const hasStage = typeof base.stage === 'string' && base.stage.length > 0 && base.stage !== 'NOT_STARTED';
       if (payload.progress && typeof payload.progress === 'object') {
         base.streamingProgress = payload.progress;
+        const ratio = computePhaseProgressRatio(payload.progress);
+        if (ratio !== null && base.phaseProgress === undefined) {
+          base.phaseProgress = ratio;
+        }
       }
-      if (payload.phase === 'DISCOVERING' && !base.statusText) {
-        base.statusText = 'Discovering local boot assets...';
-      } else if (payload.phase === 'PRELOADING' && !base.statusText) {
-        base.statusText = 'Streaming guest image & shaders...';
-      } else if (payload.phase === 'LAUNCHING_RUNTIME' && !base.statusText) {
-        base.statusText = 'Launching Wasm64 runtime...';
-      } else if (payload.phase === 'FALLBACK_SMOKE_DEMO' && !base.statusText) {
-        base.statusText = 'Starting WebGPU smoke demo...';
+      if (payload.phase === 'DISCOVERING') {
+        if (!hasStage) {
+          base.stage = 'PGIM_LOAD';
+          if (base.phaseProgress === undefined) {
+            base.phaseProgress = 0.05;
+          }
+        }
+        if (!base.statusText) {
+          base.statusText = 'Discovering local boot assets...';
+        }
+      } else if (payload.phase === 'PRELOADING') {
+        if (!hasStage) {
+          base.stage = 'PGIM_LOAD';
+        }
+        if (!base.statusText) {
+          base.statusText = 'Streaming guest image & shaders...';
+        }
+      } else if (payload.phase === 'LAUNCHING_RUNTIME') {
+        if (!hasStage || base.stage === 'PGIM_LOAD') {
+          base.stage = 'WASM_INIT';
+        }
+        if (!base.statusText) {
+          base.statusText = 'Launching Wasm64 runtime...';
+        }
+      } else if (payload.phase === 'FALLBACK_SMOKE_DEMO') {
+        if (!hasStage || base.stage === 'PGIM_LOAD') {
+          base.stage = 'D3D12_INIT';
+        }
+        if (!base.statusText) {
+          base.statusText = 'Starting WebGPU smoke demo...';
+        }
       }
       splashOverlay.updateBootState(base);
     },
     updateProgress(progress) {
-      splashOverlay.updateBootState({ streamingProgress: progress });
+      const patch = { streamingProgress: progress };
+      const ratio = computePhaseProgressRatio(progress);
+      if (ratio !== null) {
+        patch.stage = 'PGIM_LOAD';
+        patch.phaseProgress = ratio;
+      }
+      splashOverlay.updateBootState(patch);
     },
     updateTracer(tracer) {
       splashOverlay.updateBootState(tracer);
@@ -1345,14 +1440,18 @@ function createSplashOverlayAdapter(splashOverlay) {
         splashOverlay.dismiss(meta);
       }
     },
-    hide() {
+    hide(hideOpts) {
       // Allow smooth dismiss fade or visible-frame hold to remain active until finished.
       const state = typeof splashOverlay.getState === 'function' ? splashOverlay.getState() : null;
       if (state && (state.fading || state.holdingForVisibleFrame)) {
         return;
       }
       if (typeof splashOverlay.hide === 'function') {
-        splashOverlay.hide();
+        if (hideOpts !== undefined) {
+          splashOverlay.hide(hideOpts);
+        } else {
+          splashOverlay.hide();
+        }
       }
     },
     destroy() {
@@ -1387,6 +1486,10 @@ export class PlayGta6AppHandle {
     this._getDiagnosticsSnapshot = components.getDiagnosticsSnapshot || (() => null);
     this._getBootTelemetry = components.getBootTelemetry || (() => null);
     this._getFastBootPlan = components.getFastBootPlan || (() => null);
+    this._getPhaseTelemetry = components.getPhaseTelemetry || (() => null);
+    this._reclaimSoftMemory = components.reclaimSoftMemory || (async () => ({ ok: false }));
+    this._registerReclaimHook = components.registerReclaimHook || (() => () => {});
+    this._attachAudioRing = components.attachAudioRing || (() => null);
     this._notifyFirstPresent = components.notifyFirstPresent || (() => ({ ok: true }));
     this._notifyFirstVisibleFrame = components.notifyFirstVisibleFrame || (() => ({ ok: true }));
     this._recordFastBootMilestone = components.recordFastBootMilestone || (() => null);
@@ -1419,6 +1522,22 @@ export class PlayGta6AppHandle {
 
   getFastBootPlan() {
     return this._getFastBootPlan();
+  }
+
+  getPhaseTelemetry() {
+    return this._getPhaseTelemetry();
+  }
+
+  reclaimSoftMemory(reason) {
+    return this._reclaimSoftMemory(reason);
+  }
+
+  registerReclaimHook(hook) {
+    return this._registerReclaimHook(hook);
+  }
+
+  attachAudioRing(mod, opts) {
+    return this._attachAudioRing(mod, opts);
   }
 
   notifyFirstPresent(meta) {
@@ -1654,6 +1773,12 @@ export function bootstrapPlayGta6App(options = {}) {
     framesDrained: 0,
     underruns: 0,
     overruns: 0,
+  };
+
+  const audioRingTelemetry = {
+    audioRingAttached: false,
+    audioRingAttachAttempts: 0,
+    audioRingLastReason: null,
   };
 
   const loaderTelemetry = {
@@ -1970,6 +2095,58 @@ export function bootstrapPlayGta6App(options = {}) {
     if (latestFastBootPlan && latestFastBootPlan.recommendedSlabMaxBytes > 0) {
       fields.recommendedSlabMaxBytes = latestFastBootPlan.recommendedSlabMaxBytes;
     }
+    const audioRingRetryOpts =
+      options.audioRingRetry && typeof options.audioRingRetry === 'object'
+        ? options.audioRingRetry
+        : null;
+    const resolvedAudioRingIntervalMs = sanitizePositiveInt(
+      options.audioRingRetryIntervalMs !== undefined
+        ? options.audioRingRetryIntervalMs
+        : audioRingRetryOpts && audioRingRetryOpts.retryIntervalMs !== undefined
+          ? audioRingRetryOpts.retryIntervalMs
+          : undefined
+    );
+    const resolvedAudioRingMaxRetries = toNonNegativeInt(
+      options.audioRingMaxRetries !== undefined
+        ? options.audioRingMaxRetries
+        : audioRingRetryOpts && audioRingRetryOpts.maxRetries !== undefined
+          ? audioRingRetryOpts.maxRetries
+          : undefined,
+      null
+    );
+    const hasExplicitAudioRingAutoRetry =
+      typeof options.audioRingAutoRetry === 'boolean' ||
+      Boolean(audioRingRetryOpts && typeof audioRingRetryOpts.autoRetry === 'boolean');
+    const resolvedAudioRingAutoRetry =
+      typeof options.audioRingAutoRetry === 'boolean'
+        ? options.audioRingAutoRetry
+        : audioRingRetryOpts && typeof audioRingRetryOpts.autoRetry === 'boolean'
+          ? audioRingRetryOpts.autoRetry
+          : undefined;
+    const hasExplicitAudioRingRetryOnNoExport =
+      typeof options.audioRingRetryOnNoExport === 'boolean' ||
+      Boolean(audioRingRetryOpts && typeof audioRingRetryOpts.retryOnNoExport === 'boolean');
+    const resolvedAudioRingRetryOnNoExport =
+      typeof options.audioRingRetryOnNoExport === 'boolean'
+        ? options.audioRingRetryOnNoExport
+        : audioRingRetryOpts && typeof audioRingRetryOpts.retryOnNoExport === 'boolean'
+          ? audioRingRetryOpts.retryOnNoExport
+          : undefined;
+    if (resolvedAudioRingIntervalMs !== null) {
+      fields.audioRingRetryIntervalMs = resolvedAudioRingIntervalMs;
+    }
+    if (resolvedAudioRingMaxRetries !== null) {
+      fields.audioRingMaxRetries = resolvedAudioRingMaxRetries;
+    }
+    if (hasExplicitAudioRingAutoRetry) {
+      fields.audioRingAutoRetry = resolvedAudioRingAutoRetry;
+    }
+    if (hasExplicitAudioRingRetryOnNoExport) {
+      fields.audioRingRetryOnNoExport = resolvedAudioRingRetryOnNoExport;
+    }
+    if (typeof options.audioRingAutoPump === 'boolean') {
+      fields.audioRingAutoPump = options.audioRingAutoPump;
+    }
     return fields;
   }
 
@@ -2221,6 +2398,21 @@ export function bootstrapPlayGta6App(options = {}) {
       globalThis.PlayGta6SplashOverlay.SplashOverlayController) ||
     null;
 
+  const resolvedSplashFadeOutMs = (() => {
+    const candidates = [
+      options.splashFadeOutMs,
+      options.fadeOutMs,
+      splashOverlayOptions.fadeOutMs,
+    ];
+    for (let i = 0; i < candidates.length; i += 1) {
+      const value = candidates[i];
+      if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
+        return value;
+      }
+    }
+    return DEFAULT_SPLASH_FADE_OUT_MS;
+  })();
+
   let splashOverlay = null;
   let ownsSplashOverlay = false;
   if (options.splashOverlay !== undefined) {
@@ -2232,6 +2424,8 @@ export function bootstrapPlayGta6App(options = {}) {
   ) {
     splashOverlay = new SplashOverlayCtor({
       ...splashOverlayOptions,
+      fadeOutMs: resolvedSplashFadeOutMs,
+      nowFn: splashOverlayOptions.nowFn || now,
       holdUntilVisible: resolvedHoldUntilVisible,
       ...(splashOverlayOptions.locationSearch === undefined &&
       splashOverlayOptions.search === undefined &&
@@ -3574,12 +3768,117 @@ export function bootstrapPlayGta6App(options = {}) {
     return true;
   }
 
+  function ingestAudioRingTelemetry(data, { allowGenericAttached = false } = {}) {
+    if (!data || typeof data !== 'object' || destroyed) {
+      return false;
+    }
+    const sources = collectPlainSources([
+      data,
+      data.stats,
+      data.audioStats,
+      data.audio,
+      data.audioRing,
+      data.audioRingTelemetry,
+      data.metrics,
+    ]);
+    let updated = false;
+
+    const attachedKeys = allowGenericAttached
+      ? [
+          'audioRingAttached',
+          'audio_ring_attached',
+          'guestRingAttached',
+          'guest_ring_attached',
+          'pcmRingAttached',
+          'pcm_ring_attached',
+          'ringAttached',
+          'attached',
+        ]
+      : [
+          'audioRingAttached',
+          'audio_ring_attached',
+          'guestRingAttached',
+          'guest_ring_attached',
+          'pcmRingAttached',
+          'pcm_ring_attached',
+          'ringAttached',
+        ];
+    const attachedField = pickFirstDefinedField(sources, attachedKeys);
+    let sawAttached = null;
+    if (attachedField.found) {
+      if (typeof attachedField.value === 'boolean') {
+        sawAttached = attachedField.value;
+      } else if (typeof attachedField.value === 'string') {
+        sawAttached = parseBooleanQueryFlag(attachedField.value);
+      }
+      if (sawAttached !== null) {
+        audioRingTelemetry.audioRingAttached = sawAttached;
+        updated = true;
+      }
+    }
+
+    const reasonField = pickFirstDefinedField(sources, [
+      'audioRingLastReason',
+      'audio_ring_last_reason',
+      'statusReason',
+    ]);
+    let sawReason = null;
+    if (reasonField.found && typeof reasonField.value === 'string') {
+      const cleanReason = sanitizeDiagnosticText(reasonField.value, 64);
+      if (cleanReason) {
+        sawReason = cleanReason;
+        audioRingTelemetry.audioRingLastReason = cleanReason;
+        updated = true;
+      }
+    }
+
+    const attemptsField = pickFirstDefinedField(sources, [
+      'audioRingAttachAttempts',
+      'audio_ring_attach_attempts',
+      'attachAttempts',
+      'attach_attempts',
+    ]);
+    const retryField = pickFirstDefinedField(sources, [
+      'audioRingRetryCount',
+      'audio_ring_retry_count',
+    ]);
+
+    if (attemptsField.found) {
+      const parsedAttempts = toNonNegativeInt(attemptsField.value, null);
+      if (parsedAttempts !== null) {
+        audioRingTelemetry.audioRingAttachAttempts = Math.max(
+          audioRingTelemetry.audioRingAttachAttempts,
+          parsedAttempts
+        );
+        updated = true;
+      }
+    } else if (retryField.found) {
+      const parsedRetries = toNonNegativeInt(retryField.value, null);
+      if (parsedRetries !== null) {
+        const minAttempts =
+          sawAttached === true || sawReason !== null || parsedRetries > 0
+            ? parsedRetries + (sawAttached === true || sawReason !== null ? 1 : 0)
+            : 0;
+        audioRingTelemetry.audioRingAttachAttempts = Math.max(
+          audioRingTelemetry.audioRingAttachAttempts,
+          minAttempts
+        );
+        updated = true;
+      }
+    } else if (sawAttached === true && audioRingTelemetry.audioRingAttachAttempts === 0) {
+      audioRingTelemetry.audioRingAttachAttempts = 1;
+    }
+
+    return updated;
+  }
+
   function handleAudioStatsMessage(data) {
     if (!data || typeof data !== 'object' || destroyed) {
       return false;
     }
     const sources = collectPlainSources([data, data.stats, data.audioStats, data.audio]);
     audioTelemetry.hasReceivedStats = true;
+    ingestAudioRingTelemetry(data, { allowGenericAttached: false });
 
     const outputStateField = pickFirstDefinedField(sources, [
       'outputState',
@@ -3807,6 +4106,9 @@ export function bootstrapPlayGta6App(options = {}) {
     if (perfRes.updated) {
       updated = true;
     }
+    if (ingestAudioRingTelemetry(data, { allowGenericAttached: false })) {
+      updated = true;
+    }
 
     return updated;
   }
@@ -3937,6 +4239,40 @@ export function bootstrapPlayGta6App(options = {}) {
     if (data.type === 'audio-stats' || data.type === 'audio-telemetry') {
       return handleAudioStatsMessage(data);
     }
+    if (typeof data.type === 'string' && AUDIO_RING_MESSAGE_TYPES.has(data.type)) {
+      const updated = ingestAudioRingTelemetry(data, { allowGenericAttached: true });
+      if (data.type === 'audio-ring-attempt' && !updated) {
+        audioRingTelemetry.audioRingAttachAttempts += 1;
+      }
+      if (data.type === 'audio-ring-attached' && data.attached !== false && data.audioRingAttached !== false) {
+        audioRingTelemetry.audioRingAttached = true;
+        audioRingTelemetry.audioRingAttachAttempts = Math.max(
+          audioRingTelemetry.audioRingAttachAttempts,
+          1
+        );
+      }
+      return true;
+    }
+    if (typeof data.type === 'string' && SESSION_PHASE_MESSAGE_TYPES.has(data.type)) {
+      if (session && typeof session.recordPhase === 'function') {
+        try {
+          session.recordPhase(data.phase, data.timestampMs);
+        } catch {
+          // Session phase transitions must never throw out of worker message handling.
+        }
+      }
+      return true;
+    }
+    if (typeof data.type === 'string' && MEMORY_PRESSURE_MESSAGE_TYPES.has(data.type)) {
+      const pressureReason =
+        typeof data.reason === 'string' && data.reason.trim().length > 0
+          ? data.reason.trim()
+          : data.type;
+      Promise.resolve(reclaimSoftMemory(pressureReason)).catch(() => {
+        // Soft memory reclaim rejections must never surface as unhandled rejections.
+      });
+      return true;
+    }
     if (data.type === 'gpu-validation-error') {
       return handleGpuValidationErrorMessage(data);
     }
@@ -4043,6 +4379,9 @@ export function bootstrapPlayGta6App(options = {}) {
         rawBlackLoadingMs >= 0
           ? { blackLoadingMs: rawBlackLoadingMs }
           : {}),
+        ...(typeof data.fadeOutMs === 'number' && Number.isFinite(data.fadeOutMs)
+          ? { fadeOutMs: data.fadeOutMs }
+          : {}),
         ...(typeof data.fadeDurationMs === 'number' && Number.isFinite(data.fadeDurationMs)
           ? { fadeDurationMs: data.fadeDurationMs }
           : {}),
@@ -4088,7 +4427,14 @@ export function bootstrapPlayGta6App(options = {}) {
       return true;
     }
     if (data.type === undefined && data.label === undefined && data.error === undefined) {
+      let handledBare = false;
+      if (ingestAudioRingTelemetry(data, { allowGenericAttached: false })) {
+        handledBare = true;
+      }
       if (ingestLoaderTelemetry(data, { notify: true, parseLabel: false })) {
+        handledBare = true;
+      }
+      if (handledBare) {
         return true;
       }
     }
@@ -4199,14 +4545,52 @@ export function bootstrapPlayGta6App(options = {}) {
       globalThis.PlayGta6PgimPreloader &&
       globalThis.PlayGta6PgimPreloader.PgimPreloader) ||
     null;
+  const pgimPreloaderOptions =
+    options.pgimPreloaderOptions && typeof options.pgimPreloaderOptions === 'object'
+      ? options.pgimPreloaderOptions
+      : {};
+  const resolvedPgimOpfsCache =
+    options.opfsCache !== undefined ? options.opfsCache : pgimPreloaderOptions.opfsCache;
+  const resolvedPgimOpfsCacheVersion =
+    options.opfsCacheVersion !== undefined
+      ? options.opfsCacheVersion
+      : pgimPreloaderOptions.opfsCacheVersion;
+  const resolvedPgimOpfsCacheDirName =
+    options.opfsCacheDirName !== undefined
+      ? options.opfsCacheDirName
+      : pgimPreloaderOptions.opfsCacheDirName;
+  const resolvedPgimOpfsValidateWithHead =
+    options.opfsValidateWithHead !== undefined
+      ? options.opfsValidateWithHead
+      : pgimPreloaderOptions.opfsValidateWithHead;
+  const resolvedPgimOpfsStorageObj =
+    options.opfsStorageObj !== undefined
+      ? options.opfsStorageObj
+      : pgimPreloaderOptions.opfsStorageObj !== undefined
+        ? pgimPreloaderOptions.opfsStorageObj
+        : resolvedPgimOpfsCache === true && storageObj
+          ? storageObj
+          : undefined;
   const pgimPreloader =
     options.pgimPreloader !== undefined
       ? options.pgimPreloader
       : typeof PgimPreloaderCtor === 'function'
         ? new PgimPreloaderCtor({
-            ...(options.pgimPreloaderOptions && typeof options.pgimPreloaderOptions === 'object'
-              ? options.pgimPreloaderOptions
+            ...pgimPreloaderOptions,
+            ...(resolvedPgimOpfsCache !== undefined ? { opfsCache: resolvedPgimOpfsCache } : {}),
+            ...(resolvedPgimOpfsCacheVersion !== undefined
+              ? { opfsCacheVersion: resolvedPgimOpfsCacheVersion }
               : {}),
+            ...(resolvedPgimOpfsCacheDirName !== undefined
+              ? { opfsCacheDirName: resolvedPgimOpfsCacheDirName }
+              : {}),
+            ...(resolvedPgimOpfsValidateWithHead !== undefined
+              ? { opfsValidateWithHead: resolvedPgimOpfsValidateWithHead }
+              : {}),
+            ...(resolvedPgimOpfsStorageObj !== undefined
+              ? { opfsStorageObj: resolvedPgimOpfsStorageObj }
+              : {}),
+            nowFn: pgimPreloaderOptions.nowFn || now,
             fetchImpl: fetchImpl || undefined,
           })
         : null;
@@ -4232,6 +4616,7 @@ export function bootstrapPlayGta6App(options = {}) {
       return { ok: true, alreadyPresented: true };
     }
     firstPresentNotified = true;
+    notifyAudioRingGuestMilestone('first_present');
     if (bootOrchestrator && typeof bootOrchestrator.notifyFirstPresent === 'function') {
       try {
         const result = bootOrchestrator.notifyFirstPresent(meta);
@@ -4547,6 +4932,15 @@ export function bootstrapPlayGta6App(options = {}) {
 
     fastBootMilestones[milestone] = recordedMs;
     syncPerfPhaseForFastBootMilestone(milestone);
+    const mappedSessionPhase = FAST_BOOT_MILESTONE_TO_SESSION_PHASE[milestone];
+    if (mappedSessionPhase && session && typeof session.recordPhase === 'function') {
+      try {
+        session.recordPhase(mappedSessionPhase);
+      } catch {
+        // Session phase transitions must never disrupt fast-boot milestone recording.
+      }
+    }
+    notifyAudioRingGuestMilestone(milestone.toLowerCase());
 
     return Object.freeze({
       ok: true,
@@ -4556,11 +4950,54 @@ export function bootstrapPlayGta6App(options = {}) {
     });
   }
 
+  function ingestAudioRingLogLine(text) {
+    if (typeof text !== 'string' || text.length === 0) {
+      return false;
+    }
+    const match = AUDIO_RING_ATTACHED_LOG_RE.exec(text);
+    if (!match) {
+      return false;
+    }
+    const parsedFlag = parseBooleanQueryFlag(match[1]);
+    if (parsedFlag === null) {
+      return false;
+    }
+    audioRingTelemetry.audioRingAttached = parsedFlag;
+    const attemptsMatch = AUDIO_RING_ATTEMPTS_LOG_RE.exec(text);
+    const retriesMatch = AUDIO_RING_RETRIES_LOG_RE.exec(text);
+    if (attemptsMatch) {
+      const parsedAttempts = toNonNegativeInt(attemptsMatch[1], null);
+      if (parsedAttempts !== null) {
+        audioRingTelemetry.audioRingAttachAttempts = Math.max(
+          audioRingTelemetry.audioRingAttachAttempts,
+          parsedAttempts
+        );
+      }
+    } else if (retriesMatch) {
+      const parsedRetries = toNonNegativeInt(retriesMatch[1], null);
+      if (parsedRetries !== null) {
+        audioRingTelemetry.audioRingAttachAttempts = Math.max(
+          audioRingTelemetry.audioRingAttachAttempts,
+          parsedRetries + 1
+        );
+      }
+    } else if (parsedFlag && audioRingTelemetry.audioRingAttachAttempts === 0) {
+      audioRingTelemetry.audioRingAttachAttempts = 1;
+    }
+    if (parsedFlag) {
+      audioRingTelemetry.audioRingLastReason = 'ok';
+    }
+    return true;
+  }
+
   function feedBootLog(line) {
     if (destroyed) {
       return;
     }
     const text = typeof line === 'string' ? line : '';
+    if (text) {
+      ingestAudioRingLogLine(text);
+    }
     const extractedAdapter = text ? extractGpuAdapterFromLogLine(text) : null;
     if (extractedAdapter) {
       recordGpuAdapter(extractedAdapter);
@@ -4647,13 +5084,480 @@ export function bootstrapPlayGta6App(options = {}) {
   let destroyPromise = null;
   const externalWorkerCleanups = [];
 
+  // W308: Lazy _playgta6_audio_ring() auto-retry wiring when audioWorker is present.
+  const externalAudioWorker = options.audioWorker || null;
+  let externalAudioWorkerReady =
+    externalAudioWorker !== null ? options.audioWorkerReady !== false : false;
+  const audioRingRetryConfig =
+    options.audioRingRetry && typeof options.audioRingRetry === 'object'
+      ? options.audioRingRetry
+      : {};
+  const resolvedSetTimeout =
+    options.setTimeout ||
+    audioRingRetryConfig.setTimeoutFn ||
+    (windowObj && typeof windowObj.setTimeout === 'function'
+      ? windowObj.setTimeout.bind(windowObj)
+      : typeof setTimeout === 'function'
+        ? (fn, ms) => setTimeout(fn, ms)
+        : null);
+  const resolvedClearTimeout =
+    options.clearTimeout ||
+    audioRingRetryConfig.clearTimeoutFn ||
+    (windowObj && typeof windowObj.clearTimeout === 'function'
+      ? windowObj.clearTimeout.bind(windowObj)
+      : typeof clearTimeout === 'function'
+        ? (id) => clearTimeout(id)
+        : null);
+  const scheduleAudioRingRetryFn =
+    options.scheduleAudioRingRetry === null
+      ? null
+      : typeof options.scheduleAudioRingRetry === 'function'
+        ? options.scheduleAudioRingRetry
+        : (globalObj.PlayGta6Loader &&
+            typeof globalObj.PlayGta6Loader.scheduleAudioRingRetry === 'function' &&
+            globalObj.PlayGta6Loader.scheduleAudioRingRetry) ||
+          (typeof globalThis !== 'undefined' &&
+            globalThis.PlayGta6Loader &&
+            typeof globalThis.PlayGta6Loader.scheduleAudioRingRetry === 'function' &&
+            globalThis.PlayGta6Loader.scheduleAudioRingRetry) ||
+          null;
+  const attachRuntimeAudioRingFn =
+    options.attachRuntimeAudioRing === null
+      ? null
+      : typeof options.attachRuntimeAudioRing === 'function'
+        ? options.attachRuntimeAudioRing
+        : (globalObj.PlayGta6Loader &&
+            typeof globalObj.PlayGta6Loader.attachRuntimeAudioRing === 'function' &&
+            globalObj.PlayGta6Loader.attachRuntimeAudioRing) ||
+          (typeof globalThis !== 'undefined' &&
+            globalThis.PlayGta6Loader &&
+            typeof globalThis.PlayGta6Loader.attachRuntimeAudioRing === 'function' &&
+            globalThis.PlayGta6Loader.attachRuntimeAudioRing) ||
+          null;
+
+  let boundAudioRingModule =
+    options.wasmModule && typeof options.wasmModule === 'object' ? options.wasmModule : null;
+  let audioRingController =
+    options.audioRingController && typeof options.audioRingController === 'object'
+      ? options.audioRingController
+      : null;
+  let ownsAudioRingController = false;
+
+  function resolveExternalWasmModule(modOverride) {
+    if (modOverride && typeof modOverride === 'object') {
+      boundAudioRingModule = modOverride;
+      return modOverride;
+    }
+    if (typeof options.getWasmModule === 'function') {
+      try {
+        const dynamicMod = options.getWasmModule();
+        if (dynamicMod && typeof dynamicMod === 'object') {
+          boundAudioRingModule = dynamicMod;
+          return dynamicMod;
+        }
+      } catch {
+        // Ignore dynamic module getter errors.
+      }
+    }
+    return boundAudioRingModule;
+  }
+
+  function resolveAudioRingPtrFromModule(mod) {
+    if (!mod || typeof mod !== 'object') {
+      return { hasExport: false, ptr: null };
+    }
+    const candidates = [
+      mod._playgta6_audio_ring,
+      mod.playgta6_audio_ring,
+      mod.asm && mod.asm._playgta6_audio_ring,
+      mod.asm && mod.asm.playgta6_audio_ring,
+      mod.wasmExports && mod.wasmExports._playgta6_audio_ring,
+      mod.wasmExports && mod.wasmExports.playgta6_audio_ring,
+    ];
+    for (let i = 0; i < candidates.length; i += 1) {
+      if (typeof candidates[i] === 'function') {
+        try {
+          return { hasExport: true, ptr: candidates[i].call(mod) };
+        } catch {
+          return { hasExport: true, ptr: null };
+        }
+      }
+    }
+    return { hasExport: false, ptr: null };
+  }
+
+  function createFallbackAudioRingController() {
+    const retryIntervalMs =
+      sanitizePositiveInt(
+        options.audioRingRetryIntervalMs !== undefined
+          ? options.audioRingRetryIntervalMs
+          : audioRingRetryConfig.retryIntervalMs
+      ) ?? DEFAULT_AUDIO_RING_RETRY_INTERVAL_MS;
+    const maxRetries =
+      toNonNegativeInt(
+        options.audioRingMaxRetries !== undefined
+          ? options.audioRingMaxRetries
+          : audioRingRetryConfig.maxRetries,
+        null
+      ) ?? DEFAULT_AUDIO_RING_MAX_RETRIES;
+    const autoRetry =
+      options.audioRingAutoRetry !== false && audioRingRetryConfig.autoRetry !== false;
+    const retryOnNoExport =
+      options.audioRingRetryOnNoExport === true || audioRingRetryConfig.retryOnNoExport === true;
+
+    let timerId = null;
+    let retries = 0;
+    let attempts = 0;
+    let attached = false;
+    let lastReason = null;
+    let ctrlDestroyed = false;
+
+    const clearTimer = () => {
+      if (timerId !== null) {
+        const id = timerId;
+        timerId = null;
+        if (typeof resolvedClearTimeout === 'function') {
+          try {
+            resolvedClearTimeout(id);
+          } catch {
+            // Ignore timer clear errors.
+          }
+        }
+      }
+    };
+
+    const scheduleNext = () => {
+      if (
+        ctrlDestroyed ||
+        destroyed ||
+        attached ||
+        !autoRetry ||
+        timerId !== null ||
+        retries >= maxRetries ||
+        typeof resolvedSetTimeout !== 'function'
+      ) {
+        return false;
+      }
+      timerId = resolvedSetTimeout(() => {
+        timerId = null;
+        if (ctrlDestroyed || destroyed || attached) {
+          return;
+        }
+        retries += 1;
+        attempt(null, null);
+      }, retryIntervalMs);
+      return true;
+    };
+
+    const attempt = (modOverride, attachOpts) => {
+      if (ctrlDestroyed || destroyed) {
+        return { attached: false, reason: 'destroyed' };
+      }
+      if (attached) {
+        return { attached: true, alreadyAttached: true, reason: 'ok' };
+      }
+      attempts += 1;
+      audioRingTelemetry.audioRingAttachAttempts = Math.max(
+        audioRingTelemetry.audioRingAttachAttempts + 1,
+        attempts
+      );
+      const targetMod = resolveExternalWasmModule(modOverride);
+      if (!targetMod) {
+        lastReason = 'no_export';
+        audioRingTelemetry.audioRingLastReason = lastReason;
+        if (typeof options.getWasmModule === 'function' || retryOnNoExport) {
+          scheduleNext();
+        }
+        return { attached: false, reason: lastReason };
+      }
+      if (!externalAudioWorker || typeof externalAudioWorker.postMessage !== 'function' || !externalAudioWorkerReady) {
+        lastReason = 'worker_not_ready';
+        audioRingTelemetry.audioRingLastReason = lastReason;
+        scheduleNext();
+        return { attached: false, reason: lastReason };
+      }
+      if (attachRuntimeAudioRingFn) {
+        try {
+          const res = attachRuntimeAudioRingFn(targetMod, externalAudioWorker, {
+            ...(options.audioRingMemory !== undefined ? { memory: options.audioRingMemory } : {}),
+            ...(options.audioRingPointerSize !== undefined
+              ? { pointerSize: options.audioRingPointerSize }
+              : {}),
+            ...(typeof options.audioRingAutoPump === 'boolean'
+              ? { autoPump: options.audioRingAutoPump }
+              : {}),
+            ...(attachOpts && typeof attachOpts === 'object' ? attachOpts : {}),
+          });
+          if (res && res.attached) {
+            attached = true;
+            lastReason = 'ok';
+            clearTimer();
+            audioRingTelemetry.audioRingAttached = true;
+            audioRingTelemetry.audioRingLastReason = 'ok';
+            return res;
+          }
+          lastReason = sanitizeDiagnosticText((res && (res.statusReason || res.reason)) || 'null_ptr', 64);
+          audioRingTelemetry.audioRingLastReason = lastReason;
+          if (lastReason !== 'no_export' || retryOnNoExport) {
+            scheduleNext();
+          }
+          return res || { attached: false, reason: lastReason };
+        } catch {
+          lastReason = 'invalid_struct';
+          audioRingTelemetry.audioRingLastReason = lastReason;
+          scheduleNext();
+          return { attached: false, reason: lastReason };
+        }
+      }
+      const probed = resolveAudioRingPtrFromModule(targetMod);
+      if (!probed.hasExport) {
+        lastReason = 'no_export';
+        audioRingTelemetry.audioRingLastReason = lastReason;
+        if (retryOnNoExport) {
+          scheduleNext();
+        }
+        return { attached: false, reason: lastReason };
+      }
+      if (probed.ptr === null || probed.ptr === undefined || probed.ptr === 0 || probed.ptr === 0n) {
+        lastReason = 'null_ptr';
+        audioRingTelemetry.audioRingLastReason = lastReason;
+        scheduleNext();
+        return { attached: false, reason: lastReason };
+      }
+      try {
+        externalAudioWorker.postMessage({
+          type: 'attach-guest-pcm-ring',
+          attachGuestPcmRing: true,
+          audioRingPtr: probed.ptr,
+          ...(options.audioRingMemory !== undefined ? { buffer: options.audioRingMemory } : {}),
+        });
+        attached = true;
+        lastReason = 'ok';
+        clearTimer();
+        audioRingTelemetry.audioRingAttached = true;
+        audioRingTelemetry.audioRingLastReason = 'ok';
+        return { attached: true, reason: 'ok', audioRingPtr: probed.ptr };
+      } catch {
+        lastReason = 'worker_not_ready';
+        audioRingTelemetry.audioRingLastReason = lastReason;
+        scheduleNext();
+        return { attached: false, reason: lastReason };
+      }
+    };
+
+    return {
+      attach: (modOverride, attachOpts) => attempt(modOverride, attachOpts),
+      probeNow: () => attempt(null, null),
+      onAudioWorkerReady() {
+        externalAudioWorkerReady = true;
+        if (!attached) {
+          return attempt(null, null);
+        }
+        return { attached: true, alreadyAttached: true, reason: 'ok' };
+      },
+      notifyGuestMilestone() {
+        if (!attached) {
+          return attempt(null, null);
+        }
+        return { attached: true, alreadyAttached: true, reason: 'ok' };
+      },
+      getTelemetry() {
+        return {
+          audioRingAttached: attached,
+          audioRingAttachAttempts: attempts,
+          audioRingRetryCount: retries,
+          audioRingLastReason: lastReason,
+          audioRingRetryPending: timerId !== null,
+          audioRingRetryExhausted: !attached && retries >= maxRetries,
+          audioRingMaxRetries: maxRetries,
+          audioRingRetryIntervalMs: retryIntervalMs,
+          destroyed: ctrlDestroyed,
+        };
+      },
+      stop: clearTimer,
+      reset() {
+        clearTimer();
+        attached = false;
+        retries = 0;
+        lastReason = null;
+      },
+      destroy() {
+        ctrlDestroyed = true;
+        clearTimer();
+      },
+    };
+  }
+
+  function ensureAudioRingController(modOverride = null, attachOpts = undefined) {
+    if (destroyed) {
+      return { controller: null, probedOnCreate: false };
+    }
+    if (modOverride && typeof modOverride === 'object') {
+      boundAudioRingModule = modOverride;
+    }
+    if (audioRingController) {
+      return { controller: audioRingController, probedOnCreate: false };
+    }
+    if (!externalAudioWorker) {
+      return { controller: null, probedOnCreate: false };
+    }
+    const hasModuleSource = Boolean(boundAudioRingModule || typeof options.getWasmModule === 'function');
+    if (!hasModuleSource) {
+      return { controller: null, probedOnCreate: false };
+    }
+    if (scheduleAudioRingRetryFn) {
+      const retryIntervalMs =
+        sanitizePositiveInt(
+          options.audioRingRetryIntervalMs !== undefined
+            ? options.audioRingRetryIntervalMs
+            : audioRingRetryConfig.retryIntervalMs
+        ) ?? DEFAULT_AUDIO_RING_RETRY_INTERVAL_MS;
+      const maxRetries =
+        toNonNegativeInt(
+          options.audioRingMaxRetries !== undefined
+            ? options.audioRingMaxRetries
+            : audioRingRetryConfig.maxRetries,
+          null
+        ) ?? DEFAULT_AUDIO_RING_MAX_RETRIES;
+      const autoRetry =
+        options.audioRingAutoRetry !== false && audioRingRetryConfig.autoRetry !== false;
+      const retryOnNoExport =
+        options.audioRingRetryOnNoExport === true || audioRingRetryConfig.retryOnNoExport === true;
+      audioRingController = scheduleAudioRingRetryFn({
+        module: boundAudioRingModule,
+        getModule: () => resolveExternalWasmModule(null),
+        audioWorker: externalAudioWorker,
+        isAudioWorkerReady: () => externalAudioWorkerReady,
+        ...(options.audioRingMemory !== undefined ? { memory: options.audioRingMemory } : {}),
+        ...(options.audioRingPointerSize !== undefined
+          ? { pointerSize: options.audioRingPointerSize }
+          : {}),
+        ...(typeof options.audioRingAutoPump === 'boolean'
+          ? { autoPump: options.audioRingAutoPump }
+          : {}),
+        ...(attachOpts && typeof attachOpts === 'object' ? { attachOptions: attachOpts } : {}),
+        retryIntervalMs,
+        maxRetries,
+        autoRetry,
+        retryOnNoExport,
+        ...(typeof resolvedSetTimeout === 'function' ? { setTimeoutFn: resolvedSetTimeout } : {}),
+        ...(typeof resolvedClearTimeout === 'function'
+          ? { clearTimeoutFn: resolvedClearTimeout }
+          : {}),
+        onAttempt(res, telemetry) {
+          audioRingTelemetry.audioRingAttachAttempts += 1;
+          if (res && res.attached) {
+            audioRingTelemetry.audioRingAttached = true;
+          } else if (telemetry && typeof telemetry.audioRingAttached === 'boolean') {
+            audioRingTelemetry.audioRingAttached = telemetry.audioRingAttached;
+          }
+          const reason =
+            (res && (res.statusReason || res.reason)) ||
+            (telemetry && telemetry.audioRingLastReason) ||
+            null;
+          if (typeof reason === 'string' && reason.length > 0) {
+            audioRingTelemetry.audioRingLastReason = sanitizeDiagnosticText(reason, 64);
+          }
+        },
+        onAttached(res, telemetry) {
+          audioRingTelemetry.audioRingAttached = true;
+          audioRingTelemetry.audioRingLastReason = 'ok';
+          const retryCount =
+            telemetry && typeof telemetry.audioRingRetryCount === 'number'
+              ? toSafeNonNegativeInt(telemetry.audioRingRetryCount, 0)
+              : 0;
+          audioRingTelemetry.audioRingAttachAttempts = Math.max(
+            audioRingTelemetry.audioRingAttachAttempts,
+            retryCount + 1
+          );
+        },
+      });
+      ownsAudioRingController = true;
+      return { controller: audioRingController, probedOnCreate: true };
+    }
+    audioRingController = createFallbackAudioRingController();
+    ownsAudioRingController = true;
+    return { controller: audioRingController, probedOnCreate: false };
+  }
+
+  function attachAudioRing(modOverride = null, attachOpts = undefined) {
+    if (destroyed) {
+      return { attached: false, destroyed: true };
+    }
+    const { controller: ctrl, probedOnCreate } = ensureAudioRingController(modOverride, attachOpts);
+    if (!ctrl) {
+      return null;
+    }
+    if (probedOnCreate) {
+      return typeof ctrl.getTelemetry === 'function' ? ctrl.getTelemetry() : { attached: audioRingTelemetry.audioRingAttached };
+    }
+    try {
+      if (typeof ctrl.attach === 'function') {
+        return ctrl.attach(modOverride, attachOpts);
+      }
+      if (typeof ctrl.probeNow === 'function') {
+        return ctrl.probeNow();
+      }
+    } catch {
+      // Audio-ring attachment probes must never throw into callers.
+    }
+    return null;
+  }
+
+  function notifyAudioRingGuestMilestone(milestoneName) {
+    if (destroyed || audioRingTelemetry.audioRingAttached) {
+      return;
+    }
+    const ctrl = audioRingController || ensureAudioRingController(null).controller;
+    if (!ctrl) {
+      return;
+    }
+    try {
+      if (typeof ctrl.notifyGuestMilestone === 'function') {
+        ctrl.notifyGuestMilestone(milestoneName);
+      } else if (typeof ctrl.probeNow === 'function') {
+        ctrl.probeNow();
+      }
+    } catch {
+      // Milestone audio-ring retry triggers must never disrupt boot.
+    }
+  }
+
   for (const workerCandidate of [options.gpuWorker, options.audioWorker, options.ioWorker]) {
     if (isEventTargetLike(workerCandidate)) {
+      const isAudioCandidate = workerCandidate === externalAudioWorker;
       const onExternalWorkerMessage = (ev) => {
         if (destroyed) {
           return;
         }
         const data = ev && typeof ev === 'object' && ev.data !== undefined ? ev.data : ev;
+        if (isAudioCandidate && data && typeof data === 'object') {
+          if (data.ready === true) {
+            externalAudioWorkerReady = true;
+            const ensured = audioRingController
+              ? { controller: audioRingController, probedOnCreate: false }
+              : ensureAudioRingController(null);
+            const ctrl = ensured.controller;
+            if (ctrl && !ensured.probedOnCreate) {
+              try {
+                if (typeof ctrl.onAudioWorkerReady === 'function') {
+                  ctrl.onAudioWorkerReady(externalAudioWorker);
+                } else if (typeof ctrl.probeNow === 'function') {
+                  ctrl.probeNow();
+                }
+              } catch {
+                // Non-fatal audio worker ready probe failure.
+              }
+            }
+          }
+          if (
+            data.guestRingAttached !== undefined ||
+            data.audioRingAttached !== undefined ||
+            data.attached !== undefined
+          ) {
+            ingestAudioRingTelemetry(data, { allowGenericAttached: true });
+          }
+        }
         handleWorkerMessage(data);
       };
       try {
@@ -5122,6 +6026,71 @@ export function bootstrapPlayGta6App(options = {}) {
       ? options.capabilityProbe
       : createCapabilityProbe({ windowObj, navigatorObj, webgpuAdapterFactory });
 
+  const fallbackReclaimHooks = new Set();
+  const reclaimUnregisters = [];
+  let fallbackReclaimRuns = 0;
+  let fallbackReclaimFailures = 0;
+  let fallbackLastReclaimReason = null;
+  let fallbackLastReclaimAtMs = null;
+
+  const userMemoryReclaimHooks = [];
+  if (typeof options.onMemoryReclaim === 'function') {
+    userMemoryReclaimHooks.push(options.onMemoryReclaim);
+  }
+  if (typeof options.onMemoryPressure === 'function') {
+    userMemoryReclaimHooks.push(options.onMemoryPressure);
+  }
+  if (Array.isArray(options.memoryPressureCallbacks)) {
+    for (let i = 0; i < options.memoryPressureCallbacks.length; i += 1) {
+      if (typeof options.memoryPressureCallbacks[i] === 'function') {
+        userMemoryReclaimHooks.push(options.memoryPressureCallbacks[i]);
+      }
+    }
+  }
+  if (Array.isArray(options.reclaimHooks)) {
+    for (let i = 0; i < options.reclaimHooks.length; i += 1) {
+      if (typeof options.reclaimHooks[i] === 'function') {
+        userMemoryReclaimHooks.push(options.reclaimHooks[i]);
+      }
+    }
+  }
+
+  async function runBuiltinSoftMemoryReclaim(context) {
+    if (destroyed) {
+      return;
+    }
+    if (bootOrchestrator && typeof bootOrchestrator.releasePreloadBuffers === 'function') {
+      try {
+        bootOrchestrator.releasePreloadBuffers();
+      } catch {
+        // Preload buffer release must never interrupt soft memory reclaim.
+      }
+    }
+    const reason = context && typeof context.reason === 'string' ? context.reason : 'memory-pressure';
+    const shouldEvictOnReclaim =
+      options.reclaimEvictsOpfs !== false &&
+      (reason !== 'restart' || Boolean(latestFastBootPlan && latestFastBootPlan.shouldEvictColdChunks));
+    if (
+      shouldEvictOnReclaim &&
+      storageManager &&
+      typeof storageManager.runQuotaPressureEviction === 'function'
+    ) {
+      try {
+        const rawEviction = await storageManager.runQuotaPressureEviction();
+        if (!destroyed && rawEviction && typeof rawEviction === 'object') {
+          latestQuotaEviction = Object.freeze({
+            triggered: true,
+            ok: rawEviction.ok !== false,
+            evictedBytes: toSafeNonNegativeInt(rawEviction.evictedBytes, 0),
+            evictedEntries: toSafeNonNegativeInt(rawEviction.evictedEntries, 0),
+          });
+        }
+      } catch {
+        // Storage quota eviction errors must never interrupt soft memory reclaim.
+      }
+    }
+  }
+
   session = new RuntimeSessionController({
     fetchImpl,
     statusUrl,
@@ -5138,7 +6107,126 @@ export function bootstrapPlayGta6App(options = {}) {
     ...(options.hudIntervalMs !== undefined ? { hudIntervalMs: options.hudIntervalMs } : {}),
     audioGestureTarget:
       options.audioGestureTarget !== undefined ? options.audioGestureTarget : windowObj || undefined,
+    onMemoryReclaim: runBuiltinSoftMemoryReclaim,
   });
+
+  function registerReclaimHook(hook) {
+    if (typeof hook !== 'function') {
+      throw new TypeError('registerReclaimHook requires a hook function');
+    }
+    if (destroyed) {
+      return () => {};
+    }
+    if (session && typeof session.registerReclaimHook === 'function') {
+      const unregister = session.registerReclaimHook(hook);
+      reclaimUnregisters.push(unregister);
+      return unregister;
+    }
+    fallbackReclaimHooks.add(hook);
+    let active = true;
+    const unregister = () => {
+      if (!active) return;
+      active = false;
+      fallbackReclaimHooks.delete(hook);
+    };
+    reclaimUnregisters.push(unregister);
+    return unregister;
+  }
+
+  for (let i = 0; i < userMemoryReclaimHooks.length; i += 1) {
+    registerReclaimHook(userMemoryReclaimHooks[i]);
+  }
+
+  async function reclaimSoftMemory(reason = 'memory-pressure') {
+    const rawReason =
+      typeof reason === 'string' && reason.trim().length > 0
+        ? reason.trim()
+        : reason && typeof reason === 'object' && typeof reason.reason === 'string' && reason.reason.trim().length > 0
+          ? reason.reason.trim()
+          : 'memory-pressure';
+    const sanitizedReason = sanitizeDiagnosticText(rawReason, 128) || 'memory-pressure';
+    if (destroyed) {
+      return Object.freeze({
+        ok: false,
+        destroyed: true,
+        reason: sanitizedReason,
+        hooksInvoked: 0,
+        hooksSucceeded: 0,
+        hooksFailed: 0,
+        reclaimRuns: fallbackReclaimRuns,
+        reclaimFailures: fallbackReclaimFailures,
+      });
+    }
+    if (session && typeof session.reclaimSoftMemory === 'function') {
+      try {
+        return await session.reclaimSoftMemory(sanitizedReason);
+      } catch (err) {
+        crashReporter.recordError('runtime', err, {
+          source: 'session',
+          phase: 'reclaimSoftMemory',
+          reason: sanitizedReason,
+        });
+        return Object.freeze({
+          ok: false,
+          reason: sanitizedReason,
+          error: sanitizeDiagnosticText(err && err.message ? err.message : String(err)),
+        });
+      }
+    }
+    if (session && typeof session.requestMemoryReclaim === 'function') {
+      try {
+        return await session.requestMemoryReclaim(sanitizedReason);
+      } catch (err) {
+        crashReporter.recordError('runtime', err, {
+          source: 'session',
+          phase: 'requestMemoryReclaim',
+          reason: sanitizedReason,
+        });
+        return Object.freeze({
+          ok: false,
+          reason: sanitizedReason,
+          error: sanitizeDiagnosticText(err && err.message ? err.message : String(err)),
+        });
+      }
+    }
+    const timestampMs = now();
+    fallbackReclaimRuns += 1;
+    fallbackLastReclaimReason = sanitizedReason;
+    fallbackLastReclaimAtMs = timestampMs;
+    const hooks = [runBuiltinSoftMemoryReclaim, ...fallbackReclaimHooks];
+    let hooksInvoked = 0;
+    let hooksSucceeded = 0;
+    let hooksFailed = 0;
+    for (let i = 0; i < hooks.length; i += 1) {
+      hooksInvoked += 1;
+      try {
+        await hooks[i]({
+          reason: sanitizedReason,
+          state: resolveSessionStateText(),
+          bootMode: resolveCurrentBootMode(),
+          timestampMs,
+        });
+        hooksSucceeded += 1;
+      } catch (err) {
+        hooksFailed += 1;
+        fallbackReclaimFailures += 1;
+        crashReporter.recordError('runtime', err, {
+          source: 'memoryReclaim',
+          reason: sanitizedReason,
+        });
+      }
+    }
+    return Object.freeze({
+      ok: hooksFailed === 0,
+      reason: sanitizedReason,
+      hooksInvoked,
+      hooksSucceeded,
+      hooksFailed,
+      reclaimRuns: fallbackReclaimRuns,
+      reclaimFailures: fallbackReclaimFailures,
+      timestampMs,
+    });
+  }
 
   if (
     initialBootAssets.sideModuleUrls !== undefined ||
@@ -5147,7 +6235,7 @@ export function bootstrapPlayGta6App(options = {}) {
     notifySideModulePreflight(initialBootAssets);
   }
 
-  // 7b. Optional BootOrchestrator (W44) wired when splash overlay or explicit flag is enabled.
+  // 7b. Optional BootOrchestrator (W44/W309) wired when splash overlay or explicit flag is enabled.
   const useBootOrchestrator =
     options.bootOrchestrator !== undefined ||
     options.enableBootOrchestrator === true ||
@@ -5160,12 +6248,40 @@ export function bootstrapPlayGta6App(options = {}) {
     bootOrchestrator = options.bootOrchestrator;
   } else if (useBootOrchestrator && typeof BootOrchestratorCtor === 'function') {
     const splashAdapter = createSplashOverlayAdapter(splashOverlay);
-    bootOrchestrator = new BootOrchestratorCtor({
+    const bootOrchestratorOptions =
+      options.bootOrchestratorOptions && typeof options.bootOrchestratorOptions === 'object'
+        ? options.bootOrchestratorOptions
+        : {};
+    const orchestratorConfig = {
+      ...bootOrchestratorOptions,
+      ...(options.parallelPreload !== undefined ? { parallelPreload: options.parallelPreload } : {}),
+      ...(options.preloadConcurrency !== undefined
+        ? { preloadConcurrency: options.preloadConcurrency }
+        : {}),
+      ...(options.releasePreloadBuffers !== undefined
+        ? { releasePreloadBuffers: options.releasePreloadBuffers }
+        : {}),
+      ...(options.stageTimeoutMs !== undefined ? { stageTimeoutMs: options.stageTimeoutMs } : {}),
+      ...(options.preloadRuntimeWasm !== undefined
+        ? { preloadRuntimeWasm: options.preloadRuntimeWasm }
+        : {}),
+      ...(options.opfsProbe !== undefined ? { opfsProbe: options.opfsProbe } : {}),
+      ...(options.preloadShaderPackHeader !== undefined
+        ? { preloadShaderPackHeader: options.preloadShaderPackHeader }
+        : {}),
+      ...(options.preloadReflectionSidecar !== undefined
+        ? { preloadReflectionSidecar: options.preloadReflectionSidecar }
+        : {}),
+      ...(options.preloadTasks !== undefined ? { preloadTasks: options.preloadTasks } : {}),
+      ...(options.onPhaseChange !== undefined ? { onPhaseChange: options.onPhaseChange } : {}),
+      ...(options.onFirstPresent !== undefined ? { onFirstPresent: options.onFirstPresent } : {}),
+      ...(options.onStageStall !== undefined ? { onStageStall: options.onStageStall } : {}),
       fetchImpl,
       statusUrl,
       splashOverlay: splashAdapter,
       preloader: pgimPreloader,
       bootTracer,
+      nowFn: bootOrchestratorOptions.nowFn || now,
       onLaunchRuntime: async (bootPayload) => {
         recordDiscoveredBootAssets(bootPayload);
         lastBootSessionResult = await session.start(pendingStartOpts);
@@ -5178,7 +6294,8 @@ export function bootstrapPlayGta6App(options = {}) {
             : { preferSmoke: true };
         lastBootSessionResult = await session.start(fallbackOpts);
       },
-    });
+    };
+    bootOrchestrator = new BootOrchestratorCtor(orchestratorConfig);
     ownsBootOrchestrator = true;
   }
 
@@ -5560,6 +6677,274 @@ export function bootstrapPlayGta6App(options = {}) {
     });
   }
 
+  function resolveAudioRingSnapshot() {
+    let attached = Boolean(audioRingTelemetry.audioRingAttached);
+    let attempts = toSafeNonNegativeInt(audioRingTelemetry.audioRingAttachAttempts, 0);
+    let lastReason = audioRingTelemetry.audioRingLastReason;
+    if (audioRingController && typeof audioRingController.getTelemetry === 'function') {
+      try {
+        const ctrlTel = audioRingController.getTelemetry();
+        if (ctrlTel && typeof ctrlTel === 'object') {
+          if (ctrlTel.audioRingAttached === true) {
+            attached = true;
+          }
+          const explicitAttempts = toNonNegativeInt(ctrlTel.audioRingAttachAttempts, null);
+          if (explicitAttempts !== null) {
+            attempts = Math.max(attempts, explicitAttempts);
+          } else {
+            const retries = toNonNegativeInt(ctrlTel.audioRingRetryCount, null);
+            if (retries !== null) {
+              const inferred =
+                ctrlTel.audioRingAttached === true || ctrlTel.audioRingLastReason !== null
+                  ? retries + 1
+                  : retries;
+              attempts = Math.max(attempts, inferred);
+            }
+          }
+          if (lastReason === null && typeof ctrlTel.audioRingLastReason === 'string') {
+            lastReason = sanitizeDiagnosticText(ctrlTel.audioRingLastReason, 64) || null;
+          }
+        }
+      } catch {
+        // Ignore audioRingController telemetry errors.
+      }
+    }
+    return Object.freeze({
+      audioRingAttached: attached,
+      audioRingAttachAttempts: attempts,
+      audioRingLastReason: lastReason,
+    });
+  }
+
+  function getPhaseTelemetry() {
+    let raw = null;
+    if (session && typeof session.getPhaseTelemetry === 'function') {
+      try {
+        raw = session.getPhaseTelemetry();
+      } catch {
+        raw = null;
+      }
+    }
+    let sessionStats = null;
+    if (!raw && session && typeof session.getStats === 'function') {
+      try {
+        sessionStats = session.getStats();
+      } catch {
+        sessionStats = null;
+      }
+    }
+    let rawDurations =
+      (raw && raw.phaseDurationsMs && typeof raw.phaseDurationsMs === 'object'
+        ? raw.phaseDurationsMs
+        : null) ||
+      (sessionStats && sessionStats.phaseDurationsMs && typeof sessionStats.phaseDurationsMs === 'object'
+        ? sessionStats.phaseDurationsMs
+        : null);
+    if (!rawDurations && session && typeof session.getPhaseDurations === 'function') {
+      try {
+        rawDurations = session.getPhaseDurations();
+      } catch {
+        rawDurations = null;
+      }
+    }
+
+    const sanitizedDurations = {};
+    for (let i = 0; i < CANONICAL_SESSION_PHASES.length; i += 1) {
+      const phaseKey = CANONICAL_SESSION_PHASES[i];
+      const val = rawDurations ? sanitizeNonNegativeFiniteNumber(rawDurations[phaseKey]) : null;
+      sanitizedDurations[phaseKey] = val !== null ? val : 0;
+    }
+
+    let currentPhase = null;
+    const rawCurrentPhase =
+      (raw && typeof raw.currentPhase === 'string' ? raw.currentPhase : null) ??
+      (sessionStats && typeof sessionStats.currentPhase === 'string'
+        ? sessionStats.currentPhase
+        : null) ??
+      (session && typeof session.getCurrentPhase === 'function'
+        ? (() => {
+            try {
+              return session.getCurrentPhase();
+            } catch {
+              return null;
+            }
+          })()
+        : null);
+    if (typeof rawCurrentPhase === 'string' && rawCurrentPhase.trim().length > 0) {
+      currentPhase = sanitizeDiagnosticText(rawCurrentPhase.trim(), 64) || null;
+    }
+
+    const phaseTransitionCount = toSafeNonNegativeInt(
+      (raw && raw.phaseTransitionCount) ?? (sessionStats && sessionStats.phaseTransitionCount),
+      0
+    );
+    const reclaimRuns = toSafeNonNegativeInt(
+      (raw && raw.reclaimRuns) ?? (sessionStats && sessionStats.reclaimRuns) ?? fallbackReclaimRuns,
+      0
+    );
+    const reclaimFailures = toSafeNonNegativeInt(
+      (raw && raw.reclaimFailures) ??
+        (sessionStats && sessionStats.reclaimFailures) ??
+        fallbackReclaimFailures,
+      0
+    );
+    const rawLastReason =
+      (raw && raw.lastReclaimReason) ??
+      (sessionStats && sessionStats.lastReclaimReason) ??
+      fallbackLastReclaimReason;
+    const lastReclaimReason =
+      typeof rawLastReason === 'string' && rawLastReason.trim().length > 0
+        ? sanitizeDiagnosticText(rawLastReason.trim(), 128)
+        : null;
+    const lastReclaimAtMs = sanitizeNonNegativeFiniteNumber(
+      (raw && raw.lastReclaimAtMs) ??
+        (sessionStats && sessionStats.lastReclaimAtMs) ??
+        fallbackLastReclaimAtMs
+    );
+
+    return Object.freeze({
+      currentPhase,
+      phaseDurationsMs: Object.freeze(sanitizedDurations),
+      phaseTransitionCount,
+      reclaimRuns,
+      reclaimFailures,
+      lastReclaimReason,
+      lastReclaimAtMs,
+    });
+  }
+
+  function resolvePreloadTelemetrySnapshot() {
+    let orchStats = null;
+    if (bootOrchestrator) {
+      try {
+        if (typeof bootOrchestrator.getStats === 'function') {
+          orchStats = bootOrchestrator.getStats();
+        } else if (typeof bootOrchestrator.getTimingStats === 'function') {
+          orchStats = bootOrchestrator.getTimingStats();
+        } else if (typeof bootOrchestrator.getPreloadStats === 'function') {
+          orchStats = { preloadStats: bootOrchestrator.getPreloadStats() };
+        }
+      } catch {
+        orchStats = null;
+      }
+    }
+    let preloaderStats = null;
+    if (pgimPreloader && typeof pgimPreloader.getStats === 'function') {
+      try {
+        preloaderStats = pgimPreloader.getStats();
+      } catch {
+        preloaderStats = null;
+      }
+    }
+    if (!orchStats && !preloaderStats) {
+      return null;
+    }
+    const pStats =
+      orchStats && orchStats.preloadStats && typeof orchStats.preloadStats === 'object'
+        ? orchStats.preloadStats
+        : {};
+    const stageDurations = {};
+    if (orchStats && orchStats.stageDurationsMs && typeof orchStats.stageDurationsMs === 'object') {
+      const keys = Object.keys(orchStats.stageDurationsMs);
+      for (let i = 0; i < keys.length; i += 1) {
+        const key = sanitizeDiagnosticText(keys[i], 64);
+        const val = sanitizeNonNegativeFiniteNumber(orchStats.stageDurationsMs[keys[i]]);
+        if (key && val !== null) {
+          stageDurations[key] = val;
+        }
+      }
+    }
+    return Object.freeze({
+      parallelPreload:
+        orchStats && typeof orchStats.parallelPreload === 'boolean'
+          ? orchStats.parallelPreload
+          : orchStats && typeof orchStats.parallelPreloadEnabled === 'boolean'
+            ? orchStats.parallelPreloadEnabled
+            : Boolean(pStats.parallelEnabled),
+      preloadConcurrency: toSafeNonNegativeInt(
+        (orchStats && orchStats.preloadConcurrency) ?? pStats.concurrencyLimit,
+        0
+      ),
+      serialEstimateMs:
+        sanitizeNonNegativeFiniteNumber(
+          (orchStats && orchStats.serialEstimateMs) ?? pStats.serialEstimateMs
+        ) ?? 0,
+      parallelWallMs:
+        sanitizeNonNegativeFiniteNumber(
+          (orchStats && orchStats.parallelWallMs) ?? pStats.parallelWallMs
+        ) ?? 0,
+      overlapSavedMs:
+        sanitizeNonNegativeFiniteNumber(
+          (orchStats && orchStats.overlapSavedMs) ??
+            (orchStats && orchStats.parallelPreloadSavedMs) ??
+            pStats.overlapSavedMs
+        ) ?? 0,
+      parallelStagesCount: toSafeNonNegativeInt(
+        (orchStats && orchStats.parallelStagesCount) ?? pStats.parallelStagesCount,
+        0
+      ),
+      totalBootMs: sanitizeNonNegativeFiniteNumber(orchStats && orchStats.totalBootMs) ?? 0,
+      stageDurationsMs: Object.freeze(stageDurations),
+      opfsHits: toSafeNonNegativeInt(preloaderStats && preloaderStats.opfsHits, 0),
+      opfsMisses: toSafeNonNegativeInt(preloaderStats && preloaderStats.opfsMisses, 0),
+      opfsWrites: toSafeNonNegativeInt(preloaderStats && preloaderStats.opfsWrites, 0),
+      opfsInvalidations: toSafeNonNegativeInt(preloaderStats && preloaderStats.opfsInvalidations, 0),
+      bytesFromOpfs: toSafeNonNegativeInt(preloaderStats && preloaderStats.bytesFromOpfs, 0),
+      bytesFromNetwork: toSafeNonNegativeInt(preloaderStats && preloaderStats.bytesFromNetwork, 0),
+      bytesLoaded: toSafeNonNegativeInt(preloaderStats && preloaderStats.bytesLoaded, 0),
+      totalBytes: toSafeNonNegativeInt(preloaderStats && preloaderStats.totalBytes, 0),
+      throughputMBps: sanitizeNonNegativeFiniteNumber(preloaderStats && preloaderStats.throughputMBps) ?? 0,
+    });
+  }
+
+  function resolveSplashTelemetrySnapshot() {
+    if (!splashOverlay || typeof splashOverlay !== 'object') {
+      return null;
+    }
+    let raw = null;
+    try {
+      if (typeof splashOverlay.getStats === 'function') {
+        raw = splashOverlay.getStats();
+      } else if (typeof splashOverlay.getState === 'function') {
+        raw = splashOverlay.getState();
+      }
+    } catch {
+      raw = null;
+    }
+    if (!raw || typeof raw !== 'object') {
+      return null;
+    }
+    const stageDurations = {};
+    if (raw.stageDurationsMs && typeof raw.stageDurationsMs === 'object') {
+      const keys = Object.keys(raw.stageDurationsMs);
+      for (let i = 0; i < keys.length; i += 1) {
+        const key = sanitizeDiagnosticText(keys[i], 64);
+        const val = sanitizeNonNegativeFiniteNumber(raw.stageDurationsMs[keys[i]]);
+        if (key && val !== null) {
+          stageDurations[key] = val;
+        }
+      }
+    }
+    return Object.freeze({
+      phase:
+        typeof raw.phase === 'string' && raw.phase.length > 0
+          ? sanitizeDiagnosticText(raw.phase, 64)
+          : null,
+      stage:
+        typeof raw.stage === 'string' && raw.stage.length > 0
+          ? sanitizeDiagnosticText(raw.stage, 64)
+          : null,
+      progressPct: toSafeNonNegativeInt(raw.progressPct, 0),
+      fadeOutMs:
+        sanitizeNonNegativeFiniteNumber(raw.fadeOutMs) ?? resolvedSplashFadeOutMs,
+      fadeOutCompleted: Boolean(raw.fadeOutCompleted),
+      visible: Boolean(raw.visible),
+      dismissed: Boolean(raw.dismissed),
+      totalSplashMs: sanitizeNonNegativeFiniteNumber(raw.totalSplashMs) ?? 0,
+      stageDurationsMs: Object.freeze(stageDurations),
+    });
+  }
+
   function getDiagnosticsSnapshot() {
     const sessionState = resolveSessionStateText();
     const recentCopy = Object.freeze(
@@ -5573,10 +6958,19 @@ export function bootstrapPlayGta6App(options = {}) {
       bootToInGameMs,
     } = resolveFastBootTimings();
     const perf = resolvePerfTelemetrySnapshot();
+    const audioRing = resolveAudioRingSnapshot();
+    const phaseTelemetry = getPhaseTelemetry();
+    const preloadTelemetry = resolvePreloadTelemetrySnapshot();
+    const splashTelemetry = resolveSplashTelemetrySnapshot();
     const loadingAssets = isSplashOverlayHolding();
     return Object.freeze({
       bootMode: resolveCurrentBootMode(),
       sessionState,
+      sessionPhase: phaseTelemetry.currentPhase,
+      phaseDurationsMs: phaseTelemetry.phaseDurationsMs,
+      phaseTelemetry,
+      reclaimRuns: phaseTelemetry.reclaimRuns,
+      reclaimFailures: phaseTelemetry.reclaimFailures,
       milestone: resolveCurrentMilestone(),
       sideModuleCount: resolveSideModuleCount(),
       validationErrorCount,
@@ -5591,6 +6985,8 @@ export function bootstrapPlayGta6App(options = {}) {
       bootToIntroVideoMs,
       bootToMainMenuMs,
       bootToInGameMs,
+      audioRingAttached: audioRing.audioRingAttached,
+      audioRingAttachAttempts: audioRing.audioRingAttachAttempts,
       fps30ComplianceRate: perf.fps30ComplianceRate,
       dominantBottleneck: perf.dominantBottleneck,
       frameJitterMs: perf.frameJitterMs,
@@ -5599,6 +6995,8 @@ export function bootstrapPlayGta6App(options = {}) {
       bindGroupHitRate: perf.bindGroupHitRate,
       mailboxLanes: perf.mailboxLanes,
       fastBootPlan: latestFastBootPlan,
+      preloadTelemetry,
+      splashTelemetry,
       loadingAssets,
       holdUntilVisible: Boolean(resolvedHoldUntilVisible),
       dumpPipelines: Boolean(activeDumpConfig && activeDumpConfig.dumpPipelines),
@@ -5622,6 +7020,10 @@ export function bootstrapPlayGta6App(options = {}) {
       bootToInGameMs,
     } = resolveFastBootTimings();
     const perf = resolvePerfTelemetrySnapshot();
+    const audioRing = resolveAudioRingSnapshot();
+    const phaseTelemetry = getPhaseTelemetry();
+    const preloadTelemetry = resolvePreloadTelemetrySnapshot();
+    const splashTelemetry = resolveSplashTelemetrySnapshot();
     const loadingAssets = isSplashOverlayHolding();
 
     const gpu = Object.freeze({
@@ -5672,6 +7074,11 @@ export function bootstrapPlayGta6App(options = {}) {
     return Object.freeze({
       bootMode: resolveCurrentBootMode(),
       sessionState,
+      sessionPhase: phaseTelemetry.currentPhase,
+      phaseDurationsMs: phaseTelemetry.phaseDurationsMs,
+      phaseTelemetry,
+      reclaimRuns: phaseTelemetry.reclaimRuns,
+      reclaimFailures: phaseTelemetry.reclaimFailures,
       milestone: resolveCurrentMilestone(),
       destroyed: Boolean(destroyed),
       dumpPipelines: Boolean(activeDumpConfig && activeDumpConfig.dumpPipelines),
@@ -5687,6 +7094,8 @@ export function bootstrapPlayGta6App(options = {}) {
       bootToMainMenuMs,
       bootToInGameMs,
       fastBootMilestones: fastBootMilestonesSnap,
+      audioRingAttached: audioRing.audioRingAttached,
+      audioRingAttachAttempts: audioRing.audioRingAttachAttempts,
       fps30ComplianceRate: perf.fps30ComplianceRate,
       dominantBottleneck: perf.dominantBottleneck,
       frameJitterMs: perf.frameJitterMs,
@@ -5697,6 +7106,8 @@ export function bootstrapPlayGta6App(options = {}) {
       mailboxLanes: perf.mailboxLanes,
       fastBootPlan: latestFastBootPlan,
       quotaEviction: latestQuotaEviction,
+      preloadTelemetry,
+      splashTelemetry,
       loadingAssets: gpu.loadingAssets,
       realPackDrawCount: gpu.realPackDrawCount,
       fallbackDrawCount: gpu.fallbackDrawCount,
@@ -5993,14 +7404,29 @@ export function bootstrapPlayGta6App(options = {}) {
       }
       result = sessionResult;
     }
-    if (!destroyed && result && result.ok && desiredInputScript) {
-      startActiveInputScript(desiredInputScript);
+    if (!destroyed && result && result.ok) {
+      if (desiredInputScript) {
+        startActiveInputScript(desiredInputScript);
+      }
+      if (
+        (externalAudioWorker && (boundAudioRingModule || typeof options.getWasmModule === 'function')) ||
+        audioRingController
+      ) {
+        attachAudioRing(null);
+      }
     }
     return result;
   }
 
   async function stop() {
     stopActiveInputScript();
+    if (audioRingController && typeof audioRingController.stop === 'function') {
+      try {
+        audioRingController.stop();
+      } catch {
+        // Ignore audio ring retry stop errors.
+      }
+    }
     if (destroyed) {
       return {
         ok: true,
@@ -6023,6 +7449,29 @@ export function bootstrapPlayGta6App(options = {}) {
 
     destroyed = true;
     destroyPromise = (async () => {
+      if (audioRingController) {
+        const ctrl = audioRingController;
+        audioRingController = null;
+        try {
+          if (ownsAudioRingController && typeof ctrl.destroy === 'function') {
+            ctrl.destroy();
+          } else if (typeof ctrl.stop === 'function') {
+            ctrl.stop();
+          }
+        } catch {
+          // Ignore audio ring retry controller teardown errors.
+        }
+      }
+
+      while (reclaimUnregisters.length > 0) {
+        const unregister = reclaimUnregisters.pop();
+        try {
+          unregister();
+        } catch {
+          // Ignore reclaim hook unregister errors.
+        }
+      }
+      fallbackReclaimHooks.clear();
       if (attachedGlobalHook && globalScope && typeof globalScope === 'object') {
         attachedGlobalHook = false;
         try {
@@ -6199,6 +7648,10 @@ export function bootstrapPlayGta6App(options = {}) {
     getDiagnosticsSnapshot,
     getBootTelemetry,
     getFastBootPlan: () => latestFastBootPlan,
+    getPhaseTelemetry,
+    reclaimSoftMemory,
+    registerReclaimHook,
+    attachAudioRing,
     notifyFirstPresent,
     notifyFirstVisibleFrame,
     recordFastBootMilestone,
