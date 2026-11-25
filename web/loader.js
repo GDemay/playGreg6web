@@ -1323,6 +1323,85 @@ function createWorkerBootInitPayloads(msg = {}) {
   };
 }
 
+/**
+ * Build worker init payloads plus zero-copy transfer lists for any preloaded non-SAB
+ * `ArrayBuffer`s (`pgimBuffer`/`pgimBytes` -> `ioWorker`, `shaderPackBuffer`/`shaderPackBytes`
+ * -> `gpuWorker`) alongside `msg.canvas`, avoiding structured-clone duplication.
+ */
+function createWorkerBootInitPayloadsWithTransfers(msg = {}) {
+  const base = createWorkerBootInitPayloads(msg);
+  const ioTransferList = [];
+  const gpuTransferList = [];
+  const seenTransfers = new Set();
+
+  const tryQueueTransfer = (buf, list) => {
+    if (!isTransferableArrayBuffer(buf) || buf.detached || buf.byteLength <= 0 || seenTransfers.has(buf)) {
+      return false;
+    }
+    seenTransfers.add(buf);
+    list.push(buf);
+    return true;
+  };
+
+  if (msg && typeof msg === 'object') {
+    const rawPgim = msg.pgimBuffer !== undefined && msg.pgimBuffer !== null
+      ? msg.pgimBuffer
+      : msg.pgimBytes !== undefined && msg.pgimBytes !== null
+        ? msg.pgimBytes
+        : msg.bundle && msg.bundle.pgim
+          ? msg.bundle.pgim.buffer || msg.bundle.pgim.bytes || null
+          : null;
+    if (rawPgim) {
+      if (isSharedArrayBuffer(rawPgim) || (ArrayBuffer.isView(rawPgim) && isSharedArrayBuffer(rawPgim.buffer))) {
+        base.ioInit.pgimBuffer = ArrayBuffer.isView(rawPgim) ? rawPgim.buffer : rawPgim;
+      } else {
+        const pgimBuf = toTransferableArrayBuffer(rawPgim);
+        if (pgimBuf && pgimBuf.byteLength > 0) {
+          base.ioInit.pgimBuffer = pgimBuf;
+          tryQueueTransfer(pgimBuf, ioTransferList);
+        }
+      }
+    }
+
+    const rawShaderPack = msg.shaderPackBuffer !== undefined && msg.shaderPackBuffer !== null
+      ? msg.shaderPackBuffer
+      : msg.shaderPackBytes !== undefined && msg.shaderPackBytes !== null
+        ? msg.shaderPackBytes
+        : msg.bundle && msg.bundle.shaderPackBytes
+          ? msg.bundle.shaderPackBytes.buffer || msg.bundle.shaderPackBytes.bytes || msg.bundle.shaderPackBytes
+          : null;
+    if (rawShaderPack) {
+      if (
+        isSharedArrayBuffer(rawShaderPack) ||
+        (ArrayBuffer.isView(rawShaderPack) && isSharedArrayBuffer(rawShaderPack.buffer))
+      ) {
+        base.gpuInit.shaderPackBuffer = ArrayBuffer.isView(rawShaderPack)
+          ? rawShaderPack.buffer
+          : rawShaderPack;
+      } else {
+        const shaderBuf = toTransferableArrayBuffer(rawShaderPack);
+        if (shaderBuf && shaderBuf.byteLength > 0) {
+          base.gpuInit.shaderPackBuffer = shaderBuf;
+          tryQueueTransfer(shaderBuf, gpuTransferList);
+        }
+      }
+    }
+
+    if (msg.canvas) {
+      gpuTransferList.unshift(msg.canvas);
+    }
+  }
+
+  return {
+    ioInit: base.ioInit,
+    gpuInit: base.gpuInit,
+    ioTransferList,
+    gpuTransferList,
+    transferredArrayBufferCount:
+      ioTransferList.length + (msg && msg.canvas ? Math.max(0, gpuTransferList.length - 1) : gpuTransferList.length),
+  };
+}
+
 // Builds Wasm64/Wasm32 `env` host import functions matching docs/wasm_abi.md and runtime/os/os_shim.cpp.
 function createHostImports(options = {}) {
   let currentMemory = options.memory || null;
@@ -2946,6 +3025,731 @@ function mergeHostImportsIntoWasmImports(imports, hostEnv) {
   return merged;
 }
 
+const WASM_WIRE_BINARY_KEYS = Object.freeze([
+  'wasmBinary',
+  'wireBytes',
+  'rawBytes',
+  'bytes',
+  'buffer',
+  'arrayBuffer',
+  'data',
+  'wasmBytes',
+  'wasmBuffer',
+  'pgimBytes',
+  'pgimBuffer',
+  'shaderPackBytes',
+  'shaderPackBuffer',
+]);
+const WASM_WIRE_COLLECTION_KEYS = Object.freeze([
+  'preloadedBuffers',
+  'guestModuleBytes',
+  'sideModuleBytes',
+  'sideModules',
+  'guestModules',
+  'wasmModules',
+  'modules',
+  'modulesByName',
+  'sidecars',
+  'bundle',
+  'program',
+  'runtimeWasm',
+  'pgim',
+]);
+const WASM_KEY_HINT_RE = /(?:wasm|guest_?part|guestmodule|sidemodule|wirebytes)/i;
+
+const wasmMemoryTelemetry = {
+  wireBytesReleased: 0,
+  droppedWasmBuffers: 0,
+  droppedPreloadBuffers: 0,
+  transferredArrayBuffers: 0,
+  streamingCompiles: 0,
+  fallbackCompiles: 0,
+};
+
+let activeSharedWasmModuleCount = 0;
+
+function isCompiledWasmModule(value, wasmNs) {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  const ModuleCtor =
+    (wasmNs && typeof wasmNs.Module === 'function' ? wasmNs.Module : null) ||
+    (typeof WebAssembly !== 'undefined' && typeof WebAssembly.Module === 'function'
+      ? WebAssembly.Module
+      : null);
+  return Boolean(ModuleCtor && value instanceof ModuleCtor);
+}
+
+function getBinaryWireInfo(value, wasmNs) {
+  if (!value || typeof value !== 'object' || isCompiledWasmModule(value, wasmNs)) {
+    return null;
+  }
+  if (isTransferableArrayBuffer(value)) {
+    return { backingBuffer: value, byteLength: value.byteLength, isShared: false };
+  }
+  if (isSharedArrayBuffer(value)) {
+    return { backingBuffer: value, byteLength: value.byteLength, isShared: true };
+  }
+  if (ArrayBuffer.isView(value)) {
+    return {
+      backingBuffer: value.buffer,
+      byteLength: value.byteLength,
+      isShared: isSharedArrayBuffer(value.buffer),
+    };
+  }
+  return null;
+}
+
+function recordDroppedWasmWireBytes(byteLength, count = 1) {
+  const bytes = toNonNegativeInt(byteLength, 0);
+  const buffers = toNonNegativeInt(count, 0);
+  if (bytes > 0) {
+    wasmMemoryTelemetry.wireBytesReleased += bytes;
+  }
+  if (buffers > 0) {
+    wasmMemoryTelemetry.droppedWasmBuffers += buffers;
+  }
+}
+
+function recordDroppedPreloadBytes(byteLength, count = 1) {
+  const bytes = toNonNegativeInt(byteLength, 0);
+  const buffers = toNonNegativeInt(count, 0);
+  if (bytes > 0) {
+    wasmMemoryTelemetry.wireBytesReleased += bytes;
+  }
+  if (buffers > 0) {
+    wasmMemoryTelemetry.droppedPreloadBuffers += buffers;
+  }
+}
+
+function recordTransferredArrayBuffers(count = 1) {
+  const n = toNonNegativeInt(count, 0);
+  if (n > 0) {
+    wasmMemoryTelemetry.transferredArrayBuffers += n;
+  }
+}
+
+function getWasmMemoryTelemetry() {
+  return {
+    wireBytesReleased: wasmMemoryTelemetry.wireBytesReleased,
+    droppedWasmBuffers: wasmMemoryTelemetry.droppedWasmBuffers,
+    droppedPreloadBuffers: wasmMemoryTelemetry.droppedPreloadBuffers,
+    transferredArrayBuffers: wasmMemoryTelemetry.transferredArrayBuffers,
+    streamingCompiles: wasmMemoryTelemetry.streamingCompiles,
+    fallbackCompiles: wasmMemoryTelemetry.fallbackCompiles,
+    sharedModuleCount: activeSharedWasmModuleCount,
+  };
+}
+
+function resetWasmMemoryTelemetry() {
+  wasmMemoryTelemetry.wireBytesReleased = 0;
+  wasmMemoryTelemetry.droppedWasmBuffers = 0;
+  wasmMemoryTelemetry.droppedPreloadBuffers = 0;
+  wasmMemoryTelemetry.transferredArrayBuffers = 0;
+  wasmMemoryTelemetry.streamingCompiles = 0;
+  wasmMemoryTelemetry.fallbackCompiles = 0;
+  return getWasmMemoryTelemetry();
+}
+
+function isWritableOwnProp(obj, key) {
+  if (!obj || typeof obj !== 'object') {
+    return false;
+  }
+  if (!Object.prototype.hasOwnProperty.call(obj, key)) {
+    return false;
+  }
+  const desc = Object.getOwnPropertyDescriptor(obj, key);
+  if (!desc) {
+    return false;
+  }
+  if ('get' in desc || 'set' in desc) {
+    return typeof desc.set === 'function';
+  }
+  return desc.writable === true;
+}
+
+/**
+ * Collect unique standalone non-SAB `ArrayBuffer`s reachable inside `payload` for
+ * zero-copy `postMessage(msg, transferList)`. Skips `SharedArrayBuffer`, `WebAssembly.Module`,
+ * detached buffers, and subviews that do not cover their entire backing buffer.
+ */
+function collectTransferableArrayBuffers(payload, wasmNs) {
+  const unique = new Set();
+  const visited = new Set();
+
+  const visit = (value) => {
+    if (!value || typeof value !== 'object' || isCompiledWasmModule(value, wasmNs)) {
+      return;
+    }
+    if (isTransferableArrayBuffer(value)) {
+      if (!value.detached && value.byteLength > 0) {
+        unique.add(value);
+      }
+      return;
+    }
+    if (isSharedArrayBuffer(value)) {
+      return;
+    }
+    if (ArrayBuffer.isView(value)) {
+      const buf = value.buffer;
+      if (
+        isTransferableArrayBuffer(buf) &&
+        !buf.detached &&
+        value.byteOffset === 0 &&
+        value.byteLength === buf.byteLength &&
+        buf.byteLength > 0
+      ) {
+        unique.add(buf);
+      }
+      return;
+    }
+    if (visited.has(value)) {
+      return;
+    }
+    visited.add(value);
+    if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i += 1) {
+        visit(value[i]);
+      }
+      return;
+    }
+    if (value instanceof Map || value instanceof Set) {
+      value.forEach((v) => visit(v));
+      return;
+    }
+    const keys = Object.keys(value);
+    for (let i = 0; i < keys.length; i += 1) {
+      let child;
+      try {
+        child = value[keys[i]];
+      } catch {
+        continue;
+      }
+      visit(child);
+    }
+  };
+
+  visit(payload);
+  return Array.from(unique);
+}
+
+/**
+ * Immediately drop raw `.wasm` / preload `ArrayBuffer` & `Uint8Array` references from a
+ * message, map, array, or bundle (`= null` / `Map.delete` / `array.length = 0`) while
+ * preserving compiled `WebAssembly.Module` objects and lightweight metadata.
+ */
+function releaseWireBytesFromObject(target, options = {}) {
+  const safeOpts = options && typeof options === 'object' ? options : {};
+  const recordTelemetry = safeOpts.recordTelemetry !== false;
+  const assumeWasm = safeOpts.assumeWasm === true;
+  const wasmNs = safeOpts.wasmApi || (typeof WebAssembly !== 'undefined' ? WebAssembly : null);
+  const releasedFields = [];
+  let releasedBytes = 0;
+  let droppedWasmCount = 0;
+  let droppedPreloadCount = 0;
+
+  if (!target || typeof target !== 'object' || isCompiledWasmModule(target, wasmNs)) {
+    return { releasedFields, releasedBytes, droppedWasmBuffers: 0, droppedPreloadBuffers: 0 };
+  }
+
+  const countedByBuffer = new Map();
+  const visited = new Set();
+
+  const countBuffer = (info, path) => {
+    if (!info || !info.backingBuffer) {
+      return;
+    }
+    const isWasm = assumeWasm || WASM_KEY_HINT_RE.test(path);
+    const len = info.byteLength > 0 ? info.byteLength : 0;
+    const prev = countedByBuffer.get(info.backingBuffer);
+    if (prev === undefined) {
+      countedByBuffer.set(info.backingBuffer, len);
+      releasedBytes += len;
+      if (isWasm) {
+        droppedWasmCount += 1;
+      } else {
+        droppedPreloadCount += 1;
+      }
+    } else if (len > prev) {
+      releasedBytes += len - prev;
+      countedByBuffer.set(info.backingBuffer, len);
+    }
+  };
+
+  const nullBinaryProp = (obj, key, path) => {
+    if (!isWritableOwnProp(obj, key)) {
+      return false;
+    }
+    let val;
+    try {
+      val = obj[key];
+    } catch {
+      return false;
+    }
+    const info = getBinaryWireInfo(val, wasmNs);
+    if (!info) {
+      return false;
+    }
+    try {
+      obj[key] = null;
+    } catch {
+      return false;
+    }
+    releasedFields.push(path);
+    countBuffer(info, path);
+    return true;
+  };
+
+  const walk = (node, prefix) => {
+    if (!node || typeof node !== 'object' || isCompiledWasmModule(node, wasmNs) || visited.has(node)) {
+      return;
+    }
+    visited.add(node);
+
+    if (node instanceof Map) {
+      const entries = Array.from(node.entries());
+      for (let i = 0; i < entries.length; i += 1) {
+        const [k, v] = entries[i];
+        const label = typeof k === 'string' || typeof k === 'number' ? String(k) : 'entry';
+        const path = prefix ? `${prefix}.${label}` : label;
+        const info = getBinaryWireInfo(v, wasmNs);
+        if (info) {
+          node.delete(k);
+          releasedFields.push(path);
+          countBuffer(info, path);
+        } else if (v && typeof v === 'object' && !isCompiledWasmModule(v, wasmNs)) {
+          walk(v, path);
+        }
+      }
+      return;
+    }
+
+    if (Array.isArray(node)) {
+      let allDirectBinary = node.length > 0;
+      for (let i = 0; i < node.length; i += 1) {
+        const item = node[i];
+        const path = prefix ? `${prefix}[${i}]` : `[${i}]`;
+        const info = getBinaryWireInfo(item, wasmNs);
+        if (info) {
+          if (isWritableOwnProp(node, String(i))) {
+            node[i] = null;
+            releasedFields.push(path);
+            countBuffer(info, path);
+          }
+        } else {
+          allDirectBinary = false;
+          if (item && typeof item === 'object' && !isCompiledWasmModule(item, wasmNs)) {
+            walk(item, path);
+          }
+        }
+      }
+      if (allDirectBinary && !Object.isFrozen(node)) {
+        try {
+          node.length = 0;
+        } catch {
+          // Ignore non-resizable arrays.
+        }
+      }
+      return;
+    }
+
+    for (let i = 0; i < WASM_WIRE_BINARY_KEYS.length; i += 1) {
+      const k = WASM_WIRE_BINARY_KEYS[i];
+      if (Object.prototype.hasOwnProperty.call(node, k)) {
+        const path = prefix ? `${prefix}.${k}` : k;
+        if (!nullBinaryProp(node, k, path)) {
+          const child = node[k];
+          if (child && typeof child === 'object' && !isCompiledWasmModule(child, wasmNs)) {
+            walk(child, path);
+          }
+        }
+      }
+    }
+
+    for (let i = 0; i < WASM_WIRE_COLLECTION_KEYS.length; i += 1) {
+      const k = WASM_WIRE_COLLECTION_KEYS[i];
+      if (!Object.prototype.hasOwnProperty.call(node, k)) {
+        continue;
+      }
+      let child;
+      try {
+        child = node[k];
+      } catch {
+        continue;
+      }
+      if (!child || typeof child !== 'object' || isCompiledWasmModule(child, wasmNs)) {
+        continue;
+      }
+      const path = prefix ? `${prefix}.${k}` : k;
+      if (getBinaryWireInfo(child, wasmNs)) {
+        nullBinaryProp(node, k, path);
+      } else {
+        walk(child, path);
+      }
+    }
+
+    // For plain maps (e.g. `preloadedBuffers` / `guestModuleBytes`), also drop direct binary keys.
+    if (
+      prefix &&
+      /(?:preloadedBuffers|guestModuleBytes|sideModuleBytes|sidecars|modulesByName)$/i.test(prefix)
+    ) {
+      const keys = Object.keys(node);
+      for (let i = 0; i < keys.length; i += 1) {
+        const k = keys[i];
+        const path = `${prefix}.${k}`;
+        if (!nullBinaryProp(node, k, path)) {
+          const child = node[k];
+          if (child && typeof child === 'object' && !isCompiledWasmModule(child, wasmNs)) {
+            walk(child, path);
+          }
+        }
+      }
+    }
+  };
+
+  walk(target, '');
+
+  if (recordTelemetry && (releasedBytes > 0 || droppedWasmCount > 0 || droppedPreloadCount > 0)) {
+    if (droppedWasmCount > 0) {
+      recordDroppedWasmWireBytes(releasedBytes, droppedWasmCount);
+      if (droppedPreloadCount > 0) {
+        wasmMemoryTelemetry.droppedPreloadBuffers += droppedPreloadCount;
+      }
+    } else if (droppedPreloadCount > 0) {
+      recordDroppedPreloadBytes(releasedBytes, droppedPreloadCount);
+    } else if (releasedBytes > 0) {
+      wasmMemoryTelemetry.wireBytesReleased += releasedBytes;
+    }
+  }
+
+  return {
+    releasedFields,
+    releasedBytes,
+    droppedWasmBuffers: droppedWasmCount,
+    droppedPreloadBuffers: droppedPreloadCount,
+  };
+}
+
+/**
+ * Strip any raw wire-byte `ArrayBuffer` / `Uint8Array` payloads from an Emscripten
+ * `sharedModules` list, map, or object so compiled `WebAssembly.Module` instances are
+ * shared across pthreads WITHOUT ever keeping or cloning raw `.wasm` wire bytes.
+ */
+function stripWireBytesFromSharedModules(sharedModules, options = {}) {
+  const safeOpts = options && typeof options === 'object' ? options : {};
+  const wasmNs = safeOpts.wasmApi || (typeof WebAssembly !== 'undefined' ? WebAssembly : null);
+  if (!sharedModules || typeof sharedModules !== 'object') {
+    return { releasedFields: [], releasedBytes: 0, droppedWasmBuffers: 0, droppedPreloadBuffers: 0 };
+  }
+  const result = releaseWireBytesFromObject(sharedModules, {
+    wasmApi: wasmNs,
+    assumeWasm: true,
+    recordTelemetry: safeOpts.recordTelemetry !== false,
+  });
+  return result;
+}
+
+/**
+ * Compile a WebAssembly module preferring `WebAssembly.compileStreaming` so large
+ * `guest_part_*.wasm` binaries never materialize as 1 GB JS `ArrayBuffer`s.
+ *
+ * Falls back cleanly to `response.arrayBuffer()` + `WebAssembly.compile(bytes)` and
+ * immediately drops all raw wire-byte references once compilation settles.
+ */
+async function compileWasmModuleStreaming(source, options = {}) {
+  const safeOpts = options && typeof options === 'object' ? options : {};
+  const wasmNs =
+    safeOpts.wasmApi && typeof safeOpts.wasmApi === 'object'
+      ? safeOpts.wasmApi
+      : typeof WebAssembly !== 'undefined'
+        ? WebAssembly
+        : null;
+  if (!wasmNs || typeof wasmNs.compile !== 'function') {
+    throw new Error('WebAssembly.compile is unavailable');
+  }
+  const fetchFn =
+    typeof safeOpts.fetchFn === 'function'
+      ? safeOpts.fetchFn
+      : typeof fetch === 'function'
+        ? fetch
+        : null;
+
+  if (isCompiledWasmModule(source, wasmNs)) {
+    return { module: source, streaming: false, wireBytesReleased: 0 };
+  }
+
+  const releaseOwnerSlot = () => {
+    if (!safeOpts.owner || safeOpts.ownerKey === undefined) {
+      return;
+    }
+    try {
+      if (safeOpts.owner instanceof Map) {
+        safeOpts.owner.delete(safeOpts.ownerKey);
+      } else if (isWritableOwnProp(safeOpts.owner, safeOpts.ownerKey)) {
+        safeOpts.owner[safeOpts.ownerKey] = null;
+      }
+    } catch {
+      // Ignore release errors on frozen/exotic containers.
+    }
+  };
+
+  const directBinary = getBinaryWireInfo(source, wasmNs);
+  if (directBinary) {
+    let localBytes = source;
+    const byteLength = directBinary.byteLength;
+    releaseOwnerSlot();
+    let mod;
+    try {
+      const compilePromise = wasmNs.compile(localBytes);
+      localBytes = null;
+      mod = await compilePromise;
+    } finally {
+      localBytes = null;
+      releaseOwnerSlot();
+      if (byteLength > 0) {
+        recordDroppedWasmWireBytes(byteLength, 1);
+      }
+    }
+    wasmMemoryTelemetry.fallbackCompiles += 1;
+    return { module: mod, streaming: false, wireBytesReleased: byteLength };
+  }
+
+  let resp = source;
+  if (typeof source === 'string') {
+    if (!fetchFn) {
+      throw new Error(`fetch unavailable while compiling ${source}`);
+    }
+    const fetchInit = { credentials: 'same-origin' };
+    if (safeOpts.signal) {
+      fetchInit.signal = safeOpts.signal;
+    }
+    resp = await fetchFn(source, fetchInit);
+  } else if (resp && typeof resp.then === 'function') {
+    resp = await resp;
+  }
+
+  if (!resp || resp.ok === false) {
+    const status = resp && resp.status !== undefined ? resp.status : 'unknown';
+    throw new Error(`Failed to fetch Wasm module (HTTP ${status})`);
+  }
+
+  const contentType =
+    resp.headers && typeof resp.headers.get === 'function'
+      ? String(resp.headers.get('content-type') || '')
+      : '';
+  const isRealResponse = typeof Response === 'undefined' || resp instanceof Response;
+  const canStream =
+    typeof wasmNs.compileStreaming === 'function' &&
+    (isRealResponse || safeOpts.allowStreamingWithoutContentType === true) &&
+    (contentType.toLowerCase().includes('application/wasm') ||
+      safeOpts.allowStreamingWithoutContentType === true);
+
+  if (canStream) {
+    try {
+      const mod = await wasmNs.compileStreaming(Promise.resolve(resp));
+      wasmMemoryTelemetry.streamingCompiles += 1;
+      return { module: mod, streaming: true, wireBytesReleased: 0 };
+    } catch (streamErr) {
+      if (resp.bodyUsed) {
+        throw streamErr;
+      }
+      // Fall back to arrayBuffer() + compile() when streaming was rejected before consuming body.
+    }
+  }
+
+  let wireBytes = await resp.arrayBuffer();
+  const byteLength = wireBytes && typeof wireBytes.byteLength === 'number' ? wireBytes.byteLength : 0;
+  let mod;
+  try {
+    const compilePromise = wasmNs.compile(wireBytes);
+    wireBytes = null;
+    mod = await compilePromise;
+  } finally {
+    wireBytes = null;
+    if (byteLength > 0) {
+      recordDroppedWasmWireBytes(byteLength, 1);
+    }
+  }
+  wasmMemoryTelemetry.fallbackCompiles += 1;
+  return { module: mod, streaming: false, wireBytesReleased: byteLength };
+}
+
+/**
+ * Shared compiled `WebAssembly.Module` cache for Emscripten side modules (`guest_part_*.wasm`).
+ * Compiles each module at most once, deduplicates concurrent requests, shares the compiled
+ * `WebAssembly.Module` across all `em-pthread` workers, and NEVER retains raw wire bytes.
+ */
+function createSharedWasmModuleCache(options = {}) {
+  const safeOpts = options && typeof options === 'object' ? options : {};
+  const modulesByKey = new Map();
+  const inFlightByKey = new Map();
+  const trackGlobalCount = safeOpts.trackGlobalCount === true;
+
+  const normalizeKey = (rawKey) => {
+    if (typeof rawKey !== 'string') {
+      return '';
+    }
+    const base = extractWasmBasename(rawKey) || rawKey.trim();
+    return base.toLowerCase();
+  };
+
+  const syncGlobalCount = () => {
+    if (trackGlobalCount) {
+      activeSharedWasmModuleCount = modulesByKey.size;
+    }
+  };
+
+  function setModule(nameOrUrl, mod) {
+    const key = normalizeKey(nameOrUrl);
+    if (!key || !isCompiledWasmModule(mod, safeOpts.wasmApi)) {
+      return false;
+    }
+    modulesByKey.set(key, mod);
+    syncGlobalCount();
+    return true;
+  }
+
+  function getModule(nameOrUrl) {
+    const key = normalizeKey(nameOrUrl);
+    return key ? modulesByKey.get(key) || null : null;
+  }
+
+  function hasModule(nameOrUrl) {
+    const key = normalizeKey(nameOrUrl);
+    return key ? modulesByKey.has(key) : false;
+  }
+
+  async function compileAndShare(nameOrUrl, source, callOpts = {}) {
+    const key = normalizeKey(nameOrUrl);
+    if (!key) {
+      throw new TypeError('Shared Wasm module key must be a non-empty string');
+    }
+    const existing = modulesByKey.get(key);
+    if (existing) {
+      // Even on cache hit, immediately release any raw wire bytes passed by caller.
+      if (callOpts && callOpts.owner && callOpts.ownerKey !== undefined) {
+        const info = getBinaryWireInfo(source, callOpts.wasmApi || safeOpts.wasmApi);
+        if (callOpts.owner instanceof Map) {
+          callOpts.owner.delete(callOpts.ownerKey);
+        } else if (isWritableOwnProp(callOpts.owner, callOpts.ownerKey)) {
+          callOpts.owner[callOpts.ownerKey] = null;
+        }
+        if (info && info.byteLength > 0) {
+          recordDroppedWasmWireBytes(info.byteLength, 1);
+        }
+      }
+      return existing;
+    }
+    const pending = inFlightByKey.get(key);
+    if (pending) {
+      return pending;
+    }
+    const promise = compileWasmModuleStreaming(source, {
+      wasmApi: callOpts.wasmApi || safeOpts.wasmApi,
+      fetchFn: callOpts.fetchFn || safeOpts.fetchFn,
+      signal: callOpts.signal,
+      allowStreamingWithoutContentType: callOpts.allowStreamingWithoutContentType,
+      owner: callOpts.owner,
+      ownerKey: callOpts.ownerKey,
+    })
+      .then((res) => {
+        if (res && res.module) {
+          modulesByKey.set(key, res.module);
+          syncGlobalCount();
+          return res.module;
+        }
+        return null;
+      })
+      .finally(() => {
+        inFlightByKey.delete(key);
+      });
+    inFlightByKey.set(key, promise);
+    return promise;
+  }
+
+  async function ingestPreloadedBuffers(container, callOpts = {}) {
+    if (!container || typeof container !== 'object') {
+      return [];
+    }
+    const compiled = [];
+    const entries =
+      container instanceof Map
+        ? Array.from(container.entries())
+        : Object.keys(container).map((k) => [k, container[k]]);
+    for (let i = 0; i < entries.length; i += 1) {
+      const [key, raw] = entries[i];
+      if (!raw) {
+        continue;
+      }
+      const wasmNs = callOpts.wasmApi || safeOpts.wasmApi;
+      if (isCompiledWasmModule(raw, wasmNs)) {
+        setModule(key, raw);
+        compiled.push(raw);
+        continue;
+      }
+      let wireCandidate = raw;
+      if (!getBinaryWireInfo(raw, wasmNs) && typeof raw === 'object') {
+        if (isCompiledWasmModule(raw.module, wasmNs)) {
+          setModule(key, raw.module);
+          compiled.push(raw.module);
+          releaseWireBytesFromObject(raw, { wasmApi: wasmNs, assumeWasm: true });
+          continue;
+        }
+        wireCandidate =
+          raw.wasmBinary || raw.wireBytes || raw.bytes || raw.buffer || raw.arrayBuffer || null;
+      }
+      if (getBinaryWireInfo(wireCandidate, wasmNs)) {
+        const mod = await compileAndShare(key, wireCandidate, {
+          ...callOpts,
+          owner: container,
+          ownerKey: key,
+        });
+        if (mod) {
+          compiled.push(mod);
+        }
+        if (raw && typeof raw === 'object' && raw !== wireCandidate) {
+          releaseWireBytesFromObject(raw, { wasmApi: wasmNs, assumeWasm: true });
+        }
+      }
+    }
+    return compiled;
+  }
+
+  function getSharedModulesArray() {
+    return Array.from(modulesByKey.values());
+  }
+
+  function getSharedModulesMap() {
+    return new Map(modulesByKey);
+  }
+
+  function clear() {
+    modulesByKey.clear();
+    inFlightByKey.clear();
+    syncGlobalCount();
+  }
+
+  return {
+    setModule,
+    getModule,
+    hasModule,
+    compileAndShare,
+    ingestPreloadedBuffers,
+    getSharedModulesArray,
+    getSharedModulesMap,
+    clear,
+    get size() {
+      return modulesByKey.size;
+    },
+    getStats() {
+      return {
+        sharedModuleCount: modulesByKey.size,
+        inFlightCompiles: inFlightByKey.size,
+      };
+    },
+  };
+}
+
 function createInstantiateWasmHandler(options = {}) {
   const locateFile =
     typeof options.locateFile === 'function' ? options.locateFile : (f) => `dist/${f}`;
@@ -2957,7 +3761,18 @@ function createInstantiateWasmHandler(options = {}) {
       : typeof fetch === 'function'
         ? fetch
         : null;
-  const wasmBinary = options.wasmBinary || null;
+  const wasmNs =
+    options.wasmApi && typeof options.wasmApi === 'object'
+      ? options.wasmApi
+      : typeof WebAssembly !== 'undefined'
+        ? WebAssembly
+        : null;
+  const precompiledModule = isCompiledWasmModule(options.wasmBinary, wasmNs)
+    ? options.wasmBinary
+    : null;
+  // Hold raw wire bytes in a mutable slot (never captured by `finish`) and clear immediately
+  // upon handing to `WebAssembly.instantiate` so the closure retains 0 wire bytes.
+  let pendingWireBytes = precompiledModule ? null : options.wasmBinary || null;
   const onError = typeof options.onError === 'function' ? options.onError : null;
 
   return function instantiateWasm(imports, receiveInstance) {
@@ -2976,9 +3791,7 @@ function createInstantiateWasmHandler(options = {}) {
       const mod =
         result && result.module
           ? result.module
-          : typeof WebAssembly !== 'undefined' && wasmBinary instanceof WebAssembly.Module
-            ? wasmBinary
-            : undefined;
+          : precompiledModule || undefined;
       if (
         instance &&
         instance.exports &&
@@ -3010,8 +3823,21 @@ function createInstantiateWasmHandler(options = {}) {
 
     const wasmUrl = locateFile('runtime.wasm');
     let instantiatePromise;
-    if (wasmBinary) {
-      instantiatePromise = WebAssembly.instantiate(wasmBinary, mergedImports);
+    if (precompiledModule) {
+      instantiatePromise = wasmNs.instantiate(precompiledModule, mergedImports);
+    } else if (pendingWireBytes) {
+      let localWireBytes = pendingWireBytes;
+      pendingWireBytes = null;
+      const wireInfo = getBinaryWireInfo(localWireBytes, wasmNs);
+      const wireLen = wireInfo ? wireInfo.byteLength : 0;
+      const rawPromise = wasmNs.instantiate(localWireBytes, mergedImports);
+      localWireBytes = null;
+      instantiatePromise = rawPromise.finally(() => {
+        if (wireLen > 0) {
+          recordDroppedWasmWireBytes(wireLen, 1);
+        }
+        wasmMemoryTelemetry.fallbackCompiles += 1;
+      });
     } else if (!fetchFn) {
       handleFailure(new Error(`fetch unavailable while loading ${wasmUrl}`));
       return {};
@@ -3027,14 +3853,34 @@ function createInstantiateWasmHandler(options = {}) {
             resp.headers && typeof resp.headers.get === 'function'
               ? String(resp.headers.get('content-type') || '')
               : '';
-          const canStream =
-            typeof WebAssembly.instantiateStreaming === 'function' &&
-            (typeof Response === 'undefined' || resp instanceof Response) &&
-            contentType.toLowerCase().includes('application/wasm');
-          if (canStream) {
-            return WebAssembly.instantiateStreaming(Promise.resolve(resp), mergedImports);
+          const isRealResponse = typeof Response === 'undefined' || resp instanceof Response;
+          const isWasmMime = contentType.toLowerCase().includes('application/wasm');
+          const canInstantiateStreaming =
+            typeof wasmNs.instantiateStreaming === 'function' && isRealResponse && isWasmMime;
+          if (canInstantiateStreaming) {
+            wasmMemoryTelemetry.streamingCompiles += 1;
+            return wasmNs.instantiateStreaming(Promise.resolve(resp), mergedImports);
           }
-          return resp.arrayBuffer().then((bytes) => WebAssembly.instantiate(bytes, mergedImports));
+          const canCompileStreaming =
+            typeof wasmNs.compileStreaming === 'function' && isRealResponse && isWasmMime;
+          if (canCompileStreaming) {
+            wasmMemoryTelemetry.streamingCompiles += 1;
+            return wasmNs.compileStreaming(Promise.resolve(resp)).then((mod) =>
+              wasmNs.instantiate(mod, mergedImports).then((instance) => ({ instance, module: mod })),
+            );
+          }
+          return resp.arrayBuffer().then((bytes) => {
+            let localBytes = bytes;
+            const wireLen = localBytes && typeof localBytes.byteLength === 'number' ? localBytes.byteLength : 0;
+            const p = wasmNs.instantiate(localBytes, mergedImports);
+            localBytes = null;
+            return p.finally(() => {
+              if (wireLen > 0) {
+                recordDroppedWasmWireBytes(wireLen, 1);
+              }
+              wasmMemoryTelemetry.fallbackCompiles += 1;
+            });
+          });
         });
     }
 
@@ -5620,6 +6466,16 @@ function buildRuntimeModuleConfig(options = {}) {
     if (mod && !boundModule) {
       boundModule = mod;
     }
+    // W351 (#1077): Drop raw Emscripten `Module.wasmBinary` wire bytes once compiled/initialized.
+    if (mod && typeof mod === 'object' && Object.prototype.hasOwnProperty.call(mod, 'wasmBinary')) {
+      const binInfo = getBinaryWireInfo(mod.wasmBinary);
+      if (binInfo && isWritableOwnProp(mod, 'wasmBinary')) {
+        mod.wasmBinary = null;
+        if (binInfo.byteLength > 0) {
+          recordDroppedWasmWireBytes(binInfo.byteLength, 1);
+        }
+      }
+    }
     attachPipelineDumpSyncer(mod);
     attachInputBridge(mod);
     attachAudioRing(mod);
@@ -5694,6 +6550,13 @@ function buildRuntimeModuleConfig(options = {}) {
   if (combinedDynamicLibraries.length > 0) {
     config.dynamicLibraries = combinedDynamicLibraries.slice();
     config.sideModuleUrls = resolvedSideModuleUrls.slice();
+  }
+  if (Array.isArray(options.sharedModules) && options.sharedModules.length > 0) {
+    stripWireBytesFromSharedModules(options.sharedModules);
+    const compiledOnly = options.sharedModules.filter((entry) => isCompiledWasmModule(entry));
+    if (compiledOnly.length > 0) {
+      config.sharedModules = compiledOnly;
+    }
   }
   if (manifestSummary) {
     config.indirectDispatch = manifestSummary.indirectDispatch;
@@ -5909,6 +6772,12 @@ function createPthreadPoolCoordinator(options = {}) {
         : null;
   const onPthreadTxMessage =
     typeof options.onPthreadTxMessage === 'function' ? options.onPthreadTxMessage : null;
+  const getSharedModules =
+    typeof options.getSharedModules === 'function'
+      ? options.getSharedModules
+      : Array.isArray(options.sharedModules)
+        ? () => options.sharedModules
+        : null;
   const explicitMessageChannelCtor = options.MessageChannelCtor;
   const onTelemetryChange =
     typeof options.onTelemetryChange === 'function' ? options.onTelemetryChange : null;
@@ -6386,6 +7255,41 @@ function createPthreadPoolCoordinator(options = {}) {
         }
         if (isPthreadLoadMessage(msg)) {
           if (entry.state === 'spawned') {
+            // W351 (#1077): Share compiled WebAssembly.Module objects across pthreads and never
+            // carry or clone raw wire-byte ArrayBuffers alongside compiled modules in CMD_LOAD.
+            if (msg && typeof msg === 'object') {
+              if (msg.sharedModules) {
+                stripWireBytesFromSharedModules(msg.sharedModules);
+              } else if (getSharedModules) {
+                const shared = getSharedModules();
+                if (Array.isArray(shared) && shared.length > 0) {
+                  const compiledOnly = shared.filter((m) => isCompiledWasmModule(m));
+                  if (compiledOnly.length > 0) {
+                    msg.sharedModules = compiledOnly;
+                  }
+                }
+              }
+              if (isCompiledWasmModule(msg.wasmModule)) {
+                if (
+                  Object.prototype.hasOwnProperty.call(msg, 'wasmBinary') &&
+                  getBinaryWireInfo(msg.wasmBinary)
+                ) {
+                  const info = getBinaryWireInfo(msg.wasmBinary);
+                  if (isWritableOwnProp(msg, 'wasmBinary')) {
+                    msg.wasmBinary = null;
+                    if (info && info.byteLength > 0) {
+                      recordDroppedWasmWireBytes(info.byteLength, 1);
+                    }
+                  }
+                }
+                if (msg.guestModuleBytes) {
+                  releaseWireBytesFromObject(msg.guestModuleBytes, { assumeWasm: true });
+                }
+                if (msg.preloadedBuffers) {
+                  releaseWireBytesFromObject(msg.preloadedBuffers, { assumeWasm: true });
+                }
+              }
+            }
             entry.loadArgs = callArgs;
             enqueueLoad(entry);
             emitTelemetry();
@@ -6554,6 +7458,9 @@ let configuredDumpMaxConcurrentUploads = undefined;
 let activeCoordinatorPipelineDumpSyncer = null;
 let activeGuestManifestSummary = null;
 let activeSideModuleProgressGetter = null;
+let pendingPreloadedWasmBinary = null;
+let pendingPreloadedGuestBuffers = null;
+const coordinatorSharedWasmModules = createSharedWasmModuleCache({ trackGlobalCount: true });
 
 // W345: Keep pthread GPU submits flowing through the coordinator's multiplexed `txPort`
 // so `FIRST_PRESENT` detection (`GPU_OPCODE_PRESENT = 7`), audio-ring milestone delivery,
@@ -6636,6 +7543,7 @@ function handlePthreadTxMessage(data) {
 const coordinatorPthreadPool = createPthreadPoolCoordinator({
   getHttpfsMailboxSab: () => httpfsMailboxSab,
   getHttpfsMailboxSabs: () => httpfsMailboxSabs,
+  getSharedModules: () => coordinatorSharedWasmModules.getSharedModulesArray(),
   onPthreadTxMessage: handlePthreadTxMessage,
 });
 
@@ -6703,6 +7611,13 @@ function getLoaderStatus() {
     audioRingRetryCount: audioRingTelemetry ? audioRingTelemetry.audioRingRetryCount : 0,
     audioRingLastReason: audioRingTelemetry ? audioRingTelemetry.audioRingLastReason : null,
     renderStateStats: lastRenderStateStats ? Object.assign({}, lastRenderStateStats) : null,
+    wireBytesReleased: wasmMemoryTelemetry.wireBytesReleased,
+    droppedWasmBuffers: wasmMemoryTelemetry.droppedWasmBuffers,
+    droppedPreloadBuffers: wasmMemoryTelemetry.droppedPreloadBuffers,
+    transferredArrayBuffers: wasmMemoryTelemetry.transferredArrayBuffers,
+    streamingCompiles: wasmMemoryTelemetry.streamingCompiles,
+    fallbackCompiles: wasmMemoryTelemetry.fallbackCompiles,
+    sharedModuleCount: coordinatorSharedWasmModules.size,
   };
 }
 
@@ -6751,12 +7666,25 @@ async function tryBootWasmRuntime() {
     report('Loading Emscripten Wasm64 runtime (dist/runtime.js)...');
     importScripts('./dist/runtime.js');
     if (typeof self.createRuntimeModule === 'function') {
+      if (pendingPreloadedGuestBuffers) {
+        const toIngest = pendingPreloadedGuestBuffers;
+        pendingPreloadedGuestBuffers = null;
+        try {
+          await coordinatorSharedWasmModules.ingestPreloadedBuffers(toIngest, { fetchFn: fetch });
+        } finally {
+          releaseWireBytesFromObject(toIngest, { assumeWasm: true });
+        }
+      }
+
       const runtimeOptions = {
         onFirstPresent: () => {
           coordinatorFirstPresentEmitted = true;
         },
         onExit: () => {
           coordinatorPthreadPool.closeTxPorts();
+          coordinatorSharedWasmModules.clear();
+          pendingPreloadedWasmBinary = null;
+          pendingPreloadedGuestBuffers = null;
           activeCoordinatorRuntimeModule = null;
           activeCoordinatorModuleConfig = null;
         },
@@ -6766,6 +7694,14 @@ async function tryBootWasmRuntime() {
           postProgress({ error: `runtime wasm: ${err}` });
         },
       };
+      if (pendingPreloadedWasmBinary) {
+        runtimeOptions.wasmBinary = pendingPreloadedWasmBinary;
+        pendingPreloadedWasmBinary = null;
+      }
+      const precompiledSharedModules = coordinatorSharedWasmModules.getSharedModulesArray();
+      if (precompiledSharedModules.length > 0) {
+        runtimeOptions.sharedModules = precompiledSharedModules;
+      }
       if (manifestSummary) {
         runtimeOptions.guestManifest = manifestSummary;
       }
@@ -7136,8 +8072,45 @@ if (typeof self !== 'undefined') {
       }
     };
 
-    const workerInits = createWorkerBootInitPayloads(msg);
-    ioWorker.postMessage(workerInits.ioInit);
+    const workerInits = createWorkerBootInitPayloadsWithTransfers(msg);
+    if (workerInits.transferredArrayBufferCount > 0) {
+      recordTransferredArrayBuffers(workerInits.transferredArrayBufferCount);
+    }
+
+    // Consume any preloaded Wasm binary / side-module wire buffers from `msg` and immediately
+    // null out all raw binary properties on `msg` so `self.onmessage`'s closure retains 0 bytes.
+    coordinatorSharedWasmModules.clear();
+    pendingPreloadedWasmBinary =
+      msg.wasmBinary !== undefined && msg.wasmBinary !== null ? msg.wasmBinary : null;
+    if (msg.wasmBinary !== undefined && isWritableOwnProp(msg, 'wasmBinary')) {
+      msg.wasmBinary = null;
+    }
+    if (Array.isArray(msg.sharedModules)) {
+      stripWireBytesFromSharedModules(msg.sharedModules);
+      for (let i = 0; i < msg.sharedModules.length; i += 1) {
+        if (isCompiledWasmModule(msg.sharedModules[i])) {
+          coordinatorSharedWasmModules.setModule(`shared_${i}.wasm`, msg.sharedModules[i]);
+        }
+      }
+    }
+    pendingPreloadedGuestBuffers = null;
+    if (msg.guestModuleBytes && typeof msg.guestModuleBytes === 'object') {
+      pendingPreloadedGuestBuffers = msg.guestModuleBytes;
+      if (isWritableOwnProp(msg, 'guestModuleBytes')) {
+        msg.guestModuleBytes = null;
+      }
+    } else if (msg.preloadedBuffers && typeof msg.preloadedBuffers === 'object') {
+      pendingPreloadedGuestBuffers = msg.preloadedBuffers;
+      if (isWritableOwnProp(msg, 'preloadedBuffers')) {
+        msg.preloadedBuffers = null;
+      }
+    }
+
+    if (workerInits.ioTransferList.length > 0) {
+      ioWorker.postMessage(workerInits.ioInit, workerInits.ioTransferList);
+    } else {
+      ioWorker.postMessage(workerInits.ioInit);
+    }
     if (httpfsMailboxSab) {
       const attachMailboxMsg = { attachMailbox: true, sab: httpfsMailboxSab };
       if (httpfsMailboxSabs.length > 0) {
@@ -7145,8 +8118,19 @@ if (typeof self !== 'undefined') {
       }
       ioWorker.postMessage(attachMailboxMsg);
     }
-    gpuWorker.postMessage(workerInits.gpuInit, [msg.canvas]);
+    if (workerInits.gpuTransferList.length > 0) {
+      gpuWorker.postMessage(workerInits.gpuInit, workerInits.gpuTransferList);
+    } else {
+      gpuWorker.postMessage(workerInits.gpuInit, [msg.canvas]);
+    }
     audioWorker.postMessage({ init: true });
+
+    // Clear all binary buffer references from `msg` and `workerInits` immediately after handoff.
+    releaseWireBytesFromObject(msg, { recordTelemetry: false });
+    workerInits.ioInit = null;
+    workerInits.gpuInit = null;
+    workerInits.ioTransferList = null;
+    workerInits.gpuTransferList = null;
   };
 }
 
@@ -7195,12 +8179,20 @@ const exportedApi = {
   installPthreadWorkerProxy,
   getPthreadTelemetry,
   getLoaderStatus,
+  getWasmMemoryTelemetry,
+  resetWasmMemoryTelemetry,
+  collectTransferableArrayBuffers,
+  releaseWireBytesFromObject,
+  stripWireBytesFromSharedModules,
+  compileWasmModuleStreaming,
+  createSharedWasmModuleCache,
   parseGuestManifest,
   loadGuestManifest,
   inspectGpuPacketBatchForPresent,
   normalizeBootHttpfsPath,
   collectBootBridgeInitFields,
   createWorkerBootInitPayloads,
+  createWorkerBootInitPayloadsWithTransfers,
   forwardGpuWorkerMessage,
   sanitizeRenderStateStats,
   createHostImports,
