@@ -407,7 +407,7 @@ Device::~Device() {
             std::lock_guard<std::mutex> lock(address_textures_mutex_);
             ids.reserve(address_textures_.size());
             for (const auto& entry : address_textures_) {
-                ids.push_back(entry.second);
+                ids.push_back(entry.second.id);
             }
             address_textures_.clear();
         }

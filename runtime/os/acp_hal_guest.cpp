@@ -286,6 +286,16 @@ constexpr uint32_t kXApuMaxPacketBytes = 0x280;   // one input slot
 constexpr uint32_t kXApuMaxOutputBytes = 0x1E00;  // one output slot
 
 using XApuResult = std::array<uint8_t, kXApuResultBytes>;
+// O36: a title that never dequeues must not grow a connection's result queue without limit: past
+// this many pending results the oldest is dropped.
+constexpr size_t kXApuMaxPendingResults = 4096;
+
+void push_bounded(std::deque<XApuResult>& queue, const XApuResult& result) {
+    queue.push_back(result);
+    while (queue.size() > kXApuMaxPendingResults) {
+        queue.pop_front();
+    }
+}
 
 struct XApuState {
     std::mutex mutex;
@@ -475,10 +485,10 @@ HResult xapu_enqueue_command(uint64_t handle, uint64_t command, uint32_t /*flags
         }
     }
     if (type == 3) {
-        it->second.push_back(decode_command(handle, decode));
+        push_bounded(it->second, decode_command(handle, decode));
         ++xapu().type3_results;
     } else if (acknowledged) {
-        it->second.push_back(make_result(type, head[1]));
+        push_bounded(it->second, make_result(type, head[1]));
     } else {
         ++xapu().unhandled;
     }

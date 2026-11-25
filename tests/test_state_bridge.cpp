@@ -3062,7 +3062,27 @@ void test_banded_texture_upload() {
     com::set_guest_memory(nullptr);
 }
 
+// O36: views die with their texture: create/destroy N textures with views, the table stays small.
+void test_view_table_bounded() {
+    d3d::DescriptorHeapRegistry heaps;
+    bridge::StateBridgeDevice device(heaps, bridge::BridgeOptions{});
+    for (uint32_t n = 1; n <= 5000; ++n) {
+        bridge::ViewRecord rec{};
+        rec.texture_id = n;
+        rec.resource_id = n;
+        CHECK(device.test_intern_view(rec) != 0);
+        device.unregister_resource(n);
+        CHECK(device.live_view_count() == 0);
+    }
+    // A recycled id resolves to the new view, and the same texture re-interns to one id.
+    bridge::ViewRecord rec{};
+    rec.texture_id = 9000;
+    const uint32_t a = device.test_intern_view(rec);
+    CHECK(device.test_intern_view(rec) == a && a <= 2u && device.view(a)->texture_id == 9000u);
+}
+
 int main() {
+    test_view_table_bounded();
     test_content_hash_change_detection();
     test_storage_texture_format_conversion();
     test_fragment_storage_texture_format_conversion();

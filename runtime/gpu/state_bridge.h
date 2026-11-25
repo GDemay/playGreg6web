@@ -294,6 +294,14 @@ private:
     };
 
     uint32_t intern_view(const ViewRecord& record) const;
+    void retire_views(uint32_t texture_id);
+
+public:
+    // O36 (tests): live interned views and sampler count.
+    size_t live_view_count() const;
+    uint32_t test_intern_view(const ViewRecord& record) const { return intern_view(record); }
+
+private:
     bool resolve_view_descriptor(uint64_t cpu_handle, d3d::DescriptorKind kind, d3d::ViewDescriptor* out) const;
     PipelineLayoutRecord* find_layout(uint64_t first_shader, uint64_t second_shader);
     uint32_t module_id(uint64_t shader_identity, bool* known) const;
@@ -343,6 +351,10 @@ private:
     mutable std::mutex views_mutex_;
     mutable std::deque<ViewRecord> views_;  // index = view_id - 1 (stable addresses)
     mutable std::unordered_map<std::string, uint32_t> view_ids_;
+    // O36: views die with their texture: the id is recycled (free list) and the interned key dropped.
+    mutable std::deque<std::string> view_keys_;                               // index = view_id - 1; empty = free
+    mutable std::unordered_map<uint32_t, std::vector<uint32_t>> views_by_texture_;
+    mutable std::vector<uint32_t> free_views_;
 
     std::mutex objects_mutex_;  // layouts, samplers, root constant ring
     std::vector<std::unique_ptr<GroupLayoutRecord>> group_layouts_;
