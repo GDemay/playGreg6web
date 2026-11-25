@@ -1,11 +1,14 @@
-// W102: bounded-concurrency async GPU pipeline compilation.
+// W102 / W138 / W168: priority-scheduled, bounded-concurrency async GPU pipeline compilation.
 //
 // A burst of ~200 createRenderPipeline() calls on one frame blocks the GPU process long enough to
 // trip a Windows WDDM TDR and lose the Dawn instance. AsyncPipelineCache routes every compile
-// through create{Render,Compute}PipelineAsync with at most `maxConcurrent` compilations in flight
-// (FIFO queue for the rest), dedupes identical pipelines by `dedupeKey`, retries once with a
-// `fallbackDescriptor` (e.g. layout: 'auto') when the primary descriptor rejects, and drops results
-// that resolve after reset(newDevice) (device loss) instead of writing them into the new device.
+// through create{Render,Compute}PipelineAsync with at most `maxConcurrentCompiles` (default 4,
+// 0 = unlimited) compilations in flight, prioritizing graphics (render) pipelines ahead of
+// background compute pipelines (or explicit numeric priority, FIFO within equal priority),
+// coalesces identical pipelines by `dedupeKey` (promoting queued jobs when a higher-priority
+// caller arrives), retries once with a `fallbackDescriptor` (e.g. layout: 'auto') when the
+// primary descriptor rejects, tracks compile-stall latency telemetry, and drops results that
+// resolve after reset(newDevice) (device loss) instead of writing them into the new device.
 //
 // Zero external dependencies; UMD export for classic Web Workers loaded through importScripts
 // (globalThis.PlayGta6AsyncPipelineCache) and Node.js (module.exports), like render_state_packets.js.
@@ -17,6 +20,11 @@
 const DEFAULT_MAX_CONCURRENT_PIPELINES = 4;
 
 const PIPELINE_KIND = Object.freeze({ RENDER: 'render', COMPUTE: 'compute' });
+
+const DEFAULT_PIPELINE_PRIORITY = Object.freeze({
+  render: 10,
+  compute: 0,
+});
 
 const PIPELINE_STATUS = Object.freeze({
   PENDING: 'pending',
@@ -47,8 +55,40 @@ function normalizeMaxConcurrent(value) {
  * @returns {number}
  */
 function normalizeMaxConcurrentCompiles(value) {
+  if (value === 0) return 0;
   const n = Number(value);
-  return Number.isInteger(n) && n >= 1 ? n : 0;
+  return Number.isInteger(n) && n >= 1 ? n : DEFAULT_MAX_CONCURRENT_PIPELINES;
+}
+
+/**
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+function hasFinitePriority(value) {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+/**
+ * @param {'render' | 'compute'} kind
+ * @param {unknown} priority
+ * @param {boolean} prioritizeGraphics
+ * @returns {number}
+ */
+function resolvePipelinePriority(kind, priority, prioritizeGraphics) {
+  if (hasFinitePriority(priority)) return priority;
+  if (!prioritizeGraphics) return 0;
+  return kind === PIPELINE_KIND.RENDER
+    ? DEFAULT_PIPELINE_PRIORITY.render
+    : DEFAULT_PIPELINE_PRIORITY.compute;
+}
+
+/**
+ * @param {'render' | 'compute'} kind
+ * @param {string | null} dedupeKey
+ * @returns {string | null}
+ */
+function makeDedupeMapKey(kind, dedupeKey) {
+  return dedupeKey !== null ? `${kind}\0${dedupeKey}` : null;
 }
 
 function defaultNow() {
@@ -86,6 +126,7 @@ class AsyncPipelineCache {
    *   device?: GPUDevice | null,
    *   maxConcurrent?: number,
    *   maxConcurrentCompiles?: number,
+   *   prioritizeGraphics?: boolean,
    *   nowFn?: (() => number) | null,
    *   onReady?: ((id: unknown, pipeline: object, meta: object) => void) | null,
    *   onError?: ((id: unknown, err: Error, meta: object) => void) | null,
@@ -96,6 +137,7 @@ class AsyncPipelineCache {
     device = null,
     maxConcurrent,
     maxConcurrentCompiles,
+    prioritizeGraphics = true,
     nowFn = null,
     onReady = null,
     onError = null,
@@ -115,10 +157,11 @@ class AsyncPipelineCache {
         this.maxConcurrent = this.maxConcurrentCompiles;
       }
     } else {
-      this.maxConcurrentCompiles = 0;
       this.maxConcurrent = normalizeMaxConcurrent(maxConcurrent);
+      this.maxConcurrentCompiles = this.maxConcurrent;
     }
     this._concurrencyLimit = this.maxConcurrent > 0 ? this.maxConcurrent : Infinity;
+    this.prioritizeGraphics = prioritizeGraphics !== false;
     this._nowFn = typeof nowFn === 'function' ? nowFn : defaultNow;
     this.onReady = typeof onReady === 'function' ? onReady : null;
     this.onError = typeof onError === 'function' ? onError : null;
@@ -127,9 +170,10 @@ class AsyncPipelineCache {
 
     /** id -> { id, kind, state, pipeline, error, job, dedupeKey, deferred } */
     this._entries = new Map();
-    /** dedupeKey -> pending job, or { done: true, pipeline } once it compiled */
+    /** `${kind}\0${dedupeKey}` -> pending job, or { kind, done: true, pipeline } once compiled */
     this._dedupe = new Map();
     this._queue = [];
+    this._nextSeq = 0;
     this._inFlight = 0;
     this._idleWaiters = [];
 
@@ -146,13 +190,15 @@ class AsyncPipelineCache {
     this._failedAsyncCompiles = 0;
     this._asyncCompileCount = 0;
     this._asyncCompileTotalMs = 0;
+    this._maxCompileMs = 0;
+    this._priorityPromotions = 0;
   }
 
   /**
    * Compile a render pipeline without blocking the GPU process on a burst.
    * @param {unknown} id
    * @param {GPURenderPipelineDescriptor} descriptor
-   * @param {{ dedupeKey?: string, allowSyncFallback?: boolean,
+   * @param {{ dedupeKey?: string, priority?: number, allowSyncFallback?: boolean,
    *   fallbackDescriptor?: GPURenderPipelineDescriptor | null }} [options]
    * @returns {Promise<{ id: unknown, status: string, pipeline?: GPURenderPipeline, error?: Error }>}
    */
@@ -164,7 +210,7 @@ class AsyncPipelineCache {
    * Compute counterpart of compileRenderPipeline().
    * @param {unknown} id
    * @param {GPUComputePipelineDescriptor} descriptor
-   * @param {{ dedupeKey?: string, allowSyncFallback?: boolean,
+   * @param {{ dedupeKey?: string, priority?: number, allowSyncFallback?: boolean,
    *   fallbackDescriptor?: GPUComputePipelineDescriptor | null }} [options]
    * @returns {Promise<{ id: unknown, status: string, pipeline?: GPUComputePipeline, error?: Error }>}
    */
@@ -203,8 +249,8 @@ class AsyncPipelineCache {
       if (job.ids.size === 0 && !job.started) {
         const index = this._queue.indexOf(job);
         if (index >= 0) this._queue.splice(index, 1);
-        if (job.dedupeKey !== null && this._dedupe.get(job.dedupeKey) === job) {
-          this._dedupe.delete(job.dedupeKey);
+        if (job.dedupeMapKey !== null && this._dedupe.get(job.dedupeMapKey) === job) {
+          this._dedupe.delete(job.dedupeMapKey);
         }
         this._checkIdle();
       }
@@ -247,6 +293,9 @@ class AsyncPipelineCache {
   }
 
   getStats() {
+    const avgCompileMs = this._asyncCompileCount > 0
+      ? this._asyncCompileTotalMs / this._asyncCompileCount
+      : 0;
     return {
       generation: this.generation,
       maxConcurrent: this.maxConcurrent,
@@ -255,11 +304,14 @@ class AsyncPipelineCache {
       ...this._stats,
       inFlightCompiles: this._inFlight,
       peakInFlightCompiles: this._peakInFlightCompiles,
+      activeCompiles: this._inFlight,
+      peakConcurrentCompiles: this._peakInFlightCompiles,
       queuedCompiles: this._queue.length,
       failedAsyncCompiles: this._failedAsyncCompiles,
-      avgAsyncCompileMs: this._asyncCompileCount > 0
-        ? this._asyncCompileTotalMs / this._asyncCompileCount
-        : 0,
+      avgAsyncCompileMs: avgCompileMs,
+      avgCompileMs,
+      maxCompileMs: this._maxCompileMs,
+      priorityPromotions: this._priorityPromotions,
     };
   }
 
@@ -268,14 +320,21 @@ class AsyncPipelineCache {
   _compile(kind, id, descriptor, options) {
     const opts = options && typeof options === 'object' ? options : {};
     const dedupeKey = typeof opts.dedupeKey === 'string' && opts.dedupeKey !== '' ? opts.dedupeKey : null;
+    const dedupeMapKey = makeDedupeMapKey(kind, dedupeKey);
+    const hasExplicitPriority = hasFinitePriority(opts.priority);
+    const priority = resolvePipelinePriority(kind, opts.priority, this.prioritizeGraphics);
     const allowSyncFallback = opts.allowSyncFallback !== false;
     const fallbackDescriptor = opts.fallbackDescriptor || null;
 
     const existing = this._entries.get(id);
     if (existing && existing.state !== PIPELINE_STATUS.FAILED) {
-      return existing.state === PIPELINE_STATUS.PENDING
-        ? existing.deferred.promise
-        : Promise.resolve({ id, status: PIPELINE_STATUS.READY, pipeline: existing.pipeline });
+      if (existing.state === PIPELINE_STATUS.PENDING) {
+        if (existing.job && !existing.job.started && (existing.kind === kind || hasExplicitPriority)) {
+          this._promoteQueuedJob(existing.job, priority);
+        }
+        return existing.deferred.promise;
+      }
+      return Promise.resolve({ id, status: PIPELINE_STATUS.READY, pipeline: existing.pipeline });
     }
 
     const entry = {
@@ -290,8 +349,8 @@ class AsyncPipelineCache {
     };
     this._entries.set(id, entry);
 
-    if (dedupeKey !== null) {
-      const shared = this._dedupe.get(dedupeKey);
+    if (dedupeMapKey !== null) {
+      const shared = this._dedupe.get(dedupeMapKey);
       if (shared && shared.kind === kind) {
         this._stats.dedupeHits += 1;
         if (shared.done) {
@@ -299,6 +358,9 @@ class AsyncPipelineCache {
         } else {
           entry.job = shared;
           shared.ids.add(id);
+          if (!shared.started) {
+            this._promoteQueuedJob(shared, priority);
+          }
         }
         return entry.deferred.promise;
       }
@@ -309,6 +371,9 @@ class AsyncPipelineCache {
       descriptor,
       fallbackDescriptor,
       dedupeKey,
+      dedupeMapKey,
+      priority,
+      seq: (this._nextSeq += 1),
       generation: this.generation,
       ownerId: id,
       ids: new Set([id]),
@@ -325,11 +390,48 @@ class AsyncPipelineCache {
       return entry.deferred.promise;
     }
 
-    if (dedupeKey !== null) this._dedupe.set(dedupeKey, job);
-    this._queue.push(job);
-    if (this._queue.length > this._stats.peakQueueDepth) this._stats.peakQueueDepth = this._queue.length;
+    if (dedupeMapKey !== null) this._dedupe.set(dedupeMapKey, job);
+    this._enqueueJob(job);
     this._pump();
     return entry.deferred.promise;
+  }
+
+  _enqueueJob(job) {
+    let insertIndex = this._queue.length;
+    for (let i = 0; i < this._queue.length; i += 1) {
+      const queued = this._queue[i];
+      if (job.priority > queued.priority || (job.priority === queued.priority && job.seq < queued.seq)) {
+        insertIndex = i;
+        break;
+      }
+    }
+    const promotedAhead = insertIndex < this._queue.length;
+    this._queue.splice(insertIndex, 0, job);
+    if (promotedAhead) {
+      this._priorityPromotions += 1;
+    }
+    if (this._queue.length > this._stats.peakQueueDepth) {
+      this._stats.peakQueueDepth = this._queue.length;
+    }
+  }
+
+  _promoteQueuedJob(job, newPriority) {
+    if (!job || job.started || newPriority <= job.priority) return false;
+    const currentIndex = this._queue.indexOf(job);
+    if (currentIndex < 0) return false;
+    this._queue.splice(currentIndex, 1);
+    job.priority = newPriority;
+    let insertIndex = this._queue.length;
+    for (let i = 0; i < this._queue.length; i += 1) {
+      const queued = this._queue[i];
+      if (job.priority > queued.priority || (job.priority === queued.priority && job.seq < queued.seq)) {
+        insertIndex = i;
+        break;
+      }
+    }
+    this._queue.splice(insertIndex, 0, job);
+    this._priorityPromotions += 1;
+    return true;
   }
 
   _compileSync(job, device, methods, allowSyncFallback) {
@@ -362,8 +464,8 @@ class AsyncPipelineCache {
     if (!error && (pipeline === null || pipeline === undefined)) {
       error = new Error(`AsyncPipelineCache: ${methods.sync} returned no pipeline`);
     }
-    if (!error && job.dedupeKey !== null) {
-      this._dedupe.set(job.dedupeKey, { kind: job.kind, done: true, pipeline });
+    if (!error && job.dedupeMapKey !== null) {
+      this._dedupe.set(job.dedupeMapKey, { kind: job.kind, done: true, pipeline });
     }
     this._completeJob(job, pipeline, error, true);
   }
@@ -435,13 +537,16 @@ class AsyncPipelineCache {
       const elapsedMs = Math.max(0, this._now() - job.startedAtMs);
       this._asyncCompileCount += 1;
       this._asyncCompileTotalMs += elapsedMs;
+      if (elapsedMs > this._maxCompileMs) {
+        this._maxCompileMs = elapsedMs;
+      }
       if (error) {
         this._failedAsyncCompiles += 1;
       }
       releaseSlot();
-      if (job.dedupeKey !== null && this._dedupe.get(job.dedupeKey) === job) {
-        if (error) this._dedupe.delete(job.dedupeKey);
-        else this._dedupe.set(job.dedupeKey, { kind: job.kind, done: true, pipeline });
+      if (job.dedupeMapKey !== null && this._dedupe.get(job.dedupeMapKey) === job) {
+        if (error) this._dedupe.delete(job.dedupeMapKey);
+        else this._dedupe.set(job.dedupeMapKey, { kind: job.kind, done: true, pipeline });
       }
       this._completeJob(job, pipeline, error, false);
     } catch (err) {
@@ -544,6 +649,7 @@ class AsyncPipelineCache {
 const exportedApi = {
   AsyncPipelineCache,
   DEFAULT_MAX_CONCURRENT_PIPELINES,
+  DEFAULT_PIPELINE_PRIORITY,
   PIPELINE_KIND,
   PIPELINE_STATUS,
 };
