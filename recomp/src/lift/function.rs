@@ -4,7 +4,7 @@
 //! into the function body inside a checkpoint: if any part of it turns out to be unsupported, the
 //! partial output is rolled back and replaced by an `__playgta6_unimplemented` trap.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use iced_x86::{
@@ -340,6 +340,8 @@ pub(super) fn lift(
         has_shared_ret: false,
         unwind_sites: 0,
         flag_summaries,
+        dead_after: flag_liveness::dead_after(func, flag_summaries),
+        dead_flags: 0,
     };
     lifter.lift_blocks()?;
     Ok(lifter.finish())
@@ -409,6 +411,11 @@ struct FunctionLifter<'a> {
     /// (`flag_liveness`); without it every call and tail jump stores every tracked flag and
     /// register and every call reloads them.
     flag_summaries: Option<&'a FlagSummaries>,
+    /// Per modelled instruction, the flags dead right after it (`flag_liveness::dead_after`).
+    dead_after: BTreeMap<u64, FlagMask>,
+    /// [`Self::dead_after`] of the instruction being lifted (0 outside modelled instructions):
+    /// these flags are neither computed nor stored.
+    dead_flags: FlagMask,
 }
 
 struct Checkpoint {
@@ -457,7 +464,10 @@ impl FunctionLifter<'_> {
                 }
                 let checkpoint = self.checkpoint();
                 self.ea = None;
-                match self.lift_instruction(ins) {
+                self.dead_flags = self.dead_after.get(&ins.ip()).copied().unwrap_or(0);
+                let lifted = self.lift_instruction(ins);
+                self.dead_flags = 0;
+                match lifted {
                     Ok(()) => {}
                     Err(InsnError::Cfg(err)) => return Err(err),
                     Err(InsnError::Unsupported(reason)) => {
@@ -1118,8 +1128,16 @@ impl FunctionLifter<'_> {
 
     // ----- flags ---------------------------------------------------------------------------------
 
+    /// False when the current instruction's value of `flag` is dead (see [`Self::dead_flags`]).
+    fn flag_live(&self, flag: Flag) -> bool {
+        self.dead_flags & (1 << flag as usize) == 0
+    }
+
     fn set_flag(&mut self, flag: Flag, value: &str) {
         debug_assert!(self.flags[flag as usize], "flag {flag:?} was not tracked");
+        if !self.flag_live(flag) {
+            return;
+        }
         self.emit(&format!("store i1 {value}, ptr {}", flag.slot()));
     }
 
@@ -1162,11 +1180,47 @@ impl FunctionLifter<'_> {
         [zf, sf, pf]
     }
 
+    /// Computes and stores the live ones of ZF, SF and PF of `r`.
     fn set_zsp(&mut self, r: &str, bits: u32) {
-        let [zf, sf, pf] = self.zsp(r, bits);
-        self.set_flag(Flag::Zf, &zf);
-        self.set_flag(Flag::Sf, &sf);
-        self.set_flag(Flag::Pf, &pf);
+        if self.flag_live(Flag::Zf) {
+            let zf = self.val(&format!("icmp eq i{bits} {r}, 0"));
+            self.set_flag(Flag::Zf, &zf);
+        }
+        if self.flag_live(Flag::Sf) {
+            let sf = self.msb(r, bits);
+            self.set_flag(Flag::Sf, &sf);
+        }
+        if self.flag_live(Flag::Pf) {
+            let pf = self.parity(r, bits);
+            self.set_flag(Flag::Pf, &pf);
+        }
+    }
+
+    /// Computes and stores OF and AF of `r = a + b` (or `a - b` when `sub`) when they are live.
+    fn set_of_af(&mut self, a: &str, b: &str, r: &str, bits: u32, sub: bool) {
+        let t = ty(bits);
+        if self.flag_live(Flag::Of) {
+            let (x, y) = if sub {
+                // OF: operands differ in sign and the result's sign differs from a.
+                (
+                    self.val(&format!("xor {t} {a}, {b}")),
+                    self.val(&format!("xor {t} {a}, {r}")),
+                )
+            } else {
+                // OF: both inputs differ in sign from the result.
+                (
+                    self.val(&format!("xor {t} {a}, {r}")),
+                    self.val(&format!("xor {t} {b}, {r}")),
+                )
+            };
+            let xy = self.val(&format!("and {t} {x}, {y}"));
+            let of = self.msb(&xy, bits);
+            self.set_flag(Flag::Of, &of);
+        }
+        if self.flag_live(Flag::Af) {
+            let af = self.aux_flag(a, b, r, bits);
+            self.set_flag(Flag::Af, &af);
+        }
     }
 
     fn condition(&mut self, cc: ConditionCode) -> R<String> {
@@ -1465,7 +1519,11 @@ impl FunctionLifter<'_> {
             Alu::Add | Alu::Adc => {
                 let (r, cf) = if matches!(op, Alu::Add) {
                     let r = self.val(&format!("add {t} {a}, {b}"));
-                    let cf = self.val(&format!("icmp ult {t} {r}, {a}"));
+                    let cf = if self.flag_live(Flag::Cf) {
+                        self.val(&format!("icmp ult {t} {r}, {a}"))
+                    } else {
+                        String::new()
+                    };
                     (r, cf)
                 } else {
                     // carry out of a + b + c: r < a, or r == a with a carry in.
@@ -1479,15 +1537,8 @@ impl FunctionLifter<'_> {
                     let cf = self.val(&format!("or i1 {lt}, {ceq}"));
                     (r, cf)
                 };
-                // OF: both inputs differ in sign from the result.
-                let x = self.val(&format!("xor {t} {a}, {r}"));
-                let y = self.val(&format!("xor {t} {b}, {r}"));
-                let xy = self.val(&format!("and {t} {x}, {y}"));
-                let of = self.msb(&xy, bits);
-                let af = self.aux_flag(a, b, &r, bits);
                 self.set_flag(Flag::Cf, &cf);
-                self.set_flag(Flag::Of, &of);
-                self.set_flag(Flag::Af, &af);
+                self.set_of_af(a, b, &r, bits, false);
                 r
             }
             Alu::Sub | Alu::Cmp | Alu::Sbb => {
@@ -1504,18 +1555,15 @@ impl FunctionLifter<'_> {
                     (r, cf)
                 } else {
                     let r = self.val(&format!("sub {t} {a}, {b}"));
-                    let cf = self.val(&format!("icmp ult {t} {a}, {b}"));
+                    let cf = if self.flag_live(Flag::Cf) {
+                        self.val(&format!("icmp ult {t} {a}, {b}"))
+                    } else {
+                        String::new()
+                    };
                     (r, cf)
                 };
-                // OF: operands differ in sign and the result's sign differs from a.
-                let x = self.val(&format!("xor {t} {a}, {b}"));
-                let y = self.val(&format!("xor {t} {a}, {r}"));
-                let xy = self.val(&format!("and {t} {x}, {y}"));
-                let of = self.msb(&xy, bits);
-                let af = self.aux_flag(a, b, &r, bits);
                 self.set_flag(Flag::Cf, &cf);
-                self.set_flag(Flag::Of, &of);
-                self.set_flag(Flag::Af, &af);
+                self.set_of_af(a, b, &r, bits, true);
                 r
             }
             Alu::And | Alu::Or | Alu::Xor | Alu::Test => {
@@ -1555,18 +1603,26 @@ impl FunctionLifter<'_> {
             Mnemonic::Inc => {
                 // CF is preserved by inc/dec.
                 let r = self.val(&format!("add {t} {a}, 1"));
-                let of = self.val(&format!("icmp eq {t} {r}, {min}"));
-                let af = self.aux_flag(a, "1", &r, bits);
-                self.set_flag(Flag::Of, &of);
-                self.set_flag(Flag::Af, &af);
+                if self.flag_live(Flag::Of) {
+                    let of = self.val(&format!("icmp eq {t} {r}, {min}"));
+                    self.set_flag(Flag::Of, &of);
+                }
+                if self.flag_live(Flag::Af) {
+                    let af = self.aux_flag(a, "1", &r, bits);
+                    self.set_flag(Flag::Af, &af);
+                }
                 r
             }
             Mnemonic::Dec => {
                 let r = self.val(&format!("sub {t} {a}, 1"));
-                let of = self.val(&format!("icmp eq {t} {a}, {min}"));
-                let af = self.aux_flag(a, "1", &r, bits);
-                self.set_flag(Flag::Of, &of);
-                self.set_flag(Flag::Af, &af);
+                if self.flag_live(Flag::Of) {
+                    let of = self.val(&format!("icmp eq {t} {a}, {min}"));
+                    self.set_flag(Flag::Of, &of);
+                }
+                if self.flag_live(Flag::Af) {
+                    let af = self.aux_flag(a, "1", &r, bits);
+                    self.set_flag(Flag::Af, &af);
+                }
                 r
             }
             _ => {
@@ -1725,6 +1781,7 @@ impl FunctionLifter<'_> {
             let [zf, sf, pf] = self.zsp(&r, bits);
             updates.extend([(Flag::Zf, zf), (Flag::Sf, sf), (Flag::Pf, pf)]);
         }
+        updates.retain(|&(flag, _)| self.flag_live(flag));
         if imm_count.is_some() {
             for (flag, new) in updates {
                 self.set_flag(flag, &new);
@@ -1773,6 +1830,14 @@ impl FunctionLifter<'_> {
         } else {
             (self.read_op(ins, 0, bits)?, self.read_op(ins, 1, bits)?)
         };
+        if !self.flag_live(Flag::Cf) && !self.flag_live(Flag::Of) {
+            let r = if bits == 64 {
+                self.val(&format!("mul i64 {a}, {b}"))
+            } else {
+                self.val(&format!("mul {t} {a}, {b}"))
+            };
+            return self.write_op(ins, 0, &r, bits);
+        }
         let (r, overflow) = if bits == 64 {
             // The truncated product is a plain `mul`: only CF/OF need the 128-bit high half, so
             // when they are dead (nearly always) the 32-bit-halves helper folds away entirely.
