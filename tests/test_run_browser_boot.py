@@ -2031,6 +2031,50 @@ class HudMp4AndNewPresetsTests(unittest.TestCase):
             self.assertTrue(ok5, warn5)
             self.assertNotIn("-start_number", ffmpeg_cmds[-1])
 
+    def test_encode_frames_to_mp4_passes_even_dimensions_filter_and_faststart(self):
+        odd_png = _make_synthetic_rgb_png(15, 9, lambda x, y: (32, 64, 128))
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            frames_dir = root / "frames"
+            frames_dir.mkdir()
+            (frames_dir / "frame_0001.png").write_bytes(odd_png)
+            (frames_dir / "frame_0002.png").write_bytes(odd_png)
+
+            out_mp4 = root / "capture.mp4"
+            ffmpeg_cmds: list[list[str]] = []
+
+            def fake_ffmpeg(cmd, cwd, log, timeout):
+                ffmpeg_cmds.append(list(cmd))
+                Path(cmd[-1]).write_bytes(b"ftypmp42")
+                return 0
+
+            ok, warn = rbb.encode_frames_to_mp4(
+                frames_dir,
+                out_mp4,
+                fps=2.0,
+                runner=fake_ffmpeg,
+                which_fn=lambda n: "ffmpeg" if n == "ffmpeg" else None,
+            )
+            self.assertTrue(ok, warn)
+            self.assertEqual(len(ffmpeg_cmds), 1)
+            cmd = ffmpeg_cmds[0]
+
+            i_idx = cmd.index("-i")
+            vf_idx = cmd.index("-vf")
+            movflags_idx = cmd.index("-movflags")
+            out_idx = len(cmd) - 1
+
+            self.assertEqual(cmd[vf_idx + 1], "scale=trunc(iw/2)*2:trunc(ih/2)*2")
+            self.assertEqual(cmd[movflags_idx + 1], "+faststart")
+            self.assertEqual(cmd[cmd.index("-c:v") + 1], "libx264")
+            self.assertEqual(cmd[cmd.index("-pix_fmt") + 1], "yuv420p")
+            self.assertEqual(cmd[out_idx], str(out_mp4))
+            self.assertGreater(vf_idx, i_idx)
+            self.assertLess(vf_idx, out_idx)
+            self.assertGreater(movflags_idx, i_idx)
+            self.assertLess(movflags_idx, out_idx)
+
     def test_run_browser_session_and_cli_plumbing_for_hide_hud_mp4_fps_and_skip_black(self):
         all_black_png = _make_synthetic_rgb_png(420, 4, lambda x, y: (0, 0, 0))
         left_lit_png = _make_synthetic_rgb_png(420, 4, lambda x, y: (200, 100, 50) if x < 410 else (0, 0, 0))
