@@ -47,6 +47,13 @@
     return value;
   }
 
+  function clampUnitRatio(value) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+      return 0;
+    }
+    return value >= 1 ? 1 : value;
+  }
+
   function toUint8Array(input) {
     if (input instanceof Uint8Array) {
       return input;
@@ -201,7 +208,12 @@
       this._packetsDrained = 0;
       this._maxBatchSize = 0;
       this._backpressureWaits = 0;
+      this._backpressureStalls = 0;
       this._peakOccupancyBytes = 0;
+      this._drainCalls = 0;
+      this._maxDrainBatchBytes = 0;
+      this._totalBytesDrained = 0;
+      this._emptyDrains = 0;
     }
 
     _recordOccupancy(bytes) {
@@ -217,6 +229,13 @@
 
     get highWatermarkBytes() {
       return Math.min(this._capacityBytes, sanitizeNonNegInt(this._peakOccupancyBytes));
+    }
+
+    get peakOccupancyRatio() {
+      if (this._capacityBytes <= 0) {
+        return 0;
+      }
+      return clampUnitRatio(this.highWatermarkBytes / this._capacityBytes);
     }
 
     get peakUtilizationPct() {
@@ -239,6 +258,26 @@
 
     get backpressureWaits() {
       return sanitizeNonNegInt(this._backpressureWaits);
+    }
+
+    get backpressureStalls() {
+      return sanitizeNonNegInt(this._backpressureStalls);
+    }
+
+    get drainCalls() {
+      return sanitizeNonNegInt(this._drainCalls);
+    }
+
+    get maxDrainBatchBytes() {
+      return Math.min(this._capacityBytes, sanitizeNonNegInt(this._maxDrainBatchBytes));
+    }
+
+    get totalBytesDrained() {
+      return sanitizeNonNegInt(this._totalBytesDrained);
+    }
+
+    get emptyDrains() {
+      return sanitizeNonNegInt(this._emptyDrains);
     }
 
     get sab() {
@@ -299,7 +338,8 @@
     recordBackpressureWait(count = 1) {
       const n = sanitizeNonNegInt(count);
       if (n > 0) {
-        this._backpressureWaits += n;
+        this._backpressureWaits = sanitizeNonNegInt(this._backpressureWaits) + n;
+        this._backpressureStalls = sanitizeNonNegInt(this._backpressureStalls) + n;
       }
       return sanitizeNonNegInt(this._backpressureWaits);
     }
@@ -329,7 +369,8 @@
       this._recordOccupancy(used);
       const free = used >= this._capacityBytes ? 0 : this._capacityBytes - used;
       if (len > free) {
-        this._backpressureWaits += 1;
+        this._backpressureWaits = sanitizeNonNegInt(this._backpressureWaits) + 1;
+        this._backpressureStalls = sanitizeNonNegInt(this._backpressureStalls) + 1;
         Atomics.add(this._headerU32, HEADER_INDEX.DROPPED_PACKETS, 1);
         return false;
       }
@@ -367,7 +408,9 @@
       const readPos = Atomics.load(this._headerU32, HEADER_INDEX.READ_POS);
       const writePos = Atomics.load(this._headerU32, HEADER_INDEX.WRITE_POS);
       const avail = (writePos - readPos) >>> 0;
+      this._drainCalls = sanitizeNonNegInt(this._drainCalls) + 1;
       if (avail === 0) {
+        this._emptyDrains = sanitizeNonNegInt(this._emptyDrains) + 1;
         return 0;
       }
       this._recordOccupancy(avail);
@@ -393,6 +436,11 @@
       } finally {
         Atomics.store(this._headerU32, HEADER_INDEX.READ_POS, nextRead);
         Atomics.notify(this._headerI32, HEADER_INDEX.READ_POS, 1);
+        this._totalBytesDrained = sanitizeNonNegInt(this._totalBytesDrained) + avail;
+        const curMaxBytes = sanitizeNonNegInt(this._maxDrainBatchBytes);
+        if (avail > curMaxBytes) {
+          this._maxDrainBatchBytes = avail;
+        }
       }
       return avail;
     }
@@ -453,7 +501,9 @@
       const readPos = Atomics.load(this._headerU32, HEADER_INDEX.READ_POS);
       const writePos = Atomics.load(this._headerU32, HEADER_INDEX.WRITE_POS);
       const avail = (writePos - readPos) >>> 0;
+      this._drainCalls = sanitizeNonNegInt(this._drainCalls) + 1;
       if (avail === 0) {
+        this._emptyDrains = sanitizeNonNegInt(this._emptyDrains) + 1;
         return { packets: 0, bytes: 0, remainingBytes: 0, wrapped: false };
       }
 
@@ -549,14 +599,25 @@
           const nextRead = (readPos + completedBytes) >>> 0;
           Atomics.store(this._headerU32, HEADER_INDEX.READ_POS, nextRead);
           Atomics.notify(this._headerI32, HEADER_INDEX.READ_POS, 1);
+          this._totalBytesDrained =
+            sanitizeNonNegInt(this._totalBytesDrained) + completedBytes;
+          const curMaxBytes = sanitizeNonNegInt(this._maxDrainBatchBytes);
+          if (completedBytes > curMaxBytes) {
+            this._maxDrainBatchBytes = completedBytes;
+          }
         }
         if (completedPackets > 0) {
-          this._batchesDrained += 1;
-          this._packetsDrained += completedPackets;
-          if (completedPackets > this._maxBatchSize) {
+          this._batchesDrained = sanitizeNonNegInt(this._batchesDrained) + 1;
+          this._packetsDrained = sanitizeNonNegInt(this._packetsDrained) + completedPackets;
+          const curMaxBatch = sanitizeNonNegInt(this._maxBatchSize);
+          if (completedPackets > curMaxBatch) {
             this._maxBatchSize = completedPackets;
           }
         }
+      }
+
+      if (completedBytes === 0) {
+        this._emptyDrains = sanitizeNonNegInt(this._emptyDrains) + 1;
       }
 
       const batchWrapped =
@@ -570,12 +631,21 @@
       };
     }
 
-    resetTelemetry() {
+    resetStats() {
       this._batchesDrained = 0;
       this._packetsDrained = 0;
       this._maxBatchSize = 0;
       this._backpressureWaits = 0;
+      this._backpressureStalls = 0;
       this._peakOccupancyBytes = 0;
+      this._drainCalls = 0;
+      this._maxDrainBatchBytes = 0;
+      this._totalBytesDrained = 0;
+      this._emptyDrains = 0;
+    }
+
+    resetTelemetry() {
+      this.resetStats();
     }
 
     reset() {
@@ -583,7 +653,7 @@
       Atomics.store(this._headerU32, HEADER_INDEX.READ_POS, 0);
       Atomics.store(this._headerU32, HEADER_INDEX.DROPPED_PACKETS, 0);
       Atomics.store(this._headerU32, HEADER_INDEX.NOTIFY_SEQ, 0);
-      this.resetTelemetry();
+      this.resetStats();
     }
 
     getStats() {
@@ -599,11 +669,23 @@
       const avgBatchSize =
         batchesDrained > 0 ? sanitizeNonNegNumber(packetsDrained / batchesDrained) : 0;
       const backpressureWaits = sanitizeNonNegInt(this._backpressureWaits);
+      const backpressureStalls = sanitizeNonNegInt(this._backpressureStalls);
+      const drainCalls = sanitizeNonNegInt(this._drainCalls);
+      const maxDrainBatchBytes = Math.min(
+        this._capacityBytes,
+        sanitizeNonNegInt(this._maxDrainBatchBytes)
+      );
+      const totalBytesDrained = sanitizeNonNegInt(this._totalBytesDrained);
+      const emptyDrains = sanitizeNonNegInt(this._emptyDrains);
       const peakOccupancyBytes = Math.min(
         this._capacityBytes,
         sanitizeNonNegInt(this._peakOccupancyBytes)
       );
       const highWatermarkBytes = peakOccupancyBytes;
+      const peakOccupancyRatio =
+        this._capacityBytes > 0
+          ? clampUnitRatio(highWatermarkBytes / this._capacityBytes)
+          : 0;
       const peakUtilizationPct =
         this._capacityBytes > 0
           ? Math.min(
@@ -632,7 +714,13 @@
         avgBatchSize,
         packetsDrained,
         backpressureWaits,
+        backpressureStalls,
+        drainCalls,
+        maxDrainBatchBytes,
+        totalBytesDrained,
+        emptyDrains,
         peakOccupancyBytes,
+        peakOccupancyRatio,
         highWatermarkBytes,
         peakUtilizationPct,
         utilizationPct,

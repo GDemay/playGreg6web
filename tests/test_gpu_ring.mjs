@@ -1319,3 +1319,293 @@ test('W198 high-watermark utilization, peakUtilizationPct, resetTelemetry(), and
     assert.equal(rawHeader.getUint32(off, true), 0, `SAB header reserved word at byte ${off} must remain 0`);
   }
 });
+
+test('W244 backpressure & batch-drain telemetry tracks drainCalls, maxDrainBatchBytes, totalBytesDrained, backpressureStalls, peakOccupancyRatio, emptyDrains, and resetStats()', () => {
+  const ring = GpuRingBuffer.create(64);
+  const rawHeader = new DataView(ring.sab);
+
+  // Initial stats & getters.
+  assert.equal(ring.drainCalls, 0);
+  assert.equal(ring.maxDrainBatchBytes, 0);
+  assert.equal(ring.totalBytesDrained, 0);
+  assert.equal(ring.backpressureStalls, 0);
+  assert.equal(ring.peakOccupancyRatio, 0);
+  assert.equal(ring.emptyDrains, 0);
+
+  const init = ring.getStats();
+  assert.equal(init.drainCalls, 0);
+  assert.equal(init.maxDrainBatchBytes, 0);
+  assert.equal(init.totalBytesDrained, 0);
+  assert.equal(init.backpressureStalls, 0);
+  assert.equal(init.peakOccupancyRatio, 0);
+  assert.equal(init.emptyDrains, 0);
+  // Existing fields preserved.
+  assert.equal(init.capacityBytes, 64);
+  assert.equal(init.batchesDrained, 0);
+  assert.equal(init.packetsDrained, 0);
+  assert.equal(init.backpressureWaits, 0);
+  assert.equal(init.highWatermarkBytes, 0);
+  assert.equal(init.peakUtilizationPct, 0);
+
+  // Invalid drain arguments throw without incrementing drainCalls or emptyDrains.
+  assert.throws(() => ring.drainTo(null), TypeError);
+  assert.throws(() => ring.drainBatch(null), TypeError);
+  assert.throws(() => ring.drainBatch(() => {}, 0), RangeError);
+  assert.equal(ring.drainCalls, 0);
+  assert.equal(ring.emptyDrains, 0);
+
+  // Empty drains via both drainTo and drainBatch increment drainCalls and emptyDrains.
+  assert.equal(ring.drainTo(() => { throw new Error('unexpected'); }), 0);
+  const emptyBatch = ring.drainBatch(() => { throw new Error('unexpected'); });
+  assert.equal(emptyBatch.bytes, 0);
+  assert.equal(ring.drainCalls, 2);
+  assert.equal(ring.emptyDrains, 2);
+  assert.equal(ring.totalBytesDrained, 0);
+  assert.equal(ring.maxDrainBatchBytes, 0);
+  assert.equal(ring.batchesDrained, 0);
+
+  // Write 3x16B packets -> 48B (peakOccupancyRatio = 0.75).
+  const pkt16 = encodeRawPacket(OPCODES.DRAW, 3, new Uint8Array(8));
+  assert.equal(ring.writeBytes(pkt16), true);
+  assert.equal(ring.peakOccupancyRatio, 0.25);
+  assert.equal(ring.writeBytes(pkt16), true);
+  assert.equal(ring.writeBytes(pkt16), true);
+  assert.equal(ring.peakOccupancyRatio, 0.75);
+  assert.equal(ring.getStats().peakOccupancyRatio, 0.75);
+
+  // Oversized write (> capacity) is NOT a backpressure stall.
+  assert.equal(ring.writeBytes(new Uint8Array(65)), false);
+  assert.equal(ring.backpressureStalls, 0);
+  assert.equal(ring.droppedPackets, 1);
+
+  // Full/insufficient-space writes increment backpressureStalls & backpressureWaits.
+  assert.equal(ring.writeBytes(new Uint8Array(32)), false);
+  assert.equal(ring.writeBytes(new Uint8Array(17)), false);
+  assert.equal(ring.backpressureStalls, 2);
+  assert.equal(ring.backpressureWaits, 2);
+
+  // External wait recording also updates backpressureStalls and ignores invalid counts.
+  assert.equal(ring.recordBackpressureWait(3), 5);
+  assert.equal(ring.recordBackpressureWait(0), 5);
+  assert.equal(ring.recordBackpressureWait(-2), 5);
+  assert.equal(ring.recordBackpressureWait(NaN), 5);
+  assert.equal(ring.backpressureStalls, 5);
+
+  // Fill remaining 16B -> 64B (peakOccupancyRatio = 1.0).
+  assert.equal(ring.writeBytes(pkt16), true);
+  assert.equal(ring.peakOccupancyRatio, 1);
+
+  // Drain 1 packet (16B) via drainBatch, then 2 packets (32B) via drainBatch, then remaining 16B via drainTo.
+  const b1 = ring.drainBatch(1, () => {});
+  assert.equal(b1.bytes, 16);
+  assert.equal(ring.drainCalls, 3);
+  assert.equal(ring.emptyDrains, 2);
+  assert.equal(ring.maxDrainBatchBytes, 16);
+  assert.equal(ring.totalBytesDrained, 16);
+
+  const b2 = ring.drainBatch(2, () => {});
+  assert.equal(b2.bytes, 32);
+  assert.equal(ring.drainCalls, 4);
+  assert.equal(ring.maxDrainBatchBytes, 32);
+  assert.equal(ring.totalBytesDrained, 48);
+
+  const dTo = ring.drainTo(() => {});
+  assert.equal(dTo, 16);
+  assert.equal(ring.drainCalls, 5);
+  assert.equal(ring.maxDrainBatchBytes, 32);
+  assert.equal(ring.totalBytesDrained, 64);
+
+  // Drain a larger wrapped batch (48B) -> maxDrainBatchBytes advances to 48.
+  assert.equal(ring.writeBytes(pkt16), true);
+  assert.equal(ring.writeBytes(pkt16), true);
+  assert.equal(ring.writeBytes(pkt16), true);
+  const b3 = ring.drainBatch(() => {});
+  assert.equal(b3.bytes, 48);
+  assert.equal(ring.drainCalls, 6);
+  assert.equal(ring.maxDrainBatchBytes, 48);
+  assert.equal(ring.totalBytesDrained, 112);
+
+  // Incomplete trailing packet counts as a drainCall + emptyDrain without changing byte totals.
+  assert.equal(ring.writeBytes(pkt16.subarray(0, 4)), true);
+  const partial = ring.drainBatch(() => {});
+  assert.equal(partial.bytes, 0);
+  assert.equal(ring.drainCalls, 7);
+  assert.equal(ring.emptyDrains, 3);
+  assert.equal(ring.totalBytesDrained, 112);
+  assert.equal(ring.maxDrainBatchBytes, 48);
+
+  // Finish the incomplete packet, then verify resetStats() clears counters without discarding queued SAB bytes.
+  assert.equal(ring.writeBytes(pkt16.subarray(4)), true);
+  const writePosBefore = ring.writePos;
+  const readPosBefore = ring.readPos;
+
+  const snapBeforeReset = ring.getStats();
+  assert.equal(snapBeforeReset.drainCalls, 7);
+  assert.equal(snapBeforeReset.maxDrainBatchBytes, 48);
+  assert.equal(snapBeforeReset.totalBytesDrained, 112);
+  assert.equal(snapBeforeReset.backpressureStalls, 5);
+  assert.equal(snapBeforeReset.peakOccupancyRatio, 1);
+  assert.equal(snapBeforeReset.emptyDrains, 3);
+
+  ring.resetStats();
+  assert.equal(ring.drainCalls, 0);
+  assert.equal(ring.maxDrainBatchBytes, 0);
+  assert.equal(ring.totalBytesDrained, 0);
+  assert.equal(ring.backpressureStalls, 0);
+  assert.equal(ring.peakOccupancyRatio, 0);
+  assert.equal(ring.emptyDrains, 0);
+  assert.equal(ring.batchesDrained, 0);
+  assert.equal(ring.packetsDrained, 0);
+  assert.equal(ring.backpressureWaits, 0);
+  assert.equal(ring.highWatermarkBytes, 0);
+  assert.equal(ring.writePos, writePosBefore);
+  assert.equal(ring.readPos, readPosBefore);
+
+  // Draining the still-queued 16B packet after resetStats() works cleanly and records fresh ratio 0.25.
+  const bAfter = ring.drainBatch(() => {});
+  assert.equal(bAfter.packets, 1);
+  assert.equal(bAfter.bytes, 16);
+  const afterStats = ring.getStats();
+  assert.equal(afterStats.drainCalls, 1);
+  assert.equal(afterStats.maxDrainBatchBytes, 16);
+  assert.equal(afterStats.totalBytesDrained, 16);
+  assert.equal(afterStats.backpressureStalls, 0);
+  assert.equal(afterStats.peakOccupancyRatio, 0.25);
+  assert.equal(afterStats.emptyDrains, 0);
+
+  // Verify 64B SAB header reserved words remain untouched.
+  for (let off = 32; off < 64; off += 4) {
+    assert.equal(rawHeader.getUint32(off, true), 0);
+  }
+});
+
+test('W244 telemetry sanitization, mid-batch throw semantics, and zero-extra-atomics burst stability', () => {
+  const producer = GpuRingBuffer.create(128);
+  const consumer = GpuRingBuffer.attach(producer.sab);
+  const pkt16 = encodeRawPacket(OPCODES.DRAW, 0, new Uint8Array(8));
+
+  // Throw on packet 0 increments drainCalls, but NOT emptyDrains/totalBytesDrained/maxDrainBatchBytes.
+  assert.equal(producer.writeBytes(pkt16), true);
+  assert.equal(producer.writeBytes(pkt16), true);
+  assert.equal(producer.writeBytes(pkt16), true);
+  assert.throws(() => {
+    consumer.drainBatch(() => {
+      throw new Error('fail-first');
+    });
+  }, /fail-first/);
+  assert.equal(consumer.drainCalls, 1);
+  assert.equal(consumer.emptyDrains, 0);
+  assert.equal(consumer.totalBytesDrained, 0);
+  assert.equal(consumer.maxDrainBatchBytes, 0);
+
+  // Throw on packet 2 after 2 completed packets commits 32B to totalBytesDrained & maxDrainBatchBytes.
+  assert.throws(() => {
+    consumer.drainBatch((_pkt, idx) => {
+      if (idx === 2) {
+        throw new Error('fail-third');
+      }
+    });
+  }, /fail-third/);
+  assert.equal(consumer.drainCalls, 2);
+  assert.equal(consumer.emptyDrains, 0);
+  assert.equal(consumer.totalBytesDrained, 32);
+  assert.equal(consumer.maxDrainBatchBytes, 32);
+
+  // Drain remaining 16B packet cleanly.
+  const tailRes = consumer.drainBatch(() => {});
+  assert.equal(tailRes.bytes, 16);
+  assert.equal(consumer.drainCalls, 3);
+  assert.equal(consumer.totalBytesDrained, 48);
+  assert.equal(consumer.maxDrainBatchBytes, 32);
+
+  // Corruption sanitization & clamping of all W244 telemetry fields.
+  consumer._drainCalls = NaN;
+  consumer._maxDrainBatchBytes = 999999;
+  consumer._totalBytesDrained = -50;
+  consumer._backpressureStalls = Infinity;
+  consumer._emptyDrains = -7;
+  consumer._peakOccupancyBytes = 999999;
+  let sanitized = consumer.getStats();
+  assert.equal(sanitized.drainCalls, 0);
+  assert.equal(sanitized.maxDrainBatchBytes, 128);
+  assert.equal(sanitized.totalBytesDrained, 0);
+  assert.equal(sanitized.backpressureStalls, 0);
+  assert.equal(sanitized.emptyDrains, 0);
+  assert.equal(sanitized.peakOccupancyRatio, 1);
+
+  consumer._peakOccupancyBytes = -12;
+  assert.equal(consumer.peakOccupancyRatio, 0);
+  assert.equal(consumer.getStats().peakOccupancyRatio, 0);
+
+  consumer._peakOccupancyBytes = NaN;
+  assert.equal(consumer.peakOccupancyRatio, 0);
+  assert.equal(consumer.getStats().peakOccupancyRatio, 0);
+
+  // Self-healing after corrupted fields: subsequent operations increment from sanitized 0.
+  consumer._maxDrainBatchBytes = NaN;
+  assert.equal(consumer.drainBatch(() => {}).bytes, 0);
+  assert.equal(consumer.drainCalls, 1);
+  assert.equal(consumer.emptyDrains, 1);
+  assert.equal(producer.writeBytes(pkt16), true);
+  assert.equal(consumer.drainBatch(() => {}).bytes, 16);
+  assert.equal(consumer.drainCalls, 2);
+  assert.equal(consumer.totalBytesDrained, 16);
+  assert.equal(consumer.maxDrainBatchBytes, 16);
+  assert.equal(consumer.peakOccupancyRatio, 16 / 128);
+
+  // Full reset() clears pointers and W244 telemetry.
+  producer.reset();
+  consumer.resetStats();
+  const afterReset = consumer.getStats();
+  assert.equal(afterReset.drainCalls, 0);
+  assert.equal(afterReset.maxDrainBatchBytes, 0);
+  assert.equal(afterReset.totalBytesDrained, 0);
+  assert.equal(afterReset.backpressureStalls, 0);
+  assert.equal(afterReset.peakOccupancyRatio, 0);
+  assert.equal(afterReset.emptyDrains, 0);
+
+  // Burst stress: 500 cycles of fill + backpressure stall + batch drain + empty poll.
+  const origStore = Atomics.store;
+  let readPosStores = 0;
+  Atomics.store = (ta, idx, val) => {
+    if (idx === HEADER_INDEX.READ_POS) {
+      readPosStores += 1;
+    }
+    return origStore(ta, idx, val);
+  };
+
+  let expectedStalls = 0;
+  let expectedDrainedBytes = 0;
+  try {
+    for (let cycle = 0; cycle < 500; cycle++) {
+      // Fill 8x16B = 128B (full ring), then trigger 1 stall.
+      for (let p = 0; p < 8; p++) {
+        assert.equal(producer.writeBytes(pkt16), true);
+      }
+      assert.equal(producer.writeBytes(pkt16), false);
+      expectedStalls += 1;
+
+      const batch = consumer.drainBatch(() => {});
+      assert.equal(batch.packets, 8);
+      assert.equal(batch.bytes, 128);
+      expectedDrainedBytes += 128;
+
+      // One empty poll per cycle.
+      const empty = consumer.drainBatch(() => {});
+      assert.equal(empty.bytes, 0);
+    }
+  } finally {
+    Atomics.store = origStore;
+  }
+
+  assert.equal(readPosStores, 500, 'single atomic READ_POS store per non-empty drainBatch');
+  const prodStats = producer.getStats();
+  const consStats = consumer.getStats();
+  assert.equal(prodStats.backpressureStalls, expectedStalls);
+  assert.equal(prodStats.peakOccupancyRatio, 1);
+  assert.equal(consStats.drainCalls, 1000);
+  assert.equal(consStats.emptyDrains, 500);
+  assert.equal(consStats.totalBytesDrained, expectedDrainedBytes);
+  assert.equal(consStats.maxDrainBatchBytes, 128);
+  assert.equal(consStats.peakOccupancyRatio, 1);
+});
