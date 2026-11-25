@@ -3185,3 +3185,514 @@ test('W338 preserves backwards compatibility on mock devices, supports explicit 
     processor.destroy();
   }
 });
+
+// ============================================================================
+// W342: Mid-frame deferred GPU destroy & 1D -> 2D LUT texture promotion
+// ============================================================================
+
+function buildCreateTexture2Packet({
+  id,
+  width,
+  height = 1,
+  depthOrArrayLayers = 1,
+  mipLevelCount = 1,
+  sampleCount = 1,
+  usage = TEXTURE_USAGE.TEXTURE_BINDING | TEXTURE_USAGE.COPY_DST,
+  dimensionCode = TEXTURE_DIMENSION.DIM_1D,
+  formatCode = 22, // rgba8unorm in ABI v2
+}) {
+  const payload = new ArrayBuffer(40);
+  const view = new DataView(payload);
+  view.setUint32(0, id, true);
+  view.setUint32(4, width, true);
+  view.setUint32(8, height, true);
+  view.setUint32(12, depthOrArrayLayers, true);
+  view.setUint32(16, mipLevelCount, true);
+  view.setUint32(20, sampleCount, true);
+  view.setUint32(24, usage, true);
+  view.setUint8(28, dimensionCode);
+  view.setUint8(29, formatCode);
+  view.setUint8(30, 0);
+  const builder = new BinaryCommandBuilder();
+  builder._pushPacket(OPCODES.CREATE_TEXTURE2, new Uint8Array(payload));
+  return builder.finish();
+}
+
+test('W342: mid-frame _destroyTextureIfPresent and _destroyBufferIfPresent defer .destroy() until queue.submit() + onSubmittedWorkDone()', async () => {
+  const { device, ctx } = createMockWebGpu();
+  const workDoneResolvers = [];
+  const submitSnapshots = [];
+
+  const trackedTextures = [];
+  const trackedBuffers = [];
+  const origCreateTexture = device.createTexture.bind(device);
+  device.createTexture = (desc) => {
+    const tex = origCreateTexture(desc);
+    tex.destroyCalls = 0;
+    const origDestroy = tex.destroy.bind(tex);
+    tex.destroy = () => {
+      tex.destroyCalls += 1;
+      origDestroy();
+    };
+    trackedTextures.push(tex);
+    return tex;
+  };
+  const origCreateBuffer = device.createBuffer.bind(device);
+  device.createBuffer = (desc) => {
+    const buf = origCreateBuffer(desc);
+    buf.destroyCalls = 0;
+    const origDestroy = buf.destroy.bind(buf);
+    buf.destroy = () => {
+      buf.destroyCalls += 1;
+      origDestroy();
+    };
+    trackedBuffers.push(buf);
+    return buf;
+  };
+  const origSubmit = device.queue.submit.bind(device.queue);
+  device.queue.submit = (cmdBufs) => {
+    submitSnapshots.push({
+      destroyedTexturesAtSubmit: trackedTextures.filter((t) => t.destroyed).length,
+      destroyedBuffersAtSubmit: trackedBuffers.filter((b) => b.destroyed).length,
+    });
+    return origSubmit(cmdBufs);
+  };
+  device.queue.onSubmittedWorkDone = () =>
+    new Promise((resolve) => {
+      workDoneResolvers.push(resolve);
+    });
+
+  // resourceRegistry is null (live Chrome default configuration).
+  const processor = new WgpuCommandProcessor(device, ctx);
+  assert.equal(processor.resourceRegistry, null);
+
+  // Mid-frame: create a 256x1 LUT texture and buffer, then replace/destroy them before Present.
+  const prePresent = new BinaryCommandBuilder()
+    .beginFrame()
+    .createTexture(10, 256, 1, 1, 1, TEXTURE_FORMAT.RGBA8_UNORM, TEXTURE_USAGE.TEXTURE_BINDING | TEXTURE_USAGE.COPY_DST, TEXTURE_DIMENSION.DIM_2D)
+    .createBuffer(20, BUFFER_USAGE.VERTEX | BUFFER_USAGE.COPY_DST, 256)
+    // Recreating id 10 and destroying id 20 mid-frame must NOT synchronously call .destroy()!
+    .createTexture(10, 256, 1, 1, 1, TEXTURE_FORMAT.RGBA8_UNORM, TEXTURE_USAGE.TEXTURE_BINDING | TEXTURE_USAGE.COPY_DST, TEXTURE_DIMENSION.DIM_2D)
+    .destroyResource(20)
+    .finish();
+
+  processor.execute(prePresent);
+
+  assert.equal(trackedTextures.length, 2);
+  assert.equal(trackedBuffers.length, 1);
+  // Old texture and destroyed buffer are removed from live maps, but NOT yet destroyed!
+  assert.equal(processor.textures.get(10), trackedTextures[1]);
+  assert.equal(processor.buffers.has(20), false);
+  assert.equal(trackedTextures[0].destroyed, false);
+  assert.equal(trackedBuffers[0].destroyed, false);
+  assert.equal(processor._deferredGpuDestroys.length, 2);
+
+  // Now submit the frame via Present.
+  processor.execute(new BinaryCommandBuilder().present().finish());
+
+  // At queue.submit() time, zero destroyed resources were in use!
+  assert.equal(submitSnapshots.length, 1);
+  assert.deepEqual(submitSnapshots[0], {
+    destroyedTexturesAtSubmit: 0,
+    destroyedBuffersAtSubmit: 0,
+  });
+  // Still awaiting onSubmittedWorkDone() -> must remain alive until GPU work completes.
+  assert.equal(trackedTextures[0].destroyed, false);
+  assert.equal(trackedBuffers[0].destroyed, false);
+  assert.equal(processor._deferredGpuDestroys.length, 0);
+  assert.equal(processor._inFlightDeferredDestroys.size, 2);
+  assert.equal(workDoneResolvers.length, 1);
+
+  // Resolve GPU work fence -> deferred destroys finalize cleanly.
+  workDoneResolvers.shift()();
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal(trackedTextures[0].destroyed, true);
+  assert.equal(trackedTextures[0].destroyCalls, 1);
+  assert.equal(trackedBuffers[0].destroyed, true);
+  assert.equal(trackedBuffers[0].destroyCalls, 1);
+  assert.equal(trackedTextures[1].destroyed, false);
+  assert.equal(processor._inFlightDeferredDestroys.size, 0);
+  assert.equal(processor.getStats().deferredGpuDestroysCompleted, 2);
+
+  processor.destroy();
+});
+
+test('W342: deferred destroy falls back cleanly right after submit() when onSubmittedWorkDone is absent, drains on _flushPendingUploads(), and drives resourceTable beginFrame/endFrame', () => {
+  const { device, ctx } = createMockWebGpu();
+  delete device.queue.onSubmittedWorkDone;
+
+  const events = [];
+  const origSubmit = device.queue.submit.bind(device.queue);
+  device.queue.submit = (cmdBufs) => {
+    events.push({
+      type: 'submit',
+      pendingCount: processor._deferredGpuDestroys.length,
+      anyDestroyed: processor._deferredGpuDestroys.some((r) => r.destroyed),
+    });
+    return origSubmit(cmdBufs);
+  };
+
+  const resourceTable = {
+    beginFrame() {
+      events.push({ type: 'resourceTable.beginFrame' });
+    },
+    endFrame(queue) {
+      events.push({ type: 'resourceTable.endFrame', hasQueue: queue === device.queue });
+    },
+  };
+
+  const processor = new WgpuCommandProcessor(device, ctx, { resourceTable });
+
+  const frameStream = new BinaryCommandBuilder()
+    .beginFrame()
+    .createTexture(7, 128, 1, 1, 1, TEXTURE_FORMAT.RGBA8_UNORM, TEXTURE_USAGE.TEXTURE_BINDING)
+    .destroyResource(7)
+    .present()
+    .finish();
+
+  processor.execute(frameStream);
+
+  assert.equal(events[0].type, 'resourceTable.beginFrame');
+  assert.equal(events[1].type, 'submit');
+  assert.equal(events[1].pendingCount, 1);
+  assert.equal(events[1].anyDestroyed, false);
+  assert.deepEqual(events[2], { type: 'resourceTable.endFrame', hasQueue: true });
+  assert.equal(processor._deferredGpuDestroys.length, 0);
+  assert.equal(processor.getStats().deferredGpuDestroysCompleted, 1);
+
+  // Also test _flushPendingUploads() path when an upload encoder is active outside beginFrame().
+  processor.execute(
+    new BinaryCommandBuilder()
+      .createBuffer(33, BUFFER_USAGE.COPY_DST | BUFFER_USAGE.UNIFORM, 64)
+      .finish()
+  );
+  const uploadBuf = processor.buffers.get(33);
+  processor._ensurePendingEncoder();
+  processor._hasPendingUploadCommands = true;
+  processor._destroyBufferIfPresent(33);
+  assert.equal(uploadBuf.destroyed, false);
+  assert.equal(processor._deferredGpuDestroys.length, 1);
+
+  assert.equal(processor._flushPendingUploads(false), true);
+  assert.equal(uploadBuf.destroyed, true);
+  assert.equal(processor._deferredGpuDestroys.length, 0);
+
+  processor.destroy();
+});
+
+test('W342: _resetDeviceResources() and destroy() flush pending and in-flight deferred destroys without double-destroy', async () => {
+  // Part A: _resetDeviceResources()
+  {
+    const { device, ctx } = createMockWebGpu();
+    const resolvers = [];
+    device.queue.onSubmittedWorkDone = () => new Promise((r) => resolvers.push(r));
+
+    const origCreateTexture = device.createTexture.bind(device);
+    device.createTexture = (desc) => {
+      const t = origCreateTexture(desc);
+      t.destroyCalls = 0;
+      const origDestroy = t.destroy.bind(t);
+      t.destroy = () => {
+        t.destroyCalls += 1;
+        origDestroy();
+      };
+      return t;
+    };
+
+    const processor = new WgpuCommandProcessor(device, ctx);
+
+    // Frame 1: create & mid-frame destroy texture 1 -> ends up in _inFlightDeferredDestroys after Present.
+    processor.execute(
+      new BinaryCommandBuilder()
+        .beginFrame()
+        .createTexture(1, 64, 64, 1, 1, TEXTURE_FORMAT.RGBA8_UNORM, TEXTURE_USAGE.TEXTURE_BINDING)
+        .finish()
+    );
+    const inFlightTex = processor.textures.get(1);
+    processor.execute(new BinaryCommandBuilder().destroyResource(1).present().finish());
+    assert.equal(inFlightTex.destroyed, false);
+    assert.equal(processor._inFlightDeferredDestroys.size, 1);
+
+    // Frame 2: create & mid-frame destroy texture 2 (still pending, no Present yet).
+    processor.execute(
+      new BinaryCommandBuilder()
+        .beginFrame()
+        .createTexture(2, 64, 64, 1, 1, TEXTURE_FORMAT.RGBA8_UNORM, TEXTURE_USAGE.TEXTURE_BINDING)
+        .finish()
+    );
+    const pendingTex = processor.textures.get(2);
+    processor.execute(new BinaryCommandBuilder().destroyResource(2).finish());
+    assert.equal(pendingTex.destroyed, false);
+    assert.equal(processor._deferredGpuDestroys.length, 1);
+
+    // Device reset must immediately destroy both pending and in-flight deferred textures.
+    processor._resetDeviceResources();
+    assert.equal(inFlightTex.destroyed, true);
+    assert.equal(inFlightTex.destroyCalls, 1);
+    assert.equal(pendingTex.destroyed, true);
+    assert.equal(pendingTex.destroyCalls, 1);
+    assert.equal(processor._deferredGpuDestroys.length, 0);
+    assert.equal(processor._inFlightDeferredDestroys.size, 0);
+
+    // Resolving the stale fence afterwards must NOT call destroy() a second time.
+    resolvers.shift()();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(inFlightTex.destroyCalls, 1);
+
+    processor.destroy();
+  }
+
+  // Part B: destroy()
+  {
+    const { device, ctx } = createMockWebGpu();
+    const resolvers = [];
+    device.queue.onSubmittedWorkDone = () => new Promise((r) => resolvers.push(r));
+
+    const origCreateBuffer = device.createBuffer.bind(device);
+    device.createBuffer = (desc) => {
+      const b = origCreateBuffer(desc);
+      b.destroyCalls = 0;
+      const origDestroy = b.destroy.bind(b);
+      b.destroy = () => {
+        b.destroyCalls += 1;
+        origDestroy();
+      };
+      return b;
+    };
+
+    const processor = new WgpuCommandProcessor(device, ctx);
+
+    processor.execute(
+      new BinaryCommandBuilder()
+        .beginFrame()
+        .createBuffer(10, BUFFER_USAGE.UNIFORM | BUFFER_USAGE.COPY_DST, 128)
+        .finish()
+    );
+    const inFlightBuf = processor.buffers.get(10);
+    processor.execute(new BinaryCommandBuilder().destroyResource(10).present().finish());
+
+    processor.execute(
+      new BinaryCommandBuilder()
+        .beginFrame()
+        .createBuffer(11, BUFFER_USAGE.UNIFORM | BUFFER_USAGE.COPY_DST, 128)
+        .finish()
+    );
+    const pendingBuf = processor.buffers.get(11);
+    processor.execute(new BinaryCommandBuilder().destroyResource(11).finish());
+
+    assert.equal(inFlightBuf.destroyed, false);
+    assert.equal(pendingBuf.destroyed, false);
+
+    processor.destroy();
+
+    assert.equal(inFlightBuf.destroyed, true);
+    assert.equal(inFlightBuf.destroyCalls, 1);
+    assert.equal(pendingBuf.destroyed, true);
+    assert.equal(pendingBuf.destroyCalls, 1);
+    assert.equal(processor._deferredGpuDestroys.length, 0);
+    assert.equal(processor._inFlightDeferredDestroys.size, 0);
+
+    resolvers.shift()();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(inFlightBuf.destroyCalls, 1);
+  }
+});
+
+test('W342: 1D LUT textures (4096x1 rgba8unorm & r32float) are promoted to WebGPU dimension 2d with valid 2d createView()', () => {
+  const { device, ctx } = createMockWebGpu();
+  const createdDescs = [];
+  const viewDescs = [];
+
+  device.createTexture = (desc) => {
+    const copy = { ...desc, size: { ...desc.size } };
+    createdDescs.push(copy);
+    return {
+      kind: 'GPUTexture',
+      dimension: copy.dimension,
+      desc: copy,
+      destroyed: false,
+      createView(viewDesc) {
+        if (copy.dimension === '1d' && viewDesc && viewDesc.dimension === '2d') {
+          throw new Error('WebGPU validation error: cannot create 2d view of 1d texture');
+        }
+        viewDescs.push(viewDesc ? { ...viewDesc } : null);
+        return {
+          kind: 'GPUTextureView',
+          dimension: (viewDesc && viewDesc.dimension) || copy.dimension,
+        };
+      },
+      destroy() {
+        this.destroyed = true;
+      },
+    };
+  };
+
+  const processor = new WgpuCommandProcessor(device, ctx);
+
+  // 1. ABI v1 CREATE_TEXTURE: 4096x1 rgba8unorm, dimension = 1d
+  processor.execute(
+    new BinaryCommandBuilder()
+      .createTexture(
+        101,
+        4096,
+        1,
+        1,
+        1,
+        TEXTURE_FORMAT.RGBA8_UNORM,
+        TEXTURE_USAGE.TEXTURE_BINDING | TEXTURE_USAGE.COPY_DST,
+        TEXTURE_DIMENSION.DIM_1D
+      )
+      .finish()
+  );
+
+  // 2. ABI v2 CREATE_TEXTURE2: 4096x1 r32float (code 16), dimension = 1d
+  processor.execute(
+    buildCreateTexture2Packet({
+      id: 102,
+      width: 4096,
+      height: 1,
+      depthOrArrayLayers: 1,
+      dimensionCode: TEXTURE_DIMENSION.DIM_1D,
+      formatCode: 16, // r32float
+    })
+  );
+
+  // 3. ABI v2 CREATE_TEXTURE2: 4096x1 rgba8unorm (code 22), dimension = 1d
+  processor.execute(
+    buildCreateTexture2Packet({
+      id: 103,
+      width: 4096,
+      height: 1,
+      depthOrArrayLayers: 1,
+      dimensionCode: TEXTURE_DIMENSION.DIM_1D,
+      formatCode: 22, // rgba8unorm
+    })
+  );
+
+  assert.equal(createdDescs.length, 3);
+  for (const desc of createdDescs) {
+    assert.equal(desc.dimension, '2d');
+    assert.deepEqual(desc.size, { width: 4096, height: 1, depthOrArrayLayers: 1 });
+    assert.equal(desc.mipLevelCount, 1);
+  }
+  assert.equal(createdDescs[0].format, 'rgba8unorm');
+  assert.equal(createdDescs[1].format, 'r32float');
+  assert.equal(createdDescs[2].format, 'rgba8unorm');
+
+  assert.deepEqual(viewDescs, [
+    { dimension: '2d' },
+    { dimension: '2d' },
+    { dimension: '2d' },
+  ]);
+  assert.equal(processor.textureViews.get(101).dimension, '2d');
+  assert.equal(processor.textureViews.get(102).dimension, '2d');
+  assert.equal(processor.textureViews.get(103).dimension, '2d');
+  assert.equal(processor.getStats().promoted1DTo2DCount, 3);
+
+  processor.destroy();
+});
+
+test('W342: promote1DTo2D: false opts out of 1D -> 2D promotion and guards createView() against { dimension: "2d" } on 1d textures', () => {
+  const { device, ctx } = createMockWebGpu();
+  const createdDescs = [];
+  const viewDescs = [];
+
+  device.createTexture = (desc) => {
+    const copy = { ...desc, size: { ...desc.size } };
+    createdDescs.push(copy);
+    return {
+      kind: 'GPUTexture',
+      dimension: copy.dimension,
+      desc: copy,
+      destroyed: false,
+      createView(viewDesc) {
+        if (copy.dimension === '1d' && viewDesc && viewDesc.dimension === '2d') {
+          throw new Error('WebGPU validation error: cannot create 2d view of 1d texture');
+        }
+        viewDescs.push(viewDesc ? { ...viewDesc } : null);
+        return {
+          kind: 'GPUTextureView',
+          dimension: (viewDesc && viewDesc.dimension) || copy.dimension,
+        };
+      },
+      destroy() {
+        this.destroyed = true;
+      },
+    };
+  };
+
+  const processor = new WgpuCommandProcessor(device, ctx, { promote1DTo2D: false });
+
+  processor.execute(
+    new BinaryCommandBuilder()
+      .createTexture(
+        201,
+        4096,
+        1,
+        1,
+        1,
+        TEXTURE_FORMAT.RGBA8_UNORM,
+        TEXTURE_USAGE.TEXTURE_BINDING | TEXTURE_USAGE.COPY_DST,
+        TEXTURE_DIMENSION.DIM_1D
+      )
+      .finish()
+  );
+  processor.execute(
+    buildCreateTexture2Packet({
+      id: 202,
+      width: 4096,
+      height: 1,
+      depthOrArrayLayers: 1,
+      dimensionCode: TEXTURE_DIMENSION.DIM_1D,
+      formatCode: 16, // r32float
+    })
+  );
+
+  assert.equal(createdDescs.length, 2);
+  assert.equal(createdDescs[0].dimension, '1d');
+  assert.equal(createdDescs[0].format, 'rgba8unorm');
+  assert.deepEqual(createdDescs[0].size, { width: 4096, height: 1, depthOrArrayLayers: 1 });
+  assert.equal(createdDescs[1].dimension, '1d');
+  assert.equal(createdDescs[1].format, 'r32float');
+  assert.deepEqual(createdDescs[1].size, { width: 4096, height: 1, depthOrArrayLayers: 1 });
+
+  // Neither createView call passed { dimension: '2d' }.
+  assert.deepEqual(viewDescs, [null, null]);
+  assert.equal(processor.textureViews.get(201).dimension, '1d');
+  assert.equal(processor.textureViews.get(202).dimension, '1d');
+  assert.equal(processor.getStats().promoted1DTo2DCount, 0);
+
+  // Explicit _createSafeTextureView guard prevents passing { dimension: '2d' } to a 1d texture.
+  const guardedView = processor._createSafeTextureView(processor.textures.get(201), {
+    dimension: '2d',
+  });
+  assert.equal(guardedView.dimension, '1d');
+  assert.deepEqual(viewDescs[2], { dimension: '1d' });
+
+  processor.destroy();
+});
+
+test('W342: outside an active frame, _destroyTextureIfPresent and _destroyBufferIfPresent stay synchronous', () => {
+  const { device, ctx } = createMockWebGpu();
+  const processor = new WgpuCommandProcessor(device, ctx);
+
+  processor.execute(
+    new BinaryCommandBuilder()
+      .createTexture(301, 16, 16, 1, 1, TEXTURE_FORMAT.RGBA8_UNORM, TEXTURE_USAGE.TEXTURE_BINDING)
+      .createBuffer(302, BUFFER_USAGE.UNIFORM, 64)
+      .finish()
+  );
+  const tex = processor.textures.get(301);
+  const buf = processor.buffers.get(302);
+
+  assert.equal(processor._isFrameOrBatchActive(), false);
+  processor._destroyTextureIfPresent(301);
+  processor._destroyBufferIfPresent(302);
+
+  assert.equal(tex.destroyed, true);
+  assert.equal(buf.destroyed, true);
+  assert.equal(processor._deferredGpuDestroys.length, 0);
+
+  processor.destroy();
+});
