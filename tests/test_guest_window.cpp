@@ -552,6 +552,26 @@ void test_write_marks() {
     CHECK((taken(W, k64K) == std::vector<uint64_t>{0}));
     CHECK(!gw::write_marked(W));
 
+    // O36: a mark pass takes a slot's mark once and reports it to every reader in the pass.
+    {
+        gw::MarkPass pass;
+        pass.begin();
+        gw::mark_written(W + k64K + 8, 4);
+        std::vector<uint64_t> a, b, c;
+        CHECK(pass.take(W, 2 * k64K, &a) && (a == std::vector<uint64_t>{k64K}));
+        CHECK(pass.take(W + k64K + 0x100, 16, &b) && (b == std::vector<uint64_t>{0}));  // same slot, same pass
+        CHECK(!gw::write_marked(W + k64K));  // taken once, from the table
+        pass.begin();
+        CHECK(pass.take(W, 2 * k64K, &c) && c.empty());  // a new pass: nothing new
+        gw::mark_written(W + 5, 1);
+        c.clear();
+        CHECK(pass.take(W, 2 * k64K, &c) && c.empty());  // slot 0 was taken in this pass already
+        pass.begin();
+        c.clear();
+        CHECK(pass.take(W, 2 * k64K, &c) && (c == std::vector<uint64_t>{0}));  // the next pass sees it
+        CHECK(!pass.take(0x1000, 16, &c));  // not translated
+    }
+
     // Verification counters.
     CHECK(!gw::write_marks_verified() && gw::verify_misses() == 0);
     gw::set_write_marks_verified(true);

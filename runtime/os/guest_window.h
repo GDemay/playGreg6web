@@ -142,6 +142,24 @@ void note_verify_miss(uint64_t va);
 bool write_marked(uint64_t va);
 uint64_t verify_misses();
 
+// O36: one pass over the marks (a submission's flush) with several readers. take_written clears a
+// slot's mark, so a second reader of the same slot (two buffers sharing a slot, a relocated range
+// inside a buffer) would no longer see it. A pass takes each slot's mark once, on its first query,
+// and answers every later query of that slot in the same pass from that result.
+class MarkPass {
+public:
+    // Starts a new pass (marks taken in earlier passes are not reported again).
+    void begin();
+    // take_written within the pass: false if [va, va + len) is not translated; otherwise appends
+    // the offsets (from `va`, as take_written) of the slots marked when this pass first took them.
+    bool take(uint64_t va, size_t len, std::vector<uint64_t>* slot_offsets);
+
+private:
+    std::vector<uint32_t> pass_of_;  // per slot: the pass that took its mark (0: none yet)
+    std::vector<uint8_t> marked_;    // per slot: whether that take found it marked
+    uint32_t pass_ = 0;
+};
+
 // (pointer, length) marshaling for host code called with guest buffers (O29; the generated
 // import thunks of code lifted with the windowed memory model use one per call). Outside the
 // window a buffer is its flat host pointer. A window buffer whose slots are mapped onto adjacent
