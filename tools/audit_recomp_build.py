@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Recompilation coverage and boot-path bottleneck profiler (Track 1 / R15, T52).
+"""Recompilation coverage and boot-path bottleneck profiler (Track 1 / R15, T52, T68).
 
 Parses exact JSON produced by `playgta6-recomp build` (`build-manifest.json`,
 schema `playgta6-recomp-build`), `playgta6-recomp build-program`
@@ -7,7 +7,8 @@ schema `playgta6-recomp-build`), `playgta6-recomp build-program`
 `tools/build_guest_wasm.py` (`guest_manifest.json`), and
 `playgta6-recomp discover --json` (`render_summary_json` in
 `recomp/src/summary.rs`). Also accepts a build output directory (module dir,
-multi-module program dir, dist dir, or `--out` root containing `<module>/`).
+multi-module program dir, dist dir, or `--out` root containing `<module>/`),
+and supports browser fast-boot Wasm64 staging audits via `--dist-dir <DIR>`.
 
 Computes:
 - Function / block / instruction lift coverage and shard size distribution.
@@ -15,6 +16,11 @@ Computes:
   function/shard/import counts, unresolved imports by DLL, and dependency cycles).
 - Wasm / `GOT.func` and `wasmTable` footprint telemetry from `guest_manifest.json`
   (or dispatch-mode estimate when only `program-manifest.json` is present).
+- Browser fast-boot Wasm64 audit (`--dist-dir`): `runtime.wasm` +
+  `guest_part_*.wasm` presence, total bytes, split-balance ratio / dominant-shard
+  warning, pure-Python Wasm export section inspection (`_main` / `main`,
+  `_playgta6_get_input_state_ptr`, `_playgta6_audio_ring`), and boot manifest
+  consistency against staged artifacts.
 - Top-N unlifted x86-64 mnemonics and lift-failure categories.
 - Entry-point + TLS-callback boot-path BFS, including shortest-path traces
   to `D3D12XboxCreateDevice` / `PresentX` when import/call metadata is present.
@@ -25,7 +31,8 @@ Security invariant: stdout, JSON, and Markdown never include host absolute
 paths, usernames, or raw binary bytes. Pure Python 3.12 stdlib.
 
 Usage:
-    python tools/audit_recomp_build.py <recomp-build-dir-or-json> [--top N] [--boot-depth D] [--fail-on-unresolved [N]] [--markdown] [--json]
+    python tools/audit_recomp_build.py <recomp-build-dir-or-json> [--top N] [--boot-depth D] [--fail-on-unresolved [N]] [--dist-dir DIR] [--boot-manifest FILE] [--balance-warn-ratio R] [--markdown] [--json]
+    python tools/audit_recomp_build.py --dist-dir <staged-dist-dir> [--boot-manifest FILE] [--balance-warn-ratio R] [--markdown] [--json]
 """
 
 from __future__ import annotations
@@ -38,7 +45,7 @@ import sys
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, BinaryIO, Mapping, Sequence
 
 SCHEMA_BUILD = "playgta6-recomp-build"
 SCHEMA_PROGRAM = "playgta6-recomp-program"
@@ -47,10 +54,44 @@ SCHEMA_AUDIT_VERSION = 1
 MANIFEST_FILE = "build-manifest.json"
 PROGRAM_MANIFEST_FILE = "program-manifest.json"
 GUEST_MANIFEST_FILE = "guest_manifest.json"
+BOOT_MANIFEST_FILE = "boot-manifest.json"
+RUNTIME_WASM_FILE = "runtime.wasm"
+RUNTIME_JS_FILE = "runtime.js"
 REPORT_FILE = "report.txt"
 DEFAULT_TOP = 15
 EXIT_THRESHOLD_FAILED = 2
 BOOT_TARGETS = ("D3D12XboxCreateDevice", "PresentX")
+
+# Browser fast-boot Wasm64 audit constants (T68).
+V8_MAX_WASM_MODULE_BYTES = 1024 * 1024 * 1024  # 1 GiB Chromium/V8 single-module cap
+DEFAULT_SPLIT_BALANCE_WARN_RATIO = 1.5
+WASM_MAGIC = b"\x00asm"
+WASM_VERSION_BYTES = b"\x01\x00\x00\x00"
+WASM_SECTION_EXPORT = 7
+WASM_MAX_SECTION_ID = 13
+WASM_EXPORT_KINDS: dict[int, str] = {
+    0x00: "func",
+    0x01: "table",
+    0x02: "memory",
+    0x03: "global",
+    0x04: "tag",
+}
+REQUIRED_RUNTIME_EXPORTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("_main", ("_main", "main")),
+    (
+        "_playgta6_get_input_state_ptr",
+        ("_playgta6_get_input_state_ptr", "playgta6_get_input_state_ptr"),
+    ),
+    (
+        "_playgta6_audio_ring",
+        ("_playgta6_audio_ring", "playgta6_audio_ring"),
+    ),
+)
+
+_GUEST_PART_RE = re.compile(r"^guest_part_([A-Za-z0-9_-]+)\.wasm$", re.IGNORECASE)
+_SAFE_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
+_SCHEME_PREFIX_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+_ENCODED_TRAVERSAL_RE = re.compile(r"%(?:2e|2f|5c)", re.IGNORECASE)
 
 DISCOVER_JSON_NAMES = (
     "discover.json",
@@ -63,6 +104,7 @@ DISCOVER_JSON_NAMES = (
 
 _WINDOWS_PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\s\"'<>|,;()\[\]]+")
 _UNC_PATH_RE = re.compile(r"\\\\[^\s\"'<>|,;()\[\]]+")
+_UNC_FS_PATH_RE = re.compile(r"(?<!:)//[^\s\"'<>|,;()\[\]]+")
 _POSIX_PATH_RE = re.compile(
     r"/(?:Users|home|tmp|var|opt|root|mnt|private|etc|usr|Library|Volumes)/[^\s\"'<>|,;()\[\]]*"
 )
@@ -71,6 +113,10 @@ _REPORT_MNEMONIC_RE = re.compile(r"^\s{2,}([A-Za-z][A-Za-z0-9./]+)\s+(\d+)\s*$")
 
 class AuditError(ValueError):
     """Raised when inputs cannot be loaded or classified."""
+
+
+class _WasmBinaryError(ValueError):
+    """Raised when a Wasm binary is truncated, malformed, or invalid."""
 
 
 # ---------------------------------------------------------------------------
@@ -101,9 +147,10 @@ def sanitize_text(raw: str | None) -> str:
     """Strip host absolute paths (both `\\` and `/`) and active usernames."""
     if raw is None:
         return ""
-    text = raw.replace("\\", "/")
+    text = _UNC_PATH_RE.sub("<path>", str(raw))
+    text = text.replace("\\", "/")
     sanitized = _WINDOWS_PATH_RE.sub("<path>", text)
-    sanitized = _UNC_PATH_RE.sub("<path>", sanitized)
+    sanitized = _UNC_FS_PATH_RE.sub("<path>", sanitized)
     sanitized = _POSIX_PATH_RE.sub("<path>", sanitized)
     # Catch remaining drive-letter paths after slash normalization.
     sanitized = re.sub(r"[A-Za-z]:/(?:[^\s\"'<>|,;()\[\]]+)", "<path>", sanitized)
@@ -2430,11 +2477,929 @@ def check_unresolved_threshold(
     return count <= max_unresolved, count
 
 
+# ---------------------------------------------------------------------------
+# Browser fast-boot Wasm64 audit (T68)
+# ---------------------------------------------------------------------------
+
+
+def _read_exact(fh: BinaryIO, length: int, pos: int, end: int) -> tuple[bytes, int]:
+    if length < 0 or pos + length > end:
+        raise _WasmBinaryError("unexpected EOF in Wasm binary")
+    data = fh.read(length)
+    if len(data) != length:
+        raise _WasmBinaryError("short read in Wasm binary")
+    return data, pos + length
+
+
+def _read_uleb128_u32(fh: BinaryIO, pos: int, end: int) -> tuple[int, int]:
+    result = 0
+    shift = 0
+    for idx in range(5):
+        raw, pos = _read_exact(fh, 1, pos, end)
+        byte = raw[0]
+        if idx == 4 and ((byte & 0x80) != 0 or (byte & 0xF0) != 0):
+            raise _WasmBinaryError("invalid ULEB128 u32")
+        result |= (byte & 0x7F) << shift
+        if (byte & 0x80) == 0:
+            return result, pos
+        shift += 7
+    raise _WasmBinaryError("overlong ULEB128 u32")
+
+
+def inspect_wasm_header(path: Path) -> bool:
+    """Return True iff `path` begins with valid WebAssembly 1.0 magic + version."""
+    try:
+        with path.open("rb") as fh:
+            header = fh.read(8)
+    except OSError:
+        return False
+    return len(header) == 8 and header[:4] == WASM_MAGIC and header[4:8] == WASM_VERSION_BYTES
+
+
+def _empty_export_audit(*, inspected: bool, valid_wasm: bool = False) -> dict[str, Any]:
+    required_names = [canonical for canonical, _ in REQUIRED_RUNTIME_EXPORTS]
+    return {
+        "inspected": inspected,
+        "valid_wasm": valid_wasm,
+        "has_export_section": False,
+        "total_export_count": 0,
+        "func_export_count": 0,
+        "memory_exported": False,
+        "required": {name: False for name in required_names},
+        "required_present_count": 0,
+        "required_total_count": len(required_names),
+        "missing_required": list(required_names),
+        "all_required_present": False,
+    }
+
+
+def inspect_wasm_exports(path: Path) -> dict[str, Any]:
+    """Pure-Python WebAssembly Export section (id=7) inspector for `runtime.wasm`.
+
+    Seeks directly past non-export sections so large Wasm64 binaries are audited
+    without loading code/data sections into memory. Emits strictly sanitized
+    counts, booleans, and fixed required-symbol names (zero host paths/bytes).
+    """
+    try:
+        file_size = path.stat().st_size
+    except OSError:
+        return _empty_export_audit(inspected=True, valid_wasm=False)
+
+    if file_size < 8:
+        return _empty_export_audit(inspected=True, valid_wasm=False)
+
+    has_export_section = False
+    total_exports = 0
+    func_exports = 0
+    memory_exported = False
+    func_export_names: set[str] = set()
+
+    try:
+        with path.open("rb") as fh:
+            header, pos = _read_exact(fh, 8, 0, file_size)
+            if header[:4] != WASM_MAGIC or header[4:8] != WASM_VERSION_BYTES:
+                return _empty_export_audit(inspected=True, valid_wasm=False)
+
+            while pos < file_size:
+                sec_id_bytes, pos = _read_exact(fh, 1, pos, file_size)
+                sec_id = sec_id_bytes[0]
+                if sec_id > WASM_MAX_SECTION_ID:
+                    raise _WasmBinaryError("unknown Wasm section id")
+                sec_size, pos = _read_uleb128_u32(fh, pos, file_size)
+                sec_end = pos + sec_size
+                if sec_end > file_size:
+                    raise _WasmBinaryError("truncated Wasm section")
+
+                if sec_id == WASM_SECTION_EXPORT:
+                    if has_export_section:
+                        raise _WasmBinaryError("duplicate Wasm export section")
+                    has_export_section = True
+                    export_count, pos = _read_uleb128_u32(fh, pos, sec_end)
+                    for _ in range(export_count):
+                        name_len, pos = _read_uleb128_u32(fh, pos, sec_end)
+                        raw_name, pos = _read_exact(fh, name_len, pos, sec_end)
+                        try:
+                            name = raw_name.decode("utf-8")
+                        except UnicodeDecodeError as exc:
+                            raise _WasmBinaryError("invalid UTF-8 export name") from exc
+                        kind_bytes, pos = _read_exact(fh, 1, pos, sec_end)
+                        kind_code = kind_bytes[0]
+                        if kind_code not in WASM_EXPORT_KINDS:
+                            raise _WasmBinaryError("unknown Wasm export kind")
+                        _index, pos = _read_uleb128_u32(fh, pos, sec_end)
+                        total_exports += 1
+                        kind_name = WASM_EXPORT_KINDS[kind_code]
+                        if kind_name == "func":
+                            func_exports += 1
+                            func_export_names.add(name)
+                        elif kind_name == "memory":
+                            memory_exported = True
+                    if pos != sec_end:
+                        raise _WasmBinaryError("trailing bytes in Wasm export section")
+                else:
+                    pos = sec_end
+                    fh.seek(pos)
+    except (_WasmBinaryError, OSError):
+        return _empty_export_audit(inspected=True, valid_wasm=False)
+
+    required_map: dict[str, bool] = {}
+    missing_required: list[str] = []
+    for canonical, aliases in REQUIRED_RUNTIME_EXPORTS:
+        present = any(alias in func_export_names for alias in aliases)
+        required_map[canonical] = present
+        if not present:
+            missing_required.append(canonical)
+
+    present_count = len(REQUIRED_RUNTIME_EXPORTS) - len(missing_required)
+    return {
+        "inspected": True,
+        "valid_wasm": True,
+        "has_export_section": has_export_section,
+        "total_export_count": total_exports,
+        "func_export_count": func_exports,
+        "memory_exported": memory_exported,
+        "required": required_map,
+        "required_present_count": present_count,
+        "required_total_count": len(REQUIRED_RUNTIME_EXPORTS),
+        "missing_required": missing_required,
+        "all_required_present": len(missing_required) == 0,
+    }
+
+
+def _natural_part_sort_key(name: str) -> tuple[Any, ...]:
+    parts = re.split(r"(\d+)", name.lower())
+    return tuple(int(part) if part.isdigit() else part for part in parts)
+
+
+def _is_safe_child_file(root_resolved: Path, candidate: Path) -> bool:
+    try:
+        resolved = candidate.resolve()
+        return resolved.is_relative_to(root_resolved) and resolved.is_file()
+    except OSError:
+        return False
+
+
+def _validate_manifest_relpath(raw: Any) -> tuple[str, ...] | None:
+    """Validate a manifest-supplied relative artifact path (rejects traversal/host paths)."""
+    if not isinstance(raw, str):
+        return None
+    cleaned = raw.strip()
+    if not cleaned:
+        return None
+    if _SAFE_CONTROL_CHAR_RE.search(cleaned):
+        return None
+    if _ENCODED_TRAVERSAL_RE.search(cleaned):
+        return None
+    if cleaned.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", cleaned):
+        return None
+    if _SCHEME_PREFIX_RE.match(cleaned):
+        return None
+    normalized = cleaned.replace("\\", "/")
+    segments = [seg for seg in normalized.split("/") if seg and seg != "."]
+    if not segments or any(seg == ".." for seg in segments):
+        return None
+    return tuple(segments)
+
+
+def _resolve_manifest_artifact(base_dirs: Sequence[Path], segments: tuple[str, ...]) -> Path | None:
+    for base in base_dirs:
+        try:
+            root = base.resolve()
+            candidate = (root / Path(*segments)).resolve()
+            if candidate.is_relative_to(root) and candidate.is_file():
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def _compute_split_balance(
+    part_sizes: Sequence[int],
+    *,
+    warn_ratio: float = DEFAULT_SPLIT_BALANCE_WARN_RATIO,
+) -> dict[str, Any]:
+    count = len(part_sizes)
+    if count == 0:
+        return {
+            "part_count": 0,
+            "min_bytes": 0,
+            "median_bytes": 0.0,
+            "mean_bytes": 0.0,
+            "max_bytes": 0,
+            "max_to_mean_ratio": 0.0,
+            "max_to_min_ratio": 0.0,
+            "max_share_ratio": 0.0,
+            "split_balance_ratio": 0.0,
+            "warn_threshold_ratio": round(warn_ratio, 4),
+            "has_empty_part": False,
+            "dominant_shard_warning": False,
+            "balanced": False,
+        }
+
+    total = sum(part_sizes)
+    min_b = min(part_sizes)
+    max_b = max(part_sizes)
+    mean_b = total / count
+    med_b = median(part_sizes)
+    has_empty = min_b == 0
+
+    max_to_mean = round(max_b / mean_b, 4) if mean_b > 0 else 0.0
+    if min_b > 0:
+        max_to_min: float | None = round(max_b / min_b, 4)
+    elif max_b == 0:
+        max_to_min = 0.0
+    else:
+        max_to_min = None
+    max_share = round(max_b / total, 4) if total > 0 else 0.0
+
+    dominant_warning = bool(
+        count >= 2
+        and (
+            max_to_mean > warn_ratio
+            or (has_empty and max_b > 0)
+        )
+    )
+    balanced = bool(count >= 1 and total > 0 and not has_empty and not dominant_warning)
+
+    return {
+        "part_count": count,
+        "min_bytes": min_b,
+        "median_bytes": round(med_b, 2),
+        "mean_bytes": round(mean_b, 2),
+        "max_bytes": max_b,
+        "max_to_mean_ratio": max_to_mean,
+        "max_to_min_ratio": max_to_min,
+        "max_share_ratio": max_share,
+        "split_balance_ratio": max_to_mean,
+        "warn_threshold_ratio": round(warn_ratio, 4),
+        "has_empty_part": has_empty,
+        "dominant_shard_warning": dominant_warning,
+        "balanced": balanced,
+    }
+
+
+def _audit_boot_manifest_consistency(
+    dist_dir: Path,
+    *,
+    boot_manifest: str | Path | None,
+    runtime_wasm_present: bool,
+    runtime_wasm_bytes: int,
+    runtime_js_present: bool,
+    staged_guest_parts: Mapping[str, int],
+) -> dict[str, Any]:
+    dist_resolved = dist_dir.resolve()
+    manifest_path: Path | None = None
+    manifest_kind = "none"
+
+    if boot_manifest is not None:
+        explicit = Path(boot_manifest)
+        if not explicit.is_file():
+            raise AuditError(f"boot manifest not found: {basename_label(boot_manifest)}")
+        manifest_path = explicit
+        manifest_kind = (
+            "guest_manifest"
+            if explicit.name.lower() == GUEST_MANIFEST_FILE
+            else "boot_manifest"
+        )
+    else:
+        guest_cand = dist_dir / GUEST_MANIFEST_FILE
+        boot_cand = dist_dir / BOOT_MANIFEST_FILE
+        if _is_safe_child_file(dist_resolved, guest_cand):
+            manifest_path = guest_cand
+            manifest_kind = "guest_manifest"
+        elif _is_safe_child_file(dist_resolved, boot_cand):
+            manifest_path = boot_cand
+            manifest_kind = "boot_manifest"
+
+    staged_side_count = len(staged_guest_parts)
+    if manifest_path is None:
+        return {
+            "present": False,
+            "kind": "none",
+            "valid_json": False,
+            "declared_side_module_count": 0,
+            "staged_side_module_count": staged_side_count,
+            "declared_split_modules": None,
+            "split_count_matches": None,
+            "runtime_wasm_matches": None,
+            "runtime_js_matches": None,
+            "total_bytes_matches": None,
+            "missing_on_disk_count": 0,
+            "unlisted_on_disk_count": 0,
+            "size_mismatch_count": 0,
+            "unsafe_entry_count": 0,
+            "checked_artifact_count": 0,
+            "consistent": False,
+        }
+
+    try:
+        doc = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {
+            "present": True,
+            "kind": manifest_kind,
+            "valid_json": False,
+            "declared_side_module_count": 0,
+            "staged_side_module_count": staged_side_count,
+            "declared_split_modules": None,
+            "split_count_matches": None,
+            "runtime_wasm_matches": None,
+            "runtime_js_matches": None,
+            "total_bytes_matches": None,
+            "missing_on_disk_count": 0,
+            "unlisted_on_disk_count": 0,
+            "size_mismatch_count": 0,
+            "unsafe_entry_count": 0,
+            "checked_artifact_count": 0,
+            "consistent": False,
+        }
+
+    if not isinstance(doc, dict):
+        return {
+            "present": True,
+            "kind": manifest_kind,
+            "valid_json": False,
+            "declared_side_module_count": 0,
+            "staged_side_module_count": staged_side_count,
+            "declared_split_modules": None,
+            "split_count_matches": None,
+            "runtime_wasm_matches": None,
+            "runtime_js_matches": None,
+            "total_bytes_matches": None,
+            "missing_on_disk_count": 0,
+            "unlisted_on_disk_count": 0,
+            "size_mismatch_count": 0,
+            "unsafe_entry_count": 0,
+            "checked_artifact_count": 0,
+            "consistent": False,
+        }
+
+    if (
+        manifest_path.name.lower() != BOOT_MANIFEST_FILE
+        and doc.get("schema") != "boot-manifest"
+        and is_guest_manifest(doc)
+    ):
+        manifest_kind = "guest_manifest"
+
+    base_dirs: list[Path] = [dist_dir]
+    if manifest_path.parent.resolve() != dist_resolved:
+        base_dirs.append(manifest_path.parent)
+
+    unsafe_entry_count = 0
+    missing_keys: set[str] = set()
+    size_mismatch_keys: set[str] = set()
+    checked_keys: set[str] = set()
+
+    def _check_artifact(
+        raw_rel: Any,
+        *,
+        expected_bytes: int | None = None,
+        search_dirs: Sequence[Path] = (dist_dir,),
+    ) -> tuple[str | None, int | None]:
+        nonlocal unsafe_entry_count
+        segs = _validate_manifest_relpath(raw_rel)
+        if segs is None:
+            unsafe_entry_count += 1
+            return None, None
+        key = "/".join(segs).lower()
+        checked_keys.add(key)
+        resolved = _resolve_manifest_artifact(search_dirs, segs)
+        if resolved is None:
+            missing_keys.add(key)
+            return key, None
+        try:
+            actual_size = resolved.stat().st_size
+        except OSError:
+            missing_keys.add(key)
+            return key, None
+        if expected_bytes is not None and actual_size != expected_bytes:
+            size_mismatch_keys.add(key)
+        return key, actual_size
+
+    # 1. Runtime Wasm / JS declarations.
+    runtime_wasm_matches: bool | None = None
+    raw_runtime_wasm = _pick(doc, "runtimeWasm", "runtime_wasm")
+    if raw_runtime_wasm is not None:
+        key, actual = _check_artifact(raw_runtime_wasm, search_dirs=(dist_dir,))
+        runtime_wasm_matches = bool(key is not None and actual is not None and runtime_wasm_present)
+
+    runtime_js_matches: bool | None = None
+    raw_runtime_js = _pick(doc, "runtimeJs", "runtime_js")
+    if raw_runtime_js is not None:
+        key, actual = _check_artifact(raw_runtime_js, search_dirs=(dist_dir,))
+        runtime_js_matches = bool(key is not None and actual is not None and runtime_js_present)
+
+    # 2. Side modules & declared byte sizes.
+    declared_side_keys: set[str] = set()
+    declared_side_order: list[str] = []
+    declared_side_sizes_map: dict[str, int] = {}
+
+    raw_side_sizes = _pick(doc, "sideModuleSizes", "side_module_sizes")
+    if isinstance(raw_side_sizes, list):
+        for item in raw_side_sizes:
+            if not isinstance(item, Mapping):
+                unsafe_entry_count += 1
+                continue
+            raw_name = _pick(item, "name", "path", "file")
+            raw_bytes = _pick(item, "wasmBytes", "wasm_bytes", "size", "bytes")
+            expected = (
+                as_int(raw_bytes, -1)
+                if raw_bytes is not None and not isinstance(raw_bytes, bool)
+                else None
+            )
+            if expected is not None and expected < 0:
+                expected = None
+            key, actual = _check_artifact(raw_name, expected_bytes=expected, search_dirs=(dist_dir,))
+            if key is not None:
+                if key not in declared_side_keys:
+                    declared_side_keys.add(key)
+                    declared_side_order.append(key)
+                if actual is not None:
+                    declared_side_sizes_map[key] = actual
+
+    raw_side_names = _pick(doc, "sideModules", "side_modules")
+    if isinstance(raw_side_names, list):
+        for item in raw_side_names:
+            key, actual = _check_artifact(item, search_dirs=(dist_dir,))
+            if key is not None:
+                if key not in declared_side_keys:
+                    declared_side_keys.add(key)
+                    declared_side_order.append(key)
+                if actual is not None and key not in declared_side_sizes_map:
+                    declared_side_sizes_map[key] = actual
+
+    # 3. wasmMetrics per-module byte sizes & totals.
+    wasm_metrics = _pick(doc, "wasmMetrics", "wasm_metrics")
+    total_bytes_matches: bool | None = None
+    wasm_metrics_actual_by_key: dict[str, int] = {}
+    if isinstance(wasm_metrics, Mapping):
+        raw_mods = wasm_metrics.get("modules")
+        if isinstance(raw_mods, list):
+            for item in raw_mods:
+                if not isinstance(item, Mapping):
+                    continue
+                raw_name = _pick(item, "name", "path", "file")
+                raw_bytes = _pick(item, "wasmBytes", "wasm_bytes", "size")
+                expected = (
+                    as_int(raw_bytes, -1)
+                    if raw_bytes is not None and not isinstance(raw_bytes, bool)
+                    else None
+                )
+                if expected is not None and expected < 0:
+                    expected = None
+                key, actual = _check_artifact(
+                    raw_name,
+                    expected_bytes=expected,
+                    search_dirs=(dist_dir,),
+                )
+                if key is not None and actual is not None:
+                    wasm_metrics_actual_by_key[key] = actual
+                    role = str(item.get("role") or "").strip().lower()
+                    if role == "side" and key not in declared_side_keys:
+                        declared_side_keys.add(key)
+                        declared_side_order.append(key)
+
+        totals = wasm_metrics.get("totals")
+        if isinstance(totals, Mapping):
+            raw_total = _pick(totals, "wasmBytes", "wasm_bytes")
+            if raw_total is not None and not isinstance(raw_total, bool):
+                declared_total = as_int(raw_total, -1)
+                if declared_total >= 0:
+                    actual_total = runtime_wasm_bytes + sum(staged_guest_parts.values())
+                    # Include any non-guest_part declared side modules (e.g., guest_reg.wasm).
+                    for key, sz in declared_side_sizes_map.items():
+                        if key not in staged_guest_parts:
+                            actual_total += sz
+                    total_bytes_matches = declared_total == actual_total
+
+    raw_top_total = _pick(doc, "totalWasmBytes", "total_wasm_bytes", "totalBytes", "total_bytes")
+    if total_bytes_matches is None and raw_top_total is not None and not isinstance(raw_top_total, bool):
+        declared_total = as_int(raw_top_total, -1)
+        if declared_total >= 0:
+            actual_total = runtime_wasm_bytes + sum(staged_guest_parts.values())
+            for key, sz in declared_side_sizes_map.items():
+                if key not in staged_guest_parts:
+                    actual_total += sz
+            total_bytes_matches = declared_total == actual_total
+
+    # 4. Optional boot-manifest.json image/file references (`pgim`, `image`, `files`, `artifacts`).
+    for single_key in ("pgim", "image"):
+        val = doc.get(single_key)
+        if isinstance(val, str) and val.strip():
+            _check_artifact(val, search_dirs=base_dirs)
+
+    for list_key in ("files", "artifacts"):
+        raw_list = doc.get(list_key)
+        if isinstance(raw_list, list):
+            for entry in raw_list:
+                if isinstance(entry, str):
+                    _check_artifact(entry, search_dirs=base_dirs)
+                elif isinstance(entry, Mapping):
+                    raw_path = _pick(entry, "path", "name", "file")
+                    raw_sz = _pick(entry, "size", "bytes", "wasmBytes", "wasm_bytes")
+                    expected = (
+                        as_int(raw_sz, -1)
+                        if raw_sz is not None and not isinstance(raw_sz, bool)
+                        else None
+                    )
+                    if expected is not None and expected < 0:
+                        expected = None
+                    _check_artifact(raw_path, expected_bytes=expected, search_dirs=base_dirs)
+                else:
+                    unsafe_entry_count += 1
+
+    # 5. Split count and unlisted staged `guest_part_*.wasm` checks.
+    raw_split_modules = _pick(doc, "splitModules", "split_modules")
+    declared_split_modules: int | None = None
+    split_count_matches: bool | None = None
+    if raw_split_modules is not None and not isinstance(raw_split_modules, bool):
+        declared_split_modules = as_int(raw_split_modules, -1)
+        if declared_split_modules >= 0:
+            split_count_matches = declared_split_modules == staged_side_count
+        else:
+            declared_split_modules = None
+
+    has_side_section = (
+        raw_side_names is not None
+        or raw_side_sizes is not None
+        or manifest_kind == "guest_manifest"
+        or bool(declared_side_keys)
+    )
+    unlisted_on_disk_count = 0
+    if has_side_section:
+        for staged_name in staged_guest_parts:
+            if staged_name not in declared_side_keys:
+                unlisted_on_disk_count += 1
+
+    consistent = bool(
+        len(missing_keys) == 0
+        and unlisted_on_disk_count == 0
+        and len(size_mismatch_keys) == 0
+        and unsafe_entry_count == 0
+        and runtime_wasm_matches is not False
+        and runtime_js_matches is not False
+        and split_count_matches is not False
+        and total_bytes_matches is not False
+    )
+
+    return {
+        "present": True,
+        "kind": manifest_kind,
+        "valid_json": True,
+        "declared_side_module_count": len(declared_side_order),
+        "staged_side_module_count": staged_side_count,
+        "declared_split_modules": declared_split_modules,
+        "split_count_matches": split_count_matches,
+        "runtime_wasm_matches": runtime_wasm_matches,
+        "runtime_js_matches": runtime_js_matches,
+        "total_bytes_matches": total_bytes_matches,
+        "missing_on_disk_count": len(missing_keys),
+        "unlisted_on_disk_count": unlisted_on_disk_count,
+        "size_mismatch_count": len(size_mismatch_keys),
+        "unsafe_entry_count": unsafe_entry_count,
+        "checked_artifact_count": len(checked_keys),
+        "consistent": consistent,
+    }
+
+
+def audit_wasm64_fast_boot(
+    dist_dir: str | Path,
+    *,
+    boot_manifest: str | Path | None = None,
+    balance_warn_ratio: float = DEFAULT_SPLIT_BALANCE_WARN_RATIO,
+) -> dict[str, Any]:
+    """Audit a staged browser Wasm64 dist directory for fast-boot readiness (T68).
+
+    Checks:
+      1. `runtime.wasm` + `guest_part_*.wasm` presence, total byte size, V8 1 GiB
+         module cap, and split-balance ratio (warning when a single shard
+         dominates cold startup download/compile time).
+      2. Pure-Python Wasm export section inspection on `runtime.wasm` confirming
+         `_main` / `main`, `_playgta6_get_input_state_ptr`, and
+         `_playgta6_audio_ring`.
+      3. Boot manifest (`guest_manifest.json` / `boot-manifest.json`) consistency
+         against staged artifacts.
+
+    Emits strictly sanitized counts, ratios, booleans, and fixed symbol/warning
+    codes (zero host filesystem paths or usernames).
+    """
+    if isinstance(balance_warn_ratio, bool) or balance_warn_ratio <= 1.0:
+        raise AuditError("--balance-warn-ratio must be > 1.0")
+
+    target = Path(dist_dir)
+    if not target.is_dir():
+        raise AuditError(f"dist directory not found: {basename_label(dist_dir)}")
+
+    dist_resolved = target.resolve()
+    skipped_unsafe_entries = 0
+
+    # 1. Inspect runtime.wasm & runtime.js safely inside dist_dir.
+    runtime_wasm_path = target / RUNTIME_WASM_FILE
+    runtime_wasm_present = _is_safe_child_file(dist_resolved, runtime_wasm_path)
+    if not runtime_wasm_present and runtime_wasm_path.exists():
+        skipped_unsafe_entries += 1
+
+    runtime_wasm_bytes = 0
+    if runtime_wasm_present:
+        try:
+            runtime_wasm_bytes = runtime_wasm_path.stat().st_size
+        except OSError:
+            runtime_wasm_present = False
+            runtime_wasm_bytes = 0
+
+    runtime_js_path = target / RUNTIME_JS_FILE
+    runtime_js_present = _is_safe_child_file(dist_resolved, runtime_js_path)
+    if not runtime_js_present and runtime_js_path.exists():
+        skipped_unsafe_entries += 1
+
+    # 2. Pure-Python Wasm export section inspection on runtime.wasm.
+    if runtime_wasm_present:
+        exports = inspect_wasm_exports(runtime_wasm_path)
+    else:
+        exports = _empty_export_audit(inspected=False, valid_wasm=False)
+
+    # 3. Discover guest_part_*.wasm split modules (naturally sorted, symlink-safe).
+    part_candidates: list[Path] = []
+    try:
+        for child in target.iterdir():
+            if not _GUEST_PART_RE.match(child.name):
+                continue
+            if not _is_safe_child_file(dist_resolved, child):
+                skipped_unsafe_entries += 1
+                continue
+            part_candidates.append(child)
+    except OSError as exc:
+        raise AuditError(
+            f"failed to scan dist directory {basename_label(dist_dir)}: "
+            f"{exc.strerror or type(exc).__name__}"
+        ) from exc
+
+    part_candidates.sort(key=lambda p: _natural_part_sort_key(p.name))
+
+    staged_guest_parts: dict[str, int] = {}
+    part_sizes: list[int] = []
+    guest_parts_valid_count = 0
+    guest_parts_invalid_count = 0
+    exceeds_v8_count = 0
+
+    if runtime_wasm_present and runtime_wasm_bytes > V8_MAX_WASM_MODULE_BYTES:
+        exceeds_v8_count += 1
+
+    for part_path in part_candidates:
+        try:
+            size = part_path.stat().st_size
+        except OSError:
+            guest_parts_invalid_count += 1
+            continue
+        staged_guest_parts[part_path.name.lower()] = size
+        part_sizes.append(size)
+        if inspect_wasm_header(part_path):
+            guest_parts_valid_count += 1
+        else:
+            guest_parts_invalid_count += 1
+        if size > V8_MAX_WASM_MODULE_BYTES:
+            exceeds_v8_count += 1
+
+    guest_parts_total_bytes = sum(part_sizes)
+    total_wasm_bytes = runtime_wasm_bytes + guest_parts_total_bytes
+
+    artifacts = {
+        "runtime_wasm_present": runtime_wasm_present,
+        "runtime_wasm_valid": bool(exports["valid_wasm"]),
+        "runtime_wasm_bytes": runtime_wasm_bytes,
+        "runtime_wasm_mib": round(runtime_wasm_bytes / (1024 * 1024), 4),
+        "runtime_js_present": runtime_js_present,
+        "guest_part_count": len(part_sizes),
+        "guest_parts_present": len(part_sizes) > 0,
+        "guest_parts_valid_count": guest_parts_valid_count,
+        "guest_parts_invalid_count": guest_parts_invalid_count,
+        "guest_parts_total_bytes": guest_parts_total_bytes,
+        "guest_parts_total_mib": round(guest_parts_total_bytes / (1024 * 1024), 4),
+        "total_wasm_bytes": total_wasm_bytes,
+        "total_wasm_mib": round(total_wasm_bytes / (1024 * 1024), 4),
+        "v8_1gib_limit_bytes": V8_MAX_WASM_MODULE_BYTES,
+        "exceeds_v8_1gib_count": exceeds_v8_count,
+        "any_exceeds_v8_1gib_limit": exceeds_v8_count > 0,
+        "skipped_unsafe_entries": skipped_unsafe_entries,
+    }
+
+    split_balance = _compute_split_balance(part_sizes, warn_ratio=balance_warn_ratio)
+
+    boot_manifest_report = _audit_boot_manifest_consistency(
+        target,
+        boot_manifest=boot_manifest,
+        runtime_wasm_present=runtime_wasm_present,
+        runtime_wasm_bytes=runtime_wasm_bytes,
+        runtime_js_present=runtime_js_present,
+        staged_guest_parts=staged_guest_parts,
+    )
+
+    warnings: list[str] = []
+    if not runtime_wasm_present:
+        warnings.append("missing_runtime_wasm")
+    elif not exports["valid_wasm"]:
+        warnings.append("invalid_runtime_wasm")
+    elif not exports["all_required_present"]:
+        warnings.append("missing_required_exports")
+
+    if len(part_sizes) == 0:
+        warnings.append("missing_guest_parts")
+    if guest_parts_invalid_count > 0:
+        warnings.append("invalid_guest_part_wasm")
+    if exceeds_v8_count > 0:
+        warnings.append("v8_1gib_limit_exceeded")
+    if split_balance["dominant_shard_warning"]:
+        warnings.append("dominant_shard_imbalance")
+
+    if not boot_manifest_report["present"]:
+        warnings.append("missing_boot_manifest")
+    elif not boot_manifest_report["valid_json"]:
+        warnings.append("invalid_boot_manifest_json")
+    else:
+        if boot_manifest_report["unsafe_entry_count"] > 0:
+            warnings.append("boot_manifest_unsafe_entries")
+        if not boot_manifest_report["consistent"]:
+            warnings.append("boot_manifest_mismatch")
+
+    ready = bool(
+        runtime_wasm_present
+        and exports["valid_wasm"]
+        and exports["all_required_present"]
+        and len(part_sizes) > 0
+        and guest_parts_invalid_count == 0
+        and exceeds_v8_count == 0
+        and boot_manifest_report["consistent"]
+    )
+
+    return sanitize_value(
+        {
+            "ready": ready,
+            "has_warnings": len(warnings) > 0,
+            "warning_count": len(warnings),
+            "warnings": warnings,
+            "artifacts": artifacts,
+            "split_balance": split_balance,
+            "exports": exports,
+            "boot_manifest": boot_manifest_report,
+        }
+    )
+
+
+def _fast_boot_recommendation_items(fast_boot: Mapping[str, Any]) -> list[tuple[str, str]]:
+    items: list[tuple[str, str]] = []
+    artifacts = fast_boot.get("artifacts") or {}
+    exports = fast_boot.get("exports") or {}
+    balance = fast_boot.get("split_balance") or {}
+    manifest = fast_boot.get("boot_manifest") or {}
+
+    if not artifacts.get("runtime_wasm_present"):
+        items.append(
+            (
+                "fast_boot_runtime",
+                "Stage runtime.wasm into the browser dist directory before launching.",
+            )
+        )
+    elif not exports.get("valid_wasm"):
+        items.append(
+            (
+                "fast_boot_runtime",
+                "Staged runtime.wasm failed Wasm binary header/section parsing; rebuild with Emscripten -sMEMORY64=1.",
+            )
+        )
+    elif not exports.get("all_required_present"):
+        missing = ", ".join(exports.get("missing_required") or [])
+        items.append(
+            (
+                "fast_boot_exports",
+                f"runtime.wasm is missing required browser boot exports ({missing}); "
+                "ensure -sEXPORTED_FUNCTIONS=_main,_playgta6_get_input_state_ptr,_playgta6_audio_ring.",
+            )
+        )
+
+    if not artifacts.get("guest_parts_present"):
+        items.append(
+            (
+                "fast_boot_splits",
+                "No guest_part_*.wasm split side modules found; build split modules for parallel browser cold-start streaming.",
+            )
+        )
+    elif as_int(artifacts.get("guest_parts_invalid_count"), 0) > 0:
+        items.append(
+            (
+                "fast_boot_splits",
+                f"{artifacts['guest_parts_invalid_count']} guest_part_*.wasm file(s) failed Wasm header validation.",
+            )
+        )
+
+    if artifacts.get("any_exceeds_v8_1gib_limit"):
+        items.append(
+            (
+                "fast_boot_v8_cap",
+                f"{artifacts.get('exceeds_v8_1gib_count', 1)} Wasm module(s) exceed the 1 GiB V8 module cap; "
+                "increase --split-modules or lower --max-side-module-mib.",
+            )
+        )
+
+    if balance.get("dominant_shard_warning"):
+        items.append(
+            (
+                "fast_boot_balance",
+                f"Split-module size imbalance detected (max/mean={_as_float(balance.get('split_balance_ratio'), 0.0):.2f}x, "
+                f"largest share={_as_float(balance.get('max_share_ratio'), 0.0) * 100.0:.1f}%, "
+                f"threshold={_as_float(balance.get('warn_threshold_ratio'), DEFAULT_SPLIT_BALANCE_WARN_RATIO):.2f}x); "
+                "rebalance guest_part_*.wasm shards so one shard does not dominate cold startup download/compile time.",
+            )
+        )
+
+    if not manifest.get("present"):
+        items.append(
+            (
+                "fast_boot_manifest",
+                "No guest_manifest.json or boot-manifest.json found in dist directory; stage manifest alongside Wasm artifacts.",
+            )
+        )
+    elif not manifest.get("valid_json"):
+        items.append(
+            (
+                "fast_boot_manifest",
+                "Boot manifest JSON could not be parsed; regenerate guest_manifest.json / boot-manifest.json.",
+            )
+        )
+    elif not manifest.get("consistent"):
+        items.append(
+            (
+                "fast_boot_manifest",
+                f"Boot manifest drift detected (missing={as_int(manifest.get('missing_on_disk_count'), 0)}, "
+                f"unlisted={as_int(manifest.get('unlisted_on_disk_count'), 0)}, "
+                f"size_mismatches={as_int(manifest.get('size_mismatch_count'), 0)}, "
+                f"unsafe_entries={as_int(manifest.get('unsafe_entry_count'), 0)}); "
+                "re-stage dist artifacts and regenerate the manifest.",
+            )
+        )
+
+    return items
+
+
+def _append_fast_boot_recommendations(
+    recs: list[dict[str, Any]],
+    fast_boot: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    extra = _fast_boot_recommendation_items(fast_boot)
+    if not extra:
+        return recs
+    filtered = [dict(r) for r in recs if r.get("category") != "ready"]
+    for category, detail in extra:
+        filtered.append({"priority": len(filtered) + 1, "category": category, "detail": detail})
+    for idx, rec in enumerate(filtered, start=1):
+        rec["priority"] = idx
+    return filtered
+
+
+def audit_dist_dir(
+    dist_dir: str | Path,
+    *,
+    boot_manifest: str | Path | None = None,
+    balance_warn_ratio: float = DEFAULT_SPLIT_BALANCE_WARN_RATIO,
+) -> dict[str, Any]:
+    """Standalone browser fast-boot Wasm64 audit report for `--dist-dir <DIR>`."""
+    fast_boot = audit_wasm64_fast_boot(
+        dist_dir,
+        boot_manifest=boot_manifest,
+        balance_warn_ratio=balance_warn_ratio,
+    )
+    items = _fast_boot_recommendation_items(fast_boot)
+    if items:
+        recs = [
+            {"priority": idx, "category": cat, "detail": detail}
+            for idx, (cat, detail) in enumerate(items, start=1)
+        ]
+    else:
+        recs = [
+            {
+                "priority": 1,
+                "category": "ready",
+                "detail": "Wasm64 fast-boot staging checks passed (runtime exports, split balance, and boot manifest aligned).",
+            }
+        ]
+    report = {
+        "schema": SCHEMA_AUDIT,
+        "schema_version": SCHEMA_AUDIT_VERSION,
+        "mode": "wasm64_fast_boot",
+        "source": basename_label(dist_dir),
+        "wasm64_fast_boot": fast_boot,
+        "recommendations": recs,
+    }
+    return sanitize_value(report)
+
+
 def audit_recomp_build(
     path: str | Path,
     *,
     top: int = DEFAULT_TOP,
     boot_depth: int | None = None,
+    dist_dir: str | Path | None = None,
+    boot_manifest: str | Path | None = None,
+    balance_warn_ratio: float = DEFAULT_SPLIT_BALANCE_WARN_RATIO,
 ) -> dict[str, Any]:
     """Audit a recomp build dir, `program-manifest.json`, `guest_manifest.json`, `build-manifest.json`, or discover JSON."""
     if top < 0:
@@ -2445,9 +3410,8 @@ def audit_recomp_build(
     inputs = load_audit_inputs(path)
 
     if inputs.program_manifest is not None:
-        return _audit_program_inputs(inputs, top=top, boot_depth=boot_depth)
-
-    if inputs.guest_manifest is not None:
+        report = _audit_program_inputs(inputs, top=top, boot_depth=boot_depth)
+    elif inputs.guest_manifest is not None:
         if inputs.manifest is not None or inputs.discover is not None:
             report = _audit_single_module_core(
                 inputs.manifest,
@@ -2540,16 +3504,27 @@ def audit_recomp_build(
             program_summary,
             wasm_footprint,
         )
-        return sanitize_value(report)
+    else:
+        report = _audit_single_module_core(
+            inputs.manifest,
+            inputs.discover,
+            inputs.source,
+            inputs.report_text,
+            top=top,
+            boot_depth=boot_depth,
+        )
 
-    report = _audit_single_module_core(
-        inputs.manifest,
-        inputs.discover,
-        inputs.source,
-        inputs.report_text,
-        top=top,
-        boot_depth=boot_depth,
-    )
+    if dist_dir is not None:
+        fast_boot = audit_wasm64_fast_boot(
+            dist_dir,
+            boot_manifest=boot_manifest,
+            balance_warn_ratio=balance_warn_ratio,
+        )
+        report["wasm64_fast_boot"] = fast_boot
+        report["recommendations"] = _append_fast_boot_recommendations(
+            report["recommendations"],
+            fast_boot,
+        )
     return sanitize_value(report)
 
 
@@ -2558,7 +3533,109 @@ def audit_recomp_build(
 # ---------------------------------------------------------------------------
 
 
+def _format_fast_boot_text_lines(fast_boot: Mapping[str, Any]) -> list[str]:
+    artifacts = fast_boot.get("artifacts") or {}
+    balance = fast_boot.get("split_balance") or {}
+    exports = fast_boot.get("exports") or {}
+    manifest = fast_boot.get("boot_manifest") or {}
+    warnings = fast_boot.get("warnings") or []
+    req = exports.get("required") or {}
+
+    max_to_min = balance.get("max_to_min_ratio")
+    max_to_min_str = f"{_as_float(max_to_min, 0.0):.2f}x" if max_to_min is not None else "inf"
+    lines = [
+        "wasm64 fast-boot:",
+        f"  ready: {'yes' if fast_boot.get('ready') else 'no'}, "
+        f"warnings: {as_int(fast_boot.get('warning_count'), 0)}"
+        + (f" ({', '.join(warnings)})" if warnings else ""),
+        f"  runtime.wasm: {'present' if artifacts.get('runtime_wasm_present') else 'missing'} "
+        f"({as_int(artifacts.get('runtime_wasm_bytes'), 0)} bytes, "
+        f"valid={'yes' if artifacts.get('runtime_wasm_valid') else 'no'}), "
+        f"runtime.js: {'present' if artifacts.get('runtime_js_present') else 'missing'}",
+        f"  guest_part_*.wasm: {as_int(artifacts.get('guest_part_count'), 0)} files "
+        f"(valid {as_int(artifacts.get('guest_parts_valid_count'), 0)}, "
+        f"invalid {as_int(artifacts.get('guest_parts_invalid_count'), 0)}), "
+        f"parts bytes {as_int(artifacts.get('guest_parts_total_bytes'), 0)}, "
+        f"total wasm bytes {as_int(artifacts.get('total_wasm_bytes'), 0)} "
+        f"({_as_float(artifacts.get('total_wasm_mib'), 0.0):.4f} MiB)",
+        f"  split balance: ratio {_as_float(balance.get('split_balance_ratio'), 0.0):.4f}x "
+        f"(max/min {max_to_min_str}, largest share {_as_float(balance.get('max_share_ratio'), 0.0) * 100.0:.2f}%, "
+        f"threshold {_as_float(balance.get('warn_threshold_ratio'), DEFAULT_SPLIT_BALANCE_WARN_RATIO):.2f}x, "
+        f"dominant_warning={'yes' if balance.get('dominant_shard_warning') else 'no'})",
+        f"  runtime exports: {as_int(exports.get('required_present_count'), 0)}/"
+        f"{as_int(exports.get('required_total_count'), len(REQUIRED_RUNTIME_EXPORTS))} required "
+        f"(_main={'ok' if req.get('_main') else 'missing'}, "
+        f"_playgta6_get_input_state_ptr={'ok' if req.get('_playgta6_get_input_state_ptr') else 'missing'}, "
+        f"_playgta6_audio_ring={'ok' if req.get('_playgta6_audio_ring') else 'missing'})",
+        f"  boot manifest ({manifest.get('kind') or 'none'}): "
+        f"present={'yes' if manifest.get('present') else 'no'}, "
+        f"consistent={'yes' if manifest.get('consistent') else 'no'}, "
+        f"declared={as_int(manifest.get('declared_side_module_count'), 0)}, "
+        f"staged={as_int(manifest.get('staged_side_module_count'), 0)}, "
+        f"missing={as_int(manifest.get('missing_on_disk_count'), 0)}, "
+        f"unlisted={as_int(manifest.get('unlisted_on_disk_count'), 0)}, "
+        f"size_mismatches={as_int(manifest.get('size_mismatch_count'), 0)}, "
+        f"unsafe={as_int(manifest.get('unsafe_entry_count'), 0)}",
+        "",
+    ]
+    return lines
+
+
+def _format_fast_boot_markdown_lines(fast_boot: Mapping[str, Any]) -> list[str]:
+    artifacts = fast_boot.get("artifacts") or {}
+    balance = fast_boot.get("split_balance") or {}
+    exports = fast_boot.get("exports") or {}
+    manifest = fast_boot.get("boot_manifest") or {}
+    warnings = fast_boot.get("warnings") or []
+    req = exports.get("required") or {}
+
+    max_to_min = balance.get("max_to_min_ratio")
+    max_to_min_str = f"{_as_float(max_to_min, 0.0):.2f}x" if max_to_min is not None else "inf"
+    lines = [
+        "",
+        "## Wasm64 fast-boot audit",
+        "",
+        f"- Ready: **{'yes' if fast_boot.get('ready') else 'no'}** "
+        f"(warnings: {as_int(fast_boot.get('warning_count'), 0)}"
+        + (f" — {', '.join(f'`{w}`' for w in warnings)})" if warnings else ")"),
+        f"- `runtime.wasm`: {'present' if artifacts.get('runtime_wasm_present') else '**missing**'} "
+        f"({as_int(artifacts.get('runtime_wasm_bytes'), 0)} bytes, "
+        f"valid={bool(artifacts.get('runtime_wasm_valid'))})",
+        f"- `guest_part_*.wasm`: **{as_int(artifacts.get('guest_part_count'), 0)}** files "
+        f"({as_int(artifacts.get('guest_parts_total_bytes'), 0)} bytes), "
+        f"total Wasm: **{as_int(artifacts.get('total_wasm_bytes'), 0)}** bytes "
+        f"({_as_float(artifacts.get('total_wasm_mib'), 0.0):.4f} MiB)",
+        f"- Split balance: **{_as_float(balance.get('split_balance_ratio'), 0.0):.4f}x** "
+        f"(max/min {max_to_min_str}, largest share {_as_float(balance.get('max_share_ratio'), 0.0) * 100.0:.2f}%, "
+        f"dominant shard warning: `{bool(balance.get('dominant_shard_warning'))}`)",
+        f"- Required runtime exports ({as_int(exports.get('required_present_count'), 0)}/"
+        f"{as_int(exports.get('required_total_count'), len(REQUIRED_RUNTIME_EXPORTS))}): "
+        f"`_main`={bool(req.get('_main'))}, "
+        f"`_playgta6_get_input_state_ptr`={bool(req.get('_playgta6_get_input_state_ptr'))}, "
+        f"`_playgta6_audio_ring`={bool(req.get('_playgta6_audio_ring'))}",
+        f"- Boot manifest (`{manifest.get('kind') or 'none'}`): "
+        f"present={bool(manifest.get('present'))}, consistent=**{bool(manifest.get('consistent'))}**, "
+        f"missing={as_int(manifest.get('missing_on_disk_count'), 0)}, "
+        f"unlisted={as_int(manifest.get('unlisted_on_disk_count'), 0)}, "
+        f"size_mismatches={as_int(manifest.get('size_mismatch_count'), 0)}, "
+        f"unsafe={as_int(manifest.get('unsafe_entry_count'), 0)}",
+    ]
+    return lines
+
+
 def format_text_report(report: Mapping[str, Any]) -> str:
+    fast_boot = report.get("wasm64_fast_boot")
+    if "coverage" not in report and isinstance(fast_boot, Mapping):
+        lines = [
+            f"playgta6-recomp wasm64 fast-boot audit: {report.get('source') or '<unknown>'}",
+            "",
+        ]
+        lines.extend(_format_fast_boot_text_lines(fast_boot))
+        lines.append("recommendations:")
+        for rec in report.get("recommendations") or []:
+            lines.append(f"  {rec['priority']}. [{rec['category']}] {rec['detail']}")
+        return "\n".join(lines) + "\n"
+
     cov = report["coverage"]
     shards = report["shards"]
     jump = report["jump_tables"]
@@ -2697,6 +3774,9 @@ def format_text_report(report: Mapping[str, Any]) -> str:
             )
         lines.append("")
 
+    if isinstance(fast_boot, Mapping):
+        lines.extend(_format_fast_boot_text_lines(fast_boot))
+
     lines.append("recommendations:")
     for rec in report.get("recommendations") or []:
         lines.append(f"  {rec['priority']}. [{rec['category']}] {rec['detail']}")
@@ -2704,6 +3784,17 @@ def format_text_report(report: Mapping[str, Any]) -> str:
 
 
 def format_markdown_report(report: Mapping[str, Any]) -> str:
+    fast_boot = report.get("wasm64_fast_boot")
+    if "coverage" not in report and isinstance(fast_boot, Mapping):
+        lines = [
+            f"# Wasm64 fast-boot audit (`{report.get('source') or 'unknown'}`)",
+        ]
+        lines.extend(_format_fast_boot_markdown_lines(fast_boot))
+        lines.extend(["", "## Recommendations", ""])
+        for rec in report.get("recommendations") or []:
+            lines.append(f"{rec['priority']}. **{rec['category']}** — {rec['detail']}")
+        return "\n".join(lines) + "\n"
+
     cov = report["coverage"]
     shards = report["shards"]
     jump = report["jump_tables"]
@@ -2828,6 +3919,9 @@ def format_markdown_report(report: Mapping[str, Any]) -> str:
                 f"estimated `GOT.func` entries: **{wasm_fp.get('estimated_got_func_entries', 0)}**"
             )
 
+    if isinstance(fast_boot, Mapping):
+        lines.extend(_format_fast_boot_markdown_lines(fast_boot))
+
     lines.extend(["", "## Recommendations", ""])
     for rec in report.get("recommendations") or []:
         lines.append(f"{rec['priority']}. **{rec['category']}** — {rec['detail']}")
@@ -2847,15 +3941,46 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Audit playgta6-recomp build coverage, multi-module programs, Wasm/GOT.func "
-            "footprint, and boot-path lift bottlenecks from build-manifest.json, "
-            "program-manifest.json, guest_manifest.json, and/or discover --json."
+            "footprint, browser fast-boot Wasm64 staging (--dist-dir), and boot-path "
+            "lift bottlenecks from build-manifest.json, program-manifest.json, "
+            "guest_manifest.json, and/or discover --json."
         )
     )
     parser.add_argument(
         "input",
+        nargs="?",
+        default=None,
         help=(
             "Path to a recomp build directory, program-manifest.json, guest_manifest.json, "
-            "build-manifest.json, or discover JSON file."
+            "build-manifest.json, or discover JSON file (optional when --dist-dir is passed)."
+        ),
+    )
+    parser.add_argument(
+        "--dist-dir",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Run browser fast-boot Wasm64 audit on staged dist directory "
+            "(runtime.wasm, guest_part_*.wasm, required exports, split-balance, boot manifest)."
+        ),
+    )
+    parser.add_argument(
+        "--boot-manifest",
+        default=None,
+        metavar="FILE",
+        help=(
+            "Optional explicit boot manifest (guest_manifest.json or boot-manifest.json) "
+            "to validate against --dist-dir."
+        ),
+    )
+    parser.add_argument(
+        "--balance-warn-ratio",
+        type=float,
+        default=DEFAULT_SPLIT_BALANCE_WARN_RATIO,
+        metavar="R",
+        help=(
+            "Max-to-mean byte ratio threshold above which a single guest_part_*.wasm "
+            f"shard triggers a dominant-shard warning (default {DEFAULT_SPLIT_BALANCE_WARN_RATIO})."
         ),
     )
     parser.add_argument(
@@ -2903,11 +4028,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.fail_on_unresolved is not None and args.fail_on_unresolved < 0:
             raise AuditError("--fail-on-unresolved must be >= 0")
-        report = audit_recomp_build(
-            args.input,
-            top=args.top,
-            boot_depth=args.boot_depth,
-        )
+        if args.boot_manifest is not None and args.dist_dir is None:
+            raise AuditError("--boot-manifest requires --dist-dir")
+        if args.input is None and args.dist_dir is None:
+            raise AuditError("either an input path or --dist-dir is required")
+
+        if args.input is None:
+            report = audit_dist_dir(
+                args.dist_dir,
+                boot_manifest=args.boot_manifest,
+                balance_warn_ratio=args.balance_warn_ratio,
+            )
+        else:
+            report = audit_recomp_build(
+                args.input,
+                top=args.top,
+                boot_depth=args.boot_depth,
+                dist_dir=args.dist_dir,
+                boot_manifest=args.boot_manifest,
+                balance_warn_ratio=args.balance_warn_ratio,
+            )
     except AuditError as exc:
         print(f"Error: {sanitize_text(str(exc))}", file=sys.stderr)
         return 1
