@@ -35,6 +35,10 @@
       skippedOutOfBoundsDraws: 0,
       skippedMisalignedDraws: 0,
       skippedZeroCountDraws: 0,
+      batchesDispatched: 0,
+      commandsValidated: 0,
+      zeroCountElided: 0,
+      outOfBoundsElided: 0,
     };
   }
 
@@ -100,18 +104,25 @@
     }
   }
 
-  function recordRangeRejection(status, instanceStats = null, skippedCount = 1) {
-    recordBoundsRejection(instanceStats);
-    const delta = skippedCount > 0 ? skippedCount : 1;
-    if (status === RANGE_MISALIGNED_OFFSET) {
-      recordStat('skippedMisalignedDraws', delta, instanceStats);
-    } else if (
+  function isOutOfBoundsRangeStatus(status) {
+    return (
       status === RANGE_OUT_OF_BOUNDS ||
       status === RANGE_INVALID_OFFSET ||
       status === RANGE_INVALID_OPT_BUFFER_SIZE ||
       status === RANGE_INVALID_BUFFER_SIZE
-    ) {
+    );
+  }
+
+  function recordRangeRejection(status, instanceStats = null, skippedCount = 1, elided = false) {
+    recordBoundsRejection(instanceStats);
+    const delta = skippedCount > 0 ? skippedCount : 1;
+    if (status === RANGE_MISALIGNED_OFFSET) {
+      recordStat('skippedMisalignedDraws', delta, instanceStats);
+    } else if (isOutOfBoundsRangeStatus(status)) {
       recordStat('skippedOutOfBoundsDraws', delta, instanceStats);
+      if (elided) {
+        recordStat('outOfBoundsElided', delta, instanceStats);
+      }
     }
   }
 
@@ -154,7 +165,11 @@
    *   validatedIndirectDraws: number,
    *   skippedOutOfBoundsDraws: number,
    *   skippedMisalignedDraws: number,
-   *   skippedZeroCountDraws: number
+   *   skippedZeroCountDraws: number,
+   *   batchesDispatched: number,
+   *   commandsValidated: number,
+   *   zeroCountElided: number,
+   *   outOfBoundsElided: number
    * }}
    */
   function getStats() {
@@ -175,6 +190,10 @@
       skippedOutOfBoundsDraws: moduleStats.skippedOutOfBoundsDraws,
       skippedMisalignedDraws: moduleStats.skippedMisalignedDraws,
       skippedZeroCountDraws: moduleStats.skippedZeroCountDraws,
+      batchesDispatched: moduleStats.batchesDispatched,
+      commandsValidated: moduleStats.commandsValidated,
+      zeroCountElided: moduleStats.zeroCountElided,
+      outOfBoundsElided: moduleStats.outOfBoundsElided,
     };
   }
 
@@ -766,26 +785,59 @@
     return fastCheckIndirectRange(buffer, offset, recordSize, explicitSize) === RANGE_OK;
   }
 
+  function resolveOutTarget(options, out) {
+    if (out !== undefined && out !== null && typeof out === 'object') {
+      return out;
+    }
+    if (
+      options !== undefined &&
+      options !== null &&
+      typeof options === 'object' &&
+      options.out !== undefined &&
+      options.out !== null &&
+      typeof options.out === 'object'
+    ) {
+      return options.out;
+    }
+    return null;
+  }
+
   /**
    * Non-throwing range validation returning structured status without mutating telemetry.
+   * Supports an optional pre-allocated `out` scratch object (via `options.out` or 5th arg)
+   * to avoid per-draw allocations on hot paths.
    *
    * @param {{usage:number, size?:number, destroyed?:boolean}} buffer
    * @param {number} offset
    * @param {number} recordSize
    * @param {object} [options]
    * @param {number} [options.bufferSize]
+   * @param {object} [options.out]
+   * @param {object} [out]
    * @returns {{ok:boolean, code:string|null, offset:number, recordSize:number, bufferSize:number|null}}
    */
-  function checkIndirectRange(buffer, offset, recordSize, options) {
+  function checkIndirectRange(buffer, offset, recordSize, options, out) {
     const explicitSize = options !== undefined && options !== null ? options.bufferSize : undefined;
     const status = fastCheckIndirectRange(buffer, offset, recordSize, explicitSize);
     const effectiveSize = resolveEffectiveBufferSizeFast(buffer, explicitSize);
+    const outTarget = resolveOutTarget(options, out);
+    const ok = status === RANGE_OK;
+    const code = RANGE_CODE_TO_REASON[status];
+    const bufferSize = effectiveSize >= 0 ? effectiveSize : null;
+    if (outTarget !== null) {
+      outTarget.ok = ok;
+      outTarget.code = code;
+      outTarget.offset = offset;
+      outTarget.recordSize = recordSize;
+      outTarget.bufferSize = bufferSize;
+      return outTarget;
+    }
     return {
-      ok: status === RANGE_OK,
-      code: RANGE_CODE_TO_REASON[status],
+      ok,
+      code,
       offset,
       recordSize,
-      bufferSize: effectiveSize >= 0 ? effectiveSize : null,
+      bufferSize,
     };
   }
 
@@ -811,11 +863,16 @@
     return record.x === 0 || record.y === 0 || record.z === 0;
   }
 
-  function toOptionalDataView(source) {
+  function prepareShadowSource(source) {
     if (source === undefined || source === null) {
       return null;
     }
-    if (source instanceof DataView) {
+    if (
+      source instanceof Uint8Array ||
+      source instanceof Uint32Array ||
+      source instanceof Int32Array ||
+      source instanceof DataView
+    ) {
       return source;
     }
     if (ArrayBuffer.isView(source)) {
@@ -827,12 +884,51 @@
     return null;
   }
 
-  function isZeroCountViewAt(kind, view, byteOffset) {
-    if (!view) {
+  /**
+   * Zero-allocation zero-count check against a CPU shadow buffer at `byteOffset`.
+   * Checks uint32 == 0 directly on Uint8Array / Uint32Array / Int32Array / DataView
+   * without allocating temporary DataView wrappers.
+   */
+  function isZeroCountShadowAt(kind, source, byteOffset) {
+    if (source === null || source === undefined) {
       return false;
     }
     const layout = LAYOUTS[kind];
-    if (!layout || byteOffset < 0 || byteOffset + layout.byteSize > view.byteLength) {
+    if (!layout || byteOffset < 0) {
+      return false;
+    }
+    const recordSize = layout.byteSize;
+    if (source instanceof Uint8Array) {
+      if (byteOffset + recordSize > source.byteLength) {
+        return false;
+      }
+      if ((source[byteOffset] | source[byteOffset + 1] | source[byteOffset + 2] | source[byteOffset + 3]) === 0) {
+        return true;
+      }
+      if ((source[byteOffset + 4] | source[byteOffset + 5] | source[byteOffset + 6] | source[byteOffset + 7]) === 0) {
+        return true;
+      }
+      if (kind === INDIRECT_KIND.DISPATCH) {
+        return (
+          (source[byteOffset + 8] | source[byteOffset + 9] | source[byteOffset + 10] | source[byteOffset + 11]) === 0
+        );
+      }
+      return false;
+    }
+    if (source instanceof Uint32Array || source instanceof Int32Array) {
+      if (byteOffset + recordSize > source.byteLength) {
+        return false;
+      }
+      if (isAligned4Fast(byteOffset)) {
+        const idx = byteOffset <= 0x7fffffff ? byteOffset >>> 2 : byteOffset / 4;
+        if (source[idx] === 0 || source[idx + 1] === 0) {
+          return true;
+        }
+        return kind === INDIRECT_KIND.DISPATCH && source[idx + 2] === 0;
+      }
+    }
+    const view = source instanceof DataView ? source : prepareShadowSource(source);
+    if (!view || byteOffset + recordSize > view.byteLength) {
       return false;
     }
     if (kind === INDIRECT_KIND.DRAW || kind === INDIRECT_KIND.DRAW_INDEXED) {
@@ -872,11 +968,51 @@
     return false;
   }
 
+  function writeValidationResult(
+    target,
+    ok,
+    code,
+    kind,
+    offset,
+    recordSize,
+    requiredStrideBytes,
+    bufferSize,
+    zeroCount
+  ) {
+    if (target !== null) {
+      target.ok = ok;
+      target.valid = ok;
+      target.code = code;
+      target.reason = code;
+      target.kind = kind;
+      target.offset = offset;
+      target.recordSize = recordSize;
+      target.requiredStrideBytes = requiredStrideBytes;
+      target.bufferSize = bufferSize;
+      target.zeroCount = zeroCount;
+      return target;
+    }
+    return {
+      ok,
+      valid: ok,
+      code,
+      reason: code,
+      kind,
+      offset,
+      recordSize,
+      requiredStrideBytes,
+      bufferSize,
+      zeroCount,
+    };
+  }
+
   /**
    * Non-throwing strict validation for an indirect argument buffer draw/dispatch:
    * checks `offset >= 0`, `offset % 4 === 0`, `INDIRECT` usage, liveness, and
    * `offset + requiredStrideBytes <= bufferSize` (16B drawIndirect, 20B drawIndexedIndirect,
    * 12B dispatchWorkgroupsIndirect), plus zero-count detection. Does not mutate telemetry.
+   * Supports an optional pre-allocated `out` scratch result object (via `options.out` or 5th arg)
+   * for zero-allocation hot-path validation.
    *
    * @param {string} kind One of INDIRECT_KIND ('draw' | 'drawIndexed' | 'dispatch').
    * @param {{usage:number, size?:number, destroyed?:boolean}} buffer
@@ -889,6 +1025,8 @@
    * @param {object} [options.record]
    * @param {object} [options.args]
    * @param {ArrayBuffer|DataView|ArrayBufferView} [options.shadowData]
+   * @param {object} [options.out]
+   * @param {object} [out]
    * @returns {{
    *   ok: boolean,
    *   valid: boolean,
@@ -902,26 +1040,26 @@
    *   zeroCount: boolean
    * }}
    */
-  function validateIndirectBufferArgs(kind, buffer, offset = 0, options) {
+  function validateIndirectBufferArgs(kind, buffer, offset = 0, options, out) {
     const layout = LAYOUTS[kind];
     const hasOpts = options !== undefined && options !== null && typeof options === 'object';
+    const outTarget = resolveOutTarget(options, out);
     const explicitSize = hasOpts ? options.bufferSize : undefined;
     const effectiveSize = resolveEffectiveBufferSizeFast(buffer, explicitSize);
     const knownBufferSize = effectiveSize >= 0 ? effectiveSize : null;
 
     if (!layout) {
-      return {
-        ok: false,
-        valid: false,
-        code: 'UNKNOWN_KIND',
-        reason: 'UNKNOWN_KIND',
+      return writeValidationResult(
+        outTarget,
+        false,
+        'UNKNOWN_KIND',
         kind,
         offset,
-        recordSize: 0,
-        requiredStrideBytes: 0,
-        bufferSize: knownBufferSize,
-        zeroCount: false,
-      };
+        0,
+        0,
+        knownBufferSize,
+        false
+      );
     }
 
     const recordSize = layout.byteSize;
@@ -937,98 +1075,129 @@
       requiredStrideBytes < recordSize ||
       !isAligned4Fast(requiredStrideBytes)
     ) {
-      return {
-        ok: false,
-        valid: false,
-        code: 'INVALID_STRIDE',
-        reason: 'INVALID_STRIDE',
+      return writeValidationResult(
+        outTarget,
+        false,
+        'INVALID_STRIDE',
         kind,
         offset,
         recordSize,
-        requiredStrideBytes: isPosSafeIntFast(requiredStrideBytes) ? requiredStrideBytes : 0,
-        bufferSize: knownBufferSize,
-        zeroCount: false,
-      };
+        isPosSafeIntFast(requiredStrideBytes) ? requiredStrideBytes : 0,
+        knownBufferSize,
+        false
+      );
     }
 
     if (hasOpts && options.count === 0) {
       if (!isNonNegSafeIntFast(offset)) {
-        return {
-          ok: false,
-          valid: false,
-          code: 'INVALID_OFFSET',
-          reason: 'INVALID_OFFSET',
+        return writeValidationResult(
+          outTarget,
+          false,
+          'INVALID_OFFSET',
           kind,
           offset,
           recordSize,
           requiredStrideBytes,
-          bufferSize: knownBufferSize,
-          zeroCount: true,
-        };
+          knownBufferSize,
+          true
+        );
       }
       if (!isAligned4Fast(offset)) {
-        return {
-          ok: false,
-          valid: false,
-          code: 'MISALIGNED_OFFSET',
-          reason: 'MISALIGNED_OFFSET',
+        return writeValidationResult(
+          outTarget,
+          false,
+          'MISALIGNED_OFFSET',
           kind,
           offset,
           recordSize,
           requiredStrideBytes,
-          bufferSize: knownBufferSize,
-          zeroCount: true,
-        };
+          knownBufferSize,
+          true
+        );
       }
-      return {
-        ok: true,
-        valid: true,
-        code: 'ZERO_COUNT',
-        reason: 'ZERO_COUNT',
+      return writeValidationResult(
+        outTarget,
+        true,
+        'ZERO_COUNT',
         kind,
         offset,
         recordSize,
         requiredStrideBytes,
-        bufferSize: knownBufferSize,
-        zeroCount: true,
-      };
+        knownBufferSize,
+        true
+      );
     }
 
     const status = fastCheckIndirectRange(buffer, offset, requiredStrideBytes, explicitSize);
     if (status !== RANGE_OK) {
-      const code = RANGE_CODE_TO_REASON[status];
-      return {
-        ok: false,
-        valid: false,
-        code,
-        reason: code,
+      return writeValidationResult(
+        outTarget,
+        false,
+        RANGE_CODE_TO_REASON[status],
         kind,
         offset,
         recordSize,
         requiredStrideBytes,
-        bufferSize: knownBufferSize,
-        zeroCount: false,
-      };
+        knownBufferSize,
+        false
+      );
     }
 
-    const shadowView = hasOpts ? toOptionalDataView(options.shadowData) : null;
     const zeroCount =
       hasOpts &&
       options.elideZeroCount !== false &&
-      (hasZeroCountOption(kind, options) || isZeroCountViewAt(kind, shadowView, offset));
+      (hasZeroCountOption(kind, options) || isZeroCountShadowAt(kind, options.shadowData, offset));
 
-    return {
-      ok: true,
-      valid: true,
-      code: zeroCount ? 'ZERO_COUNT' : null,
-      reason: zeroCount ? 'ZERO_COUNT' : null,
+    return writeValidationResult(
+      outTarget,
+      true,
+      zeroCount ? 'ZERO_COUNT' : null,
       kind,
       offset,
       recordSize,
       requiredStrideBytes,
-      bufferSize: knownBufferSize,
-      zeroCount,
-    };
+      knownBufferSize,
+      zeroCount
+    );
+  }
+
+  /**
+   * Hot-path zero-allocation indirect draw/indexed-draw argument validator.
+   * Accepts either `(kind, buffer, offset, options, out)` or `(buffer, offset, optionsOrIndexed, out)`.
+   * Preserves 100% of W269 bounds/alignment/liveness/zero-count checks without mutating telemetry.
+   * When `out` (or `options.out`) is provided, populates and returns `out` with zero heap allocations.
+   */
+  function validateIndirectDrawArgs(kindOrBuffer, bufferOrOffset, offsetOrOptions, optionsOrOut, outArg) {
+    if (typeof kindOrBuffer === 'string') {
+      return validateIndirectBufferArgs(
+        kindOrBuffer,
+        bufferOrOffset,
+        offsetOrOptions === undefined ? 0 : offsetOrOptions,
+        optionsOrOut,
+        outArg
+      );
+    }
+    const buffer = kindOrBuffer;
+    const offset = bufferOrOffset === undefined ? 0 : bufferOrOffset;
+    if (typeof offsetOrOptions === 'boolean') {
+      return validateIndirectBufferArgs(
+        offsetOrOptions ? INDIRECT_KIND.DRAW_INDEXED : INDIRECT_KIND.DRAW,
+        buffer,
+        offset,
+        undefined,
+        optionsOrOut
+      );
+    }
+    const options = offsetOrOptions;
+    const kind =
+      options !== undefined && options !== null && typeof options === 'object'
+        ? options.kind !== undefined
+          ? options.kind
+          : options.indexed
+            ? INDIRECT_KIND.DRAW_INDEXED
+            : INDIRECT_KIND.DRAW
+        : INDIRECT_KIND.DRAW;
+    return validateIndirectBufferArgs(kind, buffer, offset, options, optionsOrOut);
   }
 
   function maxRecordsFittingBuffer(bufferSize, firstOffset, stride, recordSize) {
@@ -1460,6 +1629,27 @@
     return Boolean(mask[i]);
   }
 
+  function writeEncodeSingleResult(target, offset, byteSize, executed, skipped, reason) {
+    if (target !== null) {
+      target.offset = offset;
+      target.byteSize = byteSize;
+      target.executed = executed;
+      target.skipped = skipped;
+      target.reason = reason;
+      return target;
+    }
+    if (executed && !skipped) {
+      return { offset, byteSize };
+    }
+    return {
+      offset,
+      byteSize,
+      executed,
+      skipped,
+      reason,
+    };
+  }
+
   /**
    * Validate indirect offset alignment/bounds (16 bytes) and issue one `drawIndirect`.
    *
@@ -1469,48 +1659,56 @@
    * @param {object} [options]
    * @param {number} [options.bufferSize] Optional explicit buffer byte length.
    * @param {boolean} [options.skipInvalid=false] Skip instead of throwing on invalid args.
+   * @param {object} [options.out] Optional scratch result object.
+   * @param {object} [out] Optional scratch result object.
    * @returns {{offset:number, byteSize:number, executed?:boolean, skipped?:boolean, reason?:string}}
    */
-  function encodeIndirectDraw(pass, buffer, indirectOffset = 0, options) {
+  function encodeIndirectDraw(pass, buffer, indirectOffset = 0, options, out) {
     const hasOpts = options !== undefined && options !== null;
+    const outTarget = resolveOutTarget(options, out);
     const statsTarget = hasOpts ? options._statsTarget || null : null;
     const skipInvalid = hasOpts && Boolean(options.skipInvalid);
+    recordStat('commandsValidated', 1, statsTarget);
     if (hasOpts && options.count === 0) {
       recordStat('zeroBatchSkips', 1, statsTarget);
       recordStat('skippedZeroCountDraws', 1, statsTarget);
-      return {
-        offset: indirectOffset,
-        byteSize: DRAW_INDIRECT_BYTES,
-        executed: false,
-        skipped: true,
-        reason: 'ZERO_COUNT',
-      };
+      recordStat('zeroCountElided', 1, statsTarget);
+      return writeEncodeSingleResult(
+        outTarget,
+        indirectOffset,
+        DRAW_INDIRECT_BYTES,
+        false,
+        true,
+        'ZERO_COUNT'
+      );
     }
     if (!pass || typeof pass.drawIndirect !== 'function') {
       if (skipInvalid) {
         recordBoundsRejection(statsTarget);
-        return {
-          offset: indirectOffset,
-          byteSize: DRAW_INDIRECT_BYTES,
-          executed: false,
-          skipped: true,
-          reason: 'MISSING_PASS_METHOD',
-        };
+        return writeEncodeSingleResult(
+          outTarget,
+          indirectOffset,
+          DRAW_INDIRECT_BYTES,
+          false,
+          true,
+          'MISSING_PASS_METHOD'
+        );
       }
       throw new TypeError('pass must implement drawIndirect');
     }
     const explicitSize = hasOpts ? options.bufferSize : undefined;
     const status = fastCheckIndirectRange(buffer, indirectOffset, DRAW_INDIRECT_BYTES, explicitSize);
     if (status !== RANGE_OK) {
-      recordRangeRejection(status, statsTarget, 1);
+      recordRangeRejection(status, statsTarget, 1, skipInvalid);
       if (skipInvalid) {
-        return {
-          offset: indirectOffset,
-          byteSize: DRAW_INDIRECT_BYTES,
-          executed: false,
-          skipped: true,
-          reason: RANGE_CODE_TO_REASON[status],
-        };
+        return writeEncodeSingleResult(
+          outTarget,
+          indirectOffset,
+          DRAW_INDIRECT_BYTES,
+          false,
+          true,
+          RANGE_CODE_TO_REASON[status]
+        );
       }
       throwForRangeCode(status, buffer, indirectOffset, DRAW_INDIRECT_BYTES, explicitSize);
     }
@@ -1518,20 +1716,22 @@
       hasOpts &&
       options.elideZeroCount !== false &&
       (hasZeroCountOption(INDIRECT_KIND.DRAW, options) ||
-        isZeroCountViewAt(INDIRECT_KIND.DRAW, toOptionalDataView(options.shadowData), indirectOffset))
+        isZeroCountShadowAt(INDIRECT_KIND.DRAW, options.shadowData, indirectOffset))
     ) {
       recordStat('skippedZeroCountDraws', 1, statsTarget);
-      return {
-        offset: indirectOffset,
-        byteSize: DRAW_INDIRECT_BYTES,
-        executed: false,
-        skipped: true,
-        reason: 'ZERO_COUNT',
-      };
+      recordStat('zeroCountElided', 1, statsTarget);
+      return writeEncodeSingleResult(
+        outTarget,
+        indirectOffset,
+        DRAW_INDIRECT_BYTES,
+        false,
+        true,
+        'ZERO_COUNT'
+      );
     }
     pass.drawIndirect(buffer, indirectOffset);
     recordEncodedKind(INDIRECT_KIND.DRAW, 1, statsTarget);
-    return { offset: indirectOffset, byteSize: DRAW_INDIRECT_BYTES };
+    return writeEncodeSingleResult(outTarget, indirectOffset, DRAW_INDIRECT_BYTES, true, false, null);
   }
 
   /**
@@ -1543,33 +1743,40 @@
    * @param {object} [options]
    * @param {number} [options.bufferSize] Optional explicit buffer byte length.
    * @param {boolean} [options.skipInvalid=false] Skip instead of throwing on invalid args.
+   * @param {object} [options.out] Optional scratch result object.
+   * @param {object} [out] Optional scratch result object.
    * @returns {{offset:number, byteSize:number, executed?:boolean, skipped?:boolean, reason?:string}}
    */
-  function encodeIndirectDrawIndexed(pass, buffer, indirectOffset = 0, options) {
+  function encodeIndirectDrawIndexed(pass, buffer, indirectOffset = 0, options, out) {
     const hasOpts = options !== undefined && options !== null;
+    const outTarget = resolveOutTarget(options, out);
     const statsTarget = hasOpts ? options._statsTarget || null : null;
     const skipInvalid = hasOpts && Boolean(options.skipInvalid);
+    recordStat('commandsValidated', 1, statsTarget);
     if (hasOpts && options.count === 0) {
       recordStat('zeroBatchSkips', 1, statsTarget);
       recordStat('skippedZeroCountDraws', 1, statsTarget);
-      return {
-        offset: indirectOffset,
-        byteSize: DRAW_INDEXED_INDIRECT_BYTES,
-        executed: false,
-        skipped: true,
-        reason: 'ZERO_COUNT',
-      };
+      recordStat('zeroCountElided', 1, statsTarget);
+      return writeEncodeSingleResult(
+        outTarget,
+        indirectOffset,
+        DRAW_INDEXED_INDIRECT_BYTES,
+        false,
+        true,
+        'ZERO_COUNT'
+      );
     }
     if (!pass || typeof pass.drawIndexedIndirect !== 'function') {
       if (skipInvalid) {
         recordBoundsRejection(statsTarget);
-        return {
-          offset: indirectOffset,
-          byteSize: DRAW_INDEXED_INDIRECT_BYTES,
-          executed: false,
-          skipped: true,
-          reason: 'MISSING_PASS_METHOD',
-        };
+        return writeEncodeSingleResult(
+          outTarget,
+          indirectOffset,
+          DRAW_INDEXED_INDIRECT_BYTES,
+          false,
+          true,
+          'MISSING_PASS_METHOD'
+        );
       }
       throw new TypeError('pass must implement drawIndexedIndirect');
     }
@@ -1581,15 +1788,16 @@
       explicitSize
     );
     if (status !== RANGE_OK) {
-      recordRangeRejection(status, statsTarget, 1);
+      recordRangeRejection(status, statsTarget, 1, skipInvalid);
       if (skipInvalid) {
-        return {
-          offset: indirectOffset,
-          byteSize: DRAW_INDEXED_INDIRECT_BYTES,
-          executed: false,
-          skipped: true,
-          reason: RANGE_CODE_TO_REASON[status],
-        };
+        return writeEncodeSingleResult(
+          outTarget,
+          indirectOffset,
+          DRAW_INDEXED_INDIRECT_BYTES,
+          false,
+          true,
+          RANGE_CODE_TO_REASON[status]
+        );
       }
       throwForRangeCode(status, buffer, indirectOffset, DRAW_INDEXED_INDIRECT_BYTES, explicitSize);
     }
@@ -1597,24 +1805,29 @@
       hasOpts &&
       options.elideZeroCount !== false &&
       (hasZeroCountOption(INDIRECT_KIND.DRAW_INDEXED, options) ||
-        isZeroCountViewAt(
-          INDIRECT_KIND.DRAW_INDEXED,
-          toOptionalDataView(options.shadowData),
-          indirectOffset
-        ))
+        isZeroCountShadowAt(INDIRECT_KIND.DRAW_INDEXED, options.shadowData, indirectOffset))
     ) {
       recordStat('skippedZeroCountDraws', 1, statsTarget);
-      return {
-        offset: indirectOffset,
-        byteSize: DRAW_INDEXED_INDIRECT_BYTES,
-        executed: false,
-        skipped: true,
-        reason: 'ZERO_COUNT',
-      };
+      recordStat('zeroCountElided', 1, statsTarget);
+      return writeEncodeSingleResult(
+        outTarget,
+        indirectOffset,
+        DRAW_INDEXED_INDIRECT_BYTES,
+        false,
+        true,
+        'ZERO_COUNT'
+      );
     }
     pass.drawIndexedIndirect(buffer, indirectOffset);
     recordEncodedKind(INDIRECT_KIND.DRAW_INDEXED, 1, statsTarget);
-    return { offset: indirectOffset, byteSize: DRAW_INDEXED_INDIRECT_BYTES };
+    return writeEncodeSingleResult(
+      outTarget,
+      indirectOffset,
+      DRAW_INDEXED_INDIRECT_BYTES,
+      true,
+      false,
+      null
+    );
   }
 
   /**
@@ -1626,33 +1839,40 @@
    * @param {object} [options]
    * @param {number} [options.bufferSize] Optional explicit buffer byte length.
    * @param {boolean} [options.skipInvalid=false] Skip instead of throwing on invalid args.
+   * @param {object} [options.out] Optional scratch result object.
+   * @param {object} [out] Optional scratch result object.
    * @returns {{offset:number, byteSize:number, executed?:boolean, skipped?:boolean, reason?:string}}
    */
-  function encodeIndirectDispatch(pass, buffer, indirectOffset = 0, options) {
+  function encodeIndirectDispatch(pass, buffer, indirectOffset = 0, options, out) {
     const hasOpts = options !== undefined && options !== null;
+    const outTarget = resolveOutTarget(options, out);
     const statsTarget = hasOpts ? options._statsTarget || null : null;
     const skipInvalid = hasOpts && Boolean(options.skipInvalid);
+    recordStat('commandsValidated', 1, statsTarget);
     if (hasOpts && options.count === 0) {
       recordStat('zeroBatchSkips', 1, statsTarget);
       recordStat('skippedZeroCountDraws', 1, statsTarget);
-      return {
-        offset: indirectOffset,
-        byteSize: DISPATCH_INDIRECT_BYTES,
-        executed: false,
-        skipped: true,
-        reason: 'ZERO_COUNT',
-      };
+      recordStat('zeroCountElided', 1, statsTarget);
+      return writeEncodeSingleResult(
+        outTarget,
+        indirectOffset,
+        DISPATCH_INDIRECT_BYTES,
+        false,
+        true,
+        'ZERO_COUNT'
+      );
     }
     if (!pass || typeof pass.dispatchWorkgroupsIndirect !== 'function') {
       if (skipInvalid) {
         recordBoundsRejection(statsTarget);
-        return {
-          offset: indirectOffset,
-          byteSize: DISPATCH_INDIRECT_BYTES,
-          executed: false,
-          skipped: true,
-          reason: 'MISSING_PASS_METHOD',
-        };
+        return writeEncodeSingleResult(
+          outTarget,
+          indirectOffset,
+          DISPATCH_INDIRECT_BYTES,
+          false,
+          true,
+          'MISSING_PASS_METHOD'
+        );
       }
       throw new TypeError('pass must implement dispatchWorkgroupsIndirect');
     }
@@ -1664,15 +1884,16 @@
       explicitSize
     );
     if (status !== RANGE_OK) {
-      recordRangeRejection(status, statsTarget, 1);
+      recordRangeRejection(status, statsTarget, 1, skipInvalid);
       if (skipInvalid) {
-        return {
-          offset: indirectOffset,
-          byteSize: DISPATCH_INDIRECT_BYTES,
-          executed: false,
-          skipped: true,
-          reason: RANGE_CODE_TO_REASON[status],
-        };
+        return writeEncodeSingleResult(
+          outTarget,
+          indirectOffset,
+          DISPATCH_INDIRECT_BYTES,
+          false,
+          true,
+          RANGE_CODE_TO_REASON[status]
+        );
       }
       throwForRangeCode(status, buffer, indirectOffset, DISPATCH_INDIRECT_BYTES, explicitSize);
     }
@@ -1680,24 +1901,29 @@
       hasOpts &&
       options.elideZeroCount !== false &&
       (hasZeroCountOption(INDIRECT_KIND.DISPATCH, options) ||
-        isZeroCountViewAt(
-          INDIRECT_KIND.DISPATCH,
-          toOptionalDataView(options.shadowData),
-          indirectOffset
-        ))
+        isZeroCountShadowAt(INDIRECT_KIND.DISPATCH, options.shadowData, indirectOffset))
     ) {
       recordStat('skippedZeroCountDraws', 1, statsTarget);
-      return {
-        offset: indirectOffset,
-        byteSize: DISPATCH_INDIRECT_BYTES,
-        executed: false,
-        skipped: true,
-        reason: 'ZERO_COUNT',
-      };
+      recordStat('zeroCountElided', 1, statsTarget);
+      return writeEncodeSingleResult(
+        outTarget,
+        indirectOffset,
+        DISPATCH_INDIRECT_BYTES,
+        false,
+        true,
+        'ZERO_COUNT'
+      );
     }
     pass.dispatchWorkgroupsIndirect(buffer, indirectOffset);
     recordEncodedKind(INDIRECT_KIND.DISPATCH, 1, statsTarget);
-    return { offset: indirectOffset, byteSize: DISPATCH_INDIRECT_BYTES };
+    return writeEncodeSingleResult(
+      outTarget,
+      indirectOffset,
+      DISPATCH_INDIRECT_BYTES,
+      true,
+      false,
+      null
+    );
   }
 
   /**
@@ -1812,7 +2038,7 @@
     if (clampToBuffer) {
       const baseStatus = fastCheckIndirectRange(buffer, firstOffset, recordSize, explicitSize);
       if (baseStatus !== RANGE_OK && baseStatus !== RANGE_OUT_OF_BOUNDS) {
-        recordRangeRejection(baseStatus, statsTarget, effectiveCount);
+        recordRangeRejection(baseStatus, statsTarget, effectiveCount, skipInvalid);
         if (skipInvalid) {
           return { calls: 0, draws: 0, skipped: effectiveCount, native };
         }
@@ -1825,6 +2051,7 @@
           clampedSkipped = effectiveCount - maxFit;
           effectiveCount = maxFit;
           recordStat('skippedOutOfBoundsDraws', clampedSkipped, statsTarget);
+          recordStat('outOfBoundsElided', clampedSkipped, statsTarget);
           if (!batch.clamped) {
             if (maxFit === 0) {
               recordBoundsRejection(statsTarget);
@@ -1833,6 +2060,7 @@
             }
           }
           if (effectiveCount === 0) {
+            recordStat('commandsValidated', clampedSkipped, statsTarget);
             return { calls: 0, draws: 0, skipped: clampedSkipped, native };
           }
         }
@@ -1840,14 +2068,15 @@
     }
 
     const hasVisibility = options.visibility !== undefined && options.visibility !== null;
-    const shadowView =
-      options.elideZeroCount !== false ? toOptionalDataView(options.shadowData) : null;
+    const shadowSource =
+      options.elideZeroCount !== false ? prepareShadowSource(options.shadowData) : null;
 
-    if (!hasVisibility && !shadowView) {
+    if (!hasVisibility && !shadowSource) {
       const spanBytes = stride * (effectiveCount - 1) + recordSize;
       const status = fastCheckIndirectRange(buffer, firstOffset, spanBytes, explicitSize);
       if (status !== RANGE_OK) {
-        recordRangeRejection(status, statsTarget, effectiveCount);
+        recordRangeRejection(status, statsTarget, effectiveCount, skipInvalid);
+        recordStat('commandsValidated', effectiveCount + clampedSkipped, statsTarget);
         if (skipInvalid) {
           return { calls: 0, draws: 0, skipped: effectiveCount + clampedSkipped, native };
         }
@@ -1856,6 +2085,8 @@
       if (native) {
         pass[nativeMethod](buffer, firstOffset, effectiveCount);
         recordEncodedKind(kind, effectiveCount, statsTarget);
+        recordStat('commandsValidated', effectiveCount + clampedSkipped, statsTarget);
+        recordStat('batchesDispatched', 1, statsTarget);
         recordMaxStat('maxMultiDrawCount', effectiveCount, statsTarget);
         return { calls: 1, draws: effectiveCount, skipped: clampedSkipped, native: true };
       }
@@ -1863,6 +2094,8 @@
         pass[method](buffer, offset);
       }
       recordEncodedKind(kind, effectiveCount, statsTarget);
+      recordStat('commandsValidated', effectiveCount + clampedSkipped, statsTarget);
+      recordStat('batchesDispatched', 1, statsTarget);
       recordMaxStat('maxMultiDrawCount', effectiveCount, statsTarget);
       return { calls: effectiveCount, draws: effectiveCount, skipped: clampedSkipped, native: false };
     }
@@ -1880,6 +2113,7 @@
         }
       }
       if (maxVisIdx === -1) {
+        recordStat('commandsValidated', effectiveCount + clampedSkipped, statsTarget);
         return { calls: 0, draws: 0, skipped: effectiveCount + clampedSkipped, native };
       }
     }
@@ -1887,7 +2121,8 @@
     const maxVisOffset = firstOffset + maxVisIdx * stride;
     const status = fastCheckIndirectRange(buffer, maxVisOffset, recordSize, explicitSize);
     if (status !== RANGE_OK) {
-      recordRangeRejection(status, statsTarget, effectiveCount);
+      recordRangeRejection(status, statsTarget, effectiveCount, skipInvalid);
+      recordStat('commandsValidated', effectiveCount + clampedSkipped, statsTarget);
       if (skipInvalid) {
         return { calls: 0, draws: 0, skipped: effectiveCount + clampedSkipped, native };
       }
@@ -1898,21 +2133,14 @@
     let draws = 0;
     let zeroSkipped = 0;
     let skipped = clampedSkipped + (effectiveCount - 1 - maxVisIdx);
-    const isSlotActive = (i) => {
-      if (hasVisibility && !visibleAt(visibility, i)) {
-        return false;
-      }
-      if (shadowView && isZeroCountViewAt(kind, shadowView, firstOffset + i * stride)) {
-        return false;
-      }
-      return true;
-    };
 
     if (native) {
       let i = 0;
       while (i <= maxVisIdx) {
-        if (!isSlotActive(i)) {
-          if ((!hasVisibility || visibleAt(visibility, i)) && shadowView && isZeroCountViewAt(kind, shadowView, firstOffset + i * stride)) {
+        const isVis = !hasVisibility || visibleAt(visibility, i);
+        const isZero = isVis && shadowSource !== null && isZeroCountShadowAt(kind, shadowSource, firstOffset + i * stride);
+        if (!isVis || isZero) {
+          if (isZero) {
             zeroSkipped += 1;
           }
           skipped += 1;
@@ -1920,7 +2148,13 @@
           continue;
         }
         let runEnd = i + 1;
-        while (runEnd <= maxVisIdx && isSlotActive(runEnd)) {
+        while (runEnd <= maxVisIdx) {
+          if (hasVisibility && !visibleAt(visibility, runEnd)) {
+            break;
+          }
+          if (shadowSource !== null && isZeroCountShadowAt(kind, shadowSource, firstOffset + runEnd * stride)) {
+            break;
+          }
           runEnd += 1;
         }
         const runCount = runEnd - i;
@@ -1935,7 +2169,7 @@
           skipped += 1;
           continue;
         }
-        if (shadowView && isZeroCountViewAt(kind, shadowView, offset)) {
+        if (shadowSource !== null && isZeroCountShadowAt(kind, shadowSource, offset)) {
           zeroSkipped += 1;
           skipped += 1;
           continue;
@@ -1946,11 +2180,14 @@
       }
     }
 
+    recordStat('commandsValidated', effectiveCount + clampedSkipped, statsTarget);
     if (zeroSkipped > 0) {
       recordStat('skippedZeroCountDraws', zeroSkipped, statsTarget);
+      recordStat('zeroCountElided', zeroSkipped, statsTarget);
     }
     if (draws > 0) {
       recordEncodedKind(kind, draws, statsTarget);
+      recordStat('batchesDispatched', 1, statsTarget);
       recordMaxStat('maxMultiDrawCount', draws, statsTarget);
     }
     return { calls, draws, skipped, native };
@@ -2079,7 +2316,7 @@
     if (clampToBuffer) {
       const baseStatus = fastCheckIndirectRange(buffer, firstOffset, recordSize, explicitSize);
       if (baseStatus !== RANGE_OK && baseStatus !== RANGE_OUT_OF_BOUNDS) {
-        recordRangeRejection(baseStatus, statsTarget, effectiveCount);
+        recordRangeRejection(baseStatus, statsTarget, effectiveCount, skipInvalid);
         if (skipInvalid) {
           return { calls: 0, dispatches: 0, skipped: effectiveCount, clamped };
         }
@@ -2092,6 +2329,7 @@
           clampedSkipped = effectiveCount - maxFit;
           effectiveCount = maxFit;
           recordStat('skippedOutOfBoundsDraws', clampedSkipped, statsTarget);
+          recordStat('outOfBoundsElided', clampedSkipped, statsTarget);
           if (!clamped) {
             if (maxFit === 0) {
               recordBoundsRejection(statsTarget);
@@ -2101,6 +2339,7 @@
           }
           clamped = true;
           if (effectiveCount === 0) {
+            recordStat('commandsValidated', clampedSkipped, statsTarget);
             return { calls: 0, dispatches: 0, skipped: clampedSkipped, clamped: true };
           }
         }
@@ -2108,14 +2347,15 @@
     }
 
     const hasVisibility = options.visibility !== undefined && options.visibility !== null;
-    const shadowView =
-      options.elideZeroCount !== false ? toOptionalDataView(options.shadowData) : null;
+    const shadowSource =
+      options.elideZeroCount !== false ? prepareShadowSource(options.shadowData) : null;
 
-    if (!hasVisibility && !shadowView) {
+    if (!hasVisibility && !shadowSource) {
       const spanBytes = stride * (effectiveCount - 1) + recordSize;
       const status = fastCheckIndirectRange(buffer, firstOffset, spanBytes, explicitSize);
       if (status !== RANGE_OK) {
-        recordRangeRejection(status, statsTarget, effectiveCount);
+        recordRangeRejection(status, statsTarget, effectiveCount, skipInvalid);
+        recordStat('commandsValidated', effectiveCount + clampedSkipped, statsTarget);
         if (skipInvalid) {
           return {
             calls: 0,
@@ -2130,6 +2370,8 @@
         pass.dispatchWorkgroupsIndirect(buffer, offset);
       }
       recordEncodedKind(INDIRECT_KIND.DISPATCH, effectiveCount, statsTarget);
+      recordStat('commandsValidated', effectiveCount + clampedSkipped, statsTarget);
+      recordStat('batchesDispatched', 1, statsTarget);
       recordMaxStat('maxMultiDrawCount', effectiveCount, statsTarget);
       return {
         calls: effectiveCount,
@@ -2150,6 +2392,7 @@
         }
       }
       if (maxVisIdx === -1) {
+        recordStat('commandsValidated', effectiveCount + clampedSkipped, statsTarget);
         return { calls: 0, dispatches: 0, skipped: effectiveCount + clampedSkipped, clamped };
       }
     }
@@ -2157,7 +2400,8 @@
     const maxVisOffset = firstOffset + maxVisIdx * stride;
     const status = fastCheckIndirectRange(buffer, maxVisOffset, recordSize, explicitSize);
     if (status !== RANGE_OK) {
-      recordRangeRejection(status, statsTarget, effectiveCount);
+      recordRangeRejection(status, statsTarget, effectiveCount, skipInvalid);
+      recordStat('commandsValidated', effectiveCount + clampedSkipped, statsTarget);
       if (skipInvalid) {
         return {
           calls: 0,
@@ -2177,7 +2421,7 @@
         skipped += 1;
         continue;
       }
-      if (shadowView && isZeroCountViewAt(INDIRECT_KIND.DISPATCH, shadowView, offset)) {
+      if (shadowSource !== null && isZeroCountShadowAt(INDIRECT_KIND.DISPATCH, shadowSource, offset)) {
         zeroSkipped += 1;
         skipped += 1;
         continue;
@@ -2185,11 +2429,14 @@
       pass.dispatchWorkgroupsIndirect(buffer, offset);
       dispatches += 1;
     }
+    recordStat('commandsValidated', effectiveCount + clampedSkipped, statsTarget);
     if (zeroSkipped > 0) {
       recordStat('skippedZeroCountDraws', zeroSkipped, statsTarget);
+      recordStat('zeroCountElided', zeroSkipped, statsTarget);
     }
     if (dispatches > 0) {
       recordEncodedKind(INDIRECT_KIND.DISPATCH, dispatches, statsTarget);
+      recordStat('batchesDispatched', 1, statsTarget);
       recordMaxStat('maxMultiDrawCount', dispatches, statsTarget);
     }
     return { calls: dispatches, dispatches, skipped, clamped };
@@ -2231,9 +2478,50 @@
    *   stride: number
    * }}
    */
-  function executeIndirect(pass, kind, buffer, argOffset = 0, options) {
+  function writeExecuteResult(
+    target,
+    ok,
+    executed,
+    calls,
+    requestedCount,
+    clamped,
+    skipped,
+    reason,
+    native,
+    firstOffset,
+    stride
+  ) {
+    if (target !== null) {
+      target.ok = ok;
+      target.executed = executed;
+      target.calls = calls;
+      target.requestedCount = requestedCount;
+      target.clamped = clamped;
+      target.skipped = skipped;
+      target.reason = reason;
+      target.native = native;
+      target.firstOffset = firstOffset;
+      target.stride = stride;
+      return target;
+    }
+    return {
+      ok,
+      executed,
+      calls,
+      requestedCount,
+      clamped,
+      skipped,
+      reason,
+      native,
+      firstOffset,
+      stride,
+    };
+  }
+
+  function executeIndirect(pass, kind, buffer, argOffset = 0, options, out) {
     const layout = LAYOUTS[kind];
     const hasOpts = options !== undefined && options !== null;
+    const outTarget = resolveOutTarget(options, out);
     const statsTarget = hasOpts ? options._statsTarget || null : null;
     const strict = hasOpts && Boolean(options.strict);
 
@@ -2242,18 +2530,19 @@
       if (strict) {
         throw new TypeError(`unknown indirect kind '${kind}'`);
       }
-      return {
-        ok: false,
-        executed: 0,
-        calls: 0,
-        requestedCount: 0,
-        clamped: false,
-        skipped: 0,
-        reason: 'UNKNOWN_KIND',
-        native: false,
-        firstOffset: 0,
-        stride: 0,
-      };
+      return writeExecuteResult(
+        outTarget,
+        false,
+        0,
+        0,
+        0,
+        false,
+        0,
+        'UNKNOWN_KIND',
+        false,
+        0,
+        0
+      );
     }
 
     const recordSize = layout.byteSize;
@@ -2275,18 +2564,20 @@
       if (strict) {
         throw new TypeError(`pass must implement ${method}`);
       }
-      return {
-        ok: false,
-        executed: 0,
-        calls: 0,
-        requestedCount: hasOpts && isNonNegSafeIntFast(options.count) ? options.count : 1,
-        clamped: false,
-        skipped: hasOpts && isNonNegSafeIntFast(options.count) ? options.count : 1,
-        reason: 'MISSING_PASS_METHOD',
-        native: false,
-        firstOffset: isNonNegSafeIntFast(argOffset) ? argOffset : 0,
-        stride: recordSize,
-      };
+      const reqFallback = hasOpts && isNonNegSafeIntFast(options.count) ? options.count : 1;
+      return writeExecuteResult(
+        outTarget,
+        false,
+        0,
+        0,
+        reqFallback,
+        false,
+        reqFallback,
+        'MISSING_PASS_METHOD',
+        false,
+        isNonNegSafeIntFast(argOffset) ? argOffset : 0,
+        recordSize
+      );
     }
 
     const requestedCount = hasOpts
@@ -2310,9 +2601,9 @@
     // firstSlot === 0, no visibility mask).
     const hasVisibility = hasOpts && options.visibility !== undefined && options.visibility !== null;
     const elideZeroCount = !hasOpts || options.elideZeroCount !== false;
-    const shadowView =
+    const shadowSource =
       hasOpts && elideZeroCount && options.shadowData !== undefined && options.shadowData !== null
-        ? toOptionalDataView(options.shadowData)
+        ? prepareShadowSource(options.shadowData)
         : null;
     if (
       requestedCount === 1 &&
@@ -2321,58 +2612,63 @@
       !hasVisibility &&
       isPosSafeIntFast(maxBatch)
     ) {
+      recordStat('commandsValidated', 1, statsTarget);
       const status = fastCheckIndirectRange(buffer, argOffset, recordSize, explicitSize);
       if (status === RANGE_OK) {
         if (
           hasOpts &&
           elideZeroCount &&
-          (hasZeroCountOption(kind, options) || isZeroCountViewAt(kind, shadowView, argOffset))
+          (hasZeroCountOption(kind, options) || isZeroCountShadowAt(kind, shadowSource, argOffset))
         ) {
           recordStat('skippedZeroCountDraws', 1, statsTarget);
-          return {
-            ok: true,
-            executed: 0,
-            calls: 0,
-            requestedCount: 1,
-            clamped: false,
-            skipped: 1,
-            reason: 'ZERO_COUNT',
-            native: false,
-            firstOffset: argOffset,
-            stride: recordSize,
-          };
+          recordStat('zeroCountElided', 1, statsTarget);
+          return writeExecuteResult(
+            outTarget,
+            true,
+            0,
+            0,
+            1,
+            false,
+            1,
+            'ZERO_COUNT',
+            false,
+            argOffset,
+            recordSize
+          );
         }
         pass[method](buffer, argOffset);
         recordEncodedKind(kind, 1, statsTarget);
-        return {
-          ok: true,
-          executed: 1,
-          calls: 1,
-          requestedCount: 1,
-          clamped: false,
-          skipped: 0,
-          reason: null,
-          native: false,
-          firstOffset: argOffset,
-          stride: recordSize,
-        };
+        return writeExecuteResult(
+          outTarget,
+          true,
+          1,
+          1,
+          1,
+          false,
+          0,
+          null,
+          false,
+          argOffset,
+          recordSize
+        );
       }
-      recordRangeRejection(status, statsTarget, 1);
+      recordRangeRejection(status, statsTarget, 1, !strict);
       if (strict) {
         throwForRangeCode(status, buffer, argOffset, recordSize, explicitSize);
       }
-      return {
-        ok: false,
-        executed: 0,
-        calls: 0,
-        requestedCount: 1,
-        clamped: false,
-        skipped: 1,
-        reason: RANGE_CODE_TO_REASON[status],
-        native: false,
-        firstOffset: isNonNegSafeIntFast(argOffset) ? argOffset : 0,
-        stride: recordSize,
-      };
+      return writeExecuteResult(
+        outTarget,
+        false,
+        0,
+        0,
+        1,
+        false,
+        1,
+        RANGE_CODE_TO_REASON[status],
+        false,
+        isNonNegSafeIntFast(argOffset) ? argOffset : 0,
+        recordSize
+      );
     }
 
     const plan = computeIndirectBatchStepPlan(buffer, {
@@ -2389,15 +2685,16 @@
 
     if (!plan.valid) {
       const skippedCount = plan.requestedCount > 0 ? plan.requestedCount : 1;
+      recordStat('commandsValidated', skippedCount, statsTarget);
       if (plan.reason === 'BATCH_LIMIT_EXCEEDED') {
         recordBatchLimitRejected(statsTarget);
       } else if (
         plan.reason === 'MISALIGNED_OFFSET' ||
         (plan.reason === 'INVALID_STRIDE' && isPosSafeIntFast(stride) && !isAligned4Fast(stride))
       ) {
-        recordRangeRejection(RANGE_MISALIGNED_OFFSET, statsTarget, skippedCount);
+        recordRangeRejection(RANGE_MISALIGNED_OFFSET, statsTarget, skippedCount, !strict);
       } else if (plan.reason === 'OUT_OF_BOUNDS' || plan.reason === 'INVALID_OFFSET') {
-        recordRangeRejection(RANGE_OUT_OF_BOUNDS, statsTarget, skippedCount);
+        recordRangeRejection(RANGE_OUT_OF_BOUNDS, statsTarget, skippedCount, !strict);
       } else {
         recordBoundsRejection(statsTarget);
       }
@@ -2407,62 +2704,69 @@
         }
         throw new IndirectDrawError(plan.reason, `executeIndirect ${kind} failed: ${plan.reason}`);
       }
-      return {
-        ok: false,
-        executed: 0,
-        calls: 0,
-        requestedCount: plan.requestedCount,
-        clamped: false,
-        skipped: plan.requestedCount,
-        reason: plan.reason,
-        native: false,
-        firstOffset: plan.firstOffset,
-        stride: plan.stride,
-      };
+      return writeExecuteResult(
+        outTarget,
+        false,
+        0,
+        0,
+        plan.requestedCount,
+        false,
+        plan.requestedCount,
+        plan.reason,
+        false,
+        plan.firstOffset,
+        plan.stride
+      );
     }
 
     if (plan.effectiveCount === 0) {
       recordStat('zeroBatchSkips', 1, statsTarget);
       recordStat('skippedZeroCountDraws', 1, statsTarget);
-      return {
-        ok: true,
-        executed: 0,
-        calls: 0,
-        requestedCount: 0,
-        clamped: false,
-        skipped: 0,
-        reason: null,
-        native: false,
-        firstOffset: plan.firstOffset,
-        stride: plan.stride,
-      };
+      return writeExecuteResult(
+        outTarget,
+        true,
+        0,
+        0,
+        0,
+        false,
+        0,
+        null,
+        false,
+        plan.firstOffset,
+        plan.stride
+      );
     }
 
+    let oobClamped = 0;
     if (plan.clamped) {
       recordBatchClamped(statsTarget);
       const countAfterBatchClamp =
         clampBatch && plan.requestedCount > maxBatch ? maxBatch : plan.requestedCount;
-      const oobClamped = countAfterBatchClamp - plan.effectiveCount;
+      oobClamped = countAfterBatchClamp - plan.effectiveCount;
       if (oobClamped > 0) {
         recordStat('skippedOutOfBoundsDraws', oobClamped, statsTarget);
+        recordStat('outOfBoundsElided', oobClamped, statsTarget);
       }
     }
 
     const clampedSkipped = plan.requestedCount - plan.effectiveCount;
+    recordStat('commandsValidated', plan.effectiveCount + oobClamped, statsTarget);
     if (hasOpts && elideZeroCount && hasZeroCountOption(kind, options)) {
       recordStat('skippedZeroCountDraws', plan.effectiveCount, statsTarget);
-      return {
-        ok: true,
-        executed: 0,
-        calls: 0,
-        requestedCount: plan.requestedCount,
-        clamped: plan.clamped,
-        skipped: clampedSkipped + plan.effectiveCount,
-        reason: plan.clampedReason || 'ZERO_COUNT',
-        native: false,
-        firstOffset: plan.firstOffset,
-        stride: plan.stride,
-      };
+      recordStat('zeroCountElided', plan.effectiveCount, statsTarget);
+      return writeExecuteResult(
+        outTarget,
+        true,
+        0,
+        0,
+        plan.requestedCount,
+        plan.clamped,
+        clampedSkipped + plan.effectiveCount,
+        plan.clampedReason || 'ZERO_COUNT',
+        false,
+        plan.firstOffset,
+        plan.stride
+      );
     }
 
     const native =
@@ -2476,7 +2780,7 @@
     let zeroSkipped = 0;
     let skipped = clampedSkipped;
 
-    if (!hasVisibility && !shadowView) {
+    if (!hasVisibility && !shadowSource) {
       if (native) {
         pass[nativeMethod](buffer, plan.firstOffset, plan.effectiveCount);
         calls = 1;
@@ -2494,25 +2798,16 @@
       }
     } else {
       const visibility = hasVisibility ? options.visibility : null;
-      const isSlotActive = (i) => {
-        if (hasVisibility && !visibleAt(visibility, i)) {
-          return false;
-        }
-        if (shadowView && isZeroCountViewAt(kind, shadowView, plan.firstOffset + i * plan.stride)) {
-          return false;
-        }
-        return true;
-      };
-
       if (native) {
         let i = 0;
         while (i < plan.effectiveCount) {
-          if (!isSlotActive(i)) {
-            if (
-              (!hasVisibility || visibleAt(visibility, i)) &&
-              shadowView &&
-              isZeroCountViewAt(kind, shadowView, plan.firstOffset + i * plan.stride)
-            ) {
+          const isVis = !hasVisibility || visibleAt(visibility, i);
+          const isZero =
+            isVis &&
+            shadowSource !== null &&
+            isZeroCountShadowAt(kind, shadowSource, plan.firstOffset + i * plan.stride);
+          if (!isVis || isZero) {
+            if (isZero) {
               zeroSkipped += 1;
             }
             skipped += 1;
@@ -2520,7 +2815,16 @@
             continue;
           }
           let runEnd = i + 1;
-          while (runEnd < plan.effectiveCount && isSlotActive(runEnd)) {
+          while (runEnd < plan.effectiveCount) {
+            if (hasVisibility && !visibleAt(visibility, runEnd)) {
+              break;
+            }
+            if (
+              shadowSource !== null &&
+              isZeroCountShadowAt(kind, shadowSource, plan.firstOffset + runEnd * plan.stride)
+            ) {
+              break;
+            }
             runEnd += 1;
           }
           const runCount = runEnd - i;
@@ -2539,7 +2843,7 @@
             skipped += 1;
             continue;
           }
-          if (shadowView && isZeroCountViewAt(kind, shadowView, offset)) {
+          if (shadowSource !== null && isZeroCountShadowAt(kind, shadowSource, offset)) {
             zeroSkipped += 1;
             skipped += 1;
             continue;
@@ -2553,47 +2857,853 @@
 
     if (zeroSkipped > 0) {
       recordStat('skippedZeroCountDraws', zeroSkipped, statsTarget);
+      recordStat('zeroCountElided', zeroSkipped, statsTarget);
     }
     if (executed > 0) {
       recordEncodedKind(kind, executed, statsTarget);
       if (plan.requestedCount > 1 || executed > 1) {
+        recordStat('batchesDispatched', 1, statsTarget);
         recordMaxStat('maxMultiDrawCount', executed, statsTarget);
       }
     }
 
-    return {
-      ok: true,
+    return writeExecuteResult(
+      outTarget,
+      true,
       executed,
       calls,
-      requestedCount: plan.requestedCount,
-      clamped: plan.clamped,
+      plan.requestedCount,
+      plan.clamped,
       skipped,
-      reason: plan.clampedReason || (executed === 0 && zeroSkipped > 0 ? 'ZERO_COUNT' : null),
+      plan.clampedReason || (executed === 0 && zeroSkipped > 0 ? 'ZERO_COUNT' : null),
       native,
-      firstOffset: plan.firstOffset,
-      stride: plan.stride,
-    };
+      plan.firstOffset,
+      plan.stride
+    );
   }
 
   /**
    * Safe-by-default `ExecuteIndirect` helper for non-indexed `drawIndirect` (16-byte record).
    */
-  function executeIndirectDraw(pass, buffer, argOffset = 0, options) {
-    return executeIndirect(pass, INDIRECT_KIND.DRAW, buffer, argOffset, options);
+  function executeIndirectDraw(pass, buffer, argOffset = 0, options, out) {
+    return executeIndirect(pass, INDIRECT_KIND.DRAW, buffer, argOffset, options, out);
   }
 
   /**
    * Safe-by-default `ExecuteIndirect` helper for indexed `drawIndexedIndirect` (20-byte record).
    */
-  function executeIndirectDrawIndexed(pass, buffer, argOffset = 0, options) {
-    return executeIndirect(pass, INDIRECT_KIND.DRAW_INDEXED, buffer, argOffset, options);
+  function executeIndirectDrawIndexed(pass, buffer, argOffset = 0, options, out) {
+    return executeIndirect(pass, INDIRECT_KIND.DRAW_INDEXED, buffer, argOffset, options, out);
   }
 
   /**
    * Safe-by-default `ExecuteIndirect` helper for compute `dispatchWorkgroupsIndirect` (12-byte record).
    */
-  function executeIndirectDispatch(pass, buffer, argOffset = 0, options) {
-    return executeIndirect(pass, INDIRECT_KIND.DISPATCH, buffer, argOffset, options);
+  function executeIndirectDispatch(pass, buffer, argOffset = 0, options, out) {
+    return executeIndirect(pass, INDIRECT_KIND.DISPATCH, buffer, argOffset, options, out);
+  }
+
+  function writeDispatchResult(
+    target,
+    ok,
+    dispatched,
+    executed,
+    skipped,
+    elided,
+    reason,
+    offset,
+    byteSize,
+    indexed
+  ) {
+    if (target !== null) {
+      target.ok = ok;
+      target.dispatched = dispatched;
+      target.executed = executed;
+      target.skipped = skipped;
+      target.elided = elided;
+      target.reason = reason;
+      target.offset = offset;
+      target.byteSize = byteSize;
+      target.indexed = indexed;
+      return target;
+    }
+    return {
+      ok,
+      dispatched,
+      executed,
+      skipped,
+      elided,
+      reason,
+      offset,
+      byteSize,
+      indexed,
+    };
+  }
+
+  function dispatchIndirectSingle(pass, kind, buffer, indirectOffset, options, out) {
+    const indexed = kind === INDIRECT_KIND.DRAW_INDEXED;
+    const recordSize = indexed ? DRAW_INDEXED_INDIRECT_BYTES : DRAW_INDIRECT_BYTES;
+    const method = indexed ? 'drawIndexedIndirect' : 'drawIndirect';
+    const hasOpts = options !== undefined && options !== null;
+    const outTarget = resolveOutTarget(options, out);
+    const statsTarget = hasOpts ? options._statsTarget || null : null;
+    const strict = hasOpts && Boolean(options.strict);
+
+    recordStat('commandsValidated', 1, statsTarget);
+
+    if (hasOpts && options.count === 0) {
+      recordStat('zeroBatchSkips', 1, statsTarget);
+      recordStat('skippedZeroCountDraws', 1, statsTarget);
+      recordStat('zeroCountElided', 1, statsTarget);
+      return writeDispatchResult(
+        outTarget,
+        true,
+        false,
+        0,
+        1,
+        true,
+        'ZERO_COUNT',
+        indirectOffset,
+        recordSize,
+        indexed
+      );
+    }
+
+    if (!pass || typeof pass[method] !== 'function') {
+      recordBoundsRejection(statsTarget);
+      if (strict) {
+        throw new TypeError(`pass must implement ${method}`);
+      }
+      return writeDispatchResult(
+        outTarget,
+        false,
+        false,
+        0,
+        1,
+        true,
+        'MISSING_PASS_METHOD',
+        indirectOffset,
+        recordSize,
+        indexed
+      );
+    }
+
+    const explicitSize = hasOpts ? options.bufferSize : undefined;
+    const status = fastCheckIndirectRange(buffer, indirectOffset, recordSize, explicitSize);
+    if (status !== RANGE_OK) {
+      recordRangeRejection(status, statsTarget, 1, !strict);
+      if (strict) {
+        throwForRangeCode(status, buffer, indirectOffset, recordSize, explicitSize);
+      }
+      return writeDispatchResult(
+        outTarget,
+        false,
+        false,
+        0,
+        1,
+        true,
+        RANGE_CODE_TO_REASON[status],
+        indirectOffset,
+        recordSize,
+        indexed
+      );
+    }
+
+    if (
+      hasOpts &&
+      options.elideZeroCount !== false &&
+      (hasZeroCountOption(kind, options) ||
+        isZeroCountShadowAt(kind, options.shadowData, indirectOffset))
+    ) {
+      recordStat('skippedZeroCountDraws', 1, statsTarget);
+      recordStat('zeroCountElided', 1, statsTarget);
+      return writeDispatchResult(
+        outTarget,
+        true,
+        false,
+        0,
+        1,
+        true,
+        'ZERO_COUNT',
+        indirectOffset,
+        recordSize,
+        indexed
+      );
+    }
+
+    pass[method](buffer, indirectOffset);
+    recordEncodedKind(kind, 1, statsTarget);
+    return writeDispatchResult(
+      outTarget,
+      true,
+      true,
+      1,
+      0,
+      false,
+      null,
+      indirectOffset,
+      recordSize,
+      indexed
+    );
+  }
+
+  /**
+   * Hot-path zero-allocation indirect draw dispatcher (16-byte DrawIndirectArgs).
+   * Preserves 100% of W269 alignment, usage, liveness, bounds, and zero-count checks.
+   * When `out` (via 5th arg or `options.out`) is provided, mutates and returns `out`
+   * with zero per-draw object allocations.
+   *
+   * @param {{drawIndirect: Function}} pass GPURenderPassEncoder.
+   * @param {{usage:number, size?:number, destroyed?:boolean}} buffer Indirect buffer.
+   * @param {number} [indirectOffset=0]
+   * @param {object} [options]
+   * @param {object} [out] Optional pre-allocated scratch result object.
+   */
+  function dispatchIndirectDraw(pass, buffer, indirectOffset = 0, options, out) {
+    return dispatchIndirectSingle(pass, INDIRECT_KIND.DRAW, buffer, indirectOffset, options, out);
+  }
+
+  /**
+   * Hot-path zero-allocation indexed indirect draw dispatcher (20-byte DrawIndexedIndirectArgs).
+   * Preserves 100% of W269 alignment, usage, liveness, bounds, and zero-count checks.
+   * When `out` (via 5th arg or `options.out`) is provided, mutates and returns `out`
+   * with zero per-draw object allocations.
+   *
+   * @param {{drawIndexedIndirect: Function}} pass GPURenderPassEncoder.
+   * @param {{usage:number, size?:number, destroyed?:boolean}} buffer Indirect buffer.
+   * @param {number} [indirectOffset=0]
+   * @param {object} [options]
+   * @param {object} [out] Optional pre-allocated scratch result object.
+   */
+  function dispatchIndexedIndirectDraw(pass, buffer, indirectOffset = 0, options, out) {
+    return dispatchIndirectSingle(
+      pass,
+      INDIRECT_KIND.DRAW_INDEXED,
+      buffer,
+      indirectOffset,
+      options,
+      out
+    );
+  }
+
+  function writeBatchDispatchResult(
+    target,
+    ok,
+    dispatched,
+    calls,
+    validated,
+    requestedCount,
+    clamped,
+    skipped,
+    zeroCountElided,
+    outOfBoundsElided,
+    visibilitySkipped,
+    reason,
+    native,
+    firstOffset,
+    stride
+  ) {
+    if (target !== null) {
+      target.ok = ok;
+      target.dispatched = dispatched;
+      target.executed = dispatched;
+      target.calls = calls;
+      target.validated = validated;
+      target.requestedCount = requestedCount;
+      target.clamped = clamped;
+      target.skipped = skipped;
+      target.zeroCountElided = zeroCountElided;
+      target.outOfBoundsElided = outOfBoundsElided;
+      target.visibilitySkipped = visibilitySkipped;
+      target.reason = reason;
+      target.native = native;
+      target.firstOffset = firstOffset;
+      target.stride = stride;
+      return target;
+    }
+    return {
+      ok,
+      dispatched,
+      executed: dispatched,
+      calls,
+      validated,
+      requestedCount,
+      clamped,
+      skipped,
+      zeroCountElided,
+      outOfBoundsElided,
+      visibilitySkipped,
+      reason,
+      native,
+      firstOffset,
+      stride,
+    };
+  }
+
+  /**
+   * Single-pass, zero-per-command-allocation batched multi-draw-indirect validation & dispatch.
+   * Validates consecutive indirect command structs (`firstOffset + i * stride`) in one pass,
+   * cleanly eliding zero-count and out-of-bounds commands while preserving 100% of W269 checks.
+   * Supports an optional pre-allocated `out` scratch result object (via 4th arg or `options.out`).
+   *
+   * @param {object} pass GPURenderPassEncoder or GPUComputePassEncoder.
+   * @param {{usage:number, size?:number, destroyed?:boolean}} buffer Indirect buffer.
+   * @param {object} [options]
+   * @param {boolean} [options.indexed=false] Use 20-byte drawIndexedIndirect records when `kind` omitted.
+   * @param {string} [options.kind] Explicit INDIRECT_KIND ('draw' | 'drawIndexed' | 'dispatch').
+   * @param {number} [options.count] Number of consecutive indirect command structs.
+   * @param {number} [options.maxCommandCount] Alias for `count`.
+   * @param {number} [options.baseOffset=0] Byte offset of slot 0 (`offset` / `argOffset` aliases accepted).
+   * @param {number} [options.firstSlot=0] Starting command slot index.
+   * @param {number} [options.stride] Byte stride between consecutive structs (default record size).
+   * @param {number} [options.bufferSize] Optional explicit buffer byte length.
+   * @param {ArrayBuffer|DataView|ArrayBufferView} [options.shadowData] Optional CPU shadow bytes for zero-count elision.
+   * @param {object[]} [options.records] Optional CPU record array for zero-count elision.
+   * @param {ArrayLike<boolean|number>} [options.visibility] Optional CPU visibility mask.
+   * @param {boolean} [options.elideZeroCount=true] Elide zero-count commands cleanly.
+   * @param {boolean} [options.useNative=false] Coalesce contiguous valid runs into native multiDraw* calls when available.
+   * @param {number} [options.maxIndirectBatchCount=4096] Maximum commands per batch.
+   * @param {boolean} [options.clampBatch=true] Clamp oversized batches instead of rejecting.
+   * @param {boolean} [options.strict=false] Throw on fatal pass/buffer/alignment/stride errors.
+   * @param {object} [options.out] Optional pre-allocated scratch result object.
+   * @param {object} [out] Optional pre-allocated scratch result object.
+   */
+  function dispatchIndirectBatch(pass, buffer, options, out) {
+    const hasOpts = options !== undefined && options !== null && typeof options === 'object';
+    const outTarget = resolveOutTarget(options, out);
+    const statsTarget = hasOpts ? options._statsTarget || null : null;
+    const strict = hasOpts && Boolean(options.strict);
+
+    const kind =
+      hasOpts && options.kind !== undefined
+        ? options.kind
+        : hasOpts && options.indexed
+          ? INDIRECT_KIND.DRAW_INDEXED
+          : INDIRECT_KIND.DRAW;
+    const layout = LAYOUTS[kind];
+    if (!layout) {
+      recordBoundsRejection(statsTarget);
+      if (strict) {
+        throw new TypeError(`unknown indirect kind '${kind}'`);
+      }
+      return writeBatchDispatchResult(
+        outTarget,
+        false,
+        0,
+        0,
+        0,
+        0,
+        false,
+        0,
+        0,
+        0,
+        0,
+        'UNKNOWN_KIND',
+        false,
+        0,
+        0
+      );
+    }
+
+    const recordSize = layout.byteSize;
+    const method =
+      kind === INDIRECT_KIND.DRAW
+        ? 'drawIndirect'
+        : kind === INDIRECT_KIND.DRAW_INDEXED
+          ? 'drawIndexedIndirect'
+          : 'dispatchWorkgroupsIndirect';
+    const nativeMethod =
+      kind === INDIRECT_KIND.DRAW
+        ? 'multiDrawIndirect'
+        : kind === INDIRECT_KIND.DRAW_INDEXED
+          ? 'multiDrawIndexedIndirect'
+          : null;
+
+    const records = hasOpts && Array.isArray(options.records) ? options.records : null;
+    const requestedCount = hasOpts
+      ? options.count !== undefined
+        ? options.count
+        : options.maxCommandCount !== undefined
+          ? options.maxCommandCount
+          : records !== null
+            ? records.length
+            : 0
+      : 0;
+    const baseOffset = hasOpts
+      ? options.baseOffset !== undefined
+        ? options.baseOffset
+        : options.offset !== undefined
+          ? options.offset
+          : options.argOffset !== undefined
+            ? options.argOffset
+            : 0
+      : 0;
+    const firstSlot = hasOpts && options.firstSlot !== undefined ? options.firstSlot : 0;
+    const stride = hasOpts && options.stride !== undefined ? options.stride : recordSize;
+    const maxBatch =
+      hasOpts && options.maxIndirectBatchCount !== undefined
+        ? options.maxIndirectBatchCount
+        : DEFAULT_MAX_INDIRECT_BATCH_COUNT;
+    const clampBatch = !hasOpts || options.clampBatch !== false;
+    const explicitSize = hasOpts ? options.bufferSize : undefined;
+
+    if (!pass || typeof pass[method] !== 'function') {
+      recordBoundsRejection(statsTarget);
+      if (strict) {
+        throw new TypeError(`pass must implement ${method}`);
+      }
+      const reqValid = isNonNegSafeIntFast(requestedCount) ? requestedCount : 0;
+      return writeBatchDispatchResult(
+        outTarget,
+        false,
+        0,
+        0,
+        0,
+        reqValid,
+        false,
+        reqValid,
+        0,
+        0,
+        0,
+        'MISSING_PASS_METHOD',
+        false,
+        isNonNegSafeIntFast(baseOffset) ? baseOffset : 0,
+        isPosSafeIntFast(stride) ? stride : recordSize
+      );
+    }
+
+    if (!isNonNegSafeIntFast(requestedCount)) {
+      recordBoundsRejection(statsTarget);
+      if (strict) {
+        throw new RangeError(`count must be a non-negative integer, got ${requestedCount}`);
+      }
+      return writeBatchDispatchResult(
+        outTarget,
+        false,
+        0,
+        0,
+        0,
+        0,
+        false,
+        0,
+        0,
+        0,
+        0,
+        'INVALID_COUNT',
+        false,
+        isNonNegSafeIntFast(baseOffset) ? baseOffset : 0,
+        isPosSafeIntFast(stride) ? stride : recordSize
+      );
+    }
+
+    if (!isPosSafeIntFast(maxBatch)) {
+      recordBoundsRejection(statsTarget);
+      if (strict) {
+        throw new RangeError(`maxIndirectBatchCount must be a positive integer, got ${maxBatch}`);
+      }
+      return writeBatchDispatchResult(
+        outTarget,
+        false,
+        0,
+        0,
+        0,
+        requestedCount,
+        false,
+        requestedCount,
+        0,
+        0,
+        0,
+        'INVALID_BATCH_LIMIT',
+        false,
+        isNonNegSafeIntFast(baseOffset) ? baseOffset : 0,
+        isPosSafeIntFast(stride) ? stride : recordSize
+      );
+    }
+
+    if (!isNonNegSafeIntFast(firstSlot) || !isNonNegSafeIntFast(baseOffset)) {
+      const skippedCount = requestedCount > 0 ? requestedCount : 1;
+      recordRangeRejection(RANGE_INVALID_OFFSET, statsTarget, skippedCount, !strict);
+      recordStat('commandsValidated', requestedCount, statsTarget);
+      if (strict) {
+        throw new RangeError(`baseOffset/firstSlot must be non-negative integers`);
+      }
+      return writeBatchDispatchResult(
+        outTarget,
+        false,
+        0,
+        0,
+        requestedCount,
+        requestedCount,
+        false,
+        requestedCount,
+        0,
+        requestedCount,
+        0,
+        'INVALID_OFFSET',
+        false,
+        0,
+        isPosSafeIntFast(stride) ? stride : recordSize
+      );
+    }
+
+    if (!isPosSafeIntFast(stride) || stride < recordSize || !isAligned4Fast(stride)) {
+      const skippedCount = requestedCount > 0 ? requestedCount : 1;
+      if (isPosSafeIntFast(stride) && !isAligned4Fast(stride)) {
+        recordRangeRejection(RANGE_MISALIGNED_OFFSET, statsTarget, skippedCount, false);
+      } else {
+        recordBoundsRejection(statsTarget);
+      }
+      if (strict) {
+        throw new RangeError(`stride must be a multiple of 4 and >= ${recordSize}, got ${stride}`);
+      }
+      return writeBatchDispatchResult(
+        outTarget,
+        false,
+        0,
+        0,
+        0,
+        requestedCount,
+        false,
+        requestedCount,
+        0,
+        0,
+        0,
+        'INVALID_STRIDE',
+        false,
+        baseOffset,
+        0
+      );
+    }
+
+    const firstOffset = baseOffset + firstSlot * stride;
+    if (!isNonNegSafeIntFast(firstOffset)) {
+      const skippedCount = requestedCount > 0 ? requestedCount : 1;
+      recordRangeRejection(RANGE_OUT_OF_BOUNDS, statsTarget, skippedCount, !strict);
+      recordStat('commandsValidated', requestedCount, statsTarget);
+      if (strict) {
+        throw new IndirectDrawError('OUT_OF_BOUNDS', 'indirect batch firstOffset overflow');
+      }
+      return writeBatchDispatchResult(
+        outTarget,
+        false,
+        0,
+        0,
+        requestedCount,
+        requestedCount,
+        false,
+        requestedCount,
+        0,
+        requestedCount,
+        0,
+        'OUT_OF_BOUNDS',
+        false,
+        0,
+        stride
+      );
+    }
+
+    if (!isAligned4Fast(firstOffset)) {
+      const skippedCount = requestedCount > 0 ? requestedCount : 1;
+      recordRangeRejection(RANGE_MISALIGNED_OFFSET, statsTarget, skippedCount, false);
+      recordStat('commandsValidated', requestedCount, statsTarget);
+      if (strict) {
+        throwForRangeCode(RANGE_MISALIGNED_OFFSET, buffer, firstOffset, recordSize, explicitSize);
+      }
+      return writeBatchDispatchResult(
+        outTarget,
+        false,
+        0,
+        0,
+        requestedCount,
+        requestedCount,
+        false,
+        requestedCount,
+        0,
+        0,
+        0,
+        'MISALIGNED_OFFSET',
+        false,
+        firstOffset,
+        stride
+      );
+    }
+
+    if (requestedCount === 0) {
+      recordStat('zeroBatchSkips', 1, statsTarget);
+      recordStat('skippedZeroCountDraws', 1, statsTarget);
+      return writeBatchDispatchResult(
+        outTarget,
+        true,
+        0,
+        0,
+        0,
+        0,
+        false,
+        0,
+        0,
+        0,
+        0,
+        null,
+        false,
+        firstOffset,
+        stride
+      );
+    }
+
+    if (!buffer || typeof buffer !== 'object' || (buffer.usage & BUFFER_USAGE.INDIRECT) === 0) {
+      recordRangeRejection(RANGE_NOT_INDIRECT, statsTarget, requestedCount, false);
+      recordStat('commandsValidated', requestedCount, statsTarget);
+      if (strict) {
+        throwForRangeCode(RANGE_NOT_INDIRECT, buffer, firstOffset, recordSize, explicitSize);
+      }
+      return writeBatchDispatchResult(
+        outTarget,
+        false,
+        0,
+        0,
+        requestedCount,
+        requestedCount,
+        false,
+        requestedCount,
+        0,
+        0,
+        0,
+        'NOT_INDIRECT',
+        false,
+        firstOffset,
+        stride
+      );
+    }
+
+    if (buffer.destroyed === true) {
+      recordRangeRejection(RANGE_DESTROYED_BUFFER, statsTarget, requestedCount, false);
+      recordStat('commandsValidated', requestedCount, statsTarget);
+      if (strict) {
+        throwForRangeCode(RANGE_DESTROYED_BUFFER, buffer, firstOffset, recordSize, explicitSize);
+      }
+      return writeBatchDispatchResult(
+        outTarget,
+        false,
+        0,
+        0,
+        requestedCount,
+        requestedCount,
+        false,
+        requestedCount,
+        0,
+        0,
+        0,
+        'DESTROYED_BUFFER',
+        false,
+        firstOffset,
+        stride
+      );
+    }
+
+    const effectiveSize = resolveEffectiveBufferSizeFast(buffer, explicitSize);
+    if (effectiveSize === -2 || effectiveSize === -3) {
+      const code = effectiveSize === -2 ? RANGE_INVALID_OPT_BUFFER_SIZE : RANGE_INVALID_BUFFER_SIZE;
+      recordRangeRejection(code, statsTarget, requestedCount, !strict);
+      recordStat('commandsValidated', requestedCount, statsTarget);
+      if (strict) {
+        throwForRangeCode(code, buffer, firstOffset, recordSize, explicitSize);
+      }
+      return writeBatchDispatchResult(
+        outTarget,
+        false,
+        0,
+        0,
+        requestedCount,
+        requestedCount,
+        false,
+        requestedCount,
+        0,
+        requestedCount,
+        0,
+        'OUT_OF_BOUNDS',
+        false,
+        firstOffset,
+        stride
+      );
+    }
+
+    let effectiveCount = requestedCount;
+    let clampedByBatch = false;
+    if (effectiveCount > maxBatch) {
+      if (!clampBatch) {
+        recordBatchLimitRejected(statsTarget);
+        if (strict) {
+          throw new IndirectDrawError(
+            'BATCH_LIMIT_EXCEEDED',
+            `indirect batch count ${requestedCount} exceeds maxIndirectBatchCount ${maxBatch}`
+          );
+        }
+        return writeBatchDispatchResult(
+          outTarget,
+          false,
+          0,
+          0,
+          0,
+          requestedCount,
+          false,
+          requestedCount,
+          0,
+          0,
+          0,
+          'BATCH_LIMIT_EXCEEDED',
+          false,
+          firstOffset,
+          stride
+        );
+      }
+      effectiveCount = maxBatch;
+      clampedByBatch = true;
+      recordBatchClamped(statsTarget);
+    }
+
+    const hasVisibility = hasOpts && options.visibility !== undefined && options.visibility !== null;
+    const visibility = hasVisibility ? options.visibility : null;
+    const elideZeroCount = !hasOpts || options.elideZeroCount !== false;
+    const shadowSource =
+      hasOpts && elideZeroCount && options.shadowData !== undefined && options.shadowData !== null
+        ? prepareShadowSource(options.shadowData)
+        : null;
+    const batchZeroOption = hasOpts && elideZeroCount && hasZeroCountOption(kind, options);
+    const native =
+      Boolean(hasOpts && options.useNative) &&
+      nativeMethod !== null &&
+      stride === recordSize &&
+      typeof pass[nativeMethod] === 'function';
+
+    let dispatched = 0;
+    let calls = 0;
+    let validated = 0;
+    let zeroElided = 0;
+    let oobElided = 0;
+    let visSkipped = 0;
+    let runStartOffset = 0;
+    let runCount = 0;
+
+    for (let i = 0, offset = firstOffset; i < effectiveCount; i += 1, offset += stride) {
+      const end = offset + recordSize;
+      if (
+        (effectiveSize >= 0 && end > effectiveSize) ||
+        (end > 0x7fffffff && !Number.isSafeInteger(end))
+      ) {
+        if (native && runCount > 0) {
+          pass[nativeMethod](buffer, runStartOffset, runCount);
+          calls += 1;
+          dispatched += runCount;
+          runCount = 0;
+        }
+        const remainingOob = effectiveCount - i;
+        oobElided += remainingOob;
+        validated += remainingOob;
+        break;
+      }
+
+      validated += 1;
+
+      if (hasVisibility && !visibleAt(visibility, i)) {
+        if (native && runCount > 0) {
+          pass[nativeMethod](buffer, runStartOffset, runCount);
+          calls += 1;
+          dispatched += runCount;
+          runCount = 0;
+        }
+        visSkipped += 1;
+        continue;
+      }
+
+      if (
+        elideZeroCount &&
+        (batchZeroOption ||
+          (shadowSource !== null && isZeroCountShadowAt(kind, shadowSource, offset)) ||
+          (records !== null && i < records.length && isZeroCountRecord(kind, records[i])))
+      ) {
+        if (native && runCount > 0) {
+          pass[nativeMethod](buffer, runStartOffset, runCount);
+          calls += 1;
+          dispatched += runCount;
+          runCount = 0;
+        }
+        zeroElided += 1;
+        continue;
+      }
+
+      if (native) {
+        if (runCount === 0) {
+          runStartOffset = offset;
+          runCount = 1;
+        } else {
+          runCount += 1;
+        }
+      } else {
+        pass[method](buffer, offset);
+        calls += 1;
+        dispatched += 1;
+      }
+    }
+
+    if (native && runCount > 0) {
+      pass[nativeMethod](buffer, runStartOffset, runCount);
+      calls += 1;
+      dispatched += runCount;
+      runCount = 0;
+    }
+
+    recordStat('commandsValidated', validated, statsTarget);
+    if (zeroElided > 0) {
+      recordStat('skippedZeroCountDraws', zeroElided, statsTarget);
+      recordStat('zeroCountElided', zeroElided, statsTarget);
+    }
+    const allOob = oobElided === effectiveCount && dispatched === 0 && zeroElided === 0 && visSkipped === 0;
+    if (oobElided > 0) {
+      recordStat('skippedOutOfBoundsDraws', oobElided, statsTarget);
+      recordStat('outOfBoundsElided', oobElided, statsTarget);
+      if (allOob) {
+        recordBoundsRejection(statsTarget);
+      } else if (!clampedByBatch) {
+        recordBatchClamped(statsTarget);
+      }
+    }
+    if (dispatched > 0) {
+      recordEncodedKind(kind, dispatched, statsTarget);
+      recordStat('batchesDispatched', 1, statsTarget);
+      recordMaxStat('maxMultiDrawCount', dispatched, statsTarget);
+    }
+
+    const clampedByBuffer = oobElided > 0 && !allOob;
+    const clamped = clampedByBatch || clampedByBuffer;
+    const reason = allOob
+      ? 'OUT_OF_BOUNDS'
+      : clampedByBatch && clampedByBuffer
+        ? 'CLAMPED_TO_BATCH_LIMIT_AND_BUFFER'
+        : clampedByBatch
+          ? 'CLAMPED_TO_BATCH_LIMIT'
+          : clampedByBuffer
+            ? 'CLAMPED_TO_BUFFER'
+            : dispatched === 0 && zeroElided > 0
+              ? 'ZERO_COUNT'
+              : null;
+
+    return writeBatchDispatchResult(
+      outTarget,
+      !allOob,
+      dispatched,
+      calls,
+      validated,
+      requestedCount,
+      clamped,
+      requestedCount - dispatched,
+      zeroElided,
+      oobElided,
+      visSkipped,
+      reason,
+      native,
+      firstOffset,
+      stride
+    );
   }
 
   /**
@@ -2948,6 +4058,10 @@
      *   skippedOutOfBoundsDraws: number,
      *   skippedMisalignedDraws: number,
      *   skippedZeroCountDraws: number,
+     *   batchesDispatched: number,
+     *   commandsValidated: number,
+     *   zeroCountElided: number,
+     *   outOfBoundsElided: number,
      *   liveSlots: number,
      *   capacity: number,
      *   stride: number,
@@ -2973,6 +4087,10 @@
         skippedOutOfBoundsDraws: this._stats.skippedOutOfBoundsDraws,
         skippedMisalignedDraws: this._stats.skippedMisalignedDraws,
         skippedZeroCountDraws: this._stats.skippedZeroCountDraws,
+        batchesDispatched: this._stats.batchesDispatched,
+        commandsValidated: this._stats.commandsValidated,
+        zeroCountElided: this._stats.zeroCountElided,
+        outOfBoundsElided: this._stats.outOfBoundsElided,
         liveSlots: this.live.size,
         capacity: this.capacity,
         stride: this.stride,
@@ -3032,6 +4150,7 @@
     checkIndirectRange,
     isZeroCountRecord,
     validateIndirectBufferArgs,
+    validateIndirectDrawArgs,
     validateIndirectRange,
     computeIndirectBatchStepPlan,
     validateIndirectBatch,
@@ -3048,6 +4167,9 @@
     executeIndirectDraw,
     executeIndirectDrawIndexed,
     executeIndirectDispatch,
+    dispatchIndirectDraw,
+    dispatchIndexedIndirectDraw,
+    dispatchIndirectBatch,
     getStats,
     resetStats,
     IndirectArgsBuffer,
