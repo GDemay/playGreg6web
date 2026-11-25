@@ -2883,3 +2883,118 @@ test('W286 tracks 30 FPS compliance rate, rolling frameJitterMs, and longestStal
   assert.equal(stats.frameJitterMs, 0);
   assert.equal(stats.longestStallMs, 0);
 });
+
+test('W348 preserves COPY_SRC usage across resize, configure, setFormat, configureForStreamFormat, and recover, and rolls back failed configure', () => {
+  const { canvas, context, device, events } = createMockWebGpuEnv();
+  attachMockBlitCapabilities(device, events);
+
+  const copySrcUsage = TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC;
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'bgra8unorm',
+    enableDepth: false,
+  });
+
+  // Initial configure enables RENDER_ATTACHMENT | COPY_SRC.
+  swapchain.configure({ width: 1280, height: 720, usage: copySrcUsage });
+  assert.equal(swapchain.usage, copySrcUsage);
+  assert.equal(swapchain.hasCopySrcUsage, true);
+  assert.equal(context.configurations[0].usage, copySrcUsage);
+
+  // Subsequent resize() and configure({ width, height }) without usage MUST preserve COPY_SRC.
+  assert.equal(swapchain.resize(1920, 1080, 1), true);
+  assert.equal(swapchain.usage, copySrcUsage);
+  assert.equal(swapchain.hasCopySrcUsage, true);
+  assert.equal(context.configurations[context.configurations.length - 1].usage, copySrcUsage);
+
+  swapchain.configure({ width: 1280, height: 720 });
+  assert.equal(swapchain.usage, copySrcUsage);
+  assert.equal(context.configurations[context.configurations.length - 1].usage, copySrcUsage);
+
+  // Format changes (direct and blit fallback) MUST preserve COPY_SRC.
+  swapchain.setFormat('rgba8unorm');
+  assert.equal(swapchain.usage, copySrcUsage);
+  assert.equal(context.configurations[context.configurations.length - 1].usage, copySrcUsage);
+
+  swapchain.configureForStreamFormat('rgb10a2unorm');
+  assert.equal(swapchain.usesBlitFallback, true);
+  assert.equal(swapchain.usage, copySrcUsage);
+
+  swapchain.configureForStreamFormat('bgra8unorm');
+  assert.equal(swapchain.usesBlitFallback, false);
+  assert.equal(swapchain.usage, copySrcUsage);
+  assert.equal(context.configurations[context.configurations.length - 1].usage, copySrcUsage);
+
+  // Device recovery MUST preserve COPY_SRC.
+  const env2 = createMockWebGpuEnv();
+  swapchain.recover(env2.device);
+  assert.equal(swapchain.usage, copySrcUsage);
+  assert.equal(context.configurations[context.configurations.length - 1].usage, copySrcUsage);
+
+  // A throwing configure({ usage }) must roll back stored usage rather than corrupting it.
+  const origConfigure = context.configure.bind(context);
+  context.configure = () => {
+    throw new Error('simulated configure failure');
+  };
+  assert.throws(
+    () => swapchain.configure({ usage: TEXTURE_USAGE_RENDER_ATTACHMENT }),
+    /simulated configure failure/
+  );
+  assert.equal(swapchain.usage, copySrcUsage);
+  assert.equal(swapchain.hasCopySrcUsage, true);
+  context.configure = origConfigure;
+  swapchain.destroy();
+});
+
+test('W348 confirmVisibleFrame transitions gated black presents to visible without double-counting presentCount', () => {
+  const { canvas, context, device } = createMockWebGpuEnv();
+  let clockMs = 1000;
+  const fired = [];
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'bgra8unorm',
+    enableDepth: false,
+    nowFn: () => clockMs,
+    onFirstVisibleFrame: (info) => fired.push({ ...info }),
+  });
+  swapchain.configure({ width: 1280, height: 720 });
+
+  // 3 gated black presents: hasVisibleContent stays false, visiblePresentsTotal stays 0.
+  for (let i = 0; i < 3; i += 1) {
+    clockMs += 100;
+    swapchain.markFrameContent({ hasVisibleContent: false, realPackDraws: 0, timestampMs: clockMs });
+    swapchain.recordFramePresented(clockMs);
+  }
+  assert.equal(swapchain.presentCount, 3);
+  assert.equal(swapchain.hasVisibleContent, false);
+  assert.equal(swapchain.visiblePresentsTotal, 0);
+  assert.equal(swapchain.blackPresentsTotal, 3);
+  assert.equal(swapchain.firstVisiblePresentIndex, null);
+  assert.equal(swapchain.firstVisiblePresentMs, null);
+  assert.equal(fired.length, 0);
+
+  // Async readback confirms non-black pixels on frame 3 at t=4200ms without incrementing presentCount.
+  assert.equal(swapchain.confirmVisibleFrame({ timestampMs: 4200, realPackDraws: 5 }), true);
+  assert.equal(swapchain.presentCount, 3);
+  assert.equal(swapchain.hasVisibleContent, true);
+  assert.equal(swapchain.visiblePresentsTotal, 1);
+  assert.equal(swapchain.blackPresentsTotal, 2);
+  assert.equal(swapchain.consecutiveBlackPresents, 0);
+  assert.equal(swapchain.firstVisiblePresentIndex, 3);
+  assert.equal(swapchain.firstVisiblePresentMs, 4200);
+  assert.equal(fired.length, 1);
+  assert.equal(fired[0].firstVisiblePresentIndex, 3);
+  assert.equal(fired[0].firstVisiblePresentMs, 4200);
+  assert.equal(fired[0].realPackDraws, 5);
+
+  // Repeated confirmation is a safe one-shot no-op.
+  assert.equal(swapchain.confirmVisibleFrame({ timestampMs: 9999, realPackDraws: 1 }), false);
+  assert.equal(swapchain.presentCount, 3);
+  assert.equal(swapchain.firstVisiblePresentMs, 4200);
+  assert.equal(fired.length, 1);
+  swapchain.destroy();
+});
