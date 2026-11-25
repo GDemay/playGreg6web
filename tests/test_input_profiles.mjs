@@ -11,10 +11,14 @@ import {
 import {
   RESPONSE_CURVES,
   PROFILE_LIMITS,
+  PROFILE_ALLOWED_FIELDS,
   PROFILE_SCHEMA_VERSION,
   DEFAULT_STORAGE_KEY,
   applyResponseCurve,
   transformStickAxes,
+  exportProfileJson,
+  importProfileJson,
+  detectBindingConflicts,
   BUILTIN_PROFILES,
   InputProfileManager,
 } from '../web/input/input_profiles.js';
@@ -491,4 +495,420 @@ test('save, load, exportJson, and importJson persist state and strictly validate
   const noStorageMgr = new InputProfileManager({ storage: null });
   assert.equal(noStorageMgr.save(), false);
   assert.equal(noStorageMgr.load(), false);
+});
+
+test('exportProfileJson and importProfileJson round-trip deterministically and enforce strict allowlisted schema', () => {
+  const manager = new InputProfileManager({ storage: null });
+  const cleanCustom = manager.createProfile({
+    id: 'tourney-v1',
+    name: 'Tournament Clean',
+    keyBindings: {
+      KeyD: INPUT_BUTTONS.MOVE_RIGHT,
+      KeyA: INPUT_BUTTONS.MOVE_LEFT,
+      KeyS: INPUT_BUTTONS.MOVE_BACKWARD,
+      KeyW: INPUT_BUTTONS.MOVE_FORWARD,
+      Space: INPUT_BUTTONS.JUMP,
+      KeyR: INPUT_BUTTONS.X,
+    },
+    mouseSensitivityX: 2.0,
+    mouseSensitivityY: 1.5,
+    invertLookY: false,
+    leftStickDeadzone: 0.1,
+    rightStickDeadzone: 0.08,
+    triggerDeadzone: 0.05,
+    stickCurve: RESPONSE_CURVES.CUBIC,
+    swapSticks: false,
+    swapTriggersAndBumpers: true,
+  });
+
+  // Manager and standalone exports produce identical deterministic JSON with sorted keyBindings keys
+  const exportedViaMgr = manager.exportProfileJson('tourney-v1');
+  const exportedStandalone = exportProfileJson(cleanCustom);
+  assert.equal(exportedViaMgr, exportedStandalone);
+
+  const parsedEnvelope = JSON.parse(exportedViaMgr);
+  assert.equal(parsedEnvelope.schemaVersion, PROFILE_SCHEMA_VERSION);
+  assert.deepEqual(Object.keys(parsedEnvelope.profile).sort(), [...PROFILE_ALLOWED_FIELDS].sort());
+  assert.deepEqual(Object.keys(parsedEnvelope.profile.keyBindings), [
+    'KeyA',
+    'KeyD',
+    'KeyR',
+    'KeyS',
+    'KeyW',
+    'Space',
+  ]);
+
+  // Standalone importProfileJson accepts envelope format and standalone bare profile JSON
+  const importedStandalone = importProfileJson(exportedViaMgr);
+  assert.deepEqual(importedStandalone, cleanCustom);
+  const importedBare = importProfileJson(JSON.stringify(parsedEnvelope.profile));
+  assert.deepEqual(importedBare, cleanCustom);
+
+  // Manager importProfileJson inserts cleanly, supports allowOverwrite, activate, and rejectConflicts
+  const receiver = new InputProfileManager({ storage: null });
+  const imported = receiver.importProfileJson(exportedViaMgr, {
+    allowOverwrite: false,
+    activate: true,
+    rejectConflicts: true,
+  });
+  assert.deepEqual(imported, cleanCustom);
+  assert.equal(receiver.getActiveProfile().id, 'tourney-v1');
+
+  // allowOverwrite: false rejects duplicate ID without mutating existing profile
+  assert.throws(
+    () => receiver.importProfileJson(exportedViaMgr, { allowOverwrite: false }),
+    RangeError
+  );
+
+  // rejectConflicts: true rejects a profile with duplicate key-to-action bindings (e.g. default preset)
+  const defaultExport = manager.exportProfileJson('default');
+  assert.throws(
+    () => receiver.importProfileJson(defaultExport, { rejectConflicts: true }),
+    /binding conflicts/i
+  );
+  // Default (rejectConflicts: false) allows round-tripping built-in profiles
+  const reimportedDefault = receiver.importProfileJson(defaultExport);
+  assert.equal(reimportedDefault.id, 'default');
+  assert.deepEqual(reimportedDefault.keyBindings, BUILTIN_PROFILES.default.keyBindings);
+
+  // Unknown profileId on exportProfileJson throws RangeError
+  assert.throws(() => manager.exportProfileJson('does-not-exist'), RangeError);
+});
+
+test('importProfileJson rejects prototype pollution, unknown fields, control chars, out-of-range values, oversized payloads, and invalid key codes', () => {
+  const manager = new InputProfileManager({ storage: null });
+  const validProfile = manager.getProfile('fps');
+  const beforeSnapshot = manager.exportJson();
+
+  const wrap = (profile) =>
+    JSON.stringify({ schemaVersion: PROFILE_SCHEMA_VERSION, profile });
+
+  // Build oversized keyBindings map (> MAX_KEY_BINDINGS)
+  const tooManyBindings = {};
+  for (let i = 0; i <= PROFILE_LIMITS.MAX_KEY_BINDINGS; i++) {
+    tooManyBindings[`Key${String(i).padStart(2, '0')}`] = INPUT_BUTTONS.A;
+  }
+
+  const invalidCases = [
+    // Non-string / malformed / wrong root
+    [null, TypeError],
+    [12345, TypeError],
+    ['{not valid json', SyntaxError],
+    ['[]', TypeError],
+    ['"string"', TypeError],
+    // Envelope schemaVersion & unknown fields
+    [JSON.stringify({ schemaVersion: 99, profile: validProfile }), RangeError],
+    [JSON.stringify({ profile: validProfile }), RangeError],
+    [JSON.stringify({ schemaVersion: 1, profile: validProfile, extra: true }), RangeError],
+    [wrap({ ...validProfile, unexpectedField: 'nope' }), RangeError],
+    // Prototype-pollution keys at root, profile, keyBindings, and id
+    ['{"schemaVersion":1,"__proto__":{"polluted":true},"profile":' + JSON.stringify(validProfile) + '}', RangeError],
+    ['{"schemaVersion":1,"constructor":{"polluted":true},"profile":' + JSON.stringify(validProfile) + '}', RangeError],
+    ['{"schemaVersion":1,"prototype":{"polluted":true},"profile":' + JSON.stringify(validProfile) + '}', RangeError],
+    ['{"schemaVersion":1,"profile":{"__proto__":{"polluted":true},' + JSON.stringify(validProfile).slice(1) + '}', RangeError],
+    ['{"schemaVersion":1,"profile":' + JSON.stringify({ ...validProfile, keyBindings: {} }).replace('{}', '{"__proto__":1}') + '}', RangeError],
+    ['{"schemaVersion":1,"profile":' + JSON.stringify({ ...validProfile, keyBindings: {} }).replace('{}', '{"constructor":1}') + '}', RangeError],
+    ['{"schemaVersion":1,"profile":' + JSON.stringify({ ...validProfile, keyBindings: {} }).replace('{}', '{"prototype":1}') + '}', RangeError],
+    [wrap({ ...validProfile, id: '__proto__' }), RangeError],
+    [wrap({ ...validProfile, id: 'constructor' }), RangeError],
+    [wrap({ ...validProfile, id: 'prototype' }), RangeError],
+    // Control characters in id, name, and keyBindings keys
+    [wrap({ ...validProfile, id: 'bad\nid' }), RangeError],
+    [wrap({ ...validProfile, id: 'bad\u0000id' }), RangeError],
+    [wrap({ ...validProfile, name: 'Bad\tName' }), RangeError],
+    [wrap({ ...validProfile, name: 'Bad\u001bName' }), RangeError],
+    [wrap({ ...validProfile, name: 'Bad\u007fName' }), RangeError],
+    [wrap({ ...validProfile, name: 'Bad\u0085Name' }), RangeError],
+    [wrap({ ...validProfile, keyBindings: { 'KeyW\n': INPUT_BUTTONS.MOVE_FORWARD } }), RangeError],
+    // Bounded lengths & entry counts
+    [wrap({ ...validProfile, id: 'a'.repeat(PROFILE_LIMITS.MAX_ID_LENGTH + 1) }), RangeError],
+    [wrap({ ...validProfile, name: 'N'.repeat(PROFILE_LIMITS.MAX_NAME_LENGTH + 1) }), RangeError],
+    [wrap({ ...validProfile, keyBindings: { ['K' + 'a'.repeat(PROFILE_LIMITS.MAX_KEY_CODE_LENGTH)]: INPUT_BUTTONS.A } }), RangeError],
+    [wrap({ ...validProfile, keyBindings: tooManyBindings }), RangeError],
+    [' '.repeat(PROFILE_LIMITS.MAX_JSON_BYTES + 1), RangeError],
+    // Invalid profile ID format
+    [wrap({ ...validProfile, id: 'has space' }), RangeError],
+    [wrap({ ...validProfile, id: '../escape' }), RangeError],
+    // Strict finite sensitivity / deadzone ranges (no silent clamping in importProfileJson)
+    [wrap({ ...validProfile, mouseSensitivityX: PROFILE_LIMITS.MIN_SENSITIVITY - 0.01 }), RangeError],
+    [wrap({ ...validProfile, mouseSensitivityX: PROFILE_LIMITS.MAX_SENSITIVITY + 0.01 }), RangeError],
+    [wrap({ ...validProfile, mouseSensitivityY: 0 }), RangeError],
+    [wrap({ ...validProfile, leftStickDeadzone: -0.01 }), RangeError],
+    [wrap({ ...validProfile, rightStickDeadzone: PROFILE_LIMITS.MAX_DEADZONE + 0.05 }), RangeError],
+    [wrap({ ...validProfile, triggerDeadzone: 1.0 }), RangeError],
+    [wrap({ ...validProfile, mouseSensitivityX: null }), TypeError],
+    [wrap({ ...validProfile, triggerDeadzone: '0.1' }), TypeError],
+    // Invalid key codes & bitmasks
+    [wrap({ ...validProfile, keyBindings: { keyW: INPUT_BUTTONS.MOVE_FORWARD } }), RangeError],
+    [wrap({ ...validProfile, keyBindings: { W: INPUT_BUTTONS.MOVE_FORWARD } }), RangeError],
+    [wrap({ ...validProfile, keyBindings: { 'Key W': INPUT_BUTTONS.MOVE_FORWARD } }), RangeError],
+    [wrap({ ...validProfile, keyBindings: { 'Key-W': INPUT_BUTTONS.MOVE_FORWARD } }), RangeError],
+    [wrap({ ...validProfile, keyBindings: { '123Key': INPUT_BUTTONS.MOVE_FORWARD } }), RangeError],
+    [wrap({ ...validProfile, keyBindings: { KeyW: -1 } }), RangeError],
+    [wrap({ ...validProfile, keyBindings: { KeyW: 1.5 } }), RangeError],
+    [wrap({ ...validProfile, keyBindings: { KeyW: 1 << 6 } }), RangeError],  // gap bit
+    [wrap({ ...validProfile, keyBindings: { KeyW: 1 << 30 } }), RangeError], // unknown bit
+  ];
+
+  for (const [payload, expectedError] of invalidCases) {
+    assert.throws(
+      () => manager.importProfileJson(payload),
+      expectedError,
+      `Expected ${expectedError.name} for payload: ${String(payload).slice(0, 120)}`
+    );
+  }
+
+  // Zero prototype pollution and zero state mutation after all rejected payloads
+  assert.equal(({}).polluted, undefined);
+  assert.equal(Object.prototype.polluted, undefined);
+  assert.equal(manager.exportJson(), beforeSnapshot);
+
+  // Existing importJson also rejects prototype-pollution keys and unknown root fields
+  assert.throws(
+    () => manager.importJson('{"schemaVersion":1,"activeProfileId":"default","__proto__":{"polluted":true},"profiles":[' + JSON.stringify(validProfile) + ']}'),
+    RangeError
+  );
+  assert.throws(
+    () => manager.importJson(JSON.stringify({ schemaVersion: 1, activeProfileId: 'default', extraRoot: 1, profiles: [validProfile] })),
+    RangeError
+  );
+  assert.equal(({}).polluted, undefined);
+  assert.equal(manager.exportJson(), beforeSnapshot);
+});
+
+test('detectBindingConflicts returns deterministic duplicate key-to-action conflicts and optional multi-action keys', () => {
+  const manager = new InputProfileManager({ storage: null });
+
+  // Clean 1-to-1 profile has zero conflicts
+  const cleanProfile = {
+    id: 'clean',
+    name: 'Clean',
+    keyBindings: {
+      KeyW: INPUT_BUTTONS.MOVE_FORWARD,
+      KeyS: INPUT_BUTTONS.MOVE_BACKWARD,
+      KeyA: INPUT_BUTTONS.MOVE_LEFT,
+      KeyD: INPUT_BUTTONS.MOVE_RIGHT,
+      Space: INPUT_BUTTONS.JUMP,
+      KeyR: INPUT_BUTTONS.X,
+    },
+  };
+  assert.deepEqual(detectBindingConflicts(cleanProfile), []);
+  assert.deepEqual(manager.detectBindingConflicts(cleanProfile), []);
+
+  // Deterministic ordering regardless of key insertion order
+  const dupOrderA = {
+    keyBindings: {
+      KeyT: INPUT_BUTTONS.X,
+      KeyR: INPUT_BUTTONS.X,
+      KeyI: INPUT_BUTTONS.MOVE_FORWARD,
+      KeyW: INPUT_BUTTONS.MOVE_FORWARD,
+    },
+  };
+  const dupOrderB = {
+    keyBindings: {
+      KeyW: INPUT_BUTTONS.MOVE_FORWARD,
+      KeyR: INPUT_BUTTONS.X,
+      KeyI: INPUT_BUTTONS.MOVE_FORWARD,
+      KeyT: INPUT_BUTTONS.X,
+    },
+  };
+  const expectedDups = [
+    {
+      type: 'duplicate-action',
+      action: 'MOVE_FORWARD',
+      mask: INPUT_BUTTONS.MOVE_FORWARD,
+      keys: ['KeyI', 'KeyW'],
+    },
+    {
+      type: 'duplicate-action',
+      action: 'X',
+      mask: INPUT_BUTTONS.X,
+      keys: ['KeyR', 'KeyT'],
+    },
+  ];
+  assert.deepEqual(detectBindingConflicts(dupOrderA), expectedDups);
+  assert.deepEqual(detectBindingConflicts(dupOrderB), expectedDups);
+
+  // Built-in default preset conflicts match DEFAULT_KEY_BINDINGS aliases deterministically
+  assert.deepEqual(manager.detectBindingConflicts('default'), [
+    {
+      type: 'duplicate-action',
+      action: 'A',
+      mask: INPUT_BUTTONS.A,
+      keys: ['Enter', 'NumpadEnter', 'Space'],
+    },
+    {
+      type: 'duplicate-action',
+      action: 'B',
+      mask: INPUT_BUTTONS.B,
+      keys: ['Backspace', 'ControlLeft', 'ControlRight', 'Escape'],
+    },
+    {
+      type: 'duplicate-action',
+      action: 'LS',
+      mask: INPUT_BUTTONS.LS,
+      keys: ['ShiftLeft', 'ShiftRight'],
+    },
+    {
+      type: 'duplicate-action',
+      action: 'SPRINT',
+      mask: INPUT_BUTTONS.SPRINT,
+      keys: ['ShiftLeft', 'ShiftRight'],
+    },
+  ]);
+
+  // Built-in lefty-kb preset duplicate conflicts + optional includeMultiActionKeys
+  assert.deepEqual(manager.detectBindingConflicts('lefty-kb'), [
+    {
+      type: 'duplicate-action',
+      action: 'LS',
+      mask: INPUT_BUTTONS.LS,
+      keys: ['ShiftLeft', 'ShiftRight'],
+    },
+    {
+      type: 'duplicate-action',
+      action: 'SPRINT',
+      mask: INPUT_BUTTONS.SPRINT,
+      keys: ['ShiftLeft', 'ShiftRight'],
+    },
+  ]);
+
+  const withMultiAction = manager.detectBindingConflicts('lefty-kb', {
+    includeMultiActionKeys: true,
+  });
+  assert.deepEqual(
+    withMultiAction.filter((c) => c.type === 'multi-action-key'),
+    [
+      {
+        type: 'multi-action-key',
+        key: 'ShiftLeft',
+        mask: INPUT_BUTTONS.SPRINT | INPUT_BUTTONS.LS,
+        actions: ['LS', 'SPRINT'],
+      },
+      {
+        type: 'multi-action-key',
+        key: 'ShiftRight',
+        mask: INPUT_BUTTONS.SPRINT | INPUT_BUTTONS.LS,
+        actions: ['LS', 'SPRINT'],
+      },
+      {
+        type: 'multi-action-key',
+        key: 'Space',
+        mask: INPUT_BUTTONS.JUMP | INPUT_BUTTONS.A,
+        actions: ['A', 'JUMP'],
+      },
+    ]
+  );
+
+  // Default argument inspects active profile
+  manager.setActiveProfile('lefty-kb');
+  assert.deepEqual(manager.detectBindingConflicts(), manager.detectBindingConflicts('lefty-kb'));
+
+  // Invalid inputs throw cleanly
+  assert.throws(() => manager.detectBindingConflicts('unknown-id'), RangeError);
+  assert.throws(() => manager.detectBindingConflicts(42), TypeError);
+  assert.throws(() => detectBindingConflicts({ keyBindings: { 'bad key': INPUT_BUTTONS.A } }), RangeError);
+});
+
+test('safe fallback reset recovers cleanly from corrupted storage, throwing storage, and custom profile resets', () => {
+  // 1. resetToDefaults restores all built-ins, drops custom profiles, sets active to 'default'
+  const storage = new MemoryStorage();
+  const manager = new InputProfileManager({ storage });
+  manager.rebindKey('default', 'KeyT', 'X');
+  manager.createProfile({
+    ...BUILTIN_PROFILES.fps,
+    id: 'custom-broken',
+    name: 'Custom Broken',
+    mouseSensitivityX: 5.5,
+    invertLookY: true,
+  });
+  manager.setActiveProfile('custom-broken');
+
+  // Backwards compatibility: resetProfile on custom profile without fallbackToDefault still throws
+  assert.throws(() => manager.resetProfile('custom-broken'), RangeError);
+
+  // Safe fallback reset on a custom profile restores default bindings/tuning while keeping id/name
+  const resetCustom = manager.resetProfile('custom-broken', { fallbackToDefault: true });
+  assert.equal(resetCustom.id, 'custom-broken');
+  assert.equal(resetCustom.name, 'Custom Broken');
+  assert.equal(resetCustom.mouseSensitivityX, BUILTIN_PROFILES.default.mouseSensitivityX);
+  assert.equal(resetCustom.invertLookY, false);
+  assert.deepEqual(resetCustom.keyBindings, BUILTIN_PROFILES.default.keyBindings);
+
+  // Safe fallback reset on a missing profile ID falls back to built-in default
+  const fallbackUnknown = manager.resetProfile('nonexistent', { fallbackToDefault: true });
+  assert.equal(fallbackUnknown.id, 'default');
+  assert.equal(manager.getActiveProfile().id, 'default');
+  assert.deepEqual(fallbackUnknown.keyBindings, BUILTIN_PROFILES.default.keyBindings);
+
+  // Full resetToDefaults drops custom profiles and persists clean defaults
+  manager.setActiveProfile('custom-broken');
+  const defaults = manager.resetToDefaults({ persist: true });
+  assert.equal(defaults.id, 'default');
+  assert.equal(manager.getActiveProfile().id, 'default');
+  assert.equal(manager.getProfile('custom-broken'), null);
+  assert.equal(manager.listProfiles().length, Object.keys(BUILTIN_PROFILES).length);
+  assert.ok(storage.getItem(DEFAULT_STORAGE_KEY));
+
+  // 2. resetToDefaults({ persist: true }) never throws even if storage.setItem throws QuotaExceededError
+  const failingWriteStorage = {
+    getItem: () => null,
+    setItem: () => {
+      throw new Error('QuotaExceededError');
+    },
+  };
+  const resilientMgr = new InputProfileManager({ storage: failingWriteStorage });
+  resilientMgr.setActiveProfile('fps');
+  const recovered = resilientMgr.resetToDefaults({ persist: true });
+  assert.equal(recovered.id, 'default');
+  assert.equal(resilientMgr.getActiveProfile().id, 'default');
+
+  // 3. load({ fallbackToDefault: true, persistFallback: true }) recovers from corrupt / polluted localStorage
+  const corruptPayloads = [
+    '{corrupt json',
+    '{"schemaVersion":1,"activeProfileId":"default","__proto__":{"polluted":true},"profiles":[]}',
+    JSON.stringify({ schemaVersion: 999, activeProfileId: 'default', profiles: [BUILTIN_PROFILES.default] }),
+  ];
+
+  for (const corrupt of corruptPayloads) {
+    const corruptStorage = new MemoryStorage();
+    corruptStorage.setItem(DEFAULT_STORAGE_KEY, corrupt);
+
+    // Backwards-compatible default load() still throws on corrupt data
+    const strictLoader = new InputProfileManager({ storage: corruptStorage });
+    assert.throws(() => strictLoader.load());
+
+    // Safe fallback load() recovers cleanly to defaults and repairs persisted storage
+    const safeLoader = new InputProfileManager({ storage: corruptStorage });
+    safeLoader.setActiveProfile('fps');
+    assert.equal(
+      safeLoader.load({ fallbackToDefault: true, persistFallback: true }),
+      false
+    );
+    assert.equal(safeLoader.getActiveProfile().id, 'default');
+    assert.deepEqual(safeLoader.getActiveProfile().keyBindings, DEFAULT_KEY_BINDINGS);
+
+    // Repaired storage now loads cleanly on a fresh manager
+    const repairedReader = new InputProfileManager({ storage: corruptStorage });
+    assert.equal(repairedReader.load(), true);
+    assert.equal(repairedReader.getActiveProfile().id, 'default');
+  }
+
+  // 4. Constructor autoLoad + fallbackToDefault recovers from throwing storage.getItem
+  const throwingReadStorage = {
+    getItem: () => {
+      throw new Error('SecurityError');
+    },
+    setItem: () => {
+      throw new Error('SecurityError');
+    },
+  };
+  const autoRecovered = new InputProfileManager({
+    storage: throwingReadStorage,
+    autoLoad: true,
+    fallbackToDefault: true,
+    persistFallback: true,
+  });
+  assert.equal(autoRecovered.getActiveProfile().id, 'default');
+  assert.equal(autoRecovered.listProfiles().length, Object.keys(BUILTIN_PROFILES).length);
 });
