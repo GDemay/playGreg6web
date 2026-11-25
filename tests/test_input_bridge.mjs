@@ -1506,6 +1506,7 @@ test('W174 INPUT_SCRIPT_PRESETS and INPUT_SCRIPT_PRESET_NAMES expose frozen buil
     'intro-watch',
     'legal-notices',
     'chrome-menu-flow',
+    'chrome-full-boot',
   ]);
   assert.deepEqual(Object.keys(INPUT_SCRIPT_PRESETS), [...INPUT_SCRIPT_PRESET_NAMES]);
 
@@ -2208,6 +2209,184 @@ test('W199 InputBridge drives legal-notices and chrome-menu-flow into SAB and fo
   assert.equal(stats.activePreset, null);
   assert.equal(stats.preset, 'chrome-menu-flow');
   assert.equal(stats.scriptedPressesSent, 26);
+  assert.equal(stats.lastScriptedButton, 'A');
+
+  bridge.destroy();
+});
+
+test('W229 chrome-full-boot preset plays full 4K Bink2 intro unskipped, presses A 235s..295s, loops DPAD_DOWN -> DPAD_DOWN -> A x3 from 298s, and zero B/DPAD_UP', () => {
+  assert.ok(INPUT_SCRIPT_PRESET_NAMES.includes('chrome-full-boot'));
+  const spec = INPUT_SCRIPT_PRESETS['chrome-full-boot'];
+  assert.ok(spec);
+  assert.equal(spec.name, 'chrome-full-boot');
+  assert.equal(spec.events.length, 25); // 235000..295000 inclusive step 2500
+  assert.equal(spec.events[0].atMs, 235000);
+  assert.equal(spec.events[spec.events.length - 1].atMs, 295000);
+  assert.equal(spec.loop.startMs, 298000);
+  assert.equal(spec.loop.periodMs, 12000);
+  assert.equal(spec.loop.events.length, 5);
+
+  const player = new ScriptedInputPlayer('chrome-full-boot');
+  assert.equal(player.preset, 'chrome-full-boot');
+
+  // Zero button presses before 235000 ms so the 4K Bink2 intro video & Rockstar logo play unskipped.
+  for (const t of [0, 20000, 64000, 120000, 165000, 218000, 234999]) {
+    assert.deepEqual(player.sampleAt(t), { buttonsMask: 0, activeEventCount: 0 }, `silent at ${t}`);
+    assert.equal(player.pressCountAt(t), 0);
+  }
+
+  // Phase 1: Spaced A every 2500 ms (holdMs: 100) from 235000 ms through 295000 ms (25 presses).
+  let fixedCount = 0;
+  for (let atMs = 235000; atMs <= 295000; atMs += 2500) {
+    fixedCount += 1;
+    assert.equal(player.sampleAt(atMs - 1).buttonsMask, 0, `idle before A at ${atMs}`);
+    assert.equal(player.sampleAt(atMs).buttonsMask, INPUT_BUTTONS.A, `A pressed at ${atMs}`);
+    assert.equal(player.sampleAt(atMs + 99).buttonsMask, INPUT_BUTTONS.A, `A held at ${atMs + 99}`);
+    assert.equal(player.sampleAt(atMs + 100).buttonsMask, 0, `A released at ${atMs + 100}`);
+    assert.equal(player.pressCountAt(atMs), fixedCount);
+  }
+  assert.equal(fixedCount, 25);
+
+  // Quiet transition window (295100..297999 ms) before loop start at 298000 ms.
+  for (let t = 295100; t < 298000; t += 100) {
+    assert.equal(player.sampleAt(t).buttonsMask, 0, `quiet pause at ${t}`);
+  }
+
+  // Phase 2: Loop DPAD_DOWN (+0), DPAD_DOWN (+500), A (+1200), A (+4500), A (+8000) every 12000 ms from 298000 ms.
+  const expectedLoopOffsets = [
+    [0, INPUT_BUTTONS.DPAD_DOWN],
+    [500, INPUT_BUTTONS.DPAD_DOWN],
+    [1200, INPUT_BUTTONS.A],
+    [4500, INPUT_BUTTONS.A],
+    [8000, INPUT_BUTTONS.A],
+  ];
+
+  for (let cycle = 0; cycle < 4; cycle++) {
+    const base = 298000 + cycle * 12000;
+    for (let j = 0; j < expectedLoopOffsets.length; j++) {
+      const [offsetMs, expectedBtn] = expectedLoopOffsets[j];
+      const t = base + offsetMs;
+      assert.equal(player.sampleAt(t - 1).buttonsMask, 0, `cycle ${cycle} idle before +${offsetMs}`);
+      assert.equal(player.sampleAt(t).buttonsMask, expectedBtn, `cycle ${cycle} press at +${offsetMs}`);
+      assert.equal(player.sampleAt(t + 99).buttonsMask, expectedBtn, `cycle ${cycle} hold at +${offsetMs}`);
+      assert.equal(player.sampleAt(t + 100).buttonsMask, 0, `cycle ${cycle} release at +${offsetMs}`);
+      assert.equal(player.pressCountAt(t), fixedCount + cycle * 5 + j + 1);
+    }
+  }
+
+  // Invariant: Zero presses before 235000 ms, and NEVER presses B or DPAD_UP anywhere in 420 seconds; only A or DPAD_DOWN.
+  for (let t = 0; t <= 420000; t += 50) {
+    const mask = player.sampleAt(t).buttonsMask;
+    if (t < 235000) {
+      assert.equal(mask, 0, `chrome-full-boot must emit zero presses before 235000 ms (got ${mask} at t=${t})`);
+    }
+    assert.equal(mask & INPUT_BUTTONS.B, 0, `chrome-full-boot must never press B at t=${t}`);
+    assert.equal(mask & INPUT_BUTTONS.DPAD_UP, 0, `chrome-full-boot must never press DPAD_UP at t=${t}`);
+    assert.ok(
+      mask === 0 || mask === INPUT_BUTTONS.A || mask === INPUT_BUTTONS.DPAD_DOWN,
+      `unexpected button mask ${mask} at t=${t}`
+    );
+  }
+
+  // Exact nextTransitionMs across intro -> Phase 1 -> Phase 2 boundaries.
+  assert.equal(player.nextTransitionMs(0), 235000);
+  assert.equal(player.nextTransitionMs(295000), 295100);
+  assert.equal(player.nextTransitionMs(295100), 298000);
+  assert.equal(player.nextTransitionMs(298000), 298100);
+  assert.equal(player.nextTransitionMs(298100), 298500);
+  assert.equal(player.nextTransitionMs(298600), 299200);
+  assert.equal(player.nextTransitionMs(299300), 302500);
+  assert.equal(player.nextTransitionMs(302600), 306000);
+  assert.equal(player.nextTransitionMs(306100), 310000);
+
+  // maxPresses & endMs caps work cleanly on chrome-full-boot.
+  const capped = new ScriptedInputPlayer({ preset: 'chrome-full-boot', maxPresses: 28 });
+  assert.equal(capped.preset, 'chrome-full-boot');
+  assert.equal(capped.sampleAt(298000).buttonsMask, INPUT_BUTTONS.DPAD_DOWN); // #26
+  assert.equal(capped.sampleAt(298500).buttonsMask, INPUT_BUTTONS.DPAD_DOWN); // #27
+  assert.equal(capped.sampleAt(299200).buttonsMask, INPUT_BUTTONS.A);         // #28
+  assert.equal(capped.sampleAt(302500).buttonsMask, 0);
+  assert.equal(capped.pressCountAt(400000), 28);
+  assert.equal(capped.nextTransitionMs(299300), null);
+
+  const cappedEnd = new ScriptedInputPlayer('chrome-full-boot', { endMs: 299250 });
+  assert.equal(cappedEnd.sampleAt(299200).buttonsMask, INPUT_BUTTONS.A);
+  assert.equal(cappedEnd.sampleAt(299249).buttonsMask, INPUT_BUTTONS.A);
+  assert.equal(cappedEnd.sampleAt(299250).buttonsMask, 0);
+  assert.equal(cappedEnd.nextTransitionMs(299200), 299250);
+  assert.equal(cappedEnd.nextTransitionMs(299250), null);
+});
+
+test('W229 InputBridge drives chrome-full-boot into SAB and formats HUD telemetry cleanly', () => {
+  const env = createMockEnv();
+  const clock = createFakeClockAndTimers(0);
+  const bridge = new InputBridge(env.canvas, {
+    windowObj: env.win,
+    documentObj: env.doc,
+    navigatorObj: env.nav,
+  });
+
+  assert.ok(bridge.getStats().availablePresets.includes('chrome-full-boot'));
+
+  bridge.startScript('chrome-full-boot', {
+    nowFn: clock.nowFn,
+    setTimeoutFn: clock.setTimeoutFn,
+    clearTimeoutFn: clock.clearTimeoutFn,
+  });
+
+  let stats = bridge.getStats();
+  assert.equal(stats.scriptActive, true);
+  assert.equal(stats.activePreset, 'chrome-full-boot');
+  assert.equal(stats.scriptedPressesSent, 0);
+  assert.equal(stats.lastScriptedButton, null);
+  assert.equal(stats.elapsedScriptMs, 0);
+  assert.equal(bridge.getSnapshot().buttons, 0);
+
+  // Silent throughout the entire 4K Bink2 intro & Rockstar logo (0..234999 ms).
+  clock.advanceBy(234999);
+  assert.equal(bridge.getSnapshot().buttons, 0);
+  assert.equal(bridge.getStats().scriptedPressesSent, 0);
+
+  // First A press at 235000 ms.
+  clock.advanceBy(1);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  assert.equal(bridge.getStats().scriptedPressesSent, 1);
+  assert.equal(bridge.getStats().lastScriptedButton, 'A');
+
+  // Advance to loop start (298000 ms -> 25 fixed A + 1st DPAD_DOWN = 26 presses).
+  clock.advanceBy(63000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.DPAD_DOWN);
+  stats = bridge.getStats();
+  assert.equal(stats.scriptedPressesSent, 26);
+  assert.equal(stats.lastScriptedButton, 'DPAD_DOWN');
+
+  // 2nd DPAD_DOWN at 298500 ms -> 27 presses.
+  clock.advanceBy(500);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.DPAD_DOWN);
+  assert.equal(bridge.getStats().scriptedPressesSent, 27);
+
+  // A at 299200 ms -> 28 presses; A at 302500 ms -> 29 presses; A at 306000 ms -> 30 presses.
+  clock.advanceBy(700);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  assert.equal(bridge.getStats().scriptedPressesSent, 28);
+  assert.equal(bridge.getStats().lastScriptedButton, 'A');
+
+  clock.advanceBy(3300);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  assert.equal(bridge.getStats().scriptedPressesSent, 29);
+
+  clock.advanceBy(3500);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  assert.equal(bridge.getStats().scriptedPressesSent, 30);
+
+  // Stopping clears activePreset & SAB buttons while preserving telemetry counters.
+  bridge.stopScript();
+  assert.equal(bridge.getSnapshot().buttons, 0);
+  stats = bridge.getStatus();
+  assert.equal(stats.scriptActive, false);
+  assert.equal(stats.activePreset, null);
+  assert.equal(stats.preset, 'chrome-full-boot');
+  assert.equal(stats.scriptedPressesSent, 30);
   assert.equal(stats.lastScriptedButton, 'A');
 
   bridge.destroy();
