@@ -124,6 +124,8 @@ public:
     virtual bool acquire(uint32_t thread_id) = 0;
 
     void wake_waiters_locked() {
+        // Lets a spinning waiter (see wait_for_objects) notice a state change without the lock.
+        signal_seq.fetch_add(1, std::memory_order_release);
         for (WaitBlock* block : waiters) {
             block->cv.notify_one();
         }
@@ -131,6 +133,7 @@ public:
 
     const Type type;
     std::vector<WaitBlock*> waiters;
+    std::atomic<uint32_t> signal_seq{0};
 };
 
 namespace {
@@ -371,6 +374,9 @@ bool try_satisfy_locked(ObjectArray& objects,
     return true;
 }
 
+// Upper bound of the spin phase before a blocking wait parks the thread.
+constexpr auto kWaitSpinWindow = std::chrono::microseconds(20);
+
 uint32_t wait_for_objects(uint32_t count,
                           const Handle* handles,
                           bool wait_all,
@@ -408,6 +414,7 @@ uint32_t wait_for_objects(uint32_t count,
 
     WaitBlock block;
     bool registered = false;
+    bool spun = timeout_ms == 0;  // a poll never spins
     uint32_t result = WAIT_TIMEOUT;
     {
         std::unique_lock<std::mutex> lock(dispatcher_mutex());
@@ -415,6 +422,33 @@ uint32_t wait_for_objects(uint32_t count,
             if (!infinite && Clock::now() >= deadline) {
                 result = WAIT_TIMEOUT;
                 break;
+            }
+            if (!spun) {
+                // Short bounded spin before parking: producer/consumer pairs (render thread, Bink
+                // workers) usually signal within microseconds, and a futex sleep + wake costs far
+                // more. Only a wake_waiters_locked() on one of the objects ends the spin early;
+                // the state is then re-checked under the lock, so no wait is ever skipped.
+                spun = true;
+                std::array<uint32_t, MAXIMUM_WAIT_OBJECTS> seen{};
+                for (uint32_t i = 0; i < count; ++i) {
+                    seen[i] = objects[i]->signal_seq.load(std::memory_order_acquire);
+                }
+                lock.unlock();
+                const Clock::time_point spin_end = Clock::now() + kWaitSpinWindow;
+                bool changed = false;
+                for (uint32_t iter = 1; !changed; ++iter) {
+                    for (uint32_t i = 0; i < count && !changed; ++i) {
+                        changed = objects[i]->signal_seq.load(std::memory_order_acquire) != seen[i];
+                    }
+                    if ((iter & 31u) == 0 && Clock::now() >= spin_end) {
+                        break;
+                    }
+                    if ((iter & 7u) == 0) {
+                        std::this_thread::yield();
+                    }
+                }
+                lock.lock();
+                continue;
             }
             if (!registered) {
                 for (uint32_t i = 0; i < count; ++i) {
