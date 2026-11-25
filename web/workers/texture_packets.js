@@ -1,12 +1,18 @@
 // GPU packet ABI v1/v2 texture handling for WgpuCommandProcessor:
 // - ABI v2 CreateTexture2 (opcode 35, 40-byte payload, docs/gpu_commands.md "CreateTexture2")
-//   with safe mipLevels and sampleCount clamping alongside ABI v1 CreateTexture (opcode 12).
+//   with safe mipLevels and sampleCount clamping alongside ABI v1 CreateTexture (opcode 12),
+//   automatically attaching compatible sRGB/linear sibling `viewFormats` (`rgba8unorm`,
+//   `bgra8unorm`, `bc1..bc7`).
+// - Zero-copy direct `queue.writeTexture` fast path when source row pitch is already 256-byte
+//   aligned (e.g., 4K Bink2 `3840x2160` `r8unorm` Y plane).
 // - WebGPU 256-byte bytesPerRow alignment & row-pitch repacking helpers (`alignBytesPerRow256`,
-//   `repackRowsTo256`) applied on buffer-to-texture copies (`copyBufferToTexture` / staged
-//   `WriteTexture`) so unaligned row strides never fail WebGPU validation.
+//   `repackRowsTo256`) backed by a bounded persistent per-handler scratch `Uint8Array` (e.g.,
+//   reused across 4K Bink2 `1920x1080` `r8unorm` Cr/Cb planes where `1920 -> 2048`).
 // - Safe `SharedArrayBuffer`-backed view copying before `queue.writeTexture` /
 //   `copyBufferToTexture`.
-// - Sanitized telemetry counters (`createTexture2Count`, `rowPitchRepackCount`, `sabCopyCount`).
+// - Sanitized telemetry counters (`createTexture2Count`, `rowPitchRepackCount`, `sabCopyCount`,
+//   `directZeroCopyUploads`, `repackedUploads`, `scratchBufferReuses`, `r8unormUploads`,
+//   `bytesUploaded`, `srgbSiblingViewFormatsAdded`).
 //
 // Install with installTexturePackets(processor) after the v2 handler (render_state_packets.js):
 // it chains in front of processor.extension and forwards every other opcode to it.
@@ -22,7 +28,24 @@
   const CREATE_TEXTURE2_BYTES = 40;
   const MAX_VIEW_FORMATS = 8;
   const WEBGPU_BYTES_PER_ROW_ALIGNMENT = 256;
+  const DEFAULT_MAX_SCRATCH_BYTES = 16 * 1024 * 1024; // 16 MiB cap for persistent row-repack / SAB scratch
   const GPU_BUFFER_USAGE_COPY_SRC_DST = 0x0004 | 0x0008;
+
+  // Compatible WebGPU sRGB <-> linear viewFormat sibling pairs.
+  const SRGB_SIBLING_FORMATS = Object.freeze({
+    rgba8unorm: 'rgba8unorm-srgb',
+    'rgba8unorm-srgb': 'rgba8unorm',
+    bgra8unorm: 'bgra8unorm-srgb',
+    'bgra8unorm-srgb': 'bgra8unorm',
+    'bc1-rgba-unorm': 'bc1-rgba-unorm-srgb',
+    'bc1-rgba-unorm-srgb': 'bc1-rgba-unorm',
+    'bc2-rgba-unorm': 'bc2-rgba-unorm-srgb',
+    'bc2-rgba-unorm-srgb': 'bc2-rgba-unorm',
+    'bc3-rgba-unorm': 'bc3-rgba-unorm-srgb',
+    'bc3-rgba-unorm-srgb': 'bc3-rgba-unorm',
+    'bc7-rgba-unorm': 'bc7-rgba-unorm-srgb',
+    'bc7-rgba-unorm-srgb': 'bc7-rgba-unorm',
+  });
 
   // v1 GpuTextureFormat enum names (runtime/abi/playgta6_abi.h).
   const V1_TEXTURE_FORMAT_NAMES = Object.freeze([
@@ -54,9 +77,79 @@
 
   const HOOK_ORIG_CREATE_TEXTURE = '__playgta6OrigHandleCreateTexture';
   const HOOK_ORIG_WRITE_TEXTURE = '__playgta6OrigHandleWriteTexture';
+  const HOOK_ORIG_DESTROY = '__playgta6OrigTexturePacketsDestroy';
 
   function isBcCompressedFormat(format) {
     return typeof format === 'string' && format.startsWith('bc');
+  }
+
+  /**
+   * Return the WebGPU-compatible sRGB <-> linear sibling format for `format`
+   * (`rgba8unorm`, `bgra8unorm`, `bc1/bc2/bc3/bc7` unorm <-> `-srgb`), or `null`
+   * if `format` has no sRGB sibling.
+   *
+   * @param {string} format
+   * @returns {string | null}
+   */
+  function getSrgbSiblingFormat(format) {
+    if (typeof format !== 'string') {
+      return null;
+    }
+    const normalized = format.trim().toLowerCase();
+    if (Object.prototype.hasOwnProperty.call(SRGB_SIBLING_FORMATS, normalized)) {
+      return SRGB_SIBLING_FORMATS[normalized];
+    }
+    return null;
+  }
+
+  /**
+   * Build a deduplicated, WebGPU-valid `viewFormats` array for a texture of `format`:
+   * - Filters any caller-supplied `requestedViewFormats` down to formats that are
+   *   view-format-compatible with `format` (`format` itself or its sRGB/linear sibling).
+   * - Automatically appends the compatible sRGB/linear sibling when one exists so
+   *   sRGB/linear texture views never fail WebGPU validation.
+   *
+   * @param {string} format
+   * @param {string[] | null | undefined} [requestedViewFormats]
+   * @returns {{ viewFormats: string[] | undefined, siblingAdded: boolean }}
+   */
+  function resolveCompatibleViewFormats(format, requestedViewFormats) {
+    if (typeof format !== 'string' || !format) {
+      return { viewFormats: undefined, siblingAdded: false };
+    }
+    const baseFormat = format.trim().toLowerCase();
+    const sibling = getSrgbSiblingFormat(baseFormat);
+    const out = [];
+    const seen = new Set();
+
+    if (Array.isArray(requestedViewFormats)) {
+      for (let i = 0; i < requestedViewFormats.length; i += 1) {
+        const raw = requestedViewFormats[i];
+        if (typeof raw !== 'string') {
+          continue;
+        }
+        const vf = raw.trim().toLowerCase();
+        if (!vf || seen.has(vf)) {
+          continue;
+        }
+        if (vf === baseFormat || (sibling !== null && vf === sibling)) {
+          seen.add(vf);
+          out.push(vf);
+        }
+      }
+    }
+
+    let siblingAdded = false;
+    if (sibling !== null && !seen.has(sibling)) {
+      seen.add(sibling);
+      out.push(sibling);
+      siblingAdded = true;
+    }
+
+    return {
+      viewFormats: out.length > 0 ? out : undefined,
+      siblingAdded,
+    };
   }
 
   function deviceSupportsBcSliced3d(device) {
@@ -193,10 +286,16 @@
    * When `bytesPerRow` is already a multiple of 256 and `srcBytes` is not backed
    * by a `SharedArrayBuffer`, returns a zero-copy view with `repacked: false`.
    *
+   * When an optional non-shared `scratchBuffer` (`Uint8Array`) of sufficient
+   * `byteLength` is provided and copying/repacking is required, writes into
+   * `scratchBuffer.subarray(0, totalBytes)` instead of allocating a new buffer
+   * and zeroes each row's trailing padding bytes.
+   *
    * @param {Uint8Array | ArrayBufferView | ArrayBuffer | SharedArrayBuffer} srcBytes
    * @param {number} bytesPerRow
    * @param {number} rowCount
    * @param {number} [depthOrLayers=1]
+   * @param {Uint8Array | null} [scratchBuffer=null]
    * @returns {{
    *   data: Uint8Array,
    *   bytesPerRow: number,
@@ -204,9 +303,16 @@
    *   rowCount: number,
    *   repacked: boolean,
    *   copiedFromSab: boolean,
+   *   reusedScratch: boolean,
    * }}
    */
-  function repackRowsTo256(srcBytes, bytesPerRow, rowCount, depthOrLayers = 1) {
+  function repackRowsTo256(
+    srcBytes,
+    bytesPerRow,
+    rowCount,
+    depthOrLayers = 1,
+    scratchBuffer = null
+  ) {
     const src = toUint8Array(srcBytes, 'repackRowsTo256');
     if (!Number.isInteger(bytesPerRow) || bytesPerRow < 1) {
       throw new RangeError(`repackRowsTo256: bytesPerRow must be a positive integer, got ${bytesPerRow}`);
@@ -232,6 +338,7 @@
         rowCount: 0,
         repacked: false,
         copiedFromSab: false,
+        reusedScratch: false,
       };
     }
 
@@ -245,7 +352,13 @@
     if (alignedBytesPerRow === bytesPerRow) {
       const slice = src.byteLength === requiredSrcBytes ? src : src.subarray(0, requiredSrcBytes);
       if (fromSab) {
-        const copy = new Uint8Array(requiredSrcBytes);
+        const canReuseScratch =
+          scratchBuffer instanceof Uint8Array &&
+          !isSharedBuffer(scratchBuffer.buffer) &&
+          scratchBuffer.byteLength >= requiredSrcBytes;
+        const copy = canReuseScratch
+          ? scratchBuffer.subarray(0, requiredSrcBytes)
+          : new Uint8Array(requiredSrcBytes);
         copy.set(slice, 0);
         return {
           data: copy,
@@ -254,6 +367,7 @@
           rowCount: totalRows,
           repacked: false,
           copiedFromSab: true,
+          reusedScratch: canReuseScratch,
         };
       }
       return {
@@ -263,13 +377,26 @@
         rowCount: totalRows,
         repacked: false,
         copiedFromSab: false,
+        reusedScratch: false,
       };
     }
 
-    const dst = new Uint8Array(alignedBytesPerRow * totalRows);
+    const totalDstBytes = alignedBytesPerRow * totalRows;
+    const canReuseScratch =
+      scratchBuffer instanceof Uint8Array &&
+      !isSharedBuffer(scratchBuffer.buffer) &&
+      scratchBuffer.byteLength >= totalDstBytes;
+    const dst = canReuseScratch
+      ? scratchBuffer.subarray(0, totalDstBytes)
+      : new Uint8Array(totalDstBytes);
+
     for (let row = 0; row < totalRows; row += 1) {
       const srcOffset = row * bytesPerRow;
-      dst.set(src.subarray(srcOffset, srcOffset + bytesPerRow), row * alignedBytesPerRow);
+      const dstOffset = row * alignedBytesPerRow;
+      dst.set(src.subarray(srcOffset, srcOffset + bytesPerRow), dstOffset);
+      if (canReuseScratch) {
+        dst.fill(0, dstOffset + bytesPerRow, dstOffset + alignedBytesPerRow);
+      }
     }
 
     return {
@@ -279,6 +406,7 @@
       rowCount: totalRows,
       repacked: true,
       copiedFromSab: fromSab,
+      reusedScratch: canReuseScratch,
     };
   }
 
@@ -399,15 +527,21 @@
       dimension
     );
 
+    const descriptor = {
+      size: { width, height, depthOrArrayLayers },
+      mipLevelCount,
+      format,
+      usage,
+      dimension,
+    };
+    const sibling = getSrgbSiblingFormat(format);
+    if (sibling !== null) {
+      descriptor.viewFormats = [sibling];
+    }
+
     return {
       id,
-      descriptor: {
-        size: { width, height, depthOrArrayLayers },
-        mipLevelCount,
-        format,
-        usage,
-        dimension,
-      },
+      descriptor,
     };
   }
 
@@ -531,12 +665,26 @@
   }
 
   class TexturePackets {
-    constructor(processor, next) {
+    constructor(processor, next, options = {}) {
       this.processor = processor;
       this.next = next || null;
       this._bc3dFallbackTextures = new Set();
       this._bc3dFallbackTextureObjs = new WeakSet();
-      this.stats = {
+      this._textureFormats = new Map();
+      this._textureObjFormats = new WeakMap();
+      const rawMaxScratch =
+        options && typeof options === 'object' ? options.maxScratchBytes : undefined;
+      this._maxScratchBytes =
+        Number.isInteger(rawMaxScratch) && rawMaxScratch >= 0
+          ? rawMaxScratch
+          : DEFAULT_MAX_SCRATCH_BYTES;
+      this._scratchBuffer = null;
+      this.stats = this._createEmptyStats();
+      this.lastError = null;
+    }
+
+    _createEmptyStats() {
+      return {
         created: 0,
         errors: 0,
         createTexture2Count: 0,
@@ -544,8 +692,14 @@
         sabCopyCount: 0,
         bc3dFallbacks: 0,
         bc3dFallbackUploadsSkipped: 0,
+        directZeroCopyUploads: 0,
+        repackedUploads: 0,
+        scratchBufferReuses: 0,
+        scratchBufferAllocations: 0,
+        r8unormUploads: 0,
+        bytesUploaded: 0,
+        srgbSiblingViewFormatsAdded: 0,
       };
-      this.lastError = null;
     }
 
     /**
@@ -561,7 +715,127 @@
         sabCopyCount: toNonNegativeInt(this.stats.sabCopyCount),
         bc3dFallbacks: toNonNegativeInt(this.stats.bc3dFallbacks),
         bc3dFallbackUploadsSkipped: toNonNegativeInt(this.stats.bc3dFallbackUploadsSkipped),
+        directZeroCopyUploads: toNonNegativeInt(this.stats.directZeroCopyUploads),
+        repackedUploads: toNonNegativeInt(this.stats.repackedUploads),
+        scratchBufferReuses: toNonNegativeInt(this.stats.scratchBufferReuses),
+        scratchBufferAllocations: toNonNegativeInt(this.stats.scratchBufferAllocations),
+        scratchBufferBytes: toNonNegativeInt(
+          this._scratchBuffer ? this._scratchBuffer.byteLength : 0
+        ),
+        r8unormUploads: toNonNegativeInt(this.stats.r8unormUploads),
+        bytesUploaded: toNonNegativeInt(this.stats.bytesUploaded),
+        srgbSiblingViewFormatsAdded: toNonNegativeInt(this.stats.srgbSiblingViewFormatsAdded),
       };
+    }
+
+    /**
+     * Reset all telemetry counters, cached texture format/fallback tracking, and
+     * release the persistent scratch buffer. Handler remains usable after reset().
+     */
+    reset() {
+      this._bc3dFallbackTextures.clear();
+      this._bc3dFallbackTextureObjs = new WeakSet();
+      this._textureFormats.clear();
+      this._textureObjFormats = new WeakMap();
+      this._scratchBuffer = null;
+      this.stats = this._createEmptyStats();
+      this.lastError = null;
+      if (this.next && typeof this.next.reset === 'function') {
+        this.next.reset();
+      }
+    }
+
+    /**
+     * Release internal resources (including the persistent scratch buffer) and
+     * reset all telemetry counters. Idempotent.
+     */
+    destroy() {
+      this._bc3dFallbackTextures.clear();
+      this._bc3dFallbackTextureObjs = new WeakSet();
+      this._textureFormats.clear();
+      this._textureObjFormats = new WeakMap();
+      this._scratchBuffer = null;
+      this.stats = this._createEmptyStats();
+      this.lastError = null;
+      if (this.next && typeof this.next.destroy === 'function') {
+        this.next.destroy();
+      }
+    }
+
+    _acquireScratchBuffer(requiredBytes) {
+      if (
+        !Number.isInteger(requiredBytes) ||
+        requiredBytes <= 0 ||
+        requiredBytes > this._maxScratchBytes
+      ) {
+        return { buffer: null, reused: false };
+      }
+      if (this._scratchBuffer && this._scratchBuffer.byteLength >= requiredBytes) {
+        this.stats.scratchBufferReuses += 1;
+        return { buffer: this._scratchBuffer, reused: true };
+      }
+      this._scratchBuffer = new Uint8Array(requiredBytes);
+      this.stats.scratchBufferAllocations += 1;
+      return { buffer: this._scratchBuffer, reused: false };
+    }
+
+    _prepareDirectWriteData(input) {
+      const src = toUint8Array(input, 'writeTexture');
+      if (!isSharedBuffer(src.buffer)) {
+        return { data: src, copiedFromSab: false, reusedScratch: false };
+      }
+      if (src.byteLength === 0) {
+        return { data: new Uint8Array(0), copiedFromSab: true, reusedScratch: false };
+      }
+      const scratch = this._acquireScratchBuffer(src.byteLength);
+      if (scratch.buffer) {
+        const dst = scratch.buffer.subarray(0, src.byteLength);
+        dst.set(src, 0);
+        return { data: dst, copiedFromSab: true, reusedScratch: scratch.reused };
+      }
+      const copy = new Uint8Array(src.byteLength);
+      copy.set(src, 0);
+      return { data: copy, copiedFromSab: true, reusedScratch: false };
+    }
+
+    _repackRowsWithScratch(srcBytes, bytesPerRow, rowCount, depthOrLayers = 1) {
+      const src = toUint8Array(srcBytes, 'repackRowsTo256');
+      const totalRows =
+        Number.isInteger(rowCount) && rowCount > 0 && Number.isInteger(depthOrLayers) && depthOrLayers > 0
+          ? rowCount * depthOrLayers
+          : 0;
+      const alignedBytesPerRow =
+        Number.isInteger(bytesPerRow) && bytesPerRow > 0 ? alignBytesPerRow256(bytesPerRow) : 0;
+      const fromSab = isSharedBuffer(src.buffer);
+      const needsCopyOrRepack =
+        totalRows > 0 && alignedBytesPerRow > 0 && (alignedBytesPerRow !== bytesPerRow || fromSab);
+
+      let scratchBuffer = null;
+      if (needsCopyOrRepack && src.byteLength >= bytesPerRow * totalRows) {
+        const neededBytes = alignedBytesPerRow * totalRows;
+        const acquired = this._acquireScratchBuffer(neededBytes);
+        scratchBuffer = acquired.buffer;
+      }
+
+      return repackRowsTo256(src, bytesPerRow, rowCount, depthOrLayers, scratchBuffer);
+    }
+
+    _isR8UnormTexture(texture, textureId) {
+      if (textureId !== undefined && this._textureFormats.get(textureId) === 'r8unorm') {
+        return true;
+      }
+      if (texture && typeof texture === 'object') {
+        if (this._textureObjFormats.get(texture) === 'r8unorm') {
+          return true;
+        }
+        if (texture.format === 'r8unorm') {
+          return true;
+        }
+        if (texture.desc && texture.desc.format === 'r8unorm') {
+          return true;
+        }
+      }
+      return false;
     }
 
     handlePacket(opcode, view, payloadOffset, payloadBytes) {
@@ -609,16 +883,18 @@
 
     destroyResource(id) {
       this._bc3dFallbackTextures.delete(id);
+      this._textureFormats.delete(id);
       if (this.next && typeof this.next.destroyResource === 'function') {
         this.next.destroyResource(id);
       }
     }
 
     /**
-     * Safe `queue.writeTexture` wrapper that copies `SharedArrayBuffer`-backed views
-     * into a standalone `ArrayBuffer`-backed `Uint8Array` before uploading.
+     * Safe `queue.writeTexture` wrapper that takes a zero-copy direct upload path
+     * for non-shared views and copies `SharedArrayBuffer`-backed views into a
+     * reusable non-shared scratch `Uint8Array` before uploading.
      */
-    writeTexture(destination, data, dataLayout, size) {
+    writeTexture(destination, data, dataLayout, size, textureId) {
       if (
         destination &&
         destination.texture &&
@@ -634,13 +910,27 @@
         return { uploaded: false, copiedFromSab: false };
       }
 
-      const prepared = copyFromSharedIfNeeded(data);
+      const prepared = this._prepareDirectWriteData(data);
       if (prepared.copiedFromSab) {
         this.stats.sabCopyCount += 1;
       }
 
       p.device.queue.writeTexture(destination, prepared.data, dataLayout, size);
-      return { uploaded: true, copiedFromSab: prepared.copiedFromSab };
+
+      this.stats.bytesUploaded += prepared.data.byteLength;
+      if (!prepared.copiedFromSab) {
+        this.stats.directZeroCopyUploads += 1;
+      }
+      if (this._isR8UnormTexture(destination && destination.texture, textureId)) {
+        this.stats.r8unormUploads += 1;
+      }
+
+      return {
+        uploaded: true,
+        copiedFromSab: prepared.copiedFromSab,
+        zeroCopy: !prepared.copiedFromSab,
+        reusedScratch: prepared.reusedScratch,
+      };
     }
 
     /**
@@ -705,7 +995,7 @@
           }
         }
 
-        const packed = repackRowsTo256(
+        const packed = this._repackRowsWithScratch(
           rawBytes,
           rawBytesPerRow,
           rowsPerImage,
@@ -713,10 +1003,12 @@
         );
         if (packed.repacked) {
           this.stats.rowPitchRepackCount += 1;
+          this.stats.repackedUploads += 1;
         }
         if (packed.copiedFromSab) {
           this.stats.sabCopyCount += 1;
         }
+        const isR8 = this._isR8UnormTexture(destination.texture);
 
         if (
           p &&
@@ -737,9 +1029,14 @@
             stageLayout.aspect = destination.aspect;
           }
           p.stagingPool.stageTextureUpload(encoder, destination.texture, packed.data, stageLayout);
+          this.stats.bytesUploaded += packed.data.byteLength;
+          if (isR8) {
+            this.stats.r8unormUploads += 1;
+          }
           return {
             repacked: packed.repacked,
             copiedFromSab: packed.copiedFromSab,
+            reusedScratch: packed.reusedScratch,
             bytesPerRow: packed.bytesPerRow,
             originalBytesPerRow: rawBytesPerRow,
             staged: true,
@@ -761,9 +1058,14 @@
             destination,
             normSize
           );
+          this.stats.bytesUploaded += packed.data.byteLength;
+          if (isR8) {
+            this.stats.r8unormUploads += 1;
+          }
           return {
             repacked: false,
             copiedFromSab: packed.copiedFromSab,
+            reusedScratch: packed.reusedScratch,
             bytesPerRow: packed.bytesPerRow,
             originalBytesPerRow: rawBytesPerRow,
             staged: false,
@@ -804,9 +1106,14 @@
           destination,
           normSize
         );
+        this.stats.bytesUploaded += packed.data.byteLength;
+        if (isR8) {
+          this.stats.r8unormUploads += 1;
+        }
         return {
           repacked: packed.repacked,
           copiedFromSab: packed.copiedFromSab,
+          reusedScratch: packed.reusedScratch,
           bytesPerRow: packed.bytesPerRow,
           originalBytesPerRow: rawBytesPerRow,
           stagingBuffer,
@@ -816,8 +1123,15 @@
 
       // GPU-buffer-only copy path (no CPU bytes supplied).
       const rawBytesPerRow = Number.isInteger(source.bytesPerRow) ? source.bytesPerRow : 0;
+      const isR8 = this._isR8UnormTexture(destination.texture);
       if (rawBytesPerRow === 0 || rawBytesPerRow % WEBGPU_BYTES_PER_ROW_ALIGNMENT === 0) {
         encoder.copyBufferToTexture(source, destination, normSize);
+        if (rawBytesPerRow > 0) {
+          this.stats.bytesUploaded += rawBytesPerRow * totalRows;
+        }
+        if (isR8) {
+          this.stats.r8unormUploads += 1;
+        }
         return {
           repacked: false,
           copiedFromSab: false,
@@ -879,6 +1193,11 @@
           normSize
         );
         this.stats.rowPitchRepackCount += 1;
+        this.stats.repackedUploads += 1;
+        this.stats.bytesUploaded += repackedTotalBytes;
+        if (isR8) {
+          this.stats.r8unormUploads += 1;
+        }
         return {
           repacked: true,
           copiedFromSab: false,
@@ -947,6 +1266,49 @@
         dataLen
       );
 
+      const effectiveRowsPerImage = rowsPerImage > 0 ? rowsPerImage : height;
+      const totalRows = effectiveRowsPerImage * depthOrArrayLayers;
+      const effectiveBytesPerRow =
+        bytesPerRow > 0
+          ? bytesPerRow
+          : totalRows > 0 && dataLen % totalRows === 0
+            ? dataLen / totalRows
+            : 0;
+      const isRowAligned256 =
+        effectiveBytesPerRow > 0 &&
+        effectiveBytesPerRow % WEBGPU_BYTES_PER_ROW_ALIGNMENT === 0;
+      const hasDirectQueueWrite = Boolean(
+        p.device.queue && typeof p.device.queue.writeTexture === 'function'
+      );
+
+      // Fast path: when source row pitch is already 256-byte aligned (e.g., 4K Bink2
+      // 3840x2160 r8unorm Y plane where 3840 % 256 === 0), upload directly via
+      // queue.writeTexture without staging pool churn or scratch buffer repacking.
+      if (isRowAligned256 && hasDirectQueueWrite && width > 0 && height > 0 && dataLen > 0) {
+        const directLayout = { offset: 0, bytesPerRow: effectiveBytesPerRow };
+        if (rowsPerImage > 0) {
+          directLayout.rowsPerImage = rowsPerImage;
+        } else if (totalRows > 1) {
+          directLayout.rowsPerImage = effectiveRowsPerImage;
+        }
+        this.writeTexture(
+          {
+            texture,
+            mipLevel,
+            origin: { x: originX, y: originY, z: originZ },
+          },
+          rawData,
+          directLayout,
+          {
+            width,
+            height,
+            depthOrArrayLayers,
+          },
+          textureId
+        );
+        return;
+      }
+
       if (
         p.stagingPool &&
         !p.stagingPool._destroyed &&
@@ -955,14 +1317,6 @@
         height > 0 &&
         dataLen > 0
       ) {
-        const effectiveRowsPerImage = rowsPerImage > 0 ? rowsPerImage : height;
-        const totalRows = effectiveRowsPerImage * depthOrArrayLayers;
-        const effectiveBytesPerRow =
-          bytesPerRow > 0
-            ? bytesPerRow
-            : totalRows > 0 && dataLen % totalRows === 0
-              ? dataLen / totalRows
-              : 0;
         const canStage =
           effectiveBytesPerRow > 0 && dataLen >= effectiveBytesPerRow * totalRows;
 
@@ -970,7 +1324,7 @@
           const encoder =
             typeof p._ensurePendingEncoder === 'function' ? p._ensurePendingEncoder() : null;
           if (encoder && typeof encoder.copyBufferToTexture === 'function') {
-            const packed = repackRowsTo256(
+            const packed = this._repackRowsWithScratch(
               rawData,
               effectiveBytesPerRow,
               effectiveRowsPerImage,
@@ -978,6 +1332,7 @@
             );
             if (packed.repacked) {
               this.stats.rowPitchRepackCount += 1;
+              this.stats.repackedUploads += 1;
             }
             if (packed.copiedFromSab) {
               this.stats.sabCopyCount += 1;
@@ -994,6 +1349,10 @@
             };
             p.stagingPool.stageTextureUpload(encoder, texture, packed.data, layout);
             p._hasPendingUploadCommands = true;
+            this.stats.bytesUploaded += packed.data.byteLength;
+            if (this._isR8UnormTexture(texture, textureId)) {
+              this.stats.r8unormUploads += 1;
+            }
             return;
           }
           if (!p._hasPendingUploadCommands) {
@@ -1005,6 +1364,8 @@
       const dataLayout = { offset: 0 };
       if (bytesPerRow > 0) {
         dataLayout.bytesPerRow = bytesPerRow;
+      } else if (effectiveBytesPerRow > 0 && totalRows > 1) {
+        dataLayout.bytesPerRow = effectiveBytesPerRow;
       }
       if (rowsPerImage > 0) {
         dataLayout.rowsPerImage = rowsPerImage;
@@ -1022,13 +1383,15 @@
           width,
           height,
           depthOrArrayLayers,
-        }
+        },
+        textureId
       );
     }
 
     _create(id, descriptor, isV2 = true) {
       const p = this.processor;
       this._bc3dFallbackTextures.delete(id);
+      this._textureFormats.delete(id);
       if (typeof p._destroyTextureIfPresent === 'function') {
         p._destroyTextureIfPresent(id);
       }
@@ -1039,6 +1402,7 @@
 
       let effectiveDescriptor = descriptor;
       let bc3dFallback = false;
+      let srgbSiblingAdded = false;
       if (
         descriptor &&
         descriptor.dimension === '3d' &&
@@ -1062,6 +1426,31 @@
             delete effectiveDescriptor.viewFormats;
           }
         }
+      } else if (descriptor && typeof descriptor.format === 'string') {
+        const resolved = resolveCompatibleViewFormats(descriptor.format, descriptor.viewFormats);
+        const origViewFormats = Array.isArray(descriptor.viewFormats) ? descriptor.viewFormats : null;
+        const resolvedViewFormats = resolved.viewFormats || null;
+        const changed =
+          resolved.siblingAdded ||
+          (origViewFormats !== null &&
+            (resolvedViewFormats === null ||
+              origViewFormats.length !== resolvedViewFormats.length ||
+              origViewFormats.some((vf, idx) => vf !== resolvedViewFormats[idx])));
+        if (changed) {
+          effectiveDescriptor = {
+            ...descriptor,
+            size: descriptor.size ? { ...descriptor.size } : descriptor.size,
+          };
+          if (resolvedViewFormats && resolvedViewFormats.length > 0) {
+            effectiveDescriptor.viewFormats = resolvedViewFormats;
+          } else {
+            delete effectiveDescriptor.viewFormats;
+          }
+          srgbSiblingAdded = resolved.siblingAdded;
+        } else if (!isV2 && resolvedViewFormats && resolvedViewFormats.length > 0) {
+          // decodeCreateTexture (v1) already attached the compatible sibling viewFormat.
+          srgbSiblingAdded = true;
+        }
       }
 
       let texture;
@@ -1073,6 +1462,15 @@
         return;
       }
       p.textures.set(id, texture);
+      if (effectiveDescriptor && typeof effectiveDescriptor.format === 'string') {
+        this._textureFormats.set(id, effectiveDescriptor.format);
+        if (texture && typeof texture === 'object') {
+          this._textureObjFormats.set(texture, effectiveDescriptor.format);
+        }
+      }
+      if (srgbSiblingAdded) {
+        this.stats.srgbSiblingViewFormatsAdded += 1;
+      }
       if (bc3dFallback) {
         this._bc3dFallbackTextures.add(id);
         if (texture && typeof texture === 'object') {
@@ -1128,8 +1526,8 @@
     }
   }
 
-  function installTexturePackets(processor) {
-    const handler = new TexturePackets(processor, processor.extension || null);
+  function installTexturePackets(processor, options = {}) {
+    const handler = new TexturePackets(processor, processor.extension || null, options);
     processor.extension = handler;
 
     if (processor && typeof processor === 'object') {
@@ -1165,6 +1563,18 @@
           handler.handleWriteTexture(view, payloadOffset, payloadBytes);
         };
       }
+
+      if (typeof processor.destroy === 'function' && !processor[HOOK_ORIG_DESTROY]) {
+        processor[HOOK_ORIG_DESTROY] = processor.destroy;
+      }
+      if (typeof processor[HOOK_ORIG_DESTROY] === 'function') {
+        const origDestroy = processor[HOOK_ORIG_DESTROY];
+        processor.destroy = function hardenedDestroy() {
+          const result = origDestroy.apply(this, arguments);
+          handler.destroy();
+          return result;
+        };
+      }
     }
 
     return handler;
@@ -1184,6 +1594,10 @@
     isSharedArrayBufferView,
     isBcCompressedFormat,
     deviceSupportsBcSliced3d,
+    getSrgbSiblingFormat,
+    resolveCompatibleViewFormats,
+    SRGB_SIBLING_FORMATS,
+    DEFAULT_MAX_SCRATCH_BYTES,
     BC_SLICED_3D_FEATURE,
     CREATE_TEXTURE,
     CREATE_TEXTURE_BYTES,
