@@ -214,7 +214,7 @@ fn pause_and_loop_heads_are_compiler_barriers() {
     for ir in [pause_spin_module(), plain_spin_module()] {
         assert!(ir.contains(crate::lift::LOOP_BARRIER), "{ir}");
     }
-    // Straight-line code gets none, and the barrier needs no wasm atomics.
+    // Straight-line code without tail jumps gets none, and the barrier needs no wasm atomics.
     let straight = module_ir(|a| {
         a.mov(eax, dword_ptr(rcx))?;
         a.ret()
@@ -263,6 +263,104 @@ fn spin_wait_reloads(ir: &str) {
         }
     }
     assert!(load_after_fence, "{optimized}");
+}
+
+/// A spin built from tail jumps between two functions: `sub_1000` polls `*(u16*)rcx` and jumps
+/// to `sub_2000` while it is below 0x100, and `sub_2000` jumps straight back. Neither function
+/// has a backward edge of its own, but once LLVM inlines `sub_2000` into `sub_1000` the self
+/// tail call becomes a loop (tail-recursion elimination).
+fn tail_jump_spin_module() -> String {
+    let program = Program::new()
+        .asm(0x1000, |a| {
+            let mut done = a.create_label();
+            a.movzx(eax, word_ptr(rcx))?;
+            a.cmp(ax, 0x100)?;
+            a.jae(done)?;
+            a.jmp(0x2000)?;
+            a.set_label(&mut done)?;
+            a.ret()
+        })
+        .asm(0x2000, |a| a.jmp(0x1000));
+    let functions = program.discover();
+    let module = lift_module(functions.values()).expect("lifts");
+    for f in &module.functions {
+        assert!(f.unsupported.is_empty(), "{:?}", f.unsupported);
+    }
+    module.ir
+}
+
+#[test]
+fn function_entries_are_compiler_barriers() {
+    let ir = tail_jump_spin_module();
+    for name in ["sub_1000", "sub_2000"] {
+        let header = format!("define void @{name}(");
+        let start = ir.find(&header).unwrap_or_else(|| panic!("{name} missing:\n{ir}"));
+        let entry: String = ir[start..]
+            .lines()
+            .skip(2)
+            .take_while(|l| !l.ends_with(':'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let fence = entry.find(crate::lift::LOOP_BARRIER);
+        let branch = entry.find("  br label %bb_");
+        assert!(
+            matches!((fence, branch), (Some(f), Some(b)) if f < b),
+            "{name}: entry block ends with the barrier and its branch:\n{entry}"
+        );
+    }
+}
+
+/// After the middle-end the inlined tail-jump cycle must still reload the polled word.
+#[test]
+fn tail_jump_spins_keep_their_load_after_optimisation() {
+    let ir = tail_jump_spin_module();
+    let Some(crate::lift::compile::LlvmTool::Llc { opt: Some(opt), .. }) =
+        crate::lift::compile::find_llvm_tool()
+    else {
+        eprintln!("skipping: no LLVM opt found");
+        return;
+    };
+    let ll = std::env::temp_dir().join(format!(
+        "playgta6_recomp_tail_spin_{}.ll",
+        std::process::id()
+    ));
+    std::fs::write(&ll, &ir).expect("write ll");
+    let out = std::process::Command::new(opt)
+        .args(["-O2", "-S"])
+        .arg(&ll)
+        .output()
+        .expect("runs opt");
+    let _ = std::fs::remove_file(&ll);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let optimized = String::from_utf8_lossy(&out.stdout);
+    let start = optimized
+        .find("@sub_1000(")
+        .and_then(|i| optimized[..i].rfind("define "))
+        .expect("sub_1000 survives");
+    let body: String = optimized[start..]
+        .lines()
+        .take_while(|l| *l != "}")
+        .collect::<Vec<_>>()
+        .join("\n");
+    // Every block that holds the barrier loads the polled word after it, before it branches.
+    let mut fences = 0;
+    let mut in_fence_block = false;
+    for line in body.lines().map(str::trim) {
+        if line.starts_with(crate::lift::LOOP_BARRIER) {
+            fences += 1;
+            in_fence_block = true;
+        } else if in_fence_block && line.contains(" = load i16") {
+            in_fence_block = false;
+        } else if in_fence_block && (line.starts_with("br ") || line.starts_with("ret ")) {
+            panic!("barrier block without the polled load:\n{body}");
+        }
+    }
+    assert!(fences > 0, "the barrier survives optimisation:\n{body}");
+    // The cycle really was closed into a loop (otherwise the test proves nothing).
+    assert!(
+        !body.contains("@sub_2000(") || body.contains("br label"),
+        "{body}"
+    );
 }
 
 #[test]

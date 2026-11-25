@@ -607,6 +607,14 @@ impl FunctionLifter<'_> {
             self.emit(&line);
         }
         ir.push_str(&std::mem::take(&mut self.body));
+        // A loop can also span functions (tail jumps from one to the next and back). Once LLVM
+        // inlines the callee, the self tail call becomes a loop whose head is this entry, so
+        // the entry of a function that tail-jumps is a barrier too (see `LOOP_BARRIER`). Every
+        // function on such a cycle has a tail jump; leaf functions get none, as a barrier there
+        // would sit inside the caller's loop after inlining and block its optimisation.
+        if !exits.is_empty() {
+            let _ = writeln!(ir, "  {}", crate::lift::LOOP_BARRIER);
+        }
         let _ = writeln!(ir, "  br label %{}", block_label(entry));
         ir.push_str(&body);
         ir.push_str("}\n");
