@@ -116,6 +116,13 @@ const REMAPPED_BIND_GROUP_CACHE_LIMIT = 2048;
 const PRESENTX_BIND_GROUP_CACHE_LIMIT = 256;
 // W104: bound on distinct missing render-pass textures remembered for error deduplication.
 const MISSING_TEXTURE_REPORT_LIMIT = 4096;
+// W354: per-texture WeakMap GPUTextureView cache cap and fast pass state elision limits.
+const MAX_VIEWS_PER_TEXTURE = 64;
+const MAX_FAST_PASS_BG_SLOTS = 8;
+const MAX_FAST_PASS_DYN_OFFSETS = 8;
+const EMPTY_DYNAMIC_OFFSETS = Object.freeze([]);
+const EMPTY_WARNINGS = Object.freeze([]);
+const SWAPCHAIN_VIEW_SENTINEL = Symbol('swapchainView');
 
 let _cachedTextureFormatsModule = null;
 const _gpuObjectIds = new WeakMap();
@@ -1187,14 +1194,17 @@ function isExplicitLayoutCompatibleWithWgsl(group0Entries, wgslBindings) {
   return true;
 }
 
-// W101: normalize a setBindGroup dynamicOffsets argument (Array / typed array / null) into a plain
-// array of uint32 offsets; anything else yields [].
+// W101/W354: normalize a setBindGroup dynamicOffsets argument (Array / typed array / null) into a
+// plain array of uint32 offsets; empty/invalid input returns shared frozen EMPTY_DYNAMIC_OFFSETS.
 function normalizeDynamicOffsets(raw) {
-  if (!raw || !(Array.isArray(raw) || ArrayBuffer.isView(raw))) return [];
-  const out = [];
-  for (let i = 0; i < raw.length; i += 1) {
+  if (!raw || !(Array.isArray(raw) || ArrayBuffer.isView(raw)) || raw.length === 0) {
+    return EMPTY_DYNAMIC_OFFSETS;
+  }
+  const len = raw.length;
+  const out = new Array(len);
+  for (let i = 0; i < len; i += 1) {
     const v = Number(raw[i]);
-    out.push(Number.isFinite(v) && v > 0 ? Math.floor(v) >>> 0 : 0);
+    out[i] = Number.isFinite(v) && v > 0 ? Math.floor(v) >>> 0 : 0;
   }
   return out;
 }
@@ -1597,48 +1607,51 @@ function resolveAttachmentViewSize(view, explicitSize) {
   return null;
 }
 
-// W266: normalizes a GPURenderPassDescriptor so all attachments share a consistent (width, height),
+// W266/W354: normalizes a GPURenderPassDescriptor so all attachments share a consistent (width, height),
 // dropping mismatched secondary color / depthStencil / resolveTarget attachments and clamping
 // depthClearValue / readOnly invariants before WebGPU sees the pass descriptor.
+// Avoids .map()/.slice()/array allocations on the common clean path.
 function sanitizeRenderPassAttachments(descriptor, attachmentSizes = null) {
   if (!descriptor || typeof descriptor !== 'object') {
-    return { descriptor, referenceSize: null, sanitizedCount: 0, warnings: [] };
+    return { descriptor, referenceSize: null, sanitizedCount: 0, warnings: EMPTY_WARNINGS };
   }
   const colorSizesInput =
-    attachmentSizes && Array.isArray(attachmentSizes.colors) ? attachmentSizes.colors : [];
-  const rawColors = Array.isArray(descriptor.colorAttachments) ? descriptor.colorAttachments : [];
-  const colorSizes = rawColors.map((att, i) =>
-    att ? resolveAttachmentViewSize(att.view, colorSizesInput[i] || null) : null
-  );
+    attachmentSizes && Array.isArray(attachmentSizes.colors) ? attachmentSizes.colors : null;
+  const rawColors = Array.isArray(descriptor.colorAttachments) ? descriptor.colorAttachments : null;
+  const colorCount = rawColors ? rawColors.length : 0;
+
+  let referenceSize = null;
+  // Pass 1: locate referenceSize and check if any color attachment needs mutation without cloning.
+  for (let i = 0; i < colorCount; i += 1) {
+    const att = rawColors[i];
+    if (!att) continue;
+    const sz = resolveAttachmentViewSize(att.view, colorSizesInput ? colorSizesInput[i] || null : null);
+    if (sz) {
+      referenceSize = sz;
+      break;
+    }
+  }
   const rawDs = descriptor.depthStencilAttachment || null;
   const dsSize = rawDs
     ? resolveAttachmentViewSize(rawDs.view, attachmentSizes ? attachmentSizes.depthStencil : null)
     : null;
-
-  let referenceSize = null;
-  for (let i = 0; i < colorSizes.length; i += 1) {
-    if (colorSizes[i]) {
-      referenceSize = colorSizes[i];
-      break;
-    }
-  }
   if (!referenceSize && dsSize) {
     referenceSize = dsSize;
   }
 
   let sanitizedCount = 0;
-  const warnings = [];
-  let colorsChanged = false;
-  const outColors = rawColors.slice();
+  let warnings = null;
+  let outColors = null;
 
-  for (let i = 0; i < outColors.length; i += 1) {
-    const att = outColors[i];
+  for (let i = 0; i < colorCount; i += 1) {
+    const att = rawColors[i];
     if (!att) continue;
-    const sz = colorSizes[i];
+    const sz = resolveAttachmentViewSize(att.view, colorSizesInput ? colorSizesInput[i] || null : null);
     if (referenceSize && sz && (sz.width !== referenceSize.width || sz.height !== referenceSize.height)) {
+      if (!outColors) outColors = rawColors.slice();
       outColors[i] = null;
-      colorsChanged = true;
       sanitizedCount += 1;
+      if (!warnings) warnings = [];
       warnings.push({
         key: `rp-color-size-mismatch:${i}:${sz.width}x${sz.height}:${referenceSize.width}x${referenceSize.height}`,
         message: `render pass: dropped colorAttachments[${i}] (${sz.width}x${sz.height}) mismatched with pass target (${referenceSize.width}x${referenceSize.height})`,
@@ -1656,11 +1669,12 @@ function sanitizeRenderPassAttachments(descriptor, attachmentSizes = null) {
         resolveSz &&
         (resolveSz.width !== referenceSize.width || resolveSz.height !== referenceSize.height)
       ) {
+        if (!outColors) outColors = rawColors.slice();
         const cleanAtt = { ...att };
         delete cleanAtt.resolveTarget;
         outColors[i] = cleanAtt;
-        colorsChanged = true;
         sanitizedCount += 1;
+        if (!warnings) warnings = [];
         warnings.push({
           key: `rp-resolve-size-mismatch:${i}:${resolveSz.width}x${resolveSz.height}:${referenceSize.width}x${referenceSize.height}`,
           message: `render pass: dropped colorAttachments[${i}].resolveTarget (${resolveSz.width}x${resolveSz.height}) mismatched with pass target (${referenceSize.width}x${referenceSize.height})`,
@@ -1676,28 +1690,26 @@ function sanitizeRenderPassAttachments(descriptor, attachmentSizes = null) {
       outDs = null;
       dsChanged = true;
       sanitizedCount += 1;
+      if (!warnings) warnings = [];
       warnings.push({
         key: `rp-depth-size-mismatch:${dsSize.width}x${dsSize.height}:${referenceSize.width}x${referenceSize.height}`,
         message: `render pass: dropped depthStencilAttachment (${dsSize.width}x${dsSize.height}) mismatched with pass target (${referenceSize.width}x${referenceSize.height})`,
       });
     } else {
       let cleanDs = null;
-      const ensureDsClone = () => {
-        if (!cleanDs) cleanDs = { ...rawDs };
-        return cleanDs;
-      };
       if (rawDs.depthReadOnly) {
         if (
           rawDs.depthLoadOp !== undefined ||
           rawDs.depthStoreOp !== undefined ||
           rawDs.depthClearValue !== undefined
         ) {
-          const cloned = ensureDsClone();
-          delete cloned.depthLoadOp;
-          delete cloned.depthStoreOp;
-          delete cloned.depthClearValue;
+          cleanDs = { ...rawDs };
+          delete cleanDs.depthLoadOp;
+          delete cleanDs.depthStoreOp;
+          delete cleanDs.depthClearValue;
           dsChanged = true;
           sanitizedCount += 1;
+          if (!warnings) warnings = [];
           warnings.push({
             key: 'rp-depth-readonly-ops',
             message: 'render pass: stripped depthLoadOp/depthStoreOp/depthClearValue on depthReadOnly attachment',
@@ -1707,10 +1719,11 @@ function sanitizeRenderPassAttachments(descriptor, attachmentSizes = null) {
         const rawClear = rawDs.depthClearValue;
         const clampedClear = Math.min(1, Math.max(0, finiteOr(rawClear, 1))) || 0;
         if (!Number.isFinite(rawClear) || clampedClear !== rawClear) {
-          const cloned = ensureDsClone();
-          cloned.depthClearValue = clampedClear;
+          if (!cleanDs) cleanDs = { ...rawDs };
+          cleanDs.depthClearValue = clampedClear;
           dsChanged = true;
           sanitizedCount += 1;
+          if (!warnings) warnings = [];
           warnings.push({
             key: `rp-depth-clear-clamp:${rawClear}`,
             message: `render pass: clamped depthClearValue ${rawClear} to ${clampedClear}`,
@@ -1723,12 +1736,13 @@ function sanitizeRenderPassAttachments(descriptor, attachmentSizes = null) {
           rawDs.stencilStoreOp !== undefined ||
           rawDs.stencilClearValue !== undefined
         ) {
-          const cloned = ensureDsClone();
-          delete cloned.stencilLoadOp;
-          delete cloned.stencilStoreOp;
-          delete cloned.stencilClearValue;
+          if (!cleanDs) cleanDs = { ...rawDs };
+          delete cleanDs.stencilLoadOp;
+          delete cleanDs.stencilStoreOp;
+          delete cleanDs.stencilClearValue;
           dsChanged = true;
           sanitizedCount += 1;
+          if (!warnings) warnings = [];
           warnings.push({
             key: 'rp-stencil-readonly-ops',
             message: 'render pass: stripped stencilLoadOp/stencilStoreOp/stencilClearValue on stencilReadOnly attachment',
@@ -1739,16 +1753,16 @@ function sanitizeRenderPassAttachments(descriptor, attachmentSizes = null) {
     }
   }
 
-  if (!colorsChanged && !dsChanged) {
-    return { descriptor, referenceSize, sanitizedCount: 0, warnings };
+  if (outColors === null && !dsChanged) {
+    return { descriptor, referenceSize, sanitizedCount: 0, warnings: EMPTY_WARNINGS };
   }
-  const outDescriptor = { ...descriptor, colorAttachments: outColors };
+  const outDescriptor = { ...descriptor, colorAttachments: outColors || rawColors || [] };
   if (outDs) {
     outDescriptor.depthStencilAttachment = outDs;
   } else {
     delete outDescriptor.depthStencilAttachment;
   }
-  return { descriptor: outDescriptor, referenceSize, sanitizedCount, warnings };
+  return { descriptor: outDescriptor, referenceSize, sanitizedCount, warnings: warnings || EMPTY_WARNINGS };
 }
 
 // ---- Decoders (pure; also used by the tests; W302 zero-alloc scratch reuse) ----
@@ -2609,8 +2623,8 @@ function decodeBeginRenderPass(view, offset = 0, out = null) {
   return { colors, depthStencil };
 }
 
-// W302: lightweight monomorphic pass-command objects for hot dynamic render-state packets,
-// eliminating per-packet closures and temporary scratch objects during decode & replay.
+// W302/W354: lightweight monomorphic pass-command objects for hot dynamic render-state packets,
+// eliminating per-packet closures and redundant WebGPU state calls within the same render pass.
 class SetViewportCommand {
   constructor(handler, x, y, width, height, minDepth, maxDepth) {
     this.type = 'renderState';
@@ -2634,7 +2648,8 @@ class SetViewportCommand {
     raw.minDepth = this.minDepth;
     raw.maxDepth = this.maxDepth;
     const vp = clampViewportToTarget(raw, targetSize, h._scratch.viewportClamped);
-    if (isViewportClamped(raw, vp)) {
+    const wasClamped = isViewportClamped(raw, vp);
+    if (wasClamped) {
       h.telemetry.clampedViewports += 1;
       const targetTag = targetSize ? `${targetSize.width}x${targetSize.height}` : 'unbounded';
       h._recordTelemetryWarningOnce(
@@ -2642,7 +2657,41 @@ class SetViewportCommand {
         `clamped viewport (${raw.x},${raw.y},${raw.width}x${raw.height},d=${raw.minDepth}..${raw.maxDepth}) to (${vp.x},${vp.y},${vp.width}x${vp.height},d=${vp.minDepth}..${vp.maxDepth}) for target ${targetTag}`
       );
     }
+    const ps = h._syncPassState(ctl.pass);
+    if (
+      h.elideRedundantState &&
+      ps.hasViewport &&
+      ps.vpX === vp.x &&
+      ps.vpY === vp.y &&
+      ps.vpW === vp.width &&
+      ps.vpH === vp.height &&
+      ps.vpMinD === vp.minDepth &&
+      ps.vpMaxD === vp.maxDepth &&
+      (!wasClamped ||
+        (ps.vpRawX === this.x &&
+          ps.vpRawY === this.y &&
+          ps.vpRawW === this.width &&
+          ps.vpRawH === this.height &&
+          ps.vpRawMinD === this.minDepth &&
+          ps.vpRawMaxD === this.maxDepth))
+    ) {
+      h.telemetry.elidedViewportSets += 1;
+      return;
+    }
     ctl.pass.setViewport(vp.x, vp.y, vp.width, vp.height, vp.minDepth, vp.maxDepth);
+    ps.hasViewport = true;
+    ps.vpX = vp.x;
+    ps.vpY = vp.y;
+    ps.vpW = vp.width;
+    ps.vpH = vp.height;
+    ps.vpMinD = vp.minDepth;
+    ps.vpMaxD = vp.maxDepth;
+    ps.vpRawX = this.x;
+    ps.vpRawY = this.y;
+    ps.vpRawW = this.width;
+    ps.vpRawH = this.height;
+    ps.vpRawMinD = this.minDepth;
+    ps.vpRawMaxD = this.maxDepth;
   }
 }
 
@@ -2665,7 +2714,8 @@ class SetScissorRectCommand {
     raw.width = this.width;
     raw.height = this.height;
     const sc = clampScissorToTarget(raw, targetSize, h._scratch.scissorClamped);
-    if (isScissorClamped(raw, sc)) {
+    const wasClamped = isScissorClamped(raw, sc);
+    if (wasClamped) {
       h.telemetry.clampedScissors += 1;
       const targetTag = targetSize ? `${targetSize.width}x${targetSize.height}` : 'unbounded';
       h._recordTelemetryWarningOnce(
@@ -2673,34 +2723,195 @@ class SetScissorRectCommand {
         `clamped scissor (${raw.x},${raw.y},${raw.width}x${raw.height}) to (${sc.x},${sc.y},${sc.width}x${sc.height}) for target ${targetTag}`
       );
     }
+    const ps = h._syncPassState(ctl.pass);
+    if (
+      h.elideRedundantState &&
+      ps.hasScissor &&
+      ps.scX === sc.x &&
+      ps.scY === sc.y &&
+      ps.scW === sc.width &&
+      ps.scH === sc.height &&
+      (!wasClamped ||
+        (ps.scRawX === this.x &&
+          ps.scRawY === this.y &&
+          ps.scRawW === this.width &&
+          ps.scRawH === this.height))
+    ) {
+      h.telemetry.elidedScissorSets += 1;
+      return;
+    }
     ctl.pass.setScissorRect(sc.x, sc.y, sc.width, sc.height);
+    ps.hasScissor = true;
+    ps.scX = sc.x;
+    ps.scY = sc.y;
+    ps.scW = sc.width;
+    ps.scH = sc.height;
+    ps.scRawX = this.x;
+    ps.scRawY = this.y;
+    ps.scRawW = this.width;
+    ps.scRawH = this.height;
   }
 }
 
 class SetBlendConstantCommand {
-  constructor(r, g, b, a) {
+  constructor(handler, r, g, b, a) {
     this.type = 'renderState';
+    this._handler = handler;
     this.r = r;
     this.g = g;
     this.b = b;
     this.a = a;
   }
   run(ctl) {
-    if (ctl.passKind === 'render') {
+    if (ctl.passKind !== 'render') return;
+    const h = this._handler;
+    if (h) {
+      const ps = h._syncPassState(ctl.pass);
+      if (
+        h.elideRedundantState &&
+        ps.hasBlend &&
+        ps.bcR === this.r &&
+        ps.bcG === this.g &&
+        ps.bcB === this.b &&
+        ps.bcA === this.a
+      ) {
+        h.telemetry.elidedBlendConstantSets += 1;
+        return;
+      }
       ctl.pass.setBlendConstant({ r: this.r, g: this.g, b: this.b, a: this.a });
+      ps.hasBlend = true;
+      ps.bcR = this.r;
+      ps.bcG = this.g;
+      ps.bcB = this.b;
+      ps.bcA = this.a;
+      return;
     }
+    ctl.pass.setBlendConstant({ r: this.r, g: this.g, b: this.b, a: this.a });
   }
 }
 
 class SetStencilReferenceCommand {
-  constructor(reference) {
+  constructor(handler, reference) {
     this.type = 'renderState';
+    this._handler = handler;
     this.reference = reference;
   }
   run(ctl) {
-    if (ctl.passKind === 'render') {
+    if (ctl.passKind !== 'render') return;
+    const h = this._handler;
+    if (h) {
+      const ps = h._syncPassState(ctl.pass);
+      if (h.elideRedundantState && ps.hasStencil && ps.stencilRef === this.reference) {
+        h.telemetry.elidedStencilRefSets += 1;
+        return;
+      }
       ctl.pass.setStencilReference(this.reference);
+      ps.hasStencil = true;
+      ps.stencilRef = this.reference;
+      return;
     }
+    ctl.pass.setStencilReference(this.reference);
+  }
+}
+
+// W354: monomorphic SetBindGroup2 command (self-serves _rsSetBindGroup & _wgpuMeta without extra objects).
+class SetBindGroup2Command {
+  constructor(handler, groupIndex, bindGroupId, bindGroup, bindGroupDesc, offsets) {
+    this.type = 'renderState';
+    this._handler = handler;
+    this.kind = 'setBindGroup2';
+    this.groupIndex = groupIndex;
+    this.bindGroupId = bindGroupId;
+    this.bindGroup = bindGroup;
+    this.bindGroupDesc = bindGroupDesc;
+    this.offsets = offsets;
+    this._rsSetBindGroup = this;
+    this._wgpuMeta = this;
+  }
+  run(ctl) {
+    if (!ctl.pass) return;
+    const h = this._handler;
+    if (
+      h &&
+      ctl.passKind === 'render' &&
+      h.elideRedundantState &&
+      !h._flushHasV1BindGroup &&
+      h._isPassBindGroupRedundant(ctl.pass, this.groupIndex, this.bindGroup, this.offsets)
+    ) {
+      h.telemetry.elidedBindGroupSets += 1;
+      return;
+    }
+    ctl.pass.setBindGroup(this.groupIndex, this.bindGroup, this.offsets);
+    if (h && ctl.passKind === 'render') {
+      h._recordPassBindGroup(ctl.pass, this.groupIndex, this.bindGroup, this.offsets);
+    }
+  }
+}
+
+class RemappedSetBindGroupCommand {
+  constructor(handler, bindGroup, bindGroupId) {
+    this.type = 'renderState';
+    this._handler = handler;
+    this.kind = 'setBindGroup2';
+    this.groupIndex = 0;
+    this.bindGroupId = bindGroupId || 0;
+    this.bindGroup = bindGroup;
+    this._wgpuMeta = this;
+  }
+  run(ctl) {
+    if (!ctl.pass) return;
+    const h = this._handler;
+    if (
+      h &&
+      ctl.passKind === 'render' &&
+      h.elideRedundantState &&
+      h.elideRemappedBindGroups &&
+      !h._flushHasV1BindGroup &&
+      h._isPassBindGroupRedundant(ctl.pass, 0, this.bindGroup, null)
+    ) {
+      h.telemetry.elidedBindGroupSets += 1;
+      return;
+    }
+    ctl.pass.setBindGroup(0, this.bindGroup);
+    if (h && ctl.passKind === 'render') {
+      h._recordPassBindGroup(ctl.pass, 0, this.bindGroup, null);
+    }
+  }
+}
+
+class NoopRenderGroup0Command {
+  constructor(bindGroupId) {
+    this.type = 'renderState';
+    this.kind = 'setBindGroup2';
+    this.groupIndex = 0;
+    this.bindGroupId = bindGroupId || 0;
+    this._wgpuMeta = this;
+  }
+  run() {}
+}
+
+class BeginRenderPassCommand {
+  constructor(handler, decoded, resolvers, targetAttachmentIsSwapchain, staticTargetSize) {
+    this.type = 'renderState';
+    this._handler = handler;
+    this.kind = 'beginRenderPass';
+    this._rsPassOp = 'beginRenderPass';
+    this._wgpuMeta = this;
+    this._decoded = decoded;
+    this._resolvers = resolvers;
+    this._targetIsSwapchain = targetAttachmentIsSwapchain;
+    this._staticTargetSize = staticTargetSize;
+  }
+  run(ctl) {
+    const h = this._handler;
+    const desc = h.buildRenderPassDescriptor(this._decoded, this._resolvers, ctl);
+    const pass = ctl.beginRenderPass(desc);
+    const activePass = pass || ctl.pass || null;
+    h._activePass = activePass;
+    h._resetPassState(activePass);
+    h._activePassTargetSize =
+      h._lastPassReferenceSize ||
+      (this._targetIsSwapchain ? h._resolveSwapchainSize(ctl) : this._staticTargetSize);
   }
 }
 
@@ -2757,6 +2968,57 @@ class RenderStatePackets {
     this.pendingAsyncComputePipelines = new Map();
     this.layoutsByContent = new Map(); // 'bgl:<hex>' / 'pl:<hex>' -> object
     this.textureViews = new Map(); // textureId -> Map(descKey -> GPUTextureView)
+    // W354: WeakMap<GPUTexture, { defaultView, byKey }> caches GPUTextureViews by live texture object
+    // identity (automatic GC when textures are replaced/collected, zero Dawn IPC spam).
+    this._textureViewWeakCache = new WeakMap();
+    // W354: WeakMap<GPUPipeline, GPUBindGroupLayout> caches group-0 layout lookups on PresentX / auto-remap paths.
+    this._pipelineBglCache = new WeakMap();
+    // W354: per-pass state-change filter (default enabled) to elide redundant WebGPU state calls within a pass.
+    this.elideRedundantState = options.elideRedundantState !== false;
+    this.elideRemappedBindGroups = options.elideRemappedBindGroups === true;
+    this._flushHasV1BindGroup = false;
+    this._passState = {
+      pass: null,
+      hasViewport: false,
+      vpX: 0,
+      vpY: 0,
+      vpW: 0,
+      vpH: 0,
+      vpMinD: 0,
+      vpMaxD: 1,
+      vpRawX: 0,
+      vpRawY: 0,
+      vpRawW: 0,
+      vpRawH: 0,
+      vpRawMinD: 0,
+      vpRawMaxD: 1,
+      hasScissor: false,
+      scX: 0,
+      scY: 0,
+      scW: 0,
+      scH: 0,
+      scRawX: 0,
+      scRawY: 0,
+      scRawW: 0,
+      scRawH: 0,
+      hasBlend: false,
+      bcR: 0,
+      bcG: 0,
+      bcB: 0,
+      bcA: 0,
+      hasStencil: false,
+      stencilRef: 0,
+      bgMask: 0,
+      bgGroups: new Array(MAX_FAST_PASS_BG_SLOTS).fill(null),
+      bgHasOffsets: new Uint8Array(MAX_FAST_PASS_BG_SLOTS),
+      bgOffsetsLen: new Int32Array(MAX_FAST_PASS_BG_SLOTS),
+      bgOffsetsData: new Uint32Array(MAX_FAST_PASS_BG_SLOTS * MAX_FAST_PASS_DYN_OFFSETS),
+      bgOffsetsOverflow: new Array(MAX_FAST_PASS_BG_SLOTS).fill(null),
+      bgOverflow: null,
+    };
+    this._scratchSwapchainFormatDesc = { format: '' };
+    this._scratchLastRenderGroup0 = { bindGroupId: 0, bindGroupDesc: null, dynamicOffsets: EMPTY_DYNAMIC_OFFSETS };
+    this._scratchLastComputeGroup0 = { bindGroupId: 0, bindGroupDesc: null, dynamicOffsets: EMPTY_DYNAMIC_OFFSETS };
     this.textureMeta = new Map(); // textureId -> { id, requestedFormat, format, bcFallback, usage, width, height }
     this.dummies = new Map();
     this.emptyLayout = null;
@@ -2790,6 +3052,13 @@ class RenderStatePackets {
       clampedScissors: 0,
       strippedNonBlendableBlends: 0,
       sanitizedAttachments: 0,
+      elidedViewportSets: 0,
+      elidedScissorSets: 0,
+      elidedBlendConstantSets: 0,
+      elidedStencilRefSets: 0,
+      elidedBindGroupSets: 0,
+      textureViewCacheHits: 0,
+      textureViewCacheMisses: 0,
       warnings: [],
     };
     this._seenWarningKeys = new Set();
@@ -2812,8 +3081,145 @@ class RenderStatePackets {
         this._activePass = null;
         this._activePassTargetSize = null;
         this._lastPassReferenceSize = null;
+        this._resetPassState(null);
       },
     };
+  }
+
+  _resetPassState(pass) {
+    const ps = this._passState;
+    ps.pass = pass;
+    ps.hasViewport = false;
+    ps.hasScissor = false;
+    ps.hasBlend = false;
+    ps.hasStencil = false;
+    let mask = ps.bgMask;
+    while (mask !== 0) {
+      const bit = mask & -mask;
+      const slot = 31 - Math.clz32(bit);
+      mask ^= bit;
+      ps.bgGroups[slot] = null;
+      ps.bgHasOffsets[slot] = 0;
+      ps.bgOffsetsLen[slot] = 0;
+    }
+    ps.bgMask = 0;
+    if (ps.bgOverflow !== null && ps.bgOverflow.size > 0) {
+      ps.bgOverflow.clear();
+    }
+    return ps;
+  }
+
+  _syncPassState(pass) {
+    if (this._passState.pass !== pass) {
+      return this._resetPassState(pass);
+    }
+    return this._passState;
+  }
+
+  _isPassBindGroupRedundant(pass, groupIndex, bindGroup, offsets) {
+    if (!bindGroup || bindGroup.destroyed === true) return false;
+    const ps = this._syncPassState(pass);
+    const hasOff = offsets !== null && offsets !== undefined ? 1 : 0;
+    const len = hasOff === 1 ? offsets.length : 0;
+    if (groupIndex >= 0 && groupIndex < MAX_FAST_PASS_BG_SLOTS) {
+      const bit = 1 << groupIndex;
+      if ((ps.bgMask & bit) === 0 || ps.bgGroups[groupIndex] !== bindGroup) {
+        return false;
+      }
+      if (ps.bgHasOffsets[groupIndex] !== hasOff) {
+        // Treat null/undefined and empty [] offsets identically on the same bind group only when both have len === 0?
+        // Preserve strict match between explicit offsets array presence and length.
+        if (!(len === 0 && ps.bgOffsetsLen[groupIndex] === 0)) return false;
+      }
+      if (ps.bgOffsetsLen[groupIndex] !== len) return false;
+      if (len === 0) return true;
+      if (len <= MAX_FAST_PASS_DYN_OFFSETS) {
+        const base = groupIndex * MAX_FAST_PASS_DYN_OFFSETS;
+        const data = ps.bgOffsetsData;
+        for (let i = 0; i < len; i += 1) {
+          if (data[base + i] !== offsets[i]) return false;
+        }
+        return true;
+      }
+      const ov = ps.bgOffsetsOverflow[groupIndex];
+      if (!ov || ov.length < len) return false;
+      for (let i = 0; i < len; i += 1) {
+        if (ov[i] !== offsets[i]) return false;
+      }
+      return true;
+    }
+    if (ps.bgOverflow === null) return false;
+    const rec = ps.bgOverflow.get(groupIndex);
+    if (!rec || rec.bindGroup !== bindGroup || rec.len !== len) return false;
+    if (len === 0) return true;
+    for (let i = 0; i < len; i += 1) {
+      if (rec.offsets[i] !== offsets[i]) return false;
+    }
+    return true;
+  }
+
+  _recordPassBindGroup(pass, groupIndex, bindGroup, offsets) {
+    const ps = this._syncPassState(pass);
+    const hasOff = offsets !== null && offsets !== undefined ? 1 : 0;
+    const len = hasOff === 1 ? offsets.length : 0;
+    if (groupIndex >= 0 && groupIndex < MAX_FAST_PASS_BG_SLOTS) {
+      const bit = 1 << groupIndex;
+      ps.bgMask |= bit;
+      ps.bgGroups[groupIndex] = bindGroup;
+      ps.bgHasOffsets[groupIndex] = hasOff;
+      ps.bgOffsetsLen[groupIndex] = len;
+      if (len > 0) {
+        if (len <= MAX_FAST_PASS_DYN_OFFSETS) {
+          const base = groupIndex * MAX_FAST_PASS_DYN_OFFSETS;
+          const data = ps.bgOffsetsData;
+          for (let i = 0; i < len; i += 1) {
+            data[base + i] = offsets[i];
+          }
+        } else {
+          let ov = ps.bgOffsetsOverflow[groupIndex];
+          if (!ov || ov.length < len) {
+            ov = new Uint32Array(len);
+            ps.bgOffsetsOverflow[groupIndex] = ov;
+          }
+          for (let i = 0; i < len; i += 1) {
+            ov[i] = offsets[i];
+          }
+        }
+      }
+      return;
+    }
+    if (ps.bgOverflow === null) ps.bgOverflow = new Map();
+    let rec = ps.bgOverflow.get(groupIndex);
+    if (!rec) {
+      rec = { bindGroup, len, offsets: len > 0 ? new Uint32Array(len) : null };
+      ps.bgOverflow.set(groupIndex, rec);
+    } else {
+      rec.bindGroup = bindGroup;
+      rec.len = len;
+      if (len > 0 && (!rec.offsets || rec.offsets.length < len)) {
+        rec.offsets = new Uint32Array(len);
+      }
+    }
+    for (let i = 0; i < len; i += 1) {
+      rec.offsets[i] = offsets[i];
+    }
+  }
+
+  _getPipelineGroup0Layout(pipeline) {
+    if (!pipeline || typeof pipeline.getBindGroupLayout !== 'function') return null;
+    if (this._pipelineBglCache.has(pipeline)) {
+      return this._pipelineBglCache.get(pipeline);
+    }
+    let layout = null;
+    try {
+      layout = pipeline.getBindGroupLayout(0) || null;
+    } catch (_) {
+      layout = null;
+    }
+    if (layout) {
+      this._pipelineBglCache.set(pipeline, layout);
+    }
+    return layout;
   }
 
   getStats() {
@@ -2840,6 +3246,13 @@ class RenderStatePackets {
       clampedScissors: this.telemetry.clampedScissors,
       strippedNonBlendableBlends: this.telemetry.strippedNonBlendableBlends,
       sanitizedAttachments: this.telemetry.sanitizedAttachments,
+      elidedViewportSets: this.telemetry.elidedViewportSets,
+      elidedScissorSets: this.telemetry.elidedScissorSets,
+      elidedBlendConstantSets: this.telemetry.elidedBlendConstantSets,
+      elidedStencilRefSets: this.telemetry.elidedStencilRefSets,
+      elidedBindGroupSets: this.telemetry.elidedBindGroupSets,
+      textureViewCacheHits: this.telemetry.textureViewCacheHits,
+      textureViewCacheMisses: this.telemetry.textureViewCacheMisses,
     };
   }
 
@@ -2872,6 +3285,13 @@ class RenderStatePackets {
       clampedScissors: this.telemetry.clampedScissors,
       strippedNonBlendableBlends: this.telemetry.strippedNonBlendableBlends,
       sanitizedAttachments: this.telemetry.sanitizedAttachments,
+      elidedViewportSets: this.telemetry.elidedViewportSets,
+      elidedScissorSets: this.telemetry.elidedScissorSets,
+      elidedBlendConstantSets: this.telemetry.elidedBlendConstantSets,
+      elidedStencilRefSets: this.telemetry.elidedStencilRefSets,
+      elidedBindGroupSets: this.telemetry.elidedBindGroupSets,
+      textureViewCacheHits: this.telemetry.textureViewCacheHits,
+      textureViewCacheMisses: this.telemetry.textureViewCacheMisses,
       warnings: this.telemetry.warnings.slice(),
     };
   }
@@ -2945,14 +3365,14 @@ class RenderStatePackets {
         if (payloadBytes < BLEND_CONSTANTS_PACKET_BYTES) return this._count(false);
         const bc = decodeBlendConstantsPacket(view, offset, this._scratch.blendConstants);
         if (!bc) return this._count(false);
-        this.processor._passCommands.push(new SetBlendConstantCommand(bc.r, bc.g, bc.b, bc.a));
+        this.processor._passCommands.push(new SetBlendConstantCommand(this, bc.r, bc.g, bc.b, bc.a));
         return this._count(true);
       }
       case V2_OPCODES.SET_STENCIL_REFERENCE: {
         if (payloadBytes < STENCIL_REF_PACKET_BYTES) return this._count(false);
         const sr = decodeStencilRefPacket(view, offset, this._scratch.stencilRef);
         if (!sr) return this._count(false);
-        this.processor._passCommands.push(new SetStencilReferenceCommand(sr.reference));
+        this.processor._passCommands.push(new SetStencilReferenceCommand(this, sr.reference));
         return this._count(true);
       }
       case V2_OPCODES.CREATE_BIND_GROUP2:
@@ -2984,8 +3404,9 @@ class RenderStatePackets {
   }
 
   _invalidateRemappedBindGroupsForPipeline(pipelineId, isCompute) {
+    if (this.remappedBindGroups.size === 0) return;
     const prefix = `${isCompute ? 'c' : 'r'}:${pipelineId}:`;
-    for (const key of Array.from(this.remappedBindGroups.keys())) {
+    for (const key of this.remappedBindGroups.keys()) {
       if (key.startsWith(prefix)) {
         this.remappedBindGroups.delete(key);
       }
@@ -2993,8 +3414,9 @@ class RenderStatePackets {
   }
 
   _invalidateRemappedBindGroupsForBindGroup(bindGroupId) {
+    if (this.remappedBindGroups.size === 0) return;
     const target = String(bindGroupId);
-    for (const key of Array.from(this.remappedBindGroups.keys())) {
+    for (const key of this.remappedBindGroups.keys()) {
       // Key shape: '<c|r>:<pipeId>:<bgId>[@<dynOffsets>]'.
       const at = key.indexOf('@');
       const base = at >= 0 ? key.slice(0, at) : key;
@@ -3016,7 +3438,7 @@ class RenderStatePackets {
     }
   }
 
-  // W186: detect GPUDevice replacement or device-generation bump and flush device-bound caches.
+  // W186/W354: detect GPUDevice replacement or device-generation bump and flush device-bound caches.
   _syncDeviceGeneration() {
     const liveDevice = (this.processor && this.processor.device) || this.device;
     const liveGen =
@@ -3026,11 +3448,14 @@ class RenderStatePackets {
     if (liveDevice !== this.device || liveGen !== this._cachedDeviceGeneration) {
       this.invalidatePresentXCache();
       this.textureViews.clear();
+      this._textureViewWeakCache = new WeakMap();
+      this._pipelineBglCache = new WeakMap();
       this._textureViewOwners.clear();
       this.dummies.clear();
       this.remappedBindGroups.clear();
       this.emptyLayout = null;
       this.emptyFragment = null;
+      this._resetPassState(null);
       this.device = liveDevice;
       this._cachedDeviceGeneration = liveGen;
       return true;
@@ -3047,6 +3472,7 @@ class RenderStatePackets {
   _getTextureGeneration(textureId, liveTexture) {
     const prevOwner = this._textureViewOwners.get(textureId);
     if (liveTexture && prevOwner && prevOwner !== liveTexture) {
+      this._textureViewWeakCache.delete(prevOwner);
       this.textureViews.delete(textureId);
       this._invalidatePresentXCacheForResource(textureId);
       this._textureViewOwners.set(textureId, liveTexture);
@@ -3107,7 +3533,7 @@ class RenderStatePackets {
   _invalidatePresentXCacheForResource(resourceId) {
     if (this.presentxBindGroupCache.size === 0) return 0;
     let removed = 0;
-    for (const [key, entry] of Array.from(this.presentxBindGroupCache.entries())) {
+    for (const [key, entry] of this.presentxBindGroupCache.entries()) {
       if (
         entry.planeTextureId === resourceId ||
         entry.samplerId === resourceId ||
@@ -3128,7 +3554,7 @@ class RenderStatePackets {
       return count;
     }
     let removed = 0;
-    for (const [key, entry] of Array.from(this.presentxBindGroupCache.entries())) {
+    for (const [key, entry] of this.presentxBindGroupCache.entries()) {
       if (
         (filter.planeTextureId !== undefined && entry.planeTextureId === filter.planeTextureId) ||
         (filter.samplerId !== undefined && entry.samplerId === filter.samplerId) ||
@@ -3145,9 +3571,9 @@ class RenderStatePackets {
     return removed;
   }
 
-  // W186: hot-path PresentX multi-plane bind-group + texture-view cache.
+  // W186/W354: hot-path PresentX multi-plane bind-group + texture-view cache.
   // Caches per-(planeTextureId, viewFormat, sampler, pipeline/layout) across frames and invalidates
-  // automatically on texture handle/generation change, device change, reset, or destroy.
+  // automatically on texture handle/generation/destroyed change, device change, reset, or destroy.
   getOrCreatePresentXPlaneBindGroup(params) {
     if (this._destroyed || !params || typeof params !== 'object') return null;
     this._syncDeviceGeneration();
@@ -3159,24 +3585,31 @@ class RenderStatePackets {
     }
     const texture =
       this.processor && this.processor.textures ? this.processor.textures.get(planeTextureId) : null;
-    if (!texture || typeof texture.createView !== 'function') return null;
+    if (!texture || texture.destroyed === true || typeof texture.createView !== 'function') return null;
 
     const texGen = this._getTextureGeneration(planeTextureId, texture);
-    const baseViewDesc =
-      params.viewDesc && typeof params.viewDesc === 'object' ? { ...params.viewDesc } : {};
-    if (
+    const hasParamViewDesc = Boolean(params.viewDesc && typeof params.viewDesc === 'object');
+    const hasParamViewFormat =
       typeof params.viewFormat === 'string' &&
       params.viewFormat.length > 0 &&
-      params.viewFormat !== 'undefined' &&
-      !baseViewDesc.format
-    ) {
-      baseViewDesc.format = params.viewFormat;
+      params.viewFormat !== 'undefined';
+    let baseViewDesc;
+    if (hasParamViewDesc) {
+      if (hasParamViewFormat && !params.viewDesc.format) {
+        baseViewDesc = { ...params.viewDesc, format: params.viewFormat };
+      } else {
+        baseViewDesc = params.viewDesc;
+      }
+    } else if (hasParamViewFormat) {
+      const scratchDesc = this._scratchSwapchainFormatDesc;
+      scratchDesc.format = params.viewFormat;
+      baseViewDesc = scratchDesc;
+    } else {
+      baseViewDesc = null;
     }
     const resolvedViewFormat =
       this._resolveTextureFormat(planeTextureId, baseViewDesc) ||
-      (typeof params.viewFormat === 'string' && params.viewFormat !== 'undefined'
-        ? params.viewFormat
-        : 'default');
+      (hasParamViewFormat ? params.viewFormat : 'default');
     const viewDescKey = buildTextureViewKey(baseViewDesc);
 
     const samplerId = Number.isInteger(params.samplerId) && params.samplerId > 0 ? params.samplerId : 0;
@@ -3185,7 +3618,7 @@ class RenderStatePackets {
     if (!samplerObj && samplerId > 0 && this.processor && this.processor.samplers) {
       samplerObj = this.processor.samplers.get(samplerId) || null;
     }
-    if (!samplerObj) {
+    if (!samplerObj || samplerObj.destroyed === true) {
       const samplerKind =
         params.samplerKind === 'comparison' || params.samplerKind === 'non-filtering'
           ? params.samplerKind
@@ -3211,12 +3644,8 @@ class RenderStatePackets {
       const bglRec = this.bindGroupLayouts.get(layoutId);
       bindGroupLayout = bglRec ? bglRec.layout : null;
     }
-    if (!bindGroupLayout && pipelineObj && typeof pipelineObj.getBindGroupLayout === 'function') {
-      try {
-        bindGroupLayout = pipelineObj.getBindGroupLayout(0);
-      } catch (_) {
-        bindGroupLayout = null;
-      }
+    if (!bindGroupLayout && pipelineObj) {
+      bindGroupLayout = this._getPipelineGroup0Layout(pipelineObj);
     }
     if (!bindGroupLayout) return null;
 
@@ -3232,8 +3661,14 @@ class RenderStatePackets {
       cached.device === this.device &&
       cached.deviceGeneration === this._cachedDeviceGeneration &&
       cached.texture === texture &&
+      cached.texture.destroyed !== true &&
+      cached.view &&
+      cached.view.destroyed !== true &&
+      cached.bindGroup &&
+      cached.bindGroup.destroyed !== true &&
       cached.textureGen === texGen &&
       cached.sampler === samplerObj &&
+      cached.sampler.destroyed !== true &&
       cached.layout === bindGroupLayout &&
       cached.pipeline === (pipelineObj || null)
     ) {
@@ -3245,7 +3680,7 @@ class RenderStatePackets {
       return { view: cached.view, bindGroup: cached.bindGroup, hit: true, cacheKey };
     }
 
-    const view = this._textureView(planeTextureId, baseViewDesc);
+    const view = this._textureView(planeTextureId, baseViewDesc || {});
     if (!view) return null;
 
     let bindGroup;
@@ -3292,6 +3727,8 @@ class RenderStatePackets {
   reset() {
     this.invalidatePresentXCache();
     this.textureViews.clear();
+    this._textureViewWeakCache = new WeakMap();
+    this._pipelineBglCache = new WeakMap();
     this._textureViewOwners.clear();
     this.remappedBindGroups.clear();
     this.dummies.clear();
@@ -3300,6 +3737,7 @@ class RenderStatePackets {
     this._activePass = null;
     this._activePassTargetSize = null;
     this._lastPassReferenceSize = null;
+    this._resetPassState(null);
   }
 
   destroy() {
@@ -3334,7 +3772,15 @@ class RenderStatePackets {
     this._invalidateRemappedBindGroupsForBindGroup(id);
     this._invalidatePresentXCacheForResource(id);
     this._bumpTextureGeneration(id);
-    this._textureViewOwners.delete(id);
+    const prevOwner = this._textureViewOwners.get(id);
+    if (prevOwner) {
+      this._textureViewWeakCache.delete(prevOwner);
+      this._textureViewOwners.delete(id);
+    }
+    const liveTex = this.processor && this.processor.textures ? this.processor.textures.get(id) : null;
+    if (liveTex) {
+      this._textureViewWeakCache.delete(liveTex);
+    }
     this.textureViews.delete(id);
     this.textureMeta.delete(id);
     if (
@@ -4413,6 +4859,8 @@ class RenderStatePackets {
   // immediately before WgpuCommandProcessor._flushPresent() executes them.
   _preparePassCommandsForFlush() {
     this._syncDeviceGeneration();
+    this._flushHasV1BindGroup = false;
+    this._resetPassState(null);
     const cmds = this.processor && this.processor._passCommands;
     if (!Array.isArray(cmds) || cmds.length === 0) return;
 
@@ -4422,44 +4870,37 @@ class RenderStatePackets {
     let activeComputeAutoLayout = null;
     let hadExplicitSetComputePipeline = false;
     let group0BoundForCompute = false;
-    let lastComputeGroup0 = null;
+    let hasLastComputeGroup0 = false;
+    const lastComputeGroup0 = this._scratchLastComputeGroup0;
 
     let activeRenderPipelineId = null;
     let activeRenderAutoLayout = null;
     let group0BoundForRender = false;
-    let lastRenderGroup0 = null;
+    let hasLastRenderGroup0 = false;
+    const lastRenderGroup0 = this._scratchLastRenderGroup0;
     // W103: the bound pipeline is still compiling asynchronously; skip its draws/dispatches.
     let activeRenderPending = false;
     let activeComputePending = false;
 
-    let modified = false;
-    const filtered = [];
-
-    const makeRemappedSetBindGroupCmd = (bindGroup, bindGroupId) => ({
-      type: 'renderState',
-      run: (ctl) => {
-        if (ctl.pass) ctl.pass.setBindGroup(0, bindGroup);
-      },
-      _wgpuMeta: {
-        kind: 'setBindGroup2',
-        groupIndex: 0,
-        bindGroupId: bindGroupId || 0,
-      },
-    });
-
-    const makeNoopRenderGroup0Cmd = (bindGroupId) => ({
-      type: 'renderState',
-      run: () => {},
-      _wgpuMeta: {
-        kind: 'setBindGroup2',
-        groupIndex: 0,
-        bindGroupId: bindGroupId || 0,
-      },
-    });
+    // W354: lazily allocate `filtered` ONLY if the command stream actually needs modification
+    // (zero array allocation on steady-state frames!).
+    let filtered = null;
+    const ensureFiltered = (copyUpTo) => {
+      if (filtered === null) {
+        filtered = new Array(copyUpTo);
+        for (let k = 0; k < copyUpTo; k += 1) {
+          filtered[k] = cmds[k];
+        }
+      }
+      return filtered;
+    };
 
     for (let i = 0; i < cmds.length; i += 1) {
       const cmd = cmds[i];
-      if (!cmd) continue;
+      if (!cmd) {
+        ensureFiltered(i);
+        continue;
+      }
 
       const passOpKind =
         (cmd._wgpuMeta && cmd._wgpuMeta.kind) || cmd._rsPassOp || null;
@@ -4470,14 +4911,14 @@ class RenderStatePackets {
         activeComputeAutoLayout = null;
         hadExplicitSetComputePipeline = false;
         group0BoundForCompute = false;
-        lastComputeGroup0 = null;
+        hasLastComputeGroup0 = false;
         activeRenderPipelineId = null;
         activeRenderAutoLayout = null;
         group0BoundForRender = false;
-        lastRenderGroup0 = null;
+        hasLastRenderGroup0 = false;
         activeRenderPending = false;
         activeComputePending = false;
-        filtered.push(cmd);
+        if (filtered !== null) filtered.push(cmd);
         continue;
       }
 
@@ -4488,7 +4929,7 @@ class RenderStatePackets {
         activeComputeAutoLayout = null;
         hadExplicitSetComputePipeline = false;
         group0BoundForCompute = false;
-        lastComputeGroup0 = null;
+        hasLastComputeGroup0 = false;
         activeComputePending = false;
         activeRenderPipelineId = cmd.pipelineId;
         activeRenderPending = this.isAsyncPipelinePending(cmd.pipelineId, false);
@@ -4496,13 +4937,13 @@ class RenderStatePackets {
           // Never bind an undefined pipeline; its draws are dropped until the compile resolves.
           activeRenderAutoLayout = null;
           group0BoundForRender = false;
-          modified = true;
+          ensureFiltered(i);
           continue;
         }
         const rMeta = this.renderPipelineAutoLayoutMeta.get(cmd.pipelineId) || null;
         activeRenderAutoLayout = rMeta && rMeta.autoLayoutRemap ? rMeta : null;
         group0BoundForRender = false;
-        filtered.push(cmd);
+        if (filtered !== null) filtered.push(cmd);
         continue;
       }
 
@@ -4511,7 +4952,7 @@ class RenderStatePackets {
         activeRenderPipelineId = null;
         activeRenderAutoLayout = null;
         group0BoundForRender = false;
-        lastRenderGroup0 = null;
+        hasLastRenderGroup0 = false;
         activeRenderPending = false;
         hadExplicitSetComputePipeline = true;
         activeComputePipelineId = cmd.pipelineId;
@@ -4520,7 +4961,7 @@ class RenderStatePackets {
           activeComputePipelineValid = false;
           activeComputeAutoLayout = null;
           group0BoundForCompute = false;
-          modified = true;
+          ensureFiltered(i);
           continue;
         }
         activeComputePipelineValid = Boolean(
@@ -4533,17 +4974,20 @@ class RenderStatePackets {
             `missing-compute-pipeline:${cmd.pipelineId}`,
             `compute pipeline ${cmd.pipelineId} unavailable; subsequent dispatches will be skipped`
           );
-          modified = true;
+          ensureFiltered(i);
           continue;
         }
         const cMeta = this.computePipelineMeta.get(cmd.pipelineId) || null;
         activeComputeAutoLayout = cMeta && cMeta.autoLayoutRemap ? cMeta : null;
         group0BoundForCompute = false;
-        filtered.push(cmd);
+        if (filtered !== null) filtered.push(cmd);
         continue;
       }
 
       const isSetBgV1 = cmd.type === 'setBindGroup';
+      if (isSetBgV1) {
+        this._flushHasV1BindGroup = true;
+      }
       const isSetBgV2 = Boolean(cmd._rsSetBindGroup || passOpKind === 'setBindGroup2');
       if (isSetBgV1 || isSetBgV2) {
         let groupIndex;
@@ -4574,7 +5018,10 @@ class RenderStatePackets {
 
         if (groupIndex === 0) {
           if (activePassMode === 'compute') {
-            lastComputeGroup0 = { bindGroupId, bindGroupDesc, dynamicOffsets };
+            lastComputeGroup0.bindGroupId = bindGroupId;
+            lastComputeGroup0.bindGroupDesc = bindGroupDesc;
+            lastComputeGroup0.dynamicOffsets = dynamicOffsets;
+            hasLastComputeGroup0 = true;
             if (activeComputePipelineValid && activeComputeAutoLayout) {
               const pipeline = this.processor.computePipelines.get(activeComputePipelineId);
               const res = this._getOrCreateRemappedBindGroup(
@@ -4588,17 +5035,19 @@ class RenderStatePackets {
               );
               group0BoundForCompute = true;
               if (res.status === 'ok') {
-                filtered.push(makeRemappedSetBindGroupCmd(res.bindGroup, bindGroupId));
-                modified = true;
+                ensureFiltered(i).push(new RemappedSetBindGroupCommand(this, res.bindGroup, bindGroupId));
                 continue;
               }
               if (res.status === 'empty') {
-                modified = true;
+                ensureFiltered(i);
                 continue;
               }
             }
           } else if (activePassMode === 'render') {
-            lastRenderGroup0 = { bindGroupId, bindGroupDesc, dynamicOffsets };
+            lastRenderGroup0.bindGroupId = bindGroupId;
+            lastRenderGroup0.bindGroupDesc = bindGroupDesc;
+            lastRenderGroup0.dynamicOffsets = dynamicOffsets;
+            hasLastRenderGroup0 = true;
             if (activeRenderAutoLayout) {
               const pipeline = this.processor.pipelines.get(activeRenderPipelineId);
               const res = this._getOrCreateRemappedBindGroup(
@@ -4612,22 +5061,26 @@ class RenderStatePackets {
               );
               group0BoundForRender = true;
               if (res.status === 'ok') {
-                filtered.push(makeRemappedSetBindGroupCmd(res.bindGroup, bindGroupId));
-                modified = true;
+                ensureFiltered(i).push(new RemappedSetBindGroupCommand(this, res.bindGroup, bindGroupId));
                 continue;
               }
               if (res.status === 'empty') {
-                filtered.push(makeNoopRenderGroup0Cmd(bindGroupId));
-                modified = true;
+                ensureFiltered(i).push(new NoopRenderGroup0Command(bindGroupId));
                 continue;
               }
             }
           } else {
-            lastRenderGroup0 = { bindGroupId, bindGroupDesc, dynamicOffsets };
-            lastComputeGroup0 = { bindGroupId, bindGroupDesc, dynamicOffsets };
+            lastRenderGroup0.bindGroupId = bindGroupId;
+            lastRenderGroup0.bindGroupDesc = bindGroupDesc;
+            lastRenderGroup0.dynamicOffsets = dynamicOffsets;
+            hasLastRenderGroup0 = true;
+            lastComputeGroup0.bindGroupId = bindGroupId;
+            lastComputeGroup0.bindGroupDesc = bindGroupDesc;
+            lastComputeGroup0.dynamicOffsets = dynamicOffsets;
+            hasLastComputeGroup0 = true;
           }
         }
-        filtered.push(cmd);
+        if (filtered !== null) filtered.push(cmd);
         continue;
       }
 
@@ -4638,42 +5091,42 @@ class RenderStatePackets {
         activeComputeAutoLayout = null;
         hadExplicitSetComputePipeline = false;
         group0BoundForCompute = false;
-        lastComputeGroup0 = null;
+        hasLastComputeGroup0 = false;
         activeComputePending = false;
         if (activeRenderPending) {
           this.telemetry.pendingAsyncPipelineSkips += 1;
-          modified = true;
+          ensureFiltered(i);
           continue;
         }
         if (activeRenderAutoLayout && !group0BoundForRender) {
           const pipeline = this.processor.pipelines.get(activeRenderPipelineId);
-          const src = lastRenderGroup0 || { bindGroupId: 0, bindGroupDesc: null, dynamicOffsets: [] };
+          const srcBgId = hasLastRenderGroup0 ? lastRenderGroup0.bindGroupId : 0;
+          const srcBgDesc = hasLastRenderGroup0 ? lastRenderGroup0.bindGroupDesc : null;
+          const srcDynOff = hasLastRenderGroup0 ? lastRenderGroup0.dynamicOffsets : EMPTY_DYNAMIC_OFFSETS;
           const res = this._getOrCreateRemappedBindGroup(
             false,
             activeRenderPipelineId,
             pipeline,
             activeRenderAutoLayout.wgslBindings,
-            src.bindGroupId,
-            src.bindGroupDesc,
-            src.dynamicOffsets
+            srcBgId,
+            srcBgDesc,
+            srcDynOff
           );
           group0BoundForRender = true;
           if (res.status === 'ok') {
-            filtered.push(makeRemappedSetBindGroupCmd(res.bindGroup, src.bindGroupId));
-            modified = true;
+            ensureFiltered(i).push(new RemappedSetBindGroupCommand(this, res.bindGroup, srcBgId));
           } else if (res.status === 'empty') {
-            filtered.push(makeNoopRenderGroup0Cmd(src.bindGroupId));
-            modified = true;
+            ensureFiltered(i).push(new NoopRenderGroup0Command(srcBgId));
           }
         }
-        filtered.push(cmd);
+        if (filtered !== null) filtered.push(cmd);
         continue;
       }
 
       if (cmd.type === 'dispatchCompute') {
         if (activeComputePending) {
           this.telemetry.pendingAsyncPipelineSkips += 1;
-          modified = true;
+          ensureFiltered(i);
           continue;
         }
         if (hadExplicitSetComputePipeline && !activeComputePipelineValid) {
@@ -4682,7 +5135,7 @@ class RenderStatePackets {
             `skip-dispatch-no-pipeline:${activeComputePipelineId}`,
             `skipped compute dispatch: compute pipeline ${activeComputePipelineId} is unavailable`
           );
-          modified = true;
+          ensureFiltered(i);
           continue;
         }
         const rawX = cmd.workgroupX;
@@ -4695,7 +5148,7 @@ class RenderStatePackets {
             `skip-dispatch-zero:${rawX}x${rawY}x${rawZ}`,
             `skipped compute dispatch with zero or invalid workgroups (${rawX}x${rawY}x${rawZ})`
           );
-          modified = true;
+          ensureFiltered(i);
           continue;
         }
         if (check.clamped) {
@@ -4710,31 +5163,32 @@ class RenderStatePackets {
         }
         if (activeComputeAutoLayout && !group0BoundForCompute) {
           const pipeline = this.processor.computePipelines.get(activeComputePipelineId);
-          const src = lastComputeGroup0 || { bindGroupId: 0, bindGroupDesc: null, dynamicOffsets: [] };
+          const srcBgId = hasLastComputeGroup0 ? lastComputeGroup0.bindGroupId : 0;
+          const srcBgDesc = hasLastComputeGroup0 ? lastComputeGroup0.bindGroupDesc : null;
+          const srcDynOff = hasLastComputeGroup0 ? lastComputeGroup0.dynamicOffsets : EMPTY_DYNAMIC_OFFSETS;
           const res = this._getOrCreateRemappedBindGroup(
             true,
             activeComputePipelineId,
             pipeline,
             activeComputeAutoLayout.wgslBindings,
-            src.bindGroupId,
-            src.bindGroupDesc,
-            src.dynamicOffsets
+            srcBgId,
+            srcBgDesc,
+            srcDynOff
           );
           group0BoundForCompute = true;
           if (res.status === 'ok') {
-            filtered.push(makeRemappedSetBindGroupCmd(res.bindGroup, src.bindGroupId));
-            modified = true;
+            ensureFiltered(i).push(new RemappedSetBindGroupCommand(this, res.bindGroup, srcBgId));
           }
         }
         this.telemetry.computeDispatchCount += 1;
-        filtered.push(cmd);
+        if (filtered !== null) filtered.push(cmd);
         continue;
       }
 
-      filtered.push(cmd);
+      if (filtered !== null) filtered.push(cmd);
     }
 
-    if (modified) {
+    if (filtered !== null) {
       this.processor._passCommands = filtered;
     }
   }
@@ -4764,6 +5218,14 @@ class RenderStatePackets {
     }
 
     const id = decoded.id;
+    const prevTexture = this.processor && this.processor.textures ? this.processor.textures.get(id) : null;
+    if (prevTexture) {
+      this._textureViewWeakCache.delete(prevTexture);
+    }
+    const prevOwner = this._textureViewOwners.get(id);
+    if (prevOwner) {
+      this._textureViewWeakCache.delete(prevOwner);
+    }
     if (typeof this.processor._destroyTextureIfPresent === 'function') {
       this.processor._destroyTextureIfPresent(id);
     }
@@ -4856,26 +5318,46 @@ class RenderStatePackets {
     return null;
   }
 
-  _textureView(textureId, desc) {
-    this._syncDeviceGeneration();
-    const texture = this.processor.textures.get(textureId);
-    if (!texture || typeof texture.createView !== 'function') return null;
-    this._getTextureGeneration(textureId, texture);
-    let effectiveDesc = desc;
-    const meta = this.textureMeta.get(textureId);
-    if (effectiveDesc && typeof effectiveDesc.format === 'string' && meta) {
-      if (meta.bcFallback && isBcCompressedFormat(effectiveDesc.format)) {
-        effectiveDesc = { ...effectiveDesc, format: meta.format };
+  // W354: WeakMap<GPUTexture, { defaultView, byKey }> texture-view cache respecting W347 1D->2D
+  // promoted LUT coercion and reverse 1D guard, with zero descriptor allocation on cache hits.
+  getOrCreateTextureView(texture, desc = null, meta = null, textureIdForError = 0) {
+    if (!texture || typeof texture !== 'object') return null;
+    if (texture.destroyed === true) {
+      this._textureViewWeakCache.delete(texture);
+      return null;
+    }
+    if (typeof texture.createView !== 'function') return null;
+
+    const hasDesc = Boolean(desc && typeof desc === 'object');
+    let effFormat = hasDesc && typeof desc.format === 'string' && desc.format !== '' ? desc.format : '';
+    let effDim = hasDesc && typeof desc.dimension === 'string' && desc.dimension !== '' ? desc.dimension : '';
+    const effAspect = hasDesc && typeof desc.aspect === 'string' && desc.aspect !== '' ? desc.aspect : '';
+    let effBaseMip = hasDesc && desc.baseMipLevel !== undefined ? desc.baseMipLevel : undefined;
+    let effMipCount = hasDesc && desc.mipLevelCount !== undefined ? desc.mipLevelCount : undefined;
+    let effBaseLayer = hasDesc && desc.baseArrayLayer !== undefined ? desc.baseArrayLayer : undefined;
+    let effLayerCount = hasDesc && desc.arrayLayerCount !== undefined ? desc.arrayLayerCount : undefined;
+    let modified = false;
+
+    if (effFormat && meta) {
+      if (meta.bcFallback && isBcCompressedFormat(effFormat)) {
+        effFormat = meta.format;
+        modified = true;
       } else if (
         meta.formatFallback &&
-        effectiveDesc.format === 'depth32float-stencil8' &&
+        effFormat === 'depth32float-stencil8' &&
         meta.format === 'depth24plus-stencil8'
       ) {
-        effectiveDesc = { ...effectiveDesc, format: meta.format };
+        effFormat = meta.format;
+        modified = true;
       }
     }
+
     const actualTexDim = this._resolveActualTextureDimension(texture, meta);
-    const isPromoted1DTo2D = Boolean(meta && meta.promoted1DTo2D === true);
+    const isPromoted1DTo2D = Boolean(
+      (meta && meta.promoted1DTo2D === true) ||
+        texture.promoted1DTo2D === true ||
+        (texture.desc && texture.desc.promoted1DTo2D === true)
+    );
     const texMipCount =
       typeof texture.mipLevelCount === 'number' && texture.mipLevelCount >= 1
         ? texture.mipLevelCount
@@ -4888,97 +5370,180 @@ class RenderStatePackets {
             : isPromoted1DTo2D
               ? 1
               : null;
-    if (
-      effectiveDesc &&
-      effectiveDesc.dimension === '1d' &&
-      (actualTexDim === '2d' || isPromoted1DTo2D)
-    ) {
+
+    if (hasDesc && effDim === '1d' && (actualTexDim === '2d' || isPromoted1DTo2D)) {
       // W347: W341/W342 promote 1D LUT textures (e.g. 4096x1) to WebGPU dimension '2d';
       // coerce explicit '1d' view descriptors to '2d' with valid single-layer/mip bounds.
-      const coerced = {
-        ...effectiveDesc,
-        dimension: '2d',
-        baseArrayLayer: 0,
-        arrayLayerCount: 1,
-      };
+      effDim = '2d';
+      effBaseLayer = 0;
+      effLayerCount = 1;
       if (isPromoted1DTo2D || texMipCount === 1) {
-        if (coerced.baseMipLevel !== undefined && coerced.baseMipLevel !== 0) {
-          coerced.baseMipLevel = 0;
+        if (effBaseMip !== undefined && effBaseMip !== 0) {
+          effBaseMip = 0;
         }
-        coerced.mipLevelCount = 1;
+        effMipCount = 1;
       }
-      effectiveDesc = coerced;
+      modified = true;
     } else if (
       actualTexDim === '1d' &&
-      effectiveDesc &&
-      typeof effectiveDesc.dimension === 'string' &&
-      effectiveDesc.dimension !== 'undefined' &&
-      effectiveDesc.dimension !== '1d'
+      hasDesc &&
+      effDim &&
+      effDim !== 'undefined' &&
+      effDim !== '1d'
     ) {
       // W347: Reverse guard — real WebGPU '1d' textures only allow '1d' views (1 mip, 1 layer).
-      const coerced = { ...effectiveDesc, dimension: '1d' };
-      if (coerced.baseArrayLayer !== undefined && coerced.baseArrayLayer !== 0) {
-        coerced.baseArrayLayer = 0;
-      }
-      if (coerced.arrayLayerCount !== undefined && coerced.arrayLayerCount !== 1) {
-        coerced.arrayLayerCount = 1;
-      }
-      if (coerced.baseMipLevel !== undefined && coerced.baseMipLevel !== 0) {
-        coerced.baseMipLevel = 0;
-      }
-      if (coerced.mipLevelCount !== undefined && coerced.mipLevelCount !== 1) {
-        coerced.mipLevelCount = 1;
-      }
-      effectiveDesc = coerced;
+      effDim = '1d';
+      if (effBaseLayer !== undefined && effBaseLayer !== 0) effBaseLayer = 0;
+      if (effLayerCount !== undefined && effLayerCount !== 1) effLayerCount = 1;
+      if (effBaseMip !== undefined && effBaseMip !== 0) effBaseMip = 0;
+      if (effMipCount !== undefined && effMipCount !== 1) effMipCount = 1;
+      modified = true;
     }
-    const key = buildTextureViewKey(effectiveDesc);
-    let views = this.textureViews.get(textureId);
-    if (!views) {
-      views = new Map();
-      this.textureViews.set(textureId, views);
-    }
-    let textureView = views.get(key);
-    if (!textureView) {
+
+    const bMip = effBaseMip || 0;
+    const mCnt = effMipCount || 0;
+    const bLay = effBaseLayer || 0;
+    const lCnt = effLayerCount || 0;
+    const isDefaultKey = !effFormat && !effDim && !effAspect && !bMip && !mCnt && !bLay && !lCnt;
+
+    let record = this._textureViewWeakCache.get(texture);
+    if (isDefaultKey) {
+      if (record && record.defaultView) {
+        if (record.defaultView.destroyed !== true) {
+          this.telemetry.textureViewCacheHits += 1;
+          return record.defaultView;
+        }
+        record.defaultView = null;
+      }
+      this.telemetry.textureViewCacheMisses += 1;
+      let view;
       try {
-        textureView = texture.createView(effectiveDesc);
+        view = hasDesc ? texture.createView(desc) : texture.createView();
       } catch (err) {
-        this._packetError = `texture ${textureId} createView: ${String(
-          err && err.message ? err.message : err
-        )}`;
+        if (textureIdForError) {
+          this._packetError = `texture ${textureIdForError} createView: ${String(
+            err && err.message ? err.message : err
+          )}`;
+        }
         return null;
       }
-      views.set(key, textureView);
+      if (view && typeof view === 'object') {
+        if (!record) {
+          this._textureViewWeakCache.set(texture, { defaultView: view, byKey: null });
+        } else {
+          record.defaultView = view;
+        }
+      }
+      return view;
+    }
+
+    const key = `${effFormat}|${effDim}|${effAspect}|${bMip}|${mCnt}|${bLay}|${lCnt}`;
+    if (record && record.byKey !== null) {
+      const cached = record.byKey.get(key);
+      if (cached) {
+        if (cached.destroyed !== true) {
+          this.telemetry.textureViewCacheHits += 1;
+          return cached;
+        }
+        record.byKey.delete(key);
+      }
+    }
+
+    this.telemetry.textureViewCacheMisses += 1;
+    let createDesc;
+    if (!modified && hasDesc) {
+      createDesc = desc;
+    } else {
+      createDesc = hasDesc ? { ...desc } : {};
+      if (effFormat) createDesc.format = effFormat;
+      if (effDim) createDesc.dimension = effDim;
+      if (effAspect) createDesc.aspect = effAspect;
+      if (effBaseMip !== undefined) createDesc.baseMipLevel = effBaseMip;
+      if (effMipCount !== undefined) createDesc.mipLevelCount = effMipCount;
+      if (effBaseLayer !== undefined) createDesc.baseArrayLayer = effBaseLayer;
+      if (effLayerCount !== undefined) createDesc.arrayLayerCount = effLayerCount;
+    }
+
+    let textureView;
+    try {
+      textureView = texture.createView(createDesc);
+    } catch (err) {
+      if (textureIdForError) {
+        this._packetError = `texture ${textureIdForError} createView: ${String(
+          err && err.message ? err.message : err
+        )}`;
+      }
+      return null;
+    }
+    if (textureView && typeof textureView === 'object') {
+      if (!record) {
+        const byKey = new Map();
+        byKey.set(key, textureView);
+        this._textureViewWeakCache.set(texture, { defaultView: null, byKey });
+      } else {
+        if (record.byKey === null) {
+          record.byKey = new Map();
+        } else if (record.byKey.size >= MAX_VIEWS_PER_TEXTURE) {
+          const oldestKey = record.byKey.keys().next().value;
+          record.byKey.delete(oldestKey);
+        }
+        record.byKey.set(key, textureView);
+      }
     }
     return textureView;
   }
 
+  _textureView(textureId, desc) {
+    this._syncDeviceGeneration();
+    const texture = this.processor.textures.get(textureId);
+    if (!texture || texture.destroyed === true || typeof texture.createView !== 'function') {
+      if (texture && texture.destroyed === true) {
+        this._textureViewWeakCache.delete(texture);
+        this.textureViews.delete(textureId);
+      }
+      return null;
+    }
+    this._getTextureGeneration(textureId, texture);
+    const meta = this.textureMeta.get(textureId) || null;
+    return this.getOrCreateTextureView(texture, desc, meta, textureId);
+  }
+
   // Attachment view resolver; the canvas texture only exists at Present (ctl.swapchainView).
+  // W354: non-swapchain attachments store the GPUTextureView directly (zero per-attachment closure);
+  // swapchain format views are cached in WeakMap<GPUTexture, ...> to avoid repeated createView() IPC.
   _attachmentView(textureId, desc) {
     if (textureId === SWAPCHAIN_TEXTURE_ID) {
       const requestedFormat =
         desc && typeof desc.format === 'string' && desc.format !== 'undefined' ? desc.format : null;
+      if (!requestedFormat) {
+        return SWAPCHAIN_VIEW_SENTINEL;
+      }
       return (ctl) => {
         if (
-          requestedFormat &&
           ctl &&
           ctl.swapchainTexture &&
+          ctl.swapchainTexture.destroyed !== true &&
           typeof ctl.swapchainTexture.createView === 'function' &&
           this.processor &&
           this.processor._swapchainViewFormat &&
           this.processor._swapchainViewFormat !== requestedFormat &&
           (!this.processor._swapchain || !this.processor._swapchain.usesBlitFallback)
         ) {
-          try {
-            return ctl.swapchainTexture.createView({ format: requestedFormat });
-          } catch (_) {
-            // Fall back to ctl.swapchainView if the swapchain texture does not support requestedFormat.
-          }
+          const formatDesc = this._scratchSwapchainFormatDesc;
+          formatDesc.format = requestedFormat;
+          const cachedView = this.getOrCreateTextureView(ctl.swapchainTexture, formatDesc, null, 0);
+          if (cachedView) return cachedView;
         }
         return ctl.swapchainView;
       };
     }
-    const textureView = this._textureView(textureId, desc);
-    return textureView ? () => textureView : null;
+    return this._textureView(textureId, desc);
+  }
+
+  _resolveAttachmentEntry(entry, ctl) {
+    if (entry === SWAPCHAIN_VIEW_SENTINEL) return ctl.swapchainView;
+    if (typeof entry === 'function') return entry(ctl);
+    return entry;
   }
 
   _textureAttachmentSize(textureId, viewDesc) {
@@ -5075,20 +5640,27 @@ class RenderStatePackets {
 
   // The exact GPURenderPassDescriptor for a decoded BeginRenderPass (views resolved via `ctl`).
   buildRenderPassDescriptor(decoded, resolvers, ctl) {
-    const colorSizes = [];
-    const colorAttachments = decoded.colors.map((c, i) => {
+    const colorCount = decoded.colors.length;
+    const colorSizes = new Array(colorCount);
+    const colorAttachments = new Array(colorCount);
+    for (let i = 0; i < colorCount; i += 1) {
+      const c = decoded.colors[i];
       if (!c) {
-        colorSizes.push(null);
-        return null;
+        colorSizes[i] = null;
+        colorAttachments[i] = null;
+        continue;
       }
-      colorSizes.push(
+      colorSizes[i] =
         c.textureId === SWAPCHAIN_TEXTURE_ID
           ? this._resolveSwapchainSize(ctl)
-          : this._textureAttachmentSize(c.textureId, c.view)
-      );
+          : this._textureAttachmentSize(c.textureId, c.view);
       const loadOp = c.loadOp === 'clear' || c.loadOp === 'load' ? c.loadOp : 'load';
       const storeOp = c.storeOp === 'discard' || c.storeOp === 'store' ? c.storeOp : 'store';
-      const attachment = { view: resolvers.colors[i](ctl), loadOp, storeOp };
+      const attachment = {
+        view: this._resolveAttachmentEntry(resolvers.colors[i], ctl),
+        loadOp,
+        storeOp,
+      };
       if (loadOp === 'clear') {
         attachment.clearValue = {
           r: finiteOr(c.clearValue && c.clearValue.r, 0) || 0,
@@ -5097,8 +5669,8 @@ class RenderStatePackets {
           a: finiteOr(c.clearValue && c.clearValue.a, 1) || 0,
         };
       }
-      return attachment;
-    });
+      colorAttachments[i] = attachment;
+    }
     const descriptor = { colorAttachments };
     const d = decoded.depthStencil;
     let depthStencilSize = null;
@@ -5107,7 +5679,7 @@ class RenderStatePackets {
         d.textureId === SWAPCHAIN_TEXTURE_ID
           ? this._resolveSwapchainSize(ctl)
           : this._textureAttachmentSize(d.textureId, d.view);
-      const ds = { view: resolvers.depthStencil(ctl) };
+      const ds = { view: this._resolveAttachmentEntry(resolvers.depthStencil, ctl) };
       if (d.depthLoadOp !== 0) {
         ds.depthLoadOp = nameOf(LOAD_OP_NAMES, d.depthLoadOp);
         ds.depthStoreOp = nameOf(STORE_OP_NAMES, d.depthStoreOp);
@@ -5159,10 +5731,17 @@ class RenderStatePackets {
 
   _beginRenderPass(view, offset) {
     const decoded = decodeBeginRenderPass(view, offset);
-    const resolvers = { colors: [], depthStencil: null };
-    for (const c of decoded.colors) {
+    const colorCount = decoded.colors.length;
+    const colorResolvers = new Array(colorCount);
+    let targetAttachment = null;
+    for (let i = 0; i < colorCount; i += 1) {
+      const c = decoded.colors[i];
+      if (!c) {
+        colorResolvers[i] = null;
+        continue;
+      }
+      if (!targetAttachment) targetAttachment = c;
       if (
-        c &&
         c.textureId === SWAPCHAIN_TEXTURE_ID &&
         c.view &&
         c.view.format &&
@@ -5172,40 +5751,34 @@ class RenderStatePackets {
         // #709: match canvas swapchain format to the stream's declared attachment format.
         this.processor.setSwapchainFormat(c.view.format);
       }
-      const resolver = c ? this._attachmentView(c.textureId, c.view) : null;
-      if (c && !resolver) {
+      const resolver = this._attachmentView(c.textureId, c.view);
+      if (!resolver) {
         return this._missingRenderPassTexture(c.textureId);
       }
-      resolvers.colors.push(resolver);
+      colorResolvers[i] = resolver;
     }
+    let dsResolver = null;
     if (decoded.depthStencil) {
-      resolvers.depthStencil = this._attachmentView(decoded.depthStencil.textureId, decoded.depthStencil.view);
-      if (!resolvers.depthStencil) {
+      if (!targetAttachment) targetAttachment = decoded.depthStencil;
+      dsResolver = this._attachmentView(decoded.depthStencil.textureId, decoded.depthStencil.view);
+      if (!dsResolver) {
         return this._missingRenderPassTexture(decoded.depthStencil.textureId);
       }
     }
-    const targetAttachment = decoded.colors.find((c) => c !== null) || decoded.depthStencil || null;
-    let resolveTargetSize = null;
-    if (targetAttachment) {
-      if (targetAttachment.textureId === SWAPCHAIN_TEXTURE_ID) {
-        resolveTargetSize = (ctl) => this._resolveSwapchainSize(ctl);
-      } else {
-        const staticSize = this._textureAttachmentSize(targetAttachment.textureId, targetAttachment.view);
-        resolveTargetSize = () => staticSize;
-      }
-    }
-    this.processor._passCommands.push({
-      type: 'renderState',
-      _rsPassOp: 'beginRenderPass',
-      _wgpuMeta: { kind: 'beginRenderPass' },
-      run: (ctl) => {
-        const desc = this.buildRenderPassDescriptor(decoded, resolvers, ctl);
-        const pass = ctl.beginRenderPass(desc);
-        this._activePass = pass || ctl.pass || null;
-        this._activePassTargetSize =
-          this._lastPassReferenceSize || (resolveTargetSize ? resolveTargetSize(ctl) : null);
-      },
-    });
+    const targetIsSwapchain = Boolean(targetAttachment && targetAttachment.textureId === SWAPCHAIN_TEXTURE_ID);
+    const staticTargetSize =
+      targetAttachment && !targetIsSwapchain
+        ? this._textureAttachmentSize(targetAttachment.textureId, targetAttachment.view)
+        : null;
+    this.processor._passCommands.push(
+      new BeginRenderPassCommand(
+        this,
+        decoded,
+        { colors: colorResolvers, depthStencil: dsResolver },
+        targetIsSwapchain,
+        staticTargetSize
+      )
+    );
     return true;
   }
 
@@ -5792,8 +6365,14 @@ class RenderStatePackets {
         cached.device === this.device &&
         cached.deviceGeneration === this._cachedDeviceGeneration &&
         cached.texture === presentxCacheMeta.texture &&
+        cached.texture.destroyed !== true &&
+        cached.view &&
+        cached.view.destroyed !== true &&
+        cached.bindGroup &&
+        cached.bindGroup.destroyed !== true &&
         cached.textureGen === presentxCacheMeta.textureGen &&
         cached.sampler === presentxCacheMeta.sampler &&
+        cached.sampler.destroyed !== true &&
         cached.layout === presentxCacheMeta.layout
       ) {
         this._cachePresentXBindGroup(presentxCacheKey, cached);
@@ -5829,8 +6408,15 @@ class RenderStatePackets {
     const bindGroupId = view.getUint32(offset + 4, true);
     const count = view.getUint32(offset + 8, true);
     if (16 + count * 4 > payloadBytes) return false;
-    const offsets = [];
-    for (let i = 0; i < count; i++) offsets.push(view.getUint32(offset + 16 + i * 4, true));
+    let offsets;
+    if (count === 0) {
+      offsets = EMPTY_DYNAMIC_OFFSETS;
+    } else {
+      offsets = new Array(count);
+      for (let i = 0; i < count; i += 1) {
+        offsets[i] = view.getUint32(offset + 16 + i * 4, true);
+      }
+    }
     // Resolved now: a later DestroyResource (bind group retired by the runtime) must not affect it.
     const bindGroup = this.processor.bindGroups.get(bindGroupId);
     if (!bindGroup) {
@@ -5838,24 +6424,9 @@ class RenderStatePackets {
       return false;
     }
     const bindGroupDesc = this.bindGroupDescriptors.get(bindGroupId) || null;
-    this.processor._passCommands.push({
-      type: 'renderState',
-      _rsSetBindGroup: {
-        groupIndex: index,
-        bindGroupId,
-        bindGroup,
-        bindGroupDesc,
-        offsets,
-      },
-      _wgpuMeta: {
-        kind: 'setBindGroup2',
-        groupIndex: index,
-        bindGroupId,
-      },
-      run: (ctl) => {
-        if (ctl.pass) ctl.pass.setBindGroup(index, bindGroup, offsets);
-      },
-    });
+    this.processor._passCommands.push(
+      new SetBindGroup2Command(this, index, bindGroupId, bindGroup, bindGroupDesc, offsets)
+    );
     return true;
   }
 
