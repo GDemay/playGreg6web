@@ -12,6 +12,7 @@
   const DEFAULT_MAX_ROWS = 32;
   const DEFAULT_MAX_TOP_MISSING_SHADERS = 8;
   const MAX_TOP_MISSING_SHADERS_CAP = 32;
+  const MAX_GPU_ADAPTER_LENGTH = 96;
   const EXPORT_FORMAT = 'playgta6-missing-shaders-v1';
   const EXPORT_SCHEMA_VERSION = 1;
   const STAGE_NOT_STARTED = 'NOT_STARTED';
@@ -20,6 +21,20 @@
   const ROOT_CLASS = 'pg6-gpu-panel';
   const DEFAULT_ARIA_LABEL = 'Frame-1 GPU & Missing-Shader Diagnostics';
   const U64_MAX = 0xffffffffffffffffn;
+
+  const ANSI_ESCAPE_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
+  const CONTROL_CHAR_RE = /[\u0000-\u001f\u007f-\u009f]/g;
+  const URL_TOKEN_RE = /[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\s"'`<>)\]},;]*/g;
+  const WIN_DRIVE_PATH_RE = /[a-zA-Z]:[\\/][^\s"'`<>|*?)\]},;]*/g;
+  const BACKSLASH_TOKEN_RE = /[^\s"'`<>|*?)\]},;]*\\[^\s"'`<>|*?)\]},;]*/g;
+  const RELATIVE_PATH_TOKEN_RE = /(^|[\s"'`(\[={<,:;|])\.\.?\/[^\s"'`<>)\]},;]*/g;
+  const POSIX_ROOT_PATH_RE =
+    /(^|[\s"'`(\[={<,:;|])\/(?:(?:users|library|applications|volumes|home|root|tmp|var|etc|opt|usr|mnt|media|private|srv|proc|sys|dev|run|cygdrive|windows|programdata)(?:\/[^\s"'`<>)\]},;]*)*|[a-z0-9._-]+(?:\/[a-z0-9._-]+)+)/gi;
+  const ROOT_REL_USER_PATH_RE =
+    /(^|[\s"'`(\[={<,:;|])(?:users|home|appdata)\/[^\s"'`<>)\]},;]+/gi;
+  const HOST_PATH_PREFIX_RE =
+    /^(?:[a-zA-Z]:[\\/]|\\\\|[a-zA-Z][a-zA-Z0-9+.-]*:\/\/|\.\.?[\\/]|\/(?:users|library|applications|volumes|home|root|tmp|var|etc|opt|usr|mnt|media|private|srv|proc|sys|dev|run|cygdrive|windows|programdata)(?:\/|$))/i;
+  const REDACTED_TOKEN_RE = /\[REDACTED(?:_[A-Z0-9_]+)?\]/gi;
 
   /** Allowlist of canonical WebGPU swapchain / render-target format tokens. */
   const ALLOWED_SWAPCHAIN_FORMATS = Object.freeze([
@@ -158,6 +173,9 @@
     '.' +
     ROOT_CLASS +
     '__top-missing-shaders{font-size:0.72rem;word-break:break-all;}' +
+    '.' +
+    ROOT_CLASS +
+    '__gpu-adapter{font-size:0.74rem;word-break:break-word;}' +
     '.' +
     ROOT_CLASS +
     '__progress-bar{height:0.35rem;border-radius:999px;background:rgba(255,255,255,0.12);overflow:hidden;}' +
@@ -323,7 +341,10 @@
       progressPct = 0;
     }
 
-    const readyForSplash = Boolean(safeRead(raw, 'readyForSplash')) || stage === 'FIRST_PRESENT';
+    const readyForSplash =
+      Boolean(safeRead(raw, 'readyForSplash')) ||
+      stage === 'FIRST_PRESENT' ||
+      stage === 'FIRST_VISIBLE_FRAME';
 
     return {
       stage,
@@ -928,6 +949,354 @@
   }
 
   /**
+   * Sanitize a WebGPU adapter label (or `{ vendor, architecture }` object) into a
+   * lowercase safe `vendor / architecture` string of at most `MAX_GPU_ADAPTER_LENGTH`
+   * (96) characters with ANSI escapes, control characters, URLs, and host paths stripped.
+   *
+   * @param {unknown} rawAdapter
+   * @returns {string|null}
+   */
+  function sanitizeGpuAdapter(rawAdapter) {
+    if (rawAdapter === null || rawAdapter === undefined) {
+      return null;
+    }
+
+    let raw = null;
+    if (typeof rawAdapter === 'string') {
+      raw = rawAdapter;
+    } else if (
+      typeof rawAdapter === 'object' &&
+      !Array.isArray(rawAdapter) &&
+      !ArrayBuffer.isView(rawAdapter) &&
+      !(rawAdapter instanceof ArrayBuffer)
+    ) {
+      const rawVendor = safeRead(rawAdapter, 'vendor');
+      const rawArch =
+        safeRead(rawAdapter, 'architecture') !== undefined
+          ? safeRead(rawAdapter, 'architecture')
+          : safeRead(rawAdapter, 'arch');
+      const vendor = typeof rawVendor === 'string' ? rawVendor.trim() : '';
+      const arch = typeof rawArch === 'string' ? rawArch.trim() : '';
+      if (vendor && arch) {
+        raw = `${vendor} / ${arch}`;
+      } else if (vendor || arch) {
+        raw = vendor || arch;
+      } else {
+        const nested =
+          safeRead(rawAdapter, 'gpuAdapter') !== undefined
+            ? safeRead(rawAdapter, 'gpuAdapter')
+            : safeRead(rawAdapter, 'adapterLabel');
+        if (typeof nested === 'string') {
+          raw = nested;
+        }
+      }
+    }
+
+    if (typeof raw !== 'string' || raw.length === 0) {
+      return null;
+    }
+
+    const cleanedRaw = raw
+      .replace(ANSI_ESCAPE_RE, ' ')
+      .replace(/[\r\n\t]+/g, ' ')
+      .replace(CONTROL_CHAR_RE, '')
+      .trim();
+
+    if (cleanedRaw.length === 0 || HOST_PATH_PREFIX_RE.test(cleanedRaw)) {
+      return null;
+    }
+
+    let out = cleanedRaw
+      .replace(URL_TOKEN_RE, ' ')
+      .replace(WIN_DRIVE_PATH_RE, ' ')
+      .replace(BACKSLASH_TOKEN_RE, ' ')
+      .replace(RELATIVE_PATH_TOKEN_RE, '$1')
+      .replace(POSIX_ROOT_PATH_RE, '$1')
+      .replace(ROOT_REL_USER_PATH_RE, '$1')
+      .replace(REDACTED_TOKEN_RE, ' ')
+      .replace(/\.\.+/g, ' ')
+      .toLowerCase()
+      .replace(/[^a-z0-9 /._+()-]+/g, ' ')
+      .replace(/\(\s*\)/g, ' ')
+      .replace(/\s+/g, ' ')
+      .replace(/\s*\/\s*/g, ' / ')
+      .replace(/(?:\s*\/\s*){2,}/g, ' / ')
+      .replace(/^[\s/._+-]+|[\s/._+-]+$/g, '');
+
+    if (out.length > MAX_GPU_ADAPTER_LENGTH) {
+      out = out.slice(0, MAX_GPU_ADAPTER_LENGTH).replace(/[\s/._+-]+$/, '');
+    }
+
+    if (!/[a-z0-9]/.test(out)) {
+      return null;
+    }
+
+    return out.length > 0 ? out : null;
+  }
+
+  /**
+   * Format a non-negative millisecond duration (e.g. `firstVisibleFrameMs`, `blackLoadingMs`)
+   * for compact UI rendering, returning `—` when absent or invalid.
+   *
+   * @param {unknown} value
+   * @returns {string}
+   */
+  function formatDurationMs(value) {
+    const n = sanitizeNonNegativeNumber(value);
+    return n === null ? PLACEHOLDER_DASH : `${n.toFixed(1)} ms`;
+  }
+
+  function createDefaultAdapterStats() {
+    return {
+      gpuAdapter: null,
+    };
+  }
+
+  function createDefaultVisibilityStats() {
+    return {
+      firstVisibleFrameMs: null,
+      blackLoadingMs: null,
+      blackPresentsTotal: 0,
+    };
+  }
+
+  function createDefaultReflectionStats() {
+    return {
+      reflectedStages: 0,
+      inlineSamplerStages: 0,
+      resourceHeapBindings: 0,
+    };
+  }
+
+  function pickFirstDefinedWithSource(sources, keys) {
+    for (let i = 0; i < sources.length; i += 1) {
+      const entry = sources[i];
+      const src = entry && entry.obj;
+      if (!src || typeof src !== 'object') continue;
+      for (let j = 0; j < keys.length; j += 1) {
+        const val = safeRead(src, keys[j]);
+        if (val !== undefined) {
+          return { found: true, value: val, explicitNull: Boolean(entry.explicitNull) };
+        }
+      }
+    }
+    return { found: false, value: undefined, explicitNull: false };
+  }
+
+  function extractAdapterStats(source, base) {
+    let next = base ? { ...base } : createDefaultAdapterStats();
+    if (!source || typeof source !== 'object') {
+      return next;
+    }
+
+    const rawAdapterStats = safeRead(source, 'adapterStats');
+    if (rawAdapterStats === null) {
+      next = createDefaultAdapterStats();
+    }
+    const adapterStatsObj =
+      rawAdapterStats && typeof rawAdapterStats === 'object' ? rawAdapterStats : null;
+
+    const rawBoot =
+      safeRead(source, 'bootSummary') !== undefined
+        ? safeRead(source, 'bootSummary')
+        : safeRead(source, 'boot');
+    const bootObj = rawBoot && typeof rawBoot === 'object' ? rawBoot : null;
+
+    const rawCompat =
+      safeRead(source, 'compatStats') !== undefined
+        ? safeRead(source, 'compatStats')
+        : safeRead(source, 'gpuCompatStats') !== undefined
+          ? safeRead(source, 'gpuCompatStats')
+          : safeRead(source, 'gpu');
+    const compatObj = rawCompat && typeof rawCompat === 'object' ? rawCompat : null;
+
+    const rawDevice =
+      safeRead(source, 'deviceStats') !== undefined
+        ? safeRead(source, 'deviceStats')
+        : safeRead(source, 'adapterInfo');
+    const deviceObj = rawDevice && typeof rawDevice === 'object' ? rawDevice : null;
+
+    const picked = pickFirstDefinedWithSource(
+      [
+        { obj: source, explicitNull: true },
+        { obj: adapterStatsObj, explicitNull: true },
+        { obj: bootObj, explicitNull: false },
+        { obj: compatObj, explicitNull: false },
+        { obj: deviceObj, explicitNull: false },
+      ],
+      ['gpuAdapter', 'adapterLabel', 'adapterInfo']
+    );
+
+    if (picked.found) {
+      if (picked.value === null) {
+        if (picked.explicitNull) {
+          next.gpuAdapter = null;
+        }
+      } else {
+        next.gpuAdapter = sanitizeGpuAdapter(picked.value);
+      }
+    } else if (
+      deviceObj &&
+      (safeRead(deviceObj, 'vendor') !== undefined ||
+        safeRead(deviceObj, 'architecture') !== undefined ||
+        safeRead(deviceObj, 'arch') !== undefined)
+    ) {
+      next.gpuAdapter = sanitizeGpuAdapter(deviceObj);
+    }
+
+    return next;
+  }
+
+  function extractVisibilityStats(source, base) {
+    let next = base ? { ...base } : createDefaultVisibilityStats();
+    if (!source || typeof source !== 'object') {
+      return next;
+    }
+
+    const rawVis =
+      safeRead(source, 'visibilityStats') !== undefined
+        ? safeRead(source, 'visibilityStats')
+        : safeRead(source, 'visibleFrameStats');
+    if (rawVis === null) {
+      next = createDefaultVisibilityStats();
+    }
+    const visObj = rawVis && typeof rawVis === 'object' ? rawVis : null;
+
+    const rawBoot =
+      safeRead(source, 'bootSummary') !== undefined
+        ? safeRead(source, 'bootSummary')
+        : safeRead(source, 'boot');
+    const bootObj = rawBoot && typeof rawBoot === 'object' ? rawBoot : null;
+
+    const rawSwapchain =
+      safeRead(source, 'swapchainStats') !== undefined
+        ? safeRead(source, 'swapchainStats')
+        : safeRead(source, 'swapchain');
+    const swapchainObj = rawSwapchain && typeof rawSwapchain === 'object' ? rawSwapchain : null;
+
+    const rawFrame =
+      safeRead(source, 'frameStats') !== undefined
+        ? safeRead(source, 'frameStats')
+        : safeRead(source, 'frames');
+    const frameObj = rawFrame && typeof rawFrame === 'object' ? rawFrame : null;
+
+    const rawGpu = safeRead(source, 'gpu');
+    const gpuObj = rawGpu && typeof rawGpu === 'object' ? rawGpu : null;
+
+    const rawPerf =
+      safeRead(source, 'perfStats') !== undefined
+        ? safeRead(source, 'perfStats')
+        : safeRead(source, 'perf');
+    const perfObj = rawPerf && typeof rawPerf === 'object' ? rawPerf : null;
+
+    const sources = [
+      { obj: source, explicitNull: true },
+      { obj: visObj, explicitNull: true },
+      { obj: bootObj, explicitNull: false },
+      { obj: swapchainObj, explicitNull: false },
+      { obj: frameObj, explicitNull: false },
+      { obj: gpuObj, explicitNull: false },
+      { obj: perfObj, explicitNull: false },
+    ];
+
+    const firstVisible = pickFirstDefinedWithSource(sources, [
+      'firstVisibleFrameMs',
+      'firstVisiblePresentMs',
+    ]);
+    if (firstVisible.found) {
+      if (firstVisible.value === null) {
+        if (firstVisible.explicitNull) {
+          next.firstVisibleFrameMs = null;
+        }
+      } else {
+        next.firstVisibleFrameMs = sanitizeNonNegativeNumber(firstVisible.value);
+      }
+    }
+
+    const blackLoading = pickFirstDefinedWithSource(sources, ['blackLoadingMs']);
+    if (blackLoading.found) {
+      if (blackLoading.value === null) {
+        if (blackLoading.explicitNull) {
+          next.blackLoadingMs = null;
+        }
+      } else {
+        next.blackLoadingMs = sanitizeNonNegativeNumber(blackLoading.value);
+      }
+    }
+
+    const blackPresents = pickFirstDefinedWithSource(sources, ['blackPresentsTotal']);
+    if (blackPresents.found) {
+      if (blackPresents.value === null) {
+        if (blackPresents.explicitNull) {
+          next.blackPresentsTotal = 0;
+        }
+      } else {
+        next.blackPresentsTotal = sanitizeNonNegativeInt(blackPresents.value, 0);
+      }
+    }
+
+    return next;
+  }
+
+  function extractReflectionStats(source, base) {
+    let next = base ? { ...base } : createDefaultReflectionStats();
+    if (!source || typeof source !== 'object') {
+      return next;
+    }
+
+    const rawRefl =
+      safeRead(source, 'reflectionStats') !== undefined
+        ? safeRead(source, 'reflectionStats')
+        : safeRead(source, 'shaderReflectionStats') !== undefined
+          ? safeRead(source, 'shaderReflectionStats')
+          : safeRead(source, 'reflection') !== undefined
+            ? safeRead(source, 'reflection')
+            : safeRead(source, 's44Stats');
+    if (rawRefl === null) {
+      next = createDefaultReflectionStats();
+    }
+    const reflObj = rawRefl && typeof rawRefl === 'object' ? rawRefl : null;
+
+    const rawShaderPack =
+      safeRead(source, 'shaderPackStats') !== undefined
+        ? safeRead(source, 'shaderPackStats')
+        : safeRead(source, 'packStats');
+    const shaderPackObj = rawShaderPack && typeof rawShaderPack === 'object' ? rawShaderPack : null;
+
+    const rawGpu = safeRead(source, 'gpu');
+    const gpuObj = rawGpu && typeof rawGpu === 'object' ? rawGpu : null;
+
+    let reflectedStages = pickFirstDefined(
+      [source, reflObj, shaderPackObj, gpuObj],
+      ['reflectedStages']
+    );
+    if (!reflectedStages.found && reflObj) {
+      reflectedStages = pickFirstDefined([reflObj], ['stageCount', 'shaderCount']);
+    }
+    if (reflectedStages.found) {
+      next.reflectedStages = sanitizeNonNegativeInt(reflectedStages.value, 0);
+    }
+
+    const inlineSamplerStages = pickFirstDefined(
+      [source, reflObj, shaderPackObj, gpuObj],
+      ['inlineSamplerStages']
+    );
+    if (inlineSamplerStages.found) {
+      next.inlineSamplerStages = sanitizeNonNegativeInt(inlineSamplerStages.value, 0);
+    }
+
+    const resourceHeapBindings = pickFirstDefined(
+      [source, reflObj, shaderPackObj, gpuObj],
+      ['resourceHeapBindings']
+    );
+    if (resourceHeapBindings.found) {
+      next.resourceHeapBindings = sanitizeNonNegativeInt(resourceHeapBindings.value, 0);
+    }
+
+    return next;
+  }
+
+  /**
    * Normalize and sanitize a single missing-shader entry into a canonical row
    * (`hash` hex, `stage`, `hits`, optional numeric timestamps, and display `text`).
    * Returns `null` if the entry lacks a valid 64-bit hash (rejecting paths/buffers).
@@ -1080,6 +1449,9 @@
     const maxTop =
       Number.isInteger(rawMaxTop) && rawMaxTop >= 1 ? rawMaxTop : DEFAULT_MAX_TOP_MISSING_SHADERS;
     const perfStats = extractPerfStats(source, null, maxTop);
+    const adapterStats = extractAdapterStats(source, null);
+    const visibilityStats = extractVisibilityStats(source, null);
+    const reflectionStats = extractReflectionStats(source, null);
 
     let exportedAtValue = safeRead(source, 'exportedAt');
     if (exportedAtValue === undefined) {
@@ -1136,12 +1508,21 @@
         swapchainFormat: compatStats.swapchainFormat,
         usesBlitFallback: compatStats.usesBlitFallback,
         blitCount: compatStats.blitCount,
+        gpuAdapter: adapterStats.gpuAdapter,
+        firstVisibleFrameMs: visibilityStats.firstVisibleFrameMs,
+        blackLoadingMs: visibilityStats.blackLoadingMs,
+        blackPresentsTotal: visibilityStats.blackPresentsTotal,
       },
       io: {
         pgimFullFetches: ioStats.pgimFullFetches,
         slabCacheHits: ioStats.slabCacheHits,
         slabCacheMisses: ioStats.slabCacheMisses,
         syncFastPathHits: ioStats.syncFastPathHits,
+      },
+      reflection: {
+        reflectedStages: reflectionStats.reflectedStages,
+        inlineSamplerStages: reflectionStats.inlineSamplerStages,
+        resourceHeapBindings: reflectionStats.resourceHeapBindings,
       },
       perf: {
         onePercentLowFps: perfStats.onePercentLowFps,
@@ -1314,6 +1695,9 @@
       this._compatStats = createDefaultCompatStats();
       this._ioStats = createDefaultIoStats();
       this._perfStats = createDefaultPerfStats();
+      this._adapterStats = createDefaultAdapterStats();
+      this._visibilityStats = createDefaultVisibilityStats();
+      this._reflectionStats = createDefaultReflectionStats();
       this._missingShaders = [];
       this._renderedCache = Object.create(null);
 
@@ -1659,6 +2043,75 @@
       perfGrid.appendChild(topMissingShadersMetric.card);
       perfSection.appendChild(perfGrid);
 
+      // --- Active WebGPU adapter, visible-frame readiness & S44 shader reflection section (W240) ---
+      const adapterReflectionSection = createEl(
+        doc,
+        'div',
+        `${ROOT_CLASS}__section ${ROOT_CLASS}__adapter-reflection`,
+        {
+          role: 'group',
+          'aria-label': 'Adapter, Visibility & Shader Reflection',
+        }
+      );
+      adapterReflectionSection.appendChild(
+        createEl(doc, 'div', `${ROOT_CLASS}__section-title`, {
+          text: 'Adapter, Visibility & Shader Reflection',
+        })
+      );
+      const adapterReflectionGrid = createEl(doc, 'div', `${ROOT_CLASS}__grid`);
+      const gpuAdapterMetric = this._buildMetricCard(
+        doc,
+        'GPU Adapter',
+        `${ROOT_CLASS}__gpu-adapter`,
+        PLACEHOLDER_DASH
+      );
+      gpuAdapterMetric.card.className = `${ROOT_CLASS}__metric ${ROOT_CLASS}__metric--wide`;
+      const firstVisibleFrameMsMetric = this._buildMetricCard(
+        doc,
+        'First Visible',
+        `${ROOT_CLASS}__first-visible-frame-ms`,
+        PLACEHOLDER_DASH
+      );
+      const blackLoadingMsMetric = this._buildMetricCard(
+        doc,
+        'Black Loading',
+        `${ROOT_CLASS}__black-loading-ms`,
+        PLACEHOLDER_DASH
+      );
+      const blackPresentsTotalMetric = this._buildMetricCard(
+        doc,
+        'Black Presents',
+        `${ROOT_CLASS}__black-presents-total`,
+        '0'
+      );
+      const reflectedStagesMetric = this._buildMetricCard(
+        doc,
+        'Reflected Stages',
+        `${ROOT_CLASS}__reflected-stages`,
+        '0'
+      );
+      const inlineSamplerStagesMetric = this._buildMetricCard(
+        doc,
+        'Inline Samplers',
+        `${ROOT_CLASS}__inline-sampler-stages`,
+        '0'
+      );
+      const resourceHeapBindingsMetric = this._buildMetricCard(
+        doc,
+        'Heap Bindings',
+        `${ROOT_CLASS}__resource-heap-bindings`,
+        '0'
+      );
+
+      adapterReflectionGrid.appendChild(gpuAdapterMetric.card);
+      adapterReflectionGrid.appendChild(firstVisibleFrameMsMetric.card);
+      adapterReflectionGrid.appendChild(blackLoadingMsMetric.card);
+      adapterReflectionGrid.appendChild(blackPresentsTotalMetric.card);
+      adapterReflectionGrid.appendChild(reflectedStagesMetric.card);
+      adapterReflectionGrid.appendChild(inlineSamplerStagesMetric.card);
+      adapterReflectionGrid.appendChild(resourceHeapBindingsMetric.card);
+      adapterReflectionSection.appendChild(adapterReflectionGrid);
+
       // --- Missing-shader table section ---
       const missingSection = createEl(doc, 'div', `${ROOT_CLASS}__section ${ROOT_CLASS}__missing`);
       const missingHeader = createEl(
@@ -1694,6 +2147,7 @@
       body.appendChild(compatSection);
       body.appendChild(ioSection);
       body.appendChild(perfSection);
+      body.appendChild(adapterReflectionSection);
       body.appendChild(missingSection);
 
       rootEl.appendChild(header);
@@ -1735,6 +2189,13 @@
         bindGroupCacheHits: bindGroupCacheHitsMetric.val,
         topMissingCount: topMissingCountMetric.val,
         topMissingShaders: topMissingShadersMetric.val,
+        gpuAdapter: gpuAdapterMetric.val,
+        firstVisibleFrameMs: firstVisibleFrameMsMetric.val,
+        blackLoadingMs: blackLoadingMsMetric.val,
+        blackPresentsTotal: blackPresentsTotalMetric.val,
+        reflectedStages: reflectedStagesMetric.val,
+        inlineSamplerStages: inlineSamplerStagesMetric.val,
+        resourceHeapBindings: resourceHeapBindingsMetric.val,
         missingHeader,
         table,
         tbody,
@@ -1788,6 +2249,13 @@
           bindGroupCacheHits: q(`.${ROOT_CLASS}__bind-group-cache-hits`),
           topMissingCount: q(`.${ROOT_CLASS}__top-missing-count`),
           topMissingShaders: q(`.${ROOT_CLASS}__top-missing-shaders`),
+          gpuAdapter: q(`.${ROOT_CLASS}__gpu-adapter`),
+          firstVisibleFrameMs: q(`.${ROOT_CLASS}__first-visible-frame-ms`),
+          blackLoadingMs: q(`.${ROOT_CLASS}__black-loading-ms`),
+          blackPresentsTotal: q(`.${ROOT_CLASS}__black-presents-total`),
+          reflectedStages: q(`.${ROOT_CLASS}__reflected-stages`),
+          inlineSamplerStages: q(`.${ROOT_CLASS}__inline-sampler-stages`),
+          resourceHeapBindings: q(`.${ROOT_CLASS}__resource-heap-bindings`),
           missingHeader: q(`.${ROOT_CLASS}__missing-header`),
           table: q(`.${ROOT_CLASS}__table`),
           tbody: q(`.${ROOT_CLASS}__table-body`),
@@ -1913,6 +2381,9 @@
       const compat = this._compatStats;
       const io = this._ioStats;
       const perf = this._perfStats;
+      const adapter = this._adapterStats;
+      const visibility = this._visibilityStats;
+      const reflection = this._reflectionStats;
 
       try {
         this._setTextIfChanged('summaryBadge', els.summaryBadge, `${boot.stage} · ${boot.progressPct}%`);
@@ -2020,6 +2491,43 @@
             perf.topMissingShaderOverflow,
             this._maxTopMissingShaders
           )
+        );
+
+        // W240: Active WebGPU adapter, visible-frame readiness & S44 shader reflection breakdown.
+        this._setTextIfChanged(
+          'gpuAdapter',
+          els.gpuAdapter,
+          adapter.gpuAdapter || PLACEHOLDER_DASH
+        );
+        this._setTextIfChanged(
+          'firstVisibleFrameMs',
+          els.firstVisibleFrameMs,
+          formatDurationMs(visibility.firstVisibleFrameMs)
+        );
+        this._setTextIfChanged(
+          'blackLoadingMs',
+          els.blackLoadingMs,
+          formatDurationMs(visibility.blackLoadingMs)
+        );
+        this._setTextIfChanged(
+          'blackPresentsTotal',
+          els.blackPresentsTotal,
+          visibility.blackPresentsTotal
+        );
+        this._setTextIfChanged(
+          'reflectedStages',
+          els.reflectedStages,
+          reflection.reflectedStages
+        );
+        this._setTextIfChanged(
+          'inlineSamplerStages',
+          els.inlineSamplerStages,
+          reflection.inlineSamplerStages
+        );
+        this._setTextIfChanged(
+          'resourceHeapBindings',
+          els.resourceHeapBindings,
+          reflection.resourceHeapBindings
         );
 
         const totalMissing = this._missingShaders.length;
@@ -2139,6 +2647,35 @@
       this._compatStats = extractCompatStats(snapshot, this._compatStats);
       this._ioStats = extractIoStats(snapshot, this._ioStats);
       this._perfStats = extractPerfStats(snapshot, this._perfStats, this._maxTopMissingShaders);
+      this._adapterStats = extractAdapterStats(snapshot, this._adapterStats);
+      this._visibilityStats = extractVisibilityStats(snapshot, this._visibilityStats);
+      this._reflectionStats = extractReflectionStats(snapshot, this._reflectionStats);
+
+      this._render();
+      return this.getState();
+    }
+
+    /**
+     * Reset all telemetry counters, adapter/visibility/reflection diagnostics, and
+     * missing-shader rows back to clean initial defaults while preserving mounted DOM.
+     *
+     * @returns {object} Current controller state after reset.
+     */
+    reset() {
+      if (this._destroyed) {
+        return this.getState();
+      }
+      this._boot = normalizeBootSummary(null);
+      this._frameStats = normalizeFrameStats(null);
+      this._fallbackStats = normalizeFallbackStats(null);
+      this._compatStats = createDefaultCompatStats();
+      this._ioStats = createDefaultIoStats();
+      this._perfStats = createDefaultPerfStats();
+      this._adapterStats = createDefaultAdapterStats();
+      this._visibilityStats = createDefaultVisibilityStats();
+      this._reflectionStats = createDefaultReflectionStats();
+      this._missingShaders = [];
+      this._exportCount = 0;
 
       this._render();
       return this.getState();
@@ -2159,6 +2696,9 @@
         compatStats: this._compatStats,
         ioStats: this._ioStats,
         perfStats: this._perfStats,
+        adapterStats: this._adapterStats,
+        visibilityStats: this._visibilityStats,
+        reflectionStats: this._reflectionStats,
         maxTopMissingShaders: this._maxTopMissingShaders,
         now: this._now,
       });
@@ -2236,6 +2776,15 @@
           topMissingShaders: this._perfStats.topMissingShaders.map((row) => ({ ...row })),
           topMissingShaderOverflow: this._perfStats.topMissingShaderOverflow,
         },
+        gpuAdapter: this._adapterStats.gpuAdapter,
+        firstVisibleFrameMs: this._visibilityStats.firstVisibleFrameMs,
+        blackLoadingMs: this._visibilityStats.blackLoadingMs,
+        blackPresentsTotal: this._visibilityStats.blackPresentsTotal,
+        reflectedStages: this._reflectionStats.reflectedStages,
+        inlineSamplerStages: this._reflectionStats.inlineSamplerStages,
+        resourceHeapBindings: this._reflectionStats.resourceHeapBindings,
+        visibilityStats: { ...this._visibilityStats },
+        reflectionStats: { ...this._reflectionStats },
         hitRateText: formatHitRatePct(this._fallbackStats.hitRatePct),
         missingShaders: this._missingShaders.map((row) => ({ ...row })),
         visibleMissingShaders,
@@ -2244,6 +2793,11 @@
         exportCount: this._exportCount,
         root: this._root,
       };
+    }
+
+    /** @returns {object} Snapshot of current panel state (alias of `getState()`). */
+    getSnapshot() {
+      return this.getState();
     }
 
     /** Tear down DOM event listeners and detach the panel node. Idempotent. */
@@ -2302,12 +2856,15 @@
   const exportedApi = Object.freeze({
     DEFAULT_MAX_ROWS,
     DEFAULT_MAX_TOP_MISSING_SHADERS,
+    MAX_GPU_ADAPTER_LENGTH,
     EXPORT_FORMAT,
     EXPORT_SCHEMA_VERSION,
     BOOT_STAGE_ORDER,
     STAGE_NAMES,
     ALLOWED_SWAPCHAIN_FORMATS,
     sanitizeSwapchainFormat,
+    sanitizeGpuAdapter,
+    formatDurationMs,
     formatOnePercentLowFps,
     formatP99FrameMs,
     normalizeTopMissingShaders,
@@ -2315,6 +2872,7 @@
     formatMissingShaderRow,
     buildMissingShaderExport,
     GpuBootPanelController,
+    GpuBootPanel: GpuBootPanelController,
   });
 
   if (typeof globalThis !== 'undefined') {
