@@ -11,6 +11,7 @@
   const DEFAULT_STATUS_URL = '/api/status';
   const DEFAULT_STAGE_TIMEOUT_MS = 0;
   const DEFAULT_PARALLEL_PRELOAD = true;
+  const DEFAULT_PRELOAD_CONCURRENCY = 8;
   const DEFAULT_RELEASE_PRELOAD_BUFFERS = true;
   const MAX_DIAGNOSTIC_TEXT_LENGTH = 512;
   const FORBIDDEN_TASK_NAMES = Object.freeze(new Set(['__proto__', 'constructor', 'prototype']));
@@ -73,6 +74,29 @@
       throw new TypeError('parallelPreload must be a boolean');
     }
     return value;
+  }
+
+  function normalizePreloadConcurrency(value, label = 'preloadConcurrency') {
+    if (value === undefined || value === null) return DEFAULT_PRELOAD_CONCURRENCY;
+    if (typeof value !== 'number') {
+      throw new TypeError(`${label} must be a positive integer or null`);
+    }
+    if (!Number.isFinite(value) || !Number.isInteger(value) || value < 1) {
+      throw new RangeError(`${label} must be a positive integer`);
+    }
+    return value;
+  }
+
+  function deriveReflectionSidecarUrl(shaderPackUrl) {
+    const raw = nonEmptyString(shaderPackUrl);
+    if (!raw) return null;
+    const cutIdx = raw.search(/[?#]/);
+    const basePath = cutIdx >= 0 ? raw.slice(0, cutIdx) : raw;
+    if (!basePath) return null;
+    if (basePath.endsWith('.reflect.json')) {
+      return basePath;
+    }
+    return `${basePath}.reflect.json`;
   }
 
   function normalizeReleasePreloadBuffers(value) {
@@ -218,6 +242,8 @@
     releaseAssetSlot(bundle, 'shaderPackIndex', 'shaderPackIndex');
     releaseAssetSlot(bundle, 'reflectionManifest', 'reflectionManifest');
     releaseAssetSlot(bundle, 'reflectionSidecar', 'reflectionSidecar');
+    releaseAssetSlot(bundle, 'runtimeWasm', 'runtimeWasm');
+    releaseAssetSlot(bundle, 'opfsWarmBoot', 'opfsWarmBoot');
 
     if (Object.prototype.hasOwnProperty.call(bundle, 'modules')) {
       releaseModuleList(bundle.modules, 'modules');
@@ -306,25 +332,32 @@
     return out;
   }
 
-  function emptyPreloadStats(parallelEnabled) {
+  function emptyPreloadStats(parallelEnabled, concurrencyLimit = DEFAULT_PRELOAD_CONCURRENCY) {
+    const resolvedLimit =
+      Number.isInteger(concurrencyLimit) && concurrencyLimit >= 1 ? concurrencyLimit : DEFAULT_PRELOAD_CONCURRENCY;
     return {
       parallelEnabled: Boolean(parallelEnabled),
+      concurrencyLimit: resolvedLimit,
       taskCount: 0,
       completedCount: 0,
       optionalMissingCount: 0,
       failedCount: 0,
       abortedCount: 0,
       maxConcurrency: 0,
+      parallelStagesCount: 0,
       wallTimeMs: 0,
+      parallelWallMs: 0,
       sequentialTimeMs: 0,
+      serialEstimateMs: 0,
       parallelPreloadSavedMs: 0,
+      overlapSavedMs: 0,
       taskTimingsMs: {},
       tasks: {},
     };
   }
 
   function clonePreloadStats(stats) {
-    const src = stats || emptyPreloadStats(DEFAULT_PARALLEL_PRELOAD);
+    const src = stats || emptyPreloadStats(DEFAULT_PARALLEL_PRELOAD, DEFAULT_PRELOAD_CONCURRENCY);
     const taskTimingsMs = {};
     if (src.taskTimingsMs && typeof src.taskTimingsMs === 'object') {
       for (const key of Object.keys(src.taskTimingsMs)) {
@@ -345,8 +378,21 @@
         }
       }
     }
+    const wallTimeMs = clampNonNegativeFinite(
+      src.parallelWallMs !== undefined ? src.parallelWallMs : src.wallTimeMs
+    );
+    const sequentialTimeMs = clampNonNegativeFinite(
+      src.serialEstimateMs !== undefined ? src.serialEstimateMs : src.sequentialTimeMs
+    );
+    const overlapSavedMs = clampNonNegativeFinite(
+      src.overlapSavedMs !== undefined ? src.overlapSavedMs : src.parallelPreloadSavedMs
+    );
     return {
       parallelEnabled: Boolean(src.parallelEnabled),
+      concurrencyLimit:
+        Number.isInteger(src.concurrencyLimit) && src.concurrencyLimit >= 1
+          ? src.concurrencyLimit
+          : DEFAULT_PRELOAD_CONCURRENCY,
       taskCount: Number.isInteger(src.taskCount) && src.taskCount >= 0 ? src.taskCount : 0,
       completedCount: Number.isInteger(src.completedCount) && src.completedCount >= 0 ? src.completedCount : 0,
       optionalMissingCount:
@@ -354,11 +400,399 @@
       failedCount: Number.isInteger(src.failedCount) && src.failedCount >= 0 ? src.failedCount : 0,
       abortedCount: Number.isInteger(src.abortedCount) && src.abortedCount >= 0 ? src.abortedCount : 0,
       maxConcurrency: Number.isInteger(src.maxConcurrency) && src.maxConcurrency >= 0 ? src.maxConcurrency : 0,
-      wallTimeMs: clampNonNegativeFinite(src.wallTimeMs),
-      sequentialTimeMs: clampNonNegativeFinite(src.sequentialTimeMs),
-      parallelPreloadSavedMs: clampNonNegativeFinite(src.parallelPreloadSavedMs),
+      parallelStagesCount:
+        Number.isInteger(src.parallelStagesCount) && src.parallelStagesCount >= 0 ? src.parallelStagesCount : 0,
+      wallTimeMs,
+      parallelWallMs: wallTimeMs,
+      sequentialTimeMs,
+      serialEstimateMs: sequentialTimeMs,
+      parallelPreloadSavedMs: overlapSavedMs,
+      overlapSavedMs,
       taskTimingsMs,
       tasks,
+    };
+  }
+
+  /**
+   * Execute independent preload tasks concurrently with bounded concurrency via `Promise.allSettled`,
+   * deterministic fatal error propagation, optional-stage resilience, and sanitized overlap timing
+   * savings telemetry (`serialEstimateMs`, `parallelWallMs`, `overlapSavedMs`, `parallelStagesCount`).
+   *
+   * @param {Array<{name: string, run: Function, optional?: boolean, asset?: string, kind?: string}>} tasks
+   * @param {object} [options]
+   * @param {boolean} [options.parallel=true]
+   * @param {number|null} [options.maxConcurrency=8]
+   * @param {AbortSignal|null} [options.signal=null]
+   * @param {(() => number)|null} [options.nowFn]
+   * @param {Function|null} [options.onOptionalMissing]
+   * @param {Function|null} [options.onComplete]
+   * @param {boolean} [options.throwOnError=true]
+   */
+  async function runConcurrentPreloads(tasks, options = {}) {
+    if (!Array.isArray(tasks)) {
+      throw new TypeError('runConcurrentPreloads tasks must be an array');
+    }
+    if (options !== undefined && (options === null || typeof options !== 'object')) {
+      throw new TypeError('runConcurrentPreloads options must be an object');
+    }
+
+    const parallel = normalizeParallelPreload(options.parallel);
+    const concurrencyOption =
+      options.maxConcurrency !== undefined ? options.maxConcurrency : options.concurrency;
+    const concurrencyLimit = normalizePreloadConcurrency(concurrencyOption, 'maxConcurrency');
+    const signal = options.signal !== undefined ? options.signal : null;
+    if (signal !== null && (typeof signal !== 'object' || typeof signal.aborted !== 'boolean')) {
+      throw new TypeError('runConcurrentPreloads signal must be an AbortSignal or null');
+    }
+    const clockFn = optionalFn(options.nowFn, 'nowFn') || defaultNow;
+    const onOptionalMissing = optionalFn(options.onOptionalMissing, 'onOptionalMissing');
+    const onComplete = optionalFn(options.onComplete, 'onComplete');
+    const throwOnError = options.throwOnError !== undefined ? Boolean(options.throwOnError) : true;
+
+    const seenNames = new Set();
+    const normalizedTasks = [];
+    for (let i = 0; i < tasks.length; i += 1) {
+      const entry = tasks[i];
+      if (!entry || typeof entry !== 'object') {
+        throw new TypeError(`tasks[${i}] must be an object`);
+      }
+      const name = typeof entry.name === 'string' ? entry.name.trim() : '';
+      if (!name || FORBIDDEN_TASK_NAMES.has(name)) {
+        throw new TypeError(`tasks[${i}].name must be a valid non-empty string`);
+      }
+      if (seenNames.has(name)) {
+        throw new TypeError(`tasks contains duplicate task name "${name}"`);
+      }
+      if (typeof entry.run !== 'function') {
+        throw new TypeError(`tasks[${i}].run must be a function`);
+      }
+      if (entry.optional !== undefined && typeof entry.optional !== 'boolean') {
+        throw new TypeError(`tasks[${i}].optional must be a boolean`);
+      }
+      seenNames.add(name);
+      normalizedTasks.push({
+        name,
+        asset: typeof entry.asset === 'string' && entry.asset.trim().length > 0 ? entry.asset.trim() : name,
+        kind: typeof entry.kind === 'string' && entry.kind.length > 0 ? entry.kind : 'custom',
+        optional: entry.optional !== undefined ? entry.optional : true,
+        run: entry.run,
+      });
+    }
+
+    if (normalizedTasks.length === 0) {
+      const empty = emptyPreloadStats(parallel, concurrencyLimit);
+      invokeQuiet(onComplete, clonePreloadStats(empty));
+      return {
+        ok: true,
+        aborted: false,
+        error: null,
+        results: {},
+        resultsMap: new Map(),
+        settled: [],
+        stats: clonePreloadStats(empty),
+      };
+    }
+
+    let lastClockMs = 0;
+    const readNow = () => {
+      try {
+        const value = clockFn();
+        if (typeof value === 'number' && Number.isFinite(value)) {
+          lastClockMs = value;
+          return value;
+        }
+      } catch {
+        // Fall back to last known finite reading.
+      }
+      return lastClockMs;
+    };
+
+    const batchStartedAt = readNow();
+    const { controller: batchController, unlink: unlinkBatch } = linkSignal(signal);
+    const batchSignal = batchController.signal;
+
+    let inFlight = 0;
+    let maxConcurrency = 0;
+    let hasFatalError = false;
+    let firstAbortError = null;
+    const fatalErrorsByIndex = new Map();
+    let completedCount = 0;
+    let optionalMissingCount = 0;
+    let failedCount = 0;
+    let abortedCount = 0;
+    let sequentialTimeMs = 0;
+    let effectiveTaskCount = 0;
+    let reportedBootBundleTotalMs = 0;
+    const resultsMap = new Map();
+    const taskTimingsMs = Object.create(null);
+    const taskRecords = Object.create(null);
+    const settled = new Array(normalizedTasks.length);
+
+    const runSingleTask = async (task, taskIndex) => {
+      const startedAt = readNow();
+      inFlight += 1;
+      if (inFlight > maxConcurrency) {
+        maxConcurrency = inFlight;
+      }
+      try {
+        throwIfAborted(batchSignal);
+        const value = await raceAbort(Promise.resolve().then(() => task.run(batchSignal)), batchSignal);
+        const durationMs = clampNonNegativeFinite(readNow() - startedAt);
+        resultsMap.set(task.name, value);
+        settled[taskIndex] = {
+          name: task.name,
+          asset: task.asset,
+          optional: Boolean(task.optional),
+          status: 'fulfilled',
+          value,
+          error: null,
+          durationMs,
+        };
+
+        const subTiming =
+          task.kind === 'bootBundle' &&
+          value &&
+          typeof value === 'object' &&
+          value.timingMs &&
+          typeof value.timingMs === 'object'
+            ? value.timingMs
+            : null;
+        const subKeys = subTiming
+          ? Object.keys(subTiming).filter(
+              (key) =>
+                key !== 'total' &&
+                typeof subTiming[key] === 'number' &&
+                Number.isFinite(subTiming[key]) &&
+                subTiming[key] >= 0
+            )
+          : [];
+
+        if (subKeys.length > 0) {
+          for (const key of subKeys) {
+            const subDur = clampNonNegativeFinite(subTiming[key]);
+            taskTimingsMs[key] = subDur;
+            taskRecords[key] = {
+              status: 'completed',
+              optional: key !== 'pgim',
+              durationMs: subDur,
+              error: null,
+            };
+            sequentialTimeMs += subDur;
+            effectiveTaskCount += 1;
+            completedCount += 1;
+          }
+          if (typeof subTiming.total === 'number' && Number.isFinite(subTiming.total) && subTiming.total > 0) {
+            reportedBootBundleTotalMs = clampNonNegativeFinite(subTiming.total);
+          }
+          if (subKeys.length > maxConcurrency) {
+            maxConcurrency = subKeys.length;
+          }
+        } else {
+          taskTimingsMs[task.name] = durationMs;
+          taskRecords[task.name] = {
+            status: 'completed',
+            optional: Boolean(task.optional),
+            durationMs,
+            error: null,
+          };
+          sequentialTimeMs += durationMs;
+          effectiveTaskCount += 1;
+          completedCount += 1;
+        }
+      } catch (err) {
+        const durationMs = clampNonNegativeFinite(readNow() - startedAt);
+        const abortedByOuter = Boolean(signal && signal.aborted);
+        const explicitAbort = isAbortError(err);
+        const abortedBySibling = Boolean(
+          !abortedByOuter &&
+          batchSignal.aborted &&
+          hasFatalError &&
+          (explicitAbort || err === batchSignal.reason)
+        );
+
+        if (abortedByOuter || abortedBySibling || explicitAbort) {
+          abortedCount += 1;
+          const sanitizedErr = sanitizeDiagnosticText(toError(err, 'Preload task aborted').message);
+          taskTimingsMs[task.name] = durationMs;
+          taskRecords[task.name] = {
+            status: 'aborted',
+            optional: Boolean(task.optional),
+            durationMs,
+            error: sanitizedErr,
+          };
+          settled[taskIndex] = {
+            name: task.name,
+            asset: task.asset,
+            optional: Boolean(task.optional),
+            status: 'aborted',
+            value: null,
+            error: sanitizedErr,
+            durationMs,
+          };
+          if (!abortedBySibling && firstAbortError === null) {
+            firstAbortError = err;
+            if (!batchSignal.aborted) {
+              batchController.abort(err);
+            }
+          }
+          return;
+        }
+
+        if (task.optional && !isValidationError(err)) {
+          optionalMissingCount += 1;
+          resultsMap.set(task.name, null);
+          const statusLabel = isMissingOptionalError(err) ? 'missing' : 'fallback';
+          const sanitizedErr = sanitizeDiagnosticText(
+            toError(err, `Optional preload task ${task.name} failed`).message
+          );
+          taskTimingsMs[task.name] = durationMs;
+          taskRecords[task.name] = {
+            status: statusLabel,
+            optional: true,
+            durationMs,
+            error: sanitizedErr,
+          };
+          settled[taskIndex] = {
+            name: task.name,
+            asset: task.asset,
+            optional: true,
+            status: statusLabel,
+            value: null,
+            error: sanitizedErr,
+            durationMs,
+          };
+          sequentialTimeMs += durationMs;
+          effectiveTaskCount += 1;
+          invokeQuiet(onOptionalMissing, { task, error: sanitizedErr, status: statusLabel, durationMs });
+          return;
+        }
+
+        failedCount += 1;
+        const sanitizedErr = sanitizeDiagnosticText(toError(err, `Preload task ${task.name} failed`).message);
+        taskTimingsMs[task.name] = durationMs;
+        taskRecords[task.name] = {
+          status: 'failed',
+          optional: Boolean(task.optional),
+          durationMs,
+          error: sanitizedErr,
+        };
+        settled[taskIndex] = {
+          name: task.name,
+          asset: task.asset,
+          optional: Boolean(task.optional),
+          status: 'rejected',
+          value: null,
+          error: sanitizedErr,
+          durationMs,
+        };
+        fatalErrorsByIndex.set(taskIndex, err);
+        hasFatalError = true;
+        if (!batchSignal.aborted) {
+          batchController.abort(err);
+        }
+      } finally {
+        inFlight -= 1;
+      }
+    };
+
+    const effectiveConcurrency = parallel ? Math.min(normalizedTasks.length, concurrencyLimit) : 1;
+    let nextIndex = 0;
+
+    const runWorker = async () => {
+      while (nextIndex < normalizedTasks.length) {
+        if (batchSignal.aborted || hasFatalError) {
+          break;
+        }
+        const taskIndex = nextIndex;
+        nextIndex += 1;
+        await runSingleTask(normalizedTasks[taskIndex], taskIndex);
+        if (!parallel && (batchSignal.aborted || hasFatalError)) {
+          break;
+        }
+      }
+    };
+
+    let stats;
+    try {
+      const workers = [];
+      for (let w = 0; w < effectiveConcurrency; w += 1) {
+        workers.push(runWorker());
+      }
+      await Promise.allSettled(workers);
+    } finally {
+      unlinkBatch();
+      const measuredWallMs = clampNonNegativeFinite(readNow() - batchStartedAt);
+      const parallelWallMs = Math.max(measuredWallMs, reportedBootBundleTotalMs);
+      const serialEstimateMs = clampNonNegativeFinite(sequentialTimeMs);
+      const parallelStagesCount = parallel && effectiveTaskCount > 1 && maxConcurrency > 1 ? effectiveTaskCount : 0;
+      const canSave = parallel && parallelStagesCount > 1 && failedCount === 0 && abortedCount === 0;
+      const overlapSavedMs = canSave ? clampNonNegativeFinite(serialEstimateMs - parallelWallMs) : 0;
+      stats = {
+        parallelEnabled: parallel,
+        concurrencyLimit,
+        taskCount: effectiveTaskCount > 0 ? effectiveTaskCount : normalizedTasks.length,
+        completedCount,
+        optionalMissingCount,
+        failedCount,
+        abortedCount,
+        maxConcurrency,
+        parallelStagesCount,
+        wallTimeMs: parallelWallMs,
+        parallelWallMs,
+        sequentialTimeMs: serialEstimateMs,
+        serialEstimateMs,
+        parallelPreloadSavedMs: overlapSavedMs,
+        overlapSavedMs,
+        taskTimingsMs,
+        tasks: taskRecords,
+      };
+      invokeQuiet(onComplete, clonePreloadStats(stats));
+    }
+
+    let fatalError = null;
+    if (signal && signal.aborted) {
+      fatalError = abortReason(signal);
+    } else if (fatalErrorsByIndex.size > 0) {
+      let minIdx = Number.POSITIVE_INFINITY;
+      for (const idx of fatalErrorsByIndex.keys()) {
+        if (idx < minIdx) minIdx = idx;
+      }
+      fatalError = fatalErrorsByIndex.get(minIdx);
+    } else if (firstAbortError !== null) {
+      fatalError = firstAbortError;
+    }
+
+    const clonedStats = clonePreloadStats(stats);
+    const results = Object.create(null);
+    for (const [key, val] of resultsMap.entries()) {
+      results[key] = val;
+    }
+    const plainResults = { ...results };
+    const compactedSettled = settled.filter(Boolean);
+
+    if (fatalError !== null) {
+      if (throwOnError) {
+        throw fatalError;
+      }
+      return {
+        ok: false,
+        aborted: Boolean((signal && signal.aborted) || isAbortError(fatalError)),
+        error: fatalError,
+        results: plainResults,
+        resultsMap,
+        settled: compactedSettled,
+        stats: clonedStats,
+      };
+    }
+
+    return {
+      ok: true,
+      aborted: false,
+      error: null,
+      results: plainResults,
+      resultsMap,
+      settled: compactedSettled,
+      stats: clonedStats,
     };
   }
 
@@ -641,12 +1075,21 @@
       urlFromArtifact(src.programManifest)
     );
     const gameBase = pickUrl(src.gameBase, src.gameBaseUrl);
-    const shaderPackUrl = pickUrl(src.shaderPackUrl, src.shaderPack, urlFromArtifact(src.wgslPack));
+    const shaderPackUrl = pickUrl(
+      src.shaderPackUrl,
+      src.shaderPack,
+      src.splashShaderPackUrl,
+      src.splashPackUrl,
+      urlFromArtifact(src.wgslPack),
+      urlFromArtifact(src.splashShaderPack)
+    );
     const shaderPackIndexUrl = pickUrl(
       src.shaderPackIndexUrl,
       src.shaderPackHeaderUrl,
+      src.wgpkHeaderUrl,
       urlFromArtifact(src.shaderPackIndex),
-      urlFromArtifact(src.shaderPackHeader)
+      urlFromArtifact(src.shaderPackHeader),
+      urlFromArtifact(src.wgpkHeader)
     );
     const reflectionManifestUrl = pickUrl(
       src.reflectionManifestUrl,
@@ -657,8 +1100,11 @@
       src.reflectionSidecarUrl,
       src.stageReflectionSidecarUrl,
       src.sidecarUrl,
+      src.reflectJsonUrl,
+      src.reflectionJsonUrl,
       urlFromArtifact(src.reflectionSidecar),
-      urlFromArtifact(src.sidecar)
+      urlFromArtifact(src.sidecar),
+      urlFromArtifact(src.reflectJson)
     );
 
     const runtimeArtifact = src.runtimeWasm !== undefined ? src.runtimeWasm : src.hasWasmBinary;
@@ -725,7 +1171,12 @@
      * @param {(() => number)|null} [options.nowFn]
      * @param {number|null} [options.stageTimeoutMs=0]
      * @param {boolean} [options.parallelPreload=true]
+     * @param {number|null} [options.preloadConcurrency=8]
      * @param {boolean} [options.releasePreloadBuffers=true]
+     * @param {Function|null} [options.preloadRuntimeWasm=null]
+     * @param {Function|null} [options.opfsProbe=null]
+     * @param {Function|null} [options.preloadShaderPackHeader=null]
+     * @param {Function|null} [options.preloadReflectionSidecar=null]
      * @param {Array<{name: string, run: Function, optional?: boolean, asset?: string}>|null} [options.preloadTasks=null]
      */
     constructor(options = {}) {
@@ -747,7 +1198,12 @@
         nowFn = null,
         stageTimeoutMs = DEFAULT_STAGE_TIMEOUT_MS,
         parallelPreload = DEFAULT_PARALLEL_PRELOAD,
+        preloadConcurrency = DEFAULT_PRELOAD_CONCURRENCY,
         releasePreloadBuffers = DEFAULT_RELEASE_PRELOAD_BUFFERS,
+        preloadRuntimeWasm = null,
+        opfsProbe = null,
+        preloadShaderPackHeader = null,
+        preloadReflectionSidecar = null,
         preloadTasks = null,
       } = options;
 
@@ -760,7 +1216,12 @@
       const resolvedNowFn = optionalFn(nowFn, 'nowFn') || defaultNow;
       const resolvedStageTimeoutMs = normalizeStageTimeoutMs(stageTimeoutMs);
       const resolvedParallelPreload = normalizeParallelPreload(parallelPreload);
+      const resolvedPreloadConcurrency = normalizePreloadConcurrency(preloadConcurrency, 'preloadConcurrency');
       const resolvedReleasePreloadBuffers = normalizeReleasePreloadBuffers(releasePreloadBuffers);
+      const resolvedPreloadRuntimeWasm = optionalFn(preloadRuntimeWasm, 'preloadRuntimeWasm');
+      const resolvedOpfsProbe = optionalFn(opfsProbe, 'opfsProbe');
+      const resolvedPreloadShaderPackHeader = optionalFn(preloadShaderPackHeader, 'preloadShaderPackHeader');
+      const resolvedPreloadReflectionSidecar = optionalFn(preloadReflectionSidecar, 'preloadReflectionSidecar');
       const resolvedPreloadTasks = normalizePreloadTasks(preloadTasks);
 
       this._fetchImpl = fetchImpl || null;
@@ -776,7 +1237,12 @@
       this._nowFn = resolvedNowFn;
       this._stageTimeoutMs = resolvedStageTimeoutMs;
       this._parallelPreload = resolvedParallelPreload;
+      this._preloadConcurrency = resolvedPreloadConcurrency;
       this._releasePreloadBuffers = resolvedReleasePreloadBuffers;
+      this._preloadRuntimeWasm = resolvedPreloadRuntimeWasm;
+      this._opfsProbe = resolvedOpfsProbe;
+      this._preloadShaderPackHeader = resolvedPreloadShaderPackHeader;
+      this._preloadReflectionSidecar = resolvedPreloadReflectionSidecar;
       this._preloadTasks = resolvedPreloadTasks;
       this._lastClockMs = 0;
 
@@ -804,7 +1270,7 @@
       this._stalledStage = null;
       this._stalledMs = 0;
       this._stallCount = 0;
-      this._preloadStats = emptyPreloadStats(this._parallelPreload);
+      this._preloadStats = emptyPreloadStats(this._parallelPreload, this._preloadConcurrency);
     }
 
     _readNow() {
@@ -835,7 +1301,7 @@
       this._stalledStage = null;
       this._stalledMs = 0;
       this._stallCount = 0;
-      this._preloadStats = emptyPreloadStats(this._parallelPreload);
+      this._preloadStats = emptyPreloadStats(this._parallelPreload, this._preloadConcurrency);
     }
 
     _buildTimingSnapshot(now = this._readNow()) {
@@ -853,6 +1319,10 @@
         totalStageDurationMs,
         totalBootMs,
         parallelPreloadSavedMs: preloadStats.parallelPreloadSavedMs,
+        serialEstimateMs: preloadStats.serialEstimateMs,
+        parallelWallMs: preloadStats.parallelWallMs,
+        overlapSavedMs: preloadStats.overlapSavedMs,
+        parallelStagesCount: preloadStats.parallelStagesCount,
         preloadTaskTimingsMs,
         preloadStats,
       };
@@ -872,10 +1342,75 @@
         totalBootMs: timing.totalBootMs,
         totalStageDurationMs: timing.totalStageDurationMs,
         parallelPreloadEnabled: this._parallelPreload,
+        preloadConcurrency: this._preloadConcurrency,
         parallelPreloadSavedMs: timing.parallelPreloadSavedMs,
+        serialEstimateMs: timing.serialEstimateMs,
+        parallelWallMs: timing.parallelWallMs,
+        overlapSavedMs: timing.overlapSavedMs,
+        parallelStagesCount: timing.parallelStagesCount,
         preloadTaskTimingsMs: timing.preloadTaskTimingsMs,
         preloadStats: timing.preloadStats,
       };
+    }
+
+    /**
+     * Return sanitized boot orchestrator timing, concurrency, and overlap savings statistics
+     * (`serialEstimateMs`, `parallelWallMs`, `overlapSavedMs`, `parallelStagesCount`) suitable
+     * for telemetry panels and JSON diagnostics without binary bundle references.
+     */
+    getStats() {
+      const timing = this._buildTimingSnapshot();
+      const { watchdog } = timing;
+      return {
+        phase: this._phase,
+        bootMode: this._bootMode,
+        firstPresent: this._firstPresent,
+        firstPresentSource: this._firstPresentSource,
+        parallelPreload: this._parallelPreload,
+        parallelPreloadEnabled: this._parallelPreload,
+        preloadConcurrency: this._preloadConcurrency,
+        phaseTimingsMs: timing.phaseTimingsMs,
+        stageDurationsMs: timing.stageDurationsMs,
+        currentStageElapsedMs: watchdog.currentStageElapsedMs,
+        totalBootMs: timing.totalBootMs,
+        totalStageDurationMs: timing.totalStageDurationMs,
+        serialEstimateMs: timing.serialEstimateMs,
+        parallelWallMs: timing.parallelWallMs,
+        overlapSavedMs: timing.overlapSavedMs,
+        parallelPreloadSavedMs: timing.parallelPreloadSavedMs,
+        parallelStagesCount: timing.parallelStagesCount,
+        preloadTaskTimingsMs: timing.preloadTaskTimingsMs,
+        preloadStats: timing.preloadStats,
+        isStalled: watchdog.isStalled,
+        stalledStage: watchdog.stalledStage,
+        stalledMs: watchdog.stalledMs,
+        stallCount: this._stallCount,
+      };
+    }
+
+    /**
+     * Run a batch of independent preload tasks using this orchestrator's clock, concurrency limit,
+     * and `parallelPreload` configuration.
+     */
+    async runConcurrentPreloads(tasks, options = {}) {
+      if (options !== undefined && (options === null || typeof options !== 'object')) {
+        throw new TypeError('runConcurrentPreloads options must be an object');
+      }
+      const parallel =
+        options.parallel !== undefined ? options.parallel : this._parallelPreload;
+      const maxConcurrency =
+        options.maxConcurrency !== undefined
+          ? options.maxConcurrency
+          : options.concurrency !== undefined
+            ? options.concurrency
+            : this._preloadConcurrency;
+      const nowFn = options.nowFn !== undefined ? options.nowFn : () => this._readNow();
+      return runConcurrentPreloads(tasks, {
+        ...options,
+        parallel,
+        maxConcurrency,
+        nowFn,
+      });
     }
 
     /**
@@ -994,12 +1529,17 @@
         destroyed: this._destroyed,
         aborted: this._aborted,
         parallelPreload: this._parallelPreload,
+        preloadConcurrency: this._preloadConcurrency,
         stageDurationsMs: timing.stageDurationsMs,
         phaseTimingsMs: timing.phaseTimingsMs,
         currentStageElapsedMs: watchdog.currentStageElapsedMs,
         totalStageDurationMs: timing.totalStageDurationMs,
         totalBootMs: timing.totalBootMs,
         parallelPreloadSavedMs: timing.parallelPreloadSavedMs,
+        serialEstimateMs: timing.serialEstimateMs,
+        parallelWallMs: timing.parallelWallMs,
+        overlapSavedMs: timing.overlapSavedMs,
+        parallelStagesCount: timing.parallelStagesCount,
         preloadTaskTimingsMs: timing.preloadTaskTimingsMs,
         preloadStats: timing.preloadStats,
         stageTimeoutMs: this._stageTimeoutMs,
@@ -1025,6 +1565,7 @@
         destroyed: this._destroyed,
         aborted: this._aborted,
         parallelPreload: this._parallelPreload,
+        preloadConcurrency: this._preloadConcurrency,
         fallbackReason: this._fallbackReason ? sanitizeDiagnosticText(this._fallbackReason) : null,
         error: this._error ? sanitizeDiagnosticText(this._error.message) : null,
         stageDurationsMs: timing.stageDurationsMs,
@@ -1033,6 +1574,10 @@
         totalStageDurationMs: timing.totalStageDurationMs,
         totalBootMs: timing.totalBootMs,
         parallelPreloadSavedMs: timing.parallelPreloadSavedMs,
+        serialEstimateMs: timing.serialEstimateMs,
+        parallelWallMs: timing.parallelWallMs,
+        overlapSavedMs: timing.overlapSavedMs,
+        parallelStagesCount: timing.parallelStagesCount,
         preloadTaskTimingsMs: timing.preloadTaskTimingsMs,
         preloadStats: timing.preloadStats,
         stageTimeoutMs: this._stageTimeoutMs,
@@ -1063,6 +1608,13 @@
       const phaseTimingsMs = this._cloneStageDurations();
       const totalBootMs = sumStageDurations(stageDurationsMs, 0);
       const parallelPreloadSavedMs = clampNonNegativeFinite(this._preloadStats.parallelPreloadSavedMs);
+      const serialEstimateMs = clampNonNegativeFinite(this._preloadStats.serialEstimateMs);
+      const parallelWallMs = clampNonNegativeFinite(this._preloadStats.parallelWallMs);
+      const overlapSavedMs = clampNonNegativeFinite(this._preloadStats.overlapSavedMs);
+      const parallelStagesCount =
+        Number.isInteger(this._preloadStats.parallelStagesCount) && this._preloadStats.parallelStagesCount >= 0
+          ? this._preloadStats.parallelStagesCount
+          : 0;
 
       const event = {
         phase: nextPhase,
@@ -1082,6 +1634,10 @@
         phaseTimingsMs,
         totalBootMs,
         parallelPreloadSavedMs,
+        serialEstimateMs,
+        parallelWallMs,
+        overlapSavedMs,
+        parallelStagesCount,
         ...(detail && typeof detail === 'object' ? detail : {}),
       };
       invokeQuiet(this._onPhaseChange, event);
@@ -1186,10 +1742,73 @@
       return payload;
     }
 
+    _resolveRuntimeWasmLoader() {
+      if (this._preloadRuntimeWasm) return this._preloadRuntimeWasm;
+      const preloader = this._preloader;
+      if (!preloader) return null;
+      if (typeof preloader.preloadRuntimeWasm === 'function') {
+        return preloader.preloadRuntimeWasm.bind(preloader);
+      }
+      if (typeof preloader.compileRuntimeWasm === 'function') {
+        return preloader.compileRuntimeWasm.bind(preloader);
+      }
+      if (typeof preloader.preloadWasm === 'function') {
+        return preloader.preloadWasm.bind(preloader);
+      }
+      return null;
+    }
+
+    _resolveOpfsProbe() {
+      if (this._opfsProbe) return this._opfsProbe;
+      const preloader = this._preloader;
+      if (!preloader) return null;
+      if (typeof preloader.probeOpfsWarmBoot === 'function') {
+        return preloader.probeOpfsWarmBoot.bind(preloader);
+      }
+      if (typeof preloader.probeOpfs === 'function') {
+        return preloader.probeOpfs.bind(preloader);
+      }
+      return null;
+    }
+
+    _resolveShaderPackHeaderLoader() {
+      if (this._preloadShaderPackHeader) return this._preloadShaderPackHeader;
+      const preloader = this._preloader;
+      if (!preloader) return null;
+      if (typeof preloader.preloadShaderPackHeader === 'function') {
+        return preloader.preloadShaderPackHeader.bind(preloader);
+      }
+      if (typeof preloader.preloadShaderPackIndex === 'function') {
+        return preloader.preloadShaderPackIndex.bind(preloader);
+      }
+      return null;
+    }
+
+    _resolveReflectionSidecarLoader() {
+      if (this._preloadReflectionSidecar) return this._preloadReflectionSidecar;
+      const preloader = this._preloader;
+      if (!preloader) return null;
+      if (typeof preloader.preloadReflectionSidecar === 'function') {
+        return preloader.preloadReflectionSidecar.bind(preloader);
+      }
+      if (typeof preloader.preloadSidecar === 'function') {
+        return preloader.preloadSidecar.bind(preloader);
+      }
+      return null;
+    }
+
     async _preloadBundle(assets, signal) {
       const preloader = this._preloader;
+      const shaderPackIndexLoader = this._resolveShaderPackHeaderLoader();
+      const reflectionSidecarLoader = this._resolveReflectionSidecarLoader();
+      const runtimeWasmLoader = this._resolveRuntimeWasmLoader();
+      const opfsProbe = this._resolveOpfsProbe();
+
       const needsPreloader = Boolean(
-        assets.pgimUrl || assets.shaderPackUrl || assets.shaderPackIndexUrl || assets.reflectionSidecarUrl
+        assets.pgimUrl ||
+        (assets.shaderPackUrl && !this._preloadShaderPackHeader && !this._preloadReflectionSidecar) ||
+        (assets.shaderPackIndexUrl && !this._preloadShaderPackHeader) ||
+        (assets.reflectionSidecarUrl && !this._preloadReflectionSidecar)
       );
       if (needsPreloader && !preloader) {
         throw new Error('Boot artifacts are present but no preloader is configured');
@@ -1207,18 +1826,6 @@
           ? preloader.preloadPgim.bind(preloader)
           : preloader && typeof preloader.preloadGuestImage === 'function'
             ? preloader.preloadGuestImage.bind(preloader)
-            : null;
-      const shaderPackIndexLoader =
-        preloader && typeof preloader.preloadShaderPackHeader === 'function'
-          ? preloader.preloadShaderPackHeader.bind(preloader)
-          : preloader && typeof preloader.preloadShaderPackIndex === 'function'
-            ? preloader.preloadShaderPackIndex.bind(preloader)
-            : null;
-      const reflectionSidecarLoader =
-        preloader && typeof preloader.preloadReflectionSidecar === 'function'
-          ? preloader.preloadReflectionSidecar.bind(preloader)
-          : preloader && typeof preloader.preloadSidecar === 'function'
-            ? preloader.preloadSidecar.bind(preloader)
             : null;
 
       if (assets.pgimUrl && !hasBootBundle && !pgimLoader) {
@@ -1296,10 +1903,13 @@
         });
       }
 
-      if (assets.reflectionSidecarUrl) {
+      const resolvedReflectionSidecarUrl =
+        assets.reflectionSidecarUrl ||
+        (reflectionSidecarLoader && assets.shaderPackUrl ? deriveReflectionSidecarUrl(assets.shaderPackUrl) : null);
+      if (resolvedReflectionSidecarUrl) {
         const sidecarFn =
           reflectionSidecarLoader ||
-          (preloader && typeof preloader.preloadReflectionManifest === 'function'
+          (assets.reflectionSidecarUrl && preloader && typeof preloader.preloadReflectionManifest === 'function'
             ? preloader.preloadReflectionManifest.bind(preloader)
             : null);
         if (sidecarFn) {
@@ -1309,7 +1919,7 @@
             kind: 'reflectionSidecar',
             optional: true,
             run: (taskSignal) =>
-              sidecarFn(assets.reflectionSidecarUrl, {
+              sidecarFn(resolvedReflectionSidecarUrl, {
                 onProgress: forwardFor('reflectionSidecar'),
                 signal: taskSignal,
               }),
@@ -1317,8 +1927,41 @@
         }
       }
 
-      for (const customTask of this._preloadTasks) {
+      if (runtimeWasmLoader && assets.runtimeWasmAvailable && assets.runtimeWasmUrl) {
         tasks.push({
+          name: 'runtimeWasm',
+          asset: 'runtimeWasm',
+          kind: 'runtimeWasm',
+          optional: true,
+          run: (taskSignal) =>
+            runtimeWasmLoader(assets.runtimeWasmUrl, {
+              assets: { ...assets },
+              status: this._status ? { ...this._status } : null,
+              onProgress: forwardFor('runtimeWasm'),
+              signal: taskSignal,
+            }),
+        });
+      }
+
+      if (opfsProbe) {
+        tasks.push({
+          name: 'opfsWarmBoot',
+          asset: 'opfsWarmBoot',
+          kind: 'opfsWarmBoot',
+          optional: true,
+          run: (taskSignal) =>
+            opfsProbe({
+              assets: { ...assets },
+              status: this._status ? { ...this._status } : null,
+              onProgress: forwardFor('opfsWarmBoot'),
+              signal: taskSignal,
+            }),
+        });
+      }
+
+      for (const customTask of this._preloadTasks) {
+        const existingIdx = tasks.findIndex((entry) => entry.name === customTask.name);
+        const wrappedTask = {
           name: customTask.name,
           asset: customTask.asset,
           kind: 'custom',
@@ -1330,11 +1973,16 @@
               signal: taskSignal,
               onProgress: forwardFor(customTask.asset),
             }),
-        });
+        };
+        if (existingIdx >= 0) {
+          tasks[existingIdx] = wrappedTask;
+        } else {
+          tasks.push(wrappedTask);
+        }
       }
 
       if (tasks.length === 0) {
-        this._preloadStats = emptyPreloadStats(this._parallelPreload);
+        this._preloadStats = emptyPreloadStats(this._parallelPreload, this._preloadConcurrency);
         return {
           pgim: null,
           shaderPackBytes: null,
@@ -1343,190 +1991,27 @@
         };
       }
 
-      const batchStartedAt = this._readNow();
-      const { controller: batchController, unlink: unlinkBatch } = linkSignal(signal);
-      const batchSignal = batchController.signal;
+      const execution = await runConcurrentPreloads(tasks, {
+        parallel: this._parallelPreload,
+        maxConcurrency: this._preloadConcurrency,
+        signal,
+        nowFn: () => this._readNow(),
+        onOptionalMissing: ({ task }) => {
+          this._forwardProgress({
+            phase: 'optional-missing',
+            asset: task.asset,
+            loadedBytes: 0,
+            totalBytes: 0,
+            pct: 0,
+          });
+        },
+        onComplete: (stats) => {
+          this._preloadStats = stats;
+        },
+        throwOnError: true,
+      });
 
-      let inFlight = 0;
-      let maxConcurrency = 0;
-      let firstFatalError = null;
-      let completedCount = 0;
-      let optionalMissingCount = 0;
-      let failedCount = 0;
-      let abortedCount = 0;
-      let sequentialTimeMs = 0;
-      let effectiveTaskCount = 0;
-      let reportedBootBundleTotalMs = 0;
-      const results = new Map();
-      const taskTimingsMs = Object.create(null);
-      const taskRecords = Object.create(null);
-
-      const runSingleTask = async (task) => {
-        const startedAt = this._readNow();
-        inFlight += 1;
-        if (inFlight > maxConcurrency) {
-          maxConcurrency = inFlight;
-        }
-        try {
-          throwIfAborted(batchSignal);
-          const value = await raceAbort(Promise.resolve().then(() => task.run(batchSignal)), batchSignal);
-          const durationMs = clampNonNegativeFinite(this._readNow() - startedAt);
-          results.set(task.name, value);
-
-          const subTiming =
-            task.kind === 'bootBundle' &&
-            value &&
-            typeof value === 'object' &&
-            value.timingMs &&
-            typeof value.timingMs === 'object'
-              ? value.timingMs
-              : null;
-          const subKeys = subTiming
-            ? Object.keys(subTiming).filter(
-                (key) =>
-                  key !== 'total' &&
-                  typeof subTiming[key] === 'number' &&
-                  Number.isFinite(subTiming[key]) &&
-                  subTiming[key] >= 0
-              )
-            : [];
-
-          if (subKeys.length > 0) {
-            for (const key of subKeys) {
-              const subDur = clampNonNegativeFinite(subTiming[key]);
-              taskTimingsMs[key] = subDur;
-              taskRecords[key] = {
-                status: 'completed',
-                optional: key !== 'pgim',
-                durationMs: subDur,
-                error: null,
-              };
-              sequentialTimeMs += subDur;
-              effectiveTaskCount += 1;
-              completedCount += 1;
-            }
-            if (typeof subTiming.total === 'number' && Number.isFinite(subTiming.total) && subTiming.total > 0) {
-              reportedBootBundleTotalMs = clampNonNegativeFinite(subTiming.total);
-            }
-            if (subKeys.length > maxConcurrency) {
-              maxConcurrency = subKeys.length;
-            }
-          } else {
-            taskTimingsMs[task.name] = durationMs;
-            taskRecords[task.name] = {
-              status: 'completed',
-              optional: Boolean(task.optional),
-              durationMs,
-              error: null,
-            };
-            sequentialTimeMs += durationMs;
-            effectiveTaskCount += 1;
-            completedCount += 1;
-          }
-        } catch (err) {
-          const durationMs = clampNonNegativeFinite(this._readNow() - startedAt);
-          const abortedByOuter = Boolean(signal && signal.aborted);
-          const abortedBySibling = Boolean(!abortedByOuter && batchSignal.aborted && firstFatalError !== null);
-          const explicitAbort = isAbortError(err);
-
-          if (abortedByOuter || abortedBySibling || explicitAbort) {
-            abortedCount += 1;
-            taskTimingsMs[task.name] = durationMs;
-            taskRecords[task.name] = {
-              status: 'aborted',
-              optional: Boolean(task.optional),
-              durationMs,
-              error: sanitizeDiagnosticText(toError(err, 'Preload task aborted').message),
-            };
-            if (!abortedBySibling && firstFatalError === null) {
-              firstFatalError = err;
-              if (!batchSignal.aborted) {
-                batchController.abort(err);
-              }
-            }
-            return;
-          }
-
-          if (task.optional && !isValidationError(err)) {
-            optionalMissingCount += 1;
-            results.set(task.name, null);
-            const statusLabel = isMissingOptionalError(err) ? 'missing' : 'fallback';
-            taskTimingsMs[task.name] = durationMs;
-            taskRecords[task.name] = {
-              status: statusLabel,
-              optional: true,
-              durationMs,
-              error: sanitizeDiagnosticText(toError(err, `Optional preload task ${task.name} failed`).message),
-            };
-            sequentialTimeMs += durationMs;
-            effectiveTaskCount += 1;
-            this._forwardProgress({
-              phase: 'optional-missing',
-              asset: task.asset,
-              loadedBytes: 0,
-              totalBytes: 0,
-              pct: 0,
-            });
-            return;
-          }
-
-          failedCount += 1;
-          taskTimingsMs[task.name] = durationMs;
-          taskRecords[task.name] = {
-            status: 'failed',
-            optional: Boolean(task.optional),
-            durationMs,
-            error: sanitizeDiagnosticText(toError(err, `Preload task ${task.name} failed`).message),
-          };
-          if (firstFatalError === null) {
-            firstFatalError = err;
-            if (!batchSignal.aborted) {
-              batchController.abort(err);
-            }
-          }
-        } finally {
-          inFlight -= 1;
-        }
-      };
-
-      try {
-        if (this._parallelPreload && tasks.length > 1) {
-          await Promise.all(tasks.map((task) => runSingleTask(task)));
-        } else {
-          for (const task of tasks) {
-            throwIfAborted(batchSignal);
-            await runSingleTask(task);
-            if (firstFatalError !== null) break;
-          }
-        }
-      } finally {
-        unlinkBatch();
-        const measuredWallMs = clampNonNegativeFinite(this._readNow() - batchStartedAt);
-        const effectiveWallMs = Math.max(measuredWallMs, reportedBootBundleTotalMs);
-        const canSave = this._parallelPreload && effectiveTaskCount > 1 && failedCount === 0 && abortedCount === 0;
-        const parallelPreloadSavedMs = canSave
-          ? clampNonNegativeFinite(sequentialTimeMs - effectiveWallMs)
-          : 0;
-        this._preloadStats = {
-          parallelEnabled: this._parallelPreload,
-          taskCount: effectiveTaskCount > 0 ? effectiveTaskCount : tasks.length,
-          completedCount,
-          optionalMissingCount,
-          failedCount,
-          abortedCount,
-          maxConcurrency,
-          wallTimeMs: effectiveWallMs,
-          sequentialTimeMs: clampNonNegativeFinite(sequentialTimeMs),
-          parallelPreloadSavedMs,
-          taskTimingsMs,
-          tasks: taskRecords,
-        };
-      }
-
-      throwIfAborted(signal);
-      if (firstFatalError !== null) {
-        throw firstFatalError;
-      }
+      const results = execution.resultsMap;
 
       const customSidecars = this._preloadTasks.length > 0 ? {} : null;
       if (customSidecars) {
@@ -1550,6 +2035,14 @@
           merged.reflectionSidecar = results.get('reflectionSidecar');
           extraBytes += inferBytesLoaded(merged.reflectionSidecar);
         }
+        if (results.has('runtimeWasm')) {
+          merged.runtimeWasm = results.get('runtimeWasm');
+          extraBytes += inferBytesLoaded(merged.runtimeWasm);
+        }
+        if (results.has('opfsWarmBoot')) {
+          merged.opfsWarmBoot = results.get('opfsWarmBoot');
+          extraBytes += inferBytesLoaded(merged.opfsWarmBoot);
+        }
         if (customSidecars) {
           merged.sidecars = customSidecars;
           for (const key of Object.keys(customSidecars)) {
@@ -1566,13 +2059,17 @@
       const shaderPackIndexResult = results.has('shaderPackIndex') ? results.get('shaderPackIndex') : null;
       const reflectionResult = results.has('reflection') ? results.get('reflection') : null;
       const reflectionSidecarResult = results.has('reflectionSidecar') ? results.get('reflectionSidecar') : null;
+      const runtimeWasmResult = results.has('runtimeWasm') ? results.get('runtimeWasm') : null;
+      const opfsWarmBootResult = results.has('opfsWarmBoot') ? results.get('opfsWarmBoot') : null;
 
       let bytesLoaded =
         inferBytesLoaded(pgimResult) +
         inferBytesLoaded(shaderPackResult) +
         inferBytesLoaded(shaderPackIndexResult) +
         inferBytesLoaded(reflectionResult) +
-        inferBytesLoaded(reflectionSidecarResult);
+        inferBytesLoaded(reflectionSidecarResult) +
+        inferBytesLoaded(runtimeWasmResult) +
+        inferBytesLoaded(opfsWarmBootResult);
       if (customSidecars) {
         for (const key of Object.keys(customSidecars)) {
           bytesLoaded += inferBytesLoaded(customSidecars[key]);
@@ -1590,6 +2087,12 @@
       }
       if (results.has('reflectionSidecar')) {
         bundle.reflectionSidecar = reflectionSidecarResult;
+      }
+      if (results.has('runtimeWasm')) {
+        bundle.runtimeWasm = runtimeWasmResult;
+      }
+      if (results.has('opfsWarmBoot')) {
+        bundle.opfsWarmBoot = opfsWarmBootResult;
       }
       if (customSidecars) {
         bundle.sidecars = customSidecars;
@@ -1644,6 +2147,10 @@
           fallbackReason: this._fallbackReason,
           phaseTimingsMs: timing.phaseTimingsMs,
           parallelPreloadSavedMs: timing.parallelPreloadSavedMs,
+          serialEstimateMs: timing.serialEstimateMs,
+          parallelWallMs: timing.parallelWallMs,
+          overlapSavedMs: timing.overlapSavedMs,
+          parallelStagesCount: timing.parallelStagesCount,
           totalBootMs: timing.totalBootMs,
         };
       }
@@ -1709,11 +2216,17 @@
         });
 
         throwIfAborted(signal);
+        const hasRuntimeWasmPreload = Boolean(
+          this._resolveRuntimeWasmLoader() && this._assets.runtimeWasmAvailable && this._assets.runtimeWasmUrl
+        );
+        const hasOpfsProbe = Boolean(this._resolveOpfsProbe());
         const shouldPreload = Boolean(
           this._assets.pgimUrl ||
           this._assets.shaderPackUrl ||
           this._assets.shaderPackIndexUrl ||
           this._assets.reflectionSidecarUrl ||
+          hasRuntimeWasmPreload ||
+          hasOpfsProbe ||
           this._preloadTasks.length > 0
         );
         if (shouldPreload) {
@@ -1754,6 +2267,10 @@
             ...launchPayload,
             phaseTimingsMs: timing.phaseTimingsMs,
             parallelPreloadSavedMs: timing.parallelPreloadSavedMs,
+            serialEstimateMs: timing.serialEstimateMs,
+            parallelWallMs: timing.parallelWallMs,
+            overlapSavedMs: timing.overlapSavedMs,
+            parallelStagesCount: timing.parallelStagesCount,
             totalBootMs: timing.totalBootMs,
           };
         }
@@ -1791,6 +2308,10 @@
           fallbackReason: this._fallbackReason,
           phaseTimingsMs: timing.phaseTimingsMs,
           parallelPreloadSavedMs: timing.parallelPreloadSavedMs,
+          serialEstimateMs: timing.serialEstimateMs,
+          parallelWallMs: timing.parallelWallMs,
+          overlapSavedMs: timing.overlapSavedMs,
+          parallelStagesCount: timing.parallelStagesCount,
           totalBootMs: timing.totalBootMs,
         };
       } catch (err) {
@@ -1820,6 +2341,10 @@
             error: toError(err, 'Boot pipeline aborted'),
             phaseTimingsMs: timing.phaseTimingsMs,
             parallelPreloadSavedMs: timing.parallelPreloadSavedMs,
+            serialEstimateMs: timing.serialEstimateMs,
+            parallelWallMs: timing.parallelWallMs,
+            overlapSavedMs: timing.overlapSavedMs,
+            parallelStagesCount: timing.parallelStagesCount,
             totalBootMs: timing.totalBootMs,
           };
         }
@@ -1834,6 +2359,10 @@
           error: normalized,
           phaseTimingsMs: timing.phaseTimingsMs,
           parallelPreloadSavedMs: timing.parallelPreloadSavedMs,
+          serialEstimateMs: timing.serialEstimateMs,
+          parallelWallMs: timing.parallelWallMs,
+          overlapSavedMs: timing.overlapSavedMs,
+          parallelStagesCount: timing.parallelStagesCount,
           totalBootMs: timing.totalBootMs,
         };
       }
@@ -2039,11 +2568,13 @@
     DEFAULT_STATUS_URL,
     DEFAULT_STAGE_TIMEOUT_MS,
     DEFAULT_PARALLEL_PRELOAD,
+    DEFAULT_PRELOAD_CONCURRENCY,
     DEFAULT_RELEASE_PRELOAD_BUFFERS,
     BootOrchestrator,
     discoverBootAssets,
     isRealGuestBoot,
     releaseBootBundleBytes,
+    runConcurrentPreloads,
     default: BootOrchestrator,
   });
 
