@@ -10,7 +10,10 @@ const {
   WEBGPU_BYTES_PER_ROW_ALIGNMENT,
   UNIFORM_BUFFER_SIZE,
   UNIFORM_FLAG_FULL_RANGE,
+  UNIFORM_FLAG_SWAP_CHROMA,
   BINK_PIXEL_FORMAT,
+  BINK_CHROMA_ORDER,
+  BINK_LOAD_OP,
   YUV_COLOR_SPACE,
   YUV_COLOR_RANGE,
   YUV_MATRICES,
@@ -56,6 +59,7 @@ function createMockWebGpuDevice() {
       writeTextureCalls.push({
         dest: { ...dest, origin: dest.origin ? { ...dest.origin } : undefined },
         data: bytes,
+        rawData: data,
         dataLayout: { ...dataLayout },
         size: { ...size },
       });
@@ -1267,6 +1271,422 @@ test('W115: droppedFrames tracks frame-pacing hitches and overwritten unpresente
   // Explicit driver drop recording also increments droppedFrames.
   presenter.recordDroppedFrame(2);
   assert.equal(presenter.getStats().droppedFrames, 5);
+
+  presenter.destroy();
+});
+
+test('W165: BINK_CHROMA_ORDER, uniform flags, and WGSL chroma swap support yuv vs yvu without red<->blue inversion', () => {
+  assert.ok(Object.isFrozen(BINK_CHROMA_ORDER));
+  assert.equal(BINK_CHROMA_ORDER.YUV, 'yuv');
+  assert.equal(BINK_CHROMA_ORDER.YVU, 'yvu');
+  assert.equal(UNIFORM_FLAG_SWAP_CHROMA, 2);
+
+  // WGSL must inspect bit 1 (2u) of uniforms.flags and swap chroma_u/chroma_v via select().
+  assert.match(BINK_PRESENTER_WGSL, /\(uniforms\.flags\s*&\s*2u\)\s*!=\s*0u/);
+  assert.match(BINK_PRESENTER_WGSL, /select\s*\(\s*raw_u\s*,\s*raw_v\s*,\s*swap_chroma\s*\)/);
+  assert.match(BINK_PRESENTER_WGSL, /select\s*\(\s*raw_v\s*,\s*raw_u\s*,\s*swap_chroma\s*\)/);
+
+  // Default packPresenterUniforms uses 'yuv' (swap flag cleared).
+  const packedYuv = packPresenterUniforms({
+    pixelFormat: BINK_PIXEL_FORMAT.YUV420P,
+    colorSpace: YUV_COLOR_SPACE.BT709,
+    colorRange: YUV_COLOR_RANGE.LIMITED,
+  });
+  const u32Yuv = new Uint32Array(packedYuv.buffer);
+  assert.equal(u32Yuv[3] & UNIFORM_FLAG_SWAP_CHROMA, 0);
+  assert.equal(u32Yuv[3] & UNIFORM_FLAG_FULL_RANGE, 0);
+
+  // 'yvu' sets UNIFORM_FLAG_SWAP_CHROMA and composes cleanly with UNIFORM_FLAG_FULL_RANGE.
+  const packedYvuFull = packPresenterUniforms({
+    pixelFormat: BINK_PIXEL_FORMAT.YUV420P,
+    colorSpace: YUV_COLOR_SPACE.BT709,
+    colorRange: YUV_COLOR_RANGE.FULL,
+    chromaOrder: BINK_CHROMA_ORDER.YVU,
+  });
+  const u32YvuFull = new Uint32Array(packedYvuFull.buffer);
+  assert.equal(u32YvuFull[3] & UNIFORM_FLAG_FULL_RANGE, UNIFORM_FLAG_FULL_RANGE);
+  assert.equal(u32YvuFull[3] & UNIFORM_FLAG_SWAP_CHROMA, UNIFORM_FLAG_SWAP_CHROMA);
+
+  // Presenter constructor, setter, and per-frame chromaOrder transitions update GPU uniforms cleanly.
+  const device = createMockWebGpuDevice();
+  const presenter = new BinkVideoPresenter({
+    device,
+    chromaOrder: BINK_CHROMA_ORDER.YVU,
+  });
+  assert.equal(presenter.chromaOrder, 'yvu');
+  assert.equal(presenter.getStats().chromaOrder, 'yvu');
+
+  const y = new Uint8Array(16 * 8).fill(180);
+  const cr = new Uint8Array(8 * 4).fill(220);
+  const cb = new Uint8Array(8 * 4).fill(90);
+  const targetView = { kind: 'GPUTextureView', id: 'swap-chroma' };
+
+  const up1 = presenter.uploadYuv420Frame({ y, u: cr, v: cb, width: 16, height: 8 });
+  assert.equal(up1.chromaOrder, 'yvu');
+  const pres1 = presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360);
+  assert.equal(pres1.chromaOrder, 'yvu');
+
+  const latestFlags = () => {
+    const buf = device.writeBufferCalls[device.writeBufferCalls.length - 1].data;
+    return new Uint32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4)[3];
+  };
+  assert.equal(latestFlags() & UNIFORM_FLAG_SWAP_CHROMA, UNIFORM_FLAG_SWAP_CHROMA);
+
+  const writesAfterYvu = device.writeBufferCalls.length;
+  // Per-frame switch back to 'yuv' marks uniforms dirty and clears swap flag.
+  const up2 = presenter.uploadYuv420Frame({
+    y,
+    u: cb,
+    v: cr,
+    width: 16,
+    height: 8,
+    chromaOrder: BINK_CHROMA_ORDER.YUV,
+  });
+  assert.equal(up2.chromaOrder, 'yuv');
+  assert.equal(presenter.chromaOrder, 'yuv');
+  assert.equal(presenter.getStats().chromaOrder, 'yuv');
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360);
+  assert.equal(device.writeBufferCalls.length, writesAfterYvu + 1);
+  assert.equal(latestFlags() & UNIFORM_FLAG_SWAP_CHROMA, 0);
+
+  // setChromaOrder('yvu') marks uniforms dirty and re-enables swap flag.
+  presenter.setChromaOrder(BINK_CHROMA_ORDER.YVU);
+  assert.equal(presenter.chromaOrder, 'yvu');
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360);
+  assert.equal(latestFlags() & UNIFORM_FLAG_SWAP_CHROMA, UNIFORM_FLAG_SWAP_CHROMA);
+
+  // uploadNv12Frame also supports per-frame chromaOrder ('yuv' vs 'yvu' / NV21).
+  const uv = new Uint8Array(8 * 4 * 2).fill(128);
+  const nvUp = presenter.uploadNv12Frame({
+    y,
+    uv,
+    width: 16,
+    height: 8,
+    chromaOrder: BINK_CHROMA_ORDER.YUV,
+  });
+  assert.equal(nvUp.chromaOrder, 'yuv');
+  presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360);
+  assert.equal(latestFlags() & UNIFORM_FLAG_SWAP_CHROMA, 0);
+
+  presenter.destroy();
+});
+
+test('W165: 4K (3840x2160 Y + 1920x1080 Cr/Cb) Bink2Scarlett YUV420P uses zero-copy Y upload and reusable chroma scratch buffer', () => {
+  const device = createMockWebGpuDevice();
+  const presenter = new BinkVideoPresenter({
+    device,
+    chromaOrder: BINK_CHROMA_ORDER.YVU,
+  });
+  const targetView = { kind: 'GPUTextureView', id: 'swap-4k' };
+
+  const width = 3840;
+  const height = 2160;
+  const uvW = 1920;
+  const uvH = 1080;
+
+  const y = new Uint8Array(width * height);
+  const cr = new Uint8Array(uvW * uvH);
+  const cb = new Uint8Array(uvW * uvH);
+
+  // Stamp deterministic sentinels on first, middle, and last rows of each plane.
+  y[0] = 0x11;
+  y[width - 1] = 0x22;
+  y[(height - 1) * width] = 0x33;
+  y[height * width - 1] = 0x44;
+
+  cr[0] = 0xa1;
+  cr[uvW - 1] = 0xa2;
+  cr[uvW] = 0xa3;
+  cr[(uvH - 1) * uvW + uvW - 1] = 0xa4;
+
+  cb[0] = 0xb1;
+  cb[uvW - 1] = 0xb2;
+  cb[uvW] = 0xb3;
+  cb[(uvH - 1) * uvW + uvW - 1] = 0xb4;
+
+  for (let frameIdx = 0; frameIdx < 3; frameIdx += 1) {
+    const up = presenter.uploadYuv420Frame({
+      y,
+      u: cr,
+      v: cb,
+      width,
+      height,
+      chromaOrder: BINK_CHROMA_ORDER.YVU,
+    });
+    assert.equal(up.format, BINK_PIXEL_FORMAT.YUV420P);
+    assert.equal(up.chromaOrder, 'yvu');
+    assert.equal(up.yBytesPerRow, 3840);
+    assert.equal(up.uvBytesPerRow, 2048);
+    assert.equal(up.yZeroCopy, true);
+    assert.equal(up.chromaZeroCopy, false);
+    assert.equal(up.bytesUploaded, 3840 * 2160 + 2048 * 1080 * 2);
+
+    const pres = presenter.presentFrame(createMockCommandEncoder(), targetView, 3840, 2160);
+    assert.equal(pres.presented, true);
+    assert.equal(pres.chromaOrder, 'yvu');
+  }
+
+  // 3 frames * 3 planes = 9 plane writeTexture calls (+ 1 lazy 1x1 neutral dummy texture upload).
+  const planeCalls = device.writeTextureCalls.filter(
+    (c) => c.dest.texture.label !== 'playgta6-bink-presenter-dummy'
+  );
+  assert.equal(planeCalls.length, 9);
+
+  // Frame 0 & Frame 2 calls: Y zero-copy, Cr/Cb scratch-repacked into the same reusable 2048x1080 buffer.
+  const yCall0 = planeCalls[0];
+  const crCall0 = planeCalls[1];
+  const cbCall0 = planeCalls[2];
+  const yCall2 = planeCalls[6];
+  const crCall2 = planeCalls[7];
+
+  // Zero-copy Y: exact Uint8Array reference passed directly to writeTexture with 3840 bytesPerRow.
+  assert.equal(yCall0.rawData, y);
+  assert.equal(yCall2.rawData, y);
+  assert.equal(yCall0.dataLayout.bytesPerRow, 3840);
+  assert.equal(yCall0.dataLayout.rowsPerImage, 2160);
+
+  // Reusable chroma scratch buffer: allocated once (2048 * 1080), reused across Cr, Cb, and all frames.
+  assert.equal(crCall0.dataLayout.bytesPerRow, 2048);
+  assert.equal(cbCall0.dataLayout.bytesPerRow, 2048);
+  assert.equal(crCall0.rawData.byteLength, 2048 * 1080);
+  assert.equal(crCall0.rawData.buffer, cbCall0.rawData.buffer);
+  assert.equal(crCall0.rawData.buffer, crCall2.rawData.buffer);
+
+  // Verify repacked row bytes and zeroed padding tail [1920..2048) on Cr and Cb.
+  assert.equal(crCall0.data[0], 0xa1);
+  assert.equal(crCall0.data[uvW - 1], 0xa2);
+  assert.equal(crCall0.data[uvW], 0);
+  assert.equal(crCall0.data[2047], 0);
+  assert.equal(crCall0.data[2048], 0xa3);
+  assert.equal(crCall0.data[(uvH - 1) * 2048 + uvW - 1], 0xa4);
+  assert.equal(crCall0.data[(uvH - 1) * 2048 + 2047], 0);
+
+  assert.equal(cbCall0.data[0], 0xb1);
+  assert.equal(cbCall0.data[uvW - 1], 0xb2);
+  assert.equal(cbCall0.data[uvW], 0);
+  assert.equal(cbCall0.data[2048], 0xb3);
+  assert.equal(cbCall0.data[(uvH - 1) * 2048 + uvW - 1], 0xb4);
+
+  // Verify 4K upload telemetry counters.
+  const stats = presenter.getStats();
+  assert.equal(stats.directZeroCopyUploads, 3);
+  assert.equal(stats.chromaRepackUploads, 6);
+  assert.equal(stats.scratchAllocations, 1);
+  assert.equal(stats.chromaOrder, 'yvu');
+  assert.equal(stats.lastFrameWidth, 3840);
+  assert.equal(stats.lastFrameHeight, 2160);
+  assert.equal(stats.planeReallocations, 1);
+  assert.equal(stats.framesPresented, 3);
+
+  // Verify uniform buffer carries YUV420P mode (1) and SWAP_CHROMA flag (2).
+  const latestUniform = device.writeBufferCalls[device.writeBufferCalls.length - 1].data;
+  const u32 = new Uint32Array(
+    latestUniform.buffer,
+    latestUniform.byteOffset,
+    latestUniform.byteLength / 4
+  );
+  assert.equal(u32[0], 1);
+  assert.equal(u32[3] & UNIFORM_FLAG_SWAP_CHROMA, UNIFORM_FLAG_SWAP_CHROMA);
+
+  presenter.destroy();
+});
+
+test('W165: pre-aligned 256-byte chroma strides and 4K NV12 take zero-copy fast path with zero scratch allocations', () => {
+  // Direct helper checks for 256-byte-multiple strides (2048 and 2304) vs truncated last row.
+  const aligned2304 = new Uint8Array(2304 * 4);
+  const direct2304 = prepareAlignedPlaneData(aligned2304, 1920, 4, 2304, 'Cr-2304');
+  assert.equal(direct2304.padded, false);
+  assert.equal(direct2304.usesScratch, false);
+  assert.equal(direct2304.bytesPerRow, 2304);
+  assert.equal(direct2304.data, aligned2304);
+
+  // Truncated last row (2048 * 3 + 1920 < 2048 * 4) must safely fall back to scratch repack.
+  const truncated2048 = new Uint8Array(2048 * 3 + 1920);
+  const scratch = new Uint8Array(2048 * 4);
+  const repacked = prepareAlignedPlaneData(truncated2048, 1920, 4, 2048, 'Cr-trunc', scratch);
+  assert.equal(repacked.padded, true);
+  assert.equal(repacked.usesScratch, true);
+  assert.equal(repacked.bytesPerRow, 2048);
+
+  // End-to-end 4K YUV420P with pre-aligned uvStride=2048: all 3 planes zero-copy, 0 scratch allocs.
+  const device = createMockWebGpuDevice();
+  const presenter = new BinkVideoPresenter({ device, doubleBuffer: false });
+
+  const y4k = new Uint8Array(3840 * 2160);
+  const crAligned = new Uint8Array(2048 * 1080);
+  const cbAligned = new Uint8Array(2048 * 1080);
+
+  const up = presenter.uploadYuv420Frame({
+    y: y4k,
+    u: crAligned,
+    v: cbAligned,
+    width: 3840,
+    height: 2160,
+    yStride: 3840,
+    uvStride: 2048,
+    chromaOrder: BINK_CHROMA_ORDER.YVU,
+  });
+  assert.equal(up.yZeroCopy, true);
+  assert.equal(up.chromaZeroCopy, true);
+  assert.equal(up.yBytesPerRow, 3840);
+  assert.equal(up.uvBytesPerRow, 2048);
+
+  let stats = presenter.getStats();
+  assert.equal(stats.directZeroCopyUploads, 3);
+  assert.equal(stats.chromaRepackUploads, 0);
+  assert.equal(stats.scratchAllocations, 0);
+
+  // 4K NV12 (3840 Y + 1920*2 = 3840 UV) also uploads both planes zero-copy with 0 scratch allocs.
+  const uv4k = new Uint8Array(3840 * 1080);
+  const nvUp = presenter.uploadNv12Frame({
+    y: y4k,
+    uv: uv4k,
+    width: 3840,
+    height: 2160,
+  });
+  assert.equal(nvUp.yZeroCopy, true);
+  assert.equal(nvUp.chromaZeroCopy, true);
+  assert.equal(nvUp.yBytesPerRow, 3840);
+  assert.equal(nvUp.uvBytesPerRow, 3840);
+
+  stats = presenter.getStats();
+  assert.equal(stats.directZeroCopyUploads, 5);
+  assert.equal(stats.chromaRepackUploads, 0);
+  assert.equal(stats.scratchAllocations, 0);
+
+  presenter.destroy();
+});
+
+test('W165: loadOp supports clear (default) and load for menu/UI swapchain underlay and overlay composition', () => {
+  assert.ok(Object.isFrozen(BINK_LOAD_OP));
+  assert.equal(BINK_LOAD_OP.CLEAR, 'clear');
+  assert.equal(BINK_LOAD_OP.LOAD, 'load');
+
+  const device = createMockWebGpuDevice();
+  const targetView = { kind: 'GPUTextureView', id: 'swap-menu' };
+
+  // Default presenter uses loadOp: 'clear' with clearValue.
+  const defaultPresenter = new BinkVideoPresenter({ device });
+  assert.equal(defaultPresenter.loadOp, 'clear');
+  assert.equal(defaultPresenter.getStats().loadOp, 'clear');
+
+  const rgba = new Uint8Array(16 * 8 * 4).fill(255);
+  defaultPresenter.uploadRgbaFrame(rgba, 16, 8);
+
+  const encClear = createMockCommandEncoder();
+  const resClear = defaultPresenter.presentFrame(encClear, targetView, 640, 360);
+  assert.equal(resClear.loadOp, 'clear');
+  assert.equal(encClear.renderPasses[0].descriptor.colorAttachments[0].loadOp, 'clear');
+  assert.ok('clearValue' in encClear.renderPasses[0].descriptor.colorAttachments[0]);
+
+  // Per-frame loadOp: 'load' omits clearValue so existing menu/UI pixels stay intact.
+  const encLoad = createMockCommandEncoder();
+  const resLoad = defaultPresenter.presentFrame(encLoad, targetView, 640, 360, {
+    loadOp: BINK_LOAD_OP.LOAD,
+    opacity: 0.5,
+  });
+  assert.equal(resLoad.presented, true);
+  assert.equal(resLoad.loadOp, 'load');
+  const loadAttachment = encLoad.renderPasses[0].descriptor.colorAttachments[0];
+  assert.equal(loadAttachment.loadOp, 'load');
+  assert.equal('clearValue' in loadAttachment, false);
+
+  // Opacity 0.5 was written into uniform buffer lane 2.
+  const latestUniform = device.writeBufferCalls[device.writeBufferCalls.length - 1].data;
+  const f32 = new Float32Array(
+    latestUniform.buffer,
+    latestUniform.byteOffset,
+    latestUniform.byteLength / 4
+  );
+  assertNear(f32[2], 0.5);
+  defaultPresenter.destroy();
+
+  // Constructor default loadOp: 'load' preserves existing swapchain even when !hasFrame.
+  const overlayPresenter = new BinkVideoPresenter({
+    device,
+    loadOp: BINK_LOAD_OP.LOAD,
+  });
+  assert.equal(overlayPresenter.loadOp, 'load');
+  assert.equal(overlayPresenter.getStats().loadOp, 'load');
+
+  const encEmpty = createMockCommandEncoder();
+  const emptyRes = overlayPresenter.presentFrame(encEmpty, targetView, 640, 360);
+  assert.equal(emptyRes.presented, false);
+  assert.equal(emptyRes.loadOp, 'load');
+  assert.equal(encEmpty.renderPasses[0].descriptor.colorAttachments[0].loadOp, 'load');
+  assert.equal('clearValue' in encEmpty.renderPasses[0].descriptor.colorAttachments[0], false);
+  assert.equal(encEmpty.renderPasses[0].draws.length, 0);
+
+  // setLoadOp('clear') switches the default back to 'clear'.
+  overlayPresenter.setLoadOp(BINK_LOAD_OP.CLEAR);
+  assert.equal(overlayPresenter.loadOp, 'clear');
+  const encAfterSet = createMockCommandEncoder();
+  overlayPresenter.presentFrame(encAfterSet, targetView, 640, 360);
+  assert.equal(encAfterSet.renderPasses[0].descriptor.colorAttachments[0].loadOp, 'clear');
+  assert.ok('clearValue' in encAfterSet.renderPasses[0].descriptor.colorAttachments[0]);
+
+  overlayPresenter.destroy();
+});
+
+test('W165: option validation rejects invalid chromaOrder, loadOp, storeOp, and opacity without mutating state', () => {
+  const device = createMockWebGpuDevice();
+  const targetView = { kind: 'GPUTextureView', id: 'swap-val' };
+
+  assert.throws(() => new BinkVideoPresenter({ device, chromaOrder: 'rgb' }), RangeError);
+  assert.throws(() => new BinkVideoPresenter({ device, chromaOrder: 'YVU' }), RangeError);
+  assert.throws(() => new BinkVideoPresenter({ device, loadOp: 'discard' }), RangeError);
+  assert.throws(() => packPresenterUniforms({ chromaOrder: 'invalid' }), RangeError);
+  assert.throws(() => packPresenterUniforms({ opacity: -0.1 }), RangeError);
+  assert.throws(() => packPresenterUniforms({ opacity: 1.5 }), RangeError);
+  assert.throws(() => packPresenterUniforms({ opacity: NaN }), RangeError);
+
+  const presenter = new BinkVideoPresenter({ device });
+  assert.throws(() => presenter.setChromaOrder('ycrcb'), RangeError);
+  assert.throws(() => presenter.setLoadOp('preserve'), RangeError);
+  assert.equal(presenter.chromaOrder, 'yuv');
+  assert.equal(presenter.loadOp, 'clear');
+
+  const y = new Uint8Array(16 * 8);
+  const u = new Uint8Array(8 * 4);
+  const v = new Uint8Array(8 * 4);
+  const uv = new Uint8Array(8 * 4 * 2);
+
+  assert.throws(
+    () => presenter.uploadYuv420Frame({ y, u, v, width: 16, height: 8, chromaOrder: 'bad' }),
+    RangeError
+  );
+  assert.throws(
+    () => presenter.uploadNv12Frame({ y, uv, width: 16, height: 8, chromaOrder: 'nv21' }),
+    RangeError
+  );
+  assert.equal(presenter.getStats().uploadedFrames, 0);
+  assert.equal(presenter.chromaOrder, 'yuv');
+
+  assert.throws(
+    () => presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360, 'bad'),
+    TypeError
+  );
+  assert.throws(
+    () =>
+      presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360, {
+        loadOp: 'invalid',
+      }),
+    RangeError
+  );
+  assert.throws(
+    () =>
+      presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360, {
+        storeOp: 'keep',
+      }),
+    RangeError
+  );
+  assert.throws(
+    () =>
+      presenter.presentFrame(createMockCommandEncoder(), targetView, 640, 360, {
+        opacity: 2,
+      }),
+    RangeError
+  );
 
   presenter.destroy();
 });
