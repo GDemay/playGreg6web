@@ -110,6 +110,13 @@
   /* --- Motion (Astryx standard easing) --- */
   --duration-fast: 125ms;
   --ease-standard: cubic-bezier(0.24, 1, 0.4, 1);
+
+  /* --- Splash Cross-Fade & Frosted High-Contrast Backdrop Tokens (W232) --- */
+  --pg6-splash-fade: 400ms;
+  --pg6-splash-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --pg6-splash-backdrop: rgba(15, 17, 22, 0.78);
+  --pg6-splash-backdrop-strong: rgba(12, 14, 19, 0.88);
+  --pg6-splash-pill-border: rgba(255, 255, 255, 0.14);
 }
 
 *,
@@ -1034,6 +1041,90 @@ body {
 }
 
 /* ============================================================================
+ * Splash Cross-Fade & Frosted High-Contrast Backdrop Helpers (W232)
+ * ========================================================================== */
+
+.pg6-fade-transition {
+  opacity: 1;
+  transition:
+    opacity var(--pg6-splash-fade, 400ms) var(--pg6-splash-ease, ease),
+    transform var(--pg6-splash-fade, 400ms) var(--pg6-splash-ease, ease);
+  will-change: opacity;
+}
+
+.pg6-fade-out {
+  opacity: 0;
+  transform: translateY(4px);
+  pointer-events: none;
+  transition:
+    opacity var(--pg6-splash-fade, 400ms) var(--pg6-splash-ease, ease),
+    transform var(--pg6-splash-fade, 400ms) var(--pg6-splash-ease, ease);
+}
+
+.pg6-splash-frosted {
+  background: var(--pg6-splash-backdrop);
+  color: var(--color-text-strong);
+  border: 1px solid var(--pg6-splash-pill-border);
+  border-radius: var(--radius-container);
+  box-shadow: var(--shadow-high);
+  backdrop-filter: blur(16px) saturate(1.15);
+  -webkit-backdrop-filter: blur(16px) saturate(1.15);
+}
+
+.pg6-splash-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--spacing-2);
+  padding: 6px 12px;
+  border: 1px solid var(--pg6-splash-pill-border);
+  border-radius: var(--radius-full);
+  background: var(--pg6-splash-backdrop-strong);
+  color: var(--color-text-strong);
+  box-shadow: var(--shadow-med);
+  backdrop-filter: blur(14px) saturate(1.15);
+  -webkit-backdrop-filter: blur(14px) saturate(1.15);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.55);
+}
+
+#splash-overlay-root .pg6-splash {
+  transition: opacity var(--pg6-splash-fade, 400ms) var(--pg6-splash-ease, ease);
+  will-change: opacity;
+}
+
+#splash-overlay-root .pg6-splash.pg6-splash--fading {
+  opacity: 0;
+  pointer-events: none;
+}
+
+#splash-overlay-root .pg6-splash__panel {
+  padding: 14px 16px;
+  border: 1px solid var(--pg6-splash-pill-border);
+  border-radius: var(--radius-container);
+  background: var(--pg6-splash-backdrop);
+  box-shadow: var(--shadow-high);
+  backdrop-filter: blur(16px) saturate(1.15);
+  -webkit-backdrop-filter: blur(16px) saturate(1.15);
+  contain: layout style paint;
+}
+
+#splash-overlay-root .pg6-splash__stage {
+  color: var(--color-text-strong);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.55);
+}
+
+#splash-overlay-root .pg6-splash__spinner {
+  transition:
+    transform var(--duration-fast) var(--ease-standard),
+    opacity var(--duration-fast) var(--ease-standard);
+}
+
+#splash-overlay-root .pg6-splash__greg {
+  box-shadow:
+    0 0 0 1px var(--pg6-splash-pill-border),
+    var(--shadow-med);
+}
+
+/* ============================================================================
  * Reduced Motion & Instant HUD / Splash Hiding (W226)
  * ========================================================================== */
 
@@ -1047,6 +1138,10 @@ body {
   #hud,
   #splash-overlay-root,
   .pg6-splash,
+  #splash-overlay-root .pg6-splash,
+  #splash-overlay-root .pg6-splash__spinner,
+  .pg6-fade-transition,
+  .pg6-fade-out,
   .pg6-splash__bar-fill,
   .pg6-splash__stream-fill,
   .astryx-button,
