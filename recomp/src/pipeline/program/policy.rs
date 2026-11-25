@@ -139,10 +139,10 @@ const GUEST_FAMILIES: &[&str] = &[
 ];
 
 /// Middleware the runtime deliberately replaces with host shims (O14 offline/WebGPU stubs):
-/// networking (`XCurl`, `libHttpClient.GDK`), video (`Bink2Scarlett`), and the GPU paths
-/// (`XboxBvhBuilder`, AMD FidelityFX).
+/// networking (`XCurl`, `libHttpClient.GDK`) and the GPU paths (`XboxBvhBuilder`, AMD
+/// FidelityFX). `Bink2Scarlett` is not among them (R44): a supplied copy decodes on the CPU in
+/// lifted code, and the shims serve only when the DLL is absent.
 pub const DEFAULT_HOST_ONLY: &[&str] = &[
-    "bink2scarlett.dll",
     "xcurl.dll",
     "libhttpclient.gdk.dll",
     "xboxbvhbuilder.dll",
