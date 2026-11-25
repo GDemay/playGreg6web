@@ -2509,3 +2509,445 @@ test('W201 invalidation clears cached views and updates viewCacheInvalidations o
   });
   assert.equal(vmCtx.PlayGta6ResourceRegistry.DEFAULT_MAX_CACHED_VIEWS_PER_TEXTURE, 16);
 });
+
+// ---------------------------------------------------------------------------
+// W250 (#1094): Sanitized texture-view hit-rate & invalidation telemetry,
+// #973 A8_UNORM-promoted rgba8unorm / Bink2 r8unorm texture counters,
+// peakLiveTextures / peakLiveBuffers high-water marks, and resetStats().
+// ---------------------------------------------------------------------------
+
+test('W250 getStats() exposes sanitized texture-view hit-rate, viewInvalidations, r8unorm/rgba8unorm & peak-live defaults', () => {
+  const reg = new GpuResourceRegistry();
+  const stats = reg.getStats();
+
+  // New W250 fields default cleanly to 0.
+  assert.equal(stats.viewCacheHits, 0);
+  assert.equal(stats.viewCacheMisses, 0);
+  assert.equal(stats.viewCacheHitRate, 0);
+  assert.equal(stats.viewInvalidations, 0);
+  assert.equal(stats.r8unormTextures, 0);
+  assert.equal(stats.rgba8unormTextures, 0);
+  assert.equal(stats.peakLiveTextures, 0);
+  assert.equal(stats.peakLiveBuffers, 0);
+
+  // Existing stats contract remains 100% preserved.
+  const expectedExistingKeys = [
+    'countsByKind',
+    'byKind',
+    'pendingCountsByKind',
+    'activeCount',
+    'pendingRetireCount',
+    'activeBytes',
+    'pendingRetireBytes',
+    'totalBytes',
+    'peakBytes',
+    'peakTotalBytes',
+    'softBudgetBytes',
+    'budgetExceeded',
+    'budgetWarningCount',
+    'totalRegistered',
+    'totalRetired',
+    'totalDestroyed',
+    'destroyErrors',
+    'currentFrame',
+    'framesInFlight',
+    'bcFormatFallbackCount',
+    'bcDimensionAlignCount',
+    'bufferAlignPadCount',
+    'mipClampCount',
+    'sampleClampCount',
+    'staleViewsInvalidated',
+    'viewCacheHits',
+    'viewCacheMisses',
+    'viewCacheInvalidations',
+    'viewCacheEvictions',
+    'maxCachedViewsPerTexture',
+    'textureRecreations',
+    'cachedViewCount',
+  ];
+  for (const key of expectedExistingKeys) {
+    assert.ok(Object.prototype.hasOwnProperty.call(stats, key), `missing existing stats field ${key}`);
+  }
+
+  // Defensive sanitization: corrupted internal counters never yield NaN/Infinity/negatives or out-of-range hit rate.
+  reg._viewCacheHits = -5;
+  reg._viewCacheMisses = NaN;
+  reg._viewCacheInvalidations = Infinity;
+  reg._r8unormTextures = -2;
+  reg._rgba8unormTextures = 3.9;
+  reg._peakLiveTextures = -10;
+  reg._peakLiveBuffers = NaN;
+
+  const sanitized = reg.getStats();
+  assert.equal(sanitized.viewCacheHits, 0);
+  assert.equal(sanitized.viewCacheMisses, 0);
+  assert.equal(sanitized.viewCacheHitRate, 0);
+  assert.equal(sanitized.viewInvalidations, 0);
+  assert.equal(sanitized.r8unormTextures, 0);
+  assert.equal(sanitized.rgba8unormTextures, 3);
+  assert.equal(sanitized.peakLiveTextures, 0);
+  assert.equal(sanitized.peakLiveBuffers, 0);
+
+  // Classic-worker importScripts isolation keeps internal W250 helpers private.
+  const sandbox = { console, TextEncoder, TextDecoder };
+  const vmCtx = vm.createContext(sandbox);
+  vmCtx.self = vmCtx;
+  vmCtx.importScripts = (...urls) => {
+    for (const rel of urls) {
+      const fullPath = path.resolve(WORKERS_DIR, rel);
+      const source = readFileSync(fullPath, 'utf8');
+      vm.runInContext(source, vmCtx, { filename: fullPath });
+    }
+  };
+  vmCtx.importScripts('./resource_registry.js');
+  assert.doesNotThrow(() => {
+    vm.runInContext(
+      `
+      function sanitizeNonNegativeCounter() {}
+      function clampUnitRate() {}
+      `,
+      vmCtx
+    );
+  });
+});
+
+test('W250 viewCacheHitRate is clamped [0, 1] and viewInvalidations tracks replace, retire, invalidateTextureViews, and destroyAll', () => {
+  const { device } = createMockWebGpuDevice({
+    features: new Set([TEXTURE_COMPRESSION_BC_FEATURE]),
+  });
+  const reg = new GpuResourceRegistry({
+    framesInFlight: 2,
+    device,
+    includeSrgbSiblingViewFormat: true,
+  });
+
+  reg.createTexture2(1, {
+    width: 1920,
+    height: 1080,
+    format: 'rgba8unorm',
+    usage: GPU_TEXTURE_USAGE.TEXTURE_BINDING | GPU_TEXTURE_USAGE.RENDER_ATTACHMENT,
+  });
+
+  // 0 lookups -> 0 hit rate
+  assert.equal(reg.getStats().viewCacheHitRate, 0);
+
+  // 2 misses, 0 hits -> 0 hit rate
+  const vLin = reg.getTextureView(1, { format: 'rgba8unorm' });
+  const vSrgb = reg.getTextureView(1, { format: 'rgba8unorm-srgb' });
+  assert.ok(vLin && vSrgb);
+  let stats = reg.getStats();
+  assert.equal(stats.viewCacheMisses, 2);
+  assert.equal(stats.viewCacheHits, 0);
+  assert.equal(stats.viewCacheHitRate, 0);
+
+  // 6 hits across the 2 cached views -> 6 / 8 = 0.75
+  for (let i = 0; i < 3; i += 1) {
+    assert.equal(reg.getTextureView(1, { format: 'rgba8unorm' }), vLin);
+    assert.equal(reg.getTextureView(1, { format: 'rgba8unorm-srgb' }), vSrgb);
+  }
+  stats = reg.getStats();
+  assert.equal(stats.viewCacheHits, 6);
+  assert.equal(stats.viewCacheMisses, 2);
+  assert.equal(stats.viewCacheHitRate, 0.75);
+  assert.ok(stats.viewCacheHitRate >= 0 && stats.viewCacheHitRate <= 1);
+  assert.equal(stats.viewInvalidations, 0);
+
+  // Replacing handle 1 (1080p -> 4K) invalidates 2 cached views + 1 default linked view = 3
+  reg.createTexture2(1, {
+    width: 3840,
+    height: 2160,
+    format: 'rgba8unorm',
+    usage: GPU_TEXTURE_USAGE.TEXTURE_BINDING | GPU_TEXTURE_USAGE.RENDER_ATTACHMENT,
+  });
+  stats = reg.getStats();
+  assert.equal(stats.viewInvalidations, 3);
+  assert.equal(stats.viewInvalidations, stats.viewCacheInvalidations);
+  assert.equal(stats.viewInvalidations, stats.staleViewsInvalidated);
+
+  // Explicit invalidateTextureViews(1) invalidates cached + default linked views
+  const v4k = reg.getTextureView(1);
+  assert.ok(v4k);
+  assert.equal(reg.invalidateTextureViews(1), 2);
+  stats = reg.getStats();
+  assert.equal(stats.viewInvalidations, 5);
+  assert.equal(stats.viewCacheInvalidations, 5);
+
+  // Retire invalidates newly cached view
+  const v4kAgain = reg.getTextureView(1);
+  assert.ok(v4kAgain);
+  assert.equal(reg.retire(RESOURCE_KIND.TEXTURE, 1), true);
+  stats = reg.getStats();
+  assert.equal(stats.viewInvalidations, 6);
+
+  // destroyAll invalidates live cached + default views once and is idempotent
+  reg.createTexture2(2, { width: 64, height: 64, format: 'r8unorm' });
+  reg.getTextureView(2);
+  reg.destroyAll();
+  stats = reg.getStats();
+  assert.equal(stats.viewInvalidations, 8);
+  reg.destroyAll();
+  assert.equal(reg.getStats().viewInvalidations, 8);
+});
+
+test('W250 tracks #973 rgba8unorm and Bink2 r8unorm textures across CreateTexture2, BC fallback, and direct register()', () => {
+  // 1. Device WITH texture-compression-bc
+  const { device: bcDevice } = createMockWebGpuDevice({
+    features: new Set([TEXTURE_COMPRESSION_BC_FEATURE]),
+  });
+  const reg = new GpuResourceRegistry({ framesInFlight: 2, device: bcDevice });
+
+  // Binary CreateTexture2 Bink2 Y/U/V r8unorm planes (format code 1)
+  const yPayload = buildCreateTexture2Payload({ id: 10, width: 1920, height: 1080, format: 1 });
+  const uPayload = buildCreateTexture2Payload({ id: 11, width: 960, height: 540, format: 1 });
+  assert.equal(reg.createTexture2(yPayload, 0, CREATE_TEXTURE2_PAYLOAD_BYTES).error, undefined);
+  assert.equal(reg.createTexture2(uPayload, 0, CREATE_TEXTURE2_PAYLOAD_BYTES).error, undefined);
+
+  // Binary CreateTexture2 #973 A8_UNORM-promoted rgba8unorm texture (format code 22)
+  const a8PromotedPayload = buildCreateTexture2Payload({ id: 12, width: 512, height: 512, format: 22 });
+  assert.equal(reg.createTexture2(a8PromotedPayload, 0, CREATE_TEXTURE2_PAYLOAD_BYTES).error, undefined);
+
+  // Structured createTexture with case-insensitive format strings
+  reg.createTexture(13, { width: 64, height: 64, format: 'R8UNORM' });
+  reg.createTexture(14, { width: 64, height: 64, format: 'RGBA8UNORM' });
+
+  // Non-r8unorm / non-rgba8unorm formats MUST NOT increment either counter
+  reg.createTexture2(15, { width: 64, height: 64, format: 'rgba8unorm-srgb' });
+  reg.createTexture2(16, { width: 64, height: 64, format: 'bgra8unorm' });
+  reg.createTexture2(17, { width: 64, height: 64, format: 'rg8unorm' });
+  reg.createTexture2(18, { width: 64, height: 64, format: 'rgba16float' });
+  reg.createTexture2(19, { width: 64, height: 64, format: 'depth24plus-stencil8' });
+  reg.createTexture2(20, { width: 64, height: 64, format: 'bc7-rgba-unorm' });
+
+  let stats = reg.getStats();
+  assert.equal(stats.r8unormTextures, 3);
+  assert.equal(stats.rgba8unormTextures, 2);
+
+  // Direct register() with format / descriptor.format / resource.format counts once;
+  // in-place re-registration of the exact same texture object does NOT double-count.
+  const directR8 = { format: 'r8unorm', destroy() {} };
+  const directRgba = { destroy() {} };
+  const bareNoFormat = { destroy() {} };
+  reg.register(RESOURCE_KIND.TEXTURE, 30, directR8, { byteSize: 1024 });
+  reg.register(RESOURCE_KIND.TEXTURE, 30, directR8, { byteSize: 2048, label: 'same-obj-update' });
+  reg.register(RESOURCE_KIND.TEXTURE, 31, directRgba, {
+    byteSize: 4096,
+    descriptor: { width: 32, height: 32, format: 'rgba8unorm' },
+  });
+  reg.register(RESOURCE_KIND.TEXTURE, 32, bareNoFormat, { byteSize: 512 });
+
+  stats = reg.getStats();
+  assert.equal(stats.r8unormTextures, 4);
+  assert.equal(stats.rgba8unormTextures, 3);
+
+  // Replacing handle 10 (1080p -> 4K r8unorm recreation) increments r8unormTextures
+  reg.createTexture2(10, { width: 3840, height: 2160, format: 'r8unorm' });
+  assert.equal(reg.getStats().r8unormTextures, 5);
+
+  // Invalid binary CreateTexture2 packet does not increment format counters
+  const badPayload = buildCreateTexture2Payload({ id: 99, format: 0 });
+  assert.ok(reg.createTexture2(badPayload).error);
+  assert.equal(reg.getStats().r8unormTextures, 5);
+  assert.equal(reg.getStats().rgba8unormTextures, 3);
+
+  // 2. Device WITHOUT texture-compression-bc: BC fallback resolves effectiveFormat to rgba8unorm
+  const { device: noBcDevice } = createMockWebGpuDevice({ features: new Set() });
+  const fallbackReg = new GpuResourceRegistry({ device: noBcDevice });
+  fallbackReg.createTexture2(1, { width: 64, height: 64, format: 'bc7-rgba-unorm' });
+  fallbackReg.createTexture2(2, { width: 64, height: 64, format: 'bc3-rgba-unorm-srgb' });
+  assert.equal(fallbackReg.getStats().bcFormatFallbackCount, 2);
+  assert.equal(fallbackReg.getStats().rgba8unormTextures, 2);
+  assert.equal(fallbackReg.getStats().r8unormTextures, 0);
+
+  // Failing device.createTexture does not increment counters
+  const { device: failDevice } = createMockWebGpuDevice({ throwOnCreateTexture: true });
+  const failReg = new GpuResourceRegistry({ device: failDevice });
+  assert.ok(failReg.createTexture2(a8PromotedPayload).error);
+  assert.equal(failReg.getStats().rgba8unormTextures, 0);
+  assert.equal(failReg.getStats().peakLiveTextures, 0);
+});
+
+test('W250 peakLiveTextures and peakLiveBuffers track live high-water marks across register, overwrite, retire, and destroyAll', () => {
+  const { device } = createMockWebGpuDevice({
+    features: new Set([TEXTURE_COMPRESSION_BC_FEATURE]),
+  });
+  const reg = new GpuResourceRegistry({ framesInFlight: 2, device });
+
+  // Register 3 textures and 4 buffers concurrently
+  reg.createTexture2(1, { width: 64, height: 64, format: 'r8unorm' });
+  reg.createTexture2(2, { width: 64, height: 64, format: 'rgba8unorm' });
+  reg.createTexture2(3, { width: 64, height: 64, format: 'rgba16float' });
+  reg.createBuffer(10, { size: 64, usage: GPU_BUFFER_USAGE.VERTEX });
+  reg.createBuffer(11, { size: 128, usage: GPU_BUFFER_USAGE.INDEX });
+  reg.createBuffer(12, { size: 256, usage: GPU_BUFFER_USAGE.UNIFORM });
+  reg.register(RESOURCE_KIND.BUFFER, 13, createDestroyableMock('raw-buf'), { byteSize: 512 });
+
+  // Other kinds (sampler, bindGroup) do not affect peakLiveTextures or peakLiveBuffers
+  reg.register(RESOURCE_KIND.SAMPLER, 100, createNonDestroyableMock('samp'));
+  reg.register(RESOURCE_KIND.BIND_GROUP, 101, createNonDestroyableMock('bg'));
+
+  let stats = reg.getStats();
+  assert.equal(stats.countsByKind[RESOURCE_KIND.TEXTURE], 3);
+  assert.equal(stats.countsByKind[RESOURCE_KIND.BUFFER], 4);
+  assert.equal(stats.peakLiveTextures, 3);
+  assert.equal(stats.peakLiveBuffers, 4);
+
+  // Overwriting existing handles does NOT inflate peakLiveTextures / peakLiveBuffers
+  reg.createTexture2(1, { width: 128, height: 128, format: 'r8unorm' });
+  reg.createBuffer(10, { size: 128, usage: GPU_BUFFER_USAGE.VERTEX });
+  stats = reg.getStats();
+  assert.equal(stats.countsByKind[RESOURCE_KIND.TEXTURE], 3);
+  assert.equal(stats.countsByKind[RESOURCE_KIND.BUFFER], 4);
+  assert.equal(stats.peakLiveTextures, 3);
+  assert.equal(stats.peakLiveBuffers, 4);
+
+  // Retiring drops live counts while preserving high-water marks
+  reg.retire(RESOURCE_KIND.TEXTURE, 2);
+  reg.retire(RESOURCE_KIND.TEXTURE, 3);
+  reg.retire(RESOURCE_KIND.BUFFER, 11);
+  reg.retire(RESOURCE_KIND.BUFFER, 12);
+  reg.retire(RESOURCE_KIND.BUFFER, 13);
+  stats = reg.getStats();
+  assert.equal(stats.countsByKind[RESOURCE_KIND.TEXTURE], 1);
+  assert.equal(stats.countsByKind[RESOURCE_KIND.BUFFER], 1);
+  assert.equal(stats.peakLiveTextures, 3);
+  assert.equal(stats.peakLiveBuffers, 4);
+
+  // Exceeding previous peak updates high-water marks cleanly
+  reg.createTexture2(2, { width: 32, height: 32, format: 'rgba8unorm' });
+  reg.createTexture2(3, { width: 32, height: 32, format: 'rgba8unorm' });
+  reg.createTexture2(4, { width: 32, height: 32, format: 'r8unorm' });
+  stats = reg.getStats();
+  assert.equal(stats.countsByKind[RESOURCE_KIND.TEXTURE], 4);
+  assert.equal(stats.peakLiveTextures, 4);
+  assert.equal(stats.peakLiveBuffers, 4);
+
+  // destroyAll clears live tables while preserving peak high-water marks
+  reg.destroyAll();
+  stats = reg.getStats();
+  assert.equal(stats.countsByKind[RESOURCE_KIND.TEXTURE], 0);
+  assert.equal(stats.countsByKind[RESOURCE_KIND.BUFFER], 0);
+  assert.equal(stats.peakLiveTextures, 4);
+  assert.equal(stats.peakLiveBuffers, 4);
+});
+
+test('W250 resetStats() resets cumulative telemetry, re-baselines peaks to live occupancy, and preserves live resources & cached views', () => {
+  const { device, createdTextures, createdBuffers } = createMockWebGpuDevice({
+    features: new Set(), // no BC -> triggers bcFormatFallbackCount too
+  });
+  const reg = new GpuResourceRegistry({
+    framesInFlight: 2,
+    softBudgetBytes: 1024,
+    device,
+    includeSrgbSiblingViewFormat: true,
+  });
+
+  reg.beginFrame(1);
+
+  // Populate live textures (r8unorm + rgba8unorm + BC fallback -> rgba8unorm), buffers, views, and retirements
+  reg.createTexture2(1, { width: 64, height: 64, format: 'r8unorm', mipLevels: 99, sampleCount: 4 });
+  reg.createTexture2(2, { width: 32, height: 32, format: 'rgba8unorm' });
+  reg.createTexture2(3, { width: 16, height: 16, format: 'bc7-rgba-unorm' });
+  reg.createBuffer(10, { size: 5, usage: GPU_BUFFER_USAGE.VERTEX | GPU_BUFFER_USAGE.COPY_DST });
+  reg.createBuffer(11, { size: 12, usage: GPU_BUFFER_USAGE.UNIFORM });
+  reg.createBuffer(12, { size: 64, usage: GPU_BUFFER_USAGE.VERTEX });
+
+  // Cache views and build hits + misses + invalidations
+  const v1 = reg.getTextureView(1);
+  assert.equal(reg.getTextureView(1), v1);
+  const v2 = reg.getTextureView(2, { format: 'rgba8unorm-srgb' });
+  assert.equal(reg.getTextureView(2, { format: 'rgba8unorm-srgb' }), v2);
+  const v3 = reg.getTextureView(3);
+  assert.ok(v3);
+
+  // Retire texture 3 and buffers 11 & 12 so live counts < peaks and pendingRetire is non-empty
+  reg.retire(RESOURCE_KIND.TEXTURE, 3);
+  reg.retire(RESOURCE_KIND.BUFFER, 11);
+  reg.retire(RESOURCE_KIND.BUFFER, 12);
+
+  const before = reg.getStats();
+  assert.equal(before.countsByKind[RESOURCE_KIND.TEXTURE], 2);
+  assert.equal(before.countsByKind[RESOURCE_KIND.BUFFER], 1);
+  assert.equal(before.peakLiveTextures, 3);
+  assert.equal(before.peakLiveBuffers, 3);
+  assert.equal(before.r8unormTextures, 1);
+  assert.equal(before.rgba8unormTextures, 2);
+  assert.equal(before.viewCacheHits, 2);
+  assert.equal(before.viewCacheMisses, 3);
+  assert.equal(before.viewCacheHitRate, 2 / 5);
+  assert.equal(before.viewInvalidations, 2); // default + cached view for texture 3
+  assert.equal(before.bcFormatFallbackCount, 1);
+  assert.equal(before.mipClampCount, 1);
+  assert.equal(before.sampleClampCount, 1);
+  assert.equal(before.bufferAlignPadCount, 2);
+  assert.equal(before.budgetWarningCount, 1);
+  assert.ok(before.pendingRetireCount >= 3);
+
+  // Call resetStats()
+  const after = reg.resetStats();
+
+  // Cumulative counters reset cleanly to 0
+  assert.equal(after.viewCacheHits, 0);
+  assert.equal(after.viewCacheMisses, 0);
+  assert.equal(after.viewCacheHitRate, 0);
+  assert.equal(after.viewInvalidations, 0);
+  assert.equal(after.viewCacheInvalidations, 0);
+  assert.equal(after.staleViewsInvalidated, 0);
+  assert.equal(after.viewCacheEvictions, 0);
+  assert.equal(after.textureRecreations, 0);
+  assert.equal(after.r8unormTextures, 0);
+  assert.equal(after.rgba8unormTextures, 0);
+  assert.equal(after.bcFormatFallbackCount, 0);
+  assert.equal(after.bcDimensionAlignCount, 0);
+  assert.equal(after.bufferAlignPadCount, 0);
+  assert.equal(after.mipClampCount, 0);
+  assert.equal(after.sampleClampCount, 0);
+  assert.equal(after.totalRegistered, 0);
+  assert.equal(after.totalRetired, 0);
+  assert.equal(after.totalDestroyed, 0);
+  assert.equal(after.destroyErrors, 0);
+  assert.equal(after.budgetWarningCount, 0);
+
+  // Peak gauges re-baseline to current live occupancy (peak >= live invariant holds)
+  assert.equal(after.countsByKind[RESOURCE_KIND.TEXTURE], 2);
+  assert.equal(after.countsByKind[RESOURCE_KIND.BUFFER], 1);
+  assert.equal(after.peakLiveTextures, 2);
+  assert.equal(after.peakLiveBuffers, 1);
+  assert.equal(after.peakBytes, after.totalBytes);
+  assert.equal(after.peakTotalBytes, after.totalBytes);
+
+  // Live resources, cached views, texture generations, and deferred GC queue are 100% preserved!
+  assert.equal(reg.get(RESOURCE_KIND.TEXTURE, 1), createdTextures[0]);
+  assert.equal(reg.get(RESOURCE_KIND.TEXTURE, 2), createdTextures[1]);
+  assert.equal(reg.get(RESOURCE_KIND.BUFFER, 10), createdBuffers[0]);
+  assert.equal(after.cachedViewCount, 2);
+  assert.equal(reg.getTextureGeneration(1), 1);
+  assert.equal(reg.isTextureViewValid(v1), true);
+  assert.equal(reg.isTextureViewValid(v2), true);
+  assert.equal(reg.isTextureViewValid(v3), false);
+
+  // Re-fetching already-cached view v1 after resetStats() is an immediate hit (hitRate === 1)
+  assert.equal(reg.getTextureView(1), v1);
+  const postHit = reg.getStats();
+  assert.equal(postHit.viewCacheHits, 1);
+  assert.equal(postHit.viewCacheMisses, 0);
+  assert.equal(postHit.viewCacheHitRate, 1);
+
+  // Deferred retirements from before resetStats() still collect cleanly on frame advance
+  reg.beginFrame(2);
+  reg.beginFrame(3);
+  assert.equal(createdTextures[2].destroyCount, 1);
+  assert.equal(createdBuffers[1].destroyCount, 1);
+  assert.equal(createdBuffers[2].destroyCount, 1);
+  assert.equal(reg.getStats().pendingRetireCount, 0);
+  assert.equal(reg.getStats().totalDestroyed, before.pendingRetireCount);
+
+  // After destroyAll() + resetStats(), peaks also drop to 0
+  reg.destroyAll();
+  const cleared = reg.resetStats();
+  assert.equal(cleared.peakLiveTextures, 0);
+  assert.equal(cleared.peakLiveBuffers, 0);
+  assert.equal(cleared.peakBytes, 0);
+  assert.equal(cleared.totalBytes, 0);
+  assert.equal(cleared.activeCount, 0);
+  assert.equal(cleared.cachedViewCount, 0);
+});
