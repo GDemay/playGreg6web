@@ -6,6 +6,7 @@ const require = createRequire(import.meta.url);
 const {
   AsyncPipelineCache,
   DEFAULT_MAX_CONCURRENT_PIPELINES,
+  DEFAULT_PIPELINE_PRIORITY,
   PIPELINE_STATUS,
 } = require('../web/workers/async_pipeline_cache.js');
 
@@ -110,7 +111,10 @@ function recordCallbacks() {
 
 test('defaults: maxConcurrent 4 and initial stats', () => {
   assert.equal(DEFAULT_MAX_CONCURRENT_PIPELINES, 4);
+  assert.ok(DEFAULT_PIPELINE_PRIORITY.render > DEFAULT_PIPELINE_PRIORITY.compute);
   const cache = new AsyncPipelineCache({ device: createManualDevice() });
+  assert.equal(cache.maxConcurrentCompiles, 4);
+  assert.equal(cache.prioritizeGraphics, true);
   assert.deepEqual(cache.getStats(), {
     generation: 0,
     maxConcurrent: 4,
@@ -125,18 +129,28 @@ test('defaults: maxConcurrent 4 and initial stats', () => {
     discardedStale: 0,
     inFlightCompiles: 0,
     peakInFlightCompiles: 0,
+    activeCompiles: 0,
+    peakConcurrentCompiles: 0,
     queuedCompiles: 0,
     failedAsyncCompiles: 0,
     avgAsyncCompileMs: 0,
+    avgCompileMs: 0,
+    maxCompileMs: 0,
+    priorityPromotions: 0,
   });
   assert.equal(new AsyncPipelineCache({ maxConcurrent: 0 }).maxConcurrent, 4);
   assert.equal(new AsyncPipelineCache({ maxConcurrent: 2.5 }).maxConcurrent, 4);
+  assert.equal(new AsyncPipelineCache({ maxConcurrentCompiles: -1 }).maxConcurrentCompiles, 4);
+  assert.equal(new AsyncPipelineCache({ maxConcurrentCompiles: 2.5 }).maxConcurrentCompiles, 4);
+  assert.equal(new AsyncPipelineCache({ maxConcurrentCompiles: null }).maxConcurrentCompiles, 4);
+  assert.equal(new AsyncPipelineCache({ maxConcurrentCompiles: 0 }).maxConcurrentCompiles, 0);
 });
 
 test('concurrency cap: 12 pipelines with maxConcurrent 3 never exceed 3 in flight (FIFO)', async () => {
   const device = createManualDevice();
   const cb = recordCallbacks();
-  const cache = new AsyncPipelineCache({ device, maxConcurrent: 3, ...cb });
+  // Opt out of W168 graphics-over-compute default to verify legacy cross-kind FIFO behavior.
+  const cache = new AsyncPipelineCache({ device, maxConcurrent: 3, prioritizeGraphics: false, ...cb });
 
   const results = [];
   for (let i = 0; i < 12; i += 1) {
@@ -506,7 +520,7 @@ test('repeat compile of a pending or ready id does not recompile', async () => {
 
 test('W138: maxConcurrentCompiles: 2 caps 5 distinct pipelines in FIFO order with telemetry', async () => {
   const device = createManualDevice();
-  const cache = new AsyncPipelineCache({ device, maxConcurrentCompiles: 2 });
+  const cache = new AsyncPipelineCache({ device, maxConcurrentCompiles: 2, prioritizeGraphics: false });
   assert.equal(cache.maxConcurrentCompiles, 2);
 
   const promises = [
@@ -737,6 +751,342 @@ test('W138: deterministic fake-clock nowFn tracks avgAsyncCompileMs without queu
   device.calls[3].resolve();
   await p3;
   assert.equal(cache.getStats().avgAsyncCompileMs, 22.5);
+});
+
+test('W168: graphics-over-compute priority schedules UI render pipelines ahead of queued compute burst', async () => {
+  const device = createManualDevice();
+  const cache = new AsyncPipelineCache({ device, maxConcurrentCompiles: 2 });
+
+  // Fill both concurrency slots with background compute pipelines, then queue 3 more compute jobs.
+  const cs0 = cache.compileComputePipeline('cs0', { label: 'cs0' });
+  const cs1 = cache.compileComputePipeline('cs1', { label: 'cs1' });
+  const cs2 = cache.compileComputePipeline('cs2', { label: 'cs2' });
+  const cs3 = cache.compileComputePipeline('cs3', { label: 'cs3' });
+  const cs4 = cache.compileComputePipeline('cs4', { label: 'cs4' });
+
+  assert.deepEqual(device.calls.map((c) => c.descriptor.label), ['cs0', 'cs1']);
+  let stats = cache.getStats();
+  assert.equal(stats.activeCompiles, 2);
+  assert.equal(stats.peakConcurrentCompiles, 2);
+  assert.equal(stats.queuedCompiles, 3);
+  assert.equal(stats.priorityPromotions, 0);
+
+  // Start Screen -> UI TEXT SIZE transition bursts 3 render pipelines while compute backlog is queued.
+  const uiBg = cache.compileRenderPipeline('ui_bg', { label: 'ui_bg' });
+  const uiText = cache.compileRenderPipeline('ui_text', { label: 'ui_text' });
+  const uiCursor = cache.compileRenderPipeline('ui_cursor', { label: 'ui_cursor' });
+
+  stats = cache.getStats();
+  assert.equal(stats.activeCompiles, 2);
+  assert.equal(stats.queuedCompiles, 6);
+  assert.equal(stats.priorityPromotions, 3, 'each render pipeline promoted ahead of queued compute jobs');
+
+  // Drain all slots one by one; UI render pipelines must compile in FIFO order before queued compute.
+  const dispatchOrder = ['cs0', 'cs1'];
+  for (let i = 0; i < 8; i += 1) {
+    assert.ok(device.inFlight <= 2, `concurrency cap violated: ${device.inFlight}`);
+    const call = device.calls[i];
+    call.resolve();
+    await tick();
+    if (device.calls.length > dispatchOrder.length) {
+      dispatchOrder.push(device.calls[device.calls.length - 1].descriptor.label);
+    }
+  }
+
+  const results = await Promise.all([cs0, cs1, cs2, cs3, cs4, uiBg, uiText, uiCursor]);
+  await cache.whenIdle();
+
+  assert.ok(results.every((r) => r.status === PIPELINE_STATUS.READY));
+  assert.equal(device.peakInFlight, 2);
+  assert.deepEqual(dispatchOrder, [
+    'cs0',
+    'cs1',
+    'ui_bg',
+    'ui_text',
+    'ui_cursor',
+    'cs2',
+    'cs3',
+    'cs4',
+  ]);
+  stats = cache.getStats();
+  assert.equal(stats.activeCompiles, 0);
+  assert.equal(stats.peakConcurrentCompiles, 2);
+  assert.equal(stats.queuedCompiles, 0);
+  assert.equal(stats.priorityPromotions, 3);
+  assert.equal(stats.compiled, 8);
+});
+
+test('W168: explicit numeric priority overrides default render/compute order with FIFO tie-breaking', async () => {
+  const device = createManualDevice();
+  const cache = new AsyncPipelineCache({ device, maxConcurrentCompiles: 1 });
+
+  // Slot 0 occupied by initial compute job.
+  const p0 = cache.compileComputePipeline('c0', { label: 'c0' });
+  // Queue a mix of default render (10), default compute (0), low-priority render (-5),
+  // urgent compute (50), and equal-priority ties (20).
+  const p1 = cache.compileRenderPipeline('r_low', { label: 'r_low' }, { priority: -5 });
+  const p2 = cache.compileComputePipeline('c_def', { label: 'c_def' });
+  const p3 = cache.compileRenderPipeline('r_def', { label: 'r_def' });
+  const p4 = cache.compileComputePipeline('c_tie_a', { label: 'c_tie_a' }, { priority: 20 });
+  const p5 = cache.compileRenderPipeline('r_tie_b', { label: 'r_tie_b' }, { priority: 20 });
+  const p6 = cache.compileComputePipeline('c_urgent', { label: 'c_urgent' }, { priority: 50 });
+
+  assert.equal(device.calls.length, 1);
+  assert.equal(cache.getStats().queuedCompiles, 6);
+  // Promotions: c_def(0 > -5), r_def(10 > 0), c_tie_a(20 > 10), r_tie_b(20 > 10), c_urgent(50 > 20) => 5
+  assert.equal(cache.getStats().priorityPromotions, 5);
+
+  for (let i = 0; i < 7; i += 1) {
+    device.calls[i].resolve();
+    await tick();
+  }
+  await Promise.all([p0, p1, p2, p3, p4, p5, p6]);
+  await cache.whenIdle();
+
+  assert.deepEqual(
+    device.calls.map((c) => c.descriptor.label),
+    ['c0', 'c_urgent', 'c_tie_a', 'r_tie_b', 'r_def', 'c_def', 'r_low'],
+  );
+
+  // prioritizeGraphics: false disables render-over-compute default while still honoring explicit priority.
+  const dev2 = createManualDevice();
+  const fifoCache = new AsyncPipelineCache({
+    device: dev2,
+    maxConcurrentCompiles: 1,
+    prioritizeGraphics: false,
+  });
+  const q0 = fifoCache.compileComputePipeline('a0', { label: 'a0' });
+  const q1 = fifoCache.compileComputePipeline('a1', { label: 'a1' });
+  const q2 = fifoCache.compileRenderPipeline('a2', { label: 'a2' });
+  const q3 = fifoCache.compileComputePipeline('a3_hi', { label: 'a3_hi' }, { priority: 5 });
+  assert.equal(fifoCache.getStats().priorityPromotions, 1);
+  for (let i = 0; i < 4; i += 1) {
+    dev2.calls[i].resolve();
+    await tick();
+  }
+  await Promise.all([q0, q1, q2, q3]);
+  assert.deepEqual(
+    dev2.calls.map((c) => c.descriptor.label),
+    ['a0', 'a3_hi', 'a1', 'a2'],
+  );
+});
+
+test('W168: duplicate key coalescing promotes queued jobs and isolates render/compute dedupe namespaces', async () => {
+  const device = createManualDevice();
+  const cache = new AsyncPipelineCache({ device, maxConcurrentCompiles: 1 });
+
+  // Slot 0 occupied by active compile.
+  const active = cache.compileRenderPipeline('active', { label: 'active' });
+  // Queue a default render job (10), then a lower-priority render job (2) with dedupeKey 'ui-shared',
+  // and a compute job with the SAME dedupeKey 'ui-shared'.
+  const rMid = cache.compileRenderPipeline('r_mid', { label: 'r_mid' });
+  const rLow = cache.compileRenderPipeline('r_low', { label: 'r_low' }, {
+    dedupeKey: 'ui-shared',
+    priority: 2,
+  });
+  const cSameKey = cache.compileComputePipeline('c_same_key', { label: 'c_same_key' }, {
+    dedupeKey: 'ui-shared',
+  });
+
+  assert.equal(cache.getStats().queuedCompiles, 3);
+  assert.equal(cache.getStats().priorityPromotions, 0);
+
+  // Coalesce onto queued 'ui-shared' render job with higher priority (25) -> must promote ahead of r_mid.
+  const rAlias = cache.compileRenderPipeline('r_low_alias', { label: 'r_low' }, {
+    dedupeKey: 'ui-shared',
+    priority: 25,
+  });
+  // Coalesce onto queued compute job with same 'ui-shared' key -> must attach to compute, NOT render!
+  const cAlias = cache.compileComputePipeline('c_same_key_alias', { label: 'c_same_key' }, {
+    dedupeKey: 'ui-shared',
+  });
+
+  // Same-id re-request on queued r_mid with higher priority (30) promotes r_mid ahead of r_low (25)
+  // and returns the exact same promise without double-queuing.
+  const rMidSame = cache.compileRenderPipeline('r_mid', { label: 'r_mid' }, { priority: 30 });
+  assert.strictEqual(rMidSame, rMid);
+
+  let stats = cache.getStats();
+  assert.equal(stats.queuedCompiles, 3, 'coalesced duplicates do not double-queue');
+  assert.equal(stats.dedupeHits, 2);
+  assert.equal(stats.priorityPromotions, 2, 'r_low promoted to 25 and r_mid promoted to 30');
+
+  // Settle all 4 distinct compiles.
+  for (let i = 0; i < 4; i += 1) {
+    device.calls[i].resolve();
+    await tick();
+  }
+  const [rActive, rMidRes, rLowRes, rAliasRes, cRes, cAliasRes] = await Promise.all([
+    active,
+    rMid,
+    rLow,
+    rAlias,
+    cSameKey,
+    cAlias,
+  ]);
+  await cache.whenIdle();
+
+  assert.equal(device.calls.length, 4, 'each distinct (kind, dedupeKey) compiled once');
+  assert.deepEqual(
+    device.calls.map((c) => c.descriptor.label),
+    ['active', 'r_mid', 'r_low', 'c_same_key'],
+  );
+  assert.strictEqual(rLowRes.pipeline, rAliasRes.pipeline);
+  assert.equal(rLowRes.pipeline.kind, 'render');
+  assert.strictEqual(cRes.pipeline, cAliasRes.pipeline);
+  assert.equal(cRes.pipeline.kind, 'compute');
+  assert.notStrictEqual(rLowRes.pipeline, cRes.pipeline);
+  assert.equal(rActive.status, PIPELINE_STATUS.READY);
+  assert.equal(rMidRes.status, PIPELINE_STATUS.READY);
+});
+
+test('W168: failure recovery releases slot, clears failed dedupe key, and drains highest-priority queued pipeline', async () => {
+  const device = createManualDevice();
+  const origRenderAsync = device.createRenderPipelineAsync;
+  device.createRenderPipelineAsync = (descriptor) => {
+    if (descriptor.label === 'boom-sync') {
+      throw new Error('sync driver throw');
+    }
+    return origRenderAsync(descriptor);
+  };
+
+  const cache = new AsyncPipelineCache({ device, maxConcurrentCompiles: 1 });
+
+  // Active compute compile with fallbackDescriptor that will fail both primary and fallback.
+  const cFail = cache.compileComputePipeline(
+    'c_fail',
+    { label: 'c_primary' },
+    { dedupeKey: 'bad-cs', fallbackDescriptor: { label: 'c_fallback' } },
+  );
+  // Queue a compute job first, then a render job that synchronously throws, then a healthy render job.
+  const cQueued = cache.compileComputePipeline('c_queued', { label: 'c_queued' });
+  const rThrow = cache.compileRenderPipeline('r_throw', { label: 'boom-sync' }, { dedupeKey: 'throw-rs' });
+  const rOk = cache.compileRenderPipeline('r_ok', { label: 'r_ok' });
+
+  assert.equal(cache.getStats().activeCompiles, 1);
+  assert.equal(cache.getStats().queuedCompiles, 3);
+  assert.equal(cache.getStats().priorityPromotions, 2);
+
+  // Reject primary -> fallback runs in the same slot; reject fallback -> slot frees for r_throw (render > compute).
+  device.calls[0].reject(new Error('primary rejected'));
+  await tick();
+  assert.equal(cache.getStats().activeCompiles, 1);
+  assert.equal(device.calls[1].descriptor.label, 'c_fallback');
+
+  device.calls[1].reject(new Error('fallback rejected'));
+  const [resCFail, resRThrow] = await Promise.all([cFail, rThrow]);
+  await tick();
+
+  assert.equal(resCFail.status, PIPELINE_STATUS.FAILED);
+  assert.equal(resCFail.retried, true);
+  assert.equal(resRThrow.status, PIPELINE_STATUS.FAILED);
+  assert.match(resRThrow.error.message, /sync driver throw/);
+
+  // After both failures, r_ok (render) must be dispatched ahead of c_queued (compute).
+  assert.equal(device.calls.length, 3);
+  assert.equal(device.calls[2].descriptor.label, 'r_ok');
+  assert.equal(cache.getStats().activeCompiles, 1);
+  assert.equal(cache.getStats().queuedCompiles, 1);
+  assert.equal(cache.getStats().failedAsyncCompiles, 2);
+
+  device.calls[2].resolve();
+  await rOk;
+  assert.equal(device.calls[3].descriptor.label, 'c_queued');
+
+  device.calls[3].resolve();
+  await cQueued;
+
+  // Previously failed dedupeKey can be retried cleanly now that it was cleared on failure.
+  const cRetry = cache.compileComputePipeline('c_retry', { label: 'c_retry' }, { dedupeKey: 'bad-cs' });
+  assert.equal(device.calls.length, 5);
+  device.calls[4].resolve();
+  assert.equal((await cRetry).status, PIPELINE_STATUS.READY);
+  await cache.whenIdle();
+
+  const stats = cache.getStats();
+  assert.equal(stats.activeCompiles, 0);
+  assert.equal(stats.queuedCompiles, 0);
+  assert.equal(stats.peakConcurrentCompiles, 1);
+  assert.equal(stats.failedAsyncCompiles, 2);
+  assert.equal(stats.compiled, 3);
+});
+
+test('W168: compile-stall and latency telemetry tracks activeCompiles, peakConcurrentCompiles, maxCompileMs, avgCompileMs', async () => {
+  let now = 1000;
+  const device = createManualDevice();
+  const cache = new AsyncPipelineCache({
+    device,
+    maxConcurrentCompiles: 2,
+    nowFn: () => now,
+  });
+
+  // t=1000: c0 (compute) and c1 (compute) start immediately; c2 (compute) queues; r0 (render) promotes ahead of c2.
+  const c0 = cache.compileComputePipeline('c0', { label: 'c0' });
+  const c1 = cache.compileComputePipeline('c1', { label: 'c1' }, { fallbackDescriptor: { label: 'c1_fb' } });
+  const c2 = cache.compileComputePipeline('c2', { label: 'c2' });
+  const r0 = cache.compileRenderPipeline('r0', { label: 'r0' });
+
+  let stats = cache.getStats();
+  assert.equal(stats.activeCompiles, 2);
+  assert.equal(stats.peakConcurrentCompiles, 2);
+  assert.equal(stats.queuedCompiles, 2);
+  assert.equal(stats.priorityPromotions, 1);
+  assert.equal(stats.maxCompileMs, 0);
+  assert.equal(stats.avgCompileMs, 0);
+
+  // t=1005: c0 finishes quickly (5ms) -> r0 launches at t=1005 (not t=1000).
+  now = 1005;
+  device.calls[0].resolve();
+  await c0;
+  stats = cache.getStats();
+  assert.equal(stats.maxCompileMs, 5);
+  assert.equal(stats.avgCompileMs, 5);
+  assert.equal(stats.avgAsyncCompileMs, 5);
+  assert.equal(stats.activeCompiles, 2);
+  assert.equal(stats.queuedCompiles, 1);
+  assert.equal(device.calls[2].descriptor.label, 'r0');
+
+  // t=1030: c1 primary rejects -> retries fallback at t=1030 keeping startedAtMs=1000;
+  //         r0 finishes in 25ms (1030 - 1005) -> c2 launches at t=1030.
+  now = 1030;
+  device.calls[1].reject(new Error('layout mismatch'));
+  device.calls[2].resolve();
+  await r0;
+  await tick();
+  stats = cache.getStats();
+  assert.equal(stats.maxCompileMs, 25);
+  assert.equal(stats.avgCompileMs, 15); // (5 + 25) / 2
+  assert.equal(stats.activeCompiles, 2);
+  assert.equal(stats.queuedCompiles, 0);
+
+  // t=1120: c1 fallback resolves after a 120ms stall spike (1120 - 1000).
+  now = 1120;
+  const c1FallbackCall = device.calls.find((c) => c.descriptor.label === 'c1_fb');
+  c1FallbackCall.resolve();
+  await c1;
+  stats = cache.getStats();
+  assert.equal(stats.maxCompileMs, 120);
+  assert.equal(stats.avgCompileMs, 50); // (5 + 25 + 120) / 3
+  assert.equal(stats.activeCompiles, 1);
+
+  // t=1140: c2 (started at t=1030) fails after 110ms; maxCompileMs remains 120.
+  now = 1140;
+  const c2Call = device.calls.find((c) => c.descriptor.label === 'c2');
+  c2Call.reject(new Error('compile stall fail'));
+  await c2;
+  await cache.whenIdle();
+
+  stats = cache.getStats();
+  assert.equal(stats.activeCompiles, 0);
+  assert.equal(stats.peakConcurrentCompiles, 2);
+  assert.equal(stats.queuedCompiles, 0);
+  assert.equal(stats.maxCompileMs, 120);
+  assert.equal(stats.avgCompileMs, 65); // (5 + 25 + 120 + 110) / 4
+  assert.equal(stats.avgAsyncCompileMs, 65);
+  assert.equal(stats.priorityPromotions, 1);
+  assert.equal(stats.failedAsyncCompiles, 1);
+  assert.equal(stats.compiled, 3);
+  assert.equal(stats.failed, 1);
 });
 
 test('zero unhandled rejections: throwing APIs, callbacks, and logger are contained', async () => {
