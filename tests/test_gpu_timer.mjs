@@ -919,3 +919,452 @@ test('reset() and destroy() clear rolling histories, spike counters, and discard
     passes: {},
   });
 });
+
+test('W209 GPU timestamp-query beginPass/endPass aggregates repeated labels and computes getTopPasses(limit) without hot-path descriptor reallocations', async () => {
+  const env = createMockWebGpu({ supported: true });
+  const timer = new GpuPassTimer({
+    device: env.device,
+    maxPassesPerFrame: 8,
+    readbackSlots: 3,
+    historySize: 8,
+  });
+
+  assert.equal(timer.mode, 'gpu');
+  assert.deepEqual(timer.getTopPasses(), []);
+
+  // Frame 1: bink2_yuv runs twice (2.0ms + 3.0ms = 5.0ms), ui_overlay (3.0ms), shadow (2.0ms) -> 10.0ms total
+  timer.beginFrame();
+  const ts0Frame1 = timer.beginPass('bink2_yuv');
+  assert.equal(timer.endPass(), null);
+  const ts1Frame1 = timer.beginPass('ui_overlay');
+  assert.equal(timer.endPass(), null);
+  const ts2Frame1 = timer.beginPass('bink2_yuv');
+  assert.equal(timer.endPass(), null);
+  const ts3Frame1 = timer.beginPass('shadow');
+  assert.equal(timer.endPass(), null);
+
+  assert.ok(Object.isFrozen(ts0Frame1));
+  assert.deepEqual(ts0Frame1, {
+    querySet: env.querySets[0],
+    beginningOfPassWriteIndex: 0,
+    endOfPassWriteIndex: 1,
+  });
+  assert.deepEqual(ts3Frame1, {
+    querySet: env.querySets[0],
+    beginningOfPassWriteIndex: 6,
+    endOfPassWriteIndex: 7,
+  });
+
+  env.setFrameTimestamps([
+    0n,
+    2_000_000n, // bink2_yuv #1: 2.0 ms
+    2_000_000n,
+    5_000_000n, // ui_overlay:   3.0 ms
+    5_000_000n,
+    8_000_000n, // bink2_yuv #2: 3.0 ms
+    8_000_000n,
+    10_000_000n, // shadow:      2.0 ms
+  ]);
+  assert.equal(timer.resolveFrame(env.device.createCommandEncoder()), true);
+  const res1 = await timer.collectCompletedReadback();
+  assert.equal(res1.totalGpuMs, 10.0);
+
+  // Frame 2: verify pre-allocated timestampWrites descriptor reuse (zero hot-path object allocations)
+  // bink2_yuv (7.0ms), ui_overlay (1.0ms), shadow (2.0ms) -> 10.0ms total
+  timer.beginFrame();
+  const ts0Frame2 = timer.beginPass('bink2_yuv');
+  assert.equal(ts0Frame2, ts0Frame1);
+  assert.equal(timer.endPass(), null);
+  const ts1Frame2 = timer.beginPass('ui_overlay');
+  assert.equal(ts1Frame2, ts1Frame1);
+  assert.equal(timer.endPass(), null);
+  const ts2Frame2 = timer.beginPass('shadow');
+  assert.equal(ts2Frame2, ts2Frame1);
+  assert.equal(timer.endPass(), null);
+
+  env.setFrameTimestamps([
+    0n,
+    7_000_000n, // bink2_yuv:  7.0 ms
+    7_000_000n,
+    8_000_000n, // ui_overlay: 1.0 ms
+    8_000_000n,
+    10_000_000n, // shadow:    2.0 ms
+  ]);
+  assert.equal(timer.resolveFrame(env.device.createCommandEncoder()), true);
+  await timer.collectCompletedReadback();
+
+  // Over 2 frames (20ms total):
+  // bink2_yuv:  frame sums [5.0, 7.0] -> total 12.0ms, avg 6.0ms, max 7.0ms, share 60%
+  // ui_overlay: frame sums [3.0, 1.0] -> total  4.0ms, avg 2.0ms, max 3.0ms, share 20%
+  // shadow:     frame sums [2.0, 2.0] -> total  4.0ms, avg 2.0ms, max 2.0ms, share 20%
+  // Tie between ui_overlay and shadow breaks by maxMs descending (3.0 > 2.0).
+  const allTop = timer.getTopPasses();
+  assert.deepEqual(allTop, [
+    {
+      label: 'bink2_yuv',
+      name: 'bink2_yuv',
+      count: 2,
+      totalCount: 3,
+      avgMs: 6.0,
+      maxMs: 7.0,
+      lastMs: 7.0,
+      totalMs: 12.0,
+      shareOfFramePct: 60.0,
+      mode: 'gpu',
+    },
+    {
+      label: 'ui_overlay',
+      name: 'ui_overlay',
+      count: 2,
+      totalCount: 2,
+      avgMs: 2.0,
+      maxMs: 3.0,
+      lastMs: 1.0,
+      totalMs: 4.0,
+      shareOfFramePct: 20.0,
+      mode: 'gpu',
+    },
+    {
+      label: 'shadow',
+      name: 'shadow',
+      count: 2,
+      totalCount: 2,
+      avgMs: 2.0,
+      maxMs: 2.0,
+      lastMs: 2.0,
+      totalMs: 4.0,
+      shareOfFramePct: 20.0,
+      mode: 'gpu',
+    },
+  ]);
+
+  // Share of frame percentages sum to 100%.
+  const shareSum = allTop.reduce((acc, p) => acc + p.shareOfFramePct, 0);
+  assert.ok(Math.abs(shareSum - 100) < 1e-9);
+
+  // Limit handling: positive, 0, negative, NaN, Infinity.
+  const top2 = timer.getTopPasses(2);
+  assert.equal(top2.length, 2);
+  assert.equal(top2[0].label, 'bink2_yuv');
+  assert.equal(top2[1].label, 'ui_overlay');
+  assert.equal(timer.getTopPasses(1).length, 1);
+  assert.deepEqual(timer.getTopPasses(0), []);
+  assert.deepEqual(timer.getTopPasses(-3), []);
+  assert.deepEqual(timer.getTopPasses(Number.NaN), []);
+  assert.equal(timer.getTopPasses(Number.POSITIVE_INFINITY).length, 3);
+
+  // Defensive snapshot: mutating returned objects does not corrupt internal state.
+  top2[0].avgMs = 999;
+  assert.equal(timer.getTopPasses(1)[0].avgMs, 6.0);
+
+  timer.destroy();
+});
+
+test('W209 CPU performance.now() fallback when timestamp-query is unavailable', () => {
+  const { device } = createMockWebGpu({ supported: false });
+
+  assert.throws(() => new GpuPassTimer({ device, now: 'not-a-fn' }), TypeError);
+
+  let clockMs = 100.0;
+  const timer = new GpuPassTimer({
+    device,
+    historySize: 5,
+    frameBudgetMs: 10.0,
+    now: () => clockMs,
+  });
+
+  assert.equal(timer.supported, false);
+  assert.equal(timer.mode, 'cpu');
+  assert.equal(timer.endPass(), null);
+
+  // Frame 1 via explicit beginFrame / beginPass / endPass / endFrame
+  timer.beginFrame();
+  assert.equal(timer.beginPass('bink2_decode'), undefined);
+  clockMs += 6.0;
+  assert.equal(timer.endPass(), 6.0);
+
+  assert.equal(timer.beginPass('ui_hud'), undefined);
+  clockMs += 2.0;
+  assert.equal(timer.endPass(), 2.0);
+
+  assert.equal(timer.endFrame(), true);
+  assert.equal(timer.endFrame(), false); // idempotent when no passes recorded since last finalize
+
+  // Frame 2 via resolveFrame(encoder) (returns false since no GPU commands, still commits CPU frame)
+  timer.beginFrame();
+  assert.equal(timer.beginPass('bink2_decode'), undefined);
+  clockMs += 10.0;
+  assert.equal(timer.endPass(), 10.0);
+
+  assert.equal(timer.beginPass('ui_hud'), undefined);
+  clockMs += 2.0;
+  assert.equal(timer.endPass(), 2.0);
+
+  // Backwards clock delta clamps safely to 0
+  assert.equal(timer.beginPass('clock_skew'), undefined);
+  clockMs -= 5.0;
+  assert.equal(timer.endPass(), 0);
+  clockMs += 5.0;
+
+  assert.equal(timer.resolveFrame(device.createCommandEncoder()), false);
+
+  const stats = timer.getStats();
+  assert.equal(stats.supported, false);
+  assert.equal(stats.resolvedFrames, 2);
+  assert.equal(stats.lastFrameGpuMs, 12.0);
+  assert.equal(stats.passStats.bink2_decode.avgMs, 8.0);
+  assert.equal(stats.passStats.bink2_decode.maxMs, 10.0);
+
+  // Total rolling window across 2 frames = 8.0 + 12.0 = 20.0ms:
+  // bink2_decode: 16.0ms (80%), ui_hud: 4.0ms (20%), clock_skew: 0ms (0%)
+  const top = timer.getTopPasses();
+  assert.deepEqual(top, [
+    {
+      label: 'bink2_decode',
+      name: 'bink2_decode',
+      count: 2,
+      totalCount: 2,
+      avgMs: 8.0,
+      maxMs: 10.0,
+      lastMs: 10.0,
+      totalMs: 16.0,
+      shareOfFramePct: 80.0,
+      mode: 'cpu',
+    },
+    {
+      label: 'ui_hud',
+      name: 'ui_hud',
+      count: 2,
+      totalCount: 2,
+      avgMs: 2.0,
+      maxMs: 2.0,
+      lastMs: 2.0,
+      totalMs: 4.0,
+      shareOfFramePct: 20.0,
+      mode: 'cpu',
+    },
+    {
+      label: 'clock_skew',
+      name: 'clock_skew',
+      count: 1,
+      totalCount: 1,
+      avgMs: 0,
+      maxMs: 0,
+      lastMs: 0,
+      totalMs: 0,
+      shareOfFramePct: 0,
+      mode: 'cpu',
+    },
+  ]);
+
+  // Direct beginPass/endPass without calling beginFrame/endFrame immediately reflects in getTopPasses()
+  const directTimer = new GpuPassTimer({ device: null });
+  assert.equal(directTimer.supported, false);
+  assert.equal(directTimer.mode, 'cpu');
+  directTimer.beginPass('bink2_direct');
+  const d1 = directTimer.endPass();
+  assert.equal(typeof d1, 'number');
+  assert.ok(Number.isFinite(d1) && d1 >= 0);
+  const directTop = directTimer.getTopPasses(1);
+  assert.equal(directTop.length, 1);
+  assert.equal(directTop[0].label, 'bink2_direct');
+  assert.equal(directTop[0].mode, 'cpu');
+
+  timer.destroy();
+  assert.equal(timer.beginPass('after_destroy'), undefined);
+  assert.equal(timer.endPass(), null);
+  assert.equal(timer.endFrame(), false);
+  assert.deepEqual(timer.getTopPasses(), []);
+  directTimer.destroy();
+});
+
+test('W209 ring wrap-around evicts aged-out passes and keeps share-of-frame % exact at 100%', async () => {
+  const env = createMockWebGpu({ supported: true });
+  const timer = new GpuPassTimer({
+    device: env.device,
+    maxPassesPerFrame: 4,
+    readbackSlots: 2,
+    historySize: 3,
+  });
+
+  // Frame 1: one-time 40ms boot splash + 2ms ui (should age out completely after frame 4)
+  timer.beginFrame();
+  timer.beginPass('bink2_boot_splash');
+  timer.endPass();
+  timer.beginPass('ui');
+  timer.endPass();
+  env.setFrameTimestamps([0n, 40_000_000n, 40_000_000n, 42_000_000n]);
+  assert.equal(timer.resolveFrame(env.device.createCommandEncoder()), true);
+  await timer.collectCompletedReadback();
+
+  // Frames 2, 3, 4: lighting [6, 4, 8] (sum 18), ui [2, 4, 0] (sum 6) -> window total = 24ms
+  const steadyFrames = [
+    [6_000_000n, 2_000_000n],
+    [4_000_000n, 4_000_000n],
+    [8_000_000n, 0n],
+  ];
+  for (const [lightingNs, uiNs] of steadyFrames) {
+    timer.beginFrame();
+    timer.getPassTimestampWrites('lighting');
+    timer.getPassTimestampWrites('ui');
+    env.setFrameTimestamps([0n, lightingNs, 10_000_000n, 10_000_000n + uiNs]);
+    assert.equal(timer.resolveFrame(env.device.createCommandEncoder()), true);
+    await timer.collectCompletedReadback();
+  }
+
+  const top = timer.getTopPasses();
+  assert.equal(top.length, 2);
+  assert.equal(top.find((p) => p.label === 'bink2_boot_splash'), undefined);
+
+  assert.deepEqual(top, [
+    {
+      label: 'lighting',
+      name: 'lighting',
+      count: 3,
+      totalCount: 3,
+      avgMs: 6.0,
+      maxMs: 8.0,
+      lastMs: 8.0,
+      totalMs: 18.0,
+      shareOfFramePct: 75.0,
+      mode: 'gpu',
+    },
+    {
+      label: 'ui',
+      name: 'ui',
+      count: 3,
+      totalCount: 4,
+      avgMs: 2.0,
+      maxMs: 4.0,
+      lastMs: 0,
+      totalMs: 6.0,
+      shareOfFramePct: 25.0,
+      mode: 'gpu',
+    },
+  ]);
+
+  // Also verify CPU fallback ring wrap-around with an open frame in progress.
+  let cpuNow = 0;
+  const cpuTimer = new GpuPassTimer({
+    device: null,
+    historySize: 2,
+    now: () => cpuNow,
+  });
+
+  // Frame 1: spike (50ms) -> will be evicted once frames 2 and 3 exist
+  cpuTimer.beginFrame();
+  cpuTimer.beginPass('boot_spike');
+  cpuNow += 50;
+  cpuTimer.endPass();
+  cpuTimer.endFrame();
+
+  // Frame 2: bink2 (6ms), ui (4ms)
+  cpuTimer.beginFrame();
+  cpuTimer.beginPass('bink2');
+  cpuNow += 6;
+  cpuTimer.endPass();
+  cpuTimer.beginPass('ui');
+  cpuNow += 4;
+  cpuTimer.endPass();
+  cpuTimer.endFrame();
+
+  // Frame 3 (open, not yet endFrame'd): bink2 (8ms), ui (2ms)
+  cpuTimer.beginFrame();
+  cpuTimer.beginPass('bink2');
+  cpuNow += 8;
+  cpuTimer.endPass();
+  cpuTimer.beginPass('ui');
+  cpuNow += 2;
+  cpuTimer.endPass();
+
+  const cpuTop = cpuTimer.getTopPasses();
+  assert.equal(cpuTop.length, 2);
+  assert.equal(cpuTop[0].label, 'bink2');
+  assert.equal(cpuTop[0].avgMs, 7.0);
+  assert.equal(cpuTop[0].maxMs, 8.0);
+  assert.equal(cpuTop[0].shareOfFramePct, 70.0);
+  assert.equal(cpuTop[1].label, 'ui');
+  assert.equal(cpuTop[1].avgMs, 3.0);
+  assert.equal(cpuTop[1].maxMs, 4.0);
+  assert.equal(cpuTop[1].shareOfFramePct, 30.0);
+
+  timer.destroy();
+  cpuTimer.destroy();
+});
+
+test('W209 reset() clears top-pass rankings, frame totals, and open CPU passes cleanly', async () => {
+  // GPU mode reset()
+  const env = createMockWebGpu({ supported: true });
+  const gpuTimer = new GpuPassTimer({
+    device: env.device,
+    maxPassesPerFrame: 4,
+    readbackSlots: 2,
+    historySize: 4,
+  });
+
+  gpuTimer.beginFrame();
+  gpuTimer.beginPass('alpha');
+  gpuTimer.endPass();
+  gpuTimer.beginPass('beta');
+  gpuTimer.endPass();
+  env.setFrameTimestamps([0n, 3_000_000n, 3_000_000n, 4_000_000n]);
+  assert.equal(gpuTimer.resolveFrame(env.device.createCommandEncoder()), true);
+  await gpuTimer.collectCompletedReadback();
+  assert.equal(gpuTimer.getTopPasses().length, 2);
+
+  gpuTimer.reset();
+  assert.deepEqual(gpuTimer.getTopPasses(), []);
+
+  // Fresh post-reset frame computes 100% share cleanly without pre-reset frame total leakage.
+  gpuTimer.beginFrame();
+  gpuTimer.beginPass('gamma');
+  gpuTimer.endPass();
+  env.setFrameTimestamps([0n, 2_500_000n]);
+  assert.equal(gpuTimer.resolveFrame(env.device.createCommandEncoder()), true);
+  await gpuTimer.collectCompletedReadback();
+  assert.deepEqual(gpuTimer.getTopPasses(), [
+    {
+      label: 'gamma',
+      name: 'gamma',
+      count: 1,
+      totalCount: 1,
+      avgMs: 2.5,
+      maxMs: 2.5,
+      lastMs: 2.5,
+      totalMs: 2.5,
+      shareOfFramePct: 100.0,
+      mode: 'gpu',
+    },
+  ]);
+
+  // CPU fallback mode reset() also clears in-progress open passes and zero-duration tie-breaking.
+  let t = 0;
+  const cpuTimer = new GpuPassTimer({ device: null, now: () => t });
+  cpuTimer.beginFrame();
+  cpuTimer.beginPass('in_progress');
+  t += 5;
+  cpuTimer.reset();
+  // Calling endPass() after reset must be a safe no-op (open pass stack was cleared).
+  assert.equal(cpuTimer.endPass(), null);
+  assert.deepEqual(cpuTimer.getTopPasses(), []);
+
+  // All-zero passes break ties lexicographically and report 0% share (never NaN).
+  cpuTimer.beginFrame();
+  cpuTimer.beginPass('z_pass');
+  cpuTimer.endPass();
+  cpuTimer.beginPass('a_pass');
+  cpuTimer.endPass();
+  cpuTimer.endFrame();
+
+  const zeroTop = cpuTimer.getTopPasses();
+  assert.deepEqual(
+    zeroTop.map((p) => ({ label: p.label, shareOfFramePct: p.shareOfFramePct })),
+    [
+      { label: 'a_pass', shareOfFramePct: 0 },
+      { label: 'z_pass', shareOfFramePct: 0 },
+    ]
+  );
+
+  gpuTimer.destroy();
+  cpuTimer.destroy();
+});
