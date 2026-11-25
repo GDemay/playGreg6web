@@ -2547,3 +2547,422 @@ test('W196: classic-worker importScripts exposes pow2 bucket exports without lea
   assert.equal(ctx.compareEvictionLru, undefined);
 });
 
+// ---------------------------------------------------------------------------
+// W245: Sanitized 4K upload pool telemetry, VRAM pressure tracking,
+// clamped hitRate [0, 1], lruEvictions, oversizedAllocations,
+// totalBytesStaged, and resetStats().
+// ---------------------------------------------------------------------------
+
+test('W245: initial getStats exposes sanitized telemetry fields, legacy aliases, and immutable snapshots', () => {
+  const MiB = 1024 * 1024;
+  const { device } = createLightweight4kMockDevice();
+  const pool = new GpuStagingPool({
+    device,
+    bucketStrategy: BUCKET_STRATEGY.POW2,
+    maxPooledBytes: 64 * MiB,
+    framesInFlight: 3,
+  });
+
+  const stats = pool.getStats();
+  assert.equal(stats.poolHits, 0);
+  assert.equal(stats.poolMisses, 0);
+  assert.equal(stats.hitRate, 0);
+  assert.equal(stats.poolHitRate, 0);
+  assert.equal(stats.peakAllocatedBytes, 0);
+  assert.equal(stats.lruEvictions, 0);
+  assert.equal(stats.evictedCount, 0);
+  assert.equal(stats.oversizedAllocations, 0);
+  assert.equal(stats.oversizeAllocations, 0);
+  assert.equal(stats.totalBytesStaged, 0);
+  assert.equal(stats.bytesUploaded, 0);
+  assert.equal(stats.totalBytesUploaded, 0);
+
+  // Sanitized JSON-serializable telemetry: no GPUBuffer/ArrayBuffer references, finite bounds.
+  const roundTrip = JSON.parse(JSON.stringify(stats));
+  assert.equal(roundTrip.hitRate, 0);
+  assert.ok(roundTrip.hitRate >= 0 && roundTrip.hitRate <= 1);
+  assert.equal(roundTrip.totalBytesStaged, 0);
+
+  // Mutating the returned snapshot must never corrupt internal pool telemetry.
+  stats.poolHits = 9999;
+  stats.poolMisses = 9999;
+  stats.hitRate = 99;
+  stats.peakAllocatedBytes = 9999;
+  stats.lruEvictions = 9999;
+  stats.oversizedAllocations = 9999;
+  stats.totalBytesStaged = 9999;
+  stats.largeSlabBucketCounts[4 * MiB] = 42;
+
+  const fresh = pool.getStats();
+  assert.equal(fresh.poolHits, 0);
+  assert.equal(fresh.poolMisses, 0);
+  assert.equal(fresh.hitRate, 0);
+  assert.equal(fresh.peakAllocatedBytes, 0);
+  assert.equal(fresh.lruEvictions, 0);
+  assert.equal(fresh.oversizedAllocations, 0);
+  assert.equal(fresh.totalBytesStaged, 0);
+  assert.deepEqual(fresh.largeSlabBucketCounts, {});
+
+  pool.destroy();
+});
+
+test('W245: 4K pow2 upload telemetry tracks poolHits, poolMisses, hitRate, peakAllocatedBytes, oversizedAllocations, and totalBytesStaged with zero cache-hit allocations', async () => {
+  const MiB = 1024 * 1024;
+  const { device, createdBuffers } = createLightweight4kMockDevice();
+  const pool = new GpuStagingPool({
+    device,
+    chunkSize: 4 * MiB,
+    bucketStrategy: BUCKET_STRATEGY.POW2,
+    maxPooledBytes: 96 * MiB,
+    framesInFlight: 3,
+    maxLargeSlabs: 12,
+  });
+
+  const encoder = createLightweightEncoder();
+  const dstY = { id: 'w245-y' };
+  const dstU = { id: 'w245-u' };
+  const dstV = { id: 'w245-v' };
+  const dstUniform = { id: 'w245-ubo' };
+
+  const yBytes = new Uint8Array(3840 * 2160); // 7.91 MiB (> 4 MiB chunkSize -> oversized, 8 MiB pow2 bucket)
+  const uBytes = new Uint8Array(2048 * 1080); // 2.11 MiB (<= 4 MiB chunkSize, 4 MiB pow2 bucket)
+  const vBytes = new Uint8Array(2048 * 1080); // 2.11 MiB (<= 4 MiB chunkSize, 4 MiB pow2 bucket)
+  const uboBytes = new Uint8Array(512);
+  const perFrameStaged = yBytes.byteLength + uBytes.byteLength + vBytes.byteLength + uboBytes.byteLength;
+
+  // 3 warmup frames (all misses) + 12 steady-state frames (100% cache hits).
+  const warmupFrames = 3;
+  const steadyFrames = 12;
+  const totalFrames = warmupFrames + steadyFrames;
+
+  for (let frame = 0; frame < totalFrames; frame += 1) {
+    pool.beginFrame(frame);
+    pool.stageBufferUpload(encoder, dstUniform, 0, uboBytes);
+    // Empty upload is a no-op and must not alter totalBytesStaged or poolMisses.
+    pool.stageBufferUpload(encoder, dstUniform, 0, new Uint8Array(0));
+    pool.stageTextureUpload(encoder, dstY, yBytes, { width: 3840, height: 2160, bytesPerRow: 3840 });
+    pool.stageTextureUpload(encoder, dstU, uBytes, { width: 1920, height: 1080, bytesPerRow: 2048 });
+    pool.stageTextureUpload(encoder, dstV, vBytes, { width: 1920, height: 1080, bytesPerRow: 2048 });
+    pool.endFrame();
+
+    if (frame === warmupFrames - 1) {
+      assert.equal(createdBuffers.length, 12); // 3 * (4 MiB std + 8 MiB Y + 4 MiB U + 4 MiB V)
+      const warm = pool.getStats();
+      assert.equal(warm.poolMisses, 12);
+      assert.equal(warm.poolHits, 0);
+      assert.equal(warm.hitRate, 0);
+      assert.equal(warm.poolHitRate, 0);
+      assert.equal(warm.oversizedAllocations, 3); // Y plane > 4 MiB chunkSize
+      assert.equal(warm.oversizeAllocations, 3);
+      assert.equal(warm.lruEvictions, 0);
+      assert.equal(warm.peakAllocatedBytes, 3 * (4 + 8 + 4 + 4) * MiB);
+      assert.equal(warm.totalBytesStaged, warmupFrames * perFrameStaged);
+      assert.equal(warm.totalBytesUploaded, warm.totalBytesStaged);
+    }
+  }
+
+  // Zero extra GPUBuffer allocations during steady-state cache hits!
+  assert.equal(createdBuffers.length, 12);
+  const steady = pool.getStats();
+  const expectedHits = steadyFrames * 4;
+  const expectedMisses = warmupFrames * 4;
+  assert.equal(steady.poolHits, expectedHits);
+  assert.equal(steady.poolMisses, expectedMisses);
+  assert.equal(steady.hitRate, expectedHits / (expectedHits + expectedMisses));
+  assert.equal(steady.poolHitRate, steady.hitRate);
+  assert.ok(steady.hitRate >= 0 && steady.hitRate <= 1);
+  assert.equal(steady.peakAllocatedBytes, 3 * (4 + 8 + 4 + 4) * MiB);
+  assert.equal(steady.lruEvictions, 0);
+  assert.equal(steady.oversizedAllocations, totalFrames); // 1 oversized Y plane per frame
+  assert.equal(steady.oversizeAllocations, steady.oversizedAllocations);
+  assert.equal(steady.totalBytesStaged, totalFrames * perFrameStaged);
+  assert.equal(steady.totalBytesUploaded, steady.totalBytesStaged);
+
+  pool.destroy();
+
+  // Mapped mode direct allocate() staging also tracks totalBytesStaged and hitRate cleanly.
+  const mappedMock = createLightweight4kMockDevice({ enableWorkDoneFence: true, allocateBacking: true });
+  const mappedPool = new GpuStagingPool({
+    device: mappedMock.device,
+    chunkSize: 4 * MiB,
+    bucketStrategy: BUCKET_STRATEGY.POW2,
+    maxPooledBytes: 32 * MiB,
+    framesInFlight: 2,
+    mode: STAGING_MODE.MAPPED,
+  });
+
+  const yDirectSize = Math.ceil(8.3 * MiB); // > 4 MiB chunkSize -> oversized, 16 MiB pow2 bucket
+  mappedPool.beginFrame(0);
+  const direct0 = mappedPool.allocate(yDirectSize, 256);
+  assert.ok(direct0.view instanceof Uint8Array);
+  mappedPool.endFrame();
+
+  mappedMock.deferredFences[0].resolve();
+  await mappedMock.deferredFences[0].promise;
+  await mappedPool.waitForPendingMaps();
+
+  mappedPool.beginFrame(1);
+  const direct1 = mappedPool.allocate(yDirectSize, 256);
+  assert.equal(direct1.buffer, direct0.buffer);
+  assert.equal(mappedMock.createdBuffers.length, 1, 'mapped cache hit must allocate zero new GPUBuffers');
+  mappedPool.endFrame();
+
+  const mappedStats = mappedPool.getStats();
+  assert.equal(mappedStats.poolMisses, 1);
+  assert.equal(mappedStats.poolHits, 1);
+  assert.equal(mappedStats.hitRate, 0.5);
+  assert.equal(mappedStats.peakAllocatedBytes, 16 * MiB);
+  assert.equal(mappedStats.oversizedAllocations, 2);
+  assert.equal(mappedStats.totalBytesStaged, yDirectSize * 2);
+  assert.equal(mappedStats.lruEvictions, 0);
+  mappedPool.destroy();
+});
+
+test('W245: lruEvictions tracks per-bucket, global cap, VRAM budget, and idle evictions while ignoring OOM failures and destroy', () => {
+  const MiB = 1024 * 1024;
+  const { device } = createLightweight4kMockDevice();
+  const pool = new GpuStagingPool({
+    device,
+    chunkSize: 4 * MiB,
+    bucketStrategy: BUCKET_STRATEGY.POW2,
+    maxPooledBytes: 24 * MiB,
+    maxLargeSlabs: 4,
+    maxSlabsPerBucket: 2,
+    framesInFlight: 1,
+    minWarmChunks: 0,
+  });
+
+  // 1. Per-bucket cap eviction (3x 4 MiB slabs > maxSlabsPerBucket=2 -> 1 LRU eviction).
+  const chromaSize = Math.ceil(2.07 * MiB);
+  pool.beginFrame(0);
+  pool.allocate(chromaSize, 256);
+  pool.allocate(chromaSize, 256);
+  pool.allocate(chromaSize, 256);
+  pool.endFrame();
+
+  pool.beginFrame(1);
+  let stats = pool.getStats();
+  assert.equal(stats.lruEvictions, 1);
+  assert.equal(stats.evictedCount, 1);
+  assert.equal(stats.allocatedBytes, 8 * MiB);
+  assert.equal(stats.peakAllocatedBytes, 12 * MiB);
+  assert.equal(stats.oversizedAllocations, 0);
+  assert.equal(stats.totalBytesStaged, chromaSize * 3);
+
+  // 2. VRAM budget cap eviction: live = 8 MiB (2x 4 MiB idle). Allocate 16 MiB (8.3 MiB > 4 MiB -> oversized)
+  //    then allocate 8 MiB (3840x2160 > 4 MiB -> oversized) on frame 2 -> 24 + 8 > 24 MiB forces 2x 4 MiB LRU evictions!
+  const y83Size = Math.ceil(8.3 * MiB);
+  pool.allocate(y83Size, 256); // 16 MiB bucket; live = 24 MiB, peak = 24 MiB
+  pool.endFrame();
+
+  pool.beginFrame(2); // all 3 slabs idle (2x 4 MiB from frame 0, 1x 16 MiB from frame 1)
+  const y4kSize = 3840 * 2160; // 8 MiB bucket
+  pool.allocate(y4kSize, 256); // evicts both older frame-0 4 MiB slabs (2 LRU evictions), keeps frame-1 16 MiB
+  stats = pool.getStats();
+  assert.equal(stats.lruEvictions, 3);
+  assert.equal(stats.evictedCount, 3);
+  assert.equal(stats.allocatedBytes, 24 * MiB);
+  assert.equal(stats.peakAllocatedBytes, 24 * MiB);
+  assert.equal(stats.oversizedAllocations, 2);
+  assert.equal(stats.totalBytesStaged, chromaSize * 3 + y83Size + y4kSize);
+
+  // 3. Over-budget allocation failure must NOT inflate any telemetry counters.
+  //    Hold both 16 MiB and 8 MiB active (24 / 24 MiB active), then request another 4 MiB.
+  pool.allocate(y83Size, 256); // hits idle 16 MiB slab
+  const beforeOom = pool.getStats();
+  assert.equal(beforeOom.poolHits, 1);
+  assert.equal(beforeOom.oversizedAllocations, 3);
+  assert.throws(() => pool.allocate(y4kSize, 256), RangeError);
+  const afterOom = pool.getStats();
+  assert.equal(afterOom.poolHits, beforeOom.poolHits);
+  assert.equal(afterOom.poolMisses, beforeOom.poolMisses);
+  assert.equal(afterOom.hitRate, beforeOom.hitRate);
+  assert.equal(afterOom.peakAllocatedBytes, beforeOom.peakAllocatedBytes);
+  assert.equal(afterOom.lruEvictions, beforeOom.lruEvictions);
+  assert.equal(afterOom.oversizedAllocations, beforeOom.oversizedAllocations);
+  assert.equal(afterOom.totalBytesStaged, beforeOom.totalBytesStaged);
+  pool.endFrame();
+
+  // 4. Idle-frame reclamation increments lruEvictions while preserving peakAllocatedBytes.
+  pool.beginFrame(10);
+  const reclaimed = pool.reclaimIdleChunks(5);
+  assert.equal(reclaimed.reclaimedChunks, 2);
+  stats = pool.getStats();
+  assert.equal(stats.lruEvictions, 5);
+  assert.equal(stats.allocatedBytes, 0);
+  assert.equal(stats.peakAllocatedBytes, 24 * MiB);
+
+  // 5. destroy() must NOT increment lruEvictions and keeps peakAllocatedBytes & totalBytesStaged intact.
+  pool.allocate(chromaSize, 256);
+  const beforeDestroy = pool.getStats();
+  pool.destroy();
+  const afterDestroy = pool.getStats();
+  assert.equal(afterDestroy.lruEvictions, beforeDestroy.lruEvictions);
+  assert.equal(afterDestroy.peakAllocatedBytes, 24 * MiB);
+  assert.equal(afterDestroy.totalBytesStaged, beforeDestroy.totalBytesStaged);
+  assert.equal(afterDestroy.allocatedBytes, 0);
+});
+
+test('W245: resetStats zeroes cumulative telemetry cleanly, preserves live pooled buffers, clamps hitRate to 1.0 on post-reset hits, and re-baselines peakAllocatedBytes', () => {
+  const MiB = 1024 * 1024;
+  const { device, createdBuffers } = createLightweight4kMockDevice();
+  const pool = new GpuStagingPool({
+    device,
+    chunkSize: 4 * MiB,
+    bucketStrategy: BUCKET_STRATEGY.POW2,
+    maxPooledBytes: 32 * MiB,
+    maxSlabsPerBucket: 2,
+    framesInFlight: 1,
+  });
+
+  const encoder = createLightweightEncoder();
+  const dstY = { id: 'reset-y' };
+  const dstU = { id: 'reset-u' };
+  const yData = new Uint8Array(3840 * 2160); // 8 MiB bucket (> 4 MiB -> oversized)
+  const uData = new Uint8Array(2048 * 1080); // 4 MiB bucket
+
+  // Frame 0 spike: 3x 4 MiB slabs + 1x 8 MiB slab = 20 MiB peak; per-bucket cap evicts 1x 4 MiB on recycle -> 16 MiB live.
+  pool.beginFrame(0);
+  pool.stageTextureUpload(encoder, dstY, yData, { width: 3840, height: 2160, bytesPerRow: 3840 });
+  pool.stageTextureUpload(encoder, dstU, uData, { width: 1920, height: 1080, bytesPerRow: 2048 });
+  pool.stageTextureUpload(encoder, dstU, uData, { width: 1920, height: 1080, bytesPerRow: 2048 });
+  pool.stageTextureUpload(encoder, dstU, uData, { width: 1920, height: 1080, bytesPerRow: 2048 });
+  pool.endFrame();
+
+  // Frame 1: recycle & evict 1x 4 MiB slab, then get 2 hits (Y + U).
+  pool.beginFrame(1);
+  pool.stageTextureUpload(encoder, dstY, yData, { width: 3840, height: 2160, bytesPerRow: 3840 });
+  pool.stageTextureUpload(encoder, dstU, uData, { width: 1920, height: 1080, bytesPerRow: 2048 });
+  pool.endFrame();
+
+  pool.beginFrame(2); // all 3 remaining slabs (1x 8 MiB + 2x 4 MiB = 16 MiB) are idle
+  const preReset = pool.getStats();
+  assert.equal(preReset.poolMisses, 4);
+  assert.equal(preReset.poolHits, 2);
+  assert.equal(preReset.hitRate, 2 / 6);
+  assert.equal(preReset.lruEvictions, 1);
+  assert.equal(preReset.oversizedAllocations, 2);
+  assert.equal(preReset.peakAllocatedBytes, 20 * MiB);
+  assert.equal(preReset.allocatedBytes, 16 * MiB);
+  assert.equal(preReset.totalBytesStaged, yData.byteLength * 2 + uData.byteLength * 4);
+  assert.equal(createdBuffers.length, 4);
+
+  // Reset telemetry while 16 MiB of warm pooled buffers remain live!
+  const resetReturn = pool.resetStats();
+  const postReset = pool.getStats();
+  assert.deepEqual(resetReturn, postReset);
+
+  // All cumulative telemetry counters reset cleanly to 0.
+  assert.equal(postReset.poolHits, 0);
+  assert.equal(postReset.poolMisses, 0);
+  assert.equal(postReset.hitRate, 0);
+  assert.equal(postReset.poolHitRate, 0);
+  assert.equal(postReset.lruEvictions, 0);
+  assert.equal(postReset.evictedCount, 0);
+  assert.equal(postReset.evictedBytes, 0);
+  assert.equal(postReset.oversizedAllocations, 0);
+  assert.equal(postReset.oversizeAllocations, 0);
+  assert.equal(postReset.totalBytesStaged, 0);
+  assert.equal(postReset.bytesUploaded, 0);
+  assert.equal(postReset.totalBytesUploaded, 0);
+  assert.equal(postReset.bytesReused, 0);
+  assert.equal(postReset.bytesAllocated, 0);
+  assert.equal(postReset.allocationCount, 0);
+  assert.equal(postReset.largeSlabHits, 0);
+  assert.equal(postReset.largeSlabMisses, 0);
+  assert.equal(postReset.largeSlabEvictions, 0);
+  assert.equal(postReset.reclaimedChunks, 0);
+  assert.equal(postReset.reclaimedBytes, 0);
+  assert.equal(postReset.framesCompleted, 0);
+  assert.equal(postReset.alignPadCount, 0);
+  assert.equal(postReset.sabCopyCount, 0);
+  assert.equal(postReset.doubleReleaseIgnored, 0);
+
+  // Live pool state is 100% preserved and peakAllocatedBytes re-baselines to current live VRAM (16 MiB).
+  assert.equal(postReset.allocatedBytes, 16 * MiB);
+  assert.equal(postReset.peakAllocatedBytes, 16 * MiB);
+  assert.equal(postReset.peakBytes, 16 * MiB);
+  assert.equal(postReset.idleCount, 3);
+  assert.deepEqual(postReset.largeSlabBucketCounts, {
+    [8 * MiB]: 1,
+    [4 * MiB]: 2,
+  });
+
+  // Subsequent frames reuse preserved warm slabs -> 0 misses, 100% hitRate === 1.0, 0 new GPUBuffers!
+  for (let f = 2; f < 6; f += 1) {
+    if (f > 2) {
+      pool.beginFrame(f);
+    }
+    pool.stageTextureUpload(encoder, dstY, yData, { width: 3840, height: 2160, bytesPerRow: 3840 });
+    pool.stageTextureUpload(encoder, dstU, uData, { width: 1920, height: 1080, bytesPerRow: 2048 });
+    pool.stageTextureUpload(encoder, dstU, uData, { width: 1920, height: 1080, bytesPerRow: 2048 });
+    pool.endFrame();
+  }
+
+  assert.equal(createdBuffers.length, 4, 'post-reset steady-state frames must create zero new GPUBuffers');
+  const steadyPostReset = pool.getStats();
+  assert.equal(steadyPostReset.poolHits, 12);
+  assert.equal(steadyPostReset.poolMisses, 0);
+  assert.equal(steadyPostReset.hitRate, 1);
+  assert.equal(steadyPostReset.poolHitRate, 1);
+  assert.equal(steadyPostReset.oversizedAllocations, 4);
+  assert.equal(steadyPostReset.lruEvictions, 0);
+  assert.equal(steadyPostReset.peakAllocatedBytes, 16 * MiB);
+  assert.equal(steadyPostReset.totalBytesStaged, 4 * (yData.byteLength + uData.byteLength * 2));
+
+  // New allocation expanding live VRAM from 16 MiB -> 32 MiB advances peakAllocatedBytes cleanly.
+  pool.beginFrame(6);
+  pool.allocate(Math.ceil(8.3 * MiB), 256); // 16 MiB bucket -> live = 32 MiB
+  assert.equal(pool.getStats().peakAllocatedBytes, 32 * MiB);
+  assert.equal(pool.getStats().poolMisses, 1);
+  assert.equal(pool.getStats().hitRate, 12 / 13);
+  pool.endFrame();
+
+  // After destroy(), resetStats() zeroes peakAllocatedBytes as well (allocatedBytes === 0).
+  pool.destroy();
+  const destroyedReset = pool.resetStats();
+  assert.equal(destroyedReset.destroyed, true);
+  assert.equal(destroyedReset.allocatedBytes, 0);
+  assert.equal(destroyedReset.peakAllocatedBytes, 0);
+  assert.equal(destroyedReset.poolHits, 0);
+  assert.equal(destroyedReset.poolMisses, 0);
+  assert.equal(destroyedReset.hitRate, 0);
+  assert.equal(destroyedReset.lruEvictions, 0);
+  assert.equal(destroyedReset.oversizedAllocations, 0);
+  assert.equal(destroyedReset.totalBytesStaged, 0);
+});
+
+test('W245: classic-worker importScripts keeps W245 telemetry helpers isolated inside IIFE', () => {
+  const source = fs.readFileSync(
+    new URL('../web/workers/staging_pool.js', import.meta.url),
+    'utf8'
+  );
+  const sandbox = {
+    Uint8Array,
+    ArrayBuffer,
+    SharedArrayBuffer,
+    DataView,
+    Float32Array,
+    Math,
+    Number,
+    Object,
+    Set,
+    Map,
+    Array,
+    Promise,
+    Error,
+    TypeError,
+    RangeError,
+    JSON,
+    Infinity,
+  };
+  sandbox.self = sandbox;
+  sandbox.globalThis = sandbox;
+  const ctx = vm.createContext(sandbox);
+
+  vm.runInContext(source, ctx, { filename: 'staging_pool.js' });
+  assert.equal(typeof ctx.PlayGta6StagingPool.GpuStagingPool.prototype.resetStats, 'function');
+  assert.equal(ctx.clampUnitRate, undefined);
+  assert.equal(ctx.sanitizeNonNegativeCounter, undefined);
+});
+
