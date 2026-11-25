@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt::{self, Write as _};
 
 use crate::convert::{fnv1a_64, format_shader_hash};
@@ -13,11 +14,18 @@ pub const DXBC_HEADER_BYTES: usize = 32;
 /// Fixed per-chunk header size in bytes: fourcc(4) + payload_size(4).
 pub const DXBC_CHUNK_HEADER_BYTES: usize = 8;
 
+/// Upper bound on chunk count accepted in a single DXBC container
+/// (defends against crafted containers with pathological offset tables).
+pub const DXBC_MAX_CHUNKS: u32 = 256;
+
 /// LLVM bitcode magic bytes (`BC\xC0\xDE`) found inside `DXIL` program payloads.
 pub const LLVM_BITCODE_MAGIC: [u8; 4] = [0x42, 0x43, 0xC0, 0xDE];
 
 /// Minimum `DxilProgramHeader` size in bytes (6 x 32-bit words).
 const DXIL_PROGRAM_HEADER_BYTES: usize = 24;
+
+/// Minimum `RDEF` (SM4) fixed header size in bytes before variable-length tables and strings.
+const RDEF_MIN_HEADER_BYTES: usize = 28;
 
 /// Errors produced when parsing a DXBC / DXIL shader container.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,11 +45,32 @@ pub enum DxbcError {
         table_end: usize,
         container_size: usize,
     },
+    TooManyChunks {
+        chunk_count: u32,
+        max_chunks: u32,
+    },
     ChunkOutOfBounds {
         chunk_index: usize,
         offset: u32,
         size: u32,
         container_size: usize,
+    },
+    InvalidChunkTag {
+        chunk_index: usize,
+        offset: u32,
+        fourcc: [u8; 4],
+    },
+    DuplicateChunkTag {
+        fourcc: [u8; 4],
+        first_index: usize,
+        duplicate_index: usize,
+    },
+    OverlappingChunks {
+        first_index: usize,
+        first_offset: u32,
+        first_end: u32,
+        second_index: usize,
+        second_offset: u32,
     },
 }
 
@@ -74,6 +103,13 @@ impl fmt::Display for DxbcError {
                 f,
                 "DXBC chunk offset table ({chunk_count} chunks, end={table_end}) exceeds container size {container_size}"
             ),
+            Self::TooManyChunks {
+                chunk_count,
+                max_chunks,
+            } => write!(
+                f,
+                "DXBC chunk count {chunk_count} exceeds safety limit ({max_chunks})"
+            ),
             Self::ChunkOutOfBounds {
                 chunk_index,
                 offset,
@@ -82,6 +118,34 @@ impl fmt::Display for DxbcError {
             } => write!(
                 f,
                 "DXBC chunk {chunk_index} at offset {offset} (+header+{size} bytes) exceeds container bounds ({container_size} bytes)"
+            ),
+            Self::InvalidChunkTag {
+                chunk_index,
+                offset,
+                fourcc,
+            } => write!(
+                f,
+                "DXBC chunk {chunk_index} at offset {offset} has invalid FourCC tag {:?}",
+                format_fourcc(*fourcc)
+            ),
+            Self::DuplicateChunkTag {
+                fourcc,
+                first_index,
+                duplicate_index,
+            } => write!(
+                f,
+                "duplicate DXBC chunk tag {:?} (chunk indices {first_index} and {duplicate_index})",
+                format_fourcc(*fourcc)
+            ),
+            Self::OverlappingChunks {
+                first_index,
+                first_offset,
+                first_end,
+                second_index,
+                second_offset,
+            } => write!(
+                f,
+                "overlapping DXBC chunks: chunk {first_index} [{first_offset}..{first_end}) overlaps chunk {second_index} at offset {second_offset}"
             ),
         }
     }
@@ -442,19 +506,74 @@ pub struct DxbcFileEntry {
     pub result: Result<DxbcInfo, String>,
 }
 
-/// Validate a DXBC container and return zero-copy chunk payload slices.
-///
-/// Fully bounds-checked and overflow-checked: guaranteed panic-free on arbitrary or truncated bytes.
-pub fn parse_dxbc_chunks(bytes: &[u8]) -> Result<Vec<DxbcChunkRef<'_>>, DxbcError> {
-    let (_, _, _, total_size, chunk_count) = parse_dxbc_header(bytes)?;
-    let container_size = total_size as usize;
+/// Return `true` if `fourcc` is a valid printable ASCII DXBC chunk FourCC tag:
+/// the first byte must be printable non-space ASCII (`0x21..=0x7E`) and the
+/// remaining three bytes must be printable ASCII (`0x20..=0x7E`).
+pub const fn is_valid_fourcc(fourcc: [u8; 4]) -> bool {
+    if !fourcc[0].is_ascii_graphic() {
+        return false;
+    }
+    let mut i = 1;
+    while i < 4 {
+        let b = fourcc[i];
+        if !(b.is_ascii_graphic() || b == b' ') {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
 
-    let table_bytes = (chunk_count as usize)
+struct ParsedHeader {
+    digest: [u8; 16],
+    version_major: u16,
+    version_minor: u16,
+    total_size: u32,
+    chunk_count: u32,
+}
+
+struct ParsedChunkEntry<'a> {
+    table_index: usize,
+    start: u32,
+    end: u32,
+    chunk: DxbcChunkRef<'a>,
+}
+
+/// Validate a DXBC container and return zero-copy chunk payload slices in
+/// deterministic canonical ascending-offset order.
+///
+/// Fully bounds-checked and overflow-checked: guaranteed panic-free on arbitrary,
+/// empty, or truncated bytes, and rejects invalid FourCC tags, duplicate FourCC
+/// tags, overlapping/aliased chunk byte ranges, and excessive chunk counts.
+pub fn parse_dxbc_chunks(bytes: &[u8]) -> Result<Vec<DxbcChunkRef<'_>>, DxbcError> {
+    let header = parse_dxbc_header(bytes)?;
+    parse_dxbc_chunks_with_header(bytes, header.total_size, header.chunk_count)
+}
+
+fn parse_dxbc_chunks_with_header(
+    bytes: &[u8],
+    total_size: u32,
+    chunk_count: u32,
+) -> Result<Vec<DxbcChunkRef<'_>>, DxbcError> {
+    let container_size = usize::try_from(total_size)
+        .map_err(|_| DxbcError::Overflow("DXBC total_size exceeds platform usize".to_string()))?;
+    let container = bytes
+        .get(..container_size)
+        .ok_or(DxbcError::InvalidTotalSize {
+            declared: total_size,
+            actual: bytes.len(),
+        })?;
+
+    let table_bytes_u32 = chunk_count
         .checked_mul(4)
         .ok_or_else(|| DxbcError::Overflow("chunk offset table byte length overflow".to_string()))?;
-    let table_end = DXBC_HEADER_BYTES
-        .checked_add(table_bytes)
-        .ok_or_else(|| DxbcError::Overflow("header + chunk offset table size overflow".to_string()))?;
+    let table_end_u32 = (DXBC_HEADER_BYTES as u32)
+        .checked_add(table_bytes_u32)
+        .ok_or_else(|| {
+            DxbcError::Overflow("header + chunk offset table size overflow".to_string())
+        })?;
+    let table_end = usize::try_from(table_end_u32)
+        .map_err(|_| DxbcError::Overflow("chunk offset table end exceeds usize".to_string()))?;
 
     if table_end > container_size {
         return Err(DxbcError::ChunkTableOutOfBounds {
@@ -464,17 +583,36 @@ pub fn parse_dxbc_chunks(bytes: &[u8]) -> Result<Vec<DxbcChunkRef<'_>>, DxbcErro
         });
     }
 
-    let mut chunks = Vec::with_capacity(chunk_count as usize);
-    for idx in 0..(chunk_count as usize) {
-        let entry_pos = DXBC_HEADER_BYTES + idx * 4;
-        let offset = read_u32_le(bytes, entry_pos).ok_or_else(|| {
+    if chunk_count > DXBC_MAX_CHUNKS {
+        return Err(DxbcError::TooManyChunks {
+            chunk_count,
+            max_chunks: DXBC_MAX_CHUNKS,
+        });
+    }
+
+    let chunk_count_usize = usize::try_from(chunk_count)
+        .map_err(|_| DxbcError::Overflow("chunk count exceeds platform usize".to_string()))?;
+    let mut parsed = Vec::with_capacity(chunk_count_usize);
+
+    for idx in 0..chunk_count_usize {
+        let entry_rel = idx
+            .checked_mul(4)
+            .ok_or_else(|| DxbcError::Overflow("chunk offset table index overflow".to_string()))?;
+        let entry_pos = DXBC_HEADER_BYTES
+            .checked_add(entry_rel)
+            .ok_or_else(|| DxbcError::Overflow("chunk offset table entry overflow".to_string()))?;
+        let offset = read_u32_le(container, entry_pos).ok_or_else(|| {
             DxbcError::Overflow("chunk offset table index out of bounds".to_string())
         })?;
-        let offset_usize = offset as usize;
 
-        let payload_start = offset_usize
-            .checked_add(DXBC_CHUNK_HEADER_BYTES)
+        let payload_start_u32 = offset
+            .checked_add(DXBC_CHUNK_HEADER_BYTES as u32)
             .ok_or_else(|| DxbcError::Overflow(format!("chunk {idx} header offset overflow")))?;
+        let offset_usize = usize::try_from(offset)
+            .map_err(|_| DxbcError::Overflow(format!("chunk {idx} offset exceeds usize")))?;
+        let payload_start = usize::try_from(payload_start_u32).map_err(|_| {
+            DxbcError::Overflow(format!("chunk {idx} payload start exceeds usize"))
+        })?;
 
         if offset_usize < table_end || payload_start > container_size {
             return Err(DxbcError::ChunkOutOfBounds {
@@ -485,18 +623,40 @@ pub fn parse_dxbc_chunks(bytes: &[u8]) -> Result<Vec<DxbcChunkRef<'_>>, DxbcErro
             });
         }
 
+        let fourcc_end = offset_usize
+            .checked_add(4)
+            .ok_or_else(|| DxbcError::Overflow(format!("chunk {idx} fourcc offset overflow")))?;
+        let fourcc_slice =
+            container
+                .get(offset_usize..fourcc_end)
+                .ok_or(DxbcError::ChunkOutOfBounds {
+                    chunk_index: idx,
+                    offset,
+                    size: 0,
+                    container_size,
+                })?;
         let fourcc: [u8; 4] = [
-            bytes[offset_usize],
-            bytes[offset_usize + 1],
-            bytes[offset_usize + 2],
-            bytes[offset_usize + 3],
+            fourcc_slice[0],
+            fourcc_slice[1],
+            fourcc_slice[2],
+            fourcc_slice[3],
         ];
-        let size = read_u32_le(bytes, offset_usize + 4)
+        if !is_valid_fourcc(fourcc) {
+            return Err(DxbcError::InvalidChunkTag {
+                chunk_index: idx,
+                offset,
+                fourcc,
+            });
+        }
+
+        let size = read_u32_le(container, fourcc_end)
             .ok_or_else(|| DxbcError::Overflow(format!("chunk {idx} size read out of bounds")))?;
 
-        let payload_end = payload_start
-            .checked_add(size as usize)
+        let payload_end_u32 = payload_start_u32
+            .checked_add(size)
             .ok_or_else(|| DxbcError::Overflow(format!("chunk {idx} payload length overflow")))?;
+        let payload_end = usize::try_from(payload_end_u32)
+            .map_err(|_| DxbcError::Overflow(format!("chunk {idx} payload end exceeds usize")))?;
 
         if payload_end > container_size {
             return Err(DxbcError::ChunkOutOfBounds {
@@ -507,24 +667,74 @@ pub fn parse_dxbc_chunks(bytes: &[u8]) -> Result<Vec<DxbcChunkRef<'_>>, DxbcErro
             });
         }
 
-        chunks.push(DxbcChunkRef {
-            fourcc,
-            offset,
-            payload: &bytes[payload_start..payload_end],
+        let payload =
+            container
+                .get(payload_start..payload_end)
+                .ok_or(DxbcError::ChunkOutOfBounds {
+                    chunk_index: idx,
+                    offset,
+                    size,
+                    container_size,
+                })?;
+
+        parsed.push(ParsedChunkEntry {
+            table_index: idx,
+            start: offset,
+            end: payload_end_u32,
+            chunk: DxbcChunkRef {
+                fourcc,
+                offset,
+                payload,
+            },
         });
     }
 
-    Ok(chunks)
+    // Canonicalize enumeration order by physical container offset, then verify
+    // non-overlapping byte ranges and unique FourCC tags deterministically.
+    parsed.sort_by_key(|entry| (entry.start, entry.end, entry.table_index));
+
+    for pair in parsed.windows(2) {
+        let prev = &pair[0];
+        let next = &pair[1];
+        if next.start < prev.end {
+            return Err(DxbcError::OverlappingChunks {
+                first_index: prev.table_index,
+                first_offset: prev.start,
+                first_end: prev.end,
+                second_index: next.table_index,
+                second_offset: next.start,
+            });
+        }
+    }
+
+    let mut seen_tags: BTreeMap<[u8; 4], usize> = BTreeMap::new();
+    for entry in &parsed {
+        if let Some(&prev_idx) = seen_tags.get(&entry.chunk.fourcc) {
+            let (first_index, duplicate_index) = if prev_idx <= entry.table_index {
+                (prev_idx, entry.table_index)
+            } else {
+                (entry.table_index, prev_idx)
+            };
+            return Err(DxbcError::DuplicateChunkTag {
+                fourcc: entry.chunk.fourcc,
+                first_index,
+                duplicate_index,
+            });
+        }
+        seen_tags.insert(entry.chunk.fourcc, entry.table_index);
+    }
+
+    Ok(parsed.into_iter().map(|entry| entry.chunk).collect())
 }
 
 /// Parse a DXBC / DXIL shader container binary into a structured [`DxbcInfo`] summary.
 ///
 /// Computes the deterministic 64-bit FNV-1a hash over `bytes` and summarizes recognized chunks
 /// (`DXIL`, `SHDR`, `SHEX`, `RDEF`, `ISGN`/`OSGN`/`ISG1`/`OSG1`/`PSG1`/`PCSG`, `STAT`, `HASH`,
-/// `SFI0`) without retaining raw shader bytecode.
+/// `SFI0`) in deterministic canonical ascending-offset order without retaining raw shader bytecode.
 pub fn parse_dxbc(bytes: &[u8]) -> Result<DxbcInfo, DxbcError> {
-    let (digest, version_major, version_minor, total_size, _) = parse_dxbc_header(bytes)?;
-    let chunk_refs = parse_dxbc_chunks(bytes)?;
+    let header = parse_dxbc_header(bytes)?;
+    let chunk_refs = parse_dxbc_chunks_with_header(bytes, header.total_size, header.chunk_count)?;
 
     let mut chunks = Vec::with_capacity(chunk_refs.len());
     for chunk in chunk_refs {
@@ -541,16 +751,16 @@ pub fn parse_dxbc(bytes: &[u8]) -> Result<DxbcInfo, DxbcError> {
 
     Ok(DxbcInfo {
         fnv1a_hash: fnv1a_64(bytes),
-        digest,
-        version_major,
-        version_minor,
-        total_size,
+        digest: header.digest,
+        version_major: header.version_major,
+        version_minor: header.version_minor,
+        total_size: header.total_size,
         actual_bytes: bytes.len(),
         chunks,
     })
 }
 
-fn parse_dxbc_header(bytes: &[u8]) -> Result<([u8; 16], u16, u16, u32, u32), DxbcError> {
+fn parse_dxbc_header(bytes: &[u8]) -> Result<ParsedHeader, DxbcError> {
     if bytes.len() < DXBC_HEADER_BYTES {
         return Err(DxbcError::TooShort {
             actual: bytes.len(),
@@ -571,7 +781,8 @@ fn parse_dxbc_header(bytes: &[u8]) -> Result<([u8; 16], u16, u16, u32, u32), Dxb
     let total_size = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
     let chunk_count = u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]);
 
-    let container_size = total_size as usize;
+    let container_size = usize::try_from(total_size)
+        .map_err(|_| DxbcError::Overflow("DXBC total_size exceeds platform usize".to_string()))?;
     if container_size < DXBC_HEADER_BYTES || container_size > bytes.len() {
         return Err(DxbcError::InvalidTotalSize {
             declared: total_size,
@@ -579,7 +790,13 @@ fn parse_dxbc_header(bytes: &[u8]) -> Result<([u8; 16], u16, u16, u32, u32), Dxb
         });
     }
 
-    Ok((digest, version_major, version_minor, total_size, chunk_count))
+    Ok(ParsedHeader {
+        digest,
+        version_major,
+        version_minor,
+        total_size,
+        chunk_count,
+    })
 }
 
 fn summarize_chunk(fourcc: [u8; 4], payload: &[u8]) -> DxbcChunkDetail {
@@ -616,7 +833,13 @@ fn parse_dxil_chunk(payload: &[u8]) -> Option<DxilHeaderSummary> {
 
     let program_version = read_u32_le(payload, 0)?;
     let size_in_uint32 = read_u32_le(payload, 4)?;
-    let dxil_magic = [payload[8], payload[9], payload[10], payload[11]];
+    let dxil_magic_slice = payload.get(8..12)?;
+    let dxil_magic = [
+        dxil_magic_slice[0],
+        dxil_magic_slice[1],
+        dxil_magic_slice[2],
+        dxil_magic_slice[3],
+    ];
     let dxil_version = read_u32_le(payload, 12)?;
     let bitcode_offset = read_u32_le(payload, 16)?;
     let bitcode_size = read_u32_le(payload, 20)?;
@@ -627,14 +850,21 @@ fn parse_dxil_chunk(payload: &[u8]) -> Option<DxilHeaderSummary> {
     let dxil_version_major = ((dxil_version >> 8) & 0xFF) as u8;
     let dxil_version_minor = (dxil_version & 0xFF) as u8;
 
-    // DxilBitcodeHeader starts at byte 8 of the DXIL chunk; BitcodeOffset is relative to it.
-    let has_llvm_bitcode_magic = 8usize
-        .checked_add(bitcode_offset as usize)
-        .and_then(|start| {
+    // DxilBitcodeHeader starts at byte 8 of the DXIL chunk; BitcodeOffset is relative to it
+    // and must point at or past the end of the 24-byte DxilProgramHeader (bitcode_offset >= 16).
+    let has_llvm_bitcode_magic = 8u32
+        .checked_add(bitcode_offset)
+        .and_then(|start_u32| {
+            let end_bc_u32 = start_u32.checked_add(bitcode_size)?;
+            let start = usize::try_from(start_u32).ok()?;
+            let end_bc = usize::try_from(end_bc_u32).ok()?;
             let end_magic = start.checked_add(4)?;
-            let end_bc = start.checked_add(bitcode_size as usize)?;
-            if bitcode_size >= 4 && end_magic <= payload.len() && end_bc <= payload.len() {
-                Some(payload[start..end_magic] == LLVM_BITCODE_MAGIC)
+            if start >= DXIL_PROGRAM_HEADER_BYTES
+                && bitcode_size >= 4
+                && end_magic <= payload.len()
+                && end_bc <= payload.len()
+            {
+                Some(payload.get(start..end_magic) == Some(LLVM_BITCODE_MAGIC.as_slice()))
             } else {
                 Some(false)
             }
@@ -674,19 +904,22 @@ fn parse_legacy_shader_chunk(payload: &[u8]) -> Option<LegacyShaderHeaderSummary
 }
 
 fn parse_rdef_chunk(payload: &[u8]) -> Option<RdefSummary> {
-    if payload.len() < 28 {
+    if payload.len() < RDEF_MIN_HEADER_BYTES {
         return None;
     }
     let constant_buffer_count = read_u32_le(payload, 0)?;
     let resource_binding_count = read_u32_le(payload, 8)?;
-    let target_minor = payload[16];
-    let target_major = payload[17];
-    let program_type = u16::from_le_bytes([payload[18], payload[19]]);
+    let target_minor = *payload.get(16)?;
+    let target_major = *payload.get(17)?;
+    let program_type = u16::from_le_bytes([*payload.get(18)?, *payload.get(19)?]);
     let flags = read_u32_le(payload, 20)?;
-    let creator_offset = read_u32_le(payload, 24)? as usize;
+    let creator_offset_u32 = read_u32_le(payload, 24)?;
 
-    let is_rd11 = payload.len() >= 32 && &payload[28..32] == b"RD11";
-    let creator = read_c_string(payload, creator_offset, 256);
+    let is_rd11 = payload.get(28..32) == Some(b"RD11".as_slice());
+    let creator = usize::try_from(creator_offset_u32)
+        .ok()
+        .filter(|&off| off >= RDEF_MIN_HEADER_BYTES)
+        .and_then(|off| read_c_string(payload, off, 256));
 
     Some(RdefSummary {
         constant_buffer_count,
@@ -736,7 +969,7 @@ fn parse_hash_chunk(payload: &[u8]) -> Option<HashChunkSummary> {
         return None;
     }
     let flags = read_u32_le(payload, 0)?;
-    let digest_hex = encode_hex_lower(&payload[4..20]);
+    let digest_hex = encode_hex_lower(payload.get(4..20)?);
     Some(HashChunkSummary { flags, digest_hex })
 }
 
@@ -796,16 +1029,17 @@ fn read_u32_le(bytes: &[u8], offset: usize) -> Option<u32> {
 }
 
 fn read_c_string(bytes: &[u8], offset: usize, max_len: usize) -> Option<String> {
-    if offset == 0 || offset >= bytes.len() {
+    if offset == 0 || max_len == 0 {
         return None;
     }
-    let tail = &bytes[offset..];
+    let tail = bytes.get(offset..)?;
     let limit = tail.len().min(max_len);
-    let nul_pos = tail[..limit].iter().position(|&b| b == 0)?;
+    let window = tail.get(..limit)?;
+    let nul_pos = window.iter().position(|&b| b == 0)?;
     if nul_pos == 0 {
         return None;
     }
-    let text = std::str::from_utf8(&tail[..nul_pos]).ok()?;
+    let text = std::str::from_utf8(window.get(..nul_pos)?).ok()?;
     if text.chars().all(|c| !c.is_control()) {
         Some(text.to_string())
     } else {
@@ -1536,5 +1770,428 @@ mod tests {
         let batch_json = render_dxbc_batch_json(&batch);
         assert!(batch_json.contains("\"total\": 2"));
         assert!(batch_json.contains("\"error\": \"invalid DXBC magic\""));
+    }
+
+    #[test]
+    fn rejects_every_truncated_header_length_and_truncated_tables_or_chunks() {
+        let dxil = build_dxil_chunk_payload(0, 6, 6, 1, 6, true);
+        let isgn = build_signature_chunk_payload(2);
+        let valid = build_dxbc_container(&[(*b"DXIL", &dxil), (*b"ISGN", &isgn)]);
+
+        // Every truncated header prefix 0..32 bytes must fail with TooShort.
+        for len in 0..DXBC_HEADER_BYTES {
+            let err = parse_dxbc(&valid[..len]).unwrap_err();
+            assert_eq!(
+                err,
+                DxbcError::TooShort {
+                    actual: len,
+                    expected_min: DXBC_HEADER_BYTES,
+                }
+            );
+            assert_eq!(parse_dxbc_chunks(&valid[..len]).unwrap_err(), err);
+        }
+
+        // Declared total_size == 0 or < DXBC_HEADER_BYTES fails with InvalidTotalSize.
+        for declared in [0u32, 1, 31] {
+            let mut buf = build_dxbc_container(&[]);
+            buf[24..28].copy_from_slice(&declared.to_le_bytes());
+            assert_eq!(
+                parse_dxbc(&buf).unwrap_err(),
+                DxbcError::InvalidTotalSize {
+                    declared,
+                    actual: buf.len(),
+                }
+            );
+        }
+
+        // Truncated container body (1 byte short of total_size).
+        assert_eq!(
+            parse_dxbc(&valid[..valid.len() - 1]).unwrap_err(),
+            DxbcError::InvalidTotalSize {
+                declared: valid.len() as u32,
+                actual: valid.len() - 1,
+            }
+        );
+
+        // Truncated chunk offset table: total_size covers header + 1 offset, but chunk_count == 2.
+        let mut trunc_table = build_dxbc_container(&[]);
+        trunc_table.extend_from_slice(&40u32.to_le_bytes());
+        let len = trunc_table.len() as u32;
+        trunc_table[24..28].copy_from_slice(&len.to_le_bytes());
+        trunc_table[28..32].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(
+            parse_dxbc_chunks(&trunc_table).unwrap_err(),
+            DxbcError::ChunkTableOutOfBounds {
+                chunk_count: 2,
+                table_end: DXBC_HEADER_BYTES + 8,
+                container_size: trunc_table.len(),
+            }
+        );
+
+        // Truncated 8-byte chunk header (only 7 bytes after offset table).
+        let mut trunc_chunk_hdr = build_dxbc_container(&[]);
+        trunc_chunk_hdr.extend_from_slice(&36u32.to_le_bytes()); // offset[0] = 36
+        trunc_chunk_hdr.extend_from_slice(b"DXIL\x00\x00\x00"); // 7 bytes, missing last size byte
+        let len = trunc_chunk_hdr.len() as u32;
+        trunc_chunk_hdr[24..28].copy_from_slice(&len.to_le_bytes());
+        trunc_chunk_hdr[28..32].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(
+            parse_dxbc_chunks(&trunc_chunk_hdr).unwrap_err(),
+            DxbcError::ChunkOutOfBounds {
+                chunk_index: 0,
+                offset: 36,
+                size: 0,
+                container_size: trunc_chunk_hdr.len(),
+            }
+        );
+
+        // Trailing bytes after total_size are ignored for valid containers,
+        // and chunks must never be allowed to read past total_size into trailing bytes.
+        let mut with_trailing = valid.clone();
+        with_trailing.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        let parsed = parse_dxbc(&with_trailing).expect("valid container with trailing bytes");
+        assert_eq!(parsed.total_size as usize, valid.len());
+        assert_eq!(parsed.actual_bytes, with_trailing.len());
+        assert_eq!(parsed.chunks.len(), 2);
+
+        // Inflate second chunk size by 2 bytes so it stays inside with_trailing.len()
+        // but exceeds declared total_size: must still be rejected as ChunkOutOfBounds.
+        let second_off = u32::from_le_bytes(with_trailing[36..40].try_into().unwrap()) as usize;
+        let orig_size =
+            u32::from_le_bytes(with_trailing[second_off + 4..second_off + 8].try_into().unwrap());
+        with_trailing[second_off + 4..second_off + 8]
+            .copy_from_slice(&(orig_size + 2).to_le_bytes());
+        assert_eq!(
+            parse_dxbc_chunks(&with_trailing).unwrap_err(),
+            DxbcError::ChunkOutOfBounds {
+                chunk_index: 1,
+                offset: second_off as u32,
+                size: orig_size + 2,
+                container_size: valid.len(),
+            }
+        );
+    }
+
+    #[test]
+    fn handles_zero_length_slices_empty_containers_and_zero_length_chunk_payloads() {
+        // Zero-length input slice on all entry points and sub-parsers must never panic.
+        assert!(matches!(
+            parse_dxbc(&[]),
+            Err(DxbcError::TooShort {
+                actual: 0,
+                expected_min: 32
+            })
+        ));
+        assert!(matches!(
+            parse_dxbc_chunks(&[]),
+            Err(DxbcError::TooShort {
+                actual: 0,
+                expected_min: 32
+            })
+        ));
+        assert_eq!(parse_dxil_chunk(&[]), None);
+        assert_eq!(parse_legacy_shader_chunk(&[]), None);
+        assert_eq!(parse_rdef_chunk(&[]), None);
+        assert_eq!(parse_signature_chunk(&[]), None);
+        assert_eq!(parse_stat_chunk(&[]), None);
+        assert_eq!(parse_hash_chunk(&[]), None);
+        assert_eq!(parse_sfi0_chunk(&[]), None);
+        assert_eq!(read_u32_le(&[], 0), None);
+        assert_eq!(read_c_string(&[], 0, 16), None);
+        assert_eq!(read_c_string(&[], 1, 16), None);
+        assert_eq!(read_c_string(b"abc\0", 1, 0), None);
+
+        // Valid zero-chunk container.
+        let empty_container = build_dxbc_container(&[]);
+        let empty_info = parse_dxbc(&empty_container).expect("zero-chunk container should parse");
+        assert!(empty_info.chunks.is_empty());
+        assert!(!empty_info.is_dxil());
+        assert_eq!(empty_info.shader_kind(), None);
+        assert_eq!(empty_info.shader_model(), None);
+        assert!(render_dxbc_info_md(None, &empty_info).contains("No chunks present."));
+        assert!(render_dxbc_info_json(None, &empty_info).contains("\"chunks\": []"));
+
+        // Adjacent zero-length chunk payloads (recognized + custom tags) must parse
+        // cleanly without panicking and degrade recognized empty chunks to Detail::Other.
+        let zero_payload_container = build_dxbc_container(&[
+            (*b"DXIL", &[]),
+            (*b"SHDR", &[]),
+            (*b"RDEF", &[]),
+            (*b"ISGN", &[]),
+            (*b"STAT", &[]),
+            (*b"HASH", &[]),
+            (*b"SFI0", &[]),
+            (*b"PRIV", &[]),
+        ]);
+        let refs = parse_dxbc_chunks(&zero_payload_container)
+            .expect("zero-length chunk payloads should parse");
+        assert_eq!(refs.len(), 8);
+        assert!(refs.iter().all(|c| c.payload.is_empty()));
+
+        let info = parse_dxbc(&zero_payload_container).expect("zero-length chunks summarize safely");
+        assert_eq!(info.chunks.len(), 8);
+        assert!(info.chunks.iter().all(|c| c.size == 0 && c.detail == DxbcChunkDetail::Other));
+        assert!(!info.is_dxil());
+        assert!(!info.has_llvm_bitcode());
+    }
+
+    #[test]
+    fn rejects_overflowing_chunk_counts_offsets_sizes_and_subparser_overflows() {
+        // 1. chunk_count * 4 u32 multiplication overflow (0x4000_0000 and u32::MAX)
+        for bad_count in [0x4000_0000u32, u32::MAX] {
+            let mut buf = build_dxbc_container(&[]);
+            buf[28..32].copy_from_slice(&bad_count.to_le_bytes());
+            assert!(matches!(
+                parse_dxbc_chunks(&buf),
+                Err(DxbcError::Overflow(_))
+            ));
+        }
+
+        // 2. DXBC_HEADER_BYTES + chunk_count * 4 u32 addition overflow (0x3fff_ffff * 4 = 0xffff_fffc)
+        let mut add_ovf = build_dxbc_container(&[]);
+        add_ovf[28..32].copy_from_slice(&0x3fff_ffffu32.to_le_bytes());
+        assert!(matches!(
+            parse_dxbc_chunks(&add_ovf),
+            Err(DxbcError::Overflow(_))
+        ));
+
+        // 3. chunk_count exceeding DXBC_MAX_CHUNKS when table fits inside container_size
+        let over_cap = DXBC_MAX_CHUNKS + 1;
+        let total = DXBC_HEADER_BYTES + (over_cap as usize) * 4;
+        let mut too_many = vec![0u8; total];
+        too_many[0..4].copy_from_slice(&DXBC_MAGIC);
+        too_many[24..28].copy_from_slice(&(total as u32).to_le_bytes());
+        too_many[28..32].copy_from_slice(&over_cap.to_le_bytes());
+        assert_eq!(
+            parse_dxbc_chunks(&too_many).unwrap_err(),
+            DxbcError::TooManyChunks {
+                chunk_count: over_cap,
+                max_chunks: DXBC_MAX_CHUNKS,
+            }
+        );
+
+        // 4. Chunk offset + 8 u32 overflow (u32::MAX - 7 ..= u32::MAX)
+        for bad_offset in [u32::MAX - 7, u32::MAX - 1, u32::MAX] {
+            let mut buf = build_dxbc_container(&[(*b"PRIV", &[1, 2, 3, 4])]);
+            buf[32..36].copy_from_slice(&bad_offset.to_le_bytes());
+            assert!(matches!(
+                parse_dxbc_chunks(&buf),
+                Err(DxbcError::Overflow(_))
+            ));
+        }
+
+        // 5. Chunk payload_start + size u32 overflow
+        let mut size_ovf = build_dxbc_container(&[(*b"PRIV", &[1, 2, 3, 4])]);
+        let off = u32::from_le_bytes(size_ovf[32..36].try_into().unwrap()) as usize;
+        for bad_size in [u32::MAX - (off as u32) - 7, u32::MAX] {
+            size_ovf[off + 4..off + 8].copy_from_slice(&bad_size.to_le_bytes());
+            assert!(matches!(
+                parse_dxbc_chunks(&size_ovf),
+                Err(DxbcError::Overflow(_))
+            ));
+        }
+
+        // 6. DXIL bitcode_offset / bitcode_size overflow & header-overlapping bitcode_offset < 16
+        let mut dxil_ovf = build_dxil_chunk_payload(5, 6, 6, 1, 6, true);
+        dxil_ovf[16..20].copy_from_slice(&u32::MAX.to_le_bytes()); // bitcode_offset overflow
+        let parsed = parse_dxil_chunk(&dxil_ovf).expect("DXIL header still decodes");
+        assert!(!parsed.has_llvm_bitcode_magic);
+
+        let mut dxil_size_ovf = build_dxil_chunk_payload(5, 6, 6, 1, 6, true);
+        dxil_size_ovf[20..24].copy_from_slice(&u32::MAX.to_le_bytes()); // bitcode_size overflow
+        let parsed = parse_dxil_chunk(&dxil_size_ovf).expect("DXIL header still decodes");
+        assert!(!parsed.has_llvm_bitcode_magic);
+
+        // Craft a DXIL payload whose DxilMagic bytes happen to be LLVM_BITCODE_MAGIC and
+        // bitcode_offset = 0 (aliasing bytes 8..12 inside DxilProgramHeader): must be rejected!
+        let mut dxil_alias = build_dxil_chunk_payload(5, 6, 6, 1, 6, false);
+        dxil_alias[8..12].copy_from_slice(&LLVM_BITCODE_MAGIC);
+        dxil_alias[16..20].copy_from_slice(&0u32.to_le_bytes());
+        dxil_alias[20..24].copy_from_slice(&4u32.to_le_bytes());
+        let parsed = parse_dxil_chunk(&dxil_alias).expect("DXIL header still decodes");
+        assert!(!parsed.has_llvm_bitcode_magic);
+
+        // 7. RDEF creator_offset overflowing, pointing inside RDEF header (< 28), or unterminated
+        let mut rdef = build_rdef_chunk_payload(1, 2, 6, 6, "dxc");
+        rdef[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(parse_rdef_chunk(&rdef).unwrap().creator, None);
+
+        rdef[24..28].copy_from_slice(&4u32.to_le_bytes()); // inside fixed header
+        assert_eq!(parse_rdef_chunk(&rdef).unwrap().creator, None);
+
+        let mut rdef_unterm = build_rdef_chunk_payload(1, 2, 6, 6, "dxc");
+        *rdef_unterm.last_mut().unwrap() = b'X'; // overwrite NUL terminator
+        assert_eq!(parse_rdef_chunk(&rdef_unterm).unwrap().creator, None);
+    }
+
+    #[test]
+    fn rejects_invalid_duplicate_and_overlapping_chunk_tags_and_ranges() {
+        // Invalid FourCC tags: NULs, control bytes, DEL, non-ASCII, all-space, leading space.
+        let invalid_tags: [[u8; 4]; 7] = [
+            [0, 0, 0, 0],
+            *b"DX\x00L",
+            *b"DX\nL",
+            *b"DX\x7fL",
+            [0x80, b'A', b'B', b'C'],
+            *b"    ",
+            *b" DXI",
+        ];
+        for bad_tag in invalid_tags {
+            assert!(!is_valid_fourcc(bad_tag));
+            let container = build_dxbc_container(&[(bad_tag, &[1, 2, 3, 4])]);
+            assert_eq!(
+                parse_dxbc_chunks(&container).unwrap_err(),
+                DxbcError::InvalidChunkTag {
+                    chunk_index: 0,
+                    offset: (DXBC_HEADER_BYTES + 4) as u32,
+                    fourcc: bad_tag,
+                }
+            );
+        }
+
+        // Valid trailing-space FourCC tag is accepted.
+        assert!(is_valid_fourcc(*b"FOO "));
+        let trailing_space = build_dxbc_container(&[(*b"FOO ", &[0xaa])]);
+        let chunks = parse_dxbc_chunks(&trailing_space).expect("trailing-space FourCC is valid");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].fourcc, *b"FOO ");
+
+        // Duplicate FourCC tags across distinct non-overlapping chunks must be rejected.
+        let isgn_a = build_signature_chunk_payload(1);
+        let isgn_b = build_signature_chunk_payload(2);
+        let dup_tag = build_dxbc_container(&[(*b"ISGN", &isgn_a), (*b"ISGN", &isgn_b)]);
+        assert_eq!(
+            parse_dxbc_chunks(&dup_tag).unwrap_err(),
+            DxbcError::DuplicateChunkTag {
+                fourcc: *b"ISGN",
+                first_index: 0,
+                duplicate_index: 1,
+            }
+        );
+        assert_eq!(
+            parse_dxbc(&dup_tag).unwrap_err(),
+            DxbcError::DuplicateChunkTag {
+                fourcc: *b"ISGN",
+                first_index: 0,
+                duplicate_index: 1,
+            }
+        );
+
+        // Duplicate chunk offset (two offset-table slots aliasing the exact same chunk).
+        let mut dup_offset = build_dxbc_container(&[(*b"ISGN", &isgn_a), (*b"OSGN", &isgn_b)]);
+        let off0 = u32::from_le_bytes(dup_offset[32..36].try_into().unwrap());
+        dup_offset[36..40].copy_from_slice(&off0.to_le_bytes());
+        assert_eq!(
+            parse_dxbc_chunks(&dup_offset).unwrap_err(),
+            DxbcError::OverlappingChunks {
+                first_index: 0,
+                first_offset: off0,
+                first_end: off0 + (DXBC_CHUNK_HEADER_BYTES + isgn_a.len()) as u32,
+                second_index: 1,
+                second_offset: off0,
+            }
+        );
+
+        // Partially overlapping chunk ranges (chunk 1 starts inside chunk 0's payload).
+        // Craft payload0 so bytes at relative offset 8 form a valid inner chunk header ("OSGN", size 0).
+        let mut payload0 = vec![0u8; 16];
+        payload0[8..12].copy_from_slice(b"OSGN");
+        payload0[12..16].copy_from_slice(&0u32.to_le_bytes());
+        let mut partial_overlap = build_dxbc_container(&[(*b"PRIV", &payload0), (*b"STAT", &[])]);
+        let off0 = u32::from_le_bytes(partial_overlap[32..36].try_into().unwrap());
+        let overlapping_off1 = off0 + (DXBC_CHUNK_HEADER_BYTES as u32) + 8;
+        partial_overlap[36..40].copy_from_slice(&overlapping_off1.to_le_bytes());
+        assert_eq!(
+            parse_dxbc_chunks(&partial_overlap).unwrap_err(),
+            DxbcError::OverlappingChunks {
+                first_index: 0,
+                first_offset: off0,
+                first_end: off0 + (DXBC_CHUNK_HEADER_BYTES + payload0.len()) as u32,
+                second_index: 1,
+                second_offset: overlapping_off1,
+            }
+        );
+    }
+
+    #[test]
+    fn enumerates_chunks_deterministically_in_canonical_ascending_offset_order() {
+        let dxil = build_dxil_chunk_payload(5, 6, 6, 1, 6, true);
+        let isgn = build_signature_chunk_payload(3);
+        let stat = build_stat_chunk_payload(64, 8, 4);
+
+        let canonical = build_dxbc_container(&[
+            (*b"ISGN", &isgn),
+            (*b"STAT", &stat),
+            (*b"DXIL", &dxil),
+        ]);
+
+        // Clone the container and permute its offset table to [off_2, off_0, off_1].
+        let mut permuted = canonical.clone();
+        let off0: [u8; 4] = canonical[32..36].try_into().unwrap();
+        let off1: [u8; 4] = canonical[36..40].try_into().unwrap();
+        let off2: [u8; 4] = canonical[40..44].try_into().unwrap();
+        permuted[32..36].copy_from_slice(&off2);
+        permuted[36..40].copy_from_slice(&off0);
+        permuted[40..44].copy_from_slice(&off1);
+
+        let chunks_canonical = parse_dxbc_chunks(&canonical).expect("canonical container");
+        let chunks_permuted = parse_dxbc_chunks(&permuted).expect("permuted offset-table container");
+        assert_eq!(chunks_canonical, chunks_permuted);
+        assert!(chunks_permuted.windows(2).all(|w| w[0].offset < w[1].offset));
+        assert_eq!(
+            chunks_permuted.iter().map(|c| c.fourcc).collect::<Vec<_>>(),
+            vec![*b"ISGN", *b"STAT", *b"DXIL"]
+        );
+
+        let info_canonical = parse_dxbc(&canonical).expect("parse canonical");
+        let info_permuted = parse_dxbc(&permuted).expect("parse permuted");
+        assert_eq!(info_canonical.chunks, info_permuted.chunks);
+        assert_eq!(info_canonical.shader_kind(), info_permuted.shader_kind());
+        assert_eq!(info_canonical.shader_model(), info_permuted.shader_model());
+
+        // Repeated runs produce bit-for-bit identical summaries, Markdown, and JSON.
+        let info_repeat = parse_dxbc(&permuted).expect("repeat parse");
+        assert_eq!(info_permuted, info_repeat);
+        assert_eq!(
+            render_dxbc_info_md(Some("cs.dxil"), &info_permuted),
+            render_dxbc_info_md(Some("cs.dxil"), &info_repeat)
+        );
+        assert_eq!(
+            render_dxbc_info_json(Some("cs.dxil"), &info_permuted),
+            render_dxbc_info_json(Some("cs.dxil"), &info_repeat)
+        );
+    }
+
+    #[test]
+    fn formats_all_hardened_dxbc_error_variants_cleanly() {
+        let samples = [
+            DxbcError::TooManyChunks {
+                chunk_count: 300,
+                max_chunks: DXBC_MAX_CHUNKS,
+            },
+            DxbcError::InvalidChunkTag {
+                chunk_index: 1,
+                offset: 44,
+                fourcc: [0x00, 0xff, 0x0a, 0x7f],
+            },
+            DxbcError::DuplicateChunkTag {
+                fourcc: *b"DXIL",
+                first_index: 0,
+                duplicate_index: 2,
+            },
+            DxbcError::OverlappingChunks {
+                first_index: 0,
+                first_offset: 40,
+                first_end: 64,
+                second_index: 1,
+                second_offset: 52,
+            },
+        ];
+
+        for err in samples {
+            let msg = err.to_string();
+            assert!(!msg.is_empty());
+            assert!(msg.chars().all(|c| !c.is_control()));
+        }
     }
 }
