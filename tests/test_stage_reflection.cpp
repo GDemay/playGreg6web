@@ -336,15 +336,35 @@ void test_layout_join() {
     CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &wrong}}, &slots, &report));
     CHECK(report.find("is a resource table") != std::string::npos);
 
-    // A writable binding over a declared read-only slot is still a failure.
+    // A writable binding over a declared CBV joins the slot as a UAV (#482: shared root signatures
+    // list a CBV where the stage's own space-1 layout has a UAV; the stage stores through it).
     StageReflection writable;
-    ReflectedBinding st = tex;
+    ReflectedBinding st = tex;  // slot 1 = CBV b0 space 1
     st.kind = ReflectedBindingKind::StorageTexture;
     st.storage_format = 18;
-    writable.bindings = {st};
+    ReflectedBinding sb = tex;
+    sb.binding = 5;
+    sb.kind = ReflectedBindingKind::Storage;
+    sb.min_binding_size = 16;
+    writable.bindings = {st, sb};
     report.clear();
-    CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &writable}}, &untouched, &report));
-    CHECK(report.find("cannot take a CBV") != std::string::npos);
+    JoinStats cbv_stats;
+    CHECK(join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &writable}}, &slots, &report, &cbv_stats));
+    CHECK(report.empty() && cbv_stats.table_slots_outside_rs == 2);
+    if (slots.groups.size() == 1 && slots.groups[0].bindings.size() == 2) {
+        const bridge::LayoutBinding& w = slots.groups[0].bindings[0];
+        CHECK(w.entry.binding == 2 && w.join.table_parameter == 0 && w.join.table_slot == 1 &&
+              w.join.register_class == d3d::DescriptorRangeType::Uav &&
+              w.entry.type == static_cast<uint8_t>(GpuBindingLayoutType::StorageTexture) &&
+              w.entry.storage_format == 18);
+        const bridge::LayoutBinding& s = slots.groups[0].bindings[1];
+        CHECK(s.entry.binding == 5 && s.join.table_parameter == 0 && s.join.table_slot == 1 &&
+              s.join.register_class == d3d::DescriptorRangeType::Uav &&
+              s.entry.type == static_cast<uint8_t>(GpuBindingLayoutType::Buffer) &&
+              s.entry.binding_type == static_cast<uint8_t>(GpuBufferBindingType::Storage));
+    } else {
+        CHECK(false);
+    }
     // Over a declared SRV it joins the slot as a UAV (the stage writes through the descriptor, #482:
     // compute stages image_store through s5 + 32 where the root signature declares an SRV).
     StageReflection over_srv;
