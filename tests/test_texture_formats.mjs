@@ -8,6 +8,9 @@ const texMod = require('../web/workers/texture_formats.js');
 const {
   DXGI_FORMAT,
   DXGI_FORMAT_NAMES,
+  DXGI_FORMAT_MAX_ID,
+  DXGI_FORMAT_TABLE,
+  WEBGPU_FORMAT_INFO,
   WEBGPU_BYTES_PER_ROW_ALIGNMENT,
   TEXTURE_COMPRESSION_BC_FEATURE,
   TEXTURE_COMPRESSION_BC_SLICED_3D_FEATURE,
@@ -15,12 +18,16 @@ const {
   CHROMIUM_UNORM16_FEATURE,
   DEPTH32FLOAT_STENCIL8_FEATURE,
   BGRA8UNORM_STORAGE_FEATURE,
+  getWebGpuFormatInfo,
+  lookupDxgiFormat,
   mapDxgiFormatToWebGpu,
   getSrgbSiblingFormat,
   classifyTextureFormatSupport,
   resolveStorageCompatibleFormat,
   calcMipSize,
   calcMipLayout,
+  computeMipLayout,
+  computeMipByteSize,
   padTextureRowsForWriteTexture,
   decodeBc1ToRgba8,
   decodeBc3ToRgba8,
@@ -1155,4 +1162,308 @@ test('W163 resolveStorageCompatibleFormat rejects depth/stencil, compressed, opt
       reason: 'invalid-format',
     });
   }
+});
+
+test('W301 DXGI_FORMAT_TABLE is a frozen dense O(1) table for DXGI ids 0..132 with zero-alloc lookups', () => {
+  assert.equal(DXGI_FORMAT_MAX_ID, 132);
+  assert.ok(Array.isArray(DXGI_FORMAT_TABLE));
+  assert.equal(DXGI_FORMAT_TABLE.length, 133);
+  assert.equal(Object.isFrozen(DXGI_FORMAT_TABLE), true);
+  assert.equal(DXGI_FORMAT_TABLE[0], null);
+
+  for (let i = 0; i <= DXGI_FORMAT_MAX_ID; i += 1) {
+    assert.equal(Object.prototype.hasOwnProperty.call(DXGI_FORMAT_TABLE, i), true, `dense slot ${i}`);
+    const entry = DXGI_FORMAT_TABLE[i];
+    if (entry !== null) {
+      assert.equal(Object.isFrozen(entry), true, `frozen entry at ${i}`);
+      assert.equal(entry.dxgiFormat, i);
+      assert.equal(entry.name, DXGI_FORMAT_NAMES[i]);
+      assert.ok(typeof entry.webgpuFormat === 'string' && entry.webgpuFormat.length > 0);
+      assert.ok(entry.aspect === 'all' || entry.aspect === 'depth-only' || entry.aspect === 'stencil-only');
+    }
+  }
+
+  // Zero-alloc identity: repeated mapDxgiFormatToWebGpu / lookupDxgiFormat calls return the exact same frozen object
+  const withAllFeatures = new Set([
+    TEXTURE_COMPRESSION_BC_FEATURE,
+    DEPTH32FLOAT_STENCIL8_FEATURE,
+    TEXTURE_FORMATS_TIER1_FEATURE,
+  ]);
+  const noFeatures = new Set();
+
+  for (let code = 1; code <= DXGI_FORMAT_MAX_ID; code += 1) {
+    if (DXGI_FORMAT_TABLE[code] === null) {
+      assert.equal(lookupDxgiFormat(code), null);
+      continue;
+    }
+    const a = mapDxgiFormatToWebGpu(code, withAllFeatures);
+    const b = mapDxgiFormatToWebGpu(code, withAllFeatures);
+    assert.equal(a, b, `native lookup for code ${code} must not allocate`);
+    assert.equal(a, DXGI_FORMAT_TABLE[code], `native lookup for code ${code} returns dense table entry`);
+    assert.equal(Object.isFrozen(a), true);
+
+    const f1 = mapDxgiFormatToWebGpu(code, noFeatures);
+    const f2 = mapDxgiFormatToWebGpu(code, noFeatures);
+    assert.equal(f1, f2, `fallback lookup for code ${code} must not allocate`);
+    assert.equal(Object.isFrozen(f1), true);
+
+    assert.equal(lookupDxgiFormat(code, withAllFeatures), a);
+    assert.equal(lookupDxgiFormat(code, noFeatures), f1);
+    assert.equal(lookupDxgiFormat(a.name, withAllFeatures), a);
+    assert.equal(lookupDxgiFormat(`DXGI_FORMAT_${a.name}`, withAllFeatures), a);
+  }
+
+  // Non-throwing lookupDxgiFormat returns null for invalid/unsupported inputs
+  for (const bad of [0, -1, 133, 999, 28.5, NaN, Infinity, '', 'UNKNOWN', 'NO_SUCH_FORMAT', null, undefined, {}]) {
+    assert.equal(lookupDxgiFormat(bad), null, `expected null for ${String(bad)}`);
+  }
+
+  // classifyTextureFormatSupport & resolveStorageCompatibleFormat also reuse frozen records
+  assert.equal(classifyTextureFormatSupport('rgba16float'), classifyTextureFormatSupport('rgba16float'));
+  assert.equal(
+    classifyTextureFormatSupport('bc7-rgba-unorm', { deviceFeatures: withAllFeatures }),
+    classifyTextureFormatSupport('bc7-rgba-unorm', { deviceFeatures: withAllFeatures })
+  );
+  assert.equal(
+    resolveStorageCompatibleFormat('rgba16float'),
+    resolveStorageCompatibleFormat('rgba16float')
+  );
+});
+
+test('W301 complete HDR10, render-target, BC1-BC7, and depth/stencil metadata (aspect, sRGB, HDR, feature)', () => {
+  const withAll = new Set([
+    TEXTURE_COMPRESSION_BC_FEATURE,
+    DEPTH32FLOAT_STENCIL8_FEATURE,
+    TEXTURE_FORMATS_TIER1_FEATURE,
+  ]);
+
+  // HDR10 & render-target formats (including shorthand string aliases)
+  const hdrCases = [
+    [DXGI_FORMAT.R10G10B10A2_UNORM, 'R10G10B10A2_UNORM', 'rgb10a2unorm', 4],
+    [DXGI_FORMAT.R11G11B10_FLOAT, 'R11G11B10_FLOAT', 'rg11b10ufloat', 4],
+    [DXGI_FORMAT.R16G16B16A16_FLOAT, 'RGBA16_FLOAT', 'rgba16float', 8],
+    [DXGI_FORMAT.R16G16_FLOAT, 'RG16_FLOAT', 'rg16float', 4],
+    [DXGI_FORMAT.R16_FLOAT, 'R16_FLOAT', 'r16float', 2],
+    [DXGI_FORMAT.R32G32B32A32_FLOAT, 'RGBA32_FLOAT', 'rgba32float', 16],
+    [DXGI_FORMAT.R9G9B9E5_SHAREDEXP, 'R9G9B9E5_SHAREDEXP', 'rgb9e5ufloat', 4],
+  ];
+
+  for (const [code, alias, webgpuFormat, bytesPerBlock] of hdrCases) {
+    const desc = mapDxgiFormatToWebGpu(code);
+    assert.equal(desc.webgpuFormat, webgpuFormat);
+    assert.equal(desc.blockWidth, 1);
+    assert.equal(desc.blockHeight, 1);
+    assert.equal(desc.bytesPerBlock, bytesPerBlock);
+    assert.equal(desc.aspect, 'all');
+    assert.equal(desc.isCompressed, false);
+    assert.equal(desc.isDepth, false);
+    assert.equal(desc.hasStencil, false);
+    assert.equal(desc.isSrgb, false);
+    assert.equal(desc.isHdr, true);
+    assert.equal(desc.requiresFeature, null);
+    assert.equal(desc.needsSoftwareDecode, false);
+    assert.equal(mapDxgiFormatToWebGpu(alias), desc);
+    assert.equal(mapDxgiFormatToWebGpu(`DXGI_FORMAT_${alias}`), desc);
+    assert.equal(WEBGPU_FORMAT_INFO[webgpuFormat].isHdr, true);
+    assert.equal(WEBGPU_FORMAT_INFO[webgpuFormat].aspect, 'all');
+  }
+
+  // BC1..BC7 complete metadata (unorm, sRGB, snorm, BC6H ufloat/float)
+  const bcMetaCases = [
+    [DXGI_FORMAT.BC1_UNORM, 'bc1-rgba-unorm', 8, false, false],
+    [DXGI_FORMAT.BC1_UNORM_SRGB, 'bc1-rgba-unorm-srgb', 8, true, false],
+    [DXGI_FORMAT.BC2_UNORM, 'bc2-rgba-unorm', 16, false, false],
+    [DXGI_FORMAT.BC2_UNORM_SRGB, 'bc2-rgba-unorm-srgb', 16, true, false],
+    [DXGI_FORMAT.BC3_UNORM, 'bc3-rgba-unorm', 16, false, false],
+    [DXGI_FORMAT.BC3_UNORM_SRGB, 'bc3-rgba-unorm-srgb', 16, true, false],
+    [DXGI_FORMAT.BC4_UNORM, 'bc4-r-unorm', 8, false, false],
+    [DXGI_FORMAT.BC4_SNORM, 'bc4-r-snorm', 8, false, false],
+    [DXGI_FORMAT.BC5_UNORM, 'bc5-rg-unorm', 16, false, false],
+    [DXGI_FORMAT.BC5_SNORM, 'bc5-rg-snorm', 16, false, false],
+    [DXGI_FORMAT.BC6H_UF16, 'bc6h-rgb-ufloat', 16, false, true],
+    [DXGI_FORMAT.BC6H_SF16, 'bc6h-rgb-float', 16, false, true],
+    [DXGI_FORMAT.BC7_UNORM, 'bc7-rgba-unorm', 16, false, false],
+    [DXGI_FORMAT.BC7_UNORM_SRGB, 'bc7-rgba-unorm-srgb', 16, true, false],
+  ];
+
+  for (const [code, webgpuFormat, bytesPerBlock, isSrgb, isHdr] of bcMetaCases) {
+    const desc = mapDxgiFormatToWebGpu(code, withAll);
+    assert.equal(desc.webgpuFormat, webgpuFormat);
+    assert.equal(desc.blockWidth, 4);
+    assert.equal(desc.blockHeight, 4);
+    assert.equal(desc.bytesPerBlock, bytesPerBlock);
+    assert.equal(desc.aspect, 'all');
+    assert.equal(desc.isCompressed, true);
+    assert.equal(desc.isDepth, false);
+    assert.equal(desc.hasStencil, false);
+    assert.equal(desc.isSrgb, isSrgb);
+    assert.equal(desc.isHdr, isHdr);
+    assert.equal(desc.requiresFeature, TEXTURE_COMPRESSION_BC_FEATURE);
+    assert.equal(WEBGPU_FORMAT_INFO[webgpuFormat].requiresFeature, TEXTURE_COMPRESSION_BC_FEATURE);
+    assert.equal(WEBGPU_FORMAT_INFO[webgpuFormat].isHdr, isHdr);
+  }
+
+  // Depth & depth/stencil metadata (aspect, hasStencil, required feature & fallback)
+  const depthCases = [
+    [DXGI_FORMAT.D32_FLOAT, 'depth32float', 4, 'depth-only', false, null],
+    [DXGI_FORMAT.D16_UNORM, 'depth16unorm', 2, 'depth-only', false, null],
+    [DXGI_FORMAT.D24_UNORM_S8_UINT, 'depth24plus-stencil8', 4, 'all', true, null],
+    [DXGI_FORMAT.D32_FLOAT_S8X24_UINT, 'depth32float-stencil8', 8, 'all', true, DEPTH32FLOAT_STENCIL8_FEATURE],
+    [DXGI_FORMAT.R32_FLOAT_X8X24_TYPELESS, 'depth32float-stencil8', 8, 'depth-only', true, DEPTH32FLOAT_STENCIL8_FEATURE],
+    [DXGI_FORMAT.X32_TYPELESS_G8X24_UINT, 'depth32float-stencil8', 8, 'stencil-only', true, DEPTH32FLOAT_STENCIL8_FEATURE],
+    [DXGI_FORMAT.R24_UNORM_X8_TYPELESS, 'depth24plus-stencil8', 4, 'depth-only', true, null],
+    [DXGI_FORMAT.X24_TYPELESS_G8_UINT, 'depth24plus-stencil8', 4, 'stencil-only', true, null],
+  ];
+
+  for (const [code, webgpuFormat, bytesPerBlock, aspect, hasStencil, reqFeature] of depthCases) {
+    const desc = mapDxgiFormatToWebGpu(code, withAll);
+    assert.equal(desc.webgpuFormat, webgpuFormat);
+    assert.equal(desc.bytesPerBlock, bytesPerBlock);
+    assert.equal(desc.aspect, aspect);
+    assert.equal(desc.isDepth, true);
+    assert.equal(desc.hasStencil, hasStencil);
+    assert.equal(desc.isSrgb, false);
+    assert.equal(desc.requiresFeature, reqFeature);
+  }
+
+  // D32_FLOAT_S8X24_UINT falls back cleanly to depth24plus-stencil8 when feature is absent
+  const d32s8Fallback = mapDxgiFormatToWebGpu(DXGI_FORMAT.D32_FLOAT_S8X24_UINT, new Set());
+  assert.equal(d32s8Fallback.webgpuFormat, 'depth24plus-stencil8');
+  assert.equal(d32s8Fallback.nativeWebgpuFormat, 'depth32float-stencil8');
+  assert.equal(d32s8Fallback.aspect, 'all');
+  assert.equal(d32s8Fallback.hasStencil, true);
+  assert.equal(d32s8Fallback.requiresFeature, DEPTH32FLOAT_STENCIL8_FEATURE);
+
+  // WEBGPU_FORMAT_INFO depth/stencil aspects
+  assert.equal(getWebGpuFormatInfo('depth32float').aspect, 'depth-only');
+  assert.equal(getWebGpuFormatInfo('depth16unorm').aspect, 'depth-only');
+  assert.equal(getWebGpuFormatInfo('depth24plus-stencil8').aspect, 'all');
+  assert.equal(getWebGpuFormatInfo('depth32float-stencil8').aspect, 'all');
+  assert.equal(getWebGpuFormatInfo('stencil8').aspect, 'stencil-only');
+});
+
+test('W301 computeMipLayout and computeMipByteSize handle BC 4x4 rounding, 256B alignment, out reuse, and degenerate dims safely', () => {
+  // BC7 256x128 mip 0: 64x32 blocks, 64*16 = 1024B/row (exact 256B multiple)
+  const bc7M0 = computeMipLayout(DXGI_FORMAT.BC7_UNORM_SRGB, 256, 128, 0);
+  assert.deepEqual(bc7M0, {
+    width: 256,
+    height: 128,
+    mipLevel: 0,
+    copyWidth: 256,
+    copyHeight: 128,
+    blocksX: 64,
+    blocksY: 32,
+    blockWidth: 4,
+    blockHeight: 4,
+    bytesPerBlock: 16,
+    unalignedBytesPerRow: 1024,
+    bytesPerRow: 1024,
+    rowsPerImage: 32,
+    tightBytes: 1024 * 32,
+    totalBytes: 1024 * 32,
+    byteSize: 1024 * 32,
+  });
+  assert.equal(computeMipByteSize(DXGI_FORMAT.BC7_UNORM_SRGB, 256, 128, 0), 1024 * 32);
+
+  // BC7 tail mip 7 on 256x128 -> 2x1 pixels -> rounded to 1x1 block (4x4 copy extent), 16B -> 256B/row
+  const bc7Tail = computeMipLayout('bc7-rgba-unorm-srgb', 256, 128, 7);
+  assert.equal(bc7Tail.width, 2);
+  assert.equal(bc7Tail.height, 1);
+  assert.equal(bc7Tail.copyWidth, 4);
+  assert.equal(bc7Tail.copyHeight, 4);
+  assert.equal(bc7Tail.blocksX, 1);
+  assert.equal(bc7Tail.blocksY, 1);
+  assert.equal(bc7Tail.unalignedBytesPerRow, 16);
+  assert.equal(bc7Tail.bytesPerRow, 256);
+  assert.equal(bc7Tail.tightBytes, 16);
+  assert.equal(bc7Tail.totalBytes, 256);
+  assert.equal(computeMipByteSize('bc7-rgba-unorm-srgb', 256, 128, 7), 256);
+  assert.equal(computeMipByteSize('bc7-rgba-unorm-srgb', 256, 128, 7, 1, false), 16);
+
+  // BC1 non-multiple-of-4 mip: 40x24 mip 2 -> 10x6 -> 3x2 blocks (12x8 copy), 24B -> 256B/row, 512B total
+  const bc1M2 = computeMipLayout(DXGI_FORMAT.BC1_UNORM, 40, 24, 2);
+  assert.equal(bc1M2.width, 10);
+  assert.equal(bc1M2.height, 6);
+  assert.equal(bc1M2.copyWidth, 12);
+  assert.equal(bc1M2.copyHeight, 8);
+  assert.equal(bc1M2.blocksX, 3);
+  assert.equal(bc1M2.blocksY, 2);
+  assert.equal(bc1M2.unalignedBytesPerRow, 24);
+  assert.equal(bc1M2.bytesPerRow, 256);
+  assert.equal(bc1M2.totalBytes, 512);
+  assert.equal(computeMipByteSize(DXGI_FORMAT.BC1_UNORM, 40, 24, 2, 6), 512 * 6);
+
+  // HDR10 / FP16 render targets via shorthand alias and DXGI id
+  const hdrM1 = computeMipLayout('RGBA16_FLOAT', 1920, 1080, 1);
+  assert.equal(hdrM1.width, 960);
+  assert.equal(hdrM1.height, 540);
+  assert.equal(hdrM1.unalignedBytesPerRow, 960 * 8);
+  assert.equal(hdrM1.bytesPerRow, 7680); // 7680 % 256 === 0
+  assert.equal(hdrM1.totalBytes, 7680 * 540);
+
+  // Large mipLevel (32, Infinity) clamps cleanly to 1x1 without 32-bit shift wraparound
+  const hugeMip = computeMipLayout(DXGI_FORMAT.R10G10B10A2_UNORM, 1024, 1024, 32);
+  assert.equal(hugeMip.width, 1);
+  assert.equal(hugeMip.height, 1);
+  assert.equal(hugeMip.bytesPerRow, 256);
+  assert.equal(hugeMip.totalBytes, 256);
+
+  // Zero-alloc reusable `out` object returns same reference and overwrites cleanly
+  const scratch = {};
+  const r1 = computeMipLayout(DXGI_FORMAT.BC6H_UF16, 64, 64, 0, scratch);
+  assert.equal(r1, scratch);
+  assert.equal(scratch.width, 64);
+  assert.equal(scratch.bytesPerRow, 256);
+  assert.equal(scratch.totalBytes, 256 * 16);
+
+  const r2 = computeMipLayout(DXGI_FORMAT.BC6H_UF16, 64, 64, 4, scratch);
+  assert.equal(r2, scratch);
+  assert.equal(scratch.width, 4);
+  assert.equal(scratch.blocksX, 1);
+  assert.equal(scratch.totalBytes, 256);
+
+  // Degenerate 0 / negative / NaN / Infinity / invalid format NEVER throw and return zeroed layout
+  const degenerateCases = [
+    [DXGI_FORMAT.BC7_UNORM, 0, 64, 0],
+    [DXGI_FORMAT.BC7_UNORM, 64, 0, 0],
+    [DXGI_FORMAT.BC7_UNORM, NaN, 64, 0],
+    [DXGI_FORMAT.BC7_UNORM, 64, NaN, 0],
+    [DXGI_FORMAT.BC7_UNORM, -16, 64, 0],
+    [DXGI_FORMAT.BC7_UNORM, Infinity, 64, 0],
+    [DXGI_FORMAT.R8G8B8A8_UNORM, undefined, null, NaN],
+    [DXGI_FORMAT.UNKNOWN, 64, 64, 0],
+    ['not-a-format', 64, 64, 0],
+    [null, 64, 64, 0],
+  ];
+
+  const firstZero = computeMipLayout(DXGI_FORMAT.BC7_UNORM, 0, 0, 0);
+  assert.equal(Object.isFrozen(firstZero), true);
+  for (const [fmt, w, h, mip] of degenerateCases) {
+    const res = computeMipLayout(fmt, w, h, mip);
+    assert.equal(res, firstZero, `degenerate (${String(fmt)}, ${w}, ${h}) reuses frozen zero singleton`);
+    assert.equal(res.width, 0);
+    assert.equal(res.height, 0);
+    assert.equal(res.bytesPerRow, 0);
+    assert.equal(res.totalBytes, 0);
+    assert.equal(res.byteSize, 0);
+    assert.equal(computeMipByteSize(fmt, w, h, mip), 0);
+
+    // Passing `out` zeroes `out` in-place (no stale data retained)
+    const outRes = computeMipLayout(fmt, w, h, mip, scratch);
+    assert.equal(outRes, scratch);
+    assert.equal(scratch.width, 0);
+    assert.equal(scratch.height, 0);
+    assert.equal(scratch.bytesPerRow, 0);
+    assert.equal(scratch.totalBytes, 0);
+  }
+
+  // Degenerate mipLevel (negative / NaN) safely clamps to mip 0 without throwing
+  const negMip = computeMipLayout(DXGI_FORMAT.R8G8B8A8_UNORM, 64, 32, -3);
+  assert.equal(negMip.mipLevel, 0);
+  assert.equal(negMip.width, 64);
+  assert.equal(negMip.height, 32);
+  assert.equal(negMip.bytesPerRow, 256);
+  const nanMip = computeMipLayout(DXGI_FORMAT.R8G8B8A8_UNORM, 64, 32, NaN);
+  assert.equal(nanMip.mipLevel, 0);
+  assert.equal(nanMip.width, 64);
 });
