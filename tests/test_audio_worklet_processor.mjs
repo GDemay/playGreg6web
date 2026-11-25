@@ -19,6 +19,13 @@ const {
   DEFAULT_FADE_IN_FRAMES,
   MAX_DECLICK_FRAMES,
   DEFAULT_SAMPLE_CLAMP_LIMIT,
+  DEFAULT_MAX_BUFFERED_FRAMES,
+  DEFAULT_HIGH_WATERMARK_FRAMES,
+  DEFAULT_TARGET_WATERMARK_FRAMES,
+  DEFAULT_TRIM_CROSSFADE_FRAMES,
+  MAX_TRIM_CROSSFADE_FRAMES,
+  DEFAULT_STATS_INTERVAL_QUANTA,
+  clampFillRatio,
   HDR_WRITE_CURSOR,
   HDR_READ_CURSOR,
   HDR_CAPACITY_FRAMES,
@@ -1004,14 +1011,29 @@ test('W227 process() performs strictly zero heap allocations across 256 quanta o
     Uint8Array: trackCtor(Uint8Array),
     ArrayBuffer: trackCtor(ArrayBuffer),
     SharedArrayBuffer: trackCtor(SharedArrayBuffer),
-    Object: Object.assign(trackCtor(Object), {
-      assign(...args) {
+    Object: new Proxy(Object, {
+      construct(target, args, newTarget) {
         if (trackingAllocations) allocationCount++;
-        return Object.assign(...args);
+        return Reflect.construct(target, args, newTarget);
       },
-      create(...args) {
+      apply(target, thisArg, args) {
         if (trackingAllocations) allocationCount++;
-        return Object.create(...args);
+        return Reflect.apply(target, thisArg, args);
+      },
+      get(target, prop, receiver) {
+        if (prop === 'assign') {
+          return (...args) => {
+            if (trackingAllocations) allocationCount++;
+            return Reflect.apply(target.assign, target, args);
+          };
+        }
+        if (prop === 'create') {
+          return (...args) => {
+            if (trackingAllocations) allocationCount++;
+            return Reflect.apply(target.create, target, args);
+          };
+        }
+        return Reflect.get(target, prop, receiver);
       },
     }),
     Atomics: trackedAtomics,
@@ -1119,4 +1141,651 @@ test('W227 defends against corrupted SAB cursors and degenerate output arrays wi
   assert.equal(processor.process([], [[]]), true);
   assert.equal(processor.process([], [[null]]), true);
   assert.equal(processor.process([], [[new Float32Array(0)]]), true);
+});
+
+// ---------------------------------------------------------------------------
+// W327: Lock-Free Watermark Telemetry, Overrun Drift Guard & Zero-Click Splice
+// ---------------------------------------------------------------------------
+
+test('W327 exports watermark constants, clampFillRatio, and control messages with safe defaults', () => {
+  assert.equal(DEFAULT_MAX_BUFFERED_FRAMES, 0);
+  assert.equal(DEFAULT_HIGH_WATERMARK_FRAMES, 4800);
+  assert.equal(DEFAULT_TARGET_WATERMARK_FRAMES, 1440);
+  assert.equal(DEFAULT_TRIM_CROSSFADE_FRAMES, 32);
+  assert.equal(MAX_TRIM_CROSSFADE_FRAMES, 512);
+  assert.equal(DEFAULT_STATS_INTERVAL_QUANTA, 0);
+  assert.equal(typeof clampFillRatio, 'function');
+  assert.equal(globalThis.PlayGta6AudioWorklet.clampFillRatio, clampFillRatio);
+  assert.equal(
+    globalThis.PlayGta6AudioWorklet.DEFAULT_HIGH_WATERMARK_FRAMES,
+    DEFAULT_HIGH_WATERMARK_FRAMES
+  );
+  assert.equal(
+    globalThis.PlayGta6AudioWorklet.DEFAULT_TRIM_CROSSFADE_FRAMES,
+    DEFAULT_TRIM_CROSSFADE_FRAMES
+  );
+
+  // clampFillRatio strictly clamps to finite [0, 1].
+  assert.equal(clampFillRatio(0), 0.0);
+  assert.equal(Object.is(clampFillRatio(-0), 0), true);
+  assert.equal(clampFillRatio(-0.25), 0.0);
+  assert.equal(clampFillRatio(0.42), 0.42);
+  assert.equal(clampFillRatio(1.0), 1.0);
+  assert.equal(clampFillRatio(2.75), 1.0);
+  assert.equal(clampFillRatio(Number.NaN), 0.0);
+  assert.equal(clampFillRatio(Number.POSITIVE_INFINITY), 0.0);
+  assert.equal(clampFillRatio(Number.NEGATIVE_INFINITY), 0.0);
+  assert.equal(clampFillRatio(undefined), 0.0);
+  assert.equal(clampFillRatio('0.5'), 0.0);
+
+  // Default processor keeps overrun guard & periodic stats disabled for backward compatibility.
+  const ring = AudioRingBuffer.create(512, 2);
+  const proc = new PlayGta6AudioWorkletProcessor({ processorOptions: { sab: ring.sab } });
+  assert.equal(proc.maxBufferedFrames, 0);
+  assert.equal(proc.targetWatermarkFrames, 0);
+  assert.equal(proc.trimCrossfadeFrames, DEFAULT_TRIM_CROSSFADE_FRAMES);
+  assert.equal(proc.statsIntervalQuanta, 0);
+  assert.equal(proc.fillRatio, 0.0);
+  assert.equal(proc.peakFillRatio, 0.0);
+  assert.equal(proc.overrunTrimmedFrames, 0);
+  assert.equal(proc.overrunTrimCount, 0);
+  assert.equal(proc.underrunQuanta, 0);
+  assert.equal(proc.quantaProcessed, 0);
+
+  // overrunGuard: true enables 48 kHz defaults (4800 high / 1440 target).
+  const guarded = new PlayGta6AudioWorkletProcessor({
+    processorOptions: { sab: ring.sab, overrunGuard: true },
+  });
+  assert.equal(guarded.maxBufferedFrames, DEFAULT_HIGH_WATERMARK_FRAMES);
+  assert.equal(guarded.targetWatermarkFrames, DEFAULT_TARGET_WATERMARK_FRAMES);
+
+  // Control messages configure watermark guard & stats interval and guard invalid values.
+  const replies = attachMessageRecorder(proc);
+  proc.port.onmessage({
+    data: {
+      type: 'setWatermarkConfig',
+      maxBufferedFrames: 384,
+      targetWatermarkFrames: 256,
+      trimCrossfadeFrames: 48,
+      id: 'wm-1',
+    },
+  });
+  assert.deepEqual(replies[replies.length - 1], {
+    type: 'watermarkConfig',
+    maxBufferedFrames: 384,
+    targetWatermarkFrames: 256,
+    trimCrossfadeFrames: 48,
+    id: 'wm-1',
+  });
+  assert.equal(proc.maxBufferedFrames, 384);
+  assert.equal(proc.targetWatermarkFrames, 256);
+  assert.equal(proc.trimCrossfadeFrames, 48);
+
+  // Target watermark clamps to maxBufferedFrames and ignores NaN/negative inputs.
+  assert.equal(proc.setTargetWatermarkFrames(9999), 384);
+  assert.equal(proc.setTargetWatermarkFrames(-10), 384);
+  assert.equal(proc.setTargetWatermarkFrames(null), 192); // auto half-of-max
+  assert.equal(proc.setTrimCrossfadeFrames(9999), MAX_TRIM_CROSSFADE_FRAMES);
+  assert.equal(proc.setTrimCrossfadeFrames(-5), MAX_TRIM_CROSSFADE_FRAMES);
+  assert.equal(proc.setTrimCrossfadeFrames(Number.NaN), MAX_TRIM_CROSSFADE_FRAMES);
+  assert.equal(proc.setMaxBufferedFrames(-100), 384);
+  assert.equal(proc.setMaxBufferedFrames(Number.NaN), 384);
+
+  proc.port.onmessage({
+    data: { type: 'setStatsInterval', statsIntervalQuanta: 16, id: 'si-1' },
+  });
+  assert.deepEqual(replies[replies.length - 1], {
+    type: 'statsInterval',
+    statsIntervalQuanta: 16,
+    id: 'si-1',
+  });
+  assert.equal(proc.statsIntervalQuanta, 16);
+  assert.equal(proc.setStatsIntervalQuanta(0), 0);
+});
+
+test('W327 overrun drift guard trims excess buffered frames to target watermark and bounds latency across bursts', () => {
+  const ring = AudioRingBuffer.create(2048, 2);
+  const processor = new PlayGta6AudioWorkletProcessor({
+    processorOptions: {
+      sab: ring.sab,
+      maxBufferedFrames: 512,
+      targetWatermarkFrames: 256,
+      trimCrossfadeFrames: 0, // isolate exact read-cursor jump in this test
+    },
+  });
+
+  // Push 1024 sequentially tagged stereo frames: frame i -> (i / 2048, -i / 2048).
+  const burst = new Float32Array(1024 * 2);
+  for (let f = 0; f < 1024; f++) {
+    burst[f * 2] = f / 2048;
+    burst[f * 2 + 1] = -f / 2048;
+  }
+  assert.equal(ring.pushSamples(burst), 1024);
+  assert.equal(processor.fillRatio, 0.5);
+
+  // Used (1024) > maxBufferedFrames (512) -> trims 1024 - 256 = 768 frames, then plays 128 frames
+  // starting at frame 768, leaving 128 frames buffered and 0 underruns.
+  const out = makePlanarOutput(2, 128);
+  assert.equal(processor.process([], out), true);
+  assert.equal(processor.overrunTrimmedFrames, 768);
+  assert.equal(processor.overrunTrimCount, 1);
+  assert.equal(processor.underrunQuanta, 0);
+  assert.equal(processor.quantaProcessed, 1);
+  assert.equal(ring.availableFrames(), 128);
+  assert.equal(processor.fillRatio, 128 / 2048);
+  assert.equal(processor.peakFillRatio, 1024 / 2048);
+
+  // Verify exact post-trim frame indices [768 .. 895].
+  for (let f = 0; f < 128; f++) {
+    const expected = Math.fround((768 + f) / 2048);
+    assert.equal(out[0][0][f], expected);
+    assert.equal(out[0][1][f], -expected);
+  }
+
+  // Sustained burst stress (simulating producer running ahead of 30 FPS video across wrap-around):
+  // latency must remain strictly bounded <= maxBufferedFrames after every quantum with 0 underruns.
+  const chunk384 = makeConstantStereo(384, 0.25, -0.25);
+  for (let i = 0; i < 30; i++) {
+    ring.pushSamples(chunk384);
+    assert.equal(processor.process([], out), true);
+    assert.ok(
+      ring.availableFrames() <= 512,
+      `Buffered frames (${ring.availableFrames()}) drifted above ceiling at step ${i}`
+    );
+  }
+  assert.equal(processor.underrunQuanta, 0);
+  assert.ok(processor.overrunTrimmedFrames > 768);
+  assert.ok(processor.overrunTrimCount > 1);
+
+  // Even when targetWatermarkFrames < quantumFrames, guard keeps at least 1 full quantum so
+  // trimming never self-inflicts an artificial underrun.
+  const smallTargetRing = AudioRingBuffer.create(1024, 2);
+  const smallTargetProc = new PlayGta6AudioWorkletProcessor({
+    processorOptions: {
+      sab: smallTargetRing.sab,
+      maxBufferedFrames: 256,
+      targetWatermarkFrames: 32, // < 128-frame quantum
+      trimCrossfadeFrames: 0,
+    },
+  });
+  assert.equal(smallTargetRing.pushSamples(makeConstantStereo(400, 0.5, -0.5)), 400);
+  const outSmall = makePlanarOutput(2, 128);
+  assert.equal(smallTargetProc.process([], outSmall), true);
+  assert.equal(smallTargetProc.overrunTrimmedFrames, 400 - 128);
+  assert.equal(smallTargetProc.underrunQuanta, 0);
+  assert.equal(smallTargetRing.availableFrames(), 0);
+  assert.equal(outSmall[0][0][127], 0.5);
+});
+
+test('W327 overrun trim applies zero-click half-cosine crossfade across stereo, mono, 4ch, wrap-around, and NaN/peak old-head inputs', () => {
+  const xfadeFrames = 32;
+  const ampL = Math.fround(0.8);
+  const ampR = Math.fround(-0.6);
+
+  // 1. Stereo polarity reversal (+0.8/-0.6 -> -0.8/+0.6) across an overrun trim boundary.
+  const ring = AudioRingBuffer.create(1024, 2);
+  const processor = new PlayGta6AudioWorkletProcessor({
+    processorOptions: {
+      sab: ring.sab,
+      maxBufferedFrames: 384,
+      targetWatermarkFrames: 256,
+      trimCrossfadeFrames: xfadeFrames,
+    },
+  });
+
+  // Quantum 1: normal steady-state playback at (+0.8, -0.6).
+  assert.equal(ring.pushSamples(makeConstantStereo(128, ampL, ampR)), 128);
+  const q1 = makePlanarOutput(2, 128);
+  assert.equal(processor.process([], q1), true);
+  assert.equal(q1[0][0][127], ampL);
+  assert.equal(q1[0][1][127], ampR);
+  assert.equal(processor.overrunTrimmedFrames, 0);
+
+  // Producer burst: 256 frames of old polarity (+0.8, -0.6) followed by 256 frames of inverted polarity (-0.8, +0.6).
+  // Total = 512 > maxBufferedFrames (384) -> trims 256 frames so new read head lands on (-0.8, +0.6).
+  assert.equal(ring.pushSamples(makeConstantStereo(256, ampL, ampR)), 256);
+  assert.equal(ring.pushSamples(makeConstantStereo(256, -ampL, -ampR)), 256);
+
+  const q2 = makePlanarOutput(2, 128);
+  assert.equal(processor.process([], q2), true);
+  assert.equal(processor.overrunTrimmedFrames, 256);
+  assert.equal(processor.overrunTrimCount, 1);
+
+  const [outL, outR] = q2[0];
+  // Zero discontinuity at quantum boundary (Q1[127] -> Q2[0]).
+  assert.equal(outL[0], ampL);
+  assert.equal(outR[0], ampR);
+  // Exact 50/50 midpoint at f = xfadeFrames / 2 = 16 -> 0.0.
+  assert.ok(Math.abs(outL[16]) < 1e-5, `Expected midpoint ~0.0, got ${outL[16]}`);
+  assert.ok(Math.abs(outR[16]) < 1e-5, `Expected midpoint ~0.0, got ${outR[16]}`);
+  // Post-crossfade frames match new stream bit-exact.
+  for (let f = xfadeFrames; f < 128; f++) {
+    assert.equal(outL[f], -ampL);
+    assert.equal(outR[f], -ampR);
+  }
+  // Every adjacent sample delta across the full quantum is bounded by half-cosine max slope.
+  const maxStepL = (Math.PI / (2 * xfadeFrames)) * Math.abs(2 * ampL) + 1e-4;
+  const maxStepR = (Math.PI / (2 * xfadeFrames)) * Math.abs(2 * ampR) + 1e-4;
+  for (let f = 1; f < 128; f++) {
+    const stepL = Math.abs(outL[f] - outL[f - 1]);
+    const stepR = Math.abs(outR[f] - outR[f - 1]);
+    assert.ok(stepL <= maxStepL, `L click at frame ${f}: step ${stepL} > ${maxStepL}`);
+    assert.ok(stepR <= maxStepR, `R click at frame ${f}: step ${stepR} > ${maxStepR}`);
+  }
+
+  // 2. Wrap-around overrun trim with NaN/Infinity and hot peaks (> 1.0) in discarded old head.
+  const wrapRing = AudioRingBuffer.create(512, 2);
+  const wrapProc = new PlayGta6AudioWorkletProcessor({
+    processorOptions: {
+      sab: wrapRing.sab,
+      maxBufferedFrames: 320,
+      targetWatermarkFrames: 192,
+      trimCrossfadeFrames: 32,
+      softLimit: true,
+    },
+  });
+  // Advance cursors cleanly near end of ring (slot 496) without trimming or underrunning
+  // to force ring wrap-around right inside the old-head crossfade!
+  const step124 = makeConstantStereo(124, 0.2, -0.2);
+  const drain124 = makePlanarOutput(2, 124);
+  for (let i = 0; i < 4; i++) {
+    assert.equal(wrapRing.pushSamples(step124), 124);
+    assert.equal(wrapProc.process([], drain124), true);
+  }
+  assert.equal(wrapProc.overrunTrimmedFrames, 0);
+  assert.equal(wrapProc.inUnderrun, false);
+
+  const dirtyOldHead = makeConstantStereo(200, 0.5, -0.5);
+  dirtyOldHead[0] = Number.NaN;
+  dirtyOldHead[1] = Number.POSITIVE_INFINITY;
+  dirtyOldHead[20 * 2] = 3.5; // wrapped slot, hot peak
+  dirtyOldHead[20 * 2 + 1] = -4.2;
+  assert.equal(pushRawSabFrames(wrapRing.sab, dirtyOldHead), 200);
+  assert.equal(pushRawSabFrames(wrapRing.sab, makeConstantStereo(200, -0.4, 0.4)), 200);
+
+  const wrapOut = makePlanarOutput(2, 128);
+  assert.equal(wrapProc.process([], wrapOut), true);
+  assert.ok(wrapProc.overrunTrimmedFrames > 0);
+  for (let f = 0; f < 128; f++) {
+    assert.ok(Number.isFinite(wrapOut[0][0][f]) && Math.abs(wrapOut[0][0][f]) <= 1.0);
+    assert.ok(Number.isFinite(wrapOut[0][1][f]) && Math.abs(wrapOut[0][1][f]) <= 1.0);
+  }
+  // Frame 0 had NaN/Inf in old head -> sanitized to 0.0 (alpha=0 -> output[0] === 0.0).
+  assert.equal(wrapOut[0][0][0], 0.0);
+  assert.equal(wrapOut[0][1][0], 0.0);
+
+  // 3. Mono-to-stereo & 4-channel trim crossfades stay finite and smooth.
+  const monoRing = AudioRingBuffer.create(512, 1);
+  const monoProc = new PlayGta6AudioWorkletProcessor({
+    processorOptions: {
+      sab: monoRing.sab,
+      maxBufferedFrames: 256,
+      targetWatermarkFrames: 128,
+      trimCrossfadeFrames: 16,
+    },
+  });
+  const monoBurst = new Float32Array(384);
+  monoBurst.fill(0.6, 0, 256);
+  monoBurst.fill(-0.6, 256, 384);
+  assert.equal(monoRing.pushSamples(monoBurst), 384);
+  const monoOut = makePlanarOutput(2, 128);
+  assert.equal(monoProc.process([], monoOut), true);
+  assert.equal(monoProc.overrunTrimmedFrames, 256);
+  assert.equal(monoOut[0][0][0], Math.fround(0.6));
+  assert.equal(monoOut[0][1][0], Math.fround(0.6));
+  assert.ok(Math.abs(monoOut[0][0][8]) < 1e-5);
+  assert.equal(monoOut[0][0][16], Math.fround(-0.6));
+  assert.equal(monoOut[0][1][16], Math.fround(-0.6));
+
+  const ring4 = AudioRingBuffer.create(512, 4);
+  const proc4 = new PlayGta6AudioWorkletProcessor({
+    processorOptions: {
+      sab: ring4.sab,
+      maxBufferedFrames: 256,
+      targetWatermarkFrames: 128,
+      trimCrossfadeFrames: 16,
+    },
+  });
+  const burst4 = new Float32Array(384 * 4);
+  burst4.fill(0.5, 0, 256 * 4);
+  burst4.fill(-0.5, 256 * 4, 384 * 4);
+  assert.equal(ring4.pushSamples(burst4), 384);
+  const out4 = makePlanarOutput(4, 128);
+  assert.equal(proc4.process([], out4), true);
+  assert.equal(proc4.overrunTrimmedFrames, 256);
+  for (let c = 0; c < 4; c++) {
+    assert.equal(out4[0][c][0], 0.5);
+    assert.ok(Math.abs(out4[0][c][8]) < 1e-5);
+    assert.equal(out4[0][c][16], -0.5);
+  }
+});
+
+test('W327 fillRatio clamping [0, 1], peakFillRatio tracking, and periodic port stats telemetry', () => {
+  // Detached processor reports exact 0.0 fillRatio and peakFillRatio.
+  const detached = new PlayGta6AudioWorkletProcessor();
+  assert.equal(detached.fillRatio, 0.0);
+  assert.equal(detached.peakFillRatio, 0.0);
+  assert.equal(detached.getStats().fillRatio, 0.0);
+  assert.equal(detached.getStats().peakFillRatio, 0.0);
+
+  const ring = AudioRingBuffer.create(512, 2);
+  const processor = new PlayGta6AudioWorkletProcessor({
+    processorOptions: {
+      sab: ring.sab,
+      maxBufferedFrames: 384,
+      targetWatermarkFrames: 256,
+      statsIntervalQuanta: 2,
+    },
+  });
+
+  // Snapshot each posted message (mimicking MessagePort structured clone) while also verifying
+  // periodic port stats reuse the same pre-allocated payload object (zero-alloc!).
+  const postedRefs = [];
+  const snapshots = [];
+  processor.port.postMessage = (msg) => {
+    postedRefs.push(msg);
+    snapshots.push({ ...msg });
+  };
+
+  // Push 512 frames (100% full) -> fillRatio === 1.0.
+  assert.equal(ring.pushSamples(makeConstantStereo(512, 0.4, -0.4)), 512);
+  assert.equal(processor.fillRatio, 1.0);
+
+  // Quantum 1: trims 256, consumes 128 -> remaining 128 (0.25), peakFillRatio = 1.0, no periodic stats yet.
+  const out = makePlanarOutput(2, 128);
+  assert.equal(processor.process([], out), true);
+  assert.equal(snapshots.length, 0);
+  assert.equal(processor.fillRatio, 0.25);
+  assert.equal(processor.peakFillRatio, 1.0);
+
+  // Quantum 2: consumes remaining 128 -> remaining 0 (0.0), periodic stats fires!
+  assert.equal(processor.process([], out), true);
+  assert.equal(snapshots.length, 1);
+  assert.equal(snapshots[0].type, 'stats');
+  assert.equal(snapshots[0].periodic, true);
+  assert.equal(snapshots[0].quantaProcessed, 2);
+  assert.equal(snapshots[0].processedQuanta, 2);
+  assert.equal(snapshots[0].overrunTrimmedFrames, 256);
+  assert.equal(snapshots[0].underrunQuanta, 0);
+  assert.equal(snapshots[0].fillRatio, 0.0);
+  assert.equal(snapshots[0].peakFillRatio, 1.0);
+
+  // Quanta 3 & 4: empty underruns -> second periodic stats fires with underrunQuanta === 2.
+  assert.equal(processor.process([], out), true);
+  assert.equal(processor.process([], out), true);
+  assert.equal(snapshots.length, 2);
+  assert.equal(postedRefs[0], postedRefs[1], 'Periodic stats must reuse pre-allocated payload object');
+  assert.equal(snapshots[1].quantaProcessed, 4);
+  assert.equal(snapshots[1].underrunQuanta, 2);
+  assert.equal(snapshots[1].fillRatio, 0.0);
+  assert.equal(snapshots[1].peakFillRatio, 1.0);
+
+  // Corrupted SAB cursors still clamp fillRatio strictly to [0, 1].
+  const ctrl = new Int32Array(ring.sab, 0, RING_HEADER_INT32_COUNT);
+  Atomics.store(ctrl, HDR_READ_CURSOR, -9999);
+  Atomics.store(ctrl, HDR_WRITE_CURSOR, 999999);
+  const corruptStats = processor.getStats();
+  assert.ok(Number.isFinite(corruptStats.fillRatio));
+  assert.ok(corruptStats.fillRatio >= 0.0 && corruptStats.fillRatio <= 1.0);
+  assert.ok(corruptStats.peakFillRatio >= 0.0 && corruptStats.peakFillRatio <= 1.0);
+});
+
+test('W327 preserves W272 cosine underrun/recovery fade ramps and soft-limiter alongside overrun drift guard and resetStats()', () => {
+  const ring = AudioRingBuffer.create(1024, 2);
+  const processor = new PlayGta6AudioWorkletProcessor({
+    processorOptions: {
+      sab: ring.sab,
+      cosineRamp: true,
+      softLimit: true,
+      maxBufferedFrames: 512,
+      targetWatermarkFrames: 256,
+      trimCrossfadeFrames: 32,
+      statsIntervalQuanta: 4,
+    },
+  });
+
+  // 1. Overrun burst with NaN/Inf and hot >0.9 peaks -> trims 384 frames with crossfade + soft-limit.
+  const burst = makeConstantStereo(640, 0.8, -0.6);
+  burst[384 * 2] = Number.NaN;
+  burst[384 * 2 + 1] = 2.2;
+  burst[(384 + 40) * 2] = 2.5;
+  burst[(384 + 40) * 2 + 1] = Number.NEGATIVE_INFINITY;
+  assert.equal(pushRawSabFrames(ring.sab, burst), 640);
+
+  const q1 = makePlanarOutput(2, 128);
+  assert.equal(processor.process([], q1), true);
+  assert.equal(processor.overrunTrimmedFrames, 384);
+  assert.equal(processor.overrunTrimCount, 1);
+  assert.ok(q1[0][0][40] > 0.9 && q1[0][0][40] <= 1.0);
+  assert.equal(q1[0][1][40], 0.0);
+  // Bit-exact linear passthrough for normal |x| <= 0.9 after crossfade region.
+  assert.equal(q1[0][0][60], Math.fround(0.8));
+  assert.equal(q1[0][1][60], Math.fround(-0.6));
+  assert.equal(processor.nonFiniteSanitized, 2);
+  assert.equal(processor.softClippedSamples, 2);
+
+  // Drain remaining 128 frames cleanly (no trim, no underrun).
+  const q2 = makePlanarOutput(2, 128);
+  assert.equal(processor.process([], q2), true);
+  assert.equal(ring.availableFrames(), 0);
+  assert.equal(q2[0][0][127], Math.fround(0.8));
+
+  // 2. Sudden underrun -> W272 64-frame half-cosine fade-out preserved bit-exact.
+  const q3 = makePlanarOutput(2, 128, 9.0);
+  assert.equal(processor.process([], q3), true);
+  const expectedCosFirst = 0.5 * (1.0 + Math.cos(Math.PI / 64));
+  const expectedCosMid = 0.5 * (1.0 + Math.cos((32 * Math.PI) / 64));
+  assert.ok(Math.abs(q3[0][0][0] - Math.fround(0.8) * expectedCosFirst) < 1e-5);
+  assert.ok(Math.abs(q3[0][0][31] - Math.fround(0.8) * expectedCosMid) < 1e-5);
+  assert.equal(q3[0][0][63], 0.0);
+  assert.equal(q3[0][1][63], 0.0);
+  assert.equal(processor.underrunFadeOuts, 1);
+  assert.equal(processor.underrunQuanta, 1);
+
+  // 3. Recovery -> W272 64-frame half-cosine fade-in preserved bit-exact.
+  assert.equal(ring.pushSamples(makeConstantStereo(128, 0.7, -0.5)), 128);
+  const q4 = makePlanarOutput(2, 128);
+  assert.equal(processor.process([], q4), true);
+  assert.equal(q4[0][0][0], 0.0);
+  assert.equal(q4[0][1][0], 0.0);
+  assert.ok(Math.abs(q4[0][0][32] - Math.fround(0.7) * 0.5) < 1e-5);
+  assert.equal(q4[0][0][64], Math.fround(0.7));
+  assert.equal(q4[0][1][64], Math.fround(-0.5));
+  assert.equal(processor.recoveryFadeIns, 1);
+  assert.equal(processor.quantaProcessed, 4);
+
+  // 4. resetStats() clears all telemetry counters while preserving config & attachment.
+  const replies = attachMessageRecorder(processor);
+  processor.port.onmessage({ data: { type: 'resetStats', id: 'rs-1' } });
+  assert.deepEqual(replies[replies.length - 1], { type: 'statsReset', id: 'rs-1' });
+
+  const afterReset = processor.getStats();
+  assert.equal(afterReset.attached, true);
+  assert.equal(afterReset.quantaProcessed, 0);
+  assert.equal(afterReset.processedQuanta, 0);
+  assert.equal(afterReset.processedFrames, 0);
+  assert.equal(afterReset.framesProcessed, 0);
+  assert.equal(afterReset.underruns, 0);
+  assert.equal(afterReset.underrunQuanta, 0);
+  assert.equal(afterReset.underrunFrames, 0);
+  assert.equal(afterReset.overrunTrimmedFrames, 0);
+  assert.equal(afterReset.overrunTrimCount, 0);
+  assert.equal(afterReset.peakFillRatio, 0.0);
+  assert.equal(afterReset.sanitizedSamples, 0);
+  assert.equal(afterReset.nonFiniteSanitized, 0);
+  assert.equal(afterReset.clampedSamples, 0);
+  assert.equal(afterReset.softClippedSamples, 0);
+  assert.equal(afterReset.fadeOutCount, 0);
+  assert.equal(afterReset.fadeInCount, 0);
+  // Config stays intact.
+  assert.equal(afterReset.fadeCurve, 'cosine');
+  assert.equal(afterReset.softLimit, true);
+  assert.equal(afterReset.maxBufferedFrames, 512);
+  assert.equal(afterReset.targetWatermarkFrames, 256);
+  assert.equal(afterReset.trimCrossfadeFrames, 32);
+  assert.equal(afterReset.statsIntervalQuanta, 4);
+
+  // Post-reset playback continues cleanly and tracks fresh stats from zero.
+  assert.equal(ring.pushSamples(makeConstantStereo(128, 0.3, -0.3)), 128);
+  const q5 = makePlanarOutput(2, 128);
+  assert.equal(processor.process([], q5), true);
+  assert.equal(q5[0][0][0], Math.fround(0.3));
+  assert.equal(processor.quantaProcessed, 1);
+  assert.equal(processor.framesProcessed, 128);
+  assert.equal(processor.peakFillRatio, 128 / 1024);
+});
+
+test('W327 process() performs strictly zero allocations and zero Atomics.wait with overrun trim, crossfade, W272 cosine/softLimit, and periodic stats active', () => {
+  const src = fs.readFileSync(
+    path.resolve(__dirname, '../web/workers/audio_worklet_processor.js'),
+    'utf8'
+  );
+
+  let allocationCount = 0;
+  let trackingAllocations = false;
+  let waitCalls = 0;
+  let periodicMessages = 0;
+
+  function trackCtor(RealCtor) {
+    return new Proxy(RealCtor, {
+      construct(target, args, newTarget) {
+        if (trackingAllocations) allocationCount++;
+        return Reflect.construct(target, args, newTarget);
+      },
+      apply(target, thisArg, args) {
+        if (trackingAllocations) allocationCount++;
+        return Reflect.apply(target, thisArg, args);
+      },
+    });
+  }
+
+  let RegisteredProcessor = null;
+  class MockBase {
+    constructor() {
+      this.port = {
+        onmessage: null,
+        postMessage(msg) {
+          if (msg && msg.type === 'stats' && msg.periodic) {
+            periodicMessages++;
+          }
+        },
+      };
+    }
+  }
+
+  const sandbox = {
+    AudioWorkletProcessor: MockBase,
+    registerProcessor(_name, ctor) {
+      RegisteredProcessor = ctor;
+    },
+    Array: trackCtor(Array),
+    Float32Array: trackCtor(Float32Array),
+    Int32Array: trackCtor(Int32Array),
+    Uint8Array: trackCtor(Uint8Array),
+    ArrayBuffer: trackCtor(ArrayBuffer),
+    SharedArrayBuffer: trackCtor(SharedArrayBuffer),
+    Object: new Proxy(Object, {
+      construct(target, args, newTarget) {
+        if (trackingAllocations) allocationCount++;
+        return Reflect.construct(target, args, newTarget);
+      },
+      apply(target, thisArg, args) {
+        if (trackingAllocations) allocationCount++;
+        return Reflect.apply(target, thisArg, args);
+      },
+      get(target, prop, receiver) {
+        if (prop === 'assign') {
+          return (...args) => {
+            if (trackingAllocations) allocationCount++;
+            return Reflect.apply(target.assign, target, args);
+          };
+        }
+        if (prop === 'create') {
+          return (...args) => {
+            if (trackingAllocations) allocationCount++;
+            return Reflect.apply(target.create, target, args);
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    }),
+    Atomics: {
+      load: Atomics.load,
+      store: Atomics.store,
+      add: Atomics.add,
+      wait() {
+        waitCalls++;
+        throw new Error('Atomics.wait must never be called on AudioWorklet thread');
+      },
+    },
+    Number,
+    Math,
+    Boolean,
+    String,
+    Error,
+    TypeError,
+    RangeError,
+  };
+  sandbox.globalThis = sandbox;
+  sandbox.self = sandbox;
+
+  vm.runInNewContext(src, sandbox, { filename: 'audio_worklet_processor.js' });
+  assert.equal(typeof RegisteredProcessor, 'function');
+
+  const ring = AudioRingBuffer.create(1024, 2);
+  const processor = new RegisteredProcessor({
+    processorOptions: {
+      sab: ring.sab,
+      cosineRamp: true,
+      softLimit: true,
+      smoothingFrames: 16,
+      maxBufferedFrames: 384,
+      targetWatermarkFrames: 256,
+      trimCrossfadeFrames: 32,
+      statsIntervalQuanta: 8,
+    },
+  });
+
+  const out = makePlanarOutput(2, 128);
+  const burstChunk = makeConstantStereo(512, 0.7, -0.7);
+  burstChunk[10] = Number.NaN;
+  burstChunk[11] = 2.4;
+  const normalChunk = makeConstantStereo(128, -0.5, 0.5);
+
+  const totalQuanta = 128;
+  for (let q = 0; q < totalQuanta; q++) {
+    if (q % 16 === 0) {
+      // Trigger overrun trim + crossfade.
+      pushRawSabFrames(ring.sab, burstChunk);
+    } else if (q % 16 === 9 || q % 16 === 10) {
+      // Let ring run dry to trigger W272 cosine fade-out & recovery fade-in.
+    } else {
+      pushRawSabFrames(ring.sab, normalChunk);
+    }
+
+    trackingAllocations = true;
+    const keepAlive = processor.process([], out);
+    trackingAllocations = false;
+
+    assert.equal(keepAlive, true);
+    for (let f = 0; f < 128; f++) {
+      const l = out[0][0][f];
+      const r = out[0][1][f];
+      assert.ok(Number.isFinite(l) && Math.abs(l) <= 1.0);
+      assert.ok(Number.isFinite(r) && Math.abs(r) <= 1.0);
+    }
+  }
+
+  const stats = processor.getStats();
+  assert.equal(allocationCount, 0, `Expected 0 allocations in process(), got ${allocationCount}`);
+  assert.equal(waitCalls, 0);
+  assert.equal(periodicMessages, totalQuanta / 8);
+  assert.equal(stats.quantaProcessed, totalQuanta);
+  assert.ok(stats.overrunTrimmedFrames > 0);
+  assert.ok(stats.overrunTrimCount > 0);
+  assert.ok(stats.underrunQuanta > 0);
+  assert.ok(stats.underrunFadeOuts > 0);
+  assert.ok(stats.recoveryFadeIns > 0);
+  assert.ok(stats.peakFillRatio > 0 && stats.peakFillRatio <= 1.0);
+  assert.ok(stats.fillRatio >= 0 && stats.fillRatio <= 1.0);
 });
