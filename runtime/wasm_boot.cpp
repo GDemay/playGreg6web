@@ -7,6 +7,7 @@
 #include <memory>
 #include <utility>
 
+#include "abi/playgta6_abi.h"
 #include "gpu/d3d12_guest_objects.h"
 #include "gpu/d3d12_xs_exports.h"
 #include "gpu/shader_pack_index.h"
@@ -17,7 +18,15 @@
 #include "os/image_loader.h"
 #include "os/os_shim.h"
 #include "os/win32_kernel.h"
+#include "os/xbox_scarlett.h"
 #include "os/xbox_scarlett_guest.h"
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten/emscripten.h>
+#define PG6_WASM_BOOT_EXPORT EMSCRIPTEN_KEEPALIVE
+#else
+#define PG6_WASM_BOOT_EXPORT
+#endif
 
 #if defined(PG6_BOOT_LINKED_GUEST) && defined(PG6_BOOT_PROGRAM)
 extern "C" const Pg6Program pg6_program;
@@ -282,6 +291,15 @@ WasmBootResult fail_result(std::string stage, std::string error) {
 }
 
 std::atomic<const WasmBootConfig*> g_active_boot_cfg{nullptr};
+struct alignas(64) AlignedWasmInputState {
+    playgta6::InputState state{};
+};
+AlignedWasmInputState g_wasm_input_state{};
+static_assert(sizeof(playgta6::InputState) == 40, "InputState layout must stay 40 bytes");
+static_assert(alignof(AlignedWasmInputState) == 64,
+              "g_wasm_input_state must be 64-byte aligned");
+static_assert(offsetof(AlignedWasmInputState, state) == 0,
+              "InputState must sit at offset 0 of AlignedWasmInputState");
 
 void wasm_off_thread_fault() {
     const WasmBootConfig* active = g_active_boot_cfg.load(std::memory_order_acquire);
@@ -739,6 +757,12 @@ WasmBootResult run_wasm_program_boot(const WasmBootConfig& cfg, const Pg6Program
     ScopedDStorageWorkerThreads dstorage_threads_guard(cfg.dstorage_worker_threads);
     ScopedDeviceOptions device_options_guard;
 
+    // O36 / #796: attach linear-memory InputState so GameInput reads browser inputSab updates.
+    if (playgta6::InputState* current_input = os::scarlett::get_game_input_state();
+        current_input == nullptr || current_input == &g_wasm_input_state.state) {
+        attach_default_input_state();
+    }
+
     std::shared_ptr<gpu::ShaderPackIndex> shader_pack;
     std::string loaded_pack_path;
     if (try_load_shader_pack(cfg, cfg.shader_pack_path, /*is_fallback=*/false, shader_pack)) {
@@ -888,6 +912,10 @@ WasmBootResult run_wasm_guest_boot(const WasmBootConfig& cfg) {
         reinterpret_cast<const guest::BootImport*>(pg6_import_thunks), pg6_import_thunk_count);
     boot_cfg.modules.push_back(std::move(exe));
     boot_cfg.log_progress = true;
+    if (playgta6::InputState* current_input = os::scarlett::get_game_input_state();
+        current_input == nullptr || current_input == &g_wasm_input_state.state) {
+        attach_default_input_state();
+    }
     const guest::BootResult boot = guest::run_boot(boot_cfg);
     result.ok = boot.status == guest::BootStatus::Exited;
     result.exit_code = boot.stats.exit_code;
@@ -907,4 +935,16 @@ WasmBootResult run_wasm_guest_boot(const WasmBootConfig& cfg) {
 #endif
 }
 
+playgta6::InputState* input_state_ptr() noexcept {
+    return &g_wasm_input_state.state;
+}
+
+void attach_default_input_state() {
+    os::scarlett::set_game_input_state(&g_wasm_input_state.state, os::SeqlockMode::MonotonicSeq);
+}
+
 }  // namespace playgta6::boot
+
+extern "C" PG6_WASM_BOOT_EXPORT uintptr_t playgta6_get_input_state_ptr(void) {
+    return reinterpret_cast<uintptr_t>(playgta6::boot::input_state_ptr());
+}

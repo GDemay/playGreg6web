@@ -2038,6 +2038,9 @@ class TestBrowserBootFlags(unittest.TestCase):
     EXPECTED_RUNTIME_METHODS = (
         "-sEXPORTED_RUNTIME_METHODS=wasmMemory,FS,HEAPU8,addRunDependency,removeRunDependency"
     )
+    EXPECTED_EXPORTED_FUNCTIONS = (
+        "-sEXPORTED_FUNCTIONS=_main,_playgta6_get_input_state_ptr"
+    )
 
     def _repo(self, tmp: Path) -> Path:
         repo = tmp / "repo"
@@ -2254,10 +2257,16 @@ class TestBrowserBootFlags(unittest.TestCase):
         default_flags = bgw.resolve_link_flags()
         self.assertNotIn(self.EXPECTED_INCOMING_API, default_flags)
         self.assertNotIn(self.EXPECTED_RUNTIME_METHODS, default_flags)
+        self.assertNotIn(self.EXPECTED_EXPORTED_FUNCTIONS, default_flags)
 
         boot_flags = bgw.resolve_link_flags(browser_boot_exports=True)
         self.assertIn(self.EXPECTED_INCOMING_API, boot_flags)
         self.assertIn(self.EXPECTED_RUNTIME_METHODS, boot_flags)
+        self.assertIn(self.EXPECTED_EXPORTED_FUNCTIONS, boot_flags)
+
+        split_boot_flags = bgw.resolve_link_flags(browser_boot_exports=True, main_module=True)
+        self.assertIn(self.EXPECTED_RUNTIME_METHODS, split_boot_flags)
+        self.assertIn(self.EXPECTED_EXPORTED_FUNCTIONS, split_boot_flags)
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2304,6 +2313,7 @@ class TestBrowserBootFlags(unittest.TestCase):
                 "-sASSERTIONS=1",
                 self.EXPECTED_INCOMING_API,
                 self.EXPECTED_RUNTIME_METHODS,
+                self.EXPECTED_EXPORTED_FUNCTIONS,
             ):
                 self.assertIn(expected, payload["link_flags"])
                 self.assertIn(expected, payload["link_argv"])

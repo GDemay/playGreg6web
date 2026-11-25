@@ -18,6 +18,9 @@ const {
   HOST_ABI_IMPORT_NAMES,
   GPU_OPCODE_PRESENT,
   GPU_PACKET_HEADER_BYTES,
+  INPUT_STATE_BYTES,
+  INPUT_STATE_WORDS,
+  DEFAULT_INPUT_BRIDGE_POLL_MS,
   BOOT_INIT_FORWARD_KEYS,
   isEmscriptenPthreadWorkerName,
   isEmscriptenPthreadWorker,
@@ -32,6 +35,7 @@ const {
   sanitizeRenderStateStats,
   getLoaderStatus,
   createHostImports,
+  startInputSabBridge,
   resolveRuntimeScriptUrl,
   resolveSideModuleUrl,
   sanitizeSideModuleUrls,
@@ -2428,4 +2432,300 @@ test('W101 forwardGpuWorkerMessage surfaces sanitized renderStateStats and getLo
   assert.equal(sanitizeRenderStateStats(null), null);
   assert.equal(sanitizeRenderStateStats([1, 2]), null);
   assert.equal(sanitizeRenderStateStats('x'), null);
+});
+
+function writeTestInputSnapshot(sab, snapshot) {
+  const i32 = new Int32Array(sab, 0, INPUT_STATE_WORDS);
+  const f32 = new Float32Array(sab, 0, INPUT_STATE_WORDS);
+  Atomics.add(i32, 0, 1); // odd: write in progress
+  if (snapshot.buttons !== undefined) {
+    Atomics.store(i32, 1, snapshot.buttons | 0);
+  }
+  if (snapshot.mouseDx !== undefined) {
+    Atomics.add(i32, 2, snapshot.mouseDx | 0);
+  }
+  if (snapshot.mouseDy !== undefined) {
+    Atomics.add(i32, 3, snapshot.mouseDy | 0);
+  }
+  const fScratch = new Float32Array(1);
+  const iScratch = new Int32Array(fScratch.buffer);
+  const storeFloat = (wordIdx, val) => {
+    if (val === undefined) return;
+    fScratch[0] = val;
+    Atomics.store(i32, wordIdx, iScratch[0]);
+  };
+  storeFloat(4, snapshot.lx);
+  storeFloat(5, snapshot.ly);
+  storeFloat(6, snapshot.rx);
+  storeFloat(7, snapshot.ry);
+  storeFloat(8, snapshot.lt);
+  storeFloat(9, snapshot.rt);
+  Atomics.add(i32, 0, 1); // even: publish snapshot
+  return { seq: Atomics.load(i32, 0) >>> 0, f32 };
+}
+
+test('O36/#796 startInputSabBridge copies InputState buttons, axes, triggers, and mouse deltas into Wasm64 linear memory at BigInt offset with valid seqlock framing', () => {
+  assert.equal(INPUT_STATE_BYTES, 40);
+  assert.equal(INPUT_STATE_WORDS, 10);
+  assert.equal(DEFAULT_INPUT_BRIDGE_POLL_MS, 16);
+
+  const sab = new SharedArrayBuffer(INPUT_STATE_BYTES);
+  const wasmMemory = new WebAssembly.Memory({ initial: 1, maximum: 4 });
+  const inputPtr = 256n; // Wasm64 BigInt linear-memory address (64-byte aligned)
+
+  // Observe every Atomics.store sequence value written to dst word 0 to verify odd->even seqlock framing.
+  const observedDstSeqWrites = [];
+  const trackingAtomics = {
+    load: (arr, idx) => Atomics.load(arr, idx),
+    store: (arr, idx, val) => {
+      if (arr.buffer === wasmMemory.buffer && idx === 0) {
+        observedDstSeqWrites.push(val >>> 0);
+      }
+      return Atomics.store(arr, idx, val);
+    },
+    add: (arr, idx, val) => Atomics.add(arr, idx, val),
+    exchange: (arr, idx, val) => Atomics.exchange(arr, idx, val),
+    notify: (arr, idx, count) => Atomics.notify(arr, idx, count),
+  };
+
+  // Pre-populate an initial button press before attach to verify immediate initial sync.
+  const BUTTON_A = 1 << 8;
+  const BUTTON_RB = 1 << 13;
+  writeTestInputSnapshot(sab, {
+    buttons: BUTTON_A,
+    mouseDx: 12,
+    mouseDy: -7,
+    lx: 0.5,
+    ly: -0.25,
+    rx: -0.75,
+    ry: 1.0,
+    lt: 0.4,
+    rt: 0.9,
+  });
+
+  let scheduledFn = null;
+  let clearedToken = null;
+  const fakeTimerToken = { id: 77 };
+
+  const mod = {
+    wasmMemory,
+    _playgta6_get_input_state_ptr: () => inputPtr,
+  };
+
+  const bridge = startInputSabBridge({
+    inputSab: sab,
+    module: mod,
+    pollIntervalMs: 16,
+    atomicsObj: trackingAtomics,
+    useWaitAsync: false,
+    setIntervalFn: (fn) => {
+      scheduledFn = fn;
+      return fakeTimerToken;
+    },
+    clearIntervalFn: (token) => {
+      clearedToken = token;
+    },
+  });
+
+  assert.equal(bridge.active, true);
+  assert.equal(bridge.inputStatePtr, 256);
+  assert.equal(typeof scheduledFn, 'function');
+
+  // Initial sync wrote odd (1) then even (2).
+  assert.deepEqual(observedDstSeqWrites, [1, 2]);
+
+  const dstI32 = new Int32Array(wasmMemory.buffer, 256, INPUT_STATE_WORDS);
+  const dstF32 = new Float32Array(wasmMemory.buffer, 256, INPUT_STATE_WORDS);
+  assert.equal(dstI32[0] >>> 0, 2);
+  assert.equal(dstI32[1] >>> 0, BUTTON_A);
+  assert.equal(dstI32[2], 12);
+  assert.equal(dstI32[3], -7);
+  assert.ok(Math.abs(dstF32[4] - 0.5) < 1e-6);
+  assert.ok(Math.abs(dstF32[5] - -0.25) < 1e-6);
+  assert.ok(Math.abs(dstF32[6] - -0.75) < 1e-6);
+  assert.ok(Math.abs(dstF32[7] - 1.0) < 1e-6);
+  assert.ok(Math.abs(dstF32[8] - 0.4) < 1e-6);
+  assert.ok(Math.abs(dstF32[9] - 0.9) < 1e-6);
+
+  // Mouse deltas were atomically drained from inputSab so a subsequent button event won't double-count.
+  const srcI32 = new Int32Array(sab, 0, INPUT_STATE_WORDS);
+  assert.equal(srcI32[2], 0);
+  assert.equal(srcI32[3], 0);
+
+  // Simulate C++ GameInputReader consuming mouse deltas, then a new input update arrives.
+  dstI32[2] = 0;
+  dstI32[3] = 0;
+  writeTestInputSnapshot(sab, { buttons: BUTTON_A | BUTTON_RB, lx: -1.0, rt: 0.0 });
+
+  // Simulate an in-progress torn write (odd seq) first: poll tick must skip it cleanly.
+  Atomics.add(srcI32, 0, 1);
+  scheduledFn();
+  assert.equal(dstI32[0] >>> 0, 2, 'must not copy torn snapshot while src seq is odd');
+
+  // Finish the write (even seq): next poll tick copies cleanly and advances dst seq to 4 (3 -> 4).
+  Atomics.add(srcI32, 0, 1);
+  scheduledFn();
+  assert.deepEqual(observedDstSeqWrites, [1, 2, 3, 4]);
+  assert.equal(dstI32[0] >>> 0, 4);
+  assert.equal(dstI32[1] >>> 0, BUTTON_A | BUTTON_RB);
+  assert.equal(dstI32[2], 0);
+  assert.equal(dstI32[3], 0);
+  assert.ok(Math.abs(dstF32[4] - -1.0) < 1e-6);
+  assert.ok(Math.abs(dstF32[9] - 0.0) < 1e-6);
+
+  // Stop clears timer and suppresses any further writes.
+  bridge.stop();
+  bridge.stop(); // idempotent
+  assert.equal(clearedToken, fakeTimerToken);
+  assert.equal(bridge.getStats().stopped, true);
+  assert.equal(bridge.getStats().active, false);
+
+  writeTestInputSnapshot(sab, { buttons: 0 });
+  assert.equal(bridge.syncNow(true), false);
+  assert.equal(dstI32[1] >>> 0, BUTTON_A | BUTTON_RB);
+});
+
+test('O36/#796 startInputSabBridge re-acquires Int32Array view after wasmMemory.grow() and buffer replacement', () => {
+  const sab = new SharedArrayBuffer(INPUT_STATE_BYTES);
+  const wasmMemory = new WebAssembly.Memory({ initial: 1, maximum: 4 });
+  const oldBuffer = wasmMemory.buffer;
+
+  let currentMem = wasmMemory;
+  const mod = {
+    get wasmMemory() {
+      return currentMem;
+    },
+    asm: {
+      playgta6_get_input_state_ptr: () => 128n,
+    },
+  };
+
+  const bridge = startInputSabBridge({
+    inputSab: sab,
+    module: mod,
+    useWaitAsync: false,
+    disableFallbackInterval: true,
+  });
+
+  assert.equal(bridge.active, true);
+  writeTestInputSnapshot(sab, { buttons: 1 << 8, lx: 0.25 });
+  assert.equal(bridge.syncNow(), true);
+  assert.equal(new Int32Array(wasmMemory.buffer, 128, INPUT_STATE_WORDS)[1] >>> 0, 1 << 8);
+  assert.equal(bridge.getStats().bufferReacquires, 0);
+
+  // Grow WebAssembly.Memory -> detaches oldBuffer and produces a new ArrayBuffer!
+  wasmMemory.grow(1);
+  assert.notEqual(wasmMemory.buffer, oldBuffer);
+
+  writeTestInputSnapshot(sab, { buttons: 1 << 9, lx: -0.5 });
+  assert.equal(bridge.syncNow(), true);
+  const grownI32 = new Int32Array(wasmMemory.buffer, 128, INPUT_STATE_WORDS);
+  const grownF32 = new Float32Array(wasmMemory.buffer, 128, INPUT_STATE_WORDS);
+  assert.equal(grownI32[0] >>> 0, 4);
+  assert.equal(grownI32[1] >>> 0, 1 << 9);
+  assert.ok(Math.abs(grownF32[4] - -0.5) < 1e-6);
+  assert.equal(bridge.getStats().bufferReacquires, 1);
+
+  // Also test full buffer replacement (e.g. swapped backing SharedArrayBuffer).
+  const replacementSab = new SharedArrayBuffer(65536);
+  currentMem = { buffer: replacementSab };
+  writeTestInputSnapshot(sab, { buttons: 1 << 10, ry: 0.75 });
+  assert.equal(bridge.syncNow(), true);
+  const replacedI32 = new Int32Array(replacementSab, 128, INPUT_STATE_WORDS);
+  const replacedF32 = new Float32Array(replacementSab, 128, INPUT_STATE_WORDS);
+  assert.equal(replacedI32[0] >>> 0, 6);
+  assert.equal(replacedI32[1] >>> 0, 1 << 10);
+  assert.ok(Math.abs(replacedF32[7] - 0.75) < 1e-6);
+  assert.equal(bridge.getStats().bufferReacquires, 2);
+
+  bridge.stop();
+});
+
+test('O36/#796 startInputSabBridge wakes reactively via Atomics.waitAsync on notify and degrades gracefully when export or inputSab is missing', async () => {
+  // 1. Missing inputSab, tiny buffer, missing export, null/zero pointer, unaligned pointer all degrade cleanly.
+  const sab = new SharedArrayBuffer(INPUT_STATE_BYTES);
+  const mem = new WebAssembly.Memory({ initial: 1, maximum: 1 });
+  assert.equal(startInputSabBridge({}).active, false);
+  assert.equal(startInputSabBridge({ inputSab: new ArrayBuffer(16), module: { wasmMemory: mem, _playgta6_get_input_state_ptr: () => 64n } }).active, false);
+  assert.equal(startInputSabBridge({ inputSab: sab, module: { wasmMemory: mem } }).active, false);
+  assert.equal(startInputSabBridge({ inputSab: sab, module: { wasmMemory: mem, _playgta6_get_input_state_ptr: () => 0n } }).active, false);
+  assert.equal(startInputSabBridge({ inputSab: sab, module: { wasmMemory: mem, _playgta6_get_input_state_ptr: () => 0 } }).active, false);
+  assert.equal(startInputSabBridge({ inputSab: sab, module: { wasmMemory: mem, _playgta6_get_input_state_ptr: () => 65n } }).active, false);
+  assert.equal(
+    startInputSabBridge({
+      inputSab: sab,
+      module: {
+        wasmMemory: mem,
+        _playgta6_get_input_state_ptr: () => {
+          throw new Error('not exported');
+        },
+      },
+    }).active,
+    false,
+  );
+
+  // 2. Reactive Atomics.waitAsync wakeup on Atomics.notify (when supported by Node runtime).
+  if (typeof Atomics.waitAsync === 'function') {
+    const bridge = startInputSabBridge({
+      inputSab: sab,
+      module: { wasmMemory: mem, _playgta6_get_input_state_ptr: () => 64n },
+      pollIntervalMs: 500,
+      disableFallbackInterval: true,
+    });
+    assert.equal(bridge.active, true);
+
+    const srcI32 = new Int32Array(sab, 0, INPUT_STATE_WORDS);
+    writeTestInputSnapshot(sab, { buttons: 1 << 8, lt: 0.6 });
+    Atomics.notify(srcI32, 0, 1);
+
+    // Wait a few ticks for waitAsync promise resolution (much faster than 500ms timeout).
+    const deadline = Date.now() + 250;
+    const dstI32 = new Int32Array(mem.buffer, 64, INPUT_STATE_WORDS);
+    while (dstI32[0] === 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    assert.equal(dstI32[0] >>> 0, 2);
+    assert.equal(dstI32[1] >>> 0, 1 << 8);
+    assert.ok(bridge.getStats().waitAsyncWakeups >= 1);
+
+    bridge.stop();
+  }
+});
+
+test('O36/#796 buildRuntimeModuleConfig wires onRuntimeInitialized and onExit to start and stop the inputSab bridge', () => {
+  const sab = new SharedArrayBuffer(INPUT_STATE_BYTES);
+  const wasmMemory = new WebAssembly.Memory({ initial: 1, maximum: 2 });
+  let userInitCalled = 0;
+  let userExitCalled = 0;
+
+  const cfg = buildRuntimeModuleConfig({
+    locationHref: 'http://127.0.0.1:8080/loader.js',
+    inputSab: sab,
+    inputPollIntervalMs: 100,
+    onRuntimeInitialized() {
+      userInitCalled += 1;
+    },
+    onExit() {
+      userExitCalled += 1;
+    },
+  });
+
+  const mockModule = {
+    wasmMemory,
+    _playgta6_get_input_state_ptr: () => 192n,
+  };
+
+  writeTestInputSnapshot(sab, { buttons: 1 << 8 });
+  cfg.preRun[0](mockModule);
+  cfg.onRuntimeInitialized.call(mockModule);
+
+  assert.equal(userInitCalled, 1);
+  const bridge = cfg.getInputBridge();
+  assert.ok(bridge && bridge.active);
+  assert.equal(new Int32Array(wasmMemory.buffer, 192, INPUT_STATE_WORDS)[1] >>> 0, 1 << 8);
+
+  cfg.onExit(0);
+  assert.equal(userExitCalled, 1);
+  assert.equal(cfg.getInputBridge(), null);
+  assert.equal(bridge.getStats().stopped, true);
 });
