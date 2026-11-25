@@ -6,6 +6,7 @@ import bootstrapDefault, {
   DEFAULT_LOADER_URL,
   DEFAULT_MAX_VALIDATION_ERRORS,
   DEFAULT_SHADER_PACK_URL,
+  DEFAULT_SPLASH_FADE_OUT_MS,
   DEFAULT_STREAM_SHADERS_THRESHOLD_BYTES,
   DEFAULT_STREAM_SHADERS_THRESHOLD_MB,
   MAX_STREAM_THRESHOLD_BYTES,
@@ -4522,4 +4523,743 @@ test('W261 first-user-gesture (pointerdown / keydown) unlocks audioEngine once a
     windowObj.dispatch('keydown', { code: 'Enter' });
     assert.equal(unlockCalls, 0);
   }
+});
+
+test('W333 W308 lazy _playgta6_audio_ring() auto-retry with audioWorker exposes audioRingAttached and audioRingAttachAttempts', async () => {
+  const { createRequire } = await import('node:module');
+  const require = createRequire(import.meta.url);
+  const loaderApi = require('../web/loader.js');
+
+  function createFakeTimeoutScheduler() {
+    let nextId = 1;
+    const pending = new Map();
+    return {
+      setTimeout(fn, ms) {
+        const id = nextId++;
+        pending.set(id, { fn, ms });
+        return id;
+      },
+      clearTimeout(id) {
+        pending.delete(id);
+      },
+      fireNext() {
+        const first = pending.entries().next();
+        if (first.done) return false;
+        const [id, entry] = first.value;
+        pending.delete(id);
+        entry.fn();
+        return true;
+      },
+      pendingCount() {
+        return pending.size;
+      },
+    };
+  }
+
+  // Build a valid Wasm64 Playgta6AudioRing struct inside a SharedArrayBuffer.
+  function makeValidWasm64AudioRingSab() {
+    const sab = new SharedArrayBuffer(65536);
+    const view = new DataView(sab);
+    const structOffset = 64;
+    const baseOffset = 4096;
+    const readIdxOffset = 128;
+    const writeIdxOffset = 132;
+    view.setBigUint64(structOffset + 0, BigInt(baseOffset), true);
+    view.setUint32(structOffset + 8, 2048, true); // capacity (power of 2)
+    view.setUint32(structOffset + 12, 2, true); // channels (stereo)
+    view.setUint32(structOffset + 16, 48000, true); // sampleRate
+    view.setBigUint64(structOffset + 24, BigInt(readIdxOffset), true);
+    view.setBigUint64(structOffset + 32, BigInt(writeIdxOffset), true);
+    return { sab, structOffset };
+  }
+
+  // Case 1: Real PlayGta6Loader.scheduleAudioRingRetry retries null_ptr twice, then attaches on 3rd attempt.
+  {
+    const clock = createClock(1000);
+    const raf = createFakeRaf(clock);
+    const timers = createFakeTimers();
+    const timeouts = createFakeTimeoutScheduler();
+    const webgpu = createMockWebGpuEnv();
+    const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+      clock,
+      raf,
+      timers,
+      gpu: webgpu.gpu,
+    });
+
+    const { sab, structOffset } = makeValidWasm64AudioRingSab();
+    let ptrCalls = 0;
+    const mockWasmModule = {
+      wasmMemory: { buffer: sab },
+      _playgta6_audio_ring() {
+        ptrCalls += 1;
+        return ptrCalls >= 3 ? BigInt(structOffset) : 0n;
+      },
+    };
+
+    const audioPosted = [];
+    const audioWorker = createFakeEventTarget({
+      postMessage(msg) {
+        audioPosted.push(msg);
+      },
+    });
+    const loaderPosted = [];
+    const mockWorker = createFakeEventTarget({
+      postMessage(msg) {
+        loaderPosted.push(msg);
+      },
+      terminate() {},
+    });
+
+    const app = bootstrapPlayGta6App({
+      windowObj,
+      documentObj,
+      navigatorObj,
+      fetchImpl: createMockFetch({ ok: true, coopCoep: true, hasWasmBinary: true }),
+      canvas: webgpu.canvas,
+      hud: createMockHud(),
+      audioWorker,
+      wasmModule: mockWasmModule,
+      scheduleAudioRingRetry: loaderApi.scheduleAudioRingRetry,
+      audioRingRetryIntervalMs: 125,
+      audioRingMaxRetries: 10,
+      audioRingAutoRetry: true,
+      setTimeout: timeouts.setTimeout,
+      clearTimeout: timeouts.clearTimeout,
+      now: clock.now,
+      setInterval: timers.setInterval,
+      clearInterval: timers.clearInterval,
+      createWasmWorker() {
+        return mockWorker;
+      },
+    });
+
+    try {
+      assert.equal(app.getBootTelemetry().audioRingAttached, false);
+      assert.equal(app.getBootTelemetry().audioRingAttachAttempts, 0);
+
+      const started = await app.start();
+      assert.equal(started.ok, true);
+
+      // Explicit W308 retry options are forwarded in initPayload.
+      assert.equal(loaderPosted[0].audioRingRetryIntervalMs, 125);
+      assert.equal(loaderPosted[0].audioRingMaxRetries, 10);
+      assert.equal(loaderPosted[0].audioRingAutoRetry, true);
+
+      // Attempt 1 returned 0n -> retry timer scheduled.
+      assert.equal(app.getBootTelemetry().audioRingAttached, false);
+      assert.equal(app.getBootTelemetry().audioRingAttachAttempts, 1);
+      assert.equal(timeouts.pendingCount(), 1);
+
+      // Attempt 2 returned 0n -> still retrying.
+      assert.equal(timeouts.fireNext(), true);
+      assert.equal(app.getBootTelemetry().audioRingAttached, false);
+      assert.equal(app.getBootTelemetry().audioRingAttachAttempts, 2);
+      assert.equal(timeouts.pendingCount(), 1);
+
+      // Attempt 3 returns valid Wasm64 struct -> attaches to audioWorker & clears timer.
+      assert.equal(timeouts.fireNext(), true);
+      assert.equal(audioPosted.length, 1);
+      assert.equal(audioPosted[0].type, 'attach-guest-pcm-ring');
+      assert.equal(audioPosted[0].sampleRate, 48000);
+      assert.equal(audioPosted[0].channels, 2);
+      assert.equal(timeouts.pendingCount(), 0);
+
+      const snap = app.getBootTelemetry();
+      assert.equal(snap.audioRingAttached, true);
+      assert.equal(snap.audioRingAttachAttempts, 3);
+      assert.deepEqual(Object.keys(snap.audio).sort(), [
+        'framesDrained',
+        'outputState',
+        'overruns',
+        'underruns',
+      ]);
+
+      const diag = app.getDiagnosticsSnapshot();
+      assert.equal(diag.audioRingAttached, true);
+      assert.equal(diag.audioRingAttachAttempts, 3);
+    } finally {
+      await app.destroy();
+    }
+    assert.equal(timeouts.pendingCount(), 0);
+    assert.equal(audioWorker.listenerCount(), 0);
+  }
+
+  // Case 2: Fallback built-in retry + deferred audioWorker ready + loader-status / log ingestion.
+  {
+    const clock = createClock(2000);
+    const raf = createFakeRaf(clock);
+    const timers = createFakeTimers();
+    const timeouts = createFakeTimeoutScheduler();
+    const webgpu = createMockWebGpuEnv();
+    const broadcastInstances = [];
+    class MockBroadcastChannel {
+      constructor(name) {
+        this.name = name;
+        this.onmessage = null;
+        broadcastInstances.push(this);
+      }
+      close() {}
+    }
+    const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+      clock,
+      raf,
+      timers,
+      gpu: webgpu.gpu,
+    });
+    windowObj.BroadcastChannel = MockBroadcastChannel;
+
+    const audioPosted = [];
+    const audioWorker = createFakeEventTarget({
+      postMessage(msg) {
+        audioPosted.push(msg);
+      },
+    });
+    const mockWorker = createFakeEventTarget({
+      postMessage() {},
+      terminate() {},
+    });
+
+    const app = bootstrapPlayGta6App({
+      windowObj,
+      documentObj,
+      navigatorObj,
+      fetchImpl: createMockFetch({ ok: true, coopCoep: true, hasWasmBinary: true }),
+      canvas: webgpu.canvas,
+      hud: createMockHud(),
+      audioWorker,
+      audioWorkerReady: false,
+      scheduleAudioRingRetry: null,
+      attachRuntimeAudioRing: null,
+      wasmModule: {
+        _playgta6_audio_ring() {
+          return 0x1000n;
+        },
+      },
+      setTimeout: timeouts.setTimeout,
+      clearTimeout: timeouts.clearTimeout,
+      now: clock.now,
+      setInterval: timers.setInterval,
+      clearInterval: timers.clearInterval,
+      createWasmWorker() {
+        return mockWorker;
+      },
+    });
+
+    try {
+      await app.start();
+      // Initial probe saw audioWorkerReady=false -> scheduled retry.
+      assert.equal(app.getBootTelemetry().audioRingAttached, false);
+      assert.equal(app.getBootTelemetry().audioRingAttachAttempts, 1);
+
+      // audioWorker emits { ready: true } -> immediately probes and attaches!
+      audioWorker.dispatch('message', { data: { ready: true } });
+      assert.equal(audioPosted.length, 1);
+      assert.equal(audioPosted[0].attachGuestPcmRing, true);
+      assert.equal(app.getBootTelemetry().audioRingAttached, true);
+      assert.equal(app.getBootTelemetry().audioRingAttachAttempts, 2);
+
+      // Also verify loader-status & BroadcastChannel [audio] log ingestion preserve higher attempt counts.
+      mockWorker.dispatch('message', {
+        data: {
+          type: 'loader-status',
+          audioRingAttached: true,
+          audioRingRetryCount: 4,
+          audioRingLastReason: 'ok',
+        },
+      });
+      assert.equal(app.getBootTelemetry().audioRingAttachAttempts, 5);
+
+      broadcastInstances[0].onmessage({
+        data: {
+          label: '[audio] audio_ring_attached=true sampleRate=48000 channels=2 capacity=131072 retries=6',
+        },
+      });
+      assert.equal(app.getBootTelemetry().audioRingAttachAttempts, 7);
+    } finally {
+      await app.destroy();
+    }
+    assert.equal(timeouts.pendingCount(), 0);
+  }
+});
+
+test('W333 passes through W309 BootOrchestrator concurrent preload options, W310 PgimPreloader OPFS cache options, and W311 SplashOverlay monotonic phase progress + 220ms fadeOutMs', async () => {
+  const { createRequire } = await import('node:module');
+  const require = createRequire(import.meta.url);
+  const { BootOrchestrator } = require('../web/runtime/boot_orchestrator.js');
+  const { PgimPreloader } = require('../web/runtime/pgim_preloader.js');
+  const { SplashOverlayController } = require('../web/ui/splash_overlay.js');
+
+  assert.equal(DEFAULT_SPLASH_FADE_OUT_MS, 220);
+
+  function makeMockNode(tag = 'div') {
+    const attrs = new Map();
+    const styles = new Map();
+    const node = {
+      tagName: String(tag).toUpperCase(),
+      className: '',
+      hidden: false,
+      textContent: '',
+      innerHTML: '',
+      parentNode: null,
+      children: [],
+      style: {
+        setProperty(k, v) {
+          styles.set(k, String(v));
+        },
+        getPropertyValue(k) {
+          return styles.get(k) || '';
+        },
+      },
+      classList: {
+        add(c) {
+          const set = new Set(String(node.className || '').split(/\s+/).filter(Boolean));
+          set.add(c);
+          node.className = [...set].join(' ');
+        },
+        remove(c) {
+          const set = new Set(String(node.className || '').split(/\s+/).filter(Boolean));
+          set.delete(c);
+          node.className = [...set].join(' ');
+        },
+        contains(c) {
+          return String(node.className || '').split(/\s+/).includes(c);
+        },
+      },
+      setAttribute(k, v) {
+        attrs.set(k, String(v));
+      },
+      getAttribute(k) {
+        return attrs.has(k) ? attrs.get(k) : null;
+      },
+      removeAttribute(k) {
+        attrs.delete(k);
+      },
+      appendChild(child) {
+        child.parentNode = node;
+        node.children.push(child);
+        return child;
+      },
+      removeChild(child) {
+        const idx = node.children.indexOf(child);
+        if (idx >= 0) node.children.splice(idx, 1);
+        child.parentNode = null;
+        return child;
+      },
+      addEventListener() {},
+      removeEventListener() {},
+      querySelector() {
+        return null;
+      },
+    };
+    return node;
+  }
+
+  // Build a minimal valid 64-byte PGIM v1 container for real PgimPreloader OPFS warm-boot testing.
+  function buildMinimalPgimBytes() {
+    const buf = new ArrayBuffer(64);
+    const bytes = new Uint8Array(buf);
+    const view = new DataView(buf);
+    bytes[0] = 0x50; // P
+    bytes[1] = 0x47; // G
+    bytes[2] = 0x49; // I
+    bytes[3] = 0x4d; // M
+    view.setUint32(4, 1, true); // version
+    view.setUint32(8, 64, true); // header_bytes
+    view.setUint32(12, 64, true); // section_entry_bytes
+    view.setUint32(16, 0, true); // flags
+    view.setUint32(20, 4096, true); // page_size
+    view.setBigUint64(24, 0x140000000n, true); // image_base
+    view.setUint32(32, 0x1000, true); // size_of_image
+    view.setUint32(36, 0x1000, true); // section_alignment
+    view.setUint32(40, 0, true); // entry_point_rva
+    view.setUint32(44, 0, true); // section_count
+    view.setUint32(48, 0, true); // dir64_count
+    view.setUint32(52, 0, true); // highlow_count
+    view.setBigUint64(56, 64n, true); // file_size
+    return bytes;
+  }
+
+  const clock = createClock(10000);
+  const raf = createFakeRaf(clock);
+  const timers = createFakeTimers();
+  const webgpu = createMockWebGpuEnv();
+  const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+    clock,
+    raf,
+    timers,
+    gpu: webgpu.gpu,
+  });
+  documentObj.head = makeMockNode('head');
+  documentObj.createElement = (tag) => makeMockNode(tag);
+  documentObj.querySelector = () => null;
+
+  const pgimBytes = buildMinimalPgimBytes();
+  const opfsStoreMap = new Map();
+  let opfsReads = 0;
+  let opfsWrites = 0;
+  const mockOpfsCache = {
+    async read(key) {
+      opfsReads += 1;
+      return opfsStoreMap.has(key) ? opfsStoreMap.get(key) : null;
+    },
+    async write(key, bytes) {
+      opfsWrites += 1;
+      opfsStoreMap.set(key, new Uint8Array(bytes));
+    },
+    async delete(key) {
+      opfsStoreMap.delete(key);
+    },
+  };
+
+  let inFlightPreloads = 0;
+  let maxConcurrentPreloads = 0;
+  let runtimeWasmCalls = 0;
+  let opfsProbeCalls = 0;
+  let customTaskCalls = 0;
+  const splashProgressSamples = [];
+  let fadeScheduledMs = null;
+  let fadeCallback = null;
+
+  const fetchImpl = async (url, init = {}) => {
+    if (String(url).includes('/api/status')) {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            ok: true,
+            coopCoep: true,
+            hasWasmBinary: true,
+            pgimUrl: '/boot/guest.pgim',
+            runtimeWasm: '/dist/runtime.wasm',
+          };
+        },
+      };
+    }
+    if (String(url).includes('/boot/guest.pgim')) {
+      const headers = {
+        get(name) {
+          const lower = String(name).toLowerCase();
+          if (lower === 'content-length') return String(pgimBytes.byteLength);
+          if (lower === 'accept-ranges') return 'bytes';
+          if (lower === 'etag') return '"pgim-v1"';
+          return null;
+        },
+      };
+      if (init.method === 'HEAD') {
+        return { ok: true, status: 200, headers };
+      }
+      return {
+        ok: true,
+        status: 200,
+        headers,
+        async arrayBuffer() {
+          return pgimBytes.slice().buffer;
+        },
+      };
+    }
+    return { ok: false, status: 404, headers: { get: () => null } };
+  };
+
+  const mockWorker = createFakeEventTarget({
+    postMessage() {},
+    terminate() {},
+  });
+
+  const app = bootstrapPlayGta6App({
+    windowObj,
+    documentObj,
+    navigatorObj,
+    fetchImpl,
+    canvas: webgpu.canvas,
+    hud: createMockHud(),
+    splashContainer: makeMockNode('div'),
+    SplashOverlayCtor: SplashOverlayController,
+    PgimPreloaderCtor: PgimPreloader,
+    BootOrchestratorCtor: BootOrchestrator,
+    // W310 OPFS warm-boot cache options pass-through
+    opfsCache: mockOpfsCache,
+    opfsCacheVersion: 2,
+    opfsCacheDirName: 'custom-pgim-cache',
+    opfsValidateWithHead: true,
+    // W309 BootOrchestrator concurrent preload options pass-through
+    parallelPreload: true,
+    preloadConcurrency: 4,
+    releasePreloadBuffers: true,
+    preloadRuntimeWasm: async () => {
+      runtimeWasmCalls += 1;
+      inFlightPreloads += 1;
+      maxConcurrentPreloads = Math.max(maxConcurrentPreloads, inFlightPreloads);
+      clock.advance(40);
+      await Promise.resolve();
+      inFlightPreloads -= 1;
+      return { compiled: true, bytesLoaded: 1024 };
+    },
+    opfsProbe: async () => {
+      opfsProbeCalls += 1;
+      inFlightPreloads += 1;
+      maxConcurrentPreloads = Math.max(maxConcurrentPreloads, inFlightPreloads);
+      clock.advance(30);
+      await Promise.resolve();
+      inFlightPreloads -= 1;
+      return { warmBootReady: true };
+    },
+    bootOrchestratorOptions: {
+      preloadTasks: [
+        {
+          name: 'customSidecar',
+          optional: true,
+          async run() {
+            customTaskCalls += 1;
+            return { ok: true };
+          },
+        },
+      ],
+      onPhaseChange() {
+        if (app && app.splashOverlay) {
+          splashProgressSamples.push(app.splashOverlay.getState().progressPct);
+        }
+      },
+    },
+    // W311 SplashOverlay default 220ms fadeOutMs (no explicit fadeMs/fadeOutMs)
+    splashOverlayOptions: {
+      setTimeout(fn, ms) {
+        fadeScheduledMs = ms;
+        fadeCallback = fn;
+        return 1;
+      },
+      clearTimeout() {
+        fadeCallback = null;
+      },
+    },
+    now: clock.now,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+    createWasmWorker() {
+      return mockWorker;
+    },
+  });
+
+  try {
+    // W310 options were passed cleanly to PgimPreloader.
+    assert.ok(app.pgimPreloader instanceof PgimPreloader);
+    assert.equal(app.pgimPreloader.opfsCacheVersion, 2);
+    assert.equal(app.pgimPreloader.opfsCacheDirName, 'custom-pgim-cache');
+    assert.equal(app.pgimPreloader.opfsValidateWithHead, true);
+
+    // W311 default fadeOutMs is 220ms.
+    assert.equal(app.splashOverlay.getState().fadeOutMs, 220);
+    assert.equal(app.splashOverlay.getState().fadeMs, 220);
+
+    const started = await app.start();
+    assert.equal(started.ok, true);
+    await app.pgimPreloader.flushOpfsWrites();
+
+    // W309 concurrent preload tasks ran through BootOrchestrator.
+    assert.equal(runtimeWasmCalls, 1);
+    assert.equal(opfsProbeCalls, 1);
+    assert.equal(customTaskCalls, 1);
+    assert.ok(maxConcurrentPreloads >= 2);
+
+    // W310 OPFS cache was probed and written through.
+    assert.ok(opfsReads >= 1);
+    assert.ok(opfsWrites >= 1);
+
+    // W311 splash progress stayed strictly monotonic across orchestrator phases.
+    assert.ok(splashProgressSamples.length >= 2);
+    for (let i = 1; i < splashProgressSamples.length; i += 1) {
+      assert.ok(
+        splashProgressSamples[i] >= splashProgressSamples[i - 1],
+        `Expected monotonic splash progress: ${splashProgressSamples.join(', ')}`
+      );
+    }
+
+    // Out-of-order earlier phase update cannot regress splash progress.
+    const beforeStale = app.splashOverlay.getState().progressPct;
+    app.splashOverlay.updateBootState({ stage: 'PGIM_LOAD', phaseProgress: 0.1 });
+    assert.ok(app.splashOverlay.getState().progressPct >= beforeStale);
+
+    // FIRST_PRESENT dismisses with default 220ms fadeOutMs.
+    clock.advance(50);
+    mockWorker.dispatch('message', { data: { type: 'first-present', framesPresented: 1 } });
+    assert.equal(fadeScheduledMs, 220);
+    assert.equal(app.splashOverlay.getState().fading, true);
+    clock.advance(220);
+    fadeCallback();
+    assert.equal(app.splashOverlay.getState().fadeOutCompleted, true);
+    assert.equal(app.splashOverlay.getState().visible, false);
+
+    // Telemetry snapshots surface W309/W310 preloadTelemetry and W311 splashTelemetry cleanly.
+    const snap = app.getBootTelemetry();
+    assert.equal(Object.isFrozen(snap.preloadTelemetry), true);
+    assert.equal(snap.preloadTelemetry.parallelPreload, true);
+    assert.equal(snap.preloadTelemetry.preloadConcurrency, 4);
+    assert.ok(snap.preloadTelemetry.parallelStagesCount >= 2);
+    assert.ok(snap.preloadTelemetry.opfsWrites >= 1);
+    assert.equal(Object.isFrozen(snap.splashTelemetry), true);
+    assert.equal(snap.splashTelemetry.fadeOutMs, 220);
+    assert.equal(snap.splashTelemetry.fadeOutCompleted, true);
+    assert.equal(snap.splashTelemetry.progressPct, 100);
+  } finally {
+    await app.destroy();
+  }
+});
+
+test('W333 wires W321 RuntimeSessionController phase durations, getPhaseTelemetry(), and reclaimSoftMemory() / memory-pressure callbacks', async () => {
+  const clock = createClock(5000);
+  const raf = createFakeRaf(clock);
+  const timers = createFakeTimers();
+  const webgpu = createMockWebGpuEnv();
+  const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+    clock,
+    raf,
+    timers,
+    gpu: webgpu.gpu,
+  });
+
+  const mockWorker = createFakeEventTarget({
+    postMessage() {},
+    terminate() {},
+  });
+
+  let releasePreloadCalls = 0;
+  let evictionCalls = 0;
+  const memoryReclaimEvents = [];
+  const memoryPressureEvents = [];
+
+  const mockOrchestrator = {
+    async start() {
+      return { ok: true, bootMode: 'wasm-guest' };
+    },
+    releasePreloadBuffers() {
+      releasePreloadCalls += 1;
+      return { releasedFields: ['pgim.bytes'], releasedBytes: 1024 };
+    },
+    getStats() {
+      return { parallelPreload: true, preloadConcurrency: 8, totalBootMs: 120 };
+    },
+  };
+
+  const mockStorageManager = {
+    async getFastBootPlan() {
+      return {
+        warmCacheReady: true,
+        recommendedSlabMaxBytes: 64 * 1024 * 1024,
+        recommendedOpfsBudgetBytes: 256 * 1024 * 1024,
+        quotaHeadroomBytes: 1024 * 1024 * 1024,
+        pressureLevel: 'low',
+        shouldEvictColdChunks: false,
+      };
+    },
+    async runQuotaPressureEviction() {
+      evictionCalls += 1;
+      return { ok: true, evictedBytes: 8192, evictedEntries: 2 };
+    },
+  };
+
+  const app = bootstrapPlayGta6App({
+    windowObj,
+    documentObj,
+    navigatorObj,
+    fetchImpl: createMockFetch({ ok: true, coopCoep: true, hasWasmBinary: true }),
+    canvas: webgpu.canvas,
+    hud: createMockHud(),
+    bootOrchestrator: mockOrchestrator,
+    storageManager: mockStorageManager,
+    onMemoryReclaim(ctx) {
+      memoryReclaimEvents.push(ctx);
+    },
+    onMemoryPressure(ctx) {
+      memoryPressureEvents.push(ctx);
+    },
+    now: clock.now,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+    createWasmWorker() {
+      return mockWorker;
+    },
+  });
+
+  try {
+    const started = await app.start();
+    assert.equal(started.ok, true);
+    assert.equal(app.getPhaseTelemetry().currentPhase, 'boot');
+
+    // Advance clock through boot -> start_screen -> main_menu -> in_game via milestones & worker message.
+    clock.advance(400);
+    app.recordFastBootMilestone('START_SCREEN');
+    clock.advance(300);
+    mockWorker.dispatch('message', {
+      data: { type: 'session-phase', phase: 'main_menu' },
+    });
+    clock.advance(500);
+    app.recordFastBootMilestone('IN_GAME');
+    clock.advance(250);
+
+    const phaseTel = app.getPhaseTelemetry();
+    assert.equal(Object.isFrozen(phaseTel), true);
+    assert.equal(Object.isFrozen(phaseTel.phaseDurationsMs), true);
+    assert.equal(phaseTel.currentPhase, 'in_game');
+    assert.equal(phaseTel.phaseDurationsMs.boot, 400);
+    assert.equal(phaseTel.phaseDurationsMs.start_screen, 300);
+    assert.equal(phaseTel.phaseDurationsMs.main_menu, 500);
+    assert.equal(phaseTel.phaseDurationsMs.in_game, 250);
+    assert.ok(phaseTel.phaseTransitionCount >= 4);
+
+    // Register an extra dynamic reclaim hook + a throwing hook to verify error isolation.
+    let dynamicHookCount = 0;
+    const unregisterDynamic = app.registerReclaimHook(() => {
+      dynamicHookCount += 1;
+    });
+    const unregisterFailing = app.registerReclaimHook(() => {
+      throw new Error('non-fatal reclaim warning');
+    });
+
+    const reclaimRes = await app.reclaimSoftMemory('vram-high');
+    assert.equal(reclaimRes.reason, 'vram-high');
+    assert.equal(reclaimRes.reclaimRuns, 1);
+    assert.equal(reclaimRes.reclaimFailures, 1);
+    assert.equal(releasePreloadCalls, 1);
+    assert.equal(evictionCalls, 1);
+    assert.equal(memoryReclaimEvents.length, 1);
+    assert.equal(memoryPressureEvents.length, 1);
+    assert.equal(dynamicHookCount, 1);
+
+    // Unregister failing hook, then trigger memory-pressure worker message.
+    unregisterFailing();
+    mockWorker.dispatch('message', {
+      data: { type: 'memory-pressure', reason: 'heap-spike' },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(app.getPhaseTelemetry().reclaimRuns, 2);
+    assert.equal(app.getPhaseTelemetry().reclaimFailures, 1);
+    assert.equal(app.getPhaseTelemetry().lastReclaimReason, 'heap-spike');
+    assert.equal(memoryReclaimEvents.length, 2);
+    assert.equal(dynamicHookCount, 2);
+    unregisterDynamic();
+
+    // Verify telemetry snapshots include W321 phase & reclaim fields.
+    const snap = app.getBootTelemetry();
+    assert.equal(snap.sessionPhase, 'in_game');
+    assert.equal(snap.phaseDurationsMs.boot, 400);
+    assert.equal(snap.phaseDurationsMs.main_menu, 500);
+    assert.equal(snap.reclaimRuns, 2);
+    assert.equal(snap.reclaimFailures, 1);
+    assert.equal(snap.phaseTelemetry.currentPhase, 'in_game');
+
+    const diag = app.getDiagnosticsSnapshot();
+    assert.equal(diag.sessionPhase, 'in_game');
+    assert.equal(diag.phaseDurationsMs.boot, 400);
+    assert.equal(diag.reclaimRuns, 2);
+    assert.equal(diag.reclaimFailures, 1);
+  } finally {
+    await app.destroy();
+  }
+
+  // Reclaim after destroy returns cleanly without invoking hooks.
+  const afterDestroy = await app.reclaimSoftMemory('late-pressure');
+  assert.equal(afterDestroy.ok, false);
+  assert.equal(afterDestroy.destroyed, true);
+  assert.equal(memoryReclaimEvents.length, 2);
 });
