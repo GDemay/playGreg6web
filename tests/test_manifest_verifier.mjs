@@ -21,8 +21,10 @@ import {
   computeDigest,
   computeStreamingReadiness,
   createIncrementalVerifier,
+  getFingerprintCacheStats,
   getStats,
   hasIncompleteSuffix,
+  isStrongEtag,
   parseContentRange,
   resetStats,
   validateBootset,
@@ -2472,6 +2474,611 @@ describe('bounded concurrency, streaming reader hashing, AbortSignal propagation
       abortedCount: 0,
       peakConcurrentHashes: 0,
       activeHashes: 0,
+    });
+  });
+});
+
+describe('warm-boot ETag+size fingerprint skip cache (W328)', () => {
+  it('validates strong RFC 9110 ETags via isStrongEtag() and rejects weak, empty, unquoted, or control-char values', () => {
+    assert.equal(isStrongEtag('"abc123"'), true);
+    assert.equal(isStrongEtag(' "ffdc0-2000" '), true);
+    assert.equal(isStrongEtag('"a"'), true);
+
+    assert.equal(isStrongEtag('W/"abc123"'), false);
+    assert.equal(isStrongEtag('w/"abc123"'), false);
+    assert.equal(isStrongEtag('""'), false);
+    assert.equal(isStrongEtag('abc123'), false);
+    assert.equal(isStrongEtag(''), false);
+    assert.equal(isStrongEtag('   '), false);
+    assert.equal(isStrongEtag('"bad\nchar"'), false);
+    assert.equal(isStrongEtag(null), false);
+    assert.equal(isStrongEtag(undefined), false);
+    assert.equal(isStrongEtag(12345), false);
+  });
+
+  it('skips GET body fetches and SHA-256 re-hashing on warm boot when HEAD strong ETag + Content-Length match verifiedFingerprints or previousSnapshot', async () => {
+    resetStats();
+
+    const rpfBytes = makeSyntheticPayload(16384, 0x31);
+    const pgimBytes = makeSyntheticPayload(12288, 0x32);
+    const packBytes = makeSyntheticPayload(8192, 0x33);
+    const totalAssetBytes = rpfBytes.byteLength + pgimBytes.byteLength + packBytes.byteLength;
+
+    const files = [
+      { path: 'x64/levels.rpf', size: rpfBytes.byteLength, sha256: sha256Hex(rpfBytes), etag: '"rpf-v1"' },
+      { path: 'guest/boot.pgim', size: pgimBytes.byteLength, sha256: sha256Hex(pgimBytes), etag: '"pgim-v1"' },
+      { path: 'shaders/world.wgsl.pack', size: packBytes.byteLength, sha256: sha256Hex(packBytes), etag: '"pack-v1"' },
+    ];
+    const manifest = makeValidManifest({ files });
+    const backing = new Map([
+      ['x64/levels.rpf', { bytes: rpfBytes, etag: '"rpf-v1"' }],
+      ['guest/boot.pgim', { bytes: pgimBytes, etag: '"pgim-v1"' }],
+      ['shaders/world.wgsl.pack', { bytes: packBytes, etag: '"pack-v1"' }],
+    ]);
+
+    // 1. Cold boot: hashes all 3 files and emits a sanitized verifiedFingerprints snapshot.
+    const coldMock = createMockDataFetch(backing);
+    const coldReport = await verifyLiveEndpoints({
+      fetchImpl: coldMock.fetchImpl,
+      dataBase: '/data/',
+      manifest,
+      sampleCount: 10,
+      verifyHashes: true,
+      checkCoopCoep: true,
+    });
+
+    assert.equal(coldReport.ok, true);
+    assert.equal(coldReport.passed, 3);
+    assert.equal(coldReport.fingerprintSkippedCount, 0);
+    assert.equal(coldReport.bytesSkippedByFingerprint, 0);
+    assert.equal(coldReport.telemetry.fingerprintSkippedCount, 0);
+    assert.equal(coldReport.telemetry.bytesSkippedByFingerprint, 0);
+    assert.equal(coldReport.bytesHashed, totalAssetBytes);
+    assert.deepEqual(coldReport.verifiedFingerprints, {
+      'x64/levels.rpf': { etag: '"rpf-v1"', size: rpfBytes.byteLength, sha256: sha256Hex(rpfBytes) },
+      'guest/boot.pgim': { etag: '"pgim-v1"', size: pgimBytes.byteLength, sha256: sha256Hex(pgimBytes) },
+      'shaders/world.wgsl.pack': { etag: '"pack-v1"', size: packBytes.byteLength, sha256: sha256Hex(packBytes) },
+    });
+    assert.ok(coldMock.calls.some((c) => c.method === 'GET'));
+
+    // 2. Warm boot via verifiedFingerprints plain object: ONLY HEAD requests, ZERO GET requests!
+    resetStats();
+    const warmMock = createMockDataFetch(backing);
+    const warmReport = await verifyLiveEndpoints({
+      fetchImpl: warmMock.fetchImpl,
+      dataBase: '/data/',
+      manifest,
+      sampleCount: 10,
+      verifyHashes: true,
+      checkCoopCoep: true,
+      verifiedFingerprints: coldReport.verifiedFingerprints,
+    });
+
+    assert.equal(warmReport.ok, true);
+    assert.equal(warmReport.probed, 3);
+    assert.equal(warmReport.passed, 3);
+    assert.equal(warmReport.failed, 0);
+    assert.equal(warmReport.filesVerified, 3);
+    assert.equal(warmReport.bytesHashed, 0);
+    assert.equal(warmReport.bytesVerified, 0);
+    assert.equal(warmReport.peakConcurrentHashes, 0);
+    assert.equal(warmReport.fingerprintSkippedCount, 3);
+    assert.equal(warmReport.bytesSkippedByFingerprint, totalAssetBytes);
+    assert.equal(warmReport.telemetry.fingerprintSkippedCount, 3);
+    assert.equal(warmReport.telemetry.bytesSkippedByFingerprint, totalAssetBytes);
+    assert.equal(warmReport.telemetry.bytesHashed, 0);
+
+    // Strictly 3 HEAD requests and 0 GET requests (neither Range GET nor full body GET).
+    assert.equal(warmMock.calls.length, 3);
+    assert.ok(warmMock.calls.every((c) => c.method === 'HEAD'));
+
+    for (const r of warmReport.results) {
+      assert.equal(r.ok, true);
+      assert.equal(r.fingerprintSkipped, true);
+      assert.equal(r.bytesSkippedByFingerprint, r.expectedSize);
+      assert.equal(r.range.skipped, true);
+      assert.equal(r.range.status, null);
+      assert.equal(r.hash.verified, true);
+      assert.equal(r.hash.skippedByFingerprint, true);
+      assert.equal(r.hash.checkedBytes, 0);
+      assert.equal(r.hash.actual, r.hash.expected);
+      assert.equal(r.coopCoep, true);
+    }
+
+    assert.deepEqual(getFingerprintCacheStats(), {
+      fingerprintSkippedCount: 3,
+      bytesSkippedByFingerprint: totalAssetBytes,
+    });
+
+    // 3. Warm boot via previousSnapshot (passing full coldReport directly) and via Map.
+    const snapMock = createMockDataFetch(backing);
+    const snapReport = await verifyLiveEndpoints({
+      fetchImpl: snapMock.fetchImpl,
+      dataBase: '/data/',
+      manifest,
+      sampleCount: 10,
+      verifyHashes: true,
+      previousSnapshot: coldReport,
+    });
+    assert.equal(snapReport.ok, true);
+    assert.equal(snapReport.fingerprintSkippedCount, 3);
+    assert.equal(snapReport.bytesSkippedByFingerprint, totalAssetBytes);
+    assert.equal(snapReport.bytesHashed, 0);
+    assert.equal(snapMock.calls.length, 3);
+    assert.ok(snapMock.calls.every((c) => c.method === 'HEAD'));
+
+    const mapMock = createMockDataFetch(backing);
+    const fpMap = new Map(Object.entries(coldReport.verifiedFingerprints));
+    const mapReport = await verifyLiveEndpoints({
+      fetchImpl: mapMock.fetchImpl,
+      dataBase: '/data/',
+      manifest,
+      sampleCount: 10,
+      verifyHashes: true,
+      verifiedFingerprints: fpMap,
+    });
+    assert.equal(mapReport.ok, true);
+    assert.equal(mapReport.fingerprintSkippedCount, 3);
+    assert.equal(mapReport.bytesSkippedByFingerprint, totalAssetBytes);
+    assert.equal(mapMock.calls.length, 3);
+    assert.ok(mapMock.calls.every((c) => c.method === 'HEAD'));
+
+    // Cumulative fingerprint cache stats tracked across runs and reset cleanly by resetStats().
+    assert.deepEqual(getFingerprintCacheStats(), {
+      fingerprintSkippedCount: 9,
+      bytesSkippedByFingerprint: totalAssetBytes * 3,
+    });
+    resetStats();
+    assert.deepEqual(getFingerprintCacheStats(), {
+      fingerprintSkippedCount: 0,
+      bytesSkippedByFingerprint: 0,
+    });
+    // Existing W278 getStats() contract stays 100% intact.
+    assert.deepEqual(getStats(), {
+      filesVerified: 0,
+      bytesHashed: 0,
+      mismatchCount: 0,
+      abortedCount: 0,
+      peakConcurrentHashes: 0,
+      activeHashes: 0,
+    });
+  });
+
+  it('forces full streaming re-hash when ETag changes, updating snapshot on valid payload and catching corruption on bad payload', async () => {
+    resetStats();
+    const v1Bytes = makeSyntheticPayload(8192, 0x51);
+    const v2Bytes = makeSyntheticPayload(8192, 0x52);
+    const corruptBytes = v2Bytes.slice();
+    corruptBytes[4096] ^= 0xff;
+
+    const previousVerified = {
+      'x64/world.rpf': { etag: '"world-v1"', size: v1Bytes.byteLength, sha256: sha256Hex(v1Bytes) },
+      'shaders/fx.wgsl.pack': { etag: '"fx-v1"', size: v1Bytes.byteLength, sha256: sha256Hex(v1Bytes) },
+    };
+
+    const manifest = makeValidManifest({
+      files: [
+        { path: 'x64/world.rpf', size: v2Bytes.byteLength, sha256: sha256Hex(v2Bytes) },
+        { path: 'shaders/fx.wgsl.pack', size: v2Bytes.byteLength, sha256: sha256Hex(v2Bytes) },
+      ],
+    });
+
+    const backing = new Map([
+      ['x64/world.rpf', { bytes: v2Bytes, etag: '"world-v2"' }],
+      ['shaders/fx.wgsl.pack', { bytes: corruptBytes, etag: '"fx-v2"' }],
+    ]);
+
+    let arrayBufferCalled = 0;
+    const methodsByPath = new Map();
+    const fetchImpl = async (url, init = {}) => {
+      const method = (init.method || 'GET').toUpperCase();
+      const rangeHeader = init.headers?.Range || init.headers?.range || null;
+      const relPath = url.replace(/^\/data\//, '');
+      const list = methodsByPath.get(relPath) || [];
+      list.push(rangeHeader ? `${method}:range` : method);
+      methodsByPath.set(relPath, list);
+
+      const entry = backing.get(relPath);
+      const baseHeaders = { 'Accept-Ranges': 'bytes', ETag: entry.etag };
+      if (method === 'HEAD') {
+        return {
+          status: 200,
+          ok: true,
+          headers: makeMockHeaders({ ...baseHeaders, 'Content-Length': String(entry.bytes.byteLength) }),
+        };
+      }
+      if (rangeHeader) {
+        return {
+          status: 206,
+          ok: true,
+          headers: makeMockHeaders({
+            ...baseHeaders,
+            'Content-Range': `bytes 0-0/${entry.bytes.byteLength}`,
+            'Content-Length': '1',
+          }),
+          body: createChunkReadableStream([entry.bytes.subarray(0, 1)]).stream,
+        };
+      }
+      return {
+        status: 200,
+        ok: true,
+        headers: makeMockHeaders({ ...baseHeaders, 'Content-Length': String(entry.bytes.byteLength) }),
+        body: createChunkReadableStream(splitIntoChunks(entry.bytes, [2048])).stream,
+        async arrayBuffer() {
+          arrayBufferCalled += 1;
+          throw new Error('must stream via body.getReader() on ETag fallback');
+        },
+      };
+    };
+
+    const report = await verifyLiveEndpoints({
+      fetchImpl,
+      dataBase: '/data/',
+      manifest,
+      sampleCount: 5,
+      verifyHashes: true,
+      verifiedFingerprints: previousVerified,
+    });
+
+    assert.equal(arrayBufferCalled, 0);
+    assert.equal(report.ok, false);
+    assert.equal(report.passed, 1);
+    assert.equal(report.failed, 1);
+    assert.equal(report.fingerprintSkippedCount, 0);
+    assert.equal(report.bytesSkippedByFingerprint, 0);
+    assert.equal(report.bytesHashed, v2Bytes.byteLength * 2);
+    assert.deepEqual(methodsByPath.get('x64/world.rpf'), ['HEAD', 'GET:range', 'GET']);
+    assert.deepEqual(methodsByPath.get('shaders/fx.wgsl.pack'), ['HEAD', 'GET:range', 'GET']);
+
+    // Valid updated file replaces old snapshot entry; failed file is excluded from verifiedFingerprints.
+    assert.equal(report.results[0].ok, true);
+    assert.equal(report.results[0].fingerprintSkipped, false);
+    assert.deepEqual(report.verifiedFingerprints, {
+      'x64/world.rpf': { etag: '"world-v2"', size: v2Bytes.byteLength, sha256: sha256Hex(v2Bytes) },
+    });
+    assert.equal(report.results[1].ok, false);
+    assert.equal(report.results[1].hash.verified, false);
+    assert.deepEqual(report.results[1].mismatchCategories, ['hash_mismatch']);
+  });
+
+  it('falls back to full streaming verification on weak ETag, missing ETag, missing Content-Length, size drift, or unhashed snapshot entry', async () => {
+    resetStats();
+    const payload = makeSyntheticPayload(4096, 0x61);
+    const sha = sha256Hex(payload);
+    const wrongSizePayload = makeSyntheticPayload(2048, 0x62);
+
+    const manifest = makeValidManifest({
+      files: [
+        { path: 'weak.rpf', size: payload.byteLength, sha256: sha },
+        { path: 'missing_etag.rpf', size: payload.byteLength, sha256: sha },
+        { path: 'no_head_len.pgim', size: payload.byteLength, sha256: sha },
+        { path: 'size_diff.pack', size: payload.byteLength, sha256: sha },
+        { path: 'no_cached_sha.rpf', size: payload.byteLength, sha256: sha },
+        { path: 'diff_cached_sha.rpf', size: payload.byteLength, sha256: sha },
+      ],
+    });
+
+    const verifiedFingerprints = {
+      'weak.rpf': { etag: 'W/"weak-1"', size: payload.byteLength, sha256: sha },
+      'missing_etag.rpf': { etag: '"was-strong"', size: payload.byteLength, sha256: sha },
+      'no_head_len.pgim': { etag: '"no-len-1"', size: payload.byteLength, sha256: sha },
+      'size_diff.pack': { etag: '"size-1"', size: payload.byteLength, sha256: sha },
+      'no_cached_sha.rpf': { etag: '"nosha-1"', size: payload.byteLength, sha256: null },
+      'diff_cached_sha.rpf': { etag: '"diffsha-1"', size: payload.byteLength, sha256: '0'.repeat(64) },
+    };
+
+    const getCounts = new Map();
+    const fetchImpl = async (url, init = {}) => {
+      const method = (init.method || 'GET').toUpperCase();
+      const rangeHeader = init.headers?.Range || init.headers?.range || null;
+      const relPath = url.replace(/^\/data\//, '');
+      if (method === 'GET' && !rangeHeader) {
+        getCounts.set(relPath, (getCounts.get(relPath) || 0) + 1);
+      }
+
+      const bytes = relPath === 'size_diff.pack' ? wrongSizePayload : payload;
+      const etagByPath = {
+        'weak.rpf': 'W/"weak-1"',
+        'missing_etag.rpf': null,
+        'no_head_len.pgim': '"no-len-1"',
+        'size_diff.pack': '"size-1"',
+        'no_cached_sha.rpf': '"nosha-1"',
+        'diff_cached_sha.rpf': '"diffsha-1"',
+      };
+      const etag = etagByPath[relPath];
+      const baseHeaders = { 'Accept-Ranges': 'bytes' };
+      if (etag) baseHeaders.ETag = etag;
+
+      if (method === 'HEAD') {
+        const headers = { ...baseHeaders };
+        if (relPath !== 'no_head_len.pgim') {
+          headers['Content-Length'] = String(bytes.byteLength);
+        }
+        return { status: 200, ok: true, headers: makeMockHeaders(headers) };
+      }
+
+      if (rangeHeader) {
+        return {
+          status: 206,
+          ok: true,
+          headers: makeMockHeaders({
+            ...baseHeaders,
+            'Content-Range': `bytes 0-0/${bytes.byteLength}`,
+            'Content-Length': '1',
+          }),
+          body: createChunkReadableStream([bytes.subarray(0, 1)]).stream,
+        };
+      }
+
+      return {
+        status: 200,
+        ok: true,
+        headers: makeMockHeaders({ ...baseHeaders, 'Content-Length': String(bytes.byteLength) }),
+        body: createChunkReadableStream(splitIntoChunks(bytes, [1024])).stream,
+      };
+    };
+
+    const report = await verifyLiveEndpoints({
+      fetchImpl,
+      dataBase: '/data/',
+      manifest,
+      sampleCount: 10,
+      verifyHashes: true,
+      verifiedFingerprints,
+    });
+
+    assert.equal(report.fingerprintSkippedCount, 0);
+    assert.equal(report.bytesSkippedByFingerprint, 0);
+    assert.equal(report.telemetry.fingerprintSkippedCount, 0);
+    assert.equal(report.telemetry.bytesSkippedByFingerprint, 0);
+
+    // Every single entry must have fallen back to a full GET hash verification.
+    for (const f of manifest.files) {
+      assert.equal(getCounts.get(f.path), 1, `expected full GET fallback for ${f.path}`);
+    }
+    assert.equal(report.bytesHashed, payload.byteLength * 5 + wrongSizePayload.byteLength);
+
+    // Weak ETag must never be written to verifiedFingerprints; valid strong ETag fallbacks are emitted.
+    assert.equal('weak.rpf' in report.verifiedFingerprints, false);
+    assert.equal('missing_etag.rpf' in report.verifiedFingerprints, false);
+    assert.equal('size_diff.pack' in report.verifiedFingerprints, false);
+    assert.equal(report.verifiedFingerprints['no_head_len.pgim'].sha256, sha);
+    assert.equal(report.verifiedFingerprints['no_cached_sha.rpf'].sha256, sha);
+    assert.equal(report.verifiedFingerprints['diff_cached_sha.rpf'].sha256, sha);
+  });
+
+  it('bypasses matching fingerprint cache when forceReverify: true is set', async () => {
+    resetStats();
+    const bytesA = makeSyntheticPayload(6144, 0x71);
+    const bytesB = makeSyntheticPayload(4096, 0x72);
+    const manifest = makeValidManifest({
+      files: [
+        { path: 'x64/a.rpf', size: bytesA.byteLength, sha256: sha256Hex(bytesA), etag: '"a1"' },
+        { path: 'guest/b.pgim', size: bytesB.byteLength, sha256: sha256Hex(bytesB), etag: '"b1"' },
+      ],
+    });
+    const backing = new Map([
+      ['x64/a.rpf', { bytes: bytesA, etag: '"a1"' }],
+      ['guest/b.pgim', { bytes: bytesB, etag: '"b1"' }],
+    ]);
+
+    const snapshot = {
+      'x64/a.rpf': { etag: '"a1"', size: bytesA.byteLength, sha256: sha256Hex(bytesA) },
+      'guest/b.pgim': { etag: '"b1"', size: bytesB.byteLength, sha256: sha256Hex(bytesB) },
+    };
+
+    const { fetchImpl, calls } = createMockDataFetch(backing);
+    const report = await verifyLiveEndpoints({
+      fetchImpl,
+      dataBase: '/data/',
+      manifest,
+      sampleCount: 10,
+      verifyHashes: true,
+      verifiedFingerprints: snapshot,
+      previousSnapshot: snapshot,
+      forceReverify: true,
+    });
+
+    assert.equal(report.ok, true);
+    assert.equal(report.passed, 2);
+    assert.equal(report.fingerprintSkippedCount, 0);
+    assert.equal(report.bytesSkippedByFingerprint, 0);
+    assert.equal(report.telemetry.fingerprintSkippedCount, 0);
+    assert.equal(report.telemetry.bytesSkippedByFingerprint, 0);
+    assert.equal(report.bytesHashed, bytesA.byteLength + bytesB.byteLength);
+    // 2 HEAD + 2 Range GET + 2 Full GET = 6 requests
+    assert.equal(calls.length, 6);
+    assert.equal(calls.filter((c) => c.method === 'GET' && !c.range).length, 2);
+    assert.ok(report.results.every((r) => r.fingerprintSkipped === false));
+    assert.deepEqual(getFingerprintCacheStats(), {
+      fingerprintSkippedCount: 0,
+      bytesSkippedByFingerprint: 0,
+    });
+  });
+
+  it('preserves W278 bounded concurrency, manifest order, AbortSignal handling, and sanitized telemetry on mixed warm-boot batches', async () => {
+    resetStats();
+    const entries = [
+      { path: 'x64/skip_0.rpf', size: 10240, etag: '"skip-0"', mode: 'skip' },
+      { path: 'guest/changed_1.pgim', size: 6144, etag: '"chg-v2"', cachedEtag: '"chg-v1"', mode: 'fallback' },
+      { path: 'shaders/skip_2.wgsl.pack', size: 8192, etag: '"skip-2"', mode: 'skip' },
+      { path: 'x64/weak_3.rpf', size: 4096, etag: 'W/"weak-3"', mode: 'fallback' },
+      { path: 'x64/skip_4.rpf', size: 12288, etag: '"skip-4"', mode: 'skip' },
+      { path: 'shaders/new_5.wgsl.pack', size: 5120, etag: '"new-5"', mode: 'fallback' },
+    ];
+
+    const files = [];
+    const payloads = new Map();
+    const verifiedFingerprints = {
+      // Malicious / unsafe cache keys must be silently ignored and never leaked.
+      '../escape.rpf': { etag: '"bad"', size: 10, sha256: 'a'.repeat(64) },
+      'C:/Users/Alice/secret.rpf': { etag: '"bad2"', size: 10, sha256: 'b'.repeat(64) },
+    };
+
+    let expectedSkippedBytes = 0;
+    let expectedHashedBytes = 0;
+    for (let i = 0; i < entries.length; i += 1) {
+      const e = entries[i];
+      const bytes = makeSyntheticPayload(e.size, 0x80 + i);
+      const sha = sha256Hex(bytes);
+      files.push({ path: e.path, size: e.size, sha256: sha });
+      payloads.set(e.path, { bytes, etag: e.etag });
+      if (e.mode === 'skip') {
+        expectedSkippedBytes += e.size;
+        verifiedFingerprints[e.path] = { etag: e.etag, size: e.size, sha256: sha };
+      } else {
+        expectedHashedBytes += e.size;
+        if (e.cachedEtag) {
+          verifiedFingerprints[e.path] = { etag: e.cachedEtag, size: e.size, sha256: sha };
+        } else if (e.etag.startsWith('W/')) {
+          verifiedFingerprints[e.path] = { etag: e.etag, size: e.size, sha256: sha };
+        }
+      }
+    }
+
+    const manifest = makeValidManifest({ files });
+    let inFlightStreams = 0;
+    let peakInFlightStreams = 0;
+    const getRequestedPaths = new Set();
+
+    const fetchImpl = async (url, init = {}) => {
+      const method = (init.method || 'GET').toUpperCase();
+      const rangeHeader = init.headers?.Range || init.headers?.range || null;
+      const relPath = url.replace(/^\/data\//, '');
+      const item = payloads.get(relPath);
+      const baseHeaders = { 'Accept-Ranges': 'bytes', ETag: item.etag };
+
+      if (method === 'HEAD') {
+        return {
+          status: 200,
+          ok: true,
+          headers: makeMockHeaders({ ...baseHeaders, 'Content-Length': String(item.bytes.byteLength) }),
+        };
+      }
+
+      getRequestedPaths.add(relPath);
+      if (rangeHeader) {
+        return {
+          status: 206,
+          ok: true,
+          headers: makeMockHeaders({
+            ...baseHeaders,
+            'Content-Range': `bytes 0-0/${item.bytes.byteLength}`,
+            'Content-Length': '1',
+          }),
+          body: createChunkReadableStream([item.bytes.subarray(0, 1)]).stream,
+        };
+      }
+
+      const chunks = splitIntoChunks(item.bytes, [1024]);
+      let idx = 0;
+      let active = false;
+      const stream = new ReadableStream({
+        async pull(controller) {
+          if (!active) {
+            active = true;
+            inFlightStreams += 1;
+            if (inFlightStreams > peakInFlightStreams) peakInFlightStreams = inFlightStreams;
+          }
+          await new Promise((r) => setTimeout(r, 4));
+          if (idx >= chunks.length) {
+            if (active) {
+              active = false;
+              inFlightStreams -= 1;
+            }
+            controller.close();
+            return;
+          }
+          controller.enqueue(chunks[idx]);
+          idx += 1;
+        },
+        cancel() {
+          if (active) {
+            active = false;
+            inFlightStreams -= 1;
+          }
+        },
+      });
+
+      return {
+        status: 200,
+        ok: true,
+        headers: makeMockHeaders({ ...baseHeaders, 'Content-Length': String(item.bytes.byteLength) }),
+        body: stream,
+        async arrayBuffer() {
+          throw new Error('must stream fallback files via body.getReader()');
+        },
+      };
+    };
+
+    const report = await verifyLiveEndpoints({
+      fetchImpl,
+      dataBase: '/data/',
+      manifest,
+      sampleCount: 10,
+      maxConcurrency: 2,
+      verifyHashes: true,
+      verifiedFingerprints,
+    });
+
+    assert.equal(report.ok, true);
+    assert.equal(report.passed, 6);
+    assert.equal(report.maxConcurrency, 2);
+    assert.equal(report.fingerprintSkippedCount, 3);
+    assert.equal(report.bytesSkippedByFingerprint, expectedSkippedBytes);
+    assert.equal(report.bytesHashed, expectedHashedBytes);
+    assert.ok(peakInFlightStreams >= 1 && peakInFlightStreams <= 2);
+    assert.ok(report.peakConcurrentHashes >= 1 && report.peakConcurrentHashes <= 2);
+
+    // Manifest order preserved.
+    assert.deepEqual(
+      report.results.map((r) => r.path),
+      entries.map((e) => e.path),
+    );
+
+    // Skipped entries never issued any GET request.
+    assert.equal(getRequestedPaths.has('x64/skip_0.rpf'), false);
+    assert.equal(getRequestedPaths.has('shaders/skip_2.wgsl.pack'), false);
+    assert.equal(getRequestedPaths.has('x64/skip_4.rpf'), false);
+    assert.equal(getRequestedPaths.has('guest/changed_1.pgim'), true);
+    assert.equal(getRequestedPaths.has('x64/weak_3.rpf'), true);
+    assert.equal(getRequestedPaths.has('shaders/new_5.wgsl.pack'), true);
+
+    // Sanitized output must never leak unsafe cache keys or host paths.
+    const serialized = JSON.stringify(report);
+    assert.equal(serialized.includes('Alice'), false);
+    assert.equal(serialized.includes('../escape.rpf'), false);
+    assert.equal('x64/weak_3.rpf' in report.verifiedFingerprints, false);
+    assert.equal(Object.keys(report.verifiedFingerprints).length, 5);
+
+    // AbortSignal during HEAD does not count aborted entry as fingerprint-skipped.
+    resetStats();
+    const controller = new AbortController();
+    const abortFetch = async (url, init = {}) => {
+      if (init.method === 'HEAD') {
+        setTimeout(() => controller.abort(new Error('cancelled during HEAD')), 5);
+        return new Promise(() => {});
+      }
+      return fetchImpl(url, init);
+    };
+    const abortReport = await verifyLiveEndpoints({
+      fetchImpl: abortFetch,
+      dataBase: '/data/',
+      manifest,
+      sampleCount: 6,
+      maxConcurrency: 2,
+      verifyHashes: true,
+      verifiedFingerprints,
+      signal: controller.signal,
+    });
+    assert.equal(abortReport.ok, false);
+    assert.equal(abortReport.aborted, true);
+    assert.equal(abortReport.abortedCount, 2);
+    assert.equal(abortReport.fingerprintSkippedCount, 0);
+    assert.equal(abortReport.bytesSkippedByFingerprint, 0);
+    assert.deepEqual(getFingerprintCacheStats(), {
+      fingerprintSkippedCount: 0,
+      bytesSkippedByFingerprint: 0,
     });
   });
 });
