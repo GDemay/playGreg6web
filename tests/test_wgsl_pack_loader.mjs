@@ -1667,3 +1667,609 @@ test('W109 ranged index parser & fetcher validate corrupt headers, bounds, UTF-8
   assert.equal(directIndexPack.mode, 'ranged');
   assert.equal(await directIndexPack.getWgslAsync(h1), SAMPLE_VS_WGSL);
 });
+
+// ---------------------------------------------------------------------------
+// W160: Large (1.83 GiB – 4 GiB, 18,504+ shader) ranged packs, unsigned u32
+//       offsets, in-flight fetch coalescing, and ranged cache telemetry (#854)
+// ---------------------------------------------------------------------------
+
+function buildSyntheticLargeIndexBuffer(entries, options = {}) {
+  const flags = options.flags === undefined ? 0 : options.flags >>> 0;
+  const tableEnd = WGPK_HEADER_BYTES + entries.length * WGPK_ENTRY_BYTES;
+  const buf = new ArrayBuffer(tableEnd);
+  const bytes = new Uint8Array(buf);
+  const view = new DataView(buf);
+
+  bytes[0] = 0x57; // W
+  bytes[1] = 0x47; // G
+  bytes[2] = 0x50; // P
+  bytes[3] = 0x4b; // K
+  view.setUint32(4, WGPK_VERSION, true);
+  view.setUint32(8, entries.length >>> 0, true);
+  view.setUint32(12, flags, true);
+
+  for (let i = 0; i < entries.length; i += 1) {
+    const item = entries[i];
+    const base = WGPK_HEADER_BYTES + i * WGPK_ENTRY_BYTES;
+    view.setBigUint64(base, normalizeHash(item.hash), true);
+    bytes[base + 8] = item.stage;
+    bytes[base + 9] = 0;
+    bytes[base + 10] = 0;
+    bytes[base + 11] = 0;
+    view.setUint32(base + 12, item.offset >>> 0, true);
+    view.setUint32(base + 16, item.length >>> 0, true);
+  }
+
+  return bytes;
+}
+
+function createSparseRangeMockFetch({
+  url: targetUrl,
+  indexBytes,
+  totalBytes,
+  payloadsByOffset,
+  omitTotalInContentRange = false,
+  beforeResponse = null,
+}) {
+  const requests = [];
+  const enc = new TextEncoder();
+  const payloadMap = new Map();
+  for (const [offset, wgsl] of payloadsByOffset.entries()) {
+    const bytes = typeof wgsl === 'string' ? enc.encode(wgsl) : wgsl;
+    payloadMap.set(offset, bytes);
+  }
+
+  const readHeader = (headers, name) => {
+    if (!headers) return null;
+    if (typeof headers.get === 'function') return headers.get(name);
+    const target = name.toLowerCase();
+    for (const [k, v] of Object.entries(headers)) {
+      if (k.toLowerCase() === target) return String(v);
+    }
+    return null;
+  };
+
+  const mockFetch = async (url, init = {}) => {
+    const method = (init && init.method ? String(init.method) : 'GET').toUpperCase();
+    const range = readHeader(init && init.headers, 'Range');
+
+    if (beforeResponse) {
+      const override = await beforeResponse({ url, method, range, init, requests });
+      if (override) {
+        requests.push({ url, method, range, status: override.status, start: null, end: null, bytesSent: 0 });
+        return override;
+      }
+    }
+
+    if (url !== targetUrl) {
+      requests.push({ url, method, range, status: 404, start: null, end: null, bytesSent: 0 });
+      return {
+        ok: false,
+        status: 404,
+        statusText: 'Not Found',
+        headers: new Headers(),
+        async arrayBuffer() {
+          return new ArrayBuffer(0);
+        },
+      };
+    }
+
+    if (method === 'HEAD') {
+      requests.push({ url, method, range: null, status: 200, start: null, end: null, bytesSent: 0 });
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        headers: new Headers({
+          'Content-Length': String(totalBytes),
+          'Accept-Ranges': 'bytes',
+        }),
+        async arrayBuffer() {
+          return new ArrayBuffer(0);
+        },
+      };
+    }
+
+    assert.ok(range, `expected Range header for sparse large pack request to ${url}`);
+    const match = /^bytes=(\d+)-(\d+)$/i.exec(range.trim());
+    assert.ok(match, `expected valid non-negative Range header, got: ${range}`);
+    const start = Number(match[1]);
+    const reqEnd = Number(match[2]);
+    assert.ok(Number.isSafeInteger(start) && start >= 0, `invalid start offset: ${start}`);
+    assert.ok(Number.isSafeInteger(reqEnd) && reqEnd >= start, `invalid end offset: ${reqEnd}`);
+    assert.ok(start < totalBytes, `start ${start} >= totalBytes ${totalBytes}`);
+
+    const end = Math.min(reqEnd, totalBytes - 1);
+    const len = end - start + 1;
+    let slice;
+
+    if (end < indexBytes.byteLength) {
+      slice = indexBytes.slice(start, end + 1);
+    } else if (start < indexBytes.byteLength && end >= indexBytes.byteLength) {
+      slice = new Uint8Array(len);
+      const copyLen = indexBytes.byteLength - start;
+      slice.set(indexBytes.subarray(start, indexBytes.byteLength), 0);
+      // Remaining bytes beyond indexBytes are zero-filled padding unless needed.
+      assert.ok(copyLen > 0);
+    } else {
+      const payload = payloadMap.get(start);
+      assert.ok(payload, `unexpected payload range start=${start} (end=${end})`);
+      assert.equal(payload.byteLength, len, `payload length mismatch at offset ${start}`);
+      slice = payload.slice();
+    }
+
+    const totalTag = omitTotalInContentRange ? '*' : String(totalBytes);
+    requests.push({ url, method, range, status: 206, start, end, bytesSent: slice.byteLength });
+    return {
+      ok: true,
+      status: 206,
+      statusText: 'Partial Content',
+      headers: new Headers({
+        'Content-Range': `bytes ${start}-${end}/${totalTag}`,
+        'Content-Length': String(slice.byteLength),
+        'Accept-Ranges': 'bytes',
+      }),
+      async arrayBuffer() {
+        return slice.buffer;
+      },
+    };
+  };
+
+  return { fetch: mockFetch, requests };
+}
+
+test('W160 ranged TOC parsing and HTTP 206 Range fetches handle 1.83–4 GiB offsets (> 0x80000000 up to 0xFFFFFFFF) without signed 32-bit wraparound', async () => {
+  const enc = new TextEncoder();
+  const TOTAL_4_GIB = 0x100000000; // 4,294,967,296 bytes (exact 4 GiB)
+  const ENTRY_COUNT = 18504;
+  const TABLE_END = WGPK_HEADER_BYTES + ENTRY_COUNT * WGPK_ENTRY_BYTES; // 370,096 bytes
+
+  const makePaddedWgsl = (tag, targetBytes) => {
+    const prefix = `@compute @workgroup_size(1) fn fn_${tag}() { /* `;
+    const suffix = ' */ }';
+    const padLen = targetBytes - enc.encode(prefix).byteLength - enc.encode(suffix).byteLength;
+    assert.ok(padLen >= 0);
+    return `${prefix}${'z'.repeat(padLen)}${suffix}`;
+  };
+
+  const wgslLow = makePaddedWgsl('low_0', 128);
+  const wgsl183Gib = makePaddedWgsl('at_1_83_gib', 192);
+  const wgslCrossing2Gib = makePaddedWgsl('cross_2_gib', 64);
+  const wgslExact2Gib = makePaddedWgsl('exact_2_gib', 256);
+  const wgslOver3Gib = `// 3 GiB+ UTF-8 🚀 日本語\n${SAMPLE_FS_WGSL}`;
+  const wgslCeiling4Gib = makePaddedWgsl('ceiling_4_gib', 256);
+
+  assert.equal(enc.encode(wgslCeiling4Gib).byteLength, 256);
+
+  // Place 18,504 non-overlapping entries spanning from TABLE_END all the way to the exact 4 GiB ceiling.
+  const entries = new Array(ENTRY_COUNT);
+  const payloadsByOffset = new Map();
+
+  // First 18,498 entries packed densely right after TABLE_END (each 64 bytes -> ~1.18 MiB).
+  let cursor = TABLE_END;
+  for (let i = 0; i < ENTRY_COUNT - 6; i += 1) {
+    const len = i === 0 ? enc.encode(wgslLow).byteLength : 64;
+    entries[i] = {
+      hash: BigInt(i + 1),
+      stage: (i % 3) + 1,
+      offset: cursor,
+      length: len,
+    };
+    if (i === 0) {
+      payloadsByOffset.set(cursor, wgslLow);
+    }
+    cursor += len;
+  }
+
+  const h183Gib = fnv1a64('w160-1.83gib');
+  const hCross2Gib = fnv1a64('w160-cross-2gib');
+  const hExact2Gib = fnv1a64('w160-exact-2gib');
+  const hOver3Gib = fnv1a64('w160-over-3gib');
+  const hCeiling4Gib = fnv1a64('w160-ceiling-4gib');
+  const hZeroAtHigh = fnv1a64('w160-zero-high');
+
+  const off183Gib = 0x75000000; // ~1.83 GiB
+  const offCross2Gib = 0x7ffffff0; // crosses 0x80000000 (+64 -> 0x80000030)
+  const offExact2Gib = 0x80000100; // strictly > 2 GiB (signed i32 would be negative!)
+  const offOver3Gib = 0xc0001234; // > 3 GiB
+  const offZeroHigh = 0xe0000000; // 0-length entry past 3.5 GiB
+  const offCeiling4Gib = 0xffffff00; // 4,294,967,040 + 256 == 4,294,967,296 (exact 4 GiB)
+
+  const highEntries = [
+    { hash: h183Gib, stage: SHADER_STAGE.VERTEX, offset: off183Gib, length: enc.encode(wgsl183Gib).byteLength },
+    { hash: hCross2Gib, stage: SHADER_STAGE.FRAGMENT, offset: offCross2Gib, length: enc.encode(wgslCrossing2Gib).byteLength },
+    { hash: hExact2Gib, stage: SHADER_STAGE.COMPUTE, offset: offExact2Gib, length: enc.encode(wgslExact2Gib).byteLength },
+    { hash: hOver3Gib, stage: SHADER_STAGE.FRAGMENT, offset: offOver3Gib, length: enc.encode(wgslOver3Gib).byteLength },
+    { hash: hZeroAtHigh, stage: SHADER_STAGE.COMPUTE, offset: offZeroHigh, length: 0 },
+    { hash: hCeiling4Gib, stage: SHADER_STAGE.VERTEX, offset: offCeiling4Gib, length: enc.encode(wgslCeiling4Gib).byteLength },
+  ];
+  for (let i = 0; i < highEntries.length; i += 1) {
+    entries[ENTRY_COUNT - 6 + i] = highEntries[i];
+  }
+
+  payloadsByOffset.set(off183Gib, wgsl183Gib);
+  payloadsByOffset.set(offCross2Gib, wgslCrossing2Gib);
+  payloadsByOffset.set(offExact2Gib, wgslExact2Gib);
+  payloadsByOffset.set(offOver3Gib, wgslOver3Gib);
+  payloadsByOffset.set(offCeiling4Gib, wgslCeiling4Gib);
+
+  const indexBytes = buildSyntheticLargeIndexBuffer(entries, { flags: 0x80000001 });
+  const mock = createSparseRangeMockFetch({
+    url: '/packs/full-4gib.wgsl.pack',
+    indexBytes,
+    totalBytes: TOTAL_4_GIB,
+    payloadsByOffset,
+  });
+
+  // Default 64 KiB initial window requires 2 range requests for the 18,504-entry TOC (370,096 bytes)
+  const pack = await loadIndexFromUrl('/packs/full-4gib.wgsl.pack', { fetch: mock.fetch });
+  assert.equal(pack.mode, 'ranged');
+  assert.equal(pack.size, ENTRY_COUNT);
+  assert.equal(pack.flags, 0x80000001);
+  assert.equal(pack.byteLength, TOTAL_4_GIB);
+  assert.equal(pack.dataStart, TABLE_END);
+  assert.equal(mock.requests.length, 2);
+  assert.equal(mock.requests[0].range, `bytes=0-${DEFAULT_INITIAL_RANGE_BYTES - 1}`);
+  assert.equal(mock.requests[1].range, `bytes=${DEFAULT_INITIAL_RANGE_BYTES}-${TABLE_END - 1}`);
+
+  let stats = pack.getStats();
+  assert.equal(stats.rangeFetchCount, 2);
+  assert.equal(stats.rangeFetches, 2);
+  assert.equal(stats.rangeBytesFetched, TABLE_END);
+  assert.equal(stats.inFlightCoalesced, 0);
+  assert.equal(stats.lruEvictions, 0);
+
+  // Verify every >2 GiB offset is stored as an unsigned positive JS number and fetches the exact unsigned byte range.
+  const fetched183 = await pack.getWgslAsync(h183Gib);
+  assert.equal(fetched183, wgsl183Gib);
+  assert.equal(mock.requests[2].range, `bytes=${off183Gib}-${off183Gib + 192 - 1}`);
+
+  const fetchedCross = await pack.getWgslAsync(hCross2Gib);
+  assert.equal(fetchedCross, wgslCrossing2Gib);
+  assert.equal(mock.requests[3].range, `bytes=${offCross2Gib}-${offCross2Gib + 64 - 1}`);
+  assert.equal(mock.requests[3].range, 'bytes=2147483632-2147483695');
+
+  const fetched2Gib = await pack.getWgslAsync(hExact2Gib);
+  assert.equal(fetched2Gib, wgslExact2Gib);
+  assert.equal(mock.requests[4].range, 'bytes=2147483904-2147484159');
+
+  const fetched3Gib = await pack.getWgslAsync(hOver3Gib);
+  assert.equal(fetched3Gib, wgslOver3Gib);
+  const over3Len = enc.encode(wgslOver3Gib).byteLength;
+  assert.equal(mock.requests[5].range, `bytes=${offOver3Gib}-${offOver3Gib + over3Len - 1}`);
+
+  const fetchedCeiling = await pack.getWgslAsync(hCeiling4Gib);
+  assert.equal(fetchedCeiling, wgslCeiling4Gib);
+  assert.equal(mock.requests[6].range, 'bytes=4294967040-4294967295');
+
+  // Zero-length entry past 3.5 GiB resolves immediately without firing an HTTP request
+  assert.equal(await pack.getWgslAsync(hZeroAtHigh), '');
+  assert.equal(mock.requests.length, 7);
+
+  stats = pack.getStats();
+  assert.equal(stats.rangeFetchCount, 7);
+  assert.equal(stats.rangeBytesFetched, TABLE_END + 192 + 64 + 256 + over3Len + 256);
+
+  // loadFromUrl with streamThresholdBytes auto-switches to ranged mode when HEAD Content-Length is 4 GiB
+  const autoMock = createSparseRangeMockFetch({
+    url: '/packs/full-4gib.wgsl.pack',
+    indexBytes,
+    totalBytes: TOTAL_4_GIB,
+    payloadsByOffset,
+  });
+  const autoPack = await loadFromUrl('/packs/full-4gib.wgsl.pack', {
+    fetch: autoMock.fetch,
+    streamThresholdBytes: 1024 * 1024,
+  });
+  assert.equal(autoPack.mode, 'ranged');
+  assert.equal(autoMock.requests[0].method, 'HEAD');
+  assert.equal(await autoPack.getWgslAsync(hCeiling4Gib), wgslCeiling4Gib);
+
+  // Unknown total size (Content-Range: bytes 0-N/*) still accepts exact 4 GiB ceiling (end == 0x100000000)
+  const smallHighIndex = buildSyntheticLargeIndexBuffer([
+    { hash: hExact2Gib, stage: SHADER_STAGE.COMPUTE, offset: offExact2Gib, length: 256 },
+    { hash: hCeiling4Gib, stage: SHADER_STAGE.VERTEX, offset: offCeiling4Gib, length: 256 },
+  ]);
+  const starMock = createSparseRangeMockFetch({
+    url: '/packs/star-4gib.wgsl.pack',
+    indexBytes: smallHighIndex,
+    totalBytes: TOTAL_4_GIB,
+    payloadsByOffset,
+    omitTotalInContentRange: true,
+  });
+  const starPack = await loadIndexFromUrl('/packs/star-4gib.wgsl.pack', {
+    fetch: starMock.fetch,
+    initialRangeBytes: smallHighIndex.byteLength,
+  });
+  assert.equal(starPack.byteLength, TOTAL_4_GIB);
+  assert.equal(await starPack.getWgslAsync(hCeiling4Gib), wgslCeiling4Gib);
+
+  // Corrupt entry overflowing past 4 GiB when totalBytes is unknown is still rejected
+  const overflowIndex = buildSyntheticLargeIndexBuffer([
+    { hash: hCeiling4Gib, stage: SHADER_STAGE.VERTEX, offset: 0xffffffff, length: 16 },
+  ]);
+  assert.throws(() => parseWgslPackIndex(overflowIndex), /out of bounds/i);
+
+  // Overlapping ranges above 2 GiB are still detected accurately
+  const overlapHighIndex = buildSyntheticLargeIndexBuffer([
+    { hash: hExact2Gib, stage: SHADER_STAGE.COMPUTE, offset: 0x80000000, length: 128 },
+    { hash: hOver3Gib, stage: SHADER_STAGE.FRAGMENT, offset: 0x80000040, length: 128 },
+  ]);
+  assert.throws(
+    () => parseWgslPackIndex(overlapHighIndex, { totalBytes: TOTAL_4_GIB }),
+    /overlapping payload/i
+  );
+});
+
+test('W160 concurrent getWgslAsync coalesces burst HTTP 206 Range fetches and cleans up inFlightFetches on both resolve and reject', async () => {
+  const enc = new TextEncoder();
+  const TOTAL_3_GIB = 0xc0000000;
+  const hResolve = fnv1a64('w160-coalesce-resolve');
+  const hReject = fnv1a64('w160-coalesce-reject');
+  const hSibling = fnv1a64('w160-coalesce-sibling');
+
+  const offResolve = 0x80002000;
+  const offReject = 0x90004000;
+  const offSibling = 0xa0006000;
+
+  const wgslResolve = `// coalesced >2GiB shader\n${SAMPLE_VS_WGSL}`;
+  const wgslReject = `// retried >2GiB shader\n${SAMPLE_FS_WGSL}`;
+  const wgslSibling = `// parallel >2GiB sibling\n${SAMPLE_CS_WGSL}`;
+
+  const resolveLen = enc.encode(wgslResolve).byteLength;
+  const rejectLen = enc.encode(wgslReject).byteLength;
+  const siblingLen = enc.encode(wgslSibling).byteLength;
+
+  const indexBytes = buildSyntheticLargeIndexBuffer([
+    { hash: hResolve, stage: SHADER_STAGE.VERTEX, offset: offResolve, length: resolveLen },
+    { hash: hReject, stage: SHADER_STAGE.FRAGMENT, offset: offReject, length: rejectLen },
+    { hash: hSibling, stage: SHADER_STAGE.COMPUTE, offset: offSibling, length: siblingLen },
+  ]);
+
+  const gates = new Map();
+  let failRejectRangeOnce = true;
+
+  const mock = createSparseRangeMockFetch({
+    url: '/packs/coalesce.wgsl.pack',
+    indexBytes,
+    totalBytes: TOTAL_3_GIB,
+    payloadsByOffset: new Map([
+      [offResolve, wgslResolve],
+      [offReject, wgslReject],
+      [offSibling, wgslSibling],
+    ]),
+    beforeResponse: async ({ range }) => {
+      if (!range || range.startsWith('bytes=0-')) {
+        return null;
+      }
+      if (range.startsWith(`bytes=${offResolve}-`) || range.startsWith(`bytes=${offSibling}-`)) {
+        await new Promise((resolve) => {
+          gates.set(range, resolve);
+        });
+        return null;
+      }
+      if (range.startsWith(`bytes=${offReject}-`) && failRejectRangeOnce) {
+        await new Promise((resolve) => {
+          gates.set(range, resolve);
+        });
+        failRejectRangeOnce = false;
+        return {
+          ok: false,
+          status: 503,
+          statusText: 'Service Unavailable',
+          headers: new Headers(),
+          async arrayBuffer() {
+            return new ArrayBuffer(0);
+          },
+        };
+      }
+      return null;
+    },
+  });
+
+  const pack = await loadIndexFromUrl('/packs/coalesce.wgsl.pack', {
+    fetch: mock.fetch,
+    initialRangeBytes: indexBytes.byteLength,
+  });
+  assert.equal(pack.getStats().inFlightCount, 0);
+  assert.equal(pack.getStats().rangeFetchCount, 1);
+  assert.equal(pack.getStats().rangeBytesFetched, indexBytes.byteLength);
+
+  // 1. Burst of 8 concurrent calls for hResolve + 2 concurrent calls for hSibling
+  const resolvePromises = [
+    pack.getWgslAsync(hResolve),
+    pack.getWgslAsync(formatHashHex(hResolve)),
+    pack.getWgslAsync(formatHashHex(hResolve).slice(2).toUpperCase()),
+    pack.getWgslAsync(hResolve),
+    pack.getWgslAsync(hResolve),
+    pack.getWgslAsync(formatHashHex(hResolve)),
+    pack.getWgslAsync(hResolve),
+    pack.getWgslAsync(hResolve),
+  ];
+  const siblingPromises = [
+    pack.getWgslAsync(hSibling),
+    pack.getWgslAsync(formatHashHex(hSibling)),
+  ];
+
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(gates.size, 2, 'distinct hashes should run concurrently while duplicates coalesce');
+  assert.equal(pack.getStats().inFlightCount, 2);
+  assert.equal(pack.getStats().inFlightCoalesced, 8); // 7 for hResolve + 1 for hSibling
+  assert.equal(pack.getStats().inFlightDeduplications, 8);
+
+  for (const release of gates.values()) {
+    release();
+  }
+  gates.clear();
+
+  const resolvedValues = await Promise.all(resolvePromises);
+  const siblingValues = await Promise.all(siblingPromises);
+  assert.ok(resolvedValues.every((v) => v === wgslResolve));
+  assert.ok(siblingValues.every((v) => v === wgslSibling));
+
+  // Verify cleanup and telemetry after resolve
+  let stats = pack.getStats();
+  assert.equal(stats.inFlightCount, 0);
+  assert.equal(stats.rangeFetchCount, 3); // 1 index + 1 hResolve + 1 hSibling
+  assert.equal(stats.rangeBytesFetched, indexBytes.byteLength + resolveLen + siblingLen);
+  assert.equal(stats.inFlightCoalesced, 8);
+
+  // Subsequent lookup hits LRU cache with zero extra network calls
+  assert.equal(await pack.getWgslAsync(hResolve), wgslResolve);
+  assert.equal(pack.getStats().rangeFetchCount, 3);
+  assert.equal(pack.getStats().cacheHits, 1);
+
+  // 2. Burst of 4 concurrent calls for hReject when the single HTTP 206 fetch fails with 503
+  let retryResultFromCatch = null;
+  let inFlightObservedInCatch = -1;
+
+  const pFail1 = pack.getWgslAsync(hReject).catch(async (err) => {
+    assert.match(err.message, /HTTP 503/);
+    // Must already be cleaned up in finally BEFORE catch handler runs so immediate retry fires cleanly!
+    inFlightObservedInCatch = pack.getStats().inFlightCount;
+    retryResultFromCatch = await pack.getWgslAsync(hReject);
+    return 'caught-and-retried';
+  });
+  const pFail2 = pack.getWgslAsync(formatHashHex(hReject));
+  const pFail3 = pack.getWgslAsync(hReject);
+  const pFail4 = pack.getWgslAsync(hReject);
+
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(gates.size, 1);
+  assert.equal(pack.getStats().inFlightCount, 1);
+  assert.equal(pack.getStats().inFlightCoalesced, 11); // +3 coalesced onto the failing request
+
+  for (const release of gates.values()) {
+    release();
+  }
+  gates.clear();
+
+  const [s1, s2, s3, s4] = await Promise.allSettled([pFail1, pFail2, pFail3, pFail4]);
+  assert.equal(s1.status, 'fulfilled');
+  assert.equal(s1.value, 'caught-and-retried');
+  assert.equal(inFlightObservedInCatch, 0, 'inFlightFetches must be cleared before caller rejection handlers run');
+  assert.equal(retryResultFromCatch, wgslReject);
+  assert.equal(s2.status, 'rejected');
+  assert.equal(s3.status, 'rejected');
+  assert.equal(s4.status, 'rejected');
+
+  stats = pack.getStats();
+  assert.equal(stats.inFlightCount, 0);
+  assert.equal(stats.rangeFetchCount, 5); // 3 prior + 1 failed 503 + 1 successful retry
+  assert.equal(stats.rangeBytesFetched, indexBytes.byteLength + resolveLen + siblingLen + rejectLen);
+  assert.equal(stats.inFlightCoalesced, 11);
+});
+
+test('W160 ranged cache telemetry (inFlightCoalesced, rangeFetchCount, rangeBytesFetched, lruEvictions) aggregates cleanly across WgslPackCache', async () => {
+  const enc = new TextEncoder();
+  const TOTAL_4_GIB = 0x100000000;
+  const make100ByteWgsl = (tag) => {
+    const prefix = `@compute @workgroup_size(1) fn w160_${tag}() { /* `;
+    const suffix = ' */ }';
+    const padLen = 100 - prefix.length - suffix.length;
+    return `${prefix}${'k'.repeat(padLen)}${suffix}`;
+  };
+
+  const hA = fnv1a64('w160-telem-A');
+  const hB = fnv1a64('w160-telem-B');
+  const hC = fnv1a64('w160-telem-C');
+  const wgslA = make100ByteWgsl('A');
+  const wgslB = make100ByteWgsl('B');
+  const wgslC = make100ByteWgsl('C');
+  assert.equal(enc.encode(wgslA).byteLength, 100);
+
+  const offA = 0x80000000;
+  const offB = 0xa0000000;
+  const offC = 0xffffff9c; // 0xFFFFFF9C + 100 == 0x100000000 (exact 4 GiB)
+
+  const indexBytes = buildSyntheticLargeIndexBuffer([
+    { hash: hA, stage: SHADER_STAGE.COMPUTE, offset: offA, length: 100 },
+    { hash: hB, stage: SHADER_STAGE.COMPUTE, offset: offB, length: 100 },
+    { hash: hC, stage: SHADER_STAGE.COMPUTE, offset: offC, length: 100 },
+  ]);
+
+  let releaseA = null;
+  let holdA = true;
+  const mock = createSparseRangeMockFetch({
+    url: '/packs/telemetry-4gib.wgsl.pack',
+    indexBytes,
+    totalBytes: TOTAL_4_GIB,
+    payloadsByOffset: new Map([
+      [offA, wgslA],
+      [offB, wgslB],
+      [offC, wgslC],
+    ]),
+    beforeResponse: async ({ range }) => {
+      if (holdA && range === `bytes=${offA}-${offA + 99}`) {
+        holdA = false;
+        await new Promise((resolve) => {
+          releaseA = resolve;
+        });
+      }
+      return null;
+    },
+  });
+
+  // LRU budget = 220 bytes (fits 2 x 100-byte shaders; 3rd shader triggers 1 LRU eviction)
+  const cache = new WgslPackCache({
+    fetch: mock.fetch,
+    initialRangeBytes: indexBytes.byteLength,
+    maxCachedWgslBytes: 220,
+  });
+
+  const pack = await cache.loadIndexFromUrl('/packs/telemetry-4gib.wgsl.pack');
+  const gpu = createMockGpuDevice();
+
+  // Burst 3 concurrent getOrCreateShaderModuleAsync calls for hA (coalesced into 1 range fetch & 1 shader compile)
+  const m1 = cache.getOrCreateShaderModuleAsync(gpu.device, hA);
+  const m2 = cache.getOrCreateShaderModuleAsync(gpu.device, formatHashHex(hA));
+  const m3 = cache.getWgslAsync(hA);
+
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(typeof releaseA, 'function');
+  assert.equal(cache.getStats().inFlightCount, 1);
+  assert.equal(cache.getStats().inFlightCoalesced, 2);
+  releaseA();
+
+  const [mod1, mod2, src3] = await Promise.all([m1, m2, m3]);
+  assert.equal(mod1, mod2);
+  assert.equal(mod1.code, wgslA);
+  assert.equal(src3, wgslA);
+  assert.equal(gpu.calls.length, 1);
+
+  // Fetch B (fits within 220 B budget) then C (evicts A -> lruEvictions === 1)
+  assert.equal(await cache.getWgslAsync(hB), wgslB);
+  assert.equal(await cache.getWgslAsync(hC), wgslC);
+
+  const packStats = pack.getStats();
+  const cacheStats = cache.getStats();
+
+  for (const s of [packStats, cacheStats]) {
+    assert.equal(s.rangeFetchCount, 4); // 1 index + A + B + C
+    assert.equal(s.rangeFetches, 4);
+    assert.equal(s.rangeBytesFetched, indexBytes.byteLength + 300);
+    assert.equal(s.inFlightCoalesced, 2);
+    assert.equal(s.inFlightDeduplications, 2);
+    assert.equal(s.inFlightCount, 0);
+    assert.equal(s.lruEvictions, 1);
+    assert.equal(s.wgslCacheEvictions, 1);
+    for (const key of [
+      'inFlightCoalesced',
+      'rangeFetchCount',
+      'rangeBytesFetched',
+      'lruEvictions',
+      'inFlightCount',
+    ]) {
+      assert.equal(typeof s[key], 'number');
+      assert.ok(Number.isSafeInteger(s[key]) && s[key] >= 0, `${key} must be a non-negative safe integer`);
+    }
+  }
+
+  // inspect() remains fully JSON-serializable with all additive ranged telemetry fields
+  const snapshot = cache.inspect();
+  assert.doesNotThrow(() => JSON.stringify(snapshot));
+  assert.equal(snapshot.stats.rangeFetchCount, 4);
+  assert.equal(snapshot.stats.rangeBytesFetched, indexBytes.byteLength + 300);
+  assert.equal(snapshot.stats.inFlightCoalesced, 2);
+  assert.equal(snapshot.stats.lruEvictions, 1);
+});
