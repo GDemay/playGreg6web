@@ -58,7 +58,7 @@ const FILE_URL_RE =
 const URL_USERINFO_RE = /\b((?:https?|wss?|ftp):\/\/)([^\s/@"'`<>]+):([^\s/@"'`<>]*)@/gi;
 
 const URL_QUERY_RE =
-  /((?:https?|wss?):\/\/[^\s"'`<>?#]+)\?(?!\[REDACTED\])[^\s"'`<>#)\]}]+?(?=:\d+:\d+(?:[)\s"'`<>\]}]|$)|[\s"'`<>#)\]}]|$)/gi;
+  /((?:https?|wss?|ftp):\/\/[^\s"'`<>?#]+)\?(?!\[REDACTED\])[^\s"'`<>#)\]}]+?(?=:\d+:\d+(?:[)\s"'`<>\]}]|$)|[\s"'`<>#)\]}]|$)/gi;
 
 const STANDALONE_QUERY_RE =
   /\?[A-Za-z0-9_.~%-]+=[^\s"'`<>#)\]}]+?(?=:\d+:\d+(?:[)\s"'`<>\]}]|$)|[\s"'`<>#)\]}]|$)/g;
@@ -66,18 +66,35 @@ const STANDALONE_QUERY_RE =
 const AUTH_SCHEME_RE = /\b(Bearer|Basic)\s+(?!\[REDACTED\])[A-Za-z0-9\-._~+/=:]+/gi;
 
 const SECRET_KV_RE =
-  /\b(authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|id[_-]?token|client[_-]?secret|x-api-key|x-auth-token|cookie|set-cookie|password|passwd|secret|token)(\s*[:=]\s*)(?!(?:(?:Bearer|Basic)\s+)?\[REDACTED\])(?:"[^"]*"|'[^']*'|[^\s,;}\])]+)/gi;
+  /\b(authorization|api[_-]?key|apikey|api[_-]?secret|access[_-]?token|refresh[_-]?token|auth[_-]?token|id[_-]?token|client[_-]?secret|private[_-]?key|secret[_-]?key|signing[_-]?key|session[_-]?token|session[_-]?id|csrf[_-]?token|sas[_-]?token|x-api-key|x-auth-token|x-access-token|x-session-token|x-amz-signature|x-amz-security-token|x-amz-credential|cookie|set-cookie|password|passwd|secret|token|jwt)(["']?\s*[:=]\s*)(?!(?:(?:Bearer|Basic)\s+)?\[REDACTED\])(?:"[^"]*"|'[^']*'|[^\s,;}\])&]+)/gi;
 
-const QUOTED_WIN_PATH_RE = /(["'`])([A-Za-z]:[\\/][^"'`\r\n]+?)(:\d+:\d+)?\1/g;
+const BARE_TOKEN_RE =
+  /\b(?:eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{16,}|sk_(?:live|test)_[A-Za-z0-9]{12,}|AKIA[0-9A-Z]{16})\b/g;
+
+const DATA_URI_BASE64_RE =
+  /\bdata:[a-z0-9.+-]+\/[a-z0-9.+-]+(?:;[^,\s"'`<>]*)?;base64,[A-Za-z0-9+/=\r\n_-]{16,}/gi;
+
+const HEX_DUMP_BYTES_RE =
+  /(?<![0-9a-fA-F])(?:[0-9a-fA-F]{2}[ \t]+){16,}[0-9a-fA-F]{2}(?![0-9a-fA-F])/g;
+
+const LONG_HEX_PAYLOAD_RE = /(?<![0-9a-fA-F])(?:0x)?[0-9a-fA-F]{65,}(?![0-9a-fA-F])/g;
+
+const BINARY_CONTROL_CHAR_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f]/;
+const BINARY_CONTROL_RUN_RE = /[^\r\n\t\x20-\x7e]*[\x00-\x08\x0b\x0c\x0e-\x1f][^\r\n\t\x20-\x7e]*/g;
+
+const QUOTED_WIN_PATH_RE = /(["'`])((?:\\\\[?.]\\)?[A-Za-z]:[\\/][^"'`\r\n]+?)(:\d+:\d+)?\1/g;
+
+const WIN_DEVICE_PATH_RE =
+  /(^|[\s"'`(\[={<,:;|])(\\\\[?.]\\[^\s"'`<>|)\]},;]+?)(?=:\d+:\d+(?:[)\s"'`<>\]};,]|$)|[\s"'`<>|)\]},;]|$)/g;
 
 const WIN_DRIVE_PATH_RE =
   /(?<![A-Za-z0-9_])([A-Za-z]:(?:\\|\/(?!\/))[^\s"'`<>|*?)\]},;]+?)(?=:\d+:\d+(?:[)\s"'`<>\]};,]|$)|[\s"'`<>|*?)\]},;]|$)/g;
 
 const WIN_UNC_PATH_RE =
-  /(^|[\s"'`(\[={<,:;])(\\\\[^\s\\"'`<>|*?)\]},;]+\\[^\s"'`<>|*?)\]},;]+?)(?=:\d+:\d+(?:[)\s"'`<>\]};,]|$)|[\s"'`<>|*?)\]},;]|$)/g;
+  /(^|[\s"'`(\[={<,:;|])(\\\\[^\s\\"'`<>|*?)\]},;]+\\[^\s"'`<>|*?)\]},;]+?)(?=:\d+:\d+(?:[)\s"'`<>\]};,]|$)|[\s"'`<>|*?)\]},;]|$)/g;
 
 const POSIX_ROOTS =
-  'home|Users|root|tmp|var|etc|opt|usr|mnt|media|Volumes|private|srv|proc|sys|dev|run|Library|Applications';
+  'home|Users|root|tmp|var|etc|opt|usr|mnt|media|Volumes|private|srv|proc|sys|dev|run|Library|Applications|cygdrive';
 
 const QUOTED_POSIX_PATH_RE = new RegExp(
   `(["'\`])(\\/(?:${POSIX_ROOTS})(?:\\/[^"'\`\\r\\n]*?)?)(:\\d+:\\d+)?\\1`,
@@ -85,20 +102,24 @@ const QUOTED_POSIX_PATH_RE = new RegExp(
 );
 
 const POSIX_ABS_PATH_RE = new RegExp(
-  `(^|[\\s(\\[={<,:;\`])(\\/(?:${POSIX_ROOTS})(?:\\/[^\\s"'\`<>\\)\\]},;]+?)?)(?=:\\d+:\\d+(?:[)\\s"'\`<>\\]};,]|$)|[\\s"'\`<>\\)\\]},;]|$)`,
+  `(^|[\\s"'\`(\\[={<,:;|])(\\/(?:${POSIX_ROOTS})(?:\\/[^\\s"'\`<>\\)\\]},;]+?)?)(?=:\\d+:\\d+(?:[)\\s"'\`<>\\]};,]|$)|[\\s"'\`<>\\)\\]},;]|$)`,
   'g'
 );
 
+const MSYS_DRIVE_USER_PATH_RE =
+  /(^|[\s"'`(\[={<,:;|])(\/[a-zA-Z]\/(?:Users|Windows|Program(?:\s+Files)?|Documents\s+and\s+Settings)(?:\/[^\s"'`<>)\]},;]+?)?)(?=:\d+:\d+(?:[)\s"'`<>\]};,]|$)|[\s"'`<>)\]},;]|$)/g;
+
 const TILDE_HOME_PATH_RE =
-  /(^|[\s"'`(\[={<,:;])(~[A-Za-z0-9._-]*\/[^\s"'`<>)\]},;]+?)(?=:\d+:\d+(?:[)\s"'`<>\]};,]|$)|[\s"'`<>)\]},;]|$)/g;
+  /(^|[\s"'`(\[={<,:;|])(~[A-Za-z0-9._-]*\/[^\s"'`<>)\]},;]+?)(?=:\d+:\d+(?:[)\s"'`<>\]};,]|$)|[\s"'`<>)\]},;]|$)/g;
 
 const SENSITIVE_KEY_RE =
-  /^(?:authorization|cookie|set[_-]?cookie|password|passwd|secret|client[_-]?secret|api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|auth[_-]?token|id[_-]?token|bearer[_-]?token|session[_-]?id|token)$/i;
+  /^(?:authorization|cookie|set[_-]?cookie|password|passwd|secret|client[_-]?secret|api[_-]?key|apikey|api[_-]?secret|access[_-]?token|refresh[_-]?token|auth[_-]?token|id[_-]?token|bearer[_-]?token|session[_-]?token|session[_-]?id|csrf[_-]?token|sas[_-]?token|private[_-]?key|secret[_-]?key|signing[_-]?key|x[_-]?api[_-]?key|x[_-]?auth[_-]?token|x[_-]?access[_-]?token|x[_-]?session[_-]?token|x[_-]?amz[_-]?(?:signature|security[_-]?token|credential)|jwt|token)$/i;
 
 /**
  * Strips Windows paths (`C:\Users\...`), POSIX host paths (`/home/...`, `/Users/...`),
- * `file://` URLs, query strings (`?token=...`), URL credentials, and bearer/auth tokens
- * so diagnostic bundles never leak host usernames, local paths, or secrets.
+ * `file://` URLs, query strings (`?token=...`), URL credentials, bearer/auth tokens,
+ * and raw binary payloads (data URIs, multi-byte hex dumps, binary control bytes)
+ * while preserving sanitized hex VAs (`0x...`), instruction offsets, and shader hashes.
  *
  * @param {unknown} text
  * @returns {string}
@@ -113,32 +134,57 @@ export function sanitizeString(text) {
     return out;
   }
 
+  // 0. Redact raw binary payloads (NUL/control-byte blobs, base64 data URIs, hex dumps).
+  if (BINARY_CONTROL_CHAR_RE.test(out)) {
+    let nulCount = 0;
+    let ctrlCount = 0;
+    for (let i = 0; i < out.length; i += 1) {
+      const code = out.charCodeAt(i);
+      if (code === 0) {
+        nulCount += 1;
+        ctrlCount += 1;
+      } else if ((code < 0x20 && code !== 0x09 && code !== 0x0a && code !== 0x0d) || code === 0x7f) {
+        ctrlCount += 1;
+      }
+    }
+    if (out.startsWith('\x00asm') || (nulCount >= 2 && ctrlCount / out.length >= 0.1) || ctrlCount >= 8) {
+      return '[REDACTED_BUFFER]';
+    }
+    out = out.replace(BINARY_CONTROL_RUN_RE, '[REDACTED_BUFFER]');
+  }
+  out = out.replace(DATA_URI_BASE64_RE, '[REDACTED_BUFFER]');
+  out = out.replace(HEX_DUMP_BYTES_RE, '[REDACTED_BUFFER]');
+  out = out.replace(LONG_HEX_PAYLOAD_RE, '[REDACTED_BUFFER]');
+
   // 1. Redact file:// URLs completely (preserving optional :line:col in stack frames).
   out = out.replace(FILE_URL_RE, '[REDACTED_FILE_URL]');
 
   // 2. Redact embedded URL credentials (scheme://user:pass@host).
   out = out.replace(URL_USERINFO_RE, '$1[REDACTED]@');
 
-  // 3. Redact query strings on HTTP/WS URLs and standalone ?key=value tokens.
+  // 3. Redact query strings on HTTP/WS/FTP URLs and standalone ?key=value tokens.
   out = out.replace(URL_QUERY_RE, '$1?[REDACTED]');
   out = out.replace(STANDALONE_QUERY_RE, '?[REDACTED]');
 
-  // 4. Redact Bearer/Basic tokens and inline credential key=value / header pairs.
+  // 4. Redact Bearer/Basic tokens, inline credential key=value / header pairs, and bare JWTs/PATs.
   out = out.replace(AUTH_SCHEME_RE, '$1 [REDACTED]');
   out = out.replace(SECRET_KV_RE, '$1$2[REDACTED]');
+  out = out.replace(BARE_TOKEN_RE, '[REDACTED_TOKEN]');
 
-  // 5. Redact Windows absolute drive and UNC paths (quoted first to catch spaces).
+  // 5. Redact Windows absolute drive, extended-length/device, and UNC paths (quoted first to catch spaces).
   out = out.replace(QUOTED_WIN_PATH_RE, (_, quote, _path, lineCol) => {
     return `${quote}[REDACTED_PATH]${lineCol || ''}${quote}`;
   });
+  out = out.replace(WIN_DEVICE_PATH_RE, '$1[REDACTED_PATH]');
   out = out.replace(WIN_DRIVE_PATH_RE, '[REDACTED_PATH]');
   out = out.replace(WIN_UNC_PATH_RE, '$1[REDACTED_PATH]');
 
-  // 6. Redact POSIX host absolute paths and ~ home paths (preserving app routes like /api/status).
+  // 6. Redact POSIX host absolute paths, MSYS drive user paths, and ~ home paths (preserving app routes like /api/status).
   out = out.replace(QUOTED_POSIX_PATH_RE, (_, quote, _path, lineCol) => {
     return `${quote}[REDACTED_PATH]${lineCol || ''}${quote}`;
   });
   out = out.replace(POSIX_ABS_PATH_RE, '$1[REDACTED_PATH]');
+  out = out.replace(MSYS_DRIVE_USER_PATH_RE, '$1[REDACTED_PATH]');
   out = out.replace(TILDE_HOME_PATH_RE, '$1[REDACTED_PATH]');
 
   return out;
@@ -155,6 +201,21 @@ function isBinaryBuffer(value) {
     return true;
   }
   return false;
+}
+
+function isSerializedNodeBuffer(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  if (value.type !== 'Buffer' || !Array.isArray(value.data)) {
+    return false;
+  }
+  const keys = Object.keys(value);
+  return keys.length === 2 && (value.data.length === 0 || typeof value.data[0] === 'number');
+}
+
+function isBlobLike(value) {
+  return Boolean(value && typeof value === 'object' && typeof Blob === 'function' && value instanceof Blob);
 }
 
 function isErrorLike(value) {
@@ -213,6 +274,18 @@ export function sanitizeValue(value, seen = new WeakSet(), depth = 0) {
     return {
       type: value.constructor ? sanitizeString(value.constructor.name) : 'BinaryBuffer',
       byteLength: typeof value.byteLength === 'number' ? value.byteLength : 0,
+    };
+  }
+  if (isSerializedNodeBuffer(value)) {
+    return {
+      type: 'Buffer',
+      byteLength: value.data.length,
+    };
+  }
+  if (isBlobLike(value)) {
+    return {
+      type: 'Blob',
+      byteLength: typeof value.size === 'number' && Number.isFinite(value.size) ? value.size : 0,
     };
   }
 
@@ -487,7 +560,54 @@ export function classifyBootError(errorOrMessage) {
 }
 
 function isPlainObject(value) {
-  return Boolean(value && typeof value === 'object' && !Array.isArray(value) && !isBinaryBuffer(value));
+  return Boolean(
+    value &&
+      typeof value === 'object' &&
+      !Array.isArray(value) &&
+      !isBinaryBuffer(value) &&
+      !isSerializedNodeBuffer(value) &&
+      !isBlobLike(value)
+  );
+}
+
+const HEX_ADDRESS_RE = /^\s*(\+?)(?:0x)([0-9a-f]{1,16})\s*$/i;
+const HEX_SHADER_HASH_RE = /^\s*(?:0x)?([0-9a-f]{1,64})\s*$/i;
+
+function sanitizeHexAddress(value, { allowPlus = false, allowNumber = true } = {}) {
+  if (value === null) {
+    return null;
+  }
+  if (typeof value === 'bigint') {
+    return value >= 0n ? `0x${value.toString(16)}` : undefined;
+  }
+  if (typeof value === 'number') {
+    if (allowNumber && Number.isSafeInteger(value) && value >= 0) {
+      return `0x${value.toString(16)}`;
+    }
+    return undefined;
+  }
+  if (typeof value === 'string') {
+    const m = HEX_ADDRESS_RE.exec(value);
+    if (m) {
+      const prefix = allowPlus && m[1] === '+' ? '+' : '';
+      return `${prefix}0x${m[2].toLowerCase()}`;
+    }
+  }
+  return undefined;
+}
+
+function sanitizeInstructionOffset(value) {
+  if (value === null) {
+    return null;
+  }
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) {
+    return value;
+  }
+  return sanitizeHexAddress(value, { allowPlus: true, allowNumber: false });
+}
+
+function roundTo2(value) {
+  return Math.round(value * 100) / 100;
 }
 
 function clipSanitizedString(value, maxLen = 256) {
@@ -533,9 +653,40 @@ function sanitizeTrapRecord(raw) {
   if (kind !== undefined) out.kind = kind;
   if (raw.guestVa === null) {
     out.guestVa = null;
+  } else if (raw.guestVa !== undefined) {
+    const hexVa = sanitizeHexAddress(raw.guestVa);
+    if (hexVa !== undefined) {
+      out.guestVa = hexVa;
+    } else {
+      const guestVa = clipSanitizedString(raw.guestVa, 32);
+      if (guestVa !== undefined) out.guestVa = guestVa;
+    }
+  }
+  for (const offsetKey of ['instructionOffset', 'insnOffset', 'rva', 'funcOffset']) {
+    if (raw[offsetKey] !== undefined) {
+      const cleanOffset = sanitizeInstructionOffset(raw[offsetKey]);
+      if (cleanOffset !== undefined) out[offsetKey] = cleanOffset;
+    }
+  }
+  for (const addrKey of ['functionVa', 'funcVa', 'rip', 'pc']) {
+    if (raw[addrKey] !== undefined) {
+      const cleanAddr = sanitizeHexAddress(raw[addrKey]);
+      if (cleanAddr !== undefined) out[addrKey] = cleanAddr;
+    }
+  }
+  if (raw.opcode === null) {
+    out.opcode = null;
+  } else if (typeof raw.opcode === 'number' && Number.isSafeInteger(raw.opcode) && raw.opcode >= 0) {
+    out.opcode = raw.opcode;
+  } else if (typeof raw.opcode === 'string') {
+    const opcode = clipSanitizedString(raw.opcode, 64);
+    if (opcode !== undefined) out.opcode = opcode;
+  }
+  if (raw.mnemonic === null) {
+    out.mnemonic = null;
   } else {
-    const guestVa = clipSanitizedString(raw.guestVa, 32);
-    if (guestVa !== undefined) out.guestVa = guestVa;
+    const mnemonic = clipSanitizedString(raw.mnemonic, 64);
+    if (mnemonic !== undefined) out.mnemonic = mnemonic;
   }
   if (raw.dll === null) {
     out.dll = null;
@@ -594,9 +745,20 @@ function sanitizeUnresolvedImportRecord(raw) {
   }
   if (raw.guestVa === null) {
     out.guestVa = null;
-  } else {
-    const guestVa = clipSanitizedString(raw.guestVa, 32);
-    if (guestVa !== undefined) out.guestVa = guestVa;
+  } else if (raw.guestVa !== undefined) {
+    const hexVa = sanitizeHexAddress(raw.guestVa);
+    if (hexVa !== undefined) {
+      out.guestVa = hexVa;
+    } else {
+      const guestVa = clipSanitizedString(raw.guestVa, 32);
+      if (guestVa !== undefined) out.guestVa = guestVa;
+    }
+  }
+  for (const offsetKey of ['instructionOffset', 'insnOffset', 'rva']) {
+    if (raw[offsetKey] !== undefined) {
+      const cleanOffset = sanitizeInstructionOffset(raw[offsetKey]);
+      if (cleanOffset !== undefined) out[offsetKey] = cleanOffset;
+    }
   }
   const count = pickNonNegInt(raw, 'count');
   if (count !== undefined) out.count = count;
@@ -769,14 +931,19 @@ function sanitizeMissingShaderEntry(raw) {
   let hash;
   if (typeof raw.hash === 'bigint' && raw.hash >= 0n) {
     hash = `0x${raw.hash.toString(16).padStart(16, '0')}`;
+  } else if (typeof raw.hash === 'number' && Number.isSafeInteger(raw.hash) && raw.hash >= 0) {
+    hash = `0x${raw.hash.toString(16).padStart(16, '0')}`;
   } else if (typeof raw.hash === 'string') {
-    hash = clipSanitizedString(raw.hash, 64);
+    const hexMatch = HEX_SHADER_HASH_RE.exec(raw.hash);
+    hash = hexMatch ? `0x${hexMatch[1].toLowerCase()}` : clipSanitizedString(raw.hash, 64);
   } else if (typeof raw.hashHex === 'string') {
-    hash = clipSanitizedString(raw.hashHex, 64);
+    const hexMatch = HEX_SHADER_HASH_RE.exec(raw.hashHex);
+    hash = hexMatch ? `0x${hexMatch[1].toLowerCase()}` : clipSanitizedString(raw.hashHex, 64);
   }
   const stage = clipSanitizedString(raw.stage, 32);
   const hits = pickNonNegInt(raw, 'hits') ?? pickNonNegInt(raw, 'count');
   const firstSeenFrame = pickNonNegInt(raw, 'firstSeenFrame');
+  const pipelineKind = clipSanitizedString(raw.pipelineKind ?? raw.profile, 64);
 
   if (hash === undefined && stage === undefined && hits === undefined) {
     return null;
@@ -786,12 +953,129 @@ function sanitizeMissingShaderEntry(raw) {
   if (stage !== undefined) out.stage = stage;
   if (hits !== undefined) out.hits = hits;
   if (firstSeenFrame !== undefined) out.firstSeenFrame = firstSeenFrame;
+  if (pipelineKind !== undefined) out.pipelineKind = pipelineKind;
+  return out;
+}
+
+/**
+ * Strictly allowlists and sanitizes a Bink2 / splash video telemetry snapshot
+ * (or duck-typed `BinkVideoPresenter` / `SplashFrameBridge` instance via `getStats()`).
+ * Drops raw pixel planes/buffers, file/video paths, URLs, and unknown keys.
+ *
+ * @param {unknown} raw
+ * @param {number} [depth=0]
+ * @returns {object|null}
+ */
+function sanitizeBinkTelemetry(raw, depth = 0) {
+  if (raw === null || raw === undefined) {
+    return null;
+  }
+  let source = raw;
+  if (typeof source === 'object' && typeof source.getStats === 'function') {
+    try {
+      source = source.getStats();
+    } catch {
+      return null;
+    }
+  }
+  if (!isPlainObject(source)) {
+    return null;
+  }
+
+  const out = {};
+  for (const strKey of [
+    'pixelFormat',
+    'lastFrameFormat',
+    'colorSpace',
+    'colorRange',
+    'chromaOrder',
+    'lastChromaOrder',
+    'loadOp',
+    'lastLoadOp',
+    'presentationFormat',
+    'lastSource',
+    'state',
+    'status',
+  ]) {
+    const val = clipSanitizedString(source[strKey], 64);
+    if (val !== undefined) out[strKey] = val;
+  }
+
+  for (const intKey of [
+    'frameWidth',
+    'frameHeight',
+    'lastFrameWidth',
+    'lastFrameHeight',
+    'uploadedFrames',
+    'presentedFrames',
+    'framesPresented',
+    'droppedFrames',
+    'skippedFrames',
+    'decodedFrames',
+    'queueDepth',
+    'maxQueueDepth',
+    'resizeCount',
+    'planeReallocations',
+    'scratchAllocations',
+    'directZeroCopyUploads',
+    'chromaRepackUploads',
+    'bytesUploaded',
+    'slotCount',
+    'activeSlotIndex',
+    'pendingUploads',
+    'framesBeforeFirstPresent',
+    'lateSplashFramesIgnored',
+    'nv12FramesForwarded',
+    'yvuFramesForwarded',
+    'underlayLoadFramesPresented',
+    'zeroCopyFramesForwarded',
+    'audioTracks',
+    'sampleRate',
+    'channels',
+    'audioUnderruns',
+  ]) {
+    const val = pickNonNegInt(source, intKey);
+    if (val !== undefined) out[intKey] = val;
+  }
+
+  for (const numKey of ['targetFps', 'frameIntervalMs', 'avgDecodeMs', 'avgUploadMs', 'fps', 'onePercentLowFps']) {
+    const val = pickNonNegNumber(source, numKey);
+    if (val !== undefined) out[numKey] = val;
+  }
+
+  for (const boolKey of [
+    'hasFrame',
+    'paused',
+    'looping',
+    'skipped',
+    'pipelineReady',
+    'usesStagingPool',
+    'firstPresentSent',
+    'guestFirstPresent',
+    'splashSuppressed',
+    'zeroCopy',
+    'destroyed',
+    'active',
+  ]) {
+    if (typeof source[boolKey] === 'boolean') {
+      out[boolKey] = source[boolKey];
+    }
+  }
+
+  if (depth < 1 && isPlainObject(source.presenterStats)) {
+    const nested = sanitizeBinkTelemetry(source.presenterStats, depth + 1);
+    if (nested && Object.keys(nested).length > 0) {
+      out.presenterStats = nested;
+    }
+  }
+
   return out;
 }
 
 /**
  * Strictly allowlists and sanitizes a GPU telemetry snapshot.
- * Drops unknown keys, shader sources, and raw binary buffers; redacts host paths/tokens.
+ * Drops unknown keys, shader sources, and raw binary buffers; redacts host paths/tokens;
+ * preserves exact validation/draw/skip counts, 1%-low FPS, Bink2 telemetry, and missing shader hashes.
  *
  * @param {unknown} raw
  * @returns {object|null}
@@ -814,29 +1098,68 @@ function sanitizeGpuTelemetry(raw) {
   if (backend !== undefined) out.backend = backend;
   if (typeof raw.deviceLost === 'boolean') out.deviceLost = raw.deviceLost;
 
+  if (raw.lastValidationErrorCode === null) {
+    out.lastValidationErrorCode = null;
+  } else {
+    const code = clipSanitizedString(raw.lastValidationErrorCode, 128);
+    if (code !== undefined) out.lastValidationErrorCode = code;
+  }
+  if (raw.lastValidationErrorMessage === null) {
+    out.lastValidationErrorMessage = null;
+  } else {
+    const msg = clipSanitizedString(raw.lastValidationErrorMessage, 512);
+    if (msg !== undefined) out.lastValidationErrorMessage = msg;
+  }
+
   for (const intKey of [
     'validationErrors',
+    'validationErrorCount',
+    'validationErrorSuppressedCount',
     'shaderPackCount',
     'loadedShaders',
     'pipelineCount',
     'bufferCount',
     'textureCount',
     'framesPresented',
+    'presentCount',
+    'splashFramesPresented',
+    'frameCount',
     'droppedFrames',
     'drawCalls',
+    'realPackDrawCount',
+    'fallbackDrawCount',
+    'skippedDrawCount',
+    'skippedDraws',
+    'unboundBindGroupCount',
     'computeDispatches',
     'packetsProcessed',
+    'packetCount',
+    'bytesProcessed',
+    'vramBytes',
   ]) {
     const val = pickNonNegInt(raw, intKey);
     if (val !== undefined) out[intKey] = val;
+  }
+
+  for (const numKey of ['fps', 'onePercentLowFps', 'fps1PctLow', 'p95FrameMs', 'p99FrameMs', 'maxFrameMs']) {
+    const val = pickNonNegNumber(raw, numKey);
+    if (val !== undefined) out[numKey] = val;
   }
 
   if (isPlainObject(raw.frameStats)) {
     const fs = {};
     for (const intKey of [
       'framesPresented',
+      'presentCount',
       'droppedFrames',
       'drawCalls',
+      'realPackDrawCount',
+      'fallbackDrawCount',
+      'skippedDrawCount',
+      'skippedDraws',
+      'unboundBindGroupCount',
+      'validationErrors',
+      'validationErrorCount',
       'computeDispatches',
       'packetsProcessed',
       'ringBytesDrained',
@@ -846,7 +1169,16 @@ function sanitizeGpuTelemetry(raw) {
       const val = pickNonNegInt(raw.frameStats, intKey);
       if (val !== undefined) fs[intKey] = val;
     }
-    for (const numKey of ['lastFrameMs', 'avgFrameMs']) {
+    for (const numKey of [
+      'lastFrameMs',
+      'avgFrameMs',
+      'fps',
+      'onePercentLowFps',
+      'fps1PctLow',
+      'p95FrameMs',
+      'p99FrameMs',
+      'maxFrameMs',
+    ]) {
       const val = pickNonNegNumber(raw.frameStats, numKey);
       if (val !== undefined) fs[numKey] = val;
     }
@@ -857,7 +1189,9 @@ function sanitizeGpuTelemetry(raw) {
     ? raw.fallbackStats
     : isPlainObject(raw.shaderFallbackStats)
       ? raw.shaderFallbackStats
-      : null;
+      : isPlainObject(raw.shaderFallback)
+        ? raw.shaderFallback
+        : null;
   if (rawFallback) {
     const fb = {};
     for (const intKey of [
@@ -865,7 +1199,9 @@ function sanitizeGpuTelemetry(raw) {
       'fallbackHits',
       'builtinHits',
       'totalLookups',
+      'totalResolves',
       'uniqueMissing',
+      'missingCount',
       'overflowMissingCount',
     ]) {
       const val = pickNonNegInt(rawFallback, intKey);
@@ -876,19 +1212,38 @@ function sanitizeGpuTelemetry(raw) {
     out.fallbackStats = fb;
   }
 
-  if (Array.isArray(raw.missingShaders)) {
+  const rawMissingList = Array.isArray(raw.missingShaders)
+    ? raw.missingShaders
+    : Array.isArray(raw.topMissingShaders)
+      ? raw.topMissingShaders
+      : isPlainObject(raw.missingShaderSummary) && Array.isArray(raw.missingShaderSummary.top)
+        ? raw.missingShaderSummary.top
+        : isPlainObject(raw.missingShaderSummary) && Array.isArray(raw.missingShaderSummary.entries)
+          ? raw.missingShaderSummary.entries
+          : null;
+
+  if (rawMissingList) {
     const missingShaders = [];
     for (
       let i = 0;
-      i < raw.missingShaders.length && missingShaders.length < MAX_GPU_MISSING_SHADERS;
+      i < rawMissingList.length && missingShaders.length < MAX_GPU_MISSING_SHADERS;
       i += 1
     ) {
-      const clean = sanitizeMissingShaderEntry(raw.missingShaders[i]);
+      const clean = sanitizeMissingShaderEntry(rawMissingList[i]);
       if (clean) {
         missingShaders.push(clean);
       }
     }
     out.missingShaders = missingShaders;
+  }
+
+  for (const binkKey of ['bink', 'binkPresenter', 'splashBridge']) {
+    if (raw[binkKey] !== undefined && raw[binkKey] !== null) {
+      const cleanBink = sanitizeBinkTelemetry(raw[binkKey]);
+      if (cleanBink && Object.keys(cleanBink).length > 0) {
+        out[binkKey] = cleanBink;
+      }
+    }
   }
 
   return out;
@@ -1061,6 +1416,7 @@ export class CrashReporter {
     this._errorClassifications = new WeakMap();
     this._bootSnapshot = null;
     this._gpuTelemetry = null;
+    this._binkTelemetry = null;
 
     this._attachedTarget = null;
     this._boundOnError = null;
@@ -1138,6 +1494,7 @@ export class CrashReporter {
     this._categoryCounts = Object.create(null);
     this._bootSnapshot = null;
     this._gpuTelemetry = null;
+    this._binkTelemetry = null;
   }
 
   /**
@@ -1182,6 +1539,29 @@ export class CrashReporter {
    */
   getGpuTelemetry() {
     return this._gpuTelemetry ? sanitizeValue(this._gpuTelemetry) : null;
+  }
+
+  /**
+   * Stores an allowlisted, sanitized Bink2 / splash presenter telemetry snapshot
+   * (or duck-typed `BinkVideoPresenter` / `SplashFrameBridge` instance via `getStats()`)
+   * to include under `bootDiagnostics.binkTelemetry` in exported diagnostic bundles.
+   * Pass `null` or `undefined` to clear.
+   *
+   * @param {object|null|undefined} snapshot
+   * @returns {object|null}
+   */
+  setBinkTelemetry(snapshot) {
+    this._binkTelemetry = sanitizeBinkTelemetry(snapshot);
+    return this.getBinkTelemetry();
+  }
+
+  /**
+   * Returns a sanitized clone of the attached Bink2 telemetry snapshot, or `null` when unset.
+   *
+   * @returns {object|null}
+   */
+  getBinkTelemetry() {
+    return this._binkTelemetry ? sanitizeValue(this._binkTelemetry) : null;
   }
 
   /**
@@ -1415,6 +1795,7 @@ export class CrashReporter {
    * @param {object} [options.bootSnapshot] Optional per-report boot summary override.
    * @param {object} [options.bootSummary] Alias for `bootSnapshot`.
    * @param {object} [options.gpuTelemetry] Optional per-report GPU telemetry override.
+   * @param {object} [options.binkTelemetry] Optional per-report Bink2/splash telemetry override.
    * @param {unknown} [options.extra]
    * @returns {object}
    */
@@ -1425,6 +1806,7 @@ export class CrashReporter {
     bootSnapshot,
     bootSummary,
     gpuTelemetry,
+    binkTelemetry,
     extra,
   } = {}) {
     const ts = this._now();
@@ -1465,6 +1847,8 @@ export class CrashReporter {
       rawBootOverride !== undefined ? sanitizeBootSnapshot(rawBootOverride) : this._bootSnapshot;
     const resolvedGpuTelemetry =
       gpuTelemetry !== undefined ? sanitizeGpuTelemetry(gpuTelemetry) : this._gpuTelemetry;
+    const resolvedBinkTelemetry =
+      binkTelemetry !== undefined ? sanitizeBinkTelemetry(binkTelemetry) : this._binkTelemetry;
 
     const report = {
       schemaVersion: SCHEMA_VERSION,
@@ -1482,6 +1866,7 @@ export class CrashReporter {
         errorCodeCounts,
         bootSnapshot: resolvedBootSnapshot,
         gpuTelemetry: resolvedGpuTelemetry,
+        binkTelemetry: resolvedBinkTelemetry,
       },
     };
 
@@ -1489,7 +1874,25 @@ export class CrashReporter {
       report.extra = extra;
     }
 
-    return sanitizeValue(report);
+    const sanitizedReport = sanitizeValue(report);
+    if (
+      sanitizedReport &&
+      sanitizedReport.perf &&
+      isPlainObject(sanitizedReport.perf.frames) &&
+      sanitizedReport.perf.frames.onePercentLowFps === undefined
+    ) {
+      const explicitLow = pickNonNegNumber(sanitizedReport.perf.frames, 'fps1PctLow');
+      if (explicitLow !== undefined) {
+        sanitizedReport.perf.frames.onePercentLowFps = explicitLow;
+      } else {
+        const p99Ms = pickNonNegNumber(sanitizedReport.perf.frames, 'p99FrameTimeMs');
+        if (p99Ms !== undefined && p99Ms > 0) {
+          sanitizedReport.perf.frames.onePercentLowFps = roundTo2(1000 / p99Ms);
+        }
+      }
+    }
+
+    return sanitizedReport;
   }
 
   /**
@@ -1511,6 +1914,18 @@ export class CrashReporter {
             : 2;
 
     return JSON.stringify(this.buildReport(opts), null, indent);
+  }
+
+  /**
+   * Formats `buildReport(options)` as a compact, strictly sanitized Markdown snippet
+   * ready to paste directly onto GitHub issue comments.
+   *
+   * @param {object} [options]
+   * @returns {string}
+   */
+  toGitHubIssueMarkdown(options = {}) {
+    const opts = options && typeof options === 'object' ? options : {};
+    return formatGitHubIssueMarkdown(this.buildReport(opts), opts);
   }
 
   /**
@@ -1592,6 +2007,496 @@ export class CrashReporter {
     this._boundOnError = null;
     this._boundOnRejection = null;
   }
+}
+
+function formatCompactNumber(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return null;
+  }
+  if (Number.isInteger(value)) {
+    return String(value);
+  }
+  return String(roundTo2(value));
+}
+
+function escapeMdInlineCode(value, maxLen = 128) {
+  const safe = sanitizeString(value == null ? '' : String(value))
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/`/g, "'")
+    .trim();
+  const clipped = safe.length > maxLen ? `${safe.slice(0, maxLen - 3)}...` : safe;
+  return `\`${clipped}\``;
+}
+
+function escapeMdTableCell(value, maxLen = 160) {
+  const safe = sanitizeString(value == null ? '' : String(value))
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/\|/g, '\\|')
+    .trim();
+  return safe.length > maxLen ? `${safe.slice(0, maxLen - 3)}...` : safe;
+}
+
+function resolveOnePercentLowFps(perf, gpu) {
+  const frames = perf && isPlainObject(perf.frames) ? perf.frames : null;
+  if (frames) {
+    const explicit = pickNonNegNumber(frames, 'onePercentLowFps') ?? pickNonNegNumber(frames, 'fps1PctLow');
+    if (explicit !== undefined) return explicit;
+    const p99Ms = pickNonNegNumber(frames, 'p99FrameTimeMs');
+    if (p99Ms !== undefined && p99Ms > 0) return roundTo2(1000 / p99Ms);
+  }
+  if (perf && isPlainObject(perf)) {
+    const topExplicit = pickNonNegNumber(perf, 'onePercentLowFps') ?? pickNonNegNumber(perf, 'fps1PctLow');
+    if (topExplicit !== undefined) return topExplicit;
+  }
+  if (gpu && isPlainObject(gpu)) {
+    const gpuExplicit = pickNonNegNumber(gpu, 'onePercentLowFps') ?? pickNonNegNumber(gpu, 'fps1PctLow');
+    if (gpuExplicit !== undefined) return gpuExplicit;
+    const gpuP99 = pickNonNegNumber(gpu, 'p99FrameMs');
+    if (gpuP99 !== undefined && gpuP99 > 0) return roundTo2(1000 / gpuP99);
+    const fs = isPlainObject(gpu.frameStats) ? gpu.frameStats : null;
+    if (fs) {
+      const fsExplicit = pickNonNegNumber(fs, 'onePercentLowFps') ?? pickNonNegNumber(fs, 'fps1PctLow');
+      if (fsExplicit !== undefined) return fsExplicit;
+      const fsP99 = pickNonNegNumber(fs, 'p99FrameMs');
+      if (fsP99 !== undefined && fsP99 > 0) return roundTo2(1000 / fsP99);
+    }
+  }
+  return null;
+}
+
+function resolveTrapOffsetDisplay(trap) {
+  if (!trap || !isPlainObject(trap)) {
+    return null;
+  }
+  for (const key of ['instructionOffset', 'insnOffset', 'rva', 'funcOffset']) {
+    const val = trap[key];
+    if (val !== undefined && val !== null && val !== '') {
+      return typeof val === 'number' ? `0x${val.toString(16)}` : String(val);
+    }
+  }
+  return null;
+}
+
+function resolveTrapVaDisplay(trap) {
+  if (!trap || !isPlainObject(trap)) {
+    return null;
+  }
+  for (const key of ['guestVa', 'va', 'rip', 'pc', 'functionVa', 'funcVa']) {
+    const val = trap[key];
+    if (val !== undefined && val !== null && val !== '') {
+      return String(val);
+    }
+  }
+  return null;
+}
+
+/**
+ * Formats a diagnostic report (or `CrashReporter` instance, or raw unsanitized
+ * report-shaped object) into a compact, strictly sanitized Markdown snippet
+ * ready to paste directly onto GitHub issues.
+ *
+ * Aggressively redacts local host paths, query secrets/tokens, and raw binary payloads
+ * while preserving exact sanitized trap VAs (`0x...`), instruction offsets, GPU
+ * validation/draw/skip counts, 1%-low FPS, Bink2 telemetry, and top missing shader hashes.
+ *
+ * @param {object|null|undefined} report
+ * @param {object} [options]
+ * @param {string} [options.title='### PlayGTA6Web Sanitized Diagnostic Summary']
+ * @param {number} [options.maxTraps=5]
+ * @param {number} [options.maxMissingShaders=5]
+ * @param {number} [options.maxErrors=5]
+ * @param {number} [options.maxUnresolvedImports=5]
+ * @returns {string}
+ */
+export function formatGitHubIssueMarkdown(report, options = {}) {
+  const opts = options && typeof options === 'object' ? options : {};
+  const maxTraps = Number.isInteger(opts.maxTraps) && opts.maxTraps >= 0 ? opts.maxTraps : 5;
+  const maxMissingShaders =
+    Number.isInteger(opts.maxMissingShaders) && opts.maxMissingShaders >= 0 ? opts.maxMissingShaders : 5;
+  const maxErrors = Number.isInteger(opts.maxErrors) && opts.maxErrors >= 0 ? opts.maxErrors : 5;
+  const maxUnresolvedImports =
+    Number.isInteger(opts.maxUnresolvedImports) && opts.maxUnresolvedImports >= 0
+      ? opts.maxUnresolvedImports
+      : 5;
+
+  let rawSource = report;
+  if (rawSource && typeof rawSource === 'object' && typeof rawSource.buildReport === 'function') {
+    try {
+      rawSource = rawSource.buildReport();
+    } catch {
+      rawSource = null;
+    }
+  }
+
+  const safeReport = isPlainObject(rawSource) ? sanitizeValue(rawSource) : {};
+  const rawBootDiag =
+    isPlainObject(rawSource) && isPlainObject(rawSource.bootDiagnostics) ? rawSource.bootDiagnostics : null;
+
+  const bootSnapshot = sanitizeBootSnapshot(
+    rawBootDiag && rawBootDiag.bootSnapshot !== undefined
+      ? rawBootDiag.bootSnapshot
+      : isPlainObject(rawSource)
+        ? rawSource.bootSnapshot ?? rawSource.bootSummary
+        : null
+  );
+  const gpuTelemetry = sanitizeGpuTelemetry(
+    rawBootDiag && rawBootDiag.gpuTelemetry !== undefined
+      ? rawBootDiag.gpuTelemetry
+      : isPlainObject(rawSource)
+        ? rawSource.gpuTelemetry
+        : null
+  );
+  const binkTelemetry = sanitizeBinkTelemetry(
+    rawBootDiag && rawBootDiag.binkTelemetry !== undefined
+      ? rawBootDiag.binkTelemetry
+      : isPlainObject(rawSource) && rawSource.binkTelemetry !== undefined
+        ? rawSource.binkTelemetry
+        : gpuTelemetry
+          ? gpuTelemetry.bink ?? gpuTelemetry.binkPresenter ?? gpuTelemetry.splashBridge ?? null
+          : null
+  );
+
+  const title =
+    typeof opts.title === 'string' && opts.title.trim().length > 0
+      ? sanitizeString(opts.title.trim())
+      : '### PlayGTA6Web Sanitized Diagnostic Summary';
+
+  const lines = [title];
+
+  // Metadata line
+  const metaParts = [];
+  if (typeof safeReport.appVersion === 'string' && safeReport.appVersion.length > 0) {
+    metaParts.push(`**App:** ${escapeMdInlineCode(safeReport.appVersion, 64)}`);
+  }
+  if (typeof safeReport.schemaVersion === 'number' && Number.isFinite(safeReport.schemaVersion)) {
+    metaParts.push(`**Schema:** v${Math.floor(safeReport.schemaVersion)}`);
+  }
+  if (typeof safeReport.generatedAt === 'string' && safeReport.generatedAt.length > 0) {
+    metaParts.push(`**Generated:** ${escapeMdInlineCode(safeReport.generatedAt, 64)}`);
+  }
+  if (metaParts.length > 0) {
+    lines.push(`- ${metaParts.join(' | ')}`);
+  }
+
+  // Capabilities line
+  if (isPlainObject(safeReport.capabilities)) {
+    const c = safeReport.capabilities;
+    const capParts = [];
+    if (typeof c.wasm64 === 'boolean') capParts.push(`Wasm64=${c.wasm64 ? 'yes' : 'no'}`);
+    if (typeof c.webgpu === 'boolean') capParts.push(`WebGPU=${c.webgpu ? 'yes' : 'no'}`);
+    if (typeof c.sharedArrayBuffer === 'boolean') capParts.push(`SAB=${c.sharedArrayBuffer ? 'yes' : 'no'}`);
+    if (typeof c.crossOriginIsolated === 'boolean') capParts.push(`COI=${c.crossOriginIsolated ? 'yes' : 'no'}`);
+    if (typeof c.opfs === 'boolean') capParts.push(`OPFS=${c.opfs ? 'yes' : 'no'}`);
+    if (typeof c.hardwareConcurrency === 'number' && c.hardwareConcurrency > 0) {
+      capParts.push(`Threads=${Math.floor(c.hardwareConcurrency)}`);
+    }
+    if (capParts.length > 0) {
+      lines.push(`- **Capabilities:** ${capParts.join(', ')}`);
+    }
+  }
+
+  // Boot summary
+  if (bootSnapshot && Object.keys(bootSnapshot).length > 0) {
+    const bootParts = [];
+    if (bootSnapshot.stage) bootParts.push(`stage=${escapeMdInlineCode(bootSnapshot.stage, 64)}`);
+    if (bootSnapshot.progressPct !== undefined) {
+      bootParts.push(`progress=${formatCompactNumber(bootSnapshot.progressPct)}%`);
+    }
+    const mode = bootSnapshot.mode || bootSnapshot.bootMode;
+    if (mode) bootParts.push(`mode=${escapeMdInlineCode(mode, 64)}`);
+    if (bootSnapshot.readyForSplash !== undefined) {
+      bootParts.push(`readyForSplash=${bootSnapshot.readyForSplash ? 'yes' : 'no'}`);
+    }
+    if (bootSnapshot.trapCount !== undefined) {
+      const uniq =
+        bootSnapshot.uniqueTrapCount !== undefined ? ` (unique=${bootSnapshot.uniqueTrapCount})` : '';
+      bootParts.push(`traps=${bootSnapshot.trapCount}${uniq}`);
+    }
+    if (bootParts.length > 0) {
+      lines.push(`- **Boot:** ${bootParts.join(', ')}`);
+    }
+  }
+
+  // Performance / Frame pacing (including 1%-low FPS)
+  const perf = isPlainObject(safeReport.perf) ? safeReport.perf : null;
+  const perfFrames = perf && isPlainObject(perf.frames) ? perf.frames : null;
+  const gpuFrameStats = gpuTelemetry && isPlainObject(gpuTelemetry.frameStats) ? gpuTelemetry.frameStats : null;
+  const fpsVal =
+    (perfFrames && pickNonNegNumber(perfFrames, 'fps')) ??
+    (gpuTelemetry && pickNonNegNumber(gpuTelemetry, 'fps')) ??
+    (gpuFrameStats && pickNonNegNumber(gpuFrameStats, 'fps'));
+  const onePctLowFps = resolveOnePercentLowFps(perf, gpuTelemetry);
+  const avgMs =
+    (perfFrames && pickNonNegNumber(perfFrames, 'avgFrameTimeMs')) ??
+    (gpuFrameStats && pickNonNegNumber(gpuFrameStats, 'avgFrameMs'));
+  const p95Ms =
+    (perfFrames && pickNonNegNumber(perfFrames, 'p95FrameTimeMs')) ??
+    (gpuTelemetry && pickNonNegNumber(gpuTelemetry, 'p95FrameMs')) ??
+    (gpuFrameStats && pickNonNegNumber(gpuFrameStats, 'p95FrameMs'));
+  const p99Ms =
+    (perfFrames && pickNonNegNumber(perfFrames, 'p99FrameTimeMs')) ??
+    (gpuTelemetry && pickNonNegNumber(gpuTelemetry, 'p99FrameMs')) ??
+    (gpuFrameStats && pickNonNegNumber(gpuFrameStats, 'p99FrameMs'));
+  const totalFrames = perfFrames ? pickNonNegInt(perfFrames, 'totalFrames') : undefined;
+  const jankFrames = perfFrames ? pickNonNegInt(perfFrames, 'jankFrames') : undefined;
+
+  const perfParts = [];
+  if (fpsVal !== undefined) perfParts.push(`FPS=${escapeMdInlineCode(formatCompactNumber(fpsVal))}`);
+  if (onePctLowFps !== null) {
+    perfParts.push(`1%-low FPS=${escapeMdInlineCode(formatCompactNumber(onePctLowFps))}`);
+  }
+  if (avgMs !== undefined) perfParts.push(`avg=${formatCompactNumber(avgMs)}ms`);
+  if (p95Ms !== undefined) perfParts.push(`p95=${formatCompactNumber(p95Ms)}ms`);
+  if (p99Ms !== undefined) perfParts.push(`p99=${formatCompactNumber(p99Ms)}ms`);
+  if (totalFrames !== undefined) perfParts.push(`frames=${totalFrames}`);
+  if (jankFrames !== undefined) perfParts.push(`jank=${jankFrames}`);
+  if (perfParts.length > 0) {
+    lines.push(`- **Performance:** ${perfParts.join(', ')}`);
+  }
+
+  // GPU telemetry summary (validation / draw / skip counts + fallback stats)
+  if (gpuTelemetry && Object.keys(gpuTelemetry).length > 0) {
+    const fs = gpuFrameStats || {};
+    const gpuParts = [];
+    if (gpuTelemetry.backend) gpuParts.push(`backend=${escapeMdInlineCode(gpuTelemetry.backend, 64)}`);
+    if (gpuTelemetry.adapter) gpuParts.push(`adapter=${escapeMdInlineCode(gpuTelemetry.adapter, 96)}`);
+    if (gpuTelemetry.deviceLost === true) gpuParts.push('deviceLost=yes');
+
+    const presents =
+      gpuTelemetry.framesPresented ??
+      gpuTelemetry.presentCount ??
+      fs.framesPresented ??
+      fs.presentCount;
+    if (presents !== undefined) gpuParts.push(`presents=${presents}`);
+
+    const drawCalls = gpuTelemetry.drawCalls ?? fs.drawCalls;
+    if (drawCalls !== undefined) gpuParts.push(`draws=${drawCalls}`);
+    const realDraws = gpuTelemetry.realPackDrawCount ?? fs.realPackDrawCount;
+    if (realDraws !== undefined) gpuParts.push(`realPackDraws=${realDraws}`);
+    const fallbackDraws = gpuTelemetry.fallbackDrawCount ?? fs.fallbackDrawCount;
+    if (fallbackDraws !== undefined) gpuParts.push(`fallbackDraws=${fallbackDraws}`);
+    const skippedDraws =
+      gpuTelemetry.skippedDrawCount ??
+      gpuTelemetry.skippedDraws ??
+      fs.skippedDrawCount ??
+      fs.skippedDraws;
+    if (skippedDraws !== undefined) gpuParts.push(`skippedDraws=${skippedDraws}`);
+    const unboundBg = gpuTelemetry.unboundBindGroupCount ?? fs.unboundBindGroupCount;
+    if (unboundBg !== undefined) gpuParts.push(`unboundBindGroups=${unboundBg}`);
+
+    const computeDispatches = gpuTelemetry.computeDispatches ?? fs.computeDispatches;
+    if (computeDispatches !== undefined) gpuParts.push(`compute=${computeDispatches}`);
+
+    const validationErrors =
+      gpuTelemetry.validationErrorCount ??
+      gpuTelemetry.validationErrors ??
+      fs.validationErrorCount ??
+      fs.validationErrors;
+    if (validationErrors !== undefined) gpuParts.push(`validationErrors=${validationErrors}`);
+
+    if (gpuTelemetry.fallbackStats) {
+      const fb = gpuTelemetry.fallbackStats;
+      if (fb.hitRatePct !== undefined) {
+        gpuParts.push(`shaderHitRate=${formatCompactNumber(fb.hitRatePct)}%`);
+      }
+      if (fb.uniqueMissing !== undefined) {
+        gpuParts.push(`uniqueMissingShaders=${fb.uniqueMissing}`);
+      }
+    }
+
+    if (gpuParts.length > 0) {
+      lines.push(`- **GPU:** ${gpuParts.join(', ')}`);
+    }
+
+    if (gpuTelemetry.lastValidationErrorCode || gpuTelemetry.lastValidationErrorMessage) {
+      const codeStr = gpuTelemetry.lastValidationErrorCode
+        ? `${escapeMdInlineCode(gpuTelemetry.lastValidationErrorCode, 64)} `
+        : '';
+      const msgStr = gpuTelemetry.lastValidationErrorMessage
+        ? escapeMdTableCell(gpuTelemetry.lastValidationErrorMessage, 200)
+        : '';
+      lines.push(`- **Last GPU Validation Error:** ${codeStr}${msgStr}`.trimEnd());
+    }
+  }
+
+  // Bink2 / Splash video telemetry
+  if (binkTelemetry && Object.keys(binkTelemetry).length > 0) {
+    const presenter = isPlainObject(binkTelemetry.presenterStats) ? binkTelemetry.presenterStats : {};
+    const binkParts = [];
+    const fmt = binkTelemetry.pixelFormat ?? binkTelemetry.lastFrameFormat ?? presenter.pixelFormat;
+    if (fmt) binkParts.push(`format=${escapeMdInlineCode(fmt, 32)}`);
+    const width =
+      binkTelemetry.frameWidth ?? binkTelemetry.lastFrameWidth ?? presenter.frameWidth ?? presenter.lastFrameWidth;
+    const height =
+      binkTelemetry.frameHeight ??
+      binkTelemetry.lastFrameHeight ??
+      presenter.frameHeight ??
+      presenter.lastFrameHeight;
+    if (width !== undefined && height !== undefined && width > 0 && height > 0) {
+      binkParts.push(`res=${width}x${height}`);
+    }
+    const chroma = binkTelemetry.chromaOrder ?? binkTelemetry.lastChromaOrder ?? presenter.chromaOrder;
+    if (chroma) binkParts.push(`chroma=${escapeMdInlineCode(chroma, 16)}`);
+    const colorSpace = binkTelemetry.colorSpace ?? presenter.colorSpace;
+    const colorRange = binkTelemetry.colorRange ?? presenter.colorRange;
+    if (colorSpace) {
+      binkParts.push(`color=${escapeMdInlineCode(colorRange ? `${colorSpace}/${colorRange}` : colorSpace, 32)}`);
+    }
+    const presented =
+      binkTelemetry.presentedFrames ??
+      binkTelemetry.framesPresented ??
+      presenter.presentedFrames ??
+      presenter.framesPresented;
+    if (presented !== undefined) binkParts.push(`presented=${presented}`);
+    const dropped = binkTelemetry.droppedFrames ?? presenter.droppedFrames;
+    if (dropped !== undefined) binkParts.push(`dropped=${dropped}`);
+    const skippedFrames = binkTelemetry.skippedFrames ?? presenter.skippedFrames;
+    if (skippedFrames !== undefined) {
+      binkParts.push(`skippedFrames=${skippedFrames}`);
+    } else if (typeof binkTelemetry.skipped === 'boolean') {
+      binkParts.push(`skipped=${binkTelemetry.skipped ? 'yes' : 'no'}`);
+    }
+    const uploaded = binkTelemetry.uploadedFrames ?? presenter.uploadedFrames;
+    if (uploaded !== undefined) binkParts.push(`uploaded=${uploaded}`);
+    const targetFps = binkTelemetry.targetFps ?? presenter.targetFps;
+    if (targetFps !== undefined) binkParts.push(`targetFps=${formatCompactNumber(targetFps)}`);
+    if (binkParts.length > 0) {
+      lines.push(`- **Bink2:** ${binkParts.join(', ')}`);
+    }
+  }
+
+  // Traps table (preserving exact guestVa and instruction offsets)
+  if (bootSnapshot && maxTraps > 0) {
+    const collectedTraps = [];
+    const seenTrapKeys = new Set();
+    const pushTrap = (trap) => {
+      if (!isPlainObject(trap)) return;
+      const va = resolveTrapVaDisplay(trap) || '';
+      const off = resolveTrapOffsetDisplay(trap) || '';
+      const key = `${trap.seq ?? ''}|${trap.kind ?? ''}|${va}|${off}|${trap.import ?? ''}|${trap.message ?? ''}`;
+      if (seenTrapKeys.has(key)) return;
+      seenTrapKeys.add(key);
+      collectedTraps.push(trap);
+    };
+    if (bootSnapshot.lastTrap) {
+      pushTrap(bootSnapshot.lastTrap);
+    }
+    if (Array.isArray(bootSnapshot.recentTraps)) {
+      for (let i = bootSnapshot.recentTraps.length - 1; i >= 0 && collectedTraps.length < maxTraps; i -= 1) {
+        pushTrap(bootSnapshot.recentTraps[i]);
+      }
+    }
+
+    if (collectedTraps.length > 0) {
+      lines.push('');
+      lines.push('#### Traps');
+      lines.push('| Kind | Guest VA | Insn Offset | Stage | Detail | Count |');
+      lines.push('| --- | --- | --- | --- | --- | --- |');
+      for (const trap of collectedTraps.slice(0, maxTraps)) {
+        const kindCell = trap.kind ? escapeMdInlineCode(trap.kind, 48) : '-';
+        const va = resolveTrapVaDisplay(trap);
+        const vaCell = va ? escapeMdInlineCode(va, 32) : '-';
+        const off = resolveTrapOffsetDisplay(trap);
+        const offCell = off ? escapeMdInlineCode(off, 32) : '-';
+        const stageCell = trap.stage ? escapeMdInlineCode(trap.stage, 48) : '-';
+        const detailParts = [];
+        if (trap.import) detailParts.push(escapeMdInlineCode(trap.import, 96));
+        if (trap.mnemonic) detailParts.push(escapeMdInlineCode(trap.mnemonic, 32));
+        if (trap.message) detailParts.push(escapeMdTableCell(trap.message, 140));
+        const detailCell = detailParts.length > 0 ? detailParts.join(' ') : '-';
+        const countCell = trap.count !== undefined ? String(trap.count) : '1';
+        lines.push(`| ${kindCell} | ${vaCell} | ${offCell} | ${stageCell} | ${detailCell} | ${countCell} |`);
+      }
+    }
+
+    // Top unresolved imports
+    if (
+      maxUnresolvedImports > 0 &&
+      Array.isArray(bootSnapshot.unresolvedImports) &&
+      bootSnapshot.unresolvedImports.length > 0
+    ) {
+      const sortedImports = [...bootSnapshot.unresolvedImports].sort(
+        (a, b) => (b.count ?? 0) - (a.count ?? 0) || String(a.name ?? '').localeCompare(String(b.name ?? ''))
+      );
+      lines.push('');
+      lines.push('#### Unresolved Imports');
+      for (const imp of sortedImports.slice(0, maxUnresolvedImports)) {
+        const label = imp.name || (imp.dll && imp.symbol ? `${imp.dll}!${imp.symbol}` : imp.symbol || 'unknown');
+        const vaPart = imp.guestVa ? ` @ ${escapeMdInlineCode(imp.guestVa, 32)}` : '';
+        const off = resolveTrapOffsetDisplay(imp);
+        const offPart = off ? ` (+${escapeMdInlineCode(off, 32)})` : '';
+        const countPart = imp.count !== undefined ? ` (x${imp.count})` : '';
+        lines.push(`- ${escapeMdInlineCode(label, 128)}${vaPart}${offPart}${countPart}`);
+      }
+    }
+  }
+
+  // Top Missing Shaders table (preserving exact 0x... shader hashes)
+  if (
+    maxMissingShaders > 0 &&
+    gpuTelemetry &&
+    Array.isArray(gpuTelemetry.missingShaders) &&
+    gpuTelemetry.missingShaders.length > 0
+  ) {
+    const sortedShaders = [...gpuTelemetry.missingShaders].sort(
+      (a, b) => (b.hits ?? 0) - (a.hits ?? 0) || String(a.hash ?? '').localeCompare(String(b.hash ?? ''))
+    );
+    lines.push('');
+    lines.push('#### Top Missing Shaders');
+    lines.push('| Hash | Stage | Hits | First Frame |');
+    lines.push('| --- | --- | --- | --- |');
+    for (const shader of sortedShaders.slice(0, maxMissingShaders)) {
+      const hashCell = shader.hash ? escapeMdInlineCode(shader.hash, 64) : '-';
+      const stageCell = shader.stage ? escapeMdInlineCode(shader.stage, 32) : '-';
+      const hitsCell = shader.hits !== undefined ? String(shader.hits) : '-';
+      const frameCell = shader.firstSeenFrame !== undefined ? String(shader.firstSeenFrame) : '-';
+      lines.push(`| ${hashCell} | ${stageCell} | ${hitsCell} | ${frameCell} |`);
+    }
+  }
+
+  // Sanitized Errors summary
+  const safeErrors = Array.isArray(safeReport.errors) ? safeReport.errors : [];
+  const safeClassified =
+    safeReport.bootDiagnostics && Array.isArray(safeReport.bootDiagnostics.classifiedErrors)
+      ? safeReport.bootDiagnostics.classifiedErrors
+      : [];
+
+  if (maxErrors > 0 && safeErrors.length > 0) {
+    lines.push('');
+    lines.push('#### Errors');
+    if (isPlainObject(safeReport.errorStats)) {
+      const st = safeReport.errorStats;
+      const statParts = [];
+      if (typeof st.recordedCount === 'number') statParts.push(`recorded=${st.recordedCount}`);
+      if (typeof st.coalescedCount === 'number') statParts.push(`coalesced=${st.coalescedCount}`);
+      if (typeof st.droppedCount === 'number') statParts.push(`dropped=${st.droppedCount}`);
+      if (statParts.length > 0) {
+        lines.push(`- **Counts:** ${statParts.join(', ')}`);
+      }
+    }
+    lines.push('| Category | Code | Occurrences | VA / Offset | Message |');
+    lines.push('| --- | --- | --- | --- | --- |');
+    for (let i = 0; i < safeErrors.length && i < maxErrors; i += 1) {
+      const err = safeErrors[i];
+      if (!isPlainObject(err)) continue;
+      const classified = isPlainObject(safeClassified[i]) ? safeClassified[i] : classifyBootError(err);
+      const catCell = err.category ? escapeMdInlineCode(err.category, 32) : '`runtime`';
+      const codeCell = classified && classified.code ? escapeMdInlineCode(classified.code, 40) : '-';
+      const occCell =
+        typeof err.occurrences === 'number' && Number.isFinite(err.occurrences) ? String(err.occurrences) : '1';
+      const ctx = isPlainObject(err.context) ? err.context : null;
+      const ctxVa = resolveTrapVaDisplay(ctx);
+      const ctxOff = resolveTrapOffsetDisplay(ctx);
+      const locParts = [];
+      if (ctxVa) locParts.push(escapeMdInlineCode(ctxVa, 32));
+      if (ctxOff) locParts.push(escapeMdInlineCode(ctxOff, 32));
+      const locCell = locParts.length > 0 ? locParts.join(' / ') : '-';
+      const msgCell = escapeMdTableCell(err.message || err.name || '', 160) || '-';
+      lines.push(`| ${catCell} | ${codeCell} | ${occCell} | ${locCell} | ${msgCell} |`);
+    }
+  }
+
+  return sanitizeString(lines.join('\n'));
 }
 
 export default CrashReporter;
