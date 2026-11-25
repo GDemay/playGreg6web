@@ -39,8 +39,16 @@
   const DEFAULT_MAX_TRACKED_MISSING = 512;
   const DEFAULT_MAX_TRACKED_MISSING_HASHES = 2048;
   const DEFAULT_MAX_CATEGORIZED_MISSING_HASHES = 8192;
+  const DEFAULT_MAX_RESOLVE_CACHE_ENTRIES = 8192;
   const DEFAULT_TOP_MISSING_LIMIT = 16;
   const DEFAULT_MISSING_SUMMARY_TOP_LIMIT = 32;
+
+  const ENTRY_POINT_REGEXES = Object.freeze({
+    vertex: /@vertex\b[\s\S]*?\bfn\s+([A-Za-z_][A-Za-z0-9_]*)/,
+    fragment: /@fragment\b[\s\S]*?\bfn\s+([A-Za-z_][A-Za-z0-9_]*)/,
+    compute: /@compute\b[\s\S]*?\bfn\s+([A-Za-z_][A-Za-z0-9_]*)/,
+  });
+  const FALLBACK_FN_REGEX = /\bfn\s+([A-Za-z_][A-Za-z0-9_]*)/;
 
   /**
    * Canonical missing-shader failure categories for live Chrome triage telemetry (W179).
@@ -334,6 +342,9 @@
     if (typeof profile !== 'string') {
       return 'default';
     }
+    if (Object.prototype.hasOwnProperty.call(BUILTIN_FALLBACK_PROFILES, profile)) {
+      return profile;
+    }
     const key = profile.trim().toLowerCase();
     if (key.length === 0) {
       return 'default';
@@ -443,6 +454,44 @@
   }
 
   /**
+   * Zero-allocation hot-path stage code resolver (Vertex=1, Fragment=2, Compute=3).
+   * Falls back to `normalizeStage` for trimmed/mixed-case strings and validation errors.
+   *
+   * @param {number | string} stage
+   * @returns {1 | 2 | 3}
+   */
+  function normalizeStageCode(stage) {
+    if (stage === SHADER_STAGE.VERTEX || stage === 'vertex' || stage === 'vs') {
+      return SHADER_STAGE.VERTEX;
+    }
+    if (
+      stage === SHADER_STAGE.FRAGMENT ||
+      stage === 'fragment' ||
+      stage === 'fs' ||
+      stage === 'ps' ||
+      stage === 'pixel'
+    ) {
+      return SHADER_STAGE.FRAGMENT;
+    }
+    if (stage === SHADER_STAGE.COMPUTE || stage === 'compute' || stage === 'cs') {
+      return SHADER_STAGE.COMPUTE;
+    }
+    return STAGE_NAME_TO_CODE[normalizeStage(stage)];
+  }
+
+  function normalizeFrameNumber(frame) {
+    if (
+      typeof frame !== 'number' ||
+      !Number.isInteger(frame) ||
+      !Number.isSafeInteger(frame) ||
+      frame < 0
+    ) {
+      throw new RangeError(`frame must be a non-negative safe integer, got ${frame}`);
+    }
+    return frame;
+  }
+
+  /**
    * Normalize a missing-shader reason string to one of:
    * `'not_in_pack' | 'reflection_failed' | 'compile_failed' | 'other'`.
    *
@@ -505,13 +554,140 @@
     if (typeof wgsl !== 'string' || wgsl.length === 0) {
       return DEFAULT_ENTRY_POINTS[stageName] || null;
     }
-    const re = new RegExp(`@${stageName}\\b[\\s\\S]*?\\bfn\\s+([A-Za-z_][A-Za-z0-9_]*)`);
-    const match = re.exec(wgsl);
-    if (match) {
-      return match[1];
+    const re = ENTRY_POINT_REGEXES[stageName];
+    if (re) {
+      const match = re.exec(wgsl);
+      if (match) {
+        return match[1];
+      }
     }
-    const fallback = /\bfn\s+([A-Za-z_][A-Za-z0-9_]*)/.exec(wgsl);
+    const fallback = FALLBACK_FN_REGEX.exec(wgsl);
     return fallback ? fallback[1] : DEFAULT_ENTRY_POINTS[stageName] || null;
+  }
+
+  function isBetterMissingRow(a, b) {
+    if (a.hitCount !== b.hitCount) {
+      return a.hitCount > b.hitCount;
+    }
+    if (a.hash !== b.hash) {
+      return a.hash < b.hash;
+    }
+    return a.stage < b.stage;
+  }
+
+  function compareMissingRowsDesc(a, b) {
+    if (a.hitCount !== b.hitCount) {
+      return b.hitCount - a.hitCount;
+    }
+    if (a.hash !== b.hash) {
+      return a.hash < b.hash ? -1 : 1;
+    }
+    return a.stage < b.stage ? -1 : a.stage > b.stage ? 1 : 0;
+  }
+
+  function siftUpMinHeap(heap, index) {
+    let i = index;
+    while (i > 0) {
+      const parent = (i - 1) >> 1;
+      // Min-heap puts the WORST (lowest-priority) row at heap[0].
+      if (isBetterMissingRow(heap[parent], heap[i])) {
+        const tmp = heap[parent];
+        heap[parent] = heap[i];
+        heap[i] = tmp;
+        i = parent;
+      } else {
+        break;
+      }
+    }
+  }
+
+  function siftDownMinHeap(heap, index) {
+    const len = heap.length;
+    let i = index;
+    while (true) {
+      const left = (i << 1) + 1;
+      const right = left + 1;
+      let worst = i;
+      if (left < len && isBetterMissingRow(heap[worst], heap[left])) {
+        worst = left;
+      }
+      if (right < len && isBetterMissingRow(heap[worst], heap[right])) {
+        worst = right;
+      }
+      if (worst === i) {
+        break;
+      }
+      const tmp = heap[i];
+      heap[i] = heap[worst];
+      heap[worst] = tmp;
+      i = worst;
+    }
+  }
+
+  /**
+   * Select the top-K missing-shader rows across stage maps using a bounded min-heap
+   * when `limit < totalCount`, avoiding full-table sorting and excess allocations.
+   *
+   * @param {Array<Map<bigint, object> | null>} missingByStage
+   * @param {number} totalCount
+   * @param {number} limit
+   * @returns {Array<object>}
+   */
+  function selectTopMissingRows(missingByStage, totalCount, limit) {
+    if (limit <= 0 || totalCount <= 0) {
+      return [];
+    }
+    const k = limit < totalCount ? limit : totalCount;
+    if (k >= totalCount) {
+      const all = new Array(totalCount);
+      let idx = 0;
+      for (let s = 1; s <= 3; s += 1) {
+        const map = missingByStage[s];
+        for (const row of map.values()) {
+          all[idx] = row;
+          idx += 1;
+        }
+      }
+      all.sort(compareMissingRowsDesc);
+      return all;
+    }
+
+    const heap = [];
+    for (let s = 1; s <= 3; s += 1) {
+      const map = missingByStage[s];
+      for (const row of map.values()) {
+        if (heap.length < k) {
+          heap.push(row);
+          siftUpMinHeap(heap, heap.length - 1);
+        } else if (isBetterMissingRow(row, heap[0])) {
+          heap[0] = row;
+          siftDownMinHeap(heap, 0);
+        }
+      }
+    }
+    heap.sort(compareMissingRowsDesc);
+    return heap;
+  }
+
+  function tryCallPackMethod(packLoader, fn, key) {
+    if (typeof fn !== 'function') {
+      return undefined;
+    }
+    try {
+      return unwrapPackResult(fn.call(packLoader, key));
+    } catch (_err) {
+      return undefined;
+    }
+  }
+
+  function lookupPackSourceWithKey(packLoader, key) {
+    return (
+      tryCallPackMethod(packLoader, packLoader.getWgsl, key) ||
+      tryCallPackMethod(packLoader, packLoader.getSource, key) ||
+      tryCallPackMethod(packLoader, packLoader.getShaderSource, key) ||
+      tryCallPackMethod(packLoader, packLoader.lookup, key) ||
+      tryCallPackMethod(packLoader, packLoader.get, key)
+    );
   }
 
   function unwrapPackResult(raw) {
@@ -551,38 +727,42 @@
    * @param {bigint} hashBigInt
    * @returns {{ wgsl: string, entryPoint: string | null } | undefined}
    */
-  function lookupPackSource(packLoader, hashBigInt) {
+  function lookupPackSource(packLoader, hashBigInt, hashHex) {
     if (!packLoader) {
       return undefined;
     }
 
-    const hashHex = formatShaderHash(hashBigInt);
-    const keys = [hashBigInt, hashHex];
-
-    const tryCall = (fn, key) => {
-      if (typeof fn !== 'function') {
-        return undefined;
-      }
-      try {
-        return unwrapPackResult(fn.call(packLoader, key));
-      } catch (_err) {
-        return undefined;
-      }
-    };
-
-    for (let i = 0; i < keys.length; i += 1) {
-      const key = keys[i];
-      const hit =
-        tryCall(packLoader.getWgsl, key) ||
-        tryCall(packLoader.getSource, key) ||
-        tryCall(packLoader.getShaderSource, key) ||
-        tryCall(packLoader.lookup, key) ||
-        tryCall(packLoader.get, key);
-      if (hit) {
-        return hit;
-      }
+    const byBigInt = lookupPackSourceWithKey(packLoader, hashBigInt);
+    if (byBigInt) {
+      return byBigInt;
     }
-    return undefined;
+
+    const resolvedHex = hashHex !== undefined ? hashHex : formatShaderHash(hashBigInt);
+    return lookupPackSourceWithKey(packLoader, resolvedHex);
+  }
+
+  /**
+   * Return true when `hashBigInt` exists in a ranged-mode WGPK index whose payload
+   * has not yet been fetched into memory. Transient misses for ranged entries must not
+   * be negatively memoized so the next `resolve()` immediately picks up the real pack
+   * shader once the HTTP 206 Range fetch completes.
+   *
+   * @param {object | Map | null | undefined} packLoader
+   * @param {bigint} hashBigInt
+   * @returns {boolean}
+   */
+  function isPendingRangedPackShader(packLoader, hashBigInt) {
+    if (!packLoader || typeof packLoader !== 'object') {
+      return false;
+    }
+    if (packLoader._shaderEntries instanceof Map) {
+      const record = packLoader._shaderEntries.get(hashBigInt);
+      return Boolean(record && record.pack && record.pack.mode === 'ranged');
+    }
+    if (packLoader.mode === 'ranged' && packLoader.entries instanceof Map) {
+      return packLoader.entries.has(hashBigInt);
+    }
+    return false;
   }
 
   function resolveFallbackHashForStage(fallbackHashes, stageName) {
@@ -610,6 +790,8 @@
      *   maxTrackedMissingHashes?: number,
      *   maxTrackedMissing?: number,
      *   maxCategorizedMissingHashes?: number,
+     *   maxResolveCacheEntries?: number,
+     *   initialFrame?: number,
      *   defaultProfile?: string | null,
      *   realShaders?: Iterable<any> | Map<any, any> | Record<string, any> | null,
      *   now?: () => number,
@@ -667,11 +849,49 @@
       }
       this._maxCategorizedMissing = maxCategorized;
 
+      let maxResolveCache = DEFAULT_MAX_RESOLVE_CACHE_ENTRIES;
+      if (opts.maxResolveCacheEntries !== undefined) {
+        if (
+          !Number.isInteger(opts.maxResolveCacheEntries) ||
+          opts.maxResolveCacheEntries < 0
+        ) {
+          throw new RangeError(
+            `maxResolveCacheEntries must be a non-negative integer, got ${opts.maxResolveCacheEntries}`
+          );
+        }
+        maxResolveCache = opts.maxResolveCacheEntries;
+      }
+      this._maxResolveCacheEntries = maxResolveCache;
+
+      const initialFrame =
+        opts.initialFrame !== undefined && opts.initialFrame !== null
+          ? normalizeFrameNumber(opts.initialFrame)
+          : 0;
+      this._currentFrame = initialFrame;
+
       this._now = typeof opts.now === 'function' ? opts.now : defaultNow;
       this._defaultProfile = normalizeFallbackProfile(opts.defaultProfile);
 
-      this._missing = new Map();
+      // W204: Per-stage O(1) missing-hash maps keyed by u64 BigInt (zero key-concatenation).
+      this._missingByStage = [null, new Map(), new Map(), new Map()];
+      this._missingCount = 0;
       this._overflowMissingCount = 0;
+      this._telemetryGeneration = 0;
+
+      // W204: Fast-path per-stage resolved-hash memoization (zero temporary objects on cache hits).
+      this._resolveCacheByStage = [null, new Map(), new Map(), new Map()];
+      this._resolveCacheEntries = new Map();
+      this._resolveCacheHits = 0;
+      this._resolveCacheMisses = 0;
+      this._resolveCacheInvalidations = 0;
+      this._packStampVersion = undefined;
+      this._packStampNextId = -1;
+      this._packStampPacksSize = -1;
+      this._packStampEntriesSize = -1;
+      this._packStampDynamicSize = -1;
+      this._packStampMapSize = -1;
+      this._capturePackStamp();
+
       this._stats = {
         totalLookups: 0,
         packHits: 0,
@@ -696,7 +916,229 @@
 
       if (opts.realShaders !== undefined && opts.realShaders !== null) {
         this._registerInitialRealShaders(opts.realShaders);
+        this._resolveCacheInvalidations = 0;
       }
+    }
+
+    _capturePackStamp() {
+      const loader = this._packLoader;
+      if (loader === null || loader === undefined) {
+        this._packStampVersion = undefined;
+        this._packStampNextId = -1;
+        this._packStampPacksSize = -1;
+        this._packStampEntriesSize = -1;
+        this._packStampDynamicSize = -1;
+        this._packStampMapSize = -1;
+        return;
+      }
+      this._packStampVersion =
+        loader.generation !== undefined
+          ? loader.generation
+          : loader.packVersion !== undefined
+            ? loader.packVersion
+            : loader.version;
+      this._packStampNextId = typeof loader._nextPackId === 'number' ? loader._nextPackId : -1;
+      this._packStampPacksSize = loader._packs instanceof Map ? loader._packs.size : -1;
+      this._packStampEntriesSize =
+        loader._shaderEntries instanceof Map
+          ? loader._shaderEntries.size
+          : loader._entries instanceof Map
+            ? loader._entries.size
+            : -1;
+      this._packStampDynamicSize =
+        loader._dynamicEntries instanceof Map ? loader._dynamicEntries.size : -1;
+      this._packStampMapSize = typeof loader.size === 'number' ? loader.size : -1;
+    }
+
+    _syncPackCacheVersion() {
+      const loader = this._packLoader;
+      if (loader === null || loader === undefined) {
+        return;
+      }
+      const v =
+        loader.generation !== undefined
+          ? loader.generation
+          : loader.packVersion !== undefined
+            ? loader.packVersion
+            : loader.version;
+      const nextId = typeof loader._nextPackId === 'number' ? loader._nextPackId : -1;
+      const packsSize = loader._packs instanceof Map ? loader._packs.size : -1;
+      const entriesSize =
+        loader._shaderEntries instanceof Map
+          ? loader._shaderEntries.size
+          : loader._entries instanceof Map
+            ? loader._entries.size
+            : -1;
+      const dynSize = loader._dynamicEntries instanceof Map ? loader._dynamicEntries.size : -1;
+      const mapSize = typeof loader.size === 'number' ? loader.size : -1;
+
+      if (
+        v !== this._packStampVersion ||
+        nextId !== this._packStampNextId ||
+        packsSize !== this._packStampPacksSize ||
+        entriesSize !== this._packStampEntriesSize ||
+        dynSize !== this._packStampDynamicSize ||
+        mapSize !== this._packStampMapSize
+      ) {
+        this._packStampVersion = v;
+        this._packStampNextId = nextId;
+        this._packStampPacksSize = packsSize;
+        this._packStampEntriesSize = entriesSize;
+        this._packStampDynamicSize = dynSize;
+        this._packStampMapSize = mapSize;
+        this._clearResolveCache();
+      }
+    }
+
+    _clearResolveCache() {
+      this._resolveCacheByStage[1].clear();
+      this._resolveCacheByStage[2].clear();
+      this._resolveCacheByStage[3].clear();
+      this._resolveCacheEntries.clear();
+      this._resolveCacheInvalidations += 1;
+    }
+
+    _evictResolveCacheEntry(entry) {
+      const stageCache = this._resolveCacheByStage[entry.stageCode];
+      if (entry.key1 !== undefined && stageCache.get(entry.key1) === entry) {
+        stageCache.delete(entry.key1);
+      }
+      if (entry.key2 !== undefined && stageCache.get(entry.key2) === entry) {
+        stageCache.delete(entry.key2);
+      }
+      if (entry.key3 !== undefined && stageCache.get(entry.key3) === entry) {
+        stageCache.delete(entry.key3);
+      }
+      this._resolveCacheEntries.delete(entry);
+    }
+
+    _storeResolveCache(
+      stageCode,
+      stageName,
+      rawHash,
+      hashBigInt,
+      hashHex,
+      result,
+      source,
+      profile,
+      missingRow,
+      categorizedRow
+    ) {
+      if (this._maxResolveCacheEntries <= 0) {
+        return;
+      }
+
+      const stageCache = this._resolveCacheByStage[stageCode];
+      const existing = stageCache.get(hashBigInt) || stageCache.get(hashHex) || stageCache.get(rawHash);
+      if (existing !== undefined) {
+        this._evictResolveCacheEntry(existing);
+      }
+
+      if (this._resolveCacheEntries.size >= this._maxResolveCacheEntries) {
+        const oldest = this._resolveCacheEntries.keys().next().value;
+        if (oldest !== undefined) {
+          this._evictResolveCacheEntry(oldest);
+        }
+      }
+
+      const key1 = hashBigInt;
+      const key2 = hashHex;
+      const key3 = rawHash !== key1 && rawHash !== key2 ? rawHash : undefined;
+
+      const entry = {
+        stageCode,
+        stageName,
+        hashBigInt,
+        hashHex,
+        source,
+        profile,
+        result,
+        missingRow,
+        categorizedRow,
+        telemetryGeneration: this._telemetryGeneration,
+        key1,
+        key2,
+        key3,
+      };
+
+      stageCache.set(key1, entry);
+      stageCache.set(key2, entry);
+      if (key3 !== undefined) {
+        stageCache.set(key3, entry);
+      }
+      this._resolveCacheEntries.set(entry, entry);
+    }
+
+    /**
+     * Invalidate all memoized `resolve()` entries (e.g. after a shader pack reload).
+     * Missing-shader telemetry and registered real shaders are preserved.
+     */
+    invalidateCache() {
+      this._capturePackStamp();
+      this._clearResolveCache();
+    }
+
+    /**
+     * Alias for `invalidateCache()` to notify the router that the active shader pack reloaded.
+     */
+    onPackReload() {
+      this.invalidateCache();
+    }
+
+    /**
+     * Set the current frame index recorded on missing-shader `firstSeenFrame` / `lastSeenFrame`.
+     *
+     * @param {number} frameIndex
+     * @returns {number}
+     */
+    setFrame(frameIndex) {
+      this._currentFrame = normalizeFrameNumber(frameIndex);
+      return this._currentFrame;
+    }
+
+    /**
+     * Advance the current frame index by `delta` (default 1) and return the new frame index.
+     *
+     * @param {number} [delta=1]
+     * @returns {number}
+     */
+    advanceFrame(delta = 1) {
+      const step = normalizeFrameNumber(delta);
+      this._currentFrame += step;
+      return this._currentFrame;
+    }
+
+    /**
+     * Return the current frame index tracked by the router.
+     *
+     * @returns {number}
+     */
+    getCurrentFrame() {
+      return this._currentFrame;
+    }
+
+    /**
+     * Return sanitized fast-path resolve cache telemetry.
+     *
+     * @returns {{
+     *   hits: number,
+     *   misses: number,
+     *   entries: number,
+     *   maxEntries: number,
+     *   invalidations: number,
+     *   hitRatio: number,
+     * }}
+     */
+    getResolveCacheStats() {
+      const total = this._resolveCacheHits + this._resolveCacheMisses;
+      return {
+        hits: this._resolveCacheHits,
+        misses: this._resolveCacheMisses,
+        entries: this._resolveCacheEntries.size,
+        maxEntries: this._maxResolveCacheEntries,
+        invalidations: this._resolveCacheInvalidations,
+        hitRatio: total > 0 ? this._resolveCacheHits / total : 0,
+      };
     }
 
     _registerInitialRealShaders(realShaders) {
@@ -869,6 +1311,7 @@
         registeredAtMs: this._now(),
       };
       this._realShaders.set(`${hashHex}|${stageKey}`, record);
+      this._clearResolveCache();
 
       return {
         hashHex,
@@ -897,17 +1340,27 @@
             removed = true;
           }
         }
+        if (removed) {
+          this._clearResolveCache();
+        }
         return removed;
       }
       const stageKey = stage === '*' ? '*' : normalizeStage(stage);
-      return this._realShaders.delete(`${hashHex}|${stageKey}`);
+      const removed = this._realShaders.delete(`${hashHex}|${stageKey}`);
+      if (removed) {
+        this._clearResolveCache();
+      }
+      return removed;
     }
 
     /**
      * Clear all explicitly registered real shaders.
      */
     clearRealShaders() {
-      this._realShaders.clear();
+      if (this._realShaders.size > 0) {
+        this._realShaders.clear();
+        this._clearResolveCache();
+      }
     }
 
     /**
@@ -1045,20 +1498,24 @@
     }
 
     /**
-     * Replace the pack loader used for exact / stage-fallback lookups.
+     * Replace the pack loader used for exact / stage-fallback lookups and invalidate
+     * the resolved-hash memoization cache.
      * @param {object | Map | null | undefined} packLoader
      */
     setPackLoader(packLoader) {
       this._packLoader = packLoader !== undefined ? packLoader : null;
+      this.invalidateCache();
     }
 
     /**
-     * Replace per-stage S9 fallback hashes (`vertex` / `fragment` / `compute`).
+     * Replace per-stage S9 fallback hashes (`vertex` / `fragment` / `compute`) and
+     * invalidate the resolved-hash memoization cache.
      * @param {Record<string, bigint | string | number> | null | undefined} fallbackHashes
      */
     setFallbackHashes(fallbackHashes) {
       this._fallbackHashes =
         fallbackHashes && typeof fallbackHashes === 'object' ? { ...fallbackHashes } : {};
+      this.invalidateCache();
     }
 
     /**
@@ -1068,10 +1525,14 @@
      * 3) stage-matched S9 fallback hash in pack,
      * 4) built-in WGSL.
      *
+     * Hot repeat calls hit the per-stage resolved-hash memoization cache with zero
+     * temporary object allocations and O(1) missing-hash counter updates.
+     *
      * @param {bigint | string | number} hash
      * @param {number | string} stage
      * @param {{
      *   profile?: string | null,
+     *   frame?: number | null,
      *   forceFallback?: boolean,
      *   isRealShader?: boolean,
      *   existingSource?: string | null,
@@ -1101,36 +1562,124 @@
      * }}
      */
     resolve(hash, stage, options) {
-      const stageName = normalizeStage(stage);
+      const stageCode = normalizeStageCode(stage);
+      const stageName = STAGE_NAMES[stageCode];
+
+      if (this._packLoader !== null) {
+        this._syncPackCacheVersion();
+      }
+
+      const opts = options !== undefined && options !== null && typeof options === 'object' ? options : null;
+      const hasSpecialOpts =
+        opts !== null &&
+        (opts.forceFallback === true ||
+          opts.isRealShader === true ||
+          opts.existingSource !== undefined ||
+          opts.existingShader !== undefined ||
+          opts.reason !== undefined ||
+          opts.missingReason !== undefined);
+
+      // W204 Fast Path: zero temporary object allocations on cache hits.
+      if (!hasSpecialOpts && this._maxResolveCacheEntries > 0) {
+        const cached = this._resolveCacheByStage[stageCode].get(hash);
+        if (cached !== undefined) {
+          if (cached.source === 'pack') {
+            this._stats.totalLookups += 1;
+            this._stats.packHits += 1;
+            this._resolveCacheHits += 1;
+            return cached.result;
+          }
+          if (cached.source === 'fallback') {
+            const frame =
+              opts !== null && opts.frame !== undefined && opts.frame !== null
+                ? normalizeFrameNumber(opts.frame)
+                : this._currentFrame;
+            this._stats.totalLookups += 1;
+            this._stats.fallbackHits += 1;
+            this._resolveCacheHits += 1;
+            this._recordCachedMissHit(cached, this._now(), frame);
+            return cached.result;
+          }
+          if (cached.source === 'builtin') {
+            const profileName =
+              opts !== null && opts.profile !== undefined && opts.profile !== null
+                ? normalizeFallbackProfile(opts.profile)
+                : this._defaultProfile;
+            if (cached.profile === profileName) {
+              const frame =
+                opts !== null && opts.frame !== undefined && opts.frame !== null
+                  ? normalizeFrameNumber(opts.frame)
+                  : this._currentFrame;
+              this._stats.totalLookups += 1;
+              this._stats.builtinHits += 1;
+              this._resolveCacheHits += 1;
+              this._recordCachedMissHit(cached, this._now(), frame);
+              return cached.result;
+            }
+          }
+        }
+      }
+
       const requested = normalizeShaderHash(hash);
       const requestedHex = formatShaderHash(requested);
-      const nowMs = this._now();
-      const opts = options && typeof options === 'object' ? options : null;
+      const frame =
+        opts !== null && opts.frame !== undefined && opts.frame !== null
+          ? normalizeFrameNumber(opts.frame)
+          : this._currentFrame;
       const profileName =
-        opts && opts.profile !== undefined && opts.profile !== null
+        opts !== null && opts.profile !== undefined && opts.profile !== null
           ? normalizeFallbackProfile(opts.profile)
           : this._defaultProfile;
 
+      if (!hasSpecialOpts) {
+        this._resolveCacheMisses += 1;
+      }
+
       this._stats.totalLookups += 1;
 
-      const exact = lookupPackSource(this._packLoader, requested);
+      const exact = lookupPackSource(this._packLoader, requested, requestedHex);
       if (exact) {
         this._stats.packHits += 1;
-        const result = {
+        if (opts !== null && opts.forceFallback === true && !this._isConfiguredFallbackHash(requested)) {
+          const nowMs = this._now();
+          this._recordBlockedOverride(requestedHex, stageName, 'pack_shader_protected', nowMs);
+          return {
+            wgsl: exact.wgsl,
+            source: 'pack',
+            requestedHash: requestedHex,
+            resolvedHash: requestedHex,
+            stage: stageName,
+            entryPoint: exact.entryPoint || extractEntryPoint(exact.wgsl, stageName),
+            fallbackBlocked: true,
+            guardReason: 'pack_shader_protected',
+          };
+        }
+        const result = Object.freeze({
           wgsl: exact.wgsl,
           source: 'pack',
           requestedHash: requestedHex,
           resolvedHash: requestedHex,
           stage: stageName,
           entryPoint: exact.entryPoint || extractEntryPoint(exact.wgsl, stageName),
-        };
-        if (opts && opts.forceFallback === true && !this._isConfiguredFallbackHash(requested)) {
-          this._recordBlockedOverride(requestedHex, stageName, 'pack_shader_protected', nowMs);
-          result.fallbackBlocked = true;
-          result.guardReason = 'pack_shader_protected';
+        });
+        if (!hasSpecialOpts) {
+          this._storeResolveCache(
+            stageCode,
+            stageName,
+            hash,
+            requested,
+            requestedHex,
+            result,
+            'pack',
+            null,
+            null,
+            null
+          );
         }
         return result;
       }
+
+      const nowMs = this._now();
 
       // W179: Real-shader override guard — never silently replace a registered real shader
       // (e.g. menu or Bink2 YUV shader) with an S9 or built-in opaque fallback.
@@ -1164,7 +1713,7 @@
       }
 
       // W179: Caller-indicated existing real shader guard.
-      if (opts) {
+      if (opts !== null) {
         const existingShader =
           opts.existingShader && typeof opts.existingShader === 'object'
             ? opts.existingShader
@@ -1210,35 +1759,52 @@
         }
       }
 
-      // Exact miss — record Frame-1 & categorized missing-shader telemetry.
-      this._trackMissing(requestedHex, stageName, nowMs);
+      // Exact miss — record Frame-1 & categorized missing-shader telemetry in O(1).
+      const missingRow = this._trackMissing(requested, requestedHex, stageCode, stageName, nowMs, frame);
       const missReason =
-        opts && (opts.reason !== undefined || opts.missingReason !== undefined)
+        opts !== null && (opts.reason !== undefined || opts.missingReason !== undefined)
           ? normalizeMissingReason(opts.reason !== undefined ? opts.reason : opts.missingReason)
           : MISSING_SHADER_REASONS.NOT_IN_PACK;
-      this._recordCategorizedMissing(requestedHex, stageName, missReason, nowMs);
+      const categorizedRow = this._recordCategorizedMissingRow(requestedHex, stageName, missReason, nowMs);
+
+      const canCacheMiss = !hasSpecialOpts && !isPendingRangedPackShader(this._packLoader, requested);
 
       const fallbackHash = resolveFallbackHashForStage(this._fallbackHashes, stageName);
       if (fallbackHash !== null) {
-        const fallbackHit = lookupPackSource(this._packLoader, fallbackHash);
+        const resolvedHex = formatShaderHash(fallbackHash);
+        const fallbackHit = lookupPackSource(this._packLoader, fallbackHash, resolvedHex);
         if (fallbackHit) {
           this._stats.fallbackHits += 1;
-          const resolvedHex = formatShaderHash(fallbackHash);
-          return {
+          const result = Object.freeze({
             wgsl: fallbackHit.wgsl,
             source: 'fallback',
             requestedHash: requestedHex,
             resolvedHash: resolvedHex,
             stage: stageName,
             entryPoint: fallbackHit.entryPoint || extractEntryPoint(fallbackHit.wgsl, stageName),
-          };
+          });
+          if (canCacheMiss) {
+            this._storeResolveCache(
+              stageCode,
+              stageName,
+              hash,
+              requested,
+              requestedHex,
+              result,
+              'fallback',
+              null,
+              missingRow,
+              categorizedRow
+            );
+          }
+          return result;
         }
       }
 
       const profileTemplates = BUILTIN_FALLBACK_PROFILES[profileName] || BUILTIN_FALLBACK_WGSL;
       const builtin = profileTemplates[stageName] || BUILTIN_FALLBACK_WGSL[stageName];
       this._stats.builtinHits += 1;
-      return {
+      const result = Object.freeze({
         wgsl: builtin,
         source: 'builtin',
         requestedHash: requestedHex,
@@ -1246,33 +1812,108 @@
         stage: stageName,
         entryPoint: extractEntryPoint(builtin, stageName),
         profile: profileName,
-      };
+      });
+      if (canCacheMiss) {
+        this._storeResolveCache(
+          stageCode,
+          stageName,
+          hash,
+          requested,
+          requestedHex,
+          result,
+          'builtin',
+          profileName,
+          missingRow,
+          categorizedRow
+        );
+      }
+      return result;
     }
 
-    _trackMissing(hashHex, stageName, nowMs) {
-      const key = `${hashHex}|${stageName}`;
-      const existing = this._missing.get(key);
-      if (existing) {
+    _recordCachedMissHit(cached, nowMs, frame) {
+      if (cached.telemetryGeneration === this._telemetryGeneration) {
+        const row = cached.missingRow;
+        if (row !== null) {
+          row.hitCount += 1;
+          row.lastSeenMs = nowMs;
+          if (frame < row.firstSeenFrame) {
+            row.firstSeenFrame = frame;
+          }
+          if (frame > row.lastSeenFrame) {
+            row.lastSeenFrame = frame;
+          }
+        } else {
+          this._overflowMissingCount += 1;
+        }
+
+        this._categorizedTotals.total += 1;
+        this._categorizedTotals.byReason.not_in_pack += 1;
+        this._categorizedTotals.byStage[cached.stageName] += 1;
+        const catRow = cached.categorizedRow;
+        if (catRow !== null) {
+          catRow.hitCount += 1;
+          catRow.reasons.not_in_pack += 1;
+          catRow.lastReason = MISSING_SHADER_REASONS.NOT_IN_PACK;
+          catRow.lastSeenMs = nowMs;
+        } else {
+          this._categorizedOverflowCount += 1;
+        }
+        return;
+      }
+
+      // Telemetry was reset while the resolved shader stayed memoized — re-bind O(1) rows cleanly.
+      cached.missingRow = this._trackMissing(
+        cached.hashBigInt,
+        cached.hashHex,
+        cached.stageCode,
+        cached.stageName,
+        nowMs,
+        frame
+      );
+      cached.categorizedRow = this._recordCategorizedMissingRow(
+        cached.hashHex,
+        cached.stageName,
+        MISSING_SHADER_REASONS.NOT_IN_PACK,
+        nowMs
+      );
+      cached.telemetryGeneration = this._telemetryGeneration;
+    }
+
+    _trackMissing(hashBigInt, hashHex, stageCode, stageName, nowMs, frame) {
+      const stageMap = this._missingByStage[stageCode];
+      const existing = stageMap.get(hashBigInt);
+      if (existing !== undefined) {
         existing.hitCount += 1;
         existing.lastSeenMs = nowMs;
-        return;
+        if (frame < existing.firstSeenFrame) {
+          existing.firstSeenFrame = frame;
+        }
+        if (frame > existing.lastSeenFrame) {
+          existing.lastSeenFrame = frame;
+        }
+        return existing;
       }
 
-      if (this._missing.size >= this._maxTrackedMissing) {
+      if (this._missingCount >= this._maxTrackedMissing) {
         this._overflowMissingCount += 1;
-        return;
+        return null;
       }
 
-      this._missing.set(key, {
+      const row = {
         hash: hashHex,
         stage: stageName,
         hitCount: 1,
         firstSeenMs: nowMs,
         lastSeenMs: nowMs,
-      });
+        firstSeenFrame: frame,
+        lastSeenFrame: frame,
+      };
+      stageMap.set(hashBigInt, row);
+      this._missingCount += 1;
+      return row;
     }
 
-    _recordCategorizedMissing(hashHex, stageName, reason, nowMs) {
+    _recordCategorizedMissingRow(hashHex, stageName, reason, nowMs) {
       this._categorizedTotals.total += 1;
       this._categorizedTotals.byReason[reason] += 1;
       this._categorizedTotals.byStage[stageName] += 1;
@@ -1284,18 +1925,32 @@
         existing.reasons[reason] += 1;
         existing.lastReason = reason;
         existing.lastSeenMs = nowMs;
-        return {
-          hashHex,
-          stage: stageName,
-          reason,
-          hitCount: existing.hitCount,
-          tracked: true,
-          overflowed: false,
-        };
+        return existing;
       }
 
       if (this._categorizedMissing.size >= this._maxCategorizedMissing) {
         this._categorizedOverflowCount += 1;
+        return null;
+      }
+
+      const reasons = createEmptyReasonCounts();
+      reasons[reason] = 1;
+      const row = {
+        hashHex,
+        stage: stageName,
+        hitCount: 1,
+        reasons,
+        lastReason: reason,
+        firstSeenMs: nowMs,
+        lastSeenMs: nowMs,
+      };
+      this._categorizedMissing.set(key, row);
+      return row;
+    }
+
+    _recordCategorizedMissing(hashHex, stageName, reason, nowMs) {
+      const row = this._recordCategorizedMissingRow(hashHex, stageName, reason, nowMs);
+      if (row === null) {
         return {
           hashHex,
           stage: stageName,
@@ -1305,24 +1960,11 @@
           overflowed: true,
         };
       }
-
-      const reasons = createEmptyReasonCounts();
-      reasons[reason] = 1;
-      this._categorizedMissing.set(key, {
-        hashHex,
-        stage: stageName,
-        hitCount: 1,
-        reasons,
-        lastReason: reason,
-        firstSeenMs: nowMs,
-        lastSeenMs: nowMs,
-      });
-
       return {
         hashHex,
         stage: stageName,
         reason,
-        hitCount: 1,
+        hitCount: row.hitCount,
         tracked: true,
         overflowed: false,
       };
@@ -1503,38 +2145,45 @@
       const opts = options && typeof options === 'object' ? options : {};
       let limit = opts.limit;
       if (limit === undefined || limit === null) {
-        limit = this._missing.size;
+        limit = this._missingCount;
       }
       if (!Number.isInteger(limit) || limit < 0) {
         throw new RangeError(`limit must be a non-negative integer, got ${limit}`);
       }
+      if (limit === 0 || this._missingCount === 0) {
+        return [];
+      }
 
-      const rows = Array.from(this._missing.values()).map((row) => ({
-        hash: row.hash,
-        stage: row.stage,
-        hitCount: row.hitCount,
-        firstSeenMs: row.firstSeenMs,
-        lastSeenMs: row.lastSeenMs,
-      }));
-
-      rows.sort(
-        (a, b) =>
-          b.hitCount - a.hitCount ||
-          a.hash.localeCompare(b.hash) ||
-          a.stage.localeCompare(b.stage)
-      );
-
-      return rows.slice(0, limit);
+      const selected = selectTopMissingRows(this._missingByStage, this._missingCount, limit);
+      const out = new Array(selected.length);
+      for (let i = 0; i < selected.length; i += 1) {
+        const row = selected[i];
+        out[i] = {
+          hash: row.hash,
+          stage: row.stage,
+          hitCount: row.hitCount,
+          firstSeenMs: row.firstSeenMs,
+          lastSeenMs: row.lastSeenMs,
+        };
+      }
+      return out;
     }
 
     /**
      * Return top-N missing shaders ranked by miss count descending, breaking ties
-     * deterministically by `hashHex` ascending (then `stage` ascending).
-     * Records are sanitized (`{ hashHex, stage, count }`) with zero host paths or
-     * raw shader text.
+     * deterministically by `hash` / `hashHex` ascending (then `stage` ascending).
+     * Records are strictly sanitized (`{ hash, hashHex, stage, count, firstSeenFrame, lastSeenFrame }`)
+     * with zero host paths, raw shader text, or binary dumps.
      *
      * @param {number} [limit=16]
-     * @returns {Array<{ hashHex: string, stage: 'vertex' | 'fragment' | 'compute', count: number }>}
+     * @returns {Array<{
+     *   hash: string,
+     *   hashHex: string,
+     *   stage: 'vertex' | 'fragment' | 'compute',
+     *   count: number,
+     *   firstSeenFrame: number,
+     *   lastSeenFrame: number,
+     * }>}
      */
     getTopMissingShaders(limit = DEFAULT_TOP_MISSING_LIMIT) {
       const resolvedLimit =
@@ -1542,31 +2191,35 @@
       if (!Number.isInteger(resolvedLimit) || resolvedLimit < 0) {
         throw new RangeError(`limit must be a non-negative integer, got ${resolvedLimit}`);
       }
-      if (resolvedLimit === 0 || this._missing.size === 0) {
+      if (resolvedLimit === 0 || this._missingCount === 0) {
         return [];
       }
 
-      const rows = Array.from(this._missing.values(), (row) => ({
-        hashHex: row.hash,
-        stage: row.stage,
-        count: row.hitCount,
-      }));
-
-      rows.sort(
-        (a, b) =>
-          b.count - a.count ||
-          (a.hashHex < b.hashHex ? -1 : a.hashHex > b.hashHex ? 1 : 0) ||
-          (a.stage < b.stage ? -1 : a.stage > b.stage ? 1 : 0)
+      const selected = selectTopMissingRows(
+        this._missingByStage,
+        this._missingCount,
+        resolvedLimit
       );
-
-      return rows.slice(0, resolvedLimit);
+      const out = new Array(selected.length);
+      for (let i = 0; i < selected.length; i += 1) {
+        const row = selected[i];
+        out[i] = {
+          hash: row.hash,
+          hashHex: row.hash,
+          stage: row.stage,
+          count: row.hitCount,
+          firstSeenFrame: row.firstSeenFrame,
+          lastSeenFrame: row.lastSeenFrame,
+        };
+      }
+      return out;
     }
 
     /**
      * Aggregate lookup / missing-shader telemetry.
      */
     getStats() {
-      const uniqueMissing = this._missing.size;
+      const uniqueMissing = this._missingCount;
       const total = this._stats.totalLookups;
       const hitRatio = total > 0 ? this._stats.packHits / total : 0;
       const hitRatePct =
@@ -1585,22 +2238,38 @@
     }
 
     /**
-     * Clear missing-shader telemetry, categorized summary, guard counters, and lookup counters.
-     * Preserves configured `packLoader`, `fallbackHashes`, and registered real shaders.
+     * Clear tracked missing-shader maps, categorized missing telemetry, and overflow counters.
+     * Preserves configured `packLoader`, `fallbackHashes`, registered real shaders,
+     * lookup hit counters, and memoized shader resolutions.
      */
-    reset() {
-      this._missing.clear();
+    resetMissingTelemetry() {
+      this._missingByStage[1].clear();
+      this._missingByStage[2].clear();
+      this._missingByStage[3].clear();
+      this._missingCount = 0;
       this._overflowMissingCount = 0;
-      this._stats.totalLookups = 0;
-      this._stats.packHits = 0;
-      this._stats.fallbackHits = 0;
-      this._stats.builtinHits = 0;
+      this._telemetryGeneration += 1;
 
       this._categorizedMissing.clear();
       this._categorizedOverflowCount = 0;
       this._categorizedTotals.total = 0;
       this._categorizedTotals.byReason = createEmptyReasonCounts();
       this._categorizedTotals.byStage = createEmptyStageCounts();
+    }
+
+    /**
+     * Clear missing-shader telemetry, categorized summary, guard counters, and lookup counters.
+     * Preserves configured `packLoader`, `fallbackHashes`, and registered real shaders.
+     */
+    reset() {
+      this.resetMissingTelemetry();
+      this._stats.totalLookups = 0;
+      this._stats.packHits = 0;
+      this._stats.fallbackHits = 0;
+      this._stats.builtinHits = 0;
+
+      this._resolveCacheHits = 0;
+      this._resolveCacheMisses = 0;
 
       this._blockedOverrides.clear();
       this._blockedOverrideCount = 0;
@@ -1620,6 +2289,7 @@
     DEFAULT_MAX_TRACKED_MISSING,
     DEFAULT_MAX_TRACKED_MISSING_HASHES,
     DEFAULT_MAX_CATEGORIZED_MISSING_HASHES,
+    DEFAULT_MAX_RESOLVE_CACHE_ENTRIES,
     DEFAULT_TOP_MISSING_LIMIT,
     DEFAULT_MISSING_SUMMARY_TOP_LIMIT,
     normalizeShaderHash,
