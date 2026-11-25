@@ -65,6 +65,17 @@ void set_write_tracking(bool on) {
 }
 
 bool take_written_pages(const void* host, uint64_t len, uint64_t* commit_seq, std::vector<uint64_t>* offsets) {
+    if (commit_seq == nullptr) {
+        return false;
+    }
+    WriteCursor cursor{*commit_seq, 0};
+    const bool ok = take_written_pages(host, len, &cursor, offsets);
+    *commit_seq = cursor.commit_seq;
+    return ok;
+}
+
+bool take_written_pages(const void* host, uint64_t len, WriteCursor* cursor, std::vector<uint64_t>* offsets) {
+    uint64_t* commit_seq = cursor != nullptr ? &cursor->commit_seq : nullptr;
     if (host == nullptr || len == 0 || commit_seq == nullptr || offsets == nullptr) {
         return false;
     }
@@ -87,7 +98,11 @@ bool take_written_pages(const void* host, uint64_t len, uint64_t* commit_seq, st
         }
         *commit_seq = g_commit_seq;
     }
-    return backing::take_written_pages(static_cast<const uint8_t*>(host), len, offsets);
+    return backing::take_written_pages(static_cast<const uint8_t*>(host), len, &cursor->view_clock, offsets);
+}
+
+uint64_t shared_view_write_faults() {
+    return backing::tracked_view_faults();
 }
 
 ArenaObserver set_arena_observer(ArenaObserver observer) {

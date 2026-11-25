@@ -399,7 +399,19 @@ inline constexpr uint64_t kWrittenPageSize = 4096;
 // Write tracking is opt-in: reservations made after set_write_tracking(true) carry it (Windows).
 // Tracking a large reservation costs the memory manager a bitmap and time on reserve/release, so
 // processes that create many arenas (tests) leave it off unless they need it.
+// R40: shared page views (the shared zone, Windows) are always tracked, without MEM_WRITE_WATCH: a
+// call covering a view makes every view of its page read-only until the next write through any of
+// them, which faults once, stamps them all written and makes them writable again. A caller's
+// cursor remembers the stamps it has seen, so callers whose ranges overlap all see a write (the
+// `commit_seq` form has no such position: it reports every view in the range written).
 void set_write_tracking(bool on);
+struct WriteCursor {
+    uint64_t commit_seq = 0;
+    uint64_t view_clock = 0;
+};
+bool take_written_pages(const void* host, uint64_t len, WriteCursor* cursor, std::vector<uint64_t>* offsets);
 bool take_written_pages(const void* host, uint64_t len, uint64_t* commit_seq, std::vector<uint64_t>* offsets);
+// R40: writes to shared page views caught so far (one per page and take interval).
+uint64_t shared_view_write_faults();
 
 }  // namespace playgta6::os
