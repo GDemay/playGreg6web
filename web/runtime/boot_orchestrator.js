@@ -9,6 +9,8 @@
 
 (function (root) {
   const DEFAULT_STATUS_URL = '/api/status';
+  const DEFAULT_STAGE_TIMEOUT_MS = 0;
+  const MAX_DIAGNOSTIC_TEXT_LENGTH = 512;
 
   /** Ordered high-level boot pipeline phases. */
   const BOOT_PHASE = Object.freeze({
@@ -23,12 +25,80 @@
     DESTROYED: 'DESTROYED',
   });
 
+  /** Active boot pipeline phases tracked for duration and stall watchdog detection. */
+  const WATCHED_BOOT_PHASES = Object.freeze(
+    new Set([
+      BOOT_PHASE.DISCOVERING,
+      BOOT_PHASE.PRELOADING,
+      BOOT_PHASE.LAUNCHING_RUNTIME,
+      BOOT_PHASE.FALLBACK_SMOKE_DEMO,
+    ])
+  );
+
   /** Explicit boot mode distinguishing real Wasm64 guest boot vs smoke-demo fallback. */
   const BOOT_MODE = Object.freeze({
     PENDING: 'pending',
     WASM_GUEST: 'wasm-guest',
     SMOKE_DEMO: 'smoke-demo',
   });
+
+  function defaultNow() {
+    if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
+      return performance.now();
+    }
+    return Date.now();
+  }
+
+  function clampNonNegativeFinite(value) {
+    return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
+  }
+
+  function normalizeStageTimeoutMs(value) {
+    if (value === undefined || value === null) return DEFAULT_STAGE_TIMEOUT_MS;
+    if (typeof value !== 'number') {
+      throw new TypeError('stageTimeoutMs must be a finite non-negative number or null');
+    }
+    if (!Number.isFinite(value) || value < 0) {
+      throw new RangeError('stageTimeoutMs must be a finite non-negative number');
+    }
+    return value === 0 ? 0 : value;
+  }
+
+  function sumStageDurations(stageDurationsMs, currentStageElapsedMs) {
+    let total = clampNonNegativeFinite(currentStageElapsedMs);
+    for (const key of Object.keys(stageDurationsMs)) {
+      total += clampNonNegativeFinite(stageDurationsMs[key]);
+    }
+    return clampNonNegativeFinite(total);
+  }
+
+  const FILE_URL_RE = /\bfile:\/\/[^\s"'`<>)\]}]+/gi;
+  const URL_USERINFO_RE = /\b((?:https?|wss?|ftp):\/\/)([^\s/@"'`<>]+):([^\s/@"'`<>]*)@/gi;
+  const URL_QUERY_RE = /((?:https?|wss?):\/\/[^\s"'`<>?#]+)\?(?!\[REDACTED\])[^\s"'`<>#)\]}]+/gi;
+  const AUTH_SCHEME_RE = /\b(Bearer|Basic)\s+(?!\[REDACTED\])[A-Za-z0-9\-._~+/=:]+/gi;
+  const SECRET_KV_RE =
+    /\b(authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|id[_-]?token|client[_-]?secret|x-api-key|x-auth-token|cookie|set-cookie|password|passwd|secret|token)(\s*[:=]\s*)(?!(?:(?:Bearer|Basic)\s+)?\[REDACTED\])(?:"[^"]*"|'[^']*'|[^\s,;}\])]+)/gi;
+  const WIN_DRIVE_PATH_RE = /(?<![A-Za-z0-9_])[A-Za-z]:(?:\\|\/(?!\/))[^\s"'`<>|*?)\]},;]+/g;
+  const WIN_UNC_PATH_RE = /(^|[\s"'`(\[={<,:;])\\\\[^\s\\"'`<>|*?)\]},;]+\\[^\s"'`<>|*?)\]},;]+/g;
+  const POSIX_ABS_PATH_RE =
+    /(^|[\s(\[={<,:;`"'])\/(?:home|Users|root|tmp|var|etc|opt|usr|mnt|media|Volumes|private|srv)\/[^\s"'`<>)\]},;]+/g;
+
+  function sanitizeDiagnosticText(value, maxLen = MAX_DIAGNOSTIC_TEXT_LENGTH) {
+    if (value == null) return null;
+    let text = String(value);
+    text = text.replace(FILE_URL_RE, '[REDACTED_PATH]');
+    text = text.replace(URL_USERINFO_RE, '$1[REDACTED]@');
+    text = text.replace(URL_QUERY_RE, '$1?[REDACTED]');
+    text = text.replace(AUTH_SCHEME_RE, '$1 [REDACTED]');
+    text = text.replace(SECRET_KV_RE, '$1$2[REDACTED]');
+    text = text.replace(WIN_DRIVE_PATH_RE, '[REDACTED_PATH]');
+    text = text.replace(WIN_UNC_PATH_RE, '$1[REDACTED_PATH]');
+    text = text.replace(POSIX_ABS_PATH_RE, '$1[REDACTED_PATH]');
+    if (text.length > maxLen) {
+      return `${text.slice(0, maxLen - 3)}...`;
+    }
+    return text;
+  }
 
   function defaultFetchImpl() {
     if (typeof globalThis !== 'undefined' && typeof globalThis.fetch === 'function') {
@@ -280,6 +350,9 @@
      * @param {Function|null} [options.onFallbackSmokeDemo]
      * @param {Function|null} [options.onPhaseChange]
      * @param {Function|null} [options.onFirstPresent]
+     * @param {Function|null} [options.onStageStall]
+     * @param {(() => number)|null} [options.nowFn]
+     * @param {number|null} [options.stageTimeoutMs=0]
      */
     constructor(options = {}) {
       if (options !== undefined && (options === null || typeof options !== 'object')) {
@@ -296,6 +369,9 @@
         onFallbackSmokeDemo = null,
         onPhaseChange = null,
         onFirstPresent = null,
+        onStageStall = null,
+        nowFn = null,
+        stageTimeoutMs = DEFAULT_STAGE_TIMEOUT_MS,
       } = options;
 
       if (fetchImpl !== null && fetchImpl !== undefined && typeof fetchImpl !== 'function') {
@@ -304,6 +380,8 @@
       if (typeof statusUrl !== 'string' || statusUrl.length === 0) {
         throw new TypeError('statusUrl must be a non-empty string');
       }
+      const resolvedNowFn = optionalFn(nowFn, 'nowFn') || defaultNow;
+      const resolvedStageTimeoutMs = normalizeStageTimeoutMs(stageTimeoutMs);
 
       this._fetchImpl = fetchImpl || null;
       this._statusUrl = statusUrl;
@@ -314,6 +392,10 @@
       this._onFallbackSmokeDemo = optionalFn(onFallbackSmokeDemo, 'onFallbackSmokeDemo');
       this._onPhaseChange = optionalFn(onPhaseChange, 'onPhaseChange');
       this._onFirstPresent = optionalFn(onFirstPresent, 'onFirstPresent');
+      this._onStageStall = optionalFn(onStageStall, 'onStageStall');
+      this._nowFn = resolvedNowFn;
+      this._stageTimeoutMs = resolvedStageTimeoutMs;
+      this._lastClockMs = 0;
 
       this._phase = BOOT_PHASE.IDLE;
       this._bootMode = BOOT_MODE.PENDING;
@@ -332,6 +414,107 @@
       this._sessionToken = 0;
       this._abortUnlink = null;
       this._controller = new AbortController();
+
+      this._stageDurationsMs = Object.create(null);
+      this._stageEnteredAt = this._readNow();
+      this._stalled = false;
+      this._stalledStage = null;
+      this._stalledMs = 0;
+      this._stallCount = 0;
+    }
+
+    _readNow() {
+      try {
+        const value = this._nowFn();
+        if (typeof value === 'number' && Number.isFinite(value)) {
+          this._lastClockMs = value;
+          return value;
+        }
+      } catch {
+        // Fall back to last known finite clock reading.
+      }
+      return this._lastClockMs;
+    }
+
+    _cloneStageDurations() {
+      const out = {};
+      for (const phase of Object.keys(this._stageDurationsMs)) {
+        out[phase] = clampNonNegativeFinite(this._stageDurationsMs[phase]);
+      }
+      return out;
+    }
+
+    _resetTimingTelemetry(now = this._readNow()) {
+      this._stageDurationsMs = Object.create(null);
+      this._stageEnteredAt = now;
+      this._stalled = false;
+      this._stalledStage = null;
+      this._stalledMs = 0;
+      this._stallCount = 0;
+    }
+
+    _evaluateWatchdog(now = this._readNow()) {
+      const active = WATCHED_BOOT_PHASES.has(this._phase);
+      const currentStageElapsedMs = active ? clampNonNegativeFinite(now - this._stageEnteredAt) : 0;
+      const enabled = this._stageTimeoutMs > 0;
+      const isStalled = active && enabled && currentStageElapsedMs >= this._stageTimeoutMs;
+      return {
+        currentStageElapsedMs,
+        isStalled,
+        stalledStage: isStalled ? this._phase : null,
+        stalledMs: isStalled ? currentStageElapsedMs : 0,
+      };
+    }
+
+    /**
+     * Evaluate whether the current active boot stage has exceeded `stageTimeoutMs`.
+     * Non-destructive: never aborts or mutates phase transitions.
+     *
+     * @returns {{
+     *   isStalled: boolean,
+     *   stalledStage: string | null,
+     *   stalledMs: number,
+     *   stageTimeoutMs: number,
+     *   phase: string,
+     *   currentStageElapsedMs: number,
+     * }}
+     */
+    checkStageStall() {
+      const now = this._readNow();
+      const watchdog = this._evaluateWatchdog(now);
+
+      if (watchdog.isStalled) {
+        const newlyStalled = !this._stalled || this._stalledStage !== watchdog.stalledStage;
+        this._stalled = true;
+        this._stalledStage = watchdog.stalledStage;
+        this._stalledMs = watchdog.stalledMs;
+        if (newlyStalled) {
+          this._stallCount += 1;
+          invokeQuiet(this._onStageStall, {
+            phase: this._phase,
+            bootMode: this._bootMode,
+            stalledStage: watchdog.stalledStage,
+            stalledMs: watchdog.stalledMs,
+            stageTimeoutMs: this._stageTimeoutMs,
+            currentStageElapsedMs: watchdog.currentStageElapsedMs,
+            stageDurationsMs: this._cloneStageDurations(),
+            stallCount: this._stallCount,
+          });
+        }
+      } else {
+        this._stalled = false;
+        this._stalledStage = null;
+        this._stalledMs = 0;
+      }
+
+      return {
+        isStalled: watchdog.isStalled,
+        stalledStage: watchdog.stalledStage,
+        stalledMs: watchdog.stalledMs,
+        stageTimeoutMs: this._stageTimeoutMs,
+        phase: this._phase,
+        currentStageElapsedMs: watchdog.currentStageElapsedMs,
+      };
     }
 
     /**
@@ -343,6 +526,10 @@
     }
 
     getState() {
+      const now = this._readNow();
+      const watchdog = this._evaluateWatchdog(now);
+      const stageDurationsMs = this._cloneStageDurations();
+      const totalStageDurationMs = sumStageDurations(stageDurationsMs, watchdog.currentStageElapsedMs);
       return {
         phase: this._phase,
         bootMode: this._bootMode,
@@ -359,13 +546,62 @@
         firstPresentSource: this._firstPresentSource,
         destroyed: this._destroyed,
         aborted: this._aborted,
+        stageDurationsMs,
+        currentStageElapsedMs: watchdog.currentStageElapsedMs,
+        totalStageDurationMs,
+        stageTimeoutMs: this._stageTimeoutMs,
+        isStalled: watchdog.isStalled,
+        stalledStage: watchdog.stalledStage,
+        stalledMs: watchdog.stalledMs,
+        stallCount: this._stallCount,
+      };
+    }
+
+    /**
+     * Export a JSON-safe, sanitized diagnostic snapshot with host paths, query strings,
+     * and auth tokens redacted and binary bundle payloads omitted.
+     */
+    getDiagnosticSnapshot() {
+      const now = this._readNow();
+      const watchdog = this._evaluateWatchdog(now);
+      const stageDurationsMs = this._cloneStageDurations();
+      const totalStageDurationMs = sumStageDurations(stageDurationsMs, watchdog.currentStageElapsedMs);
+      return {
+        phase: this._phase,
+        bootMode: this._bootMode,
+        firstPresent: this._firstPresent,
+        firstPresentSource: this._firstPresentSource,
+        destroyed: this._destroyed,
+        aborted: this._aborted,
+        fallbackReason: this._fallbackReason ? sanitizeDiagnosticText(this._fallbackReason) : null,
+        error: this._error ? sanitizeDiagnosticText(this._error.message) : null,
+        stageDurationsMs,
+        currentStageElapsedMs: watchdog.currentStageElapsedMs,
+        totalStageDurationMs,
+        stageTimeoutMs: this._stageTimeoutMs,
+        isStalled: watchdog.isStalled,
+        stalledStage: watchdog.stalledStage,
+        stalledMs: watchdog.stalledMs,
+        stallCount: this._stallCount,
+        tracer: tracerSnapshot(this._bootTracer),
       };
     }
 
     _setPhase(nextPhase, detail = null) {
       if (this._phase === nextPhase) return;
+      const now = this._readNow();
       const previousPhase = this._phase;
+      if (WATCHED_BOOT_PHASES.has(previousPhase)) {
+        const elapsedMs = clampNonNegativeFinite(now - this._stageEnteredAt);
+        const prevAccum = clampNonNegativeFinite(this._stageDurationsMs[previousPhase]);
+        this._stageDurationsMs[previousPhase] = clampNonNegativeFinite(prevAccum + elapsedMs);
+      }
       this._phase = nextPhase;
+      this._stageEnteredAt = now;
+      this._stalled = false;
+      this._stalledStage = null;
+      this._stalledMs = 0;
+
       const event = {
         phase: nextPhase,
         previousPhase,
@@ -380,6 +616,7 @@
         tracer: tracerSnapshot(this._bootTracer),
         fallbackReason: this._fallbackReason,
         error: this._error,
+        stageDurationsMs: this._cloneStageDurations(),
         ...(detail && typeof detail === 'object' ? detail : {}),
       };
       invokeQuiet(this._onPhaseChange, event);
@@ -601,6 +838,7 @@
       this._progress = null;
       this._aborted = false;
       this._pgimLoadMarked = false;
+      this._resetTimingTelemetry();
 
       try {
         throwIfAborted(signal);
@@ -696,7 +934,16 @@
         if (this._destroyed) {
           return { ok: false, destroyed: true, phase: BOOT_PHASE.DESTROYED, bootMode: this._bootMode };
         }
-        if (signal.aborted || isAbortError(err) || token !== this._sessionToken) {
+        if (token !== this._sessionToken) {
+          return {
+            ok: false,
+            aborted: true,
+            phase: this._phase,
+            bootMode: this._bootMode,
+            error: toError(err, 'Boot pipeline aborted'),
+          };
+        }
+        if (signal.aborted || isAbortError(err)) {
           this._aborted = true;
           this._setPhase(BOOT_PHASE.CANCELLED);
           return {
@@ -820,6 +1067,57 @@
     }
 
     /**
+     * Reset boot state, stage timing breakdown, and stalled-stage watchdog back to IDLE
+     * so the orchestrator can be started cleanly again. No-op once destroyed.
+     */
+    reset() {
+      if (this._destroyed) {
+        return {
+          ok: false,
+          destroyed: true,
+          phase: BOOT_PHASE.DESTROYED,
+          bootMode: this._bootMode,
+        };
+      }
+      this._sessionToken += 1;
+      this._startPromise = null;
+      try {
+        if (this._controller && typeof this._controller.abort === 'function' && !this._controller.signal.aborted) {
+          this._controller.abort(abortReason(this._controller.signal));
+        }
+      } catch {
+        // Ignore abort errors during reset.
+      }
+      if (typeof this._abortUnlink === 'function') {
+        try {
+          this._abortUnlink();
+        } catch {
+          // Ignore.
+        }
+        this._abortUnlink = null;
+      }
+      this._controller = new AbortController();
+      this._phase = BOOT_PHASE.IDLE;
+      this._bootMode = BOOT_MODE.PENDING;
+      this._status = null;
+      this._assets = null;
+      this._bundle = null;
+      this._progress = null;
+      this._fallbackReason = null;
+      this._error = null;
+      this._firstPresent = false;
+      this._firstPresentSource = null;
+      this._aborted = false;
+      this._pgimLoadMarked = false;
+      this._resetTimingTelemetry();
+      return {
+        ok: true,
+        phase: this._phase,
+        bootMode: this._bootMode,
+      };
+    }
+
+    /**
      * Abort in-flight work, destroy the overlay, and freeze the orchestrator.
      * Safe to call more than once.
      */
@@ -855,6 +1153,7 @@
     BOOT_PHASE,
     BOOT_MODE,
     DEFAULT_STATUS_URL,
+    DEFAULT_STAGE_TIMEOUT_MS,
     BootOrchestrator,
     discoverBootAssets,
     isRealGuestBoot,
