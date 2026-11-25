@@ -15,6 +15,11 @@
   const MAX_DRAIN_INTERVAL_MS = 250;
   const MAX_DRAIN_ELAPSED_MS = 100;
 
+  // W293/W299: Target jitter/latency buffer tuning bounds (clamped to [10, 120] ms, default 30 ms).
+  const DEFAULT_TARGET_LATENCY_MS = 30;
+  const MIN_TARGET_LATENCY_MS = 10;
+  const MAX_TARGET_LATENCY_MS = 120;
+
   // Single-packet PCM safety bound (4 MiB = 524,288 stereo float32 frames ~= 10.9s @ 48 kHz).
   const DEFAULT_MAX_PCM_BYTES = 4 * 1024 * 1024;
   const MAX_ID_STRING_LEN = 128;
@@ -22,6 +27,8 @@
   // Underrun de-click micro-fade ramp defaults (32 frames ~= 0.67 ms @ 48 kHz).
   const DEFAULT_DECLICK_FRAMES = 32;
   const MAX_DECLICK_FRAMES = 4096;
+  const DEFAULT_FADE_CURVE = 'linear';
+  const EMPTY_FLOAT32 = new Float32Array(0);
 
   // Multi-channel ITU-R BS.775 downmix, soft-clip limiter, and resampling safeguards.
   const DEFAULT_SOFT_CLIP_KNEE = 0.95;
@@ -104,6 +111,30 @@
     if (n < 0) return fallback;
     if (n > MAX_DECLICK_FRAMES) return MAX_DECLICK_FRAMES;
     return n;
+  }
+
+  function sanitizeFadeCurve(value, fallback = DEFAULT_FADE_CURVE) {
+    if (value === 'cosine' || value === 'linear') {
+      return value;
+    }
+    return fallback;
+  }
+
+  function clampTargetLatencyMs(value, fallback = DEFAULT_TARGET_LATENCY_MS) {
+    const safeFallback =
+      typeof fallback === 'number' && Number.isFinite(fallback)
+        ? fallback <= MIN_TARGET_LATENCY_MS
+          ? MIN_TARGET_LATENCY_MS
+          : fallback >= MAX_TARGET_LATENCY_MS
+            ? MAX_TARGET_LATENCY_MS
+            : fallback
+        : DEFAULT_TARGET_LATENCY_MS;
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      return safeFallback;
+    }
+    if (value <= MIN_TARGET_LATENCY_MS) return MIN_TARGET_LATENCY_MS;
+    if (value >= MAX_TARGET_LATENCY_MS) return MAX_TARGET_LATENCY_MS;
+    return value;
   }
 
   function sanitizeSampleRate(value) {
@@ -544,6 +575,67 @@
 
     acquireFloat32(slotName, sampleCount) {
       return this._getOrCreateSlot(slotName, sampleCount, false).view;
+    }
+
+    /**
+     * Returns the pre-allocated backing `Float32Array` for `slotName` with length
+     * `>= minSampleCount`. Unlike `acquireFloat32`, varying `minSampleCount` below
+     * capacity never allocates a `.subarray()` wrapper, guaranteeing zero allocations
+     * across variable-size stereo ring drains.
+     *
+     * @param {string} slotName
+     * @param {number} minSampleCount
+     * @returns {Float32Array}
+     */
+    acquireFloat32Backing(slotName, minSampleCount) {
+      const count = sanitizeNonNegInt(minSampleCount, 0);
+      if (count > this._maxSamples) {
+        throw new RangeError(
+          `PCM scratch request (${count} samples) exceeds maxSamples (${this._maxSamples})`
+        );
+      }
+
+      let slot = this._slots[slotName];
+      if (!slot) {
+        const cap = count > 0 ? count : 1;
+        const backing = new Float32Array(cap);
+        slot = {
+          backing,
+          capacity: cap,
+          view: count === cap ? backing : backing.subarray(0, count),
+          viewLen: count,
+          byteBacking: null,
+          byteView: null,
+          byteViewLen: -1,
+          pair: { floats: null, bytes: null },
+        };
+        slot.pair.floats = slot.view;
+        slot.pair.bytes = null;
+        this._slots[slotName] = slot;
+        this._slotCount += 1;
+        this._allocations += 1;
+        return slot.backing;
+      }
+
+      if (count > slot.capacity) {
+        const backing = new Float32Array(count);
+        slot.backing = backing;
+        slot.capacity = count;
+        slot.view = backing;
+        slot.viewLen = count;
+        if (slot.byteBacking !== null) {
+          slot.byteBacking = new Uint8Array(backing.buffer);
+          slot.byteView = slot.byteBacking;
+          slot.byteViewLen = count * Float32Array.BYTES_PER_ELEMENT;
+        }
+        slot.pair.floats = slot.view;
+        slot.pair.bytes = slot.byteView;
+        this._allocations += 1;
+        return slot.backing;
+      }
+
+      this._reuses += 1;
+      return slot.backing;
     }
 
     acquireFloat32WithBytes(slotName, sampleCount) {
@@ -1003,6 +1095,198 @@
     return x < 0 ? -bounded : bounded;
   }
 
+  /**
+   * W272-aligned zero-allocation in-place half-cosine gain ramp across `frameCount`
+   * interleaved frames from `startGain` to `endGain`. Non-finite samples are sanitized to 0.0.
+   *
+   * @param {Float32Array|number[]} samples
+   * @param {number} [channels=1]
+   * @param {number} [frameCount]
+   * @param {number} [startGain=1.0]
+   * @param {number} [endGain=0.0]
+   * @returns {Float32Array|number[]}
+   */
+  function applyFadeRamp(samples, channels = 1, frameCount, startGain = 1.0, endGain = 0.0) {
+    if (!samples || typeof samples.length !== 'number') {
+      throw new TypeError('applyFadeRamp requires a Float32Array or array-like sample buffer');
+    }
+    if (!Number.isInteger(channels) || channels <= 0) {
+      throw new RangeError(`channels must be a positive integer, got ${channels}`);
+    }
+    const maxFrames = Math.floor(samples.length / channels);
+    let n;
+    if (frameCount === undefined || frameCount === null) {
+      n = maxFrames;
+    } else {
+      if (typeof frameCount !== 'number' || !Number.isFinite(frameCount) || frameCount < 0) {
+        throw new RangeError(`frameCount must be a non-negative finite number, got ${frameCount}`);
+      }
+      n = Math.floor(frameCount);
+      if (n > maxFrames) n = maxFrames;
+    }
+    if (n <= 0) {
+      return samples;
+    }
+
+    const g0 = typeof startGain === 'number' && Number.isFinite(startGain) ? startGain : 0.0;
+    const g1 = typeof endGain === 'number' && Number.isFinite(endGain) ? endGain : 0.0;
+
+    if (n === 1) {
+      for (let c = 0; c < channels; c++) {
+        const s = samples[c];
+        samples[c] = g1 === 0.0 || s - s !== 0 ? 0.0 : s * g1;
+      }
+      return samples;
+    }
+
+    const gDiff = g1 - g0;
+    const lastIdx = n - 1;
+    const invDenom = Math.PI / lastIdx;
+
+    if (channels === 2) {
+      for (let f = 0; f < n; f++) {
+        const gain =
+          f === 0
+            ? g0
+            : f === lastIdx
+              ? g1
+              : g0 + gDiff * (0.5 * (1.0 - Math.cos(f * invDenom)));
+        const base = f * 2;
+        if (gain === 0.0) {
+          samples[base] = 0.0;
+          samples[base + 1] = 0.0;
+        } else {
+          const s0 = samples[base];
+          const s1 = samples[base + 1];
+          samples[base] = s0 - s0 !== 0 ? 0.0 : s0 * gain;
+          samples[base + 1] = s1 - s1 !== 0 ? 0.0 : s1 * gain;
+        }
+      }
+    } else if (channels === 1) {
+      for (let f = 0; f < n; f++) {
+        const gain =
+          f === 0
+            ? g0
+            : f === lastIdx
+              ? g1
+              : g0 + gDiff * (0.5 * (1.0 - Math.cos(f * invDenom)));
+        const s = samples[f];
+        samples[f] = gain === 0.0 || s - s !== 0 ? 0.0 : s * gain;
+      }
+    } else {
+      for (let f = 0; f < n; f++) {
+        const gain =
+          f === 0
+            ? g0
+            : f === lastIdx
+              ? g1
+              : g0 + gDiff * (0.5 * (1.0 - Math.cos(f * invDenom)));
+        const base = f * channels;
+        if (gain === 0.0) {
+          for (let c = 0; c < channels; c++) {
+            samples[base + c] = 0.0;
+          }
+        } else {
+          for (let c = 0; c < channels; c++) {
+            const s = samples[base + c];
+            samples[base + c] = s - s !== 0 ? 0.0 : s * gain;
+          }
+        }
+      }
+    }
+
+    return samples;
+  }
+
+  /**
+   * W272-aligned zero-allocation in-place non-finite sanitizer & smooth `tanh` soft-limiter.
+   * Pass a reusable `outStats` object to avoid heap allocations on hot paths.
+   *
+   * @param {Float32Array|number[]} samples
+   * @param {number} [count]
+   * @param {number|object} [kneeOrOptions=DEFAULT_SOFT_CLIP_KNEE]
+   * @param {{ softClippedSamples: number, nonFiniteSanitized: number }} [outStats]
+   * @returns {{ softClippedSamples: number, nonFiniteSanitized: number }}
+   */
+  function sanitizeAndSoftLimitBuffer(
+    samples,
+    count,
+    kneeOrOptions = DEFAULT_SOFT_CLIP_KNEE,
+    outStats = null
+  ) {
+    if (!samples || typeof samples.length !== 'number') {
+      throw new TypeError('sanitizeAndSoftLimitBuffer requires a Float32Array or array-like buffer');
+    }
+
+    let knee = DEFAULT_SOFT_CLIP_KNEE;
+    let statsTarget = outStats;
+    if (typeof kneeOrOptions === 'object' && kneeOrOptions !== null) {
+      if (kneeOrOptions.knee !== undefined) {
+        knee = kneeOrOptions.knee;
+      } else if (kneeOrOptions.softLimitKnee !== undefined) {
+        knee = kneeOrOptions.softLimitKnee;
+      } else if (kneeOrOptions.limiterKnee !== undefined) {
+        knee = kneeOrOptions.limiterKnee;
+      }
+      if (!statsTarget && kneeOrOptions.stats && typeof kneeOrOptions.stats === 'object') {
+        statsTarget = kneeOrOptions.stats;
+      } else if (
+        !statsTarget &&
+        kneeOrOptions.knee === undefined &&
+        kneeOrOptions.softLimitKnee === undefined &&
+        kneeOrOptions.limiterKnee === undefined
+      ) {
+        statsTarget = kneeOrOptions;
+      }
+    } else if (kneeOrOptions !== undefined) {
+      knee = kneeOrOptions;
+    }
+
+    if (typeof knee !== 'number' || !Number.isFinite(knee) || knee < 0 || knee >= 1.0) {
+      throw new RangeError(`knee must be in [0, 1), got ${knee}`);
+    }
+
+    let n;
+    if (count === undefined || count === null) {
+      n = samples.length;
+    } else {
+      if (typeof count !== 'number' || !Number.isFinite(count) || count < 0) {
+        throw new RangeError(`count must be a non-negative finite number, got ${count}`);
+      }
+      n = Math.floor(count);
+      if (n > samples.length) n = samples.length;
+    }
+
+    const negKnee = -knee;
+    const headroom = 1.0 - knee;
+    let softClippedSamples = 0;
+    let nonFiniteSanitized = 0;
+
+    for (let i = 0; i < n; i++) {
+      const s = samples[i];
+      if (s - s !== 0) {
+        samples[i] = 0.0;
+        nonFiniteSanitized += 1;
+      } else if (s > knee) {
+        const compressed = knee + headroom * Math.tanh((s - knee) / headroom);
+        samples[i] = compressed > 1.0 ? 1.0 : compressed;
+        softClippedSamples += 1;
+      } else if (s < negKnee) {
+        const compressed = knee + headroom * Math.tanh((-s - knee) / headroom);
+        samples[i] = compressed > 1.0 ? -1.0 : -compressed;
+        softClippedSamples += 1;
+      }
+    }
+
+    if (statsTarget) {
+      statsTarget.softClippedSamples = (statsTarget.softClippedSamples || 0) + softClippedSamples;
+      statsTarget.nonFiniteSanitized = (statsTarget.nonFiniteSanitized || 0) + nonFiniteSanitized;
+      return statsTarget;
+    }
+
+    return { softClippedSamples, nonFiniteSanitized };
+  }
+
   function validateDownmixGain(value, fallback, name) {
     if (value === undefined) {
       return fallback;
@@ -1283,9 +1567,13 @@
       nanSanitized += extracted.sanitizedSamples;
     }
 
-    const srcFrames = Math.floor(src.length / channels);
+    const maxSrcFrames = Math.floor(src.length / channels);
+    const srcFrames =
+      opts.srcFrames !== undefined
+        ? Math.min(sanitizeNonNegInt(opts.srcFrames, 0), maxSrcFrames)
+        : maxSrcFrames;
     if (srcFrames <= 0) {
-      return new Float32Array(0);
+      return EMPTY_FLOAT32;
     }
 
     const state = opts.state && typeof opts.state === 'object' ? opts.state : null;
@@ -1343,7 +1631,7 @@
         const rem = startPhase - srcFrames;
         state.phase = rem > EPS ? rem : 0.0;
       }
-      return new Float32Array(0);
+      return EMPTY_FLOAT32;
     }
 
     const outFrames = Math.floor((srcFrames - startPhase - EPS) / step) + 1;
@@ -1480,6 +1768,14 @@
     const underrunFrames = sanitizeNonNegInt(s.underrunFrames, 0);
     const fadeOutCount = sanitizeNonNegInt(s.fadeOutCount, 0);
     const fadeInCount = sanitizeNonNegInt(s.fadeInCount, 0);
+    const underrunFadeCount = sanitizeNonNegInt(
+      s.underrunFadeCount !== undefined ? s.underrunFadeCount : fadeOutCount,
+      fadeOutCount
+    );
+    const recoveryFadeCount = sanitizeNonNegInt(
+      s.recoveryFadeCount !== undefined ? s.recoveryFadeCount : fadeInCount,
+      fadeInCount
+    );
     const rawPeakFill = sanitizeNonNegInt(s.peakFillFrames, 0);
     const peakFillFrames =
       capacityFrames > 0 ? Math.min(rawPeakFill, capacityFrames) : rawPeakFill;
@@ -1516,9 +1812,18 @@
       s.nanSanitizedSamples !== undefined ? s.nanSanitizedSamples : sanitizedSamples,
       sanitizedSamples
     );
+    const sanitizedNonFiniteSamples = sanitizeNonNegInt(
+      s.sanitizedNonFiniteSamples !== undefined
+        ? s.sanitizedNonFiniteSamples
+        : sanitizedSamples,
+      sanitizedSamples
+    );
     const downmixedFrames = sanitizeNonNegInt(s.downmixedFrames, 0);
     const resampledFrames = sanitizeNonNegInt(s.resampledFrames, 0);
     const clippedSamples = sanitizeNonNegInt(s.clippedSamples, 0);
+    const softClippedSamples = sanitizeNonNegInt(s.softClippedSamples, 0);
+    const targetLatencyMs = clampTargetLatencyMs(s.targetLatencyMs, DEFAULT_TARGET_LATENCY_MS);
+    const zeroAllocDrains = sanitizeNonNegInt(s.zeroAllocDrains, 0);
     const activeVoicePeak = sanitizeNonNegInt(
       s.activeVoicePeak !== undefined ? s.activeVoicePeak : s.activeVoices,
       0
@@ -1579,6 +1884,8 @@
         underrunRecoveries,
         fadeOutCount,
         fadeInCount,
+        underrunFadeCount,
+        recoveryFadeCount,
         peakFillFrames,
         minFillFrames,
         avgFillRatio,
@@ -1586,6 +1893,7 @@
         overflows,
         overflowPolicy,
         maxFillRatio,
+        targetLatencyMs,
         droppedFrames,
         totalPushedFrames,
         totalPulledFrames,
@@ -1594,12 +1902,15 @@
         sabCopiedPackets,
         sanitizedSamples,
         nanSanitizedSamples,
+        sanitizedNonFiniteSamples,
         downmixedFrames,
         resampledFrames,
         clippedSamples,
+        softClippedSamples,
         activeVoicePeak,
         scratchAllocations,
         scratchReuses,
+        zeroAllocDrains,
         guestRingAttached,
         guestFramesDrained,
         guestUnderruns,
@@ -1788,6 +2099,13 @@
       this._data = new Float32Array(sab, dataByteOffset, capacitySamples);
       this._readCtrl = new Int32Array(sab, readIndexByteOffset, 1);
       this._writeCtrl = new Int32Array(sab, writeIndexByteOffset, 1);
+      this._lastStereoFrame = new Float32Array(GUEST_PCM_RING_CHANNELS);
+      this._hasActiveAudio = false;
+      this._inUnderrun = false;
+      this._fadeInPos = 0;
+      this._fadeInTotal = 0;
+      this._underrunFadeCount = 0;
+      this._recoveryFadeCount = 0;
       this._reusableResult = {
         framesRead: 0,
         underrun: false,
@@ -1795,9 +2113,31 @@
         overrun: false,
         overrunDroppedFrames: 0,
         clippedSamples: 0,
+        softClippedSamples: 0,
         sanitizedSamples: 0,
+        underrunFade: false,
+        recoveryFade: false,
         peakLevel: 0.0,
       };
+    }
+
+    get underrunFadeCount() {
+      return this._underrunFadeCount;
+    }
+
+    get recoveryFadeCount() {
+      return this._recoveryFadeCount;
+    }
+
+    resetFadeState() {
+      this._lastStereoFrame[0] = 0.0;
+      this._lastStereoFrame[1] = 0.0;
+      this._hasActiveAudio = false;
+      this._inUnderrun = false;
+      this._fadeInPos = 0;
+      this._fadeInTotal = 0;
+      this._underrunFadeCount = 0;
+      this._recoveryFadeCount = 0;
     }
 
     get sab() {
@@ -1885,7 +2225,10 @@
       res.overrun = false;
       res.overrunDroppedFrames = 0;
       res.clippedSamples = 0;
+      res.softClippedSamples = 0;
       res.sanitizedSamples = 0;
+      res.underrunFade = false;
+      res.recoveryFade = false;
       res.peakLevel = 0.0;
 
       if (reqFrames <= 0) {
@@ -1899,7 +2242,15 @@
         typeof rawKnee === 'number' && Number.isFinite(rawKnee) && rawKnee >= 0 && rawKnee < 1.0
           ? rawKnee
           : DEFAULT_SOFT_CLIP_KNEE;
+      const negKnee = -knee;
+      const headroom = 1.0 - knee;
       const fillSilence = opts && opts.fillSilence !== undefined ? Boolean(opts.fillSilence) : true;
+      const declickFrames =
+        opts && opts.declickFrames !== undefined
+          ? sanitizeDeclickFrames(opts.declickFrames, 0)
+          : 0;
+      const useCosine =
+        !opts || opts.fadeCurve === undefined || opts.fadeCurve === 'cosine';
 
       let read = Atomics.load(this._readCtrl, 0) >>> 0;
       const write = Atomics.load(this._writeCtrl, 0) >>> 0;
@@ -1927,6 +2278,7 @@
       const samplesToRead = framesToRead * GUEST_PCM_RING_CHANNELS;
 
       let clippedSamples = 0;
+      let softClippedSamples = 0;
       let sanitizedSamples = 0;
       let peakLevel = 0.0;
 
@@ -1939,14 +2291,20 @@
 
         for (let i = 0; i < firstSamples; i++) {
           let v = ringData[startSlot + i];
-          if (!Number.isFinite(v)) {
+          if (v - v !== 0) {
             v = 0.0;
             sanitizedSamples += 1;
-          }
-          if (softClip) {
-            if (v > knee || v < -knee) {
+          } else if (softClip) {
+            if (v > knee) {
               clippedSamples += 1;
-              v = softClipSample(v, knee);
+              softClippedSamples += 1;
+              const compressed = knee + headroom * Math.tanh((v - knee) / headroom);
+              v = compressed > 1.0 ? 1.0 : compressed;
+            } else if (v < negKnee) {
+              clippedSamples += 1;
+              softClippedSamples += 1;
+              const compressed = knee + headroom * Math.tanh((-v - knee) / headroom);
+              v = compressed > 1.0 ? -1.0 : -compressed;
             }
           } else if (v > 1.0) {
             v = 1.0;
@@ -1964,14 +2322,20 @@
 
         for (let i = 0; i < secondSamples; i++) {
           let v = ringData[i];
-          if (!Number.isFinite(v)) {
+          if (v - v !== 0) {
             v = 0.0;
             sanitizedSamples += 1;
-          }
-          if (softClip) {
-            if (v > knee || v < -knee) {
+          } else if (softClip) {
+            if (v > knee) {
               clippedSamples += 1;
-              v = softClipSample(v, knee);
+              softClippedSamples += 1;
+              const compressed = knee + headroom * Math.tanh((v - knee) / headroom);
+              v = compressed > 1.0 ? 1.0 : compressed;
+            } else if (v < negKnee) {
+              clippedSamples += 1;
+              softClippedSamples += 1;
+              const compressed = knee + headroom * Math.tanh((-v - knee) / headroom);
+              v = compressed > 1.0 ? -1.0 : -compressed;
             }
           } else if (v > 1.0) {
             v = 1.0;
@@ -1994,19 +2358,113 @@
         Atomics.store(this._readCtrl, 0, read | 0);
       }
 
+      // W272/W299 click-free half-cosine (or linear) recovery fade-in when audio resumes after underrun.
+      if (framesToRead > 0 && declickFrames > 0 && fillSilence) {
+        if (this._inUnderrun) {
+          this._inUnderrun = false;
+          this._fadeInPos = 0;
+          this._fadeInTotal = declickFrames;
+          this._recoveryFadeCount += 1;
+          res.recoveryFade = true;
+        }
+        if (this._fadeInTotal > 0 && this._fadeInPos < this._fadeInTotal) {
+          const remaining = this._fadeInTotal - this._fadeInPos;
+          const rampCount = framesToRead < remaining ? framesToRead : remaining;
+          const total = this._fadeInTotal;
+          for (let f = 0; f < rampCount; f++) {
+            const t = (this._fadeInPos + f) / total;
+            const rampGain = useCosine ? 0.5 * (1.0 - Math.cos(Math.PI * t)) : t;
+            const base = f * GUEST_PCM_RING_CHANNELS;
+            output[base] *= rampGain;
+            output[base + 1] *= rampGain;
+          }
+          this._fadeInPos += rampCount;
+          if (this._fadeInPos >= this._fadeInTotal) {
+            this._fadeInPos = 0;
+            this._fadeInTotal = 0;
+          }
+        }
+      }
+
       if (framesToRead < reqFrames) {
         const missingFrames = reqFrames - framesToRead;
-        if (fillSilence) {
+        if (declickFrames > 0 && fillSilence) {
+          this._fadeInPos = 0;
+          this._fadeInTotal = 0;
+          if (framesToRead > 0 || this._hasActiveAudio) {
+            if (
+              framesToRead > 0 &&
+              missingFrames < declickFrames &&
+              framesToRead > missingFrames
+            ) {
+              const fadeFrames = declickFrames < framesToRead ? declickFrames : framesToRead;
+              const fadeStart = framesToRead - fadeFrames;
+              for (let i = 0; i < fadeFrames; i++) {
+                const rampGain =
+                  i === fadeFrames - 1
+                    ? 0.0
+                    : useCosine
+                      ? 0.5 * (1.0 + Math.cos(Math.PI * ((i + 1) / fadeFrames)))
+                      : (fadeFrames - 1 - i) / fadeFrames;
+                const base = (fadeStart + i) * GUEST_PCM_RING_CHANNELS;
+                output[base] *= rampGain;
+                output[base + 1] *= rampGain;
+              }
+              output.fill(0, samplesToRead, reqFrames * GUEST_PCM_RING_CHANNELS);
+            } else {
+              if (framesToRead > 0) {
+                const lastBase = (framesToRead - 1) * GUEST_PCM_RING_CHANNELS;
+                this._lastStereoFrame[0] = output[lastBase];
+                this._lastStereoFrame[1] = output[lastBase + 1];
+              }
+              const fadeFrames = declickFrames < missingFrames ? declickFrames : missingFrames;
+              const lastL = this._lastStereoFrame[0];
+              const lastR = this._lastStereoFrame[1];
+              for (let i = 0; i < fadeFrames; i++) {
+                const rampGain =
+                  i === fadeFrames - 1
+                    ? 0.0
+                    : useCosine
+                      ? 0.5 * (1.0 + Math.cos(Math.PI * ((i + 1) / fadeFrames)))
+                      : (fadeFrames - 1 - i) / fadeFrames;
+                const base = (framesToRead + i) * GUEST_PCM_RING_CHANNELS;
+                output[base] = lastL * rampGain;
+                output[base + 1] = lastR * rampGain;
+              }
+              if (framesToRead + fadeFrames < reqFrames) {
+                output.fill(
+                  0,
+                  (framesToRead + fadeFrames) * GUEST_PCM_RING_CHANNELS,
+                  reqFrames * GUEST_PCM_RING_CHANNELS
+                );
+              }
+            }
+            this._underrunFadeCount += 1;
+            res.underrunFade = true;
+            this._hasActiveAudio = false;
+            this._lastStereoFrame[0] = 0.0;
+            this._lastStereoFrame[1] = 0.0;
+          } else {
+            output.fill(0, samplesToRead, reqFrames * GUEST_PCM_RING_CHANNELS);
+          }
+          this._inUnderrun = true;
+        } else if (fillSilence) {
           output.fill(0, samplesToRead, reqFrames * GUEST_PCM_RING_CHANNELS);
         }
         res.underrun = true;
         res.underrunFrames = missingFrames;
+      } else if (framesToRead > 0) {
+        const lastBase = (framesToRead - 1) * GUEST_PCM_RING_CHANNELS;
+        this._lastStereoFrame[0] = output[lastBase];
+        this._lastStereoFrame[1] = output[lastBase + 1];
+        this._hasActiveAudio = true;
       }
 
       res.framesRead = framesToRead;
       res.overrun = overrun;
       res.overrunDroppedFrames = overrunDroppedFrames;
       res.clippedSamples = clippedSamples;
+      res.softClippedSamples = softClippedSamples;
       res.sanitizedSamples = sanitizedSamples;
       res.peakLevel = peakLevel;
       return res;
@@ -2125,6 +2583,10 @@
       this._volume = clampVolume(options.volume !== undefined ? options.volume : 1.0);
       this._muted = Boolean(options.muted);
       this._declickFrames = sanitizeDeclickFrames(options.declickFrames, 0);
+      this._fadeCurve = sanitizeFadeCurve(
+        options.fadeCurve,
+        options.cosineRamp === true ? 'cosine' : DEFAULT_FADE_CURVE
+      );
       this._overflowPolicy = normalizeOverflowPolicy(
         options.overflowPolicy,
         DEFAULT_OVERFLOW_POLICY
@@ -2182,6 +2644,10 @@
 
     get declickFrames() {
       return this._declickFrames;
+    }
+
+    get fadeCurve() {
+      return this._fadeCurve;
     }
 
     get overflowPolicy() {
@@ -2293,6 +2759,11 @@
     setDeclickFrames(frames) {
       this._declickFrames = sanitizeDeclickFrames(frames, this._declickFrames);
       return this._declickFrames;
+    }
+
+    setFadeCurve(curve) {
+      this._fadeCurve = sanitizeFadeCurve(curve, this._fadeCurve);
+      return this._fadeCurve;
     }
 
     setOverflowPolicy(policy) {
@@ -2645,8 +3116,9 @@
       this._recordFillTransition(used, afterFill);
 
       const declickFrames = this._declickFrames;
+      const useCosine = this._fadeCurve === 'cosine';
 
-      // Track recovery from underrun and apply smooth linear fade-in when enabled.
+      // Track recovery from underrun and apply smooth linear or half-cosine fade-in when enabled.
       if (framesToRead > 0) {
         if (this._inUnderrun) {
           this._inUnderrun = false;
@@ -2663,7 +3135,8 @@
           const rampCount = framesToRead < remaining ? framesToRead : remaining;
           const total = this._fadeInTotal;
           for (let f = 0; f < rampCount; f++) {
-            const rampGain = (this._fadeInPos + f) / total;
+            const t = (this._fadeInPos + f) / total;
+            const rampGain = useCosine ? 0.5 * (1.0 - Math.cos(Math.PI * t)) : t;
             const base = f * channels;
             for (let c = 0; c < channels; c++) {
               output[base + c] *= rampGain;
@@ -2696,7 +3169,11 @@
                 declickFrames < framesToRead ? declickFrames : framesToRead;
               const fadeStart = framesToRead - fadeFrames;
               for (let i = 0; i < fadeFrames; i++) {
-                const rampGain = (fadeFrames - 1 - i) / fadeFrames;
+                const rampGain = useCosine
+                  ? i === fadeFrames - 1
+                    ? 0.0
+                    : 0.5 * (1.0 + Math.cos(Math.PI * ((i + 1) / fadeFrames)))
+                  : (fadeFrames - 1 - i) / fadeFrames;
                 const base = (fadeStart + i) * channels;
                 for (let c = 0; c < channels; c++) {
                   output[base + c] *= rampGain;
@@ -2714,7 +3191,11 @@
               const fadeFrames =
                 declickFrames < missingFrames ? declickFrames : missingFrames;
               for (let i = 0; i < fadeFrames; i++) {
-                const rampGain = (fadeFrames - 1 - i) / fadeFrames;
+                const rampGain = useCosine
+                  ? i === fadeFrames - 1
+                    ? 0.0
+                    : 0.5 * (1.0 + Math.cos(Math.PI * ((i + 1) / fadeFrames)))
+                  : (fadeFrames - 1 - i) / fadeFrames;
                 const base = (framesToRead + i) * channels;
                 for (let c = 0; c < channels; c++) {
                   output[base + c] = this._lastOutputFrame[c] * rampGain;
@@ -2907,6 +3388,7 @@
         muted: this._muted,
         effectiveGain: this.effectiveGain(),
         declickFrames: this._declickFrames,
+        fadeCurve: this._fadeCurve,
         overflowPolicy: this._overflowPolicy,
         maxFillRatio: this._maxFillRatio,
         underrunRecoveryFrames: this._underrunRecoveryFrames,
@@ -2966,10 +3448,31 @@
         opts.declickFrames,
         DEFAULT_DECLICK_FRAMES
       );
+      this._fadeCurve = sanitizeFadeCurve(
+        opts.fadeCurve,
+        opts.cosineRamp === true ? 'cosine' : DEFAULT_FADE_CURVE
+      );
+      this._guestFadeCurve = sanitizeFadeCurve(
+        opts.guestFadeCurve !== undefined ? opts.guestFadeCurve : opts.fadeCurve,
+        'cosine'
+      );
+      this._targetLatencyMs = clampTargetLatencyMs(
+        opts.targetLatencyMs,
+        DEFAULT_TARGET_LATENCY_MS
+      );
+      this._targetLatencyConfigured = opts.targetLatencyMs !== undefined;
       this._autoDrain = opts.autoDrain !== undefined ? Boolean(opts.autoDrain) : true;
+      const defaultDrainInterval = this._targetLatencyConfigured
+        ? sanitizePositiveInt(
+            Math.floor(this._targetLatencyMs / 2),
+            DEFAULT_DRAIN_INTERVAL_MS,
+            MIN_DRAIN_INTERVAL_MS,
+            MAX_DRAIN_INTERVAL_MS
+          )
+        : DEFAULT_DRAIN_INTERVAL_MS;
       this._drainIntervalMs = sanitizePositiveInt(
         opts.drainIntervalMs,
-        DEFAULT_DRAIN_INTERVAL_MS,
+        defaultDrainInterval,
         MIN_DRAIN_INTERVAL_MS,
         MAX_DRAIN_INTERVAL_MS
       );
@@ -3057,6 +3560,8 @@
       this._downmixedFrames = 0;
       this._resampledFrames = 0;
       this._clippedSamples = 0;
+      this._softClippedSamples = 0;
+      this._zeroAllocDrains = 0;
       this._activeVoicePeak = 0;
       this._resamplerState = { phase: 0.0 };
       this._lastResampleSrcRate = null;
@@ -3068,6 +3573,7 @@
       this._guestRingSoftClip = true;
       this._guestRingLimiterKnee = this._limiterKnee;
       this._guestRingQuantumFrames = GUEST_PCM_RING_DEFAULT_QUANTUM_FRAMES;
+      this._guestRingExplicitQuantum = false;
       this._guestRingAutoPump = false;
       this._guestResamplerState = { phase: 0.0 };
       this._guestFramesDrained = 0;
@@ -3076,10 +3582,14 @@
       this._guestOverruns = 0;
       this._guestOverrunFrames = 0;
       this._guestPeakLevel = 0.0;
+      this._guestUnderrunFadeCount = 0;
+      this._guestRecoveryFadeCount = 0;
       this._guestReadOpts = {
         softClip: true,
         limiterKnee: this._limiterKnee,
         fillSilence: true,
+        declickFrames: this._declickFrames,
+        fadeCurve: this._guestFadeCurve,
       };
       this._guestReadScratch = {
         framesRead: 0,
@@ -3088,7 +3598,10 @@
         overrun: false,
         overrunDroppedFrames: 0,
         clippedSamples: 0,
+        softClippedSamples: 0,
         sanitizedSamples: 0,
+        underrunFade: false,
+        recoveryFade: false,
         peakLevel: 0.0,
       };
 
@@ -3261,12 +3774,102 @@
       return this._declickFrames;
     }
 
+    get fadeCurve() {
+      return this._fadeCurve;
+    }
+
     setDeclickFrames(frames) {
       this._declickFrames = sanitizeDeclickFrames(frames, this._declickFrames);
       if (this.ring) {
         this.ring.setDeclickFrames(this._declickFrames);
       }
       return this._declickFrames;
+    }
+
+    setFadeCurve(curve) {
+      const next = sanitizeFadeCurve(curve, this._fadeCurve);
+      this._fadeCurve = next;
+      this._guestFadeCurve = next;
+      if (this.ring) {
+        this.ring.setFadeCurve(next);
+      }
+      return this._fadeCurve;
+    }
+
+    get targetLatencyMs() {
+      return this._targetLatencyMs;
+    }
+
+    get targetLatencyFrames() {
+      return Math.max(1, Math.round((this._targetLatencyMs / 1000) * this.sampleRate));
+    }
+
+    get drainWatermarkFrames() {
+      const targetFrames = this.targetLatencyFrames;
+      if (this.ring && this.ring.capacityFrames > 0) {
+        return targetFrames < this.ring.capacityFrames ? targetFrames : this.ring.capacityFrames;
+      }
+      return targetFrames;
+    }
+
+    get drainIntervalMs() {
+      return this._drainIntervalMs;
+    }
+
+    /**
+     * Tunes the jitter/latency target in milliseconds (clamped to [10, 120] ms,
+     * default 30 ms), updating the ring drain watermark, refill cadence, and
+     * pre-allocated guest stereo drain scratch capacity cleanly.
+     *
+     * @param {number} ms
+     * @returns {number} Active clamped target latency in ms.
+     */
+    setTargetLatencyMs(ms) {
+      if (typeof ms !== 'number' || !Number.isFinite(ms)) {
+        return this._targetLatencyMs;
+      }
+      const clamped = clampTargetLatencyMs(ms, this._targetLatencyMs);
+      this._targetLatencyMs = clamped;
+      this._targetLatencyConfigured = true;
+
+      const nextInterval = sanitizePositiveInt(
+        Math.floor(clamped / 2),
+        DEFAULT_DRAIN_INTERVAL_MS,
+        MIN_DRAIN_INTERVAL_MS,
+        MAX_DRAIN_INTERVAL_MS
+      );
+      this._drainIntervalMs = nextInterval;
+
+      const targetFrames = this.targetLatencyFrames;
+      const maxScratchFrames = Math.max(
+        1,
+        Math.floor(this._scratchPool._maxSamples / GUEST_PCM_RING_CHANNELS)
+      );
+      const quantumCap = Math.min(GUEST_PCM_RING_MAX_QUANTUM_FRAMES, maxScratchFrames);
+
+      if (!this._guestRingExplicitQuantum) {
+        this._guestRingQuantumFrames = Math.min(
+          Math.max(128, Math.floor(targetFrames / 2)),
+          quantumCap
+        );
+      }
+
+      if (this._guestRing) {
+        const prewarmFrames = Math.min(
+          Math.max(this._guestRingQuantumFrames, this.drainWatermarkFrames),
+          quantumCap
+        );
+        this._scratchPool.acquireFloat32Backing(
+          'guestDrain',
+          prewarmFrames * GUEST_PCM_RING_CHANNELS
+        );
+      }
+
+      if (this._drainTimer !== null) {
+        this._startDrainTimer();
+      }
+
+      return this._targetLatencyMs;
     }
 
     get overflowPolicy() {
@@ -3425,11 +4028,16 @@
         Math.floor(this._scratchPool._maxSamples / GUEST_PCM_RING_CHANNELS)
       );
       const quantumCap = Math.min(GUEST_PCM_RING_MAX_QUANTUM_FRAMES, maxScratchFrames);
+      const hasExplicitQuantum =
+        descriptor.quantumFrames !== undefined || descriptor.defaultQuantumFrames !== undefined;
+      const defaultQuantum = this._targetLatencyConfigured
+        ? Math.min(Math.max(128, Math.floor(this.targetLatencyFrames / 2)), quantumCap)
+        : Math.min(GUEST_PCM_RING_DEFAULT_QUANTUM_FRAMES, quantumCap);
       const quantumFrames = sanitizePositiveInt(
         descriptor.quantumFrames !== undefined
           ? descriptor.quantumFrames
           : descriptor.defaultQuantumFrames,
-        Math.min(GUEST_PCM_RING_DEFAULT_QUANTUM_FRAMES, quantumCap),
+        defaultQuantum,
         1,
         quantumCap
       );
@@ -3438,7 +4046,11 @@
       this._guestRingSoftClip = softClip;
       this._guestRingLimiterKnee = rawKnee;
       this._guestRingQuantumFrames = quantumFrames;
+      this._guestRingExplicitQuantum = hasExplicitQuantum;
       this._guestRingAutoPump = Boolean(descriptor.autoPump);
+      if (descriptor.fadeCurve !== undefined) {
+        this._guestFadeCurve = sanitizeFadeCurve(descriptor.fadeCurve, this._guestFadeCurve);
+      }
       this._guestResamplerState = { phase: 0.0 };
 
       if (descriptor.resetStats === true) {
@@ -3448,10 +4060,18 @@
         this._guestOverruns = 0;
         this._guestOverrunFrames = 0;
         this._guestPeakLevel = 0.0;
+        this._guestUnderrunFadeCount = 0;
+        this._guestRecoveryFadeCount = 0;
       }
 
-      // Pre-warm the guest drain scratch buffer once on attach for zero-alloc quanta.
-      this._scratchPool.acquireFloat32('guestDrain', quantumFrames * GUEST_PCM_RING_CHANNELS);
+      // Pre-warm the guest drain stereo scratch buffer once on attach for zero-alloc quanta.
+      const prewarmFrames = this._targetLatencyConfigured
+        ? Math.min(Math.max(quantumFrames, this.drainWatermarkFrames), quantumCap)
+        : quantumFrames;
+      this._scratchPool.acquireFloat32Backing(
+        'guestDrain',
+        prewarmFrames * GUEST_PCM_RING_CHANNELS
+      );
 
       return {
         attached: true,
@@ -3470,6 +4090,7 @@
     detachGuestPcmRing() {
       const wasAttached = this._guestRing !== null;
       this._guestRing = null;
+      this._guestRingExplicitQuantum = false;
       this._guestRingAutoPump = false;
       this._guestResamplerState = { phase: 0.0 };
       return {
@@ -3536,10 +4157,16 @@
             : outputMaxFrames;
       } else {
         const upper = Math.min(GUEST_PCM_RING_MAX_QUANTUM_FRAMES, maxScratchFrames);
-        requestedFrames =
-          maxFramesOpt !== undefined
-            ? sanitizePositiveInt(maxFramesOpt, this._guestRingQuantumFrames, 1, upper)
-            : Math.min(this._guestRingQuantumFrames, upper);
+        if (maxFramesOpt !== undefined) {
+          requestedFrames = sanitizePositiveInt(maxFramesOpt, this._guestRingQuantumFrames, 1, upper);
+        } else if (this._targetLatencyConfigured && this.ring) {
+          const watermark = this.drainWatermarkFrames;
+          const buffered = this.ring.availableFrames();
+          const deficit = watermark > buffered ? watermark - buffered : 0;
+          requestedFrames = deficit > 0 ? Math.min(deficit, upper) : 0;
+        } else {
+          requestedFrames = Math.min(this._guestRingQuantumFrames, upper);
+        }
       }
 
       if (!this._guestRing || requestedFrames <= 0) {
@@ -3559,6 +4186,9 @@
           overrun: false,
           overrunDroppedFrames: 0,
           peakLevel: 0.0,
+          zeroAlloc: true,
+          sanitizedNonFiniteSamples: 0,
+          softClippedSamples: 0,
         };
       }
 
@@ -3579,6 +4209,14 @@
         opts && opts.fillSilence !== undefined
           ? Boolean(opts.fillSilence)
           : output !== null;
+      const drainDeclickFrames =
+        opts && opts.declickFrames !== undefined
+          ? sanitizeDeclickFrames(opts.declickFrames, this._declickFrames)
+          : this._declickFrames;
+      const drainFadeCurve =
+        opts && opts.fadeCurve !== undefined
+          ? sanitizeFadeCurve(opts.fadeCurve, this._guestFadeCurve)
+          : this._guestFadeCurve;
 
       const guestRate = reader.sampleRate;
       const targetRate = this.sampleRate;
@@ -3586,6 +4224,10 @@
       const readOpts = this._guestReadOpts;
       readOpts.softClip = softClip;
       readOpts.limiterKnee = limiterKnee;
+      readOpts.declickFrames = drainDeclickFrames;
+      readOpts.fadeCurve = drainFadeCurve;
+
+      const allocsBefore = this._scratchPool.allocations;
 
       if (output !== null) {
         // Direct output buffer mode (zero per-quantum allocation).
@@ -3604,8 +4246,16 @@
           if (readRes.peakLevel > this._guestPeakLevel) {
             this._guestPeakLevel = readRes.peakLevel;
           }
+          if (readRes.underrunFade) {
+            this._guestUnderrunFadeCount += 1;
+          }
+          if (readRes.recoveryFade) {
+            this._guestRecoveryFadeCount += 1;
+          }
           this._clippedSamples += readRes.clippedSamples;
+          this._softClippedSamples += readRes.softClippedSamples;
           this._sanitizedSamples += readRes.sanitizedSamples;
+          this._zeroAllocDrains += 1;
           if (readRes.framesRead > 0) {
             this.recordActiveVoices(1);
           }
@@ -3619,21 +4269,25 @@
             overrun: readRes.overrun,
             overrunDroppedFrames: readRes.overrunDroppedFrames,
             peakLevel: readRes.peakLevel,
+            zeroAlloc: true,
+            sanitizedNonFiniteSamples: readRes.sanitizedSamples,
+            softClippedSamples: readRes.softClippedSamples,
           };
         }
 
-        // Direct output mode with sample-rate conversion.
+        // Direct output mode with sample-rate conversion (reuses pre-allocated stereo scratch).
         const step = guestRate / targetRate;
         const startPhase = this._guestResamplerState.phase || 0.0;
         const neededSrcFrames = Math.min(
           maxScratchFrames,
           Math.max(1, Math.ceil(startPhase + (requestedFrames - 1) * step + 1e-9))
         );
-        const srcScratch = this._scratchPool.acquireFloat32(
+        const srcScratch = this._scratchPool.acquireFloat32Backing(
           'guestDrain',
           neededSrcFrames * GUEST_PCM_RING_CHANNELS
         );
         readOpts.fillSilence = false;
+        readOpts.declickFrames = 0;
         const readRes = reader.readInto(srcScratch, neededSrcFrames, readOpts, this._guestReadScratch);
 
         this._guestFramesDrained += readRes.framesRead;
@@ -3642,28 +4296,25 @@
           this._guestOverrunFrames += readRes.overrunDroppedFrames;
         }
         this._clippedSamples += readRes.clippedSamples;
+        this._softClippedSamples += readRes.softClippedSamples;
         this._sanitizedSamples += readRes.sanitizedSamples;
 
         let outFramesWritten = 0;
         let peakLevel = readRes.peakLevel;
+        let totalSanitized = readRes.sanitizedSamples;
+        let totalSoftClipped = readRes.softClippedSamples;
         if (readRes.framesRead > 0) {
           const rsStats = this._rsStats;
           rsStats.resampledFrames = 0;
           rsStats.nanSanitizedSamples = 0;
           rsStats.clippedSamples = 0;
-          const exactSrc =
-            readRes.framesRead === neededSrcFrames
-              ? srcScratch
-              : this._scratchPool.acquireFloat32(
-                  'guestDrain',
-                  readRes.framesRead * GUEST_PCM_RING_CHANNELS
-                );
           const resampled = resampleLinear(
-            exactSrc,
+            srcScratch,
             GUEST_PCM_RING_CHANNELS,
             guestRate,
             targetRate,
             {
+              srcFrames: readRes.framesRead,
               state: this._guestResamplerState,
               maxOutputFrames: maxScratchFrames,
               scratch: this._scratchPool,
@@ -3675,6 +4326,11 @@
           this._resampledFrames += rsStats.resampledFrames;
           this._sanitizedSamples += rsStats.nanSanitizedSamples;
           this._clippedSamples += rsStats.clippedSamples;
+          if (softClip) {
+            this._softClippedSamples += rsStats.clippedSamples;
+            totalSoftClipped += rsStats.clippedSamples;
+          }
+          totalSanitized += rsStats.nanSanitizedSamples;
 
           const resampledFrames = Math.floor(resampled.length / GUEST_PCM_RING_CHANNELS);
           outFramesWritten =
@@ -3713,6 +4369,11 @@
           this._guestUnderrunFrames += underrunFrames;
         }
 
+        const zeroAlloc = this._scratchPool.allocations === allocsBefore;
+        if (zeroAlloc) {
+          this._zeroAllocDrains += 1;
+        }
+
         return {
           framesDrained: readRes.framesRead,
           requestedFrames,
@@ -3724,17 +4385,21 @@
           overrun: readRes.overrun,
           overrunDroppedFrames: readRes.overrunDroppedFrames,
           peakLevel,
+          zeroAlloc,
+          sanitizedNonFiniteSamples: totalSanitized,
+          softClippedSamples: totalSoftClipped,
         };
       }
 
-      // Pump mode: drain from guest PCM ring into worker output ring (`this.ring`).
+      // Pump mode: drain from guest PCM ring into worker output ring (`this.ring`)
+      // using the pre-allocated stereo scratch buffer with zero per-drain allocations.
       if (this.ring && this.ring.channels !== GUEST_PCM_RING_CHANNELS) {
         throw new RangeError(
           `Cannot pump stereo guest PCM ring into ${this.ring.channels}-channel worker ring`
         );
       }
 
-      const scratchBuf = this._scratchPool.acquireFloat32(
+      const scratchBuf = this._scratchPool.acquireFloat32Backing(
         'guestDrain',
         requestedFrames * GUEST_PCM_RING_CHANNELS
       );
@@ -3753,26 +4418,29 @@
       if (readRes.peakLevel > this._guestPeakLevel) {
         this._guestPeakLevel = readRes.peakLevel;
       }
+      if (readRes.underrunFade) {
+        this._guestUnderrunFadeCount += 1;
+      }
+      if (readRes.recoveryFade) {
+        this._guestRecoveryFadeCount += 1;
+      }
       this._clippedSamples += readRes.clippedSamples;
+      this._softClippedSamples += readRes.softClippedSamples;
       this._sanitizedSamples += readRes.sanitizedSamples;
 
+      let totalSanitized = readRes.sanitizedSamples;
+      let totalSoftClipped = readRes.softClippedSamples;
       const sourceFramesToPump = fillSilence ? requestedFrames : readRes.framesRead;
       let pcmToPush = scratchBuf;
       let framesToPush = sourceFramesToPump;
 
       if (needsResample && sourceFramesToPump > 0) {
-        const exactSrc =
-          sourceFramesToPump === requestedFrames
-            ? scratchBuf
-            : this._scratchPool.acquireFloat32(
-                'guestDrain',
-                sourceFramesToPump * GUEST_PCM_RING_CHANNELS
-              );
         const rsStats = this._rsStats;
         rsStats.resampledFrames = 0;
         rsStats.nanSanitizedSamples = 0;
         rsStats.clippedSamples = 0;
-        pcmToPush = resampleLinear(exactSrc, GUEST_PCM_RING_CHANNELS, guestRate, targetRate, {
+        pcmToPush = resampleLinear(scratchBuf, GUEST_PCM_RING_CHANNELS, guestRate, targetRate, {
+          srcFrames: sourceFramesToPump,
           state: this._guestResamplerState,
           maxOutputFrames: maxScratchFrames,
           scratch: this._scratchPool,
@@ -3784,6 +4452,11 @@
         this._resampledFrames += rsStats.resampledFrames;
         this._sanitizedSamples += rsStats.nanSanitizedSamples;
         this._clippedSamples += rsStats.clippedSamples;
+        if (softClip) {
+          this._softClippedSamples += rsStats.clippedSamples;
+          totalSoftClipped += rsStats.clippedSamples;
+        }
+        totalSanitized += rsStats.nanSanitizedSamples;
       }
 
       let pushedFrames = 0;
@@ -3830,6 +4503,11 @@
         }
       }
 
+      const zeroAlloc = this._scratchPool.allocations === allocsBefore;
+      if (zeroAlloc) {
+        this._zeroAllocDrains += 1;
+      }
+
       return {
         framesDrained: readRes.framesRead,
         requestedFrames,
@@ -3840,6 +4518,9 @@
         overrun,
         overrunDroppedFrames,
         peakLevel: readRes.peakLevel,
+        zeroAlloc,
+        sanitizedNonFiniteSamples: totalSanitized,
+        softClippedSamples: totalSoftClipped,
       };
     }
 
@@ -3858,6 +4539,8 @@
       this._downmixedFrames = 0;
       this._resampledFrames = 0;
       this._clippedSamples = 0;
+      this._softClippedSamples = 0;
+      this._zeroAllocDrains = 0;
       this._activeVoicePeak = 0;
       this._resamplerState = { phase: 0.0 };
       this._lastResampleSrcRate = null;
@@ -3869,6 +4552,11 @@
       this._guestOverruns = 0;
       this._guestOverrunFrames = 0;
       this._guestPeakLevel = 0.0;
+      this._guestUnderrunFadeCount = 0;
+      this._guestRecoveryFadeCount = 0;
+      if (this._guestRing) {
+        this._guestRing.resetFadeState();
+      }
       this._scratchPool.resetStats();
     }
 
@@ -3954,8 +4642,10 @@
         muted: this.muted,
         effectiveGain: this.effectiveGain(),
         declickFrames: this._declickFrames,
+        fadeCurve: this._fadeCurve,
         overflowPolicy: this._overflowPolicy,
         maxFillRatio: this._maxFillRatio,
+        targetLatencyMs: this._targetLatencyMs,
         underrunRecoveryFrames: this._underrunRecoveryFrames,
         framesDrained: this.framesDrained,
         packetsReceived: this._packetsReceived,
@@ -3967,6 +4657,8 @@
         underrunRecoveries: ringStats.underrunRecoveries,
         fadeOutCount: ringStats.fadeOutCount,
         fadeInCount: ringStats.fadeInCount,
+        underrunFadeCount: ringStats.fadeOutCount + this._guestUnderrunFadeCount,
+        recoveryFadeCount: ringStats.fadeInCount + this._guestRecoveryFadeCount,
         peakFillFrames: ringStats.peakFillFrames,
         minFillFrames: ringStats.minFillFrames,
         avgFillRatio: ringStats.avgFillRatio,
@@ -3980,12 +4672,15 @@
         sabCopiedPackets: this._sabCopiedPackets,
         sanitizedSamples: this._sanitizedSamples,
         nanSanitizedSamples: this._sanitizedSamples,
+        sanitizedNonFiniteSamples: this._sanitizedSamples,
         downmixedFrames: this._downmixedFrames,
         resampledFrames: this._resampledFrames,
         clippedSamples: this._clippedSamples,
+        softClippedSamples: this._softClippedSamples,
         activeVoicePeak: this._activeVoicePeak,
         scratchAllocations: this._scratchPool.allocations,
         scratchReuses: this._scratchPool.reuses,
+        zeroAllocDrains: this._zeroAllocDrains,
         guestRingAttached: this._guestRing !== null,
         guestFramesDrained: this._guestFramesDrained,
         guestUnderruns: this._guestUnderruns,
@@ -4064,6 +4759,29 @@
               this._declickFrames
             );
           }
+          if (msg.fadeCurve !== undefined || msg.cosineRamp !== undefined) {
+            const nextCurve = sanitizeFadeCurve(
+              msg.fadeCurve,
+              msg.cosineRamp === true ? 'cosine' : this._fadeCurve
+            );
+            this._fadeCurve = nextCurve;
+            this._guestFadeCurve = nextCurve;
+          }
+          if (msg.targetLatencyMs !== undefined) {
+            this._targetLatencyMs = clampTargetLatencyMs(
+              msg.targetLatencyMs,
+              this._targetLatencyMs
+            );
+            this._targetLatencyConfigured = true;
+            if (msg.drainIntervalMs === undefined) {
+              this._drainIntervalMs = sanitizePositiveInt(
+                Math.floor(this._targetLatencyMs / 2),
+                DEFAULT_DRAIN_INTERVAL_MS,
+                MIN_DRAIN_INTERVAL_MS,
+                MAX_DRAIN_INTERVAL_MS
+              );
+            }
+          }
           if (msg.overflowPolicy !== undefined) {
             this._overflowPolicy = normalizeOverflowPolicy(
               msg.overflowPolicy,
@@ -4129,6 +4847,7 @@
               volume: this.volume,
               muted: this.muted,
               declickFrames: this._declickFrames,
+              fadeCurve: this._fadeCurve,
               overflowPolicy: this._overflowPolicy,
               maxFillRatio: this._maxFillRatio,
               underrunRecoveryFrames: this._underrunRecoveryFrames,
@@ -4145,6 +4864,7 @@
             );
             nextRing = AudioRingBuffer.create(cap, nextChannels, {
               declickFrames: this._declickFrames,
+              fadeCurve: this._fadeCurve,
               overflowPolicy: this._overflowPolicy,
               maxFillRatio: this._maxFillRatio,
               underrunRecoveryFrames: this._underrunRecoveryFrames,
@@ -4377,6 +5097,9 @@
             });
             this._downmixedFrames += dmStats.downmixedFrames;
             this._clippedSamples += dmStats.clippedSamples;
+            if (dmSoftClip) {
+              this._softClippedSamples += dmStats.clippedSamples;
+            }
             this._sanitizedSamples += dmStats.nanSanitizedSamples;
           } else if (msg.softClip === true || (msg.softClip === undefined && this._softClip)) {
             const knee =
@@ -4395,6 +5118,7 @@
               limited[i] = softClipSample(v, knee);
             }
             this._clippedSamples += clipped;
+            this._softClippedSamples += clipped;
             pcm = limited;
           }
 
@@ -4576,6 +5300,10 @@
               guestUnderruns: this._guestUnderruns,
               guestOverruns: this._guestOverruns,
               guestPeakLevel: this._guestPeakLevel,
+              zeroAlloc: res.zeroAlloc,
+              zeroAllocDrains: this._zeroAllocDrains,
+              sanitizedNonFiniteSamples: this._sanitizedSamples,
+              softClippedSamples: this._softClippedSamples,
               availableFrames: this.ring ? this.ring.availableFrames() : 0,
             });
           }
@@ -4606,6 +5334,51 @@
               framesDrained: this.framesDrained,
               outputState: this.outputState,
               availableFrames: this.ring ? this.ring.availableFrames() : 0,
+            });
+          }
+          return;
+        }
+
+        if (
+          msg.type === 'set-target-latency' ||
+          msg.type === 'setTargetLatencyMs' ||
+          msg.type === 'setTargetLatency' ||
+          msg.setTargetLatency ||
+          msg.setTargetLatencyMs
+        ) {
+          const rawMs =
+            msg.targetLatencyMs !== undefined
+              ? msg.targetLatencyMs
+              : msg.latencyMs !== undefined
+                ? msg.latencyMs
+                : msg.ms;
+          const appliedMs = this.setTargetLatencyMs(rawMs);
+          if (safeId !== undefined) {
+            this._safePostMessage({
+              id: safeId,
+              type: 'target-latency',
+              targetLatencyMs: appliedMs,
+              targetLatencyFrames: this.targetLatencyFrames,
+              drainWatermarkFrames: this.drainWatermarkFrames,
+              drainIntervalMs: this._drainIntervalMs,
+            });
+          }
+          return;
+        }
+
+        if (
+          msg.type === 'setFadeCurve' ||
+          msg.type === 'set-fade-curve' ||
+          msg.setFadeCurve
+        ) {
+          const appliedCurve = this.setFadeCurve(
+            msg.fadeCurve !== undefined ? msg.fadeCurve : msg.curve
+          );
+          if (safeId !== undefined) {
+            this._safePostMessage({
+              id: safeId,
+              type: 'fade-curve',
+              fadeCurve: appliedCurve,
             });
           }
           return;
@@ -4730,9 +5503,13 @@
     MAX_CAPACITY_FRAMES,
     MAX_CHANNELS,
     DEFAULT_DRAIN_INTERVAL_MS,
+    DEFAULT_TARGET_LATENCY_MS,
+    MIN_TARGET_LATENCY_MS,
+    MAX_TARGET_LATENCY_MS,
     DEFAULT_MAX_PCM_BYTES,
     DEFAULT_DECLICK_FRAMES,
     MAX_DECLICK_FRAMES,
+    DEFAULT_FADE_CURVE,
     DEFAULT_SOFT_CLIP_KNEE,
     DEFAULT_OVERFLOW_POLICY,
     DEFAULT_MAX_FILL_RATIO,
@@ -4748,12 +5525,15 @@
     DEFAULT_MAX_RESAMPLE_FRAMES,
     SUPPORTED_DOWNMIX_CHANNELS,
     RING_HEADER_BYTES,
+    clampTargetLatencyMs,
     deinterleavePcm,
     interleavePcm,
     extractSafePcmSamples,
     clonePcmForTransfer,
     sanitizeTransferList,
     softClipSample,
+    applyFadeRamp,
+    sanitizeAndSoftLimitBuffer,
     downmixToStereo,
     resampleLinear,
     buildAudioTelemetrySnapshot,
