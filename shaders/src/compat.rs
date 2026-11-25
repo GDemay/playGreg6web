@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
 
 use crate::convert::{SPIRV_HEADER_BYTES, SPIRV_MAGIC};
@@ -19,14 +19,35 @@ pub const WEBGPU_MAX_COMPUTE_WORKGROUP_SIZE_Z: u32 = 64;
 /// WebGPU baseline default `maxComputeInvocationsPerWorkgroup`.
 pub const WEBGPU_MAX_COMPUTE_INVOCATIONS_PER_WORKGROUP: u32 = 256;
 
+/// WebGPU baseline default `maxComputeWorkgroupStorageSize` (bytes).
+pub const WEBGPU_MAX_COMPUTE_WORKGROUP_STORAGE_SIZE: u32 = 16_384;
+
 /// WebGPU baseline default `maxBindGroups` (valid bind group indices are `0..4`).
 pub const WEBGPU_MAX_BIND_GROUPS: u32 = 4;
+
+/// WebGPU baseline default `maxBindingsPerBindGroup`.
+pub const WEBGPU_MAX_BINDINGS_PER_BIND_GROUP: usize = 1000;
+
+/// WebGPU baseline default `maxDynamicUniformBuffersPerPipelineLayout`.
+pub const WEBGPU_MAX_DYNAMIC_UNIFORM_BUFFERS_PER_PIPELINE_LAYOUT: usize = 8;
+
+/// WebGPU baseline default `maxDynamicStorageBuffersPerPipelineLayout`.
+pub const WEBGPU_MAX_DYNAMIC_STORAGE_BUFFERS_PER_PIPELINE_LAYOUT: usize = 4;
 
 /// WebGPU baseline default `maxStorageBuffersPerShaderStage`.
 pub const WEBGPU_MAX_STORAGE_BUFFERS_PER_SHADER_STAGE: usize = 8;
 
 /// WebGPU baseline default `maxUniformBuffersPerShaderStage`.
 pub const WEBGPU_MAX_UNIFORM_BUFFERS_PER_SHADER_STAGE: usize = 12;
+
+/// WebGPU baseline default `maxSampledTexturesPerShaderStage`.
+pub const WEBGPU_MAX_SAMPLED_TEXTURES_PER_SHADER_STAGE: usize = 16;
+
+/// WebGPU baseline default `maxSamplersPerShaderStage`.
+pub const WEBGPU_MAX_SAMPLERS_PER_SHADER_STAGE: usize = 16;
+
+/// WebGPU baseline default `maxStorageTexturesPerShaderStage`.
+pub const WEBGPU_MAX_STORAGE_TEXTURES_PER_SHADER_STAGE: usize = 4;
 
 // ---------------------------------------------------------------------------
 // SPIR-V Binary Format Constants (Khronos SPIR-V Unified Registry)
@@ -55,8 +76,10 @@ const DECORATION_NON_UNIFORM: u32 = 5300;
 // Capabilities
 const CAP_GEOMETRY: u32 = 2;
 const CAP_TESSELLATION: u32 = 3;
+const CAP_FLOAT16: u32 = 9;
 const CAP_FLOAT64: u32 = 10;
 const CAP_INT64: u32 = 11;
+const CAP_CLIP_DISTANCE: u32 = 32;
 const CAP_SUBGROUP_DISPATCH: u32 = 58;
 const CAP_GROUP_NON_UNIFORM: u32 = 61;
 const CAP_GROUP_NON_UNIFORM_VOTE: u32 = 62;
@@ -120,6 +143,7 @@ const EXEC_MODE_LOCAL_SIZE: u32 = 17;
 const EXEC_MODE_SUBGROUP_SIZE: u32 = 35;
 const EXEC_MODE_SUBGROUPS_PER_WORKGROUP: u32 = 36;
 const EXEC_MODE_SUBGROUPS_PER_WORKGROUP_ID: u32 = 37;
+const EXEC_MODE_LOCAL_SIZE_ID: u32 = 38;
 const EXEC_MODE_SUBGROUP_UNIFORM_CONTROL_FLOW_KHR: u32 = 4421;
 const EXEC_MODE_DENORM_PRESERVE: u32 = 4459;
 const EXEC_MODE_DENORM_FLUSH_TO_ZERO: u32 = 4460;
@@ -214,10 +238,18 @@ pub enum CompatIssueKind {
     Tessellation,
     PhysicalStorageBuffer,
     WorkgroupSizeLimitExceeded,
+    WorkgroupStorageLimitExceeded,
     BindGroupLimitExceeded,
+    BindingsPerBindGroupLimitExceeded,
+    RequiredFeatureMissing,
     // WebGPU baseline limit warnings
     StorageBufferLimitExceeded,
     UniformBufferLimitExceeded,
+    DynamicUniformBufferLimitExceeded,
+    DynamicStorageBufferLimitExceeded,
+    SampledTextureLimitExceeded,
+    SamplerLimitExceeded,
+    StorageTextureLimitExceeded,
     OverrideWorkgroupSize,
 }
 
@@ -239,9 +271,17 @@ impl CompatIssueKind {
             Self::Tessellation => "Tessellation",
             Self::PhysicalStorageBuffer => "PhysicalStorageBuffer",
             Self::WorkgroupSizeLimitExceeded => "WorkgroupSizeLimitExceeded",
+            Self::WorkgroupStorageLimitExceeded => "WorkgroupStorageLimitExceeded",
             Self::BindGroupLimitExceeded => "BindGroupLimitExceeded",
+            Self::BindingsPerBindGroupLimitExceeded => "BindingsPerBindGroupLimitExceeded",
+            Self::RequiredFeatureMissing => "RequiredFeatureMissing",
             Self::StorageBufferLimitExceeded => "StorageBufferLimitExceeded",
             Self::UniformBufferLimitExceeded => "UniformBufferLimitExceeded",
+            Self::DynamicUniformBufferLimitExceeded => "DynamicUniformBufferLimitExceeded",
+            Self::DynamicStorageBufferLimitExceeded => "DynamicStorageBufferLimitExceeded",
+            Self::SampledTextureLimitExceeded => "SampledTextureLimitExceeded",
+            Self::SamplerLimitExceeded => "SamplerLimitExceeded",
+            Self::StorageTextureLimitExceeded => "StorageTextureLimitExceeded",
             Self::OverrideWorkgroupSize => "OverrideWorkgroupSize",
         }
     }
@@ -339,19 +379,36 @@ impl CompatAudit {
         }
     }
 
+    /// Sort recorded issues into canonical deterministic order:
+    /// severity (`Blocker` -> `Warning` -> `Rewritten`), then `kind`, `message`, and `hint`.
+    pub fn sort_deterministic(&mut self) {
+        self.issues.sort_by(|a, b| {
+            severity_rank(a.severity)
+                .cmp(&severity_rank(b.severity))
+                .then_with(|| a.kind.cmp(&b.kind))
+                .then_with(|| a.message.cmp(&b.message))
+                .then_with(|| a.hint.cmp(&b.hint))
+        });
+    }
+
     /// Merge another audit (for example, post-Naga limits audit) into this one.
     ///
     /// Deduplicates overlapping `(severity, kind)` findings that were already caught during the
-    /// SPIR-V pre-pass so single-shader issue counts stay accurate.
+    /// SPIR-V pre-pass so single-shader issue counts stay accurate, and sorts deterministically.
     pub fn merge(&mut self, other: CompatAudit) {
-        self.rewritten_instructions += other.rewritten_instructions;
+        self.rewritten_instructions = self
+            .rewritten_instructions
+            .saturating_add(other.rewritten_instructions);
         for issue in other.issues {
-            if issue.severity == CompatSeverity::Rewritten {
+            if issue.severity == CompatSeverity::Rewritten
+                || issue.kind == CompatIssueKind::RequiredFeatureMissing
+            {
                 self.push_unique(issue);
             } else {
                 self.push_once_per_kind(issue);
             }
         }
+        self.sort_deterministic();
     }
 }
 
@@ -465,7 +522,7 @@ pub fn spirv_bytes_to_words(bytes: &[u8]) -> Result<Vec<u32>, SpirvStreamError> 
 
 /// Convert a SPIR-V 32-bit word stream back into little-endian bytes.
 pub fn spirv_words_to_bytes(words: &[u32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(words.len() * 4);
+    let mut bytes = Vec::with_capacity(words.len().saturating_mul(4));
     for &word in words {
         bytes.extend_from_slice(&word.to_le_bytes());
     }
@@ -518,7 +575,7 @@ pub fn sanitize_spirv_words(
         sanitized_word_count: 0,
     };
 
-    let mut stripped_non_semantic_sets: HashSet<u32> = HashSet::new();
+    let mut stripped_non_semantic_sets: BTreeSet<u32> = BTreeSet::new();
     let mut stripped_non_semantic_calls: usize = 0;
 
     let mut offset = SPIRV_HEADER_WORDS;
@@ -574,7 +631,8 @@ pub fn sanitize_spirv_words(
                     if set_name.starts_with("NonSemantic.") {
                         if options.strip_non_semantic {
                             stripped_non_semantic_sets.insert(set_id);
-                            audit.rewritten_instructions += 1;
+                            audit.rewritten_instructions =
+                                audit.rewritten_instructions.saturating_add(1);
                             audit.push_unique(CompatIssue {
                                 severity: CompatSeverity::Rewritten,
                                 kind: CompatIssueKind::NonSemanticStripped,
@@ -603,8 +661,8 @@ pub fn sanitize_spirv_words(
             OP_EXT_INST => {
                 // OpExtInst: [header, result_type, result_id, set_id, instruction, operands...]
                 if inst.len() >= 5 && stripped_non_semantic_sets.contains(&inst[3]) {
-                    stripped_non_semantic_calls += 1;
-                    audit.rewritten_instructions += 1;
+                    stripped_non_semantic_calls = stripped_non_semantic_calls.saturating_add(1);
+                    audit.rewritten_instructions = audit.rewritten_instructions.saturating_add(1);
                     keep = false;
                 }
             }
@@ -718,6 +776,7 @@ pub fn sanitize_spirv_words(
     }
 
     audit.sanitized_word_count = out.len();
+    audit.sort_deterministic();
 
     Ok(SanitizedSpirv { words: out, audit })
 }
@@ -726,7 +785,7 @@ fn decode_spirv_string(operand_words: &[u32]) -> Option<String> {
     if operand_words.is_empty() {
         return None;
     }
-    let mut raw = Vec::with_capacity(operand_words.len() * 4);
+    let mut raw = Vec::with_capacity(operand_words.len().saturating_mul(4));
     let mut found_nul = false;
     'outer: for &word in operand_words {
         for byte in word.to_le_bytes() {
@@ -747,7 +806,7 @@ fn handle_extension(ext_name: &str, options: &SanitizeOptions, audit: &mut Compa
     match ext_name {
         "SPV_KHR_float_controls" | "SPV_KHR_float_controls2" => {
             if options.strip_float_controls {
-                audit.rewritten_instructions += 1;
+                audit.rewritten_instructions = audit.rewritten_instructions.saturating_add(1);
                 audit.push_unique(CompatIssue {
                     severity: CompatSeverity::Rewritten,
                     kind: CompatIssueKind::FloatControlsStripped,
@@ -769,7 +828,7 @@ fn handle_extension(ext_name: &str, options: &SanitizeOptions, audit: &mut Compa
         }
         "SPV_KHR_non_semantic_info" => {
             if options.strip_non_semantic {
-                audit.rewritten_instructions += 1;
+                audit.rewritten_instructions = audit.rewritten_instructions.saturating_add(1);
                 audit.push_unique(CompatIssue {
                     severity: CompatSeverity::Rewritten,
                     kind: CompatIssueKind::NonSemanticStripped,
@@ -869,7 +928,7 @@ fn handle_capability(cap: u32, options: &SanitizeOptions, audit: &mut CompatAudi
         | CAP_ROUNDING_MODE_RTZ => {
             let name = float_control_capability_name(cap);
             if options.strip_float_controls {
-                audit.rewritten_instructions += 1;
+                audit.rewritten_instructions = audit.rewritten_instructions.saturating_add(1);
                 audit.push_unique(CompatIssue {
                     severity: CompatSeverity::Rewritten,
                     kind: CompatIssueKind::FloatControlsStripped,
@@ -1056,7 +1115,7 @@ fn handle_execution_mode(
         | EXEC_MODE_ROUNDING_MODE_RTZ => {
             let name = float_control_exec_mode_name(mode);
             if options.strip_float_controls {
-                audit.rewritten_instructions += 1;
+                audit.rewritten_instructions = audit.rewritten_instructions.saturating_add(1);
                 audit.push_unique(CompatIssue {
                     severity: CompatSeverity::Rewritten,
                     kind: CompatIssueKind::FloatControlsStripped,
@@ -1083,6 +1142,18 @@ fn handle_execution_mode(
                 let z = inst[5];
                 check_workgroup_size([x, y, z], None, audit);
             }
+            true
+        }
+        EXEC_MODE_LOCAL_SIZE_ID if opcode == OP_EXECUTION_MODE_ID => {
+            audit.push_once_per_kind(CompatIssue {
+                severity: CompatSeverity::Warning,
+                kind: CompatIssueKind::OverrideWorkgroupSize,
+                message: "SPIR-V uses OpExecutionModeId LocalSizeId (specialization-constant workgroup size); verify runtime values stay within WebGPU default limits".to_string(),
+                hint: Some(
+                    "ensure specialized workgroup dimensions stay within 256x256x64 and <= 256 invocations"
+                        .to_string(),
+                ),
+            });
             true
         }
         EXEC_MODE_SUBGROUP_SIZE
@@ -1215,32 +1286,49 @@ fn audit_storage_class(storage_class: u32, audit: &mut CompatAudit) {
 }
 
 fn check_workgroup_size(size: [u32; 3], entry_point: Option<&str>, audit: &mut CompatAudit) {
+    check_workgroup_size_with_limits(size, entry_point, &WebGpuLimits::webgpu_baseline(), audit);
+}
+
+fn check_workgroup_size_with_limits(
+    size: [u32; 3],
+    entry_point: Option<&str>,
+    limits: &WebGpuLimits,
+    audit: &mut CompatAudit,
+) {
     let [x, y, z] = size;
-    let total = u64::from(x)
-        .saturating_mul(u64::from(y))
-        .saturating_mul(u64::from(z));
+    // Exact product in u128: (u32::MAX)^3 < 2^96 < 2^128, so this never overflows.
+    let total = u128::from(x) * u128::from(y) * u128::from(z);
 
-    let exceeds_dim = x > WEBGPU_MAX_COMPUTE_WORKGROUP_SIZE_X
-        || y > WEBGPU_MAX_COMPUTE_WORKGROUP_SIZE_Y
-        || z > WEBGPU_MAX_COMPUTE_WORKGROUP_SIZE_Z;
-    let exceeds_total = total > u64::from(WEBGPU_MAX_COMPUTE_INVOCATIONS_PER_WORKGROUP);
+    let max_x = limits.max_compute_workgroup_size_x;
+    let max_y = limits.max_compute_workgroup_size_y;
+    let max_z = limits.max_compute_workgroup_size_z;
+    let max_inv = limits.max_compute_invocations_per_workgroup;
+
     let has_zero = x == 0 || y == 0 || z == 0;
+    let exceeds_dim = x > max_x || y > max_y || z > max_z;
+    let exceeds_total = total > u128::from(max_inv);
 
-    if exceeds_dim || exceeds_total || has_zero {
+    if has_zero || exceeds_dim || exceeds_total {
         let prefix = match entry_point {
             Some(name) => format!("compute entry point '{name}' "),
             None => String::new(),
         };
+        let message = if has_zero {
+            format!(
+                "{prefix}workgroup_size({x}, {y}, {z}) has a zero dimension; WebGPU requires each workgroup dimension to be >= 1 (limits {max_x}x{max_y}x{max_z}, max {max_inv} invocations)"
+            )
+        } else {
+            format!(
+                "{prefix}workgroup_size({x}, {y}, {z}) = {total} invocations exceeds WebGPU limits ({max_x}x{max_y}x{max_z}, max {max_inv} invocations)"
+            )
+        };
         audit.push_once_per_kind(CompatIssue {
             severity: CompatSeverity::Blocker,
             kind: CompatIssueKind::WorkgroupSizeLimitExceeded,
-            message: format!(
-                "{prefix}workgroup_size({x}, {y}, {z}) = {total} invocations exceeds WebGPU baseline default limits ({WEBGPU_MAX_COMPUTE_WORKGROUP_SIZE_X}x{WEBGPU_MAX_COMPUTE_WORKGROUP_SIZE_Y}x{WEBGPU_MAX_COMPUTE_WORKGROUP_SIZE_Z}, max {WEBGPU_MAX_COMPUTE_INVOCATIONS_PER_WORKGROUP} invocations)"
-            ),
-            hint: Some(
-                "request higher WebGPU compute workgroup limits or retile dispatch threads to <= 256 invocations"
-                    .to_string(),
-            ),
+            message,
+            hint: Some(format!(
+                "ensure each workgroup dimension is >= 1 and retile dispatch threads within {max_x}x{max_y}x{max_z} (<= {max_inv} invocations)"
+            )),
         });
     }
 }
@@ -1331,18 +1419,30 @@ fn bindless_capability_name(cap: u32) -> &'static str {
 ///
 /// Checks:
 /// - Compute workgroup sizes (`256 x 256 x 64`, `<= 256` total invocations) and override sizes
+/// - Compute workgroup storage size (`maxComputeWorkgroupStorageSize = 16384` bytes)
 /// - Unsupported shader stages (`Task`, `Mesh`, ray tracing stages)
-/// - Bind group index ceiling (`maxBindGroups = 4`, indices `0..4`)
+/// - Bind group index ceiling (`maxBindGroups = 4`, indices `0..4`) and per-group binding counts
 /// - Push constants / immediate data (`AddressSpace::Immediate`)
-/// - Storage buffer and uniform buffer counts per shader stage (`8` / `12` WebGPU defaults)
+/// - Per-stage storage buffer, uniform buffer, sampled texture, sampler, and storage texture counts
 /// - Unsupported IR types (`f64`, `i64`/`u64`, `BindingArray`, `AccelerationStructure`, `RayQuery`)
 pub fn audit_naga_module(module: &naga::Module) -> CompatAudit {
+    audit_naga_module_with_limits(module, &WebGpuLimits::webgpu_baseline())
+}
+
+/// Audit a parsed [`naga::Module`] against explicit [`WebGpuLimits`], producing deterministically
+/// ordered compatibility diagnostics.
+pub fn audit_naga_module_with_limits(
+    module: &naga::Module,
+    limits: &WebGpuLimits,
+) -> CompatAudit {
     let mut audit = CompatAudit::default();
 
     // 1. Entry points: stages and compute workgroup limits.
+    let mut has_compute_entry_point = false;
     for ep in &module.entry_points {
         match ep.stage {
             naga::ShaderStage::Compute => {
+                has_compute_entry_point = true;
                 if ep.workgroup_size_overrides.is_some() {
                     audit.push_unique(CompatIssue {
                         severity: CompatSeverity::Warning,
@@ -1354,7 +1454,12 @@ pub fn audit_naga_module(module: &naga::Module) -> CompatAudit {
                         hint: None,
                     });
                 } else {
-                    check_workgroup_size(ep.workgroup_size, Some(&ep.name), &mut audit);
+                    check_workgroup_size_with_limits(
+                        ep.workgroup_size,
+                        Some(&ep.name),
+                        limits,
+                        &mut audit,
+                    );
                 }
             }
             naga::ShaderStage::Task | naga::ShaderStage::Mesh => {
@@ -1410,9 +1515,9 @@ pub fn audit_naga_module(module: &naga::Module) -> CompatAudit {
         }
     }
 
-    // 2. Global variables: address spaces, bind groups, push constants / immediates.
-    let mut module_storage_buffers = 0usize;
-    let mut module_uniform_buffers = 0usize;
+    // 2. Global variables: address spaces, bind groups, per-group binding counts, push constants.
+    let mut module_counts = StageResourceCounts::default();
+    let mut bindings_per_group: BTreeMap<u32, usize> = BTreeMap::new();
 
     for (_, var) in module.global_variables.iter() {
         match var.space {
@@ -1449,73 +1554,91 @@ pub fn audit_naga_module(module: &naga::Module) -> CompatAudit {
                     ),
                 });
             }
-            naga::AddressSpace::Storage { .. } => {
-                module_storage_buffers += 1;
-            }
-            naga::AddressSpace::Uniform => {
-                module_uniform_buffers += 1;
-            }
             _ => {}
         }
 
-        if let Some(binding) = &var.binding
-            && binding.group >= WEBGPU_MAX_BIND_GROUPS
-        {
-            let label = var.name.as_deref().unwrap_or("<unnamed>");
+        tally_global_resource(module, var, &mut module_counts);
+
+        if let Some(binding) = &var.binding {
+            let group_count = bindings_per_group.entry(binding.group).or_insert(0);
+            *group_count = group_count.saturating_add(1);
+
+            if binding.group >= limits.max_bind_groups {
+                let label = var.name.as_deref().unwrap_or("<unnamed>");
+                audit.push_once_per_kind(CompatIssue {
+                    severity: CompatSeverity::Blocker,
+                    kind: CompatIssueKind::BindGroupLimitExceeded,
+                    message: format!(
+                        "resource '{label}' uses @group({}) @binding({}), exceeding WebGPU maxBindGroups ({}; valid groups 0..{})",
+                        binding.group,
+                        binding.binding,
+                        limits.max_bind_groups,
+                        limits.max_bind_groups
+                    ),
+                    hint: Some(format!(
+                        "pack descriptor sets into <= {} bind groups for WebGPU compatibility",
+                        limits.max_bind_groups
+                    )),
+                });
+            }
+        }
+    }
+
+    for (&group, &count) in &bindings_per_group {
+        if count > limits.max_bindings_per_bind_group {
             audit.push_once_per_kind(CompatIssue {
                 severity: CompatSeverity::Blocker,
-                kind: CompatIssueKind::BindGroupLimitExceeded,
+                kind: CompatIssueKind::BindingsPerBindGroupLimitExceeded,
                 message: format!(
-                    "resource '{label}' uses @group({}) @binding({}), exceeding WebGPU baseline maxBindGroups ({WEBGPU_MAX_BIND_GROUPS}; valid groups 0..{WEBGPU_MAX_BIND_GROUPS})",
-                    binding.group, binding.binding
+                    "@group({group}) declares {count} bindings, exceeding WebGPU maxBindingsPerBindGroup ({})",
+                    limits.max_bindings_per_bind_group
                 ),
-                hint: Some(
-                    "pack descriptor sets into <= 4 bind groups for WebGPU baseline compatibility"
-                        .to_string(),
-                ),
+                hint: Some(format!(
+                    "reduce bindings in @group({group}) to <= {}",
+                    limits.max_bindings_per_bind_group
+                )),
             });
         }
+    }
+
+    // 2b. Compute workgroup storage budget check (only when compute entry point or workgroup vars exist).
+    let workgroup_storage_bytes = compute_workgroup_storage_bytes(module);
+    if (has_compute_entry_point || workgroup_storage_bytes > 0)
+        && workgroup_storage_bytes > limits.max_compute_workgroup_storage_size
+    {
+        audit.push_once_per_kind(CompatIssue {
+            severity: CompatSeverity::Blocker,
+            kind: CompatIssueKind::WorkgroupStorageLimitExceeded,
+            message: format!(
+                "module uses {workgroup_storage_bytes} bytes of workgroup storage, exceeding WebGPU maxComputeWorkgroupStorageSize ({})",
+                limits.max_compute_workgroup_storage_size
+            ),
+            hint: Some(format!(
+                "reduce var<workgroup> shared memory usage to <= {} bytes or request a higher device limit",
+                limits.max_compute_workgroup_storage_size
+            )),
+        });
     }
 
     // 3. Per-stage binding counts (falls back to module-wide globals when an entry point
     //    doesn't directly reference unused globals or when there are 0 entry points).
     if module.entry_points.is_empty() {
-        check_stage_buffer_limits(
-            None,
-            module_storage_buffers,
-            module_uniform_buffers,
-            &mut audit,
-        );
+        check_stage_resource_limits(None, &module_counts, limits, &mut audit);
     } else {
         for ep in &module.entry_points {
             let referenced = collect_referenced_globals(module, &ep.function);
-            let mut stage_storage = 0usize;
-            let mut stage_uniform = 0usize;
+            let mut stage_counts = StageResourceCounts::default();
             for handle in referenced {
-                match module.global_variables[handle].space {
-                    naga::AddressSpace::Storage { .. } => stage_storage += 1,
-                    naga::AddressSpace::Uniform => stage_uniform += 1,
-                    _ => {}
-                }
+                tally_global_resource(module, &module.global_variables[handle], &mut stage_counts);
             }
             // If a synthetic module declares global resource bindings without loading them in
             // the stub body, also honor the module-wide count so limit audits still catch them.
-            let effective_storage = if module.entry_points.len() == 1 {
-                stage_storage.max(module_storage_buffers)
+            let effective = if module.entry_points.len() == 1 {
+                stage_counts.elementwise_max(&module_counts)
             } else {
-                stage_storage
+                stage_counts
             };
-            let effective_uniform = if module.entry_points.len() == 1 {
-                stage_uniform.max(module_uniform_buffers)
-            } else {
-                stage_uniform
-            };
-            check_stage_buffer_limits(
-                Some(&ep.name),
-                effective_storage,
-                effective_uniform,
-                &mut audit,
-            );
+            check_stage_resource_limits(Some(&ep.name), &effective, limits, &mut audit);
         }
     }
 
@@ -1556,13 +1679,82 @@ pub fn audit_naga_module(module: &naga::Module) -> CompatAudit {
         }
     }
 
+    audit.sort_deterministic();
     audit
 }
 
-fn check_stage_buffer_limits(
-    entry_point: Option<&str>,
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StageResourceCounts {
     storage_buffers: usize,
     uniform_buffers: usize,
+    sampled_textures: usize,
+    samplers: usize,
+    storage_textures: usize,
+}
+
+impl StageResourceCounts {
+    fn elementwise_max(&self, other: &Self) -> Self {
+        Self {
+            storage_buffers: self.storage_buffers.max(other.storage_buffers),
+            uniform_buffers: self.uniform_buffers.max(other.uniform_buffers),
+            sampled_textures: self.sampled_textures.max(other.sampled_textures),
+            samplers: self.samplers.max(other.samplers),
+            storage_textures: self.storage_textures.max(other.storage_textures),
+        }
+    }
+}
+
+fn tally_global_resource(
+    module: &naga::Module,
+    var: &naga::GlobalVariable,
+    counts: &mut StageResourceCounts,
+) {
+    match var.space {
+        naga::AddressSpace::Storage { .. } => {
+            counts.storage_buffers = counts.storage_buffers.saturating_add(1);
+        }
+        naga::AddressSpace::Uniform => {
+            counts.uniform_buffers = counts.uniform_buffers.saturating_add(1);
+        }
+        naga::AddressSpace::Handle => match &module.types[var.ty].inner {
+            naga::TypeInner::Image { class, .. } => match class {
+                naga::ImageClass::Storage { .. } => {
+                    counts.storage_textures = counts.storage_textures.saturating_add(1);
+                }
+                _ => {
+                    counts.sampled_textures = counts.sampled_textures.saturating_add(1);
+                }
+            },
+            naga::TypeInner::Sampler { .. } => {
+                counts.samplers = counts.samplers.saturating_add(1);
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
+fn compute_workgroup_storage_bytes(module: &naga::Module) -> u32 {
+    let mut layouter = naga::proc::Layouter::default();
+    if layouter.update(module.to_ctx()).is_err() {
+        return 0;
+    }
+    let mut total: u32 = 0;
+    for (_, var) in module.global_variables.iter() {
+        if var.space == naga::AddressSpace::WorkGroup {
+            let raw_size = layouter[var.ty].size;
+            // WebGPU rounds each workgroup variable up to a 16-byte multiple.
+            let aligned = raw_size.saturating_add(15) & !15u32;
+            total = total.saturating_add(aligned);
+        }
+    }
+    total
+}
+
+fn check_stage_resource_limits(
+    entry_point: Option<&str>,
+    counts: &StageResourceCounts,
+    limits: &WebGpuLimits,
     audit: &mut CompatAudit,
 ) {
     let scope = match entry_point {
@@ -1570,12 +1762,13 @@ fn check_stage_buffer_limits(
         None => "module".to_string(),
     };
 
-    if storage_buffers > WEBGPU_MAX_STORAGE_BUFFERS_PER_SHADER_STAGE {
+    if counts.storage_buffers > limits.max_storage_buffers_per_shader_stage {
         audit.push_once_per_kind(CompatIssue {
             severity: CompatSeverity::Warning,
             kind: CompatIssueKind::StorageBufferLimitExceeded,
             message: format!(
-                "{scope} uses {storage_buffers} storage buffer bindings, exceeding WebGPU baseline maxStorageBuffersPerShaderStage ({WEBGPU_MAX_STORAGE_BUFFERS_PER_SHADER_STAGE})"
+                "{scope} uses {} storage buffer bindings, exceeding WebGPU maxStorageBuffersPerShaderStage ({})",
+                counts.storage_buffers, limits.max_storage_buffers_per_shader_stage
             ),
             hint: Some(
                 "request higher maxStorageBuffersPerShaderStage or merge read-only buffers into a combined storage buffer"
@@ -1584,15 +1777,61 @@ fn check_stage_buffer_limits(
         });
     }
 
-    if uniform_buffers > WEBGPU_MAX_UNIFORM_BUFFERS_PER_SHADER_STAGE {
+    if counts.uniform_buffers > limits.max_uniform_buffers_per_shader_stage {
         audit.push_once_per_kind(CompatIssue {
             severity: CompatSeverity::Warning,
             kind: CompatIssueKind::UniformBufferLimitExceeded,
             message: format!(
-                "{scope} uses {uniform_buffers} uniform buffer bindings, exceeding WebGPU baseline maxUniformBuffersPerShaderStage ({WEBGPU_MAX_UNIFORM_BUFFERS_PER_SHADER_STAGE})"
+                "{scope} uses {} uniform buffer bindings, exceeding WebGPU maxUniformBuffersPerShaderStage ({})",
+                counts.uniform_buffers, limits.max_uniform_buffers_per_shader_stage
             ),
             hint: Some(
                 "pack uniform buffers into fewer bindings or a shared constant buffer".to_string(),
+            ),
+        });
+    }
+
+    if counts.sampled_textures > limits.max_sampled_textures_per_shader_stage {
+        audit.push_once_per_kind(CompatIssue {
+            severity: CompatSeverity::Warning,
+            kind: CompatIssueKind::SampledTextureLimitExceeded,
+            message: format!(
+                "{scope} uses {} sampled texture bindings, exceeding WebGPU maxSampledTexturesPerShaderStage ({})",
+                counts.sampled_textures, limits.max_sampled_textures_per_shader_stage
+            ),
+            hint: Some(
+                "combine textures into texture_2d_array atlases or request higher maxSampledTexturesPerShaderStage"
+                    .to_string(),
+            ),
+        });
+    }
+
+    if counts.samplers > limits.max_samplers_per_shader_stage {
+        audit.push_once_per_kind(CompatIssue {
+            severity: CompatSeverity::Warning,
+            kind: CompatIssueKind::SamplerLimitExceeded,
+            message: format!(
+                "{scope} uses {} sampler bindings, exceeding WebGPU maxSamplersPerShaderStage ({})",
+                counts.samplers, limits.max_samplers_per_shader_stage
+            ),
+            hint: Some(
+                "deduplicate immutable sampler states to stay within maxSamplersPerShaderStage"
+                    .to_string(),
+            ),
+        });
+    }
+
+    if counts.storage_textures > limits.max_storage_textures_per_shader_stage {
+        audit.push_once_per_kind(CompatIssue {
+            severity: CompatSeverity::Warning,
+            kind: CompatIssueKind::StorageTextureLimitExceeded,
+            message: format!(
+                "{scope} uses {} storage texture bindings, exceeding WebGPU maxStorageTexturesPerShaderStage ({})",
+                counts.storage_textures, limits.max_storage_textures_per_shader_stage
+            ),
+            hint: Some(
+                "pack storage outputs or request higher maxStorageTexturesPerShaderStage"
+                    .to_string(),
             ),
         });
     }
@@ -1631,59 +1870,1307 @@ fn audit_naga_scalar(scalar: naga::Scalar, audit: &mut CompatAudit) {
 fn collect_referenced_globals(
     module: &naga::Module,
     root: &naga::Function,
-) -> HashSet<naga::Handle<naga::GlobalVariable>> {
-    let mut globals = HashSet::new();
-    let mut visited_fns: HashSet<naga::Handle<naga::Function>> = HashSet::new();
+) -> Vec<naga::Handle<naga::GlobalVariable>> {
+    let mut globals: BTreeMap<usize, naga::Handle<naga::GlobalVariable>> = BTreeMap::new();
+    let mut visited_fns: BTreeSet<usize> = BTreeSet::new();
     let mut pending_fns: Vec<naga::Handle<naga::Function>> = Vec::new();
 
     scan_function_globals(root, &mut globals, &mut pending_fns);
     while let Some(fn_handle) = pending_fns.pop() {
-        if visited_fns.insert(fn_handle) {
+        if visited_fns.insert(fn_handle.index()) {
             scan_function_globals(&module.functions[fn_handle], &mut globals, &mut pending_fns);
         }
     }
 
-    globals
+    globals.into_values().collect()
 }
 
 fn scan_function_globals(
     func: &naga::Function,
-    globals: &mut HashSet<naga::Handle<naga::GlobalVariable>>,
+    globals: &mut BTreeMap<usize, naga::Handle<naga::GlobalVariable>>,
     callees: &mut Vec<naga::Handle<naga::Function>>,
 ) {
     for (_, expr) in func.expressions.iter() {
         if let naga::Expression::GlobalVariable(handle) = *expr {
-            globals.insert(handle);
+            globals.insert(handle.index(), handle);
         }
     }
     collect_calls_in_block(&func.body, callees);
 }
 
 fn collect_calls_in_block(block: &naga::Block, callees: &mut Vec<naga::Handle<naga::Function>>) {
-    for stmt in block.iter() {
-        match stmt {
-            naga::Statement::Block(inner) => collect_calls_in_block(inner, callees),
-            naga::Statement::If { accept, reject, .. } => {
-                collect_calls_in_block(accept, callees);
-                collect_calls_in_block(reject, callees);
-            }
-            naga::Statement::Switch { cases, .. } => {
-                for case in cases {
-                    collect_calls_in_block(&case.body, callees);
+    let mut worklist: Vec<&naga::Block> = vec![block];
+    while let Some(current) = worklist.pop() {
+        for stmt in current.iter() {
+            match stmt {
+                naga::Statement::Block(inner) => worklist.push(inner),
+                naga::Statement::If { accept, reject, .. } => {
+                    worklist.push(reject);
+                    worklist.push(accept);
                 }
+                naga::Statement::Switch { cases, .. } => {
+                    for case in cases.iter().rev() {
+                        worklist.push(&case.body);
+                    }
+                }
+                naga::Statement::Loop {
+                    body, continuing, ..
+                } => {
+                    worklist.push(continuing);
+                    worklist.push(body);
+                }
+                naga::Statement::Call { function, .. } => {
+                    callees.push(*function);
+                }
+                _ => {}
             }
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => {
-                collect_calls_in_block(body, callees);
-                collect_calls_in_block(continuing, callees);
-            }
-            naga::Statement::Call { function, .. } => {
-                callees.push(*function);
-            }
-            _ => {}
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// WebGPU Feature-Compatibility & Limit Guards (3D Main Menu & In-Game Shaders)
+// ---------------------------------------------------------------------------
+
+/// Optional WebGPU `GPUFeatureName` flags required by 3D Main Menu and playable in-game shaders.
+///
+/// Variants are declared in strict ascending lexicographical order of their canonical WebGPU
+/// feature name (`as_str()`), guaranteeing deterministic ordering in `BTreeSet`s and reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum WebGpuFeature {
+    /// `bgra8unorm-storage` — `texture_storage_2d<bgra8unorm, ...>` read/write storage textures.
+    Bgra8UnormStorage,
+    /// `clip-distances` — `@builtin(clip_distances)` vertex clipping planes.
+    ClipDistances,
+    /// `depth-clip-control` — unclipped depth (`unclippedDepth: true`).
+    DepthClipControl,
+    /// `depth32float-stencil8` — combined 32-bit float depth + 8-bit stencil attachments/textures.
+    Depth32FloatStencil8,
+    /// `dual-source-blending` — `@blend_src(0/1)` fragment outputs.
+    DualSourceBlending,
+    /// `float32-filterable` — linear filtering of 32-bit float textures (`r32float`/`rg32float`/`rgba32float`).
+    Float32Filterable,
+    /// `indirect-first-instance` — non-zero `firstInstance` in indirect draws.
+    IndirectFirstInstance,
+    /// `rg11b10ufloat-renderable` — HDR `rg11b10ufloat` render attachments.
+    Rg11b10UfloatRenderable,
+    /// `shader-f16` — `enable f16;` 16-bit floating-point WGSL arithmetic.
+    ShaderF16,
+    /// `subgroups` — `enable subgroups;` native subgroup operations & built-ins.
+    Subgroups,
+    /// `texture-compression-astc` — ASTC compressed textures.
+    TextureCompressionAstc,
+    /// `texture-compression-bc` — BC1–BC7 block-compressed textures (Xbox/D3D12 standard).
+    TextureCompressionBc,
+    /// `texture-compression-etc2` — ETC2/EAC compressed textures.
+    TextureCompressionEtc2,
+    /// `timestamp-query` — GPU pass/command timestamp queries.
+    TimestampQuery,
+}
+
+impl WebGpuFeature {
+    /// All known optional WebGPU features in canonical ascending order.
+    pub const ALL: &'static [Self] = &[
+        Self::Bgra8UnormStorage,
+        Self::ClipDistances,
+        Self::DepthClipControl,
+        Self::Depth32FloatStencil8,
+        Self::DualSourceBlending,
+        Self::Float32Filterable,
+        Self::IndirectFirstInstance,
+        Self::Rg11b10UfloatRenderable,
+        Self::ShaderF16,
+        Self::Subgroups,
+        Self::TextureCompressionAstc,
+        Self::TextureCompressionBc,
+        Self::TextureCompressionEtc2,
+        Self::TimestampQuery,
+    ];
+
+    /// Canonical WebGPU `GPUFeatureName` string.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bgra8UnormStorage => "bgra8unorm-storage",
+            Self::ClipDistances => "clip-distances",
+            Self::DepthClipControl => "depth-clip-control",
+            Self::Depth32FloatStencil8 => "depth32float-stencil8",
+            Self::DualSourceBlending => "dual-source-blending",
+            Self::Float32Filterable => "float32-filterable",
+            Self::IndirectFirstInstance => "indirect-first-instance",
+            Self::Rg11b10UfloatRenderable => "rg11b10ufloat-renderable",
+            Self::ShaderF16 => "shader-f16",
+            Self::Subgroups => "subgroups",
+            Self::TextureCompressionAstc => "texture-compression-astc",
+            Self::TextureCompressionBc => "texture-compression-bc",
+            Self::TextureCompressionEtc2 => "texture-compression-etc2",
+            Self::TimestampQuery => "timestamp-query",
+        }
+    }
+
+    /// Parse a WebGPU `GPUFeatureName` string (case-insensitive, trimmed).
+    pub fn from_name(name: &str) -> Option<Self> {
+        let normalized = name.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            return None;
+        }
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|feature| feature.as_str() == normalized)
+    }
+
+    /// Return the optional WebGPU feature required to create or sample a texture with `format`.
+    ///
+    /// Returns `None` for baseline core WebGPU texture formats as well as empty or unknown strings.
+    pub fn required_for_texture_format(format: &str) -> Option<Self> {
+        let normalized = format.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            return None;
+        }
+        match normalized.as_str() {
+            "bc1-rgba-unorm"
+            | "bc1-rgba-unorm-srgb"
+            | "bc2-rgba-unorm"
+            | "bc2-rgba-unorm-srgb"
+            | "bc3-rgba-unorm"
+            | "bc3-rgba-unorm-srgb"
+            | "bc4-r-unorm"
+            | "bc4-r-snorm"
+            | "bc5-rg-unorm"
+            | "bc5-rg-snorm"
+            | "bc6h-rgb-ufloat"
+            | "bc6h-rgb-float"
+            | "bc7-rgba-unorm"
+            | "bc7-rgba-unorm-srgb" => Some(Self::TextureCompressionBc),
+            "depth32float-stencil8" => Some(Self::Depth32FloatStencil8),
+            "etc2-rgb8unorm"
+            | "etc2-rgb8unorm-srgb"
+            | "etc2-rgb8a1unorm"
+            | "etc2-rgb8a1unorm-srgb"
+            | "etc2-rgba8unorm"
+            | "etc2-rgba8unorm-srgb"
+            | "eac-r11unorm"
+            | "eac-r11snorm"
+            | "eac-rg11unorm"
+            | "eac-rg11snorm" => Some(Self::TextureCompressionEtc2),
+            other if is_astc_texture_format(other) => Some(Self::TextureCompressionAstc),
+            _ => None,
+        }
+    }
+
+    /// Return the optional WebGPU feature required to bind a storage texture with `format`.
+    pub fn required_for_storage_texture_format(format: &str) -> Option<Self> {
+        let normalized = format.trim().to_ascii_lowercase();
+        if normalized == "bgra8unorm" {
+            Some(Self::Bgra8UnormStorage)
+        } else {
+            None
+        }
+    }
+
+    /// Return the optional WebGPU feature required to use `format` as a render/depth attachment.
+    pub fn required_for_render_attachment_format(format: &str) -> Option<Self> {
+        let normalized = format.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "depth32float-stencil8" => Some(Self::Depth32FloatStencil8),
+            "rg11b10ufloat" => Some(Self::Rg11b10UfloatRenderable),
+            _ => None,
+        }
+    }
+
+    /// Deterministically detect optional WebGPU features required by a WGSL source module.
+    ///
+    /// Safely ignores empty inputs, line comments (`//`), and nested block comments (`/* ... */`).
+    pub fn required_for_wgsl_source(wgsl: &str) -> BTreeSet<Self> {
+        let mut features = BTreeSet::new();
+        if wgsl.trim().is_empty() {
+            return features;
+        }
+
+        let stripped = strip_wgsl_comments(wgsl);
+
+        // 1. Parse `enable <ext1>, <ext2>;` directives.
+        for stmt in stripped.split(';') {
+            let trimmed = stmt.trim_start();
+            if let Some(rest) = trimmed.strip_prefix("enable")
+                && rest.starts_with(|c: char| c.is_ascii_whitespace())
+            {
+                for item in rest.split(',') {
+                    match item.trim() {
+                        "f16" => {
+                            features.insert(Self::ShaderF16);
+                        }
+                        "subgroups" => {
+                            features.insert(Self::Subgroups);
+                        }
+                        "clip_distances" => {
+                            features.insert(Self::ClipDistances);
+                        }
+                        "dual_source_blending" => {
+                            features.insert(Self::DualSourceBlending);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // 2. Token-boundary defense-in-depth detection for feature-gated WGSL constructs.
+        if contains_wgsl_ident(&stripped, "f16") {
+            features.insert(Self::ShaderF16);
+        }
+        if contains_wgsl_ident(&stripped, "blend_src") && stripped.contains("@blend_src") {
+            features.insert(Self::DualSourceBlending);
+        }
+        if contains_wgsl_ident(&stripped, "clip_distances") {
+            features.insert(Self::ClipDistances);
+        }
+        if uses_wgsl_bgra8unorm_storage(&stripped) {
+            features.insert(Self::Bgra8UnormStorage);
+        }
+        if uses_wgsl_subgroups(&stripped) {
+            features.insert(Self::Subgroups);
+        }
+
+        features
+    }
+
+    /// Deterministically detect optional WebGPU features required by a SPIR-V 32-bit word stream.
+    ///
+    /// Performs full bounds-checked framing validation without panicking on empty or malformed data.
+    pub fn required_for_spirv_words(words: &[u32]) -> Result<BTreeSet<Self>, SpirvStreamError> {
+        if words.len() < SPIRV_HEADER_WORDS {
+            return Err(SpirvStreamError::TooShort {
+                actual_words: words.len(),
+                min_words: SPIRV_HEADER_WORDS,
+            });
+        }
+        let magic = words[0];
+        if magic != SPIRV_MAGIC {
+            return Err(SpirvStreamError::InvalidMagic {
+                magic,
+                is_big_endian: magic == SPIRV_MAGIC.swap_bytes(),
+            });
+        }
+
+        let mut features = BTreeSet::new();
+        let mut offset = SPIRV_HEADER_WORDS;
+        while offset < words.len() {
+            let header = words[offset];
+            let word_count = (header >> 16) as usize;
+            let opcode = (header & 0xffff) as u16;
+            if word_count == 0 {
+                return Err(SpirvStreamError::InvalidWordCount {
+                    word_offset: offset,
+                    opcode,
+                });
+            }
+            let Some(end) = offset.checked_add(word_count) else {
+                return Err(SpirvStreamError::TruncatedInstruction {
+                    word_offset: offset,
+                    opcode,
+                    declared_words: word_count,
+                    available_words: words.len() - offset,
+                });
+            };
+            if end > words.len() {
+                return Err(SpirvStreamError::TruncatedInstruction {
+                    word_offset: offset,
+                    opcode,
+                    declared_words: word_count,
+                    available_words: words.len() - offset,
+                });
+            }
+
+            let inst = &words[offset..end];
+            match opcode {
+                OP_CAPABILITY => {
+                    if let Some(&cap) = inst.get(1) {
+                        match cap {
+                            CAP_FLOAT16 => {
+                                features.insert(Self::ShaderF16);
+                            }
+                            CAP_CLIP_DISTANCE => {
+                                features.insert(Self::ClipDistances);
+                            }
+                            CAP_SUBGROUP_DISPATCH
+                            | CAP_GROUP_NON_UNIFORM
+                            | CAP_GROUP_NON_UNIFORM_VOTE
+                            | CAP_GROUP_NON_UNIFORM_ARITHMETIC
+                            | CAP_GROUP_NON_UNIFORM_BALLOT
+                            | CAP_GROUP_NON_UNIFORM_SHUFFLE
+                            | CAP_GROUP_NON_UNIFORM_SHUFFLE_RELATIVE
+                            | CAP_GROUP_NON_UNIFORM_CLUSTERED
+                            | CAP_GROUP_NON_UNIFORM_QUAD
+                            | CAP_SUBGROUP_BALLOT_KHR
+                            | CAP_SUBGROUP_VOTE_KHR
+                            | CAP_GROUP_NON_UNIFORM_PARTITIONED_EXT
+                            | CAP_GROUP_NON_UNIFORM_ROTATE_KHR => {
+                                features.insert(Self::Subgroups);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                OP_EXTENSION => {
+                    if let Some(ext_name) = decode_spirv_string(&inst[1..]) {
+                        match ext_name.as_str() {
+                            "SPV_KHR_shader_ballot"
+                            | "SPV_KHR_shader_vote"
+                            | "SPV_KHR_subgroup_uniform_control_flow"
+                            | "SPV_KHR_subgroup_rotate"
+                            | "SPV_KHR_shader_subgroup_extended_types" => {
+                                features.insert(Self::Subgroups);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                OP_EXECUTION_MODE | OP_EXECUTION_MODE_ID => {
+                    if let Some(&mode) = inst.get(2)
+                        && matches!(
+                            mode,
+                            EXEC_MODE_SUBGROUP_SIZE
+                                | EXEC_MODE_SUBGROUPS_PER_WORKGROUP
+                                | EXEC_MODE_SUBGROUPS_PER_WORKGROUP_ID
+                                | EXEC_MODE_SUBGROUP_UNIFORM_CONTROL_FLOW_KHR
+                        )
+                    {
+                        features.insert(Self::Subgroups);
+                    }
+                }
+                OP_TYPE_FLOAT => {
+                    if let Some(&width) = inst.get(2)
+                        && width == 16
+                    {
+                        features.insert(Self::ShaderF16);
+                    }
+                }
+                _ => {}
+            }
+
+            offset = end;
+        }
+
+        Ok(features)
+    }
+
+    /// Deterministically detect optional WebGPU features required by a parsed [`naga::Module`].
+    pub fn required_for_naga_module(module: &naga::Module) -> BTreeSet<Self> {
+        let mut features = BTreeSet::new();
+
+        for (_, ty) in module.types.iter() {
+            match &ty.inner {
+                naga::TypeInner::Scalar(scalar)
+                | naga::TypeInner::Vector { scalar, .. }
+                | naga::TypeInner::Matrix { scalar, .. }
+                | naga::TypeInner::Atomic(scalar) => {
+                    if scalar.kind == naga::ScalarKind::Float && scalar.width == 2 {
+                        features.insert(Self::ShaderF16);
+                    }
+                }
+                naga::TypeInner::Image {
+                    class:
+                        naga::ImageClass::Storage {
+                            format: naga::StorageFormat::Bgra8Unorm,
+                            ..
+                        },
+                    ..
+                } => {
+                    features.insert(Self::Bgra8UnormStorage);
+                }
+                naga::TypeInner::Struct { members, .. } => {
+                    for member in members {
+                        if let Some(binding) = &member.binding {
+                            collect_naga_binding_features(binding, &mut features);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        for ep in &module.entry_points {
+            collect_naga_function_features(&ep.function, &mut features);
+        }
+        for (_, func) in module.functions.iter() {
+            collect_naga_function_features(func, &mut features);
+        }
+
+        features
+    }
+}
+
+impl fmt::Display for WebGpuFeature {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+fn is_astc_texture_format(fmt: &str) -> bool {
+    let Some(rest) = fmt.strip_prefix("astc-") else {
+        return false;
+    };
+    let Some(dims) = rest
+        .strip_suffix("-unorm-srgb")
+        .or_else(|| rest.strip_suffix("-unorm"))
+    else {
+        return false;
+    };
+    matches!(
+        dims,
+        "4x4"
+            | "5x4"
+            | "5x5"
+            | "6x5"
+            | "6x6"
+            | "8x5"
+            | "8x6"
+            | "8x8"
+            | "10x5"
+            | "10x6"
+            | "10x8"
+            | "10x10"
+            | "12x10"
+            | "12x12"
+    )
+}
+
+fn strip_wgsl_comments(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0usize;
+    let mut block_depth: usize = 0;
+
+    while i < bytes.len() {
+        if block_depth > 0 {
+            if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                block_depth = block_depth.saturating_add(1);
+                out.push_str("  ");
+                i += 2;
+            } else if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                block_depth -= 1;
+                out.push_str("  ");
+                i += 2;
+            } else {
+                if bytes[i] == b'\n' {
+                    out.push('\n');
+                } else {
+                    out.push(' ');
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            out.push_str("  ");
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                out.push(' ');
+                i += 1;
+            }
+        } else if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            block_depth = 1;
+            out.push_str("  ");
+            i += 2;
+        } else {
+            let ch = src[i..].chars().next().unwrap_or(' ');
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+
+    out
+}
+
+fn is_wgsl_ident_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn contains_wgsl_ident(src: &str, ident: &str) -> bool {
+    if ident.is_empty() || src.len() < ident.len() {
+        return false;
+    }
+    let bytes = src.as_bytes();
+    let mut start = 0usize;
+    while let Some(rel) = src[start..].find(ident) {
+        let idx = start + rel;
+        let end = idx + ident.len();
+        let before_ok = idx == 0 || !is_wgsl_ident_char(bytes[idx - 1]);
+        let after_ok = end == bytes.len() || !is_wgsl_ident_char(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        start = idx + 1;
+    }
+    false
+}
+
+fn uses_wgsl_bgra8unorm_storage(stripped: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "texture_storage_1d",
+        "texture_storage_2d",
+        "texture_storage_2d_array",
+        "texture_storage_3d",
+    ];
+    for prefix in PREFIXES {
+        let mut start = 0usize;
+        while let Some(rel) = stripped[start..].find(prefix) {
+            let after_prefix = start + rel + prefix.len();
+            let tail = stripped[after_prefix..].trim_start();
+            if let Some(after_lt) = tail.strip_prefix('<')
+                && let Some(close_idx) = after_lt.find('>')
+                && contains_wgsl_ident(&after_lt[..close_idx], "bgra8unorm")
+            {
+                return true;
+            }
+            start = after_prefix;
+        }
+    }
+    false
+}
+
+fn uses_wgsl_subgroups(stripped: &str) -> bool {
+    const SUBGROUP_TOKENS: &[&str] = &[
+        "subgroup_size",
+        "subgroup_invocation_id",
+        "subgroupBallot",
+        "subgroupAdd",
+        "subgroupMul",
+        "subgroupMin",
+        "subgroupMax",
+        "subgroupAnd",
+        "subgroupOr",
+        "subgroupXor",
+        "subgroupAll",
+        "subgroupAny",
+        "subgroupElect",
+        "subgroupBroadcast",
+        "subgroupBroadcastFirst",
+        "subgroupShuffle",
+        "subgroupShuffleXor",
+        "subgroupShuffleUp",
+        "subgroupShuffleDown",
+        "subgroupExclusiveAdd",
+        "subgroupExclusiveMul",
+        "subgroupInclusiveAdd",
+        "subgroupInclusiveMul",
+        "quadBroadcast",
+        "quadSwapX",
+        "quadSwapY",
+        "quadSwapDiagonal",
+    ];
+    SUBGROUP_TOKENS
+        .iter()
+        .any(|token| contains_wgsl_ident(stripped, token))
+}
+
+fn collect_naga_binding_features(binding: &naga::Binding, features: &mut BTreeSet<WebGpuFeature>) {
+    match binding {
+        naga::Binding::BuiltIn(builtin) => match builtin {
+            naga::BuiltIn::SubgroupSize
+            | naga::BuiltIn::SubgroupInvocationId
+            | naga::BuiltIn::NumSubgroups
+            | naga::BuiltIn::SubgroupId => {
+                features.insert(WebGpuFeature::Subgroups);
+            }
+            naga::BuiltIn::ClipDistances => {
+                features.insert(WebGpuFeature::ClipDistances);
+            }
+            _ => {}
+        },
+        naga::Binding::Location {
+            blend_src: Some(_), ..
+        } => {
+            features.insert(WebGpuFeature::DualSourceBlending);
+        }
+        _ => {}
+    }
+}
+
+fn collect_naga_function_features(func: &naga::Function, features: &mut BTreeSet<WebGpuFeature>) {
+    for arg in &func.arguments {
+        if let Some(binding) = &arg.binding {
+            collect_naga_binding_features(binding, features);
+        }
+    }
+    if let Some(result) = &func.result
+        && let Some(binding) = &result.binding
+    {
+        collect_naga_binding_features(binding, features);
+    }
+
+    for (_, expr) in func.expressions.iter() {
+        if matches!(expr, naga::Expression::SubgroupOperationResult { .. }) {
+            features.insert(WebGpuFeature::Subgroups);
+        }
+    }
+
+    let mut worklist: Vec<&naga::Block> = vec![&func.body];
+    while let Some(block) = worklist.pop() {
+        for stmt in block.iter() {
+            match stmt {
+                naga::Statement::SubgroupBallot { .. }
+                | naga::Statement::SubgroupCollectiveOperation { .. }
+                | naga::Statement::SubgroupGather { .. } => {
+                    features.insert(WebGpuFeature::Subgroups);
+                }
+                naga::Statement::Block(inner) => worklist.push(inner),
+                naga::Statement::If { accept, reject, .. } => {
+                    worklist.push(reject);
+                    worklist.push(accept);
+                }
+                naga::Statement::Switch { cases, .. } => {
+                    for case in cases.iter().rev() {
+                        worklist.push(&case.body);
+                    }
+                }
+                naga::Statement::Loop {
+                    body, continuing, ..
+                } => {
+                    worklist.push(continuing);
+                    worklist.push(body);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// WebGPU `GPUSupportedLimits` subset enforced by shader compatibility guards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebGpuLimits {
+    pub max_bind_groups: u32,
+    pub max_bindings_per_bind_group: usize,
+    pub max_dynamic_uniform_buffers_per_pipeline_layout: usize,
+    pub max_dynamic_storage_buffers_per_pipeline_layout: usize,
+    pub max_storage_buffers_per_shader_stage: usize,
+    pub max_uniform_buffers_per_shader_stage: usize,
+    pub max_sampled_textures_per_shader_stage: usize,
+    pub max_samplers_per_shader_stage: usize,
+    pub max_storage_textures_per_shader_stage: usize,
+    pub max_compute_workgroup_size_x: u32,
+    pub max_compute_workgroup_size_y: u32,
+    pub max_compute_workgroup_size_z: u32,
+    pub max_compute_invocations_per_workgroup: u32,
+    pub max_compute_workgroup_storage_size: u32,
+}
+
+impl WebGpuLimits {
+    /// WebGPU specification baseline default limits (`GPUSupportedLimits` defaults).
+    pub const fn webgpu_baseline() -> Self {
+        Self {
+            max_bind_groups: WEBGPU_MAX_BIND_GROUPS,
+            max_bindings_per_bind_group: WEBGPU_MAX_BINDINGS_PER_BIND_GROUP,
+            max_dynamic_uniform_buffers_per_pipeline_layout:
+                WEBGPU_MAX_DYNAMIC_UNIFORM_BUFFERS_PER_PIPELINE_LAYOUT,
+            max_dynamic_storage_buffers_per_pipeline_layout:
+                WEBGPU_MAX_DYNAMIC_STORAGE_BUFFERS_PER_PIPELINE_LAYOUT,
+            max_storage_buffers_per_shader_stage: WEBGPU_MAX_STORAGE_BUFFERS_PER_SHADER_STAGE,
+            max_uniform_buffers_per_shader_stage: WEBGPU_MAX_UNIFORM_BUFFERS_PER_SHADER_STAGE,
+            max_sampled_textures_per_shader_stage: WEBGPU_MAX_SAMPLED_TEXTURES_PER_SHADER_STAGE,
+            max_samplers_per_shader_stage: WEBGPU_MAX_SAMPLERS_PER_SHADER_STAGE,
+            max_storage_textures_per_shader_stage: WEBGPU_MAX_STORAGE_TEXTURES_PER_SHADER_STAGE,
+            max_compute_workgroup_size_x: WEBGPU_MAX_COMPUTE_WORKGROUP_SIZE_X,
+            max_compute_workgroup_size_y: WEBGPU_MAX_COMPUTE_WORKGROUP_SIZE_Y,
+            max_compute_workgroup_size_z: WEBGPU_MAX_COMPUTE_WORKGROUP_SIZE_Z,
+            max_compute_invocations_per_workgroup: WEBGPU_MAX_COMPUTE_INVOCATIONS_PER_WORKGROUP,
+            max_compute_workgroup_storage_size: WEBGPU_MAX_COMPUTE_WORKGROUP_STORAGE_SIZE,
+        }
+    }
+}
+
+impl Default for WebGpuLimits {
+    fn default() -> Self {
+        Self::webgpu_baseline()
+    }
+}
+
+/// Target browser WebGPU adapter/device capability profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebGpuDeviceProfile {
+    pub enabled_features: BTreeSet<WebGpuFeature>,
+    pub limits: WebGpuLimits,
+}
+
+impl WebGpuDeviceProfile {
+    /// Strict WebGPU core baseline (no optional features, spec default limits).
+    pub fn baseline() -> Self {
+        Self {
+            enabled_features: BTreeSet::new(),
+            limits: WebGpuLimits::webgpu_baseline(),
+        }
+    }
+
+    /// Standard desktop WebGPU profile targeted by the 3D Main Menu and in-game renderer
+    /// (`texture-compression-bc` + `depth32float-stencil8`, spec default limits).
+    pub fn main_menu_target() -> Self {
+        Self::with_features(
+            [
+                WebGpuFeature::TextureCompressionBc,
+                WebGpuFeature::Depth32FloatStencil8,
+            ],
+            WebGpuLimits::webgpu_baseline(),
+        )
+    }
+
+    /// Build a custom device profile with explicit enabled features and limits.
+    pub fn with_features<I>(features: I, limits: WebGpuLimits) -> Self
+    where
+        I: IntoIterator<Item = WebGpuFeature>,
+    {
+        Self {
+            enabled_features: features.into_iter().collect(),
+            limits,
+        }
+    }
+}
+
+impl Default for WebGpuDeviceProfile {
+    fn default() -> Self {
+        Self::baseline()
+    }
+}
+
+/// Aggregated WebGPU feature and limit requirements for a shader or pipeline.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ShaderCompatRequirements {
+    pub required_features: BTreeSet<WebGpuFeature>,
+    pub bind_group_indices: BTreeSet<u32>,
+    pub bindings_per_group: BTreeMap<u32, usize>,
+    pub dynamic_uniform_buffers: usize,
+    pub dynamic_storage_buffers: usize,
+    pub storage_buffers_per_stage: usize,
+    pub uniform_buffers_per_stage: usize,
+    pub sampled_textures_per_stage: usize,
+    pub samplers_per_stage: usize,
+    pub storage_textures_per_stage: usize,
+    pub compute_workgroup_size: Option<[u32; 3]>,
+    pub compute_workgroup_storage_bytes: u32,
+}
+
+impl ShaderCompatRequirements {
+    /// Extract WebGPU feature and resource limit requirements from a [`naga::Module`].
+    pub fn from_naga_module(module: &naga::Module) -> Self {
+        let mut req = Self {
+            required_features: WebGpuFeature::required_for_naga_module(module),
+            compute_workgroup_storage_bytes: compute_workgroup_storage_bytes(module),
+            ..Self::default()
+        };
+
+        let mut module_counts = StageResourceCounts::default();
+        for (_, var) in module.global_variables.iter() {
+            tally_global_resource(module, var, &mut module_counts);
+            if let Some(binding) = &var.binding {
+                req.bind_group_indices.insert(binding.group);
+                let count = req.bindings_per_group.entry(binding.group).or_insert(0);
+                *count = count.saturating_add(1);
+            }
+        }
+
+        let mut worst_counts = if module.entry_points.is_empty() {
+            module_counts
+        } else {
+            StageResourceCounts::default()
+        };
+
+        for ep in &module.entry_points {
+            if ep.stage == naga::ShaderStage::Compute && ep.workgroup_size_overrides.is_none() {
+                req.compute_workgroup_size =
+                    select_worst_workgroup_size(req.compute_workgroup_size, ep.workgroup_size);
+            }
+
+            let referenced = collect_referenced_globals(module, &ep.function);
+            let mut stage_counts = StageResourceCounts::default();
+            for handle in referenced {
+                tally_global_resource(module, &module.global_variables[handle], &mut stage_counts);
+            }
+            let effective = if module.entry_points.len() == 1 {
+                stage_counts.elementwise_max(&module_counts)
+            } else {
+                stage_counts
+            };
+            worst_counts = worst_counts.elementwise_max(&effective);
+        }
+
+        req.storage_buffers_per_stage = worst_counts.storage_buffers;
+        req.uniform_buffers_per_stage = worst_counts.uniform_buffers;
+        req.sampled_textures_per_stage = worst_counts.sampled_textures;
+        req.samplers_per_stage = worst_counts.samplers;
+        req.storage_textures_per_stage = worst_counts.storage_textures;
+
+        req
+    }
+
+    /// Build requirements from WGSL source and a list of sampled/created WebGPU texture formats.
+    pub fn from_wgsl_and_formats(wgsl: &str, texture_formats: &[&str]) -> Self {
+        let mut req = Self {
+            required_features: WebGpuFeature::required_for_wgsl_source(wgsl),
+            ..Self::default()
+        };
+        req.add_texture_formats(texture_formats.iter().copied());
+        req
+    }
+
+    /// Record required WebGPU features implied by sampled/created texture formats (e.g. BC1–BC7,
+    /// `depth32float-stencil8`, ETC2, ASTC).
+    pub fn add_texture_formats<'a, I>(&mut self, formats: I)
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        for fmt in formats {
+            if let Some(feature) = WebGpuFeature::required_for_texture_format(fmt) {
+                self.required_features.insert(feature);
+            }
+        }
+    }
+
+    /// Record required WebGPU features implied by storage texture formats (e.g. `bgra8unorm`).
+    pub fn add_storage_texture_formats<'a, I>(&mut self, formats: I)
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        for fmt in formats {
+            if let Some(feature) = WebGpuFeature::required_for_storage_texture_format(fmt) {
+                self.required_features.insert(feature);
+            }
+        }
+    }
+
+    /// Record required WebGPU features implied by render/depth attachment formats.
+    pub fn add_render_attachment_formats<'a, I>(&mut self, formats: I)
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        for fmt in formats {
+            if let Some(feature) = WebGpuFeature::required_for_render_attachment_format(fmt) {
+                self.required_features.insert(feature);
+            }
+        }
+    }
+
+    /// Return the minimum `maxBindGroups` value needed (`max_group_index + 1`), or `0` if unused.
+    ///
+    /// Computed in `u64` so `u32::MAX` never overflows.
+    pub fn required_bind_groups(&self) -> u64 {
+        self.bind_group_indices
+            .last()
+            .map_or(0, |&max_group| u64::from(max_group) + 1)
+    }
+
+    /// Merge another requirement set into `self` using saturating/max/union operations so merging
+    /// across shader stages or pipeline passes never overflows and remains deterministic.
+    pub fn merge(&mut self, other: &Self) {
+        for &feature in &other.required_features {
+            self.required_features.insert(feature);
+        }
+        for &group in &other.bind_group_indices {
+            self.bind_group_indices.insert(group);
+        }
+        for (&group, &count) in &other.bindings_per_group {
+            let entry = self.bindings_per_group.entry(group).or_insert(0);
+            *entry = (*entry).max(count);
+        }
+        self.dynamic_uniform_buffers = self
+            .dynamic_uniform_buffers
+            .saturating_add(other.dynamic_uniform_buffers);
+        self.dynamic_storage_buffers = self
+            .dynamic_storage_buffers
+            .saturating_add(other.dynamic_storage_buffers);
+        self.storage_buffers_per_stage = self
+            .storage_buffers_per_stage
+            .max(other.storage_buffers_per_stage);
+        self.uniform_buffers_per_stage = self
+            .uniform_buffers_per_stage
+            .max(other.uniform_buffers_per_stage);
+        self.sampled_textures_per_stage = self
+            .sampled_textures_per_stage
+            .max(other.sampled_textures_per_stage);
+        self.samplers_per_stage = self.samplers_per_stage.max(other.samplers_per_stage);
+        self.storage_textures_per_stage = self
+            .storage_textures_per_stage
+            .max(other.storage_textures_per_stage);
+        if let Some(other_wg) = other.compute_workgroup_size {
+            self.compute_workgroup_size =
+                select_worst_workgroup_size(self.compute_workgroup_size, other_wg);
+        }
+        self.compute_workgroup_storage_bytes = self
+            .compute_workgroup_storage_bytes
+            .max(other.compute_workgroup_storage_bytes);
+    }
+}
+
+fn select_worst_workgroup_size(current: Option<[u32; 3]>, candidate: [u32; 3]) -> Option<[u32; 3]> {
+    let Some(cur) = current else {
+        return Some(candidate);
+    };
+    let rank = |s: [u32; 3]| -> (u8, u128, [u32; 3]) {
+        let has_zero = u8::from(s[0] == 0 || s[1] == 0 || s[2] == 0);
+        let total = u128::from(s[0]) * u128::from(s[1]) * u128::from(s[2]);
+        (has_zero, total, s)
+    };
+    if rank(candidate) > rank(cur) {
+        Some(candidate)
+    } else {
+        Some(cur)
+    }
+}
+
+/// Structured WebGPU limit violation recorded during compatibility guard evaluation.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LimitViolation {
+    pub kind: CompatIssueKind,
+    pub limit_name: &'static str,
+    pub actual: u128,
+    pub limit: u128,
+    pub detail: String,
+}
+
+/// Deterministic WebGPU feature and limit compatibility guard report.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WebGpuCompatReport {
+    /// Required optional WebGPU features in canonical ascending order.
+    pub required_features: Vec<WebGpuFeature>,
+    /// Required features absent from the target [`WebGpuDeviceProfile`], in canonical order.
+    pub missing_features: Vec<WebGpuFeature>,
+    /// Limit violations in canonical deterministic order.
+    pub limit_violations: Vec<LimitViolation>,
+    /// Unified compatibility audit sorted deterministically.
+    pub audit: CompatAudit,
+}
+
+impl WebGpuCompatReport {
+    /// Returns `true` when all required features are enabled, no limits are exceeded, and no
+    /// hard compatibility blockers exist.
+    pub fn is_compatible(&self) -> bool {
+        self.missing_features.is_empty()
+            && self.limit_violations.is_empty()
+            && !self.audit.has_blockers()
+    }
+
+    /// Canonical WebGPU feature names required by the shader/pipeline.
+    pub fn required_feature_names(&self) -> Vec<&'static str> {
+        self.required_features.iter().map(|f| f.as_str()).collect()
+    }
+
+    /// Canonical WebGPU feature names missing from the target device profile.
+    pub fn missing_feature_names(&self) -> Vec<&'static str> {
+        self.missing_features.iter().map(|f| f.as_str()).collect()
+    }
+}
+
+/// Evaluate [`ShaderCompatRequirements`] against a [`WebGpuDeviceProfile`].
+///
+/// Guarantees:
+/// - Deterministic canonical ordering of `required_features`, `missing_features`,
+///   `limit_violations`, and `audit.issues`.
+/// - Overflow-safe arithmetic (`u128` for workgroup products and bind-group counts).
+/// - Clean handling of empty/zero inputs (empty requirements pass; zero workgroup dimensions fail).
+pub fn evaluate_webgpu_compat(
+    req: &ShaderCompatRequirements,
+    profile: &WebGpuDeviceProfile,
+) -> WebGpuCompatReport {
+    let required_features: Vec<WebGpuFeature> = req.required_features.iter().copied().collect();
+    let mut missing_features = Vec::new();
+    let mut limit_violations = Vec::new();
+    let mut audit = CompatAudit::default();
+
+    // 1. Required WebGPU feature guards (canonical BTreeSet order).
+    for &feature in &required_features {
+        if !profile.enabled_features.contains(&feature) {
+            missing_features.push(feature);
+            let name = feature.as_str();
+            audit.push_unique(CompatIssue {
+                severity: CompatSeverity::Blocker,
+                kind: CompatIssueKind::RequiredFeatureMissing,
+                message: format!(
+                    "shader/pipeline requires WebGPU feature '{name}', which is not enabled on the target device profile"
+                ),
+                hint: Some(format!(
+                    "request '{name}' in GPUAdapter.requestDevice(requiredFeatures) or enable a fallback path"
+                )),
+            });
+        }
+    }
+
+    let limits = &profile.limits;
+
+    // 2. Bind group index ceiling (handles empty sets, max_bind_groups == 0, and group == u32::MAX).
+    if let Some(&max_group) = req.bind_group_indices.last()
+        && max_group >= limits.max_bind_groups
+    {
+        let required_groups = u128::from(max_group) + 1;
+        let max_groups = u128::from(limits.max_bind_groups);
+        let detail = format!(
+            "bind group index {max_group} requires {required_groups} bind groups, exceeding maxBindGroups ({max_groups})"
+        );
+        limit_violations.push(LimitViolation {
+            kind: CompatIssueKind::BindGroupLimitExceeded,
+            limit_name: "maxBindGroups",
+            actual: required_groups,
+            limit: max_groups,
+            detail: detail.clone(),
+        });
+        audit.push_once_per_kind(CompatIssue {
+            severity: CompatSeverity::Blocker,
+            kind: CompatIssueKind::BindGroupLimitExceeded,
+            message: detail,
+            hint: Some(format!(
+                "pack descriptor sets into <= {} bind groups",
+                limits.max_bind_groups
+            )),
+        });
+    }
+
+    // 3. Per-bind-group binding count ceiling (deterministic BTreeMap group order).
+    for (&group, &count) in &req.bindings_per_group {
+        if count > limits.max_bindings_per_bind_group {
+            let detail = format!(
+                "@group({group}) uses {count} bindings, exceeding maxBindingsPerBindGroup ({})",
+                limits.max_bindings_per_bind_group
+            );
+            limit_violations.push(LimitViolation {
+                kind: CompatIssueKind::BindingsPerBindGroupLimitExceeded,
+                limit_name: "maxBindingsPerBindGroup",
+                actual: count as u128,
+                limit: limits.max_bindings_per_bind_group as u128,
+                detail: detail.clone(),
+            });
+            audit.push_once_per_kind(CompatIssue {
+                severity: CompatSeverity::Blocker,
+                kind: CompatIssueKind::BindingsPerBindGroupLimitExceeded,
+                message: detail,
+                hint: Some(format!(
+                    "reduce bindings in @group({group}) to <= {}",
+                    limits.max_bindings_per_bind_group
+                )),
+            });
+        }
+    }
+
+    // 4. Pipeline-layout dynamic buffer limits.
+    if req.dynamic_uniform_buffers > limits.max_dynamic_uniform_buffers_per_pipeline_layout {
+        let detail = format!(
+            "pipeline uses {} dynamic uniform buffers, exceeding maxDynamicUniformBuffersPerPipelineLayout ({})",
+            req.dynamic_uniform_buffers, limits.max_dynamic_uniform_buffers_per_pipeline_layout
+        );
+        limit_violations.push(LimitViolation {
+            kind: CompatIssueKind::DynamicUniformBufferLimitExceeded,
+            limit_name: "maxDynamicUniformBuffersPerPipelineLayout",
+            actual: req.dynamic_uniform_buffers as u128,
+            limit: limits.max_dynamic_uniform_buffers_per_pipeline_layout as u128,
+            detail: detail.clone(),
+        });
+        audit.push_once_per_kind(CompatIssue {
+            severity: CompatSeverity::Warning,
+            kind: CompatIssueKind::DynamicUniformBufferLimitExceeded,
+            message: detail,
+            hint: Some(
+                "coalesce dynamic uniform rings or request higher maxDynamicUniformBuffersPerPipelineLayout"
+                    .to_string(),
+            ),
+        });
+    }
+
+    if req.dynamic_storage_buffers > limits.max_dynamic_storage_buffers_per_pipeline_layout {
+        let detail = format!(
+            "pipeline uses {} dynamic storage buffers, exceeding maxDynamicStorageBuffersPerPipelineLayout ({})",
+            req.dynamic_storage_buffers, limits.max_dynamic_storage_buffers_per_pipeline_layout
+        );
+        limit_violations.push(LimitViolation {
+            kind: CompatIssueKind::DynamicStorageBufferLimitExceeded,
+            limit_name: "maxDynamicStorageBuffersPerPipelineLayout",
+            actual: req.dynamic_storage_buffers as u128,
+            limit: limits.max_dynamic_storage_buffers_per_pipeline_layout as u128,
+            detail: detail.clone(),
+        });
+        audit.push_once_per_kind(CompatIssue {
+            severity: CompatSeverity::Warning,
+            kind: CompatIssueKind::DynamicStorageBufferLimitExceeded,
+            message: detail,
+            hint: Some(
+                "reduce dynamic storage buffer bindings or request higher maxDynamicStorageBuffersPerPipelineLayout"
+                    .to_string(),
+            ),
+        });
+    }
+
+    // 5. Per-shader-stage resource limits.
+    let stage_counts = StageResourceCounts {
+        storage_buffers: req.storage_buffers_per_stage,
+        uniform_buffers: req.uniform_buffers_per_stage,
+        sampled_textures: req.sampled_textures_per_stage,
+        samplers: req.samplers_per_stage,
+        storage_textures: req.storage_textures_per_stage,
+    };
+    check_stage_resource_limits(None, &stage_counts, limits, &mut audit);
+
+    if req.storage_buffers_per_stage > limits.max_storage_buffers_per_shader_stage {
+        limit_violations.push(LimitViolation {
+            kind: CompatIssueKind::StorageBufferLimitExceeded,
+            limit_name: "maxStorageBuffersPerShaderStage",
+            actual: req.storage_buffers_per_stage as u128,
+            limit: limits.max_storage_buffers_per_shader_stage as u128,
+            detail: format!(
+                "stage uses {} storage buffers, exceeding maxStorageBuffersPerShaderStage ({})",
+                req.storage_buffers_per_stage, limits.max_storage_buffers_per_shader_stage
+            ),
+        });
+    }
+    if req.uniform_buffers_per_stage > limits.max_uniform_buffers_per_shader_stage {
+        limit_violations.push(LimitViolation {
+            kind: CompatIssueKind::UniformBufferLimitExceeded,
+            limit_name: "maxUniformBuffersPerShaderStage",
+            actual: req.uniform_buffers_per_stage as u128,
+            limit: limits.max_uniform_buffers_per_shader_stage as u128,
+            detail: format!(
+                "stage uses {} uniform buffers, exceeding maxUniformBuffersPerShaderStage ({})",
+                req.uniform_buffers_per_stage, limits.max_uniform_buffers_per_shader_stage
+            ),
+        });
+    }
+    if req.sampled_textures_per_stage > limits.max_sampled_textures_per_shader_stage {
+        limit_violations.push(LimitViolation {
+            kind: CompatIssueKind::SampledTextureLimitExceeded,
+            limit_name: "maxSampledTexturesPerShaderStage",
+            actual: req.sampled_textures_per_stage as u128,
+            limit: limits.max_sampled_textures_per_shader_stage as u128,
+            detail: format!(
+                "stage uses {} sampled textures, exceeding maxSampledTexturesPerShaderStage ({})",
+                req.sampled_textures_per_stage, limits.max_sampled_textures_per_shader_stage
+            ),
+        });
+    }
+    if req.samplers_per_stage > limits.max_samplers_per_shader_stage {
+        limit_violations.push(LimitViolation {
+            kind: CompatIssueKind::SamplerLimitExceeded,
+            limit_name: "maxSamplersPerShaderStage",
+            actual: req.samplers_per_stage as u128,
+            limit: limits.max_samplers_per_shader_stage as u128,
+            detail: format!(
+                "stage uses {} samplers, exceeding maxSamplersPerShaderStage ({})",
+                req.samplers_per_stage, limits.max_samplers_per_shader_stage
+            ),
+        });
+    }
+    if req.storage_textures_per_stage > limits.max_storage_textures_per_shader_stage {
+        limit_violations.push(LimitViolation {
+            kind: CompatIssueKind::StorageTextureLimitExceeded,
+            limit_name: "maxStorageTexturesPerShaderStage",
+            actual: req.storage_textures_per_stage as u128,
+            limit: limits.max_storage_textures_per_shader_stage as u128,
+            detail: format!(
+                "stage uses {} storage textures, exceeding maxStorageTexturesPerShaderStage ({})",
+                req.storage_textures_per_stage, limits.max_storage_textures_per_shader_stage
+            ),
+        });
+    }
+
+    // 6. Compute workgroup dimensions & total invocations (overflow-safe u128 math + zero guard).
+    if let Some(size @ [x, y, z]) = req.compute_workgroup_size {
+        check_workgroup_size_with_limits(size, None, limits, &mut audit);
+        let total = u128::from(x) * u128::from(y) * u128::from(z);
+
+        if x == 0 || x > limits.max_compute_workgroup_size_x {
+            limit_violations.push(LimitViolation {
+                kind: CompatIssueKind::WorkgroupSizeLimitExceeded,
+                limit_name: "maxComputeWorkgroupSizeX",
+                actual: u128::from(x),
+                limit: u128::from(limits.max_compute_workgroup_size_x),
+                detail: format!(
+                    "workgroup_size.x = {x} violates valid range 1..={}",
+                    limits.max_compute_workgroup_size_x
+                ),
+            });
+        }
+        if y == 0 || y > limits.max_compute_workgroup_size_y {
+            limit_violations.push(LimitViolation {
+                kind: CompatIssueKind::WorkgroupSizeLimitExceeded,
+                limit_name: "maxComputeWorkgroupSizeY",
+                actual: u128::from(y),
+                limit: u128::from(limits.max_compute_workgroup_size_y),
+                detail: format!(
+                    "workgroup_size.y = {y} violates valid range 1..={}",
+                    limits.max_compute_workgroup_size_y
+                ),
+            });
+        }
+        if z == 0 || z > limits.max_compute_workgroup_size_z {
+            limit_violations.push(LimitViolation {
+                kind: CompatIssueKind::WorkgroupSizeLimitExceeded,
+                limit_name: "maxComputeWorkgroupSizeZ",
+                actual: u128::from(z),
+                limit: u128::from(limits.max_compute_workgroup_size_z),
+                detail: format!(
+                    "workgroup_size.z = {z} violates valid range 1..={}",
+                    limits.max_compute_workgroup_size_z
+                ),
+            });
+        }
+        if total == 0 || total > u128::from(limits.max_compute_invocations_per_workgroup) {
+            limit_violations.push(LimitViolation {
+                kind: CompatIssueKind::WorkgroupSizeLimitExceeded,
+                limit_name: "maxComputeInvocationsPerWorkgroup",
+                actual: total,
+                limit: u128::from(limits.max_compute_invocations_per_workgroup),
+                detail: format!(
+                    "workgroup_size({x}, {y}, {z}) = {total} invocations violates valid range 1..={}",
+                    limits.max_compute_invocations_per_workgroup
+                ),
+            });
+        }
+    }
+
+    // 7. Compute workgroup storage budget.
+    if req.compute_workgroup_storage_bytes > limits.max_compute_workgroup_storage_size {
+        let detail = format!(
+            "workgroup storage uses {} bytes, exceeding maxComputeWorkgroupStorageSize ({})",
+            req.compute_workgroup_storage_bytes, limits.max_compute_workgroup_storage_size
+        );
+        limit_violations.push(LimitViolation {
+            kind: CompatIssueKind::WorkgroupStorageLimitExceeded,
+            limit_name: "maxComputeWorkgroupStorageSize",
+            actual: u128::from(req.compute_workgroup_storage_bytes),
+            limit: u128::from(limits.max_compute_workgroup_storage_size),
+            detail: detail.clone(),
+        });
+        audit.push_once_per_kind(CompatIssue {
+            severity: CompatSeverity::Blocker,
+            kind: CompatIssueKind::WorkgroupStorageLimitExceeded,
+            message: detail,
+            hint: Some(format!(
+                "reduce var<workgroup> shared memory usage to <= {} bytes",
+                limits.max_compute_workgroup_storage_size
+            )),
+        });
+    }
+
+    limit_violations.sort();
+    audit.sort_deterministic();
+
+    WebGpuCompatReport {
+        required_features,
+        missing_features,
+        limit_violations,
+        audit,
+    }
+}
+
+/// Evaluate a parsed [`naga::Module`] and associated texture formats against a
+/// [`WebGpuDeviceProfile`], unifying IR structural blockers, feature guards, and limit checks.
+pub fn evaluate_naga_module_compat(
+    module: &naga::Module,
+    texture_formats: &[&str],
+    profile: &WebGpuDeviceProfile,
+) -> WebGpuCompatReport {
+    let mut req = ShaderCompatRequirements::from_naga_module(module);
+    req.add_texture_formats(texture_formats.iter().copied());
+    let mut report = evaluate_webgpu_compat(&req, profile);
+    report
+        .audit
+        .merge(audit_naga_module_with_limits(module, &profile.limits));
+    report
 }
 
 // ---------------------------------------------------------------------------
@@ -1709,7 +3196,9 @@ pub fn render_compat_audit_report_md(records: &[ShaderAuditRecord]) -> String {
         .iter()
         .filter(|r| r.audit.rewritten_instructions > 0)
         .count();
-    let total_rewritten_insts: usize = records.iter().map(|r| r.audit.rewritten_instructions).sum();
+    let total_rewritten_insts: usize = records
+        .iter()
+        .fold(0usize, |acc, r| acc.saturating_add(r.audit.rewritten_instructions));
     let shaders_with_blockers = records
         .iter()
         .filter(|r| r.audit.has_blockers() || r.stream_error.is_some() || !r.lowered_to_wgsl)
@@ -1773,7 +3262,7 @@ pub fn render_compat_audit_report_md(records: &[ShaderAuditRecord]) -> String {
                     occurrences: 0,
                     hint: issue.hint.clone(),
                 });
-            bucket.occurrences += 1;
+            bucket.occurrences = bucket.occurrences.saturating_add(1);
             bucket.shader_paths.insert(record.source_path.clone());
             if bucket.hint.is_none() && issue.hint.is_some() {
                 bucket.hint = issue.hint.clone();
@@ -1822,10 +3311,17 @@ pub fn render_compat_audit_report_md(records: &[ShaderAuditRecord]) -> String {
         out.push('\n');
     }
 
-    let failing_records: Vec<&ShaderAuditRecord> = records
+    let mut failing_records: Vec<&ShaderAuditRecord> = records
         .iter()
         .filter(|r| !r.lowered_to_wgsl || r.audit.has_blockers() || r.stream_error.is_some())
         .collect();
+    failing_records.sort_by(|a, b| {
+        a.source_path
+            .cmp(&b.source_path)
+            .then_with(|| a.stage.cmp(&b.stage))
+            .then_with(|| a.stream_error.cmp(&b.stream_error))
+            .then_with(|| a.naga_error.cmp(&b.naga_error))
+    });
 
     if !failing_records.is_empty() {
         out.push_str("## Shaders Requiring Attention\n\n");
@@ -1837,10 +3333,11 @@ pub fn render_compat_audit_report_md(records: &[ShaderAuditRecord]) -> String {
             } else {
                 "lowered with baseline blockers".to_string()
             };
-            let blocker_kinds = rec
-                .audit
-                .blockers()
-                .map(|b| format!("`{}`", b.kind))
+            let unique_blocker_kinds: BTreeSet<CompatIssueKind> =
+                rec.audit.blockers().map(|b| b.kind).collect();
+            let blocker_kinds = unique_blocker_kinds
+                .into_iter()
+                .map(|kind| format!("`{kind}`"))
                 .collect::<Vec<_>>()
                 .join(", ");
             if blocker_kinds.is_empty() {
@@ -2237,7 +3734,7 @@ mod tests {
         let sanitized = sanitize_spirv_words(&words, &SanitizeOptions::default()).unwrap();
         assert!(sanitized.audit.has_blockers());
 
-        let blocker_kinds: HashSet<CompatIssueKind> =
+        let blocker_kinds: BTreeSet<CompatIssueKind> =
             sanitized.audit.blockers().map(|i| i.kind).collect();
         for expected in [
             CompatIssueKind::RayTracing,
@@ -2514,5 +4011,606 @@ mod tests {
         assert!(md.contains("RayTracing"));
         assert!(md.contains("cs_float.spv"));
         assert!(md.contains("rt_miss.spv"));
+    }
+
+    // -----------------------------------------------------------------------
+    // S54: WebGPU Feature-Compatibility, Limit Guards & Deterministic Ordering
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn webgpu_feature_catalog_is_canonically_ordered_and_roundtrips() {
+        for window in WebGpuFeature::ALL.windows(2) {
+            assert!(
+                window[0] < window[1],
+                "WebGpuFeature enum order must be strictly ascending: {:?} vs {:?}",
+                window[0],
+                window[1]
+            );
+            assert!(
+                window[0].as_str() < window[1].as_str(),
+                "WebGpuFeature::as_str() order must match enum Ord: {} vs {}",
+                window[0].as_str(),
+                window[1].as_str()
+            );
+        }
+
+        for &feature in WebGpuFeature::ALL {
+            assert_eq!(WebGpuFeature::from_name(feature.as_str()), Some(feature));
+            assert_eq!(
+                WebGpuFeature::from_name(&format!("  {}  ", feature.as_str().to_ascii_uppercase())),
+                Some(feature)
+            );
+        }
+
+        assert_eq!(WebGpuFeature::from_name(""), None);
+        assert_eq!(WebGpuFeature::from_name("   "), None);
+        assert_eq!(WebGpuFeature::from_name("unknown-feature"), None);
+    }
+
+    #[test]
+    fn texture_and_attachment_format_feature_detection_covers_bc1_to_bc7_and_depth32s8() {
+        // All BC1-BC7 formats map to texture-compression-bc.
+        for bc_fmt in [
+            "bc1-rgba-unorm",
+            "bc1-rgba-unorm-srgb",
+            "bc2-rgba-unorm",
+            "bc2-rgba-unorm-srgb",
+            "bc3-rgba-unorm",
+            "bc3-rgba-unorm-srgb",
+            "bc4-r-unorm",
+            "bc4-r-snorm",
+            "bc5-rg-unorm",
+            "bc5-rg-snorm",
+            "bc6h-rgb-ufloat",
+            "bc6h-rgb-float",
+            "bc7-rgba-unorm",
+            "BC7-RGBA-UNORM-SRGB",
+        ] {
+            assert_eq!(
+                WebGpuFeature::required_for_texture_format(bc_fmt),
+                Some(WebGpuFeature::TextureCompressionBc),
+                "expected texture-compression-bc for {bc_fmt}"
+            );
+        }
+
+        assert_eq!(
+            WebGpuFeature::required_for_texture_format("depth32float-stencil8"),
+            Some(WebGpuFeature::Depth32FloatStencil8)
+        );
+        assert_eq!(
+            WebGpuFeature::required_for_render_attachment_format("depth32float-stencil8"),
+            Some(WebGpuFeature::Depth32FloatStencil8)
+        );
+        assert_eq!(
+            WebGpuFeature::required_for_render_attachment_format("rg11b10ufloat"),
+            Some(WebGpuFeature::Rg11b10UfloatRenderable)
+        );
+        assert_eq!(
+            WebGpuFeature::required_for_storage_texture_format("bgra8unorm"),
+            Some(WebGpuFeature::Bgra8UnormStorage)
+        );
+        assert_eq!(
+            WebGpuFeature::required_for_texture_format("etc2-rgba8unorm"),
+            Some(WebGpuFeature::TextureCompressionEtc2)
+        );
+        assert_eq!(
+            WebGpuFeature::required_for_texture_format("astc-4x4-unorm-srgb"),
+            Some(WebGpuFeature::TextureCompressionAstc)
+        );
+
+        // Baseline, empty, whitespace, and malformed formats return None cleanly.
+        for core_or_empty in [
+            "",
+            "   ",
+            "rgba8unorm",
+            "bgra8unorm",
+            "rgba16float",
+            "depth24plus",
+            "depth32float",
+            "astc-99x99-unorm",
+        ] {
+            assert_eq!(
+                WebGpuFeature::required_for_texture_format(core_or_empty),
+                None,
+                "unexpected feature for {core_or_empty:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wgsl_feature_scanner_detects_features_and_ignores_comments_and_empty_input() {
+        assert!(WebGpuFeature::required_for_wgsl_source("").is_empty());
+        assert!(WebGpuFeature::required_for_wgsl_source("   \n\t  ").is_empty());
+
+        // Comments (including nested block comments) and lookalike identifiers must NOT trigger.
+        let commented_only = r#"
+            // enable f16;
+            /* enable subgroups; /* nested enable clip_distances; */
+               @blend_src(0) texture_storage_2d<bgra8unorm, write> */
+            struct MyF16Helper { my_f16_val: f32, subgroup_emul: u32 };
+            @compute @workgroup_size(8, 8, 1)
+            fn main() { let x: f32 = 1.0; }
+        "#;
+        assert!(
+            WebGpuFeature::required_for_wgsl_source(commented_only).is_empty(),
+            "comments and lookalike identifiers must not produce false positives"
+        );
+
+        // Combined optional features in unsorted order return canonically sorted BTreeSet.
+        let full_wgsl = r#"
+            enable subgroups, f16;
+            enable dual_source_blending;
+            enable clip_distances;
+            @group(0) @binding(0) var out_tex: texture_storage_2d<bgra8unorm, write>;
+            struct FsOut {
+                @location(0) @blend_src(0) c0: vec4<f16>,
+                @location(0) @blend_src(1) c1: vec4<f16>,
+            };
+            @compute @workgroup_size(64, 1, 1)
+            fn cs_main(@builtin(subgroup_invocation_id) lane: u32) {
+                let b = subgroupBallot(lane == 0u);
+                _ = b;
+            }
+        "#;
+        let detected: Vec<&'static str> = WebGpuFeature::required_for_wgsl_source(full_wgsl)
+            .into_iter()
+            .map(|f| f.as_str())
+            .collect();
+        assert_eq!(
+            detected,
+            vec![
+                "bgra8unorm-storage",
+                "clip-distances",
+                "dual-source-blending",
+                "shader-f16",
+                "subgroups",
+            ]
+        );
+    }
+
+    #[test]
+    fn spirv_and_naga_feature_detection_handles_f16_subgroups_bgra8_and_malformed_inputs() {
+        // 1. SPIR-V with Float16 + Subgroup + ClipDistance capabilities.
+        let mut b = SpirvBuilder::new();
+        let void_ty = b.id();
+        let f16_ty = b.id();
+        let fn_ty = b.id();
+        let main_fn = b.id();
+        let entry_label = b.id();
+
+        b.inst(OP_CAPABILITY, &[CAP_SHADER]);
+        b.inst(OP_CAPABILITY, &[CAP_GROUP_NON_UNIFORM_BALLOT]);
+        b.inst(OP_CAPABILITY, &[CAP_FLOAT16]);
+        b.inst(OP_CAPABILITY, &[CAP_CLIP_DISTANCE]);
+        b.inst(OP_MEMORY_MODEL, &[ADDRESSING_LOGICAL, MEMORY_GLSL450]);
+        b.inst_with_string(
+            OP_ENTRY_POINT,
+            &[EXEC_MODEL_GL_COMPUTE, main_fn],
+            "main",
+            &[],
+        );
+        b.inst(OP_EXECUTION_MODE, &[main_fn, EXEC_MODE_LOCAL_SIZE, 64, 1, 1]);
+        b.inst(OP_TYPE_VOID, &[void_ty]);
+        b.inst(OP_TYPE_FLOAT, &[f16_ty, 16]);
+        b.inst(OP_TYPE_FUNCTION, &[fn_ty, void_ty]);
+        b.inst(OP_FUNCTION, &[void_ty, main_fn, 0, fn_ty]);
+        b.inst(OP_LABEL, &[entry_label]);
+        b.inst(OP_RETURN, &[]);
+        b.inst(OP_FUNCTION_END, &[]);
+
+        let words = spirv_bytes_to_words(&b.finish_bytes()).unwrap();
+        let spv_features: Vec<&'static str> = WebGpuFeature::required_for_spirv_words(&words)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.as_str())
+            .collect();
+        assert_eq!(spv_features, vec!["clip-distances", "shader-f16", "subgroups"]);
+
+        // Empty/malformed SPIR-V returns clean error without panicking.
+        assert!(matches!(
+            WebGpuFeature::required_for_spirv_words(&[]),
+            Err(SpirvStreamError::TooShort { .. })
+        ));
+
+        // 2. Programmatic Naga module with f16, Bgra8Unorm storage texture, ClipDistance,
+        //    dual-source blending, and SubgroupSize built-in.
+        let mut module = naga::Module::default();
+        let f16_handle = module.types.insert(
+            naga::Type {
+                name: None,
+                inner: naga::TypeInner::Scalar(naga::Scalar {
+                    kind: naga::ScalarKind::Float,
+                    width: 2,
+                }),
+            },
+            naga::Span::UNDEFINED,
+        );
+        let _bgra_storage = module.types.insert(
+            naga::Type {
+                name: None,
+                inner: naga::TypeInner::Image {
+                    dim: naga::ImageDimension::D2,
+                    arrayed: false,
+                    class: naga::ImageClass::Storage {
+                        format: naga::StorageFormat::Bgra8Unorm,
+                        access: naga::StorageAccess::STORE,
+                    },
+                },
+            },
+            naga::Span::UNDEFINED,
+        );
+        let u32_ty = module.types.insert(
+            naga::Type {
+                name: None,
+                inner: naga::TypeInner::Scalar(naga::Scalar::U32),
+            },
+            naga::Span::UNDEFINED,
+        );
+        let _struct_ty = module.types.insert(
+            naga::Type {
+                name: Some("Out".to_string()),
+                inner: naga::TypeInner::Struct {
+                    members: vec![
+                        naga::StructMember {
+                            name: Some("clip".to_string()),
+                            ty: f16_handle,
+                            binding: Some(naga::Binding::BuiltIn(naga::BuiltIn::ClipDistances)),
+                            offset: 0,
+                        },
+                        naga::StructMember {
+                            name: Some("blend1".to_string()),
+                            ty: f16_handle,
+                            binding: Some(naga::Binding::Location {
+                                location: 0,
+                                interpolation: None,
+                                sampling: None,
+                                blend_src: Some(1),
+                                per_primitive: false,
+                            }),
+                            offset: 4,
+                        },
+                    ],
+                    span: 8,
+                },
+            },
+            naga::Span::UNDEFINED,
+        );
+        let mut func = naga::Function::default();
+        func.arguments.push(naga::FunctionArgument {
+            name: Some("sg_size".to_string()),
+            ty: u32_ty,
+            binding: Some(naga::Binding::BuiltIn(naga::BuiltIn::SubgroupSize)),
+        });
+        module.entry_points.push(naga::EntryPoint {
+            name: "cs_main".to_string(),
+            stage: naga::ShaderStage::Compute,
+            early_depth_test: None,
+            workgroup_size: [64, 1, 1],
+            workgroup_size_overrides: None,
+            function: func,
+            mesh_info: None,
+            task_payload: None,
+            incoming_ray_payload: None,
+        });
+
+        let naga_features: Vec<&'static str> = WebGpuFeature::required_for_naga_module(&module)
+            .into_iter()
+            .map(|f| f.as_str())
+            .collect();
+        assert_eq!(
+            naga_features,
+            vec![
+                "bgra8unorm-storage",
+                "clip-distances",
+                "dual-source-blending",
+                "shader-f16",
+                "subgroups",
+            ]
+        );
+    }
+
+    #[test]
+    fn limit_boundary_checks_enforce_exact_webgpu_thresholds() {
+        let profile = WebGpuDeviceProfile::baseline();
+
+        // Exact-at-limit configuration MUST pass with zero violations.
+        let mut at_limit = ShaderCompatRequirements::default();
+        at_limit.bind_group_indices.insert(3); // group 3 => 4 bind groups (limit 4)
+        at_limit
+            .bindings_per_group
+            .insert(0, WEBGPU_MAX_BINDINGS_PER_BIND_GROUP);
+        at_limit.dynamic_uniform_buffers = WEBGPU_MAX_DYNAMIC_UNIFORM_BUFFERS_PER_PIPELINE_LAYOUT;
+        at_limit.dynamic_storage_buffers = WEBGPU_MAX_DYNAMIC_STORAGE_BUFFERS_PER_PIPELINE_LAYOUT;
+        at_limit.storage_buffers_per_stage = WEBGPU_MAX_STORAGE_BUFFERS_PER_SHADER_STAGE;
+        at_limit.uniform_buffers_per_stage = WEBGPU_MAX_UNIFORM_BUFFERS_PER_SHADER_STAGE;
+        at_limit.sampled_textures_per_stage = WEBGPU_MAX_SAMPLED_TEXTURES_PER_SHADER_STAGE;
+        at_limit.samplers_per_stage = WEBGPU_MAX_SAMPLERS_PER_SHADER_STAGE;
+        at_limit.storage_textures_per_stage = WEBGPU_MAX_STORAGE_TEXTURES_PER_SHADER_STAGE;
+        at_limit.compute_workgroup_size = Some([16, 16, 1]); // 256 invocations
+        at_limit.compute_workgroup_storage_bytes = WEBGPU_MAX_COMPUTE_WORKGROUP_STORAGE_SIZE;
+
+        let ok = evaluate_webgpu_compat(&at_limit, &profile);
+        assert!(ok.is_compatible(), "at-limit requirements must pass: {ok:?}");
+        assert!(ok.limit_violations.is_empty());
+        assert!(ok.audit.issues.is_empty());
+
+        // Single-axis boundaries [256,1,1], [1,256,1], [1,1,64] also pass.
+        for valid_wg in [[256, 1, 1], [1, 256, 1], [1, 1, 64], [1, 1, 1]] {
+            let req = ShaderCompatRequirements {
+                compute_workgroup_size: Some(valid_wg),
+                ..ShaderCompatRequirements::default()
+            };
+            let rep = evaluate_webgpu_compat(&req, &profile);
+            assert!(rep.is_compatible(), "workgroup {valid_wg:?} must pass: {rep:?}");
+        }
+
+        // Limit + 1 for every single limit category MUST trigger a structured LimitViolation.
+        let mut over = at_limit.clone();
+        over.bind_group_indices.insert(4);
+        over.bindings_per_group
+            .insert(0, WEBGPU_MAX_BINDINGS_PER_BIND_GROUP + 1);
+        over.dynamic_uniform_buffers += 1;
+        over.dynamic_storage_buffers += 1;
+        over.storage_buffers_per_stage += 1;
+        over.uniform_buffers_per_stage += 1;
+        over.sampled_textures_per_stage += 1;
+        over.samplers_per_stage += 1;
+        over.storage_textures_per_stage += 1;
+        over.compute_workgroup_size = Some([257, 1, 1]);
+        over.compute_workgroup_storage_bytes += 1;
+
+        let rep = evaluate_webgpu_compat(&over, &profile);
+        assert!(!rep.is_compatible());
+
+        let violated_limits: BTreeSet<&'static str> =
+            rep.limit_violations.iter().map(|v| v.limit_name).collect();
+        for expected in [
+            "maxBindGroups",
+            "maxBindingsPerBindGroup",
+            "maxDynamicUniformBuffersPerPipelineLayout",
+            "maxDynamicStorageBuffersPerPipelineLayout",
+            "maxStorageBuffersPerShaderStage",
+            "maxUniformBuffersPerShaderStage",
+            "maxSampledTexturesPerShaderStage",
+            "maxSamplersPerShaderStage",
+            "maxStorageTexturesPerShaderStage",
+            "maxComputeWorkgroupSizeX",
+            "maxComputeInvocationsPerWorkgroup",
+            "maxComputeWorkgroupStorageSize",
+        ] {
+            assert!(
+                violated_limits.contains(expected),
+                "expected limit violation {expected} in {violated_limits:?}"
+            );
+        }
+
+        // Z-axis boundary (65 > 64) and invocation-product boundary (16*16*2 = 512 > 256).
+        let over_z = ShaderCompatRequirements {
+            compute_workgroup_size: Some([1, 1, 65]),
+            ..ShaderCompatRequirements::default()
+        };
+        let rep_z = evaluate_webgpu_compat(&over_z, &profile);
+        assert!(!rep_z.is_compatible());
+        assert!(
+            rep_z
+                .limit_violations
+                .iter()
+                .any(|v| v.limit_name == "maxComputeWorkgroupSizeZ" && v.actual == 65 && v.limit == 64)
+        );
+    }
+
+    #[test]
+    fn overflow_and_empty_or_zero_inputs_are_guarded_cleanly() {
+        // 1. Empty inputs across public entry points.
+        let empty_req = ShaderCompatRequirements::default();
+        assert_eq!(empty_req.required_bind_groups(), 0);
+        assert!(evaluate_webgpu_compat(&empty_req, &WebGpuDeviceProfile::baseline()).is_compatible());
+        assert!(spirv_words_to_bytes(&[]).is_empty());
+        assert!(audit_naga_module(&naga::Module::default()).issues.is_empty());
+        let empty_md = render_compat_audit_report_md(&[]);
+        assert!(empty_md.contains("| Total `.spv` files audited | 0 |"));
+        assert!(empty_md.contains("No compatibility issues or rewrites recorded."));
+
+        // 2. Zero-limit profile: empty bind groups pass; group 0 fails cleanly without underflow.
+        let mut zero_group_profile = WebGpuDeviceProfile::baseline();
+        zero_group_profile.limits.max_bind_groups = 0;
+        assert!(evaluate_webgpu_compat(&empty_req, &zero_group_profile).is_compatible());
+        let mut group0_req = ShaderCompatRequirements::default();
+        group0_req.bind_group_indices.insert(0);
+        let group0_rep = evaluate_webgpu_compat(&group0_req, &zero_group_profile);
+        assert!(!group0_rep.is_compatible());
+        assert_eq!(group0_rep.limit_violations[0].actual, 1);
+        assert_eq!(group0_rep.limit_violations[0].limit, 0);
+
+        // 3. Zero compute workgroup dimensions fail cleanly with explicit diagnostic.
+        for zero_wg in [[0, 1, 1], [1, 0, 1], [1, 1, 0], [0, 0, 0]] {
+            let req = ShaderCompatRequirements {
+                compute_workgroup_size: Some(zero_wg),
+                ..ShaderCompatRequirements::default()
+            };
+            let rep = evaluate_webgpu_compat(&req, &WebGpuDeviceProfile::baseline());
+            assert!(!rep.is_compatible(), "zero workgroup {zero_wg:?} must fail");
+            assert!(rep.audit.blockers().any(|i| {
+                i.kind == CompatIssueKind::WorkgroupSizeLimitExceeded
+                    && i.message.contains("zero dimension")
+            }));
+        }
+
+        // 4. Extreme u32::MAX values never overflow u32/u64 multiplication or +1 arithmetic.
+        let mut extreme = ShaderCompatRequirements::default();
+        extreme.bind_group_indices.insert(u32::MAX);
+        extreme.compute_workgroup_size = Some([u32::MAX, u32::MAX, u32::MAX]);
+        assert_eq!(extreme.required_bind_groups(), u64::from(u32::MAX) + 1);
+
+        let extreme_rep = evaluate_webgpu_compat(&extreme, &WebGpuDeviceProfile::baseline());
+        assert!(!extreme_rep.is_compatible());
+        let expected_inv = u128::from(u32::MAX) * u128::from(u32::MAX) * u128::from(u32::MAX);
+        assert!(extreme_rep.limit_violations.iter().any(|v| {
+            v.limit_name == "maxComputeInvocationsPerWorkgroup" && v.actual == expected_inv
+        }));
+        assert!(extreme_rep.limit_violations.iter().any(|v| {
+            v.limit_name == "maxBindGroups" && v.actual == u128::from(u32::MAX) + 1
+        }));
+
+        // 5. Saturating merge for usize::MAX counters in ShaderCompatRequirements and CompatAudit.
+        let mut req_a = ShaderCompatRequirements {
+            dynamic_uniform_buffers: usize::MAX,
+            dynamic_storage_buffers: usize::MAX,
+            ..ShaderCompatRequirements::default()
+        };
+        let req_b = ShaderCompatRequirements {
+            dynamic_uniform_buffers: 10,
+            dynamic_storage_buffers: 10,
+            ..ShaderCompatRequirements::default()
+        };
+        req_a.merge(&req_b);
+        assert_eq!(req_a.dynamic_uniform_buffers, usize::MAX);
+        assert_eq!(req_a.dynamic_storage_buffers, usize::MAX);
+
+        let mut audit_a = CompatAudit {
+            rewritten_instructions: usize::MAX,
+            ..CompatAudit::default()
+        };
+        let audit_b = CompatAudit {
+            rewritten_instructions: 42,
+            ..CompatAudit::default()
+        };
+        audit_a.merge(audit_b);
+        assert_eq!(audit_a.rewritten_instructions, usize::MAX);
+    }
+
+    #[test]
+    fn deterministic_diagnostic_and_feature_ordering_across_input_permutations() {
+        // 1. Main Menu target satisfies BC + depth32float-stencil8, while missing shader-f16 & subgroups
+        //    are reported in identical canonical order regardless of format/feature insertion order.
+        let wgsl = "enable subgroups, f16; @compute @workgroup_size(64, 1, 1) fn main() {}";
+        let req_order_1 = ShaderCompatRequirements::from_wgsl_and_formats(
+            wgsl,
+            &["bc7-rgba-unorm", "depth32float-stencil8", "bc1-rgba-unorm"],
+        );
+        let req_order_2 = ShaderCompatRequirements::from_wgsl_and_formats(
+            wgsl,
+            &["depth32float-stencil8", "bc1-rgba-unorm", "bc7-rgba-unorm"],
+        );
+
+        let menu_profile = WebGpuDeviceProfile::main_menu_target();
+        let rep_1 = evaluate_webgpu_compat(&req_order_1, &menu_profile);
+        let rep_2 = evaluate_webgpu_compat(&req_order_2, &menu_profile);
+        assert_eq!(rep_1, rep_2);
+        assert_eq!(
+            rep_1.required_feature_names(),
+            vec![
+                "depth32float-stencil8",
+                "shader-f16",
+                "subgroups",
+                "texture-compression-bc",
+            ]
+        );
+        assert_eq!(rep_1.missing_feature_names(), vec!["shader-f16", "subgroups"]);
+
+        // With all four features enabled, the report becomes fully compatible.
+        let full_profile = WebGpuDeviceProfile::with_features(
+            [
+                WebGpuFeature::TextureCompressionBc,
+                WebGpuFeature::Depth32FloatStencil8,
+                WebGpuFeature::ShaderF16,
+                WebGpuFeature::Subgroups,
+            ],
+            WebGpuLimits::webgpu_baseline(),
+        );
+        assert!(evaluate_webgpu_compat(&req_order_1, &full_profile).is_compatible());
+
+        // 2. Permuting SPIR-V capability declaration order yields identical CompatAudit issue order.
+        let build_caps = |caps: &[u32]| -> Vec<u32> {
+            let mut b = SpirvBuilder::new();
+            let void_ty = b.id();
+            let fn_ty = b.id();
+            let main_fn = b.id();
+            let entry_label = b.id();
+            b.inst(OP_CAPABILITY, &[CAP_SHADER]);
+            for &cap in caps {
+                b.inst(OP_CAPABILITY, &[cap]);
+            }
+            b.inst(OP_MEMORY_MODEL, &[ADDRESSING_LOGICAL, MEMORY_GLSL450]);
+            b.inst_with_string(
+                OP_ENTRY_POINT,
+                &[EXEC_MODEL_GL_COMPUTE, main_fn],
+                "main",
+                &[],
+            );
+            b.inst(OP_EXECUTION_MODE, &[main_fn, EXEC_MODE_LOCAL_SIZE, 1, 1, 1]);
+            b.inst(OP_TYPE_VOID, &[void_ty]);
+            b.inst(OP_TYPE_FUNCTION, &[fn_ty, void_ty]);
+            b.inst(OP_FUNCTION, &[void_ty, main_fn, 0, fn_ty]);
+            b.inst(OP_LABEL, &[entry_label]);
+            b.inst(OP_RETURN, &[]);
+            b.inst(OP_FUNCTION_END, &[]);
+            spirv_bytes_to_words(&b.finish_bytes()).unwrap()
+        };
+
+        let spv_a = build_caps(&[CAP_TESSELLATION, CAP_INT64, CAP_FLOAT64, CAP_GEOMETRY]);
+        let spv_b = build_caps(&[CAP_GEOMETRY, CAP_FLOAT64, CAP_TESSELLATION, CAP_INT64]);
+        let audit_a = sanitize_spirv_words(&spv_a, &SanitizeOptions::default())
+            .unwrap()
+            .audit;
+        let audit_b = sanitize_spirv_words(&spv_b, &SanitizeOptions::default())
+            .unwrap()
+            .audit;
+        assert_eq!(audit_a.issues, audit_b.issues);
+
+        // 3. Permuting ShaderAuditRecord order yields byte-for-byte identical Markdown reports.
+        let rec_z = ShaderAuditRecord {
+            source_path: "z_shader.spv".to_string(),
+            stage: Some("compute".to_string()),
+            lowered_to_wgsl: false,
+            stream_error: None,
+            naga_error: Some("err_z".to_string()),
+            audit: audit_a.clone(),
+        };
+        let rec_a = ShaderAuditRecord {
+            source_path: "a_shader.spv".to_string(),
+            stage: Some("fragment".to_string()),
+            lowered_to_wgsl: false,
+            stream_error: None,
+            naga_error: Some("err_a".to_string()),
+            audit: audit_b,
+        };
+        let md_1 = render_compat_audit_report_md(&[rec_z.clone(), rec_a.clone()]);
+        let md_2 = render_compat_audit_report_md(&[rec_a, rec_z]);
+        assert_eq!(md_1, md_2);
+
+        // 4. evaluate_naga_module_compat combines Naga structural blockers + missing features deterministically.
+        let mut naga_mod = naga::Module::default();
+        let _f64_ty = naga_mod.types.insert(
+            naga::Type {
+                name: None,
+                inner: naga::TypeInner::Scalar(naga::Scalar::F64),
+            },
+            naga::Span::UNDEFINED,
+        );
+        let combined = evaluate_naga_module_compat(
+            &naga_mod,
+            &["bc7-rgba-unorm", "depth32float-stencil8"],
+            &WebGpuDeviceProfile::baseline(),
+        );
+        assert!(!combined.is_compatible());
+        assert_eq!(
+            combined.missing_feature_names(),
+            vec!["depth32float-stencil8", "texture-compression-bc"]
+        );
+        assert!(
+            combined
+                .audit
+                .blockers()
+                .any(|i| i.kind == CompatIssueKind::Float64)
+        );
+        assert_eq!(
+            combined
+                .audit
+                .blockers()
+                .filter(|i| i.kind == CompatIssueKind::RequiredFeatureMissing)
+                .count(),
+            2
+        );
     }
 }
