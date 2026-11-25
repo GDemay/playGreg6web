@@ -7,8 +7,11 @@ const gpuTimerMod = require('../web/workers/gpu_timer.js');
 const {
   DEFAULT_MAX_PASSES_PER_FRAME,
   DEFAULT_READBACK_SLOTS,
+  DEFAULT_QUERY_RING_SLOTS,
   DEFAULT_HISTORY_SIZE,
   DEFAULT_FRAME_BUDGET_MS,
+  DEFAULT_PASS_BUDGET_MS,
+  DEFAULT_30FPS_BUDGET_MS,
   BUFFER_USAGE,
   MAP_MODE,
   computePercentiles,
@@ -177,8 +180,11 @@ test('UMD export attaches PlayGta6GpuTimer on globalThis and exposes defaults', 
   assert.equal(globalThis.PlayGta6GpuTimer.computePercentiles, computePercentiles);
   assert.equal(DEFAULT_MAX_PASSES_PER_FRAME, 32);
   assert.equal(DEFAULT_READBACK_SLOTS, 3);
+  assert.equal(DEFAULT_QUERY_RING_SLOTS, 1);
   assert.equal(DEFAULT_HISTORY_SIZE, 120);
   assert.equal(DEFAULT_FRAME_BUDGET_MS, 16.67);
+  assert.equal(DEFAULT_PASS_BUDGET_MS, 33.333);
+  assert.equal(DEFAULT_30FPS_BUDGET_MS, 33.333);
   assert.equal(BUFFER_USAGE.QUERY_RESOLVE, 0x0200);
   assert.equal(BUFFER_USAGE.MAP_READ, 0x0001);
   assert.equal(MAP_MODE.READ, 0x0001);
@@ -217,6 +223,11 @@ test('graceful no-op degradation when device lacks timestamp-query feature or is
     lastFrameGpuMs: 0,
     p50PassMs: 0,
     p95PassMs: 0,
+    maxPassMs: 0,
+    passBudgetMs: 33.333,
+    passesOverBudget: 0,
+    querySlotRecycles: 0,
+    querySlotWraps: 0,
     passStats: {},
   });
 
@@ -337,9 +348,30 @@ test('supported lifecycle: allocates resources, profiles compute + render passes
     lastFrameGpuMs: 5.75,
     p50PassMs: 1.25,
     p95PassMs: 4.5,
+    maxPassMs: 4.5,
+    passBudgetMs: 33.333,
+    passesOverBudget: 0,
+    querySlotRecycles: 0,
+    querySlotWraps: 1,
     passStats: {
-      compute: { count: 1, lastMs: 1.25, avgMs: 1.25, maxMs: 1.25 },
-      main_render: { count: 1, lastMs: 4.5, avgMs: 4.5, maxMs: 4.5 },
+      compute: {
+        count: 1,
+        lastMs: 1.25,
+        avgMs: 1.25,
+        p50Ms: 1.25,
+        p95Ms: 1.25,
+        maxMs: 1.25,
+        passesOverBudget: 0,
+      },
+      main_render: {
+        count: 1,
+        lastMs: 4.5,
+        avgMs: 4.5,
+        p50Ms: 4.5,
+        p95Ms: 4.5,
+        maxMs: 4.5,
+        passesOverBudget: 0,
+      },
     },
   });
 
@@ -547,7 +579,10 @@ test('rolling getStats() evicts samples older than historySize for avgMs and max
     count: 4,
     lastMs: 6,
     avgMs: 4,
+    p50Ms: 4,
+    p95Ms: 6,
     maxMs: 6,
+    passesOverBudget: 0,
   });
 
   // Returned stats snapshot is defensive (mutating it does not affect internal state).
@@ -1545,6 +1580,11 @@ test('W277: bounded rolling pass duration window computes p50PassMs and p95PassM
     lastFrameGpuMs: 0,
     p50PassMs: 0,
     p95PassMs: 0,
+    maxPassMs: 0,
+    passBudgetMs: 33.333,
+    passesOverBudget: 0,
+    querySlotRecycles: 0,
+    querySlotWraps: 0,
     passStats: {},
   });
   assert.equal(timer.isDestroyed, false);
@@ -1585,4 +1625,372 @@ test('W277: bounded rolling pass duration window computes p50PassMs and p95PassM
   assert.equal(deferTimer.getStats().p50PassMs, 0);
   assert.equal(deferTimer.getStats().mapErrors, 0);
   deferTimer.destroy();
+});
+
+test('W324: rolling 30 FPS per-pass histograms compute p50Ms/p95Ms/maxMs and passesOverBudget against 33.333ms default budget', async () => {
+  const env = createMockWebGpu({ supported: true });
+
+  // Validate option rejection for invalid passBudgetMs / queryRingSlots values.
+  assert.throws(() => new GpuPassTimer({ device: env.device, passBudgetMs: 0 }), RangeError);
+  assert.throws(() => new GpuPassTimer({ device: env.device, passBudgetMs: -5 }), RangeError);
+  assert.throws(
+    () => new GpuPassTimer({ device: env.device, passBudgetMs: Number.NaN }),
+    RangeError
+  );
+  assert.throws(() => new GpuPassTimer({ device: env.device, queryRingSlots: 0 }), RangeError);
+  assert.throws(() => new GpuPassTimer({ device: env.device, queryRingSlots: -2 }), RangeError);
+  assert.throws(() => new GpuPassTimer({ device: env.device, queryRingSlots: 1.5 }), RangeError);
+
+  const timer = new GpuPassTimer({
+    device: env.device,
+    maxPassesPerFrame: 4,
+    readbackSlots: 2,
+    historySize: 20,
+  });
+
+  assert.equal(timer.passBudgetMs, 33.333);
+  assert.equal(timer.queryRingSlots, 1);
+  assert.deepEqual(timer.getPassStats(), {});
+  assert.equal(timer.getPassStats('gbuffer'), null);
+  assert.equal(timer.getPassStats(''), null);
+  assert.equal(timer.getPassStats(null), null);
+
+  // Feed 25 frames for 'gbuffer' and 'shadow':
+  // - First 5 frames: huge spikes (50ms gbuffer, 40ms shadow) that MUST age out of the 20-sample rolling window
+  //   for p50Ms/p95Ms/maxMs, while passesOverBudget retains the 5 over-budget events.
+  // - Next 20 frames for gbuffer: 1..18ms, 33.333ms (exact boundary, NOT over budget), 33.334ms (over budget #6)
+  //   -> sorted window of 20 samples: [1,2,...,18, 33.333, 33.334]
+  //      p50 (ceil(0.5*20)-1 = idx 9) = 10ms, p95 (ceil(0.95*20)-1 = idx 18) = 33.333ms, max = 33.334ms
+  //      passesOverBudget = 5 (early spikes) + 1 (33.334ms) = 6
+  // - Next 20 frames for shadow: 2..21ms (all <= 33.333ms)
+  //   -> sorted window of 20 samples: [2..21]
+  //      p50 (idx 9) = 11ms, p95 (idx 18) = 20ms, max = 21ms
+  //      passesOverBudget = 5 (early spikes only)
+  for (let frame = 0; frame < 25; frame += 1) {
+    let gbufMs;
+    let shadowMs;
+    if (frame < 5) {
+      gbufMs = 50;
+      shadowMs = 40;
+    } else {
+      const idx = frame - 5; // 0..19
+      if (idx < 18) {
+        gbufMs = idx + 1;
+      } else if (idx === 18) {
+        gbufMs = 33.333; // exact 30 FPS boundary -> NOT strictly over budget
+      } else {
+        gbufMs = 33.334; // strictly over 33.333 ms budget
+      }
+      shadowMs = idx + 2;
+    }
+
+    timer.beginFrame();
+    timer.getPassTimestampWrites('gbuffer');
+    timer.getPassTimestampWrites('shadow');
+    const gNs = BigInt(Math.round(gbufMs * 1_000_000));
+    const sNs = BigInt(Math.round(shadowMs * 1_000_000));
+    env.setFrameTimestamps([0n, gNs, 100_000_000n, 100_000_000n + sNs]);
+    assert.equal(timer.resolveFrame(env.device.createCommandEncoder()), true);
+    await timer.collectCompletedReadback();
+  }
+
+  const gbufStats = timer.getPassStats('gbuffer');
+  assert.equal(gbufStats.count, 25);
+  assert.equal(gbufStats.lastMs, 33.334);
+  assert.equal(gbufStats.p50Ms, 10);
+  assert.equal(gbufStats.p95Ms, 33.333);
+  assert.equal(gbufStats.maxMs, 33.334);
+  assert.equal(gbufStats.passesOverBudget, 6);
+
+  const shadowStats = timer.getPassStats('shadow');
+  assert.equal(shadowStats.count, 25);
+  assert.equal(shadowStats.lastMs, 21);
+  assert.equal(shadowStats.p50Ms, 11);
+  assert.equal(shadowStats.p95Ms, 20);
+  assert.equal(shadowStats.maxMs, 21);
+  assert.equal(shadowStats.passesOverBudget, 5);
+
+  // getPassStats() with no argument matches getStats().passStats and is defensive.
+  const allPassStats = timer.getPassStats();
+  const stats = timer.getStats();
+  assert.deepEqual(allPassStats, stats.passStats);
+  assert.equal(stats.passBudgetMs, 33.333);
+  assert.equal(stats.passesOverBudget, 11);
+  assert.equal(stats.maxPassMs, 33.334);
+
+  allPassStats.gbuffer.p95Ms = 9999;
+  gbufStats.passesOverBudget = 9999;
+  assert.equal(timer.getPassStats('gbuffer').p95Ms, 33.333);
+  assert.equal(timer.getPassStats('gbuffer').passesOverBudget, 6);
+
+  // Custom passBudgetMs and CPU fallback mode also track passesOverBudget & rolling p50/p95/max.
+  let nowMs = 0;
+  const cpuTimer = new GpuPassTimer({
+    device: null,
+    historySize: 4,
+    passBudgetMs: 10.0,
+    now: () => nowMs,
+  });
+  assert.equal(cpuTimer.passBudgetMs, 10.0);
+  for (const dur of [5, 10, 12, 15, 8]) {
+    cpuTimer.beginFrame();
+    cpuTimer.beginPass('cpu_pass');
+    nowMs += dur;
+    cpuTimer.endPass();
+    cpuTimer.endFrame();
+  }
+  // Rolling window of last 4 samples: [10, 12, 15, 8] -> sorted [8, 10, 12, 15]
+  // p50 = 10, p95 = 15, max = 15; samples strictly > 10 are [12, 15] => passesOverBudget = 2
+  assert.deepEqual(cpuTimer.getPassStats('cpu_pass'), {
+    count: 5,
+    lastMs: 8,
+    avgMs: 11.25,
+    p50Ms: 10,
+    p95Ms: 15,
+    maxMs: 15,
+    passesOverBudget: 2,
+  });
+  assert.equal(cpuTimer.getStats().passesOverBudget, 2);
+
+  timer.destroy();
+  cpuTimer.destroy();
+});
+
+test('W324: query-slot ring wrap-around recycles pre-allocated descriptors with zero GC churn across pipelined frames', async () => {
+  const env = createMockWebGpu({ supported: true, deferMap: true });
+  const timer = new GpuPassTimer({
+    device: env.device,
+    maxPassesPerFrame: 4,
+    readbackSlots: 3,
+    queryRingSlots: 3,
+    historySize: 30,
+  });
+
+  assert.equal(timer.queryRingSlots, 3);
+  // GPUQuerySet holds queryRingSlots * maxPassesPerFrame * 2 = 3 * 4 * 2 = 24 timestamp queries.
+  assert.equal(env.querySets.length, 1);
+  assert.equal(env.querySets[0].desc.count, 24);
+  // Resolve buffer + 3 readback buffers each hold 1 frame slice = 4 * 2 * 8 = 64 bytes.
+  assert.equal(env.buffers.length, 4);
+  for (const buf of env.buffers) {
+    assert.equal(buf.size, 64);
+  }
+
+  const firstSlicePass0 = [];
+  const firstSlicePass1 = [];
+
+  // Run 9 frames (3 full query-ring wrap cycles) with 2 pipelined frames in flight at a time.
+  const inFlight = [];
+  for (let frame = 0; frame < 9; frame += 1) {
+    timer.beginFrame();
+    const ts0 = timer.beginPass('gbuffer');
+    assert.equal(timer.endPass(), null);
+    const ts1 = timer.beginPass('lighting');
+    assert.equal(timer.endPass(), null);
+
+    const expectedSlice = frame % 3;
+    const expectedQueryBase = expectedSlice * 8;
+    assert.ok(Object.isFrozen(ts0));
+    assert.ok(Object.isFrozen(ts1));
+    assert.equal(ts0.beginningOfPassWriteIndex, expectedQueryBase);
+    assert.equal(ts0.endOfPassWriteIndex, expectedQueryBase + 1);
+    assert.equal(ts1.beginningOfPassWriteIndex, expectedQueryBase + 2);
+    assert.equal(ts1.endOfPassWriteIndex, expectedQueryBase + 3);
+
+    // Verify exact descriptor object identity reuse after ring wrap-around (zero per-pass allocation).
+    if (frame < 3) {
+      firstSlicePass0[expectedSlice] = ts0;
+      firstSlicePass1[expectedSlice] = ts1;
+    } else {
+      assert.equal(ts0, firstSlicePass0[expectedSlice]);
+      assert.equal(ts1, firstSlicePass1[expectedSlice]);
+    }
+
+    const gMs = (frame + 1) * 2;
+    const lMs = (frame + 1) * 3;
+    env.setFrameTimestamps([
+      0n,
+      BigInt(gMs * 1_000_000),
+      100_000_000n,
+      100_000_000n + BigInt(lMs * 1_000_000),
+    ]);
+
+    assert.equal(timer.resolveFrame(env.device.createCommandEncoder()), true);
+    assert.equal(env.resolveCalls[frame].firstQuery, expectedQueryBase);
+    assert.equal(env.resolveCalls[frame].queryCount, 4);
+
+    // Keep 2 frames pipelined, draining the oldest once 2 are queued.
+    if (frame >= 1) {
+      const p = timer.collectCompletedReadback();
+      inFlight.push(p);
+      env.pendingMaps.shift().resolve();
+      const resolved = await p;
+      assert.ok(resolved);
+      assert.equal(resolved.passes[0].name, 'gbuffer');
+      assert.equal(resolved.passes[1].name, 'lighting');
+    }
+  }
+
+  // Drain the final remaining frame.
+  const finalReadback = timer.collectCompletedReadback();
+  env.pendingMaps.shift().resolve();
+  const finalResult = await finalReadback;
+  assert.deepEqual(finalResult, {
+    totalGpuMs: 45,
+    passes: [
+      { name: 'gbuffer', durationMs: 18 },
+      { name: 'lighting', durationMs: 27 },
+    ],
+  });
+
+  // 9 frames across 3 ring slices => 3 full wraps, 6 slice recycles, 0 extra GPUQuerySet allocations.
+  assert.equal(env.querySets.length, 1);
+  const stats = timer.getStats();
+  assert.equal(stats.resolvedFrames, 9);
+  assert.equal(stats.skippedFrames, 0);
+  assert.equal(stats.querySlotWraps, 3);
+  assert.equal(stats.querySlotRecycles, 6);
+  assert.equal(stats.passStats.gbuffer.p50Ms, 10);
+  assert.equal(stats.passStats.gbuffer.p95Ms, 18);
+  assert.equal(stats.passStats.gbuffer.maxMs, 18);
+  assert.equal(stats.passStats.lighting.p50Ms, 15);
+  assert.equal(stats.passStats.lighting.p95Ms, 27);
+  assert.equal(stats.passStats.lighting.maxMs, 27);
+
+  // Skipped resolveFrame (all readback slots busy) must NOT advance the query-slot ring slice.
+  for (let i = 0; i < 3; i += 1) {
+    timer.beginFrame();
+    timer.getPassTimestampWrites('busy');
+    env.setFrameTimestamps([0n, 1_000_000n]);
+    assert.equal(timer.resolveFrame(env.device.createCommandEncoder()), true);
+  }
+  const wrapsBeforeSkip = timer.getStats().querySlotWraps;
+  const recyclesBeforeSkip = timer.getStats().querySlotRecycles;
+  timer.beginFrame();
+  const tsBeforeSkip = timer.getPassTimestampWrites('skipped');
+  assert.equal(timer.resolveFrame(env.device.createCommandEncoder()), false);
+  assert.equal(timer.getStats().querySlotWraps, wrapsBeforeSkip);
+  assert.equal(timer.getStats().querySlotRecycles, recyclesBeforeSkip);
+
+  // After freeing one readback slot, next frame uses the exact same slice that was skipped.
+  const drainOne = timer.collectCompletedReadback();
+  env.pendingMaps.shift().resolve();
+  await drainOne;
+  timer.beginFrame();
+  const tsAfterSkip = timer.getPassTimestampWrites('reused_slice');
+  assert.equal(tsAfterSkip, tsBeforeSkip);
+
+  // Drain remaining 2 pending slots before teardown.
+  for (let i = 0; i < 2; i += 1) {
+    const p = timer.collectCompletedReadback();
+    env.pendingMaps.shift().resolve();
+    await p;
+  }
+
+  timer.destroy();
+});
+
+test('W324: preserves W277 device-loss / mapAsync guards and clears histogram + ring counters cleanly on resetStats()', async () => {
+  let triggerLost;
+  const env = createMockWebGpu({ supported: true, deferMap: true });
+  env.device.lost = new Promise((resolve) => {
+    triggerLost = resolve;
+  });
+
+  const timer = new GpuPassTimer({
+    device: env.device,
+    maxPassesPerFrame: 4,
+    readbackSlots: 2,
+    queryRingSlots: 2,
+    historySize: 16,
+  });
+
+  // Frame 1 (slice 0): over 30 FPS budget (42ms)
+  timer.beginFrame();
+  const tsSlice0 = timer.beginPass('volumetrics');
+  timer.endPass();
+  assert.equal(tsSlice0.beginningOfPassWriteIndex, 0);
+  env.setFrameTimestamps([0n, 42_000_000n]);
+  assert.equal(timer.resolveFrame(env.device.createCommandEncoder()), true);
+  const p1 = timer.collectCompletedReadback();
+  env.pendingMaps.shift().resolve();
+  await p1;
+
+  // Frame 2 (slice 1): mapAsync rejects (W277 guard) -> must NOT corrupt passStats or leak mapped state
+  timer.beginFrame();
+  const tsSlice1 = timer.beginPass('volumetrics');
+  timer.endPass();
+  assert.equal(tsSlice1.beginningOfPassWriteIndex, 8);
+  env.setFrameTimestamps([0n, 50_000_000n]);
+  assert.equal(timer.resolveFrame(env.device.createCommandEncoder()), true);
+  const p2 = timer.collectCompletedReadback();
+  env.pendingMaps.shift().reject(new DOMException('GPU aborted', 'AbortError'));
+  assert.equal(await p2, null);
+
+  let stats = timer.getStats();
+  assert.equal(stats.resolvedFrames, 1);
+  assert.equal(stats.mapErrors, 1);
+  assert.equal(stats.droppedQueryFrames, 1);
+  assert.equal(stats.passesOverBudget, 1);
+  assert.equal(stats.querySlotWraps, 1);
+  assert.equal(timer.getPassStats('volumetrics').passesOverBudget, 1);
+  assert.equal(timer.getPassStats('volumetrics').maxMs, 42);
+
+  // resetStats() clears per-pass histograms, passesOverBudget, query-slot ring counters, and slice cursor.
+  const resetSnapshot = timer.resetStats();
+  assert.deepEqual(resetSnapshot, {
+    supported: true,
+    resolvedFrames: 0,
+    skippedFrames: 0,
+    droppedPasses: 0,
+    droppedQueryFrames: 0,
+    mapErrors: 0,
+    lastFrameGpuMs: 0,
+    p50PassMs: 0,
+    p95PassMs: 0,
+    maxPassMs: 0,
+    passBudgetMs: 33.333,
+    passesOverBudget: 0,
+    querySlotRecycles: 0,
+    querySlotWraps: 0,
+    passStats: {},
+  });
+  assert.deepEqual(timer.getPassStats(), {});
+  assert.equal(timer.getPassStats('volumetrics'), null);
+
+  // Next frame after resetStats() restarts cleanly at slice 0 (beginningOfPassWriteIndex === 0).
+  timer.beginFrame();
+  const tsAfterReset = timer.beginPass('volumetrics');
+  timer.endPass();
+  assert.equal(tsAfterReset, tsSlice0);
+  env.setFrameTimestamps([0n, 12_000_000n]);
+  assert.equal(timer.resolveFrame(env.device.createCommandEncoder()), true);
+  const p3 = timer.collectCompletedReadback();
+  env.pendingMaps.shift().resolve();
+  await p3;
+
+  assert.deepEqual(timer.getPassStats('volumetrics'), {
+    count: 1,
+    lastMs: 12,
+    avgMs: 12,
+    p50Ms: 12,
+    p95Ms: 12,
+    maxMs: 12,
+    passesOverBudget: 0,
+  });
+
+  // Trigger device.lost -> subsequent resolveFrame must be safely guarded and drop cleanly.
+  triggerLost({ reason: 'destroyed', message: 'Simulated W324 device loss' });
+  await Promise.resolve();
+
+  timer.beginFrame();
+  timer.beginPass('after_loss');
+  timer.endPass();
+  const resolveCountBeforeLoss = env.resolveCalls.length;
+  assert.equal(timer.resolveFrame(env.device.createCommandEncoder()), false);
+  assert.equal(env.resolveCalls.length, resolveCountBeforeLoss);
+  assert.equal(timer.getStats().droppedQueryFrames, 1);
+  assert.equal(timer.getPassStats('after_loss'), null);
+
+  timer.destroy();
 });
