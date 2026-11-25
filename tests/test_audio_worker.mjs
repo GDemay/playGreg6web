@@ -13,11 +13,16 @@ const audioMod = require('../web/workers/audio_worker.js');
 const {
   AudioRingBuffer,
   AudioMixerWorker,
+  GuestPcmRingReader,
   PcmScratchPool,
   OUTPUT_STATES,
   OVERFLOW_POLICIES,
   DEFAULT_MAX_PCM_BYTES,
   DEFAULT_DECLICK_FRAMES,
+  GUEST_PCM_RING_DEFAULT_SAMPLE_RATE,
+  GUEST_PCM_RING_CHANNELS,
+  GUEST_PCM_RING_DEFAULT_CAPACITY_SAMPLES,
+  GUEST_PCM_RING_DEFAULT_QUANTUM_FRAMES,
   ITU_BS775_CENTER_GAIN,
   ITU_BS775_SURROUND_GAIN,
   deinterleavePcm,
@@ -1718,4 +1723,513 @@ test('W222 underrun recovery watermark holds silence until re-primed and telemet
   assert.equal(afterReset.underrunRecoveries, 0);
   assert.equal(afterReset.bufferFillPct, 0);
   worker.destroy();
+});
+
+// ---------------------------------------------------------------------------
+// W235: R40 Host Stereo PCM Ring Reader & Pump (Playgta6AudioRing / #1027)
+// ---------------------------------------------------------------------------
+
+/**
+ * Allocates a mock WASM linear-memory SharedArrayBuffer matching
+ * `RingStorage` / `Playgta6AudioRing` in `runtime/os/audio_downmix.h`:
+ *   [base .. base + capacitySamples*4)  float32 interleaved stereo samples
+ *   [writeOffset .. writeOffset + 4)    uint32 producer write_index
+ *   [readOffset  .. readOffset  + 4)    uint32 host read_index
+ */
+function createMockGuestPcmRing({
+  capacitySamples = 64,
+  baseOffset = 64,
+  sampleRate = 48000,
+  channels = 2,
+} = {}) {
+  const dataBytes = capacitySamples * Float32Array.BYTES_PER_ELEMENT;
+  const writeIndexByteOffset = baseOffset + dataBytes;
+  const readIndexByteOffset = writeIndexByteOffset + 4;
+  const totalBytes = readIndexByteOffset + 64;
+  const sab = new SharedArrayBuffer(totalBytes);
+  const data = new Float32Array(sab, baseOffset, capacitySamples);
+  const writeCtrl = new Uint32Array(sab, writeIndexByteOffset, 1);
+  const readCtrl = new Uint32Array(sab, readIndexByteOffset, 1);
+  const mask = capacitySamples - 1;
+
+  function producerPush(samples) {
+    const w = Atomics.load(writeCtrl, 0) >>> 0;
+    const r = Atomics.load(readCtrl, 0) >>> 0;
+    const freeSpace = capacitySamples - ((w - r) >>> 0);
+    const n = Math.min(samples.length, freeSpace);
+    for (let i = 0; i < n; i++) {
+      data[(w + i) & mask] = samples[i];
+    }
+    Atomics.store(writeCtrl, 0, (w + n) >>> 0);
+    return n;
+  }
+
+  function producerForcePush(samples) {
+    const w = Atomics.load(writeCtrl, 0) >>> 0;
+    for (let i = 0; i < samples.length; i++) {
+      data[(w + i) & mask] = samples[i];
+    }
+    Atomics.store(writeCtrl, 0, (w + samples.length) >>> 0);
+  }
+
+  return {
+    sab,
+    data,
+    writeCtrl,
+    readCtrl,
+    descriptor: {
+      sab,
+      base: baseOffset,
+      capacity: capacitySamples,
+      channels,
+      sample_rate: sampleRate,
+      read_index_ptr: readIndexByteOffset,
+      write_index_ptr: writeIndexByteOffset,
+    },
+    producerPush,
+    producerForcePush,
+  };
+}
+
+test('W235 attachGuestPcmRing / drainGuestPcmRing / detachGuestPcmRing align with Playgta6AudioRing and pump exact stereo frames', () => {
+  assert.equal(typeof GuestPcmRingReader, 'function');
+  assert.equal(GUEST_PCM_RING_DEFAULT_SAMPLE_RATE, 48000);
+  assert.equal(GUEST_PCM_RING_CHANNELS, 2);
+  assert.equal(GUEST_PCM_RING_DEFAULT_CAPACITY_SAMPLES, 1 << 17);
+  assert.equal(GUEST_PCM_RING_DEFAULT_QUANTUM_FRAMES, 480);
+
+  const replies = [];
+  const worker = new AudioMixerWorker((m) => replies.push(m), {
+    outputState: 'active',
+    autoDrain: false,
+    declickFrames: 0,
+  });
+
+  worker.handleMessage({
+    init: true,
+    sampleRate: 48000,
+    channels: 2,
+    capacityFrames: 256,
+    outputState: 'active',
+  });
+
+  assert.equal(worker.getStats().guestRingAttached, false);
+
+  // Use BigInt offsets (wasm64 uintptr_t style) via worker message contract.
+  const mock = createMockGuestPcmRing({ capacitySamples: 64, baseOffset: 128 });
+  worker.handleMessage({
+    attachGuestPcmRing: true,
+    id: 'attach-1',
+    sab: mock.sab,
+    base: BigInt(mock.descriptor.base),
+    capacity: mock.descriptor.capacity,
+    channels: 2,
+    sample_rate: 48000,
+    read_index_ptr: BigInt(mock.descriptor.read_index_ptr),
+    write_index_ptr: BigInt(mock.descriptor.write_index_ptr),
+    quantumFrames: 16,
+  });
+
+  const attachReply = replies[replies.length - 1];
+  assert.equal(attachReply.id, 'attach-1');
+  assert.equal(attachReply.attached, true);
+  assert.equal(attachReply.guestRingAttached, true);
+  assert.equal(attachReply.capacitySamples, 64);
+  assert.equal(attachReply.capacityFrames, 32);
+  assert.equal(attachReply.quantumFrames, 16);
+  assert.equal(worker.getStats().guestRingAttached, true);
+
+  // Push 16 stereo frames with amplitude inside [-0.95, 0.95] (bit-exact passthrough).
+  const input16 = new Float32Array(16 * 2);
+  for (let f = 0; f < 16; f++) {
+    input16[f * 2] = Math.fround((f + 1) * 0.05);
+    input16[f * 2 + 1] = Math.fround(-(f + 1) * 0.04);
+  }
+  assert.equal(mock.producerPush(input16), 32);
+
+  // Drain via worker message protocol -> pumps into worker.ring.
+  worker.handleMessage({ drainGuestPcmRing: true, id: 'drain-1', maxFrames: 16 });
+  const drainReply = replies[replies.length - 1];
+  assert.equal(drainReply.id, 'drain-1');
+  assert.equal(drainReply.framesDrained, 16);
+  assert.equal(drainReply.pushedFrames, 16);
+  assert.equal(drainReply.droppedFrames, 0);
+  assert.equal(drainReply.underrun, false);
+  assert.equal(drainReply.overrun, false);
+  assert.equal(drainReply.guestFramesDrained, 16);
+  assert.equal(Atomics.load(mock.readCtrl, 0), 32);
+
+  const pulled = new Float32Array(16 * 2);
+  assert.equal(worker.pullSamples(pulled), 16);
+  assert.deepEqual(Array.from(pulled), Array.from(input16));
+
+  // Direct output buffer drain mode also works bit-exact.
+  assert.equal(mock.producerPush(input16), 32);
+  const directOut = new Float32Array(16 * 2);
+  const directRes = worker.drainGuestPcmRing(directOut);
+  assert.equal(directRes.framesDrained, 16);
+  assert.equal(directRes.underrun, false);
+  assert.deepEqual(Array.from(directOut), Array.from(input16));
+  assert.equal(Atomics.load(mock.readCtrl, 0), 64);
+
+  // Detach via message protocol (and verify idempotent second detach).
+  worker.handleMessage({ detachGuestPcmRing: true, id: 'detach-1' });
+  const detachReply = replies[replies.length - 1];
+  assert.equal(detachReply.id, 'detach-1');
+  assert.equal(detachReply.detached, true);
+  assert.equal(detachReply.wasAttached, true);
+  assert.equal(detachReply.guestRingAttached, false);
+  assert.equal(worker.getStats().guestRingAttached, false);
+
+  const detach2 = worker.detachGuestPcmRing();
+  assert.equal(detach2.wasAttached, false);
+  assert.equal(detach2.guestRingAttached, false);
+
+  // Draining while detached is a safe no-op and zero-fills direct output.
+  const detachedOut = new Float32Array(8 * 2);
+  detachedOut.fill(5.0);
+  const detachedRes = worker.drainGuestPcmRing(detachedOut);
+  assert.equal(detachedRes.framesDrained, 0);
+  assert.ok(detachedOut.every((v) => v === 0));
+
+  worker.destroy();
+});
+
+test('W235 guest PCM ring wrap-around safety across ring boundary and uint32 2^32 cursor overflow with zero per-quantum heap allocation', () => {
+  const worker = new AudioMixerWorker(null, {
+    outputState: 'active',
+    autoDrain: false,
+    declickFrames: 0,
+  });
+  worker.handleMessage({
+    init: true,
+    sampleRate: 48000,
+    channels: 2,
+    capacityFrames: 512,
+    outputState: 'active',
+  });
+
+  // Small 16-sample (8-frame) ring to force heavy wrap-around.
+  const mock = createMockGuestPcmRing({ capacitySamples: 16, baseOffset: 32 });
+  worker.attachGuestPcmRing({
+    ...mock.descriptor,
+    quantumFrames: 6,
+  });
+
+  // 1. Cross the 2^32 unsigned 32-bit cursor boundary explicitly!
+  // Start both cursors 4 samples (2 frames) before 2^32.
+  const startCursor = 0xfffffffc; // 4294967292
+  Atomics.store(mock.readCtrl, 0, startCursor);
+  Atomics.store(mock.writeCtrl, 0, startCursor);
+
+  const wrapIn = new Float32Array(6 * 2);
+  for (let f = 0; f < 6; f++) {
+    wrapIn[f * 2] = Math.fround((f + 1) * 0.1);
+    wrapIn[f * 2 + 1] = Math.fround(-(f + 1) * 0.1);
+  }
+  assert.equal(mock.producerPush(wrapIn), 12);
+  assert.equal(Atomics.load(mock.writeCtrl, 0), 8); // (0xFFFFFFFC + 12) >>> 0 === 8
+
+  const wrapOut = new Float32Array(6 * 2);
+  const wrapRes = worker.drainGuestPcmRing(wrapOut);
+  assert.equal(wrapRes.framesDrained, 6);
+  assert.equal(wrapRes.underrun, false);
+  assert.equal(wrapRes.overrun, false);
+  assert.equal(Atomics.load(mock.readCtrl, 0), 8);
+  assert.deepEqual(Array.from(wrapOut), Array.from(wrapIn));
+
+  // 2. Zero per-quantum heap allocation check across 50 wrapped pump + direct quanta.
+  const allocsAfterAttach = worker.getScratchStats().allocations;
+  const reusesBefore = worker.getScratchStats().reuses;
+  const pullBuf = new Float32Array(6 * 2);
+
+  for (let round = 0; round < 50; round++) {
+    const chunk = new Float32Array(6 * 2);
+    for (let f = 0; f < 6; f++) {
+      const s = ((round * 6 + f) % 19) * 0.04;
+      chunk[f * 2] = Math.fround(s);
+      chunk[f * 2 + 1] = Math.fround(-s);
+    }
+    assert.equal(mock.producerPush(chunk), 12);
+
+    const res = worker.drainGuestPcmRing(6);
+    assert.equal(res.framesDrained, 6);
+    assert.equal(res.pushedFrames, 6);
+    assert.equal(res.underrun, false);
+    assert.equal(res.overrun, false);
+
+    assert.equal(worker.pullSamples(pullBuf), 6);
+    assert.deepEqual(Array.from(pullBuf), Array.from(chunk));
+  }
+
+  // Steady-state pump quanta performed ZERO new scratch buffer allocations!
+  assert.equal(
+    worker.getScratchStats().allocations,
+    allocsAfterAttach,
+    'Steady-state drainGuestPcmRing must perform zero per-quantum scratch allocations'
+  );
+  assert.ok(worker.getScratchStats().reuses >= reusesBefore + 50);
+
+  // Direct output mode also performs ZERO scratch allocations across 20 quanta.
+  for (let round = 0; round < 20; round++) {
+    assert.equal(mock.producerPush(wrapIn), 12);
+    const res = worker.drainGuestPcmRing(wrapOut);
+    assert.equal(res.framesDrained, 6);
+    assert.deepEqual(Array.from(wrapOut), Array.from(wrapIn));
+  }
+  assert.equal(worker.getScratchStats().allocations, allocsAfterAttach);
+  assert.equal(worker.getStats().guestFramesDrained, 6 + 50 * 6 + 20 * 6);
+  worker.destroy();
+});
+
+test('W235 graceful underrun silence fill, soft-clipping [-1, 1], NaN sanitization, and overrun drop accounting', () => {
+  const worker = new AudioMixerWorker(null, {
+    outputState: 'active',
+    autoDrain: false,
+    declickFrames: 0,
+  });
+  worker.handleMessage({
+    init: true,
+    sampleRate: 48000,
+    channels: 2,
+    capacityFrames: 8,
+    outputState: 'active',
+  });
+
+  // 16-sample (8-frame) guest ring.
+  const mock = createMockGuestPcmRing({ capacitySamples: 16, baseOffset: 64 });
+  worker.attachGuestPcmRing({
+    ...mock.descriptor,
+    quantumFrames: 8,
+    softClip: true,
+    limiterKnee: 0.95,
+  });
+
+  // 1. Soft-clipping [-1, 1] + NaN/Infinity sanitization + partial underrun silence fill.
+  const hotAndBad = new Float32Array([
+    0.5, -0.5,                       // frame 0: inside knee -> bit-exact
+    2.5, -3.0,                       // frame 1: hot -> soft-clipped in (0.95, 1.0] / [-1.0, -0.95)
+    Number.NaN, Number.POSITIVE_INFINITY, // frame 2: non-finite -> 0.0, 0.0
+    Number.NEGATIVE_INFINITY, 0.99,  // frame 3: -Inf -> 0.0, 0.99 -> soft-clipped
+  ]);
+  assert.equal(mock.producerPush(hotAndBad), 8);
+
+  const out8 = new Float32Array(8 * 2);
+  out8.fill(77.0); // sentinel to verify silence fill overwrites underrun tail
+  const res1 = worker.drainGuestPcmRing(out8);
+  assert.equal(res1.framesDrained, 4);
+  assert.equal(res1.underrun, true);
+  assert.equal(res1.underrunFrames, 4);
+  assert.equal(out8[0], 0.5);
+  assert.equal(out8[1], -0.5);
+  assert.ok(out8[2] > 0.95 && out8[2] <= 1.0);
+  assert.ok(out8[3] < -0.95 && out8[3] >= -1.0);
+  assert.equal(out8[4], 0.0);
+  assert.equal(out8[5], 0.0);
+  assert.equal(out8[6], 0.0);
+  assert.ok(out8[7] > 0.95 && out8[7] <= 1.0);
+  // Underrun tail frames 4..7 must be strictly 0.0.
+  for (let i = 8; i < 16; i++) {
+    assert.equal(out8[i], 0.0);
+  }
+  assert.ok(res1.peakLevel > 0.95 && res1.peakLevel <= 1.0);
+  assert.equal(worker.getStats().guestUnderruns, 1);
+  assert.equal(worker.getStats().sanitizedSamples, 3);
+  assert.equal(worker.getStats().clippedSamples, 3);
+
+  // 2. Pump mode underrun with explicit fillSilence: true pushes silence frames cleanly.
+  const emptyPump = worker.drainGuestPcmRing({ maxFrames: 4, fillSilence: true });
+  assert.equal(emptyPump.framesDrained, 0);
+  assert.equal(emptyPump.underrun, true);
+  assert.equal(emptyPump.underrunFrames, 4);
+  assert.equal(emptyPump.pushedFrames, 4);
+  assert.equal(worker.getStats().guestUnderruns, 2);
+
+  const silencePulled = new Float32Array(4 * 2);
+  silencePulled.fill(1.0);
+  assert.equal(worker.pullSamples(silencePulled), 4);
+  assert.ok(silencePulled.every((v) => v === 0));
+
+  // 3. Guest-ring producer lap overrun (producer advances write past read + capacity).
+  // Push 12 frames (24 samples) into 8-frame (16-sample) ring without checking free space:
+  // oldest 4 frames are overwritten, freshest 8 frames (frames 4..11) survive.
+  const lapFrames = new Float32Array(12 * 2);
+  for (let f = 0; f < 12; f++) {
+    lapFrames[f * 2] = Math.fround((f + 1) * 0.05);
+    lapFrames[f * 2 + 1] = Math.fround(-(f + 1) * 0.05);
+  }
+  mock.producerForcePush(lapFrames);
+
+  const afterLap = new Float32Array(8 * 2);
+  const lapRes = worker.drainGuestPcmRing(afterLap);
+  assert.equal(lapRes.overrun, true);
+  assert.equal(lapRes.overrunDroppedFrames, 4);
+  assert.equal(lapRes.framesDrained, 8);
+  assert.deepEqual(Array.from(afterLap), Array.from(lapFrames.subarray(4 * 2)));
+  assert.equal(worker.getStats().guestOverruns, 1);
+
+  // 4. Worker output ring backpressure overrun when pumping into a full active worker ring.
+  // Fill worker.ring (capacity 8) with 6 frames first.
+  worker.handleMessage({ pushPcm: true, samples: makeConstantStereoFrames(6, 0.25) });
+  assert.equal(worker.ring.availableFrames(), 6);
+
+  // Push 6 frames into guest ring and pump into worker.ring (only 2 frames free -> 4 dropped).
+  assert.equal(mock.producerPush(makeConstantStereoFrames(6, 0.5)), 12);
+  const backpressureRes = worker.drainGuestPcmRing(6);
+  assert.equal(backpressureRes.framesDrained, 6);
+  assert.equal(backpressureRes.pushedFrames, 2);
+  assert.equal(backpressureRes.droppedFrames, 4);
+  assert.equal(backpressureRes.overrun, true);
+  assert.equal(worker.getStats().guestOverruns, 2);
+
+  // 5. Backward/corrupt cursor anomaly (read > write by small delta -> unsigned diff > 2^31) resyncs safely.
+  Atomics.store(mock.writeCtrl, 0, 10);
+  Atomics.store(mock.readCtrl, 0, 20);
+  const corruptOut = new Float32Array(4 * 2);
+  corruptOut.fill(3.0);
+  const corruptRes = worker.drainGuestPcmRing(corruptOut);
+  assert.equal(corruptRes.overrun, true);
+  assert.equal(corruptRes.framesDrained, 0);
+  assert.equal(Atomics.load(mock.readCtrl, 0), 10); // resynced to write
+  assert.ok(corruptOut.every((v) => v === 0));
+  assert.equal(worker.getStats().guestOverruns, 3);
+
+  worker.destroy();
+});
+
+test('W235 guest PCM ring resampling (44.1 kHz -> 48 kHz), validation, telemetry sanitization, headless autoPump, and reset', () => {
+  const replies = [];
+  let fakeNow = 2000;
+  const worker = new AudioMixerWorker((m) => replies.push(m), {
+    now: () => fakeNow,
+    outputState: 'active',
+    autoDrain: false,
+    declickFrames: 0,
+  });
+
+  worker.handleMessage({
+    init: true,
+    sampleRate: 48000,
+    channels: 2,
+    capacityFrames: 2048,
+    outputState: 'active',
+  });
+
+  // 1. Invalid descriptors rejected cleanly via handleMessage (never throw) and throw via direct API.
+  const goodSab = new SharedArrayBuffer(512);
+  const invalidDescriptors = [
+    { sab: new ArrayBuffer(512), base: 0, capacity: 16, read_index_ptr: 64, write_index_ptr: 68 }, // non-SAB
+    { sab: goodSab, base: 0, capacity: 12, read_index_ptr: 64, write_index_ptr: 68 }, // non-power-of-two
+    { sab: goodSab, base: 2, capacity: 16, read_index_ptr: 64, write_index_ptr: 68 }, // unaligned base
+    { sab: goodSab, base: 0, capacity: 16, read_index_ptr: 64, write_index_ptr: 64 }, // aliased cursors
+    { sab: goodSab, base: 0, capacity: 16, read_index_ptr: 8, write_index_ptr: 68 },  // cursor overlaps data
+    { sab: goodSab, base: 0, capacity: 16, channels: 6, read_index_ptr: 64, write_index_ptr: 68 }, // non-stereo
+    { sab: goodSab, base: 0, capacity: 16, sample_rate: 100, read_index_ptr: 64, write_index_ptr: 68 }, // bad rate
+    { sab: goodSab, base: 480, capacity: 16, read_index_ptr: 0, write_index_ptr: 4 }, // data out of bounds
+  ];
+
+  for (let i = 0; i < invalidDescriptors.length; i++) {
+    assert.throws(() => worker.attachGuestPcmRing(invalidDescriptors[i]));
+    assert.doesNotThrow(() => {
+      worker.handleMessage({
+        type: 'attach-guest-pcm-ring',
+        id: `bad-${i}`,
+        descriptor: invalidDescriptors[i],
+      });
+    });
+    const errReply = replies[replies.length - 1];
+    assert.equal(errReply.id, `bad-${i}`);
+    assert.equal(errReply.attached, false);
+    assert.equal(typeof errReply.error, 'string');
+  }
+  assert.equal(worker.getStats().guestRingAttached, false);
+  assert.equal(worker.getStats().rejectedPackets, invalidDescriptors.length);
+
+  // 2. 44.1 kHz guest ring -> 48 kHz worker pump resampling.
+  const mock441 = createMockGuestPcmRing({
+    capacitySamples: 2048,
+    baseOffset: 64,
+    sampleRate: 44100,
+  });
+  worker.attachGuestPcmRing({ ...mock441.descriptor, quantumFrames: 441 });
+
+  const tone441 = new Float32Array(441 * 2);
+  for (let f = 0; f < 441; f++) {
+    const v = Math.sin((2 * Math.PI * 1000 * f) / 44100) * 0.5;
+    tone441[f * 2] = v;
+    tone441[f * 2 + 1] = -v;
+  }
+  assert.equal(mock441.producerPush(tone441), 441 * 2);
+
+  const rsDrain = worker.drainGuestPcmRing(441);
+  assert.equal(rsDrain.framesDrained, 441);
+  assert.equal(rsDrain.pushedFrames, 480);
+
+  const pulled48 = new Float32Array(480 * 2);
+  assert.equal(worker.pullSamples(pulled48), 480);
+  let sumSq = 0;
+  for (let f = 0; f < 478; f++) {
+    const exp = Math.sin((2 * Math.PI * 1000 * f) / 48000) * 0.5;
+    const dL = pulled48[f * 2] - exp;
+    const dR = pulled48[f * 2 + 1] - -exp;
+    sumSq += dL * dL + dR * dR;
+  }
+  assert.ok(Math.sqrt(sumSq / (478 * 2)) < 0.005);
+
+  // 3. Sanitized audio-stats telemetry surfaces all 5 W235 counters and sanitizes dirty inputs.
+  worker.handleMessage({ stats: true, id: 'w235-stats' });
+  const statsMsg = replies[replies.length - 1];
+  assert.equal(statsMsg.type, 'audio-stats');
+  assert.equal(statsMsg.stats.guestRingAttached, true);
+  assert.equal(statsMsg.stats.guestFramesDrained, 441);
+  assert.equal(statsMsg.stats.guestUnderruns, 0);
+  assert.equal(statsMsg.stats.guestOverruns, 0);
+  assert.ok(statsMsg.stats.guestPeakLevel > 0.45 && statsMsg.stats.guestPeakLevel <= 0.55);
+
+  const dirty = buildAudioTelemetrySnapshot(
+    {
+      guestRingAttached: 1,
+      guestFramesDrained: -99,
+      guestUnderruns: Number.NaN,
+      guestOverruns: Infinity,
+      guestPeakLevel: 42.5,
+      secretPath: 'C:\\game\\audio.awc',
+    },
+    { timestamp: 5555 }
+  );
+  assert.equal(dirty.stats.guestRingAttached, true);
+  assert.equal(dirty.stats.guestFramesDrained, 0);
+  assert.equal(dirty.stats.guestUnderruns, 0);
+  assert.equal(dirty.stats.guestOverruns, 0);
+  assert.equal(dirty.stats.guestPeakLevel, 1.0);
+  assert.equal(JSON.stringify(dirty).includes('audio.awc'), false);
+
+  // 4. reset() zeroes guest counters while keeping the guest ring attached.
+  worker.reset();
+  const afterReset = worker.getStats();
+  assert.equal(afterReset.guestRingAttached, true);
+  assert.equal(afterReset.guestFramesDrained, 0);
+  assert.equal(afterReset.guestUnderruns, 0);
+  assert.equal(afterReset.guestOverruns, 0);
+  assert.equal(afterReset.guestPeakLevel, 0);
+
+  // 5. Headless drain mode with autoPump: true drains guest ring on drainTick().
+  const mockHeadless = createMockGuestPcmRing({ capacitySamples: 1024, baseOffset: 64 });
+  worker.setOutputState('headless-drain');
+  worker.attachGuestPcmRing({
+    ...mockHeadless.descriptor,
+    quantumFrames: 240,
+    autoPump: true,
+  });
+  assert.equal(mockHeadless.producerPush(makeConstantStereoFrames(240, 0.4)), 480);
+
+  worker._lastDrainMs = 2000;
+  fakeNow = 2005; // 5 ms @ 48 kHz = 240 frames
+  const tickDrained = worker.drainTick(fakeNow);
+  assert.equal(tickDrained, 240);
+  assert.equal(worker.getStats().guestFramesDrained, 240);
+  assert.equal(Atomics.load(mockHeadless.readCtrl, 0), 480);
+
+  worker.destroy();
+  assert.equal(worker.getStats().guestRingAttached, false);
 });
