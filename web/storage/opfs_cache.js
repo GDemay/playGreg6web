@@ -13,6 +13,7 @@ export const DEFAULT_INDEX_FLUSH_DELAY_MS = 0;
 export const DEFAULT_PREFETCH_CONCURRENCY = 4;
 export const DEFAULT_MAX_PENDING_WRITES = 64;
 export const DEFAULT_MAX_WRITE_CONCURRENCY = 4;
+export const DEFAULT_MAX_OPEN_SYNC_HANDLES = 8;
 
 export const CHUNK_KINDS = Object.freeze({
   SHADER_PACK: 'shader-pack',
@@ -350,6 +351,20 @@ function cloneNodeMeta(node) {
   };
 }
 
+function closeSyncHandleSafe(syncHandle) {
+  if (!syncHandle || typeof syncHandle.close !== 'function') {
+    return;
+  }
+  try {
+    const res = syncHandle.close();
+    if (res && typeof res.catch === 'function') {
+      res.catch(() => {});
+    }
+  } catch {
+    // Ignore errors from already-closed or invalidated sync access handles.
+  }
+}
+
 async function readFileHandleBytes(handle) {
   if (!handle || typeof handle.getFile !== 'function') {
     return null;
@@ -422,6 +437,8 @@ export class OpfsChunkCache {
    * @param {number} [options.indexFlushDelayMs=0] `0` for immediate backwards-compatible flush; `> 0` for debounced batching.
    * @param {boolean} [options.persistIndex=true] Persist chunk index metadata JSON to OPFS.
    * @param {boolean} [options.reconcileOnInit=true] Reconcile persisted index against OPFS files on init.
+   * @param {boolean} [options.useSyncAccessHandle=true] Enable worker `FileSystemSyncAccessHandle` fast path when supported by file handles.
+   * @param {number} [options.maxOpenSyncHandles=8] Bounded LRU pool size for open `SyncAccessHandle`s (`0` closes each handle immediately in `finally`).
    * @param {() => number} [options.nowFn] Injectable clock function returning epoch ms.
    * @param {() => number} [options.now] Fallback clock alias.
    * @param {(fn: Function, delayMs: number) => any} [options.setTimeoutFn] Injectable setTimeout.
@@ -473,6 +490,11 @@ export class OpfsChunkCache {
       opts.maxWriteConcurrency,
       DEFAULT_MAX_WRITE_CONCURRENCY
     );
+    this.useSyncAccessHandle = opts.useSyncAccessHandle !== false;
+    this.maxOpenSyncHandles = sanitizeNonNegativeInt(
+      opts.maxOpenSyncHandles,
+      DEFAULT_MAX_OPEN_SYNC_HANDLES
+    );
 
     this._nowFn =
       typeof opts.nowFn === 'function'
@@ -515,6 +537,12 @@ export class OpfsChunkCache {
     this._activeBgWrites = new Set();
     this._bgWriteWaiters = [];
 
+    // Bounded LRU pool of Web Worker OPFS FileSystemSyncAccessHandles (W313).
+    this._syncHandles = new Map();
+    this._openingSyncHandles = new Map();
+    this._syncPoolGeneration = 0;
+    this._activeTransientSyncHandles = 0;
+
     // Sanitized warm-boot telemetry counters.
     this._hits = 0;
     this._misses = 0;
@@ -534,6 +562,9 @@ export class OpfsChunkCache {
     this._prefetchInFlightDeduped = 0;
     this._prefetchFailed = 0;
     this._prefetchBytes = 0;
+    this._syncHandleReads = 0;
+    this._syncHandleWrites = 0;
+    this._syncHandleFallbacks = 0;
   }
 
   // --- O(1) Doubly-Linked-List LRU Primitives ---
@@ -719,10 +750,213 @@ export class OpfsChunkCache {
     return dir.getFileHandle(leaf, { create });
   }
 
+  // --- Web Worker SyncAccessHandle Fast Path & Bounded LRU Handle Pool (W313) ---
+
+  _closeSyncHandle(key) {
+    let closed = false;
+    const inFlight = this._openingSyncHandles.get(key);
+    if (inFlight) {
+      inFlight.cancelled = true;
+      this._openingSyncHandles.delete(key);
+    }
+    const existing = this._syncHandles.get(key);
+    if (existing) {
+      this._syncHandles.delete(key);
+      closeSyncHandleSafe(existing);
+      closed = true;
+    }
+    return closed;
+  }
+
+  /**
+   * Synchronously closes all open pooled `FileSystemSyncAccessHandle` instances and
+   * cancels any in-flight sync handle opens so zero handles are leaked.
+   *
+   * @returns {number} Number of pooled handles closed.
+   */
+  closeAllHandles() {
+    this._syncPoolGeneration += 1;
+    for (const openState of this._openingSyncHandles.values()) {
+      openState.cancelled = true;
+    }
+    this._openingSyncHandles.clear();
+
+    let closed = 0;
+    for (const syncHandle of this._syncHandles.values()) {
+      closeSyncHandleSafe(syncHandle);
+      closed += 1;
+    }
+    this._syncHandles.clear();
+    return closed;
+  }
+
+  async _acquireSyncHandle(key, fileHandle) {
+    if (this.maxOpenSyncHandles === 0) {
+      const syncHandle = await fileHandle.createSyncAccessHandle();
+      if (!syncHandle || typeof syncHandle !== 'object') {
+        throw new Error('createSyncAccessHandle() returned an invalid handle');
+      }
+      this._activeTransientSyncHandles += 1;
+      return { syncHandle, pooled: false, cancelled: false };
+    }
+
+    if (this._syncHandles.has(key)) {
+      const existingHandle = this._syncHandles.get(key);
+      this._syncHandles.delete(key);
+      this._syncHandles.set(key, existingHandle);
+      return { syncHandle: existingHandle, pooled: true, cancelled: false };
+    }
+
+    const inFlight = this._openingSyncHandles.get(key);
+    if (inFlight) {
+      await inFlight.promise;
+      if (this._syncHandles.has(key)) {
+        const sharedHandle = this._syncHandles.get(key);
+        this._syncHandles.delete(key);
+        this._syncHandles.set(key, sharedHandle);
+        return { syncHandle: sharedHandle, pooled: true, cancelled: false };
+      }
+      return { syncHandle: null, pooled: false, cancelled: true };
+    }
+
+    const gen = this._syncPoolGeneration;
+    const openState = { cancelled: false, promise: null };
+    openState.promise = (async () => {
+      const syncHandle = await fileHandle.createSyncAccessHandle();
+      if (!syncHandle || typeof syncHandle !== 'object') {
+        throw new Error('createSyncAccessHandle() returned an invalid handle');
+      }
+      if (openState.cancelled || gen !== this._syncPoolGeneration) {
+        closeSyncHandleSafe(syncHandle);
+        return null;
+      }
+      if (this._syncHandles.has(key)) {
+        const prev = this._syncHandles.get(key);
+        this._syncHandles.delete(key);
+        closeSyncHandleSafe(prev);
+      }
+      while (this._syncHandles.size >= this.maxOpenSyncHandles) {
+        const lruKey = this._syncHandles.keys().next().value;
+        if (lruKey === undefined) break;
+        const lruHandle = this._syncHandles.get(lruKey);
+        this._syncHandles.delete(lruKey);
+        closeSyncHandleSafe(lruHandle);
+      }
+      this._syncHandles.set(key, syncHandle);
+      return syncHandle;
+    })();
+
+    this._openingSyncHandles.set(key, openState);
+    try {
+      const syncHandle = await openState.promise;
+      if (!syncHandle) {
+        return { syncHandle: null, pooled: false, cancelled: true };
+      }
+      return { syncHandle, pooled: true, cancelled: false };
+    } finally {
+      if (this._openingSyncHandles.get(key) === openState) {
+        this._openingSyncHandles.delete(key);
+      }
+    }
+  }
+
+  _writeWithSyncHandle(syncHandle, bytes) {
+    if (typeof syncHandle.truncate === 'function') {
+      syncHandle.truncate(0);
+    }
+    if (bytes.byteLength > 0) {
+      let offset = 0;
+      while (offset < bytes.byteLength) {
+        const view = offset === 0 ? bytes : bytes.subarray(offset);
+        const written = syncHandle.write(view, { at: offset });
+        if (written === undefined) {
+          offset = bytes.byteLength;
+          break;
+        }
+        if (typeof written !== 'number' || !Number.isFinite(written) || written <= 0) {
+          throw new Error('SyncAccessHandle.write() made no progress');
+        }
+        offset += written;
+      }
+    }
+    if (typeof syncHandle.flush === 'function') {
+      syncHandle.flush();
+    }
+  }
+
+  _readWithSyncHandle(syncHandle) {
+    const size = sanitizeNonNegativeInt(syncHandle.getSize(), 0);
+    if (size === 0) {
+      return new Uint8Array(0);
+    }
+    const buf = new Uint8Array(size);
+    let offset = 0;
+    while (offset < size) {
+      const view = offset === 0 ? buf : buf.subarray(offset);
+      const bytesRead = syncHandle.read(view, { at: offset });
+      if (typeof bytesRead !== 'number' || !Number.isFinite(bytesRead) || bytesRead <= 0) {
+        break;
+      }
+      offset += bytesRead;
+    }
+    return offset === size ? buf : buf.slice(0, offset);
+  }
+
   async _writeFile(cacheDir, key, bytes) {
+    if (this.useSyncAccessHandle && this._syncHandles.has(key)) {
+      const existingHandle = this._syncHandles.get(key);
+      this._syncHandles.delete(key);
+      this._syncHandles.set(key, existingHandle);
+      try {
+        this._writeWithSyncHandle(existingHandle, bytes);
+        this._syncHandleWrites += 1;
+        return;
+      } catch (err) {
+        this._closeSyncHandle(key);
+        if (isQuotaExceededError(err)) {
+          throw err;
+        }
+      }
+    }
+
     const handle = await this._getFileHandle(cacheDir, key, { create: true });
+
+    if (this.useSyncAccessHandle && handle && typeof handle.createSyncAccessHandle === 'function') {
+      let acquired = null;
+      try {
+        acquired = await this._acquireSyncHandle(key, handle);
+        if (acquired && acquired.syncHandle) {
+          if (typeof acquired.syncHandle.write !== 'function') {
+            throw new Error('SyncAccessHandle does not support write()');
+          }
+          this._writeWithSyncHandle(acquired.syncHandle, bytes);
+          this._syncHandleWrites += 1;
+          return;
+        }
+      } catch (err) {
+        if (acquired && acquired.pooled) {
+          this._closeSyncHandle(key);
+        }
+        if (isQuotaExceededError(err)) {
+          throw err;
+        }
+        if (!handle || typeof handle.createWritable !== 'function') {
+          throw err;
+        }
+        this._syncHandleFallbacks += 1;
+      } finally {
+        if (acquired && !acquired.pooled && acquired.syncHandle) {
+          this._activeTransientSyncHandles = Math.max(0, this._activeTransientSyncHandles - 1);
+          closeSyncHandleSafe(acquired.syncHandle);
+        }
+      }
+    }
+
     if (!handle || typeof handle.createWritable !== 'function') {
       throw new Error(`OPFS file handle for "${key}" does not support createWritable()`);
+    }
+    if (this._syncHandles.has(key)) {
+      this._closeSyncHandle(key);
     }
     const writable = await handle.createWritable();
     try {
@@ -741,6 +975,22 @@ export class OpfsChunkCache {
   }
 
   async _readFile(cacheDir, key) {
+    if (this.useSyncAccessHandle && this._syncHandles.has(key)) {
+      const existingHandle = this._syncHandles.get(key);
+      this._syncHandles.delete(key);
+      this._syncHandles.set(key, existingHandle);
+      try {
+        const bytes = this._readWithSyncHandle(existingHandle);
+        this._syncHandleReads += 1;
+        return bytes;
+      } catch (err) {
+        this._closeSyncHandle(key);
+        if (isNotFoundError(err)) {
+          return null;
+        }
+      }
+    }
+
     let handle;
     try {
       handle = await this._getFileHandle(cacheDir, key, { create: false });
@@ -750,10 +1000,46 @@ export class OpfsChunkCache {
       }
       throw err;
     }
+
+    if (this.useSyncAccessHandle && handle && typeof handle.createSyncAccessHandle === 'function') {
+      let acquired = null;
+      try {
+        acquired = await this._acquireSyncHandle(key, handle);
+        if (acquired && acquired.syncHandle) {
+          if (
+            typeof acquired.syncHandle.read !== 'function' ||
+            typeof acquired.syncHandle.getSize !== 'function'
+          ) {
+            throw new Error('SyncAccessHandle does not support read()/getSize()');
+          }
+          const bytes = this._readWithSyncHandle(acquired.syncHandle);
+          this._syncHandleReads += 1;
+          return bytes;
+        }
+      } catch (err) {
+        if (acquired && acquired.pooled) {
+          this._closeSyncHandle(key);
+        }
+        if (isNotFoundError(err)) {
+          return null;
+        }
+        if (!handle || typeof handle.getFile !== 'function') {
+          throw err;
+        }
+        this._syncHandleFallbacks += 1;
+      } finally {
+        if (acquired && !acquired.pooled && acquired.syncHandle) {
+          this._activeTransientSyncHandles = Math.max(0, this._activeTransientSyncHandles - 1);
+          closeSyncHandleSafe(acquired.syncHandle);
+        }
+      }
+    }
+
     return readFileHandleBytes(handle);
   }
 
   async _removeFile(cacheDir, key) {
+    this._closeSyncHandle(key);
     const segments = key.split('/');
     const dirChain = [{ dir: cacheDir, name: null }];
     let dir = cacheDir;
@@ -828,8 +1114,7 @@ export class OpfsChunkCache {
       return null;
     }
     try {
-      const handle = await cacheDir.getFileHandle(this.indexFileName, { create: false });
-      const bytes = await readFileHandleBytes(handle);
+      const bytes = await this._readFile(cacheDir, this.indexFileName);
       if (!bytes || bytes.byteLength === 0) {
         return null;
       }
@@ -1865,6 +2150,7 @@ export class OpfsChunkCache {
    */
   async clear() {
     this._cancelFlushTimer();
+    this.closeAllHandles();
     const { supported, dir: cacheDir } = await this._ensureCacheDir({ create: false });
     if (!supported) {
       return { supported: false, removedCount: 0, freedBytes: 0 };
@@ -2269,6 +2555,10 @@ export class OpfsChunkCache {
       prefetchFailed: this._prefetchFailed,
       prefetchBytes: this._prefetchBytes,
       inFlightCount: this._inFlightPrefetches.size,
+      syncHandleReads: this._syncHandleReads,
+      syncHandleWrites: this._syncHandleWrites,
+      syncHandleFallbacks: this._syncHandleFallbacks,
+      openSyncHandles: this._syncHandles.size + this._activeTransientSyncHandles,
     };
   }
 
@@ -2294,16 +2584,31 @@ export class OpfsChunkCache {
     this._prefetchInFlightDeduped = 0;
     this._prefetchFailed = 0;
     this._prefetchBytes = 0;
+    this._syncHandleReads = 0;
+    this._syncHandleWrites = 0;
+    this._syncHandleFallbacks = 0;
     return this.getStats();
   }
 
   /**
-   * Flushes any pending background writes and batched index metadata, and clears pending timers.
+   * Flushes any pending background writes and batched index metadata, clears pending timers,
+   * and closes all open `FileSystemSyncAccessHandle` instances.
    */
   async close() {
     await this.flushBackgroundWrites();
     this._cancelFlushTimer();
-    return this.flushIndex();
+    try {
+      return await this.flushIndex();
+    } finally {
+      this.closeAllHandles();
+    }
+  }
+
+  /**
+   * Alias for `close()` that flushes pending writes/index and releases all sync handles.
+   */
+  async destroy() {
+    return this.close();
   }
 }
 
