@@ -120,8 +120,14 @@ ALLOWED_INPUT_SCRIPT_PRESETS: dict[str, str] = {
     "intro-watch": "intro-watch",
     "legal-notices": "legal-notices",
     "chrome-menu-flow": "chrome-menu-flow",
+    "chrome-full-boot": "chrome-full-boot",
 }
+INPUT_SCRIPT_ALIASES: dict[str, str] = ALLOWED_INPUT_SCRIPT_PRESETS
 _SAFE_INPUT_SCRIPT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+MAX_GPU_ADAPTER_LEN = 96
+_WGPU_ADAPTER_LOG_RE = re.compile(r"\[wgpu_worker\]\s+WebGPU adapter:\s*([^\r\n]+)", re.IGNORECASE)
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_PNG_IEND_CHUNK = b"\x00\x00\x00\x00IEND\xaeB`\x82"
 
 BOOT_OPTIONS_NAME = "boot-options.json"
 DEFAULT_DUMP_PIPELINES_DIR = "/pg6_dump"
@@ -1666,6 +1672,7 @@ class BrowserSessionResult:
     stream_shaders: bool = False
     stream_threshold_mb: float | None = None
     boot_options: dict[str, Any] | None = None
+    gpu_adapter: str | None = None
 
 
 def _format_console_event(params: Mapping[str, Any], elapsed_s: float) -> tuple[str, bool]:
@@ -1781,6 +1788,92 @@ def _extract_input_script(
         cleaned = sanitize_input_script_preset(raw)
         if cleaned is not None:
             return cleaned
+    return None
+
+
+def sanitize_gpu_adapter(raw: Any) -> str | None:
+    """Sanitize a WebGPU adapter string to lowercase safe vendor/arch tokens (max 96 chars, no host paths)."""
+    if not isinstance(raw, str):
+        return None
+    lines = raw.splitlines()
+    first_line = lines[0] if lines else ""
+    if not first_line.strip():
+        return None
+    cleaned = sanitize_text(first_line)
+    cleaned = re.sub(r"<(?:path|user)>", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.lower()
+    segments: list[str] = []
+    for raw_seg in cleaned.split("/"):
+        seg = re.sub(r"\.\.+", " ", raw_seg)
+        seg = re.sub(r"[^a-z0-9._+\- ]+", " ", seg)
+        seg = re.sub(r"\s+", " ", seg).strip(" ._-+")
+        if seg and re.search(r"[a-z0-9]", seg):
+            segments.append(seg)
+    if not segments:
+        return None
+    joined = " / ".join(segments)
+    if len(joined) > MAX_GPU_ADAPTER_LEN:
+        joined = joined[:MAX_GPU_ADAPTER_LEN].rstrip(" /._-+")
+    return joined or None
+
+
+def extract_gpu_adapter_from_line(line: Any) -> str | None:
+    """Extract and sanitize a WebGPU adapter string from one console/log line."""
+    if not isinstance(line, str):
+        return None
+    match = _WGPU_ADAPTER_LOG_RE.search(line)
+    if match is None:
+        return None
+    return sanitize_gpu_adapter(match.group(1))
+
+
+def extract_gpu_adapter_from_console_lines(lines: Sequence[str] | None) -> str | None:
+    """Scan console log lines for `[wgpu_worker] WebGPU adapter: ...` and return the latest sanitized value."""
+    if not lines:
+        return None
+    detected: str | None = None
+    for line in lines:
+        parsed = extract_gpu_adapter_from_line(line)
+        if parsed is not None:
+            detected = parsed
+    return detected
+
+
+def _extract_gpu_adapter(
+    session: BrowserSessionResult,
+    probe: Mapping[str, Any] | None = None,
+) -> str | None:
+    """Resolve sanitized `gpu_adapter` from session, console logs, or probe telemetry."""
+    direct = sanitize_gpu_adapter(session.gpu_adapter)
+    if direct is not None:
+        return direct
+    from_console = extract_gpu_adapter_from_console_lines(session.console_lines)
+    if from_console is not None:
+        return from_console
+    probe_map = probe if isinstance(probe, Mapping) else (
+        session.final_probe if isinstance(session.final_probe, Mapping) else {}
+    )
+    hud = probe_map.get("hud")
+    if isinstance(hud, Mapping):
+        hud_lines = hud.get("logLines")
+        if isinstance(hud_lines, list):
+            from_hud = extract_gpu_adapter_from_console_lines([str(x) for x in hud_lines])
+            if from_hud is not None:
+                return from_hud
+    boot_state = probe_map.get("bootState")
+    if isinstance(boot_state, Mapping):
+        gpu = boot_state.get("gpu")
+        if isinstance(gpu, Mapping):
+            for key in ("adapter", "gpuAdapter", "gpu_adapter"):
+                val = sanitize_gpu_adapter(gpu.get(key))
+                if val is not None:
+                    return val
+    diag = probe_map.get("diagnostics")
+    if isinstance(diag, Mapping):
+        for key in ("gpuAdapter", "gpu_adapter"):
+            val = sanitize_gpu_adapter(diag.get(key))
+            if val is not None:
+                return val
     return None
 
 
@@ -1915,6 +2008,37 @@ def _format_ffmpeg_fps(fps: float) -> str:
     return text if text and text != "0" else f"{fps:.16f}".rstrip("0").rstrip(".")
 
 
+def _is_valid_frame_file(path: Path, ext: str) -> bool:
+    """Return True when `path` is a readable, non-empty, structurally complete PNG/JPEG frame."""
+    try:
+        st = path.stat()
+    except OSError:
+        return False
+    if st.st_size <= 0:
+        return False
+    try:
+        with path.open("rb") as fh:
+            if ext == "png":
+                if st.st_size < len(_PNG_SIGNATURE) + len(_PNG_IEND_CHUNK):
+                    return False
+                if fh.read(len(_PNG_SIGNATURE)) != _PNG_SIGNATURE:
+                    return False
+                tail_len = min(st.st_size, 32)
+                fh.seek(st.st_size - tail_len)
+                return _PNG_IEND_CHUNK in fh.read(tail_len)
+            if ext == "jpg":
+                if st.st_size < 4:
+                    return False
+                if fh.read(2) != b"\xff\xd8":
+                    return False
+                tail_len = min(st.st_size, 16)
+                fh.seek(st.st_size - tail_len)
+                return fh.read(tail_len).rstrip(b"\x00").endswith(b"\xff\xd9")
+    except OSError:
+        return False
+    return True
+
+
 def encode_frames_to_mp4(
     frames_dir: Path,
     out_mp4: Path,
@@ -1940,51 +2064,80 @@ def encode_frames_to_mp4(
     jpg_frames = _list_numbered_frames(frames_dir, "jpg")
     png_frames = _list_numbered_frames(frames_dir, "png") if not jpg_frames else []
     if jpg_frames:
+        ext = "jpg"
         pattern = "frame_%04d.jpg"
         numbered_frames = jpg_frames
     elif png_frames:
+        ext = "png"
         pattern = "frame_%04d.png"
         numbered_frames = png_frames
     else:
         return False, "no captured JPEG frames found for MP4 encoding"
 
-    start_number: int | None = None
-    if skip_black:
-        first_non_black, skipped_count = find_first_non_black_frame_number(
-            numbered_frames,
-            canvas_min_x=canvas_min_x,
-            pil_image_mod=pil_image_mod,
-            _auto_import_pil=_auto_import_pil,
-        )
-        if first_non_black is not None and skipped_count > 0:
-            start_number = first_non_black
+    valid_frames = [(num, path) for num, path in numbered_frames if _is_valid_frame_file(path, ext)]
+    if not valid_frames:
+        return False, "no valid captured frames found for MP4 encoding"
 
-    rate_str = _format_ffmpeg_fps(clean_fps)
-    cmd = [
-        ffmpeg,
-        "-y",
-        "-framerate",
-        rate_str,
-    ]
-    if start_number is not None:
-        cmd += ["-start_number", str(start_number)]
-    cmd += [
-        "-i",
-        str(frames_dir / pattern),
-        "-vf",
-        "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-        "-c:v",
-        "libx264",
-        "-pix_fmt",
-        "yuv420p",
-        "-movflags",
-        "+faststart",
-        str(out_mp4),
-    ]
-    rc = runner(cmd, frames_dir.parent, frames_dir.parent / "ffmpeg.log", 120.0)
-    if rc != 0 or not out_mp4.is_file():
-        return False, f"ffmpeg exited with code {rc}"
-    return True, None
+    needs_staging = len(valid_frames) < len(numbered_frames)
+    stage_ctx: tempfile.TemporaryDirectory[str] | None = None
+    try:
+        if needs_staging:
+            stage_ctx = tempfile.TemporaryDirectory(prefix="playgta6-mp4-frames-")
+            stage_dir = Path(stage_ctx.name)
+            staged_frames: list[tuple[int, Path]] = []
+            for idx, (_orig_num, src_path) in enumerate(valid_frames, start=1):
+                dst_path = stage_dir / f"frame_{idx:04d}.{ext}"
+                try:
+                    os.link(src_path, dst_path)
+                except OSError:
+                    shutil.copy2(src_path, dst_path)
+                staged_frames.append((idx, dst_path))
+            effective_frames_dir = stage_dir
+            effective_frames = staged_frames
+        else:
+            effective_frames_dir = frames_dir
+            effective_frames = valid_frames
+
+        start_number: int | None = None
+        if skip_black:
+            first_non_black, skipped_count = find_first_non_black_frame_number(
+                effective_frames,
+                canvas_min_x=canvas_min_x,
+                pil_image_mod=pil_image_mod,
+                _auto_import_pil=_auto_import_pil,
+            )
+            if first_non_black is not None and skipped_count > 0:
+                start_number = first_non_black
+
+        rate_str = _format_ffmpeg_fps(clean_fps)
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-framerate",
+            rate_str,
+        ]
+        if start_number is not None:
+            cmd += ["-start_number", str(start_number)]
+        cmd += [
+            "-i",
+            str(effective_frames_dir / pattern),
+            "-vf",
+            "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(out_mp4),
+        ]
+        rc = runner(cmd, frames_dir.parent, frames_dir.parent / "ffmpeg.log", 120.0)
+        if rc != 0 or not out_mp4.is_file():
+            return False, f"ffmpeg exited with code {rc}"
+        return True, None
+    finally:
+        if stage_ctx is not None:
+            stage_ctx.cleanup()
 
 
 def run_browser_session(
@@ -2187,10 +2340,12 @@ def run_browser_session(
                 b64_data = shot.get("data")
                 if isinstance(b64_data, str) and b64_data:
                     raw_bytes = base64.b64decode(b64_data)
+                    if not raw_bytes:
+                        return
                     idx = len(result.captured_frames) + 1
                     ext = "png" if use_png_capture else "jpg"
                     fname = f"frame_{idx:04d}.{ext}"
-                    (frames_dir / fname).write_bytes(raw_bytes)
+                    atomic_write_bytes(raw_bytes, frames_dir / fname)
                     result.captured_frames.append(fname)
                     if pil_image_mod is not None:
                         non_black = check_canvas_non_black(
@@ -2212,6 +2367,9 @@ def run_browser_session(
                 if method == "Runtime.consoleAPICalled":
                     line, _is_err = _format_console_event(params, now_s)
                     result.console_lines.append(line)
+                    adapter = extract_gpu_adapter_from_line(line)
+                    if adapter is not None:
+                        result.gpu_adapter = adapter
                 elif method == "Runtime.exceptionThrown":
                     line = _format_exception_event(params, now_s)
                     result.console_lines.append(line)
@@ -2220,7 +2378,11 @@ def run_browser_session(
                     entry = params.get("entry") or {}
                     lvl = str(entry.get("level") or "info")
                     txt = sanitize_text(str(entry.get("text") or ""))
-                    result.console_lines.append(f"[{now_s:7.2f}s] [log.{lvl}] {txt}")
+                    entry_line = f"[{now_s:7.2f}s] [log.{lvl}] {txt}"
+                    result.console_lines.append(entry_line)
+                    adapter = extract_gpu_adapter_from_line(entry_line)
+                    if adapter is not None:
+                        result.gpu_adapter = adapter
                 elif method == "Inspector.targetCrashed":
                     result.crashed = True
                     result.status = "error"
@@ -2320,6 +2482,17 @@ def run_browser_session(
                     result.presents.append(_sample_present_record(final_probe, len(result.presents), wall_ms))
 
         result.elapsed_ms = round((time.monotonic() - start_mono) * 1000.0, 2)
+        if result.gpu_adapter is None:
+            result.gpu_adapter = _extract_gpu_adapter(result)
+        if result.gpu_adapter is None and chrome_log_fh is not None:
+            try:
+                chrome_log_fh.flush()
+                chrome_log_path = run_dir / "chrome.log"
+                if chrome_log_path.is_file():
+                    chrome_log_lines = chrome_log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                    result.gpu_adapter = extract_gpu_adapter_from_console_lines(chrome_log_lines)
+            except OSError:
+                pass
         if result.crashed:
             result.ok = False
             result.exit_code = 1
@@ -2401,6 +2574,7 @@ def build_boot_report(
         stream_shaders or session.stream_shaders or effective_stream_threshold_mb is not None
     )
     effective_boot_options = boot_options if boot_options is not None else session.boot_options
+    effective_gpu_adapter = _extract_gpu_adapter(session, probe)
 
     milestones: list[dict[str, Any]] = []
     raw_milestones = tracer.get("milestones")
@@ -2469,6 +2643,8 @@ def build_boot_report(
     if session.capture_frames_enabled or session.captured_frames or session.non_black_canvas_frames is not None:
         summary["capturedFrames"] = len(session.captured_frames)
         summary["nonBlackCanvasFrames"] = session.non_black_canvas_frames
+    if effective_gpu_adapter is not None:
+        summary["gpu_adapter"] = effective_gpu_adapter
 
     report: dict[str, Any] = {
         "schema": REPORT_SCHEMA,
@@ -2478,6 +2654,7 @@ def build_boot_report(
         "mode": boot_mode,
         "smoke": bool(smoke),
         "inputScript": effective_input_script,
+        "gpu_adapter": effective_gpu_adapter,
         "status": status,
         "phase": phase,
         "exit_code": session.exit_code,
@@ -2542,6 +2719,7 @@ def build_telemetry_payload(
         stream_shaders or session.stream_shaders or effective_stream_threshold_mb is not None
     )
     effective_boot_options = boot_options if boot_options is not None else session.boot_options
+    effective_gpu_adapter = _extract_gpu_adapter(session, probe)
     effective_hide_hud = bool(hide_hud or session.hide_hud)
     effective_mp4_fps = mp4_fps if mp4_fps is not None else session.mp4_fps
     effective_mp4_skip_black = bool(mp4_skip_black or session.mp4_skip_black)
@@ -2558,6 +2736,8 @@ def build_telemetry_payload(
     if session.capture_frames_enabled or session.captured_frames or session.non_black_canvas_frames is not None:
         summary["capturedFrames"] = len(session.captured_frames)
         summary["nonBlackCanvasFrames"] = session.non_black_canvas_frames
+    if effective_gpu_adapter is not None:
+        summary["gpu_adapter"] = effective_gpu_adapter
     return sanitize_value(
         {
             "schema": "playgta6-browser-telemetry",
@@ -2567,6 +2747,7 @@ def build_telemetry_payload(
             "headless": headless,
             "hide_hud": effective_hide_hud,
             "inputScript": effective_input_script,
+            "gpu_adapter": effective_gpu_adapter,
             "stream_shaders": effective_stream_shaders,
             "stream_threshold_mb": effective_stream_threshold_mb,
             "boot_options": dict(effective_boot_options) if effective_boot_options is not None else None,
@@ -2642,6 +2823,9 @@ def digest(report: dict[str, Any], exit_code: int, max_counters: int = 12) -> st
         f"page_errors={counters.get('page_errors', 0)}"
     )
     summary = report.get("summary") if isinstance(report.get("summary"), Mapping) else {}
+    gpu_adapter = sanitize_gpu_adapter(report.get("gpu_adapter") or summary.get("gpu_adapter"))
+    if gpu_adapter:
+        lines.append(f"gpu_adapter: {gpu_adapter}")
     input_script = report.get("inputScript") or summary.get("inputScript")
     if input_script:
         lines.append(f"input_script: {input_script}")
@@ -2773,7 +2957,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "sanitized scripted-input preset appended as ?inputScript=<preset> "
             "(allowed: start-screen, menu-flow, calibration-skip, intro-watch, "
-            "legal-notices, chrome-menu-flow)"
+            "legal-notices, chrome-menu-flow, chrome-full-boot)"
         ),
     )
     p.add_argument(
