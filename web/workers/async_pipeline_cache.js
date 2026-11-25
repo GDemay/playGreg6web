@@ -1,17 +1,19 @@
-// W102 / W138 / W168 / W203 / W263: priority-scheduled, bounded-concurrency async GPU pipeline compilation.
+// W102 / W138 / W168 / W203 / W263 / W305: priority-scheduled, bounded-concurrency async GPU pipeline compilation.
 //
 // A burst of ~200 createRenderPipeline() calls on one frame blocks the GPU process long enough to
 // trip a Windows WDDM TDR and lose the Dawn instance. AsyncPipelineCache routes every compile
 // through create{Render,Compute}PipelineAsync with at most `maxConcurrentCompiles` (default 4,
-// 0 = unlimited, dynamically adjustable via setMaxConcurrentCompiles) compilations in flight,
-// prioritizing demand draws / graphics (render) pipelines ahead of background warmups & compute
-// pipelines (or explicit numeric priority / named priority lanes, FIFO within equal priority),
-// coalesces concurrent identical pipelines by `id` or canonical key (`(kind, dedupeKey/canonicalKey)`
-// or opt-in descriptor canonicalization, promoting queued jobs when a higher-priority caller
-// arrives or via promote()), retries once with a `fallbackDescriptor` (e.g. layout: 'auto') when
-// the primary descriptor rejects (unless device-lost), tracks compile latency percentiles
-// (`p50CompileMs`, `p95CompileMs`) in a bounded ring alongside `activeCompiles`, `coalescedCompiles`,
-// `compileErrors`, and compile-stall / queue-wait telemetry via getTelemetry(), getStats(), and
+// bounded integers clamped to [1, 16]; 0 = legacy unlimited opt-out, dynamically adjustable via
+// setMaxConcurrentCompiles) compilations in flight, prioritizing Start Screen / UI / Main Menu
+// shaders via explicit priority tiers (CRITICAL = 0, HIGH = 1, NORMAL = 2, BACKGROUND = 3) in
+// prewarm() and compile*() calls (alongside legacy numeric/lane priorities, FIFO within equal
+// priority), coalesces concurrent identical pipelines by `id` or canonical key
+// (`(kind, dedupeKey/canonicalKey)` or opt-in descriptor canonicalization, promoting queued jobs
+// when a higher-priority caller arrives or via promote()/promoteTier()), retries once with a
+// `fallbackDescriptor` (e.g. layout: 'auto') when the primary descriptor rejects (unless
+// device-lost), tracks compile latency percentiles (`p50CompileMs`, `p95CompileMs`) in a bounded
+// ring alongside `queuedByPriority`, `activeCompiles`, `peakActiveCompiles`, `compileStallCount`,
+// `avgCompileMs`, `coalescedCompiles`, and `compileErrors` via getTelemetry(), getStats(), and
 // resetStats(), and drops results that resolve after reset(newDevice) (device loss) instead of
 // writing them into the new device.
 //
@@ -23,6 +25,8 @@
   'use strict';
 
 const DEFAULT_MAX_CONCURRENT_PIPELINES = 4;
+const MIN_CONCURRENT_COMPILES = 1;
+const MAX_CONCURRENT_COMPILES = 16;
 const DEFAULT_COMPILE_STALL_THRESHOLD_MS = 16;
 const DEFAULT_COMPILE_LATENCY_RING_SIZE = 128;
 
@@ -31,6 +35,15 @@ const PIPELINE_KIND = Object.freeze({ RENDER: 'render', COMPUTE: 'compute' });
 const DEFAULT_PIPELINE_PRIORITY = Object.freeze({
   render: 10,
   compute: 0,
+});
+
+// W305: Priority tiers for 30 FPS Main Menu & 3D scene transition PSO scheduling
+// (lower tier number = higher urgency: CRITICAL UI compiles ahead of BACKGROUND world shaders).
+const PIPELINE_PRIORITY_TIER = Object.freeze({
+  CRITICAL: 0,
+  HIGH: 1,
+  NORMAL: 2,
+  BACKGROUND: 3,
 });
 
 const PIPELINE_PRIORITY_LANE = Object.freeze({
@@ -45,6 +58,14 @@ const PIPELINE_PRIORITY_LANE = Object.freeze({
   HIGH: 20,
   DEMAND: 100,
   URGENT: 100,
+  CRITICAL: 100,
+});
+
+const TIER_TO_PRIORITY_SCORE = Object.freeze({
+  [PIPELINE_PRIORITY_TIER.CRITICAL]: PIPELINE_PRIORITY_LANE.CRITICAL,
+  [PIPELINE_PRIORITY_TIER.HIGH]: PIPELINE_PRIORITY_LANE.HIGH,
+  [PIPELINE_PRIORITY_TIER.NORMAL]: PIPELINE_PRIORITY_LANE.NORMAL,
+  [PIPELINE_PRIORITY_TIER.BACKGROUND]: PIPELINE_PRIORITY_LANE.BACKGROUND,
 });
 
 const PIPELINE_STATUS = Object.freeze({
@@ -68,17 +89,26 @@ const DEVICE_METHODS = Object.freeze({
  */
 function normalizeMaxConcurrent(value) {
   const n = Number(value);
-  return Number.isInteger(n) && n >= 1 ? n : DEFAULT_MAX_CONCURRENT_PIPELINES;
+  if (Number.isInteger(n) && n >= MIN_CONCURRENT_COMPILES) {
+    return Math.min(MAX_CONCURRENT_COMPILES, n);
+  }
+  return DEFAULT_MAX_CONCURRENT_PIPELINES;
 }
 
 /**
+ * Normalize `maxConcurrentCompiles`: positive integers are clamped to [1, 16] so sudden shader
+ * bursts never saturate Chrome Tint / D3D12 compiler threads and stall 30 FPS presentation;
+ * explicit 0 preserves the legacy unlimited opt-out; invalid values fall back to default 4.
  * @param {unknown} value
  * @returns {number}
  */
 function normalizeMaxConcurrentCompiles(value) {
   if (value === 0) return 0;
   const n = Number(value);
-  return Number.isInteger(n) && n >= 1 ? n : DEFAULT_MAX_CONCURRENT_PIPELINES;
+  if (Number.isInteger(n) && n >= MIN_CONCURRENT_COMPILES) {
+    return Math.min(MAX_CONCURRENT_COMPILES, n);
+  }
+  return DEFAULT_MAX_CONCURRENT_PIPELINES;
 }
 
 /**
@@ -273,6 +303,37 @@ function resolvePipelinePriority(kind, priority, prioritizeGraphics, lane) {
 }
 
 /**
+ * W305: Parse a priority tier (`CRITICAL = 0`, `HIGH = 1`, `NORMAL = 2`, `BACKGROUND = 3`),
+ * a named tier/lane string ('critical', 'high', 'normal', 'background', ...), or `{ tier / priorityTier }`
+ * into its internal scheduling score (higher score dispatches earlier).
+ * @param {unknown} value
+ * @returns {number | null}
+ */
+function parsePriorityTier(value) {
+  if (typeof value === 'number' && Number.isInteger(value)) {
+    if (Object.prototype.hasOwnProperty.call(TIER_TO_PRIORITY_SCORE, value)) {
+      return TIER_TO_PRIORITY_SCORE[value];
+    }
+    return null;
+  }
+  if (typeof value === 'string') {
+    const key = value.trim().toUpperCase();
+    if (key && Object.prototype.hasOwnProperty.call(PIPELINE_PRIORITY_TIER, key)) {
+      return TIER_TO_PRIORITY_SCORE[PIPELINE_PRIORITY_TIER[key]];
+    }
+    if (key && Object.prototype.hasOwnProperty.call(PIPELINE_PRIORITY_LANE, key)) {
+      return PIPELINE_PRIORITY_LANE[key];
+    }
+    return null;
+  }
+  if (value && typeof value === 'object') {
+    if (value.priorityTier !== undefined) return parsePriorityTier(value.priorityTier);
+    if (value.tier !== undefined) return parsePriorityTier(value.tier);
+  }
+  return null;
+}
+
+/**
  * @param {number} priority
  * @returns {'urgent' | 'high' | 'normal' | 'low' | 'background'}
  */
@@ -281,6 +342,18 @@ function classifyPriorityLane(priority) {
   if (priority >= PIPELINE_PRIORITY_LANE.HIGH) return 'high';
   if (priority >= PIPELINE_PRIORITY_LANE.NORMAL) return 'normal';
   if (priority >= PIPELINE_PRIORITY_LANE.LOW) return 'low';
+  return 'background';
+}
+
+/**
+ * W305: Map an internal scheduling score to one of the 4 priority tier telemetry buckets.
+ * @param {number} priority
+ * @returns {'critical' | 'high' | 'normal' | 'background'}
+ */
+function classifyPriorityTier(priority) {
+  if (priority >= PIPELINE_PRIORITY_LANE.CRITICAL) return 'critical';
+  if (priority >= PIPELINE_PRIORITY_LANE.HIGH) return 'high';
+  if (priority >= PIPELINE_PRIORITY_LANE.LOW) return 'normal';
   return 'background';
 }
 
@@ -444,14 +517,16 @@ class AsyncPipelineCache {
 
   /**
    * Promote a queued pipeline compilation by entry `id` or `dedupeKey` to a higher priority
-   * (numeric or named lane such as 'urgent', 'high', 'normal').
+   * (numeric, named lane such as 'critical', 'urgent', 'high', 'normal', or `{ tier }`).
    * @param {unknown} idOrKey
-   * @param {number | string} [priority]
+   * @param {number | string | { tier?: number | string, priorityTier?: number | string }} [priority]
    * @param {'render' | 'compute' | null} [kind]
    * @returns {boolean} whether any queued job was promoted.
    */
   promote(idOrKey, priority = PIPELINE_PRIORITY_LANE.URGENT, kind = null) {
-    const targetPriority = parsePriorityValue(priority);
+    const targetPriority = (priority && typeof priority === 'object')
+      ? parsePriorityTier(priority)
+      : parsePriorityValue(priority);
     if (targetPriority === null) return false;
 
     const entry = this._entries.get(idOrKey);
@@ -479,6 +554,64 @@ class AsyncPipelineCache {
     }
 
     return false;
+  }
+
+  /**
+   * W305: Elevate a queued pipeline compilation to a W305 priority tier
+   * (`CRITICAL = 0`, `HIGH = 1`, `NORMAL = 2`, `BACKGROUND = 3` or tier name).
+   * @param {unknown} idOrKey
+   * @param {number | string} [tier]
+   * @param {'render' | 'compute' | null} [kind]
+   * @returns {boolean}
+   */
+  promoteTier(idOrKey, tier = PIPELINE_PRIORITY_TIER.CRITICAL, kind = null) {
+    const score = parsePriorityTier(tier);
+    if (score === null) return false;
+    return this.promote(idOrKey, score, kind);
+  }
+
+  /**
+   * W305: Priority-tiered async pipeline prewarm for Start Screen / UI / Main Menu & 3D scene
+   * transitions. Accepts either a single `(id, descriptor, options)` request or a batch array
+   * `prewarm([{ id, descriptor, kind?, priority?, priorityTier?, dedupeKey?, canonicalKey?,
+   * fallbackDescriptor? }, ...], defaultOptions?)`.
+   *
+   * Within `prewarm()`, `priority` and `priorityTier` interpret W305 tiers:
+   *   `CRITICAL = 0` > `HIGH = 1` > `NORMAL = 2` > `BACKGROUND = 3` (default).
+   * Batch calls dispatch higher-priority tiers first into available concurrency slots while
+   * returning results aligned 1:1 with the caller's request order.
+   */
+  prewarm(idOrRequests, descriptorOrOptions, options = {}) {
+    if (Array.isArray(idOrRequests)) {
+      const batchDefaults = descriptorOrOptions && typeof descriptorOrOptions === 'object'
+        ? descriptorOrOptions
+        : {};
+      const count = idOrRequests.length;
+      const promises = new Array(count);
+      const planned = [];
+      for (let i = 0; i < count; i += 1) {
+        const req = idOrRequests[i];
+        if (!req || typeof req !== 'object') {
+          promises[i] = Promise.resolve({
+            id: undefined,
+            status: PIPELINE_STATUS.FAILED,
+            error: new Error('AsyncPipelineCache: invalid prewarm request entry'),
+          });
+          continue;
+        }
+        const merged = { ...batchDefaults, ...req };
+        const score = this._resolvePrewarmPriorityScore(merged);
+        planned.push({ index: i, req, merged, score });
+      }
+      planned.sort((a, b) => (b.score - a.score) || (a.index - b.index));
+      for (let i = 0; i < planned.length; i += 1) {
+        const item = planned[i];
+        const reqId = item.req.id !== undefined ? item.req.id : item.req.key;
+        promises[item.index] = this._prewarmOne(reqId, item.req.descriptor, item.merged);
+      }
+      return Promise.all(promises);
+    }
+    return this._prewarmOne(idOrRequests, descriptorOrOptions, options);
   }
 
   /**
@@ -622,6 +755,7 @@ class AsyncPipelineCache {
       ? this._totalQueueWaitMs / this._startedJobCount
       : 0;
     const { p50CompileMs, p95CompileMs } = this._computeCompileLatencyPercentiles();
+    const queuedByPriority = this._getQueuedPriorityBreakdown();
     const stats = {
       generation: this.generation,
       maxConcurrent: this.maxConcurrent,
@@ -639,13 +773,17 @@ class AsyncPipelineCache {
       maxCompileMs: this._maxCompileMs,
       priorityPromotions: this._priorityPromotions,
     };
-    // W203 / W263 canonical telemetry properties exposed on getStats() as non-enumerable properties
-    // so legacy deepEqual snapshots keep their exact own-enumerable shape while callers reading
-    // stats.p50CompileMs / p95CompileMs / coalescedCompiles / compileErrors / inFlightCount / ...
-    // work without needing a separate call. Use getTelemetry() for an all-enumerable snapshot.
+    // W203 / W263 / W305 canonical telemetry properties exposed on getStats() as non-enumerable
+    // properties so legacy deepEqual snapshots keep their exact own-enumerable shape while callers
+    // reading stats.queuedByPriority / peakActiveCompiles / compileStallCount / p50CompileMs /
+    // p95CompileMs / coalescedCompiles / compileErrors / ... work without needing a separate call.
+    // Use getTelemetry() for an all-enumerable snapshot.
     Object.defineProperties(stats, {
       inFlightCount: { value: this._inFlight, enumerable: false, configurable: true },
       queuedCount: { value: this._queue.length, enumerable: false, configurable: true },
+      queuedByPriority: { value: queuedByPriority, enumerable: false, configurable: true },
+      peakActiveCompiles: { value: this._peakInFlightCompiles, enumerable: false, configurable: true },
+      compileStallCount: { value: this._stallCount, enumerable: false, configurable: true },
       promotedCount: { value: this._queuedPromotions, enumerable: false, configurable: true },
       dedupedCount: { value: this._dedupedCount, enumerable: false, configurable: true },
       completedCount: { value: this._stats.compiled, enumerable: false, configurable: true },
@@ -665,7 +803,8 @@ class AsyncPipelineCache {
   }
 
   /**
-   * W203 / W263: Return an all-enumerable compile queue, coalescing, latency percentile & stall telemetry snapshot.
+   * W203 / W263 / W305: Return an all-enumerable compile queue, priority tier, coalescing,
+   * latency percentile & stall telemetry snapshot.
    */
   getTelemetry() {
     const avgCompileMs = this._asyncCompileCount > 0
@@ -679,6 +818,7 @@ class AsyncPipelineCache {
       generation: this.generation,
       maxConcurrentCompiles: this.maxConcurrentCompiles,
       activeCompiles: this._inFlight,
+      peakActiveCompiles: this._peakInFlightCompiles,
       inFlightCount: this._inFlight,
       peakInFlightCount: this._peakInFlightCompiles,
       queuedCount: this._queue.length,
@@ -705,11 +845,42 @@ class AsyncPipelineCache {
       avgQueueWaitMs,
       stallThresholdMs: this.stallThresholdMs,
       stallCount: this._stallCount,
+      compileStallCount: this._stallCount,
       queueByLane: this._getQueuedLaneBreakdown(),
+      queuedByPriority: this._getQueuedPriorityBreakdown(),
     };
   }
 
   // -------------------------------------------------------------------------------------------
+
+  _resolvePrewarmPriorityScore(opts) {
+    const rawTier = opts.priorityTier !== undefined
+      ? opts.priorityTier
+      : (opts.tier !== undefined
+        ? opts.tier
+        : (opts.priority !== undefined ? opts.priority : PIPELINE_PRIORITY_TIER.BACKGROUND));
+    const tierScore = parsePriorityTier(rawTier);
+    if (tierScore !== null) return tierScore;
+    const numeric = parsePriorityValue(rawTier);
+    if (numeric !== null) return numeric;
+    return PIPELINE_PRIORITY_LANE.BACKGROUND;
+  }
+
+  _prewarmOne(id, descriptor, options) {
+    const opts = options && typeof options === 'object' ? options : {};
+    const kind = opts.kind === PIPELINE_KIND.COMPUTE
+      ? PIPELINE_KIND.COMPUTE
+      : PIPELINE_KIND.RENDER;
+    const priorityScore = this._resolvePrewarmPriorityScore(opts);
+    const compileOpts = {
+      ...opts,
+      priority: priorityScore,
+    };
+    delete compileOpts.priorityTier;
+    delete compileOpts.tier;
+    delete compileOpts.kind;
+    return this._compile(kind, id, descriptor, compileOpts);
+  }
 
   _compile(kind, id, descriptor, options) {
     const opts = options && typeof options === 'object' ? options : {};
@@ -723,14 +894,20 @@ class AsyncPipelineCache {
       dedupeKey = canonicalizePipelineKey(descriptor, { ignoreTopLevelLabel: true });
     }
     const dedupeMapKey = makeDedupeMapKey(kind, dedupeKey);
-    const parsedPriority = parsePriorityValue(opts.priority);
+    const parsedTier = opts.priorityTier !== undefined
+      ? parsePriorityTier(opts.priorityTier)
+      : (opts.tier !== undefined ? parsePriorityTier(opts.tier) : null);
+    const parsedPriority = parsedTier !== null ? parsedTier : parsePriorityValue(opts.priority);
     const parsedLane = parsedPriority === null ? parsePriorityValue(opts.lane) : null;
     const semanticPriority = (parsedPriority === null && parsedLane === null)
       ? (opts.demand === true
         ? PIPELINE_PRIORITY_LANE.DEMAND
         : ((opts.warmup === true || opts.isWarmup === true) ? PIPELINE_PRIORITY_LANE.WARMUP : null))
       : null;
-    const hasExplicitPriority = parsedPriority !== null || parsedLane !== null || semanticPriority !== null;
+    const hasExplicitPriority = parsedTier !== null
+      || parsedPriority !== null
+      || parsedLane !== null
+      || semanticPriority !== null;
     const priority = resolvePipelinePriority(
       kind,
       parsedPriority !== null ? parsedPriority : (parsedLane !== null ? parsedLane : semanticPriority),
@@ -875,6 +1052,14 @@ class AsyncPipelineCache {
       lanes[classifyPriorityLane(this._queue[i].priority)] += 1;
     }
     return lanes;
+  }
+
+  _getQueuedPriorityBreakdown() {
+    const tiers = { critical: 0, high: 0, normal: 0, background: 0 };
+    for (let i = 0; i < this._queue.length; i += 1) {
+      tiers[classifyPriorityTier(this._queue[i].priority)] += 1;
+    }
+    return tiers;
   }
 
   _compileSync(job, device, methods, allowSyncFallback) {
@@ -1165,13 +1350,18 @@ class AsyncPipelineCache {
 const exportedApi = {
   AsyncPipelineCache,
   DEFAULT_MAX_CONCURRENT_PIPELINES,
+  MIN_CONCURRENT_COMPILES,
+  MAX_CONCURRENT_COMPILES,
   DEFAULT_PIPELINE_PRIORITY,
   DEFAULT_COMPILE_STALL_THRESHOLD_MS,
   DEFAULT_COMPILE_LATENCY_RING_SIZE,
   PIPELINE_KIND,
   PIPELINE_PRIORITY_LANE,
+  PIPELINE_PRIORITY_TIER,
   PIPELINE_STATUS,
   canonicalizePipelineKey,
+  classifyPriorityTier,
+  parsePriorityTier,
   isDeviceLostError,
 };
 
