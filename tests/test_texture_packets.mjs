@@ -399,6 +399,9 @@ test('CreateTexture2 creates a texture with format, samples and view formats in 
     bytesUploaded: 0,
     srgbSiblingViewFormatsAdded: 0,
     promoted1DTo2DCount: 0,
+    chunkedWrites: 0,
+    trimmedStagingBytes: 0,
+    destroyedTextures: 0,
   });
   const [rt, tex] = gpu.calls.filter((c) => c.op === 'createTexture').map((c) => c.desc);
   assert.deepEqual(rt, {
@@ -693,6 +696,9 @@ test('staged WriteTexture & copyBufferToTexture repack unaligned bytesPerRow to 
     bytesUploaded: 1024,
     srgbSiblingViewFormatsAdded: 1,
     promoted1DTo2DCount: 0,
+    chunkedWrites: 0,
+    trimmedStagingBytes: 0,
+    destroyedTextures: 0,
   });
 });
 
@@ -764,6 +770,9 @@ test('direct queue.writeTexture safely copies SharedArrayBuffer views and tracks
     bytesUploaded: 32,
     srgbSiblingViewFormatsAdded: 1,
     promoted1DTo2DCount: 0,
+    chunkedWrites: 0,
+    trimmedStagingBytes: 0,
+    destroyedTextures: 0,
   });
 });
 
@@ -854,6 +863,9 @@ test('handler.copyBufferToTexture repacks both CPU-backed and GPU-buffer-only un
     bytesUploaded: 1536,
     srgbSiblingViewFormatsAdded: 1,
     promoted1DTo2DCount: 0,
+    chunkedWrites: 0,
+    trimmedStagingBytes: 0,
+    destroyedTextures: 0,
   });
   for (const [key, val] of Object.entries(stats)) {
     assert.equal(typeof val, 'number', `stat ${key} must be numeric`);
@@ -1069,6 +1081,9 @@ test('W108 (#734): 3D BC textures fall back to rgba8unorm without bc-sliced-3d a
     bytesUploaded: 0,
     srgbSiblingViewFormatsAdded: 0,
     promoted1DTo2DCount: 0,
+    chunkedWrites: 0,
+    trimmedStagingBytes: 0,
+    destroyedTextures: 0,
   });
 });
 
@@ -1315,6 +1330,9 @@ test('W164 (#871): 4K Bink2 3840x2160 r8unorm Y plane takes zero-copy direct que
     bytesUploaded: W * H,
     srgbSiblingViewFormatsAdded: 0,
     promoted1DTo2DCount: 0,
+    chunkedWrites: 0,
+    trimmedStagingBytes: 0,
+    destroyedTextures: 0,
   });
 });
 
@@ -1452,6 +1470,9 @@ test('W164 (#871): 4K Bink2 1920x1080 r8unorm Cr/Cb planes reuse persistent scra
     bytesUploaded: expectedBytes,
     srgbSiblingViewFormatsAdded: 0,
     promoted1DTo2DCount: 0,
+    chunkedWrites: 0,
+    trimmedStagingBytes: 0,
+    destroyedTextures: 0,
   });
 });
 
@@ -1704,6 +1725,9 @@ test('W164 (#871): telemetry resets cleanly on reset(), destroy(), and processor
     bytesUploaded: 0,
     srgbSiblingViewFormatsAdded: 0,
     promoted1DTo2DCount: 0,
+    chunkedWrites: 0,
+    trimmedStagingBytes: 0,
+    destroyedTextures: 0,
   };
 
   // 1) reset() clears counters and releases scratch buffer, while handler stays usable.
