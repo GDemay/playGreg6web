@@ -295,6 +295,24 @@ class RunTests(unittest.TestCase):
             args = json.loads((fx.build / "runs" / "mf" / "boot-report.json").read_text())["args"]
             self.assertEqual(args[args.index("--max-ms") + 1], "240000")
 
+    def test_menu_flow_2_preset(self):
+        self.assertEqual(rnb.PRESETS["menu-flow-2"]["max_ms"], 450_000)
+        script = rnb.input_script_text(450_000, "menu-flow-2").splitlines()
+        events = [line.split() for line in script if not line.startswith("#")]
+        times = [int(e[0]) for e in events]
+        self.assertEqual(times, sorted(times))
+        self.assertLess(times[-1], 450_000)
+        # menu-flow up to 95 s, then A leaves the list screen.
+        self.assertIn(["92500", "A", "100"], events)
+        self.assertEqual(events[events.index(["92500", "A", "100"]) + 1], ["101500", "A", "100"])
+        # Down x N + A, N = 1..5, every 25 s; N = 5 ends with the A at 234 s.
+        self.assertEqual(events.count(["225000", "DDown", "150"]), 1)
+        self.assertEqual([e for e in events if 225_000 <= int(e[0]) <= 235_000][-1], ["234000", "A", "100"])
+        self.assertEqual(len([e for e in events if e[1] == "DDown" and 125_000 <= int(e[0]) < 235_000]), 15)
+        # then A every 9 s
+        self.assertIn(["255000", "A", "100"], events)
+        self.assertIn(["264000", "A", "100"], events)
+
     def test_presets(self):
         self.assertEqual(rnb.PRESETS["long"]["max_ms"], 600_000)
         self.assertFalse(rnb.PRESETS["smoke"]["input"])

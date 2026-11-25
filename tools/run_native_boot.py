@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """One-command native boot runner: rebuild what is stale, run `playgta6_boot`, keep the run.
 
-    python tools/run_native_boot.py [--preset smoke|start-screen|menu-flow|long] [--name NAME]
+    python tools/run_native_boot.py [--preset smoke|start-screen|menu-flow|menu-flow-2|long] [--name NAME]
         [--exe PATH] [--game-dir DIR] [options] [-- extra playgta6_boot options]
 
 What it does, in order:
@@ -71,6 +71,7 @@ PRESETS: dict[str, dict] = {
     "smoke": {"max_ms": 60_000, "watchdog_ms": 90_000, "input": None},
     "start-screen": {"max_ms": 120_000, "watchdog_ms": 150_000, "input": "start-screen"},
     "menu-flow": {"max_ms": 240_000, "watchdog_ms": 270_000, "input": "menu-flow"},
+    "menu-flow-2": {"max_ms": 450_000, "watchdog_ms": 480_000, "input": "menu-flow-2"},
     "long": {"max_ms": 600_000, "watchdog_ms": 630_000, "input": None},
 }
 INPUT_START_MS = 5_000
@@ -259,7 +260,30 @@ def menu_flow_script_text(duration_ms: int) -> str:
     return "\n".join(lines) + "\n"
 
 
+def menu_flow_2_script_text(duration_ms: int) -> str:
+    """The menu-flow-2 preset: menu-flow up to 95 s, then past the list screen after LEGAL NOTICES.
+    A at 101.5 s leaves the list screen (4 -> 20 draws per frame); on the next screen Down x N then
+    A (N = 1..5, 25 s apart, the cursor is cumulative) advances at N = 5 (A at 234 s, 20 -> 30
+    draws per frame); then A every 9 s walks through the following screens (23, then 37 draws per
+    frame from about 295 s, which holds)."""
+    lines = ["# menu-flow-2 (tools/run_native_boot.py): menu-flow to 95 s; A at 101.5 s (list screen);",
+             "# Down x N + A for N = 1..5 every 25 s from 125 s; then A every 9 s"]
+    events = [e for e in (l.split() for l in menu_flow_script_text(95_000).splitlines() if not l.startswith("#"))]
+    events = [(int(t), b, int(h)) for t, b, h in events]
+    events.append((101_500, "A", INPUT_HOLD_MS))
+    t = 125_000
+    for n in range(1, 6):
+        events += [(t + i * 1_500, "DDown", 150) for i in range(n)]
+        events.append((t + n * 1_500 + 1_500, "A", INPUT_HOLD_MS))
+        t += 25_000
+    events += [(u, "A", INPUT_HOLD_MS) for u in range(t + 5_000, duration_ms, 9_000)]
+    lines += [f"{u} {b} {h}" for u, b, h in events if u < duration_ms]
+    return "\n".join(lines) + "\n"
+
+
 def input_script_text(duration_ms: int, kind: str = "start-screen") -> str:
+    if kind == "menu-flow-2":
+        return menu_flow_2_script_text(duration_ms)
     if kind == "menu-flow":
         return menu_flow_script_text(duration_ms)
     lines = ["# A pressed once a second from 5 s (tools/run_native_boot.py, start-screen preset)"]
