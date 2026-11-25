@@ -8,6 +8,10 @@
 import { sanitizeString, sanitizeValue } from './crash_report.js';
 
 export const DEFAULT_MAX_TRAPS = 256;
+export const DEFAULT_SLOW_THRESHOLD_MS = null;
+export const CHROME_TRACE_CATEGORY = 'playgta6.boot';
+export const DEFAULT_TRACE_PID = 1;
+export const DEFAULT_TRACE_TID = 1;
 export const MAX_MESSAGE_LENGTH = 512;
 export const STAGE_NOT_STARTED = 'NOT_STARTED';
 
@@ -318,6 +322,27 @@ function resolveTrapKind(kind) {
   return name;
 }
 
+function validateSlowThresholdMs(value) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    throw new RangeError(`slowThresholdMs must be a non-negative finite number or null, got ${value}`);
+  }
+  return value;
+}
+
+function validateTraceId(value, label) {
+  if (!Number.isInteger(value) || value < 0) {
+    throw new RangeError(`${label} must be a non-negative integer, got ${value}`);
+  }
+  return value;
+}
+
+function msToMicros(ms) {
+  return Number.isFinite(ms) ? Math.max(0, Math.round(ms * 1000)) : 0;
+}
+
 /**
  * Tracks guest boot progress through `BOOT_MILESTONES` and collects guest traps
  * (unimplemented opcodes, unresolved imports, indirect-call misses, ...) into a
@@ -329,6 +354,7 @@ export class BootTracer {
    * @param {number} [options.maxTraps=256] Ring capacity for recent trap records.
    * @param {() => number} [options.now] Monotonic clock in milliseconds.
    * @param {number} [options.startMs] Boot start timestamp (defaults to `now()`).
+   * @param {number|null} [options.slowThresholdMs=null] Optional inter-milestone delta threshold in ms for flagging slow milestones.
    * @param {{ recordError?: Function, recordLog?: Function }} [options.crashReporter]
    * @param {{ setStatus?: Function, updateMetrics?: Function }} [options.hud]
    */
@@ -336,7 +362,14 @@ export class BootTracer {
     if (options !== undefined && (options === null || typeof options !== 'object')) {
       throw new TypeError('BootTracer options must be an object');
     }
-    const { maxTraps = DEFAULT_MAX_TRAPS, now = defaultNow, startMs, crashReporter = null, hud = null } = options;
+    const {
+      maxTraps = DEFAULT_MAX_TRAPS,
+      now = defaultNow,
+      startMs,
+      slowThresholdMs = DEFAULT_SLOW_THRESHOLD_MS,
+      crashReporter = null,
+      hud = null,
+    } = options;
 
     if (!Number.isInteger(maxTraps) || maxTraps < 1) {
       throw new RangeError(`maxTraps must be a positive integer, got ${maxTraps}`);
@@ -344,9 +377,11 @@ export class BootTracer {
     if (typeof now !== 'function') {
       throw new TypeError('now must be a function returning milliseconds');
     }
+    const validatedSlowThresholdMs = validateSlowThresholdMs(slowThresholdMs);
 
     this._maxTraps = maxTraps;
     this._now = now;
+    this._slowThresholdMs = validatedSlowThresholdMs;
     this._crashReporter = crashReporter && typeof crashReporter === 'object' ? crashReporter : null;
     this._hud = hud && typeof hud === 'object' ? hud : null;
     this._traps = new TrapRing(maxTraps);
@@ -355,6 +390,10 @@ export class BootTracer {
 
   get maxTraps() {
     return this._maxTraps;
+  }
+
+  get slowThresholdMs() {
+    return this._slowThresholdMs;
   }
 
   get trapCount() {
@@ -371,7 +410,9 @@ export class BootTracer {
     const start = typeof startMs === 'number' && Number.isFinite(startMs) ? startMs : this._now();
     this._startMs = Number.isFinite(start) ? start : 0;
     this._lastElapsedMs = 0;
+    this._lastMilestoneElapsedMs = 0;
     this._milestones = new Map();
+    this._milestoneOrder = [];
     this._highestIdx = -1;
     this._traps.clear();
     this._trapCount = 0;
@@ -439,8 +480,21 @@ export class BootTracer {
 
     if (firstReach) {
       const safeDetail = detail === undefined ? null : sanitizeValue(detail);
-      entry = { milestone: name, index, elapsedMs, lastElapsedMs: elapsedMs, count: 1, detail: safeDetail ?? null };
+      const deltaFromPrevMs = Math.max(0, elapsedMs - this._lastMilestoneElapsedMs);
+      this._lastMilestoneElapsedMs = elapsedMs;
+      const slow = this._slowThresholdMs !== null && deltaFromPrevMs > this._slowThresholdMs;
+      entry = {
+        milestone: name,
+        index,
+        elapsedMs,
+        lastElapsedMs: elapsedMs,
+        deltaFromPrevMs,
+        slow,
+        count: 1,
+        detail: safeDetail ?? null,
+      };
       this._milestones.set(name, entry);
+      this._milestoneOrder.push(name);
       if (index > this._highestIdx) {
         this._highestIdx = index;
       }
@@ -583,15 +637,235 @@ export class BootTracer {
   }
 
   /**
+   * Returns reached milestones in chronological first-reach order with inter-milestone
+   * delta timings and cumulative elapsed time from boot start.
+   *
+   * @param {object} [options]
+   * @param {number|null} [options.slowThresholdMs] Optional override for slow-milestone flagging.
+   * @returns {Array<{ name: string, index: number, atMs: number, deltaMs: number,
+   *   deltaFromPrevMs: number, cumulativeMs: number, slow: boolean }>}
+   */
+  getMilestoneDeltas(options = {}) {
+    if (options !== undefined && (options === null || typeof options !== 'object')) {
+      throw new TypeError('getMilestoneDeltas options must be an object');
+    }
+    const threshold =
+      options.slowThresholdMs !== undefined
+        ? validateSlowThresholdMs(options.slowThresholdMs)
+        : this._slowThresholdMs;
+
+    return this._milestoneOrder.map((name) => {
+      const entry = this._milestones.get(name);
+      const slow = threshold !== null && entry.deltaFromPrevMs > threshold;
+      return {
+        name: entry.milestone,
+        index: entry.index,
+        atMs: entry.elapsedMs,
+        deltaMs: entry.deltaFromPrevMs,
+        deltaFromPrevMs: entry.deltaFromPrevMs,
+        cumulativeMs: entry.elapsedMs,
+        slow,
+      };
+    });
+  }
+
+  /**
+   * Exports a sanitized Chromium `chrome://tracing` / Perfetto JSON trace object
+   * containing `ph: 'X'` boot phase spans and `ph: 'i'` instant milestone (and optional trap)
+   * markers with timestamps and durations in microseconds.
+   *
+   * @param {object} [options]
+   * @param {number} [options.pid=1] Process id for trace events.
+   * @param {number} [options.tid=1] Thread id for trace events.
+   * @param {string} [options.category='playgta6.boot'] Trace event category.
+   * @param {boolean} [options.includeTraps=true] Whether to include trap instant markers.
+   * @param {boolean} [options.includeMetadata=false] Whether to include `ph: 'M'` process/thread name events.
+   * @param {number|null} [options.slowThresholdMs] Optional override for slow-milestone tagging.
+   * @returns {{ traceEvents: object[], displayTimeUnit: 'ms', metadata: object }}
+   */
+  toChromeTraceEvents(options = {}) {
+    if (options !== undefined && (options === null || typeof options !== 'object')) {
+      throw new TypeError('toChromeTraceEvents options must be an object');
+    }
+    const {
+      pid = DEFAULT_TRACE_PID,
+      tid = DEFAULT_TRACE_TID,
+      category = CHROME_TRACE_CATEGORY,
+      includeTraps = true,
+      includeMetadata = false,
+      slowThresholdMs,
+    } = options;
+
+    validateTraceId(pid, 'pid');
+    validateTraceId(tid, 'tid');
+    const threshold =
+      slowThresholdMs !== undefined ? validateSlowThresholdMs(slowThresholdMs) : this._slowThresholdMs;
+    const safeCategory =
+      typeof category === 'string' && category.trim().length > 0
+        ? clip(category.trim(), 128)
+        : CHROME_TRACE_CATEGORY;
+
+    const metadataEvents = [];
+    if (includeMetadata) {
+      metadataEvents.push(
+        {
+          name: 'process_name',
+          ph: 'M',
+          pid,
+          tid: 0,
+          args: { name: 'playgta6web' },
+        },
+        {
+          name: 'thread_name',
+          ph: 'M',
+          pid,
+          tid,
+          args: { name: 'guest-boot' },
+        }
+      );
+    }
+
+    const timedEvents = [];
+    let prevAtMs = 0;
+    let prevUs = 0;
+
+    for (const name of this._milestoneOrder) {
+      const entry = this._milestones.get(name);
+      const atUs = msToMicros(entry.elapsedMs);
+      const durUs = Math.max(0, atUs - prevUs);
+      const slow = threshold !== null && entry.deltaFromPrevMs > threshold;
+
+      timedEvents.push({
+        name: `phase:${entry.milestone}`,
+        cat: safeCategory,
+        ph: 'X',
+        ts: prevUs,
+        dur: durUs,
+        pid,
+        tid,
+        args: {
+          milestone: entry.milestone,
+          index: entry.index,
+          fromMs: prevAtMs,
+          atMs: entry.elapsedMs,
+          deltaMs: entry.deltaFromPrevMs,
+          deltaFromPrevMs: entry.deltaFromPrevMs,
+          cumulativeMs: entry.elapsedMs,
+          slow,
+          count: entry.count,
+        },
+      });
+
+      const markerArgs = {
+        milestone: entry.milestone,
+        index: entry.index,
+        atMs: entry.elapsedMs,
+        deltaMs: entry.deltaFromPrevMs,
+        deltaFromPrevMs: entry.deltaFromPrevMs,
+        cumulativeMs: entry.elapsedMs,
+        slow,
+        count: entry.count,
+        lastElapsedMs: entry.lastElapsedMs,
+      };
+      if (entry.detail !== null) {
+        markerArgs.detail = entry.detail;
+      }
+
+      timedEvents.push({
+        name: entry.milestone,
+        cat: safeCategory,
+        ph: 'i',
+        s: 't',
+        ts: atUs,
+        pid,
+        tid,
+        args: markerArgs,
+      });
+
+      prevAtMs = entry.elapsedMs;
+      prevUs = atUs;
+    }
+
+    if (includeTraps) {
+      for (const trap of this._traps.toArray()) {
+        timedEvents.push({
+          name: `trap:${trap.kind}`,
+          cat: safeCategory,
+          ph: 'i',
+          s: 't',
+          ts: msToMicros(trap.elapsedMs),
+          pid,
+          tid,
+          args: {
+            seq: trap.seq,
+            kind: trap.kind,
+            guestVa: trap.guestVa,
+            dll: trap.dll,
+            symbol: trap.symbol,
+            import: trap.import,
+            fatal: trap.fatal,
+            stage: trap.stage,
+            count: trap.count,
+            message: trap.message,
+          },
+        });
+      }
+    }
+
+    timedEvents.sort((a, b) => a.ts - b.ts);
+
+    const metadata = {
+      source: 'playgta6web.boot_tracer',
+      stage: this._stage(),
+      progressPct: this._progressPct(),
+      readyForSplash: this._milestones.has('FIRST_PRESENT'),
+      elapsedMs: this._elapsed(),
+      milestonesReached: this._milestones.size,
+      trapCount: this._trapCount,
+    };
+    if (threshold !== null) {
+      metadata.slowThresholdMs = threshold;
+    }
+
+    return sanitizeValue({
+      traceEvents: [...metadataEvents, ...timedEvents],
+      displayTimeUnit: 'ms',
+      metadata,
+    });
+  }
+
+  /**
    * Returns the sanitized boot progress and trap summary.
    */
   getSummary() {
     const milestones = BOOT_MILESTONES.map((name, index) => {
       const entry = this._milestones.get(name);
       return entry
-        ? { milestone: name, index, reached: true, elapsedMs: entry.elapsedMs, lastElapsedMs: entry.lastElapsedMs, count: entry.count, detail: entry.detail }
-        : { milestone: name, index, reached: false, elapsedMs: null, lastElapsedMs: null, count: 0, detail: null };
+        ? {
+            milestone: name,
+            index,
+            reached: true,
+            elapsedMs: entry.elapsedMs,
+            lastElapsedMs: entry.lastElapsedMs,
+            deltaFromPrevMs: entry.deltaFromPrevMs,
+            slow: entry.slow,
+            count: entry.count,
+            detail: entry.detail,
+          }
+        : {
+            milestone: name,
+            index,
+            reached: false,
+            elapsedMs: null,
+            lastElapsedMs: null,
+            deltaFromPrevMs: null,
+            slow: false,
+            count: 0,
+            detail: null,
+          };
     });
+
+    const slowMilestones = this.getMilestoneDeltas().filter((delta) => delta.slow);
 
     const unresolvedImports = Array.from(this._imports.values(), (entry) => ({ ...entry })).sort(
       (a, b) => b.count - a.count || a.firstElapsedMs - b.firstElapsedMs || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)
@@ -604,6 +878,8 @@ export class BootTracer {
       elapsedMs: this._elapsed(),
       milestonesReached: this._milestones.size,
       milestones,
+      slowThresholdMs: this._slowThresholdMs,
+      slowMilestones,
       trapCount: this._trapCount,
       uniqueTrapCount: this._signatures.size,
       lastTrap: this._lastTrap ? { ...this._lastTrap } : null,
