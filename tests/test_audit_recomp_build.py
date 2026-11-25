@@ -1307,5 +1307,583 @@ class TestMultiModuleSanitizationAndSafety(unittest.TestCase):
         self.assertEqual(report["wasm_footprint"]["guest_dll_modules"], ["audio_dsp", "video_codec"])
 
 
+# ---------------------------------------------------------------------------
+# T68: Browser fast-boot Wasm64 audit tests
+# ---------------------------------------------------------------------------
+
+
+def _encode_uleb128(value: int) -> bytes:
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        if value:
+            out.append(byte | 0x80)
+        else:
+            out.append(byte)
+            return bytes(out)
+
+
+def _wasm_section(sec_id: int, payload: bytes) -> bytes:
+    return bytes([sec_id]) + _encode_uleb128(len(payload)) + payload
+
+
+def _build_synthetic_wasm(
+    exports: list[tuple[str, int, int]] | None = None,
+    *,
+    target_size: int | None = None,
+    leading_custom_bytes: int = 0,
+) -> bytes:
+    """Build a minimal valid WebAssembly 1.0 binary with an optional Export section."""
+    buf = bytearray(b"\x00asm\x01\x00\x00\x00")
+    if leading_custom_bytes > 0:
+        # Custom section (id=0): name "" (len=0) + padding bytes.
+        buf.extend(_wasm_section(0, b"\x00" + b"\x00" * leading_custom_bytes))
+    if exports is not None:
+        payload = bytearray(_encode_uleb128(len(exports)))
+        for name, kind, idx in exports:
+            encoded = name.encode("utf-8")
+            payload.extend(_encode_uleb128(len(encoded)))
+            payload.extend(encoded)
+            payload.append(kind)
+            payload.extend(_encode_uleb128(idx))
+        buf.extend(_wasm_section(7, bytes(payload)))
+    if target_size is not None and len(buf) < target_size:
+        # Add a trailing custom section (id=0) to reach the exact target byte size.
+        remaining = target_size - len(buf)
+        if remaining >= 3:
+            for plen in range(remaining - 2, max(remaining - 6, 0), -1):
+                header_len = 1 + len(_encode_uleb128(plen))
+                if header_len + plen == remaining and plen >= 1:
+                    buf.extend(_wasm_section(0, b"\x00" + b"\x00" * (plen - 1)))
+                    break
+    return bytes(buf)
+
+
+def _default_runtime_exports() -> list[tuple[str, int, int]]:
+    return [
+        ("memory", 0x02, 0),
+        ("_main", 0x00, 0),
+        ("_playgta6_get_input_state_ptr", 0x00, 1),
+        ("_playgta6_audio_ring", 0x00, 2),
+    ]
+
+
+def _stage_fast_boot_dist(
+    root: Path,
+    *,
+    runtime_exports: list[tuple[str, int, int]] | None = None,
+    runtime_size: int = 256,
+    include_runtime_wasm: bool = True,
+    include_runtime_js: bool = True,
+    part_sizes: list[int] | None = None,
+    write_guest_manifest: bool = True,
+    guest_manifest_override: dict | None = None,
+    boot_manifest: dict | None = None,
+) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    if runtime_exports is None:
+        runtime_exports = _default_runtime_exports()
+    if part_sizes is None:
+        part_sizes = [512, 512]
+
+    actual_runtime_bytes = 0
+    if include_runtime_wasm:
+        rt_bytes = _build_synthetic_wasm(
+            runtime_exports,
+            target_size=runtime_size,
+            leading_custom_bytes=16,
+        )
+        (root / "runtime.wasm").write_bytes(rt_bytes)
+        actual_runtime_bytes = len(rt_bytes)
+
+    if include_runtime_js:
+        (root / "runtime.js").write_text("// synthetic emscripten glue\n", encoding="utf-8")
+
+    part_entries: list[tuple[str, int]] = []
+    for idx, sz in enumerate(part_sizes):
+        name = f"guest_part_{idx:02d}.wasm"
+        blob = _build_synthetic_wasm(exports=[], target_size=sz)
+        (root / name).write_bytes(blob)
+        part_entries.append((name, len(blob)))
+
+    if write_guest_manifest:
+        total_bytes = actual_runtime_bytes + sum(sz for _, sz in part_entries)
+        manifest_doc: dict = {
+            "schemaVersion": 1,
+            "runtimeJs": "runtime.js",
+            "runtimeWasm": "runtime.wasm",
+            "indirectDispatch": "shard",
+            "splitModules": len(part_entries),
+            "splitStrategy": "contiguous",
+            "sideModules": [name for name, _ in part_entries],
+            "sideModuleSizes": [
+                {
+                    "index": idx,
+                    "name": name,
+                    "role": "shards",
+                    "shardCount": 2,
+                    "wasmBytes": sz,
+                }
+                for idx, (name, sz) in enumerate(part_entries)
+            ],
+            "wasmMetrics": {
+                "indirectDispatch": "shard",
+                "modules": [
+                    {
+                        "name": "runtime.wasm",
+                        "role": "main",
+                        "wasmBytes": actual_runtime_bytes,
+                    },
+                    *[
+                        {
+                            "name": name,
+                            "role": "side",
+                            "wasmBytes": sz,
+                        }
+                        for name, sz in part_entries
+                    ],
+                ],
+                "totals": {
+                    "moduleCount": 1 + len(part_entries),
+                    "sideModuleCount": len(part_entries),
+                    "wasmBytes": total_bytes,
+                },
+            },
+        }
+        if guest_manifest_override is not None:
+            manifest_doc.update(guest_manifest_override)
+        (root / "guest_manifest.json").write_text(
+            json.dumps(manifest_doc, indent=2), encoding="utf-8"
+        )
+
+    if boot_manifest is not None:
+        (root / "boot-manifest.json").write_text(
+            json.dumps(boot_manifest, indent=2), encoding="utf-8"
+        )
+
+    return root
+
+
+class TestWasmExportSectionInspector(unittest.TestCase):
+    def test_accepts_underscored_and_unprefixed_emscripten_exports(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            p1 = Path(tmp) / "underscored.wasm"
+            p1.write_bytes(_build_synthetic_wasm(_default_runtime_exports(), leading_custom_bytes=24))
+            res1 = arb.inspect_wasm_exports(p1)
+
+            p2 = Path(tmp) / "emscripten.wasm"
+            p2.write_bytes(
+                _build_synthetic_wasm(
+                    [
+                        ("memory", 0x02, 0),
+                        ("main", 0x00, 0),
+                        ("playgta6_get_input_state_ptr", 0x00, 1),
+                        ("playgta6_audio_ring", 0x00, 2),
+                    ]
+                )
+            )
+            res2 = arb.inspect_wasm_exports(p2)
+
+        for res in (res1, res2):
+            self.assertTrue(res["inspected"])
+            self.assertTrue(res["valid_wasm"])
+            self.assertTrue(res["has_export_section"])
+            self.assertTrue(res["memory_exported"])
+            self.assertEqual(res["total_export_count"], 4)
+            self.assertEqual(res["func_export_count"], 3)
+            self.assertTrue(res["all_required_present"])
+            self.assertEqual(res["missing_required"], [])
+            self.assertEqual(
+                res["required"],
+                {
+                    "_main": True,
+                    "_playgta6_get_input_state_ptr": True,
+                    "_playgta6_audio_ring": True,
+                },
+            )
+
+    def test_missing_or_wrong_kind_exports_are_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            p_missing = Path(tmp) / "missing.wasm"
+            p_missing.write_bytes(_build_synthetic_wasm([("main", 0x00, 0)]))
+            res_missing = arb.inspect_wasm_exports(p_missing)
+
+            # _playgta6_audio_ring exported as global (kind=0x03) instead of func (0x00).
+            p_wrong_kind = Path(tmp) / "wrong_kind.wasm"
+            p_wrong_kind.write_bytes(
+                _build_synthetic_wasm(
+                    [
+                        ("_main", 0x00, 0),
+                        ("_playgta6_get_input_state_ptr", 0x00, 1),
+                        ("_playgta6_audio_ring", 0x03, 0),
+                    ]
+                )
+            )
+            res_wrong = arb.inspect_wasm_exports(p_wrong_kind)
+
+            # Valid Wasm binary with no Export section at all.
+            p_no_sec = Path(tmp) / "no_exports.wasm"
+            p_no_sec.write_bytes(_build_synthetic_wasm(exports=None))
+            res_no_sec = arb.inspect_wasm_exports(p_no_sec)
+
+        self.assertTrue(res_missing["valid_wasm"])
+        self.assertFalse(res_missing["all_required_present"])
+        self.assertEqual(
+            res_missing["missing_required"],
+            ["_playgta6_get_input_state_ptr", "_playgta6_audio_ring"],
+        )
+
+        self.assertTrue(res_wrong["valid_wasm"])
+        self.assertFalse(res_wrong["required"]["_playgta6_audio_ring"])
+        self.assertEqual(res_wrong["missing_required"], ["_playgta6_audio_ring"])
+
+        self.assertTrue(res_no_sec["valid_wasm"])
+        self.assertFalse(res_no_sec["has_export_section"])
+        self.assertEqual(res_no_sec["required_present_count"], 0)
+
+    def test_corrupt_truncated_and_duplicate_export_section_wasm_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            p_bad_magic = Path(tmp) / "bad.wasm"
+            p_bad_magic.write_bytes(b"NOT_WASM_BINARY")
+
+            p_trunc = Path(tmp) / "trunc.wasm"
+            # Declares an export section of 50 bytes, but file ends immediately.
+            p_trunc.write_bytes(b"\x00asm\x01\x00\x00\x00\x07\x32\x01")
+
+            p_dup = Path(tmp) / "dup.wasm"
+            sec = _wasm_section(7, b"\x00")
+            p_dup.write_bytes(b"\x00asm\x01\x00\x00\x00" + sec + sec)
+
+            for path in (p_bad_magic, p_trunc, p_dup):
+                res = arb.inspect_wasm_exports(path)
+                self.assertTrue(res["inspected"])
+                self.assertFalse(res["valid_wasm"])
+                self.assertFalse(res["all_required_present"])
+
+
+class TestWasm64FastBootAudit(unittest.TestCase):
+    def test_balanced_consistent_dist_dir_is_ready_with_zero_warnings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dist = _stage_fast_boot_dist(
+                Path(tmp) / "dist",
+                runtime_size=256,
+                part_sizes=[1024, 1024, 1024],
+            )
+            fb = arb.audit_wasm64_fast_boot(dist)
+
+        self.assertTrue(fb["ready"])
+        self.assertFalse(fb["has_warnings"])
+        self.assertEqual(fb["warnings"], [])
+        self.assertEqual(fb["artifacts"]["runtime_wasm_bytes"], 256)
+        self.assertTrue(fb["artifacts"]["runtime_wasm_present"])
+        self.assertTrue(fb["artifacts"]["runtime_wasm_valid"])
+        self.assertEqual(fb["artifacts"]["guest_part_count"], 3)
+        self.assertEqual(fb["artifacts"]["guest_parts_total_bytes"], 3072)
+        self.assertEqual(fb["artifacts"]["total_wasm_bytes"], 3328)
+        self.assertFalse(fb["artifacts"]["any_exceeds_v8_1gib_limit"])
+
+        bal = fb["split_balance"]
+        self.assertEqual(bal["split_balance_ratio"], 1.0)
+        self.assertEqual(bal["max_to_mean_ratio"], 1.0)
+        self.assertEqual(bal["max_to_min_ratio"], 1.0)
+        self.assertAlmostEqual(bal["max_share_ratio"], 1 / 3, places=4)
+        self.assertFalse(bal["dominant_shard_warning"])
+        self.assertTrue(bal["balanced"])
+
+        self.assertTrue(fb["exports"]["all_required_present"])
+        self.assertTrue(fb["boot_manifest"]["present"])
+        self.assertEqual(fb["boot_manifest"]["kind"], "guest_manifest")
+        self.assertTrue(fb["boot_manifest"]["consistent"])
+        self.assertTrue(fb["boot_manifest"]["split_count_matches"])
+        self.assertTrue(fb["boot_manifest"]["total_bytes_matches"])
+        self.assertEqual(fb["boot_manifest"]["missing_on_disk_count"], 0)
+        self.assertEqual(fb["boot_manifest"]["unlisted_on_disk_count"], 0)
+        self.assertEqual(fb["boot_manifest"]["size_mismatch_count"], 0)
+
+    def test_dominant_shard_triggers_split_balance_warning_and_threshold_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            # 8000 / 1000 / 1000 -> mean=3333.33, max/mean=2.40x > 1.5x, share=80%.
+            dist = _stage_fast_boot_dist(
+                Path(tmp) / "skewed",
+                part_sizes=[8000, 1000, 1000],
+            )
+            fb_default = arb.audit_wasm64_fast_boot(dist)
+            fb_relaxed = arb.audit_wasm64_fast_boot(dist, balance_warn_ratio=2.5)
+            report = arb.audit_dist_dir(dist)
+
+        self.assertTrue(fb_default["split_balance"]["dominant_shard_warning"])
+        self.assertFalse(fb_default["split_balance"]["balanced"])
+        self.assertAlmostEqual(fb_default["split_balance"]["split_balance_ratio"], 2.4, places=3)
+        self.assertAlmostEqual(fb_default["split_balance"]["max_to_min_ratio"], 8.0, places=3)
+        self.assertAlmostEqual(fb_default["split_balance"]["max_share_ratio"], 0.8, places=3)
+        self.assertIn("dominant_shard_imbalance", fb_default["warnings"])
+        self.assertIn(
+            "fast_boot_balance",
+            {r["category"] for r in report["recommendations"]},
+        )
+
+        # Relaxing threshold above 2.4x clears the dominant shard warning.
+        self.assertFalse(fb_relaxed["split_balance"]["dominant_shard_warning"])
+        self.assertTrue(fb_relaxed["split_balance"]["balanced"])
+        self.assertNotIn("dominant_shard_imbalance", fb_relaxed["warnings"])
+
+    def test_missing_runtime_or_missing_parts_or_corrupt_part_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dist_no_rt = _stage_fast_boot_dist(
+                Path(tmp) / "no_rt",
+                include_runtime_wasm=False,
+                part_sizes=[512, 512],
+            )
+            fb_no_rt = arb.audit_wasm64_fast_boot(dist_no_rt)
+
+            dist_no_parts = _stage_fast_boot_dist(
+                Path(tmp) / "no_parts",
+                part_sizes=[],
+            )
+            fb_no_parts = arb.audit_wasm64_fast_boot(dist_no_parts)
+
+            dist_bad_part = _stage_fast_boot_dist(
+                Path(tmp) / "bad_part",
+                part_sizes=[512, 512],
+            )
+            (dist_bad_part / "guest_part_01.wasm").write_bytes(b"corrupt" + b"\x00" * 505)
+            fb_bad_part = arb.audit_wasm64_fast_boot(dist_bad_part)
+
+        self.assertFalse(fb_no_rt["ready"])
+        self.assertIn("missing_runtime_wasm", fb_no_rt["warnings"])
+        self.assertFalse(fb_no_rt["exports"]["inspected"])
+
+        self.assertFalse(fb_no_parts["ready"])
+        self.assertIn("missing_guest_parts", fb_no_parts["warnings"])
+        self.assertEqual(fb_no_parts["artifacts"]["guest_part_count"], 0)
+
+        self.assertFalse(fb_bad_part["ready"])
+        self.assertIn("invalid_guest_part_wasm", fb_bad_part["warnings"])
+        self.assertEqual(fb_bad_part["artifacts"]["guest_parts_valid_count"], 1)
+        self.assertEqual(fb_bad_part["artifacts"]["guest_parts_invalid_count"], 1)
+
+    def test_boot_manifest_mismatch_missing_unlisted_and_size_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            # 1. Missing declared side module on disk.
+            dist_missing = _stage_fast_boot_dist(
+                Path(tmp) / "m_missing",
+                part_sizes=[512, 512],
+            )
+            (dist_missing / "guest_part_01.wasm").unlink()
+            fb_missing = arb.audit_wasm64_fast_boot(dist_missing)
+
+            # 2. Unlisted extra guest_part on disk.
+            dist_unlisted = _stage_fast_boot_dist(
+                Path(tmp) / "m_unlisted",
+                part_sizes=[512],
+            )
+            (dist_unlisted / "guest_part_01.wasm").write_bytes(
+                _build_synthetic_wasm(exports=[], target_size=512)
+            )
+            fb_unlisted = arb.audit_wasm64_fast_boot(dist_unlisted)
+
+            # 3. Byte-size drift between manifest and disk.
+            dist_drift = _stage_fast_boot_dist(
+                Path(tmp) / "m_drift",
+                part_sizes=[512, 512],
+            )
+            (dist_drift / "guest_part_00.wasm").write_bytes(
+                _build_synthetic_wasm(exports=[], target_size=1024)
+            )
+            fb_drift = arb.audit_wasm64_fast_boot(dist_drift)
+
+            # 4. Missing manifest entirely.
+            dist_none = _stage_fast_boot_dist(
+                Path(tmp) / "m_none",
+                part_sizes=[512, 512],
+                write_guest_manifest=False,
+            )
+            fb_none = arb.audit_wasm64_fast_boot(dist_none)
+
+            # 5. Invalid JSON manifest.
+            dist_bad_json = _stage_fast_boot_dist(
+                Path(tmp) / "m_bad_json",
+                part_sizes=[512],
+                write_guest_manifest=False,
+            )
+            (dist_bad_json / "guest_manifest.json").write_text("{not-json", encoding="utf-8")
+            fb_bad_json = arb.audit_wasm64_fast_boot(dist_bad_json)
+
+        self.assertFalse(fb_missing["ready"])
+        self.assertFalse(fb_missing["boot_manifest"]["consistent"])
+        self.assertEqual(fb_missing["boot_manifest"]["missing_on_disk_count"], 1)
+        self.assertFalse(fb_missing["boot_manifest"]["split_count_matches"])
+        self.assertIn("boot_manifest_mismatch", fb_missing["warnings"])
+
+        self.assertFalse(fb_unlisted["ready"])
+        self.assertFalse(fb_unlisted["boot_manifest"]["consistent"])
+        self.assertEqual(fb_unlisted["boot_manifest"]["unlisted_on_disk_count"], 1)
+        self.assertFalse(fb_unlisted["boot_manifest"]["split_count_matches"])
+        self.assertIn("boot_manifest_mismatch", fb_unlisted["warnings"])
+
+        self.assertFalse(fb_drift["ready"])
+        self.assertFalse(fb_drift["boot_manifest"]["consistent"])
+        self.assertEqual(fb_drift["boot_manifest"]["size_mismatch_count"], 1)
+        self.assertFalse(fb_drift["boot_manifest"]["total_bytes_matches"])
+        self.assertIn("boot_manifest_mismatch", fb_drift["warnings"])
+
+        self.assertFalse(fb_none["ready"])
+        self.assertFalse(fb_none["boot_manifest"]["present"])
+        self.assertEqual(fb_none["boot_manifest"]["kind"], "none")
+        self.assertIn("missing_boot_manifest", fb_none["warnings"])
+
+        self.assertFalse(fb_bad_json["ready"])
+        self.assertTrue(fb_bad_json["boot_manifest"]["present"])
+        self.assertFalse(fb_bad_json["boot_manifest"]["valid_json"])
+        self.assertIn("invalid_boot_manifest_json", fb_bad_json["warnings"])
+
+    def test_explicit_boot_manifest_json_with_pgim_and_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dist = _stage_fast_boot_dist(
+                root / "dist",
+                part_sizes=[512, 512],
+                write_guest_manifest=False,
+            )
+            pgim = root / "boot" / "main.pgim"
+            pgim.parent.mkdir(parents=True, exist_ok=True)
+            pgim.write_bytes(b"PGIM" + b"\x00" * 60)
+            bm_path = root / "boot" / "boot-manifest.json"
+            bm_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "boot-manifest",
+                        "runtimeWasm": "runtime.wasm",
+                        "runtimeJs": "runtime.js",
+                        "splitModules": 2,
+                        "sideModules": ["guest_part_00.wasm", "guest_part_01.wasm"],
+                        "pgim": "main.pgim",
+                        "files": [{"path": "main.pgim", "size": 64}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            fb = arb.audit_wasm64_fast_boot(dist, boot_manifest=bm_path)
+
+        self.assertTrue(fb["ready"])
+        self.assertTrue(fb["boot_manifest"]["present"])
+        self.assertEqual(fb["boot_manifest"]["kind"], "boot_manifest")
+        self.assertTrue(fb["boot_manifest"]["consistent"])
+        self.assertEqual(fb["boot_manifest"]["missing_on_disk_count"], 0)
+        self.assertEqual(fb["boot_manifest"]["size_mismatch_count"], 0)
+
+
+class TestWasm64FastBootCliAndSanitization(unittest.TestCase):
+    def test_standalone_and_combined_cli_json_markdown_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            dist = _stage_fast_boot_dist(tmp_path / "dist", part_sizes=[512, 512])
+            build_dir = _write_build_dir(tmp_path / "build", manifest=_manifest(), discover=_discover())
+
+            # Standalone --dist-dir mode.
+            j_code, j_out, j_err = _run_cli(["--dist-dir", str(dist), "--json"])
+            m_code, m_out, m_err = _run_cli(["--dist-dir", str(dist), "--markdown"])
+            t_code, t_out, t_err = _run_cli(["--dist-dir", str(dist)])
+
+            # Combined <build_dir> + --dist-dir mode.
+            cj_code, cj_out, cj_err = _run_cli([str(build_dir), "--dist-dir", str(dist), "--json"])
+            cm_code, cm_out, cm_err = _run_cli([str(build_dir), "--dist-dir", str(dist), "--markdown"])
+            ct_code, ct_out, ct_err = _run_cli([str(build_dir), "--dist-dir", str(dist)])
+
+            # Legacy mode without --dist-dir must stay 100% backwards compatible.
+            leg_code, leg_out, leg_err = _run_cli([str(build_dir), "--json"])
+
+        self.assertEqual((j_code, j_err), (0, ""))
+        self.assertEqual((m_code, m_err), (0, ""))
+        self.assertEqual((t_code, t_err), (0, ""))
+        standalone = json.loads(j_out)
+        self.assertEqual(standalone["schema"], "playgta6-recomp-audit")
+        self.assertEqual(standalone["mode"], "wasm64_fast_boot")
+        self.assertTrue(standalone["wasm64_fast_boot"]["ready"])
+        self.assertIn("## Wasm64 fast-boot audit", m_out)
+        self.assertIn("wasm64 fast-boot:", t_out)
+
+        self.assertEqual((cj_code, cj_err), (0, ""))
+        self.assertEqual((cm_code, cm_err), (0, ""))
+        self.assertEqual((ct_code, ct_err), (0, ""))
+        combined = json.loads(cj_out)
+        self.assertEqual(combined["coverage"]["discovered_functions"], 5)
+        self.assertTrue(combined["wasm64_fast_boot"]["ready"])
+        self.assertIn("## Wasm64 fast-boot audit", cm_out)
+        self.assertIn("wasm64 fast-boot:", ct_out)
+
+        self.assertEqual((leg_code, leg_err), (0, ""))
+        self.assertNotIn("wasm64_fast_boot", json.loads(leg_out))
+
+    def test_cli_validation_errors_exit_one_with_sanitized_stderr(self) -> None:
+        code_none, out_none, err_none = _run_cli(["--json"])
+        code_bm, out_bm, err_bm = _run_cli(["--boot-manifest", "boot-manifest.json"])
+        code_miss, out_miss, err_miss = _run_cli(
+            ["--dist-dir", r"C:\Users\alice\missing_dist_xyz", "--json"]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            dist = _stage_fast_boot_dist(Path(tmp) / "dist")
+            code_ratio, out_ratio, err_ratio = _run_cli(
+                ["--dist-dir", str(dist), "--balance-warn-ratio", "1.0", "--json"]
+            )
+
+        self.assertEqual(code_none, 1)
+        self.assertEqual(out_none, "")
+        self.assertIn("Error:", err_none)
+
+        self.assertEqual(code_bm, 1)
+        self.assertEqual(out_bm, "")
+        self.assertIn("--boot-manifest requires --dist-dir", err_bm)
+
+        self.assertEqual(code_miss, 1)
+        self.assertEqual(out_miss, "")
+        self.assertIn("Error:", err_miss)
+        self.assertNotIn("C:\\", err_miss)
+        self.assertNotIn("alice", err_miss)
+
+        self.assertEqual(code_ratio, 1)
+        self.assertEqual(out_ratio, "")
+        self.assertIn("--balance-warn-ratio", err_ratio)
+
+    def test_fast_boot_output_strips_all_host_paths_usernames_and_unsafe_manifest_paths(self) -> None:
+        username = os.environ.get("USERNAME") or os.environ.get("USER") or "marcb"
+        with tempfile.TemporaryDirectory() as tmp:
+            nasty_dist = Path(tmp) / "Users" / username / "secret_dist"
+            _stage_fast_boot_dist(
+                nasty_dist,
+                part_sizes=[2048, 512],
+                guest_manifest_override={
+                    "runtimeWasm": rf"C:\Users\{username}\dist\runtime.wasm",
+                    "sideModules": [
+                        "../escape.wasm",
+                        f"/home/{username}/guest_part_00.wasm",
+                        r"\\fileserver\share\guest_part_01.wasm",
+                    ],
+                },
+            )
+            with mock.patch.dict(os.environ, {"USERNAME": username, "USER": username}):
+                report = arb.audit_dist_dir(nasty_dist)
+                json_text = arb.format_json_report(report)
+                md_text = arb.format_markdown_report(report)
+                txt_text = arb.format_text_report(report)
+
+        fb = report["wasm64_fast_boot"]
+        self.assertFalse(fb["boot_manifest"]["consistent"])
+        self.assertGreaterEqual(fb["boot_manifest"]["unsafe_entry_count"], 4)
+        self.assertIn("boot_manifest_unsafe_entries", fb["warnings"])
+        self.assertIn("dominant_shard_imbalance", fb["warnings"])
+
+        blob = json.dumps(report) + json_text + md_text + txt_text
+        self.assertNotIn(username, blob)
+        self.assertNotIn("C:\\", blob)
+        self.assertNotIn("C:/", blob)
+        self.assertNotIn("/home/", blob)
+        self.assertNotIn("/Users/", blob)
+        self.assertNotIn("fileserver", blob)
+        self.assertNotIn("escape.wasm", blob)
+        self.assertNotRegex(blob, r"[A-Za-z]:[\\/]")
+
+
 if __name__ == "__main__":
     unittest.main()
