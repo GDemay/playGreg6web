@@ -1142,8 +1142,19 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
             if (unwritten(cpu, r.size) && !r.shadow.empty()) {
                 continue;
             }
+            // R40: compare the live bytes in place where they are mapped in one piece (no copy
+            // through the arena's checked read for an unchanged range, the usual case).
+            const auto* live = static_cast<const uint8_t*>(com::guest_to_host(cpu, static_cast<size_t>(r.size)));
+            if (live != nullptr && r.shadow.size() == r.size && std::memcmp(live, r.shadow.data(), r.shadow.size()) == 0) {
+                continue;
+            }
             bytes.resize(static_cast<size_t>(r.size));  // only the view's bytes: the home past them stays zero
-            if (!com::read_guest(cpu, bytes.data(), bytes.size()) || bytes == r.shadow) {
+            if (live != nullptr) {
+                std::memcpy(bytes.data(), live, bytes.size());
+            } else if (!com::read_guest(cpu, bytes.data(), bytes.size())) {
+                continue;
+            }
+            if (bytes == r.shadow) {
                 continue;
             }
             encoder.write_buffer(r.buffer_id, static_cast<uint32_t>(r.offset), bytes.data(), static_cast<uint32_t>(r.size));
@@ -1161,13 +1172,25 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
             if (unwritten(cpu, r.size) && r.ever_uploaded) {
                 continue;
             }
-            bytes.resize(static_cast<size_t>(r.size));
-            if (!read_guest_best_effort(cpu, bytes.data(), bytes.size())) {
-                continue;
-            }
-            const uint64_t hash = content_hash(bytes.data(), bytes.size());
-            if (r.ever_uploaded && hash == r.last_hash) {
-                continue;
+            // R40: hash the live bytes in place where they are mapped in one piece and copy them
+            // only when they changed (most ranges are unchanged at most submissions).
+            const auto* live = static_cast<const uint8_t*>(com::guest_to_host(cpu, static_cast<size_t>(r.size)));
+            uint64_t hash = 0;
+            if (live != nullptr) {
+                hash = content_hash(live, static_cast<size_t>(r.size));
+                if (r.ever_uploaded && hash == r.last_hash) {
+                    continue;
+                }
+                bytes.assign(live, live + r.size);
+            } else {
+                bytes.resize(static_cast<size_t>(r.size));
+                if (!read_guest_best_effort(cpu, bytes.data(), bytes.size())) {
+                    continue;
+                }
+                hash = content_hash(bytes.data(), bytes.size());
+                if (r.ever_uploaded && hash == r.last_hash) {
+                    continue;
+                }
             }
             bytes.resize(static_cast<size_t>(write_len), 0);
             for (uint64_t off = 0; off < write_len; off += kMaxWriteChunk) {
@@ -1190,13 +1213,24 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
             if (unwritten(cpu, key.second)) {
                 continue;  // (uploaded when it was created)
             }
-            bytes.assign(static_cast<size_t>(key.second), 0);
-            if (!read_guest_best_effort(cpu, bytes.data(), bytes.size())) {
-                continue;
-            }
-            const uint64_t hash = content_hash(bytes.data(), bytes.size());
-            if (hash == r.last_hash) {
-                continue;
+            // R40: as above, hash in place and copy only a changed range.
+            const auto* live = static_cast<const uint8_t*>(com::guest_to_host(cpu, static_cast<size_t>(key.second)));
+            uint64_t hash = 0;
+            if (live != nullptr) {
+                hash = content_hash(live, static_cast<size_t>(key.second));
+                if (hash == r.last_hash) {
+                    continue;
+                }
+                bytes.assign(live, live + key.second);
+            } else {
+                bytes.assign(static_cast<size_t>(key.second), 0);
+                if (!read_guest_best_effort(cpu, bytes.data(), bytes.size())) {
+                    continue;
+                }
+                hash = content_hash(bytes.data(), bytes.size());
+                if (hash == r.last_hash) {
+                    continue;
+                }
             }
             bytes.resize(static_cast<size_t>(r.buffer_bytes), 0);
             for (uint64_t off = 0; off < r.buffer_bytes; off += kMaxWriteChunk) {
