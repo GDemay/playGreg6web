@@ -17,7 +17,7 @@ import { AudioEngine } from './audio/audio_engine.js';
 import { BrowserStorageManager } from './storage/storage_manager.js';
 import { PerfMonitor } from './telemetry/perf_monitor.js';
 import { CrashReporter, sanitizeString } from './telemetry/crash_report.js';
-import { BootTracer } from './telemetry/boot_tracer.js';
+import { BootTracer, sanitizeGpuAdapter } from './telemetry/boot_tracer.js';
 
 export const DEFAULT_LOADER_URL = new URL('./loader.js', import.meta.url).href;
 export const DEFAULT_SHADER_PACK_URL = '/shaders/fallback.wgsl.pack';
@@ -347,6 +347,111 @@ function getQueryParamInsensitive(params, name) {
     }
   }
   return null;
+}
+
+function getLastQueryParamInsensitive(params, name) {
+  const targetLower = name.toLowerCase();
+  let lastValue = null;
+  for (const [key, value] of params.entries()) {
+    if (key.toLowerCase() === targetLower) {
+      lastValue = value;
+    }
+  }
+  return lastValue;
+}
+
+const GPU_ADAPTER_LOG_RE = /(?:\[wgpu_worker\]\s*)?WebGPU\s+adapter\s*:\s*(.+)$/i;
+const FIRST_VISIBLE_FRAME_LOG_RE =
+  /\bFIRST_VISIBLE_FRAME\b|\bfirst[\s_-]*(?:visible|non[\s_-]*black)[\s_-]*frame\b/i;
+const VISIBLE_FRAME_LOG_FAILURE_RE =
+  /\b(?:fail(?:ed|s|ure)?|error|timeout|timed[\s_-]*out|abort(?:ed)?)\b/i;
+
+function stripHtmlAndUrlsFromAdapterText(text) {
+  return text
+    .replace(/<script\b[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/\b(?:https?|file|data|javascript|ftp|wss?):\/\/[^\s"'`<>)\]},;]*/gi, ' ')
+    .replace(/\b(?:javascript|data):[^\s"'`<>)\]},;]*/gi, ' ');
+}
+
+function extractSanitizedGpuAdapter(raw) {
+  if (raw === null || raw === undefined) {
+    return null;
+  }
+  if (typeof raw === 'string') {
+    return sanitizeGpuAdapter(stripHtmlAndUrlsFromAdapterText(raw));
+  }
+  if (typeof raw === 'object' && !Array.isArray(raw)) {
+    const src =
+      raw.info && typeof raw.info === 'object' && !Array.isArray(raw.info) ? raw.info : raw;
+    const direct = sanitizeGpuAdapter(src);
+    if (direct) {
+      return direct;
+    }
+    const keys = [
+      'gpuAdapter',
+      'gpu_adapter',
+      'adapterLabel',
+      'adapter_label',
+      'label',
+      'description',
+      'device',
+      'name',
+    ];
+    for (const source of [src, raw]) {
+      for (const key of keys) {
+        if (
+          Object.prototype.hasOwnProperty.call(source, key) &&
+          typeof source[key] === 'string' &&
+          source[key].trim().length > 0
+        ) {
+          const sanitized = sanitizeGpuAdapter(stripHtmlAndUrlsFromAdapterText(source[key]));
+          if (sanitized) {
+            return sanitized;
+          }
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Extracts and sanitizes a WebGPU adapter label from a worker/runtime log line
+ * (e.g. `[wgpu_worker] WebGPU adapter: NVIDIA / Turing`), or returns `null`.
+ *
+ * @param {unknown} line
+ * @returns {string|null}
+ */
+export function extractGpuAdapterFromLogLine(line) {
+  if (typeof line !== 'string' || line.length === 0) {
+    return null;
+  }
+  const m = GPU_ADAPTER_LOG_RE.exec(line);
+  if (!m) {
+    return null;
+  }
+  return extractSanitizedGpuAdapter(m[1]);
+}
+
+/**
+ * Parses the optional `?splashHold=1|true|on|yes` / `?splashHold=0|false|no|off`
+ * query parameter (case-insensitive; last occurrence wins). Returns `true`,
+ * `false`, or `null` when absent or invalid.
+ *
+ * @param {string|URLSearchParams|URL|Location|object|null|undefined} search
+ * @returns {boolean|null}
+ */
+export function parseSplashHoldQuery(search) {
+  const params = toUrlSearchParams(search);
+  if (!params) {
+    return null;
+  }
+  const raw = getLastQueryParamInsensitive(params, 'splashHold');
+  if (raw === null) {
+    return null;
+  }
+  return parseBooleanQueryFlag(raw);
 }
 
 function toUrlSearchParams(search) {
@@ -1076,10 +1181,22 @@ function createSplashOverlayAdapter(splashOverlay) {
         splashOverlay.dismiss(meta);
       }
     },
+    setLoadingAssetsProgress(progress) {
+      if (typeof splashOverlay.setLoadingAssetsProgress === 'function') {
+        splashOverlay.setLoadingAssetsProgress(progress);
+      }
+    },
+    notifyFirstVisibleFrame(meta) {
+      if (typeof splashOverlay.notifyFirstVisibleFrame === 'function') {
+        splashOverlay.notifyFirstVisibleFrame(meta);
+      } else if (typeof splashOverlay.dismiss === 'function') {
+        splashOverlay.dismiss(meta);
+      }
+    },
     hide() {
-      // Allow smooth dismiss fade to complete when dismiss() already started fading.
+      // Allow smooth dismiss fade or visible-frame hold to remain active until finished.
       const state = typeof splashOverlay.getState === 'function' ? splashOverlay.getState() : null;
-      if (state && state.fading) {
+      if (state && (state.fading || state.holdingForVisibleFrame)) {
         return;
       }
       if (typeof splashOverlay.hide === 'function') {
@@ -1118,6 +1235,7 @@ export class PlayGta6AppHandle {
     this._getDiagnosticsSnapshot = components.getDiagnosticsSnapshot || (() => null);
     this._getBootTelemetry = components.getBootTelemetry || (() => null);
     this._notifyFirstPresent = components.notifyFirstPresent || (() => ({ ok: true }));
+    this._notifyFirstVisibleFrame = components.notifyFirstVisibleFrame || (() => ({ ok: true }));
     this._start = components.start;
     this._stop = components.stop;
     this._resize = components.resize;
@@ -1147,6 +1265,10 @@ export class PlayGta6AppHandle {
 
   notifyFirstPresent(meta) {
     return this._notifyFirstPresent(meta);
+  }
+
+  notifyFirstVisibleFrame(meta) {
+    return this._notifyFirstVisibleFrame(meta);
   }
 
   start(opts) {
@@ -1295,6 +1417,31 @@ export function bootstrapPlayGta6App(options = {}) {
             : ''
         : '';
   const parsedUrlOptions = parseBootUrlOptions(rawUrlSearch);
+  const parsedSplashHold = parseSplashHoldQuery(rawUrlSearch);
+  const splashOverlayOptions =
+    options.splashOverlayOptions && typeof options.splashOverlayOptions === 'object'
+      ? options.splashOverlayOptions
+      : {};
+  const resolvedHoldUntilVisible = (() => {
+    if (
+      Object.prototype.hasOwnProperty.call(options, 'holdUntilVisible') &&
+      options.holdUntilVisible !== undefined &&
+      options.holdUntilVisible !== null
+    ) {
+      return resolveBooleanOverride(options.holdUntilVisible, false);
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(splashOverlayOptions, 'holdUntilVisible') &&
+      splashOverlayOptions.holdUntilVisible !== undefined &&
+      splashOverlayOptions.holdUntilVisible !== null
+    ) {
+      return resolveBooleanOverride(splashOverlayOptions.holdUntilVisible, false);
+    }
+    if (parsedSplashHold !== null) {
+      return parsedSplashHold;
+    }
+    return false;
+  })();
   const baseInputScript = resolveInputScriptOverride(options, parsedUrlOptions.inputScript);
   const baseStreamConfig = resolveStreamConfigOverride(options, parsedUrlOptions);
   const baseDumpConfig = resolveDumpConfigOverride(options, parsedUrlOptions);
@@ -1306,6 +1453,8 @@ export function bootstrapPlayGta6App(options = {}) {
     dumpPipelines: baseDumpConfig.dumpPipelines,
     allowDumpWrites: baseDumpConfig.allowDumpWrites,
     dumpEndpoint: baseDumpConfig.dumpEndpoint,
+    splashHold: parsedSplashHold,
+    holdUntilVisible: resolvedHoldUntilVisible,
   });
   let activeStreamConfig = baseStreamConfig;
   let activeDumpConfig = baseDumpConfig;
@@ -1320,6 +1469,11 @@ export function bootstrapPlayGta6App(options = {}) {
     skippedDrawCount: 0,
     lastValidationErrorCode: null,
     lastValidationErrorMessage: null,
+    gpuAdapter: null,
+    hasVisibleContent: false,
+    firstVisibleFrameMs: null,
+    blackLoadingMs: null,
+    loadingAssets: false,
   };
 
   const audioTelemetry = {
@@ -1806,12 +1960,14 @@ export function bootstrapPlayGta6App(options = {}) {
     splashContainer &&
     typeof SplashOverlayCtor === 'function'
   ) {
-    const splashOverlayOptions =
-      options.splashOverlayOptions && typeof options.splashOverlayOptions === 'object'
-        ? options.splashOverlayOptions
-        : {};
     splashOverlay = new SplashOverlayCtor({
       ...splashOverlayOptions,
+      holdUntilVisible: resolvedHoldUntilVisible,
+      ...(splashOverlayOptions.locationSearch === undefined &&
+      splashOverlayOptions.search === undefined &&
+      rawUrlSearch
+        ? { locationSearch: rawUrlSearch }
+        : {}),
       parent: splashContainer,
       documentObj: documentObj || undefined,
       windowObj: windowObj || undefined,
@@ -2059,6 +2215,205 @@ export function bootstrapPlayGta6App(options = {}) {
     return true;
   }
 
+  function isSplashOverlayHolding() {
+    if (!splashOverlay || typeof splashOverlay !== 'object') {
+      return false;
+    }
+    if (typeof splashOverlay.getState === 'function') {
+      try {
+        const state = splashOverlay.getState();
+        if (state && typeof state === 'object') {
+          return Boolean(state.holdingForVisibleFrame);
+        }
+      } catch {
+        // Ignore overlay state errors.
+      }
+    }
+    return Boolean(resolvedHoldUntilVisible && firstPresentNotified && !firstVisibleFrameNotified);
+  }
+
+  function recordGpuAdapter(rawAdapter) {
+    if (destroyed) {
+      return null;
+    }
+    const sanitized = extractSanitizedGpuAdapter(rawAdapter);
+    if (!sanitized) {
+      return null;
+    }
+    const changed = gpuTelemetry.gpuAdapter !== sanitized;
+    gpuTelemetry.gpuAdapter = sanitized;
+
+    if (changed) {
+      if (bootTracer && typeof bootTracer.recordGpuAdapter === 'function') {
+        try {
+          bootTracer.recordGpuAdapter(sanitized);
+        } catch {
+          // Telemetry errors must never disrupt boot.
+        }
+      }
+
+      const hudTargets = resolveHudTargets();
+      for (let i = 0; i < hudTargets.length; i += 1) {
+        const target = hudTargets[i];
+        const handled = invokeFirstHook(
+          target,
+          ['setGpuAdapter', 'updateGpuAdapter', 'recordGpuAdapter', 'onGpuAdapter'],
+          sanitized
+        );
+        if (!handled && target === hud && typeof target.updateMetrics === 'function') {
+          try {
+            target.updateMetrics({ gpuAdapter: sanitized });
+          } catch {
+            // Ignore HUD metrics errors.
+          }
+        }
+      }
+
+      if (gpuBootPanel) {
+        invokeFirstHook(
+          gpuBootPanel,
+          ['setGpuAdapter', 'updateGpuAdapter', 'recordGpuAdapter'],
+          sanitized
+        );
+        safeUpdateGpuBootPanel();
+      }
+    }
+
+    return sanitized;
+  }
+
+  function ingestGpuAdapterFromPayload(data) {
+    if (!data || typeof data !== 'object') {
+      return null;
+    }
+    const sources = collectPlainSources([
+      data,
+      data.stats,
+      data.gpuStats,
+      data.drawStats,
+      data.frameStats,
+      data.swapchainStats,
+      data.swapchain,
+      data.metrics,
+    ]);
+    const adapterField = pickFirstDefinedField(sources, [
+      'gpuAdapter',
+      'gpu_adapter',
+      'adapterLabel',
+      'adapter_label',
+      'adapterInfo',
+      'adapter_info',
+      'adapter',
+    ]);
+    if (!adapterField.found || adapterField.value === null) {
+      return null;
+    }
+    return recordGpuAdapter(adapterField.value);
+  }
+
+  function detectVisibleFrameSignal(data) {
+    const sources = collectPlainSources([
+      data,
+      data && data.stats,
+      data && data.gpuStats,
+      data && data.drawStats,
+      data && data.frameStats,
+      data && data.swapchainStats,
+      data && data.swapchain,
+    ]);
+    const explicitVisible = pickFirstDefinedField(sources, [
+      'hasVisibleContent',
+      'has_visible_content',
+    ]);
+    if (explicitVisible.found && typeof explicitVisible.value === 'boolean') {
+      return {
+        hasExplicitFlag: true,
+        isVisible: explicitVisible.value === true,
+      };
+    }
+    const visiblePresents = pickFirstDefinedField(sources, [
+      'visiblePresentsTotal',
+      'visible_presents_total',
+    ]);
+    if (visiblePresents.found && toSafeNonNegativeInt(visiblePresents.value, 0) > 0) {
+      return {
+        hasExplicitFlag: true,
+        isVisible: true,
+      };
+    }
+    const realPackField = pickFirstDefinedField(sources, [
+      'realPackDrawCount',
+      'real_pack_draw_count',
+      'realPackDraws',
+      'packDrawCount',
+      'packDraws',
+    ]);
+    if (realPackField.found && toSafeNonNegativeInt(realPackField.value, 0) > 0) {
+      return {
+        hasExplicitFlag: false,
+        isVisible: true,
+      };
+    }
+    return {
+      hasExplicitFlag: false,
+      isVisible: false,
+    };
+  }
+
+  function updateSplashLoadingAssetsProgress(extra = {}) {
+    if (destroyed || !splashOverlay || typeof splashOverlay.setLoadingAssetsProgress !== 'function') {
+      return false;
+    }
+    if (!isSplashOverlayHolding()) {
+      return false;
+    }
+    const effectivePresentCount = Math.max(gpuTelemetry.presentCount, resolveFramesPresented());
+    const payload = {
+      presents:
+        typeof extra.presents === 'number' && Number.isFinite(extra.presents) && extra.presents >= 0
+          ? Math.floor(extra.presents)
+          : effectivePresentCount,
+      realPackDraws:
+        typeof extra.realPackDraws === 'number' &&
+        Number.isFinite(extra.realPackDraws) &&
+        extra.realPackDraws >= 0
+          ? Math.floor(extra.realPackDraws)
+          : gpuTelemetry.realPackDrawCount,
+    };
+    if (typeof extra.message === 'string' && extra.message.trim().length > 0) {
+      payload.message = extra.message.trim();
+    }
+    try {
+      splashOverlay.setLoadingAssetsProgress(payload);
+      return true;
+    } catch {
+      // Overlay errors must never interrupt telemetry.
+      return false;
+    }
+  }
+
+  function syncVisibleFrameFromTelemetry(data, { source = 'gpu-stats', deferObserverForward = true } = {}) {
+    if (destroyed) {
+      return false;
+    }
+    const signal = detectVisibleFrameSignal(data);
+    if (signal.isVisible) {
+      const effectivePresentCount = Math.max(gpuTelemetry.presentCount, resolveFramesPresented());
+      notifyFirstVisibleFrame({
+        source,
+        presents: effectivePresentCount,
+        realPackDraws: gpuTelemetry.realPackDrawCount,
+        _deferObserverForward: deferObserverForward,
+      });
+      return true;
+    }
+    if (isSplashOverlayHolding()) {
+      gpuTelemetry.loadingAssets = true;
+      updateSplashLoadingAssetsProgress();
+    }
+    return false;
+  }
+
   function handleSplashFramePresentedMessage(data) {
     if (!data || typeof data !== 'object' || data.type !== 'splash-frame-presented') {
       return false;
@@ -2066,6 +2421,8 @@ export function bootstrapPlayGta6App(options = {}) {
     if (destroyed) {
       return false;
     }
+
+    ingestGpuAdapterFromPayload(data);
 
     const ok = data.ok !== false;
     const frameIndex =
@@ -2077,6 +2434,18 @@ export function bootstrapPlayGta6App(options = {}) {
     const rawTs = data.timestampMs ?? data.timestamp;
     const timestampMs =
       typeof rawTs === 'number' && Number.isFinite(rawTs) ? rawTs : epochNow();
+
+    const realPackField = pickFirstDefinedField([data], [
+      'realPackDrawCount',
+      'real_pack_draw_count',
+      'realPackDraws',
+    ]);
+    if (realPackField.found) {
+      gpuTelemetry.realPackDrawCount = Math.max(
+        gpuTelemetry.realPackDrawCount,
+        toSafeNonNegativeInt(realPackField.value, 0)
+      );
+    }
 
     if (reportedFrames !== null) {
       wgpuFramesPresented = Math.max(wgpuFramesPresented, reportedFrames);
@@ -2099,6 +2468,13 @@ export function bootstrapPlayGta6App(options = {}) {
       crashReporter.recordLog('warn', 'wgpu_worker', `splash-frame-presented failed: ${error}`);
     }
 
+    if (ok) {
+      syncVisibleFrameFromTelemetry(data, {
+        source: 'splash-frame-presented',
+        deferObserverForward: true,
+      });
+    }
+
     if (ok && gpuBootPanel) {
       safeUpdateGpuBootPanel({
         frameStats: {
@@ -2114,6 +2490,7 @@ export function bootstrapPlayGta6App(options = {}) {
       });
     }
 
+    const loadingAssets = isSplashOverlayHolding();
     const eventPayload = Object.freeze({
       type: 'splash-frame-presented',
       ok,
@@ -2121,6 +2498,14 @@ export function bootstrapPlayGta6App(options = {}) {
       framesPresented: effectiveFramesPresented,
       splashFramesPresented,
       firstPresent,
+      loadingAssets,
+      ...(gpuTelemetry.gpuAdapter !== null ? { gpuAdapter: gpuTelemetry.gpuAdapter } : {}),
+      ...(gpuTelemetry.firstVisibleFrameMs !== null
+        ? { firstVisibleFrameMs: gpuTelemetry.firstVisibleFrameMs }
+        : {}),
+      ...(gpuTelemetry.blackLoadingMs !== null
+        ? { blackLoadingMs: gpuTelemetry.blackLoadingMs }
+        : {}),
       ...(error ? { error } : {}),
       ...(reason ? { reason } : {}),
       timestampMs,
@@ -2165,7 +2550,8 @@ export function bootstrapPlayGta6App(options = {}) {
 
   function buildGpuStatsPayload() {
     const effectivePresentCount = Math.max(gpuTelemetry.presentCount, resolveFramesPresented());
-    return Object.freeze({
+    const loadingAssets = isSplashOverlayHolding();
+    const payload = {
       type: 'gpu-stats',
       realPackDrawCount: gpuTelemetry.realPackDrawCount,
       fallbackDrawCount: gpuTelemetry.fallbackDrawCount,
@@ -2175,7 +2561,19 @@ export function bootstrapPlayGta6App(options = {}) {
       validationErrorCount,
       lastValidationErrorCode: gpuTelemetry.lastValidationErrorCode,
       lastValidationErrorMessage: gpuTelemetry.lastValidationErrorMessage,
-    });
+      hasVisibleContent: gpuTelemetry.hasVisibleContent,
+      loadingAssets,
+    };
+    if (gpuTelemetry.gpuAdapter !== null) {
+      payload.gpuAdapter = gpuTelemetry.gpuAdapter;
+    }
+    if (gpuTelemetry.firstVisibleFrameMs !== null) {
+      payload.firstVisibleFrameMs = gpuTelemetry.firstVisibleFrameMs;
+    }
+    if (gpuTelemetry.blackLoadingMs !== null) {
+      payload.blackLoadingMs = gpuTelemetry.blackLoadingMs;
+    }
+    return Object.freeze(payload);
   }
 
   function forwardGpuStatsToObservers(gpuStatsPayload, { allowHudMetricsFallback = true } = {}) {
@@ -2236,11 +2634,19 @@ export function bootstrapPlayGta6App(options = {}) {
       data.gpuStats,
       data.drawStats,
       data.frameStats,
+      data.swapchainStats,
+      data.swapchain,
     ]);
     let matchedW83Field = false;
 
+    const adapterLabel = ingestGpuAdapterFromPayload(data);
+    if (adapterLabel !== null) {
+      matchedW83Field = true;
+    }
+
     const realPackField = pickFirstDefinedField(sources, [
       'realPackDrawCount',
+      'real_pack_draw_count',
       'realPackDraws',
       'packDrawCount',
       'packDraws',
@@ -2333,6 +2739,7 @@ export function bootstrapPlayGta6App(options = {}) {
       return false;
     }
     applyGpuStatsFields(data);
+    syncVisibleFrameFromTelemetry(data, { source: 'gpu-stats', deferObserverForward: true });
     const gpuStatsPayload = buildGpuStatsPayload();
     forwardGpuStatsToObservers(gpuStatsPayload, { allowHudMetricsFallback: true });
     if (gpuBootPanel && gpuStatsPayload.presentCount > 0) {
@@ -2610,8 +3017,12 @@ export function bootstrapPlayGta6App(options = {}) {
       patch.missingShaders = data.missingShaders;
     }
     const hadDrawOrBindFields = applyGpuStatsFields(data);
+    const triggeredVisible = syncVisibleFrameFromTelemetry(data, {
+      source: 'gpu-telemetry',
+      deferObserverForward: true,
+    });
     safeUpdateGpuBootPanel(patch);
-    if (hadDrawOrBindFields) {
+    if (hadDrawOrBindFields || triggeredVisible) {
       forwardGpuStatsToObservers(buildGpuStatsPayload(), { allowHudMetricsFallback: false });
     }
     return true;
@@ -2670,6 +3081,7 @@ export function bootstrapPlayGta6App(options = {}) {
       return handleSplashFramePresentedMessage(data);
     }
     if (data.type === 'frame-presented') {
+      ingestGpuAdapterFromPayload(data);
       const reportedFrames = toNonNegativeInt(
         data.presentCount ?? data.framesPresented ?? data.frame ?? data.frameCount,
         null
@@ -2681,10 +3093,23 @@ export function bootstrapPlayGta6App(options = {}) {
         wgpuFramesPresented += 1;
         gpuTelemetry.presentCount = Math.max(gpuTelemetry.presentCount, wgpuFramesPresented);
       }
+      const realPackField = pickFirstDefinedField([data], [
+        'realPackDrawCount',
+        'real_pack_draw_count',
+        'realPackDraws',
+      ]);
+      if (realPackField.found) {
+        gpuTelemetry.realPackDrawCount = Math.max(
+          gpuTelemetry.realPackDrawCount,
+          toSafeNonNegativeInt(realPackField.value, 0)
+        );
+      }
+      syncVisibleFrameFromTelemetry(data, { source: 'frame-presented', deferObserverForward: true });
       forwardGpuStatsToObservers(buildGpuStatsPayload(), { allowHudMetricsFallback: false });
       return true;
     }
     if (data.type === 'first-present') {
+      ingestGpuAdapterFromPayload(data);
       const reportedFrames = toNonNegativeInt(data.framesPresented ?? data.presentCount, null);
       if (reportedFrames !== null) {
         wgpuFramesPresented = Math.max(wgpuFramesPresented, reportedFrames);
@@ -2692,12 +3117,80 @@ export function bootstrapPlayGta6App(options = {}) {
         wgpuFramesPresented = Math.max(wgpuFramesPresented, 1);
       }
       gpuTelemetry.presentCount = Math.max(gpuTelemetry.presentCount, wgpuFramesPresented);
+      const realPackField = pickFirstDefinedField([data], [
+        'realPackDrawCount',
+        'real_pack_draw_count',
+        'realPackDraws',
+      ]);
+      if (realPackField.found) {
+        gpuTelemetry.realPackDrawCount = Math.max(
+          gpuTelemetry.realPackDrawCount,
+          toSafeNonNegativeInt(realPackField.value, 0)
+        );
+      }
       notifyFirstPresent({
         source: sanitizeDiagnosticText(data.source || 'wgpu_worker', 64) || 'wgpu_worker',
         frameIndex:
           Number.isInteger(data.frameIndex) && data.frameIndex >= 0 ? data.frameIndex : 0,
         framesPresented: wgpuFramesPresented,
       });
+      syncVisibleFrameFromTelemetry(data, { source: 'first-present', deferObserverForward: false });
+      return true;
+    }
+    if (data.type === 'first-visible-frame' || data.type === 'visible-frame') {
+      ingestGpuAdapterFromPayload(data);
+      const reportedFrames = toNonNegativeInt(data.framesPresented ?? data.presentCount, null);
+      if (reportedFrames !== null) {
+        wgpuFramesPresented = Math.max(wgpuFramesPresented, reportedFrames);
+        gpuTelemetry.presentCount = Math.max(gpuTelemetry.presentCount, reportedFrames);
+      }
+      const realPackField = pickFirstDefinedField([data], [
+        'realPackDrawCount',
+        'real_pack_draw_count',
+        'realPackDraws',
+      ]);
+      if (realPackField.found) {
+        gpuTelemetry.realPackDrawCount = Math.max(
+          gpuTelemetry.realPackDrawCount,
+          toSafeNonNegativeInt(realPackField.value, 0)
+        );
+      }
+      notifyFirstVisibleFrame({
+        source: sanitizeDiagnosticText(data.source || data.type, 64) || data.type,
+        ...(typeof data.elapsedMs === 'number' && Number.isFinite(data.elapsedMs) && data.elapsedMs >= 0
+          ? { elapsedMs: data.elapsedMs }
+          : {}),
+        ...(typeof data.fadeDurationMs === 'number' && Number.isFinite(data.fadeDurationMs)
+          ? { fadeDurationMs: data.fadeDurationMs }
+          : {}),
+        ...(typeof data.fadeMs === 'number' && Number.isFinite(data.fadeMs)
+          ? { fadeMs: data.fadeMs }
+          : {}),
+      });
+      return true;
+    }
+    if (
+      data.type === 'gpu-adapter' ||
+      data.type === 'webgpu-adapter' ||
+      data.type === 'adapter-info'
+    ) {
+      ingestGpuAdapterFromPayload(data);
+      return true;
+    }
+    if (data.type === 'log' || data.type === 'worker-log') {
+      const text =
+        typeof data.message === 'string'
+          ? data.message
+          : typeof data.line === 'string'
+            ? data.line
+            : typeof data.text === 'string'
+              ? data.text
+              : typeof data.label === 'string'
+                ? data.label
+                : null;
+      if (text) {
+        feedBootLog(text);
+      }
       return true;
     }
     if (typeof data.type === 'string' && LOADER_TELEMETRY_MESSAGE_TYPES.has(data.type)) {
@@ -2775,6 +3268,8 @@ export function bootstrapPlayGta6App(options = {}) {
     };
 
     wrapMethod('markMilestone', () => true);
+    wrapMethod('recordFirstVisibleFrame', () => true);
+    wrapMethod('recordGpuAdapter', () => true);
     wrapMethod('recordTrap', () => true);
     wrapMethod('reset', () => true);
     wrapMethod('ingestLogLine', (res) => Boolean(res));
@@ -2833,6 +3328,7 @@ export function bootstrapPlayGta6App(options = {}) {
   let bootOrchestrator = null;
   let ownsBootOrchestrator = false;
   let firstPresentNotified = false;
+  let firstVisibleFrameNotified = false;
 
   function notifyFirstPresent(meta = {}) {
     if (destroyed) {
@@ -2844,7 +3340,9 @@ export function bootstrapPlayGta6App(options = {}) {
     firstPresentNotified = true;
     if (bootOrchestrator && typeof bootOrchestrator.notifyFirstPresent === 'function') {
       try {
-        return bootOrchestrator.notifyFirstPresent(meta);
+        const result = bootOrchestrator.notifyFirstPresent(meta);
+        gpuTelemetry.loadingAssets = isSplashOverlayHolding();
+        return result;
       } catch {
         // Fall through to direct overlay dismissal.
       }
@@ -2867,13 +3365,135 @@ export function bootstrapPlayGta6App(options = {}) {
         // Overlay errors must never interrupt rendering.
       }
     }
+    gpuTelemetry.loadingAssets = isSplashOverlayHolding();
     return { ok: true, alreadyPresented: false };
   }
 
+  function notifyFirstVisibleFrame(meta = {}) {
+    if (destroyed) {
+      return { ok: false, destroyed: true };
+    }
+    if (firstVisibleFrameNotified) {
+      return {
+        ok: true,
+        alreadyVisible: true,
+        firstVisibleFrameMs: gpuTelemetry.firstVisibleFrameMs,
+        blackLoadingMs: gpuTelemetry.blackLoadingMs,
+      };
+    }
+    firstVisibleFrameNotified = true;
+    gpuTelemetry.hasVisibleContent = true;
+    gpuTelemetry.loadingAssets = false;
+
+    const safeMeta = meta && typeof meta === 'object' && !Array.isArray(meta) ? meta : {};
+    if (bootTracer && typeof bootTracer.recordFirstVisibleFrame === 'function') {
+      try {
+        const tracerOpts = {};
+        if (
+          typeof safeMeta.elapsedMs === 'number' &&
+          Number.isFinite(safeMeta.elapsedMs) &&
+          safeMeta.elapsedMs >= 0
+        ) {
+          tracerOpts.elapsedMs = safeMeta.elapsedMs;
+        }
+        if (typeof safeMeta.source === 'string' && safeMeta.source.trim().length > 0) {
+          tracerOpts.source = sanitizeDiagnosticText(safeMeta.source, 64);
+        }
+        if (safeMeta.detail !== undefined) {
+          tracerOpts.detail = safeMeta.detail;
+        }
+        const rec = bootTracer.recordFirstVisibleFrame(tracerOpts);
+        if (rec && typeof rec === 'object') {
+          if (typeof rec.firstVisibleFrameMs === 'number' && Number.isFinite(rec.firstVisibleFrameMs)) {
+            gpuTelemetry.firstVisibleFrameMs = rec.firstVisibleFrameMs;
+          }
+          if (typeof rec.blackLoadingMs === 'number' && Number.isFinite(rec.blackLoadingMs)) {
+            gpuTelemetry.blackLoadingMs = rec.blackLoadingMs;
+          }
+        }
+      } catch {
+        // Tracer errors must never interrupt rendering.
+      }
+    } else if (bootTracer && typeof bootTracer.markMilestone === 'function') {
+      try {
+        bootTracer.markMilestone('FIRST_VISIBLE_FRAME', safeMeta);
+      } catch {
+        // Ignore stub tracers without optional milestones.
+      }
+    }
+
+    if (
+      (gpuTelemetry.firstVisibleFrameMs === null || gpuTelemetry.blackLoadingMs === null) &&
+      bootTracer &&
+      typeof bootTracer.getSummary === 'function'
+    ) {
+      try {
+        const summary = bootTracer.getSummary();
+        if (summary && typeof summary === 'object') {
+          if (
+            gpuTelemetry.firstVisibleFrameMs === null &&
+            typeof summary.firstVisibleFrameMs === 'number' &&
+            Number.isFinite(summary.firstVisibleFrameMs)
+          ) {
+            gpuTelemetry.firstVisibleFrameMs = summary.firstVisibleFrameMs;
+          }
+          if (
+            gpuTelemetry.blackLoadingMs === null &&
+            typeof summary.blackLoadingMs === 'number' &&
+            Number.isFinite(summary.blackLoadingMs)
+          ) {
+            gpuTelemetry.blackLoadingMs = summary.blackLoadingMs;
+          }
+        }
+      } catch {
+        // Ignore tracer errors.
+      }
+    }
+
+    if (splashOverlay) {
+      try {
+        if (typeof splashOverlay.notifyFirstVisibleFrame === 'function') {
+          splashOverlay.notifyFirstVisibleFrame(safeMeta);
+        } else if (typeof splashOverlay.dismiss === 'function') {
+          splashOverlay.dismiss(safeMeta);
+        }
+      } catch {
+        // Overlay errors must never interrupt rendering.
+      }
+    }
+
+    if (safeMeta._deferObserverForward !== true) {
+      forwardGpuStatsToObservers(buildGpuStatsPayload(), { allowHudMetricsFallback: false });
+    }
+
+    return {
+      ok: true,
+      alreadyVisible: false,
+      firstVisibleFrameMs: gpuTelemetry.firstVisibleFrameMs,
+      blackLoadingMs: gpuTelemetry.blackLoadingMs,
+    };
+  }
+
   function feedBootLog(line) {
+    if (destroyed) {
+      return;
+    }
+    const text = typeof line === 'string' ? line : '';
+    const extractedAdapter = text ? extractGpuAdapterFromLogLine(text) : null;
+    if (extractedAdapter) {
+      recordGpuAdapter(extractedAdapter);
+    }
+    const logIndicatesVisibleFrame =
+      Boolean(text) &&
+      FIRST_VISIBLE_FRAME_LOG_RE.test(text) &&
+      !VISIBLE_FRAME_LOG_FAILURE_RE.test(text);
+
     if (bootOrchestrator && typeof bootOrchestrator.feedRuntimeLog === 'function') {
       try {
         bootOrchestrator.feedRuntimeLog(line);
+        if (logIndicatesVisibleFrame) {
+          notifyFirstVisibleFrame({ source: 'boot_log' });
+        }
         return;
       } catch {
         // Fall back to direct tracer update.
@@ -2896,9 +3516,19 @@ export function bootstrapPlayGta6App(options = {}) {
         if (summary && summary.readyForSplash) {
           notifyFirstPresent({ source: 'boot_log' });
         }
+        if (
+          logIndicatesVisibleFrame ||
+          (summary &&
+            typeof summary.firstVisibleFrameMs === 'number' &&
+            Number.isFinite(summary.firstVisibleFrameMs))
+        ) {
+          notifyFirstVisibleFrame({ source: 'boot_log' });
+        }
       } catch {
         // Tracer errors must never interrupt runtime logs.
       }
+    } else if (logIndicatesVisibleFrame) {
+      notifyFirstVisibleFrame({ source: 'boot_log' });
     }
   }
 
@@ -3090,6 +3720,7 @@ export function bootstrapPlayGta6App(options = {}) {
           if (handleWorkerMessage(data)) {
             return;
           }
+          ingestGpuAdapterFromPayload(data);
           ingestLoaderTelemetry(data, { notify: true, parseLabel: true });
           if (data.metrics && hud && typeof hud.updateMetrics === 'function') {
             try {
@@ -3274,6 +3905,10 @@ export function bootstrapPlayGta6App(options = {}) {
 
     if (!device || typeof device !== 'object') {
       throw new Error('Failed to acquire WebGPU GPUDevice');
+    }
+
+    if (adapter && typeof adapter === 'object' && adapter.info) {
+      recordGpuAdapter(adapter.info);
     }
 
     if (destroyed) {
@@ -3609,11 +4244,50 @@ export function bootstrapPlayGta6App(options = {}) {
     return configuredInputScript ? sanitizeInputScriptPreset(configuredInputScript) : null;
   }
 
+  function resolveTracerVisibleTiming() {
+    let gpuAdapter = gpuTelemetry.gpuAdapter;
+    let firstVisibleFrameMs = gpuTelemetry.firstVisibleFrameMs;
+    let blackLoadingMs = gpuTelemetry.blackLoadingMs;
+    if (
+      (gpuAdapter === null || firstVisibleFrameMs === null || blackLoadingMs === null) &&
+      bootTracer &&
+      typeof bootTracer.getSummary === 'function'
+    ) {
+      try {
+        const summary = bootTracer.getSummary();
+        if (summary && typeof summary === 'object') {
+          if (gpuAdapter === null && typeof summary.gpuAdapter === 'string' && summary.gpuAdapter) {
+            gpuAdapter = summary.gpuAdapter;
+          }
+          if (
+            firstVisibleFrameMs === null &&
+            typeof summary.firstVisibleFrameMs === 'number' &&
+            Number.isFinite(summary.firstVisibleFrameMs)
+          ) {
+            firstVisibleFrameMs = summary.firstVisibleFrameMs;
+          }
+          if (
+            blackLoadingMs === null &&
+            typeof summary.blackLoadingMs === 'number' &&
+            Number.isFinite(summary.blackLoadingMs)
+          ) {
+            blackLoadingMs = summary.blackLoadingMs;
+          }
+        }
+      } catch {
+        // Ignore tracer errors.
+      }
+    }
+    return { gpuAdapter, firstVisibleFrameMs, blackLoadingMs };
+  }
+
   function getDiagnosticsSnapshot() {
     const sessionState = resolveSessionStateText();
     const recentCopy = Object.freeze(
       recentValidationErrors.map((entry) => Object.freeze({ ...entry }))
     );
+    const { gpuAdapter, firstVisibleFrameMs, blackLoadingMs } = resolveTracerVisibleTiming();
+    const loadingAssets = isSplashOverlayHolding();
     return Object.freeze({
       bootMode: resolveCurrentBootMode(),
       sessionState,
@@ -3623,6 +4297,12 @@ export function bootstrapPlayGta6App(options = {}) {
       recentValidationErrors: recentCopy,
       framesPresented: resolveFramesPresented(),
       splashFramesPresented,
+      gpuAdapter,
+      hasVisibleContent: Boolean(gpuTelemetry.hasVisibleContent),
+      firstVisibleFrameMs,
+      blackLoadingMs,
+      loadingAssets,
+      holdUntilVisible: Boolean(resolvedHoldUntilVisible),
       dumpPipelines: Boolean(activeDumpConfig && activeDumpConfig.dumpPipelines),
       allowDumpWrites: Boolean(activeDumpConfig && activeDumpConfig.allowDumpWrites),
       inputScript: resolveDiagnosticInputScript(),
@@ -3636,6 +4316,8 @@ export function bootstrapPlayGta6App(options = {}) {
     const effectiveAudioOutputState = audioTelemetry.hasReceivedStats
       ? audioTelemetry.outputState
       : normalizeAudioOutputState(audioEngine && audioEngine.state);
+    const { gpuAdapter, firstVisibleFrameMs, blackLoadingMs } = resolveTracerVisibleTiming();
+    const loadingAssets = isSplashOverlayHolding();
 
     const gpu = Object.freeze({
       realPackDrawCount: toSafeNonNegativeInt(gpuTelemetry.realPackDrawCount, 0),
@@ -3646,6 +4328,11 @@ export function bootstrapPlayGta6App(options = {}) {
       validationErrorCount: toSafeNonNegativeInt(validationErrorCount, 0),
       lastValidationErrorCode: gpuTelemetry.lastValidationErrorCode,
       lastValidationErrorMessage: gpuTelemetry.lastValidationErrorMessage,
+      gpuAdapter,
+      hasVisibleContent: Boolean(gpuTelemetry.hasVisibleContent),
+      firstVisibleFrameMs,
+      blackLoadingMs,
+      loadingAssets,
     });
 
     const audio = Object.freeze({
@@ -3673,6 +4360,12 @@ export function bootstrapPlayGta6App(options = {}) {
       dumpPipelines: Boolean(activeDumpConfig && activeDumpConfig.dumpPipelines),
       allowDumpWrites: Boolean(activeDumpConfig && activeDumpConfig.allowDumpWrites),
       inputScript: resolveDiagnosticInputScript(),
+      holdUntilVisible: Boolean(resolvedHoldUntilVisible),
+      gpuAdapter: gpu.gpuAdapter,
+      hasVisibleContent: gpu.hasVisibleContent,
+      firstVisibleFrameMs: gpu.firstVisibleFrameMs,
+      blackLoadingMs: gpu.blackLoadingMs,
+      loadingAssets: gpu.loadingAssets,
       realPackDrawCount: gpu.realPackDrawCount,
       fallbackDrawCount: gpu.fallbackDrawCount,
       presentCount: gpu.presentCount,
@@ -4071,6 +4764,7 @@ export function bootstrapPlayGta6App(options = {}) {
     getDiagnosticsSnapshot,
     getBootTelemetry,
     notifyFirstPresent,
+    notifyFirstVisibleFrame,
     start,
     stop,
     resize,
