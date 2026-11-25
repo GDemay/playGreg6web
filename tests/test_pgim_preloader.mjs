@@ -1558,6 +1558,12 @@ test('W147 constructor validates retryDelayMs, maxRetryDelayMs, sleepFn, nowFn a
     parallelMode: false,
     retryCount: 0,
     abortedCount: 0,
+    opfsHits: 0,
+    opfsMisses: 0,
+    opfsWrites: 0,
+    opfsInvalidations: 0,
+    bytesFromOpfs: 0,
+    bytesFromNetwork: 0,
   });
   assert.deepEqual(p.getSnapshot(), initial);
 });
@@ -1918,6 +1924,12 @@ test('W147 honors AbortSignal immediately during retry backoff and tracks aborte
       parallelMode: false,
       retryCount: 0,
       abortedCount: 0,
+      opfsHits: 0,
+      opfsMisses: 0,
+      opfsWrites: 0,
+      opfsInvalidations: 0,
+      bytesFromOpfs: 0,
+      bytesFromNetwork: 0,
     });
     assert.deepEqual(preloader.getStats(), cleared);
   }
@@ -2529,4 +2541,624 @@ test('W258 PgimPreloader retains zero fetched ArrayBuffer or Uint8Array referenc
   assert.equal(hasBinaryBufferReference(preloader), false, 'preloadBootBundle must not retain binary buffers on instance');
   assert.equal(preloader.getStats().state, 'complete');
   assert.ok(preloader.getStats().bytesLoaded >= image.byteLength + pack.byteLength);
+});
+
+// ---------------------------------------------------------------------------------------------
+// W310: Versioned OPFS warm-boot cache, ETag rotation, quota fallback, progress ratio & W258.
+// ---------------------------------------------------------------------------------------------
+
+function createMemoryOpfsStore(hooks = {}) {
+  const entries = new Map();
+  const reads = [];
+  const writes = [];
+  const deletes = [];
+  return {
+    entries,
+    reads,
+    writes,
+    deletes,
+    async read(key, meta) {
+      reads.push({ key, meta });
+      if (typeof hooks.onRead === 'function') {
+        return hooks.onRead(key, meta, entries);
+      }
+      const val = entries.get(key);
+      return val ? val.slice() : null;
+    },
+    async write(key, bytes, meta) {
+      writes.push({ key, byteLength: bytes.byteLength, meta });
+      if (typeof hooks.onWrite === 'function') {
+        return hooks.onWrite(key, bytes, meta, entries);
+      }
+      entries.set(key, new Uint8Array(bytes).slice());
+      return true;
+    },
+    async delete(key) {
+      deletes.push(key);
+      if (typeof hooks.onDelete === 'function') {
+        return hooks.onDelete(key, entries);
+      }
+      return entries.delete(key);
+    },
+  };
+}
+
+function createEtagServer(initialEntries, options = {}) {
+  const { supportRange = true, headStatus = 200, delayMs = 0 } = options;
+  const files = new Map();
+  for (const [url, entry] of Object.entries(initialEntries)) {
+    files.set(url, { bytes: entry.bytes, etag: entry.etag ?? null });
+  }
+  const log = [];
+  const fetchImpl = async (url, init = {}) => {
+    const method = init.method || 'GET';
+    const range = init.headers?.Range ?? init.headers?.range ?? null;
+    log.push({ url, method, range });
+    if (init.signal?.aborted) throw init.signal.reason;
+    if (delayMs > 0) await delay(delayMs, init.signal);
+    const entry = files.get(url);
+    if (!entry) return new Response(null, { status: 404 });
+    const { bytes, etag } = entry;
+    const baseHeaders = { 'content-length': String(bytes.byteLength) };
+    if (etag !== null) baseHeaders.etag = etag;
+    if (method === 'HEAD') {
+      if (headStatus !== 200) return new Response(null, { status: headStatus });
+      baseHeaders['accept-ranges'] = supportRange ? 'bytes' : 'none';
+      return new Response(null, { status: 200, headers: baseHeaders });
+    }
+    if (range && supportRange) {
+      const m = /^bytes=(\d+)-(\d+)$/.exec(range);
+      const start = Number(m[1]);
+      if (start >= bytes.byteLength) return new Response(null, { status: 416 });
+      const end = Math.min(Number(m[2]), bytes.byteLength - 1);
+      const headers = {
+        'content-range': `bytes ${start}-${end}/${bytes.byteLength}`,
+        'content-length': String(end - start + 1),
+      };
+      if (etag !== null) headers.etag = etag;
+      return new Response(bytes.slice(start, end + 1), { status: 206, headers });
+    }
+    return new Response(bytes.slice(), { status: 200, headers: baseHeaders });
+  };
+  return {
+    fetchImpl,
+    log,
+    setFile(url, bytes, etag = null) {
+      files.set(url, { bytes, etag });
+    },
+    getCount(method, url = null) {
+      return log.filter((r) => r.method === method && (url === null || r.url === url)).length;
+    },
+  };
+}
+
+function createMockOpfsDirHandle() {
+  const files = new Map();
+  const makeDir = () => ({
+    async getDirectoryHandle() {
+      return makeDir();
+    },
+    async getFileHandle(name, { create = false } = {}) {
+      if (!files.has(name)) {
+        if (!create) {
+          throw new DOMException(`File not found: ${name}`, 'NotFoundError');
+        }
+        files.set(name, new Uint8Array(0));
+      }
+      return {
+        name,
+        async getFile() {
+          const data = files.get(name) || new Uint8Array(0);
+          return {
+            size: data.byteLength,
+            async arrayBuffer() {
+              return data.slice().buffer;
+            },
+          };
+        },
+        async createWritable() {
+          let pending = new Uint8Array(0);
+          return {
+            async write(chunk) {
+              if (chunk instanceof Uint8Array) pending = chunk.slice();
+              else if (ArrayBuffer.isView(chunk)) {
+                pending = new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength).slice();
+              } else if (chunk instanceof ArrayBuffer) {
+                pending = new Uint8Array(chunk).slice();
+              }
+            },
+            async close() {
+              files.set(name, pending);
+            },
+            async abort() {},
+          };
+        },
+      };
+    },
+    async removeEntry(name) {
+      if (!files.has(name)) {
+        throw new DOMException(`File not found: ${name}`, 'NotFoundError');
+      }
+      files.delete(name);
+    },
+  });
+  return { dirHandle: makeDir(), files };
+}
+
+test('W310 exports OPFS cache helpers, validates options, and builds sanitized versioned fingerprints', () => {
+  assert.equal(pgimMod.PGIM_OPFS_CACHE_VERSION, 1);
+  assert.equal(pgimMod.DEFAULT_OPFS_CACHE_DIR, 'playgta6-pgim-cache');
+  assert.equal(typeof pgimMod.sanitizePgimCacheUrlPath, 'function');
+  assert.equal(typeof pgimMod.buildPgimOpfsFingerprint, 'function');
+  assert.equal(typeof pgimMod.buildPgimOpfsCacheKey, 'function');
+
+  // Sanitization strips origin, credentials, query params, fragments, backslashes, and traversal.
+  assert.equal(
+    pgimMod.sanitizePgimCacheUrlPath('https://user:secret@example.com/data/../boot/GTA6.pgim?token=xyz#hash'),
+    'boot/GTA6.pgim'
+  );
+  assert.equal(pgimMod.sanitizePgimCacheUrlPath('../data/..\\boot\\GTA6.pgim?token=1'), 'boot/GTA6.pgim');
+  assert.equal(pgimMod.sanitizePgimCacheUrlPath('/data/GTA6.pgim'), 'data/GTA6.pgim');
+  assert.equal(pgimMod.sanitizePgimCacheUrlPath('http://127.0.0.1:8080/data/GTA6.pgim?v=1'), 'data/GTA6.pgim');
+
+  // Fingerprint keys are filename-safe, deterministic, and sensitive to urlPath, etag, byteLength, and version.
+  const fp1 = pgimMod.buildPgimOpfsFingerprint('/data/GTA6.pgim?sig=abc', '"etag-v1"', 40960, 1);
+  const fp1Same = pgimMod.buildPgimOpfsFingerprint('http://localhost:8080/data/GTA6.pgim', '"etag-v1"', 40960, 1);
+  const fpEtag2 = pgimMod.buildPgimOpfsFingerprint('/data/GTA6.pgim', '"etag-v2"', 40960, 1);
+  const fpSize2 = pgimMod.buildPgimOpfsFingerprint('/data/GTA6.pgim', '"etag-v1"', 81920, 1);
+  const fpVer2 = pgimMod.buildPgimOpfsFingerprint('/data/GTA6.pgim', '"etag-v1"', 40960, 2);
+  const fpOtherPath = pgimMod.buildPgimOpfsFingerprint('/other/GTA6.pgim', '"etag-v1"', 40960, 1);
+
+  assert.equal(fp1.dataKey, fp1Same.dataKey);
+  assert.equal(fp1.metaKey, fp1Same.metaKey);
+  assert.equal(fp1.fingerprint, fp1Same.fingerprint);
+  assert.match(fp1.dataKey, /^[A-Za-z0-9._-]+\.pgim$/);
+  assert.match(fp1.metaKey, /^[A-Za-z0-9._-]+\.meta\.json$/);
+  assert.ok(!fp1.dataKey.includes('sig') && !fp1.dataKey.includes('localhost'));
+  assert.notEqual(fp1.dataKey, fpEtag2.dataKey);
+  assert.notEqual(fp1.dataKey, fpSize2.dataKey);
+  assert.notEqual(fp1.dataKey, fpVer2.dataKey);
+  assert.notEqual(fp1.dataKey, fpOtherPath.dataKey);
+  assert.equal(fp1.metaKey, fpEtag2.metaKey, 'same urlPath shares metaKey so ETag rotation can evict stale payload');
+  assert.notEqual(fp1.metaKey, fpVer2.metaKey, 'bumping cache version namespaces metaKey cleanly');
+  assert.notEqual(fp1.metaKey, fpOtherPath.metaKey);
+  assert.equal(pgimMod.buildPgimOpfsCacheKey('/data/GTA6.pgim', '"etag-v1"', 40960), fp1.dataKey);
+
+  // Constructor option validation.
+  const fetchImpl = async () => new Response(null);
+  assert.throws(() => new PgimPreloader({ fetchImpl, opfsCache: 42 }), TypeError);
+  assert.throws(() => new PgimPreloader({ fetchImpl, opfsCache: {} }), TypeError);
+  assert.throws(() => new PgimPreloader({ fetchImpl, opfsCache: { read: () => {} } }), TypeError);
+  assert.throws(() => new PgimPreloader({ fetchImpl, opfsCacheVersion: 0 }), RangeError);
+  assert.throws(() => new PgimPreloader({ fetchImpl, opfsCacheVersion: '../bad' }), RangeError);
+  assert.doesNotThrow(() => new PgimPreloader({ fetchImpl, opfsCache: null }));
+  assert.doesNotThrow(() => new PgimPreloader({ fetchImpl, opfsCache: false }));
+  assert.doesNotThrow(() => new PgimPreloader({ fetchImpl, opfsCache: true }));
+  assert.doesNotThrow(() => new PgimPreloader({ fetchImpl, opfsCache: createMemoryOpfsStore() }));
+});
+
+test('W310 cold fetch streams with monotonic ratio progress and persists asynchronously to OPFS without blocking', async () => {
+  const image = buildLargePgim();
+  const server = createEtagServer({ '/boot/GTA6.pgim': { bytes: image, etag: '"pgim-v1"' } });
+
+  // Gate the OPFS payload write behind a deferred promise to prove preloadGuestImage never blocks on disk I/O.
+  let releaseWrite;
+  let writeStarted = false;
+  const writeGate = new Promise((resolve) => {
+    releaseWrite = resolve;
+  });
+  const store = createMemoryOpfsStore({
+    async onWrite(key, bytes, meta, entries) {
+      if (key.endsWith('.pgim')) {
+        writeStarted = true;
+        await writeGate;
+      }
+      entries.set(key, new Uint8Array(bytes).slice());
+      return true;
+    },
+  });
+
+  const preloader = new PgimPreloader({
+    fetchImpl: server.fetchImpl,
+    opfsCache: store,
+    chunkSize: 4096,
+    concurrency: 3,
+  });
+
+  const events = [];
+  const result = await preloader.preloadGuestImage('/boot/GTA6.pgim', {
+    onProgress: (e) => events.push(e),
+    verifyChecksums: true,
+  });
+
+  // Preload resolved BEFORE the deferred OPFS write finished.
+  assert.equal(writeStarted, true, 'background OPFS write should have started');
+  assert.deepEqual(result.bytes, image);
+  assert.equal(result.opfsCacheHit, false);
+  assert.equal(result.etag, '"pgim-v1"');
+  assert.equal(result.transport, 'range');
+  assert.equal(preloader.getStats().opfsHits, 0);
+  assert.equal(preloader.getStats().opfsMisses, 1);
+  assert.equal(preloader.getStats().opfsWrites, 0, 'write has not finished yet');
+  assert.equal(preloader.getStats().bytesFromOpfs, 0);
+  assert.equal(preloader.getStats().bytesFromNetwork, image.byteLength);
+
+  // Monotonic progress callbacks with loadedBytes, totalBytes, and ratio in [0, 1].
+  assertMonotonic(events, image.byteLength);
+  let prevRatio = -1;
+  for (const e of events) {
+    assert.equal(typeof e.ratio, 'number');
+    assert.ok(Number.isFinite(e.ratio) && e.ratio >= 0 && e.ratio <= 1, `bad ratio ${e.ratio}`);
+    assert.ok(e.ratio >= prevRatio, `ratio regressed: ${e.ratio} < ${prevRatio}`);
+    prevRatio = e.ratio;
+  }
+  assert.equal(events[events.length - 1].ratio, 1);
+
+  // Release the background OPFS write and verify persistence + stats update.
+  releaseWrite();
+  await preloader.flushOpfsWrites();
+  const statsAfterWrite = preloader.getStats();
+  assert.equal(statsAfterWrite.opfsWrites, 1);
+  assert.equal(statsAfterWrite.opfsMisses, 1);
+  assert.equal(statsAfterWrite.opfsHits, 0);
+  assert.equal(statsAfterWrite.opfsInvalidations, 0);
+  assert.equal(statsAfterWrite.bytesFromOpfs, 0);
+  assert.equal(statsAfterWrite.bytesFromNetwork, image.byteLength);
+  assert.equal(store.entries.size, 2, 'payload + metadata entries persisted in OPFS');
+});
+
+test('W310 warm OPFS hit skips HTTP GET entirely, emits opfsCacheHit=true, and supports SAB + multi-module + no-HEAD fast path', async () => {
+  const image = buildLargePgim();
+  const server = createEtagServer({ '/boot/GTA6.pgim': { bytes: image, etag: '"warm-etag-1"' } });
+  const store = createMemoryOpfsStore();
+
+  // Cold boot #1 populates OPFS.
+  const coldPreloader = new PgimPreloader({ fetchImpl: server.fetchImpl, opfsCache: store, chunkSize: 4096 });
+  const cold = await coldPreloader.preloadPgim('/boot/GTA6.pgim');
+  await coldPreloader.flushOpfsWrites();
+  assert.equal(cold.opfsCacheHit, false);
+  assert.ok(server.getCount('GET', '/boot/GTA6.pgim') > 1);
+  const getsAfterCold = server.getCount('GET', '/boot/GTA6.pgim');
+
+  // Warm boot #2 (fresh PgimPreloader instance simulating repeat page load): HEAD validates ETag/size, 0 HTTP GETs!
+  const warmPreloader = new PgimPreloader({
+    fetchImpl: server.fetchImpl,
+    opfsCache: store,
+    chunkSize: 4096,
+    useSharedArrayBuffer: true,
+  });
+  const warmEvents = [];
+  const warm = await warmPreloader.preloadPgim('/boot/GTA6.pgim', {
+    onProgress: (e) => warmEvents.push(e),
+    verifyChecksums: true,
+  });
+
+  assert.equal(warm.opfsCacheHit, true);
+  assert.equal(warm.transport, 'opfs-cache');
+  assert.equal(warm.etag, '"warm-etag-1"');
+  assert.equal(warm.shared, true);
+  assert.ok(warm.bytes.buffer instanceof SharedArrayBuffer);
+  assert.deepEqual(new Uint8Array(warm.bytes), image);
+  assert.equal(server.getCount('GET', '/boot/GTA6.pgim'), getsAfterCold, 'warm hit must issue zero HTTP GET requests');
+  assert.ok(warmEvents.some((e) => e.phase === 'cache-hit' && e.opfsCacheHit === true && e.ratio === 1));
+  assert.equal(warmEvents[warmEvents.length - 1].phase, 'complete');
+  assert.equal(warmEvents[warmEvents.length - 1].opfsCacheHit, true);
+  assert.equal(warmEvents[warmEvents.length - 1].ratio, 1);
+  assertMonotonic(warmEvents, image.byteLength);
+
+  const warmStats = warmPreloader.getStats();
+  assert.equal(warmStats.state, 'complete');
+  assert.equal(warmStats.opfsHits, 1);
+  assert.equal(warmStats.opfsMisses, 0);
+  assert.equal(warmStats.opfsWrites, 0);
+  assert.equal(warmStats.opfsInvalidations, 0);
+  assert.equal(warmStats.bytesFromOpfs, image.byteLength);
+  assert.equal(warmStats.bytesFromNetwork, 0);
+  assert.equal(warmStats.bytesLoaded, image.byteLength);
+
+  // Warm boot #3 with opfsValidateWithHead: false skips even the HEAD probe (zero network requests).
+  const reqsBeforeNoHead = server.log.length;
+  const offlinePreloader = new PgimPreloader({
+    fetchImpl: server.fetchImpl,
+    opfsCache: store,
+    opfsValidateWithHead: false,
+  });
+  const offlineRes = await offlinePreloader.preloadGuestImage('/boot/GTA6.pgim');
+  assert.equal(offlineRes.opfsCacheHit, true);
+  assert.deepEqual(offlineRes.bytes, image);
+  assert.equal(server.log.length, reqsBeforeNoHead, 'cached-metadata fast path skips HEAD and GET');
+  assert.equal(offlinePreloader.getStats().opfsHits, 1);
+  assert.equal(offlinePreloader.getStats().bytesFromOpfs, image.byteLength);
+  assert.equal(offlinePreloader.getStats().bytesFromNetwork, 0);
+
+  // Warm boot #4 with HEAD 405 falls back cleanly to cached metadata when available.
+  const server405 = createEtagServer({ '/boot/GTA6.pgim': { bytes: image, etag: '"warm-etag-1"' } }, { headStatus: 405 });
+  const preloader405 = new PgimPreloader({ fetchImpl: server405.fetchImpl, opfsCache: store });
+  const res405 = await preloader405.preloadGuestImage('/boot/GTA6.pgim');
+  assert.equal(res405.opfsCacheHit, true);
+  assert.deepEqual(res405.bytes, image);
+  assert.equal(server405.getCount('GET'), 0);
+
+  // Warm boot with mock FileSystemDirectoryHandle (native OPFS adapter).
+  const { dirHandle } = createMockOpfsDirHandle();
+  const fsServer = createEtagServer({ '/native/game.pgim': { bytes: image, etag: '"native-v1"' } });
+  const fsPreloader1 = new PgimPreloader({ fetchImpl: fsServer.fetchImpl, opfsCache: dirHandle, chunkSize: 8192 });
+  const fsCold = await fsPreloader1.preloadGuestImage('/native/game.pgim');
+  await fsPreloader1.flushOpfsWrites();
+  assert.equal(fsCold.opfsCacheHit, false);
+  const fsGetsAfterCold = fsServer.getCount('GET');
+
+  const fsPreloader2 = new PgimPreloader({ fetchImpl: fsServer.fetchImpl, opfsCache: dirHandle, chunkSize: 8192 });
+  const fsWarm = await fsPreloader2.preloadGuestImage('/native/game.pgim');
+  assert.equal(fsWarm.opfsCacheHit, true);
+  assert.deepEqual(fsWarm.bytes, image);
+  assert.equal(fsServer.getCount('GET'), fsGetsAfterCold);
+  assert.equal(fsPreloader2.getStats().opfsHits, 1);
+  assert.equal(fsPreloader2.getStats().bytesFromOpfs, image.byteLength);
+});
+
+test('W310 ETag rotation and corrupt OPFS entries invalidate stale cache, refetch over HTTP, and rewrite OPFS', async () => {
+  // Build two distinct PGIM images of the EXACT SAME byteLength to prove ETag alone triggers rotation!
+  const imageV1 = buildModulePgim(101, { textBytes: 0x1800, dataBytes: 0x1400 });
+  const imageV2 = buildModulePgim(202, { textBytes: 0x1800, dataBytes: 0x1400 });
+  assert.equal(imageV1.byteLength, imageV2.byteLength);
+  assert.notDeepEqual(imageV1, imageV2);
+
+  const server = createEtagServer({ '/boot/game.pgim': { bytes: imageV1, etag: '"v1"' } });
+  const store = createMemoryOpfsStore();
+  const fpV1 = pgimMod.buildPgimOpfsFingerprint('/boot/game.pgim', '"v1"', imageV1.byteLength);
+  const fpV2 = pgimMod.buildPgimOpfsFingerprint('/boot/game.pgim', '"v2"', imageV2.byteLength);
+
+  // Boot 1 (cold v1).
+  const p1 = new PgimPreloader({ fetchImpl: server.fetchImpl, opfsCache: store, chunkSize: 4096 });
+  const r1 = await p1.preloadGuestImage('/boot/game.pgim');
+  await p1.flushOpfsWrites();
+  assert.equal(r1.opfsCacheHit, false);
+  assert.deepEqual(r1.bytes, imageV1);
+  assert.ok(store.entries.has(fpV1.dataKey));
+
+  // Rotate ETag on server ("v1" -> "v2").
+  server.setFile('/boot/game.pgim', imageV2, '"v2"');
+
+  // Boot 2 detects ETag rotation, deletes v1, refetches v2 over HTTP, and persists v2.
+  const p2 = new PgimPreloader({ fetchImpl: server.fetchImpl, opfsCache: store, chunkSize: 4096 });
+  const r2 = await p2.preloadGuestImage('/boot/game.pgim', { verifyChecksums: true });
+  await p2.flushOpfsWrites();
+  assert.equal(r2.opfsCacheHit, false);
+  assert.equal(r2.etag, '"v2"');
+  assert.deepEqual(r2.bytes, imageV2);
+  assert.ok(store.deletes.includes(fpV1.dataKey), 'stale v1 payload key must be deleted on ETag rotation');
+  assert.equal(store.entries.has(fpV1.dataKey), false);
+  assert.equal(store.entries.has(fpV2.dataKey), true);
+  const s2 = p2.getStats();
+  assert.equal(s2.opfsInvalidations, 1);
+  assert.equal(s2.opfsMisses, 1);
+  assert.equal(s2.opfsHits, 0);
+  assert.equal(s2.opfsWrites, 1);
+  assert.equal(s2.bytesFromOpfs, 0);
+  assert.equal(s2.bytesFromNetwork, imageV2.byteLength);
+
+  // Boot 3 hits OPFS with rotated v2 and issues 0 HTTP GETs.
+  const getsBeforeV2Hit = server.getCount('GET');
+  const p3 = new PgimPreloader({ fetchImpl: server.fetchImpl, opfsCache: store, chunkSize: 4096 });
+  const r3 = await p3.preloadGuestImage('/boot/game.pgim');
+  assert.equal(r3.opfsCacheHit, true);
+  assert.deepEqual(r3.bytes, imageV2);
+  assert.equal(server.getCount('GET'), getsBeforeV2Hit);
+  assert.equal(p3.getStats().opfsHits, 1);
+  assert.equal(p3.getStats().bytesFromOpfs, imageV2.byteLength);
+
+  // Corrupt cached payload self-heals: invalidates corrupt bytes and falls back to HTTP without failing boot.
+  const corrupt = store.entries.get(fpV2.dataKey).slice();
+  corrupt[0] ^= 0xff; // break PGIM magic
+  store.entries.set(fpV2.dataKey, corrupt);
+
+  const p4 = new PgimPreloader({ fetchImpl: server.fetchImpl, opfsCache: store, chunkSize: 4096 });
+  const r4 = await p4.preloadGuestImage('/boot/game.pgim');
+  await p4.flushOpfsWrites();
+  assert.equal(r4.opfsCacheHit, false);
+  assert.deepEqual(r4.bytes, imageV2);
+  assert.equal(p4.getStats().opfsInvalidations, 1);
+  assert.equal(p4.getStats().opfsMisses, 1);
+  assert.equal(p4.getStats().opfsWrites, 1);
+  assert.equal(p4.getStats().bytesFromNetwork, imageV2.byteLength);
+});
+
+test('W310 swallows QuotaExceededError and storage errors without failing boot', async () => {
+  const image = buildLargePgim();
+  const server = createEtagServer({ '/boot/quota.pgim': { bytes: image, etag: '"q-v1"' } });
+
+  // 1. Async QuotaExceededError rejection on write.
+  {
+    const quotaStore = createMemoryOpfsStore({
+      async onWrite() {
+        throw new DOMException('OPFS quota exceeded', 'QuotaExceededError');
+      },
+    });
+    const preloader = new PgimPreloader({ fetchImpl: server.fetchImpl, opfsCache: quotaStore, chunkSize: 4096 });
+    const result = await preloader.preloadGuestImage('/boot/quota.pgim');
+    await preloader.flushOpfsWrites();
+    assert.deepEqual(result.bytes, image);
+    assert.equal(result.opfsCacheHit, false);
+    const stats = preloader.getStats();
+    assert.equal(stats.state, 'complete');
+    assert.equal(stats.opfsHits, 0);
+    assert.equal(stats.opfsMisses, 1);
+    assert.equal(stats.opfsWrites, 0);
+    assert.equal(stats.bytesFromOpfs, 0);
+    assert.equal(stats.bytesFromNetwork, image.byteLength);
+  }
+
+  // 2. Synchronous QuotaExceededError throw on write + read throwing SecurityError.
+  {
+    const brokenStore = {
+      read() {
+        throw new DOMException('Blocked in private mode', 'SecurityError');
+      },
+      write() {
+        throw new DOMException('Quota full', 'QuotaExceededError');
+      },
+      delete() {
+        throw new Error('delete failed');
+      },
+    };
+    const preloader = new PgimPreloader({ fetchImpl: server.fetchImpl, opfsCache: brokenStore, chunkSize: 4096 });
+    const result = await preloader.preloadGuestImage('/boot/quota.pgim');
+    await preloader.flushOpfsWrites();
+    assert.deepEqual(result.bytes, image);
+    assert.equal(result.opfsCacheHit, false);
+    assert.equal(preloader.getStats().opfsWrites, 0);
+    assert.equal(preloader.getStats().bytesFromNetwork, image.byteLength);
+  }
+
+  // 3. opfsCache: true in Node without navigator.storage gracefully falls back to network.
+  {
+    const preloader = new PgimPreloader({
+      fetchImpl: server.fetchImpl,
+      opfsCache: true,
+      opfsStorageObj: null,
+      chunkSize: 4096,
+    });
+    const result = await preloader.preloadGuestImage('/boot/quota.pgim');
+    await preloader.flushOpfsWrites();
+    assert.deepEqual(result.bytes, image);
+    assert.equal(result.opfsCacheHit, false);
+    assert.equal(preloader.getStats().opfsWrites, 0);
+    assert.equal(preloader.getStats().bytesFromNetwork, image.byteLength);
+  }
+});
+
+test('W310 preserves W258 explicit ArrayBuffer release and zero instance buffer retention across cold & warm OPFS boots', async () => {
+  const image = buildLargePgim();
+  const pack = new Uint8Array(
+    buildWgslPackBuffer([{ hash: 0x12345678n, stage: 'vertex', wgsl: '@vertex fn main() -> @builtin(position) vec4f { return vec4f(); }' }])
+  );
+  const manifest = s6Manifest();
+  const server = createEtagServer({
+    '/w310/game.pgim': { bytes: image, etag: '"w310-v1"' },
+    '/w310/boot.wgsl.pack': { bytes: pack, etag: '"pack-v1"' },
+    '/w310/reflection.json': { bytes: new TextEncoder().encode(JSON.stringify(manifest)), etag: '"refl-v1"' },
+  });
+
+  // Gate cold write to confirm releasing the returned bundle immediately does not corrupt the in-flight OPFS write.
+  let releaseWrite;
+  const writeGate = new Promise((resolve) => {
+    releaseWrite = resolve;
+  });
+  const store = createMemoryOpfsStore({
+    async onWrite(key, bytes, meta, entries) {
+      if (key.endsWith('.pgim')) await writeGate;
+      entries.set(key, new Uint8Array(bytes).slice());
+      return true;
+    },
+  });
+
+  const coldPreloader = new PgimPreloader({ fetchImpl: server.fetchImpl, opfsCache: store, chunkSize: 4096 });
+  const coldBundle = await coldPreloader.preloadBootBundle({
+    pgimUrl: '/w310/game.pgim',
+    shaderPackUrl: '/w310/boot.wgsl.pack',
+    reflectionUrl: '/w310/reflection.json',
+  });
+  assert.equal(coldBundle.opfsCacheHit, false);
+  assert.equal(hasBinaryBufferReference(coldPreloader), false, 'preloader must retain zero binary buffers while OPFS write is pending');
+
+  // Immediately release handoff buffers per W258 BEFORE background OPFS write finishes.
+  const coldReleased = releaseBootBundleBytes(coldBundle);
+  assert.equal(coldReleased.releasedBytes, image.byteLength + pack.byteLength);
+  assert.equal(coldBundle.buffer, null);
+  assert.equal(coldBundle.pgimBytes, null);
+  assert.equal(coldBundle.pgim.bytes, null);
+  assert.equal(coldBundle.pgim.buffer, null);
+  assert.equal(coldBundle.shaderPackBytes, null);
+  assert.equal(coldBundle.bytesLoaded, image.byteLength);
+  assert.equal(coldBundle.pgimHeader.magic, 'PGIM');
+
+  // Now complete background OPFS write and verify warm boot reads intact bytes from OPFS.
+  releaseWrite();
+  await coldPreloader.flushOpfsWrites();
+  assert.equal(hasBinaryBufferReference(coldPreloader), false);
+  assert.equal(coldPreloader.getStats().opfsWrites, 1);
+
+  const getsBeforeWarm = server.getCount('GET', '/w310/game.pgim');
+  const warmPreloader = new PgimPreloader({ fetchImpl: server.fetchImpl, opfsCache: store, chunkSize: 4096 });
+  const warmBundle = await warmPreloader.preloadBootBundle({
+    pgimUrl: '/w310/game.pgim',
+    shaderPackUrl: '/w310/boot.wgsl.pack',
+    reflectionUrl: '/w310/reflection.json',
+  });
+  assert.equal(warmBundle.opfsCacheHit, true);
+  assert.equal(warmBundle.pgim.opfsCacheHit, true);
+  assert.equal(server.getCount('GET', '/w310/game.pgim'), getsBeforeWarm, 'warm boot bundle skips PGIM HTTP GET');
+  assert.deepEqual(warmBundle.pgimBytes, image);
+  assert.equal(hasBinaryBufferReference(warmPreloader), false);
+
+  // Release warm-cached bundle buffers via W258 helper and verify metadata + idempotency.
+  const warmReleased = releaseBootBundleBytes(warmBundle);
+  assert.equal(warmReleased.releasedBytes, image.byteLength + pack.byteLength);
+  assert.equal(warmBundle.buffer, null);
+  assert.equal(warmBundle.pgimBytes, null);
+  assert.equal(warmBundle.pgim.bytes, null);
+  assert.equal(warmBundle.pgim.buffer, null);
+  assert.equal(warmBundle.shaderPackBytes, null);
+  assert.equal(warmBundle.opfsCacheHit, true);
+  assert.equal(warmBundle.etag, '"w310-v1"');
+  assert.equal(warmBundle.bytesLoaded, image.byteLength);
+  assert.deepEqual(releaseBootBundleBytes(warmBundle), { releasedFields: [], releasedBytes: 0 });
+});
+
+test('W310 multi-module preloadProgramModules mixes OPFS warm hits and cold misses with accurate aggregate stats', async () => {
+  const m1 = buildModulePgim(111, { imageBase: 0x100000000n });
+  const m2 = buildModulePgim(112, { imageBase: 0x140000000n });
+  const manifestBytes = jsonBytes({
+    schema: 'playgta6-recomp-program',
+    schema_version: 1,
+    modules: [
+      { module: 'dep', role: 'dll' },
+      { module: 'main', role: 'exe' },
+    ],
+  });
+  const server = createEtagServer({
+    '/prog/program-manifest.json': { bytes: manifestBytes, etag: '"m-v1"' },
+    '/prog/dep/image/guest.pgim': { bytes: m1, etag: '"dep-v1"' },
+    '/prog/main/image/guest.pgim': { bytes: m2, etag: '"main-v1"' },
+  });
+  const store = createMemoryOpfsStore();
+
+  // Warm only `dep` on boot #1.
+  const pre1 = new PgimPreloader({ fetchImpl: server.fetchImpl, opfsCache: store, chunkSize: 4096 });
+  await pre1.preloadGuestImage('/prog/dep/image/guest.pgim');
+  await pre1.flushOpfsWrites();
+
+  // Multi-module boot: `dep` hits OPFS (0 GETs), `main` fetches from network and persists to OPFS.
+  const getsBefore = server.getCount('GET', '/prog/dep/image/guest.pgim');
+  const events = [];
+  const pre2 = new PgimPreloader({ fetchImpl: server.fetchImpl, opfsCache: store, chunkSize: 4096 });
+  const res = await pre2.preloadProgramModules('/prog/program-manifest.json', {
+    onProgress: (e) => events.push(e),
+  });
+  await pre2.flushOpfsWrites();
+
+  assert.equal(res.modulesByName.dep.opfsCacheHit, true);
+  assert.equal(res.modulesByName.main.opfsCacheHit, false);
+  assert.deepEqual(res.modulesByName.dep.bytes, m1);
+  assert.deepEqual(res.modulesByName.main.bytes, m2);
+  assert.equal(server.getCount('GET', '/prog/dep/image/guest.pgim'), getsBefore);
+
+  const stats = pre2.getStats();
+  assert.equal(stats.opfsHits, 1);
+  assert.equal(stats.opfsMisses, 1);
+  assert.equal(stats.opfsWrites, 1);
+  assert.equal(stats.opfsInvalidations, 0);
+  assert.equal(stats.bytesFromOpfs, m1.byteLength);
+  assert.equal(stats.bytesFromNetwork, m2.byteLength);
+
+  // Verify ratio on multi-module progress events is monotonic and reaches 1.
+  const withRatio = events.filter((e) => typeof e.ratio === 'number');
+  assert.ok(withRatio.length >= 3);
+  let lastRatio = -1;
+  for (const e of withRatio) {
+    assert.ok(e.ratio >= lastRatio && e.ratio >= 0 && e.ratio <= 1);
+    lastRatio = e.ratio;
+  }
+  assert.equal(events[events.length - 1].ratio, 1);
 });

@@ -61,6 +61,8 @@
   const DEFAULT_MAX_RETRIES = 3;
   const DEFAULT_BASE_RETRY_DELAY_MS = 50;
   const DEFAULT_MAX_RETRY_DELAY_MS = 30000;
+  const PGIM_OPFS_CACHE_VERSION = 1;
+  const DEFAULT_OPFS_CACHE_DIR = 'playgta6-pgim-cache';
 
   function defaultSleep(ms, signal) {
     if (signal && signal.aborted) {
@@ -154,6 +156,12 @@
       parallelMode: false,
       retryCount: 0,
       abortedCount: 0,
+      opfsHits: 0,
+      opfsMisses: 0,
+      opfsWrites: 0,
+      opfsInvalidations: 0,
+      bytesFromOpfs: 0,
+      bytesFromNetwork: 0,
     };
   }
 
@@ -173,6 +181,12 @@
       this.parallelMode = false;
       this.retryCount = 0;
       this.abortedCount = 0;
+      this.opfsHits = 0;
+      this.opfsMisses = 0;
+      this.opfsWrites = 0;
+      this.opfsInvalidations = 0;
+      this.bytesFromOpfs = 0;
+      this.bytesFromNetwork = 0;
       this._abortRecorded = false;
     }
 
@@ -206,6 +220,29 @@
 
     recordRetry() {
       this.retryCount += 1;
+    }
+
+    recordOpfsHit(bytes = 0) {
+      this.opfsHits += 1;
+      const n = sanitizeNonNegativeInt(bytes);
+      if (n > 0) this.bytesFromOpfs += n;
+    }
+
+    recordOpfsMiss() {
+      this.opfsMisses += 1;
+    }
+
+    recordOpfsWrite() {
+      this.opfsWrites += 1;
+    }
+
+    recordOpfsInvalidation() {
+      this.opfsInvalidations += 1;
+    }
+
+    recordNetworkBytes(deltaBytes) {
+      const delta = sanitizeNonNegativeInt(deltaBytes);
+      if (delta > 0) this.bytesFromNetwork += delta;
     }
 
     recordAbort() {
@@ -292,6 +329,12 @@
         parallelMode: Boolean(this.parallelMode),
         retryCount: sanitizeNonNegativeInt(this.retryCount),
         abortedCount: sanitizeNonNegativeInt(this.abortedCount),
+        opfsHits: sanitizeNonNegativeInt(this.opfsHits),
+        opfsMisses: sanitizeNonNegativeInt(this.opfsMisses),
+        opfsWrites: sanitizeNonNegativeInt(this.opfsWrites),
+        opfsInvalidations: sanitizeNonNegativeInt(this.opfsInvalidations),
+        bytesFromOpfs: sanitizeNonNegativeInt(this.bytesFromOpfs),
+        bytesFromNetwork: sanitizeNonNegativeInt(this.bytesFromNetwork),
       };
     }
   }
@@ -932,11 +975,292 @@
 
   function makeEmitter(onProgress, extra = null) {
     if (typeof onProgress !== 'function') return () => {};
-    return (phase, loadedBytes, totalBytes) => {
-      const pct = totalBytes ? Math.min(100, (loadedBytes / totalBytes) * 100) : 0;
-      const event = { phase, loadedBytes, totalBytes, pct };
-      onProgress(extra ? { ...event, ...extra } : event);
+    let maxLoaded = 0;
+    let maxRatio = 0;
+    return (phase, loadedBytes, totalBytes, eventExtra = null) => {
+      const safeLoaded = Math.max(maxLoaded, sanitizeNonNegativeInt(loadedBytes));
+      maxLoaded = safeLoaded;
+      const safeTotal =
+        totalBytes !== null && totalBytes !== undefined && Number.isFinite(totalBytes) && totalBytes >= 0
+          ? Math.floor(totalBytes)
+          : null;
+      const rawRatio = safeTotal && safeTotal > 0 ? Math.min(1, Math.max(0, safeLoaded / safeTotal)) : 0;
+      const ratio = safeTotal && safeTotal > 0 ? Math.max(maxRatio, rawRatio) : maxRatio;
+      if (safeTotal && safeTotal > 0) maxRatio = ratio;
+      const pct = Math.min(100, ratio * 100);
+      const event = { phase, loadedBytes: safeLoaded, totalBytes: safeTotal, ratio, pct };
+      if (extra && eventExtra) {
+        onProgress({ ...event, ...extra, ...eventExtra });
+      } else if (extra) {
+        onProgress({ ...event, ...extra });
+      } else if (eventExtra) {
+        onProgress({ ...event, ...eventExtra });
+      } else {
+        onProgress(event);
+      }
     };
+  }
+
+  function isQuotaExceededError(err) {
+    if (!err || typeof err !== 'object') return false;
+    return (
+      err.name === 'QuotaExceededError' ||
+      err.code === 22 ||
+      err.code === 1014 ||
+      /quota/i.test(String(err.message || ''))
+    );
+  }
+
+  function isNotFoundError(err) {
+    if (!err || typeof err !== 'object') return false;
+    return (
+      err.name === 'NotFoundError' ||
+      err.code === 'ENOENT' ||
+      err.code === 8 ||
+      /not\s*found/i.test(String(err.message || ''))
+    );
+  }
+
+  function normalizeEtag(rawEtag) {
+    if (typeof rawEtag !== 'string') return null;
+    const cleaned = rawEtag.replace(/[\x00-\x1f\x7f]/g, '').trim();
+    return cleaned.length > 0 ? cleaned : null;
+  }
+
+  function fnv1a64HexString(str) {
+    const bytes = new TextEncoder().encode(String(str));
+    return pgimFnv1a64(bytes).toString(16).padStart(16, '0');
+  }
+
+  /**
+   * Sanitize a PGIM URL or path into a canonical relative `urlPath` with origin, credentials,
+   * query strings, fragments, backslashes, and traversal segments stripped.
+   *
+   * @param {string} rawUrl
+   * @returns {string}
+   */
+  function sanitizePgimCacheUrlPath(rawUrl) {
+    if (typeof rawUrl !== 'string' || rawUrl.trim().length === 0) {
+      throw new TypeError('PGIM cache url must be a non-empty string');
+    }
+    let candidate = rawUrl.trim().replace(/[\x00-\x1f\x7f]/g, '');
+    if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(candidate)) {
+      try {
+        candidate = new URL(candidate).pathname;
+      } catch {
+        candidate = candidate.split(/[?#]/, 1)[0];
+      }
+    } else {
+      candidate = candidate.split(/[?#]/, 1)[0];
+    }
+    candidate = candidate.replace(/\\/g, '/');
+    const rawSegments = candidate.split('/');
+    const safeSegments = [];
+    for (let i = 0; i < rawSegments.length; i += 1) {
+      const seg = rawSegments[i];
+      if (!seg || seg === '.') continue;
+      if (seg === '..') {
+        if (safeSegments.length > 0) safeSegments.pop();
+        continue;
+      }
+      safeSegments.push(seg);
+    }
+    return safeSegments.length > 0 ? safeSegments.join('/') : 'guest.pgim';
+  }
+
+  function normalizeOpfsCacheVersion(version) {
+    if (version === undefined || version === null) return PGIM_OPFS_CACHE_VERSION;
+    if (typeof version === 'number') {
+      if (!Number.isSafeInteger(version) || version < 1) {
+        throw new RangeError(`opfsCacheVersion must be a positive integer or non-empty token, got: ${version}`);
+      }
+      return version;
+    }
+    if (typeof version === 'string') {
+      const trimmed = version.trim();
+      if (!/^[A-Za-z0-9._-]{1,32}$/.test(trimmed)) {
+        throw new RangeError(`opfsCacheVersion contains unsupported characters: ${version}`);
+      }
+      return trimmed;
+    }
+    throw new TypeError('opfsCacheVersion must be a positive integer or non-empty string');
+  }
+
+  /**
+   * Build a deterministic, OPFS-filename-safe versioned fingerprint and cache keys from
+   * `(urlPath, etag, byteLength)`.
+   *
+   * @param {string} url
+   * @param {string | null} [etag=null]
+   * @param {number | null} [byteLength=null]
+   * @param {number | string} [version=PGIM_OPFS_CACHE_VERSION]
+   */
+  function buildPgimOpfsFingerprint(url, etag = null, byteLength = null, version = PGIM_OPFS_CACHE_VERSION) {
+    const ver = normalizeOpfsCacheVersion(version);
+    const urlPath = sanitizePgimCacheUrlPath(url);
+    const normEtag = normalizeEtag(etag);
+    const validSize = Number.isSafeInteger(byteLength) && byteLength >= 0 ? byteLength : null;
+    const pathHash = fnv1a64HexString(urlPath);
+    const etagHash = normEtag !== null ? fnv1a64HexString(normEtag) : 'noetag';
+    const sizeToken = validSize !== null ? String(validSize) : 'nosize';
+    const leafRaw = urlPath.includes('/') ? urlPath.slice(urlPath.lastIndexOf('/') + 1) : urlPath;
+    const stemRaw = leafRaw.replace(/\.pgim$/i, '');
+    const safeStem = (stemRaw.replace(/[^A-Za-z0-9_-]/g, '_').replace(/^_+|_+$/g, '') || 'pgim').slice(0, 28);
+    const versionTag = `v${ver}`;
+    const fingerprint = `${versionTag}:${pathHash}:${sizeToken}:${etagHash}`;
+    const dataKey = `pgim-${versionTag}-${pathHash}-${safeStem}-${sizeToken}-${etagHash}.pgim`;
+    const metaKey = `pgim-${versionTag}-${pathHash}-${safeStem}.meta.json`;
+    return {
+      version: ver,
+      urlPath,
+      etag: normEtag,
+      byteLength: validSize,
+      pathHash,
+      etagHash,
+      fingerprint,
+      dataKey,
+      metaKey,
+    };
+  }
+
+  function buildPgimOpfsCacheKey(url, etag = null, byteLength = null, version = PGIM_OPFS_CACHE_VERSION) {
+    return buildPgimOpfsFingerprint(url, etag, byteLength, version).dataKey;
+  }
+
+  function extractCachedBytes(raw) {
+    if (raw === null || raw === undefined) return null;
+    if (raw instanceof Uint8Array) return raw;
+    if (ArrayBuffer.isView(raw)) return new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
+    if (raw instanceof ArrayBuffer || isSharedArrayBuffer(raw)) return new Uint8Array(raw);
+    if (typeof raw === 'object') {
+      if (raw.hit === false) return null;
+      if (raw.bytes !== undefined && raw.bytes !== null) return extractCachedBytes(raw.bytes);
+      if (raw.data !== undefined && raw.data !== null) return extractCachedBytes(raw.data);
+      if (raw.buffer !== undefined && raw.buffer !== null) return extractCachedBytes(raw.buffer);
+    }
+    return null;
+  }
+
+  function isFileSystemDirectoryHandle(value) {
+    return Boolean(
+      value &&
+        typeof value === 'object' &&
+        typeof value.getFileHandle === 'function' &&
+        typeof value.getDirectoryHandle === 'function'
+    );
+  }
+
+  function createNativeOpfsStore({ dirHandle = null, dirName = DEFAULT_OPFS_CACHE_DIR, storageObj = undefined } = {}) {
+    const resolveDir = async (create) => {
+      if (dirHandle) return dirHandle;
+      const storage =
+        storageObj !== undefined
+          ? storageObj
+          : typeof navigator !== 'undefined' && navigator && navigator.storage
+            ? navigator.storage
+            : null;
+      if (!storage || typeof storage.getDirectory !== 'function') return null;
+      let rootDir;
+      try {
+        rootDir = await storage.getDirectory();
+      } catch {
+        return null;
+      }
+      if (!rootDir || typeof rootDir.getDirectoryHandle !== 'function') return null;
+      try {
+        return await rootDir.getDirectoryHandle(dirName, { create });
+      } catch (err) {
+        if (!create && isNotFoundError(err)) return null;
+        throw err;
+      }
+    };
+
+    return {
+      async read(key) {
+        const dir = await resolveDir(false);
+        if (!dir) return null;
+        let handle;
+        try {
+          handle = await dir.getFileHandle(key, { create: false });
+        } catch (err) {
+          if (isNotFoundError(err)) return null;
+          throw err;
+        }
+        if (!handle || typeof handle.getFile !== 'function') return null;
+        const file = await handle.getFile();
+        if (!file || typeof file.arrayBuffer !== 'function') return null;
+        return new Uint8Array(await file.arrayBuffer());
+      },
+      async write(key, bytes) {
+        const dir = await resolveDir(true);
+        if (!dir) return false;
+        const handle = await dir.getFileHandle(key, { create: true });
+        if (!handle || typeof handle.createWritable !== 'function') return false;
+        const writable = await handle.createWritable();
+        try {
+          const payload = isSharedArrayBuffer(bytes.buffer) ? bytes.slice() : bytes;
+          await writable.write(payload);
+          await writable.close();
+          return true;
+        } catch (err) {
+          if (typeof writable.abort === 'function') {
+            try {
+              await writable.abort();
+            } catch {
+              // Ignore abort cleanup error.
+            }
+          }
+          throw err;
+        }
+      },
+      async delete(key) {
+        const dir = await resolveDir(false);
+        if (!dir || typeof dir.removeEntry !== 'function') return false;
+        try {
+          await dir.removeEntry(key);
+          return true;
+        } catch (err) {
+          if (isNotFoundError(err)) return false;
+          throw err;
+        }
+      },
+    };
+  }
+
+  function normalizeOpfsCacheStore(opfsCache, { dirName = DEFAULT_OPFS_CACHE_DIR, storageObj = undefined } = {}) {
+    if (opfsCache === null || opfsCache === undefined || opfsCache === false) {
+      return null;
+    }
+    if (opfsCache === true) {
+      return createNativeOpfsStore({ dirName, storageObj });
+    }
+    if (isFileSystemDirectoryHandle(opfsCache)) {
+      return createNativeOpfsStore({ dirHandle: opfsCache, dirName });
+    }
+    if (typeof opfsCache === 'object') {
+      const hasReadWrite = typeof opfsCache.read === 'function' && typeof opfsCache.write === 'function';
+      const hasGetPut = typeof opfsCache.get === 'function' && typeof opfsCache.put === 'function';
+      if (hasReadWrite || hasGetPut) {
+        const deleteFn =
+          typeof opfsCache.delete === 'function'
+            ? (key) => opfsCache.delete(key)
+            : typeof opfsCache.remove === 'function'
+              ? (key) => opfsCache.remove(key)
+              : null;
+        return {
+          read: hasReadWrite
+            ? (key, meta) => opfsCache.read(key, meta)
+            : (key, meta) => opfsCache.get(key, meta),
+          write: hasReadWrite
+            ? (key, bytes, meta) => opfsCache.write(key, bytes, meta)
+            : (key, bytes, meta) => opfsCache.put(key, bytes, meta),
+          delete: deleteFn,
+        };
+      }
+    }
+    throw new TypeError(
+      'opfsCache must be null, boolean, a FileSystemDirectoryHandle, or an object exposing { read, write, delete } (or { get, put, delete })'
+    );
   }
 
   function httpError(url, status, what = 'PGIM image') {
@@ -1662,6 +1986,17 @@
    * @param {{
    *   fetchImpl?: typeof fetch,
    *   rangeCache?: { read(path: string, offset: number, length: number): Promise<Uint8Array> } | null,
+   *   opfsCache?: boolean | FileSystemDirectoryHandle | {
+   *     read?: (key: string, meta?: object) => Promise<any>,
+   *     write?: (key: string, bytes: Uint8Array, meta?: object) => Promise<any>,
+   *     delete?: (key: string) => Promise<any>,
+   *     get?: (key: string, meta?: object) => Promise<any>,
+   *     put?: (key: string, bytes: Uint8Array, meta?: object) => Promise<any>,
+   *   } | null,
+   *   opfsCacheVersion?: number | string,
+   *   opfsCacheDirName?: string,
+   *   opfsValidateWithHead?: boolean,
+   *   opfsStorageObj?: { getDirectory?: () => Promise<any> } | null,
    *   chunkSize?: number,
    *   chunkBytes?: number,
    *   concurrency?: number,
@@ -1680,6 +2015,11 @@
   constructor({
     fetchImpl,
     rangeCache = null,
+    opfsCache = null,
+    opfsCacheVersion = PGIM_OPFS_CACHE_VERSION,
+    opfsCacheDirName = DEFAULT_OPFS_CACHE_DIR,
+    opfsValidateWithHead = true,
+    opfsStorageObj = undefined,
     chunkSize,
     chunkBytes,
     concurrency = DEFAULT_CONCURRENCY,
@@ -1705,6 +2045,15 @@
     if (rangeCache !== null && (typeof rangeCache !== 'object' || typeof rangeCache.read !== 'function')) {
       throw new TypeError('rangeCache must expose read(path, offset, length)');
     }
+    const normalizedOpfsVersion = normalizeOpfsCacheVersion(opfsCacheVersion);
+    const normalizedOpfsDir =
+      typeof opfsCacheDirName === 'string' && opfsCacheDirName.trim().length > 0
+        ? opfsCacheDirName.trim()
+        : DEFAULT_OPFS_CACHE_DIR;
+    const normalizedOpfsStore = normalizeOpfsCacheStore(opfsCache, {
+      dirName: normalizedOpfsDir,
+      storageObj: opfsStorageObj,
+    });
     const effectiveChunkSize =
       chunkSize !== undefined
         ? chunkSize
@@ -1752,6 +2101,12 @@
     }
     this.fetchImpl = impl;
     this.rangeCache = rangeCache;
+    this.opfsCache = opfsCache;
+    this._opfsStore = normalizedOpfsStore;
+    this.opfsCacheVersion = normalizedOpfsVersion;
+    this.opfsCacheDirName = normalizedOpfsDir;
+    this.opfsValidateWithHead = Boolean(opfsValidateWithHead);
+    this._pendingOpfsWrites = new Set();
     this.chunkSize = effectiveChunkSize;
     this.chunkBytes = effectiveChunkSize;
     this.concurrency = concurrency;
@@ -1765,6 +2120,17 @@
     this.useSharedArrayBuffer = Boolean(useSharedArrayBuffer);
     this.targetBuffer = targetBuffer;
     this._telemetryRun = null;
+  }
+
+  /**
+   * Wait for any background non-blocking OPFS write-through tasks to finish settling.
+   * Never rejects even if a background OPFS write hit `QuotaExceededError`.
+   */
+  async flushOpfsWrites() {
+    while (this._pendingOpfsWrites.size > 0) {
+      const batch = Array.from(this._pendingOpfsWrites);
+      await Promise.allSettled(batch);
+    }
   }
 
   _resolveTransferConfig({ chunkSize, chunkBytes, concurrency } = {}) {
@@ -1869,11 +2235,28 @@
    */
   async preloadGuestImage(
     url,
-    { onProgress, signal, verifyChecksums = false, chunkSize, chunkBytes, concurrency } = {}
+    {
+      onProgress,
+      signal,
+      verifyChecksums = false,
+      chunkSize,
+      chunkBytes,
+      concurrency,
+      opfsValidateWithHead,
+      validateWithHead,
+      expectedEtag = null,
+      expectedBytes = null,
+    } = {}
   ) {
     if (typeof url !== 'string' || url.length === 0) throw new TypeError('PGIM url must be a non-empty string');
     const transfer = this._resolveTransferConfig({ chunkSize, chunkBytes, concurrency });
     const run = this._startTelemetryRun();
+    const effectiveValidateWithHead =
+      opfsValidateWithHead !== undefined
+        ? Boolean(opfsValidateWithHead)
+        : validateWithHead !== undefined
+          ? Boolean(validateWithHead)
+          : this.opfsValidateWithHead;
     try {
       const result = await this._preloadGuestImageCore(url, {
         onProgress,
@@ -1886,6 +2269,9 @@
         emitComplete: true,
         telemetryRun: run,
         ownsTotalBytes: true,
+        opfsValidateWithHead: effectiveValidateWithHead,
+        expectedEtag,
+        expectedBytes,
       });
       run.complete(result.totalBytes);
       const stats = run.snapshot();
@@ -1906,6 +2292,288 @@
     }
   }
 
+  async _deleteOpfsKeys(keys) {
+    const store = this._opfsStore;
+    if (!store || typeof store.delete !== 'function') return;
+    const unique = new Set();
+    for (let i = 0; i < keys.length; i += 1) {
+      const k = keys[i];
+      if (typeof k === 'string' && k.length > 0 && !unique.has(k)) {
+        unique.add(k);
+      }
+    }
+    for (const key of unique) {
+      try {
+        await store.delete(key);
+      } catch {
+        // Best-effort stale entry cleanup; never fail preload on delete error.
+      }
+    }
+  }
+
+  async _readOpfsMeta(metaKey, signal) {
+    const store = this._opfsStore;
+    if (!store) return null;
+    let raw;
+    try {
+      raw = await raceAbort(Promise.resolve().then(() => store.read(metaKey, { kind: 'pgim-meta' })), signal);
+    } catch (err) {
+      if ((signal && signal.aborted) || isAbortError(err)) throw err;
+      return null;
+    }
+    throwIfAborted(signal);
+    const bytes = extractCachedBytes(raw);
+    if (!bytes || bytes.byteLength === 0) return null;
+    try {
+      const parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+      if (!isPlainObject(parsed)) return null;
+      return parsed;
+    } catch {
+      return { _corrupt: true };
+    }
+  }
+
+  async _tryLoadFromOpfsCache(
+    ctx,
+    probe,
+    { verifyChecksums = false, expectedEtag = null, expectedBytes = null, countMiss = true } = {}
+  ) {
+    const store = this._opfsStore;
+    if (!store) return null;
+    throwIfAborted(ctx.signal);
+
+    const probeEtag = probe && probe.etag !== undefined ? normalizeEtag(probe.etag) : normalizeEtag(expectedEtag);
+    const probeSize =
+      probe && typeof probe.totalBytes === 'number' && Number.isSafeInteger(probe.totalBytes) && probe.totalBytes >= 0
+        ? probe.totalBytes
+        : Number.isSafeInteger(expectedBytes) && expectedBytes >= 0
+          ? expectedBytes
+          : null;
+    const headValidated = Boolean(probe && probe.headOk);
+
+    const baseFp = buildPgimOpfsFingerprint(ctx.url, probeEtag, probeSize, this.opfsCacheVersion);
+    const meta = await this._readOpfsMeta(baseFp.metaKey, ctx.signal);
+
+    let candidateDataKey = null;
+    let candidateEtag = probeEtag;
+    let candidateFingerprint = baseFp.fingerprint;
+    let invalidated = false;
+
+    if (meta !== null) {
+      const validMetaShape =
+        !meta._corrupt &&
+        meta.version === this.opfsCacheVersion &&
+        meta.urlPath === baseFp.urlPath &&
+        typeof meta.dataKey === 'string' &&
+        meta.dataKey.length > 0 &&
+        Number.isSafeInteger(meta.byteLength) &&
+        meta.byteLength >= PGIM_HEADER_BYTES;
+
+      if (!validMetaShape) {
+        invalidated = true;
+      } else {
+        const metaEtag = normalizeEtag(meta.etag);
+        let mismatch = false;
+        if (probeSize !== null && meta.byteLength !== probeSize) {
+          mismatch = true;
+        }
+        if (headValidated) {
+          // Strict ETag equality when HEAD succeeded (detects ETag rotation, addition, or removal).
+          if (metaEtag !== probeEtag) {
+            mismatch = true;
+          }
+        } else if (probeEtag !== null && metaEtag !== probeEtag) {
+          mismatch = true;
+        }
+        if (mismatch) {
+          invalidated = true;
+        } else {
+          candidateDataKey = meta.dataKey;
+          candidateEtag = metaEtag;
+          candidateFingerprint =
+            typeof meta.fingerprint === 'string' && meta.fingerprint.length > 0
+              ? meta.fingerprint
+              : buildPgimOpfsFingerprint(ctx.url, metaEtag, meta.byteLength, this.opfsCacheVersion).fingerprint;
+        }
+      }
+
+      if (invalidated) {
+        const keysToDelete = [baseFp.metaKey];
+        if (typeof meta.dataKey === 'string' && meta.dataKey.length > 0) {
+          keysToDelete.push(meta.dataKey);
+        }
+        await this._deleteOpfsKeys(keysToDelete);
+        if (ctx.run) {
+          ctx.run.recordOpfsInvalidation();
+          if (countMiss) ctx.run.recordOpfsMiss();
+        }
+        return null;
+      }
+    } else if (probeSize !== null) {
+      // Direct fingerprint lookup when caller pre-populated dataKey without metaKey.
+      candidateDataKey = baseFp.dataKey;
+    }
+
+    if (!candidateDataKey) {
+      if (countMiss && ctx.run) ctx.run.recordOpfsMiss();
+      return null;
+    }
+
+    let rawData;
+    try {
+      rawData = await raceAbort(
+        Promise.resolve().then(() =>
+          store.read(candidateDataKey, {
+            kind: 'pgim',
+            version: this.opfsCacheVersion,
+            urlPath: baseFp.urlPath,
+            etag: candidateEtag,
+            byteLength: probeSize,
+            fingerprint: candidateFingerprint,
+          })
+        ),
+        ctx.signal
+      );
+    } catch (err) {
+      if ((ctx.signal && ctx.signal.aborted) || isAbortError(err)) throw err;
+      if (countMiss && ctx.run) ctx.run.recordOpfsMiss();
+      return null;
+    }
+    throwIfAborted(ctx.signal);
+
+    const cachedRawBytes = extractCachedBytes(rawData);
+    if (!cachedRawBytes || cachedRawBytes.byteLength < PGIM_HEADER_BYTES) {
+      if (meta !== null) {
+        await this._deleteOpfsKeys([candidateDataKey, baseFp.metaKey]);
+        if (ctx.run) ctx.run.recordOpfsInvalidation();
+      }
+      if (countMiss && ctx.run) ctx.run.recordOpfsMiss();
+      return null;
+    }
+
+    if (probeSize !== null && cachedRawBytes.byteLength !== probeSize) {
+      await this._deleteOpfsKeys([candidateDataKey, baseFp.metaKey]);
+      if (ctx.run) {
+        ctx.run.recordOpfsInvalidation();
+        if (countMiss) ctx.run.recordOpfsMiss();
+      }
+      return null;
+    }
+
+    let targetBytes;
+    let shared = false;
+    if (this.targetBuffer !== null || this.useSharedArrayBuffer) {
+      const dest = this._allocate(cachedRawBytes.byteLength);
+      dest.bytes.set(cachedRawBytes, 0);
+      targetBytes = dest.bytes;
+      shared = dest.shared;
+    } else {
+      const isTightArrayBuffer =
+        cachedRawBytes.buffer instanceof ArrayBuffer &&
+        cachedRawBytes.byteOffset === 0 &&
+        cachedRawBytes.byteLength === cachedRawBytes.buffer.byteLength;
+      targetBytes = isTightArrayBuffer ? cachedRawBytes : cachedRawBytes.slice();
+      shared = false;
+    }
+
+    let layout;
+    try {
+      layout = parsePgimLayout(targetBytes, { verifyChecksums });
+    } catch {
+      await this._deleteOpfsKeys([candidateDataKey, baseFp.metaKey]);
+      if (ctx.run) {
+        ctx.run.recordOpfsInvalidation();
+        if (countMiss) ctx.run.recordOpfsMiss();
+      }
+      return null;
+    }
+
+    const total = targetBytes.byteLength;
+    if (ctx.run) {
+      if (ctx.ownsTotalBytes) ctx.run.setTotalBytes(total);
+      ctx.run.recordOpfsHit(total);
+      ctx.run.recordBytes(total);
+    }
+    ctx.emit('cache-hit', total, total, { opfsCacheHit: true });
+    return {
+      bytes: targetBytes,
+      shared,
+      layout,
+      transport: 'opfs-cache',
+      chunksFetched: 0,
+      parallelMode: false,
+      opfsCacheHit: true,
+      etag: candidateEtag,
+      cacheKey: candidateDataKey,
+      cacheFingerprint: candidateFingerprint,
+    };
+  }
+
+  _scheduleOpfsWrite(run, { url, etag, bytes, totalBytes }) {
+    const store = this._opfsStore;
+    if (!store || !bytes || !(totalBytes > 0)) return;
+    const fp = buildPgimOpfsFingerprint(url, etag, totalBytes, this.opfsCacheVersion);
+    const metaPayload = new TextEncoder().encode(
+      JSON.stringify({
+        version: this.opfsCacheVersion,
+        urlPath: fp.urlPath,
+        etag: fp.etag,
+        byteLength: totalBytes,
+        fingerprint: fp.fingerprint,
+        dataKey: fp.dataKey,
+      })
+    );
+    // Avoid SharedArrayBuffer views in FileSystemWritableFileStream.write().
+    const writeBytes = isSharedArrayBuffer(bytes.buffer) ? bytes.slice() : bytes;
+    const dataMeta = {
+      kind: 'pgim',
+      version: this.opfsCacheVersion,
+      urlPath: fp.urlPath,
+      etag: fp.etag,
+      byteLength: totalBytes,
+      fingerprint: fp.fingerprint,
+    };
+    const metaInfo = {
+      kind: 'pgim-meta',
+      version: this.opfsCacheVersion,
+      urlPath: fp.urlPath,
+      etag: fp.etag,
+      byteLength: totalBytes,
+      fingerprint: fp.fingerprint,
+    };
+
+    const runWrite = async () => {
+      const writeRes = await store.write(fp.dataKey, writeBytes, dataMeta);
+      const stored =
+        writeRes !== false &&
+        !(writeRes && typeof writeRes === 'object' && writeRes.stored === false);
+      if (!stored) return;
+      try {
+        await store.write(fp.metaKey, metaPayload, metaInfo);
+      } catch (metaErr) {
+        if (typeof store.delete === 'function') {
+          try {
+            await store.delete(fp.dataKey);
+          } catch {
+            // Ignore cleanup failure.
+          }
+        }
+        throw metaErr;
+      }
+      if (run) run.recordOpfsWrite();
+    };
+
+    const task = runWrite()
+      .catch((err) => {
+        // Non-blocking persistence: swallow QuotaExceededError and transient storage errors.
+        void isQuotaExceededError(err);
+      })
+      .finally(() => {
+        this._pendingOpfsWrites.delete(task);
+      });
+    this._pendingOpfsWrites.add(task);
+  }
+
   async _preloadGuestImageCore(
     url,
     {
@@ -1919,6 +2587,9 @@
       emitComplete = true,
       telemetryRun = null,
       ownsTotalBytes = true,
+      opfsValidateWithHead = this.opfsValidateWithHead,
+      expectedEtag = null,
+      expectedBytes = null,
     } = {}
   ) {
     if (typeof url !== 'string' || url.length === 0) throw new TypeError('PGIM url must be a non-empty string');
@@ -1938,26 +2609,69 @@
     };
 
     let probe = precomputedProbe;
-    if (probe === null) {
-      if (emitProbe) emit('probe', 0, null);
-      probe = await this._probe(ctx);
+    let loaded = null;
+
+    // Optional cached-metadata fast path when HEAD validation is explicitly disabled.
+    if (this._opfsStore && probe === null && !opfsValidateWithHead) {
+      loaded = await this._tryLoadFromOpfsCache(ctx, null, {
+        verifyChecksums,
+        expectedEtag,
+        expectedBytes,
+        countMiss: false,
+      });
     }
-    let loaded;
-    if (this.rangeCache) {
-      loaded = await this._loadViaRangeCache(ctx, probe);
-    } else if (probe.acceptRanges === false) {
-      const response = await this._request(ctx, { method: 'GET' });
-      if (!response.ok) throw httpError(url, response.status);
-      loaded = await this._consumeFullBody(ctx, response, probe.totalBytes);
-    } else {
-      loaded = await this._loadRanged(ctx, probe);
+
+    if (loaded === null) {
+      if (probe === null) {
+        if (emitProbe) emit('probe', 0, null);
+        probe = await this._probe(ctx);
+      }
+      if (this._opfsStore) {
+        loaded = await this._tryLoadFromOpfsCache(ctx, probe, {
+          verifyChecksums,
+          expectedEtag,
+          expectedBytes,
+          countMiss: true,
+        });
+      }
+    }
+
+    if (loaded === null) {
+      if (this.rangeCache) {
+        loaded = await this._loadViaRangeCache(ctx, probe);
+      } else if (probe.acceptRanges === false) {
+        const response = await this._request(ctx, { method: 'GET' });
+        if (!response.ok) throw httpError(url, response.status);
+        loaded = await this._consumeFullBody(ctx, response, probe.totalBytes);
+      } else {
+        loaded = await this._loadRanged(ctx, probe);
+      }
     }
     throwIfAborted(signal);
 
-    const layout = parsePgimLayout(loaded.bytes, { verifyChecksums });
+    const layout = loaded.layout || parsePgimLayout(loaded.bytes, { verifyChecksums });
     const totalBytes = loaded.bytes.byteLength;
+    const effectiveEtag =
+      loaded.etag !== undefined && loaded.etag !== null
+        ? loaded.etag
+        : probe && probe.etag !== undefined
+          ? probe.etag
+          : null;
+    const opfsCacheHit = Boolean(loaded.opfsCacheHit);
+
+    if (!opfsCacheHit && this._opfsStore && !(signal && signal.aborted)) {
+      this._scheduleOpfsWrite(ctx.run, {
+        url,
+        etag: effectiveEtag,
+        bytes: loaded.bytes,
+        totalBytes,
+      });
+    }
+
     const durationMs = this._elapsedSince(started);
-    if (emitComplete) emit('complete', totalBytes, totalBytes);
+    if (emitComplete) {
+      emit('complete', totalBytes, totalBytes, opfsCacheHit ? { opfsCacheHit: true } : null);
+    }
     return {
       bytes: loaded.bytes,
       buffer: loaded.bytes.buffer,
@@ -1965,6 +2679,10 @@
       layout,
       shared: loaded.shared,
       transport: loaded.transport,
+      opfsCacheHit,
+      etag: effectiveEtag,
+      cacheKey: loaded.cacheKey || null,
+      cacheFingerprint: loaded.cacheFingerprint || null,
       requests: ctx.requests,
       chunksFetched: loaded.chunksFetched,
       parallelMode: loaded.parallelMode,
@@ -2273,25 +2991,30 @@
         }
       }
       const aggTotal = allTotalsKnown ? totalBytes : null;
-      const pct = aggTotal ? Math.min(100, (loadedBytes / aggTotal) * 100) : 0;
-      return { loadedBytes, totalBytes: aggTotal, pct };
+      const ratio = aggTotal ? Math.min(1, Math.max(0, loadedBytes / aggTotal)) : 0;
+      const pct = Math.min(100, ratio * 100);
+      return { loadedBytes, totalBytes: aggTotal, ratio, pct };
     };
 
     let maxEmittedLoaded = 0;
+    let maxEmittedRatio = 0;
     let maxEmittedPct = 0;
-    const emitAggregate = (phase, moduleIndex, descriptor) => {
+    const emitAggregate = (phase, moduleIndex, descriptor, extra = null) => {
       const agg = computeAggregate();
       if (telemetryRun && agg.totalBytes !== null) {
         telemetryRun.setTotalBytes(agg.totalBytes);
       }
       const loadedBytes = Math.max(maxEmittedLoaded, agg.loadedBytes);
+      const ratio = agg.totalBytes !== null ? Math.max(maxEmittedRatio, agg.ratio) : maxEmittedRatio;
       const pct = agg.totalBytes !== null ? Math.max(maxEmittedPct, agg.pct) : maxEmittedPct;
       maxEmittedLoaded = loadedBytes;
+      maxEmittedRatio = ratio;
       maxEmittedPct = pct;
-      emitEvent({
+      const payload = {
         phase,
         loadedBytes,
         totalBytes: agg.totalBytes,
+        ratio,
         pct,
         moduleIndex,
         moduleCount,
@@ -2299,7 +3022,8 @@
         moduleUrl: descriptor.url,
         moduleLoadedBytes: moduleLoaded[moduleIndex],
         moduleTotalBytes: moduleTotals[moduleIndex],
-      });
+      };
+      emitEvent(extra ? { ...payload, ...extra } : payload);
     };
 
     emitAggregate('probe', 0, descriptors[0]);
@@ -2327,7 +3051,7 @@
           if (typeof evt.totalBytes === 'number' && evt.totalBytes > 0) {
             moduleTotals[i] = evt.totalBytes;
           }
-          emitAggregate(evt.phase, i, descriptor);
+          emitAggregate(evt.phase, i, descriptor, evt.opfsCacheHit ? { opfsCacheHit: true } : null);
         },
       });
       totalRequests += modResult.requests;
@@ -2349,6 +3073,8 @@
         buffer: modResult.buffer,
         shared: modResult.shared,
         transport: modResult.transport,
+        opfsCacheHit: modResult.opfsCacheHit,
+        etag: modResult.etag,
         requests: modResult.requests,
         chunksFetched: modResult.chunksFetched,
         parallelMode: modResult.parallelMode,
@@ -2365,17 +3091,19 @@
         configurable: true,
         writable: true,
       });
-      emitAggregate('module-complete', i, descriptor);
+      emitAggregate('module-complete', i, descriptor, modResult.opfsCacheHit ? { opfsCacheHit: true } : null);
     }
 
     const totalBytes = loadedModules.reduce((acc, m) => acc + m.totalBytes, 0);
     const durationMs = this._elapsedSince(started);
     const lastIdx = moduleCount - 1;
     const lastDescriptor = descriptors[lastIdx];
+    const allOpfsHits = loadedModules.length > 0 && loadedModules.every((m) => m.opfsCacheHit);
     emitEvent({
       phase: 'complete',
       loadedBytes: totalBytes,
       totalBytes,
+      ratio: 1,
       pct: 100,
       moduleIndex: lastIdx,
       moduleCount,
@@ -2383,6 +3111,7 @@
       moduleUrl: lastDescriptor.url,
       moduleLoadedBytes: loadedModules[lastIdx].totalBytes,
       moduleTotalBytes: loadedModules[lastIdx].totalBytes,
+      ...(allOpfsHits ? { opfsCacheHit: true } : {}),
     });
 
     const mainModule =
@@ -2428,6 +3157,10 @@
       bytes: result.bytes,
       shared: result.shared,
       transport: result.transport,
+      opfsCacheHit: result.opfsCacheHit,
+      etag: result.etag,
+      cacheKey: result.cacheKey,
+      cacheFingerprint: result.cacheFingerprint,
       requests: result.requests,
       chunksFetched: result.chunksFetched,
       parallelMode: result.parallelMode,
@@ -2666,6 +3399,7 @@
 
       if (hasProgramManifest) {
         const primary = pgimResult.mainModule;
+        const allOpfsHits = pgimResult.modules.length > 0 && pgimResult.modules.every((m) => m.opfsCacheHit);
         if (typeof onProgress === 'function') {
           onProgress({
             phase: 'complete',
@@ -2676,6 +3410,7 @@
             moduleIndex: pgimResult.moduleCount - 1,
             moduleCount: pgimResult.moduleCount,
             currentModule: pgimResult.modules[pgimResult.moduleCount - 1].name,
+            ...(allOpfsHits ? { opfsCacheHit: true } : {}),
           });
         }
         return {
@@ -2686,6 +3421,7 @@
           buffer: primary.buffer,
           header: primary.header,
           shared: primary.shared,
+          opfsCacheHit: allOpfsHits,
           program: pgimResult,
           modules: pgimResult.modules,
           modulesByName: pgimResult.modulesByName,
@@ -2709,13 +3445,17 @@
 
       const image = pgimResult;
       if (typeof onProgress === 'function') {
-        onProgress({
+        const bundleCompleteEvent = {
           phase: 'complete',
           asset: 'bundle',
           loadedBytes: image.bytesLoaded,
           totalBytes: image.bytesLoaded,
           pct: 100,
-        });
+        };
+        if (image.opfsCacheHit) {
+          bundleCompleteEvent.opfsCacheHit = true;
+        }
+        onProgress(bundleCompleteEvent);
       }
       return {
         pgim: image,
@@ -2725,6 +3465,8 @@
         buffer: image.buffer,
         header: image.header,
         shared: image.shared,
+        opfsCacheHit: Boolean(image.opfsCacheHit),
+        etag: image.etag ?? null,
         shaderPackBytes,
         reflectionManifest,
         timingMs,
@@ -2800,10 +3542,10 @@
         response = await this._request(ctx, { method: 'HEAD' });
       } catch (err) {
         if (ctx.signal && ctx.signal.aborted) throw err;
-        return { totalBytes: null, acceptRanges: null }; // HEAD unsupported: probe with a Range GET.
+        return { totalBytes: null, acceptRanges: null, etag: null, headOk: false }; // HEAD unsupported: probe with a Range GET.
       }
       if (response.status === 404 || response.status === 410) throw httpError(ctx.url, response.status);
-      if (!response.ok) return { totalBytes: null, acceptRanges: null };
+      if (!response.ok) return { totalBytes: null, acceptRanges: null, etag: null, headOk: false };
       const totalBytes = contentLength(response);
       if (totalBytes !== null && totalBytes < PGIM_HEADER_BYTES) {
         throw new PgimPreloadError(
@@ -2818,7 +3560,8 @@
         if (/\bbytes\b/i.test(ranges)) acceptRanges = true;
         else if (ranges.trim().toLowerCase() === 'none') acceptRanges = false;
       }
-      return { totalBytes, acceptRanges };
+      const etag = normalizeEtag(headerValue(response, 'etag'));
+      return { totalBytes, acceptRanges, etag, headOk: true };
     }
 
     async _probeAsset(ctx, what) {
@@ -2987,7 +3730,7 @@
 
           const bytes = new Uint8Array(await raceAbort(res.arrayBuffer(), signal));
           throwIfAborted(signal);
-          return { bytes, range: cr };
+          return { bytes, range: cr, etag: normalizeEtag(headerValue(res, 'etag')) };
         } catch (err) {
           if (signal && signal.aborted) throw abortReason(signal);
           if (isAbortError(err)) throw err;
@@ -3024,7 +3767,7 @@
         // Server ignored the Range header: consume the full body as a single GET.
         return this._consumeFullBody(ctx, firstRes.fullResponse, probe.totalBytes);
       }
-      const { bytes: first, range } = firstRes;
+      const { bytes: first, range, etag: chunkEtag } = firstRes;
       if (range && (range.start !== 0 || range.end - range.start + 1 !== first.byteLength)) {
         throw new PgimPreloadError('RANGE_MISMATCH', `PGIM first chunk Content-Range does not match the ${first.byteLength} received bytes`);
       }
@@ -3045,6 +3788,7 @@
       if (ctx.run) {
         if (ctx.ownsTotalBytes) ctx.run.setTotalBytes(total);
         ctx.run.recordBytes(first.byteLength);
+        ctx.run.recordNetworkBytes(first.byteLength);
         ctx.run.recordChunk(1);
       }
       ctx.emit('header', first.byteLength, total);
@@ -3060,12 +3804,19 @@
           });
           return chunkRes.bytesWritten;
         },
-        { directWrite: true }
+        { directWrite: true, countNetworkBytes: true }
       );
       const chunksFetched = 1 + parallel.chunksCompleted;
       const parallelMode = concurrency > 1 && chunksFetched > 1;
       if (parallelMode && ctx.run) ctx.run.setParallelMode(true);
-      return { ...dest, transport: 'range', chunksFetched, parallelMode };
+      return {
+        ...dest,
+        transport: 'range',
+        chunksFetched,
+        parallelMode,
+        opfsCacheHit: false,
+        etag: probe.etag ?? chunkEtag ?? null,
+      };
     }
 
     async _loadViaRangeCache(ctx, probe) {
@@ -3102,7 +3853,7 @@
       return { ...dest, transport: 'range-cache', chunksFetched, parallelMode };
     }
 
-    async _parallelChunks(ctx, dest, startOffset, fetchChunk, { directWrite = false } = {}) {
+    async _parallelChunks(ctx, dest, startOffset, fetchChunk, { directWrite = false, countNetworkBytes = false } = {}) {
       const chunkSize = ctx.chunkSize ?? this.chunkSize;
       const concurrency = ctx.concurrency ?? this.concurrency;
       const total = dest.byteLength;
@@ -3148,6 +3899,7 @@
             chunksCompleted += 1;
             if (ctx.run) {
               ctx.run.recordBytes(written);
+              if (countNetworkBytes) ctx.run.recordNetworkBytes(written);
               ctx.run.recordChunk(1);
             }
             ctx.emit('download', loaded, total);
@@ -3171,6 +3923,7 @@
     }
 
     async _consumeFullBody(ctx, response, knownTotal) {
+      const responseEtag = normalizeEtag(headerValue(response, 'etag'));
       const declared = contentLength(response);
       if (declared !== null && knownTotal !== null && declared !== knownTotal) {
         throw new PgimPreloadError('SIZE_MISMATCH', `PGIM size changed between HEAD (${knownTotal}) and GET (${declared})`);
@@ -3192,10 +3945,18 @@
         if (ctx.run) {
           if (ctx.ownsTotalBytes) ctx.run.setTotalBytes(header.fileSize);
           ctx.run.recordBytes(whole.byteLength);
+          ctx.run.recordNetworkBytes(whole.byteLength);
           ctx.run.recordChunk(1);
         }
         ctx.emit('download', whole.byteLength, header.fileSize);
-        return { ...dest, transport: 'full', chunksFetched: 1, parallelMode: false };
+        return {
+          ...dest,
+          transport: 'full',
+          chunksFetched: 1,
+          parallelMode: false,
+          opfsCacheHit: false,
+          etag: responseEtag,
+        };
       }
 
       const reader = body.getReader();
@@ -3236,11 +3997,15 @@
             if (ctx.run) {
               if (ctx.ownsTotalBytes) ctx.run.setTotalBytes(total);
               ctx.run.recordBytes(loaded);
+              ctx.run.recordNetworkBytes(loaded);
             }
             ctx.emit('header', loaded, total);
           } else {
             write(chunk);
-            if (ctx.run) ctx.run.recordBytes(chunk.byteLength);
+            if (ctx.run) {
+              ctx.run.recordBytes(chunk.byteLength);
+              ctx.run.recordNetworkBytes(chunk.byteLength);
+            }
             ctx.emit('download', loaded, total);
           }
         }
@@ -3264,7 +4029,14 @@
         });
       }
       if (ctx.run) ctx.run.recordChunk(1);
-      return { ...dest, transport: 'full', chunksFetched: 1, parallelMode: false };
+      return {
+        ...dest,
+        transport: 'full',
+        chunksFetched: 1,
+        parallelMode: false,
+        opfsCacheHit: false,
+        etag: responseEtag,
+      };
     }
 
     async _fetchAsset(
@@ -3305,7 +4077,7 @@
               });
               return chunkRes.bytesWritten;
             },
-            { directWrite: true }
+            { directWrite: true, countNetworkBytes: true }
           );
           const parallelMode = parallel.chunksCompleted > 1;
           if (parallelMode && telemetryRun) telemetryRun.setParallelMode(true);
@@ -3344,7 +4116,10 @@
               parts.push(part);
             }
             loaded += part.byteLength;
-            if (telemetryRun) telemetryRun.recordBytes(part.byteLength);
+            if (telemetryRun) {
+              telemetryRun.recordBytes(part.byteLength);
+              telemetryRun.recordNetworkBytes(part.byteLength);
+            }
             emit('download', loaded, declared);
           }
         } catch (err) {
@@ -3378,6 +4153,7 @@
         if (telemetryRun) {
           if (ownsTotalBytes) telemetryRun.setTotalBytes(bytes.byteLength);
           telemetryRun.recordBytes(bytes.byteLength);
+          telemetryRun.recordNetworkBytes(bytes.byteLength);
           telemetryRun.recordChunk(1);
         }
       }
@@ -3404,6 +4180,11 @@
       preloader = null,
       fetchImpl,
       rangeCache = null,
+      opfsCache = null,
+      opfsCacheVersion,
+      opfsCacheDirName,
+      opfsValidateWithHead,
+      opfsStorageObj,
       chunkSize,
       chunkBytes,
       concurrency,
@@ -3424,6 +4205,11 @@
         : new PgimPreloader({
             fetchImpl,
             rangeCache,
+            opfsCache,
+            ...(opfsCacheVersion !== undefined ? { opfsCacheVersion } : {}),
+            ...(opfsCacheDirName !== undefined ? { opfsCacheDirName } : {}),
+            ...(opfsValidateWithHead !== undefined ? { opfsValidateWithHead } : {}),
+            ...(opfsStorageObj !== undefined ? { opfsStorageObj } : {}),
             ...(chunkSize !== undefined ? { chunkSize } : {}),
             ...(chunkBytes !== undefined ? { chunkBytes } : {}),
             ...(concurrency !== undefined ? { concurrency } : {}),
@@ -3452,6 +4238,8 @@
     PGIM_PROT,
     DEFAULT_CHUNK_BYTES,
     DEFAULT_CONCURRENCY,
+    PGIM_OPFS_CACHE_VERSION,
+    DEFAULT_OPFS_CACHE_DIR,
     PROGRAM_MANIFEST_SCHEMA,
     PROGRAM_MANIFEST_SCHEMA_VERSION,
     PgimPreloadError,
@@ -3459,6 +4247,9 @@
     parsePgimHeader,
     parsePgimLayout,
     resolveSafeManifestUrl,
+    sanitizePgimCacheUrlPath,
+    buildPgimOpfsFingerprint,
+    buildPgimOpfsCacheKey,
     parseProgramManifest,
     parseBootManifest,
     preloadProgramModules,
