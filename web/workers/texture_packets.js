@@ -11,8 +11,10 @@
 // - Safe `SharedArrayBuffer`-backed view copying before `queue.writeTexture` /
 //   `copyBufferToTexture`.
 // - Sanitized telemetry counters (`createTexture2Count`, `rowPitchRepackCount`, `sabCopyCount`,
+//   `uploadCount`, `uploadBytes`, `zeroCopyUploads`, `scratchRepackUploads`,
 //   `directZeroCopyUploads`, `repackedUploads`, `scratchBufferReuses`, `r8unormUploads`,
-//   `bytesUploaded`, `srgbSiblingViewFormatsAdded`).
+//   `bytesUploaded`, `srgbSiblingViewFormatsAdded`) exposed via `getStats()`, `getUploadStats()`,
+//   and the `uploadStats` getter.
 //
 // Install with installTexturePackets(processor) after the v2 handler (render_state_packets.js):
 // it chains in front of processor.extension and forwards every other opcode to it.
@@ -239,21 +241,29 @@
 
   /**
    * Safely converts `input` to a `Uint8Array` backed by a non-shared `ArrayBuffer`.
-   * If `input` is backed by a `SharedArrayBuffer`, allocates a standalone copy so
+   * If `input` is backed by a `SharedArrayBuffer`, copies into an optional reusable
+   * non-shared `scratchBuffer` (when large enough) or allocates a standalone copy so
    * WebGPU `queue.writeTexture` / `queue.writeBuffer` / `copyBufferToTexture` calls
    * never reject shared buffers or race with concurrent guest writes.
    *
    * @param {Uint8Array | ArrayBufferView | ArrayBuffer | SharedArrayBuffer} input
-   * @returns {{ data: Uint8Array, copiedFromSab: boolean }}
+   * @param {Uint8Array | null} [scratchBuffer=null]
+   * @returns {{ data: Uint8Array, copiedFromSab: boolean, reusedScratch: boolean }}
    */
-  function copyFromSharedIfNeeded(input) {
+  function copyFromSharedIfNeeded(input, scratchBuffer = null) {
     const src = toUint8Array(input, 'copyFromSharedIfNeeded');
     if (isSharedBuffer(src.buffer)) {
-      const copy = new Uint8Array(src.byteLength);
+      const canReuseScratch =
+        scratchBuffer instanceof Uint8Array &&
+        !isSharedBuffer(scratchBuffer.buffer) &&
+        scratchBuffer.byteLength >= src.byteLength;
+      const copy = canReuseScratch
+        ? scratchBuffer.subarray(0, src.byteLength)
+        : new Uint8Array(src.byteLength);
       copy.set(src, 0);
-      return { data: copy, copiedFromSab: true };
+      return { data: copy, copiedFromSab: true, reusedScratch: canReuseScratch };
     }
-    return { data: src, copiedFromSab: false };
+    return { data: src, copiedFromSab: false, reusedScratch: false };
   }
 
   /**
@@ -692,6 +702,10 @@
         sabCopyCount: 0,
         bc3dFallbacks: 0,
         bc3dFallbackUploadsSkipped: 0,
+        uploadCount: 0,
+        uploadBytes: 0,
+        zeroCopyUploads: 0,
+        scratchRepackUploads: 0,
         directZeroCopyUploads: 0,
         repackedUploads: 0,
         scratchBufferReuses: 0,
@@ -700,6 +714,12 @@
         bytesUploaded: 0,
         srgbSiblingViewFormatsAdded: 0,
       };
+    }
+
+    _recordUploadBytes(byteLength) {
+      const bytes = toNonNegativeInt(byteLength);
+      this.stats.bytesUploaded += bytes;
+      this.stats.uploadBytes += bytes;
     }
 
     /**
@@ -715,6 +735,10 @@
         sabCopyCount: toNonNegativeInt(this.stats.sabCopyCount),
         bc3dFallbacks: toNonNegativeInt(this.stats.bc3dFallbacks),
         bc3dFallbackUploadsSkipped: toNonNegativeInt(this.stats.bc3dFallbackUploadsSkipped),
+        uploadCount: toNonNegativeInt(this.stats.uploadCount),
+        uploadBytes: toNonNegativeInt(this.stats.uploadBytes),
+        zeroCopyUploads: toNonNegativeInt(this.stats.zeroCopyUploads),
+        scratchRepackUploads: toNonNegativeInt(this.stats.scratchRepackUploads),
         directZeroCopyUploads: toNonNegativeInt(this.stats.directZeroCopyUploads),
         repackedUploads: toNonNegativeInt(this.stats.repackedUploads),
         scratchBufferReuses: toNonNegativeInt(this.stats.scratchBufferReuses),
@@ -726,6 +750,30 @@
         bytesUploaded: toNonNegativeInt(this.stats.bytesUploaded),
         srgbSiblingViewFormatsAdded: toNonNegativeInt(this.stats.srgbSiblingViewFormatsAdded),
       };
+    }
+
+    /**
+     * Return a lightweight sanitized snapshot of WriteTexture / texture upload
+     * telemetry (`uploadCount`, `uploadBytes`, `zeroCopyUploads`,
+     * `scratchRepackUploads`, and scratch/SAB counters).
+     */
+    getUploadStats() {
+      return {
+        uploadCount: toNonNegativeInt(this.stats.uploadCount),
+        uploadBytes: toNonNegativeInt(this.stats.uploadBytes),
+        zeroCopyUploads: toNonNegativeInt(this.stats.zeroCopyUploads),
+        scratchRepackUploads: toNonNegativeInt(this.stats.scratchRepackUploads),
+        scratchBufferAllocations: toNonNegativeInt(this.stats.scratchBufferAllocations),
+        scratchBufferReuses: toNonNegativeInt(this.stats.scratchBufferReuses),
+        scratchBufferBytes: toNonNegativeInt(
+          this._scratchBuffer ? this._scratchBuffer.byteLength : 0
+        ),
+        sabCopyCount: toNonNegativeInt(this.stats.sabCopyCount),
+      };
+    }
+
+    get uploadStats() {
+      return this.getUploadStats();
     }
 
     /**
@@ -917,9 +965,11 @@
 
       p.device.queue.writeTexture(destination, prepared.data, dataLayout, size);
 
-      this.stats.bytesUploaded += prepared.data.byteLength;
+      this.stats.uploadCount += 1;
+      this._recordUploadBytes(prepared.data.byteLength);
       if (!prepared.copiedFromSab) {
         this.stats.directZeroCopyUploads += 1;
+        this.stats.zeroCopyUploads += 1;
       }
       if (this._isR8UnormTexture(destination && destination.texture, textureId)) {
         this.stats.r8unormUploads += 1;
@@ -1004,6 +1054,9 @@
         if (packed.repacked) {
           this.stats.rowPitchRepackCount += 1;
           this.stats.repackedUploads += 1;
+          if (packed.reusedScratch) {
+            this.stats.scratchRepackUploads += 1;
+          }
         }
         if (packed.copiedFromSab) {
           this.stats.sabCopyCount += 1;
@@ -1029,7 +1082,11 @@
             stageLayout.aspect = destination.aspect;
           }
           p.stagingPool.stageTextureUpload(encoder, destination.texture, packed.data, stageLayout);
-          this.stats.bytesUploaded += packed.data.byteLength;
+          this.stats.uploadCount += 1;
+          this._recordUploadBytes(packed.data.byteLength);
+          if (!packed.repacked && !packed.copiedFromSab) {
+            this.stats.zeroCopyUploads += 1;
+          }
           if (isR8) {
             this.stats.r8unormUploads += 1;
           }
@@ -1058,7 +1115,11 @@
             destination,
             normSize
           );
-          this.stats.bytesUploaded += packed.data.byteLength;
+          this.stats.uploadCount += 1;
+          this._recordUploadBytes(packed.data.byteLength);
+          if (!packed.copiedFromSab) {
+            this.stats.zeroCopyUploads += 1;
+          }
           if (isR8) {
             this.stats.r8unormUploads += 1;
           }
@@ -1106,7 +1167,11 @@
           destination,
           normSize
         );
-        this.stats.bytesUploaded += packed.data.byteLength;
+        this.stats.uploadCount += 1;
+        this._recordUploadBytes(packed.data.byteLength);
+        if (!packed.repacked && !packed.copiedFromSab) {
+          this.stats.zeroCopyUploads += 1;
+        }
         if (isR8) {
           this.stats.r8unormUploads += 1;
         }
@@ -1126,8 +1191,9 @@
       const isR8 = this._isR8UnormTexture(destination.texture);
       if (rawBytesPerRow === 0 || rawBytesPerRow % WEBGPU_BYTES_PER_ROW_ALIGNMENT === 0) {
         encoder.copyBufferToTexture(source, destination, normSize);
+        this.stats.uploadCount += 1;
         if (rawBytesPerRow > 0) {
-          this.stats.bytesUploaded += rawBytesPerRow * totalRows;
+          this._recordUploadBytes(rawBytesPerRow * totalRows);
         }
         if (isR8) {
           this.stats.r8unormUploads += 1;
@@ -1192,9 +1258,10 @@
           destination,
           normSize
         );
+        this.stats.uploadCount += 1;
         this.stats.rowPitchRepackCount += 1;
         this.stats.repackedUploads += 1;
-        this.stats.bytesUploaded += repackedTotalBytes;
+        this._recordUploadBytes(repackedTotalBytes);
         if (isR8) {
           this.stats.r8unormUploads += 1;
         }
@@ -1333,6 +1400,9 @@
             if (packed.repacked) {
               this.stats.rowPitchRepackCount += 1;
               this.stats.repackedUploads += 1;
+              if (packed.reusedScratch) {
+                this.stats.scratchRepackUploads += 1;
+              }
             }
             if (packed.copiedFromSab) {
               this.stats.sabCopyCount += 1;
@@ -1349,7 +1419,11 @@
             };
             p.stagingPool.stageTextureUpload(encoder, texture, packed.data, layout);
             p._hasPendingUploadCommands = true;
-            this.stats.bytesUploaded += packed.data.byteLength;
+            this.stats.uploadCount += 1;
+            this._recordUploadBytes(packed.data.byteLength);
+            if (!packed.repacked && !packed.copiedFromSab) {
+              this.stats.zeroCopyUploads += 1;
+            }
             if (this._isR8UnormTexture(texture, textureId)) {
               this.stats.r8unormUploads += 1;
             }
@@ -1369,6 +1443,8 @@
       }
       if (rowsPerImage > 0) {
         dataLayout.rowsPerImage = rowsPerImage;
+      } else if (depthOrArrayLayers > 1 && effectiveRowsPerImage > 0) {
+        dataLayout.rowsPerImage = effectiveRowsPerImage;
       }
 
       this.writeTexture(
