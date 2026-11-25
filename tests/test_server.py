@@ -1,9 +1,13 @@
+import contextlib
 import http.client
+import io
 import json
 import os
+import socket
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -415,6 +419,323 @@ class TestServeLocal(unittest.TestCase):
         status, headers, _ = self._request("GET", "/data/../../README.md")
         self.assertEqual(status, 404)
         self._assert_isolation_headers(headers)
+
+    def test_http11_keep_alive_reuses_single_socket_across_all_response_types(self) -> None:
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            def send(method: str, path: str, headers: dict[str, str] | None = None):
+                conn.request(method, path, headers=headers or {})
+                resp = conn.getresponse()
+                body = resp.read()
+                return resp, dict(resp.getheaders()), body
+
+            # 1. GET / -> 200 OK
+            resp1, hdr1, body1 = send("GET", "/")
+            self.assertEqual(resp1.version, 11)
+            self.assertEqual(resp1.status, 200)
+            self.assertFalse(resp1.will_close)
+            self.assertEqual(hdr1.get("Connection", "").lower(), "keep-alive")
+            self.assertEqual(hdr1.get("Content-Length"), str(len(body1)))
+            self._assert_isolation_headers(hdr1)
+            self.assertEqual(body1, b"<h1>ok</h1>")
+            self.assertIsNotNone(conn.sock)
+            first_sock = conn.sock
+            first_peer = first_sock.getsockname()
+
+            # 2. HEAD /data/sample.bin -> 200 OK with exact Content-Length, empty body
+            resp2, hdr2, body2 = send("HEAD", "/data/sample.bin")
+            self.assertIs(conn.sock, first_sock)
+            self.assertEqual(conn.sock.getsockname(), first_peer)
+            self.assertEqual(resp2.version, 11)
+            self.assertEqual(resp2.status, 200)
+            self.assertFalse(resp2.will_close)
+            self.assertEqual(hdr2.get("Content-Length"), "16")
+            self._assert_isolation_headers(hdr2)
+            self.assertEqual(body2, b"")
+            etag = hdr2["ETag"]
+
+            # 3. GET /data/sample.bin with Range -> 206 Partial Content
+            resp3, hdr3, body3 = send("GET", "/data/sample.bin", {"Range": "bytes=4-9"})
+            self.assertIs(conn.sock, first_sock)
+            self.assertEqual(resp3.version, 11)
+            self.assertEqual(resp3.status, 206)
+            self.assertFalse(resp3.will_close)
+            self.assertEqual(hdr3.get("Content-Range"), "bytes 4-9/16")
+            self.assertEqual(hdr3.get("Content-Length"), "6")
+            self._assert_isolation_headers(hdr3)
+            self.assertEqual(body3, b"456789")
+
+            # 4. GET /data/sample.bin with If-None-Match -> 304 Not Modified (must not hang)
+            resp4, hdr4, body4 = send("GET", "/data/sample.bin", {"If-None-Match": etag})
+            self.assertIs(conn.sock, first_sock)
+            self.assertEqual(resp4.version, 11)
+            self.assertEqual(resp4.status, 304)
+            self.assertFalse(resp4.will_close)
+            self._assert_isolation_headers(hdr4)
+            self.assertEqual(body4, b"")
+
+            # 5. GET /api/status -> 200 OK JSON with exact Content-Length
+            resp5, hdr5, body5 = send("GET", "/api/status")
+            self.assertIs(conn.sock, first_sock)
+            self.assertEqual(resp5.version, 11)
+            self.assertEqual(resp5.status, 200)
+            self.assertFalse(resp5.will_close)
+            self.assertEqual(hdr5.get("Content-Length"), str(len(body5)))
+            self._assert_isolation_headers(hdr5)
+            self.assertTrue(json.loads(body5.decode("utf-8"))["ok"])
+
+            # 6. HEAD /api/status -> 200 OK with Content-Length > 0 and empty body
+            resp6, hdr6, body6 = send("HEAD", "/api/status")
+            self.assertIs(conn.sock, first_sock)
+            self.assertEqual(resp6.version, 11)
+            self.assertEqual(resp6.status, 200)
+            self.assertFalse(resp6.will_close)
+            self.assertGreater(int(hdr6.get("Content-Length", "0")), 0)
+            self._assert_isolation_headers(hdr6)
+            self.assertEqual(body6, b"")
+
+            # 7. OPTIONS / -> 204 No Content with Allow header
+            resp7, hdr7, body7 = send("OPTIONS", "/")
+            self.assertIs(conn.sock, first_sock)
+            self.assertEqual(resp7.version, 11)
+            self.assertEqual(resp7.status, 204)
+            self.assertFalse(resp7.will_close)
+            self.assertIn("GET", hdr7.get("Allow", ""))
+            self.assertIn("HEAD", hdr7.get("Allow", ""))
+            self.assertIn("OPTIONS", hdr7.get("Allow", ""))
+            self._assert_isolation_headers(hdr7)
+            self.assertEqual(body7, b"")
+
+            # 8. GET /nonexistent -> 404 Not Found with Content-Length: 0
+            resp8, hdr8, body8 = send("GET", "/nonexistent-asset.bin")
+            self.assertIs(conn.sock, first_sock)
+            self.assertEqual(resp8.version, 11)
+            self.assertEqual(resp8.status, 404)
+            self.assertFalse(resp8.will_close)
+            self.assertEqual(hdr8.get("Content-Length"), "0")
+            self._assert_isolation_headers(hdr8)
+            self.assertEqual(body8, b"")
+
+            # 9. GET /data/sample.bin with invalid Range -> 416 with Content-Length: 0
+            resp9, hdr9, body9 = send("GET", "/data/sample.bin", {"Range": "bytes=100-200"})
+            self.assertIs(conn.sock, first_sock)
+            self.assertEqual(resp9.version, 11)
+            self.assertEqual(resp9.status, 416)
+            self.assertFalse(resp9.will_close)
+            self.assertEqual(hdr9.get("Content-Length"), "0")
+            self.assertEqual(hdr9.get("Content-Range"), "bytes */16")
+            self._assert_isolation_headers(hdr9)
+            self.assertEqual(body9, b"")
+
+            # 10. Final GET /demo.wasm proves socket stayed synchronized and reusable
+            resp10, hdr10, body10 = send("GET", "/demo.wasm")
+            self.assertIs(conn.sock, first_sock)
+            self.assertEqual(conn.sock.getsockname(), first_peer)
+            self.assertEqual(resp10.version, 11)
+            self.assertEqual(resp10.status, 200)
+            self.assertFalse(resp10.will_close)
+            self.assertEqual(hdr10.get("Content-Length"), "8")
+            self._assert_isolation_headers(hdr10)
+            self.assertEqual(body10, b"\x00asm\x01\x00\x00\x00")
+        finally:
+            conn.close()
+
+    def test_http11_connection_close_closes_socket_cleanly(self) -> None:
+        for conn_header in ("close", "keep-alive, close"):
+            with self.subTest(connection_header=conn_header):
+                conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+                try:
+                    conn.request("GET", "/", headers={"Connection": conn_header})
+                    resp = conn.getresponse()
+                    body = resp.read()
+                    headers = dict(resp.getheaders())
+                    self.assertEqual(resp.version, 11)
+                    self.assertEqual(resp.status, 200)
+                    self.assertEqual(headers.get("Connection", "").lower(), "close")
+                    self.assertEqual(headers.get("Content-Length"), str(len(body)))
+                    self.assertTrue(resp.will_close)
+                    self.assertIsNone(conn.sock)
+                    self.assertEqual(body, b"<h1>ok</h1>")
+                finally:
+                    conn.close()
+
+    def test_unsupported_method_returns_405_with_content_length_and_closes(self) -> None:
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            conn.request("POST", "/api/status", body=b'{"x":1}')
+            resp = conn.getresponse()
+            body = resp.read()
+            headers = dict(resp.getheaders())
+            self.assertEqual(resp.version, 11)
+            self.assertEqual(resp.status, 405)
+            self.assertEqual(headers.get("Content-Length"), "0")
+            self.assertEqual(headers.get("Connection", "").lower(), "close")
+            self.assertIn("GET", headers.get("Allow", ""))
+            self._assert_isolation_headers(headers)
+            self.assertTrue(resp.will_close)
+            self.assertEqual(body, b"")
+        finally:
+            conn.close()
+
+    def test_malformed_request_returns_400_with_http11_and_content_length(self) -> None:
+        with socket.create_connection(("127.0.0.1", self.port), timeout=5) as sock:
+            sock.sendall(b"BADREQUEST\r\n\r\n")
+            chunks: list[bytes] = []
+            while True:
+                data = sock.recv(4096)
+                if not data:
+                    break
+                chunks.append(data)
+        raw = b"".join(chunks)
+        header_block, _, body = raw.partition(b"\r\n\r\n")
+        header_text = header_block.decode("iso-8859-1")
+        self.assertTrue(header_text.startswith("HTTP/1.1 400 "))
+        self.assertIn("Connection: close", header_text)
+        self.assertIn(f"Content-Length: {len(body)}", header_text)
+
+    def test_large_range_streaming_and_1mib_chunk_size(self) -> None:
+        self.assertGreaterEqual(serve_local.STREAM_CHUNK_SIZE, 512 * 1024)
+        self.assertEqual(serve_local.STREAM_CHUNK_SIZE, 1024 * 1024)
+
+        # Build a 2.5 MiB deterministic payload and stream full + 2 MiB Range on one socket.
+        pattern = bytes(range(256))
+        total_size = 2_621_440  # 2.5 MiB
+        payload = pattern * (total_size // len(pattern))
+        (self.data_root / "large.pgim").write_bytes(payload)
+
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            range_start = 262_144
+            range_len = 2 * 1024 * 1024
+            range_end = range_start + range_len - 1
+            conn.request(
+                "GET",
+                "/data/large.pgim",
+                headers={"Range": f"bytes={range_start}-{range_end}"},
+            )
+            resp1 = conn.getresponse()
+            body1 = resp1.read()
+            hdr1 = dict(resp1.getheaders())
+            first_sock = conn.sock
+
+            self.assertEqual(resp1.version, 11)
+            self.assertEqual(resp1.status, 206)
+            self.assertFalse(resp1.will_close)
+            self.assertEqual(hdr1.get("Content-Length"), str(range_len))
+            self.assertEqual(hdr1.get("Content-Range"), f"bytes {range_start}-{range_end}/{total_size}")
+            self.assertEqual(body1, payload[range_start : range_end + 1])
+
+            conn.request("GET", "/data/large.pgim")
+            resp2 = conn.getresponse()
+            body2 = resp2.read()
+            hdr2 = dict(resp2.getheaders())
+            self.assertIs(conn.sock, first_sock)
+            self.assertEqual(resp2.status, 200)
+            self.assertEqual(hdr2.get("Content-Length"), str(total_size))
+            self.assertEqual(body2, payload)
+        finally:
+            conn.close()
+
+    def test_keep_alive_idle_timeout_closes_quietly(self) -> None:
+        httpd = serve_local.create_server(
+            "127.0.0.1",
+            0,
+            self.web_root,
+            self.data_root,
+            keep_alive_timeout=0.15,
+        )
+        port = httpd.server_address[1]
+        stderr_buf = io.StringIO()
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with contextlib.redirect_stderr(stderr_buf):
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                try:
+                    conn.request("GET", "/")
+                    resp = conn.getresponse()
+                    self.assertEqual(resp.status, 200)
+                    self.assertEqual(resp.read(), b"<h1>ok</h1>")
+                    self.assertIsNotNone(conn.sock)
+                    # Wait past the 0.15s idle keep-alive timeout; server should close silently.
+                    time.sleep(0.35)
+                    conn.sock.settimeout(2.0)
+                    self.assertEqual(conn.sock.recv(16), b"")
+                finally:
+                    conn.close()
+            stderr_text = stderr_buf.getvalue()
+            self.assertNotIn("Traceback", stderr_text)
+            self.assertNotIn("Request timed out", stderr_text)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=2)
+
+    def test_mid_body_truncation_marks_close_connection(self) -> None:
+        sample = self.data_root / "shrinking.bin"
+        sample.write_bytes(b"0123456789abcdef")
+
+        class _ShrinkingReader:
+            def __init__(self) -> None:
+                self._sent = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def seek(self, _offset: int) -> None:
+                return None
+
+            def read(self, _n: int) -> bytes:
+                if not self._sent:
+                    self._sent = True
+                    return b"0123"
+                return b""
+
+            def close(self) -> None:
+                return None
+
+        written: list[bytes] = []
+
+        class _CollectingWriter:
+            def write(self, data: bytes) -> int:
+                written.append(data)
+                return len(data)
+
+        handler = object.__new__(serve_local.PlayGta6Handler)
+        handler.web_root = self.web_root
+        handler.data_root = self.data_root
+        handler.game_root = None
+        handler.shaders_root = self.data_root / "shaders"
+        handler.boot_root = None
+        handler.headers = {}
+        handler.close_connection = False
+        handler.wfile = _CollectingWriter()
+        handler.send_response = lambda *a, **kw: None
+        handler.send_header = lambda *a, **kw: None
+        handler.end_headers = lambda *a, **kw: None
+
+        orig_resolve = handler._resolve_target
+        fake_path = type(
+            "_FakePath",
+            (),
+            {
+                "is_file": lambda self: True,
+                "stat": lambda self: sample.stat(),
+                "open": lambda self, _mode="rb": _ShrinkingReader(),
+                "__str__": lambda self: str(sample),
+            },
+        )()
+        handler._resolve_target = lambda _url: fake_path
+        try:
+            handler._serve_file("/data/shrinking.bin", send_body=True)
+        finally:
+            handler._resolve_target = orig_resolve
+
+        self.assertEqual(b"".join(written), b"0123")
+        self.assertTrue(handler.close_connection)
 
 
 if __name__ == "__main__":
