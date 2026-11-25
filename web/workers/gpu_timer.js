@@ -3,8 +3,11 @@
 (function (root) {
   const DEFAULT_MAX_PASSES_PER_FRAME = 32;
   const DEFAULT_READBACK_SLOTS = 3;
+  const DEFAULT_QUERY_RING_SLOTS = 1;
   const DEFAULT_HISTORY_SIZE = 120;
   const DEFAULT_FRAME_BUDGET_MS = 16.67;
+  const DEFAULT_PASS_BUDGET_MS = 33.333;
+  const DEFAULT_30FPS_BUDGET_MS = DEFAULT_PASS_BUDGET_MS;
   const TIMESTAMP_BYTE_SIZE = 8;
   const NS_PER_MS = 1e6;
 
@@ -214,8 +217,10 @@
      * @param {GPUDevice} [options.device]
      * @param {number} [options.maxPassesPerFrame=32]
      * @param {number} [options.readbackSlots=3]
+     * @param {number} [options.queryRingSlots=1]
      * @param {number} [options.historySize=120]
      * @param {number} [options.frameBudgetMs=16.67]
+     * @param {number} [options.passBudgetMs=33.333]
      * @param {() => number} [options.now] Optional clock returning milliseconds (defaults to `performance.now()`).
      */
     constructor(options = {}) {
@@ -232,6 +237,11 @@
         DEFAULT_READBACK_SLOTS,
         'readbackSlots'
       );
+      this._queryRingSlots = normalizePositiveInt(
+        opts.queryRingSlots,
+        DEFAULT_QUERY_RING_SLOTS,
+        'queryRingSlots'
+      );
       this._historySize = normalizePositiveInt(
         opts.historySize,
         DEFAULT_HISTORY_SIZE,
@@ -242,6 +252,11 @@
         DEFAULT_FRAME_BUDGET_MS,
         'frameBudgetMs'
       );
+      this._passBudgetMs = normalizePositiveNumber(
+        opts.passBudgetMs,
+        DEFAULT_PASS_BUDGET_MS,
+        'passBudgetMs'
+      );
       if (opts.now !== undefined && typeof opts.now !== 'function') {
         throw new TypeError('now must be a function');
       }
@@ -249,6 +264,7 @@
 
       this._device = device;
       this._maxQueries = this._maxPassesPerFrame * 2;
+      this._totalQueries = this._maxQueries * this._queryRingSlots;
       this._bufferByteSize = this._maxQueries * TIMESTAMP_BYTE_SIZE;
 
       this._supported = false;
@@ -263,6 +279,12 @@
       this._pendingHead = 0;
       this._pendingTail = 0;
       this._pendingCount = 0;
+
+      // Pre-allocated query-slot ring recycling state (zero hot-path allocations).
+      this._activeQueryRingSlice = 0;
+      this._queryRingSliceUsed = new Uint32Array(this._queryRingSlots);
+      this._querySlotRecycles = 0;
+      this._querySlotWraps = 0;
 
       // Pre-allocated per-frame pass recording storage (zero hot-path allocations).
       this._framePassNames = new Array(this._maxPassesPerFrame);
@@ -284,10 +306,13 @@
       this._frameTotalWindowCount = 0;
       this._frameSeq = 0;
 
-      // Pre-allocated rolling pass duration ring for global p50PassMs / p95PassMs stats.
+      // Pre-allocated rolling pass duration ring for global p50PassMs / p95PassMs / maxPassMs stats.
       this._passDurations = new Float64Array(this._historySize);
       this._passDurationWriteIdx = 0;
       this._passDurationWindowCount = 0;
+
+      // Reusable typed scratch buffer for zero-alloc percentile sorting over bounded rings.
+      this._sortScratch = new Float64Array(this._historySize);
 
       // Open CPU fallback frame accumulators (active only when !supported and beginPass/endPass are used).
       this._cpuFrameOpen = false;
@@ -300,6 +325,7 @@
       this._droppedPasses = 0;
       this._droppedQueryFrames = 0;
       this._mapErrors = 0;
+      this._passesOverBudget = 0;
       this._lastFrameGpuMs = 0;
       this._resetGeneration = 0;
       this._passHistories = new Map();
@@ -318,7 +344,7 @@
         querySet = device.createQuerySet({
           label: 'playgta6-gpu-timer-queries',
           type: 'timestamp',
-          count: this._maxQueries,
+          count: this._totalQueries,
         });
         if (!querySet) {
           throw new Error('createQuerySet returned empty query set');
@@ -356,13 +382,18 @@
           });
         }
 
-        const timestampWriteDescriptors = new Array(this._maxPassesPerFrame);
-        for (let i = 0; i < this._maxPassesPerFrame; i += 1) {
-          timestampWriteDescriptors[i] = Object.freeze({
-            querySet,
-            beginningOfPassWriteIndex: i * 2,
-            endOfPassWriteIndex: i * 2 + 1,
-          });
+        const totalDescriptorSlots = this._queryRingSlots * this._maxPassesPerFrame;
+        const timestampWriteDescriptors = new Array(totalDescriptorSlots);
+        for (let slice = 0; slice < this._queryRingSlots; slice += 1) {
+          const queryBase = slice * this._maxQueries;
+          const descBase = slice * this._maxPassesPerFrame;
+          for (let i = 0; i < this._maxPassesPerFrame; i += 1) {
+            timestampWriteDescriptors[descBase + i] = Object.freeze({
+              querySet,
+              beginningOfPassWriteIndex: queryBase + i * 2,
+              endOfPassWriteIndex: queryBase + i * 2 + 1,
+            });
+          }
         }
 
         this._querySet = querySet;
@@ -429,6 +460,10 @@
       return this._readbackSlotCount;
     }
 
+    get queryRingSlots() {
+      return this._queryRingSlots;
+    }
+
     get historySize() {
       return this._historySize;
     }
@@ -437,8 +472,49 @@
       return this._frameBudgetMs;
     }
 
+    get passBudgetMs() {
+      return this._passBudgetMs;
+    }
+
     get isDestroyed() {
       return this._destroyed;
+    }
+
+    _computeWindowStats(ring, count) {
+      if (count <= 0) {
+        return {
+          count: 0,
+          avgMs: 0,
+          minMs: 0,
+          p50Ms: 0,
+          p95Ms: 0,
+          p99Ms: 0,
+          maxMs: 0,
+        };
+      }
+
+      const scratch = this._sortScratch;
+      for (let i = 0; i < count; i += 1) {
+        scratch[i] = ring[i];
+      }
+
+      const view = count === scratch.length ? scratch : scratch.subarray(0, count);
+      view.sort();
+
+      let sum = 0;
+      for (let i = 0; i < count; i += 1) {
+        sum += view[i];
+      }
+
+      return {
+        count,
+        avgMs: sum / count,
+        minMs: view[0],
+        p50Ms: percentileFromSorted(view, count, 0.5),
+        p95Ms: percentileFromSorted(view, count, 0.95),
+        p99Ms: percentileFromSorted(view, count, 0.99),
+        maxMs: view[count - 1],
+      };
     }
 
     _recordFrameTotal(totalMs, frameSeq) {
@@ -631,7 +707,8 @@
       this._framePassBeginIdx[passIdx] = beginningOfPassWriteIndex;
       this._framePassEndIdx[passIdx] = endOfPassWriteIndex;
 
-      return this._timestampWriteDescriptors[passIdx];
+      const descriptorIdx = this._activeQueryRingSlice * this._maxPassesPerFrame + passIdx;
+      return this._timestampWriteDescriptors[descriptorIdx];
     }
 
     /**
@@ -696,11 +773,13 @@
         return false;
       }
 
+      const sliceIdx = this._activeQueryRingSlice;
+      const firstQuery = sliceIdx * this._maxQueries;
       const queryCount = this._queryCursor;
       const copyBytes = queryCount * TIMESTAMP_BYTE_SIZE;
 
       try {
-        encoder.resolveQuerySet(this._querySet, 0, queryCount, this._resolveBuffer, 0);
+        encoder.resolveQuerySet(this._querySet, firstQuery, queryCount, this._resolveBuffer, 0);
         encoder.copyBufferToBuffer(this._resolveBuffer, 0, freeSlot.buffer, 0, copyBytes);
       } catch (_) {
         this._droppedQueryFrames += 1;
@@ -724,6 +803,16 @@
       this._pendingRing[this._pendingTail] = freeSlot;
       this._pendingTail = (this._pendingTail + 1) % this._readbackSlotCount;
       this._pendingCount += 1;
+
+      if (this._queryRingSliceUsed[sliceIdx] > 0) {
+        this._querySlotRecycles += 1;
+      }
+      this._queryRingSliceUsed[sliceIdx] += 1;
+      const nextSlice = (sliceIdx + 1) % this._queryRingSlots;
+      if (nextSlice === 0) {
+        this._querySlotWraps += 1;
+      }
+      this._activeQueryRingSlice = nextSlice;
 
       this._framePassCount = 0;
       this._queryCursor = 0;
@@ -752,6 +841,7 @@
           count: 0,
           lastMs: 0,
           budgetExceedCount: 0,
+          passesOverBudget: 0,
           frameSamples: new Float64Array(this._historySize),
           frameSeqs: new Float64Array(this._historySize),
           frameWriteIdx: 0,
@@ -771,6 +861,10 @@
       entry.lastMs = safeDurationMs;
       if (safeDurationMs > this._frameBudgetMs) {
         entry.budgetExceedCount += 1;
+      }
+      if (safeDurationMs > this._passBudgetMs) {
+        entry.passesOverBudget += 1;
+        this._passesOverBudget += 1;
       }
 
       if (typeof frameSeq === 'number' && frameSeq > 0) {
@@ -946,8 +1040,7 @@
       if (!entry || entry.windowCount === 0) {
         return null;
       }
-      const windowSamples = entry.samples.subarray(0, entry.windowCount);
-      const percentiles = computePercentiles(windowSamples);
+      const percentiles = this._computeWindowStats(entry.samples, entry.windowCount);
       return {
         count: percentiles.count,
         totalCount: entry.count,
@@ -1158,11 +1251,17 @@
       this._droppedPasses = 0;
       this._droppedQueryFrames = 0;
       this._mapErrors = 0;
+      this._passesOverBudget = 0;
       this._lastFrameGpuMs = 0;
       this._passHistories.clear();
       this._passDurations.fill(0);
       this._passDurationWriteIdx = 0;
       this._passDurationWindowCount = 0;
+      this._sortScratch.fill(0);
+      this._activeQueryRingSlice = 0;
+      this._queryRingSliceUsed.fill(0);
+      this._querySlotRecycles = 0;
+      this._querySlotWraps = 0;
       this._framePassCount = 0;
       this._framePassNames.fill(undefined);
       this._queryCursor = 0;
@@ -1206,6 +1305,73 @@
     }
 
     /**
+     * Returns sanitized rolling 30 FPS per-pass GPU timing histogram statistics.
+     *
+     * - When called with no argument (`label === undefined`), returns a defensive map of
+     *   all recorded passes keyed by pass label.
+     * - When called with a specific pass label, returns that pass's sanitized histogram
+     *   stats object or `null` if no samples have been recorded for it.
+     *
+     * @param {string} [label]
+     * @returns {Record<string, {
+     *   count: number,
+     *   lastMs: number,
+     *   avgMs: number,
+     *   p50Ms: number,
+     *   p95Ms: number,
+     *   maxMs: number,
+     *   passesOverBudget: number
+     * }> | {
+     *   count: number,
+     *   lastMs: number,
+     *   avgMs: number,
+     *   p50Ms: number,
+     *   p95Ms: number,
+     *   maxMs: number,
+     *   passesOverBudget: number
+     * } | null}
+     */
+    getPassStats(label) {
+      if (label !== undefined) {
+        if (typeof label !== 'string' || label.length === 0) {
+          return null;
+        }
+        const entry = this._passHistories.get(label);
+        if (!entry || entry.windowCount === 0) {
+          return null;
+        }
+        const hist = this._computeWindowStats(entry.samples, entry.windowCount);
+        return {
+          count: entry.count,
+          lastMs: entry.lastMs,
+          avgMs: hist.avgMs,
+          p50Ms: hist.p50Ms,
+          p95Ms: hist.p95Ms,
+          maxMs: hist.maxMs,
+          passesOverBudget: entry.passesOverBudget,
+        };
+      }
+
+      const passStats = {};
+      for (const [name, entry] of this._passHistories.entries()) {
+        if (entry.windowCount === 0) {
+          continue;
+        }
+        const hist = this._computeWindowStats(entry.samples, entry.windowCount);
+        passStats[name] = {
+          count: entry.count,
+          lastMs: entry.lastMs,
+          avgMs: hist.avgMs,
+          p50Ms: hist.p50Ms,
+          p95Ms: hist.p95Ms,
+          maxMs: hist.maxMs,
+          passesOverBudget: entry.passesOverBudget,
+        };
+      }
+      return passStats;
+    }
+
+    /**
      * Returns a snapshot of overall profiler counters and per-pass rolling stats.
      *
      * @returns {{
@@ -1218,32 +1384,27 @@
      *   lastFrameGpuMs: number,
      *   p50PassMs: number,
      *   p95PassMs: number,
-     *   passStats: Record<string, { count: number, lastMs: number, avgMs: number, maxMs: number }>
+     *   maxPassMs: number,
+     *   passBudgetMs: number,
+     *   passesOverBudget: number,
+     *   querySlotRecycles: number,
+     *   querySlotWraps: number,
+     *   passStats: Record<string, {
+     *     count: number,
+     *     lastMs: number,
+     *     avgMs: number,
+     *     p50Ms: number,
+     *     p95Ms: number,
+     *     maxMs: number,
+     *     passesOverBudget: number
+     *   }>
      * }}
      */
     getStats() {
-      const passStats = {};
-      for (const [name, entry] of this._passHistories.entries()) {
-        let sum = 0;
-        let maxMs = 0;
-        for (let i = 0; i < entry.windowCount; i += 1) {
-          const v = entry.samples[i];
-          sum += v;
-          if (v > maxMs) {
-            maxMs = v;
-          }
-        }
-        const avgMs = entry.windowCount > 0 ? sum / entry.windowCount : 0;
-        passStats[name] = {
-          count: entry.count,
-          lastMs: entry.lastMs,
-          avgMs,
-          maxMs,
-        };
-      }
-
-      const rollingPassPercentiles = computePercentiles(
-        this._passDurations.subarray(0, this._passDurationWindowCount)
+      const passStats = this.getPassStats();
+      const rollingPassPercentiles = this._computeWindowStats(
+        this._passDurations,
+        this._passDurationWindowCount
       );
 
       return {
@@ -1256,6 +1417,11 @@
         lastFrameGpuMs: this._lastFrameGpuMs,
         p50PassMs: rollingPassPercentiles.p50Ms,
         p95PassMs: rollingPassPercentiles.p95Ms,
+        maxPassMs: rollingPassPercentiles.maxMs,
+        passBudgetMs: this._passBudgetMs,
+        passesOverBudget: this._passesOverBudget,
+        querySlotRecycles: this._querySlotRecycles,
+        querySlotWraps: this._querySlotWraps,
         passStats,
       };
     }
@@ -1316,8 +1482,11 @@
   const exportedApi = {
     DEFAULT_MAX_PASSES_PER_FRAME,
     DEFAULT_READBACK_SLOTS,
+    DEFAULT_QUERY_RING_SLOTS,
     DEFAULT_HISTORY_SIZE,
     DEFAULT_FRAME_BUDGET_MS,
+    DEFAULT_PASS_BUDGET_MS,
+    DEFAULT_30FPS_BUDGET_MS,
     TIMESTAMP_BYTE_SIZE,
     BUFFER_USAGE,
     MAP_MODE,
