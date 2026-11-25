@@ -145,6 +145,9 @@ const DEFAULT_MAX_VALIDATION_ERROR_POSTS = 64;
 const MAX_VALIDATION_ERROR_MESSAGE_LENGTH = 512;
 const MAX_GPU_ADAPTER_FIELD_LENGTH = 96;
 const MAX_DIRECT_WRITE_BUFFER_CHUNK_BYTES = 4 * 1024 * 1024;
+const DEFAULT_OVERSIZED_RT_RECLAIM_IDLE_FRAMES = 2;
+const DEFAULT_OVERSIZED_RT_RECLAIM_INTERVAL_FRAMES = 2;
+const MAX_ZERO_ALLOC_RING_DRAIN_BATCHES = 64;
 const WGSL_GROUP0_RE = /@group\(\s*0\s*\)/;
 
 const OPCODE_NAMES = Object.freeze({
@@ -1835,10 +1838,60 @@ class WgpuCommandProcessor {
       options.gpuAdapter && typeof options.gpuAdapter === 'object'
         ? sanitizeGpuAdapterInfo(options.gpuAdapter)
         : null;
+    this._ownsDrawExecutor = false;
     this.drawExecutor =
       options.drawExecutor && typeof options.drawExecutor === 'object'
         ? options.drawExecutor
         : null;
+    this._reuseDrawResult = options.reuseDrawResult !== false;
+    if (this.drawExecutor && this._reuseDrawResult) {
+      try {
+        if (typeof this.drawExecutor.setReuseDrawResult === 'function') {
+          this.drawExecutor.setReuseDrawResult(true);
+        } else if ('_reuseDrawResult' in this.drawExecutor) {
+          this.drawExecutor._reuseDrawResult = true;
+        }
+      } catch (_) {
+        // Ignore frozen or read-only custom DrawExecutor mocks.
+      }
+    }
+    this._frameDrawSummaryOpts = Object.freeze({ reuse: true });
+    this._frameSummaryScratch = {
+      hasNonClearDraw: false,
+      realPackDrawsThisFrame: 0,
+      fallbackDrawsThisFrame: 0,
+      drawsThisFrame: 0,
+    };
+    this.resourceTable =
+      options.resourceTable && typeof options.resourceTable === 'object'
+        ? options.resourceTable
+        : null;
+    this._zeroAllocDrains = 0;
+    this._zeroAllocDrainOpts = { reuseResult: true };
+    this._zeroAllocDrainPresents = 0;
+    this._zeroAllocDrainSpanBytes = 0;
+    this._onZeroAllocDrainSpan = (bytesView, byteOffset, byteLength) => {
+      const viewBytes =
+        byteOffset === 0 && byteLength === bytesView.byteLength
+          ? bytesView
+          : bytesView.subarray(byteOffset, byteOffset + byteLength);
+      this._zeroAllocDrainSpanBytes = viewBytes.byteLength;
+      const execRes = this.executeCommandBuffer(viewBytes);
+      this._zeroAllocDrainPresents += execRes.presents;
+    };
+    this._reclaimedOversizedBytes = 0;
+    this._oversizedRtReclaimIdleFrames = resolvePositiveIntOption(
+      options.oversizedRtReclaimIdleFrames,
+      DEFAULT_OVERSIZED_RT_RECLAIM_IDLE_FRAMES
+    );
+    this._oversizedRtReclaimIntervalFrames = resolvePositiveIntOption(
+      options.oversizedRtReclaimIntervalFrames,
+      DEFAULT_OVERSIZED_RT_RECLAIM_INTERVAL_FRAMES
+    );
+    this._lastPresentSource = null;
+    this._lastPresentWidth = 0;
+    this._lastPresentHeight = 0;
+    this._pendingSceneTransition = false;
     this._frameDrawsThisFrame = 0;
     this._frameRealPackDrawsThisFrame = 0;
     this._frameFallbackDrawsThisFrame = 0;
@@ -2178,6 +2231,40 @@ class WgpuCommandProcessor {
         }
         this.shaderFallbackRouter = new FallbackRouterCtor(routerOpts);
         this._ownsShaderFallbackRouter = true;
+      }
+    }
+
+    // W282: Optional owned DrawExecutor configured with reuseDrawResult: true for zero-alloc draws.
+    if (
+      !this.drawExecutor &&
+      options.enableDrawExecutor === true &&
+      device &&
+      typeof device === 'object'
+    ) {
+      const DrawExecutorCtor = resolveSubsystemCtor(
+        options.DrawExecutor,
+        'PlayGta6DrawExecutor',
+        'DrawExecutor',
+        './draw_executor.js'
+      );
+      if (DrawExecutorCtor) {
+        const execOpts =
+          options.drawExecutorOptions && typeof options.drawExecutorOptions === 'object'
+            ? { ...options.drawExecutorOptions }
+            : {};
+        if (execOpts.reuseDrawResult === undefined) {
+          execOpts.reuseDrawResult = this._reuseDrawResult;
+        }
+        execOpts.device = device;
+        execOpts.format = execOpts.format || this.format;
+        if (execOpts.pipelineCache === undefined && this.pipelineCache) {
+          execOpts.pipelineCache = this.pipelineCache;
+        }
+        if (execOpts.shaderFallbackRouter === undefined && this.shaderFallbackRouter) {
+          execOpts.shaderFallbackRouter = this.shaderFallbackRouter;
+        }
+        this.drawExecutor = new DrawExecutorCtor(execOpts);
+        this._ownsDrawExecutor = true;
       }
     }
 
@@ -3147,7 +3234,21 @@ class WgpuCommandProcessor {
       };
     }
 
-    const pipeline = this.device.createRenderPipeline(descriptor);
+    const specFastKey = `spec:${pipeMeta.id}:${canonicalProfile}:${this._getRenderTargetFormat()}`;
+    let pipeline;
+    if (this.pipelineCache && typeof this.pipelineCache.getFastRenderPipeline === 'function') {
+      pipeline = this.pipelineCache.getFastRenderPipeline(specFastKey, descriptor);
+    } else if (
+      this.pipelineCache &&
+      typeof this.pipelineCache.getOrCreateRenderPipeline === 'function'
+    ) {
+      pipeline = this.pipelineCache.getOrCreateRenderPipeline(descriptor, specFastKey);
+    } else {
+      pipeline = this.device.createRenderPipeline(descriptor);
+    }
+    if (!pipeline) {
+      return null;
+    }
     const entry = { pipeline, profile: canonicalProfile, changed: true, vsCode, fsCode };
     this._specializedFallbackPipelines.set(cacheKey, entry);
     return entry;
@@ -3728,6 +3829,22 @@ class WgpuCommandProcessor {
           if (renderNowMs !== null) {
             this._lastSplashPresentMs = renderNowMs;
           }
+          const splashSceneTransition =
+            this._pendingSceneTransition ||
+            (this._lastPresentSource !== null && this._lastPresentSource !== 'splash');
+          const splashResChanged =
+            this._lastPresentWidth > 0 &&
+            targetWidth > 0 &&
+            (targetWidth !== this._lastPresentWidth || targetHeight !== this._lastPresentHeight);
+          this._pendingSceneTransition = false;
+          this._lastPresentSource = 'splash';
+          if (targetWidth > 0 && targetHeight > 0) {
+            this._lastPresentWidth = targetWidth;
+            this._lastPresentHeight = targetHeight;
+          }
+          if (splashSceneTransition || splashResChanged) {
+            this.reclaimOversizedRenderTargets(this._oversizedRtReclaimIdleFrames);
+          }
           const prevFrameCount = this.frameCount;
           this.frameCount += 1;
           this._splashFramesPresented += 1;
@@ -4070,7 +4187,7 @@ class WgpuCommandProcessor {
     }
   }
 
-  _endSubsystemsForFrame(workDoneFence = null) {
+  _endSubsystemsForFrame(workDoneFence = null, frameHints = null) {
     if (
       this.stagingPool &&
       !this.stagingPool._destroyed &&
@@ -4090,6 +4207,21 @@ class WgpuCommandProcessor {
       typeof this.rtPool.endFrame === 'function'
     ) {
       this.rtPool.endFrame();
+    }
+    if (
+      this.rtPool &&
+      !this.rtPool.isDestroyed &&
+      typeof this.rtPool.reclaimOversizedIdle === 'function'
+    ) {
+      const hints = frameHints && typeof frameHints === 'object' ? frameHints : null;
+      const shouldReclaim = Boolean(
+        (hints && (hints.sceneTransition || hints.resolutionChanged || hints.isIdleFrame)) ||
+          (this.frameCount > 0 &&
+            this.frameCount % this._oversizedRtReclaimIntervalFrames === 0)
+      );
+      if (shouldReclaim) {
+        this.reclaimOversizedRenderTargets(this._oversizedRtReclaimIdleFrames);
+      }
     }
     this._frameBegunForIndex = -1;
   }
@@ -5798,6 +5930,47 @@ class WgpuCommandProcessor {
     return this.onResize(width, height);
   }
 
+  /**
+   * W285: Aggressively reclaim idle oversized render targets (e.g. 4K Bink2 targets before
+   * Main Menu / In-Game) when `rtPool.reclaimOversizedIdle` is supported.
+   *
+   * @param {number} [maxIdleFrames=2]
+   * @returns {{ reclaimedCount: number, reclaimedBytes: number }}
+   */
+  reclaimOversizedRenderTargets(maxIdleFrames = this._oversizedRtReclaimIdleFrames) {
+    if (
+      this._destroyed ||
+      !this.rtPool ||
+      this.rtPool.isDestroyed ||
+      typeof this.rtPool.reclaimOversizedIdle !== 'function'
+    ) {
+      return { reclaimedCount: 0, reclaimedBytes: 0 };
+    }
+    try {
+      const result = this.rtPool.reclaimOversizedIdle(maxIdleFrames);
+      const reclaimedCount = toNonNegativeInt(result && result.reclaimedCount, 0);
+      const reclaimedBytes = toNonNegativeInt(result && result.reclaimedBytes, 0);
+      if (reclaimedBytes > 0) {
+        this._reclaimedOversizedBytes += reclaimedBytes;
+      }
+      return { reclaimedCount, reclaimedBytes };
+    } catch (_) {
+      return { reclaimedCount: 0, reclaimedBytes: 0 };
+    }
+  }
+
+  /**
+   * W285: Mark an explicit scene transition (e.g. Intro Video -> Main Menu -> In-Game)
+   * and immediately reclaim idle oversized render targets from RenderTargetPool.
+   *
+   * @param {number} [maxIdleFrames=2]
+   * @returns {{ reclaimedCount: number, reclaimedBytes: number }}
+   */
+  notifySceneTransition(maxIdleFrames = this._oversizedRtReclaimIdleFrames) {
+    this._pendingSceneTransition = true;
+    return this.reclaimOversizedRenderTargets(maxIdleFrames);
+  }
+
   _resolveShaderReflection(shaderId, shaderEntry, stageName) {
     if (
       !this.reflectionRegistry ||
@@ -6708,11 +6881,29 @@ class WgpuCommandProcessor {
       };
     }
 
+    const vsGen = this._shaderModuleGenerations.get(vsShaderId) || 0;
+    const fsGen = fsShaderId !== 0 ? this._shaderModuleGenerations.get(fsShaderId) || 0 : 0;
+    const rtFormat = fsEntry ? this._getRenderTargetFormat() : 'none';
+    const renderFastKey = `v1r:${vsGen}:${fsGen}:${vertexStride}:${topology}:${rtFormat}:${reflected ? 'r' : 'a'}:${effectiveFallbackProfile || ''}`;
+
     let pipeline;
     try {
-      pipeline = this.device.createRenderPipeline(descriptor);
+      if (this.pipelineCache && typeof this.pipelineCache.getFastRenderPipeline === 'function') {
+        pipeline = this.pipelineCache.getFastRenderPipeline(renderFastKey, descriptor);
+      } else if (
+        this.pipelineCache &&
+        typeof this.pipelineCache.getOrCreateRenderPipeline === 'function'
+      ) {
+        pipeline = this.pipelineCache.getOrCreateRenderPipeline(descriptor, renderFastKey);
+      } else {
+        pipeline = this.device.createRenderPipeline(descriptor);
+      }
     } catch (err) {
       this._recordOpValidationError('CreateRenderPipeline', err);
+      return;
+    }
+    if (!pipeline) {
+      // W268 negative-cached (quarantined) or failed pipeline compile — skip cleanly.
       return;
     }
     this.pipelines.set(id, pipeline);
@@ -6905,7 +7096,28 @@ class WgpuCommandProcessor {
   _handleCreateComputePipeline(view, payloadOffset) {
     const built = this._buildComputePipelineDescriptorV1(view, payloadOffset);
     if (!built) return;
-    const pipeline = this.device.createComputePipeline(built.descriptor);
+    const csGen = this._shaderModuleGenerations.get(built.csShaderId) || 0;
+    const computeFastKey = `v1c:${csGen}:${built.reflected ? 'r' : 'a'}`;
+    let pipeline;
+    try {
+      if (this.pipelineCache && typeof this.pipelineCache.getFastComputePipeline === 'function') {
+        pipeline = this.pipelineCache.getFastComputePipeline(computeFastKey, built.descriptor);
+      } else if (
+        this.pipelineCache &&
+        typeof this.pipelineCache.getOrCreateComputePipeline === 'function'
+      ) {
+        pipeline = this.pipelineCache.getOrCreateComputePipeline(built.descriptor, computeFastKey);
+      } else {
+        pipeline = this.device.createComputePipeline(built.descriptor);
+      }
+    } catch (err) {
+      this._recordOpValidationError('CreateComputePipeline', err);
+      return;
+    }
+    if (!pipeline) {
+      // W268 negative-cached (quarantined) or failed compute pipeline compile — skip cleanly.
+      return;
+    }
     this._registerComputePipelineV1(built.id, pipeline);
   }
 
@@ -7943,10 +8155,50 @@ class WgpuCommandProcessor {
       }
     }
 
+    let presentSceneTransition = false;
+    let presentResolutionChanged = false;
+    let presentIsIdleFrame = false;
+
     if (submitted) {
       const presentTs = this._getNowMs();
       this.frameCount += 1;
       this._presentCount += 1;
+      const curWidth =
+        (swapchainTexture &&
+          typeof swapchainTexture.width === 'number' &&
+          swapchainTexture.width > 0 &&
+          Math.floor(swapchainTexture.width)) ||
+        (activeSwapchain &&
+          typeof activeSwapchain.width === 'number' &&
+          activeSwapchain.width > 0 &&
+          Math.floor(activeSwapchain.width)) ||
+        this._viewportWidth ||
+        0;
+      const curHeight =
+        (swapchainTexture &&
+          typeof swapchainTexture.height === 'number' &&
+          swapchainTexture.height > 0 &&
+          Math.floor(swapchainTexture.height)) ||
+        (activeSwapchain &&
+          typeof activeSwapchain.height === 'number' &&
+          activeSwapchain.height > 0 &&
+          Math.floor(activeSwapchain.height)) ||
+        this._viewportHeight ||
+        0;
+      presentSceneTransition =
+        this._pendingSceneTransition ||
+        (this._lastPresentSource !== null && this._lastPresentSource !== 'command-buffer');
+      presentResolutionChanged =
+        this._lastPresentWidth > 0 &&
+        curWidth > 0 &&
+        (curWidth !== this._lastPresentWidth || curHeight !== this._lastPresentHeight);
+      this._pendingSceneTransition = false;
+      this._lastPresentSource = 'command-buffer';
+      if (curWidth > 0 && curHeight > 0) {
+        this._lastPresentWidth = curWidth;
+        this._lastPresentHeight = curHeight;
+      }
+
       if (this.frameCount === 1) {
         this._notifyFirstPresent({
           frameIndex: 0,
@@ -7957,30 +8209,34 @@ class WgpuCommandProcessor {
         });
       }
 
-      const rawSummary =
-        this.drawExecutor && typeof this.drawExecutor.getFrameDrawSummary === 'function'
-          ? this.drawExecutor.getFrameDrawSummary()
-          : null;
-      const summary = rawSummary
-        ? {
-            hasNonClearDraw:
-              Boolean(rawSummary.hasNonClearDraw === true) ||
-              this._frameNonClearDrawsThisFrame > 0,
-            realPackDrawsThisFrame:
-              toNonNegativeInt(rawSummary.realPackDrawsThisFrame, 0) +
-              this._frameRealPackDrawsThisFrame,
-            fallbackDrawsThisFrame:
-              toNonNegativeInt(rawSummary.fallbackDrawsThisFrame, 0) +
-              this._frameFallbackDrawsThisFrame,
-            drawsThisFrame:
-              toNonNegativeInt(rawSummary.drawsThisFrame, 0) + this._frameDrawsThisFrame,
-          }
-        : {
-            hasNonClearDraw: this._frameNonClearDrawsThisFrame > 0,
-            realPackDrawsThisFrame: this._frameRealPackDrawsThisFrame,
-            fallbackDrawsThisFrame: this._frameFallbackDrawsThisFrame,
-            drawsThisFrame: this._frameDrawsThisFrame,
-          };
+      let rawSummary = null;
+      if (this.drawExecutor && typeof this.drawExecutor.getFrameDrawSummary === 'function') {
+        try {
+          rawSummary = this.drawExecutor.getFrameDrawSummary(this._frameDrawSummaryOpts);
+        } catch (_) {
+          rawSummary = this.drawExecutor.getFrameDrawSummary();
+        }
+      }
+      const summary = this._frameSummaryScratch;
+      if (rawSummary && typeof rawSummary === 'object') {
+        summary.hasNonClearDraw =
+          Boolean(rawSummary.hasNonClearDraw === true) ||
+          this._frameNonClearDrawsThisFrame > 0;
+        summary.realPackDrawsThisFrame =
+          toNonNegativeInt(rawSummary.realPackDrawsThisFrame, 0) +
+          this._frameRealPackDrawsThisFrame;
+        summary.fallbackDrawsThisFrame =
+          toNonNegativeInt(rawSummary.fallbackDrawsThisFrame, 0) +
+          this._frameFallbackDrawsThisFrame;
+        summary.drawsThisFrame =
+          toNonNegativeInt(rawSummary.drawsThisFrame, 0) + this._frameDrawsThisFrame;
+      } else {
+        summary.hasNonClearDraw = this._frameNonClearDrawsThisFrame > 0;
+        summary.realPackDrawsThisFrame = this._frameRealPackDrawsThisFrame;
+        summary.fallbackDrawsThisFrame = this._frameFallbackDrawsThisFrame;
+        summary.drawsThisFrame = this._frameDrawsThisFrame;
+      }
+      presentIsIdleFrame = summary.drawsThisFrame === 0;
 
       let swapchainReportedFirstVisible = false;
       if (activeSwapchain && typeof activeSwapchain.markFrameContent === 'function') {
@@ -8025,6 +8281,12 @@ class WgpuCommandProcessor {
         ) {
           swapchainReportedFirstVisible = true;
         }
+      } else if (activeSwapchain && typeof activeSwapchain.recordFramePresented === 'function') {
+        try {
+          activeSwapchain.recordFramePresented(presentTs);
+        } catch (_) {
+          // Swapchain telemetry must never break frame presentation.
+        }
       }
 
       if (
@@ -8062,7 +8324,11 @@ class WgpuCommandProcessor {
     }
 
     const workDoneFence = submitted ? this._getWorkDoneFence() : null;
-    this._endSubsystemsForFrame(workDoneFence);
+    this._endSubsystemsForFrame(workDoneFence, {
+      sceneTransition: presentSceneTransition,
+      resolutionChanged: presentResolutionChanged,
+      isIdleFrame: presentIsIdleFrame,
+    });
 
     if (
       submitted &&
@@ -8089,7 +8355,11 @@ class WgpuCommandProcessor {
   }
 
   attachRing(ringOrSab, options = {}) {
-    if (ringOrSab && typeof ringOrSab.drainTo === 'function') {
+    if (
+      ringOrSab &&
+      (typeof ringOrSab.drainBatchZeroAlloc === 'function' ||
+        typeof ringOrSab.drainTo === 'function')
+    ) {
       this.ring = ringOrSab;
       return this.ring;
     }
@@ -8113,6 +8383,37 @@ class WgpuCommandProcessor {
       return { frameCount: this.frameCount, presents: 0, bytesDrained: 0 };
     }
     let presents = 0;
+    // W284: Prefer zero-alloc span draining when supported by the attached ring.
+    if (typeof this.ring.drainBatchZeroAlloc === 'function') {
+      let bytesDrained = 0;
+      for (let batch = 0; batch < MAX_ZERO_ALLOC_RING_DRAIN_BATCHES; batch += 1) {
+        this._zeroAllocDrainPresents = 0;
+        this._zeroAllocDrainSpanBytes = 0;
+        const res = this.ring.drainBatchZeroAlloc(
+          this._onZeroAllocDrainSpan,
+          this._zeroAllocDrainOpts
+        );
+        presents += this._zeroAllocDrainPresents;
+        const batchBytes =
+          res && typeof res === 'object' && typeof res.bytes === 'number'
+            ? res.bytes
+            : typeof res === 'number' && Number.isFinite(res)
+              ? res
+              : this._zeroAllocDrainSpanBytes;
+        if (batchBytes > 0) {
+          bytesDrained += batchBytes;
+          this._zeroAllocDrains += 1;
+        }
+        const remainingBytes =
+          res && typeof res === 'object' && typeof res.remainingBytes === 'number'
+            ? res.remainingBytes
+            : 0;
+        if (batchBytes <= 0 || remainingBytes <= 0) {
+          break;
+        }
+      }
+      return { frameCount: this.frameCount, presents, bytesDrained };
+    }
     const bytesDrained = this.ring.drainTo((bytes) => {
       const result = this.executeCommandBuffer(bytes);
       presents += result.presents;
@@ -8549,6 +8850,41 @@ class WgpuCommandProcessor {
     );
     const asyncShaderPendingCount = toNonNegativeInt(this._inFlightRangedShaders.size, 0);
 
+    let ringStats = null;
+    if (this.ring && typeof this.ring.getStats === 'function') {
+      try {
+        ringStats = this.ring.getStats();
+      } catch (_) {
+        ringStats = null;
+      }
+    }
+    let resourceTable = null;
+    if (this.resourceTable && typeof this.resourceTable.getStats === 'function') {
+      try {
+        resourceTable = this.resourceTable.getStats();
+      } catch (_) {
+        resourceTable = null;
+      }
+    }
+    let drawExecutorStats = null;
+    if (this.drawExecutor && typeof this.drawExecutor.getStats === 'function') {
+      try {
+        drawExecutorStats = this.drawExecutor.getStats();
+      } catch (_) {
+        drawExecutorStats = null;
+      }
+    }
+    const perf30Fps = resolve30FpsTelemetry(this, {
+      swapchain,
+      rtPool,
+      resourceTable,
+      drawExecutor: drawExecutorStats,
+      ring: ringStats,
+      pipelineCache,
+      reclaimedOversizedBytes: this._reclaimedOversizedBytes,
+      zeroAllocDrains: this._zeroAllocDrains,
+    });
+
     return {
       frameCount: this.frameCount,
       framesPresented: this.frameCount,
@@ -8595,6 +8931,23 @@ class WgpuCommandProcessor {
       asyncPipelineStats,
       asyncPipelineCompileStats,
       pipelineCache,
+      pipelineCacheStats: perf30Fps.pipelineCacheStats,
+      ring: ringStats,
+      resourceTable,
+      drawExecutor: drawExecutorStats,
+      fps30ComplianceRate: perf30Fps.fps30ComplianceRate,
+      frameJitterMs: perf30Fps.frameJitterMs,
+      longestStallMs: perf30Fps.longestStallMs,
+      vramBudgetUtilization: perf30Fps.vramBudgetUtilization,
+      bindGroupHitRate: perf30Fps.bindGroupHitRate,
+      zeroAllocDrains: perf30Fps.zeroAllocDrains,
+      reclaimedOversizedBytes: perf30Fps.reclaimedOversizedBytes,
+      fastLookupHits: perf30Fps.pipelineCacheStats.fastLookupHits,
+      fastLookupMisses: perf30Fps.pipelineCacheStats.fastLookupMisses,
+      fastLookupHitRate: perf30Fps.pipelineCacheStats.fastLookupHitRate,
+      negativeCacheHits: perf30Fps.pipelineCacheStats.negativeCacheHits,
+      negativeCacheSize: perf30Fps.pipelineCacheStats.negativeCacheSize,
+      negativeCacheEvictions: perf30Fps.pipelineCacheStats.negativeCacheEvictions,
       fallbackSamplersCreated,
       fallbackSamplerBindingsSynthesized,
       fallbackProfileCounts: { ...this._fallbackProfileCounts },
@@ -8732,6 +9085,17 @@ class WgpuCommandProcessor {
       typeof this.pipelineCache.clear === 'function'
     ) {
       this.pipelineCache.clear();
+    }
+    if (
+      this.drawExecutor &&
+      this._ownsDrawExecutor &&
+      typeof this.drawExecutor.destroy === 'function'
+    ) {
+      try {
+        this.drawExecutor.destroy();
+      } catch (_) {
+        // Ignore teardown errors on owned drawExecutor.
+      }
     }
     if (
       this.reflectionRegistry &&
@@ -8945,6 +9309,211 @@ function toNonNegativeFinite(value) {
     return null;
   }
   return n;
+}
+
+function toClampedUnitRate(value) {
+  if (value === undefined || value === null || value === '') {
+    return 0;
+  }
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n) || n <= 0) {
+    return 0;
+  }
+  return n >= 1 ? 1 : n;
+}
+
+function readOptionalStatsObject(source) {
+  if (!source || typeof source !== 'object') {
+    return null;
+  }
+  try {
+    if (typeof source.getStats === 'function') {
+      const s = source.getStats();
+      if (s && typeof s === 'object') {
+        return s;
+      }
+    }
+  } catch (_) {
+    // Ignore throwing mock getStats() implementations.
+  }
+  return source;
+}
+
+/**
+ * W295: Extract and sanitize 30 FPS hot-path telemetry across WgpuSwapchain (W286),
+ * RenderTargetPool (W285), ResourceTable (W267), GpuRingBuffer (W284), and
+ * WebGpuPipelineCache (W281/W268) with zero host paths or raw buffers.
+ */
+function resolve30FpsTelemetry(processor, stats) {
+  const proc = processor && typeof processor === 'object' ? processor : null;
+  const st = stats && typeof stats === 'object' ? stats : null;
+
+  const swapObj =
+    (proc && (proc.swapchain || proc._swapchain)) ||
+    (st && (st.swapchain || st.swapchainStats)) ||
+    null;
+  const swapStats = readOptionalStatsObject(swapObj);
+
+  const rtPoolObj = (proc && proc.rtPool) || (st && st.rtPool) || null;
+  const rtPoolStats = readOptionalStatsObject(rtPoolObj);
+
+  const resourceTableObj =
+    (proc && (proc.resourceTable || proc._resourceTable)) ||
+    (st && st.resourceTable) ||
+    null;
+  const resourceTableStats = readOptionalStatsObject(resourceTableObj);
+
+  const drawExecObj = (proc && proc.drawExecutor) || (st && st.drawExecutor) || null;
+  const drawExecStats = readOptionalStatsObject(drawExecObj);
+
+  const ringObj = (proc && proc.ring) || (st && st.ring) || null;
+  const ringStats = readOptionalStatsObject(ringObj);
+
+  const pipeCacheObj = (proc && proc.pipelineCache) || (st && st.pipelineCache) || null;
+  const pipeCacheStats = readOptionalStatsObject(pipeCacheObj);
+
+  const fps30ComplianceRate = toClampedUnitRate(
+    swapStats && swapStats.fps30ComplianceRate !== undefined
+      ? swapStats.fps30ComplianceRate
+      : swapObj && swapObj.fps30ComplianceRate !== undefined
+        ? swapObj.fps30ComplianceRate
+        : st && st.fps30ComplianceRate
+  );
+  const frameJitterRaw = toNonNegativeFinite(
+    swapStats && swapStats.frameJitterMs !== undefined
+      ? swapStats.frameJitterMs
+      : swapObj && swapObj.frameJitterMs !== undefined
+        ? swapObj.frameJitterMs
+        : st && st.frameJitterMs
+  );
+  const frameJitterMs = frameJitterRaw !== null ? frameJitterRaw : 0;
+  const longestStallRaw = toNonNegativeFinite(
+    swapStats && swapStats.longestStallMs !== undefined
+      ? swapStats.longestStallMs
+      : swapObj && swapObj.longestStallMs !== undefined
+        ? swapObj.longestStallMs
+        : st && st.longestStallMs
+  );
+  const longestStallMs = longestStallRaw !== null ? longestStallRaw : 0;
+
+  let rawVramUtil =
+    rtPoolStats && rtPoolStats.vramBudgetUtilization !== undefined
+      ? rtPoolStats.vramBudgetUtilization
+      : st && st.vramBudgetUtilization;
+  if (
+    (rawVramUtil === undefined || rawVramUtil === null) &&
+    rtPoolStats &&
+    typeof rtPoolStats.totalBytes === 'number' &&
+    typeof rtPoolStats.maxPoolBytes === 'number' &&
+    rtPoolStats.maxPoolBytes > 0
+  ) {
+    rawVramUtil = rtPoolStats.totalBytes / rtPoolStats.maxPoolBytes;
+  }
+  const vramBudgetUtilization = toClampedUnitRate(rawVramUtil);
+
+  const rtReclaimed = toNonNegativeInt(rtPoolStats && rtPoolStats.reclaimedOversizedBytes, 0);
+  const localReclaimed = toNonNegativeInt(
+    proc && proc._reclaimedOversizedBytes !== undefined
+      ? proc._reclaimedOversizedBytes
+      : st && st.reclaimedOversizedBytes,
+    0
+  );
+  const reclaimedOversizedBytes = Math.max(rtReclaimed, localReclaimed);
+
+  let rawBgHitRate =
+    resourceTableStats && resourceTableStats.bindGroupHitRate !== undefined
+      ? resourceTableStats.bindGroupHitRate
+      : st && st.bindGroupHitRate !== undefined
+        ? st.bindGroupHitRate
+        : drawExecStats && drawExecStats.bindGroupHitRate;
+  if (
+    (rawBgHitRate === undefined || rawBgHitRate === null) &&
+    resourceTableStats &&
+    typeof resourceTableStats.bindGroupHits === 'number' &&
+    typeof resourceTableStats.bindGroupMisses === 'number'
+  ) {
+    const totalBg = resourceTableStats.bindGroupHits + resourceTableStats.bindGroupMisses;
+    rawBgHitRate = totalBg > 0 ? resourceTableStats.bindGroupHits / totalBg : 0;
+  }
+  const bindGroupHitRate = toClampedUnitRate(rawBgHitRate);
+
+  const ringZeroAlloc = toNonNegativeInt(
+    ringStats && ringStats.zeroAllocDrains !== undefined
+      ? ringStats.zeroAllocDrains
+      : ringObj && ringObj.zeroAllocDrains,
+    0
+  );
+  const localZeroAlloc = toNonNegativeInt(
+    proc && proc._zeroAllocDrains !== undefined
+      ? proc._zeroAllocDrains
+      : st && st.zeroAllocDrains,
+    0
+  );
+  const zeroAllocDrains = Math.max(ringZeroAlloc, localZeroAlloc);
+
+  const fastLookupHits = toNonNegativeInt(
+    pipeCacheStats && pipeCacheStats.fastLookupHits !== undefined
+      ? pipeCacheStats.fastLookupHits
+      : st && st.fastLookupHits,
+    0
+  );
+  const fastLookupMisses = toNonNegativeInt(
+    pipeCacheStats && pipeCacheStats.fastLookupMisses !== undefined
+      ? pipeCacheStats.fastLookupMisses
+      : st && st.fastLookupMisses,
+    0
+  );
+  const fastLookupHitRate = toClampedUnitRate(
+    pipeCacheStats && pipeCacheStats.fastLookupHitRate !== undefined
+      ? pipeCacheStats.fastLookupHitRate
+      : st && st.fastLookupHitRate !== undefined
+        ? st.fastLookupHitRate
+        : fastLookupHits + fastLookupMisses > 0
+          ? fastLookupHits / (fastLookupHits + fastLookupMisses)
+          : 0
+  );
+  const negativeCacheHits = toNonNegativeInt(
+    pipeCacheStats && pipeCacheStats.negativeCacheHits !== undefined
+      ? pipeCacheStats.negativeCacheHits
+      : pipeCacheStats && pipeCacheStats.quarantineHits !== undefined
+        ? pipeCacheStats.quarantineHits
+        : pipeCacheStats && pipeCacheStats.negativeHits !== undefined
+          ? pipeCacheStats.negativeHits
+          : st && st.negativeCacheHits,
+    0
+  );
+  const negativeCacheSize = toNonNegativeInt(
+    pipeCacheStats && pipeCacheStats.negativeCacheSize !== undefined
+      ? pipeCacheStats.negativeCacheSize
+      : pipeCacheStats && pipeCacheStats.quarantinedKeys !== undefined
+        ? pipeCacheStats.quarantinedKeys
+        : st && st.negativeCacheSize,
+    0
+  );
+  const negativeCacheEvictions = toNonNegativeInt(
+    pipeCacheStats && pipeCacheStats.negativeCacheEvictions !== undefined
+      ? pipeCacheStats.negativeCacheEvictions
+      : st && st.negativeCacheEvictions,
+    0
+  );
+
+  return {
+    fps30ComplianceRate,
+    frameJitterMs,
+    longestStallMs,
+    vramBudgetUtilization,
+    bindGroupHitRate,
+    zeroAllocDrains,
+    reclaimedOversizedBytes,
+    pipelineCacheStats: {
+      fastLookupHits,
+      fastLookupMisses,
+      fastLookupHitRate,
+      negativeCacheHits,
+      negativeCacheSize,
+      negativeCacheEvictions,
+    },
+  };
 }
 
 function sanitizeTelemetryStage(stage) {
@@ -9239,6 +9808,16 @@ function buildGpuTelemetrySnapshot(processor, options = {}) {
       stats && stats.gpuAdapter && typeof stats.gpuAdapter === 'object'
         ? sanitizeGpuAdapterInfo(stats.gpuAdapter)
         : null;
+    // W295: Sanitized 30 FPS hot-path telemetry (W286/W285/W284/W281/W268/W267).
+    const perf30Fps = resolve30FpsTelemetry(processor, stats);
+    snapshot.fps30ComplianceRate = perf30Fps.fps30ComplianceRate;
+    snapshot.frameJitterMs = perf30Fps.frameJitterMs;
+    snapshot.longestStallMs = perf30Fps.longestStallMs;
+    snapshot.vramBudgetUtilization = perf30Fps.vramBudgetUtilization;
+    snapshot.bindGroupHitRate = perf30Fps.bindGroupHitRate;
+    snapshot.zeroAllocDrains = perf30Fps.zeroAllocDrains;
+    snapshot.reclaimedOversizedBytes = perf30Fps.reclaimedOversizedBytes;
+    snapshot.pipelineCacheStats = perf30Fps.pipelineCacheStats;
   }
   return snapshot;
 }
@@ -10572,6 +11151,23 @@ function createWgpuWorkerHandler(options = {}) {
       now: telemetryNow,
       gpuAdapter,
       drawExecutor: initPayload.drawExecutor ?? options.drawExecutor,
+      enableDrawExecutor: initPayload.enableDrawExecutor ?? options.enableDrawExecutor,
+      DrawExecutor:
+        initPayload.DrawExecutor !== undefined
+          ? initPayload.DrawExecutor
+          : options.DrawExecutor,
+      drawExecutorOptions:
+        initPayload.drawExecutorOptions ?? options.drawExecutorOptions,
+      reuseDrawResult:
+        initPayload.reuseDrawResult !== undefined
+          ? initPayload.reuseDrawResult
+          : options.reuseDrawResult,
+      resourceTable: initPayload.resourceTable ?? options.resourceTable,
+      oversizedRtReclaimIdleFrames:
+        initPayload.oversizedRtReclaimIdleFrames ?? options.oversizedRtReclaimIdleFrames,
+      oversizedRtReclaimIntervalFrames:
+        initPayload.oversizedRtReclaimIntervalFrames ??
+        options.oversizedRtReclaimIntervalFrames,
       swapchain: activeSwapchain,
       ownsSwapchain,
       logger: options.logger,
@@ -10705,7 +11301,9 @@ function createWgpuWorkerHandler(options = {}) {
       throw new Error('attachRing requires ringSab or ring');
     }
     const RingCtor =
-      ringSource && typeof ringSource.drainTo === 'function'
+      ringSource &&
+      (typeof ringSource.drainBatchZeroAlloc === 'function' ||
+        typeof ringSource.drainTo === 'function')
         ? null
         : resolveGpuRingBuffer(msg.GpuRingBuffer || injectedRingCtor);
     attachedRing = RingCtor
@@ -10895,6 +11493,7 @@ function createWgpuWorkerHandler(options = {}) {
             chunkedWriteBufferUploads: stats
               ? toNonNegativeInt(stats.chunkedWriteBufferUploads, 0)
               : 0,
+            ...resolve30FpsTelemetry(processor, stats),
           };
           if (payload.id !== undefined) {
             reply.id = payload.id;
@@ -10906,6 +11505,22 @@ function createWgpuWorkerHandler(options = {}) {
             stats,
             gpuAdapter: (stats && stats.gpuAdapter) || getActiveGpuAdapter(),
           });
+        }
+      } else if ((payload.type === 'scene-transition' || payload.sceneTransition) && processor) {
+        const reclaimed =
+          typeof processor.notifySceneTransition === 'function'
+            ? processor.notifySceneTransition(payload.maxIdleFrames)
+            : { reclaimedCount: 0, reclaimedBytes: 0 };
+        if (payload.id !== undefined || payload.type === 'scene-transition') {
+          const reply = {
+            type: 'scene-transition',
+            reclaimedCount: toNonNegativeInt(reclaimed && reclaimed.reclaimedCount, 0),
+            reclaimedBytes: toNonNegativeInt(reclaimed && reclaimed.reclaimedBytes, 0),
+          };
+          if (payload.id !== undefined) {
+            reply.id = payload.id;
+          }
+          postMessage(reply);
         }
       } else if (payload.type === 'present-splash-frame' || payload.type === 'bink-frame') {
         const framePayload =
