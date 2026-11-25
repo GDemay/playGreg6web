@@ -4175,3 +4175,480 @@ test('W161 (#855 / #809): PresentX handles sRGB direct canvas views, WgpuSwapcha
     assert.equal(swapchain.blitCount, 1);
   }
 });
+
+// ---------------------------------------------------------------------------------------------
+// W186 (#927): W163 storage format resolution, W167 default sampler fallbacks, & PresentX cache
+// ---------------------------------------------------------------------------------------------
+
+test('W186 (#927): W163 resolveStorageCompatibleFormat maps sRGB linear siblings, bgra8unorm-storage, and tier1 formats cleanly', () => {
+  const { resolveStorageCompatibleFormat } = require('../web/workers/texture_formats.js');
+  const bgraSrgbCode = formatCodeOf('bgra8unorm-srgb');
+  const rgbaSrgbCode = formatCodeOf('rgba8unorm-srgb');
+  const r16FloatCode = formatCodeOf('r16float');
+  const bgraCode = formatCodeOf('bgra8unorm');
+  const depth32Code = formatCodeOf('depth32float');
+
+  // 1) Device WITH bgra8unorm-storage + texture-formats-tier1:
+  //    - bgra8unorm-srgb storageTexture BGL remaps to linear sibling bgra8unorm (not rgba8unorm!)
+  //    - rgba8unorm-srgb storageTexture BGL remaps to linear sibling rgba8unorm
+  //    - r16float (tier1) stays r16float
+  //    - binding an sRGB view to a storageTexture slot requests the linear sibling view format
+  {
+    const gpu = createMockWebGpu();
+    gpu.device.features = new Set(['bgra8unorm-storage', 'texture-formats-tier1']);
+    const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { format: 'bgra8unorm' });
+    let helperCalls = 0;
+    const handler = installRenderStatePackets(processor, {
+      resolveStorageCompatibleFormat: (fmt, opts) => {
+        helperCalls += 1;
+        return resolveStorageCompatibleFormat(fmt, opts);
+      },
+    });
+
+    const stream = concat(
+      createTexture2Packet({
+        id: 10,
+        width: 32,
+        height: 32,
+        format: bgraCode,
+        usage: 0x04 | 0x08,
+        viewFormats: [bgraSrgbCode],
+      }),
+      createTexture2Packet({
+        id: 11,
+        width: 32,
+        height: 32,
+        format: r16FloatCode,
+        usage: 0x04 | 0x08,
+      }),
+      bindGroupLayoutPacket(20, [
+        { binding: 0, visibility: 4, type: 3, subtype: 0, dimension: 2, storageFormat: bgraSrgbCode },
+        { binding: 1, visibility: 4, type: 3, subtype: 0, dimension: 2, storageFormat: rgbaSrgbCode },
+        { binding: 2, visibility: 4, type: 3, subtype: 0, dimension: 2, storageFormat: r16FloatCode },
+      ]),
+      bindGroup2Packet(30, 20, [
+        { binding: 0, type: 1, id: 10, view: viewDesc({ format: bgraSrgbCode, dimension: 2 }) },
+        { binding: 1, type: 1, id: 0 },
+        { binding: 2, type: 1, id: 11, view: viewDesc({ format: r16FloatCode, dimension: 2 }) },
+      ])
+    );
+
+    processor.executeCommandBuffer(stream);
+    assert.equal(handler.stats.errors, 0, handler.lastError);
+    assert.ok(helperCalls > 0, 'resolveStorageCompatibleFormat helper must be invoked');
+
+    const [bgl] = gpu.results('createBindGroupLayout');
+    assert.equal(bgl.desc.entries[0].storageTexture.format, 'bgra8unorm');
+    assert.equal(bgl.desc.entries[1].storageTexture.format, 'rgba8unorm');
+    assert.equal(bgl.desc.entries[2].storageTexture.format, 'r16float');
+
+    const [bg] = gpu.results('createBindGroup');
+    const linearBgraView = gpu
+      .results('texture.createView')
+      .find((v) => v.result === bg.desc.entries[0].resource);
+    assert.equal(
+      linearBgraView.desc.format,
+      'bgra8unorm',
+      'sRGB storage texture binding must rewrite view format to linear sibling bgra8unorm'
+    );
+  }
+
+  // 2) Device WITHOUT bgra8unorm-storage / texture-formats-tier1:
+  //    - bgra8unorm-srgb and r16float fall back to rgba8unorm with reason-annotated warnings
+  //    - binding an unsupported depth32float texture to a storageTexture slot falls back to a safe dummy
+  {
+    const gpu = createMockWebGpu();
+    gpu.device.features = new Set();
+    const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { format: 'bgra8unorm' });
+    const handler = installRenderStatePackets(processor);
+
+    const stream = concat(
+      createTexture2Packet({ id: 12, width: 16, height: 16, format: depth32Code, usage: 0x04 | 0x10 }),
+      bindGroupLayoutPacket(21, [
+        { binding: 0, visibility: 4, type: 3, subtype: 0, dimension: 2, storageFormat: bgraSrgbCode },
+        { binding: 1, visibility: 4, type: 3, subtype: 0, dimension: 2, storageFormat: r16FloatCode },
+      ]),
+      bindGroup2Packet(31, 21, [
+        { binding: 0, type: 1, id: 12 },
+        { binding: 1, type: 1, id: 0 },
+      ])
+    );
+
+    processor.executeCommandBuffer(stream);
+    assert.equal(handler.stats.errors, 0, handler.lastError);
+
+    const [bgl] = gpu.results('createBindGroupLayout');
+    assert.equal(bgl.desc.entries[0].storageTexture.format, 'rgba8unorm');
+    assert.equal(bgl.desc.entries[1].storageTexture.format, 'rgba8unorm');
+
+    const warnings = handler.getTelemetry().warnings;
+    assert.ok(warnings.some((w) => w.includes('missing-bgra8unorm-storage')));
+    assert.ok(warnings.some((w) => w.includes('missing-texture-formats-tier1')));
+    assert.ok(warnings.some((w) => w.includes('depth-stencil-not-storage-compatible')));
+
+    const [bg] = gpu.results('createBindGroup');
+    const dummyStorageTex = gpu.results('createTexture').at(-1);
+    assert.equal(dummyStorageTex.desc.format, 'rgba8unorm');
+    assert.equal(bg.desc.entries[0].resource.textureHandle, dummyStorageTex.result.handle);
+  }
+});
+
+test('W186 (#927): W167 getOrCreateDefaultSampler synthesizes filtering/comparison/non-filtering samplers for 0, missing, omitted, and auto-remapped bindings', () => {
+  const { WebGpuPipelineCache } = require('../web/workers/pipeline_cache.js');
+  const gpu = createMockWebGpu();
+  const pipelineCache = new WebGpuPipelineCache({ device: gpu.device });
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, {
+    format: 'bgra8unorm',
+    pipelineCache,
+  });
+  const handler = installRenderStatePackets(processor);
+
+  assert.equal(handler.getStats().fallbackSamplersBound, 0);
+  assert.equal(handler.getTelemetry().fallbackSamplersBound, 0);
+
+  // Explicit layout with filtering (binding 1), comparison (binding 2), and omitted non-filtering (binding 3).
+  const bglEntries = [
+    { binding: 0, visibility: 6, type: 2, subtype: 0, dimension: 2 },
+    { binding: 1, visibility: 6, type: 1, subtype: 0 }, // filtering
+    { binding: 2, visibility: 6, type: 1, subtype: 2 }, // comparison
+    { binding: 3, visibility: 6, type: 1, subtype: 1 }, // non-filtering
+  ];
+
+  // Bind group 50: sampler handle 0 at @1, missing sampler handle 777 at @2, and @3 omitted completely!
+  const stream1 = concat(
+    createTexture2Packet({ id: 10, width: 16, height: 16, format: formatCodeOf('rgba8unorm'), usage: 0x04 }),
+    bindGroupLayoutPacket(40, bglEntries),
+    bindGroup2Packet(50, 40, [
+      { binding: 0, type: 1, id: 10 },
+      { binding: 1, type: 2, id: 0 }, // 0 handle -> filtering default
+      { binding: 2, type: 2, id: 777 }, // missing handle -> comparison default (no packet error!)
+      // binding 3 omitted -> synthesized non-filtering default!
+    ])
+  );
+  processor.executeCommandBuffer(stream1);
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  assert.equal(handler.getStats().fallbackSamplersBound, 3);
+  assert.equal(handler.getTelemetry().fallbackSamplersBound, 3);
+  assert.equal(pipelineCache.getStats().fallbackSamplersCreated, 3);
+
+  const [bg50] = gpu.results('createBindGroup');
+  assert.equal(bg50.desc.entries.length, 4);
+  assert.equal(bg50.desc.entries[1].resource, pipelineCache.getOrCreateDefaultSampler('filtering'));
+  assert.equal(bg50.desc.entries[2].resource, pipelineCache.getOrCreateDefaultSampler('comparison'));
+  assert.equal(bg50.desc.entries[3].resource, pipelineCache.getOrCreateDefaultSampler('non-filtering'));
+  assert.equal(bg50.desc.entries[1].resource.desc.magFilter, 'linear');
+  assert.equal(bg50.desc.entries[2].resource.desc.compare, 'less-equal');
+  assert.equal(bg50.desc.entries[3].resource.desc.magFilter, 'nearest');
+
+  // Second bind group with missing/0 samplers reuses pipelineCache's cached samplers (zero new createSampler calls).
+  const samplersBefore = gpu.results('createSampler').length;
+  processor.executeCommandBuffer(
+    bindGroup2Packet(51, 40, [
+      { binding: 0, type: 1, id: 10 },
+      { binding: 1, type: 2, id: 0 },
+      { binding: 2, type: 2, id: 888 },
+    ])
+  );
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  assert.equal(gpu.results('createSampler').length, samplersBefore);
+  assert.equal(handler.getStats().fallbackSamplersBound, 6);
+
+  // Auto-layout remap on a compute dispatch whose WGSL uses both sampler and sampler_comparison
+  // when bound group has no real samplers: synthesizes via pipelineCache.getOrCreateDefaultSampler.
+  const origCreateCompute = gpu.device.createComputePipeline.bind(gpu.device);
+  gpu.device.createComputePipeline = (desc) => {
+    const pipe = origCreateCompute(desc);
+    pipe.getBindGroupLayout = () => ({ kind: 'GPUBindGroupLayout', autoFor: pipe.handle });
+    return pipe;
+  };
+  const csWgsl = `
+    @group(0) @binding(0) var srcTex: texture_2d<f32>;
+    @group(0) @binding(1) var linSmp: sampler;
+    @group(0) @binding(2) var cmpSmp: sampler_comparison;
+    @compute @workgroup_size(1) fn cs_main() {
+      let _a = textureSampleLevel(srcTex, linSmp, vec2<f32>(0.5), 0.0);
+      let _b = cmpSmp;
+    }
+  `;
+  const mismatchBgl = bindGroupLayoutPacket(41, [
+    { binding: 0, visibility: 4, type: 0, subtype: 0, minBindingSize: 16 },
+  ]);
+  const mismatchPl = pipelineLayoutPacket(42, [41]);
+  const csPipePayload = new Uint8Array(32);
+  const cpv = new DataView(csPipePayload.buffer);
+  cpv.setUint32(0, 60, true);
+  cpv.setUint32(4, 61, true);
+  cpv.setUint32(8, 42, true);
+
+  processor.executeCommandBuffer(
+    concat(
+      new Stream().packet(OPCODES.BEGIN_FRAME).shader(61, 2, csWgsl).bytes(),
+      mismatchBgl,
+      mismatchPl,
+      header(V2_OPCODES.CREATE_COMPUTE_PIPELINE2, csPipePayload),
+      new Stream()
+        .u32s(OPCODES.SET_COMPUTE_PIPELINE, [60])
+        .u32s(OPCODES.DISPATCH_COMPUTE, [1, 1, 1])
+        .packet(OPCODES.PRESENT)
+        .bytes()
+    )
+  );
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  assert.equal(handler.getStats().fallbackSamplersBound, 8);
+  assert.equal(gpu.results('createSampler').length, samplersBefore);
+
+  const remappedBg = gpu.results('createBindGroup').at(-1);
+  assert.equal(remappedBg.desc.entries[1].resource, pipelineCache.getOrCreateDefaultSampler('filtering'));
+  assert.equal(remappedBg.desc.entries[2].resource, pipelineCache.getOrCreateDefaultSampler('comparison'));
+});
+
+test('W186 (#927): PresentX multi-plane bind-group/view cache eliminates per-frame allocations across 60 frames and invalidates cleanly', () => {
+  const gpu = createMockWebGpu();
+  gpu.ctx.canvas = { width: 1280, height: 720 };
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { format: 'bgra8unorm' });
+  const handler = installRenderStatePackets(processor);
+
+  const bgraCode = formatCodeOf('bgra8unorm');
+  const rgbaCode = formatCodeOf('rgba8unorm');
+
+  // Setup: alternating 4K scene textures (#2, #3), 1080p UI overlay (#10), PresentX blit shaders/layout/pipelines.
+  processor.executeCommandBuffer(
+    concat(
+      createTexture2Packet({ id: 2, width: 3840, height: 2160, format: bgraCode, usage: 0x14 }),
+      createTexture2Packet({ id: 3, width: 3840, height: 2160, format: bgraCode, usage: 0x14 }),
+      createTexture2Packet({ id: 10, width: 1920, height: 1080, format: rgbaCode, usage: 0x14 }),
+      new Stream()
+        .shader(101, 0, PRESENT_BLIT_VS_WGSL)
+        .shader(102, 1, PRESENT_BLIT_FS_WGSL)
+        .bytes(),
+      bindGroupLayoutPacket(103, [
+        { binding: 0, visibility: 2, type: 2, subtype: 0, dimension: 2 },
+        { binding: 1, visibility: 2, type: 1, subtype: 0 },
+      ]),
+      pipelineLayoutPacket(104, [103]),
+      createSampler2Packet(105, { filter: 1 }),
+      renderPipeline2Packet(110, 101, 102, 104, buildPresentBlitPipelineKey({ canvasFormatCode: bgraCode, blended: false })),
+      renderPipeline2Packet(111, 101, 102, 104, buildPresentBlitPipelineKey({ canvasFormatCode: bgraCode, blended: true }))
+    )
+  );
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+
+  const viewsBeforeLoop = gpu.results('texture.createView').length;
+  const bgsBeforeLoop = gpu.results('createBindGroup').length;
+  assert.equal(bgsBeforeLoop, 0);
+
+  // Simulate 60 frames of multi-plane PresentX where the guest/host allocates fresh bind-group IDs
+  // each frame and retires the previous frame's bind-group IDs via DestroyResource.
+  let nextBgId = 1000;
+  let prevPlane1Bg = 0;
+  let prevPlane0Bg = 0;
+  for (let frame = 0; frame < 60; frame += 1) {
+    const sceneTexId = frame % 2 === 0 ? 2 : 3;
+    const plane1BgId = nextBgId++;
+    const plane0BgId = nextBgId++;
+    const parts = [new Stream().packet(OPCODES.BEGIN_FRAME).bytes()];
+    if (prevPlane1Bg > 0) {
+      parts.push(
+        new Stream()
+          .u32s(OPCODES.DESTROY_RESOURCE, [prevPlane1Bg])
+          .u32s(OPCODES.DESTROY_RESOURCE, [prevPlane0Bg])
+          .bytes()
+      );
+    }
+    parts.push(
+      bindGroup2Packet(plane1BgId, 103, [
+        { binding: 0, type: 1, id: sceneTexId, view: viewDesc({ dimension: 2, mipCount: 1, layerCount: 1 }) },
+        { binding: 1, type: 2, id: 105 },
+      ]),
+      bindGroup2Packet(plane0BgId, 103, [
+        { binding: 0, type: 1, id: 10, view: viewDesc({ dimension: 2, mipCount: 1, layerCount: 1 }) },
+        { binding: 1, type: 2, id: 105 },
+      ]),
+      presentBeginRenderPassPacket({ formatCode: bgraCode, loadOp: 2, storeOp: 1, clearValue: [0, 0, 0, 1] }),
+      new Stream().u32s(OPCODES.SET_PIPELINE, [110]).bytes(),
+      setBindGroup2Packet(0, plane1BgId, []),
+      new Stream().u32s(OPCODES.DRAW, [3, 1, 0, 0]).bytes(),
+      new Stream().u32s(OPCODES.SET_PIPELINE, [111]).bytes(),
+      setBindGroup2Packet(0, plane0BgId, []),
+      new Stream().u32s(OPCODES.DRAW, [3, 1, 0, 0]).bytes(),
+      header(V2_OPCODES.END_RENDER_PASS, new Uint8Array(0)),
+      new Stream().packet(OPCODES.PRESENT).bytes()
+    );
+    const res = processor.executeCommandBuffer(concat(...parts));
+    assert.equal(res.presents, 1);
+    assert.equal(handler.stats.errors, 0, handler.lastError);
+    prevPlane1Bg = plane1BgId;
+    prevPlane0Bg = plane0BgId;
+  }
+
+  // Only 3 distinct plane textures (#2, #3, #10) -> exactly 3 views + 3 bind groups created across all 60 frames!
+  assert.equal(gpu.results('texture.createView').length - viewsBeforeLoop, 3);
+  assert.equal(gpu.results('createBindGroup').length, 3);
+  assert.equal(handler.getStats().presentxBindGroupCacheMisses, 3);
+  assert.equal(handler.getStats().presentxBindGroupCacheHits, 117);
+  assert.equal(handler.getTelemetry().presentxBindGroupCacheMisses, 3);
+  assert.equal(handler.getTelemetry().presentxBindGroupCacheHits, 117);
+
+  // Invalidation 1: Recreating plane texture #2 (CreateTexture2) invalidates cached view & bind group for #2 only.
+  const bgsBeforeTexRecreate = gpu.results('createBindGroup').length;
+  processor.executeCommandBuffer(
+    concat(
+      createTexture2Packet({ id: 2, width: 3840, height: 2160, format: bgraCode, usage: 0x14 }),
+      bindGroup2Packet(2000, 103, [
+        { binding: 0, type: 1, id: 2, view: viewDesc({ dimension: 2, mipCount: 1, layerCount: 1 }) },
+        { binding: 1, type: 2, id: 105 },
+      ]),
+      bindGroup2Packet(2001, 103, [
+        { binding: 0, type: 1, id: 10, view: viewDesc({ dimension: 2, mipCount: 1, layerCount: 1 }) },
+        { binding: 1, type: 2, id: 105 },
+      ])
+    )
+  );
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  assert.equal(gpu.results('createBindGroup').length, bgsBeforeTexRecreate + 1, 'only recreated plane #2 must miss');
+  assert.equal(handler.getStats().presentxBindGroupCacheMisses, 4);
+  assert.equal(handler.getStats().presentxBindGroupCacheHits, 118);
+
+  // Invalidation 2: Silent texture handle replacement in processor.textures (v1 CreateTexture style) invalidates cleanly.
+  const replacementTex10 = gpu.device.createTexture({
+    size: { width: 1920, height: 1080, depthOrArrayLayers: 1 },
+    format: 'rgba8unorm',
+    usage: 0x14,
+  });
+  processor.textures.set(10, replacementTex10);
+  const bgsBeforeSilentReplace = gpu.results('createBindGroup').length;
+  processor.executeCommandBuffer(
+    bindGroup2Packet(2002, 103, [
+      { binding: 0, type: 1, id: 10, view: viewDesc({ dimension: 2, mipCount: 1, layerCount: 1 }) },
+      { binding: 1, type: 2, id: 105 },
+    ])
+  );
+  assert.equal(gpu.results('createBindGroup').length, bgsBeforeSilentReplace + 1);
+  assert.equal(gpu.results('createBindGroup').at(-1).desc.entries[0].resource.textureHandle, replacementTex10.handle);
+  assert.equal(handler.getStats().presentxBindGroupCacheMisses, 5);
+
+  // Invalidation 3: Sampler overwritten via CreateSampler2 invalidates cached bind groups using that sampler.
+  const bgsBeforeSamplerReplace = gpu.results('createBindGroup').length;
+  processor.executeCommandBuffer(
+    concat(
+      createSampler2Packet(105, { filter: 0 }),
+      bindGroup2Packet(2003, 103, [
+        { binding: 0, type: 1, id: 2, view: viewDesc({ dimension: 2, mipCount: 1, layerCount: 1 }) },
+        { binding: 1, type: 2, id: 105 },
+      ])
+    )
+  );
+  assert.equal(gpu.results('createBindGroup').length, bgsBeforeSamplerReplace + 1);
+  assert.equal(handler.getStats().presentxBindGroupCacheMisses, 6);
+
+  // Invalidation 4: Direct getOrCreatePresentXPlaneBindGroup keys on (planeTextureId, viewFormat, sampler, pipeline),
+  // invalidates on device change, reset(), and returns null after destroy().
+  const pipe110 = processor.pipelines.get(110);
+  const pipe111 = processor.pipelines.get(111);
+  const layout103 = handler.bindGroupLayouts.get(103).layout;
+  const smp105 = processor.samplers.get(105);
+
+  const px1 = handler.getOrCreatePresentXPlaneBindGroup({
+    planeTextureId: 2,
+    viewFormat: 'bgra8unorm',
+    sampler: smp105,
+    samplerId: 105,
+    pipeline: pipe110,
+    pipelineId: 110,
+    layout: layout103,
+    layoutId: 103,
+  });
+  assert.ok(px1 && px1.hit === false);
+  const px1Again = handler.getOrCreatePresentXPlaneBindGroup({
+    planeTextureId: 2,
+    viewFormat: 'bgra8unorm',
+    sampler: smp105,
+    samplerId: 105,
+    pipeline: pipe110,
+    pipelineId: 110,
+    layout: layout103,
+    layoutId: 103,
+  });
+  assert.ok(px1Again && px1Again.hit === true);
+  assert.equal(px1Again.bindGroup, px1.bindGroup);
+  assert.equal(px1Again.view, px1.view);
+
+  // Different pipeline (blended plane 0 vs opaque plane 1) gets its own cache key.
+  const pxDifferentPipe = handler.getOrCreatePresentXPlaneBindGroup({
+    planeTextureId: 2,
+    viewFormat: 'bgra8unorm',
+    sampler: smp105,
+    samplerId: 105,
+    pipeline: pipe111,
+    pipelineId: 111,
+    layout: layout103,
+    layoutId: 103,
+  });
+  assert.ok(pxDifferentPipe && pxDifferentPipe.hit === false);
+  assert.notEqual(pxDifferentPipe.bindGroup, px1.bindGroup);
+
+  // Different viewFormat gets its own cache key.
+  const pxDifferentFmt = handler.getOrCreatePresentXPlaneBindGroup({
+    planeTextureId: 2,
+    viewFormat: 'bgra8unorm-srgb',
+    sampler: smp105,
+    samplerId: 105,
+    pipeline: pipe110,
+    pipelineId: 110,
+    layout: layout103,
+    layoutId: 103,
+  });
+  assert.ok(pxDifferentFmt && pxDifferentFmt.hit === false);
+
+  // Device generation change flushes PresentX cache automatically.
+  const gpu2 = createMockWebGpu();
+  const tex2NewDev = gpu2.device.createTexture({
+    size: { width: 3840, height: 2160, depthOrArrayLayers: 1 },
+    format: 'bgra8unorm',
+    usage: 0x14,
+  });
+  const smpNewDev = gpu2.device.createSampler({});
+  const layoutNewDev = gpu2.device.createBindGroupLayout({ entries: [] });
+  processor.device = gpu2.device;
+  processor._deviceGeneration = (processor._deviceGeneration || 0) + 1;
+  processor.textures.set(2, tex2NewDev);
+
+  const pxAfterDeviceChange = handler.getOrCreatePresentXPlaneBindGroup({
+    planeTextureId: 2,
+    viewFormat: 'bgra8unorm',
+    sampler: smpNewDev,
+    pipeline: pipe110,
+    pipelineId: 110,
+    layout: layoutNewDev,
+  });
+  assert.ok(pxAfterDeviceChange && pxAfterDeviceChange.hit === false);
+  assert.equal(gpu2.results('createBindGroup').length, 1);
+
+  // reset() invalidates cache cleanly; subsequent call misses and recreates.
+  handler.reset();
+  assert.equal(handler.presentxBindGroupCache.size, 0);
+  const pxAfterReset = handler.getOrCreatePresentXPlaneBindGroup({
+    planeTextureId: 2,
+    viewFormat: 'bgra8unorm',
+    sampler: smpNewDev,
+    pipeline: pipe110,
+    pipelineId: 110,
+    layout: layoutNewDev,
+  });
+  assert.ok(pxAfterReset && pxAfterReset.hit === false);
+  assert.equal(gpu2.results('createBindGroup').length, 2);
+
+  // destroy() clears everything and prevents further allocations.
+  handler.destroy();
+  assert.equal(handler.presentxBindGroupCache.size, 0);
+  assert.equal(
+    handler.getOrCreatePresentXPlaneBindGroup({
+      planeTextureId: 2,
+      viewFormat: 'bgra8unorm',
+      sampler: smpNewDev,
+      pipeline: pipe110,
+      layout: layoutNewDev,
+    }),
+    null
+  );
+});
