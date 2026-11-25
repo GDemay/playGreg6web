@@ -27,6 +27,8 @@ import ntpath
 import os
 import posixpath
 import re
+import socket
+import stat
 import sys
 import tempfile
 import threading
@@ -50,7 +52,10 @@ DUMP_URL_PREFIX = "/__pg6_dump/"
 DEFAULT_MAX_DUMP_FILE_BYTES = 64 * 1024 * 1024  # 64 MiB default cap per dumped file
 _DUMP_WRITE_LOCK = threading.Lock()
 
-STREAM_CHUNK_SIZE = 1024 * 1024  # 1 MiB streaming buffer for large .pgim/.wasm/Range reads
+STREAM_CHUNK_BYTES = 1024 * 1024  # 1 MiB streaming buffer for large .pgim/.wasm/Range reads
+STREAM_CHUNK_SIZE = STREAM_CHUNK_BYTES  # Backwards-compatible alias
+SOCKET_SNDBUF_BYTES = 1024 * 1024  # 1 MiB TCP send buffer hint for loopback Range throughput
+_STREAM_BUFFERS = threading.local()
 KEEP_ALIVE_TIMEOUT = 30.0  # Idle socket timeout (seconds) for HTTP/1.1 keep-alive connections
 ALLOWED_METHODS = "GET, HEAD, OPTIONS"
 DUMP_ALLOWED_METHODS = "POST, OPTIONS"
@@ -224,6 +229,31 @@ def if_range_matches(header_value: str, etag: str, last_modified: str, mtime: fl
     if parsed_dt.tzinfo is None:
         parsed_dt = parsed_dt.replace(tzinfo=timezone.utc)
     return int(parsed_dt.timestamp()) == int(mtime)
+
+
+def if_modified_since_not_modified(header_value: str, mtime: float) -> bool:
+    """Evaluate RFC 9110 Section 13.1.3 `If-Modified-Since` (1-second HTTP-date granularity)."""
+    value = header_value.strip()
+    if not value:
+        return False
+    try:
+        parsed_dt = parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError):
+        return False
+    if parsed_dt is None:
+        return False
+    if parsed_dt.tzinfo is None:
+        parsed_dt = parsed_dt.replace(tzinfo=timezone.utc)
+    return int(mtime) <= int(parsed_dt.timestamp())
+
+
+def _get_thread_stream_buffer(chunk_bytes: int) -> bytearray:
+    """Return a reusable per-thread `bytearray` of `chunk_bytes` for zero-alloc streaming."""
+    buf: bytearray | None = getattr(_STREAM_BUFFERS, "buf", None)
+    if buf is None or len(buf) != chunk_bytes:
+        buf = bytearray(chunk_bytes)
+        _STREAM_BUFFERS.buf = buf
+    return buf
 
 
 def _count_shader_packs(web_root: Path, data_root: Path, shaders_root: Path | None = None) -> int:
@@ -589,6 +619,7 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
         dump_root: Path | None = None,
         max_dump_file_bytes: int = DEFAULT_MAX_DUMP_FILE_BYTES,
         keep_alive_timeout: float | None = None,
+        stream_chunk_bytes: int | None = None,
         **kwargs,
     ):
         self.web_root = web_root
@@ -600,10 +631,37 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
         self.max_dump_file_bytes = max_dump_file_bytes
         if keep_alive_timeout is not None:
             self.timeout = keep_alive_timeout
+        self._stream_chunk_bytes = stream_chunk_bytes
         self._headers_sent = False
         self._connection_header_sent = False
         self._client_requested_close = False
         super().__init__(*args, **kwargs)
+
+    def setup(self) -> None:
+        super().setup()
+        self._configure_client_socket()
+
+    def _configure_client_socket(self) -> None:
+        conn = getattr(self, "connection", None)
+        if conn is None or not hasattr(conn, "setsockopt"):
+            return
+        try:
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        if SOCKET_SNDBUF_BYTES > 0:
+            try:
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_SNDBUF_BYTES)
+            except OSError:
+                pass
+
+    def _get_stream_chunk_bytes(self) -> int:
+        configured = getattr(self, "_stream_chunk_bytes", None)
+        if configured is not None:
+            return configured
+        if STREAM_CHUNK_BYTES != 1024 * 1024:
+            return STREAM_CHUNK_BYTES
+        return STREAM_CHUNK_SIZE
 
     def _request_has_unconsumed_body(self) -> bool:
         if not hasattr(self, "headers") or self.headers is None:
@@ -814,19 +872,70 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
                 self.close_connection = True
                 raise
 
+    def _send_not_modified(self, etag: str, last_modified: str) -> None:
+        self.send_response(HTTPStatus.NOT_MODIFIED)
+        self.send_header("ETag", etag)
+        self.send_header("Last-Modified", last_modified)
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+
+    def _stream_file_range(self, f: Any, length: int) -> None:
+        chunk_bytes = max(1, self._get_stream_chunk_bytes())
+        readinto = getattr(f, "readinto", None)
+        use_fast_buffer = callable(readinto) and hasattr(self.wfile, "_sock")
+
+        remaining = length
+        if use_fast_buffer:
+            buf = _get_thread_stream_buffer(chunk_bytes)
+            mv = memoryview(buf)
+            while remaining > 0:
+                to_read = chunk_bytes if remaining > chunk_bytes else remaining
+                n = readinto(mv[:to_read])
+                if not n:
+                    # File shrank mid-stream after Content-Length was emitted:
+                    # force socket close so HTTP/1.1 framing cannot desynchronize.
+                    self.close_connection = True
+                    break
+                remaining -= n
+                if remaining == 0:
+                    # Release the file before the last bytes reach the client: once the
+                    # response is complete the file can be replaced or deleted (Windows
+                    # refuses to delete a file that is still open).
+                    f.close()
+                self.wfile.write(mv[:n])
+            return
+
+        while remaining > 0:
+            chunk = f.read(min(chunk_bytes, remaining))
+            if not chunk:
+                # File shrank mid-stream after Content-Length was emitted:
+                # force socket close so HTTP/1.1 framing cannot desynchronize.
+                self.close_connection = True
+                break
+            remaining -= len(chunk)
+            if remaining == 0:
+                # Release the file before the last bytes reach the client: once the
+                # response is complete the file can be replaced or deleted (Windows
+                # refuses to delete a file that is still open).
+                f.close()
+            self.wfile.write(chunk)
+
     def _serve_file(self, url_path: str, send_body: bool) -> None:
         resolved = self._resolve_target(url_path)
         if isinstance(resolved, tuple):
             self._send_empty(resolved[1])
             return
         target = resolved
-        if target is None or not target.is_file():
+        if target is None:
             self._send_empty(HTTPStatus.NOT_FOUND)
             return
 
         try:
             st = target.stat()
         except OSError:
+            self._send_empty(HTTPStatus.NOT_FOUND)
+            return
+        if not stat.S_ISREG(st.st_mode):
             self._send_empty(HTTPStatus.NOT_FOUND)
             return
 
@@ -839,13 +948,15 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
             if_none_match = ", ".join(raw_if_none_match) if raw_if_none_match else None
         else:
             if_none_match = self.headers.get("If-None-Match")
-        if if_none_match and etag_matches_if_none_match(if_none_match, etag):
-            self.send_response(HTTPStatus.NOT_MODIFIED)
-            self.send_header("ETag", etag)
-            self.send_header("Last-Modified", last_modified)
-            self.send_header("Cache-Control", "no-cache")
-            self.end_headers()
-            return
+        if if_none_match:
+            if etag_matches_if_none_match(if_none_match, etag):
+                self._send_not_modified(etag, last_modified)
+                return
+        else:
+            if_modified_since = self.headers.get("If-Modified-Since")
+            if if_modified_since and if_modified_since_not_modified(if_modified_since, st.st_mtime):
+                self._send_not_modified(etag, last_modified)
+                return
 
         content_type, _ = mimetypes.guess_type(str(target))
         content_type = content_type or "application/octet-stream"
@@ -899,24 +1010,10 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
 
         try:
             with f:
-                f.seek(start)
+                if start > 0:
+                    f.seek(start)
                 send_file_headers()
-
-                remaining = length
-                while remaining > 0:
-                    chunk = f.read(min(STREAM_CHUNK_SIZE, remaining))
-                    if not chunk:
-                        # File shrank mid-stream after Content-Length was emitted:
-                        # force socket close so HTTP/1.1 framing cannot desynchronize.
-                        self.close_connection = True
-                        break
-                    remaining -= len(chunk)
-                    if remaining == 0:
-                        # Release the file before the last bytes reach the client: once the
-                        # response is complete the file can be replaced or deleted (Windows
-                        # refuses to delete a file that is still open).
-                        f.close()
-                    self.wfile.write(chunk)
+                self._stream_file_range(f, length)
         except CLIENT_DISCONNECT_ERRORS:
             self.close_connection = True
             return
@@ -1043,8 +1140,9 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
             ) as tmp_file:
                 tmp_path = Path(tmp_file.name)
                 remaining = content_length
+                chunk_bytes = max(1, self._get_stream_chunk_bytes())
                 while remaining > 0:
-                    chunk = self.rfile.read(min(STREAM_CHUNK_SIZE, remaining))
+                    chunk = self.rfile.read(min(chunk_bytes, remaining))
                     if not chunk:
                         self._send_json(
                             HTTPStatus.BAD_REQUEST,
@@ -1090,8 +1188,9 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
                         )
                         return
                     with target.open("ab") as dest, tmp_path.open("rb") as src:
+                        chunk_bytes = max(1, self._get_stream_chunk_bytes())
                         while True:
-                            buf = src.read(STREAM_CHUNK_SIZE)
+                            buf = src.read(chunk_bytes)
                             if not buf:
                                 break
                             dest.write(buf)
@@ -1177,9 +1276,12 @@ def create_server(
     dump_root: Path | None = None,
     max_dump_file_bytes: int = DEFAULT_MAX_DUMP_FILE_BYTES,
     keep_alive_timeout: float | None = None,
+    stream_chunk_bytes: int | None = None,
 ) -> QuietThreadingHTTPServer:
     if max_dump_file_bytes < 0:
         raise ValueError("max_dump_file_bytes must be >= 0")
+    if stream_chunk_bytes is not None and stream_chunk_bytes <= 0:
+        raise ValueError("stream_chunk_bytes must be > 0")
     handler = partial(
         PlayGta6Handler,
         web_root=web_root,
@@ -1190,6 +1292,7 @@ def create_server(
         dump_root=dump_root,
         max_dump_file_bytes=max_dump_file_bytes,
         keep_alive_timeout=keep_alive_timeout,
+        stream_chunk_bytes=stream_chunk_bytes,
     )
     return QuietThreadingHTTPServer((host, port), handler)
 
