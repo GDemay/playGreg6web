@@ -2399,6 +2399,17 @@ void BindGroupCache::clear(std::vector<uint32_t>* retired) {
     entries_.clear();
 }
 
+uint32_t BindGroupCache::erase(const CachedBindGroup* group) {
+    for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+        if (it->second.get() == group) {
+            const uint32_t id = it->second->gpu_id;
+            entries_.erase(it);
+            return id;
+        }
+    }
+    return 0;
+}
+
 size_t BindGroupCache::end_epoch(size_t max_entries, std::vector<uint32_t>* retired) {
     size_t dropped = 0;
     if (entries_.size() > max_entries) {

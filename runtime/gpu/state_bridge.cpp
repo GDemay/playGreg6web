@@ -183,6 +183,7 @@ void StateBridgeDevice::register_texture(uint32_t resource_id, const TextureInfo
             }
         }
         textures_[resource_id] = info;
+        retired_resources_.erase(resource_id);
         if (info.gpu_va != 0) {
             textures_by_va_[info.gpu_va] = resource_id;
         }
@@ -190,6 +191,11 @@ void StateBridgeDevice::register_texture(uint32_t resource_id, const TextureInfo
     if (replaced) {
         retire_intermediates(resource_id);  // a new description: intermediates of the old one are stale
     }
+}
+
+bool StateBridgeDevice::retired(uint32_t resource_id) const {
+    std::shared_lock lock(resources_mutex_);
+    return retired_resources_.count(resource_id) != 0;
 }
 
 uint32_t StateBridgeDevice::texture_at(uint64_t gpu_va) const {
@@ -205,6 +211,7 @@ void StateBridgeDevice::register_buffer(uint32_t resource_id, uint64_t gpu_va, u
         buffers_by_va_.erase(it->second);
     }
     buffers_by_va_[gpu_va] = {resource_id, byte_size};
+    retired_resources_.erase(resource_id);
     buffer_va_[resource_id] = gpu_va;
     buffer_allocated_[resource_id] = std::max(byte_size, allocated_size);
 }
@@ -224,18 +231,25 @@ uint64_t StateBridgeDevice::buffer_gpu_va(uint32_t resource_id) const {
 void StateBridgeDevice::unregister_resource(uint32_t resource_id) {
     {
         std::unique_lock lock(resources_mutex_);
+        bool known = false;
         if (auto it = textures_.find(resource_id); it != textures_.end()) {
             if (auto v = textures_by_va_.find(it->second.gpu_va);
                 v != textures_by_va_.end() && v->second == resource_id) {
                 textures_by_va_.erase(v);
             }
             textures_.erase(it);
+            known = true;
         }
         if (auto it = buffer_va_.find(resource_id); it != buffer_va_.end()) {
             buffers_by_va_.erase(it->second);
             buffer_va_.erase(it);
+            known = true;
         }
         buffer_allocated_.erase(resource_id);
+        if (known && resource_id != 0) {
+            retired_resources_.insert(resource_id);
+            retire_epoch_.fetch_add(1, std::memory_order_acq_rel);
+        }
     }
     retire_views(resource_id);
     retire_intermediates(resource_id);
@@ -1408,6 +1422,7 @@ bool CommandListBridge::emit_bind_group(d3d::BindPoint /*bind_point*/,
     gpu_entries(group, *cached, encoder_, &entries);
     cached->relocations = pending_relocations_;
     cached->relocation_epoch = device_.options().relocation_epoch ? device_.options().relocation_epoch() : 0;
+    cached->retire_epoch = device_.retire_epoch();
     GpuCreateBindGroup2Payload header{};
     header.id = device_.allocate_id();
     header.layout_id = group.id;
@@ -1426,6 +1441,21 @@ bool CommandListBridge::emit_bind_group(d3d::BindPoint /*bind_point*/,
         note_memory_group(group, *plan, *cached, encoder_.size() - entry_bytes);
     }
     return true;
+}
+
+bool CommandListBridge::binds_retired(d3d::CachedBindGroup* cached) const {
+    const uint64_t epoch = device_.retire_epoch();
+    if (epoch == cached->retire_epoch) {
+        return false;
+    }
+    for (const d3d::BindGroupEntry& e : cached->entries) {
+        if ((e.kind == d3d::BindResourceKind::TextureView || e.kind == d3d::BindResourceKind::Buffer) &&
+            e.resource_id != 0 && device_.retired(e.resource_id)) {
+            return true;
+        }
+    }
+    cached->retire_epoch = epoch;
+    return false;
 }
 
 bool CommandListBridge::relocations_moved(d3d::CachedBindGroup* cached) {
@@ -1563,6 +1593,11 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
         switch (e.kind) {
         case d3d::BindResourceKind::Buffer:
             out.resource_type = static_cast<uint32_t>(GpuBindResourceType::Buffer);
+            if (e.resource_id != 0 && device_.retired(e.resource_id)) {
+                diagnostics_ |= BridgeDiag::NullBinding;  // G66 (#691): destroyed buffer, see TextureView
+                ++stats_.retired_resources_nulled;
+                break;
+            }
             out.resource_id = e.resource_id;
             out.offset = e.offset;
             out.size = e.size;
@@ -1673,6 +1708,13 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
             break;
         case d3d::BindResourceKind::TextureView:
             out.resource_type = static_cast<uint32_t>(GpuBindResourceType::TextureView);
+            if (e.resource_id != 0 && device_.retired(e.resource_id)) {
+                // G66 (#691): a stale descriptor of a destroyed texture (the title released it and
+                // left the slot): binding it would invalidate the whole submit. Bound null.
+                diagnostics_ |= BridgeDiag::NullBinding;
+                ++stats_.retired_resources_nulled;
+                break;
+            }
             out.resource_id = e.resource_id;
             out.view = texture_view_desc(e.view);
             if (layout.type == static_cast<uint8_t>(GpuBindingLayoutType::StorageTexture)) {
@@ -1870,8 +1912,24 @@ bool CommandListBridge::apply_bind_groups(d3d::BindPoint bind_point,
             const uint64_t cb_misses_before = bind_groups_.cb_index_misses();
             const uint64_t hits_before = bind_groups_.hits();
             const uint64_t misses_before = bind_groups_.misses();
-            const d3d::BindGroupLookup lookup = bind_groups_.get_or_build(
+            d3d::BindGroupLookup lookup = bind_groups_.get_or_build(
                 root_args_, bind_point, plans[g], group.id, &StateBridgeDevice::gpu_va_trampoline, &device_);
+            if (lookup.status == d3d::Status::Ok && lookup.bind_group != nullptr && !lookup.rebuilt &&
+                lookup.bind_group->gpu_id != 0 && binds_retired(lookup.bind_group)) {
+                // G66 (#691): the descriptors did not change but a resource they name was destroyed
+                // (descriptor words carry a GPU VA, which a new resource may now occupy): build the
+                // group again from the descriptors, and retire the old one.
+                const uint32_t old_id = bind_groups_.erase(lookup.bind_group);
+                lookup = bind_groups_.get_or_build(root_args_, bind_point, plans[g], group.id,
+                                                   &StateBridgeDevice::gpu_va_trampoline, &device_);
+                if (lookup.retired_gpu_id == 0) {
+                    lookup.retired_gpu_id = old_id;
+                } else if (old_id != 0) {
+                    redirects_.erase(old_id);
+                    encoder_.destroy_resource(old_id);
+                }
+                ++stats_.bind_groups_resource_retired;
+            }
             stats_.bind_group_cache_hits += bind_groups_.hits() - hits_before;
             stats_.bind_group_cache_misses += bind_groups_.misses() - misses_before;
             stats_.heap_index_misses += bind_groups_.heap_index_misses() - heap_misses_before;

@@ -1006,6 +1006,8 @@ struct CachedBindGroup {
     };
     std::vector<Relocation> relocations;
     uint64_t relocation_epoch = 0;
+    // G66 (#691): the bridge's resource retire epoch when the entries were last checked live.
+    uint64_t retire_epoch = 0;
 
     // Internal validity data.
     std::vector<uint64_t> key;
@@ -1061,6 +1063,8 @@ public:
 
     // Drops every entry, appending their gpu ids (if non-zero) to `retired`.
     void clear(std::vector<uint32_t>* retired);
+    // Drops one entry (a pointer a lookup returned); returns its gpu id (0 when none / not cached).
+    uint32_t erase(const CachedBindGroup* group);
     // Bounds the cache between recordings (O36). Keys carry root-view GPU addresses and table base
     // indices, which ring allocators change per draw, so without a bound the cache (and the WebGPU
     // bind groups behind it) grows for the whole run. When more than `max_entries` are cached, drops
