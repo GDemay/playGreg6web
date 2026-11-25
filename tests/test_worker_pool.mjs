@@ -7,6 +7,9 @@ import {
   DEFAULT_MAX_RESPAWNS_PER_SLOT,
   DEFAULT_RESPAWN_BACKOFF_BASE_MS,
   DEFAULT_RESPAWN_BACKOFF_MAX_MS,
+  DEFAULT_MAX_BOOT_RETRIES,
+  DEFAULT_BOOT_RETRY_BASE_DELAY_MS,
+  DEFAULT_BOOT_RETRY_MAX_DELAY_MS,
   WorkerPoolError,
   PoolTerminatedError,
   QueueFullError,
@@ -2055,5 +2058,469 @@ test('W274: getStats() surfaces respawnCount, trimmedWorkers, circuitBreakerTrip
   assert.equal(s.circuitOpen, true);
 
   await pool.terminate();
+  assert.equal(clock.pending, 0);
+});
+
+// ---- W315: transient boot retry backoff, warm worker reserve & resetStats -
+
+test('W315: constructor validates boot retry options and clamps minWarmWorkers to [0, maxWorkers]', async () => {
+  assert.equal(DEFAULT_MAX_BOOT_RETRIES, 3);
+  assert.equal(DEFAULT_BOOT_RETRY_BASE_DELAY_MS, 50);
+  assert.equal(DEFAULT_BOOT_RETRY_MAX_DELAY_MS, 500);
+
+  assert.throws(() => new WorkerPool({ workerFactory: () => ({}), maxBootRetries: -1 }), RangeError);
+  assert.throws(() => new WorkerPool({ workerFactory: () => ({}), maxBootRetries: 1.5 }), RangeError);
+  assert.throws(() => new WorkerPool({ workerFactory: () => ({}), bootRetryBaseDelayMs: -1 }), RangeError);
+  assert.throws(() => new WorkerPool({ workerFactory: () => ({}), bootRetryBaseDelayMs: NaN }), RangeError);
+  assert.throws(() => new WorkerPool({ workerFactory: () => ({}), bootRetryBaseDelayMs: Infinity }), RangeError);
+  assert.throws(() => new WorkerPool({ workerFactory: () => ({}), bootRetryMaxDelayMs: -1 }), RangeError);
+  assert.throws(() => new WorkerPool({ workerFactory: () => ({}), bootRetryMaxDelayMs: NaN }), RangeError);
+  assert.throws(() => new WorkerPool({ workerFactory: () => ({}), bootRetryMaxDelayMs: Infinity }), RangeError);
+  assert.throws(() => new WorkerPool({ workerFactory: () => ({}), minWarmWorkers: NaN }), RangeError);
+  assert.throws(() => new WorkerPool({ workerFactory: () => ({}), minWarmWorkers: Infinity }), RangeError);
+  assert.throws(() => new WorkerPool({ workerFactory: () => ({}), minWarmWorkers: '2' }), RangeError);
+
+  // Negative minWarmWorkers clamps to 0.
+  const { pool: negPool } = setup({ maxWorkers: 3, minWarmWorkers: -5 });
+  negPool.warmUp(2);
+  assert.equal(negPool.getStats().warmWorkersReserved, 0);
+  assert.deepEqual(negPool.trimIdleWorkers(0), { trimmed: 2, remainingIdle: 0, active: 0 });
+  await negPool.destroy();
+
+  // Oversized minWarmWorkers clamps to maxWorkers.
+  const { pool: clampedPool } = setup({ maxWorkers: 2, minWarmWorkers: 10 });
+  assert.equal(clampedPool.warmUp(), 2);
+  assert.equal(clampedPool.getStats().warmWorkersReserved, 2);
+  assert.deepEqual(clampedPool.trimIdleWorkers(0), { trimmed: 0, remainingIdle: 2, active: 0 });
+  await clampedPool.destroy();
+});
+
+test('W315: transient boot NetworkError on importScripts retries with bounded exponential backoff and recovers', async () => {
+  const { pool, workers, clock } = setup({
+    maxWorkers: 1,
+    retries: 0,
+    maxConsecutiveCrashes: 1,
+  });
+
+  const job = pool.submit('boot', 'wasm64-thread');
+  assert.equal(workers.length, 1);
+
+  // Failure 1 -> retry #1 after 50ms.
+  workers[0].emit('error', {
+    message: "Uncaught NetworkError: Failed to execute 'importScripts' on 'WorkerGlobalScope'",
+  });
+  assert.equal(workers[0].terminated, true);
+  assert.equal(pool.getStats().bootRetryCount, 1);
+  assert.equal(pool.getStats().crashed, 0);
+  assert.equal(pool.getStats().circuitOpen, false);
+  clock.advance(49);
+  assert.equal(workers.length, 1);
+  clock.advance(1);
+  assert.equal(workers.length, 2);
+  assert.equal(workers[1].last().payload, 'wasm64-thread');
+
+  // Failure 2 -> retry #2 after 100ms.
+  workers[1].emit('error', { error: new DOMException('Failed to fetch script', 'NetworkError') });
+  assert.equal(pool.getStats().bootRetryCount, 2);
+  assert.equal(pool.getStats().crashed, 0);
+  clock.advance(99);
+  assert.equal(workers.length, 2);
+  clock.advance(1);
+  assert.equal(workers.length, 3);
+  assert.equal(workers[2].last().payload, 'wasm64-thread');
+
+  // Failure 3 -> retry #3 after 200ms.
+  workers[2].emit('error', { message: 'importScripts failed: net::ERR_CONNECTION_RESET' });
+  assert.equal(pool.getStats().bootRetryCount, 3);
+  assert.equal(pool.getStats().crashed, 0);
+  clock.advance(199);
+  assert.equal(workers.length, 3);
+  clock.advance(1);
+  assert.equal(workers.length, 4);
+  assert.equal(workers[3].last().payload, 'wasm64-thread');
+
+  // 4th attempt boots cleanly and completes the job.
+  workers[3].reply({ id: workers[3].last().id, ok: true, result: 'booted' });
+  assert.equal(await job, 'booted');
+
+  const stats = pool.getStats();
+  assert.equal(stats.bootRetryCount, 3);
+  assert.equal(stats.bootRetrySuccessCount, 1);
+  assert.equal(stats.bootRetryExhaustedCount, 0);
+  assert.equal(stats.crashed, 0);
+  assert.equal(stats.circuitOpen, false);
+  assert.equal(stats.completed, 1);
+  assert.equal(clock.pending, 0);
+
+  // Once a worker has booted, a later NetworkError mid-job is treated as a runtime crash, not a boot retry.
+  const midJob = pool.submit('work', 'post-boot');
+  workers[3].emit('error', { message: 'NetworkError mid-task' });
+  await assert.rejects(midJob, WorkerCrashError);
+  assert.equal(pool.getStats().bootRetryCount, 3);
+  assert.equal(pool.getStats().crashed, 1);
+  assert.equal(pool.getStats().circuitOpen, true);
+
+  await pool.destroy();
+  assert.equal(clock.pending, 0);
+});
+
+test('W315: boot retry exponential backoff is capped at 500 ms', async () => {
+  const { pool, workers, clock } = setup({
+    maxWorkers: 1,
+    maxBootRetries: 4,
+    bootRetryBaseDelayMs: 200,
+    maxConsecutiveCrashes: 0,
+  });
+
+  const p = pool.submit('t', 'payload');
+  // Retry #1: 200ms
+  workers[0].emit('error', { message: 'NetworkError' });
+  clock.advance(199);
+  assert.equal(workers.length, 1);
+  clock.advance(1);
+  assert.equal(workers.length, 2);
+
+  // Retry #2: 400ms
+  workers[1].emit('error', { message: 'NetworkError' });
+  clock.advance(399);
+  assert.equal(workers.length, 2);
+  clock.advance(1);
+  assert.equal(workers.length, 3);
+
+  // Retry #3: 800ms -> capped at 500ms
+  workers[2].emit('error', { message: 'NetworkError' });
+  clock.advance(499);
+  assert.equal(workers.length, 3);
+  clock.advance(1);
+  assert.equal(workers.length, 4);
+
+  // Retry #4: 1600ms -> stays capped at 500ms
+  workers[3].emit('error', { message: 'NetworkError' });
+  clock.advance(499);
+  assert.equal(workers.length, 4);
+  clock.advance(1);
+  assert.equal(workers.length, 5);
+
+  workers[4].reply({ id: workers[4].last().id, ok: true, result: 'ok' });
+  assert.equal(await p, 'ok');
+  assert.equal(pool.getStats().bootRetryCount, 4);
+  assert.equal(pool.getStats().bootRetrySuccessCount, 1);
+
+  await pool.destroy();
+  assert.equal(clock.pending, 0);
+});
+
+test('W315: synchronous workerFactory NetworkError retries with backoff and recovers on submit and warmUp', async () => {
+  const clock = createClock();
+  const workers = [];
+  let attempts = 0;
+  const pool = new WorkerPool({
+    workerFactory: () => {
+      attempts++;
+      if (attempts <= 2) {
+        throw new DOMException('Failed to load worker script', 'NetworkError');
+      }
+      const w = new FakeWorker();
+      workers.push(w);
+      return w;
+    },
+    maxWorkers: 2,
+    maxBootRetries: 3,
+    bootRetryBaseDelayMs: 50,
+    now: clock.now,
+    setTimeout: clock.setTimeout,
+    clearTimeout: clock.clearTimeout,
+  });
+
+  // 1) submit() survives 2 synchronous transient boot failures.
+  const p = pool.submit('t', 'hello');
+  assert.equal(attempts, 1);
+  assert.equal(workers.length, 0);
+  assert.equal(pool.getStats().bootRetryCount, 1);
+  assert.equal(pool.getStats().crashed, 0);
+
+  clock.advance(50);
+  assert.equal(attempts, 2);
+  assert.equal(workers.length, 0);
+  assert.equal(pool.getStats().bootRetryCount, 2);
+
+  clock.advance(100);
+  assert.equal(attempts, 3);
+  assert.equal(workers.length, 1);
+  assert.equal(workers[0].last().payload, 'hello');
+
+  workers[0].reply({ id: workers[0].last().id, ok: true, result: 'world' });
+  assert.equal(await p, 'world');
+  assert.equal(pool.getStats().bootRetrySuccessCount, 1);
+  assert.equal(pool.getStats().bootRetryExhaustedCount, 0);
+
+  // 2) warmUp() also retries transient factory NetworkError and honors ready signal.
+  let warmFails = 1;
+  const clock2 = createClock();
+  const warmWorkers = [];
+  const warmPool = new WorkerPool({
+    workerFactory: () => {
+      if (warmFails > 0) {
+        warmFails--;
+        throw new DOMException('NetworkError', 'NetworkError');
+      }
+      const w = new FakeWorker();
+      warmWorkers.push(w);
+      return w;
+    },
+    maxWorkers: 2,
+    minWarmWorkers: 1,
+    bootRetryBaseDelayMs: 50,
+    now: clock2.now,
+    setTimeout: clock2.setTimeout,
+    clearTimeout: clock2.clearTimeout,
+  });
+  assert.equal(warmPool.warmUp(1), 0);
+  assert.equal(warmPool.getStats().bootRetryCount, 1);
+  clock2.advance(50);
+  assert.equal(warmWorkers.length, 1);
+  assert.equal(warmPool.getStats().idleWorkers, 1);
+  assert.equal(warmPool.getStats().warmWorkersReserved, 1);
+  warmWorkers[0].reply({ ready: true });
+  assert.equal(warmPool.getStats().bootRetrySuccessCount, 1);
+
+  await pool.destroy();
+  await warmPool.destroy();
+  assert.equal(clock.pending, 0);
+  assert.equal(clock2.pending, 0);
+});
+
+test('W315: exhausted boot retries hand off cleanly to circuit breaker and recover after resetCircuitBreaker()', async () => {
+  const { pool, workers, clock } = setup({
+    maxWorkers: 1,
+    maxBootRetries: 2,
+    bootRetryBaseDelayMs: 50,
+    maxConsecutiveCrashes: 1,
+    crashWindowMs: 1000,
+  });
+
+  const j1 = pool.submit('t', 'first');
+  const j2 = settleState(pool.submit('t', 'queued-second'));
+
+  // Initial attempt fails -> retry #1 (50ms).
+  workers[0].emit('error', { message: 'NetworkError: importScripts failed' });
+  assert.equal(pool.getStats().bootRetryCount, 1);
+  assert.equal(pool.getStats().bootRetryExhaustedCount, 0);
+  assert.equal(pool.getStats().circuitOpen, false);
+
+  clock.advance(50);
+  // Retry #1 fails -> retry #2 (100ms).
+  workers[1].emit('error', { message: 'NetworkError: importScripts failed' });
+  assert.equal(pool.getStats().bootRetryCount, 2);
+  assert.equal(pool.getStats().bootRetryExhaustedCount, 0);
+  assert.equal(pool.getStats().circuitOpen, false);
+
+  clock.advance(100);
+  // Retry #2 fails -> retries exhausted -> handed off to crash & circuit breaker.
+  workers[2].emit('error', { message: 'NetworkError: importScripts failed' });
+  await assert.rejects(j1, WorkerCrashError);
+  await flush();
+
+  assert.equal(j2.status, 'rejected');
+  assert.ok(j2.value instanceof CircuitOpenError);
+
+  const stats = pool.getStats();
+  assert.equal(stats.bootRetryCount, 2);
+  assert.equal(stats.bootRetrySuccessCount, 0);
+  assert.equal(stats.bootRetryExhaustedCount, 1);
+  assert.equal(stats.crashed, 1);
+  assert.equal(stats.circuitOpen, true);
+  assert.equal(stats.circuitBreakerTrips, 1);
+  assert.equal(clock.pending, 0);
+
+  // Subsequent submits fail fast while breaker is open.
+  await assert.rejects(pool.submit('t', 'blocked'), CircuitOpenError);
+  assert.equal(workers.length, 3);
+
+  // Resetting the circuit breaker restores normal operation.
+  pool.resetCircuitBreaker();
+  const recovered = pool.submit('t', 'after-reset');
+  assert.equal(workers.length, 4);
+  workers[3].reply({ id: workers[3].last().id, ok: true, result: 'alive' });
+  assert.equal(await recovered, 'alive');
+
+  await pool.destroy();
+  assert.equal(clock.pending, 0);
+});
+
+test('W315: minWarmWorkers reserve floor protects warm workers during manual and automatic idle trimming', async () => {
+  const { pool, workers, clock } = setup({
+    maxWorkers: 4,
+    minWarmWorkers: 2,
+    idleTimeoutMs: 100,
+  });
+
+  // Spawn 4 workers and complete jobs in deterministic order (0, 1, 2, 3).
+  const jobs = [pool.submit('t', 0), pool.submit('t', 1), pool.submit('t', 2), pool.submit('t', 3)];
+  for (let i = 0; i < 4; i++) {
+    clock.advance(10);
+    workers[i].reply({ id: workers[i].last().id, ok: true, result: i });
+  }
+  await Promise.all(jobs);
+
+  assert.equal(pool.getStats().idleWorkers, 4);
+  assert.equal(pool.getStats().warmWorkersReserved, 2);
+
+  // trimIdleWorkers(0) and trimIdleWorkers(1) never evict below minWarmWorkers (2).
+  assert.deepEqual(pool.trimIdleWorkers(0), { trimmed: 2, remainingIdle: 2, active: 0 });
+  assert.equal(workers[0].terminated, true);
+  assert.equal(workers[1].terminated, true);
+  assert.equal(workers[2].terminated, false);
+  assert.equal(workers[3].terminated, false);
+  assert.equal(pool.getStats().idleWorkers, 2);
+  assert.equal(pool.getStats().warmWorkersReserved, 2);
+  assert.equal(pool.getStats().trimmedWorkers, 2);
+
+  assert.deepEqual(pool.trimIdleWorkers(1), { trimmed: 0, remainingIdle: 2, active: 0 });
+
+  // Automatic idleTimeoutMs also never evicts below minWarmWorkers (2).
+  clock.advance(200);
+  assert.equal(pool.getStats().workers, 2);
+  assert.equal(pool.getStats().idleWorkers, 2);
+  assert.equal(pool.getStats().warmWorkersReserved, 2);
+  assert.equal(pool.getStats().trimmedWorkers, 2);
+
+  // Re-expand to 4 workers, complete them, and verify automatic idleTimeoutMs trims 4 -> 2 (not 0).
+  const jobs2 = [pool.submit('t', 4), pool.submit('t', 5), pool.submit('t', 6), pool.submit('t', 7)];
+  for (const w of workers.filter((x) => !x.terminated)) {
+    w.reply({ id: w.last().id, ok: true, result: 'ok' });
+  }
+  await Promise.all(jobs2);
+  assert.equal(pool.getStats().idleWorkers, 4);
+
+  clock.advance(100);
+  assert.equal(pool.getStats().workers, 2);
+  assert.equal(pool.getStats().idleWorkers, 2);
+  assert.equal(pool.getStats().warmWorkersReserved, 2);
+  assert.equal(pool.getStats().trimmedWorkers, 4);
+
+  await pool.destroy();
+  assert.equal(pool.getStats().warmWorkersReserved, 0);
+  assert.equal(clock.pending, 0);
+});
+
+test('W315: destroy() and terminateAll() cancel pending boot retry timers cleanly without spawning', async () => {
+  // 1) destroy() during pending boot retry.
+  {
+    const { pool, workers, clock } = setup({
+      maxWorkers: 1,
+      maxBootRetries: 3,
+      bootRetryBaseDelayMs: 50,
+    });
+    const j = settleState(pool.submit('t', 1));
+    workers[0].emit('error', { message: 'NetworkError: importScripts failed' });
+    assert.equal(clock.pending, 1);
+    assert.equal(pool.getStats().bootRetryCount, 1);
+
+    await pool.destroy();
+    await flush();
+    assert.equal(j.status, 'rejected');
+    assert.ok(j.value instanceof PoolTerminatedError);
+    assert.equal(clock.pending, 0);
+
+    clock.advance(1000);
+    assert.equal(workers.length, 1);
+  }
+
+  // 2) terminateAll() during pending boot retry.
+  {
+    const { pool, workers, clock } = setup({
+      maxWorkers: 1,
+      maxBootRetries: 3,
+      bootRetryBaseDelayMs: 50,
+    });
+    const j = settleState(pool.submit('t', 2));
+    workers[0].emit('error', { error: new DOMException('offline', 'NetworkError') });
+    assert.equal(clock.pending, 1);
+
+    await pool.terminateAll();
+    await flush();
+    assert.equal(j.status, 'rejected');
+    assert.ok(j.value instanceof PoolTerminatedError);
+    assert.equal(clock.pending, 0);
+
+    clock.advance(1000);
+    assert.equal(workers.length, 1);
+  }
+
+  // 3) Aborting the sole queued job during boot retry cancels the pending timer cleanly.
+  {
+    const { pool, workers, clock } = setup({
+      maxWorkers: 1,
+      maxBootRetries: 3,
+      bootRetryBaseDelayMs: 50,
+    });
+    const ac = new AbortController();
+    const j = pool.submit('t', 3, { signal: ac.signal });
+    workers[0].emit('error', { message: 'NetworkError' });
+    assert.equal(clock.pending, 1);
+
+    ac.abort();
+    await assert.rejects(j, JobAbortedError);
+    assert.equal(clock.pending, 0);
+
+    await pool.destroy();
+  }
+});
+
+test('W315: getStats() surfaces W315 telemetry and resetStats() clears cumulative counters cleanly', async () => {
+  const { pool, workers, clock } = setup({
+    maxWorkers: 2,
+    minWarmWorkers: 1,
+    maxBootRetries: 2,
+    bootRetryBaseDelayMs: 50,
+    maxConsecutiveCrashes: 5,
+  });
+
+  // Initial zeroed W315 telemetry.
+  let s = pool.getStats();
+  assert.deepEqual(s, pool.stats());
+  assert.equal(s.bootRetryCount, 0);
+  assert.equal(s.bootRetrySuccessCount, 0);
+  assert.equal(s.bootRetryExhaustedCount, 0);
+  assert.equal(s.warmWorkersReserved, 0);
+
+  // Trigger 1 boot retry -> recover.
+  const j1 = pool.submit('t', 'recover');
+  workers[0].emit('error', { message: 'NetworkError: importScripts' });
+  clock.advance(50);
+  workers[1].reply({ id: workers[1].last().id, ok: true, result: 'ok' });
+  assert.equal(await j1, 'ok');
+
+  s = pool.getStats();
+  assert.equal(s.bootRetryCount, 1);
+  assert.equal(s.bootRetrySuccessCount, 1);
+  assert.equal(s.bootRetryExhaustedCount, 0);
+  assert.equal(s.warmWorkersReserved, 1);
+  assert.equal(s.idleWorkers, 1);
+  assert.equal(s.completed, 1);
+
+  // resetStats() clears cumulative counters while preserving live worker gauges.
+  pool.resetStats();
+  s = pool.getStats();
+  assert.deepEqual(s, pool.stats());
+  assert.equal(s.bootRetryCount, 0);
+  assert.equal(s.bootRetrySuccessCount, 0);
+  assert.equal(s.bootRetryExhaustedCount, 0);
+  assert.equal(s.submitted, 0);
+  assert.equal(s.completed, 0);
+  assert.equal(s.failed, 0);
+  assert.equal(s.crashed, 0);
+  assert.equal(s.trimmedWorkers, 0);
+  assert.equal(s.circuitBreakerTrips, 0);
+  assert.equal(s.peakQueueDepth, 0);
+  assert.equal(s.avgRunMs, 0);
+  assert.equal(s.avgWaitMs, 0);
+  // Live gauges still reflect the warm idle worker.
+  assert.equal(s.workers, 1);
+  assert.equal(s.idleWorkers, 1);
+  assert.equal(s.warmWorkersReserved, 1);
+
+  await pool.destroy();
   assert.equal(clock.pending, 0);
 });
