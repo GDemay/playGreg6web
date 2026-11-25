@@ -1994,5 +1994,600 @@ class TestGpuTraceAudits(unittest.TestCase):
         self.assertGreaterEqual(summary["active_shaders"], 1)
 
 
+class TestGpuTraceBinkAndStartScreenAudits(unittest.TestCase):
+    def test_bink_video_audit_4k_planar_uploaded_and_sampled_by_draw(self) -> None:
+        # Format code 1 in WGPU_TEXTURE_FORMAT_NAMES is "r8unorm"; code 27 is "bgra8unorm".
+        y_payload = b"\x11" * 128
+        cb_payload = b"\x22" * 64
+        cr_payload = b"\x33" * 64
+        font_payload = b"\x44" * 32
+
+        chunks: list[bytes] = [
+            # 4K Bink2 planar Y (3840x2160) + Cb/Cr (1920x1080) as r8unorm
+            gpu_trace.encode_create_texture2(10, 3840, 2160, 1, usage_flags=0x0006),
+            gpu_trace.encode_create_texture2(11, 1920, 1080, 1, usage_flags=0x0006),
+            gpu_trace.encode_create_texture2(12, 1920, 1080, 1, usage_flags=0x0006),
+            # Non-video r8unorm font atlas uploaded once
+            gpu_trace.encode_create_texture2(13, 2048, 2048, 1, usage_flags=0x0006),
+            # Non-r8unorm texture (must be excluded from Bink video audit)
+            gpu_trace.encode_create_texture2(14, 3840, 2160, 27, usage_flags=0x0016),
+            gpu_trace.encode_create_sampler2(20),
+            gpu_trace.encode_create_bind_group_layout(
+                30,
+                [
+                    (0, 0x2, 2, 0, 2),
+                    (1, 0x2, 2, 0, 2),
+                    (2, 0x2, 2, 0, 2),
+                    (3, 0x2, 1, 0),
+                ],
+            ),
+            gpu_trace.encode_create_pipeline_layout(31, [30]),
+            gpu_trace.encode_create_render_pipeline2(
+                500,
+                1,
+                2,
+                31,
+                _make_pipeline_key(vs_shader=0xB101, ps_shader=0xB102, color_formats=[27]),
+            ),
+            gpu_trace.encode_create_bind_group2(
+                40,
+                30,
+                [
+                    (0, gpu_trace.GpuBindResourceType.TextureView, 10),
+                    (1, gpu_trace.GpuBindResourceType.TextureView, 11),
+                    (2, gpu_trace.GpuBindResourceType.TextureView, 12),
+                    (3, gpu_trace.GpuBindResourceType.Sampler, 20),
+                ],
+            ),
+            # Single one-time upload for font atlas in setup preamble
+            gpu_trace.encode_write_texture(13, 8, 4, font_payload),
+        ]
+
+        # 3 frames of per-frame Y/Cb/Cr uploads + YCbCr draw sampling them
+        for _ in range(3):
+            chunks.extend(
+                [
+                    gpu_trace.encode_begin_frame(),
+                    gpu_trace.encode_write_texture(10, 16, 8, y_payload),
+                    gpu_trace.encode_write_texture(11, 8, 8, cb_payload),
+                    gpu_trace.encode_write_texture(12, 8, 8, cr_payload),
+                    gpu_trace.encode_begin_render_pass(
+                        [{"texture_id": gpu_trace.SWAPCHAIN_TEXTURE_ID, "load_op": 2, "store_op": 1}]
+                    ),
+                    gpu_trace.encode_set_pipeline(500),
+                    gpu_trace.encode_set_bind_group2(0, 40),
+                    gpu_trace.encode_draw(3),
+                    gpu_trace.encode_end_render_pass(),
+                    gpu_trace.encode_present(),
+                ]
+            )
+
+        trace = gpu_trace.decode_stream(b"".join(chunks), strict=True)
+        self.assertTrue(trace.ok, [d.message for d in trace.diagnostics])
+
+        audit = gpu_trace.audit_bink_video(trace)
+        self.assertEqual(audit["r8unorm_texture_count"], 4)
+        self.assertEqual(audit["video_candidate_count"], 3)
+        self.assertEqual(audit["uploaded_plane_count"], 4)
+        self.assertEqual(audit["per_frame_uploaded_plane_count"], 3)
+        self.assertEqual(audit["bound_plane_count"], 3)
+        self.assertEqual(audit["sampled_by_draw_plane_count"], 3)
+        self.assertEqual(audit["sampled_by_dispatch_plane_count"], 0)
+        self.assertTrue(audit["any_plane_sampled_by_draw"])
+        self.assertTrue(audit["any_video_plane_sampled_by_draw"])
+        self.assertTrue(audit["any_r8unorm_sampled_by_draw"])
+        self.assertEqual(audit["total_upload_count"], 10)
+        self.assertEqual(
+            audit["total_upload_bytes"],
+            3 * (len(y_payload) + len(cb_payload) + len(cr_payload)) + len(font_payload),
+        )
+        self.assertEqual(audit["total_bind_group_refs"], 3)
+        self.assertEqual(audit["total_set_bind_group_refs"], 9)
+        self.assertEqual(audit["total_draws_sampling_planes"], 3)
+        self.assertEqual(audit["total_dispatches_sampling_planes"], 0)
+
+        # Planar group pairs 3840x2160 Y (#10) with 1920x1080 Cb/Cr (#11, #12).
+        self.assertEqual(len(audit["planar_groups"]), 1)
+        grp = audit["planar_groups"][0]
+        self.assertEqual(grp["luma_dimensions"], "3840x2160")
+        self.assertEqual(grp["chroma_dimensions"], "1920x1080")
+        self.assertEqual(grp["luma_texture_ids"], [10])
+        self.assertEqual(grp["chroma_texture_ids"], [11, 12])
+        self.assertEqual(grp["total_upload_count"], 9)
+        self.assertTrue(grp["any_sampled_by_draw"])
+
+        by_id = {row["texture_id"]: row for row in audit["planes"]}
+        self.assertNotIn(14, by_id)
+
+        self.assertEqual(by_id[10]["plane_hint"], "4k_luma")
+        self.assertTrue(by_id[10]["is_video_resolution"])
+        self.assertTrue(by_id[10]["is_video_candidate"])
+        self.assertTrue(by_id[10]["per_frame_uploads"])
+        self.assertEqual(by_id[10]["upload_count"], 3)
+        self.assertEqual(by_id[10]["upload_bytes"], 3 * len(y_payload))
+        self.assertEqual(by_id[10]["upload_frame_count"], 3)
+        self.assertEqual(by_id[10]["bind_group_count"], 1)
+        self.assertEqual(by_id[10]["bind_group_ids"], [40])
+        self.assertEqual(by_id[10]["set_bind_group_count"], 3)
+        self.assertEqual(by_id[10]["draw_count"], 3)
+        self.assertTrue(by_id[10]["sampled_by_draw"])
+        self.assertEqual(by_id[10]["sampled_pipeline_ids"], [500])
+
+        for chroma_id in (11, 12):
+            self.assertEqual(by_id[chroma_id]["plane_hint"], "4k_chroma_or_1080p_luma")
+            self.assertEqual(by_id[chroma_id]["upload_count"], 3)
+            self.assertEqual(by_id[chroma_id]["upload_bytes"], 3 * len(cb_payload))
+            self.assertEqual(by_id[chroma_id]["draw_count"], 3)
+            self.assertTrue(by_id[chroma_id]["sampled_by_draw"])
+
+        # Font atlas (2048x2048, uploaded once, never bound) is not a video candidate.
+        self.assertFalse(by_id[13]["is_video_candidate"])
+        self.assertFalse(by_id[13]["per_frame_uploads"])
+        self.assertFalse(by_id[13]["sampled_by_draw"])
+
+        text = gpu_trace.format_bink_video_audit_text(audit)
+        self.assertIn("Bink Video Audit (r8unorm planes):", text)
+        self.assertIn("Any Video Plane Sampled By Draw: YES", text)
+        self.assertIn("3840x2160 (Y: #10) + 1920x1080 (Cb/Cr: #11,#12)", text)
+        self.assertIn("4k_luma", text)
+
+    def test_bink_video_audit_unsampled_planes_compute_fallback_and_partial_capture(self) -> None:
+        # Scenario:
+        # - 4K Y (#100) + Cb/Cr (#101, #102) r8unorm planes uploaded every frame and bound in BG #200,
+        #   but BG #200 is overwritten by BG #201 (non-video font atlas #103) before Draw -> video planes NOT sampled by draw!
+        # - Custom non-standard 256x144 / 128x72 r8unorm planes (#104, #105) uploaded every frame and sampled by DispatchCompute.
+        # - 3840x2160 r8unorm render attachment (#106) with 0 uploads.
+        # - Partial-capture r8unorm texture (#107) without CreateTexture2, inferred from CreateBindGroup2 view format + WriteTexture.
+        r8_view = gpu_trace.encode_texture_view_desc(texture_format=1, dimension=2)
+        chunks: list[bytes] = [
+            gpu_trace.encode_create_texture2(100, 3840, 2160, 1, usage_flags=0x0006),
+            gpu_trace.encode_create_texture2(101, 1920, 1080, 1, usage_flags=0x0006),
+            gpu_trace.encode_create_texture2(102, 1920, 1080, 1, usage_flags=0x0006),
+            gpu_trace.encode_create_texture2(103, 2048, 2048, 1, usage_flags=0x0006),
+            gpu_trace.encode_create_texture2(104, 256, 144, 1, usage_flags=0x0006),
+            gpu_trace.encode_create_texture2(105, 128, 72, 1, usage_flags=0x0006),
+            gpu_trace.encode_create_texture2(106, 3840, 2160, 1, usage_flags=0x0014),  # RENDER_ATTACHMENT
+            gpu_trace.encode_create_bind_group_layout(10, [(0, 0x2, 2, 0, 2)]),
+            gpu_trace.encode_create_bind_group2(
+                200,
+                10,
+                [
+                    (0, gpu_trace.GpuBindResourceType.TextureView, 100),
+                    (1, gpu_trace.GpuBindResourceType.TextureView, 101),
+                    (2, gpu_trace.GpuBindResourceType.TextureView, 102),
+                ],
+            ),
+            gpu_trace.encode_create_bind_group2(
+                201,
+                10,
+                [(0, gpu_trace.GpuBindResourceType.TextureView, 103)],
+            ),
+            gpu_trace.encode_create_bind_group(
+                202,
+                pipeline_id=600,
+                group_index=0,
+                entries=[
+                    gpu_trace.BindGroupEntry(0, gpu_trace.GpuBindResourceType.TextureView, 104),
+                    gpu_trace.BindGroupEntry(1, gpu_trace.GpuBindResourceType.TextureView, 105),
+                ],
+            ),
+            # Partial-capture r8unorm view reference for texture #107 (never created in capture)
+            gpu_trace.encode_create_bind_group2(
+                203,
+                10,
+                [(0, gpu_trace.GpuBindResourceType.TextureView, 107, 0, 0, r8_view)],
+            ),
+            gpu_trace.encode_create_render_pipeline2(
+                501, 1, 2, 0, _make_pipeline_key(vs_shader=0xA1, ps_shader=0xA2, color_formats=[27])
+            ),
+            gpu_trace.encode_create_compute_pipeline2(600, 3, 0, cs_shader=0xC1),
+        ]
+
+        for frame_i in range(2):
+            chunks.extend(
+                [
+                    gpu_trace.encode_begin_frame(),
+                    gpu_trace.encode_write_texture(100, 16, 16, b"\x01" * 40),
+                    gpu_trace.encode_write_texture(101, 8, 8, b"\x02" * 20),
+                    gpu_trace.encode_write_texture(102, 8, 8, b"\x03" * 20),
+                    gpu_trace.encode_write_texture(104, 16, 16, b"\x04" * 16),
+                    gpu_trace.encode_write_texture(105, 8, 8, b"\x05" * 8),
+                    gpu_trace.encode_write_texture(107, 640, 360, b"\x06" * 12),
+                    gpu_trace.encode_begin_render_pass(
+                        [{"texture_id": gpu_trace.SWAPCHAIN_TEXTURE_ID, "load_op": 2, "store_op": 1}]
+                    ),
+                    gpu_trace.encode_set_pipeline(501),
+                    # Bind video planes, then overwrite slot 0 with font atlas before drawing!
+                    gpu_trace.encode_set_bind_group2(0, 200),
+                    gpu_trace.encode_set_bind_group2(0, 201),
+                    gpu_trace.encode_draw(6),
+                    gpu_trace.encode_end_render_pass(),
+                    # Compute pass samples custom planar pair (#104, #105)
+                    gpu_trace.encode_set_compute_pipeline(600),
+                    gpu_trace.encode_set_bind_group(0, 202),
+                    gpu_trace.encode_dispatch_compute(4, 4, 1),
+                    gpu_trace.encode_present(),
+                ]
+            )
+            if frame_i == 0:
+                chunks.append(gpu_trace.encode_write_texture(103, 16, 16, b"\x07" * 10))
+
+        trace = gpu_trace.decode_stream(b"".join(chunks), strict=True)
+        self.assertTrue(trace.ok, [d.message for d in trace.diagnostics])
+
+        audit = gpu_trace.audit_bink_video(trace)
+        self.assertEqual(audit["r8unorm_texture_count"], 8)
+        # Video candidates: #100, #101, #102 (4K), #104, #105 (per-frame + planar), #106 (4K res), #107 (640x360 + per-frame).
+        # Font atlas #103 (2048x2048, uploaded once) is NOT a video candidate.
+        self.assertEqual(audit["video_candidate_count"], 7)
+        self.assertFalse(audit["any_video_plane_sampled_by_draw"])
+        self.assertFalse(audit["any_plane_sampled_by_draw"])
+        self.assertTrue(audit["any_r8unorm_sampled_by_draw"])
+        self.assertEqual(audit["sampled_by_draw_plane_count"], 1)  # only font #103
+        self.assertEqual(audit["sampled_by_dispatch_plane_count"], 2)  # #104 & #105
+        self.assertEqual(audit["total_dispatches_sampling_planes"], 2)
+
+        by_id = {row["texture_id"]: row for row in audit["planes"]}
+        self.assertEqual(by_id[100]["set_bind_group_count"], 2)
+        self.assertEqual(by_id[100]["draw_count"], 0)
+        self.assertFalse(by_id[100]["sampled_by_draw"])
+        self.assertTrue(by_id[103]["sampled_by_draw"])
+        self.assertEqual(by_id[103]["draw_count"], 2)
+        self.assertTrue(by_id[104]["sampled_by_dispatch"])
+        self.assertEqual(by_id[104]["plane_hint"], "planar_luma")
+        self.assertEqual(by_id[105]["plane_hint"], "planar_chroma")
+        self.assertEqual(by_id[104]["sampled_compute_pipeline_ids"], [600])
+        self.assertTrue(by_id[106]["is_render_attachment"])
+        self.assertEqual(by_id[106]["upload_count"], 0)
+        # Partial-capture texture #107 inferred dimensions from WriteTexture mip 0.
+        self.assertEqual((by_id[107]["width"], by_id[107]["height"]), (640, 360))
+        self.assertEqual(by_id[107]["plane_hint"], "720p_chroma")
+        self.assertTrue(by_id[107]["per_frame_uploads"])
+
+        text = gpu_trace.format_bink_video_audit_text(audit)
+        self.assertIn("Any Video Plane Sampled By Draw: NO", text)
+        self.assertIn("compute", text)
+
+    def test_start_screen_skips_ranking_and_anomaly_categories(self) -> None:
+        stream = b"".join(
+            [
+                # Layouts:
+                # BGL 10: bindings 0 (uniform buffer) and 1 (sampled texture)
+                gpu_trace.encode_create_bind_group_layout(
+                    10,
+                    [
+                        (0, 0x3, 0, 0),
+                        (1, 0x2, 2, 0, 2),
+                    ],
+                ),
+                # BGL 11: binding 0 (sampler)
+                gpu_trace.encode_create_bind_group_layout(11, [(0, 0x2, 1, 0)]),
+                # PLL 20: requires group 0 = BGL 10
+                gpu_trace.encode_create_pipeline_layout(20, [10]),
+                # PLL 21: group 0 = empty (0), group 1 = BGL 11 (tests cross-pipeline isolation)
+                gpu_trace.encode_create_pipeline_layout(21, [0, 11]),
+                # Clean BG 30 for BGL 10
+                gpu_trace.encode_create_bind_group2(
+                    30,
+                    10,
+                    [
+                        (0, gpu_trace.GpuBindResourceType.Buffer, 500, 0, 64),
+                        (1, gpu_trace.GpuBindResourceType.TextureView, 501),
+                    ],
+                ),
+                # Broken BG 31 for BGL 10: missing @binding(1) + null @binding(0)
+                gpu_trace.encode_create_bind_group2(
+                    31,
+                    10,
+                    [(0, gpu_trace.GpuBindResourceType.Buffer, 0, 0, 64)],
+                ),
+                # Clean BG 32 for BGL 11
+                gpu_trace.encode_create_bind_group2(
+                    32,
+                    11,
+                    [(0, gpu_trace.GpuBindResourceType.Sampler, 502)],
+                ),
+                # Offscreen rgba16float target (40) + depth32float (48)
+                gpu_trace.encode_create_texture2(60, 1280, 720, 40, usage_flags=0x10),
+                gpu_trace.encode_create_texture2(61, 1280, 720, 48, usage_flags=0x10),
+                # --- Pipelines ---
+                # Clean pair (0xAAAA / 0xBBBB): must NOT appear in ranked_pairs.
+                gpu_trace.encode_create_render_pipeline2(
+                    100, 1, 2, 20, _make_pipeline_key(vs_shader=0xAAAA, ps_shader=0xBBBB, color_formats=[27])
+                ),
+                # Clean pair with PLL 21 (group 0 empty, group 1 = BGL 11): must NOT inherit dirty BG 31 at group 0!
+                gpu_trace.encode_create_render_pipeline2(
+                    101, 1, 2, 21, _make_pipeline_key(vs_shader=0xAAAB, ps_shader=0xBBBC, color_formats=[27])
+                ),
+                # Depth-only pipeline (ps_shader=0, fs_module_id=0, no color targets): must NOT flag missing_shader_module!
+                gpu_trace.encode_create_render_pipeline2(
+                    102, 1, 0, 0, _make_pipeline_key(vs_shader=0xCCCC, ps_shader=0, color_formats=[], depth_format=48)
+                ),
+                # Rank #1 candidate: pair (0x1111 / 0x2222) across TWO pipeline IDs (200 & 201):
+                #   - Pipeline 200: 2x set_pipeline_without_draw with broken BG 31 (each adds missing_binding + null_binding)
+                #   - Pipeline 201: 2x set_pipeline_without_draw with NO group 0 bound (each adds unbound_bind_group_slot)
+                #   Total = 4 skips + 6 binding anomalies = 10 anomalies.
+                gpu_trace.encode_create_render_pipeline2(
+                    200, 1, 2, 20, _make_pipeline_key(vs_shader=0x1111, ps_shader=0x2222, color_formats=[27])
+                ),
+                gpu_trace.encode_create_render_pipeline2(
+                    201, 1, 2, 20, _make_pipeline_key(vs_shader=0x1111, ps_shader=0x2222, color_formats=[22])
+                ),
+                # Rank #2 candidate: pair (0x3333 / 0x4444), pipeline 202:
+                #   - missing_shader_module (fs_module_id=0 with ps_shader=0x4444) -> 1 skip
+                #   - zero_count_draw (Draw(0)) -> 1 skip
+                #   - render_pass_format_mismatch (pipeline expects bgra8unorm [27], pass has rgba16float [40]) -> 1 binding anomaly
+                #   Total = 3 anomalies.
+                gpu_trace.encode_create_render_pipeline2(
+                    202, 1, 0, 0, _make_pipeline_key(vs_shader=0x3333, ps_shader=0x4444, color_formats=[27])
+                ),
+                # Rank #3 candidate: compute pair (cs:0x5555), pipeline 203:
+                #   - missing_shader_module (cs_module_id=0) -> 1 skip
+                #   - set_compute_pipeline_without_dispatch -> 1 skip
+                #   - zero_count_dispatch (0, 1, 1) -> 1 skip
+                #   Total = 3 anomalies (ties total=3 with #2, has higher skip_event_count=3 vs 2 -> actually ranks #2!).
+                gpu_trace.encode_create_compute_pipeline2(203, 0, 0, cs_shader=0x5555),
+                # Rank #4 candidate: never-bound pipeline 204 (0x6666 / 0x7777):
+                #   - pipeline_never_executed -> 1 skip.
+                gpu_trace.encode_create_render_pipeline2(
+                    204, 1, 2, 0, _make_pipeline_key(vs_shader=0x6666, ps_shader=0x7777, color_formats=[27])
+                ),
+                gpu_trace.encode_begin_frame(),
+                # Depth-only pass: pipeline 102 draws cleanly.
+                gpu_trace.encode_begin_render_pass([], {"texture_id": 61, "depth_load_op": 2, "depth_store_op": 1}),
+                gpu_trace.encode_set_pipeline(102),
+                gpu_trace.encode_draw(3),
+                gpu_trace.encode_end_render_pass(),
+                # Swapchain pass:
+                gpu_trace.encode_begin_render_pass(
+                    [{"texture_id": gpu_trace.SWAPCHAIN_TEXTURE_ID, "load_op": 2, "store_op": 1}]
+                ),
+                # Clean pipeline 100
+                gpu_trace.encode_set_pipeline(100),
+                gpu_trace.encode_set_bind_group2(0, 30),
+                gpu_trace.encode_draw(6),
+                # Pipeline 200 skipped twice with broken BG 31 bound at group 0
+                gpu_trace.encode_set_pipeline(200),
+                gpu_trace.encode_set_bind_group2(0, 31),
+                gpu_trace.encode_set_pipeline(200),
+                # Switch to clean pipeline 101 (group 0 unused, group 1 = BG 32): must stay clean!
+                gpu_trace.encode_set_pipeline(101),
+                gpu_trace.encode_set_bind_group2(1, 32),
+                gpu_trace.encode_draw(3),
+                gpu_trace.encode_end_render_pass(),
+                # Fresh pass (active_bind_groups cleared): pipeline 201 skipped twice with no group 0 bound
+                gpu_trace.encode_begin_render_pass(
+                    [{"texture_id": gpu_trace.SWAPCHAIN_TEXTURE_ID, "load_op": 1, "store_op": 1}]
+                ),
+                gpu_trace.encode_set_pipeline(201),
+                gpu_trace.encode_set_pipeline(201),
+                gpu_trace.encode_end_render_pass(),
+                # Offscreen rgba16float pass: pipeline 202 issues zero-count draw with color format mismatch
+                gpu_trace.encode_begin_render_pass([{"texture_id": 60, "load_op": 2, "store_op": 1}]),
+                gpu_trace.encode_set_pipeline(202),
+                gpu_trace.encode_draw(0),
+                gpu_trace.encode_end_render_pass(),
+                # Compute pass: pipeline 203 skipped once, then zero-count dispatched once
+                gpu_trace.encode_set_compute_pipeline(203),
+                gpu_trace.encode_set_compute_pipeline(203),
+                gpu_trace.encode_dispatch_compute(0, 1, 1),
+                gpu_trace.encode_present(),
+            ]
+        )
+
+        trace = gpu_trace.decode_stream(stream, strict=True)
+        self.assertTrue(trace.ok, [d.message for d in trace.diagnostics])
+
+        audit = gpu_trace.audit_start_screen_skips(trace)
+        self.assertFalse(audit["ok"])
+        self.assertEqual(audit["total_pipelines"], 8)
+        self.assertEqual(audit["total_pipeline_pairs"], 7)
+        self.assertEqual(audit["affected_pipeline_pairs"], 4)
+        self.assertEqual(audit["emitted_draws"], 3)  # pipelines 102, 100, 101
+        self.assertEqual(audit["emitted_dispatches"], 0)
+        self.assertEqual(audit["unbound_draws"], 0)
+        self.assertEqual(audit["unbound_dispatches"], 0)
+
+        ranked = audit["ranked_pairs"]
+        self.assertEqual(len(ranked), 4)
+        self.assertEqual([r["rank"] for r in ranked], [1, 2, 3, 4])
+
+        # Clean pairs must not appear in ranked_pairs.
+        ranked_names = {r["shader_pair"] for r in ranked}
+        self.assertNotIn("0x000000000000aaaa / 0x000000000000bbbb", ranked_names)
+        self.assertNotIn("0x000000000000aaab / 0x000000000000bbbc", ranked_names)
+        self.assertNotIn("0x000000000000cccc / none", ranked_names)
+
+        # #1: 0x1111 / 0x2222 (10 anomalies: 4 skips + 6 binding anomalies across pipelines 200 & 201)
+        r1 = ranked[0]
+        self.assertEqual(r1["kind"], "render")
+        self.assertEqual(r1["shader_pair"], "0x0000000000001111 / 0x0000000000002222")
+        self.assertEqual(r1["pipeline_ids"], [200, 201])
+        self.assertEqual(r1["pipeline_count"], 2)
+        self.assertEqual(r1["skip_event_count"], 4)
+        self.assertEqual(r1["binding_anomaly_count"], 6)
+        self.assertEqual(r1["total_anomalies"], 10)
+        self.assertEqual(r1["top_reason"], "set_pipeline_without_draw")
+        self.assertEqual(
+            r1["reason_counts"],
+            {
+                "missing_binding": 2,
+                "null_binding": 2,
+                "set_pipeline_without_draw": 4,
+                "unbound_bind_group_slot": 2,
+            },
+        )
+        self.assertEqual(r1["affected_bind_group_ids"], [31])
+        self.assertIn("@group(0):@binding(1)", r1["affected_bindings"])
+        self.assertIn("@group(0):@binding(0)", r1["affected_bindings"])
+        self.assertIn("@group(0)", r1["affected_bindings"])
+
+        # #2: cs:0x5555 (3 anomalies, 3 skip events)
+        r2 = ranked[1]
+        self.assertEqual(r2["kind"], "compute")
+        self.assertEqual(r2["shader_pair"], "cs:0x0000000000005555")
+        self.assertEqual(r2["skip_event_count"], 3)
+        self.assertEqual(r2["binding_anomaly_count"], 0)
+        self.assertEqual(r2["total_anomalies"], 3)
+        self.assertEqual(
+            r2["reason_counts"],
+            {
+                "missing_shader_module": 1,
+                "set_compute_pipeline_without_dispatch": 1,
+                "zero_count_dispatch": 1,
+            },
+        )
+
+        # #3: 0x3333 / 0x4444 (3 anomalies: 2 skips + 1 render pass format mismatch)
+        r3 = ranked[2]
+        self.assertEqual(r3["shader_pair"], "0x0000000000003333 / 0x0000000000004444")
+        self.assertEqual(r3["skip_event_count"], 2)
+        self.assertEqual(r3["binding_anomaly_count"], 1)
+        self.assertEqual(r3["total_anomalies"], 3)
+        self.assertEqual(
+            r3["reason_counts"],
+            {
+                "missing_shader_module": 1,
+                "render_pass_format_mismatch": 1,
+                "zero_count_draw": 1,
+            },
+        )
+
+        # #4: 0x6666 / 0x7777 (never bound or drawn)
+        r4 = ranked[3]
+        self.assertEqual(r4["shader_pair"], "0x0000000000006666 / 0x0000000000007777")
+        self.assertEqual(r4["reason_counts"], {"pipeline_never_executed": 1})
+        self.assertEqual(r4["total_anomalies"], 1)
+
+        text = gpu_trace.format_start_screen_skips_text(audit)
+        self.assertIn("Start-Screen Skips Audit:", text)
+        self.assertIn("ISSUES FOUND (17 anomaly event(s) across 4/7 pipeline pair(s))", text)
+        self.assertIn("0x0000000000001111 / 0x0000000000002222", text)
+        self.assertIn("cs:0x0000000000005555", text)
+        self.assertIn("set_pipeline_without_draw", text)
+
+    def test_bink_and_start_screen_cli_json_backwards_compat_and_sanitization(self) -> None:
+        raw_image_marker = b"\xde\xad\xbe\xef\xca\xfe\xba\xbe" * 4
+        stream = b"".join(
+            [
+                gpu_trace.encode_create_texture2(10, 3840, 2160, 1, usage_flags=0x0006),
+                gpu_trace.encode_create_texture2(11, 1920, 1080, 1, usage_flags=0x0006),
+                gpu_trace.encode_create_bind_group_layout(20, [(0, 0x2, 2, 0, 2)]),
+                gpu_trace.encode_create_pipeline_layout(21, [20]),
+                gpu_trace.encode_create_render_pipeline2(
+                    30, 1, 0, 21, _make_pipeline_key(vs_shader=0x9001, ps_shader=0x9002, color_formats=[27])
+                ),
+                gpu_trace.encode_begin_frame(),
+                gpu_trace.encode_write_texture(10, 8, 4, raw_image_marker),
+                gpu_trace.encode_write_texture(11, 4, 2, raw_image_marker[:16]),
+                gpu_trace.encode_begin_render_pass(
+                    [{"texture_id": gpu_trace.SWAPCHAIN_TEXTURE_ID, "load_op": 2, "store_op": 1}]
+                ),
+                gpu_trace.encode_set_pipeline(30),
+                gpu_trace.encode_end_render_pass(),
+                gpu_trace.encode_present(),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            nested = Path(tmp) / "secret_host_dir_933"
+            nested.mkdir()
+            trace_path = nested / "local_capture_secret.pg6trace"
+            trace_path.write_bytes(stream)
+
+            # 1. Backwards compatibility: omitting new flags keeps existing JSON & text untouched.
+            buf_default_json = io.StringIO()
+            with redirect_stdout(buf_default_json):
+                rc = gpu_trace.main([str(trace_path), "--json", "--stats"])
+            self.assertEqual(rc, 0)
+            default_payload = json.loads(buf_default_json.getvalue())
+            self.assertNotIn("bink_video_audit", default_payload)
+            self.assertNotIn("start_screen_skips", default_payload)
+
+            buf_default_text = io.StringIO()
+            with redirect_stdout(buf_default_text):
+                rc = gpu_trace.main([str(trace_path), "--stats"])
+            self.assertEqual(rc, 0)
+            self.assertNotIn("Bink Video Audit", buf_default_text.getvalue())
+            self.assertNotIn("Start-Screen Skips Audit", buf_default_text.getvalue())
+
+            # 2. Combined CLI --bink-video-audit --start-screen-skips --stats --json (sanitized).
+            buf_json = io.StringIO()
+            with redirect_stdout(buf_json):
+                rc = gpu_trace.main(
+                    [
+                        str(trace_path),
+                        "--json",
+                        "--stats",
+                        "--shader-summary",
+                        "--binding-audit",
+                        "--bink-video-audit",
+                        "--start-screen-skips",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            json_raw = buf_json.getvalue()
+            payload = json.loads(json_raw)
+            self.assertIn("shader_summary", payload)
+            self.assertIn("binding_audit", payload)
+            self.assertIn("bink_video_audit", payload)
+            self.assertIn("start_screen_skips", payload)
+            self.assertFalse(payload["bink_video_audit"]["any_plane_sampled_by_draw"])
+            self.assertEqual(payload["bink_video_audit"]["video_candidate_count"], 2)
+            self.assertFalse(payload["start_screen_skips"]["ok"])
+            self.assertEqual(
+                payload["start_screen_skips"]["ranked_pairs"][0]["shader_pair"],
+                "0x0000000000009001 / 0x0000000000009002",
+            )
+
+            # Sanitization checks on JSON output (no host paths, no raw image bytes).
+            self.assertNotIn("secret_host_dir_933", json_raw)
+            self.assertNotIn("local_capture_secret", json_raw)
+            self.assertNotIn("deadbeef", json_raw.lower())
+            self.assertNotIn("cafebabe", json_raw.lower())
+
+            # 3. Combined CLI text output (sanitized).
+            buf_text = io.StringIO()
+            with redirect_stdout(buf_text):
+                rc = gpu_trace.main(
+                    [str(trace_path), "--stats", "--bink-video-audit", "--start-screen-skips"]
+                )
+            self.assertEqual(rc, 0)
+            text_out = buf_text.getvalue()
+            self.assertIn("Bink Video Audit (r8unorm planes):", text_out)
+            self.assertIn("Any Video Plane Sampled By Draw: NO", text_out)
+            self.assertIn("Start-Screen Skips Audit:", text_out)
+            self.assertIn("0x0000000000009001 / 0x0000000000009002", text_out)
+            self.assertNotIn("secret_host_dir_933", text_out)
+            self.assertNotIn("local_capture_secret", text_out)
+            self.assertNotIn("deadbeef", text_out.lower())
+            self.assertNotIn("cafebabe", text_out.lower())
+
+        # Empty stream edge case
+        empty = gpu_trace.decode_stream(b"", strict=True)
+        bink_empty = gpu_trace.audit_bink_video(empty)
+        skips_empty = gpu_trace.audit_start_screen_skips(empty)
+        self.assertEqual(bink_empty["r8unorm_texture_count"], 0)
+        self.assertFalse(bink_empty["any_plane_sampled_by_draw"])
+        self.assertTrue(skips_empty["ok"])
+        self.assertEqual(skips_empty["ranked_pairs"], [])
+        self.assertIn("(none)", gpu_trace.format_bink_video_audit_text(bink_empty))
+        self.assertIn("CLEAN (0 anomalies)", gpu_trace.format_start_screen_skips_text(skips_empty))
+
+    def test_bink_and_start_screen_audits_on_state_bridge_fixture(self) -> None:
+        fixture = REPO_ROOT / "tests" / "fixtures" / "state_bridge_frame.hex"
+        if not fixture.is_file():
+            self.skipTest("state_bridge_frame.hex fixture not present")
+        raw = bytes.fromhex("".join(fixture.read_text(encoding="utf-8").split()))
+        trace = gpu_trace.decode_stream(raw, strict=True)
+        bink = gpu_trace.audit_bink_video(trace)
+        self.assertEqual(bink["r8unorm_texture_count"], 0)
+        self.assertFalse(bink["any_plane_sampled_by_draw"])
+        skips = gpu_trace.audit_start_screen_skips(trace)
+        self.assertTrue(skips["ok"], skips)
+        self.assertEqual(skips["total_anomalies"], 0)
+        self.assertEqual(skips["ranked_pairs"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
