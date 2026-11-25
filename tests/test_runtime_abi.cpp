@@ -977,6 +977,12 @@ void test_v2_opcodes_and_payload_layouts() {
     CHECK(offsetof(GpuBindGroupLayoutEntry, view_dimension) == 10);
     CHECK(offsetof(GpuBindGroupLayoutEntry, flags) == 11);
     CHECK(offsetof(GpuBindGroupLayoutEntry, storage_format) == 12);
+    CHECK(offsetof(GpuBindGroupLayoutEntry, binding_array_size) == 14);
+    CHECK(offsetof(GpuBindGroupEntry2, array_index) == 12);
+    CHECK(offsetof(GpuBindGroupEntry2, reserved) == 14);
+    CHECK(offsetof(GpuCreateBindGroup2Payload, flags) == 12);
+    CHECK(GpuLayoutFlags::BindingArrays == 0x2u && GpuBindGroupFlags::BindingArrays == 0x1u);
+    CHECK(kGpuMaxBindingArraySize == 256);
     CHECK(offsetof(GpuCreateBindGroupLayoutPayload, content_id) == 16);
     CHECK(offsetof(GpuCreatePipelineLayoutPayload, content_id) == 16);
     CHECK(offsetof(GpuCreateComputePipeline2Payload, key) == 16);

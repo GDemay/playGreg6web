@@ -809,6 +809,9 @@ enum class HeapIndexSource : uint8_t {
     CbRootConstants = 1,
     CbRootDescriptor = 2,
     CbTable = 3,
+    // No index is read: the index is 0 (plus ShaderBinding::array_index). A lane-indexed heap window
+    // without a CB window base (G62).
+    Constant = 4,
 };
 
 struct ShaderBinding {
@@ -833,6 +836,12 @@ struct ShaderBinding {
     uint32_t cb_byte_offset = 0;
     uint32_t cb_bit_offset = 0;
     uint32_t cb_mask = 0xffffffffu;
+    // Binding array element (G62, #482; a lane-indexed heap window bound as a WGSL binding_array):
+    // element `array_index` of an array of `array_size` heap descriptors. The element reads the heap
+    // index above plus array_index (the window starts at that index). array_size 0 = not an array.
+    // The bridge expands a layout entry of N elements into N joins, array_index 0..N-1.
+    uint32_t array_size = 0;
+    uint32_t array_index = 0;
     // Direct table slot (register/space unused): descriptor `table_slot` of descriptor-table
     // parameter `table_parameter`, whether or not the root signature declares a range there. Console
     // stages read their tables as memory, past the ranges a title's root signature declares (G62).
@@ -851,7 +860,8 @@ inline bool same_join(const ShaderBinding& a, const ShaderBinding& b) noexcept {
            a.heap_index_parameter == b.heap_index_parameter && a.heap_index_dword == b.heap_index_dword &&
            a.heap_shift == b.heap_shift && a.heap_index_source == b.heap_index_source &&
            a.cb_table_slot == b.cb_table_slot && a.cb_byte_offset == b.cb_byte_offset &&
-           a.cb_bit_offset == b.cb_bit_offset && a.cb_mask == b.cb_mask && a.table_parameter == b.table_parameter &&
+           a.cb_bit_offset == b.cb_bit_offset && a.cb_mask == b.cb_mask && a.array_size == b.array_size &&
+           a.array_index == b.array_index && a.table_parameter == b.table_parameter &&
            a.table_slot == b.table_slot && a.inline_sampler == b.inline_sampler &&
            std::memcmp(&a.sampler, &b.sampler, sizeof(a.sampler)) == 0;
 }
@@ -880,6 +890,7 @@ struct PlanEntry {
     uint32_t cb_byte_offset = 0;
     uint32_t cb_bit_offset = 0;
     uint32_t cb_mask = 0xffffffffu;
+    uint32_t heap_index_bias = 0;  // HeapIndexed: added to the index (binding array element, ShaderBinding::array_index)
     SamplerDesc sampler{};                     // InlineSampler
 };
 
