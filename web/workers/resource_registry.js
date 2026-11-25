@@ -15,6 +15,8 @@
   const DEFAULT_SOFT_BUDGET_BYTES = 512 * 1024 * 1024; // 512 MiB
   const DEFAULT_OLDEST_LIVE_LIMIT = 16;
   const DEFAULT_MAX_CACHED_VIEWS_PER_TEXTURE = 16;
+  const FAST_HANDLE_LIMIT = 65536;
+  const DEFAULT_MAX_STALE_HANDLE_HISTORY = 16384;
 
   const CREATE_TEXTURE2_OPCODE = 35;
   const CREATE_TEXTURE2_PAYLOAD_BYTES = 40;
@@ -266,6 +268,77 @@
 
   const RESOURCE_KINDS = Object.freeze(Object.values(RESOURCE_KIND));
   const VALID_KIND_SET = new Set(RESOURCE_KINDS);
+
+  // Per-category VRAM accounting buckets (W300, #1077/#1207).
+  const VRAM_KIND = Object.freeze({
+    BUFFER: 'buffer',
+    TEXTURE: 'texture',
+    RENDER_TARGET: 'renderTarget',
+    SAMPLER: 'sampler',
+    OTHER: 'other',
+  });
+
+  const VRAM_KINDS = Object.freeze([
+    VRAM_KIND.BUFFER,
+    VRAM_KIND.TEXTURE,
+    VRAM_KIND.RENDER_TARGET,
+    VRAM_KIND.SAMPLER,
+    VRAM_KIND.OTHER,
+  ]);
+  const VALID_VRAM_KIND_SET = new Set(VRAM_KINDS);
+
+  /**
+   * Resolve the VRAM accounting bucket (`buffer`, `texture`, `renderTarget`,
+   * `sampler`, or `other`) for a resource registration.
+   *
+   * @param {string} kind
+   * @param {object | null | undefined} resource
+   * @param {object | null | undefined} [meta]
+   * @returns {'buffer' | 'texture' | 'renderTarget' | 'sampler' | 'other'}
+   */
+  function resolveVramKind(kind, resource, meta) {
+    if (meta && typeof meta === 'object') {
+      if (typeof meta.vramKind === 'string') {
+        return VALID_VRAM_KIND_SET.has(meta.vramKind) ? meta.vramKind : VRAM_KIND.OTHER;
+      }
+      if (meta.isRenderTarget === true || meta.renderTarget === true) {
+        return VRAM_KIND.RENDER_TARGET;
+      }
+    }
+
+    if (kind === RESOURCE_KIND.BUFFER) {
+      return VRAM_KIND.BUFFER;
+    }
+    if (kind === RESOURCE_KIND.SAMPLER) {
+      return VRAM_KIND.SAMPLER;
+    }
+    if (kind === RESOURCE_KIND.TEXTURE) {
+      const desc =
+        meta && meta.descriptor && typeof meta.descriptor === 'object' ? meta.descriptor : null;
+      if (desc && (desc.isRenderTarget === true || desc.renderTarget === true)) {
+        return VRAM_KIND.RENDER_TARGET;
+      }
+      let usage = 0;
+      if (meta && meta.usage !== undefined) {
+        usage = Number(meta.usage) >>> 0;
+      } else if (meta && meta.usageFlags !== undefined) {
+        usage = Number(meta.usageFlags) >>> 0;
+      } else if (meta && meta.usage_flags !== undefined) {
+        usage = Number(meta.usage_flags) >>> 0;
+      } else if (desc && desc.usage !== undefined) {
+        usage = Number(desc.usage) >>> 0;
+      } else if (desc && desc.usageFlags !== undefined) {
+        usage = Number(desc.usageFlags) >>> 0;
+      } else if (resource && typeof resource === 'object' && resource.usage !== undefined) {
+        usage = Number(resource.usage) >>> 0;
+      }
+      if ((usage & GPU_TEXTURE_USAGE.RENDER_ATTACHMENT) !== 0) {
+        return VRAM_KIND.RENDER_TARGET;
+      }
+      return VRAM_KIND.TEXTURE;
+    }
+    return VRAM_KIND.OTHER;
+  }
 
   function assertValidKind(kind) {
     if (typeof kind !== 'string' || !VALID_KIND_SET.has(kind)) {
@@ -1392,6 +1465,7 @@
         device = null,
         includeSrgbSiblingViewFormat = false,
         maxCachedViewsPerTexture = DEFAULT_MAX_CACHED_VIEWS_PER_TEXTURE,
+        maxStaleHandleHistory = DEFAULT_MAX_STALE_HANDLE_HISTORY,
         onBudgetWarning = null,
         onDestroyError = null,
         onSanitizeWarning = null,
@@ -1399,6 +1473,7 @@
 
       assertPositiveInteger(framesInFlight, 'framesInFlight');
       assertPositiveInteger(maxCachedViewsPerTexture, 'maxCachedViewsPerTexture');
+      assertPositiveInteger(maxStaleHandleHistory, 'maxStaleHandleHistory');
 
       let resolvedBudget = null;
       if (softBudgetBytes !== null && softBudgetBytes !== Infinity) {
@@ -1424,18 +1499,69 @@
       this.device = device;
       this.includeSrgbSiblingViewFormat = Boolean(includeSrgbSiblingViewFormat);
       this.maxCachedViewsPerTexture = maxCachedViewsPerTexture;
+      this._maxStaleHandleHistory = maxStaleHandleHistory;
       this._onBudgetWarning = onBudgetWarning;
       this._onDestroyError = onDestroyError;
       this._onSanitizeWarning = onSanitizeWarning;
 
       /** @type {Map<string, Map<number, object>>} */
       this._tables = new Map();
+      /** @type {Record<string, Map<number, object>>} */
+      this._tablesByKind = Object.create(null);
+      /** @type {Record<string, Array<object | undefined>>} */
+      this._fastSlotsByKind = Object.create(null);
+      /** @type {Record<string, Set<number>>} */
+      this._retiredHandlesByKind = Object.create(null);
       /** @type {Record<string, number>} */
       this._activeBytesByKind = {};
       for (let i = 0; i < RESOURCE_KINDS.length; i += 1) {
         const kind = RESOURCE_KINDS[i];
-        this._tables.set(kind, new Map());
+        const kindMap = new Map();
+        this._tables.set(kind, kindMap);
+        this._tablesByKind[kind] = kindMap;
+        this._fastSlotsByKind[kind] = [];
+        this._retiredHandlesByKind[kind] = new Set();
         this._activeBytesByKind[kind] = 0;
+      }
+
+      // Direct hot-path table & dense slot references (zero Map/string dispatch on typed lookups).
+      this._bufferTable = this._tablesByKind[RESOURCE_KIND.BUFFER];
+      this._textureTable = this._tablesByKind[RESOURCE_KIND.TEXTURE];
+      this._textureViewTable = this._tablesByKind[RESOURCE_KIND.TEXTURE_VIEW];
+      this._samplerTable = this._tablesByKind[RESOURCE_KIND.SAMPLER];
+      this._bindGroupTable = this._tablesByKind[RESOURCE_KIND.BIND_GROUP];
+      this._renderPipelineTable = this._tablesByKind[RESOURCE_KIND.RENDER_PIPELINE];
+      this._computePipelineTable = this._tablesByKind[RESOURCE_KIND.COMPUTE_PIPELINE];
+
+      this._fastBuffers = this._fastSlotsByKind[RESOURCE_KIND.BUFFER];
+      this._fastTextures = this._fastSlotsByKind[RESOURCE_KIND.TEXTURE];
+      this._fastTextureViews = this._fastSlotsByKind[RESOURCE_KIND.TEXTURE_VIEW];
+      this._fastSamplers = this._fastSlotsByKind[RESOURCE_KIND.SAMPLER];
+      this._fastBindGroups = this._fastSlotsByKind[RESOURCE_KIND.BIND_GROUP];
+      this._fastRenderPipelines = this._fastSlotsByKind[RESOURCE_KIND.RENDER_PIPELINE];
+      this._fastComputePipelines = this._fastSlotsByKind[RESOURCE_KIND.COMPUTE_PIPELINE];
+
+      this._retiredBuffers = this._retiredHandlesByKind[RESOURCE_KIND.BUFFER];
+      this._retiredTextures = this._retiredHandlesByKind[RESOURCE_KIND.TEXTURE];
+      this._retiredTextureViews = this._retiredHandlesByKind[RESOURCE_KIND.TEXTURE_VIEW];
+      this._retiredSamplers = this._retiredHandlesByKind[RESOURCE_KIND.SAMPLER];
+      this._retiredBindGroups = this._retiredHandlesByKind[RESOURCE_KIND.BIND_GROUP];
+      this._retiredRenderPipelines = this._retiredHandlesByKind[RESOURCE_KIND.RENDER_PIPELINE];
+      this._retiredComputePipelines = this._retiredHandlesByKind[RESOURCE_KIND.COMPUTE_PIPELINE];
+
+      // Per-VRAM-kind live/pending/peak accounting (W300, #1077/#1207).
+      this._vramLiveBytesByKind = Object.create(null);
+      this._vramPendingBytesByKind = Object.create(null);
+      this._vramPeakBytesByKind = Object.create(null);
+      this._vramPeakLiveBytesByKind = Object.create(null);
+      this._vramLiveCountByKind = Object.create(null);
+      for (let i = 0; i < VRAM_KINDS.length; i += 1) {
+        const vk = VRAM_KINDS[i];
+        this._vramLiveBytesByKind[vk] = 0;
+        this._vramPendingBytesByKind[vk] = 0;
+        this._vramPeakBytesByKind[vk] = 0;
+        this._vramPeakLiveBytesByKind[vk] = 0;
+        this._vramLiveCountByKind[vk] = 0;
       }
 
       /** @type {Map<number, object>} */
@@ -1461,6 +1587,7 @@
       this._pendingFences = new Set();
       /** @type {WeakSet<object>} */
       this._destroyedResources = new WeakSet();
+      this._hasDestroyedResources = false;
 
       this._currentFrame = 0;
       this._generation = 0;
@@ -1477,6 +1604,13 @@
       this._totalRetired = 0;
       this._totalDestroyed = 0;
       this._destroyErrors = 0;
+
+      // W300 stale-eviction and O(1) fast-path telemetry counters.
+      this._evictedCount = 0;
+      this._evictedBytes = 0;
+      this._staleLookupMisses = 0;
+      this._fastHandleHits = 0;
+      this._fastHandleOverflowHits = 0;
 
       // Sanitized Frame-1 hardening counters exposed on getStats().
       this._bcFormatFallbackCount = 0;
@@ -1526,11 +1660,167 @@
     }
 
     _updatePeakBytes() {
-      const totalBytes = this._activeBytes + this._pendingRetireBytes;
+      const totalBytes =
+        sanitizeNonNegativeCounter(this._activeBytes) +
+        sanitizeNonNegativeCounter(this._pendingRetireBytes);
       if (totalBytes > this._peakBytes) {
         this._peakBytes = totalBytes;
       }
       return totalBytes;
+    }
+
+    _updateVramPeaks(vramKind) {
+      const liveBytes = sanitizeNonNegativeCounter(this._vramLiveBytesByKind[vramKind]);
+      const pendingBytes = sanitizeNonNegativeCounter(this._vramPendingBytesByKind[vramKind]);
+      const totalKindBytes = liveBytes + pendingBytes;
+      if (liveBytes > this._vramPeakLiveBytesByKind[vramKind]) {
+        this._vramPeakLiveBytesByKind[vramKind] = liveBytes;
+      }
+      if (totalKindBytes > this._vramPeakBytesByKind[vramKind]) {
+        this._vramPeakBytesByKind[vramKind] = totalKindBytes;
+      }
+    }
+
+    _markHandleStale(kind, handle) {
+      const retiredSet = this._retiredHandlesByKind[kind];
+      if (!retiredSet) {
+        return;
+      }
+      if (retiredSet.has(handle)) {
+        retiredSet.delete(handle);
+      } else if (retiredSet.size >= this._maxStaleHandleHistory) {
+        const oldest = retiredSet.values().next().value;
+        if (oldest !== undefined) {
+          retiredSet.delete(oldest);
+        }
+      }
+      retiredSet.add(handle);
+    }
+
+    _setFastSlot(kind, handle, resource) {
+      if (handle >= 0 && handle < FAST_HANDLE_LIMIT) {
+        this._fastSlotsByKind[kind][handle] = resource;
+      }
+    }
+
+    _clearFastSlot(kind, handle, table) {
+      if (handle >= 0 && handle < FAST_HANDLE_LIMIT) {
+        const slots = this._fastSlotsByKind[kind];
+        if (table.size === 0) {
+          slots.length = 0;
+        } else if (handle < slots.length) {
+          slots[handle] = undefined;
+        }
+      }
+    }
+
+    _cleanupKindMetadata(kind, handle, entry) {
+      if (kind === RESOURCE_KIND.BUFFER) {
+        this._bufferMeta.delete(handle);
+      } else if (kind === RESOURCE_KIND.TEXTURE) {
+        this._textureMeta.delete(handle);
+        this._activeTextureGeneration.delete(handle);
+        this._invalidateTextureViews(handle, { retireLinkedTableViews: true });
+      } else if (kind === RESOURCE_KIND.TEXTURE_VIEW) {
+        if (entry.textureId !== undefined && entry.textureId !== null) {
+          const linkedSet = this._linkedViewHandlesByTexture.get(entry.textureId);
+          if (linkedSet) {
+            linkedSet.delete(handle);
+            if (linkedSet.size === 0) {
+              this._linkedViewHandlesByTexture.delete(entry.textureId);
+            }
+          }
+          if (entry.resource && typeof entry.resource === 'object') {
+            const viewMeta = this._viewMetadata.get(entry.resource);
+            if (viewMeta) {
+              viewMeta.invalidated = true;
+            }
+          }
+        }
+      }
+    }
+
+    _peek(kind, handle) {
+      const slots = this._fastSlotsByKind[kind];
+      if (!slots) {
+        return undefined;
+      }
+      if (handle >= 0 && handle < FAST_HANDLE_LIMIT && (handle | 0) === handle) {
+        return slots[handle];
+      }
+      const entry = this._tablesByKind[kind].get(handle);
+      return entry ? entry.resource : undefined;
+    }
+
+    _evictDestroyedEntry(kind, handle) {
+      const table = this._tablesByKind[kind];
+      if (!table) {
+        return 0;
+      }
+      const entry = table.get(handle);
+      if (!entry) {
+        return 0;
+      }
+
+      table.delete(handle);
+      this._clearFastSlot(kind, handle, table);
+      this._markHandleStale(kind, handle);
+      this._cleanupKindMetadata(kind, handle, entry);
+
+      const byteSize = sanitizeNonNegativeCounter(entry.byteSize);
+      const vramKind = entry.vramKind || VRAM_KIND.OTHER;
+
+      this._activeBytes = Math.max(0, this._activeBytes - byteSize);
+      this._activeBytesByKind[kind] = Math.max(0, this._activeBytesByKind[kind] - byteSize);
+      this._vramLiveBytesByKind[vramKind] = Math.max(
+        0,
+        this._vramLiveBytesByKind[vramKind] - byteSize
+      );
+      this._vramLiveCountByKind[vramKind] = Math.max(
+        0,
+        this._vramLiveCountByKind[vramKind] - 1
+      );
+
+      if (entry.resource && typeof entry.resource === 'object') {
+        this._destroyedResources.add(entry.resource);
+        this._hasDestroyedResources = true;
+      }
+      entry.destroyed = true;
+      entry.resource = null;
+
+      this._totalDestroyed += 1;
+      this._evictedCount += 1;
+      this._evictedBytes += byteSize;
+      this._checkBudget(null);
+      return byteSize;
+    }
+
+    _buildVramByKindSnapshot() {
+      const snapshot = {};
+      for (let i = 0; i < VRAM_KINDS.length; i += 1) {
+        const vk = VRAM_KINDS[i];
+        const count = sanitizeNonNegativeCounter(this._vramLiveCountByKind[vk]);
+        const liveBytes = sanitizeNonNegativeCounter(this._vramLiveBytesByKind[vk]);
+        const pendingRetireBytes = sanitizeNonNegativeCounter(this._vramPendingBytesByKind[vk]);
+        const totalBytes = liveBytes + pendingRetireBytes;
+        const peakLiveBytes = Math.max(
+          liveBytes,
+          sanitizeNonNegativeCounter(this._vramPeakLiveBytesByKind[vk])
+        );
+        const peakBytes = Math.max(
+          totalBytes,
+          sanitizeNonNegativeCounter(this._vramPeakBytesByKind[vk])
+        );
+        snapshot[vk] = {
+          count,
+          liveBytes,
+          pendingRetireBytes,
+          totalBytes,
+          peakBytes,
+          peakLiveBytes,
+        };
+      }
+      return snapshot;
     }
 
     _updatePeakLiveCounts(kind) {
@@ -1611,6 +1901,7 @@
 
       if (resource && typeof resource === 'object' && !this._destroyedResources.has(resource)) {
         this._destroyedResources.add(resource);
+        this._hasDestroyedResources = true;
         if (typeof resource.destroy === 'function') {
           try {
             resource.destroy();
@@ -1887,17 +2178,37 @@
         linkedTextureId = meta.textureId;
       }
 
-      const table = this._tables.get(kind);
+      const table = this._tablesByKind[kind];
       const existing = table.get(handle);
+      const vramKind = resolveVramKind(kind, resource, meta);
 
       if (existing) {
         if (existing.resource === resource) {
-          this._activeBytes = Math.max(0, this._activeBytes - existing.byteSize) + byteSize;
+          const prevByteSize = sanitizeNonNegativeCounter(existing.byteSize);
+          const prevVramKind = existing.vramKind || VRAM_KIND.OTHER;
+          this._activeBytes = Math.max(0, this._activeBytes - prevByteSize) + byteSize;
           this._activeBytesByKind[kind] =
-            Math.max(0, this._activeBytesByKind[kind] - existing.byteSize) + byteSize;
+            Math.max(0, this._activeBytesByKind[kind] - prevByteSize) + byteSize;
+          this._vramLiveBytesByKind[prevVramKind] = Math.max(
+            0,
+            this._vramLiveBytesByKind[prevVramKind] - prevByteSize
+          );
+          if (prevVramKind !== vramKind) {
+            this._vramLiveCountByKind[prevVramKind] = Math.max(
+              0,
+              this._vramLiveCountByKind[prevVramKind] - 1
+            );
+            this._vramLiveCountByKind[vramKind] += 1;
+          }
+          this._vramLiveBytesByKind[vramKind] += byteSize;
+
           existing.byteSize = byteSize;
+          existing.vramKind = vramKind;
           existing.label = label;
           existing.tag = tag;
+
+          this._setFastSlot(kind, handle, resource);
+          this._retiredHandlesByKind[kind].delete(handle);
 
           if (kind === RESOURCE_KIND.TEXTURE) {
             const currentGen = this._activeTextureGeneration.get(handle) || 1;
@@ -1913,6 +2224,7 @@
             }
           }
 
+          this._updateVramPeaks(vramKind);
           this._updatePeakBytes();
           this._checkBudget({ kind, handle, label });
           return resource;
@@ -1939,6 +2251,7 @@
 
       const entry = {
         kind,
+        vramKind,
         handle,
         resource,
         byteSize,
@@ -1958,6 +2271,8 @@
       this._nextRegistrationSeq += 1;
 
       table.set(handle, entry);
+      this._setFastSlot(kind, handle, resource);
+      this._retiredHandlesByKind[kind].delete(handle);
       this._updatePeakLiveCounts(kind);
 
       if (kind === RESOURCE_KIND.TEXTURE) {
@@ -1991,8 +2306,11 @@
 
       this._activeBytes += byteSize;
       this._activeBytesByKind[kind] += byteSize;
+      this._vramLiveBytesByKind[vramKind] += byteSize;
+      this._vramLiveCountByKind[vramKind] += 1;
       this._totalRegistered += 1;
 
+      this._updateVramPeaks(vramKind);
       this._updatePeakBytes();
       this._checkBudget({ kind, handle, label });
 
@@ -2233,6 +2551,17 @@
               sanitized.descriptor.sampleCount
             );
 
+      const vramKind =
+        options && typeof options.vramKind === 'string'
+          ? resolveVramKind(RESOURCE_KIND.TEXTURE, texture, options)
+          : (options && (options.isRenderTarget === true || options.renderTarget === true)) ||
+              (descriptor &&
+                typeof descriptor === 'object' &&
+                (descriptor.isRenderTarget === true || descriptor.renderTarget === true)) ||
+              (sanitized.descriptor.usage & GPU_TEXTURE_USAGE.RENDER_ATTACHMENT) !== 0
+            ? VRAM_KIND.RENDER_TARGET
+            : VRAM_KIND.TEXTURE;
+
       // Registering on an existing handle automatically retires the prior texture,
       // increments textureGeneration & textureRecreations, and invalidates all
       // cached/linked views for `handle`.
@@ -2240,6 +2569,7 @@
         byteSize: estimatedBytes,
         label,
         tag,
+        vramKind,
         _skipAutoTextureMeta: true,
       });
 
@@ -2350,7 +2680,7 @@
         return {
           id: decoded.id,
           texture,
-          view: this.get(RESOURCE_KIND.TEXTURE_VIEW, decoded.id) || null,
+          view: this._peek(RESOURCE_KIND.TEXTURE_VIEW, decoded.id) || null,
           meta: this.getTextureMeta(decoded.id) || null,
         };
       } catch (err) {
@@ -2705,17 +3035,245 @@
     }
 
     /**
-     * Look up an active resource by `(kind, handle)`.
+     * Look up an active resource by `(kind, handle)` using an O(1) zero-allocation
+     * direct-indexed fast path for numeric handles `< FAST_HANDLE_LIMIT`.
+     * Automatically detects and evicts externally destroyed resources, and records
+     * `staleLookupMisses` when querying a previously retired or destroyed handle.
      *
      * @param {string} kind
      * @param {number} handle
      * @returns {object | undefined}
      */
     get(kind, handle) {
-      assertValidKind(kind);
+      const slots = this._fastSlotsByKind[kind];
+      if (slots === undefined) {
+        assertValidKind(kind);
+      }
+      if (typeof handle === 'number' && handle >= 0) {
+        if (handle < FAST_HANDLE_LIMIT && (handle | 0) === handle) {
+          const res = slots[handle];
+          if (res !== undefined) {
+            if (
+              res.destroyed === true ||
+              (this._hasDestroyedResources && this._destroyedResources.has(res))
+            ) {
+              this._evictDestroyedEntry(kind, handle);
+              this._staleLookupMisses += 1;
+              return undefined;
+            }
+            this._fastHandleHits += 1;
+            return res;
+          }
+          if (this._retiredHandlesByKind[kind].has(handle)) {
+            this._staleLookupMisses += 1;
+          }
+          return undefined;
+        }
+        if (Number.isSafeInteger(handle)) {
+          const entry = this._tablesByKind[kind].get(handle);
+          if (entry !== undefined) {
+            const res = entry.resource;
+            if (
+              res &&
+              (res.destroyed === true ||
+                (this._hasDestroyedResources && this._destroyedResources.has(res)))
+            ) {
+              this._evictDestroyedEntry(kind, handle);
+              this._staleLookupMisses += 1;
+              return undefined;
+            }
+            this._fastHandleOverflowHits += 1;
+            return res;
+          }
+          if (this._retiredHandlesByKind[kind].has(handle)) {
+            this._staleLookupMisses += 1;
+          }
+          return undefined;
+        }
+      }
       assertValidHandle(handle);
-      const entry = this._tables.get(kind).get(handle);
-      return entry ? entry.resource : undefined;
+      return undefined;
+    }
+
+    /**
+     * O(1) zero-allocation, exception-free handle lookup for hot draw/bind paths.
+     * Avoids string formatting, error allocation, and Map hashing for dense
+     * numeric handles `< FAST_HANDLE_LIMIT`, falling back to O(1) Map lookup for
+     * larger safe-integer handles. Returns `undefined` for missing, invalid, or
+     * stale/destroyed handles.
+     *
+     * @param {string} kind
+     * @param {number} handle
+     * @returns {object | undefined}
+     */
+    getFast(kind, handle) {
+      const slots = this._fastSlotsByKind[kind];
+      if (slots === undefined || typeof handle !== 'number' || handle < 0) {
+        return undefined;
+      }
+      if (handle < FAST_HANDLE_LIMIT && (handle | 0) === handle) {
+        const res = slots[handle];
+        if (res !== undefined) {
+          if (
+            res.destroyed === true ||
+            (this._hasDestroyedResources && this._destroyedResources.has(res))
+          ) {
+            this._evictDestroyedEntry(kind, handle);
+            this._staleLookupMisses += 1;
+            return undefined;
+          }
+          this._fastHandleHits += 1;
+          return res;
+        }
+        if (this._retiredHandlesByKind[kind].has(handle)) {
+          this._staleLookupMisses += 1;
+        }
+        return undefined;
+      }
+      if (Number.isSafeInteger(handle)) {
+        const entry = this._tablesByKind[kind].get(handle);
+        if (entry !== undefined) {
+          const res = entry.resource;
+          if (
+            res &&
+            (res.destroyed === true ||
+              (this._hasDestroyedResources && this._destroyedResources.has(res)))
+          ) {
+            this._evictDestroyedEntry(kind, handle);
+            this._staleLookupMisses += 1;
+            return undefined;
+          }
+          this._fastHandleOverflowHits += 1;
+          return res;
+        }
+        if (this._retiredHandlesByKind[kind].has(handle)) {
+          this._staleLookupMisses += 1;
+        }
+      }
+      return undefined;
+    }
+
+    _getTypedFast(kind, slots, table, retiredSet, handle) {
+      if (typeof handle !== 'number' || handle < 0) {
+        return undefined;
+      }
+      if (handle < FAST_HANDLE_LIMIT && (handle | 0) === handle) {
+        const res = slots[handle];
+        if (res !== undefined) {
+          if (
+            res.destroyed === true ||
+            (this._hasDestroyedResources && this._destroyedResources.has(res))
+          ) {
+            this._evictDestroyedEntry(kind, handle);
+            this._staleLookupMisses += 1;
+            return undefined;
+          }
+          this._fastHandleHits += 1;
+          return res;
+        }
+        if (retiredSet.has(handle)) {
+          this._staleLookupMisses += 1;
+        }
+        return undefined;
+      }
+      if (Number.isSafeInteger(handle)) {
+        const entry = table.get(handle);
+        if (entry !== undefined) {
+          const res = entry.resource;
+          if (
+            res &&
+            (res.destroyed === true ||
+              (this._hasDestroyedResources && this._destroyedResources.has(res)))
+          ) {
+            this._evictDestroyedEntry(kind, handle);
+            this._staleLookupMisses += 1;
+            return undefined;
+          }
+          this._fastHandleOverflowHits += 1;
+          return res;
+        }
+        if (retiredSet.has(handle)) {
+          this._staleLookupMisses += 1;
+        }
+      }
+      return undefined;
+    }
+
+    /** O(1) zero-alloc GPUBuffer lookup by numeric handle. */
+    getBufferFast(handle) {
+      return this._getTypedFast(
+        RESOURCE_KIND.BUFFER,
+        this._fastBuffers,
+        this._bufferTable,
+        this._retiredBuffers,
+        handle
+      );
+    }
+
+    /** O(1) zero-alloc GPUTexture lookup by numeric handle. */
+    getTextureFast(handle) {
+      return this._getTypedFast(
+        RESOURCE_KIND.TEXTURE,
+        this._fastTextures,
+        this._textureTable,
+        this._retiredTextures,
+        handle
+      );
+    }
+
+    /** O(1) zero-alloc GPUTextureView lookup by numeric handle. */
+    getTextureViewFast(handle) {
+      return this._getTypedFast(
+        RESOURCE_KIND.TEXTURE_VIEW,
+        this._fastTextureViews,
+        this._textureViewTable,
+        this._retiredTextureViews,
+        handle
+      );
+    }
+
+    /** O(1) zero-alloc GPUSampler lookup by numeric handle. */
+    getSamplerFast(handle) {
+      return this._getTypedFast(
+        RESOURCE_KIND.SAMPLER,
+        this._fastSamplers,
+        this._samplerTable,
+        this._retiredSamplers,
+        handle
+      );
+    }
+
+    /** O(1) zero-alloc GPUBindGroup lookup by numeric handle. */
+    getBindGroupFast(handle) {
+      return this._getTypedFast(
+        RESOURCE_KIND.BIND_GROUP,
+        this._fastBindGroups,
+        this._bindGroupTable,
+        this._retiredBindGroups,
+        handle
+      );
+    }
+
+    /** O(1) zero-alloc GPURenderPipeline lookup by numeric handle. */
+    getRenderPipelineFast(handle) {
+      return this._getTypedFast(
+        RESOURCE_KIND.RENDER_PIPELINE,
+        this._fastRenderPipelines,
+        this._renderPipelineTable,
+        this._retiredRenderPipelines,
+        handle
+      );
+    }
+
+    /** O(1) zero-alloc GPUComputePipeline lookup by numeric handle. */
+    getComputePipelineFast(handle) {
+      return this._getTypedFast(
+        RESOURCE_KIND.COMPUTE_PIPELINE,
+        this._fastComputePipelines,
+        this._computePipelineTable,
+        this._retiredComputePipelines,
+        handle
+      );
     }
 
     /**
@@ -2728,8 +3286,24 @@
     getEntry(kind, handle) {
       assertValidKind(kind);
       assertValidHandle(handle);
-      const entry = this._tables.get(kind).get(handle);
-      return entry ? snapshotEntry(entry) : undefined;
+      const entry = this._tablesByKind[kind].get(handle);
+      if (!entry) {
+        if (this._retiredHandlesByKind[kind].has(handle)) {
+          this._staleLookupMisses += 1;
+        }
+        return undefined;
+      }
+      const res = entry.resource;
+      if (
+        res &&
+        (res.destroyed === true ||
+          (this._hasDestroyedResources && this._destroyedResources.has(res)))
+      ) {
+        this._evictDestroyedEntry(kind, handle);
+        this._staleLookupMisses += 1;
+        return undefined;
+      }
+      return snapshotEntry(entry);
     }
 
     /**
@@ -2740,9 +3314,71 @@
      * @returns {boolean}
      */
     has(kind, handle) {
-      assertValidKind(kind);
+      const slots = this._fastSlotsByKind[kind];
+      if (slots === undefined) {
+        assertValidKind(kind);
+      }
+      if (typeof handle === 'number' && handle >= 0) {
+        if (handle < FAST_HANDLE_LIMIT && (handle | 0) === handle) {
+          const res = slots[handle];
+          return (
+            res !== undefined &&
+            res.destroyed !== true &&
+            (!this._hasDestroyedResources || !this._destroyedResources.has(res))
+          );
+        }
+        if (Number.isSafeInteger(handle)) {
+          const entry = this._tablesByKind[kind].get(handle);
+          if (!entry) {
+            return false;
+          }
+          const res = entry.resource;
+          return (
+            res !== null &&
+            res !== undefined &&
+            res.destroyed !== true &&
+            (!this._hasDestroyedResources || !this._destroyedResources.has(res))
+          );
+        }
+      }
       assertValidHandle(handle);
-      return this._tables.get(kind).has(handle);
+      return false;
+    }
+
+    /**
+     * O(1) zero-allocation, exception-free active resource existence check.
+     *
+     * @param {string} kind
+     * @param {number} handle
+     * @returns {boolean}
+     */
+    hasFast(kind, handle) {
+      const slots = this._fastSlotsByKind[kind];
+      if (slots === undefined || typeof handle !== 'number' || handle < 0) {
+        return false;
+      }
+      if (handle < FAST_HANDLE_LIMIT && (handle | 0) === handle) {
+        const res = slots[handle];
+        return (
+          res !== undefined &&
+          res.destroyed !== true &&
+          (!this._hasDestroyedResources || !this._destroyedResources.has(res))
+        );
+      }
+      if (Number.isSafeInteger(handle)) {
+        const entry = this._tablesByKind[kind].get(handle);
+        if (!entry) {
+          return false;
+        }
+        const res = entry.resource;
+        return (
+          res !== null &&
+          res !== undefined &&
+          res.destroyed !== true &&
+          (!this._hasDestroyedResources || !this._destroyedResources.has(res))
+        );
+      }
+      return false;
     }
 
     /**
@@ -2785,40 +3421,33 @@
       assertValidKind(kind);
       assertValidHandle(handle);
 
-      const table = this._tables.get(kind);
+      const table = this._tablesByKind[kind];
       const entry = table.get(handle);
       if (!entry) {
         return false;
       }
 
       table.delete(handle);
-      if (kind === RESOURCE_KIND.BUFFER) {
-        this._bufferMeta.delete(handle);
-      } else if (kind === RESOURCE_KIND.TEXTURE) {
-        this._textureMeta.delete(handle);
-        this._activeTextureGeneration.delete(handle);
-        this._invalidateTextureViews(handle, { retireLinkedTableViews: true });
-      } else if (kind === RESOURCE_KIND.TEXTURE_VIEW) {
-        if (entry.textureId !== undefined && entry.textureId !== null) {
-          const linkedSet = this._linkedViewHandlesByTexture.get(entry.textureId);
-          if (linkedSet) {
-            linkedSet.delete(handle);
-            if (linkedSet.size === 0) {
-              this._linkedViewHandlesByTexture.delete(entry.textureId);
-            }
-          }
-          if (entry.resource && typeof entry.resource === 'object') {
-            const viewMeta = this._viewMetadata.get(entry.resource);
-            if (viewMeta) {
-              viewMeta.invalidated = true;
-            }
-          }
-        }
-      }
+      this._clearFastSlot(kind, handle, table);
+      this._markHandleStale(kind, handle);
+      this._cleanupKindMetadata(kind, handle, entry);
 
-      this._activeBytes = Math.max(0, this._activeBytes - entry.byteSize);
-      this._activeBytesByKind[kind] = Math.max(0, this._activeBytesByKind[kind] - entry.byteSize);
-      this._pendingRetireBytes += entry.byteSize;
+      const byteSize = sanitizeNonNegativeCounter(entry.byteSize);
+      const vramKind = entry.vramKind || VRAM_KIND.OTHER;
+
+      this._activeBytes = Math.max(0, this._activeBytes - byteSize);
+      this._activeBytesByKind[kind] = Math.max(0, this._activeBytesByKind[kind] - byteSize);
+      this._pendingRetireBytes += byteSize;
+
+      this._vramLiveBytesByKind[vramKind] = Math.max(
+        0,
+        this._vramLiveBytesByKind[vramKind] - byteSize
+      );
+      this._vramLiveCountByKind[vramKind] = Math.max(
+        0,
+        this._vramLiveCountByKind[vramKind] - 1
+      );
+      this._vramPendingBytesByKind[vramKind] += byteSize;
 
       entry.retiredAtFrame = this._currentFrame;
       entry.sealed = false;
@@ -2829,6 +3458,91 @@
       this._pendingRetire.push(entry);
       this._totalRetired += 1;
       return true;
+    }
+
+    /**
+     * Immediately remove and destroy a single active resource `(kind, handle)`,
+     * reclaiming its per-kind VRAM bytes and recording eviction telemetry
+     * (`evictedCount`, `evictedBytes`) without waiting for `framesInFlight`.
+     *
+     * @param {string} kind
+     * @param {number} handle
+     * @returns {boolean} True if an active resource was destroyed, false otherwise
+     */
+    destroy(kind, handle) {
+      assertValidKind(kind);
+      assertValidHandle(handle);
+
+      const table = this._tablesByKind[kind];
+      const entry = table.get(handle);
+      if (!entry) {
+        return false;
+      }
+
+      table.delete(handle);
+      this._clearFastSlot(kind, handle, table);
+      this._markHandleStale(kind, handle);
+      this._cleanupKindMetadata(kind, handle, entry);
+
+      const byteSize = sanitizeNonNegativeCounter(entry.byteSize);
+      const vramKind = entry.vramKind || VRAM_KIND.OTHER;
+
+      this._activeBytes = Math.max(0, this._activeBytes - byteSize);
+      this._activeBytesByKind[kind] = Math.max(0, this._activeBytesByKind[kind] - byteSize);
+      this._vramLiveBytesByKind[vramKind] = Math.max(
+        0,
+        this._vramLiveBytesByKind[vramKind] - byteSize
+      );
+      this._vramLiveCountByKind[vramKind] = Math.max(
+        0,
+        this._vramLiveCountByKind[vramKind] - 1
+      );
+
+      if (this._destroyEntry(entry)) {
+        this._evictedCount += 1;
+        this._evictedBytes += byteSize;
+      }
+
+      this._checkBudget(null);
+      return true;
+    }
+
+    /**
+     * Proactively sweep all active resource tables and evict any entries whose
+     * underlying WebGPU resource has been destroyed externally (`resource.destroyed === true`).
+     * Updates per-kind VRAM accounting, `evictedCount`, and `evictedBytes`.
+     *
+     * @returns {{ evictedCount: number, evictedBytes: number }}
+     */
+    evictStale() {
+      let evictedCount = 0;
+      let evictedBytes = 0;
+
+      for (let i = 0; i < RESOURCE_KINDS.length; i += 1) {
+        const kind = RESOURCE_KINDS[i];
+        const table = this._tablesByKind[kind];
+        if (table.size === 0) {
+          continue;
+        }
+        const staleHandles = [];
+        for (const [handle, entry] of table.entries()) {
+          const res = entry.resource;
+          if (
+            !res ||
+            res.destroyed === true ||
+            (this._hasDestroyedResources && this._destroyedResources.has(res))
+          ) {
+            staleHandles.push(handle);
+          }
+        }
+        for (let j = 0; j < staleHandles.length; j += 1) {
+          const freed = this._evictDestroyedEntry(kind, staleHandles[j]);
+          evictedCount += 1;
+          evictedBytes += freed;
+        }
+      }
+
+      return { evictedCount, evictedBytes };
     }
 
     /**
@@ -2983,10 +3697,18 @@
         }
 
         if (eligible) {
-          this._pendingRetireBytes = Math.max(0, this._pendingRetireBytes - entry.byteSize);
-          freedBytes += entry.byteSize;
+          const byteSize = sanitizeNonNegativeCounter(entry.byteSize);
+          const vramKind = entry.vramKind || VRAM_KIND.OTHER;
+          this._pendingRetireBytes = Math.max(0, this._pendingRetireBytes - byteSize);
+          this._vramPendingBytesByKind[vramKind] = Math.max(
+            0,
+            this._vramPendingBytesByKind[vramKind] - byteSize
+          );
+          freedBytes += byteSize;
           if (this._destroyEntry(entry)) {
             destroyedCount += 1;
+            this._evictedCount += 1;
+            this._evictedBytes += byteSize;
           }
         } else {
           remaining.push(entry);
@@ -3058,9 +3780,60 @@
     }
 
     /**
+     * Return a sanitized per-kind VRAM accounting snapshot broken down into
+     * `buffer`, `texture`, `renderTarget`, `sampler`, and `other`, along with
+     * total live/pending/peak VRAM and stale-eviction byte counters.
+     *
+     * @returns {{
+     *   buffer: { count: number, liveBytes: number, pendingRetireBytes: number, totalBytes: number, peakBytes: number, peakLiveBytes: number },
+     *   texture: { count: number, liveBytes: number, pendingRetireBytes: number, totalBytes: number, peakBytes: number, peakLiveBytes: number },
+     *   renderTarget: { count: number, liveBytes: number, pendingRetireBytes: number, totalBytes: number, peakBytes: number, peakLiveBytes: number },
+     *   sampler: { count: number, liveBytes: number, pendingRetireBytes: number, totalBytes: number, peakBytes: number, peakLiveBytes: number },
+     *   other: { count: number, liveBytes: number, pendingRetireBytes: number, totalBytes: number, peakBytes: number, peakLiveBytes: number },
+     *   byKind: Record<string, { count: number, liveBytes: number, pendingRetireBytes: number, totalBytes: number, peakBytes: number, peakLiveBytes: number }>,
+     *   totalLiveBytes: number,
+     *   totalPendingRetireBytes: number,
+     *   totalBytes: number,
+     *   peakTotalVramBytes: number,
+     *   evictedCount: number,
+     *   evictedBytes: number,
+     *   softBudgetBytes: number | null,
+     *   budgetExceeded: boolean,
+     * }}
+     */
+    getVramBreakdown() {
+      const byKind = this._buildVramByKindSnapshot();
+      const activeBytes = sanitizeNonNegativeCounter(this._activeBytes);
+      const pendingRetireBytes = sanitizeNonNegativeCounter(this._pendingRetireBytes);
+      const totalBytes = activeBytes + pendingRetireBytes;
+      const peakTotalVramBytes = Math.max(
+        totalBytes,
+        sanitizeNonNegativeCounter(this._peakBytes)
+      );
+
+      return {
+        buffer: byKind[VRAM_KIND.BUFFER],
+        texture: byKind[VRAM_KIND.TEXTURE],
+        renderTarget: byKind[VRAM_KIND.RENDER_TARGET],
+        sampler: byKind[VRAM_KIND.SAMPLER],
+        other: byKind[VRAM_KIND.OTHER],
+        byKind,
+        totalLiveBytes: activeBytes,
+        totalPendingRetireBytes: pendingRetireBytes,
+        totalBytes,
+        peakTotalVramBytes,
+        evictedCount: sanitizeNonNegativeCounter(this._evictedCount),
+        evictedBytes: sanitizeNonNegativeCounter(this._evictedBytes),
+        softBudgetBytes: this.softBudgetBytes,
+        budgetExceeded: this._budgetExceeded,
+      };
+    }
+
+    /**
      * Return a sanitized snapshot of per-kind counts, VRAM byte accounting,
-     * lifecycle stats, Frame-1 hardening counters, and W250 texture-view &
-     * r8unorm/rgba8unorm format telemetry.
+     * lifecycle stats, Frame-1 hardening counters, W250 texture-view &
+     * r8unorm/rgba8unorm format telemetry, and W300 per-kind VRAM breakdown &
+     * stale-eviction telemetry.
      */
     getStats() {
       const countsByKind = {};
@@ -3068,7 +3841,7 @@
       let activeCount = 0;
       for (let i = 0; i < RESOURCE_KINDS.length; i += 1) {
         const kind = RESOURCE_KINDS[i];
-        const count = this._tables.get(kind).size;
+        const count = this._tablesByKind[kind].size;
         countsByKind[kind] = count;
         byKind[kind] = {
           count,
@@ -3094,6 +3867,7 @@
       const pendingRetireBytes = sanitizeNonNegativeCounter(this._pendingRetireBytes);
       const totalBytes = activeBytes + pendingRetireBytes;
       const peakBytes = Math.max(totalBytes, sanitizeNonNegativeCounter(this._peakBytes));
+      const vramByKind = this._buildVramByKindSnapshot();
 
       const liveTextures = countsByKind[RESOURCE_KIND.TEXTURE];
       const liveBuffers = countsByKind[RESOURCE_KIND.BUFFER];
@@ -3114,6 +3888,7 @@
       return {
         countsByKind,
         byKind,
+        vramByKind,
         pendingCountsByKind,
         activeCount,
         pendingRetireCount: this._pendingRetire.length,
@@ -3122,6 +3897,7 @@
         totalBytes,
         peakBytes,
         peakTotalBytes: peakBytes,
+        peakTotalVramBytes: peakBytes,
         peakLiveTextures,
         peakLiveBuffers,
         softBudgetBytes: this.softBudgetBytes,
@@ -3131,6 +3907,11 @@
         totalRetired: sanitizeNonNegativeCounter(this._totalRetired),
         totalDestroyed: sanitizeNonNegativeCounter(this._totalDestroyed),
         destroyErrors: sanitizeNonNegativeCounter(this._destroyErrors),
+        evictedCount: sanitizeNonNegativeCounter(this._evictedCount),
+        evictedBytes: sanitizeNonNegativeCounter(this._evictedBytes),
+        staleLookupMisses: sanitizeNonNegativeCounter(this._staleLookupMisses),
+        fastHandleHits: sanitizeNonNegativeCounter(this._fastHandleHits),
+        fastHandleOverflowHits: sanitizeNonNegativeCounter(this._fastHandleOverflowHits),
         currentFrame: sanitizeNonNegativeCounter(this._currentFrame),
         framesInFlight: this.framesInFlight,
         bcFormatFallbackCount: sanitizeNonNegativeCounter(this._bcFormatFallbackCount),
@@ -3156,8 +3937,9 @@
     /**
      * Reset cumulative telemetry counters while preserving all live resources,
      * cached texture views, texture generations, and deferred retirement queues.
-     * Re-baselines `peakBytes`, `peakLiveTextures`, and `peakLiveBuffers` to the
-     * current live occupancy so peak >= live invariants always hold.
+     * Re-baselines `peakBytes`, `peakTotalVramBytes`, per-kind `vramByKind` peaks,
+     * `peakLiveTextures`, and `peakLiveBuffers` to current live occupancy so
+     * peak >= live invariants always hold.
      *
      * @returns {object} Fresh `getStats()` snapshot after reset
      */
@@ -3165,14 +3947,28 @@
       this._peakBytes =
         sanitizeNonNegativeCounter(this._activeBytes) +
         sanitizeNonNegativeCounter(this._pendingRetireBytes);
-      this._peakLiveTextures = this._tables.get(RESOURCE_KIND.TEXTURE).size;
-      this._peakLiveBuffers = this._tables.get(RESOURCE_KIND.BUFFER).size;
+      this._peakLiveTextures = this._tablesByKind[RESOURCE_KIND.TEXTURE].size;
+      this._peakLiveBuffers = this._tablesByKind[RESOURCE_KIND.BUFFER].size;
+
+      for (let i = 0; i < VRAM_KINDS.length; i += 1) {
+        const vk = VRAM_KINDS[i];
+        const liveBytes = sanitizeNonNegativeCounter(this._vramLiveBytesByKind[vk]);
+        const pendingBytes = sanitizeNonNegativeCounter(this._vramPendingBytesByKind[vk]);
+        this._vramPeakLiveBytesByKind[vk] = liveBytes;
+        this._vramPeakBytesByKind[vk] = liveBytes + pendingBytes;
+      }
 
       this._budgetWarningCount = 0;
       this._totalRegistered = 0;
       this._totalRetired = 0;
       this._totalDestroyed = 0;
       this._destroyErrors = 0;
+
+      this._evictedCount = 0;
+      this._evictedBytes = 0;
+      this._staleLookupMisses = 0;
+      this._fastHandleHits = 0;
+      this._fastHandleOverflowHits = 0;
 
       this._bcFormatFallbackCount = 0;
       this._bcDimensionAlignCount = 0;
@@ -3221,7 +4017,7 @@
           }
         }
       }
-      const activeViewTable = this._tables.get(RESOURCE_KIND.TEXTURE_VIEW);
+      const activeViewTable = this._tablesByKind[RESOURCE_KIND.TEXTURE_VIEW];
       for (const viewEntry of activeViewTable.values()) {
         if (viewEntry && viewEntry.textureId !== undefined && viewEntry.textureId !== null) {
           const viewObj = viewEntry.resource;
@@ -3250,12 +4046,20 @@
       const toDestroy = [];
       for (let i = 0; i < RESOURCE_KINDS.length; i += 1) {
         const kind = RESOURCE_KINDS[i];
-        const table = this._tables.get(kind);
+        const table = this._tablesByKind[kind];
         for (const entry of table.values()) {
+          this._markHandleStale(kind, entry.handle);
           toDestroy.push(entry);
         }
         table.clear();
+        this._fastSlotsByKind[kind].length = 0;
         this._activeBytesByKind[kind] = 0;
+      }
+      for (let i = 0; i < VRAM_KINDS.length; i += 1) {
+        const vk = VRAM_KINDS[i];
+        this._vramLiveBytesByKind[vk] = 0;
+        this._vramPendingBytesByKind[vk] = 0;
+        this._vramLiveCountByKind[vk] = 0;
       }
       this._bufferMeta.clear();
       this._textureMeta.clear();
@@ -3274,9 +4078,12 @@
 
       for (let i = 0; i < toDestroy.length; i += 1) {
         const entry = toDestroy[i];
-        freedBytes += entry.byteSize;
+        const byteSize = sanitizeNonNegativeCounter(entry.byteSize);
+        freedBytes += byteSize;
         if (this._destroyEntry(entry)) {
           destroyedCount += 1;
+          this._evictedCount += 1;
+          this._evictedBytes += byteSize;
         }
       }
 
@@ -3285,12 +4092,24 @@
         freedBytes,
       };
     }
+
+    /**
+     * Alias for `destroyAll()` that clears all active and deferred resources,
+     * zeroes live/pending VRAM across all kinds, and records eviction stats.
+     *
+     * @returns {{ destroyedCount: number, freedBytes: number }}
+     */
+    clear() {
+      return this.destroyAll();
+    }
   }
 
   const exportsObj = Object.freeze({
     DEFAULT_FRAMES_IN_FLIGHT,
     DEFAULT_SOFT_BUDGET_BYTES,
     DEFAULT_MAX_CACHED_VIEWS_PER_TEXTURE,
+    FAST_HANDLE_LIMIT,
+    DEFAULT_MAX_STALE_HANDLE_HISTORY,
     CREATE_TEXTURE2_OPCODE,
     CREATE_TEXTURE2_PAYLOAD_BYTES,
     MAX_TEXTURE_VIEW_FORMATS,
@@ -3310,6 +4129,9 @@
     UNIFORM_BUFFER_MIN_BYTES,
     RESOURCE_KIND,
     RESOURCE_KINDS,
+    VRAM_KIND,
+    VRAM_KINDS,
+    resolveVramKind,
     isBcFormat,
     isSrgbFormat,
     getSrgbSiblingFormat,
@@ -3341,6 +4163,8 @@
       DEFAULT_FRAMES_IN_FLIGHT,
       DEFAULT_SOFT_BUDGET_BYTES,
       DEFAULT_MAX_CACHED_VIEWS_PER_TEXTURE,
+      FAST_HANDLE_LIMIT,
+      DEFAULT_MAX_STALE_HANDLE_HISTORY,
       CREATE_TEXTURE2_OPCODE,
       CREATE_TEXTURE2_PAYLOAD_BYTES,
       MAX_TEXTURE_VIEW_FORMATS,
@@ -3360,6 +4184,9 @@
       UNIFORM_BUFFER_MIN_BYTES,
       RESOURCE_KIND,
       RESOURCE_KINDS,
+      VRAM_KIND,
+      VRAM_KINDS,
+      resolveVramKind,
       isBcFormat,
       isSrgbFormat,
       getSrgbSiblingFormat,
