@@ -18,6 +18,8 @@
   const BUFFER_ALIGNMENT_BYTES = 4;
   const UNIFORM_BUFFER_MIN_BYTES = 16;
   const DEFAULT_FAST_SLOT_CAPACITY = 1024;
+  const DEFAULT_MAX_BIND_GROUPS = 4096;
+  const MAX_GENERATION_TOMBSTONES = 65536;
 
   const SLOT_KIND_MAP = Object.freeze({
     buffer: 'buffer',
@@ -820,6 +822,8 @@
      *   resourceRegistry?: object | null,
      *   registry?: object | null,
      *   onWarning?: ((event: { kind: string, id: number, detail: string }) => void) | null,
+     *   fastSlotCapacity?: number,
+     *   maxBindGroups?: number,
      * }} [options]
      */
     constructor(device, options = {}) {
@@ -910,6 +914,52 @@
         shaderModule: new Map(),
         generic: new Map(),
       };
+
+      // Bounded LRU GPUBindGroup cache with generation-stamped stale eviction (W267).
+      const maxBindGroups =
+        options.maxBindGroups !== undefined
+          ? options.maxBindGroups
+          : DEFAULT_MAX_BIND_GROUPS;
+      if (!Number.isInteger(maxBindGroups) || maxBindGroups < 0) {
+        throw new RangeError(
+          `ResourceTable maxBindGroups must be a non-negative integer, got ${maxBindGroups}`
+        );
+      }
+      this._maxBindGroups = maxBindGroups;
+      /** @type {Map<string, object>} */
+      this._bindGroupCache = new Map();
+      /** @type {Map<string, Set<string>>} */
+      this._bindGroupResourceRefs = new Map();
+      this._bindGroupHits = 0;
+      this._bindGroupMisses = 0;
+      this._staleBindGroupEvictions = 0;
+      this._lruBindGroupEvictions = 0;
+
+      // Monotonic per-resource generation stamps across create/overwrite/destroy (W267).
+      this._nextResourceGeneration = 1;
+      this._resourceGenerations = {
+        buffer: new Map(),
+        texture: new Map(),
+        textureView: new Map(),
+        sampler: new Map(),
+        shaderModule: new Map(),
+      };
+      this._liveResourceGenerations = {
+        buffer: new Map(),
+        texture: new Map(),
+        textureView: new Map(),
+        sampler: new Map(),
+        shaderModule: new Map(),
+      };
+      /** @type {Map<number, number>} */
+      this._textureViewParents = new Map();
+      /** @type {Map<number, Set<number>>} */
+      this._textureChildViews = new Map();
+      this._objectOrigin = typeof WeakMap === 'function' ? new WeakMap() : null;
+      this._layoutIds = typeof WeakMap === 'function' ? new WeakMap() : null;
+      this._externalObjectIds = typeof WeakMap === 'function' ? new WeakMap() : null;
+      this._nextLayoutId = 1;
+      this._nextExternalObjectId = 1;
     }
 
     _getResourceVersionBucket(kind) {
@@ -1008,6 +1058,142 @@
         this._tableVersion += 1;
       }
       return invalidated;
+    }
+
+    _normalizeGenerationBucket(kind) {
+      const normalized = normalizeSlotKind(kind, null);
+      if (
+        normalized === 'buffer' ||
+        normalized === 'texture' ||
+        normalized === 'textureView' ||
+        normalized === 'sampler' ||
+        normalized === 'shaderModule'
+      ) {
+        return normalized;
+      }
+      return null;
+    }
+
+    _resourceRefKey(bucket, handle) {
+      return `${bucket}:${handle}`;
+    }
+
+    _advanceResourceGeneration(bucket, id, isLive) {
+      const gen = this._nextResourceGeneration;
+      this._nextResourceGeneration += 1;
+      const genMap = this._resourceGenerations[bucket];
+      if (genMap.has(id)) {
+        genMap.delete(id);
+      }
+      genMap.set(id, gen);
+      const liveMap = this._liveResourceGenerations[bucket];
+      if (isLive) {
+        liveMap.set(id, gen);
+      } else {
+        liveMap.delete(id);
+        if (genMap.size > liveMap.size + MAX_GENERATION_TOMBSTONES) {
+          for (const candidateId of genMap.keys()) {
+            if (!liveMap.has(candidateId)) {
+              genMap.delete(candidateId);
+              break;
+            }
+          }
+        }
+      }
+      return gen;
+    }
+
+    _trackObjectOrigin(obj, kind, handle, generation, parentTextureHandle, parentTextureGeneration) {
+      if (!obj || typeof obj !== 'object' || this._objectOrigin === null) {
+        return;
+      }
+      const meta = { kind, handle, generation };
+      if (parentTextureHandle !== undefined) {
+        meta.parentTextureHandle = parentTextureHandle;
+        meta.parentTextureGeneration = parentTextureGeneration;
+      }
+      this._objectOrigin.set(obj, meta);
+    }
+
+    _linkTextureViewParent(viewId, textureId) {
+      const prevParent = this._textureViewParents.get(viewId);
+      if (prevParent !== undefined && prevParent !== textureId) {
+        const prevSet = this._textureChildViews.get(prevParent);
+        if (prevSet !== undefined) {
+          prevSet.delete(viewId);
+          if (prevSet.size === 0) {
+            this._textureChildViews.delete(prevParent);
+          }
+        }
+      }
+      this._textureViewParents.set(viewId, textureId);
+      let childSet = this._textureChildViews.get(textureId);
+      if (childSet === undefined) {
+        childSet = new Set();
+        this._textureChildViews.set(textureId, childSet);
+      }
+      childSet.add(viewId);
+    }
+
+    _unlinkTextureViewParent(viewId) {
+      const parentId = this._textureViewParents.get(viewId);
+      if (parentId !== undefined) {
+        this._textureViewParents.delete(viewId);
+        const childSet = this._textureChildViews.get(parentId);
+        if (childSet !== undefined) {
+          childSet.delete(viewId);
+          if (childSet.size === 0) {
+            this._textureChildViews.delete(parentId);
+          }
+        }
+      }
+      return parentId;
+    }
+
+    /**
+     * Return the latest monotonic generation stamp for a tracked resource handle
+     * (`0` if never created or pruned as an ancient destroyed tombstone).
+     * Advances monotonically on every create, overwrite, and destroy.
+     *
+     * @param {string} kind
+     * @param {number} handle
+     * @returns {number}
+     */
+    getResourceGeneration(kind, handle) {
+      if (handle === null || handle === undefined) {
+        return 0;
+      }
+      const bucket = this._normalizeGenerationBucket(kind);
+      if (bucket === null) {
+        return 0;
+      }
+      return this._resourceGenerations[bucket].get(handle) || 0;
+    }
+
+    /**
+     * Return `true` iff `(kind, handle)` is currently live at `generation`.
+     * Returns `false` if the handle was destroyed, overwritten, or never created.
+     *
+     * @param {string} kind
+     * @param {number} handle
+     * @param {number} generation
+     * @returns {boolean}
+     */
+    isResourceGenerationCurrent(kind, handle, generation) {
+      if (
+        handle === null ||
+        handle === undefined ||
+        typeof generation !== 'number' ||
+        !Number.isSafeInteger(generation) ||
+        generation < 1
+      ) {
+        return false;
+      }
+      const bucket = this._normalizeGenerationBucket(kind);
+      if (bucket === null) {
+        return false;
+      }
+      return this._liveResourceGenerations[bucket].get(handle) === generation;
     }
 
     _getLiveHandleCount() {
@@ -1136,6 +1322,9 @@
         });
       }
 
+      const bufGen = this._advanceResourceGeneration('buffer', id, true);
+      this._trackObjectOrigin(buffer, 'buffer', id, bufGen);
+      this._invalidateBindGroupsForBucketHandle('buffer', id);
       const bufResVer = this._bumpResourceVersion('buffer', id);
       this._invalidateSlotsForResource('buffer', id, bufResVer);
 
@@ -1253,11 +1442,19 @@
         throw err;
       }
       this.textures.set(id, texture);
+      const texGen = this._advanceResourceGeneration('texture', id, true);
+      this._trackObjectOrigin(texture, 'texture', id, texGen);
 
       let textureView = null;
       if (texture && typeof texture.createView === 'function') {
         textureView = texture.createView();
         this.textureViews.set(id, textureView);
+        this._linkTextureViewParent(id, id);
+        const viewGen = this._advanceResourceGeneration('textureView', id, true);
+        this._trackObjectOrigin(textureView, 'textureView', id, viewGen, id, texGen);
+      } else {
+        this._unlinkTextureViewParent(id);
+        this._liveResourceGenerations.textureView.delete(id);
       }
 
       const meta = {
@@ -1295,6 +1492,8 @@
         }
       }
 
+      this._invalidateBindGroupsForBucketHandle('texture', id);
+      this._invalidateBindGroupsForBucketHandle('textureView', id);
       const texResVer = this._bumpResourceVersion('texture', id);
       this._invalidateSlotsForResource('texture', id, texResVer);
 
@@ -1365,9 +1564,74 @@
       }
     }
 
+    /**
+     * Create or overwrite a tracked `GPUTextureView` handle with monotonic
+     * generation stamping and automatic parent-texture lifetime tracking.
+     *
+     * Accepts either:
+     * - `createTextureView(viewId, textureId, viewDescriptor)`
+     * - `createTextureView(textureId, viewDescriptor)` (overwrites default view for `textureId`)
+     *
+     * @param {number} id
+     * @param {number | object} [textureIdOrDescriptor]
+     * @param {object} [viewDescriptorArg]
+     * @returns {object | undefined}
+     */
+    createTextureView(id, textureIdOrDescriptor, viewDescriptorArg) {
+      let textureId = id;
+      let viewDesc;
+      if (typeof textureIdOrDescriptor === 'number') {
+        textureId = textureIdOrDescriptor;
+        viewDesc = viewDescriptorArg;
+      } else {
+        viewDesc = textureIdOrDescriptor;
+      }
+
+      const texture = this.textures.get(textureId);
+      if (!texture || typeof texture.createView !== 'function') {
+        this._missingLookups += 1;
+        return undefined;
+      }
+
+      const existed = this.textureViews.has(id);
+      if (existed) {
+        this._advanceResourceGeneration('textureView', id, false);
+        this._invalidateBindGroupsForBucketHandle('textureView', id);
+      }
+
+      const view = viewDesc !== undefined ? texture.createView(viewDesc) : texture.createView();
+      this.textureViews.set(id, view);
+      this._linkTextureViewParent(id, textureId);
+
+      const parentTexGen = this._liveResourceGenerations.texture.get(textureId) || 0;
+      const viewGen = this._advanceResourceGeneration('textureView', id, true);
+      this._trackObjectOrigin(view, 'textureView', id, viewGen, textureId, parentTexGen);
+      this._invalidateBindGroupsForBucketHandle('textureView', id);
+
+      if (this.resourceRegistry && typeof this.resourceRegistry.register === 'function') {
+        this.resourceRegistry.register('textureView', id, view, {
+          byteSize: 0,
+          label: (viewDesc && viewDesc.label) || `textureView:${id}`,
+        });
+      }
+
+      const texResVer = this._bumpResourceVersion('texture', textureId);
+      this._invalidateSlotsForResource('texture', textureId, texResVer);
+      if (id !== textureId) {
+        const viewSlotVer = this._bumpResourceVersion('texture', id);
+        this._invalidateSlotsForResource('texture', id, viewSlotVer);
+      }
+
+      return view;
+    }
+
     createSampler(id, descriptor = {}) {
       const existed = this.samplers.has(id);
       const sampler = this.device.createSampler(descriptor);
+      if (existed) {
+        this._advanceResourceGeneration('sampler', id, false);
+        this._invalidateBindGroupsForBucketHandle('sampler', id);
+      }
       this.samplers.set(id, sampler);
       if (this.resourceRegistry && typeof this.resourceRegistry.register === 'function') {
         this.resourceRegistry.register('sampler', id, sampler, {
@@ -1375,6 +1639,9 @@
           label: descriptor.label || `sampler:${id}`,
         });
       }
+      const sampGen = this._advanceResourceGeneration('sampler', id, true);
+      this._trackObjectOrigin(sampler, 'sampler', id, sampGen);
+      this._invalidateBindGroupsForBucketHandle('sampler', id);
       const sampResVer = this._bumpResourceVersion('sampler', id);
       this._invalidateSlotsForResource('sampler', id, sampResVer);
       this._samplersCreated += 1;
@@ -1385,6 +1652,10 @@
     createShaderModule(id, descriptor) {
       const existed = this.shaderModules.has(id);
       const mod = this.device.createShaderModule(descriptor);
+      if (existed) {
+        this._advanceResourceGeneration('shaderModule', id, false);
+        this._invalidateBindGroupsForBucketHandle('shaderModule', id);
+      }
       this.shaderModules.set(id, mod);
       if (this.resourceRegistry && typeof this.resourceRegistry.register === 'function') {
         this.resourceRegistry.register('shaderModule', id, mod, {
@@ -1392,6 +1663,9 @@
           label: (descriptor && descriptor.label) || `shaderModule:${id}`,
         });
       }
+      const modGen = this._advanceResourceGeneration('shaderModule', id, true);
+      this._trackObjectOrigin(mod, 'shaderModule', id, modGen);
+      this._invalidateBindGroupsForBucketHandle('shaderModule', id);
       const modResVer = this._bumpResourceVersion('shaderModule', id);
       this._invalidateSlotsForResource('shaderModule', id, modResVer);
       this._shaderModulesCreated += 1;
@@ -1481,6 +1755,8 @@
       this.buffers.delete(id);
       this._bufferMeta.delete(id);
       this._destroyCount += 1;
+      this._advanceResourceGeneration('buffer', id, false);
+      this._invalidateBindGroupsForBucketHandle('buffer', id);
       if (countDelete) {
         this._totalDeletes += 1;
         this._resourceVersions.buffer.delete(id);
@@ -1496,7 +1772,11 @@
     _destroyTextureInternal(id, countDelete) {
       const existing = this.textures.get(id);
       if (!existing) {
-        this.textureViews.delete(id);
+        if (this.textureViews.delete(id)) {
+          this._unlinkTextureViewParent(id);
+          this._advanceResourceGeneration('textureView', id, false);
+          this._invalidateBindGroupsForBucketHandle('textureView', id);
+        }
         this._textureMeta.delete(id);
         return false;
       }
@@ -1509,10 +1789,35 @@
       } else if (typeof existing.destroy === 'function') {
         existing.destroy();
       }
+      const childViews = this._textureChildViews.get(id);
+      const childViewIds = childViews ? Array.from(childViews) : [];
+      this._textureChildViews.delete(id);
+
       this.textures.delete(id);
       this.textureViews.delete(id);
+      this._textureViewParents.delete(id);
       this._textureMeta.delete(id);
       this._destroyCount += 1;
+
+      this._advanceResourceGeneration('texture', id, false);
+      this._advanceResourceGeneration('textureView', id, false);
+      this._invalidateBindGroupsForBucketHandle('texture', id);
+      this._invalidateBindGroupsForBucketHandle('textureView', id);
+
+      for (let i = 0; i < childViewIds.length; i += 1) {
+        const childViewId = childViewIds[i];
+        if (childViewId === id) {
+          continue;
+        }
+        this.textureViews.delete(childViewId);
+        this._textureViewParents.delete(childViewId);
+        if (this.resourceRegistry && typeof this.resourceRegistry.retire === 'function') {
+          this.resourceRegistry.retire('textureView', childViewId);
+        }
+        this._advanceResourceGeneration('textureView', childViewId, false);
+        this._invalidateBindGroupsForBucketHandle('textureView', childViewId);
+      }
+
       if (countDelete) {
         this._totalDeletes += 1;
         this._resourceVersions.texture.delete(id);
@@ -1525,20 +1830,41 @@
       return this._destroyTextureInternal(id, true);
     }
 
+    destroyTextureView(id) {
+      if (!this.textureViews.delete(id)) {
+        return false;
+      }
+      this._unlinkTextureViewParent(id);
+      if (this.resourceRegistry && typeof this.resourceRegistry.retire === 'function') {
+        this.resourceRegistry.retire('textureView', id);
+      }
+      this._advanceResourceGeneration('textureView', id, false);
+      this._invalidateBindGroupsForBucketHandle('textureView', id);
+      this._invalidateSlotsForResource('texture', id, 0);
+      return true;
+    }
+
+    destroySampler(id) {
+      if (!this.samplers.delete(id)) {
+        return false;
+      }
+      if (this.resourceRegistry && typeof this.resourceRegistry.retire === 'function') {
+        this.resourceRegistry.retire('sampler', id);
+      }
+      this._destroyCount += 1;
+      this._totalDeletes += 1;
+      this._resourceVersions.sampler.delete(id);
+      this._advanceResourceGeneration('sampler', id, false);
+      this._invalidateBindGroupsForBucketHandle('sampler', id);
+      this._invalidateSlotsForResource('sampler', id, 0);
+      return true;
+    }
+
     destroy(id) {
       let count = 0;
       if (this.destroyBuffer(id)) count += 1;
       if (this.destroyTexture(id)) count += 1;
-      if (this.samplers.delete(id)) {
-        if (this.resourceRegistry && typeof this.resourceRegistry.retire === 'function') {
-          this.resourceRegistry.retire('sampler', id);
-        }
-        this._destroyCount += 1;
-        this._totalDeletes += 1;
-        this._resourceVersions.sampler.delete(id);
-        this._invalidateSlotsForResource('sampler', id, 0);
-        count += 1;
-      }
+      if (this.destroySampler(id)) count += 1;
       if (this.shaderModules.delete(id)) {
         if (this.resourceRegistry && typeof this.resourceRegistry.retire === 'function') {
           this.resourceRegistry.retire('shaderModule', id);
@@ -1546,6 +1872,8 @@
         this._destroyCount += 1;
         this._totalDeletes += 1;
         this._resourceVersions.shaderModule.delete(id);
+        this._advanceResourceGeneration('shaderModule', id, false);
+        this._invalidateBindGroupsForBucketHandle('shaderModule', id);
         this._invalidateSlotsForResource('shaderModule', id, 0);
         count += 1;
       }
@@ -2133,6 +2461,8 @@
           }
           if (entry.usage !== undefined) viewDesc.usage = entry.usage;
           entry.cachedView = tex.createView(viewDesc);
+          const texGen = this._liveResourceGenerations.texture.get(entry.handle) || 0;
+          this._trackObjectOrigin(entry.cachedView, 'texture', entry.handle, texGen);
           return entry.cachedView;
         }
         return this.textureViews.get(entry.handle);
@@ -2260,12 +2590,1014 @@
       return key;
     }
 
+    // -------------------------------------------------------------------------
+    // Generation-stamped bounded LRU GPUBindGroup cache (W267 / #1129 / #1077)
+    // -------------------------------------------------------------------------
+
+    get maxBindGroups() {
+      return this._maxBindGroups;
+    }
+
+    _getLayoutId(layout) {
+      if (typeof layout === 'string' || typeof layout === 'number') {
+        return `p:${layout}`;
+      }
+      if (layout && typeof layout === 'object' && this._layoutIds !== null) {
+        let id = this._layoutIds.get(layout);
+        if (id === undefined) {
+          id = this._nextLayoutId;
+          this._nextLayoutId += 1;
+          this._layoutIds.set(layout, id);
+        }
+        return `o:${id}`;
+      }
+      return 'null';
+    }
+
+    _getExternalObjectId(obj) {
+      if (obj && typeof obj === 'object' && this._externalObjectIds !== null) {
+        let id = this._externalObjectIds.get(obj);
+        if (id === undefined) {
+          id = this._nextExternalObjectId;
+          this._nextExternalObjectId += 1;
+          this._externalObjectIds.set(obj, id);
+        }
+        return id;
+      }
+      return 0;
+    }
+
+    _addBindGroupResourceRefs(cacheKey, stamps) {
+      for (let i = 0; i < stamps.length; i += 1) {
+        const refKey = this._resourceRefKey(stamps[i].kind, stamps[i].handle);
+        let keySet = this._bindGroupResourceRefs.get(refKey);
+        if (keySet === undefined) {
+          keySet = new Set();
+          this._bindGroupResourceRefs.set(refKey, keySet);
+        }
+        keySet.add(cacheKey);
+      }
+    }
+
+    _removeBindGroupResourceRefs(cacheKey, stamps) {
+      for (let i = 0; i < stamps.length; i += 1) {
+        const refKey = this._resourceRefKey(stamps[i].kind, stamps[i].handle);
+        const keySet = this._bindGroupResourceRefs.get(refKey);
+        if (keySet !== undefined) {
+          keySet.delete(cacheKey);
+          if (keySet.size === 0) {
+            this._bindGroupResourceRefs.delete(refKey);
+          }
+        }
+      }
+    }
+
+    _evictBindGroupEntry(cacheKey, entry, reason) {
+      if (!this._bindGroupCache.has(cacheKey)) {
+        return false;
+      }
+      this._bindGroupCache.delete(cacheKey);
+      if (entry && Array.isArray(entry.stamps)) {
+        this._removeBindGroupResourceRefs(cacheKey, entry.stamps);
+      }
+      if (reason === 'stale') {
+        this._staleBindGroupEvictions += 1;
+      } else if (reason === 'lru') {
+        this._lruBindGroupEvictions += 1;
+      }
+      return true;
+    }
+
+    _invalidateBindGroupsForBucketHandle(bucket, handle) {
+      const refKey = this._resourceRefKey(bucket, handle);
+      const keySet = this._bindGroupResourceRefs.get(refKey);
+      if (keySet === undefined || keySet.size === 0) {
+        return 0;
+      }
+      const keysToEvict = Array.from(keySet);
+      let evicted = 0;
+      for (let i = 0; i < keysToEvict.length; i += 1) {
+        const cacheKey = keysToEvict[i];
+        const entry = this._bindGroupCache.get(cacheKey);
+        if (entry !== undefined && this._evictBindGroupEntry(cacheKey, entry, 'stale')) {
+          evicted += 1;
+        }
+      }
+      return evicted;
+    }
+
+    /**
+     * Proactively evict all cached `GPUBindGroup` entries referencing
+     * `(kind, handle)` (including child views when `kind` is `'texture'`).
+     *
+     * @param {string} kind
+     * @param {number} handle
+     * @returns {number} Number of stale bind groups evicted.
+     */
+    invalidateBindGroupsForResource(kind, handle) {
+      if (handle === null || handle === undefined) {
+        return 0;
+      }
+      const bucket = this._normalizeGenerationBucket(kind);
+      if (bucket === null) {
+        return 0;
+      }
+      let evicted = this._invalidateBindGroupsForBucketHandle(bucket, handle);
+      if (bucket === 'texture') {
+        evicted += this._invalidateBindGroupsForBucketHandle('textureView', handle);
+        const childViews = this._textureChildViews.get(handle);
+        if (childViews !== undefined) {
+          for (const childViewId of Array.from(childViews)) {
+            if (childViewId !== handle) {
+              evicted += this._invalidateBindGroupsForBucketHandle('textureView', childViewId);
+            }
+          }
+        }
+      }
+      return evicted;
+    }
+
+    _isBindGroupEntryValid(entry) {
+      if (!entry) {
+        return false;
+      }
+      const stamps = entry.stamps;
+      for (let i = 0; i < stamps.length; i += 1) {
+        const stamp = stamps[i];
+        const liveMap = this._liveResourceGenerations[stamp.kind];
+        if (!liveMap || liveMap.get(stamp.handle) !== stamp.generation) {
+          return false;
+        }
+      }
+      if (entry.directResources && entry.directResources.length > 0) {
+        for (let i = 0; i < entry.directResources.length; i += 1) {
+          const res = entry.directResources[i];
+          if (!res || res.destroyed === true) {
+            return false;
+          }
+          if (res.buffer && res.buffer.destroyed === true) {
+            return false;
+          }
+          if (this._objectOrigin !== null) {
+            const origin = this._objectOrigin.get(res);
+            if (origin !== undefined) {
+              const liveMap = this._liveResourceGenerations[origin.kind];
+              if (!liveMap || liveMap.get(origin.handle) !== origin.generation) {
+                return false;
+              }
+              if (origin.parentTextureHandle !== undefined) {
+                if (
+                  this._liveResourceGenerations.texture.get(origin.parentTextureHandle) !==
+                  origin.parentTextureGeneration
+                ) {
+                  return false;
+                }
+              }
+            }
+          }
+        }
+      }
+      if (entry.slotSnapshot && !this.isSlotSnapshotValid(entry.slotSnapshot)) {
+        return false;
+      }
+      return true;
+    }
+
+    _appendStamp(stamps, seenKeys, kind, handle, generation, directResources) {
+      const bucket = this._normalizeGenerationBucket(kind);
+      if (bucket === null || handle === null || handle === undefined) {
+        return;
+      }
+      const refKey = this._resourceRefKey(bucket, handle);
+      if (!seenKeys.has(refKey)) {
+        seenKeys.add(refKey);
+        stamps.push({ kind: bucket, handle, generation });
+      }
+      if (directResources) {
+        const liveGen = this._liveResourceGenerations[bucket].get(handle);
+        if (liveGen !== undefined && liveGen === generation) {
+          if (bucket === 'buffer') {
+            const b = this.buffers.get(handle);
+            if (b) directResources.push(b);
+          } else if (bucket === 'texture') {
+            const t = this.textures.get(handle);
+            if (t) directResources.push(t);
+          } else if (bucket === 'textureView') {
+            const v = this.textureViews.get(handle);
+            if (v) directResources.push(v);
+          } else if (bucket === 'sampler') {
+            const s = this.samplers.get(handle);
+            if (s) directResources.push(s);
+          }
+        }
+      }
+      if (bucket === 'textureView') {
+        const parentTexId = this._textureViewParents.get(handle);
+        if (parentTexId !== undefined) {
+          const parentKey = this._resourceRefKey('texture', parentTexId);
+          if (!seenKeys.has(parentKey)) {
+            const parentGen = this._liveResourceGenerations.texture.get(parentTexId) || 0;
+            seenKeys.add(parentKey);
+            stamps.push({ kind: 'texture', handle: parentTexId, generation: parentGen });
+            if (directResources) {
+              const parentTex = this.textures.get(parentTexId);
+              if (parentTex) directResources.push(parentTex);
+            }
+          }
+        }
+      }
+    }
+
+    _normalizeBindGroupStamps(resourceRefs, requireLive) {
+      const stamps = [];
+      const seenKeys = new Set();
+      const directResources = [];
+      const slotIndices = [];
+
+      if (!Array.isArray(resourceRefs)) {
+        return { ok: true, stamps, directResources, slotSnapshot: null };
+      }
+
+      for (let i = 0; i < resourceRefs.length; i += 1) {
+        const ref = resourceRefs[i];
+        if (ref === null || ref === undefined) {
+          continue;
+        }
+        if (Array.isArray(ref)) {
+          const bucket = this._normalizeGenerationBucket(ref[0]);
+          const handle = ref[1];
+          if (bucket === null || typeof handle !== 'number') {
+            continue;
+          }
+          const explicitGen = ref.length >= 3 && typeof ref[2] === 'number' ? ref[2] : undefined;
+          const liveGen = this._liveResourceGenerations[bucket].get(handle);
+          if (requireLive && (liveGen === undefined || (explicitGen !== undefined && explicitGen !== liveGen))) {
+            this._missingLookups += 1;
+            return { ok: false, stamps: [], directResources: [], slotSnapshot: null };
+          }
+          const gen = explicitGen !== undefined ? explicitGen : liveGen !== undefined ? liveGen : 0;
+          this._appendStamp(stamps, seenKeys, bucket, handle, gen, directResources);
+          continue;
+        }
+        if (typeof ref === 'object') {
+          if (ref.slot !== undefined && isValidSlotIndex(ref.slot)) {
+            const slotEntry = this._getSlotEntry(ref.slot);
+            if (!slotEntry || !slotEntry.bound) {
+              if (requireLive) {
+                this._missingLookups += 1;
+                return { ok: false, stamps: [], directResources: [], slotSnapshot: null };
+              }
+              continue;
+            }
+            slotIndices.push(ref.slot);
+            if (slotEntry.resource !== null) {
+              if (requireLive && slotEntry.resource.destroyed === true) {
+                return { ok: false, stamps: [], directResources: [], slotSnapshot: null };
+              }
+              directResources.push(slotEntry.resource);
+              if (this._objectOrigin !== null) {
+                const origin = this._objectOrigin.get(slotEntry.resource);
+                if (origin !== undefined) {
+                  if (requireLive && !this.isResourceGenerationCurrent(origin.kind, origin.handle, origin.generation)) {
+                    return { ok: false, stamps: [], directResources: [], slotSnapshot: null };
+                  }
+                  this._appendStamp(stamps, seenKeys, origin.kind, origin.handle, origin.generation, null);
+                }
+              }
+            } else if (slotEntry.handle !== null) {
+              const bucket = this._normalizeGenerationBucket(slotEntry.kind);
+              if (bucket !== null) {
+                const liveGen = this._liveResourceGenerations[bucket].get(slotEntry.handle);
+                if (requireLive && liveGen === undefined) {
+                  this._missingLookups += 1;
+                  return { ok: false, stamps: [], directResources: [], slotSnapshot: null };
+                }
+                this._appendStamp(
+                  stamps,
+                  seenKeys,
+                  bucket,
+                  slotEntry.handle,
+                  liveGen !== undefined ? liveGen : 0,
+                  directResources
+                );
+                if (bucket === 'texture') {
+                  const viewGen = this._liveResourceGenerations.textureView.get(slotEntry.handle);
+                  if (viewGen !== undefined) {
+                    this._appendStamp(stamps, seenKeys, 'textureView', slotEntry.handle, viewGen, directResources);
+                  }
+                }
+              }
+            }
+            continue;
+          }
+
+          if (ref.handle !== undefined || ref.id !== undefined || ref.resourceId !== undefined) {
+            const handle =
+              ref.handle !== undefined
+                ? ref.handle
+                : ref.id !== undefined
+                  ? ref.id
+                  : ref.resourceId;
+            const bucket = this._normalizeGenerationBucket(ref.kind);
+            if (bucket !== null && typeof handle === 'number') {
+              const explicitGen = typeof ref.generation === 'number' ? ref.generation : undefined;
+              const liveGen = this._liveResourceGenerations[bucket].get(handle);
+              if (requireLive && (liveGen === undefined || (explicitGen !== undefined && explicitGen !== liveGen))) {
+                this._missingLookups += 1;
+                return { ok: false, stamps: [], directResources: [], slotSnapshot: null };
+              }
+              const gen = explicitGen !== undefined ? explicitGen : liveGen !== undefined ? liveGen : 0;
+              this._appendStamp(stamps, seenKeys, bucket, handle, gen, directResources);
+              if (bucket === 'texture') {
+                const viewGen = this._liveResourceGenerations.textureView.get(handle);
+                if (viewGen !== undefined) {
+                  this._appendStamp(stamps, seenKeys, 'textureView', handle, viewGen, directResources);
+                }
+              }
+              continue;
+            }
+          }
+
+          // Direct GPU resource object (or { buffer } binding wrapper).
+          const targetObj = ref.buffer && typeof ref.buffer === 'object' ? ref.buffer : ref;
+          if (requireLive && targetObj.destroyed === true) {
+            return { ok: false, stamps: [], directResources: [], slotSnapshot: null };
+          }
+          directResources.push(targetObj);
+          if (this._objectOrigin !== null) {
+            const origin = this._objectOrigin.get(targetObj);
+            if (origin !== undefined) {
+              if (requireLive && !this.isResourceGenerationCurrent(origin.kind, origin.handle, origin.generation)) {
+                return { ok: false, stamps: [], directResources: [], slotSnapshot: null };
+              }
+              if (
+                requireLive &&
+                origin.parentTextureHandle !== undefined &&
+                !this.isResourceGenerationCurrent(
+                  'texture',
+                  origin.parentTextureHandle,
+                  origin.parentTextureGeneration
+                )
+              ) {
+                return { ok: false, stamps: [], directResources: [], slotSnapshot: null };
+              }
+              this._appendStamp(stamps, seenKeys, origin.kind, origin.handle, origin.generation, null);
+              if (origin.parentTextureHandle !== undefined) {
+                this._appendStamp(
+                  stamps,
+                  seenKeys,
+                  'texture',
+                  origin.parentTextureHandle,
+                  origin.parentTextureGeneration,
+                  null
+                );
+              }
+            }
+          }
+        }
+      }
+
+      const slotSnapshot = slotIndices.length > 0 ? this.captureSlotVersions(slotIndices) : null;
+      return { ok: true, stamps, directResources, slotSnapshot };
+    }
+
+    _storeBindGroupEntry(cacheKey, bindGroup, stamps, directResources, slotSnapshot) {
+      if (this._maxBindGroups === 0) {
+        return false;
+      }
+
+      const existing = this._bindGroupCache.get(cacheKey);
+      if (existing !== undefined) {
+        this._removeBindGroupResourceRefs(cacheKey, existing.stamps);
+        this._bindGroupCache.delete(cacheKey);
+      } else {
+        while (this._bindGroupCache.size >= this._maxBindGroups) {
+          const oldestKey = this._bindGroupCache.keys().next().value;
+          const oldestEntry = this._bindGroupCache.get(oldestKey);
+          this._evictBindGroupEntry(oldestKey, oldestEntry, 'lru');
+        }
+      }
+
+      const entry = {
+        key: cacheKey,
+        bindGroup,
+        stamps,
+        directResources,
+        slotSnapshot,
+      };
+      this._bindGroupCache.set(cacheKey, entry);
+      this._addBindGroupResourceRefs(cacheKey, stamps);
+      return true;
+    }
+
+    /**
+     * Store a `GPUBindGroup` in the bounded LRU cache stamped with the exact
+     * `(handle, generation)` tuples of its referenced resources.
+     *
+     * @param {string | number} key
+     * @param {object} bindGroup
+     * @param {Array<object | Array>} [resourceRefs]
+     * @returns {boolean}
+     */
+    setBindGroup(key, bindGroup, resourceRefs = []) {
+      if (key === null || key === undefined) {
+        throw new TypeError('ResourceTable setBindGroup requires a non-null cache key');
+      }
+      if (!bindGroup || typeof bindGroup !== 'object') {
+        throw new TypeError('ResourceTable setBindGroup requires a bindGroup object');
+      }
+      const cacheKey = String(key);
+      const normalized = this._normalizeBindGroupStamps(resourceRefs, false);
+      return this._storeBindGroupEntry(
+        cacheKey,
+        bindGroup,
+        normalized.stamps,
+        normalized.directResources,
+        normalized.slotSnapshot
+      );
+    }
+
+    /**
+     * Look up a cached `GPUBindGroup` by key. Automatically validates every
+     * stamped `(handle, generation)` tuple and direct resource state; stale
+     * entries are evicted immediately (`staleBindGroupEvictions += 1`).
+     * Valid hits refresh LRU recency.
+     *
+     * @param {string | number} key
+     * @returns {object | undefined}
+     */
+    getBindGroup(key) {
+      if (key === null || key === undefined) {
+        this._bindGroupMisses += 1;
+        return undefined;
+      }
+      const cacheKey = String(key);
+      const entry = this._bindGroupCache.get(cacheKey);
+      if (entry === undefined) {
+        this._bindGroupMisses += 1;
+        return undefined;
+      }
+      if (!this._isBindGroupEntryValid(entry)) {
+        this._evictBindGroupEntry(cacheKey, entry, 'stale');
+        this._bindGroupMisses += 1;
+        return undefined;
+      }
+      if (this._bindGroupCache.size > 1) {
+        this._bindGroupCache.delete(cacheKey);
+        this._bindGroupCache.set(cacheKey, entry);
+      }
+      this._bindGroupHits += 1;
+      return entry.bindGroup;
+    }
+
+    /**
+     * Non-mutating predicate returning `true` iff `key` is cached and all its
+     * resource generation stamps are still live.
+     *
+     * @param {string | number} key
+     * @returns {boolean}
+     */
+    hasBindGroup(key) {
+      if (key === null || key === undefined) {
+        return false;
+      }
+      const entry = this._bindGroupCache.get(String(key));
+      return entry !== undefined && this._isBindGroupEntryValid(entry);
+    }
+
+    /**
+     * Non-mutating inspection helper returning the stamped `(kind, handle, generation)`
+     * tuples and current validity for a cached bind group entry.
+     *
+     * @param {string | number} key
+     * @returns {{ key: string, stamps: Array<{ kind: string, handle: number, generation: number }>, valid: boolean } | undefined}
+     */
+    getBindGroupMeta(key) {
+      if (key === null || key === undefined) {
+        return undefined;
+      }
+      const cacheKey = String(key);
+      const entry = this._bindGroupCache.get(cacheKey);
+      if (entry === undefined) {
+        return undefined;
+      }
+      return {
+        key: cacheKey,
+        stamps: entry.stamps.map((s) => ({
+          kind: s.kind,
+          handle: s.handle,
+          generation: s.generation,
+        })),
+        valid: this._isBindGroupEntryValid(entry),
+      };
+    }
+
+    deleteBindGroup(key) {
+      if (key === null || key === undefined) {
+        return false;
+      }
+      const cacheKey = String(key);
+      const entry = this._bindGroupCache.get(cacheKey);
+      if (entry === undefined) {
+        return false;
+      }
+      return this._evictBindGroupEntry(cacheKey, entry, 'explicit');
+    }
+
+    clearBindGroups() {
+      const count = this._bindGroupCache.size;
+      this._bindGroupCache.clear();
+      this._bindGroupResourceRefs.clear();
+      return count;
+    }
+
+    /**
+     * Sweep cached bind groups and evict any entries whose resource generations
+     * advanced or whose underlying GPU objects were destroyed externally.
+     *
+     * @returns {number} Number of stale entries evicted.
+     */
+    evictStaleBindGroups() {
+      let evicted = 0;
+      for (const [cacheKey, entry] of Array.from(this._bindGroupCache.entries())) {
+        if (!this._isBindGroupEntryValid(entry)) {
+          if (this._evictBindGroupEntry(cacheKey, entry, 'stale')) {
+            evicted += 1;
+          }
+        }
+      }
+      return evicted;
+    }
+
+    _resolveBindGroupEntries(rawEntries, rawSlots) {
+      const normalizedItems = [];
+      if (Array.isArray(rawEntries)) {
+        for (let i = 0; i < rawEntries.length; i += 1) {
+          normalizedItems.push(rawEntries[i]);
+        }
+      } else if (Array.isArray(rawSlots)) {
+        for (let i = 0; i < rawSlots.length; i += 1) {
+          normalizedItems.push({ binding: i, slot: rawSlots[i] });
+        }
+      }
+
+      const sorted = normalizedItems.slice().sort((a, b) => (a.binding || 0) - (b.binding || 0));
+      const gpuEntries = [];
+      const stamps = [];
+      const seenKeys = new Set();
+      const directResources = [];
+      const slotIndices = [];
+      const keyParts = [];
+
+      for (let i = 0; i < sorted.length; i += 1) {
+        const item = sorted[i];
+        if (!item || typeof item !== 'object') {
+          return { ok: false, reason: 'invalid_entry' };
+        }
+        const binding = Number(item.binding) || 0;
+
+        // Mode 1: ResourceTable slot index.
+        if (item.slot !== undefined) {
+          const slotIdx = item.slot;
+          const slotEntry = this._getSlotEntry(slotIdx);
+          if (!slotEntry || !slotEntry.bound) {
+            this._missingLookups += 1;
+            return { ok: false, reason: 'missing_slot', id: slotIdx };
+          }
+          const bgEntry = this.getBindGroupEntry(binding, slotIdx);
+          if (!bgEntry) {
+            return { ok: false, reason: 'missing_slot_resource', id: slotIdx };
+          }
+          const resolvedObj =
+            bgEntry.resource && bgEntry.resource.buffer ? bgEntry.resource.buffer : bgEntry.resource;
+          if (!resolvedObj || resolvedObj.destroyed === true) {
+            return { ok: false, reason: 'destroyed_resource', id: slotIdx };
+          }
+          slotIndices.push(slotIdx);
+          directResources.push(resolvedObj);
+          if (slotEntry.handle !== null) {
+            const bucket = this._normalizeGenerationBucket(slotEntry.kind);
+            if (bucket !== null) {
+              const liveGen = this._liveResourceGenerations[bucket].get(slotEntry.handle);
+              if (liveGen === undefined) {
+                return { ok: false, reason: 'destroyed_resource', id: slotEntry.handle };
+              }
+              this._appendStamp(stamps, seenKeys, bucket, slotEntry.handle, liveGen, directResources);
+              if (bucket === 'texture') {
+                const viewGen = this._liveResourceGenerations.textureView.get(slotEntry.handle);
+                if (viewGen !== undefined) {
+                  this._appendStamp(stamps, seenKeys, 'textureView', slotEntry.handle, viewGen, directResources);
+                }
+              }
+            }
+          } else if (this._objectOrigin !== null) {
+            const origin = this._objectOrigin.get(resolvedObj);
+            if (origin !== undefined) {
+              if (!this.isResourceGenerationCurrent(origin.kind, origin.handle, origin.generation)) {
+                return { ok: false, reason: 'stale_resource', id: origin.handle };
+              }
+              this._appendStamp(stamps, seenKeys, origin.kind, origin.handle, origin.generation, null);
+            }
+          }
+          gpuEntries.push(bgEntry);
+          keyParts.push(
+            `${binding}:slot:${slotIdx}:${slotEntry.kind}:${slotEntry.handle !== null ? slotEntry.handle : this._getExternalObjectId(resolvedObj)}:${slotEntry.offset}:${slotEntry.size !== undefined ? slotEntry.size : -1}`
+          );
+          continue;
+        }
+
+        // Mode 2: ResourceTable handle descriptor ({ binding, kind, handle, offset?, size? }).
+        if (item.handle !== undefined || item.id !== undefined || item.resourceId !== undefined) {
+          const handle =
+            item.handle !== undefined
+              ? item.handle
+              : item.id !== undefined
+                ? item.id
+                : item.resourceId;
+          const bucket = this._normalizeGenerationBucket(item.kind);
+          if (bucket === null || typeof handle !== 'number') {
+            return { ok: false, reason: 'invalid_handle_entry', id: handle };
+          }
+          const liveGen = this._liveResourceGenerations[bucket].get(handle);
+          if (liveGen === undefined) {
+            this._missingLookups += 1;
+            return { ok: false, reason: 'missing_resource', id: handle };
+          }
+
+          if (bucket === 'buffer') {
+            const buf = this.buffers.get(handle);
+            if (!buf || buf.destroyed === true) {
+              this.invalidateBindGroupsForResource('buffer', handle);
+              this._missingLookups += 1;
+              return { ok: false, reason: 'destroyed_buffer', id: handle };
+            }
+            const offset =
+              item.offset !== undefined && Number.isFinite(Number(item.offset))
+                ? Math.max(0, Math.floor(Number(item.offset)))
+                : 0;
+            const size =
+              item.size !== undefined && Number.isFinite(Number(item.size))
+                ? Math.max(0, Math.floor(Number(item.size)))
+                : undefined;
+            const bufBinding = { buffer: buf, offset };
+            if (size !== undefined) {
+              bufBinding.size = size;
+            }
+            gpuEntries.push({ binding, resource: bufBinding });
+            this._appendStamp(stamps, seenKeys, 'buffer', handle, liveGen, directResources);
+            keyParts.push(`${binding}:buffer:${handle}:${offset}:${size !== undefined ? size : -1}`);
+            continue;
+          }
+
+          if (bucket === 'texture' || bucket === 'textureView') {
+            const view = this.textureViews.get(handle);
+            const parentTexId =
+              bucket === 'texture' ? handle : this._textureViewParents.get(handle);
+            const parentTex = parentTexId !== undefined ? this.textures.get(parentTexId) : undefined;
+            if (!view || view.destroyed === true || (parentTex && parentTex.destroyed === true)) {
+              if (parentTexId !== undefined) {
+                this.invalidateBindGroupsForResource('texture', parentTexId);
+              } else {
+                this.invalidateBindGroupsForResource(bucket, handle);
+              }
+              this._missingLookups += 1;
+              return { ok: false, reason: 'destroyed_texture', id: handle };
+            }
+            if (parentTexId !== undefined && !this._liveResourceGenerations.texture.has(parentTexId)) {
+              this.invalidateBindGroupsForResource('texture', parentTexId);
+              this._missingLookups += 1;
+              return { ok: false, reason: 'destroyed_texture', id: parentTexId };
+            }
+            gpuEntries.push({ binding, resource: view });
+            this._appendStamp(stamps, seenKeys, bucket, handle, liveGen, directResources);
+            if (bucket === 'texture') {
+              const viewGen = this._liveResourceGenerations.textureView.get(handle);
+              if (viewGen !== undefined) {
+                this._appendStamp(stamps, seenKeys, 'textureView', handle, viewGen, directResources);
+              }
+            }
+            keyParts.push(`${binding}:${bucket}:${handle}`);
+            continue;
+          }
+
+          if (bucket === 'sampler') {
+            const sampler = this.samplers.get(handle);
+            if (!sampler || sampler.destroyed === true) {
+              this.invalidateBindGroupsForResource('sampler', handle);
+              this._missingLookups += 1;
+              return { ok: false, reason: 'destroyed_sampler', id: handle };
+            }
+            gpuEntries.push({ binding, resource: sampler });
+            this._appendStamp(stamps, seenKeys, 'sampler', handle, liveGen, directResources);
+            keyParts.push(`${binding}:sampler:${handle}`);
+            continue;
+          }
+        }
+
+        // Mode 3: Direct WebGPU GPUBindGroupEntry ({ binding, resource }).
+        const resource = item.resource;
+        if (!resource || typeof resource !== 'object') {
+          return { ok: false, reason: 'missing_direct_resource' };
+        }
+        const isBufferBinding = Boolean(resource.buffer && typeof resource.buffer === 'object');
+        const targetObj = isBufferBinding ? resource.buffer : resource;
+        let origin = this._objectOrigin !== null ? this._objectOrigin.get(targetObj) : undefined;
+        if (targetObj.destroyed === true || resource.destroyed === true) {
+          if (origin !== undefined) {
+            this.invalidateBindGroupsForResource(origin.kind, origin.handle);
+          } else {
+            this.evictStaleBindGroups();
+          }
+          return { ok: false, reason: 'destroyed_direct_resource' };
+        }
+
+        if (origin !== undefined) {
+          if (!this.isResourceGenerationCurrent(origin.kind, origin.handle, origin.generation)) {
+            this.invalidateBindGroupsForResource(origin.kind, origin.handle);
+            return { ok: false, reason: 'stale_direct_resource', id: origin.handle };
+          }
+          if (origin.parentTextureHandle !== undefined) {
+            if (
+              !this.isResourceGenerationCurrent(
+                'texture',
+                origin.parentTextureHandle,
+                origin.parentTextureGeneration
+              )
+            ) {
+              this.invalidateBindGroupsForResource('texture', origin.parentTextureHandle);
+              return { ok: false, reason: 'stale_direct_texture', id: origin.parentTextureHandle };
+            }
+            const parentTex = this.textures.get(origin.parentTextureHandle);
+            if (parentTex && parentTex.destroyed === true) {
+              this.invalidateBindGroupsForResource('texture', origin.parentTextureHandle);
+              return { ok: false, reason: 'destroyed_direct_texture', id: origin.parentTextureHandle };
+            }
+            if (parentTex) {
+              directResources.push(parentTex);
+            }
+          }
+          this._appendStamp(stamps, seenKeys, origin.kind, origin.handle, origin.generation, null);
+          if (origin.parentTextureHandle !== undefined) {
+            this._appendStamp(
+              stamps,
+              seenKeys,
+              'texture',
+              origin.parentTextureHandle,
+              origin.parentTextureGeneration,
+              null
+            );
+          }
+          directResources.push(targetObj);
+          if (isBufferBinding) {
+            const offset = resource.offset !== undefined ? Math.max(0, Math.floor(Number(resource.offset))) : 0;
+            const size = resource.size !== undefined ? Math.max(0, Math.floor(Number(resource.size))) : -1;
+            keyParts.push(`${binding}:${origin.kind}:${origin.handle}:${offset}:${size}`);
+          } else {
+            keyParts.push(`${binding}:${origin.kind}:${origin.handle}`);
+          }
+        } else {
+          directResources.push(targetObj);
+          const extId = this._getExternalObjectId(targetObj);
+          if (isBufferBinding) {
+            const offset = resource.offset !== undefined ? Math.max(0, Math.floor(Number(resource.offset))) : 0;
+            const size = resource.size !== undefined ? Math.max(0, Math.floor(Number(resource.size))) : -1;
+            keyParts.push(`${binding}:ext:${extId}:${offset}:${size}`);
+          } else {
+            keyParts.push(`${binding}:ext:${extId}`);
+          }
+        }
+        gpuEntries.push({ binding, resource });
+      }
+
+      const slotSnapshot = slotIndices.length > 0 ? this.captureSlotVersions(slotIndices) : null;
+      return {
+        ok: true,
+        gpuEntries,
+        stamps,
+        directResources,
+        slotSnapshot,
+        entriesKey: keyParts.join('|'),
+      };
+    }
+
+    /**
+     * Get a cached `GPUBindGroup` or create, stamp, and cache a new one under
+     * the bounded LRU policy (`maxBindGroups`).
+     *
+     * Supports:
+     * - `getOrCreateBindGroup(key, descriptor)` (`{ layout, entries?, slots?, label?, resources?, factory? }`)
+     * - `getOrCreateBindGroup(key, factory, resourceRefs)`
+     * - `getOrCreateBindGroup(key, layout, entries, options)`
+     * - `getOrCreateBindGroup(layout, entries, options)`
+     * - `getOrCreateBindGroup(descriptor)` (auto-derives deterministic key if `descriptor.key` is omitted)
+     *
+     * Returns `null` (without calling `device.createBindGroup`) if any referenced
+     * handle is missing or destroyed.
+     *
+     * @returns {object | null}
+     */
+    getOrCreateBindGroup(arg0, arg1, arg2, arg3) {
+      let explicitKey = null;
+      let layout = null;
+      let entries = null;
+      let slots = null;
+      let label;
+      let factory = null;
+      let explicitResourceRefs = null;
+
+      if (typeof arg0 === 'string' || typeof arg0 === 'number') {
+        explicitKey = String(arg0);
+        if (typeof arg1 === 'function') {
+          factory = arg1;
+          explicitResourceRefs = Array.isArray(arg2)
+            ? arg2
+            : arg2 && Array.isArray(arg2.resources)
+              ? arg2.resources
+              : [];
+        } else if (arg1 && typeof arg1 === 'object' && Array.isArray(arg2)) {
+          layout = arg1;
+          entries = arg2;
+          if (arg3 && typeof arg3 === 'object') {
+            label = arg3.label;
+            explicitResourceRefs = arg3.resources || null;
+            if (typeof arg3.factory === 'function') factory = arg3.factory;
+          }
+        } else if (arg1 && typeof arg1 === 'object') {
+          layout = arg1.layout || null;
+          entries = arg1.entries || null;
+          slots = arg1.slots || null;
+          label = arg1.label;
+          explicitResourceRefs = arg1.resources || null;
+          factory =
+            typeof arg1.factory === 'function'
+              ? arg1.factory
+              : typeof arg1.create === 'function'
+                ? arg1.create
+                : null;
+        }
+      } else if (arg0 && typeof arg0 === 'object') {
+        if (Array.isArray(arg1)) {
+          layout = arg0;
+          entries = arg1;
+          const opts = arg2 && typeof arg2 === 'object' ? arg2 : null;
+          if (opts) {
+            if (opts.key !== undefined && opts.key !== null) {
+              explicitKey = String(opts.key);
+            }
+            label = opts.label;
+            explicitResourceRefs = opts.resources || null;
+            if (typeof opts.factory === 'function') factory = opts.factory;
+          }
+        } else {
+          if (arg0.key !== undefined && arg0.key !== null) {
+            explicitKey = String(arg0.key);
+          }
+          layout = arg0.layout || null;
+          entries = arg0.entries || null;
+          slots = arg0.slots || null;
+          label = arg0.label;
+          explicitResourceRefs = arg0.resources || null;
+          factory =
+            typeof arg0.factory === 'function'
+              ? arg0.factory
+              : typeof arg0.create === 'function'
+                ? arg0.create
+                : null;
+        }
+      } else {
+        throw new TypeError('ResourceTable getOrCreateBindGroup requires a key, layout, or descriptor');
+      }
+
+      // Fast-path lookup when an explicit cache key was provided.
+      if (explicitKey !== null) {
+        const existing = this._bindGroupCache.get(explicitKey);
+        if (existing !== undefined) {
+          if (this._isBindGroupEntryValid(existing)) {
+            if (this._bindGroupCache.size > 1) {
+              this._bindGroupCache.delete(explicitKey);
+              this._bindGroupCache.set(explicitKey, existing);
+            }
+            this._bindGroupHits += 1;
+            return existing.bindGroup;
+          }
+          this._evictBindGroupEntry(explicitKey, existing, 'stale');
+        }
+      }
+
+      let resolved = null;
+      let cacheKey = explicitKey;
+
+      if (entries !== null || slots !== null) {
+        resolved = this._resolveBindGroupEntries(entries, slots);
+        if (!resolved.ok) {
+          this._bindGroupMisses += 1;
+          this._warn(
+            'bind_group_invalid_resource',
+            typeof resolved.id === 'number' ? resolved.id : -1,
+            `skipped bind group creation: ${resolved.reason}`
+          );
+          return null;
+        }
+        if (cacheKey === null) {
+          cacheKey = `L:${this._getLayoutId(layout)}|${resolved.entriesKey}`;
+          const existing = this._bindGroupCache.get(cacheKey);
+          if (existing !== undefined) {
+            if (this._isBindGroupEntryValid(existing)) {
+              if (this._bindGroupCache.size > 1) {
+                this._bindGroupCache.delete(cacheKey);
+                this._bindGroupCache.set(cacheKey, existing);
+              }
+              this._bindGroupHits += 1;
+              return existing.bindGroup;
+            }
+            this._evictBindGroupEntry(cacheKey, existing, 'stale');
+          }
+        }
+      }
+
+      if (cacheKey === null) {
+        throw new TypeError(
+          'ResourceTable getOrCreateBindGroup requires an explicit key or layout + entries/slots'
+        );
+      }
+
+      this._bindGroupMisses += 1;
+
+      const stamps = resolved ? resolved.stamps : [];
+      const seenKeys = new Set();
+      for (let i = 0; i < stamps.length; i += 1) {
+        seenKeys.add(this._resourceRefKey(stamps[i].kind, stamps[i].handle));
+      }
+      const directResources = resolved ? resolved.directResources : [];
+      let slotSnapshot = resolved ? resolved.slotSnapshot : null;
+
+      if (Array.isArray(explicitResourceRefs) && explicitResourceRefs.length > 0) {
+        const extra = this._normalizeBindGroupStamps(explicitResourceRefs, true);
+        if (!extra.ok) {
+          this._warn(
+            'bind_group_invalid_resource',
+            -1,
+            'skipped bind group creation: referenced resource handle is missing or stale'
+          );
+          return null;
+        }
+        for (let i = 0; i < extra.stamps.length; i += 1) {
+          const s = extra.stamps[i];
+          const rk = this._resourceRefKey(s.kind, s.handle);
+          if (!seenKeys.has(rk)) {
+            seenKeys.add(rk);
+            stamps.push(s);
+          }
+        }
+        for (let i = 0; i < extra.directResources.length; i += 1) {
+          directResources.push(extra.directResources[i]);
+        }
+        if (slotSnapshot === null && extra.slotSnapshot !== null) {
+          slotSnapshot = extra.slotSnapshot;
+        }
+      }
+
+      let bindGroup;
+      if (factory !== null) {
+        bindGroup = factory(resolved ? resolved.gpuEntries : undefined);
+      } else {
+        if (!layout) {
+          throw new TypeError(
+            'ResourceTable getOrCreateBindGroup requires a layout or factory function'
+          );
+        }
+        if (typeof this.device.createBindGroup !== 'function') {
+          throw new TypeError(
+            'ResourceTable device does not implement createBindGroup()'
+          );
+        }
+        const bgDesc = {
+          layout,
+          entries: resolved ? resolved.gpuEntries : [],
+        };
+        if (typeof label === 'string' && label.length > 0) {
+          bgDesc.label = label;
+        }
+        bindGroup = this.device.createBindGroup(bgDesc);
+      }
+
+      if (!bindGroup || typeof bindGroup !== 'object') {
+        return null;
+      }
+
+      this._storeBindGroupEntry(cacheKey, bindGroup, stamps, directResources, slotSnapshot);
+      return bindGroup;
+    }
+
     destroyAll() {
       for (const id of Array.from(this.buffers.keys())) {
         this.destroyBuffer(id);
       }
       for (const id of Array.from(this.textures.keys())) {
         this.destroyTexture(id);
+      }
+      for (const id of Array.from(this.textureViews.keys())) {
+        this.destroyTextureView(id);
       }
       for (const id of Array.from(this.samplers.keys())) {
         this.destroy(id);
@@ -2276,10 +3608,10 @@
     }
 
     /**
-     * Destroy all tracked GPU resources, clear bound descriptor slots, and
-     * clear internal handle/metadata maps. Monotonic slot/table versions are
-     * preserved (and incremented when active slots are cleared) so downstream
-     * bind-group caches never observe stale version reuse.
+     * Destroy all tracked GPU resources, clear bound descriptor slots, clear
+     * cached bind groups, and clear internal handle/metadata maps. Monotonic
+     * slot/table versions and resource generation counters are preserved so
+     * downstream bind-group caches never observe stale version reuse.
      * Pass `{ resetStats: true }` to also reset telemetry counters.
      *
      * @param {{ resetStats?: boolean }} [options]
@@ -2287,8 +3619,11 @@
     clear(options = {}) {
       this.clearSlots();
       this.destroyAll();
+      this.clearBindGroups();
       this._bufferMeta.clear();
       this.textureViews.clear();
+      this._textureViewParents.clear();
+      this._textureChildViews.clear();
       this._textureMeta.clear();
       if (options && options.resetStats) {
         this.resetStats();
@@ -2299,6 +3634,11 @@
      * Return sanitized diagnostic counters (no host paths or raw payload data).
      */
     getStats() {
+      const totalBindGroupLookups = this._bindGroupHits + this._bindGroupMisses;
+      const rawHitRate =
+        totalBindGroupLookups > 0 ? this._bindGroupHits / totalBindGroupLookups : 0;
+      const bindGroupHitRate = Math.min(1, Math.max(0, rawHitRate));
+
       return {
         bcFormatFallbackCount: this._bcFormatFallbackCount,
         bcDimensionAlignCount: this._bcDimensionAlignCount,
@@ -2329,6 +3669,13 @@
         slotLookups: this._slotLookups,
         tableVersion: this._tableVersion,
         activeSlots: this._activeSlots,
+        bindGroupHits: this._bindGroupHits,
+        bindGroupMisses: this._bindGroupMisses,
+        bindGroupHitRate,
+        staleBindGroupEvictions: this._staleBindGroupEvictions,
+        lruBindGroupEvictions: this._lruBindGroupEvictions,
+        cachedBindGroups: this._bindGroupCache.size,
+        maxBindGroups: this._maxBindGroups,
       };
     }
 
@@ -2355,6 +3702,10 @@
       this._slotWrites = 0;
       this._elidedNoOpWrites = 0;
       this._slotLookups = 0;
+      this._bindGroupHits = 0;
+      this._bindGroupMisses = 0;
+      this._staleBindGroupEvictions = 0;
+      this._lruBindGroupEvictions = 0;
     }
   }
 
@@ -2373,6 +3724,7 @@
     BUFFER_ALIGNMENT_BYTES,
     UNIFORM_BUFFER_MIN_BYTES,
     DEFAULT_FAST_SLOT_CAPACITY,
+    DEFAULT_MAX_BIND_GROUPS,
     isBcFormat,
     deviceSupportsBc,
     computeMaxMipLevels,
@@ -2408,6 +3760,7 @@
       BUFFER_ALIGNMENT_BYTES,
       UNIFORM_BUFFER_MIN_BYTES,
       DEFAULT_FAST_SLOT_CAPACITY,
+      DEFAULT_MAX_BIND_GROUPS,
       isBcFormat,
       deviceSupportsBc,
       computeMaxMipLevels,
