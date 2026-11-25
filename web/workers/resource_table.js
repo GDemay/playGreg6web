@@ -19,7 +19,163 @@
   const UNIFORM_BUFFER_MIN_BYTES = 16;
   const DEFAULT_FAST_SLOT_CAPACITY = 1024;
   const DEFAULT_MAX_BIND_GROUPS = 4096;
+  const DEFAULT_FAST_BIND_GROUP_BUCKETS = 512;
+  const FAST_BIND_GROUP_PROBE_WINDOW = 8;
+  const MAX_FAST_BIND_GROUP_ENTRIES = 64;
   const MAX_GENERATION_TOMBSTONES = 65536;
+
+  // Dual-u32 FNV-1a + splitmix32 constants for zero-alloc bind-group key hashing (W320).
+  const FNV1A_32_OFFSET = 0x811c9dc5;
+  const FNV1A_32_PRIME = 0x01000193;
+  const FNV1A_HI_OFFSET = 0x9e3779b9;
+  const SPLITMIX_C1 = 0x85ebca6b;
+  const SPLITMIX_C2 = 0xc2b2ae35;
+  const TWO_POW_32 = 4294967296;
+
+  const BG_KIND_BUFFER = 1;
+  const BG_KIND_TEXTURE = 2;
+  const BG_KIND_TEXTURE_VIEW = 3;
+  const BG_KIND_SAMPLER = 4;
+  const BG_KIND_SLOT = 5;
+  const BG_KIND_EXT_BUFFER = 6;
+  const BG_KIND_EXT_OBJECT = 7;
+
+  function splitmix32(x) {
+    let z = (x + 0x9e3779b9) >>> 0;
+    z = Math.imul(z ^ (z >>> 16), SPLITMIX_C1) >>> 0;
+    z = Math.imul(z ^ (z >>> 13), SPLITMIX_C2) >>> 0;
+    return (z ^ (z >>> 16)) >>> 0;
+  }
+
+  function nextPowerOfTwo(n) {
+    let p = 1;
+    while (p < n && p < 0x40000000) {
+      p <<= 1;
+    }
+    return p;
+  }
+
+  /**
+   * Compute a zero-allocation deterministic dual-u32 (64-bit) FNV-1a + splitmix32
+   * hash over `(layoutId, entryCount, bindingSlots[], resourceHandles[], generations[])`
+   * with optional extra typed arrays `(kinds[], offsets[], sizes[])`.
+   *
+   * When `outPair` (e.g. a pre-allocated `Uint32Array(2)`) is provided, writes
+   * the full 64-bit `(lo, hi)` state into `outPair[0]` and `outPair[1]`.
+   * Returns a non-negative 53-bit safe integer combining both 32-bit halves with
+   * zero heap allocations.
+   *
+   * @param {number | string} layoutId
+   * @param {number} entryCount
+   * @param {ArrayLike<number> | null | undefined} bindingSlots
+   * @param {ArrayLike<number> | null | undefined} resourceHandles
+   * @param {ArrayLike<number> | null | undefined} generations
+   * @param {Uint32Array | Array<number> | null | undefined} [outPair]
+   * @param {ArrayLike<number> | null | undefined} [kinds]
+   * @param {ArrayLike<number> | null | undefined} [offsets]
+   * @param {ArrayLike<number> | null | undefined} [sizes]
+   * @returns {number}
+   */
+  function computeBindGroupHashFast(
+    layoutId,
+    entryCount,
+    bindingSlots,
+    resourceHandles,
+    generations,
+    outPair,
+    kinds,
+    offsets,
+    sizes
+  ) {
+    let h1 = FNV1A_32_OFFSET;
+    let h2 = FNV1A_HI_OFFSET;
+
+    if (typeof layoutId === 'number') {
+      const lo = layoutId >>> 0;
+      const hi = layoutId > 0xffffffff ? Math.floor(layoutId / TWO_POW_32) >>> 0 : 0;
+      h1 = Math.imul(h1 ^ lo, FNV1A_32_PRIME) >>> 0;
+      h2 = Math.imul(h2 ^ (hi ^ splitmix32(lo)), FNV1A_32_PRIME) >>> 0;
+    } else if (typeof layoutId === 'string') {
+      const strLen = layoutId.length;
+      for (let i = 0; i < strLen; i += 1) {
+        const ch = layoutId.charCodeAt(i);
+        h1 = Math.imul(h1 ^ ch, FNV1A_32_PRIME) >>> 0;
+        h2 = Math.imul(h2 ^ splitmix32((ch + i) >>> 0), FNV1A_32_PRIME) >>> 0;
+      }
+    } else {
+      h1 = Math.imul(h1, FNV1A_32_PRIME) >>> 0;
+      h2 = Math.imul(h2 ^ 0x27d4eb2d, FNV1A_32_PRIME) >>> 0;
+    }
+
+    const count = entryCount > 0 ? entryCount >>> 0 : 0;
+    h1 = Math.imul(h1 ^ count, FNV1A_32_PRIME) >>> 0;
+    h2 = Math.imul(h2 ^ splitmix32(count), FNV1A_32_PRIME) >>> 0;
+
+    const hasSlots = bindingSlots !== undefined && bindingSlots !== null;
+    const hasHandles = resourceHandles !== undefined && resourceHandles !== null;
+    const hasGens = generations !== undefined && generations !== null;
+    const hasKinds = kinds !== undefined && kinds !== null;
+    const hasOffsets = offsets !== undefined && offsets !== null;
+    const hasSizes = sizes !== undefined && sizes !== null;
+
+    for (let i = 0; i < count; i += 1) {
+      const slot = hasSlots ? bindingSlots[i] >>> 0 : 0;
+      const handle = hasHandles ? resourceHandles[i] >>> 0 : 0;
+      const gen = hasGens ? generations[i] >>> 0 : 0;
+
+      h1 = Math.imul(h1 ^ slot, FNV1A_32_PRIME) >>> 0;
+      h1 = Math.imul(h1 ^ handle, FNV1A_32_PRIME) >>> 0;
+      h1 = Math.imul(h1 ^ gen, FNV1A_32_PRIME) >>> 0;
+
+      const idxSalt = Math.imul(i + 1, 0x27d4eb2d) >>> 0;
+      h2 = Math.imul(h2 ^ splitmix32((slot ^ idxSalt) >>> 0), FNV1A_32_PRIME) >>> 0;
+      h2 = Math.imul(h2 ^ splitmix32((handle ^ gen) >>> 0), FNV1A_32_PRIME) >>> 0;
+      h2 = ((h2 << 13) | (h2 >>> 19)) >>> 0;
+      h2 = Math.imul(h2 ^ gen, FNV1A_32_PRIME) >>> 0;
+
+      if (hasKinds) {
+        const k = kinds[i] >>> 0;
+        h1 = Math.imul(h1 ^ k, FNV1A_32_PRIME) >>> 0;
+        h2 = Math.imul(h2 ^ splitmix32(k), FNV1A_32_PRIME) >>> 0;
+      }
+      if (hasOffsets) {
+        const off = offsets[i];
+        if (off !== 0) {
+          const offLo = off >>> 0;
+          h1 = Math.imul(h1 ^ offLo, FNV1A_32_PRIME) >>> 0;
+          h2 = Math.imul(h2 ^ splitmix32(offLo), FNV1A_32_PRIME) >>> 0;
+          if (off > 0xffffffff) {
+            const offHi = Math.floor(off / TWO_POW_32) >>> 0;
+            h1 = Math.imul(h1 ^ offHi, FNV1A_32_PRIME) >>> 0;
+            h2 = Math.imul(h2 ^ splitmix32(offHi), FNV1A_32_PRIME) >>> 0;
+          }
+        }
+      }
+      if (hasSizes) {
+        const sz = sizes[i];
+        if (sz !== -1) {
+          const szLo = sz >>> 0;
+          h1 = Math.imul(h1 ^ szLo, FNV1A_32_PRIME) >>> 0;
+          h2 = Math.imul(h2 ^ splitmix32(szLo), FNV1A_32_PRIME) >>> 0;
+          if (sz > 0xffffffff) {
+            const szHi = Math.floor(sz / TWO_POW_32) >>> 0;
+            h1 = Math.imul(h1 ^ szHi, FNV1A_32_PRIME) >>> 0;
+            h2 = Math.imul(h2 ^ splitmix32(szHi), FNV1A_32_PRIME) >>> 0;
+          }
+        }
+      }
+    }
+
+    const finalLo = splitmix32((h1 ^ (h2 >>> 16)) >>> 0);
+    const finalHi = splitmix32((h2 ^ (finalLo >>> 16) ^ 0x517cc1b7) >>> 0);
+
+    if (outPair !== undefined && outPair !== null) {
+      outPair[0] = finalLo;
+      outPair[1] = finalHi;
+    }
+
+    return (finalHi & 0x1fffff) * TWO_POW_32 + finalLo;
+  }
 
   const SLOT_KIND_MAP = Object.freeze({
     buffer: 'buffer',
@@ -935,6 +1091,40 @@
       this._staleBindGroupEvictions = 0;
       this._lruBindGroupEvictions = 0;
 
+      // Zero-alloc numeric 64-bit fast-cache & scratch probe arrays for GPUBindGroup lookups (W320).
+      const requestedFastBgBuckets =
+        options.fastBindGroupBuckets !== undefined
+          ? options.fastBindGroupBuckets
+          : DEFAULT_FAST_BIND_GROUP_BUCKETS;
+      if (!Number.isInteger(requestedFastBgBuckets) || requestedFastBgBuckets < 0) {
+        throw new RangeError(
+          `ResourceTable fastBindGroupBuckets must be a non-negative integer, got ${requestedFastBgBuckets}`
+        );
+      }
+      this._fastBgBucketCount =
+        requestedFastBgBuckets > 0 && maxBindGroups > 0
+          ? nextPowerOfTwo(requestedFastBgBuckets)
+          : 0;
+      this._fastBgMask = this._fastBgBucketCount > 0 ? this._fastBgBucketCount - 1 : 0;
+      /** @type {Array<object | null> | null} */
+      this._fastBgSlots =
+        this._fastBgBucketCount > 0 ? new Array(this._fastBgBucketCount).fill(null) : null;
+      this._fastBgReplaceCursor = 0;
+      this._bindGroupHashFn =
+        typeof options.bindGroupHashFn === 'function' ? options.bindGroupHashFn : null;
+      this._probeMaxEntries = MAX_FAST_BIND_GROUP_ENTRIES;
+      this._probeBindings = new Uint32Array(MAX_FAST_BIND_GROUP_ENTRIES);
+      this._probeKinds = new Uint8Array(MAX_FAST_BIND_GROUP_ENTRIES);
+      this._probeHandles = new Uint32Array(MAX_FAST_BIND_GROUP_ENTRIES);
+      this._probeGenerations = new Uint32Array(MAX_FAST_BIND_GROUP_ENTRIES);
+      this._probeOffsets = new Float64Array(MAX_FAST_BIND_GROUP_ENTRIES);
+      this._probeSizes = new Float64Array(MAX_FAST_BIND_GROUP_ENTRIES);
+      this._probeHashPair = new Uint32Array(2);
+      this._probeEpoch = 0;
+      this._zeroAllocKeyProbes = 0;
+      this._zeroAllocKeyHits = 0;
+      this._hashCollisions = 0;
+
       // Monotonic per-resource generation stamps across create/overwrite/destroy (W267).
       this._nextResourceGeneration = 1;
       this._resourceGenerations = {
@@ -957,6 +1147,7 @@
       this._textureChildViews = new Map();
       this._objectOrigin = typeof WeakMap === 'function' ? new WeakMap() : null;
       this._layoutIds = typeof WeakMap === 'function' ? new WeakMap() : null;
+      this._primitiveLayoutIds = new Map();
       this._externalObjectIds = typeof WeakMap === 'function' ? new WeakMap() : null;
       this._nextLayoutId = 1;
       this._nextExternalObjectId = 1;
@@ -2598,6 +2789,28 @@
       return this._maxBindGroups;
     }
 
+    _getNumericLayoutId(layout) {
+      if (layout && typeof layout === 'object' && this._layoutIds !== null) {
+        let id = this._layoutIds.get(layout);
+        if (id === undefined) {
+          id = this._nextLayoutId;
+          this._nextLayoutId += 1;
+          this._layoutIds.set(layout, id);
+        }
+        return id;
+      }
+      if (typeof layout === 'string' || typeof layout === 'number') {
+        let id = this._primitiveLayoutIds.get(layout);
+        if (id === undefined) {
+          id = this._nextLayoutId;
+          this._nextLayoutId += 1;
+          this._primitiveLayoutIds.set(layout, id);
+        }
+        return id;
+      }
+      return 0;
+    }
+
     _getLayoutId(layout) {
       if (typeof layout === 'string' || typeof layout === 'number') {
         return `p:${layout}`;
@@ -2612,6 +2825,36 @@
         return `o:${id}`;
       }
       return 'null';
+    }
+
+    _normalizeGenerationBucketFast(kind) {
+      if (
+        kind === 'buffer' ||
+        kind === 'texture' ||
+        kind === 'textureView' ||
+        kind === 'sampler' ||
+        kind === 'shaderModule'
+      ) {
+        return kind;
+      }
+      return this._normalizeGenerationBucket(kind);
+    }
+
+    _detachFastBgSlot(entry) {
+      if (!entry) {
+        return;
+      }
+      entry.evicted = true;
+      const idx = entry.fastSlotIndex;
+      if (idx >= 0 && this._fastBgSlots !== null) {
+        const slot = this._fastBgSlots[idx];
+        if (slot !== null && slot.cacheEntry === entry) {
+          slot.occupied = false;
+          slot.cacheEntry = null;
+          slot.cacheKey = null;
+        }
+        entry.fastSlotIndex = -1;
+      }
     }
 
     _getExternalObjectId(obj) {
@@ -2657,6 +2900,7 @@
         return false;
       }
       this._bindGroupCache.delete(cacheKey);
+      this._detachFastBgSlot(entry);
       if (entry && Array.isArray(entry.stamps)) {
         this._removeBindGroupResourceRefs(cacheKey, entry.stamps);
       }
@@ -2961,13 +3205,14 @@
       return { ok: true, stamps, directResources, slotSnapshot };
     }
 
-    _storeBindGroupEntry(cacheKey, bindGroup, stamps, directResources, slotSnapshot) {
+    _storeBindGroupEntryRecord(cacheKey, bindGroup, stamps, directResources, slotSnapshot) {
       if (this._maxBindGroups === 0) {
-        return false;
+        return null;
       }
 
       const existing = this._bindGroupCache.get(cacheKey);
       if (existing !== undefined) {
+        this._detachFastBgSlot(existing);
         this._removeBindGroupResourceRefs(cacheKey, existing.stamps);
         this._bindGroupCache.delete(cacheKey);
       } else {
@@ -2984,10 +3229,19 @@
         stamps,
         directResources,
         slotSnapshot,
+        fastSlotIndex: -1,
+        evicted: false,
       };
       this._bindGroupCache.set(cacheKey, entry);
       this._addBindGroupResourceRefs(cacheKey, stamps);
-      return true;
+      return entry;
+    }
+
+    _storeBindGroupEntry(cacheKey, bindGroup, stamps, directResources, slotSnapshot) {
+      return (
+        this._storeBindGroupEntryRecord(cacheKey, bindGroup, stamps, directResources, slotSnapshot) !==
+        null
+      );
     }
 
     /**
@@ -3106,6 +3360,20 @@
 
     clearBindGroups() {
       const count = this._bindGroupCache.size;
+      if (this._fastBgSlots !== null) {
+        for (let i = 0; i < this._fastBgSlots.length; i += 1) {
+          const slot = this._fastBgSlots[i];
+          if (slot !== null && slot.occupied) {
+            if (slot.cacheEntry !== null) {
+              slot.cacheEntry.evicted = true;
+              slot.cacheEntry.fastSlotIndex = -1;
+            }
+            slot.occupied = false;
+            slot.cacheEntry = null;
+            slot.cacheKey = null;
+          }
+        }
+      }
       this._bindGroupCache.clear();
       this._bindGroupResourceRefs.clear();
       return count;
@@ -3380,6 +3648,570 @@
       };
     }
 
+    _extractFastBindGroupProbe(entries, slots) {
+      const isSlotsOnly = entries === null && Array.isArray(slots);
+      const list = isSlotsOnly ? slots : Array.isArray(entries) ? entries : null;
+      if (list === null) {
+        return -1;
+      }
+      const count = list.length;
+      if (count > this._probeMaxEntries) {
+        return -1;
+      }
+
+      const bindings = this._probeBindings;
+      const kinds = this._probeKinds;
+      const handles = this._probeHandles;
+      const generations = this._probeGenerations;
+      const offsets = this._probeOffsets;
+      const sizes = this._probeSizes;
+
+      let needsSort = false;
+      let prevBinding = -1;
+
+      for (let i = 0; i < count; i += 1) {
+        let binding;
+        if (isSlotsOnly) {
+          binding = i;
+          const slotIdx = list[i];
+          if (!isValidSlotIndex(slotIdx) || slotIdx > 0xffffffff) {
+            return -1;
+          }
+          const slotEntry = this._getSlotEntry(slotIdx);
+          if (!slotEntry || !slotEntry.bound || slotEntry.version > 0xffffffff) {
+            return -1;
+          }
+          if (!this._isSlotEntryLiveForFastProbe(slotEntry)) {
+            return -1;
+          }
+          bindings[i] = binding;
+          kinds[i] = BG_KIND_SLOT;
+          handles[i] = slotIdx;
+          generations[i] = slotEntry.version;
+          offsets[i] = slotEntry.offset;
+          sizes[i] = slotEntry.size !== undefined ? slotEntry.size : -1;
+        } else {
+          const item = list[i];
+          if (!item || typeof item !== 'object') {
+            return -1;
+          }
+          const rawBinding = item.binding;
+          binding = rawBinding === undefined ? 0 : Number(rawBinding) || 0;
+          if (!Number.isInteger(binding) || binding < 0 || binding > 0xffffffff) {
+            return -1;
+          }
+
+          if (item.slot !== undefined) {
+            const slotIdx = item.slot;
+            if (!isValidSlotIndex(slotIdx) || slotIdx > 0xffffffff) {
+              return -1;
+            }
+            const slotEntry = this._getSlotEntry(slotIdx);
+            if (!slotEntry || !slotEntry.bound || slotEntry.version > 0xffffffff) {
+              return -1;
+            }
+            if (!this._isSlotEntryLiveForFastProbe(slotEntry)) {
+              return -1;
+            }
+            bindings[i] = binding;
+            kinds[i] = BG_KIND_SLOT;
+            handles[i] = slotIdx;
+            generations[i] = slotEntry.version;
+            offsets[i] = slotEntry.offset;
+            sizes[i] = slotEntry.size !== undefined ? slotEntry.size : -1;
+          } else if (
+            item.handle !== undefined ||
+            item.id !== undefined ||
+            item.resourceId !== undefined
+          ) {
+            const handle =
+              item.handle !== undefined
+                ? item.handle
+                : item.id !== undefined
+                  ? item.id
+                  : item.resourceId;
+            const bucket = this._normalizeGenerationBucketFast(item.kind);
+            if (
+              bucket === null ||
+              typeof handle !== 'number' ||
+              !Number.isInteger(handle) ||
+              handle < 0 ||
+              handle > 0xffffffff
+            ) {
+              return -1;
+            }
+            const liveGen = this._liveResourceGenerations[bucket].get(handle);
+            if (liveGen === undefined || liveGen > 0xffffffff) {
+              return -1;
+            }
+
+            if (bucket === 'buffer') {
+              const buf = this.buffers.get(handle);
+              if (!buf || buf.destroyed === true) {
+                return -1;
+              }
+              const rawOff = item.offset;
+              const offset =
+                rawOff !== undefined && Number.isFinite(Number(rawOff))
+                  ? Math.max(0, Math.floor(Number(rawOff)))
+                  : 0;
+              const rawSz = item.size;
+              const size =
+                rawSz !== undefined && Number.isFinite(Number(rawSz))
+                  ? Math.max(0, Math.floor(Number(rawSz)))
+                  : -1;
+              bindings[i] = binding;
+              kinds[i] = BG_KIND_BUFFER;
+              handles[i] = handle;
+              generations[i] = liveGen;
+              offsets[i] = offset;
+              sizes[i] = size;
+            } else if (bucket === 'texture') {
+              const view = this.textureViews.get(handle);
+              const tex = this.textures.get(handle);
+              if (!view || view.destroyed === true || (tex && tex.destroyed === true)) {
+                return -1;
+              }
+              const viewGen = this._liveResourceGenerations.textureView.get(handle);
+              const effGen = viewGen !== undefined ? viewGen : liveGen;
+              if (effGen > 0xffffffff) {
+                return -1;
+              }
+              bindings[i] = binding;
+              kinds[i] = BG_KIND_TEXTURE;
+              handles[i] = handle;
+              generations[i] = effGen;
+              offsets[i] = 0;
+              sizes[i] = -1;
+            } else if (bucket === 'textureView') {
+              const view = this.textureViews.get(handle);
+              const parentTexId = this._textureViewParents.get(handle);
+              const parentTex =
+                parentTexId !== undefined ? this.textures.get(parentTexId) : undefined;
+              if (!view || view.destroyed === true || (parentTex && parentTex.destroyed === true)) {
+                return -1;
+              }
+              if (parentTexId !== undefined && !this._liveResourceGenerations.texture.has(parentTexId)) {
+                return -1;
+              }
+              bindings[i] = binding;
+              kinds[i] = BG_KIND_TEXTURE_VIEW;
+              handles[i] = handle;
+              generations[i] = liveGen;
+              offsets[i] = 0;
+              sizes[i] = -1;
+            } else if (bucket === 'sampler') {
+              const sampler = this.samplers.get(handle);
+              if (!sampler || sampler.destroyed === true) {
+                return -1;
+              }
+              bindings[i] = binding;
+              kinds[i] = BG_KIND_SAMPLER;
+              handles[i] = handle;
+              generations[i] = liveGen;
+              offsets[i] = 0;
+              sizes[i] = -1;
+            } else {
+              return -1;
+            }
+          } else {
+            const resource = item.resource;
+            if (!resource || typeof resource !== 'object') {
+              return -1;
+            }
+            const isBufferBinding = Boolean(resource.buffer && typeof resource.buffer === 'object');
+            const targetObj = isBufferBinding ? resource.buffer : resource;
+            if (targetObj.destroyed === true || resource.destroyed === true) {
+              return -1;
+            }
+            const origin = this._objectOrigin !== null ? this._objectOrigin.get(targetObj) : undefined;
+            if (origin !== undefined) {
+              const liveMap = this._liveResourceGenerations[origin.kind];
+              if (!liveMap || liveMap.get(origin.handle) !== origin.generation) {
+                return -1;
+              }
+              if (
+                origin.handle < 0 ||
+                origin.handle > 0xffffffff ||
+                origin.generation > 0xffffffff
+              ) {
+                return -1;
+              }
+              if (origin.parentTextureHandle !== undefined) {
+                if (
+                  this._liveResourceGenerations.texture.get(origin.parentTextureHandle) !==
+                  origin.parentTextureGeneration
+                ) {
+                  return -1;
+                }
+                const parentTex = this.textures.get(origin.parentTextureHandle);
+                if (parentTex && parentTex.destroyed === true) {
+                  return -1;
+                }
+              }
+              let kindCode = 0;
+              if (origin.kind === 'buffer') kindCode = BG_KIND_BUFFER;
+              else if (origin.kind === 'texture') kindCode = BG_KIND_TEXTURE;
+              else if (origin.kind === 'textureView') kindCode = BG_KIND_TEXTURE_VIEW;
+              else if (origin.kind === 'sampler') kindCode = BG_KIND_SAMPLER;
+              else return -1;
+
+              bindings[i] = binding;
+              kinds[i] = kindCode;
+              handles[i] = origin.handle;
+              generations[i] = origin.generation;
+              if (isBufferBinding) {
+                const rawOff = resource.offset;
+                offsets[i] =
+                  rawOff !== undefined && Number.isFinite(Number(rawOff))
+                    ? Math.max(0, Math.floor(Number(rawOff)))
+                    : 0;
+                const rawSz = resource.size;
+                sizes[i] =
+                  rawSz !== undefined && Number.isFinite(Number(rawSz))
+                    ? Math.max(0, Math.floor(Number(rawSz)))
+                    : -1;
+              } else {
+                offsets[i] = 0;
+                sizes[i] = -1;
+              }
+            } else {
+              const extId = this._getExternalObjectId(targetObj);
+              if (extId <= 0 || extId > 0xffffffff) {
+                return -1;
+              }
+              bindings[i] = binding;
+              kinds[i] = isBufferBinding ? BG_KIND_EXT_BUFFER : BG_KIND_EXT_OBJECT;
+              handles[i] = extId;
+              generations[i] = 0;
+              if (isBufferBinding) {
+                const rawOff = resource.offset;
+                offsets[i] =
+                  rawOff !== undefined && Number.isFinite(Number(rawOff))
+                    ? Math.max(0, Math.floor(Number(rawOff)))
+                    : 0;
+                const rawSz = resource.size;
+                sizes[i] =
+                  rawSz !== undefined && Number.isFinite(Number(rawSz))
+                    ? Math.max(0, Math.floor(Number(rawSz)))
+                    : -1;
+              } else {
+                offsets[i] = 0;
+                sizes[i] = -1;
+              }
+            }
+          }
+        }
+
+        if (binding < prevBinding) {
+          needsSort = true;
+        }
+        prevBinding = binding;
+      }
+
+      if (needsSort) {
+        for (let i = 1; i < count; i += 1) {
+          const b = bindings[i];
+          const k = kinds[i];
+          const h = handles[i];
+          const g = generations[i];
+          const off = offsets[i];
+          const sz = sizes[i];
+          let j = i - 1;
+          while (j >= 0 && bindings[j] > b) {
+            bindings[j + 1] = bindings[j];
+            kinds[j + 1] = kinds[j];
+            handles[j + 1] = handles[j];
+            generations[j + 1] = generations[j];
+            offsets[j + 1] = offsets[j];
+            sizes[j + 1] = sizes[j];
+            j -= 1;
+          }
+          bindings[j + 1] = b;
+          kinds[j + 1] = k;
+          handles[j + 1] = h;
+          generations[j + 1] = g;
+          offsets[j + 1] = off;
+          sizes[j + 1] = sz;
+        }
+      }
+
+      return count;
+    }
+
+    _isSlotEntryLiveForFastProbe(slotEntry) {
+      if (slotEntry.resource !== null) {
+        if (slotEntry.resource.destroyed === true) {
+          return false;
+        }
+        if (this._objectOrigin !== null) {
+          const origin = this._objectOrigin.get(slotEntry.resource);
+          if (origin !== undefined) {
+            const liveMap = this._liveResourceGenerations[origin.kind];
+            if (!liveMap || liveMap.get(origin.handle) !== origin.generation) {
+              return false;
+            }
+            if (origin.parentTextureHandle !== undefined) {
+              if (
+                this._liveResourceGenerations.texture.get(origin.parentTextureHandle) !==
+                origin.parentTextureGeneration
+              ) {
+                return false;
+              }
+              const parentTex = this.textures.get(origin.parentTextureHandle);
+              if (parentTex && parentTex.destroyed === true) {
+                return false;
+              }
+            }
+          }
+        }
+        return true;
+      }
+      if (slotEntry.handle === null) {
+        return false;
+      }
+      const bucket = this._normalizeGenerationBucketFast(slotEntry.kind);
+      if (bucket === null) {
+        return false;
+      }
+      if (!this._liveResourceGenerations[bucket].has(slotEntry.handle)) {
+        return false;
+      }
+      if (bucket === 'buffer') {
+        const buf = this.buffers.get(slotEntry.handle);
+        return Boolean(buf && buf.destroyed !== true);
+      }
+      if (bucket === 'texture' || bucket === 'textureView') {
+        const tex = this.textures.get(slotEntry.handle);
+        const view = this.textureViews.get(slotEntry.handle);
+        if ((tex && tex.destroyed === true) || (view && view.destroyed === true)) {
+          return false;
+        }
+        if (slotEntry.cachedView && slotEntry.cachedView.destroyed === true) {
+          return false;
+        }
+        return Boolean(view || tex);
+      }
+      if (bucket === 'sampler') {
+        const sampler = this.samplers.get(slotEntry.handle);
+        return Boolean(sampler && sampler.destroyed !== true);
+      }
+      return false;
+    }
+
+    _hashFastProbe(layoutId, entryCount) {
+      const pair = this._probeHashPair;
+      if (this._bindGroupHashFn !== null) {
+        pair[0] = 0;
+        pair[1] = 0;
+        const customHash = this._bindGroupHashFn(
+          layoutId,
+          entryCount,
+          this._probeBindings,
+          this._probeHandles,
+          this._probeGenerations,
+          pair,
+          this._probeKinds,
+          this._probeOffsets,
+          this._probeSizes
+        );
+        if (
+          pair[0] === 0 &&
+          pair[1] === 0 &&
+          typeof customHash === 'number' &&
+          Number.isFinite(customHash)
+        ) {
+          pair[0] = customHash >>> 0;
+          pair[1] = customHash > 0xffffffff ? Math.floor(customHash / TWO_POW_32) >>> 0 : 0;
+        }
+        return;
+      }
+      computeBindGroupHashFast(
+        layoutId,
+        entryCount,
+        this._probeBindings,
+        this._probeHandles,
+        this._probeGenerations,
+        pair,
+        this._probeKinds,
+        this._probeOffsets,
+        this._probeSizes
+      );
+    }
+
+    _fastSlotMatchesProbe(slot, layoutId, entryCount) {
+      if (slot.layoutId !== layoutId || slot.entryCount !== entryCount) {
+        return false;
+      }
+      const bA = slot.bindings;
+      const kA = slot.kinds;
+      const hA = slot.handles;
+      const gA = slot.generations;
+      const oA = slot.offsets;
+      const sA = slot.sizes;
+      const bB = this._probeBindings;
+      const kB = this._probeKinds;
+      const hB = this._probeHandles;
+      const gB = this._probeGenerations;
+      const oB = this._probeOffsets;
+      const sB = this._probeSizes;
+      for (let i = 0; i < entryCount; i += 1) {
+        if (
+          bA[i] !== bB[i] ||
+          hA[i] !== hB[i] ||
+          gA[i] !== gB[i] ||
+          kA[i] !== kB[i] ||
+          oA[i] !== oB[i] ||
+          sA[i] !== sB[i]
+        ) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    _probeFastBindGroupCache(layoutId, entryCount) {
+      if (this._fastBgSlots === null) {
+        return null;
+      }
+      this._probeEpoch = (this._probeEpoch + 1) >>> 0;
+      this._hashFastProbe(layoutId, entryCount);
+      this._zeroAllocKeyProbes += 1;
+
+      const hashLo = this._probeHashPair[0];
+      const hashHi = this._probeHashPair[1];
+      const mask = this._fastBgMask;
+      const start = hashLo & mask;
+      const slots = this._fastBgSlots;
+      const probeLimit = Math.min(FAST_BIND_GROUP_PROBE_WINDOW, this._fastBgBucketCount);
+
+      for (let p = 0; p < probeLimit; p += 1) {
+        const idx = (start + p) & mask;
+        const slot = slots[idx];
+        if (slot === null || !slot.occupied) {
+          continue;
+        }
+        if (slot.hashLo !== hashLo || slot.hashHi !== hashHi) {
+          continue;
+        }
+        if (!this._fastSlotMatchesProbe(slot, layoutId, entryCount)) {
+          this._hashCollisions += 1;
+          continue;
+        }
+        const entry = slot.cacheEntry;
+        if (entry === null || entry.evicted) {
+          slot.occupied = false;
+          slot.cacheEntry = null;
+          slot.cacheKey = null;
+          continue;
+        }
+        if (!this._isBindGroupEntryValid(entry)) {
+          this._evictBindGroupEntry(slot.cacheKey, entry, 'stale');
+          return null;
+        }
+        if (this._bindGroupCache.size > 1) {
+          this._bindGroupCache.delete(entry.key);
+          this._bindGroupCache.set(entry.key, entry);
+        }
+        this._zeroAllocKeyHits += 1;
+        this._bindGroupHits += 1;
+        return entry.bindGroup;
+      }
+      return null;
+    }
+
+    _insertFastBindGroupEntry(entry, layoutId, entryCount) {
+      if (this._fastBgSlots === null || !entry || entry.evicted || entry.fastSlotIndex >= 0) {
+        return;
+      }
+      const hashLo = this._probeHashPair[0];
+      const hashHi = this._probeHashPair[1];
+      const mask = this._fastBgMask;
+      const start = hashLo & mask;
+      const slots = this._fastBgSlots;
+      const probeLimit = Math.min(FAST_BIND_GROUP_PROBE_WINDOW, this._fastBgBucketCount);
+
+      let targetIdx = -1;
+      for (let p = 0; p < probeLimit; p += 1) {
+        const idx = (start + p) & mask;
+        const slot = slots[idx];
+        if (
+          slot === null ||
+          !slot.occupied ||
+          slot.cacheEntry === null ||
+          slot.cacheEntry.evicted
+        ) {
+          targetIdx = idx;
+          break;
+        }
+      }
+
+      if (targetIdx === -1) {
+        const victimOffset = this._fastBgReplaceCursor % probeLimit;
+        this._fastBgReplaceCursor = (this._fastBgReplaceCursor + 1) >>> 0;
+        targetIdx = (start + victimOffset) & mask;
+        const victimSlot = slots[targetIdx];
+        if (victimSlot !== null && victimSlot.cacheEntry !== null) {
+          victimSlot.cacheEntry.fastSlotIndex = -1;
+        }
+      }
+
+      let slot = slots[targetIdx];
+      const minCap = entryCount > 8 ? entryCount : 8;
+      if (slot === null) {
+        slot = {
+          occupied: true,
+          hashLo,
+          hashHi,
+          layoutId,
+          entryCount,
+          capacity: minCap,
+          bindings: new Uint32Array(minCap),
+          kinds: new Uint8Array(minCap),
+          handles: new Uint32Array(minCap),
+          generations: new Uint32Array(minCap),
+          offsets: new Float64Array(minCap),
+          sizes: new Float64Array(minCap),
+          cacheKey: entry.key,
+          cacheEntry: entry,
+        };
+        slots[targetIdx] = slot;
+      } else {
+        if (slot.capacity < entryCount) {
+          slot.capacity = entryCount;
+          slot.bindings = new Uint32Array(entryCount);
+          slot.kinds = new Uint8Array(entryCount);
+          slot.handles = new Uint32Array(entryCount);
+          slot.generations = new Uint32Array(entryCount);
+          slot.offsets = new Float64Array(entryCount);
+          slot.sizes = new Float64Array(entryCount);
+        }
+        slot.occupied = true;
+        slot.hashLo = hashLo;
+        slot.hashHi = hashHi;
+        slot.layoutId = layoutId;
+        slot.entryCount = entryCount;
+        slot.cacheKey = entry.key;
+        slot.cacheEntry = entry;
+      }
+
+      const bSrc = this._probeBindings;
+      const kSrc = this._probeKinds;
+      const hSrc = this._probeHandles;
+      const gSrc = this._probeGenerations;
+      const oSrc = this._probeOffsets;
+      const sSrc = this._probeSizes;
+      for (let i = 0; i < entryCount; i += 1) {
+        slot.bindings[i] = bSrc[i];
+        slot.kinds[i] = kSrc[i];
+        slot.handles[i] = hSrc[i];
+        slot.generations[i] = gSrc[i];
+        slot.offsets[i] = oSrc[i];
+        slot.sizes[i] = sSrc[i];
+      }
+      entry.fastSlotIndex = targetIdx;
+    }
+
     /**
      * Get a cached `GPUBindGroup` or create, stamp, and cache a new one under
      * the bounded LRU policy (`maxBindGroups`).
@@ -3484,6 +4316,27 @@
         }
       }
 
+      // Zero-alloc numeric 64-bit fast-path probe when auto-keying entries/slots (W320).
+      let fastProbeCount = -1;
+      let fastProbeLayoutId = 0;
+      let fastProbeEpoch = 0;
+      if (
+        explicitKey === null &&
+        this._fastBgSlots !== null &&
+        (entries !== null || slots !== null) &&
+        (!Array.isArray(explicitResourceRefs) || explicitResourceRefs.length === 0)
+      ) {
+        fastProbeCount = this._extractFastBindGroupProbe(entries, slots);
+        if (fastProbeCount >= 0) {
+          fastProbeLayoutId = this._getNumericLayoutId(layout);
+          const fastHit = this._probeFastBindGroupCache(fastProbeLayoutId, fastProbeCount);
+          if (fastHit !== null) {
+            return fastHit;
+          }
+          fastProbeEpoch = this._probeEpoch;
+        }
+      }
+
       let resolved = null;
       let cacheKey = explicitKey;
 
@@ -3506,6 +4359,9 @@
               if (this._bindGroupCache.size > 1) {
                 this._bindGroupCache.delete(cacheKey);
                 this._bindGroupCache.set(cacheKey, existing);
+              }
+              if (fastProbeCount >= 0 && this._probeEpoch === fastProbeEpoch) {
+                this._insertFastBindGroupEntry(existing, fastProbeLayoutId, fastProbeCount);
               }
               this._bindGroupHits += 1;
               return existing.bindGroup;
@@ -3585,7 +4441,16 @@
         return null;
       }
 
-      this._storeBindGroupEntry(cacheKey, bindGroup, stamps, directResources, slotSnapshot);
+      const storedEntry = this._storeBindGroupEntryRecord(
+        cacheKey,
+        bindGroup,
+        stamps,
+        directResources,
+        slotSnapshot
+      );
+      if (storedEntry !== null && fastProbeCount >= 0 && this._probeEpoch === fastProbeEpoch) {
+        this._insertFastBindGroupEntry(storedEntry, fastProbeLayoutId, fastProbeCount);
+      }
       return bindGroup;
     }
 
@@ -3676,6 +4541,9 @@
         lruBindGroupEvictions: this._lruBindGroupEvictions,
         cachedBindGroups: this._bindGroupCache.size,
         maxBindGroups: this._maxBindGroups,
+        zeroAllocKeyProbes: this._zeroAllocKeyProbes,
+        zeroAllocKeyHits: this._zeroAllocKeyHits,
+        hashCollisions: this._hashCollisions,
       };
     }
 
@@ -3706,6 +4574,9 @@
       this._bindGroupMisses = 0;
       this._staleBindGroupEvictions = 0;
       this._lruBindGroupEvictions = 0;
+      this._zeroAllocKeyProbes = 0;
+      this._zeroAllocKeyHits = 0;
+      this._hashCollisions = 0;
     }
   }
 
@@ -3725,6 +4596,7 @@
     UNIFORM_BUFFER_MIN_BYTES,
     DEFAULT_FAST_SLOT_CAPACITY,
     DEFAULT_MAX_BIND_GROUPS,
+    DEFAULT_FAST_BIND_GROUP_BUCKETS,
     isBcFormat,
     deviceSupportsBc,
     computeMaxMipLevels,
@@ -3735,6 +4607,7 @@
     padBufferUploadData,
     decodeCreateTexture2,
     sanitizeTextureDescriptor,
+    computeBindGroupHashFast,
     ResourceTable,
   });
 
@@ -3761,6 +4634,7 @@
       UNIFORM_BUFFER_MIN_BYTES,
       DEFAULT_FAST_SLOT_CAPACITY,
       DEFAULT_MAX_BIND_GROUPS,
+      DEFAULT_FAST_BIND_GROUP_BUCKETS,
       isBcFormat,
       deviceSupportsBc,
       computeMaxMipLevels,
@@ -3771,6 +4645,7 @@
       padBufferUploadData,
       decodeCreateTexture2,
       sanitizeTextureDescriptor,
+      computeBindGroupHashFast,
       ResourceTable,
     };
   }
