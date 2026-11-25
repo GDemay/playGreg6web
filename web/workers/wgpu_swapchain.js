@@ -162,6 +162,38 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
     return value;
   }
 
+  function sanitizeNonNegativeDrawCount(value) {
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+      return Math.floor(value);
+    }
+    if (value === true) {
+      return 1;
+    }
+    return 0;
+  }
+
+  function isPositiveContentFlag(value) {
+    return (
+      value === true ||
+      (typeof value === 'number' && Number.isFinite(value) && value > 0)
+    );
+  }
+
+  function isFrameContentMetadata(obj) {
+    if (!obj || typeof obj !== 'object') {
+      return false;
+    }
+    return (
+      'hasVisibleContent' in obj ||
+      'hasDraws' in obj ||
+      'realPackDraws' in obj ||
+      'nonClearDraw' in obj ||
+      'timestampMs' in obj ||
+      'frameIntervalUs' in obj ||
+      'dropped' in obj
+    );
+  }
+
   function resolvePreferredCanvasFormat() {
     if (
       typeof navigator !== 'undefined' &&
@@ -401,6 +433,7 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
         frameIntervalUs,
         droppedFrameThresholdMs,
         onValidationError = null,
+        onFirstVisibleFrame = null,
         maxErrorHistory = DEFAULT_MAX_ERROR_HISTORY,
       } = options;
 
@@ -446,6 +479,13 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
         typeof onValidationError !== 'function'
       ) {
         throw new TypeError('onValidationError must be a function when provided');
+      }
+      if (
+        onFirstVisibleFrame !== null &&
+        onFirstVisibleFrame !== undefined &&
+        typeof onFirstVisibleFrame !== 'function'
+      ) {
+        throw new TypeError('onFirstVisibleFrame must be a function when provided');
       }
       if (!Number.isInteger(maxErrorHistory) || maxErrorHistory < 1) {
         throw new RangeError(`maxErrorHistory must be a positive integer, got ${maxErrorHistory}`);
@@ -511,6 +551,8 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       this._frameIntervalUs = resolvedFrameIntervalUs;
       this._droppedFrameThresholdMs = resolvedDroppedFrameThresholdMs;
       this._onValidationError = typeof onValidationError === 'function' ? onValidationError : null;
+      this._onFirstVisibleFrame =
+        typeof onFirstVisibleFrame === 'function' ? onFirstVisibleFrame : null;
       this._maxErrorHistory = maxErrorHistory;
 
       this._width = 0;
@@ -561,6 +603,20 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       this._frameDeltaRing = new Float64Array(frameWindowSize);
       this._frameDeltaHead = 0;
       this._frameDeltaCount = 0;
+
+      // Zero-GPU-readback visible-content readiness tracking (W231).
+      this._hasVisibleContent = false;
+      this._firstVisiblePresentIndex = null;
+      this._firstVisiblePresentMs = null;
+      this._consecutiveBlackPresents = 0;
+      this._blackPresentsTotal = 0;
+      this._visiblePresentsTotal = 0;
+      this._firstVisibleFired = false;
+      this._pendingFrameVisible = false;
+      this._pendingRealPackDraws = 0;
+      this._pendingContentTimestampMs = null;
+      this._hasPendingFrameContent = false;
+
       this._liveTelemetry = this._createTelemetryObject();
 
       this._hookDeviceLost(this._device);
@@ -621,6 +677,30 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
 
     get maxFrameMs() {
       return this._maxFrameMs;
+    }
+
+    get hasVisibleContent() {
+      return this._hasVisibleContent;
+    }
+
+    get firstVisiblePresentIndex() {
+      return this._firstVisiblePresentIndex;
+    }
+
+    get firstVisiblePresentMs() {
+      return this._firstVisiblePresentMs;
+    }
+
+    get consecutiveBlackPresents() {
+      return this._consecutiveBlackPresents;
+    }
+
+    get blackPresentsTotal() {
+      return this._blackPresentsTotal;
+    }
+
+    get visiblePresentsTotal() {
+      return this._visiblePresentsTotal;
     }
 
     get usesBlitFallback() {
@@ -1732,17 +1812,50 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
 
     /**
      * Finalize frame presentation on the given command encoder by recording the fullscreen
-     * intermediate-to-canvas blit pass if blit fallback is active.
+     * intermediate-to-canvas blit pass if blit fallback is active, and update visible-content
+     * readiness / present telemetry when invoked with an encoder or frame metadata.
      *
-     * @param {GPUCommandEncoder} [commandEncoder]
-     * @param {GPUTextureView} [canvasTextureView]
+     * Supported signatures:
+     * - `present(commandEncoder, canvasTextureView?, meta?)`
+     * - `present(commandEncoder, meta)`
+     * - `present(meta)` (metadata-only present without an encoder)
+     *
+     * @param {GPUCommandEncoder | object} [commandEncoder]
+     * @param {GPUTextureView | object} [canvasTextureView]
+     * @param {{
+     *   hasVisibleContent?: boolean,
+     *   hasDraws?: boolean | number,
+     *   realPackDraws?: number | boolean,
+     *   nonClearDraw?: boolean | number,
+     *   timestampMs?: number,
+     *   frameIntervalUs?: number | null,
+     *   dropped?: boolean,
+     * }} [meta]
      * @returns {boolean} True if a blit pass was recorded.
      */
-    present(commandEncoder, canvasTextureView) {
-      if (!commandEncoder) {
+    present(commandEncoder, canvasTextureView, meta) {
+      if (!commandEncoder || this._destroyed || this._isDeviceLost) {
         return false;
       }
-      return this.blitToCanvasIfNeeded(commandEncoder, canvasTextureView);
+
+      // Allow calling present({ hasVisibleContent, realPackDraws, ... }) without an encoder.
+      if (typeof commandEncoder.beginRenderPass !== 'function') {
+        if (isFrameContentMetadata(commandEncoder)) {
+          this.recordFramePresented(commandEncoder);
+        }
+        return false;
+      }
+
+      let resolvedCanvasView = canvasTextureView;
+      let resolvedMeta = meta;
+      if (resolvedMeta === undefined && isFrameContentMetadata(canvasTextureView)) {
+        resolvedMeta = canvasTextureView;
+        resolvedCanvasView = undefined;
+      }
+
+      const blitted = this.blitToCanvasIfNeeded(commandEncoder, resolvedCanvasView);
+      this.recordFramePresented(resolvedMeta);
+      return blitted;
     }
 
     /**
@@ -1870,6 +1983,12 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
         format: this._format,
         depthFormat: this._enableDepth ? this._depthFormat : null,
         isDeviceLost: false,
+        hasVisibleContent: false,
+        firstVisiblePresentIndex: null,
+        firstVisiblePresentMs: null,
+        consecutiveBlackPresents: 0,
+        blackPresentsTotal: 0,
+        visiblePresentsTotal: 0,
       });
     }
 
@@ -1893,12 +2012,71 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       target.format = this._format;
       target.depthFormat = this._enableDepth ? this._depthFormat : null;
       target.isDeviceLost = this._isDeviceLost;
+      target.hasVisibleContent = this._hasVisibleContent;
+      target.firstVisiblePresentIndex = this._firstVisiblePresentIndex;
+      target.firstVisiblePresentMs = this._firstVisiblePresentMs;
+      target.consecutiveBlackPresents = this._consecutiveBlackPresents;
+      target.blackPresentsTotal = this._blackPresentsTotal;
+      target.visiblePresentsTotal = this._visiblePresentsTotal;
       if (this._frameIntervalUs !== null) {
         target.frameIntervalUs = this._frameIntervalUs;
       } else if ('frameIntervalUs' in target) {
         delete target.frameIntervalUs;
       }
       return target;
+    }
+
+    /**
+     * Mark whether the pending frame being recorded contains visible (non-black / non-clear)
+     * draw content without performing any GPU readback. May be called multiple times per frame;
+     * positive draw signals latch until consumed by the next `recordFramePresented()` /
+     * `recordPresent()` / `present()` call, unless explicitly overridden by a boolean
+     * `hasVisibleContent` flag.
+     *
+     * @param {{
+     *   hasDraws?: boolean | number,
+     *   realPackDraws?: number | boolean,
+     *   nonClearDraw?: boolean | number,
+     *   hasVisibleContent?: boolean,
+     *   timestampMs?: number,
+     * } | boolean} [content]
+     * @returns {boolean} Whether the current pending frame is marked as having visible content.
+     */
+    markFrameContent(content) {
+      if (this._destroyed) {
+        return false;
+      }
+      if (typeof content === 'boolean') {
+        this._hasPendingFrameContent = true;
+        this._pendingFrameVisible = content;
+        return this._pendingFrameVisible;
+      }
+      if (!content || typeof content !== 'object') {
+        return this._pendingFrameVisible;
+      }
+
+      this._hasPendingFrameContent = true;
+
+      const realPackCount = sanitizeNonNegativeDrawCount(content.realPackDraws);
+      if (realPackCount > 0) {
+        this._pendingRealPackDraws += realPackCount;
+      }
+
+      if (typeof content.hasVisibleContent === 'boolean') {
+        this._pendingFrameVisible = content.hasVisibleContent;
+      } else if (
+        realPackCount > 0 ||
+        isPositiveContentFlag(content.hasDraws) ||
+        isPositiveContentFlag(content.nonClearDraw)
+      ) {
+        this._pendingFrameVisible = true;
+      }
+
+      if (typeof content.timestampMs === 'number' && Number.isFinite(content.timestampMs)) {
+        this._pendingContentTimestampMs = content.timestampMs;
+      }
+
+      return this._pendingFrameVisible;
     }
 
     /**
@@ -1918,18 +2096,37 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
 
     /**
      * Record a presented frame timestamp into the pre-allocated rolling frame-pacing ring buffer
-     * with zero per-frame allocations.
+     * with zero per-frame allocations, and update visible-content readiness counters.
      *
-     * @param {number | { timestampMs?: number, frameIntervalUs?: number | null, dropped?: boolean }} [timestampOrOptions]
+     * @param {number | {
+     *   timestampMs?: number,
+     *   frameIntervalUs?: number | null,
+     *   dropped?: boolean,
+     *   hasVisibleContent?: boolean,
+     *   hasDraws?: boolean | number,
+     *   realPackDraws?: number | boolean,
+     *   nonClearDraw?: boolean | number,
+     * }} [timestampOrOptions]
      *   Optional explicit timestamp override in milliseconds (defaults to `nowFn()`/`now()`) or
-     *   metadata object `{ timestampMs?, frameIntervalUs?, dropped? }`.
-     * @param {number | { frameIntervalUs?: number | null, dropped?: boolean }} [meta]
-     *   Optional present cadence metadata (`{ frameIntervalUs, dropped }` or numeric `frameIntervalUs`).
+     *   metadata object.
+     * @param {number | {
+     *   frameIntervalUs?: number | null,
+     *   dropped?: boolean,
+     *   hasVisibleContent?: boolean,
+     *   hasDraws?: boolean | number,
+     *   realPackDraws?: number | boolean,
+     *   nonClearDraw?: boolean | number,
+     * }} [meta]
+     *   Optional present cadence and visible-content metadata, or numeric `frameIntervalUs`.
      */
     recordFramePresented(timestampOrOptions, meta) {
       let explicitTimestampMs;
       let providedFrameIntervalUs;
       let explicitDropped = false;
+      let hasExplicitVisible = false;
+      let explicitVisible = false;
+      let inlinePositiveContent = false;
+      let inlineRealPackDraws = 0;
 
       if (timestampOrOptions && typeof timestampOrOptions === 'object') {
         explicitTimestampMs = timestampOrOptions.timestampMs;
@@ -1938,6 +2135,21 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
         }
         if (timestampOrOptions.dropped === true) {
           explicitDropped = true;
+        }
+        if (typeof timestampOrOptions.hasVisibleContent === 'boolean') {
+          hasExplicitVisible = true;
+          explicitVisible = timestampOrOptions.hasVisibleContent;
+        }
+        const optRealPack = sanitizeNonNegativeDrawCount(timestampOrOptions.realPackDraws);
+        if (optRealPack > 0) {
+          inlineRealPackDraws += optRealPack;
+          inlinePositiveContent = true;
+        }
+        if (
+          isPositiveContentFlag(timestampOrOptions.hasDraws) ||
+          isPositiveContentFlag(timestampOrOptions.nonClearDraw)
+        ) {
+          inlinePositiveContent = true;
         }
       } else {
         explicitTimestampMs = timestampOrOptions;
@@ -1950,6 +2162,21 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
           }
           if (meta.dropped === true) {
             explicitDropped = true;
+          }
+          if (typeof meta.hasVisibleContent === 'boolean') {
+            hasExplicitVisible = true;
+            explicitVisible = meta.hasVisibleContent;
+          }
+          const metaRealPack = sanitizeNonNegativeDrawCount(meta.realPackDraws);
+          if (metaRealPack > 0) {
+            inlineRealPackDraws += metaRealPack;
+            inlinePositiveContent = true;
+          }
+          if (
+            isPositiveContentFlag(meta.hasDraws) ||
+            isPositiveContentFlag(meta.nonClearDraw)
+          ) {
+            inlinePositiveContent = true;
           }
         } else if (typeof meta === 'number' || meta === null) {
           providedFrameIntervalUs = meta;
@@ -1964,6 +2191,21 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
         typeof explicitTimestampMs === 'number' && Number.isFinite(explicitTimestampMs)
           ? explicitTimestampMs
           : this._now();
+
+      // Consume pending frame-content flags marked prior to present so the next frame starts clean.
+      let frameVisible = this._pendingFrameVisible;
+      const frameRealPackDraws = this._pendingRealPackDraws + inlineRealPackDraws;
+      const pendingContentTimestampMs = this._pendingContentTimestampMs;
+      this._pendingFrameVisible = false;
+      this._pendingRealPackDraws = 0;
+      this._pendingContentTimestampMs = null;
+      this._hasPendingFrameContent = false;
+
+      if (hasExplicitVisible) {
+        frameVisible = explicitVisible;
+      } else if (inlinePositiveContent) {
+        frameVisible = true;
+      }
 
       this._totalFrames += 1;
       this._presentCount += 1;
@@ -2005,7 +2247,61 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       }
 
       this._lastFrameTimestamp = nowMs;
+
+      if (frameVisible) {
+        this._visiblePresentsTotal += 1;
+        this._consecutiveBlackPresents = 0;
+        this._hasVisibleContent = true;
+
+        if (!this._firstVisibleFired) {
+          const visibleTs =
+            typeof explicitTimestampMs === 'number' && Number.isFinite(explicitTimestampMs)
+              ? explicitTimestampMs
+              : pendingContentTimestampMs !== null
+                ? pendingContentTimestampMs
+                : nowMs;
+          this._firstVisiblePresentIndex = this._presentCount;
+          this._firstVisiblePresentMs =
+            typeof visibleTs === 'number' && Number.isFinite(visibleTs) ? visibleTs : 0;
+          this._firstVisibleFired = true;
+
+          if (typeof this._onFirstVisibleFrame === 'function') {
+            try {
+              this._onFirstVisibleFrame({
+                presentIndex: this._firstVisiblePresentIndex,
+                firstVisiblePresentIndex: this._firstVisiblePresentIndex,
+                timestampMs: this._firstVisiblePresentMs,
+                firstVisiblePresentMs: this._firstVisiblePresentMs,
+                blackPresentsTotal: this._blackPresentsTotal,
+                consecutiveBlackPresents: 0,
+                visiblePresentsTotal: this._visiblePresentsTotal,
+                realPackDraws: frameRealPackDraws,
+                hasVisibleContent: true,
+                width: this._width,
+                height: this._height,
+              });
+            } catch {
+              // Isolate callback exceptions so readiness notifications never break rendering.
+            }
+          }
+        }
+      } else {
+        this._blackPresentsTotal += 1;
+        this._consecutiveBlackPresents += 1;
+      }
+
       return this._fillTelemetry(this._liveTelemetry);
+    }
+
+    /**
+     * Alias for `recordFramePresented()`, accepting optional timestamp and visible-content
+     * metadata (`hasVisibleContent`, `hasDraws`, `realPackDraws`, `nonClearDraw`).
+     *
+     * @param {number | object} [timestampOrOptions]
+     * @param {number | object} [meta]
+     */
+    recordPresent(timestampOrOptions, meta) {
+      return this.recordFramePresented(timestampOrOptions, meta);
     }
 
     /**
@@ -2074,6 +2370,57 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
      */
     clearValidationErrors() {
       this._validationErrors.length = 0;
+    }
+
+    /**
+     * Reset frame-pacing, visible-content readiness, blit, and validation error statistics
+     * cleanly for a new session while preserving configured GPU resources and re-arming the
+     * one-shot `onFirstVisibleFrame` callback.
+     */
+    resetStats() {
+      this._totalFrames = 0;
+      this._presentCount = 0;
+      this._droppedFrameCount = 0;
+      this._resizeCount = 0;
+      this._reconfigureCount = 0;
+      this._skippedRedundantReconfigures = 0;
+      this._lastFrameTimestamp = null;
+      this._lastPresentIntervalMs = 0;
+      this._lastFrameMs = 0;
+      this._avgFrameMs = 0;
+      this._maxFrameMs = 0;
+      this._fps = 0;
+      this._frameDeltaRing.fill(0);
+      this._frameDeltaHead = 0;
+      this._frameDeltaCount = 0;
+
+      this._blitCount = 0;
+      this._viewFormatsFallbackCount = 0;
+
+      this._validationErrors.length = 0;
+      this._validationErrorCount = 0;
+      this._validationErrorSeq = 0;
+
+      this._hasVisibleContent = false;
+      this._firstVisiblePresentIndex = null;
+      this._firstVisiblePresentMs = null;
+      this._consecutiveBlackPresents = 0;
+      this._blackPresentsTotal = 0;
+      this._visiblePresentsTotal = 0;
+      this._firstVisibleFired = false;
+      this._pendingFrameVisible = false;
+      this._pendingRealPackDraws = 0;
+      this._pendingContentTimestampMs = null;
+      this._hasPendingFrameContent = false;
+
+      this._fillTelemetry(this._liveTelemetry);
+    }
+
+    /**
+     * Alias for `resetStats()`. Resets session telemetry and re-arms `onFirstVisibleFrame`.
+     */
+    reset() {
+      this.resetStats();
     }
 
     /**
@@ -2179,6 +2526,11 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
 
       this._deviceLostCallbacks.clear();
       this._onValidationError = null;
+      this._onFirstVisibleFrame = null;
+      this._pendingFrameVisible = false;
+      this._pendingRealPackDraws = 0;
+      this._pendingContentTimestampMs = null;
+      this._hasPendingFrameContent = false;
       this._device = null;
       this._context = null;
       this._canvas = null;

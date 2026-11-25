@@ -354,6 +354,12 @@ test('rolling FPS and frame-time telemetry uses injectable clock and evicts old 
     format: 'bgra8unorm',
     depthFormat: 'depth24plus',
     isDeviceLost: false,
+    hasVisibleContent: false,
+    firstVisiblePresentIndex: null,
+    firstVisiblePresentMs: null,
+    consecutiveBlackPresents: 0,
+    blackPresentsTotal: 0,
+    visiblePresentsTotal: 0,
   });
 
   // First presented frame establishes baseline timestamp (no delta yet).
@@ -2194,4 +2200,421 @@ test('W197 tracks zero-allocation frame-pacing telemetry (presentCount, reconfig
   assert.equal(swapchain.droppedFrameCount, 6);
   assert.equal(swapchain.lastFrameMs, 200);
   assert.equal(swapchain.maxFrameMs, 200);
+});
+
+// ---------------------------------------------------------------------------
+// W231 (#1031): Zero-GPU-readback visible-content readiness & black-loading
+// present telemetry
+// ---------------------------------------------------------------------------
+
+test('W231 tracks black-loading presents, first visible frame readiness, and later black transitions via markFrameContent + recordPresent', () => {
+  const { canvas, context, device } = createMockWebGpuEnv();
+  let clockMs = 1000;
+  const firstVisibleEvents = [];
+
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'bgra8unorm',
+    nowFn: () => clockMs,
+    onFirstVisibleFrame(info) {
+      firstVisibleEvents.push({ ...info });
+      // Mutate received info to verify internal state isolation.
+      info.firstVisiblePresentIndex = 999999;
+      info.hasVisibleContent = false;
+    },
+  });
+  swapchain.configure({ width: 1280, height: 720 });
+
+  // Initial state before any present.
+  assert.equal(swapchain.hasVisibleContent, false);
+  assert.equal(swapchain.firstVisiblePresentIndex, null);
+  assert.equal(swapchain.firstVisiblePresentMs, null);
+  assert.equal(swapchain.consecutiveBlackPresents, 0);
+  assert.equal(swapchain.blackPresentsTotal, 0);
+  assert.equal(swapchain.visiblePresentsTotal, 0);
+  assert.equal(firstVisibleEvents.length, 0);
+
+  const initStats = swapchain.getStats();
+  assert.equal(initStats.hasVisibleContent, false);
+  assert.equal(initStats.firstVisiblePresentIndex, null);
+  assert.equal(initStats.firstVisiblePresentMs, null);
+  assert.equal(initStats.consecutiveBlackPresents, 0);
+  assert.equal(initStats.blackPresentsTotal, 0);
+  assert.equal(initStats.visiblePresentsTotal, 0);
+
+  // Present 3 black/clear-only boot frames.
+  assert.equal(
+    swapchain.markFrameContent({ hasDraws: false, realPackDraws: 0, nonClearDraw: false }),
+    false
+  );
+  swapchain.recordPresent();
+  clockMs += 16;
+  swapchain.recordPresent(); // unmarked frame defaults to black
+  clockMs += 16;
+  swapchain.markFrameContent({ hasDraws: 0, realPackDraws: 0, nonClearDraw: 0 });
+  swapchain.recordPresent();
+
+  assert.equal(swapchain.presentCount, 3);
+  assert.equal(swapchain.hasVisibleContent, false);
+  assert.equal(swapchain.firstVisiblePresentIndex, null);
+  assert.equal(swapchain.firstVisiblePresentMs, null);
+  assert.equal(swapchain.consecutiveBlackPresents, 3);
+  assert.equal(swapchain.blackPresentsTotal, 3);
+  assert.equal(swapchain.visiblePresentsTotal, 0);
+  assert.equal(firstVisibleEvents.length, 0);
+
+  // Frame 4: multi-pass frame where pass 1 has real draws and pass 2 is clear-only.
+  clockMs = 1500;
+  assert.equal(swapchain.markFrameContent({ hasDraws: false, realPackDraws: 0 }), false);
+  assert.equal(
+    swapchain.markFrameContent({ hasDraws: true, realPackDraws: 5, nonClearDraw: true }),
+    true
+  );
+  assert.equal(
+    swapchain.markFrameContent({ hasDraws: false, realPackDraws: 0, nonClearDraw: false }),
+    true
+  );
+
+  // Before present commits the frame, readiness counters have not fired yet.
+  assert.equal(swapchain.hasVisibleContent, false);
+  assert.equal(firstVisibleEvents.length, 0);
+
+  const t4 = swapchain.recordPresent();
+  assert.equal(t4.presentCount, 4);
+  assert.equal(t4.hasVisibleContent, true);
+  assert.equal(t4.firstVisiblePresentIndex, 4);
+  assert.equal(t4.firstVisiblePresentMs, 1500);
+  assert.equal(t4.consecutiveBlackPresents, 0);
+  assert.equal(t4.blackPresentsTotal, 3);
+  assert.equal(t4.visiblePresentsTotal, 1);
+
+  assert.equal(firstVisibleEvents.length, 1);
+  assert.deepEqual(firstVisibleEvents[0], {
+    presentIndex: 4,
+    firstVisiblePresentIndex: 4,
+    timestampMs: 1500,
+    firstVisiblePresentMs: 1500,
+    blackPresentsTotal: 3,
+    consecutiveBlackPresents: 0,
+    visiblePresentsTotal: 1,
+    realPackDraws: 5,
+    hasVisibleContent: true,
+    width: 1280,
+    height: 720,
+  });
+
+  // Internal state unaffected by callback mutation.
+  assert.equal(swapchain.firstVisiblePresentIndex, 4);
+  assert.equal(swapchain.hasVisibleContent, true);
+
+  // Frame 5: another visible frame -> callback must NOT re-fire; firstVisible* stays latched.
+  clockMs = 1516;
+  swapchain.markFrameContent({ nonClearDraw: true });
+  swapchain.recordPresent();
+  assert.equal(firstVisibleEvents.length, 1);
+  assert.equal(swapchain.firstVisiblePresentIndex, 4);
+  assert.equal(swapchain.firstVisiblePresentMs, 1500);
+  assert.equal(swapchain.visiblePresentsTotal, 2);
+  assert.equal(swapchain.blackPresentsTotal, 3);
+  assert.equal(swapchain.consecutiveBlackPresents, 0);
+
+  // Frames 6 & 7: subsequent black loading screen frames increment consecutiveBlackPresents
+  // while preserving hasVisibleContent=true and latched firstVisible*.
+  clockMs = 1532;
+  swapchain.recordPresent();
+  clockMs = 1548;
+  swapchain.recordPresent();
+  assert.equal(swapchain.hasVisibleContent, true);
+  assert.equal(swapchain.firstVisiblePresentIndex, 4);
+  assert.equal(swapchain.firstVisiblePresentMs, 1500);
+  assert.equal(swapchain.consecutiveBlackPresents, 2);
+  assert.equal(swapchain.blackPresentsTotal, 5);
+  assert.equal(swapchain.visiblePresentsTotal, 2);
+  assert.equal(swapchain.blackPresentsTotal + swapchain.visiblePresentsTotal, swapchain.presentCount);
+
+  // Frame 8: visible again -> consecutiveBlackPresents resets to 0.
+  clockMs = 1564;
+  swapchain.markFrameContent({ realPackDraws: 2 });
+  const t8 = swapchain.recordPresent();
+  assert.equal(t8.consecutiveBlackPresents, 0);
+  assert.equal(t8.blackPresentsTotal, 5);
+  assert.equal(t8.visiblePresentsTotal, 3);
+  assert.equal(t8.presentCount, 8);
+  assert.equal(firstVisibleEvents.length, 1);
+
+  // getStats() and getTelemetry() expose identical sanitized readiness counters.
+  const stats = swapchain.getStats();
+  const telem = swapchain.getTelemetry();
+  for (const key of [
+    'hasVisibleContent',
+    'firstVisiblePresentIndex',
+    'firstVisiblePresentMs',
+    'consecutiveBlackPresents',
+    'blackPresentsTotal',
+    'visiblePresentsTotal',
+  ]) {
+    assert.equal(stats[key], telem[key], `mismatch on ${key}`);
+  }
+});
+
+test('W231 supports visible-content metadata directly in present() and recordPresent(), including blit fallback and timestamp precedence', () => {
+  const { canvas, context, device, events } = createMockWebGpuEnv();
+  attachMockBlitCapabilities(device, events);
+
+  let clockMs = 2000;
+  const fired = [];
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'bgra8unorm',
+    enableDepth: false,
+    nowFn: () => clockMs,
+    onFirstVisibleFrame: (info) => fired.push(info),
+  });
+  swapchain.configure({ width: 800, height: 600 });
+  swapchain.configureForStreamFormat('rgb10a2unorm');
+
+  // 1. present(encoder, canvasView, meta) with black frame -> blits and counts as black.
+  const enc1 = createMockCommandEncoder();
+  const explicitView = { kind: 'GPUTextureView', id: 'canvas-view-w231' };
+  assert.equal(
+    swapchain.present(enc1, explicitView, { hasVisibleContent: false, realPackDraws: 0 }),
+    true
+  );
+  assert.equal(swapchain.blitCount, 1);
+  assert.equal(swapchain.presentCount, 1);
+  assert.equal(swapchain.blackPresentsTotal, 1);
+  assert.equal(swapchain.consecutiveBlackPresents, 1);
+  assert.equal(swapchain.hasVisibleContent, false);
+
+  // 2. present(encoder, meta) 2-arg form with realPackDraws > 0 triggers first visible frame.
+  clockMs = 2033;
+  const enc2 = createMockCommandEncoder();
+  assert.equal(swapchain.present(enc2, { realPackDraws: 4, timestampMs: 2050 }), true);
+  assert.equal(swapchain.blitCount, 2);
+  assert.equal(swapchain.presentCount, 2);
+  assert.equal(swapchain.hasVisibleContent, true);
+  assert.equal(swapchain.firstVisiblePresentIndex, 2);
+  assert.equal(swapchain.firstVisiblePresentMs, 2050);
+  assert.equal(swapchain.visiblePresentsTotal, 1);
+  assert.equal(swapchain.consecutiveBlackPresents, 0);
+  assert.equal(fired.length, 1);
+  assert.equal(fired[0].realPackDraws, 4);
+  assert.equal(fired[0].firstVisiblePresentMs, 2050);
+
+  // 3. Metadata-only present({ hasVisibleContent: true }) without encoder returns false and records present.
+  clockMs = 2066;
+  assert.equal(swapchain.present({ hasVisibleContent: true, realPackDraws: 2 }), false);
+  assert.equal(swapchain.presentCount, 3);
+  assert.equal(swapchain.visiblePresentsTotal, 2);
+  assert.equal(swapchain.blitCount, 2);
+
+  // 4. Explicit hasVisibleContent: false on recordPresent overrides prior markFrameContent({ hasDraws: true }).
+  swapchain.markFrameContent({ hasDraws: true, realPackDraws: 1 });
+  swapchain.recordPresent(2100, { hasVisibleContent: false });
+  assert.equal(swapchain.presentCount, 4);
+  assert.equal(swapchain.blackPresentsTotal, 2);
+  assert.equal(swapchain.consecutiveBlackPresents, 1);
+  assert.equal(swapchain.visiblePresentsTotal, 2);
+
+  // 5. markFrameContent({ timestampMs }) is used when recordPresent() omits explicit timestampMs.
+  swapchain.resetStats();
+  clockMs = 9000;
+  swapchain.markFrameContent({ hasDraws: true, timestampMs: 4321 });
+  swapchain.recordPresent();
+  assert.equal(swapchain.firstVisiblePresentIndex, 1);
+  assert.equal(swapchain.firstVisiblePresentMs, 4321);
+
+  // 6. Explicit recordPresent({ timestampMs }) overrides markFrameContent({ timestampMs }).
+  swapchain.reset();
+  swapchain.markFrameContent({ hasDraws: true, timestampMs: 4321 });
+  swapchain.recordPresent({ timestampMs: 7777 });
+  assert.equal(swapchain.firstVisiblePresentIndex, 1);
+  assert.equal(swapchain.firstVisiblePresentMs, 7777);
+});
+
+test('W231 isolates onFirstVisibleFrame callback errors and re-arms cleanly on resetStats() and reset()', () => {
+  const { canvas, context, device } = createMockWebGpuEnv();
+  attachMockEventTarget(device);
+
+  let clockMs = 100;
+  let shouldThrow = true;
+  const calls = [];
+
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'bgra8unorm',
+    nowFn: () => clockMs,
+    onFirstVisibleFrame(info) {
+      calls.push(info);
+      if (shouldThrow) {
+        throw new Error('UI splash transition callback boom');
+      }
+    },
+  });
+  swapchain.configure({ width: 1920, height: 1080 });
+  const depthTexBeforeReset = device.createdTextures[0];
+
+  // Record a validation error to verify resetStats() clears stats while keeping GPU resources alive.
+  device.dispatchUncapturedError({ name: 'GPUValidationError', message: 'pre-reset error' });
+  assert.equal(swapchain.getStats().validationErrorCount, 1);
+
+  // Black frame then first visible frame whose callback throws.
+  swapchain.recordPresent();
+  clockMs = 250;
+  assert.doesNotThrow(() => {
+    swapchain.recordPresent({ hasVisibleContent: true, realPackDraws: 7 });
+  });
+
+  // Callback error was isolated; counters are intact and callback is NOT retried on next visible frame.
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].firstVisiblePresentIndex, 2);
+  assert.equal(calls[0].firstVisiblePresentMs, 250);
+  assert.equal(swapchain.hasVisibleContent, true);
+  assert.equal(swapchain.firstVisiblePresentIndex, 2);
+  assert.equal(swapchain.firstVisiblePresentMs, 250);
+  assert.equal(swapchain.visiblePresentsTotal, 1);
+  assert.equal(swapchain.blackPresentsTotal, 1);
+
+  clockMs = 266;
+  swapchain.recordPresent({ hasVisibleContent: true });
+  assert.equal(calls.length, 1);
+  assert.equal(swapchain.visiblePresentsTotal, 2);
+
+  // Add a pending mark before resetStats() to ensure resetStats() clears pending frame content too.
+  swapchain.markFrameContent({ hasDraws: true, realPackDraws: 3, timestampMs: 999 });
+  swapchain.resetStats();
+
+  // Configured GPU state preserved; all telemetry and readiness counters reset cleanly.
+  assert.equal(swapchain.isConfigured, true);
+  assert.equal(swapchain.width, 1920);
+  assert.equal(swapchain.height, 1080);
+  assert.equal(depthTexBeforeReset.destroyed, false);
+
+  const resetStats = swapchain.getStats();
+  assert.equal(resetStats.totalFrames, 0);
+  assert.equal(resetStats.presentCount, 0);
+  assert.equal(resetStats.droppedFrameCount, 0);
+  assert.equal(resetStats.validationErrorCount, 0);
+  assert.equal(resetStats.validationErrorHistorySize, 0);
+  assert.equal(resetStats.hasVisibleContent, false);
+  assert.equal(resetStats.firstVisiblePresentIndex, null);
+  assert.equal(resetStats.firstVisiblePresentMs, null);
+  assert.equal(resetStats.consecutiveBlackPresents, 0);
+  assert.equal(resetStats.blackPresentsTotal, 0);
+  assert.equal(resetStats.visiblePresentsTotal, 0);
+
+  // Stale pre-reset markFrameContent was cleared -> unmarked present counts as black.
+  clockMs = 300;
+  swapchain.recordPresent();
+  assert.equal(swapchain.hasVisibleContent, false);
+  assert.equal(swapchain.blackPresentsTotal, 1);
+  assert.equal(calls.length, 1);
+
+  // Callback is re-armed after resetStats() and fires once on the new session's first visible frame.
+  shouldThrow = false;
+  clockMs = 400;
+  swapchain.recordPresent({ realPackDraws: 2 });
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].firstVisiblePresentIndex, 2);
+  assert.equal(calls[1].firstVisiblePresentMs, 400);
+  assert.equal(calls[1].blackPresentsTotal, 1);
+
+  // reset() alias also re-arms callback cleanly.
+  swapchain.reset();
+  clockMs = 500;
+  swapchain.recordPresent({ hasDraws: true });
+  assert.equal(calls.length, 3);
+  assert.equal(calls[2].firstVisiblePresentIndex, 1);
+  assert.equal(calls[2].firstVisiblePresentMs, 500);
+});
+
+test('W231 validates onFirstVisibleFrame option, sanitizes invalid inputs, and handles destroy/device-lost safely', async () => {
+  const { canvas, context, device } = createMockWebGpuEnv();
+
+  assert.throws(
+    () => new WgpuSwapchain({ canvas, device, context, onFirstVisibleFrame: 'nope' }),
+    TypeError
+  );
+  assert.throws(
+    () => new WgpuSwapchain({ canvas, device, context, onFirstVisibleFrame: 42 }),
+    TypeError
+  );
+
+  let clockMs = 500;
+  let firedCount = 0;
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'bgra8unorm',
+    nowFn: () => clockMs,
+    onFirstVisibleFrame: () => {
+      firedCount += 1;
+    },
+  });
+  swapchain.configure({ width: 640, height: 360 });
+
+  // Invalid / negative / NaN / Infinity inputs never mark visible or corrupt counters.
+  assert.equal(swapchain.markFrameContent(), false);
+  assert.equal(swapchain.markFrameContent(null), false);
+  assert.equal(swapchain.markFrameContent({}), false);
+  assert.equal(
+    swapchain.markFrameContent({
+      hasDraws: -1,
+      realPackDraws: -10,
+      nonClearDraw: NaN,
+      timestampMs: Infinity,
+    }),
+    false
+  );
+  assert.equal(
+    swapchain.markFrameContent({
+      hasDraws: NaN,
+      realPackDraws: Infinity,
+      nonClearDraw: -3,
+      timestampMs: NaN,
+    }),
+    false
+  );
+
+  const live1 = swapchain.recordPresent();
+  assert.equal(live1.hasVisibleContent, false);
+  assert.equal(live1.blackPresentsTotal, 1);
+  assert.equal(live1.consecutiveBlackPresents, 1);
+  assert.equal(live1.visiblePresentsTotal, 0);
+  assert.equal(live1.firstVisiblePresentIndex, null);
+  assert.equal(live1.firstVisiblePresentMs, null);
+
+  // Zero-allocation reuse of live telemetry object on subsequent recordPresent calls.
+  clockMs += 16;
+  const live2 = swapchain.recordPresent({ realPackDraws: 3.9 });
+  assert.strictEqual(live1, live2);
+  assert.equal(live2.hasVisibleContent, true);
+  assert.equal(live2.firstVisiblePresentIndex, 2);
+  assert.equal(live2.firstVisiblePresentMs, 516);
+  assert.equal(firedCount, 1);
+
+  // No-arg present() is a safe no-op returning false.
+  assert.equal(swapchain.present(), false);
+  assert.equal(swapchain.presentCount, 2);
+
+  // When device is lost, present() returns false without recording a present.
+  device.triggerLost({ reason: 'unknown', message: 'lost' });
+  await device.lost;
+  await Promise.resolve();
+  assert.equal(swapchain.present({ hasVisibleContent: true }), false);
+  assert.equal(swapchain.presentCount, 2);
+
+  // After destroy(), markFrameContent() and present() are safe no-ops and getStats() stays readable.
+  swapchain.destroy();
+  assert.equal(swapchain.markFrameContent({ hasDraws: true }), false);
+  assert.equal(swapchain.present({ hasVisibleContent: true }), false);
+  assert.equal(swapchain.getStats().hasVisibleContent, true);
+  assert.equal(swapchain.getStats().firstVisiblePresentIndex, 2);
 });
