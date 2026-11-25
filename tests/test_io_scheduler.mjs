@@ -18,6 +18,7 @@ const {
   IO_PRIORITY,
   IoPriorityScheduler,
   DEFAULT_AGING_INTERVAL_MS,
+  DEFAULT_AGING_WINDOW_MS,
   DEFAULT_DEDUPE_IN_FLIGHT,
   makeReadKey,
   classifyIoPriority,
@@ -1053,6 +1054,7 @@ test('agingThresholdMs: 0 (and default) preserves strict priority ordering regar
     const opts = {
       rangeCache,
       maxConcurrency: 1,
+      agingWindowMs: 0,
       nowFn: () => fakeNow,
       sleep: async () => {},
     };
@@ -2672,4 +2674,395 @@ test('W248 resetStats() cleanly resets telemetry without cancelling queued or in
   assert.equal(afterIdleReset.completed, 0);
   assert.equal(afterIdleReset.dispatched, 0);
   assert.equal(afterIdleReset.enqueued, 0);
+});
+
+// ---------------------------------------------------------------------------
+// W288: Starvation-free priority aging (agingWindowMs), injectable `now` clock,
+//       promotedByAgingCount, maxQueueWaitMs, activeByPriority, and resetStats().
+// ---------------------------------------------------------------------------
+
+test('W288 exports DEFAULT_AGING_WINDOW_MS, applies 2000ms default, and classifies core_bvh4.rpf as boot-critical HIGH', () => {
+  assert.equal(DEFAULT_AGING_WINDOW_MS, 2000);
+
+  const scheduler = new IoPriorityScheduler({
+    rangeCache: { read: async () => new Uint8Array(0) },
+  });
+  assert.equal(scheduler.agingWindowMs, 2000);
+
+  const src = fs.readFileSync(path.join(repoRoot, 'web/workers/io_scheduler.js'), 'utf8');
+  const sandbox = {};
+  sandbox.globalThis = sandbox;
+  sandbox.self = sandbox;
+  vm.runInNewContext(src, sandbox);
+
+  assert.equal(sandbox.PlayGta6IoScheduler.DEFAULT_AGING_WINDOW_MS, 2000);
+  assert.equal(isBootCriticalRpfPath('/game/core_bvh4.rpf'), true);
+  assert.equal(classifyBootArchivePriority('/game/core_bvh4.rpf'), IO_PRIORITY.HIGH);
+  assert.equal(classifyIoPriority('/game/core_bvh4.rpf'), IO_PRIORITY.HIGH);
+  assert.equal(classifyIoPriority('rpf://game/core_bvh4.rpf/node_0.bin'), IO_PRIORITY.HIGH);
+});
+
+test('W288 agingWindowMs promotes NORMAL and PREFETCH one tier per window under heavy HIGH load using injectable `now` clock', async () => {
+  let mockNow = 0;
+  const dispatchOrder = [];
+  const gates = new Map();
+
+  const rangeCache = {
+    read(filePath, offset, length) {
+      dispatchOrder.push(filePath);
+      const gate = gates.get(filePath);
+      if (gate) return gate.promise;
+      return Promise.resolve(makeBytes(filePath.charCodeAt(0), length));
+    },
+  };
+
+  const gBlocker = deferred();
+  const gHigh1 = deferred();
+  const gNormal = deferred();
+  const gHigh2 = deferred();
+  const gPrefetch = deferred();
+  gates.set('blocker.bin', gBlocker);
+  gates.set('high-1.rpf', gHigh1);
+  gates.set('normal-old.rpf', gNormal);
+  gates.set('high-2.rpf', gHigh2);
+  gates.set('prefetch-old.rpf', gPrefetch);
+
+  const scheduler = new IoPriorityScheduler({
+    rangeCache,
+    maxConcurrency: 1,
+    agingWindowMs: 500,
+    now: () => mockNow,
+    sleep: async () => {},
+  });
+  assert.equal(scheduler.agingWindowMs, 500);
+
+  // t = 0: blocker runs; NORMAL (tier 2) and PREFETCH (tier 3) queue up.
+  const pBlocker = scheduler.scheduleRead('blocker.bin', 0, 16, { priority: IO_PRIORITY.HIGH });
+  const pNormal = scheduler.scheduleRead('normal-old.rpf', 0, 16, { priority: IO_PRIORITY.NORMAL });
+  const pPrefetch = scheduler.scheduleRead('prefetch-old.rpf', 0, 16, {
+    priority: IO_PRIORITY.PREFETCH,
+  });
+
+  // t = 250 (< 500ms): neither NORMAL nor PREFETCH has aged -> fresh HIGH wins.
+  mockNow = 250;
+  const pHigh1 = scheduler.scheduleRead('high-1.rpf', 0, 16, { priority: IO_PRIORITY.HIGH });
+  gBlocker.resolve(makeBytes(1, 16));
+  await pBlocker;
+  await Promise.resolve();
+
+  assert.deepEqual(dispatchOrder, ['blocker.bin', 'high-1.rpf']);
+  assert.equal(scheduler.getStats().promotedByAgingCount, 0);
+
+  // t = 500 (1 window): NORMAL (wait 500ms -> 1 step -> eff HIGH, enq 0) beats fresh HIGH (enq 500);
+  // PREFETCH (wait 500ms -> 1 step -> eff NORMAL) has not reached HIGH yet.
+  mockNow = 500;
+  const pHigh2 = scheduler.scheduleRead('high-2.rpf', 0, 16, { priority: IO_PRIORITY.HIGH });
+  gHigh1.resolve(makeBytes(2, 16));
+  await pHigh1;
+  await Promise.resolve();
+
+  assert.deepEqual(dispatchOrder, ['blocker.bin', 'high-1.rpf', 'normal-old.rpf']);
+  assert.equal(scheduler.getStats().promotedByAgingCount, 1);
+  assert.equal(scheduler.getStats().byPriority.NORMAL.promotedByAgingCount, 1);
+
+  // t = 750 (< 1000ms): PREFETCH has only aged 1 step (to eff NORMAL), so queued high-2 (eff HIGH) runs first.
+  mockNow = 750;
+  const pHigh3 = scheduler.scheduleRead('high-3.rpf', 0, 16, { priority: IO_PRIORITY.HIGH });
+  gNormal.resolve(makeBytes(3, 16));
+  await pNormal;
+  await Promise.resolve();
+
+  assert.deepEqual(dispatchOrder, ['blocker.bin', 'high-1.rpf', 'normal-old.rpf', 'high-2.rpf']);
+  assert.equal(scheduler.getStats().promotedByAgingCount, 1);
+
+  // t = 1000 (2 windows): PREFETCH (wait 1000ms -> 2 steps -> eff HIGH, enq 0) beats high-3 (enq 750)!
+  mockNow = 1000;
+  gHigh2.resolve(makeBytes(4, 16));
+  await pHigh2;
+  await Promise.resolve();
+
+  assert.deepEqual(dispatchOrder, [
+    'blocker.bin',
+    'high-1.rpf',
+    'normal-old.rpf',
+    'high-2.rpf',
+    'prefetch-old.rpf',
+  ]);
+  assert.equal(scheduler.getStats().promotedByAgingCount, 2);
+  assert.equal(scheduler.getStats().byPriority.PREFETCH.promotedByAgingCount, 1);
+
+  // Finish PREFETCH -> high-3 drains last.
+  mockNow = 1050;
+  gPrefetch.resolve(makeBytes(5, 16));
+  await Promise.all([pPrefetch, pHigh3]);
+
+  assert.deepEqual(dispatchOrder, [
+    'blocker.bin',
+    'high-1.rpf',
+    'normal-old.rpf',
+    'high-2.rpf',
+    'prefetch-old.rpf',
+    'high-3.rpf',
+  ]);
+
+  const stats = scheduler.getStats();
+  assert.equal(stats.promotedByAgingCount, 2);
+  assert.equal(stats.agedPromotions, 2);
+  assert.equal(stats.promotions, 2);
+  assert.equal(stats.maxQueueWaitMs, 1000);
+  assert.equal(stats.byPriority.NORMAL.maxQueueWaitMs, 500);
+  assert.equal(stats.byPriority.PREFETCH.maxQueueWaitMs, 1000);
+});
+
+test('W288 CRITICAL stays strictly highest regardless of aging wait time while aged tasks still beat fresh HIGH bursts', async () => {
+  let mockNow = 0;
+  const dispatchOrder = [];
+  const gates = new Map();
+
+  const rangeCache = {
+    read(filePath, offset, length) {
+      dispatchOrder.push(filePath);
+      const gate = gates.get(filePath);
+      if (gate) return gate.promise;
+      return Promise.resolve(makeBytes(filePath.charCodeAt(0), length));
+    },
+  };
+
+  const gBlocker = deferred();
+  const gCrit1 = deferred();
+  const gCrit2 = deferred();
+  gates.set('blocker.bin', gBlocker);
+  gates.set('shaders/crit-1.wgsl.pack', gCrit1);
+  gates.set('shaders/crit-2.wgsl.pack', gCrit2);
+
+  // Uses default agingWindowMs (2000ms) with injectable `now` clock.
+  const scheduler = new IoPriorityScheduler({
+    rangeCache,
+    maxConcurrency: 1,
+    now: () => mockNow,
+    sleep: async () => {},
+  });
+  assert.equal(scheduler.agingWindowMs, DEFAULT_AGING_WINDOW_MS);
+
+  // t = 0: blocker runs; PREFETCH and NORMAL queue up.
+  const pBlocker = scheduler.scheduleRead('blocker.bin', 0, 16, { priority: IO_PRIORITY.HIGH });
+  const pPrefetch = scheduler.scheduleRead('prefetch/world_lod.rpf', 0, 16);
+  const pNormal = scheduler.scheduleRead('x64/levels/world.rpf', 0, 16);
+
+  // t = 20000 (10x agingWindowMs): both PREFETCH and NORMAL are capped at HIGH (below CRITICAL).
+  // Fresh CRITICAL and HIGH arrive.
+  mockNow = 20000;
+  const pHighFresh = scheduler.scheduleRead('/game/core_bvh4.rpf', 0, 16);
+  const pCrit1 = scheduler.scheduleRead('shaders/crit-1.wgsl.pack', 0, 16);
+
+  gBlocker.resolve(makeBytes(1, 16));
+  await pBlocker;
+  await Promise.resolve();
+
+  // CRITICAL MUST run first even though PREFETCH/NORMAL waited 20,000ms!
+  assert.deepEqual(dispatchOrder, ['blocker.bin', 'shaders/crit-1.wgsl.pack']);
+  assert.equal(scheduler.getStats().promotedByAgingCount, 0);
+
+  // Another CRITICAL arrives before crit-1 completes -> still runs ahead of aged tasks!
+  mockNow = 20500;
+  const pCrit2 = scheduler.scheduleRead('shaders/crit-2.wgsl.pack', 0, 16);
+  gCrit1.resolve(makeBytes(2, 16));
+  await pCrit1;
+  await Promise.resolve();
+
+  assert.deepEqual(dispatchOrder, [
+    'blocker.bin',
+    'shaders/crit-1.wgsl.pack',
+    'shaders/crit-2.wgsl.pack',
+  ]);
+  assert.equal(scheduler.getStats().promotedByAgingCount, 0);
+
+  // Once CRITICAL queue is empty, aged NORMAL and PREFETCH (capped at HIGH, enq 0) beat fresh HIGH (enq 20000)!
+  mockNow = 21000;
+  gCrit2.resolve(makeBytes(3, 16));
+  await Promise.all([pCrit2, pNormal, pPrefetch, pHighFresh]);
+
+  assert.deepEqual(dispatchOrder, [
+    'blocker.bin',
+    'shaders/crit-1.wgsl.pack',
+    'shaders/crit-2.wgsl.pack',
+    'x64/levels/world.rpf',
+    'prefetch/world_lod.rpf',
+    '/game/core_bvh4.rpf',
+  ]);
+
+  const stats = scheduler.getStats();
+  assert.equal(stats.promotedByAgingCount, 2);
+  assert.equal(stats.maxQueueWaitMs, 21000);
+});
+
+test('W288 agingWindowMs: 0 and agingWindowMs: false cleanly opt out of priority aging', async () => {
+  for (const disabledOpt of [0, false]) {
+    let mockNow = 0;
+    const dispatchOrder = [];
+    const gBlocker = deferred();
+
+    const rangeCache = {
+      read(filePath, offset, length) {
+        dispatchOrder.push(filePath);
+        if (filePath === 'blocker.bin') return gBlocker.promise;
+        return Promise.resolve(makeBytes(9, length));
+      },
+    };
+
+    const scheduler = new IoPriorityScheduler({
+      rangeCache,
+      maxConcurrency: 1,
+      agingWindowMs: disabledOpt,
+      now: () => mockNow,
+      sleep: async () => {},
+    });
+    assert.equal(scheduler.agingWindowMs, 0);
+
+    const pBlocker = scheduler.scheduleRead('blocker.bin', 0, 8, { priority: IO_PRIORITY.NORMAL });
+    const pPrefetch = scheduler.scheduleRead('prefetch-old.rpf', 0, 8, {
+      priority: IO_PRIORITY.PREFETCH,
+    });
+    const pNormal = scheduler.scheduleRead('normal-old.rpf', 0, 8, {
+      priority: IO_PRIORITY.NORMAL,
+    });
+
+    // Advance well past default 2000ms window before fresh HIGH & CRITICAL arrive.
+    mockNow = 60000;
+    const pHigh = scheduler.scheduleRead('high-fresh.rpf', 0, 8, { priority: IO_PRIORITY.HIGH });
+    const pCritical = scheduler.scheduleRead('critical-fresh.rpf', 0, 8, {
+      priority: IO_PRIORITY.CRITICAL,
+    });
+
+    gBlocker.resolve(makeBytes(1, 8));
+    await Promise.all([pBlocker, pPrefetch, pNormal, pHigh, pCritical]);
+
+    assert.deepEqual(dispatchOrder, [
+      'blocker.bin',
+      'critical-fresh.rpf',
+      'high-fresh.rpf',
+      'normal-old.rpf',
+      'prefetch-old.rpf',
+    ]);
+
+    const stats = scheduler.getStats();
+    assert.equal(stats.promotedByAgingCount, 0);
+    assert.equal(stats.maxQueueWaitMs, 60000);
+  }
+});
+
+test('W288 tracks activeByPriority, promotedByAgingCount, and maxQueueWaitMs across concurrent reads with clean resetStats()', async () => {
+  let mockNow = 0;
+  const gates = new Map();
+
+  const rangeCache = {
+    read(filePath, offset, length) {
+      const gate = gates.get(filePath);
+      if (gate) return gate.promise;
+      return Promise.resolve(makeBytes(4, length));
+    },
+  };
+
+  const gCrit = deferred();
+  const gHigh = deferred();
+  const gNormal = deferred();
+  const gPrefetch = deferred();
+  gates.set('crit.bin', gCrit);
+  gates.set('high.bin', gHigh);
+  gates.set('normal.bin', gNormal);
+  gates.set('prefetch.bin', gPrefetch);
+
+  const scheduler = new IoPriorityScheduler({
+    rangeCache,
+    maxConcurrency: 3,
+    agingWindowMs: 200,
+    now: () => mockNow,
+    sleep: async () => {},
+  });
+
+  // Fill all 3 concurrency slots across CRITICAL, HIGH, and NORMAL; queue PREFETCH at t = 0.
+  const pCrit = scheduler.scheduleRead('crit.bin', 0, 8, { priority: IO_PRIORITY.CRITICAL });
+  const pHigh = scheduler.scheduleRead('high.bin', 0, 8, { priority: IO_PRIORITY.HIGH });
+  const pNormal = scheduler.scheduleRead('normal.bin', 0, 8, { priority: IO_PRIORITY.NORMAL });
+  const pPrefetch = scheduler.scheduleRead('prefetch.bin', 0, 8, {
+    priority: IO_PRIORITY.PREFETCH,
+  });
+
+  const activeSnap = scheduler.getStats();
+  assert.deepEqual(activeSnap.activeByPriority, {
+    CRITICAL: 1,
+    HIGH: 1,
+    NORMAL: 1,
+    PREFETCH: 0,
+  });
+  assert.equal(activeSnap.inFlight, 3);
+  assert.equal(activeSnap.queued, 1);
+
+  // Snapshot isolation on activeByPriority & promotedByAgingCount.
+  activeSnap.activeByPriority.CRITICAL = 999;
+  activeSnap.promotedByAgingCount = 999;
+  assert.equal(scheduler.getStats().activeByPriority.CRITICAL, 1);
+  assert.equal(scheduler.getStats().promotedByAgingCount, 0);
+
+  // At t = 450 (2+ aging windows), enqueue a fresh HIGH task and release NORMAL slot ->
+  // aged PREFETCH (eff HIGH, enq 0) promotes ahead of fresh HIGH (enq 450).
+  mockNow = 450;
+  const pHighFresh = scheduler.scheduleRead('high-fresh.bin', 0, 8, {
+    priority: IO_PRIORITY.HIGH,
+  });
+  gNormal.resolve(makeBytes(3, 8));
+  await pNormal;
+  await Promise.resolve();
+
+  const afterPromotion = scheduler.getStats();
+  assert.deepEqual(afterPromotion.activeByPriority, {
+    CRITICAL: 1,
+    HIGH: 1,
+    NORMAL: 0,
+    PREFETCH: 1,
+  });
+  assert.equal(afterPromotion.promotedByAgingCount, 1);
+  assert.equal(afterPromotion.maxQueueWaitMs, 450);
+
+  // Mid-flight resetStats(): resets counters (promotedByAgingCount, maxQueueWaitMs) cleanly
+  // while keeping live activeByPriority accurate so in-flight release never underflows.
+  scheduler.resetStats();
+  const midReset = scheduler.getStats();
+  assert.equal(midReset.promotedByAgingCount, 0);
+  assert.equal(midReset.maxQueueWaitMs, 0);
+  assert.deepEqual(midReset.activeByPriority, {
+    CRITICAL: 1,
+    HIGH: 1,
+    NORMAL: 0,
+    PREFETCH: 1,
+  });
+
+  // Drain all remaining tasks at t = 600 (high-fresh waited 150ms).
+  mockNow = 600;
+  gCrit.resolve(makeBytes(1, 8));
+  gHigh.resolve(makeBytes(2, 8));
+  gPrefetch.resolve(makeBytes(4, 8));
+  await Promise.all([pCrit, pHigh, pPrefetch, pHighFresh]);
+
+  const afterDrain = scheduler.getStats();
+  assert.deepEqual(afterDrain.activeByPriority, {
+    CRITICAL: 0,
+    HIGH: 0,
+    NORMAL: 0,
+    PREFETCH: 0,
+  });
+  assert.equal(afterDrain.inFlight, 0);
+  assert.equal(afterDrain.maxQueueWaitMs, 150);
+
+  // Idle resetStats() zeroes everything cleanly.
+  scheduler.resetStats();
+  const idleReset = scheduler.getStats();
+  assert.equal(idleReset.promotedByAgingCount, 0);
+  assert.equal(idleReset.maxQueueWaitMs, 0);
+  assert.deepEqual(idleReset.activeByPriority, {
+    CRITICAL: 0,
+    HIGH: 0,
+    NORMAL: 0,
+    PREFETCH: 0,
+  });
 });
