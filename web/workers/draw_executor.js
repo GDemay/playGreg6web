@@ -87,6 +87,10 @@
       typeof GPUBufferUsage !== 'undefined' && typeof GPUBufferUsage.UNIFORM === 'number'
         ? GPUBufferUsage.UNIFORM
         : 0x0040,
+    INDIRECT:
+      typeof GPUBufferUsage !== 'undefined' && typeof GPUBufferUsage.INDIRECT === 'number'
+        ? GPUBufferUsage.INDIRECT
+        : 0x0100,
   });
 
   const TEXTURE_USAGE = Object.freeze({
@@ -679,6 +683,26 @@
     return true;
   }
 
+  function isValidIndirectBuffer(indirectBuffer, indirectOffset, indexed) {
+    if (!isValidGpuBuffer(indirectBuffer, BUFFER_USAGE.INDIRECT)) {
+      return false;
+    }
+    if (!Number.isInteger(indirectOffset) || indirectOffset < 0 || indirectOffset % 4 !== 0) {
+      return false;
+    }
+    const minBytes = indexed ? 20 : 16;
+    const bufSize =
+      typeof indirectBuffer.size === 'number' && Number.isFinite(indirectBuffer.size)
+        ? indirectBuffer.size
+        : null;
+    if (bufSize !== null) {
+      if (bufSize < minBytes || indirectOffset + minBytes > bufSize) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   function isValidCbvBinding(entry) {
     if (!entry) {
       return false;
@@ -814,7 +838,11 @@
       normalDraws: 0,
       fallbackDraws: 0,
       indexedDraws: 0,
+      nonIndexedDraws: 0,
+      indirectDraws: 0,
       skippedDraws: 0,
+      zeroCountDrawsSkipped: 0,
+      redundantPipelineSkips: 0,
       fallbackProfileCounts: {
         [FALLBACK_PROFILE.DEFAULT]: 0,
         [FALLBACK_PROFILE.FULLSCREEN_TRIANGLE_CBV]: 0,
@@ -852,6 +880,7 @@
      *   depthStencilFormat?: string | null,
      *   maxFallbackPipelines?: number,
      *   enableShaderFallback?: boolean,
+     *   elideRedundantPipelines?: boolean,
      *   onWarning?: (message: string, meta?: object) => void,
      * }} [options]
      */
@@ -882,6 +911,7 @@
         );
       }
       this._maxFallbackPipelines = maxPipelines;
+      this._elideRedundantPipelines = opts.elideRedundantPipelines !== false;
       this._onWarning = typeof opts.onWarning === 'function' ? opts.onWarning : null;
 
       if (opts.shaderFallbackRouter !== undefined) {
@@ -895,6 +925,8 @@
 
       // Active per-pass draw state.
       this._activePipeline = null;
+      this._boundPass = null;
+      this._boundPipeline = null;
       this._vertexBuffers = new Map();
       this._indexBuffer = null;
       this._bindGroups = new Map();
@@ -931,6 +963,8 @@
         this._destroySyntheticResources();
         this._fallbackPipelineCache.clear();
         this._fallbackShaderModuleCache.clear();
+        this._boundPass = null;
+        this._boundPipeline = null;
       }
       this._device = device !== undefined ? device : null;
     }
@@ -964,16 +998,53 @@
     }
 
     /**
+     * Mark the end of the active render pass so subsequent passes re-bind pipelines cleanly.
+     */
+    endPass() {
+      this._boundPass = null;
+      this._boundPipeline = null;
+    }
+
+    /**
      * Clear all bound pipeline, buffer, texture, sampler, and bind-group state.
      */
     resetState() {
       this._activePipeline = null;
+      this._boundPass = null;
+      this._boundPipeline = null;
       this._vertexBuffers.clear();
       this._indexBuffer = null;
       this._bindGroups.clear();
       this._cbvs.clear();
       this._textures.clear();
       this._samplers.clear();
+    }
+
+    /**
+     * Reset active per-pass state (and optionally telemetry counters when `{ stats: true }`).
+     */
+    reset(options) {
+      this.resetState();
+      if (options && typeof options === 'object' && options.stats === true) {
+        this.resetStats();
+      }
+    }
+
+    _bindPipelineOnPass(pass, gpuPipeline) {
+      if (
+        this._elideRedundantPipelines &&
+        this._boundPass === pass &&
+        this._boundPipeline === gpuPipeline &&
+        gpuPipeline !== null &&
+        gpuPipeline !== undefined
+      ) {
+        this._stats.redundantPipelineSkips += 1;
+        return false;
+      }
+      pass.setPipeline(gpuPipeline);
+      this._boundPass = pass;
+      this._boundPipeline = gpuPipeline;
+      return true;
     }
 
     setPipeline(pipelineOrDesc) {
@@ -2267,6 +2338,28 @@
     }
 
     /**
+     * Execute an indirect non-indexed draw (`drawIndirect`) with redundant-pipeline elision
+     * and indirect buffer validation.
+     *
+     * @param {object} pass GPURenderPassEncoder
+     * @param {object} drawArgs `{ indirectBuffer, indirectOffset?, ...overrides }`
+     */
+    executeDrawIndirect(pass, drawArgs = {}) {
+      return this._executeDrawIndirectInternal(pass, drawArgs, false);
+    }
+
+    /**
+     * Execute an indirect indexed draw (`drawIndexedIndirect`) with redundant-pipeline elision
+     * and index / indirect buffer validation.
+     *
+     * @param {object} pass GPURenderPassEncoder
+     * @param {object} drawArgs `{ indirectBuffer, indirectOffset?, ...overrides }`
+     */
+    executeDrawIndexedIndirect(pass, drawArgs = {}) {
+      return this._executeDrawIndirectInternal(pass, drawArgs, true);
+    }
+
+    /**
      * Positional convenience wrapper for `executeDraw`.
      */
     draw(pass, vertexCount, instanceCount = 1, firstVertex = 0, firstInstance = 0) {
@@ -2291,8 +2384,225 @@
       });
     }
 
+    /**
+     * Positional convenience wrapper for `executeDrawIndirect`.
+     */
+    drawIndirect(pass, indirectBuffer, indirectOffset = 0) {
+      return this.executeDrawIndirect(pass, {
+        indirectBuffer,
+        indirectOffset,
+      });
+    }
+
+    /**
+     * Positional convenience wrapper for `executeDrawIndexedIndirect`.
+     */
+    drawIndexedIndirect(pass, indirectBuffer, indirectOffset = 0) {
+      return this.executeDrawIndexedIndirect(pass, {
+        indirectBuffer,
+        indirectOffset,
+      });
+    }
+
+    _executeDrawIndirectInternal(pass, drawArgs, indexed) {
+      const args = drawArgs && typeof drawArgs === 'object' ? drawArgs : {};
+      const indirectBuffer = args.indirectBuffer !== undefined ? args.indirectBuffer : null;
+      const indirectOffset = args.indirectOffset !== undefined ? args.indirectOffset : 0;
+
+      const baseResult = {
+        executed: false,
+        skipped: false,
+        reason: null,
+        isFallback: false,
+        profile: null,
+        effectiveProfile: null,
+        indexed,
+        indirect: true,
+        indirectOffset:
+          Number.isInteger(indirectOffset) && indirectOffset >= 0 ? indirectOffset : 0,
+        pipelineElided: false,
+        vertexCount: 0,
+        indexCount: 0,
+        instanceCount: 0,
+        substitutedCbv: false,
+        substitutedTexture: false,
+        substitutedSampler: false,
+        substitutedVertexBuffer: false,
+      };
+
+      if (this._destroyed) {
+        this._stats.skippedDraws += 1;
+        return { ...baseResult, skipped: true, reason: 'executor-destroyed' };
+      }
+
+      const drawMethod = indexed ? 'drawIndexedIndirect' : 'drawIndirect';
+      if (
+        !pass ||
+        typeof pass !== 'object' ||
+        typeof pass.setPipeline !== 'function' ||
+        typeof pass[drawMethod] !== 'function'
+      ) {
+        this._stats.skippedDraws += 1;
+        return { ...baseResult, skipped: true, reason: 'invalid-render-pass' };
+      }
+
+      if (!isValidIndirectBuffer(indirectBuffer, indirectOffset, indexed)) {
+        this._stats.skippedDraws += 1;
+        return { ...baseResult, skipped: true, reason: 'invalid-indirect-buffer' };
+      }
+
+      const drawState = this.getDrawState({
+        ...args,
+        indexed,
+        indirect: true,
+        vertexCount: args.vertexCount !== undefined ? args.vertexCount : 0,
+        indexCount: 0,
+        instanceCount: 1,
+      });
+
+      const isFallback = this._needsFallbackRouting(drawState);
+      baseResult.isFallback = isFallback;
+
+      if (!isFallback) {
+        const realPipeline =
+          drawState.pipeline && drawState.pipeline.pipeline
+            ? drawState.pipeline.pipeline
+            : drawState.pipeline;
+
+        try {
+          const bound = this._bindPipelineOnPass(pass, realPipeline);
+          baseResult.pipelineElided = !bound;
+          this._bindNormalResources(pass);
+          if (indexed) {
+            if (!this._validateAndBindIndexBuffer(pass, 1, 0)) {
+              this._stats.skippedDraws += 1;
+              return { ...baseResult, skipped: true, reason: 'invalid-index-buffer' };
+            }
+            pass.drawIndexedIndirect(indirectBuffer, indirectOffset);
+          } else {
+            pass.drawIndirect(indirectBuffer, indirectOffset);
+          }
+          this._stats.totalDraws += 1;
+          this._stats.normalDraws += 1;
+          this._stats.indirectDraws += 1;
+          return { ...baseResult, executed: true };
+        } catch (err) {
+          this._stats.passErrors += 1;
+          this._stats.skippedDraws += 1;
+          this._warn('Normal indirect draw execution failed', {
+            error: String(err && err.message ? err.message : err),
+          });
+          return { ...baseResult, skipped: true, reason: 'pass-error' };
+        }
+      }
+
+      const resolved = this.resolveFallbackShaders(drawState);
+      if (!resolved) {
+        this._stats.skippedDraws += 1;
+        return { ...baseResult, skipped: true, reason: 'shader-resolve-failed' };
+      }
+
+      baseResult.profile = resolved.selectedProfile;
+      baseResult.effectiveProfile = resolved.effectiveProfile;
+
+      const fallbackPipeline = this._getOrCreateFallbackPipeline(resolved, drawState);
+      if (!fallbackPipeline) {
+        this._stats.skippedDraws += 1;
+        return { ...baseResult, skipped: true, reason: 'pipeline-creation-failed' };
+      }
+
+      try {
+        const bound = this._bindPipelineOnPass(pass, fallbackPipeline);
+        baseResult.pipelineElided = !bound;
+      } catch (err) {
+        this._stats.passErrors += 1;
+        this._stats.skippedDraws += 1;
+        this._warn('pass.setPipeline failed on fallback indirect draw', {
+          profile: resolved.effectiveProfile,
+          error: String(err && err.message ? err.message : err),
+        });
+        return { ...baseResult, skipped: true, reason: 'pass-error' };
+      }
+
+      if (resolved.effectiveProfile === FALLBACK_PROFILE.FULLSCREEN_TRIANGLE_CBV) {
+        const bgRes = this._bindFallbackGroupForCbv(pass, fallbackPipeline, drawState);
+        baseResult.substitutedCbv = bgRes.substitutedCbv;
+        if (!bgRes.ok) {
+          this._stats.skippedDraws += 1;
+          return { ...baseResult, skipped: true, reason: 'fallback-cbv-bind-failed' };
+        }
+      } else if (resolved.effectiveProfile === FALLBACK_PROFILE.TEXTURED_QUAD_24B) {
+        const bgRes = this._bindFallbackGroupForTexturedQuad(pass, fallbackPipeline, drawState);
+        baseResult.substitutedTexture = bgRes.substitutedTexture;
+        baseResult.substitutedSampler = bgRes.substitutedSampler;
+        if (!bgRes.ok) {
+          this._stats.skippedDraws += 1;
+          return { ...baseResult, skipped: true, reason: 'fallback-texture-bind-failed' };
+        }
+
+        const vbRes = this._bindFallbackVertexBuffer24B(pass, drawState, 1, 0);
+        baseResult.substitutedVertexBuffer = vbRes.substitutedVertexBuffer;
+        if (!vbRes.ok) {
+          this._stats.skippedDraws += 1;
+          return { ...baseResult, skipped: true, reason: 'fallback-vb-bind-failed' };
+        }
+      } else if (resolved.effectiveProfile === FALLBACK_PROFILE.SPLASH_RECT_24B) {
+        const bgRes = this._bindFallbackGroupForSplashRect(pass, fallbackPipeline, drawState);
+        baseResult.substitutedCbv = bgRes.substitutedCbv;
+        baseResult.substitutedTexture = bgRes.substitutedTexture;
+        baseResult.substitutedSampler = bgRes.substitutedSampler;
+        if (!bgRes.ok) {
+          this._stats.skippedDraws += 1;
+          return { ...baseResult, skipped: true, reason: 'fallback-splash-bind-failed' };
+        }
+
+        const vbRes = this._bindFallbackVertexBufferSplashRect24B(pass, drawState, 1, 0);
+        baseResult.substitutedVertexBuffer = vbRes.substitutedVertexBuffer;
+        if (!vbRes.ok) {
+          this._stats.skippedDraws += 1;
+          return { ...baseResult, skipped: true, reason: 'fallback-vb-bind-failed' };
+        }
+      }
+
+      try {
+        if (indexed) {
+          if (!this._validateAndBindIndexBuffer(pass, 1, 0)) {
+            this._stats.skippedDraws += 1;
+            return { ...baseResult, skipped: true, reason: 'invalid-index-buffer' };
+          }
+          pass.drawIndexedIndirect(indirectBuffer, indirectOffset);
+        } else {
+          pass.drawIndirect(indirectBuffer, indirectOffset);
+        }
+      } catch (err) {
+        this._stats.passErrors += 1;
+        this._stats.skippedDraws += 1;
+        this._warn('Fallback indirect draw submission failed', {
+          profile: resolved.effectiveProfile,
+          error: String(err && err.message ? err.message : err),
+        });
+        return { ...baseResult, skipped: true, reason: 'pass-error' };
+      }
+
+      this._stats.totalDraws += 1;
+      this._stats.fallbackDraws += 1;
+      this._stats.indirectDraws += 1;
+      const countedProfile = Object.prototype.hasOwnProperty.call(
+        this._stats.fallbackProfileCounts,
+        resolved.selectedProfile
+      )
+        ? resolved.selectedProfile
+        : FALLBACK_PROFILE.DEFAULT;
+      this._stats.fallbackProfileCounts[countedProfile] += 1;
+
+      return { ...baseResult, executed: true };
+    }
+
     _executeDrawInternal(pass, drawArgs, indexed) {
       const args = drawArgs && typeof drawArgs === 'object' ? drawArgs : {};
+      if (args.indirect === true) {
+        return this._executeDrawIndirectInternal(pass, args, indexed);
+      }
       const count = indexed
         ? toNonNegativeInt(args.indexCount, 0)
         : toNonNegativeInt(args.vertexCount, 0);
@@ -2313,6 +2623,8 @@
         profile: null,
         effectiveProfile: null,
         indexed,
+        indirect: false,
+        pipelineElided: false,
         vertexCount: indexed ? 0 : count,
         indexCount: indexed ? count : 0,
         instanceCount,
@@ -2339,6 +2651,7 @@
 
       if (count <= 0 || instanceCount <= 0) {
         this._stats.skippedDraws += 1;
+        this._stats.zeroCountDrawsSkipped += 1;
         return { ...baseResult, skipped: true, reason: 'zero-draw-count' };
       }
 
@@ -2364,7 +2677,8 @@
             : drawState.pipeline;
 
         try {
-          pass.setPipeline(realPipeline);
+          const bound = this._bindPipelineOnPass(pass, realPipeline);
+          baseResult.pipelineElided = !bound;
           this._bindNormalResources(pass);
           if (indexed) {
             if (!this._validateAndBindIndexBuffer(pass, count, firstIndex)) {
@@ -2375,6 +2689,7 @@
             this._stats.indexedDraws += 1;
           } else {
             pass.draw(count, instanceCount, firstVertex, firstInstance);
+            this._stats.nonIndexedDraws += 1;
           }
           this._stats.totalDraws += 1;
           this._stats.normalDraws += 1;
@@ -2407,7 +2722,8 @@
       }
 
       try {
-        pass.setPipeline(fallbackPipeline);
+        const bound = this._bindPipelineOnPass(pass, fallbackPipeline);
+        baseResult.pipelineElided = !bound;
       } catch (err) {
         this._stats.passErrors += 1;
         this._stats.skippedDraws += 1;
@@ -2480,6 +2796,7 @@
           this._stats.indexedDraws += 1;
         } else {
           pass.draw(effectiveCount, instanceCount, effectiveFirstVertex, firstInstance);
+          this._stats.nonIndexedDraws += 1;
         }
       } catch (err) {
         this._stats.passErrors += 1;
@@ -2511,7 +2828,7 @@
 
     /**
      * Return a fresh JSON-serializable snapshot of draw executor telemetry,
-     * including `fallbackProfileCounts`.
+     * including `fallbackProfileCounts` and per-kind draw counters.
      */
     getStats() {
       return {
@@ -2519,7 +2836,11 @@
         normalDraws: this._stats.normalDraws,
         fallbackDraws: this._stats.fallbackDraws,
         indexedDraws: this._stats.indexedDraws,
+        nonIndexedDraws: this._stats.nonIndexedDraws,
+        indirectDraws: this._stats.indirectDraws,
         skippedDraws: this._stats.skippedDraws,
+        zeroCountDrawsSkipped: this._stats.zeroCountDrawsSkipped,
+        redundantPipelineSkips: this._stats.redundantPipelineSkips,
         fallbackProfileCounts: {
           [FALLBACK_PROFILE.DEFAULT]: this._stats.fallbackProfileCounts[FALLBACK_PROFILE.DEFAULT],
           [FALLBACK_PROFILE.FULLSCREEN_TRIANGLE_CBV]:
