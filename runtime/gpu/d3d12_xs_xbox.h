@@ -449,6 +449,10 @@ enum class Counter : size_t {
     FrameWaitTimeouts,
     PresentWaitsSatisfied,      // PRESENT waits (WaitFrameEventX type 2) that waited for the present
     PresentWaitsUnpresented,    // ... whose token was not presented within the cap (pacer fallback)
+    FencePublishesByPresent,    // queue-signal values published once the next frame was presented
+    FencePublishLagFrames,      // ... the presents they waited past the first (sum)
+    FencePublishesByCap,        // ... published by the cap (no present in time)
+    FencePublishesByWait,       // ... published early because a blocking wait needed them
     FrameIntervalChanges,
     FrameEventsScheduled,
     PresentsWithPlanes,
