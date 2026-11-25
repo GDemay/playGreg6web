@@ -64,6 +64,12 @@
 // signature flags SAMPLER_HEAP_DIRECTLY_INDEXED / CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED): the index is
 // a root constant (the user SGPR inside a constants parameter); the descriptor is the one at byte
 // offset (index << shift) of the bound heap, chosen at draw time.
+// A root-descriptor source over a descriptor table (G62, #482): the translator reports
+// "root_descriptor" when the stage builds a buffer from the user-data SGPR pair itself, but the
+// root parameter that starts at that SGPR may be a descriptor table (one SGPR, a 32-bit pointer).
+// Such a binding joins as the table's descriptor at "table_byte_offset" when the sidecar gives it
+// next to "root_descriptor": true (version >= 2, kStageReflectionVersionRootTableOffset), else as
+// the table's first descriptor (slot 0). Counted in JoinStats::root_descriptor_tables.
 // Stages without an entry keep the layer's conventions (layout_from_root_signature, input element i
 // -> @location(i)).
 
@@ -158,6 +164,9 @@ struct ReflectedBinding {
     // a CB-indexed index (cbv, user_sgpr, table_byte_offset, cb_*); otherwise it is 0.
     uint32_t lane_max_count = 0;
     bool lane_has_window_base = false;
+    // RootDescriptor: the sidecar gave table_byte_offset with it (version >= 2), used when the root
+    // parameter at user_sgpr is a descriptor table; otherwise such a table joins at slot 0.
+    bool root_table_offset_given = false;
 };
 
 enum class ReflectedStage : uint8_t { Vertex = 1, Fragment = 2, Compute = 3 };
@@ -170,6 +179,12 @@ struct StageReflection {
 
 // Pack key (stage identity) -> reflection.
 using StageReflectionIndex = std::unordered_map<uint64_t, StageReflection>;
+
+// Sidecar versions this parser reads. Version 2 adds the optional "table_byte_offset" of a
+// "root_descriptor" source (ignored in version 1 documents).
+inline constexpr uint32_t kStageReflectionVersion = 1;
+inline constexpr uint32_t kStageReflectionVersionRootTableOffset = 2;
+inline constexpr uint32_t kStageReflectionMaxVersion = 2;
 
 // Parses a sidecar (see above). False + message when malformed; unknown members are ignored.
 bool parse_stage_reflection_json(std::string_view json, StageReflectionIndex* out, std::string* error);
@@ -200,6 +215,9 @@ struct JoinStats {
     uint64_t lane_indexed_bindings = 0;
     // Lane-indexed heap bindings joined as binding arrays (JoinOptions::binding_arrays; on success).
     uint64_t lane_indexed_arrays = 0;
+    // Root-descriptor bindings whose user SGPR starts a descriptor table, joined as a table slot
+    // (the given table_byte_offset, else the first descriptor; on success).
+    uint64_t root_descriptor_tables = 0;
 };
 struct JoinOptions {
     // The consumer binds binding arrays (GpuLayoutFlags::BindingArrays): lane-indexed heap windows

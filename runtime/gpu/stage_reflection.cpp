@@ -294,7 +294,7 @@ bool parse_cb_dword(const Json& body, ReflectedBinding* r) {
     return ok && r->cb_bit_offset < 32 && r->cb_mask != 0 && r->cb_byte_offset % 4 == 0;
 }
 
-bool parse_stage(const Json& s, StageReflection* out, std::string* error) {
+bool parse_stage(const Json& s, uint32_t version, StageReflection* out, std::string* error) {
     const std::string stage = get_string(s, "stage");
     if (stage == "vertex") {
         out->stage = ReflectedStage::Vertex;
@@ -465,6 +465,14 @@ bool parse_stage(const Json& s, StageReflection* out, std::string* error) {
                     r.source = ReflectedSource::RootConstants;
                 } else if (get_bool(*src, "root_descriptor")) {
                     r.source = ReflectedSource::RootDescriptor;
+                    if (version >= kStageReflectionVersionRootTableOffset &&
+                        src->get("table_byte_offset") != nullptr) {
+                        if (!get_u32(*src, "table_byte_offset", &r.table_byte_offset)) {
+                            *error = "bad root_descriptor table_byte_offset";
+                            return false;
+                        }
+                        r.root_table_offset_given = true;
+                    }
                 } else if (!get_u32(*src, "table_byte_offset", &r.table_byte_offset)) {
                     *error = "source needs table_byte_offset, root_constants or root_descriptor";
                     return false;
@@ -664,7 +672,8 @@ bool parse_stage_reflection_json(std::string_view json, StageReflectionIndex* ou
         return false;
     }
     uint32_t version = 0;
-    if (!get_u32(root, "version", &version) || version != 1) {
+    if (!get_u32(root, "version", &version) || version < kStageReflectionVersion ||
+        version > kStageReflectionMaxVersion) {
         *error = "unsupported reflection version";
         return false;
     }
@@ -682,7 +691,7 @@ bool parse_stage_reflection_json(std::string_view json, StageReflectionIndex* ou
         }
         StageReflection r;
         std::string why;
-        if (!parse_stage(s, &r, &why)) {
+        if (!parse_stage(s, version, &r, &why)) {
             *error = "stage " + key + ": " + why;
             return false;
         }
@@ -761,6 +770,7 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
     uint64_t outside_rs = 0;
     uint64_t lane_indexed = 0;
     uint64_t lane_arrays = 0;
+    uint64_t root_tables = 0;
     bool ok = true;
     auto fail = [&](const ReflectedBinding& b, const std::string& why) {
         *report += binding_key(b) + ": " + why + "\n";
@@ -914,21 +924,31 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                 }
                 const d3d::RootParameterDesc& p = rs.parameters[static_cast<size_t>(pi)];
                 const std::string pname = "root parameter " + std::to_string(pi);
-                switch (b.source) {
+                ReflectedSource source = b.source;
+                uint32_t table_byte_offset = b.table_byte_offset;
+                if (source == ReflectedSource::RootDescriptor &&
+                    p.parameter_type == d3d::RootParameterType::DescriptorTable) {
+                    // The stage builds its buffer from the SGPR that holds the table pointer (#482):
+                    // join the table's descriptor the sidecar names, else its first one.
+                    source = ReflectedSource::Table;
+                    table_byte_offset = b.root_table_offset_given ? b.table_byte_offset : 0;
+                    ++root_tables;
+                }
+                switch (source) {
                     case ReflectedSource::Table: {
                         if (p.parameter_type != d3d::RootParameterType::DescriptorTable) {
                             fail(b, pname + " is not a descriptor table");
                             continue;
                         }
-                        if (b.table_byte_offset % kTableSlotBytes != 0) {
-                            fail(b, pname + ": byte offset " + std::to_string(b.table_byte_offset) +
+                        if (table_byte_offset % kTableSlotBytes != 0) {
+                            fail(b, pname + ": byte offset " + std::to_string(table_byte_offset) +
                                         " is not a descriptor boundary");
                             continue;
                         }
                         const bool read_only_kind = b.kind != ReflectedBindingKind::Storage &&
                                                     b.kind != ReflectedBindingKind::StorageTexture;
                         const bool declared =
-                            table_slot_register(p, b.table_byte_offset / kTableSlotBytes, &cls, &reg, &space);
+                            table_slot_register(p, table_byte_offset / kTableSlotBytes, &cls, &reg, &space);
                         if (!declared || (read_only_kind && !kind_accepts(b.kind, cls)) ||
                             (!read_only_kind && cls != d3d::DescriptorRangeType::Uav)) {
                             // A slot the root signature does not declare, or declares as another class:
@@ -949,7 +969,7 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                             }
                             if (sampler_kind != sampler_table) {
                                 fail(b, pname + " has no descriptor at byte offset " +
-                                            std::to_string(b.table_byte_offset) + " and is a " +
+                                            std::to_string(table_byte_offset) + " and is a " +
                                             (sampler_table ? "sampler" : "resource") + " table");
                                 continue;
                             }
@@ -961,7 +981,7 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                                       : d3d::DescriptorRangeType::Srv;
                             reg = space = 0;
                             lb.join.table_parameter = static_cast<uint32_t>(pi);
-                            lb.join.table_slot = b.table_byte_offset / kTableSlotBytes;
+                            lb.join.table_slot = table_byte_offset / kTableSlotBytes;
                             ++outside_rs;
                         }
                         break;
@@ -1096,6 +1116,7 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
     if (stats != nullptr) {
         stats->table_slots_outside_rs += outside_rs;
         stats->lane_indexed_arrays += lane_arrays;
+        stats->root_descriptor_tables += root_tables;
     }
     return true;
 }

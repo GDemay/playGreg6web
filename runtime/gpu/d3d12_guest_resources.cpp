@@ -3121,6 +3121,7 @@ bool Device::resolve_with_pack(GraphicsPsoSource& src, uint64_t* vs_key, uint64_
             count_work(Work::ReflectionLaneIndexedUnbound, join_stats.lane_indexed_bindings);
             if (ok) {
                 count_work(Work::ReflectionTableSlotsOutsideRs, join_stats.table_slots_outside_rs);
+                count_work(Work::ReflectionRootDescriptorTables, join_stats.root_descriptor_tables);
             }
         }
         if (!ok) {
@@ -3357,6 +3358,7 @@ HResult Device::create_compute_pso(const GuestComputePipelineStateDesc& g, const
                 if (ok) {
                     reflected = true;
                     count_work(Work::ReflectionTableSlotsOutsideRs, join_stats.table_slots_outside_rs);
+                    count_work(Work::ReflectionRootDescriptorTables, join_stats.root_descriptor_tables);
                 } else {
                     const uint64_t rs_hash = rs ? rs->signature().hash() : 0;
                     std::lock_guard<std::mutex> lock(pack_mutex_);

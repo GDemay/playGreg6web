@@ -53,6 +53,7 @@ const char* work_name(Work w) {
     case Work::BindGroupCacheMisses: return "bind_group_cache_misses";
     case Work::BindGroupsCreated: return "bind_groups_created";
     case Work::PipelinesCreated: return "pipelines_created";
+    case Work::ReflectionRootDescriptorTables: return "reflection_root_descriptor_tables";
     case Work::Count: break;
     }
     return "?";
