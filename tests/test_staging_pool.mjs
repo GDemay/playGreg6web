@@ -1189,3 +1189,340 @@ test('G46: classic-worker importScripts IIFE isolation attaches PlayGta6StagingP
   assert.equal(ctx.WEBGPU_BUFFER_COPY_ALIGNMENT, undefined);
 });
 
+// ---------------------------------------------------------------------------
+// W126: Idle chunk reclamation (`reclaimIdleChunks`, `minWarmChunks`,
+// `idleEvictFrames`) and peak VRAM / oversize telemetry.
+// ---------------------------------------------------------------------------
+
+test('W126: burst allocation updates peakBytesAllocated and oversizeAllocations without inflating on failure', () => {
+  const { device, createdBuffers } = createMockGpuDevice();
+  const pool = new GpuStagingPool({
+    device,
+    chunkSize: 512,
+    maxPoolBytes: 2560,
+    framesInFlight: 2,
+  });
+
+  // Initial stats before any allocation.
+  const initStats = pool.getStats();
+  assert.equal(initStats.peakBytesAllocated, 0);
+  assert.equal(initStats.peakAllocatedBytes, 0);
+  assert.equal(initStats.reclaimedChunks, 0);
+  assert.equal(initStats.reclaimedBytes, 0);
+  assert.equal(initStats.oversizeAllocations, 0);
+  assert.equal(pool.minWarmChunks, 1);
+  assert.equal(pool.idleEvictFrames, 0);
+
+  pool.beginFrame(0);
+  pool.allocate(400, 4); // chunk 1 (512B)
+  pool.allocate(400, 4); // rollover -> chunk 2 (512B)
+  pool.allocate(1024, 4); // oversized -> chunk 3 (1024B)
+
+  let stats = pool.getStats();
+  assert.equal(createdBuffers.length, 3);
+  assert.equal(stats.allocatedBytes, 2048);
+  assert.equal(stats.peakBytesAllocated, 2048);
+  assert.equal(stats.peakAllocatedBytes, 2048);
+  assert.equal(stats.oversizeAllocations, 1);
+
+  // Over-budget oversized allocation must throw and NOT increment oversizeAllocations or peakBytesAllocated.
+  assert.throws(() => pool.allocate(1024, 4), RangeError);
+  stats = pool.getStats();
+  assert.equal(stats.oversizeAllocations, 1);
+  assert.equal(stats.peakBytesAllocated, 2048);
+  pool.endFrame();
+
+  // Recycle all 3 chunks at frame 2 and reuse the oversized chunk -> increments oversizeAllocations again.
+  pool.beginFrame(2);
+  const reusedBig = pool.allocate(1024, 4);
+  assert.equal(reusedBig.buffer, createdBuffers[2]);
+  stats = pool.getStats();
+  assert.equal(stats.oversizeAllocations, 2);
+  assert.equal(stats.allocatedBytes, 2048);
+  assert.equal(stats.peakBytesAllocated, 2048);
+  pool.endFrame();
+
+  // destroy() clears live bytes while keeping peakBytesAllocated intact.
+  pool.destroy();
+  const destroyedStats = pool.getStats();
+  assert.equal(destroyedStats.allocatedBytes, 0);
+  assert.equal(destroyedStats.peakBytesAllocated, 2048);
+  assert.equal(destroyedStats.oversizeAllocations, 2);
+});
+
+test('W126: reclaimIdleChunks destroys idle chunks after N frames, prefers oversized first, and preserves minWarmChunks', () => {
+  const { device, createdBuffers } = createMockGpuDevice();
+  const pool = new GpuStagingPool({
+    device,
+    chunkSize: 512,
+    maxPoolBytes: 4096,
+    framesInFlight: 2,
+    minWarmChunks: 1,
+  });
+
+  // Frame 0 burst: 2 standard (512B each) + 1 oversized (1024B) = 2048B.
+  pool.beginFrame(0);
+  pool.allocate(400, 4); // chunk 0 (512B, lastUsedFrame = 0)
+  pool.allocate(400, 4); // chunk 1 (512B, lastUsedFrame = 0)
+  pool.allocate(1024, 4); // chunk 2 (1024B oversized, lastUsedFrame = 0)
+  pool.endFrame();
+
+  // Frame 2 recycles all 3 chunks; idle age is 2 frames (< 5).
+  pool.beginFrame(2);
+  assert.equal(pool.getStats().recycledChunks, 3);
+  assert.deepEqual(pool.reclaimIdleChunks(5), { reclaimedChunks: 0, reclaimedBytes: 0 });
+  // No-arg reclaimIdleChunks is a safe no-op when idleEvictFrames === 0.
+  assert.deepEqual(pool.reclaimIdleChunks(), { reclaimedChunks: 0, reclaimedBytes: 0 });
+  pool.endFrame();
+
+  // Frame 5: all 3 recycled chunks now have currentFrame - lastUsedFrame = 5 >= 5.
+  pool.beginFrame(5);
+  const reclaimed = pool.reclaimIdleChunks(5);
+  assert.deepEqual(reclaimed, { reclaimedChunks: 2, reclaimedBytes: 1536 });
+
+  // Oversized chunk (createdBuffers[2]) and oldest standard chunk (createdBuffers[0]) destroyed;
+  // 1 warm standard chunk (createdBuffers[1]) preserved to satisfy minWarmChunks = 1.
+  assert.equal(createdBuffers[2].destroyCount, 1, 'oversized idle chunk must be reclaimed first');
+  assert.equal(createdBuffers[0].destroyCount, 1, 'older idle standard chunk reclaimed second');
+  assert.equal(createdBuffers[1].destroyCount, 0, 'minWarmChunks warm standard chunk must stay alive');
+
+  const stats = pool.getStats();
+  assert.equal(stats.recycledChunks, 1);
+  assert.equal(stats.allocatedBytes, 512);
+  assert.equal(stats.peakBytesAllocated, 2048);
+  assert.equal(stats.reclaimedChunks, 2);
+  assert.equal(stats.reclaimedBytes, 1536);
+
+  // Calling reclaimIdleChunks again stays at minWarmChunks = 1.
+  assert.deepEqual(pool.reclaimIdleChunks(0), { reclaimedChunks: 0, reclaimedBytes: 0 });
+  assert.equal(pool.getStats().recycledChunks, 1);
+
+  // destroy() cleanly destroys the remaining warm chunk without double-destroying reclaimed chunks.
+  pool.destroy();
+  assert.equal(createdBuffers[0].destroyCount, 1);
+  assert.equal(createdBuffers[1].destroyCount, 1);
+  assert.equal(createdBuffers[2].destroyCount, 1);
+  assert.equal(pool.getStats().allocatedBytes, 0);
+  assert.equal(pool.getStats().reclaimedChunks, 2);
+  assert.equal(pool.getStats().reclaimedBytes, 1536);
+  assert.throws(() => pool.reclaimIdleChunks(1), /destroyed/i);
+
+  // minWarmChunks = 0 allows reclaiming all idle chunks down to 0 bytes.
+  const zeroWarmMock = createMockGpuDevice();
+  const zeroWarmPool = new GpuStagingPool({
+    device: zeroWarmMock.device,
+    chunkSize: 512,
+    maxPoolBytes: 2048,
+    framesInFlight: 1,
+    minWarmChunks: 0,
+  });
+  zeroWarmPool.beginFrame(0);
+  zeroWarmPool.allocate(400, 4);
+  zeroWarmPool.allocate(400, 4);
+  zeroWarmPool.endFrame();
+
+  zeroWarmPool.beginFrame(3);
+  assert.deepEqual(zeroWarmPool.reclaimIdleChunks(3), { reclaimedChunks: 2, reclaimedBytes: 1024 });
+  assert.equal(zeroWarmPool.getStats().recycledChunks, 0);
+  assert.equal(zeroWarmPool.getStats().allocatedBytes, 0);
+  assert.equal(zeroWarmPool.getStats().peakBytesAllocated, 1024);
+  zeroWarmPool.destroy();
+
+  // Option and argument validation.
+  assert.throws(
+    () => new GpuStagingPool({ device, minWarmChunks: -1 }),
+    RangeError
+  );
+  assert.throws(
+    () => new GpuStagingPool({ device, idleEvictFrames: -2 }),
+    RangeError
+  );
+  const validPool = new GpuStagingPool({ device, chunkSize: 512, maxPoolBytes: 1024 });
+  assert.throws(() => validPool.reclaimIdleChunks(-1), RangeError);
+  assert.throws(() => validPool.reclaimIdleChunks(1.5), RangeError);
+  validPool.destroy();
+});
+
+test('W126: idleEvictFrames automatically reclaims idle chunks on frame advance and recycleCompleted', async () => {
+  const { device, createdBuffers, deferredFences } = createMockGpuDevice({
+    enableWorkDoneFence: true,
+  });
+  const pool = new GpuStagingPool({
+    device,
+    chunkSize: 512,
+    maxPoolBytes: 4096,
+    framesInFlight: 2,
+    minWarmChunks: 1,
+    idleEvictFrames: 4,
+  });
+
+  // Frame 0: allocate 3 chunks (2 standard + 1 oversized).
+  pool.beginFrame(0);
+  pool.allocate(400, 4);
+  pool.allocate(400, 4);
+  pool.allocate(1024, 4);
+  pool.endFrame();
+
+  // Frames 1..3: idle age < 4, nothing auto-reclaimed yet.
+  for (let f = 1; f <= 3; f += 1) {
+    const beginRes = pool.beginFrame(f);
+    assert.equal(beginRes.reclaimedChunks, 0);
+    const endRes = pool.endFrame();
+    assert.equal(endRes.reclaimedChunks, 0);
+  }
+  assert.equal(pool.getStats().recycledChunks, 3);
+  assert.equal(pool.getStats().reclaimedChunks, 0);
+
+  // Frame 4: idle age == 4 >= idleEvictFrames -> auto-reclaims oversized + 1 standard chunk!
+  const begin4 = pool.beginFrame(4);
+  assert.equal(begin4.reclaimedChunks, 2);
+  assert.equal(begin4.reclaimedBytes, 1536);
+  assert.equal(begin4.recycledChunks, 1);
+  assert.equal(pool.getStats().reclaimedChunks, 2);
+  assert.equal(pool.getStats().reclaimedBytes, 1536);
+  assert.equal(pool.getStats().allocatedBytes, 512);
+  assert.equal(pool.getStats().peakBytesAllocated, 2048);
+
+  // Also verify recycleCompleted() triggers auto-reclamation when a fence resolves after idleEvictFrames.
+  // Allocate 2 chunks in frame 4 (reusing warm chunk + 1 fresh chunk), retire them, advance to frame 8
+  // with long framesInFlight pool so only fence resolution recycles them.
+  pool.endFrame();
+  pool.destroy();
+
+  const fenceMock = createMockGpuDevice({ enableWorkDoneFence: true });
+  const fencePool = new GpuStagingPool({
+    device: fenceMock.device,
+    chunkSize: 512,
+    maxPoolBytes: 4096,
+    framesInFlight: 10,
+    minWarmChunks: 1,
+    idleEvictFrames: 3,
+  });
+
+  fencePool.beginFrame(0);
+  fencePool.allocate(400, 4);
+  fencePool.allocate(400, 4);
+  fencePool.endFrame();
+
+  // Frame 4: still in-flight because framesInFlight=10 and fence not yet resolved -> NOT reclaimed!
+  fencePool.beginFrame(4);
+  assert.equal(fencePool.getStats().inFlightChunks, 2);
+  assert.equal(fencePool.getStats().reclaimedChunks, 0);
+
+  // Resolve GPU fence and call recycleCompleted(): both move to recycled, 1 immediately auto-reclaimed!
+  fenceMock.deferredFences[0].resolve();
+  await fenceMock.deferredFences[0].promise;
+  await Promise.resolve();
+
+  const moved = fencePool.recycleCompleted();
+  assert.equal(moved, 2);
+  assert.equal(fencePool.getStats().recycledChunks, 1);
+  assert.equal(fencePool.getStats().reclaimedChunks, 1);
+  assert.equal(fencePool.getStats().reclaimedBytes, 512);
+  fencePool.destroy();
+
+  // Default idleEvictFrames === 0 must never unexpectedly auto-evict warm chunks.
+  const defaultMock = createMockGpuDevice();
+  const defaultPool = new GpuStagingPool({
+    device: defaultMock.device,
+    chunkSize: 512,
+    maxPoolBytes: 2048,
+    framesInFlight: 1,
+  });
+  defaultPool.beginFrame(0);
+  defaultPool.allocate(400, 4);
+  defaultPool.allocate(400, 4);
+  defaultPool.endFrame();
+  defaultPool.beginFrame(100);
+  defaultPool.endFrame();
+  assert.equal(defaultPool.getStats().recycledChunks, 2);
+  assert.equal(defaultPool.getStats().reclaimedChunks, 0);
+  defaultPool.destroy();
+  assert.ok(createdBuffers.length === 3 && deferredFences.length === 1);
+});
+
+test('W126: active and in-flight chunks are never reclaimed prematurely in writeBuffer or mapped mode', async () => {
+  // 1. writeBuffer mode: active + in-flight chunks must never be destroyed by reclaimIdleChunks(0).
+  const { device, createdBuffers } = createMockGpuDevice();
+  const pool = new GpuStagingPool({
+    device,
+    chunkSize: 512,
+    maxPoolBytes: 4096,
+    framesInFlight: 4,
+    minWarmChunks: 0,
+    idleEvictFrames: 1,
+  });
+
+  // Frame 0: allocate chunk 0 and retire it (in-flight until frame 4).
+  pool.beginFrame(0);
+  pool.allocate(400, 4);
+  pool.endFrame();
+  assert.equal(pool.getStats().inFlightChunks, 1);
+
+  // Frame 2: chunk 0 is still in-flight (2 - 0 = 2 < framesInFlight=4), chunk 1 is active.
+  pool.beginFrame(2);
+  pool.allocate(400, 4);
+  assert.equal(pool.getStats().inFlightChunks, 1);
+  assert.equal(pool.getStats().activeChunks, 1);
+
+  // Explicit aggressive reclaimIdleChunks(0) must NOT touch active or in-flight chunks!
+  assert.deepEqual(pool.reclaimIdleChunks(0), { reclaimedChunks: 0, reclaimedBytes: 0 });
+  assert.equal(createdBuffers[0].destroyCount, 0);
+  assert.equal(createdBuffers[1].destroyCount, 0);
+  assert.equal(pool.getStats().inFlightChunks, 1);
+  assert.equal(pool.getStats().activeChunks, 1);
+  pool.endFrame();
+
+  // Frame 4: chunk 0 becomes recycled (age 4 >= idleEvictFrames=1) and is reclaimed,
+  // while chunk 1 (retired at frame 2, in-flight until frame 6) stays untouched!
+  const begin4 = pool.beginFrame(4);
+  assert.equal(begin4.reclaimedChunks, 1);
+  assert.equal(begin4.reclaimedBytes, 512);
+  assert.equal(createdBuffers[0].destroyCount, 1);
+  assert.equal(createdBuffers[1].destroyCount, 0);
+  assert.equal(pool.getStats().inFlightChunks, 1);
+  assert.equal(pool.getStats().recycledChunks, 0);
+  pool.destroy();
+  assert.equal(createdBuffers[1].destroyCount, 1);
+
+  // 2. mapped mode: in-flight unmapped/pending-remap chunks are protected; recycled mapped chunks reclaim cleanly.
+  const mappedMock = createMockGpuDevice({ enableWorkDoneFence: true });
+  const mappedPool = new GpuStagingPool({
+    device: mappedMock.device,
+    chunkSize: 512,
+    maxPoolBytes: 2048,
+    framesInFlight: 2,
+    minWarmChunks: 1,
+    mode: STAGING_MODE.MAPPED,
+  });
+
+  mappedPool.beginFrame(0);
+  mappedPool.allocate(400, 4); // chunk 0
+  mappedPool.allocate(400, 4); // chunk 1
+  mappedPool.endFrame();
+
+  // Still in-flight at frame 1 before fence resolves.
+  mappedPool.beginFrame(1);
+  assert.deepEqual(mappedPool.reclaimIdleChunks(0), { reclaimedChunks: 0, reclaimedBytes: 0 });
+  assert.equal(mappedMock.createdBuffers[0].destroyCount, 0);
+  assert.equal(mappedMock.createdBuffers[1].destroyCount, 0);
+
+  // Resolve fence and await mapAsync -> chunks move to recycled.
+  mappedMock.deferredFences[0].resolve();
+  await mappedMock.deferredFences[0].promise;
+  await mappedPool.waitForPendingMaps();
+  mappedPool.endFrame();
+
+  mappedPool.beginFrame(5);
+  const mappedReclaim = mappedPool.reclaimIdleChunks(5);
+  assert.deepEqual(mappedReclaim, { reclaimedChunks: 1, reclaimedBytes: 512 });
+  assert.equal(mappedPool.getStats().recycledChunks, 1);
+  assert.equal(mappedPool.getStats().reclaimedChunks, 1);
+  assert.equal(mappedPool.getStats().reclaimedBytes, 512);
+
+  // Remaining mapped chunk is cleanly destroyed on pool.destroy() with zero double-destroy.
+  mappedPool.destroy();
+  assert.equal(mappedMock.createdBuffers[0].destroyCount, 1);
+  assert.equal(mappedMock.createdBuffers[1].destroyCount, 1);
+});
+
