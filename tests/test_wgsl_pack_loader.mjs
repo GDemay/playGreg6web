@@ -26,6 +26,7 @@ import {
   loadFromUrl,
   WgslPack,
   WgslPackCache,
+  WgslPackLoader,
 } from '../web/workers/wgsl_pack_loader.js';
 
 const SAMPLE_VS_WGSL =
@@ -3316,4 +3317,482 @@ test('W202 prefetchHashes handles 200 OK fallback, partial UTF-8 errors, and >2 
   assert.equal(await highPack.getWgslAsync(hHighA), wgslHighA);
   assert.equal(await highPack.getWgslAsync(hHighB), wgslHighB);
   assert.equal(highPack.stats().lruHits, 2);
+});
+
+// ---------------------------------------------------------------------------
+// W239: Bounded LRU cache (maxCacheBytes / maxCacheEntries), hot-hash pinning
+//       (pinHashes / unpinHashes), prefetchHashes({ maxCoalesceGapBytes }),
+//       and sanitized getStats() telemetry for 1+ GiB (16,226-entry) packs
+// ---------------------------------------------------------------------------
+
+test('W239 bounded LRU cache enforces maxCacheEntries and maxCacheBytes with O(1) touch & eviction, keeping unbounded entry default', async () => {
+  assert.equal(WgslPackLoader, WgslPackCache);
+
+  const enc = new TextEncoder();
+  const makeSized = (tag, targetBytes) => {
+    const prefix = `@compute @workgroup_size(1) fn w239_${tag}() { /* `;
+    const suffix = ' */ }';
+    const padLen = targetBytes - enc.encode(prefix).byteLength - enc.encode(suffix).byteLength;
+    assert.ok(padLen >= 0);
+    return `${prefix}${'x'.repeat(padLen)}${suffix}`;
+  };
+
+  const hashes = [];
+  const entries = [];
+  for (let i = 0; i < 6; i += 1) {
+    const h = fnv1a64(`w239-lru-entry-${i}`);
+    hashes.push(h);
+    entries.push({
+      hash: h,
+      stage: (i % 3) + 1,
+      wgsl: makeSized(`e${i}`, 100),
+    });
+  }
+  const packBuf = buildWgslPackBuffer(entries);
+  const tableEnd = WGPK_HEADER_BYTES + entries.length * WGPK_ENTRY_BYTES;
+
+  // 1. Default maxCacheEntries is unbounded (null): all 6 entries fit without entry-count eviction
+  const defaultMock = createRangeMockFetch({ '/packs/w239-default.wgsl.pack': packBuf });
+  const defaultPack = await loadIndexFromUrl('/packs/w239-default.wgsl.pack', {
+    fetch: defaultMock.fetch,
+    initialRangeBytes: tableEnd,
+  });
+  assert.equal(defaultPack.getStats().maxCacheEntries, null);
+  for (let i = 0; i < entries.length; i += 1) {
+    assert.equal(await defaultPack.getWgslAsync(hashes[i]), entries[i].wgsl);
+  }
+  assert.equal(defaultPack.getStats().cacheEntries, 6);
+  assert.equal(defaultPack.getStats().cacheBytes, 600);
+  assert.equal(defaultPack.getStats().cacheEvictions, 0);
+
+  // 2. Bounded maxCacheEntries = 3 (with default 32 MiB byte budget): evicts LRU entry on 4th fetch
+  const entryCapMock = createRangeMockFetch({ '/packs/w239-entries.wgsl.pack': packBuf });
+  const entryCapPack = await loadIndexFromUrl('/packs/w239-entries.wgsl.pack', {
+    fetch: entryCapMock.fetch,
+    initialRangeBytes: tableEnd,
+    maxCacheEntries: 3,
+  });
+  assert.equal(entryCapPack.getStats().maxCacheEntries, 3);
+
+  assert.equal(await entryCapPack.getWgslAsync(hashes[0]), entries[0].wgsl);
+  assert.equal(await entryCapPack.getWgslAsync(hashes[1]), entries[1].wgsl);
+  assert.equal(await entryCapPack.getWgslAsync(hashes[2]), entries[2].wgsl);
+  assert.equal(entryCapPack.getStats().cacheEntries, 3);
+  assert.equal(entryCapPack.getStats().cacheEvictions, 0);
+  assert.equal(entryCapMock.requests.length, 4); // 1 index + 3 shaders
+
+  // Touch hashes[0] -> LRU order becomes [1, 2, 0]
+  assert.equal(await entryCapPack.getWgslAsync(hashes[0]), entries[0].wgsl);
+  assert.equal(entryCapPack.getStats().cacheHits, 1);
+  assert.equal(entryCapMock.requests.length, 4);
+
+  // Fetch hashes[3] -> exceeds maxCacheEntries=3 -> evicts hashes[1] -> resident: [2, 0, 3]
+  assert.equal(await entryCapPack.getWgslAsync(hashes[3]), entries[3].wgsl);
+  assert.equal(entryCapPack.getStats().cacheEntries, 3);
+  assert.equal(entryCapPack.getStats().cacheBytes, 300);
+  assert.equal(entryCapPack.getStats().cacheEvictions, 1);
+  assert.equal(entryCapMock.requests.length, 5);
+
+  // hashes[0] and hashes[2] are still cached (0 extra fetches)
+  assert.equal(await entryCapPack.getWgslAsync(hashes[0]), entries[0].wgsl);
+  assert.equal(await entryCapPack.getWgslAsync(hashes[2]), entries[2].wgsl);
+  assert.equal(entryCapMock.requests.length, 5);
+  assert.equal(entryCapPack.getStats().cacheHits, 3);
+
+  // hashes[1] was evicted -> re-fetches and evicts hashes[3] (oldest remaining)
+  assert.equal(await entryCapPack.getWgslAsync(hashes[1]), entries[1].wgsl);
+  assert.equal(entryCapMock.requests.length, 6);
+  assert.equal(entryCapPack.getStats().cacheEvictions, 2);
+
+  // 3. Combined maxCacheBytes = 250 + maxCacheEntries = 5 (byte limit binds first at 2 entries)
+  const byteCapMock = createRangeMockFetch({ '/packs/w239-bytes.wgsl.pack': packBuf });
+  const byteCapPack = await loadIndexFromUrl('/packs/w239-bytes.wgsl.pack', {
+    fetch: byteCapMock.fetch,
+    initialRangeBytes: tableEnd,
+    maxCacheBytes: 250,
+    maxCacheEntries: 5,
+  });
+  assert.equal(byteCapPack.getStats().maxCacheBytes, 250);
+  assert.equal(byteCapPack.getStats().maxCacheEntries, 5);
+  assert.equal(await byteCapPack.getWgslAsync(hashes[0]), entries[0].wgsl);
+  assert.equal(await byteCapPack.getWgslAsync(hashes[1]), entries[1].wgsl);
+  assert.equal(await byteCapPack.getWgslAsync(hashes[2]), entries[2].wgsl);
+  assert.equal(byteCapPack.getStats().cacheEntries, 2);
+  assert.equal(byteCapPack.getStats().cacheBytes, 200);
+  assert.equal(byteCapPack.getStats().cacheEvictions, 1);
+
+  // 4. Option validation rejects negative / non-integer limits
+  await assert.rejects(
+    () => loadIndexFromUrl('/packs/w239-bytes.wgsl.pack', { fetch: byteCapMock.fetch, maxCacheBytes: -1 }),
+    RangeError
+  );
+  await assert.rejects(
+    () => loadIndexFromUrl('/packs/w239-bytes.wgsl.pack', { fetch: byteCapMock.fetch, maxCacheEntries: -1 }),
+    RangeError
+  );
+  await assert.rejects(
+    () => loadIndexFromUrl('/packs/w239-bytes.wgsl.pack', { fetch: byteCapMock.fetch, maxCacheEntries: 2.5 }),
+    RangeError
+  );
+  await assert.rejects(
+    () => byteCapPack.prefetchHashes([hashes[0]], { maxCoalesceGapBytes: -4 }),
+    RangeError
+  );
+  assert.throws(() => byteCapPack.pinHashes(123), TypeError);
+  assert.throws(() => byteCapPack.pinHashes('0x1234'), TypeError);
+  assert.throws(() => byteCapPack.unpinHashes(123), TypeError);
+});
+
+test('W239 pinHashes and unpinHashes keep hot Bink2 / UI shaders resident across LRU eviction pressure', async () => {
+  const enc = new TextEncoder();
+  const make100B = (tag) => {
+    const prefix = `@fragment fn pin_${tag}() -> @location(0) vec4<f32> { /* `;
+    const suffix = ' */ return vec4<f32>(1.0); }';
+    const padLen = 100 - enc.encode(prefix).byteLength - enc.encode(suffix).byteLength;
+    assert.ok(padLen >= 0);
+    return `${prefix}${'b'.repeat(padLen)}${suffix}`;
+  };
+
+  const hBink = fnv1a64('w239-hot-bink2');
+  const hUi = fnv1a64('w239-hot-ui');
+  const hCold1 = fnv1a64('w239-cold-1');
+  const hCold2 = fnv1a64('w239-cold-2');
+  const hCold3 = fnv1a64('w239-cold-3');
+  const hOversized = fnv1a64('w239-oversized-pinned');
+
+  const wgslBink = make100B('bink2');
+  const wgslUi = make100B('ui');
+  const wgslCold1 = make100B('c1');
+  const wgslCold2 = make100B('c2');
+  const wgslCold3 = make100B('c3');
+  const wgslOversized = make100B('ov') + '/* ' + 'z'.repeat(300) + ' */';
+
+  const packBuf = buildWgslPackBuffer([
+    { hash: hBink, stage: SHADER_STAGE.FRAGMENT, wgsl: wgslBink },
+    { hash: hUi, stage: SHADER_STAGE.FRAGMENT, wgsl: wgslUi },
+    { hash: hCold1, stage: SHADER_STAGE.COMPUTE, wgsl: wgslCold1 },
+    { hash: hCold2, stage: SHADER_STAGE.COMPUTE, wgsl: wgslCold2 },
+    { hash: hCold3, stage: SHADER_STAGE.COMPUTE, wgsl: wgslCold3 },
+    { hash: hOversized, stage: SHADER_STAGE.VERTEX, wgsl: wgslOversized },
+  ]);
+  const tableEnd = WGPK_HEADER_BYTES + 6 * WGPK_ENTRY_BYTES;
+  const mock = createRangeMockFetch({ '/packs/w239-pin.wgsl.pack': packBuf });
+
+  // Cache budget fits 3 x 100B entries (maxCacheBytes = 320, maxCacheEntries = 3)
+  const pack = await loadIndexFromUrl('/packs/w239-pin.wgsl.pack', {
+    fetch: mock.fetch,
+    initialRangeBytes: tableEnd,
+    maxCacheBytes: 320,
+    maxCacheEntries: 3,
+  });
+
+  // Pin hBink BEFORE fetching (via hex string + duplicate), and pin hUi AFTER fetching (promotes LRU -> pinned)
+  assert.equal(pack.pinHashes([formatHashHex(hBink), hBink]), 1);
+  assert.equal(pack.isPinned(hBink), true);
+  assert.equal(pack.isPinned(hUi), false);
+  assert.equal(pack.getStats().pinnedCount, 1);
+
+  assert.equal(await pack.getWgslAsync(hBink), wgslBink);
+  assert.equal(await pack.getWgslAsync(hUi), wgslUi);
+  assert.equal(pack.pinHashes([hUi]), 1);
+  assert.equal(pack.getStats().pinnedCount, 2);
+  assert.equal(pack.getStats().pinnedBytes, 200);
+  assert.equal(pack.getStats().pinnedCachedEntries, 2);
+  assert.equal(pack.getStats().cacheEntries, 2);
+  assert.equal(pack.getStats().cacheBytes, 200);
+  assert.deepEqual(new Set(pack.getPinnedHashes()), new Set([hBink, hUi]));
+
+  // Sync getWgsl() also works on pinned entries while resident
+  assert.equal(pack.getWgsl(hBink), wgslBink);
+  assert.equal(pack.getWgsl(hUi), wgslUi);
+
+  // Stream cold1, cold2, cold3 through the remaining 1-slot / 120B unpinned headroom
+  const reqsBeforeChurn = mock.requests.length;
+  assert.equal(await pack.getWgslAsync(hCold1), wgslCold1); // fits (3 entries, 300B)
+  assert.equal(pack.getStats().cacheEvictions, 0);
+  assert.equal(await pack.getWgslAsync(hCold2), wgslCold2); // evicts cold1 (never bink/ui!)
+  assert.equal(pack.getStats().cacheEvictions, 1);
+  assert.equal(await pack.getWgslAsync(hCold3), wgslCold3); // evicts cold2 (never bink/ui!)
+  assert.equal(pack.getStats().cacheEvictions, 2);
+  assert.equal(mock.requests.length, reqsBeforeChurn + 3);
+
+  // Hot Bink2 and UI shaders must still be 100% cache hits with ZERO HTTP re-fetches!
+  const reqsAfterChurn = mock.requests.length;
+  assert.equal(await pack.getWgslAsync(hBink), wgslBink);
+  assert.equal(await pack.getWgslAsync(hUi), wgslUi);
+  assert.equal(await pack.getWgslAsync(hCold3), wgslCold3);
+  assert.equal(mock.requests.length, reqsAfterChurn);
+  assert.equal(pack.getStats().cacheHits, 3);
+
+  // clearWgslCache({ keepPinned: true }) drops only unpinned entries (cold3), preserving pinned bink & ui
+  assert.equal(pack.clearWgslCache({ keepPinned: true }), 1);
+  assert.equal(pack.getStats().cacheEntries, 2);
+  assert.equal(pack.getStats().cacheBytes, 200);
+  assert.equal(await pack.getWgslAsync(hBink), wgslBink);
+  assert.equal(await pack.getWgslAsync(hUi), wgslUi);
+  assert.equal(mock.requests.length, reqsAfterChurn);
+
+  // Pinning an oversized shader (> maxCacheBytes) still keeps it resident when fetched,
+  // and subsequent unpinned fetches never evict pinned shaders
+  assert.equal(pack.pinHashes([hOversized]), 1);
+  assert.equal(await pack.getWgslAsync(hOversized), wgslOversized);
+  assert.equal(pack.getStats().pinnedCount, 3);
+  assert.equal(pack.getStats().pinnedCachedEntries, 3);
+
+  const reqsWithOversized = mock.requests.length;
+  // Unpinned cold1 cannot fit alongside pinned entries (> 320B), returns WGSL cleanly without evicting pinned
+  assert.equal(await pack.getWgslAsync(hCold1), wgslCold1);
+  assert.equal(mock.requests.length, reqsWithOversized + 1);
+  assert.equal(await pack.getWgslAsync(hBink), wgslBink);
+  assert.equal(await pack.getWgslAsync(hUi), wgslUi);
+  assert.equal(await pack.getWgslAsync(hOversized), wgslOversized);
+  assert.equal(mock.requests.length, reqsWithOversized + 1);
+
+  // Unpinning the oversized shader immediately drops it (exceeds maxCacheBytes) and increments cacheEvictions
+  const evictionsBeforeUnpinOversized = pack.getStats().cacheEvictions;
+  assert.equal(pack.unpinHashes([hOversized]), 1);
+  assert.equal(pack.isPinned(hOversized), false);
+  assert.equal(pack.getStats().pinnedCount, 2);
+  assert.equal(pack.getStats().cacheEvictions, evictionsBeforeUnpinOversized + 1);
+  assert.equal(pack.getStats().cacheBytes, 200);
+
+  // Unpinning hBink moves it back into the evictable LRU pool so future pressure can evict it
+  assert.equal(pack.unpinHashes([formatHashHex(hBink)]), 1);
+  assert.equal(pack.unpinHashes([hBink]), 0); // already unpinned
+  assert.equal(pack.isPinned(hBink), false);
+  assert.equal(pack.getStats().pinnedCount, 1);
+
+  // Load cold1, cold2, cold3 -> cold1 fits (ui pinned + bink + cold1 = 3), cold2 evicts bink!
+  assert.equal(await pack.getWgslAsync(hCold1), wgslCold1);
+  assert.equal(await pack.getWgslAsync(hCold2), wgslCold2);
+  // hUi (still pinned) stays cached, while hBink was evicted and requires a fresh Range fetch
+  const reqsBeforeReFetchBink = mock.requests.length;
+  assert.equal(await pack.getWgslAsync(hUi), wgslUi);
+  assert.equal(mock.requests.length, reqsBeforeReFetchBink);
+  assert.equal(await pack.getWgslAsync(hBink), wgslBink);
+  assert.equal(mock.requests.length, reqsBeforeReFetchBink + 1);
+
+  // Null/undefined pinHashes and unpinHashes are safe no-ops returning 0
+  assert.equal(pack.pinHashes(null), 0);
+  assert.equal(pack.unpinHashes(undefined), 0);
+});
+
+test('W239 WgslPackLoader handles 1+ GiB (16,226-entry) ranged pack with pinHashes, prefetchHashes({ maxCoalesceGapBytes }), and full sanitized getStats()', async () => {
+  const enc = new TextEncoder();
+  const ENTRY_COUNT = 16226;
+  const TOTAL_BYTES = 0x60000000; // 1.5 GiB (1,610,612,736 bytes)
+  const TABLE_END = WGPK_HEADER_BYTES + ENTRY_COUNT * WGPK_ENTRY_BYTES; // 324,536 bytes
+
+  const makeWgsl = (tag, targetBytes) => {
+    const prefix = `@compute @workgroup_size(8) fn w239_big_${tag}() { /* `;
+    const suffix = ' */ }';
+    const padLen = targetBytes - enc.encode(prefix).byteLength - enc.encode(suffix).byteLength;
+    assert.ok(padLen >= 0);
+    return `${prefix}${'s'.repeat(padLen)}${suffix}`;
+  };
+
+  // Build 16,226-entry TOC with 2 clusters of nearby shaders separated by a large gap
+  // (simulating real 1+ GiB pack ranged streaming under streamShaders=1).
+  const entries = new Array(ENTRY_COUNT);
+  let cursor = TABLE_END;
+  for (let i = 0; i < ENTRY_COUNT - 6; i += 1) {
+    entries[i] = {
+      hash: BigInt(i + 1),
+      stage: (i % 3) + 1,
+      offset: cursor,
+      length: 64,
+    };
+    cursor += 64;
+  }
+
+  // High-offset cluster 1 around ~1.0 GiB: hBink (120B), 80B gap, hUi (120B), contiguous hHud (120B)
+  // High-offset cluster 2 around ~1.4 GiB (far beyond maxCoalesceGapBytes): hWorldA (120B), 200B gap, hWorldB (120B), 5000B gap, hWorldC (120B)
+  const hBink = fnv1a64('w239-16226-bink');
+  const hUi = fnv1a64('w239-16226-ui');
+  const hHud = fnv1a64('w239-16226-hud');
+  const hWorldA = fnv1a64('w239-16226-world-a');
+  const hWorldB = fnv1a64('w239-16226-world-b');
+  const hWorldC = fnv1a64('w239-16226-world-c');
+
+  const wgslBink = makeWgsl('bink', 120);
+  const wgslUi = makeWgsl('ui', 120);
+  const wgslHud = makeWgsl('hud', 120);
+  const wgslWorldA = makeWgsl('wa', 120);
+  const wgslWorldB = makeWgsl('wb', 120);
+  const wgslWorldC = makeWgsl('wc', 120);
+
+  const offBink = 0x40000000; // 1.0 GiB
+  const offUi = offBink + 120 + 80; // 80B gap
+  const offHud = offUi + 120; // contiguous (0B gap)
+
+  const offWorldA = 0x58000000; // ~1.375 GiB
+  const offWorldB = offWorldA + 120 + 200; // 200B gap
+  const offWorldC = offWorldB + 120 + 5000; // 5000B gap
+
+  const specialEntries = [
+    { hash: hBink, stage: SHADER_STAGE.FRAGMENT, offset: offBink, length: 120, wgsl: wgslBink },
+    { hash: hUi, stage: SHADER_STAGE.FRAGMENT, offset: offUi, length: 120, wgsl: wgslUi },
+    { hash: hHud, stage: SHADER_STAGE.VERTEX, offset: offHud, length: 120, wgsl: wgslHud },
+    { hash: hWorldA, stage: SHADER_STAGE.COMPUTE, offset: offWorldA, length: 120, wgsl: wgslWorldA },
+    { hash: hWorldB, stage: SHADER_STAGE.COMPUTE, offset: offWorldB, length: 120, wgsl: wgslWorldB },
+    { hash: hWorldC, stage: SHADER_STAGE.COMPUTE, offset: offWorldC, length: 120, wgsl: wgslWorldC },
+  ];
+  for (let i = 0; i < specialEntries.length; i += 1) {
+    entries[ENTRY_COUNT - 6 + i] = specialEntries[i];
+  }
+
+  const indexBytes = buildSyntheticLargeIndexBuffer(entries);
+  const requests = [];
+  const mockFetch = async (url, init = {}) => {
+    const method = (init.method || 'GET').toUpperCase();
+    const range = init.headers && (init.headers.Range || init.headers.range);
+    if (method === 'HEAD') {
+      requests.push({ method, range: null, status: 200, bytesSent: 0 });
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        headers: new Headers({
+          'Content-Length': String(TOTAL_BYTES),
+          'Accept-Ranges': 'bytes',
+        }),
+        async arrayBuffer() {
+          return new ArrayBuffer(0);
+        },
+      };
+    }
+    const [, sStr, eStr] = /^bytes=(\d+)-(\d+)$/.exec(range);
+    const start = Number(sStr);
+    const end = Math.min(Number(eStr), TOTAL_BYTES - 1);
+    const len = end - start + 1;
+    const out = new Uint8Array(len);
+    if (start < indexBytes.byteLength) {
+      const copyEnd = Math.min(end + 1, indexBytes.byteLength);
+      out.set(indexBytes.subarray(start, copyEnd), 0);
+    }
+    for (const sp of specialEntries) {
+      const spStart = sp.offset;
+      const spEnd = sp.offset + sp.length;
+      if (spStart >= start && spEnd <= end + 1) {
+        out.set(enc.encode(sp.wgsl), spStart - start);
+      }
+    }
+    requests.push({ method, range, status: 206, start, end, bytesSent: len });
+    return {
+      ok: true,
+      status: 206,
+      statusText: 'Partial Content',
+      headers: new Headers({
+        'Content-Range': `bytes ${start}-${end}/${TOTAL_BYTES}`,
+        'Content-Length': String(len),
+        'Accept-Ranges': 'bytes',
+      }),
+      async arrayBuffer() {
+        return out.buffer;
+      },
+    };
+  };
+
+  // Use WgslPackLoader with bounded maxCacheBytes + maxCacheEntries, pin BEFORE pack load
+  const loader = new WgslPackLoader({
+    fetch: mockFetch,
+    streamThresholdBytes: 1024 * 1024,
+    maxCacheBytes: 480,
+    maxCacheEntries: 4,
+  });
+
+  // Pin hot Bink2 + UI shaders before loading the pack; _registerPack propagates them automatically!
+  assert.equal(loader.pinHashes([hBink, formatHashHex(hUi)]), 2);
+  assert.equal(loader.getStats().pinnedCount, 2);
+
+  const pack = await loader.loadFromUrl('/packs/gta6-16226.wgsl.pack');
+  assert.equal(pack.mode, 'ranged');
+  assert.equal(pack.size, ENTRY_COUNT);
+  assert.equal(pack.isPinned(hBink), true);
+  assert.equal(pack.isPinned(hUi), true);
+
+  // Coalesced prefetch with maxCoalesceGapBytes: 256 (deliberately unsorted input):
+  //   Range 1: [hBink..hHud] (80B + 0B gaps <= 256B) -> span 440B
+  //   Range 2: [hWorldA..hWorldB] (200B gap <= 256B) -> span 440B
+  //   Range 3: [hWorldC] (5000B gap > 256B -> split!) -> span 120B
+  const reqsBeforePrefetch = requests.length;
+  const pf = await loader.prefetchHashes(
+    [hWorldC, hHud, hWorldB, hBink, hWorldA, hUi],
+    { maxCoalesceGapBytes: 256 }
+  );
+  assert.equal(pf.requested, 6);
+  assert.equal(pf.prefetched, 6);
+  assert.equal(pf.batches, 3);
+  assert.equal(pf.bytesFetched, 440 + 440 + 120);
+  assert.equal(requests.length, reqsBeforePrefetch + 3, '6 unsorted shaders must coalesce into 3 HTTP 206 requests');
+
+  // Verify sorted coalesced byte ranges
+  const pfRanges = requests.slice(reqsBeforePrefetch).map((r) => r.range).sort();
+  assert.deepEqual(
+    pfRanges,
+    [
+      `bytes=${offBink}-${offHud + 119}`,
+      `bytes=${offWorldA}-${offWorldB + 119}`,
+      `bytes=${offWorldC}-${offWorldC + 119}`,
+    ].sort()
+  );
+
+  // Even though 6 x 120B = 720B > maxCacheBytes=480 and 6 > maxCacheEntries=4,
+  // pinned hBink and hUi MUST remain resident with 0 extra HTTP fetches!
+  const reqsAfterPrefetch = requests.length;
+  assert.equal(await loader.getWgslAsync(hBink), wgslBink);
+  assert.equal(await loader.getWgslAsync(hUi), wgslUi);
+  assert.equal(requests.length, reqsAfterPrefetch);
+
+  // Verify every W239 sanitized telemetry field on both pack.getStats() and loader.getStats()
+  const packStats = pack.getStats();
+  const loaderStats = loader.getStats();
+  const expectedRangeBytes = TABLE_END + 440 + 440 + 120;
+
+  for (const s of [packStats, loaderStats]) {
+    assert.equal(s.cacheHits, 2);
+    assert.equal(s.cacheMisses, 0);
+    assert.equal(s.cacheEvictions, 2); // 6 prefetched into 4-entry/480B cap with 2 pinned => 2 unpinned evicted
+    assert.equal(s.pinnedCount, 2);
+    assert.equal(s.cacheEntries, 4); // 2 pinned + 2 newest unpinned
+    assert.equal(s.cacheBytes, 480);
+    assert.equal(s.prefetchCoalescedRanges, 3);
+    assert.equal(s.rangeBytesFetched, expectedRangeBytes);
+
+    for (const key of [
+      'cacheHits',
+      'cacheMisses',
+      'cacheEvictions',
+      'pinnedCount',
+      'cacheEntries',
+      'cacheBytes',
+      'prefetchCoalescedRanges',
+      'rangeBytesFetched',
+    ]) {
+      assert.equal(typeof s[key], 'number', `${key} must be a number`);
+      assert.ok(Number.isSafeInteger(s[key]) && s[key] >= 0, `${key} must be a sanitized non-negative integer`);
+    }
+  }
+
+  // inspect() remains JSON-serializable with all W239 telemetry fields
+  const snapshot = loader.inspect();
+  assert.doesNotThrow(() => JSON.stringify(snapshot));
+  assert.equal(snapshot.stats.pinnedCount, 2);
+  assert.equal(snapshot.stats.cacheEntries, 4);
+  assert.equal(snapshot.stats.cacheBytes, 480);
+  assert.equal(snapshot.stats.cacheEvictions, 2);
+  assert.equal(snapshot.stats.prefetchCoalescedRanges, 3);
+  assert.equal(snapshot.stats.rangeBytesFetched, expectedRangeBytes);
+
+  // Unpin on loader propagates to underlying pack and updates pinnedCount
+  assert.equal(loader.unpinHashes([hBink, hUi]), 2);
+  assert.equal(loader.getStats().pinnedCount, 0);
+  assert.equal(pack.getStats().pinnedCount, 0);
+  assert.equal(loader.isPinned(hBink), false);
+
+  // clear() resets pinned set on loader as well
+  loader.pinHashes([hBink]);
+  assert.equal(loader.getStats().pinnedCount, 1);
+  loader.clear({ resetStats: true });
+  assert.equal(loader.getStats().pinnedCount, 0);
 });
