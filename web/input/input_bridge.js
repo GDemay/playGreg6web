@@ -2,6 +2,14 @@
 // into a SharedArrayBuffer using atomic writes + even/odd seqlock framing compatible with
 // both SeqlockMode::MonotonicSeq and SeqlockMode::EvenOddSeqlock in runtime/os/game_input.cpp.
 
+import {
+  INPUT_BUTTONS,
+  DEFAULT_KEY_BINDINGS,
+  applyRadialDeadzone,
+} from './input_profiles.js';
+
+export { INPUT_BUTTONS, DEFAULT_KEY_BINDINGS, applyRadialDeadzone };
+
 export const INPUT_ABI_VERSION = 1;
 export const INPUT_STATE_BYTES = 40;
 export const INPUT_STATE_WORDS = 10;
@@ -48,63 +56,6 @@ export const INPUT_ABI_LAYOUT = Object.freeze({
     Object.freeze({ name: 'left_trigger', key: 'LEFT_TRIGGER', type: 'float32', offset: 32, wordIndex: 8, size: 4 }),
     Object.freeze({ name: 'right_trigger', key: 'RIGHT_TRIGGER', type: 'float32', offset: 36, wordIndex: 9, size: 4 }),
   ]),
-});
-
-// Button bitmasks matching runtime/os/game_input.h (bits 0..5 & 8..15) plus
-// non-overlapping Xbox GameInput extensions (bits 16..22).
-export const INPUT_BUTTONS = Object.freeze({
-  // Movement & legacy keyboard bits 0..5 (runtime/os/game_input.h)
-  MOVE_FORWARD: 1 << 0,   // kMoveForward  (KeyW)
-  MOVE_BACKWARD: 1 << 1,  // kMoveBackward (KeyS)
-  MOVE_LEFT: 1 << 2,      // kMoveLeft     (KeyA)
-  MOVE_RIGHT: 1 << 3,     // kMoveRight    (KeyD)
-  JUMP: 1 << 4,           // kJump         (Space)
-  SPRINT: 1 << 5,         // kSprint       (ShiftLeft)
-
-  // Xbox GameInput buttons bits 8..15 (runtime/os/game_input.h)
-  A: 1 << 8,              // kGamepadA
-  B: 1 << 9,              // kGamepadB
-  X: 1 << 10,             // kGamepadX
-  Y: 1 << 11,             // kGamepadY
-  LB: 1 << 12,            // kLeftBumper
-  RB: 1 << 13,            // kRightBumper
-  MENU: 1 << 14,          // kMenu (Start)
-  VIEW: 1 << 15,          // kView (Back / Select)
-
-  // Extended Xbox GameInput buttons bits 16..22
-  LS: 1 << 16,            // Left Stick press (L3)
-  RS: 1 << 17,            // Right Stick press (R3)
-  DPAD_UP: 1 << 18,       // D-Pad Up
-  DPAD_DOWN: 1 << 19,     // D-Pad Down
-  DPAD_LEFT: 1 << 20,     // D-Pad Left
-  DPAD_RIGHT: 1 << 21,    // D-Pad Right
-  GUIDE: 1 << 22,         // Xbox Guide / Home button
-});
-
-export const DEFAULT_KEY_BINDINGS = Object.freeze({
-  KeyW: INPUT_BUTTONS.MOVE_FORWARD,
-  KeyS: INPUT_BUTTONS.MOVE_BACKWARD,
-  KeyA: INPUT_BUTTONS.MOVE_LEFT,
-  KeyD: INPUT_BUTTONS.MOVE_RIGHT,
-  Space: INPUT_BUTTONS.JUMP | INPUT_BUTTONS.A,
-  Enter: INPUT_BUTTONS.A,
-  NumpadEnter: INPUT_BUTTONS.A,
-  ShiftLeft: INPUT_BUTTONS.SPRINT | INPUT_BUTTONS.LS,
-  ShiftRight: INPUT_BUTTONS.SPRINT | INPUT_BUTTONS.LS,
-  ControlLeft: INPUT_BUTTONS.B,
-  ControlRight: INPUT_BUTTONS.B,
-  Backspace: INPUT_BUTTONS.B,
-  KeyC: INPUT_BUTTONS.RS,
-  KeyR: INPUT_BUTTONS.X,
-  KeyF: INPUT_BUTTONS.Y,
-  KeyQ: INPUT_BUTTONS.LB,
-  KeyE: INPUT_BUTTONS.RB,
-  Tab: INPUT_BUTTONS.VIEW,
-  Escape: INPUT_BUTTONS.B | INPUT_BUTTONS.MENU,
-  ArrowUp: INPUT_BUTTONS.DPAD_UP,
-  ArrowDown: INPUT_BUTTONS.DPAD_DOWN,
-  ArrowLeft: INPUT_BUTTONS.DPAD_LEFT,
-  ArrowRight: INPUT_BUTTONS.DPAD_RIGHT,
 });
 
 // W3C Standard Gamepad button index -> INPUT_BUTTONS bitmask (indices 6 & 7 are analog triggers).
@@ -1371,6 +1322,8 @@ export class InputBridge {
       : { ...DEFAULT_KEY_BINDINGS };
 
     this._stickDeadzone = opts.stickDeadzone ?? 0.15;
+    this._leftStickDeadzone = opts.leftStickDeadzone ?? this._stickDeadzone;
+    this._rightStickDeadzone = opts.rightStickDeadzone ?? this._stickDeadzone;
     this._stickOuterDeadzone = opts.stickOuterDeadzone ?? 0.98;
     this._triggerDeadzone = opts.triggerDeadzone ?? 0.05;
     this._triggerOuterDeadzone = opts.triggerOuterDeadzone ?? 0.98;
@@ -1380,6 +1333,12 @@ export class InputBridge {
     this._autoStartOnGamepad = opts.autoStart !== false;
     this._onPointerLockChangeCallback =
       typeof opts.onPointerLockChange === 'function' ? opts.onPointerLockChange : null;
+
+    // Input hardening & hot-plug telemetry
+    this._blurResets = 0;
+    this._gamepadConnects = 0;
+    this._gamepadDisconnects = 0;
+    this._activeGamepadIndex = null;
 
     // Input source state
     this._pressedKeys = new Set();
@@ -1655,19 +1614,52 @@ export class InputBridge {
       }
     });
 
-    this._addListener(this._window, 'gamepadconnected', () => {
+    this._addListener(this._window, 'gamepadconnected', (e) => {
       if (this.disposed) return;
-      this.pollGamepads();
+      this._gamepadConnects += 1;
+      const eventPad = e?.gamepad && e.gamepad.connected !== false ? e.gamepad : null;
+      const eventPadIndex =
+        eventPad && typeof eventPad.index === 'number' ? eventPad.index : null;
+      const eventPadAllowed =
+        eventPad !== null &&
+        (this._gamepadIndex === null ||
+          (eventPadIndex !== null && this._gamepadIndex === eventPadIndex));
+
+      if (eventPadAllowed && eventPadIndex !== null) {
+        this._activeGamepadIndex = eventPadIndex;
+      }
+
+      const selected =
+        this._selectGamepadEntry() ||
+        (eventPadAllowed ? { pad: eventPad, index: eventPadIndex ?? 0 } : null);
+      this._pollSelectedGamepadEntry(selected, false);
       if (this._autoStartOnGamepad && !this.running) {
         this._startLoop(false);
       }
     });
 
-    this._addListener(this._window, 'gamepaddisconnected', () => {
+    this._addListener(this._window, 'gamepaddisconnected', (e) => {
       if (this.disposed) return;
-      this.pollGamepads();
-      if (!this._manualStart && !this._selectGamepad()) {
-        this.stop();
+      this._gamepadDisconnects += 1;
+      const disconnectedIndex =
+        typeof e?.gamepad?.index === 'number' ? e.gamepad.index : null;
+      if (
+        disconnectedIndex === null ||
+        this._activeGamepadIndex === disconnectedIndex
+      ) {
+        this._activeGamepadIndex = null;
+      }
+      this._clearGamepadState();
+
+      const remaining = this._selectGamepadEntry(disconnectedIndex);
+      if (remaining) {
+        this._pollSelectedGamepadEntry(remaining, true);
+      } else {
+        this._activeGamepadIndex = null;
+        this._commitMergedState(true);
+        if (!this._manualStart) {
+          this.stop();
+        }
       }
     });
   }
@@ -1718,19 +1710,28 @@ export class InputBridge {
     this._mouseRt = 0;
   }
 
+  _clearGamepadState() {
+    this._gpButtons = 0;
+    this._gpLx = 0;
+    this._gpLy = 0;
+    this._gpRx = 0;
+    this._gpRy = 0;
+    this._gpLt = 0;
+    this._gpRt = 0;
+  }
+
   _clearTransientInputs() {
     if (this.disposed) return;
-    const hadKeys = this._pressedKeys.size > 0;
-    const hadMouse = this._mouseButtonsMask !== 0;
-    if (!hadKeys && !hadMouse) return;
+    this._blurResets += 1;
 
     this._pressedKeys.clear();
     this._recomputeKeyboardState();
     this._clearMouseButtons();
-    this._commitMergedState(true);
+    this._clearGamepadState();
+    this._commitMergedState(true, true);
   }
 
-  _selectGamepad() {
+  _selectGamepadEntry(excludeIndex = null) {
     if (!this._navigator || typeof this._navigator.getGamepads !== 'function') {
       return null;
     }
@@ -1743,39 +1744,56 @@ export class InputBridge {
     if (!pads) return null;
 
     if (typeof this._gamepadIndex === 'number') {
+      if (excludeIndex !== null && this._gamepadIndex === excludeIndex) {
+        return null;
+      }
       const target = pads[this._gamepadIndex];
-      return target && target.connected !== false ? target : null;
+      if (!target || target.connected === false) return null;
+      const idx = typeof target.index === 'number' ? target.index : this._gamepadIndex;
+      if (excludeIndex !== null && idx === excludeIndex) return null;
+      return { pad: target, index: idx };
     }
 
+    let activeEntry = null;
+    let firstStandard = null;
     let fallback = null;
     for (let i = 0; i < pads.length; i++) {
       const pad = pads[i];
       if (!pad || pad.connected === false) continue;
-      if (pad.mapping === 'standard') return pad;
-      if (!fallback) fallback = pad;
+      const idx = typeof pad.index === 'number' ? pad.index : i;
+      if (excludeIndex !== null && idx === excludeIndex) continue;
+
+      if (this._activeGamepadIndex !== null && idx === this._activeGamepadIndex) {
+        activeEntry = { pad, index: idx };
+      }
+      if (pad.mapping === 'standard' && !firstStandard) {
+        firstStandard = { pad, index: idx };
+      }
+      if (!fallback) {
+        fallback = { pad, index: idx };
+      }
     }
-    return fallback;
+
+    if (activeEntry && (activeEntry.pad.mapping === 'standard' || !firstStandard)) {
+      return activeEntry;
+    }
+    return firstStandard || fallback;
   }
 
-  /**
-   * Polls navigator.getGamepads(), maps buttons/sticks/triggers with deadzones,
-   * merges with keyboard + mouse state, and commits to the SharedArrayBuffer if changed.
-   * Returns true if a new snapshot was committed.
-   */
-  pollGamepads() {
-    if (this.disposed) return false;
+  _selectGamepad(excludeIndex = null) {
+    const entry = this._selectGamepadEntry(excludeIndex);
+    return entry ? entry.pad : null;
+  }
 
-    const pad = this._selectGamepad();
-    if (!pad) {
-      this._gpButtons = 0;
-      this._gpLx = 0;
-      this._gpLy = 0;
-      this._gpRx = 0;
-      this._gpRy = 0;
-      this._gpLt = 0;
-      this._gpRt = 0;
-      return this._commitMergedState(false);
+  _pollSelectedGamepadEntry(entry, forceCommit = false) {
+    if (!entry || !entry.pad) {
+      this._activeGamepadIndex = null;
+      this._clearGamepadState();
+      return this._commitMergedState(forceCommit);
     }
+
+    const { pad, index } = entry;
+    this._activeGamepadIndex = index;
 
     const buttons = pad.buttons || EMPTY_ARRAY;
     let gpMask = 0;
@@ -1800,17 +1818,17 @@ export class InputBridge {
     const rawRx = Number.isFinite(axes[2]) ? axes[2] : 0;
     const rawRy = Number.isFinite(axes[3]) ? axes[3] * ySign : 0;
 
-    const left = applyDeadzone(
+    const left = applyRadialDeadzone(
       rawLx,
       rawLy,
-      this._stickDeadzone,
+      this._leftStickDeadzone,
       this._stickOuterDeadzone,
       this._leftStickScratch
     );
-    const right = applyDeadzone(
+    const right = applyRadialDeadzone(
       rawRx,
       rawRy,
-      this._stickDeadzone,
+      this._rightStickDeadzone,
       this._stickOuterDeadzone,
       this._rightStickScratch
     );
@@ -1820,10 +1838,20 @@ export class InputBridge {
     this._gpRx = right.x;
     this._gpRy = right.y;
 
-    return this._commitMergedState(false);
+    return this._commitMergedState(forceCommit);
   }
 
-  _commitMergedState(force = false) {
+  /**
+   * Polls navigator.getGamepads(), maps buttons/sticks/triggers with deadzones,
+   * merges with keyboard + mouse state, and commits to the SharedArrayBuffer if changed.
+   * Returns true if a new snapshot was committed.
+   */
+  pollGamepads() {
+    if (this.disposed) return false;
+    return this._pollSelectedGamepadEntry(this._selectGamepadEntry(), false);
+  }
+
+  _commitMergedState(force = false, clearMouseDelta = false) {
     const mergedButtons =
       (this._keyButtons | this._mouseButtonBits | this._gpButtons | this._scriptButtons) >>> 0;
 
@@ -1881,10 +1909,15 @@ export class InputBridge {
 
     // Even/odd seqlock update:
     // 1. Bump seq to odd before writing fields.
-    // 2. Write buttons and all 6 float32 channels atomically (preserving mouse_dx / mouse_dy).
+    // 2. Write buttons and all 6 float32 channels atomically (preserving mouse_dx / mouse_dy
+    //    unless explicitly clearing transient state on blur/visibilitychange).
     // 3. Bump seq to even after writing fields.
     this._atomicAddU32(INPUT_WORD_INDICES.SEQ, 1);
     this._atomicStoreU32(INPUT_WORD_INDICES.BUTTONS, mergedButtons);
+    if (clearMouseDelta) {
+      this._atomicStoreI32(INPUT_WORD_INDICES.MOUSE_DX, 0);
+      this._atomicStoreI32(INPUT_WORD_INDICES.MOUSE_DY, 0);
+    }
     this._atomicStoreI32(INPUT_WORD_INDICES.LEFT_STICK_X, lxBits);
     this._atomicStoreI32(INPUT_WORD_INDICES.LEFT_STICK_Y, lyBits);
     this._atomicStoreI32(INPUT_WORD_INDICES.RIGHT_STICK_X, rxBits);
@@ -2032,6 +2065,10 @@ export class InputBridge {
       elapsedScriptMs: script.elapsedScriptMs,
       currentScriptMask: script.currentMask,
       availablePresets: INPUT_SCRIPT_PRESET_NAMES,
+      blurResets: this._blurResets,
+      gamepadConnects: this._gamepadConnects,
+      gamepadDisconnects: this._gamepadDisconnects,
+      activeGamepadIndex: this._activeGamepadIndex,
     };
   }
 
@@ -2063,13 +2100,8 @@ export class InputBridge {
     this._clearMouseButtons();
     this._wheelDelta = 0;
 
-    this._gpButtons = 0;
-    this._gpLx = 0;
-    this._gpLy = 0;
-    this._gpRx = 0;
-    this._gpRy = 0;
-    this._gpLt = 0;
-    this._gpRt = 0;
+    this._clearGamepadState();
+    this._activeGamepadIndex = null;
 
     this.buttons = 0;
     this._lastLx = 0;
