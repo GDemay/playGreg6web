@@ -1035,6 +1035,27 @@ MipPlacement mip_placement(const TextureLayoutDesc& desc, uint32_t mip) noexcept
     return p;
 }
 
+uint64_t surface_element_offset(const TextureLayoutDesc& desc, uint32_t mip, uint32_t x, uint32_t y,
+                                uint32_t z) noexcept {
+    if (is_linear_layout(desc)) {
+        return UINT64_MAX;
+    }
+    const ChainLayout c = build_chain(desc);
+    if (!c.ok || mip >= c.mips) {
+        return UINT64_MAX;
+    }
+    const uint32_t mip_w = std::max(1u, desc.width >> std::min(mip, 31u));
+    const uint32_t mip_h = std::max(1u, desc.height >> std::min(mip, 31u));
+    const uint32_t mip_d = std::max(1u, desc.depth >> std::min(mip, 31u));
+    const uint32_t bx = (mip_w + c.fmt.block_width - 1u) / c.fmt.block_width;
+    const uint32_t by = (mip_h + c.fmt.block_height - 1u) / c.fmt.block_height;
+    const uint32_t nz = desc.depth > 1u ? mip_d : std::max(desc.array_size, 1u);
+    if (x >= bx || y >= by || z >= nz) {
+        return UINT64_MAX;
+    }
+    return chain_address(c, mip, x, y, z);
+}
+
 size_t surface_bytes(const TextureLayoutDesc& desc) noexcept {
     const MipPlacement p = mip_placement(desc, 0u);
     return p.ok ? static_cast<size_t>(p.surface_bytes) : 0u;

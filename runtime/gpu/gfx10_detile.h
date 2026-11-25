@@ -133,6 +133,14 @@ struct MipPlacement {
 };
 MipPlacement mip_placement(const TextureLayoutDesc& desc, uint32_t mip) noexcept;
 
+// Byte offset from the resource base of element (x, y) of mip `mip` (elements: texels, or 4x4
+// blocks for BC formats) in slice `z` (3D: the depth slice of that mip; arrays: the array slice,
+// which must be < desc.array_size), using exactly the address the surface detiler reads
+// (detile_from_surface / detile_surface_subresource). UINT64_MAX when the layout is not a tiled
+// or console linear (0x100) surface or a coordinate is out of range.
+uint64_t surface_element_offset(const TextureLayoutDesc& desc, uint32_t mip, uint32_t x, uint32_t y,
+                                uint32_t z) noexcept;
+
 // Bytes of the whole surface (desc.mip_levels mips, all slices) from the base address; 0 if unsupported.
 size_t surface_bytes(const TextureLayoutDesc& desc) noexcept;
 

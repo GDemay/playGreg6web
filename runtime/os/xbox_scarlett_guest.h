@@ -128,6 +128,8 @@
 //                                                  bytes, 15 mip entries of 0x70 bytes from plane
 //                                                  +0x38; the title reads mip +0x00 (u64), +0x10
 //                                                  (u64), +0x1C (u32) and copies whole planes    m
+//     s6  GetTexelElementOffsetBytes(plane, mip, x, y, zOrSlice, sample, bitOffset*) -> UINT64, 2 sites
+//         (element coordinates; the title divides BC texel coordinates by 4)                          m
 //     s8  CopyIntoSubresource(dst, plane, subresource, src, rowPitch, slicePitch)  1 site, arity 7 m
 //     s10 GetResourceTiling(numTiles*, packedMipInfo*, tileShape*, numTilings*, firstTiling,
 //         tilings*)                                1 site, arity 7, the D3D12 GetResourceTiling
