@@ -79,6 +79,31 @@
     }
   }
 
+  function sanitizeNonNegativeCounter(value) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+      return 0;
+    }
+    return Math.floor(value);
+  }
+
+  function clampUnitRate(numerator, denominator) {
+    if (
+      typeof numerator !== 'number' ||
+      typeof denominator !== 'number' ||
+      !Number.isFinite(numerator) ||
+      !Number.isFinite(denominator) ||
+      denominator <= 0 ||
+      numerator <= 0
+    ) {
+      return 0;
+    }
+    const rate = numerator / denominator;
+    if (!Number.isFinite(rate) || rate <= 0) {
+      return 0;
+    }
+    return rate >= 1 ? 1 : rate;
+  }
+
   /**
    * Align a non-negative integer up to the nearest multiple of `alignment`.
    * Safe across the full IEEE-754 integer range (no 32-bit bitwise truncation).
@@ -573,6 +598,7 @@
       this._inFlightChunks = [];
       this._currentChunk = null;
       this._pendingMapPromises = new Set();
+      this._lastAcquireFresh = false;
 
       // Pool-wide telemetry.
       this._totalChunksAllocated = 0;
@@ -587,6 +613,7 @@
       this._evictedBytes = 0;
       this._oversizeAllocations = 0;
       this._bytesUploaded = 0;
+      this._totalBytesStaged = 0;
       this._bytesReused = 0;
       this._allocationCount = 0;
       this._bufferReuseHits = 0;
@@ -1168,14 +1195,16 @@
         this._largeSlabHits += 1;
         this._bytesReused += recycled.size;
         this._activeChunks.push(recycled);
-        return { chunk: recycled, fresh: false };
+        this._lastAcquireFresh = false;
+        return recycled;
       }
 
       const created = this._createChunk(bucketSize, oversized, bucketSize);
       this._bufferReuseMisses += 1;
       this._largeSlabMisses += 1;
       this._activeChunks.push(created);
-      return { chunk: created, fresh: true };
+      this._lastAcquireFresh = true;
+      return created;
     }
 
     _takeRecycledChunk(minSize, oversized) {
@@ -1222,7 +1251,11 @@
         return null;
       }
 
-      const [chunk] = this._recycledChunks.splice(bestIndex, 1);
+      const chunk = this._recycledChunks[bestIndex];
+      for (let i = bestIndex + 1; i < this._recycledChunks.length; i += 1) {
+        this._recycledChunks[i - 1] = this._recycledChunks[i];
+      }
+      this._recycledChunks.pop();
       chunk.cursor = 0;
       chunk.lastUsedFrame = this._currentFrame < 0 ? 0 : this._currentFrame;
       chunk.lastUsedSeq = ++this._lruSeq;
@@ -1249,13 +1282,15 @@
         this._bufferReuseHits += 1;
         this._bytesReused += recycled.size;
         this._activeChunks.push(recycled);
-        return { chunk: recycled, fresh: false };
+        this._lastAcquireFresh = false;
+        return recycled;
       }
 
       const created = this._createChunk(targetSize, oversized, 0);
       this._bufferReuseMisses += 1;
       this._activeChunks.push(created);
-      return { chunk: created, fresh: true };
+      this._lastAcquireFresh = true;
+      return created;
     }
 
     _moveInFlightToRecycled(chunk) {
@@ -1615,16 +1650,14 @@
       if (isLargeSlab) {
         // Persistent large-slab bucket (e.g., 2–16 MiB 4K Bink2 YUV planes);
         // preserves _currentChunk for smaller sub-allocations.
-        const acquired = this._acquireLargeSlab(slabBucketSize, isOversized);
-        chunk = acquired.chunk;
-        isFreshBuffer = acquired.fresh;
+        chunk = this._acquireLargeSlab(slabBucketSize, isOversized);
+        isFreshBuffer = this._lastAcquireFresh;
         offset = 0;
         chunk.cursor = alignedSize;
       } else if (isOversized) {
         // Dedicated oversized chunk; preserve _currentChunk for smaller allocations.
-        const acquired = this._acquireChunk(alignedSize, true);
-        chunk = acquired.chunk;
-        isFreshBuffer = acquired.fresh;
+        chunk = this._acquireChunk(alignedSize, true);
+        isFreshBuffer = this._lastAcquireFresh;
         offset = 0;
         chunk.cursor = alignedSize;
       } else {
@@ -1639,9 +1672,8 @@
         }
 
         if (!chunk) {
-          const acquired = this._acquireChunk(alignedSize, false);
-          chunk = acquired.chunk;
-          isFreshBuffer = acquired.fresh;
+          chunk = this._acquireChunk(alignedSize, false);
+          isFreshBuffer = this._lastAcquireFresh;
           offset = 0;
           chunk.cursor = alignedSize;
           this._currentChunk = chunk;
@@ -1670,6 +1702,7 @@
       }
 
       this._allocationCount += 1;
+      this._totalBytesStaged += byteSize;
       this._frameAllocations += 1;
       this._frameBytesAllocated += byteSize;
 
@@ -1951,17 +1984,30 @@
         }
       }
 
-      const poolLookups = this._bufferReuseHits + this._bufferReuseMisses;
-      const largeSlabTotal = this._largeSlabHits + this._largeSlabMisses;
+      const poolHits = sanitizeNonNegativeCounter(this._bufferReuseHits);
+      const poolMisses = sanitizeNonNegativeCounter(this._bufferReuseMisses);
+      const poolLookups = poolHits + poolMisses;
+      const hitRate = clampUnitRate(poolHits, poolLookups);
+      const largeSlabHits = sanitizeNonNegativeCounter(this._largeSlabHits);
+      const largeSlabMisses = sanitizeNonNegativeCounter(this._largeSlabMisses);
+      const largeSlabTotal = largeSlabHits + largeSlabMisses;
+      const peakAllocatedBytes = sanitizeNonNegativeCounter(this._peakAllocatedBytes);
+      const lruEvictions = sanitizeNonNegativeCounter(this._evictedCount);
+      const oversizedAllocations = sanitizeNonNegativeCounter(this._oversizeAllocations);
+      const totalBytesStaged = sanitizeNonNegativeCounter(this._totalBytesStaged);
+      const bytesUploaded = sanitizeNonNegativeCounter(this._bytesUploaded);
+      const allocationCount = sanitizeNonNegativeCounter(this._allocationCount);
+      const reusedAllocations = sanitizeNonNegativeCounter(this._reusedAllocations);
+      const freshAllocations = sanitizeNonNegativeCounter(this._freshAllocations);
       const elapsedMs =
         this._firstActivityTimeMs !== null && this._lastActivityTimeMs !== null
           ? Math.max(0, this._lastActivityTimeMs - this._firstActivityTimeMs)
           : 0;
       const uploadBytesPerSec =
-        elapsedMs > 0 && this._bytesUploaded > 0 ? (this._bytesUploaded * 1000) / elapsedMs : 0;
+        elapsedMs > 0 && bytesUploaded > 0 ? (bytesUploaded * 1000) / elapsedMs : 0;
 
       return {
-        totalChunksAllocated: this._totalChunksAllocated,
+        totalChunksAllocated: sanitizeNonNegativeCounter(this._totalChunksAllocated),
         activeChunks: activeCount,
         recycledChunks: recycledCount,
         inFlightChunks: this._inFlightChunks.length,
@@ -1969,57 +2015,102 @@
         recycledBuffers: recycledCount,
         activeCount,
         idleCount: recycledCount,
-        allocatedBytes: this._allocatedBytes,
-        bytesAllocated: this._totalBytesAllocated,
-        bytesReused: this._bytesReused,
-        peakBytes: this._peakAllocatedBytes,
-        peakAllocatedBytes: this._peakAllocatedBytes,
-        peakBytesAllocated: this._peakAllocatedBytes,
-        peakAllocationBytes: this._peakAllocatedBytes,
-        peakSingleAllocationBytes: this._peakSingleAllocationBytes,
+        allocatedBytes: sanitizeNonNegativeCounter(this._allocatedBytes),
+        bytesAllocated: sanitizeNonNegativeCounter(this._totalBytesAllocated),
+        bytesReused: sanitizeNonNegativeCounter(this._bytesReused),
+        peakBytes: peakAllocatedBytes,
+        peakAllocatedBytes,
+        peakBytesAllocated: peakAllocatedBytes,
+        peakAllocationBytes: peakAllocatedBytes,
+        peakSingleAllocationBytes: sanitizeNonNegativeCounter(this._peakSingleAllocationBytes),
         maxPoolBytes: this.maxPoolBytes,
         maxPooledBytes: this.maxPoolBytes,
-        reclaimedChunks: this._reclaimedChunks,
-        reclaimedBytes: this._reclaimedBytes,
-        evictedCount: this._evictedCount,
-        evictedBytes: this._evictedBytes,
-        oversizeAllocations: this._oversizeAllocations,
-        bytesUploaded: this._bytesUploaded,
-        totalBytesUploaded: this._bytesUploaded,
-        allocationCount: this._allocationCount,
-        poolHits: this._bufferReuseHits,
-        poolMisses: this._bufferReuseMisses,
-        poolHitRate: poolLookups > 0 ? this._bufferReuseHits / poolLookups : 0,
-        bufferReuseHits: this._bufferReuseHits,
-        bufferReuseMisses: this._bufferReuseMisses,
-        reusedAllocations: this._reusedAllocations,
-        freshAllocations: this._freshAllocations,
-        reuseRate: this._allocationCount > 0 ? this._reusedAllocations / this._allocationCount : 0,
-        largeSlabHits: this._largeSlabHits,
-        largeSlabMisses: this._largeSlabMisses,
-        largeSlabEvictions: this._largeSlabEvictions,
-        largeSlabReuseRate: largeSlabTotal > 0 ? this._largeSlabHits / largeSlabTotal : 0,
+        reclaimedChunks: sanitizeNonNegativeCounter(this._reclaimedChunks),
+        reclaimedBytes: sanitizeNonNegativeCounter(this._reclaimedBytes),
+        evictedCount: lruEvictions,
+        evictedBytes: sanitizeNonNegativeCounter(this._evictedBytes),
+        lruEvictions,
+        oversizeAllocations: oversizedAllocations,
+        oversizedAllocations,
+        bytesUploaded,
+        totalBytesUploaded: bytesUploaded,
+        totalBytesStaged,
+        allocationCount,
+        poolHits,
+        poolMisses,
+        poolHitRate: hitRate,
+        hitRate,
+        bufferReuseHits: poolHits,
+        bufferReuseMisses: poolMisses,
+        reusedAllocations,
+        freshAllocations,
+        reuseRate: clampUnitRate(reusedAllocations, allocationCount),
+        largeSlabHits,
+        largeSlabMisses,
+        largeSlabEvictions: sanitizeNonNegativeCounter(this._largeSlabEvictions),
+        largeSlabReuseRate: clampUnitRate(largeSlabHits, largeSlabTotal),
         activeLargeSlabs,
         inFlightLargeSlabs,
-        idleLargeSlabs: this._idleLargeSlabCount,
-        largeSlabBytes: this._largeSlabBytes,
+        idleLargeSlabs: sanitizeNonNegativeCounter(this._idleLargeSlabCount),
+        largeSlabBytes: sanitizeNonNegativeCounter(this._largeSlabBytes),
         maxLargeSlabs: this.maxLargeSlabs,
         maxSlabsPerBucket: this.maxSlabsPerBucket,
         bucketStrategy: this.bucketStrategy,
         maxBucketBytes: this.maxBucketBytes,
         largeSlabBucketCounts,
-        framesCompleted: this._framesCompleted,
-        lastFrameBytesUploaded: this._lastFrameBytesUploaded,
-        peakFrameBytesUploaded: this._peakFrameBytesUploaded,
+        framesCompleted: sanitizeNonNegativeCounter(this._framesCompleted),
+        lastFrameBytesUploaded: sanitizeNonNegativeCounter(this._lastFrameBytesUploaded),
+        peakFrameBytesUploaded: sanitizeNonNegativeCounter(this._peakFrameBytesUploaded),
         avgBytesPerFrame:
-          this._framesCompleted > 0 ? this._bytesUploaded / this._framesCompleted : 0,
+          this._framesCompleted > 0 ? bytesUploaded / this._framesCompleted : 0,
         uploadBytesPerSec,
         uploadMiBPerSec: uploadBytesPerSec / (1024 * 1024),
-        alignPadCount: this._alignPadCount,
-        sabCopyCount: this._sabCopyCount,
-        doubleReleaseIgnored: this._doubleReleaseIgnored,
+        alignPadCount: sanitizeNonNegativeCounter(this._alignPadCount),
+        sabCopyCount: sanitizeNonNegativeCounter(this._sabCopyCount),
+        doubleReleaseIgnored: sanitizeNonNegativeCounter(this._doubleReleaseIgnored),
         destroyed: this._destroyed,
       };
+    }
+
+    /**
+     * Reset cumulative telemetry counters while preserving live pooled GPUBuffers,
+     * active/in-flight/recycled queues, and frame/LRU ordering state.
+     * Re-baselines `peakAllocatedBytes` to the current live `allocatedBytes` so
+     * `peakAllocatedBytes >= allocatedBytes` always holds.
+     */
+    resetStats() {
+      this._totalChunksAllocated = 0;
+      this._totalBytesAllocated = 0;
+      this._peakAllocatedBytes = this._allocatedBytes;
+      this._peakSingleAllocationBytes = 0;
+      this._reclaimedChunks = 0;
+      this._reclaimedBytes = 0;
+      this._evictedCount = 0;
+      this._evictedBytes = 0;
+      this._oversizeAllocations = 0;
+      this._bytesUploaded = 0;
+      this._totalBytesStaged = 0;
+      this._bytesReused = 0;
+      this._allocationCount = 0;
+      this._bufferReuseHits = 0;
+      this._bufferReuseMisses = 0;
+      this._largeSlabHits = 0;
+      this._largeSlabMisses = 0;
+      this._largeSlabEvictions = 0;
+      this._reusedAllocations = 0;
+      this._freshAllocations = 0;
+      this._alignPadCount = 0;
+      this._sabCopyCount = 0;
+      this._doubleReleaseIgnored = 0;
+      this._framesCompleted = 0;
+      this._lastFrameBytesUploaded = 0;
+      this._peakFrameBytesUploaded = 0;
+      this._firstActivityTimeMs = null;
+      this._lastActivityTimeMs = null;
+      this._frameAllocations = 0;
+      this._frameBytesAllocated = 0;
+      this._frameBytesUploaded = 0;
+      return this.getStats();
     }
 
     /**
