@@ -181,6 +181,40 @@ function decodeSabUtf8(payloadView, byteLength) {
   return textDecoder.decode(copy);
 }
 
+function isThenable(value) {
+  return (
+    value !== null &&
+    (typeof value === 'object' || typeof value === 'function') &&
+    typeof value.then === 'function'
+  );
+}
+
+function extractReadBytes(res) {
+  if (res === null || res === undefined) {
+    return undefined;
+  }
+  const raw =
+    typeof res === 'object' &&
+    !ArrayBuffer.isView(res) &&
+    !(res instanceof ArrayBuffer) &&
+    res.bytes !== undefined
+      ? res.bytes
+      : res;
+  if (raw === null || raw === undefined) {
+    return undefined;
+  }
+  if (raw instanceof Uint8Array) {
+    return raw;
+  }
+  if (raw instanceof ArrayBuffer) {
+    return new Uint8Array(raw);
+  }
+  if (ArrayBuffer.isView(raw)) {
+    return new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
+  }
+  return null;
+}
+
 class HttpfsMailboxHost {
   constructor(sab, options = {}) {
     assertValidMailboxBuffer(sab);
@@ -230,6 +264,11 @@ class HttpfsMailboxHost {
     this._loopPromise = null;
     this._pollTimer = null;
     this._pollResolve = null;
+    this._stats = {
+      requests: 0,
+      syncFastPathHits: 0,
+      asyncPathHits: 0,
+    };
   }
 
   get payloadCapacity() {
@@ -238,6 +277,18 @@ class HttpfsMailboxHost {
 
   get isRunning() {
     return this._running;
+  }
+
+  get syncFastPathHits() {
+    return this._stats.syncFastPathHits;
+  }
+
+  getStats() {
+    return {
+      requests: this._stats.requests,
+      syncFastPathHits: this._stats.syncFastPathHits,
+      asyncPathHits: this._stats.asyncPathHits,
+    };
   }
 
   _resolveRangeCache() {
@@ -278,7 +329,42 @@ class HttpfsMailboxHost {
     Atomics.notify(this._statusView, 0, 1);
   }
 
-  async _handleOpen(lengthBig, cap) {
+  _finishOpenResult(handle) {
+    if (typeof handle === 'number' && Number.isInteger(handle) && handle >= 0) {
+      this.completeResponse(BigInt(handle), HttpfsStatus.ResponseReady);
+    } else {
+      const errCode = typeof handle === 'number' && handle < 0 ? Math.trunc(handle) : -2;
+      this.completeResponse(BigInt(errCode), HttpfsStatus.Error);
+    }
+  }
+
+  _finishReadResult(res, reqLen) {
+    const bytes = extractReadBytes(res);
+    if (bytes === undefined) {
+      this.completeResponse(-9n, HttpfsStatus.Error);
+      return;
+    }
+    if (bytes === null) {
+      this.completeResponse(-5n, HttpfsStatus.Error);
+      return;
+    }
+    const toCopy = Math.min(bytes.byteLength, reqLen);
+    if (toCopy > 0) {
+      this._payloadView.set(bytes.subarray(0, toCopy), 0);
+    }
+    this.completeResponse(BigInt(toCopy), HttpfsStatus.ResponseReady);
+  }
+
+  _finishCloseResult(res) {
+    if (res === false || (typeof res === 'number' && res < 0)) {
+      const errCode = typeof res === 'number' && res < 0 ? Math.trunc(res) : -9;
+      this.completeResponse(BigInt(errCode), HttpfsStatus.Error);
+    } else {
+      this.completeResponse(0n, HttpfsStatus.ResponseReady);
+    }
+  }
+
+  _handleOpen(lengthBig, cap) {
     if (lengthBig === 0n || lengthBig > BigInt(cap)) {
       this.completeResponse(-22n, HttpfsStatus.Error);
       return;
@@ -295,13 +381,13 @@ class HttpfsMailboxHost {
     }
 
     if (this._customOpen) {
-      const handle = await this._customOpen(cleanPath);
-      if (typeof handle === 'number' && Number.isInteger(handle) && handle >= 0) {
-        this.completeResponse(BigInt(handle), HttpfsStatus.ResponseReady);
-      } else {
-        const errCode = typeof handle === 'number' && handle < 0 ? Math.trunc(handle) : -2;
-        this.completeResponse(BigInt(errCode), HttpfsStatus.Error);
+      const handle = this._customOpen(cleanPath);
+      if (isThenable(handle)) {
+        return handle.then((resolved) => {
+          this._finishOpenResult(resolved);
+        });
       }
+      this._finishOpenResult(handle);
       return;
     }
 
@@ -318,11 +404,19 @@ class HttpfsMailboxHost {
     }
 
     if (inManifest === null && this._probeOnOpen) {
-      try {
-        await cache.read(cleanPath, 0, 1);
-      } catch {
-        this.completeResponse(-2n, HttpfsStatus.Error);
-        return;
+      const probe = cache.read(cleanPath, 0, 1);
+      if (isThenable(probe)) {
+        return probe.then(
+          () => {
+            const handle = this._nextHandle;
+            this._nextHandle += 1;
+            this._handles.set(handle, { path: cleanPath });
+            this.completeResponse(BigInt(handle), HttpfsStatus.ResponseReady);
+          },
+          () => {
+            this.completeResponse(-2n, HttpfsStatus.Error);
+          },
+        );
       }
     }
 
@@ -332,7 +426,7 @@ class HttpfsMailboxHost {
     this.completeResponse(BigInt(handle), HttpfsStatus.ResponseReady);
   }
 
-  async _handleRead(handle, offsetBig, lengthBig, cap) {
+  _handleRead(handle, offsetBig, lengthBig, cap) {
     if (offsetBig > BigInt(Number.MAX_SAFE_INTEGER)) {
       this.completeResponse(-22n, HttpfsStatus.Error);
       return;
@@ -346,28 +440,13 @@ class HttpfsMailboxHost {
         this.completeResponse(0n, HttpfsStatus.ResponseReady);
         return;
       }
-      const res = await this._customRead(handle, offset, reqLen);
-      if (res === null || res === undefined) {
-        this.completeResponse(-9n, HttpfsStatus.Error);
-        return;
+      const res = this._customRead(handle, offset, reqLen);
+      if (isThenable(res)) {
+        return res.then((resolved) => {
+          this._finishReadResult(resolved, reqLen);
+        });
       }
-      const bytes =
-        res instanceof Uint8Array
-          ? res
-          : res instanceof ArrayBuffer
-            ? new Uint8Array(res)
-            : ArrayBuffer.isView(res)
-              ? new Uint8Array(res.buffer, res.byteOffset, res.byteLength)
-              : null;
-      if (!bytes) {
-        this.completeResponse(-5n, HttpfsStatus.Error);
-        return;
-      }
-      const toCopy = Math.min(bytes.byteLength, reqLen);
-      if (toCopy > 0) {
-        this._payloadView.set(bytes.subarray(0, toCopy), 0);
-      }
-      this.completeResponse(BigInt(toCopy), HttpfsStatus.ResponseReady);
+      this._finishReadResult(res, reqLen);
       return;
     }
 
@@ -388,23 +467,24 @@ class HttpfsMailboxHost {
       return;
     }
 
-    const bytes = await cache.read(entry.path, offset, reqLen);
-    const toCopy = Math.min(bytes.byteLength, reqLen);
-    if (toCopy > 0) {
-      this._payloadView.set(bytes.subarray(0, toCopy), 0);
+    const res = cache.read(entry.path, offset, reqLen);
+    if (isThenable(res)) {
+      return res.then((bytes) => {
+        this._finishReadResult(bytes, reqLen);
+      });
     }
-    this.completeResponse(BigInt(toCopy), HttpfsStatus.ResponseReady);
+    this._finishReadResult(res, reqLen);
   }
 
-  async _handleClose(handle) {
+  _handleClose(handle) {
     if (this._customClose) {
-      const res = await this._customClose(handle);
-      if (res === false || (typeof res === 'number' && res < 0)) {
-        const errCode = typeof res === 'number' && res < 0 ? Math.trunc(res) : -9;
-        this.completeResponse(BigInt(errCode), HttpfsStatus.Error);
-      } else {
-        this.completeResponse(0n, HttpfsStatus.ResponseReady);
+      const res = this._customClose(handle);
+      if (isThenable(res)) {
+        return res.then((resolved) => {
+          this._finishCloseResult(resolved);
+        });
       }
+      this._finishCloseResult(res);
       return;
     }
 
@@ -415,40 +495,61 @@ class HttpfsMailboxHost {
     }
   }
 
-  async processOnce() {
+  _dispatchOnce() {
     const status = Atomics.load(this._statusView, 0);
     if (status !== HttpfsStatus.RequestReady) {
       return false;
     }
 
+    this._stats.requests += 1;
     const op = this._headerView.getUint32(HttpfsOffsets.OP, true);
     const handle = this._headerView.getInt32(HttpfsOffsets.HANDLE, true);
     const offsetBig = this._headerView.getBigUint64(HttpfsOffsets.OFFSET, true);
     const lengthBig = this._headerView.getBigUint64(HttpfsOffsets.LENGTH, true);
     const cap = this.payloadCapacity;
 
+    let pending;
     try {
       if (op === HttpfsOp.Open) {
-        await this._handleOpen(lengthBig, cap);
+        pending = this._handleOpen(lengthBig, cap);
       } else if (op === HttpfsOp.Read) {
-        await this._handleRead(handle, offsetBig, lengthBig, cap);
+        pending = this._handleRead(handle, offsetBig, lengthBig, cap);
       } else if (op === HttpfsOp.Close) {
-        await this._handleClose(handle);
+        pending = this._handleClose(handle);
       } else {
         this.completeResponse(-1n, HttpfsStatus.Error);
       }
     } catch {
       const errCode = op === HttpfsOp.Open ? -2n : -5n;
       this.completeResponse(errCode, HttpfsStatus.Error);
+      this._stats.syncFastPathHits += 1;
+      return true;
     }
 
+    if (isThenable(pending)) {
+      this._stats.asyncPathHits += 1;
+      return pending.then(
+        () => true,
+        () => {
+          const errCode = op === HttpfsOp.Open ? -2n : -5n;
+          this.completeResponse(errCode, HttpfsStatus.Error);
+          return true;
+        },
+      );
+    }
+
+    this._stats.syncFastPathHits += 1;
     return true;
+  }
+
+  processOnce() {
+    const dispatched = this._dispatchOnce();
+    return isThenable(dispatched) ? dispatched : Promise.resolve(dispatched);
   }
 
   _waitForChange(expectedStatus) {
     if (!this._forcePoll && typeof Atomics.waitAsync === 'function') {
-      const res = Atomics.waitAsync(this._statusView, 0, expectedStatus);
-      return res.async ? res.value : Promise.resolve(res.value);
+      return Atomics.waitAsync(this._statusView, 0, expectedStatus).value;
     }
     return new Promise((resolve) => {
       if (typeof setTimeout !== 'function') {
@@ -470,16 +571,37 @@ class HttpfsMailboxHost {
     }
     this._running = true;
     this._loopPromise = (async () => {
+      let syncBurst = 0;
       while (this._running) {
         const status = Atomics.load(this._statusView, 0);
         if (status === HttpfsStatus.Shutdown) {
           break;
         }
         if (status === HttpfsStatus.RequestReady) {
-          await this.processOnce();
+          const dispatched = this._dispatchOnce();
+          if (isThenable(dispatched)) {
+            syncBurst = 0;
+            await dispatched;
+          } else {
+            syncBurst += 1;
+            if (syncBurst >= 128) {
+              syncBurst = 0;
+              await Promise.resolve();
+            }
+          }
           continue;
         }
-        await this._waitForChange(status);
+        const waitResult = this._waitForChange(status);
+        if (isThenable(waitResult)) {
+          syncBurst = 0;
+          await waitResult;
+        } else {
+          syncBurst += 1;
+          if (syncBurst >= 128) {
+            syncBurst = 0;
+            await Promise.resolve();
+          }
+        }
       }
       this._running = false;
     })();
