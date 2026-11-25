@@ -760,6 +760,458 @@ class TestVerifyBrowserBoot(unittest.TestCase):
             httpd.server_close()
             thread.join(timeout=2)
 
+    # ------------------------------------------------------------------
+    # T76: --min-fps & --require-non-black boot-report verification
+    # ------------------------------------------------------------------
+
+    def test_min_fps_direct_present_fps_avg_pass_and_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _create_repo_skeleton(Path(tmp), include_server=False)
+            report_path = repo / "work" / "boot-report.json"
+
+            # Direct present_fps_avg at exact 30.0 threshold passes.
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "playgta6-boot-report",
+                        "schema_version": 2,
+                        "present_fps_avg": 30.0,
+                        "summary": {"nonBlackCanvasFrames": 5},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            gate_pass = vbb.check_boot_report_gate(
+                repo,
+                boot_report=report_path,
+                min_fps=30.0,
+            )
+            self.assertEqual(gate_pass.status, "pass")
+            self.assertTrue(gate_pass.details["min_fps_ok"])
+            self.assertEqual(gate_pass.details["present_fps_avg"], 30.0)
+            self.assertEqual(gate_pass.details["present_fps_source"], "present_fps_avg")
+            self.assertEqual(gate_pass.details["bootReportLabel"], "work/boot-report.json")
+
+            # Slightly below threshold (29.996 would round to 30.00 if compared after rounding).
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "playgta6-boot-report",
+                        "schema_version": 2,
+                        "summary": {"present_fps_avg": 29.996},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            gate_below = vbb.check_boot_report_gate(
+                repo,
+                boot_report=report_path,
+                min_fps=30.0,
+            )
+            self.assertEqual(gate_below.status, "fail")
+            self.assertFalse(gate_below.details["min_fps_ok"])
+            self.assertIn("--min-fps", gate_below.summary)
+
+            # Explicit 0.0 present_fps_avg is treated as 0 fps (not missing) and fails cleanly.
+            report_path.write_text(
+                json.dumps({"present_fps_avg": 0.0}),
+                encoding="utf-8",
+            )
+            gate_zero = vbb.check_boot_report_gate(
+                repo,
+                boot_report=report_path,
+                min_fps=30.0,
+            )
+            self.assertEqual(gate_zero.status, "fail")
+            self.assertFalse(gate_zero.details["min_fps_ok"])
+            self.assertEqual(gate_zero.details["present_fps_avg"], 0.0)
+            self.assertEqual(gate_zero.details["present_fps_source"], "present_fps_avg")
+
+    def test_min_fps_legacy_report_computed_from_present_span(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _create_repo_skeleton(Path(tmp), include_server=False)
+            report_path = repo / "work" / "legacy-report.json"
+
+            # Legacy report without present_fps_avg: 60 presents over 2000ms = 30.0 fps -> pass.
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "playgta6-boot-report",
+                        "schema_version": 1,
+                        "counters": {"presents": 60},
+                        "first_present_ms": 1000.0,
+                        "last_present_ms": 3000.0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            gate_pass = vbb.check_boot_report_gate(
+                repo,
+                boot_report=report_path,
+                min_fps=30.0,
+            )
+            self.assertEqual(gate_pass.status, "pass")
+            self.assertTrue(gate_pass.details["min_fps_ok"])
+            self.assertEqual(gate_pass.details["present_fps_avg"], 30.0)
+            self.assertEqual(gate_pass.details["present_fps_source"], "computed_present_span")
+            self.assertEqual(gate_pass.details["present_span_ms"], 2000.0)
+
+            # Legacy v2 report with presents list wall_ms samples and low FPS: 20 / 2.0s = 10.0 fps -> fail.
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "playgta6-boot-report",
+                        "schema_version": 2,
+                        "counters": {"presents": 20},
+                        "presents": [
+                            {"wall_ms": 500.0},
+                            {"wall_ms": 1500.0},
+                            {"wall_ms": 2500.0},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            gate_fail = vbb.check_boot_report_gate(
+                repo,
+                boot_report=report_path,
+                min_fps=30.0,
+            )
+            self.assertEqual(gate_fail.status, "fail")
+            self.assertFalse(gate_fail.details["min_fps_ok"])
+            self.assertEqual(gate_fail.details["present_fps_avg"], 10.0)
+            self.assertEqual(gate_fail.details["present_fps_source"], "computed_present_span")
+
+            # Legacy report with zero span (last_present_ms == first_present_ms) fails cleanly without ZeroDivisionError.
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "counters": {"presents": 1},
+                        "first_present_ms": 1000.0,
+                        "last_present_ms": 1000.0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            gate_zero_span = vbb.check_boot_report_gate(
+                repo,
+                boot_report=report_path,
+                min_fps=30.0,
+            )
+            self.assertEqual(gate_zero_span.status, "fail")
+            self.assertFalse(gate_zero_span.details["min_fps_ok"])
+            self.assertIsNone(gate_zero_span.details["present_fps_avg"])
+
+            # Legacy report with 0 presents and no timestamps fails cleanly.
+            report_path.write_text(
+                json.dumps({"counters": {"presents": 0}}),
+                encoding="utf-8",
+            )
+            gate_no_presents = vbb.check_boot_report_gate(
+                repo,
+                boot_report=report_path,
+                min_fps=30.0,
+            )
+            self.assertEqual(gate_no_presents.status, "fail")
+            self.assertFalse(gate_no_presents.details["min_fps_ok"])
+            self.assertIn("0 presents", gate_no_presents.summary)
+
+    def test_require_non_black_pass_and_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _create_repo_skeleton(Path(tmp), include_server=False)
+            report_path = repo / "work" / "boot-report.json"
+
+            # Pass via nonBlackCanvasFrames > 0 (even when first_visible_frame_s is null).
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "first_visible_frame_s": None,
+                        "summary": {"capturedFrames": 10, "nonBlackCanvasFrames": 4},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            gate_nb = vbb.check_boot_report_gate(
+                repo,
+                boot_report=report_path,
+                require_non_black=True,
+            )
+            self.assertEqual(gate_nb.status, "pass")
+            self.assertTrue(gate_nb.details["non_black_ok"])
+            self.assertEqual(gate_nb.details["nonBlackCanvasFrames"], 4)
+
+            # Pass via first_visible_frame_s is not None (even without nonBlackCanvasFrames).
+            report_path.write_text(
+                json.dumps({"first_visible_frame_s": 1.425, "summary": {}}),
+                encoding="utf-8",
+            )
+            gate_fvf = vbb.check_boot_report_gate(
+                repo,
+                boot_report=report_path,
+                require_non_black=True,
+            )
+            self.assertEqual(gate_fvf.status, "pass")
+            self.assertTrue(gate_fvf.details["non_black_ok"])
+            self.assertEqual(gate_fvf.details["first_visible_frame_s"], 1.425)
+
+            # Fail when all-black capture (nonBlackCanvasFrames == 0 and first_visible_frame_s is None).
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "first_visible_frame_s": None,
+                        "summary": {"capturedFrames": 12, "nonBlackCanvasFrames": 0},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            gate_black = vbb.check_boot_report_gate(
+                repo,
+                boot_report=report_path,
+                require_non_black=True,
+            )
+            self.assertEqual(gate_black.status, "fail")
+            self.assertFalse(gate_black.details["non_black_ok"])
+            self.assertIn("all-black", gate_black.summary)
+
+            # Fail when both fields are absent.
+            report_path.write_text(json.dumps({"summary": {}}), encoding="utf-8")
+            gate_missing_fields = vbb.check_boot_report_gate(
+                repo,
+                boot_report=report_path,
+                require_non_black=True,
+            )
+            self.assertEqual(gate_missing_fields.status, "fail")
+            self.assertFalse(gate_missing_fields.details["non_black_ok"])
+
+    def test_boot_report_auto_discovery_and_run_dir_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _create_repo_skeleton(Path(tmp), include_server=False)
+            run_a = repo / "work" / "browser-boot" / "runs" / "run_old"
+            run_b = repo / "work" / "browser-boot" / "runs" / "run_new"
+            run_a.mkdir(parents=True)
+            run_b.mkdir(parents=True)
+            old_file = run_a / "boot-report.json"
+            new_file = run_b / "boot-report.json"
+            old_file.write_text(
+                json.dumps({"present_fps_avg": 5.0, "summary": {"nonBlackCanvasFrames": 0}}),
+                encoding="utf-8",
+            )
+            new_file.write_text(
+                json.dumps({"present_fps_avg": 35.0, "summary": {"nonBlackCanvasFrames": 8}}),
+                encoding="utf-8",
+            )
+            os.utime(old_file, (1_700_000_000, 1_700_000_000))
+            os.utime(new_file, (1_700_000_100, 1_700_000_100))
+
+            # Auto-discovery picks newest run under work/browser-boot/runs/.
+            gate_auto = vbb.check_boot_report_gate(
+                repo,
+                min_fps=30.0,
+                require_non_black=True,
+            )
+            self.assertEqual(gate_auto.status, "pass")
+            self.assertEqual(gate_auto.details["sourceMode"], "discovered")
+            self.assertEqual(
+                gate_auto.details["bootReportLabel"],
+                "work/browser-boot/runs/run_new/boot-report.json",
+            )
+
+            # Passing a run directory resolves <dir>/boot-report.json.
+            gate_dir = vbb.check_boot_report_gate(
+                repo,
+                boot_report=run_a,
+                min_fps=30.0,
+                require_non_black=True,
+            )
+            self.assertEqual(gate_dir.status, "fail")
+            self.assertFalse(gate_dir.details["min_fps_ok"])
+            self.assertFalse(gate_dir.details["non_black_ok"])
+
+    def test_cli_min_fps_and_require_non_black_exit_codes_and_json_sanitization(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = _create_repo_skeleton(base)
+            _populate_complete_env(repo, base, wasm_kind="linked_guest_runtime")
+
+            # Store boot report outside repo under a secret-looking host path and embed
+            # host paths + UNC paths inside the report JSON itself to test strict sanitization.
+            secret_dir = base / "Users" / "TopSecretUser" / "PrivateCaptures"
+            secret_dir.mkdir(parents=True)
+            good_report = secret_dir / "boot-report.json"
+            good_report.write_text(
+                json.dumps(
+                    {
+                        "schema": "playgta6-boot-report",
+                        "schema_version": 2,
+                        "present_fps_avg": 32.5,
+                        "first_visible_frame_s": 1.25,
+                        "message": r"captured at C:\Users\TopSecretUser\PrivateCaptures and \\nas\share\TopSecretUser\cap",
+                        "capture_frames_dir": "/home/TopSecretUser/frames",
+                        "summary": {"capturedFrames": 10, "nonBlackCanvasFrames": 7},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            # 1) Passing boot report -> exit code 0, sanitized JSON with zero host paths.
+            stdout_pass = io.StringIO()
+            with redirect_stdout(stdout_pass):
+                code_pass = vbb.main(
+                    [
+                        "--repo-root",
+                        str(repo),
+                        "--skip-server",
+                        "--boot-report",
+                        str(good_report),
+                        "--min-fps",
+                        "30",
+                        "--require-non-black",
+                        "--json",
+                    ]
+                )
+            blob_pass = stdout_pass.getvalue()
+            payload_pass = json.loads(blob_pass)
+            self.assertEqual(code_pass, 0)
+            self.assertTrue(payload_pass["ok"])
+            self.assertTrue(payload_pass["boot_report_ok"])
+            self.assertEqual(payload_pass["gates"]["boot_report"]["status"], "pass")
+            self.assertEqual(
+                payload_pass["gates"]["boot_report"]["details"]["bootReportLabel"],
+                "boot-report.json",
+            )
+            self.assertNotIn("TopSecretUser", blob_pass)
+            self.assertNotIn("PrivateCaptures", blob_pass)
+            self.assertNotIn(str(secret_dir), blob_pass)
+            self.assertNotRegex(blob_pass, r"[A-Za-z]:\\")
+            self.assertNotRegex(blob_pass, r"[A-Za-z]:/")
+            self.assertNotIn("/Users/", blob_pass)
+            self.assertNotIn("/home/", blob_pass)
+            self.assertNotIn("//nas/", blob_pass)
+
+            # 2) Failing all-black / low-FPS report -> exit code 1, sanitized JSON.
+            bad_report = secret_dir / "bad-boot-report.json"
+            bad_report.write_text(
+                json.dumps(
+                    {
+                        "schema": "playgta6-boot-report",
+                        "schema_version": 2,
+                        "counters": {"presents": 15},
+                        "first_present_ms": 1000.0,
+                        "last_present_ms": 2000.0,
+                        "first_visible_frame_s": None,
+                        "summary": {"capturedFrames": 8, "nonBlackCanvasFrames": 0},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stdout_fail = io.StringIO()
+            with redirect_stdout(stdout_fail):
+                code_fail = vbb.main(
+                    [
+                        "--repo-root",
+                        str(repo),
+                        "--skip-server",
+                        "--boot-report",
+                        str(bad_report),
+                        "--min-fps",
+                        "30",
+                        "--require-non-black",
+                        "--json",
+                    ]
+                )
+            blob_fail = stdout_fail.getvalue()
+            payload_fail = json.loads(blob_fail)
+            self.assertEqual(code_fail, 1)
+            self.assertFalse(payload_fail["ok"])
+            self.assertFalse(payload_fail["boot_report_ok"])
+            self.assertEqual(payload_fail["gates"]["boot_report"]["status"], "fail")
+            self.assertFalse(payload_fail["gates"]["boot_report"]["details"]["min_fps_ok"])
+            self.assertFalse(payload_fail["gates"]["boot_report"]["details"]["non_black_ok"])
+            self.assertNotIn("TopSecretUser", blob_fail)
+            self.assertNotIn("PrivateCaptures", blob_fail)
+            self.assertNotRegex(blob_fail, r"[A-Za-z]:\\")
+            self.assertNotRegex(blob_fail, r"[A-Za-z]:/")
+            self.assertNotIn("/Users/", blob_fail)
+            self.assertNotIn("/home/", blob_fail)
+
+            # 3) Missing boot report under secret path -> fails cleanly with zero host paths.
+            missing_report = secret_dir / "missing-report.json"
+            stdout_missing = io.StringIO()
+            with redirect_stdout(stdout_missing):
+                code_missing = vbb.main(
+                    [
+                        "--repo-root",
+                        str(repo),
+                        "--skip-server",
+                        "--boot-report",
+                        str(missing_report),
+                        "--min-fps",
+                        "30",
+                        "--json",
+                    ]
+                )
+            blob_missing = stdout_missing.getvalue()
+            payload_missing = json.loads(blob_missing)
+            self.assertEqual(code_missing, 1)
+            self.assertFalse(payload_missing["boot_report_ok"])
+            self.assertEqual(payload_missing["gates"]["boot_report"]["status"], "fail")
+            self.assertNotIn("TopSecretUser", blob_missing)
+            self.assertNotIn("PrivateCaptures", blob_missing)
+            self.assertNotRegex(blob_missing, r"[A-Za-z]:\\")
+            self.assertNotRegex(blob_missing, r"[A-Za-z]:/")
+
+            # 4) Text output includes boot_report gate & boot_report_ok without host paths.
+            text_out = vbb.format_report_text(payload_pass)
+            self.assertIn("boot_report", text_out)
+            self.assertIn("boot_report_ok", text_out)
+            self.assertNotIn("TopSecretUser", text_out)
+
+    def test_existing_default_report_shape_unchanged_without_boot_report_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = _create_repo_skeleton(base, include_server=False)
+            _populate_complete_env(repo, base, wasm_kind="linked_guest_runtime")
+            report = vbb.run_verification(
+                repo,
+                env={},
+                skip_server=True,
+                import_coverage_fn=_full_import_coverage,
+            )
+            self.assertNotIn("boot_report", report["gates"])
+            self.assertNotIn("boot_report_ok", report)
+            self.assertTrue(report["ok"])
+
+    def test_invalid_min_fps_and_malformed_boot_report_fail_cleanly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _create_repo_skeleton(Path(tmp), include_server=False)
+            bad_json = repo / "work" / "malformed.json"
+            bad_json.write_text("{not valid json", encoding="utf-8")
+
+            gate_bad_json = vbb.check_boot_report_gate(
+                repo,
+                boot_report=bad_json,
+                min_fps=30.0,
+            )
+            self.assertEqual(gate_bad_json.status, "fail")
+            self.assertTrue(gate_bad_json.details["reportPresent"])
+            self.assertFalse(gate_bad_json.details["reportValid"])
+
+            for invalid_fps in (-1.0, float("nan"), float("inf")):
+                gate_bad_fps = vbb.check_boot_report_gate(
+                    repo,
+                    boot_report=bad_json,
+                    min_fps=invalid_fps,
+                )
+                self.assertEqual(gate_bad_fps.status, "fail")
+                self.assertFalse(gate_bad_fps.details["min_fps_ok"])
+
+            # CLI rejects negative --min-fps with usage exit code 2.
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as ctx:
+                    vbb.main(["--min-fps", "-5"])
+            self.assertEqual(ctx.exception.code, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
