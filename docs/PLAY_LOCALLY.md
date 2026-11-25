@@ -10,13 +10,17 @@ Build and watch the game in a headed Chrome on your own machine. Game files stay
 
 ## Quick start
 ```powershell
-.\tools\play_local.ps1 -Exe <path-to-game.exe> -GameDir <package-dir> -Port 8141 -BuildDir work/browser-boot -InputScript calibration-skip
+.\tools\play_local.ps1 -Exe <path-to-game.exe> -GameDir <package-dir> -ShaderPack <path-to-pack> -Port 8141 -BuildDir work/browser-boot -InputScript calibration-skip
 ```
 This calls `tools/run_browser_boot.py --preset long --headed`: it rebuilds stale stages (recomp lift, PIC runtime lib,
 guest Wasm, shader pack, staging), starts the local COOP/COEP server and launches Chrome with its own profile.
 Useful switches: `-NoBuild` (fail on stale), `-TrustBuild` (reuse artifacts), `-DryRun` (print plan),
 `-Chrome <path>`, `-DurationS`. Input presets: start-screen, menu-flow, calibration-skip, intro-watch,
 legal-notices, chrome-menu-flow. Defaults come from `PLAYGTA6_EXE`, `GTA6_GAME_DIR`, `CHROME_PATH`.
+
+`-ShaderPack` is required to see anything: without a pack the panel shows "Shader Packs: 0 packs" and every draw is dropped.
+Build one with `playgta6-shaders pack-rdna2 --max-wgsl-bytes 262144` plus `tools/stage_reflection_sidecar.py` (see the build recipe below); the `.reflect.json` sidecar is staged next to the pack.
+"Manifest/Bootset: Missing" in the readiness panel is fine for local play and can be ignored.
 
 Stop: close the Chrome window or press Ctrl+C in the script's terminal (the server ends with it).
 
