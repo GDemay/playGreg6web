@@ -13,6 +13,8 @@ const {
   EXPORT_SCHEMA_VERSION,
   BOOT_STAGE_ORDER,
   STAGE_NAMES,
+  ALLOWED_SWAPCHAIN_FORMATS,
+  sanitizeSwapchainFormat,
   formatMissingShaderRow,
   buildMissingShaderExport,
   GpuBootPanelController,
@@ -781,6 +783,267 @@ test('integrates directly with live BootTracer and ShaderFallbackRouter snapshot
   const parsed = JSON.parse(json);
   assert.equal(parsed.missingShaderCount, 2);
   assert.equal(parsed.gpu.hitRatePct, 25);
+
+  controller.destroy();
+});
+
+test('W114 default/omitted compat and HTTPFS telemetry preserves exact backwards-compatible defaults', () => {
+  assert.ok(Array.isArray(ALLOWED_SWAPCHAIN_FORMATS) && Object.isFrozen(ALLOWED_SWAPCHAIN_FORMATS));
+  assert.equal(typeof sanitizeSwapchainFormat, 'function');
+
+  const { controller } = createPanel();
+  const state = controller.getState();
+  const root = state.root;
+
+  assert.deepEqual(state.compatStats, {
+    bindGroupKindMismatches: 0,
+    autoLayoutFallbacks: 0,
+    bc3dFallbacks: 0,
+    bc3dFallbackUploadsSkipped: 0,
+    swapchainFormat: null,
+    usesBlitFallback: false,
+    blitCount: 0,
+  });
+  assert.deepEqual(state.ioStats, {
+    pgimFullFetches: 0,
+    slabCacheHits: 0,
+    slabCacheMisses: 0,
+    syncFastPathHits: 0,
+  });
+
+  // Accessible groups & default DOM values
+  const compatSection = root.querySelector('.pg6-gpu-panel__compat');
+  const ioSection = root.querySelector('.pg6-gpu-panel__io');
+  assert.equal(compatSection.getAttribute('role'), 'group');
+  assert.equal(compatSection.getAttribute('aria-label'), 'WebGPU Compatibility & Swapchain');
+  assert.equal(ioSection.getAttribute('role'), 'group');
+  assert.equal(ioSection.getAttribute('aria-label'), 'HTTPFS & Cache Telemetry');
+
+  assert.equal(root.querySelector('.pg6-gpu-panel__bind-mismatches').textContent, '0');
+  assert.equal(root.querySelector('.pg6-gpu-panel__auto-layout-fallbacks').textContent, '0');
+  assert.equal(root.querySelector('.pg6-gpu-panel__bc3d-fallbacks').textContent, '0');
+  assert.equal(root.querySelector('.pg6-gpu-panel__bc3d-uploads-skipped').textContent, '0');
+  assert.equal(root.querySelector('.pg6-gpu-panel__swapchain-format').textContent, '—');
+  assert.equal(root.querySelector('.pg6-gpu-panel__blit-fallback').textContent, 'Direct (0)');
+  assert.equal(root.querySelector('.pg6-gpu-panel__pgim-fetches').textContent, '0');
+  assert.equal(root.querySelector('.pg6-gpu-panel__slab-hits').textContent, '0');
+  assert.equal(root.querySelector('.pg6-gpu-panel__slab-misses').textContent, '0');
+  assert.equal(root.querySelector('.pg6-gpu-panel__sync-fast-hits').textContent, '0');
+
+  // Export preserves format, schemaVersion, existing keys, and safe additive defaults.
+  const exported = JSON.parse(controller.exportMissingShadersJson());
+  assert.equal(exported.format, EXPORT_FORMAT);
+  assert.equal(exported.schemaVersion, EXPORT_SCHEMA_VERSION);
+  assert.equal(exported.gpu.framesPresented, 0);
+  assert.equal(exported.gpu.bindGroupKindMismatches, 0);
+  assert.equal(exported.gpu.autoLayoutFallbacks, 0);
+  assert.equal(exported.gpu.bc3dFallbacks, 0);
+  assert.equal(exported.gpu.bc3dFallbackUploadsSkipped, 0);
+  assert.equal(exported.gpu.swapchainFormat, null);
+  assert.equal(exported.gpu.usesBlitFallback, false);
+  assert.equal(exported.gpu.blitCount, 0);
+  assert.deepEqual(exported.io, {
+    pgimFullFetches: 0,
+    slabCacheHits: 0,
+    slabCacheMisses: 0,
+    syncFastPathHits: 0,
+  });
+
+  controller.destroy();
+});
+
+test('W114 update() ingests bind-group mismatches, 3D BC fallbacks, swapchain/blit, and HTTPFS cache metrics into DOM and JSON export', () => {
+  const { controller, exportCalls } = createPanel();
+
+  // Ingest via top-level fields and nested ioStats.
+  controller.update({
+    bindGroupKindMismatches: 4,
+    autoLayoutFallbacks: 7,
+    bc3dFallbacks: 3,
+    bc3dFallbackUploadsSkipped: 11,
+    swapchainFormat: 'RGB10A2UNORM',
+    usesBlitFallback: true,
+    blitCount: 25,
+    ioStats: {
+      pgimFullFetches: 2,
+      slabCacheHits: 148,
+      slabCacheMisses: 6,
+      syncFastPathHits: 142,
+    },
+  });
+
+  const state = controller.getState();
+  const root = state.root;
+  assert.deepEqual(state.compatStats, {
+    bindGroupKindMismatches: 4,
+    autoLayoutFallbacks: 7,
+    bc3dFallbacks: 3,
+    bc3dFallbackUploadsSkipped: 11,
+    swapchainFormat: 'rgb10a2unorm',
+    usesBlitFallback: true,
+    blitCount: 25,
+  });
+  assert.deepEqual(state.ioStats, {
+    pgimFullFetches: 2,
+    slabCacheHits: 148,
+    slabCacheMisses: 6,
+    syncFastPathHits: 142,
+  });
+
+  assert.equal(root.querySelector('.pg6-gpu-panel__bind-mismatches').textContent, '4');
+  assert.equal(root.querySelector('.pg6-gpu-panel__auto-layout-fallbacks').textContent, '7');
+  assert.equal(root.querySelector('.pg6-gpu-panel__bc3d-fallbacks').textContent, '3');
+  assert.equal(root.querySelector('.pg6-gpu-panel__bc3d-uploads-skipped').textContent, '11');
+  assert.equal(root.querySelector('.pg6-gpu-panel__swapchain-format').textContent, 'rgb10a2unorm');
+  assert.equal(root.querySelector('.pg6-gpu-panel__blit-fallback').textContent, 'Active (25)');
+  assert.equal(
+    root.querySelector('.pg6-gpu-panel__blit-fallback').getAttribute('data-uses-blit'),
+    'true'
+  );
+  assert.equal(root.querySelector('.pg6-gpu-panel__pgim-fetches').textContent, '2');
+  assert.equal(root.querySelector('.pg6-gpu-panel__slab-hits').textContent, '148');
+  assert.equal(root.querySelector('.pg6-gpu-panel__slab-misses').textContent, '6');
+  assert.equal(root.querySelector('.pg6-gpu-panel__sync-fast-hits').textContent, '142');
+
+  // Partial update via worker sub-objects preserves unaffected fields.
+  controller.update({
+    renderStateStats: { bindGroupKindMismatches: 9, autoLayoutFallbacks: 12 },
+    textureStats: { bc3dFallbacks: 5, bc3dFallbackUploadsSkipped: 19 },
+    swapchainStats: { format: 'bgra8unorm', usesBlitFallback: false, blitCount: 25 },
+  });
+
+  const s2 = controller.getState();
+  assert.equal(s2.compatStats.bindGroupKindMismatches, 9);
+  assert.equal(s2.compatStats.autoLayoutFallbacks, 12);
+  assert.equal(s2.compatStats.bc3dFallbacks, 5);
+  assert.equal(s2.compatStats.bc3dFallbackUploadsSkipped, 19);
+  assert.equal(s2.compatStats.swapchainFormat, 'bgra8unorm');
+  assert.equal(s2.compatStats.usesBlitFallback, false);
+  assert.equal(s2.compatStats.blitCount, 25);
+  // HTTPFS counters preserved across partial GPU update.
+  assert.equal(s2.ioStats.pgimFullFetches, 2);
+  assert.equal(s2.ioStats.slabCacheHits, 148);
+  assert.equal(root.querySelector('.pg6-gpu-panel__swapchain-format').textContent, 'bgra8unorm');
+  assert.equal(root.querySelector('.pg6-gpu-panel__blit-fallback').textContent, 'Direct (25)');
+
+  // Top-level HTTPFS fields also update selectively without wiping other counters.
+  controller.update({
+    pgimFullFetches: 3,
+    syncFastPathHits: 200,
+  });
+  assert.equal(controller.getState().ioStats.pgimFullFetches, 3);
+  assert.equal(controller.getState().ioStats.slabCacheHits, 148);
+  assert.equal(controller.getState().ioStats.syncFastPathHits, 200);
+
+  // Verify JSON export contains all sanitized additive fields alongside existing schema keys.
+  const jsonText = controller.exportMissingShadersJson();
+  assert.equal(exportCalls.length, 1);
+  const exported = JSON.parse(jsonText);
+  assert.equal(exported.format, EXPORT_FORMAT);
+  assert.equal(exported.schemaVersion, EXPORT_SCHEMA_VERSION);
+  assert.equal(exported.gpu.bindGroupKindMismatches, 9);
+  assert.equal(exported.gpu.autoLayoutFallbacks, 12);
+  assert.equal(exported.gpu.bc3dFallbacks, 5);
+  assert.equal(exported.gpu.bc3dFallbackUploadsSkipped, 19);
+  assert.equal(exported.gpu.swapchainFormat, 'bgra8unorm');
+  assert.equal(exported.gpu.usesBlitFallback, false);
+  assert.equal(exported.gpu.blitCount, 25);
+  assert.deepEqual(exported.io, {
+    pgimFullFetches: 3,
+    slabCacheHits: 148,
+    slabCacheMisses: 6,
+    syncFastPathHits: 200,
+  });
+
+  // Explicit null reset clears compatStats / ioStats cleanly.
+  controller.update({ compatStats: null, ioStats: null });
+  assert.equal(controller.getState().compatStats.swapchainFormat, null);
+  assert.equal(controller.getState().compatStats.bindGroupKindMismatches, 0);
+  assert.equal(controller.getState().ioStats.slabCacheHits, 0);
+
+  controller.destroy();
+});
+
+test('W114 malicious or overly long swapchainFormat strings and invalid counters are sanitized/rejected', () => {
+  assert.equal(sanitizeSwapchainFormat('rgba8unorm'), 'rgba8unorm');
+  assert.equal(sanitizeSwapchainFormat('  BGRA8UNORM  '), 'bgra8unorm');
+  assert.equal(sanitizeSwapchainFormat('rgb10a2unorm'), 'rgb10a2unorm');
+  assert.equal(sanitizeSwapchainFormat('C:\\Users\\alice\\GTA6\\game.exe'), null);
+  assert.equal(sanitizeSwapchainFormat('/home/alice/secret/swapchain.bin'), null);
+  assert.equal(sanitizeSwapchainFormat('file:///C:/Users/alice/rgba8unorm'), null);
+  assert.equal(sanitizeSwapchainFormat('rgba8unorm; ../../etc/passwd'), null);
+  assert.equal(sanitizeSwapchainFormat('a'.repeat(512)), null);
+  assert.equal(sanitizeSwapchainFormat(new Uint8Array([1, 2, 3])), null);
+  assert.equal(sanitizeSwapchainFormat(12345), null);
+  assert.equal(sanitizeSwapchainFormat(null), null);
+
+  const { controller } = createPanel();
+  const root = controller.getState().root;
+
+  // Set a valid format first, then pass a malicious host path — it must be rejected to null / '—'.
+  controller.update({ swapchainFormat: 'rgba8unorm' });
+  assert.equal(controller.getState().compatStats.swapchainFormat, 'rgba8unorm');
+  assert.equal(root.querySelector('.pg6-gpu-panel__swapchain-format').textContent, 'rgba8unorm');
+
+  controller.update({
+    swapchainFormat: 'C:\\Users\\alice\\AppData\\Local\\GTA6\\secret_dump.rpf',
+    bindGroupKindMismatches: -5,
+    autoLayoutFallbacks: Number.NaN,
+    bc3dFallbacks: 'not-a-number',
+    bc3dFallbackUploadsSkipped: Infinity,
+    blitCount: -99,
+    ioStats: {
+      pgimFullFetches: -1,
+      slabCacheHits: 'C:\\Users\\alice\\slab',
+      slabCacheMisses: 3.9,
+      syncFastPathHits: undefined,
+      hostPath: '/home/alice/game/main.pgim',
+      rawBytes: new Uint8Array([0xca, 0xfe, 0xba, 0xbe]),
+    },
+  });
+
+  const state = controller.getState();
+  assert.equal(state.compatStats.swapchainFormat, null);
+  assert.equal(state.compatStats.bindGroupKindMismatches, 0);
+  assert.equal(state.compatStats.autoLayoutFallbacks, 0);
+  assert.equal(state.compatStats.bc3dFallbacks, 0);
+  assert.equal(state.compatStats.bc3dFallbackUploadsSkipped, 0);
+  assert.equal(state.compatStats.blitCount, 0);
+  assert.equal(state.ioStats.pgimFullFetches, 0);
+  assert.equal(state.ioStats.slabCacheHits, 0);
+  assert.equal(state.ioStats.slabCacheMisses, 3);
+  assert.equal(state.ioStats.syncFastPathHits, 0);
+
+  assert.equal(root.querySelector('.pg6-gpu-panel__swapchain-format').textContent, '—');
+
+  const exportedJson = controller.exportMissingShadersJson();
+  const exported = JSON.parse(exportedJson);
+  assert.equal(exported.gpu.swapchainFormat, null);
+  assert.doesNotMatch(
+    exportedJson,
+    /Users|alice|AppData|secret_dump|home|main\.pgim|rawBytes|hostPath/i
+  );
+
+  // Also test buildMissingShaderExport directly with malicious swapchainFormat & extra fields.
+  const directExport = buildMissingShaderExport({
+    swapchainFormat: '/var/private/users/bob/game.xvc',
+    compatStats: {
+      bindGroupKindMismatches: 2,
+      secretDump: new Uint8Array([1, 2, 3]),
+    },
+    ioStats: {
+      pgimFullFetches: 1,
+      localFile: 'D:\\Games\\Secret\\file.rpf',
+    },
+    exportedAt: Date.UTC(2026, 6, 1, 0, 0, 0),
+  });
+  assert.equal(directExport.gpu.swapchainFormat, null);
+  assert.equal(directExport.gpu.bindGroupKindMismatches, 2);
+  assert.equal(directExport.io.pgimFullFetches, 1);
+  assert.doesNotMatch(
+    JSON.stringify(directExport),
+    /private|bob|game\.xvc|secretDump|Games|Secret|file\.rpf/i
+  );
 
   controller.destroy();
 });

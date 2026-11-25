@@ -13,10 +13,33 @@
   const EXPORT_FORMAT = 'playgta6-missing-shaders-v1';
   const EXPORT_SCHEMA_VERSION = 1;
   const STAGE_NOT_STARTED = 'NOT_STARTED';
+  const PLACEHOLDER_DASH = '—';
   const STYLE_ATTR = 'data-pg6-gpu-boot-panel-style';
   const ROOT_CLASS = 'pg6-gpu-panel';
   const DEFAULT_ARIA_LABEL = 'Frame-1 GPU & Missing-Shader Diagnostics';
   const U64_MAX = 0xffffffffffffffffn;
+
+  /** Allowlist of canonical WebGPU swapchain / render-target format tokens. */
+  const ALLOWED_SWAPCHAIN_FORMATS = Object.freeze([
+    'bgra8unorm',
+    'bgra8unorm-srgb',
+    'rgba8unorm',
+    'rgba8unorm-srgb',
+    'rgba16float',
+    'rgb10a2unorm',
+    'rgb10a2uint',
+    'rg11b10ufloat',
+    'rgb9e5ufloat',
+    'rgba32float',
+    'r8unorm',
+    'rg8unorm',
+    'r16float',
+    'rg16float',
+    'r32float',
+    'rg32float',
+  ]);
+
+  const ALLOWED_SWAPCHAIN_FORMAT_SET = new Set(ALLOWED_SWAPCHAIN_FORMATS);
 
   /** Guest boot milestones in chronological order (mirrors BootTracer BOOT_MILESTONES). */
   const BOOT_STAGE_ORDER = Object.freeze([
@@ -114,6 +137,9 @@
     '.' +
     ROOT_CLASS +
     '__grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:0.35rem;}' +
+    '.' +
+    ROOT_CLASS +
+    '__grid--4{grid-template-columns:repeat(4,minmax(0,1fr));}' +
     '.' +
     ROOT_CLASS +
     '__metric{padding:0.3rem 0.45rem;border-radius:0.35rem;background:rgba(255,255,255,0.04);}' +
@@ -358,6 +384,193 @@
   }
 
   /**
+   * Sanitize a WebGPU swapchain / render-target format token against a strict allowlist
+   * so host paths, URLs, or arbitrary strings can never appear in UI or exports.
+   *
+   * @param {unknown} rawFormat
+   * @returns {string|null}
+   */
+  function sanitizeSwapchainFormat(rawFormat) {
+    if (typeof rawFormat !== 'string') {
+      return null;
+    }
+    const token = rawFormat.trim().toLowerCase();
+    if (token.length === 0 || token.length > 32) {
+      return null;
+    }
+    return ALLOWED_SWAPCHAIN_FORMAT_SET.has(token) ? token : null;
+  }
+
+  function createDefaultCompatStats() {
+    return {
+      bindGroupKindMismatches: 0,
+      autoLayoutFallbacks: 0,
+      bc3dFallbacks: 0,
+      bc3dFallbackUploadsSkipped: 0,
+      swapchainFormat: null,
+      usesBlitFallback: false,
+      blitCount: 0,
+    };
+  }
+
+  function createDefaultIoStats() {
+    return {
+      pgimFullFetches: 0,
+      slabCacheHits: 0,
+      slabCacheMisses: 0,
+      syncFastPathHits: 0,
+    };
+  }
+
+  function pickFirstDefined(sources, keys) {
+    for (let i = 0; i < sources.length; i += 1) {
+      const src = sources[i];
+      if (!src || typeof src !== 'object') continue;
+      for (let j = 0; j < keys.length; j += 1) {
+        const val = safeRead(src, keys[j]);
+        if (val !== undefined) {
+          return { found: true, value: val };
+        }
+      }
+    }
+    return { found: false, value: undefined };
+  }
+
+  function extractCompatStats(source, base) {
+    let next = base ? { ...base } : createDefaultCompatStats();
+    if (!source || typeof source !== 'object') {
+      return next;
+    }
+
+    const rawCompat =
+      safeRead(source, 'compatStats') !== undefined
+        ? safeRead(source, 'compatStats')
+        : safeRead(source, 'gpuCompatStats') !== undefined
+          ? safeRead(source, 'gpuCompatStats')
+          : safeRead(source, 'gpu');
+    if (rawCompat === null) {
+      next = createDefaultCompatStats();
+    }
+    const compatObj = rawCompat && typeof rawCompat === 'object' ? rawCompat : null;
+
+    const rawRenderState = safeRead(source, 'renderStateStats');
+    const renderStateObj =
+      rawRenderState && typeof rawRenderState === 'object' ? rawRenderState : null;
+
+    const rawTexture = safeRead(source, 'textureStats');
+    const textureObj = rawTexture && typeof rawTexture === 'object' ? rawTexture : null;
+
+    const rawSwapchain =
+      safeRead(source, 'swapchainStats') !== undefined
+        ? safeRead(source, 'swapchainStats')
+        : safeRead(source, 'swapchain');
+    const swapchainObj = rawSwapchain && typeof rawSwapchain === 'object' ? rawSwapchain : null;
+
+    const rawFrame = safeRead(source, 'frameStats');
+    const frameObj = rawFrame && typeof rawFrame === 'object' ? rawFrame : null;
+
+    const bindMismatch = pickFirstDefined(
+      [source, compatObj, renderStateObj, frameObj],
+      ['bindGroupKindMismatches']
+    );
+    if (bindMismatch.found) {
+      next.bindGroupKindMismatches = nonNegativeInt(bindMismatch.value, 0);
+    }
+
+    const autoLayout = pickFirstDefined(
+      [source, compatObj, renderStateObj, frameObj],
+      ['autoLayoutFallbacks']
+    );
+    if (autoLayout.found) {
+      next.autoLayoutFallbacks = nonNegativeInt(autoLayout.value, 0);
+    }
+
+    const bc3d = pickFirstDefined([source, compatObj, textureObj, frameObj], ['bc3dFallbacks']);
+    if (bc3d.found) {
+      next.bc3dFallbacks = nonNegativeInt(bc3d.value, 0);
+    }
+
+    const bc3dSkipped = pickFirstDefined(
+      [source, compatObj, textureObj, frameObj],
+      ['bc3dFallbackUploadsSkipped']
+    );
+    if (bc3dSkipped.found) {
+      next.bc3dFallbackUploadsSkipped = nonNegativeInt(bc3dSkipped.value, 0);
+    }
+
+    let swapFormat = pickFirstDefined(
+      [source, compatObj, swapchainObj, frameObj],
+      ['swapchainFormat']
+    );
+    if (!swapFormat.found && swapchainObj) {
+      swapFormat = pickFirstDefined([swapchainObj], ['streamFormat', 'format']);
+    }
+    if (swapFormat.found) {
+      next.swapchainFormat = sanitizeSwapchainFormat(swapFormat.value);
+    }
+
+    const usesBlit = pickFirstDefined(
+      [source, compatObj, swapchainObj, frameObj],
+      ['usesBlitFallback']
+    );
+    if (usesBlit.found) {
+      next.usesBlitFallback = Boolean(usesBlit.value);
+    }
+
+    const blitCount = pickFirstDefined([source, compatObj, swapchainObj, frameObj], ['blitCount']);
+    if (blitCount.found) {
+      next.blitCount = nonNegativeInt(blitCount.value, 0);
+    }
+
+    return next;
+  }
+
+  function extractIoStats(source, base) {
+    let next = base ? { ...base } : createDefaultIoStats();
+    if (!source || typeof source !== 'object') {
+      return next;
+    }
+
+    const rawIo =
+      safeRead(source, 'ioStats') !== undefined
+        ? safeRead(source, 'ioStats')
+        : safeRead(source, 'httpfsStats') !== undefined
+          ? safeRead(source, 'httpfsStats')
+          : safeRead(source, 'io');
+    if (rawIo === null) {
+      next = createDefaultIoStats();
+    }
+    const ioObj = rawIo && typeof rawIo === 'object' ? rawIo : null;
+
+    const pgim = pickFirstDefined([source, ioObj], ['pgimFullFetches']);
+    if (pgim.found) {
+      next.pgimFullFetches = nonNegativeInt(pgim.value, 0);
+    }
+
+    const slabHits = pickFirstDefined([source, ioObj], ['slabCacheHits']);
+    if (slabHits.found) {
+      next.slabCacheHits = nonNegativeInt(slabHits.value, 0);
+    }
+
+    const slabMisses = pickFirstDefined([source, ioObj], ['slabCacheMisses']);
+    if (slabMisses.found) {
+      next.slabCacheMisses = nonNegativeInt(slabMisses.value, 0);
+    }
+
+    const syncFast = pickFirstDefined([source, ioObj], ['syncFastPathHits']);
+    if (syncFast.found) {
+      next.syncFastPathHits = nonNegativeInt(syncFast.value, 0);
+    }
+
+    return next;
+  }
+
+  function formatBlitFallbackText(usesBlitFallback, blitCount) {
+    const count = nonNegativeInt(blitCount, 0);
+    return usesBlitFallback ? `Active (${count})` : `Direct (${count})`;
+  }
+
+  /**
    * Normalize and sanitize a single missing-shader entry into a canonical row
    * (`hash` hex, `stage`, `hits`, optional numeric timestamps, and display `text`).
    * Returns `null` if the entry lacks a valid 64-bit hash (rejecting paths/buffers).
@@ -504,6 +717,8 @@
     );
     const frameStats = normalizeFrameStats(safeRead(source, 'frameStats'));
     const fallbackStats = normalizeFallbackStats(safeRead(source, 'fallbackStats'));
+    const compatStats = extractCompatStats(source, null);
+    const ioStats = extractIoStats(source, null);
 
     let exportedAtValue = safeRead(source, 'exportedAt');
     if (exportedAtValue === undefined) {
@@ -553,6 +768,19 @@
         hitRatePct: fallbackStats.hitRatePct,
         uniqueMissing: missingShaders.length,
         overflowMissingCount: fallbackStats.overflowMissingCount,
+        bindGroupKindMismatches: compatStats.bindGroupKindMismatches,
+        autoLayoutFallbacks: compatStats.autoLayoutFallbacks,
+        bc3dFallbacks: compatStats.bc3dFallbacks,
+        bc3dFallbackUploadsSkipped: compatStats.bc3dFallbackUploadsSkipped,
+        swapchainFormat: compatStats.swapchainFormat,
+        usesBlitFallback: compatStats.usesBlitFallback,
+        blitCount: compatStats.blitCount,
+      },
+      io: {
+        pgimFullFetches: ioStats.pgimFullFetches,
+        slabCacheHits: ioStats.slabCacheHits,
+        slabCacheMisses: ioStats.slabCacheMisses,
+        syncFastPathHits: ioStats.syncFastPathHits,
       },
       missingShaderCount: missingShaders.length,
       missingShaders,
@@ -698,6 +926,8 @@
       this._boot = normalizeBootSummary(null);
       this._frameStats = normalizeFrameStats(null);
       this._fallbackStats = normalizeFallbackStats(null);
+      this._compatStats = createDefaultCompatStats();
+      this._ioStats = createDefaultIoStats();
       this._missingShaders = [];
 
       this._styleEl = ensureSharedStyle(doc);
@@ -871,6 +1101,108 @@
       countersGrid.appendChild(builtinHitsMetric.card);
       countersSection.appendChild(countersGrid);
 
+      // --- WebGPU compatibility & swapchain diagnostics section ---
+      const compatSection = createEl(
+        doc,
+        'div',
+        `${ROOT_CLASS}__section ${ROOT_CLASS}__compat`,
+        {
+          role: 'group',
+          'aria-label': 'WebGPU Compatibility & Swapchain',
+        }
+      );
+      compatSection.appendChild(
+        createEl(doc, 'div', `${ROOT_CLASS}__section-title`, { text: 'WebGPU Compatibility' })
+      );
+      const compatGrid = createEl(doc, 'div', `${ROOT_CLASS}__grid`);
+      const bindMismatchesMetric = this._buildMetricCard(
+        doc,
+        'Bind Mismatches',
+        `${ROOT_CLASS}__bind-mismatches`,
+        '0'
+      );
+      const autoLayoutMetric = this._buildMetricCard(
+        doc,
+        'Auto-Layout',
+        `${ROOT_CLASS}__auto-layout-fallbacks`,
+        '0'
+      );
+      const bc3dFallbacksMetric = this._buildMetricCard(
+        doc,
+        '3D BC Fallbacks',
+        `${ROOT_CLASS}__bc3d-fallbacks`,
+        '0'
+      );
+      const bc3dSkippedMetric = this._buildMetricCard(
+        doc,
+        '3D BC Skipped',
+        `${ROOT_CLASS}__bc3d-uploads-skipped`,
+        '0'
+      );
+      const swapchainFormatMetric = this._buildMetricCard(
+        doc,
+        'Swapchain',
+        `${ROOT_CLASS}__swapchain-format`,
+        PLACEHOLDER_DASH
+      );
+      const blitFallbackMetric = this._buildMetricCard(
+        doc,
+        'Blit Fallback',
+        `${ROOT_CLASS}__blit-fallback`,
+        formatBlitFallbackText(false, 0)
+      );
+      compatGrid.appendChild(bindMismatchesMetric.card);
+      compatGrid.appendChild(autoLayoutMetric.card);
+      compatGrid.appendChild(bc3dFallbacksMetric.card);
+      compatGrid.appendChild(bc3dSkippedMetric.card);
+      compatGrid.appendChild(swapchainFormatMetric.card);
+      compatGrid.appendChild(blitFallbackMetric.card);
+      compatSection.appendChild(compatGrid);
+
+      // --- HTTPFS & cache acceleration telemetry section ---
+      const ioSection = createEl(
+        doc,
+        'div',
+        `${ROOT_CLASS}__section ${ROOT_CLASS}__io`,
+        {
+          role: 'group',
+          'aria-label': 'HTTPFS & Cache Telemetry',
+        }
+      );
+      ioSection.appendChild(
+        createEl(doc, 'div', `${ROOT_CLASS}__section-title`, { text: 'HTTPFS & Cache' })
+      );
+      const ioGrid = createEl(doc, 'div', `${ROOT_CLASS}__grid ${ROOT_CLASS}__grid--4`);
+      const pgimFetchesMetric = this._buildMetricCard(
+        doc,
+        'PGIM Fetches',
+        `${ROOT_CLASS}__pgim-fetches`,
+        '0'
+      );
+      const slabHitsMetric = this._buildMetricCard(
+        doc,
+        'Slab Hits',
+        `${ROOT_CLASS}__slab-hits`,
+        '0'
+      );
+      const slabMissesMetric = this._buildMetricCard(
+        doc,
+        'Slab Misses',
+        `${ROOT_CLASS}__slab-misses`,
+        '0'
+      );
+      const syncFastHitsMetric = this._buildMetricCard(
+        doc,
+        'Sync Fast Path',
+        `${ROOT_CLASS}__sync-fast-hits`,
+        '0'
+      );
+      ioGrid.appendChild(pgimFetchesMetric.card);
+      ioGrid.appendChild(slabHitsMetric.card);
+      ioGrid.appendChild(slabMissesMetric.card);
+      ioGrid.appendChild(syncFastHitsMetric.card);
+      ioSection.appendChild(ioGrid);
+
       // --- Missing-shader table section ---
       const missingSection = createEl(doc, 'div', `${ROOT_CLASS}__section ${ROOT_CLASS}__missing`);
       const missingHeader = createEl(
@@ -903,6 +1235,8 @@
 
       body.appendChild(bootSection);
       body.appendChild(countersSection);
+      body.appendChild(compatSection);
+      body.appendChild(ioSection);
       body.appendChild(missingSection);
 
       rootEl.appendChild(header);
@@ -927,6 +1261,16 @@
         fallbackHits: fallbackHitsMetric.val,
         builtinHits: builtinHitsMetric.val,
         hitRate: hitRateMetric.val,
+        bindGroupKindMismatches: bindMismatchesMetric.val,
+        autoLayoutFallbacks: autoLayoutMetric.val,
+        bc3dFallbacks: bc3dFallbacksMetric.val,
+        bc3dFallbackUploadsSkipped: bc3dSkippedMetric.val,
+        swapchainFormat: swapchainFormatMetric.val,
+        blitFallback: blitFallbackMetric.val,
+        pgimFullFetches: pgimFetchesMetric.val,
+        slabCacheHits: slabHitsMetric.val,
+        slabCacheMisses: slabMissesMetric.val,
+        syncFastPathHits: syncFastHitsMetric.val,
         missingHeader,
         table,
         tbody,
@@ -963,6 +1307,16 @@
           fallbackHits: q(`.${ROOT_CLASS}__fallback-hits`),
           builtinHits: q(`.${ROOT_CLASS}__builtin-hits`),
           hitRate: q(`.${ROOT_CLASS}__hit-rate`),
+          bindGroupKindMismatches: q(`.${ROOT_CLASS}__bind-mismatches`),
+          autoLayoutFallbacks: q(`.${ROOT_CLASS}__auto-layout-fallbacks`),
+          bc3dFallbacks: q(`.${ROOT_CLASS}__bc3d-fallbacks`),
+          bc3dFallbackUploadsSkipped: q(`.${ROOT_CLASS}__bc3d-uploads-skipped`),
+          swapchainFormat: q(`.${ROOT_CLASS}__swapchain-format`),
+          blitFallback: q(`.${ROOT_CLASS}__blit-fallback`),
+          pgimFullFetches: q(`.${ROOT_CLASS}__pgim-fetches`),
+          slabCacheHits: q(`.${ROOT_CLASS}__slab-hits`),
+          slabCacheMisses: q(`.${ROOT_CLASS}__slab-misses`),
+          syncFastPathHits: q(`.${ROOT_CLASS}__sync-fast-hits`),
           missingHeader: q(`.${ROOT_CLASS}__missing-header`),
           table: q(`.${ROOT_CLASS}__table`),
           tbody: q(`.${ROOT_CLASS}__table-body`),
@@ -1052,6 +1406,8 @@
       const boot = this._boot;
       const frames = this._frameStats;
       const fb = this._fallbackStats;
+      const compat = this._compatStats;
+      const io = this._ioStats;
 
       try {
         if (els.summaryBadge) {
@@ -1093,6 +1449,45 @@
         }
         if (els.hitRate) {
           els.hitRate.textContent = formatHitRatePct(fb.hitRatePct);
+        }
+
+        if (els.bindGroupKindMismatches) {
+          els.bindGroupKindMismatches.textContent = String(compat.bindGroupKindMismatches);
+        }
+        if (els.autoLayoutFallbacks) {
+          els.autoLayoutFallbacks.textContent = String(compat.autoLayoutFallbacks);
+        }
+        if (els.bc3dFallbacks) {
+          els.bc3dFallbacks.textContent = String(compat.bc3dFallbacks);
+        }
+        if (els.bc3dFallbackUploadsSkipped) {
+          els.bc3dFallbackUploadsSkipped.textContent = String(compat.bc3dFallbackUploadsSkipped);
+        }
+        if (els.swapchainFormat) {
+          els.swapchainFormat.textContent = compat.swapchainFormat || PLACEHOLDER_DASH;
+        }
+        if (els.blitFallback) {
+          els.blitFallback.textContent = formatBlitFallbackText(
+            compat.usesBlitFallback,
+            compat.blitCount
+          );
+          if (typeof els.blitFallback.setAttribute === 'function') {
+            els.blitFallback.setAttribute('data-uses-blit', String(compat.usesBlitFallback));
+            els.blitFallback.setAttribute('data-blit-count', String(compat.blitCount));
+          }
+        }
+
+        if (els.pgimFullFetches) {
+          els.pgimFullFetches.textContent = String(io.pgimFullFetches);
+        }
+        if (els.slabCacheHits) {
+          els.slabCacheHits.textContent = String(io.slabCacheHits);
+        }
+        if (els.slabCacheMisses) {
+          els.slabCacheMisses.textContent = String(io.slabCacheMisses);
+        }
+        if (els.syncFastPathHits) {
+          els.syncFastPathHits.textContent = String(io.syncFastPathHits);
         }
 
         const totalMissing = this._missingShaders.length;
@@ -1156,6 +1551,22 @@
      *   missingShaders?: Array|null,
      *   fallbackStats?: object|null,
      *   frameStats?: object|null,
+     *   compatStats?: object|null,
+     *   renderStateStats?: object|null,
+     *   textureStats?: object|null,
+     *   swapchainStats?: object|null,
+     *   ioStats?: object|null,
+     *   bindGroupKindMismatches?: number,
+     *   autoLayoutFallbacks?: number,
+     *   bc3dFallbacks?: number,
+     *   bc3dFallbackUploadsSkipped?: number,
+     *   swapchainFormat?: string|null,
+     *   usesBlitFallback?: boolean,
+     *   blitCount?: number,
+     *   pgimFullFetches?: number,
+     *   slabCacheHits?: number,
+     *   slabCacheMisses?: number,
+     *   syncFastPathHits?: number,
      * }} [snapshot]
      * @returns {object} Current controller state.
      */
@@ -1187,6 +1598,9 @@
         this._frameStats = normalizeFrameStats(frameStats);
       }
 
+      this._compatStats = extractCompatStats(snapshot, this._compatStats);
+      this._ioStats = extractIoStats(snapshot, this._ioStats);
+
       this._render();
       return this.getState();
     }
@@ -1203,6 +1617,8 @@
         missingShaders: this._missingShaders,
         fallbackStats: this._fallbackStats,
         frameStats: this._frameStats,
+        compatStats: this._compatStats,
+        ioStats: this._ioStats,
         now: this._now,
       });
       const jsonText = JSON.stringify(payload, null, 2);
@@ -1268,6 +1684,8 @@
         boot: { ...this._boot },
         frameStats: { ...this._frameStats },
         fallbackStats: { ...this._fallbackStats },
+        compatStats: { ...this._compatStats },
+        ioStats: { ...this._ioStats },
         hitRateText: formatHitRatePct(this._fallbackStats.hitRatePct),
         missingShaders: this._missingShaders.map((row) => ({ ...row })),
         visibleMissingShaders,
@@ -1336,6 +1754,8 @@
     EXPORT_SCHEMA_VERSION,
     BOOT_STAGE_ORDER,
     STAGE_NAMES,
+    ALLOWED_SWAPCHAIN_FORMATS,
+    sanitizeSwapchainFormat,
     formatMissingShaderRow,
     buildMissingShaderExport,
     GpuBootPanelController,
