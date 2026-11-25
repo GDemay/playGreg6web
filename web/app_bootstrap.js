@@ -21,6 +21,7 @@ import { BootTracer } from './telemetry/boot_tracer.js';
 
 export const DEFAULT_LOADER_URL = new URL('./loader.js', import.meta.url).href;
 export const DEFAULT_SHADER_PACK_URL = '/shaders/fallback.wgsl.pack';
+export const DEFAULT_DUMP_ENDPOINT = '/__pg6_dump/';
 export const DEFAULT_VIEWPORT_WIDTH = 640;
 export const DEFAULT_VIEWPORT_HEIGHT = 360;
 export const DEFAULT_CANVAS_FORMAT = 'bgra8unorm';
@@ -36,6 +37,13 @@ const BYTES_PER_MIB = 1024 * 1024;
 const SAFE_INPUT_SCRIPT_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const POSITIVE_DECIMAL_RE = /^(?:\d+(?:\.\d+)?|\.\d+)$/;
 
+const BUILTIN_INPUT_SCRIPT_PRESETS = Object.freeze([
+  'start-screen',
+  'menu-flow',
+  'calibration-skip',
+  'intro-watch',
+]);
+
 const ALLOWED_INPUT_SCRIPT_PRESETS = (() => {
   const map = new Map();
   if (INPUT_SCRIPT_PRESETS && typeof INPUT_SCRIPT_PRESETS === 'object') {
@@ -48,8 +56,11 @@ const ALLOWED_INPUT_SCRIPT_PRESETS = (() => {
       }
     }
   }
-  if (!map.has('start-screen')) {
-    map.set('start-screen', 'start-screen');
+  for (let i = 0; i < BUILTIN_INPUT_SCRIPT_PRESETS.length; i += 1) {
+    const preset = BUILTIN_INPUT_SCRIPT_PRESETS[i];
+    if (!map.has(preset)) {
+      map.set(preset, preset);
+    }
   }
   return map;
 })();
@@ -385,9 +396,12 @@ function toUrlSearchParams(search) {
 
 /**
  * Pure URL query-parameter parser and sanitizer for bootstrap options:
- * - `?inputScript=<preset>` (case-insensitive, strictly allowlisted to known preset IDs)
+ * - `?inputScript=<preset>` (case-insensitive, strictly allowlisted to known preset IDs:
+ *   `start-screen`, `menu-flow`, `calibration-skip`, `intro-watch`, and valid presets in `INPUT_SCRIPT_PRESETS`)
  * - `?streamShaders=1|true` (enables ranged shader streaming with default 64 MiB threshold)
  * - `?streamThresholdMb=<N>` (finite positive number clamped to safe bounds, converted to bytes)
+ * - `?dumpPipelines=1|true` (enables opt-in MEMFS `/pg6_dump` pipeline dump sync in `loader.js`, default `false`)
+ * - `?allowDumpWrites=1|true` (enables opt-in `/pg6_dump/*` write forwarding in `io_worker.js` to `/__pg6_dump/`, default `false`)
  *
  * @param {string|URLSearchParams|URL|Location|object|null|undefined} search
  * @returns {Readonly<{
@@ -395,6 +409,9 @@ function toUrlSearchParams(search) {
  *   streamShaders: boolean,
  *   streamThresholdMb: number | null,
  *   streamThresholdBytes: number | null,
+ *   dumpPipelines: boolean,
+ *   allowDumpWrites: boolean,
+ *   dumpEndpoint: string | null,
  * }>}
  */
 export function parseBootUrlOptions(search) {
@@ -405,6 +422,9 @@ export function parseBootUrlOptions(search) {
       streamShaders: false,
       streamThresholdMb: null,
       streamThresholdBytes: null,
+      dumpPipelines: false,
+      allowDumpWrites: false,
+      dumpEndpoint: null,
     });
   }
 
@@ -412,6 +432,12 @@ export function parseBootUrlOptions(search) {
   const streamFlag = parseBooleanQueryFlag(getQueryParamInsensitive(params, 'streamShaders'));
   const parsedThreshold = parseStreamThresholdMb(
     getQueryParamInsensitive(params, 'streamThresholdMb')
+  );
+  const dumpPipelinesFlag = parseBooleanQueryFlag(
+    getQueryParamInsensitive(params, 'dumpPipelines')
+  );
+  const allowDumpWritesFlag = parseBooleanQueryFlag(
+    getQueryParamInsensitive(params, 'allowDumpWrites')
   );
 
   let streamShaders = false;
@@ -430,11 +456,98 @@ export function parseBootUrlOptions(search) {
     streamThresholdBytes = DEFAULT_STREAM_SHADERS_THRESHOLD_BYTES;
   }
 
+  const dumpPipelines = dumpPipelinesFlag === true;
+  const allowDumpWrites = allowDumpWritesFlag === true;
+  const dumpEndpoint = allowDumpWrites ? DEFAULT_DUMP_ENDPOINT : null;
+
   return Object.freeze({
     inputScript,
     streamShaders,
     streamThresholdMb,
     streamThresholdBytes,
+    dumpPipelines,
+    allowDumpWrites,
+    dumpEndpoint,
+  });
+}
+
+function sanitizeDumpEndpoint(raw) {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const clean = sanitizeTelemetryUrl(raw);
+  if (!clean) {
+    return null;
+  }
+  return clean.endsWith('/') ? clean : `${clean}/`;
+}
+
+function resolveBooleanOverride(value, fallback) {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+  if (typeof value === 'string') {
+    const parsed = parseBooleanQueryFlag(value);
+    if (parsed !== null) {
+      return parsed;
+    }
+  }
+  return fallback;
+}
+
+function resolveDumpConfigOverride(source, base) {
+  const baseDumpPipelines = Boolean(base && base.dumpPipelines === true);
+  const baseAllowDumpWrites = Boolean(base && base.allowDumpWrites === true);
+  const baseDumpEndpoint = baseAllowDumpWrites
+    ? (base && typeof base.dumpEndpoint === 'string' && base.dumpEndpoint) || DEFAULT_DUMP_ENDPOINT
+    : null;
+
+  if (!source || typeof source !== 'object') {
+    return Object.freeze({
+      dumpPipelines: baseDumpPipelines,
+      allowDumpWrites: baseAllowDumpWrites,
+      dumpEndpoint: baseDumpEndpoint,
+    });
+  }
+
+  const hasDumpPipelines =
+    Object.prototype.hasOwnProperty.call(source, 'dumpPipelines') &&
+    source.dumpPipelines !== undefined;
+  const hasAllowDumpWrites =
+    Object.prototype.hasOwnProperty.call(source, 'allowDumpWrites') &&
+    source.allowDumpWrites !== undefined;
+  const hasDumpEndpoint =
+    Object.prototype.hasOwnProperty.call(source, 'dumpEndpoint') &&
+    source.dumpEndpoint !== undefined;
+
+  if (!hasDumpPipelines && !hasAllowDumpWrites && !hasDumpEndpoint) {
+    return Object.freeze({
+      dumpPipelines: baseDumpPipelines,
+      allowDumpWrites: baseAllowDumpWrites,
+      dumpEndpoint: baseDumpEndpoint,
+    });
+  }
+
+  const dumpPipelines = hasDumpPipelines
+    ? resolveBooleanOverride(source.dumpPipelines, baseDumpPipelines)
+    : baseDumpPipelines;
+  const allowDumpWrites = hasAllowDumpWrites
+    ? resolveBooleanOverride(source.allowDumpWrites, baseAllowDumpWrites)
+    : baseAllowDumpWrites;
+
+  let dumpEndpoint = null;
+  if (allowDumpWrites) {
+    if (hasDumpEndpoint) {
+      dumpEndpoint = sanitizeDumpEndpoint(source.dumpEndpoint) || DEFAULT_DUMP_ENDPOINT;
+    } else {
+      dumpEndpoint = baseDumpEndpoint || DEFAULT_DUMP_ENDPOINT;
+    }
+  }
+
+  return Object.freeze({
+    dumpPipelines,
+    allowDumpWrites,
+    dumpEndpoint,
   });
 }
 
@@ -1184,13 +1297,19 @@ export function bootstrapPlayGta6App(options = {}) {
   const parsedUrlOptions = parseBootUrlOptions(rawUrlSearch);
   const baseInputScript = resolveInputScriptOverride(options, parsedUrlOptions.inputScript);
   const baseStreamConfig = resolveStreamConfigOverride(options, parsedUrlOptions);
+  const baseDumpConfig = resolveDumpConfigOverride(options, parsedUrlOptions);
   const resolvedBootUrlOptions = Object.freeze({
     inputScript: baseInputScript,
     streamShaders: baseStreamConfig.streamShaders,
     streamThresholdMb: baseStreamConfig.streamThresholdMb,
     streamThresholdBytes: baseStreamConfig.streamThresholdBytes,
+    dumpPipelines: baseDumpConfig.dumpPipelines,
+    allowDumpWrites: baseDumpConfig.allowDumpWrites,
+    dumpEndpoint: baseDumpConfig.dumpEndpoint,
   });
   let activeStreamConfig = baseStreamConfig;
+  let activeDumpConfig = baseDumpConfig;
+  let configuredInputScript = baseInputScript;
   let activeInputScript = null;
 
   const gpuTelemetry = {
@@ -1445,6 +1564,13 @@ export function bootstrapPlayGta6App(options = {}) {
     ) {
       fields.streamShaders = true;
       fields.streamThresholdBytes = activeStreamConfig.streamThresholdBytes;
+    }
+    if (activeDumpConfig && activeDumpConfig.dumpPipelines === true) {
+      fields.dumpPipelines = true;
+    }
+    if (activeDumpConfig && activeDumpConfig.allowDumpWrites === true) {
+      fields.allowDumpWrites = true;
+      fields.dumpEndpoint = activeDumpConfig.dumpEndpoint || DEFAULT_DUMP_ENDPOINT;
     }
     return fields;
   }
@@ -3463,6 +3589,26 @@ export function bootstrapPlayGta6App(options = {}) {
     return sessionState;
   }
 
+  function resolveDiagnosticInputScript() {
+    if (activeInputScript) {
+      return sanitizeInputScriptPreset(activeInputScript);
+    }
+    if (inputBridge && typeof inputBridge.getScriptState === 'function') {
+      try {
+        const scriptState = inputBridge.getScriptState();
+        if (scriptState && scriptState.active && typeof scriptState.preset === 'string') {
+          const sanitized = sanitizeInputScriptPreset(scriptState.preset);
+          if (sanitized) {
+            return sanitized;
+          }
+        }
+      } catch {
+        // Ignore inputBridge state errors.
+      }
+    }
+    return configuredInputScript ? sanitizeInputScriptPreset(configuredInputScript) : null;
+  }
+
   function getDiagnosticsSnapshot() {
     const sessionState = resolveSessionStateText();
     const recentCopy = Object.freeze(
@@ -3477,6 +3623,9 @@ export function bootstrapPlayGta6App(options = {}) {
       recentValidationErrors: recentCopy,
       framesPresented: resolveFramesPresented(),
       splashFramesPresented,
+      dumpPipelines: Boolean(activeDumpConfig && activeDumpConfig.dumpPipelines),
+      allowDumpWrites: Boolean(activeDumpConfig && activeDumpConfig.allowDumpWrites),
+      inputScript: resolveDiagnosticInputScript(),
       destroyed,
     });
   }
@@ -3521,6 +3670,9 @@ export function bootstrapPlayGta6App(options = {}) {
       sessionState,
       milestone: resolveCurrentMilestone(),
       destroyed: Boolean(destroyed),
+      dumpPipelines: Boolean(activeDumpConfig && activeDumpConfig.dumpPipelines),
+      allowDumpWrites: Boolean(activeDumpConfig && activeDumpConfig.allowDumpWrites),
+      inputScript: resolveDiagnosticInputScript(),
       realPackDrawCount: gpu.realPackDrawCount,
       fallbackDrawCount: gpu.fallbackDrawCount,
       presentCount: gpu.presentCount,
@@ -3673,7 +3825,9 @@ export function bootstrapPlayGta6App(options = {}) {
     }
     stopActiveInputScript();
     activeStreamConfig = resolveStreamConfigOverride(startOpts, baseStreamConfig);
+    activeDumpConfig = resolveDumpConfigOverride(startOpts, baseDumpConfig);
     const desiredInputScript = resolveInputScriptOverride(startOpts, baseInputScript);
+    configuredInputScript = desiredInputScript;
     lastNotifiedSideModuleKey = null;
     startOverrideShaderPackUrl =
       startOpts && typeof startOpts === 'object'
