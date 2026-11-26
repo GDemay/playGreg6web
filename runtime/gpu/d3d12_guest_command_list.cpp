@@ -358,6 +358,9 @@ void CommandList::bind_pipeline(PipelineState* state) {
     if (state->is_compute()) {
         compute_pso_ = state;
         bridge_.SetComputePipelineState(state->resolved() ? state->compute() : nullptr);
+    } else if (state->mesh() != nullptr) {
+        graphics_pso_ = state;
+        bridge_.SetMeshPipelineState(state->resolved() ? state->mesh() : nullptr);
     } else {
         graphics_pso_ = state;
         bridge_.SetPipelineState(state->resolved() ? state->graphics() : nullptr);

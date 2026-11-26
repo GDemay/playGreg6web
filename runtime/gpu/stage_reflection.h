@@ -175,6 +175,11 @@ struct StageReflection {
     ReflectedStage stage = ReflectedStage::Vertex;
     std::vector<ReflectedVertexInput> vertex_inputs;
     std::vector<ReflectedBinding> bindings;
+    // G66: a mesh stage translated to compute (pack key bridge::mesh_compute_pack_key): its output
+    // record layout, from the optional "mesh_output": {"max_vertices", "max_primitives",
+    // "vertex_words"} (see bridge::MeshOutputLayout; validated by bridge::valid_mesh_output_layout).
+    bool has_mesh_output = false;
+    bridge::MeshOutputLayout mesh_output{};
 };
 
 // Pack key (stage identity) -> reflection.

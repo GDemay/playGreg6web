@@ -2929,9 +2929,14 @@ PipelineState::PipelineState(com::Ref<Device> device, com::Ref<RootSignature> ro
 }
 
 PipelineState::~PipelineState() {
-    if (graphics_) {
+    if (graphics_ || mesh_) {
         CommandEncoder enc;
-        device_->state_bridge().release_pipeline_state(std::move(graphics_), enc);
+        if (graphics_) {
+            device_->state_bridge().release_pipeline_state(std::move(graphics_), enc);
+        }
+        if (mesh_) {
+            device_->state_bridge().release_mesh_pipeline_state(std::move(mesh_), enc);
+        }
         if (enc.size() != 0) {
             device_->submit(enc);
         }
@@ -3474,6 +3479,134 @@ HResult Device::create_graphics_pso_from(GraphicsPsoSource source, const Guid& r
                                              rs ? &rs->signature().desc() : nullptr);
     }
     state->source_ = std::move(src);
+    return hand_out(std::move(state), riid, out);
+}
+
+HResult Device::create_mesh_pso(const GuestGraphicsPipelineStateDesc& g, const GuestShaderBytecode& ms,
+                                bool amplification, const Guid& riid, OutPtr out) {
+    const auto placeholder = [&](const char* reason) {
+        count(xbox::Counter::PlaceholderPipelineStates);
+        return create_placeholder_pso(reason, riid, out);
+    };
+    if (amplification) {
+        return placeholder("amplification shaders");
+    }
+    const ShaderPackIndex* pack = options_.shader_pack.get();
+    const StageReflectionIndex* refl = options_.stage_reflection.get();
+    com::Ref<RootSignature> rs = root_signature_ref(g.pRootSignature);
+    if (pack == nullptr || refl == nullptr || !rs || g.NumRenderTargets > 8) {
+        return placeholder("mesh shaders (no shader pack, reflection or root signature)");
+    }
+    uint64_t ms_id = 0;
+    uint64_t ps_id = 0;
+    DxilDigest ms_digest{};
+    DxilDigest ps_digest{};
+    if (!read_shader(*this, ms, "MS", &ms_id, &ms_digest) || !read_shader(*this, g.PS, "PS", &ps_id, &ps_digest) ||
+        ms_id == 0) {
+        return placeholder("mesh shaders (unreadable stage)");
+    }
+    // Pack keys, as for the other stages: the joined console-native stage's code identity first,
+    // then the DXIL identity.
+    static const DxilDigest kZero{};
+    const auto find_key = [&](const DxilDigest& digest, uint64_t dxil, uint64_t salt, PackStage stage) -> uint64_t {
+        NativeStageRecord native{};
+        if (native_index_size() != 0 && digest != kZero) {
+            find_native_stage(digest, &native);
+        }
+        for (uint64_t k : {native.identity != 0 ? native.code_identity : uint64_t{0}, dxil}) {
+            auto it = k != 0 ? pack->find(k ^ salt) : pack->end();
+            if (it != pack->end() && it->second == stage) {
+                return k ^ salt;
+            }
+        }
+        return 0;
+    };
+    const uint64_t ms_key = find_key(ms_digest, ms_id, bridge::kMeshComputeKeySalt, PackStage::Compute);
+    const uint64_t ps_key = ps_id != 0 ? find_key(ps_digest, ps_id, 0, PackStage::Fragment) : 0;
+    const auto ms_refl = ms_key != 0 ? refl->find(ms_key) : refl->end();
+    if (ms_key == 0 || ms_refl == refl->end() || !ms_refl->second.has_mesh_output || (ps_id != 0 && ps_key == 0)) {
+        return placeholder("mesh shaders (no mesh compute translation in the pack)");
+    }
+    const bridge::MeshOutputLayout output = ms_refl->second.mesh_output;
+    // Layouts: the mesh stage's from its reflection (graphics user data, compute visibility); the
+    // draw's from the pixel stage's reflection, or the root-signature convention without one.
+    std::string report;
+    bridge::PipelineLayoutDesc stage_layout;
+    bool ok = join_pipeline_layout(rs->signature().desc(), /*compute=*/false,
+                                   {{GpuShaderStageBits::Compute, &ms_refl->second}}, &stage_layout, &report, nullptr,
+                                   JoinOptions{options_.bridge.binding_arrays});
+    bridge::PipelineLayoutDesc draw_layout;
+    const auto ps_refl = ps_key != 0 ? refl->find(ps_key) : refl->end();
+    if (ok && ps_refl != refl->end()) {
+        ok = join_pipeline_layout(rs->signature().desc(), /*compute=*/false,
+                                  {{GpuShaderStageBits::Fragment, &ps_refl->second}}, &draw_layout, &report, nullptr,
+                                  JoinOptions{options_.bridge.binding_arrays});
+    } else if (ok) {
+        draw_layout = layout_from_root_signature(rs->signature().desc());
+    }
+    if (!ok || stage_layout.groups.size() > bridge::kMeshOutputGroup ||
+        draw_layout.groups.size() > bridge::kMeshOutputGroup) {
+        char head[96];
+        std::snprintf(head, sizeof(head), "d3d12_xs: mesh pipeline layout join failed (mesh 0x%016" PRIx64 "):\n", ms_key);
+        os::log(std::string(head) + report);
+        return placeholder("mesh shaders (pipeline layout)");
+    }
+    const uint64_t stage_identity = bridge::mesh_compute_pack_key(ms_id);
+    const uint64_t draw_vs = bridge::mesh_draw_vertex_identity(output);
+    {
+        std::lock_guard<std::mutex> lock(pack_mutex_);
+        CommandEncoder enc;
+        const auto module_for = [&](uint64_t key, GpuShaderStage stage, const std::string& code) {
+            auto it = pack_modules_.find(key);
+            if (it != pack_modules_.end()) {
+                return it->second;
+            }
+            const uint32_t id = allocate_id();
+            enc.create_shader_module(id, stage, code);
+            pack_modules_.emplace(key, id);
+            return id;
+        };
+        register_shader_module(stage_identity, module_for(ms_key, GpuShaderStage::Compute, pack_key_code(ms_key)));
+        register_shader_module(draw_vs, module_for(draw_vs, GpuShaderStage::Vertex, bridge::mesh_draw_vertex_wgsl(output)));
+        if (ps_id != 0) {
+            register_shader_module(ps_id, module_for(ps_key, GpuShaderStage::Fragment, pack_key_code(ps_key)));
+        }
+        if (enc.size() != 0) {
+            submit(enc);
+        }
+        if (pack_layouts_.insert({stage_identity, 0}).second) {
+            bridge_->register_pipeline_layout(stage_identity, 0, std::move(stage_layout));
+        }
+        if (pack_layouts_.insert({draw_vs, ps_id}).second) {
+            bridge_->register_pipeline_layout(draw_vs, ps_id, std::move(draw_layout));
+        }
+    }
+    pso::D3D12GraphicsPsoDesc d{};
+    d.vs = draw_vs;
+    d.ps = ps_id;
+    d.root_signature_id = static_cast<uint32_t>(rs->signature().hash());
+    convert_blend_desc(g.BlendState, &d.BlendState);
+    d.SampleMask = g.SampleMask;
+    convert_rasterizer_desc(g.RasterizerState, &d.RasterizerState);
+    convert_depth_stencil_desc(g.DepthStencilState, &d.DepthStencilState);
+    d.PrimitiveTopologyType = pso::D3D12PrimitiveTopologyType::Triangle;
+    d.NumRenderTargets = g.NumRenderTargets;
+    for (int i = 0; i < 8; ++i) {
+        d.RTVFormats[i] = static_cast<pso::DxgiFormat>(g.RTVFormats[i]);
+    }
+    d.DSVFormat = static_cast<pso::DxgiFormat>(g.DSVFormat);
+    d.SampleDesc.Count = g.SampleCount;
+    d.SampleDesc.Quality = g.SampleQuality;
+    auto state = com::create_object<PipelineState>(com::implements(kID3D12PipelineState), device_ref(this), rs);
+    if (!state) {
+        return kEOutOfMemory;
+    }
+    state->initialize_guest_payload();
+    state->mesh_ = bridge_->create_mesh_pipeline_state(d, stage_identity, output, &rs->signature());
+    state->identities_ = {ms_id, ps_id};
+    state->resolved_ = (state->mesh_->diagnostics() &
+                        (bridge::BridgeDiag::UnknownShaderModule | bridge::BridgeDiag::MissingPipelineLayout)) == 0;
+    count(xbox::Counter::MeshPipelineStates);
     return hand_out(std::move(state), riid, out);
 }
 
