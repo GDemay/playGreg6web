@@ -6,7 +6,6 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <iterator>
 #include <mutex>
 #include <thread>
 
@@ -44,9 +43,19 @@ std::string default_warm_list_path(const std::string& title) {
 }
 
 bool read_warm_list_file(const std::string& path, std::vector<uint8_t>* out) {
-    std::ifstream in(path, std::ios::binary);
+    if (out == nullptr) return false;
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
     if (!in) return false;
-    out->assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    const std::streampos end = in.tellg();
+    if (end < 0) return false;
+    const auto size = static_cast<size_t>(end);
+    out->resize(size);
+    if (size == 0) return true;
+    in.seekg(0, std::ios::beg);
+    if (!in.read(reinterpret_cast<char*>(out->data()), static_cast<std::streamsize>(size))) {
+        out->clear();
+        return false;
+    }
     return true;
 }
 
@@ -106,27 +115,24 @@ void prewarm_host_start(PrewarmBuilder builder) {
         while (!g_stop && !b.ready()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        PrewarmTask tasks[8];
+        PrewarmTask task{};
         while (!g_stop) {
-            const size_t n = pipeline_prewarm().take(tasks, 8);
-            if (n == 0) break;  // queue drained
-            for (size_t i = 0; i < n; ++i) {
-                const auto t0 = std::chrono::steady_clock::now();
-                PrewarmBuild result;
-                const PrewarmDetail detail = pipeline_prewarm().detail_of(tasks[i].id);
-                if (detail && b.build_pipeline) {
-                    result = b.build_pipeline(tasks[i].id, tasks[i].kind, tasks[i].key0, tasks[i].key1, *detail);
-                } else {
-                    result = b.build(tasks[i].kind, tasks[i].key0, tasks[i].key1) ? PrewarmBuild::Built
-                                                                                   : PrewarmBuild::Failed;
-                }
-                const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                    std::chrono::steady_clock::now() - t0).count();
-                if (result == PrewarmBuild::Lost) {
-                    pipeline_prewarm().complete_lost(tasks[i].id);
-                } else {
-                    pipeline_prewarm().complete(tasks[i].id, result == PrewarmBuild::Built, static_cast<uint64_t>(ns));
-                }
+            if (pipeline_prewarm().take(&task, 1) == 0) break;  // queue drained
+            const auto t0 = std::chrono::steady_clock::now();
+            PrewarmBuild result;
+            const PrewarmDetail detail = pipeline_prewarm().detail_of(task.id);
+            if (detail && b.build_pipeline) {
+                result = b.build_pipeline(task.id, task.kind, task.key0, task.key1, *detail);
+            } else {
+                result = b.build(task.kind, task.key0, task.key1) ? PrewarmBuild::Built
+                                                                  : PrewarmBuild::Failed;
+            }
+            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - t0).count();
+            if (result == PrewarmBuild::Lost) {
+                pipeline_prewarm().complete_lost(task.id);
+            } else {
+                pipeline_prewarm().complete(task.id, result == PrewarmBuild::Built, static_cast<uint64_t>(ns));
             }
         }
     });
@@ -154,14 +160,19 @@ bool prewarm_host_save() {
 std::string prewarm_host_report_json() {
     const PrewarmProgress p = pipeline_prewarm().progress();
     const PrewarmUse u = pipeline_prewarm().use_stats();
-    char buf[512];
+    const PrewarmDiagnostics d = pipeline_prewarm().diagnostics();
+    char buf[1024];
     std::snprintf(buf, sizeof(buf),
                   "{\"queued_total\": %u, \"prewarmed\": %u, \"hit_before_use\": %u, \"wasted\": %u, \"failed\": %u, "
                   "\"skipped\": %u, \"observed\": %u, \"pipelines_prewarmed\": %u, "
-                  "\"pipelines_hit_before_use\": %u, \"pipelines_wasted\": %u, \"build_ms\": %llu}",
+                  "\"pipelines_hit_before_use\": %u, \"pipelines_wasted\": %u, \"build_ms\": %llu, "
+                  "\"longest_build_ms\": %llu, \"races_lost\": %u, \"retired_queued\": %u, \"pack_skipped\": %u, "
+                  "\"priority_queued\": %u}",
                   p.total, u.prewarmed, u.hit, u.wasted, p.failed, p.skipped, p.observed, u.pipelines_prewarmed,
                   u.pipelines_hit, u.pipelines_wasted,
-                  static_cast<unsigned long long>(p.total_ns / 1000000));
+                  static_cast<unsigned long long>(p.total_ns / 1000000),
+                  static_cast<unsigned long long>(p.longest_ns / 1000000),
+                  d.races_lost, d.retired_queued, d.pack_skipped, d.priority_queued);
     return buf;
 }
 
