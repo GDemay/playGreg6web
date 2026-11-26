@@ -160,7 +160,334 @@ Resource* as_resource(uint64_t va) {
     return arg ? static_cast<Resource*>(arg.get()) : nullptr;
 }
 
+constexpr uint64_t align_up_u64(uint64_t v, uint64_t a) {
+    return a <= 1u ? v : ((v + a - 1u) / a) * a;
+}
+
+constexpr uint32_t align_up_u32(uint32_t v, uint32_t a) {
+    return a <= 1u ? v : ((v + a - 1u) / a) * a;
+}
+
+bool is_depth_dxgi_format(uint32_t format) {
+    switch (static_cast<pso::DxgiFormat>(format)) {
+    case pso::DxgiFormat::R32G8X24_TYPELESS:
+    case pso::DxgiFormat::D32_FLOAT_S8X24_UINT:
+    case pso::DxgiFormat::R32_FLOAT_X8X24_TYPELESS:
+    case pso::DxgiFormat::X32_TYPELESS_G8X24_UINT:
+    case pso::DxgiFormat::R32_TYPELESS:
+    case pso::DxgiFormat::D32_FLOAT:
+    case pso::DxgiFormat::R24G8_TYPELESS:
+    case pso::DxgiFormat::D24_UNORM_S8_UINT:
+    case pso::DxgiFormat::R24_UNORM_X8_TYPELESS:
+    case pso::DxgiFormat::X24_TYPELESS_G8_UINT:
+    case pso::DxgiFormat::R16_TYPELESS:
+    case pso::DxgiFormat::D16_UNORM:
+    case pso::DxgiFormat::D16_UNORM_S8_UINT:
+    case pso::DxgiFormat::R16_UNORM_X8_TYPELESS:
+    case pso::DxgiFormat::X16_TYPELESS_G8_UINT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+struct SubresourceInfo {
+    uint32_t mip = 0;
+    uint32_t layer = 0;
+    uint32_t plane = 0;
+    uint32_t mip_w = 1;
+    uint32_t mip_h = 1;
+    uint32_t mip_d = 1;
+    uint32_t phys_w = 1;
+    uint32_t phys_h = 1;
+    bool is_1d = false;
+    bool is_3d = false;
+};
+
+bool decode_texture_subresource(const Resource* tex, uint32_t sub, const DxgiFormatLayout& layout,
+                                SubresourceInfo* out) {
+    if (tex == nullptr || tex->is_buffer() || sub >= tex->subresource_count()) {
+        return false;
+    }
+    const uint32_t mips = std::max<uint32_t>(1u, tex->mip_levels());
+    const uint32_t layers = std::max<uint32_t>(1u, tex->array_layers());
+    const bool is_1d = tex->desc().Dimension == ResourceDimension::Texture1D;
+    const bool is_3d = tex->desc().Dimension == ResourceDimension::Texture3D;
+    const uint32_t mip = sub % mips;
+    const uint32_t layer = (sub / mips) % layers;
+    const uint32_t plane = sub / (mips * layers);
+    const uint32_t bw = std::max<uint32_t>(1u, layout.block_width);
+    const uint32_t bh = std::max<uint32_t>(1u, layout.block_height);
+    const uint32_t mip_w = std::max<uint32_t>(1u, static_cast<uint32_t>(tex->desc().Width >> mip));
+    const uint32_t mip_h = is_1d ? 1u : std::max<uint32_t>(1u, tex->desc().Height >> mip);
+    const uint32_t mip_d = is_3d ? std::max<uint32_t>(1u, static_cast<uint32_t>(tex->desc().DepthOrArraySize) >> mip) : 1u;
+    out->mip = mip;
+    out->layer = layer;
+    out->plane = plane;
+    out->mip_w = mip_w;
+    out->mip_h = mip_h;
+    out->mip_d = mip_d;
+    out->phys_w = align_up_u32(mip_w, bw);
+    out->phys_h = is_1d ? 1u : align_up_u32(mip_h, bh);
+    out->is_1d = is_1d;
+    out->is_3d = is_3d;
+    return true;
+}
+
+bool formats_compatible_for_resolve(uint32_t a, uint32_t b) {
+    if (a == b) {
+        return true;
+    }
+    const DxgiFormatLayout la = dxgi_format_layout(a);
+    const DxgiFormatLayout lb = dxgi_format_layout(b);
+    if (!la.known || !lb.known) {
+        return false;
+    }
+    return la.block_bytes == lb.block_bytes && la.block_width == lb.block_width &&
+           la.block_height == lb.block_height && la.planes == lb.planes;
+}
+
+float normalize_zero(float v) {
+    return v == 0.0f ? 0.0f : v;
+}
+
+// Clamps a D3D12 viewport to WebGPU-valid bounds:
+//   x >= 0, y >= 0, width >= 0, height >= 0, x + width <= limit_w, y + height <= limit_h,
+//   0 <= minDepth <= maxDepth <= 1, all finite.
+pso::D3D12Viewport clamp_viewport_webgpu(const pso::D3D12Viewport& vp, uint32_t rt_w, uint32_t rt_h,
+                                         uint32_t max_dim) {
+    const float limit_w = static_cast<float>(rt_w > 0 ? std::min(rt_w, max_dim) : max_dim);
+    const float limit_h = static_cast<float>(rt_h > 0 ? std::min(rt_h, max_dim) : max_dim);
+    float x = std::isfinite(vp.TopLeftX) ? vp.TopLeftX : 0.0f;
+    float y = std::isfinite(vp.TopLeftY) ? vp.TopLeftY : 0.0f;
+    float w = std::isfinite(vp.Width) ? vp.Width : 0.0f;
+    float h = std::isfinite(vp.Height) ? vp.Height : 0.0f;
+    if (w < 0.0f) {
+        w = 0.0f;
+    }
+    if (h < 0.0f) {
+        h = 0.0f;
+    }
+    if (x < 0.0f) {
+        w = std::max(0.0f, w + x);
+        x = 0.0f;
+    }
+    if (y < 0.0f) {
+        h = std::max(0.0f, h + y);
+        y = 0.0f;
+    }
+    x = std::clamp(x, 0.0f, limit_w);
+    y = std::clamp(y, 0.0f, limit_h);
+    w = std::clamp(w, 0.0f, std::max(0.0f, limit_w - x));
+    h = std::clamp(h, 0.0f, std::max(0.0f, limit_h - y));
+
+    float min_d = std::isfinite(vp.MinDepth) ? std::clamp(vp.MinDepth, 0.0f, 1.0f) : 0.0f;
+    float max_d = std::isfinite(vp.MaxDepth) ? std::clamp(vp.MaxDepth, 0.0f, 1.0f) : 1.0f;
+    if (min_d > max_d) {
+        std::swap(min_d, max_d);
+    }
+    return pso::D3D12Viewport{normalize_zero(x), normalize_zero(y), normalize_zero(w), normalize_zero(h),
+                              normalize_zero(min_d), normalize_zero(max_d)};
+}
+
+// Clamps a D3D12 scissor rect against render-target extents (or max_dim when no RT is bound yet).
+pso::D3D12Rect clamp_scissor_webgpu(const pso::D3D12Rect& r, uint32_t rt_w, uint32_t rt_h, uint32_t max_dim) {
+    const int64_t limit_w = static_cast<int64_t>(rt_w > 0 ? std::min(rt_w, max_dim) : max_dim);
+    const int64_t limit_h = static_cast<int64_t>(rt_h > 0 ? std::min(rt_h, max_dim) : max_dim);
+    const int64_t x0 = std::clamp<int64_t>(r.left, 0, limit_w);
+    const int64_t y0 = std::clamp<int64_t>(r.top, 0, limit_h);
+    const int64_t x1 = std::clamp<int64_t>(r.right, x0, limit_w);
+    const int64_t y1 = std::clamp<int64_t>(r.bottom, y0, limit_h);
+    return pso::D3D12Rect{static_cast<int32_t>(x0), static_cast<int32_t>(y0), static_cast<int32_t>(x1),
+                          static_cast<int32_t>(y1)};
+}
+
+// Per-CommandList auxiliary state for G79 (kept in this TU to preserve d3d12_guest_resources.h unchanged).
+struct CommandListAux {
+    struct BoundDsv {
+        uint32_t resource_id = 0;
+        uint32_t mip = 0;
+        uint32_t base_layer = 0;
+        uint32_t layer_count = 1;
+        bool depth_read_only = false;
+    };
+    struct DeferredMeta {
+        uint64_t dst_cpu_va = 0;
+        uint64_t dst_width = 0;
+        uint64_t dst_allocated = 0;
+        bool needs_rmw_align = false;
+    };
+    struct ComputeRootArg {
+        uint8_t kind = 0;  // 0 unset, 1 table
+        uint64_t value = 0;
+    };
+
+    std::vector<pso::D3D12Viewport> raw_viewports;
+    std::vector<pso::D3D12Viewport> clamped_viewports;
+    std::vector<pso::D3D12Rect> raw_scissors;
+    std::vector<pso::D3D12Rect> clamped_scissors;
+    float blend_factor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    uint32_t stencil_ref = 0;
+    uint32_t rt_width = 0;
+    uint32_t rt_height = 0;
+    BoundDsv bound_dsv{};
+    const d3d::RootSignature* compute_root_signature = nullptr;
+    std::array<ComputeRootArg, 64> compute_root_args{};
+    bridge::DepthTwinTracker depth_twin;
+    std::vector<DeferredMeta> deferred_meta;
+    uint64_t depth_srv_sync_flushes = 0;
+    uint64_t depth_srv_sync_refreshes = 0;
+    uint64_t resolves_emitted = 0;
+    uint64_t resolves_fallback = 0;
+
+    void reset_dynamic_state() {
+        raw_viewports.clear();
+        clamped_viewports.clear();
+        raw_scissors.clear();
+        clamped_scissors.clear();
+        blend_factor[0] = blend_factor[1] = blend_factor[2] = blend_factor[3] = 1.0f;
+        stencil_ref = 0;
+        rt_width = 0;
+        rt_height = 0;
+        bound_dsv = {};
+        compute_root_signature = nullptr;
+        compute_root_args = {};
+    }
+
+    void reset_all() {
+        reset_dynamic_state();
+        depth_twin.reset();
+        deferred_meta.clear();
+        depth_srv_sync_flushes = 0;
+        depth_srv_sync_refreshes = 0;
+        resolves_emitted = 0;
+        resolves_fallback = 0;
+    }
+};
+
+std::mutex g_aux_mutex;
+std::unordered_map<const CommandList*, std::unique_ptr<CommandListAux>> g_aux_map;
+
+CommandListAux& aux_of(const CommandList* list) {
+    std::lock_guard<std::mutex> lock(g_aux_mutex);
+    auto& ptr = g_aux_map[list];
+    if (!ptr) {
+        ptr = std::make_unique<CommandListAux>();
+    }
+    return *ptr;
+}
+
+void erase_aux(const CommandList* list) {
+    std::lock_guard<std::mutex> lock(g_aux_mutex);
+    g_aux_map.erase(list);
+}
+
+// Synchronizes any depth-as-SRV descriptor table bindings against `aux.depth_twin` so pending twin
+// writes are flushed and stale SRV twins are refreshed accurately across mip levels and array layers.
+void sync_depth_srvs_for_tables(Device& dev, CommandListAux& aux, const d3d::RootSignature* rs,
+                                const std::function<uint64_t(size_t)>& table_gpu_handle) {
+    if (rs == nullptr) {
+        return;
+    }
+    const d3d::RootSignatureDesc& rd = rs->desc();
+    for (size_t p = 0; p < rd.parameters.size(); ++p) {
+        const d3d::RootParameterDesc& param = rd.parameters[p];
+        if (param.parameter_type != d3d::RootParameterType::DescriptorTable) {
+            continue;
+        }
+        const uint64_t gpu_handle = table_gpu_handle(p);
+        if (gpu_handle == 0) {
+            continue;
+        }
+        d3d::ResolvedDescriptor base{};
+        if (dev.heaps().resolve_gpu(d3d::GpuDescriptorHandle{gpu_handle}, &base) != d3d::Status::Ok ||
+            base.heap == nullptr) {
+            continue;
+        }
+        uint32_t table_offset = 0;
+        for (const d3d::DescriptorRangeDesc& range : param.ranges) {
+            if (range.offset_in_descriptors_from_table_start != 0xFFFFFFFFu) {
+                table_offset = range.offset_in_descriptors_from_table_start;
+            }
+            const uint32_t count =
+                range.num_descriptors == d3d::kUnboundedDescriptorCount ? 16u : std::min<uint32_t>(range.num_descriptors, 64u);
+            if (range.range_type == d3d::DescriptorRangeType::Srv) {
+                for (uint32_t i = 0; i < count; ++i) {
+                    const uint32_t slot = base.index + table_offset + i;
+                    if (slot >= base.heap->capacity()) {
+                        break;
+                    }
+                    const d3d::ViewDescriptor* v = base.heap->view(slot);
+                    if (v == nullptr || v->kind != d3d::DescriptorKind::Srv || v->resource_id == 0) {
+                        continue;
+                    }
+                    bridge::TextureInfo ti{};
+                    if (!dev.state_bridge().texture_info(v->resource_id, &ti) ||
+                        !is_depth_dxgi_format(static_cast<uint32_t>(ti.format))) {
+                        continue;
+                    }
+                    const uint32_t total_mips = std::max<uint32_t>(1u, ti.mip_levels);
+                    const uint32_t total_layers =
+                        ti.dimension == GpuTextureDimension::Dim3D ? 1u : std::max<uint32_t>(1u, ti.depth_or_array_size);
+                    const uint32_t base_mip = std::min<uint32_t>(v->first_mip, total_mips - 1u);
+                    const uint32_t mips =
+                        (v->mip_levels == 0 || v->mip_levels == 0xFFFFu)
+                            ? (total_mips - base_mip)
+                            : std::min<uint32_t>(v->mip_levels, total_mips - base_mip);
+                    const uint32_t base_layer = std::min(v->first_array_slice, total_layers - 1u);
+                    const uint32_t layers =
+                        (v->array_size == 0 || v->array_size == 0xFFFFFFFFu)
+                            ? (total_layers - base_layer)
+                            : std::min(v->array_size, total_layers - base_layer);
+                    const bridge::DepthTwinTracker::SrvSyncPlan plan =
+                        aux.depth_twin.plan_srv_read(v->resource_id, base_mip, mips, base_layer, layers);
+                    if (plan.any()) {
+                        aux.depth_srv_sync_flushes += plan.flush_twin_to_depth.size();
+                        aux.depth_srv_sync_refreshes += plan.refresh_depth_to_srv.size();
+                        aux.depth_twin.apply_srv_sync(v->resource_id, plan);
+                    }
+                }
+            }
+            table_offset += count;
+        }
+    }
+}
+
 }  // namespace
+
+CommandListDynamicStateSnapshot inspect_command_list_state(const CommandList* list) {
+    CommandListDynamicStateSnapshot snap{};
+    if (list == nullptr) {
+        return snap;
+    }
+    std::lock_guard<std::mutex> lock(g_aux_mutex);
+    const auto it = g_aux_map.find(list);
+    if (it == g_aux_map.end() || !it->second) {
+        return snap;
+    }
+    const CommandListAux& aux = *it->second;
+    snap.viewports = aux.clamped_viewports;
+    snap.scissors = aux.clamped_scissors;
+    std::memcpy(snap.blend_factor, aux.blend_factor, sizeof(snap.blend_factor));
+    snap.stencil_ref = aux.stencil_ref;
+    snap.bound_dsv_texture = aux.bound_dsv.resource_id;
+    snap.bound_rt_width = aux.rt_width;
+    snap.bound_rt_height = aux.rt_height;
+    snap.depth_srv_sync_flushes = aux.depth_srv_sync_flushes;
+    snap.depth_srv_sync_refreshes = aux.depth_srv_sync_refreshes;
+    snap.resolves_emitted = aux.resolves_emitted;
+    snap.resolves_fallback = aux.resolves_fallback;
+    return snap;
+}
+
+const bridge::DepthTwinTracker* inspect_command_list_depth_twin(const CommandList* list) {
+    if (list == nullptr) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(g_aux_mutex);
+    const auto it = g_aux_map.find(list);
+    return (it != g_aux_map.end() && it->second) ? &it->second->depth_twin : nullptr;
+}
 
 // ---------------------------------------------------------------------------------------------
 // Device: command lists
@@ -291,6 +618,7 @@ CommandList::CommandList(com::Ref<Device> device, uint32_t type)
 }
 
 CommandList::~CommandList() {
+    erase_aux(this);
     device_->command_lists.fetch_sub(1);
 }
 
@@ -329,6 +657,7 @@ void CommandList::reset(PipelineState* initial_state) {
     pinned_.clear();
     graphics_pso_ = nullptr;
     compute_pso_ = nullptr;
+    aux_of(this).reset_all();
     bridge_.Reset(nullptr);
     open_ = true;
     if (initial_state != nullptr) {
@@ -375,11 +704,26 @@ void CommandList::ClearState(InterfaceArg<IPipelineStateHost> state) {
     if (!usable()) {
         return;
     }
-    // Keep the recorded packets; drop the bound state and rebind `state`.
+    // Keep the recorded packets; drop the bound state to D3D12 defaults and rebind `state`.
     graphics_pso_ = nullptr;
     compute_pso_ = nullptr;
+    graphics_root_args_ = {};
+    graphics_root_signature_ = nullptr;
+    vertex_buffers_ = {};
+    index_buffer_ = {};
+    rtv_handles_.clear();
+    dsv_handle_ = 0;
+    rect_list_ = false;
+    bridge_vb_views_ = {};
+    aux_of(this).reset_dynamic_state();
     bridge_.SetPipelineState(nullptr);
     bridge_.SetComputePipelineState(nullptr);
+    bridge_.RSSetViewports(0, nullptr);
+    bridge_.RSSetScissorRects(0, nullptr);
+    bridge_.OMSetBlendFactor(nullptr);
+    bridge_.OMSetStencilRef(0);
+    bridge_.OMSetRenderTargets(0, nullptr, false, nullptr);
+    bridge_.IASetIndexBuffer(nullptr);
     if (state) {
         bind_pipeline(static_cast<PipelineState*>(state.get()));
     }
@@ -658,6 +1002,17 @@ void CommandList::DrawInstanced(uint32_t vertices, uint32_t instances, uint32_t 
         describe_skipped_draw("DrawInstanced", vertices, instances, "pipeline state without shader modules");
         return;
     }
+    CommandListAux& aux = aux_of(this);
+    const d3d::RootSignature* active_rs =
+        graphics_root_signature_ != nullptr
+            ? graphics_root_signature_
+            : ((graphics_pso_ != nullptr && graphics_pso_->graphics_source() != nullptr &&
+                graphics_pso_->graphics_source()->root_signature)
+                   ? &graphics_pso_->graphics_source()->root_signature->signature()
+                   : nullptr);
+    sync_depth_srvs_for_tables(*device_, aux, active_rs, [&](size_t p) -> uint64_t {
+        return p < graphics_root_args_.size() && graphics_root_args_[p].kind == 1 ? graphics_root_args_[p].value : 0ull;
+    });
     if (rect_list_) {
         std::string why;
         if (!expand_rect_list_draw(vertices, instances, start_vertex, start_instance, &why)) {
@@ -665,8 +1020,18 @@ void CommandList::DrawInstanced(uint32_t vertices, uint32_t instances, uint32_t 
         }
         return;
     }
+    const uint64_t drawn_before = bridge_.stats().draws;
     const uint64_t dropped = bridge_.stats().draws_skipped;
     bridge_.DrawInstanced(vertices, instances, start_vertex, start_instance);
+    if (bridge_.stats().draws != drawn_before && aux.bound_dsv.resource_id != 0 && !aux.bound_dsv.depth_read_only) {
+        const GraphicsPsoSource* src = graphics_pso_ != nullptr ? graphics_pso_->graphics_source() : nullptr;
+        const bool depth_writes = src == nullptr || (src->desc.DepthStencilState.DepthEnable &&
+                                                     src->desc.DepthStencilState.DepthWriteMask != pso::D3D12DepthWriteMask::Zero);
+        if (depth_writes) {
+            aux.depth_twin.note_depth_written(aux.bound_dsv.resource_id, aux.bound_dsv.mip, 1u,
+                                              aux.bound_dsv.base_layer, aux.bound_dsv.layer_count);
+        }
+    }
     if (bridge_.stats().draws_skipped != dropped) {
         describe_dropped_draw("DrawInstanced", vertices, instances);
     }
@@ -867,7 +1232,7 @@ bool CommandList::expand_rect_list_draw(uint32_t vertices, uint32_t instances, u
                 return false;
             }
         }
-        if (uint64_t{start_vertex + vertices} * vb.stride > vb.size) {
+        if ((uint64_t{start_vertex} + uint64_t{vertices}) * vb.stride > vb.size) {
             *why = "rectangle-list draw beyond its vertex buffer";
             return false;
         }
@@ -963,12 +1328,33 @@ void CommandList::DrawIndexedInstanced(uint32_t indices, uint32_t instances, uin
         describe_skipped_draw("DrawIndexedInstanced", indices, instances, "pipeline state without shader modules");
         return;
     }
+    CommandListAux& aux = aux_of(this);
+    const d3d::RootSignature* active_rs =
+        graphics_root_signature_ != nullptr
+            ? graphics_root_signature_
+            : ((graphics_pso_ != nullptr && graphics_pso_->graphics_source() != nullptr &&
+                graphics_pso_->graphics_source()->root_signature)
+                   ? &graphics_pso_->graphics_source()->root_signature->signature()
+                   : nullptr);
+    sync_depth_srvs_for_tables(*device_, aux, active_rs, [&](size_t p) -> uint64_t {
+        return p < graphics_root_args_.size() && graphics_root_args_[p].kind == 1 ? graphics_root_args_[p].value : 0ull;
+    });
     if (skip_rect_list_draw("DrawIndexedInstanced", indices, instances,
                             "indexed rectangle-list topology (not expanded; the title draws none)")) {
         return;
     }
+    const uint64_t drawn_before = bridge_.stats().draws;
     const uint64_t dropped = bridge_.stats().draws_skipped;
     bridge_.DrawIndexedInstanced(indices, instances, start_index, base_vertex, start_instance);
+    if (bridge_.stats().draws != drawn_before && aux.bound_dsv.resource_id != 0 && !aux.bound_dsv.depth_read_only) {
+        const GraphicsPsoSource* src = graphics_pso_ != nullptr ? graphics_pso_->graphics_source() : nullptr;
+        const bool depth_writes = src == nullptr || (src->desc.DepthStencilState.DepthEnable &&
+                                                     src->desc.DepthStencilState.DepthWriteMask != pso::D3D12DepthWriteMask::Zero);
+        if (depth_writes) {
+            aux.depth_twin.note_depth_written(aux.bound_dsv.resource_id, aux.bound_dsv.mip, 1u,
+                                              aux.bound_dsv.base_layer, aux.bound_dsv.layer_count);
+        }
+    }
     if (bridge_.stats().draws_skipped != dropped) {
         describe_dropped_draw("DrawIndexedInstanced", indices, instances);
     }
@@ -992,6 +1378,18 @@ void CommandList::Dispatch(uint32_t x, uint32_t y, uint32_t z) {
         device_->note_skipped_draw();
         return;
     }
+    CommandListAux& aux = aux_of(this);
+    const d3d::RootSignature* active_cs_rs =
+        aux.compute_root_signature != nullptr
+            ? aux.compute_root_signature
+            : ((compute_pso_ != nullptr && compute_pso_->compute() != nullptr)
+                   ? compute_pso_->compute()->root_signature()
+                   : nullptr);
+    sync_depth_srvs_for_tables(*device_, aux, active_cs_rs, [&](size_t p) -> uint64_t {
+        return p < aux.compute_root_args.size() && aux.compute_root_args[p].kind == 1
+                   ? aux.compute_root_args[p].value
+                   : 0ull;
+    });
     const uint64_t emitted = bridge_.stats().dispatches;
     const bridge::BridgeStats before = bridge_.stats();
     bridge_.Dispatch(x, y, z);
@@ -1019,9 +1417,18 @@ void CommandList::CopyBufferRegion(InterfaceArg<IResourceHost> dst_arg, uint64_t
     Resource* src = resource(src_arg);
     va_watch_resource("copy source (CopyBufferRegion)", src, "to resource id " + std::to_string(dst ? dst->id() : 0));
     va_watch_resource("copy destination (CopyBufferRegion)", dst, "from resource id " + std::to_string(src ? src->id() : 0));
-    if (dst == nullptr || src == nullptr || !dst->is_buffer() || !src->is_buffer() ||
-        dst_offset + bytes > dst->desc().Width || src_offset + bytes > src->desc().Width) {
+    if (dst == nullptr || src == nullptr || !dst->is_buffer() || !src->is_buffer()) {
         note("CopyBufferRegion: invalid resources or range");
+        return;
+    }
+    const uint64_t dst_w = dst->desc().Width;
+    const uint64_t src_w = src->desc().Width;
+    if (dst_offset > dst_w || bytes > dst_w - dst_offset || src_offset > src_w || bytes > src_w - src_offset) {
+        note("CopyBufferRegion: invalid resources or range");
+        return;
+    }
+    // Zero-byte copy is a valid D3D12 no-op.
+    if (bytes == 0) {
         return;
     }
     if (src->cpu_address() == 0 && dst->cpu_address() != 0) {
@@ -1041,6 +1448,24 @@ void CommandList::CopyBufferRegion(InterfaceArg<IResourceHost> dst_arg, uint64_t
         device_->note_unsupported_copy("CopyBufferRegion: GPU-to-GPU buffer copy has no packet (skipped)");
         return;
     }
+    // Identical self-copy on a CPU-visible buffer is a safe no-op.
+    if (src == dst && dst_offset == src_offset) {
+        return;
+    }
+    // Guard against 32-bit truncation in GpuWriteBufferPayload::dst_offset.
+    const uint64_t aligned_end = align_up_u64(dst_offset + bytes, 4u);
+    if (dst_offset > UINT32_MAX || aligned_end > UINT32_MAX) {
+        note("CopyBufferRegion: destination range exceeds 32-bit WriteBuffer offset limit");
+        return;
+    }
+    // WebGPU queue.writeBuffer requires 4-byte aligned bufferOffset and size.
+    const bool dst_unaligned = (dst_offset & 3u) != 0u;
+    const bool len_unaligned = (bytes & 3u) != 0u;
+    if (dst_unaligned && dst->cpu_address() == 0) {
+        note("CopyBufferRegion: unaligned destination offset " + std::to_string(dst_offset) +
+             " on GPU-only buffer (skipped for WebGPU 4-byte alignment)");
+        return;
+    }
     pinned_.push_back(com::Ref<com::ComObject>::share(src));
     pinned_.push_back(com::Ref<com::ComObject>::share(dst));
     DeferredWrite w;
@@ -1048,7 +1473,18 @@ void CommandList::CopyBufferRegion(InterfaceArg<IResourceHost> dst_arg, uint64_t
     w.dst_offset = dst_offset;
     w.src = src->cpu_address() + src_offset;
     w.size = bytes;
+    CommandListAux::DeferredMeta meta{};
+    meta.dst_cpu_va = dst->cpu_address();
+    meta.dst_width = dst_w;
+    meta.dst_allocated = std::max<uint64_t>(device_->state_bridge().buffer_allocated_size(dst->id()),
+                                            align_up_u64(dst_w, 4u));
+    meta.needs_rmw_align = dst_unaligned || len_unaligned;
+    CommandListAux& aux = aux_of(this);
+    if (aux.deferred_meta.size() < deferred_.size()) {
+        aux.deferred_meta.resize(deferred_.size());
+    }
     deferred_.push_back(w);
+    aux.deferred_meta.push_back(meta);
 }
 
 void CommandList::CopyResource(InterfaceArg<IResourceHost> dst_arg, InterfaceArg<IResourceHost> src_arg) {
@@ -1064,19 +1500,43 @@ void CommandList::CopyResource(InterfaceArg<IResourceHost> dst_arg, InterfaceArg
         return;
     }
     if (dst->is_buffer() && src->is_buffer() && src->cpu_address() != 0) {
+        const uint64_t bytes = std::min(dst->desc().Width, src->desc().Width);
+        if (bytes == 0 || src == dst) {
+            return;
+        }
+        const uint64_t aligned_end = align_up_u64(bytes, 4u);
+        if (aligned_end > UINT32_MAX) {
+            note("CopyResource: buffer size exceeds 32-bit WriteBuffer limit");
+            return;
+        }
         pinned_.push_back(com::Ref<com::ComObject>::share(src));
+        pinned_.push_back(com::Ref<com::ComObject>::share(dst));
         DeferredWrite w;
         w.id = dst->id();
         w.src = src->cpu_address();
-        w.size = std::min(dst->desc().Width, src->desc().Width);
+        w.size = bytes;
+        CommandListAux::DeferredMeta meta{};
+        meta.dst_cpu_va = dst->cpu_address();
+        meta.dst_width = dst->desc().Width;
+        meta.dst_allocated = std::max<uint64_t>(device_->state_bridge().buffer_allocated_size(dst->id()),
+                                                align_up_u64(dst->desc().Width, 4u));
+        meta.needs_rmw_align = (bytes & 3u) != 0u;
+        CommandListAux& aux = aux_of(this);
+        if (aux.deferred_meta.size() < deferred_.size()) {
+            aux.deferred_meta.resize(deferred_.size());
+        }
         deferred_.push_back(w);
+        aux.deferred_meta.push_back(meta);
         return;
     }
     if (dst->is_buffer() && src->is_buffer() && src->cpu_address() == 0 && dst->cpu_address() != 0) {
         // G66: a whole GPU buffer into CPU-visible memory: read back.
+        const uint64_t bytes = std::min(dst->desc().Width, src->desc().Width);
+        if (bytes == 0) {
+            return;
+        }
         pinned_.push_back(com::Ref<com::ComObject>::share(src));
         pinned_.push_back(com::Ref<com::ComObject>::share(dst));
-        const uint64_t bytes = std::min(dst->desc().Width, src->desc().Width);
         GpuReadbackBufferPayload p{};
         p.buffer_id = src->id();
         p.size = bytes;
@@ -1084,6 +1544,9 @@ void CommandList::CopyResource(InterfaceArg<IResourceHost> dst_arg, InterfaceArg
             record_readback(GpuOpcode::ReadbackBuffer, &p, sizeof(p), src->id(), dst->cpu_address(), bytes);
         }
         return;
+    }
+    if (!dst->is_buffer() && is_depth_dxgi_format(dst->desc().Format)) {
+        aux_of(this).depth_twin.note_depth_copied(dst->id(), 0, 0, 0, 0);
     }
     device_->note_unsupported_copy("CopyResource: only CPU-visible buffer sources are supported (skipped)");
 }
@@ -1107,6 +1570,26 @@ void CommandList::CopyTextureRegion(com::CallContext& ctx) {
         copy_texture_to_footprint(ctx, dst, src, tex, buf);
         return;
     }
+    if (dst.Type == 0 && src.Type == 0 && tex != nullptr && buf != nullptr && !tex->is_buffer() && !buf->is_buffer()) {
+        // Texture -> texture subresource copy: validate subresources and update depth-twin state.
+        const DxgiFormatLayout dst_l = dxgi_format_layout(tex->desc().Format);
+        const DxgiFormatLayout src_l = dxgi_format_layout(buf->desc().Format);
+        SubresourceInfo dst_sub{}, src_sub{};
+        const uint32_t dst_sub_idx = static_cast<uint32_t>(dst.PlacedFootprint.Offset);
+        const uint32_t src_sub_idx = static_cast<uint32_t>(src.PlacedFootprint.Offset);
+        if (!dst_l.known || !src_l.known || !decode_texture_subresource(tex, dst_sub_idx, dst_l, &dst_sub) ||
+            !decode_texture_subresource(buf, src_sub_idx, src_l, &src_sub)) {
+            note("CopyTextureRegion: texture-to-texture subresource or format invalid");
+            return;
+        }
+        if (is_depth_dxgi_format(tex->desc().Format)) {
+            const uint32_t dst_z = static_cast<uint32_t>(ctx.int_arg(4));
+            aux_of(this).depth_twin.note_depth_copied(tex->id(), dst_sub.mip, 1u,
+                                                      dst_sub.is_3d ? dst_z : dst_sub.layer, 1u);
+        }
+        device_->note_unsupported_copy("CopyTextureRegion: GPU texture-to-texture copy has no packet (skipped)");
+        return;
+    }
     if (tex == nullptr || buf == nullptr || dst.Type != 0 || src.Type != 1 || tex->is_buffer() || !buf->is_buffer()) {
         device_->note_unsupported_copy("CopyTextureRegion: only buffer footprint -> texture subresource is supported");
         return;
@@ -1116,35 +1599,90 @@ void CommandList::CopyTextureRegion(com::CallContext& ctx) {
         return;
     }
     const uint32_t sub = static_cast<uint32_t>(dst.PlacedFootprint.Offset);  // SubresourceIndex
-    if (sub >= tex->subresource_count()) {
-        note("CopyTextureRegion: subresource " + std::to_string(sub) + " out of range");
-        return;
-    }
     const GuestSubresourceFootprint& fp = src.PlacedFootprint.Footprint;
     const DxgiFormatLayout l = dxgi_format_layout(fp.Format);
-    if (!l.known || fp.RowPitch == 0) {
+    if (!l.known || fp.RowPitch == 0 || fp.Width == 0 || fp.Height == 0 || fp.Depth == 0) {
         note("CopyTextureRegion: unknown footprint format " + std::to_string(fp.Format));
         return;
     }
-    GuestBox box{0, 0, 0, fp.Width, fp.Height, fp.Depth};
+    SubresourceInfo sub_info{};
+    if (!decode_texture_subresource(tex, sub, l, &sub_info)) {
+        note("CopyTextureRegion: subresource " + std::to_string(sub) + " out of range");
+        return;
+    }
+    const uint32_t dst_x = static_cast<uint32_t>(ctx.int_arg(2));
+    const uint32_t dst_y = static_cast<uint32_t>(ctx.int_arg(3));
+    const uint32_t dst_z = static_cast<uint32_t>(ctx.int_arg(4));
+    if ((dst_x % l.block_width) != 0 || (dst_y % l.block_height) != 0) {
+        note("CopyTextureRegion: destination origin not aligned to format block size");
+        return;
+    }
+    if (sub_info.is_1d && (dst_y != 0 || dst_z != 0)) {
+        note("CopyTextureRegion: 1D texture destination origin y/z must be 0");
+        return;
+    }
+    if (!sub_info.is_3d && dst_z != 0) {
+        note("CopyTextureRegion: 2D/array/cubemap destination origin z must be 0");
+        return;
+    }
+    if (dst_x >= sub_info.phys_w || dst_y >= sub_info.phys_h || (sub_info.is_3d && dst_z >= sub_info.mip_d)) {
+        note("CopyTextureRegion: destination origin exceeds subresource dimensions");
+        return;
+    }
+    const uint32_t fp_phys_w = align_up_u32(fp.Width, l.block_width);
+    const uint32_t fp_phys_h = align_up_u32(fp.Height, l.block_height);
+    GuestBox box{0, 0, 0, fp_phys_w, fp_phys_h, fp.Depth};
     if (ctx.int_arg(6) != 0 && !com::read_guest(ctx.int_arg(6), box)) {
         note("CopyTextureRegion: unreadable source box");
         return;
     }
-    const uint32_t w = box.right > box.left ? box.right - box.left : 0;
-    const uint32_t h = box.bottom > box.top ? box.bottom - box.top : 0;
-    const uint32_t d = box.back > box.front ? box.back - box.front : 0;
+    if (box.right <= box.left || box.bottom <= box.top || box.back <= box.front) {
+        return;  // empty box is a valid no-op
+    }
+    if ((box.left % l.block_width) != 0 || (box.top % l.block_height) != 0) {
+        note("CopyTextureRegion: source box origin not aligned to format block size");
+        return;
+    }
+    if (box.left >= fp_phys_w || box.top >= fp_phys_h || box.front >= fp.Depth) {
+        note("CopyTextureRegion: source box origin exceeds footprint dimensions");
+        return;
+    }
+    box.right = std::min(box.right, fp_phys_w);
+    box.bottom = std::min(box.bottom, fp_phys_h);
+    box.back = std::min(box.back, fp.Depth);
+
+    // For block-compressed formats (e.g. BC1-BC7 4x4), round mip-tail copy extents up to whole
+    // blocks so WebGPU writeTexture/copyBufferToTexture never rejects 2x2 or 1x1 mip tails.
+    uint32_t w = align_up_u32(box.right - box.left, l.block_width);
+    uint32_t h = align_up_u32(box.bottom - box.top, l.block_height);
+    uint32_t d = box.back - box.front;
+    w = std::min(w, sub_info.phys_w - dst_x);
+    h = std::min(h, sub_info.phys_h - dst_y);
+    d = std::min(d, sub_info.is_3d ? (sub_info.mip_d - dst_z) : 1u);
     if (w == 0 || h == 0 || d == 0) {
         return;
     }
-    const uint32_t rows = (h + l.block_height - 1) / l.block_height;
-    const uint32_t rows_per_slice = (fp.Height + l.block_height - 1) / l.block_height;
-    const uint64_t row_bytes = uint64_t{(w + l.block_width - 1) / l.block_width} * l.block_bytes;
-    const uint64_t start = src.PlacedFootprint.Offset + uint64_t{box.front} * rows_per_slice * fp.RowPitch +
-                           uint64_t{box.top / l.block_height} * fp.RowPitch +
-                           uint64_t{box.left / l.block_width} * l.block_bytes;
-    const uint64_t len = uint64_t{d - 1} * rows_per_slice * fp.RowPitch + uint64_t{rows - 1} * fp.RowPitch + row_bytes;
-    if (start + len > buf->desc().Width) {
+    const uint32_t elem_bytes = l.planes == 2 ? plane_block_bytes(fp.Format, sub_info.plane) : l.block_bytes;
+    const uint32_t blocks_x = (w + l.block_width - 1u) / l.block_width;
+    const uint32_t rows = (h + l.block_height - 1u) / l.block_height;
+    const uint32_t rows_per_slice = std::max(rows, (fp.Height + l.block_height - 1u) / l.block_height);
+    const uint64_t row_bytes = uint64_t{blocks_x} * elem_bytes;
+    if (row_bytes > fp.RowPitch) {
+        note("CopyTextureRegion: row bytes exceed footprint RowPitch");
+        return;
+    }
+    const uint64_t slice_stride = uint64_t{rows_per_slice} * uint64_t{fp.RowPitch};
+    const uint64_t rel_start = uint64_t{box.front} * slice_stride +
+                               uint64_t{box.top / l.block_height} * fp.RowPitch +
+                               uint64_t{box.left / l.block_width} * elem_bytes;
+    const uint64_t buf_w = buf->desc().Width;
+    if (src.PlacedFootprint.Offset > buf_w || rel_start > buf_w - src.PlacedFootprint.Offset) {
+        note("CopyTextureRegion: footprint exceeds the source buffer");
+        return;
+    }
+    const uint64_t start = src.PlacedFootprint.Offset + rel_start;
+    const uint64_t len = uint64_t{d - 1u} * slice_stride + uint64_t{rows - 1u} * fp.RowPitch + row_bytes;
+    if (len > buf_w - start || len > UINT32_MAX) {
         note("CopyTextureRegion: footprint exceeds the source buffer");
         return;
     }
@@ -1153,27 +1691,34 @@ void CommandList::CopyTextureRegion(com::CallContext& ctx) {
                                        " needs CPU conversion for its WebGPU format (not implemented); skipped");
         return;
     }
-    const uint32_t mip = sub % tex->mip_levels();
-    const uint32_t layer = (sub / tex->mip_levels()) % tex->array_layers();
-    const bool is3d = tex->desc().Dimension == ResourceDimension::Texture3D;
+    const uint32_t origin_z = sub_info.is_3d ? dst_z : sub_info.layer;
     pinned_.push_back(com::Ref<com::ComObject>::share(buf));
+    pinned_.push_back(com::Ref<com::ComObject>::share(tex));
     DeferredWrite wr;
     wr.texture = true;
     wr.id = tex->id();
     wr.src = buf->cpu_address() + start;
     wr.size = len;
     wr.tex.texture_id = tex->id();
-    wr.tex.mip_level = mip;
-    wr.tex.origin_x = static_cast<uint32_t>(ctx.int_arg(2));
-    wr.tex.origin_y = static_cast<uint32_t>(ctx.int_arg(3));
-    wr.tex.origin_z = is3d ? static_cast<uint32_t>(ctx.int_arg(4)) : layer;
+    wr.tex.mip_level = sub_info.mip;
+    wr.tex.origin_x = dst_x;
+    wr.tex.origin_y = dst_y;
+    wr.tex.origin_z = origin_z;
     wr.tex.width = w;
     wr.tex.height = h;
     wr.tex.depth_or_layers = d;
     wr.tex.bytes_per_row = fp.RowPitch;
     wr.tex.rows_per_image = rows_per_slice;
     wr.widen_a8 = tex->desc().Format == static_cast<uint32_t>(pso::DxgiFormat::A8_UNORM);
+    CommandListAux& aux = aux_of(this);
+    if (aux.deferred_meta.size() < deferred_.size()) {
+        aux.deferred_meta.resize(deferred_.size());
+    }
     deferred_.push_back(wr);
+    aux.deferred_meta.push_back(CommandListAux::DeferredMeta{});
+    if (is_depth_dxgi_format(tex->desc().Format)) {
+        aux.depth_twin.note_depth_copied(tex->id(), sub_info.mip, 1u, origin_z, d);
+    }
     device_->note_texture_copy_destination(tex->id());
 }
 
@@ -1219,14 +1764,15 @@ void CommandList::copy_texture_to_footprint(com::CallContext& ctx, const GuestTe
         return;
     }
     const uint32_t sub = static_cast<uint32_t>(src.PlacedFootprint.Offset);  // SubresourceIndex
-    if (sub >= tex->subresource_count()) {
-        note("CopyTextureRegion: source subresource " + std::to_string(sub) + " out of range");
-        return;
-    }
     const GuestSubresourceFootprint& fp = dst.PlacedFootprint.Footprint;
     const DxgiFormatLayout l = dxgi_format_layout(fp.Format);
-    if (!l.known || fp.RowPitch == 0) {
+    if (!l.known || fp.RowPitch == 0 || fp.Width == 0 || fp.Height == 0 || fp.Depth == 0) {
         note("CopyTextureRegion: unknown footprint format " + std::to_string(fp.Format));
+        return;
+    }
+    SubresourceInfo sub_info{};
+    if (!decode_texture_subresource(tex, sub, l, &sub_info)) {
+        note("CopyTextureRegion: source subresource " + std::to_string(sub) + " out of range");
         return;
     }
     if (device_->upload_needs_conversion(tex->desc().Format)) {
@@ -1234,45 +1780,78 @@ void CommandList::copy_texture_to_footprint(com::CallContext& ctx, const GuestTe
                                        " has a converted WebGPU format; read-back skipped");
         return;
     }
-    const uint32_t mip = sub % tex->mip_levels();
-    const uint32_t layer = (sub / tex->mip_levels()) % tex->array_layers();
-    const bool is3d = tex->desc().Dimension == ResourceDimension::Texture3D;
-    const uint64_t mip_w = std::max<uint64_t>(1, tex->desc().Width >> mip);
-    const uint32_t mip_h = std::max<uint32_t>(1, tex->desc().Height >> mip);
-    const uint32_t mip_d = is3d ? std::max<uint32_t>(1, tex->desc().DepthOrArraySize >> mip) : 1;
-    GuestBox box{0, 0, 0, static_cast<uint32_t>(mip_w), mip_h, mip_d};
+    GuestBox box{0, 0, 0, sub_info.phys_w, sub_info.phys_h, sub_info.mip_d};
     if (ctx.int_arg(6) != 0 && !com::read_guest(ctx.int_arg(6), box)) {
         note("CopyTextureRegion: unreadable source box");
         return;
     }
-    const uint32_t w = box.right > box.left ? box.right - box.left : 0;
-    const uint32_t h = box.bottom > box.top ? box.bottom - box.top : 0;
-    const uint32_t d = box.back > box.front ? box.back - box.front : 0;
+    if (box.right <= box.left || box.bottom <= box.top || box.back <= box.front) {
+        return;  // empty box is a valid no-op
+    }
+    if ((box.left % l.block_width) != 0 || (box.top % l.block_height) != 0) {
+        note("CopyTextureRegion: read-back source box origin not aligned to format block size");
+        return;
+    }
+    if (box.left >= sub_info.phys_w || box.top >= sub_info.phys_h || box.front >= sub_info.mip_d) {
+        note("CopyTextureRegion: read-back source box origin exceeds subresource dimensions");
+        return;
+    }
+    box.right = std::min(box.right, sub_info.phys_w);
+    box.bottom = std::min(box.bottom, sub_info.phys_h);
+    box.back = std::min(box.back, sub_info.mip_d);
+
+    uint32_t w = align_up_u32(box.right - box.left, l.block_width);
+    uint32_t h = align_up_u32(box.bottom - box.top, l.block_height);
+    uint32_t d = box.back - box.front;
+    w = std::min(w, sub_info.phys_w - box.left);
+    h = std::min(h, sub_info.phys_h - box.top);
+    d = std::min(d, sub_info.is_3d ? (sub_info.mip_d - box.front) : 1u);
     if (w == 0 || h == 0 || d == 0) {
         return;
     }
     const uint32_t dst_x = static_cast<uint32_t>(ctx.int_arg(2));
     const uint32_t dst_y = static_cast<uint32_t>(ctx.int_arg(3));
     const uint32_t dst_z = static_cast<uint32_t>(ctx.int_arg(4));
-    const uint32_t rows = (h + l.block_height - 1) / l.block_height;
-    const uint32_t rows_per_slice = (fp.Height + l.block_height - 1) / l.block_height;
-    const uint64_t row_bytes = uint64_t{(w + l.block_width - 1) / l.block_width} * l.block_bytes;
-    const uint64_t start = dst.PlacedFootprint.Offset + uint64_t{dst_z} * rows_per_slice * fp.RowPitch +
-                           uint64_t{dst_y / l.block_height} * fp.RowPitch +
-                           uint64_t{dst_x / l.block_width} * l.block_bytes;
-    const uint64_t len = uint64_t{d - 1} * rows_per_slice * fp.RowPitch + uint64_t{rows - 1} * fp.RowPitch + row_bytes;
-    if (row_bytes > fp.RowPitch || start + len > buf->desc().Width) {
+    if ((dst_x % l.block_width) != 0 || (dst_y % l.block_height) != 0) {
+        note("CopyTextureRegion: read-back destination origin not aligned to format block size");
+        return;
+    }
+    const uint32_t elem_bytes = l.planes == 2 ? plane_block_bytes(fp.Format, sub_info.plane) : l.block_bytes;
+    const uint32_t rows = (h + l.block_height - 1u) / l.block_height;
+    const uint32_t rows_per_slice = std::max(rows, (fp.Height + l.block_height - 1u) / l.block_height);
+    const uint64_t row_bytes = uint64_t{(w + l.block_width - 1u) / l.block_width} * elem_bytes;
+    const uint64_t slice_stride = uint64_t{rows_per_slice} * uint64_t{fp.RowPitch};
+    const uint64_t rel_start = uint64_t{dst_z} * slice_stride +
+                               uint64_t{dst_y / l.block_height} * fp.RowPitch +
+                               uint64_t{dst_x / l.block_width} * elem_bytes;
+    const uint64_t buf_w = buf->desc().Width;
+    if (row_bytes > fp.RowPitch || dst.PlacedFootprint.Offset > buf_w ||
+        rel_start > buf_w - dst.PlacedFootprint.Offset) {
         note("CopyTextureRegion: read-back region exceeds the destination footprint");
         return;
+    }
+    const uint64_t start = dst.PlacedFootprint.Offset + rel_start;
+    const uint64_t len = uint64_t{d - 1u} * slice_stride + uint64_t{rows - 1u} * fp.RowPitch + row_bytes;
+    if (len > buf_w - start) {
+        note("CopyTextureRegion: read-back region exceeds the destination footprint");
+        return;
+    }
+    const uint32_t origin_z = sub_info.is_3d ? box.front : sub_info.layer;
+    if (is_depth_dxgi_format(tex->desc().Format)) {
+        CommandListAux& aux = aux_of(this);
+        for (const auto& pending : aux.depth_twin.pending_out(tex->id(), sub_info.mip, 1u, origin_z, d)) {
+            aux.depth_twin.note_copied_out(tex->id(), pending.mip, pending.layer);
+            ++aux.depth_srv_sync_flushes;
+        }
     }
     pinned_.push_back(com::Ref<com::ComObject>::share(buf));
     pinned_.push_back(com::Ref<com::ComObject>::share(tex));
     GpuReadbackTexturePayload p{};
     p.texture_id = tex->id();
-    p.mip_level = mip;
+    p.mip_level = sub_info.mip;
     p.origin_x = box.left;
     p.origin_y = box.top;
-    p.origin_z = is3d ? box.front : layer;
+    p.origin_z = origin_z;
     p.width = w;
     p.height = h;
     p.depth_or_layers = d;
@@ -1301,10 +1880,66 @@ void CommandList::CopyTextureRegionX(com::CallContext& ctx) {
     CopyTextureRegion(ctx);
 }
 
-void CommandList::ResolveSubresource(com::CallContext&) {
-    if (usable()) {
-        device_->note_unsupported_copy("ResolveSubresource: no resolve packet (skipped)");
+void CommandList::ResolveSubresource(com::CallContext& ctx) {
+    // (pDstResource, DstSubresource, pSrcResource, SrcSubresource, Format)
+    if (!usable()) {
+        return;
     }
+    Resource* dst = as_resource(ctx.int_arg(1));
+    const uint32_t dst_sub_idx = static_cast<uint32_t>(ctx.int_arg(2));
+    Resource* src = as_resource(ctx.int_arg(3));
+    const uint32_t src_sub_idx = static_cast<uint32_t>(ctx.int_arg(4));
+    const uint32_t format = static_cast<uint32_t>(ctx.int_arg(5));
+    va_watch_resource("resolve source (ResolveSubresource)", src,
+                      "to resource id " + std::to_string(dst ? dst->id() : 0));
+    va_watch_resource("resolve destination (ResolveSubresource)", dst,
+                      "from resource id " + std::to_string(src ? src->id() : 0));
+    if (dst == nullptr || src == nullptr || dst->is_buffer() || src->is_buffer() || !dst->has_gpu_texture() ||
+        !src->has_gpu_texture()) {
+        note("ResolveSubresource: invalid source or destination texture");
+        return;
+    }
+    const DxgiFormatLayout fmt_layout = dxgi_format_layout(format);
+    if (format == 0 || !fmt_layout.known || !formats_compatible_for_resolve(format, dst->desc().Format) ||
+        !formats_compatible_for_resolve(format, src->desc().Format)) {
+        note("ResolveSubresource: invalid or incompatible resolve format " + std::to_string(format));
+        return;
+    }
+    SubresourceInfo dst_sub{}, src_sub{};
+    if (!decode_texture_subresource(dst, dst_sub_idx, fmt_layout, &dst_sub) ||
+        !decode_texture_subresource(src, src_sub_idx, fmt_layout, &src_sub)) {
+        note("ResolveSubresource: subresource index out of range");
+        return;
+    }
+    if (dst->desc().Dimension != ResourceDimension::Texture2D || src->desc().Dimension != ResourceDimension::Texture2D ||
+        dst->desc().SampleCount > 1u || dst_sub.mip_w != src_sub.mip_w || dst_sub.mip_h != src_sub.mip_h) {
+        note("ResolveSubresource: incompatible texture dimensions or sample counts");
+        return;
+    }
+
+    pinned_.push_back(com::Ref<com::ComObject>::share(src));
+    pinned_.push_back(com::Ref<com::ComObject>::share(dst));
+    CommandListAux& aux = aux_of(this);
+    const bool depth_resolve = is_depth_dxgi_format(format) || is_depth_dxgi_format(dst->desc().Format);
+    if (depth_resolve) {
+        aux.depth_twin.note_depth_copied(dst->id(), dst_sub.mip, 1u, dst_sub.layer, 1u);
+    }
+    device_->note_texture_copy_destination(dst->id());
+
+    // Flush pending clears and close any active render pass before emitting the resolve pass.
+    bridge_.ResourceBarrier(0, nullptr);
+
+    const bool src_sampleable = (src->desc().Flags & ResourceFlags::DenyShaderResource) == 0u;
+    const bool dst_attachable =
+        depth_resolve ? ((dst->desc().Flags & ResourceFlags::AllowDepthStencil) != 0u)
+                      : ((dst->desc().Flags & ResourceFlags::AllowRenderTarget) != 0u);
+    if (src->desc().SampleCount > 1u && src_sub.mip == 0u && src_sampleable && dst_attachable &&
+        device_->emit_msaa_resolve(dst->id(), dst_sub.mip, dst_sub.layer, src->id(), src_sub.layer, format, encoder_)) {
+        ++aux.resolves_emitted;
+        return;
+    }
+    ++aux.resolves_fallback;
+    device_->note_unsupported_copy("ResolveSubresource: unsupported resolve configuration (safe fallback)");
 }
 
 void CommandList::ClearUnorderedAccessView(com::CallContext&) {
@@ -1321,7 +1956,11 @@ void CommandList::append_submission(CommandEncoder& out, std::vector<d3d::StateD
     // Root tables over descriptor memory: the GPU reads the slots when the list executes, so they are
     // read again now and the recorded bind groups are rewritten where the title changed them.
     bridge_.refresh_memory_bind_groups(out);
-    for (const DeferredWrite& w : deferred_) {
+    CommandListAux& aux = aux_of(this);
+    for (size_t idx = 0; idx < deferred_.size(); ++idx) {
+        const DeferredWrite& w = deferred_[idx];
+        const CommandListAux::DeferredMeta meta =
+            idx < aux.deferred_meta.size() ? aux.deferred_meta[idx] : CommandListAux::DeferredMeta{};
         std::vector<uint8_t> bytes(static_cast<size_t>(w.size));
         if (!com::read_guest(w.src, bytes.data(), bytes.size())) {
             device_->note_bad_argument("ExecuteCommandLists: copy source " + hex(w.src) + " no longer readable");
@@ -1348,9 +1987,35 @@ void CommandList::append_submission(CommandEncoder& out, std::vector<d3d::StateD
                               w.tex.rows_per_image, bytes.data(), static_cast<uint32_t>(bytes.size()));
         } else {
             count_work(Work::BufferUploads);
-            for (uint64_t off = 0; off < w.size; off += kMaxWriteChunk) {
-                const uint64_t n = std::min(kMaxWriteChunk, w.size - off);
-                out.write_buffer(w.id, static_cast<uint32_t>(w.dst_offset + off), bytes.data() + off,
+            uint64_t write_offset = w.dst_offset;
+            const uint8_t* write_ptr = bytes.data();
+            uint64_t write_size = w.size;
+            std::vector<uint8_t> aligned;
+            if (meta.needs_rmw_align || (write_offset & 3u) != 0u || (write_size & 3u) != 0u) {
+                const uint64_t aligned_start = write_offset & ~uint64_t{3};
+                const uint64_t aligned_end = align_up_u64(write_offset + write_size, 4u);
+                const uint64_t aligned_len = aligned_end - aligned_start;
+                if (aligned_end > UINT32_MAX || (meta.dst_allocated != 0 && aligned_end > meta.dst_allocated)) {
+                    device_->note_bad_argument("ExecuteCommandLists: aligned CopyBufferRegion exceeds destination buffer");
+                    continue;
+                }
+                aligned.assign(static_cast<size_t>(aligned_len), 0u);
+                if (meta.dst_cpu_va != 0) {
+                    const uint64_t readable =
+                        aligned_start < meta.dst_width ? std::min(aligned_len, meta.dst_width - aligned_start) : 0u;
+                    if (readable != 0) {
+                        com::read_guest(meta.dst_cpu_va + aligned_start, aligned.data(), static_cast<size_t>(readable));
+                    }
+                }
+                std::memcpy(aligned.data() + static_cast<size_t>(write_offset - aligned_start), bytes.data(),
+                            bytes.size());
+                write_offset = aligned_start;
+                write_ptr = aligned.data();
+                write_size = aligned_len;
+            }
+            for (uint64_t off = 0; off < write_size; off += kMaxWriteChunk) {
+                const uint64_t n = std::min(kMaxWriteChunk, write_size - off);
+                out.write_buffer(w.id, static_cast<uint32_t>(write_offset + off), write_ptr + off,
                                  static_cast<uint32_t>(n));
             }
         }
@@ -1414,7 +2079,14 @@ void CommandList::RSSetViewports(uint32_t count, uint64_t viewports) {
         note("RSSetViewports: unreadable viewports");
         return;
     }
-    bridge_.RSSetViewports(count, v.data());
+    CommandListAux& aux = aux_of(this);
+    aux.raw_viewports = v;
+    aux.clamped_viewports.resize(count);
+    const uint32_t max_dim = device_->state_bridge().options().max_texture_dimension_2d;
+    for (uint32_t i = 0; i < count; ++i) {
+        aux.clamped_viewports[i] = clamp_viewport_webgpu(v[i], aux.rt_width, aux.rt_height, max_dim);
+    }
+    bridge_.RSSetViewports(count, aux.clamped_viewports.empty() ? nullptr : aux.clamped_viewports.data());
 }
 
 void CommandList::RSSetScissorRects(uint32_t count, uint64_t rects) {
@@ -1427,7 +2099,14 @@ void CommandList::RSSetScissorRects(uint32_t count, uint64_t rects) {
         note("RSSetScissorRects: unreadable rects");
         return;
     }
-    bridge_.RSSetScissorRects(count, r.data());
+    CommandListAux& aux = aux_of(this);
+    aux.raw_scissors = r;
+    aux.clamped_scissors.resize(count);
+    const uint32_t max_dim = device_->state_bridge().options().max_texture_dimension_2d;
+    for (uint32_t i = 0; i < count; ++i) {
+        aux.clamped_scissors[i] = clamp_scissor_webgpu(r[i], aux.rt_width, aux.rt_height, max_dim);
+    }
+    bridge_.RSSetScissorRects(count, aux.clamped_scissors.empty() ? nullptr : aux.clamped_scissors.data());
 }
 
 void CommandList::OMSetBlendFactor(uint64_t factor) {
@@ -1439,12 +2118,19 @@ void CommandList::OMSetBlendFactor(uint64_t factor) {
         note("OMSetBlendFactor: unreadable factor");
         return;
     }
+    for (float& c : f) {
+        c = std::isfinite(c) ? normalize_zero(c) : 0.0f;
+    }
+    CommandListAux& aux = aux_of(this);
+    std::memcpy(aux.blend_factor, f, sizeof(f));
     bridge_.OMSetBlendFactor(f);
 }
 
 void CommandList::OMSetStencilRef(uint32_t ref) {
     if (usable()) {
-        bridge_.OMSetStencilRef(ref);
+        const uint32_t masked = ref & 0xFFu;
+        aux_of(this).stencil_ref = masked;
+        bridge_.OMSetStencilRef(masked);
     }
 }
 
@@ -1622,7 +2308,9 @@ void CommandList::SetComputeRootSignature(InterfaceArg<IRootSignatureHost> signa
     if (signature) {
         pinned_.push_back(com::Ref<com::ComObject>::share(signature.object()));
     }
-    const d3d::Status s = bridge_.SetComputeRootSignature(signature_of(signature));
+    const d3d::RootSignature* sig = signature_of(signature);
+    aux_of(this).compute_root_signature = sig;
+    const d3d::Status s = bridge_.SetComputeRootSignature(sig);
     if (s != d3d::Status::Ok) {
         note(std::string("SetComputeRootSignature: ") + d3d::status_name(s));
     }
@@ -1654,6 +2342,10 @@ void CommandList::SetGraphicsRootSignature(InterfaceArg<IRootSignatureHost> sign
     } while (0)
 
 void CommandList::SetComputeRootDescriptorTable(uint32_t index, uint64_t base) {
+    CommandListAux& aux = aux_of(this);
+    if (index < aux.compute_root_args.size()) {
+        aux.compute_root_args[index] = {1, base};
+    }
     PG6_ROOT_CALL(bridge_.SetComputeRootDescriptorTable(index, d3d::GpuDescriptorHandle{base}), "SetComputeRootDescriptorTable");
 }
 
@@ -1851,8 +2543,67 @@ void CommandList::OMSetRenderTargets(uint32_t count, uint64_t rtvs, bool single_
                                             : handles[i].ptr);
     }
     dsv_handle_ = dsv != 0 ? depth.ptr : 0;
+
+    // Update bound RT/DSV extents and active DSV metadata for viewport/scissor clamping and depth-twin sync.
+    CommandListAux& aux = aux_of(this);
+    uint32_t min_w = UINT32_MAX;
+    uint32_t min_h = UINT32_MAX;
+    auto accumulate_handle = [&](uint64_t cpu_handle) -> const d3d::ViewDescriptor* {
+        if (cpu_handle == 0) {
+            return nullptr;
+        }
+        d3d::ResolvedDescriptor res{};
+        if (device_->heaps().resolve_cpu(d3d::CpuDescriptorHandle{cpu_handle}, &res) != d3d::Status::Ok ||
+            res.heap == nullptr) {
+            return nullptr;
+        }
+        const d3d::ViewDescriptor* v = res.heap->view(res.index);
+        if (v == nullptr || v->resource_id == 0) {
+            return nullptr;
+        }
+        bridge::TextureInfo ti{};
+        if (device_->state_bridge().texture_info(v->resource_id, &ti)) {
+            const uint32_t mw = std::max<uint32_t>(1u, ti.width >> v->first_mip);
+            const uint32_t mh = std::max<uint32_t>(1u, ti.height >> v->first_mip);
+            min_w = std::min(min_w, mw);
+            min_h = std::min(min_h, mh);
+        }
+        return v;
+    };
+    for (uint64_t h : rtv_handles_) {
+        accumulate_handle(h);
+    }
+    aux.bound_dsv = {};
+    if (const d3d::ViewDescriptor* dv = accumulate_handle(dsv_handle_); dv != nullptr) {
+        aux.bound_dsv.resource_id = dv->resource_id;
+        aux.bound_dsv.mip = dv->first_mip;
+        aux.bound_dsv.base_layer = dv->first_array_slice;
+        aux.bound_dsv.layer_count = dv->array_size != 0 ? dv->array_size : 1u;
+        aux.bound_dsv.depth_read_only = (dv->flags & 0x1u) != 0u;  // D3D12_DSV_FLAG_READ_ONLY_DEPTH
+    }
+    aux.rt_width = (min_w != UINT32_MAX) ? min_w : 0u;
+    aux.rt_height = (min_h != UINT32_MAX) ? min_h : 0u;
+
     bridge_.OMSetRenderTargets(count, handles.empty() ? nullptr : handles.data(), single_range,
                                dsv != 0 ? &depth : nullptr);
+
+    // Re-clamp any viewports/scissors set prior to OMSetRenderTargets against the new RT extents.
+    const uint32_t max_dim = device_->state_bridge().options().max_texture_dimension_2d;
+    if (!aux.raw_viewports.empty()) {
+        aux.clamped_viewports.resize(aux.raw_viewports.size());
+        for (size_t i = 0; i < aux.raw_viewports.size(); ++i) {
+            aux.clamped_viewports[i] =
+                clamp_viewport_webgpu(aux.raw_viewports[i], aux.rt_width, aux.rt_height, max_dim);
+        }
+        bridge_.RSSetViewports(static_cast<uint32_t>(aux.clamped_viewports.size()), aux.clamped_viewports.data());
+    }
+    if (!aux.raw_scissors.empty()) {
+        aux.clamped_scissors.resize(aux.raw_scissors.size());
+        for (size_t i = 0; i < aux.raw_scissors.size(); ++i) {
+            aux.clamped_scissors[i] = clamp_scissor_webgpu(aux.raw_scissors[i], aux.rt_width, aux.rt_height, max_dim);
+        }
+        bridge_.RSSetScissorRects(static_cast<uint32_t>(aux.clamped_scissors.size()), aux.clamped_scissors.data());
+    }
 }
 
 void CommandList::ClearDepthStencilView(uint64_t dsv, uint32_t flags, float depth, uint8_t stencil,
@@ -1865,8 +2616,52 @@ void CommandList::ClearDepthStencilView(uint64_t dsv, uint32_t flags, float dept
         note("ClearDepthStencilView: unreadable rects");
         return;
     }
-    bridge_.ClearDepthStencilView(d3d::CpuDescriptorHandle{dsv}, flags, depth, stencil, rect_count,
-                                  r.empty() ? nullptr : r.data());
+    flags &= (bridge::DepthTwinTracker::kClearFlagDepth | bridge::DepthTwinTracker::kClearFlagStencil);
+    if (flags == 0u) {
+        return;  // neither depth nor stencil clear flag set: valid no-op
+    }
+    // WebGPU depthClearValue must be finite and in [0.0, 1.0].
+    const float clean_depth = std::isfinite(depth) ? std::clamp(depth, 0.0f, 1.0f) : 1.0f;
+
+    uint32_t mip_w = device_->state_bridge().options().max_texture_dimension_2d;
+    uint32_t mip_h = mip_w;
+    d3d::ResolvedDescriptor res{};
+    const d3d::ViewDescriptor* dv = nullptr;
+    if (dsv != 0 && device_->heaps().resolve_cpu(d3d::CpuDescriptorHandle{dsv}, &res) == d3d::Status::Ok &&
+        res.heap != nullptr) {
+        dv = res.heap->view(res.index);
+        if (dv != nullptr && dv->resource_id != 0) {
+            bridge::TextureInfo ti{};
+            if (device_->state_bridge().texture_info(dv->resource_id, &ti)) {
+                mip_w = std::max<uint32_t>(1u, ti.width >> dv->first_mip);
+                mip_h = std::max<uint32_t>(1u, ti.height >> dv->first_mip);
+            }
+        }
+    }
+
+    std::vector<pso::D3D12Rect> clamped_rects;
+    if (rect_count > 0) {
+        clamped_rects.reserve(rect_count);
+        for (const pso::D3D12Rect& rect : r) {
+            const pso::D3D12Rect c = clamp_scissor_webgpu(rect, mip_w, mip_h, mip_w > mip_h ? mip_w : mip_h);
+            if (c.right > c.left && c.bottom > c.top) {
+                clamped_rects.push_back(c);
+            }
+        }
+        if (clamped_rects.empty()) {
+            return;  // all clear rects fell outside the DSV extents
+        }
+    }
+
+    if ((flags & bridge::DepthTwinTracker::kClearFlagDepth) != 0u && dv != nullptr && dv->resource_id != 0) {
+        const uint32_t layers = dv->array_size != 0 ? dv->array_size : 1u;
+        aux_of(this).depth_twin.note_depth_cleared(dv->resource_id, flags, dv->first_mip, 1u, dv->first_array_slice,
+                                                   layers, /*full_subresource=*/rect_count == 0u);
+    }
+
+    bridge_.ClearDepthStencilView(d3d::CpuDescriptorHandle{dsv}, flags, clean_depth, stencil,
+                                  static_cast<uint32_t>(clamped_rects.size()),
+                                  clamped_rects.empty() ? nullptr : clamped_rects.data());
 }
 
 void CommandList::ClearRenderTargetView(uint64_t rtv, uint64_t color, uint32_t rect_count, uint64_t rects) {
