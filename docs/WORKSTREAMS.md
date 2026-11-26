@@ -76,6 +76,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Since #1387: boot report gets an audio section (#1389); menu-flow-3 gets past the TERMS OF SERVICE screen (#1403); XGameSave slot 16 (CreateContainer) on the local provider (#1412).
   - Since #1415: lifter keeps registers a direct callee never touches out of the state (#1430) and skips flags overwritten before any reader (#1436); audio report counts spatial passes in non_silent_fraction (#1433), XApu codec census and per-type command counters (#1444); XGameSave slot 15 truthful E_NOTIMPL with file-backed container info (#1435); guest sync: uncontended CS/SRW fast paths and spin-before-park (#1441), per-object dispatcher locks and FIFO wait-block handoff (#1455); R51 overflow test fixed after PE parser hardening (#1443); `--host-input` feeds real XInput pad and keyboard into GameInput (#1456); native build compiles the harness with /MP and drops IR of cache hits (#1458); GPU flush hashes relocated ranges in place, copies only on change (#1461).
   - Since #1466: boot report counts code misses (#1474); content-keyed lift cache in run_native_boot (#1475); XCRDAPI option bit 21 (#1478) and DestinationIsPhysicalPages scatter (#1486); lifter forwards register/flag values (#1479, #1485, #1499, #1504); parallel discovery waves (#1481); screen-synchronised input scripts (#1483); precise host sleeps (#1487).
+  - Since #1506: XApu connect, XTaskQueue pool, XMA2 frame walker, ScheduleFrameEventX, DirectStorage BCPack, launch/PLM and clock-stall fixes (#1509-#1540).
 - [x] **R41 — Boot Report Comparison Tool: Diff Two Native Boot Runs (`tools/compare_boot_reports.py`)** — `DONE` (PR #672, closes #670)
   - Structured diff of two boot reports (milestones, imports, address space, stop, counters, captures) with a pass/fail verdict and noise tolerances.
 - [x] **R42 — Boot Report: Milestone Import Indices, Per-Present Samples and Per-Thread Import Counts in the JSON** — `DONE` (PR #679, closes #673) *(R41 follow-up)*
@@ -158,6 +159,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Measure the lookup's share of frame time on the real boot and add a semantics-preserving per-thread cache for both dispatch modes.
   - Since #1415: XMem per-page write-tracking locks replace the single global mutex (#1445).
   - Since #1466: cheaper write-tracking harvests, GetWriteWatch only in watched reservations (#1476).
+  - Since #1506: queue slot 31 maps all four page-mapping kinds (#1524).
 - [x] **O34 — Local XGameSave Provider Backed by /userdata (`runtime/os`, xgameruntime)** — `DONE` (PR #685, closes #667)
   - Implement provider init, containers and blobs on a configurable host directory mapped to the browser's /userdata; cloud sync reported unavailable.
 - [x] **O35 — Full Sanitizer Sweep of the Runtime Suites (ASan, UBSan, TSan) and Fix What It Finds** — `DONE` (PR #701, closes #669)
@@ -257,6 +259,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Since #1387: lane-indexed heap windows parsed with join-skip counts (#1394); Bridge ABI binding arrays for lane-indexed heap bindings, off by default (#1413).
   - Since #1415: writable bindings joined over declared CBV table slots as UAVs (#1438).
   - Since #1466: root_descriptor sources joined on descriptor-table SGPRs as table slots (#1471); contained SGPRs and f32/u32 vertex reinterpretation in the reflection join (#1505).
+  - Since #1506: default-read vertex inputs joined by reflection (#1513).
 - [x] **G64 — Upload Every Mip and Array Slice of Console-Layout Textures, Including Linear Multi-Mip Chains (`runtime/gpu`)** — `DONE` (PR #676, closes #665) *(G49 follow-up)*
   - Upload all mips and slices through the dirty-tracked path with GFX10 placement; model linear multi-mip chains from measured footprints.
 - [x] **G65 — One Linear Layout Rule for Allocation Size, XG Layout and Upload (`runtime/gpu`, XG)** — `DONE` (PR #689, closes #678) *(G64 follow-up)*
@@ -269,6 +272,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Since #1387: replay_capture auto-trims traces too large for the browser (#1393).
   - Since #1415: storage views convert through an intermediate when the declared format differs (#1416), also for fragment-stage storage textures (#1429) and vertex/mixed stages (#1434); band-wise atlas uploads, trim keeps unrewritten texture writes (#1432); widen reflected dword vertex fetches over adjacent elements, glyph fix (#1446); cheaper per-draw bind group tracking, reuse counters in the boot report (#1448).
   - Since #1466: replay trim keeps texture writes not rewritten within 4 frames (#1482); cached bind groups whose relocated home moved are re-created (#1503).
+  - Since #1506: mesh pipelines, ExecuteIndirect, read-back, DXIL XDAT native code, mip-chain view clamps (#1507-#1542).
 
 ---
 
