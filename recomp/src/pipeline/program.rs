@@ -269,6 +269,8 @@ pub const EXE_MODULE: &str = super::DEFAULT_MODULE;
 pub const HOST_MODULES: &[&str] = &[
     "acphal.dll",
     "amd_fidelityfx_loader_xbox.dll",
+    // Loaded at runtime by the --audio-out render thread (MMCSS "Pro Audio", os/audio_out_wasapi.cpp).
+    "avrt.dll",
     "bink2scarlett.dll",
     "chad.dll",
     "combase.dll",
