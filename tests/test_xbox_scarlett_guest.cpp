@@ -2427,7 +2427,7 @@ void test_xapu() {
     CHECK(static_cast<uint32_t>(fx.dcall(count, {I(handle), I(0)})) == 0);
 }
 
-// R40: connect parameters {streams, commands per stream, memory bytes, options}: a result event in
+// Connect parameters {process, streams, commands per stream, memory bytes, frames, options} (os/xapu_connect.h): a result event in
 // the second qword of the output struct (set for every result), the requested memory size, and
 // queue-full past streams * commands outstanding results.
 void test_xapu_connect_params() {
@@ -2437,7 +2437,7 @@ void test_xapu_connect_params() {
     const uint64_t dequeue = fx.export_address("xapu.dll", "XApuDequeueResult");
     const uint64_t disconnect = fx.export_address("xapu.dll", "XApuDisconnect");
     const uint64_t params = com::guest_alloc(0x18);
-    const uint32_t words[4] = {1, 3, 0x400000, 1};
+    const uint32_t words[6] = {1, 1, 3, 0x400000, 0, 8};
     CHECK(com::write_guest(params, words, sizeof(words)));
     const uint64_t p2 = com::guest_alloc(0x10);
     const uint64_t out = fx.out_slot();

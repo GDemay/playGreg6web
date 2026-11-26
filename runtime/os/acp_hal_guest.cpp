@@ -49,6 +49,7 @@
 #include <utility>
 #include <vector>
 
+#include "os/xapu_connect.h"
 #include "os/xapu_opus.h"
 #include "os/xbox_middleware.h"
 #include "os/xbox_scarlett_guest.h"
@@ -631,8 +632,6 @@ XApuState& xapu() {
 // copies in (0x144F20AD0) and base + 0x14000 + s * 0x1E00 as its output area (0x144F20B64,
 // 0x144E64B45); the voice free list ends at slot 0x80. So 128 * 0x280 = 0x14000 bytes of input
 // slots followed by 128 * 0x1E00 bytes of output slots.
-constexpr uint64_t kXApuVoiceSlots = 0x80;
-constexpr uint64_t kXApuSharedBytes = kXApuVoiceSlots * 0x280 + kXApuVoiceSlots * 0x1E00;
 
 uint64_t alloc_zeroed(uint64_t bytes) {
     const uint64_t va = com::guest_alloc(bytes);
@@ -645,37 +644,15 @@ uint64_t alloc_zeroed(uint64_t bytes) {
     return va;
 }
 
-// Connect parameters (R40), read defensively: {u32 streams, u32 commands per stream, u32 memory
-// bytes, u32 options}. Options bit 0 asks for an auto-reset result event, written to the second
-// qword of the output struct. Zero or implausible values fall back to the fixed 128-slot layout
-// with no queue limit and no event.
-constexpr uint32_t kXApuOptionResultEvent = 1;
-constexpr uint32_t kXApuMaxStreams = 4096;
-constexpr uint32_t kXApuMaxCommandsPerStream = 4096;
-constexpr uint32_t kXApuMaxMemoryBytes = 64u << 20;
+// Connect parameters: see os/xapu_connect.h (six u32 words, layout verified against the title's call).
 constexpr HResult kXApuQueueFull = static_cast<HResult>(0x8007006Cu);
 
-struct XApuConnectParams {
-    uint64_t memory_bytes = kXApuSharedBytes;
-    size_t outstanding_limit = 0;
-    bool result_event = false;
-};
-
-XApuConnectParams parse_connect_params(uint64_t params) {
-    XApuConnectParams r;
-    uint32_t w[4] = {};
+xapu_connect::Params parse_connect_params(uint64_t params) {
+    uint32_t w[6] = {};
     if (!com::read_guest(params, w, sizeof(w))) {
-        return r;
+        return {};
     }
-    if (w[0] != 0 && w[0] <= kXApuMaxStreams && w[1] != 0 && w[1] <= kXApuMaxCommandsPerStream) {
-        r.outstanding_limit = size_t{w[0]} * w[1];
-    }
-    // The voice slots are addressed at fixed offsets, so never go below the fixed layout.
-    if (w[2] > kXApuSharedBytes && w[2] <= kXApuMaxMemoryBytes) {
-        r.memory_bytes = w[2];
-    }
-    r.result_event = (w[3] & kXApuOptionResultEvent) != 0;
-    return r;
+    return xapu_connect::parse(w);
 }
 
 void signal_result_event(uint64_t handle) {  // the caller holds the lock
@@ -692,8 +669,8 @@ HResult xapu_connect(uint64_t params, GuestPtr<uint64_t> shared, OutPtr out) {
     if (params == 0 || shared.is_null()) {
         return com::E_INVALIDARG_HR;
     }
-    // PG6_AUDIO_TRACE=1: the first connect logs the raw bytes of the parameter struct (the field
-    // layout {streams, commands per stream, memory bytes, options} is an assumption, not seen).
+    // PG6_AUDIO_TRACE=1: the first connect logs the raw bytes of the parameter struct (the layout is
+    // documented in os/xapu_connect.h).
     {
         static std::atomic<bool> logged{false};
         const char* trace = std::getenv("PG6_AUDIO_TRACE");
@@ -713,7 +690,7 @@ HResult xapu_connect(uint64_t params, GuestPtr<uint64_t> shared, OutPtr out) {
         }
     }
     const uint64_t handle = com::guest_alloc(64);
-    const XApuConnectParams cp = parse_connect_params(params);
+    const xapu_connect::Params cp = parse_connect_params(params);
     const uint64_t memory = alloc_zeroed(cp.memory_bytes);
     if (handle == 0 || memory == 0) {
         if (handle != 0) {
