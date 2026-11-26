@@ -100,6 +100,7 @@
 #include "gpu/drop_table.h"
 #include "gpu/pipeline_prewarm_host.h"
 #include "gpu/gpu_time.h"
+#include "gpu/present_pacing.h"
 #include "gpu/d3d12_xs_exports.h"
 #include "gpu/d3d12_xs_xbox.h"
 #include "gpu/frame_capture.h"
@@ -113,7 +114,9 @@
 #endif
 #include "guest/input_script.h"
 #include "gpu/gpu_va_watch.h"
+#include "gpu/present_pacing.h"
 #include "os/guest_heap.h"
+#include "os/host_sleep.h"
 #include "guest/boot.h"
 #include "os/httpfs_mailbox.h"
 #include "os/image_loader.h"
@@ -764,7 +767,8 @@ std::atomic<bool> g_window_focused{true};
 std::atomic<playgta6::guest::host_input::HostInputSource*> g_host_source{nullptr};
 std::mutex g_live_final_mutex;
 std::string g_live_final_stats = "null";  // the executor's stats_json, captured when the pump stops
-std::atomic<bool> g_live_deadline_active{false};  // the --max-ms watcher thread of a live run
+std::atomic<bool> g_live_deadline_active{false};
+std::atomic<bool> g_live_stats_active{false};  // the 5 s [live] fps line thread  // the --max-ms watcher thread of a live run
 std::atomic<bool> g_guest_faulted{false};  // set before the window is held open on a fault
 
 // Window title on the pump thread, about 4 times a second: fps, frames presented, draws per frame
@@ -876,6 +880,34 @@ bool start_live_window() {
     }
     g_live_started = true;
     playgta6::os::set_wgpu_submit_observer(&live_observer);
+    // Every 5 s: where the frame time goes (so a run below 60 fps names its cap): presents/s, the share of
+    // wall time the guest's submit() was blocked behind a full executor queue, and the share it slept in
+    // the present pacer (title-driven waits). Neither high = the guest's own CPU is the limit.
+    g_live_stats_active.store(true);
+    std::thread([] {
+        namespace gp = playgta6::gpu;
+        auto prev_t = std::chrono::steady_clock::now();
+        ne::LivePumpStats prev = g_live.stats();
+        gp::PresentPacer::Stats prev_p = gp::present_pacer().stats();
+        while (g_live_stats_active.load() && !g_live.window_closed()) {
+            for (int i = 0; i < 50 && g_live_stats_active.load(); ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (!g_live_stats_active.load()) break;
+            const auto now = std::chrono::steady_clock::now();
+            const ne::LivePumpStats cur = g_live.stats();
+            const gp::PresentPacer::Stats cp = gp::present_pacer().stats();
+            const double secs = std::chrono::duration<double>(now - prev_t).count();
+            std::fprintf(stderr,
+                         "[live] %.1f fps, submit blocked %.1f%%, pacer slept %.1f%%, queue max %llu, interval %u\n",
+                         static_cast<double>(cur.presents - prev.presents) / secs,
+                         100.0 * static_cast<double>(cur.blocked_ns - prev.blocked_ns) / (secs * 1e9),
+                         100.0 * static_cast<double>(cp.wait_us - prev_p.wait_us) / (secs * 1e6),
+                         static_cast<unsigned long long>(cur.max_queue_depth), cp.last_interval);
+            prev_t = now;
+            prev = cur;
+            prev_p = cp;
+        }
+    }).detach();
     // --max-ms must end a live run even while the guest is blocked behind the executor (the boot's own
     // limit is only checked on indirect dispatches, which a thread stuck in submit never reaches).
     if (g_options.max_ms != 0) {
@@ -912,6 +944,7 @@ void hold_window_on_fault(bool faulted) {
 void stop_live_window() {
     if (!g_live_started) return;
     g_live_deadline_active.store(false);
+    g_live_stats_active.store(false);
     playgta6::os::set_wgpu_submit_observer(nullptr);
     g_live.stop();
     const ne::LivePumpStats s = g_live.stats();
@@ -1249,6 +1282,7 @@ int main(int argc, char** argv) {
         usage();
         return kExitUsage;
     }
+    os::host_sleep::raise_timer_resolution();  // guest timed waits otherwise wake on the 15.6 ms tick
     os::scarlett::guest_api::set_dstorage_worker_threads(static_cast<uint32_t>(g_options.dstorage_workers));
     {
         // BCPack tables: user-supplied only (docs/BCPACK.md). A bad --bcpack-tables file is a usage

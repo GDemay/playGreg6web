@@ -1,6 +1,8 @@
 // Present pacing against a 60 Hz vblank clock (O36, gpu/present_pacing.h), on a fake clock.
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <cstdio>
 #include <vector>
 
@@ -216,6 +218,23 @@ void test_host_sleep_is_precise() {
     CHECK(median < 6000);
 }
 
+// A timed condition-variable wait (what the guest's WaitForSingleObject timeouts use) wakes near its
+// timeout once the timer resolution is raised, not on the 15.6 ms tick. Median of 15 waits of 4 ms.
+void test_timer_resolution_raised() {
+    playgta6::os::host_sleep::raise_timer_resolution();
+    std::mutex m;
+    std::condition_variable cv;
+    std::vector<int64_t> us;
+    for (int i = 0; i < 15; ++i) {
+        std::unique_lock<std::mutex> lock(m);
+        const auto t0 = Clock::now();
+        cv.wait_until(lock, t0 + std::chrono::milliseconds(4));
+        us.push_back(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count());
+    }
+    std::sort(us.begin(), us.end());
+    CHECK(us[us.size() / 2] < 10000);
+}
+
 int main() {
     std::printf("test_present_pacing\n");
     test_vblank_clock();
@@ -227,6 +246,7 @@ int main() {
     test_title_driven_interval_zero_remains_immediate();
     test_present_samples_ring();
     test_host_sleep_is_precise();
+    test_timer_resolution_raised();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_present_pacing: %d failure(s)\n", g_failures);
         return 1;
