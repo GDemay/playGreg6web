@@ -105,10 +105,10 @@ There is no package-licence or entitlement answer anywhere: no slot returns a li
 3. Which HRESULT slot 71/72 should settle on long term (see section 2).
 4. Any policy for XStore slots 20/21/22/65/68 if the boot reaches them.
 
-## 7. Pending owner decisions: device id and XUser sign-in state
+## 7. Pending owner decisions: device id, XUser sign-in state and XStore licence
 
 Behaviour-only summary of a static analysis of the title's call sites. No addresses, bytes or extracted data
-are recorded. **Nothing below is implemented until the owner decides**; both slots still trap today.
+are recorded. **Nothing below is implemented until the owner decides**; the slots still trap today.
 
 ### 7.1 XSystemGetAppSpecificDeviceId (XSystem slot 5)
 
@@ -157,3 +157,36 @@ no tokens, no online services.
 
 Confidence: high for the call sites and error handling; medium for "the built text is never read" and the exact
 meaning of the cleared list. No dynamic run backs this.
+
+### 7.3 XStore licence slots (20, 22, 23, 28, 65, 67, 69)
+
+Store, licence and entitlement are owner hard stops. Behaviour only: no addresses or bytes are recorded.
+Nothing below is implemented; the slots still trap today.
+
+Which slots the title reaches:
+- Game licence: slot 28 (query), with follow-ups 29, 66 and 67. The title only reads "is disc", "is trial",
+  "trial owned by this user" and "trial seconds left".
+- Add-on licences: slot 65, then 20 (package) or XStoreExt 71 (durable), then 21/72, 22 and 68. XStoreExt 71/72 is
+  already answered.
+- Slots 22, 23 and 66-69 are only reached after a success (a licence handle or a received game licence exists).
+  If the runtime never claims a success, the title never gets there.
+- No store call is made until a local user is active; with no active user the title marks the request
+  "unavailable" itself. This decision therefore follows the XUser decision (7.2): the stops appear once a user
+  is active.
+
+What the title does on failure (synchronous or asynchronous; no error screen found in the traced code):
+- Game licence: it behaves as a full, non-trial, non-disc game and retries quietly in the background
+  (roughly 120 s, interval not certain). There is nothing to gain from claiming a licence.
+- Add-on licences: the item is treated as unavailable. Most errors are retried up to 4 more times, then
+  "unavailable"; a failed start or failed slot 65 goes to "unavailable" at once.
+
+| Option | Consequence |
+|---|---|
+| A. Truthful offline answers: slot 28 returns the offline code 0x800704CF, slot 65 returns "not found"; all other slots keep trapping (recommended) | Title runs as the full game, add-ons unavailable, no claim about ownership or sign-in. Trapping slots stay as a tripwire: a hit there means something claimed a success. Same pattern as the slot 71 decision. |
+| B. Fail the whole store context at creation (xcl-style) | Title skips both flows itself; fewest store calls. XStoreCreateContext is implemented and has other callers (product and catalogue paths) that were not traced, so other stops may move. |
+| C. Anything that claims ownership, licence or entitlement (success from 28/29, licence handles, slot 22 true, active add-ons) | Rejected. The title does not need it, and it is a hard stop. |
+
+Recommendation: **A**.
+
+Confidence: high for the state machines and the result codes they test; medium for "no error screen" (not every
+consumer of the add-on callback was traced) and the exact retry interval.
