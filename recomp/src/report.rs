@@ -7,7 +7,9 @@ use std::fmt::Write as _;
 
 use playgta6_recomp::pipeline::ShardRecord;
 use playgta6_recomp::summary::{
-    CoverageSummary, RankedCount, format_top_n, percentage_2dp, rank_top_n, sanitize_label,
+    CoverageSummary, FunctionSizeStats, RankedCount, V8_MAX_WASM_FUNCTION_BODY_BYTES,
+    V8_MAX_WASM_FUNCTION_LOCALS, V8_MAX_WASM_MODULE_BYTES, Wasm64HeadroomReport, format_top_n,
+    mib_2dp, percentage_2dp, percentage_u64_2dp, rank_top_n, ratio_2dp, sanitize_label,
 };
 
 use crate::pe::{ImportedSymbol, Pe64};
@@ -1114,6 +1116,282 @@ impl ShardBalanceSummary {
         out.push('\n');
         out
     }
+
+    /// Total shard size in MiB, rounded half-up to 2 decimal places.
+    pub fn total_bytes_mib(&self) -> f64 {
+        mib_2dp(self.total_bytes)
+    }
+
+    /// Heaviest shard size in MiB, rounded half-up to 2 decimal places.
+    pub fn max_shard_bytes_mib(&self) -> f64 {
+        mib_2dp(self.max_shard_bytes)
+    }
+
+    /// Remaining total byte headroom under [`V8_MAX_WASM_MODULE_BYTES`] (`0` when at or over cap).
+    pub fn v8_module_headroom_bytes(&self) -> u64 {
+        V8_MAX_WASM_MODULE_BYTES.saturating_sub(self.total_bytes)
+    }
+
+    /// Total shard byte utilization against [`V8_MAX_WASM_MODULE_BYTES`] (`0.00..=100.00`).
+    pub fn v8_module_utilization_pct(&self) -> f64 {
+        percentage_u64_2dp(self.total_bytes, V8_MAX_WASM_MODULE_BYTES)
+    }
+
+    /// Returns `true` if `total_bytes` strictly exceeds [`V8_MAX_WASM_MODULE_BYTES`].
+    pub fn exceeds_v8_module_cap(&self) -> bool {
+        self.total_bytes > V8_MAX_WASM_MODULE_BYTES
+    }
+
+    /// Ratio `min_shard_functions / max_shard_functions`, rounded half-up to 2dp (`0.0` when max is 0).
+    pub fn min_to_max_function_ratio(&self) -> f64 {
+        if self.max_shard_functions == 0 {
+            return 0.0;
+        }
+        ratio_2dp(
+            self.min_shard_functions as u64,
+            self.max_shard_functions as u64,
+        )
+    }
+
+    /// Ratio `min_shard_bytes / max_shard_bytes`, rounded half-up to 2dp (`0.0` when max is 0).
+    pub fn min_to_max_byte_ratio(&self) -> f64 {
+        if self.max_shard_bytes == 0 {
+            return 0.0;
+        }
+        ratio_2dp(self.min_shard_bytes, self.max_shard_bytes)
+    }
+
+    /// Returns up to `top_n` heaviest shards sorted deterministically by
+    /// `bytes desc, functions desc, name asc`.
+    pub fn heaviest_shards(&self, top_n: usize) -> Vec<&ShardEntry> {
+        if top_n == 0 || self.shards.is_empty() {
+            return Vec::new();
+        }
+        let mut refs: Vec<&ShardEntry> = self.shards.iter().collect();
+        refs.sort_by(|a, b| {
+            b.bytes
+                .cmp(&a.bytes)
+                .then_with(|| b.functions.cmp(&a.functions))
+                .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        refs.truncate(top_n);
+        refs
+    }
+
+    /// Renders a sanitized Markdown Wasm64 shard & V8 headroom report against `module_cap_bytes`
+    /// and optional largest function body bytes / max function locals.
+    pub fn render_headroom_markdown(
+        &self,
+        module_cap_bytes: u64,
+        largest_fn_bytes: Option<u64>,
+        max_locals: Option<usize>,
+    ) -> String {
+        let module_headroom_bytes = module_cap_bytes.saturating_sub(self.total_bytes);
+        let module_util_pct = percentage_u64_2dp(self.total_bytes, module_cap_bytes);
+        let exceeds_module_cap = self.total_bytes > module_cap_bytes;
+        let within_caps = !exceeds_module_cap
+            && largest_fn_bytes.is_none_or(|b| b <= V8_MAX_WASM_FUNCTION_BODY_BYTES)
+            && max_locals.is_none_or(|l| l <= V8_MAX_WASM_FUNCTION_LOCALS);
+        let status = if within_caps {
+            "within-caps"
+        } else {
+            "over-cap"
+        };
+
+        let mut out = String::with_capacity(512);
+        let _ = writeln!(out, "### Wasm64 Shard & V8 Headroom");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "| Metric | Value |");
+        let _ = writeln!(out, "| --- | ---: |");
+        let _ = writeln!(out, "| Shards | {} |", self.shard_count);
+        let _ = writeln!(
+            out,
+            "| Total Bytes | {} ({:.2} MiB) |",
+            self.total_bytes,
+            self.total_bytes_mib()
+        );
+        let _ = writeln!(
+            out,
+            "| Module Cap | {} ({:.2} MiB) |",
+            module_cap_bytes,
+            mib_2dp(module_cap_bytes)
+        );
+        let _ = writeln!(
+            out,
+            "| Module Headroom | {} ({:.2} MiB) |",
+            module_headroom_bytes,
+            mib_2dp(module_headroom_bytes)
+        );
+        let _ = writeln!(out, "| Module Utilization | {:.2}% |", module_util_pct);
+        let _ = writeln!(
+            out,
+            "| Max Shard Bytes | {} ({:.2} MiB) |",
+            self.max_shard_bytes,
+            self.max_shard_bytes_mib()
+        );
+        let _ = writeln!(
+            out,
+            "| Min/Max Function Ratio | {:.2} |",
+            self.min_to_max_function_ratio()
+        );
+        let _ = writeln!(
+            out,
+            "| Min/Max Byte Ratio | {:.2} |",
+            self.min_to_max_byte_ratio()
+        );
+        let _ = writeln!(out, "| Function Skew Ratio | {:.2}x |", self.skew_ratio);
+        let _ = writeln!(out, "| Byte Skew Ratio | {:.2}x |", self.byte_skew_ratio);
+        if let Some(fn_bytes) = largest_fn_bytes {
+            let fn_headroom = V8_MAX_WASM_FUNCTION_BODY_BYTES.saturating_sub(fn_bytes);
+            let fn_util = percentage_u64_2dp(fn_bytes, V8_MAX_WASM_FUNCTION_BODY_BYTES);
+            let _ = writeln!(
+                out,
+                "| Largest Function Body | {} / {} bytes ({:.2}%, headroom {} bytes) |",
+                fn_bytes, V8_MAX_WASM_FUNCTION_BODY_BYTES, fn_util, fn_headroom
+            );
+        }
+        if let Some(locals) = max_locals {
+            let locals_headroom = V8_MAX_WASM_FUNCTION_LOCALS.saturating_sub(locals);
+            let locals_util = percentage_2dp(locals, V8_MAX_WASM_FUNCTION_LOCALS);
+            let _ = writeln!(
+                out,
+                "| Max Function Locals | {} / {} ({:.2}%, headroom {}) |",
+                locals, V8_MAX_WASM_FUNCTION_LOCALS, locals_util, locals_headroom
+            );
+        }
+        let _ = writeln!(out, "| V8 Cap Status | {status} |");
+
+        let heaviest = self.heaviest_shards(self.shards.len());
+        if !heaviest.is_empty() {
+            let _ = writeln!(out);
+            let _ = writeln!(out, "| Heaviest Shard | Functions | Bytes | MiB |");
+            let _ = writeln!(out, "| --- | ---: | ---: | ---: |");
+            for shard in heaviest {
+                let clean_name = sanitize_source_label(&shard.name);
+                let _ = writeln!(
+                    out,
+                    "| `{}` | {} | {} | {:.2} |",
+                    md_table_cell(&clean_name),
+                    shard.functions,
+                    shard.bytes,
+                    mib_2dp(shard.bytes),
+                );
+            }
+        }
+        out
+    }
+
+    /// Renders a sanitized RFC 8259 JSON Wasm64 headroom report with strictly sorted top-level ASCII keys.
+    pub fn render_headroom_json(
+        &self,
+        module_cap_bytes: u64,
+        largest_fn_bytes: Option<u64>,
+        max_locals: Option<usize>,
+    ) -> String {
+        let module_headroom_bytes = module_cap_bytes.saturating_sub(self.total_bytes);
+        let module_util_pct = percentage_u64_2dp(self.total_bytes, module_cap_bytes);
+        let exceeds_module_cap = self.total_bytes > module_cap_bytes;
+        let within_caps = !exceeds_module_cap
+            && largest_fn_bytes.is_none_or(|b| b <= V8_MAX_WASM_FUNCTION_BODY_BYTES)
+            && max_locals.is_none_or(|l| l <= V8_MAX_WASM_FUNCTION_LOCALS);
+
+        let fn_body_headroom = largest_fn_bytes
+            .map(|b| V8_MAX_WASM_FUNCTION_BODY_BYTES.saturating_sub(b).to_string())
+            .unwrap_or_else(|| "null".to_string());
+        let fn_body_util = largest_fn_bytes
+            .map(|b| format!("{:.2}", percentage_u64_2dp(b, V8_MAX_WASM_FUNCTION_BODY_BYTES)))
+            .unwrap_or_else(|| "null".to_string());
+        let largest_fn_json = largest_fn_bytes
+            .map(|b| b.to_string())
+            .unwrap_or_else(|| "null".to_string());
+
+        let locals_headroom = max_locals
+            .map(|l| V8_MAX_WASM_FUNCTION_LOCALS.saturating_sub(l).to_string())
+            .unwrap_or_else(|| "null".to_string());
+        let locals_util = max_locals
+            .map(|l| format!("{:.2}", percentage_2dp(l, V8_MAX_WASM_FUNCTION_LOCALS)))
+            .unwrap_or_else(|| "null".to_string());
+        let max_locals_json = max_locals
+            .map(|l| l.to_string())
+            .unwrap_or_else(|| "null".to_string());
+
+        let heaviest = self.heaviest_shards(self.shards.len());
+
+        let mut out = String::with_capacity(1024);
+        out.push_str("{\n");
+        let _ = writeln!(out, "  \"byte_skew_ratio\": {:.2},", self.byte_skew_ratio);
+        let _ = writeln!(out, "  \"exceeds_module_cap\": {exceeds_module_cap},");
+        let _ = writeln!(
+            out,
+            "  \"function_body_cap_bytes\": {},",
+            V8_MAX_WASM_FUNCTION_BODY_BYTES
+        );
+        let _ = writeln!(
+            out,
+            "  \"function_body_headroom_bytes\": {fn_body_headroom},"
+        );
+        let _ = writeln!(out, "  \"function_body_utilization_pct\": {fn_body_util},");
+        let _ = writeln!(
+            out,
+            "  \"function_locals_cap\": {},",
+            V8_MAX_WASM_FUNCTION_LOCALS
+        );
+        if heaviest.is_empty() {
+            out.push_str("  \"heaviest_shards\": [],\n");
+        } else {
+            out.push_str("  \"heaviest_shards\": [\n");
+            for (idx, shard) in heaviest.iter().enumerate() {
+                let comma = if idx + 1 < heaviest.len() { "," } else { "" };
+                let clean_name = sanitize_source_label(&shard.name);
+                let _ = writeln!(
+                    out,
+                    "    {{\"bytes\": {}, \"bytes_mib\": {:.2}, \"functions\": {}, \"name\": {}}}{comma}",
+                    shard.bytes,
+                    mib_2dp(shard.bytes),
+                    shard.functions,
+                    json_str(&clean_name),
+                );
+            }
+            out.push_str("  ],\n");
+        }
+        let _ = writeln!(out, "  \"largest_function_body_bytes\": {largest_fn_json},");
+        let _ = writeln!(out, "  \"locals_headroom\": {locals_headroom},");
+        let _ = writeln!(out, "  \"locals_utilization_pct\": {locals_util},");
+        let _ = writeln!(out, "  \"max_function_locals\": {max_locals_json},");
+        let _ = writeln!(out, "  \"max_shard_bytes\": {},", self.max_shard_bytes);
+        let _ = writeln!(
+            out,
+            "  \"max_shard_bytes_mib\": {:.2},",
+            self.max_shard_bytes_mib()
+        );
+        let _ = writeln!(
+            out,
+            "  \"min_to_max_byte_ratio\": {:.2},",
+            self.min_to_max_byte_ratio()
+        );
+        let _ = writeln!(
+            out,
+            "  \"min_to_max_function_ratio\": {:.2},",
+            self.min_to_max_function_ratio()
+        );
+        let _ = writeln!(out, "  \"module_cap_bytes\": {module_cap_bytes},");
+        let _ = writeln!(out, "  \"module_cap_mib\": {:.2},", mib_2dp(module_cap_bytes));
+        let _ = writeln!(out, "  \"module_headroom_bytes\": {module_headroom_bytes},");
+        let _ = writeln!(
+            out,
+            "  \"module_headroom_mib\": {:.2},",
+            mib_2dp(module_headroom_bytes)
+        );
+        let _ = writeln!(out, "  \"module_utilization_pct\": {:.2},", module_util_pct);
+        let _ = writeln!(out, "  \"shard_count\": {},", self.shard_count);
+        let _ = writeln!(out, "  \"skew_ratio\": {:.2},", self.skew_ratio);
+        let _ = writeln!(out, "  \"total_bytes\": {},", self.total_bytes);
+        let _ = writeln!(out, "  \"total_bytes_mib\": {:.2},", self.total_bytes_mib());
+        let _ = writeln!(out, "  \"within_caps\": {within_caps}");
+        out.push_str("}\n");
+        out
+    }
 }
 
 #[allow(dead_code)]
@@ -1563,6 +1841,310 @@ fn write_ranked_json(
         );
     }
     let _ = writeln!(out, "  ]{comma_end}");
+}
+
+#[allow(dead_code)]
+fn write_indented_json_block(out: &mut String, block: &str, indent_spaces: usize) {
+    let prefix = " ".repeat(indent_spaces);
+    let trimmed = block.trim_end_matches(['\r', '\n']);
+    for (idx, line) in trimmed.lines().enumerate() {
+        if idx == 0 {
+            out.push_str(line);
+        } else {
+            out.push('\n');
+            out.push_str(&prefix);
+            out.push_str(line);
+        }
+    }
+}
+
+/// Sanitized combined report for function-size distribution, optional Wasm64 V8 headroom,
+/// and optional Wasm64 shard balance.
+///
+/// Outputs addresses, counts, ratios, byte sizes, and sanitized labels only — never host paths
+/// or raw binary bytes.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionHeadroomReport {
+    pub source: String,
+    pub function_sizes: FunctionSizeStats,
+    pub wasm64_headroom: Option<Wasm64HeadroomReport>,
+    pub shard_balance: Option<ShardBalanceSummary>,
+}
+
+#[allow(dead_code)]
+impl FunctionHeadroomReport {
+    /// Creates a new sanitized report from a source label and [`FunctionSizeStats`].
+    pub fn new(source_label: &str, function_sizes: FunctionSizeStats) -> Self {
+        Self {
+            source: sanitize_source_label(source_label),
+            function_sizes,
+            wasm64_headroom: None,
+            shard_balance: None,
+        }
+    }
+
+    /// Attaches a [`Wasm64HeadroomReport`] to this report.
+    pub fn with_wasm64_headroom(mut self, headroom: Wasm64HeadroomReport) -> Self {
+        self.wasm64_headroom = Some(headroom);
+        self
+    }
+
+    /// Attaches a [`ShardBalanceSummary`] to this report.
+    pub fn with_shard_balance(mut self, balance: ShardBalanceSummary) -> Self {
+        self.shard_balance = Some(balance);
+        self
+    }
+
+    /// Renders a crisp, deterministic, sanitized one-line summary.
+    pub fn render_one_line(&self) -> String {
+        let source = sanitize_source_label(&self.source);
+        let mut out = format!("[{source}] {}", self.function_sizes.render_one_line());
+        if let Some(ref headroom) = self.wasm64_headroom {
+            let _ = write!(out, " | {}", headroom.render_one_line());
+        }
+        if let Some(ref balance) = self.shard_balance {
+            let _ = write!(out, " | {}", balance.render_one_line());
+        }
+        out
+    }
+
+    /// Renders a sanitized, deterministically ordered Markdown report.
+    pub fn render_markdown(&self) -> String {
+        let source = sanitize_source_label(&self.source);
+        let mut out = String::with_capacity(1024);
+        let _ = writeln!(
+            out,
+            "## Function Size & Wasm64 Headroom Report — `{}`",
+            md_inline(&source)
+        );
+        let _ = writeln!(out);
+        let _ = writeln!(out, "- {}", md_inline(&self.render_one_line()));
+        let _ = writeln!(out);
+
+        // --- Function Size Distribution ---
+        let fs = &self.function_sizes;
+        let _ = writeln!(out, "### Function Size Distribution");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "| Metric | Value |");
+        let _ = writeln!(out, "| --- | ---: |");
+        let _ = writeln!(out, "| Total Functions | {} |", fs.total_functions);
+        let _ = writeln!(out, "| Total Blocks | {} |", fs.total_blocks);
+        let _ = writeln!(out, "| Total Instructions | {} |", fs.total_instructions);
+        let _ = writeln!(
+            out,
+            "| Min / Max Instructions | {} / {} |",
+            fs.min_instructions, fs.max_instructions
+        );
+        let mean_insns = if fs.mean_instructions.is_finite() {
+            fs.mean_instructions
+        } else {
+            0.0
+        };
+        let _ = writeln!(out, "| Mean Instructions | {:.2} |", mean_insns);
+        let _ = writeln!(
+            out,
+            "| p50 / p95 / p99 Instructions | {} / {} / {} |",
+            fs.p50_instructions, fs.p95_instructions, fs.p99_instructions
+        );
+        let _ = writeln!(
+            out,
+            "| Functions > 1k Instructions | {} |",
+            fs.functions_over_1k_insns
+        );
+        let _ = writeln!(
+            out,
+            "| Functions > 10k Instructions | {} |",
+            fs.functions_over_10k_insns
+        );
+
+        let mut sorted_top = fs.top_functions.clone();
+        sorted_top.sort_by(|a, b| {
+            b.instructions
+                .cmp(&a.instructions)
+                .then_with(|| b.blocks.cmp(&a.blocks))
+                .then_with(|| a.entry.cmp(&b.entry))
+                .then_with(|| b.indirect_calls.cmp(&a.indirect_calls))
+                .then_with(|| b.diagnostics.cmp(&a.diagnostics))
+        });
+        if !sorted_top.is_empty() {
+            let _ = writeln!(out);
+            let _ = writeln!(
+                out,
+                "| Rank | Entry | Instructions | Blocks | Indirect Calls | Diagnostics |"
+            );
+            let _ = writeln!(out, "| ---: | --- | ---: | ---: | ---: | ---: |");
+            for (idx, func) in sorted_top.iter().enumerate() {
+                let _ = writeln!(
+                    out,
+                    "| {} | `0x{:x}` | {} | {} | {} | {} |",
+                    idx + 1,
+                    func.entry,
+                    func.instructions,
+                    func.blocks,
+                    func.indirect_calls,
+                    func.diagnostics,
+                );
+            }
+        }
+
+        // --- Optional Wasm64 V8 Headroom ---
+        if let Some(ref headroom) = self.wasm64_headroom {
+            let status = if headroom.within_v8_caps() {
+                "within-caps"
+            } else {
+                "over-cap"
+            };
+            let _ = writeln!(out);
+            let _ = writeln!(out, "### Wasm64 V8 Headroom");
+            let _ = writeln!(out);
+            let _ = writeln!(out, "| Metric | Value |");
+            let _ = writeln!(out, "| --- | ---: |");
+            let _ = writeln!(out, "| Side Modules | {} |", headroom.side_modules.len());
+            let _ = writeln!(
+                out,
+                "| Total Module Bytes | {} ({:.2} MiB) |",
+                headroom.total_module_bytes,
+                mib_2dp(headroom.total_module_bytes)
+            );
+            let _ = writeln!(
+                out,
+                "| Largest Side Module | {} ({:.2} MiB, {:.2}% of {:.2} MiB cap) |",
+                headroom.largest_module_bytes,
+                mib_2dp(headroom.largest_module_bytes),
+                headroom.module_utilization_pct(),
+                mib_2dp(headroom.module_cap_bytes),
+            );
+            let _ = writeln!(
+                out,
+                "| Min Module Headroom | {} ({:.2} MiB) |",
+                headroom.min_module_headroom_bytes,
+                mib_2dp(headroom.min_module_headroom_bytes),
+            );
+            let _ = writeln!(
+                out,
+                "| Asymmetric Split Ratio | {:.2}x |",
+                headroom.asymmetric_split_ratio()
+            );
+            let _ = writeln!(
+                out,
+                "| Largest Function Body | {} / {} bytes ({:.2}%, headroom {} bytes) |",
+                headroom.largest_function_body_bytes,
+                headroom.function_body_cap_bytes,
+                headroom.function_body_utilization_pct(),
+                headroom.function_body_headroom_bytes(),
+            );
+            let _ = writeln!(
+                out,
+                "| Functions > 1 MiB | {} |",
+                headroom.functions_over_1mib
+            );
+            let _ = writeln!(
+                out,
+                "| Max Function Locals | {} / {} ({:.2}%, headroom {}) |",
+                headroom.max_function_locals,
+                headroom.function_locals_cap,
+                headroom.locals_utilization_pct(),
+                headroom.locals_headroom(),
+            );
+            let _ = writeln!(out, "| V8 Cap Status | {status} |");
+
+            let mut modules_sorted = headroom.side_modules.clone();
+            for m in &mut modules_sorted {
+                m.label = sanitize_source_label(&m.label);
+            }
+            modules_sorted.sort_by(|a, b| {
+                b.bytes
+                    .cmp(&a.bytes)
+                    .then_with(|| b.shards.cmp(&a.shards))
+                    .then_with(|| a.label.to_ascii_lowercase().cmp(&b.label.to_ascii_lowercase()))
+                    .then_with(|| a.label.cmp(&b.label))
+            });
+            if !modules_sorted.is_empty() {
+                let _ = writeln!(out);
+                let _ = writeln!(
+                    out,
+                    "| Side Module | Shards | Bytes | MiB | Cap Util | Headroom (MiB) | Status |"
+                );
+                let _ = writeln!(out, "| --- | ---: | ---: | ---: | ---: | ---: | --- |");
+                for module in &modules_sorted {
+                    let mod_status = if module.exceeds_cap(headroom.module_cap_bytes) {
+                        "over-cap"
+                    } else {
+                        "ok"
+                    };
+                    let _ = writeln!(
+                        out,
+                        "| `{}` | {} | {} | {:.2} | {:.2}% | {:.2} | {mod_status} |",
+                        md_table_cell(&module.label),
+                        module.shards,
+                        module.bytes,
+                        module.bytes_mib(),
+                        module.utilization_pct(headroom.module_cap_bytes),
+                        mib_2dp(module.headroom_bytes(headroom.module_cap_bytes)),
+                    );
+                }
+            }
+        }
+
+        // --- Optional Shard Balance ---
+        if let Some(ref balance) = self.shard_balance {
+            let sanitized_balance = ShardBalanceSummary::from_shards_with_threshold(
+                balance.shards.iter().cloned(),
+                balance.max_skew_threshold,
+            );
+            let _ = writeln!(out);
+            out.push_str(&sanitized_balance.render_markdown());
+        }
+
+        out
+    }
+
+    /// Renders a sanitized RFC 8259 JSON report with strictly sorted top-level ASCII keys.
+    pub fn render_json(&self) -> String {
+        let source = sanitize_source_label(&self.source);
+        let summary_line = self.render_one_line();
+        let function_sizes_json = self.function_sizes.render_json();
+
+        let mut out = String::with_capacity(1024);
+        out.push_str("{\n");
+        out.push_str("  \"function_sizes\": ");
+        write_indented_json_block(&mut out, &function_sizes_json, 2);
+        out.push_str(",\n");
+
+        match &self.shard_balance {
+            Some(balance) => {
+                let sanitized_balance = ShardBalanceSummary::from_shards_with_threshold(
+                    balance.shards.iter().cloned(),
+                    balance.max_skew_threshold,
+                );
+                out.push_str("  \"shard_balance\": ");
+                write_shard_balance_json(&mut out, &sanitized_balance, 2, false);
+                out.push_str(",\n");
+            }
+            None => {
+                out.push_str("  \"shard_balance\": null,\n");
+            }
+        }
+
+        let _ = writeln!(out, "  \"source\": {},", json_str(&source));
+        let _ = writeln!(out, "  \"summary_line\": {},", json_str(&summary_line));
+
+        match &self.wasm64_headroom {
+            Some(headroom) => {
+                let headroom_json = headroom.render_json();
+                out.push_str("  \"wasm64_headroom\": ");
+                write_indented_json_block(&mut out, &headroom_json, 2);
+                out.push('\n');
+            }
+            None => {
+                out.push_str("  \"wasm64_headroom\": null\n");
+            }
+        }
+
+        out.push_str("}\n");
+        out
+    }
 }
 
 #[cfg(test)]
@@ -2345,5 +2927,345 @@ mod tests {
         assert!(json.contains("\"name\": \"shard-00000.wasm\""));
         assert!(json.contains("\"name\": \"shard-00001.wasm\""));
         assert!(json.contains("\"name\": \"shard-00002.wasm\""));
+    }
+
+    #[test]
+    fn shard_balance_headroom_helpers_and_json_validation() {
+        use playgta6_recomp::summary::{FunctionSizeEntry, SideModuleEntry};
+
+        // Empty shard balance: zero-division guards
+        let empty = ShardBalanceSummary::from_function_counts(&[]);
+        assert_eq!(empty.total_bytes_mib(), 0.0);
+        assert_eq!(empty.max_shard_bytes_mib(), 0.0);
+        assert_eq!(empty.v8_module_headroom_bytes(), V8_MAX_WASM_MODULE_BYTES);
+        assert_eq!(empty.v8_module_utilization_pct(), 0.0);
+        assert!(!empty.exceeds_v8_module_cap());
+        assert_eq!(empty.min_to_max_function_ratio(), 0.0);
+        assert_eq!(empty.min_to_max_byte_ratio(), 0.0);
+        assert!(empty.heaviest_shards(5).is_empty());
+
+        let empty_headroom_json =
+            empty.render_headroom_json(V8_MAX_WASM_MODULE_BYTES, None, None);
+        JsonValidator::validate(&empty_headroom_json)
+            .expect("empty headroom JSON must be valid RFC 8259 JSON");
+        let empty_keys = extract_top_level_json_keys(&empty_headroom_json);
+        assert!(empty_keys.len() >= 20);
+        for pair in empty_keys.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "render_headroom_json keys must be strictly sorted: {:?} >= {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        assert!(empty_headroom_json.contains("\"largest_function_body_bytes\": null,"));
+        assert!(empty_headroom_json.contains("\"max_function_locals\": null,"));
+        assert!(empty_headroom_json.contains("\"within_caps\": true"));
+
+        // Non-empty shards with deterministic heaviest_shards tie-breaking
+        let balance = ShardBalanceSummary::from_shards(vec![
+            ShardEntry::new("shard-00002.wasm", 100, 2 * 1024 * 1024),
+            ShardEntry::new("shard-00000.wasm", 200, 4 * 1024 * 1024),
+            ShardEntry::new("shard-00001.wasm", 150, 2 * 1024 * 1024),
+        ]);
+        assert_eq!(balance.total_bytes_mib(), 8.0);
+        assert_eq!(balance.max_shard_bytes_mib(), 4.0);
+        assert_eq!(
+            balance.v8_module_headroom_bytes(),
+            V8_MAX_WASM_MODULE_BYTES - 8 * 1024 * 1024
+        );
+        assert_eq!(balance.v8_module_utilization_pct(), 0.78);
+        assert!(!balance.exceeds_v8_module_cap());
+        assert_eq!(balance.min_to_max_function_ratio(), 0.5);
+        assert_eq!(balance.min_to_max_byte_ratio(), 0.5);
+        assert!(balance.heaviest_shards(0).is_empty());
+        let top2 = balance.heaviest_shards(2);
+        assert_eq!(top2.len(), 2);
+        assert_eq!(top2[0].name, "shard-00000.wasm");
+        assert_eq!(top2[1].name, "shard-00001.wasm"); // tied bytes -> higher functions wins
+
+        let headroom_md = balance.render_headroom_markdown(
+            V8_MAX_WASM_MODULE_BYTES,
+            Some(1_700_000),
+            Some(1_306),
+        );
+        assert!(headroom_md.contains("### Wasm64 Shard & V8 Headroom"));
+        assert!(headroom_md.contains("| V8 Cap Status | within-caps |"));
+        assert!(headroom_md.contains("| `shard-00000.wasm` | 200 |"));
+
+        let headroom_json = balance.render_headroom_json(
+            V8_MAX_WASM_MODULE_BYTES,
+            Some(1_700_000),
+            Some(1_306),
+        );
+        JsonValidator::validate(&headroom_json)
+            .expect("shard headroom JSON must be valid RFC 8259 JSON");
+        let headroom_keys = extract_top_level_json_keys(&headroom_json);
+        for pair in headroom_keys.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "render_headroom_json keys must be strictly sorted: {:?} >= {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        assert!(headroom_json.contains("\"largest_function_body_bytes\": 1700000,"));
+        assert!(headroom_json.contains("\"max_function_locals\": 1306,"));
+        assert!(headroom_json.contains("\"within_caps\": true"));
+
+        // Over-V8-cap shard balance
+        let over_cap = ShardBalanceSummary::from_shards(vec![
+            ShardEntry::new("huge-0.wasm", 10_000, 600 * 1024 * 1024),
+            ShardEntry::new("huge-1.wasm", 10_000, 500 * 1024 * 1024),
+        ]);
+        assert!(over_cap.exceeds_v8_module_cap());
+        assert_eq!(over_cap.v8_module_headroom_bytes(), 0);
+        assert_eq!(over_cap.v8_module_utilization_pct(), 100.0);
+        let over_json = over_cap.render_headroom_json(V8_MAX_WASM_MODULE_BYTES, None, None);
+        JsonValidator::validate(&over_json).expect("over-cap headroom JSON must be valid");
+        assert!(over_json.contains("\"exceeds_module_cap\": true,"));
+        assert!(over_json.contains("\"within_caps\": false"));
+
+        // Validate summary.rs JSON renderers (FunctionSizeStats & Wasm64HeadroomReport) with JsonValidator
+        let fn_stats = FunctionSizeStats::from_entries(
+            vec![
+                FunctionSizeEntry {
+                    entry: 0x0001_4000_1000,
+                    blocks: 50,
+                    instructions: 2_500,
+                    indirect_calls: 4,
+                    diagnostics: 0,
+                },
+                FunctionSizeEntry {
+                    entry: 0x0001_4000_9000,
+                    blocks: 4,
+                    instructions: 30,
+                    indirect_calls: 0,
+                    diagnostics: 1,
+                },
+            ],
+            5,
+        );
+        let fn_json = fn_stats.render_json();
+        JsonValidator::validate(&fn_json).expect("FunctionSizeStats JSON must be valid RFC 8259");
+        let fn_keys = extract_top_level_json_keys(&fn_json);
+        for pair in fn_keys.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "FunctionSizeStats JSON keys must be strictly sorted: {:?} >= {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+
+        let wasm_headroom = Wasm64HeadroomReport::new(
+            vec![
+                SideModuleEntry::new("guest_part_0.wasm", 383, 890 * 1024 * 1024),
+                SideModuleEntry::new("guest_part_2.wasm", 1, 7_025_459),
+            ],
+            1_700_000,
+            1_306,
+            4,
+        );
+        let wasm_json = wasm_headroom.render_json();
+        JsonValidator::validate(&wasm_json)
+            .expect("Wasm64HeadroomReport JSON must be valid RFC 8259");
+        let wasm_keys = extract_top_level_json_keys(&wasm_json);
+        for pair in wasm_keys.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "Wasm64HeadroomReport JSON keys must be strictly sorted: {:?} >= {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn function_headroom_report_order_independence_and_json_key_sorting() {
+        use playgta6_recomp::summary::{FunctionSizeEntry, SideModuleEntry};
+
+        let entries_a = vec![
+            FunctionSizeEntry {
+                entry: 0x0001_4000_4000,
+                blocks: 10,
+                instructions: 500,
+                indirect_calls: 1,
+                diagnostics: 0,
+            },
+            FunctionSizeEntry {
+                entry: 0x0001_4000_2000,
+                blocks: 45,
+                instructions: 12_000,
+                indirect_calls: 6,
+                diagnostics: 0,
+            },
+            FunctionSizeEntry {
+                entry: 0x0001_4000_1000,
+                blocks: 45,
+                instructions: 12_000,
+                indirect_calls: 2,
+                diagnostics: 1,
+            },
+        ];
+        let mut entries_b = entries_a.clone();
+        entries_b.reverse();
+
+        let modules_a = vec![
+            SideModuleEntry::new("guest_part_1.wasm", 1, 146_801),
+            SideModuleEntry::new("guest_part_0.wasm", 383, 890 * 1024 * 1024),
+            SideModuleEntry::new("guest_part_2.wasm", 1, 7_025_459),
+        ];
+        let mut modules_b = modules_a.clone();
+        modules_b.reverse();
+
+        let shards_a = vec![
+            ShardEntry::new("shard-00001.wasm", 100, 200_000),
+            ShardEntry::new("shard-00000.wasm", 120, 240_000),
+        ];
+        let mut shards_b = shards_a.clone();
+        shards_b.reverse();
+
+        let rep_a = FunctionHeadroomReport::new(
+            "game.exe",
+            FunctionSizeStats::from_entries(entries_a, 5),
+        )
+        .with_wasm64_headroom(Wasm64HeadroomReport::new(modules_a, 1_700_000, 1_306, 4))
+        .with_shard_balance(ShardBalanceSummary::from_shards(shards_a));
+
+        let rep_b = FunctionHeadroomReport::new(
+            "game.exe",
+            FunctionSizeStats::from_entries(entries_b, 5),
+        )
+        .with_wasm64_headroom(Wasm64HeadroomReport::new(modules_b, 1_700_000, 1_306, 4))
+        .with_shard_balance(ShardBalanceSummary::from_shards(shards_b));
+
+        assert_eq!(rep_a, rep_b);
+        assert_eq!(rep_a.render_one_line(), rep_b.render_one_line());
+        assert_eq!(rep_a.render_markdown(), rep_b.render_markdown());
+        let json_a = rep_a.render_json();
+        let json_b = rep_b.render_json();
+        assert_eq!(json_a, json_b);
+        JsonValidator::validate(&json_a)
+            .expect("FunctionHeadroomReport JSON must be valid RFC 8259");
+
+        let keys = extract_top_level_json_keys(&json_a);
+        assert_eq!(
+            keys,
+            vec![
+                "function_sizes",
+                "shard_balance",
+                "source",
+                "summary_line",
+                "wasm64_headroom",
+            ]
+        );
+        for pair in keys.windows(2) {
+            assert!(pair[0] < pair[1]);
+        }
+
+        // Minimal report (no optional sections)
+        let minimal = FunctionHeadroomReport::new("minimal.exe", FunctionSizeStats::default());
+        let min_json = minimal.render_json();
+        JsonValidator::validate(&min_json).expect("minimal FunctionHeadroomReport JSON must be valid");
+        let min_keys = extract_top_level_json_keys(&min_json);
+        assert_eq!(min_keys, keys);
+        assert!(min_json.contains("\"shard_balance\": null,"));
+        assert!(min_json.contains("\"wasm64_headroom\": null\n}"));
+    }
+
+    #[test]
+    fn function_headroom_and_shard_headroom_block_adversarial_host_paths() {
+        use playgta6_recomp::summary::{FunctionSizeEntry, SideModuleEntry};
+
+        let mut balance = ShardBalanceSummary::from_shards(vec![
+            ShardEntry::new(r"C:\Users\alice\Private\shard-00000.wasm", 100, 200_000),
+            ShardEntry::new("/home/runner/work/secret/shard-00001.wasm", 120, 240_000),
+            ShardEntry::new(r"\\fileserver\share\hidden\shard-00002.wasm", 80, 160_000),
+            ShardEntry::new("file:///Users/bob/Desktop/", 10, 20_000),
+        ]);
+        // Defense-in-depth: mutate shard name after construction
+        balance.shards[0].name = r"\\?\C:\SecretAdmin\shard-00000.wasm".to_string();
+
+        let headroom_md = balance.render_headroom_markdown(
+            V8_MAX_WASM_MODULE_BYTES,
+            Some(1_700_000),
+            Some(1_306),
+        );
+        let headroom_json = balance.render_headroom_json(
+            V8_MAX_WASM_MODULE_BYTES,
+            Some(1_700_000),
+            Some(1_306),
+        );
+        JsonValidator::validate(&headroom_json).expect("sanitized shard headroom JSON must be valid");
+
+        let mut full = FunctionHeadroomReport::new(
+            r"C:\Users\alice\Games\GTA6\game.exe",
+            FunctionSizeStats::from_entries(
+                vec![FunctionSizeEntry {
+                    entry: 0x0001_4000_1000,
+                    blocks: 5,
+                    instructions: 50,
+                    indirect_calls: 1,
+                    diagnostics: 0,
+                }],
+                5,
+            ),
+        )
+        .with_wasm64_headroom(Wasm64HeadroomReport::new(
+            vec![
+                SideModuleEntry::new(
+                    r"\\buildbox\share\artifacts\guest_part_0.wasm",
+                    383,
+                    890 * 1024 * 1024,
+                ),
+                SideModuleEntry::new(
+                    "file:///tmp/private_build/guest_part_1.wasm",
+                    1,
+                    146_801,
+                ),
+            ],
+            1_700_000,
+            1_306,
+            4,
+        ))
+        .with_shard_balance(balance);
+        full.source = "/Users/bob/Private/game.exe".to_string();
+
+        let one_line = full.render_one_line();
+        let md = full.render_markdown();
+        let json = full.render_json();
+        JsonValidator::validate(&json).expect("sanitized FunctionHeadroomReport JSON must be valid");
+
+        for output in [&headroom_md, &headroom_json, &one_line, &md, &json] {
+            assert!(
+                !contains_host_path(output),
+                "host path leaked into output:\n{output}"
+            );
+            for forbidden in [
+                "alice",
+                "bob",
+                "runner",
+                "Private",
+                "SecretAdmin",
+                "fileserver",
+                "hidden",
+                "buildbox",
+                "private_build",
+                "file://",
+                r"C:\",
+                "/home/",
+                "/Users/",
+                "/tmp/",
+            ] {
+                assert!(
+                    !output.contains(forbidden),
+                    "forbidden host path segment `{forbidden}` leaked into output:\n{output}"
+                );
+            }
+        }
+        assert!(json.contains("\"source\": \"game.exe\","));
+        assert!(json.contains("\"label\": \"guest_part_0.wasm\""));
+        assert!(json.contains("\"name\": \"shard-00000.wasm\""));
     }
 }
