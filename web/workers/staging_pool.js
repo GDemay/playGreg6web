@@ -2696,29 +2696,98 @@
     }
 
     /**
+     * Release the reusable CPU upload scratch buffer (`_uploadScratch`) to reclaim
+     * transient JS heap memory during idle periods or scene transitions.
+     *
+     * @returns {number} Bytes released from CPU scratch.
+     */
+    trimScratch() {
+      const released =
+        this._uploadScratch && typeof this._uploadScratch.byteLength === 'number'
+          ? this._uploadScratch.byteLength
+          : 0;
+      this._uploadScratch = null;
+      return released;
+    }
+
+    /**
+     * Return concise live GPU & CPU staging memory byte accounting (#1077).
+     */
+    getMemoryStats() {
+      let activeBytes = 0;
+      for (let i = 0; i < this._activeChunks.length; i += 1) {
+        activeBytes += this._activeChunks[i].size;
+      }
+      let inFlightBytes = 0;
+      for (let i = 0; i < this._inFlightChunks.length; i += 1) {
+        inFlightBytes += this._inFlightChunks[i].size;
+      }
+      let recycledBytes = 0;
+      for (let i = 0; i < this._recycledChunks.length; i += 1) {
+        recycledBytes += this._recycledChunks[i].size;
+      }
+      for (const bucket of this._largeSlabBuckets.values()) {
+        for (let i = 0; i < bucket.length; i += 1) {
+          recycledBytes += bucket[i].size;
+        }
+      }
+      const scratchBytes =
+        this._uploadScratch && typeof this._uploadScratch.byteLength === 'number'
+          ? this._uploadScratch.byteLength
+          : 0;
+      const allocatedBytes = sanitizeNonNegativeCounter(this._allocatedBytes);
+      return {
+        stagingPoolBytes: allocatedBytes,
+        allocatedBytes,
+        peakAllocatedBytes: sanitizeNonNegativeCounter(this._peakAllocatedBytes),
+        activeBytes,
+        inFlightBytes,
+        recycledBytes,
+        largeSlabBytes: sanitizeNonNegativeCounter(this._largeSlabBytes),
+        scratchBytes,
+        maxPoolBytes: this.maxPoolBytes,
+      };
+    }
+
+    /**
      * Return pool-wide allocation, large-slab reuse, and upload bandwidth statistics.
      */
     getStats() {
       const activeCount = this._activeChunks.length;
       const recycledCount = this._getRecycledCount();
       let activeLargeSlabs = 0;
+      let activeBytes = 0;
       for (let i = 0; i < this._activeChunks.length; i += 1) {
+        activeBytes += this._activeChunks[i].size;
         if (this._activeChunks[i].isLargeSlab) {
           activeLargeSlabs += 1;
         }
       }
       let inFlightLargeSlabs = 0;
+      let inFlightBytes = 0;
       for (let i = 0; i < this._inFlightChunks.length; i += 1) {
+        inFlightBytes += this._inFlightChunks[i].size;
         if (this._inFlightChunks[i].isLargeSlab) {
           inFlightLargeSlabs += 1;
         }
+      }
+      let recycledBytes = 0;
+      for (let i = 0; i < this._recycledChunks.length; i += 1) {
+        recycledBytes += this._recycledChunks[i].size;
       }
       const largeSlabBucketCounts = {};
       for (const [bucketSize, bucket] of this._largeSlabBuckets.entries()) {
         if (bucket.length > 0) {
           largeSlabBucketCounts[bucketSize] = bucket.length;
+          for (let i = 0; i < bucket.length; i += 1) {
+            recycledBytes += bucket[i].size;
+          }
         }
       }
+      const scratchBytes =
+        this._uploadScratch && typeof this._uploadScratch.byteLength === 'number'
+          ? this._uploadScratch.byteLength
+          : 0;
 
       const poolHits = sanitizeNonNegativeCounter(this._bufferReuseHits);
       const poolMisses = sanitizeNonNegativeCounter(this._bufferReuseMisses);
@@ -2753,6 +2822,11 @@
         activeCount,
         idleCount: recycledCount,
         allocatedBytes: sanitizeNonNegativeCounter(this._allocatedBytes),
+        stagingPoolBytes: sanitizeNonNegativeCounter(this._allocatedBytes),
+        activeBytes,
+        inFlightBytes,
+        recycledBytes,
+        scratchBytes,
         bytesAllocated: sanitizeNonNegativeCounter(this._totalBytesAllocated),
         bytesReused: sanitizeNonNegativeCounter(this._bytesReused),
         peakBytes: peakAllocatedBytes,
