@@ -887,6 +887,34 @@ void test_concurrent_registration() {
     }
 }
 
+// A middleware shim registered under a DLL's name (Bink2Scarlett.dll) is shadowed by the lifted
+// module that registers later: the module takes the name over, its guest exports win both by name
+// and by ordinal, and LookupExport reports them as guest code. Before the module registers, the
+// same name resolves to the shim (the fallback), and the lifted module's address range is unknown.
+void test_lifted_module_takes_over_shim_name() {
+    constexpr uint64_t kShim = 0x7000;
+    constexpr uint64_t kBase = 0x1A0000000ULL;
+    CHECK(register_export("Bink2Scarlett.dll", "BinkClose", 0, kShim));
+    CHECK(register_export("Bink2Scarlett.dll", "BinkOnlyShim", 0, kShim + 8));
+    CHECK(resolve_import("Bink2Scarlett.dll", "BinkClose") == kShim);  // fallback while not lifted
+    CHECK(find_module_by_address(kBase + 0x10) == kNullHandle);
+    CHECK(register_guest_module("Bink2Scarlett.dll", "C:\g\Bink2Scarlett.dll", kBase, 0x20000) == kBase);
+    CHECK(register_guest_export("Bink2Scarlett.dll", "BinkClose", 3, kBase + 0x1000));
+    CHECK(resolve_import("Bink2Scarlett.dll", "BinkClose") == kBase + 0x1000);
+    CHECK(resolve_import("bink2scarlett.dll", "BinkClose") == kBase + 0x1000);
+    CHECK(resolve_import_ordinal("Bink2Scarlett.dll", 3) == kBase + 0x1000);
+    // A name only the shim exported does not leak into the lifted module.
+    CHECK(resolve_import("Bink2Scarlett.dll", "BinkOnlyShim") == 0);
+    const Handle h = find_module_by_address(kBase + 0x1000);
+    CHECK(h == kBase);
+    const ExportLookup found = LookupExport(h, "BinkClose");
+    CHECK(found.address == kBase + 0x1000 && found.guest);
+    CHECK(GetModuleHandleA("Bink2Scarlett.dll") == kBase);
+    // Late shim registrations cannot shadow the guest module either.
+    CHECK(!register_export("Bink2Scarlett.dll", "BinkClose", 0, kShim));
+    CHECK(resolve_import("Bink2Scarlett.dll", "BinkClose") == kBase + 0x1000);
+}
+
 }  // namespace
 
 int main() {
@@ -901,6 +929,7 @@ int main() {
     test_load_library_refcounts();
     test_get_proc_address();
     test_concurrent_registration();
+    test_lifted_module_takes_over_shim_name();
 
     if (g_failures != 0) {
         std::fprintf(stderr, "test_win32_loader failed with %d failure(s)\n", g_failures);
