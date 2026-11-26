@@ -293,6 +293,18 @@ class CompileTests(unittest.TestCase):
             again = nb.compile_all(inputs.units, cfg, 2, runner)
             self.assertTrue(all(r.cached for r in again))
 
+    def test_delete_ir_also_on_a_cache_hit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            module = make_module(root, shards=2)
+            inputs = nb.load_module(module)
+            runner = FakeRunner()
+            nb.compile_all(inputs.units, self._cfg(root, runner), 2, runner)
+            self.assertTrue((module / "lift" / "shard-00000.ll").exists())
+            again = nb.compile_all(inputs.units, self._cfg(root, runner, delete_ir=True), 2, runner)
+            self.assertTrue(all(r.cached for r in again))
+            self.assertFalse((module / "lift" / "shard-00000.ll").exists())
+
 
 class CacheTests(unittest.TestCase):
     KEY = "ab" * 32
@@ -495,6 +507,8 @@ class HarnessTests(unittest.TestCase):
             self.assertIn("/BASE:0x7E0000000000", text)
             self.assertIn("/DYNAMICBASE:NO", text)
             self.assertIn("/INCREMENTAL:NO", text)
+            # Parallel cl within each MSBuild project (runtime included: set before add_subdirectory).
+            self.assertLess(text.index("add_compile_options(/MP)"), text.index("add_subdirectory("))
             self.assertIn("/DEBUG:NONE", text)
             self.assertIn("/DEBUG\n", nb.harness_cmakelists(REPO_ROOT, inputs, objs, root / "bin", True).replace(" /DYNAMICBASE", "\n"))
 

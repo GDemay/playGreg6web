@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -148,11 +149,20 @@ struct SurveyEntry {
     uint64_t count = 0;
 };
 
+// Guest addresses the recompiler missed, by fault kind: a count plus the distinct addresses in
+// first-seen order (capped at kMissTargetCap; `count` keeps counting past the cap).
+struct MissList {
+    uint64_t count = 0;
+    std::vector<uint64_t> targets;
+};
+constexpr size_t kMissTargetCap = 256;
+
 struct RecentImport {
     uint64_t seq = 0;
     size_t import_index = 0;
     uint64_t args[5] = {};  // rcx rdx r8 r9 [rsp+0x28] at the call
     uint32_t thread = 0;    // guest thread id (TEB ClientId)
+    uint64_t return_address = 0;  // guest return address of the call
 };
 
 // First call of an API worth a timeline entry (see kTimelineApis).
@@ -267,6 +277,11 @@ struct BootState {
     std::vector<RecentImport> recent;  // ring
     size_t recent_next = 0;
     std::vector<SurveyEntry> survey_called;
+    // Code misses (guarded by `mutex`): indirect calls/jumps to no lifted entry, context restores
+    // to no resume target, and traps. Every boot thread's fault is counted, even ones not reported.
+    MissList miss_unknown_target;
+    MissList miss_unknown_resume_target;
+    MissList miss_trap;
     uint64_t tls_callbacks_run = 0;
     bool entry_started = false;
     std::vector<Milestone> milestones;
@@ -817,10 +832,40 @@ const char* fault_kind_id(FaultKind kind) {
 void log_trap();
 void finish_report();
 
+void record_code_miss(FaultKind kind, uint64_t va) {
+    BootState& b = boot();
+    MissList* list = nullptr;
+    switch (kind) {
+        case FaultKind::UnknownTarget:
+            list = &b.miss_unknown_target;
+            break;
+        case FaultKind::UnknownResumeTarget:
+            list = &b.miss_unknown_resume_target;
+            break;
+        case FaultKind::Trap:
+            list = &b.miss_trap;
+            break;
+        default:
+            return;
+    }
+    std::lock_guard<std::mutex> lock(b.mutex);
+    ++list->count;
+    if (list->targets.size() < kMissTargetCap &&
+        std::find(list->targets.begin(), list->targets.end(), va) == list->targets.end()) {
+        list->targets.push_back(va);
+    }
+}
+
 void boot_fault_handler(const FaultInfo* info) {
     BootState& b = boot();
     if (!b.running || info == nullptr) {
         return;  // the default handler logs and aborts
+    }
+    {
+        const auto miss_kind = static_cast<FaultKind>(info->kind);
+        record_code_miss(miss_kind, miss_kind == FaultKind::UnknownResumeTarget && info->state != nullptr
+                                        ? info->state->resume_rip
+                                        : info->va);
     }
     const bool other_thread = !t_running_boot;
     if (other_thread && (b.off_thread_fault == nullptr || b.off_thread_fault_taken.exchange(true))) {
@@ -966,6 +1011,7 @@ void boot_dispatch_observer(GuestState* state, uint64_t target) {
                 read_u64(*b.arena, state->gpr[GuestReg::Rsp] + 0x28, entry.args[4]);
             }
             entry.thread = t_active != nullptr ? t_active->thread_id : 0;
+            entry.return_address = t_dispatch_ring[(t_dispatch_count - 1) % kDispatchRing].return_address;
             const BootImport& imp = b.imports[static_cast<size_t>(index)].import;
             std::string strings;
             if (b.trace_limit != 0) {
@@ -1215,12 +1261,34 @@ void boot_terminate_process_handler(uint32_t exit_code, void* /*user*/) {
     request_exit(static_cast<int32_t>(exit_code));
 }
 
+// XLaunchNewGame of the running title: the guest's constrained-change then app-state routines run
+// with TRUE on the calling guest thread, then a ~1 s grace period for work they started.
+void boot_relaunch_invoke(const os::win32::AppNotification& call, void* /*user*/) {
+    com::GuestFunction<void(bool, uint64_t)> routine(call.routine);
+    routine(call.flag != 0, call.context);
+}
+
+void boot_relaunch_grace(uint32_t grace_ms, void* /*user*/) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(grace_ms));
+}
+
+void boot_relaunch_prepare(void* /*user*/) {
+    os::win32::run_relaunch_suspend_sequence(&boot_relaunch_invoke, nullptr, &boot_relaunch_grace, nullptr);
+}
+
+// Guest return address of this thread's latest dispatched call (PG6_EVENT_TRACE callers).
+uint64_t boot_current_guest_caller() {
+    return t_dispatch_count != 0 ? t_dispatch_ring[(t_dispatch_count - 1) % kDispatchRing].return_address : 0;
+}
+
 void install_hooks() {
     BootState& b = boot();
+    os::win32::set_event_trace_caller(&boot_current_guest_caller);
     b.previous_fault_handler = set_fault_handler(&boot_fault_handler);
     b.previous_observer = set_dispatch_observer(&boot_dispatch_observer);
     b.previous_exit_hook = pg6_crt_set_exit_hook(&boot_exit_hook);
     os::win32::set_process_exit_handler(&boot_terminate_process_handler, nullptr);
+    os::win32::set_relaunch_prepare_hook(&boot_relaunch_prepare, nullptr);
     b.hooks_installed = true;
 }
 
@@ -1233,6 +1301,8 @@ void remove_hooks() {
     set_dispatch_observer(b.previous_observer);
     pg6_crt_set_exit_hook(b.previous_exit_hook);
     os::win32::set_process_exit_handler(nullptr, nullptr);
+    os::win32::set_relaunch_prepare_hook(nullptr, nullptr);
+    os::win32::set_event_trace_caller(nullptr);
     b.hooks_installed = false;
 }
 
@@ -1732,6 +1802,19 @@ std::string build_report() {
         o += hits.empty() ? "],\n" : "\n  ],\n";
     }
 
+    o += "  \"com_calls\": [";
+    {
+        const std::vector<com::TraceRow> rows = com::trace_report();
+        for (size_t i = 0; i < rows.size(); ++i) {
+            const com::TraceRow& r = rows[i];
+            o += (i == 0 ? "\n    " : ",\n    ");
+            o += "{\"interface\": " + json_string(r.interface_name) + ", \"slot\": " +
+                 std::to_string(r.slot) + ", \"count\": " + std::to_string(r.count) +
+                 ", \"hresult\": " + hex(static_cast<uint32_t>(r.hresult)) + "}";
+        }
+        o += rows.empty() ? "],\n" : "\n  ],\n";
+    }
+
     if (f.has_host_frames) {
         o += "  \"host_frames\": [";
         for (size_t i = 0; i < f.host_frames.size(); ++i) {
@@ -1789,6 +1872,19 @@ std::string build_report() {
                  ", \"count\": " + std::to_string(e.count) + "}";
         }
         o += b.survey_called.empty() ? "]},\n" : "\n  ]},\n";
+
+        // Code the recompiler missed (addresses only; feed back with `recomp build --entry`).
+        const auto miss_json = [](const char* name, const MissList& m) {
+            std::string j = std::string("\"") + name + "\": {\"count\": " + std::to_string(m.count) +
+                            ", \"targets\": [";
+            for (size_t k = 0; k < m.targets.size(); ++k) {
+                j += (k == 0 ? "" : ", ") + hex(m.targets[k]);
+            }
+            return j + "]}";
+        };
+        o += "  \"code_misses\": {" + miss_json("unknown_target", b.miss_unknown_target) + ", " +
+             miss_json("unknown_resume_target", b.miss_unknown_resume_target) + ", " +
+             miss_json("trap", b.miss_trap) + "},\n";
     }
 
     // Timeline of first calls, threads, address space.
@@ -2333,7 +2429,30 @@ std::string guest_thread_last_import(uint32_t thread_id) {
     std::lock_guard<std::mutex> lock(b.mutex);
     for (const auto& [thread, entry] : b.thread_last) {
         if (thread->thread_id == thread_id) {
-            return import_label(b.imports[entry.import_index].import);
+            const BootImport& imp = b.imports[entry.import_index].import;
+            std::string label = import_label(imp);
+            // Waits and sleeps: the guest caller and the handle / time argument, so a profile
+            // says which wait a blocked thread is in (--profile).
+            const std::string symbol = import_symbol(imp);
+            const bool sleep = symbol == "Sleep" || symbol == "SleepEx";
+            const bool wait_one = symbol == "WaitForSingleObject" || symbol == "WaitForSingleObjectEx";
+            const bool wait_many = symbol == "WaitForMultipleObjects" || symbol == "WaitForMultipleObjectsEx";
+            if (sleep || wait_one || wait_many) {
+                char text[96];
+                if (sleep) {
+                    std::snprintf(text, sizeof(text), " ms=%" PRIu64, entry.args[0] & 0xFFFFFFFFu);
+                } else if (wait_one) {
+                    std::snprintf(text, sizeof(text), " h=0x%" PRIx64 " ms=%" PRId32, entry.args[0],
+                                  static_cast<int32_t>(entry.args[1]));
+                } else {
+                    std::snprintf(text, sizeof(text), " n=%" PRIu64 " ms=%" PRId32, entry.args[0] & 0xFFFFFFFFu,
+                                  static_cast<int32_t>(entry.args[3]));
+                }
+                label += text;
+                std::snprintf(text, sizeof(text), " ret 0x%" PRIx64, entry.return_address);
+                label += text;
+            }
+            return label;
         }
     }
     return {};
@@ -2519,9 +2638,22 @@ bool json_uint(std::string_view json, std::string_view key, uint64_t& out) {
         if (c < '0' || c > '9') {
             return false;
         }
-        n = n * 10 + static_cast<uint64_t>(c - '0');
+        const uint64_t digit = static_cast<uint64_t>(c - '0');
+        if (n > (std::numeric_limits<uint64_t>::max() - digit) / 10) {
+            return false;
+        }
+        n = n * 10 + digit;
     }
     out = n;
+    return true;
+}
+
+bool json_uint32(std::string_view json, std::string_view key, uint32_t& out) {
+    uint64_t n = 0;
+    if (!json_uint(json, key, n) || n > std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    out = static_cast<uint32_t>(n);
     return true;
 }
 
@@ -2545,6 +2677,16 @@ bool apply_boot_options_json(std::string_view json, BootConfig& config) {
     }
     if (json_uint(json, "import_trace_limit", n)) {
         config.import_trace_limit = static_cast<size_t>(n);
+    }
+    uint32_t u32 = 0;
+    if (json_uint32(json, "fence_publish_lag_frames", u32)) {
+        config.fence_publish_lag_frames = u32;
+    }
+    if (json_uint32(json, "fence_publish_cap_ms", u32)) {
+        config.fence_publish_cap_ms = u32;
+    }
+    if (json_uint32(json, "present_max_interval", u32)) {
+        config.present_max_interval = u32;
     }
     const std::string_view verify = json_value(json, "verify_window_marks");
     if (verify == "true" || verify == "false") {
@@ -2651,6 +2793,17 @@ std::string last_summary() {
     return boot().last_summary;
 }
 
+PresentStatus present_status() {
+    BootState& b = boot();
+    std::lock_guard<std::mutex> lock(b.mutex);
+    const gpu::PresentSample last = b.present_samples.last();
+    PresentStatus s;
+    s.presents = b.present_samples.total();
+    s.draws_per_frame = last.draws;
+    s.wall_ms = last.wall_ms;
+    return s;
+}
+
 LiveCounters live_counters() {
     BootState& b = boot();
     LiveCounters c;
@@ -2749,6 +2902,9 @@ void reset_boot() {
     b.recent.clear();
     b.recent_next = 0;
     b.survey_called.clear();
+    b.miss_unknown_target = {};
+    b.miss_unknown_resume_target = {};
+    b.miss_trap = {};
     b.tls_callbacks_run = 0;
     b.entry_started = false;
     b.milestones.clear();
@@ -2809,12 +2965,22 @@ BootResult run_boot(const BootConfig& config) {
     b.report_sink = config.report_sink;
     os::guest_window::set_write_marks_verified(config.verify_window_marks);
     gpu::present_pacer().set_enabled(config.present_pacing);
-    // Only a switched-off option changes anything: the harness sets its own device options.
-    if (!config.fence_publish_lag || !config.defer_gpu_objects) {
+    gpu::d3d12_guest::xbox::set_present_max_interval(config.present_max_interval);
+    // Only a switched-off bool option disables a harness setting; lag tuning fields are wired
+    // through from BootConfig (defaults match DeviceOptions: 1 frame, 33 ms).
+    {
         gpu::d3d12_guest::DeviceOptions device_options = gpu::d3d12_xs_exports::device_options();
-        device_options.fence_publish_lag = device_options.fence_publish_lag && config.fence_publish_lag;
-        device_options.defer_gpu_objects = device_options.defer_gpu_objects && config.defer_gpu_objects;
-        gpu::d3d12_xs_exports::set_device_options(std::move(device_options));
+        const bool lag_changed = !config.fence_publish_lag && device_options.fence_publish_lag;
+        const bool defer_changed = !config.defer_gpu_objects && device_options.defer_gpu_objects;
+        const bool lag_frames_changed = device_options.fence_publish_lag_frames != config.fence_publish_lag_frames;
+        const bool lag_cap_changed = device_options.fence_publish_cap_ms != config.fence_publish_cap_ms;
+        if (lag_changed || defer_changed || lag_frames_changed || lag_cap_changed) {
+            device_options.fence_publish_lag = device_options.fence_publish_lag && config.fence_publish_lag;
+            device_options.defer_gpu_objects = device_options.defer_gpu_objects && config.defer_gpu_objects;
+            device_options.fence_publish_lag_frames = config.fence_publish_lag_frames;
+            device_options.fence_publish_cap_ms = config.fence_publish_cap_ms;
+            gpu::d3d12_xs_exports::set_device_options(std::move(device_options));
+        }
     }
     if (!config.xmem_shared_pages) {
         os::win32::set_process_shared_zone(false);

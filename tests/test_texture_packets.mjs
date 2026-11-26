@@ -56,13 +56,41 @@ function createMockWebGpu({ strictWebGpu = false, features = undefined } = {}) {
           `WebGPU validation: 3d texture format ${desc.format} requires texture-compression-bc-sliced-3d`
         );
       }
+      const texDimension = desc.dimension || '2d';
+      const texWidth = Array.isArray(desc.size) ? desc.size[0] : desc.size && desc.size.width;
+      const texHeight = Array.isArray(desc.size)
+        ? (desc.size[1] !== undefined ? desc.size[1] : 1)
+        : (desc.size && desc.size.height !== undefined ? desc.size.height : 1);
+      const texDepth = Array.isArray(desc.size)
+        ? (desc.size[2] !== undefined ? desc.size[2] : 1)
+        : (desc.size && desc.size.depthOrArrayLayers !== undefined ? desc.size.depthOrArrayLayers : 1);
       const texture = {
         kind: 'GPUTexture',
         handle: nextHandle++,
         format: desc.format,
+        dimension: texDimension,
+        width: texWidth,
+        height: texHeight,
+        depthOrArrayLayers: texDepth,
+        mipLevelCount: desc.mipLevelCount || 1,
         desc,
         destroyed: false,
         createView(viewDesc) {
+          const requestedViewDim =
+            viewDesc && typeof viewDesc.dimension === 'string' ? viewDesc.dimension : null;
+          if (strictWebGpu && requestedViewDim) {
+            const validDimsByTexDim = {
+              '1d': ['1d'],
+              '2d': ['2d', '2d-array', 'cube', 'cube-array'],
+              '3d': ['3d'],
+            };
+            const compatible = validDimsByTexDim[texDimension] || ['2d'];
+            if (!compatible.includes(requestedViewDim)) {
+              throw new Error(
+                `WebGPU validation: The dimension (${requestedViewDim}) of the texture view is not compatible with the dimension (${texDimension}) of texture (${texWidth} px, ${desc.format})`
+              );
+            }
+          }
           if (
             strictWebGpu &&
             viewDesc &&
@@ -76,7 +104,21 @@ function createMockWebGpu({ strictWebGpu = false, features = undefined } = {}) {
               );
             }
           }
-          return { kind: 'GPUTextureView', textureHandle: texture.handle, viewDesc };
+          const resolvedDimension =
+            requestedViewDim ||
+            (texDimension === '1d'
+              ? '1d'
+              : texDimension === '3d'
+                ? '3d'
+                : texDepth > 1
+                  ? '2d-array'
+                  : '2d');
+          return {
+            kind: 'GPUTextureView',
+            textureHandle: texture.handle,
+            dimension: resolvedDimension,
+            viewDesc,
+          };
         },
         destroy() {
           texture.destroyed = true;
@@ -356,6 +398,10 @@ test('CreateTexture2 creates a texture with format, samples and view formats in 
     r8unormUploads: 0,
     bytesUploaded: 0,
     srgbSiblingViewFormatsAdded: 0,
+    promoted1DTo2DCount: 0,
+    chunkedWrites: 0,
+    trimmedStagingBytes: 0,
+    destroyedTextures: 0,
   });
   const [rt, tex] = gpu.calls.filter((c) => c.op === 'createTexture').map((c) => c.desc);
   assert.deepEqual(rt, {
@@ -649,6 +695,10 @@ test('staged WriteTexture & copyBufferToTexture repack unaligned bytesPerRow to 
     r8unormUploads: 0,
     bytesUploaded: 1024,
     srgbSiblingViewFormatsAdded: 1,
+    promoted1DTo2DCount: 0,
+    chunkedWrites: 0,
+    trimmedStagingBytes: 0,
+    destroyedTextures: 0,
   });
 });
 
@@ -719,6 +769,10 @@ test('direct queue.writeTexture safely copies SharedArrayBuffer views and tracks
     r8unormUploads: 0,
     bytesUploaded: 32,
     srgbSiblingViewFormatsAdded: 1,
+    promoted1DTo2DCount: 0,
+    chunkedWrites: 0,
+    trimmedStagingBytes: 0,
+    destroyedTextures: 0,
   });
 });
 
@@ -808,6 +862,10 @@ test('handler.copyBufferToTexture repacks both CPU-backed and GPU-buffer-only un
     r8unormUploads: 0,
     bytesUploaded: 1536,
     srgbSiblingViewFormatsAdded: 1,
+    promoted1DTo2DCount: 0,
+    chunkedWrites: 0,
+    trimmedStagingBytes: 0,
+    destroyedTextures: 0,
   });
   for (const [key, val] of Object.entries(stats)) {
     assert.equal(typeof val, 'number', `stat ${key} must be numeric`);
@@ -1022,6 +1080,10 @@ test('W108 (#734): 3D BC textures fall back to rgba8unorm without bc-sliced-3d a
     r8unormUploads: 0,
     bytesUploaded: 0,
     srgbSiblingViewFormatsAdded: 0,
+    promoted1DTo2DCount: 0,
+    chunkedWrites: 0,
+    trimmedStagingBytes: 0,
+    destroyedTextures: 0,
   });
 });
 
@@ -1267,6 +1329,10 @@ test('W164 (#871): 4K Bink2 3840x2160 r8unorm Y plane takes zero-copy direct que
     r8unormUploads: 1,
     bytesUploaded: W * H,
     srgbSiblingViewFormatsAdded: 0,
+    promoted1DTo2DCount: 0,
+    chunkedWrites: 0,
+    trimmedStagingBytes: 0,
+    destroyedTextures: 0,
   });
 });
 
@@ -1403,6 +1469,10 @@ test('W164 (#871): 4K Bink2 1920x1080 r8unorm Cr/Cb planes reuse persistent scra
     r8unormUploads: FRAMES * 3,
     bytesUploaded: expectedBytes,
     srgbSiblingViewFormatsAdded: 0,
+    promoted1DTo2DCount: 0,
+    chunkedWrites: 0,
+    trimmedStagingBytes: 0,
+    destroyedTextures: 0,
   });
 });
 
@@ -1654,6 +1724,10 @@ test('W164 (#871): telemetry resets cleanly on reset(), destroy(), and processor
     r8unormUploads: 0,
     bytesUploaded: 0,
     srgbSiblingViewFormatsAdded: 0,
+    promoted1DTo2DCount: 0,
+    chunkedWrites: 0,
+    trimmedStagingBytes: 0,
+    destroyedTextures: 0,
   };
 
   // 1) reset() clears counters and releases scratch buffer, while handler stays usable.
@@ -3015,4 +3089,722 @@ test('W303 (#1219): BC1-BC7 tail-mip parity preserved alongside block-aligned BC
   assert.equal(handler.getStats().uploadsCount, 0);
   assert.equal(handler.getStats().reusedDescriptorCount, 0);
   assert.equal(handler.getStats().clampedSubRegionCount, 0);
+});
+
+test('W341 (#1460): 4096x1 rgba8unorm 1D LUT promotes to WebGPU 2D (4096x1x1) with valid 2D view, sRGB viewFormats, and metadata', () => {
+  const gpu = createMockWebGpu({ strictWebGpu: true });
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx);
+  const rsHandler = installRenderStatePackets(processor);
+  const handler = tp.installTexturePackets(processor);
+
+  assert.equal(handler.promote1DTo2D, true);
+
+  // ABI v2 CreateTexture2: 4096x1 rgba8unorm (format 22) 1D LUT (dimension 0).
+  processor.executeCommandBuffer(
+    createTexture2Packet({
+      id: 1460,
+      width: 4096,
+      height: 1,
+      layers: 1,
+      mips: 1,
+      samples: 1,
+      usage: 0x06, // COPY_DST | TEXTURE_BINDING
+      dimension: 0, // 1d
+      format: 22, // rgba8unorm
+    })
+  );
+  // ABI v1 CreateTexture: 4096x1 rgba8unorm (v1 format 0) 1D LUT (dimension 0).
+  processor.executeCommandBuffer(
+    createTexture1Packet({
+      id: 1461,
+      width: 4096,
+      height: 1,
+      layers: 1,
+      mips: 1,
+      usage: 0x06,
+      dimension: 0,
+      format: 0,
+    })
+  );
+
+  for (const id of [1460, 1461]) {
+    const tex = processor.textures.get(id);
+    assert.ok(tex, `texture ${id} must be created`);
+    assert.equal(tex.desc.dimension, '2d');
+    assert.deepEqual(tex.desc.size, { width: 4096, height: 1, depthOrArrayLayers: 1 });
+    assert.equal(tex.desc.mipLevelCount, 1);
+    assert.equal(tex.desc.format, 'rgba8unorm');
+    assert.deepEqual(tex.desc.viewFormats, ['rgba8unorm-srgb']);
+
+    // Default textureView created by handler must be a valid '2d' GPUTextureView.
+    const defaultView = processor.textureViews.get(id);
+    assert.ok(defaultView);
+    assert.equal(defaultView.dimension, '2d');
+
+    // Explicit 2D views (linear and sRGB sibling) must pass strict WebGPU validation.
+    const view2d = tex.createView({ dimension: '2d', format: 'rgba8unorm' });
+    assert.equal(view2d.dimension, '2d');
+    const view2dSrgb = tex.createView({ dimension: '2d', format: 'rgba8unorm-srgb' });
+    assert.equal(view2dSrgb.dimension, '2d');
+
+    // Chained RenderStatePackets._textureView requesting a 2D view must succeed cleanly.
+    const rsView = rsHandler._textureView(id, {
+      dimension: '2d',
+      format: 'rgba8unorm',
+      baseMipLevel: 0,
+      mipLevelCount: 1,
+      baseArrayLayer: 0,
+      arrayLayerCount: 1,
+      aspect: 'all',
+    });
+    assert.ok(rsView);
+    assert.equal(rsView.dimension, '2d');
+
+    // Metadata preserves requestedDimension: '1d' while recording actual WebGPU dimension: '2d'.
+    const meta = handler._getTextureMeta(tex, id);
+    assert.equal(meta.dimension, '2d');
+    assert.equal(meta.requestedDimension, '1d');
+    assert.equal(meta.promoted1DTo2D, true);
+    assert.equal(meta.width, 4096);
+    assert.equal(meta.height, 1);
+    assert.equal(meta.depthOrArrayLayers, 1);
+
+    const rsMeta = rsHandler.textureMeta.get(id);
+    assert.ok(rsMeta);
+    assert.equal(rsMeta.dimension, '2d');
+    assert.equal(rsMeta.requestedDimension, '1d');
+    assert.equal(rsMeta.promoted1DTo2D, true);
+  }
+
+  assert.equal(processor.textures.get(1460).desc.sampleCount, 1);
+  assert.equal(handler.getStats().promoted1DTo2DCount, 2);
+  assert.equal(handler.getStats().srgbSiblingViewFormatsAdded, 2);
+  assert.equal(handler.getStats().errors, 0);
+});
+
+test('W341 (#1460): 4096x1 r32float 1D LUT promotes to WebGPU 2D (4096x1x1) with valid 2D view compatibility', () => {
+  const gpu = createMockWebGpu({ strictWebGpu: true });
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx);
+  const handler = tp.installTexturePackets(processor);
+
+  // 4096x1 r32float (format 16) 1D LUT with oversized height/layers/mips/samples safely clamped.
+  processor.executeCommandBuffer(
+    createTexture2Packet({
+      id: 1462,
+      width: 4096,
+      height: 4,
+      layers: 2,
+      mips: 8,
+      samples: 4,
+      usage: 0x06,
+      dimension: 0, // 1d
+      format: 16, // r32float
+    })
+  );
+
+  const tex = processor.textures.get(1462);
+  assert.ok(tex);
+  assert.equal(tex.desc.dimension, '2d');
+  assert.deepEqual(tex.desc.size, { width: 4096, height: 1, depthOrArrayLayers: 1 });
+  assert.equal(tex.desc.mipLevelCount, 1);
+  assert.equal(tex.desc.sampleCount, 1);
+  assert.equal(tex.desc.format, 'r32float');
+  assert.equal(tex.desc.viewFormats, undefined);
+
+  const defaultView = processor.textureViews.get(1462);
+  assert.ok(defaultView);
+  assert.equal(defaultView.dimension, '2d');
+  assert.doesNotThrow(() => tex.createView({ dimension: '2d', format: 'r32float' }));
+
+  const meta = handler._getTextureMeta(tex, 1462);
+  assert.equal(meta.dimension, '2d');
+  assert.equal(meta.requestedDimension, '1d');
+  assert.equal(meta.promoted1DTo2D, true);
+  assert.equal(handler.getStats().promoted1DTo2DCount, 1);
+  assert.equal(handler.getStats().errors, 0);
+});
+
+test('W341 (#1460): direct writeTexture uploads into promoted 4096x1 rgba8unorm and r32float 2D LUTs (plain, SAB, and height=0)', () => {
+  const gpu = createMockWebGpu({ strictWebGpu: true });
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx);
+  const handler = tp.installTexturePackets(processor);
+
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 1463, width: 4096, height: 1, usage: 0x06, dimension: 0, format: 22 })
+  );
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 1464, width: 4096, height: 1, usage: 0x06, dimension: 0, format: 16 })
+  );
+
+  const rgbaLut = new Uint8Array(4096 * 4);
+  rgbaLut[0] = 0x11;
+  rgbaLut[1] = 0x22;
+  rgbaLut[4096 * 4 - 1] = 0xee;
+
+  const r32Lut = new Uint8Array(4096 * 4);
+  new Float32Array(r32Lut.buffer)[0] = 1.5;
+  new Float32Array(r32Lut.buffer)[4095] = -3.25;
+
+  // 1) Plain ArrayBuffer 4096x1 rgba8unorm upload (16384B/row, 256B-aligned zero-copy fast path).
+  const pktRgba = writeTexturePacket({
+    textureId: 1463,
+    width: 4096,
+    height: 1,
+    layers: 1,
+    bytesPerRow: 4096 * 4,
+    rowsPerImage: 1,
+    data: rgbaLut,
+    useSab: false,
+  });
+  processor.executeCommandBuffer(pktRgba);
+
+  // 2) SAB-backed 4096x1 r32float upload with height=0 (1D packet omitting height -> normalized to 1).
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 1464,
+      width: 4096,
+      height: 0,
+      layers: 1,
+      bytesPerRow: 4096 * 4,
+      rowsPerImage: 0,
+      data: r32Lut,
+      useSab: true,
+    })
+  );
+
+  // 3) Direct handler.writeTexture call omitting height in GPUExtent3D.
+  const directRes = handler.writeTexture(
+    { texture: processor.textures.get(1463), mipLevel: 0, origin: { x: 0, y: 0, z: 0 } },
+    rgbaLut,
+    { offset: 0, bytesPerRow: 4096 * 4, rowsPerImage: 1 },
+    { width: 4096 },
+    1463
+  );
+  assert.equal(directRes.uploaded, true);
+  assert.equal(directRes.clamped, false);
+
+  const wtCalls = gpu.calls.filter((c) => c.op === 'writeTexture');
+  assert.equal(wtCalls.length, 3);
+
+  assert.deepEqual(wtCalls[0].size, { width: 4096, height: 1, depthOrArrayLayers: 1 });
+  assert.deepEqual(wtCalls[0].destination.origin, { x: 0, y: 0, z: 0 });
+  assert.equal(wtCalls[0].dataLayout.bytesPerRow, 16384);
+  assert.equal(wtCalls[0].bufferRef, pktRgba.buffer);
+  assert.equal(wtCalls[0].bytes[0], 0x11);
+  assert.equal(wtCalls[0].bytes[16383], 0xee);
+
+  assert.deepEqual(wtCalls[1].size, { width: 4096, height: 1, depthOrArrayLayers: 1 });
+  assert.equal(wtCalls[1].isSab, false);
+  const uploadedFloats = new Float32Array(
+    wtCalls[1].bytes.buffer,
+    wtCalls[1].bytes.byteOffset,
+    4096
+  );
+  assert.equal(uploadedFloats[0], 1.5);
+  assert.equal(uploadedFloats[4095], -3.25);
+
+  assert.deepEqual(wtCalls[2].size, { width: 4096, height: 1, depthOrArrayLayers: 1 });
+  assert.equal(handler.getStats().promoted1DTo2DCount, 2);
+  assert.equal(handler.getStats().sabCopyCount, 1);
+  assert.equal(handler.getStats().errors, 0);
+});
+
+test('W341 (#1460): staged WriteTexture & copyBufferToTexture uploads and sub-rect originX/originY clamping on promoted 1D->2D LUTs', () => {
+  const gpu = createMockWebGpu({ strictWebGpu: true });
+  const stagingPool = new GpuStagingPool({ device: gpu.device, chunkSize: 128 * 1024 });
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { stagingPool });
+  const handler = tp.installTexturePackets(processor);
+
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 1465, width: 4096, height: 1, usage: 0x06, dimension: 0, format: 22 })
+  );
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 1466, width: 4096, height: 1, usage: 0x06, dimension: 0, format: 16 })
+  );
+  const rgbaTex = processor.textures.get(1465);
+  const r32Tex = processor.textures.get(1466);
+
+  // 1) Staged partial sub-rect WriteTexture with unaligned 128B row pitch at originX=128, originY=0.
+  const subBytes = new Uint8Array(32 * 4);
+  for (let i = 0; i < subBytes.length; i += 1) subBytes[i] = (i + 5) & 0xff;
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 1465,
+      originX: 128,
+      originY: 0,
+      width: 32,
+      height: 1,
+      bytesPerRow: 128,
+      rowsPerImage: 1,
+      data: subBytes,
+    })
+  );
+
+  // 2) Right-edge partial sub-rect clamp: originX=4080, width=32 (4080+32=4112 > 4096 -> clamps to width=16).
+  const edgeBytes = new Uint8Array(32 * 4);
+  for (let i = 0; i < 32; i += 1) {
+    edgeBytes[i * 4] = i + 1;
+    edgeBytes[i * 4 + 3] = 0xff;
+  }
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 1465,
+      originX: 4080,
+      originY: 0,
+      width: 32,
+      height: 1,
+      bytesPerRow: 128,
+      rowsPerImage: 1,
+      data: edgeBytes,
+    })
+  );
+
+  // 3) Out-of-bounds originY=1 on promoted 4096x1 texture -> safely skipped, zero GPU calls, zero errors.
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 1465,
+      originX: 0,
+      originY: 1,
+      width: 16,
+      height: 1,
+      bytesPerRow: 64,
+      rowsPerImage: 1,
+      data: new Uint8Array(64),
+    })
+  );
+
+  // 4) copyBufferToTexture CPU-backed SAB and GPU-buffer-only unaligned 64B rows into promoted r32float LUT.
+  const encoder = gpu.device.createCommandEncoder();
+  const sabSub = new Uint8Array(new SharedArrayBuffer(16 * 4));
+  new Float32Array(sabSub.buffer)[0] = 42.0;
+  new Float32Array(sabSub.buffer)[15] = 99.5;
+  const c2tCpu = handler.copyBufferToTexture(
+    encoder,
+    { bytesPerRow: 64, rowsPerImage: 1 },
+    { texture: r32Tex, mipLevel: 0, origin: { x: 64, y: 0, z: 0 } },
+    { width: 16, height: 1, depthOrArrayLayers: 1 },
+    sabSub
+  );
+  assert.equal(c2tCpu.repacked, true);
+  assert.equal(c2tCpu.copiedFromSab, true);
+  assert.equal(c2tCpu.bytesPerRow, 256);
+  assert.equal(c2tCpu.clamped, false);
+
+  const gpuBuf = gpu.device.createBuffer({ size: 64, usage: 0x0004 | 0x0008 });
+  for (let i = 0; i < 64; i += 1) gpuBuf.backing[i] = 0x80 + i;
+  const c2tGpu = handler.copyBufferToTexture(
+    encoder,
+    { buffer: gpuBuf, offset: 0, bytesPerRow: 64, rowsPerImage: 1 },
+    { texture: r32Tex, mipLevel: 0, origin: { x: 256, y: 0, z: 0 } },
+    { width: 16, height: 1, depthOrArrayLayers: 1 }
+  );
+  assert.equal(c2tGpu.repacked, true);
+  assert.equal(c2tGpu.bytesPerRow, 256);
+  assert.equal(c2tGpu.clamped, false);
+
+  const c2tCalls = gpu.calls.filter((c) => c.op === 'copyBufferToTexture');
+  assert.equal(c2tCalls.length, 4);
+
+  // Verify call 0: exact sub-rect at (128, 0), 32x1x1, 256B aligned with zeroed padding.
+  assert.equal(c2tCalls[0].destination.texture, rgbaTex);
+  assert.deepEqual(c2tCalls[0].destination.origin, { x: 128, y: 0, z: 0 });
+  assert.deepEqual(c2tCalls[0].copySize, { width: 32, height: 1, depthOrArrayLayers: 1 });
+  assert.equal(c2tCalls[0].source.bytesPerRow, 256);
+  assert.deepEqual(Array.from(c2tCalls[0].bytes.subarray(0, 128)), Array.from(subBytes));
+  for (let p = 128; p < 256; p += 1) {
+    assert.equal(c2tCalls[0].bytes[p], 0, `padding byte ${p} must be zero`);
+  }
+
+  // Verify call 1: right-edge clamped to (4080, 0), 16x1x1, preserving unclipped left-16 texels.
+  assert.deepEqual(c2tCalls[1].destination.origin, { x: 4080, y: 0, z: 0 });
+  assert.deepEqual(c2tCalls[1].copySize, { width: 16, height: 1, depthOrArrayLayers: 1 });
+  assert.equal(c2tCalls[1].bytes[0], 1);
+  assert.equal(c2tCalls[1].bytes[15 * 4], 16);
+
+  // Verify calls 2 & 3 on r32float LUT.
+  assert.equal(c2tCalls[2].destination.texture, r32Tex);
+  assert.deepEqual(c2tCalls[2].destination.origin, { x: 64, y: 0, z: 0 });
+  assert.deepEqual(c2tCalls[2].copySize, { width: 16, height: 1, depthOrArrayLayers: 1 });
+  const c2tFloats = new Float32Array(c2tCalls[2].bytes.buffer, c2tCalls[2].bytes.byteOffset, 16);
+  assert.equal(c2tFloats[0], 42.0);
+  assert.equal(c2tFloats[15], 99.5);
+
+  assert.deepEqual(c2tCalls[3].destination.origin, { x: 256, y: 0, z: 0 });
+  assert.deepEqual(c2tCalls[3].copySize, { width: 16, height: 1, depthOrArrayLayers: 1 });
+  assert.deepEqual(Array.from(c2tCalls[3].bytes.subarray(0, 64)), Array.from(gpuBuf.backing));
+
+  const stats = handler.getStats();
+  assert.equal(stats.promoted1DTo2DCount, 2);
+  assert.equal(stats.clampedSubRegionCount, 2); // right-edge clamp + OOB originY=1
+  assert.equal(stats.rowPitchRepackCount, 4);
+  assert.equal(stats.errors, 0);
+});
+
+test('W341 (#1460): explicit promote1DTo2D: false opt-out preserves native 1D dimension and demonstrates 2D-view mismatch', () => {
+  const gpu = createMockWebGpu({ strictWebGpu: true });
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx);
+  const handler = tp.installTexturePackets(processor, { promote1DTo2D: false });
+
+  assert.equal(handler.promote1DTo2D, false);
+
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 1470, width: 4096, height: 1, usage: 0x06, dimension: 0, format: 22 })
+  );
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 1471, width: 4096, height: 1, usage: 0x06, dimension: 0, format: 16 })
+  );
+
+  for (const id of [1470, 1471]) {
+    const tex = processor.textures.get(id);
+    assert.ok(tex);
+    assert.equal(tex.desc.dimension, '1d');
+    assert.deepEqual(tex.desc.size, { width: 4096, height: 1, depthOrArrayLayers: 1 });
+    assert.equal(processor.textureViews.get(id).dimension, '1d');
+    const meta = handler._getTextureMeta(tex, id);
+    assert.equal(meta.dimension, '1d');
+    assert.equal(meta.requestedDimension, '1d');
+    assert.equal(meta.promoted1DTo2D, false);
+
+    // Creating a 2D view against an unpromoted 1D texture fails strict WebGPU validation
+    // (reproducing the t81/t82 Chrome WebGPU validation error).
+    assert.throws(
+      () => tex.createView({ dimension: '2d' }),
+      /not compatible with the dimension \(1d\)/
+    );
+    assert.doesNotThrow(() => tex.createView({ dimension: '1d' }));
+  }
+
+  assert.equal(handler.getStats().promoted1DTo2DCount, 0);
+  assert.equal(handler.getStats().created, 2);
+  assert.equal(handler.getStats().errors, 0);
+
+  // Alias option promote1DTexturesTo2D: false also opts out cleanly.
+  const gpu2 = createMockWebGpu({ strictWebGpu: true });
+  const processor2 = new WgpuCommandProcessor(gpu2.device, gpu2.ctx);
+  const handler2 = tp.installTexturePackets(processor2, { promote1DTexturesTo2D: false });
+  assert.equal(handler2.promote1DTo2D, false);
+  processor2.executeCommandBuffer(
+    createTexture2Packet({ id: 1472, width: 4096, height: 1, usage: 0x06, dimension: 0, format: 16 })
+  );
+  assert.equal(processor2.textures.get(1472).desc.dimension, '1d');
+  assert.equal(handler2.getStats().promoted1DTo2DCount, 0);
+});
+
+test('W341 (#1460): promoted1DTo2DCount ignores failed creations, updates on recreate/destroy, and resets cleanly', () => {
+  const gpu = createMockWebGpu({ strictWebGpu: true });
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx);
+  const handler = tp.installTexturePackets(processor);
+
+  // Invalid format code 0 with dimension 0 must NOT increment promoted1DTo2DCount.
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 1480, width: 4096, height: 1, usage: 0x06, dimension: 0, format: 0 })
+  );
+  assert.equal(handler.getStats().errors, 1);
+  assert.equal(handler.getStats().promoted1DTo2DCount, 0);
+
+  // Valid 1D texture increments promoted1DTo2DCount to 1.
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 1481, width: 4096, height: 1, usage: 0x06, dimension: 0, format: 22 })
+  );
+  assert.equal(handler.getStats().promoted1DTo2DCount, 1);
+  assert.equal(handler._getTextureMeta(processor.textures.get(1481), 1481).requestedDimension, '1d');
+
+  // Re-creating id 1481 as a native 2D texture refreshes metadata cleanly.
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 1481, width: 64, height: 64, usage: 0x06, dimension: 1, format: 22 })
+  );
+  assert.equal(handler.getStats().promoted1DTo2DCount, 1);
+  const recreatedMeta = handler._getTextureMeta(processor.textures.get(1481), 1481);
+  assert.equal(recreatedMeta.dimension, '2d');
+  assert.equal(recreatedMeta.requestedDimension, '2d');
+  assert.equal(recreatedMeta.promoted1DTo2D, false);
+
+  // DestroyResource clears tracked metadata for that texture ID.
+  processor.executeCommandBuffer(destroyPacket(1481));
+  assert.equal(handler._textureMeta.has(1481), false);
+
+  // resetStats(), reset(), and destroy() zero promoted1DTo2DCount cleanly.
+  handler.resetStats();
+  assert.equal(handler.getStats().promoted1DTo2DCount, 0);
+
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 1482, width: 4096, height: 1, usage: 0x06, dimension: 0, format: 16 })
+  );
+  assert.equal(handler.getStats().promoted1DTo2DCount, 1);
+  handler.reset();
+  assert.equal(handler.getStats().promoted1DTo2DCount, 0);
+
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 1483, width: 4096, height: 1, usage: 0x06, dimension: 0, format: 16 })
+  );
+  assert.equal(handler.getStats().promoted1DTo2DCount, 1);
+  handler.destroy();
+  assert.equal(handler.getStats().promoted1DTo2DCount, 0);
+});
+
+test('W344: 4K Bink2 SAB Y+Cr+Cb multi-frame uploads reuse a single persistent scratch buffer with zero per-frame allocations', () => {
+  const gpu = createMockWebGpu({ strictWebGpu: true });
+  const stagingPool = new GpuStagingPool({
+    device: gpu.device,
+    chunkSize: 4 * 1024 * 1024,
+    maxPoolBytes: 64 * 1024 * 1024,
+  });
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { stagingPool });
+  const handler = tp.installTexturePackets(processor);
+
+  const YW = 3840;
+  const YH = 2160;
+  const CW = 1920;
+  const CH = 1080;
+  const ALIGNED_CW = 2048;
+
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 3440, width: YW, height: YH, usage: 0x06, format: 1 })
+  );
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 3441, width: CW, height: CH, usage: 0x06, format: 1 })
+  );
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 3442, width: CW, height: CH, usage: 0x06, format: 1 })
+  );
+
+  const yData = new Uint8Array(YW * YH);
+  const crData = new Uint8Array(CW * CH);
+  const cbData = new Uint8Array(CW * CH);
+
+  const FRAMES = 4;
+  let stableScratchRef = null;
+  for (let frame = 0; frame < FRAMES; frame += 1) {
+    stagingPool.beginFrame(frame);
+    yData[0] = 0x10 + frame;
+    yData[YW * YH - 1] = 0x20 + frame;
+    crData[0] = 0x30 + frame;
+    crData[CW - 1] = 0x40 + frame;
+    cbData[0] = 0x50 + frame;
+    cbData[(CH - 1) * CW + (CW - 1)] = 0x60 + frame;
+
+    // All three planes arrive from SharedArrayBuffer (real Wasm64 command ring).
+    processor.executeCommandBuffer(
+      writeTexturePacket({
+        textureId: 3440,
+        width: YW,
+        height: YH,
+        bytesPerRow: YW,
+        rowsPerImage: YH,
+        data: yData,
+        useSab: true,
+      })
+    );
+    if (frame === 0) {
+      stableScratchRef = handler._scratchBuffer;
+      assert.ok(stableScratchRef instanceof Uint8Array);
+      assert.equal(stableScratchRef.byteLength, YW * YH);
+      // Poison chroma padding zone inside the shared scratch buffer to prove strict zero-padding on reuse.
+      stableScratchRef.fill(0xee, CW, ALIGNED_CW);
+    }
+    processor.executeCommandBuffer(
+      writeTexturePacket({
+        textureId: 3441,
+        width: CW,
+        height: CH,
+        bytesPerRow: CW,
+        rowsPerImage: CH,
+        data: crData,
+        useSab: true,
+      })
+    );
+    processor.executeCommandBuffer(
+      writeTexturePacket({
+        textureId: 3442,
+        width: CW,
+        height: CH,
+        bytesPerRow: CW,
+        rowsPerImage: CH,
+        data: cbData,
+        useSab: true,
+      })
+    );
+    assert.equal(
+      handler._scratchBuffer,
+      stableScratchRef,
+      `Frame ${frame}: single 8.3 MiB scratch buffer must serve Y, Cr, and Cb with zero reallocations`
+    );
+    stagingPool.endFrame();
+  }
+
+  const wtCalls = gpu.calls.filter((c) => c.op === 'writeTexture');
+  const c2tCalls = gpu.calls.filter((c) => c.op === 'copyBufferToTexture');
+  assert.equal(wtCalls.length, FRAMES);
+  assert.equal(c2tCalls.length, FRAMES * 2);
+  assert.ok(wtCalls.every((c) => c.isSab === false), 'no SAB views may reach queue.writeTexture');
+
+  // Verify frame 0 Y plane bytes and Cr plane zero-padded tail [1920..2048).
+  assert.equal(wtCalls[0].bytes[0], 0x10);
+  assert.equal(wtCalls[0].bytes[YW * YH - 1], 0x20);
+  assert.equal(c2tCalls[0].bytes[0], 0x30);
+  assert.equal(c2tCalls[0].bytes[CW - 1], 0x40);
+  for (let p = CW; p < ALIGNED_CW; p += 1) {
+    assert.equal(c2tCalls[0].bytes[p], 0, `Cr padding byte ${p} must be zeroed on reused scratch`);
+  }
+
+  const stats = handler.getStats();
+  assert.equal(stats.scratchBufferAllocations, 1, 'only 1 scratch allocation across 12 SAB plane uploads');
+  assert.equal(stats.scratchBufferReuses, FRAMES * 3 - 1, 'remaining 11 uploads must reuse scratch');
+  assert.equal(stats.sabCopyCount, FRAMES * 3);
+  assert.equal(stats.reusedDescriptorCount, FRAMES * 3);
+  // Internal reusable holders must not pin buffer references after uploads finish.
+  assert.equal(handler._reusablePreparedData.data, null);
+  assert.equal(handler._reusableRepackResult.data, null);
+});
+
+test('W344: TextureScratchPool geometric growth amortizes ramping upload sizes up to maxBytes cap', () => {
+  const pool = new tp.TextureScratchPool({ maxBytes: 4096 });
+
+  // Initial allocation stays tightly sized to requiredBytes.
+  const a1 = pool.acquire(512);
+  assert.equal(a1.pooled, true);
+  assert.equal(a1.reused, false);
+  assert.equal(a1.buffer.byteLength, 512);
+  assert.equal(a1.view.byteLength, 512);
+
+  // Ramping to 700B grows geometrically (512 * 2 = 1024B) so 900B hits without reallocating.
+  const a2 = pool.acquire(700);
+  assert.equal(a2.pooled, true);
+  assert.equal(a2.reused, false);
+  assert.equal(a2.buffer.byteLength, 1024);
+  assert.equal(a2.view.byteLength, 700);
+
+  const a3 = pool.acquire(900);
+  assert.equal(a3.pooled, true);
+  assert.equal(a3.reused, true);
+  assert.equal(a3.buffer, a2.buffer);
+  assert.equal(a3.view.byteLength, 900);
+
+  // Ramping to 3000B grows to 3000B (max(3000, 2048) clamped to 4096B cap).
+  const a4 = pool.acquire(3000);
+  assert.equal(a4.pooled, true);
+  assert.equal(a4.reused, false);
+  assert.equal(a4.buffer.byteLength, 3000);
+  assert.equal(a4.view.byteLength, 3000);
+
+  // Ramping to 3500B doubles clamped to maxBytes (4096B).
+  const a5 = pool.acquire(3500);
+  assert.equal(a5.pooled, true);
+  assert.equal(a5.reused, false);
+  assert.equal(a5.buffer.byteLength, 4096);
+  assert.equal(a5.view.byteLength, 3500);
+
+  // Requesting 4096B reuses the capped buffer.
+  const a6 = pool.acquire(4096);
+  assert.equal(a6.pooled, true);
+  assert.equal(a6.reused, true);
+  assert.equal(a6.buffer, a5.buffer);
+
+  // Oversized 8192B falls back to standalone without replacing retained 4096B slot.
+  const a7 = pool.acquire(8192);
+  assert.equal(a7.pooled, false);
+  assert.equal(a7.oversized, true);
+  assert.equal(pool.retainedBytes, 4096);
+  assert.equal(pool.getStats().allocations, 4);
+  assert.equal(pool.getStats().reuses, 2);
+  assert.equal(pool.getStats().oversizedFallbacks, 1);
+});
+
+test('W344: handleWriteTexture pre-clamped fast path avoids duplicate clamping and preserves small-row & 1D->2D LUT parity', () => {
+  const gpu = createMockWebGpu({ strictWebGpu: true });
+  const stagingPool = new GpuStagingPool({ device: gpu.device, chunkSize: 64 * 1024 });
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { stagingPool });
+  const handler = tp.installTexturePackets(processor);
+
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 3450, width: 256, height: 4, usage: 0x06, format: 1 })
+  );
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 3451, width: 4096, height: 1, usage: 0x06, dimension: 0, format: 22 })
+  );
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 3452, width: 4, height: 4, usage: 0x06, format: 22 })
+  );
+
+  let clampCalls = 0;
+  const origClamp = handler._clampSubRegion.bind(handler);
+  handler._clampSubRegion = function spiedClamp(...args) {
+    clampCalls += 1;
+    return origClamp(...args);
+  };
+
+  // 1) Aligned direct upload (256x4 r8unorm) -> exactly 1 clamp call (no duplicate clamp in writeTexture).
+  const alignedData = new Uint8Array(256 * 4);
+  alignedData[0] = 0x7a;
+  alignedData[1023] = 0x8b;
+  const alignedPkt = writeTexturePacket({
+    textureId: 3450,
+    width: 256,
+    height: 4,
+    bytesPerRow: 256,
+    rowsPerImage: 4,
+    data: alignedData,
+  });
+  processor.executeCommandBuffer(alignedPkt);
+  assert.equal(clampCalls, 1, 'aligned direct WriteTexture must clamp sub-region exactly once');
+
+  // 2) Promoted 1D->2D 4096x1 rgba8unorm LUT (bytesPerRow = 16384, aligned) -> 1 clamp call, zero-copy!
+  const lutData = new Uint8Array(4096 * 4);
+  lutData[0] = 0xaa;
+  lutData[lutData.length - 1] = 0xbb;
+  const lutPkt = writeTexturePacket({
+    textureId: 3451,
+    width: 4096,
+    height: 0,
+    bytesPerRow: 4096 * 4,
+    rowsPerImage: 1,
+    data: lutData,
+  });
+  processor.executeCommandBuffer(lutPkt);
+  assert.equal(clampCalls, 2);
+
+  // 3) Small-row (<=32B) staged repack (4x4 rgba8unorm, 16B/row) -> verifies inline small-row repack & zeroed tails.
+  const smallPixels = new Uint8Array(64);
+  for (let i = 0; i < 64; i += 1) smallPixels[i] = i + 5;
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 3452,
+      width: 4,
+      height: 4,
+      bytesPerRow: 16,
+      rowsPerImage: 4,
+      data: smallPixels,
+    })
+  );
+  // Poison scratch and re-upload to verify zero-padding on small-row scratch reuse.
+  handler._scratchBuffer.fill(0xcc);
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 3452,
+      width: 4,
+      height: 4,
+      bytesPerRow: 16,
+      rowsPerImage: 4,
+      data: smallPixels,
+    })
+  );
+  assert.equal(clampCalls, 4);
+
+  const wtCalls = gpu.calls.filter((c) => c.op === 'writeTexture');
+  assert.equal(wtCalls.length, 2);
+  assert.equal(wtCalls[0].bufferRef, alignedPkt.buffer);
+  assert.equal(wtCalls[1].bufferRef, lutPkt.buffer);
+  assert.deepEqual(wtCalls[1].size, { width: 4096, height: 1, depthOrArrayLayers: 1 });
+
+  const c2tCalls = gpu.calls.filter((c) => c.op === 'copyBufferToTexture');
+  assert.equal(c2tCalls.length, 2);
+  for (let row = 0; row < 4; row += 1) {
+    assert.deepEqual(
+      Array.from(c2tCalls[1].bytes.subarray(row * 256, row * 256 + 16)),
+      Array.from(smallPixels.subarray(row * 16, row * 16 + 16))
+    );
+    for (let pad = 16; pad < 256; pad += 1) {
+      assert.equal(c2tCalls[1].bytes[row * 256 + pad], 0);
+    }
+  }
 });

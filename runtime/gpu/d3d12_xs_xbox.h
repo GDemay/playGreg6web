@@ -128,7 +128,7 @@
 //  constants, 41/42 CBV, 43/44 SRV, 45/46 UAV, 47 IASetIndexBuffer, 48 IASetVertexBuffers,
 //  49 SOSetTargets, 50 OMSetRenderTargets, 51 ClearDepthStencilView, 52 ClearRenderTargetView,
 //  53/54 ClearUnorderedAccessView, 55 DiscardResource. 56..58 debug markers (inferred), 61
-//  ExecuteIndirect (signature, max 1, args, offset, 0, 0). 70 OMSetDepthBounds (two floats),
+//  ExecuteIndirect (signature, max count, args, offset, count buffer, count offset). 70 OMSetDepthBounds (two floats),
 //  85 CopyTextureRegionX (pDst, DstX, DstY, DstZ, pSrc, pSrcBox, flags),
 //  126 RSSetShadingRate (rate, combiners), 127 RSSetShadingRateImage (resource or 0).
 //  Xbox-only, meaning not established, recorded without effect: 59, 60, 62 (4 args), 72 (5 args,
@@ -381,6 +381,8 @@ struct StreamPipeline {
     StreamPipelineKind kind = StreamPipelineKind::Graphics;
     GuestGraphicsPipelineStateDesc graphics{};
     GuestComputePipelineStateDesc compute{};
+    GuestShaderBytecode mesh{};           // MS subobject (kind Mesh)
+    bool amplification = false;           // an AS subobject is present
     uint32_t subobjects = 0;
     uint32_t ignored_subobjects = 0;  // known types without an equivalent (view instancing, ...)
 };
@@ -464,7 +466,10 @@ enum class Counter : size_t {
     PresentPlanesNotDrawn,       // ... not drawn (no texture, not a filterable colour format, or
                                  // already the canvas through Device::set_back_buffer)
     ExecutesWithToken,
-    IndirectSkipped,
+    IndirectSkipped,             // ExecuteIndirect not emitted (invalid arguments, unsupported signature)
+    IndirectExecuted,            // ... emitted (draw / indexed draw / dispatch through the clamp pass)
+    IndirectMeshSkipped,         // ... mesh dispatch signatures without an emulated mesh pipeline bound, skipped
+    IndirectType105Skipped,      // ... Xbox type 105 signatures: skipped
     RectListPipelineStates,      // topology type kTopologyTypeRect accepted
     RectListDrawsSkipped,        // draws with topology kTopologyRectList that were not expanded
     RectListDrawsExpanded,       // ... expanded into triangle lists
@@ -478,7 +483,9 @@ enum class Counter : size_t {
     NativePipelineStatesRefused, // slot 57 with DeviceOptions::refuse_native_pipelines
     DxilStagesJoined,            // DXIL stage joined to an indexed native stage
     DxilStagesNotJoined,
+    DxilStagesEmbeddedNative,    // DXIL stage running the native code its own container carries (G66)
     PlaceholderPipelineStates,
+    MeshPipelineStates,          // G66: mesh pipelines emulated (mesh stage as compute + draw)
     UnknownOverrideKinds,
     ComputePipelineStatesX,      // slot 62 (DXIL)
     BlobPipelineStatesRefused,   // slot 67 (console-native compute)

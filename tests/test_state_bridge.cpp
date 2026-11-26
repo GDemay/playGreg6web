@@ -562,6 +562,161 @@ void test_bind_group_rebuild_and_retire() {
     list.Close();
 }
 
+// G66 (#691): the title releases a texture and leaves its descriptor in the heap. The descriptor
+// words do not change, so the cached bind group stayed a hit and kept binding the destroyed texture:
+// WebGPU then rejects the whole submit (show1 capture: black frame 2216). The hit is rebuilt with
+// the destroyed texture bound null, and the old group is retired.
+void test_cached_bind_group_drops_destroyed_texture() {
+    Scene scene;
+    gpu::CommandEncoder enc;
+    bridge::CommandListBridge list(scene.device, enc);
+    scene.bind_root(list);
+    const d3d::CpuDescriptorHandle rtv0 = scene.rtv(0);
+    list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+    list.DrawInstanced(3, 1, 0, 0);
+    list.Close();
+
+    // Another texture's destruction leaves the cached group alone.
+    scene.device.unregister_resource(Scene::kAlbedo2);
+    CHECK(scene.device.retired(Scene::kAlbedo2));
+    const auto record = [&] {
+        const size_t mark = enc.size();
+        list.Reset(nullptr);
+        scene.bind_root(list);
+        list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+        list.DrawInstanced(3, 1, 0, 0);
+        list.Close();
+        return decode(enc, mark);
+    };
+    std::vector<Packet> p = record();
+    CHECK(std::none_of(p.begin(), p.end(), [](const Packet& x) { return x.opcode == GpuOpcode::CreateBindGroup2; }));
+    CHECK(list.stats().bind_groups_resource_retired == 0);
+
+    // Destroying the bound texture: the next hit builds a group with it bound null.
+    scene.device.unregister_resource(Scene::kAlbedo);
+    p = record();
+    const auto created = std::find_if(p.begin(), p.end(),
+                                      [](const Packet& x) { return x.opcode == GpuOpcode::CreateBindGroup2; });
+    CHECK(created != p.end());
+    if (created != p.end()) {
+        const auto bg = pod<GpuCreateBindGroup2Payload>(*created);
+        const auto e1 = pod<GpuBindGroupEntry2>(*created, sizeof(bg) + sizeof(GpuBindGroupEntry2));
+        CHECK(e1.resource_id == 0 && e1.resource_type == static_cast<uint32_t>(GpuBindResourceType::TextureView));
+    }
+    CHECK(std::any_of(p.begin(), p.end(), [](const Packet& x) { return x.opcode == GpuOpcode::DestroyResource; }));
+    CHECK(list.stats().bind_groups_resource_retired == 1);
+    CHECK(list.stats().retired_resources_nulled >= 1);
+
+    // The rebuilt group is cached again; a texture registered under the id again is bound again.
+    p = record();
+    CHECK(std::none_of(p.begin(), p.end(), [](const Packet& x) { return x.opcode == GpuOpcode::CreateBindGroup2; }));
+    scene.device.register_texture(Scene::kAlbedo, {pso::DxgiFormat::R8G8B8A8_UNORM, 256, 256, 1, 9, 1,
+                                                   GpuTextureDimension::Dim2D, false});
+    CHECK(!scene.device.retired(Scene::kAlbedo));
+}
+
+// G66 partly-held mip chains: the title streams only a texture's small levels. Sampled views start
+// at the first held level (and at the view's min-LOD clamp), cached bind groups follow changes of
+// the held levels, and each clamped binding is counted.
+void test_partly_held_mip_chain_clamps_views() {
+    // The clamp itself.
+    uint16_t base = 0, count = 0;
+    CHECK(bridge::clamp_view_to_resident_mips(9, 3, 0.0f, &base, &count) && base == 3 && count == 0);
+    base = 1, count = 4;  // levels 1..4
+    CHECK(bridge::clamp_view_to_resident_mips(9, 3, 0.0f, &base, &count) && base == 3 && count == 2);
+    base = 1, count = 2;  // levels 1..2, nothing held: the view's last level stays
+    CHECK(bridge::clamp_view_to_resident_mips(9, 6, 0.0f, &base, &count) && base == 2 && count == 1);
+    base = 4, count = 0;
+    CHECK(!bridge::clamp_view_to_resident_mips(9, 3, 0.0f, &base, &count) && base == 4 && count == 0);
+    base = 0, count = 0;
+    CHECK(bridge::clamp_view_to_resident_mips(9, 0, 2.5f, &base, &count) && base == 2 && count == 0);
+    base = 0, count = 0;
+    CHECK(bridge::clamp_view_to_resident_mips(9, 1, 20.0f, &base, &count) && base == 8);
+
+    // Held levels from per-subresource upload marks (mip + slice * mips).
+    const uint64_t small_held[] = {0, 0, 0, 7, 7, 7};
+    CHECK(bridge::held_mip_floor(small_held, 6, 1) == 3);
+    const uint64_t all_held[] = {1, 1, 1};
+    CHECK(bridge::held_mip_floor(all_held, 3, 1) == 0);
+    const uint64_t top_only[] = {1, 0, 0};  // smaller levels filled on the GPU: not clamped
+    CHECK(bridge::held_mip_floor(top_only, 3, 1) == 0);
+    CHECK(bridge::held_mip_floor(small_held, 6, 1, /*streamable=*/false) == 0);  // black mips of a plain texture
+    const uint64_t two_slices[] = {0, 0, 1, 0, 1, 0};  // slice 0 holds level 2, slice 1 level 1
+    CHECK(bridge::held_mip_floor(two_slices, 3, 2) == 1);
+
+    Scene scene;
+    CHECK(!scene.device.set_resident_mip_floor(9999, 2));
+    gpu::CommandEncoder enc;
+    bridge::CommandListBridge list(scene.device, enc);
+    const d3d::CpuDescriptorHandle rtv0 = scene.rtv(0);
+    const auto draw = [&] {
+        const size_t mark = enc.size();
+        scene.bind_root(list);
+        list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+        list.DrawInstanced(3, 1, 0, 0);
+        return decode(enc, mark);
+    };
+    const auto texture_entry = [](const std::vector<Packet>& p, GpuBindGroupEntry2* out) {
+        for (const Packet& x : p) {
+            if (x.opcode == GpuOpcode::CreateBindGroup2) {
+                *out = pod<GpuBindGroupEntry2>(x, sizeof(GpuCreateBindGroup2Payload) + sizeof(GpuBindGroupEntry2));
+                return true;
+            }
+        }
+        return false;
+    };
+    const auto destroys = [](const std::vector<Packet>& p) {
+        return std::count_if(p.begin(), p.end(), [](const Packet& x) { return x.opcode == GpuOpcode::DestroyResource; });
+    };
+
+    // Levels 3.. held: the bound view starts at level 3.
+    CHECK(scene.device.set_resident_mip_floor(Scene::kAlbedo, 3));
+    std::vector<Packet> p = draw();
+    GpuBindGroupEntry2 e{};
+    CHECK(texture_entry(p, &e));
+    CHECK(e.resource_id == Scene::kAlbedo && e.view.base_mip_level == 3 && e.view.mip_level_count == 0);
+    CHECK(list.stats().mip_clamped_binds == 1);
+
+    // Unchanged held levels: the cached group is bound again.
+    p = draw();
+    CHECK(!texture_entry(p, &e) && destroys(p) == 0);
+
+    // Another texture's floor (limited to its single level) changes nothing.
+    CHECK(scene.device.set_resident_mip_floor(Scene::kAlbedo2, 0));
+    p = draw();
+    CHECK(!texture_entry(p, &e));
+
+    // More levels streamed in: the cached group is re-created over the new first held level.
+    CHECK(scene.device.set_resident_mip_floor(Scene::kAlbedo, 1));
+    p = draw();
+    CHECK(texture_entry(p, &e) && e.view.base_mip_level == 1 && destroys(p) == 1);
+    CHECK(list.stats().bind_groups_residency_changed == 1 && list.stats().mip_clamped_binds == 2);
+
+    // Registering the same description again keeps the held levels.
+    scene.device.register_texture(Scene::kAlbedo, {pso::DxgiFormat::R8G8B8A8_UNORM, 256, 256, 1, 9, 1,
+                                                   GpuTextureDimension::Dim2D, false});
+    bridge::TextureInfo info{};
+    CHECK(scene.device.texture_info(Scene::kAlbedo, &info) && info.resident_mip_floor == 1);
+
+    // The whole chain held: unclamped again.
+    CHECK(scene.device.set_resident_mip_floor(Scene::kAlbedo, 0));
+    p = draw();
+    CHECK(texture_entry(p, &e) && e.view.base_mip_level == 0 && e.view.mip_level_count == 0);
+    CHECK(list.stats().bind_groups_residency_changed == 2 && list.stats().mip_clamped_binds == 2);
+
+    // The view's own min-LOD clamp (ResourceMinLODClamp) clamps it too.
+    d3d::ViewDesc srv;
+    srv.format = 28;
+    srv.dimension = d3d::ViewDimension::Texture2D;
+    srv.min_lod_clamp = 4.25f;
+    CHECK(scene.heaps.create_shader_resource_view(Scene::kAlbedo, &srv, scene.srv_heap->cpu_handle(0)) ==
+          d3d::Status::Ok);
+    p = draw();
+    CHECK(texture_entry(p, &e) && e.view.base_mip_level == 4 && e.view.mip_level_count == 0);
+    CHECK(list.stats().mip_clamped_binds == 3);
+    list.Close();
+}
+
 void test_usage_conflict_is_diagnosed() {
     Scene scene;
     gpu::CommandEncoder enc;
@@ -724,6 +879,471 @@ void test_compute_dispatch_packets() {
         CHECK((early.diagnostics() & bridge::BridgeDiag::NoComputePipeline) != 0);
     }
 
+}
+
+// G66 ExecuteIndirect: a clamp compute pass (count buffer, out-of-range arguments) writes compacted
+// records into the bridge's indirect ring, which one DrawIndirect / DrawIndexedIndirect /
+// DispatchIndirect per command reads.
+size_t find_op(const std::vector<Packet>& p, GpuOpcode op, size_t from = 0) {
+    for (size_t i = from; i < p.size(); ++i) {
+        if (p[i].opcode == op) {
+            return i;
+        }
+    }
+    return p.size();
+}
+
+size_t count_op(const std::vector<Packet>& p, GpuOpcode op) {
+    return static_cast<size_t>(std::count_if(p.begin(), p.end(), [&](const Packet& k) { return k.opcode == op; }));
+}
+
+// The clamp pass's params (the last 32-byte WriteBuffer before `before`).
+std::array<uint32_t, 8> indirect_params(const std::vector<Packet>& p, size_t before) {
+    std::array<uint32_t, 8> v{};
+    for (size_t i = std::min(before, p.size()); i-- > 0;) {
+        if (p[i].opcode == GpuOpcode::WriteBuffer && pod<GpuWriteBufferPayload>(p[i]).data_len == 32) {
+            std::memcpy(v.data(), p[i].payload.data() + sizeof(GpuWriteBufferPayload), sizeof(v));
+            break;
+        }
+    }
+    return v;
+}
+
+void test_execute_indirect_packets() {
+    Scene scene(7000);
+    constexpr uint32_t kArgs = 400;
+    constexpr uint32_t kCount = 401;
+    constexpr uint32_t kIndex = 402;
+    scene.device.register_buffer(kArgs, 0x300000, 4096);
+    scene.device.register_buffer(kCount, 0x310000, 256);
+    scene.device.register_buffer(kIndex, 0x320000, 1024);
+
+    const std::string wgsl = bridge::indirect_clamp_wgsl();
+    CHECK(wgsl.find("@compute @workgroup_size(64)") != std::string::npos);
+    CHECK(wgsl.find("fn cs_main") != std::string::npos);
+    CHECK(wgsl.find("arrayLength(&cnt)") != std::string::npos);
+
+    gpu::CommandEncoder enc;
+    bridge::CommandListBridge list(scene.device, enc);
+    scene.bind_root(list);
+    const d3d::CpuDescriptorHandle rtv1 = scene.rtv(1);
+    list.OMSetRenderTargets(1, &rtv1, false, nullptr);
+    list.DrawInstanced(3, 1, 0, 0);
+    const size_t mark = enc.size();
+
+    // Draws: 3 commands, 32-byte stride at offset 64, count buffer word 1.
+    bridge::IndirectExecution draw;
+    draw.kind = bridge::IndirectKind::Draw;
+    draw.max_count = 3;
+    draw.stride = 32;
+    draw.args_buffer = kArgs;
+    draw.args_offset = 64;
+    draw.count_buffer = kCount;
+    draw.count_offset = 4;
+    CHECK(list.ExecuteIndirect(draw));
+    {
+        const std::vector<Packet> p = decode(enc, mark);
+        using O = GpuOpcode;
+        const size_t end_pass = find_op(p, O::EndRenderPass);
+        const size_t module = find_op(p, O::CreateShaderModule);
+        const size_t layout = find_op(p, O::CreateBindGroupLayout);
+        const size_t pipeline = find_op(p, O::CreateComputePipeline2);
+        const size_t ring_create = find_op(p, O::CreateBuffer);
+        const size_t group = find_op(p, O::CreateBindGroup2);
+        const size_t dispatch = find_op(p, O::DispatchCompute);
+        const size_t begin = find_op(p, O::BeginRenderPass, dispatch);
+        const size_t first_draw = find_op(p, O::DrawIndirect);
+        CHECK(end_pass < module && module < pipeline && pipeline < dispatch && dispatch < begin &&
+              begin < first_draw && first_draw < p.size());
+        CHECK(layout < p.size() && ring_create < p.size() && group < dispatch);
+        if (first_draw >= p.size() || group >= p.size() || ring_create >= p.size() || layout >= p.size()) {
+            return;
+        }
+        const auto layout_head = pod<GpuCreateBindGroupLayoutPayload>(p[layout]);
+        CHECK(layout_head.entry_count == 4);
+        const auto params_entry = pod<GpuBindGroupLayoutEntry>(p[layout], sizeof(layout_head));
+        const auto out_entry = pod<GpuBindGroupLayoutEntry>(p[layout], sizeof(layout_head) + 3 * sizeof(GpuBindGroupLayoutEntry));
+        CHECK(params_entry.binding_type == static_cast<uint8_t>(GpuBufferBindingType::Uniform) &&
+              params_entry.flags == GpuBindGroupLayoutEntryFlags::HasDynamicOffset);
+        CHECK(out_entry.binding_type == static_cast<uint8_t>(GpuBufferBindingType::Storage) &&
+              out_entry.flags == GpuBindGroupLayoutEntryFlags::HasDynamicOffset);
+        const auto ring = pod<GpuCreateBufferPayload>(p[ring_create]);
+        CHECK(ring.usage_flags == (GpuBufferUsage::Storage | GpuBufferUsage::Indirect));
+        CHECK(ring.byte_size == bridge::kIndirectRingBytes + bridge::kIndirectWindowBytes);
+        const auto bg = pod<GpuCreateBindGroup2Payload>(p[group]);
+        CHECK(bg.entry_count == 4 && bg.layout_id == layout_head.id);
+        const auto args_entry = pod<GpuBindGroupEntry2>(p[group], sizeof(bg) + sizeof(GpuBindGroupEntry2));
+        const auto count_entry = pod<GpuBindGroupEntry2>(p[group], sizeof(bg) + 2 * sizeof(GpuBindGroupEntry2));
+        const auto ring_entry = pod<GpuBindGroupEntry2>(p[group], sizeof(bg) + 3 * sizeof(GpuBindGroupEntry2));
+        CHECK(args_entry.resource_id == kArgs && count_entry.resource_id == kCount && ring_entry.resource_id == ring.id);
+        CHECK(ring_entry.size == bridge::kIndirectWindowBytes);
+        const auto set = pod<GpuSetBindGroup2Payload>(p[dispatch - 1]);
+        CHECK(p[dispatch - 1].opcode == O::SetBindGroup2 && set.bind_group_id == bg.id && set.dynamic_offset_count == 2);
+        const uint32_t window = pod<uint32_t>(p[dispatch - 1], sizeof(set) + 4);
+        CHECK(pod<GpuDispatchComputePayload>(p[dispatch]).workgroup_x == 1);
+        const std::array<uint32_t, 8> params = indirect_params(p, dispatch);
+        CHECK((params == std::array<uint32_t, 8>{16, 8, 3, 1, 1, 0, 0xFFFFFFFFu, bridge::kMaxIndirectWorkgroups}));
+        CHECK(count_op(p, O::DrawIndirect) == 3);
+        for (uint32_t i = 0; i < 3; ++i) {
+            const auto d = pod<GpuIndirectPayload>(p[first_draw + i]);
+            CHECK(p[first_draw + i].opcode == O::DrawIndirect && d.buffer_id == ring.id &&
+                  d.offset == uint64_t{window} + 16u * i);
+        }
+    }
+    CHECK(list.stats().indirect_executions == 1 && list.stats().indirect_commands == 3);
+
+    // Indexed draws without a count buffer: the bind group (args, none) is new, the pipeline is not;
+    // the index count is clamped to the bound index buffer (600 bytes of uint16 = 300 indices).
+    const gpu::d3d12_xs::D3D12IndexBufferView ib{kIndex, 0, 600, GpuIndexFormat::Uint16};
+    list.IASetIndexBuffer(&ib);
+    const size_t mark2 = enc.size();
+    bridge::IndirectExecution indexed;
+    indexed.kind = bridge::IndirectKind::DrawIndexed;
+    indexed.max_count = 2;
+    indexed.stride = 20;
+    indexed.args_buffer = kArgs;
+    CHECK(list.ExecuteIndirect(indexed));
+    {
+        const std::vector<Packet> p = decode(enc, mark2);
+        CHECK(count_op(p, GpuOpcode::CreateShaderModule) == 0 && count_op(p, GpuOpcode::CreateComputePipeline2) == 0);
+        const size_t group = find_op(p, GpuOpcode::CreateBindGroup2);
+        CHECK(group < p.size());
+        if (group < p.size()) {
+            const auto bg = pod<GpuCreateBindGroup2Payload>(p[group]);
+            const auto count_entry = pod<GpuBindGroupEntry2>(p[group], sizeof(bg) + 2 * sizeof(GpuBindGroupEntry2));
+            CHECK(count_entry.resource_id == kArgs);  // no count buffer: the args buffer stands in
+        }
+        const size_t dispatch = find_op(p, GpuOpcode::DispatchCompute);
+        const std::array<uint32_t, 8> params = indirect_params(p, dispatch);
+        CHECK(params[0] == 0 && params[1] == 5 && params[2] == 2 && params[4] == 0 && params[5] == 1 && params[6] == 300);
+        CHECK(find_op(p, GpuOpcode::SetIndexBuffer) < find_op(p, GpuOpcode::DrawIndexedIndirect));
+        const size_t first = find_op(p, GpuOpcode::DrawIndexedIndirect);
+        CHECK(count_op(p, GpuOpcode::DrawIndexedIndirect) == 2 && first + 1 < p.size());
+        if (first + 1 < p.size()) {
+            CHECK(pod<GpuIndirectPayload>(p[first + 1]).offset - pod<GpuIndirectPayload>(p[first]).offset == 20);
+        }
+    }
+
+    // The same buffers again: cached bind group, a new ring window.
+    const size_t mark3 = enc.size();
+    CHECK(list.ExecuteIndirect(draw));
+    {
+        const std::vector<Packet> p = decode(enc, mark3);
+        CHECK(count_op(p, GpuOpcode::CreateBindGroup2) <= 1);  // only the re-begun pass's own groups
+        CHECK(count_op(p, GpuOpcode::DrawIndirect) == 3);
+    }
+
+    // Over kMaxIndirectCommands: truncated and counted.
+    bridge::IndirectExecution many = draw;
+    many.max_count = bridge::kMaxIndirectCommands + 44;
+    const size_t mark4 = enc.size();
+    CHECK(list.ExecuteIndirect(many));
+    {
+        const std::vector<Packet> p = decode(enc, mark4);
+        CHECK(count_op(p, GpuOpcode::DrawIndirect) == bridge::kMaxIndirectCommands);
+        CHECK(pod<GpuDispatchComputePayload>(p[find_op(p, GpuOpcode::DispatchCompute)]).workgroup_x ==
+              bridge::kMaxIndirectCommands / 64);
+    }
+    CHECK(list.stats().indirect_truncated == 44);
+
+    // Invalid executions are skipped without packets.
+    const size_t mark5 = enc.size();
+    bridge::IndirectExecution bad = draw;
+    bad.stride = 8;  // shorter than a draw record
+    CHECK(!list.ExecuteIndirect(bad));
+    bad = draw;
+    bad.args_buffer = 0;
+    CHECK(!list.ExecuteIndirect(bad));
+    bad = draw;
+    bad.args_offset = 6;  // unaligned
+    CHECK(!list.ExecuteIndirect(bad));
+    bad = draw;
+    bad.kind = bridge::IndirectKind::Dispatch;  // no compute pipeline state
+    bad.stride = 12;
+    CHECK(!list.ExecuteIndirect(bad));
+    CHECK(enc.size() == mark5);
+    CHECK(list.stats().indirect_skipped == 4);
+    bridge::IndirectExecution none = draw;
+    none.max_count = 0;
+    CHECK(list.ExecuteIndirect(none) && enc.size() == mark5);  // nothing to draw
+    list.Close();
+
+    {
+        // Indexed draws without an index buffer are skipped.
+        gpu::CommandEncoder scratch;
+        bridge::CommandListBridge other(scene.device, scratch);
+        scene.bind_root(other);
+        other.OMSetRenderTargets(1, &rtv1, false, nullptr);
+        CHECK(!other.ExecuteIndirect(indexed));
+        CHECK(count_op(decode(scratch), GpuOpcode::DrawIndexedIndirect) == 0);
+    }
+
+    // Dispatches: clamped to the per-dimension limit, then the stage's pipeline and bind groups.
+    constexpr uint64_t kCs = 0xC6;
+    constexpr uint32_t kParams = 403;
+    scene.device.register_shader_module(kCs, 4);
+    scene.device.register_buffer(kParams, 0x330000, 1024);
+    d3d::RootSignatureDesc rs;
+    d3d::RootParameterDesc cbv;
+    cbv.parameter_type = d3d::RootParameterType::Cbv;
+    rs.parameters.push_back(cbv);
+    d3d::RootSignature signature;
+    CHECK(d3d::RootSignature::build(rs, &signature).ok());
+    bridge::PipelineLayoutDesc layout;
+    bridge::GroupLayoutDesc group;
+    group.bindings.push_back({layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer,
+                                           static_cast<uint8_t>(GpuBufferBindingType::Uniform)),
+                              join(0, d3d::DescriptorRangeType::Cbv, 0)});
+    layout.groups.push_back(group);
+    scene.device.register_pipeline_layout(kCs, 0, layout);
+    pso::D3D12ComputePsoDesc desc;
+    desc.cs = kCs;
+    desc.root_signature_id = 11;
+    auto cpso = scene.device.create_compute_pipeline_state(desc, &signature);
+
+    gpu::CommandEncoder cenc;
+    bridge::CommandListBridge compute(scene.device, cenc);
+    CHECK(compute.SetComputeRootSignature(&signature) == d3d::Status::Ok);
+    CHECK(compute.SetComputeRootConstantBufferView(0, 0x330000) == d3d::Status::Ok);
+    compute.SetComputePipelineState(cpso.get());
+    bridge::IndirectExecution dispatch;
+    dispatch.kind = bridge::IndirectKind::Dispatch;
+    dispatch.max_count = 2;
+    dispatch.stride = 12;
+    dispatch.args_buffer = kArgs;
+    dispatch.args_offset = 128;
+    dispatch.count_buffer = kCount;
+    CHECK(compute.ExecuteIndirect(dispatch));
+    compute.Close();
+    {
+        const std::vector<Packet> p = decode(cenc);
+        const size_t clamp = find_op(p, GpuOpcode::DispatchCompute);
+        const size_t first = find_op(p, GpuOpcode::DispatchIndirect);
+        CHECK(clamp < first && first + 1 < p.size() && count_op(p, GpuOpcode::DispatchIndirect) == 2);
+        if (clamp < first && first < p.size()) {
+            CHECK(p[first - 1].opcode == GpuOpcode::SetBindGroup2);
+            bool stage_set = false;
+            for (size_t i = clamp; i < first; ++i) {
+                stage_set |= p[i].opcode == GpuOpcode::SetComputePipeline &&
+                             pod<GpuSetComputePipelinePayload>(p[i]).pipeline_id == cpso->pipeline_id();
+            }
+            CHECK(stage_set);
+            const std::array<uint32_t, 8> params = indirect_params(p, clamp);
+            CHECK(params[0] == 32 && params[1] == 3 && params[2] == 2 && params[3] == 0 && params[4] == 1 &&
+                  params[5] == 2 && params[7] == 65535);
+            CHECK(pod<GpuIndirectPayload>(p[first + 1]).offset - pod<GpuIndirectPayload>(p[first]).offset == 12);
+        }
+    }
+    CHECK(compute.stats().indirect_executions == 1 && compute.stats().indirect_commands == 2);
+
+    // A destroyed argument buffer retires its clamp bind groups: the next use builds a new one.
+    scene.device.unregister_resource(kCount);
+    scene.device.register_buffer(kCount, 0x310000, 256);
+    gpu::CommandEncoder renc;
+    bridge::CommandListBridge again(scene.device, renc);
+    CHECK(again.SetComputeRootSignature(&signature) == d3d::Status::Ok);
+    CHECK(again.SetComputeRootConstantBufferView(0, 0x330000) == d3d::Status::Ok);
+    again.SetComputePipelineState(cpso.get());
+    CHECK(again.ExecuteIndirect(dispatch));
+    again.Close();
+    {
+        const std::vector<Packet> p = decode(renc);
+        bool rebuilt = false;
+        for (const Packet& k : p) {
+            if (k.opcode == GpuOpcode::CreateBindGroup2 && pod<GpuCreateBindGroup2Payload>(k).entry_count == 4) {
+                const auto e = pod<GpuBindGroupEntry2>(k, sizeof(GpuCreateBindGroup2Payload) + 2 * sizeof(GpuBindGroupEntry2));
+                rebuilt |= e.resource_id == kCount;
+            }
+        }
+        CHECK(rebuilt);
+    }
+    CHECK(scene.device.deferred_destroy_count() >= 1);
+}
+
+// G66 mesh pipelines: the mesh stage runs as compute (groups 0..2 from the graphics root arguments,
+// group 3 the runtime's output buffer), then a draw with the runtime vertex shader pulls the
+// triangles. DispatchMesh directly and through ExecuteIndirect (clamp kind 3: dispatch + draw pair).
+void test_mesh_pipeline_packets() {
+    Scene scene(11000);
+    constexpr uint32_t kArgs = 500;
+    scene.device.register_buffer(kArgs, 0x400000, 4096);
+
+    bridge::MeshOutputLayout out{64, 32, 12};
+    CHECK(bridge::valid_mesh_output_layout(out));
+    CHECK(!bridge::valid_mesh_output_layout({0, 32, 12}) && !bridge::valid_mesh_output_layout({64, 300, 12}) &&
+          !bridge::valid_mesh_output_layout({64, 32, 10}) && !bridge::valid_mesh_output_layout({64, 32, 68}));
+    const uint32_t record = 4 + 64 * 12 + 32 * 3;
+    CHECK(bridge::mesh_group_record_words(out) == record);
+    CHECK(bridge::mesh_max_groups(out) == std::min<uint64_t>(bridge::kMeshOutputBytes / (record * 4u), 65535u));
+    CHECK(bridge::mesh_max_groups({256, 256, 64}) == bridge::kMeshOutputBytes / ((4u + 256u * 64u + 768u) * 4u));
+    CHECK(bridge::indirect_output_bytes(bridge::IndirectKind::DispatchMesh) == 28);
+    CHECK(bridge::mesh_compute_pack_key(bridge::mesh_compute_pack_key(0x1234)) == 0x1234);
+    CHECK(bridge::mesh_draw_vertex_identity(out) != bridge::mesh_draw_vertex_identity({64, 32, 8}));
+    const std::string vs = bridge::mesh_draw_vertex_wgsl(out);
+    CHECK(vs.find("fn vs_main(@builtin(vertex_index)") != std::string::npos);
+    CHECK(vs.find("@group(3) @binding(0) var<storage, read> ms_out: array<u32>;") != std::string::npos);
+    CHECK(vs.find("@location(1) a1: vec4<f32>") != std::string::npos && vs.find("@location(2)") == std::string::npos);
+    CHECK(vs.find("const RECORD_WORDS: u32 = " + std::to_string(record) + "u;") != std::string::npos);
+    CHECK(vs.find("const INDEX_BASE: u32 = 772u;") != std::string::npos);
+    const std::string clamp = bridge::indirect_clamp_wgsl();
+    CHECK(clamp.find("p.kind == 3u") != std::string::npos && clamp.find("groups * p.index_limit") != std::string::npos);
+
+    // The mesh stage: module 6, one group with the root constants (compute visibility).
+    constexpr uint64_t kMs = 0xD7;
+    const uint64_t stage_identity = bridge::mesh_compute_pack_key(kMs);
+    scene.device.register_shader_module(stage_identity, 6);
+    bridge::PipelineLayoutDesc stage_layout;
+    bridge::GroupLayoutDesc stage_group;
+    stage_group.bindings.push_back({layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer,
+                                                 static_cast<uint8_t>(GpuBufferBindingType::Uniform)),
+                                    join(0, d3d::DescriptorRangeType::Cbv, 0, true)});
+    stage_layout.groups.push_back(stage_group);
+    scene.device.register_pipeline_layout(stage_identity, 0, stage_layout);
+    // The draw: the runtime vertex shader (module 7) and the scene's pixel shader and layout.
+    const uint64_t draw_vs = bridge::mesh_draw_vertex_identity(out);
+    scene.device.register_shader_module(draw_vs, 7);
+    bridge::PipelineLayoutDesc draw_layout;
+    bridge::GroupLayoutDesc draw_group;
+    draw_group.bindings.push_back({layout_entry(0, GpuShaderStageBits::Vertex | GpuShaderStageBits::Fragment,
+                                                GpuBindingLayoutType::Buffer,
+                                                static_cast<uint8_t>(GpuBufferBindingType::Uniform)),
+                                   join(0, d3d::DescriptorRangeType::Cbv, 0, true)});
+    draw_layout.groups.push_back(draw_group);
+    scene.device.register_pipeline_layout(draw_vs, Scene::kPs, draw_layout);
+    pso::D3D12GraphicsPsoDesc desc = Scene::pso_desc();
+    desc.vs = draw_vs;
+    desc.pInputElementDescs = nullptr;
+    desc.NumInputElements = 0;
+    auto mesh = scene.device.create_mesh_pipeline_state(desc, stage_identity, out, &scene.root_signature);
+    CHECK(mesh != nullptr && mesh->diagnostics() == 0);
+    if (mesh == nullptr || mesh->diagnostics() != 0) {
+        return;
+    }
+
+    gpu::CommandEncoder enc;
+    bridge::CommandListBridge list(scene.device, enc);
+    scene.bind_root(list);
+    const d3d::CpuDescriptorHandle rtv1 = scene.rtv(1);
+    list.OMSetRenderTargets(1, &rtv1, false, nullptr);
+    list.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::LineList);  // mesh draws are triangles regardless
+    list.SetMeshPipelineState(mesh.get());
+    const size_t mark = enc.size();
+    CHECK(list.DispatchMesh(5, 1, 1));
+    uint32_t output_buffer = 0;
+    {
+        using O = GpuOpcode;
+        const std::vector<Packet> p = decode(enc, mark);
+        const size_t create = find_op(p, O::CreateComputePipeline2);
+        const size_t dispatch = find_op(p, O::DispatchCompute);
+        const size_t begin = find_op(p, O::BeginRenderPass, dispatch);
+        const size_t render = find_op(p, O::CreateRenderPipeline2, dispatch);
+        const size_t draw = find_op(p, O::Draw, dispatch);
+        CHECK(create < dispatch && dispatch < begin && begin < draw && render < draw && draw < p.size());
+        if (draw >= p.size() || render >= p.size()) {
+            return;
+        }
+        const auto cp = pod<GpuCreateComputePipeline2Payload>(p[create]);
+        const auto rp = pod<GpuCreateRenderPipeline2Payload>(p[render]);
+        CHECK(cp.cs_module_id == 6 && rp.vs_module_id == 7 && rp.fs_module_id == Scene::kFsModule);
+        CHECK(pod<GpuCreateRenderPipeline2Payload>(p[render]).key.primitive.topology ==
+              static_cast<uint8_t>(pso::WgpuPrimitiveTopology::TriangleList));
+        // Both pipeline layouts: own group, two empty groups, the output group.
+        size_t layouts = 0;
+        for (const Packet& k : p) {
+            if (k.opcode == O::CreatePipelineLayout) {
+                const auto pl = pod<GpuCreatePipelineLayoutPayload>(k);
+                if (pl.id == cp.pipeline_layout_id || pl.id == rp.pipeline_layout_id) {
+                    CHECK(pl.bind_group_layout_count == 4);
+                    ++layouts;
+                }
+            }
+        }
+        CHECK(layouts == 2);
+        for (size_t i = 0; i < dispatch; ++i) {
+            if (p[i].opcode == O::CreateBuffer && pod<GpuCreateBufferPayload>(p[i]).byte_size == bridge::kMeshOutputBytes) {
+                CHECK(pod<GpuCreateBufferPayload>(p[i]).usage_flags == GpuBufferUsage::Storage);
+                output_buffer = pod<GpuCreateBufferPayload>(p[i]).id;
+            }
+        }
+        CHECK(output_buffer != 0);
+        // Group 3 is set right before the dispatch and before the draw.
+        const auto stage_set = pod<GpuSetBindGroup2Payload>(p[dispatch - 1]);
+        CHECK(p[dispatch - 1].opcode == O::SetBindGroup2 && stage_set.group_index == bridge::kMeshOutputGroup);
+        const auto draw_set = pod<GpuSetBindGroup2Payload>(p[draw - 1]);
+        CHECK(p[draw - 1].opcode == O::SetBindGroup2 && draw_set.group_index == bridge::kMeshOutputGroup &&
+              draw_set.bind_group_id != stage_set.bind_group_id);
+        size_t output_groups = 0;
+        for (const Packet& k : p) {
+            if (k.opcode == O::CreateBindGroup2 && pod<GpuCreateBindGroup2Payload>(k).entry_count == 1) {
+                output_groups += pod<GpuBindGroupEntry2>(k, sizeof(GpuCreateBindGroup2Payload)).resource_id ==
+                                 output_buffer;
+            }
+        }
+        CHECK(output_groups == 2);
+        const auto d = pod<GpuDispatchComputePayload>(p[dispatch]);
+        CHECK(d.workgroup_x == 5 && d.workgroup_y == 1 && d.workgroup_z == 1);
+        const auto dr = pod<GpuDrawPayload>(p[draw]);
+        CHECK(dr.vertex_count == 5 * 32 * 3 && dr.instance_count == 1);
+    }
+    CHECK(list.stats().mesh_dispatches == 1);
+
+    // y/z groups and over-budget x are skipped without packets.
+    const size_t mark2 = enc.size();
+    CHECK(!list.DispatchMesh(5, 2, 1));
+    CHECK(!list.DispatchMesh(bridge::mesh_max_groups(out) + 1, 1, 1));
+    CHECK(enc.size() == mark2 && list.stats().mesh_skipped == 2);
+
+    // Indirect: per command a dispatch record, then the draw record 12 bytes on (28-byte pairs).
+    bridge::IndirectExecution e;
+    e.kind = bridge::IndirectKind::DispatchMesh;
+    e.max_count = 2;
+    e.stride = 16;
+    e.args_buffer = kArgs;
+    e.args_offset = 32;
+    CHECK(list.ExecuteIndirect(e));
+    {
+        using O = GpuOpcode;
+        const std::vector<Packet> p = decode(enc, mark2);
+        const size_t clamp_dispatch = find_op(p, O::DispatchCompute);
+        const std::array<uint32_t, 8> params = indirect_params(p, clamp_dispatch);
+        CHECK((params == std::array<uint32_t, 8>{8, 4, 2, 0, 0, 3, 32 * 3, bridge::mesh_max_groups(out)}));
+        std::vector<GpuIndirectPayload> work;
+        std::vector<O> ops;
+        for (size_t i = clamp_dispatch; i < p.size(); ++i) {
+            if (p[i].opcode == O::DispatchIndirect || p[i].opcode == O::DrawIndirect) {
+                work.push_back(pod<GpuIndirectPayload>(p[i]));
+                ops.push_back(p[i].opcode);
+                const auto set = pod<GpuSetBindGroup2Payload>(p[i - 1]);
+                CHECK(p[i - 1].opcode == O::SetBindGroup2 && set.group_index == bridge::kMeshOutputGroup);
+            }
+        }
+        CHECK((ops == std::vector<O>{O::DispatchIndirect, O::DrawIndirect, O::DispatchIndirect, O::DrawIndirect}));
+        if (work.size() == 4) {
+            CHECK(work[1].offset == work[0].offset + 12 && work[2].offset == work[0].offset + 28 &&
+                  work[3].offset == work[0].offset + 40);
+            CHECK(work[0].buffer_id == work[3].buffer_id);
+        }
+    }
+    CHECK(list.stats().mesh_dispatches == 3 && list.stats().indirect_commands == 2);
+
+    // A regular pipeline state unbinds the mesh one: mesh work is skipped.
+    list.SetPipelineState(scene.pso.get());
+    const size_t mark3 = enc.size();
+    CHECK(!list.ExecuteIndirect(e));
+    CHECK(!list.DispatchMesh(1, 1, 1));
+    CHECK(enc.size() == mark3 && list.stats().mesh_skipped == 4);
+    list.Close();
+
+    // A stage layout with more than three groups cannot take the output group.
+    constexpr uint64_t kWide = 0xE8;
+    bridge::PipelineLayoutDesc wide;
+    for (int i = 0; i < 4; ++i) {
+        wide.groups.push_back(bridge::GroupLayoutDesc{});
+    }
+    scene.device.register_shader_module(kWide, 8);
+    scene.device.register_pipeline_layout(kWide, 0, wide);
+    auto bad = scene.device.create_mesh_pipeline_state(desc, kWide, out, &scene.root_signature);
+    CHECK((bad->diagnostics() & bridge::BridgeDiag::MissingPipelineLayout) != 0);
 }
 
 // Binding arrays (G62, lane-indexed heap windows): with the device capability on, the layout entry
@@ -932,6 +1552,46 @@ void test_indexed_draw_and_layout_dedup() {
     CHECK(list.stats().draws == 2);
 }
 
+// G66: N identical draws create exactly the objects one draw does; every later draw is a cache hit.
+void test_identical_draws_create_no_new_objects() {
+    struct Result {
+        size_t creates = 0;
+        bridge::BridgeStats stats;
+    };
+    auto run = [](uint32_t n) {
+        Scene scene;
+        gpu::CommandEncoder enc;
+        bridge::CommandListBridge list(scene.device, enc);
+        scene.bind_root(list);
+        const d3d::CpuDescriptorHandle rtv0 = scene.rtv(0);
+        list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+        for (uint32_t i = 0; i < n; ++i) {
+            list.DrawInstanced(3, 1, 0, 0);
+        }
+        list.Close();
+        Result r;
+        for (const Packet& pk : decode(enc)) {
+            using O = GpuOpcode;
+            r.creates += (pk.opcode == O::CreateBuffer || pk.opcode == O::CreateSampler2 ||
+                          pk.opcode == O::CreateBindGroup2 || pk.opcode == O::CreateBindGroupLayout ||
+                          pk.opcode == O::CreatePipelineLayout || pk.opcode == O::CreateRenderPipeline2)
+                             ? 1
+                             : 0;
+        }
+        r.stats = list.stats();
+        return r;
+    };
+    const Result one = run(1);
+    const Result many = run(64);
+    CHECK(one.creates > 0);
+    CHECK(many.creates == one.creates);
+    CHECK(many.stats.draws == 64);
+    CHECK(many.stats.pipelines_created == one.stats.pipelines_created);
+    CHECK(many.stats.bind_groups_created == one.stats.bind_groups_created);
+    CHECK(many.stats.bind_group_cache_misses == one.stats.bind_group_cache_misses);
+    CHECK(many.stats.bind_group_cache_hits == one.stats.bind_group_cache_hits + 63);
+}
+
 // Several recording threads share one device: pipelines, layouts, samplers and the root constant ring
 // are created exactly once across all streams.
 void test_concurrent_command_lists() {
@@ -983,9 +1643,13 @@ void test_concurrent_command_lists() {
 
 // A constant-buffer view at a 16-byte aligned address (Xbox) bound through a descriptor table:
 // WebGPU cannot bind a uniform buffer at that offset, so the bridge asks the relocate hook for an
-// aligned copy and binds that; without the hook the binding is diagnosed.
+// aligned copy and binds that; without the hook the binding is diagnosed and bound null. G66
+// (#691): a view of zero size (a console descriptor of zero records) is relocated too. Every
+// uniform binding the bridge emits sits at a 256-byte aligned offset, within the 64 KiB limit.
 void test_unaligned_uniform_relocation() {
-    for (const bool with_hook : {true, false}) {
+    for (const int variant : {0, 1, 2}) {  // 0: hook, 1: no hook, 2: hook + zero-size view
+        const bool with_hook = variant != 1;
+        const bool zero_size = variant == 2;
         d3d::DescriptorHeapRegistry heaps;
         heaps.set_cbv_alignment(16);
         d3d::ResourceStateRegistry states;
@@ -1012,7 +1676,7 @@ void test_unaligned_uniform_relocation() {
         CHECK(heaps.create_render_target_view(kTarget, nullptr, rtv_heap->cpu_handle(0)) == d3d::Status::Ok);
         d3d::ConstantBufferViewDesc cbv;
         cbv.buffer_location = kCbVa + 0x40;
-        cbv.size_in_bytes = 96;
+        cbv.size_in_bytes = zero_size ? 0 : 96;
         CHECK(heaps.create_constant_buffer_view(&cbv, cbv_heap->cpu_handle(0)) == d3d::Status::Ok);
 
         d3d::RootSignatureDesc rs;
@@ -1031,6 +1695,9 @@ void test_unaligned_uniform_relocation() {
                                                GpuBindingLayoutType::Buffer,
                                                static_cast<uint8_t>(GpuBufferBindingType::Uniform)),
                                   join(0, d3d::DescriptorRangeType::Cbv, 0)});
+        if (zero_size) {
+            group.bindings.back().entry.min_binding_size = 16;  // the stage's reflected block (as in the trace)
+        }
         layout.groups.push_back(group);
         device.register_pipeline_layout(kVs, kPs, layout);
         pso::D3D12GraphicsPsoDesc d = Scene::pso_desc();
@@ -1060,6 +1727,17 @@ void test_unaligned_uniform_relocation() {
         for (const Packet& packet : p) {
             if (packet.opcode == GpuOpcode::CreateBindGroup2 && packet.payload.size() > sizeof(GpuCreateBindGroup2Payload)) {
                 bind_group = &packet;
+                // Every buffer binding emitted: a 256-byte aligned offset, within the 64 KiB
+                // uniform limit (or null).
+                const auto g = pod<GpuCreateBindGroup2Payload>(packet, 0);
+                for (uint32_t k = 0; k < g.entry_count; ++k) {
+                    const auto be = pod<GpuBindGroupEntry2>(
+                        packet, sizeof(GpuCreateBindGroup2Payload) + size_t{k} * sizeof(GpuBindGroupEntry2));
+                    if (be.resource_type == static_cast<uint32_t>(GpuBindResourceType::Buffer)) {
+                        CHECK(be.offset % bridge::kUniformOffsetAlignment == 0);
+                        CHECK(be.resource_id == 0 || (be.size != 0 && be.size <= bridge::kMaxUniformBindingSize));
+                    }
+                }
             }
         }
         CHECK(bind_group != nullptr);
@@ -1067,10 +1745,13 @@ void test_unaligned_uniform_relocation() {
             const auto entry = pod<GpuBindGroupEntry2>(*bind_group, sizeof(GpuCreateBindGroup2Payload));
             if (with_hook) {
                 CHECK(entry.resource_id == 777 && entry.offset == 512 && entry.size == 256);  // whole relocated slot
-                CHECK(calls.size() == 1 && calls[0].first == kCbVa + 0x40 && calls[0].second == 96);
+                // A zero-size view is relocated at the stage's reflected block (16 bytes).
+                CHECK(calls.size() == 1 && calls[0].first == kCbVa + 0x40 &&
+                      calls[0].second == (zero_size ? 16u : 96u));
                 CHECK((list.diagnostics() & bridge::BridgeDiag::UnalignedUniform) == 0);
             } else {
-                CHECK(entry.resource_id == kCb && entry.offset == 0x40);
+                // Bound null: an unaligned offset would invalidate the bind group and its draws.
+                CHECK(entry.resource_id == 0 && entry.offset == 0);
                 CHECK((list.diagnostics() & bridge::BridgeDiag::UnalignedUniform) != 0);
             }
         }
@@ -1094,7 +1775,7 @@ void test_storage_texture_needs_storage_usage() {
         constexpr uint64_t kVs = 0xE1, kPs = 0xE2;
         device.register_texture(kTarget, {pso::DxgiFormat::B8G8R8A8_UNORM, 64, 64, 1, 1, 1,
                                           GpuTextureDimension::Dim2D, false});
-        bridge::TextureInfo tex{variant == 2 ? pso::DxgiFormat::R16G16B16A16_FLOAT : pso::DxgiFormat::R8G8B8A8_UNORM_SRGB,
+        bridge::TextureInfo tex{variant == 2 ? pso::DxgiFormat::R8G8B8A8_UINT : pso::DxgiFormat::R8G8B8A8_UNORM_SRGB,
                                 32, 32, 1, 1, 1, GpuTextureDimension::Dim2D, false};
         tex.storage = with_usage;
         device.register_texture(kTex, tex);
@@ -1255,11 +1936,196 @@ void test_unaligned_storage_relocation() {
                 CHECK(calls.size() == 1 && calls[0].first == kBufVa + 0x40 && calls[0].second == 128);
                 CHECK((list.diagnostics() & bridge::BridgeDiag::UnalignedStorage) == 0);
             } else {
-                CHECK(entry.resource_id == kBuf && entry.offset == 0x40);
+                // G66 (#691): bound null, never at the unaligned offset (it would invalidate the
+                // bind group and every draw using it).
+                CHECK(entry.resource_id == 0 && entry.offset == 0);
                 CHECK((list.diagnostics() & bridge::BridgeDiag::UnalignedStorage) != 0);
             }
         }
     }
+}
+
+// G66: the title's UI vertex stage (root signature: one root SRV) reads that root SRV as a uniform
+// header (binding 0) and as read-only storage for vertex pulling (binding 3): the same GPU VA. At
+// an unaligned VA both bindings are relocated copies of that memory; the storage one (no view size:
+// a root view) copies up to the end of the buffer. It was bound null, which emptied the LEGAL
+// NOTICES alpha mask.
+void test_root_srv_read_as_uniform_and_storage() {
+    d3d::DescriptorHeapRegistry heaps;
+    d3d::ResourceStateRegistry states;
+    std::vector<std::pair<uint64_t, uint64_t>> uniform_calls, storage_calls;
+    bridge::BridgeOptions options = counting_options(5000);
+    options.relocate_uniform = [&uniform_calls](uint64_t va, uint64_t size, uint64_t, uint32_t* id, uint64_t* offset) {
+        uniform_calls.emplace_back(va, size);
+        *id = 777;
+        *offset = 512;
+        return true;
+    };
+    options.relocate_storage = [&storage_calls](uint64_t va, uint64_t size, uint32_t* id, uint64_t* offset) {
+        storage_calls.emplace_back(va, size);
+        *id = 888;
+        *offset = 1024;
+        return true;
+    };
+    bridge::StateBridgeDevice device(heaps, options, &states);
+    constexpr uint32_t kTarget = 100, kBuf = 301, kVsModule = 1, kFsModule = 2;
+    constexpr uint64_t kVs = 0xC1, kPs = 0xC2, kBufVa = 0x20000, kViewOffset = 0x40;
+    device.register_texture(kTarget, {pso::DxgiFormat::B8G8R8A8_UNORM, 64, 64, 1, 1, 1,
+                                      GpuTextureDimension::Dim2D, false});
+    device.register_buffer(kBuf, kBufVa, 4096);
+    device.register_shader_module(kVs, kVsModule);
+    device.register_shader_module(kPs, kFsModule);
+    d3d::DescriptorHeap* rtv_heap = make_heap(heaps, d3d::DescriptorHeapType::Rtv, 1, false);
+    CHECK(heaps.create_render_target_view(kTarget, nullptr, rtv_heap->cpu_handle(0)) == d3d::Status::Ok);
+
+    d3d::RootSignatureDesc rs;
+    d3d::RootParameterDesc srv;
+    srv.parameter_type = d3d::RootParameterType::Srv;
+    srv.shader_register = 0;
+    rs.parameters.push_back(srv);
+    d3d::RootSignature root;
+    CHECK(d3d::RootSignature::build(rs, &root).ok());
+    bridge::PipelineLayoutDesc layout;
+    bridge::GroupLayoutDesc group;
+    auto uniform = layout_entry(0, GpuShaderStageBits::Vertex, GpuBindingLayoutType::Buffer,
+                                static_cast<uint8_t>(GpuBufferBindingType::Uniform));
+    uniform.min_binding_size = 16;
+    group.bindings.push_back({uniform, join(0, d3d::DescriptorRangeType::Srv, 0)});
+    group.bindings.push_back({layout_entry(3, GpuShaderStageBits::Vertex, GpuBindingLayoutType::Buffer,
+                                           static_cast<uint8_t>(GpuBufferBindingType::ReadOnlyStorage)),
+                              join(3, d3d::DescriptorRangeType::Srv, 0)});
+    layout.groups.push_back(group);
+    device.register_pipeline_layout(kVs, kPs, layout);
+    pso::D3D12GraphicsPsoDesc d = Scene::pso_desc();
+    d.vs = kVs;
+    d.ps = kPs;
+    d.DSVFormat = pso::DxgiFormat::UNKNOWN;
+    auto state = device.create_graphics_pipeline_state(d, &root);
+
+    gpu::CommandEncoder enc;
+    bridge::CommandListBridge list(device, enc);
+    CHECK(list.SetGraphicsRootSignature(&root) == d3d::Status::Ok);
+    list.SetPipelineState(state.get());
+    CHECK(list.SetGraphicsRootShaderResourceView(0, kBufVa + kViewOffset) == d3d::Status::Ok);
+    list.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::TriangleList);
+    const d3d::CpuDescriptorHandle rtv0 = rtv_heap->cpu_handle(0);
+    list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+    list.DrawInstanced(3, 1, 0, 0);
+    list.Close();
+
+    const Packet* bind_group = nullptr;
+    const auto packets = decode(enc);
+    for (const Packet& packet : packets) {
+        if (packet.opcode == GpuOpcode::CreateBindGroup2 &&
+            packet.payload.size() >= sizeof(GpuCreateBindGroup2Payload) + 2 * sizeof(GpuBindGroupEntry2)) {
+            bind_group = &packet;
+        }
+    }
+    CHECK(bind_group != nullptr);
+    if (bind_group != nullptr) {
+        const auto e0 = pod<GpuBindGroupEntry2>(*bind_group, sizeof(GpuCreateBindGroup2Payload));
+        const auto e3 =
+            pod<GpuBindGroupEntry2>(*bind_group, sizeof(GpuCreateBindGroup2Payload) + sizeof(GpuBindGroupEntry2));
+        CHECK(e0.binding == 0 && e0.resource_id == 777 && e0.offset == 512);
+        CHECK(e3.binding == 3 && e3.resource_id == 888 && e3.offset == 1024 && e3.size == 4096 - kViewOffset);
+        CHECK(uniform_calls.size() == 1 && uniform_calls[0].first == kBufVa + kViewOffset);
+        CHECK(storage_calls.size() == 1 && storage_calls[0].first == kBufVa + kViewOffset &&
+              storage_calls[0].second == 4096 - kViewOffset);
+        CHECK((list.diagnostics() & (bridge::BridgeDiag::UnalignedStorage | bridge::BridgeDiag::NullBinding)) == 0);
+    }
+}
+
+// G66 (#691): a cached bind group over a relocated storage copy must follow the copy when the
+// device hands its home to another range (LRU eviction, relocation_epoch bumped). Before, the cache
+// hit kept binding the old home, so the LEGAL NOTICES draws read another draw's vertex data (grey).
+void test_cached_bind_group_follows_moved_relocation() {
+    d3d::DescriptorHeapRegistry heaps;
+    d3d::ResourceStateRegistry states;
+    uint64_t home = 1024, epoch = 0;
+    int calls = 0;
+    bridge::BridgeOptions options = counting_options(5000);
+    options.relocate_storage = [&](uint64_t, uint64_t, uint32_t* id, uint64_t* offset) {
+        ++calls;
+        *id = 888;
+        *offset = home;
+        return true;
+    };
+    options.relocation_epoch = [&epoch] { return epoch; };
+    bridge::StateBridgeDevice device(heaps, options, &states);
+    constexpr uint32_t kTarget = 100, kBuf = 301;
+    constexpr uint64_t kVs = 0xC5, kPs = 0xC6, kBufVa = 0x20000;
+    device.register_texture(kTarget, {pso::DxgiFormat::B8G8R8A8_UNORM, 64, 64, 1, 1, 1,
+                                      GpuTextureDimension::Dim2D, false});
+    device.register_buffer(kBuf, kBufVa, 4096);
+    device.register_shader_module(kVs, 1);
+    device.register_shader_module(kPs, 2);
+    d3d::DescriptorHeap* rtv_heap = make_heap(heaps, d3d::DescriptorHeapType::Rtv, 1, false);
+    d3d::DescriptorHeap* srv_heap = make_heap(heaps, d3d::DescriptorHeapType::CbvSrvUav, 4, true);
+    CHECK(heaps.create_render_target_view(kTarget, nullptr, rtv_heap->cpu_handle(0)) == d3d::Status::Ok);
+    d3d::ViewDesc srv;
+    srv.dimension = d3d::ViewDimension::Buffer;
+    srv.first_element = 4;  // offset 0x40: not 256-byte aligned, so relocated
+    srv.num_elements = 8;
+    srv.structure_byte_stride = 16;
+    CHECK(heaps.create_shader_resource_view(kBuf, &srv, srv_heap->cpu_handle(0)) == d3d::Status::Ok);
+    d3d::RootSignatureDesc rs;
+    d3d::RootParameterDesc table;
+    table.parameter_type = d3d::RootParameterType::DescriptorTable;
+    d3d::DescriptorRangeDesc range;
+    range.range_type = d3d::DescriptorRangeType::Srv;
+    range.num_descriptors = 1;
+    table.ranges.push_back(range);
+    rs.parameters.push_back(table);
+    d3d::RootSignature root;
+    CHECK(d3d::RootSignature::build(rs, &root).ok());
+    bridge::PipelineLayoutDesc layout;
+    bridge::GroupLayoutDesc group;
+    group.bindings.push_back({layout_entry(0, GpuShaderStageBits::Vertex, GpuBindingLayoutType::Buffer,
+                                           static_cast<uint8_t>(GpuBufferBindingType::ReadOnlyStorage)),
+                              join(0, d3d::DescriptorRangeType::Srv, 0)});
+    layout.groups.push_back(group);
+    device.register_pipeline_layout(kVs, kPs, layout);
+    pso::D3D12GraphicsPsoDesc d = Scene::pso_desc();
+    d.vs = kVs;
+    d.ps = kPs;
+    d.DSVFormat = pso::DxgiFormat::UNKNOWN;
+    auto state = device.create_graphics_pipeline_state(d, &root);
+
+    gpu::CommandEncoder enc;
+    bridge::CommandListBridge list(device, enc);
+    // One recording of the frame; returns the offsets of the bind groups created so far.
+    const auto record = [&] {
+        list.Reset(state.get());
+        d3d::DescriptorHeap* visible[] = {srv_heap};
+        CHECK(list.SetDescriptorHeaps(1, visible) == d3d::Status::Ok);
+        CHECK(list.SetGraphicsRootSignature(&root) == d3d::Status::Ok);
+        CHECK(list.SetGraphicsRootDescriptorTable(0, srv_heap->gpu_handle(0)) == d3d::Status::Ok);
+        list.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::TriangleList);
+        const gpu::d3d12_xs::D3D12VertexBufferView vb{Scene::kVertexBuffer, 0, 36, 12};
+        list.IASetVertexBuffers(0, 1, &vb);
+        const d3d::CpuDescriptorHandle rtv0 = rtv_heap->cpu_handle(0);
+        list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+        list.DrawInstanced(3, 1, 0, 0);
+        list.Close();
+        std::vector<uint64_t> offsets;
+        for (const Packet& packet : decode(enc)) {
+            if (packet.opcode == GpuOpcode::CreateBindGroup2 && packet.payload.size() > sizeof(GpuCreateBindGroup2Payload)) {
+                offsets.push_back(pod<GpuBindGroupEntry2>(packet, sizeof(GpuCreateBindGroup2Payload)).offset);
+            }
+        }
+        return offsets;
+    };
+    CHECK((record() == std::vector<uint64_t>{1024}));
+    CHECK((record() == std::vector<uint64_t>{1024}));  // cache hit, nothing moved
+    epoch = 1;                                          // another range evicted: same home, kept
+    CHECK((record() == std::vector<uint64_t>{1024}));
+    CHECK(list.stats().bind_groups_relocation_moved == 0);
+    home = 2048;  // this range's home handed away: the next lookup relocates it elsewhere
+    epoch = 2;
+    CHECK((record() == std::vector<uint64_t>{1024, 2048}));
+    CHECK(list.stats().bind_groups_relocation_moved == 1);
+    CHECK((record() == std::vector<uint64_t>{1024, 2048}));  // the new group is cached again
+    CHECK(calls >= 3);
 }
 
 // G62: a uniform binding with a reflected minimum size (layout min_binding_size) is bound with at
@@ -1541,7 +2407,7 @@ void test_memory_backed_tables() {
 
     // A CBV table whose slot only exists in memory (the title copied it there).
     uint32_t cb[4];
-    bridge::constant_buffer_words(kCbVa + 0x40, 96, cb);
+    bridge::constant_buffer_words(kCbVa + 0x400, 96, cb);
     memory.write(3, cb, sizeof(cb));
     CHECK(heap->view(3)->kind == d3d::DescriptorKind::Empty);  // nothing in the registry
     d3d::RootSignatureDesc rs;
@@ -1584,7 +2450,9 @@ void test_memory_backed_tables() {
     list.Close();
     uint32_t id = 0;
     GpuBindGroupEntry2 e = last_bind_group_entry(enc, &id);
-    CHECK(e.resource_id == kCb && e.offset == 0x40 && e.size == 96);
+    // (A 256-byte aligned view: bound in place, widened through the buffer as below; an unaligned
+    // one without a relocate hook binds null, see test_unaligned_uniform_relocation.)
+    CHECK(e.resource_id == kCb && e.offset == 0x400 && e.size == 4096 - 0x400);
     CHECK(list.stats().bind_groups_created == 1 && list.stats().memory_bind_groups == 1);
 
     // Unchanged at execution: nothing to do. Changed: the recorded entries are rewritten in place.
@@ -2742,27 +3610,781 @@ void test_storage_texture_format_conversion() {
     }
 }
 
+// #482: a fragment-stage storage binding of a mismatched float format goes through an intermediate
+// too: copied in (read-write) before the draw in a pass of its own, converted out when the pass ends.
+void test_fragment_storage_texture_format_conversion() {
+    d3d::DescriptorHeapRegistry heaps;
+    d3d::ResourceStateRegistry states;
+    bridge::StateBridgeDevice device(heaps, counting_options(7000), &states);
+    constexpr uint32_t kTarget = 100, kTex = 302;
+    constexpr uint64_t kVs = 0xE1, kPs = 0xE2;
+    device.register_texture(kTarget, {pso::DxgiFormat::B8G8R8A8_UNORM, 64, 64, 1, 1, 1,
+                                      GpuTextureDimension::Dim2D, false});
+    bridge::TextureInfo tex{pso::DxgiFormat::R16G16B16A16_FLOAT, 32, 32, 1, 1, 1, GpuTextureDimension::Dim2D, false};
+    tex.storage = true;
+    device.register_texture(kTex, tex);
+    device.register_shader_module(kVs, 1);
+    device.register_shader_module(kPs, 2);
+    d3d::DescriptorHeap* rtv_heap = make_heap(heaps, d3d::DescriptorHeapType::Rtv, 1, false);
+    d3d::DescriptorHeap* view_heap = make_heap(heaps, d3d::DescriptorHeapType::CbvSrvUav, 4, true);
+    CHECK(heaps.create_render_target_view(kTarget, nullptr, rtv_heap->cpu_handle(0)) == d3d::Status::Ok);
+    d3d::ViewDesc vd;
+    vd.format = static_cast<uint32_t>(tex.format);
+    vd.dimension = d3d::ViewDimension::Texture2D;
+    CHECK(heaps.create_unordered_access_view(kTex, 0, &vd, view_heap->cpu_handle(0)) == d3d::Status::Ok);
+    d3d::RootSignatureDesc rs;
+    d3d::RootParameterDesc table;
+    table.parameter_type = d3d::RootParameterType::DescriptorTable;
+    d3d::DescriptorRangeDesc range;
+    range.range_type = d3d::DescriptorRangeType::Uav;
+    range.num_descriptors = 1;
+    table.ranges.push_back(range);
+    rs.parameters.push_back(table);
+    d3d::RootSignature root;
+    CHECK(d3d::RootSignature::build(rs, &root).ok());
+    bridge::PipelineLayoutDesc layout;
+    bridge::GroupLayoutDesc group;
+    GpuBindGroupLayoutEntry entry =
+        layout_entry(0, GpuShaderStageBits::Fragment, GpuBindingLayoutType::StorageTexture,
+                     static_cast<uint8_t>(GpuStorageTextureAccess::ReadWrite),
+                     static_cast<uint8_t>(GpuTextureViewDimension::Dim2D));
+    entry.storage_format = static_cast<uint8_t>(pso::WgpuTextureFormat::Rgba8Unorm);
+    group.bindings.push_back({entry, join(0, d3d::DescriptorRangeType::Uav, 0)});
+    layout.groups.push_back(group);
+    device.register_pipeline_layout(kVs, kPs, layout);
+    pso::D3D12GraphicsPsoDesc d = Scene::pso_desc();
+    d.vs = kVs;
+    d.ps = kPs;
+    d.DSVFormat = pso::DxgiFormat::UNKNOWN;
+    auto state = device.create_graphics_pipeline_state(d, &root);
+    gpu::CommandEncoder enc;
+    bridge::CommandListBridge list(device, enc);
+    d3d::DescriptorHeap* visible[] = {view_heap};
+    CHECK(list.SetDescriptorHeaps(1, visible) == d3d::Status::Ok);
+    CHECK(list.SetGraphicsRootSignature(&root) == d3d::Status::Ok);
+    list.SetPipelineState(state.get());
+    CHECK(list.SetGraphicsRootDescriptorTable(0, view_heap->gpu_handle(0)) == d3d::Status::Ok);
+    list.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::TriangleList);
+    const gpu::d3d12_xs::D3D12VertexBufferView vb{Scene::kVertexBuffer, 0, 36, 12};
+    list.IASetVertexBuffers(0, 1, &vb);
+    const d3d::CpuDescriptorHandle rtv0 = rtv_heap->cpu_handle(0);
+    list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+    list.DrawInstanced(3, 1, 0, 0);
+    list.DrawInstanced(3, 1, 0, 0);
+    list.Close();
+
+    CHECK(list.stats().storage_views_format_mismatch == 0 && list.stats().storage_views_without_usage == 0);
+    CHECK(list.stats().storage_views_converted == 1 && list.stats().draws == 2);
+    CHECK(list.stats().storage_conversions == 2);  // one in before the first draw, one out at the pass end
+    // Order: copy-in dispatch, then the render pass with both draws, then the copy-out dispatch.
+    std::string order;
+    for (const Packet& pk : decode(enc)) {
+        switch (pk.opcode) {
+        case GpuOpcode::DispatchCompute: order += 'C'; break;
+        case GpuOpcode::BeginRenderPass: order += '['; break;
+        case GpuOpcode::EndRenderPass: order += ']'; break;
+        case GpuOpcode::Draw: order += 'D'; break;
+        default: break;
+        }
+    }
+    CHECK(order.find("C[DD]C") != std::string::npos);
+}
+
+// #482: a mixed vertex+fragment storage binding is converted too; when the texture is also the pass's
+// render attachment it is counted as an alias and not converted.
+void test_vertex_mixed_storage_and_attachment_alias() {
+    d3d::DescriptorHeapRegistry heaps;
+    d3d::ResourceStateRegistry states;
+    bridge::StateBridgeDevice device(heaps, counting_options(7000), &states);
+    constexpr uint32_t kTarget = 100, kTex = 302;
+    constexpr uint64_t kVs = 0xE1, kPs = 0xE2;
+    device.register_texture(kTarget, {pso::DxgiFormat::B8G8R8A8_UNORM, 64, 64, 1, 1, 1,
+                                      GpuTextureDimension::Dim2D, false});
+    bridge::TextureInfo tex{pso::DxgiFormat::R16G16B16A16_FLOAT, 32, 32, 1, 1, 1, GpuTextureDimension::Dim2D, false};
+    tex.storage = true;
+    device.register_texture(kTex, tex);
+    device.register_shader_module(kVs, 1);
+    device.register_shader_module(kPs, 2);
+    d3d::DescriptorHeap* rtv_heap = make_heap(heaps, d3d::DescriptorHeapType::Rtv, 2, false);
+    d3d::DescriptorHeap* view_heap = make_heap(heaps, d3d::DescriptorHeapType::CbvSrvUav, 4, true);
+    CHECK(heaps.create_render_target_view(kTarget, nullptr, rtv_heap->cpu_handle(0)) == d3d::Status::Ok);
+    d3d::ViewDesc vd;
+    vd.format = static_cast<uint32_t>(tex.format);
+    vd.dimension = d3d::ViewDimension::Texture2D;
+    CHECK(heaps.create_unordered_access_view(kTex, 0, &vd, view_heap->cpu_handle(0)) == d3d::Status::Ok);
+    d3d::RootSignatureDesc rs;
+    d3d::RootParameterDesc table;
+    table.parameter_type = d3d::RootParameterType::DescriptorTable;
+    d3d::DescriptorRangeDesc range;
+    range.range_type = d3d::DescriptorRangeType::Uav;
+    range.num_descriptors = 1;
+    table.ranges.push_back(range);
+    rs.parameters.push_back(table);
+    d3d::RootSignature root;
+    CHECK(d3d::RootSignature::build(rs, &root).ok());
+    bridge::PipelineLayoutDesc layout;
+    bridge::GroupLayoutDesc group;
+    GpuBindGroupLayoutEntry entry =
+        layout_entry(0, GpuShaderStageBits::Vertex | GpuShaderStageBits::Fragment, GpuBindingLayoutType::StorageTexture,
+                     static_cast<uint8_t>(GpuStorageTextureAccess::ReadWrite),
+                     static_cast<uint8_t>(GpuTextureViewDimension::Dim2D));
+    entry.storage_format = static_cast<uint8_t>(pso::WgpuTextureFormat::Rgba8Unorm);
+    group.bindings.push_back({entry, join(0, d3d::DescriptorRangeType::Uav, 0)});
+    layout.groups.push_back(group);
+    device.register_pipeline_layout(kVs, kPs, layout);
+    pso::D3D12GraphicsPsoDesc d = Scene::pso_desc();
+    d.vs = kVs;
+    d.ps = kPs;
+    d.DSVFormat = pso::DxgiFormat::UNKNOWN;
+    auto state = device.create_graphics_pipeline_state(d, &root);
+    gpu::CommandEncoder enc;
+    bridge::CommandListBridge list(device, enc);
+    d3d::DescriptorHeap* visible[] = {view_heap};
+    CHECK(list.SetDescriptorHeaps(1, visible) == d3d::Status::Ok);
+    CHECK(list.SetGraphicsRootSignature(&root) == d3d::Status::Ok);
+    list.SetPipelineState(state.get());
+    CHECK(list.SetGraphicsRootDescriptorTable(0, view_heap->gpu_handle(0)) == d3d::Status::Ok);
+    list.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::TriangleList);
+    const gpu::d3d12_xs::D3D12VertexBufferView vb{Scene::kVertexBuffer, 0, 36, 12};
+    list.IASetVertexBuffers(0, 1, &vb);
+    const d3d::CpuDescriptorHandle rtv0 = rtv_heap->cpu_handle(0);
+    list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+    list.DrawInstanced(3, 1, 0, 0);
+    list.Close();
+    CHECK(list.stats().storage_conversions == 2 && list.stats().storage_views_attachment_alias == 0);
+
+    gpu::CommandEncoder enc2;
+    bridge::CommandListBridge list2(device, enc2);
+    CHECK(list2.SetDescriptorHeaps(1, visible) == d3d::Status::Ok);
+    CHECK(list2.SetGraphicsRootSignature(&root) == d3d::Status::Ok);
+    list2.SetPipelineState(state.get());
+    CHECK(list2.SetGraphicsRootDescriptorTable(0, view_heap->gpu_handle(0)) == d3d::Status::Ok);
+    list2.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::TriangleList);
+    list2.IASetVertexBuffers(0, 1, &vb);
+    CHECK(heaps.create_render_target_view(kTex, nullptr, rtv_heap->cpu_handle(1)) == d3d::Status::Ok);
+    const d3d::CpuDescriptorHandle rtv1 = rtv_heap->cpu_handle(1);
+    list2.OMSetRenderTargets(1, &rtv1, false, nullptr);
+    list2.DrawInstanced(3, 1, 0, 0);
+    list2.Close();
+    CHECK(list2.stats().storage_views_attachment_alias >= 1 && list2.stats().storage_conversions == 0);
+}
+
+// #691: a glyph atlas (A8_UNORM, console linear, widened to rgba8) the title fills a few glyphs at a
+// time uploads only the changed bands of kUploadBandRows rows, not the whole texture per glyph.
+void test_banded_texture_upload() {
+    namespace com = playgta6::guest::com;
+    namespace dg = playgta6::gpu::d3d12_guest;
+    namespace gfx10 = playgta6::gpu::gfx10;
+
+    os::VirtualMemoryArena arena;
+    com::reset_com_bridge();
+    com::set_guest_memory(&arena);
+    {
+        dg::DeviceOptions dev_opts;
+        dev_opts.sink = [](const uint8_t*, size_t) {};
+        auto device = com::create_object<dg::Device>(com::implements(dg::kID3D12Device), dev_opts);
+        CHECK(device);
+        device->initialize_guest_payload();
+
+        constexpr uint32_t kW = 256, kH = 256, kBand = dg::kUploadBandRows;
+        static_assert(kH == 4 * kBand, "four bands");
+        gfx10::TextureLayoutDesc g{};
+        g.dxgi_format = 65;  // A8_UNORM
+        g.width = kW;
+        g.height = kH;
+        g.mip_levels = 1;
+        g.d3d12_layout = 0x100;
+        const size_t surface_size = gfx10::surface_bytes(g);
+        CHECK(surface_size != 0 && surface_size <= (1u << 20));
+        std::vector<uint8_t> texels(size_t{kW} * kH, 0);
+        std::vector<uint8_t> surface(surface_size, 0);
+        const uint64_t mem = arena.virtual_alloc(0, 1u << 20, os::kMemReserve | os::kMemCommit, os::PageProtect::ReadWrite);
+        auto glyph = [&](uint32_t y0, uint32_t rows, uint8_t v) {
+            for (uint32_t y = y0; y < y0 + rows; ++y) {
+                for (uint32_t x = 10; x < 20; ++x) {
+                    texels[size_t{y} * kW + x] = v;
+                }
+            }
+            CHECK(gfx10::tile_surface_subresource(g, 0, 0, texels.data(), texels.size(), surface.data(), surface.size()));
+            CHECK(com::write_guest(mem, surface.data(), surface.size()));
+        };
+
+        dg::GuestResourceDesc d{};
+        d.Dimension = dg::ResourceDimension::Texture2D;
+        d.Width = kW;
+        d.Height = kH;
+        d.DepthOrArraySize = 1;
+        d.MipLevels = 1;
+        d.Format = 65;
+        d.SampleCount = 1;
+        d.Layout = 0x100;
+        dg::Resource::Placement pl{};
+        pl.address = mem;
+        auto tex = com::create_object<dg::Resource>(com::implements(dg::kID3D12Resource), dg::device_ref(device.get()),
+                                                    d, pl, 0u);
+        CHECK(tex && tex->initialize());
+
+        auto writes = [](const gpu::CommandEncoder& enc) {
+            std::vector<Packet> out;
+            for (const Packet& pk : decode(enc)) {
+                if (pk.opcode == GpuOpcode::WriteTexture) {
+                    out.push_back(pk);
+                }
+            }
+            return out;
+        };
+        // Every row of a write holds the widened texels (0, 0, 0, a) of its rows.
+        auto check_rows = [&](const Packet& pk, uint32_t y0, uint32_t rows) {
+            const auto wt = pod<GpuWriteTexturePayload>(pk);
+            CHECK(wt.texture_id == tex->id() && wt.origin_x == 0 && wt.origin_y == y0 && wt.width == kW &&
+                  wt.height == rows && wt.bytes_per_row == kW * 4u && wt.rows_per_image == rows);
+            bool same = pk.payload.size() >= sizeof(GpuWriteTexturePayload) + size_t{rows} * kW * 4u;
+            for (uint32_t y = 0; same && y < rows; ++y) {
+                const uint8_t* row = pk.payload.data() + sizeof(GpuWriteTexturePayload) + size_t{y} * kW * 4u;
+                for (uint32_t x = 0; same && x < kW; ++x) {
+                    same = row[x * 4u] == 0 && row[x * 4u + 1] == 0 && row[x * 4u + 2] == 0 &&
+                           row[x * 4u + 3] == texels[size_t{y0 + y} * kW + x];
+                }
+            }
+            CHECK(same);
+        };
+
+        // First glyph: the whole texture (never uploaded before).
+        glyph(2, 12, 200);
+        gpu::CommandEncoder e1;
+        CHECK(device->sync_bound_texture_memory(tex->id(), e1));
+        const auto w1 = writes(e1);
+        CHECK(w1.size() == 1);
+        if (w1.size() == 1) {
+            check_rows(w1[0], 0, kH);
+        }
+
+        // A glyph inside the second band: that band only.
+        glyph(kBand + 6, 12, 150);
+        gpu::CommandEncoder e2;
+        CHECK(device->sync_bound_texture_memory(tex->id(), e2));
+        const auto w2 = writes(e2);
+        CHECK(w2.size() == 1);
+        if (w2.size() == 1) {
+            check_rows(w2[0], kBand, kBand);
+        }
+
+        // One glyph across bands 2 and 3 plus one in band 0: two writes, the adjacent bands merged.
+        glyph(3 * kBand - 4, 8, 90);
+        glyph(30, 4, 60);
+        gpu::CommandEncoder e3;
+        CHECK(device->sync_bound_texture_memory(tex->id(), e3));
+        const auto w3 = writes(e3);
+        CHECK(w3.size() == 2);
+        if (w3.size() == 2) {
+            check_rows(w3[0], 0, kBand);
+            check_rows(w3[1], 2 * kBand, 2 * kBand);
+        }
+
+        // Steady state: nothing.
+        gpu::CommandEncoder e4;
+        CHECK(!device->sync_bound_texture_memory(tex->id(), e4));
+        CHECK(writes(e4).empty());
+    }
+    com::reset_com_bridge();
+    com::set_guest_memory(nullptr);
+}
+
+// O36: views die with their texture: create/destroy N textures with views, the table stays small.
+void test_view_table_bounded() {
+    d3d::DescriptorHeapRegistry heaps;
+    bridge::StateBridgeDevice device(heaps, bridge::BridgeOptions{});
+    for (uint32_t n = 1; n <= 5000; ++n) {
+        bridge::ViewRecord rec{};
+        rec.texture_id = n;
+        rec.resource_id = n;
+        CHECK(device.test_intern_view(rec) != 0);
+        device.unregister_resource(n);
+        CHECK(device.live_view_count() == 0);
+    }
+    // A recycled id resolves to the new view, and the same texture re-interns to one id.
+    bridge::ViewRecord rec{};
+    rec.texture_id = 9000;
+    const uint32_t a = device.test_intern_view(rec);
+    CHECK(device.test_intern_view(rec) == a && a <= 2u && device.view(a)->texture_id == 9000u);
+}
+
+// G70 (#691): unregistering/evicting a texture immediately invalidates every cached bind group
+// referencing it (both directly and via interned view ids), retires the evicted bind groups with
+// zero GPU leak, and prevents stale bind groups or destroyed texture ids from being bound.
+void test_unregister_texture_invalidates_cached_bind_groups() {
+    // Part A: direct texture unregister invalidates cached bind groups in CommandListBridge.
+    {
+        Scene scene;
+        gpu::CommandEncoder enc;
+        bridge::CommandListBridge list(scene.device, enc);
+        scene.bind_root(list);
+        const d3d::CpuDescriptorHandle rtv0 = scene.rtv(0);
+        list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+
+        // Draw 1: creates and caches bind group bg1 referencing kAlbedo.
+        list.DrawInstanced(3, 1, 0, 0);
+        uint32_t bg1 = 0;
+        for (const Packet& pk : decode(enc)) {
+            if (pk.opcode == GpuOpcode::CreateBindGroup2) {
+                bg1 = pod<GpuCreateBindGroup2Payload>(pk).id;
+            }
+        }
+        CHECK(bg1 != 0);
+        CHECK(list.cached_bind_group_count() == 1);
+        const size_t views_before = scene.device.live_view_count();
+        CHECK(views_before >= 2u);  // swapchain RTV + kAlbedo SRV
+
+        // Draw 2: cache hit (only Draw emitted).
+        const size_t mark_hit = enc.size();
+        list.DrawInstanced(3, 1, 0, 0);
+        CHECK(opcodes(decode(enc, mark_hit)) == std::vector<GpuOpcode>{GpuOpcode::Draw});
+        CHECK(list.stats().bind_group_cache_hits == 1);
+
+        // Unregister kAlbedo: must immediately evict bg1 from BindGroupCache, retire its interned
+        // view, and queue bg1 for DestroyResource (zero GPU leak).
+        scene.device.unregister_resource(Scene::kAlbedo);
+        CHECK(list.cached_bind_group_count() == 0);
+        CHECK(list.stats().bind_groups_invalidated == 1);
+        CHECK(scene.device.live_view_count() < views_before);
+        CHECK(scene.device.deferred_destroy_count() == 1);
+
+        // Draw 3: heap slot still names unregistered kAlbedo; cache must miss and emit a fresh bind
+        // group with null resource_id (0), NEVER reusing bg1 or binding destroyed kAlbedo.
+        const size_t mark_null = enc.size();
+        list.DrawInstanced(3, 1, 0, 0);
+        uint32_t bg2 = 0;
+        GpuBindGroupEntry2 tex_entry{};
+        bool found_bg2 = false;
+        for (const Packet& pk : decode(enc, mark_null)) {
+            if (pk.opcode == GpuOpcode::CreateBindGroup2) {
+                bg2 = pod<GpuCreateBindGroup2Payload>(pk).id;
+                tex_entry = pod<GpuBindGroupEntry2>(pk, sizeof(GpuCreateBindGroup2Payload) + sizeof(GpuBindGroupEntry2));
+                found_bg2 = true;
+            }
+        }
+        CHECK(found_bg2 && bg2 != 0 && bg2 != bg1);
+        CHECK(tex_entry.resource_id == 0);
+        CHECK((list.diagnostics() & bridge::BridgeDiag::UnknownTexture) != 0);
+
+        // Point the heap slot at live kAlbedo2: rebuilds cleanly to kAlbedo2.
+        scene.write_albedo_srv(Scene::kAlbedo2, 0);
+        const size_t mark_live = enc.size();
+        list.DrawInstanced(3, 1, 0, 0);
+        uint32_t bg3 = 0;
+        GpuBindGroupEntry2 tex_entry3{};
+        for (const Packet& pk : decode(enc, mark_live)) {
+            if (pk.opcode == GpuOpcode::CreateBindGroup2) {
+                bg3 = pod<GpuCreateBindGroup2Payload>(pk).id;
+                tex_entry3 = pod<GpuBindGroupEntry2>(pk, sizeof(GpuCreateBindGroup2Payload) + sizeof(GpuBindGroupEntry2));
+            }
+        }
+        CHECK(bg3 != 0 && bg3 != bg1 && bg3 != bg2);
+        CHECK(tex_entry3.resource_id == Scene::kAlbedo2);
+
+        // Present flushes deferred DestroyResource(bg1) strictly after Present.
+        list.Present();
+        const std::vector<Packet> all = decode(enc);
+        size_t present_idx = all.size();
+        size_t destroy_bg1_idx = all.size();
+        for (size_t i = 0; i < all.size(); ++i) {
+            if (all[i].opcode == GpuOpcode::Present) {
+                present_idx = i;
+            } else if (all[i].opcode == GpuOpcode::DestroyResource &&
+                       pod<GpuDestroyResourcePayload>(all[i]).id == bg1) {
+                destroy_bg1_idx = i;
+            }
+        }
+        CHECK(present_idx < all.size());
+        CHECK(destroy_bg1_idx < all.size() && destroy_bg1_idx > present_idx);
+        CHECK(scene.device.deferred_destroy_count() == 0);
+    }
+
+    // Part B: BindGroupCache invalidates entries matching an interned view id even when resource_ids is empty.
+    {
+        d3d::DescriptorHeapRegistry heaps;
+        d3d::DescriptorHeap* srv_heap = make_heap(heaps, d3d::DescriptorHeapType::CbvSrvUav, 4, true);
+        d3d::ViewDesc srv{};
+        srv.format = 28;
+        srv.dimension = d3d::ViewDimension::Texture2D;
+        CHECK(heaps.create_shader_resource_view(555u, &srv, srv_heap->cpu_handle(0)) == d3d::Status::Ok);
+        d3d::RootSignatureDesc rs_desc;
+        d3d::RootParameterDesc table;
+        table.parameter_type = d3d::RootParameterType::DescriptorTable;
+        d3d::DescriptorRangeDesc range;
+        range.range_type = d3d::DescriptorRangeType::Srv;
+        range.num_descriptors = 1;
+        table.ranges.push_back(range);
+        rs_desc.parameters.push_back(table);
+        d3d::RootSignature rs;
+        CHECK(d3d::RootSignature::build(rs_desc, &rs).ok());
+        const d3d::ShaderBinding join_srv = join(0, d3d::DescriptorRangeType::Srv, 0);
+        const d3d::BindGroupPlan plan = d3d::BindGroupPlan::build(rs, std::span<const d3d::ShaderBinding>(&join_srv, 1),
+                                                                  d3d::WebGpuStage::Fragment);
+        d3d::RootArgumentState root_args;
+        d3d::DescriptorHeap* visible[] = {srv_heap};
+        CHECK(root_args.set_descriptor_heaps(1, visible) == d3d::Status::Ok);
+        CHECK(root_args.set_root_signature(d3d::BindPoint::Graphics, &rs) == d3d::Status::Ok);
+        CHECK(root_args.set_descriptor_table(d3d::BindPoint::Graphics, 0, srv_heap->gpu_handle(0)) == d3d::Status::Ok);
+
+        d3d::BindGroupCache cache;
+        d3d::BindGroupLookup lk = cache.get_or_build(root_args, d3d::BindPoint::Graphics, plan, 1u, nullptr, nullptr);
+        CHECK(lk.status == d3d::Status::Ok && lk.bind_group != nullptr);
+        lk.bind_group->gpu_id = 7777u;
+        lk.bind_group->view_ids.push_back(42u);
+        CHECK(cache.size() == 1);
+
+        const uint32_t retired_view = 42u;
+        std::vector<uint32_t> retired_bgs;
+        const size_t evicted = cache.evict_resources_and_views({}, std::span<const uint32_t>(&retired_view, 1),
+                                                               &retired_bgs);
+        CHECK(evicted == 1 && cache.size() == 0);
+        CHECK(retired_bgs.size() == 1 && retired_bgs[0] == 7777u);
+    }
+
+    // Part C: memory-backed descriptor tables force-refresh when their texture id is unregistered
+    // and replaced at the same GPU VA even though the raw descriptor memory bytes did not change.
+    {
+        d3d::DescriptorHeapRegistry heaps;
+        d3d::ResourceStateRegistry states;
+        bridge::BridgeOptions options = counting_options(8000);
+        struct Holder {
+            std::unique_ptr<TestSlotSource> source;
+        } holder;
+        struct Forward final : d3d::DescriptorSlotSource {
+            Holder* h = nullptr;
+            bool reads(const d3d::DescriptorHeap& heap) const override { return h->source && h->source->reads(heap); }
+            bool snapshot(const d3d::DescriptorHeap& heap, uint32_t f, uint32_t c, std::vector<uint8_t>* o) const override {
+                return h->source->snapshot(heap, f, c, o);
+            }
+            d3d::ViewDescriptor view(const d3d::DescriptorHeap& heap, uint32_t i, d3d::DescriptorRangeType r) const override {
+                return h->source->view(heap, i, r);
+            }
+            bool sampler(const d3d::DescriptorHeap& heap, uint32_t i, d3d::SamplerDesc* o) const override {
+                return h->source->sampler(heap, i, o);
+            }
+        } forward;
+        forward.h = &holder;
+        options.slot_source = &forward;
+
+        bridge::StateBridgeDevice device(heaps, options, &states);
+        constexpr uint32_t kTarget = 100, kTex1 = 301, kTex2 = 302;
+        constexpr uint64_t kVs = 0xF1, kPs = 0xF2, kTexVa = 0x7E00'0005'0000ull;
+        device.register_texture(kTarget, {pso::DxgiFormat::B8G8R8A8_UNORM, 64, 64, 1, 1, 1, GpuTextureDimension::Dim2D, false});
+        bridge::TextureInfo tex{pso::DxgiFormat::R32G32B32A32_FLOAT, 256, 1, 1, 1, 1, GpuTextureDimension::Dim2D, false};
+        tex.gpu_va = kTexVa;
+        device.register_texture(kTex1, tex);
+        device.register_shader_module(kVs, 1);
+        device.register_shader_module(kPs, 2);
+
+        d3d::DescriptorHeap* rtv_heap = make_heap(heaps, d3d::DescriptorHeapType::Rtv, 1, false);
+        d3d::DescriptorHeap* heap = make_heap(heaps, d3d::DescriptorHeapType::CbvSrvUav, 4, true);
+        holder.source = std::make_unique<TestSlotSource>(device, heap);
+        CHECK(heaps.create_render_target_view(kTarget, nullptr, rtv_heap->cpu_handle(0)) == d3d::Status::Ok);
+
+        d3d::ViewDescriptor img{};
+        img.kind = d3d::DescriptorKind::Srv;
+        img.resource_id = kTex1;
+        img.dimension = d3d::ViewDimension::Texture2D;
+        img.format = 2;  // R32G32B32A32_FLOAT
+        img.component_mapping = d3d::kDefaultShader4ComponentMapping;
+        img.mip_levels = 1;
+        uint32_t words[8] = {};
+        CHECK(bridge::view_words(device, img, words) == bridge::WordsStatus::Ok);
+        holder.source->write(0, words, sizeof(words));
+
+        d3d::RootSignatureDesc rs_desc;
+        d3d::RootParameterDesc table;
+        table.parameter_type = d3d::RootParameterType::DescriptorTable;
+        d3d::DescriptorRangeDesc range;
+        range.range_type = d3d::DescriptorRangeType::Srv;
+        range.num_descriptors = 1;
+        table.ranges.push_back(range);
+        rs_desc.parameters.push_back(table);
+        d3d::RootSignature rs;
+        CHECK(d3d::RootSignature::build(rs_desc, &rs).ok());
+
+        bridge::PipelineLayoutDesc layout;
+        bridge::GroupLayoutDesc group;
+        group.bindings.push_back({layout_entry(0, GpuShaderStageBits::Fragment, GpuBindingLayoutType::Texture,
+                                               static_cast<uint8_t>(GpuTextureSampleType::UnfilterableFloat),
+                                               static_cast<uint8_t>(GpuTextureViewDimension::Dim2D)),
+                                  join(0, d3d::DescriptorRangeType::Srv, 0)});
+        layout.groups.push_back(group);
+        device.register_pipeline_layout(kVs, kPs, layout);
+        pso::D3D12GraphicsPsoDesc pd = Scene::pso_desc();
+        pd.vs = kVs;
+        pd.ps = kPs;
+        pd.DSVFormat = pso::DxgiFormat::UNKNOWN;
+        auto state = device.create_graphics_pipeline_state(pd, &rs);
+
+        gpu::CommandEncoder enc;
+        bridge::CommandListBridge list(device, enc);
+        d3d::DescriptorHeap* visible[] = {heap};
+        CHECK(list.SetDescriptorHeaps(1, visible) == d3d::Status::Ok);
+        CHECK(list.SetGraphicsRootSignature(&rs) == d3d::Status::Ok);
+        list.SetPipelineState(state.get());
+        CHECK(list.SetGraphicsRootDescriptorTable(0, heap->gpu_handle(0)) == d3d::Status::Ok);
+        list.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::TriangleList);
+        const gpu::d3d12_xs::D3D12VertexBufferView vb{Scene::kVertexBuffer, 0, 36, 12};
+        list.IASetVertexBuffers(0, 1, &vb);
+        const d3d::CpuDescriptorHandle rtv0 = rtv_heap->cpu_handle(0);
+        list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+        list.DrawInstanced(3, 1, 0, 0);
+        list.Close();
+        uint32_t bg1 = 0;
+        CHECK(last_bind_group_entry(enc, &bg1).resource_id == kTex1);
+        CHECK(list.cached_bind_group_count() == 1);
+
+        // Evict kTex1 and re-create a replacement kTex2 at the same GPU VA (descriptor words unchanged).
+        device.unregister_resource(kTex1);
+        CHECK(list.cached_bind_group_count() == 0);
+        device.register_texture(kTex2, tex);
+
+        // refresh_memory_bind_groups must detect the invalidation and patch the recorded bind group to kTex2.
+        gpu::CommandEncoder prelude;
+        CHECK(list.refresh_memory_bind_groups(prelude) == 1);
+        CHECK(last_bind_group_entry(enc).resource_id == kTex2);
+    }
+}
+
+// G70 (#691): a texture bound in a draw and evicted before Present must have its DestroyResource
+// packet emitted strictly AFTER Present (never before), both at the StateBridge layer and through
+// d3d12_guest::Device::ensure_address_texture LRU eviction.
+void test_evicted_texture_destroy_deferred_until_after_present() {
+    // Part A: StateBridgeDevice + CommandListBridge deferral before Present, immediate destroy for unused.
+    {
+        Scene scene;
+        gpu::CommandEncoder enc;
+        bridge::CommandListBridge list(scene.device, enc);
+        scene.bind_root(list);
+        const d3d::CpuDescriptorHandle rtv0 = scene.rtv(0);
+        list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+
+        // Unused texture can be destroyed immediately without bloating the deferred queue.
+        constexpr uint32_t kUnused = 999u;
+        CHECK(!scene.device.is_resource_used_in_frame(kUnused));
+        CHECK(!scene.device.destroy_or_defer_resource(kUnused, enc));
+
+        // Draw 1 binds kAlbedo via bg1.
+        list.DrawInstanced(3, 1, 0, 0);
+        uint32_t bg1 = 0;
+        for (const Packet& pk : decode(enc)) {
+            if (pk.opcode == GpuOpcode::CreateBindGroup2) {
+                bg1 = pod<GpuCreateBindGroup2Payload>(pk).id;
+            }
+        }
+        CHECK(bg1 != 0);
+        CHECK(scene.device.is_resource_used_in_frame(Scene::kAlbedo));
+        CHECK(scene.device.is_resource_used_in_frame(bg1));
+
+        // Evict kAlbedo BEFORE Present: must defer DestroyResource for both kAlbedo and bg1!
+        scene.device.unregister_resource(Scene::kAlbedo);
+        CHECK(scene.device.destroy_or_defer_resource(Scene::kAlbedo, enc));
+        for (const Packet& pk : decode(enc)) {
+            if (pk.opcode == GpuOpcode::DestroyResource) {
+                const uint32_t id = pod<GpuDestroyResourcePayload>(pk).id;
+                CHECK(id != Scene::kAlbedo && id != bg1);
+            }
+        }
+        CHECK(scene.device.deferred_destroy_count() == 2);
+
+        // Emit Present: DestroyResource(kAlbedo) and DestroyResource(bg1) must appear strictly AFTER Present.
+        list.Present();
+        const std::vector<Packet> packets = decode(enc);
+        size_t present_idx = packets.size();
+        size_t destroy_tex_idx = packets.size();
+        size_t destroy_bg_idx = packets.size();
+        for (size_t i = 0; i < packets.size(); ++i) {
+            if (packets[i].opcode == GpuOpcode::Present) {
+                present_idx = i;
+            } else if (packets[i].opcode == GpuOpcode::DestroyResource) {
+                const uint32_t id = pod<GpuDestroyResourcePayload>(packets[i]).id;
+                if (id == Scene::kAlbedo) {
+                    destroy_tex_idx = i;
+                } else if (id == bg1) {
+                    destroy_bg_idx = i;
+                }
+            }
+        }
+        CHECK(present_idx < packets.size());
+        CHECK(destroy_tex_idx < packets.size() && destroy_tex_idx > present_idx);
+        CHECK(destroy_bg_idx < packets.size() && destroy_bg_idx > present_idx);
+        CHECK(scene.device.deferred_destroy_count() == 0);
+    }
+
+    // Part B: multi-frame advance_present_frame preserves resources already recorded into an unexecuted
+    // command list of Frame N+1 while flushing deferred destroys from Frame N.
+    {
+        Scene scene;
+        gpu::CommandEncoder enc;
+        bridge::CommandListBridge list(scene.device, enc);
+        scene.bind_root(list);
+        const d3d::CpuDescriptorHandle rtv0 = scene.rtv(0);
+        list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+
+        // Frame 0 deferred resource (from a previous frame).
+        constexpr uint32_t kOldTex = 888u;
+        scene.device.defer_destroy_resource(kOldTex);
+
+        // Frame 1 starts recording into `list` (not yet executed) and binds kAlbedo BEFORE
+        // advance_present_frame(1) runs.
+        list.DrawInstanced(3, 1, 0, 0);
+        CHECK(scene.device.is_resource_used_in_frame(Scene::kAlbedo));
+
+        gpu::CommandEncoder flush_enc;
+        CHECK(scene.device.advance_present_frame(1, flush_enc));
+        // kOldTex is flushed, while kAlbedo stays pinned in-frame for the unexecuted command list!
+        bool saw_old = false;
+        for (const Packet& pk : decode(flush_enc)) {
+            if (pk.opcode == GpuOpcode::DestroyResource && pod<GpuDestroyResourcePayload>(pk).id == kOldTex) {
+                saw_old = true;
+            }
+        }
+        CHECK(saw_old);
+        CHECK(scene.device.is_resource_used_in_frame(Scene::kAlbedo));
+        CHECK(scene.device.destroy_or_defer_resource(Scene::kAlbedo, flush_enc));
+        list.Close();
+    }
+
+    // Part C: full d3d12_guest::Device::ensure_address_texture LRU eviction of a 256x1 RGBA32Float
+    // texture used in Frame 0: LRU prefers non-in-frame victims, and any forced in-frame eviction
+    // emits DestroyResource strictly AFTER Present, never before.
+    {
+        namespace com = playgta6::guest::com;
+        namespace dg = playgta6::gpu::d3d12_guest;
+
+        os::VirtualMemoryArena arena;
+        com::reset_com_bridge();
+        com::set_guest_memory(&arena);
+        {
+            std::vector<uint8_t> stream;
+            dg::DeviceOptions dev_opts;
+            dev_opts.sink = [&stream](const uint8_t* data, size_t size) {
+                stream.insert(stream.end(), data, data + size);
+            };
+            auto device = com::create_object<dg::Device>(com::implements(dg::kID3D12Device), dev_opts);
+            CHECK(device);
+            device->initialize_guest_payload();
+
+            auto decode_stream = [](const std::vector<uint8_t>& buf) {
+                std::vector<Packet> out;
+                size_t off = 0;
+                while (off + sizeof(GpuPacketHeader) <= buf.size()) {
+                    GpuPacketHeader h{};
+                    std::memcpy(&h, buf.data() + off, sizeof(h));
+                    off += sizeof(h);
+                    Packet p;
+                    p.opcode = static_cast<GpuOpcode>(h.opcode);
+                    p.payload.assign(buf.data() + off, buf.data() + off + h.payload_bytes);
+                    off += h.payload_bytes;
+                    out.push_back(std::move(p));
+                }
+                CHECK(off == buf.size());
+                return out;
+            };
+
+            // Create a 256x1 RGBA32Float (DXGI format 2) address texture and mark it used in Frame 0.
+            constexpr uint64_t kBaseVa = 0x7E00'1000'0000ull;
+            const uint32_t lut_id = device->ensure_address_texture(kBaseVa, 2u, 256u, 1u, 1u, 1u, 0x100u,
+                                                                   GpuTextureDimension::Dim2D, false);
+            CHECK(lut_id != 0);
+            device->state_bridge().note_resource_used(lut_id);
+
+            // Fill the LRU with kMaxAddressTextures cold (not used in Frame 0) textures:
+            // lut_id must NOT be evicted while cold non-in-frame candidates exist.
+            std::vector<uint32_t> others;
+            others.reserve(dg::Device::kMaxAddressTextures);
+            for (size_t i = 1; i <= dg::Device::kMaxAddressTextures; ++i) {
+                const uint32_t id = device->ensure_address_texture(kBaseVa + i * 0x10000ull, 2u, 256u, 1u, 1u, 1u,
+                                                                   0x100u, GpuTextureDimension::Dim2D, false);
+                CHECK(id != 0);
+                others.push_back(id);
+            }
+            bridge::TextureInfo info{};
+            CHECK(device->state_bridge().texture_info(lut_id, &info));
+
+            // Now mark every live texture in Frame 0 with a newer tick than lut_id so the next
+            // allocation MUST evict in-frame lut_id BEFORE Present!
+            for (const uint32_t id : others) {
+                if (device->state_bridge().texture_info(id, &info)) {
+                    device->state_bridge().note_resource_used(id);
+                }
+            }
+            const uint32_t overflow_id = device->ensure_address_texture(
+                kBaseVa + (dg::Device::kMaxAddressTextures + 10u) * 0x10000ull, 2u, 256u, 1u, 1u, 1u, 0x100u,
+                GpuTextureDimension::Dim2D, false);
+            CHECK(overflow_id != 0);
+            CHECK(!device->state_bridge().texture_info(lut_id, &info));  // lut_id was evicted
+
+            // Before Present: ZERO DestroyResource(lut_id) packets may have been emitted!
+            for (const Packet& pk : decode_stream(stream)) {
+                if (pk.opcode == GpuOpcode::DestroyResource) {
+                    CHECK(pod<GpuDestroyResourcePayload>(pk).id != lut_id);
+                }
+            }
+            CHECK(device->state_bridge().deferred_destroy_count() >= 1);
+
+            // Present Frame 0, then flush Frame 1 submission prelude: DestroyResource(lut_id) must
+            // appear strictly AFTER Present!
+            device->present();
+            gpu::CommandEncoder frame1_enc;
+            device->flush_cpu_buffers(frame1_enc);
+            device->submit(frame1_enc);
+
+            const std::vector<Packet> all = decode_stream(stream);
+            size_t present_idx = all.size();
+            size_t destroy_lut_idx = all.size();
+            for (size_t i = 0; i < all.size(); ++i) {
+                if (all[i].opcode == GpuOpcode::Present) {
+                    present_idx = i;
+                } else if (all[i].opcode == GpuOpcode::DestroyResource &&
+                           pod<GpuDestroyResourcePayload>(all[i]).id == lut_id) {
+                    destroy_lut_idx = i;
+                }
+            }
+            CHECK(present_idx < all.size());
+            CHECK(destroy_lut_idx < all.size() && destroy_lut_idx > present_idx);
+        }
+        com::reset_com_bridge();
+        com::set_guest_memory(nullptr);
+    }
+}
+
 int main() {
+    test_partly_held_mip_chain_clamps_views();
+    test_view_table_bounded();
+    test_unregister_texture_invalidates_cached_bind_groups();
+    test_evicted_texture_destroy_deferred_until_after_present();
     test_content_hash_change_detection();
     test_storage_texture_format_conversion();
+    test_fragment_storage_texture_format_conversion();
+    test_vertex_mixed_storage_and_attachment_alias();
     test_seam_conversions();
     test_memory_backed_tables();
     test_representative_command_list();
     test_unaligned_uniform_relocation();
     test_unaligned_storage_relocation();
+    test_root_srv_read_as_uniform_and_storage();
+    test_cached_bind_group_follows_moved_relocation();
     test_storage_texture_needs_storage_usage();
     test_reflected_uniform_min_size();
     test_bind_group_rebuild_and_retire();
+    test_cached_bind_group_drops_destroyed_texture();
     test_usage_conflict_is_diagnosed();
     test_barrier_flushes_pending_clears();
     test_partial_clear_is_reported();
     test_compute_dispatch_packets();
+    test_execute_indirect_packets();
+    test_mesh_pipeline_packets();
     test_binding_array_layouts();
     test_diagnostics_and_closed_list();
     test_indexed_draw_and_layout_dedup();
+    test_identical_draws_create_no_new_objects();
     test_concurrent_command_lists();
     test_dirty_texture_memory_upload();
     test_all_subresource_uploads();
+    test_banded_texture_upload();
     test_bc_texture_upload_needs_feature();
     test_norm16_address_texture_upload();
     test_fence_completion_and_ref_lifetime();

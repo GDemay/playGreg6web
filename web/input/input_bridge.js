@@ -192,10 +192,258 @@ function readGamepadTrigger(button) {
   return button.pressed ? 1 : 0;
 }
 
+export const MIN_SCRIPT_HOLD_MS = 180;
+export const CHROME_MENU_FLOW_4_HOLD_MS = 200;
+export const DEFAULT_VISIBLE_FRAME_FALLBACK_MS = 2000;
+export const FIRST_VISIBLE_FRAME_INITIAL_A_DELAY_MS = 500;
+export const FIRST_VISIBLE_FRAME_INITIAL_A_HOLD_MS = 220;
+
+export const FIRST_VISIBLE_FRAME_ANCHOR_PRESETS = Object.freeze([
+  'menu-to-ingame',
+  'chrome-to-ingame',
+  'chrome-menu-flow-4',
+  'chrome-menu-flow-2',
+  'chrome-menu-flow',
+]);
+const FIRST_VISIBLE_FRAME_ANCHOR_PRESET_SET = new Set(FIRST_VISIBLE_FRAME_ANCHOR_PRESETS);
+const FIRST_VISIBLE_FRAME_MIN_GAP_MS = 500;
+
+export const FIRST_VISIBLE_FRAME_INITIAL_A_EVENTS = Object.freeze([
+  Object.freeze({
+    atMs: FIRST_VISIBLE_FRAME_INITIAL_A_DELAY_MS,
+    holdMs: FIRST_VISIBLE_FRAME_INITIAL_A_HOLD_MS,
+    button: INPUT_BUTTONS.A,
+  }),
+  Object.freeze({
+    atMs: 2500,
+    holdMs: FIRST_VISIBLE_FRAME_INITIAL_A_HOLD_MS,
+    button: INPUT_BUTTONS.A,
+  }),
+  Object.freeze({
+    atMs: 4500,
+    holdMs: FIRST_VISIBLE_FRAME_INITIAL_A_HOLD_MS,
+    button: INPUT_BUTTONS.A,
+  }),
+]);
+
+export const INPUT_SCRIPT_START_TRIGGERS = Object.freeze({
+  IMMEDIATE: 'immediate',
+  FIRST_PRESENT: 'FIRST_PRESENT',
+  FIRST_VISIBLE_FRAME: 'FIRST_VISIBLE_FRAME',
+});
+
 function buildPeriodicButtonEvents(startMs, endMs, periodMs, holdMs, button) {
   const events = [];
   for (let atMs = startMs; atMs <= endMs; atMs += periodMs) {
     events.push(Object.freeze({ atMs, holdMs, button }));
+  }
+  return Object.freeze(events);
+}
+
+// Mirrors tools/run_native_boot.py::_menu_cycle (PR #1483):
+// Up x6 (cursor reset to top), Down, Down, A — selects "Next >" on LEGAL NOTICES
+// (and advances earlier screens via A) with >= 180 ms holds for 15-30 FPS browser boots.
+const CHROME_MENU_FLOW_4_CYCLE_OFFSETS = Object.freeze([
+  Object.freeze({ offsetMs: 0, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.DPAD_UP }),
+  Object.freeze({ offsetMs: 400, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.DPAD_UP }),
+  Object.freeze({ offsetMs: 800, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.DPAD_UP }),
+  Object.freeze({ offsetMs: 1200, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.DPAD_UP }),
+  Object.freeze({ offsetMs: 1600, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.DPAD_UP }),
+  Object.freeze({ offsetMs: 2000, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.DPAD_UP }),
+  Object.freeze({ offsetMs: 3000, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.DPAD_DOWN }),
+  Object.freeze({ offsetMs: 4500, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.DPAD_DOWN }),
+  Object.freeze({ offsetMs: 6500, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.A }),
+]);
+
+// W362 (Refs #663): 16 s ROCKSTAR GAMES LEGAL TERMS & POLICIES checkbox-accept cycle.
+// Live Chrome t90 layout has 3 rows:
+//   Row 0: [ ] Privacy Policy (SCROLL [R] / SELECT [A])
+//   Row 1: [ ] Terms of Service (SCROLL [R] / SELECT [A])
+//   Row 2: Confirm > ("Confirm setup and start the game." — disabled until Row 0 & Row 1 checked)
+// Right-stick scroll uses ry: -0.95 (GameInput/XInput Y-up ABI where -1.0 is down).
+// All button holds are >= 200 ms (>= MIN_SCRIPT_HOLD_MS) and B is never pressed.
+export const CHROME_LEGAL_TERMS_ACCEPT_OFFSETS = Object.freeze([
+  Object.freeze({ offsetMs: 0, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.DPAD_UP }),
+  Object.freeze({ offsetMs: 450, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.DPAD_UP }),
+  Object.freeze({ offsetMs: 900, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.DPAD_UP }),
+  Object.freeze({ offsetMs: 1350, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.DPAD_UP }),
+  Object.freeze({ offsetMs: 1800, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.DPAD_UP }),
+  Object.freeze({ offsetMs: 2250, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.DPAD_UP }),
+  Object.freeze({ offsetMs: 2700, holdMs: 900, sticks: Object.freeze({ ry: -0.95 }) }),
+  Object.freeze({ offsetMs: 4000, holdMs: 220, button: INPUT_BUTTONS.A }),
+  Object.freeze({ offsetMs: 5200, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.DPAD_DOWN }),
+  Object.freeze({ offsetMs: 5800, holdMs: 900, sticks: Object.freeze({ ry: -0.95 }) }),
+  Object.freeze({ offsetMs: 7100, holdMs: 220, button: INPUT_BUTTONS.A }),
+  Object.freeze({ offsetMs: 8300, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.DPAD_DOWN }),
+  Object.freeze({ offsetMs: 9500, holdMs: 220, button: INPUT_BUTTONS.A }),
+  Object.freeze({ offsetMs: 12000, holdMs: 220, button: INPUT_BUTTONS.A }),
+]);
+
+function expandOffsetCycle(events, baseMs, offsets) {
+  for (let i = 0; i < offsets.length; i++) {
+    const step = offsets[i];
+    const ev = {
+      atMs: baseMs + step.offsetMs,
+      holdMs: step.holdMs,
+    };
+    if (step.button !== undefined) ev.button = step.button;
+    if (step.sticks !== undefined) ev.sticks = step.sticks;
+    if (step.triggers !== undefined) ev.triggers = step.triggers;
+    events.push(Object.freeze(ev));
+  }
+}
+
+function buildChromeMenuFlow4Events() {
+  const events = [];
+  // Phase 1 (5s..75s): Early A confirmations every 2500 ms (holdMs: 200 >= 180 ms, 29 presses).
+  // Starts at 5000 ms (anchored to FIRST_PRESENT, not gated on FIRST_VISIBLE_FRAME) so a dark
+  // Start Screen never stalls waiting 110 s like chrome-menu-flow-2, then continues across
+  // 6-star -> Bink2 -> Rockstar -> UI TEXT SIZE -> FINISH SETUP?.
+  for (let atMs = 5000; atMs <= 75000; atMs += 2500) {
+    events.push(
+      Object.freeze({ atMs, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.A })
+    );
+  }
+  // Phase 2 (80s..170.5s): 7 rounds of Timon's 14 s _menu_cycle (Up x6, Down, Down, A)
+  // matching tools/run_native_boot.py::_to_list_screen (PR #1483) to advance any remaining
+  // setup screens and deterministically select "Next >" on LEGAL NOTICES.
+  for (let round = 0; round < 7; round++) {
+    expandOffsetCycle(events, 80000 + round * 14000, CHROME_MENU_FLOW_4_CYCLE_OFFSETS);
+  }
+  // Phase 3 (178s..180s): Post-Legal List Screen top-item select matching native menu-flow-4
+  // (PR #1483: DUp to put cursor in 50-draw top state, then +2000 ms A to trigger the ~3 s
+  // transition into the 34-draw screen / Main Menu, followed by a ~10 s settle window).
+  events.push(
+    Object.freeze({ atMs: 178000, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.DPAD_UP })
+  );
+  events.push(
+    Object.freeze({ atMs: 180000, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.A })
+  );
+  // Phase 4 (184s..360s, W361/W362): Extended long-Bink2 continuation so Wasm64 browser runs where
+  // 4K Bink2 takes 30-160 s never run out of scripted inputs after UI TEXT SIZE.
+  // Phase 4a (184s..212s): 10 spaced A confirmations every 3000 ms (holdMs: 200, never B) to
+  // advance through UI TEXT SIZE -> BRIGHTNESS / HDR / SUBTITLES -> FINISH SETUP? -> LEGAL NOTICES.
+  for (let i = 0; i < 10; i++) {
+    events.push(
+      Object.freeze({
+        atMs: 184000 + i * 3000,
+        holdMs: CHROME_MENU_FLOW_4_HOLD_MS,
+        button: INPUT_BUTTONS.A,
+      })
+    );
+  }
+  // Phase 4b (218s..316s): 7 rounds of Timon's 14 s _menu_cycle (Up x6, Down, Down, A) every
+  // 14000 ms to deterministically highlight & confirm "Next >" on LEGAL NOTICES (and advance any
+  // remaining setup screen).
+  for (let round = 0; round < 7; round++) {
+    expandOffsetCycle(events, 218000 + round * 14000, CHROME_MENU_FLOW_4_CYCLE_OFFSETS);
+  }
+  // Phase 4c (320s..360s, W362): 2 rounds of 16 s ROCKSTAR GAMES LEGAL TERMS & POLICIES
+  // checkbox-accept sequence (320s..352s: Up x6 -> right-stick scroll -> A [Privacy Policy] ->
+  // Down -> right-stick scroll -> A [Terms of Service] -> Down -> A [Confirm >] -> A) followed
+  // by an A confirmation at 358s for Main Menu / Story entry (never presses B).
+  for (let round = 0; round < 2; round++) {
+    expandOffsetCycle(events, 320000 + round * 16000, CHROME_LEGAL_TERMS_ACCEPT_OFFSETS);
+  }
+  events.push(
+    Object.freeze({ atMs: 358000, holdMs: 220, button: INPUT_BUTTONS.A })
+  );
+  return Object.freeze(events);
+}
+
+function buildChromeToIngameEvents() {
+  const events = [];
+  // Phase 1 (5s..145s): Spaced A every 3000 ms (holdMs: 220, 47 presses: 5000..143000 ms)
+  // to advance Start Screen -> 4K Bink2 -> R* -> UI TEXT SIZE -> BRIGHTNESS -> FINISH SETUP?
+  // -> LEGAL NOTICES.
+  for (let atMs = 5000; atMs <= 145000; atMs += 3000) {
+    events.push(Object.freeze({ atMs, holdMs: 220, button: INPUT_BUTTONS.A }));
+  }
+  // Phase 2 (150s..206s): 4 rounds of 14 s LEGAL NOTICES _menu_cycle (Up x6, Down, Down, A)
+  // to click "Next >" into ROCKSTAR GAMES LEGAL TERMS & POLICIES (harmless if already there).
+  for (let round = 0; round < 4; round++) {
+    expandOffsetCycle(events, 150000 + round * 14000, CHROME_MENU_FLOW_4_CYCLE_OFFSETS);
+  }
+  // Phase 3 (210s..274s): 4 rounds of 16 s CHROME_LEGAL_TERMS_ACCEPT_OFFSETS to check BOTH
+  // Privacy Policy & Terms of Service checkboxes and click "Confirm >" ("Confirm setup and
+  // start the game.").
+  for (let round = 0; round < 4; round++) {
+    expandOffsetCycle(events, 210000 + round * 16000, CHROME_LEGAL_TERMS_ACCEPT_OFFSETS);
+  }
+  // Phase 4a (280s..340s): Main Menu -> Story Mode / New Game selection (spaced A every 4000 ms,
+  // holdMs: 220, 16 presses: 280000..340000 ms, never pressing B).
+  for (let atMs = 280000; atMs <= 340000; atMs += 4000) {
+    events.push(Object.freeze({ atMs, holdMs: 220, button: INPUT_BUTTONS.A }));
+  }
+  // Phase 4b (346s..420s): Gentle in-game movement & camera look sweeps interspersed with brief
+  // A confirms (completes cleanly at 418220 ms <= 420000 ms with all inputs released; never B).
+  for (let block = 0; block < 4; block++) {
+    const base = 346000 + block * 18000;
+    const strafeSign = block % 2 === 0 ? 1 : -1;
+    events.push(Object.freeze({ atMs: base, holdMs: 220, button: INPUT_BUTTONS.A }));
+    events.push(
+      Object.freeze({
+        atMs: base + 2000,
+        holdMs: 2000,
+        sticks: Object.freeze({ lx: 0, ly: 0.85 }),
+      })
+    );
+    events.push(
+      Object.freeze({
+        atMs: base + 5000,
+        holdMs: 1500,
+        sticks: Object.freeze({ rx: 0.7, ry: 0.15 }),
+      })
+    );
+    events.push(
+      Object.freeze({
+        atMs: base + 7500,
+        holdMs: 1500,
+        sticks: Object.freeze({ rx: -0.7, ry: -0.15 }),
+      })
+    );
+    events.push(
+      Object.freeze({
+        atMs: base + 10000,
+        holdMs: 2000,
+        sticks: Object.freeze({ lx: 0.5 * strafeSign, ly: 0.75, rx: 0.35 * strafeSign, ry: 0 }),
+      })
+    );
+    events.push(Object.freeze({ atMs: base + 14000, holdMs: 220, button: INPUT_BUTTONS.A }));
+  }
+  events.push(Object.freeze({ atMs: 418000, holdMs: 220, button: INPUT_BUTTONS.A }));
+  return Object.freeze(events);
+}
+
+function buildChromeMenuFlow2Events() {
+  const events = [];
+  // Phase 1: Human-paced A confirmations every 2500 ms from 110000 ms through 165000 ms
+  // (Start Screen -> CONTINUE -> Calibration -> UI TEXT SIZE in Chrome Wasm64 boots).
+  for (let atMs = 110000; atMs <= 165000; atMs += 2500) {
+    events.push(Object.freeze({ atMs, holdMs: 100, button: INPUT_BUTTONS.A }));
+  }
+  // Phase 2: 3 human-paced DPAD_DOWN, DPAD_DOWN, A cycles every 12000 ms from 169000 ms
+  // to highlight and select "Next >" on LEGAL NOTICES (mirrors PR #1333).
+  for (let cycle = 0; cycle < 3; cycle++) {
+    const base = 169000 + cycle * 12000;
+    events.push(Object.freeze({ atMs: base, holdMs: 150, button: INPUT_BUTTONS.DPAD_DOWN }));
+    events.push(Object.freeze({ atMs: base + 2000, holdMs: 150, button: INPUT_BUTTONS.DPAD_DOWN }));
+    events.push(Object.freeze({ atMs: base + 4500, holdMs: 100, button: INPUT_BUTTONS.A }));
+  }
+  // Phase 3: Single A at 206500 ms (+9 s after Phase 2) to leave the post-legal list screen.
+  events.push(Object.freeze({ atMs: 206500, holdMs: 100, button: INPUT_BUTTONS.A }));
+  // Phase 4: Cycling DPAD_DOWN x N + A (N = 1..5, spaced 25000 ms apart from 230000 ms)
+  // to advance through post-legal menu screens (never presses B or DPAD_UP).
+  for (let n = 1; n <= 5; n++) {
+    const groupStart = 230000 + (n - 1) * 25000;
+    for (let i = 0; i < n; i++) {
+      events.push(
+        Object.freeze({ atMs: groupStart + i * 1500, holdMs: 150, button: INPUT_BUTTONS.DPAD_DOWN })
+      );
+    }
+    events.push(
+      Object.freeze({ atMs: groupStart + n * 1500 + 1500, holdMs: 100, button: INPUT_BUTTONS.A })
+    );
   }
   return Object.freeze(events);
 }
@@ -226,6 +474,32 @@ function buildPeriodicButtonEvents(startMs, endMs, periodMs, holdMs, button) {
 //   Intro cinematic skip (hold A / MENU) -> Main Menu Story/Play selection -> brief in-game
 //   left stick, right stick, and LT/RT trigger movement (runtime #1139), completing cleanly
 //   at 59300 ms with all inputs released (never presses B or DPAD_UP).
+// - 'chrome-menu-flow-2': Mirrors PR #1333 (menu-flow-2) for Chrome Wasm64 boots:
+//   human-paced A every 2500 ms from 110000 ms through 165000 ms (Start Screen / Calibration /
+//   UI TEXT SIZE), 3 cycles of DPAD_DOWN, DPAD_DOWN, A every 12000 ms from 169000 ms for
+//   LEGAL NOTICES ("Next >"), A at 206500 ms to leave the post-legal list screen, cycling
+//   DPAD_DOWN x N + A (N = 1..5, spaced 25000 ms apart from 230000 ms), then looping A every
+//   9000 ms from 360000 ms into Main Menu / In-Game (never presses B or DPAD_UP).
+// - 'chrome-menu-flow-4': Mirrors native menu-flow-4 (tools/run_native_boot.py, PR #1483)
+//   for Chrome Wasm64 boots with >= 180 ms (200 ms) holds for 15-30 FPS & #1501 press latch:
+//   Phase 1 early A every 2500 ms from 5000 ms through 75000 ms (starts right after FIRST_PRESENT
+//   so a dark Start Screen never stalls while splash waits for FIRST_VISIBLE_FRAME, continuing
+//   through 6-star -> Bink2 -> Rockstar -> UI TEXT SIZE -> FINISH SETUP?), Phase 2 7 rounds of
+//   14 s cursor-resetting _menu_cycle (DPAD_UP x6, DPAD_DOWN, DPAD_DOWN, A) from 80000 ms for
+//   LEGAL NOTICES ("Next >"), Phase 3 Post-Legal List Screen DPAD_UP (178000 ms) + A (180000 ms),
+//   Phase 4 (W361/W362, 184000..358000 ms) extended long-Bink2 continuation (4a: 10 spaced A every
+//   3000 ms from 184000 ms through 211000 ms; 4b: 7 rounds of 14 s _menu_cycle from 218000 ms;
+//   4c: 2 rounds of 16 s CHROME_LEGAL_TERMS_ACCEPT_OFFSETS from 320000 ms to check Privacy Policy
+//   + Terms of Service and click "Confirm >", followed by A at 358000 ms), then Phase 5 looping
+//   CHROME_LEGAL_TERMS_ACCEPT_OFFSETS every 16000 ms from 368000 ms (never presses B).
+// - 'chrome-to-ingame': Clean, fast FIRST_VISIBLE_FRAME-anchored Chrome Wasm64 preset driving
+//   Start Screen -> 4K Bink2 -> UI TEXT SIZE / BRIGHTNESS / FINISH SETUP? (Phase 1: spaced A every
+//   3000 ms from 5000 ms through 145000 ms) -> LEGAL NOTICES "Next >" (Phase 2: 4 rounds of 14 s
+//   _menu_cycle from 150000 ms through 206000 ms) -> ROCKSTAR GAMES LEGAL TERMS & POLICIES
+//   2-checkbox + "Confirm >" accept (Phase 3: 4 rounds of 16 s CHROME_LEGAL_TERMS_ACCEPT_OFFSETS
+//   from 210000 ms through 274000 ms) -> Main Menu / Story Mode selection & gentle in-game
+//   movement/camera probes (Phase 4: spaced A every 4000 ms through 340000 ms, then A + left-stick
+//   forward / right-stick look sweeps through 420000 ms; bounded, never presses B).
 export const INPUT_SCRIPT_PRESETS = Object.freeze({
   'start-screen': Object.freeze({
     name: 'start-screen',
@@ -394,6 +668,35 @@ export const INPUT_SCRIPT_PRESETS = Object.freeze({
       }),
     ]),
   }),
+  'chrome-menu-flow-2': Object.freeze({
+    name: 'chrome-menu-flow-2',
+    events: buildChromeMenuFlow2Events(),
+    // Phase 5: Periodic A every 9000 ms from 360000 ms to advance cleanly into Main Menu /
+    // In-Game (mirrors PR #1333 menu-flow-2; never presses B or DPAD_UP).
+    loop: Object.freeze({
+      startMs: 360000,
+      periodMs: 9000,
+      events: Object.freeze([
+        Object.freeze({ offsetMs: 0, holdMs: 100, button: INPUT_BUTTONS.A }),
+      ]),
+    }),
+  }),
+  'chrome-menu-flow-4': Object.freeze({
+    name: 'chrome-menu-flow-4',
+    events: buildChromeMenuFlow4Events(),
+    // Phase 5 (W362): Looping 16 s CHROME_LEGAL_TERMS_ACCEPT_OFFSETS (Up x6, scroll, A, Down,
+    // scroll, A, Down, A, A; >= 200 ms holds) from 368000 ms after Phase 4 settles (~10 s after
+    // 358000 ms; never presses B).
+    loop: Object.freeze({
+      startMs: 368000,
+      periodMs: 16000,
+      events: CHROME_LEGAL_TERMS_ACCEPT_OFFSETS,
+    }),
+  }),
+  'chrome-to-ingame': Object.freeze({
+    name: 'chrome-to-ingame',
+    events: buildChromeToIngameEvents(),
+  }),
 });
 
 export const INPUT_SCRIPT_PRESET_NAMES = Object.freeze(Object.keys(INPUT_SCRIPT_PRESETS));
@@ -560,6 +863,43 @@ function validateOptionalEndMs(value) {
   return validateNonNegativeFinite(value, 'endMs');
 }
 
+function validateOptionalStartOffsetMs(value) {
+  if (value === undefined || value === null) return 0;
+  return validateNonNegativeFinite(value, 'startOffsetMs');
+}
+
+function validateOptionalMinHoldMs(value) {
+  if (value === undefined || value === null) return 0;
+  return validateNonNegativeFinite(value, 'minHoldMs');
+}
+
+function validateOptionalTimeoutMs(value, name) {
+  if (value === undefined || value === null) return null;
+  return validateNonNegativeFinite(value, name);
+}
+
+function normalizeStartTrigger(startOn, waitForFirstVisibleFrame) {
+  if (startOn === undefined || startOn === null || startOn === '') {
+    return waitForFirstVisibleFrame === true
+      ? INPUT_SCRIPT_START_TRIGGERS.FIRST_VISIBLE_FRAME
+      : INPUT_SCRIPT_START_TRIGGERS.IMMEDIATE;
+  }
+  if (typeof startOn !== 'string') {
+    throw new RangeError(`startOn must be a string trigger name, got ${typeof startOn}`);
+  }
+  const normalized = startOn.trim().toLowerCase().replace(/[\s-]+/g, '_');
+  if (normalized === 'immediate' || normalized === 'now') {
+    return INPUT_SCRIPT_START_TRIGGERS.IMMEDIATE;
+  }
+  if (normalized === 'first_present' || normalized === 'firstpresent') {
+    return INPUT_SCRIPT_START_TRIGGERS.FIRST_PRESENT;
+  }
+  if (normalized === 'first_visible_frame' || normalized === 'firstvisibleframe') {
+    return INPUT_SCRIPT_START_TRIGGERS.FIRST_VISIBLE_FRAME;
+  }
+  throw new RangeError(`Unknown scripted input startOn trigger: ${startOn}`);
+}
+
 function validateOptionalMaxPresses(value) {
   if (value === undefined || value === null) return null;
   if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
@@ -606,6 +946,8 @@ export class ScriptedInputPlayer {
         ...INPUT_SCRIPT_PRESETS[spec.preset],
         ...(spec.endMs !== undefined ? { endMs: spec.endMs } : null),
         ...(spec.maxPresses !== undefined ? { maxPresses: spec.maxPresses } : null),
+        ...(spec.startOffsetMs !== undefined ? { startOffsetMs: spec.startOffsetMs } : null),
+        ...(spec.minHoldMs !== undefined ? { minHoldMs: spec.minHoldMs } : null),
       };
     }
 
@@ -621,6 +963,12 @@ export class ScriptedInputPlayer {
           ? spec.events
           : EMPTY_ARRAY;
       const specObj = Array.isArray(spec) ? null : spec;
+      const startOffsetMs = validateOptionalStartOffsetMs(
+        opts.startOffsetMs !== undefined ? opts.startOffsetMs : specObj?.startOffsetMs
+      );
+      const minHoldMs = validateOptionalMinHoldMs(
+        opts.minHoldMs !== undefined ? opts.minHoldMs : specObj?.minHoldMs
+      );
       const endMs = validateOptionalEndMs(
         opts.endMs !== undefined ? opts.endMs : specObj?.endMs
       );
@@ -637,11 +985,13 @@ export class ScriptedInputPlayer {
         if (!ev || typeof ev !== 'object') {
           throw new TypeError(`Scripted input event at index ${index} must be an object`);
         }
-        const atMs = validateNonNegativeFinite(
-          ev.atMs !== undefined ? ev.atMs : ev.startMs,
-          `events[${index}].atMs`
-        );
-        const holdMs = validatePositiveFinite(ev.holdMs, `events[${index}].holdMs`);
+        const atMs =
+          validateNonNegativeFinite(
+            ev.atMs !== undefined ? ev.atMs : ev.startMs,
+            `events[${index}].atMs`
+          ) + startOffsetMs;
+        const rawHoldMs = validatePositiveFinite(ev.holdMs, `events[${index}].holdMs`);
+        const holdMs = minHoldMs > 0 ? Math.max(rawHoldMs, minHoldMs) : rawHoldMs;
         const buttonsMask = resolveScriptButtonMask(ev.button, ev.buttonsMask);
         const sticks = normalizeScriptSticks(ev.sticks);
         const triggers = normalizeScriptTriggers(ev.triggers);
@@ -675,7 +1025,8 @@ export class ScriptedInputPlayer {
         if (typeof rawLoop !== 'object' || Array.isArray(rawLoop)) {
           throw new TypeError('Scripted input loop must be an object');
         }
-        const loopStartMs = validateNonNegativeFinite(rawLoop.startMs ?? 0, 'loop.startMs');
+        const loopStartMs =
+          validateNonNegativeFinite(rawLoop.startMs ?? 0, 'loop.startMs') + startOffsetMs;
         const loopPeriodMs = validatePositiveFinite(rawLoop.periodMs, 'loop.periodMs');
         if (!Array.isArray(rawLoop.events)) {
           throw new TypeError('Scripted input loop.events must be an array');
@@ -693,7 +1044,8 @@ export class ScriptedInputPlayer {
               `loop.events[${index}].offsetMs (${offsetMs}) must be < loop.periodMs (${loopPeriodMs})`
             );
           }
-          const holdMs = validatePositiveFinite(ev.holdMs, `loop.events[${index}].holdMs`);
+          const rawHoldMs = validatePositiveFinite(ev.holdMs, `loop.events[${index}].holdMs`);
+          const holdMs = minHoldMs > 0 ? Math.max(rawHoldMs, minHoldMs) : rawHoldMs;
           const buttonsMask = resolveScriptButtonMask(ev.button, ev.buttonsMask);
           const sticks = normalizeScriptSticks(ev.sticks);
           const triggers = normalizeScriptTriggers(ev.triggers);
@@ -737,9 +1089,18 @@ export class ScriptedInputPlayer {
       this._loop = normalizedLoop;
       this._endMs = endMs;
       this._maxPresses = maxPresses;
+      this.startOffsetMs = startOffsetMs;
+      this.minHoldMs = minHoldMs;
     } else if (spec && typeof spec === 'object') {
-      const startMs = validateNonNegativeFinite(spec.startMs ?? 0, 'startMs');
-      const holdMs = validatePositiveFinite(spec.holdMs, 'holdMs');
+      const startOffsetMs = validateOptionalStartOffsetMs(
+        opts.startOffsetMs !== undefined ? opts.startOffsetMs : spec.startOffsetMs
+      );
+      const minHoldMs = validateOptionalMinHoldMs(
+        opts.minHoldMs !== undefined ? opts.minHoldMs : spec.minHoldMs
+      );
+      const startMs = validateNonNegativeFinite(spec.startMs ?? 0, 'startMs') + startOffsetMs;
+      const rawHoldMs = validatePositiveFinite(spec.holdMs, 'holdMs');
+      const holdMs = minHoldMs > 0 ? Math.max(rawHoldMs, minHoldMs) : rawHoldMs;
       const periodMs = validatePositiveFinite(spec.periodMs, 'periodMs');
       const endMs = validateOptionalEndMs(opts.endMs !== undefined ? opts.endMs : spec.endMs);
       const maxPresses = validateOptionalMaxPresses(
@@ -769,6 +1130,8 @@ export class ScriptedInputPlayer {
       this._loop = null;
       this._endMs = endMs;
       this._maxPresses = maxPresses;
+      this.startOffsetMs = startOffsetMs;
+      this.minHoldMs = minHoldMs;
     } else {
       throw new TypeError(
         'Input script spec must be a preset name, repeating schedule object, or event array'
@@ -830,6 +1193,7 @@ export class ScriptedInputPlayer {
     this._timerId = null;
     this._intervalId = null;
     this._runToken = 0;
+    this._reanchoredInitialEventsApplied = false;
   }
 
   _setBridgeSink(sinkFn) {
@@ -1294,6 +1658,119 @@ export class ScriptedInputPlayer {
   }
 
   /**
+   * Re-anchors (resets) playback to `elapsedMs = 0` at the current clock time (`nowFn()`),
+   * e.g. when `FIRST_VISIBLE_FRAME` arrives after a slow black asset-loading screen.
+   * Optionally prepends non-overlapping `initialEvents` (such as an immediate 220 ms `A`
+   * press within 500 ms so the Start Screen 3.2 s idle watchdog never fires) while keeping
+   * subsequent script phases synchronized from the new anchor.
+   */
+  reanchor(options = {}) {
+    const opts = options || {};
+    const initialEvents = Array.isArray(opts.initialEvents) ? opts.initialEvents : null;
+    const preservePressCount = opts.preservePressCount !== false;
+
+    if (
+      this._mode === 'events' &&
+      initialEvents &&
+      initialEvents.length > 0 &&
+      !this._reanchoredInitialEventsApplied &&
+      this._maxPresses !== 0
+    ) {
+      const merged = this._events.slice();
+      const added = [];
+      for (let i = 0; i < initialEvents.length; i++) {
+        const raw = initialEvents[i];
+        if (!raw || typeof raw !== 'object') continue;
+        const atMs = validateNonNegativeFinite(
+          raw.atMs !== undefined ? raw.atMs : raw.startMs,
+          `initialEvents[${i}].atMs`
+        );
+        if (this._endMs !== null && atMs >= this._endMs) continue;
+        const rawHoldMs = validatePositiveFinite(raw.holdMs, `initialEvents[${i}].holdMs`);
+        const holdMs = this.minHoldMs > 0 ? Math.max(rawHoldMs, this.minHoldMs) : rawHoldMs;
+        const evEnd = this._endMs !== null ? Math.min(atMs + holdMs, this._endMs) : atMs + holdMs;
+        if (evEnd <= atMs) continue;
+
+        let overlaps = false;
+        for (let j = 0; j < merged.length; j++) {
+          const existing = merged[j];
+          if (
+            atMs < existing.endMs + FIRST_VISIBLE_FRAME_MIN_GAP_MS &&
+            evEnd + FIRST_VISIBLE_FRAME_MIN_GAP_MS > existing.atMs
+          ) {
+            overlaps = true;
+            break;
+          }
+        }
+        if (overlaps) continue;
+
+        const normalizedEv = Object.freeze({
+          atMs,
+          holdMs: evEnd - atMs,
+          endMs: evEnd,
+          buttonsMask: resolveScriptButtonMask(raw.button, raw.buttonsMask),
+          sticks: normalizeScriptSticks(raw.sticks),
+          triggers: normalizeScriptTriggers(raw.triggers),
+        });
+        merged.push(normalizedEv);
+        added.push(normalizedEv);
+      }
+      if (added.length > 0) {
+        merged.sort((a, b) => a.atMs - b.atMs);
+        const finalEvents =
+          this._maxPresses !== null ? merged.slice(0, this._maxPresses) : merged;
+        this._events = Object.freeze(finalEvents);
+      }
+      this._reanchoredInitialEventsApplied = true;
+    }
+
+    const hadHeldState =
+      this._currentMask !== 0 ||
+      this._currentSticks !== null ||
+      this._currentTriggers !== null;
+    this._clearTimers();
+    this._runToken += 1;
+    const token = this._runToken;
+
+    this._startedAt = this._nowFn();
+    this._stoppedElapsedMs = 0;
+    this._pressCount = 0;
+    if (!preservePressCount) {
+      this._scriptedPressesSent = 0;
+      this._lastScriptedButton = null;
+    }
+    this._currentMask = 0;
+    this._currentSticks = null;
+    this._currentTriggers = null;
+    this._active = true;
+
+    this._tick(token, 0);
+
+    if (
+      hadHeldState &&
+      this._currentMask === 0 &&
+      this._currentSticks === null &&
+      this._currentTriggers === null &&
+      token === this._runToken
+    ) {
+      this._emitSample({ buttonsMask: 0, activeEventCount: 0 });
+    }
+
+    if (
+      this._active &&
+      token === this._runToken &&
+      this._useInterval &&
+      typeof this._setIntervalFn === 'function'
+    ) {
+      this._intervalId = this._setIntervalFn(() => {
+        this._tick(token);
+      }, this._tickMs);
+    }
+
+    return this;
+  }
+
+  /**
    * Manually advances playback to `elapsedMs` (or `nowFn() - startedAt` when omitted).
    */
   step(elapsedMs) {
@@ -1503,6 +1980,13 @@ export class InputBridge {
     this._gpRt = 0;
 
     this._scriptPlayer = null;
+    this._pendingScript = null;
+    this._scriptStartedOn = null;
+    this._scriptManuallyStopped = false;
+    this._scriptReanchorOnFirstVisibleFrame = false;
+    this._scriptReanchoredCount = 0;
+    this._firstPresentNotified = false;
+    this._firstVisibleFrameNotified = false;
     this._scriptButtons = 0;
     this._scriptLx = 0;
     this._scriptLy = 0;
@@ -1630,6 +2114,16 @@ export class InputBridge {
     return this.i32[index];
   }
 
+  _notifySeq() {
+    if (this._atomics && this.isSharedBuffer && typeof this._atomics.notify === 'function') {
+      try {
+        this._atomics.notify(this.i32, INPUT_WORD_INDICES.SEQ, 1);
+      } catch {
+        // Ignore host environments where Atomics.notify is unavailable/restricted.
+      }
+    }
+  }
+
   _shouldIgnoreKeydown(e, code) {
     if (this.isPointerLocked()) return false;
     // Do not hijack browser shortcuts (Ctrl+R, Ctrl+W, Alt+Tab, Cmd+*, etc.) when unlocked.
@@ -1704,6 +2198,7 @@ export class InputBridge {
       if (dx !== 0) this._atomicAddI32(INPUT_WORD_INDICES.MOUSE_DX, dx);
       if (dy !== 0) this._atomicAddI32(INPUT_WORD_INDICES.MOUSE_DY, dy);
       this._atomicAddU32(INPUT_WORD_INDICES.SEQ, 1);
+      this._notifySeq();
       this._writesCount += 1;
     });
 
@@ -2131,6 +2626,7 @@ export class InputBridge {
     this._atomicStoreI32(INPUT_WORD_INDICES.LEFT_TRIGGER, ltBits);
     this._atomicStoreI32(INPUT_WORD_INDICES.RIGHT_TRIGGER, rtBits);
     this._atomicAddU32(INPUT_WORD_INDICES.SEQ, 1);
+    this._notifySeq();
     this._writesCount += 1;
 
     return true;
@@ -2201,13 +2697,163 @@ export class InputBridge {
     return this._commitMergedState(false);
   }
 
+  _clearPendingScript() {
+    const pending = this._pendingScript;
+    if (!pending) return;
+    if (pending.timerId !== null && typeof pending.clearTimeoutFn === 'function') {
+      pending.clearTimeoutFn(pending.timerId);
+    }
+    pending.timerId = null;
+    this._pendingScript = null;
+  }
+
+  _activatePendingScript(reason) {
+    const pending = this._pendingScript;
+    if (!pending || this.disposed) return false;
+    this._clearPendingScript();
+    this._scriptPlayer = pending.player;
+    this._scriptStartedOn = reason;
+    this._scriptManuallyStopped = false;
+    if (
+      reason === INPUT_SCRIPT_START_TRIGGERS.FIRST_VISIBLE_FRAME &&
+      pending.reanchorOnFirstVisibleFrame
+    ) {
+      pending.player.reanchor({
+        initialEvents: FIRST_VISIBLE_FRAME_INITIAL_A_EVENTS,
+        preservePressCount: false,
+      });
+    } else {
+      pending.player.start();
+    }
+    return true;
+  }
+
+  _armPendingTimer(pending, delayMs, reason) {
+    if (pending.timerId !== null && typeof pending.clearTimeoutFn === 'function') {
+      pending.clearTimeoutFn(pending.timerId);
+      pending.timerId = null;
+    }
+    if (delayMs === 0) {
+      return this._activatePendingScript(reason);
+    }
+    if (typeof pending.setTimeoutFn !== 'function') {
+      return this._activatePendingScript(reason);
+    }
+    pending.timerId = pending.setTimeoutFn(() => {
+      if (this._pendingScript !== pending || this.disposed) return;
+      pending.timerId = null;
+      this._activatePendingScript(reason);
+    }, delayMs);
+    return false;
+  }
+
+  /**
+   * Notifies the bridge that the guest runtime has reached `FIRST_PRESENT`.
+   * Starts any scripted preset armed with `startOn: 'FIRST_PRESENT'` immediately,
+   * and arms (or immediately triggers when `visibleFrameFallbackMs === 0`) the bounded
+   * non-stalling fallback for presets armed with `startOn: 'FIRST_VISIBLE_FRAME'` so a
+   * dark Start Screen holding the splash overlay can never stall scripted input forever.
+   * Returns `true` if a pending script started synchronously.
+   */
+  notifyFirstPresent() {
+    if (this.disposed) return false;
+    this._firstPresentNotified = true;
+    const pending = this._pendingScript;
+    if (!pending) return false;
+    if (pending.trigger === INPUT_SCRIPT_START_TRIGGERS.FIRST_PRESENT) {
+      return this._activatePendingScript(INPUT_SCRIPT_START_TRIGGERS.FIRST_PRESENT);
+    }
+    if (pending.trigger === INPUT_SCRIPT_START_TRIGGERS.FIRST_VISIBLE_FRAME) {
+      return this._armPendingTimer(
+        pending,
+        pending.visibleFrameFallbackMs,
+        'FIRST_PRESENT_FALLBACK'
+      );
+    }
+    return false;
+  }
+
+  /**
+   * Notifies the bridge that the guest runtime has produced its first non-black visible
+   * frame (`FIRST_VISIBLE_FRAME`, which also implies `FIRST_PRESENT`).
+   * Starts any pending milestone-armed script immediately and cancels any fallback timer.
+   * When an anchorable menu preset (`menu-to-ingame`, `chrome-to-ingame`, `chrome-menu-flow-4`,
+   * `chrome-menu-flow-2`, `chrome-menu-flow`) already started earlier (e.g. via
+   * `FIRST_PRESENT`, `FIRST_PRESENT_FALLBACK`, or `immediate`) during a slow black
+   * asset-loading screen, cleanly re-anchors the script clock to `FIRST_VISIBLE_FRAME`
+   * and schedules an initial 220 ms `A` press within 500 ms so the Start Screen 3.2 s
+   * watchdog never fires.
+   * Returns `true` if a script started or re-anchored synchronously.
+   */
+  notifyFirstVisibleFrame() {
+    if (this.disposed) return false;
+    const alreadyVisible = this._firstVisibleFrameNotified;
+    this._firstPresentNotified = true;
+    this._firstVisibleFrameNotified = true;
+    if (alreadyVisible) return false;
+    if (this._pendingScript) {
+      return this._activatePendingScript(INPUT_SCRIPT_START_TRIGGERS.FIRST_VISIBLE_FRAME);
+    }
+    if (
+      this._scriptPlayer &&
+      !this._scriptManuallyStopped &&
+      this._scriptReanchorOnFirstVisibleFrame &&
+      this._scriptStartedOn !== INPUT_SCRIPT_START_TRIGGERS.FIRST_VISIBLE_FRAME
+    ) {
+      this._scriptStartedOn = INPUT_SCRIPT_START_TRIGGERS.FIRST_VISIBLE_FRAME;
+      this._scriptReanchoredCount += 1;
+      this._scriptPlayer.reanchor({
+        initialEvents: FIRST_VISIBLE_FRAME_INITIAL_A_EVENTS,
+        preservePressCount: true,
+      });
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Convenience milestone dispatcher for `'FIRST_PRESENT'` and `'FIRST_VISIBLE_FRAME'`.
+   */
+  notifyMilestone(milestone) {
+    if (this.disposed || typeof milestone !== 'string') return false;
+    const normalized = milestone.trim().toLowerCase().replace(/[\s-]+/g, '_');
+    if (normalized === 'first_present' || normalized === 'firstpresent') {
+      return this.notifyFirstPresent();
+    }
+    if (normalized === 'first_visible_frame' || normalized === 'firstvisibleframe') {
+      return this.notifyFirstVisibleFrame();
+    }
+    return false;
+  }
+
   /**
    * Starts deterministic scripted input playback (preset name, repeating schedule,
    * explicit event array, or ScriptedInputPlayer instance). Merges scripted buttons
    * alongside live keyboard/mouse/gamepad input without clobbering live state on release.
+   *
+   * Supports optional `startOn`:
+   * - `'immediate'` (default): starts playback immediately.
+   * - `'FIRST_PRESENT'`: starts immediately if `FIRST_PRESENT` already fired, otherwise
+   *   arms until `notifyFirstPresent()` (or `notifyFirstVisibleFrame()`, or optional
+   *   `firstPresentTimeoutMs`).
+   * - `'FIRST_VISIBLE_FRAME'` (or `waitForFirstVisibleFrame: true`): starts on
+   *   `notifyFirstVisibleFrame()`, and automatically falls back cleanly after
+   *   `visibleFrameFallbackMs` (default 2000 ms) once `notifyFirstPresent()` fires so a
+   *   dark Start Screen can never stall scripted input forever.
    */
   startScript(presetOrSpec, options = {}) {
     if (this.disposed) return null;
+    const opts = options || {};
+    const startTrigger = normalizeStartTrigger(opts.startOn, opts.waitForFirstVisibleFrame);
+    const visibleFrameFallbackMs =
+      opts.visibleFrameFallbackMs !== undefined && opts.visibleFrameFallbackMs !== null
+        ? validateNonNegativeFinite(opts.visibleFrameFallbackMs, 'visibleFrameFallbackMs')
+        : DEFAULT_VISIBLE_FRAME_FALLBACK_MS;
+    const firstPresentTimeoutMs = validateOptionalTimeoutMs(
+      opts.firstPresentTimeoutMs,
+      'firstPresentTimeoutMs'
+    );
+
     this.stopScript();
 
     let player;
@@ -2218,23 +2864,101 @@ export class InputBridge {
       });
     } else {
       player = new ScriptedInputPlayer(presetOrSpec, {
-        ...(options || {}),
+        ...opts,
         _bridgeSink: (sample) => {
           this._applyScriptSample(sample);
         },
       });
     }
 
+    const isDefaultAnchorPreset =
+      typeof player.preset === 'string' &&
+      FIRST_VISIBLE_FRAME_ANCHOR_PRESET_SET.has(player.preset);
+    const reanchorOnFirstVisibleFrame =
+      typeof opts.reanchorOnFirstVisibleFrame === 'boolean'
+        ? opts.reanchorOnFirstVisibleFrame
+        : isDefaultAnchorPreset;
+
     this._scriptPlayer = player;
-    player.start();
+    this._scriptStartedOn = null;
+    this._scriptManuallyStopped = false;
+    this._scriptReanchorOnFirstVisibleFrame = reanchorOnFirstVisibleFrame;
+
+    if (startTrigger === INPUT_SCRIPT_START_TRIGGERS.IMMEDIATE) {
+      this._scriptStartedOn = INPUT_SCRIPT_START_TRIGGERS.IMMEDIATE;
+      player.start();
+      return player;
+    }
+
+    if (
+      startTrigger === INPUT_SCRIPT_START_TRIGGERS.FIRST_PRESENT &&
+      (this._firstPresentNotified || this._firstVisibleFrameNotified)
+    ) {
+      this._scriptStartedOn = INPUT_SCRIPT_START_TRIGGERS.FIRST_PRESENT;
+      player.start();
+      return player;
+    }
+
+    if (
+      startTrigger === INPUT_SCRIPT_START_TRIGGERS.FIRST_VISIBLE_FRAME &&
+      this._firstVisibleFrameNotified
+    ) {
+      this._scriptStartedOn = INPUT_SCRIPT_START_TRIGGERS.FIRST_VISIBLE_FRAME;
+      if (reanchorOnFirstVisibleFrame) {
+        player.reanchor({
+          initialEvents: FIRST_VISIBLE_FRAME_INITIAL_A_EVENTS,
+          preservePressCount: false,
+        });
+      } else {
+        player.start();
+      }
+      return player;
+    }
+
+    const setTimeoutFn =
+      opts.setTimeoutFn !== undefined
+        ? opts.setTimeoutFn
+        : typeof globalThis !== 'undefined' && typeof globalThis.setTimeout === 'function'
+          ? globalThis.setTimeout.bind(globalThis)
+          : null;
+    const clearTimeoutFn =
+      opts.clearTimeoutFn !== undefined
+        ? opts.clearTimeoutFn
+        : typeof globalThis !== 'undefined' && typeof globalThis.clearTimeout === 'function'
+          ? globalThis.clearTimeout.bind(globalThis)
+          : null;
+
+    const pending = {
+      player,
+      trigger: startTrigger,
+      visibleFrameFallbackMs,
+      firstPresentTimeoutMs,
+      reanchorOnFirstVisibleFrame,
+      setTimeoutFn,
+      clearTimeoutFn,
+      timerId: null,
+    };
+    this._pendingScript = pending;
+
+    if (
+      startTrigger === INPUT_SCRIPT_START_TRIGGERS.FIRST_VISIBLE_FRAME &&
+      this._firstPresentNotified
+    ) {
+      this._armPendingTimer(pending, visibleFrameFallbackMs, 'FIRST_PRESENT_FALLBACK');
+    } else if (firstPresentTimeoutMs !== null) {
+      this._armPendingTimer(pending, firstPresentTimeoutMs, 'FIRST_PRESENT_TIMEOUT');
+    }
+
     return player;
   }
 
   /**
-   * Stops any active scripted input playback, cleans up timers, and clears
+   * Stops any active or pending scripted input playback, cleans up timers, and clears
    * scripted button bits immediately from the SharedArrayBuffer while preserving live inputs.
    */
   stopScript() {
+    this._scriptManuallyStopped = true;
+    this._clearPendingScript();
     if (this._scriptPlayer) {
       this._scriptPlayer.stop();
     }
@@ -2293,6 +3017,11 @@ export class InputBridge {
       usesAtomics: this.usesAtomics,
       buttons: this.buttons,
       scriptActive: script.active,
+      scriptPending: Boolean(this._pendingScript),
+      scriptStartedOn: this._scriptStartedOn,
+      scriptReanchoredCount: this._scriptReanchoredCount,
+      firstPresentNotified: this._firstPresentNotified,
+      firstVisibleFrameNotified: this._firstVisibleFrameNotified,
       activePreset: script.activePreset,
       preset: script.preset,
       scriptedPressesSent: script.scriptedPressesSent,
@@ -2368,6 +3097,8 @@ export class InputBridge {
   }
 
   reset() {
+    this._scriptManuallyStopped = true;
+    this._clearPendingScript();
     if (this._scriptPlayer) {
       this._scriptPlayer._stopWithoutSink();
     }
@@ -2412,6 +3143,7 @@ export class InputBridge {
     this._atomicStoreI32(INPUT_WORD_INDICES.LEFT_TRIGGER, 0);
     this._atomicStoreI32(INPUT_WORD_INDICES.RIGHT_TRIGGER, 0);
     this._atomicAddU32(INPUT_WORD_INDICES.SEQ, 1);
+    this._notifySeq();
     this._writesCount += 1;
   }
 

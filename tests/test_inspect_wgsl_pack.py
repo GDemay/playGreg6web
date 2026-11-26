@@ -1551,6 +1551,51 @@ class TestEmitPriorityHashes(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertEqual(json.loads(out)["errorCode"], "invalid_argument")
 
+class WgpkV2LargeOffsetTests(unittest.TestCase):
+    ENTRIES = [
+        (0x11, "vertex", "fn a() {}"),
+        (0x22, "fragment", "fn bb() {}"),
+        (0x33, "compute", ""),
+    ]
+
+    def test_v2_round_trip_matches_v1_content(self) -> None:
+        v1 = wgpk.build_wgpk(self.ENTRIES, version=1)
+        v2 = wgpk.build_wgpk(self.ENTRIES, version=2)
+        self.assertEqual(struct.unpack_from("<I", v2, 4)[0], 2)
+        self.assertEqual(len(v2) - len(v1), 4 * len(self.ENTRIES))  # 24 vs 20 byte records
+        b1, b2 = wgpk.parse_wgpk(v1), wgpk.parse_wgpk(v2)
+        self.assertEqual(b2.version, 2)
+        self.assertEqual(b2.data_start, 16 + 3 * 24)
+        self.assertEqual(
+            [(e.hash, e.stage_name, e.wgsl) for e in b1.entries],
+            [(e.hash, e.stage_name, e.wgsl) for e in b2.entries],
+        )
+        toc = wgpk.parse_wgpk_toc(v2)
+        self.assertEqual(toc.version, 2)
+        self.assertEqual([e.length for e in toc.entries], [len("fn a() {}"), len("fn bb() {}"), 0])
+
+    def test_v2_record_layout_and_64bit_offset_bounds(self) -> None:
+        v2 = bytearray(wgpk.build_wgpk(self.ENTRIES, version=2))
+        # Record 0: hash(8) stage(1) rsvd(3) length(4) offset(8).
+        length, offset = struct.unpack_from("<IQ", v2, 16 + 12)
+        self.assertEqual(length, len("fn a() {}"))
+        self.assertEqual(offset, 16 + 3 * 24)
+        struct.pack_into("<Q", v2, 16 + 16, 5 << 30)  # offset beyond 4 GiB, past the buffer
+        with self.assertRaises(wgpk.WgpkParseError) as ctx:
+            wgpk.parse_wgpk_toc(v2)
+        self.assertEqual(ctx.exception.code, "out_of_bounds")
+
+    def test_v2_streaming_toc_and_default_version(self) -> None:
+        self.assertEqual(struct.unpack_from("<I", wgpk.build_wgpk(self.ENTRIES), 4)[0], 1)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "v2.wgsl.pack"
+            path.write_bytes(wgpk.build_wgpk(self.ENTRIES, version=2))
+            toc, _label = wgpk.load_wgpk_toc_streaming(path)
+            self.assertEqual(toc.version, 2)
+            self.assertEqual(len(toc.entries), 3)
+        with self.assertRaises(ValueError):
+            wgpk.build_wgpk(self.ENTRIES, version=3)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,7 +2,8 @@
 // - ABI v2 CreateTexture2 (opcode 35, 40-byte payload, docs/gpu_commands.md "CreateTexture2")
 //   with safe mipLevels and sampleCount clamping alongside ABI v1 CreateTexture (opcode 12),
 //   automatically attaching compatible sRGB/linear sibling `viewFormats` (`rgba8unorm`,
-//   `bgra8unorm`, `bc1..bc7`).
+//   `bgra8unorm`, `bc1..bc7`) and promoting `1d` LUT textures to WebGPU `2d` (`width x 1 x 1`)
+//   when `promote1DTo2D` is enabled (default `true`, W341 / #1460) for `texture_2d` compatibility.
 // - Zero-copy direct `queue.writeTexture` fast path when source row pitch is already 256-byte
 //   aligned (e.g., 4K Bink2 `3840x2160` `r8unorm` Y plane).
 // - WebGPU 256-byte bytesPerRow alignment & row-pitch repacking helpers (`alignBytesPerRow256`,
@@ -20,8 +21,9 @@
 //   `uploadCount`, `uploadsCount`, `uploadBytes`, `uploadBytesTotal`, `reusedDescriptorCount`,
 //   `clampedSubRegionCount`, `zeroCopyUploads`, `scratchRepackUploads`,
 //   `directZeroCopyUploads`, `repackedUploads`, `scratchBufferReuses`, `r8unormUploads`,
-//   `bytesUploaded`, `srgbSiblingViewFormatsAdded`) exposed via `getStats()`, `getUploadStats()`,
-//   the `uploadStats` getter, and cleanly reset via `resetStats()` / `reset()` / `destroy()`.
+//   `bytesUploaded`, `srgbSiblingViewFormatsAdded`, `promoted1DTo2DCount`) exposed via
+//   `getStats()`, `getUploadStats()`, the `uploadStats` getter, and cleanly reset via
+//   `resetStats()` / `reset()` / `destroy()`.
 //
 // Install with installTexturePackets(processor) after the v2 handler (render_state_packets.js):
 // it chains in front of processor.extension and forwards every other opcode to it.
@@ -38,6 +40,8 @@
   const MAX_VIEW_FORMATS = 8;
   const WEBGPU_BYTES_PER_ROW_ALIGNMENT = 256;
   const DEFAULT_MAX_SCRATCH_BYTES = 16 * 1024 * 1024; // 16 MiB cap for persistent row-repack / SAB scratch
+  const DEFAULT_MAX_WRITE_TEXTURE_CHUNK_BYTES = 8 * 1024 * 1024; // 8 MiB strip cap (keeps 4K Bink2 Y 7.91 MiB single-call while chunking >=32 MiB 4K RGBA/array uploads)
+  const DEFAULT_MAX_WRITE_BUFFER_CHUNK_BYTES = 4 * 1024 * 1024; // 4 MiB cap per queue.writeBuffer fallback
   const GPU_BUFFER_USAGE_COPY_SRC_DST = 0x0004 | 0x0008;
 
   // Compatible WebGPU sRGB <-> linear viewFormat sibling pairs.
@@ -321,23 +325,26 @@
     }
     const baseFormat = format.trim().toLowerCase();
     const sibling = getSrgbSiblingFormat(baseFormat);
+    if (!Array.isArray(requestedViewFormats) || requestedViewFormats.length === 0) {
+      return sibling !== null
+        ? { viewFormats: [sibling], siblingAdded: true }
+        : { viewFormats: undefined, siblingAdded: false };
+    }
     const out = [];
     const seen = new Set();
 
-    if (Array.isArray(requestedViewFormats)) {
-      for (let i = 0; i < requestedViewFormats.length; i += 1) {
-        const raw = requestedViewFormats[i];
-        if (typeof raw !== 'string') {
-          continue;
-        }
-        const vf = raw.trim().toLowerCase();
-        if (!vf || seen.has(vf)) {
-          continue;
-        }
-        if (vf === baseFormat || (sibling !== null && vf === sibling)) {
-          seen.add(vf);
-          out.push(vf);
-        }
+    for (let i = 0; i < requestedViewFormats.length; i += 1) {
+      const raw = requestedViewFormats[i];
+      if (typeof raw !== 'string') {
+        continue;
+      }
+      const vf = raw.trim().toLowerCase();
+      if (!vf || seen.has(vf)) {
+        continue;
+      }
+      if (vf === baseFormat || (sibling !== null && vf === sibling)) {
+        seen.add(vf);
+        out.push(vf);
       }
     }
 
@@ -388,6 +395,10 @@
 
   function isSharedBuffer(buf) {
     if (!buf || typeof buf !== 'object') {
+      return false;
+    }
+    // O(1) V8 fast path for standard non-shared ArrayBuffers (avoids Object.prototype.toString).
+    if (buf instanceof ArrayBuffer) {
       return false;
     }
     if (typeof SharedArrayBuffer !== 'undefined' && buf instanceof SharedArrayBuffer) {
@@ -528,7 +539,8 @@
       }
 
       const otherSlotsBytes = this.retainedBytes - (existing ? existing.byteLength : 0);
-      if (requiredBytes > this.maxBytes || otherSlotsBytes + requiredBytes > this.maxBytes) {
+      const maxForSlot = this.maxBytes - otherSlotsBytes;
+      if (requiredBytes > this.maxBytes || requiredBytes > maxForSlot) {
         this._oversizedFallbacks += 1;
         const standalone = new Uint8Array(requiredBytes);
         return {
@@ -541,17 +553,70 @@
         };
       }
 
-      const allocated = new Uint8Array(requiredBytes);
+      // First allocation sizes tightly to requiredBytes; subsequent growths expand
+      // geometrically (2x clamped to maxForSlot) to amortize ramping upload sizes.
+      const allocBytes = existing
+        ? Math.min(maxForSlot, Math.max(requiredBytes, existing.byteLength * 2))
+        : requiredBytes;
+      const allocated = new Uint8Array(allocBytes);
       this._slots[slotIndex] = allocated;
       this._allocations += 1;
       return {
         buffer: allocated,
-        view: allocated,
+        view: allocBytes === requiredBytes ? allocated : allocated.subarray(0, requiredBytes),
         reused: false,
         pooled: true,
         oversized: false,
         copied: false,
       };
+    }
+
+    /**
+     * Zero-allocation fast path for slot 0 acquisition used by hot TexturePackets
+     * uploads (writes result fields directly into `out`).
+     */
+    acquireSlot0Into(out, requiredBytes) {
+      if (requiredBytes <= 0 || requiredBytes > this.maxBytes) {
+        if (requiredBytes > this.maxBytes) {
+          this._oversizedFallbacks += 1;
+        }
+        out.buffer = null;
+        out.reused = false;
+        out.pooled = false;
+        out.oversized = requiredBytes > this.maxBytes;
+        return out;
+      }
+      const existing = this._slots[0];
+      if (existing && existing.byteLength >= requiredBytes) {
+        this._reuses += 1;
+        out.buffer = existing;
+        out.reused = true;
+        out.pooled = true;
+        out.oversized = false;
+        return out;
+      }
+      const otherSlotsBytes =
+        this.maxSlots === 1 ? 0 : this.retainedBytes - (existing ? existing.byteLength : 0);
+      const maxForSlot = this.maxBytes - otherSlotsBytes;
+      if (requiredBytes > maxForSlot) {
+        this._oversizedFallbacks += 1;
+        out.buffer = null;
+        out.reused = false;
+        out.pooled = false;
+        out.oversized = true;
+        return out;
+      }
+      const allocBytes = existing
+        ? Math.min(maxForSlot, Math.max(requiredBytes, existing.byteLength * 2))
+        : requiredBytes;
+      const allocated = new Uint8Array(allocBytes);
+      this._slots[0] = allocated;
+      this._allocations += 1;
+      out.buffer = allocated;
+      out.reused = false;
+      out.pooled = true;
+      out.oversized = false;
+      return out;
     }
 
     snapshot(slice) {
@@ -579,6 +644,22 @@
         maxSlots: this.maxSlots,
         activeSlots,
       };
+    }
+
+    trim(maxRetainedBytes = 0) {
+      const cap =
+        Number.isInteger(maxRetainedBytes) && maxRetainedBytes >= 0 ? maxRetainedBytes : 0;
+      let trimmedSlots = 0;
+      let trimmedBytes = 0;
+      for (let i = 0; i < this._slots.length; i += 1) {
+        const slot = this._slots[i];
+        if (slot && slot.byteLength > cap) {
+          trimmedBytes += slot.byteLength;
+          trimmedSlots += 1;
+          this._slots[i] = null;
+        }
+      }
+      return { trimmedSlots, trimmedBytes };
     }
 
     reset() {
@@ -769,6 +850,45 @@
    * @param {number} [depthOrLayers=1]
    * @param {Uint8Array | TextureScratchPool | object | null} [scratchOrOptions=null]
    */
+  function copyAndPadRepackedRows(src, dst, bytesPerRow, alignedBytesPerRow, totalRows, zeroPad) {
+    if (totalRows === 1) {
+      if (src.byteLength === bytesPerRow) {
+        dst.set(src, 0);
+      } else if (bytesPerRow <= 32) {
+        for (let i = 0; i < bytesPerRow; i += 1) {
+          dst[i] = src[i];
+        }
+      } else {
+        dst.set(src.subarray(0, bytesPerRow), 0);
+      }
+      if (zeroPad) {
+        dst.fill(0, bytesPerRow, alignedBytesPerRow);
+      }
+      return;
+    }
+    if (bytesPerRow <= 32) {
+      for (let row = 0; row < totalRows; row += 1) {
+        const srcOffset = row * bytesPerRow;
+        const dstOffset = row * alignedBytesPerRow;
+        for (let i = 0; i < bytesPerRow; i += 1) {
+          dst[dstOffset + i] = src[srcOffset + i];
+        }
+        if (zeroPad) {
+          dst.fill(0, dstOffset + bytesPerRow, dstOffset + alignedBytesPerRow);
+        }
+      }
+      return;
+    }
+    for (let row = 0; row < totalRows; row += 1) {
+      const srcOffset = row * bytesPerRow;
+      const dstOffset = row * alignedBytesPerRow;
+      dst.set(src.subarray(srcOffset, srcOffset + bytesPerRow), dstOffset);
+      if (zeroPad) {
+        dst.fill(0, dstOffset + bytesPerRow, dstOffset + alignedBytesPerRow);
+      }
+    }
+  }
+
   function repackRowsTo256(
     srcBytes,
     bytesPerRow,
@@ -848,14 +968,14 @@
     const dest = resolveScratchDestination(totalDstBytes, scratchOrOptions);
     const dst = dest.view;
 
-    for (let row = 0; row < totalRows; row += 1) {
-      const srcOffset = row * bytesPerRow;
-      const dstOffset = row * alignedBytesPerRow;
-      dst.set(src.subarray(srcOffset, srcOffset + bytesPerRow), dstOffset);
-      if (dest.usingScratch) {
-        dst.fill(0, dstOffset + bytesPerRow, dstOffset + alignedBytesPerRow);
-      }
-    }
+    copyAndPadRepackedRows(
+      src,
+      dst,
+      bytesPerRow,
+      alignedBytesPerRow,
+      totalRows,
+      dest.usingScratch && dest.reusedScratch
+    );
 
     return {
       data: dst,
@@ -961,7 +1081,7 @@
           dst[outOff + 2] = 0;
           dst[outOff + 3] = src[srcRow + x];
         }
-        if (dest.usingScratch && hasTrailingPad) {
+        if (dest.usingScratch && dest.reusedScratch && hasTrailingPad) {
           dst.fill(0, dstRow + unalignedBytesPerRow, dstRow + bytesPerRow);
         }
       }
@@ -1606,18 +1726,32 @@
     constructor(processor, next, options = {}) {
       this.processor = processor;
       this.next = next || null;
+      const opts = options && typeof options === 'object' ? options : {};
+      // W341 (#1460): Promote 1D textures (width x 1) to WebGPU 2D (width x 1 x 1) by
+      // default so shaders with texture_2d bindings never fail 1D/2D view validation.
+      if (opts.promote1DTo2D !== undefined) {
+        this.promote1DTo2D = opts.promote1DTo2D !== false;
+      } else if (opts.promote1DTexturesTo2D !== undefined) {
+        this.promote1DTo2D = opts.promote1DTexturesTo2D !== false;
+      } else {
+        this.promote1DTo2D = true;
+      }
       this._bc3dFallbackTextures = new Set();
       this._bc3dFallbackTextureObjs = new WeakSet();
       this._textureFormats = new Map();
       this._textureObjFormats = new WeakMap();
       this._textureMeta = new Map();
       this._textureObjMeta = new WeakMap();
-      const rawMaxScratch =
-        options && typeof options === 'object' ? options.maxScratchBytes : undefined;
+      const rawMaxScratch = opts.maxScratchBytes;
       this._maxScratchBytes =
         Number.isInteger(rawMaxScratch) && rawMaxScratch >= 0
           ? rawMaxScratch
           : DEFAULT_MAX_SCRATCH_BYTES;
+      const rawMaxWriteChunk = opts.maxWriteChunkBytes;
+      this._maxWriteChunkBytes =
+        Number.isInteger(rawMaxWriteChunk) && rawMaxWriteChunk >= WEBGPU_BYTES_PER_ROW_ALIGNMENT
+          ? rawMaxWriteChunk
+          : DEFAULT_MAX_WRITE_TEXTURE_CHUNK_BYTES;
       this._scratchPool = new TextureScratchPool({ maxBytes: this._maxScratchBytes });
 
       // Pre-allocated WebGPU descriptor structs reused on hot writeTexture /
@@ -1672,6 +1806,27 @@
         mipHeight: 1,
         mipDepth: 1,
       };
+      this._reusableScratchAcquire = {
+        buffer: null,
+        reused: false,
+        pooled: false,
+        oversized: false,
+      };
+      this._reusablePreparedData = {
+        data: null,
+        copiedFromSab: false,
+        reusedScratch: false,
+      };
+      this._reusableRepackResult = {
+        data: null,
+        bytesPerRow: 0,
+        originalBytesPerRow: 0,
+        rowCount: 0,
+        repacked: false,
+        copiedFromSab: false,
+        reusedScratch: false,
+        usedPooledScratch: false,
+      };
 
       this.stats = this._createEmptyStats();
       this.lastError = null;
@@ -1709,6 +1864,10 @@
         r8unormUploads: 0,
         bytesUploaded: 0,
         srgbSiblingViewFormatsAdded: 0,
+        promoted1DTo2DCount: 0,
+        chunkedWrites: 0,
+        trimmedStagingBytes: 0,
+        destroyedTextures: 0,
       };
     }
 
@@ -1753,6 +1912,21 @@
       this._reusableStageLayout.bytesPerRow = 0;
       this._reusableStageLayout.rowsPerImage = 1;
       this._reusableStageLayout.aspect = undefined;
+      this._reusableScratchAcquire.buffer = null;
+      this._reusableScratchAcquire.reused = false;
+      this._reusableScratchAcquire.pooled = false;
+      this._reusableScratchAcquire.oversized = false;
+      this._reusablePreparedData.data = null;
+      this._reusablePreparedData.copiedFromSab = false;
+      this._reusablePreparedData.reusedScratch = false;
+      this._reusableRepackResult.data = null;
+      this._reusableRepackResult.bytesPerRow = 0;
+      this._reusableRepackResult.originalBytesPerRow = 0;
+      this._reusableRepackResult.rowCount = 0;
+      this._reusableRepackResult.repacked = false;
+      this._reusableRepackResult.copiedFromSab = false;
+      this._reusableRepackResult.reusedScratch = false;
+      this._reusableRepackResult.usedPooledScratch = false;
     }
 
     _fillCopyTexture(texture, mipLevel, originX, originY, originZ, aspect) {
@@ -1852,7 +2026,27 @@
         r8unormUploads: toNonNegativeInt(this.stats.r8unormUploads),
         bytesUploaded: toNonNegativeInt(this.stats.bytesUploaded),
         srgbSiblingViewFormatsAdded: toNonNegativeInt(this.stats.srgbSiblingViewFormatsAdded),
+        promoted1DTo2DCount: toNonNegativeInt(this.stats.promoted1DTo2DCount),
+        chunkedWrites: toNonNegativeInt(this.stats.chunkedWrites),
+        trimmedStagingBytes: toNonNegativeInt(this.stats.trimmedStagingBytes),
+        destroyedTextures: toNonNegativeInt(this.stats.destroyedTextures),
       };
+    }
+
+    /**
+     * Release retained scratch buffers larger than `maxRetainedBytes` (default 0,
+     * freeing all idle scratch memory after boot / scene transitions) and record
+     * the reclaimed byte total in `trimmedStagingBytes`.
+     *
+     * @param {number} [maxRetainedBytes=0]
+     * @returns {{ trimmedSlots: number, trimmedBytes: number }}
+     */
+    trimScratch(maxRetainedBytes = 0) {
+      const res = this._scratchPool.trim(maxRetainedBytes);
+      if (res.trimmedBytes > 0) {
+        this.stats.trimmedStagingBytes += res.trimmedBytes;
+      }
+      return res;
     }
 
     /**
@@ -1928,65 +2122,201 @@
       }
     }
 
-    _acquireScratchBuffer(requiredBytes) {
+    _acquireScratchSlot0(requiredBytes) {
+      const out = this._reusableScratchAcquire;
       if (
         !Number.isInteger(requiredBytes) ||
         requiredBytes <= 0 ||
         requiredBytes > this._maxScratchBytes
       ) {
-        return { buffer: null, reused: false };
+        out.buffer = null;
+        out.reused = false;
+        out.pooled = false;
+        out.oversized = requiredBytes > this._maxScratchBytes;
+        return out;
       }
-      const acquired = this._scratchPool.acquire(requiredBytes);
-      if (!acquired.pooled) {
-        return { buffer: null, reused: false };
+      this._scratchPool.acquireSlot0Into(out, requiredBytes);
+      if (!out.pooled) {
+        return out;
       }
-      if (acquired.reused) {
+      if (out.reused) {
         this.stats.scratchBufferReuses += 1;
-        return { buffer: acquired.buffer, reused: true };
+      } else {
+        this.stats.scratchBufferAllocations += 1;
       }
-      this.stats.scratchBufferAllocations += 1;
-      return { buffer: acquired.buffer, reused: false };
+      return out;
     }
 
-    _prepareDirectWriteData(input) {
+    _acquireScratchBuffer(requiredBytes) {
+      const acquired = this._acquireScratchSlot0(requiredBytes);
+      return { buffer: acquired.buffer, reused: acquired.reused };
+    }
+
+    _prepareDirectWriteDataInto(out, input) {
       const src = toUint8Array(input, 'writeTexture');
       if (!isSharedBuffer(src.buffer)) {
-        return { data: src, copiedFromSab: false, reusedScratch: false };
+        out.data = src;
+        out.copiedFromSab = false;
+        out.reusedScratch = false;
+        return out;
       }
       if (src.byteLength === 0) {
-        return { data: new Uint8Array(0), copiedFromSab: true, reusedScratch: false };
+        out.data = new Uint8Array(0);
+        out.copiedFromSab = true;
+        out.reusedScratch = false;
+        return out;
       }
-      const scratch = this._acquireScratchBuffer(src.byteLength);
+      const scratch = this._acquireScratchSlot0(src.byteLength);
       if (scratch.buffer) {
-        const dst = scratch.buffer.subarray(0, src.byteLength);
+        const dst =
+          scratch.buffer.byteLength === src.byteLength
+            ? scratch.buffer
+            : scratch.buffer.subarray(0, src.byteLength);
         dst.set(src, 0);
-        return { data: dst, copiedFromSab: true, reusedScratch: scratch.reused };
+        out.data = dst;
+        out.copiedFromSab = true;
+        out.reusedScratch = scratch.reused;
+        return out;
       }
       const copy = new Uint8Array(src.byteLength);
       copy.set(src, 0);
-      return { data: copy, copiedFromSab: true, reusedScratch: false };
+      out.data = copy;
+      out.copiedFromSab = true;
+      out.reusedScratch = false;
+      return out;
+    }
+
+    _prepareDirectWriteData(input) {
+      const res = this._prepareDirectWriteDataInto(this._reusablePreparedData, input);
+      return {
+        data: res.data,
+        copiedFromSab: res.copiedFromSab,
+        reusedScratch: res.reusedScratch,
+      };
+    }
+
+    _repackRowsWithScratchInto(out, srcBytes, bytesPerRow, rowCount, depthOrLayers = 1) {
+      const src = toUint8Array(srcBytes, 'repackRowsTo256');
+      if (!Number.isInteger(bytesPerRow) || bytesPerRow < 1) {
+        throw new RangeError(
+          `repackRowsTo256: bytesPerRow must be a positive integer, got ${bytesPerRow}`
+        );
+      }
+      if (!Number.isInteger(rowCount) || rowCount < 0) {
+        throw new RangeError(
+          `repackRowsTo256: rowCount must be a non-negative integer, got ${rowCount}`
+        );
+      }
+      if (!Number.isInteger(depthOrLayers) || depthOrLayers < 1) {
+        throw new RangeError(
+          `repackRowsTo256: depthOrLayers must be a positive integer, got ${depthOrLayers}`
+        );
+      }
+
+      const totalRows = rowCount * depthOrLayers;
+      const alignedBytesPerRow = alignBytesPerRow256(bytesPerRow);
+      const fromSab = isSharedBuffer(src.buffer);
+
+      if (totalRows === 0) {
+        out.data = new Uint8Array(0);
+        out.bytesPerRow = alignedBytesPerRow;
+        out.originalBytesPerRow = bytesPerRow;
+        out.rowCount = 0;
+        out.repacked = false;
+        out.copiedFromSab = false;
+        out.reusedScratch = false;
+        out.usedPooledScratch = false;
+        return out;
+      }
+
+      const requiredSrcBytes = bytesPerRow * totalRows;
+      if (src.byteLength < requiredSrcBytes) {
+        throw new RangeError(
+          `repackRowsTo256: srcBytes too small (${src.byteLength} bytes; need at least ${requiredSrcBytes} bytes for ${totalRows} rows of ${bytesPerRow} bytes)`
+        );
+      }
+
+      if (alignedBytesPerRow === bytesPerRow) {
+        const slice = src.byteLength === requiredSrcBytes ? src : src.subarray(0, requiredSrcBytes);
+        if (fromSab) {
+          const scratch = this._acquireScratchSlot0(requiredSrcBytes);
+          let dst;
+          if (scratch.buffer) {
+            dst =
+              scratch.buffer.byteLength === requiredSrcBytes
+                ? scratch.buffer
+                : scratch.buffer.subarray(0, requiredSrcBytes);
+          } else {
+            dst = new Uint8Array(requiredSrcBytes);
+          }
+          dst.set(slice, 0);
+          out.data = dst;
+          out.bytesPerRow = alignedBytesPerRow;
+          out.originalBytesPerRow = bytesPerRow;
+          out.rowCount = totalRows;
+          out.repacked = false;
+          out.copiedFromSab = true;
+          out.reusedScratch = scratch.buffer !== null;
+          out.usedPooledScratch = scratch.buffer !== null;
+          return out;
+        }
+        out.data = slice;
+        out.bytesPerRow = alignedBytesPerRow;
+        out.originalBytesPerRow = bytesPerRow;
+        out.rowCount = totalRows;
+        out.repacked = false;
+        out.copiedFromSab = false;
+        out.reusedScratch = false;
+        out.usedPooledScratch = false;
+        return out;
+      }
+
+      const totalDstBytes = alignedBytesPerRow * totalRows;
+      const scratch = this._acquireScratchSlot0(totalDstBytes);
+      let dst;
+      let mustZeroPad = false;
+      let usedPooled = false;
+      if (scratch.buffer) {
+        usedPooled = true;
+        mustZeroPad = scratch.reused;
+        dst =
+          scratch.buffer.byteLength === totalDstBytes
+            ? scratch.buffer
+            : scratch.buffer.subarray(0, totalDstBytes);
+      } else {
+        dst = new Uint8Array(totalDstBytes);
+      }
+
+      copyAndPadRepackedRows(src, dst, bytesPerRow, alignedBytesPerRow, totalRows, mustZeroPad);
+
+      out.data = dst;
+      out.bytesPerRow = alignedBytesPerRow;
+      out.originalBytesPerRow = bytesPerRow;
+      out.rowCount = totalRows;
+      out.repacked = true;
+      out.copiedFromSab = fromSab;
+      out.reusedScratch = usedPooled;
+      out.usedPooledScratch = usedPooled;
+      return out;
     }
 
     _repackRowsWithScratch(srcBytes, bytesPerRow, rowCount, depthOrLayers = 1) {
-      const src = toUint8Array(srcBytes, 'repackRowsTo256');
-      const totalRows =
-        Number.isInteger(rowCount) && rowCount > 0 && Number.isInteger(depthOrLayers) && depthOrLayers > 0
-          ? rowCount * depthOrLayers
-          : 0;
-      const alignedBytesPerRow =
-        Number.isInteger(bytesPerRow) && bytesPerRow > 0 ? alignBytesPerRow256(bytesPerRow) : 0;
-      const fromSab = isSharedBuffer(src.buffer);
-      const needsCopyOrRepack =
-        totalRows > 0 && alignedBytesPerRow > 0 && (alignedBytesPerRow !== bytesPerRow || fromSab);
-
-      let scratchBuffer = null;
-      if (needsCopyOrRepack && src.byteLength >= bytesPerRow * totalRows) {
-        const neededBytes = alignedBytesPerRow * totalRows;
-        const acquired = this._acquireScratchBuffer(neededBytes);
-        scratchBuffer = acquired.buffer;
-      }
-
-      return repackRowsTo256(src, bytesPerRow, rowCount, depthOrLayers, scratchBuffer);
+      const res = this._repackRowsWithScratchInto(
+        this._reusableRepackResult,
+        srcBytes,
+        bytesPerRow,
+        rowCount,
+        depthOrLayers
+      );
+      return {
+        data: res.data,
+        bytesPerRow: res.bytesPerRow,
+        originalBytesPerRow: res.originalBytesPerRow,
+        rowCount: res.rowCount,
+        repacked: res.repacked,
+        copiedFromSab: res.copiedFromSab,
+        reusedScratch: res.reusedScratch,
+      };
     }
 
     _getTextureFormat(texture, textureId) {
@@ -2097,12 +2427,227 @@
     }
 
     destroyResource(id) {
+      const hadTracked =
+        this._textureMeta.has(id) ||
+        this._textureFormats.has(id) ||
+        this._bc3dFallbackTextures.has(id);
       this._bc3dFallbackTextures.delete(id);
       this._textureFormats.delete(id);
       this._textureMeta.delete(id);
+      if (hadTracked) {
+        this.stats.destroyedTextures += 1;
+      }
       if (this.next && typeof this.next.destroyResource === 'function') {
         this.next.destroyResource(id);
       }
+    }
+
+    _writeBufferChunked(device, buffer, bufferOffset, bytes) {
+      const len = bytes.byteLength;
+      if (len === 0) {
+        return;
+      }
+      const chunkMax = Math.max(
+        4,
+        Math.floor(Math.min(this._maxWriteChunkBytes, DEFAULT_MAX_WRITE_BUFFER_CHUNK_BYTES) / 4) * 4
+      );
+      if (len <= chunkMax) {
+        device.queue.writeBuffer(buffer, bufferOffset, bytes);
+        return;
+      }
+      for (let off = 0; off < len; off += chunkMax) {
+        const chunkLen = Math.min(chunkMax, len - off);
+        device.queue.writeBuffer(buffer, bufferOffset + off, bytes.subarray(off, off + chunkLen));
+      }
+      this.stats.chunkedWrites += 1;
+    }
+
+    /**
+     * Dispatch a direct `queue.writeTexture` upload, automatically splitting huge
+     * uploads (> `_maxWriteChunkBytes`, default 8 MiB) into bounded row-strips or
+     * depth-slice batches so Dawn's upload ring never spikes and SAB-backed huge
+     * textures copy through the bounded reusable scratch buffer without giant
+     * transient allocations.
+     */
+    _dispatchDirectWriteTexture(
+      queue,
+      texture,
+      textureFormat,
+      blockInfo,
+      effMipLevel,
+      effOx,
+      effOy,
+      effOz,
+      rawData,
+      layoutOffset,
+      layoutBytesPerRow,
+      layoutRowsPerImage,
+      effW,
+      effH,
+      effD,
+      dstAspect,
+      hasSize,
+      rawSizeFallback
+    ) {
+      const src = toUint8Array(rawData, 'writeTexture');
+      const chunkMax = this._maxWriteChunkBytes;
+      const srcAvailBytes = Math.max(0, src.byteLength - layoutOffset);
+
+      if (
+        hasSize &&
+        srcAvailBytes > chunkMax &&
+        Number.isInteger(layoutBytesPerRow) &&
+        layoutBytesPerRow > 0 &&
+        effW > 0 &&
+        effH > 0 &&
+        effD >= 1
+      ) {
+        const bh = blockInfo && blockInfo.isCompressed ? blockInfo.blockHeight : 1;
+        const blocksY = Math.ceil(effH / bh);
+        const rpi =
+          Number.isInteger(layoutRowsPerImage) && layoutRowsPerImage > 0
+            ? layoutRowsPerImage
+            : blocksY;
+        const sliceBytes = layoutBytesPerRow * rpi;
+        const fromSab = isSharedBuffer(src.buffer);
+        const canBatchSlices = effD > 1 && sliceBytes > 0 && sliceBytes <= chunkMax;
+        const blockRowsPerChunk = Math.max(1, Math.floor(chunkMax / layoutBytesPerRow));
+        const canSplitRows = effD > 1 || blockRowsPerChunk < blocksY;
+
+        if (canBatchSlices || canSplitRows) {
+          let totalUploadedBytes = 0;
+          let anyReusedScratch = false;
+          let chunkCount = 0;
+
+          if (canBatchSlices) {
+            const slicesPerChunk = Math.max(1, Math.floor(chunkMax / sliceBytes));
+            for (let zStart = 0; zStart < effD; zStart += slicesPerChunk) {
+              const zCount = Math.min(slicesPerChunk, effD - zStart);
+              const byteStart = layoutOffset + zStart * sliceBytes;
+              if (byteStart >= src.byteLength) {
+                break;
+              }
+              const byteLen = Math.min(zCount * sliceBytes, src.byteLength - byteStart);
+              const rawSlice = src.subarray(byteStart, byteStart + byteLen);
+              const prepared = this._prepareDirectWriteDataInto(this._reusablePreparedData, rawSlice);
+              if (prepared.reusedScratch) {
+                anyReusedScratch = true;
+              }
+              const reusedDest = this._fillCopyTexture(
+                texture,
+                effMipLevel,
+                effOx,
+                effOy,
+                effOz + zStart,
+                dstAspect
+              );
+              const reusedLayout = this._fillDataLayout(0, layoutBytesPerRow, rpi);
+              const reusedSize = this._fillCopySize(effW, effH, zCount);
+              queue.writeTexture(reusedDest, prepared.data, reusedLayout, reusedSize);
+              totalUploadedBytes += prepared.data.byteLength;
+              prepared.data = null;
+              chunkCount += 1;
+            }
+          } else {
+            for (let z = 0; z < effD; z += 1) {
+              const sliceBase = layoutOffset + z * sliceBytes;
+              for (let blockRow = 0; blockRow < blocksY; blockRow += blockRowsPerChunk) {
+                const stripBlockRows = Math.min(blockRowsPerChunk, blocksY - blockRow);
+                const yOff = blockRow * bh;
+                const stripH = Math.min(effH - yOff, stripBlockRows * bh);
+                const byteStart = sliceBase + blockRow * layoutBytesPerRow;
+                if (byteStart >= src.byteLength) {
+                  break;
+                }
+                const byteLen = Math.min(
+                  stripBlockRows * layoutBytesPerRow,
+                  src.byteLength - byteStart
+                );
+                const rawStrip = src.subarray(byteStart, byteStart + byteLen);
+                const prepared = this._prepareDirectWriteDataInto(
+                  this._reusablePreparedData,
+                  rawStrip
+                );
+                if (prepared.reusedScratch) {
+                  anyReusedScratch = true;
+                }
+                const reusedDest = this._fillCopyTexture(
+                  texture,
+                  effMipLevel,
+                  effOx,
+                  effOy + yOff,
+                  effOz + z,
+                  dstAspect
+                );
+                const reusedLayout = this._fillDataLayout(0, layoutBytesPerRow, stripBlockRows);
+                const reusedSize = this._fillCopySize(effW, stripH, 1);
+                queue.writeTexture(reusedDest, prepared.data, reusedLayout, reusedSize);
+                totalUploadedBytes += prepared.data.byteLength;
+                prepared.data = null;
+                chunkCount += 1;
+              }
+            }
+          }
+
+          if (chunkCount > 0) {
+            if (fromSab) {
+              this.stats.sabCopyCount += 1;
+            }
+            if (chunkCount > 1) {
+              this.stats.chunkedWrites += 1;
+            }
+            this.stats.reusedDescriptorCount += 1;
+            this._recordUploadCount();
+            this._recordUploadBytes(totalUploadedBytes);
+            if (!fromSab) {
+              this.stats.directZeroCopyUploads += 1;
+              this.stats.zeroCopyUploads += 1;
+            }
+            if (textureFormat === 'r8unorm') {
+              this.stats.r8unormUploads += 1;
+            }
+            return {
+              copiedFromSab: fromSab,
+              reusedScratch: anyReusedScratch,
+              chunked: chunkCount > 1,
+            };
+          }
+        }
+      }
+
+      const prepared = this._prepareDirectWriteDataInto(this._reusablePreparedData, src);
+      if (prepared.copiedFromSab) {
+        this.stats.sabCopyCount += 1;
+      }
+
+      const reusedDest = this._fillCopyTexture(
+        texture,
+        effMipLevel,
+        effOx,
+        effOy,
+        effOz,
+        dstAspect
+      );
+      const reusedLayout = this._fillDataLayout(layoutOffset, layoutBytesPerRow, layoutRowsPerImage);
+      const reusedSize = hasSize ? this._fillCopySize(effW, effH, effD) : rawSizeFallback;
+
+      queue.writeTexture(reusedDest, prepared.data, reusedLayout, reusedSize);
+
+      this.stats.reusedDescriptorCount += 1;
+      this._recordUploadCount();
+      this._recordUploadBytes(prepared.data.byteLength);
+      if (!prepared.copiedFromSab) {
+        this.stats.directZeroCopyUploads += 1;
+        this.stats.zeroCopyUploads += 1;
+      }
+      if (textureFormat === 'r8unorm') {
+        this.stats.r8unormUploads += 1;
+      }
+
+      const copiedFromSab = prepared.copiedFromSab;
+      const reusedScratch = prepared.reusedScratch;
+      prepared.data = null;
+      return { copiedFromSab, reusedScratch, chunked: false };
     }
 
     /**
@@ -2233,46 +2778,82 @@
         }
       }
 
-      const prepared = this._prepareDirectWriteData(data);
-      if (prepared.copiedFromSab) {
-        this.stats.sabCopyCount += 1;
-      }
-
-      const reusedDest = this._fillCopyTexture(
+      const dispatched = this._dispatchDirectWriteTexture(
+        p.device.queue,
         texture,
+        textureFormat,
+        blockInfo,
         effMipLevel,
         effOx,
         effOy,
         effOz,
-        dstAspect
-      );
-      const reusedLayout = this._fillDataLayout(
+        data,
         layoutOffset,
         layoutBytesPerRow,
-        layoutRowsPerImage
+        layoutRowsPerImage,
+        effW,
+        effH,
+        effD,
+        dstAspect,
+        hasSize,
+        size
       );
-      const reusedSize = hasSize ? this._fillCopySize(effW, effH, effD) : size;
-
-      p.device.queue.writeTexture(reusedDest, prepared.data, reusedLayout, reusedSize);
-
-      this.stats.reusedDescriptorCount += 1;
-      this._recordUploadCount();
-      this._recordUploadBytes(prepared.data.byteLength);
-      if (!prepared.copiedFromSab) {
-        this.stats.directZeroCopyUploads += 1;
-        this.stats.zeroCopyUploads += 1;
-      }
-      if (textureFormat === 'r8unorm') {
-        this.stats.r8unormUploads += 1;
-      }
 
       return {
         uploaded: true,
-        copiedFromSab: prepared.copiedFromSab,
-        zeroCopy: !prepared.copiedFromSab,
-        reusedScratch: prepared.reusedScratch,
+        copiedFromSab: dispatched.copiedFromSab,
+        zeroCopy: !dispatched.copiedFromSab,
+        reusedScratch: dispatched.reusedScratch,
         clamped: clampedSubRegion,
       };
+    }
+
+    /**
+     * Internal zero-alloc direct queue.writeTexture fast path called by
+     * `handleWriteTexture` after sub-region clamping and format lookup have
+     * already been completed (avoids double clamping and throwaway return objects).
+     */
+    _writeTextureDirectPreclamped(
+      texture,
+      textureFormat,
+      blockInfo,
+      effMipLevel,
+      effOx,
+      effOy,
+      effOz,
+      rawData,
+      layoutBytesPerRow,
+      layoutRowsPerImage,
+      effW,
+      effH,
+      effD
+    ) {
+      const p = this.processor;
+      if (!p || !p.device || !p.device.queue || typeof p.device.queue.writeTexture !== 'function') {
+        this._error('writeTexture: device.queue.writeTexture is unavailable');
+        return;
+      }
+
+      this._dispatchDirectWriteTexture(
+        p.device.queue,
+        texture,
+        textureFormat,
+        blockInfo,
+        effMipLevel,
+        effOx,
+        effOy,
+        effOz,
+        rawData,
+        0,
+        layoutBytesPerRow,
+        layoutRowsPerImage,
+        effW,
+        effH,
+        effD,
+        'all',
+        true,
+        null
+      );
     }
 
     /**
@@ -2740,7 +3321,8 @@
           };
         }
 
-        const packed = this._repackRowsWithScratch(
+        const packed = this._repackRowsWithScratchInto(
+          this._reusableRepackResult,
           rawBytes,
           rawBytesPerRow,
           rowsPerImage,
@@ -2776,21 +3358,28 @@
             rowsPerImage,
             dstAspect
           );
-          p.stagingPool.stageTextureUpload(encoder, dstTexture, packed.data, stageLayout);
+          const packedData = packed.data;
+          const packedLen = packedData.byteLength;
+          const packedRepacked = packed.repacked;
+          const packedCopiedFromSab = packed.copiedFromSab;
+          const packedReusedScratch = packed.reusedScratch;
+          const packedBpr = packed.bytesPerRow;
+          packed.data = null;
+          p.stagingPool.stageTextureUpload(encoder, dstTexture, packedData, stageLayout);
           this.stats.reusedDescriptorCount += 1;
           this._recordUploadCount();
-          this._recordUploadBytes(packed.data.byteLength);
-          if (!packed.repacked && !packed.copiedFromSab) {
+          this._recordUploadBytes(packedLen);
+          if (!packedRepacked && !packedCopiedFromSab) {
             this.stats.zeroCopyUploads += 1;
           }
           if (isR8) {
             this.stats.r8unormUploads += 1;
           }
           return {
-            repacked: packed.repacked,
-            copiedFromSab: packed.copiedFromSab,
-            reusedScratch: packed.reusedScratch,
-            bytesPerRow: packed.bytesPerRow,
+            repacked: packedRepacked,
+            copiedFromSab: packedCopiedFromSab,
+            reusedScratch: packedReusedScratch,
+            bytesPerRow: packedBpr,
             originalBytesPerRow: rawBytesPerRow,
             staged: true,
             clamped: clampedSubRegion,
@@ -2798,13 +3387,19 @@
         }
 
         if (!packed.repacked && srcBuffer) {
+          const packedData = packed.data;
+          const packedLen = packedData.byteLength;
+          const packedCopiedFromSab = packed.copiedFromSab;
+          const packedReusedScratch = packed.reusedScratch;
+          const packedBpr = packed.bytesPerRow;
+          packed.data = null;
           if (device && device.queue && typeof device.queue.writeBuffer === 'function') {
-            device.queue.writeBuffer(srcBuffer, srcOffset, packed.data);
+            this._writeBufferChunked(device, srcBuffer, srcOffset, packedData);
           }
           const reusedSrc = this._fillBufferSource(
             srcBuffer,
             srcOffset,
-            packed.bytesPerRow,
+            packedBpr,
             rowsPerImage
           );
           const reusedDest = this._fillCopyTexture(
@@ -2819,8 +3414,8 @@
           encoder.copyBufferToTexture(reusedSrc, reusedDest, reusedSize);
           this.stats.reusedDescriptorCount += 1;
           this._recordUploadCount();
-          this._recordUploadBytes(packed.data.byteLength);
-          if (!packed.copiedFromSab) {
+          this._recordUploadBytes(packedLen);
+          if (!packedCopiedFromSab) {
             this.stats.zeroCopyUploads += 1;
           }
           if (isR8) {
@@ -2828,9 +3423,9 @@
           }
           return {
             repacked: false,
-            copiedFromSab: packed.copiedFromSab,
-            reusedScratch: packed.reusedScratch,
-            bytesPerRow: packed.bytesPerRow,
+            copiedFromSab: packedCopiedFromSab,
+            reusedScratch: packedReusedScratch,
+            bytesPerRow: packedBpr,
             originalBytesPerRow: rawBytesPerRow,
             staged: false,
             clamped: clampedSubRegion,
@@ -2843,6 +3438,7 @@
           !device.queue ||
           typeof device.queue.writeBuffer !== 'function'
         ) {
+          packed.data = null;
           this._error(
             'copyBufferToTexture: device.createBuffer/queue.writeBuffer required for repacking'
           );
@@ -2855,16 +3451,23 @@
           };
         }
 
+        const packedData = packed.data;
+        const packedLen = packedData.byteLength;
+        const packedRepacked = packed.repacked;
+        const packedCopiedFromSab = packed.copiedFromSab;
+        const packedReusedScratch = packed.reusedScratch;
+        const packedBpr = packed.bytesPerRow;
+        packed.data = null;
         const stagingBuffer = device.createBuffer({
           label: 'playgta6-texture-repack-staging',
-          size: Math.max(4, packed.data.byteLength),
+          size: Math.max(4, packedLen),
           usage: GPU_BUFFER_USAGE_COPY_SRC_DST,
         });
-        device.queue.writeBuffer(stagingBuffer, 0, packed.data);
+        this._writeBufferChunked(device, stagingBuffer, 0, packedData);
         const reusedSrc = this._fillBufferSource(
           stagingBuffer,
           0,
-          packed.bytesPerRow,
+          packedBpr,
           rowsPerImage
         );
         const reusedDest = this._fillCopyTexture(
@@ -2879,18 +3482,18 @@
         encoder.copyBufferToTexture(reusedSrc, reusedDest, reusedSize);
         this.stats.reusedDescriptorCount += 1;
         this._recordUploadCount();
-        this._recordUploadBytes(packed.data.byteLength);
-        if (!packed.repacked && !packed.copiedFromSab) {
+        this._recordUploadBytes(packedLen);
+        if (!packedRepacked && !packedCopiedFromSab) {
           this.stats.zeroCopyUploads += 1;
         }
         if (isR8) {
           this.stats.r8unormUploads += 1;
         }
         return {
-          repacked: packed.repacked,
-          copiedFromSab: packed.copiedFromSab,
-          reusedScratch: packed.reusedScratch,
-          bytesPerRow: packed.bytesPerRow,
+          repacked: packedRepacked,
+          copiedFromSab: packedCopiedFromSab,
+          reusedScratch: packedReusedScratch,
+          bytesPerRow: packedBpr,
           originalBytesPerRow: rawBytesPerRow,
           stagingBuffer,
           staged: true,
@@ -3044,7 +3647,7 @@
       const originY = view.getUint32(payloadOffset + 12, true);
       const originZ = view.getUint32(payloadOffset + 16, true);
       const width = view.getUint32(payloadOffset + 20, true);
-      const height = view.getUint32(payloadOffset + 24, true);
+      const rawHeight = view.getUint32(payloadOffset + 24, true);
       const depthOrArrayLayers = Math.max(1, view.getUint32(payloadOffset + 28, true));
       const bytesPerRow = view.getUint32(payloadOffset + 32, true);
       const rowsPerImage = view.getUint32(payloadOffset + 36, true);
@@ -3062,6 +3665,12 @@
         this.stats.bc3dFallbackUploadsSkipped += 1;
         return;
       }
+
+      const texMeta = this._getTextureMeta(texture, textureId);
+      const is1DOrPromoted = Boolean(
+        texMeta && (texMeta.dimension === '1d' || texMeta.requestedDimension === '1d')
+      );
+      const height = rawHeight === 0 && is1DOrPromoted && width > 0 ? 1 : rawHeight;
 
       const rawData = new Uint8Array(
         view.buffer,
@@ -3172,21 +3781,26 @@
 
       // Fast path: when source row pitch is already 256-byte aligned (e.g., 4K Bink2
       // 3840x2160 r8unorm Y plane where 3840 % 256 === 0, or 64x64 BC7 / 128x128 BC1),
-      // upload directly via queue.writeTexture without staging pool churn or scratch repacking.
+      // upload directly via queue.writeTexture without staging pool churn, double
+      // sub-region clamping, or scratch repacking.
       if (isRowAligned256 && hasDirectQueueWrite && copyWidth > 0 && copyHeight > 0 && dataLen > 0) {
         const directRpi =
           rowsPerImage > 0 || totalRows > 1 ? effectiveRowsPerImage : undefined;
-        const reusedDest = this._fillCopyTexture(
+        this._writeTextureDirectPreclamped(
           texture,
+          textureFormat,
+          blockInfo,
           effMipLevel,
           effOriginX,
           effOriginY,
           effOriginZ,
-          'all'
+          rawData,
+          effectiveBytesPerRow,
+          directRpi,
+          copyWidth,
+          copyHeight,
+          effDepth
         );
-        const reusedLayout = this._fillDataLayout(0, effectiveBytesPerRow, directRpi);
-        const reusedSize = this._fillCopySize(copyWidth, copyHeight, effDepth);
-        this.writeTexture(reusedDest, rawData, reusedLayout, reusedSize, textureId);
         return;
       }
 
@@ -3205,7 +3819,8 @@
           const encoder =
             typeof p._ensurePendingEncoder === 'function' ? p._ensurePendingEncoder() : null;
           if (encoder && typeof encoder.copyBufferToTexture === 'function') {
-            const packed = this._repackRowsWithScratch(
+            const packed = this._repackRowsWithScratchInto(
+              this._reusableRepackResult,
               rawData,
               effectiveBytesPerRow,
               effectiveRowsPerImage,
@@ -3234,11 +3849,14 @@
               effectiveRowsPerImage,
               undefined
             );
-            p.stagingPool.stageTextureUpload(encoder, texture, packed.data, stageLayout);
+            const packedData = packed.data;
+            const packedLen = packedData.byteLength;
+            packed.data = null;
+            p.stagingPool.stageTextureUpload(encoder, texture, packedData, stageLayout);
             p._hasPendingUploadCommands = true;
             this.stats.reusedDescriptorCount += 1;
             this._recordUploadCount();
-            this._recordUploadBytes(packed.data.byteLength);
+            this._recordUploadBytes(packedLen);
             if (!packed.repacked && !packed.copiedFromSab) {
               this.stats.zeroCopyUploads += 1;
             }
@@ -3266,26 +3884,34 @@
             ? effectiveRowsPerImage
             : undefined;
 
-      const reusedDest = this._fillCopyTexture(
+      this._writeTextureDirectPreclamped(
         texture,
+        textureFormat,
+        blockInfo,
         effMipLevel,
         effOriginX,
         effOriginY,
         effOriginZ,
-        'all'
+        rawData,
+        fallbackBpr,
+        fallbackRpi,
+        copyWidth,
+        copyHeight,
+        effDepth
       );
-      const reusedLayout = this._fillDataLayout(0, fallbackBpr, fallbackRpi);
-      const reusedSize = this._fillCopySize(copyWidth, copyHeight, effDepth);
-      this.writeTexture(reusedDest, rawData, reusedLayout, reusedSize, textureId);
     }
 
     _create(id, descriptor, isV2 = true) {
       const p = this.processor;
+      const hadExisting = Boolean(p.textures && p.textures.has(id));
       this._bc3dFallbackTextures.delete(id);
       this._textureFormats.delete(id);
       this._textureMeta.delete(id);
       if (typeof p._destroyTextureIfPresent === 'function') {
         p._destroyTextureIfPresent(id);
+      }
+      if (hadExisting) {
+        this.stats.destroyedTextures += 1;
       }
       // Cached v2 views of a previous texture with this id must not survive.
       if (this.next && typeof this.next.destroyResource === 'function') {
@@ -3295,6 +3921,11 @@
       let effectiveDescriptor = descriptor;
       let bc3dFallback = false;
       let srgbSiblingAdded = false;
+      let promoted1DTo2D = false;
+      const requestedDimension =
+        descriptor && typeof descriptor.dimension === 'string' && descriptor.dimension
+          ? descriptor.dimension
+          : '2d';
       if (
         descriptor &&
         descriptor.dimension === '3d' &&
@@ -3345,6 +3976,28 @@
         }
       }
 
+      if (this.promote1DTo2D && effectiveDescriptor && effectiveDescriptor.dimension === '1d') {
+        // W341 (#1460): Promote 1D LUT textures to WebGPU 2D (width x 1 x 1) so default
+        // and explicit 2D texture views match shader texture_2d bindings cleanly.
+        const rawSize = effectiveDescriptor.size;
+        const rawWidth = Array.isArray(rawSize)
+          ? rawSize[0]
+          : rawSize && typeof rawSize === 'object'
+            ? rawSize.width
+            : 1;
+        const width = Math.max(1, Math.floor(Number(rawWidth) || 1));
+        effectiveDescriptor = {
+          ...effectiveDescriptor,
+          dimension: '2d',
+          size: { width, height: 1, depthOrArrayLayers: 1 },
+          mipLevelCount: 1,
+        };
+        if (effectiveDescriptor.sampleCount !== undefined) {
+          effectiveDescriptor.sampleCount = 1;
+        }
+        promoted1DTo2D = true;
+      }
+
       let texture;
       try {
         texture = p.device.createTexture(effectiveDescriptor);
@@ -3370,6 +4023,8 @@
           ),
           mipLevelCount: Math.max(1, Math.floor(Number(effectiveDescriptor.mipLevelCount) || 1)),
           dimension: effectiveDescriptor.dimension || '2d',
+          requestedDimension,
+          promoted1DTo2D,
           format: effectiveDescriptor.format || null,
         };
         this._textureMeta.set(id, meta);
@@ -3380,31 +4035,41 @@
       if (srgbSiblingAdded) {
         this.stats.srgbSiblingViewFormatsAdded += 1;
       }
+      if (promoted1DTo2D) {
+        this.stats.promoted1DTo2DCount += 1;
+      }
       if (bc3dFallback) {
         this._bc3dFallbackTextures.add(id);
         if (texture && typeof texture === 'object') {
           this._bc3dFallbackTextureObjs.add(texture);
         }
         this.stats.bc3dFallbacks += 1;
-        // Propagate fallback metadata to chained RenderStatePackets so CreateBindGroup2 /
-        // BeginRenderPass views never pass a bc* view format against the rgba8unorm texture.
-        if (this.next && this.next.textureMeta && typeof this.next.textureMeta.set === 'function') {
-          this.next.textureMeta.set(id, {
-            id,
-            requestedFormat: descriptor.format,
-            format: effectiveDescriptor.format,
-            bcFallback: true,
-            formatFallback: true,
-            usage: effectiveDescriptor.usage,
-            dimension: effectiveDescriptor.dimension,
-            sampleCount: effectiveDescriptor.sampleCount || 1,
-            width: effectiveDescriptor.size ? effectiveDescriptor.size.width : 1,
-            height: effectiveDescriptor.size ? effectiveDescriptor.size.height : 1,
-            depthOrArrayLayers: effectiveDescriptor.size
-              ? effectiveDescriptor.size.depthOrArrayLayers
-              : 1,
-          });
-        }
+      }
+      if (
+        (bc3dFallback || promoted1DTo2D) &&
+        this.next &&
+        this.next.textureMeta &&
+        typeof this.next.textureMeta.set === 'function'
+      ) {
+        // Propagate fallback / 1D->2D promotion metadata to chained RenderStatePackets so
+        // CreateBindGroup2 / BeginRenderPass views see the effective format and dimension.
+        this.next.textureMeta.set(id, {
+          id,
+          requestedFormat: descriptor.format,
+          format: effectiveDescriptor.format,
+          requestedDimension,
+          dimension: effectiveDescriptor.dimension,
+          promoted1DTo2D,
+          bcFallback: bc3dFallback,
+          formatFallback: bc3dFallback,
+          usage: effectiveDescriptor.usage,
+          sampleCount: effectiveDescriptor.sampleCount || 1,
+          width: effectiveDescriptor.size ? effectiveDescriptor.size.width : 1,
+          height: effectiveDescriptor.size ? effectiveDescriptor.size.height : 1,
+          depthOrArrayLayers: effectiveDescriptor.size
+            ? effectiveDescriptor.size.depthOrArrayLayers
+            : 1,
+        });
       }
       let textureView = null;
       if (texture && typeof texture.createView === 'function') {
@@ -3515,6 +4180,8 @@
     WEBGPU_FORMAT_BLOCK_INFO,
     SRGB_SIBLING_FORMATS,
     DEFAULT_MAX_SCRATCH_BYTES,
+    DEFAULT_MAX_WRITE_TEXTURE_CHUNK_BYTES,
+    DEFAULT_MAX_WRITE_BUFFER_CHUNK_BYTES,
     BC_SLICED_3D_FEATURE,
     CREATE_TEXTURE,
     CREATE_TEXTURE_BYTES,

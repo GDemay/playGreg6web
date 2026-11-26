@@ -783,3 +783,155 @@ test('W190 (#868): end-to-end VM boot with real Node MessageChannel delivers 1,0
   coordPthread2.terminate();
   uiProgressChannel.close();
 });
+
+test('W345 pthread wgpuSubmit and coordinator handlePthreadWgpuSubmit forward standalone ArrayBuffers with zero extra copy', () => {
+  const bus = createTrackedBroadcastBus();
+  const mcFactory = createTrackedMessageChannelFactory();
+  const loaderPath = path.join(repoRoot, 'web/loader.js');
+  const loaderSource = fs.readFileSync(loaderPath, 'utf8');
+
+  const coordWorkers = new Map();
+  class ZeroCopyMockWorker extends MockPthreadWorker {
+    constructor(script, opts) {
+      super(script, opts);
+      coordWorkers.set(opts && opts.name ? opts.name : script, this);
+    }
+  }
+
+  const coordSelf = {
+    name: '',
+    location: { href: 'http://127.0.0.1:8080/loader.js' },
+    MessageChannel: mcFactory.TrackedMessageChannel,
+    onmessage: null,
+    postMessage() {},
+  };
+  const coordSandbox = {
+    self: coordSelf,
+    globalThis: null,
+    URL,
+    BroadcastChannel: bus.TrackedBroadcastChannel,
+    MessageChannel: mcFactory.TrackedMessageChannel,
+    Worker: ZeroCopyMockWorker,
+    indexedDB: null,
+    Uint8Array,
+    Int32Array,
+    Uint32Array,
+    DataView,
+    ArrayBuffer,
+    SharedArrayBuffer,
+    Atomics,
+    BigInt,
+    TextEncoder,
+    TextDecoder,
+    Map,
+    Set,
+    Promise,
+    Error,
+    Number,
+    Math,
+    Date,
+    Object,
+    Array,
+    Proxy,
+    Reflect,
+    JSON,
+    setTimeout,
+    clearTimeout,
+    fetch: async () => ({ ok: false, status: 404 }),
+    importScripts(scriptPath) {
+      const resolved = path.resolve(repoRoot, 'web', scriptPath);
+      vm.runInContext(fs.readFileSync(resolved, 'utf8'), coordContext, { filename: resolved });
+    },
+  };
+  coordSandbox.globalThis = coordSandbox;
+  const coordContext = vm.createContext(coordSandbox);
+  vm.runInContext(loaderSource, coordContext, { filename: loaderPath });
+
+  coordSelf.onmessage({
+    data: { canvas: { id: 'c' }, width: 1280, height: 720, dataBase: '/data/' },
+  });
+  const gpuWorker = coordWorkers.get('./workers/wgpu_worker.js');
+  assert.ok(gpuWorker);
+  // W345: live Wasm64 boot disables per-batch resource replay shadow-copying in wgpu_worker init.
+  assert.equal(gpuWorker.received[0].msg.enableResourceReplay, false);
+
+  // Spawn one pthread so coordinator creates a tracked MessageChannel pair.
+  const pthreadWorker = new coordSelf.Worker('./dist/runtime.js', { name: 'em-pthread-1' });
+  const txPort = pthreadWorker.received[0].msg.__playgta6_tx_port;
+  assert.ok(txPort);
+
+  // 1. Over txPort: coordinator handlePthreadWgpuSubmit transfers the EXACT ArrayBuffer straight through.
+  const frameBuf1 = encodeTestFramePacket(0.1, 0.2, 0.3, 1.0);
+  txPort.postMessage({ type: PTHREAD_TX_MSG_WGPU_SUBMIT, cmdBuffer: frameBuf1 }, [frameBuf1]);
+
+  const txSubmitted = gpuWorker.received.filter((r) => r.msg && r.msg.cmdBuffer instanceof ArrayBuffer);
+  assert.equal(txSubmitted.length, 1);
+  assert.equal(
+    txSubmitted[0].msg.cmdBuffer,
+    frameBuf1,
+    'handlePthreadWgpuSubmit must transfer the exact txPort ArrayBuffer with zero extra copy',
+  );
+  assert.equal(txSubmitted[0].transfer.length, 1);
+  assert.equal(txSubmitted[0].transfer[0], frameBuf1);
+
+  // 2. Over BroadcastChannel fallback: handlePthreadWgpuSubmit ALSO transfers the exact ArrayBuffer without copying.
+  const bcSender = new bus.TrackedBroadcastChannel(PTHREAD_WGPU_CHANNEL_NAME);
+  const frameBuf2 = encodeTestFramePacket(0.4, 0.5, 0.6, 1.0);
+  bcSender.postMessage({ type: PTHREAD_TX_MSG_WGPU_SUBMIT, cmdBuffer: frameBuf2 });
+  bcSender.close();
+
+  const allSubmitted = gpuWorker.received.filter((r) => r.msg && r.msg.cmdBuffer instanceof ArrayBuffer);
+  assert.equal(allSubmitted.length, 2);
+  assert.equal(
+    allSubmitted[1].msg.cmdBuffer,
+    frameBuf2,
+    'handlePthreadWgpuSubmit must transfer the exact BroadcastChannel ArrayBuffer with zero extra copy',
+  );
+  assert.equal(allSubmitted[1].transfer.length, 1);
+  assert.equal(allSubmitted[1].transfer[0], frameBuf2);
+
+  // 3. Pthread-side wgpuSubmit transfers standalone Uint8Array.buffer directly with zero .slice() copies.
+  const directPort = {
+    sent: [],
+    postMessage(msg, transfer) {
+      this.sent.push({ msg, transfer });
+    },
+    close() {},
+  };
+  const handle = bootstrapEmscriptenPthreadWorker({
+    scope: { name: 'em-pthread-zero-copy', WebAssembly: { Instance: WebAssembly.Instance } },
+    importScriptsFn: () => {},
+    BroadcastChannelCtor: bus.TrackedBroadcastChannel,
+    httpfsMailboxApi: null,
+    txPort: directPort,
+  });
+
+  // Patch Uint8Array.prototype.slice temporarily during host_wgpu_submit to prove zero redundant slice().
+  const origSlice = Uint8Array.prototype.slice;
+  let u8SliceCalls = 0;
+  Uint8Array.prototype.slice = function patchedSlice(...args) {
+    u8SliceCalls += 1;
+    return origSlice.apply(this, args);
+  };
+  try {
+    const mem = new WebAssembly.Memory({ initial: 1, maximum: 1 });
+    const frameBytes = new Uint8Array(encodeTestFramePacket(0.7, 0.8, 0.9, 1.0));
+    new Uint8Array(mem.buffer).set(frameBytes, 64);
+    handle.hostImports.setMemory(mem);
+    handle.hostImports.env.host_wgpu_submit(64n, BigInt(frameBytes.byteLength));
+  } finally {
+    Uint8Array.prototype.slice = origSlice;
+  }
+
+  assert.equal(u8SliceCalls, 0, 'host_wgpu_submit -> pthread wgpuSubmit must perform zero bytes.slice() calls');
+  assert.equal(directPort.sent.length, 1);
+  assert.ok(directPort.sent[0].msg.cmdBuffer instanceof ArrayBuffer);
+  assert.deepEqual(directPort.sent[0].transfer, [directPort.sent[0].msg.cmdBuffer]);
+  assert.deepEqual(
+    new Uint8Array(directPort.sent[0].msg.cmdBuffer),
+    new Uint8Array(encodeTestFramePacket(0.7, 0.8, 0.9, 1.0)),
+  );
+
+  handle.cleanup();
+  pthreadWorker.terminate();
+});

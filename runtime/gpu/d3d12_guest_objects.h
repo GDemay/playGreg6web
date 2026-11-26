@@ -77,6 +77,7 @@
 
 #include "gpu/cmd_encoder.h"
 #include "gpu/d3d12_guest_structs.h"
+#include "gpu/d3d12_readback.h"
 #include "gpu/d3d12_xs_dump.h"
 #include "gpu/d3d12_xs_xbox.h"
 #include "gpu/descriptor_heap.h"
@@ -560,13 +561,31 @@ struct TrackedTexture {
     uint32_t sample_count = 1;
     uint64_t last_upload_hash = 0;  // whole source surface
     bool ever_uploaded = false;
+    bool streamable = false;  // created as a reserved (tiled) resource: unmapped levels are not loaded
     // Submission (Device::begin_submission) that last looked at this texture: a texture bound in
     // several bind groups or lists of one ExecuteCommandLists is read and hashed once.
     uint64_t synced_submission = 0;
     // Per subresource (mip + array_slice * mip_levels): hash of the last uploaded linear texels,
     // 0 = never uploaded (the GPU texture is still zero there).
     std::vector<uint64_t> subresource_hashes;
+    // Per subresource: hashes of its bands of kUploadBandRows block rows at the last upload (2D
+    // subresources taller than one band; empty otherwise). A changed subresource writes only the
+    // bands whose hash changed (#691).
+    std::vector<std::vector<uint64_t>> subresource_bands;
+    // Window write-mark tracking (G68, #663): when the texture lives in the translated CPU window,
+    // [window_indexed_va, window_indexed_va + window_indexed_size) is indexed in
+    // Device::texture_slot_index_. flush_cpu_buffers sets window_dirty whenever a dirty slot
+    // overlaps it (sharing the submission's MarkPass with CPU buffers); sync_bound_texture_memory
+    // skips reading and hashing when window_checked is true, window_dirty is false, and no slot is
+    // currently marked.
+    uint64_t window_indexed_va = 0;
+    uint64_t window_indexed_size = 0;
+    bool window_indexed = false;
+    bool window_checked = false;
+    bool window_dirty = true;
 };
+// Block rows per dirty-tracked band of a 2D texture upload (TrackedTexture::subresource_bands).
+constexpr uint32_t kUploadBandRows = 64;
 
 struct DeviceOptions {
     PacketSink sink;                    // empty: os::wgpu_submit
@@ -594,16 +613,21 @@ struct DeviceOptions {
     std::shared_ptr<const StageReflectionIndex> stage_reflection;
     // Optional detiling hook for tiled console layouts (layout >= 0x101).
     DetileFn detile_texture;
-    // Fence completion latency (G66, #691): a queue Signal's value is published (the fence's
-    // completed-value word and GetCompletedValue) only once the next frame has been presented, as
-    // a GPU running about a frame behind the CPU would, or after `fence_publish_cap_ms` without
-    // that. Titles that write upload-ring data a frame ahead retire ring regions on the published
-    // value; this runtime reads that memory at ExecuteCommandLists, so a value published at issue
-    // lets them overwrite data a later submission still has to read. Blocking waits (fence events,
-    // a null-event SetEventOnCompletion, queue Wait) for an executed value complete at once and
-    // publish it. Off: values are published at issue. Boot harness: --no-fence-lag turns it off.
+    // Fence completion latency (G66, #691; G69, #663 / PR #1500): a queue Signal's value is
+    // published (the fence's completed-value word and GetCompletedValue) once `present_epoch` has
+    // advanced by `fence_publish_lag_frames` presents (default 1: on the frame's own PresentX,
+    // after all of its ExecuteCommandLists have already snapshotted upload-ring memory), or after
+    // `fence_publish_cap_ms` without a present (default 33 ms, one 30 Hz frame). Holding signals
+    // within the submitting frame's epoch prevents mid-frame overwrites between earlier and later
+    // ExecuteCommandLists, while publishing on that frame's PresentX avoids the 2-present (~66 ms)
+    // 15 FPS stall when the render worker polls the completed-value word. Set
+    // `fence_publish_lag_frames = 2` for the conservative next-frame lag, or `0` /
+    // `fence_publish_lag = false` (boot harness: --no-fence-lag) to publish at issue. Blocking
+    // waits (fence events, a null-event SetEventOnCompletion, queue Wait) for an executed value
+    // complete at once and publish it.
     bool fence_publish_lag = true;
-    uint32_t fence_publish_cap_ms = 100;
+    uint32_t fence_publish_lag_frames = 1;
+    uint32_t fence_publish_cap_ms = 33;
     // Lazy GPU objects (G66, #1077): a guest resource's CreateBuffer / CreateTexture2 packet is held
     // until the first submission that references its id (a bind group entry, render pass attachment,
     // vertex / index buffer, WriteBuffer / WriteTexture) and written right before that packet; a
@@ -612,6 +636,16 @@ struct DeviceOptions {
     // never bound; creating them all at once costs the browser's GPU process gigabytes. Ids are
     // allocated at creation either way, so recorded packets stay valid. Off: created at once.
     bool defer_gpu_objects = true;
+    // GPU -> CPU read-back (G66, d3d12_readback.h): copies into CPU-visible memory become
+    // ReadbackBuffer / ReadbackTexture packets either way. With `gpu_readback_hold` a queue Signal
+    // issued after one is held until the consumer reports the bytes written (never released early;
+    // `gpu_readback_timeout_ms` only logs a warning per held signal). Default: on where a consumer answers (the browser build).
+#ifdef __EMSCRIPTEN__
+    bool gpu_readback_hold = true;
+#else
+    bool gpu_readback_hold = false;
+#endif
+    uint32_t gpu_readback_timeout_ms = 250;
 };
 
 struct DeviceStats {
@@ -744,6 +778,7 @@ public:
     // Wakes every WaitFrameEventX and makes later ones return at once (shutdown, tests).
     void shutdown_frame_events() {
         pacer_.shutdown();
+        stop_frame_event_thread();
         {
             std::lock_guard<std::mutex> lock(present_mutex_);
             present_shutdown_ = true;
@@ -759,8 +794,14 @@ public:
     static constexpr uint32_t kInfiniteFrameWait = 0xFFFFFFFFu;
     // Fence completion latency (DeviceOptions::fence_publish_lag): fences with pending queue
     // signals, the present epoch (PresentX count) and the publisher.
-    bool fence_publish_lag() const { return options_.fence_publish_lag; }
+    bool fence_publish_lag() const { return options_.fence_publish_lag && options_.fence_publish_lag_frames > 0; }
+    uint32_t fence_publish_lag_frames() const {
+        return options_.fence_publish_lag ? options_.fence_publish_lag_frames : 0u;
+    }
+    uint32_t fence_publish_cap_ms() const { return options_.fence_publish_cap_ms; }
     uint64_t present_epoch() const { return present_epoch_.load(std::memory_order_acquire); }
+    // GPU -> CPU read-back ordering (d3d12_readback.h).
+    ReadbackGate& readbacks() { return *readback_gate_; }
     void register_lag_fence(Fence* fence);
     void unregister_lag_fence(Fence* fence);
     // Called at every PresentX (after the present): advances the epoch and publishes due values.
@@ -780,6 +821,12 @@ public:
     // A pipeline state that binds as "unresolved" (draws skipped) for pipelines the layer cannot
     // build (mesh shaders, ...): handed out instead of a null pointer the caller would dereference.
     HResult create_placeholder_pso(const std::string& reason, const Guid& riid, OutPtr out);
+    // G66: a mesh pipeline (stream with an MS subobject) emulated as the mesh stage run as compute
+    // plus a draw over its output (bridge::MeshPipelineState) when the shader pack has the stage's
+    // compute translation (bridge::mesh_compute_pack_key) with its mesh_output reflection; a
+    // placeholder otherwise (and for amplification shaders).
+    HResult create_mesh_pso(const GuestGraphicsPipelineStateDesc& g, const GuestShaderBytecode& ms,
+                            bool amplification, const Guid& riid, OutPtr out);
     // A console-native graphics pipeline (Xbox slot 57, d3d12_xs_xbox.h): unresolved, with one
     // identity per stage (native_stage_identity).
     HResult create_native_pso(const xbox::NativePipeline& pipeline, const Guid& riid, OutPtr out);
@@ -831,6 +878,9 @@ public:
     // reading past a small constant buffer reads whatever memory follows).
     bool relocate_uniform(uint64_t va, uint64_t size, uint64_t binding_size, uint32_t* buffer_id, uint64_t* offset);
     size_t relocated_uniform_count() const;
+    // O36: textures known only by a view at an address (bounded; least recently used dropped).
+    static constexpr size_t kMaxAddressTextures = 2048;
+    size_t address_texture_count() const;
     // Storage buffer views at unaligned offsets or address-only GPU VAs (G51): the bytes at
     // [va, va + size) (readable guest/alias memory only) get a 256-byte aligned home (or a
     // dedicated offset-0 buffer when `require_zero_offset` is true, e.g. element stride does not
@@ -1003,6 +1053,7 @@ private:
 
     mutable std::mutex submit_mutex_;
     PacketSink sink_;
+    std::unique_ptr<ReadbackGate> readback_gate_;
     // With submit_mutex_ held: `bytes` (whole packets) to the sink, each held create packet written
     // before the first packet that references its id (emit_locked), or as they are (write_sink_locked).
     void emit_locked(const uint8_t* bytes, size_t n);
@@ -1056,8 +1107,13 @@ private:
         uint32_t buffer_id = 0;
         uint64_t offset = 0;
         std::vector<uint8_t> shadow;  // bytes last written (empty: never written)
+        uint64_t last_used_seq = 0;
     };
     mutable std::mutex relocation_mutex_;
+    // O36: homes of evicted entries, reused by the next entry of the same (size, home bytes) so the
+    // zero tail past `size` stays zero. Bounds relocations_ and the chunks behind it.
+    std::map<std::pair<uint64_t, uint64_t>, std::vector<std::pair<uint32_t, uint64_t>>> relocation_free_;
+    uint64_t relocation_seq_ = 0;
     // (va, size, home bytes)
     std::map<std::tuple<uint64_t, uint64_t, uint64_t>, RelocatedUniform> relocations_;
     struct RelocatedStorage {
@@ -1087,6 +1143,8 @@ private:
     uint32_t storage_relocation_buffer_ = 0;
     uint64_t storage_relocation_used_ = 0;
     uint64_t storage_relocation_seq_ = 0;
+    // G66 (#691): uniform / storage relocation homes handed to another range (BridgeOptions::relocation_epoch).
+    std::atomic<uint64_t> relocation_evictions_{0};
     struct RelocatedIa {
         uint64_t buffer_bytes = 0;   // WebGPU buffer size (guest size rounded up to 4)
         uint32_t buffer_id = 0;
@@ -1122,6 +1180,7 @@ private:
     os::guest_window::MarkPass mark_pass_;
     mutable std::mutex tracked_textures_mutex_;
     std::unordered_map<uint32_t, TrackedTexture> tracked_textures_;
+    os::guest_window::SlotIndex texture_slot_index_;    // G68: window slot -> resource_id (under tracked_textures_mutex_)
     std::unordered_set<uint32_t> copy_destinations_;  // under tracked_textures_mutex_
     std::unordered_set<uint32_t> conversion_skipped_;  // under tracked_textures_mutex_: reported once
     std::unordered_set<uint32_t> lossy_reported_;      // under tracked_textures_mutex_: DXGI formats
@@ -1159,7 +1218,12 @@ private:
         }
     };
     mutable std::mutex address_textures_mutex_;
-    std::unordered_map<AddressTextureKey, uint32_t, AddressTextureKeyHash> address_textures_;
+    struct AddressTextureEntry {
+        uint32_t id = 0;
+        uint64_t last_use = 0;
+    };
+    std::unordered_map<AddressTextureKey, AddressTextureEntry, AddressTextureKeyHash> address_textures_;
+    uint64_t address_texture_tick_ = 0;  // under address_textures_mutex_
     mutable std::mutex detile_mutex_;
     DetileFn detile_texture_;
     std::atomic<uint64_t> upload_bytes_{0};
@@ -1202,6 +1266,19 @@ private:
     bool lag_stop_ = false;
     std::thread lag_publisher_;  // publishes capped values while no present comes
     xbox::FramePacer pacer_;
+    // ScheduleFrameEventX with an event handle: signalled at every pacer tick, `offset_us` into it
+    // (one entry per event type; scheduling a type again replaces it).
+    struct ScheduledFrameEvent {
+        uint32_t offset_us = 0;
+        uint64_t handle = 0;
+    };
+    std::mutex frame_event_mutex_;
+    std::condition_variable frame_event_cv_;
+    std::map<uint32_t, ScheduledFrameEvent> frame_events_;
+    bool frame_event_stop_ = false;
+    std::thread frame_event_thread_;
+    void run_frame_events();
+    void stop_frame_event_thread();
     std::atomic<uint64_t> xbox_counters_[static_cast<size_t>(xbox::Counter::Count)] = {};
     std::atomic<uint64_t> last_frame_token_{0};
     struct AliasWindow {
@@ -1268,10 +1345,10 @@ public:
     void signal_from_queue(uint64_t value, uint64_t present_epoch);
     // The executed value (what has really been handed off), and the published one.
     uint64_t executed_value() const { return value_.load(std::memory_order_acquire); }
-    // Publishes the pending queue signals the rule admits: signalled at an epoch at least two below
-    // `present_epoch` (the next frame has been presented), or older than `cap`. Returns the number
-    // of values published by the epoch rule and by the cap.
-    void publish_due(uint64_t present_epoch, std::chrono::steady_clock::time_point now,
+    // Publishes the pending queue signals the rule admits: signalled at an epoch at least
+    // `min_lag_frames` below `present_epoch` (default 1: the frame's own PresentX), or older than
+    // `cap`. Accumulates the counts published by present/cap and the total elapsed presents.
+    void publish_due(uint64_t present_epoch, uint32_t min_lag_frames, std::chrono::steady_clock::time_point now,
                      std::chrono::milliseconds cap, uint64_t* by_present, uint64_t* by_cap, uint64_t* lag_frames);
     // Publishes `value` (if executed) because a blocking wait needs it; true when it was pending.
     bool publish_for_wait(uint64_t value);
@@ -1340,14 +1417,26 @@ private:
 class CommandSignature final : public ChildBase<ICommandSignatureHost> {
 public:
     static constexpr const char* kComClassName = "ID3D12CommandSignature";
-    CommandSignature(com::Ref<Device> device, uint32_t byte_stride, uint32_t argument_count)
-        : ChildBase(std::move(device)), byte_stride_(byte_stride), argument_count_(argument_count) {}
+    // D3D12_INDIRECT_ARGUMENT_TYPE of the work argument (the last one); kIndirectArgXbox105 is an
+    // Xbox-only kind the title uses (meaning not established).
+    static constexpr uint32_t kIndirectArgDraw = 0;
+    static constexpr uint32_t kIndirectArgDrawIndexed = 1;
+    static constexpr uint32_t kIndirectArgDispatch = 2;
+    static constexpr uint32_t kIndirectArgDispatchMesh = 10;
+    static constexpr uint32_t kIndirectArgXbox105 = 105;
+    static constexpr uint32_t kIndirectArgUnknown = 0xFFFFFFFFu;
+    CommandSignature(com::Ref<Device> device, uint32_t byte_stride, uint32_t argument_count,
+                     uint32_t work_type = kIndirectArgUnknown)
+        : ChildBase(std::move(device)), byte_stride_(byte_stride), argument_count_(argument_count),
+          work_type_(work_type) {}
     uint32_t byte_stride() const { return byte_stride_; }
     uint32_t argument_count() const { return argument_count_; }
+    uint32_t work_type() const { return work_type_; }
 
 private:
     uint32_t byte_stride_;
     uint32_t argument_count_;
+    uint32_t work_type_;
 };
 
 class CommandQueue final : public ChildBase<ICommandQueueHost> {
@@ -1419,7 +1508,7 @@ ResourceAllocation resource_allocation(const GuestResourceDesc& desc);
 // A draw is "issued" when the title records it and ends in exactly one of: emitted (a packet),
 // no shader module, mesh/amplification pipeline (placeholder state), rectangle list, or dropped by
 // the state bridge (no pipeline state, missing bindings, ...). Dispatches likewise. Indirect
-// executions have no packet and are counted separately. Uploads count WriteTexture / WriteBuffer
+// executions (ExecuteIndirect) are counted separately: emitted or skipped. Uploads count WriteTexture / WriteBuffer
 // packets the layer builds from guest memory; copies it cannot express are "copies skipped".
 enum class Work : size_t {
     DrawsIssued,
@@ -1433,6 +1522,7 @@ enum class Work : size_t {
     DispatchesNoShaderModule,
     DispatchesDroppedByBridge,
     IndirectExecutionsSkipped,
+    IndirectExecutionsEmitted,  // G66: draws / indexed draws / dispatches through the clamp pass
     TextureUploads,
     BufferUploads,
     CopiesSkipped,
@@ -1451,6 +1541,30 @@ enum class Work : size_t {
     // failed their pipeline's reflection join because the bridge has no descriptor arrays yet, per
     // pipeline state created.
     ReflectionLaneIndexedUnbound,
+    // G66: per-draw/dispatch object reuse. Bind group lookups served from the cache vs rebuilt, and
+    // the GPU objects the recorded work created (a steady scene creates none after warm-up).
+    BindGroupCacheHits,
+    BindGroupCacheMisses,
+    BindGroupsCreated,
+    PipelinesCreated,
+    // Reflected root-descriptor bindings whose user SGPR starts a descriptor table, joined as a
+    // table slot (stage_reflection.h, G62 #482), per pipeline state created.
+    ReflectionRootDescriptorTables,
+    ReflectionVertexInputsDefaulted,
+    // Reflected bindings whose descriptor origin the translator could not trace ("unresolved"
+    // sources, sidecar version 3, G62 #482), bound as the worker's default, per pipeline state created.
+    ReflectionUnresolvedBindings,
+    // G66 GPU -> CPU read-back (d3d12_readback.h): ReadbackBuffer / ReadbackTexture packets issued
+    // and the bytes they write into guest memory, completions the consumer reported, queue signals
+    // held until their read-backs landed, and holds ended by the timeout instead.
+    ReadbacksIssued,
+    ReadbackBytes,
+    ReadbacksCompleted,
+    ReadbackSignalsHeld,
+    ReadbackTimeouts,
+    // G66 partly-held mip chains: sampled texture bindings emitted with their base mip level raised
+    // to the first level the title holds (streamed in / mapped) or to the view's min-LOD clamp.
+    MipClampedBinds,
     Count
 };
 void count_work(Work w, uint64_t n = 1);

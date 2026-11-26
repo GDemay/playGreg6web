@@ -71,10 +71,18 @@ pub const AWC_HEADER_SIZE: u64 = 16;
 
 /// Hard cap on declared streams; real banks hold far fewer.
 pub const MAX_STREAMS: u64 = 65_536;
+/// Maximum chunks a single stream can declare (3-bit count field in the stream ID entry).
+pub const MAX_CHUNKS_PER_STREAM: u64 = 7;
+/// Hard cap on total chunk descriptors across all streams in a single bank.
+pub const MAX_TOTAL_CHUNKS: u64 = MAX_STREAMS * MAX_CHUNKS_PER_STREAM;
 /// Streams whose format chunks are read; later streams only get their chunk list.
 pub const MAX_DETAIL_STREAMS: usize = 4_096;
+/// Minimum channels required in a valid stream-format chunk (guards against zero-division).
+pub const MIN_CHANNELS: u32 = 1;
 /// Maximum channels accepted in a stream-format chunk.
 pub const MAX_CHANNELS: u32 = 64;
+/// Minimum non-zero sample rate in Hz (guards against zero-division in duration math).
+pub const MIN_SAMPLE_RATE: u16 = 1;
 /// Absolute ceiling on bytes read from a bank.
 pub const MAX_READ_BYTES: u64 = 16 * 1024 * 1024;
 /// Maximum warnings stored; further ones are only counted.
@@ -82,6 +90,10 @@ pub const MAX_WARNINGS: usize = 64;
 /// Default number of streams listed in output.
 pub const DEFAULT_MAX_LISTED_STREAMS: usize = 32;
 
+const INDEX_ENTRY_SIZE: u64 = 2;
+const STREAM_ID_ENTRY_SIZE: u64 = 4;
+const NARROW_DESC_SIZE: u64 = 8;
+const WIDE_DESC_SIZE: u64 = 16;
 const FORMAT_CHUNK_SIZE: u64 = 20;
 const STREAM_FORMAT_HEADER_SIZE: u64 = 12;
 const STREAM_FORMAT_CHANNEL_SIZE: u64 = 16;
@@ -244,17 +256,22 @@ pub struct FormatInfo {
 }
 
 impl FormatInfo {
+    pub fn has_valid_sample_rate(&self) -> bool {
+        self.sample_rate >= MIN_SAMPLE_RATE
+    }
+
     pub fn duration_ms(&self) -> Option<u64> {
         duration_ms(self.samples, self.sample_rate)
     }
 }
 
 fn duration_ms(samples: u32, rate: u16) -> Option<u64> {
-    if rate == 0 {
-        None
-    } else {
-        Some(u64::from(samples) * 1000 / u64::from(rate))
+    if rate < MIN_SAMPLE_RATE {
+        return None;
     }
+    u64::from(samples)
+        .checked_mul(1000)?
+        .checked_div(u64::from(rate))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,12 +283,38 @@ pub struct ChannelFormat {
     pub codec: Codec,
 }
 
+impl ChannelFormat {
+    pub fn has_valid_sample_rate(&self) -> bool {
+        self.sample_rate >= MIN_SAMPLE_RATE
+    }
+
+    pub fn duration_ms(&self) -> Option<u64> {
+        duration_ms(self.samples, self.sample_rate)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamFormatInfo {
     pub block_count: u32,
     pub block_size: u32,
     pub channel_count: u32,
     pub channels: Vec<ChannelFormat>,
+}
+
+impl StreamFormatInfo {
+    /// Bytes per channel in each streaming block, guarded against zero channels.
+    pub fn bytes_per_channel_block(&self) -> Option<u32> {
+        if self.channel_count < MIN_CHANNELS {
+            None
+        } else {
+            self.block_size.checked_div(self.channel_count)
+        }
+    }
+
+    /// Total declared streaming block bytes (`block_count * block_size`), overflow-checked.
+    pub fn total_block_bytes(&self) -> Option<u64> {
+        u64::from(self.block_count).checked_mul(u64::from(self.block_size))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -341,6 +384,10 @@ pub enum AwcError {
         count: u64,
         max: u64,
     },
+    TooManyChunks {
+        count: u64,
+        max: u64,
+    },
     TruncatedTable {
         table: &'static str,
         required: u64,
@@ -380,6 +427,10 @@ impl fmt::Display for AwcError {
             Self::TooManyStreams { count, max } => write!(
                 f,
                 "implausible AWC stream count {count} (limit {max}); header is corrupt or an unrecognised revision"
+            ),
+            Self::TooManyChunks { count, max } => write!(
+                f,
+                "implausible AWC total chunk count {count} (limit {max}); header is corrupt or an unrecognised revision"
             ),
             Self::TruncatedTable {
                 table,
@@ -434,6 +485,9 @@ impl<R: Read + Seek> Src<'_, R> {
         if total > self.limit {
             return Err(AwcError::ReadBudgetExceeded { limit: self.limit });
         }
+        if len == 0 {
+            return Ok(Vec::new());
+        }
         let n = usize::try_from(len).map_err(|_| AwcError::SizeOverflow)?;
         let mut buf = vec![0u8; n];
         self.reader.seek(SeekFrom::Start(offset))?;
@@ -453,24 +507,80 @@ impl Warnings {
         if self.list.len() < MAX_WARNINGS {
             self.list.push(msg);
         } else {
-            self.suppressed += 1;
+            self.suppressed = self.suppressed.saturating_add(1);
         }
     }
 }
 
 fn looks_encrypted(head: &[u8]) -> bool {
-    if head.len() < 16 {
+    let Some(prefix) = head.get(..16) else {
         return false;
-    }
+    };
     let mut seen = [false; 256];
-    let mut distinct = 0;
-    for &b in &head[..16] {
+    let mut distinct = 0u32;
+    for &b in prefix {
         if !seen[b as usize] {
             seen[b as usize] = true;
             distinct += 1;
         }
     }
     distinct >= 12
+}
+
+/// Checked byte sizes and offsets for the optional chunk-index table and stream-id table.
+/// Returns `(index_table_bytes, id_table_bytes, id_table_offset, desc_table_offset)`.
+fn checked_stream_table_layout(
+    stream_count: u64,
+    has_indices: bool,
+) -> Result<(u64, u64, u64, u64), AwcError> {
+    if stream_count > MAX_STREAMS {
+        return Err(AwcError::TooManyStreams {
+            count: stream_count,
+            max: MAX_STREAMS,
+        });
+    }
+    let idx_len = if has_indices {
+        stream_count
+            .checked_mul(INDEX_ENTRY_SIZE)
+            .ok_or(AwcError::SizeOverflow)?
+    } else {
+        0
+    };
+    let id_len = stream_count
+        .checked_mul(STREAM_ID_ENTRY_SIZE)
+        .ok_or(AwcError::SizeOverflow)?;
+    let id_off = AWC_HEADER_SIZE
+        .checked_add(idx_len)
+        .ok_or(AwcError::SizeOverflow)?;
+    let desc_off = id_off.checked_add(id_len).ok_or(AwcError::SizeOverflow)?;
+    Ok((idx_len, id_len, id_off, desc_off))
+}
+
+/// Checked byte size and end offset for the chunk descriptor table.
+/// Returns `(desc_table_bytes, table_end)`.
+fn checked_desc_table_layout(
+    desc_table_off: u64,
+    total_chunks: u64,
+    wide: bool,
+) -> Result<(u64, u64), AwcError> {
+    if total_chunks > MAX_TOTAL_CHUNKS {
+        return Err(AwcError::TooManyChunks {
+            count: total_chunks,
+            max: MAX_TOTAL_CHUNKS,
+        });
+    }
+    let desc_size = if wide {
+        WIDE_DESC_SIZE
+    } else {
+        NARROW_DESC_SIZE
+    };
+    let desc_len = total_chunks
+        .checked_mul(desc_size)
+        .ok_or(AwcError::SizeOverflow)?;
+    let table_end = desc_table_off
+        .checked_add(desc_len)
+        .ok_or(AwcError::SizeOverflow)?;
+    Ok((desc_len, table_end))
 }
 
 /// Core inspector over any `Read + Seek` source, bounded by [`MAX_READ_BYTES`].
@@ -496,13 +606,14 @@ fn inspect_awc_reader_with_limit<R: Read + Seek>(
     };
     let head_len = file_size.min(AWC_HEADER_SIZE);
     let head = src.read_at(0, head_len, "header")?;
-    if head.len() < 4 {
-        return Err(AwcError::TruncatedHeader {
-            actual: head_len,
-            expected: AWC_HEADER_SIZE,
-        });
-    }
-    let magic = [head[0], head[1], head[2], head[3]];
+    let trunc = || AwcError::TruncatedHeader {
+        actual: head_len,
+        expected: AWC_HEADER_SIZE,
+    };
+    let magic: [u8; 4] = head
+        .get(..4)
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(trunc)?;
     let endian = if magic == AWC_MAGIC_LE {
         Endian::Little
     } else if magic == AWC_MAGIC_BE {
@@ -514,19 +625,24 @@ fn inspect_awc_reader_with_limit<R: Read + Seek>(
         });
     };
     if head_len < AWC_HEADER_SIZE {
-        return Err(AwcError::TruncatedHeader {
-            actual: head_len,
-            expected: AWC_HEADER_SIZE,
-        });
+        return Err(trunc());
     }
-    let trunc = || AwcError::TruncatedHeader {
-        actual: head_len,
-        expected: AWC_HEADER_SIZE,
-    };
-    let version = endian.u16(&head[4..]).ok_or_else(trunc)?;
-    let flags = endian.u16(&head[6..]).ok_or_else(trunc)?;
-    let stream_count = endian.u32(&head[8..]).ok_or_else(trunc)?;
-    let data_offset = endian.u32(&head[12..]).ok_or_else(trunc)?;
+    let version = head
+        .get(4..6)
+        .and_then(|s| endian.u16(s))
+        .ok_or_else(trunc)?;
+    let flags = head
+        .get(6..8)
+        .and_then(|s| endian.u16(s))
+        .ok_or_else(trunc)?;
+    let stream_count = head
+        .get(8..12)
+        .and_then(|s| endian.u32(s))
+        .ok_or_else(trunc)?;
+    let data_offset = head
+        .get(12..16)
+        .and_then(|s| endian.u32(s))
+        .ok_or_else(trunc)?;
 
     let known_bits = FLAG_TABLE.iter().fold(0u16, |a, (b, _)| a | b);
     let unknown_flag_bits = flags & !known_bits;
@@ -573,65 +689,71 @@ fn inspect_awc_reader_with_limit<R: Read + Seek>(
     }
 
     let n = u64::from(stream_count);
-    if n > MAX_STREAMS {
-        return Err(AwcError::TooManyStreams {
-            count: n,
-            max: MAX_STREAMS,
-        });
-    }
     let has_indices = flags & FLAG_CHUNK_INDICES != 0;
     let wide = flags & FLAG_WIDE_DESCRIPTORS != 0;
+    let (idx_len, id_len, id_off, desc_off) = checked_stream_table_layout(n, has_indices)?;
     if wide {
         warn.push(
             "wide chunk descriptors use an assumed layout (unverified); chunk values may be wrong"
                 .to_string(),
         );
     }
-    let desc_size: u64 = if wide { 16 } else { 8 };
+    let desc_size: u64 = if wide {
+        WIDE_DESC_SIZE
+    } else {
+        NARROW_DESC_SIZE
+    };
 
-    let mut pos = AWC_HEADER_SIZE;
     let indices = if has_indices {
-        let b = src.read_at(pos, n * 2, "chunk index table")?;
-        pos += n * 2;
-        Some(b)
+        Some(src.read_at(AWC_HEADER_SIZE, idx_len, "chunk index table")?)
     } else {
         None
     };
-    let id_bytes = src.read_at(pos, n * 4, "stream id table")?;
-    pos += n * 4;
+    let id_bytes = src.read_at(id_off, id_len, "stream id table")?;
 
-    let mut ids = Vec::with_capacity(id_bytes.len() / 4);
+    let n_usize = usize::try_from(n).map_err(|_| AwcError::SizeOverflow)?;
+    let expected_id_bytes = n_usize
+        .checked_mul(STREAM_ID_ENTRY_SIZE as usize)
+        .ok_or(AwcError::SizeOverflow)?;
+    if id_bytes.len() != expected_id_bytes {
+        return Err(AwcError::SizeOverflow);
+    }
+
+    let mut ids = Vec::with_capacity(n_usize);
     let mut total_chunks: u64 = 0;
-    for k in 0..n as usize {
-        let v = id_bytes
-            .get(k * 4..)
-            .and_then(|c| endian.u32(c))
-            .ok_or(AwcError::SizeOverflow)?;
+    for entry in id_bytes.chunks_exact(STREAM_ID_ENTRY_SIZE as usize) {
+        let v = endian.u32(entry).ok_or(AwcError::SizeOverflow)?;
         let count = v >> 29;
-        total_chunks += u64::from(count);
+        total_chunks = total_chunks
+            .checked_add(u64::from(count))
+            .ok_or(AwcError::SizeOverflow)?;
         ids.push((v & 0x1FFF_FFFF, count as usize));
     }
-    let desc_len = total_chunks
-        .checked_mul(desc_size)
-        .ok_or(AwcError::SizeOverflow)?;
-    let desc_bytes = src.read_at(pos, desc_len, "chunk descriptor table")?;
-    pos += desc_len;
-    report.table_end = pos;
+
+    let (desc_len, table_end) = checked_desc_table_layout(desc_off, total_chunks, wide)?;
+    let desc_bytes = src.read_at(desc_off, desc_len, "chunk descriptor table")?;
+    report.table_end = table_end;
     report.tables_parsed = true;
     report.chunk_count = total_chunks;
-    if u64::from(data_offset) < pos {
+    if u64::from(data_offset) < table_end {
         warn.push(format!(
-            "data offset {data_offset} lies before the end of the header tables ({pos})"
+            "data offset {data_offset} lies before the end of the header tables ({table_end})"
+        ));
+    }
+    if u64::from(data_offset) > file_size {
+        warn.push(format!(
+            "data offset {data_offset} exceeds file size {file_size}"
         ));
     }
     if n == 0 {
         warn.push("bank declares zero streams".to_string());
     }
 
-    // Duplicate ids.
+    // Duplicate ids (BTreeMap guarantees deterministic ascending-id warning order).
     let mut seen: BTreeMap<u32, u32> = BTreeMap::new();
     for (id, _) in &ids {
-        *seen.entry(*id).or_insert(0) += 1;
+        let entry = seen.entry(*id).or_insert(0);
+        *entry = entry.saturating_add(1);
     }
     for (id, c) in &seen {
         if *c > 1 {
@@ -639,21 +761,38 @@ fn inspect_awc_reader_with_limit<R: Read + Seek>(
         }
     }
 
-    // Build streams.
+    // Build streams with checked slice indexing and checked descriptor offsets.
+    let desc_size_usize = usize::try_from(desc_size).map_err(|_| AwcError::SizeOverflow)?;
     let mut cursor = 0usize;
+    let mut streams = Vec::with_capacity(ids.len());
     for (i, (id, count)) in ids.iter().enumerate() {
         let mut chunks = Vec::with_capacity(*count);
         for _ in 0..*count {
-            let d = desc_bytes
-                .get(cursor * desc_size as usize..)
+            let off = cursor
+                .checked_mul(desc_size_usize)
                 .ok_or(AwcError::SizeOverflow)?;
-            cursor += 1;
+            let end = off
+                .checked_add(desc_size_usize)
+                .ok_or(AwcError::SizeOverflow)?;
+            let d = desc_bytes.get(off..end).ok_or(AwcError::SizeOverflow)?;
+            cursor = cursor.checked_add(1).ok_or(AwcError::SizeOverflow)?;
             let chunk = if wide {
-                let tagword = endian.u32(d).ok_or(AwcError::SizeOverflow)?;
+                let tagword = d
+                    .get(..4)
+                    .and_then(|s| endian.u32(s))
+                    .ok_or(AwcError::SizeOverflow)?;
+                let size = d
+                    .get(4..8)
+                    .and_then(|s| endian.u32(s))
+                    .ok_or(AwcError::SizeOverflow)?;
+                let offset = d
+                    .get(8..16)
+                    .and_then(|s| endian.u64(s))
+                    .ok_or(AwcError::SizeOverflow)?;
                 ChunkInfo {
                     tag: (tagword & 0xFF) as u8,
-                    size: u64::from(endian.u32(&d[4..]).ok_or(AwcError::SizeOverflow)?),
-                    offset: endian.u64(&d[8..]).ok_or(AwcError::SizeOverflow)?,
+                    size: u64::from(size),
+                    offset,
                 }
             } else {
                 let v = endian.u64(d).ok_or(AwcError::SizeOverflow)?;
@@ -665,8 +804,12 @@ fn inspect_awc_reader_with_limit<R: Read + Seek>(
             };
             chunks.push(chunk);
         }
-        let chunk_index = indices.as_ref().and_then(|b| endian.u16(b.get(i * 2..)?));
-        report.streams.push(StreamInfo {
+        let chunk_index = indices.as_ref().and_then(|b| {
+            let off = i.checked_mul(INDEX_ENTRY_SIZE as usize)?;
+            let end = off.checked_add(INDEX_ENTRY_SIZE as usize)?;
+            endian.u16(b.get(off..end)?)
+        });
+        streams.push(StreamInfo {
             id: *id,
             chunk_index,
             chunks,
@@ -674,6 +817,15 @@ fn inspect_awc_reader_with_limit<R: Read + Seek>(
             stream_format: None,
         });
     }
+
+    // Deterministic canonical stream enumeration: ascending stream ID,
+    // stable sort preserves original table order for duplicate stream IDs.
+    streams.sort_by_key(|s| s.id);
+    report.streams = streams;
+
+    // Collect bank-wide audio data ranges once so no format/stream-format read
+    // can ever overlap audio payload from the same or any other stream.
+    let bank_data_ranges = collect_merged_data_ranges(&report.streams);
 
     // Detail pass: only small format chunks are read, never data chunks.
     let detailed = report.streams.len().min(MAX_DETAIL_STREAMS);
@@ -684,11 +836,11 @@ fn inspect_awc_reader_with_limit<R: Read + Seek>(
         ));
     }
     for stream in report.streams.iter_mut().take(detailed) {
-        inspect_stream(&mut src, endian, stream, &mut warn)?;
+        inspect_stream(&mut src, endian, stream, &bank_data_ranges, &mut warn)?;
     }
     report.streams_inspected = detailed;
 
-    // Payload totals.
+    // Payload totals (BTreeMap guarantees deterministic key order).
     let mut totals: BTreeMap<String, u64> = BTreeMap::new();
     for s in &report.streams[..detailed] {
         let bytes = s.data_bytes();
@@ -700,6 +852,7 @@ fn inspect_awc_reader_with_limit<R: Read + Seek>(
         } else if let Some(sf) = &s.stream_format {
             let mut labels: Vec<String> =
                 sf.channels.iter().map(|c| c.codec.label(endian)).collect();
+            labels.sort();
             labels.dedup();
             match labels.len() {
                 0 => "no format information".to_string(),
@@ -725,40 +878,96 @@ fn finish(report: &mut AwcReport, warn: Warnings, bytes_read: u64) {
 }
 
 fn overlaps(a_off: u64, a_len: u64, b_off: u64, b_len: u64) -> bool {
-    a_off < b_off.saturating_add(b_len) && b_off < a_off.saturating_add(a_len)
+    if a_len == 0 || b_len == 0 {
+        return false;
+    }
+    let a_start = u128::from(a_off);
+    let a_end = a_start + u128::from(a_len);
+    let b_start = u128::from(b_off);
+    let b_end = b_start + u128::from(b_len);
+    a_start < b_end && b_start < a_end
+}
+
+fn collect_merged_data_ranges(streams: &[StreamInfo]) -> Vec<(u128, u128)> {
+    let mut ranges: Vec<(u128, u128)> = streams
+        .iter()
+        .flat_map(|s| s.chunks.iter())
+        .filter(|c| c.tag == TAG_DATA && c.size > 0)
+        .map(|c| {
+            let start = u128::from(c.offset);
+            (start, start + u128::from(c.size))
+        })
+        .collect();
+    ranges.sort_unstable();
+    let mut merged: Vec<(u128, u128)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut()
+            && start <= last.1
+        {
+            last.1 = last.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    merged
+}
+
+fn overlaps_merged_ranges(offset: u64, len: u64, merged: &[(u128, u128)]) -> bool {
+    if len == 0 || merged.is_empty() {
+        return false;
+    }
+    let start = u128::from(offset);
+    let end = start + u128::from(len);
+    let idx = merged.partition_point(|&(r_start, _)| r_start < end);
+    idx > 0 && merged[idx - 1].1 > start
 }
 
 fn inspect_stream<R: Read + Seek>(
     src: &mut Src<'_, R>,
     endian: Endian,
     stream: &mut StreamInfo,
+    data_ranges: &[(u128, u128)],
     warn: &mut Warnings,
 ) -> Result<(), AwcError> {
     let id = stream.id;
     let file_size = src.file_size;
     for c in &stream.chunks {
-        let end = c.offset.saturating_add(c.size);
-        if end > file_size {
-            warn.push(format!(
-                "stream 0x{id:08X} chunk 0x{:02X} range {}..{} exceeds file size {file_size}",
-                c.tag, c.offset, end
-            ));
+        match c.offset.checked_add(c.size) {
+            None => {
+                warn.push(format!(
+                    "stream 0x{id:08X} chunk 0x{:02X} range {}+{} overflows u64 bounds",
+                    c.tag, c.offset, c.size
+                ));
+            }
+            Some(end) if end > file_size => {
+                warn.push(format!(
+                    "stream 0x{id:08X} chunk 0x{:02X} range {}..{} exceeds file size {file_size}",
+                    c.tag, c.offset, end
+                ));
+            }
+            Some(_) => {}
         }
     }
-    let data_ranges: Vec<(u64, u64)> = stream
-        .chunks
-        .iter()
-        .filter(|c| c.tag == TAG_DATA)
-        .map(|c| (c.offset, c.size))
-        .collect();
     let readable = |c: &ChunkInfo| -> bool {
-        c.offset.saturating_add(c.size) <= file_size
-            && !data_ranges
-                .iter()
-                .any(|(o, l)| overlaps(c.offset, c.size, *o, *l))
+        match c.offset.checked_add(c.size) {
+            Some(end) if end <= file_size => !overlaps_merged_ranges(c.offset, c.size, data_ranges),
+            _ => false,
+        }
     };
 
-    if let Some(c) = stream.chunks.iter().find(|c| c.tag == TAG_FORMAT).cloned() {
+    let format_chunks: Vec<ChunkInfo> = stream
+        .chunks
+        .iter()
+        .filter(|c| c.tag == TAG_FORMAT)
+        .cloned()
+        .collect();
+    if format_chunks.len() > 1 {
+        warn.push(format!(
+            "stream 0x{id:08X} has {} format chunks; inspecting the first",
+            format_chunks.len()
+        ));
+    }
+    if let Some(c) = format_chunks.into_iter().next() {
         if c.size < FORMAT_CHUNK_SIZE {
             warn.push(format!(
                 "stream 0x{id:08X} format chunk is {} bytes, expected at least {FORMAT_CHUNK_SIZE}",
@@ -771,26 +980,41 @@ fn inspect_stream<R: Read + Seek>(
         } else {
             let b = src.read_at(c.offset, FORMAT_CHUNK_SIZE, "format chunk")?;
             let bad = || AwcError::SizeOverflow;
-            stream.format = Some(FormatInfo {
-                samples: endian.u32(&b).ok_or_else(bad)?,
-                loop_point: endian.u32(&b[4..]).ok_or_else(bad)? as i32,
-                sample_rate: endian.u16(&b[8..]).ok_or_else(bad)?,
-                headroom: endian.u16(&b[10..]).ok_or_else(bad)? as i16,
-                loop_begin: endian.u16(&b[12..]).ok_or_else(bad)?,
-                loop_end: endian.u16(&b[14..]).ok_or_else(bad)?,
-                play_end: endian.u16(&b[16..]).ok_or_else(bad)?,
-                play_begin: b[18],
-                codec: Codec { id: b[19] },
-            });
+            let format = FormatInfo {
+                samples: b.get(..4).and_then(|s| endian.u32(s)).ok_or_else(bad)?,
+                loop_point: b.get(4..8).and_then(|s| endian.u32(s)).ok_or_else(bad)? as i32,
+                sample_rate: b.get(8..10).and_then(|s| endian.u16(s)).ok_or_else(bad)?,
+                headroom: b.get(10..12).and_then(|s| endian.u16(s)).ok_or_else(bad)? as i16,
+                loop_begin: b.get(12..14).and_then(|s| endian.u16(s)).ok_or_else(bad)?,
+                loop_end: b.get(14..16).and_then(|s| endian.u16(s)).ok_or_else(bad)?,
+                play_end: b.get(16..18).and_then(|s| endian.u16(s)).ok_or_else(bad)?,
+                play_begin: *b.get(18).ok_or_else(bad)?,
+                codec: Codec {
+                    id: *b.get(19).ok_or_else(bad)?,
+                },
+            };
+            if !format.has_valid_sample_rate() {
+                warn.push(format!(
+                    "stream 0x{id:08X} format chunk declares invalid sample_rate 0 Hz; duration unavailable"
+                ));
+            }
+            stream.format = Some(format);
         }
     }
 
-    if let Some(c) = stream
+    let sfmt_chunks: Vec<ChunkInfo> = stream
         .chunks
         .iter()
-        .find(|c| c.tag == TAG_STREAM_FORMAT)
+        .filter(|c| c.tag == TAG_STREAM_FORMAT)
         .cloned()
-    {
+        .collect();
+    if sfmt_chunks.len() > 1 {
+        warn.push(format!(
+            "stream 0x{id:08X} has {} stream-format chunks; inspecting the first",
+            sfmt_chunks.len()
+        ));
+    }
+    if let Some(c) = sfmt_chunks.into_iter().next() {
         if c.size < STREAM_FORMAT_HEADER_SIZE {
             warn.push(format!(
                 "stream 0x{id:08X} stream-format chunk is only {} bytes",
@@ -804,33 +1028,64 @@ fn inspect_stream<R: Read + Seek>(
             let take = c.size.min(STREAM_FORMAT_MAX_READ);
             let b = src.read_at(c.offset, take, "stream-format chunk")?;
             let bad = || AwcError::SizeOverflow;
-            let block_count = endian.u32(&b).ok_or_else(bad)?;
-            let block_size = endian.u32(&b[4..]).ok_or_else(bad)?;
-            let channel_count = endian.u32(&b[8..]).ok_or_else(bad)?;
-            if channel_count > MAX_CHANNELS {
+            let block_count = b.get(..4).and_then(|s| endian.u32(s)).ok_or_else(bad)?;
+            let block_size = b.get(4..8).and_then(|s| endian.u32(s)).ok_or_else(bad)?;
+            let channel_count = b.get(8..12).and_then(|s| endian.u32(s)).ok_or_else(bad)?;
+            if channel_count < MIN_CHANNELS {
+                warn.push(format!(
+                    "stream 0x{id:08X} declares 0 channels (expected {MIN_CHANNELS}..={MAX_CHANNELS}); channel table ignored"
+                ));
+            } else if channel_count > MAX_CHANNELS {
                 warn.push(format!(
                     "stream 0x{id:08X} declares {channel_count} channels (limit {MAX_CHANNELS}); channel table ignored"
                 ));
             } else {
+                let chan_bytes = u64::from(channel_count)
+                    .checked_mul(STREAM_FORMAT_CHANNEL_SIZE)
+                    .ok_or_else(bad)?;
                 let need = STREAM_FORMAT_HEADER_SIZE
-                    + u64::from(channel_count) * STREAM_FORMAT_CHANNEL_SIZE;
+                    .checked_add(chan_bytes)
+                    .ok_or_else(bad)?;
                 if need > take {
                     warn.push(format!(
                         "stream 0x{id:08X} stream-format chunk too small for {channel_count} channels"
                     ));
                 } else {
-                    let mut channels = Vec::new();
-                    for k in 0..channel_count as usize {
-                        let o = STREAM_FORMAT_HEADER_SIZE as usize
-                            + k * STREAM_FORMAT_CHANNEL_SIZE as usize;
-                        let e = b.get(o..o + 16).ok_or_else(bad)?;
-                        channels.push(ChannelFormat {
-                            id: endian.u32(e).ok_or_else(bad)?,
-                            samples: endian.u32(&e[4..]).ok_or_else(bad)?,
-                            headroom: endian.u16(&e[8..]).ok_or_else(bad)? as i16,
-                            sample_rate: endian.u16(&e[10..]).ok_or_else(bad)?,
-                            codec: Codec { id: e[12] },
-                        });
+                    if block_count > 0 && block_size == 0 {
+                        warn.push(format!(
+                            "stream 0x{id:08X} stream-format declares {block_count} blocks with block_size 0"
+                        ));
+                    }
+                    let channel_count_usize =
+                        usize::try_from(channel_count).map_err(|_| AwcError::SizeOverflow)?;
+                    let header_size_usize = STREAM_FORMAT_HEADER_SIZE as usize;
+                    let chan_size_usize = STREAM_FORMAT_CHANNEL_SIZE as usize;
+                    let mut channels = Vec::with_capacity(channel_count_usize);
+                    for k in 0..channel_count_usize {
+                        let k_off = k.checked_mul(chan_size_usize).ok_or_else(bad)?;
+                        let o = header_size_usize.checked_add(k_off).ok_or_else(bad)?;
+                        let end = o.checked_add(chan_size_usize).ok_or_else(bad)?;
+                        let e = b.get(o..end).ok_or_else(bad)?;
+                        let ch = ChannelFormat {
+                            id: e.get(..4).and_then(|s| endian.u32(s)).ok_or_else(bad)?,
+                            samples: e.get(4..8).and_then(|s| endian.u32(s)).ok_or_else(bad)?,
+                            headroom: e.get(8..10).and_then(|s| endian.u16(s)).ok_or_else(bad)?
+                                as i16,
+                            sample_rate: e
+                                .get(10..12)
+                                .and_then(|s| endian.u16(s))
+                                .ok_or_else(bad)?,
+                            codec: Codec {
+                                id: *e.get(12).ok_or_else(bad)?,
+                            },
+                        };
+                        if !ch.has_valid_sample_rate() {
+                            warn.push(format!(
+                                "stream 0x{id:08X} channel {k} (id=0x{:08X}) declares invalid sample_rate 0 Hz; duration unavailable",
+                                ch.id
+                            ));
+                        }
+                        channels.push(ch);
                     }
                     stream.stream_format = Some(StreamFormatInfo {
                         block_count,
@@ -863,11 +1118,11 @@ pub fn inspect_awc_file(path: &Path) -> Result<AwcReport, AwcError> {
 /// One directory-mode result: path relative to the scanned root plus outcome.
 pub type DirResult = (String, Result<AwcReport, AwcError>);
 
-/// Recursively inspects every `*.awc` under `dir`, sorted by relative path.
+/// Recursively inspects every `*.awc` under `dir`, sorted deterministically by relative path.
 pub fn inspect_awc_dir(dir: &Path) -> io::Result<Vec<DirResult>> {
     let mut found = Vec::new();
     collect_awc(dir, dir, &mut found)?;
-    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     let mut out = Vec::with_capacity(found.len());
     for (rel, path) in found {
         let result = fs::File::open(&path)
@@ -886,13 +1141,17 @@ fn collect_awc(
     dir: &Path,
     out: &mut Vec<(String, std::path::PathBuf)>,
 ) -> io::Result<()> {
+    let mut entries = Vec::new();
     for entry in fs::read_dir(dir)? {
-        let entry = entry?;
+        entries.push(entry?);
+    }
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
         let path = entry.path();
-        let meta = entry.metadata()?;
-        if meta.is_dir() {
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
             collect_awc(root, &path, out)?;
-        } else if meta.is_file()
+        } else if file_type.is_file()
             && path
                 .extension()
                 .and_then(|e| e.to_str())
@@ -1025,7 +1284,7 @@ impl AwcReport {
                                 c.sample_rate,
                                 c.headroom,
                                 json_codec(c.codec, self.endian),
-                                duration_ms(c.samples, c.sample_rate)
+                                c.duration_ms()
                                     .map_or("null".to_string(), |d| d.to_string())
                             )
                         })
@@ -1947,5 +2206,361 @@ mod tests {
         assert!(h.contains("bad.awc: ERROR"));
         assert!(inspect_awc_file(&dir.join("missing.awc")).is_err());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn truncated_containers_fail_without_panics_across_table_boundaries() {
+        for e in [Endian::Little, Endian::Big] {
+            // Empty & partial headers (0..16 bytes).
+            let full = B::new(e)
+                .flags(FLAG_CHUNK_INDICES | FLAG_WIDE_DESCRIPTORS)
+                .stream(
+                    0x42,
+                    vec![
+                        (TAG_FORMAT, fmt_chunk(e, 1000, 48_000, 0)),
+                        (
+                            TAG_STREAM_FORMAT,
+                            sfmt_chunk(e, 4, 1024, &[(1, 500, 24_000, 4)]),
+                        ),
+                        (TAG_DATA, vec![0xCC; 32]),
+                    ],
+                )
+                .build();
+
+            for len in 0..AWC_HEADER_SIZE as usize {
+                let err = inspect(&full.bytes[..len]).unwrap_err();
+                assert!(
+                    matches!(err, AwcError::TruncatedHeader { .. }),
+                    "expected TruncatedHeader for len={len}, got {err:?}"
+                );
+            }
+
+            // Truncated chunk-index table, stream-id table, and wide descriptor table.
+            assert!(matches!(
+                inspect(&full.bytes[..17]).unwrap_err(),
+                AwcError::TruncatedTable {
+                    table: "chunk index table",
+                    ..
+                }
+            ));
+            assert!(matches!(
+                inspect(&full.bytes[..20]).unwrap_err(),
+                AwcError::TruncatedTable {
+                    table: "stream id table",
+                    ..
+                }
+            ));
+            assert!(matches!(
+                inspect(&full.bytes[..full.table_end - 1]).unwrap_err(),
+                AwcError::TruncatedTable {
+                    table: "chunk descriptor table",
+                    ..
+                }
+            ));
+
+            // Truncated format & stream-format chunk payloads degrade to warnings, never panics.
+            let short_chunks = B::new(e)
+                .stream(
+                    0x99,
+                    vec![
+                        (TAG_FORMAT, vec![0; 10]),
+                        (TAG_STREAM_FORMAT, vec![0; 8]),
+                    ],
+                )
+                .build();
+            let r = inspect(&short_chunks.bytes).unwrap();
+            assert!(r.streams[0].format.is_none());
+            assert!(r.streams[0].stream_format.is_none());
+            assert!(r.warnings.iter().any(|w| w.contains("format chunk is 10 bytes")));
+            assert!(r
+                .warnings
+                .iter()
+                .any(|w| w.contains("stream-format chunk is only 8 bytes")));
+        }
+    }
+
+    #[test]
+    fn overflowing_stream_and_chunk_counts_rejected_without_oom() {
+        // Stream count above MAX_STREAMS rejected before any table allocation.
+        let mut hdr = simple(Endian::Little, 0).bytes;
+        hdr[8..12].copy_from_slice(&((MAX_STREAMS as u32) + 1).to_le_bytes());
+        assert!(matches!(
+            inspect(&hdr).unwrap_err(),
+            AwcError::TooManyStreams {
+                count,
+                max: MAX_STREAMS
+            } if count == MAX_STREAMS + 1
+        ));
+
+        // Direct checked table arithmetic catches u64 overflows and chunk cap violations.
+        assert!(matches!(
+            checked_stream_table_layout(u64::MAX, true),
+            Err(AwcError::TooManyStreams { .. })
+        ));
+        assert!(matches!(
+            checked_desc_table_layout(AWC_HEADER_SIZE, MAX_TOTAL_CHUNKS + 1, false),
+            Err(AwcError::TooManyChunks {
+                count,
+                max: MAX_TOTAL_CHUNKS
+            }) if count == MAX_TOTAL_CHUNKS + 1
+        ));
+        assert!(matches!(
+            checked_desc_table_layout(u64::MAX - 4, 1, false),
+            Err(AwcError::SizeOverflow)
+        ));
+        assert!(matches!(
+            checked_desc_table_layout(u64::MAX - 8, 1, true),
+            Err(AwcError::SizeOverflow)
+        ));
+
+        // Huge channel count (u32::MAX) in stream-format chunk warns and does not allocate.
+        let mut bad_sfmt = Vec::new();
+        bad_sfmt.extend_from_slice(&1u32.to_le_bytes());
+        bad_sfmt.extend_from_slice(&512u32.to_le_bytes());
+        bad_sfmt.extend_from_slice(&u32::MAX.to_le_bytes());
+        let b = B::new(Endian::Little)
+            .stream(1, vec![(TAG_STREAM_FORMAT, bad_sfmt)])
+            .build();
+        let r = inspect(&b.bytes).unwrap();
+        assert!(r.streams[0].stream_format.is_none());
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.contains("declares 4294967295 channels")));
+
+        // Corrupt header data_offset beyond file_size emits a warning cleanly.
+        let mut bad_off = simple(Endian::Little, 0).bytes;
+        bad_off[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        let r = inspect(&bad_off).unwrap();
+        assert!(r.warnings.iter().any(|w| w.contains("exceeds file size")));
+    }
+
+    #[test]
+    fn wide_descriptor_u64_overflow_and_bounds_guarded() {
+        for e in [Endian::Little, Endian::Big] {
+            let mut b = B::new(e)
+                .flags(FLAG_WIDE_DESCRIPTORS)
+                .stream(
+                    0x10,
+                    vec![
+                        (TAG_FORMAT, fmt_chunk(e, 100, 16_000, 0)),
+                        (TAG_DATA, vec![0xAA; 32]),
+                    ],
+                )
+                .build();
+            // Overwrite first wide descriptor (at byte 20) with offset = u64::MAX - 4, size = 20.
+            let mut desc = Vec::new();
+            desc.extend_from_slice(&put32(e, u32::from(TAG_FORMAT)));
+            desc.extend_from_slice(&put32(e, 20));
+            desc.extend_from_slice(&put64(e, u64::MAX - 4));
+            b.bytes[20..36].copy_from_slice(&desc);
+
+            let r = inspect(&b.bytes).unwrap();
+            assert!(r.streams[0].format.is_none());
+            assert!(r
+                .warnings
+                .iter()
+                .any(|w| w.contains("overflows u64 bounds")));
+            assert!(r
+                .warnings
+                .iter()
+                .any(|w| w.contains("out of bounds or overlaps audio data")));
+        }
+
+        // Empty intervals never overlap, and u64::MAX-adjacent intervals do not overflow.
+        assert!(!overlaps(100, 0, 50, 100));
+        assert!(!overlaps(50, 100, 100, 0));
+        assert!(overlaps(u64::MAX - 10, 20, u64::MAX - 5, 10));
+        assert!(!overlaps(u64::MAX - 10, 5, u64::MAX - 5, 10));
+    }
+
+    #[test]
+    fn zero_sample_rate_guard_prevents_zero_division() {
+        for e in [Endian::Little, Endian::Big] {
+            let b = B::new(e)
+                .stream(
+                    1,
+                    vec![
+                        (TAG_FORMAT, fmt_chunk(e, 48_000, 0, 0)),
+                        (TAG_DATA, vec![0x11; 64]),
+                    ],
+                )
+                .stream(
+                    2,
+                    vec![
+                        (
+                            TAG_STREAM_FORMAT,
+                            sfmt_chunk(e, 2, 1024, &[(10, 48_000, 0, 4), (11, 48_000, 48_000, 4)]),
+                        ),
+                        (TAG_DATA, vec![0x22; 64]),
+                    ],
+                )
+                .build();
+            let r = inspect(&b.bytes).unwrap();
+            let fmt = r.streams[0].format.as_ref().unwrap();
+            assert!(!fmt.has_valid_sample_rate());
+            assert_eq!(fmt.duration_ms(), None);
+
+            let sf = r.streams[1].stream_format.as_ref().unwrap();
+            assert!(!sf.channels[0].has_valid_sample_rate());
+            assert_eq!(sf.channels[0].duration_ms(), None);
+            assert!(sf.channels[1].has_valid_sample_rate());
+            assert_eq!(sf.channels[1].duration_ms(), Some(1000));
+
+            assert!(r
+                .warnings
+                .iter()
+                .any(|w| w.contains("format chunk declares invalid sample_rate 0 Hz")));
+            assert!(r
+                .warnings
+                .iter()
+                .any(|w| w.contains("channel 0") && w.contains("invalid sample_rate 0 Hz")));
+
+            let json = r.to_json(10);
+            assert!(json.contains("\"duration_ms\": null"));
+            assert!(json.contains("\"duration_ms\": 1000"));
+            let human = r.format_human(10);
+            assert!(human.contains("0 Hz, 48000 samples, codec"));
+        }
+    }
+
+    #[test]
+    fn zero_channel_and_zero_block_size_guards() {
+        for e in [Endian::Little, Endian::Big] {
+            // channel_count == 0 must be warned and ignored (zero-division guard).
+            let b_zero_ch = B::new(e)
+                .stream(
+                    1,
+                    vec![
+                        (TAG_STREAM_FORMAT, sfmt_chunk(e, 4, 2048, &[])),
+                        (TAG_DATA, vec![0; 32]),
+                    ],
+                )
+                .build();
+            let r = inspect(&b_zero_ch.bytes).unwrap();
+            assert!(r.streams[0].stream_format.is_none());
+            assert!(r
+                .warnings
+                .iter()
+                .any(|w| w.contains("declares 0 channels")));
+
+            // block_count > 0 with block_size == 0 warns cleanly without panicking.
+            let b_zero_bs = B::new(e)
+                .stream(
+                    2,
+                    vec![(
+                        TAG_STREAM_FORMAT,
+                        sfmt_chunk(e, 4, 0, &[(1, 100, 16_000, 0), (2, 100, 16_000, 0)]),
+                    )],
+                )
+                .build();
+            let r2 = inspect(&b_zero_bs.bytes).unwrap();
+            let sf = r2.streams[0].stream_format.as_ref().unwrap();
+            assert_eq!(sf.bytes_per_channel_block(), Some(0));
+            assert_eq!(sf.total_block_bytes(), Some(0));
+            assert!(r2.warnings.iter().any(|w| w.contains("block_size 0")));
+        }
+
+        // Direct zero-division guard on StreamFormatInfo helpers.
+        let empty = StreamFormatInfo {
+            block_count: 10,
+            block_size: 2048,
+            channel_count: 0,
+            channels: Vec::new(),
+        };
+        assert_eq!(empty.bytes_per_channel_block(), None);
+        assert_eq!(empty.total_block_bytes(), Some(20_480));
+
+        let stereo = StreamFormatInfo {
+            block_count: 10,
+            block_size: 2048,
+            channel_count: 2,
+            channels: Vec::new(),
+        };
+        assert_eq!(stereo.bytes_per_channel_block(), Some(1024));
+        assert_eq!(stereo.total_block_bytes(), Some(20_480));
+    }
+
+    #[test]
+    fn cross_stream_data_overlap_is_never_read() {
+        let e = Endian::Little;
+        let mut b = B::new(e)
+            .stream(0x10, vec![(TAG_FORMAT, vec![0; 20])])
+            .stream(0x20, vec![(TAG_DATA, vec![0xEE; 64])])
+            .build();
+        // Point stream 0x10's format chunk directly into stream 0x20's audio payload.
+        let data_off = b.payload[0].0;
+        let desc_off = 16 + 2 * 4;
+        let v = u64::from(TAG_FORMAT) | (20u64 << 8) | (data_off << 36);
+        b.bytes[desc_off..desc_off + 8].copy_from_slice(&v.to_le_bytes());
+
+        let mut g = Guard {
+            inner: Cursor::new(b.bytes.clone()),
+            forbidden: b.payload.clone(),
+            total: 0,
+        };
+        let r = inspect_awc_reader(&mut g, b.bytes.len() as u64, "cross.awc").unwrap();
+        assert!(r.streams[0].format.is_none());
+        assert!(r.warnings.iter().any(|w| w.contains("overlaps audio data")));
+    }
+
+    #[test]
+    fn deterministic_canonical_stream_enumeration() {
+        let e = Endian::Little;
+        // Unsorted stream IDs plus duplicate IDs must enumerate canonically by ascending ID,
+        // preserving original table order for duplicate IDs.
+        let mut b = B::new(e)
+            .flags(FLAG_CHUNK_INDICES)
+            .stream(
+                0x300,
+                vec![
+                    (TAG_FORMAT, fmt_chunk(e, 300, 16_000, 0)),
+                    (TAG_DATA, vec![0xAA; 16]),
+                ],
+            )
+            .stream(
+                0x100,
+                vec![
+                    (TAG_FORMAT, fmt_chunk(e, 100, 16_000, 4)),
+                    (TAG_DATA, vec![0xBB; 32]),
+                ],
+            )
+            .stream(
+                0x200,
+                vec![
+                    (TAG_FORMAT, fmt_chunk(e, 201, 24_000, 0)),
+                    (TAG_DATA, vec![0xCC; 24]),
+                ],
+            )
+            .stream(
+                0x200,
+                vec![
+                    (TAG_FORMAT, fmt_chunk(e, 202, 24_000, 4)),
+                    (TAG_DATA, vec![0xDD; 48]),
+                ],
+            );
+        b.indices = vec![30, 10, 21, 22];
+        let built = b.build();
+
+        let r1 = inspect(&built.bytes).unwrap();
+        let r2 = inspect(&built.bytes).unwrap();
+        assert_eq!(r1, r2);
+        assert_eq!(r1.to_json(10), r2.to_json(10));
+        assert_eq!(r1.format_human(10), r2.format_human(10));
+
+        let ordered_ids: Vec<(u32, Option<u16>, u32)> = r1
+            .streams
+            .iter()
+            .map(|s| (s.id, s.chunk_index, s.format.as_ref().unwrap().samples))
+            .collect();
+        assert_eq!(
+            ordered_ids,
+            vec![
+                (0x100, Some(10), 100),
+                (0x200, Some(21), 201),
+                (0x200, Some(22), 202),
+                (0x300, Some(30), 300),
+            ]
+        );
     }
 }

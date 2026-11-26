@@ -94,8 +94,38 @@ class TestReplayCapture(unittest.TestCase):
         self.assertEqual(replay_capture.largest_textures(data, 1), [1])
         out, frames, dropped = replay_capture.trim_trace(data, 2, [1])
         self.assertEqual(frames, 4)
-        self.assertEqual(dropped, 2 * 104)
-        self.assertEqual(len(out), len(data) - 2 * (8 + 104))
+        # Frame 1's upload is dropped; frame 3's is the last of its region (nothing rewrites it): kept.
+        self.assertEqual(dropped, 104)
+        self.assertEqual(len(out), len(data) - (8 + 104))
+
+    def test_trim_keeps_sub_rect_writes_nothing_rewrites(self) -> None:
+        # #691: a glyph atlas gets a whole write, then one band per new glyph. Dropping a band
+        # loses its glyphs for the rest of the replay; only a region rewritten later may go.
+        def write(tex, y, h, mip=0):
+            return pkt(13, struct.pack("<12I", tex, mip, 0, y, 0, 64, h, 1, 256, h, 4, 0) + b"abcd")
+        frames = [write(9, 0, 256), write(9, 64, 64), write(9, 128, 64), write(9, 64, 64, mip=1),
+                  write(9, 0, 256), write(9, 192, 64)]
+        data = b"".join(f + pkt(7) for f in frames)
+        step = len(frames[0]) + 8
+        self.assertEqual(replay_capture.superseded_writes(data, [9]), {0, step, 2 * step})
+        out, n, dropped = replay_capture.trim_trace(data, 100, [9])
+        self.assertEqual(n, 6)
+        # Frames 1 and 2 (bands the whole write of frame 4 covers) go; frame 0 is a kept frame; the
+        # mip-1 band, the whole write and the last band are never rewritten: kept.
+        self.assertEqual(dropped, 2 * (48 + 4))
+        self.assertEqual(out, frames[0] + pkt(7) + pkt(7) + pkt(7) + b"".join(f + pkt(7) for f in frames[3:]))
+
+    def test_trim_keeps_writes_rewritten_only_much_later(self) -> None:
+        # #691: an atlas band written at frame 1 and rewritten (with more glyphs) only at frame 30
+        # must survive: dropping it leaves the replay without its glyphs for 29 frames.
+        def write(y, h):
+            return pkt(13, struct.pack("<12I", 9, 0, 0, y, 0, 64, h, 1, 256, h, 4, 0) + b"abcd")
+        data = write(0, 256) + pkt(7) + write(0, 64) + pkt(7) * 29 + write(0, 64) + pkt(7) + write(0, 64) + pkt(7)
+        late = len(write(0, 256)) + 8 + len(write(0, 64)) + 8 * 29
+        self.assertEqual(replay_capture.superseded_writes(data, [9]), {late})
+        self.assertEqual(replay_capture.superseded_writes(data, [9], horizon=40), {len(write(0, 256)) + 8, late})
+        out, n, dropped = replay_capture.trim_trace(data, 100, [9])
+        self.assertEqual((n, dropped), (32, 48 + 4))
 
     def test_thin_marker_is_skipped(self) -> None:
         tex_marker = pkt(13, struct.pack("<I", 1) + b"\0" * 36 + struct.pack("<II", 0, 0x6E696874))

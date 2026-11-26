@@ -20,6 +20,7 @@
 #include "guest/guest_callbacks.h"
 #include "guest/guest_runtime.h"
 #include "os/os_shim.h"
+#include "os/win32_compat.h"
 #include "os/win32_kernel.h"
 #include "os/win32_loader.h"
 #include "os/xasync_provider.h"
@@ -74,7 +75,8 @@
 //   {e349bd1a-...}/{1861cf2e-...} XSystem: s3 GetConsoleId(3) h, s4 GetXboxLiveSandboxId(3) h
 //     (the configured console sandbox; none: E_NOTIMPL), s5 GetAppSpecificDeviceId stub. XSystemGetDeviceType /
 //     GetAnalyticsInfo are never called.
-//   {973a344e-...}/{2549f142-...} XGame: s3 XGameGetXboxTitleId(1) h (s4 XLaunchNewGame stub).
+//   {973a344e-...}/{2549f142-...} XGame: s3 XGameGetXboxTitleId(1) h, s4 XLaunchNewGame(3) h (self: relaunch
+//     via kRelaunchSelfExitCode; another title: E_NOTIMPL).
 //   {0dd112ac-...}/{b09d803c-...} XStore: s3 CreateContext h, s4 CloseContextHandle h; the
 //     other 40 used slots stay stubs (O8 offline policy: nothing about licences is invented).
 //   {0dd112ac-...}/{2d42fea5-...} XStore extension: s71 AcquireLicenseForDurablesAsync, s72
@@ -92,8 +94,11 @@
 //     a directory of the /userdata overlay).
 //   {03f0fe74-...}/{35f07670-...}: s4 has the call shape of XDisplayTryEnableHdrMode(2) h
 //     (returns Disabled: the runtime presents SDR).
-//   {3e241977-...}/{d722b373-...} XSpeechSynthesizer: s9 XSpeechSynthesizerCreate(1) h (one
-//     pointer to a still-null handle field; fails with E_NOTIMPL: no speech synthesizer).
+//   {3e241977-...}/{d722b373-...} XSpeechSynthesizer (silent synthesizer: fixed handle, empty WAVE
+//     streams). The executable's wrappers use s8 EnumerateInstalledVoices(2) h, s9 Create(1) h,
+//     s10 CloseHandle(1), s11 SetDefaultVoice(1), s12 SetCustomVoice(2), s13 CreateStreamFromText(3),
+//     s14 CloseStreamHandle(1), s15 GetStreamDataSize(2), s16 GetStreamData(4) (public header
+//     order from s8), and s21 a second 3-argument stream creator: CreateStreamFromSsml.
 //   {704c3f58-...}/{1bfff3af-...} XGameSave: s3 InitializeProvider(4) h, s4 InitializeProviderAsync(4) h,
 //     s5 InitializeProviderResult, s6 CloseProvider (O34: a local provider on the host directory
 //     --save-dir, never any cloud sync; s5/s6 by public header order), s13
@@ -111,10 +116,11 @@
 //     SubmitBlobWrite(update, name, data, size) h (header 0x128 bytes + payload), s28/s29
 //     SubmitUpdateAsync(update, block) / Result(block) h, s8/s9 GetRemainingQuotaAsync/Result h,
 //     s11/s12 DeleteContainerAsync/Result h; s7, s10, s18, s26, s27 (no title wrappers) by the
-//     same order m. s15 (no wrapper; GetContainerInfo) stays a logging stub.
-//   Stub-only (every slot logs and traps, so the first boot reports what it needs):
-//     XGameEventWrite {bbfbdcc7-...}, {1b339674-...} (XDisplay?), and unmapped
-//     {a4f1aee2-...}, {dfcd4649-...}.
+//     same order m. s15 (no wrapper; GetContainerInfo; the public header has no such function, so
+//     its signature is unknown) answers E_NOTIMPL without touching any argument.
+//   R40 non-trapping stub-only interfaces (every slot logs, then answers one documented HRESULT):
+//     events {bbfbdcc7-...} S_OK, shell {1b339674-...} and capture {a4f1aee2-...}
+//     HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED), XGameUi {dfcd4649-...} E_ABORT.
 //   {b884675d-...}: s3 is called through a wrapper that takes one pointer, passes a zeroed 0x90-byte
 //     local as the hidden return slot and copies 0x90 bytes from the returned pointer: a
 //     no-argument function returning a 144-byte struct by value, i.e. XSystemGetAnalyticsInfo()
@@ -893,6 +899,30 @@ public:
         title_id.write(g_title_id.load(std::memory_order_relaxed));
         return S_OK_HR;
     }
+
+    // XLaunchNewGame(exePath, args, defaultUser). The running title relaunching itself is a restart,
+    // not a store or licence call: the guest stops with kRelaunchSelfExitCode through the
+    // TerminateProcess path and the harness / browser boot start it again with the same arguments.
+    // Like the real call it does not return on success (only without an exit handler, i.e. tests).
+    // Launching another title stays E_NOTIMPL.
+    int32_t LaunchNewGame(const char* exe_path, const char* args, uint64_t /*default_user*/) {
+        if (exe_path == nullptr || exe_path[0] == '\0') {
+            return E_INVALIDARG_HR;
+        }
+        const char* command_line = pg6_win32_get_command_line_a();
+        if (!is_self_launch_target(exe_path, command_line != nullptr ? command_line : "")) {
+            os::log(std::string("xgameruntime: XLaunchNewGame(\"") + exe_path +
+                    "\"): another title; returning E_NOTIMPL");
+            return com::E_NOTIMPL_HR;
+        }
+        os::log(std::string("xgameruntime: XLaunchNewGame(\"") + exe_path + "\", args \"" +
+                (args != nullptr ? args : "") + "\"): relaunch of the running title requested");
+        // Constrained-change then suspend routines (and the ~1 s grace) run in the prepare hook the
+        // boot installs; the new arguments travel to the host through win32::relaunch_requested.
+        win32::begin_guest_relaunch(args != nullptr ? args : "");
+        pg6_win32_terminate_process(win32::kCurrentProcessPseudoHandle, win32::kRelaunchSelfExitCode);
+        return S_OK_HR;
+    }
 };
 
 // {0dd112ac-...}/{b09d803c-...}: XStore (contexts only; queries keep the O8 offline policy and are
@@ -964,7 +994,30 @@ private:
     std::atomic<bool> result_logged_{false};
 };
 
-void ignore_connectivity_change(void* /*context*/, const Pg6XNetworkingConnectivityHint* /*hint*/) {}
+// The guest callback of one connectivity registration. The O8 shim calls it at most once (the
+// initial notification; the offline state never changes), so it frees itself when called. A
+// registration removed before its notification was dispatched leaks this 16-byte record.
+struct GuestConnectivityCallback {
+    uint64_t function = 0;
+    uint64_t context = 0;
+};
+
+// Guest-readable copy of the hint handed to guest callbacks (the offline hint is constant).
+uint64_t guest_connectivity_hint() {
+    static const uint64_t va = com::guest_alloc(sizeof(Pg6XNetworkingConnectivityHint));
+    return va;
+}
+
+void forward_connectivity_change(void* context, const Pg6XNetworkingConnectivityHint* hint) {
+    std::unique_ptr<GuestConnectivityCallback> cb(static_cast<GuestConnectivityCallback*>(context));
+    const uint64_t va = guest_connectivity_hint();
+    if (va == 0 || hint == nullptr || !com::write_guest(va, *hint)) {
+        com::detail::log_bad_pointer("XNetworkingConnectivityHint (guest copy)", va);
+        return;
+    }
+    // XNetworkingConnectivityHintChangedCallback(void* context, const XNetworkingConnectivityHint*).
+    com::GuestFunction<void(uint64_t, uint64_t)>(cb->function).call_top_level(cb->context, va);
+}
 
 // {37e56907-...}/{bf2346b2-...}: XNetworking.
 class NetworkingApi : public com::ComObject {
@@ -981,15 +1034,20 @@ public:
         return hr;
     }
 
-    // The O8 shim never fires change notifications, so the guest callback is not kept.
-    int32_t RegisterConnectivityHintChanged(uint64_t queue, uint64_t /*context*/, uint64_t callback,
+    // The O8 shim sends the documented initial notification (offline, network initialized) to
+    // the queue's completion port; it is forwarded to the guest callback.
+    int32_t RegisterConnectivityHintChanged(uint64_t queue, uint64_t context, uint64_t callback,
                                             GuestPtr<uint64_t> token) {
         if (callback == 0 || token.is_null() || !optional_queue_ok(queue)) {
             return E_INVALIDARG_HR;
         }
+        auto cb = std::make_unique<GuestConnectivityCallback>(GuestConnectivityCallback{callback, context});
         Pg6XTaskQueueRegistrationToken host_token{};
         const int32_t hr = pg6_gdk_xnetworking_register_connectivity_hint_changed(
-            from_guest<Pg6XTaskQueue>(queue), nullptr, &ignore_connectivity_change, &host_token);
+            from_guest<Pg6XTaskQueue>(queue), cb.get(), &forward_connectivity_change, &host_token);
+        if (hr >= 0) {
+            cb.release();  // owned by the queued notification now
+        }
         token.write(host_token.token);
         return hr;
     }
@@ -1151,27 +1209,100 @@ public:
     }
 };
 
-// XSpeechSynthesizer. The runtime has no speech synthesizer: creation fails, and the title's
-// own failure path runs (no handle is invented).
+// XSpeechSynthesizer: a truthful silent synthesizer. Create returns a fixed handle, every stream
+// (from text or SSML) is a valid 16 kHz mono 16-bit PCM WAVE with no samples, size / get calls
+// report that stream, closing is free, and voice enumeration callbacks never run (no voices are
+// installed). Slot map: see the table at kSpeechTable (s8..s16 in public header order, s21 SSML).
 class SpeechApi : public com::ComObject {
 public:
     static constexpr const char* kComClassName = "xgameruntime XSpeechSynthesizer";
+    static constexpr uint64_t kSynthesizerHandle = 0x5350454543480001ull;
+    static constexpr uint64_t kStreamHandle = 0x5350454543530001ull;
+    static constexpr uint64_t kWaveHeaderSize = 44;
 
-    // s9: XSpeechSynthesizerCreate(XSpeechSynthesizerHandle*). The executable passes the address
-    // of a handle field that is still null and runs its setup only on success.
+    static void BuildSilentWave(uint8_t (&h)[44]) {
+        auto put32 = [&](size_t o, uint32_t v) { for (int i = 0; i < 4; ++i) h[o + i] = uint8_t(v >> (8 * i)); };
+        auto put16 = [&](size_t o, uint16_t v) { h[o] = uint8_t(v); h[o + 1] = uint8_t(v >> 8); };
+        std::memcpy(h, "RIFF", 4);
+        put32(4, 36);  // no samples
+        std::memcpy(h + 8, "WAVEfmt ", 8);
+        put32(16, 16);
+        put16(20, 1);       // PCM
+        put16(22, 1);       // mono
+        put32(24, 16000);   // sample rate
+        put32(28, 32000);   // byte rate
+        put16(32, 2);       // block align
+        put16(34, 16);      // bits per sample
+        std::memcpy(h + 36, "data", 4);
+        put32(40, 0);
+    }
+
+    // s8: XSpeechSynthesizerEnumerateInstalledVoices(void* context, callback*).
+    // No voices are installed, so the callback never runs.
+    int32_t EnumerateInstalledVoices(uint64_t /*context*/, uint64_t callback) {
+        if (callback == 0) {
+            return E_INVALIDARG_HR;
+        }
+        return S_OK_HR;
+    }
+
+    // s9: XSpeechSynthesizerCreate(XSpeechSynthesizerHandle*).
     int32_t Create(GuestPtr<uint64_t> handle) {
         if (handle.is_null()) {
             return E_INVALIDARG_HR;
         }
-        handle.write(0);
-        if (!logged_.exchange(true)) {
-            os::log("xgameruntime: XSpeechSynthesizerCreate: no speech synthesizer; returning E_NOTIMPL");
-        }
-        return com::E_NOTIMPL_HR;
+        handle.write(kSynthesizerHandle);
+        return S_OK_HR;
     }
 
-private:
-    std::atomic<bool> logged_{false};
+    // s10: close (free).
+    int32_t Close(uint64_t /*handle*/) { return S_OK_HR; }
+
+    // s11: SetDefaultVoice(handle): the default voice is the only one.
+    int32_t SetDefaultVoice(uint64_t /*handle*/) { return S_OK_HR; }
+
+    // s12: SetCustomVoice(handle, voiceId): no voices are installed, so no id names one.
+    int32_t SetCustomVoice(uint64_t /*handle*/, uint64_t /*voice_id*/) { return E_INVALIDARG_HR; }
+
+    // s13 / s21: CreateStreamFromText / FromSsml(handle, text, streamHandle*).
+    int32_t CreateStream(uint64_t /*handle*/, uint64_t /*text*/, GuestPtr<uint64_t> stream) {
+        if (stream.is_null()) {
+            return E_INVALIDARG_HR;
+        }
+        stream.write(kStreamHandle);
+        return S_OK_HR;
+    }
+
+    // s14: close stream (free).
+    int32_t CloseStream(uint64_t /*stream*/) { return S_OK_HR; }
+
+    // s15: GetStreamDataSize(stream, uint64_t* size).
+    int32_t GetStreamSize(uint64_t /*stream*/, GuestPtr<uint64_t> size) {
+        if (size.is_null()) {
+            return E_INVALIDARG_HR;
+        }
+        size.write(kWaveHeaderSize);
+        return S_OK_HR;
+    }
+
+    // s16: GetStreamData(stream, bufferSize, buffer, uint64_t* used).
+    int32_t GetStreamData(uint64_t /*stream*/, uint64_t buffer_size, uint64_t buffer, GuestPtr<uint64_t> used) {
+        if (buffer == 0) {
+            return E_INVALIDARG_HR;
+        }
+        if (buffer_size < kWaveHeaderSize) {
+            return E_NOT_SUFFICIENT_BUFFER_HR;
+        }
+        uint8_t header[44];
+        BuildSilentWave(header);
+        if (!com::write_guest(buffer, header, sizeof(header))) {
+            return E_INVALIDARG_HR;
+        }
+        if (!used.is_null()) {
+            used.write(kWaveHeaderSize);
+        }
+        return S_OK_HR;
+    }
 };
 
 // XGameSave (public header order: s3 XGameSaveInitializeProvider, s4 XGameSaveInitializeProviderAsync,
@@ -1611,6 +1742,12 @@ public:
     // s14: XGameSaveEnumerateContainerInfo(provider, context, callback).
     int32_t EnumerateContainerInfo(uint64_t provider, uint64_t context, uint64_t callback) {
         return EnumerateContainers(provider, std::string(), context, callback);
+    }
+
+    // s15: no public XGameSave function, signature unknown: documented E_NOTIMPL, arguments untouched.
+    int32_t GetContainerInfoUnsupported() {
+        log_once("XGameSave slot 15 (GetContainerInfo)");
+        return E_NOTIMPL_HR;
     }
 
     // s16: XGameSaveCreateContainer(provider, containerName, XGameSaveContainerHandle*). The title
@@ -2077,7 +2214,7 @@ constexpr auto kISystem =
 using GA = M<GameApi>;
 constexpr com::MethodDesc kGameMethods[] = {
     GA::method<&GameApi::GetXboxTitleId>("XGameGetXboxTitleId"),
-    GA::stub("XLaunchNewGame"),
+    GA::method<&GameApi::LaunchNewGame>("XLaunchNewGame"),
 };
 constexpr auto kIGame =
     com::declare_interface<GameApi>("xgameruntime.XGame", kGameIid, kGameMethods, {.slot_count = 16});
@@ -2139,6 +2276,7 @@ constexpr auto kGameSaveTable = slot_table<27>({
     {12, GS::method<&GameSaveApi::DeleteContainerResult>("XGameSaveDeleteContainerResult")},
     {13, GS::method<&GameSaveApi::EnumerateContainerInfoByName>("XGameSaveEnumerateContainerInfoByName")},
     {14, GS::method<&GameSaveApi::EnumerateContainerInfo>("XGameSaveEnumerateContainerInfo")},
+    {15, GS::method<&GameSaveApi::GetContainerInfoUnsupported>("XGameSaveGetContainerInfo")},
     {16, GS::method<&GameSaveApi::CreateContainer>("XGameSaveCreateContainer")},
     {17, GS::method<&GameSaveApi::CloseContainer>("XGameSaveCloseContainer")},
     {18, GS::method<&GameSaveApi::EnumerateBlobInfo>("XGameSaveEnumerateBlobInfo")},
@@ -2170,31 +2308,64 @@ constexpr auto kPlsTable = slot_table<2>({
 constexpr auto kIPersistentLocalStorage = com::declare_interface<PersistentLocalStorageApi>(
     "xgameruntime.XPersistentLocalStorage", kPlsIid, kPlsTable.slots, {.slot_count = 16});
 using SP = M<SpeechApi>;
-constexpr auto kSpeechTable = slot_table<7>({
+// Slot map from the executable's wrappers (argument counts in brackets): s8 EnumerateInstalledVoices
+// (2), s9 Create (1), s10 CloseHandle (1), s11 SetDefaultVoice (1), s12 SetCustomVoice (2), s13
+// CreateStreamFromText (3), s14 CloseStreamHandle (1), s15 GetStreamDataSize (2), s16 GetStreamData
+// (4), s21 CreateStreamFromSsml (3). s17..s20 are not called.
+constexpr auto kSpeechTable = slot_table<19>({
+    {8, SP::method<&SpeechApi::EnumerateInstalledVoices>("XSpeechSynthesizerEnumerateInstalledVoices")},
     {9, SP::method<&SpeechApi::Create>("XSpeechSynthesizerCreate")},
+    {10, SP::method<&SpeechApi::Close>("XSpeechSynthesizerCloseHandle")},
+    {11, SP::method<&SpeechApi::SetDefaultVoice>("XSpeechSynthesizerSetDefaultVoice")},
+    {12, SP::method<&SpeechApi::SetCustomVoice>("XSpeechSynthesizerSetCustomVoice")},
+    {13, SP::method<&SpeechApi::CreateStream>("XSpeechSynthesizerCreateStreamFromText")},
+    {14, SP::method<&SpeechApi::CloseStream>("XSpeechSynthesizerCloseStreamHandle")},
+    {15, SP::method<&SpeechApi::GetStreamSize>("XSpeechSynthesizerGetStreamDataSize")},
+    {16, SP::method<&SpeechApi::GetStreamData>("XSpeechSynthesizerGetStreamData")},
+    {21, SP::method<&SpeechApi::CreateStream>("XSpeechSynthesizerCreateStreamFromSsml")},
 });
 constexpr auto kISpeech = com::declare_interface<SpeechApi>("xgameruntime.XSpeechSynthesizer", kSpeechIid,
                                                             kSpeechTable.slots, {.slot_count = 32});
-constexpr auto kIEvent = com::declare_interface<StubApi>("xgameruntime.XGameEvent", kEventGuid, {},
-                                                         {.slot_count = 16});
-constexpr auto kIDisplay = com::declare_interface<StubApi>("xgameruntime.{1b339674} (XDisplay?)", kDisplayGuid,
-                                                           {}, {.slot_count = 16});
+// R40: the four areas the title reaches from its legal and privacy screens no longer trap; every slot
+// of an interface answers one fixed HRESULT. Evidence: static survey of the executable's wrappers and
+// of every caller of them (R40 verification; no runtime trace of these slots exists yet):
+//   events {bbfbdcc7}: S_OK. One wrapper, s3 (6 arguments), reached only after XGameRuntimeIsFeatureAvailable
+//     (feature 20) answers true; with the feature table at false the wrapper returns E_NOTIMPL before it
+//     queries this interface, so the slot answer is unobservable today. A truthful no-op if enabled.
+//   shell {1b339674}: ERROR_NOT_SUPPORTED. s3(handle, ptr) fails into a logged error and the caller reports
+//     failure; s4(&handle) result is ignored and its handle stays null; s5(handle) is only called for a
+//     non-null handle. The function itself is not identified; every caller tolerates any failure.
+//   capture {a4f1aee2}: ERROR_NOT_SUPPORTED. One wrapper, s5(2 arguments); the caller stores a status
+//     (success 0, 0x82323002 3, any other failure 1) in a list and continues. Function not identified.
+//   XGameUi {dfcd4649}: E_ABORT. s7/s8 = ShowPlayerProfileCardAsync/Result and s17/s18/s19 =
+//     ShowTextEntryAsync/ResultSize/Result (named by the title's own error strings); s7 and s17 failing
+//     logs the error and returns, so the Result slots are never reached. A profile-card success
+//     answer would need a real dialog, so it stays a refusal.
+constexpr int32_t kHrNotSupported = static_cast<int32_t>(0x80070032u);  // HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)
+constexpr auto kIEvent = com::declare_interface<StubApi>(
+    "xgameruntime.XGameEvent", kEventGuid, {},
+    {.slot_count = 16, .policy = com::SlotPolicy::ReturnFixed, .stub_result = 0});
+constexpr auto kIDisplay = com::declare_interface<StubApi>(
+    "xgameruntime.{1b339674} (shell)", kDisplayGuid, {},
+    {.slot_count = 16, .policy = com::SlotPolicy::ReturnFixed, .stub_result = kHrNotSupported});
 using HD = M<HdrModeApi>;
 constexpr auto kUnmapped3Table = slot_table<2>({
     {4, HD::method<&HdrModeApi::TryEnableHdrMode>("XDisplayTryEnableHdrMode")},
 });
 constexpr auto kIUnmapped3 = com::declare_interface<HdrModeApi>("xgameruntime.{03f0fe74}", kUnmapped3Iid,
                                                                 kUnmapped3Table.slots, {.slot_count = 16});
-constexpr auto kIUnmapped9 = com::declare_interface<StubApi>("xgameruntime.{a4f1aee2}", kUnmapped9Iid, {},
-                                                             {.slot_count = 16});
+constexpr auto kIUnmapped9 = com::declare_interface<StubApi>(
+    "xgameruntime.{a4f1aee2} (capture)", kUnmapped9Iid, {},
+    {.slot_count = 16, .policy = com::SlotPolicy::ReturnFixed, .stub_result = kHrNotSupported});
 using AI = M<AnalyticsInfoApi>;
 constexpr auto kUnmapped10Table = slot_table<1>({
     {3, AI::method<&AnalyticsInfoApi::GetAnalyticsInfo>("XSystemGetAnalyticsInfo")},
 });
 constexpr auto kIUnmapped10 = com::declare_interface<AnalyticsInfoApi>(
     "xgameruntime.{b884675d}", kUnmapped10Guid, kUnmapped10Table.slots, {.slot_count = 16});
-constexpr auto kIUnmapped13 = com::declare_interface<StubApi>("xgameruntime.{dfcd4649}", kUnmapped13Iid, {},
-                                                              {.slot_count = 32});
+constexpr auto kIUnmapped13 = com::declare_interface<StubApi>(
+    "xgameruntime.{dfcd4649} (XGameUi)", kUnmapped13Iid, {},
+    {.slot_count = 32, .policy = com::SlotPolicy::ReturnFixed, .stub_result = E_ABORT_HR});
 
 // ---------------------------------------------------------------------------
 // API table and singletons
@@ -2404,6 +2575,47 @@ std::vector<ApiRequest> api_requests() {
         out.push_back(ApiRequest{key.first, key.second, value.first, value.second});
     }
     return out;
+}
+
+namespace {
+std::string_view exe_basename(std::string_view path) {
+    while (!path.empty() && (path.back() == ' ' || path.back() == '\t')) {
+        path.remove_suffix(1);
+    }
+    const size_t slash = path.find_last_of("\\/");
+    return slash == std::string_view::npos ? path : path.substr(slash + 1);
+}
+
+bool iequals_ascii(std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.size(); ++i) {
+        const auto lower = [](char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c + 32) : c; };
+        if (lower(a[i]) != lower(b[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+}  // namespace
+
+bool is_self_launch_target(std::string_view exe_path, std::string_view command_line) {
+    size_t start = command_line.find_first_not_of(" \t");
+    if (start == std::string_view::npos) {
+        return false;
+    }
+    std::string_view first;
+    if (command_line[start] == '"') {
+        const size_t end = command_line.find('"', start + 1);
+        first = command_line.substr(start + 1, end == std::string_view::npos ? std::string_view::npos : end - start - 1);
+    } else {
+        const size_t end = command_line.find_first_of(" \t", start);
+        first = command_line.substr(start, end == std::string_view::npos ? std::string_view::npos : end - start);
+    }
+    const std::string_view self = exe_basename(first);
+    const std::string_view target = exe_basename(exe_path);
+    return !self.empty() && iequals_ascii(self, target);
 }
 
 void set_xbox_title_id(uint32_t title_id) {

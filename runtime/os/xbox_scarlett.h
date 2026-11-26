@@ -398,6 +398,17 @@ struct XMemWindowContiguity {
 };
 XMemWindowContiguity xmem_window_contiguity();
 void xmem_reset_for_testing();
+// Writes `len` bytes into physical pages, page after page (DirectStorage
+// DestinationIsPhysicalPages). `entry_at(i, &e)` yields the i-th page entry: a physical address
+// (frame number << 12, page-aligned) or, failing that, a frame number as XMemAllocatePhysicalPages
+// returns it. Writing starts `first_offset` bytes into the first page (small resources share a
+// page); each entry then takes min(room left in the page, bytes left). All entries are resolved
+// before any byte is written: false (nothing written) when an entry cannot be read, names no live
+// page, or `first_offset` is not inside the first page.
+bool xmem_write_physical_pages(const std::function<bool(size_t index, uint64_t* entry)>& entry_at,
+                               const uint8_t* data,
+                               size_t len,
+                               uint64_t first_offset = 0);
 
 // DirectStorage backing hooks (in-memory virtual file table + host read callback + HTTPFS fallback).
 using DStorageHostOpenCallback = std::function<int64_t(std::string_view normalized_path)>;
@@ -475,6 +486,12 @@ void set_game_input_state(playgta6::InputState* shared_state,
                           playgta6::os::SeqlockMode mode = playgta6::os::SeqlockMode::MonotonicSeq);
 playgta6::InputState* get_game_input_state();
 void set_game_input_deadzone(const playgta6::os::DeadzoneConfig& config);
+// Press latch: records buttons that went down in the attached InputState since the last
+// GameInput reading, so the next reading reports a tap shorter than the title's frame as down
+// once. sample_game_input_presses() takes one sample; set_game_input_press_sampler(true) samples
+// every 4 ms on a background thread (off by default; the browser and --host-input turn it on).
+void sample_game_input_presses();
+void set_game_input_press_sampler(bool enabled);
 
 // Registers all 16 Xbox Scarlett exports in Win32ModuleRegistry (idempotent, thread-safe).
 size_t register_all_scarlett_exports();

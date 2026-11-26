@@ -25,6 +25,7 @@ const {
   sanitizeDismissReason,
   isHudHiddenQuery,
   isGregQuery,
+  resolveDefaultGregMode,
   isSplashHoldQuery,
   SplashOverlayController,
   DEFAULT_FADE_MS,
@@ -372,7 +373,10 @@ test('constructor validates options and mounts accessible root', () => {
   const state = controller.getState();
   assert.equal(state.visible, true);
   assert.equal(state.destroyed, false);
-  assert.equal(state.usingFallback, true);
+  assert.equal(state.gregMode, true);
+  assert.equal(state.gregBackdropActive, true);
+  assert.equal(state.activeSplashImageUrl, './assets/greg.png');
+  assert.equal(state.usingFallback, false);
   assert.ok(state.root);
   assert.equal(state.root.parentNode, documentObj.body);
   assert.equal(state.root.getAttribute('role'), 'status');
@@ -381,16 +385,21 @@ test('constructor validates options and mounts accessible root', () => {
   controller.destroy();
 });
 
-test('binds splashImageUrl to img src when provided', () => {
+test('binds splashImageUrl to img src when provided and Greg mode is disabled', () => {
   const { controller } = createController({
     splashImageUrl: '/game/xbs_splash.png',
+    gregMode: false,
   });
   const state = controller.getState();
   assert.equal(state.splashImageUrl, '/game/xbs_splash.png');
+  assert.equal(state.activeSplashImageUrl, '/game/xbs_splash.png');
+  assert.equal(state.gregBackdropActive, false);
   assert.equal(state.usingFallback, false);
   const img = state.root.querySelector('.pg6-splash__img');
   assert.ok(img);
   assert.equal(img.getAttribute('src'), '/game/xbs_splash.png');
+  assert.equal(img.style.objectFit, 'cover');
+  assert.equal(img.classList.contains('pg6-splash__img--greg'), false);
   assert.equal(img.hidden, false);
   const fallback = state.root.querySelector('.pg6-splash__fallback');
   assert.equal(fallback.hidden, true);
@@ -400,6 +409,7 @@ test('binds splashImageUrl to img src when provided', () => {
 test('image onerror falls back to built-in CSS/SVG without throwing', () => {
   const { controller } = createController({
     splashImageUrl: '/game/missing-splash.png',
+    gregMode: false,
   });
   const img = controller.getState().root.querySelector('.pg6-splash__img');
   assert.equal(controller.getState().usingFallback, false);
@@ -416,10 +426,11 @@ test('image onerror falls back to built-in CSS/SVG without throwing', () => {
   controller.destroy();
 });
 
-test('null splashImageUrl uses fallback immediately', () => {
-  const { controller } = createController({ splashImageUrl: null });
+test('null splashImageUrl uses fallback immediately when Greg mode is disabled', () => {
+  const { controller } = createController({ splashImageUrl: null, gregMode: false });
   const state = controller.getState();
   assert.equal(state.usingFallback, true);
+  assert.equal(state.gregBackdropActive, false);
   const img = state.root.querySelector('.pg6-splash__img');
   assert.equal(img.hidden, true);
   const fallback = state.root.querySelector('.pg6-splash__fallback');
@@ -1443,14 +1454,14 @@ test('W228: exports isGregQuery, Spinning Greg constants, and web/assets/greg.pn
   assert.equal(isGregQuery('http://localhost:8000/?greg=0#?greg=1'), false);
 });
 
-test('W228: default ring spinner renders cleanly with gregMode false, hides on dismiss, and respects reduced motion', () => {
+test('W228: default Spinning Greg spinner renders cleanly with gregMode true, hides on dismiss, and respects reduced motion', () => {
   const doc = new MockDocument();
   const { controller } = createController({ documentObj: doc });
   const state = controller.getState();
   const stats = controller.getStats();
 
-  assert.equal(state.gregMode, false);
-  assert.equal(stats.gregMode, false);
+  assert.equal(state.gregMode, true);
+  assert.equal(stats.gregMode, true);
 
   const panel = state.root.querySelector('.pg6-splash__panel');
   assert.ok(panel);
@@ -1460,19 +1471,22 @@ test('W228: default ring spinner renders cleanly with gregMode false, hides on d
   const stage = panel.querySelector('.pg6-splash__stage');
 
   assert.ok(spinner, 'spinner element must render inside panel');
-  assert.ok(ring, 'default CSS ring spinner must render inside spinner');
+  assert.ok(ring, 'fallback CSS ring spinner must render inside spinner');
   assert.ok(greg, 'greg img element must render inside spinner');
   assert.ok(stage, 'stage label must remain intact inside panel');
   assert.equal(spinner.hidden, false);
   assert.equal(spinner.style.display, '');
-  assert.equal(spinner.getAttribute('data-greg-mode'), 'false');
-  assert.equal(spinner.classList.contains('pg6-splash__spinner--greg'), false);
-  assert.equal(ring.hidden, false);
-  assert.equal(ring.style.display, '');
-  assert.equal(greg.hidden, true);
-  assert.equal(greg.style.display, 'none');
+  assert.equal(spinner.getAttribute('aria-hidden'), 'true');
+  assert.equal(spinner.getAttribute('data-greg-mode'), 'true');
+  assert.equal(spinner.classList.contains('pg6-splash__spinner--greg'), true);
+  assert.equal(ring.hidden, true);
+  assert.equal(ring.style.display, 'none');
+  assert.equal(greg.hidden, false);
+  assert.equal(greg.style.display, '');
   assert.equal(greg.getAttribute('src'), './assets/greg.png');
   assert.equal(greg.getAttribute('alt'), 'Greg');
+  assert.equal(greg.getAttribute('aria-hidden'), 'true');
+  assert.equal(greg.getAttribute('draggable'), 'false');
 
   // Shared stylesheet includes spin keyframes and reduced-motion animation suppression.
   const styleEl = doc.head.children.find((el) => el.getAttribute('data-pg6-splash-style') === '1');
@@ -1512,7 +1526,7 @@ test('W228: default ring spinner renders cleanly with gregMode false, hides on d
   reduced.controller.destroy();
 });
 
-test('W228: ?greg=1 / ?greg=true query and constructor options activate Spinning Greg and preserve ?hud=0', () => {
+test('W228: ?greg=1 / ?greg=0 query and constructor options control Spinning Greg and preserve ?hud=0', () => {
   // Option validation.
   assert.throws(
     () => new SplashOverlayController({ documentObj: new MockDocument(), gregMode: 'yes' }),
@@ -1531,7 +1545,7 @@ test('W228: ?greg=1 / ?greg=true query and constructor options activate Spinning
     TypeError
   );
 
-  // ?greg=1 via locationSearch enables Spinning Greg automatically.
+  // ?greg=1 via locationSearch keeps Spinning Greg active.
   const viaQuery1 = createController({ locationSearch: '?greg=1' });
   assert.equal(viaQuery1.controller.getState().gregMode, true);
   assert.equal(viaQuery1.controller.getStats().gregMode, true);
@@ -1543,6 +1557,16 @@ test('W228: ?greg=1 / ?greg=true query and constructor options activate Spinning
   assert.equal(root1.querySelector('.pg6-splash__greg').getAttribute('alt'), 'Greg');
   viaQuery1.controller.destroy();
 
+  // ?greg=0 via locationSearch opts out back to the ring spinner.
+  const viaQuery0 = createController({ locationSearch: '?greg=0' });
+  assert.equal(viaQuery0.controller.getState().gregMode, false);
+  assert.equal(viaQuery0.controller.getStats().gregMode, false);
+  const root0 = viaQuery0.controller.getState().root;
+  assert.equal(root0.querySelector('.pg6-splash__spinner').classList.contains('pg6-splash__spinner--greg'), false);
+  assert.equal(root0.querySelector('.pg6-splash__spinner-ring').hidden, false);
+  assert.equal(root0.querySelector('.pg6-splash__greg').hidden, true);
+  viaQuery0.controller.destroy();
+
   // ?greg=true via windowObj.location.search enables Spinning Greg automatically.
   const viaWindow = createController({ windowObj: { location: { search: '?foo=bar&greg=true' } } });
   assert.equal(viaWindow.controller.getState().gregMode, true);
@@ -1550,7 +1574,7 @@ test('W228: ?greg=1 / ?greg=true query and constructor options activate Spinning
   viaWindow.controller.destroy();
 
   // Explicit constructor gregMode option overrides query in both directions.
-  const explicitOn = createController({ gregMode: true });
+  const explicitOn = createController({ locationSearch: '?greg=0', gregMode: true });
   assert.equal(explicitOn.controller.getStats().gregMode, true);
   explicitOn.controller.destroy();
 
@@ -1558,12 +1582,12 @@ test('W228: ?greg=1 / ?greg=true query and constructor options activate Spinning
   assert.equal(explicitOff.controller.getStats().gregMode, false);
   explicitOff.controller.destroy();
 
-  // ?hud=0 still hides the overlay cleanly even when combined with ?greg=1.
+  // ?hud=0 still hides the overlay cleanly even when combined with default/explicit Greg.
   const hudHiddenOnly = createController({ locationSearch: '?hud=0', nowFn: () => 5000 });
   assert.equal(hudHiddenOnly.controller.getStats().visible, false);
   assert.equal(hudHiddenOnly.controller.getStats().dismissed, true);
   assert.equal(hudHiddenOnly.controller.getStats().hudHidden, true);
-  assert.equal(hudHiddenOnly.controller.getStats().gregMode, false);
+  assert.equal(hudHiddenOnly.controller.getStats().gregMode, true);
   assert.equal(hudHiddenOnly.controller.getState().root.hidden, true);
   hudHiddenOnly.controller.destroy();
 
@@ -1584,36 +1608,37 @@ test('W228: 3x spinner click trigger toggles Spinning Greg cleanly and respects 
   const ring = root.querySelector('.pg6-splash__spinner-ring');
   const greg = root.querySelector('.pg6-splash__greg');
 
-  assert.equal(controller.getState().gregMode, false);
+  // Spinning Greg is enabled by default.
+  assert.equal(controller.getState().gregMode, true);
   spinner.dispatch('click');
-  spinner.dispatch('click');
-  assert.equal(controller.getState().gregMode, false);
-  assert.equal(ring.hidden, false);
-  assert.equal(greg.hidden, true);
-
-  // 3rd click activates Spinning Greg.
   spinner.dispatch('click');
   assert.equal(controller.getState().gregMode, true);
-  assert.equal(controller.getStats().gregMode, true);
   assert.equal(ring.hidden, true);
   assert.equal(greg.hidden, false);
+
+  // 3rd click toggles Spinning Greg OFF (fallback ring spinner).
+  spinner.dispatch('click');
+  assert.equal(controller.getState().gregMode, false);
+  assert.equal(controller.getStats().gregMode, false);
+  assert.equal(ring.hidden, false);
+  assert.equal(greg.hidden, true);
 
   // Clicking while hidden is ignored.
   controller.hide();
   spinner.dispatch('click');
   spinner.dispatch('click');
   spinner.dispatch('click');
-  assert.equal(controller.getState().gregMode, true);
+  assert.equal(controller.getState().gregMode, false);
 
-  // Show again and click 3x to toggle back off.
+  // Show again and click 3x to toggle back ON.
   controller.show();
   spinner.dispatch('click');
   spinner.dispatch('click');
-  assert.equal(controller.getState().gregMode, true);
-  spinner.dispatch('click');
   assert.equal(controller.getState().gregMode, false);
-  assert.equal(ring.hidden, false);
-  assert.equal(greg.hidden, true);
+  spinner.dispatch('click');
+  assert.equal(controller.getState().gregMode, true);
+  assert.equal(ring.hidden, true);
+  assert.equal(greg.hidden, false);
 
   // Listener is cleaned up on destroy.
   assert.equal(spinner.listenerCount('click'), 1);
@@ -1624,16 +1649,16 @@ test('W228: 3x spinner click trigger toggles Spinning Greg cleanly and respects 
   const customThreshold = createController({ gregClickThreshold: 2 });
   const customSpinner = customThreshold.controller.getState().root.querySelector('.pg6-splash__spinner');
   customSpinner.dispatch('click');
-  assert.equal(customThreshold.controller.getStats().gregMode, false);
-  customSpinner.dispatch('click');
   assert.equal(customThreshold.controller.getStats().gregMode, true);
+  customSpinner.dispatch('click');
+  assert.equal(customThreshold.controller.getStats().gregMode, false);
   customThreshold.controller.destroy();
 });
 
 test('W228: typing g-r-e-g toggles Spinning Greg, ignores editable inputs & modifiers, and cleans up on destroy', () => {
   const { controller, documentObj } = createController();
   assert.equal(documentObj.listenerCount('keydown'), 1);
-  assert.equal(controller.getStats().gregMode, false);
+  assert.equal(controller.getStats().gregMode, true);
 
   const typeWord = (target, word, extra = {}) => {
     for (const ch of word) {
@@ -1643,11 +1668,11 @@ test('W228: typing g-r-e-g toggles Spinning Greg, ignores editable inputs & modi
 
   // Ignored when modifiers are held.
   typeWord(documentObj, 'greg', { ctrlKey: true });
-  assert.equal(controller.getStats().gregMode, false);
+  assert.equal(controller.getStats().gregMode, true);
   typeWord(documentObj, 'greg', { altKey: true });
-  assert.equal(controller.getStats().gregMode, false);
+  assert.equal(controller.getStats().gregMode, true);
   typeWord(documentObj, 'greg', { metaKey: true });
-  assert.equal(controller.getStats().gregMode, false);
+  assert.equal(controller.getStats().gregMode, true);
 
   // Ignored when event originates from editable inputs/textareas/select/contenteditable.
   typeWord(documentObj, 'greg', { target: { tagName: 'INPUT' } });
@@ -1657,30 +1682,30 @@ test('W228: typing g-r-e-g toggles Spinning Greg, ignores editable inputs & modi
   typeWord(documentObj, 'greg', {
     target: { tagName: 'DIV', getAttribute: (name) => (name === 'contenteditable' ? 'true' : null) },
   });
-  assert.equal(controller.getStats().gregMode, false);
-
-  // Typing g-r-e-g (even after unrelated keys) toggles Spinning Greg ON.
-  typeWord(documentObj, 'abgreg');
-  assert.equal(controller.getState().gregMode, true);
   assert.equal(controller.getStats().gregMode, true);
-  assert.equal(controller.getState().root.querySelector('.pg6-splash__greg').hidden, false);
+
+  // Typing g-r-e-g (even after unrelated keys) toggles Spinning Greg OFF.
+  typeWord(documentObj, 'abgreg');
+  assert.equal(controller.getState().gregMode, false);
+  assert.equal(controller.getStats().gregMode, false);
+  assert.equal(controller.getState().root.querySelector('.pg6-splash__greg').hidden, true);
 
   // Ignored while splash overlay is hidden or dismissed.
   controller.hide();
   typeWord(documentObj, 'greg');
-  assert.equal(controller.getStats().gregMode, true);
+  assert.equal(controller.getStats().gregMode, false);
   controller.show();
 
-  // Case-insensitive typing toggles Spinning Greg OFF again.
+  // Case-insensitive typing toggles Spinning Greg ON again.
   typeWord(documentObj, 'GREG');
-  assert.equal(controller.getStats().gregMode, false);
-  assert.equal(controller.getState().root.querySelector('.pg6-splash__greg').hidden, true);
+  assert.equal(controller.getStats().gregMode, true);
+  assert.equal(controller.getState().root.querySelector('.pg6-splash__greg').hidden, false);
 
   // destroy() removes keydown listener so no listeners leak.
   controller.destroy();
   assert.equal(documentObj.listenerCount('keydown'), 0);
   typeWord(documentObj, 'greg');
-  assert.equal(controller.getStats().gregMode, false);
+  assert.equal(controller.getStats().gregMode, true);
 
   // Also binds and cleans up when windowObj provides addEventListener.
   const winListeners = new Map();
@@ -1700,7 +1725,7 @@ test('W228: typing g-r-e-g toggles Spinning Greg, ignores editable inputs & modi
   const viaWin = createController({ windowObj: mockWin });
   assert.equal(winListeners.get('keydown')?.size, 1);
   typeWord(mockWin, 'greg');
-  assert.equal(viaWin.controller.getStats().gregMode, true);
+  assert.equal(viaWin.controller.getStats().gregMode, false);
   viaWin.controller.destroy();
   assert.equal(winListeners.get('keydown')?.size, 0);
 });
@@ -1939,17 +1964,19 @@ test('W230: holdUntilVisible holds past FIRST_PRESENT, updates loading progress,
   assert.ok(controller.getState().progressPct <= 99);
   assert.equal(controller.getState().dismissed, false);
 
-  // W228 Spinning Greg triggers still work while held!
-  spinner.dispatch('click');
-  spinner.dispatch('click');
-  spinner.dispatch('click');
+  // W228 Spinning Greg triggers still work while held (default ON -> 3x click OFF -> typing greg ON)!
   assert.equal(controller.getStats().gregMode, true);
   assert.equal(gregImg.hidden, false);
+  spinner.dispatch('click');
+  spinner.dispatch('click');
+  spinner.dispatch('click');
+  assert.equal(controller.getStats().gregMode, false);
+  assert.equal(gregImg.hidden, true);
   for (const ch of 'greg') {
     documentObj.dispatch('keydown', { key: ch });
   }
-  assert.equal(controller.getStats().gregMode, false);
-  assert.equal(gregImg.hidden, true);
+  assert.equal(controller.getStats().gregMode, true);
+  assert.equal(gregImg.hidden, false);
 
   // notifyFirstVisibleFrame() cancels fallback timer and fades out smoothly (450 ms default).
   now = 195000;
@@ -2521,10 +2548,17 @@ test('W311: surfaces sanitized phase timing telemetry (stageDurationsMs, totalSp
   now = 2000; // WASM_INIT = 550 ms
   controller.updateBootState({ stage: 'D3D12_INIT', progressPct: 75 });
 
-  // Verify Spinning Greg easter egg still toggles cleanly mid-boot and preserves W252 Astryx DOM.
+  // Verify Spinning Greg is active by default mid-boot and toggles cleanly while preserving W252 Astryx DOM.
   const root = controller.getState().root;
   const spinner = root.querySelector('.pg6-splash__spinner');
   const gregImg = root.querySelector('.pg6-splash__greg');
+  assert.equal(controller.getStats().gregMode, true);
+  assert.equal(gregImg.hidden, false);
+  spinner.dispatch('click');
+  spinner.dispatch('click');
+  spinner.dispatch('click');
+  assert.equal(controller.getStats().gregMode, false);
+  assert.equal(gregImg.hidden, true);
   spinner.dispatch('click');
   spinner.dispatch('click');
   spinner.dispatch('click');
@@ -2609,4 +2643,341 @@ test('W311: surfaces sanitized phase timing telemetry (stageDurationsMs, totalSp
   assert.equal(safeStats.fadeOutCompleted, true);
   assert.doesNotThrow(() => JSON.stringify(safeStats));
   faulty.controller.destroy();
+});
+
+test('spinning Greg splash spinner renders assets/greg.png by default, degrades gracefully on load error or minimal mocks, and honors reduced motion', () => {
+  const doc = new MockDocument();
+  const { controller } = createController({ documentObj: doc });
+  const root = controller.getState().root;
+  const spinner = root.querySelector('.pg6-splash__spinner');
+  const ring = root.querySelector('.pg6-splash__spinner-ring');
+  const greg = root.querySelector('.pg6-splash__greg');
+
+  // 1) Default spinner displays Spinning Greg (./assets/greg.png) with aria-hidden & non-draggable img.
+  assert.ok(spinner);
+  assert.ok(ring);
+  assert.ok(greg);
+  assert.equal(spinner.getAttribute('aria-hidden'), 'true');
+  assert.equal(spinner.classList.contains('pg6-splash__spinner--greg'), true);
+  assert.equal(greg.tagName, 'IMG');
+  assert.equal(greg.getAttribute('src'), './assets/greg.png');
+  assert.equal(greg.getAttribute('aria-hidden'), 'true');
+  assert.equal(greg.getAttribute('draggable'), 'false');
+  assert.equal(greg.hidden, false);
+  assert.equal(greg.style.display, '');
+  assert.equal(greg.style.animation, '');
+  assert.equal(ring.hidden, true);
+  assert.equal(ring.style.display, 'none');
+
+  // Verify shared stylesheet & web/ui/overlay.css define 360-degree spin animation + object-fit: contain + reduced-motion override.
+  const styleEl = doc.head.children.find((el) => el.getAttribute('data-pg6-splash-style') === '1');
+  assert.ok(styleEl);
+  assert.match(styleEl.textContent, /\.pg6-splash__greg\{[^}]*object-fit:contain[^}]*animation:pg6-spin 1200ms linear infinite/);
+  assert.match(styleEl.textContent, /@keyframes pg6-spin\{from\{transform:rotate\(0deg\);\}to\{transform:rotate\(360deg\);\}\}/);
+  assert.match(styleEl.textContent, /\.pg6-splash\[data-reduced-motion="true"\] \.pg6-splash__greg\{animation:none!important;\}/);
+
+  const overlayCss = fs.readFileSync(path.join(REPO_ROOT, 'web', 'ui', 'overlay.css'), 'utf8');
+  assert.match(overlayCss, /@keyframes\s+pg6-spin\s*\{[\s\S]*rotate\(0deg\)[\s\S]*rotate\(360deg\)/);
+  assert.match(
+    overlayCss,
+    /#splash-overlay-root\s+\.pg6-splash__greg\s*\{[\s\S]*object-fit:\s*contain;[\s\S]*animation:\s*pg6-spin\s+1200ms\s+linear\s+infinite;/
+  );
+  assert.match(
+    overlayCss,
+    /\.pg6-splash\[data-reduced-motion="true"\]\s+\.pg6-splash__greg[\s\S]*animation:\s*none\s*!important;/
+  );
+  assert.match(
+    overlayCss,
+    /@media\s*\(\s*prefers-reduced-motion\s*:\s*reduce\s*\)[\s\S]*\.pg6-splash__greg[\s\S]*animation:\s*none\s*!important;/
+  );
+
+  // 2) If assets/greg.png fails to load, gracefully degrades to .pg6-splash__spinner-ring without throwing.
+  assert.equal(greg.listenerCount('error'), 1);
+  assert.doesNotThrow(() => greg.dispatch('error'));
+  assert.equal(greg.hidden, true);
+  assert.equal(greg.style.display, 'none');
+  assert.equal(ring.hidden, false);
+  assert.equal(ring.style.display, '');
+  assert.equal(spinner.classList.contains('pg6-splash__spinner--greg'), false);
+  assert.equal(spinner.getAttribute('data-greg-mode'), 'false');
+
+  // Error listener is cleaned up on destroy.
+  controller.destroy();
+  assert.equal(greg.listenerCount('error'), 0);
+
+  // 3) Reduced motion stops Greg spinning while keeping Greg visible cleanly.
+  const reduced = createController({
+    matchMedia: (q) => ({ matches: q === REDUCED_MOTION_QUERY }),
+  });
+  const rRoot = reduced.controller.getState().root;
+  const rSpinner = rRoot.querySelector('.pg6-splash__spinner');
+  const rGreg = rRoot.querySelector('.pg6-splash__greg');
+  assert.equal(rRoot.getAttribute('data-reduced-motion'), 'true');
+  assert.equal(rSpinner.getAttribute('data-reduced-motion'), 'true');
+  assert.equal(rSpinner.getAttribute('aria-hidden'), 'true');
+  assert.equal(rGreg.hidden, false);
+  assert.equal(rGreg.style.display, '');
+  assert.equal(rGreg.style.animation, 'none');
+  reduced.controller.destroy();
+
+  // 4) Minimal DOM test mocks (omitting style/classList/addEventListener) degrade gracefully without throwing.
+  const minimalDoc = {
+    createElement(tag) {
+      return {
+        tagName: String(tag).toUpperCase(),
+        className: '',
+        hidden: false,
+        textContent: '',
+        innerHTML: '',
+        children: [],
+        style: { setProperty() {} },
+        setAttribute() {},
+        appendChild(child) {
+          this.children.push(child);
+          return child;
+        },
+      };
+    },
+  };
+  assert.doesNotThrow(() => {
+    const minCtrl = new SplashOverlayController({ documentObj: minimalDoc, autoMount: false });
+    minCtrl.updateBootState({ stage: 'PGIM_LOAD', progressPct: 15 });
+    minCtrl.dismiss({ fadeMs: 0 });
+    minCtrl.destroy();
+  });
+});
+
+test('default Greg splash backdrop replaces /game/xbs_splash.png while keeping Spinning Greg and centered dark styling', () => {
+  assert.equal(typeof resolveDefaultGregMode, 'function');
+  assert.equal(resolveDefaultGregMode(''), true);
+  assert.equal(resolveDefaultGregMode(null), true);
+  assert.equal(resolveDefaultGregMode('?greg=1'), true);
+  assert.equal(resolveDefaultGregMode('?greg=0'), false);
+  assert.equal(resolveDefaultGregMode('?greg=false'), false);
+  assert.equal(resolveDefaultGregMode('?greg=off'), false);
+  assert.equal(resolveDefaultGregMode('?greg=no'), false);
+
+  const doc = new MockDocument();
+  const { controller } = createController({
+    documentObj: doc,
+    splashImageUrl: '/game/xbs_splash.png',
+  });
+
+  const root = controller.getState().root;
+  const media = root.querySelector('.pg6-splash__media');
+  const img = root.querySelector('.pg6-splash__img');
+  const fallback = root.querySelector('.pg6-splash__fallback');
+  const spinner = root.querySelector('.pg6-splash__spinner');
+  const gregSpinner = root.querySelector('.pg6-splash__greg');
+
+  // 1) Initial mount uses Greg backdrop and keeps Spinning Greg in the bottom Astryx card.
+  const initial = controller.getState();
+  assert.equal(initial.gregMode, true);
+  assert.equal(initial.gregBackdropActive, true);
+  assert.equal(initial.splashImageUrl, '/game/xbs_splash.png');
+  assert.equal(initial.activeSplashImageUrl, './assets/greg.png');
+  assert.equal(initial.usingFallback, false);
+  assert.equal(controller.getStats().gregBackdropActive, true);
+  assert.equal(root.getAttribute('data-greg-backdrop'), 'true');
+  assert.equal(media.classList.contains('pg6-splash__media--greg'), true);
+  assert.equal(media.getAttribute('data-greg-backdrop'), 'true');
+  assert.equal(img.getAttribute('src'), './assets/greg.png');
+  assert.equal(img.getAttribute('alt'), 'Greg');
+  assert.equal(img.getAttribute('data-greg-backdrop'), 'true');
+  assert.equal(img.classList.contains('pg6-splash__img--greg'), true);
+  assert.equal(img.style.objectFit, 'contain');
+  assert.equal(img.hidden, false);
+  assert.equal(fallback.hidden, true);
+  assert.equal(spinner.classList.contains('pg6-splash__spinner--greg'), true);
+  assert.equal(gregSpinner.hidden, false);
+  assert.equal(gregSpinner.getAttribute('src'), './assets/greg.png');
+
+  // 2) Calling setSplashImageUrl() / setSplashImage() later stores original URL but keeps Greg backdrop active.
+  const afterSet = controller.setSplashImageUrl('/game/Assets/xbs_splash.png');
+  assert.equal(afterSet.splashImageUrl, '/game/Assets/xbs_splash.png');
+  assert.equal(afterSet.activeSplashImageUrl, './assets/greg.png');
+  assert.equal(afterSet.gregBackdropActive, true);
+  assert.equal(img.getAttribute('src'), './assets/greg.png');
+  assert.equal(img.style.objectFit, 'contain');
+  assert.equal(img.classList.contains('pg6-splash__img--greg'), true);
+
+  // 3) Verify SHARED_CSS and web/ui/overlay.css style the centered Greg backdrop on a dark #0b0c10 vignette.
+  const styleEl = doc.head.children.find((el) => el.getAttribute('data-pg6-splash-style') === '1');
+  assert.ok(styleEl);
+  assert.match(styleEl.textContent, /\.pg6-splash\[data-greg-backdrop="true"\]\{background:#0b0c10;\}/);
+  assert.match(styleEl.textContent, /\.pg6-splash__media--greg\{[^}]*radial-gradient\([^}]*#0b0c10/);
+  assert.match(
+    styleEl.textContent,
+    /\.pg6-splash__img\.pg6-splash__img--greg\{[^}]*width:min\(340px,46vmin\)[^}]*max-width:70vw;max-height:55vh;object-fit:contain;/
+  );
+
+  const overlayCss = fs.readFileSync(path.join(REPO_ROOT, 'web', 'ui', 'overlay.css'), 'utf8');
+  assert.match(overlayCss, /#splash-overlay-root\s+\.pg6-splash\[data-greg-backdrop="true"\][\s\S]*#0b0c10/);
+  assert.match(overlayCss, /#splash-overlay-root\s+\.pg6-splash__media--greg[\s\S]*radial-gradient/);
+  assert.match(
+    overlayCss,
+    /#splash-overlay-root\s+\.pg6-splash__img\.pg6-splash__img--greg[\s\S]*width:\s*min\(340px,\s*46vmin\)[\s\S]*max-width:\s*70vw;[\s\S]*max-height:\s*55vh;[\s\S]*object-fit:\s*contain;/
+  );
+
+  controller.destroy();
+});
+
+test('opting out via ?greg=0 or gregMode: false renders original /game/xbs_splash.png with object-fit: cover', () => {
+  // 1) Opt-out via ?greg=0 query string.
+  const viaQuery = createController({
+    locationSearch: '?greg=0',
+    splashImageUrl: null,
+  });
+  const qRoot = viaQuery.controller.getState().root;
+  const qImg = qRoot.querySelector('.pg6-splash__img');
+  const qMedia = qRoot.querySelector('.pg6-splash__media');
+  const qFallback = qRoot.querySelector('.pg6-splash__fallback');
+
+  assert.equal(viaQuery.controller.getState().gregMode, false);
+  assert.equal(viaQuery.controller.getState().gregBackdropActive, false);
+  assert.equal(viaQuery.controller.getState().usingFallback, true);
+  assert.equal(qImg.hidden, true);
+  assert.equal(qFallback.hidden, false);
+
+  viaQuery.controller.setSplashImageUrl('/game/xbs_splash.png');
+  assert.equal(viaQuery.controller.getState().splashImageUrl, '/game/xbs_splash.png');
+  assert.equal(viaQuery.controller.getState().activeSplashImageUrl, '/game/xbs_splash.png');
+  assert.equal(viaQuery.controller.getState().gregBackdropActive, false);
+  assert.equal(viaQuery.controller.getState().usingFallback, false);
+  assert.equal(qRoot.getAttribute('data-greg-backdrop'), 'false');
+  assert.equal(qMedia.classList.contains('pg6-splash__media--greg'), false);
+  assert.equal(qImg.getAttribute('src'), '/game/xbs_splash.png');
+  assert.equal(qImg.getAttribute('alt'), 'Local splash');
+  assert.equal(qImg.classList.contains('pg6-splash__img--greg'), false);
+  assert.equal(qImg.style.objectFit, 'cover');
+  assert.equal(qImg.hidden, false);
+  assert.equal(qFallback.hidden, true);
+  viaQuery.controller.destroy();
+
+  // 2) Opt-out via constructor gregMode: false.
+  const viaOpt = createController({
+    gregMode: false,
+    splashImageUrl: '/game/xbs_splash.png',
+  });
+  const oRoot = viaOpt.controller.getState().root;
+  const oImg = oRoot.querySelector('.pg6-splash__img');
+  assert.equal(viaOpt.controller.getState().gregBackdropActive, false);
+  assert.equal(oImg.getAttribute('src'), '/game/xbs_splash.png');
+  assert.equal(oImg.style.objectFit, 'cover');
+  assert.equal(oImg.classList.contains('pg6-splash__img--greg'), false);
+  viaOpt.controller.destroy();
+});
+
+test('toggling Greg mode switches cleanly between Greg backdrop and original splash URL or SVG fallback', () => {
+  const { controller, documentObj } = createController({ splashImageUrl: null });
+  const root = controller.getState().root;
+  const media = root.querySelector('.pg6-splash__media');
+  const img = root.querySelector('.pg6-splash__img');
+  const fallback = root.querySelector('.pg6-splash__fallback');
+  const spinner = root.querySelector('.pg6-splash__spinner');
+
+  // Late discovery of /game/xbs_splash.png while Greg mode is ON.
+  controller.setSplashImageUrl('/game/xbs_splash.png');
+  assert.equal(img.getAttribute('src'), './assets/greg.png');
+  assert.equal(img.style.objectFit, 'contain');
+  assert.equal(controller.getState().gregBackdropActive, true);
+
+  // 3x click toggles Greg OFF -> immediately restores /game/xbs_splash.png with cover fit.
+  spinner.dispatch('click');
+  spinner.dispatch('click');
+  spinner.dispatch('click');
+  assert.equal(controller.getState().gregMode, false);
+  assert.equal(controller.getState().gregBackdropActive, false);
+  assert.equal(controller.getState().activeSplashImageUrl, '/game/xbs_splash.png');
+  assert.equal(img.getAttribute('src'), '/game/xbs_splash.png');
+  assert.equal(img.style.objectFit, 'cover');
+  assert.equal(img.classList.contains('pg6-splash__img--greg'), false);
+  assert.equal(media.classList.contains('pg6-splash__media--greg'), false);
+  assert.equal(root.getAttribute('data-greg-backdrop'), 'false');
+  assert.equal(img.hidden, false);
+  assert.equal(fallback.hidden, true);
+
+  // Typing "greg" toggles Greg back ON -> restores centered Greg backdrop.
+  for (const ch of 'greg') {
+    documentObj.dispatch('keydown', { key: ch });
+  }
+  assert.equal(controller.getState().gregMode, true);
+  assert.equal(controller.getState().gregBackdropActive, true);
+  assert.equal(controller.getState().activeSplashImageUrl, './assets/greg.png');
+  assert.equal(img.getAttribute('src'), './assets/greg.png');
+  assert.equal(img.style.objectFit, 'contain');
+  assert.equal(img.classList.contains('pg6-splash__img--greg'), true);
+  assert.equal(media.classList.contains('pg6-splash__media--greg'), true);
+  assert.equal(root.getAttribute('data-greg-backdrop'), 'true');
+
+  // Clearing original splashImageUrl and toggling Greg OFF falls back cleanly to built-in SVG.
+  controller.setSplashImageUrl(null);
+  assert.equal(img.getAttribute('src'), './assets/greg.png');
+  controller.setGregMode(false);
+  assert.equal(controller.getState().gregBackdropActive, false);
+  assert.equal(controller.getState().usingFallback, true);
+  assert.equal(controller.getState().activeSplashImageUrl, null);
+  assert.equal(img.hidden, true);
+  assert.equal(fallback.hidden, false);
+
+  // Toggling back ON brings Greg backdrop back.
+  controller.toggleGregMode();
+  assert.equal(controller.getState().gregBackdropActive, true);
+  assert.equal(controller.getState().usingFallback, false);
+  assert.equal(img.hidden, false);
+  assert.equal(img.getAttribute('src'), './assets/greg.png');
+  assert.equal(fallback.hidden, true);
+  controller.destroy();
+});
+
+test('Greg backdrop degrades gracefully when ./assets/greg.png fails to load', () => {
+  // 1) With a stored original splashImageUrl, Greg load error falls back to /game/xbs_splash.png,
+  //    and a second error falls back to built-in CSS/SVG.
+  const withOriginal = createController({ splashImageUrl: '/game/xbs_splash.png' });
+  const wRoot = withOriginal.controller.getState().root;
+  const wImg = wRoot.querySelector('.pg6-splash__img');
+  const wMedia = wRoot.querySelector('.pg6-splash__media');
+  const wFallback = wRoot.querySelector('.pg6-splash__fallback');
+
+  assert.equal(wImg.getAttribute('src'), './assets/greg.png');
+  assert.doesNotThrow(() => wImg.dispatch('error'));
+
+  let state = withOriginal.controller.getState();
+  assert.equal(state.gregBackdropFailed, true);
+  assert.equal(state.gregBackdropActive, false);
+  assert.equal(state.imageFailed, false);
+  assert.equal(state.usingFallback, false);
+  assert.equal(state.activeSplashImageUrl, '/game/xbs_splash.png');
+  assert.equal(wImg.getAttribute('src'), '/game/xbs_splash.png');
+  assert.equal(wImg.style.objectFit, 'cover');
+  assert.equal(wImg.classList.contains('pg6-splash__img--greg'), false);
+  assert.equal(wMedia.classList.contains('pg6-splash__media--greg'), false);
+  assert.equal(wImg.hidden, false);
+  assert.equal(wFallback.hidden, true);
+
+  // If the fallback /game/xbs_splash.png also fails, degrade cleanly to built-in SVG.
+  assert.doesNotThrow(() => wImg.dispatch('error'));
+  state = withOriginal.controller.getState();
+  assert.equal(state.imageFailed, true);
+  assert.equal(state.usingFallback, true);
+  assert.equal(state.activeSplashImageUrl, null);
+  assert.equal(wImg.hidden, true);
+  assert.equal(wFallback.hidden, false);
+  withOriginal.controller.destroy();
+
+  // 2) Without a stored original splashImageUrl, Greg load error falls back immediately to SVG.
+  const withoutOriginal = createController({ splashImageUrl: null });
+  const nRoot = withoutOriginal.controller.getState().root;
+  const nImg = nRoot.querySelector('.pg6-splash__img');
+  const nFallback = nRoot.querySelector('.pg6-splash__fallback');
+
+  assert.equal(nImg.getAttribute('src'), './assets/greg.png');
+  assert.doesNotThrow(() => nImg.dispatch('error'));
+  const nState = withoutOriginal.controller.getState();
+  assert.equal(nState.gregBackdropFailed, true);
+  assert.equal(nState.gregBackdropActive, false);
+  assert.equal(nState.usingFallback, true);
+  assert.equal(nImg.hidden, true);
+  assert.equal(nFallback.hidden, false);
+  withoutOriginal.controller.destroy();
 });

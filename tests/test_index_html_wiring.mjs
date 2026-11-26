@@ -1104,3 +1104,16 @@ test('W63 web/index.html inline detectWasm64 probes spec-standard address: i64 f
   assert.equal(runInlineDetectWasm64(undefined), false);
   assert.equal(runInlineDetectWasm64({}), false);
 });
+
+test('W343 web/index.html enables defaultHoldUntilVisible and throttles per-frame WebGPU frame presented logs', () => {
+  const moduleScript = extractModuleScript(indexHtml);
+
+  // 1. defaultHoldUntilVisible: true is passed to bootstrapPlayGta6App so splash holds until first visible frame.
+  assert.match(moduleScript, /bootstrapPlayGta6App\(\{[\s\S]*defaultHoldUntilVisible:\s*true/);
+
+  // 2. appendLog guards against per-frame "WebGPU frame #N presented" DOM spam while keeping #metric-frames live.
+  assert.match(moduleScript, /WEBGPU_FRAME_LOG_RE/);
+  assert.match(moduleScript, /WEBGPU_FRAME_LOG_MILESTONES/);
+  assert.match(moduleScript, /WEBGPU_FRAME_LOG_INTERVAL_FRAMES/);
+  assert.match(moduleScript, /setValue\(metricEls\.frames,\s*String\(frameNum\)\)/);
+});

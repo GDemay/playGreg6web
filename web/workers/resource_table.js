@@ -17,6 +17,7 @@
 
   const BUFFER_ALIGNMENT_BYTES = 4;
   const UNIFORM_BUFFER_MIN_BYTES = 16;
+  const DEFAULT_MAX_WRITE_CHUNK_BYTES = 4 * 1024 * 1024; // 4 MiB cap per queue.writeBuffer (W352)
   const DEFAULT_FAST_SLOT_CAPACITY = 1024;
   const DEFAULT_MAX_BIND_GROUPS = 4096;
   const DEFAULT_FAST_BIND_GROUP_BUCKETS = 512;
@@ -383,6 +384,49 @@
 
   // GpuTextureDimension enum names (runtime/abi/playgta6_abi.h).
   const TEXTURE_DIMENSION_NAMES = Object.freeze(['1d', '2d', '3d']);
+
+  // Valid GPUTextureViewDimension values per GPUTextureDimension per WebGPU spec.
+  const VALID_VIEW_DIMENSIONS_BY_TEXTURE_DIMENSION = Object.freeze({
+    '1d': new Set(['1d']),
+    '2d': new Set(['2d', '2d-array', 'cube', 'cube-array']),
+    '3d': new Set(['3d']),
+  });
+
+  /**
+   * Check whether a requested `GPUTextureViewDimension` is valid for a
+   * `GPUTexture` of the given `GPUTextureDimension` per WebGPU validation rules:
+   * - `'1d'` texture -> `'1d'` only
+   * - `'2d'` texture -> `'2d'`, `'2d-array'`, `'cube'`, `'cube-array'`
+   * - `'3d'` texture -> `'3d'` only
+   *
+   * When `viewDimension` is `undefined` or `null`, returns `true` (WebGPU picks
+   * the texture's default compatible view dimension).
+   *
+   * @param {string | number | null | undefined} textureDimension
+   * @param {string | null | undefined} viewDimension
+   * @returns {boolean}
+   */
+  function isViewDimensionCompatible(textureDimension, viewDimension) {
+    if (viewDimension === undefined || viewDimension === null) {
+      return true;
+    }
+    if (typeof viewDimension !== 'string') {
+      return false;
+    }
+    let texDim;
+    if (typeof textureDimension === 'string') {
+      texDim = textureDimension.toLowerCase();
+    } else if (typeof textureDimension === 'number' && Number.isInteger(textureDimension)) {
+      texDim = TEXTURE_DIMENSION_NAMES[textureDimension];
+    } else {
+      return false;
+    }
+    const allowed = VALID_VIEW_DIMENSIONS_BY_TEXTURE_DIMENSION[texDim];
+    if (!allowed) {
+      return false;
+    }
+    return allowed.has(viewDimension.toLowerCase());
+  }
 
   // All WebGPU BC1..BC7 4x4 block-compressed texture formats.
   const BC_TEXTURE_FORMATS = Object.freeze([
@@ -841,7 +885,7 @@
    *
    * @param {object} rawDescriptor
    * @param {object | null | undefined} [device]
-   * @param {{ useV1FormatTable?: boolean }} [options]
+   * @param {{ useV1FormatTable?: boolean, promote1DTo2D?: boolean }} [options]
    * @returns {{
    *   descriptor: object,
    *   originalFormat: string,
@@ -850,6 +894,7 @@
    *   bcDimensionAligned: boolean,
    *   mipClamped: boolean,
    *   sampleClamped: boolean,
+   *   promoted1DTo2D: boolean,
    * }}
    */
   function sanitizeTextureDescriptor(rawDescriptor, device, options = {}) {
@@ -857,10 +902,12 @@
       throw new TypeError('sanitizeTextureDescriptor expects a descriptor object');
     }
 
-    const dimension = resolveTextureDimension(rawDescriptor.dimension);
+    const rawDimension = resolveTextureDimension(rawDescriptor.dimension);
+    const promoted1DTo2D = rawDimension === '1d' && Boolean(options && options.promote1DTo2D);
+    const dimension = promoted1DTo2D ? '2d' : rawDimension;
     const originalFormat = resolveTextureFormat(
       rawDescriptor.format,
-      Boolean(options.useV1FormatTable)
+      Boolean(options && options.useV1FormatTable)
     );
     const usage =
       rawDescriptor.usage !== undefined
@@ -869,7 +916,7 @@
           ? Number(rawDescriptor.usageFlags) >>> 0
           : GPU_TEXTURE_USAGE.TEXTURE_BINDING | GPU_TEXTURE_USAGE.COPY_DST;
 
-    let { width, height, depthOrArrayLayers } = extractTextureSize(rawDescriptor, dimension);
+    let { width, height, depthOrArrayLayers } = extractTextureSize(rawDescriptor, rawDimension);
 
     let effectiveFormat = originalFormat;
     let bcFormatFallback = false;
@@ -962,6 +1009,7 @@
       bcDimensionAligned,
       mipClamped: mipResult.clamped,
       sampleClamped: sampleResult.clamped,
+      promoted1DTo2D,
     };
   }
 
@@ -980,6 +1028,8 @@
      *   onWarning?: ((event: { kind: string, id: number, detail: string }) => void) | null,
      *   fastSlotCapacity?: number,
      *   maxBindGroups?: number,
+     *   deferDestroys?: boolean,
+     *   promote1DTo2D?: boolean,
      * }} [options]
      */
     constructor(device, options = {}) {
@@ -993,6 +1043,41 @@
       this.device = device;
       this.resourceRegistry = options.resourceRegistry || options.registry || null;
       this._onWarning = typeof options.onWarning === 'function' ? options.onWarning : null;
+
+      // Mid-frame deferred destruction state (W340 / #1459) & W352 destroy/chunk telemetry.
+      // Defaults to false so synchronous destroys outside a frame stay 100% backwards compatible.
+      this._deferDestroys = Boolean(options.deferDestroys);
+      this._inFrame = false;
+      this._suppressDeferDestroys = false;
+      /** @type {Array<object>} */
+      this._deferredDestroys = [];
+      /** @type {Array<string>} */
+      this._deferredDestroyKinds = [];
+      /** @type {Set<{ items: Array<object>, kinds: Array<string> }>} */
+      this._inFlightDeferredBatches = new Set();
+      this._deferredDestroyCount = 0;
+      this._destroyedObjects = typeof WeakSet === 'function' ? new WeakSet() : null;
+      this._destroyedBuffers = 0;
+      this._destroyedTextures = 0;
+
+      // W352: Bounded chunk size for queue.writeBuffer to prevent Dawn upload ring spikes.
+      const rawMaxWriteChunk =
+        options.maxWriteChunkBytes !== undefined
+          ? options.maxWriteChunkBytes
+          : DEFAULT_MAX_WRITE_CHUNK_BYTES;
+      if (!Number.isInteger(rawMaxWriteChunk) || rawMaxWriteChunk < BUFFER_ALIGNMENT_BYTES) {
+        throw new RangeError(
+          `ResourceTable maxWriteChunkBytes must be an integer >= ${BUFFER_ALIGNMENT_BYTES}, got ${rawMaxWriteChunk}`
+        );
+      }
+      this._maxWriteChunkBytes = Math.ceil(rawMaxWriteChunk / BUFFER_ALIGNMENT_BYTES) * BUFFER_ALIGNMENT_BYTES;
+      this._writeScratch = null;
+      this._chunkedWrites = 0;
+
+      // Optional 1D -> 2D (width x 1) promotion and view dimension guard telemetry (W340 / #1459).
+      this._promote1DTo2D = Boolean(options.promote1DTo2D);
+      this._promoted1DTo2DCount = 0;
+      this._viewDimensionGuardCount = 0;
 
       /** @type {Map<number, object>} */
       this.buffers = new Map();
@@ -1524,9 +1609,28 @@
       return buffer;
     }
 
+    _acquireWriteScratch(requiredBytes) {
+      if (requiredBytes <= 0) {
+        return null;
+      }
+      if (this._writeScratch && this._writeScratch.byteLength >= requiredBytes) {
+        return this._writeScratch;
+      }
+      if (requiredBytes > this._maxWriteChunkBytes) {
+        return null;
+      }
+      const allocBytes = this._writeScratch
+        ? Math.min(this._maxWriteChunkBytes, Math.max(requiredBytes, this._writeScratch.byteLength * 2))
+        : requiredBytes;
+      this._writeScratch = new Uint8Array(allocBytes);
+      return this._writeScratch;
+    }
+
     /**
      * Upload bytes to a tracked buffer (or direct GPUBuffer), automatically
-     * padding non-4-byte-aligned payloads into a zero-padded 4-byte-aligned copy.
+     * padding non-4-byte-aligned payloads into a zero-padded 4-byte-aligned copy
+     * and chunking large uploads (> `maxWriteChunkBytes`, default 4 MiB) so Dawn's
+     * internal upload ring never spikes to multi-GB.
      *
      * @param {number | object} idOrBuffer
      * @param {number} bufferOffset
@@ -1552,23 +1656,317 @@
       }
 
       const dstOffset = Math.max(0, Math.floor(Number(bufferOffset) || 0));
-      const upload = padBufferUploadData(data, dataOffset, size);
-      if (upload.alignedByteLength === 0) {
+
+      let byteView;
+      if (data instanceof Uint8Array) {
+        const start = dataOffset !== undefined ? Math.max(0, Math.floor(dataOffset)) : 0;
+        const maxLen = Math.max(0, data.byteLength - start);
+        const len = size !== undefined ? Math.min(maxLen, Math.max(0, Math.floor(size))) : maxLen;
+        byteView = data.subarray(start, start + len);
+      } else if (ArrayBuffer.isView(data)) {
+        const elemSize = data.BYTES_PER_ELEMENT || 1;
+        const startBytes =
+          dataOffset !== undefined ? Math.max(0, Math.floor(dataOffset) * elemSize) : 0;
+        const maxBytes = Math.max(0, data.byteLength - startBytes);
+        const lenBytes =
+          size !== undefined
+            ? Math.min(maxBytes, Math.max(0, Math.floor(size) * elemSize))
+            : maxBytes;
+        byteView = new Uint8Array(data.buffer, data.byteOffset + startBytes, lenBytes);
+      } else if (
+        data instanceof ArrayBuffer ||
+        (typeof SharedArrayBuffer !== 'undefined' && data instanceof SharedArrayBuffer)
+      ) {
+        const startBytes = dataOffset !== undefined ? Math.max(0, Math.floor(dataOffset)) : 0;
+        const maxBytes = Math.max(0, data.byteLength - startBytes);
+        const lenBytes =
+          size !== undefined ? Math.min(maxBytes, Math.max(0, Math.floor(size))) : maxBytes;
+        byteView = new Uint8Array(data, startBytes, lenBytes);
+      } else {
+        throw new TypeError('writeBuffer data must be an ArrayBufferView or ArrayBuffer');
+      }
+
+      const originalByteLength = byteView.byteLength;
+      if (originalByteLength === 0) {
         return true;
       }
 
-      if (upload.padded) {
+      const remainder = originalByteLength % BUFFER_ALIGNMENT_BYTES;
+      const padded = remainder !== 0;
+      const alignedByteLength = padded
+        ? originalByteLength + (BUFFER_ALIGNMENT_BYTES - remainder)
+        : originalByteLength;
+      const isShared =
+        typeof SharedArrayBuffer !== 'undefined' && byteView.buffer instanceof SharedArrayBuffer;
+
+      if (padded) {
         this._bufferAlignPadCount += 1;
         this._warn(
           'buffer_write_pad',
           resourceId,
-          `padded writeBuffer ${upload.originalByteLength} -> ${upload.alignedByteLength} bytes`
+          `padded writeBuffer ${originalByteLength} -> ${alignedByteLength} bytes`
         );
       }
 
-      this.device.queue.writeBuffer(buffer, dstOffset, upload.bytes);
+      const chunkMax = this._maxWriteChunkBytes;
+      if (alignedByteLength <= chunkMax) {
+        if (!padded && !isShared) {
+          this.device.queue.writeBuffer(buffer, dstOffset, byteView);
+        } else {
+          const scratch = this._acquireWriteScratch(alignedByteLength);
+          const dst = scratch
+            ? scratch.byteLength === alignedByteLength
+              ? scratch
+              : scratch.subarray(0, alignedByteLength)
+            : new Uint8Array(alignedByteLength);
+          dst.set(byteView, 0);
+          if (padded) {
+            dst.fill(0, originalByteLength, alignedByteLength);
+          }
+          this.device.queue.writeBuffer(buffer, dstOffset, dst);
+        }
+      } else {
+        for (let off = 0; off < originalByteLength; off += chunkMax) {
+          const rawLen = Math.min(chunkMax, originalByteLength - off);
+          const chunkRem = rawLen % BUFFER_ALIGNMENT_BYTES;
+          const chunkAlignedLen =
+            chunkRem === 0 ? rawLen : rawLen + (BUFFER_ALIGNMENT_BYTES - chunkRem);
+          const srcSlice = byteView.subarray(off, off + rawLen);
+          if (!isShared && chunkRem === 0) {
+            this.device.queue.writeBuffer(buffer, dstOffset + off, srcSlice);
+          } else {
+            const scratch = this._acquireWriteScratch(chunkAlignedLen);
+            const dst = scratch
+              ? scratch.byteLength === chunkAlignedLen
+                ? scratch
+                : scratch.subarray(0, chunkAlignedLen)
+              : new Uint8Array(chunkAlignedLen);
+            dst.set(srcSlice, 0);
+            if (chunkRem !== 0) {
+              dst.fill(0, rawLen, chunkAlignedLen);
+            }
+            this.device.queue.writeBuffer(buffer, dstOffset + off, dst);
+          }
+        }
+        this._chunkedWrites += 1;
+      }
+
       this._bufferWrites += 1;
       return true;
+    }
+
+    /**
+     * Mark the start of a GPU frame. While a frame is active (or whenever the
+     * table was constructed with `{ deferDestroys: true }`), buffer/texture
+     * destroys and handle overwrites enqueue the old GPU resources into
+     * `this._deferredDestroys` instead of calling `.destroy()` synchronously.
+     *
+     * @returns {boolean}
+     */
+    beginFrame() {
+      this._inFrame = true;
+      return true;
+    }
+
+    _destroySingleResourceNow(resource, kind) {
+      if (!resource || typeof resource.destroy !== 'function') {
+        return false;
+      }
+      if (this._destroyedObjects !== null && this._destroyedObjects.has(resource)) {
+        return false;
+      }
+      if (this._destroyedObjects !== null) {
+        this._destroyedObjects.add(resource);
+      }
+      try {
+        resource.destroy();
+      } catch (_err) {
+        // Ignore errors from already-destroyed or lost WebGPU resources.
+      }
+      if (kind === 'buffer') {
+        this._destroyedBuffers += 1;
+      } else if (kind === 'texture') {
+        this._destroyedTextures += 1;
+      }
+      return true;
+    }
+
+    _destroyBatchNow(batch) {
+      if (!batch || !batch.items || batch.items.length === 0) {
+        return 0;
+      }
+      const items = batch.items.splice(0, batch.items.length);
+      const kinds = batch.kinds ? batch.kinds.splice(0, batch.kinds.length) : null;
+      let destroyed = 0;
+      for (let i = 0; i < items.length; i += 1) {
+        const res = items[i];
+        const kind = kinds ? kinds[i] : '';
+        if (this._destroySingleResourceNow(res, kind)) {
+          destroyed += 1;
+        }
+      }
+      return destroyed;
+    }
+
+    _destroyOrDefer(resource, kind = '') {
+      if (!resource || typeof resource.destroy !== 'function') {
+        return false;
+      }
+      if (this._destroyedObjects !== null && this._destroyedObjects.has(resource)) {
+        return false;
+      }
+      if (!this._suppressDeferDestroys && (this._inFrame || this._deferDestroys)) {
+        this._deferredDestroys.push(resource);
+        this._deferredDestroyKinds.push(kind);
+        this._deferredDestroyCount += 1;
+        return false;
+      }
+      return this._destroySingleResourceNow(resource, kind);
+    }
+
+    _getPendingDeferredDestroyCount() {
+      let pending = this._deferredDestroys.length;
+      if (this._inFlightDeferredBatches.size > 0) {
+        for (const batch of this._inFlightDeferredBatches) {
+          pending += batch.items.length;
+        }
+      }
+      return pending;
+    }
+
+    /**
+     * End the active GPU frame and schedule destruction of resources deferred
+     * during the frame.
+     *
+     * Snapshots and clears the current frame's deferred-destroy list. When
+     * `queue && typeof queue.onSubmittedWorkDone === 'function'`, each queued
+     * resource is destroyed after `queue.onSubmittedWorkDone()` settles (with
+     * `.catch(() => {})` safety). Otherwise the snapshotted batch is destroyed
+     * synchronously.
+     *
+     * @param {object | null | undefined} [queue]
+     * @returns {number | Promise<number>}
+     */
+    endFrame(queue) {
+      this._inFrame = false;
+      if (this._deferredDestroys.length === 0) {
+        return 0;
+      }
+      const batch = {
+        items: this._deferredDestroys,
+        kinds: this._deferredDestroyKinds,
+      };
+      this._deferredDestroys = [];
+      this._deferredDestroyKinds = [];
+
+      if (queue && typeof queue.onSubmittedWorkDone === 'function') {
+        let workPromise;
+        try {
+          workPromise = queue.onSubmittedWorkDone();
+        } catch (_err) {
+          return this._destroyBatchNow(batch);
+        }
+        if (workPromise && typeof workPromise.then === 'function') {
+          this._inFlightDeferredBatches.add(batch);
+          const finalize = () => {
+            this._inFlightDeferredBatches.delete(batch);
+            return this._destroyBatchNow(batch);
+          };
+          return workPromise.then(finalize, finalize).catch(() => 0);
+        }
+      }
+      return this._destroyBatchNow(batch);
+    }
+
+    /**
+     * Synchronously drain and destroy every queued and in-flight deferred GPU
+     * resource. Safe to call multiple times or while `onSubmittedWorkDone()`
+     * promises are still pending (no resource is ever double-destroyed).
+     *
+     * @returns {number} Number of deferred GPU resources destroyed.
+     */
+    flushDeferredDestroys() {
+      let destroyed = 0;
+      if (this._deferredDestroys.length > 0) {
+        const batch = {
+          items: this._deferredDestroys,
+          kinds: this._deferredDestroyKinds,
+        };
+        this._deferredDestroys = [];
+        this._deferredDestroyKinds = [];
+        destroyed += this._destroyBatchNow(batch);
+      }
+      if (this._inFlightDeferredBatches.size > 0) {
+        const batches = Array.from(this._inFlightDeferredBatches);
+        this._inFlightDeferredBatches.clear();
+        for (let i = 0; i < batches.length; i += 1) {
+          destroyed += this._destroyBatchNow(batches[i]);
+        }
+      }
+      return destroyed;
+    }
+
+    /**
+     * Check whether `viewDimension` is valid for a texture of `textureDimension`.
+     *
+     * @param {string | number | null | undefined} textureDimension
+     * @param {string | null | undefined} viewDimension
+     * @returns {boolean}
+     */
+    isViewDimensionCompatible(textureDimension, viewDimension) {
+      return isViewDimensionCompatible(textureDimension, viewDimension);
+    }
+
+    _resolveActualTextureDimension(texture, textureId) {
+      if (texture && typeof texture.dimension === 'string') {
+        const d = texture.dimension.toLowerCase();
+        if (d === '1d' || d === '2d' || d === '3d') {
+          return d;
+        }
+      }
+      if (texture && texture.desc && typeof texture.desc.dimension === 'string') {
+        const d = texture.desc.dimension.toLowerCase();
+        if (d === '1d' || d === '2d' || d === '3d') {
+          return d;
+        }
+      }
+      if (textureId !== undefined && textureId !== null) {
+        const meta = this._textureMeta.get(textureId);
+        if (meta && typeof meta.dimension === 'string') {
+          return meta.dimension;
+        }
+      }
+      return '2d';
+    }
+
+    _sanitizeViewDescriptorForTexture(texture, viewDesc, textureId) {
+      const textureDimension = this._resolveActualTextureDimension(texture, textureId);
+      if (viewDesc === undefined || viewDesc === null || typeof viewDesc !== 'object') {
+        return { viewDesc, adjusted: false, textureDimension };
+      }
+      const requestedDim = viewDesc.dimension;
+      if (requestedDim === undefined || requestedDim === null) {
+        return { viewDesc, adjusted: false, textureDimension };
+      }
+      if (isViewDimensionCompatible(textureDimension, requestedDim)) {
+        return { viewDesc, adjusted: false, textureDimension };
+      }
+      const safeDesc = { ...viewDesc, dimension: textureDimension };
+      if (textureDimension === '1d') {
+        if (safeDesc.baseArrayLayer !== undefined && safeDesc.baseArrayLayer > 0) {
+          safeDesc.baseArrayLayer = 0;
+        }
+        if (safeDesc.arrayLayerCount !== undefined && safeDesc.arrayLayerCount > 1) {
+          safeDesc.arrayLayerCount = 1;
+        }
+      }
+      this._viewDimensionGuardCount += 1;
+      this._warn(
+        'texture_view_dimension_guard',
+        typeof textureId === 'number' ? textureId : -1,
+        `adjusted incompatible view dimension ${String(requestedDim)} -> ${textureDimension} for ${textureDimension} texture`
+      );
+      return { viewDesc: safeDesc, adjusted: true, textureDimension };
     }
 
     /**
@@ -1577,13 +1975,27 @@
      *
      * @param {number} id
      * @param {object} descriptor
-     * @param {{ useV1FormatTable?: boolean, isTexture2?: boolean }} [options]
+     * @param {{ useV1FormatTable?: boolean, isTexture2?: boolean, promote1DTo2D?: boolean }} [options]
      * @returns {object} GPUTexture
      */
     createTexture(id, descriptor, options = {}) {
+      const promote1DTo2D =
+        options && options.promote1DTo2D !== undefined
+          ? Boolean(options.promote1DTo2D)
+          : this._promote1DTo2D;
       const sanitized = sanitizeTextureDescriptor(descriptor, this.device, {
-        useV1FormatTable: Boolean(options.useV1FormatTable),
+        useV1FormatTable: Boolean(options && options.useV1FormatTable),
+        promote1DTo2D,
       });
+
+      if (sanitized.promoted1DTo2D) {
+        this._promoted1DTo2DCount += 1;
+        this._warn(
+          'promote_1d_to_2d',
+          id,
+          `promoted 1d texture to 2d (${sanitized.descriptor.size.width}x1)`
+        );
+      }
 
       if (sanitized.bcFormatFallback) {
         this._bcFormatFallbackCount += 1;
@@ -1632,13 +2044,28 @@
         }
         throw err;
       }
+
+      let textureView = null;
+      if (texture && typeof texture.createView === 'function') {
+        try {
+          textureView = texture.createView();
+        } catch (err) {
+          // Ensure newly allocated GPUTexture is not leaked if createView() throws.
+          this._destroySingleResourceNow(texture, 'texture');
+          if (existed) {
+            this._totalDeletes += 1;
+            this._resourceVersions.texture.delete(id);
+            this._invalidateSlotsForResource('texture', id, 0);
+          }
+          throw err;
+        }
+      }
+
       this.textures.set(id, texture);
       const texGen = this._advanceResourceGeneration('texture', id, true);
       this._trackObjectOrigin(texture, 'texture', id, texGen);
 
-      let textureView = null;
-      if (texture && typeof texture.createView === 'function') {
-        textureView = texture.createView();
+      if (textureView) {
         this.textureViews.set(id, textureView);
         this._linkTextureViewParent(id, id);
         const viewGen = this._advanceResourceGeneration('textureView', id, true);
@@ -1666,6 +2093,7 @@
         bcDimensionAligned: sanitized.bcDimensionAligned,
         mipClamped: sanitized.mipClamped,
         sampleClamped: sanitized.sampleClamped,
+        promoted1DTo2D: sanitized.promoted1DTo2D,
       };
       this._textureMeta.set(id, meta);
 
@@ -1697,27 +2125,249 @@
     }
 
     /**
+     * Register or overwrite a tracked handle with an externally created
+     * `GPUTexture`. If `id` already holds a different texture, the previous
+     * texture is retired/deferred via `_destroyTextureInternal(id, false)`.
+     *
+     * @param {number} id
+     * @param {object} texture
+     * @param {{
+     *   view?: object | null,
+     *   viewDescriptor?: object,
+     *   createView?: boolean,
+     *   dimension?: string | number,
+     *   width?: number,
+     *   height?: number,
+     *   depthOrArrayLayers?: number,
+     *   mipLevelCount?: number,
+     *   sampleCount?: number,
+     *   format?: string,
+     *   usage?: number,
+     *   label?: string,
+     * }} [options]
+     * @returns {object} GPUTexture
+     */
+    setTexture(id, texture, options = {}) {
+      if (!texture || typeof texture !== 'object') {
+        throw new TypeError('ResourceTable setTexture requires a texture object');
+      }
+      const existing = this.textures.get(id);
+      if (existing === texture) {
+        return texture;
+      }
+
+      const opts = options && typeof options === 'object' ? options : {};
+      const existed = this.textures.has(id);
+      if (existed) {
+        this._destroyTextureInternal(id, false);
+      }
+
+      this.textures.set(id, texture);
+      const texGen = this._advanceResourceGeneration('texture', id, true);
+      this._trackObjectOrigin(texture, 'texture', id, texGen);
+
+      const rawDesc = texture.desc && typeof texture.desc === 'object' ? texture.desc : null;
+      const dimension = resolveTextureDimension(
+        opts.dimension !== undefined
+          ? opts.dimension
+          : texture.dimension !== undefined
+            ? texture.dimension
+            : rawDesc && rawDesc.dimension !== undefined
+              ? rawDesc.dimension
+              : '2d'
+      );
+
+      let textureView = null;
+      if (opts.view && typeof opts.view === 'object') {
+        textureView = opts.view;
+      } else if (opts.createView !== false && typeof texture.createView === 'function') {
+        if (opts.viewDescriptor !== undefined) {
+          const guarded = this._sanitizeViewDescriptorForTexture(texture, opts.viewDescriptor, id);
+          textureView =
+            guarded.viewDesc !== undefined
+              ? texture.createView(guarded.viewDesc)
+              : texture.createView();
+        } else {
+          textureView = texture.createView();
+        }
+      }
+
+      if (textureView) {
+        this.textureViews.set(id, textureView);
+        this._linkTextureViewParent(id, id);
+        const viewGen = this._advanceResourceGeneration('textureView', id, true);
+        this._trackObjectOrigin(textureView, 'textureView', id, viewGen, id, texGen);
+      } else {
+        this._unlinkTextureViewParent(id);
+        this._liveResourceGenerations.textureView.delete(id);
+      }
+
+      const rawSize = rawDesc && rawDesc.size && typeof rawDesc.size === 'object' ? rawDesc.size : null;
+      const width = Math.max(
+        1,
+        Math.floor(
+          Number(
+            opts.width !== undefined
+              ? opts.width
+              : texture.width !== undefined
+                ? texture.width
+                : rawSize && rawSize.width !== undefined
+                  ? rawSize.width
+                  : 1
+          ) || 1
+        )
+      );
+      const height =
+        dimension === '1d'
+          ? 1
+          : Math.max(
+              1,
+              Math.floor(
+                Number(
+                  opts.height !== undefined
+                    ? opts.height
+                    : texture.height !== undefined
+                      ? texture.height
+                      : rawSize && rawSize.height !== undefined
+                        ? rawSize.height
+                        : 1
+                ) || 1
+              )
+            );
+      const depthOrArrayLayers =
+        dimension === '1d'
+          ? 1
+          : Math.max(
+              1,
+              Math.floor(
+                Number(
+                  opts.depthOrArrayLayers !== undefined
+                    ? opts.depthOrArrayLayers
+                    : texture.depthOrArrayLayers !== undefined
+                      ? texture.depthOrArrayLayers
+                      : rawSize && rawSize.depthOrArrayLayers !== undefined
+                        ? rawSize.depthOrArrayLayers
+                        : 1
+                ) || 1
+              )
+            );
+      const format = resolveTextureFormat(
+        opts.format !== undefined
+          ? opts.format
+          : texture.format !== undefined
+            ? texture.format
+            : rawDesc && rawDesc.format !== undefined
+              ? rawDesc.format
+              : BC_FALLBACK_FORMAT
+      );
+      const usage =
+        opts.usage !== undefined
+          ? Number(opts.usage) >>> 0
+          : texture.usage !== undefined
+            ? Number(texture.usage) >>> 0
+            : rawDesc && rawDesc.usage !== undefined
+              ? Number(rawDesc.usage) >>> 0
+              : 0;
+
+      this._textureMeta.set(id, {
+        id,
+        width,
+        height,
+        depthOrArrayLayers,
+        mipLevelCount: Math.max(
+          1,
+          Math.floor(
+            Number(
+              opts.mipLevelCount !== undefined
+                ? opts.mipLevelCount
+                : texture.mipLevelCount !== undefined
+                  ? texture.mipLevelCount
+                  : rawDesc && rawDesc.mipLevelCount !== undefined
+                    ? rawDesc.mipLevelCount
+                    : 1
+            ) || 1
+          )
+        ),
+        sampleCount: Math.max(
+          1,
+          Math.floor(
+            Number(
+              opts.sampleCount !== undefined
+                ? opts.sampleCount
+                : texture.sampleCount !== undefined
+                  ? texture.sampleCount
+                  : rawDesc && rawDesc.sampleCount !== undefined
+                    ? rawDesc.sampleCount
+                    : 1
+            ) || 1
+          )
+        ),
+        dimension,
+        format,
+        originalFormat: format,
+        usage,
+        viewFormats: [],
+        bcFormatFallback: false,
+        bcDimensionAligned: false,
+        mipClamped: false,
+        sampleClamped: false,
+        promoted1DTo2D: false,
+      });
+
+      if (this.resourceRegistry && typeof this.resourceRegistry.register === 'function') {
+        const label = opts.label || texture.label || `texture:${id}`;
+        this.resourceRegistry.register('texture', id, texture, {
+          byteSize: 0,
+          label,
+        });
+        if (textureView) {
+          this.resourceRegistry.register('textureView', id, textureView, {
+            byteSize: 0,
+            label: `textureView:${id}`,
+          });
+        }
+      }
+
+      this._invalidateBindGroupsForBucketHandle('texture', id);
+      this._invalidateBindGroupsForBucketHandle('textureView', id);
+      const texResVer = this._bumpResourceVersion('texture', id);
+      this._invalidateSlotsForResource('texture', id, texResVer);
+
+      this._recordInsert(existed);
+      return texture;
+    }
+
+    /**
      * Create a texture using ABI v2 `CreateTexture2` metadata (opcode 35).
      * Accepts either:
-     * - `createTexture2(id, descriptor)` (structured descriptor with v2 format code/name)
-     * - `createTexture2(dataView, payloadOffset, payloadBytes)` (raw 40-byte payload)
+     * - `createTexture2(id, descriptor, options)` (structured descriptor with v2 format code/name)
+     * - `createTexture2(dataView, payloadOffset, payloadBytes, options)` (raw 40-byte payload)
      *
      * @param {number | DataView} idOrView
      * @param {object | number} [descriptorOrOffset]
-     * @param {number} [payloadBytes]
+     * @param {number | object} [payloadBytes]
+     * @param {object} [options]
      * @returns {object}
      */
-    createTexture2(idOrView, descriptorOrOffset, payloadBytes) {
+    createTexture2(idOrView, descriptorOrOffset, payloadBytes, options) {
       if (idOrView instanceof DataView) {
         return this.createTexture2FromPacket(
           idOrView,
           typeof descriptorOrOffset === 'number' ? descriptorOrOffset : 0,
-          payloadBytes
+          typeof payloadBytes === 'number' ? payloadBytes : undefined,
+          payloadBytes && typeof payloadBytes === 'object' ? payloadBytes : options
         );
       }
+      const opts =
+        payloadBytes && typeof payloadBytes === 'object'
+          ? payloadBytes
+          : options && typeof options === 'object'
+            ? options
+            : {};
       return this.createTexture(idOrView, descriptorOrOffset, {
         useV1FormatTable: false,
         isTexture2: true,
+        promote1DTo2D: opts.promote1DTo2D,
       });
     }
 
@@ -1728,19 +2378,22 @@
      * @param {DataView} view
      * @param {number} [payloadOffset=0]
      * @param {number} [payloadBytes]
+     * @param {{ promote1DTo2D?: boolean }} [options]
      * @returns {{ id: number, texture?: object, view?: object | null, meta?: object, error?: string }}
      */
-    createTexture2FromPacket(view, payloadOffset = 0, payloadBytes) {
+    createTexture2FromPacket(view, payloadOffset = 0, payloadBytes, options = {}) {
       const decoded = decodeCreateTexture2(view, payloadOffset, payloadBytes);
       if (decoded.error) {
         this._recordError(decoded.error);
         return { id: decoded.id, error: decoded.error };
       }
 
+      const opts = options && typeof options === 'object' ? options : {};
       try {
         const texture = this.createTexture(decoded.id, decoded.descriptor, {
           useV1FormatTable: false,
           isTexture2: true,
+          promote1DTo2D: opts.promote1DTo2D,
         });
         return {
           id: decoded.id,
@@ -1790,7 +2443,9 @@
         this._invalidateBindGroupsForBucketHandle('textureView', id);
       }
 
-      const view = viewDesc !== undefined ? texture.createView(viewDesc) : texture.createView();
+      const guarded = this._sanitizeViewDescriptorForTexture(texture, viewDesc, textureId);
+      const view =
+        guarded.viewDesc !== undefined ? texture.createView(guarded.viewDesc) : texture.createView();
       this.textureViews.set(id, view);
       this._linkTextureViewParent(id, textureId);
 
@@ -1938,10 +2593,10 @@
       if (this.resourceRegistry && typeof this.resourceRegistry.retire === 'function') {
         const retired = this.resourceRegistry.retire('buffer', id);
         if (!retired && typeof existing.destroy === 'function') {
-          existing.destroy();
+          this._destroyOrDefer(existing, 'buffer');
         }
       } else if (typeof existing.destroy === 'function') {
-        existing.destroy();
+        this._destroyOrDefer(existing, 'buffer');
       }
       this.buffers.delete(id);
       this._bufferMeta.delete(id);
@@ -1975,10 +2630,10 @@
         const retiredTex = this.resourceRegistry.retire('texture', id);
         this.resourceRegistry.retire('textureView', id);
         if (!retiredTex && typeof existing.destroy === 'function') {
-          existing.destroy();
+          this._destroyOrDefer(existing, 'texture');
         }
       } else if (typeof existing.destroy === 'function') {
-        existing.destroy();
+        this._destroyOrDefer(existing, 'texture');
       }
       const childViews = this._textureChildViews.get(id);
       const childViewIds = childViews ? Array.from(childViews) : [];
@@ -2651,7 +3306,8 @@
             viewDesc.arrayLayerCount = entry.arrayLayerCount;
           }
           if (entry.usage !== undefined) viewDesc.usage = entry.usage;
-          entry.cachedView = tex.createView(viewDesc);
+          const guarded = this._sanitizeViewDescriptorForTexture(tex, viewDesc, entry.handle);
+          entry.cachedView = tex.createView(guarded.viewDesc);
           const texGen = this._liveResourceGenerations.texture.get(entry.handle) || 0;
           this._trackObjectOrigin(entry.cachedView, 'texture', entry.handle, texGen);
           return entry.cachedView;
@@ -4455,20 +5111,29 @@
     }
 
     destroyAll() {
-      for (const id of Array.from(this.buffers.keys())) {
-        this.destroyBuffer(id);
-      }
-      for (const id of Array.from(this.textures.keys())) {
-        this.destroyTexture(id);
-      }
-      for (const id of Array.from(this.textureViews.keys())) {
-        this.destroyTextureView(id);
-      }
-      for (const id of Array.from(this.samplers.keys())) {
-        this.destroy(id);
-      }
-      for (const id of Array.from(this.shaderModules.keys())) {
-        this.destroy(id);
+      const prevSuppressDefer = this._suppressDeferDestroys;
+      this._suppressDeferDestroys = true;
+      this._inFrame = false;
+      try {
+        for (const id of Array.from(this.buffers.keys())) {
+          this.destroyBuffer(id);
+        }
+        for (const id of Array.from(this.textures.keys())) {
+          this.destroyTexture(id);
+        }
+        for (const id of Array.from(this.textureViews.keys())) {
+          this.destroyTextureView(id);
+        }
+        for (const id of Array.from(this.samplers.keys())) {
+          this.destroy(id);
+        }
+        for (const id of Array.from(this.shaderModules.keys())) {
+          this.destroy(id);
+        }
+        this.flushDeferredDestroys();
+        this._writeScratch = null;
+      } finally {
+        this._suppressDeferDestroys = prevSuppressDefer;
       }
     }
 
@@ -4522,6 +5187,14 @@
         samplersActive: this.samplers.size,
         shaderModulesActive: this.shaderModules.size,
         destroyCount: this._destroyCount,
+        destroyedBuffers: this._destroyedBuffers,
+        destroyedTextures: this._destroyedTextures,
+        chunkedWrites: this._chunkedWrites,
+        maxWriteChunkBytes: this._maxWriteChunkBytes,
+        deferredDestroyCount: this._deferredDestroyCount,
+        pendingDeferredDestroyCount: this._getPendingDeferredDestroyCount(),
+        viewDimensionGuardCount: this._viewDimensionGuardCount,
+        promoted1DTo2DCount: this._promoted1DTo2DCount,
         errors: this._errors,
         liveHandles: this._getLiveHandleCount(),
         peakLiveHandles: this._peakLiveHandles,
@@ -4560,6 +5233,12 @@
       this._shaderModulesCreated = 0;
       this._bufferWrites = 0;
       this._destroyCount = 0;
+      this._destroyedBuffers = 0;
+      this._destroyedTextures = 0;
+      this._chunkedWrites = 0;
+      this._deferredDestroyCount = 0;
+      this._viewDimensionGuardCount = 0;
+      this._promoted1DTo2DCount = 0;
       this._errors = 0;
       this._lastError = null;
       this._peakLiveHandles = this._getLiveHandleCount();
@@ -4580,6 +5259,8 @@
     }
   }
 
+  ResourceTable.isViewDimensionCompatible = isViewDimensionCompatible;
+
   const exportsObj = Object.freeze({
     CREATE_TEXTURE2_OPCODE,
     CREATE_TEXTURE2_PAYLOAD_BYTES,
@@ -4594,10 +5275,12 @@
     TEXTURE_COMPRESSION_BC_FEATURE,
     BUFFER_ALIGNMENT_BYTES,
     UNIFORM_BUFFER_MIN_BYTES,
+    DEFAULT_MAX_WRITE_CHUNK_BYTES,
     DEFAULT_FAST_SLOT_CAPACITY,
     DEFAULT_MAX_BIND_GROUPS,
     DEFAULT_FAST_BIND_GROUP_BUCKETS,
     isBcFormat,
+    isViewDimensionCompatible,
     deviceSupportsBc,
     computeMaxMipLevels,
     clampMipLevelCount,
@@ -4609,6 +5292,7 @@
     sanitizeTextureDescriptor,
     computeBindGroupHashFast,
     ResourceTable,
+    GpuResourceTable: ResourceTable,
   });
 
   if (typeof globalThis !== 'undefined') {
@@ -4632,10 +5316,12 @@
       TEXTURE_COMPRESSION_BC_FEATURE,
       BUFFER_ALIGNMENT_BYTES,
       UNIFORM_BUFFER_MIN_BYTES,
+      DEFAULT_MAX_WRITE_CHUNK_BYTES,
       DEFAULT_FAST_SLOT_CAPACITY,
       DEFAULT_MAX_BIND_GROUPS,
       DEFAULT_FAST_BIND_GROUP_BUCKETS,
       isBcFormat,
+      isViewDimensionCompatible,
       deviceSupportsBc,
       computeMaxMipLevels,
       clampMipLevelCount,
@@ -4647,6 +5333,7 @@
       sanitizeTextureDescriptor,
       computeBindGroupHashFast,
       ResourceTable,
+      GpuResourceTable: ResourceTable,
     };
   }
 })(typeof globalThis !== 'undefined' ? globalThis : typeof self !== 'undefined' ? self : this);

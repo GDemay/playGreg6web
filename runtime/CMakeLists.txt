@@ -16,6 +16,7 @@ add_library(playgta6_core STATIC
     os/win32_sync.cpp
     os/win32_compat_file.cpp
     os/win32_compat_sys.cpp
+    os/host_sleep.cpp
     os/win32_compat_text.cpp
     os/win32_compat_misc.cpp
     os/win32_rtl.cpp
@@ -45,11 +46,13 @@ add_library(playgta6_core STATIC
     gpu/d3d12_guest_resources.cpp
     gpu/d3d12_guest_command_list.cpp
     gpu/d3d12_xs_xbox.cpp
+    gpu/xbox_embedded_native.cpp
     gpu/present_pacing.cpp
     gpu/d3d12_xs_dump.cpp
     gpu/shader_pack_index.cpp
     gpu/stage_reflection.cpp
     gpu/gpu_va_watch.cpp
+    gpu/d3d12_readback.cpp
     gpu/gfx10_descriptors.cpp
     gpu/gfx10_detile.cpp
     gpu/descriptor_words.cpp
@@ -68,14 +71,17 @@ add_library(playgta6_core STATIC
     guest/memory_model.cpp
     guest/boot.cpp
     guest/input_script.cpp
+    guest/host_input.cpp
     wasm_boot.cpp
     os/xgameruntime_provider.cpp
     os/xgamesave_local.cpp
     os/xbox_scarlett_guest.cpp
+    os/bcpack.cpp
     guest/program_loader.cpp
     guest/shard_dispatch.cpp
     os/xbox_scarlett_guest_input.cpp
     os/acp_hal_guest.cpp
+    os/xma_decoder.cpp
     os/mmdevice_guest.cpp
     os/audio_downmix.cpp
     os/xapu_opus.cpp
@@ -126,7 +132,10 @@ if(EMSCRIPTEN AND NOT PLAYGTA6_WASM_TESTS)
         SUFFIX ".js"
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../web/dist"
     )
-    target_compile_options(runtime PRIVATE -pthread -sMEMORY64=1)
+    target_compile_options(runtime PRIVATE -pthread -sMEMORY64=1 -msimd128 -mbulk-memory)
+    if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+        target_link_options(runtime PRIVATE -sASSERTIONS=0 -sSAFE_HEAP=0)
+    endif()
     target_link_options(runtime PRIVATE
         -pthread
         -sMEMORY64=1
@@ -223,6 +232,10 @@ else()
     target_link_libraries(test_console_layout_sizes PRIVATE playgta6_core)
     add_test(NAME test_console_layout_sizes COMMAND test_console_layout_sizes)
 
+    add_executable(test_xbox_embedded_native ../tests/test_xbox_embedded_native.cpp)
+    target_link_libraries(test_xbox_embedded_native PRIVATE playgta6_core)
+    add_test(NAME test_xbox_embedded_native COMMAND test_xbox_embedded_native)
+
     add_executable(test_stage_reflection ../tests/test_stage_reflection.cpp)
     target_link_libraries(test_stage_reflection PRIVATE playgta6_core)
     add_test(NAME test_stage_reflection COMMAND test_stage_reflection)
@@ -302,6 +315,9 @@ else()
     add_executable(test_input_script ../tests/test_input_script.cpp)
     target_link_libraries(test_input_script PRIVATE playgta6_core)
     add_test(NAME playgta6_input_script_tests COMMAND test_input_script)
+    add_executable(test_host_input ../tests/test_host_input.cpp)
+    target_link_libraries(test_host_input PRIVATE playgta6_core)
+    add_test(NAME playgta6_host_input_tests COMMAND test_host_input)
 
     add_executable(test_guest_boot ../tests/test_guest_boot.cpp)
     target_link_libraries(test_guest_boot PRIVATE playgta6_core)
@@ -331,6 +347,10 @@ else()
     target_link_libraries(test_audio_downmix PRIVATE playgta6_core)
     add_test(NAME playgta6_audio_downmix_tests COMMAND test_audio_downmix)
 
+    add_executable(test_xma_decoder ../tests/test_xma_decoder.cpp)
+    target_link_libraries(test_xma_decoder PRIVATE playgta6_core)
+    add_test(NAME playgta6_xma_decoder_tests COMMAND test_xma_decoder)
+
     add_executable(test_audio_wav_dump ../tests/test_audio_wav_dump.cpp)
     target_link_libraries(test_audio_wav_dump PRIVATE playgta6_core)
     add_test(NAME playgta6_audio_wav_dump_tests COMMAND test_audio_wav_dump)
@@ -338,6 +358,10 @@ else()
     add_executable(test_audio_report ../tests/test_audio_report.cpp)
     target_link_libraries(test_audio_report PRIVATE playgta6_core)
     add_test(NAME playgta6_audio_report_tests COMMAND test_audio_report)
+
+    add_executable(test_bcpack ../tests/test_bcpack.cpp)
+    target_link_libraries(test_bcpack PRIVATE playgta6_core)
+    add_test(NAME playgta6_bcpack_tests COMMAND test_bcpack)
 
     add_executable(test_xbox_scarlett_guest ../tests/test_xbox_scarlett_guest.cpp)
     target_link_libraries(test_xbox_scarlett_guest PRIVATE playgta6_core)
@@ -411,6 +435,12 @@ else()
     add_executable(bench_xmem_map ../tests/bench_xmem_map.cpp)
     target_link_libraries(bench_xmem_map PRIVATE playgta6_core)
     add_test(NAME bench_xmem_map_smoke COMMAND bench_xmem_map)
+
+    # XMem write-tracking contention stress test (O33); CTest runs the smoke variant
+    # (`bench_xmem_contention --full [--threads N]` for numbers).
+    add_executable(bench_xmem_contention ../tests/bench_xmem_contention.cpp)
+    target_link_libraries(bench_xmem_contention PRIVATE playgta6_core)
+    add_test(NAME bench_xmem_contention_smoke COMMAND bench_xmem_contention)
 endif()
 
 if(EMSCRIPTEN AND PLAYGTA6_WASM_TESTS)

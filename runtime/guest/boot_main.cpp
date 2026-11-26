@@ -32,6 +32,9 @@
 //   --import-trace <file> write every import call (sequence, thread, DLL!symbol, rcx rdx r8 r9
 //                        [rsp+0x28]) there, up to --import-trace-limit calls (default 200000)
 //   --dstorage-workers <n>  DirectStorage (XCRDAPI) worker threads, 1..16 (default 1)
+//   --bcpack-tables <file>  BCPack format tables for DirectStorage texture requests (default: the
+//                        PLAYGTA6_BCPACK_TABLES environment variable; none = BCPack requests fail
+//                        E_NOTIMPL). User-supplied, never shipped: docs/BCPACK.md
 //   --console-mode <n>   console-mode registry value the title reads to pick its console type
 //                        (default 0x60 = Xbox Series X; 0 = leave it unset)
 //   --sandbox-id <text>  Xbox Live sandbox the emulated console reports (default RETAIL, a retail
@@ -46,6 +49,9 @@
 //   --gpu-capture-frames <n>  frames to capture (default 10)
 //   --gpu-capture-thin-uploads <n>  with payloads: keep only every nth write of a texture/buffer > 4 MiB
 //   --gpu-capture-payloads    keep WriteBuffer / WriteTexture / shader payloads in the capture
+//   --gpu-capture-start-ms <n>  start the capture's frames late, n ms after boot (gpu/frame_capture.h
+//                        "Late start"); objects and the newest writes are kept, commands dropped
+//   --gpu-capture-start-at-script  start the capture's frames at the input script's `capture` step
 //   --arena-log-limit <n>     address-space events kept in the report log (default 4096)
 //   --no-tls-callbacks / --no-entry / --quiet
 //
@@ -86,6 +92,7 @@
 #include "gpu/frame_capture.h"
 #include "guest/com_bridge.h"
 #include "guest/guest_callbacks.h"
+#include "guest/host_input.h"
 #include "guest/input_script.h"
 #include "gpu/gpu_va_watch.h"
 #include "os/guest_heap.h"
@@ -94,9 +101,11 @@
 #include "os/image_loader.h"
 #include "os/audio_report.h"
 #include "os/audio_wav_dump.h"
+#include "os/bcpack.h"
 #include "os/os_shim.h"
 #include "os/vmem.h"
 #include "os/win32_kernel.h"
+#include "os/xbox_middleware.h"
 #include "os/xbox_scarlett.h"
 #include "os/xgameruntime_provider.h"
 #include "os/xgamesave_local.h"
@@ -168,6 +177,7 @@ struct Options {
     std::string import_trace;  // --import-trace: names + arguments of every import call
     uint64_t import_trace_limit = 200000;
     uint64_t dstorage_workers = 1;  // --dstorage-workers: DirectStorage worker threads (1..16)
+    std::string bcpack_tables;      // --bcpack-tables: user-supplied BCPack table file (os/bcpack.h)
     uint64_t arena_log_limit = 4096;  // --arena-log-limit
     uint64_t console_mode = playgta6::guest::kConsoleModeSeriesX;
     std::string sandbox_id = "RETAIL";  // --sandbox-id ("" = no sandbox)
@@ -177,6 +187,8 @@ struct Options {
     uint64_t gpu_capture_frames = 10;
     bool gpu_capture_payloads = false;
     uint64_t gpu_capture_thin_uploads = 0;
+    uint64_t gpu_capture_start_ms = 0;    // --gpu-capture-start-ms: late start (0 = from boot)
+    bool gpu_capture_start_at_script = false;  // --gpu-capture-start-at-script
     bool native_pipelines = false;  // d3d12 DeviceOptions::refuse_native_pipelines = false
     bool no_fence_lag = false;      // d3d12 DeviceOptions::fence_publish_lag = false
     bool eager_gpu_objects = false; // d3d12 DeviceOptions::defer_gpu_objects = false
@@ -185,7 +197,8 @@ struct Options {
     std::string audio_dump;         // --audio-dump: WAV of the stereo mix
     std::string dump_pipelines;     // --dump-pipelines: d3d12 DeviceOptions::dump_dir (under a `work` dir)
     std::string shader_pack;        // --shader-pack: WGPK whose keys resolve pipeline stages
-    std::string input_script;       // --input-script: timed controller buttons (guest/input_script.h)
+    bool host_input = false;        // --host-input: real XInput pad + keyboard (guest/host_input.h)
+    std::string input_script;      // --input-script: timed controller buttons (guest/input_script.h)
     std::string watch_gpu_va;       // --watch-gpu-va: GPU address ranges to report references to (gpu/gpu_va_watch.h)
     // --wgpu-features: pso::WgpuFeature bits of the WebGPU device that replays the run. The bridge
     // picks texture formats (and whether guest texels can be uploaded as they are) by them; the
@@ -208,11 +221,13 @@ void usage() {
                  "                     [--watchdog-ms N] [--stack BYTES] [--host-stack-mb N]\n"
                  "                     [--report <file>] [--summary <file>] [--no-tls-callbacks]\n"
                  "                     [--no-entry] [--quiet] [--no-present-pacing] [--no-xmem-shared-pages]\n"
-                 "                     [--gpu-capture <file> [--gpu-capture-frames N] [--gpu-capture-payloads]]\n"
+                 "                     [--gpu-capture <file> [--gpu-capture-frames N] [--gpu-capture-payloads]\n"
+                 "                      [--gpu-capture-start-ms N | --gpu-capture-start-at-script]]\n"
                  "                     [--native-pipelines] [--no-fence-lag] [--eager-gpu-objects]\n"
                  "                     [--dump-pipelines <dir under work/>]\n"
-                 "                     [--shader-pack <file.wgsl.pack>] [--input-script <file>]\n"
+                 "                     [--shader-pack <file.wgsl.pack>] [--input-script <file>] [--host-input]\n"
                  "                     [--wgpu-features <mask>] [--audio-dump <file.wav>]\n"
+                 "                     [--bcpack-tables <file>]\n"
                  "                     [--watch-gpu-va <0xA-0xB|0xA+SIZE|textures:WxH[/WxH]>[,...]]\n");
 }
 
@@ -248,10 +263,14 @@ bool parse(int argc, char** argv, Options& o) {
             playgta6::os::win32::set_process_shared_zone(false);
         } else if (a == "--gpu-capture-payloads") {
             o.gpu_capture_payloads = true;
+        } else if (a == "--gpu-capture-start-at-script") {
+            o.gpu_capture_start_at_script = true;
         } else if (a == "--no-fence-lag") {
             o.no_fence_lag = true;
         } else if (a == "--eager-gpu-objects") {
             o.eager_gpu_objects = true;
+        } else if (a == "--host-input") {
+            o.host_input = true;
         } else if (a == "--native-pipelines") {
             o.native_pipelines = true;
         } else if (a == "-h" || a == "--help") {
@@ -261,7 +280,8 @@ bool parse(int argc, char** argv, Options& o) {
                    a == "--cmdline" || a == "--report" || a == "--summary" || a == "--import-trace" ||
                    a == "--gpu-capture" || a == "--sandbox-id" || a == "--dump-pipelines" ||
                    a == "--shader-pack" || a == "--input-script" || a == "--watch-gpu-va" ||
-                   a == "--user-age-group" || a == "--profile" || a == "--save-dir" || a == "--audio-dump") {
+                   a == "--user-age-group" || a == "--profile" || a == "--save-dir" || a == "--audio-dump" ||
+                   a == "--bcpack-tables") {
             if (!value(v)) {
                 return false;
             }
@@ -275,6 +295,7 @@ bool parse(int argc, char** argv, Options& o) {
                                   : a == "--user-age-group" ? o.user_age_group
                                   : a == "--save-dir" ? o.save_dir
                                   : a == "--audio-dump" ? o.audio_dump
+                                  : a == "--bcpack-tables" ? o.bcpack_tables
                                   : a == "--profile" ? o.profile
                                   : a == "--program-dir" ? o.program_dir
                                   : a == "--name"     ? o.name
@@ -288,6 +309,7 @@ bool parse(int argc, char** argv, Options& o) {
         } else if (a == "--max-calls" || a == "--max-ms" || a == "--watchdog-ms" || a == "--stack" ||
                    a == "--host-stack-mb" || a == "--survey-return" || a == "--import-trace-limit" ||
                    a == "--console-mode" || a == "--gpu-capture-frames" || a == "--gpu-capture-thin-uploads" || a == "--arena-log-limit" ||
+                   a == "--gpu-capture-start-ms" ||
                    a == "--dstorage-workers" || a == "--profile-interval-us" || a == "--wgpu-features") {
             if (!value(v)) {
                 return false;
@@ -295,6 +317,7 @@ bool parse(int argc, char** argv, Options& o) {
             uint64_t& target = a == "--max-calls"     ? o.max_calls
                                : a == "--gpu-capture-frames" ? o.gpu_capture_frames
                                : a == "--gpu-capture-thin-uploads" ? o.gpu_capture_thin_uploads
+                               : a == "--gpu-capture-start-ms" ? o.gpu_capture_start_ms
                                : a == "--arena-log-limit" ? o.arena_log_limit
                                : a == "--console-mode" ? o.console_mode
                                : a == "--dstorage-workers" ? o.dstorage_workers
@@ -951,6 +974,26 @@ int main(int argc, char** argv) {
         return kExitUsage;
     }
     os::scarlett::guest_api::set_dstorage_worker_threads(static_cast<uint32_t>(g_options.dstorage_workers));
+    {
+        // BCPack tables: user-supplied only (docs/BCPACK.md). A bad --bcpack-tables file is a usage
+        // error; a bad PLAYGTA6_BCPACK_TABLES only warns (BCPack requests then fail E_NOTIMPL).
+        const char* env = std::getenv("PLAYGTA6_BCPACK_TABLES");
+        const bool from_flag = !g_options.bcpack_tables.empty();
+        const std::string path = from_flag ? g_options.bcpack_tables : (env != nullptr ? env : "");
+        if (!path.empty()) {
+            std::string error;
+            if (os::bcpack::load_tables_file(path, &error)) {
+                std::fprintf(stderr, "[harness] BCPack tables loaded from %s (%s)\n", path.c_str(),
+                             os::bcpack::supported_formats(*os::bcpack::active_tables()).c_str());
+            } else {
+                std::fprintf(stderr, "[harness] %s: BCPack tables not loaded: %s\n", from_flag ? "error" : "warning",
+                             error.c_str());
+                if (from_flag) {
+                    return kExitUsage;
+                }
+            }
+        }
+    }
     // Write tracking on the guest address space (Windows): the GPU layer then compares only the
     // written pages of CPU-visible buffers at each ExecuteCommandLists instead of whole buffers.
     os::set_write_tracking(true);
@@ -1057,9 +1100,28 @@ int main(int argc, char** argv) {
                 t.spatial_passes = a.spatial_passes;
                 t.spatial_object_buffers = a.spatial_object_buffers;
                 t.spatial_nonzero_buffers = a.spatial_nonzero_buffers;
+                t.spatial_nonzero_passes = a.spatial_nonzero_passes;
                 t.xapu_decoded_packets = x.decoded_packets;
                 t.xapu_failed_packets = x.failed_packets;
                 t.xapu_results_posted = x.type3_results;
+                t.xapu_commands = x.commands;
+                t.xapu_unhandled_commands = x.unhandled_commands;
+                t.xapu_type1 = x.type1_commands;
+                t.xapu_type2 = x.type2_commands;
+                t.xapu_type3 = x.type3_commands;
+                t.xapu_type5 = x.type5_commands;
+                const Pg6XmaContextCensus xma = pg6_mw_xma_context_census();
+                t.xma_contexts = xma.contexts;
+                t.xma_contexts_touched = xma.touched;
+                t.xma_contexts_input_valid = xma.input_valid;
+                t.xma_contexts_output_pending = xma.output_pending;
+                const os::scarlett::guest_api::XmaCommandStats xc = os::scarlett::guest_api::xma_command_stats();
+                t.xma_contexts_enabled = xc.enabled_now;
+                t.xma_enable_commands = xc.enables + xc.mask_enables;
+                t.xma_read_advances = xc.read_advances;
+                t.xma_frames = xc.frames;
+                t.xma_blocks_written = xc.blocks_written;
+                t.xma_input_exhausted = xc.input_exhausted;
                 o += ",\n  \"audio\": " + ar::to_json(t, ar::windows().nonsilent_windows(), ar::windows().clamped.load());
             }
             if (s_with_presents) {
@@ -1074,6 +1136,13 @@ int main(int argc, char** argv) {
         capture.frames = static_cast<uint32_t>(std::max<uint64_t>(1, g_options.gpu_capture_frames));
         capture.keep_payloads = g_options.gpu_capture_payloads;
         capture.thin_uploads = static_cast<uint32_t>(g_options.gpu_capture_thin_uploads);
+        capture.start_ms = g_options.gpu_capture_start_ms;
+        capture.deferred = g_options.gpu_capture_start_ms != 0 || g_options.gpu_capture_start_at_script;
+        if (capture.deferred) {
+            std::fprintf(stderr, "[harness] GPU capture deferred until %s\n",
+                         g_options.gpu_capture_start_at_script ? "the input script's capture step"
+                                                               : (std::to_string(capture.start_ms) + " ms").c_str());
+        }
         if (!gpu::frame_capture_start(capture)) {
             std::fprintf(stderr, "[harness] cannot write the GPU capture %s\n", g_options.gpu_capture.c_str());
             return kExitUsage;
@@ -1117,6 +1186,8 @@ int main(int argc, char** argv) {
             const os::scarlett::guest_api::DStorageStats ds = os::scarlett::guest_api::dstorage_stats();
             sample->counters.emplace_back("dstorage_requests_completed", ds.requests_completed);
             sample->counters.emplace_back("dstorage_requests_failed", ds.requests_failed);
+            sample->counters.emplace_back("dstorage_bcpack_requests", ds.bcpack_requests);
+            sample->counters.emplace_back("dstorage_bcpack_decoded", ds.bcpack_decoded);
             sample->counters.emplace_back("dstorage_bytes_delivered", ds.bytes_delivered);
             sample->counters.emplace_back("dstorage_decompressed_requests", ds.decompressed_requests);
             sample->counters.emplace_back("dstorage_file_reads", ds.file_reads);
@@ -1163,8 +1234,32 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "[harness] input script %s: %zu event(s)\n", g_options.input_script.c_str(), events.size());
         playgta6::os::scarlett::set_game_input_state(&script_input);
+        const bool has_capture_step =
+            std::any_of(events.begin(), events.end(), [](const playgta6::guest::InputScriptEvent& e) {
+                return e.kind == playgta6::guest::InputStepKind::Capture;
+            });
+        if (g_options.gpu_capture_start_at_script && !has_capture_step) {
+            std::fprintf(stderr, "[harness] --gpu-capture-start-at-script: the input script has no capture step\n");
+            return kExitUsage;
+        }
         script_player = std::make_unique<playgta6::guest::InputScriptPlayer>(std::move(events), &script_input);
+        // wait / repeat steps follow the live present counters (the report's present_samples).
+        script_player->set_status_probe([] {
+            const guest::PresentStatus p = guest::present_status();
+            return playgta6::guest::InputStatus{p.presents, p.draws_per_frame};
+        });
+        if (g_options.gpu_capture_start_at_script) {
+            script_player->set_on_capture([] { gpu::frame_capture_begin(); });
+        }
+        script_player->set_log(true);
         script_player->start();
+    } else if (g_options.host_input) {
+        static playgta6::InputState host_state{};
+        static playgta6::guest::host_input::HostInputSource host_source(&host_state);
+        playgta6::os::scarlett::set_game_input_state(&host_state);
+        playgta6::os::scarlett::set_game_input_press_sampler(true);
+        host_source.start();
+        std::fprintf(stderr, "[harness] host input: XInput pad + keyboard\n");
     }
     start_watchdog();
     start_profile();

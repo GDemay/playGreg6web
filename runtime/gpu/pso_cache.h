@@ -382,7 +382,13 @@ struct VertexInputFetch {
     uint32_t offset = 0;
     uint32_t location = 0;
     WgpuVertexFormat format{};  // WgpuVertexFormat::Undefined
+    // No input-layout element feeds this attribute: D3D12 reads (0, 0, 0, 1). The attribute is placed
+    // at a spare slot (step instance, stride 0) over a shared constant buffer; `slot` is ignored and
+    // `offset` picks the float (0) or integer (16) copy of the default (kDefaultVertexBufferBytes).
+    bool constant_default = false;
 };
+inline constexpr uint32_t kDefaultVertexIntOffset = 16;
+inline constexpr uint32_t kDefaultVertexBufferBytes = 32;
 
 // D3D12_GRAPHICS_PIPELINE_STATE_DESC (or the equivalent pipeline-state stream), with shader bytecode
 // replaced by opaque 64-bit shader identities (WGSL module id or content hash; 0 = no shader) and the
@@ -1015,6 +1021,7 @@ struct GraphicsPsoTranslation {
     uint32_t ps_output_mask = 0;
     uint32_t used_vertex_slots = 0;            // slots that carry at least one attribute
     uint32_t instance_stride_zero_slots = 0;   // per-instance slots with InstanceDataStepRate 0
+    uint32_t default_vertex_slot_mask = 0;     // spare slot bound to the shared (0,0,0,1) buffer (G62)
     uint32_t tight_strides[kMaxVertexBuffers] = {};
 };
 

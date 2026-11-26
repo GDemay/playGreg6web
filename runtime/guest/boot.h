@@ -483,13 +483,19 @@ struct BootConfig {
     // O36: presents wait for the title's sync interval on a 60 Hz display (gpu/present_pacing.h);
     // off for benchmarks (report: present_pacing).
     bool present_pacing = true;
+    // G71 (#663, #1508): optional cap on PresentX sync interval in 60 Hz vblanks (0 = no clamp,
+    // honor the title's SetFrameIntervalX interval; > 0 clamps interval = min(interval, cap),
+    // e.g. 1 for 60 Hz cap).
+    uint32_t present_max_interval = 0;
     // O36: runtime switches mirroring the playgta6_boot harness flags (A/B runs of a browser
     // regression without a rebuild). All on by default.
-    bool fence_publish_lag = true;    // d3d12 DeviceOptions::fence_publish_lag (--no-fence-lag)
-    bool defer_gpu_objects = true;    // d3d12 DeviceOptions::defer_gpu_objects (--eager-gpu-objects)
-    bool xmem_shared_pages = true;    // os::win32::set_process_shared_zone (--no-xmem-shared-pages)
-    bool present_frame_waits = true;  // WaitFrameEventX(PRESENT, token) waits for the token's present
-    bool audio_endpoint = true;       // CLSID_MMDeviceEnumerator resolves (default render endpoint)
+    bool fence_publish_lag = true;            // d3d12 DeviceOptions::fence_publish_lag (--no-fence-lag)
+    uint32_t fence_publish_lag_frames = 1;    // G69/G71: DeviceOptions::fence_publish_lag_frames
+    uint32_t fence_publish_cap_ms = 33;       // G69/G71: DeviceOptions::fence_publish_cap_ms
+    bool defer_gpu_objects = true;            // d3d12 DeviceOptions::defer_gpu_objects (--eager-gpu-objects)
+    bool xmem_shared_pages = true;            // os::win32::set_process_shared_zone (--no-xmem-shared-pages)
+    bool present_frame_waits = true;          // WaitFrameEventX(PRESENT, token) waits for the token's present
+    bool audio_endpoint = true;               // CLSID_MMDeviceEnumerator resolves (default render endpoint)
 };
 
 struct BootResult {
@@ -503,10 +509,11 @@ struct BootResult {
 // a previous boot's state is released first (see reset_boot).
 BootResult run_boot(const BootConfig& config);
 
-// O36: run options of a boot that has no command line (the browser boot), as a JSON object:
+// O36/G71: run options of a boot that has no command line (the browser boot), as a JSON object:
 //   {"max_wall_ms": 300000, "max_dispatches": 0, "arena_log_limit": 4096,
 //    "import_trace_limit": 0, "report_to_log": true, "verify_window_marks": false,
-//    "present_pacing": true, "fence_publish_lag": true, "defer_gpu_objects": true,
+//    "present_pacing": true, "present_max_interval": 0, "fence_publish_lag": true,
+//    "fence_publish_lag_frames": 1, "fence_publish_cap_ms": 33, "defer_gpu_objects": true,
 //    "xmem_shared_pages": true, "present_frame_waits": true, "audio_endpoint": true}
 // Every key is optional, unknown keys are ignored; "report_to_log" sets report_sink to
 // log_report_json. False (config unchanged) if `json` is not a JSON object.
@@ -585,6 +592,16 @@ struct LiveCounters {
 };
 LiveCounters live_counters();
 
+// The live present state of the running boot (the newest `present_samples` entry): presents so
+// far, draws of the newest present, wall ms of the newest present. Safe from any thread; drives
+// the input script's `wait` steps (guest/input_script.h).
+struct PresentStatus {
+    uint64_t presents = 0;
+    uint64_t draws_per_frame = 0;
+    uint64_t wall_ms = 0;
+};
+PresentStatus present_status();
+
 // Lifted function containing a host code address (exact only for natively compiled lifted code:
 // nearest lifted function pointer at or below `host_pc`). 0 if unknown.
 uint64_t guest_function_for_host_pc(uint64_t host_pc, uint64_t* offset = nullptr);
@@ -593,6 +610,16 @@ uint64_t guest_function_for_host_pc(uint64_t host_pc, uint64_t* offset = nullptr
 std::string guest_thread_last_import(uint32_t thread_id);
 
 }  // namespace playgta6::guest
+
+namespace playgta6::gpu::d3d12_guest::xbox {
+
+// G71 (#663, #1508): process-wide cap on PresentX sync interval in 60 Hz vblanks (0 = no clamp,
+// honor the title's SetFrameIntervalX interval; > 0 clamps interval = min(interval, cap),
+// e.g. 1 for 60 Hz cap). Defined in runtime/gpu/d3d12_xs_xbox.cpp.
+void set_present_max_interval(uint32_t max_interval);
+uint32_t present_max_interval();
+
+}  // namespace playgta6::gpu::d3d12_guest::xbox
 
 // ---------------------------------------------------------------------------
 // C ABI (guest memory = os::win32::get_vmem_arena())

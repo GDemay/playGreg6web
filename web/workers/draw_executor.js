@@ -43,14 +43,74 @@
   const DEFAULT_COLOR_FORMAT = 'bgra8unorm';
   const DEFAULT_TOPOLOGY = 'triangle-list';
   const DEFAULT_MAX_FALLBACK_PIPELINES = 128;
-  const DEFAULT_MAX_BIND_GROUP_CACHE_ENTRIES = 512;
+  const DEFAULT_MAX_BIND_GROUP_CACHE_ENTRIES = 1024;
   const DEFAULT_MAX_WGSL_HASH_CACHE_ENTRIES = 256;
+  const MAX_VIEWS_PER_TEXTURE = 64;
+
+  const PASSTHROUGH_DRAW_STATE_KEYS = Object.freeze([
+    'hasBoundCbv',
+    'hasCbv',
+    'cbvCount',
+    'cbv',
+    'cbvBuffer',
+    'uniformBuffer',
+    'hasBoundTexture',
+    'hasTexture',
+    'hasSampledTexture',
+    'hasBoundSampledTexture',
+    'hasBoundSrv',
+    'textureCount',
+    'srvCount',
+    'texture',
+    'textureView',
+    'srv',
+    'hasBoundSampler',
+    'hasSampler',
+    'samplerCount',
+    'sampler',
+    'vertexShaderHash',
+    'fragmentShaderHash',
+    'vertexShader',
+    'fragmentShader',
+    'topology',
+    'isRectList',
+    'format',
+    'sampleCount',
+    'depthStencilFormat',
+    'isFallback',
+    'usesFallbackShaders',
+  ]);
 
   // Fixed-slot fast paths for WebGPU guaranteed minimum slots (0..7 VBs, 0..3 BGs)
   // enabling O(1) bitmask dirty tracking and zero-allocation hot draw execution (W282).
   const MAX_FAST_VB_SLOTS = 8;
   const MAX_FAST_BG_SLOTS = 4;
   const MAX_FAST_DYN_OFFSETS = 8;
+
+  // W354: O(1) zero-string-alloc hash-bucketed bind-group cache constants for 1..8 entries.
+  const MAX_FAST_BG_CACHE_ENTRIES = 8;
+  const BG_OWNER_LAYOUT = 1;
+  const BG_OWNER_PIPELINE = 2;
+  const BG_OWNER_FALLBACK_CBV = 3;
+  const BG_OWNER_FALLBACK_TEX = 4;
+  const BG_OWNER_FALLBACK_SPLASH = 5;
+  const BG_ENTRY_KIND_BUFFER = 0;
+  const BG_ENTRY_KIND_TEXTURE = 1;
+  const BG_ENTRY_KIND_RAW = 2;
+
+  function hashMixInt32(h, v) {
+    let x = (h ^ (v | 0)) | 0;
+    x = Math.imul(x, 0x01000193);
+    return x | 0;
+  }
+
+  function hashMixNum(h, n) {
+    if (n === 0) return hashMixInt32(h, 0);
+    const lo = n | 0;
+    if (lo === n) return hashMixInt32(h, lo);
+    const hi = Math.floor(n / 4294967296) | 0;
+    return hashMixInt32(hashMixInt32(h, lo), hi);
+  }
 
   // Integer status codes for zero-allocation index/indirect buffer validation & pass binding.
   const IB_STATUS_INVALID = 0;
@@ -921,15 +981,92 @@
     }
   }
 
+  function getResourceGeneration(resource) {
+    if (resource && typeof resource === 'object' && typeof resource.generation === 'number') {
+      return resource.generation;
+    }
+    return 0;
+  }
+
+  function buildTextureViewDescriptorKey(viewDesc) {
+    if (!viewDesc || typeof viewDesc !== 'object') {
+      return '';
+    }
+    const format = viewDesc.format !== undefined && viewDesc.format !== null ? viewDesc.format : '';
+    const dimension =
+      viewDesc.dimension !== undefined && viewDesc.dimension !== null ? viewDesc.dimension : '';
+    const aspect = viewDesc.aspect !== undefined && viewDesc.aspect !== null ? viewDesc.aspect : '';
+    const baseMip =
+      viewDesc.baseMipLevel !== undefined && viewDesc.baseMipLevel !== null
+        ? viewDesc.baseMipLevel
+        : '';
+    const mipCount =
+      viewDesc.mipLevelCount !== undefined && viewDesc.mipLevelCount !== null
+        ? viewDesc.mipLevelCount
+        : '';
+    const baseLayer =
+      viewDesc.baseArrayLayer !== undefined && viewDesc.baseArrayLayer !== null
+        ? viewDesc.baseArrayLayer
+        : '';
+    const layerCount =
+      viewDesc.arrayLayerCount !== undefined && viewDesc.arrayLayerCount !== null
+        ? viewDesc.arrayLayerCount
+        : '';
+    const usage = viewDesc.usage !== undefined && viewDesc.usage !== null ? viewDesc.usage : '';
+    if (
+      format === '' &&
+      dimension === '' &&
+      aspect === '' &&
+      baseMip === '' &&
+      mipCount === '' &&
+      baseLayer === '' &&
+      layerCount === '' &&
+      usage === ''
+    ) {
+      return '';
+    }
+    return `${format}|${dimension}|${aspect}|${baseMip}|${mipCount}|${baseLayer}|${layerCount}|${usage}`;
+  }
+
+  function validateComputeIndirectBufferStatus(indirectBuffer, indirectOffset) {
+    if (!isValidGpuBuffer(indirectBuffer, BUFFER_USAGE.INDIRECT)) {
+      return INDIRECT_STATUS_INVALID;
+    }
+    if (!Number.isInteger(indirectOffset) || indirectOffset < 0 || indirectOffset % 4 !== 0) {
+      return INDIRECT_STATUS_INVALID_RANGE;
+    }
+    const minBytes = 12; // 3 x u32 workgroup counts
+    const bufSize =
+      typeof indirectBuffer.size === 'number' && Number.isFinite(indirectBuffer.size)
+        ? indirectBuffer.size
+        : null;
+    if (bufSize !== null) {
+      if (bufSize < minBytes || indirectOffset + minBytes > bufSize) {
+        return INDIRECT_STATUS_INVALID_RANGE;
+      }
+    }
+    return INDIRECT_STATUS_OK;
+  }
+
   function isCachedBindGroupValid(entry) {
     if (!entry || !entry.bindGroup || entry.bindGroup.destroyed === true) {
       return false;
     }
     const resources = entry.resources;
     if (resources) {
+      const gens = entry.generations;
       for (let i = 0; i < resources.length; i += 1) {
         const res = resources[i];
-        if (res && res.destroyed === true) {
+        if (!res) {
+          continue;
+        }
+        if (res.destroyed === true) {
+          return false;
+        }
+        if (res.texture && res.texture.destroyed === true) {
+          return false;
+        }
+        if (gens !== null && gens !== undefined && getResourceGeneration(res) !== gens[i]) {
           return false;
         }
       }
@@ -1236,6 +1373,11 @@
       bindGroupCacheHits: 0,
       bindGroupCacheMisses: 0,
       bindGroupCacheEvictions: 0,
+      textureViewCacheHits: 0,
+      textureViewCacheMisses: 0,
+      textureViewCacheEvictions: 0,
+      computeDispatches: 0,
+      skippedComputeDispatches: 0,
       alphaBlendedDraws: 0,
       uiQuadDraws: 0,
       fontGlyphDraws: 0,
@@ -1369,6 +1511,7 @@
 
       // Active per-pass draw state (fixed-slot parallel arrays + bitmasks for O(1) dirty elision).
       this._activePipeline = null;
+      this._activeComputePipeline = null;
       this._boundPass = null;
       this._boundPipeline = null;
 
@@ -1446,9 +1589,38 @@
       this._textures = new Map();
       this._samplers = new Map();
 
-      // Reusable draw result & frame-summary snapshots (zero-alloc opt-in paths).
+      // Reusable draw/compute result & internal hot-path scratch structs (zero-alloc paths).
       this._reusableDrawResult = createDrawResultObject(false, false, 0, 1, 0);
       this._reusableIndirectResult = createDrawResultObject(false, true, 0, 0, 0);
+      this._reusableComputeResult = {
+        executed: false,
+        skipped: false,
+        reason: null,
+        indirect: false,
+        indirectOffset: 0,
+        workgroupCountX: 0,
+        workgroupCountY: 0,
+        workgroupCountZ: 0,
+        pipelineElided: false,
+        bindGroupsElided: 0,
+        bindGroupCacheHits: 0,
+        bindGroupCacheMisses: 0,
+      };
+      this._tmpFallbackBgResult = {
+        ok: false,
+        substitutedCbv: false,
+        substitutedTexture: false,
+        substitutedSampler: false,
+        cacheHit: false,
+        bindGroupElided: false,
+      };
+      this._tmpFallbackVbResult = {
+        ok: false,
+        substitutedVertexBuffer: false,
+        vertexBufferElided: false,
+        effectiveVertexCount: 0,
+        effectiveFirstVertex: 0,
+      };
       this._reusableFrameSummary = {
         hasNonClearDraw: false,
         realPackDrawsThisFrame: 0,
@@ -1459,7 +1631,23 @@
       // Device-scoped resource caches & object identity maps (WeakMap avoids retention leaks).
       this._fallbackPipelineCache = new Map();
       this._fallbackShaderModuleCache = new Map();
-      this._bindGroupCache = new Map();
+      // W354: O(1) hash-bucketed LRU bind-group cache + WeakMap reverse resource index
+      // (zero string allocation on 1..8 entry lookups, O(1) LRU promotion/eviction & invalidation).
+      this._bgBuckets = new Map();
+      this._bgHead = null;
+      this._bgTail = null;
+      this._bgCacheSize = 0;
+      this._bgResourceIndex = new WeakMap();
+      this._bgScratchBindings = new Int32Array(MAX_FAST_BG_CACHE_ENTRIES);
+      this._bgScratchKinds = new Uint8Array(MAX_FAST_BG_CACHE_ENTRIES);
+      this._bgScratchResA = new Array(MAX_FAST_BG_CACHE_ENTRIES).fill(null);
+      this._bgScratchResB = new Array(MAX_FAST_BG_CACHE_ENTRIES).fill(null);
+      this._bgScratchIdA = new Int32Array(MAX_FAST_BG_CACHE_ENTRIES);
+      this._bgScratchIdB = new Int32Array(MAX_FAST_BG_CACHE_ENTRIES);
+      this._bgScratchGenA = new Int32Array(MAX_FAST_BG_CACHE_ENTRIES);
+      this._bgScratchGenB = new Int32Array(MAX_FAST_BG_CACHE_ENTRIES);
+      this._bgScratchOff = new Float64Array(MAX_FAST_BG_CACHE_ENTRIES);
+      this._bgScratchSize = new Float64Array(MAX_FAST_BG_CACHE_ENTRIES);
       this._wgslHashCache = new Map();
       this._resourceIds = new WeakMap();
       this._nextResourceId = 0;
@@ -1521,45 +1709,234 @@
       return hash;
     }
 
-    _resolveTextureViewCached(resource) {
-      if (!isValidTextureOrView(resource)) {
+    /**
+     * Look up or create a cached `GPUTextureView` for `(texture, viewDescriptor)` backed
+     * by a `WeakMap<GPUTexture, { defaultView, byKey }>` so destroyed or replaced
+     * textures are GC'd automatically with zero memory leaks.
+     *
+     * W347/W354: Respects promoted 1D->2D LUT view coercion (`dimension: '1d'` on a `'2d'` /
+     * `promoted1DTo2D` texture -> `'2d'` with single layer/mip bounds) and the reverse 1D guard,
+     * with zero descriptor object allocation on cache hits.
+     *
+     * @param {object} texture GPUTexture (or existing GPUTextureView)
+     * @param {object | null | undefined} [viewDescriptor] GPUTextureViewDescriptor
+     * @returns {object | null}
+     */
+    getOrCreateTextureView(texture, viewDescriptor) {
+      if (!texture || typeof texture !== 'object') {
         return null;
       }
-      if (resource.textureView && isValidTextureOrView(resource.textureView)) {
-        return resource.textureView;
+      if (texture.destroyed === true) {
+        if (this._textureViewCache.has(texture)) {
+          this._textureViewCache.delete(texture);
+          this._stats.textureViewCacheEvictions += 1;
+        }
+        return null;
       }
-      if (resource.texture && isValidTextureOrView(resource.texture)) {
-        const tex = resource.texture;
-        if (typeof tex.createView === 'function') {
-          const cached = this._textureViewCache.get(tex);
-          if (cached && cached.destroyed !== true) {
-            return cached;
+      if (typeof texture.createView !== 'function') {
+        if (texture.texture && texture.texture.destroyed === true) {
+          return null;
+        }
+        return texture;
+      }
+
+      const hasDesc = Boolean(viewDescriptor && typeof viewDescriptor === 'object');
+      const rawFormat =
+        hasDesc && viewDescriptor.format !== undefined && viewDescriptor.format !== null
+          ? viewDescriptor.format
+          : '';
+      let effDim =
+        hasDesc && viewDescriptor.dimension !== undefined && viewDescriptor.dimension !== null
+          ? viewDescriptor.dimension
+          : '';
+      const rawAspect =
+        hasDesc && viewDescriptor.aspect !== undefined && viewDescriptor.aspect !== null
+          ? viewDescriptor.aspect
+          : '';
+      let effBaseMip =
+        hasDesc && viewDescriptor.baseMipLevel !== undefined && viewDescriptor.baseMipLevel !== null
+          ? viewDescriptor.baseMipLevel
+          : '';
+      let effMipCount =
+        hasDesc &&
+        viewDescriptor.mipLevelCount !== undefined &&
+        viewDescriptor.mipLevelCount !== null
+          ? viewDescriptor.mipLevelCount
+          : '';
+      let effBaseLayer =
+        hasDesc &&
+        viewDescriptor.baseArrayLayer !== undefined &&
+        viewDescriptor.baseArrayLayer !== null
+          ? viewDescriptor.baseArrayLayer
+          : '';
+      let effLayerCount =
+        hasDesc &&
+        viewDescriptor.arrayLayerCount !== undefined &&
+        viewDescriptor.arrayLayerCount !== null
+          ? viewDescriptor.arrayLayerCount
+          : '';
+      const rawUsage =
+        hasDesc && viewDescriptor.usage !== undefined && viewDescriptor.usage !== null
+          ? viewDescriptor.usage
+          : '';
+
+      let coerced = false;
+      if (hasDesc && typeof effDim === 'string' && effDim.length > 0 && effDim !== 'undefined') {
+        const actualTexDim =
+          typeof texture.dimension === 'string'
+            ? texture.dimension
+            : texture.desc && typeof texture.desc.dimension === 'string'
+              ? texture.desc.dimension
+              : null;
+        const isPromoted1DTo2D = Boolean(
+          texture.promoted1DTo2D === true ||
+            (texture.desc && texture.desc.promoted1DTo2D === true)
+        );
+        if (effDim === '1d' && (actualTexDim === '2d' || isPromoted1DTo2D)) {
+          // W347: coerce '1d' view descriptor to '2d' with valid single-layer/mip bounds on promoted 1D->2D LUTs.
+          const texMipCount =
+            typeof texture.mipLevelCount === 'number' && texture.mipLevelCount >= 1
+              ? texture.mipLevelCount
+              : texture.desc &&
+                  typeof texture.desc.mipLevelCount === 'number' &&
+                  texture.desc.mipLevelCount >= 1
+                ? texture.desc.mipLevelCount
+                : isPromoted1DTo2D
+                  ? 1
+                  : null;
+          effDim = '2d';
+          effBaseLayer = 0;
+          effLayerCount = 1;
+          if (isPromoted1DTo2D || texMipCount === 1) {
+            effBaseMip = 0;
+            effMipCount = 1;
           }
-          try {
-            const view = tex.createView();
-            if (view && typeof view === 'object') {
-              this._textureViewCache.set(tex, view);
-            }
-            return view;
-          } catch (_err) {
-            return null;
-          }
+          coerced = true;
+        } else if (actualTexDim === '1d' && effDim !== '1d') {
+          // W347: reverse guard — real WebGPU '1d' textures only allow '1d' views (1 mip, 1 layer).
+          effDim = '1d';
+          if (effBaseLayer !== '' && effBaseLayer !== 0) effBaseLayer = 0;
+          if (effLayerCount !== '' && effLayerCount !== 1) effLayerCount = 1;
+          if (effBaseMip !== '' && effBaseMip !== 0) effBaseMip = 0;
+          if (effMipCount !== '' && effMipCount !== 1) effMipCount = 1;
+          coerced = true;
         }
       }
-      if (typeof resource.createView === 'function') {
-        const cached = this._textureViewCache.get(resource);
-        if (cached && cached.destroyed !== true) {
-          return cached;
+
+      const isDefaultKey =
+        rawFormat === '' &&
+        effDim === '' &&
+        rawAspect === '' &&
+        effBaseMip === '' &&
+        effMipCount === '' &&
+        effBaseLayer === '' &&
+        effLayerCount === '' &&
+        rawUsage === '';
+
+      let record = this._textureViewCache.get(texture);
+
+      if (isDefaultKey) {
+        if (record && record.defaultView) {
+          if (record.defaultView.destroyed !== true) {
+            this._stats.textureViewCacheHits += 1;
+            return record.defaultView;
+          }
+          record.defaultView = null;
+          this._stats.textureViewCacheEvictions += 1;
         }
+        this._stats.textureViewCacheMisses += 1;
         try {
-          const view = resource.createView();
+          const view = texture.createView();
           if (view && typeof view === 'object') {
-            this._textureViewCache.set(resource, view);
+            if (!record) {
+              record = { defaultView: view, byKey: null };
+              this._textureViewCache.set(texture, record);
+            } else {
+              record.defaultView = view;
+            }
           }
           return view;
         } catch (_err) {
           return null;
         }
+      }
+
+      const key = `${rawFormat}|${effDim}|${rawAspect}|${effBaseMip}|${effMipCount}|${effBaseLayer}|${effLayerCount}|${rawUsage}`;
+      if (record && record.byKey !== null) {
+        const cached = record.byKey.get(key);
+        if (cached) {
+          if (cached.destroyed !== true) {
+            this._stats.textureViewCacheHits += 1;
+            return cached;
+          }
+          record.byKey.delete(key);
+          this._stats.textureViewCacheEvictions += 1;
+        }
+      }
+
+      this._stats.textureViewCacheMisses += 1;
+      let createDesc = viewDescriptor;
+      if (coerced) {
+        createDesc = { ...viewDescriptor, dimension: effDim };
+        if (effBaseLayer !== '') createDesc.baseArrayLayer = effBaseLayer;
+        if (effLayerCount !== '') createDesc.arrayLayerCount = effLayerCount;
+        if (effBaseMip !== '') createDesc.baseMipLevel = effBaseMip;
+        if (effMipCount !== '') createDesc.mipLevelCount = effMipCount;
+      }
+
+      try {
+        const view = texture.createView(createDesc);
+        if (view && typeof view === 'object') {
+          if (!record) {
+            const byKey = new Map();
+            byKey.set(key, view);
+            this._textureViewCache.set(texture, { defaultView: null, byKey });
+          } else {
+            if (record.byKey === null) {
+              record.byKey = new Map();
+            } else if (record.byKey.size >= MAX_VIEWS_PER_TEXTURE) {
+              const oldestKey = record.byKey.keys().next().value;
+              record.byKey.delete(oldestKey);
+              this._stats.textureViewCacheEvictions += 1;
+            }
+            record.byKey.set(key, view);
+          }
+        }
+        return view;
+      } catch (_err) {
+        return null;
+      }
+    }
+
+    _resolveTextureViewCached(resource, viewDescriptor) {
+      if (!isValidTextureOrView(resource)) {
+        return null;
+      }
+      if (resource.textureView && isValidTextureOrView(resource.textureView)) {
+        if (resource.texture && resource.texture.destroyed === true) {
+          return null;
+        }
+        return resource.textureView;
+      }
+      if (resource.texture) {
+        const tex = resource.texture;
+        if (!isValidTextureOrView(tex)) {
+          if (this._textureViewCache.has(tex)) {
+            this._textureViewCache.delete(tex);
+            this._stats.textureViewCacheEvictions += 1;
+          }
+          return null;
+        }
+        const desc =
+          viewDescriptor !== undefined
+            ? viewDescriptor
+            : resource.viewDescriptor !== undefined
+              ? resource.viewDescriptor
+              : resource.viewDesc;
+        return this.getOrCreateTextureView(tex, desc);
+      }
+      if (typeof resource.createView === 'function') {
+        return this.getOrCreateTextureView(resource, viewDescriptor);
       }
       return resource;
     }
@@ -1823,63 +2200,682 @@
       }
     }
 
+    _clearBgCacheInternal() {
+      this._bgBuckets.clear();
+      this._bgHead = null;
+      this._bgTail = null;
+      this._bgCacheSize = 0;
+      this._bgResourceIndex = new WeakMap();
+    }
+
     /**
      * Clear the device-scoped bind-group reuse cache and derived view/layout caches.
      */
-    clearBindGroupCache() {
-      this._bindGroupCache.clear();
+    clearCache() {
+      this._clearBgCacheInternal();
       this._textureViewCache = new WeakMap();
       this._bindGroupLayoutCache = new WeakMap();
       this._clearBoundBindGroups();
     }
 
-    _getOrCreateCachedBindGroupInternal(cacheKey, getLayoutFn, label, entries, trackedResources) {
-      if (this._enableBindGroupCache && cacheKey) {
-        const cached = this._bindGroupCache.get(cacheKey);
-        if (cached) {
-          if (isCachedBindGroupValid(cached)) {
-            if (this._bindGroupCache.size > 1) {
-              this._bindGroupCache.delete(cacheKey);
-              this._bindGroupCache.set(cacheKey, cached);
+    /**
+     * Alias for `clearCache()` preserved for backwards compatibility.
+     */
+    clearBindGroupCache() {
+      this.clearCache();
+    }
+
+    _bgLinkToHead(node) {
+      node.lruPrev = null;
+      node.lruNext = this._bgHead;
+      if (this._bgHead !== null) {
+        this._bgHead.lruPrev = node;
+      } else {
+        this._bgTail = node;
+      }
+      this._bgHead = node;
+    }
+
+    _bgPromoteToHead(node) {
+      if (this._bgHead === node) {
+        return;
+      }
+      const prev = node.lruPrev;
+      const next = node.lruNext;
+      if (prev !== null) prev.lruNext = next;
+      if (next !== null) next.lruPrev = prev;
+      if (this._bgTail === node) this._bgTail = prev;
+      node.lruPrev = null;
+      node.lruNext = this._bgHead;
+      if (this._bgHead !== null) {
+        this._bgHead.lruPrev = node;
+      } else {
+        this._bgTail = node;
+      }
+      this._bgHead = node;
+    }
+
+    _bgUnlinkNode(node) {
+      // 1. Unlink from hash bucket chain.
+      const h = node.hash;
+      const bPrev = node.bucketPrev;
+      const bNext = node.bucketNext;
+      if (bPrev !== null) {
+        bPrev.bucketNext = bNext;
+      } else if (bNext !== null) {
+        this._bgBuckets.set(h, bNext);
+      } else {
+        this._bgBuckets.delete(h);
+      }
+      if (bNext !== null) {
+        bNext.bucketPrev = bPrev;
+      }
+      node.bucketPrev = null;
+      node.bucketNext = null;
+
+      // 2. Unlink from doubly-linked LRU list.
+      const lPrev = node.lruPrev;
+      const lNext = node.lruNext;
+      if (lPrev !== null) lPrev.lruNext = lNext;
+      else if (this._bgHead === node) this._bgHead = lNext;
+      if (lNext !== null) lNext.lruPrev = lPrev;
+      else if (this._bgTail === node) this._bgTail = lPrev;
+      node.lruPrev = null;
+      node.lruNext = null;
+
+      // 3. Remove from reverse resource index.
+      const tracked = node.resources;
+      if (tracked !== null) {
+        for (let i = 0; i < tracked.length; i += 1) {
+          const r = tracked[i];
+          if (r && (typeof r === 'object' || typeof r === 'function')) {
+            const set = this._bgResourceIndex.get(r);
+            if (set !== undefined) {
+              set.delete(node);
+              if (set.size === 0) {
+                this._bgResourceIndex.delete(r);
+              }
             }
-            this._stats.bindGroupCacheHits += 1;
-            return { bindGroup: cached.bindGroup, cacheHit: true };
           }
-          this._bindGroupCache.delete(cacheKey);
-          this._stats.bindGroupCacheEvictions += 1;
         }
       }
+      this._bgCacheSize -= 1;
+    }
 
-      this._stats.bindGroupCacheMisses += 1;
-      const layout = getLayoutFn();
-      const bindGroup = this._device.createBindGroup({
-        label,
-        layout,
-        entries,
-      });
-
-      if (this._enableBindGroupCache && cacheKey && bindGroup) {
-        if (this._bindGroupCache.size >= this._maxBindGroupCacheEntries) {
-          const oldestKey = this._bindGroupCache.keys().next().value;
-          this._bindGroupCache.delete(oldestKey);
-          this._stats.bindGroupCacheEvictions += 1;
+    _bgRegisterResourceIndex(node, tracked) {
+      if (!tracked) return;
+      for (let i = 0; i < tracked.length; i += 1) {
+        const r = tracked[i];
+        if (!r || (typeof r !== 'object' && typeof r !== 'function')) continue;
+        let set = this._bgResourceIndex.get(r);
+        if (set === undefined) {
+          set = new Set();
+          this._bgResourceIndex.set(r, set);
         }
-        this._bindGroupCache.set(cacheKey, {
-          bindGroup,
-          resources: trackedResources || null,
-        });
+        set.add(node);
       }
+    }
 
-      return { bindGroup, cacheHit: false };
+    _bgNodeMatches(
+      node,
+      ownerKind,
+      owner,
+      groupIndex,
+      count,
+      bindings,
+      kinds,
+      resA,
+      resB,
+      genA,
+      genB,
+      offs,
+      sizes
+    ) {
+      if (
+        node.ownerKind !== ownerKind ||
+        node.owner !== owner ||
+        node.groupIndex !== groupIndex ||
+        node.entryCount !== count
+      ) {
+        return false;
+      }
+      const nb = node.bindings;
+      const nk = node.kinds;
+      const na = node.resA;
+      const nbRes = node.resB;
+      const nga = node.genA;
+      const ngb = node.genB;
+      const no = node.offs;
+      const ns = node.sizes;
+      for (let i = 0; i < count; i += 1) {
+        if (
+          nb[i] !== bindings[i] ||
+          nk[i] !== kinds[i] ||
+          na[i] !== resA[i] ||
+          nbRes[i] !== resB[i] ||
+          nga[i] !== genA[i] ||
+          ngb[i] !== genB[i] ||
+          no[i] !== offs[i] ||
+          ns[i] !== sizes[i]
+        ) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    _bgLookupNode(
+      hash,
+      ownerKind,
+      owner,
+      groupIndex,
+      count,
+      bindings,
+      kinds,
+      resA,
+      resB,
+      genA,
+      genB,
+      offs,
+      sizes
+    ) {
+      if (!this._enableBindGroupCache || this._bgCacheSize === 0) {
+        return null;
+      }
+      let node = this._bgBuckets.get(hash);
+      while (node !== undefined && node !== null) {
+        const next = node.bucketNext;
+        if (
+          this._bgNodeMatches(
+            node,
+            ownerKind,
+            owner,
+            groupIndex,
+            count,
+            bindings,
+            kinds,
+            resA,
+            resB,
+            genA,
+            genB,
+            offs,
+            sizes
+          )
+        ) {
+          if (isCachedBindGroupValid(node)) {
+            this._bgPromoteToHead(node);
+            this._stats.bindGroupCacheHits += 1;
+            return node.bindGroup;
+          }
+          this._bgUnlinkNode(node);
+          this._stats.bindGroupCacheEvictions += 1;
+          return null;
+        }
+        node = next;
+      }
+      return null;
+    }
+
+    _bgStoreNode(
+      hash,
+      ownerKind,
+      owner,
+      groupIndex,
+      count,
+      bindings,
+      kinds,
+      resA,
+      resB,
+      genA,
+      genB,
+      offs,
+      sizes,
+      bindGroup,
+      trackedResources
+    ) {
+      if (!this._enableBindGroupCache || !bindGroup) {
+        return;
+      }
+      while (this._bgCacheSize >= this._maxBindGroupCacheEntries && this._bgTail !== null) {
+        this._bgUnlinkNode(this._bgTail);
+        this._stats.bindGroupCacheEvictions += 1;
+      }
+      const cBindings = new Int32Array(count);
+      const cKinds = new Uint8Array(count);
+      const cResA = new Array(count);
+      const cResB = new Array(count);
+      const cGenA = new Int32Array(count);
+      const cGenB = new Int32Array(count);
+      const cOffs = new Float64Array(count);
+      const cSizes = new Float64Array(count);
+      for (let i = 0; i < count; i += 1) {
+        cBindings[i] = bindings[i];
+        cKinds[i] = kinds[i];
+        cResA[i] = resA[i];
+        cResB[i] = resB[i];
+        cGenA[i] = genA[i];
+        cGenB[i] = genB[i];
+        cOffs[i] = offs[i];
+        cSizes[i] = sizes[i];
+      }
+      let generations = null;
+      if (trackedResources && trackedResources.length > 0) {
+        let hasGen = false;
+        for (let i = 0; i < trackedResources.length; i += 1) {
+          const r = trackedResources[i];
+          if (r && typeof r.generation === 'number') {
+            hasGen = true;
+            break;
+          }
+        }
+        if (hasGen) {
+          generations = new Array(trackedResources.length);
+          for (let i = 0; i < trackedResources.length; i += 1) {
+            generations[i] = getResourceGeneration(trackedResources[i]);
+          }
+        }
+      }
+      const existingHead = this._bgBuckets.get(hash) || null;
+      const node = {
+        hash,
+        ownerKind,
+        owner,
+        groupIndex,
+        entryCount: count,
+        bindings: cBindings,
+        kinds: cKinds,
+        resA: cResA,
+        resB: cResB,
+        genA: cGenA,
+        genB: cGenB,
+        offs: cOffs,
+        sizes: cSizes,
+        bindGroup,
+        resources: trackedResources || null,
+        generations,
+        bucketPrev: null,
+        bucketNext: existingHead,
+        lruPrev: null,
+        lruNext: null,
+      };
+      if (existingHead !== null) {
+        existingHead.bucketPrev = node;
+      }
+      this._bgBuckets.set(hash, node);
+      this._bgLinkToHead(node);
+      this._bgRegisterResourceIndex(node, trackedResources);
+      this._bgCacheSize += 1;
     }
 
     /**
-     * Look up or create a cached GPUBindGroup keyed by layout + entry resource identities.
-     * Automatically invalidates cached entries whose backing resources are destroyed.
+     * Invalidate all cached `GPUTextureView` and `GPUBindGroup` entries referencing
+     * `resource` in O(1) via reverse WeakMap index (call when a texture, buffer, or
+     * sampler is replaced or destroyed).
+     *
+     * @param {object | null | undefined} resource
+     * @returns {number} Number of evicted cache entries
+     */
+    invalidateResource(resource) {
+      if (!resource || typeof resource !== 'object') {
+        return 0;
+      }
+      let evicted = 0;
+      if (this._textureViewCache.has(resource)) {
+        this._textureViewCache.delete(resource);
+        this._stats.textureViewCacheEvictions += 1;
+        evicted += 1;
+      }
+      const nodes = this._bgResourceIndex.get(resource);
+      if (nodes !== undefined && nodes.size > 0) {
+        const toEvict = Array.from(nodes);
+        for (let i = 0; i < toEvict.length; i += 1) {
+          this._bgUnlinkNode(toEvict[i]);
+          this._stats.bindGroupCacheEvictions += 1;
+          evicted += 1;
+        }
+        this._clearBoundBindGroups();
+      }
+      return evicted;
+    }
+
+    invalidateTexture(texture) {
+      return this.invalidateResource(texture);
+    }
+
+    invalidateBuffer(buffer) {
+      return this.invalidateResource(buffer);
+    }
+
+    _getOrCreateBindGroupStructured(ownerKind, owner, groupIndex, entries, label) {
+      const count = entries.length;
+      const useScratch = count <= MAX_FAST_BG_CACHE_ENTRIES;
+      const bindings = useScratch ? this._bgScratchBindings : new Int32Array(count);
+      const kinds = useScratch ? this._bgScratchKinds : new Uint8Array(count);
+      const resA = useScratch ? this._bgScratchResA : new Array(count);
+      const resB = useScratch ? this._bgScratchResB : new Array(count);
+      const idA = useScratch ? this._bgScratchIdA : new Int32Array(count);
+      const idB = useScratch ? this._bgScratchIdB : new Int32Array(count);
+      const genA = useScratch ? this._bgScratchGenA : new Int32Array(count);
+      const genB = useScratch ? this._bgScratchGenB : new Int32Array(count);
+      const offs = useScratch ? this._bgScratchOff : new Float64Array(count);
+      const sizes = useScratch ? this._bgScratchSize : new Float64Array(count);
+
+      let needsSort = false;
+      let anyTextureResolved = false;
+
+      // Pass 1: validate entries, resolve GPUTexture -> cached GPUTextureView, populate flat
+      // scratch slots with ZERO string, array, or object allocations on the 1..8 entry hit path.
+      for (let i = 0; i < count; i += 1) {
+        const entry = entries[i];
+        if (!entry || typeof entry !== 'object') {
+          if (useScratch) {
+            for (let k = 0; k < i; k += 1) {
+              resA[k] = null;
+              resB[k] = null;
+            }
+          }
+          this._stats.bindGroupErrors += 1;
+          return null;
+        }
+        const bNum = entry.binding | 0;
+        if (i > 0 && bNum < bindings[i - 1]) {
+          needsSort = true;
+        }
+        bindings[i] = bNum;
+        const res = entry.resource;
+        if (res && typeof res === 'object' && res.buffer !== undefined) {
+          const buf = res.buffer;
+          if (!buf || buf.destroyed === true) {
+            if (useScratch) {
+              for (let k = 0; k < i; k += 1) {
+                resA[k] = null;
+                resB[k] = null;
+              }
+            }
+            this._stats.bindGroupErrors += 1;
+            return null;
+          }
+          kinds[i] = BG_ENTRY_KIND_BUFFER;
+          resA[i] = buf;
+          resB[i] = null;
+          idA[i] = this._getResourceId(buf);
+          idB[i] = 0;
+          genA[i] = getResourceGeneration(buf);
+          genB[i] = 0;
+          offs[i] = res.offset !== undefined ? res.offset : 0;
+          sizes[i] = res.size !== undefined && res.size !== null ? res.size : -1;
+        } else if (
+          res &&
+          typeof res === 'object' &&
+          (typeof res.createView === 'function' || res.texture !== undefined)
+        ) {
+          const srcTex = res.texture !== undefined ? res.texture : res;
+          if (!srcTex || srcTex.destroyed === true) {
+            if (srcTex && this._textureViewCache.has(srcTex)) {
+              this._textureViewCache.delete(srcTex);
+              this._stats.textureViewCacheEvictions += 1;
+            }
+            if (useScratch) {
+              for (let k = 0; k < i; k += 1) {
+                resA[k] = null;
+                resB[k] = null;
+              }
+            }
+            this._stats.bindGroupErrors += 1;
+            return null;
+          }
+          const viewDesc =
+            res.viewDescriptor !== undefined
+              ? res.viewDescriptor
+              : res.viewDesc !== undefined
+                ? res.viewDesc
+                : undefined;
+          const view = this._resolveTextureViewCached(res, viewDesc);
+          if (!view || view.destroyed === true) {
+            if (useScratch) {
+              for (let k = 0; k < i; k += 1) {
+                resA[k] = null;
+                resB[k] = null;
+              }
+            }
+            this._stats.bindGroupErrors += 1;
+            return null;
+          }
+          kinds[i] = BG_ENTRY_KIND_TEXTURE;
+          resA[i] = srcTex;
+          resB[i] = view;
+          idA[i] = this._getResourceId(srcTex);
+          idB[i] = this._getResourceId(view);
+          genA[i] = getResourceGeneration(srcTex);
+          genB[i] = getResourceGeneration(view);
+          offs[i] = 0;
+          sizes[i] = -1;
+          anyTextureResolved = true;
+        } else {
+          if (!res || res.destroyed === true || (res.texture && res.texture.destroyed === true)) {
+            if (useScratch) {
+              for (let k = 0; k < i; k += 1) {
+                resA[k] = null;
+                resB[k] = null;
+              }
+            }
+            this._stats.bindGroupErrors += 1;
+            return null;
+          }
+          kinds[i] = BG_ENTRY_KIND_RAW;
+          resA[i] = res;
+          resB[i] = null;
+          idA[i] = this._getResourceId(res);
+          idB[i] = 0;
+          genA[i] = getResourceGeneration(res);
+          genB[i] = 0;
+          offs[i] = 0;
+          sizes[i] = -1;
+        }
+      }
+
+      // In-place insertion sort by binding number ONLY when out-of-order (zero allocations).
+      if (needsSort) {
+        for (let i = 1; i < count; i += 1) {
+          const kb = bindings[i];
+          const kk = kinds[i];
+          const kra = resA[i];
+          const krb = resB[i];
+          const kia = idA[i];
+          const kib = idB[i];
+          const kga = genA[i];
+          const kgb = genB[i];
+          const ko = offs[i];
+          const ks = sizes[i];
+          let j = i - 1;
+          while (j >= 0 && bindings[j] > kb) {
+            bindings[j + 1] = bindings[j];
+            kinds[j + 1] = kinds[j];
+            resA[j + 1] = resA[j];
+            resB[j + 1] = resB[j];
+            idA[j + 1] = idA[j];
+            idB[j + 1] = idB[j];
+            genA[j + 1] = genA[j];
+            genB[j + 1] = genB[j];
+            offs[j + 1] = offs[j];
+            sizes[j + 1] = sizes[j];
+            j -= 1;
+          }
+          bindings[j + 1] = kb;
+          kinds[j + 1] = kk;
+          resA[j + 1] = kra;
+          resB[j + 1] = krb;
+          idA[j + 1] = kia;
+          idB[j + 1] = kib;
+          genA[j + 1] = kga;
+          genB[j + 1] = kgb;
+          offs[j + 1] = ko;
+          sizes[j + 1] = ks;
+        }
+      }
+
+      let h = -2128831035 | 0; // FNV-1a 32-bit offset basis
+      h = hashMixInt32(h, ownerKind);
+      h = hashMixInt32(h, this._getResourceId(owner));
+      h = hashMixInt32(h, groupIndex);
+      h = hashMixInt32(h, count);
+      for (let i = 0; i < count; i += 1) {
+        h = hashMixInt32(h, bindings[i]);
+        h = hashMixInt32(h, kinds[i]);
+        h = hashMixInt32(h, idA[i]);
+        h = hashMixInt32(h, genA[i]);
+        if (kinds[i] === BG_ENTRY_KIND_BUFFER) {
+          h = hashMixNum(h, offs[i]);
+          h = hashMixNum(h, sizes[i]);
+        } else if (kinds[i] === BG_ENTRY_KIND_TEXTURE) {
+          h = hashMixInt32(h, idB[i]);
+          h = hashMixInt32(h, genB[i]);
+        }
+      }
+
+      const cachedBg = this._bgLookupNode(
+        h,
+        ownerKind,
+        owner,
+        groupIndex,
+        count,
+        bindings,
+        kinds,
+        resA,
+        resB,
+        genA,
+        genB,
+        offs,
+        sizes
+      );
+      if (cachedBg !== null) {
+        if (useScratch) {
+          for (let k = 0; k < count; k += 1) {
+            resA[k] = null;
+            resB[k] = null;
+          }
+        }
+        return cachedBg;
+      }
+
+      // Cache miss: build resolved entries (only if any GPUTexture was passed) using the already-resolved
+      // views in resB (zero duplicate _resolveTextureViewCached calls) and collect trackedResources.
+      let createEntries = entries;
+      if (anyTextureResolved) {
+        createEntries = new Array(count);
+        for (let i = 0; i < count; i += 1) {
+          const entry = entries[i];
+          const res = entry.resource;
+          if (
+            res &&
+            typeof res === 'object' &&
+            (typeof res.createView === 'function' || res.texture !== undefined)
+          ) {
+            let view = null;
+            if (!needsSort) {
+              view = resB[i];
+            } else {
+              const targetBinding = entry.binding | 0;
+              for (let j = 0; j < count; j += 1) {
+                if (bindings[j] === targetBinding && kinds[j] === BG_ENTRY_KIND_TEXTURE) {
+                  view = resB[j];
+                  break;
+                }
+              }
+            }
+            createEntries[i] = { binding: entry.binding, resource: view };
+          } else {
+            createEntries[i] = entry;
+          }
+        }
+      }
+
+      const trackedResources = [];
+      for (let i = 0; i < count; i += 1) {
+        const k = kinds[i];
+        const ra = resA[i];
+        if (k === BG_ENTRY_KIND_BUFFER) {
+          trackedResources.push(ra);
+        } else if (k === BG_ENTRY_KIND_TEXTURE) {
+          trackedResources.push(ra);
+          const rb = resB[i];
+          if (rb && rb !== ra) {
+            trackedResources.push(rb);
+          }
+        } else if (ra) {
+          trackedResources.push(ra);
+          if (ra.texture && ra.texture !== ra) {
+            trackedResources.push(ra.texture);
+          }
+        }
+      }
+
+      try {
+        this._stats.bindGroupCacheMisses += 1;
+        const layout =
+          ownerKind === BG_OWNER_LAYOUT
+            ? owner
+            : this._getPipelineBindGroupLayout(owner, groupIndex);
+        const effectiveLabel =
+          typeof label === 'string' && label.length > 0
+            ? label
+            : ownerKind === BG_OWNER_LAYOUT
+              ? 'draw_executor:cached_bg'
+              : `draw_executor:pipe_bg_${groupIndex}`;
+        const bindGroup = this._device.createBindGroup({
+          label: effectiveLabel,
+          layout,
+          entries: createEntries,
+        });
+        this._bgStoreNode(
+          h,
+          ownerKind,
+          owner,
+          groupIndex,
+          count,
+          bindings,
+          kinds,
+          resA,
+          resB,
+          genA,
+          genB,
+          offs,
+          sizes,
+          bindGroup,
+          trackedResources
+        );
+        if (useScratch) {
+          for (let k = 0; k < count; k += 1) {
+            resA[k] = null;
+            resB[k] = null;
+          }
+        }
+        return bindGroup;
+      } catch (err) {
+        if (useScratch) {
+          for (let k = 0; k < count; k += 1) {
+            resA[k] = null;
+            resB[k] = null;
+          }
+        }
+        this._stats.bindGroupErrors += 1;
+        this._warn('getOrCreateBindGroup failed', {
+          label,
+          error: String(err && err.message ? err.message : err),
+        });
+        return null;
+      }
+    }
+
+    /**
+     * Look up or create a cached GPUBindGroup keyed by `(layout, groupIndex?, entryResources)`.
+     * Automatically resolves `GPUTexture` / `{ texture, viewDescriptor }` entries through the
+     * per-`(texture, viewDescriptorKey)` view cache and invalidates cached bind groups when
+     * backing resources are destroyed or change generation.
      *
      * @param {object} layout GPUBindGroupLayout
      * @param {Array<{ binding: number, resource: object }>} entries
-     * @param {{ label?: string }} [options]
+     * @param {{ label?: string, groupIndex?: number }} [options]
      * @returns {object | null}
      */
     getOrCreateBindGroup(layout, entries, options) {
@@ -1893,65 +2889,47 @@
         return null;
       }
 
-      const label =
-        options && typeof options.label === 'string' && options.label.length > 0
-          ? options.label
-          : 'draw_executor:cached_bg';
+      const label = options && typeof options.label === 'string' ? options.label : null;
+      const groupIndex =
+        options && Number.isInteger(options.groupIndex) && options.groupIndex >= 0
+          ? options.groupIndex
+          : -1;
+      return this._getOrCreateBindGroupStructured(BG_OWNER_LAYOUT, layout, groupIndex, entries, label);
+    }
 
-      let ordered = entries;
-      for (let i = 1; i < entries.length; i += 1) {
-        if (entries[i].binding < entries[i - 1].binding) {
-          ordered = entries.slice().sort((a, b) => a.binding - b.binding);
-          break;
-        }
-      }
-
-      const trackedResources = [];
-      let cacheKey = `custom|${this._getResourceId(layout)}`;
-      for (let i = 0; i < ordered.length; i += 1) {
-        const entry = ordered[i];
-        if (!entry || typeof entry !== 'object') {
-          this._stats.bindGroupErrors += 1;
-          return null;
-        }
-        const res = entry.resource;
-        if (res && typeof res === 'object' && res.buffer !== undefined) {
-          const buf = res.buffer;
-          if (!buf || buf.destroyed === true) {
-            this._stats.bindGroupErrors += 1;
-            return null;
-          }
-          trackedResources.push(buf);
-          const off = res.offset !== undefined ? res.offset : 0;
-          const sz = res.size !== undefined && res.size !== null ? res.size : 'all';
-          cacheKey += `|b:${entry.binding}:${this._getResourceId(buf)}:${off}:${sz}`;
-        } else {
-          if (!res || res.destroyed === true) {
-            this._stats.bindGroupErrors += 1;
-            return null;
-          }
-          trackedResources.push(res);
-          cacheKey += `|r:${entry.binding}:${this._getResourceId(res)}`;
-        }
-      }
-
-      try {
-        const res = this._getOrCreateCachedBindGroupInternal(
-          cacheKey,
-          () => layout,
-          label,
-          entries,
-          trackedResources
-        );
-        return res.bindGroup;
-      } catch (err) {
+    /**
+     * Look up or create a cached GPUBindGroup keyed by `(pipeline, groupIndex, entryResources)`.
+     * Avoids calling `pipeline.getBindGroupLayout(groupIndex)` and `device.createBindGroup()`
+     * on cache hits across draws and compute dispatches.
+     *
+     * @param {object} pipeline GPURenderPipeline or GPUComputePipeline
+     * @param {number} groupIndex
+     * @param {Array<{ binding: number, resource: object }>} entries
+     * @param {{ label?: string }} [options]
+     * @returns {object | null}
+     */
+    getOrCreateBindGroupForPipeline(pipeline, groupIndex, entries, options) {
+      if (
+        !this._device ||
+        typeof this._device.createBindGroup !== 'function' ||
+        !pipeline ||
+        typeof pipeline.getBindGroupLayout !== 'function' ||
+        !Number.isInteger(groupIndex) ||
+        groupIndex < 0 ||
+        !Array.isArray(entries)
+      ) {
         this._stats.bindGroupErrors += 1;
-        this._warn('getOrCreateBindGroup failed', {
-          label,
-          error: String(err && err.message ? err.message : err),
-        });
         return null;
       }
+
+      const label = options && typeof options.label === 'string' ? options.label : null;
+      return this._getOrCreateBindGroupStructured(
+        BG_OWNER_PIPELINE,
+        pipeline,
+        groupIndex,
+        entries,
+        label
+      );
     }
 
     setDevice(device) {
@@ -1959,7 +2937,7 @@
         this._destroySyntheticResources();
         this._fallbackPipelineCache.clear();
         this._fallbackShaderModuleCache.clear();
-        this._bindGroupCache.clear();
+        this._clearBgCacheInternal();
         this._wgslHashCache.clear();
         this._textureViewCache = new WeakMap();
         this._bindGroupLayoutCache = new WeakMap();
@@ -2061,6 +3039,7 @@
      */
     resetState() {
       this._activePipeline = null;
+      this._activeComputePipeline = null;
 
       let vbMask = this._stagedVbMask;
       while (vbMask !== 0) {
@@ -2662,6 +3641,10 @@
 
     setPipeline(pipelineOrDesc) {
       this._activePipeline = pipelineOrDesc !== undefined ? pipelineOrDesc : null;
+    }
+
+    setComputePipeline(pipelineOrDesc) {
+      this._activeComputePipeline = pipelineOrDesc !== undefined ? pipelineOrDesc : null;
     }
 
     setVertexBuffer(slot, buffer, offsetOrOptions, size) {
@@ -3459,41 +4442,8 @@
       };
 
       // Propagate explicit override hints when passed directly to executeDraw / resolve.
-      const passthroughKeys = [
-        'hasBoundCbv',
-        'hasCbv',
-        'cbvCount',
-        'cbv',
-        'cbvBuffer',
-        'uniformBuffer',
-        'hasBoundTexture',
-        'hasTexture',
-        'hasSampledTexture',
-        'hasBoundSampledTexture',
-        'hasBoundSrv',
-        'textureCount',
-        'srvCount',
-        'texture',
-        'textureView',
-        'srv',
-        'hasBoundSampler',
-        'hasSampler',
-        'samplerCount',
-        'sampler',
-        'vertexShaderHash',
-        'fragmentShaderHash',
-        'vertexShader',
-        'fragmentShader',
-        'topology',
-        'isRectList',
-        'format',
-        'sampleCount',
-        'depthStencilFormat',
-        'isFallback',
-        'usesFallbackShaders',
-      ];
-      for (let i = 0; i < passthroughKeys.length; i += 1) {
-        const key = passthroughKeys[i];
+      for (let i = 0; i < PASSTHROUGH_DRAW_STATE_KEYS.length; i += 1) {
+        const key = PASSTHROUGH_DRAW_STATE_KEYS[i];
         if (ov[key] !== undefined) {
           state[key] = ov[key];
         }
@@ -3979,6 +4929,26 @@
       }
     }
 
+    _getStagedBg0Entries() {
+      if ((this._stagedBgMask & 1) === 0) {
+        return null;
+      }
+      const meta = this._stagedBgMeta[0];
+      if (meta && Array.isArray(meta.entries)) {
+        return meta.entries;
+      }
+      const raw = this._stagedBgRaw[0];
+      if (raw) {
+        if (Array.isArray(raw.entries)) {
+          return raw.entries;
+        }
+        if (raw.desc && Array.isArray(raw.desc.entries)) {
+          return raw.desc.entries;
+        }
+      }
+      return null;
+    }
+
     _findBoundCbvCandidate(drawState) {
       if (drawState.cbvBuffer) {
         return { buffer: drawState.cbvBuffer, offset: 0, size: null };
@@ -3997,19 +4967,24 @@
       for (const entry of this._cbvs.values()) {
         return entry;
       }
-      const bg0 = this._materializeStagedBindGroupDescriptor(0);
-      if (bg0 && bg0.cbvBuffer) {
-        return { buffer: bg0.cbvBuffer, offset: 0, size: null };
-      }
-      if (bg0 && Array.isArray(bg0.entries)) {
-        for (let i = 0; i < bg0.entries.length; i += 1) {
-          const e = bg0.entries[i];
-          if (e && e.resource && typeof e.resource === 'object' && e.resource.buffer) {
-            return {
-              buffer: e.resource.buffer,
-              offset: e.resource.offset || 0,
-              size: e.resource.size !== undefined ? e.resource.size : null,
-            };
+      if ((this._stagedBgMask & 1) !== 0) {
+        const meta = this._stagedBgMeta[0];
+        const raw = this._stagedBgRaw[0];
+        const cbvBuffer = (meta && meta.cbvBuffer) || (raw && raw.cbvBuffer) || null;
+        if (cbvBuffer) {
+          return { buffer: cbvBuffer, offset: 0, size: null };
+        }
+        const entries = this._getStagedBg0Entries();
+        if (entries) {
+          for (let i = 0; i < entries.length; i += 1) {
+            const e = entries[i];
+            if (e && e.resource && typeof e.resource === 'object' && e.resource.buffer) {
+              return {
+                buffer: e.resource.buffer,
+                offset: e.resource.offset || 0,
+                size: e.resource.size !== undefined ? e.resource.size : null,
+              };
+            }
           }
         }
       }
@@ -4024,24 +4999,29 @@
       for (const tex of this._textures.values()) {
         return tex;
       }
-      const bg0 = this._materializeStagedBindGroupDescriptor(0);
-      if (bg0 && bg0.textureView) return bg0.textureView;
-      if (bg0 && Array.isArray(bg0.entries)) {
-        for (let i = 0; i < bg0.entries.length; i += 1) {
-          const e = bg0.entries[i];
-          if (!e) continue;
-          if (e.textureView) return e.textureView;
-          if (e.texture) return e.texture;
-          if (
-            e.resource &&
-            typeof e.resource === 'object' &&
-            (e.type === 'texture' ||
-              e.resourceType === 1 ||
-              e.resourceType === 'textureView' ||
-              e.resource.kind === 'GPUTextureView' ||
-              e.resource.kind === 'GPUTexture')
-          ) {
-            return e.resource;
+      if ((this._stagedBgMask & 1) !== 0) {
+        const meta = this._stagedBgMeta[0];
+        const raw = this._stagedBgRaw[0];
+        const textureView = (meta && meta.textureView) || (raw && raw.textureView) || null;
+        if (textureView) return textureView;
+        const entries = this._getStagedBg0Entries();
+        if (entries) {
+          for (let i = 0; i < entries.length; i += 1) {
+            const e = entries[i];
+            if (!e) continue;
+            if (e.textureView) return e.textureView;
+            if (e.texture) return e.texture;
+            if (
+              e.resource &&
+              typeof e.resource === 'object' &&
+              (e.type === 'texture' ||
+                e.resourceType === 1 ||
+                e.resourceType === 'textureView' ||
+                e.resource.kind === 'GPUTextureView' ||
+                e.resource.kind === 'GPUTexture')
+            ) {
+              return e.resource;
+            }
           }
         }
       }
@@ -4054,22 +5034,27 @@
       for (const s of this._samplers.values()) {
         return s;
       }
-      const bg0 = this._materializeStagedBindGroupDescriptor(0);
-      if (bg0 && bg0.sampler) return bg0.sampler;
-      if (bg0 && Array.isArray(bg0.entries)) {
-        for (let i = 0; i < bg0.entries.length; i += 1) {
-          const e = bg0.entries[i];
-          if (!e) continue;
-          if (e.sampler) return e.sampler;
-          if (
-            e.resource &&
-            typeof e.resource === 'object' &&
-            (e.type === 'sampler' ||
-              e.resourceType === 2 ||
-              e.resourceType === 'sampler' ||
-              e.resource.kind === 'GPUSampler')
-          ) {
-            return e.resource;
+      if ((this._stagedBgMask & 1) !== 0) {
+        const meta = this._stagedBgMeta[0];
+        const raw = this._stagedBgRaw[0];
+        const sampler = (meta && meta.sampler) || (raw && raw.sampler) || null;
+        if (sampler) return sampler;
+        const entries = this._getStagedBg0Entries();
+        if (entries) {
+          for (let i = 0; i < entries.length; i += 1) {
+            const e = entries[i];
+            if (!e) continue;
+            if (e.sampler) return e.sampler;
+            if (
+              e.resource &&
+              typeof e.resource === 'object' &&
+              (e.type === 'sampler' ||
+                e.resourceType === 2 ||
+                e.resourceType === 'sampler' ||
+                e.resource.kind === 'GPUSampler')
+            ) {
+              return e.resource;
+            }
           }
         }
       }
@@ -4077,13 +5062,21 @@
     }
 
     _bindFallbackGroupForCbv(pass, pipeline, drawState) {
+      const out = this._tmpFallbackBgResult;
+      out.ok = false;
+      out.substitutedCbv = false;
+      out.substitutedTexture = false;
+      out.substitutedSampler = false;
+      out.cacheHit = false;
+      out.bindGroupElided = false;
+
       if (
         !this._device ||
         typeof this._device.createBindGroup !== 'function' ||
         typeof pipeline.getBindGroupLayout !== 'function'
       ) {
         this._stats.bindGroupErrors += 1;
-        return { ok: false, substitutedCbv: false, cacheHit: false, bindGroupElided: false };
+        return out;
       }
 
       const candidate = this._findBoundCbvCandidate(drawState);
@@ -4107,54 +5100,120 @@
         buffer = this._ensureFallbackCbvBuffer();
         if (!buffer) {
           this._stats.bindGroupErrors += 1;
-          return { ok: false, substitutedCbv: true, cacheHit: false, bindGroupElided: false };
+          out.substitutedCbv = true;
+          return out;
         }
       }
 
       try {
-        const cacheKey = `cbv|${this._getResourceId(pipeline)}|${this._getResourceId(buffer)}|${offset}|${size}`;
-        const bgEntry = this._getOrCreateCachedBindGroupInternal(
-          cacheKey,
-          () => this._getPipelineBindGroupLayout(pipeline, 0),
-          'draw_executor:fallback_cbv_bg',
-          [
-            {
-              binding: 0,
-              resource: { buffer, offset, size },
-            },
-          ],
-          [buffer]
+        const bindings = this._bgScratchBindings;
+        const kinds = this._bgScratchKinds;
+        const resA = this._bgScratchResA;
+        const resB = this._bgScratchResB;
+        const genA = this._bgScratchGenA;
+        const genB = this._bgScratchGenB;
+        const offs = this._bgScratchOff;
+        const sizes = this._bgScratchSize;
+        const bufGen = getResourceGeneration(buffer);
+        bindings[0] = 0;
+        kinds[0] = BG_ENTRY_KIND_BUFFER;
+        resA[0] = buffer;
+        resB[0] = null;
+        genA[0] = bufGen;
+        genB[0] = 0;
+        offs[0] = offset;
+        sizes[0] = size;
+
+        let h = -2128831035 | 0;
+        h = hashMixInt32(h, BG_OWNER_FALLBACK_CBV);
+        h = hashMixInt32(h, this._getResourceId(pipeline));
+        h = hashMixInt32(h, this._getResourceId(buffer));
+        h = hashMixInt32(h, bufGen);
+        h = hashMixNum(h, offset);
+        h = hashMixNum(h, size);
+
+        let bindGroup = this._bgLookupNode(
+          h,
+          BG_OWNER_FALLBACK_CBV,
+          pipeline,
+          0,
+          1,
+          bindings,
+          kinds,
+          resA,
+          resB,
+          genA,
+          genB,
+          offs,
+          sizes
         );
-        const bound = this._bindBindGroupOnPass(pass, 0, bgEntry.bindGroup, null);
-        return {
-          ok: true,
-          substitutedCbv,
-          cacheHit: bgEntry.cacheHit,
-          bindGroupElided: !bound,
-        };
+        let cacheHit = true;
+        if (!bindGroup) {
+          cacheHit = false;
+          this._stats.bindGroupCacheMisses += 1;
+          const layout = this._getPipelineBindGroupLayout(pipeline, 0);
+          bindGroup = this._device.createBindGroup({
+            label: 'draw_executor:fallback_cbv_bg',
+            layout,
+            entries: [
+              {
+                binding: 0,
+                resource: { buffer, offset, size },
+              },
+            ],
+          });
+          this._bgStoreNode(
+            h,
+            BG_OWNER_FALLBACK_CBV,
+            pipeline,
+            0,
+            1,
+            bindings,
+            kinds,
+            resA,
+            resB,
+            genA,
+            genB,
+            offs,
+            sizes,
+            bindGroup,
+            [buffer]
+          );
+        }
+        resA[0] = null;
+        const bound = this._bindBindGroupOnPass(pass, 0, bindGroup, null);
+        out.ok = true;
+        out.substitutedCbv = substitutedCbv;
+        out.cacheHit = cacheHit;
+        out.bindGroupElided = !bound;
+        return out;
       } catch (err) {
+        this._bgScratchResA[0] = null;
         this._stats.bindGroupErrors += 1;
         this._warn('Failed to bind fallback CBV bind group', {
           error: String(err && err.message ? err.message : err),
         });
-        return { ok: false, substitutedCbv, cacheHit: false, bindGroupElided: false };
+        out.substitutedCbv = substitutedCbv;
+        return out;
       }
     }
 
     _bindFallbackGroupForTexturedQuad(pass, pipeline, drawState) {
+      const out = this._tmpFallbackBgResult;
+      out.ok = false;
+      out.substitutedCbv = false;
+      out.substitutedTexture = false;
+      out.substitutedSampler = false;
+      out.cacheHit = false;
+      out.bindGroupElided = false;
+
       if (
         !this._device ||
         typeof this._device.createBindGroup !== 'function' ||
         typeof pipeline.getBindGroupLayout !== 'function'
       ) {
         this._stats.bindGroupErrors += 1;
-        return {
-          ok: false,
-          substitutedTexture: false,
-          substitutedSampler: false,
-          cacheHit: false,
-          bindGroupElided: false,
-        };
+        return out;
       }
 
       let substitutedTexture = false;
@@ -4171,13 +5230,8 @@
         sourceTexture = this._fallbackTexture;
         if (!textureView) {
           this._stats.bindGroupErrors += 1;
-          return {
-            ok: false,
-            substitutedTexture: true,
-            substitutedSampler: false,
-            cacheHit: false,
-            bindGroupElided: false,
-          };
+          out.substitutedTexture = true;
+          return out;
         }
       }
 
@@ -4189,56 +5243,133 @@
         sampler = this._ensureFallbackSampler();
         if (!sampler) {
           this._stats.bindGroupErrors += 1;
-          return {
-            ok: false,
-            substitutedTexture,
-            substitutedSampler: true,
-            cacheHit: false,
-            bindGroupElided: false,
-          };
+          out.substitutedTexture = substitutedTexture;
+          out.substitutedSampler = true;
+          return out;
         }
       }
 
       try {
-        const cacheKey = `tex|${this._getResourceId(pipeline)}|${this._getResourceId(textureView)}|${this._getResourceId(sampler)}`;
-        const tracked =
-          sourceTexture && sourceTexture !== textureView
-            ? [sourceTexture, textureView, sampler]
-            : [textureView, sampler];
-        const bgEntry = this._getOrCreateCachedBindGroupInternal(
-          cacheKey,
-          () => this._getPipelineBindGroupLayout(pipeline, 0),
-          'draw_executor:fallback_textured_quad_bg',
-          [
-            { binding: 0, resource: textureView },
-            { binding: 1, resource: sampler },
-          ],
-          tracked
+        const bindings = this._bgScratchBindings;
+        const kinds = this._bgScratchKinds;
+        const resA = this._bgScratchResA;
+        const resB = this._bgScratchResB;
+        const genA = this._bgScratchGenA;
+        const genB = this._bgScratchGenB;
+        const offs = this._bgScratchOff;
+        const sizes = this._bgScratchSize;
+        const viewGen = getResourceGeneration(textureView);
+        const smpGen = getResourceGeneration(sampler);
+        const texSrc = sourceTexture && sourceTexture !== textureView ? sourceTexture : null;
+        const srcGen = texSrc ? getResourceGeneration(texSrc) : 0;
+
+        bindings[0] = 0;
+        kinds[0] = BG_ENTRY_KIND_TEXTURE;
+        resA[0] = texSrc;
+        resB[0] = textureView;
+        genA[0] = srcGen;
+        genB[0] = viewGen;
+        offs[0] = 0;
+        sizes[0] = -1;
+
+        bindings[1] = 1;
+        kinds[1] = BG_ENTRY_KIND_RAW;
+        resA[1] = sampler;
+        resB[1] = null;
+        genA[1] = smpGen;
+        genB[1] = 0;
+        offs[1] = 0;
+        sizes[1] = -1;
+
+        let h = -2128831035 | 0;
+        h = hashMixInt32(h, BG_OWNER_FALLBACK_TEX);
+        h = hashMixInt32(h, this._getResourceId(pipeline));
+        h = hashMixInt32(h, this._getResourceId(textureView));
+        h = hashMixInt32(h, viewGen);
+        h = hashMixInt32(h, this._getResourceId(sampler));
+        h = hashMixInt32(h, smpGen);
+
+        let bindGroup = this._bgLookupNode(
+          h,
+          BG_OWNER_FALLBACK_TEX,
+          pipeline,
+          0,
+          2,
+          bindings,
+          kinds,
+          resA,
+          resB,
+          genA,
+          genB,
+          offs,
+          sizes
         );
-        const bound = this._bindBindGroupOnPass(pass, 0, bgEntry.bindGroup, null);
-        return {
-          ok: true,
-          substitutedTexture,
-          substitutedSampler,
-          cacheHit: bgEntry.cacheHit,
-          bindGroupElided: !bound,
-        };
+        let cacheHit = true;
+        if (!bindGroup) {
+          cacheHit = false;
+          this._stats.bindGroupCacheMisses += 1;
+          const layout = this._getPipelineBindGroupLayout(pipeline, 0);
+          bindGroup = this._device.createBindGroup({
+            label: 'draw_executor:fallback_textured_quad_bg',
+            layout,
+            entries: [
+              { binding: 0, resource: textureView },
+              { binding: 1, resource: sampler },
+            ],
+          });
+          const tracked = texSrc
+            ? [texSrc, textureView, sampler]
+            : [textureView, sampler];
+          this._bgStoreNode(
+            h,
+            BG_OWNER_FALLBACK_TEX,
+            pipeline,
+            0,
+            2,
+            bindings,
+            kinds,
+            resA,
+            resB,
+            genA,
+            genB,
+            offs,
+            sizes,
+            bindGroup,
+            tracked
+          );
+        }
+        resA[0] = null;
+        resB[0] = null;
+        resA[1] = null;
+        const bound = this._bindBindGroupOnPass(pass, 0, bindGroup, null);
+        out.ok = true;
+        out.substitutedTexture = substitutedTexture;
+        out.substitutedSampler = substitutedSampler;
+        out.cacheHit = cacheHit;
+        out.bindGroupElided = !bound;
+        return out;
       } catch (err) {
+        this._bgScratchResA[0] = null;
+        this._bgScratchResB[0] = null;
+        this._bgScratchResA[1] = null;
         this._stats.bindGroupErrors += 1;
         this._warn('Failed to bind fallback textured quad bind group', {
           error: String(err && err.message ? err.message : err),
         });
-        return {
-          ok: false,
-          substitutedTexture,
-          substitutedSampler,
-          cacheHit: false,
-          bindGroupElided: false,
-        };
+        out.substitutedTexture = substitutedTexture;
+        out.substitutedSampler = substitutedSampler;
+        return out;
       }
     }
 
     _bindFallbackVertexBuffer24B(pass, drawState, vertexCount, firstVertex) {
+      const out = this._tmpFallbackVbResult;
+      out.ok = false;
+      out.substitutedVertexBuffer = false;
+      out.vertexBufferElided = false;
+      out.effectiveVertexCount = 0;
+      out.effectiveFirstVertex = 0;
+
       const hasSlot0 = (this._stagedVbMask & 1) !== 0;
       const fallbackSlot0 = !hasSlot0 && Array.isArray(drawState.vertexBuffers)
         ? drawState.vertexBuffers[0]
@@ -4270,13 +5401,11 @@
         const size = hasSlot0 ? this._stagedVbSizes[0] : fallbackSlot0.size;
         try {
           const bound = this._bindVertexBufferOnPass(pass, 0, buffer, offset, size);
-          return {
-            ok: true,
-            substitutedVertexBuffer: false,
-            vertexBufferElided: !bound,
-            effectiveVertexCount: vertexCount,
-            effectiveFirstVertex: firstVertex,
-          };
+          out.ok = true;
+          out.vertexBufferElided = !bound;
+          out.effectiveVertexCount = vertexCount;
+          out.effectiveFirstVertex = firstVertex;
+          return out;
         } catch (err) {
           this._warn('setVertexBuffer threw on bound 24B vertex buffer; substituting synthetic quad', {
             error: String(err && err.message ? err.message : err),
@@ -4286,58 +5415,46 @@
 
       this._stats.invalidVertexBufferGuards += 1;
       this._stats.vertexBufferSubstitutions += 1;
+      out.substitutedVertexBuffer = true;
       const fallbackVb = this._ensureFallbackVertexBuffer24B();
       if (!fallbackVb) {
-        return {
-          ok: false,
-          substitutedVertexBuffer: true,
-          vertexBufferElided: false,
-          effectiveVertexCount: 0,
-          effectiveFirstVertex: 0,
-        };
+        return out;
       }
 
       try {
         const bound = this._bindVertexBufferOnPass(pass, 0, fallbackVb, 0, null);
         // Synthetic fallback quad holds 6 vertices (2 triangles); clamp non-indexed draw range safely.
         const clampedCount = drawState.indexed ? vertexCount : Math.min(Math.max(vertexCount, 3), 6);
-        return {
-          ok: true,
-          substitutedVertexBuffer: true,
-          vertexBufferElided: !bound,
-          effectiveVertexCount: clampedCount,
-          effectiveFirstVertex: 0,
-        };
+        out.ok = true;
+        out.vertexBufferElided = !bound;
+        out.effectiveVertexCount = clampedCount;
+        out.effectiveFirstVertex = 0;
+        return out;
       } catch (err) {
         this._stats.passErrors += 1;
         this._warn('Failed to bind synthetic 24B fallback vertex buffer', {
           error: String(err && err.message ? err.message : err),
         });
-        return {
-          ok: false,
-          substitutedVertexBuffer: true,
-          vertexBufferElided: false,
-          effectiveVertexCount: 0,
-          effectiveFirstVertex: 0,
-        };
+        return out;
       }
     }
 
     _bindFallbackGroupForSplashRect(pass, pipeline, drawState) {
+      const out = this._tmpFallbackBgResult;
+      out.ok = false;
+      out.substitutedCbv = false;
+      out.substitutedTexture = false;
+      out.substitutedSampler = false;
+      out.cacheHit = false;
+      out.bindGroupElided = false;
+
       if (
         !this._device ||
         typeof this._device.createBindGroup !== 'function' ||
         typeof pipeline.getBindGroupLayout !== 'function'
       ) {
         this._stats.bindGroupErrors += 1;
-        return {
-          ok: false,
-          substitutedCbv: false,
-          substitutedTexture: false,
-          substitutedSampler: false,
-          cacheHit: false,
-          bindGroupElided: false,
-        };
+        return out;
       }
 
       const cbvCandidate = this._findBoundCbvCandidate(drawState);
@@ -4363,14 +5480,8 @@
         cbvBuffer = this._ensureFallbackCbvBuffer();
         if (!cbvBuffer) {
           this._stats.bindGroupErrors += 1;
-          return {
-            ok: false,
-            substitutedCbv: true,
-            substitutedTexture: false,
-            substitutedSampler: false,
-            cacheHit: false,
-            bindGroupElided: false,
-          };
+          out.substitutedCbv = true;
+          return out;
         }
       }
 
@@ -4385,14 +5496,9 @@
         sourceTexture = this._fallbackTexture;
         if (!textureView) {
           this._stats.bindGroupErrors += 1;
-          return {
-            ok: false,
-            substitutedCbv,
-            substitutedTexture: true,
-            substitutedSampler: false,
-            cacheHit: false,
-            bindGroupElided: false,
-          };
+          out.substitutedCbv = substitutedCbv;
+          out.substitutedTexture = true;
+          return out;
         }
       }
 
@@ -4404,60 +5510,153 @@
         sampler = this._ensureFallbackSampler();
         if (!sampler) {
           this._stats.bindGroupErrors += 1;
-          return {
-            ok: false,
-            substitutedCbv,
-            substitutedTexture,
-            substitutedSampler: true,
-            cacheHit: false,
-            bindGroupElided: false,
-          };
+          out.substitutedCbv = substitutedCbv;
+          out.substitutedTexture = substitutedTexture;
+          out.substitutedSampler = true;
+          return out;
         }
       }
 
       try {
-        const cacheKey = `splash|${this._getResourceId(pipeline)}|${this._getResourceId(cbvBuffer)}|${cbvOffset}|${cbvSize}|${this._getResourceId(textureView)}|${this._getResourceId(sampler)}`;
-        const tracked =
-          sourceTexture && sourceTexture !== textureView
-            ? [cbvBuffer, sourceTexture, textureView, sampler]
-            : [cbvBuffer, textureView, sampler];
-        const bgEntry = this._getOrCreateCachedBindGroupInternal(
-          cacheKey,
-          () => this._getPipelineBindGroupLayout(pipeline, 0),
-          'draw_executor:fallback_splash_rect_bg',
-          [
-            { binding: 0, resource: { buffer: cbvBuffer, offset: cbvOffset, size: cbvSize } },
-            { binding: 1, resource: textureView },
-            { binding: 2, resource: sampler },
-          ],
-          tracked
+        const bindings = this._bgScratchBindings;
+        const kinds = this._bgScratchKinds;
+        const resA = this._bgScratchResA;
+        const resB = this._bgScratchResB;
+        const genA = this._bgScratchGenA;
+        const genB = this._bgScratchGenB;
+        const offs = this._bgScratchOff;
+        const sizes = this._bgScratchSize;
+        const cbvGen = getResourceGeneration(cbvBuffer);
+        const viewGen = getResourceGeneration(textureView);
+        const smpGen = getResourceGeneration(sampler);
+        const texSrc = sourceTexture && sourceTexture !== textureView ? sourceTexture : null;
+        const srcGen = texSrc ? getResourceGeneration(texSrc) : 0;
+
+        bindings[0] = 0;
+        kinds[0] = BG_ENTRY_KIND_BUFFER;
+        resA[0] = cbvBuffer;
+        resB[0] = null;
+        genA[0] = cbvGen;
+        genB[0] = 0;
+        offs[0] = cbvOffset;
+        sizes[0] = cbvSize;
+
+        bindings[1] = 1;
+        kinds[1] = BG_ENTRY_KIND_TEXTURE;
+        resA[1] = texSrc;
+        resB[1] = textureView;
+        genA[1] = srcGen;
+        genB[1] = viewGen;
+        offs[1] = 0;
+        sizes[1] = -1;
+
+        bindings[2] = 2;
+        kinds[2] = BG_ENTRY_KIND_RAW;
+        resA[2] = sampler;
+        resB[2] = null;
+        genA[2] = smpGen;
+        genB[2] = 0;
+        offs[2] = 0;
+        sizes[2] = -1;
+
+        let h = -2128831035 | 0;
+        h = hashMixInt32(h, BG_OWNER_FALLBACK_SPLASH);
+        h = hashMixInt32(h, this._getResourceId(pipeline));
+        h = hashMixInt32(h, this._getResourceId(cbvBuffer));
+        h = hashMixInt32(h, cbvGen);
+        h = hashMixNum(h, cbvOffset);
+        h = hashMixNum(h, cbvSize);
+        h = hashMixInt32(h, this._getResourceId(textureView));
+        h = hashMixInt32(h, viewGen);
+        h = hashMixInt32(h, this._getResourceId(sampler));
+        h = hashMixInt32(h, smpGen);
+
+        let bindGroup = this._bgLookupNode(
+          h,
+          BG_OWNER_FALLBACK_SPLASH,
+          pipeline,
+          0,
+          3,
+          bindings,
+          kinds,
+          resA,
+          resB,
+          genA,
+          genB,
+          offs,
+          sizes
         );
-        const bound = this._bindBindGroupOnPass(pass, 0, bgEntry.bindGroup, null);
-        return {
-          ok: true,
-          substitutedCbv,
-          substitutedTexture,
-          substitutedSampler,
-          cacheHit: bgEntry.cacheHit,
-          bindGroupElided: !bound,
-        };
+        let cacheHit = true;
+        if (!bindGroup) {
+          cacheHit = false;
+          this._stats.bindGroupCacheMisses += 1;
+          const layout = this._getPipelineBindGroupLayout(pipeline, 0);
+          bindGroup = this._device.createBindGroup({
+            label: 'draw_executor:fallback_splash_rect_bg',
+            layout,
+            entries: [
+              { binding: 0, resource: { buffer: cbvBuffer, offset: cbvOffset, size: cbvSize } },
+              { binding: 1, resource: textureView },
+              { binding: 2, resource: sampler },
+            ],
+          });
+          const tracked = texSrc
+            ? [cbvBuffer, texSrc, textureView, sampler]
+            : [cbvBuffer, textureView, sampler];
+          this._bgStoreNode(
+            h,
+            BG_OWNER_FALLBACK_SPLASH,
+            pipeline,
+            0,
+            3,
+            bindings,
+            kinds,
+            resA,
+            resB,
+            genA,
+            genB,
+            offs,
+            sizes,
+            bindGroup,
+            tracked
+          );
+        }
+        resA[0] = null;
+        resA[1] = null;
+        resB[1] = null;
+        resA[2] = null;
+        const bound = this._bindBindGroupOnPass(pass, 0, bindGroup, null);
+        out.ok = true;
+        out.substitutedCbv = substitutedCbv;
+        out.substitutedTexture = substitutedTexture;
+        out.substitutedSampler = substitutedSampler;
+        out.cacheHit = cacheHit;
+        out.bindGroupElided = !bound;
+        return out;
       } catch (err) {
+        this._bgScratchResA[0] = null;
+        this._bgScratchResA[1] = null;
+        this._bgScratchResB[1] = null;
+        this._bgScratchResA[2] = null;
         this._stats.bindGroupErrors += 1;
         this._warn('Failed to bind fallback splash rect bind group', {
           error: String(err && err.message ? err.message : err),
         });
-        return {
-          ok: false,
-          substitutedCbv,
-          substitutedTexture,
-          substitutedSampler,
-          cacheHit: false,
-          bindGroupElided: false,
-        };
+        out.substitutedCbv = substitutedCbv;
+        out.substitutedTexture = substitutedTexture;
+        out.substitutedSampler = substitutedSampler;
+        return out;
       }
     }
 
     _bindFallbackVertexBufferSplashRect24B(pass, drawState, vertexCount, firstVertex) {
+      const out = this._tmpFallbackVbResult;
+      out.ok = false;
+      out.substitutedVertexBuffer = false;
+      out.vertexBufferElided = false;
+      out.effectiveVertexCount = 0;
+      out.effectiveFirstVertex = 0;
+
       const hasSlot0 = (this._stagedVbMask & 1) !== 0;
       const fallbackSlot0 = !hasSlot0 && Array.isArray(drawState.vertexBuffers)
         ? drawState.vertexBuffers[0]
@@ -4489,13 +5688,11 @@
         const size = hasSlot0 ? this._stagedVbSizes[0] : fallbackSlot0.size;
         try {
           const bound = this._bindVertexBufferOnPass(pass, 0, buffer, offset, size);
-          return {
-            ok: true,
-            substitutedVertexBuffer: false,
-            vertexBufferElided: !bound,
-            effectiveVertexCount: vertexCount,
-            effectiveFirstVertex: firstVertex,
-          };
+          out.ok = true;
+          out.vertexBufferElided = !bound;
+          out.effectiveVertexCount = vertexCount;
+          out.effectiveFirstVertex = firstVertex;
+          return out;
         } catch (err) {
           this._warn(
             'setVertexBuffer threw on bound 24B splash vertex buffer; substituting synthetic splash quad',
@@ -4508,15 +5705,10 @@
 
       this._stats.invalidVertexBufferGuards += 1;
       this._stats.vertexBufferSubstitutions += 1;
+      out.substitutedVertexBuffer = true;
       const fallbackVb = this._ensureFallbackSplashVertexBuffer24B();
       if (!fallbackVb) {
-        return {
-          ok: false,
-          substitutedVertexBuffer: true,
-          vertexBufferElided: false,
-          effectiveVertexCount: 0,
-          effectiveFirstVertex: 0,
-        };
+        return out;
       }
 
       try {
@@ -4526,25 +5718,17 @@
             ? Math.floor(vertexCount / 3) * 6
             : vertexCount;
         const clampedCount = drawState.indexed ? vertexCount : Math.min(Math.max(expandedCount, 3), 6);
-        return {
-          ok: true,
-          substitutedVertexBuffer: true,
-          vertexBufferElided: !bound,
-          effectiveVertexCount: clampedCount,
-          effectiveFirstVertex: 0,
-        };
+        out.ok = true;
+        out.vertexBufferElided = !bound;
+        out.effectiveVertexCount = clampedCount;
+        out.effectiveFirstVertex = 0;
+        return out;
       } catch (err) {
         this._stats.passErrors += 1;
         this._warn('Failed to bind synthetic 24B splash fallback vertex buffer', {
           error: String(err && err.message ? err.message : err),
         });
-        return {
-          ok: false,
-          substitutedVertexBuffer: true,
-          vertexBufferElided: false,
-          effectiveVertexCount: 0,
-          effectiveFirstVertex: 0,
-        };
+        return out;
       }
     }
 
@@ -4838,6 +6022,295 @@
         );
       }
       return createDrawResultObject(indexed, indirect, count, instanceCount, indirectOffset);
+    }
+
+    /**
+     * Execute a WebGPU compute dispatch (`dispatchWorkgroups` or `dispatchWorkgroupsIndirect`)
+     * with redundant `setPipeline` / `setBindGroup` elision and `(pipeline, groupIndex, entries)`
+     * bind-group caching (avoiding per-dispatch `device.createBindGroup()` when bindings repeat).
+     *
+     * @param {object} pass GPUComputePassEncoder
+     * @param {{
+     *   pipeline?: object,
+     *   bindGroups?: Array<object>,
+     *   workgroupCountX?: number,
+     *   workgroupCountY?: number,
+     *   workgroupCountZ?: number,
+     *   x?: number,
+     *   y?: number,
+     *   z?: number,
+     *   indirect?: boolean,
+     *   indirectBuffer?: object,
+     *   indirectOffset?: number,
+     *   reuseResult?: boolean,
+     * }} [computeArgs]
+     */
+    executeCompute(pass, computeArgs = {}) {
+      const args = computeArgs && typeof computeArgs === 'object' ? computeArgs : null;
+      const indirect = Boolean(args && (args.indirect === true || args.indirectBuffer));
+      const x = args
+        ? toNonNegativeInt(args.workgroupCountX !== undefined ? args.workgroupCountX : args.x, 0)
+        : 0;
+      const y = args
+        ? toNonNegativeInt(
+            args.workgroupCountY !== undefined
+              ? args.workgroupCountY
+              : args.y !== undefined
+                ? args.y
+                : 1,
+            0
+          )
+        : 1;
+      const z = args
+        ? toNonNegativeInt(
+            args.workgroupCountZ !== undefined
+              ? args.workgroupCountZ
+              : args.z !== undefined
+                ? args.z
+                : 1,
+            0
+          )
+        : 1;
+      const indirectBuffer = args && args.indirectBuffer !== undefined ? args.indirectBuffer : null;
+      const indirectOffset = args && args.indirectOffset !== undefined ? args.indirectOffset : 0;
+      const reuse = this._reuseDrawResult || (args !== null && args.reuseResult === true);
+      const result = reuse
+        ? this._reusableComputeResult
+        : {
+            executed: false,
+            skipped: false,
+            reason: null,
+            indirect: false,
+            indirectOffset: 0,
+            workgroupCountX: 0,
+            workgroupCountY: 0,
+            workgroupCountZ: 0,
+            pipelineElided: false,
+            bindGroupsElided: 0,
+            bindGroupCacheHits: 0,
+            bindGroupCacheMisses: 0,
+          };
+
+      result.executed = false;
+      result.skipped = false;
+      result.reason = null;
+      result.indirect = indirect;
+      result.indirectOffset =
+        indirect && Number.isInteger(indirectOffset) && indirectOffset >= 0 ? indirectOffset : 0;
+      result.workgroupCountX = indirect ? 0 : x;
+      result.workgroupCountY = indirect ? 0 : y;
+      result.workgroupCountZ = indirect ? 0 : z;
+      result.pipelineElided = false;
+      result.bindGroupsElided = 0;
+      result.bindGroupCacheHits = 0;
+      result.bindGroupCacheMisses = 0;
+
+      if (this._destroyed) {
+        this._stats.skippedComputeDispatches += 1;
+        result.skipped = true;
+        result.reason = 'executor-destroyed';
+        return result;
+      }
+
+      const dispatchMethod = indirect ? 'dispatchWorkgroupsIndirect' : 'dispatchWorkgroups';
+      if (
+        !pass ||
+        typeof pass !== 'object' ||
+        typeof pass.setPipeline !== 'function' ||
+        typeof pass[dispatchMethod] !== 'function'
+      ) {
+        this._stats.skippedComputeDispatches += 1;
+        result.skipped = true;
+        result.reason = 'invalid-compute-pass';
+        return result;
+      }
+
+      if (indirect) {
+        if (validateComputeIndirectBufferStatus(indirectBuffer, indirectOffset) !== INDIRECT_STATUS_OK) {
+          this._stats.skippedComputeDispatches += 1;
+          result.skipped = true;
+          result.reason = 'invalid-indirect-buffer';
+          return result;
+        }
+      } else if (x <= 0 || y <= 0 || z <= 0) {
+        this._stats.skippedComputeDispatches += 1;
+        result.skipped = true;
+        result.reason = 'zero-workgroup-count';
+        return result;
+      }
+
+      const rawPipeline =
+        args !== null && args.pipeline !== undefined ? args.pipeline : this._activeComputePipeline;
+      const computePipeline =
+        rawPipeline && typeof rawPipeline === 'object' && rawPipeline.pipeline
+          ? rawPipeline.pipeline
+          : rawPipeline;
+      if (!computePipeline || typeof computePipeline !== 'object' || computePipeline.destroyed === true) {
+        this._stats.skippedComputeDispatches += 1;
+        result.skipped = true;
+        result.reason = 'no-compute-pipeline';
+        return result;
+      }
+
+      try {
+        const pipeBound = this._bindPipelineOnPass(pass, computePipeline);
+        result.pipelineElided = !pipeBound;
+
+        let bindGroupsElided = 0;
+        const explicitBindGroups = args !== null && Array.isArray(args.bindGroups) ? args.bindGroups : null;
+
+        if (explicitBindGroups !== null) {
+          for (let i = 0; i < explicitBindGroups.length; i += 1) {
+            const spec = explicitBindGroups[i];
+            if (!spec || typeof spec !== 'object') {
+              continue;
+            }
+            const groupIndex = Number.isInteger(spec.groupIndex) ? spec.groupIndex : i;
+            let bg = null;
+            if (Array.isArray(spec.entries) && !spec.bindGroup && spec.kind !== 'GPUBindGroup') {
+              const hitsBefore = this._stats.bindGroupCacheHits;
+              const missesBefore = this._stats.bindGroupCacheMisses;
+              const specLabel = typeof spec.label === 'string' ? spec.label : null;
+              if (spec.layout) {
+                bg =
+                  this._device && typeof this._device.createBindGroup === 'function'
+                    ? this._getOrCreateBindGroupStructured(
+                        BG_OWNER_LAYOUT,
+                        spec.layout,
+                        groupIndex >= 0 ? groupIndex : -1,
+                        spec.entries,
+                        specLabel
+                      )
+                    : ((this._stats.bindGroupErrors += 1), null);
+              } else {
+                bg =
+                  this._device &&
+                  typeof this._device.createBindGroup === 'function' &&
+                  typeof computePipeline.getBindGroupLayout === 'function' &&
+                  groupIndex >= 0
+                    ? this._getOrCreateBindGroupStructured(
+                        BG_OWNER_PIPELINE,
+                        computePipeline,
+                        groupIndex,
+                        spec.entries,
+                        specLabel
+                      )
+                    : ((this._stats.bindGroupErrors += 1), null);
+              }
+              result.bindGroupCacheHits += this._stats.bindGroupCacheHits - hitsBefore;
+              result.bindGroupCacheMisses += this._stats.bindGroupCacheMisses - missesBefore;
+              if (!bg) {
+                this._stats.skippedComputeDispatches += 1;
+                result.skipped = true;
+                result.reason = 'compute-bindgroup-failed';
+                return result;
+              }
+            } else {
+              bg = spec.bindGroup !== undefined ? spec.bindGroup : spec;
+            }
+            if (!bg || bg.destroyed === true) {
+              this._stats.bindGroupGuards += 1;
+              this._stats.skippedBindGroupBindings += 1;
+              continue;
+            }
+            const dynOffsets = spec.dynamicOffsets !== undefined ? spec.dynamicOffsets : null;
+            const bound = this._bindBindGroupOnPass(pass, groupIndex, bg, dynOffsets);
+            if (!bound) {
+              bindGroupsElided += 1;
+            }
+          }
+        } else {
+          // Bind any staged bind groups (fast bitmask slots 0..3 + overflow).
+          let bgMask = this._stagedBgMask;
+          while (bgMask !== 0) {
+            const bit = bgMask & -bgMask;
+            const slot = 31 - Math.clz32(bit);
+            bgMask ^= bit;
+            const bg = this._stagedBgGroups[slot];
+            if (!bg || bg.destroyed === true) {
+              this._stats.bindGroupGuards += 1;
+              this._stats.skippedBindGroupBindings += 1;
+              continue;
+            }
+            const bound = this._bindFastBindGroupOnPassSynced(
+              pass,
+              slot,
+              bit,
+              bg,
+              this._stagedBgHasDyn[slot],
+              this._stagedBgDynSource[slot],
+              this._stagedBgDynStart[slot],
+              this._stagedBgDynLength[slot]
+            );
+            if (!bound) {
+              bindGroupsElided += 1;
+              this._stats.redundantBindGroupSkips += 1;
+              this._stats.elidedBindGroupSets += 1;
+              this._stats.totalElidedStateCalls += 1;
+              this._totalStateCalls += 1;
+            }
+          }
+          if (this._stagedBgOverflow !== null && this._stagedBgOverflow.size > 0) {
+            for (const [groupIndex, entry] of this._stagedBgOverflow.entries()) {
+              if (!entry || !entry.bindGroup || entry.bindGroup.destroyed === true) {
+                this._stats.bindGroupGuards += 1;
+                this._stats.skippedBindGroupBindings += 1;
+                continue;
+              }
+              const bound = this._bindBindGroupOnPass(
+                pass,
+                groupIndex,
+                entry.bindGroup,
+                entry.dynamicOffsets || null
+              );
+              if (!bound) {
+                bindGroupsElided += 1;
+              }
+            }
+          }
+        }
+
+        result.bindGroupsElided = bindGroupsElided;
+        if (indirect) {
+          pass.dispatchWorkgroupsIndirect(indirectBuffer, indirectOffset);
+        } else {
+          pass.dispatchWorkgroups(x, y, z);
+        }
+        this._stats.computeDispatches += 1;
+        result.executed = true;
+        return result;
+      } catch (err) {
+        this._stats.passErrors += 1;
+        this._stats.skippedComputeDispatches += 1;
+        this._warn('Compute dispatch execution failed', {
+          error: String(err && err.message ? err.message : err),
+        });
+        result.skipped = true;
+        result.reason = 'pass-error';
+        return result;
+      }
+    }
+
+    /**
+     * Positional convenience wrapper for `executeCompute` (`dispatchWorkgroups`).
+     */
+    dispatchWorkgroups(pass, workgroupCountX, workgroupCountY = 1, workgroupCountZ = 1) {
+      return this.executeCompute(pass, {
+        workgroupCountX,
+        workgroupCountY,
+        workgroupCountZ,
+      });
+    }
+
+    /**
+     * Positional convenience wrapper for `executeCompute` (`dispatchWorkgroupsIndirect`).
+     */
+    dispatchWorkgroupsIndirect(pass, indirectBuffer, indirectOffset = 0) {
+      return this.executeCompute(pass, {
+        indirect: true,
+        indirectBuffer,
+        indirectOffset,
+      });
     }
 
     /**
@@ -5540,7 +7013,12 @@
         bindGroupCacheHits: this._stats.bindGroupCacheHits,
         bindGroupCacheMisses: this._stats.bindGroupCacheMisses,
         bindGroupCacheEvictions: this._stats.bindGroupCacheEvictions,
-        bindGroupCacheSize: this._bindGroupCache.size,
+        bindGroupCacheSize: this._bgCacheSize,
+        textureViewCacheHits: this._stats.textureViewCacheHits,
+        textureViewCacheMisses: this._stats.textureViewCacheMisses,
+        textureViewCacheEvictions: this._stats.textureViewCacheEvictions,
+        computeDispatches: this._stats.computeDispatches,
+        skippedComputeDispatches: this._stats.skippedComputeDispatches,
         alphaBlendedDraws: this._stats.alphaBlendedDraws,
         uiQuadDraws: this._stats.uiQuadDraws,
         fontGlyphDraws: this._stats.fontGlyphDraws,
@@ -5610,7 +7088,7 @@
       this._destroySyntheticResources();
       this._fallbackPipelineCache.clear();
       this._fallbackShaderModuleCache.clear();
-      this._bindGroupCache.clear();
+      this._clearBgCacheInternal();
       this._wgslHashCache.clear();
       this._textureViewCache = new WeakMap();
       this._bindGroupLayoutCache = new WeakMap();

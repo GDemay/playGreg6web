@@ -15,6 +15,12 @@ uint32_t u32_at(const uint8_t* p) {
     return v;
 }
 
+uint64_t u64_at(const uint8_t* p) {
+    uint64_t v;
+    std::memcpy(&v, p, 8);
+    return v;
+}
+
 void set_error(std::string* error, std::string message) {
     if (error != nullptr) {
         *error = std::move(message);
@@ -23,22 +29,30 @@ void set_error(std::string* error, std::string message) {
 
 }  // namespace
 
+size_t shader_pack_entry_bytes(uint32_t version) {
+    return version == 1 ? kShaderPackEntryBytes : version == 2 ? kShaderPackEntryBytesV2 : 0;
+}
+
 bool parse_shader_pack_header(const uint8_t* data,
                               size_t size,
                               uint32_t* out_count,
-                              std::string* error) {
+                              std::string* error,
+                              uint32_t* out_version) {
     if (data == nullptr || size < kShaderPackHeaderBytes || std::memcmp(data, "WGPK", 4) != 0) {
         set_error(error, "not a WGPK shader pack");
         return false;
     }
     const uint32_t version = u32_at(data + 4);
     const uint32_t count = u32_at(data + 8);
-    if (version != 1) {
+    if (shader_pack_entry_bytes(version) == 0) {
         set_error(error, "unsupported WGPK version " + std::to_string(version));
         return false;
     }
     if (out_count != nullptr) {
         *out_count = count;
+    }
+    if (out_version != nullptr) {
+        *out_version = version;
     }
     return true;
 }
@@ -55,15 +69,17 @@ bool parse_shader_pack_index_toc(const uint8_t* toc_data,
     out->clear();
 
     uint32_t count = 0;
-    if (!parse_shader_pack_header(toc_data, toc_size, &count, error)) {
+    uint32_t version = 0;
+    if (!parse_shader_pack_header(toc_data, toc_size, &count, error, &version)) {
         return false;
     }
-    if (count > (toc_size - kShaderPackHeaderBytes) / kShaderPackEntryBytes) {
+    const size_t entry_bytes = shader_pack_entry_bytes(version);
+    if (count > (toc_size - kShaderPackHeaderBytes) / entry_bytes) {
         set_error(error, "WGPK entry table exceeds the file");
         return false;
     }
     const uint64_t toc_bytes =
-        uint64_t{kShaderPackHeaderBytes} + uint64_t{count} * uint64_t{kShaderPackEntryBytes};
+        uint64_t{kShaderPackHeaderBytes} + uint64_t{count} * uint64_t{entry_bytes};
     if (total_file_size > 0 && toc_bytes > total_file_size) {
         set_error(error, "WGPK entry table exceeds the file");
         return false;
@@ -71,24 +87,29 @@ bool parse_shader_pack_index_toc(const uint8_t* toc_data,
 
     out->reserve(count);
     for (uint32_t i = 0; i < count; ++i) {
-        const uint8_t* e = toc_data + kShaderPackHeaderBytes + size_t{i} * kShaderPackEntryBytes;
+        const uint8_t* e = toc_data + kShaderPackHeaderBytes + size_t{i} * entry_bytes;
         uint64_t hash;
         std::memcpy(&hash, e, 8);
         const uint8_t stage = e[8];
-        const uint32_t offset = u32_at(e + 12);
-        const uint32_t length = u32_at(e + 16);
+        const uint64_t offset = version == 2 ? u64_at(e + 16) : uint64_t{u32_at(e + 12)};
+        const uint32_t length = u32_at(e + (version == 2 ? 12 : 16));
         if (stage < 1 || stage > 3) {
             out->clear();
             set_error(error, "WGPK entry " + std::to_string(i) + " has stage " + std::to_string(stage));
             return false;
         }
-        const uint64_t payload_end = uint64_t{offset} + uint64_t{length};
-        if (payload_end > std::numeric_limits<uint32_t>::max()) {
+        if (offset > std::numeric_limits<uint64_t>::max() - length) {
             out->clear();
             set_error(error, "WGPK entry " + std::to_string(i) + " payload range overflows");
             return false;
         }
-        if (length != 0 && uint64_t{offset} < toc_bytes) {
+        const uint64_t payload_end = offset + uint64_t{length};
+        if (version == 1 && payload_end > std::numeric_limits<uint32_t>::max()) {
+            out->clear();
+            set_error(error, "WGPK entry " + std::to_string(i) + " payload range overflows");
+            return false;
+        }
+        if (length != 0 && offset < toc_bytes) {
             out->clear();
             set_error(error, "WGPK entry " + std::to_string(i) + " payload overlaps header/TOC");
             return false;

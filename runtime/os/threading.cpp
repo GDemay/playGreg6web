@@ -143,14 +143,19 @@ void SrwLock::unlock_shared() {
 
 XTaskQueue::XTaskQueue(DispatchMode work_mode,
                        DispatchMode completion_mode,
-                       uint32_t work_threads) {
+                       uint32_t work_threads,
+                       bool work_serialized,
+                       bool completion_serialized) {
     work_port_.mode = work_mode;
     completion_port_.mode = completion_mode;
 
     if (work_mode == DispatchMode::ThreadPool) {
-        start_workers(work_port_, work_threads == 0 ? 1u : work_threads);
+        const uint32_t n = work_threads == 0 ? 1u : work_threads;
+        work_port_.max_workers = work_serialized ? n : (n > kMaxPoolWorkers ? n : kMaxPoolWorkers);
+        start_workers(work_port_, n);
     }
     if (completion_mode == DispatchMode::ThreadPool) {
+        completion_port_.max_workers = completion_serialized ? 1u : kMaxPoolWorkers;
         start_workers(completion_port_, 1u);
     }
 }
@@ -182,10 +187,28 @@ struct ActiveCallback {
 
 void XTaskQueue::start_workers(Port& port, uint32_t count) {
     std::lock_guard<std::mutex> lock(port.join_mutex);
+    {
+        std::lock_guard<std::mutex> state(port.mutex);
+        port.idle += count;
+        port.worker_count += count;
+    }
     port.workers.reserve(count);
     for (uint32_t i = 0; i < count; ++i) {
         port.workers.emplace_back([this, &port]() { worker_loop(port); });
     }
+}
+
+void XTaskQueue::grow_port(Port& port) {
+    std::lock_guard<std::mutex> lock(port.join_mutex);
+    {
+        std::lock_guard<std::mutex> state(port.mutex);
+        if (port.terminated || port.queue.size() <= port.idle || port.worker_count >= port.max_workers) {
+            return;
+        }
+        ++port.idle;
+        ++port.worker_count;
+    }
+    port.workers.emplace_back([this, &port]() { worker_loop(port); });
 }
 
 void XTaskQueue::worker_loop(Port& port) {
@@ -205,6 +228,7 @@ void XTaskQueue::worker_loop(Port& port) {
             entry = std::move(port.queue.front());
             port.queue.pop_front();
             ++port.active_callbacks;
+            --port.idle;
         }
 
         {
@@ -212,6 +236,10 @@ void XTaskQueue::worker_loop(Port& port) {
             if (entry.callback) {
                 entry.callback(false);
             }
+        }
+        {
+            std::lock_guard<std::mutex> lock(port.mutex);
+            ++port.idle;
         }
     }
 }
@@ -244,6 +272,9 @@ bool XTaskQueue::submit_to_port(Port& port, TaskEntry entry) {
         port.queue.push_back(std::move(entry));
     }
     port.cv.notify_one();
+    if (port.mode == DispatchMode::ThreadPool) {
+        grow_port(port);
+    }
     return true;
 }
 

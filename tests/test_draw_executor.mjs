@@ -3040,3 +3040,308 @@ test('W282 500-draw 30 FPS burst accuracy, zero-alloc reuseDrawResult & getFrame
   assert.equal(fresh.drawsThisFrame, 500);
   assert.equal(fresh.hasNonClearDraw, true);
 });
+
+// ---------------------------------------------------------------------------
+// W344 TextureView WeakMap cache, generation-aware GPUBindGroup cache & executeCompute
+// ---------------------------------------------------------------------------
+
+test('W344 GPUTextureView WeakMap cache keys by (texture, viewDescriptorKey), tracks telemetry, and invalidates cleanly', () => {
+  const { device } = createMockWebGpu();
+  const executor = new DrawExecutor({ device });
+
+  let createViewCalls = 0;
+  const rawTex = device.createTexture({
+    size: { width: 256, height: 256, depthOrArrayLayers: 6 },
+    mipLevelCount: 4,
+    format: 'rgba8unorm',
+    usage: 0x04,
+  });
+  const origCreateView = rawTex.createView.bind(rawTex);
+  rawTex.createView = (viewDesc) => {
+    createViewCalls += 1;
+    const view = origCreateView(viewDesc);
+    view.destroyed = false;
+    return view;
+  };
+
+  // 1. Default view (no descriptor): first call misses, subsequent calls hit with exact object identity.
+  const def1 = executor.getOrCreateTextureView(rawTex);
+  const def2 = executor.getOrCreateTextureView(rawTex, null);
+  const def3 = executor.getOrCreateTextureView(rawTex, {});
+  assert.ok(def1);
+  assert.equal(def2, def1);
+  assert.equal(def3, def1);
+  assert.equal(createViewCalls, 1);
+  assert.equal(executor.getStats().textureViewCacheMisses, 1);
+  assert.equal(executor.getStats().textureViewCacheHits, 2);
+
+  // 2. Distinct view descriptors cache independently per (texture, viewDescriptorKey).
+  const srgbMip0 = executor.getOrCreateTextureView(rawTex, {
+    format: 'rgba8unorm-srgb',
+    dimension: '2d',
+    baseMipLevel: 0,
+    mipLevelCount: 1,
+    baseArrayLayer: 0,
+    arrayLayerCount: 1,
+    aspect: 'all',
+  });
+  const srgbMip0Hit = executor.getOrCreateTextureView(rawTex, {
+    format: 'rgba8unorm-srgb',
+    dimension: '2d',
+    baseMipLevel: 0,
+    mipLevelCount: 1,
+    baseArrayLayer: 0,
+    arrayLayerCount: 1,
+    aspect: 'all',
+  });
+  const mip1View = executor.getOrCreateTextureView(rawTex, {
+    format: 'rgba8unorm',
+    dimension: '2d',
+    baseMipLevel: 1,
+    mipLevelCount: 1,
+  });
+  assert.equal(srgbMip0Hit, srgbMip0);
+  assert.notEqual(srgbMip0, def1);
+  assert.notEqual(mip1View, srgbMip0);
+  assert.equal(createViewCalls, 3);
+  assert.equal(executor.getStats().textureViewCacheMisses, 3);
+  assert.equal(executor.getStats().textureViewCacheHits, 3);
+
+  // 3. Stale/destroyed view is evicted and recreated automatically.
+  mip1View.destroyed = true;
+  const mip1Recreated = executor.getOrCreateTextureView(rawTex, {
+    format: 'rgba8unorm',
+    dimension: '2d',
+    baseMipLevel: 1,
+    mipLevelCount: 1,
+  });
+  assert.notEqual(mip1Recreated, mip1View);
+  assert.equal(executor.getStats().textureViewCacheEvictions, 1);
+  assert.equal(createViewCalls, 4);
+
+  // 4. invalidateTexture() evicts cached views for that texture.
+  assert.equal(executor.invalidateTexture(rawTex), 1);
+  assert.equal(executor.getStats().textureViewCacheEvictions, 2);
+  const defAfterInvalidate = executor.getOrCreateTextureView(rawTex);
+  assert.notEqual(defAfterInvalidate, def1);
+  assert.equal(createViewCalls, 5);
+
+  // 5. clearCache() clears all cached texture views.
+  executor.clearCache();
+  const defAfterClear = executor.getOrCreateTextureView(rawTex);
+  assert.notEqual(defAfterClear, defAfterInvalidate);
+  assert.equal(createViewCalls, 6);
+
+  // 6. Destroyed texture returns null and evicts its cache entry cleanly.
+  rawTex.destroy();
+  assert.equal(executor.getOrCreateTextureView(rawTex), null);
+  assert.equal(executor.getStats().textureViewCacheEvictions, 3);
+});
+
+test('W344 GPUBindGroup cache per (pipeline, groupIndex, resources) handles generation bumps, destruction, and clearCache', () => {
+  const { device, calls } = createMockWebGpu();
+  const executor = new DrawExecutor({ device, maxBindGroupCacheEntries: 4 });
+
+  let layoutLookups = 0;
+  const makePipe = (handle) => ({
+    kind: 'GPURenderPipeline',
+    handle,
+    getBindGroupLayout(groupIndex) {
+      layoutLookups += 1;
+      return { kind: 'GPUBindGroupLayout', pipelineHandle: handle, groupIndex };
+    },
+  });
+
+  const pipeA = makePipe(501);
+  const pipeB = makePipe(502);
+  const buf = device.createBuffer({ size: 256, usage: BUFFER_USAGE.UNIFORM });
+  buf.generation = 1;
+  const tex = device.createTexture({
+    size: { width: 64, height: 64, depthOrArrayLayers: 1 },
+    format: 'rgba8unorm',
+    usage: 0x04,
+  });
+  tex.generation = 1;
+  const sampler = device.createSampler({ magFilter: 'linear' });
+
+  // 1. First lookup creates layout, caches textureView + bindGroup; second hits with zero createBindGroup/getBindGroupLayout!
+  const bg0a = executor.getOrCreateBindGroupForPipeline(pipeA, 0, [
+    { binding: 0, resource: { buffer: buf, offset: 0, size: 256 } },
+    { binding: 1, resource: { texture: tex, viewDescriptor: { format: 'rgba8unorm-srgb' } } },
+    { binding: 2, resource: sampler },
+  ]);
+  const bg0b = executor.getOrCreateBindGroupForPipeline(pipeA, 0, [
+    { binding: 0, resource: { buffer: buf, offset: 0, size: 256 } },
+    { binding: 1, resource: { texture: tex, viewDescriptor: { format: 'rgba8unorm-srgb' } } },
+    { binding: 2, resource: sampler },
+  ]);
+  assert.ok(bg0a);
+  assert.equal(bg0b, bg0a);
+  assert.equal(calls.createBindGroup.length, 1);
+  assert.equal(layoutLookups, 1);
+  assert.equal(executor.getStats().bindGroupCacheHits, 1);
+  assert.equal(executor.getStats().bindGroupCacheMisses, 1);
+  assert.equal(executor.getStats().textureViewCacheHits, 1);
+  assert.equal(executor.getStats().textureViewCacheMisses, 1);
+
+  // 2. Different groupIndex (1) or different pipeline (pipeB) gets its own cached bind group.
+  const bgGroup1 = executor.getOrCreateBindGroupForPipeline(pipeA, 1, [
+    { binding: 0, resource: { buffer: buf, offset: 0, size: 256 } },
+  ]);
+  const bgPipeB = executor.getOrCreateBindGroupForPipeline(pipeB, 0, [
+    { binding: 0, resource: { buffer: buf, offset: 0, size: 256 } },
+  ]);
+  assert.notEqual(bgGroup1, bg0a);
+  assert.notEqual(bgPipeB, bg0a);
+  assert.notEqual(bgPipeB, bgGroup1);
+  assert.equal(calls.createBindGroup.length, 3);
+
+  // 3. Generation bump on buffer invalidates prior cached bind group cleanly.
+  buf.generation = 2;
+  const bgGen2 = executor.getOrCreateBindGroupForPipeline(pipeA, 0, [
+    { binding: 0, resource: { buffer: buf, offset: 0, size: 256 } },
+    { binding: 1, resource: { texture: tex, viewDescriptor: { format: 'rgba8unorm-srgb' } } },
+    { binding: 2, resource: sampler },
+  ]);
+  assert.ok(bgGen2);
+  assert.notEqual(bgGen2, bg0a);
+  assert.equal(calls.createBindGroup.length, 4);
+
+  // 4. invalidateBuffer(buf) evicts all bind groups referencing buf.
+  const evictedCount = executor.invalidateBuffer(buf);
+  assert.ok(evictedCount >= 1);
+  assert.equal(executor.getStats().bindGroupCacheSize, 0);
+
+  // 5. Recreate bind group with tex, then destroy tex -> must refuse stale bind group cleanly.
+  const bgWithTex = executor.getOrCreateBindGroupForPipeline(pipeA, 0, [
+    { binding: 0, resource: tex },
+    { binding: 1, resource: sampler },
+  ]);
+  assert.ok(bgWithTex);
+  tex.destroy();
+  const bgAfterTexDestroy = executor.getOrCreateBindGroupForPipeline(pipeA, 0, [
+    { binding: 0, resource: tex },
+    { binding: 1, resource: sampler },
+  ]);
+  assert.equal(bgAfterTexDestroy, null);
+
+  // 6. Replacing texture with a new GPUTexture instance creates a fresh bind group, and clearCache() resets cache size to 0.
+  const tex2 = device.createTexture({
+    size: { width: 64, height: 64, depthOrArrayLayers: 1 },
+    format: 'rgba8unorm',
+    usage: 0x04,
+  });
+  const bgTex2 = executor.getOrCreateBindGroupForPipeline(pipeA, 0, [
+    { binding: 0, resource: tex2 },
+    { binding: 1, resource: sampler },
+  ]);
+  assert.ok(bgTex2);
+  assert.notEqual(bgTex2, bgWithTex);
+  executor.clearCache();
+  assert.equal(executor.getStats().bindGroupCacheSize, 0);
+});
+
+test('W344 executeCompute caches bind groups across frames, elides redundant state, and validates indirect dispatches', () => {
+  const { device, calls } = createMockWebGpu();
+  const executor = new DrawExecutor({ device });
+
+  const computeCalls = [];
+  const makeComputePass = () => ({
+    setPipeline(pipeline) {
+      computeCalls.push({ op: 'setPipeline', pipeline });
+    },
+    setBindGroup(groupIndex, bindGroup, dynamicOffsets) {
+      computeCalls.push({ op: 'setBindGroup', groupIndex, bindGroup, dynamicOffsets });
+    },
+    dispatchWorkgroups(x, y, z) {
+      computeCalls.push({ op: 'dispatchWorkgroups', x, y, z });
+    },
+    dispatchWorkgroupsIndirect(indirectBuffer, indirectOffset) {
+      computeCalls.push({ op: 'dispatchWorkgroupsIndirect', indirectBuffer, indirectOffset });
+    },
+  });
+
+  const computePipe = {
+    kind: 'GPUComputePipeline',
+    handle: 7001,
+    getBindGroupLayout(index) {
+      return { kind: 'GPUBindGroupLayout', pipelineHandle: 7001, index };
+    },
+  };
+  const storageBuf = device.createBuffer({ size: 1024, usage: BUFFER_USAGE.UNIFORM | BUFFER_USAGE.COPY_DST });
+  const tex = device.createTexture({
+    size: { width: 128, height: 128, depthOrArrayLayers: 1 },
+    format: 'r8unorm',
+    usage: 0x04,
+  });
+  const indirectBuf = device.createBuffer({ size: 32, usage: BUFFER_USAGE.INDIRECT });
+
+  const entries = [
+    { binding: 0, resource: { buffer: storageBuf, offset: 0, size: 1024 } },
+    { binding: 1, resource: tex },
+  ];
+
+  // Frame 1 (pass 1): dispatch 1 misses bind-group cache; dispatch 2 in same pass hits cache AND elides pipeline + bindGroup!
+  const pass1 = makeComputePass();
+  executor.setComputePipeline(computePipe);
+  const c1 = executor.executeCompute(pass1, {
+    workgroupCountX: 16,
+    workgroupCountY: 8,
+    workgroupCountZ: 1,
+    bindGroups: [{ groupIndex: 0, entries }],
+  });
+  assert.equal(c1.executed, true);
+  assert.equal(c1.pipelineElided, false);
+  assert.equal(c1.bindGroupsElided, 0);
+  assert.equal(c1.bindGroupCacheMisses, 1);
+  assert.equal(c1.bindGroupCacheHits, 0);
+
+  const c2 = executor.executeCompute(pass1, {
+    workgroupCountX: 16,
+    workgroupCountY: 8,
+    workgroupCountZ: 1,
+    bindGroups: [{ groupIndex: 0, entries }],
+  });
+  assert.equal(c2.executed, true);
+  assert.equal(c2.pipelineElided, true);
+  assert.equal(c2.bindGroupsElided, 1);
+  assert.equal(c2.bindGroupCacheHits, 1);
+  assert.equal(c2.bindGroupCacheMisses, 0);
+
+  // Frame 2 (new pass object): re-emits setPipeline & setBindGroup on pass2, but STILL hits bindGroup & textureView caches (0 new createBindGroup calls)!
+  const pass2 = makeComputePass();
+  const c3 = executor.executeCompute(pass2, {
+    workgroupCountX: 8,
+    workgroupCountY: 8,
+    workgroupCountZ: 1,
+    bindGroups: [{ groupIndex: 0, entries }],
+  });
+  assert.equal(c3.executed, true);
+  assert.equal(c3.pipelineElided, false);
+  assert.equal(c3.bindGroupsElided, 0);
+  assert.equal(c3.bindGroupCacheHits, 1);
+  assert.equal(calls.createBindGroup.length, 1, 'compute bind group must be created once across both frames');
+
+  // Indirect compute dispatch validates offset alignment and buffer bounds.
+  const indOk = executor.dispatchWorkgroupsIndirect(pass2, indirectBuf, 0);
+  assert.equal(indOk.executed, true);
+  assert.equal(indOk.indirect, true);
+  const indBadOffset = executor.dispatchWorkgroupsIndirect(pass2, indirectBuf, 2);
+  assert.equal(indBadOffset.skipped, true);
+  assert.equal(indBadOffset.reason, 'invalid-indirect-buffer');
+  const zeroWork = executor.dispatchWorkgroups(pass2, 0, 1, 1);
+  assert.equal(zeroWork.skipped, true);
+  assert.equal(zeroWork.reason, 'zero-workgroup-count');
+
+  const stats = executor.getStats();
+  assert.equal(stats.computeDispatches, 4);
+  assert.equal(stats.skippedComputeDispatches, 2);
+  assert.equal(stats.bindGroupCacheHits, 2);
+  assert.equal(stats.bindGroupCacheMisses, 1);
+  assert.equal(stats.textureViewCacheHits, 2);
+  assert.equal(stats.textureViewCacheMisses, 1);
+  assert.equal(computeCalls.filter((c) => c.op === 'setPipeline').length, 2);
+  assert.equal(computeCalls.filter((c) => c.op === 'setBindGroup').length, 2);
+  assert.equal(computeCalls.filter((c) => c.op === 'dispatchWorkgroups').length, 3);
+  assert.equal(computeCalls.filter((c) => c.op === 'dispatchWorkgroupsIndirect').length, 1);
+});
