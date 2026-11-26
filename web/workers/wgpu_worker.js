@@ -194,6 +194,23 @@ function createPassCommandSlot() {
   };
 }
 
+function isPlainArrayBuffer(value) {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  if (
+    typeof SharedArrayBuffer !== 'undefined' &&
+    (value instanceof SharedArrayBuffer ||
+      Object.prototype.toString.call(value) === '[object SharedArrayBuffer]')
+  ) {
+    return false;
+  }
+  return (
+    value instanceof ArrayBuffer ||
+    Object.prototype.toString.call(value) === '[object ArrayBuffer]'
+  );
+}
+
 function readUint64AsNumber(view, offset) {
   const lo = view.getUint32(offset, true);
   const hi = view.getUint32(offset + 4, true);
@@ -205,6 +222,8 @@ const DEFAULT_MAX_VALIDATION_ERROR_POSTS = 64;
 const MAX_VALIDATION_ERROR_MESSAGE_LENGTH = 512;
 const MAX_GPU_ADAPTER_FIELD_LENGTH = 96;
 const MAX_DIRECT_WRITE_BUFFER_CHUNK_BYTES = 4 * 1024 * 1024;
+const RECYCLE_CMD_BUFFER_MIN_BYTES = 256 * 1024;
+const RECYCLE_CMD_BUFFER_MAX_BYTES = 32 * 1024 * 1024;
 const DEFAULT_OVERSIZED_RT_RECLAIM_IDLE_FRAMES = 2;
 const DEFAULT_OVERSIZED_RT_RECLAIM_INTERVAL_FRAMES = 2;
 const MAX_ZERO_ALLOC_RING_DRAIN_BATCHES = 64;
@@ -14786,8 +14805,32 @@ function createWgpuWorkerHandler(options = {}) {
           ((payload.type === 'submit' || payload.type === 'executeBatch') &&
             (payload.buffer || payload.commands || payload.data)))
       ) {
-        const batchBuffer =
+        const rawBatchBuffer =
           payload.cmdBuffer || payload.buffer || payload.commands || payload.data;
+        const isRawArrayBuffer = isPlainArrayBuffer(rawBatchBuffer);
+        const isRawSharedBuffer =
+          typeof SharedArrayBuffer !== 'undefined' &&
+          rawBatchBuffer &&
+          typeof rawBatchBuffer === 'object' &&
+          (rawBatchBuffer instanceof SharedArrayBuffer ||
+            Object.prototype.toString.call(rawBatchBuffer) === '[object SharedArrayBuffer]');
+        const hasValidByteLength =
+          typeof payload.byteLength === 'number' &&
+          Number.isInteger(payload.byteLength) &&
+          payload.byteLength >= 0 &&
+          rawBatchBuffer &&
+          typeof rawBatchBuffer.byteLength === 'number' &&
+          payload.byteLength <= rawBatchBuffer.byteLength;
+        const batchInput =
+          hasValidByteLength && (isRawArrayBuffer || isRawSharedBuffer)
+            ? new Uint8Array(rawBatchBuffer, 0, payload.byteLength)
+            : rawBatchBuffer;
+        const shouldRecycle =
+          payload.recycleBuffer === true &&
+          payload.cmdBuffer === rawBatchBuffer &&
+          isRawArrayBuffer &&
+          rawBatchBuffer.byteLength >= RECYCLE_CMD_BUFFER_MIN_BYTES &&
+          rawBatchBuffer.byteLength <= RECYCLE_CMD_BUFFER_MAX_BYTES;
         if (
           (payload.frameLuminance !== undefined || payload.luminance !== undefined) &&
           typeof processor.setFrameLuminanceMeta === 'function'
@@ -14804,7 +14847,25 @@ function createWgpuWorkerHandler(options = {}) {
           processor.attachGuestMemory(pendingGuestMemory);
         }
         const prevFrames = toNonNegativeInt(processor.frameCount, 0);
-        const result = processor.executeCommandBuffer(batchBuffer, DRAIN_RING_REUSE_OPTS);
+        let result;
+        try {
+          result = processor.executeCommandBuffer(batchInput, DRAIN_RING_REUSE_OPTS);
+        } finally {
+          if (shouldRecycle) {
+            if (processor._cachedCmdBuffer === rawBatchBuffer) {
+              processor._cachedCmdBuffer = null;
+              processor._cachedCmdView = null;
+            }
+            try {
+              postMessage(
+                { type: 'recycle-cmd-buffer', cmdBuffer: rawBatchBuffer },
+                [rawBatchBuffer]
+              );
+            } catch (_) {
+              // Ignore transfer errors if the buffer was detached or the channel closed.
+            }
+          }
+        }
         if (result.presents > 0) {
           if (prevFrames === 0 && result.frameCount >= 1) {
             notifyHandlerFirstPresent({
@@ -14860,6 +14921,8 @@ const exportedApi = {
   sanitizeGpuAdapterInfo,
   MAX_GPU_ADAPTER_FIELD_LENGTH,
   MAX_DIRECT_WRITE_BUFFER_CHUNK_BYTES,
+  RECYCLE_CMD_BUFFER_MIN_BYTES,
+  RECYCLE_CMD_BUFFER_MAX_BYTES,
   selectFallbackShaderProfile,
   sanitizeValidationErrorMessage,
   normalizeValidationErrorType,
@@ -14907,7 +14970,10 @@ if (typeof module !== 'undefined' && module.exports) {
 
 if (typeof self !== 'undefined' && typeof self.postMessage === 'function') {
   const workerHandler = createWgpuWorkerHandler({
-    postMessage: (data) => self.postMessage(data),
+    postMessage: (data, transfer) =>
+      transfer && transfer.length > 0
+        ? self.postMessage(data, transfer)
+        : self.postMessage(data),
   });
   self.onmessage = async (ev) => {
     await workerHandler.handleMessage(ev ? ev.data : null);

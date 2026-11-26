@@ -17,6 +17,8 @@ const {
   PTHREAD_HTTPFS_SAB_CHANNEL_NAME,
   PTHREAD_TX_MSG_WGPU_SUBMIT,
   PTHREAD_TX_MSG_PROGRESS,
+  PTHREAD_TX_MSG_RECYCLE_CMD_BUFFER,
+  WGPU_CMD_POOL_MIN_BYTES,
   PTHREAD_CMD_LOAD,
   PTHREAD_CMD_LOADED,
   PTHREAD_CMD_RUN,
@@ -934,4 +936,167 @@ test('W345 pthread wgpuSubmit and coordinator handlePthreadWgpuSubmit forward st
 
   handle.cleanup();
   pthreadWorker.terminate();
+});
+
+test('G75 pthread warm cmdBuffer pool recycles large ArrayBuffers end-to-end and drops cleanly on port close', () => {
+  const bus = createTrackedBroadcastBus();
+  const mcFactory = createTrackedMessageChannelFactory();
+  const loaderPath = path.join(repoRoot, 'web/loader.js');
+  const loaderSource = fs.readFileSync(loaderPath, 'utf8');
+
+  const coordWorkers = new Map();
+  class RecycleMockWorker extends MockPthreadWorker {
+    constructor(script, opts) {
+      super(script, opts);
+      coordWorkers.set(opts && opts.name ? opts.name : script, this);
+    }
+  }
+
+  const coordSelf = {
+    name: '',
+    location: { href: 'http://127.0.0.1:8080/loader.js' },
+    MessageChannel: mcFactory.TrackedMessageChannel,
+    onmessage: null,
+    postMessage() {},
+  };
+  const coordSandbox = {
+    self: coordSelf,
+    globalThis: null,
+    URL,
+    BroadcastChannel: bus.TrackedBroadcastChannel,
+    MessageChannel: mcFactory.TrackedMessageChannel,
+    Worker: RecycleMockWorker,
+    indexedDB: null,
+    Uint8Array,
+    Int32Array,
+    Uint32Array,
+    DataView,
+    ArrayBuffer,
+    SharedArrayBuffer,
+    Atomics,
+    BigInt,
+    TextEncoder,
+    TextDecoder,
+    Map,
+    Set,
+    Promise,
+    Error,
+    Number,
+    Math,
+    Date,
+    Object,
+    Array,
+    Proxy,
+    Reflect,
+    JSON,
+    setTimeout,
+    clearTimeout,
+    fetch: async () => ({ ok: false, status: 404 }),
+    importScripts(scriptPath) {
+      const resolved = path.resolve(repoRoot, 'web', scriptPath);
+      vm.runInContext(fs.readFileSync(resolved, 'utf8'), coordContext, { filename: resolved });
+    },
+  };
+  coordSandbox.globalThis = coordSandbox;
+  const coordContext = vm.createContext(coordSandbox);
+  vm.runInContext(loaderSource, coordContext, { filename: loaderPath });
+
+  coordSelf.onmessage({
+    data: { canvas: { id: 'c' }, width: 1280, height: 720, dataBase: '/data/' },
+  });
+  const gpuWorker = coordWorkers.get('./workers/wgpu_worker.js');
+  assert.ok(gpuWorker && typeof gpuWorker.onmessage === 'function');
+
+  // Spawn one pthread and wire its txPort into bootstrapEmscriptenPthreadWorker.
+  const pthreadWorker = new coordSelf.Worker('./dist/runtime.js', { name: 'em-pthread-recycle' });
+  const txPort = pthreadWorker.received[0].msg.__playgta6_tx_port;
+  assert.ok(txPort);
+
+  const handle = bootstrapEmscriptenPthreadWorker({
+    scope: { name: 'em-pthread-recycle', WebAssembly: { Instance: WebAssembly.Instance } },
+    importScriptsFn: () => {},
+    BroadcastChannelCtor: bus.TrackedBroadcastChannel,
+    httpfsMailboxApi: null,
+    txPort,
+  });
+
+  // 1 MiB Wasm linear memory (16 pages) so we can submit >= 256 KiB batches.
+  const mem = new WebAssembly.Memory({ initial: 16, maximum: 16 });
+  const memU8 = new Uint8Array(mem.buffer);
+  handle.hostImports.setMemory(mem);
+
+  // Frame 1: 300 KiB large batch (>= 256 KiB) with pool empty -> allocates fresh buffer with recycleBuffer: true.
+  const len1 = 300 * 1024;
+  memU8.fill(0, 0, len1);
+  // Write a valid NOP packet header at offset 0 (opcode=0, payloadBytes=len1-8) so FIRST_PRESENT stays false.
+  const dv1 = new DataView(mem.buffer, 0, len1);
+  dv1.setUint16(0, 0, true);
+  dv1.setUint32(4, len1 - 8, true);
+  memU8[8] = 0xab;
+  memU8[len1 - 1] = 0xcd;
+
+  handle.hostImports.env.host_wgpu_submit(0n, BigInt(len1));
+  const submitsAfter1 = gpuWorker.received.filter((r) => r.msg && r.msg.cmdBuffer instanceof ArrayBuffer);
+  assert.equal(submitsAfter1.length, 1);
+  const buf1 = submitsAfter1[0].msg.cmdBuffer;
+  assert.equal(buf1.byteLength, len1);
+  assert.equal(submitsAfter1[0].msg.byteLength, len1);
+  assert.equal(submitsAfter1[0].msg.recycleBuffer, true);
+  assert.equal(submitsAfter1[0].transfer.length, 1);
+  assert.equal(submitsAfter1[0].transfer[0], buf1);
+  assert.equal(new Uint8Array(buf1)[8], 0xab);
+  assert.equal(new Uint8Array(buf1)[len1 - 1], 0xcd);
+  assert.equal(handle.cmdBufferPool.size, 0);
+
+  // Poison trailing bytes with a PRESENT packet before recycling to verify Frame 2's byteLength clamp!
+  const presentTail = new Uint8Array(encodeTestFramePacket(0.1, 0.2, 0.3, 1.0));
+  new Uint8Array(buf1).set(presentTail, 280 * 1024);
+
+  // Simulate wgpu_worker returning buf1 via recycle-cmd-buffer -> coordinator -> txPort -> pthread pool.
+  gpuWorker.onmessage({ data: { type: PTHREAD_TX_MSG_RECYCLE_CMD_BUFFER, cmdBuffer: buf1 } });
+  assert.equal(handle.cmdBufferPool.size, 1, 'recycled buffer must return to pthread warm pool');
+
+  // Frame 2: 280 KiB batch (<= buf1.byteLength, within slack) -> reuses EXACT buf1 with byteLength = 280 KiB.
+  const len2 = 280 * 1024;
+  memU8.fill(0, 0, len2);
+  const dv2 = new DataView(mem.buffer, 0, len2);
+  dv2.setUint16(0, 0, true);
+  dv2.setUint32(4, len2 - 8, true);
+  memU8[8] = 0x55;
+  memU8[len2 - 1] = 0x77;
+
+  handle.hostImports.env.host_wgpu_submit(0n, BigInt(len2));
+  const submitsAfter2 = gpuWorker.received.filter((r) => r.msg && r.msg.cmdBuffer instanceof ArrayBuffer);
+  assert.equal(submitsAfter2.length, 2);
+  assert.equal(
+    submitsAfter2[1].msg.cmdBuffer,
+    buf1,
+    'frame 2 must reuse the exact recycled ArrayBuffer from frame 1',
+  );
+  assert.equal(submitsAfter2[1].msg.byteLength, len2);
+  assert.equal(submitsAfter2[1].msg.recycleBuffer, true);
+  assert.equal(new Uint8Array(submitsAfter2[1].msg.cmdBuffer)[8], 0x55);
+  assert.equal(new Uint8Array(submitsAfter2[1].msg.cmdBuffer)[len2 - 1], 0x77);
+  assert.equal(handle.cmdBufferPool.size, 0);
+
+  // Small (< 256 KiB) batch must NOT set recycleBuffer and must NOT consume from the pool.
+  gpuWorker.onmessage({ data: { type: PTHREAD_TX_MSG_RECYCLE_CMD_BUFFER, cmdBuffer: buf1 } });
+  assert.equal(handle.cmdBufferPool.size, 1);
+  const smallBytes = new Uint8Array(encodeTestFramePacket(0.4, 0.5, 0.6, 1.0));
+  assert.ok(smallBytes.byteLength < WGPU_CMD_POOL_MIN_BYTES);
+  memU8.set(smallBytes, 1024);
+  handle.hostImports.env.host_wgpu_submit(1024n, BigInt(smallBytes.byteLength));
+  const submitsAfter3 = gpuWorker.received.filter((r) => r.msg && r.msg.cmdBuffer instanceof ArrayBuffer);
+  assert.equal(submitsAfter3.length, 3);
+  assert.notEqual(submitsAfter3[2].msg.cmdBuffer, buf1);
+  assert.equal(submitsAfter3[2].msg.recycleBuffer, undefined);
+  assert.equal(handle.cmdBufferPool.size, 1, 'small submit must leave warm pool untouched');
+
+  // Closing the pthread worker / txPort causes any late recycle-cmd-buffer to drop cleanly.
+  handle.cleanup();
+  pthreadWorker.terminate();
+  const lateBuf = new ArrayBuffer(300 * 1024);
+  assert.doesNotThrow(() => {
+    gpuWorker.onmessage({ data: { type: PTHREAD_TX_MSG_RECYCLE_CMD_BUFFER, cmdBuffer: lateBuf } });
+  });
 });

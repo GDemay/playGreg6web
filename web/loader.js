@@ -8,6 +8,11 @@ const PTHREAD_WGPU_CHANNEL_NAME = 'playgta6-wgpu-pthread';
 const PTHREAD_HTTPFS_SAB_CHANNEL_NAME = 'playgta6-httpfs-sab';
 const PTHREAD_TX_MSG_WGPU_SUBMIT = 'wgpu-submit';
 const PTHREAD_TX_MSG_PROGRESS = 'progress';
+const PTHREAD_TX_MSG_RECYCLE_CMD_BUFFER = 'recycle-cmd-buffer';
+const WGPU_CMD_POOL_MIN_BYTES = 256 * 1024;
+const WGPU_CMD_POOL_MAX_BYTES = 32 * 1024 * 1024;
+const WGPU_CMD_POOL_MAX_BUFFERS = 3;
+const WGPU_CMD_POOL_MAX_SLACK_BYTES = 2 * 1024 * 1024;
 const PTHREAD_CMD_LOAD = 'load';
 const PTHREAD_CMD_LOADED = 'loaded';
 const PTHREAD_CMD_RUN = 'run';
@@ -359,6 +364,86 @@ function toTransferableArrayBuffer(bytes) {
     return copy.buffer;
   }
   return null;
+}
+
+/**
+ * Bounded pool of warm transferable `ArrayBuffer`s for large GPU command batches (G75, #663).
+ * Reusing already-faulted buffers returned from `wgpu_worker` avoids per-frame OS zero-page
+ * faults when streaming 4K Bink2 texture uploads (~12 MiB/frame).
+ */
+function createWarmCmdBufferPool(options = {}) {
+  const minBytes =
+    Number.isInteger(options.minBytes) && options.minBytes > 0
+      ? options.minBytes
+      : WGPU_CMD_POOL_MIN_BYTES;
+  const maxBytes =
+    Number.isInteger(options.maxBytes) && options.maxBytes >= minBytes
+      ? options.maxBytes
+      : WGPU_CMD_POOL_MAX_BYTES;
+  const maxBuffers =
+    Number.isInteger(options.maxBuffers) && options.maxBuffers > 0
+      ? options.maxBuffers
+      : WGPU_CMD_POOL_MAX_BUFFERS;
+  const maxSlackBytes =
+    Number.isInteger(options.maxSlackBytes) && options.maxSlackBytes >= 0
+      ? options.maxSlackBytes
+      : WGPU_CMD_POOL_MAX_SLACK_BYTES;
+  const buffers = [];
+
+  return {
+    get size() {
+      return buffers.length;
+    },
+    isEligibleSize(byteLength) {
+      return (
+        typeof byteLength === 'number' &&
+        Number.isInteger(byteLength) &&
+        byteLength >= minBytes &&
+        byteLength <= maxBytes
+      );
+    },
+    acquire(byteLength) {
+      if (!this.isEligibleSize(byteLength) || buffers.length === 0) {
+        return null;
+      }
+      const upperBound = Math.max(byteLength * 2, byteLength + maxSlackBytes);
+      let bestIndex = -1;
+      let bestSize = Infinity;
+      for (let i = 0; i < buffers.length; i += 1) {
+        const buf = buffers[i];
+        if (!isTransferableArrayBuffer(buf)) {
+          continue;
+        }
+        const len = buf.byteLength;
+        if (len >= byteLength && len <= upperBound && len < bestSize) {
+          bestIndex = i;
+          bestSize = len;
+        }
+      }
+      if (bestIndex < 0) {
+        return null;
+      }
+      const [picked] = buffers.splice(bestIndex, 1);
+      return picked;
+    },
+    recycle(buf) {
+      if (!isTransferableArrayBuffer(buf)) {
+        return false;
+      }
+      const len = buf.byteLength;
+      if (len < minBytes || len > maxBytes) {
+        return false;
+      }
+      if (buffers.length >= maxBuffers) {
+        buffers.shift();
+      }
+      buffers.push(buf);
+      return true;
+    },
+    clear() {
+      buffers.length = 0;
+    },
+  };
 }
 
 function asDataView(bytes) {
@@ -1489,6 +1574,10 @@ function createHostImports(options = {}) {
   const getHttpfsClient =
     typeof options.getHttpfsClient === 'function' ? options.getHttpfsClient : null;
   const store = options.userdataStore || null;
+  const cmdBufferPool =
+    options.cmdBufferPool && typeof options.cmdBufferPool.acquire === 'function'
+      ? options.cmdBufferPool
+      : null;
   let firstPresentEmitted = false;
 
   function activeBuffer() {
@@ -1541,6 +1630,34 @@ function createHostImports(options = {}) {
   function host_wgpu_submit(ptr, len) {
     const buf = activeBuffer();
     if (!buf) return;
+    if (cmdBufferPool) {
+      const byteOffset = ptrToNumber(ptr, 'ptr');
+      const byteLength = ptrToNumber(len, 'len');
+      if (byteOffset + byteLength > buf.byteLength) {
+        throw new RangeError(
+          `Wasm memory read out of bounds: [${byteOffset}..${byteOffset + byteLength}) > ${buf.byteLength}`,
+        );
+      }
+      if (byteLength >= WGPU_CMD_POOL_MIN_BYTES && byteLength <= WGPU_CMD_POOL_MAX_BYTES) {
+        const pooled = cmdBufferPool.acquire(byteLength);
+        const targetBuf = pooled || new ArrayBuffer(byteLength);
+        const targetView = new Uint8Array(targetBuf, 0, byteLength);
+        if (byteLength > 0) {
+          targetView.set(new Uint8Array(buf, byteOffset, byteLength));
+        }
+        if (!firstPresentEmitted) {
+          emitFirstPresent(targetView, inspectGpuPacketBatchForPresent(targetView));
+        }
+        if (wgpuSubmitFn) {
+          wgpuSubmitFn(targetView, {
+            cmdBuffer: targetBuf,
+            byteLength,
+            recycleBuffer: true,
+          });
+        }
+        return;
+      }
+    }
     const bytes = copyMemoryBytes(buf, ptr, len);
     if (!firstPresentEmitted) {
       emitFirstPresent(bytes, inspectGpuPacketBatchForPresent(bytes));
@@ -2169,11 +2286,52 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
 
   let txPort = null;
   let txPortClosed = false;
+  let txPortRecycleArmed = false;
+  const cmdBufferPool = createWarmCmdBufferPool();
+
+  const onTxPortMessage = (ev) => {
+    const msg = ev && ev.data !== undefined ? ev.data : ev;
+    if (
+      msg &&
+      typeof msg === 'object' &&
+      msg.type === PTHREAD_TX_MSG_RECYCLE_CMD_BUFFER &&
+      msg.cmdBuffer
+    ) {
+      cmdBufferPool.recycle(msg.cmdBuffer);
+    }
+  };
+
+  const armTxPortRecycle = (port) => {
+    if (!port || txPortRecycleArmed) {
+      return;
+    }
+    txPortRecycleArmed = true;
+    try {
+      port.onmessage = onTxPortMessage;
+    } catch {
+      // Non-fatal if a mock port exposes read-only onmessage.
+    }
+    if (typeof port.unref === 'function') {
+      try {
+        port.unref();
+      } catch {
+        // Ignore unref failures on non-Node MessagePort implementations.
+      }
+    }
+  };
 
   const closeTxPort = () => {
     const port = txPort;
     txPort = null;
     txPortClosed = true;
+    if (port && txPortRecycleArmed) {
+      try {
+        port.onmessage = null;
+      } catch {
+        // Ignore errors clearing MessagePort handler.
+      }
+    }
+    txPortRecycleArmed = false;
     closeMessagePort(port);
   };
 
@@ -2186,10 +2344,18 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
       return true;
     }
     if (txPort && txPort !== port) {
+      if (txPortRecycleArmed) {
+        try {
+          txPort.onmessage = null;
+        } catch {
+          // Ignore errors clearing previous MessagePort handler.
+        }
+      }
       closeMessagePort(txPort);
     }
     txPort = port;
     txPortClosed = false;
+    txPortRecycleArmed = false;
     return true;
   };
 
@@ -2264,17 +2430,32 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
   const hostImports = createHostImports({
     log: (msg) => pthreadReport(`[wasm] ${msg}`),
     report: () => {},
-    wgpuSubmit: (bytes) => {
-      const cmdBuffer = toTransferableArrayBuffer(bytes);
+    cmdBufferPool,
+    wgpuSubmit: (bytes, meta) => {
+      const hasRecyclableMeta = Boolean(
+        meta &&
+          meta.recycleBuffer === true &&
+          isTransferableArrayBuffer(meta.cmdBuffer) &&
+          typeof meta.byteLength === 'number',
+      );
+      const cmdBuffer = hasRecyclableMeta ? meta.cmdBuffer : toTransferableArrayBuffer(bytes);
       if (!cmdBuffer) {
         return;
       }
       if (txPort && !txPortClosed) {
+        if (hasRecyclableMeta) {
+          armTxPortRecycle(txPort);
+        }
+        const msg = hasRecyclableMeta
+          ? {
+              type: PTHREAD_TX_MSG_WGPU_SUBMIT,
+              cmdBuffer,
+              byteLength: meta.byteLength,
+              recycleBuffer: true,
+            }
+          : { type: PTHREAD_TX_MSG_WGPU_SUBMIT, cmdBuffer };
         try {
-          txPort.postMessage(
-            { type: PTHREAD_TX_MSG_WGPU_SUBMIT, cmdBuffer },
-            [cmdBuffer],
-          );
+          txPort.postMessage(msg, [cmdBuffer]);
           return;
         } catch {
           closeTxPort();
@@ -2283,10 +2464,17 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
       if (typeof BroadcastChannelCtor !== 'function') {
         return;
       }
-      postBroadcastOnce(BroadcastChannelCtor, PTHREAD_WGPU_CHANNEL_NAME, {
-        type: PTHREAD_TX_MSG_WGPU_SUBMIT,
-        cmdBuffer,
-      });
+      const bcMsg = hasRecyclableMeta
+        ? {
+            type: PTHREAD_TX_MSG_WGPU_SUBMIT,
+            cmdBuffer,
+            byteLength: meta.byteLength,
+          }
+        : {
+            type: PTHREAD_TX_MSG_WGPU_SUBMIT,
+            cmdBuffer,
+          };
+      postBroadcastOnce(BroadcastChannelCtor, PTHREAD_WGPU_CHANNEL_NAME, bcMsg);
     },
     getHttpfsClient: () => pthreadHttpfsClient,
   });
@@ -2391,6 +2579,7 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
     getHttpfsSab: () => attachedHttpfsSab,
     attachTxPort,
     hasTxPort: () => Boolean(txPort && !txPortClosed),
+    cmdBufferPool,
     channels: {
       progress: null,
       wgpu: null,
@@ -2404,6 +2593,7 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
     cleanup() {
       restoreWasmInstance();
       closeTxPort();
+      cmdBufferPool.clear();
       attachedHttpfsSab = null;
       pthreadHttpfsClient = null;
       if (hostImports && typeof hostImports.setHttpfsClient === 'function') {
@@ -6928,6 +7118,7 @@ function createPthreadPoolCoordinator(options = {}) {
   let pthreadLoadedCount = 0;
   let peakConcurrentLoads = 0;
   let pthreadActiveTxPorts = 0;
+  const activeTxPorts = new Set();
 
   function resolveHttpfsMailboxPool() {
     const rawPool = getHttpfsMailboxSabs ? getHttpfsMailboxSabs() : null;
@@ -7057,6 +7248,7 @@ function createPthreadPoolCoordinator(options = {}) {
     }
     const port = entry.txPort;
     entry.txPort = null;
+    activeTxPorts.delete(port);
     pthreadActiveTxPorts = Math.max(0, pthreadActiveTxPorts - 1);
     closeMessagePort(port);
   }
@@ -7229,7 +7421,7 @@ function createPthreadPoolCoordinator(options = {}) {
             pthreadPort = mc.port2;
             coordPort.onmessage = (ev) => {
               try {
-                onPthreadTxMessage(ev && ev.data !== undefined ? ev.data : ev, workerName);
+                onPthreadTxMessage(ev && ev.data !== undefined ? ev.data : ev, workerName, coordPort);
               } catch {
                 // Pthread TX handler errors must never disrupt the coordinator worker loop.
               }
@@ -7309,6 +7501,7 @@ function createPthreadPoolCoordinator(options = {}) {
       pthreadPeakCount = pthreadActiveCount;
     }
     if (coordPort) {
+      activeTxPorts.add(coordPort);
       pthreadActiveTxPorts += 1;
     }
 
@@ -7513,7 +7706,11 @@ function createPthreadPoolCoordinator(options = {}) {
       trackedWorkers.forEach((entry) => {
         detachEntryTxPort(entry);
       });
+      activeTxPorts.clear();
       emitTelemetry();
+    },
+    isActiveTxPort(port) {
+      return Boolean(port && activeTxPorts.has(port));
     },
     getWorkerHttpfsLane(worker) {
       const entry = trackedWorkers.get(worker);
@@ -7609,19 +7806,67 @@ function attachActiveCoordinatorGuestMemory(modOverride) {
   return false;
 }
 
+// G75 (#663): bounded FIFO mapping in-flight recycled command buffers back to the
+// originating pthread coordinator `txPort` so warm buffers return to the submitting thread.
+const pendingRecycleTxPorts = [];
+const MAX_PENDING_RECYCLE_TX_PORTS = 16;
+
+function enqueueRecycleTxPort(port) {
+  if (!port || typeof port.postMessage !== 'function') {
+    return;
+  }
+  if (pendingRecycleTxPorts.length >= MAX_PENDING_RECYCLE_TX_PORTS) {
+    pendingRecycleTxPorts.shift();
+  }
+  pendingRecycleTxPorts.push(port);
+}
+
+function handleRecycledCmdBuffer(cmdBuffer) {
+  if (
+    !isTransferableArrayBuffer(cmdBuffer) ||
+    cmdBuffer.byteLength < WGPU_CMD_POOL_MIN_BYTES ||
+    cmdBuffer.byteLength > WGPU_CMD_POOL_MAX_BYTES
+  ) {
+    return false;
+  }
+  while (pendingRecycleTxPorts.length > 0) {
+    const port = pendingRecycleTxPorts.shift();
+    if (!port || typeof port.postMessage !== 'function') {
+      continue;
+    }
+    if (
+      coordinatorPthreadPool &&
+      typeof coordinatorPthreadPool.isActiveTxPort === 'function' &&
+      !coordinatorPthreadPool.isActiveTxPort(port)
+    ) {
+      continue;
+    }
+    try {
+      port.postMessage(
+        { type: PTHREAD_TX_MSG_RECYCLE_CMD_BUFFER, cmdBuffer },
+        [cmdBuffer],
+      );
+      return true;
+    } catch {
+      // Port closed while the batch was in flight; drop the buffer cleanly.
+    }
+  }
+  return false;
+}
+
 // W345: Keep pthread GPU submits flowing through the coordinator's multiplexed `txPort`
 // so `FIRST_PRESENT` detection (`GPU_OPCODE_PRESENT = 7`), audio-ring milestone delivery,
 // and `pthreadActiveTxPorts` telemetry stay intact, while transferring the received
 // `ArrayBuffer` straight through to `gpuWorker` with zero extra copy.
 function handlePthreadWgpuSubmit(data, options = {}) {
-  const raw =
+  const isEnvelope = Boolean(
     data &&
-    typeof data === 'object' &&
-    !isTransferableArrayBuffer(data) &&
-    !isSharedArrayBuffer(data) &&
-    !ArrayBuffer.isView(data)
-      ? data.cmdBuffer || data.bytes || null
-      : data;
+      typeof data === 'object' &&
+      !isTransferableArrayBuffer(data) &&
+      !isSharedArrayBuffer(data) &&
+      !ArrayBuffer.isView(data),
+  );
+  const raw = isEnvelope ? data.cmdBuffer || data.bytes || null : data;
   let transferBuf = null;
   if (options.ownedArrayBuffer !== false && isTransferableArrayBuffer(raw)) {
     if (raw.byteLength === 0) {
@@ -7644,8 +7889,20 @@ function handlePthreadWgpuSubmit(data, options = {}) {
   if (!transferBuf || transferBuf.byteLength === 0) {
     return false;
   }
-  if (!coordinatorFirstPresentEmitted) {
-    const info = inspectGpuPacketBatchForPresent(transferBuf);
+  const hasExplicitByteLength = Boolean(
+    isEnvelope &&
+      typeof data.byteLength === 'number' &&
+      Number.isInteger(data.byteLength) &&
+      data.byteLength >= 0 &&
+      data.byteLength <= transferBuf.byteLength,
+  );
+  const effectiveByteLength = hasExplicitByteLength ? data.byteLength : transferBuf.byteLength;
+  if (!coordinatorFirstPresentEmitted && effectiveByteLength > 0) {
+    const inspectInput =
+      effectiveByteLength < transferBuf.byteLength
+        ? new Uint8Array(transferBuf, 0, effectiveByteLength)
+        : transferBuf;
+    const info = inspectGpuPacketBatchForPresent(inspectInput);
     if (info.hasPresent) {
       coordinatorFirstPresentEmitted = true;
       if (
@@ -7663,18 +7920,35 @@ function handlePthreadWgpuSubmit(data, options = {}) {
   }
   if (gpuWorker && typeof gpuWorker.postMessage === 'function') {
     attachActiveCoordinatorGuestMemory();
-    gpuWorker.postMessage({ cmdBuffer: transferBuf }, [transferBuf]);
+    const sourcePort = options && options.sourcePort ? options.sourcePort : null;
+    const wantRecycle = Boolean(
+      isEnvelope &&
+        data.recycleBuffer === true &&
+        sourcePort &&
+        typeof sourcePort.postMessage === 'function' &&
+        transferBuf.byteLength >= WGPU_CMD_POOL_MIN_BYTES &&
+        transferBuf.byteLength <= WGPU_CMD_POOL_MAX_BYTES,
+    );
+    const gpuMsg = { cmdBuffer: transferBuf };
+    if (hasExplicitByteLength) {
+      gpuMsg.byteLength = effectiveByteLength;
+    }
+    if (wantRecycle) {
+      gpuMsg.recycleBuffer = true;
+      enqueueRecycleTxPort(sourcePort);
+    }
+    gpuWorker.postMessage(gpuMsg, [transferBuf]);
     return true;
   }
   return false;
 }
 
-function handlePthreadTxMessage(data) {
+function handlePthreadTxMessage(data, _workerName, sourcePort) {
   if (!data || typeof data !== 'object') {
     return false;
   }
   if (data.type === PTHREAD_TX_MSG_WGPU_SUBMIT) {
-    return handlePthreadWgpuSubmit(data, { ownedArrayBuffer: true });
+    return handlePthreadWgpuSubmit(data, { ownedArrayBuffer: true, sourcePort });
   }
   if (data.type === PTHREAD_TX_MSG_PROGRESS) {
     if (data.payload && typeof data.payload === 'object') {
@@ -8188,6 +8462,10 @@ if (typeof self !== 'undefined') {
     gpuWorker.onmessage = (e) => {
       const data = e && e.data;
       if (!data || typeof data !== 'object') return;
+      if (data.type === PTHREAD_TX_MSG_RECYCLE_CMD_BUFFER) {
+        handleRecycledCmdBuffer(data.cmdBuffer);
+        return;
+      }
       if (data.ready) {
         attachActiveCoordinatorGuestMemory();
         onWorkerReady('wgpu_worker', data.adapter);
@@ -8314,6 +8592,11 @@ const exportedApi = {
   PTHREAD_HTTPFS_SAB_CHANNEL_NAME,
   PTHREAD_TX_MSG_WGPU_SUBMIT,
   PTHREAD_TX_MSG_PROGRESS,
+  PTHREAD_TX_MSG_RECYCLE_CMD_BUFFER,
+  WGPU_CMD_POOL_MIN_BYTES,
+  WGPU_CMD_POOL_MAX_BYTES,
+  WGPU_CMD_POOL_MAX_BUFFERS,
+  createWarmCmdBufferPool,
   PTHREAD_CMD_LOAD,
   PTHREAD_CMD_LOADED,
   PTHREAD_CMD_RUN,

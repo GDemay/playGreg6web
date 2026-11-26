@@ -771,3 +771,81 @@ test('W359: worker handler throttles telemetry posts and preserves W350 8-strip 
   assert.equal(mock.counts.copyTextureToBuffer, 8, 'W350 probe must encode 8 strips then stop once visible');
   assert.equal(processor._setBindGroup2MetaPool.length, 1, 'setBindGroup2 _wgpuMeta pool must reuse single slot');
 });
+
+test('G75: wgpu_worker cmdBuffer sub-range byteLength and recycle-cmd-buffer round-trip', async () => {
+  const mock = createFastMockWebGpu();
+  const posted = [];
+  const processor = new WgpuCommandProcessor(mock.device, mock.ctx, {
+    width: 1280,
+    height: 720,
+    requireNonBlackFrame: false,
+    enableResourceReplay: false,
+  });
+  const handler = createWgpuWorkerHandler({
+    processor,
+    postMessage: (msg, transfer) => posted.push({ msg, transfer }),
+  });
+
+  const frameBytes = new Uint8Array(
+    new PacketBuilder()
+      .beginFrame()
+      .clearColor(0.2, 0.4, 0.6, 1.0)
+      .draw(3, 1, 0, 0)
+      .present()
+      .finish()
+  );
+
+  // Oversized 512 KiB warm buffer with a poisoned extra PRESENT packet past `byteLength`.
+  const oversized = new ArrayBuffer(512 * 1024);
+  const dst = new Uint8Array(oversized);
+  dst.set(frameBytes, 0);
+  dst.set(frameBytes, frameBytes.byteLength); // must NOT be executed because byteLength stops before it
+
+  await handler.handleMessage({
+    cmdBuffer: oversized,
+    byteLength: frameBytes.byteLength,
+    recycleBuffer: true,
+  });
+
+  assert.equal(processor.frameCount, 1, 'only packets within [0, byteLength) must execute');
+  assert.equal(mock.counts.draw, 1);
+  assert.equal(
+    processor._cachedCmdBuffer,
+    null,
+    'cached DataView reference must be cleared before transferring recycled cmdBuffer'
+  );
+  const recyclePosts = posted.filter((p) => p.msg && p.msg.type === 'recycle-cmd-buffer');
+  assert.equal(recyclePosts.length, 1);
+  assert.equal(recyclePosts[0].msg.cmdBuffer, oversized);
+  assert.deepEqual(recyclePosts[0].transfer, [oversized]);
+
+  // Small (< 256 KiB) buffer must NOT be recycled even if recycleBuffer is true, and omitted byteLength works.
+  posted.length = 0;
+  const smallBuf = frameBytes.slice().buffer;
+  await handler.handleMessage({
+    cmdBuffer: smallBuf,
+    recycleBuffer: true,
+  });
+  assert.equal(processor.frameCount, 2);
+  assert.equal(
+    posted.filter((p) => p.msg && p.msg.type === 'recycle-cmd-buffer').length,
+    0,
+    'buffers below 256 KiB must not be recycled'
+  );
+
+  // SharedArrayBuffer must never be recycled (not transferable).
+  posted.length = 0;
+  const sab = new SharedArrayBuffer(512 * 1024);
+  new Uint8Array(sab).set(frameBytes, 0);
+  await handler.handleMessage({
+    cmdBuffer: sab,
+    byteLength: frameBytes.byteLength,
+    recycleBuffer: true,
+  });
+  assert.equal(processor.frameCount, 3);
+  assert.equal(
+    posted.filter((p) => p.msg && p.msg.type === 'recycle-cmd-buffer').length,
+    0,
+    'SharedArrayBuffer must never emit recycle-cmd-buffer'
+  );
+});

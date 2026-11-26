@@ -7306,6 +7306,201 @@ void test_shared_view_write_tracking_flush() {
 #endif
 }
 
+// G75 (#663): Streaming full-frame textures in a write-marked translated window (e.g. 0x100
+// console-linear 4K Bink2 Y/U/V planes) skip per-band content_hash() after 3 consecutive
+// full-surface (>= 75% bands changed) dirty frames, reset cleanly on unmarked/clean frames, and
+// keep per-band partial uploads for partial-band updates (1 of 3 bands).
+void test_streaming_texture_hash_skip() {
+    namespace gw = playgta6::os::guest_window;
+    namespace xw = playgta6::os::xmem_windows;
+    namespace sc = playgta6::os::scarlett;
+    constexpr uint64_t k64K = 64ull << 10, k16G = 16ull << 30;
+    constexpr uint32_t kType = 0x20402000u;
+    constexpr uint32_t kW = 512, kH = 192;  // 3 bands of 64 rows, 96 KiB console-linear R8_UNORM
+    constexpr uint32_t kDxgiR8Unorm = 61;
+
+    playgta6::os::set_write_tracking(false);
+    sc::xmem_reset_for_testing();
+    gw::reset_for_testing();
+    gw::set_enabled(true);
+    xw::set_policy(xw::PlacementPolicy::PhantomGpuTranslatedCpu);
+    void* cpu = pg6_xbox_XMemVirtualAlloc(nullptr, k16G, kType, 0x21u, 0x4u);
+    void* gpu = pg6_xbox_XMemVirtualAlloc(nullptr, k16G, kType, 0x3u, 0x801u);
+    const uint64_t C = playgta6::os::win32::get_vmem_arena()->guest_address(cpu);
+    const uint64_t G = playgta6::os::win32::get_vmem_arena()->guest_address(gpu);
+    CHECK(C == gw::kWindowBase && xw::is_phantom(G, k16G));
+    size_t count = 2;
+    uint64_t pfn[2] = {};
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(0x380u, &count, pfn) == 1 && count == 2);
+    const uint64_t slots[] = {C + 4 * k64K, C + 5 * k64K};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(slots, 2, pfn) == 1);
+
+    auto write_texture_packets = [](const gpu::CommandEncoder& enc, uint32_t tex_id) {
+        std::vector<Packet> out;
+        size_t off = 0;
+        while (off + sizeof(GpuPacketHeader) <= enc.size()) {
+            GpuPacketHeader h{};
+            std::memcpy(&h, enc.data() + off, sizeof(h));
+            off += sizeof(h);
+            Packet p;
+            p.opcode = static_cast<GpuOpcode>(h.opcode);
+            p.payload.assign(enc.data() + off, enc.data() + off + h.payload_bytes);
+            off += h.payload_bytes;
+            if (p.opcode == GpuOpcode::WriteTexture &&
+                payload_as<GpuWriteTexturePayload>(p).texture_id == tex_id) {
+                out.push_back(std::move(p));
+            }
+        }
+        CHECK(off == enc.size());
+        return out;
+    };
+
+    {
+        Fixture fx;
+        Scene scene(fx);
+        dg::Device* dev = host_device(scene.device);
+        int32_t result = -1;
+
+        const uint64_t tex_gpu = G + 4 * k64K;
+        const uint64_t tex_cpu = C + 4 * k64K;
+        dg::GuestResourceDesc desc = texture_desc(kW, kH, kDxgiR8Unorm, 0);
+        desc.Layout = gpu::gfx10::kConsoleLinearLayout;  // 0x100
+
+        const uint64_t tex_obj = fx.create(scene.device, Slot2::CreatePlacedResourceX,
+                                           {I(tex_gpu), I(put(desc)), I(0), I(0)},
+                                           dg::IID_ID3D12Resource, &result);
+        CHECK(result == 0);
+        const uint32_t tex_id = object_of<dg::Resource>(tex_obj)->id();
+
+        auto sync_once = [&](gpu::CommandEncoder& tex_enc) {
+            gpu::CommandEncoder buf_enc;
+            dev->begin_submission();
+            dev->flush_cpu_buffers(buf_enc);
+            const bool uploaded = dev->sync_bound_texture_memory(tex_id, tex_enc);
+            dev->end_submission();
+            return uploaded;
+        };
+
+        std::vector<uint8_t> pixels(size_t{kW} * kH, 0x10u);
+        CHECK(com::write_guest(tex_cpu, pixels.data(), pixels.size()));
+
+        // Baseline upload (frame 0): establishes band hashes, streaming_full_frames stays 0.
+        {
+            gpu::CommandEncoder enc;
+            CHECK(sync_once(enc));
+            const auto wts = write_texture_packets(enc, tex_id);
+            CHECK(wts.size() == 1);
+            if (wts.size() == 1) {
+                const auto wt = payload_as<GpuWriteTexturePayload>(wts[0]);
+                CHECK(wt.origin_y == 0 && wt.width == kW && wt.height == kH && wt.bytes_per_row == kW);
+            }
+            dg::TrackedTexture info{};
+            CHECK(dev->tracked_texture_info(tex_id, &info));
+            CHECK(info.ever_uploaded && info.streaming_full_frames == 0);
+        }
+
+        // 3 consecutive full-surface dirty updates enter streaming mode (streaming_full_frames == 3).
+        for (uint8_t step = 1; step <= 3; ++step) {
+            std::fill(pixels.begin(), pixels.end(), static_cast<uint8_t>(0x20u + step));
+            CHECK(com::write_guest(tex_cpu, pixels.data(), pixels.size()));
+            gpu::CommandEncoder enc;
+            CHECK(sync_once(enc));
+            const auto wts = write_texture_packets(enc, tex_id);
+            CHECK(wts.size() == 1);
+            if (wts.size() == 1) {
+                const auto wt = payload_as<GpuWriteTexturePayload>(wts[0]);
+                CHECK(wt.origin_y == 0 && wt.width == kW && wt.height == kH && wt.bytes_per_row == kW);
+                CHECK(wts[0].payload.size() == sizeof(GpuWriteTexturePayload) + pixels.size());
+                CHECK(std::memcmp(wts[0].payload.data() + sizeof(GpuWriteTexturePayload), pixels.data(),
+                                  pixels.size()) == 0);
+            }
+            dg::TrackedTexture info{};
+            CHECK(dev->tracked_texture_info(tex_id, &info));
+            CHECK(info.streaming_full_frames == step);
+        }
+
+        // 4th dirty update uses streaming hash-skip: uploads full texture and clears stale hashes.
+        std::fill(pixels.begin(), pixels.end(), 0x55u);
+        CHECK(com::write_guest(tex_cpu, pixels.data(), pixels.size()));
+        {
+            gpu::CommandEncoder enc;
+            CHECK(sync_once(enc));
+            const auto wts = write_texture_packets(enc, tex_id);
+            CHECK(wts.size() == 1);
+            if (wts.size() == 1) {
+                const auto wt = payload_as<GpuWriteTexturePayload>(wts[0]);
+                CHECK(wt.origin_y == 0 && wt.width == kW && wt.height == kH && wt.bytes_per_row == kW);
+                CHECK(wts[0].payload.size() == sizeof(GpuWriteTexturePayload) + pixels.size());
+                CHECK(std::memcmp(wts[0].payload.data() + sizeof(GpuWriteTexturePayload), pixels.data(),
+                                  pixels.size()) == 0);
+            }
+            dg::TrackedTexture info{};
+            CHECK(dev->tracked_texture_info(tex_id, &info));
+            CHECK(info.ever_uploaded && info.streaming_full_frames >= 3);
+            CHECK(info.last_upload_hash == 0);
+            CHECK(!info.subresource_hashes.empty() && info.subresource_hashes[0] == 0);
+            CHECK(!info.subresource_bands.empty() && info.subresource_bands[0].empty());
+        }
+
+        // Unmarked (clean) frame emits 0 WriteTexture packets and resets streaming_full_frames to 0.
+        {
+            gpu::CommandEncoder enc;
+            CHECK(!sync_once(enc));
+            CHECK(write_texture_packets(enc, tex_id).empty());
+            dg::TrackedTexture info{};
+            CHECK(dev->tracked_texture_info(tex_id, &info));
+            CHECK(info.streaming_full_frames == 0);
+        }
+
+        // Re-baseline after exiting streaming mode (subresource hashes were cleared to 0 so
+        // this full write re-populates band hashes without matching a stale hash).
+        std::fill(pixels.begin(), pixels.end(), 0x66u);
+        CHECK(com::write_guest(tex_cpu, pixels.data(), pixels.size()));
+        {
+            gpu::CommandEncoder enc;
+            CHECK(sync_once(enc));
+            const auto wts = write_texture_packets(enc, tex_id);
+            CHECK(wts.size() == 1);
+            dg::TrackedTexture info{};
+            CHECK(dev->tracked_texture_info(tex_id, &info));
+            CHECK(info.streaming_full_frames == 0);
+            CHECK(info.last_upload_hash != 0);
+        }
+
+        // Partial-band updates (1 of 3 bands modified per frame) never enter streaming mode and
+        // upload ONLY the single changed 64-row band (not 192 rows).
+        for (uint32_t step = 0; step < 4; ++step) {
+            const uint32_t band = step % 3u;
+            const size_t band_off = size_t{band} * 64u * kW;
+            const size_t band_bytes = size_t{64u} * kW;
+            std::memset(pixels.data() + band_off, static_cast<uint8_t>(0x80u + step), band_bytes);
+            CHECK(com::write_guest(tex_cpu + band_off, pixels.data() + band_off, band_bytes));
+            gpu::CommandEncoder enc;
+            CHECK(sync_once(enc));
+            const auto wts = write_texture_packets(enc, tex_id);
+            CHECK(wts.size() == 1);
+            if (wts.size() == 1) {
+                const auto wt = payload_as<GpuWriteTexturePayload>(wts[0]);
+                CHECK(wt.origin_y == band * 64u && wt.width == kW && wt.height == 64u && wt.bytes_per_row == kW);
+                CHECK(wts[0].payload.size() == sizeof(GpuWriteTexturePayload) + band_bytes);
+                CHECK(std::memcmp(wts[0].payload.data() + sizeof(GpuWriteTexturePayload),
+                                  pixels.data() + band_off, band_bytes) == 0);
+            }
+            dg::TrackedTexture info{};
+            CHECK(dev->tracked_texture_info(tex_id, &info));
+            CHECK(info.streaming_full_frames == 0);
+        }
+
+        fx.vcall(tex_obj, Slot::Release);
+        scene.release_all();
+    }
+
+    sc::xmem_reset_for_testing();
+    gw::reset_for_testing();
+    xw::set_policy(xw::PlacementPolicy::Arena);
+    playgta6::os::set_write_tracking(true);
+}
+
 int main() {
     // The flush of CPU-visible buffers uses the arena's write tracking where it exists (the boot
     // harness turns it on); exercise that path here too.
@@ -7316,6 +7511,7 @@ int main() {
     test_window_texture_sync_markpass_and_inplace_hash();
     test_g72_non256_linear_texture_single_pass_and_lazy_pad();
     test_g73_console_linear_direct_zero_copy_upload();
+    test_streaming_texture_hash_skip();
     test_shared_view_write_tracking_flush();
     test_export_registration();
     test_create_device();
