@@ -73,6 +73,30 @@ bool test_resolver(void* user, uint64_t va, GpuVaResolution* out) {
 // 1. Heap creation and handle arithmetic
 // ---------------------------------------------------------------------------
 
+// Backlog 28: live heap / slot gauges follow create, destroy and registry teardown.
+void test_live_heap_gauges() {
+    const DescriptorLiveCounts base = descriptor_live_counts();
+    {
+        DescriptorHeapRegistry reg;
+        DescriptorHeapDesc d;
+        d.type = DescriptorHeapType::CbvSrvUav;
+        d.num_descriptors = 16;
+        DescriptorHeap* a = nullptr;
+        DescriptorHeap* b = nullptr;
+        CHECK(reg.create_heap(d, &a) == Status::Ok);
+        d.num_descriptors = 8;
+        CHECK(reg.create_heap(d, &b) == Status::Ok);
+        DescriptorLiveCounts c = descriptor_live_counts();
+        CHECK(c.heaps == base.heaps + 2 && c.heap_slots == base.heap_slots + 24);
+        reg.destroy_heap(a);
+        reg.destroy_heap(a);  // double destroy is ignored
+        c = descriptor_live_counts();
+        CHECK(c.heaps == base.heaps + 1 && c.heap_slots == base.heap_slots + 8);
+    }
+    const DescriptorLiveCounts end = descriptor_live_counts();
+    CHECK(end.heaps == base.heaps && end.heap_slots == base.heap_slots);
+}
+
 void test_heap_creation_and_handles() {
     DescriptorHeapRegistry reg;
     CHECK(descriptor_handle_increment_size(DescriptorHeapType::CbvSrvUav) == 32);
@@ -1287,6 +1311,16 @@ void test_heap_indexed_bind_groups() {
         CHECK(cache.end_epoch(0, &retired) == 1 && cache.size() == 0);
         CHECK(std::find(retired.begin(), retired.end(), 99u) != retired.end());
     }
+    // Backlog 28: the live-entry gauge follows the cache through insert, eviction and clear.
+    {
+        const uint64_t others = descriptor_live_counts().cached_bind_groups - cache.size();
+        CHECK(st.set_root_constants(G, 0, 2, k1, 0) == Status::Ok);
+        BindGroupLookup l = cache.get_or_build(st, G, plan, 1, test_resolver, nullptr);
+        CHECK(l.bind_group != nullptr && cache.size() >= 1);
+        CHECK(descriptor_live_counts().cached_bind_groups == others + cache.size());
+        cache.clear(nullptr);
+        CHECK(descriptor_live_counts().cached_bind_groups == others);
+    }
 }
 
 // Binding array elements (G62, lane-indexed heap windows): element k reads the heap index plus k;
@@ -2254,6 +2288,7 @@ void test_concurrent_disjoint_writes() {
 
 int main() {
     test_heap_creation_and_handles();
+    test_live_heap_gauges();
     test_descriptor_writes();
     test_copy_descriptors_simple();
     test_copy_descriptors_multi_range();

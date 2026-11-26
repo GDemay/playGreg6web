@@ -1552,6 +1552,31 @@ void test_indexed_draw_and_layout_dedup() {
     CHECK(list.stats().draws == 2);
 }
 
+// Backlog 28: a released command list takes its cached bind groups with it (destroy deferred, the
+// process-wide live gauges drop), so create/release cycles plateau.
+void test_released_list_retires_bind_groups() {
+    Scene scene;
+    const bridge::BridgeLiveCounts base = bridge::bridge_live_counts();
+    const size_t base_deferred = scene.device.deferred_destroy_count();
+    {
+        gpu::CommandEncoder enc;
+        bridge::CommandListBridge list(scene.device, enc);
+        scene.bind_root(list);
+        const d3d::CpuDescriptorHandle rtv0 = scene.rtv(0);
+        list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+        list.DrawInstanced(3, 1, 0, 0);
+        list.Close();
+        CHECK(list.cached_bind_group_count() >= 1);
+        const bridge::BridgeLiveCounts live = bridge::bridge_live_counts();
+        CHECK(live.command_lists == base.command_lists + 1);
+        CHECK(live.cached_bind_groups >= base.cached_bind_groups + list.cached_bind_group_count());
+    }
+    const bridge::BridgeLiveCounts after = bridge::bridge_live_counts();
+    CHECK(after.command_lists == base.command_lists);
+    CHECK(after.cached_bind_groups == base.cached_bind_groups);
+    CHECK(scene.device.deferred_destroy_count() > base_deferred);
+}
+
 // G66: N identical draws create exactly the objects one draw does; every later draw is a cache hit.
 void test_identical_draws_create_no_new_objects() {
     struct Result {
@@ -4381,6 +4406,7 @@ int main() {
     test_diagnostics_and_closed_list();
     test_indexed_draw_and_layout_dedup();
     test_identical_draws_create_no_new_objects();
+    test_released_list_retires_bind_groups();
     test_concurrent_command_lists();
     test_dirty_texture_memory_upload();
     test_all_subresource_uploads();

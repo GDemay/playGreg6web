@@ -1170,6 +1170,8 @@ int main(int argc, char** argv) {
             const os::win32::KernelHandleCounts h = os::win32::live_kernel_handles();
             const guest::com::BridgeStats com = guest::com::bridge_stats();
             const os::GuestHeapStats heap = os::default_guest_heap().stats();
+            const gpu::d3d12_state::DescriptorLiveCounts dcount = gpu::d3d12_state::descriptor_live_counts();
+            const gpu::bridge::BridgeLiveCounts bcount = gpu::bridge::bridge_live_counts();
             const gpu::d3d12_guest::xbox::FrameWaitTotals waits = gpu::d3d12_guest::xbox::frame_wait_totals();
             sample->counters = {
                 {"handles_dispatcher", h.dispatcher},
@@ -1185,6 +1187,13 @@ int main(int argc, char** argv) {
                 {"heap_lock_acquisitions", heap.lock_acquisitions},
                 {"heap_lock_contended", heap.lock_contended},
                 {"heap_lock_wait_us", heap.lock_wait_ns / 1000},
+                // Live descriptor-side objects (backlog 28): all must plateau over a long run.
+                {"descriptor_heaps", dcount.heaps},
+                {"descriptor_heap_slots", dcount.heap_slots},
+                {"bind_groups_cached", bcount.cached_bind_groups},
+                {"interned_views", bcount.interned_views},
+                {"samplers_live", bcount.samplers},
+                {"command_lists_live", bcount.command_lists},
                 {"frame_waits", waits.waits},
                 {"frame_wait_us", waits.wait_us},
                 {"frame_polls", waits.polls},
