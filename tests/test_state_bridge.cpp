@@ -615,6 +615,107 @@ void test_cached_bind_group_drops_destroyed_texture() {
     CHECK(!scene.device.retired(Scene::kAlbedo));
 }
 
+// G66 partly-held mip chains: the title streams only a texture's small levels. Sampled views start
+// at the first held level (and at the view's min-LOD clamp), cached bind groups follow changes of
+// the held levels, and each clamped binding is counted.
+void test_partly_held_mip_chain_clamps_views() {
+    // The clamp itself.
+    uint16_t base = 0, count = 0;
+    CHECK(bridge::clamp_view_to_resident_mips(9, 3, 0.0f, &base, &count) && base == 3 && count == 0);
+    base = 1, count = 4;  // levels 1..4
+    CHECK(bridge::clamp_view_to_resident_mips(9, 3, 0.0f, &base, &count) && base == 3 && count == 2);
+    base = 1, count = 2;  // levels 1..2, nothing held: the view's last level stays
+    CHECK(bridge::clamp_view_to_resident_mips(9, 6, 0.0f, &base, &count) && base == 2 && count == 1);
+    base = 4, count = 0;
+    CHECK(!bridge::clamp_view_to_resident_mips(9, 3, 0.0f, &base, &count) && base == 4 && count == 0);
+    base = 0, count = 0;
+    CHECK(bridge::clamp_view_to_resident_mips(9, 0, 2.5f, &base, &count) && base == 2 && count == 0);
+    base = 0, count = 0;
+    CHECK(bridge::clamp_view_to_resident_mips(9, 1, 20.0f, &base, &count) && base == 8);
+
+    // Held levels from per-subresource upload marks (mip + slice * mips).
+    const uint64_t small_held[] = {0, 0, 0, 7, 7, 7};
+    CHECK(bridge::held_mip_floor(small_held, 6, 1) == 3);
+    const uint64_t all_held[] = {1, 1, 1};
+    CHECK(bridge::held_mip_floor(all_held, 3, 1) == 0);
+    const uint64_t top_only[] = {1, 0, 0};  // smaller levels filled on the GPU: not clamped
+    CHECK(bridge::held_mip_floor(top_only, 3, 1) == 0);
+    const uint64_t two_slices[] = {0, 0, 1, 0, 1, 0};  // slice 0 holds level 2, slice 1 level 1
+    CHECK(bridge::held_mip_floor(two_slices, 3, 2) == 1);
+
+    Scene scene;
+    CHECK(!scene.device.set_resident_mip_floor(9999, 2));
+    gpu::CommandEncoder enc;
+    bridge::CommandListBridge list(scene.device, enc);
+    const d3d::CpuDescriptorHandle rtv0 = scene.rtv(0);
+    const auto draw = [&] {
+        const size_t mark = enc.size();
+        scene.bind_root(list);
+        list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+        list.DrawInstanced(3, 1, 0, 0);
+        return decode(enc, mark);
+    };
+    const auto texture_entry = [](const std::vector<Packet>& p, GpuBindGroupEntry2* out) {
+        for (const Packet& x : p) {
+            if (x.opcode == GpuOpcode::CreateBindGroup2) {
+                *out = pod<GpuBindGroupEntry2>(x, sizeof(GpuCreateBindGroup2Payload) + sizeof(GpuBindGroupEntry2));
+                return true;
+            }
+        }
+        return false;
+    };
+    const auto destroys = [](const std::vector<Packet>& p) {
+        return std::count_if(p.begin(), p.end(), [](const Packet& x) { return x.opcode == GpuOpcode::DestroyResource; });
+    };
+
+    // Levels 3.. held: the bound view starts at level 3.
+    CHECK(scene.device.set_resident_mip_floor(Scene::kAlbedo, 3));
+    std::vector<Packet> p = draw();
+    GpuBindGroupEntry2 e{};
+    CHECK(texture_entry(p, &e));
+    CHECK(e.resource_id == Scene::kAlbedo && e.view.base_mip_level == 3 && e.view.mip_level_count == 0);
+    CHECK(list.stats().mip_clamped_binds == 1);
+
+    // Unchanged held levels: the cached group is bound again.
+    p = draw();
+    CHECK(!texture_entry(p, &e) && destroys(p) == 0);
+
+    // Another texture's floor (limited to its single level) changes nothing.
+    CHECK(scene.device.set_resident_mip_floor(Scene::kAlbedo2, 0));
+    p = draw();
+    CHECK(!texture_entry(p, &e));
+
+    // More levels streamed in: the cached group is re-created over the new first held level.
+    CHECK(scene.device.set_resident_mip_floor(Scene::kAlbedo, 1));
+    p = draw();
+    CHECK(texture_entry(p, &e) && e.view.base_mip_level == 1 && destroys(p) == 1);
+    CHECK(list.stats().bind_groups_residency_changed == 1 && list.stats().mip_clamped_binds == 2);
+
+    // Registering the same description again keeps the held levels.
+    scene.device.register_texture(Scene::kAlbedo, {pso::DxgiFormat::R8G8B8A8_UNORM, 256, 256, 1, 9, 1,
+                                                   GpuTextureDimension::Dim2D, false});
+    bridge::TextureInfo info{};
+    CHECK(scene.device.texture_info(Scene::kAlbedo, &info) && info.resident_mip_floor == 1);
+
+    // The whole chain held: unclamped again.
+    CHECK(scene.device.set_resident_mip_floor(Scene::kAlbedo, 0));
+    p = draw();
+    CHECK(texture_entry(p, &e) && e.view.base_mip_level == 0 && e.view.mip_level_count == 0);
+    CHECK(list.stats().bind_groups_residency_changed == 2 && list.stats().mip_clamped_binds == 2);
+
+    // The view's own min-LOD clamp (ResourceMinLODClamp) clamps it too.
+    d3d::ViewDesc srv;
+    srv.format = 28;
+    srv.dimension = d3d::ViewDimension::Texture2D;
+    srv.min_lod_clamp = 4.25f;
+    CHECK(scene.heaps.create_shader_resource_view(Scene::kAlbedo, &srv, scene.srv_heap->cpu_handle(0)) ==
+          d3d::Status::Ok);
+    p = draw();
+    CHECK(texture_entry(p, &e) && e.view.base_mip_level == 4 && e.view.mip_level_count == 0);
+    CHECK(list.stats().mip_clamped_binds == 3);
+    list.Close();
+}
+
 void test_usage_conflict_is_diagnosed() {
     Scene scene;
     gpu::CommandEncoder enc;
@@ -4135,6 +4236,7 @@ void test_evicted_texture_destroy_deferred_until_after_present() {
 }
 
 int main() {
+    test_partly_held_mip_chain_clamps_views();
     test_view_table_bounded();
     test_unregister_texture_invalidates_cached_bind_groups();
     test_evicted_texture_destroy_deferred_until_after_present();

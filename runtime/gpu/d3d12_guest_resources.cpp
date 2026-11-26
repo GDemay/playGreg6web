@@ -1054,6 +1054,7 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         staged.push_back(std::move(st));
     }
 
+    uint32_t held_floor = 0;
     const bool single_known_nonzero = !tt.ever_uploaded && subs.size() == 1u && !is_tiled && !convert_norm16 &&
                                       !convert_a8 && src_size == tight_mip0_bytes;
     {
@@ -1114,7 +1115,10 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
             ++out;
         }
         staged.erase(out, staged.end());
+        held_floor = bridge::held_mip_floor(cur.subresource_hashes, mips, layers);
     }
+    // G66 partly-held mip chains: views of the texture start at its first held level.
+    bridge_->set_resident_mip_floor(resource_id, held_floor);
 
     for (const Staged& st : staged) {
         for (const auto& [first, count] : st.runs) {

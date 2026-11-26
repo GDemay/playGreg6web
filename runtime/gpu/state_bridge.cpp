@@ -170,6 +170,7 @@ StateBridgeDevice::~StateBridgeDevice() = default;
 
 void StateBridgeDevice::register_texture(uint32_t resource_id, const TextureInfo& info) {
     bool replaced = false;
+    uint32_t kept_floor = 0;
     {
         std::unique_lock lock(resources_mutex_);
         if (auto it = textures_.find(resource_id); it != textures_.end()) {
@@ -177,12 +178,17 @@ void StateBridgeDevice::register_texture(uint32_t resource_id, const TextureInfo
             replaced = old.format != info.format || old.width != info.width || old.height != info.height ||
                        old.depth_or_array_size != info.depth_or_array_size || old.mip_levels != info.mip_levels ||
                        old.dimension != info.dimension;
+            kept_floor = replaced ? 0u : old.resident_mip_floor;
             if (auto v = textures_by_va_.find(it->second.gpu_va);
                 it->second.gpu_va != 0 && v != textures_by_va_.end() && v->second == resource_id) {
                 textures_by_va_.erase(v);
             }
         }
-        textures_[resource_id] = info;
+        TextureInfo& stored = textures_[resource_id];
+        stored = info;
+        if (stored.resident_mip_floor == 0) {
+            stored.resident_mip_floor = kept_floor;  // the same texture registered again keeps its held levels
+        }
         retired_resources_.erase(resource_id);
         if (info.gpu_va != 0) {
             textures_by_va_[info.gpu_va] = resource_id;
@@ -476,6 +482,63 @@ size_t StateBridgeDevice::deferred_destroy_count() const {
 void StateBridgeDevice::register_shader_module(uint64_t shader_identity, uint32_t module_id) {
     std::unique_lock lock(resources_mutex_);
     shader_modules_[shader_identity] = module_id;
+}
+
+bool StateBridgeDevice::set_resident_mip_floor(uint32_t resource_id, uint32_t first_resident_mip) {
+    std::unique_lock lock(resources_mutex_);
+    const auto it = textures_.find(resource_id);
+    if (it == textures_.end()) {
+        return false;
+    }
+    const uint32_t floor = std::min(first_resident_mip, std::max(it->second.mip_levels, 1u) - 1u);
+    if (it->second.resident_mip_floor != floor) {
+        it->second.resident_mip_floor = floor;
+        residency_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    return true;
+}
+
+bool clamp_view_to_resident_mips(uint32_t mip_levels, uint32_t resident_floor, float min_lod_clamp, uint16_t* base,
+                                 uint16_t* count) noexcept {
+    const uint32_t levels = std::max(mip_levels, 1u);
+    uint32_t floor = resident_floor;
+    if (min_lod_clamp > 0.0f) {  // false for NaN
+        floor = std::max(floor, static_cast<uint32_t>(std::floor(std::min(min_lod_clamp, 65535.0f))));
+    }
+    const uint32_t b = *base;
+    if (floor <= b || b >= levels) {
+        return false;
+    }
+    const uint32_t end = *count == 0 ? levels : std::min(levels, b + *count);  // one past the view's last level
+    const uint32_t raised = std::min(floor, end - 1u);
+    if (raised <= b) {
+        return false;
+    }
+    *base = static_cast<uint16_t>(raised);
+    if (*count != 0) {
+        *count = static_cast<uint16_t>(end - raised);
+    }
+    return true;
+}
+
+uint32_t held_mip_floor(std::span<const uint64_t> subresource_marks, uint32_t mips, uint32_t layers) noexcept {
+    const auto held = [&](uint32_t mip) {
+        for (uint32_t slice = 0; slice < layers; ++slice) {
+            const size_t index = mip + size_t{slice} * mips;
+            if (index < subresource_marks.size() && subresource_marks[index] != 0) {
+                return true;
+            }
+        }
+        return false;
+    };
+    if (mips <= 1u || layers == 0u) {
+        return 0;
+    }
+    uint32_t floor = mips;
+    while (floor > 0u && held(floor - 1u)) {
+        --floor;
+    }
+    return floor == mips ? 0u : floor;
 }
 
 bool StateBridgeDevice::texture_info(uint32_t resource_id, TextureInfo* out) const {
@@ -2247,6 +2310,13 @@ GpuTextureViewDesc CommandListBridge::texture_view_desc(const d3d::ViewDescripto
     const bool uav = v.kind == d3d::DescriptorKind::Uav;
     d.base_mip_level = v.first_mip;
     d.mip_level_count = uav ? 1 : (v.mip_levels == 0xffffu ? 0 : v.mip_levels);
+    // G66 partly-held mip chains: a sampled view starts at the first held level (and at the view's
+    // min-LOD clamp), so the shader never samples a level the title did not stream in.
+    if (v.kind == d3d::DescriptorKind::Srv && known && (tex.resident_mip_floor != 0 || v.min_lod_clamp > 0.0f) &&
+        clamp_view_to_resident_mips(tex.mip_levels, tex.resident_mip_floor, v.min_lod_clamp, &d.base_mip_level,
+                                    &d.mip_level_count)) {
+        ++stats_.mip_clamped_binds;
+    }
     switch (v.dimension) {
     case V::Texture1D:
     case V::Texture2D:
@@ -2317,6 +2387,8 @@ bool CommandListBridge::emit_bind_group(d3d::BindPoint /*bind_point*/,
     cached->relocations = pending_relocations_;
     cached->relocation_epoch = device_.options().relocation_epoch ? device_.options().relocation_epoch() : 0;
     cached->retire_epoch = device_.retire_epoch();
+    cached->residency_epoch = device_.residency_epoch();
+    cached->residency_key = residency_key(*cached);
     cached->view_ids = pending_view_ids_;
     GpuCreateBindGroup2Payload header{};
     header.id = device_.allocate_id();
@@ -2350,6 +2422,35 @@ bool CommandListBridge::binds_retired(d3d::CachedBindGroup* cached) const {
         }
     }
     cached->retire_epoch = epoch;
+    return false;
+}
+
+uint64_t CommandListBridge::residency_key(const d3d::CachedBindGroup& cached) const {
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (const d3d::BindGroupEntry& e : cached.entries) {
+        if (e.kind != d3d::BindResourceKind::TextureView || e.resource_id == 0 ||
+            e.view.kind != d3d::DescriptorKind::Srv) {
+            continue;
+        }
+        TextureInfo tex{};
+        if (!device_.texture_info(e.resource_id, &tex) || tex.resident_mip_floor == 0) {
+            continue;
+        }
+        h = (h ^ e.resource_id) * 0x100000001b3ull;
+        h = (h ^ tex.resident_mip_floor) * 0x100000001b3ull;
+    }
+    return h;
+}
+
+bool CommandListBridge::residency_changed(d3d::CachedBindGroup* cached) const {
+    const uint64_t epoch = device_.residency_epoch();
+    if (epoch == cached->residency_epoch) {
+        return false;
+    }
+    if (residency_key(*cached) != cached->residency_key) {
+        return true;  // emit_bind_group records the new epoch and key
+    }
+    cached->residency_epoch = epoch;
     return false;
 }
 
@@ -2915,6 +3016,18 @@ bool CommandListBridge::apply_bind_groups(d3d::BindPoint bind_point,
                 redirects_.erase(old_id);
                 encoder_.destroy_resource(old_id);
                 ++stats_.bind_groups_relocation_moved;
+            } else if (residency_changed(cached)) {
+                // G66 partly-held mip chains: a bound texture's held levels changed since this group
+                // was created: bind a group whose views start at the new first held level.
+                const uint32_t old_id = cached->gpu_id;
+                device_.ensure_layout_emitted(layout, encoder_);
+                if (!emit_bind_group(bind_point, group, cached, &plans[g])) {
+                    drain_invalidations_locked();
+                    return false;
+                }
+                redirects_.erase(old_id);
+                encoder_.destroy_resource(old_id);
+                ++stats_.bind_groups_residency_changed;
             } else if (cached->from_memory) {
                 note_memory_group(group, plans[g], *cached, kNoPacket);  // created by an earlier recording
             }
