@@ -83,7 +83,7 @@ impl FunctionLifter<'_> {
                 let s = self.sub_bytes(&v, false);
                 // [SubWord(X1), RotWord(SubWord(X1)) ^ rcon, SubWord(X3), RotWord(SubWord(X3)) ^ rcon]
                 let idx = [4, 5, 6, 7, 5, 6, 7, 4, 12, 13, 14, 15, 13, 14, 15, 12];
-                let r = self.shuffle(&s, &s, I8, &idx);
+                let r = self.shuffle(&s, "poison", I8, &idx);
                 let r = self.cast(&r, Ty::v(I8), Ty::v(I32));
                 let r = self.val(&format!(
                     "xor <4 x i32> {r}, <i32 0, i32 {rcon}, i32 0, i32 {rcon}>"
@@ -110,11 +110,11 @@ impl FunctionLifter<'_> {
                 // Vector butterfly reduction via `i16x8.min_u`, then `i16x8.eq` + `i16x8.bitmask`
                 // + `cttz` to recover the lowest lane index matching the minimum.
                 let v = self.v128(ins, 1, I16)?;
-                let s1 = self.shuffle(&v, &v, I16, &[4, 5, 6, 7, 0, 1, 2, 3]);
+                let s1 = self.shuffle(&v, "poison", I16, &[4, 5, 6, 7, 0, 1, 2, 3]);
                 let m1 = self.intr(Intr::UMin, Ty::v(I16), &[&v, &s1]);
-                let s2 = self.shuffle(&m1, &m1, I16, &[2, 3, 0, 1, 6, 7, 4, 5]);
+                let s2 = self.shuffle(&m1, "poison", I16, &[2, 3, 0, 1, 6, 7, 4, 5]);
                 let m2 = self.intr(Intr::UMin, Ty::v(I16), &[&m1, &s2]);
-                let s3 = self.shuffle(&m2, &m2, I16, &[1, 0, 3, 2, 5, 4, 7, 6]);
+                let s3 = self.shuffle(&m2, "poison", I16, &[1, 0, 3, 2, 5, 4, 7, 6]);
                 let m3 = self.intr(Intr::UMin, Ty::v(I16), &[&m2, &s3]);
                 let eq = self.val(&format!("icmp eq <8 x i16> {v}, {m3}"));
                 let bits = self.val(&format!("bitcast <8 x i1> {eq} to i8"));
@@ -201,28 +201,19 @@ impl FunctionLifter<'_> {
                 }
             })
             .collect();
-        self.shuffle(s, s, Elem::I8, &idx)
+        self.shuffle(s, "poison", Elem::I8, &idx)
     }
 
-    /// (Inv)SubBytes: table lookups in the AES S-box.
+    /// (Inv)SubBytes: calls outlined `@__playgta6_aes_{,inv_}sub_bytes` helper (1 call vs 80 inline
+    /// scalar S-box lookups per AES round).
     fn sub_bytes(&mut self, s: &str, inverse: bool) -> String {
-        self.use_helper(Intr::AesTables);
-        let table = if inverse {
-            "@__playgta6_aes_inv_sbox"
+        let (intr, name) = if inverse {
+            (Intr::AesInvSubBytes, "@__playgta6_aes_inv_sub_bytes")
         } else {
-            "@__playgta6_aes_sbox"
+            (Intr::AesSubBytes, "@__playgta6_aes_sub_bytes")
         };
-        let mut r = "poison".to_string();
-        for l in 0..16 {
-            let b = self.extract(s, Elem::I8, l);
-            let i = self.val(&format!("zext i8 {b} to i64"));
-            let p = self.val(&format!(
-                "getelementptr inbounds [256 x i8], ptr {table}, i64 0, i64 {i}"
-            ));
-            let x = self.val(&format!("load i8, ptr {p}"));
-            r = self.insert(&r, Elem::I8, &x, l);
-        }
-        r
+        self.use_helper(intr);
+        self.val(&format!("call <16 x i8> {name}(<16 x i8> {s})"))
     }
 
     /// Multiplication by x in GF(2^8) of every byte.

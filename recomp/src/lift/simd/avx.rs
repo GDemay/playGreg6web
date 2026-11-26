@@ -318,40 +318,6 @@ impl FunctionLifter<'_> {
         Ok(())
     }
 
-    /// Concatenates two 128-bit halves of `e` into one `<2n x e>` vector.
-    fn concat(&mut self, lo: &str, hi: &str, e: Elem) -> String {
-        let n = e.lanes();
-        let idx: Vec<u32> = (0..2 * n).collect();
-        let t = Ty::v(e).ir();
-        self.val(&format!("shufflevector {t} {lo}, {t} {hi}, {}", mask(&idx)))
-    }
-
-    /// Splits a `<2n x e>` vector into its two 128-bit halves.
-    fn split(&mut self, v: &str, e: Elem) -> (String, String) {
-        let n = e.lanes();
-        let t = Ty::vn(e, 2 * n).ir();
-        let lo: Vec<u32> = (0..n).collect();
-        let hi: Vec<u32> = (n..2 * n).collect();
-        let a = self.val(&format!("shufflevector {t} {v}, {t} poison, {}", mask(&lo)));
-        let b = self.val(&format!("shufflevector {t} {v}, {t} poison, {}", mask(&hi)));
-        (a, b)
-    }
-
-    /// The whole 128/256-bit operand `i` as `<n x e>` (n = 16 or 32 bytes worth).
-    fn whole(&mut self, ins: &Instruction, i: u32, e: Elem) -> R<(String, bool)> {
-        let wide = match ins.op_kind(i) {
-            OpKind::Register => ins.op_register(i).is_ymm(),
-            OpKind::Memory => Self::mem_bytes(ins) == 32,
-            k => return unsupported(format!("vector operand kind {k:?}")),
-        };
-        let lo = self.v_half(ins, i, 0, e)?;
-        if !wide {
-            return Ok((lo, false));
-        }
-        let hi = self.v_half(ins, i, 1, e)?;
-        Ok((self.concat(&lo, &hi, e), true))
-    }
-
     /// Lifts the instructions of this module; `Ok(false)` if `ins` is not one of them.
     pub(super) fn lift_avx(&mut self, ins: &Instruction) -> R<bool> {
         use Elem::{F32, F64, I8, I16, I32, I64};
@@ -479,19 +445,20 @@ impl FunctionLifter<'_> {
                     M::Vmovmskpd => I64,
                     _ => I8,
                 };
-                // One sign mask per 128-bit half (a single `<32 x i1>` bitcast is miscompiled
-                // by the wasm backend of some LLVM versions).
+                // One native Wasm SIMD128 `bitmask` per 128-bit half, shifted and ORed.
                 let n = e.lanes();
                 let dst = self.op_bits(ins, 0)?;
-                let mut r = "0".to_string();
-                for half in 0..2 {
-                    let v = self.v_half(ins, 1, half, e)?;
-                    let neg = self.val(&format!("icmp slt {} {v}, zeroinitializer", Ty::v(e).ir()));
-                    let bits = self.val(&format!("bitcast <{n} x i1> {neg} to i{n}"));
-                    let bits = self.val(&format!("zext i{n} {bits} to i{dst}"));
-                    let bits = self.val(&format!("shl i{dst} {bits}, {}", half * n));
-                    r = self.val(&format!("or i{dst} {r}, {bits}"));
-                }
+                let v0 = self.v_half(ins, 1, 0, e)?;
+                let lo = self.intr(Intr::Bitmask, Ty::v(e), &[&v0]);
+                let v1 = self.v_half(ins, 1, 1, e)?;
+                let hi = self.intr(Intr::Bitmask, Ty::v(e), &[&v1]);
+                let hi_sh = self.val(&format!("shl i32 {hi}, {n}"));
+                let combined = self.val(&format!("or i32 {lo}, {hi_sh}"));
+                let r = if dst > 32 {
+                    self.val(&format!("zext i32 {combined} to i{dst}"))
+                } else {
+                    combined
+                };
                 self.write_op(ins, 0, &r, dst)?;
             }
             M::Ptest | M::Vptest => self.test(ins, None)?,
@@ -626,13 +593,23 @@ impl FunctionLifter<'_> {
                 } else {
                     let v = self.v_half(ins, 1, 0, I32)?;
                     let h = self.float_to_half_v4(&v, mode);
-                    let h4 = self.val(&format!("trunc <4 x i32> {h} to <4 x i16>"));
                     match ins.op_kind(0) {
                         OpKind::Register => {
-                            let r = self.zext_lanes(&h4, I16, 4);
+                            // Pack low 16 bits of each lane + zero upper 64 bits in one
+                            // `shufflevector` (2 Wasm ops vs 9 ops with `replace_lane`).
+                            let h16 = self.cast(&h, Ty::v(I32), Ty::v(I16));
+                            let r = self.shuffle(
+                                &h16,
+                                "zeroinitializer",
+                                I16,
+                                &[0, 2, 4, 6, 8, 8, 8, 8],
+                            );
                             self.xset_half(ins.op_register(0), 0, &r, I16)?;
                         }
-                        _ => self.mem_store_at(ins, &h4, Ty::vn(I16, 4), 0, 8)?,
+                        _ => {
+                            let h4 = self.val(&format!("trunc <4 x i32> {h} to <4 x i16>"));
+                            self.mem_store_at(ins, &h4, Ty::vn(I16, 4), 0, 8)?;
+                        }
                     }
                 }
             }
@@ -663,44 +640,61 @@ impl FunctionLifter<'_> {
 
     /// `ptest/vptest` (`sign == None`) and `vtestps/vtestpd` (sign bits of `sign` lanes only):
     /// ZF = (a & b) == 0, CF = (!a & b) == 0, the other flags cleared.
-    /// Accumulates halves with vector `or` and tests via `icmp ne` + `bitcast <2 x i1> to i2`,
-    /// which LLVM lowers directly to a single `v128.any_true` per flag.
+    /// Guards ZF/CF computation with `flag_live` and uses native `@llvm.wasm.bitmask.*` for
+    /// `vtestps`/`vtestpd` (eliminating 18-byte sign-mask constants and extra `v128.and`).
     fn test(&mut self, ins: &Instruction, sign: Option<Elem>) -> R<()> {
         let wide = is_256(ins);
         let t = Ty::v(Elem::I64).ir();
-        let sign_mask = match sign {
-            Some(Elem::I32) => Some(Ty::v(Elem::I64).splat(&imm(0x8000_0000_8000_0000, 64))),
-            Some(_) => Some(Ty::v(Elem::I64).splat(&imm(0x8000_0000_0000_0000, 64))),
-            None => None,
-        };
+        let want_zf = self.flag_live(Flag::Zf);
+        let want_cf = self.flag_live(Flag::Cf);
         let mut acc_and = String::new();
         let mut acc_andn = String::new();
-        for half in 0..if wide { 2 } else { 1 } {
-            let a = self.v_half(ins, 0, half, Elem::I64)?;
-            let b = self.v_half(ins, 1, half, Elem::I64)?;
-            let na = self.val(&format!("xor {t} {a}, <i64 -1, i64 -1>"));
-            let v_and = self.val(&format!("and {t} {a}, {b}"));
-            let v_andn = self.val(&format!("and {t} {na}, {b}"));
-            if half == 0 {
-                acc_and = v_and;
-                acc_andn = v_andn;
-            } else {
-                acc_and = self.val(&format!("or {t} {acc_and}, {v_and}"));
-                acc_andn = self.val(&format!("or {t} {acc_andn}, {v_andn}"));
+        let halves = if wide { 2 } else { 1 };
+        if want_zf || want_cf {
+            for half in 0..halves {
+                let a = self.v_half(ins, 0, half, Elem::I64)?;
+                let b = self.v_half(ins, 1, half, Elem::I64)?;
+                if want_zf {
+                    let v_and = self.val(&format!("and {t} {a}, {b}"));
+                    acc_and = if half == 0 {
+                        v_and
+                    } else {
+                        self.val(&format!("or {t} {acc_and}, {v_and}"))
+                    };
+                }
+                if want_cf {
+                    let na = self.val(&format!("xor {t} {a}, <i64 -1, i64 -1>"));
+                    let v_andn = self.val(&format!("and {t} {na}, {b}"));
+                    acc_andn = if half == 0 {
+                        v_andn
+                    } else {
+                        self.val(&format!("or {t} {acc_andn}, {v_andn}"))
+                    };
+                }
             }
+        } else if ins.op_kind(1) == OpKind::Memory {
+            // Preserve memory access fault semantics even when both ZF and CF are dead.
+            let _ = self.v_half(ins, 1, 0, Elem::I64)?;
         }
-        let mut is_all_zero = |mut v: String| {
-            if let Some(m) = &sign_mask {
-                v = self.val(&format!("and {t} {v}, {m}"));
+        let is_all_zero = |l: &mut Self, v: String| {
+            if let Some(se) = sign {
+                let cast = l.cast(&v, Ty::v(Elem::I64), Ty::v(se));
+                let bm = l.intr(Intr::Bitmask, Ty::v(se), &[&cast]);
+                l.val(&format!("icmp eq i32 {bm}, 0"))
+            } else {
+                let nz = l.val(&format!("icmp ne {t} {v}, zeroinitializer"));
+                let bits = l.val(&format!("bitcast <2 x i1> {nz} to i2"));
+                l.val(&format!("icmp eq i2 {bits}, 0"))
             }
-            let nz = self.val(&format!("icmp ne {t} {v}, zeroinitializer"));
-            let bits = self.val(&format!("bitcast <2 x i1> {nz} to i2"));
-            self.val(&format!("icmp eq i2 {bits}, 0"))
         };
-        let zf = is_all_zero(acc_and);
-        let cf = is_all_zero(acc_andn);
-        self.set_flag(Flag::Zf, &zf);
-        self.set_flag(Flag::Cf, &cf);
+        if want_zf {
+            let zf = is_all_zero(self, acc_and);
+            self.set_flag(Flag::Zf, &zf);
+        }
+        if want_cf {
+            let cf = is_all_zero(self, acc_andn);
+            self.set_flag(Flag::Cf, &cf);
+        }
         for flag in [Flag::Af, Flag::Of, Flag::Pf, Flag::Sf] {
             self.set_flag(flag, "false");
         }
@@ -709,73 +703,91 @@ impl FunctionLifter<'_> {
 
     /// `vmaskmovps/pd`, `vpmaskmovd/q`: per-element loads/stores of the elements whose mask sign
     /// bit is set. Masked-out elements are never accessed (they cannot fault); loads zero them.
+    /// Processes each 128-bit half natively with `@llvm.wasm.bitmask.*` (no 256-bit CFG live
+    /// ranges and no empty `mpre` jump blocks).
     fn masked_move(&mut self, ins: &Instruction, e: Elem) -> R<()> {
         let load = ins.op_kind(0) == OpKind::Register;
         // load: dst, mask, mem ; store: mem, mask, src
-        let (mask_v, wide) = self.whole(ins, 1, e)?;
-        let n = if wide { 2 * e.lanes() } else { e.lanes() };
-        let vt = Ty::vn(e, n).ir();
+        let wide = is_256(ins);
+        let halves = if wide { 2u32 } else { 1u32 };
+        let lanes = e.lanes();
+        let vt = Ty::v(e).ir();
         let st = e.scalar();
         let bytes = u64::from(e.bits() / 8);
-        let total = (n as u64 * bytes) as usize;
+        let total = (halves as u64 * lanes as u64 * bytes) as usize;
         if Self::mem_bytes(ins) != total {
             return unsupported("internal: masked move memory size");
         }
-        let neg = self.val(&format!("icmp slt {vt} {mask_v}, zeroinitializer"));
-        let src = if load {
-            None
-        } else {
-            Some(self.whole(ins, 2, e)?.0)
-        };
+        // Pre-read mask (and store source) halves before branching so `dst == mask` stays safe.
+        let mut mask_bms = Vec::with_capacity(halves as usize);
+        let mut src_halves = Vec::with_capacity(if load { 0 } else { halves as usize });
+        for half in 0..halves {
+            let mh = self.v_half(ins, 1, half, e)?;
+            mask_bms.push(self.intr(Intr::Bitmask, Ty::v(e), &[&mh]));
+            if !load {
+                src_halves.push(self.v_half(ins, 2, half, e)?);
+            }
+        }
         // The address is computed once, in a block dominating every element access.
         self.mem_ea(ins)?;
-        let mut acc = "zeroinitializer".to_string();
-        for l in 0..n {
-            let c = self.val(&format!("extractelement <{n} x i1> {neg}, i32 {l}"));
-            let pre = self.new_label("mpre");
-            let act = self.new_label("mact");
-            let cont = self.new_label("mcont");
-            self.emit(&format!("br label %{pre}"));
-            self.start_block(&pre);
-            self.emit(&format!("br i1 {c}, label %{act}, label %{cont}"));
-            self.start_block(&act);
-            let ea = self.mem_ea_at(ins, u64::from(l) * bytes)?;
-            let loaded = if let Some(src) = &src {
-                if self.accesses_branch() {
-                    let x = self.val(&format!("extractelement {vt} {src}, i32 {l}"));
-                    self.guest_store(&ea, st, &x, bytes);
+        let mut out_halves = Vec::with_capacity(if load { halves as usize } else { 0 });
+        for half in 0..halves {
+            let bm = &mask_bms[half as usize];
+            let mut acc = "zeroinitializer".to_string();
+            for l in 0..lanes {
+                let c = if l == 0 {
+                    self.val(&format!("trunc i32 {bm} to i1"))
                 } else {
-                    let ptr = self.guest_ptr(&ea);
-                    let x = self.val(&format!("extractelement {vt} {src}, i32 {l}"));
-                    self.emit(&format!("store {st} {x}, ptr {ptr}, align 1"));
+                    let bit = self.val(&format!("and i32 {bm}, {}", 1u32 << l));
+                    self.val(&format!("icmp ne i32 {bit}, 0"))
+                };
+                let pre = self.current_block.clone();
+                let act = self.new_label("mact");
+                let cont = self.new_label("mcont");
+                self.emit(&format!("br i1 {c}, label %{act}, label %{cont}"));
+                self.start_block(&act);
+                let byte_off = u64::from(half * lanes + l) * bytes;
+                let ea = self.mem_ea_at(ins, byte_off)?;
+                let loaded = if load {
+                    Some(self.guest_load(&ea, st, bytes))
+                } else {
+                    let src_h = &src_halves[half as usize];
+                    if self.accesses_branch() {
+                        let x = self.val(&format!("extractelement {vt} {src_h}, i32 {l}"));
+                        self.guest_store(&ea, st, &x, bytes);
+                    } else {
+                        let ptr = self.guest_ptr(&ea);
+                        let x = self.val(&format!("extractelement {vt} {src_h}, i32 {l}"));
+                        self.emit(&format!("store {st} {x}, ptr {ptr}, align 1"));
+                    }
+                    None
+                };
+                // A table memory model ends the access in a block of its own (R19).
+                let from = if self.accesses_branch() {
+                    let end = self.new_label("mend");
+                    self.emit(&format!("br label %{end}"));
+                    self.start_block(&end);
+                    end
+                } else {
+                    act
+                };
+                self.emit(&format!("br label %{cont}"));
+                self.start_block(&cont);
+                if let Some(x) = loaded {
+                    let v = self.val(&format!("phi {st} [ {x}, %{from} ], [ 0, %{pre} ]"));
+                    acc = self.val(&format!("insertelement {vt} {acc}, {st} {v}, i32 {l}"));
                 }
-                None
-            } else {
-                Some(self.guest_load(&ea, st, bytes))
-            };
-            // A table memory model ends the access in a block of its own (R19).
-            let from = if self.accesses_branch() {
-                let end = self.new_label("mend");
-                self.emit(&format!("br label %{end}"));
-                self.start_block(&end);
-                end
-            } else {
-                act.clone()
-            };
-            self.emit(&format!("br label %{cont}"));
-            self.start_block(&cont);
-            if let Some(x) = loaded {
-                let v = self.val(&format!("phi {st} [ {x}, %{from} ], [ 0, %{pre} ]"));
-                acc = self.val(&format!("insertelement {vt} {acc}, {st} {v}, i32 {l}"));
+            }
+            if load {
+                out_halves.push(acc);
             }
         }
         if load {
             let reg = ins.op_register(0);
             if wide {
-                let (lo, hi) = self.split(&acc, e);
-                self.set_halves(reg, &lo, Some(&hi), e)?;
+                self.set_halves(reg, &out_halves[0], Some(&out_halves[1]), e)?;
             } else {
-                self.xset_half(reg, 0, &acc, e)?;
+                self.xset_half(reg, 0, &out_halves[0], e)?;
             }
         }
         Ok(())
@@ -783,31 +795,68 @@ impl FunctionLifter<'_> {
 
     /// `pmovsx*/pmovzx*`: the low elements of an XMM register (or exactly-sized memory) widened
     /// into a 128- or 256-bit destination.
+    ///
+    /// For 256-bit destinations, stages widening in 128-bit power-of-2 steps so LLVM emits native
+    /// `i16x8.load8x8_*` / `i32x4.load16x4_*` + `extend_low`/`extend_high` pairs with zero
+    /// cross-lane `i8x16.shuffle`s.
     fn extend(&mut self, ins: &Instruction, from: Elem, to: Elem, op: &str) -> R<()> {
         let dst = ins.op_register(0);
-        let n = if dst.is_ymm() {
-            2 * to.lanes()
-        } else {
-            to.lanes()
-        };
-        let v = match ins.op_kind(1) {
+        if !dst.is_ymm() {
+            let n = to.lanes();
+            let v = match ins.op_kind(1) {
+                OpKind::Register => {
+                    let x = self.xget_half(ins.op_register(1), 0, from)?;
+                    self.take_low(&x, from, n)
+                }
+                _ => self.mem_load_at(ins, Ty::vn(from, n), 0, (n * from.bits() / 8) as usize)?,
+            };
+            let w = self.val(&format!(
+                "{op} {} {v} to {}",
+                Ty::vn(from, n).ir(),
+                Ty::vn(to, n).ir()
+            ));
+            return self.xset_half(dst, 0, &w, to);
+        }
+        // 256-bit destination: fan out into two 128-bit halves without 256-bit intermediates.
+        let n = 2 * to.lanes();
+        let mut cur_elem = from;
+        let mut cur = match ins.op_kind(1) {
             OpKind::Register => {
                 let x = self.xget_half(ins.op_register(1), 0, from)?;
                 self.take_low(&x, from, n)
             }
             _ => self.mem_load_at(ins, Ty::vn(from, n), 0, (n * from.bits() / 8) as usize)?,
         };
-        let w = self.val(&format!(
-            "{op} {} {v} to {}",
-            Ty::vn(from, n).ir(),
-            Ty::vn(to, n).ir()
-        ));
-        if dst.is_ymm() {
-            let (lo, hi) = self.split(&w, to);
-            self.set_halves(dst, &lo, Some(&hi), to)
-        } else {
-            self.xset_half(dst, 0, &w, to)
+        // Step up to the half-width element of `to` (always <= 128 bits for `n` lanes).
+        let penult = Elem::of_bits(to.bits() / 2);
+        while cur_elem.bits() < penult.bits() {
+            let next_elem = Elem::of_bits(cur_elem.bits() * 2);
+            cur = self.val(&format!(
+                "{op} {} {cur} to {}",
+                Ty::vn(cur_elem, n).ir(),
+                Ty::vn(next_elem, n).ir()
+            ));
+            cur_elem = next_elem;
         }
+        // `cur` is now a single 128-bit vector `<n x penult>`; split into lo/hi `<half_n x penult>`
+        // and extend each directly to `<half_n x to>` (`extend_low` + `extend_high`).
+        let half_n = to.lanes();
+        let cur_t = Ty::vn(penult, n).ir();
+        let half_t = Ty::vn(penult, half_n).ir();
+        let dst_t = Ty::v(to).ir();
+        let lo_idx: Vec<u32> = (0..half_n).collect();
+        let hi_idx: Vec<u32> = (half_n..n).collect();
+        let lo_in = self.val(&format!(
+            "shufflevector {cur_t} {cur}, {cur_t} poison, {}",
+            mask(&lo_idx)
+        ));
+        let hi_in = self.val(&format!(
+            "shufflevector {cur_t} {cur}, {cur_t} poison, {}",
+            mask(&hi_idx)
+        ));
+        let lo = self.val(&format!("{op} {half_t} {lo_in} to {dst_t}"));
+        let hi = self.val(&format!("{op} {half_t} {hi_in} to {dst_t}"));
+        self.set_halves(dst, &lo, Some(&hi), to)
     }
 
     /// binary16 (zero-extended in `<4 x i32>`) -> binary32 bits, bit-exact across all 65,536
