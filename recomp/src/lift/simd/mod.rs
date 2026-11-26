@@ -102,9 +102,10 @@ mod moves;
 
 use std::fmt::Write as _;
 
-use iced_x86::{EncodingKind, Instruction, Mnemonic, OpKind, Register};
+use iced_x86::{Code, EncodingKind, Instruction, Mnemonic, OpKind, Register};
 
 use super::super::Support;
+use super::flag_liveness::{StateMask, xmm_state_bit, ymmh_state_bit};
 use super::{ColdTrapKind, FunctionLifter, R, imm, unsupported};
 
 /// Canonical type of an XMM register value (allocas and guest state slots).
@@ -467,7 +468,8 @@ pub(super) fn note_register(reg: Register, regs: &mut Regs) {
 }
 
 /// Records register halves an instruction writes without naming them as 256-bit operands: VEX
-/// instructions zero the upper half of their XMM destination, `vzeroupper`/`vzeroall` clear all.
+/// instructions zero the upper half of their XMM destination, `vzeroupper`/`vzeroall` clear all,
+/// and legacy `blendvps`/`blendvpd`/`pblendvb` implicitly read `xmm0`.
 pub(super) fn note_instruction(ins: &Instruction, regs: &mut Regs) {
     match ins.mnemonic() {
         Mnemonic::Vzeroall => {
@@ -475,6 +477,9 @@ pub(super) fn note_instruction(ins: &Instruction, regs: &mut Regs) {
             regs.ymmh = [true; 16];
         }
         Mnemonic::Vzeroupper => regs.ymmh = [true; 16],
+        Mnemonic::Blendvps | Mnemonic::Blendvpd | Mnemonic::Pblendvb => {
+            regs.xmm[0] = true;
+        }
         _ => {}
     }
     if ins.encoding() == EncodingKind::VEX
@@ -482,6 +487,7 @@ pub(super) fn note_instruction(ins: &Instruction, regs: &mut Regs) {
         && ins.op_kind(0) == OpKind::Register
         && ins.op_register(0).is_xmm()
         && ins.op_register(0).number() < 16
+        && !reads_only_first_operand(ins.mnemonic())
     {
         regs.xmm[ins.op_register(0).number()] = true;
         regs.ymmh[ins.op_register(0).number()] = true;
@@ -489,12 +495,93 @@ pub(super) fn note_instruction(ins: &Instruction, regs: &mut Regs) {
 }
 
 /// Whether a VEX instruction with an XMM first operand reads it without writing it.
-fn reads_only_first_operand(m: Mnemonic) -> bool {
+pub(super) fn reads_only_first_operand(m: Mnemonic) -> bool {
     use Mnemonic as M;
     matches!(
         m,
         M::Vcomiss | M::Vucomiss | M::Vcomisd | M::Vucomisd | M::Vptest | M::Vtestps | M::Vtestpd
     )
+}
+
+fn valid_mem_addr(ins: &Instruction) -> bool {
+    let base = ins.memory_base();
+    let index = ins.memory_index();
+    let base_ok =
+        matches!(base, Register::None | Register::RIP) || base.is_gpr64() || base.is_gpr32();
+    let index_ok = index == Register::None || index.is_gpr64() || index.is_gpr32();
+    base_ok && index_ok
+}
+
+/// Whether `ins` is a SIMD instruction that [`FunctionLifter::lift_simd`] is guaranteed to lift
+/// without trapping (`cold_trap`, `trap_unsupported`, or any runtime helper call).
+///
+/// Used by `flag_liveness` to compute exact per-register `XMM0..15` / `YMMH0..15` call-boundary
+/// summaries; any instruction returning `false` conservatively marks `ALL_STATE`.
+pub(in crate::lift) fn is_supported_non_trapping_simd(ins: &Instruction) -> bool {
+    use Mnemonic as M;
+    if ins.code() == Code::INVALID || ins.has_lock_prefix() || ins.is_string_instruction() {
+        return false;
+    }
+    if !is_simd(ins) {
+        return false;
+    }
+    match ins.mnemonic() {
+        // `ldmxcsr` traps at run time on non-default rounding modes / reserved bits.
+        M::Ldmxcsr | M::Vldmxcsr | M::Emms => return false,
+        M::Vzeroupper | M::Vzeroall => return true,
+        M::Stmxcsr | M::Vstmxcsr => {
+            return ins.op_count() == 1
+                && ins.op_kind(0) == OpKind::Memory
+                && ins.memory_size().size() == 4
+                && valid_mem_addr(ins);
+        }
+        M::Movnti => {
+            return ins.op_count() == 2
+                && ins.op_kind(0) == OpKind::Memory
+                && ins.op_kind(1) == OpKind::Register
+                && valid_mem_addr(ins)
+                && {
+                    let r = ins.op_register(1);
+                    r.is_gpr()
+                        && r.full_register().is_gpr64()
+                        && matches!(r.size(), 4 | 8)
+                        && ins.memory_size().size() == r.size()
+                };
+        }
+        _ => {}
+    }
+    if !matches!(ins.encoding(), EncodingKind::Legacy | EncodingKind::VEX) {
+        return false;
+    }
+    for i in 0..ins.op_count() {
+        match ins.op_kind(i) {
+            OpKind::Register => {
+                let r = ins.op_register(i);
+                let ok = (r.is_gpr() && r.full_register().is_gpr64())
+                    || ((r.is_xmm() || r.is_ymm()) && r.number() < 16);
+                if !ok {
+                    return false;
+                }
+            }
+            OpKind::Memory => {
+                if ins.is_vsib() || ins.memory_size().size() > 32 || !valid_mem_addr(ins) {
+                    return false;
+                }
+            }
+            kind if super::is_immediate(kind) => {}
+            _ => return false,
+        }
+    }
+    let m = ins.mnemonic();
+    if is_256(ins) {
+        avx::is_avx_supported(ins) || avx::in_lane(m)
+    } else {
+        avx::is_avx_supported(ins)
+            || moves::is_move_supported(m)
+            || float::is_float_supported(m)
+            || int::is_int_supported(m)
+            || crypto::is_crypto_supported(m)
+    }
 }
 
 /// Whether the instruction operates on 256-bit vectors (VEX.L = 1).
@@ -525,31 +612,31 @@ impl FunctionLifter<'_> {
         self.state_ptr(field, Some(idx))
     }
 
-    fn vec_slots(&self) -> Vec<(u32, usize, String)> {
+    fn vec_slots(&self, state: StateMask) -> Vec<(u32, usize, String)> {
         let mut slots = Vec::new();
         for idx in 0..16 {
-            if self.simd.xmm[idx] {
+            if self.simd.xmm[idx] && state & xmm_state_bit(idx) != 0 {
                 slots.push((5, idx, format!("%xmm{idx}")));
             }
-            if self.simd.ymmh[idx] {
+            if self.simd.ymmh[idx] && state & ymmh_state_bit(idx) != 0 {
                 slots.push((6, idx, format!("%ymmh{idx}")));
             }
         }
         slots
     }
 
-    /// Loads the tracked vector registers from `%state` into their allocas.
-    pub(super) fn sync_xmm_in(&mut self) {
-        for (field, idx, slot) in self.vec_slots() {
+    /// Loads the tracked vector registers present in `state` from `%state` into their allocas.
+    pub(super) fn sync_xmm_in(&mut self, state: StateMask) {
+        for (field, idx, slot) in self.vec_slots(state) {
             let ptr = self.state_vec_ptr(field, idx);
             let v = self.val(&format!("load {XMM_TYPE}, ptr {ptr}, align 8"));
             self.emit(&format!("store {XMM_TYPE} {v}, ptr {slot}"));
         }
     }
 
-    /// Stores the tracked vector registers back into `%state`.
-    pub(super) fn sync_xmm_out(&mut self) {
-        for (field, idx, slot) in self.vec_slots() {
+    /// Stores the tracked vector registers present in `state` back into `%state`.
+    pub(super) fn sync_xmm_out(&mut self, state: StateMask) {
+        for (field, idx, slot) in self.vec_slots(state) {
             let v = self.val(&format!("load {XMM_TYPE}, ptr {slot}"));
             let ptr = self.state_vec_ptr(field, idx);
             self.emit(&format!("store {XMM_TYPE} {v}, ptr {ptr}, align 8"));

@@ -137,6 +137,108 @@ fn unpack_mask(e: Elem, high: bool) -> Vec<u32> {
     (0..n / 2).flat_map(|i| [base + i, n + base + i]).collect()
 }
 
+/// Whether [`FunctionLifter::lift_int`] handles `m` (mirroring its dispatch).
+pub(super) fn is_int_supported(m: Mnemonic) -> bool {
+    use Mnemonic as M;
+    if binary(m).is_some() || shift(m).is_some() || variable_shift(m).is_some() {
+        return true;
+    }
+    matches!(
+        m,
+        M::Pand
+            | M::Vpand
+            | M::Pandn
+            | M::Vpandn
+            | M::Por
+            | M::Vpor
+            | M::Pxor
+            | M::Vpxor
+            | M::Pslldq
+            | M::Vpslldq
+            | M::Psrldq
+            | M::Vpsrldq
+            | M::Pshufd
+            | M::Vpshufd
+            | M::Pshuflw
+            | M::Vpshuflw
+            | M::Pshufhw
+            | M::Vpshufhw
+            | M::Pshufb
+            | M::Vpshufb
+            | M::Punpcklbw
+            | M::Vpunpcklbw
+            | M::Punpckhbw
+            | M::Vpunpckhbw
+            | M::Punpcklwd
+            | M::Vpunpcklwd
+            | M::Punpckhwd
+            | M::Vpunpckhwd
+            | M::Punpckldq
+            | M::Vpunpckldq
+            | M::Punpckhdq
+            | M::Vpunpckhdq
+            | M::Punpcklqdq
+            | M::Vpunpcklqdq
+            | M::Punpckhqdq
+            | M::Vpunpckhqdq
+            | M::Packsswb
+            | M::Vpacksswb
+            | M::Packssdw
+            | M::Vpackssdw
+            | M::Packuswb
+            | M::Vpackuswb
+            | M::Packusdw
+            | M::Vpackusdw
+            | M::Pabsb
+            | M::Vpabsb
+            | M::Pabsw
+            | M::Vpabsw
+            | M::Pabsd
+            | M::Vpabsd
+            | M::Pmaddwd
+            | M::Vpmaddwd
+            | M::Pmaddubsw
+            | M::Vpmaddubsw
+            | M::Psadbw
+            | M::Vpsadbw
+            | M::Palignr
+            | M::Vpalignr
+            | M::Pblendw
+            | M::Vpblendw
+            | M::Vpblendd
+            | M::Pblendvb
+            | M::Vpblendvb
+            | M::Phaddw
+            | M::Vphaddw
+            | M::Phaddd
+            | M::Vphaddd
+            | M::Phaddsw
+            | M::Vphaddsw
+            | M::Phsubw
+            | M::Vphsubw
+            | M::Phsubd
+            | M::Vphsubd
+            | M::Phsubsw
+            | M::Vphsubsw
+            | M::Pextrb
+            | M::Vpextrb
+            | M::Pextrw
+            | M::Vpextrw
+            | M::Pextrd
+            | M::Vpextrd
+            | M::Pextrq
+            | M::Vpextrq
+            | M::Pinsrb
+            | M::Vpinsrb
+            | M::Pinsrw
+            | M::Vpinsrw
+            | M::Pinsrd
+            | M::Vpinsrd
+            | M::Pinsrq
+            | M::Vpinsrq
+    )
+}
+
 impl FunctionLifter<'_> {
     pub(super) fn lift_int(&mut self, ins: &Instruction, vex: bool) -> R<bool> {
         use Elem::{I8, I16, I32, I64};

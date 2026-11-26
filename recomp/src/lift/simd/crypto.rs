@@ -13,6 +13,32 @@ fn byte(column: u32, row: u32) -> u32 {
     4 * (column % 4) + row
 }
 
+/// Whether [`FunctionLifter::lift_crypto`] handles `m` (mirroring its match arms).
+pub(super) fn is_crypto_supported(m: Mnemonic) -> bool {
+    use Mnemonic as M;
+    matches!(
+        m,
+        M::Aesenc
+            | M::Vaesenc
+            | M::Aesenclast
+            | M::Vaesenclast
+            | M::Aesdec
+            | M::Vaesdec
+            | M::Aesdeclast
+            | M::Vaesdeclast
+            | M::Aesimc
+            | M::Vaesimc
+            | M::Aeskeygenassist
+            | M::Vaeskeygenassist
+            | M::Pclmulqdq
+            | M::Vpclmulqdq
+            | M::Phminposuw
+            | M::Vphminposuw
+            | M::Extrq
+            | M::Insertq
+    )
+}
+
 impl FunctionLifter<'_> {
     pub(super) fn lift_crypto(&mut self, ins: &Instruction, vex: bool) -> R<bool> {
         use Elem::{I8, I16, I32, I64};

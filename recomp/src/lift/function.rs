@@ -39,7 +39,9 @@ mod string_ops;
 #[path = "unwind.rs"]
 mod unwind;
 
-use flag_liveness::{ALL_FLAGS, ALL_STATE, FlagMask, FlagSummaries, OTHER_STATE, StateMask};
+use flag_liveness::{
+    ALL_FLAGS, ALL_STATE, ALL_XMM_STATE, ALL_YMMH_STATE, FlagMask, FlagSummaries, StateMask,
+};
 
 pub(super) use atomics::CMPXCHG16B_IR;
 pub(super) use bit_ops::{PDEP_IR, PEXT_IR};
@@ -294,7 +296,9 @@ pub(super) fn lift(
                 if reg.is_gpr() && reg.full_register().is_gpr64() {
                     regs[reg.full_register().number()] = true;
                 }
-                simd::note_register(reg, &mut vector_regs);
+                if ins.mnemonic() != Mnemonic::Vzeroupper {
+                    simd::note_register(reg, &mut vector_regs);
+                }
             }
             simd::note_instruction(ins, &mut vector_regs);
         }
@@ -1254,14 +1258,14 @@ impl FunctionLifter<'_> {
         self.sync_in_parts(ALL_STATE);
     }
 
-    /// [`Self::sync_in`] loading only the registers in `state` (and the vector registers when it
-    /// has [`OTHER_STATE`]); the flags are always loaded.
+    /// [`Self::sync_in`] loading only the GPRs, `xmm` and `ymmh` registers in `state`; the flags
+    /// are always loaded.
     fn sync_in_parts(&mut self, state: StateMask) {
-        for idx in 0..16 {
-            if self.regs[idx] && state & (1 << idx) != 0 {
+        for (idx, name) in GPR_NAMES.iter().enumerate() {
+            if self.regs[idx] && state & (1u64 << idx) != 0 {
                 let ptr = self.state_gpr_ptr(idx);
                 let v = self.val(&format!("load i64, ptr {ptr}"));
-                self.emit(&format!("store i64 {v}, ptr %{}", GPR_NAMES[idx]));
+                self.emit(&format!("store i64 {v}, ptr %{name}"));
                 self.known.gprs[idx] = Some(v);
             }
         }
@@ -1275,8 +1279,8 @@ impl FunctionLifter<'_> {
                 self.known.flags[flag as usize] = Some(bit);
             }
         }
-        if state & OTHER_STATE != 0 {
-            self.sync_xmm_in();
+        if state & (ALL_XMM_STATE | ALL_YMMH_STATE) != 0 {
+            self.sync_xmm_in(state);
         }
     }
 
@@ -1297,13 +1301,13 @@ impl FunctionLifter<'_> {
             .map_or(ALL_STATE, |summaries| summaries.touched_by(target))
     }
 
-    /// [`Self::sync_out`] storing only the tracked registers in `state` (the vector registers when
-    /// it has [`OTHER_STATE`]) and the tracked flags in `flags`. The flags left out are dead
-    /// because the callee overwrites them before anything can observe them; the registers left out
-    /// are never touched by the callee, so the caller keeps them in its allocas across the call.
+    /// [`Self::sync_out`] storing only the tracked GPRs, `xmm` and `ymmh` registers in `state`
+    /// and the tracked flags in `flags`. The flags left out are dead because the callee
+    /// overwrites them before anything can observe them; the registers left out are never touched
+    /// by the callee, so the caller keeps them in its allocas across the call.
     fn sync_out_parts(&mut self, state: StateMask, flags: FlagMask) {
         for idx in 0..16 {
-            if self.regs[idx] && state & (1 << idx) != 0 {
+            if self.regs[idx] && state & (1u64 << idx) != 0 {
                 let Ok(v) = self.load_gpr(idx) else {
                     unreachable!("register {idx} is tracked")
                 };
@@ -1323,8 +1327,8 @@ impl FunctionLifter<'_> {
                 self.emit(&format!("store i8 {byte}, ptr {ptr}"));
             }
         }
-        if state & OTHER_STATE != 0 {
-            self.sync_xmm_out();
+        if state & (ALL_XMM_STATE | ALL_YMMH_STATE) != 0 {
+            self.sync_xmm_out(state);
         }
     }
 
@@ -1655,9 +1659,9 @@ impl FunctionLifter<'_> {
 
             // Any register written WITHOUT first being used as this instruction's memory base
             // closes BEFORE instruction `i`.
-            for r in 0..16 {
+            for (r, slot) in active.iter_mut().enumerate() {
                 if written_gprs & (1u16 << r) != 0 && mem_base_reg != Some(r) {
-                    close_reg(&mut active[r], r, &mut candidates);
+                    close_reg(slot, r, &mut candidates);
                 }
             }
 

@@ -17,7 +17,10 @@ use iced_x86::code_asm::*;
 use super::Program;
 use crate::lift::compile::{compile_to_object, find_llvm_tool, find_on_path, rustc_tool_dir};
 use crate::lift::target::LiftTarget;
-use crate::lift::{STATE_GPR_OFFSET, STATE_GS_BASE_OFFSET, STATE_SIZE, lift_module};
+use crate::lift::{
+    STATE_GPR_OFFSET, STATE_GS_BASE_OFFSET, STATE_SIZE, STATE_XMM_OFFSET, STATE_YMM_HI_OFFSET,
+    lift_module,
+};
 
 const F: u64 = 0x1_4000_1000;
 const G: u64 = 0x1_4000_1100;
@@ -419,4 +422,144 @@ entry:
     };
     let status = Command::new(&exe).status().expect("run native R60");
     assert_eq!(status.code(), Some(0), "native R60 run failed");
+}
+
+#[test]
+fn r61_vex128_and_vzeroupper_across_calls_run_natively() {
+    if !cfg!(target_arch = "x86_64") {
+        eprintln!("skipping native R61 test: host is not x86-64");
+        return;
+    }
+    let Some(tool) = find_llvm_tool() else {
+        eprintln!("skipping native R61 test: no LLVM tool (llc/clang) found");
+        return;
+    };
+    let target = LiftTarget::native_host();
+    let triple = target.triple().to_string();
+    let dir = TempDir::new();
+
+    const VX_CALLEE: u64 = G;
+    const VZU_CALLEE: u64 = F + 0x200;
+    const XMM1_CALLEE: u64 = F + 0x300;
+
+    // Entry F:
+    // - ymm0 starts with [1, 2, 3, 4], ymm2 starts with [10, 20, 30, 40], xmm1 starts with [5, 6]
+    // - doubles ymm0 and ymm2, calls XMM1_CALLEE (doubles xmm1; disjoint from ymm0/ymm2)
+    // - calls VX_CALLEE (`vxorps xmm2, xmm2, xmm2` -> must zero BOTH xmm2 and ymmh2!)
+    // - adds ymm2 into ymm0 (must stay [2, 4, 6, 8])
+    // - extracts ymmh2 low qword via vextracti128 + movq -> r8 (must be 0!)
+    // - extracts ymmh0 low qword -> r9 (must be 6!)
+    // - calls VZU_CALLEE (`vzeroupper` -> clears ymmh0..15, preserves xmm0..15!)
+    // - extracts ymmh0 low qword -> r10 (must be 0!)
+    // - extracts xmm0 low qword -> rax (must be 2), xmm1 low qword -> r11 (must be 10)
+    // - packs result into rax: rax + (r8 << 8) + (r9 << 16) + (r10 << 24) + (r11 << 32)
+    //   expected = 2 | (0 << 8) | (6 << 16) | (0 << 24) | (10 << 32) = 0x0000_000A_0006_0002
+    let prog = Program::new()
+        .asm(F, |a| {
+            a.vpaddq(ymm0, ymm0, ymm0)?;
+            a.vpaddq(ymm2, ymm2, ymm2)?;
+            a.call(XMM1_CALLEE)?;
+            a.call(VX_CALLEE)?;
+            a.vpaddq(ymm0, ymm0, ymm2)?;
+            a.vextracti128(xmm4, ymm2, 1)?;
+            a.movq(r8, xmm4)?;
+            a.vextracti128(xmm5, ymm0, 1)?;
+            a.movq(r9, xmm5)?;
+            a.call(VZU_CALLEE)?;
+            a.vextracti128(xmm6, ymm0, 1)?;
+            a.movq(r10, xmm6)?;
+            a.movq(rax, xmm0)?;
+            a.movq(r11, xmm1)?;
+            a.shl(r8, 8)?;
+            a.shl(r9, 16)?;
+            a.shl(r10, 24)?;
+            a.shl(r11, 32)?;
+            a.or(rax, r8)?;
+            a.or(rax, r9)?;
+            a.or(rax, r10)?;
+            a.or(rax, r11)?;
+            a.ret()
+        })
+        .asm(VX_CALLEE, |a| {
+            a.vxorps(xmm2, xmm2, xmm2)?;
+            a.ret()
+        })
+        .asm(VZU_CALLEE, |a| {
+            a.vzeroupper()?;
+            a.ret()
+        })
+        .asm(XMM1_CALLEE, |a| {
+            a.paddq(xmm1, xmm1)?;
+            a.ret()
+        });
+
+    let functions = prog.discover();
+    let module = lift_module(functions.values()).expect("lift");
+    assert!(module.functions.iter().all(|f| f.unsupported.is_empty()));
+    let native_ir = target.retarget(module.ir);
+    let want: i64 = 0x0000_000A_0006_0002;
+    let o_rsp = STATE_GPR_OFFSET + 8 * 4;
+    let o_rax = STATE_GPR_OFFSET;
+    let o_xmm0 = STATE_XMM_OFFSET;
+    let o_xmm1 = STATE_XMM_OFFSET + 16;
+    let o_xmm2 = STATE_XMM_OFFSET + 32;
+    let o_ymmh0 = STATE_YMM_HI_OFFSET;
+    let o_ymmh2 = STATE_YMM_HI_OFFSET + 32;
+    let driver = format!(
+        r#"target triple = "{triple}"
+@__playgta6_guest_base = global i64 0
+@state = global [{STATE_SIZE} x i8] zeroinitializer, align 16
+@stack = global [4096 x i64] zeroinitializer, align 16
+declare void @sub_{F:X}(ptr)
+declare void @llvm.trap() noreturn
+define void @__playgta6_indirect_call(ptr %s, i64 %t) {{ call void @llvm.trap() unreachable }}
+define void @__playgta6_trap(ptr %s, i64 %va) {{ call void @llvm.trap() unreachable }}
+define void @__playgta6_unimplemented(ptr %s, i64 %va) {{ call void @llvm.trap() unreachable }}
+define void @__playgta6_divide_error(ptr %s, i64 %va) {{ call void @llvm.trap() unreachable }}
+define i32 @main() {{
+entry:
+  %stack = ptrtoint ptr @stack to i64
+  %top = add i64 %stack, 32768
+  %entry_rsp = sub i64 %top, 8
+  store i64 %entry_rsp, ptr getelementptr (i8, ptr @state, i64 {o_rsp})
+  store <2 x i64> <i64 1, i64 2>, ptr getelementptr (i8, ptr @state, i64 {o_xmm0}), align 8
+  store <2 x i64> <i64 3, i64 4>, ptr getelementptr (i8, ptr @state, i64 {o_ymmh0}), align 8
+  store <2 x i64> <i64 5, i64 6>, ptr getelementptr (i8, ptr @state, i64 {o_xmm1}), align 8
+  store <2 x i64> <i64 10, i64 20>, ptr getelementptr (i8, ptr @state, i64 {o_xmm2}), align 8
+  store <2 x i64> <i64 30, i64 40>, ptr getelementptr (i8, ptr @state, i64 {o_ymmh2}), align 8
+  call void @sub_{F:X}(ptr @state)
+  %rax = load i64, ptr getelementptr (i8, ptr @state, i64 {o_rax})
+  %ok = icmp eq i64 %rax, {want}
+  %code = select i1 %ok, i32 0, i32 1
+  ret i32 %code
+}}
+"#
+    );
+    let lifted_ll = dir.0.join("r61_lifted.ll");
+    let driver_ll_path = dir.0.join("r61_driver.ll");
+    fs::write(&lifted_ll, &native_ir).expect("write lifted.ll");
+    fs::write(&driver_ll_path, &driver).expect("write driver.ll");
+    let obj_ext = if triple.contains("windows") {
+        "obj"
+    } else {
+        "o"
+    };
+    let mut objects = Vec::new();
+    for ll in [&lifted_ll, &driver_ll_path] {
+        let obj = ll.with_extension(obj_ext);
+        if let Err(err) = compile_to_object(&tool, &target, ll, &obj) {
+            eprintln!("skipping native R61 test: {err}");
+            return;
+        }
+        objects.push(obj);
+    }
+    let exe = match link(&dir.0, &objects, &triple) {
+        Ok(exe) => exe,
+        Err(reason) => {
+            eprintln!("skipping native R61 test: {reason}");
+            return;
+        }
+    };
+    let status = Command::new(&exe).status().expect("run native R61");
+    assert_eq!(status.code(), Some(0), "native R61 run failed");
 }

@@ -7,6 +7,94 @@ use iced_x86::{Instruction, Mnemonic, OpKind, Register};
 use super::super::{FunctionLifter, R, unsupported};
 use super::{Elem, Form, Intr, Ty};
 
+/// Whether [`FunctionLifter::lift_moves`] handles `m` (mirroring its match arms).
+pub(super) fn is_move_supported(m: Mnemonic) -> bool {
+    use Mnemonic as M;
+    matches!(
+        m,
+        M::Movaps
+            | M::Vmovaps
+            | M::Movups
+            | M::Vmovups
+            | M::Movapd
+            | M::Vmovapd
+            | M::Movupd
+            | M::Vmovupd
+            | M::Movdqa
+            | M::Vmovdqa
+            | M::Movdqu
+            | M::Vmovdqu
+            | M::Lddqu
+            | M::Vlddqu
+            | M::Movntps
+            | M::Vmovntps
+            | M::Movntpd
+            | M::Vmovntpd
+            | M::Movntdq
+            | M::Vmovntdq
+            | M::Movntdqa
+            | M::Vmovntdqa
+            | M::Movss
+            | M::Vmovss
+            | M::Movsd
+            | M::Vmovsd
+            | M::Movd
+            | M::Vmovd
+            | M::Movq
+            | M::Vmovq
+            | M::Movlps
+            | M::Vmovlps
+            | M::Movlpd
+            | M::Vmovlpd
+            | M::Movhps
+            | M::Vmovhps
+            | M::Movhpd
+            | M::Vmovhpd
+            | M::Movlhps
+            | M::Vmovlhps
+            | M::Movhlps
+            | M::Vmovhlps
+            | M::Movmskps
+            | M::Vmovmskps
+            | M::Movmskpd
+            | M::Vmovmskpd
+            | M::Pmovmskb
+            | M::Vpmovmskb
+            | M::Movsldup
+            | M::Vmovsldup
+            | M::Movshdup
+            | M::Vmovshdup
+            | M::Movddup
+            | M::Vmovddup
+            | M::Vpermilps
+            | M::Vpermilpd
+            | M::Shufps
+            | M::Vshufps
+            | M::Shufpd
+            | M::Vshufpd
+            | M::Unpcklps
+            | M::Vunpcklps
+            | M::Unpckhps
+            | M::Vunpckhps
+            | M::Unpcklpd
+            | M::Vunpcklpd
+            | M::Unpckhpd
+            | M::Vunpckhpd
+            | M::Blendps
+            | M::Vblendps
+            | M::Blendpd
+            | M::Vblendpd
+            | M::Blendvps
+            | M::Vblendvps
+            | M::Blendvpd
+            | M::Vblendvpd
+            | M::Insertps
+            | M::Vinsertps
+            | M::Extractps
+            | M::Vextractps
+    )
+}
+
 impl FunctionLifter<'_> {
     pub(super) fn lift_moves(&mut self, ins: &Instruction, vex: bool) -> R<bool> {
         use Elem::{I32, I64};

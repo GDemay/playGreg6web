@@ -143,6 +143,105 @@ fn predicate(p: u32) -> &'static str {
     }
 }
 
+/// Whether [`FunctionLifter::lift_float`] handles `m` (mirroring its dispatch).
+pub(super) fn is_float_supported(m: Mnemonic) -> bool {
+    use Mnemonic as M;
+    if arith(m).is_some() || fma(m).is_some() {
+        return true;
+    }
+    matches!(
+        m,
+        M::Andps
+            | M::Vandps
+            | M::Andpd
+            | M::Vandpd
+            | M::Andnps
+            | M::Vandnps
+            | M::Andnpd
+            | M::Vandnpd
+            | M::Orps
+            | M::Vorps
+            | M::Orpd
+            | M::Vorpd
+            | M::Xorps
+            | M::Vxorps
+            | M::Xorpd
+            | M::Vxorpd
+            | M::Cmpps
+            | M::Vcmpps
+            | M::Cmppd
+            | M::Vcmppd
+            | M::Cmpss
+            | M::Vcmpss
+            | M::Cmpsd
+            | M::Vcmpsd
+            | M::Comiss
+            | M::Vcomiss
+            | M::Ucomiss
+            | M::Vucomiss
+            | M::Comisd
+            | M::Vcomisd
+            | M::Ucomisd
+            | M::Vucomisd
+            | M::Cvtsi2ss
+            | M::Vcvtsi2ss
+            | M::Cvtsi2sd
+            | M::Vcvtsi2sd
+            | M::Cvtss2sd
+            | M::Vcvtss2sd
+            | M::Cvtsd2ss
+            | M::Vcvtsd2ss
+            | M::Cvtss2si
+            | M::Vcvtss2si
+            | M::Cvttss2si
+            | M::Vcvttss2si
+            | M::Cvtsd2si
+            | M::Vcvtsd2si
+            | M::Cvttsd2si
+            | M::Vcvttsd2si
+            | M::Cvtdq2ps
+            | M::Vcvtdq2ps
+            | M::Cvtps2dq
+            | M::Vcvtps2dq
+            | M::Cvttps2dq
+            | M::Vcvttps2dq
+            | M::Cvtdq2pd
+            | M::Vcvtdq2pd
+            | M::Cvtpd2dq
+            | M::Vcvtpd2dq
+            | M::Cvttpd2dq
+            | M::Vcvttpd2dq
+            | M::Cvtps2pd
+            | M::Vcvtps2pd
+            | M::Cvtpd2ps
+            | M::Vcvtpd2ps
+            | M::Haddps
+            | M::Vhaddps
+            | M::Haddpd
+            | M::Vhaddpd
+            | M::Hsubps
+            | M::Vhsubps
+            | M::Hsubpd
+            | M::Vhsubpd
+            | M::Addsubps
+            | M::Vaddsubps
+            | M::Addsubpd
+            | M::Vaddsubpd
+            | M::Roundps
+            | M::Vroundps
+            | M::Roundpd
+            | M::Vroundpd
+            | M::Roundss
+            | M::Vroundss
+            | M::Roundsd
+            | M::Vroundsd
+            | M::Dpps
+            | M::Vdpps
+            | M::Dppd
+            | M::Vdppd
+    )
+}
+
 impl FunctionLifter<'_> {
     pub(super) fn lift_float(&mut self, ins: &Instruction, vex: bool) -> R<bool> {
         use Elem::{F32, F64, I32};
