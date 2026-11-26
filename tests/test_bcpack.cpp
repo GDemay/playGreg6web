@@ -2,15 +2,19 @@
 // streams from a test-only encoder, and hand-built block records. No real tables, no game data.
 // Decoded BC blocks are checked against the public BC1/BC4/BC7 block layouts, read back here.
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
+#include <limits>
 #include <string>
 #include <vector>
 
 #include "bcpack_synthetic.h"
 #include "os/bcpack.h"
+#include "os/surface_blocks.h"
 
 namespace {
 
@@ -979,6 +983,1171 @@ void test_errors() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Extended tests: streaming multi-chunk, all BC7/BC6H modes, hardening, surface_blocks
+// ---------------------------------------------------------------------------
+
+void split_nibbles(uint8_t v, uint8_t* even, uint8_t* odd) {
+    uint8_t e = 0;
+    uint8_t o = 0;
+    for (uint32_t k = 0; k < 4; ++k) {
+        e = static_cast<uint8_t>(e | (((v >> (2 * k)) & 1u) << k));
+        o = static_cast<uint8_t>(o | (((v >> (2 * k + 1)) & 1u) << k));
+    }
+    *even = e;
+    *odd = o;
+}
+
+void set_refs(Record& r, bool four_symbols, uint8_t ep_ref, uint8_t ix_ref) {
+    const int8_t delta = static_cast<int8_t>(static_cast<uint8_t>(ep_ref - ix_ref));
+    const uint8_t z = sy::zigzag(delta);
+    if (four_symbols) {
+        split_nibbles(z, &r[0], &r[1]);
+        split_nibbles(ix_ref, &r[2], &r[3]);
+    } else {
+        r[0] = z;
+        r[1] = ix_ref;
+    }
+}
+
+void test_streaming_multichunk_and_history_wrap() {
+    const auto t = sy::Builder::full().tables();
+    CHECK(t != nullptr);
+    if (!t) {
+        return;
+    }
+    // 605 blocks: spans 4 full 128-block chunks + 93-block partial tail AND wraps the 256-block
+    // sliding history ring more than twice.
+    constexpr size_t kBlocks = 605;
+
+    auto pair_symbols = [](const uint32_t* ix, uint8_t* out, size_t pairs) {
+        for (size_t k = 0; k < pairs; ++k) {
+            out[k] = static_cast<uint8_t>((ix[2 * k] & 7u) | ((ix[2 * k + 1] & 7u) << 3));
+        }
+    };
+
+    // Helper: choose back-reference exercising chunk boundaries (128, 256, 384, 512) and full
+    // 255-block history reach across ring wraps.
+    auto pick_ref = [](size_t i, uint32_t salt) -> uint8_t {
+        if (i == 0) {
+            return 0;
+        }
+        if (i == 128 || i == 256 || i == 384 || i == 512) {
+            return salt == 0 ? 1u : static_cast<uint8_t>(std::min<size_t>(i, 255));
+        }
+        if (i >= 256 && (i % 7 == 0)) {
+            return 255;  // maximum sliding-window distance across ring wrap
+        }
+        if (i >= 128 && (i % 5 == 0)) {
+            return 128;  // crosses chunk boundary
+        }
+        const size_t max_r = std::min<size_t>(i, 255);
+        return static_cast<uint8_t>(1 + ((i * 13 + salt * 29) % max_r));
+    };
+
+    // --- BC1 (605 blocks) ---
+    {
+        struct State {
+            uint32_t c0[3], c1[3], pos[16];
+        };
+        std::vector<State> truth(kBlocks);
+        std::vector<Record> records(kBlocks, Record(12, 0));
+        for (size_t i = 0; i < kBlocks; ++i) {
+            const uint8_t ep_ref = pick_ref(i, 0);
+            const uint8_t ix_ref = pick_ref(i, 1);
+            set_refs(records[i], false, ep_ref, ix_ref);
+            const State zero{};
+            const State& er = ep_ref == 0 ? zero : truth[i - ep_ref];
+            const State& ir = ix_ref == 0 ? zero : truth[i - ix_ref];
+            uint32_t dpos[16];
+            for (uint32_t c = 0; c < 3; ++c) {
+                const uint32_t bits = c == 1 ? 6u : 5u;
+                const uint32_t mask = (1u << bits) - 1u;
+                const uint32_t d0 = static_cast<uint32_t>((i + c * 3 + 1) & mask);
+                const uint32_t d1 = static_cast<uint32_t>((i * 2 + c + 3) & mask);
+                records[i][2 + c] = residual(d0, bits);
+                records[i][5 + c] = residual(d1, bits);
+                truth[i].c0[c] = (er.c0[c] + d0) & mask;
+                truth[i].c1[c] = (er.c1[c] + d1) & mask;
+            }
+            for (uint32_t p = 0; p < 16; ++p) {
+                dpos[p] = static_cast<uint32_t>((i + p) & 3u);
+                truth[i].pos[p] = (ir.pos[p] + dpos[p]) & 3u;
+            }
+            for (uint32_t q = 0; q < 4; ++q) {
+                records[i][8 + q] = quad_symbol(dpos, q);
+            }
+        }
+        const std::vector<uint8_t> dst = decode_records(*t, 1, records);
+        for (size_t i = 0; i < kBlocks; ++i) {
+            check_color_half(dst.data() + i * 8, truth[i].c0, truth[i].c1, truth[i].pos);
+        }
+    }
+
+    // --- BC4 (605 blocks) ---
+    {
+        struct State {
+            uint32_t e0, e1, pos[16];
+        };
+        std::vector<State> truth(kBlocks);
+        std::vector<Record> records(kBlocks, Record(12, 0));
+        for (size_t i = 0; i < kBlocks; ++i) {
+            const uint8_t ep_ref = pick_ref(i, 2);
+            const uint8_t ix_ref = pick_ref(i, 3);
+            set_refs(records[i], false, ep_ref, ix_ref);
+            const State zero{};
+            const State& er = ep_ref == 0 ? zero : truth[i - ep_ref];
+            const State& ir = ix_ref == 0 ? zero : truth[i - ix_ref];
+            const uint32_t d0 = static_cast<uint32_t>((i * 7 + 5) & 0xFFu);
+            const uint32_t d1 = static_cast<uint32_t>((i * 11 + 13) & 0xFFu);
+            records[i][2] = residual(d0, 8);
+            records[i][3] = residual(d1, 8);
+            truth[i].e0 = (er.e0 + d0) & 0xFFu;
+            truth[i].e1 = (er.e1 + d1) & 0xFFu;
+            uint32_t dpos[16];
+            for (uint32_t p = 0; p < 16; ++p) {
+                dpos[p] = static_cast<uint32_t>((i + p * 3) & 7u);
+                truth[i].pos[p] = (ir.pos[p] + dpos[p]) & 7u;
+            }
+            pair_symbols(dpos, &records[i][4], 8);
+        }
+        const std::vector<uint8_t> dst = decode_records(*t, 4, records);
+        for (size_t i = 0; i < kBlocks; ++i) {
+            check_alpha_half(dst.data() + i * 8, truth[i].e0, truth[i].e1, truth[i].pos);
+        }
+    }
+
+    // --- BC3 (605 blocks) ---
+    {
+        struct State {
+            uint32_t a0, a1, c0[3], c1[3], apos[16], cpos[16];
+        };
+        std::vector<State> truth(kBlocks);
+        std::vector<Record> records(kBlocks, Record(24, 0));
+        for (size_t i = 0; i < kBlocks; ++i) {
+            const uint8_t ep_ref = pick_ref(i, 4);
+            const uint8_t ix_ref = pick_ref(i, 5);
+            set_refs(records[i], true, ep_ref, ix_ref);
+            const State zero{};
+            const State& er = ep_ref == 0 ? zero : truth[i - ep_ref];
+            const State& ir = ix_ref == 0 ? zero : truth[i - ix_ref];
+            const uint32_t da0 = static_cast<uint32_t>((i * 3 + 9) & 0xFFu);
+            const uint32_t da1 = static_cast<uint32_t>((i * 5 + 1) & 0xFFu);
+            records[i][4] = residual(da0, 8);
+            records[i][5] = residual(da1, 8);
+            truth[i].a0 = (er.a0 + da0) & 0xFFu;
+            truth[i].a1 = (er.a1 + da1) & 0xFFu;
+            uint32_t dapos[16], dcpos[16];
+            for (uint32_t p = 0; p < 16; ++p) {
+                dapos[p] = static_cast<uint32_t>((i + p) & 7u);
+                dcpos[p] = static_cast<uint32_t>((i * 2 + p) & 3u);
+                truth[i].apos[p] = (ir.apos[p] + dapos[p]) & 7u;
+                truth[i].cpos[p] = (ir.cpos[p] + dcpos[p]) & 3u;
+            }
+            pair_symbols(dapos, &records[i][6], 8);
+            for (uint32_t c = 0; c < 3; ++c) {
+                const uint32_t bits = c == 1 ? 6u : 5u;
+                const uint32_t mask = (1u << bits) - 1u;
+                const uint32_t d0 = static_cast<uint32_t>((i + c * 5) & mask);
+                const uint32_t d1 = static_cast<uint32_t>((i * 3 + c) & mask);
+                records[i][14 + 2 * c] = residual(d0, bits);
+                records[i][15 + 2 * c] = residual(d1, bits);
+                truth[i].c0[c] = (er.c0[c] + d0) & mask;
+                truth[i].c1[c] = (er.c1[c] + d1) & mask;
+            }
+            for (uint32_t q = 0; q < 4; ++q) {
+                records[i][20 + q] = quad_symbol(dcpos, q);
+            }
+        }
+        const std::vector<uint8_t> dst = decode_records(*t, 3, records);
+        for (size_t i = 0; i < kBlocks; ++i) {
+            check_alpha_half(dst.data() + i * 16, truth[i].a0, truth[i].a1, truth[i].apos);
+            check_color_half(dst.data() + i * 16 + 8, truth[i].c0, truth[i].c1, truth[i].cpos);
+        }
+    }
+
+    // --- BC5 (605 blocks) ---
+    {
+        struct State {
+            uint32_t e[4], pos[32];
+        };
+        std::vector<State> truth(kBlocks);
+        std::vector<Record> records(kBlocks, Record(24, 0));
+        for (size_t i = 0; i < kBlocks; ++i) {
+            const uint8_t ep_ref = pick_ref(i, 6);
+            const uint8_t ix_ref = pick_ref(i, 7);
+            set_refs(records[i], true, ep_ref, ix_ref);
+            const State zero{};
+            const State& er = ep_ref == 0 ? zero : truth[i - ep_ref];
+            const State& ir = ix_ref == 0 ? zero : truth[i - ix_ref];
+            for (uint32_t k = 0; k < 4; ++k) {
+                const uint32_t d = static_cast<uint32_t>((i * (k + 3) + k * 19) & 0xFFu);
+                records[i][4 + k] = residual(d, 8);
+                truth[i].e[k] = (er.e[k] + d) & 0xFFu;
+            }
+            uint32_t dpos[32];
+            for (uint32_t p = 0; p < 32; ++p) {
+                dpos[p] = static_cast<uint32_t>((i + p * 3) & 7u);
+                truth[i].pos[p] = (ir.pos[p] + dpos[p]) & 7u;
+            }
+            pair_symbols(dpos, &records[i][8], 16);
+        }
+        const std::vector<uint8_t> dst = decode_records(*t, 5, records);
+        for (size_t i = 0; i < kBlocks; ++i) {
+            check_alpha_half(dst.data() + i * 16, truth[i].e[0], truth[i].e[1], truth[i].pos);
+            check_alpha_half(dst.data() + i * 16 + 8, truth[i].e[2], truth[i].e[3], truth[i].pos + 16);
+        }
+    }
+
+    // --- BC6H (605 blocks, mode 11 with sliding history back-references across chunks & ring wrap) ---
+    {
+        struct State {
+            uint32_t f[2][3];  // 10-bit endpoint fields
+            uint32_t ix[16];   // 4-bit stored indices
+        };
+        std::vector<State> truth(kBlocks);
+        std::vector<Record> records(kBlocks, Record(32, 0));
+        for (size_t i = 0; i < kBlocks; ++i) {
+            if (i < 4 || (i % 3 != 0)) {
+                // Fresh block (ref = 0) with unique pattern
+                uint32_t f[4][3] = {};
+                for (uint32_t e = 0; e < 2; ++e) {
+                    for (uint32_t c = 0; c < 3; ++c) {
+                        f[e][c] = static_cast<uint32_t>((i * 17 + e * 101 + c * 37) & 0x3FFu);
+                        truth[i].f[e][c] = f[e][c];
+                    }
+                }
+                uint32_t ix[16];
+                for (uint32_t p = 0; p < 16; ++p) {
+                    ix[p] = p == 0 ? static_cast<uint32_t>(i & 7u) : static_cast<uint32_t>((i + p * 5) & 15u);
+                    truth[i].ix[p] = ix[p];
+                }
+                records[i] = bc6_record(11, f, ix, 0);
+            } else {
+                // Pure copy from an earlier block across chunk / ring boundary (zero residuals)
+                const uint8_t ep_ref = pick_ref(i, 8);
+                const uint8_t ix_ref = pick_ref(i, 9);
+                records[i][30] = 10;  // mode 11
+                set_refs(records[i], true, ep_ref, ix_ref);
+                const State& er = truth[i - ep_ref];
+                const State& ir = truth[i - ix_ref];
+                for (uint32_t e = 0; e < 2; ++e) {
+                    for (uint32_t c = 0; c < 3; ++c) {
+                        truth[i].f[e][c] = er.f[e][c];
+                    }
+                }
+                for (uint32_t p = 0; p < 16; ++p) {
+                    truth[i].ix[p] = ir.ix[p];
+                }
+            }
+        }
+        const std::vector<uint8_t> dst = decode_records(*t, 6, records);
+        for (size_t i = 0; i < kBlocks; ++i) {
+            const uint8_t* blk = dst.data() + i * 16;
+            CHECK(block_bits(blk, 0, 5) == 3);
+            for (uint32_t k = 0; k < 6; ++k) {
+                CHECK(block_bits(blk, 5 + 10 * k, 10) == truth[i].f[k / 3][k % 3]);
+            }
+            uint32_t at = 65;
+            for (uint32_t p = 0; p < 16; ++p) {
+                const uint32_t n = p == 0 ? 3u : 4u;
+                CHECK(block_bits(blk, at, n) == (truth[i].ix[p] & ((1u << n) - 1u)));
+                at += n;
+            }
+        }
+    }
+
+    // --- BC7 (605 blocks, mode 6 with sliding history back-references across chunks & ring wrap) ---
+    {
+        struct State {
+            uint32_t ep[8];  // R0 R1 (8-bit incl pbit), G0 G1 B0 B1 A0 A1 (7-bit)
+            uint32_t ix[16];
+        };
+        const uint32_t prec6[4] = {8, 7, 7, 7};
+        std::vector<State> truth(kBlocks);
+        std::vector<Record> records(kBlocks, Record(32, 0));
+        for (size_t i = 0; i < kBlocks; ++i) {
+            if (i < 4 || (i % 3 != 0)) {
+                uint32_t ep[3][8] = {};
+                for (uint32_t col = 0; col < 8; ++col) {
+                    const uint32_t mask = (1u << prec6[col / 2]) - 1u;
+                    ep[0][col] = static_cast<uint32_t>((i * 19 + col * 11 + 3) & mask);
+                    truth[i].ep[col] = ep[0][col];
+                }
+                uint32_t ix[16];
+                for (uint32_t p = 0; p < 16; ++p) {
+                    ix[p] = p == 0 ? static_cast<uint32_t>(i & 7u) : static_cast<uint32_t>((i + p * 3) & 15u);
+                    truth[i].ix[p] = ix[p];
+                }
+                records[i] = bc7_record(0, ep, prec6, ix, nullptr, false);
+            } else {
+                const uint8_t ep_ref = pick_ref(i, 10);
+                const uint8_t ix_ref = pick_ref(i, 11);
+                // Mode 6 is code 0 (s30 = 0, s31 = 0), zero residuals copies references identically.
+                set_refs(records[i], true, ep_ref, ix_ref);
+                const State& er = truth[i - ep_ref];
+                const State& ir = truth[i - ix_ref];
+                for (uint32_t col = 0; col < 8; ++col) {
+                    truth[i].ep[col] = er.ep[col];
+                }
+                for (uint32_t p = 0; p < 16; ++p) {
+                    truth[i].ix[p] = ir.ix[p];
+                }
+            }
+        }
+        const std::vector<uint8_t> dst = decode_records(*t, 7, records);
+        for (size_t i = 0; i < kBlocks; ++i) {
+            const Bc7Fields f = read_bc7(dst.data() + i * 16, {0});
+            CHECK(f.mode == 6 && f.bits == 128);
+            CHECK(f.ep[0][0][0] == (truth[i].ep[0] >> 1) && f.pbit[0][0] == (truth[i].ep[0] & 1u));
+            CHECK(f.ep[0][1][0] == (truth[i].ep[1] >> 1) && f.pbit[0][1] == (truth[i].ep[1] & 1u));
+            CHECK(f.ep[0][0][1] == truth[i].ep[2] && f.ep[0][1][1] == truth[i].ep[3]);
+            CHECK(f.ep[0][0][2] == truth[i].ep[4] && f.ep[0][1][2] == truth[i].ep[5]);
+            CHECK(f.ep[0][0][3] == truth[i].ep[6] && f.ep[0][1][3] == truth[i].ep[7]);
+            for (uint32_t p = 0; p < 16; ++p) {
+                CHECK(f.index[0][p] == (truth[i].ix[p] & (p == 0 ? 7u : 15u)));
+            }
+        }
+    }
+}
+
+void test_bc7_all_modes() {
+    sy::Builder b = sy::Builder::full();
+    std::vector<uint16_t> ctrl(512, 0);
+    // Cover every BC7 mode 0..7, all rotations 0..3 on modes 4 and 5, both index_select on mode 4.
+    ctrl[0] = 0 | (3 << 6) | (11 << 8);   // mode 0, 3 subsets, partition 11 (anchors 0, 6, 15)
+    ctrl[1] = 1 | (2 << 6) | (34 << 8);   // mode 1, 2 subsets, partition 34 (anchors 0, 6)
+    ctrl[2] = 2 | (3 << 6) | (42 << 8);   // mode 2, 3 subsets, partition 42 (anchors 0, 15, 8)
+    ctrl[3] = 3 | (2 << 6) | (50 << 8);   // mode 3, 2 subsets, partition 50 (anchors 0, 6)
+    ctrl[6] = 6 | (1 << 6);               // mode 6, 1 subset
+    ctrl[7] = 7 | (2 << 6) | (61 << 8);   // mode 7, 2 subsets, partition 61 (anchors 0, 2)
+    for (uint32_t rot = 0; rot < 4; ++rot) {
+        for (uint32_t isel = 0; isel < 2; ++isel) {
+            ctrl[16 + rot * 2 + isel] = static_cast<uint16_t>(4 | (rot << 3) | (isel << 5) | (1 << 6));
+        }
+        ctrl[32 + rot] = static_cast<uint16_t>(5 | (rot << 3) | (1 << 6));
+    }
+    std::vector<uint8_t>& bc7c = b.sections["BC7C"];
+    bc7c.clear();
+    for (uint16_t w : ctrl) {
+        sy::put16(bc7c, w);
+    }
+    const auto t = b.tables();
+    CHECK(t != nullptr);
+    if (!t) {
+        return;
+    }
+
+    // Mode 0 (3 subsets, partition 11: anchors 0, 6, 15; per-endpoint p-bits)
+    {
+        const uint32_t prec[4] = {5, 4, 4, 0};
+        const uint32_t ep[3][8] = {
+            {0x13, 0x0A, 1, 2, 3, 4, 0, 0}, {0x1E, 0x05, 5, 6, 7, 8, 0, 0}, {0x1F, 0x10, 9, 10, 11, 12, 0, 0}};
+        uint32_t ix[16];
+        for (uint32_t p = 0; p < 16; ++p) {
+            ix[p] = (p == 0 || p == 6 || p == 15) ? (p % 4) : ((p * 5 + 1) % 8);
+        }
+        const std::vector<uint8_t> dst = decode_records(*t, 7, {bc7_record(0, ep, prec, ix, nullptr, true)});
+        const Bc7Fields f = read_bc7(dst.data(), {0, 6, 15});
+        CHECK(f.mode == 0 && f.partition == 11 && f.bits == 128);
+        for (uint32_t s = 0; s < 3; ++s) {
+            CHECK(f.ep[s][0][0] == (ep[s][0] >> 1) && f.pbit[s][0] == (ep[s][0] & 1u));
+            CHECK(f.ep[s][1][0] == (ep[s][1] >> 1) && f.pbit[s][1] == (ep[s][1] & 1u));
+            CHECK(f.ep[s][0][1] == ep[s][2] && f.ep[s][1][1] == ep[s][3]);
+            CHECK(f.ep[s][0][2] == ep[s][4] && f.ep[s][1][2] == ep[s][5]);
+        }
+        for (uint32_t p = 0; p < 16; ++p) {
+            CHECK(f.index[0][p] == ix[p]);
+        }
+    }
+
+    // Mode 1 (2 subsets, partition 34: anchors 0, 6; shared per-subset p-bits)
+    {
+        const uint32_t prec[4] = {7, 6, 6, 0};
+        const uint32_t ep[3][8] = {{0x7B, 0x24, 11, 22, 33, 44, 0, 0}, {0x00, 0x7E, 55, 63, 7, 19, 0, 0}, {}};
+        uint32_t ix[16];
+        for (uint32_t p = 0; p < 16; ++p) {
+            ix[p] = (p == 0 || p == 6) ? (p == 0 ? 2 : 3) : ((p + 5) % 8);
+        }
+        const std::vector<uint8_t> dst = decode_records(*t, 7, {bc7_record(1, ep, prec, ix, nullptr, false)});
+        const Bc7Fields f = read_bc7(dst.data(), {0, 6});
+        CHECK(f.mode == 1 && f.partition == 34 && f.bits == 128);
+        for (uint32_t s = 0; s < 2; ++s) {
+            CHECK(f.ep[s][0][0] == (ep[s][0] >> 1) && f.ep[s][1][0] == (ep[s][1] >> 1));
+            CHECK(f.pbit[s][0] == (ep[s][0] & 1u));
+            CHECK(f.ep[s][0][1] == ep[s][2] && f.ep[s][1][1] == ep[s][3]);
+            CHECK(f.ep[s][0][2] == ep[s][4] && f.ep[s][1][2] == ep[s][5]);
+        }
+        for (uint32_t p = 0; p < 16; ++p) {
+            CHECK(f.index[0][p] == ix[p]);
+        }
+    }
+
+    // Mode 2 (3 subsets, partition 42: anchors 0, 15, 8; no p-bits, 5-bit RGB, 2-bit indices)
+    {
+        const uint32_t prec[4] = {5, 5, 5, 0};
+        const uint32_t ep[3][8] = {
+            {3, 19, 7, 29, 11, 31, 0, 0}, {1, 2, 3, 4, 5, 6, 0, 0}, {30, 28, 26, 24, 22, 20, 0, 0}};
+        uint32_t ix[16];
+        for (uint32_t p = 0; p < 16; ++p) {
+            ix[p] = (p == 0 || p == 15 || p == 8) ? (p & 1u) : ((p * 3 + 1) & 3u);
+        }
+        const std::vector<uint8_t> dst = decode_records(*t, 7, {bc7_record(2, ep, prec, ix, nullptr, true)});
+        const Bc7Fields f = read_bc7(dst.data(), {0, 15, 8});
+        CHECK(f.mode == 2 && f.partition == 42 && f.bits == 128);
+        for (uint32_t s = 0; s < 3; ++s) {
+            for (uint32_t ch = 0; ch < 3; ++ch) {
+                CHECK(f.ep[s][0][ch] == ep[s][2 * ch]);
+                CHECK(f.ep[s][1][ch] == ep[s][2 * ch + 1]);
+            }
+        }
+        for (uint32_t p = 0; p < 16; ++p) {
+            CHECK(f.index[0][p] == ix[p]);
+        }
+    }
+
+    // Mode 3 (2 subsets, partition 50: anchors 0, 6; 7-bit RGB + per-endpoint p-bits, 2-bit indices)
+    {
+        const uint32_t prec[4] = {8, 7, 7, 0};
+        const uint32_t ep[3][8] = {{0xAA, 0x55, 10, 20, 30, 40, 0, 0}, {0xFF, 0x01, 100, 101, 126, 127, 0, 0}, {}};
+        uint32_t ix[16];
+        for (uint32_t p = 0; p < 16; ++p) {
+            ix[p] = (p == 0 || p == 6) ? (p == 0 ? 1 : 0) : ((p + 2) & 3u);
+        }
+        const std::vector<uint8_t> dst = decode_records(*t, 7, {bc7_record(3, ep, prec, ix, nullptr, false)});
+        const Bc7Fields f = read_bc7(dst.data(), {0, 6});
+        CHECK(f.mode == 3 && f.partition == 50 && f.bits == 128);
+        for (uint32_t s = 0; s < 2; ++s) {
+            CHECK(f.ep[s][0][0] == (ep[s][0] >> 1) && f.pbit[s][0] == (ep[s][0] & 1u));
+            CHECK(f.ep[s][1][0] == (ep[s][1] >> 1) && f.pbit[s][1] == (ep[s][1] & 1u));
+            CHECK(f.ep[s][0][1] == ep[s][2] && f.ep[s][1][1] == ep[s][3]);
+            CHECK(f.ep[s][0][2] == ep[s][4] && f.ep[s][1][2] == ep[s][5]);
+        }
+        for (uint32_t p = 0; p < 16; ++p) {
+            CHECK(f.index[0][p] == ix[p]);
+        }
+    }
+
+    // Mode 4: all 4 rotations x both index_select values
+    for (uint32_t rot = 0; rot < 4; ++rot) {
+        for (uint32_t isel = 0; isel < 2; ++isel) {
+            uint32_t prec[4] = {5, 5, 5, 6};
+            if (rot != 0) {
+                std::swap(prec[3], prec[rot - 1]);
+            }
+            uint32_t ep[3][8] = {};
+            for (uint32_t col = 0; col < 8; ++col) {
+                ep[0][col] = (17 + col * 5 + rot * 3 + isel) & ((1u << prec[col / 2]) - 1u);
+            }
+            uint32_t ix0[16], ix1[16];
+            for (uint32_t p = 0; p < 16; ++p) {
+                ix0[p] = p == 0 ? ((rot + isel) & 3u) : ((p * 3 + rot) & 7u);
+                ix1[p] = p == 0 ? (isel & 1u) : ((p + rot) & 3u);
+            }
+            const uint32_t code = 16 + rot * 2 + isel;
+            const std::vector<uint8_t> dst = decode_records(*t, 7, {bc7_record(code, ep, prec, ix0, ix1, false)});
+            const Bc7Fields f = read_bc7(dst.data(), {0});
+            CHECK(f.mode == 4 && f.rotation == rot && f.index_select == isel && f.bits == 128);
+            uint32_t order[4] = {0, 1, 2, 3};
+            if (rot != 0) {
+                std::swap(order[3], order[rot - 1]);
+            }
+            for (uint32_t ch = 0; ch < 4; ++ch) {
+                CHECK(f.ep[0][0][ch] == ep[0][2 * order[ch]]);
+                CHECK(f.ep[0][1][ch] == ep[0][2 * order[ch] + 1]);
+            }
+            for (uint32_t p = 0; p < 16; ++p) {
+                CHECK(f.index[0][p] == ix1[p]);  // 2-bit set first
+                CHECK(f.index[1][p] == ix0[p]);  // 3-bit set second
+            }
+        }
+    }
+
+    // Mode 5: all 4 rotations
+    for (uint32_t rot = 0; rot < 4; ++rot) {
+        uint32_t prec[4] = {7, 7, 7, 8};
+        if (rot != 0) {
+            std::swap(prec[3], prec[rot - 1]);
+        }
+        uint32_t ep[3][8] = {};
+        for (uint32_t col = 0; col < 8; ++col) {
+            ep[0][col] = (41 + col * 23 + rot * 7) & ((1u << prec[col / 2]) - 1u);
+        }
+        uint32_t ix0[16], ix1[16];
+        for (uint32_t p = 0; p < 16; ++p) {
+            ix0[p] = p == 0 ? (rot & 1u) : ((p * 3 + rot) & 3u);
+            ix1[p] = p == 0 ? ((rot >> 1) & 1u) : ((p + rot + 1) & 3u);
+        }
+        const std::vector<uint8_t> dst = decode_records(*t, 7, {bc7_record(32 + rot, ep, prec, ix0, ix1, false)});
+        const Bc7Fields f = read_bc7(dst.data(), {0});
+        CHECK(f.mode == 5 && f.rotation == rot && f.bits == 128);
+        uint32_t order[4] = {0, 1, 2, 3};
+        if (rot != 0) {
+            std::swap(order[3], order[rot - 1]);
+        }
+        for (uint32_t ch = 0; ch < 4; ++ch) {
+            CHECK(f.ep[0][0][ch] == ep[0][2 * order[ch]]);
+            CHECK(f.ep[0][1][ch] == ep[0][2 * order[ch] + 1]);
+        }
+        for (uint32_t p = 0; p < 16; ++p) {
+            CHECK(f.index[0][p] == ix0[p]);
+            CHECK(f.index[1][p] == ix1[p]);
+        }
+    }
+
+    // Mode 7 (2 subsets, partition 61: anchors 0, 2; 5-bit RGBA + per-endpoint p-bits, 2-bit indices)
+    {
+        const uint32_t prec[4] = {6, 5, 5, 5};
+        const uint32_t ep[3][8] = {
+            {0x3D, 0x12, 3, 29, 7, 25, 11, 21}, {0x01, 0x3E, 31, 0, 15, 16, 8, 24}, {}};
+        uint32_t ix[16];
+        for (uint32_t p = 0; p < 16; ++p) {
+            ix[p] = (p == 0 || p == 2) ? (p == 0 ? 1 : 0) : ((p * 3) & 3u);
+        }
+        const std::vector<uint8_t> dst = decode_records(*t, 7, {bc7_record(7, ep, prec, ix, nullptr, false)});
+        const Bc7Fields f = read_bc7(dst.data(), {0, 2});
+        CHECK(f.mode == 7 && f.partition == 61 && f.bits == 128);
+        for (uint32_t s = 0; s < 2; ++s) {
+            CHECK(f.ep[s][0][0] == (ep[s][0] >> 1) && f.pbit[s][0] == (ep[s][0] & 1u));
+            CHECK(f.ep[s][1][0] == (ep[s][1] >> 1) && f.pbit[s][1] == (ep[s][1] & 1u));
+            CHECK(f.ep[s][0][1] == ep[s][2] && f.ep[s][1][1] == ep[s][3]);
+            CHECK(f.ep[s][0][2] == ep[s][4] && f.ep[s][1][2] == ep[s][5]);
+            CHECK(f.ep[s][0][3] == ep[s][6] && f.ep[s][1][3] == ep[s][7]);
+        }
+        for (uint32_t p = 0; p < 16; ++p) {
+            CHECK(f.index[0][p] == ix[p]);
+        }
+    }
+}
+
+void test_bc6h_all_modes() {
+    const auto t = sy::Builder::full().tables();
+    CHECK(t != nullptr);
+    if (!t) {
+        return;
+    }
+    static const uint8_t kBits[15][4] = {{0, 0, 0, 0},  {10, 5, 5, 5}, {7, 6, 6, 6},   {11, 5, 4, 4},
+                                         {11, 4, 5, 4}, {11, 4, 4, 5}, {9, 5, 5, 5},   {8, 6, 5, 5},
+                                         {8, 5, 6, 5},  {8, 5, 5, 6},  {6, 6, 6, 6},   {10, 10, 10, 10},
+                                         {11, 9, 9, 9}, {12, 8, 8, 8}, {16, 4, 4, 4}};
+    static const uint8_t kModeCode[15][2] = {{0, 0},  {0, 2},  {1, 2},  {2, 5},  {6, 5},  {10, 5}, {14, 5}, {18, 5},
+                                             {22, 5}, {26, 5}, {30, 5}, {3, 5},  {7, 5},  {11, 5}, {15, 5}};
+    // Public BC6H second-subset anchor indices for partitions 0..31.
+    static const uint8_t kAnchor2[32] = {15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+                                         15, 2,  8,  2,  2,  8,  8,  15, 2,  8,  2,  2,  8,  8,  2,  2};
+
+    // Unpacks a 128-bit BC6H block according to the public spec for `mode` (1..14) and verifies
+    // every endpoint field, partition, and index bit, plus total width == 128.
+    auto check_mode = [&](uint32_t mode) {
+        const bool two = mode < 11;
+        uint32_t ep[4][3] = {};
+        for (uint32_t e = 0; e < (two ? 4u : 2u); ++e) {
+            for (uint32_t c = 0; c < 3; ++c) {
+                const uint32_t nbits = e == 0 ? kBits[mode][0] : kBits[mode][1 + c];
+                const uint32_t mask = nbits == 16 ? 0xFFFFu : ((1u << nbits) - 1u);
+                // Distinct bit pattern exercising both LSBs and MSBs
+                ep[e][c] = (0xA53Cu ^ (mode * 0x1111u) ^ (e * 0x05A3u) ^ (c * 0x0137u)) & mask;
+            }
+        }
+        const uint32_t partition = two ? ((mode * 3 + 5) & 31u) : 0u;
+        const uint32_t anchor2 = two ? kAnchor2[partition] : 0u;
+        const uint32_t ibits = two ? 3u : 4u;
+        uint32_t ix[16];
+        for (uint32_t p = 0; p < 16; ++p) {
+            const bool is_anchor = (p == 0) || (two && p == anchor2);
+            const uint32_t mod = 1u << (ibits - (is_anchor ? 1u : 0u));
+            ix[p] = (p * 5 + mode) % mod;
+        }
+
+        const std::vector<uint8_t> dst = decode_records(*t, 6, {bc6_record(mode, ep, ix, partition)});
+        BitReader r(dst.data());
+        CHECK(r.get(kModeCode[mode][1]) == kModeCode[mode][0]);
+
+        uint32_t got[4][3] = {};
+        uint32_t got_part = 0;
+        auto read_bits = [&](uint32_t e, uint32_t c, uint32_t lo, uint32_t count) {
+            got[e][c] |= r.get(count) << lo;
+        };
+        auto read_bit = [&](uint32_t e, uint32_t c, uint32_t bit) { read_bits(e, c, bit, 1); };
+        switch (mode) {
+            case 1:
+                read_bit(2, 1, 4); read_bit(2, 2, 4); read_bit(3, 2, 4);
+                read_bits(0, 0, 0, 10); read_bits(0, 1, 0, 10); read_bits(0, 2, 0, 10);
+                read_bits(1, 0, 0, 5); read_bit(3, 1, 4); read_bits(2, 1, 0, 4);
+                read_bits(1, 1, 0, 5); read_bit(3, 2, 0); read_bits(3, 1, 0, 4);
+                read_bits(1, 2, 0, 5); read_bit(3, 2, 1); read_bits(2, 2, 0, 4);
+                read_bits(2, 0, 0, 5); read_bit(3, 2, 2); read_bits(3, 0, 0, 5);
+                read_bit(3, 2, 3); got_part = r.get(5);
+                break;
+            case 2:
+                read_bit(2, 1, 5); read_bit(3, 1, 4); read_bit(3, 1, 5);
+                read_bits(0, 0, 0, 7); read_bit(3, 2, 0); read_bit(3, 2, 1); read_bit(2, 2, 4);
+                read_bits(0, 1, 0, 7); read_bit(2, 2, 5); read_bit(3, 2, 2); read_bit(2, 1, 4);
+                read_bits(0, 2, 0, 7); read_bit(3, 2, 3); read_bit(3, 2, 5); read_bit(3, 2, 4);
+                read_bits(1, 0, 0, 6); read_bits(2, 1, 0, 4); read_bits(1, 1, 0, 6);
+                read_bits(3, 1, 0, 4); read_bits(1, 2, 0, 6); read_bits(2, 2, 0, 4);
+                read_bits(2, 0, 0, 6); read_bits(3, 0, 0, 6); got_part = r.get(5);
+                break;
+            case 3:
+                read_bits(0, 0, 0, 10); read_bits(0, 1, 0, 10); read_bits(0, 2, 0, 10);
+                read_bits(1, 0, 0, 5); read_bit(0, 0, 10); read_bits(2, 1, 0, 4);
+                read_bits(1, 1, 0, 4); read_bit(0, 1, 10); read_bit(3, 2, 0); read_bits(3, 1, 0, 4);
+                read_bits(1, 2, 0, 4); read_bit(0, 2, 10); read_bit(3, 2, 1); read_bits(2, 2, 0, 4);
+                read_bits(2, 0, 0, 5); read_bit(3, 2, 2); read_bits(3, 0, 0, 5);
+                read_bit(3, 2, 3); got_part = r.get(5);
+                break;
+            case 4:
+                read_bits(0, 0, 0, 10); read_bits(0, 1, 0, 10); read_bits(0, 2, 0, 10);
+                read_bits(1, 0, 0, 4); read_bit(0, 0, 10); read_bit(3, 1, 4); read_bits(2, 1, 0, 4);
+                read_bits(1, 1, 0, 5); read_bit(0, 1, 10); read_bits(3, 1, 0, 4);
+                read_bits(1, 2, 0, 4); read_bit(0, 2, 10); read_bit(3, 2, 1); read_bits(2, 2, 0, 4);
+                read_bits(2, 0, 0, 4); read_bit(3, 2, 0); read_bit(3, 2, 2);
+                read_bits(3, 0, 0, 4); read_bit(2, 1, 4); read_bit(3, 2, 3); got_part = r.get(5);
+                break;
+            case 5:
+                read_bits(0, 0, 0, 10); read_bits(0, 1, 0, 10); read_bits(0, 2, 0, 10);
+                read_bits(1, 0, 0, 4); read_bit(0, 0, 10); read_bit(2, 2, 4); read_bits(2, 1, 0, 4);
+                read_bits(1, 1, 0, 4); read_bit(0, 1, 10); read_bit(3, 2, 0); read_bits(3, 1, 0, 4);
+                read_bits(1, 2, 0, 5); read_bit(0, 2, 10); read_bits(2, 2, 0, 4);
+                read_bits(2, 0, 0, 4); read_bit(3, 2, 1); read_bit(3, 2, 2);
+                read_bits(3, 0, 0, 4); read_bit(3, 2, 4); read_bit(3, 2, 3); got_part = r.get(5);
+                break;
+            case 6:
+                read_bits(0, 0, 0, 9); read_bit(2, 2, 4); read_bits(0, 1, 0, 9); read_bit(2, 1, 4);
+                read_bits(0, 2, 0, 9); read_bit(3, 2, 4);
+                read_bits(1, 0, 0, 5); read_bit(3, 1, 4); read_bits(2, 1, 0, 4);
+                read_bits(1, 1, 0, 5); read_bit(3, 2, 0); read_bits(3, 1, 0, 4);
+                read_bits(1, 2, 0, 5); read_bit(3, 2, 1); read_bits(2, 2, 0, 4);
+                read_bits(2, 0, 0, 5); read_bit(3, 2, 2); read_bits(3, 0, 0, 5);
+                read_bit(3, 2, 3); got_part = r.get(5);
+                break;
+            case 7:
+                read_bits(0, 0, 0, 8); read_bit(3, 1, 4); read_bit(2, 2, 4);
+                read_bits(0, 1, 0, 8); read_bit(3, 2, 2); read_bit(2, 1, 4);
+                read_bits(0, 2, 0, 8); read_bit(3, 2, 3); read_bit(3, 2, 4);
+                read_bits(1, 0, 0, 6); read_bits(2, 1, 0, 4);
+                read_bits(1, 1, 0, 5); read_bit(3, 2, 0); read_bits(3, 1, 0, 4);
+                read_bits(1, 2, 0, 5); read_bit(3, 2, 1); read_bits(2, 2, 0, 4);
+                read_bits(2, 0, 0, 6); read_bits(3, 0, 0, 6); got_part = r.get(5);
+                break;
+            case 8:
+                read_bits(0, 0, 0, 8); read_bit(3, 2, 0); read_bit(2, 2, 4);
+                read_bits(0, 1, 0, 8); read_bit(2, 1, 5); read_bit(2, 1, 4);
+                read_bits(0, 2, 0, 8); read_bit(3, 1, 5); read_bit(3, 2, 4);
+                read_bits(1, 0, 0, 5); read_bit(3, 1, 4); read_bits(2, 1, 0, 4);
+                read_bits(1, 1, 0, 6); read_bits(3, 1, 0, 4);
+                read_bits(1, 2, 0, 5); read_bit(3, 2, 1); read_bits(2, 2, 0, 4);
+                read_bits(2, 0, 0, 5); read_bit(3, 2, 2); read_bits(3, 0, 0, 5);
+                read_bit(3, 2, 3); got_part = r.get(5);
+                break;
+            case 9:
+                read_bits(0, 0, 0, 8); read_bit(3, 2, 1); read_bit(2, 2, 4);
+                read_bits(0, 1, 0, 8); read_bit(2, 2, 5); read_bit(2, 1, 4);
+                read_bits(0, 2, 0, 8); read_bit(3, 2, 5); read_bit(3, 2, 4);
+                read_bits(1, 0, 0, 5); read_bit(3, 1, 4); read_bits(2, 1, 0, 4);
+                read_bits(1, 1, 0, 5); read_bit(3, 2, 0); read_bits(3, 1, 0, 4);
+                read_bits(1, 2, 0, 6); read_bits(2, 2, 0, 4);
+                read_bits(2, 0, 0, 5); read_bit(3, 2, 2); read_bits(3, 0, 0, 5);
+                read_bit(3, 2, 3); got_part = r.get(5);
+                break;
+            case 10:
+                read_bits(0, 0, 0, 6); read_bit(3, 1, 4); read_bit(3, 2, 0); read_bit(3, 2, 1); read_bit(2, 2, 4);
+                read_bits(0, 1, 0, 6); read_bit(2, 1, 5); read_bit(2, 2, 5); read_bit(3, 2, 2); read_bit(2, 1, 4);
+                read_bits(0, 2, 0, 6); read_bit(3, 1, 5); read_bit(3, 2, 3); read_bit(3, 2, 5); read_bit(3, 2, 4);
+                read_bits(1, 0, 0, 6); read_bits(2, 1, 0, 4); read_bits(1, 1, 0, 6);
+                read_bits(3, 1, 0, 4); read_bits(1, 2, 0, 6); read_bits(2, 2, 0, 4);
+                read_bits(2, 0, 0, 6); read_bits(3, 0, 0, 6); got_part = r.get(5);
+                break;
+            case 11:
+                read_bits(0, 0, 0, 10); read_bits(0, 1, 0, 10); read_bits(0, 2, 0, 10);
+                read_bits(1, 0, 0, 10); read_bits(1, 1, 0, 10); read_bits(1, 2, 0, 10);
+                break;
+            case 12:
+                read_bits(0, 0, 0, 10); read_bits(0, 1, 0, 10); read_bits(0, 2, 0, 10);
+                read_bits(1, 0, 0, 9); read_bit(0, 0, 10);
+                read_bits(1, 1, 0, 9); read_bit(0, 1, 10);
+                read_bits(1, 2, 0, 9); read_bit(0, 2, 10);
+                break;
+            case 13:
+                read_bits(0, 0, 0, 10); read_bits(0, 1, 0, 10); read_bits(0, 2, 0, 10);
+                read_bits(1, 0, 0, 8); read_bits(0, 0, 10, 2);
+                read_bits(1, 1, 0, 8); read_bits(0, 1, 10, 2);
+                read_bits(1, 2, 0, 8); read_bits(0, 2, 10, 2);
+                break;
+            case 14:
+                read_bits(0, 0, 0, 10); read_bits(0, 1, 0, 10); read_bits(0, 2, 0, 10);
+                read_bits(1, 0, 0, 4); read_bits(0, 0, 10, 6);
+                read_bits(1, 1, 0, 4); read_bits(0, 1, 10, 6);
+                read_bits(1, 2, 0, 4); read_bits(0, 2, 10, 6);
+                break;
+        }
+        for (uint32_t e = 0; e < (two ? 4u : 2u); ++e) {
+            for (uint32_t c = 0; c < 3; ++c) {
+                CHECK(got[e][c] == ep[e][c]);
+            }
+        }
+        if (two) {
+            CHECK(got_part == partition);
+        }
+        for (uint32_t p = 0; p < 16; ++p) {
+            const bool is_anchor = (p == 0) || (two && p == anchor2);
+            CHECK(r.get(ibits - (is_anchor ? 1u : 0u)) == ix[p]);
+        }
+        CHECK(r.at() == 128);
+    };
+
+    for (uint32_t mode = 1; mode <= 14; ++mode) {
+        check_mode(mode);
+    }
+}
+
+void test_hardening_and_fast_div() {
+    // 1. Exactness verification of multiply-shift division across boundary frequencies.
+    for (uint32_t freq : {1u, 2u, 3u, 7u, 17u, 255u, 1024u, 32767u, 65535u}) {
+        const uint64_t recip = ((uint64_t{1} << 32) + freq - 1u) / freq;
+        for (uint32_t into = 0; into <= 65535u; ++into) {
+            const uint32_t fast_q = static_cast<uint32_t>((static_cast<uint64_t>(into) * recip) >> 32);
+            const uint32_t exact_q = into / freq;
+            if (fast_q != exact_q) {
+                CHECK(fast_q == exact_q);
+                break;
+            }
+        }
+    }
+
+    // 2. End-to-end rANS round-trip with boundary bucket frequencies (including freq=1,2,3,7,17,
+    //    255,1024,32767,65535) directly through parse_tables + decode_lanes.
+    {
+        sy::Builder b = sy::Builder::full();
+        std::vector<uint8_t>& modl = b.sections["MODL"];
+        // Overwrite group 0 models (m = 0..8, used = 2 buckets: bucket 0 + bucket 1 (symbol 1))
+        // and group 1 models (m = 16..23, used = 3 buckets: bucket 0, bucket 1 (1 sym), bucket 2 (2 syms)).
+        auto set_model = [&](uint32_t m, const uint32_t freqs[9]) {
+            for (uint32_t k = 0; k < 9; ++k) {
+                const size_t off = (static_cast<size_t>(m) * 9 + k) * 2;
+                modl[off] = static_cast<uint8_t>(freqs[k] & 0xFFu);
+                modl[off + 1] = static_cast<uint8_t>((freqs[k] >> 8) & 0xFFu);
+            }
+        };
+        const uint32_t boundary_freqs[9] = {1u, 2u, 3u, 7u, 17u, 255u, 1024u, 32767u, 65535u};
+        for (uint32_t idx = 0; idx < 9; ++idx) {
+            const uint32_t f1 = boundary_freqs[idx];
+            const uint32_t freqs[9] = {65536u - f1, f1, 0, 0, 0, 0, 0, 0, 0};
+            set_model(idx, freqs);
+        }
+        // Group 1 models (width 3, header bits 6-7 = 2 -> group 1): 2 symbols in bucket 2 (symbols 2, 3)
+        // with boundary frequencies so `into / freq` hits q = 0 and q = 1.
+        const uint32_t b2_freqs[8] = {1u, 2u, 3u, 7u, 17u, 255u, 1024u, 32767u};
+        for (uint32_t idx = 0; idx < 8; ++idx) {
+            const uint32_t f2 = b2_freqs[idx];
+            const uint32_t f1 = 1u;
+            const uint32_t f0 = 65536u - f1 - (f2 << 1);
+            const uint32_t freqs[9] = {f0, f1, f2, 0, 0, 0, 0, 0, 0};
+            set_model(16 + idx, freqs);
+        }
+        // Use a BC1 layout with all lane widths = 3 so header (3<<6)|low picks group 0 (m=low)
+        // and header (2<<6)|low picks group 1 (m=16+low).
+        std::vector<sy::LaneSpec> layouts = sy::default_layouts();
+        layouts[0].widths.assign(12, 3);
+        b.set_layouts(layouts);
+        const auto t_edge = b.tables();
+        CHECK(t_edge != nullptr);
+        if (t_edge) {
+            auto encode_lane_custom = [](uint8_t header_byte, const uint32_t f[9], const std::vector<uint8_t>& syms) {
+                uint32_t first[9] = {};
+                for (uint32_t k = 1; k < 9; ++k) {
+                    first[k] = first[k - 1] + (f[k - 1] << (k == 1 ? 0 : k - 2));
+                }
+                uint64_t x = 1u << 24;
+                std::vector<uint8_t> emitted;
+                for (size_t k = syms.size(); k-- > 0;) {
+                    const uint32_t s = syms[k];
+                    uint32_t freq = 0;
+                    uint32_t start = 0;
+                    if (s == 0) {
+                        freq = f[0] - 1;
+                        start = 1;
+                    } else {
+                        uint32_t bk = 0;
+                        while ((s >> bk) != 0) {
+                            ++bk;
+                        }
+                        freq = f[bk];
+                        start = first[bk] + (s - (1u << (bk - 1))) * freq;
+                    }
+                    while (x >= (static_cast<uint64_t>(freq) << 16)) {
+                        emitted.push_back(static_cast<uint8_t>(x));
+                        x >>= 8;
+                    }
+                    x = ((x / freq) << 16) + (x % freq) + start;
+                }
+                for (int k = 0; k < 4; ++k) {
+                    emitted.push_back(static_cast<uint8_t>(x >> (8 * k)));
+                }
+                std::vector<uint8_t> payload(emitted.rbegin(), emitted.rend());
+                std::vector<uint8_t> out = {header_byte, static_cast<uint8_t>(payload.size() - 1)};
+                out.insert(out.end(), payload.begin(), payload.end());
+                const uint8_t filler[] = {0x00, 0x01, 0x00, 0x00};
+                out.insert(out.end(), std::begin(filler), std::end(filler));
+                return out;
+            };
+            // Decode 16 blocks across 12 lanes: lanes 0..8 test group 0 (including freq[1] == 65535!),
+            // lanes 9..11 test group 1 (bucket 2 with freq 255, 1024, 32767).
+            constexpr size_t kEdgeBlocks = 16;
+            struct LaneQueues {
+                std::vector<std::deque<uint8_t>> q;
+            } lq;
+            std::vector<uint8_t> expected(kEdgeBlocks * 12, 0);
+            for (uint32_t lane = 0; lane < 12; ++lane) {
+                std::vector<uint8_t> syms(kEdgeBlocks, 1);
+                uint8_t hdr = 0;
+                uint32_t f[9] = {};
+                if (lane < 9) {
+                    hdr = static_cast<uint8_t>((3u << 6) | lane);  // group 0, model `lane`
+                    f[0] = 65536u - boundary_freqs[lane];
+                    f[1] = boundary_freqs[lane];
+                    for (size_t i = 0; i < kEdgeBlocks; ++i) {
+                        // When f[0] == 1 (lane 8, freq[1] == 65535), symbol 0 has 0 slots so only symbol 1 is valid.
+                        syms[i] = (lane == 8) ? uint8_t{1} : static_cast<uint8_t>((i + lane) & 1u);
+                    }
+                } else {
+                    const uint32_t m_idx = lane - 4;  // 5, 6, 7 -> b2_freqs = 255, 1024, 32767
+                    hdr = static_cast<uint8_t>((2u << 6) | m_idx);  // group 1, model `16 + m_idx`
+                    f[1] = 1u;
+                    f[2] = b2_freqs[m_idx];
+                    f[0] = 65536u - f[1] - (f[2] << 1);
+                    for (size_t i = 0; i < kEdgeBlocks; ++i) {
+                        // Cycle through 1, 2, 3 (avoiding 0 if f[0] == 1 for f[2] == 32767)
+                        syms[i] = (m_idx == 7) ? static_cast<uint8_t>(1 + (i % 3)) : static_cast<uint8_t>((i + lane) % 4);
+                    }
+                }
+                for (size_t i = 0; i < kEdgeBlocks; ++i) {
+                    expected[i * 12 + lane] = syms[i];
+                }
+                const std::vector<uint8_t> bytes = encode_lane_custom(hdr, f, syms);
+                lq.q.emplace_back(bytes.begin(), bytes.end());
+            }
+            auto fetch_q = [](void* ctx, size_t lane, uint8_t* byte) {
+                auto* qs = static_cast<LaneQueues*>(ctx);
+                if (qs->q[lane].empty()) {
+                    return false;
+                }
+                *byte = qs->q[lane].front();
+                qs->q[lane].pop_front();
+                return true;
+            };
+            std::vector<uint8_t> got(kEdgeBlocks * 12, 0);
+            CHECK(bp::decode_lanes(*t_edge, 1, kEdgeBlocks, fetch_q, &lq, got.data()));
+            CHECK(got == expected);
+        }
+    }
+
+    const auto t = sy::Builder::full().tables();
+    CHECK(t != nullptr);
+    if (!t) {
+        return;
+    }
+
+    // 3. `slot == 0` rANS state test (x > 2^24 with (x & 0xFFFF) == 0): must abort cleanly without
+    //    unsigned underflow or crash.
+    {
+        for (uint8_t hi_byte : {uint8_t{0x02}, uint8_t{0x01}}) {
+            const uint8_t second_byte = hi_byte == 0x01 ? uint8_t{0x01} : uint8_t{0x00};
+            // Lane 0 loads 4-byte state 0x02000000 or 0x01010000 (> kRansFloor, slot == 0).
+            struct SlotZeroCtx {
+                uint8_t bad_lane[6];
+                size_t at[12] = {};
+            } ctx{{0x00, 0x03, hi_byte, second_byte, 0x00, 0x00}};
+            auto fetch_slot0 = [](void* c, size_t lane, uint8_t* byte) {
+                auto* s = static_cast<SlotZeroCtx*>(c);
+                if (lane == 0 && s->at[0] < sizeof(s->bad_lane)) {
+                    *byte = s->bad_lane[s->at[0]++];
+                    return true;
+                }
+                return false;
+            };
+            uint8_t rec[12] = {};
+            CHECK(!bp::decode_lanes(*t, 1, 1, fetch_slot0, &ctx, rec));
+        }
+        // Also via decode() with an interleaved byte buffer feeding lane 0 a slot==0 state.
+        // Round 0 feeds header 0x00 to lanes 0..7; round 1 feeds length 0x03 to lanes 0..7;
+        // subsequent rounds feed 0x02, 0x00, 0x00, 0x00 into lane 0's payload.
+        std::vector<uint8_t> bad_stream;
+        for (int i = 0; i < 12; ++i) bad_stream.push_back(0x00);  // headers
+        for (int i = 0; i < 12; ++i) bad_stream.push_back(0x03);  // 4-byte payloads
+        for (int i = 0; i < 12; ++i) bad_stream.push_back(0x02);  // byte 0 of state -> 0x02......
+        for (int i = 0; i < 36; ++i) bad_stream.push_back(0x00);  // bytes 1..3 -> 0x02000000 (slot == 0)
+        uint8_t out_blk[8] = {};
+        CHECK(bp::decode(*t, 1, bad_stream.data(), bad_stream.size(), out_blk, sizeof(out_blk)) ==
+              bp::DecodeStatus::Truncated);
+    }
+
+    // 4. Invalid BC7C control words (rotation/index_select/partition/subsets violations) -> Corrupt.
+    {
+        sy::Builder b = sy::Builder::full();
+        std::vector<uint16_t> ctrl(512, 0);
+        ctrl[10] = 6 | (1 << 3) | (1 << 6);            // mode 6 with non-zero rotation
+        ctrl[11] = 0 | (2 << 3) | (3 << 6);            // mode 0 with non-zero rotation
+        ctrl[12] = 5 | (1 << 5) | (1 << 6);            // mode 5 with non-zero index_select
+        ctrl[13] = 6 | (1 << 5) | (1 << 6);            // mode 6 with non-zero index_select
+        ctrl[14] = 0 | (3 << 6) | (16 << 8);           // mode 0 with partition 16 (>= 16)
+        ctrl[15] = 0 | (3 << 6) | (63 << 8);           // mode 0 with partition 63 (>= 16)
+        ctrl[16] = 4 | (1 << 6) | (1 << 8);            // mode 4 with non-zero partition
+        ctrl[17] = 5 | (1 << 6) | (5 << 8);            // mode 5 with non-zero partition
+        ctrl[18] = 6 | (1 << 6) | (1 << 8);            // mode 6 with non-zero partition
+        ctrl[19] = 2 | (2 << 6);                       // mode 2 with 2 subsets (needs 3)
+        ctrl[20] = 7 | (3 << 3) | (2 << 6);            // mode 7 with non-zero rotation
+        std::vector<uint8_t>& bc7c = b.sections["BC7C"];
+        bc7c.clear();
+        for (uint16_t w : ctrl) {
+            sy::put16(bc7c, w);
+        }
+        const auto t_bad_ctrl = b.tables();
+        CHECK(t_bad_ctrl != nullptr);
+        if (t_bad_ctrl) {
+            for (uint32_t code = 10; code <= 20; ++code) {
+                Record r(32, 0);
+                r[30] = static_cast<uint8_t>(code & 31u);
+                r[31] = static_cast<uint8_t>(code >> 5);
+                bp::DecodeStatus st = bp::DecodeStatus::Ok;
+                decode_records(*t_bad_ctrl, 7, {r}, &st);
+                CHECK(st == bp::DecodeStatus::Corrupt);
+            }
+        }
+    }
+
+    // 5. decode_lanes() and decode() null / zero / overflow / BC2 guards.
+    {
+        auto dummy_fetch = [](void*, size_t, uint8_t* byte) {
+            *byte = 0;
+            return true;
+        };
+        uint8_t rec[32] = {};
+        CHECK(!bp::decode_lanes(*t, 1, 0, dummy_fetch, nullptr, rec));
+        CHECK(!bp::decode_lanes(*t, 1, 1, dummy_fetch, nullptr, nullptr));
+        CHECK(!bp::decode_lanes(*t, 1, 1, nullptr, nullptr, rec));
+        CHECK(!bp::decode_lanes(*t, 0, 1, dummy_fetch, nullptr, rec));
+        CHECK(!bp::decode_lanes(*t, 2, 1, dummy_fetch, nullptr, rec));
+        CHECK(!bp::decode_lanes(*t, 8, 1, dummy_fetch, nullptr, rec));
+        CHECK(!bp::decode_lanes(*t, 7, std::numeric_limits<size_t>::max(), dummy_fetch, nullptr, rec));
+        CHECK(!bp::decode_lanes(*t, 7, std::numeric_limits<size_t>::max() / 2, dummy_fetch, nullptr, rec));
+
+        uint8_t dst[32] = {};
+        uint8_t src[16] = {};
+        CHECK(bp::decode(*t, 1, nullptr, 16, dst, 8) == bp::DecodeStatus::Truncated);
+        CHECK(bp::decode(*t, 7, nullptr, 1, dst, 16) == bp::DecodeStatus::Truncated);
+        CHECK(bp::decode(*t, 1, src, sizeof(src), nullptr, 8) == bp::DecodeStatus::BadSize);
+        CHECK(bp::decode(*t, 7, src, sizeof(src), dst, 8) == bp::DecodeStatus::BadSize);
+        CHECK(bp::decode(*t, 7, src, sizeof(src), dst, 15) == bp::DecodeStatus::BadSize);
+        CHECK(bp::decode(*t, 1, src, sizeof(src), dst, 7) == bp::DecodeStatus::BadSize);
+        CHECK(bp::decode(*t, 2, src, sizeof(src), dst, 16) == bp::DecodeStatus::Unsupported);
+        CHECK(!bp::supports(*t, 2));
+        CHECK(bp::block_bytes(2) == 0);
+    }
+
+    // 6. load_tables_file() rejects oversized (> 64 MiB) files cleanly instead of truncating.
+    {
+        const std::string path = "test_bcpack_oversized.tmp";
+        std::FILE* f = std::fopen(path.c_str(), "wb");
+        CHECK(f != nullptr);
+        if (f != nullptr) {
+            std::vector<uint8_t> zeros(1u << 20, 0);
+            for (int mb = 0; mb < 64; ++mb) {
+                std::fwrite(zeros.data(), 1, zeros.size(), f);
+            }
+            const uint8_t extra = 0x42;
+            std::fwrite(&extra, 1, 1, f);
+            std::fclose(f);
+            std::string error;
+            CHECK(!bp::load_tables_file(path, &error));
+            CHECK(error.find("64 MiB") != std::string::npos || error.find("exceeds") != std::string::npos);
+            std::remove(path.c_str());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Surface block layout helpers (os/surface_blocks.h)
+// ---------------------------------------------------------------------------
+
+void test_surface_blocks() {
+    namespace sf = playgta6::os::surface;
+
+    // Compile-time constexpr checks.
+    static_assert(sf::kBlockBytes == 65536u);
+    static_assert(sf::kBlock4kBytes == 4096u);
+    static_assert(sf::bc_block_bytes(static_cast<uint32_t>(sf::BcFormat::BC1)) == 8u);
+    static_assert(sf::bc_block_bytes(static_cast<uint32_t>(sf::BcFormat::BC2)) == 16u);
+    static_assert(sf::bc_block_bytes(static_cast<uint32_t>(sf::BcFormat::BC3)) == 16u);
+    static_assert(sf::bc_block_bytes(static_cast<uint32_t>(sf::BcFormat::BC4)) == 8u);
+    static_assert(sf::bc_block_bytes(static_cast<uint32_t>(sf::BcFormat::BC5)) == 16u);
+    static_assert(sf::bc_block_bytes(static_cast<uint32_t>(sf::BcFormat::BC6H)) == 16u);
+    static_assert(sf::bc_block_bytes(static_cast<uint32_t>(sf::BcFormat::BC7)) == 16u);
+    static_assert(sf::bc_block_bytes(0u) == 0u && sf::bc_block_bytes(8u) == 0u);
+    static_assert(sf::mip_extent(4096u, 0u) == 4096u);
+    static_assert(sf::mip_extent(4096u, 12u) == 1u);
+    static_assert(sf::mip_extent(4096u, 32u) == 1u);
+    static_assert(sf::mip_extent(4096u, 99u) == 1u);
+
+    // Existing block64k_dims / block64k_layout_2d invariants.
+    {
+        const struct {
+            uint32_t bpe, w, h;
+        } cases[5] = {{1, 256, 256}, {2, 256, 128}, {4, 128, 128}, {8, 128, 64}, {16, 64, 64}};
+        for (const auto& c : cases) {
+            sf::BlockDims d{};
+            CHECK(sf::block64k_dims(c.bpe, &d));
+            CHECK(d.width == c.w && d.height == c.h);
+            CHECK(static_cast<uint64_t>(d.width) * d.height * c.bpe == sf::kBlockBytes);
+            sf::Block64kLayout l{};
+            CHECK(!sf::block64k_layout_2d(c.w - 1, c.h, c.bpe, &l));
+            CHECK(!sf::block64k_layout_2d(c.w, c.h - 1, c.bpe, &l));
+            CHECK(sf::block64k_layout_2d(c.w, c.h, c.bpe, &l));
+            CHECK(l.padded_width == c.w && l.padded_height == c.h);
+            CHECK(l.size_bytes == sf::kBlockBytes && l.alignment == sf::kBlockBytes);
+            CHECK(sf::block64k_layout_2d(c.w + 1, c.h + 1, c.bpe, &l));
+            CHECK(l.padded_width == 2 * c.w && l.padded_height == 2 * c.h);
+            CHECK(l.size_bytes == 4 * sf::kBlockBytes);
+        }
+        CHECK(!sf::block64k_dims(0, nullptr) && !sf::block64k_dims(3, nullptr) && !sf::block64k_dims(32, nullptr));
+    }
+
+    // bc_block_bytes
+    for (uint32_t bc = 1; bc <= 7; ++bc) {
+        const uint32_t expect = (bc == 1 || bc == 4) ? 8u : 16u;
+        CHECK(sf::bc_block_bytes(bc) == expect);
+    }
+    CHECK(sf::bc_block_bytes(0) == 0 && sf::bc_block_bytes(8) == 0 && sf::bc_block_bytes(255) == 0);
+
+    // bc_surface_grid (non-multiples, 1x1, 4K, UINT32_MAX overflow safety, zero dims)
+    {
+        uint32_t bx = 0, by = 0;
+        CHECK(!sf::bc_surface_grid(0, 4, &bx, &by));
+        CHECK(!sf::bc_surface_grid(4, 0, &bx, &by));
+        CHECK(!sf::bc_surface_grid(0, 0, &bx, &by));
+        CHECK(sf::bc_surface_grid(1, 1, &bx, &by) && bx == 1 && by == 1);
+        CHECK(sf::bc_surface_grid(3, 4, &bx, &by) && bx == 1 && by == 1);
+        CHECK(sf::bc_surface_grid(5, 9, &bx, &by) && bx == 2 && by == 3);
+        CHECK(sf::bc_surface_grid(3840, 2160, &bx, &by) && bx == 960 && by == 540);
+        CHECK(sf::bc_surface_grid(4096, 4096, &bx, &by) && bx == 1024 && by == 1024);
+        CHECK(sf::bc_surface_grid(UINT32_MAX, UINT32_MAX, &bx, &by));
+        CHECK(bx == 0x40000000u && by == 0x40000000u);
+        CHECK(sf::bc_surface_grid(13, 29, nullptr, nullptr));
+    }
+
+    // bc_linear_size_bytes
+    {
+        uint64_t bytes = 0;
+        CHECK(!sf::bc_linear_size_bytes(0, 16, 7, &bytes));
+        CHECK(!sf::bc_linear_size_bytes(16, 0, 7, &bytes));
+        CHECK(!sf::bc_linear_size_bytes(16, 16, 0, &bytes));
+        CHECK(!sf::bc_linear_size_bytes(16, 16, 8, &bytes));
+        CHECK(sf::bc_linear_size_bytes(1, 1, 1, &bytes) && bytes == 8);
+        CHECK(sf::bc_linear_size_bytes(1, 1, 2, &bytes) && bytes == 16);
+        CHECK(sf::bc_linear_size_bytes(5, 9, 4, &bytes) && bytes == 2ull * 3ull * 8ull);
+        CHECK(sf::bc_linear_size_bytes(4096, 4096, 7, &bytes) && bytes == 1024ull * 1024ull * 16ull);
+        CHECK(sf::bc_linear_size_bytes(4096, 4096, 1, &bytes) && bytes == 1024ull * 1024ull * 8ull);
+        // UINT32_MAX x UINT32_MAX: 2^30 x 2^30 = 2^60 blocks -> * 16 overflows uint64_t, * 8 = 2^63 fits.
+        CHECK(!sf::bc_linear_size_bytes(UINT32_MAX, UINT32_MAX, 7, &bytes));
+        CHECK(sf::bc_linear_size_bytes(UINT32_MAX, UINT32_MAX, 1, &bytes) && bytes == (uint64_t{1} << 63));
+    }
+
+    // block4k_dims / block4k_layout_2d
+    {
+        const struct {
+            uint32_t bpe, w, h;
+        } cases[5] = {{1, 64, 64}, {2, 64, 32}, {4, 32, 32}, {8, 32, 16}, {16, 16, 16}};
+        for (const auto& c : cases) {
+            sf::BlockDims d{};
+            CHECK(sf::block4k_dims(c.bpe, &d));
+            CHECK(d.width == c.w && d.height == c.h);
+            CHECK(static_cast<uint64_t>(d.width) * d.height * c.bpe == sf::kBlock4kBytes);
+            sf::Block64kLayout l{};
+            CHECK(sf::block4k_layout_2d(1, 1, c.bpe, &l));
+            CHECK(l.padded_width == c.w && l.padded_height == c.h);
+            CHECK(l.row_pitch_bytes == static_cast<uint64_t>(c.w) * c.bpe);
+            CHECK(l.size_bytes == sf::kBlock4kBytes && l.alignment == sf::kBlock4kBytes);
+            CHECK(sf::block4k_layout_2d(c.w + 1, c.h * 2 + 3, c.bpe, &l));
+            CHECK(l.padded_width == 2 * c.w && l.padded_height == 3 * c.h);
+            CHECK(l.size_bytes == 6 * sf::kBlock4kBytes && l.alignment == sf::kBlock4kBytes);
+            CHECK(!sf::block4k_layout_2d(0, 1, c.bpe, &l));
+            CHECK(!sf::block4k_layout_2d(1, 0, c.bpe, &l));
+            CHECK(!sf::block4k_layout_2d(UINT32_MAX, 1, c.bpe, &l));  // padded_width overflows u32
+        }
+        CHECK(!sf::block4k_dims(0, nullptr) && !sf::block4k_dims(3, nullptr) && !sf::block4k_dims(32, nullptr));
+    }
+
+    // block64k_bc_dims / block64k_bc_layout_2d
+    {
+        sf::BlockDims d{};
+        CHECK(sf::block64k_bc_dims(1, &d) && d.width == 128 && d.height == 64);
+        CHECK(sf::block64k_bc_dims(4, &d) && d.width == 128 && d.height == 64);
+        for (uint32_t bc : {2u, 3u, 5u, 6u, 7u}) {
+            CHECK(sf::block64k_bc_dims(bc, &d) && d.width == 64 && d.height == 64);
+        }
+        CHECK(!sf::block64k_bc_dims(0, &d) && !sf::block64k_bc_dims(8, &d));
+
+        sf::Block64kLayout l{};
+        // 1x1 BC7 -> 1x1 blocks -> padded to 64x64 blocks = 64 KiB
+        CHECK(sf::block64k_bc_layout_2d(1, 1, 7, &l));
+        CHECK(l.padded_width == 64 && l.padded_height == 64);
+        CHECK(l.row_pitch_bytes == 64u * 16u && l.size_bytes == sf::kBlockBytes && l.alignment == sf::kBlockBytes);
+        // 513x257 BC1 -> 129x65 blocks -> padded to 256x128 blocks = 4 x 64 KiB
+        CHECK(sf::block64k_bc_layout_2d(513, 257, 1, &l));
+        CHECK(l.padded_width == 256 && l.padded_height == 128);
+        CHECK(l.row_pitch_bytes == 256u * 8u && l.size_bytes == 4 * sf::kBlockBytes && l.alignment == sf::kBlockBytes);
+        // 4096x4096 BC7 -> 1024x1024 blocks -> exact 16x16 tiles = 16 MiB
+        CHECK(sf::block64k_bc_layout_2d(4096, 4096, 7, &l));
+        CHECK(l.padded_width == 1024 && l.padded_height == 1024);
+        CHECK(l.row_pitch_bytes == 1024u * 16u && l.size_bytes == 16ull * 1024ull * 1024ull);
+        CHECK(l.alignment == sf::kBlockBytes);
+        CHECK(!sf::block64k_bc_layout_2d(0, 64, 7, &l));
+        CHECK(!sf::block64k_bc_layout_2d(64, 64, 0, &l));
+        CHECK(!sf::block64k_bc_layout_2d(UINT32_MAX, UINT32_MAX, 7, &l));
+    }
+
+    // block4k_bc_dims / block4k_bc_layout_2d
+    {
+        sf::BlockDims d{};
+        CHECK(sf::block4k_bc_dims(1, &d) && d.width == 32 && d.height == 16);
+        CHECK(sf::block4k_bc_dims(4, &d) && d.width == 32 && d.height == 16);
+        for (uint32_t bc : {2u, 3u, 5u, 6u, 7u}) {
+            CHECK(sf::block4k_bc_dims(bc, &d) && d.width == 16 && d.height == 16);
+        }
+        CHECK(!sf::block4k_bc_dims(0, &d) && !sf::block4k_bc_dims(9, &d));
+
+        sf::Block64kLayout l{};
+        CHECK(sf::block4k_bc_layout_2d(1, 1, 7, &l));
+        CHECK(l.padded_width == 16 && l.padded_height == 16);
+        CHECK(l.row_pitch_bytes == 16u * 16u && l.size_bytes == sf::kBlock4kBytes && l.alignment == sf::kBlock4kBytes);
+        CHECK(sf::block4k_bc_layout_2d(129, 65, 1, &l));
+        CHECK(l.padded_width == 64 && l.padded_height == 32);
+        CHECK(l.row_pitch_bytes == 64u * 8u && l.size_bytes == 4 * sf::kBlock4kBytes &&
+              l.alignment == sf::kBlock4kBytes);
+        CHECK(!sf::block4k_bc_layout_2d(0, 64, 1, &l));
+        CHECK(!sf::block4k_bc_layout_2d(64, 64, 99, &l));
+        CHECK(!sf::block4k_bc_layout_2d(UINT32_MAX, UINT32_MAX, 7, &l));
+    }
+
+    // mip_extent
+    CHECK(sf::mip_extent(4096, 0) == 4096);
+    CHECK(sf::mip_extent(4096, 1) == 2048);
+    CHECK(sf::mip_extent(4096, 11) == 2);
+    CHECK(sf::mip_extent(4096, 12) == 1);
+    CHECK(sf::mip_extent(4096, 13) == 1);
+    CHECK(sf::mip_extent(4096, 31) == 1);
+    CHECK(sf::mip_extent(4096, 32) == 1);
+    CHECK(sf::mip_extent(4096, 100) == 1);
+    CHECK(sf::mip_extent(300, 1) == 150);
+    CHECK(sf::mip_extent(300, 2) == 75);
+    CHECK(sf::mip_extent(300, 3) == 37);
+    CHECK(sf::mip_extent(0, 0) == 1);
+    CHECK(sf::mip_extent(1, 0) == 1);
+    CHECK(sf::mip_extent(UINT32_MAX, 0) == UINT32_MAX);
+    CHECK(sf::mip_extent(UINT32_MAX, 31) == 1);
+    CHECK(sf::mip_extent(UINT32_MAX, 32) == 1);
+}
+
 }  // namespace
 
 int main() {
@@ -991,6 +2160,11 @@ int main() {
     test_bc7_references();
     test_bc6h();
     test_errors();
+    test_streaming_multichunk_and_history_wrap();
+    test_bc7_all_modes();
+    test_bc6h_all_modes();
+    test_hardening_and_fast_div();
+    test_surface_blocks();
     if (g_failures != 0) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failures);
         return 1;
