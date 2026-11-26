@@ -421,7 +421,9 @@ void publish_guest_address_space(const VirtualMemoryArena& arena);
 // Optional diagnostics observer of reserve / commit / decommit / release requests on any arena
 // (successful or not), e.g. the boot report's address-space log. It runs under the arena's lock:
 // it must not call back into the arena. nullptr removes it. Returns the previous observer.
-enum class ArenaEvent : uint8_t { Reserve, Commit, Decommit, Release };
+// Reset is a MEM_RESET / MEM_RESET_UNDO virtual_alloc (`protect` unused), Write a checked
+// VirtualMemoryArena::write (both only reported when they succeed or fail on a valid request).
+enum class ArenaEvent : uint8_t { Reserve, Commit, Decommit, Release, Reset, Write };
 using ArenaObserver = void (*)(const VirtualMemoryArena& arena,
                                ArenaEvent event,
                                uint64_t va,     // result for a successful reserve, else the request

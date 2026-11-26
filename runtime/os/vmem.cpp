@@ -882,6 +882,7 @@ uint64_t VirtualMemoryArena::virtual_alloc(uint64_t addr,
         const bool ok = alloc_type == kMemReset
                             ? backing::reset_pages(translate(start), end - start)
                             : backing::reset_undo_pages(translate(start), end - start);
+        notify(*this, ArenaEvent::Reset, start, end - start, PageProtect::NoAccess, ok);
         return ok ? start : 0;
     }
 
@@ -1142,9 +1143,11 @@ bool VirtualMemoryArena::write(uint64_t addr, const void* src, size_t len) {
     }
     std::lock_guard<std::mutex> lock(mutex_);
     if (!pages_allow_locked(addr, len, true)) {
+        notify(*this, ArenaEvent::Write, addr, len, PageProtect::NoAccess, false);
         return false;
     }
     std::memcpy(translate(addr), src, len);
+    notify(*this, ArenaEvent::Write, addr, len, PageProtect::NoAccess, true);
     return true;
 }
 
