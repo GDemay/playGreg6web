@@ -7,10 +7,29 @@
 
 const DEFAULT_DB_NAME = 'playgta6-userdata';
 const DEFAULT_STORE_NAME = 'files';
+const DEFAULT_OPFS_DIR_NAME = 'playgta6-userdata';
 const DEFAULT_RESTORE_TIMEOUT_MS = 8000;
 const USERDATA_PREFIX = '/userdata/';
 const ARCHIVE_FORMAT = 'playgta6-userdata-archive-v1';
 const ARCHIVE_VERSION = 1;
+const OPFS_RECORD_MAGIC = 'PGUD';
+const OPFS_RECORD_VERSION = 1;
+const OPFS_RECORD_HEADER_SIZE = 24;
+const OPFS_FLAG_STAGING = 0x01;
+const OPFS_FLAG_QUARANTINED = 0x02;
+const OPFS_CORRUPT_PREFIX = '/userdata/__corrupt__/';
+const STORAGE_MODES = Object.freeze({
+  AUTO: 'auto',
+  OPFS: 'opfs',
+  INDEXEDDB: 'indexeddb',
+  MEMORY: 'memory',
+});
+const BACKEND_KINDS = Object.freeze({
+  OPFS: 'opfs',
+  INDEXEDDB: 'indexeddb',
+  MEMORY: 'memory',
+  CUSTOM: 'custom',
+});
 const DEFAULT_MAX_FILE_BYTES = 16 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES = 256 * 1024 * 1024;
 const DEFAULT_MAX_FILE_COUNT = 4096;
@@ -475,51 +494,1032 @@ function cloneMetadataEntry(meta) {
   };
 }
 
+function fnv1a128Hex(str) {
+  const bytes = new TextEncoder().encode(str);
+  let h1 = 0x811c9dc5;
+  let h2 = 0x811c9dc5 ^ 0x9e3779b9;
+  let h3 = 0x811c9dc5 ^ 0x85ebca6b;
+  let h4 = 0x811c9dc5 ^ 0xc2b2ae35;
+  for (let i = 0; i < bytes.length; i += 1) {
+    const b = bytes[i];
+    h1 = Math.imul(h1 ^ b, 0x01000193) >>> 0;
+    h2 = Math.imul(h2 ^ ((b + i) & 0xff), 0x01000193) >>> 0;
+    h3 = Math.imul(h3 ^ (b ^ 0xa5), 0x01000193) >>> 0;
+    h4 = Math.imul(h4 ^ ((b + i * 31) & 0xff), 0x01000193) >>> 0;
+  }
+  return (
+    h1.toString(16).padStart(8, '0') +
+    h2.toString(16).padStart(8, '0') +
+    h3.toString(16).padStart(8, '0') +
+    h4.toString(16).padStart(8, '0')
+  );
+}
+
+function writeU16LE(buf, offset, value) {
+  buf[offset] = value & 0xff;
+  buf[offset + 1] = (value >>> 8) & 0xff;
+}
+
+function readU16LE(buf, offset) {
+  return (buf[offset] | (buf[offset + 1] << 8)) >>> 0;
+}
+
+function writeU32LE(buf, offset, value) {
+  buf[offset] = value & 0xff;
+  buf[offset + 1] = (value >>> 8) & 0xff;
+  buf[offset + 2] = (value >>> 16) & 0xff;
+  buf[offset + 3] = (value >>> 24) & 0xff;
+}
+
+function readU32LE(buf, offset) {
+  return (
+    (buf[offset] |
+      (buf[offset + 1] << 8) |
+      (buf[offset + 2] << 16) |
+      (buf[offset + 3] << 24)) >>>
+    0
+  );
+}
+
+function computeHeaderChecksum(headerPrefix20, metaBytes) {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < 20; i += 1) {
+    hash ^= headerPrefix20[i];
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  for (let i = 0; i < metaBytes.byteLength; i += 1) {
+    hash ^= metaBytes[i];
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash >>> 0;
+}
+
+function isNotFoundError(err) {
+  if (!err || typeof err !== 'object') {
+    return false;
+  }
+  return Boolean(
+    err.name === 'NotFoundError' ||
+      err.code === 'ENOENT' ||
+      err.code === 8 ||
+      (typeof err.message === 'string' && /not\s*found|enoent/i.test(err.message)),
+  );
+}
+
+function sanitizeFallbackReason(err, fallback = 'opfs_init_failed') {
+  if (typeof err === 'string' && err.length > 0) {
+    return sanitizeReasonToken(err);
+  }
+  if (err && typeof err === 'object') {
+    if (isQuotaExceededError(err)) {
+      return 'QuotaExceededError';
+    }
+    if (typeof err.name === 'string' && err.name.length > 0 && err.name !== 'Error') {
+      return sanitizeReasonToken(err.name);
+    }
+    if (typeof err.code === 'string' && err.code.length > 0) {
+      return sanitizeReasonToken(err.code);
+    }
+  }
+  return fallback;
+}
+
+function validateOpfsDirName(dirName) {
+  if (dirName === undefined || dirName === null || dirName === '') {
+    return DEFAULT_OPFS_DIR_NAME;
+  }
+  if (typeof dirName !== 'string') {
+    throw new TypeError('opfsDirName must be a string');
+  }
+  if (
+    dirName.includes('/') ||
+    dirName.includes('\\') ||
+    dirName.includes('\0') ||
+    dirName === '.' ||
+    dirName === '..'
+  ) {
+    throw new Error(`Invalid OPFS directory name: ${dirName}`);
+  }
+  return dirName;
+}
+
+function validateRecordKeyForOpfs(recordKey) {
+  if (typeof recordKey !== 'string' || recordKey.length === 0) {
+    throw new Error('OPFS userdata record key must be a non-empty string');
+  }
+  if (recordKey.includes('\\') || recordKey.includes('\0')) {
+    throw new Error(`Invalid OPFS userdata key (forbidden character): ${recordKey}`);
+  }
+  if (isQuarantinePath(recordKey)) {
+    const rest = recordKey.slice(QUARANTINE_PREFIX.length);
+    if (!rest || rest.endsWith('/')) {
+      throw new Error(`Invalid OPFS quarantine key: ${recordKey}`);
+    }
+    const segs = rest.split('/');
+    for (let i = 0; i < segs.length; i += 1) {
+      if (!segs[i] || segs[i] === '.' || segs[i] === '..') {
+        throw new Error(`Invalid OPFS quarantine key segment: ${recordKey}`);
+      }
+    }
+    return { kind: 'quarantine', key: recordKey };
+  }
+  if (isTempPath(recordKey)) {
+    const basePath = recordKey.slice(0, -TEMP_SUFFIX.length);
+    validateUserdataPath(basePath);
+    return { kind: 'temp', key: recordKey };
+  }
+  validateUserdataPath(recordKey);
+  return { kind: 'live', key: recordKey };
+}
+
+function encodeOpfsKeyFilename(recordKey) {
+  const validated = validateRecordKeyForOpfs(recordKey);
+  const digest = fnv1a128Hex(validated.key);
+  if (validated.kind === 'quarantine') {
+    return `q_${digest}.pgud`;
+  }
+  if (validated.kind === 'temp') {
+    return `t_${digest}.pgud.tmp`;
+  }
+  return `u_${digest}.pgud`;
+}
+
+function encodeOpfsRecord(record) {
+  if (!record || typeof record !== 'object') {
+    throw new TypeError('OPFS record must be an object');
+  }
+  const validated = validateRecordKeyForOpfs(record.path);
+  const data = toUint8Array(record.data);
+  const payloadLen = data.byteLength;
+  const payloadChecksum =
+    typeof record.checksum === 'number' && Number.isFinite(record.checksum)
+      ? record.checksum >>> 0
+      : computeChecksum(data);
+  const mtime = Number.isFinite(record.mtime) && record.mtime >= 0 ? record.mtime : 0;
+  const metaSize = Number.isInteger(record.size) && record.size >= 0 ? record.size : payloadLen;
+
+  let flags = 0;
+  if (record.staging || validated.kind === 'temp') {
+    flags |= OPFS_FLAG_STAGING;
+  }
+  if (record.quarantined || validated.kind === 'quarantine') {
+    flags |= OPFS_FLAG_QUARANTINED;
+  }
+
+  const meta = {
+    path: validated.key,
+    size: metaSize,
+    mtime,
+    checksum: payloadChecksum,
+  };
+  if (flags & OPFS_FLAG_STAGING) {
+    meta.staging = true;
+    if (typeof record.targetPath === 'string' && record.targetPath.length > 0) {
+      meta.targetPath = record.targetPath;
+    }
+  }
+  if (flags & OPFS_FLAG_QUARANTINED) {
+    meta.quarantined = true;
+    if (typeof record.originalPath === 'string' && record.originalPath.length > 0) {
+      meta.originalPath = record.originalPath;
+    }
+    if (typeof record.reason === 'string' && record.reason.length > 0) {
+      meta.reason = record.reason;
+    }
+    if (Number.isFinite(record.quarantinedAt) && record.quarantinedAt >= 0) {
+      meta.quarantinedAt = record.quarantinedAt;
+    }
+  }
+
+  const metaBytes = new TextEncoder().encode(JSON.stringify(meta));
+  const totalBytes = OPFS_RECORD_HEADER_SIZE + metaBytes.byteLength + payloadLen;
+  const out = new Uint8Array(totalBytes);
+  out[0] = 0x50; // 'P'
+  out[1] = 0x47; // 'G'
+  out[2] = 0x55; // 'U'
+  out[3] = 0x44; // 'D'
+  writeU16LE(out, 4, OPFS_RECORD_VERSION);
+  writeU16LE(out, 6, flags);
+  writeU32LE(out, 8, metaBytes.byteLength);
+  writeU32LE(out, 12, payloadLen);
+  writeU32LE(out, 16, payloadChecksum);
+  const headerChecksum = computeHeaderChecksum(out, metaBytes);
+  writeU32LE(out, 20, headerChecksum);
+
+  out.set(metaBytes, OPFS_RECORD_HEADER_SIZE);
+  out.set(data, OPFS_RECORD_HEADER_SIZE + metaBytes.byteLength);
+  return out;
+}
+
+function decodeOpfsRecord(bytes) {
+  let u8;
+  try {
+    u8 = toUint8Array(bytes);
+  } catch {
+    return { ok: false, reason: 'invalid_buffer', rawBytes: new Uint8Array(0) };
+  }
+
+  if (u8.byteLength < OPFS_RECORD_HEADER_SIZE) {
+    return { ok: false, reason: 'truncated_header', rawBytes: u8 };
+  }
+
+  if (u8[0] !== 0x50 || u8[1] !== 0x47 || u8[2] !== 0x55 || u8[3] !== 0x44) {
+    return { ok: false, reason: 'invalid_magic', rawBytes: u8 };
+  }
+
+  const version = readU16LE(u8, 4);
+  if (version !== OPFS_RECORD_VERSION) {
+    return { ok: false, reason: 'unsupported_version', rawBytes: u8 };
+  }
+
+  const flags = readU16LE(u8, 6);
+  const metaLen = readU32LE(u8, 8);
+  const payloadLen = readU32LE(u8, 12);
+  const headerPayloadChecksum = readU32LE(u8, 16);
+  const storedHeaderChecksum = readU32LE(u8, 20);
+
+  const payloadStart = OPFS_RECORD_HEADER_SIZE + metaLen;
+  if (metaLen === 0 || payloadStart > u8.byteLength) {
+    return { ok: false, reason: 'truncated_metadata', rawBytes: u8 };
+  }
+
+  const metaBytes = u8.subarray(OPFS_RECORD_HEADER_SIZE, payloadStart);
+  const actualHeaderChecksum = computeHeaderChecksum(u8, metaBytes);
+  if (actualHeaderChecksum !== storedHeaderChecksum) {
+    return { ok: false, reason: 'header_checksum_mismatch', rawBytes: u8 };
+  }
+
+  let meta;
+  try {
+    meta = JSON.parse(new TextDecoder().decode(metaBytes));
+  } catch {
+    return { ok: false, reason: 'invalid_metadata_json', rawBytes: u8 };
+  }
+
+  if (!meta || typeof meta !== 'object' || typeof meta.path !== 'string' || meta.path.length === 0) {
+    return { ok: false, reason: 'invalid_metadata', rawBytes: u8 };
+  }
+
+  const expectedTotal = payloadStart + payloadLen;
+  const availablePayload = u8.slice(payloadStart, Math.min(u8.byteLength, expectedTotal));
+  const record = {
+    path: meta.path,
+    data: availablePayload,
+    mtime: typeof meta.mtime === 'number' && Number.isFinite(meta.mtime) ? meta.mtime : 0,
+    size: Number.isInteger(meta.size) && meta.size >= 0 ? meta.size : payloadLen,
+    checksum:
+      typeof meta.checksum === 'number' && Number.isFinite(meta.checksum)
+        ? meta.checksum >>> 0
+        : headerPayloadChecksum,
+  };
+  if (flags & OPFS_FLAG_STAGING || meta.staging) {
+    record.staging = true;
+    if (typeof meta.targetPath === 'string') {
+      record.targetPath = meta.targetPath;
+    }
+  }
+  if (flags & OPFS_FLAG_QUARANTINED || meta.quarantined) {
+    record.quarantined = true;
+    if (typeof meta.originalPath === 'string') {
+      record.originalPath = meta.originalPath;
+    }
+    if (typeof meta.reason === 'string') {
+      record.reason = meta.reason;
+    }
+    if (Number.isFinite(meta.quarantinedAt)) {
+      record.quarantinedAt = meta.quarantinedAt;
+    }
+  }
+
+  if (u8.byteLength < expectedTotal) {
+    record.size = payloadLen;
+    return {
+      ok: false,
+      reason: 'truncated_payload',
+      partialPath: meta.path,
+      record,
+      rawBytes: u8,
+    };
+  }
+  if (u8.byteLength > expectedTotal) {
+    return {
+      ok: false,
+      reason: 'trailing_bytes',
+      partialPath: meta.path,
+      record: { ...record, size: -1 },
+      rawBytes: u8,
+    };
+  }
+
+  const actualPayloadChecksum = computeChecksum(availablePayload);
+  if (actualPayloadChecksum !== headerPayloadChecksum || actualPayloadChecksum !== record.checksum) {
+    return {
+      ok: false,
+      reason: 'checksum_mismatch',
+      partialPath: meta.path,
+      record,
+      rawBytes: u8,
+    };
+  }
+
+  return { ok: true, record };
+}
+
+function hasGlobalOpfsApi() {
+  return Boolean(
+    typeof navigator !== 'undefined' &&
+      navigator &&
+      navigator.storage &&
+      typeof navigator.storage.getDirectory === 'function',
+  );
+}
+
+async function resolveOpfsRootHandle(options = {}) {
+  if (options.opfsRoot) {
+    const resolved = await options.opfsRoot;
+    if (!resolved || typeof resolved.getDirectoryHandle !== 'function') {
+      throw new Error('Provided opfsRoot does not implement getDirectoryHandle()');
+    }
+    return resolved;
+  }
+  if (typeof options.getOpfsRoot === 'function') {
+    const resolved = await options.getOpfsRoot();
+    if (!resolved || typeof resolved.getDirectoryHandle !== 'function') {
+      throw new Error('getOpfsRoot() did not return a FileSystemDirectoryHandle');
+    }
+    return resolved;
+  }
+  if (hasGlobalOpfsApi()) {
+    const resolved = await navigator.storage.getDirectory();
+    if (!resolved || typeof resolved.getDirectoryHandle !== 'function') {
+      throw new Error('navigator.storage.getDirectory() returned an invalid handle');
+    }
+    return resolved;
+  }
+  const err = new Error('OPFS is unavailable in this environment');
+  err.code = 'OPFS_UNAVAILABLE';
+  throw err;
+}
+
+async function probeOpfsSupport(options = {}) {
+  const opts = options && typeof options === 'object' ? options : {};
+  if (!opts.opfsRoot && typeof opts.getOpfsRoot !== 'function' && !hasGlobalOpfsApi()) {
+    return {
+      supported: false,
+      syncAccessHandle: false,
+      writable: false,
+      reason: 'opfs_unavailable',
+    };
+  }
+
+  try {
+    const root = await resolveOpfsRootHandle(opts);
+    const dirName = validateOpfsDirName(opts.opfsDirName || opts.dirName);
+    if (opts.probeDirectory !== false) {
+      await root.getDirectoryHandle(dirName, { create: true });
+    }
+    let syncAccessHandle = Boolean(
+      typeof FileSystemFileHandle !== 'undefined' &&
+        FileSystemFileHandle &&
+        FileSystemFileHandle.prototype &&
+        typeof FileSystemFileHandle.prototype.createSyncAccessHandle === 'function',
+    );
+    let writable = Boolean(
+      typeof FileSystemFileHandle !== 'undefined' &&
+        FileSystemFileHandle &&
+        FileSystemFileHandle.prototype &&
+        typeof FileSystemFileHandle.prototype.createWritable === 'function',
+    );
+    if (opts.probeCapabilities && root && typeof root.getDirectoryHandle === 'function') {
+      try {
+        const dir = await root.getDirectoryHandle(dirName, { create: true });
+        const probeName = '.pgud_probe';
+        const fh = await dir.getFileHandle(probeName, { create: true });
+        if (typeof fh.createSyncAccessHandle === 'function') {
+          syncAccessHandle = true;
+        }
+        if (typeof fh.createWritable === 'function') {
+          writable = true;
+        }
+        if (typeof dir.removeEntry === 'function') {
+          await dir.removeEntry(probeName);
+        }
+      } catch {
+        // Capability probing is best-effort.
+      }
+    }
+    return {
+      supported: true,
+      syncAccessHandle,
+      writable,
+      reason: null,
+    };
+  } catch (err) {
+    return {
+      supported: false,
+      syncAccessHandle: false,
+      writable: false,
+      reason: sanitizeFallbackReason(err, 'opfs_probe_failed'),
+    };
+  }
+}
+
+class InMemoryUserdataBackend {
+  constructor(initialRecords = []) {
+    this.kind = BACKEND_KINDS.MEMORY;
+    this._map = new Map();
+    this._closed = false;
+    if (Array.isArray(initialRecords)) {
+      for (let i = 0; i < initialRecords.length; i += 1) {
+        const rec = initialRecords[i];
+        if (rec && typeof rec.path === 'string') {
+          this._map.set(rec.path, this._cloneRecord(rec));
+        }
+      }
+    }
+  }
+
+  get size() {
+    return this._map.size;
+  }
+
+  _cloneRecord(record) {
+    const out = { ...record };
+    if (record.data instanceof Uint8Array) {
+      out.data = record.data.slice();
+    } else if (ArrayBuffer.isView(record.data)) {
+      out.data = new Uint8Array(
+        record.data.buffer,
+        record.data.byteOffset,
+        record.data.byteLength,
+      ).slice();
+    } else if (record.data instanceof ArrayBuffer) {
+      out.data = new Uint8Array(record.data.slice(0));
+    }
+    return out;
+  }
+
+  async put(record) {
+    this._map.set(record.path, this._cloneRecord(record));
+  }
+
+  async get(key) {
+    const rec = this._map.get(key);
+    return rec ? this._cloneRecord(rec) : null;
+  }
+
+  async delete(key) {
+    this._map.delete(key);
+  }
+
+  async getAll() {
+    const out = [];
+    for (const rec of this._map.values()) {
+      out.push(this._cloneRecord(rec));
+    }
+    return out;
+  }
+
+  clear() {
+    this._map.clear();
+  }
+
+  close() {
+    this._closed = true;
+  }
+}
+
+function createMemoryUserdataBackend(initialRecords = []) {
+  return new InMemoryUserdataBackend(initialRecords);
+}
+
+class OpfsUserdataBackend {
+  constructor(options = {}) {
+    this.kind = BACKEND_KINDS.OPFS;
+    this.dirName = validateOpfsDirName(options.opfsDirName || options.dirName);
+    this._opfsRoot = options.opfsRoot || null;
+    this._getOpfsRoot = typeof options.getOpfsRoot === 'function' ? options.getOpfsRoot : null;
+    this._useSyncAccessHandle = options.useSyncAccessHandle !== false;
+    this._preferSyncReads = options.preferSyncReads !== false;
+    this._dirHandle = null;
+    this._dirPromise = null;
+    this._closed = false;
+    this._corruptFileMap = new Map();
+    this._ioMode = 'auto';
+    this._stats = {
+      syncWrites: 0,
+      writableWrites: 0,
+      syncReads: 0,
+      fileReads: 0,
+      corruptFilesDetected: 0,
+    };
+  }
+
+  isInitialized() {
+    return this._dirHandle !== null;
+  }
+
+  getIoMode() {
+    return this._ioMode;
+  }
+
+  getStats() {
+    return {
+      syncWrites: this._stats.syncWrites,
+      writableWrites: this._stats.writableWrites,
+      syncReads: this._stats.syncReads,
+      fileReads: this._stats.fileReads,
+      corruptFilesDetected: this._stats.corruptFilesDetected,
+    };
+  }
+
+  async ensureReady() {
+    await this._getDirHandle();
+    return true;
+  }
+
+  async _getDirHandle() {
+    if (this._dirHandle) {
+      return this._dirHandle;
+    }
+    if (!this._dirPromise) {
+      this._dirPromise = (async () => {
+        const root = await resolveOpfsRootHandle({
+          opfsRoot: this._opfsRoot,
+          getOpfsRoot: this._getOpfsRoot,
+        });
+        const dir = await root.getDirectoryHandle(this.dirName, { create: true });
+        this._dirHandle = dir;
+        return dir;
+      })().catch((err) => {
+        this._dirPromise = null;
+        throw err;
+      });
+    }
+    return this._dirPromise;
+  }
+
+  async _writeFileHandle(fileHandle, bytes) {
+    if (this._useSyncAccessHandle && typeof fileHandle.createSyncAccessHandle === 'function') {
+      let syncHandle = null;
+      let syncAcquired = false;
+      try {
+        syncHandle = await fileHandle.createSyncAccessHandle();
+        syncAcquired = true;
+        if (typeof syncHandle.truncate === 'function') {
+          await syncHandle.truncate(0);
+        }
+        if (bytes.byteLength > 0) {
+          const written = await syncHandle.write(bytes, { at: 0 });
+          if (typeof written === 'number' && written !== bytes.byteLength) {
+            throw new Error(`Short OPFS sync write: wrote ${written} of ${bytes.byteLength} bytes`);
+          }
+        }
+        if (typeof syncHandle.flush === 'function') {
+          await syncHandle.flush();
+        }
+        this._stats.syncWrites += 1;
+        this._ioMode = 'sync-access-handle';
+        return;
+      } catch (err) {
+        if (isQuotaExceededError(err)) {
+          throw err;
+        }
+        if (syncAcquired || typeof fileHandle.createWritable !== 'function') {
+          throw err;
+        }
+        // Fallback to createWritable() if createSyncAccessHandle() is unsupported in this context.
+      } finally {
+        if (syncHandle && typeof syncHandle.close === 'function') {
+          try {
+            await syncHandle.close();
+          } catch {
+            // Ignore close errors during cleanup.
+          }
+        }
+      }
+    }
+
+    if (typeof fileHandle.createWritable === 'function') {
+      const writable = await fileHandle.createWritable();
+      try {
+        await writable.write(bytes);
+        await writable.close();
+        this._stats.writableWrites += 1;
+        this._ioMode = 'writable';
+        return;
+      } catch (err) {
+        if (typeof writable.abort === 'function') {
+          try {
+            await writable.abort();
+          } catch {
+            // Ignore abort cleanup errors.
+          }
+        }
+        throw err;
+      }
+    }
+
+    throw new Error('OPFS FileSystemFileHandle supports neither createSyncAccessHandle nor createWritable');
+  }
+
+  async _readFileHandle(fileHandle) {
+    if (
+      this._useSyncAccessHandle &&
+      this._preferSyncReads &&
+      typeof fileHandle.createSyncAccessHandle === 'function'
+    ) {
+      let syncHandle = null;
+      let syncAcquired = false;
+      try {
+        syncHandle = await fileHandle.createSyncAccessHandle();
+        syncAcquired = true;
+        const size = await syncHandle.getSize();
+        if (!Number.isFinite(size) || size <= 0) {
+          this._stats.syncReads += 1;
+          this._ioMode = 'sync-access-handle';
+          return new Uint8Array(0);
+        }
+        const buf = new Uint8Array(size);
+        let offset = 0;
+        while (offset < size) {
+          const view = offset === 0 ? buf : buf.subarray(offset);
+          const n = await syncHandle.read(view, { at: offset });
+          if (!Number.isFinite(n) || n <= 0) {
+            break;
+          }
+          offset += n;
+        }
+        this._stats.syncReads += 1;
+        this._ioMode = 'sync-access-handle';
+        return offset === size ? buf : buf.subarray(0, offset);
+      } catch (err) {
+        if (syncAcquired || typeof fileHandle.getFile !== 'function') {
+          throw err;
+        }
+        // Fallback to getFile().arrayBuffer() if sync access handle cannot be opened.
+      } finally {
+        if (syncHandle && typeof syncHandle.close === 'function') {
+          try {
+            await syncHandle.close();
+          } catch {
+            // Ignore close errors during cleanup.
+          }
+        }
+      }
+    }
+
+    if (typeof fileHandle.getFile === 'function') {
+      const file = await fileHandle.getFile();
+      const ab = await file.arrayBuffer();
+      this._stats.fileReads += 1;
+      if (this._ioMode === 'auto') {
+        this._ioMode = 'writable';
+      }
+      return new Uint8Array(ab);
+    }
+
+    throw new Error('OPFS FileSystemFileHandle supports neither createSyncAccessHandle nor getFile');
+  }
+
+  async _listDirectoryFiles(dir) {
+    const out = [];
+    if (typeof dir.entries === 'function') {
+      for await (const pair of dir.entries()) {
+        if (!Array.isArray(pair) || pair.length < 2) continue;
+        const [name, handle] = pair;
+        if (!handle || (handle.kind && handle.kind !== 'file')) continue;
+        out.push({ name, handle });
+      }
+      return out;
+    }
+    if (typeof dir.values === 'function') {
+      for await (const handle of dir.values()) {
+        if (!handle || (handle.kind && handle.kind !== 'file') || typeof handle.name !== 'string') {
+          continue;
+        }
+        out.push({ name: handle.name, handle });
+      }
+      return out;
+    }
+    if (typeof dir.keys === 'function') {
+      for await (const name of dir.keys()) {
+        if (typeof name !== 'string') continue;
+        try {
+          const handle = await dir.getFileHandle(name);
+          out.push({ name, handle });
+        } catch {
+          // Skip subdirectories or concurrently removed entries.
+        }
+      }
+      return out;
+    }
+    return out;
+  }
+
+  async put(record) {
+    const fileName = encodeOpfsKeyFilename(record.path);
+    const encoded = encodeOpfsRecord(record);
+    const dir = await this._getDirHandle();
+    const fileHandle = await dir.getFileHandle(fileName, { create: true });
+    await this._writeFileHandle(fileHandle, encoded);
+    this._corruptFileMap.delete(record.path);
+  }
+
+  async get(key) {
+    const fileName = this._corruptFileMap.get(key) || encodeOpfsKeyFilename(key);
+    const dir = await this._getDirHandle();
+    let fileHandle;
+    try {
+      fileHandle = await dir.getFileHandle(fileName);
+    } catch (err) {
+      if (isNotFoundError(err)) {
+        return null;
+      }
+      throw err;
+    }
+
+    const rawBytes = await this._readFileHandle(fileHandle);
+    const decoded = decodeOpfsRecord(rawBytes);
+    if (decoded.ok) {
+      if (decoded.record.path !== key) {
+        this._stats.corruptFilesDetected += 1;
+        return {
+          path: key,
+          data: decoded.record.data,
+          size: -1,
+          checksum: 0,
+          mtime: decoded.record.mtime,
+        };
+      }
+      return decoded.record;
+    }
+
+    this._stats.corruptFilesDetected += 1;
+    if (decoded.record && decoded.record.path === key) {
+      return decoded.record;
+    }
+    return {
+      path: key,
+      data: decoded.rawBytes || rawBytes,
+      size: -1,
+      checksum: 0,
+      mtime: 0,
+    };
+  }
+
+  async delete(key) {
+    const mapped = this._corruptFileMap.get(key);
+    const fileName = mapped || encodeOpfsKeyFilename(key);
+    const dir = await this._getDirHandle();
+    try {
+      await dir.removeEntry(fileName);
+    } catch (err) {
+      if (!isNotFoundError(err)) {
+        throw err;
+      }
+    } finally {
+      if (mapped) {
+        this._corruptFileMap.delete(key);
+      }
+    }
+  }
+
+  async getAll() {
+    const dir = await this._getDirHandle();
+    const files = await this._listDirectoryFiles(dir);
+    const records = [];
+
+    for (let i = 0; i < files.length; i += 1) {
+      const { name, handle } = files[i];
+      if (!name || (!name.endsWith('.pgud') && !name.endsWith('.pgud.tmp'))) {
+        continue;
+      }
+      let rawBytes;
+      try {
+        rawBytes = await this._readFileHandle(handle);
+      } catch (err) {
+        if (isNotFoundError(err)) {
+          continue;
+        }
+        this._stats.corruptFilesDetected += 1;
+        rawBytes = new Uint8Array(0);
+      }
+
+      const decoded = decodeOpfsRecord(rawBytes);
+      if (decoded.ok) {
+        records.push(decoded.record);
+        continue;
+      }
+
+      this._stats.corruptFilesDetected += 1;
+      const isTmpFile = name.startsWith('t_') || name.endsWith(TEMP_SUFFIX);
+      const isQuarFile = name.startsWith('q_');
+
+      if (isQuarFile) {
+        // Remove unparseable quarantine artifact safely so it never crashes boot.
+        try {
+          await dir.removeEntry(name);
+        } catch {
+          // Best-effort removal.
+        }
+        continue;
+      }
+
+      if (isTmpFile) {
+        let tmpPath = null;
+        if (decoded.partialPath && isTempPath(decoded.partialPath)) {
+          try {
+            validateRecordKeyForOpfs(decoded.partialPath);
+            tmpPath = decoded.partialPath;
+          } catch {
+            tmpPath = null;
+          }
+        }
+        if (!tmpPath) {
+          const safeToken = name.replace(/[^a-zA-Z0-9._-]/g, '_') || 'orphan';
+          tmpPath = `${OPFS_CORRUPT_PREFIX}${safeToken}${safeToken.endsWith(TEMP_SUFFIX) ? '' : TEMP_SUFFIX}`;
+        }
+        this._corruptFileMap.set(tmpPath, name);
+        records.push({
+          path: tmpPath,
+          data: decoded.rawBytes || rawBytes,
+          mtime: 0,
+          staging: true,
+        });
+        continue;
+      }
+
+      let corruptPath = null;
+      if (decoded.partialPath) {
+        try {
+          corruptPath = validateUserdataPath(decoded.partialPath);
+        } catch {
+          corruptPath = null;
+        }
+      }
+      if (corruptPath && decoded.record) {
+        this._corruptFileMap.set(corruptPath, name);
+        records.push(decoded.record);
+      } else {
+        const safeToken = name.replace(/[^a-zA-Z0-9._-]/g, '_') || 'corrupt';
+        const synthPath = `${OPFS_CORRUPT_PREFIX}${safeToken}`;
+        this._corruptFileMap.set(synthPath, name);
+        records.push({
+          path: synthPath,
+          data: decoded.rawBytes || rawBytes,
+          size: -1,
+          checksum: 0,
+          mtime: 0,
+        });
+      }
+    }
+
+    return records;
+  }
+
+  close() {
+    this._closed = true;
+    this._dirHandle = null;
+    this._dirPromise = null;
+    this._corruptFileMap.clear();
+  }
+}
+
+function createOpfsUserdataBackend(options = {}) {
+  return new OpfsUserdataBackend(options);
+}
+
 class UserdataStore {
   constructor(options = {}) {
-    this.dbName = typeof options.dbName === 'string' && options.dbName ? options.dbName : DEFAULT_DB_NAME;
+    const opts = options && typeof options === 'object' ? options : {};
+    this.dbName = typeof opts.dbName === 'string' && opts.dbName ? opts.dbName : DEFAULT_DB_NAME;
     this.storeName =
-      typeof options.storeName === 'string' && options.storeName ? options.storeName : DEFAULT_STORE_NAME;
+      typeof opts.storeName === 'string' && opts.storeName ? opts.storeName : DEFAULT_STORE_NAME;
     this.dbVersion =
-      Number.isInteger(options.dbVersion) && options.dbVersion > 0 ? options.dbVersion : 1;
+      Number.isInteger(opts.dbVersion) && opts.dbVersion > 0 ? opts.dbVersion : 1;
     this.indexedDB =
-      options.indexedDB !== undefined
-        ? options.indexedDB
+      opts.indexedDB !== undefined
+        ? opts.indexedDB
         : typeof globalThis !== 'undefined' && globalThis.indexedDB
           ? globalThis.indexedDB
           : null;
-    this.backend = options.backend || null;
 
-    this.maxFileBytes = parseQuotaLimit(options.maxFileBytes, DEFAULT_MAX_FILE_BYTES, 'maxFileBytes');
-    this.maxTotalBytes = parseQuotaLimit(options.maxTotalBytes, DEFAULT_MAX_TOTAL_BYTES, 'maxTotalBytes');
-    this.maxFileCount = parseQuotaLimit(options.maxFileCount, DEFAULT_MAX_FILE_COUNT, 'maxFileCount');
+    const rawStorageMode = opts.storageMode;
+    if (
+      rawStorageMode !== undefined &&
+      rawStorageMode !== STORAGE_MODES.AUTO &&
+      rawStorageMode !== STORAGE_MODES.OPFS &&
+      rawStorageMode !== STORAGE_MODES.INDEXEDDB &&
+      rawStorageMode !== STORAGE_MODES.MEMORY
+    ) {
+      throw new RangeError(
+        `Invalid storageMode "${String(rawStorageMode)}": expected 'auto', 'opfs', 'indexeddb', or 'memory'`,
+      );
+    }
+
+    this.opfsDirName = validateOpfsDirName(opts.opfsDirName);
+    this._hasExplicitIdbOption = Object.prototype.hasOwnProperty.call(opts, 'indexedDB');
+    this._hasExplicitOpfsOption = Boolean(opts.opfsRoot || typeof opts.getOpfsRoot === 'function');
+    this.preferOpfs =
+      opts.preferOpfs !== undefined
+        ? Boolean(opts.preferOpfs)
+        : Boolean(
+            this._hasExplicitOpfsOption ||
+              rawStorageMode === STORAGE_MODES.OPFS ||
+              rawStorageMode === STORAGE_MODES.AUTO,
+          );
+
+    this.backend = opts.backend || null;
+    this._opfsBackend = null;
+    this._memoryBackend = null;
+    this._activeBackendKind = BACKEND_KINDS.INDEXEDDB;
+    this._fallbackReason = null;
+    this._initialFallbackCount = 0;
+
+    if (opts.backend) {
+      this.storageMode = rawStorageMode || 'custom';
+      this._activeBackendKind = BACKEND_KINDS.CUSTOM;
+      this.backend = opts.backend;
+    } else if (rawStorageMode === STORAGE_MODES.MEMORY) {
+      this.storageMode = STORAGE_MODES.MEMORY;
+      this._memoryBackend = new InMemoryUserdataBackend();
+      this.backend = this._memoryBackend;
+      this._activeBackendKind = BACKEND_KINDS.MEMORY;
+    } else if (rawStorageMode === STORAGE_MODES.INDEXEDDB) {
+      this.storageMode = STORAGE_MODES.INDEXEDDB;
+      this.backend = null;
+      this._activeBackendKind = BACKEND_KINDS.INDEXEDDB;
+    } else if (
+      rawStorageMode === undefined &&
+      this._hasExplicitIdbOption &&
+      !this._hasExplicitOpfsOption &&
+      opts.preferOpfs !== true
+    ) {
+      // Preserve legacy behavior when caller passes `{ indexedDB: mockIdb }` or `{ indexedDB: null }`.
+      this.storageMode = STORAGE_MODES.INDEXEDDB;
+      this.backend = null;
+      this._activeBackendKind = BACKEND_KINDS.INDEXEDDB;
+    } else {
+      this.storageMode = rawStorageMode || STORAGE_MODES.AUTO;
+      const hasOpfsSource = this._hasExplicitOpfsOption || hasGlobalOpfsApi();
+      const wantsOpfs =
+        this.storageMode === STORAGE_MODES.OPFS ||
+        this._hasExplicitOpfsOption ||
+        (this.preferOpfs && hasGlobalOpfsApi());
+
+      if (wantsOpfs) {
+        if (hasOpfsSource) {
+          this._opfsBackend = new OpfsUserdataBackend({
+            opfsRoot: opts.opfsRoot,
+            getOpfsRoot: opts.getOpfsRoot,
+            opfsDirName: this.opfsDirName,
+            useSyncAccessHandle: opts.useSyncAccessHandle,
+            preferSyncReads: opts.preferSyncReads,
+          });
+          this.backend = this._opfsBackend;
+          this._activeBackendKind = BACKEND_KINDS.OPFS;
+        } else {
+          this._activateFallbackSync('opfs_unavailable');
+        }
+      } else if (this.indexedDB && typeof this.indexedDB.open === 'function') {
+        this.backend = null;
+        this._activeBackendKind = BACKEND_KINDS.INDEXEDDB;
+      } else {
+        this._activateFallbackSync('opfs_and_indexeddb_unavailable');
+      }
+    }
+
+    this.maxFileBytes = parseQuotaLimit(opts.maxFileBytes, DEFAULT_MAX_FILE_BYTES, 'maxFileBytes');
+    this.maxTotalBytes = parseQuotaLimit(opts.maxTotalBytes, DEFAULT_MAX_TOTAL_BYTES, 'maxTotalBytes');
+    this.maxFileCount = parseQuotaLimit(opts.maxFileCount, DEFAULT_MAX_FILE_COUNT, 'maxFileCount');
     this.maxQuarantineFiles = parseQuotaLimit(
-      options.maxQuarantineFiles,
+      opts.maxQuarantineFiles,
       DEFAULT_MAX_QUARANTINE_FILES,
       'maxQuarantineFiles',
     );
     this.maxQuarantineBytes = parseQuotaLimit(
-      options.maxQuarantineBytes,
+      opts.maxQuarantineBytes,
       DEFAULT_MAX_QUARANTINE_BYTES,
       'maxQuarantineBytes',
     );
     this.maxQuotaCleanupSteps = parseQuotaLimit(
-      options.maxQuotaCleanupSteps,
+      opts.maxQuotaCleanupSteps,
       DEFAULT_MAX_QUOTA_CLEANUP_STEPS,
       'maxQuotaCleanupSteps',
     );
-    this.coalescePendingWrites = options.coalescePendingWrites !== false;
+    this.coalescePendingWrites = opts.coalescePendingWrites !== false;
     this.maxCoalescedPerKey = parseQuotaLimit(
-      options.maxCoalescedPerKey,
+      opts.maxCoalescedPerKey,
       DEFAULT_MAX_COALESCED_PER_KEY,
       'maxCoalescedPerKey',
     );
     this.maxPendingCoalescedKeys = parseQuotaLimit(
-      options.maxPendingCoalescedKeys,
+      opts.maxPendingCoalescedKeys,
       DEFAULT_MAX_PENDING_COALESCED_KEYS,
       'maxPendingCoalescedKeys',
     );
-    this.storageEstimate = typeof options.storageEstimate === 'function' ? options.storageEstimate : null;
+    this.storageEstimate = typeof opts.storageEstimate === 'function' ? opts.storageEstimate : null;
 
     this._db = null;
     this._dbPromise = null;
@@ -564,7 +1564,61 @@ class UserdataStore {
       atomicWrites: 0,
       writeVerifyFailures: 0,
       corruptRecoveries: 0,
+      backendFallbacks: this._initialFallbackCount,
       lastWriteDurationMs: 0,
+    };
+  }
+
+  _activateFallbackSync(reason) {
+    this._fallbackReason = sanitizeFallbackReason(reason, 'storage_unavailable');
+    this._initialFallbackCount += 1;
+    if (this._stats) {
+      this._stats.backendFallbacks += 1;
+    }
+    if (this._opfsBackend) {
+      try {
+        this._opfsBackend.close();
+      } catch {
+        // Ignore OPFS close errors during fallback.
+      }
+      this._opfsBackend = null;
+    }
+    if (this.indexedDB && typeof this.indexedDB.open === 'function') {
+      this.backend = null;
+      this._activeBackendKind = BACKEND_KINDS.INDEXEDDB;
+    } else {
+      if (!this._memoryBackend) {
+        this._memoryBackend = new InMemoryUserdataBackend();
+      }
+      this.backend = this._memoryBackend;
+      this._activeBackendKind = BACKEND_KINDS.MEMORY;
+    }
+  }
+
+  async _ensureBackendReady() {
+    if (this._activeBackendKind !== BACKEND_KINDS.OPFS || !this._opfsBackend) {
+      return;
+    }
+    if (this._opfsBackend.isInitialized()) {
+      return;
+    }
+    try {
+      await this._opfsBackend.ensureReady();
+    } catch (err) {
+      this._activateFallbackSync(err);
+    }
+  }
+
+  getBackendInfo() {
+    return {
+      storageMode: this.storageMode,
+      backendKind: this._activeBackendKind,
+      preferOpfs: this.preferOpfs,
+      opfsDirName: this.opfsDirName,
+      fallbackReason: this._fallbackReason,
+      fallbackCount: this._stats.backendFallbacks,
+      opfsInitialized: Boolean(this._opfsBackend && this._opfsBackend.isInitialized()),
+      ioMode: this._opfsBackend ? this._opfsBackend.getIoMode() : null,
     };
   }
 
@@ -1057,6 +2111,7 @@ class UserdataStore {
   }
 
   async _getAllRecords() {
+    await this._ensureBackendReady();
     if (this.backend) {
       const records = await this.backend.getAll();
       return Array.isArray(records) ? records : [];
@@ -1066,6 +2121,7 @@ class UserdataStore {
   }
 
   async _putRawRecord(record) {
+    await this._ensureBackendReady();
     if (this.backend) {
       await this.backend.put(record);
       return;
@@ -1074,6 +2130,7 @@ class UserdataStore {
   }
 
   async _getRawRecord(key) {
+    await this._ensureBackendReady();
     if (this.backend) {
       if (typeof this.backend.get === 'function') {
         return await this.backend.get(key);
@@ -1097,6 +2154,7 @@ class UserdataStore {
   }
 
   async _deleteRawRecord(key) {
+    await this._ensureBackendReady();
     if (this.backend) {
       if (typeof this.backend.delete === 'function') {
         await this.backend.delete(key);
@@ -1363,6 +2421,8 @@ class UserdataStore {
     if (!fsAdapter || typeof fsAdapter.writeFile !== 'function') {
       throw new TypeError('restoreAll requires an fsAdapter with a writeFile(path, bytes) method');
     }
+
+    await this._ensureBackendReady();
 
     if (!this.backend && (!this.indexedDB || typeof this.indexedDB.open !== 'function')) {
       return { restored: 0, skipped: 0, timedOut: false, error: 'IndexedDB unavailable' };
@@ -2104,7 +3164,9 @@ class UserdataStore {
 
   getStats() {
     const storedBytes = this._indexReady ? this._indexedTotalBytes : this._fallbackStoredBytes;
+    const opfsStats = this._opfsBackend ? this._opfsBackend.getStats() : null;
     return {
+      backendKind: this._activeBackendKind,
       reads: this._stats.reads,
       writes: this._stats.writes,
       deletes: this._stats.deletes,
@@ -2123,6 +3185,9 @@ class UserdataStore {
       atomicWrites: this._stats.atomicWrites,
       writeVerifyFailures: this._stats.writeVerifyFailures,
       corruptRecoveries: this._stats.corruptRecoveries,
+      backendFallbacks: this._stats.backendFallbacks,
+      opfsSyncWrites: opfsStats ? opfsStats.syncWrites : 0,
+      opfsWritableWrites: opfsStats ? opfsStats.writableWrites : 0,
       lastWriteDurationMs: this._stats.lastWriteDurationMs,
       indexReady: this._indexReady,
       indexedFiles: this._metaIndex.size,
@@ -2150,6 +3215,7 @@ class UserdataStore {
     this._stats.atomicWrites = 0;
     this._stats.writeVerifyFailures = 0;
     this._stats.corruptRecoveries = 0;
+    this._stats.backendFallbacks = 0;
     this._stats.lastWriteDurationMs = 0;
   }
 
@@ -2360,8 +3426,14 @@ class UserdataStore {
 
 const exportedApi = {
   UserdataStore,
+  OpfsUserdataBackend,
+  InMemoryUserdataBackend,
+  createOpfsUserdataBackend,
+  createMemoryUserdataBackend,
+  probeOpfsSupport,
   DEFAULT_DB_NAME,
   DEFAULT_STORE_NAME,
+  DEFAULT_OPFS_DIR_NAME,
   DEFAULT_RESTORE_TIMEOUT_MS,
   DEFAULT_MAX_FILE_BYTES,
   DEFAULT_MAX_TOTAL_BYTES,
@@ -2376,8 +3448,16 @@ const exportedApi = {
   USERDATA_PREFIX,
   ARCHIVE_FORMAT,
   ARCHIVE_VERSION,
+  OPFS_RECORD_MAGIC,
+  OPFS_RECORD_VERSION,
+  OPFS_RECORD_HEADER_SIZE,
+  STORAGE_MODES,
+  BACKEND_KINDS,
   validateUserdataPath,
   validateUserdataPrefix,
+  encodeOpfsKeyFilename,
+  encodeOpfsRecord,
+  decodeOpfsRecord,
   encodeBase64,
   decodeBase64,
   computeChecksum,

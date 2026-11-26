@@ -2218,8 +2218,15 @@ test('W323: getStats() exposes sanitized indexCacheHits, indexCacheMisses, coale
   assert.equal(stats.indexedBytes, 28);
   assert.equal(stats.storedBytes, 28);
 
-  // Verify stats payload is strictly sanitized (only numbers/booleans, no paths or raw buffers).
+  // Verify stats payload is strictly sanitized (only numbers/booleans + enum backendKind, no paths or raw buffers).
   for (const [key, val] of Object.entries(stats)) {
+    if (key === 'backendKind') {
+      assert.ok(
+        ['opfs', 'indexeddb', 'memory', 'custom'].includes(val),
+        `Expected valid backendKind enum, got ${String(val)}`,
+      );
+      continue;
+    }
     assert.ok(
       typeof val === 'number' || typeof val === 'boolean',
       `Expected sanitized primitive telemetry for "${key}", got ${typeof val}`,
