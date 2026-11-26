@@ -153,7 +153,10 @@ function createMockWebGpu() {
       setStencilReference: (r) => record('setStencilReference', [r]),
       draw: (...a) => record('draw', a),
       drawIndexed: (...a) => record('drawIndexed', a),
+      drawIndirect: (...a) => record('drawIndirect', a),
+      drawIndexedIndirect: (...a) => record('drawIndexedIndirect', a),
       dispatchWorkgroups: (...a) => record('dispatchWorkgroups', a),
+      dispatchWorkgroupsIndirect: (...a) => record('dispatchWorkgroupsIndirect', a),
       end: () => record('end', []),
     };
   };
@@ -476,6 +479,7 @@ function bindGroupLayoutPacket(id, entries, { contentId = 0n, flags = 0 } = {}) 
     view.setUint8(o + 10, e.dimension || 0);
     view.setUint8(o + 11, e.flags || 0);
     view.setUint8(o + 12, e.storageFormat || 0);
+    view.setUint16(o + 14, e.bindingArraySize || 0, true);
     view.setBigUint64(o + 16, BigInt(e.minBindingSize || 0), true);
   });
   return header(V2_OPCODES.CREATE_BIND_GROUP_LAYOUT, payload);
@@ -492,17 +496,19 @@ function pipelineLayoutPacket(id, groupIds, { contentId = 0n, flags = 0 } = {}) 
   return header(V2_OPCODES.CREATE_PIPELINE_LAYOUT, payload);
 }
 
-function bindGroup2Packet(id, layoutId, entries) {
+function bindGroup2Packet(id, layoutId, entries, { flags = 0 } = {}) {
   const payload = new Uint8Array(16 + entries.length * 48);
   const view = new DataView(payload.buffer);
   view.setUint32(0, id, true);
   view.setUint32(4, layoutId, true);
   view.setUint32(8, entries.length, true);
+  view.setUint32(12, flags, true);
   entries.forEach((e, i) => {
     const o = 16 + i * 48;
     view.setUint32(o, e.binding, true);
     view.setUint32(o + 4, e.type, true);
     view.setUint32(o + 8, e.id, true);
+    view.setUint16(o + 12, e.arrayIndex || 0, true);
     view.setBigUint64(o + 16, BigInt(e.offset || 0), true);
     view.setBigUint64(o + 24, BigInt(e.size || 0), true);
     if (e.view) payload.set(e.view, o + 32);
@@ -833,6 +839,12 @@ function beginRenderPassPacket({ colors = [], depthStencil = null } = {}) {
     view.setUint8(o + 4, c.loadOp ?? 2); // clear
     view.setUint8(o + 5, c.storeOp ?? 1); // store
     if (c.view) payload.set(c.view, o + 8);
+    if (Array.isArray(c.clearValue)) {
+      view.setFloat32(o + 24, c.clearValue[0] ?? 0, true);
+      view.setFloat32(o + 28, c.clearValue[1] ?? 0, true);
+      view.setFloat32(o + 32, c.clearValue[2] ?? 0, true);
+      view.setFloat32(o + 36, c.clearValue[3] ?? 1, true);
+    }
   });
   if (depthStencil) {
     const d = 328;
@@ -5959,4 +5971,416 @@ test('W347: reverse guard coerces non-1d view descriptors to dimension:1d on act
   const bgDesc = handler.bindGroupDescriptors.get(401);
   assert.ok(bgDesc);
   assert.equal(bgDesc.resources[0].viewDimension, '1d');
+});
+
+// ---------------------------------------------------------------------------------------------
+// W373: Indirect draw/dispatch handling, BindingArrays, RT arena group-3, and frame pooling
+// ---------------------------------------------------------------------------------------------
+
+function indirectPacket(opcode, bufferId, offset = 0) {
+  const payload = new Uint8Array(16);
+  const view = new DataView(payload.buffer);
+  view.setUint32(0, bufferId, true);
+  view.setBigUint64(8, BigInt(offset), true);
+  return header(opcode, payload);
+}
+
+test('W373: drawIndirect, drawIndexedIndirect, and dispatchIndirect handle pending async skips, missing compute pipelines, and layout:auto group-0 remap', () => {
+  const gpu = createMockWebGpu();
+  const autoRenderBgl = { kind: 'GPUBindGroupLayout', id: 'auto-render-bgl0' };
+  const autoComputeBgl = { kind: 'GPUBindGroupLayout', id: 'auto-compute-bgl0' };
+  const origCreateRenderPipeline = gpu.device.createRenderPipeline.bind(gpu.device);
+  const origCreateComputePipeline = gpu.device.createComputePipeline.bind(gpu.device);
+  gpu.device.createRenderPipeline = (desc) => {
+    const p = origCreateRenderPipeline(desc);
+    p.getBindGroupLayout = (idx) => (idx === 0 ? autoRenderBgl : null);
+    return p;
+  };
+  gpu.device.createComputePipeline = (desc) => {
+    const p = origCreateComputePipeline(desc);
+    p.getBindGroupLayout = (idx) => (idx === 0 ? autoComputeBgl : null);
+    return p;
+  };
+
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { format: 'rgba8unorm' });
+  const handler = installRenderStatePackets(processor);
+
+  const vsCode = `
+    @group(0) @binding(0) var<uniform> u_cb: vec4<f32>;
+    @vertex fn vs_main() -> @builtin(position) vec4<f32> { return u_cb; }
+  `;
+  const fsCode = `
+    @fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }
+  `;
+  const csCode = `
+    @group(0) @binding(0) var<storage, read_write> out_buf: array<u32>;
+    @compute @workgroup_size(1) fn cs_main() { out_buf[0] = 1u; }
+  `;
+
+  // Mismatched layout (expects sampler at binding 0 instead of buffer) forces layout:'auto' remap.
+  const key = new Uint8Array(376);
+  const kv = new DataView(key.buffer);
+  kv.setUint32(20, 1, true);
+  key[24] = formatCodeOf('rgba8unorm');
+  key[26] = 0x0f;
+  kv.setUint32(160, 1, true);
+  kv.setUint32(164, 0xffffffff, true);
+
+  const computePipePayload = new Uint8Array(32);
+  const cpv = new DataView(computePipePayload.buffer);
+  cpv.setUint32(0, 720, true);
+  cpv.setUint32(4, 703, true);
+  cpv.setUint32(8, 711, true);
+
+  const setup = new Stream()
+    .shader(701, 0, vsCode)
+    .shader(702, 1, fsCode)
+    .shader(703, 2, csCode)
+    .buffer(704, 0x0100 | 0x0008, 64) // INDIRECT | COPY_DST
+    .buffer(705, 0x0040 | 0x0080 | 0x0008, 256) // UNIFORM | STORAGE | COPY_DST
+    .buffer(706, 0x0010 | 0x0008, 64) // INDEX | COPY_DST
+    .raw(bindGroupLayoutPacket(710, [{ binding: 0, visibility: 7, type: 1, subtype: 0 }])) // sampler mismatch
+    .raw(pipelineLayoutPacket(711, [710]))
+    .raw(renderPipeline2Packet(719, 701, 702, 711, key))
+    .raw(header(V2_OPCODES.CREATE_COMPUTE_PIPELINE2, computePipePayload))
+    .raw(bindGroup2Packet(730, 710, [{ binding: 0, type: 0, id: 705, offset: 0, size: 64 }]));
+
+  processor.executeCommandBuffer(setup.bytes());
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+  assert.equal(handler.renderPipelineAutoLayoutMeta.get(719)?.autoLayoutRemap, true);
+  assert.equal(handler.computePipelineMeta.get(720)?.autoLayoutRemap, true);
+
+  // Mark pipeline 799 (render) and 798 (compute) as pending async compiles.
+  handler.pendingAsyncRenderPipelines.set(799, {});
+  handler.pendingAsyncComputePipelines.set(798, {});
+
+  const frame = new Stream()
+    .packet(OPCODES.BEGIN_FRAME)
+    .raw(beginRenderPassPacket({ colors: [{ textureId: SWAPCHAIN_TEXTURE_ID, loadOp: 2, storeOp: 1 }] }))
+    // 1) Pending async render pipeline skips both DrawIndirect and DrawIndexedIndirect
+    .u32s(OPCODES.SET_PIPELINE, [799])
+    .raw(indirectPacket(OPCODES.DRAW_INDIRECT, 704, 0))
+    .raw(indirectPacket(OPCODES.DRAW_INDEXED_INDIRECT, 704, 16))
+    // 2) layout:'auto' render pipeline injects remapped group-0 before DrawIndirect & DrawIndexedIndirect
+    .raw(setBindGroup2Packet(0, 730))
+    .u32s(OPCODES.SET_PIPELINE, [719])
+    .u32s(OPCODES.SET_INDEX_BUFFER, [706, 0, 0, 0])
+    .raw(indirectPacket(OPCODES.DRAW_INDIRECT, 704, 0))
+    .raw(indirectPacket(OPCODES.DRAW_INDEXED_INDIRECT, 704, 16))
+    .raw(header(V2_OPCODES.END_RENDER_PASS, new Uint8Array(0)))
+    // 3) Pending async compute pipeline skips DispatchIndirect
+    .u32s(OPCODES.SET_COMPUTE_PIPELINE, [798])
+    .raw(indirectPacket(OPCODES.DISPATCH_INDIRECT, 704, 32))
+    // 4) Missing compute pipeline skips DispatchIndirect with warning
+    .u32s(OPCODES.SET_COMPUTE_PIPELINE, [797])
+    .raw(indirectPacket(OPCODES.DISPATCH_INDIRECT, 704, 32))
+    // 5) layout:'auto' compute pipeline injects remapped group-0 before DispatchIndirect
+    .raw(setBindGroup2Packet(0, 730))
+    .u32s(OPCODES.SET_COMPUTE_PIPELINE, [720])
+    .raw(indirectPacket(OPCODES.DISPATCH_INDIRECT, 704, 48))
+    .packet(OPCODES.PRESENT);
+
+  processor.executeCommandBuffer(frame.bytes());
+
+  const telemetry = handler.getTelemetry();
+  assert.equal(telemetry.pendingAsyncPipelineSkips, 3, '2 pending indirect draws + 1 pending indirect dispatch');
+  assert.equal(telemetry.skippedComputeDispatchCount, 1, '1 missing-pipeline indirect dispatch skipped');
+  assert.equal(telemetry.computeDispatchCount, 1, '1 valid indirect dispatch counted');
+
+  const indirectDraws = gpu.passCalls.filter((c) => c.op === 'drawIndirect');
+  const indirectIndexedDraws = gpu.passCalls.filter((c) => c.op === 'drawIndexedIndirect');
+  const indirectDispatches = gpu.passCalls.filter((c) => c.op === 'dispatchWorkgroupsIndirect');
+  assert.equal(indirectDraws.length, 1);
+  assert.equal(indirectDraws[0].args[1], 0);
+  assert.equal(indirectIndexedDraws.length, 1);
+  assert.equal(indirectIndexedDraws[0].args[1], 16);
+  assert.equal(indirectDispatches.length, 1);
+  assert.equal(indirectDispatches[0].args[1], 48, 'indirect dispatch offset preserved untouched');
+
+  // Verify remapped group-0 bind groups were injected for both render and compute indirect paths
+  const renderSetBgs = gpu.passCalls.filter((c) => c.pass === 'render' && c.op === 'setBindGroup');
+  const computeSetBgs = gpu.passCalls.filter((c) => c.pass === 'compute' && c.op === 'setBindGroup');
+  assert.ok(
+    renderSetBgs.some((c) => c.args[0] === 0 && c.args[1].desc.layout === autoRenderBgl),
+    'remapped group-0 bind group must be bound before DrawIndirect'
+  );
+  assert.ok(
+    computeSetBgs.some((c) => c.args[0] === 0 && c.args[1].desc.layout === autoComputeBgl),
+    'remapped group-0 bind group must be bound before DispatchIndirect'
+  );
+});
+
+test('W373: BindingArrays (GpuLayoutFlags::BindingArrays) in decodeBindGroupLayoutEntry, CreateBindGroupLayout, and CreateBindGroup2', () => {
+  const {
+    decodeBindGroupLayoutEntry,
+    BINDING_ARRAYS_LAYOUT_FLAG,
+    BINDING_ARRAYS_BG_FLAG,
+  } = require('../web/workers/render_state_packets.js');
+
+  // 1) Pure decoder: bindingArraySize set when >= 1, omitted/deleted on scratch when === 0
+  const buf = new Uint8Array(48);
+  const dv = new DataView(buf.buffer);
+  // Entry 0: texture binding 10 with binding_array_size = 4
+  dv.setUint32(0, 10, true);
+  dv.setUint32(4, 2, true); // fragment
+  dv.setUint8(8, 2); // texture
+  dv.setUint8(9, 0); // float
+  dv.setUint8(10, 2); // 2d
+  dv.setUint16(14, 4, true); // binding_array_size = 4
+  // Entry 1: non-array sampler binding 20 (binding_array_size = 0)
+  dv.setUint32(24, 20, true);
+  dv.setUint32(28, 2, true);
+  dv.setUint8(32, 1); // sampler
+  dv.setUint8(33, 0); // filtering
+  dv.setUint16(38, 0, true);
+
+  const scratch = {};
+  const arrEntry = decodeBindGroupLayoutEntry(dv, 0, scratch);
+  assert.equal(arrEntry.binding, 10);
+  assert.equal(arrEntry.bindingArraySize, 4);
+  const scalarEntry = decodeBindGroupLayoutEntry(dv, 24, scratch);
+  assert.equal(scalarEntry.binding, 20);
+  assert.equal('bindingArraySize' in scalarEntry, false, 'stale bindingArraySize must be deleted on scratch reuse');
+
+  // 2) Full packet execution: BindingArrays layout + bind group with array_index + null element + duplicate rejection
+  const gpu = createMockWebGpu();
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { format: 'rgba8unorm' });
+  const handler = installRenderStatePackets(processor);
+
+  const stream = new Stream()
+    .texture(801, 32, 32, 0)
+    .texture(802, 32, 32, 0)
+    .raw(
+      bindGroupLayoutPacket(
+        810,
+        [{ binding: 4, visibility: 2, type: 2, subtype: 0, dimension: 2, bindingArraySize: 3 }],
+        { flags: BINDING_ARRAYS_LAYOUT_FLAG }
+      )
+    )
+    .raw(
+      bindGroup2Packet(
+        820,
+        810,
+        [
+          { binding: 4, type: 1, id: 801, arrayIndex: 0 },
+          { binding: 4, type: 1, id: 0, arrayIndex: 1 }, // null element -> dummy texture view
+          { binding: 4, type: 1, id: 802, arrayIndex: 2 },
+        ],
+        { flags: BINDING_ARRAYS_BG_FLAG }
+      )
+    );
+
+  processor.executeCommandBuffer(stream.bytes());
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+
+  const bglRecord = handler.bindGroupLayouts.get(810);
+  assert.equal(bglRecord.hasBindingArrays, true);
+  assert.equal(bglRecord.entryByBinding.get(4).bindingArraySize, 3);
+  assert.equal(handler.getTelemetry().bindingArrayLayouts, 1);
+  assert.equal(handler.getTelemetry().bindingArrayBindGroups, 1);
+
+  const [bgCall] = gpu.results('createBindGroup');
+  assert.equal(bgCall.desc.entries.length, 3);
+  assert.deepEqual(
+    bgCall.desc.entries.map((e) => e.binding),
+    [4, 5, 6],
+    'binding-array elements must map to WebGPU slots binding + array_index'
+  );
+  assert.equal(bgCall.desc.entries[0].resource.textureHandle, processor.textures.get(801).handle);
+  assert.ok(bgCall.desc.entries[1].resource, 'null binding-array element must bind a dummy view');
+  assert.equal(bgCall.desc.entries[2].resource.textureHandle, processor.textures.get(802).handle);
+
+  // Duplicate effective binding slot (4 + 1 == 5 colliding with 4 + 1) must be rejected cleanly
+  const dupPkt = bindGroup2Packet(
+    821,
+    810,
+    [
+      { binding: 4, type: 1, id: 801, arrayIndex: 1 },
+      { binding: 4, type: 1, id: 802, arrayIndex: 1 },
+    ],
+    { flags: BINDING_ARRAYS_BG_FLAG }
+  );
+  processor.executeCommandBuffer(dupPkt);
+  assert.equal(handler.stats.errors, 1);
+  assert.match(handler.lastError, /duplicate binding 5/);
+});
+
+test('W373: Multi-group RT arena group 3 (bindings 16..21) preserves explicit PipelineLayout and elides redundant SetBindGroup2(3)', () => {
+  const gpu = createMockWebGpu();
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { format: 'rgba8unorm' });
+  const handler = installRenderStatePackets(processor);
+
+  const vsCode = `
+    @group(0) @binding(0) var<uniform> u_frame: vec4<f32>;
+    @vertex fn vs_main() -> @builtin(position) vec4<f32> { return u_frame; }
+  `;
+  const fsCode = `
+    @group(3) @binding(16) var<storage, read_write> pg6_arena0: array<u32>;
+    @group(3) @binding(20) var<storage, read> pg6_arena_dir: array<u32>;
+    @group(3) @binding(21) var<storage, read_write> pg6_rt_stats: array<u32>;
+    @fragment fn fs_main() -> @location(0) vec4<f32> {
+      let d = pg6_arena_dir[0];
+      pg6_arena0[0] = d;
+      pg6_rt_stats[0] = d;
+      return vec4<f32>(1.0);
+    }
+  `;
+
+  const key = new Uint8Array(376);
+  const kv = new DataView(key.buffer);
+  kv.setUint32(20, 1, true);
+  key[24] = formatCodeOf('rgba8unorm');
+  key[26] = 0x0f;
+  kv.setUint32(160, 1, true);
+  kv.setUint32(164, 0xffffffff, true);
+
+  // RT arena group 3 bindings 16..21: pg6_arena0..3 (storage), pg6_arena_dir (read-only-storage), pg6_rt_stats (storage)
+  const rtArenaEntries = [
+    { binding: 16, visibility: 6, type: 0, subtype: 1 }, // storage (fragment|compute)
+    { binding: 17, visibility: 6, type: 0, subtype: 1 },
+    { binding: 18, visibility: 6, type: 0, subtype: 1 },
+    { binding: 19, visibility: 6, type: 0, subtype: 1 },
+    { binding: 20, visibility: 6, type: 0, subtype: 2 }, // read-only-storage
+    { binding: 21, visibility: 6, type: 0, subtype: 1 }, // atomic stats storage
+  ];
+
+  const stream = new Stream()
+    .shader(901, 0, vsCode)
+    .shader(902, 1, fsCode)
+    .buffer(903, 0x0040 | 0x0008, 256) // uniform
+    .buffer(904, 0x0080 | 0x0008, 1024) // arena storage
+    .raw(bindGroupLayoutPacket(910, [{ binding: 0, visibility: 3, type: 0, subtype: 0 }]))
+    .raw(bindGroupLayoutPacket(913, rtArenaEntries))
+    .raw(pipelineLayoutPacket(915, [910, 0, 0, 913]))
+    .raw(renderPipeline2Packet(916, 901, 902, 915, key))
+    .raw(bindGroup2Packet(920, 910, [{ binding: 0, type: 0, id: 903, offset: 0, size: 64 }]))
+    .raw(
+      bindGroup2Packet(923, 913, [
+        { binding: 16, type: 0, id: 904, offset: 0, size: 1024 },
+        { binding: 17, type: 0, id: 904, offset: 0, size: 1024 },
+        { binding: 18, type: 0, id: 904, offset: 0, size: 1024 },
+        { binding: 19, type: 0, id: 904, offset: 0, size: 1024 },
+        { binding: 20, type: 0, id: 904, offset: 0, size: 1024 },
+        { binding: 21, type: 0, id: 904, offset: 0, size: 256 },
+      ])
+    )
+    .packet(OPCODES.BEGIN_FRAME)
+    .raw(beginRenderPassPacket({ colors: [{ textureId: SWAPCHAIN_TEXTURE_ID, loadOp: 2, storeOp: 1 }] }))
+    .u32s(OPCODES.SET_PIPELINE, [916])
+    .raw(setBindGroup2Packet(0, 920))
+    .raw(setBindGroup2Packet(3, 923))
+    .raw(setBindGroup2Packet(3, 923)) // redundant -> elided via fast 8-slot _passState
+    .u32s(OPCODES.DRAW, [3, 1, 0, 0])
+    .raw(header(V2_OPCODES.END_RENDER_PASS, new Uint8Array(0)))
+    .packet(OPCODES.PRESENT);
+
+  processor.executeCommandBuffer(stream.bytes());
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+
+  const plMeta = handler.pipelineLayoutMeta.get(915);
+  assert.equal(plMeta.groupCount, 4);
+  assert.equal(plMeta.group3HasEntries, true);
+  assert.equal(plMeta.hasRtArenaGroup3, true);
+
+  const [rpCall] = gpu.results('createRenderPipeline');
+  assert.equal(
+    rpCall.desc.layout,
+    handler.pipelineLayouts.get(915),
+    'compatible 4-group RT arena pipeline must preserve explicit GPUPipelineLayout'
+  );
+  assert.equal(handler.renderPipelineAutoLayoutMeta.has(916), false);
+
+  const group3Calls = gpu.passCalls.filter((c) => c.op === 'setBindGroup' && c.args[0] === 3);
+  assert.equal(group3Calls.length, 1, 'duplicate SetBindGroup2(3, 923) within same render pass must be elided');
+  assert.equal(handler.getTelemetry().elidedBindGroupSets, 1);
+  assert.equal(handler.getTelemetry().rtArenaGroup3Binds, 2);
+});
+
+test('W373: BeginRenderPassCommand and SetBindGroup2 dynamic-offsets frame pools reuse cleanly without aliasing across multi-RT passes', () => {
+  const gpu = createMockWebGpu();
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { format: 'rgba8unorm' });
+  const handler = installRenderStatePackets(processor);
+
+  const setup = new Stream()
+    .texture(950, 640, 360, 0) // RT0
+    .texture(951, 640, 360, 0) // RT1
+    .texture(952, 640, 360, 4) // depth32float
+    .buffer(955, 0x0040 | 0x0008, 4096)
+    .raw(
+      bindGroupLayoutPacket(960, [
+        { binding: 0, visibility: 3, type: 0, subtype: 0, flags: 0x1 }, // dynamic uniform
+        { binding: 1, visibility: 3, type: 0, subtype: 0, flags: 0x1 }, // dynamic uniform
+      ])
+    )
+    .raw(
+      bindGroup2Packet(961, 960, [
+        { binding: 0, type: 0, id: 955, offset: 0, size: 256 },
+        { binding: 1, type: 0, id: 955, offset: 0, size: 256 },
+      ])
+    );
+  processor.executeCommandBuffer(setup.bytes());
+  assert.equal(handler.stats.errors, 0, handler.lastError);
+
+  const makeFrame = (off0, off1, off2, clearR) =>
+    new Stream()
+      .packet(OPCODES.BEGIN_FRAME)
+      .raw(
+        beginRenderPassPacket({
+          colors: [
+            { textureId: 950, loadOp: 2, storeOp: 1, clearValue: [clearR, 0, 0, 1] },
+            { textureId: 951, loadOp: 2, storeOp: 1, clearValue: [0, clearR, 0, 1] },
+          ],
+          depthStencil: { textureId: 952, depthLoadOp: 2, depthStoreOp: 1, depthClearValue: 1.0 },
+        })
+      )
+      .raw(setBindGroup2Packet(0, 961, [off0, off1]))
+      .raw(header(V2_OPCODES.END_RENDER_PASS, new Uint8Array(0)))
+      .raw(beginRenderPassPacket({ colors: [{ textureId: SWAPCHAIN_TEXTURE_ID, loadOp: 2, storeOp: 1 }] }))
+      .raw(setBindGroup2Packet(0, 961, [off2, 0]))
+      .raw(header(V2_OPCODES.END_RENDER_PASS, new Uint8Array(0)))
+      .packet(OPCODES.PRESENT)
+      .bytes();
+
+  // Frame 1: populates both pools with 2 BeginRenderPassCommand entries and 2 dynamic-offset arrays
+  processor.executeCommandBuffer(makeFrame(256, 512, 768, 0.25));
+  assert.equal(handler._brpCmdPool.length, 2);
+  assert.equal(handler._brpCmdPoolUsed, 0, '_releaseFramePools resets _brpCmdPoolUsed after Present');
+  assert.equal(handler._brpCmdPool[0]._resolvers.colors.length, 0, 'pooled color resolver refs cleared');
+  assert.equal(handler._brpCmdPool[0]._resolvers.depthStencil, null, 'pooled depth resolver ref cleared');
+  assert.equal(handler._dynOffsetsPool.length, 2);
+  assert.equal(handler._dynOffsetsPoolUsed, 0, '_releaseFramePools resets _dynOffsetsPoolUsed after Present');
+
+  const brp0Ref = handler._brpCmdPool[0];
+  const brp1Ref = handler._brpCmdPool[1];
+  const dyn0Ref = handler._dynOffsetsPool[0];
+  const dyn1Ref = handler._dynOffsetsPool[1];
+
+  const f1Passes = gpu.passCalls.filter((c) => c.op === 'beginRenderPass');
+  assert.equal(f1Passes.length, 2);
+  assert.equal(f1Passes[0].args[0].colorAttachments.length, 2, 'MRT pass keeps 2 color attachments');
+  assert.ok(f1Passes[0].args[0].depthStencilAttachment, 'MRT pass keeps depth-stencil attachment');
+  assert.equal(f1Passes[0].args[0].colorAttachments[0].clearValue.r, 0.25);
+  assert.equal(f1Passes[1].args[0].colorAttachments.length, 1, 'swapchain pass keeps 1 color attachment');
+  assert.equal(f1Passes[1].args[0].depthStencilAttachment, undefined);
+
+  // Frame 2: reuses the exact same pooled instances with new data and zero pool growth
+  processor.executeCommandBuffer(makeFrame(1024, 1280, 1536, 0.75));
+  assert.equal(handler._brpCmdPool.length, 2);
+  assert.equal(handler._brpCmdPool[0], brp0Ref, 'BeginRenderPassCommand slot 0 reused across frames');
+  assert.equal(handler._brpCmdPool[1], brp1Ref, 'BeginRenderPassCommand slot 1 reused across frames');
+  assert.equal(handler._dynOffsetsPool.length, 2);
+  assert.equal(handler._dynOffsetsPool[0], dyn0Ref, 'dynamic offsets array slot 0 reused across frames');
+  assert.equal(handler._dynOffsetsPool[1], dyn1Ref, 'dynamic offsets array slot 1 reused across frames');
+
+  const allPasses = gpu.passCalls.filter((c) => c.op === 'beginRenderPass');
+  assert.equal(allPasses.length, 4);
+  assert.equal(allPasses[0].args[0].colorAttachments[0].clearValue.r, 0.25, 'Frame 1 descriptor not aliased by Frame 2');
+  assert.equal(allPasses[2].args[0].colorAttachments[0].clearValue.r, 0.75, 'Frame 2 descriptor carries new clear value');
+  assert.equal(allPasses[2].args[0].colorAttachments.length, 2);
+  assert.ok(allPasses[2].args[0].depthStencilAttachment);
+  assert.equal(allPasses[3].args[0].colorAttachments.length, 1);
+
+  const f2SetBgs = gpu.passCalls.filter((c) => c.op === 'setBindGroup').slice(2);
+  assert.deepEqual(f2SetBgs[0].args[2], [1024, 1280]);
+  assert.deepEqual(f2SetBgs[1].args[2], [1536, 0]);
 });
